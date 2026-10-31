@@ -2766,6 +2766,58 @@ suites); `just test-proof` green at `43e3d8f0` (583 passed in 51 suites,
 `fixtures::` and `constants::` among them unchanged: format 35 byte for
 byte, and the new `device_kernel::` gate).
 
+**Session P5** (2026-10-31 05:17 to 05:23, on vos-core `9d5c3ff1`'s
+`vos-phone` built for Android (timing build, mimalloc; SHA-256
+`1f9c2c9a…a62c`), 7.17's lean kernel (`67a5af17…`, 5,665 steps) against
+the device kernel after the review's folds (`c650df97…`, 2,860 steps),
+the same witness input; `scripts/p5.sh`, `runs/phone-p5.txt` and
+`runs/phone-p5.jsonl`) [measured, the Fairphone 6, governor `walt` on
+every core (stock; P4's was not recorded); battery 100% on USB power,
+27–29 °C before every run; the pin (blowup 4, 47 queries, PoW 16,
+Blake2s-M31), masked; three rounds, each interleaving the four runs, 5
+reps after a warm-up; every proof verified on the phone]:
+
+| kernel | threads | rounds' p50 | p50 / p90 (15 proves) | peak | bytes | verify |
+|---|---|---|---|---|---|---|
+| 7.17's lean (BLAKE2b io-hash) | `Auto` | 2.42 / 2.39 / 2.43 s | 2.43 / 2.44 s | 1,773–1,811 MiB | 1,820,983–1,828,604 | 32 ms |
+| **device (`H_io`)** | `Auto` | **0.97 / 0.95 / 0.97 s** | **0.97 / 1.00 s** | **701–716 MiB** | **975,523–988,262** | 17 ms |
+| 7.17's lean | 4 big, unpinned (`taskset f0`) | 3.04 / 3.11 / 3.12 s | 3.11 / 3.15 s | 1,717–1,756 MiB | 1,830,311–1,836,014 | 30 ms |
+| device | 4 big, unpinned | 1.19 / 1.16 / 1.14 s | 1.16 / 1.19 s | 688–705 MiB | 978,014–987,320 | 16 ms |
+| device, blowup 2, 86 q, PoW 20 | `Auto` | 1.02 s | 1.02 / 1.06 s | 587 MiB | 1,659,659 | 47 ms |
+| device, blowup 4, 43 q, PoW 20 | `Auto` | 0.94 s | 0.94 / 1.02 s | 719 MiB | 905,048 | 17 ms |
+
+- **The device kernel takes ×0.40 of the baseline's time** under `Auto`
+  (×0.37 on the big cores unpinned), ×0.39 of its peak and ×0.54 of its
+  bytes: x86's ratios (×0.37–0.42, ×0.37, ×0.54) hold on the phone.
+- **`Auto` on the phone is the four big cores, pinned:** 7.17's classes
+  keep cores 4–7 (the A720s and the X4 in one class, within a sixth) and
+  pin a thread to each; the same four cores unpinned are 1.20× slower
+  (1.16 against 0.97 s), the scheduler's migrations. P4's `Auto` was the
+  even split over eight (7.16's pool); its numbers are not this row's.
+- **The phone against x86:** the device kernel's 0.97 s against x86's
+  0.35 s under `Auto` (4 P + 4 E) is ×2.8, against about 0.40 s on four
+  P-cores [est, quiet] ×2.4; the baseline's 2.43 s against 7.17's quiet
+  1.01 s on four P-cores is ×2.4 (P4's ×3.0 was on 7.16's shape and
+  pool). The peak is ×1.2 x86's (0.69 against 0.57 GiB).
+- **Blowup 2 is out again:** 1.66 MB, past the budget, and no faster.
+  Blowup 4 at PoW 20 trims 8% of the bytes, the time the same (7.16's
+  grind tail decides).
+- **Memory:** the lean baseline's first cell (1.8 GiB) set off two
+  critical-pressure events in `lmkd` (05:17:22–23, no kill: "system is not
+  in reclaim") and two cached processes of the Google app ended
+  themselves on a trim (05:17:38, `oom_adj` 905); nothing from the device
+  kernel's runs, no kill in the session. MemAvailable 4.7–4.9 GB between
+  runs.
+
+**PG2 on the phone, before ingress:** the median of the three rounds'
+medians **0.968 s ≤ 1.0 s** (the 95th percentiles 0.999–1.006 s), peak
+**0.70 GiB ≤ 1 GiB**, proof **0.98 MB ≤ 1.5 MiB**, verified on the phone:
+the time, memory and bytes budgets **met, by 3% in time**. Not yet PG2:
+ingress's acceptance (7.20), and two passes a day apart (P7, P8). 7.18's
+CPU split (785 of 3,203 columns, about a third of the cells) and 7.19's
+word-level memory are now headroom, not the gate: a warm phone, or the
+95th percentile, is at the line today.
+
 **Commits:** `69f483e2` the hasher and the tag, `6264a3e0` device kernels'
 plumbing, `6246a414` the test actor and its gates, `71417423` the end in a
 module of its own, `9caa091a` the spike and the run, the review's folds
