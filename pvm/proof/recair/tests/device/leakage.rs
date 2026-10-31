@@ -121,6 +121,63 @@ fn the_published_values_do_not_depend_on_the_witness() {
     assert!(verdicts.refused().is_empty(), "{:?}", verdicts.refused());
 }
 
+/// The masking's condition without its factor two (`proving.md` §5, how
+/// large `h` must be), at the device format itself: `h = 256` against the
+/// 149 rows a column reveals at 47 queries, its chips at their floor of
+/// 2^10 rows, `N/4 = h`, or above. The two witnesses' N proofs each are not told
+/// apart, field by field nor pooled, each field of the first's is
+/// uniform, and R1 passes every transcript within `h`.
+#[cfg(feature = "heavy-gates")]
+#[test]
+fn heavy_the_device_formats_proofs_do_not_depend_on_the_witness() {
+    use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
+    use vos_pvm_recair::device::FORMAT;
+    let n = n();
+    let program = program::<Blake2sM31MerkleChannel>(&FORMAT, &blob());
+    assert_eq!(program.log_sizes.iter().min(), Some(&10));
+    let mut attempts = 0;
+    let mut most = 0;
+    let [a, b] = WITNESSES.map(|seed| {
+        let mut fields = Fields::default();
+        for mask in 0..n as u64 {
+            let (proof, stats) = prove::<Blake2sM31MerkleChannel>(
+                &FORMAT,
+                &program,
+                &blob(),
+                &witness(seed),
+                MaskRng::Seeded(mask),
+            )
+            .expect("proves");
+            if mask == 0 {
+                verify::<Blake2sM31MerkleChannel>(&FORMAT, &program, &proof).expect("verifies");
+            }
+            assert_eq!(proof.io, io_bytes(), "one public value for both witnesses");
+            assert!(stats.revealed_rows <= 149, "{stats:?}");
+            attempts += stats.attempts;
+            most = most.max(stats.revealed_rows);
+            fields.add(&private_fields(
+                &proof.proof.stark_proof,
+                &proof.proof.claimed_sums,
+            ));
+        }
+        fields
+    });
+    eprintln!(
+        "format {}: {} proofs, {attempts} attempts, at most {most} rows revealed of h = 256",
+        FORMAT.number,
+        2 * n
+    );
+    let mut verdicts = Verdicts::new("the device format's witness indistinguishability");
+    indistinguishable(&mut verdicts, "two witnesses", &a, &b, n);
+    verdicts.report();
+    assert!(verdicts.refused().is_empty(), "{:?}", verdicts.refused());
+
+    let mut verdicts = Verdicts::new("the device format's uniformity");
+    uniform(&mut verdicts, &a, n);
+    verdicts.report();
+    assert!(verdicts.refused().is_empty(), "{:?}", verdicts.refused());
+}
+
 /// No hidden state among a proof's published values: the witness's sixteen
 /// words, in the two blocks of eight the Poseidon2 call absorbs, the call's
 /// eight output words, and the witness's and the output's bytes eight at a

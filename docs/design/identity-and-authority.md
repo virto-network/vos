@@ -251,7 +251,7 @@ Ingress verifies the proof and logs only the origin it proves.
       pub arguments: Vec<u8>,          // at most cap::REQUEST
       pub nonce: [u8; 16],             // the client's, at random
       pub expires_ms: u64,             // by the node's clock
-      pub format: u32,                 // 44 (S29); 43 for a device proof
+      pub format: u32,                 // 44 (S29); 45 for a device proof
       pub public: CredentialPublic,
       pub proof: Vec<u8>,
   }
@@ -287,7 +287,7 @@ Ingress verifies the proof and logs only the origin it proves.
   - `#[msg(credential = Auth("login"))]` is
     `CredentialGuard::Auth { name, device: None }`. It admits `Anonymous`
     origins; `name`, 1–64 bytes, is the scope's. Its `device` field names
-    the attestable kernel whose device proofs (format 43) it also takes,
+    the attestable kernel whose device proofs (format 45) it also takes,
     from M5 (`#[msg(credential = Auth("login"), device = "auth")]`); the
     field exists from the start, so M5 moves no pinned blob.
   - `#[msg(credential = Owner)]` is `CredentialGuard::Owner`. It admits
@@ -327,10 +327,10 @@ Ingress verifies the proof and logs only the origin it proves.
   | 3 | this node serves the agent | `NoAgent`, `Elsewhere`, as for calls | 404, 421 |
   | 4 | the node's space has a genesis (its `SpaceId` is not `NONE`) | `NoSpace`, 0 | 403 |
   | 5 | `format` is a credential or device format this node admits | `Format`, 1 | 403 |
-  | 6 | `proof` within its format's cap (44: 512 KiB; 43: 1.5 MiB), `arguments` within `cap::REQUEST` | `Size`, 2 | 403 |
+  | 6 | `proof` within its format's cap (44: 512 KiB; 45: 1.5 MiB), `arguments` within `cap::REQUEST` | `Size`, 2 | 403 |
   | 7 | `now ≤ expires_ms ≤ now + 120 s`, `now` the node's clock | `Expiry { now }`, 3 | 403 |
   | 8 | the instance's method exists and has a credential guard | `Method`, 4 | 403 |
-  | 9 | `public`'s kind is the guard's, and the format proves it for this method (43: auth, for a guard that names a device kernel) | `Kind`, 5 | 403 |
+  | 9 | `public`'s kind is the guard's, and the format proves it for this method (45: auth, for a guard that names a device kernel) | `Kind`, 5 | 403 |
   | 10 | auth: `scope` is the one the guard's name gives | `Scope`, 6 | 403 |
   | 11 | `binding` is `C(T(binding), W(b))` of this request | `Binding`, 7 | 403 |
   | 12 | `b` is not recorded | `Replayed`, 8 | 409 |
@@ -390,7 +390,7 @@ Ingress verifies the proof and logs only the origin it proves.
 - **On JAM,** an agent whose builder is one of the space's nodes takes a
   credentialed input as it takes any: its builder's ingress verified the
   proof, under the trust-boundary rule above.
-- **Device proofs** (format 43, M5) authorize exactly what an auth proof
+- **Device proofs** (format 45, M5) authorize exactly what an auth proof
   does [decided, S24] and take the same checks (`proving.md` §8).
 
 **Guards are the same on VOS and on JAM.** Inside a space the evidence is

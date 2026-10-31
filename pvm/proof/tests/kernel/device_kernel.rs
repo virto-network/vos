@@ -36,8 +36,8 @@ fn a_device_kernels_shape_holds_no_blake2b() {
         Some(trace.io_hash),
         vos_pvm_precompiles::compute_device_io_hash(&public, &[], &[])
     );
-    // Under 2^11 steps the CPU sits at the masking's floor (4h rows, h =
-    // 512): fewer steps buy nothing more.
+    // Under 2^11 steps the CPU takes 2^11 rows, twice the masking's floor
+    // (4h rows, 2^10 at h = 256).
     let steps = trace.side_note.steps.len();
     assert!(steps < 1 << 11, "auth: {steps} steps");
     println!("auth: {steps} steps");
@@ -64,9 +64,11 @@ fn every_path_shape_proves_under_one_device_program() {
         let own = Program::install(&blob, input).expect("its own run's program");
         assert_eq!(own.id(), program.id());
         assert_eq!(own.log_sizes(), program.log_sizes());
-        let (proof, _) = program
+        let (proof, stats) = program
             .prove(input, MaskRng::default())
             .expect("proves under the kernel's program");
+        // R1's rows within `h` (`proving.md` §5): 149 at most.
+        assert!(stats.revealed_rows <= 149, "{stats:?}");
         assert_eq!(Some(proof.io), auth_io(public));
         let bytes = encode(&proof.proof).expect("encodes");
         assert!(bytes.len() <= MAX_PROOF_BYTES, "{} bytes", bytes.len());

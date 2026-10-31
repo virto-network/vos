@@ -89,7 +89,7 @@ pub enum Kind {
     #[codec(index = 5)]
     Reading = 5,
     /// An `#[attestable(device)]` method: proved on a device alone (format
-    /// 43), never attested by a node; its io-hash is the Poseidon2 one
+    /// 45), never attested by a node; its io-hash is the Poseidon2 one
     /// (`vos_pvm_precompiles::compute_device_io_hash`), and its kernel
     /// returns its statement's parts as that hash encodes them
     /// ([`crate::result::KernelReturn::from_device_return`]), no root among

@@ -588,7 +588,7 @@ last for decades.**
 | segment proofs (format 35) | ≥ 100 / ≥ 60 | blowup 4 (log 2), 40 queries, PoW 24, plus interaction PoW 8; FRI fold step 1, log last-layer degree bound 0 | 104 / 62 (62.86) |
 | leaf and fold proofs (32) | ≥ 100 / ≥ 60 | blowup 4, 44 queries, PoW 20, plus interaction PoW 8; fold step 1, last layer 2^0 | 108 / 63 |
 | credential proofs (44, by S29; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | blowup 4 (log 2), 47 queries, PoW 16, plus interaction PoW 8; variant (c) | 110 / 62 (62.92) [built, 7.10; registered, 7.12] |
-| device proofs (43; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | chosen by 7.16 among blowup 2 with 86–87 queries, 4 with 43 (or 47 at PoW 16), 8 with 29; variant (c) | ≥ 100 / ≥ 62 |
+| device proofs (45; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | blowup 4, 47 queries, PoW 16, interaction PoW 8 (7.16, among blowup 2 with 86–87 queries, 4 with 43, 8 with 29); variant (c), `h = 256` (7.17d) | 110 / 62 (62.82) |
 | the final wrap, unmasked (28; tests only) | ≥ 100 / ≥ 80 | blowup 64 (log 6), 20 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching (§3.5) | 146 / 82 (82.60) |
 | the final wrap, masked (39) | ≥ 100 / ≥ 80 | blowup 32 (log 5), 24 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching; variant (c) | 146 / 82 (82.70) |
 
@@ -655,10 +655,10 @@ last for decades.**
   `h`. The device shape proves them masked against its program
   (`vos_pvm_recair::masked::device`, slice 7's 7.15): the program's chips
   mixed after the header, its log sizes pinned, the io-hash the one public
-  sum. The device format, 43, is admitted at a space's ingress for
+  sum. The device format, 45, is admitted at a space's ingress for
   device proofs of auth's statement (slice 7's 7.20). Node segment, leaf and fold proofs stay unmasked, in the prover
   role, as the witness rows do.
-- **Device proofs (format 43, rate 1/4)** serve authorizations a space re-checks at
+- **Device proofs (format 45, rate 1/4)** serve authorizations a space re-checks at
   its ingress, never settlement.
 - **How:** spike 2's variant (c), already prototyped on our pinned Stwo
   fork, with Fable's R1–R8:
@@ -682,6 +682,97 @@ last for decades.**
   6. parameters pinned in the format;
   7. every carrier audited (A.5);
   8. the cost measured (§3.5).
+- **How large `h` must be** [argued; counted on the device shape, 7.17d]:
+  - **What a column reveals.** A masked column is `f' = f + v_H·r`, `r`
+    uniform over the `h` coefficients of the size-`h` circle FFT basis,
+    one `r` a column, drawn independently. Every published value that
+    depends on `r` is `f'` at a point off `H` (where `v_H ≠ 0`), so an
+    M31-affine function `f(p) + L_p(r)`:
+    - each out-of-domain sample, a QM31 value: **4** M31 functionals, for
+      each of the column's `|O|` offsets;
+    - each decommitted query: **1**, `f'` at the query lifted to the
+      column's domain;
+    - the composition's opening at each query: **`|O|`**, `f'` at the
+      query lifted to the composition's level and shifted by each offset.
+      The composition sits one level above the masked columns, so these
+      reads are other points than the decommitted one. Only the
+      composition's value, a function of every column's reads, is
+      published, so counting each column's own is an over-count.
+    - Nothing else: the DEEP quotients at the queries are computed from
+      these; the claimed sums are blinded by R2; an unopened leaf's hash
+      is hidden by its salt; the preprocessed columns are public.
+    - **The composition's sample at `π(z)`:** its 4 coordinate columns
+      `C_k` are each sampled at `w = π(z)`, 16 M31 values against the one
+      QM31 value `C(w)`. They are determined all the same: the `C_k(w)`
+      follow from `C(σⁱw)`, `i = 0..3`, `σ` QM31's Frobenius over M31
+      (its Galois conjugates), and each `C(σⁱw)` is computable from the
+      columns' samples conjugated, since `f'`, `π` and the offsets' shifts
+      are over M31 and the composition's only QM31 inputs (its
+      coefficient `α`, the relation challenges, the blinded sums) are
+      public.
+    - **Conditional on R3:** FRI's siblings, inner layers and last layer
+      are hidden by `R`, uniform in the FRI code, whose rank is asserted
+      by construction, with no check (`masked/mod.rs`'s R3): 8 columns of
+      `2^{m+2}` coefficients each, at least 8·2^12 = 32,768 M31
+      coefficients for the smallest device shape, against about 10³
+      functionals FRI reveals at 47 queries. The `h` argument here
+      covers the columns' randomizers alone, and holds with R3.
+  - **The count**, per column of offsets `O`, at `q` queries:
+    `4|O| + q(|O| + 1)` rows, fewer when points coincide (two queries
+    lifted to one point of a small component's domain, a read on a
+    decommitted point), never more. R1 builds exactly these rows from
+    the transcript (`rank::revealed_functionals`).
+  - **The condition.** If a column's rows are linearly independent over
+    M31, the map `r ↦ (L_p(r))_p` is onto, so for uniform `r` the
+    revealed values are uniform and independent of `f`; the columns'
+    `r` are independent, so the joint view is too. With R2, R3 and the
+    salts, the simulator samples the transcript from the public values
+    alone. Independence needs `rows ≤ h`, so **`h` must be at least the
+    largest column's count**, and R1 checks independence itself on every
+    transcript; `h ≤ N/4` keeps (c)'s composition bound.
+  - **The margin is not the argument.** `h` at twice the count (Plonky3's
+    hiding PCS takes `2(q + 4·points)` for a scheme with no check of its
+    own) makes a rank deficiency rarer; here R1 is checked exactly and a
+    deficient transcript is drawn again with fresh masks. Whether R1
+    passes is a function of the format, the shape, `z` and the query
+    positions: Fiat–Shamir outputs on salted, masked commitments, which
+    in the random-oracle model are uniform and independent of the
+    witness. Conditioning on it, and the count of attempts, reveal
+    nothing. The margin buys only fewer retries, which cost time
+    (`MAX_ATTEMPTS`, 8, then the prover fails without a proof).
+  - **The device shape at 47 queries** (format 43's parameters; the auth
+    kernel's program at `h = 256`; each chip's widest offsets read off the
+    built device set's mask points): every chip reads its previous row,
+    the logup running sum's `[-1, 0]` at least, and none a third row, so
+    the widest `|O|` is 2 in every chip and each of its masked columns,
+    main, interaction and blinding, reveals at most `4·2 + 47·3 = 149`
+    rows:
+
+    | chips | log size at `h = 256` (at 512) | `|O|` | rows at most | `h` | spare | `h / rows` |
+    |---|---|---|---|---|---|---|
+    | MEMORY | 14 (14) | 2 | 8 + 47 + 94 = 149 | 256 | 107 | 1.72 |
+    | PROGRAM_MEMORY, the data table | 13 (13) | 2 | 149 | 256 | 107 | 1.72 |
+    | REGISTER_MEMORY | 12 (12) | 2 | 149 | 256 | 107 | 1.72 |
+    | CPU, WITNESS_INPUT, the device memory | 11 (11) | 2 | 149 | 256 | 107 | 1.72 |
+    | Poseidon2, the device boundary, DeviceIoChip, JUMP_TABLE, RANGE_MULTIPLICITY_256, BITWISE_LOOKUP, POWER_OF_TWO, BYTE_TO_BITS, MUL, BITWISE, COMPARE, DIVREM | **10** (11) | 2 | 149 | 256 | 107 | 1.72 |
+
+    The count does not depend on the log size: a small chip's points
+    coincide more often, so its transcript's count is at most 149. At
+    the floor, 2^10 rows, `h = N/4` exactly. **`h = 256` meets the
+    condition for every chip, with 107 rows spare (×1.72)**; R1 measured
+    149 on the auth kernel's transcripts at `h = 256` and accepted each at
+    its first attempt (7.17c). A column of one offset would reveal
+    `4 + 2·47 = 98`. The rule's other limits: `h = 512` at 47
+    queries kept ×2 (298); `h = 256` keeps ×2 up to 40 queries, and
+    holds the condition up to 82 (`8 + 3q ≤ 256`).
+  - **What would break it:** more offsets (`|O| = 3`: 200 rows, still
+    under 256; `|O| = 4`: 251; `|O| = 5`: 302, over) or more queries. R1
+    refuses a transcript whose rows pass `h` (`n_rows ≤ h` before the
+    rank), so a shape that broke it would fail to prove (after
+    `MAX_ATTEMPTS` refused transcripts), never prove leaky; the device
+    install refuses such a format before any proof (`device_floors`).
+    `mask_rows` sizes each chip's `h` from its own offsets only below the
+    format's cap: at format 45 every device chip reaches the cap, 256.
 - **The composition mode:** a test pins that (c) lifts no constraint past
   the blowup. If it did, the prover would re-LDE every column.
 - **On the wrap** (spike 6a): no re-LDE [measured]; the prover ×2.6–2.9
@@ -1198,14 +1289,15 @@ binding the run like this:
   one public claimed sum (DeviceIoChip's); a device kernel's io-hash is
   `H_io` below, over Poseidon2, not BLAKE2b;
 - **masking:** a floor of rows per masked component, set by the queries:
-  the randomizer covers twice the rows a column reveals, `4|O| + q(|O| + 1)`
-  for `|O|` offsets a column, rounded to a power of two `h`, and a component
-  has at least `4h` rows. At blowup 2 with 86–87 queries that is 2^12 rows
-  (`h` = 1,024), at blowup 4 with 43 queries 2^11, at blowup 8 with 29
-  2^10 [model, `research/slice-7/device-params.md`]; a component with no
-  next-row read (`|O| = 1`) needs half, so `h` is set per component. Every
-  segment chip reads its running sum's previous row, so each takes the
-  full `h` [built, 7.14].
+  the randomizer covers the rows a column reveals, `4|O| + q(|O| + 1)`
+  for `|O|` offsets a column (§5, how large `h` must be), rounded to a
+  power of two `h`, and a component has at least `4h` rows. Format 43
+  took twice the rows, at blowup 4 with 47 queries `h = 512` and 2^11
+  rows [built, 7.14–7.16]; format 45 takes the rows themselves, 149, so
+  `h = 256` and 2^10 [built, 7.17d]. A component with no next-row read
+  (`|O| = 1`) needs less, so `h` is set per component (at most the
+  format's). Every segment chip reads its running sum's previous row, so
+  each takes the full `h` [built, 7.14].
 
 **The device io-hash `H_io`** [built, slice 7's 7.17b, ingress's check
 7.20's; checked by Fable]. A device kernel's io-hash was
@@ -1303,10 +1395,10 @@ columns [measured, 7.16]. Over `C`, a kernel that hashes only through
 - **What the verifier and ingress check** [built, 7.20]: the verifier
   is unchanged (the io-hash's 32 bytes are the public values,
   DeviceIoChip's sum recomputed from them); ingress picks the io-hash by
-  the proof's format, 43's being `H_io` (not by the guard), computes it
+  the proof's format, 45's being `H_io` (not by the guard), computes it
   from the request's words (`a` the SCALE encoding of
   `CredentialPublic::Auth`, 129 bytes, `o` empty, no roots: `ℓ = 133`, six
-  blocks and the length's) and verifies the proof under 43 against it. A
+  blocks and the length's) and verifies the proof under 45 against it. A
   proof whose kernel ended with BLAKE2b states another io-hash and fails.
 - **What moves:** every device kernel's code and program id (none pinned
   before ingress takes device proofs); the device kernel's end
@@ -1316,7 +1408,7 @@ columns [measured, 7.16]. Over `C`, a kernel that hashes only through
   tags (seven); the spike harness's and `tools/phone`'s kernels; a device
   kernel's gas (seven calls at 2,400 gas each where BLAKE2b's blocks
   were). **What does not:** pin I's auth words, the device chips,
-  DeviceIoChip, format 43's reference and bits (a device program may
+  DeviceIoChip, the device format's reference and bits (a device program may
   still hold BLAKE2b, so the reference keeps it), every node format,
   `compute_io_hash`, `vos_pvm_statement::Statement::io_hash`, `Attest`
   and `KernelReturn`'s codec, and every node kernel's bytes.
@@ -1337,11 +1429,15 @@ columns [measured, 7.16]. Over `C`, a kernel that hashes only through
   four-byte load a packed word, `padded_device_io_words`) and the kernel
   moves its words whole at any alignment (the PVM serves unaligned loads
   and stores; the guest target's own go byte by byte): under 2^11 steps,
-  the CPU at the masking's floor, which the gate holds [measured, 7.17c].
+  which the gate holds [measured, 7.17c]: the CPU at 2^11 rows, twice the
+  masking's floor of 2^10 at `h = 256`.
 
-**Format 43, device proofs** [measured, slice 7's 7.16]: masked (c), the
-Blake2s-M31 channel, blowup 4, 47 queries, PoW 16, interaction PoW 8,
-affine DEEP batching, `h = 512` (format 44's parameters); 110 conjectured
+**Format 45, device proofs** [measured, slice 7's 7.16 and 7.17d]:
+masked (c), the Blake2s-M31 channel, blowup 4, 47 queries, PoW 16,
+interaction PoW 8, affine DEEP batching (format 44's parameters), `h =
+256`, every chip's floor 2^10 rows. Format 43 was the same at `h = 512`
+(7.16 to 7.17c) and is retired: 45 drops the masking's factor two (§5),
+×0.82 in time and ×0.87 in peak on the phone at P6; 110 conjectured
 and 62.82 proven bits on its masked reference, every device chip at
 2^17 rows (`DEVICE_MAX_LOG_SIZE`, which install enforces: the memory
 ledger, a row a byte touched, takes 2^17 on the auth statements).
@@ -1383,7 +1479,7 @@ credential proof does. A device kernel is an `#[attestable]` method whose
 `public_args` are the SCALE encoding of auth's `CredentialPublic` (its
 kind byte, then `map_root`, `scope`, `nullifier` and `binding`, 32 bytes
 each) and whose output is empty. Ingress takes the words from the request,
-recomputes the io-hash, verifies the proof under format 43 against the
+recomputes the io-hash, verifies the proof under format 45 against the
 device program id the agent's derivation pins for the kernel the guard
 names, and then runs auth's checks (`identity-and-authority.md` §5); the
 binding names that program. The trace is witness-independent: the prover
@@ -1463,7 +1559,7 @@ that narrows the inner proof makes folds cheaper too.
 | **6** | **M3 Statements on chain** | the public-input model; `&self` witnessed reads to the space root at anchored cuts; the prover worker; the Kreivo spaces pallet's design, the verifier kit and the node's client (the pallet is the Kreivo teammate's); the JAM statements service | 18.5–29 weeks |
 | **7** | **M3.9 Simplify and scale** | the anchoring protocol simplified (pin D′: one venue core, five outcomes on the node, no migration, no rotation, equivocation terminal); a scale test across the owner's LAN | 11.5–18 weeks |
 | **7** | **M4 Credential AIR** | slice 6's re-pin batch; the zkPVM Poseidon2 host call and chip; a credential actor keeping a Poseidon2 tree in its own rows; the credential AIR (format 44); the node's binary API and its gateway; its verifier at ingress; device secrets from the Android Keystore or a security key, the device library and a demo in s4's Android client; phone gates | 15.5–22 weeks |
-| **7** | **M5 Device profile** | the segment chips masked; the boundary-free device shape (format 43); levers 1–4; the CPU split by opcode family, word-level memory if needed; the Poseidon2 chip and the levers in the node's segment format (41), as its leaves allow; the ≤ 1 s phone gate | 22–33.5 weeks, 26–39.5 with word-level memory |
+| **7** | **M5 Device profile** | the segment chips masked; the boundary-free device shape (format 45); levers 1–4; the CPU split by opcode family, word-level memory if needed; the Poseidon2 chip and the levers in the node's segment format (41), as its leaves allow; the ≤ 1 s phone gate | 22–33.5 weeks, 26–39.5 with word-level memory |
 | **later** | **M6 Signature chips** | SHA-256, SHA-512, the bignum chip, the P-256 and Edwards drivers; moved past slice 7 by the owner (S1) | 8–14 weeks |
 
 - M0 runs on two tracks. Its critical path is 5.1 → 5.2 → 5.4, and
@@ -1636,15 +1732,16 @@ counts as conjectured / proven at the reference shape [model]:
 |---|---|---|---|---|---|---|
 | 35 | segments | Poseidon2-M31 | 2, 40, 24, 1, 0, 8 | 100 / 60 | 104 / 62 | admitted |
 | 32 | leaf and fold (one padded shape) | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 63 | reserved |
-| 37 | device proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 | reserved |
 | 28 | the final wrap, unmasked (tests only) | Blake2b-256 | 6, 20, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 | admitted |
 | 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 5, 24, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 | admitted; the one production venues accept |
 | 44 | credential proofs, masked (variant (c)) | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 (62.92), on its masked shape | admitted |
+| 45 | device proofs, masked (variant (c)), `h = 256` | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 (62.82), on its masked shape | admitted |
 
 - **30 is retired unregistered** (slice 7's 7.10), and **42 retired**
   (7.12): 44 counts credential proofs on their masked shape, PoW 16 at 47
   queries, picked over 42's PoW 20 at 43 by the phone's grind (S29).
-  **37** retires unregistered when 43 registers.
+  **37** retired unregistered when 43 registered (7.16), and **43
+  retired** (7.17d): 45 takes its parameters at `h = 256`.
 - **Each entry** holds its channel, its parameters, the DEEP batching its
   proven floor assumes and both bit counts.
 - **Every entry uses A.3's encodings** and exactly its parameters.

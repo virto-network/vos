@@ -11,22 +11,23 @@
 //! | 32 | leaves and folds | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 63 |
 //! | 35 | segments | Poseidon2-M31 | 2, 40, 24, 1, 0, 8 | 100 / 60 | 104 / 62 |
 //! | 39 | the final wrap, masked | Blake2b-256 | 5, 24, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 |
-//! | 43 | device proofs, masked | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 |
 //! | 44 | credential proofs, masked | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 |
+//! | 45 | device proofs, masked | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 |
 //!
 //! - **The segment AIR** is the one every segment, leaf and device format
-//!   names: 35 and 43 name its current form, without the columns and
+//!   names: 35 and 45 name its current form, without the columns and
 //!   next-row masks no constraint reads, and 32's leaves verify it. The
 //!   numbers that named its earlier forms are [`RETIRED`]: refused, and never
 //!   registered again. 24 to 27 and 29 named it before its hardening (the
 //!   witness input, the removal of the curve chips, the AIR audit's fixes); 31,
 //!   33 and 34 named the hardened form with those columns, 31 at 44 queries;
-//!   36 named its legacy Blake2s form, below the proven floor.
+//!   36 named its legacy Blake2s form, below the proven floor; 43 named
+//!   the device format at `h = 512`.
 //!   28, 32 and 39 prove the recursion AIR (`vos-pvm-recair-air`) and keep
 //!   their numbers; 44 proves its `p2` and `qm31` alone, the credential AIR.
 //! - **Every format** takes exactly its parameters, mixes the boundary
 //!   states as the boundary chips' bytes and grinds its interaction PoW
-//!   before the relation challenges. 43 is admitted: a space's ingress
+//!   before the relation challenges. 45 is admitted: a space's ingress
 //!   verifies device proofs of auth's statement against the program it
 //!   computes from the installed kernel (`vos-pvm-recair`'s `device`). 32
 //!   is registered and refused
@@ -48,7 +49,7 @@
 //!   segment's width times its queries, and 4 fewer queries keep the leaf's
 //!   `p2` under 2^16 with room. Leaves and folds (32) take 44 queries and 20
 //!   bits: a fold verifies under half the recursion AIR's shape.
-//! - **The device format** (43) is counted on the device shape's masked
+//! - **The device format** (45) is counted on the device shape's masked
 //!   reference ([`DEVICE_REFERENCE`]: every chip a device program may hold
 //!   at `2^17` rows, the most install, the prover and the verifier admit).
 //!   Of the candidates measured (blowup 2 with 85–87 queries, 4 with 43 at
@@ -61,7 +62,12 @@
 //!   grind has the short tail format 44 was chosen for (at PoW 20 the
 //!   BLAKE2b statement's proof fits the budget, at PoW 16 it passes it by
 //!   1%). 37, reserved at an unmasked count before the masking, is retired
-//!   unregistered.
+//!   unregistered. 45 is 43's parameters at `h = 256` rather than 512
+//!   (`proving.md` §5, how large `h` must be): every device chip reveals
+//!   at most 149 rows at 47 queries, so `h = 256` holds the masking's
+//!   condition without its factor two, and every chip's floor halves to
+//!   2^10 rows; the bits do not move, `h` being in neither the parameters
+//!   nor the reference. 43, admitted at `h = 512`, is retired.
 //! - **The credential format** (44) is counted on its masked shape
 //!   ([`CREDENTIAL_REFERENCE`]): two components at the masking's floor of
 //!   2^11 rows, where every blowup costs the same cells, so blowup 4, and
@@ -295,7 +301,7 @@ pub const SEGMENT_REFERENCE: SecurityShape = SecurityShape {
     composition_point_doublings: 0,
 };
 
-/// The device format's reference (pin J), format 43's: the device set
+/// The device format's reference (pin J), format 45's: the device set
 /// (`vos_pvm_proof::device`) with every chip a device program may hold at
 /// `2^17` rows (`device::DEVICE_MAX_LOG_SIZE`, which install enforces),
 /// masked under variant (c): its columns at degree bound 2^18, the
@@ -529,19 +535,20 @@ pub const MASKED_WRAP: Format = Format {
     },
 };
 
-/// Format 43's masking: 8 salt columns a tree; an `R` of 8 columns (R3
-/// under affine batching); and `h = 512`, at least
-/// `2(4|O| + q(|O| + 1)) = 298` for `q = 47` queries and `|O| = 2`
-/// offsets, so each component pads to `4h = 2^11` rows.
+/// Format 45's masking: 8 salt columns a tree; an `R` of 8 columns (R3
+/// under affine batching); and `h = 256`, at least the
+/// `4|O| + q(|O| + 1) = 149` rows a column reveals for `q = 47` queries and
+/// `|O| = 2` offsets, every device chip's widest (`proving.md` §5), so each
+/// component pads to `4h = 2^10` rows.
 pub const DEVICE_MASKING: Masking = Masking {
     salt_columns: 8,
     fri_mask_columns: 8,
-    log_mask_rows: 9,
+    log_mask_rows: 8,
 };
 
 /// Device proofs, masked: see the module's notes.
 pub const DEVICE_PROOF: Format = Format {
-    number: 43,
+    number: 45,
     kind: ProofKind::Device,
     channel: ChannelKind::Blake2sM31,
     params: DEVICE,
@@ -601,8 +608,8 @@ pub const REGISTRY: [Format; 6] = [
     LEAF_FOLD,
     SEGMENT,
     MASKED_WRAP,
-    DEVICE_PROOF,
     CREDENTIAL_PROOF,
+    DEVICE_PROOF,
 ];
 
 /// The numbers no format takes again, each refused:
@@ -626,11 +633,15 @@ pub const REGISTRY: [Format; 6] = [
 ///   passed 50 ms; 44 takes PoW 16 at 47 queries. Proofs were made under
 ///   it, so no later format takes it;
 /// - **37, reserved, never admitted:** device proofs at blowup 2 and 86
-///   queries, counted on an unmasked shape; 43 is the device format,
-///   counted on its masked one.
+///   queries, counted on an unmasked shape; the device format is counted
+///   on its masked one;
+/// - **43, admitted, then retired:** device proofs at 45's parameters
+///   with `h = 512`, twice the rows a column reveals; 45 takes `h = 256`,
+///   its floors 2^10 rows. Proofs were made under it, so no later format
+///   takes it.
 ///
 /// So a number names one AIR and one set of parameters.
-pub const RETIRED: [u32; 13] = [24, 25, 26, 27, 29, 30, 31, 33, 34, 36, 37, 40, 42];
+pub const RETIRED: [u32; 14] = [24, 25, 26, 27, 29, 30, 31, 33, 34, 36, 37, 40, 42, 43];
 
 /// The entry for `number`, admitted or not.
 pub fn lookup(number: u32) -> Option<&'static Format> {
@@ -742,8 +753,8 @@ mod tests {
                 (32, 108, 63),
                 (35, 104, 62),
                 (39, 146, 82),
-                (43, 110, 62),
                 (44, 110, 62),
+                (45, 110, 62),
             ]
         );
         assert!(REGISTRY.iter().all(Format::meets_floors));
@@ -851,7 +862,7 @@ mod tests {
         }
     }
 
-    /// Every number names one entry; only 28, 35, 39, 43 and 44 are admitted, and a
+    /// Every number names one entry; only 28, 35, 39, 44 and 45 are admitted, and a
     /// segment verifier takes 35 alone; the retired numbers are
     /// refused as retired and name no entry; every other number is refused.
     #[test]
@@ -881,7 +892,7 @@ mod tests {
             let error = admitted(number).unwrap_err();
             assert!(error.contains("retired"), "{error}");
         }
-        for number in (0..24).chain([38, u32::MAX]) {
+        for number in (0..24).chain([38, 41, 46, u32::MAX]) {
             assert!(lookup(number).is_none());
             assert!(admitted(number).is_err());
         }

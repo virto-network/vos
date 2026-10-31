@@ -1,4 +1,4 @@
-//! Format 43 counted on the device shape's masked reference, the built set
+//! Format 45 counted on the device shape's masked reference, the built set
 //! with every chip a device program may hold at the most rows a device
 //! program takes; the candidates measured beside it counted on the same
 //! shape.
@@ -15,6 +15,7 @@ use vos_pvm_proof::format::{DEVICE_PROOF, DEVICE_REFERENCE, FormatParams, RETIRE
 use vos_pvm_proof::framework_access::MAX_RELATION_WIDTH;
 use vos_pvm_proof::masked::{DeviceComponents, drive_masked_device_chip};
 use vos_pvm_proof::security::{SecurityBits, SecurityShape, proven_count, security_bits};
+use vos_pvm_recair::masked::device::{device_floors, device_reveals};
 use vos_pvm_recair::masked::mask_pins;
 use vos_pvm_recair_air::masked::{
     BlindRelation, MaskedComponent, MaskedComponents, air_log_size, committed_log_sizes,
@@ -96,8 +97,8 @@ fn candidate(
     }
 }
 
-/// The registry's reference for format 43 is the built device set's
-/// masked shape at `DEVICE_MAX_LOG_SIZE`, field for field; 43 counts its
+/// The registry's reference for format 45 is the built device set's
+/// masked shape at `DEVICE_MAX_LOG_SIZE`, field for field; 45 counts its
 /// pinned bits on it (62.82), and one query fewer falls under 62.
 #[test]
 fn the_device_reference_shape_is_the_built_sets() {
@@ -113,8 +114,55 @@ fn the_device_reference_shape_is_the_built_sets() {
         ..DEVICE_PROOF.params
     };
     assert!(proven_count(&fewer, &built).unwrap() < 62.0);
-    assert_eq!(lookup(43), Some(&DEVICE_PROOF));
-    assert!(RETIRED.contains(&37) && lookup(37).is_none());
+    assert_eq!(lookup(45), Some(&DEVICE_PROOF));
+    for retired in [37, 43] {
+        assert!(RETIRED.contains(&retired) && lookup(retired).is_none());
+    }
+}
+
+/// The masking's condition (`proving.md` §5, how large `h` must be) on
+/// every chip of the device set, at its floor and at the most rows a
+/// program takes: each reads two offsets at most, so a masked column
+/// reveals at most `4·2 + 47·3 = 149` rows, within `h = 256` (107 spare),
+/// though not twice within it; and the floor, 2^10 rows, is `4h`.
+#[test]
+fn every_device_chip_reveals_at_most_its_h() {
+    let h = 1usize << DEVICE_PROOF.masking.unwrap().log_mask_rows;
+    assert_eq!(h, 256);
+    let chips = device_chips_of_mask(DEVICE_ALL).count();
+    for log_size in [10, DEVICE_MAX_LOG_SIZE] {
+        let reveals = device_reveals(&DEVICE_PROOF, DEVICE_ALL, &vec![log_size; chips]).unwrap();
+        assert_eq!(reveals.len(), chips);
+        for (reveal, log_mask_rows) in reveals {
+            assert_eq!((reveal.offsets, reveal.rows), (2, 149), "2^{log_size}");
+            assert_eq!(1usize << log_mask_rows, h);
+            assert!(reveal.rows <= h && 2 * reveal.rows > h);
+        }
+    }
+    let floors = device_floors(&DEVICE_PROOF, DEVICE_ALL).unwrap();
+    assert!(floors.iter().all(|&floor| floor == 10), "{floors:?}");
+}
+
+/// A format whose `h` is below the rows a chip reveals has no floors, so
+/// the install refuses it before any proof, where R1 would refuse every
+/// transcript: `h = 128` against 149 rows at 47 queries, and `h = 256`
+/// against `8 + 3·83 = 257` at 83 queries; 82 queries (254 rows) fit.
+#[test]
+fn an_h_under_the_rows_revealed_is_refused_before_any_proof() {
+    let with = |log_mask_rows, n_queries| vos_pvm_proof::format::Format {
+        params: FormatParams {
+            n_queries,
+            ..DEVICE_PROOF.params
+        },
+        masking: Some(vos_pvm_proof::format::Masking {
+            log_mask_rows,
+            ..DEVICE_PROOF.masking.unwrap()
+        }),
+        ..DEVICE_PROOF
+    };
+    assert!(device_floors(&with(7, 47), DEVICE_ALL).is_none());
+    assert!(device_floors(&with(8, 83), DEVICE_ALL).is_none());
+    assert!(device_floors(&with(8, 82), DEVICE_ALL).is_some());
 }
 
 /// A smaller device program counts more bits than the reference: the
