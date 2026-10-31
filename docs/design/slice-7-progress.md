@@ -2823,6 +2823,176 @@ plumbing, `6246a414` the test actor and its gates, `71417423` the end in a
 module of its own, `9caa091a` the spike and the run, the review's folds
 (code, then `proving.md`), `blobs.lock`, this record.
 
+## Step 7.20: the device kernel at ingress
+
+Branch `s7/7.20`, from vos-core `59c61423`; s4 on the branch `vos-7.20`
+of the clone `~/src/virto/s4-vos`, from `vos` at `b6fc447`.
+
+**Built:**
+- **The device program** (`vos_pvm_recair::device`, pin J): `Program`,
+  a device kernel's program under format 43 computed from the kernel
+  alone: its chips (`device_chips_of_code`), the log sizes a reference
+  run needs (each at least its floor, at most `DEVICE_MAX_LOG_SIZE`) and
+  the preprocessed root, committed once. `Program::auth` takes its
+  reference run on `auth_reference`, auth's public reference statement (a
+  fixed, public secret's member at slot 0 of the empty tree, a fixed
+  scope and binding), so every node computes one program from the
+  installed kernel and the device the same from the same kernel. The id
+  a binding names (`program_id`): BLAKE2b-256 of a domain, the format's
+  number and parameters, the chips, the log sizes and the root. A proof's
+  bytes (`encode`, `decode`): the masked proof's postcard encoding, at
+  most 1.5 MiB, canonical, with no io-hash. `auth_io` (H_io of auth's 129
+  public bytes, no output, no root), `auth_public`, `auth_arguments` (the
+  siblings, the secret, the slot, the public bytes). Format 43 admitted
+  in the registry.
+- **`vos-device`** (pin L's `prove_kernel`): `DeviceProgram` (`install`
+  from a reference, `auth`, `id`, `log_sizes`, `verify`),
+  `Prover::prove_kernel` (format 43, refused below `DEVICE_PEAK_BYTES`, 1
+  GiB, PG2's budget), `Prover::prove_device_auth` (auth's statement by a
+  device kernel: a `CredentialProof` under format 43, its binding naming
+  the program, its io-hash checked against the words before it leaves),
+  `verify_device`, `auth_io`.
+- **Ingress** (`node/host/src/credentialed.rs`, pin J's path): formats 44
+  and 43 admitted (43's cap 1.5 MiB); a format-43 proof answers only an
+  auth guard naming a device kernel (else `Kind`); its program is the one
+  the node computed from the installed kernel: the leader at the install
+  (`node/admin.rs`, which fails for a guarded device kernel that does not
+  run auth's reference within the format's shape), a replica that did not
+  install at the first device proof naming the kernel, on an executor,
+  then kept (`DevicePrograms`, a failure too); the binding names its id;
+  the io-hash is `H_io` of the request's auth words, picked by the format,
+  not by the guard; then pin I's checks and origin, unchanged. A guard
+  naming a device kernel still takes a credential proof, under one
+  pseudonym. `node/SECURITY.md` says so.
+- **JAM's kernel gas cap** no longer holds a device method's declared gas
+  (agent, testkit's model, the JAM builder's derivation): no node runs a
+  device kernel; the device actor (50M) installs for JAM.
+- **The device actor's `login`** (`#[msg(credential = Auth("login"),
+  device = "auth")]`): its install needs the credential actor.
+  `blobs.lock`: the device actor alone moves.
+- **PG2's acceptance run**: `vos-phone kernel --kernel K --input I --out
+  P` proves a device kernel of auth's statement as the library proves it
+  for ingress (`DeviceProgram::auth`, `prove_kernel`), verifies it on the
+  device and writes its bytes; `cargo run --release -p vos-node --example
+  device_ingress -- DIR [--rounds N] [--wait S] [--prove]` serves one node
+  of a founded space with the credential and device actors and a member,
+  writes each round's witness input (a sign-in good for 110 s), sends the
+  proof written back as `Credentialed` (0x0104) under format 43 and
+  prints the answer; `spikes/s7-device/scripts/pg2.sh <vos-phone> <out>
+  [rounds]` drives both over adb (`PG2_LOCAL=1`: its dry run on the host).
+- **The demo's Sign in choice** (`node/gateway/src/demo.rs`): `Demo`'s
+  optional `device` (the device actor's instance and its kernel's file);
+  the enrollment pins the device actor's `login` with the kernel's bytes;
+  *Sign in* offers "Sign in with my device" (the credential proof, the
+  poll's `login`) and "Sign in with my device's kernel" (a device proof,
+  the device actor's `login`), the relay admitting both. The demo's
+  `LocalSpace` installs the device actor and writes its kernel.
+- **s4** (`vos-7.20`, `08433f1` and `a8a2d9a`, not pushed): `vos.credential`'s auth
+  guard may be pinned with its device kernel's bytes (at most 256 KiB);
+  its sign-in then proves the kernel's run with `prove_device_auth`
+  (format 43) and the chrome says which proof it makes, naming the kernel by its SHA-256's first eight bytes; the prover's
+  allowance a device proof's; VOS at `a743254c`; README and CHANGELOG.
+
+**Tests:**
+- `device_kernel::every_path_shape_proves_under_one_device_program` (the
+  kernel suite, `test-proof`): slot 0 under the empty tree's siblings and
+  the last slot under a full path, each its own run's program equal to
+  the reference's (id and log sizes `[12, 11, 14, 11, 13, 13, 11, 11, 13,
+  11 …]`), each proved under it and verified against its own io-hash
+  alone (pin J's witness-independent trace), proofs 980–981 KB.
+- `program::a_run_past_the_programs_log_sizes_is_refused_by_the_prover`
+  (recair's device suite, under format 43): a reader kernel's program
+  sized by a 16-byte run refuses a 1,000-byte run (`its shape`); a larger
+  reference gives other sizes and another id. Beside it the id's inputs
+  and the bytes' canonical decode.
+- Served (`node/host/tests/served/credentialed.rs`):
+  `a_device_kernels_proof_signs_in_as_an_auth_proof_does` (a follower,
+  which computes the program, and the leader, which pinned it, admit
+  device proofs; the pseudonym equals a credential proof's; `Replayed`;
+  `Kind` at a guard naming no device kernel; `Size` for a device proof
+  sent as a credential proof; `Binding` for a credential proof sent as a
+  device proof; `Proof` for another nullifier and a byte cut); the check
+  order with 43 admitted (`Format` for a retired format, a 1.4 MiB body
+  past format and size under 43).
+- The testkit: a device kernel's gas not held to JAM's cap (agent on
+  both hosts, the model, the JAM builder); the attest test installs the
+  credential actor first.
+- The demo's e2e (`just test-gateway-ssh`): after the credential sign-in,
+  "Sign in with my device's kernel" through s4's facility at `a8a2d9a`,
+  relayed and run; the chrome names the device proof. s4: the request's
+  kernel parsed and capped, the enrollment kept with it, and
+  `a_sign_in_by_a_device_kernel_proves_its_run` (a fixture of the device
+  actor's kernel; `verify_device` against its program, and no credential
+  proof).
+- PG2's script dry run (`PG2_LOCAL=1`, 2 rounds, x86, the release
+  example, `vos-phone` on 20 threads): install 43–45 ms, prove 237–241
+  ms, verify 20–37 ms, 980–984 KB, peak 589 MiB; both rounds `Ran` at
+  the node's ingress in 19 ms, one pseudonym.
+
+**Where the plan was off:**
+- **The program's log sizes need a reference run** (7.15's note), and a
+  node has no member's witness. Rather than sizes declared in the schema
+  (which would move the agent's codec and every guarded actor's
+  section), an auth kernel's reference is auth's public reference
+  statement: the device library already fixes auth's argument layout to
+  build a kernel's input, so the node can build one too. A kernel that
+  reads its arguments otherwise does not run the reference and its
+  install fails; any other device statement waits for its own reference.
+- **The program id** is BLAKE2b-256 over the format, the chips, the log
+  sizes and the root, not a circuit hash: no circuit reads it, and the
+  transcript mixes each input.
+- **PG2's acceptance** needs a node beside the phone within a call's 120
+  s: the host writes each round's witness input and waits for the proof,
+  rather than the phone building calls itself (it holds no path or node
+  clock in the bench).
+- **The cross-repository pins** point at commits on no remote (VOS
+  `a743254c` from s4, s4 `a8a2d9a` from the demo); they were resolved
+  here by git's `insteadOf` to the local clones, and resolve elsewhere
+  once both branches are pushed.
+
+**Review (Opus):** no soundness break (the binding, the io-hash from the
+request's words, the refusals, the program id's inputs, the decode, the
+node kernels and formats 35, 41 and 44 untouched). Folded: H1 (the
+program computed before the cheap checks, per request, with no
+single-flight: now after format, size, expiry, guard and kind, once per
+kernel through an async once-cell, after restarts too); M1 (the whole
+prover cached: the verifier alone, `device::Verifier`); M2 (runs traced
+to 50M gas: about a million, `device::GAS`, and the timing a hostile
+kernel steers said as a few bits); M3 (device statements skipped the
+words' `< p` check: refused `Proof`); M4 (a kernel not yet held, or an
+executor gone, answered `Kind`: `Unavailable`, not kept); L1 (the
+program's kernel re-checked on the binding's snapshot); L2 (the blob read
+on an executor); L3 (a guard naming a method not of the `Device` kind
+refused at ingress and at the install); L4 (an unreadable schema failed
+nothing: fails the install of a package with device kernels); L5 (a
+verifier's panic counted a refused proof); L7 (what the library leaves
+unzeroized, in `pvm/device/SECURITY.md`); L8 (the docs); nits: step
+narrative out of the comments, `pg2.sh`'s serial from `PG2_SERIAL` and
+its cleanup on exit, s4's null kernel field, its once label, the kernel
+named by its hash in the chrome. Not taken: L6 (an M31 value at or above
+`p` in a decoded proof: format 44's decoder has the same gap; both for
+7.23's fuzz targets of the 43 and 44 verifiers); L9 (the pins: pushes are
+the owner's); s4's per-sign-in program computation (about 50 ms on x86)
+and its 1 GiB allowance for credential proofs (a check, not a
+reservation).
+
+**Left:**
+- **PG2's acceptance on the phone** (a later session): `tools/phone/
+  build.sh`, then `spikes/s7-device/scripts/pg2.sh
+  target/phone/vos-phone-timing spikes/s7-device/runs/phone-pg2.txt 3`
+  with the gate phone on adb; then PG2's two passes a day apart (P7, P8).
+- The pushes: VOS `s7/7.20` before s4 `vos-7.20` resolves elsewhere, then
+  s4 before the demo's lock does; s4's `just ci` runs at its push.
+- Another device statement than auth's at ingress needs its own reference
+  run; the device program cache is not evicted on an upgrade (a few KB a
+  kernel).
+
+**Commits:** VOS `e582bbfb` device programs, `43f67edf` vos-device,
+`c56d3011` the device actor's login and JAM's cap, `6ac865b6` ingress,
+`5f22eead` PG2's run, `22cd0b91` the demo, `ca03a858` the docs,
+`a743254c` the review's folds, `f020ecec` the demo's pin; this record.
+s4 `08433f1`, `a8a2d9a`.
+
 ## Step 7.10b: the node API and the gateway
 
 Branch `s7/7.10b`, from vos-core `ad1ff380`. The brief, `node-api.md`,
