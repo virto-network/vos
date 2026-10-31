@@ -109,7 +109,7 @@ impl Export {
             };
             let mut last = None;
             let mut done = true;
-            for row in self.snapshot.range(partition, (start, Bound::Unbounded)) {
+            for row in self.snapshot.range(partition, (start, prefix_end(&prefix))) {
                 let (key, value) = row.into_inner()?;
                 if !key.starts_with(&prefix) {
                     break;
@@ -287,7 +287,7 @@ impl Snapshot {
             .snapshot
             .range(
                 self.store.partition(&prefix[AGENT_KEY_PREFIX..]),
-                (start, Bound::Unbounded),
+                (start, prefix_end(&prefix)),
             )
             .map(|row| row.into_inner())
             .take_while(move |row| {
@@ -320,6 +320,22 @@ impl Snapshot {
     fn row(&self, agent: AgentId, row: NodeRow) -> Result<Option<fjall::Slice>> {
         self.snapshot.get(self.store.system(), node_row(agent, row))
     }
+}
+
+/// Where the keys starting with `prefix` end: the first key past them all,
+/// none when every byte of it is the highest. A range bounded there stops
+/// at the prefix's last row; one bounded only by a filter on the prefix
+/// goes on to the next row the store holds past it, through every row
+/// deleted on the way, which a compaction has yet to drop.
+pub(super) fn prefix_end(prefix: &[u8]) -> Bound<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.pop() {
+        if last < u8::MAX {
+            end.push(last + 1);
+            return Bound::Excluded(end);
+        }
+    }
+    Bound::Unbounded
 }
 
 /// Applied rows, with unapplied writes over them, in key order.
