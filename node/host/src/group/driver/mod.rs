@@ -444,6 +444,7 @@ impl Driver {
                 }
             }
         }
+        self.inner.campaigns.forget(self.shared.agent);
         // A caller who sees the group gone sees it lead nothing, and a
         // proposal still queued hears so.
         self.inner.led_here(self.shared.agent, false);
