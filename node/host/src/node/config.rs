@@ -212,7 +212,7 @@ impl Config {
             peers: Peers::Quic,
             election_timeout_ms: (1500, 3000),
             heartbeat_ms: 500,
-            campaigns: 512,
+            campaigns: 4096,
             writer_stall: None,
             answered: Duration::from_secs(30),
             resend_round: Duration::from_secs(1),

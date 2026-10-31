@@ -144,13 +144,24 @@ impl Driver {
     /// as a fresh append would.
     pub(super) async fn start(inner: Arc<Inner>, shared: Arc<Shared>) -> Result<Self, String> {
         let agent = shared.agent;
-        let store = &inner.store;
         let failed = |error: fjall::Error| error.to_string();
-        let rows = store.raft(agent).map_err(failed)?;
-        inner.storage.recovered(agent, rows.applied);
-        let cut = raft::recovery_cut(store, &inner.blobs, agent).map_err(failed)?;
-        inner.storage.commit(cut.changes).await?;
-        for epoch in store.stale_epochs(agent).map_err(failed)? {
+        // The store's reads run on an executor: a node starting many
+        // groups at once keeps its runtime for those already started.
+        let (store, blobs) = (inner.store.clone(), inner.blobs.clone());
+        let (applied, cut, stale) = inner
+            .offload(move || {
+                let applied = store.raft(agent)?.applied;
+                let cut = raft::recovery_cut(&store, &blobs, agent)?;
+                Ok((applied, cut, store.stale_epochs(agent)?))
+            })
+            .await
+            .ok_or("the executors stopped")?
+            .map_err(failed)?;
+        inner.storage.recovered(agent, applied);
+        if !cut.changes.is_empty() {
+            inner.storage.commit(cut.changes).await?;
+        }
+        for epoch in stale {
             inner
                 .storage
                 .commit(vec![Change::DropEpoch {
@@ -160,7 +171,12 @@ impl Driver {
                 }])
                 .await?;
         }
-        let rows = store.raft(agent).map_err(failed)?;
+        let store = inner.store.clone();
+        let rows = inner
+            .offload(move || store.raft(agent))
+            .await
+            .ok_or("the executors stopped")?
+            .map_err(failed)?;
         let last_index = rows
             .log
             .last()
