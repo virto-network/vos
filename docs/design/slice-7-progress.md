@@ -2605,7 +2605,10 @@ in the pinned branch (pinning names cores the affinity mask allows).
 
 **Gates** [measured; 12 GiB scope, `nice -n 10`, 6 jobs]: the device suite
 30 of 30, `vos-device`'s 10, the circuit suite's degree audits; `just
-check` GATE_CHECK; `just test-proof` GATE_PROOF.
+check` green at `8a93e17f` (1,652 passed in 125 suites; an earlier run
+hit the flaky checker test above), `just test-proof` green at `8a93e17f`
+(582 passed in 50 suites, `fixtures::` and `constants::` among them: format
+35 byte for byte).
 
 **Commits:** `1f983e6b` lever 1's note (for Fable), `82bc4842` lever 2,
 `2830989a` lever 3, `c2113254` lever 4, `cd2f219f` the note revised,
