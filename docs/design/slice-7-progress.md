@@ -5523,3 +5523,31 @@ byte for byte).
 hashing in place, `1e889a2c` the lean kernel and its gate, `0055dda4`
 a cell's `h`, `ee101b69` the bench, P6's script and `proving.md`,
 `51f920b0` the review's folds; this record.
+
+**Session P6** (2026-10-31, 12:10–12:30, `p6.sh`, the Fairphone 6 at
+99%, 31–32 °C, governor `walt`; 3 rounds of 7 interleaved cells, 5
+proofs each after a warm-up; every proof verified on the phone). The
+median of the rounds' medians and the 95th percentile of the 15 proofs:
+
+| cell | rounds' p50 (ms) | p50 | p95 | peak | bytes |
+|---|---|---|---|---|---|
+| base (P5's kernel, 2,860 steps) | 986 / 952 / 930 | 952 | 994 | 686 MiB | 984 KB |
+| **lean (1,722 steps)** | 754 / 740 / 741 | **741** | **818** | 636 MiB | 986 KB |
+| lean, 8 cores pinned | 926 / 976 / 969 | 969 | 1,015 | 605 MiB | 980 KB |
+| lean, big + 2 little pinned | 1,019 / 1,427 / 1,435 | 1,427 | 1,448 | 610 MiB | 977 KB |
+| lean, mimalloc never purging | 739 / 733 / 730 | 733 | 741 | 616 MiB | 977 KB |
+| lean, `target-cpu=cortex-a720` | illegal instruction (exit 132) | — | — | — | — |
+| lean at `h = 256` (proposal) | 626 / 607 / 601 | 607 | 640 | 555 MiB | 981 KB |
+
+Three cold `vos-phone kernel` runs of the lean kernel (a fresh process,
+install then prove): 843, 834 and 829 ms to prove, 196–279 ms to
+install. The lean kernel is ×0.78 of the base on the phone (x86's
+×0.85); PG2's time holds with 26% to spare at the median and 18% at the
+95th percentile. Little cores only slow the proof: `Threads::Auto`'s four
+big cores stay. The a720 build is refused by the phone's cores (a feature
+the target implies that the SoC lacks), so the generic aarch64 build
+stays. Never purging is within noise at the median and tightens the tail.
+`h = 256` would add ×0.82 but changes format 43 (its ZK margin, Fable,
+a new number): not taken without the owner. The activity manager trimmed
+two empty cached apps during the session; lmkd killed nothing. The log is
+`spikes/s7-device/runs/phone-p6.txt`.
