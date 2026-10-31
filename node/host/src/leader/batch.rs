@@ -310,6 +310,7 @@ impl Leader {
             Err(fault) if self.ended_by(&fault) => return false,
             Err(fault) => self.retry(pending, fault).await,
         }
+        self.ended = Some(Instant::now());
         true
     }
 

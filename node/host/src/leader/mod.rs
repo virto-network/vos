@@ -128,7 +128,7 @@ struct Leader {
     /// writes: a second time, the batch is shortened as a failing one is.
     skipped: bool,
     sweeps: Sweeps,
-    /// When the last batch ended.
+    /// When the last batch ended: landed, or made no batch.
     ended: Option<Instant>,
     /// When it last told senders whose messages the queue dropped full
     /// that they are behind.
@@ -248,7 +248,10 @@ impl Leader {
                         self.inner.stats.between.took(ended.elapsed());
                     }
                     let ran = self.run(pending).await;
-                    self.ended = Some(Instant::now());
+                    // A batch launched ends as it lands.
+                    if self.in_flight.is_empty() {
+                        self.ended = Some(Instant::now());
+                    }
                     if !ran {
                         return false;
                     }
