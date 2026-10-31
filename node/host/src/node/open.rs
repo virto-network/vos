@@ -163,6 +163,12 @@ impl Node {
             unrecorded: crate::prover::Unrecorded::default(),
             backlog: Mutex::new(None),
         });
+        let waking = Arc::downgrade(&inner);
+        inner.campaigns.waking(Box::new(move |agent| {
+            waking
+                .upgrade()
+                .is_some_and(|inner| inner.to_group(agent, crate::group::Local::Wake))
+        }));
         inner.resume(records, placements);
         let liveness = arrivals.map(|arrivals| start_liveness(&inner, arrivals));
         inner.spawn(super::directory::resend_records(Arc::clone(&inner)));

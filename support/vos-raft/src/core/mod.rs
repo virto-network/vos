@@ -514,12 +514,27 @@ impl<N: NodeId> Core<N> {
             && !self.short_of_floor()
     }
 
-    /// Put off a campaign due at `now` by a fresh election timeout: a host
-    /// that bounds the campaigns its groups run at once defers the others.
-    pub fn defer_campaign(&mut self, now: u64) {
+    /// Put off a campaign due at `now` until `until`: a host that bounds
+    /// the campaigns its groups run at once defers the others, and starts
+    /// each again as one ends ([`Self::campaign_now`]).
+    pub fn defer_campaign(&mut self, now: u64, until: u64) {
         self.now = self.now.max(now);
         if self.role != Role::Leader {
-            self.reset_election_timer();
+            self.election_deadline = until.max(self.now);
+        }
+    }
+
+    /// A campaign put off may start at `now`: its election deadline comes
+    /// due then, unless it heard a leader since within the election
+    /// timeout's lower end.
+    pub fn campaign_now(&mut self, now: u64) {
+        self.now = self.now.max(now);
+        let low = self.cfg.election_timeout_ms.0;
+        let heard = self
+            .last_heard_leader
+            .is_some_and(|heard| heard + low > self.now);
+        if self.role != Role::Leader && !heard {
+            self.election_deadline = self.election_deadline.min(self.now);
         }
     }
 

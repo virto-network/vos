@@ -102,6 +102,8 @@ struct Driver {
     announced: Option<Order>,
     /// The node's campaign this replica holds while it campaigns.
     campaign: Option<Campaign>,
+    /// It waits its turn for one.
+    waiting: bool,
 }
 
 /// Where the core's answers go, by the token each request took.
@@ -233,6 +235,7 @@ impl Driver {
             compact_due: false,
             announced: None,
             campaign: None,
+            waiting: false,
             inner,
             shared,
         })
@@ -359,18 +362,32 @@ impl Driver {
                     self.vouch(now);
                 }
                 // A campaign starts, or goes another round, only with one
-                // of the node's campaigns: past their bound it is put off by
-                // a fresh election timeout, so a node that wakes many
-                // leaderless groups at once elects them in turn rather
-                // than have them all time out together. A round that did
-                // not settle gives its campaign back and waits a timeout,
+                // of the node's campaigns: past their bound it waits its
+                // turn, so a node that wakes many leaderless groups at once
+                // elects them in turn rather than have them all time out
+                // together, each woken as one ends. A round that did not
+                // settle gives its campaign back and waits its turn again,
                 // so groups that keep losing do not keep the others out.
-                if self.core.campaign_due(now) {
-                    if self.campaign.take().is_none() {
-                        self.campaign = self.inner.campaigns.take();
-                    }
-                    if self.campaign.is_none() {
-                        self.core.defer_campaign(now);
+                let due = self.core.campaign_due(now);
+                if due {
+                    self.campaign = None;
+                }
+                if (due || self.waiting) && self.campaign.is_none() {
+                    let high = self.inner.settings.election_timeout_ms.1;
+                    match self.inner.campaigns.take(self.shared.agent) {
+                        Some(campaign) => {
+                            self.campaign = Some(campaign);
+                            if std::mem::take(&mut self.waiting) {
+                                self.core.campaign_now(now);
+                            }
+                        }
+                        // Woken in turn, or failing that after ten election
+                        // timeouts.
+                        None => {
+                            self.waiting = true;
+                            self.core
+                                .defer_campaign(now, now + QUIET_ROUNDS as u64 * high);
+                        }
                     }
                 }
                 self.core.tick(now);
