@@ -5551,3 +5551,96 @@ stays. Never purging is within noise at the median and tightens the tail.
 a new number): not taken without the owner. The activity manager trimmed
 two empty cached apps during the session; lmkd killed nothing. The log is
 `spikes/s7-device/runs/phone-p6.txt`.
+
+## Step 7.17d: the device format at `h = 256` (format 45)
+
+Branch `s7/7.17d`, from vos-core `84c75f80`. P6 measured the lean kernel
+at `h = 256` ×0.82 in time and ×0.87 in peak on the phone; the owner chose
+to take it (S62), with the masking's argument redone and a new number.
+
+**The argument first** (`9c34e864`, `proving.md` §5, *How large `h` must
+be*; for Fable's check): a masked column reveals at most `4|O| + q(|O| +
+1)` M31 functionals of its randomizer (four a QM31 out-of-domain sample, one
+a decommitted query, `|O|` composition reads a query), nothing else (FRI
+under `R`, the sums under R2, the leaves salted); full rank, which R1
+checks on every transcript, makes them uniform and independent of the
+witness, so `h` must be at least the count; twice the count only makes a
+retry rarer, and a retry is a public event. On the device shape at 47
+queries every chip's widest `|O|` is 2 (main, interaction and blinding
+columns), so at most **149 rows of `h = 256`, 107 spare (×1.72)**, at every
+log size, the smallest chips' 2^10 floor (`N/4 = h`) among them.
+
+**Built:**
+- **Format 45** (`fb78ba44`): 43's parameters with `log_mask_rows` 8,
+  every chip's floor 2^10; the bits do not move (110 / 62.82, `h` in
+  neither the parameters nor the reference). **43 is retired**, as 42 was
+  for 44: a number names one set of parameters, proofs were made under
+  43, and nothing pinned it (ingress, `vos-device`, the phone and the
+  program id take `device::FORMAT`); keeping both admitted would give a
+  kernel two program ids for nothing. 45 is the next number after 44;
+  41 stays the node's reserved segment format, 38 an unused gap (the
+  round trip now refuses 38, 41 and 46).
+- The program id moves by itself (it hashes the number and `log h`); no
+  id is pinned in the repository. The reference shape and every node
+  format are unchanged; `blobs.lock` as before (`just check-blobs`).
+- `masked::reveals` and `device_reveals` (`1839d5e6`): the count above per
+  component; `mask_rows` built on it (still twice, capped at the format's
+  `h`, which must cover the count).
+- Gates: every device chip reveals 149 of 256 at 2^10 and 2^17
+  (`every_device_chip_reveals_at_most_its_h`), floors 2^10; the auth
+  program's proofs within 149; the device-parameter gate at (4, 47, `h =
+  256`); a leakage gate at format 45 itself.
+- `vos-phone`'s default `h` takes the format's rule (a cell without `h` at
+  47 queries is 45's); `x86-margin.sh h` (`07731a2c`).
+- The s4 side needs no change: it names `vos_device::DEVICE_FORMAT`; four
+  of its comments still say 43.
+
+**The auth program at 45** [measured]: log sizes `[11, 10, 14, 11, 13,
+12, 10, 10, 13, 10, 11, 10, 10, 10, 10, 10, 10, 10, 10]` (eleven chips
+2^11 → 2^10), 15.9M → 11.7M cells, proofs 979–986 kB.
+
+**Leakage at the new `h`** [measured, `heavy-gates`, medium N = 64 a
+witness]: format 45 on the test kernel (every chip at its 2^10 floor),
+128 proofs, **128 attempts** (R1 passed each first time), at most 149 rows
+revealed; witness indistinguishability over 121,099 hypotheses and
+uniformity over 121,098, none refused (smallest p 7.3e-6 and 4.0e-7
+against 2.1e-9); slice 6's other device gates (hidden state, freshness,
+the sums' control, the shape) green.
+
+**x86** [measured, `runs/x86-h256.jsonl`; seeded build, the lean kernel
+`0f10b485…`, 4 P-cores (1, 3, 6, 8), 5 reps after a warm-up, three
+interleaved rounds; **load 16–24** (other agents), so the times are noisy
+and the third round's two cells both slow]:
+
+| cell | rounds' p50 (ms) | p95 | peak | bytes | attempts |
+|---|---|---|---|---|---|
+| `h = 512` (43's) | 596 / 625 / 773 | 629–925 | 502–506 MiB | 974,750 | 1 |
+| **`h = 256` (45)** | 489 / 540 / 829 | 543–936 | 418–425 MiB | 983,600 | 1 |
+
+Rounds 1 and 2: ×0.82 and ×0.86 in time (7.17c quiet ×0.81, P6 ×0.82);
+peak ×0.83 every round; bytes +0.9%. Each cell's proofs are one (seeded).
+
+**Review (Opus):** the argument holds against the code (the revealed
+rows, nothing uncounted, independent `r` a column, the retry's public
+condition); nothing high. Folded (`af3fdb0f`): M1, 43 still named in
+`pvm/proof/SECURITY.md`'s table and `node/SECURITY.md`; M2, `mask_rows`'
+doc (a cap below the count makes R1 refuse every attempt; the phone's
+note); M3, a trailing line; L1–L3, 43 in `identity-and-authority.md` and
+the chips' notes, `proving.md`'s CPU floor and its parameter table; the
+round trip's 41 and 46. Not taken: refusing a sub-count `h` in
+`mask_rows` (the R1-refusal tests take that path on purpose), the tests'
+149 derived (it is the pinned count, asserted where the rule is).
+
+**Gates** [measured; 12 GiB scope, `nice -n 10`, 8 jobs, other agents
+beside]: `just check` green at `af3fdb0f` (exit 0, 1,671 passed in 119
+suites, 31 blobs `blobs.lock`'s, none moved); `just test-proof` green at
+`af3fdb0f` (exit 0, 585 passed in 52 suites, `fixtures::` and
+`constants::` among them: formats 35, 41 and 44 and every node kernel
+byte for byte; the device leakage gates at medium N).
+
+**Commits:** `9c34e864` the argument, `1839d5e6` the reveals, `fb78ba44`
+format 45, `07731a2c` the bench, `af3fdb0f` the review's folds; this
+record.
+
+**Left:** a phone session at 45 (P6's `h256` cell is its estimate: about
+0.61 s, peak 555 MiB); Fable's check of the argument; s4's comments.
