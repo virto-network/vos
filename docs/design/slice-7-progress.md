@@ -3005,6 +3005,17 @@ at `f020ecec` (the gateway's 10, the SSH port's 3, the demo's 2); s4's
 `vos` step (fmt, clippy with `ffi`, tests: 7 unit, 4 integration) green
 at `a8a2d9a`; s4's full `just ci` not run (its pre-push hook).
 
+**PG2's acceptance on the phone** (2026-10-31, `pg2.sh`, 3 rounds, the
+Fairphone 6 at 100% and 27 °C, governor `walt`): each round the phone
+proved the sign-in's device kernel (one proof, automatic threads: 986.8,
+983.2 and 980.4 ms; install 235–315 ms; peak 604–612 MiB; 977–984 KB;
+verified there) and the node's ingress ran `login` as the member's
+pseudonym in 21–25 ms, the same pseudonym every round; one program id
+(`e75f406d…`) and one set of log sizes. The log is
+`spikes/s7-device/runs/phone-pg2.txt`. PG2's budgets and its acceptance
+at ingress are met once, with 1–2% to spare on time; P7 and P8, a day
+apart, remain (S60: the cheap levers first).
+
 ## Step 7.10b: the node API and the gateway
 
 Branch `s7/7.10b`, from vos-core `ad1ff380`. The brief, `node-api.md`,

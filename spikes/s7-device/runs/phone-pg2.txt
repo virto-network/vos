@@ -1,0 +1,66 @@
+with-env { CARGO_INCREMENTAL: "0" } { cd agent/programs; cargo build --release -p vos-agent --target ../../pvm/guest/riscv64em-vos.json }
+    Finished `release` profile [optimized] target(s) in 0.08s
+with-env { CARGO_INCREMENTAL: "0" } { cd agent/programs; cargo build --release -p vos-credentials --target ../../pvm/guest/riscv64em-vos.json }
+    Finished `release` profile [optimized] target(s) in 0.06s
+with-env { CARGO_INCREMENTAL: "0" } { cd agent/test-actors; cargo build --release --target ../../pvm/guest/riscv64em-vos.json }
+    Finished `release` profile [optimized] target(s) in 0.12s
+   Compiling vos-pvm-codec v0.1.0 (/home/daniel/src/virto/vos/.worktrees/s7-7.20/pvm/codec)
+   Compiling vos-pvm-recair-air v0.1.0 (/home/daniel/src/virto/vos/.worktrees/s7-7.20/pvm/proof/recair-air)
+   Compiling vos-pvm v0.1.0 (/home/daniel/src/virto/vos/.worktrees/s7-7.20/pvm/runtime)
+   Compiling vos-tree v0.1.0 (/home/daniel/src/virto/vos/.worktrees/s7-7.20/agent/tree)
+   Compiling vos-pvm-final-verifier v0.1.0 (/home/daniel/src/virto/vos/.worktrees/s7-7.20/pvm/proof/final-verifier)
+   Compiling vos-wire v0.1.0 (/home/daniel/src/virto/vos/.worktrees/s7-7.20/agent/wire)
+   Compiling vos-statement v0.1.0 (/home/daniel/src/virto/vos/.worktrees/s7-7.20/pvm/proof/statement)
+   Compiling vos-venue v0.1.0 (/home/daniel/src/virto/vos/.worktrees/s7-7.20/node/venue)
+   Compiling vos-api v0.1.0 (/home/daniel/src/virto/vos/.worktrees/s7-7.20/node/api)
+   Compiling vos-pvm-proof v0.1.0 (/home/daniel/src/virto/vos/.worktrees/s7-7.20/pvm/proof)
+   Compiling vos-pvm-compiler v0.1.0 (/home/daniel/src/virto/vos/.worktrees/s7-7.20/pvm/compiler)
+   Compiling vos-http v0.1.0 (/home/daniel/src/virto/vos/.worktrees/s7-7.20/node/http)
+   Compiling vos-node-prover v0.1.0 (/home/daniel/src/virto/vos/.worktrees/s7-7.20/node/prover)
+   Compiling vos-statement-service v0.1.0 (/home/daniel/src/virto/vos/.worktrees/s7-7.20/pvm/proof/statement/service)
+   Compiling vos-testkit v0.1.0 (/home/daniel/src/virto/vos/.worktrees/s7-7.20/agent/testkit)
+   Compiling vos-jam v0.1.0 (/home/daniel/src/virto/vos/.worktrees/s7-7.20/node/jam)
+   Compiling vos-gateway v0.1.0 (/home/daniel/src/virto/vos/.worktrees/s7-7.20/node/gateway)
+   Compiling vos-pvm-recair v0.1.0 (/home/daniel/src/virto/vos/.worktrees/s7-7.20/pvm/proof/recair)
+   Compiling vos-node v0.1.0 (/home/daniel/src/virto/vos/.worktrees/s7-7.20/node/host)
+   Compiling vos-device v0.1.0 (/home/daniel/src/virto/vos/.worktrees/s7-7.20/pvm/device)
+   Compiling vos-jam-dev v0.1.0 (/home/daniel/src/virto/vos/.worktrees/s7-7.20/tools/jam-dev)
+   Compiling vos-checker v0.1.0 (/home/daniel/src/virto/vos/.worktrees/s7-7.20/node/checker)
+    Finished `release` profile [optimized] target(s) in 5m 14s
+Fairphone 6
+Fairphone/FP6/FP6:16/FP6.QREL.16.115.0/WS1R:user/release-keys
+target/phone/vos-phone-timing: 1 file pushed, 0 skipped. 134.7 MB/s (13441336 bytes in 0.095s)
+/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/pg2.lagnpb/auth.kernel: 1 file pushed, 0 skipped. 144.6 MB/s (6973 bytes in 0.000s)
+b3e35660c77a9b70c39015237a010f2d1cdd085e4465b9c09dca63632f0995ee  vos-phone
+20101c67f5dbda433989d96c2d09afd296f4db533eb7788b925411c54fc9ba0c  auth.kernel
+== round 1
+Sat Oct 31 09:29:43 AM CET 2026
+  level: 100
+  temperature: 270
+MemAvailable:    4785908 kB
+/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/pg2.lagnpb/1.input: 1 file pushed, 0 skipped. 46.6 MB/s (1189 bytes in 0.000s)
+{"kind":"kernel","threads":4,"program":"e75f406d7349555029c69bd296dd0e130c2c4264e253e492f552cf1e69c5a8a8","log_sizes":[12, 11, 14, 11, 13, 13, 11, 11, 13, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11],"install_ms":314.5,"prove_ms":986.8,"verify_ms":84.84,"proof_bytes":977215,"io":"c476d6208b6e6e03d89d1d49fb1b937fbc2b342a25de3f0fe86afb4a9423d517","verified":true,"peak_rss_mib":611.9}
+/data/local/tmp/s7-pg2/1.proof: 1 file pulled, 0 skipped. 37.8 MB/s (977215 bytes in 0.025s)
+== round 2
+Sat Oct 31 09:29:44 AM CET 2026
+  level: 100
+  temperature: 270
+MemAvailable:    4798692 kB
+/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/pg2.lagnpb/2.input: 1 file pushed, 0 skipped. 32.4 MB/s (1189 bytes in 0.000s)
+{"kind":"kernel","threads":4,"program":"e75f406d7349555029c69bd296dd0e130c2c4264e253e492f552cf1e69c5a8a8","log_sizes":[12, 11, 14, 11, 13, 13, 11, 11, 13, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11],"install_ms":234.6,"prove_ms":983.2,"verify_ms":69.88,"proof_bytes":984001,"io":"896ec452cc89423bd4b6d87147f298115939b847e671e87fd962a104d79d0706","verified":true,"peak_rss_mib":608.8}
+/data/local/tmp/s7-pg2/2.proof: 1 file pulled, 0 skipped. 36.1 MB/s (984001 bytes in 0.026s)
+== round 3
+Sat Oct 31 09:29:46 AM CET 2026
+  level: 100
+  temperature: 270
+MemAvailable:    4809160 kB
+/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/pg2.lagnpb/3.input: 1 file pushed, 0 skipped. 25.6 MB/s (1189 bytes in 0.000s)
+{"kind":"kernel","threads":4,"program":"e75f406d7349555029c69bd296dd0e130c2c4264e253e492f552cf1e69c5a8a8","log_sizes":[12, 11, 14, 11, 13, 13, 11, 11, 13, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11],"install_ms":266.6,"prove_ms":980.4,"verify_ms":22.42,"proof_bytes":977032,"io":"47a7916f2632cd4c7f7bfe3625b2673bd81fe14a70069e55d26a0e44d626e132","verified":true,"peak_rss_mib":604.3}
+/data/local/tmp/s7-pg2/3.proof: 1 file pulled, 0 skipped. 40.0 MB/s (977032 bytes in 0.023s)
+== the node's answers
+{"kind":"round","round":1,"format":43,"proof_bytes":977215,"answer_ms":21.5,"answer":"Ran(Done([1, 202, 206, 89, 74, 122, 202, 223, 2, 120, 231, 65, 83, 227, 177, 201, 12, 175, 121, 19, 72, 182, 29, 154, 46, 241, 58, 83, 84, 195, 253, 197, 93]))","ran":true}
+{"kind":"round","round":2,"format":43,"proof_bytes":984001,"answer_ms":25.1,"answer":"Ran(Done([1, 202, 206, 89, 74, 122, 202, 223, 2, 120, 231, 65, 83, 227, 177, 201, 12, 175, 121, 19, 72, 182, 29, 154, 46, 241, 58, 83, 84, 195, 253, 197, 93]))","ran":true}
+{"kind":"round","round":3,"format":43,"proof_bytes":977032,"answer_ms":23.1,"answer":"Ran(Done([1, 202, 206, 89, 74, 122, 202, 223, 2, 120, 231, 65, 83, 227, 177, 201, 12, 175, 121, 19, 72, 182, 29, 154, 46, 241, 58, 83, 84, 195, 253, 197, 93]))","ran":true}
+{"kind":"done","rounds":3,"ran":3}
+Sat Oct 31 09:29:49 AM CET 2026
+exit=0
