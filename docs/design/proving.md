@@ -682,6 +682,80 @@ last for decades.**
   6. parameters pinned in the format;
   7. every carrier audited (A.5);
   8. the cost measured (§3.5).
+- **How large `h` must be** [argued; counted on the device shape, 7.17d]:
+  - **What a column reveals.** A masked column is `f' = f + v_H·r`, `r`
+    uniform over the `h` coefficients of the size-`h` circle FFT basis,
+    one `r` a column, drawn independently. Every published value that
+    depends on `r` is `f'` at a point off `H` (where `v_H ≠ 0`), so an
+    M31-affine function `f(p) + L_p(r)`:
+    - each out-of-domain sample, a QM31 value: **4** M31 functionals, for
+      each of the column's `|O|` offsets;
+    - each decommitted query: **1**, `f'` at the query lifted to the
+      column's domain;
+    - the composition's opening at each query: **`|O|`**, `f'` at the
+      query lifted to the composition's level and shifted by each offset.
+      The composition sits one level above the masked columns, so these
+      reads are other points than the decommitted one. Only the
+      composition's value, a function of every column's reads, is
+      published, so counting each column's own is an over-count.
+    - Nothing else: the DEEP quotients at the queries and the
+      composition's sample at `π(z)` are computed from these; FRI's
+      siblings, inner layers and last layer are masked by `R` (R3, an
+      `R` uniform in the FRI code); the claimed sums by R2; an unopened
+      leaf's hash by its salt; the preprocessed columns are public.
+  - **The count**, per column of offsets `O`, at `q` queries:
+    `4|O| + q(|O| + 1)` rows, fewer when points coincide (two queries
+    lifted to one point of a small component's domain, a read on a
+    decommitted point), never more. R1 builds exactly these rows from
+    the transcript (`rank::revealed_functionals`).
+  - **The condition.** If a column's rows are linearly independent over
+    M31, the map `r ↦ (L_p(r))_p` is onto, so for uniform `r` the
+    revealed values are uniform and independent of `f`; the columns'
+    `r` are independent, so the joint view is too. With R2, R3 and the
+    salts, the simulator samples the transcript from the public values
+    alone. Independence needs `rows ≤ h`, so **`h` must be at least the
+    largest column's count**, and R1 checks independence itself on every
+    transcript; `h ≤ N/4` keeps (c)'s composition bound.
+  - **The margin is not the argument.** `h` at twice the count (Plonky3's
+    hiding PCS takes `2(q + 4·points)` for a scheme with no check of its
+    own) makes a rank deficiency rarer; here R1 is checked exactly and a
+    deficient transcript is drawn again with fresh masks. Whether R1
+    passes is a function of the format, the shape, `z` and the query
+    positions: Fiat–Shamir outputs on salted, masked commitments, which
+    in the random-oracle model are uniform and independent of the
+    witness. Conditioning on it, and the count of attempts, reveal
+    nothing. The margin buys only fewer retries, which cost time
+    (`MAX_ATTEMPTS`, 8, then the prover fails without a proof).
+  - **The device shape at 47 queries** (format 43's parameters; the auth
+    kernel's program at `h = 256`; each chip's widest offsets read off the
+    built device set's mask points): every chip reads its previous row,
+    the logup running sum's `[-1, 0]` at least, and none a third row, so
+    the widest `|O|` is 2 in every chip and each of its masked columns,
+    main, interaction and blinding, reveals at most `4·2 + 47·3 = 149`
+    rows:
+
+    | chips | log size at `h = 256` (at 512) | `|O|` | rows at most | `h` | spare | `h / rows` |
+    |---|---|---|---|---|---|---|
+    | MEMORY | 14 (14) | 2 | 8 + 47 + 94 = 149 | 256 | 107 | 1.72 |
+    | PROGRAM_MEMORY, the data table | 13 (13) | 2 | 149 | 256 | 107 | 1.72 |
+    | REGISTER_MEMORY | 12 (12) | 2 | 149 | 256 | 107 | 1.72 |
+    | CPU, WITNESS_INPUT, the device memory | 11 (11) | 2 | 149 | 256 | 107 | 1.72 |
+    | Poseidon2, the device boundary, DeviceIoChip, JUMP_TABLE, RANGE_MULTIPLICITY_256, BITWISE_LOOKUP, POWER_OF_TWO, BYTE_TO_BITS, MUL, BITWISE, COMPARE, DIVREM | **10** (11) | 2 | 149 | 256 | 107 | 1.72 |
+
+    The count does not depend on the log size: a small chip's points
+    coincide more often, so its transcript's count is at most 149. At
+    the floor, 2^10 rows, `h = N/4` exactly. **`h = 256` meets the
+    condition for every chip, with 107 rows spare (×1.72)**; R1 measured
+    149 on the auth kernel's transcripts at `h = 256` and accepted each at
+    its first attempt (7.17c). A column of one offset would reveal
+    `4 + 2·47 = 98`. The rule's other limits: `h = 512` at 47
+    queries kept ×2 (298); `h = 256` keeps ×2 up to 40 queries, and
+    holds the condition up to 82 (`8 + 3q ≤ 256`).
+  - **What would break it:** more offsets (`|O| = 3`: 200 rows, still
+    under 256; `|O| = 4`: 251; `|O| = 5`: 302, over) or more queries. R1
+    refuses a transcript whose rows pass `h` (`n_rows ≤ h` before the
+    rank), so a shape that broke it would fail to prove, never prove
+    leaky; and `mask_rows` sizes each chip's `h` from its own offsets.
 - **The composition mode:** a test pins that (c) lifts no constraint past
   the blowup. If it did, the prover would re-LDE every column.
 - **On the wrap** (spike 6a): no re-LDE [measured]; the prover ×2.6–2.9
