@@ -27,7 +27,7 @@ use vos_pvm_proof::core::ecall::ECALL_WITNESS_INPUT;
 use vos_pvm_proof::device::{device_chip, device_chips_of_mask};
 use vos_pvm_proof::format::{ChannelKind, Format};
 use vos_pvm_proof::framework_access::AllLookupElements;
-use vos_pvm_proof::kernel::{PERM_RW, trace_device_kernel_to_exit, trace_forged_device_kernel};
+use vos_pvm_proof::kernel::{PERM_RW, trace_forged_kernel, trace_kernel_to_exit};
 use vos_pvm_proof::masked::{DeviceComponents, device_bound_sums, device_public_values};
 use vos_pvm_proof::poseidon2::P2MerkleChannel;
 use vos_pvm_proof::segment::SegmentCursor;
@@ -120,7 +120,7 @@ fn refused_as_unbalanced(
 
 /// [`blob`]'s run on witness 1 with its machine's memory changed first.
 fn forged_run(blob: &[u8], forge: impl FnOnce(&mut vos_pvm_proof::kernel::Memory)) -> SideNote {
-    trace_forged_device_kernel(blob, &witness(1), 10_000, forge)
+    trace_forged_kernel(blob, &witness(1), 10_000, forge)
         .expect("halts")
         .side_note
 }
@@ -251,7 +251,7 @@ fn an_unused_chip_proves_at_its_pinned_size() {
     let kernel = asm.build();
     let program = program_of(&kernel);
     assert_ne!(program.active & 1 << device_chip::MUL, 0);
-    let mut side_note = vos_pvm_proof::kernel::trace_device_kernel(&kernel, &[], 10_000)
+    let mut side_note = vos_pvm_proof::kernel::trace_kernel(&kernel, &[], 10_000)
         .expect("halts")
         .side_note;
     assert!(side_note.steps.iter().all(|step| step.opcode as u8 != 202));
@@ -275,7 +275,7 @@ fn a_run_past_the_programs_shape_is_refused() {
     let kernel = asm.build();
     let format = format();
     let short = |len: usize| {
-        vos_pvm_proof::kernel::trace_device_kernel(&kernel, &vec![7; len], 1_000_000)
+        vos_pvm_proof::kernel::trace_kernel(&kernel, &vec![7; len], 1_000_000)
             .expect("halts")
             .side_note
     };
@@ -329,7 +329,7 @@ fn a_touch_outside_the_regions_is_refused() {
     let kernel = asm.build();
     let program = program_of(&kernel);
     let side_note = || {
-        trace_forged_device_kernel(&kernel, &[], 10_000, |memory| {
+        trace_forged_kernel(&kernel, &[], 10_000, |memory| {
             assert!(memory.set_page_range(0x20, 1, PERM_RW));
         })
         .expect("halts")
@@ -351,7 +351,7 @@ fn a_write_to_a_read_only_page_is_refused() {
     let kernel = asm.build();
     let program = program_of(&kernel);
     let side_note = || {
-        trace_forged_device_kernel(&kernel, &[], 10_000, |memory| {
+        trace_forged_kernel(&kernel, &[], 10_000, |memory| {
             assert!(memory.set_page_range((RO_BASE / 0x1000) as usize, 1, PERM_RW));
         })
         .expect("halts")
@@ -364,10 +364,10 @@ fn a_write_to_a_read_only_page_is_refused() {
 /// kernels, which read none.
 fn program_of(kernel: &[u8]) -> DeviceProgram<<P2 as MerkleChannel>::H> {
     let format = format();
-    let mut reference = vos_pvm_proof::kernel::trace_device_kernel(kernel, &[], 10_000)
+    let mut reference = vos_pvm_proof::kernel::trace_kernel(kernel, &[], 10_000)
         .unwrap_or_else(|_| {
             // A kernel whose honest run faults is shaped by its forged one.
-            trace_forged_device_kernel(kernel, &[], 10_000, |memory| {
+            trace_forged_kernel(kernel, &[], 10_000, |memory| {
                 assert!(memory.set_page_range(0x20, 1, PERM_RW));
                 assert!(memory.set_page_range((RO_BASE / 0x1000) as usize, 1, PERM_RW));
             })
@@ -417,7 +417,7 @@ fn a_trapping_run_is_refused() {
     asm.trap();
     let kernel = asm.build();
     let trapped = || {
-        let (side_note, exit) = trace_device_kernel_to_exit(&kernel, &[], 10_000).expect("runs");
+        let (side_note, exit) = trace_kernel_to_exit(&kernel, &[], 10_000).expect("runs");
         assert_eq!(exit, vos_pvm::ExitReason::Panic);
         side_note
     };

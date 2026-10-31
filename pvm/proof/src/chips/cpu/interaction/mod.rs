@@ -56,48 +56,7 @@ pub(super) fn generate_interaction_trace(
     logup.finalize()
 }
 
-/// The shared chip set's CPU (`CpuP2Chip`): format 35's fractions, then the
-/// Poseidon2 call's three, gated by `IsP2Ecall`, the column after format
-/// 35's.
-pub(super) fn generate_p2_interaction_trace(
-    component_trace: &ComponentTrace,
-    lookup_elements: &AllLookupElements,
-) -> (
-    ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
-    SecureField,
-) {
-    use crate::air_column::AirColumn;
-    use crate::lookups::Poseidon2CallLookupElements;
-    use crate::trace::component::FinalizedColumn;
-
-    let mut logup = LogupTraceBuilder::new(component_trace.log_size());
-    let row = RowTrace::new(component_trace);
-    fractions(&mut logup, &row, lookup_elements);
-    let is_p2: FinalizedColumn<'_> = (&component_trace.original_trace[Column::COLUMNS_NUM]).into();
-    let reg_lookup: &RegisterMemoryLookupElements = lookup_elements.as_ref();
-    for (reg_idx, value) in [(7u32, &row.h_ptr), (8u32, &row.m_ptr)] {
-        let mut tuple: Vec<FinalizedColumn<'_>> = Vec::with_capacity(18);
-        tuple.push(FinalizedColumn::Constant(BaseField::from(reg_idx)));
-        tuple.extend_from_slice(value);
-        tuple.extend_from_slice(&row.timestamp);
-        tuple.push(FinalizedColumn::Constant(BaseField::from(0u32)));
-        logup.add_to_relation_with(
-            reg_lookup,
-            [is_p2.clone()],
-            |[active]| active.into(),
-            &tuple,
-        );
-    }
-    let p2_call: &Poseidon2CallLookupElements = lookup_elements.as_ref();
-    let mut call: Vec<FinalizedColumn<'_>> = Vec::with_capacity(16);
-    call.extend_from_slice(&row.timestamp);
-    call.extend_from_slice(&row.h_ptr[..4]);
-    call.extend_from_slice(&row.m_ptr[..4]);
-    logup.add_to_relation_with(p2_call, [is_p2], |[active]| active.into(), &call);
-    logup.finalize()
-}
-
-/// Format 35's CPU fractions, in the AIR's order.
+/// The CPU's fractions, in the AIR's order.
 fn fractions(
     logup: &mut LogupTraceBuilder,
     row: &RowTrace<'_>,
@@ -116,6 +75,7 @@ fn fractions(
     lookups::arithmetic(logup, row, lookup_elements);
     registers::witness_input(logup, row, lookup_elements);
     next_timestamp(logup, row, lookup_elements);
+    registers::poseidon2_call(logup, row, lookup_elements);
 }
 
 /// The result's bytes, range-checked on every real row.

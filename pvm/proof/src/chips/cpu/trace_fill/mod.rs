@@ -113,6 +113,9 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote, min_log_size: u32) -
     for row in num_steps..num_rows {
         let ts = last_ts + (row - num_steps + 1) as u64;
         trace.fill_columns(row, true, Column::IsPadding);
+        // ShiftZero = 1 − ShiftAmountCompl · ShiftComplInv holds on every
+        // row: the complement is 0 here.
+        trace.fill_columns(row, true, Column::ShiftZero);
         trace.fill_columns(row, ts, Column::Timestamp);
         trace.fill_columns(row, ts + 1, Column::NextTimestamp);
         fill_ts_carry(&mut trace, row, ts);
@@ -166,23 +169,4 @@ fn fill_row(out: &mut Sinks, s: Step) {
     helpers::selectors(out, s, &shift, &host, &accesses, is_truncated);
     helpers::residual(out, s, &shift, &div, &counts);
     host_call::disposition(out, s);
-}
-
-/// The shared chip set's `IsP2Ecall` column at `log_size` rows, a row a
-/// step: 1 on a served Poseidon2 call (`PvmStep::served_ecall`), 0 on every
-/// other row and the padding.
-pub(super) fn poseidon2_selector(
-    side_note: &SideNote,
-    log_size: u32,
-) -> stwo::prover::backend::simd::column::BaseColumn {
-    let call = Some(u64::from(crate::core::ecall::ECALL_POSEIDON2));
-    let mut column = vec![BaseField::from(0u32); 1 << log_size];
-    for (row, step) in side_note.steps.iter().enumerate() {
-        if step.served_ecall() == call {
-            column[row] = BaseField::from(1u32);
-        }
-    }
-    crate::trace::utils::finalize_columns(vec![column])
-        .pop()
-        .expect("one column")
 }

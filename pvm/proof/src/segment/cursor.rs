@@ -46,6 +46,8 @@ pub struct SegmentCursor<'a> {
     steps_at: usize,
     /// Index of the first BLAKE2b output write not yet applied to `mem`.
     blake2b_at: usize,
+    /// Index of the first Poseidon2 output write not yet applied to `mem`.
+    poseidon2_at: usize,
 }
 
 impl<'a> SegmentCursor<'a> {
@@ -61,6 +63,7 @@ impl<'a> SegmentCursor<'a> {
             applied_upto: 0,
             steps_at: 0,
             blake2b_at: 0,
+            poseidon2_at: 0,
         }
     }
 
@@ -90,7 +93,7 @@ impl<'a> SegmentCursor<'a> {
     /// Apply every not-yet-applied write with `ts < ts_lo` to the
     /// carried image. Stream enumeration order mirrors
     /// [`replay_writes`](super::replay_writes) (steps, then the precompile output
-    /// stream); [`apply_writes`](super::window::apply_writes) then applies the batch in ts order.
+    /// streams); [`apply_writes`](super::window::apply_writes) then applies the batch in ts order.
     fn advance_to(&mut self, ts_lo: u64) {
         let full = self.full;
         let mut writes: Vec<PendingWrite> = Vec::new();
@@ -107,6 +110,13 @@ impl<'a> SegmentCursor<'a> {
             }
             writes.push(write_of_bytes(m.ts, m.h_ptr, &m.out_bytes));
             self.blake2b_at += 1;
+        }
+        while let Some(op) = full.poseidon2_ops.get(self.poseidon2_at) {
+            if op.ts >= ts_lo {
+                break;
+            }
+            writes.push(write_of_bytes(op.ts, op.out_ptr, &op.output));
+            self.poseidon2_at += 1;
         }
         match &mut self.mem {
             SegmentMemory::Dense(memory) => apply_writes(memory, writes),

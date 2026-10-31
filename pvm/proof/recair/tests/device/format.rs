@@ -1,4 +1,4 @@
-//! Format 45 counted on the device shape's masked reference, the built set
+//! Format 46 counted on the device shape's masked reference, the built set
 //! with every chip a device program may hold at the most rows a device
 //! program takes; the candidates measured beside it counted on the same
 //! shape.
@@ -97,8 +97,8 @@ fn candidate(
     }
 }
 
-/// The registry's reference for format 45 is the built device set's
-/// masked shape at `DEVICE_MAX_LOG_SIZE`, field for field; 45 counts its
+/// The registry's reference for format 46 is the built device set's
+/// masked shape at `DEVICE_MAX_LOG_SIZE`, field for field; 46 counts its
 /// pinned bits on it (62.82), and one query fewer falls under 62.
 #[test]
 fn the_device_reference_shape_is_the_built_sets() {
@@ -114,8 +114,8 @@ fn the_device_reference_shape_is_the_built_sets() {
         ..DEVICE_PROOF.params
     };
     assert!(proven_count(&fewer, &built).unwrap() < 62.0);
-    assert_eq!(lookup(45), Some(&DEVICE_PROOF));
-    for retired in [37, 43] {
+    assert_eq!(lookup(46), Some(&DEVICE_PROOF));
+    for retired in [37, 43, 45] {
         assert!(RETIRED.contains(&retired) && lookup(retired).is_none());
     }
 }

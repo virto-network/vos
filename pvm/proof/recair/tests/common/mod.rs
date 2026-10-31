@@ -226,9 +226,9 @@ pub fn digest_wires(digest: &vos_pvm_poseidon2::Digest) -> [SecureField; 2] {
 }
 
 /// The window kernel's class-1 leaf topology: its mask and log sizes.
-pub const WINDOW_MASK: u32 = 0x01f9_ffff;
-pub const WINDOW_LOG_SIZES: [u32; 23] = [
-    15, 14, 16, 18, 9, 8, 4, 17, 4, 4, 4, 16, 8, 16, 8, 8, 6, 8, 15, 15, 15, 15, 16,
+pub const WINDOW_MASK: u32 = 0x02f3_fffb;
+pub const WINDOW_LOG_SIZES: [u32; 22] = [
+    15, 14, 16, 18, 9, 8, 4, 17, 4, 4, 4, 16, 8, 16, 8, 8, 6, 8, 15, 15, 15, 16,
 ];
 
 /// `context`'s rows, in all and by piece, to stderr.
@@ -327,13 +327,13 @@ pub fn is_refused(finalized: &Finalized<SecureField>) -> bool {
 pub fn segment_fixture() -> vos_pvm_proof::Proof {
     let bytes = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../fixtures/segment-35.proof"
+        "/../fixtures/segment-41.proof"
     ))
     .expect("the format-35 fixture");
     postcard::from_bytes(&bytes).expect("a proof")
 }
 
-/// A run of six Add64s proved under `format::SEGMENT` over all 25 chips,
+/// A run of six Add64s proved under `format::SEGMENT` over every chip,
 /// the ones it does not use padded; proved once a test binary.
 pub fn full_shape_proof() -> &'static vos_pvm_proof::Proof {
     use vos_pvm::instruction::Opcode;

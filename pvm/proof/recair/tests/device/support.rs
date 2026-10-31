@@ -101,7 +101,7 @@ pub fn witness(seed: u64) -> Vec<u8> {
 
 /// The kernel's run on `input`, traced with the Poseidon2 call served.
 pub fn run(blob: &[u8], input: &[u8]) -> SideNote {
-    vos_pvm_proof::kernel::trace_device_kernel(blob, input, 10_000)
+    vos_pvm_proof::kernel::trace_kernel(blob, input, 10_000)
         .expect("halts")
         .side_note
 }

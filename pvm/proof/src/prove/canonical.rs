@@ -31,7 +31,7 @@ use crate::side_note::SideNote;
 /// `verify_chain_standalone`: the per-segment active set is constant (full
 /// mask) and the preprocessed-bearing chips' `log_size`s are pinned.
 ///
-/// Proves under the segment format (35). `min_log_sizes` shorter than the
+/// Proves under the segment format (41). `min_log_sizes` shorter than the
 /// component count is zero-padded; a 0 floor means "natural size" (the
 /// fixed-table chips, already uniform, need no floor). Forced sizes MUST
 /// stay `<= DEFAULT_MAX_LOG_SIZE` (24) or the verifier rejects.

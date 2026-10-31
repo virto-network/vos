@@ -181,14 +181,15 @@ stwo_constraint_framework::relation!(BitwiseLookupElements, REL_BITWISE_LOOKUP_S
 //
 // Tuple: (val_b[8], val_d[8], result[8], sign_bit_b,
 //   sign_bit_d, is_rotate_l64, is_rotate_r64, is_rotate_l32,
-//   is_rotate_r32, is_mul_lo, is_mul_upper_uu, is_mul_upper_su,
-//   is_mul_upper_ss, is_32bit) — 35 limbs.
+//   is_rotate_r32, is_shlo_r, shift_zero, is_mul_lo, is_mul_upper_uu,
+//   is_mul_upper_su, is_mul_upper_ss, is_32bit) — 37 limbs.
 //
 // The tuple omits mul_high[8] and unsigned_product_low[8] (MulChip
 // witnesses both internally; result-variant binding lives in MulChip).
-// The 4 rotate flags let MulChip's variant-dispatch constraint fire
-// correctly per row.
-const REL_MULTIPLICATION_LOOKUP_SIZE: usize = WORD_SIZE * 3 + 11;
+// The 4 rotate flags and the logical right shift's flag, with whether its
+// amount is 0, let MulChip's variant-dispatch constraint fire correctly
+// per row.
+const REL_MULTIPLICATION_LOOKUP_SIZE: usize = WORD_SIZE * 3 + 13;
 stwo_constraint_framework::relation!(MultiplicationLookupElements, REL_MULTIPLICATION_LOOKUP_SIZE);
 
 // ByteToBits lookup.  256-row preprocessed table proving

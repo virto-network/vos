@@ -464,10 +464,19 @@ pub enum Column {
     #[size = 1]
     IsDivS,
     /// 1 iff this step's opcode is an arithmetic right shift (SharR32 /
-    /// SharR64 and their immediate forms).  Committed as flag byte 0's
-    /// bit 3; flows in the DivRem tuple, where it selects floor division.
+    /// SharR64 and their immediate forms).  Flag byte 0's bit 3 commits
+    /// `IsSharR + IsShloR`, a right shift, and `IsSharR · IsMul = 0` tells
+    /// it from a logical one; flows in the DivRem tuple, where it selects
+    /// floor division.
     #[size = 1]
     IsSharR,
+    /// 1 iff this step's opcode is a logical right shift (ShloR32 /
+    /// ShloR64 and their immediate forms), a multiplication by
+    /// `2^ShiftAmountCompl` whose high word MulChip takes, its low word
+    /// when `ShiftZero` (the amount is 0). `IsShloR · (1 - IsMul) = 0`
+    /// tells it from an arithmetic one in flag byte 0's bit 3.
+    #[size = 1]
+    IsShloR,
     /// Bit 7 of `div_quotient[7]` (sign of quotient on 64-bit
     /// signed div/rem).  Prover-witnessed.  Pinned via a nibble lookup;
     /// flowed to DivRemChip via the lookup tuple.
@@ -760,9 +769,10 @@ pub enum Column {
     #[size = 1]
     IsRotateR64,
     /// Complementary shift amount = `(64 − n) mod 64` where
-    /// `n = reg_val_d mod 64`.  Used as the PowerOfTwo lookup key on
-    /// RotR64 rows, so val_d gets pinned to `2^((64 − n) mod 64)`.
-    /// Range-bounded to [0, 63] by the lookup table size.
+    /// `n = reg_val_d mod 64` (32 for a 32-bit op).  Used as the
+    /// PowerOfTwo lookup key on rotate-right and logical right shift rows,
+    /// so val_d gets pinned to `2^((64 − n) mod 64)`.  Range-bounded to
+    /// [0, 63] by the lookup table size.
     #[size = 1]
     ShiftAmountCompl,
     /// The bits of `k` in `RegValD[0] + ShiftAmountCompl = 32·k` on
@@ -771,6 +781,14 @@ pub enum Column {
     /// `ShiftQuotient`.
     #[size = 4]
     ShiftQuotientCompl,
+    /// 1 iff `ShiftAmountCompl` is 0, on every row: `1 - ShiftAmountCompl ·
+    /// ShiftComplInv`, and `ShiftZero · ShiftAmountCompl = 0`. A logical
+    /// right shift by 0 takes the product's low word, its operand.
+    #[size = 1]
+    ShiftZero,
+    /// The M31 inverse of `ShiftAmountCompl`, or 0 when it is 0.
+    #[size = 1]
+    ShiftComplInv,
     // ── 32-bit rotate flags ────────────────────────────────────
     /// 1 iff this opcode is `RotL32`.  Pinned by ProgramMemoryChip's
     /// preprocessed table.  Drives the 32-bit mul-schoolbook re-route +
@@ -1003,13 +1021,6 @@ pub enum Column {
     #[size = 1]
     IsBranchTakenH,
 
-    // Control flow next_pc + memory monotonicity.
-    // (BranchTaken and MemByteActive booleans are enforced unconditionally
-    // as `X·(1-X)=0`, so no separate helpers are needed.)
-    /// `MemByteActive[i+1] · (1 - MemByteActive[i])` per i ∈ 0..7.
-    #[size = 7]
-    MemByteActiveMonoH,
-
     // Register-memory binding selector helpers.  Many cross-constraints
     // chain 3-4 selector flags before a linear body.  (The IsTruncated /
     // ValBIsReg / ValDIsReg / ResultIsReg / FlagBool / IsBlakeEcall
@@ -1044,9 +1055,10 @@ pub enum Column {
     /// `(1 - IsPadding) · IsShiftConstrained` — shift-amount identity gate.
     #[size = 1]
     RealShiftCH,
-    /// `(1 - IsPadding) · (IsRotateR64 + IsRotateR32)` — rotate-R identity gate.
+    /// `(1 - IsPadding) · (IsRotateR64 + IsRotateR32 + IsShloR)` — the
+    /// complementary shift-amount identity's gate.
     #[size = 1]
-    IsRotateRGateH,
+    ShiftComplGateH,
     /// `(1 - IsPadding) · (1 - FlagBool)` — gate for `Flag=0` constraint.
     #[size = 1]
     RealNotFlagBoolH,
@@ -1098,10 +1110,10 @@ pub enum Column {
     /// `IsDivS · (1 - DivByZero)` — root helper for DivSActivePartialH.
     #[size = 1]
     IsDivSNotDbzH,
-    /// `IsShiftConstrained · (1 - IsRotateR64 - IsRotateR32)` —
-    /// PowerOfTwo lookup multiplicity for the classic shift case.
+    /// `IsShiftConstrained · (1 - IsRotateR64 - IsRotateR32 - IsShloR)` —
+    /// PowerOfTwo lookup multiplicity for the shifts by `ShiftAmount`.
     #[size = 1]
-    IsShiftCNotRotrH,
+    ShiftAmountPow2H,
 
     /// Boolean disposition of a host-call row. One only when an ECALLI was
     /// handled and acknowledged by the embedder; zero for unhandled calls.
@@ -1131,7 +1143,7 @@ pub enum Column {
     MemRangeTimesInvH,
 
     /// ProgramMemory-authenticated exact precompile dispatch identifier
-    /// (100 or 101), or zero for any other instruction. A
+    /// (100, 101 or 102), or zero for any other instruction. A
     /// continued host-call row must select exactly the matching precompile
     /// call relation.
     #[size = 1]
@@ -1156,6 +1168,13 @@ pub enum Column {
     /// CpuChip's degree-two bound.
     #[size = 1]
     WitnessCountTimesInvH,
+
+    // ── Poseidon2 binding ──
+    /// 1 iff an acknowledged `Ecalli` of the Poseidon2 call (dispatch 102).
+    /// Its row reads φ7 and φ8, the input and output pointers (`HPtr`,
+    /// `MPtr`), below 2^32, and hands `(ts, φ7, φ8)` to `Poseidon2Chip`.
+    #[size = 1]
+    IsP2Ecall,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

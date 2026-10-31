@@ -226,6 +226,7 @@ macro_rules! chips {
             /// committed code fixes, so a proof without the chip balances only if
             /// no row needs it.
             pub const OPTIONAL: u32 = 1 << BLAKE2B
+                | 1 << POSEIDON2
                 | 1 << JUMP_TABLE
                 | 1 << WITNESS_INPUT
                 | 1 << POPCOUNT
@@ -299,6 +300,10 @@ chips! {
     CPU = chips::CpuChip,
     /// Optional: the BLAKE2b precompile's calls.
     BLAKE2B = chips::Blake2bChip,
+    /// Optional: the Poseidon2 call's permutations, one a row (pin H).
+    /// Before the range table: its trace-gen counts the bytes it
+    /// range-checks.
+    POSEIDON2 = chips::Poseidon2Chip,
     /// The memory-page Merkle tree's BLAKE2b compressions.
     BLAKE2B_BOUNDARY = chips::Blake2bBoundaryChip,
     MEMORY = chips::MemoryChip,
@@ -346,17 +351,14 @@ chips! {
 }
 
 /// Calls `visitor` with the shared chip set's chip at `index` as a device
-/// shape holds it (`device::device_chip`): the shared set's CPU at
-/// [`chip_idx::CPU`], the device's chips past [`chip_idx::COUNT`], format
-/// 35's otherwise.
+/// shape holds it (`device::device_chip`): the device's chips past
+/// [`chip_idx::COUNT`], the segment AIR's otherwise.
 ///
 /// # Panics
 /// When `index` is no chip's.
 pub(crate) fn visit_device_chip<V: ChipVisitor>(index: usize, visitor: V) -> V::Output {
     use device::device_chip;
     match index {
-        chip_idx::CPU => visitor.visit(&chips::CpuP2Chip),
-        device_chip::POSEIDON2 => visitor.visit(&chips::Poseidon2Chip),
         device_chip::DEVICE_MEMORY => visitor.visit(&chips::DeviceMemoryChip),
         device_chip::DATA_TABLE => visitor.visit(&chips::DataTableChip),
         device_chip::DEVICE_BOUNDARY => visitor.visit(&chips::DeviceBoundaryChip),
@@ -371,8 +373,6 @@ pub(crate) fn visit_device_chip<V: ChipVisitor>(index: usize, visitor: V) -> V::
 pub(crate) fn device_component(index: usize) -> &'static dyn framework::MachineProverComponent {
     use device::device_chip;
     match index {
-        chip_idx::CPU => &chips::CpuP2Chip,
-        device_chip::POSEIDON2 => &chips::Poseidon2Chip,
         device_chip::DEVICE_MEMORY => &chips::DeviceMemoryChip,
         device_chip::DATA_TABLE => &chips::DataTableChip,
         device_chip::DEVICE_BOUNDARY => &chips::DeviceBoundaryChip,
@@ -386,8 +386,6 @@ pub(crate) fn device_component(index: usize) -> &'static dyn framework::MachineP
 pub(crate) fn device_machine_component(index: usize) -> &'static dyn framework::MachineComponent {
     use device::device_chip;
     match index {
-        chip_idx::CPU => &chips::CpuP2Chip,
-        device_chip::POSEIDON2 => &chips::Poseidon2Chip,
         device_chip::DEVICE_MEMORY => &chips::DeviceMemoryChip,
         device_chip::DATA_TABLE => &chips::DataTableChip,
         device_chip::DEVICE_BOUNDARY => &chips::DeviceBoundaryChip,
@@ -432,7 +430,7 @@ pub(crate) fn chips_of_mask(mask: u32) -> impl Iterator<Item = usize> {
 /// direct `(opcode, imm)` matching for the blake2b ECALL.
 #[cfg(feature = "prover")]
 fn activity_from_steps(side_note: &side_note::SideNote) -> ChipActivity {
-    use crate::core::ecall::{ECALL_BLAKE2B_COMPRESS, ECALL_WITNESS_INPUT};
+    use crate::core::ecall::{ECALL_BLAKE2B_COMPRESS, ECALL_POSEIDON2, ECALL_WITNESS_INPUT};
     let mut a = ChipActivity::default();
     for step in &side_note.steps {
         // A precompile call counts only when served
@@ -440,6 +438,9 @@ fn activity_from_steps(side_note: &side_note::SideNote) -> ChipActivity {
         let ecall = step.served_ecall();
         if ecall == Some(ECALL_BLAKE2B_COMPRESS as u64) {
             a.blake2b = true;
+        }
+        if ecall == Some(u64::from(ECALL_POSEIDON2)) {
+            a.poseidon2 = true;
         }
         // A witness-input call compares its count with its capacity; one
         // that wrote bytes hands them to WitnessInputChip.
@@ -458,6 +459,7 @@ fn activity_from_steps(side_note: &side_note::SideNote) -> ChipActivity {
 #[derive(Default, Clone, Copy)]
 struct ChipActivity {
     blake2b: bool,
+    poseidon2: bool,
     jump_table: bool,
     popcount: bool,
     bitcount: bool,
@@ -511,6 +513,7 @@ impl ChipActivity {
         // optional chips (`chip_idx::OPTIONAL`) need an explicit arm.
         match idx {
             chip_idx::BLAKE2B => self.blake2b,
+            chip_idx::POSEIDON2 => self.poseidon2,
             chip_idx::JUMP_TABLE => self.jump_table,
             chip_idx::WITNESS_INPUT => self.witness_input,
             chip_idx::POPCOUNT => self.popcount,

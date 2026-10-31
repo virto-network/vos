@@ -1,10 +1,9 @@
 //! The device profile's shape (`docs/design/slice-7-mobile.md`, pin J): a
 //! kernel's whole run as one segment, without the page-Merkle boundary.
 //!
-//! - **The chips** are the shared chip set's (format 35's chips, the
-//!   Poseidon2 chip, and the CPU that acknowledges its call,
-//!   [`chips::CpuP2Chip`](crate::chips::CpuP2Chip)) without the page
-//!   boundary (BLAKE2B_BOUNDARY, MEMORY_PAGE, MEMORY_MERKLE,
+//! - **The chips** are the shared chip set's, the segment AIR's
+//!   ([`chip_idx`]: the CPU, the Poseidon2 chip among them), without the
+//!   page boundary (BLAKE2B_BOUNDARY, MEMORY_PAGE, MEMORY_MERKLE,
 //!   MEMORY_ROOT_BOUNDARY) or the node's boundary chips (the registers in and
 //!   out, the program's boundary), and with the device's own:
 //!   [`DeviceMemoryChip`](crate::chips::DeviceMemoryChip) (first touches and
@@ -28,24 +27,20 @@
 
 use crate::chip_idx;
 
-/// The shared chip set's indices: [`chip_idx`]'s, then the device's. The
-/// CPU at [`chip_idx::CPU`] is the shared set's
-/// ([`CpuP2Chip`](crate::chips::CpuP2Chip)) in a device shape.
+/// The shared chip set's indices: [`chip_idx`]'s, then the device's.
 pub mod device_chip {
     pub use crate::chip_idx::*;
 
-    /// One Poseidon2-M31 permutation a call (pin H).
-    pub const POSEIDON2: usize = super::chip_idx::COUNT;
     /// The run's first touches and closing reads, a row a byte it touches.
-    pub const DEVICE_MEMORY: usize = POSEIDON2 + 1;
+    pub const DEVICE_MEMORY: usize = COUNT;
     /// The program's data bytes, preprocessed.
-    pub const DATA_TABLE: usize = POSEIDON2 + 2;
+    pub const DATA_TABLE: usize = COUNT + 1;
     /// The run's entry and halt: the registers in and out.
-    pub const DEVICE_BOUNDARY: usize = POSEIDON2 + 3;
+    pub const DEVICE_BOUNDARY: usize = COUNT + 2;
     /// The io-hash, φ9..12 at the halt: the public output.
-    pub const DEVICE_IO: usize = POSEIDON2 + 4;
+    pub const DEVICE_IO: usize = COUNT + 3;
     /// The shared index space's size.
-    pub const SHARED_COUNT: usize = POSEIDON2 + 5;
+    pub const SHARED_COUNT: usize = COUNT + 4;
 }
 
 const _: () = assert!(device_chip::SHARED_COUNT <= 32);
@@ -99,11 +94,11 @@ pub const DEVICE_ALWAYS: u32 = {
         | 1 << BYTE_TO_BITS
 };
 
-/// The chips a device shape holds when its code reaches them: format 35's
-/// optional chips, the byte-wide AND table with BLAKE2b (its only consumer
-/// once the page boundary is gone), and the Poseidon2 chip.
-pub const DEVICE_OPTIONAL: u32 =
-    chip_idx::OPTIONAL | 1 << chip_idx::BITWISE_AND_BYTE | 1 << device_chip::POSEIDON2;
+/// The chips a device shape holds when its code reaches them: the segment
+/// AIR's optional chips (the Poseidon2 chip among them), and the byte-wide
+/// AND table with BLAKE2b (its only consumer once the page boundary is
+/// gone).
+pub const DEVICE_OPTIONAL: u32 = chip_idx::OPTIONAL | 1 << chip_idx::BITWISE_AND_BYTE;
 
 /// Every chip a device shape may hold.
 pub const DEVICE_ALL: u32 = DEVICE_ALWAYS | DEVICE_OPTIONAL;
@@ -364,7 +359,7 @@ pub fn device_chips_of_code(code: &[u8], bitmask: &[u8]) -> u32 {
                     id if id == u64::from(ECALL_WITNESS_INPUT) => {
                         1 << chip_idx::WITNESS_INPUT | 1 << chip_idx::COMPARE
                     }
-                    id if id == u64::from(ECALL_POSEIDON2) => 1 << device_chip::POSEIDON2,
+                    id if id == u64::from(ECALL_POSEIDON2) => 1 << chip_idx::POSEIDON2,
                     _ => 0,
                 };
             }

@@ -12,7 +12,7 @@ use crate::prover::auth_public;
 use crate::secret::DeviceSecret;
 use crate::{AuthWitness, Call, CredentialProof, CredentialPublic, DeviceError, Prover, scope};
 
-/// The device format's number, the registry's: format 45.
+/// The device format's number, the registry's: format 46.
 pub const DEVICE_FORMAT: u32 = profile::FORMAT.number;
 
 /// The most memory a device kernel's proof takes, in bytes: PG2's budget,

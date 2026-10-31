@@ -113,10 +113,11 @@ pub(super) fn operands(out: &mut Sinks, s: Step) -> Operands {
     // For left/right shifts and rotates: save shift amount, then
     // replace val_d with 2^shift_amount.
     //
-    // RotR64 / RotR32 are also pow2-replacements, but with
-    // val_d = 2^((modulus − n_real) mod modulus) (the complement)
-    // so the mul-schoolbook's low+high yields the rotated-right
-    // value.  modulus = 32 for 32-bit, 64 for 64-bit.
+    // RotR64 / RotR32 and the logical right shifts are also
+    // pow2-replacements, but with val_d = 2^((modulus − n_real) mod
+    // modulus) (the complement), so the mul-schoolbook's low+high yields
+    // the rotated-right value and its high word the shifted-right one.
+    // modulus = 32 for 32-bit, 64 for 64-bit.
     let mut saved_shift_amount: u8 = 0;
     let mut saved_shift_amount_compl: u8 = 0;
     let mut saved_shift_quotient_compl: u64 = 0;
@@ -129,8 +130,8 @@ pub(super) fn operands(out: &mut Sinks, s: Step) -> Operands {
         let modulus = if flags.is_32bit { 32u64 } else { 64 };
         let shift = val_d % modulus; // n_real = reg_val_d mod modulus
         saved_shift_amount = shift as u8;
-        let is_rotate_r = flags.is_rotate_r64 || flags.is_rotate_r32;
-        if is_rotate_r {
+        let by_compl = flags.is_rotate_r64 || flags.is_rotate_r32 || flags.is_shlo_r;
+        if by_compl {
             // val_d = 2^((modulus − n_real) mod modulus).
             let compl = if shift == 0 { 0 } else { modulus - shift };
             saved_shift_amount_compl = compl as u8;
@@ -144,7 +145,7 @@ pub(super) fn operands(out: &mut Sinks, s: Step) -> Operands {
         }
     }
 
-    // Truncate for 32-bit ALU ops (including divrem for right shifts)
+    // Truncate for 32-bit ALU ops (the shifts and rotates among them)
     if flags.is_32bit && (flags.is_add || flags.is_sub || flags.is_mul || flags.is_div_rem) {
         val_b &= 0xFFFF_FFFF;
         val_d &= 0xFFFF_FFFF;
@@ -217,6 +218,7 @@ pub(super) fn flag_columns(out: &mut Sinks, s: Step) {
     trace.fill_columns(row, flags.is_mul_upper_ss, Column::IsMulUpperSS);
     trace.fill_columns(row, flags.is_div_s, Column::IsDivS);
     trace.fill_columns(row, flags.is_shar_r, Column::IsSharR);
+    trace.fill_columns(row, flags.is_shlo_r, Column::IsShloR);
     // IsBitwise is folded — no column to fill.
     trace.fill_columns(row, flags.is_shift, Column::IsShift);
     // IsCompare is folded — no column to fill.

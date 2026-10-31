@@ -509,8 +509,7 @@ pub mod precompile {
     /// One Poseidon2-M31 compression: φ7 sixteen words (64 bytes, each a
     /// little-endian `u32` below p), φ8 the first eight words of their
     /// permutation (32 bytes, written). A word at or above p traps the
-    /// call. Handlers may make it; kernels may not, since the node's
-    /// segments do not prove it.
+    /// call. Handlers and kernels may make it.
     pub const POSEIDON2: u64 = 0x402;
 
     /// A kernel's witness input: φ7 the destination, φ8 the capacity. The

@@ -47,6 +47,10 @@ use columns::PreprocessedColumn;
 #[cfg(feature = "prover")]
 pub(crate) use reg_access::{static_destination, step_reg_accesses};
 
+/// The CPU, a row a step. Its host calls are the BLAKE2b precompile, the
+/// witness input and the Poseidon2 call (`slice-7-mobile.md`, pin H), whose
+/// row hands `(ts, φ7, φ8)` to `Poseidon2Chip` (the `Poseidon2Call`
+/// relation). The node's segments and the device shape share it.
 pub struct CpuChip;
 
 // ── Trace generation ───────────────────────────────────────────────────────
@@ -69,19 +73,15 @@ impl BuiltInComponent for CpuChip {
         trace_eval: TraceEval<PreprocessedColumn, Column, E>,
         lookups: &constraints::Lookups,
     ) {
-        constraints_of(eval, &columns::Row::new(&trace_eval), lookups, None);
+        constraints_of(eval, &columns::Row::new(&trace_eval), lookups);
     }
 }
 
-/// The CPU's constraints and relation entries in the AIR's order; `p2` the
-/// shared chip set's Poseidon2 selector, which the host-call continuation
-/// counts among the precompile selectors (`None` for format 35's CPU, whose
-/// constraints are then exactly its own).
+/// The CPU's constraints and relation entries in the AIR's order.
 fn constraints_of<E: EvalAtRow>(
     eval: &mut E,
     row: &columns::Row<E::F>,
     lookups: &constraints::Lookups,
-    p2: Option<&E::F>,
 ) {
     constraints::row::padding(eval, row);
     constraints::row::timestamp_chain(eval, row);
@@ -109,7 +109,7 @@ fn constraints_of<E: EvalAtRow>(
     constraints::bitmanip::leading_trailing_zeros(eval, row);
     constraints::control::next_pc(eval, row);
     constraints::control::branch_conditions(eval, row);
-    constraints::host_call::host_call_continuation(eval, row, p2);
+    constraints::host_call::host_call_continuation(eval, row);
     constraints::memory::result_bytes(eval, row, lookups);
     constraints::memory::memory_access(eval, row, lookups);
     constraints::memory::active_bytes(eval, row);
@@ -139,39 +139,7 @@ fn constraints_of<E: EvalAtRow>(
     constraints::lookups::bitwise_lookup(eval, row, lookups);
     constraints::host_call::witness_input(eval, row, lookups);
     constraints::row::next_timestamp_bytes(eval, row, lookups);
-}
-
-/// The shared chip set's CPU (`slice-7-mobile.md`, pin H): format 35's CPU
-/// and the Poseidon2 call. One more main column after format 35's,
-/// `IsP2Ecall`, the call's selector: an acknowledged `ecalli` of dispatch 102
-/// selects it as the host-call continuation selects the other precompiles;
-/// its row reads φ7 and φ8, the input and output pointers, below 2^32, and
-/// hands `(ts, φ7, φ8)` to `Poseidon2Chip` (the `Poseidon2Call` relation),
-/// three fractions after format 35's. Formats 41 and 45 take it; format 35
-/// keeps [`CpuChip`].
-pub struct CpuP2Chip;
-
-impl BuiltInComponent for CpuP2Chip {
-    const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 1;
-
-    type PreprocessedColumn = PreprocessedColumn;
-    type MainColumn = Column;
-    type LookupElements = (
-        constraints::Lookups,
-        crate::lookups::Poseidon2CallLookupElements,
-    );
-
-    fn add_constraints<E: EvalAtRow>(
-        &self,
-        eval: &mut E,
-        trace_eval: TraceEval<PreprocessedColumn, Column, E>,
-        (lookups, p2_call): &Self::LookupElements,
-    ) {
-        let row = &columns::Row::new(&trace_eval);
-        let is_p2 = eval.next_trace_mask();
-        constraints_of(eval, row, lookups, Some(&is_p2));
-        constraints::host_call::poseidon2_call(eval, row, lookups, p2_call, is_p2);
-    }
+    constraints::host_call::poseidon2_call(eval, row, lookups);
 }
 
 #[cfg(feature = "prover")]
@@ -194,32 +162,5 @@ impl BuiltInProverComponent for CpuChip {
         SecureField,
     ) {
         interaction::generate_interaction_trace(component_trace, lookup_elements)
-    }
-}
-
-#[cfg(feature = "prover")]
-impl BuiltInProverComponent for CpuP2Chip {
-    fn generate_main_trace_min(
-        &self,
-        side_note: &mut SideNote,
-        min_log_size: u32,
-    ) -> FinalizedTrace {
-        let mut trace = trace_fill::generate_main_trace(side_note, min_log_size);
-        trace
-            .cols
-            .push(trace_fill::poseidon2_selector(side_note, trace.log_size));
-        trace
-    }
-
-    fn generate_interaction_trace(
-        &self,
-        component_trace: &ComponentTrace,
-        _side_note: &SideNote,
-        lookup_elements: &AllLookupElements,
-    ) -> (
-        ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
-        SecureField,
-    ) {
-        interaction::generate_p2_interaction_trace(component_trace, lookup_elements)
     }
 }

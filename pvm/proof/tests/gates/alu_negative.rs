@@ -339,6 +339,43 @@ fn shlo_r64_forged_result_rejected() {
     forge_three_reg_result(Opcode::ShloR64, 2, 0, 1, 1024, 3, /*forged*/ 256);
 }
 
+#[test]
+#[should_panic(expected = "failed")]
+fn shlo_r64_by_zero_forged_as_the_high_word_rejected() {
+    // By 0 the product by 1 has a zero high word: a result of 0 is the
+    // high word alone, not the operand.
+    forge_three_reg_result(Opcode::ShloR64, 2, 0, 1, 1024, 0, /*forged*/ 0);
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn shlo_r64_by_one_forged_as_the_rotation_rejected() {
+    // The rotation's sum of both words, not the shift's high word.
+    forge_three_reg_result(
+        Opcode::ShloR64,
+        2,
+        0,
+        1,
+        1025,
+        1,
+        /*forged*/ (1 << 63) | 512,
+    );
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn shlo_r32_forged_result_rejected() {
+    forge_three_reg_result(
+        Opcode::ShloR32,
+        2,
+        0,
+        1,
+        0x8000_0000,
+        4,
+        /*forged*/ 0x0800_0001,
+    );
+}
+
 // ── DivRem ─────────────────────────────────────────────────────────────────
 
 #[test]

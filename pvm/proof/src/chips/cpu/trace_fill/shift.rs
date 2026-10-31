@@ -9,7 +9,8 @@ pub(super) struct Shift {
     pub is_shift_constrained: bool,
 }
 
-/// The shift amount and its complement for a rotate right.
+/// The shift amount, and its complement for a rotate right or a logical
+/// right shift.
 pub(super) fn shift(out: &mut Sinks, s: Step, ops: &Operands) -> Shift {
     let Sinks { trace, .. } = out;
     let Step { row, flags, .. } = s;
@@ -37,9 +38,9 @@ pub(super) fn shift(out: &mut Sinks, s: Step, ops: &Operands) -> Shift {
         0
     };
     trace.fill_columns(row, shift_amount, Column::ShiftAmount);
-    // IsShiftConstrained covers all four rotate variants.  val_d
-    // gets rewritten to a power of two; the val_d-vs-RegValD
-    // cross-constraint then skips equality on those rows.
+    // IsShiftConstrained covers every shift and rotate.  val_d gets
+    // rewritten to a power of two; the val_d-vs-RegValD cross-constraint
+    // then skips equality on those rows.
     let is_shift_constrained = (flags.is_shift && flags.shift_op <= 2)
         || flags.is_rotate_l64
         || flags.is_rotate_r64
@@ -52,6 +53,15 @@ pub(super) fn shift(out: &mut Sinks, s: Step, ops: &Operands) -> Shift {
     trace.fill_columns(row, flags.is_rotate_r32, Column::IsRotateR32);
     trace.fill_columns(row, flags.is_imm_alt, Column::IsImmAlt);
     trace.fill_columns(row, saved_shift_amount_compl, Column::ShiftAmountCompl);
+    // ShiftZero = [ShiftAmountCompl = 0], with the complement's inverse.
+    trace.fill_columns(row, saved_shift_amount_compl == 0, Column::ShiftZero);
+    if saved_shift_amount_compl != 0 {
+        trace.fill_columns_base_field(
+            row,
+            &[BaseField::from(u32::from(saved_shift_amount_compl)).inverse()],
+            Column::ShiftComplInv,
+        );
+    }
     trace.fill_columns_bytes(
         row,
         &bits::<4>(saved_shift_quotient_compl),

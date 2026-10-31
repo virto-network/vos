@@ -203,14 +203,14 @@ fn a_proof_below_a_floor_is_refused() {
     refused_both(
         with_pow(19),
         side_note,
-        "99 conjectured bits, below format 35's floor of 100",
+        "99 conjectured bits, below format 41's floor of 100",
     );
     refused_both(
         with_pow(20),
         side_note,
-        "proven bits, below format 35's floor of 60",
+        "proven bits, below format 41's floor of 60",
     );
-    refused_both(with_pow(25), side_note, "differ from format 35");
+    refused_both(with_pow(25), side_note, "differ from format 41");
 }
 
 /// The counts of a real proof, at its own shape, clear `format::SEGMENT`'s floors.

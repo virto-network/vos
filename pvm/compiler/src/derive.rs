@@ -38,10 +38,10 @@
 //!
 //! **A kernel makes no host call but the precompiles and its witness
 //! input:** one whose reachable code does is refused, naming the chain of
-//! functions from the entry to the call. A node's kernel calls BLAKE2b's
-//! precompile and never Poseidon2's; a **device kernel**
-//! (`#[attestable(device)]`, its table entry marked) calls Poseidon2's and
-//! never BLAKE2b's, so its shape holds neither BLAKE2b nor its AND table.
+//! functions from the entry to the call. A node's kernel may call BLAKE2b's
+//! precompile and Poseidon2's; a **device kernel** (`#[attestable(device)]`,
+//! its table entry marked) calls Poseidon2's and never BLAKE2b's, so its
+//! shape holds neither BLAKE2b nor its AND table.
 //! Its schema kind is `Device`, and an auth guard's `device = "..."` must
 //! name one.
 //!
@@ -1140,7 +1140,7 @@ mod tests {
 
     /// Ids 110 to 114 are no precompile: a kernel that reaches one is
     /// refused, naming it, as one reaching any host call but a kernel's
-    /// is; one reaching BLAKE2b's, or its witness input, derives.
+    /// is; one reaching BLAKE2b's, Poseidon2's or its witness input derives.
     #[test]
     fn a_kernel_reaching_an_unknown_id_is_refused() {
         const ENTRY: u64 = 0x10_0000;
@@ -1160,24 +1160,10 @@ mod tests {
         }
         for admitted in [
             vos_pvm::precompile::BLAKE2B_COMPRESS,
+            vos_pvm::precompile::POSEIDON2,
             vos_pvm::precompile::WITNESS_INPUT,
         ] {
             assert!(derived(admitted as i32).is_ok(), "{admitted:#x}");
-        }
-    }
-
-    /// Poseidon2's call is a precompile but no kernel's: a kernel that
-    /// makes it is refused at derivation, naming it.
-    #[test]
-    fn a_kernel_calling_poseidon2_is_refused() {
-        const ENTRY: u64 = 0x10_0000;
-        let poseidon2 = vos_pvm::precompile::POSEIDON2;
-        let elf = LinkedElf::text(ENTRY, calling(poseidon2 as i32));
-        match kernel(&Graph::new(&elf), &entry(ENTRY, false)) {
-            Err(DeriveError::HostCall { method, id, .. }) => {
-                assert_eq!((method, id), (7, poseidon2));
-            }
-            other => panic!("{:?}", other.map(|kernel| kernel.len())),
         }
     }
 

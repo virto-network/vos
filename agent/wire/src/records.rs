@@ -71,7 +71,7 @@ pub struct SegmentClass {
 }
 
 /// The segment AIR's chips (`vos_pvm_proof::chip_idx::COUNT`).
-pub const SEGMENT_CHIPS: usize = 25;
+pub const SEGMENT_CHIPS: usize = 26;
 
 /// The segment AIR's chips by index: bit i of a shape's chips, and
 /// [`SegmentClass::log_sizes`]` [i]`. The prover's `chip_idx` and the
@@ -79,29 +79,30 @@ pub const SEGMENT_CHIPS: usize = 25;
 pub mod segment_chip {
     pub const CPU: usize = 0;
     pub const BLAKE2B: usize = 1;
-    pub const BLAKE2B_BOUNDARY: usize = 2;
-    pub const MEMORY: usize = 3;
-    pub const MEMORY_PAGE: usize = 4;
-    pub const MEMORY_MERKLE: usize = 5;
-    pub const MEMORY_ROOT_BOUNDARY: usize = 6;
-    pub const REGISTER_MEMORY: usize = 7;
-    pub const REGISTER_MEMORY_BOUNDARY: usize = 8;
-    pub const REGISTER_MEMORY_CLOSING: usize = 9;
-    pub const PROGRAM_BOUNDARY: usize = 10;
-    pub const PROGRAM_MEMORY: usize = 11;
-    pub const JUMP_TABLE: usize = 12;
-    pub const WITNESS_INPUT: usize = 13;
-    pub const RANGE_MULTIPLICITY_256: usize = 14;
-    pub const BITWISE_LOOKUP: usize = 15;
-    pub const POWER_OF_TWO: usize = 16;
-    pub const POPCOUNT: usize = 17;
-    pub const BITCOUNT: usize = 18;
-    pub const BYTE_TO_BITS: usize = 19;
-    pub const MUL: usize = 20;
-    pub const BITWISE: usize = 21;
-    pub const COMPARE: usize = 22;
-    pub const DIVREM: usize = 23;
-    pub const BITWISE_AND_BYTE: usize = 24;
+    pub const POSEIDON2: usize = 2;
+    pub const BLAKE2B_BOUNDARY: usize = 3;
+    pub const MEMORY: usize = 4;
+    pub const MEMORY_PAGE: usize = 5;
+    pub const MEMORY_MERKLE: usize = 6;
+    pub const MEMORY_ROOT_BOUNDARY: usize = 7;
+    pub const REGISTER_MEMORY: usize = 8;
+    pub const REGISTER_MEMORY_BOUNDARY: usize = 9;
+    pub const REGISTER_MEMORY_CLOSING: usize = 10;
+    pub const PROGRAM_BOUNDARY: usize = 11;
+    pub const PROGRAM_MEMORY: usize = 12;
+    pub const JUMP_TABLE: usize = 13;
+    pub const WITNESS_INPUT: usize = 14;
+    pub const RANGE_MULTIPLICITY_256: usize = 15;
+    pub const BITWISE_LOOKUP: usize = 16;
+    pub const POWER_OF_TWO: usize = 17;
+    pub const POPCOUNT: usize = 18;
+    pub const BITCOUNT: usize = 19;
+    pub const BYTE_TO_BITS: usize = 20;
+    pub const MUL: usize = 21;
+    pub const BITWISE: usize = 22;
+    pub const COMPARE: usize = 23;
+    pub const DIVREM: usize = 24;
+    pub const BITWISE_AND_BYTE: usize = 25;
 }
 
 const _: () = assert!(segment_chip::BITWISE_AND_BYTE + 1 == SEGMENT_CHIPS);

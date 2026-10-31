@@ -109,9 +109,15 @@ pub(crate) struct OpcodeFlags {
     /// two's-complement.
     pub is_div_s: bool,
     /// Arithmetic right shifts (SharR32/SharR64 and their immediate forms):
-    /// floor division by `2^n`, which DivRemChip tells from a logical
-    /// shift's unsigned division by this flag in the DivRem tuple.
+    /// floor division by `2^n`, which DivRemChip tells from an unsigned
+    /// division by this flag in the DivRem tuple.
     pub is_shar_r: bool,
+    /// Logical right shifts (ShloR32/ShloR64 and their immediate forms):
+    /// the high word of the mul-schoolbook's `x · 2^((modulus − n) mod
+    /// modulus)`, its low word when `n` is 0, as MulChip binds it. Shares
+    /// its flag slot with `is_shar_r` (a right shift), which `is_mul` and
+    /// `is_div_rem` tell apart.
+    pub is_shlo_r: bool,
     /// Per-size signed-load flags (covers direct + indirect
     /// variants: LoadI8 / LoadIndI8 → is_load_i8, etc.).  Drive the
     /// inactive-byte sign-extension binding for `result[i]` on
@@ -271,18 +277,20 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
         Opcode::ShloL32 | Opcode::ShloLImm32 | Opcode::ShloLImmAlt32 => {
             flags!(is_shift, is_mul, is_32bit; is_imm_alt: op == Opcode::ShloLImmAlt32, shift_op: 0)
         }
-        // Logical right shifts: constrained via divrem (val_d = 2^shift_amount, result = quotient)
+        // Logical right shifts: the mul-schoolbook's high word, as a rotate
+        // right computes it (val_d = 2^((modulus − n) mod modulus)); the
+        // low word when n is 0.
         Opcode::ShloR64 | Opcode::ShloRImm64 | Opcode::ShloRImmAlt64 => {
-            flags!(is_shift, is_div_rem; is_imm_alt: op == Opcode::ShloRImmAlt64, shift_op: 1)
+            flags!(is_shift, is_mul, is_shlo_r; is_imm_alt: op == Opcode::ShloRImmAlt64, shift_op: 1)
         }
         Opcode::ShloR32 | Opcode::ShloRImm32 | Opcode::ShloRImmAlt32 => {
             flags!(
-                is_shift, is_div_rem, is_32bit;
+                is_shift, is_mul, is_shlo_r, is_32bit;
                 is_imm_alt: op == Opcode::ShloRImmAlt32, shift_op: 1
             )
         }
         // Arithmetic right shifts: floor division by val_d = 2^shift_amount
-        // (divrem + power-of-two, like ShloR), told apart by is_shar_r.
+        // (divrem + power-of-two), told apart from a division by is_shar_r.
         Opcode::SharR64 | Opcode::SharRImm64 | Opcode::SharRImmAlt64 => {
             flags!(
                 is_shift, is_div_rem, is_shar_r;
@@ -538,8 +546,9 @@ pub(crate) fn classify_opcode_for_program_memory(
         f.is_sub as u8,
         f.is_mul as u8,
         // Byte 0 bit 3: is_mul_upper is implied by its three variants
-        // (bytes 2 and 3), so the slot commits is_shar_r.
-        f.is_shar_r as u8,
+        // (bytes 2 and 3), so the slot commits a right shift, logical or
+        // arithmetic: is_mul or is_div_rem tells which.
+        (f.is_shar_r || f.is_shlo_r) as u8,
         f.is_bitwise as u8,
         f.is_shift as u8,
         f.is_compare as u8,
@@ -708,6 +717,7 @@ mod tests {
                 self.is_rotate_l32,
                 self.is_rotate_r32,
                 self.is_imm_alt,
+                self.is_shlo_r,
             ]
             .into_iter()
             .enumerate()
@@ -789,24 +799,24 @@ mod tests {
         (136, 0x200800),
         (137, 0x400800),
         (138, 0x2500),
-        (139, 0x80000002401),
+        (139, 0x200000000000000002501),
         (140, 0x800080000002402),
         (141, 0x102080),
         (142, 0xa00800),
         (143, 0xc00800),
         (144, 0x100000000000000002500),
-        (145, 0x100000000080000002401),
+        (145, 0x300000000000000002501),
         (146, 0x100000800080000002402),
         (147, 0x5000800),
         (148, 0x6000800),
         (149, 0x40),
         (150, 0x100),
         (151, 0x500),
-        (152, 0x80000000401),
+        (152, 0x200000000000000000501),
         (153, 0x800080000000402),
         (154, 0x100080),
         (155, 0x100000000000000000500),
-        (156, 0x100000000080000000401),
+        (156, 0x300000000000000000501),
         (157, 0x100000800080000000402),
         (158, 0x20000000000000000504),
         (159, 0x120000000000000000504),
@@ -827,7 +837,7 @@ mod tests {
         (195, 0x80000002010),
         (196, 0x400080000002018),
         (197, 0x2500),
-        (198, 0x80000002401),
+        (198, 0x200000000000000002501),
         (199, 0x800080000002402),
         (200, 0x40),
         (201, 0x80),
@@ -837,7 +847,7 @@ mod tests {
         (205, 0x80000000010),
         (206, 0x400080000000018),
         (207, 0x500),
-        (208, 0x80000000401),
+        (208, 0x200000000000000000501),
         (209, 0x800080000000402),
         (210, 0x4200),
         (211, 0x10200),

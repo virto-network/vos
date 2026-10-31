@@ -278,6 +278,8 @@ pub(super) fn mul_entry(out: &mut Sinks, s: Step, ops: &Operands, mul: &MulWitne
             is_rotate_r64: flags.is_rotate_r64,
             is_rotate_l32: flags.is_rotate_l32,
             is_rotate_r32: flags.is_rotate_r32,
+            is_shlo_r: flags.is_shlo_r,
+            shift_zero: ops.saved_shift_amount_compl == 0,
             is_mul_lo: !flags.is_mul_upper,
             is_mul_upper_uu: flags.is_mul_upper_uu,
             is_mul_upper_su: flags.is_mul_upper_su,

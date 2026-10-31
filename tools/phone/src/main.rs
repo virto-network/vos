@@ -20,7 +20,7 @@
 //!   a device kernel of auth's statement proved as the device library
 //!   proves it for a space's ingress (`DeviceProgram::auth`, the program
 //!   ingress computes from the installed kernel; `Prover::prove_kernel`,
-//!   format 45), on its witness input, verified here against the io-hash
+//!   format 46), on its witness input, verified here against the io-hash
 //!   of the input's last 129 bytes, auth's public arguments; the proof's
 //!   bytes written to `--out`, one `kernel` line (PG2's acceptance run,
 //!   `spikes/s7-device/scripts/pg2.sh`).

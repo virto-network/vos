@@ -160,30 +160,31 @@ fn built(mask: u32, log_sizes: &[u32]) -> (Context<NoValue>, (usize, usize, usiz
 /// built piece's rows, `p2` and `h8` exactly.
 #[test]
 fn the_bound_holds_the_built_leaves() {
-    let window: [u32; 25] = [
-        15, 14, 16, 18, 9, 8, 4, 17, 4, 4, 4, 16, 8, 16, 8, 8, 6, 0, 0, 8, 15, 15, 15, 15, 16,
+    const COUNT: usize = chip_idx::COUNT;
+    let window: [u32; COUNT] = [
+        15, 14, 0, 16, 18, 9, 8, 4, 17, 4, 4, 4, 16, 8, 16, 8, 8, 6, 0, 0, 8, 15, 15, 15, 15, 16,
     ];
-    let mut shapes: Vec<(u32, [u32; 25])> = vec![
-        (0x01f9_ffff, window),
+    let mut shapes: Vec<(u32, [u32; COUNT])> = vec![
+        (0x03f3_fffb, window),
         (chip_idx::ALL, window.map(|log| log.max(8))),
     ];
     // Every chip at one size, the lifting height's columns: no two-sample
     // column in a clean block.
-    shapes.push((0x01f9_ffff, window.map(|log| if log == 0 { 0 } else { 12 })));
+    shapes.push((0x03f3_fffb, window.map(|log| if log == 0 { 0 } else { 12 })));
     let mut rng = Rng::new(0x1eaf);
     for _ in 0..6 {
         let mask = vos_pvm_compiler::shape::ALWAYS | (rng.next_u64() as u32 & chip_idx::OPTIONAL);
-        let sizes: [u32; 25] = core::array::from_fn(|_| 4 + (rng.next_u64() % 15) as u32);
+        let sizes: [u32; COUNT] = core::array::from_fn(|_| 4 + (rng.next_u64() % 15) as u32);
         shapes.push((mask, sizes));
     }
     for (mask, sizes) in shapes {
-        let log_sizes: Vec<u32> = (0..25)
+        let log_sizes: Vec<u32> = (0..COUNT)
             .filter(|&c| mask & 1 << c != 0)
             .map(|c| sizes[c])
             .collect();
         let (context, plan, finalized) = built(mask, &log_sizes);
         let rows = context.rows();
-        let record: [u8; 25] = core::array::from_fn(|c| {
+        let record: [u8; COUNT] = core::array::from_fn(|c| {
             if mask & 1 << c != 0 {
                 sizes[c] as u8
             } else {

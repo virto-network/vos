@@ -157,9 +157,7 @@ pub(crate) fn step_reg_accesses(step: &crate::core::step::PvmStep) -> StepRegAcc
     //   blake2b: φ[7..=10] ([`BLAKE2B_CALL_REGS`]).
     //   witness input: φ[7,8] (destination/capacity), before the step's
     //   write of its count to φ[7].
-    //   Poseidon2: φ[7,8] (input/output pointers), which only the shared
-    //   chip set's CPU (`CpuP2Chip`) produces; format 35's never serves the
-    //   call.
+    //   Poseidon2: φ[7,8] (input/output pointers).
     // Only a served call reads them (`PvmStep::served_ecall`): for any
     // other the CpuChip emits no producer.
     let ecall = step.served_ecall();

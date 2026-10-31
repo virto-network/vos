@@ -1,11 +1,11 @@
 //! Poseidon2Chip — the Poseidon2 call (`0x402`, `slice-7-mobile.md` pin H),
-//! one permutation a row, in the shared chip set (formats 41 and 45).
+//! one permutation a row, in the shared chip set (formats 41 and 46).
 //!
 //! A row is a served call at its step's timestamp:
 //!
 //! - **The call:** it CONSUMES `(ts, φ7, φ8)` in the `Poseidon2Call`
-//!   relation, which the shared chip set's CPU produces from the call's row
-//!   (`CpuP2Chip`), so a row is a call and a call has its row.
+//!   relation, which the CPU produces from the call's row (`CpuChip`), so a
+//!   row is a call and a call has its row.
 //! - **The input:** 64 bytes at `φ7 + i`, each a PRODUCED read of the memory
 //!   ledger at the call's timestamp; four bytes a word, little-endian. Each
 //!   word is below p: its top byte below 128 (`Range256` of it and of it

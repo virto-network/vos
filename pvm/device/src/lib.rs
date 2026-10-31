@@ -15,7 +15,7 @@
 //!   and the binding are computed here, from it. [`verify`] checks a proof
 //!   against its call as ingress does.
 //! - **Device kernels** ([`DeviceProgram`], [`Prover::prove_kernel`]): a
-//!   kernel's run proved under the device profile, format 45, against the
+//!   kernel's run proved under the device profile, format 46, against the
 //!   program ingress computes from the same kernel; auth's statement by a
 //!   device kernel ([`Prover::prove_device_auth`], [`verify_device`]), which
 //!   a guard naming that kernel takes as it takes auth's credential proof.

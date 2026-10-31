@@ -13,7 +13,7 @@
 //! The verifier pins the preprocessed root ([`circuit_root`]): the tables'
 //! and the code's content has no other pin. It takes the chips and their
 //! sizes from the proof, and the transcript does not mix the chips (as
-//! format 35's does not); the device's segment ([`super::device`]) takes
+//! format 41's does not); the device's segment ([`super::device`]) takes
 //! both from its program and mixes the chips after the header.
 
 use num_traits::Zero;

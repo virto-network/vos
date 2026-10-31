@@ -156,7 +156,7 @@ impl Target {
     }
 }
 
-/// Prove under the segment format (35), over the trace's natural shape.
+/// Prove under the segment format (41), over the trace's natural shape.
 pub fn prove(side_note: &mut SideNote) -> Result<Proof, ProvingError> {
     install_thread_pool();
     let (proof, _) = prove_impl(side_note, Target::SEGMENT, false)?;

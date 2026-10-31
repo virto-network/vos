@@ -133,32 +133,21 @@ pub fn kernel_side_note(blob: &[u8]) -> Result<SideNote, KernelTraceError> {
 /// agent runs it: the standard layout with no arguments, φ0 the halt
 /// address, φ1 the stack's top, φ7 the argument window and φ8 0.
 pub fn trace_kernel(blob: &[u8], input: &[u8], gas: u64) -> Result<KernelTrace, KernelTraceError> {
-    trace(blob, &[], input, gas, false, |_| {})
+    trace(blob, &[], input, gas, |_| {})
 }
 
-/// [`trace_kernel`] with the Poseidon2 call served
-/// (`TracingPvm::with_poseidon2`): a device kernel's run, which only the
-/// shared chip set proves.
-pub fn trace_device_kernel(
-    blob: &[u8],
-    input: &[u8],
-    gas: u64,
-) -> Result<KernelTrace, KernelTraceError> {
-    trace(blob, &[], input, gas, true, |_| {})
-}
-
-/// [`trace_device_kernel`] with the machine's memory changed by `forge`
-/// before the run (its pages' permissions, its bytes), the change in the
-/// run's entering image: the device forgery gates' runs, which no loader
-/// makes. The tests' dev edge alone (`seeded-masks`).
+/// [`trace_kernel`] with the machine's memory changed by `forge` before
+/// the run (its pages' permissions, its bytes), the change in the run's
+/// entering image: the device forgery gates' runs, which no loader makes.
+/// The tests' dev edge alone (`seeded-masks`).
 #[cfg(feature = "seeded-masks")]
-pub fn trace_forged_device_kernel(
+pub fn trace_forged_kernel(
     blob: &[u8],
     input: &[u8],
     gas: u64,
     forge: impl FnOnce(&mut Memory),
 ) -> Result<KernelTrace, KernelTraceError> {
-    trace(blob, &[], input, gas, true, forge)
+    trace(blob, &[], input, gas, forge)
 }
 
 /// Run standard program `blob` with `gas` on `arguments`, mapped read-only
@@ -169,20 +158,19 @@ pub fn trace_program(
     arguments: &[u8],
     gas: u64,
 ) -> Result<KernelTrace, KernelTraceError> {
-    trace(blob, arguments, &[], gas, false, |_| {})
+    trace(blob, arguments, &[], gas, |_| {})
 }
 
-/// [`trace_device_kernel`] run to whatever exit it reaches, a trap
-/// included: its side note and how it stopped, what a forged trace of a run
-/// that does not halt starts from. The tests' dev edge alone
-/// (`seeded-masks`).
+/// [`trace_kernel`] run to whatever exit it reaches, a trap included: its
+/// side note and how it stopped, what a forged trace of a run that does not
+/// halt starts from. The tests' dev edge alone (`seeded-masks`).
 #[cfg(feature = "seeded-masks")]
-pub fn trace_device_kernel_to_exit(
+pub fn trace_kernel_to_exit(
     blob: &[u8],
     input: &[u8],
     gas: u64,
 ) -> Result<(SideNote, ExitReason), KernelTraceError> {
-    let (mut tracer, image, permissions) = start(blob, &[], input, gas, true, |_| {})?;
+    let (mut tracer, image, permissions) = start(blob, &[], input, gas, |_| {})?;
     let exit = tracer.run_with_precompiles();
     let side_note = tracer
         .into_side_note()
@@ -198,7 +186,6 @@ fn start(
     arguments: &[u8],
     input: &[u8],
     gas: u64,
-    poseidon2: bool,
     forge: impl FnOnce(&mut Memory),
 ) -> Result<
     (
@@ -212,11 +199,6 @@ fn start(
     let tracer = TracingPvm::new(machine)
         .with_witness_input(input.to_vec())
         .ok_or(KernelTraceError::Input)?;
-    let tracer = if poseidon2 {
-        tracer.with_poseidon2()
-    } else {
-        tracer
-    };
     Ok((tracer, image, permissions))
 }
 
@@ -225,10 +207,9 @@ fn trace(
     arguments: &[u8],
     input: &[u8],
     gas: u64,
-    poseidon2: bool,
     forge: impl FnOnce(&mut Memory),
 ) -> Result<KernelTrace, KernelTraceError> {
-    let (mut tracer, image, permissions) = start(blob, arguments, input, gas, poseidon2, forge)?;
+    let (mut tracer, image, permissions) = start(blob, arguments, input, gas, forge)?;
     let exit = tracer.run_with_precompiles();
     if exit != ExitReason::Halt {
         return Err(KernelTraceError::Exit(exit));
