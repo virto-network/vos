@@ -576,7 +576,7 @@ fn agents(placed: &[&Placed], targets: &[Target]) -> Result<Vec<Agent>, String> 
                 Err(vos_node::client::ClientError::NoAgent) => {
                     last = format!("agent {}: unknown to node {replica}", agent.0)
                 }
-                Err(error) => last = format!("agent {}: {error}", agent.0),
+                Err(error) => last = format!("agent {} at node {replica}: {error}", agent.0),
             }
         }
         Err(last)
@@ -607,12 +607,15 @@ fn agents(placed: &[&Placed], targets: &[Target]) -> Result<Vec<Agent>, String> 
 
 fn methods(plan: &Plan, targets: &[Target]) -> Result<Methods, String> {
     let first = plan.shards.first().ok_or("no ledger shards")?;
+    let node = usize::from(first.replicas[0]);
+    // A node gone since `up` (killed past its memory cap, say) refuses the
+    // connection: the error names it.
     let schema = vos_node::client::schema(
-        &targets[usize::from(first.replicas[0]) - 1],
+        &targets[node - 1],
         AgentId(first.agent),
         InstanceId(first.instance),
     )
-    .map_err(|error| error.to_string())?
+    .map_err(|error| format!("the shard actor's schema from node {node}: {error}"))?
     .ok_or("nothing installed in the first shard")?;
     let id = |name: &str| {
         schema
