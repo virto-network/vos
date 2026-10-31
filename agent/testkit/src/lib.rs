@@ -610,7 +610,9 @@ pub struct KernelRan {
     /// What it left in φ9..φ12.
     pub io_hash: [u8; 32],
     pub gas_used: u64,
-    /// Its precompile calls.
+    /// Its precompile calls: BLAKE2b compressions for a node's kernel,
+    /// Poseidon2 calls for a device kernel's ([`run_device_kernel`]), which
+    /// no bound on a kernel's compressions counts.
     pub compressions: u64,
 }
 

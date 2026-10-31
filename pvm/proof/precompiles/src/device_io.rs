@@ -33,7 +33,7 @@
 pub const DEVICE_IO_TAG: u32 = 0x7038_de5c;
 
 /// The bytes `E` may hold: below 2^24. A kernel's return lies in its heap,
-/// a few hundred KiB at most, and a work result holds 4 MiB, so no return a
+/// 512 KiB at most, and a work result holds 4 MiB, so no return a
 /// kernel makes reaches it; it keeps the length block's word below 2^24
 /// as every data word is.
 pub const MAX_DEVICE_IO: u64 = 1 << 24;

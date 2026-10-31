@@ -17,10 +17,14 @@ use crate::runtime::Output;
 /// The bytes start with room for each part's compact length, four bytes
 /// before the public arguments and four before the output; [`Self::end`]
 /// writes each length into its room and closes the gap the output's leaves.
+///
+/// Its methods are `#[inline]`, so its code is the device kernel's crate's
+/// alone and the SDK's own code, which node kernels reach, is laid out as
+/// without it.
 pub struct DeviceReturn {
     bytes: Vec<u8>,
     /// Where the output's room starts, once [`Self::output`] began it.
-    output_at: usize,
+    output_at: Option<usize>,
 }
 
 /// The room a part's compact length takes at most: four bytes, a length
@@ -28,6 +32,7 @@ pub struct DeviceReturn {
 const ROOM: usize = 4;
 
 impl Default for DeviceReturn {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
@@ -35,40 +40,50 @@ impl Default for DeviceReturn {
 
 impl DeviceReturn {
     /// An end with room for parts of `DEVICE_RETURN` bytes before it grows.
+    #[inline]
     pub fn new() -> Self {
         const DEVICE_RETURN: usize = 256;
         let mut bytes = Vec::with_capacity(DEVICE_RETURN);
         bytes.extend_from_slice(&[0; ROOM]);
         Self {
             bytes,
-            output_at: 0,
+            output_at: None,
         }
     }
 
     /// Where the public arguments' encodings go, in order.
+    #[inline]
     pub fn public_args(&mut self) -> &mut Vec<u8> {
         &mut self.bytes
     }
 
-    /// Where the output's encoding goes, after the public arguments.
+    /// Where the output's encoding goes, after the public arguments: once;
+    /// a second call traps.
+    #[inline]
     pub fn output(&mut self) -> &mut Vec<u8> {
-        self.output_at = self.bytes.len();
+        if self.output_at.is_some() {
+            trap();
+        }
+        self.output_at = Some(self.bytes.len());
         self.bytes.extend_from_slice(&[0; ROOM]);
         &mut self.bytes
     }
 
     /// The parts' encoding `E`, leaked for the host, and its io-hash `H_io`
     /// written at `io_hash`. A part of 2^30 bytes or more, or an `E` of
-    /// 2^24 or more, traps, after the method ran.
+    /// 2^24 or more, traps, after the method ran, as does an end whose
+    /// output [`Self::output`] never began.
     ///
     /// # Safety
     ///
     /// `io_hash` must point at 32 writable bytes.
+    #[inline]
     pub unsafe fn end(self, io_hash: *mut [u8; 32]) -> Output {
         let Self {
             mut bytes,
             output_at,
         } = self;
+        let output_at = output_at.unwrap_or_else(|| trap());
         let length = |len: usize| {
             u32::try_from(len)
                 .ok()
@@ -104,6 +119,7 @@ impl DeviceReturn {
 
 /// A trap, on the guest; a panic elsewhere.
 #[cold]
+#[inline]
 fn trap() -> ! {
     #[cfg(target_arch = "riscv64")]
     // SAFETY: `unimp` lowers to a PVM trap, which fails the run.

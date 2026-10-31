@@ -129,8 +129,14 @@ fn msg_options(attribute: &Attribute) -> syn::Result<Options> {
             } else if meta.path.is_ident("device") {
                 let span = meta.path.span();
                 if meta.input.peek(syn::Token![=]) {
+                    if options.device.is_some() {
+                        return Err(meta.error("`device = \"...\"` given twice"));
+                    }
                     options.device = Some((string_arg(&meta)?, span));
                 } else {
+                    if options.device_kernel.is_some() {
+                        return Err(meta.error("`device` given twice"));
+                    }
                     options.device_kernel = Some(span);
                 }
             } else if meta.path.is_ident("once") {
@@ -230,6 +236,13 @@ fn handler(
             attribute.span(),
             "an #[attestable] method takes `gas = N`, `venue_bound` and `device` alone: it has \
              no caller",
+        ));
+    }
+    if let (Some(span), Some(_)) = (options.device_kernel, options.venue_bound) {
+        return Err(Error::new(
+            span,
+            "an #[attestable(device)] method is not `venue_bound`: no venue judges a device's \
+             statement",
         ));
     }
     if let Some(span) = options.device_kernel
@@ -786,11 +799,6 @@ fn attestable_entry(
 fn device_body(handler: &Handler, module: &Ident, message: &Ident) -> Tokens {
     let method = &handler.method.sig.ident;
     let names = handler.names();
-    let venue = handler.options.venue_bound.map(|_| quote!(venue,));
-    let bound = handler
-        .options
-        .venue_bound
-        .map(|_| quote!(::vos_sdk::Encode::encode_to(&venue, parts.public_args());));
     let publics = handler
         .arguments
         .iter()
@@ -798,13 +806,12 @@ fn device_body(handler: &Handler, module: &Ident, message: &Ident) -> Tokens {
         .filter(|(_, public)| **public)
         .map(|((name, _), _)| quote!(::vos_sdk::Encode::encode_to(&#name, parts.public_args());));
     quote! {
-        let ::core::result::Result::Ok((#module::#message { #venue #(#names),* }, _)) =
+        let ::core::result::Result::Ok((#module::#message { #(#names),* }, _)) =
             <#module::#message as ::vos_sdk::Decode>::decode(input)
         else {
             ::core::panic!("undecodable arguments")
         };
         let mut parts = ::vos_sdk::device::DeviceReturn::new();
-        #bound
         #(#publics)*
         let output = Self::#method(#(#names),*);
         ::vos_sdk::Encode::encode_to(&output, parts.output());

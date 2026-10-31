@@ -122,10 +122,11 @@ const ATTEST_ENTRY: u64 = 16;
 pub struct Derived {
     pub actor: Vec<u8>,
     pub kernels: Vec<(u32, Vec<u8>)>,
-    /// Each kernel's shape, by its position in `kernels`: a node's segment
-    /// shape. A device kernel's is the device profile's, from its code
-    /// (`vos_pvm_proof::device::device_chips_of_code`), which its install
-    /// takes; no node proves its segments.
+    /// Each kernel's shape, by its position in `kernels`: the node's
+    /// segment shape. A device kernel's is recorded alike but never proved,
+    /// and not held to the recursion's leaves: a device proves it under its
+    /// device profile, whose chips its code gives
+    /// (`vos_pvm_proof::device::device_chips_of_code`).
     pub shapes: Vec<vos_wire::records::Shape>,
     /// The device kernels' methods (`#[attestable(device)]`), ascending.
     pub devices: Vec<u32>,
@@ -224,7 +225,7 @@ pub fn derive(elf: &[u8]) -> Result<Derived, DeriveError> {
     let graph = Graph::new(&linked);
     let entries = attestables(&linked)?;
     kinds_as_declared(&schema, &entries)?;
-    let devices = entries
+    let devices: Vec<u32> = entries
         .iter()
         .filter(|entry| entry.device)
         .map(|entry| entry.method)
@@ -237,6 +238,11 @@ pub fn derive(elf: &[u8]) -> Result<Derived, DeriveError> {
         .iter()
         .map(|(method, kernel)| {
             let shape = crate::shape::kernel_shape(kernel).expect("a kernel is a standard program");
+            // No node cuts a device kernel into segments: its leaves are
+            // never proved.
+            if devices.contains(method) {
+                return Ok(shape);
+            }
             match crate::leaf::oversized_leaves(&shape).first() {
                 Some(&(class, rows)) => Err(DeriveError::Leaf {
                     method: *method,
@@ -287,19 +293,12 @@ fn invocation_heap(elf: &mut LinkedElf) -> Result<u32, DeriveError> {
 fn kinds_as_declared(schema: &[u8], entries: &[AttestEntry]) -> Result<(), DeriveError> {
     use vos_wire::abi::Kind;
     let table = |why: String| DeriveError::Table(why);
-    let read = || {
-        vos_wire::schema::Schema::read(schema)
-            .map_err(|error| table(format!("the schema does not read: {error:?}")))
+    let schema = match vos_wire::schema::Schema::read(schema) {
+        Ok(schema) => schema,
+        // An ELF of no attestable method needs no schema that reads.
+        Err(_) if entries.is_empty() => return Ok(()),
+        Err(error) => return Err(table(format!("the schema does not read: {error:?}"))),
     };
-    if entries.is_empty() {
-        // An ELF of no attestable method may still guard a method by a
-        // device kernel it lacks: refused below.
-        let Ok(schema) = vos_wire::schema::Schema::read(schema) else {
-            return Ok(());
-        };
-        return devices_as_named(&schema, entries);
-    }
-    let schema = read()?;
     for entry in entries {
         let method = entry.method;
         let kind = schema
@@ -317,6 +316,14 @@ fn kinds_as_declared(schema: &[u8], entries: &[AttestEntry]) -> Result<(), Deriv
                  device kernel's"
             )));
         }
+    }
+    if let Some(method) = schema.methods.iter().find(|method| {
+        method.kind == Kind::Device && !entries.iter().any(|entry| entry.method == method.id.0)
+    }) {
+        return Err(table(format!(
+            "device kernel {:#010x} has no entry",
+            method.id.0
+        )));
     }
     devices_as_named(&schema, entries)
 }
@@ -1248,11 +1255,14 @@ mod tests {
                 "{entries:?}"
             );
         }
-        // A guard naming a device kernel of an ELF with no kernel at all.
-        assert!(matches!(
-            kinds_as_declared(&section(Kind::Command, "auth"), &[]),
-            Err(DeriveError::Table(_))
-        ));
+        // An ELF with no kernel at all: a guard naming a device kernel, and
+        // a device method of no entry.
+        for kind in [Kind::Command, Kind::Device] {
+            assert!(matches!(
+                kinds_as_declared(&section(kind, "auth"), &[]),
+                Err(DeriveError::Table(_))
+            ));
+        }
     }
 
     /// Method 7's entry at `at`, a device kernel's or a node's.
