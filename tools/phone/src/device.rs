@@ -97,6 +97,15 @@ impl Cell {
     }
 }
 
+/// A proof's masks: the operating system's, or the seeded build's fixed
+/// seed, so a proof's bytes are the same on any machine and in any pool.
+fn masks() -> MaskRng {
+    #[cfg(feature = "seeded")]
+    return MaskRng::Seeded(crate::SEED);
+    #[cfg(not(feature = "seeded"))]
+    MaskRng::default()
+}
+
 /// The kernel and the witness input of `statement` in `dir`.
 fn statement(dir: &Path, statement: &str) -> (Vec<u8>, Vec<u8>) {
     let read = |extension: &str| {
@@ -155,7 +164,7 @@ fn measure<MC: MerkleChannel>(
         let traced = started.elapsed();
         let started = Instant::now();
         let (proof, made) = prover
-            .prove(&mut side_note, MaskRng::default())
+            .prove(&mut side_note, masks())
             .expect("the device kernel proves");
         let proved = started.elapsed();
         let started = Instant::now();
@@ -230,7 +239,7 @@ fn measure<MC: MerkleChannel>(
          \"reps\":{reps},\"install_ms\":{install_ms:.1},\"trace_ms_p50\":{:.1},\
          \"prove_ms_p50\":{:.1},\"prove_ms_p95\":{:.1},\"prove_ms_min\":{:.1},\"prove_ms_max\":{:.1},\"prove_ms_runs\":[{}],\
          \"verify_ms_p50\":{:.2},\"r1_attempts\":{},\"r1_ms\":{:.1},\"proof_bytes\":{},\"distinct_proofs\":{distinct},\
-         \"verified\":true,\"peak_rss_mib\":{:.1}}}",
+         \"proof_sha256\":\"{}\",\"verified\":true,\"peak_rss_mib\":{:.1}}}",
         format.number,
         rayon::current_num_threads(),
         format.masking.expect("masked").log_mask_rows,
@@ -245,6 +254,7 @@ fn measure<MC: MerkleChannel>(
         stats.attempts,
         stats.rank_check.as_secs_f64() * 1e3,
         bytes.len(),
+        hashes.last().expect("a rep"),
         peak_rss_mib().unwrap_or(-1.0),
     );
 }
