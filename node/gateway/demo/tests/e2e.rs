@@ -462,7 +462,7 @@ async fn enroll_sign_in_and_pay_through_the_gateways_ssh_port() {
         enrolled
             .rows
             .iter()
-            .any(|(_, value)| value.contains("login (scope “login”, by this device's kernel)"))
+            .any(|(_, value)| value.contains("login (scope “login”, by this device's kernel "))
     );
     user.will(confirm(&[]));
     let at = phone.click("Sign in with my device's kernel").await;
