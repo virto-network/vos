@@ -351,6 +351,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "atomic-polyfill"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8cf2bce30dfe09ef0bfaef228b9d414faaf7e563035494d7fe092dba54b300f4"
+dependencies = [
+ "critical-section",
+]
+
+[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1753,6 +1762,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hash32"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0c35f58762feb77d74ebe43bdbc3210f09be9fe6742234d573bacc26ed92b67"
+dependencies = [
+ "byteorder",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1763,13 +1781,6 @@ name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
-dependencies = [
- "allocator-api2",
- "equivalent",
- "foldhash",
- "serde",
- "serde_core",
-]
 
 [[package]]
 name = "hashbrown"
@@ -1780,6 +1791,22 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash",
+ "serde",
+ "serde_core",
+]
+
+[[package]]
+name = "heapless"
+version = "0.7.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cdc6457c0eb62c71aac4bc17216026d8410337c4126773b9c5daba343f17964f"
+dependencies = [
+ "atomic-polyfill",
+ "hash32",
+ "rustc_version",
+ "serde",
+ "spin",
+ "stable_deref_trait",
 ]
 
 [[package]]
@@ -2793,6 +2820,7 @@ dependencies = [
  "cobs",
  "embedded-io 0.4.0",
  "embedded-io 0.6.1",
+ "heapless",
  "serde",
 ]
 
@@ -3479,12 +3507,12 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s4-credential"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=6f60229e97fb1f54b51f53c2406c168e1004a19b#6f60229e97fb1f54b51f53c2406c168e1004a19b"
+source = "git+https://codeberg.org/Virto/s4?rev=08433f1ba696796e78d3a5437608098ff4924a71#08433f1ba696796e78d3a5437608098ff4924a71"
 dependencies = [
  "getrandom 0.2.17",
  "hex",
  "russh",
- "s4-protocol",
+ "s4-protocol 0.1.0 (git+https://codeberg.org/Virto/s4?rev=08433f1ba696796e78d3a5437608098ff4924a71)",
  "serde",
  "sha2 0.10.9",
  "tokio",
@@ -3493,6 +3521,18 @@ dependencies = [
  "vos-device",
  "vos-wire",
  "zeroize",
+]
+
+[[package]]
+name = "s4-protocol"
+version = "0.1.0"
+source = "git+https://codeberg.org/Virto/s4?rev=08433f1ba696796e78d3a5437608098ff4924a71#08433f1ba696796e78d3a5437608098ff4924a71"
+dependencies = [
+ "base64",
+ "ciborium",
+ "ciborium-io",
+ "serde",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -3516,7 +3556,7 @@ dependencies = [
  "libc",
  "ratatui",
  "ratatui-image",
- "s4-protocol",
+ "s4-protocol 0.1.0 (git+https://codeberg.org/Virto/s4?rev=6f60229e97fb1f54b51f53c2406c168e1004a19b)",
  "s4-widgets",
  "sha2 0.10.9",
  "taffy",
@@ -3532,7 +3572,7 @@ source = "git+https://codeberg.org/Virto/s4?rev=6f60229e97fb1f54b51f53c2406c168e
 dependencies = [
  "rand 0.10.3",
  "russh",
- "s4-protocol",
+ "s4-protocol 0.1.0 (git+https://codeberg.org/Virto/s4?rev=6f60229e97fb1f54b51f53c2406c168e1004a19b)",
  "s4-rui",
  "tokio",
  "tracing",
@@ -3543,7 +3583,7 @@ name = "s4-widgets"
 version = "0.1.0"
 source = "git+https://codeberg.org/Virto/s4?rev=6f60229e97fb1f54b51f53c2406c168e1004a19b#6f60229e97fb1f54b51f53c2406c168e1004a19b"
 dependencies = [
- "s4-protocol",
+ "s4-protocol 0.1.0 (git+https://codeberg.org/Virto/s4?rev=6f60229e97fb1f54b51f53c2406c168e1004a19b)",
  "serde",
  "serde_bytes",
 ]
@@ -3966,6 +4006,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "stable_deref_trait"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
 name = "stacker"
 version = "0.1.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4081,7 +4127,7 @@ dependencies = [
  "dashmap",
  "educe",
  "fnv",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
  "hex",
  "indexmap",
  "itertools 0.12.1",
@@ -4102,7 +4148,7 @@ name = "stwo-constraint-framework"
 version = "2.2.0"
 source = "git+https://github.com/olanod/stwo?rev=9e9b4ff61abb319489be745b729880d8ac8177a4#9e9b4ff61abb319489be745b729880d8ac8177a4"
 dependencies = [
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
  "itertools 0.12.1",
  "num-traits",
  "rand 0.8.6",
@@ -4694,7 +4740,7 @@ dependencies = [
  "hmac 0.12.1",
  "russh",
  "s4-credential",
- "s4-protocol",
+ "s4-protocol 0.1.0 (git+https://codeberg.org/Virto/s4?rev=08433f1ba696796e78d3a5437608098ff4924a71)",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
@@ -4763,6 +4809,7 @@ dependencies = [
  "vos-pvm",
  "vos-pvm-compiler",
  "vos-pvm-final-verifier",
+ "vos-pvm-recair",
  "vos-raft",
  "vos-tree",
  "vos-venue",
@@ -4887,6 +4934,7 @@ dependencies = [
  "bytemuck",
  "getrandom 0.2.17",
  "num-traits",
+ "postcard",
  "rand 0.8.6",
  "rand_chacha",
  "rayon",
@@ -4895,6 +4943,7 @@ dependencies = [
  "stwo-constraint-framework",
  "vos-pvm-final-verifier",
  "vos-pvm-poseidon2",
+ "vos-pvm-precompiles",
  "vos-pvm-proof",
  "vos-pvm-recair-air",
  "vos-wire",

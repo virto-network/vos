@@ -4,8 +4,10 @@
 //! `vos.credential` facility s4's own (`s4-credential`) proving with this
 //! tree's device library, its secret source a software HMAC key and its
 //! chrome a script. The client enrolls, the operator invites the two
-//! digests it shows, it claims them, signs in on the path it fetched apart
-//! and pays: what the chrome confirmed is paid, whatever the document's
+//! digests it shows, it claims them, signs in on the path it fetched apart,
+//! by a credential proof and by a device proof of the device actor's
+//! kernel (pinned at enrollment), under one pseudonym, and pays: what the
+//! chrome confirmed is paid, whatever the document's
 //! fields held, and a request naming another method is refused by the
 //! gateway before any node.
 
@@ -452,6 +454,28 @@ async fn enroll_sign_in_and_pay_through_the_gateways_ssh_port() {
             .rows
             .iter()
             .any(|(_, value)| value.contains("login (scope “login”)"))
+    );
+
+    // Sign in by the device kernel pinned at enrollment: a device proof,
+    // relayed and run in the device actor's scope "login".
+    assert!(
+        enrolled
+            .rows
+            .iter()
+            .any(|(_, value)| value.contains("login (scope “login”, by this device's kernel)"))
+    );
+    user.will(confirm(&[]));
+    let at = phone.click("Sign in with my device's kernel").await;
+    let by_kernel = phone
+        .settle(at, &["Signed in as", "Not done", "refused", "failed"])
+        .await;
+    assert!(by_kernel.starts_with("Signed in as"), "{by_kernel}");
+    let form = user.shown.lock().unwrap().last().cloned().unwrap();
+    assert!(
+        form.rows
+            .iter()
+            .any(|(name, value)| name == "Proof" && value.contains("kernel")),
+        "the chrome names the device proof"
     );
 
     // Pay: the document's fields say 999 to mallory; the user confirms 20

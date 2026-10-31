@@ -58,9 +58,13 @@ pub fn server(
 ) -> Server {
     let server = match demo {
         Some((demo, app)) => {
-            let service = Arc::new(crate::demo::Service::new(demo, Arc::clone(&gateway), app));
+            let service = Arc::new(crate::demo::Service::new(
+                demo.clone(),
+                Arc::clone(&gateway),
+                app,
+            ));
             Server::new(crate::demo::APPLICATION, move || {
-                crate::demo::Screens::new(demo)
+                crate::demo::Screens::new(demo.clone())
             })
             .facility(crate::demo::FACILITY, 1)
             .host_service_fn(crate::demo::SERVICE, move |request| {
@@ -113,7 +117,7 @@ pub async fn start(
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .map_err(|error| format!("{address}: {error}"))?;
-    let demo = match (config.demo, app) {
+    let demo = match (config.demo.clone(), app) {
         (Some(demo), Some(app)) => Some((demo, app)),
         (Some(_), None) => return Err("the demo's screens need app_key".into()),
         (None, _) => None,

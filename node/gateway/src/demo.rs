@@ -1,12 +1,17 @@
 //! The demo's three screens on the SSH port (`slice-7-mobile.md` 7.13):
 //! *Enroll*, *Sign in* and *Pay*, server-owned s4 documents over the
-//! credential actor and the `purses` ledger of one agent. The proofs are
+//! credential actor and the `purses` ledger of one agent. *Sign in* offers
+//! the credential proof (the poll's `login`) and, where the file names the
+//! device actor, a device proof of its kernel `auth` (its `login`, whose
+//! guard names that kernel; 7.20): the enrollment pins the kernel's bytes,
+//! which the device proves under the device profile. The proofs are
 //! the member's device's: the client's `vos.credential` facility, which the
 //! app asks and whose answer, a node-API `Credentialed` request, the gateway
 //! relays as it is after checking it names this agent and the screen's
 //! method. The gateway builds no credential bytes and holds no authority;
 //! its app key sends only the claims an operator's invitations allow.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use s4_server::rui::{App, Cx, Effect, EffectOutput, EffectRequest, View, ViewContext, view};
@@ -32,13 +37,27 @@ pub const APPLICATION: &str = "vos.gateway";
 
 /// The agent the demo serves and its actors' instances, from the gateway's
 /// file.
-#[derive(Clone, Copy, Debug, serde::Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Demo {
     pub agent: u32,
     pub credentials: u32,
     pub purses: u32,
     pub poll: u32,
+    /// The device actor, whose `login` also takes a device proof of its
+    /// kernel `auth`: none, and *Sign in* offers the credential proof
+    /// alone.
+    #[serde(default)]
+    pub device: Option<DeviceSignIn>,
+}
+
+/// The device actor's instance, and the file holding its kernel `auth` as
+/// the install derived it, which the enrollment pins on the device.
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceSignIn {
+    pub instance: u32,
+    pub kernel: PathBuf,
 }
 
 /// The guarded methods the device is asked to pin, and the ledger's.
@@ -312,7 +331,7 @@ impl Service {
     /// the device may prove for.
     async fn enrollment(&self) -> Result<Value, HostServiceError> {
         let space = self.space().await?;
-        let demo = self.demo;
+        let demo = &self.demo;
         let guarded = |instance: u32, name: &str, guard: &str, scope: Option<(&str, bool)>| {
             let mut entries = vec![
                 ("agent", Value::from(demo.agent)),
@@ -324,8 +343,21 @@ impl Service {
                 entries.push(("scope", Value::from(scope)));
                 entries.push(("once", Value::Bool(once)));
             }
-            object(entries)
+            entries
         };
+        let mut methods = vec![
+            object(guarded(demo.poll, LOGIN, "auth", Some((LOGIN, false)))),
+            object(guarded(demo.poll, VOTE, "auth", Some((VOTE, true)))),
+            object(guarded(demo.purses, TRANSFER, "owner", None)),
+        ];
+        // The device actor's `login`, its device kernel pinned with it.
+        if let Some(device) = &demo.device {
+            let kernel = std::fs::read(&device.kernel)
+                .map_err(|error| failed(format!("the device kernel: {error}")))?;
+            let mut login = guarded(device.instance, LOGIN, "auth", Some((LOGIN, false)));
+            login.push(("kernel", Value::Bytes(kernel)));
+            methods.push(object(login));
+        }
         Ok(object([
             ("handle", Value::Bytes(space.handle.to_vec())),
             ("space", Value::Bytes(space.space.0.to_vec())),
@@ -336,14 +368,7 @@ impl Service {
                     ("identity", Value::Bytes(space.identity.to_vec())),
                 ])]),
             ),
-            (
-                "methods",
-                Value::Array(vec![
-                    guarded(demo.poll, LOGIN, "auth", Some((LOGIN, false))),
-                    guarded(demo.poll, VOTE, "auth", Some((VOTE, true))),
-                    guarded(demo.purses, TRANSFER, "owner", None),
-                ]),
-            ),
+            ("methods", Value::Array(methods)),
             (
                 "credentials",
                 object([
@@ -389,9 +414,17 @@ impl Service {
     /// node.
     async fn relay(&self, args: &Value) -> Result<Value, HostServiceError> {
         let request = bytes(args, "request")?;
-        let allowed: &[(u32, &str)] = match text(args, "screen")? {
-            "sign_in" => &[(self.demo.poll, LOGIN), (self.demo.poll, VOTE)],
-            "pay" => &[(self.demo.purses, TRANSFER)],
+        let device = self
+            .demo
+            .device
+            .as_ref()
+            .map(|device| (device.instance, LOGIN));
+        let allowed: Vec<(u32, &str)> = match text(args, "screen")? {
+            "sign_in" => [(self.demo.poll, LOGIN), (self.demo.poll, VOTE)]
+                .into_iter()
+                .chain(device)
+                .collect(),
+            "pay" => vec![(self.demo.purses, TRANSFER)],
             _ => return Err(failed("no such screen")),
         };
         let (kind, body) = request
@@ -508,6 +541,8 @@ pub enum Message {
     Claim,
     Claimed(EffectOutput),
     SignIn,
+    /// Sign in with a device proof of the device actor's kernel.
+    SignInKernel,
     Proved(Screen, EffectOutput),
     Relayed(Screen, EffectOutput),
     Pay,
@@ -721,9 +756,17 @@ impl App for Screens {
                     None => page,
                 }
             }
-            Screen::SignIn => page
-                .text("Sign in with your device")
-                .button("Sign in with my device", Message::SignIn),
+            Screen::SignIn => {
+                let page = page
+                    .text("Sign in with your device")
+                    .button("Sign in with my device", Message::SignIn);
+                match self.demo.device {
+                    Some(_) => {
+                        page.button("Sign in with my device's kernel", Message::SignInKernel)
+                    }
+                    None => page,
+                }
+            }
             Screen::Pay => {
                 let page = page
                     .text("Pay from your row")
@@ -799,14 +842,18 @@ impl App for Screens {
                 }
                 other => self.failed(other),
             },
-            Message::SignIn => {
+            Message::SignIn | Message::SignInKernel => {
+                let instance = match (&message, &self.demo.device) {
+                    (Message::SignInKernel, Some(device)) => device.instance,
+                    _ => self.demo.poll,
+                };
                 self.status = "Asking the device…".into();
                 self.proving = None;
                 cx.effect(facility(
                     "sign_in",
                     object([
                         ("agent", Value::from(self.demo.agent)),
-                        ("instance", Value::from(self.demo.poll)),
+                        ("instance", Value::from(instance)),
                         ("method", Value::from(LOGIN)),
                         ("arguments", Value::Bytes(().encode())),
                     ]),

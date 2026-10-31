@@ -1,6 +1,8 @@
 //! The s4 demo on a local space (`slice-7-mobile.md` 7.13): one node of a
-//! founded space whose agent holds the credential actor, the poll and the
-//! `purses` ledger, an operator who invites members and mints, and the
+//! founded space whose agent holds the credential actor, the poll, the
+//! `purses` ledger and the device actor (whose `login` takes a device proof
+//! of its kernel `auth` beside a credential proof, 7.20), an operator who
+//! invites members and mints, and the
 //! gateway's SSH port serving the demo's screens over the node's socket.
 //! The phone gate (PG3) runs it through `adb reverse`; the end-to-end test
 //! drives it with a headless client.
@@ -12,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use ed25519_dalek::SigningKey;
 use vos_gateway::Gateway;
 use vos_gateway::app::AppClient;
-use vos_gateway::demo::Demo;
+use vos_gateway::demo::{Demo, DeviceSignIn};
 use vos_gateway::limits::{Limits, PerAddress};
 use vos_gateway::upstream::{Address, Upstream};
 use vos_node::client::{self, Client, Operator, Target};
@@ -27,6 +29,7 @@ use vos_wire::{Decode, Encode, WindowClock};
 pub const CREDENTIALS: InstanceId = InstanceId(9);
 pub const PURSES: InstanceId = InstanceId(2);
 pub const POLL: InstanceId = InstanceId(3);
+pub const DEVICE: InstanceId = InstanceId(4);
 /// The operator's role byte, the registrar's too: one key holds both.
 const ROLE: u8 = 1;
 /// How long an invitation stands.
@@ -39,6 +42,8 @@ pub struct LocalSpace {
     agent: AgentId,
     operator: Mutex<Client>,
     programs: [(InstanceId, Vec<u8>); 3],
+    /// The device actor's kernel `auth`, as the install derived it.
+    kernel: PathBuf,
 }
 
 fn ran(name: &str, answer: Result<Response, client::ClientError>) -> Result<Vec<u8>, String> {
@@ -99,6 +104,7 @@ impl LocalSpace {
             ),
             (POLL, elf(actor_elf("poll"))?, "operator"),
             (PURSES, elf(actor_elf("purses"))?, "operator"),
+            (DEVICE, elf(actor_elf("device"))?, "operator"),
         ];
         for (instance, elf, role) in &installs {
             let install = Install {
@@ -111,6 +117,9 @@ impl LocalSpace {
                 other => return Err(format!("installing {role}: {other:?}")),
             }
         }
+        let kernel = data.join("device.kernel");
+        std::fs::write(&kernel, vos_testkit::programs::kernel("device", "auth"))
+            .map_err(|error| format!("{}: {error}", kernel.display()))?;
         let principal = Principal::Client(key.verifying_key().to_bytes());
         match signed.grant(agent, principal, Some(ROLE)) {
             Ok(Response::Ran { .. }) => {}
@@ -126,6 +135,7 @@ impl LocalSpace {
                 (POLL, vos_testkit::programs::actor("poll")),
                 (PURSES, vos_testkit::programs::actor("purses")),
             ],
+            kernel,
         };
         space.write(CREDENTIALS, "found", handle)?;
         Ok(space)
@@ -150,6 +160,10 @@ impl LocalSpace {
             credentials: CREDENTIALS.0,
             purses: PURSES.0,
             poll: POLL.0,
+            device: Some(DeviceSignIn {
+                instance: DEVICE.0,
+                kernel: self.kernel.clone(),
+            }),
         }
     }
 

@@ -194,6 +194,15 @@ a member's phone (`slice-7-mobile.md` 7.13):
   the client. What enrollment pins is the gateway's word, shown to the user
   once, as a host key is: a hostile gateway at enrollment can mislabel a
   method's guard, and the node's guard still decides what a proof admits.
+  A device kernel pinned with a method at enrollment is the gateway's word
+  too. A kernel other than the installed one proves nothing at the node,
+  whose binding names the installed kernel's program. The device runs it on
+  the member's secret and path, as it runs the credential circuit: its
+  proof states the io-hash alone, which the library checks is the one of
+  the auth words it computed before the proof leaves the device, and the
+  masked proof hides the run. What a hostile kernel still steers is
+  whether its run fits its program's shape, so whether the device answers
+  a proof or an error, and how long it takes: about one bit a sign-in.
 - **What the gateway relays.** It forwards a facility's `Credentialed`
   request as it is, after checking it names the demo's agent and the
   screen's instance and method; any other is refused before a node sees
