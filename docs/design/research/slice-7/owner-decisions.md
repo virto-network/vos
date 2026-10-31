@@ -374,3 +374,40 @@ S55. **How S44 is measured** (Q1, option (b)): `k` up to the host's
   measured there. A bound per verification may join pin I's gates: a
   verification on one executor under full load within 5 ms on average.
   Narrows S44. (2026-10-27)
+
+## Hosts, formats and builds (2026-10-27 to 2026-10-30)
+
+S56. **The scale runs' driver**: sigma (i5-1340P, wired, linger on,
+  performance governor) drives the load; the desktop only coordinates.
+  The link sigma–compumax measured 0.4 ms p50, 0.6 ms p99. (2026-10-27)
+
+S57. **The credential format** (under S29, on the phone at 7.12): format
+  44 (blowup 4, 47 queries, PoW 16) admitted and 42 retired; the PoW-20
+  grind's 95th percentile on the Fairphone 6 was 69–72 ms against 50 ms
+  with the chunked grind. (2026-10-27)
+
+S58. **Reproducible blobs**: the default agent's ELF and the two Wasm
+  blobs, which hash by their checkout path, stay out of `blobs.lock`
+  past slice 7. `trim-paths` does not fix them (out-of-root path
+  dependencies hash by absolute path and reorder `.text`); a fixed build
+  path does. Decided in the cleanup before master. (2026-10-30)
+
+S59. **The node levers in slice 7**: the quiet group's election storm and
+  the cold start at 10^5 fixed, then several batches in flight per group
+  and the per-batch state reads off the runtime thread; T1, T3's stretch,
+  T5 and T6 rerun under the performance governor. The commit-to-apply
+  gap, the disk and batched signature checks wait for the next slice.
+  (2026-10-30)
+
+## On session P5 and 7.20 (2026-10-31)
+
+S60. **Margin before the CPU split**: session P5 met PG2's time, memory
+  and size on the phone (0.97 s, 0.70 GiB, 0.98 MB) after levers 1–4, 3%
+  under the second. Cheaper levers (the grind, thread placement, the
+  kernel's steps, the build) are measured first; 7.18 is decided on their
+  outcome; P6 to P8 follow.
+
+S61. **A device program's log sizes**: from the installed kernel's run on
+  a fixed public auth statement (`auth_reference`), computed alike by
+  every node and the phone; not declared in the schema. Each further
+  device statement kind brings its own reference input.
