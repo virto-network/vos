@@ -2990,8 +2990,20 @@ reservation).
 **Commits:** VOS `e582bbfb` device programs, `43f67edf` vos-device,
 `c56d3011` the device actor's login and JAM's cap, `6ac865b6` ingress,
 `5f22eead` PG2's run, `22cd0b91` the demo, `ca03a858` the docs,
-`a743254c` the review's folds, `f020ecec` the demo's pin; this record.
-s4 `08433f1`, `a8a2d9a`.
+`a743254c` the review's folds, `f020ecec` the demo's pin, `0d1105ce`
+this record, `af07ecc3` the registry's round trip (43 admitted, which
+`test-proof`'s first run caught); the gates. s4 `08433f1`, `a8a2d9a`.
+
+**Gates** [measured; 12 GiB scope, `nice -n 10`, 8 jobs, another agent's
+runs on the machine]: `just check` green at `f020ecec` (exit 0, 1,669
+passed in 125 suites); `just test-proof` green at `af07ecc3` (exit 0, 584
+passed in 52 suites, `fixtures::` and `constants::` unchanged: format 35
+and the node kernels byte for byte), its first run at `0d1105ce` failing
+`format::tests::the_registry_numbers_round_trip` alone (it held 43
+refused), whose fix is a test's assertion; `just test-gateway-ssh` green
+at `f020ecec` (the gateway's 10, the SSH port's 3, the demo's 2); s4's
+`vos` step (fmt, clippy with `ffi`, tests: 7 unit, 4 integration) green
+at `a8a2d9a`; s4's full `just ci` not run (its pre-push hook).
 
 ## Step 7.10b: the node API and the gateway
 
