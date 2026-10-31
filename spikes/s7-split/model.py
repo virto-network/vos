@@ -389,6 +389,7 @@ def crossover():
         ("4-way (ALU | memory | control | host)", True)]
     for name, (kernel, mix) in mixes.items():
         code_ops = set(CODE[kernel])
+        calls = (1025, 1026) if kernel.startswith("device") else (1024, 1025)
         total = sum(mix.values())
         share = {f: n / total for f, n in mix.items()}
         print(f"### the {name} mix: {', '.join(f'{f} {100 * s:.1f}%' for f, s in share.items())}\n")
@@ -399,7 +400,8 @@ def crossover():
         def delta(steps, variant, pruned):
             rows = {f: share[f] * steps for f in share}
             base = 785 * (2 << max(DEVICE_FLOOR, log2ceil(steps)))
-            comps = split_components(variant, rows, code_ops if pruned else None, steps=steps)
+            comps = split_components(variant, rows, code_ops if pruned else None, calls,
+                                     steps=steps)
             return sum(c * (2 << l) for c, l, *_ in comps) / base - 1
 
         for log in range(10, 18):
@@ -593,13 +595,27 @@ def node():
             label = ("41, " + variant) + (", per program" if pruned else "")
             out[label] = r
             print(f"| {label} | {desc} | {c} | {' / '.join(map(str, r))} | {fits(r)} |")
-            rp, cp = shape_rows(window_shape, [(chip, log) for chip, log, _ in comps],
-                                family_id=variant != "today", with_p2=True)
+            comps_p2 = []
+            for families in VARIANTS[variant]:
+                comp = component(families, (code_ops | {"Ecalli"}) if pruned else None,
+                                 (1024, 1025, 1026))
+                if comp is None:
+                    continue
+                n = sum(rows.get(f, 0) for f in families)
+                log = 15 if variant == "today" else max(4, log2ceil(n))
+                comps_p2.append((family_chip(comp, 0), log))
+            rp, cp = shape_rows(window_shape, comps_p2, family_id=variant != "today",
+                                with_p2=True)
             print(f"| {label}, with the Poseidon2 chip | | {cp} | {' / '.join(map(str, rp))} |"
                   f" {fits(rp)} |")
     rp, cp = shape_rows(window_shape, [(cpu41, 15)], with_p2=True)
     print(f"| 41: `CpuP2` with the Poseidon2 chip (a kernel calling 0x402) | 781 at 15 | {cp} |"
           f" {' / '.join(map(str, rp))} | {fits(rp)} |")
+    deep_mem = list(window_shape)
+    deep_mem[3] = 19
+    rm, _ = shape_rows(deep_mem, [(cpu41, 15)])
+    print(f"\nThe byte ledger at 2^19 instead of 2^18 (41's CPU): {' / '.join(map(str, rm))},"
+          f" {rm[0] - r41[0]:+d} `p2` rows.")
     # Headroom: today's CpuP2 widened by k single-mask main columns.
     for extra in range(0, 4000, 8):
         wide = dict(cpu41)
@@ -641,6 +657,40 @@ def node():
         print(f"| {kernel} @{start} | {fmt_m(seg)} | {100 * cpu_cells / seg:.0f}% | "
               + " | ".join(line) + " |")
     print()
+    print("At each kernel's class shape (every family at its largest size over the"
+          " kernel's full chunks, as `canonical_profile_for_bounds` pads a class):\n")
+    print("| kernel | family logs (class) | 4-way | 4-way per program |")
+    print("|---|---|---|---|")
+    kernels = sorted({k for (k, kind, _) in WINDOWS if kind == "chunk15" and not k.startswith("device")})
+    for kernel in kernels:
+        chunks = [w for (k, kind, _), w in WINDOWS.items()
+                  if k == kernel and kind == "chunk15" and w["to"] - w["from"] == 1 << 15]
+        if not chunks:
+            continue
+        code_ops = set(CODE[kernel])
+        worst = {}
+        for w in chunks:
+            for f, n in family_rows(w["mix"]).items():
+                worst[f] = max(worst.get(f, 0), n)
+        line = []
+        for pruned in (False, True):
+            comps = split_components("4-way (ALU | memory | control | host)", worst,
+                                     code_ops if pruned else None, (1024, 1025),
+                                     masked=False, floor=4)
+            deltas = []
+            for w in chunks:
+                seg = 0
+                for i in range(25):
+                    if mask >> i & 1:
+                        ch = leaf.CHIPS[i]
+                        seg += (ch["preprocessed"] + sum(n for _, n in ch["main"])
+                                + sum(n for _, n in ch["interaction"])) * (1 << w["log_sizes"][i])
+                cells = sum(c * (1 << l) for c, l, *_ in comps)
+                deltas.append((cells - 772 * (1 << 15)) / seg)
+            line.append(f"{100 * max(deltas):+.1f}…{100 * min(deltas):+.1f}%")
+        logs = {f: log2ceil(n) for f, n in worst.items()}
+        print(f"| {kernel} | {logs} | " + " | ".join(line) + " |")
+    print()
     return out
 
 
@@ -657,8 +707,10 @@ def calibration():
           f" {PHONE_PER_CELL:.1f} ms per M cells; residuals:"
           + ", ".join(f" {c:.1f}M: {t} vs {a + b * c:.0f} / {PHONE_PER_CELL * c:.0f}"
                       for c, t, _ in PHONE))
+    pa, pb = fit([(c, r) for c, _, r in PHONE[:3]])
     print(f"- phone peak: {ra:.0f} MiB + {rb:.1f} MiB per M cells; 1 GiB at"
-          f" {(1024 - ra) / rb:.1f}M cells")
+          f" {(1024 - ra) / rb:.1f}M cells; P6's three points alone: {pa:.0f} + {pb:.1f},"
+          f" 1 GiB at {(1024 - pa) / pb:.1f}M cells")
     print(f"- x86 (4 P-cores, one session): {xa:.0f} ms + {xb:.1f} ms per M cells;"
           f" phone/x86 at 11.7M {607 / 328:.2f}, at 19.7M {952 / 472:.2f}\n")
 

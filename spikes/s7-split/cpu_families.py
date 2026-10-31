@@ -96,8 +96,9 @@ GROUPS = {
                        "SignDHiNib", "SignsDiffH"]),
     # A 32-bit result's sign extension (`signs`, `alu`).
     "result_sign": (lambda f: "Is32Bit" in f, ["SignBitResult", "ResultHiNib"]),
-    # A signed load's extension (`memory::signed_load_extension`).
-    "load_sign": (lambda f: bool(f & {"IsLoadI8", "IsLoadI16", "IsLoadI32"}),
+    # A load's extension (`memory::signed_load_extension`): the sign of a
+    # signed load, and the zero extension of an unsigned one.
+    "load_sign": (lambda f: "IsLoad" in f,
                   ["LoadSignBit", "LoadSignHiNib", "LoadSignSrc"]),
     # 32-bit truncation of ALU operands (`registers::register_helpers`).
     "truncation": (lambda f: "Is32Bit" in f,

@@ -5893,8 +5893,9 @@ for the owner's call on 7.18.
   On the auth kernel (1,722 steps, every family at the 2^10 floor) it saves
   5.4% of the cells, about 607 → 574 ms on the phone [model, scaled from
   P6]; on node segments 0.7–7.8%. Against an exact power of two of steps it
-  moves the CPU's cells by +2% to −8%, just past one by −42…−54%; averaged
-  over lengths −32…−46% from 2^11 steps on.
+  moves the CPU's cells by +1% to −8%, just past one by −42…−54%; averaged
+  over lengths −33…−47% from 2^11 steps on. At a node class's fixed shape
+  it saves under 1% of a segment.
 - **A per-program CPU pays more and costs less:** every traced kernel's code
   uses 48–55 of the 139 opcodes (no division, bit count, rotation, sign
   extension, min/max, signed MulUpper), so a CPU whose columns follow the
@@ -5907,14 +5908,36 @@ for the owner's call on 7.18.
 - **The first-day count (S32):** at 40 queries no leaf of today's node
   kernels passes 2^16 `p2` rows under any split (5-way 62,070; `leaf.rs`'s
   model, ported and checked on the window kernel's 57,700). With the
-  Poseidon2 chip in the shape, the 4- and 5-way splits pass it (66,210,
-  67,884): the 4-way split is device-only; 41 can take the per-program CPU
-  (56,424; 62,278 with the chip) and a 2-way split.
-- **Heavier circuits hit memory first:** 1 GiB of peak on the phone is about
-  26M cells [model, P5/P6's peaks], a device kernel of about 2^12 steps of
-  node-like code at about 1.3 s; 2^14 steps need about 2 GiB.
+  Poseidon2 chip in the shape, the 4- and 5-way splits pass it (66,254,
+  67,928), and the per-program 4-way fits by 514 rows, inside the model's
+  error: the 4-way split is device-only; 41 can take the per-program CPU
+  (56,424; 62,322 with the chip). A 2-way split with the chip fits by 920
+  rows, less than a byte ledger at 2^19 would add (+1,042).
+- **Heavier circuits meet 1.0 s first:** about 20M cells on the phone, a
+  device kernel of 2^11–2^12 steps of node-like code; 1 GiB of peak is
+  26–40M cells (the fit's slope rests on P5's one large cell; P6's three
+  points alone give 40M). A heavier kernel measured at format 45 would pin
+  it.
 - **Recommended:** the per-program CPU (3–5 weeks [est], both formats),
-  then word-level memory; a 2-way split only for kernels past 2^11 steps;
-  not the 4-way split. Two free cuts on the way: seven `MemByteActiveMonoH`
-  columns pinned to zero, and right shifts through MUL (DIVREM leaves every
-  traced kernel's shape: −7% on the auth kernel).
+  then word-level memory; a 2-way split only where a kernel's length makes
+  its padding pay; not the 4-way split. A free cut on the way: seven
+  `MemByteActiveMonoH` columns pinned to zero. Right shifts through MUL
+  take DIVREM out of the auth kernel's shape (−7%), a narrow re-pin of its
+  own.
+
+**Review (Opus):** the column reduction's groups checked against the
+constraint code (none drops a constraint a present opcode needs) and every
+figure against the model's output; nothing high but one claim. Folded: H1,
+memory binding before time was the peak fit's one large point (now 26–40M
+cells for 1 GiB, time binding first under PG2's budgets); M1, the four
+next-row `IsPadding` reads restated per component and terminality's
+argument, the family id as insurance; M2, the leaf's sensitivity to the
+largest log size (+1,042 `p2` at 2^19), the per-program 4-way with the
+chip counted as an overflow, the host family's Poseidon2 call in those
+rows; M3, node savings at a class's fixed shape (under 1% for 4-way); M4,
+the 2-way's padding margins and no gain at a power of two; M5, the
+heavier times a lower bound; L1, the unsigned loads' zero extension kept
+with their group (`load_sign` consumed by every load); L2, the mask from
+the whole program-memory table; L3, the right shift's MUL growth and
+arithmetic shifts; L4, word memory's width light; L5, the crossover's
+host calls per kernel.
