@@ -24,11 +24,15 @@ use stwo::{
 };
 
 /// How a chip's fractions are finalized: in pairs, each pair one
-/// interaction column (the default), or each fraction its own column.
+/// interaction column (the default), each fraction its own column, or of
+/// `total` fractions the first `singles` each its own and the rest in
+/// pairs (a chip whose first fractions' denominators are of degree 2, its
+/// others' of degree 1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Logup {
     Pairs,
     Single,
+    SingleThenPairs { singles: usize, total: usize },
 }
 
 impl Logup {
@@ -43,6 +47,8 @@ impl Logup {
         let batch = |i: usize| match self {
             Self::Pairs => i / 2,
             Self::Single => i,
+            Self::SingleThenPairs { singles, .. } if i < singles => i,
+            Self::SingleThenPairs { singles, .. } => singles + (i - singles) / 2,
         };
         let last = n.checked_sub(1).map_or(0, batch);
         (0..n)
@@ -56,6 +62,9 @@ impl Logup {
         match self {
             Self::Pairs => eval.finalize_logup_in_pairs(),
             Self::Single => eval.finalize_logup(),
+            Self::SingleThenPairs { total, .. } => {
+                eval.finalize_logup_batched(&self.batches(total, 0))
+            }
         }
     }
 }

@@ -34,8 +34,8 @@ use vos_pvm_proof::segment::SegmentCursor;
 use vos_pvm_proof::side_note::SideNote;
 use vos_pvm_recair::ProveError;
 use vos_pvm_recair::masked::device::{
-    DeviceProgram, device_format, device_shape, install, prove_device, prove_device_forced,
-    verify_device,
+    DeviceProgram, DeviceProver, device_format, device_shape, install, prove_device,
+    prove_device_forced, verify_device,
 };
 use vos_pvm_recair::masked::{Checks, MaskRng};
 use vos_pvm_recair_air::masked::MaskedComponents;
@@ -152,6 +152,34 @@ fn a_device_run_proves_and_verifies() {
     }
     accepted::<P2>(&format());
     accepted::<Blake2sMerkleChannel>(&small_format(ChannelKind::Blake2s, 6, 4));
+}
+
+/// A prover installed once proves as the per-proof path does, byte for
+/// byte under one seed, its preprocessed tree committed at install and
+/// borrowed by every proof; two proofs in a row from it both verify.
+#[test]
+fn an_installed_prover_proves_as_the_per_proof_path() {
+    let format = format();
+    let mut reference = run(&blob(), &witness(0));
+    let (active, log_sizes) = device_shape(&format, &blob(), &mut reference).expect("a shape");
+    let prover =
+        DeviceProver::<P2>::install(&format, &blob(), active, &log_sizes).expect("installs");
+    assert_eq!(prover.program().circuit, the_program().circuit);
+    for seed in [3, 4] {
+        let (installed, _) = prover
+            .prove(&mut run(&blob(), &witness(seed)), MaskRng::Seeded(seed))
+            .expect("proves");
+        let (per_proof, _) = prove::<P2>(
+            &format,
+            the_program(),
+            &blob(),
+            &witness(seed),
+            MaskRng::Seeded(seed),
+        )
+        .expect("proves");
+        assert_eq!(format!("{installed:?}"), format!("{per_proof:?}"));
+        verify_device::<P2>(&format, prover.program(), &installed).expect("verifies");
+    }
 }
 
 /// The program is the kernel's, never a run's: its chips are those its code

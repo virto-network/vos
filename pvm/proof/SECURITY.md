@@ -43,7 +43,7 @@ reference shape, from the security tool (`src/security.rs`):
   (`deep_values_of_column`); `c`, the most of one column, is counted the
   same way, 3. The segment shape batches 10,016 values over 9,020 samples;
   35's query term binds, 62.86 either way. The masked device reference
-  (every device chip at 2^17 rows) batches 7,548; 43 counts 62.82 by
+  (every device chip at 2^17 rows) batches 7,404; 43 counts 62.82 by
   affine batching, 62.01 by powers.
 - A verifier rejects a number the registry does not admit, a retired one
   (24 to 27, 29, 30, 31, 33, 34; 37, the device format reserved at an

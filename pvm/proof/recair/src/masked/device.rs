@@ -22,12 +22,10 @@
 use num_traits::Zero;
 use stwo::core::channel::MerkleChannel;
 use stwo::core::fields::qm31::SecureField;
-use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
+use stwo::prover::ComponentProver;
 use stwo::prover::backend::BackendForChannel;
 use stwo::prover::backend::simd::SimdBackend;
-use stwo::prover::poly::circle::PolyOps;
-use stwo::prover::{CommitmentSchemeProver, ComponentProver};
 use vos_pvm_final_verifier::Error;
 use vos_pvm_final_verifier::masked::{Claim, MaskedFormat, verify_masked};
 use vos_pvm_proof::device::{DEVICE_MAX_LOG_SIZE, DeviceLayout, device_chips_of_code};
@@ -40,7 +38,9 @@ use vos_pvm_proof::masked::{
 use vos_pvm_proof::side_note::SideNote;
 use vos_pvm_recair_air::masked::MaskedComponents;
 
-use super::{Checks, MaskRng, MaskStats, MaskedProof, MaskedProvers, MaskedTrace, mask_rows};
+use super::{
+    Checks, Committed, MaskRng, MaskStats, MaskedProof, MaskedProvers, MaskedTrace, mask_rows,
+};
 use crate::prove::ProveError;
 use crate::trace::FirstRowFraction;
 
@@ -129,43 +129,98 @@ pub fn install<MC: MerkleChannel>(
 where
     SimdBackend: BackendForChannel<MC>,
 {
-    let layout =
-        DeviceLayout::of_program(blob).ok_or(ProveError::TraceShape("not a standard program"))?;
-    if !layout.is_disjoint() {
-        return Err(ProveError::TraceShape("the layout's regions overlap"));
+    DeviceProver::<MC>::install(format, blob, active, log_sizes).map(|prover| prover.program)
+}
+
+/// A device program as its prover keeps it from the install: the program
+/// under its format, and what every proof of it shares, computed once
+/// ([`Committed`]): the twiddles and the preprocessed tree, which each
+/// proof borrows rather than committing it again.
+pub struct DeviceProver<MC: MerkleChannel>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    format: Format,
+    program: DeviceProgram<MC::H>,
+    committed: Committed<MC>,
+}
+
+impl<MC: MerkleChannel> DeviceProver<MC>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    /// [`install`], its preprocessed tree kept for the proofs.
+    pub fn install(
+        format: &Format,
+        blob: &[u8],
+        active: u32,
+        log_sizes: &[u32],
+    ) -> Result<Self, ProveError> {
+        let layout = DeviceLayout::of_program(blob)
+            .ok_or(ProveError::TraceShape("not a standard program"))?;
+        if !layout.is_disjoint() {
+            return Err(ProveError::TraceShape("the layout's regions overlap"));
+        }
+        let code = vos_pvm_proof::kernel::kernel_side_note(blob)
+            .map_err(|error| ProveError::Segment(format!("{error:?}")))?;
+        if active != device_chips_of_code(&code.code, &code.bitmask) {
+            return Err(ProveError::TraceShape("the chips are not the code's"));
+        }
+        let floors = device_floors(format, active).ok_or(ProveError::TraceShape(
+            "the format's masking does not fit the chips",
+        ))?;
+        if floors.len() != log_sizes.len() || log_sizes.iter().zip(&floors).any(|(s, f)| s < f) {
+            return Err(ProveError::TraceShape("a log size under its floor"));
+        }
+        if log_sizes.iter().any(|&size| size > DEVICE_MAX_LOG_SIZE) {
+            return Err(ProveError::TraceShape(
+                "a log size above the device format's reference",
+            ));
+        }
+        let preprocessed = device_preprocessed(&code, &layout, active, log_sizes)
+            .map_err(|error| ProveError::Segment(error.to_string()))?;
+        let committed = Committed::<MC>::new(format, log_sizes, preprocessed)
+            .ok_or(ProveError::TraceShape("a component's log size overflows"))?;
+        Ok(Self {
+            format: *format,
+            program: DeviceProgram {
+                active,
+                log_sizes: log_sizes.to_vec(),
+                layout,
+                circuit: committed.root(),
+            },
+            committed,
+        })
     }
-    let code = vos_pvm_proof::kernel::kernel_side_note(blob)
-        .map_err(|error| ProveError::Segment(format!("{error:?}")))?;
-    if active != device_chips_of_code(&code.code, &code.bitmask) {
-        return Err(ProveError::TraceShape("the chips are not the code's"));
+
+    /// Its format.
+    pub fn format(&self) -> &Format {
+        &self.format
     }
-    let floors = device_floors(format, active).ok_or(ProveError::TraceShape(
-        "the format's masking does not fit the chips",
-    ))?;
-    if floors.len() != log_sizes.len() || log_sizes.iter().zip(&floors).any(|(s, f)| s < f) {
-        return Err(ProveError::TraceShape("a log size under its floor"));
+
+    /// Its program, as its verifier pins it.
+    pub fn program(&self) -> &DeviceProgram<MC::H> {
+        &self.program
     }
-    if log_sizes.iter().any(|&size| size > DEVICE_MAX_LOG_SIZE) {
-        return Err(ProveError::TraceShape(
-            "a log size above the device format's reference",
-        ));
+
+    /// [`prove_device`] of its program under its format, the preprocessed
+    /// tree the install's.
+    pub fn prove(
+        &self,
+        side_note: &mut SideNote,
+        rng: MaskRng,
+    ) -> Result<(DeviceProof<MC::H>, MaskStats), ProveError> {
+        prove_device_with::<MC>(
+            &self.format,
+            &self.program,
+            Some(&self.committed),
+            side_note,
+            rng,
+            |_| {},
+            |_, _| {},
+            Checks::ALL,
+        )
     }
-    let preprocessed = device_preprocessed(&code, &layout, active, log_sizes)
-        .map_err(|error| ProveError::Segment(error.to_string()))?;
-    let lifting = super::lifting_log_size(format, log_sizes)
-        .ok_or(ProveError::TraceShape("a component's log size overflows"))?;
-    let twiddles =
-        SimdBackend::precompute_twiddles(CanonicCoset::new(lifting).circle_domain().half_coset);
-    let mut scheme = CommitmentSchemeProver::<SimdBackend, MC>::new(format.pcs_config(), &twiddles);
-    let mut builder = scheme.tree_builder();
-    builder.extend_polys(super::extend_preprocessed(preprocessed, &twiddles));
-    builder.commit(&mut MC::C::default());
-    Ok(DeviceProgram {
-        active,
-        log_sizes: log_sizes.to_vec(),
-        layout,
-        circuit: scheme.roots()[0],
-    })
 }
 
 /// `side_note`'s run of `program`'s kernel, traced whole, proved masked
@@ -184,6 +239,7 @@ where
     prove_device_with::<MC>(
         format,
         program,
+        None,
         side_note,
         rng,
         |_| {},
@@ -209,7 +265,7 @@ pub fn prove_device_forced<MC: MerkleChannel>(
 where
     SimdBackend: BackendForChannel<MC>,
 {
-    prove_device_with::<MC>(format, program, side_note, rng, tamper, blind, checks)
+    prove_device_with::<MC>(format, program, None, side_note, rng, tamper, blind, checks)
 }
 
 /// `side_note`'s run traced at `program`'s shape: what a forged trace starts
@@ -227,9 +283,11 @@ pub fn device_trace<H: MerkleHasherLifted>(
     .map_err(|error| ProveError::Segment(error.to_string()))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prove_device_with<MC: MerkleChannel>(
     format: &Format,
     program: &DeviceProgram<MC::H>,
+    committed: Option<&Committed<MC>>,
     side_note: &mut SideNote,
     rng: MaskRng,
     tamper: impl FnOnce(&mut MaskedDeviceTrace),
@@ -258,7 +316,10 @@ where
     let masked = MaskedTrace {
         active: program.active,
         log_sizes: &trace.log_sizes,
-        preprocessed: trace.preprocessed(),
+        preprocessed: match committed {
+            Some(_) => Vec::new(),
+            None => trace.preprocessed(),
+        },
         main: &|chip: usize| trace.main(chip),
         public: &public,
         interaction: &interaction,
@@ -267,6 +328,7 @@ where
         format,
         &program.header(),
         masked,
+        committed,
         rng,
         checks,
     )?;

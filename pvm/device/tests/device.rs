@@ -427,7 +427,7 @@ fn a_bad_witness_is_refused_before_proving() {
 }
 
 /// The configuration: a memory allowance below a proof's refused; no
-/// threads refused; `Auto` one thread a core; pinned cores prove.
+/// threads refused; `Auto` at most one thread a core; pinned cores prove.
 #[test]
 fn the_configuration_is_checked() {
     let refused = Prover::new(ProverConfig {
@@ -446,9 +446,9 @@ fn the_configuration_is_checked() {
     });
     assert_eq!(empty.err(), Some(DeviceError::Config));
     let auto = Prover::new(ProverConfig::default()).unwrap();
-    assert_eq!(
-        auto.threads(),
-        std::thread::available_parallelism().unwrap().get()
+    assert!(
+        (1..=std::thread::available_parallelism().unwrap().get()).contains(&auto.threads()),
+        "at most a thread a core"
     );
     let pinned = Prover::new(ProverConfig {
         threads: Threads::Cores(vec![0, 1]),

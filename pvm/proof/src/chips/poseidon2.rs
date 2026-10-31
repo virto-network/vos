@@ -33,8 +33,11 @@
 //! proof does not balance. A wrong carry buys nothing, so limb 0 needs no
 //! range check, unlike BLAKE2b's chip, whose carries are pinned by one.
 //!
-//! Every fraction is its own interaction column (`Logup::Single`): the
-//! addresses are of degree 2.
+//! The 96 ledger accesses come first, each fraction its own interaction
+//! column, their addresses being of degree 2; the call and the 72 range
+//! checks, whose denominators are of degree 1, follow in pairs
+//! (`Logup::SingleThenPairs`), a pair's constraint of degree 3: 169
+//! fractions in 133 interaction columns.
 
 use crate::prelude::*;
 use core::array::from_fn;
@@ -81,6 +84,9 @@ const INPUT_BYTES: usize = 64;
 const OUTPUT_BYTES: usize = 32;
 /// The S-boxes a permutation applies, two columns each.
 const SBOXES: usize = vos_pvm_recair_air::p2::N_SBOXES;
+/// The range checks a row makes: two for each input word's top byte, each
+/// output byte and each output word's top byte plus 128 ([`range_checks`]).
+const RANGE_CHECKS: usize = 2 * INPUT_BYTES / 4 + OUTPUT_BYTES + OUTPUT_BYTES / 4;
 /// `3·255 + 127`: a word's bytes' sum exactly when the word is p.
 const P_BYTE_SUM: u32 = 3 * 255 + 127;
 
@@ -243,7 +249,10 @@ fn permutation<E: EvalAtRow>(
 }
 
 impl BuiltInComponent for Poseidon2Chip {
-    const LOGUP: Logup = Logup::Single;
+    const LOGUP: Logup = Logup::SingleThenPairs {
+        singles: INPUT_BYTES + OUTPUT_BYTES,
+        total: INPUT_BYTES + OUTPUT_BYTES + 1 + RANGE_CHECKS,
+    };
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
     type LookupElements = (
@@ -329,12 +338,11 @@ impl BuiltInComponent for Poseidon2Chip {
             );
         }
 
-        // The call; the input's reads and the output's writes; the bytes'
+        // The input's reads and the output's writes; the call; the bytes'
         // ranges.
-        let mut tuple: Vec<E::F> = ts.to_vec();
-        tuple.extend(in_ptr.iter().cloned());
-        tuple.extend(out_ptr.iter().cloned());
-        eval.add_to_relation(RelationEntry::new(call, (-is_real.clone()).into(), &tuple));
+        let mut call_tuple: Vec<E::F> = ts.to_vec();
+        call_tuple.extend(in_ptr.iter().cloned());
+        call_tuple.extend(out_ptr.iter().cloned());
         let reads = Addresses::<E::F, INPUT_BYTES> {
             ptr: in_ptr,
             carry: in_carry,
@@ -361,6 +369,11 @@ impl BuiltInComponent for Poseidon2Chip {
             let tuple = access(writes.address(j), byte, true);
             eval.add_to_relation(RelationEntry::new(memory, is_real.clone().into(), &tuple));
         }
+        eval.add_to_relation(RelationEntry::new(
+            call,
+            (-is_real.clone()).into(),
+            &call_tuple,
+        ));
         for (from_output, byte, plus_128) in range_checks() {
             let byte = if from_output {
                 &output[byte]
@@ -504,7 +517,10 @@ impl BuiltInProverComponent for Poseidon2Chip {
     ) {
         use stwo::prover::backend::simd::m31::PackedBaseField;
 
-        let mut logup = LogupTraceBuilder::single(component_trace.log_size());
+        let Logup::SingleThenPairs { singles, .. } = Self::LOGUP else {
+            unreachable!("the chip's batching")
+        };
+        let mut logup = LogupTraceBuilder::single_then_pairs(component_trace.log_size(), singles);
         let call: &Poseidon2CallLookupElements = lookup_elements.as_ref();
         let memory: &MemoryAccessLookupElements = lookup_elements.as_ref();
         let range: &Range256LookupElements = lookup_elements.as_ref();
@@ -522,10 +538,9 @@ impl BuiltInProverComponent for Poseidon2Chip {
         let out_inc = column(Column::OutInc);
         let is_real = column(Column::IsReal);
 
-        let mut tuple = ts.clone();
-        tuple.extend(in_ptr.iter().cloned());
-        tuple.extend(out_ptr.iter().cloned());
-        logup.add_to_relation_with(call, [is_real[0].clone()], |[r]| (-r).into(), &tuple);
+        let mut call_tuple = ts.clone();
+        call_tuple.extend(in_ptr.iter().cloned());
+        call_tuple.extend(out_ptr.iter().cloned());
 
         for (ptr, carry, inc, values, is_write) in [
             (&in_ptr, &in_carry, &in_inc, &input, false),
@@ -566,6 +581,7 @@ impl BuiltInProverComponent for Poseidon2Chip {
                 );
             }
         }
+        logup.add_to_relation_with(call, [is_real[0].clone()], |[r]| (-r).into(), &call_tuple);
         for (from_output, byte, plus_128) in range_checks() {
             let column = if from_output {
                 output[byte].clone()

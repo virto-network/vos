@@ -2267,18 +2267,54 @@ PoW 16 puts the BLAKE2b statement's proof 1% past 1.5 MiB where PoW 20
 keeps it under. Format 43 stays reserved; 7.17's lever 4 counts again on
 the lighter shape.
 
-**Session P4: not run.** The Fairphone 6 was not on USB when this step
-reached it (2026-10-30 17:40–19:00: `adb devices` empty, the phone not in
-`lsusb`, an adb server restart changed nothing). Ready to run:
-`just phone` built `vos-phone-timing` (SHA-256 `ddeefcf6…750d`) with the
-device cells; `spikes/s7-device/scripts/p4.sh target/phone/vos-phone-timing
-spikes/s7-device/kernels <out>` runs the session (three rounds of p2 at
-every candidate at automatic threads, one on the four big cores, one of
-b2, one Blake2b-256 cell; battery at least 50% and below 35.0 °C before
-each round, waiting up to an hour; it removes `/data/local/tmp/vos-p4`).
-The pin is therefore x86's; the phone may move it only between blowup 4
-at PoW 16 and at PoW 20 (the same bytes and memory), which the grind's
-tail already decided at 7.12.
+**Session P4** (run during 7.17, 2026-10-30 23:42 to 2026-10-31 00:33,
+on the merged base's `vos-phone-timing`, SHA-256 `2ab80736…fdad`, built by
+`just phone` at 7.16's tip; `runs/phone-p4.txt`) [measured, the Fairphone
+6, the kernels 7.16 pinned; battery 84–90%, 31–35 °C before each round; 5
+reps after a warm-up, p50 / p95; the first try was stopped after round 2
+at the owner's request (PG3 on the phone; its blowup-8 cell's memory
+pressure ended the foreground app), and resumed for the rest]:
+
+| cell | threads | rounds' p50 | p95 (worst) | peak | bytes |
+|---|---|---|---|---|---|
+| p2, 2:86:20 | auto (8) | 4.97 / 5.08 / 5.00 s | 5.30 s | 2,465–2,495 MiB | 3,235,394–3,253,005 |
+| p2, 2:87:20 | auto | 5.09 / 5.00 / 4.95 s | 5.21 s | 2,451–2,505 MiB | 3,269,498–3,274,495 |
+| p2, 4:43:20 | auto | 5.76 / 5.98 / 5.81 s | 6.17 s | 3,583–3,614 MiB | 1,740,764–1,746,207 |
+| **p2, 4:47:16** | auto | **5.79 / 5.98 / 5.90 s** | 6.38 s | 3,565–3,604 MiB | 1,882,386–1,892,274 |
+| p2, 8:29:20 | auto | 15.6 / 18.6 / 14.6 s | 22.9 s | 4,838–5,555 MiB | 1,253,997–1,256,734 |
+| p2, 2:86:20 | 4 big (`f0`) | 6.05 s | 6.29 s | 2,450 MiB | 3,231,153 |
+| p2, 2:87:20 | 4 big | 5.99 s | 6.15 s | 2,410 MiB | 3,267,061 |
+| p2, 4:43:20 | 4 big | 6.95 s | 7.39 s | 3,614 MiB | 1,741,933 |
+| p2, 4:47:16 | 4 big | 7.29 s | 7.39 s | 3,540 MiB | 1,888,930 |
+| p2, 8:29:20 | 4 big | 12.5 s | 14.3 s | 5,547 MiB | 1,247,024 |
+| b2, 2:86:20 | auto | 4.76 s | 4.82 s | 2,303 MiB | 2,708,838 |
+| b2, 4:43:20 | auto | 5.97 s | 6.11 s | 3,772 MiB | 1,460,107 |
+| b2, 4:47:16 | auto | 6.11 s | 6.42 s | 3,766 MiB | 1,585,611 |
+| b2, 8:29:20 | auto | 27.7 s | 36.9 s | 5,737 MiB | 1,058,040 |
+
+Verification on the phone 33–210 ms in the prover's pool (not one core's
+budget); R1 one attempt in every cell. The Blake2b-256 cell was not run: at
+46–49 s a proof on x86 it would take minutes a proof on the phone, and the
+channel is out of the running already.
+- **The pin stands, flagged:** at blowup 4, PoW 16 and PoW 20 tie on the
+  phone (p50 5.79–5.98 against 5.76–5.98 s, the 95th percentiles within
+  4%), so the grind's choice holds. But the phone favours **blowup 2** more
+  than x86 did: about 15% faster (4.95–5.09 against 5.79–5.98 s) and 30%
+  less memory (2.4–2.5 against 3.5–3.6 GiB), its proofs 3.2–3.3 MB, about
+  2.2 times the 1.5 MiB budget. Format 43 stays at blowup 4 on the byte
+  budget; 7.17's lever 4 counts again on the lighter shape, where blowup
+  2's proofs shrink with the columns.
+- **Blowup 8 is out on the phone:** 12.5–18.6 s, 4.8–5.7 GiB, and its
+  memory pressure is what ended the foreground app during PG3.
+- **The even split over all eight cores beat the four big cores** on this
+  statement by 1.17–1.26× (blowup 2 and 4), the reverse of 7.12's credential
+  proofs (the big cores 1.2× faster there): the heavier proof keeps the
+  A520s busy. Only at blowup 8, memory-bound, were the big cores faster
+  (12.5 against 15.6 s). 7.17's `Threads::Auto` measures the classes'
+  rates rather than assuming either.
+- **The ARM factor:** the pin's 5.9 s against x86's 1.97 s on four P-cores
+  measured quiet at 7.17 (2.64 s under 7.16's load) is about 3.0× (2.2×
+  against the loaded figure).
 
 **Where PG2's 1 s stands:** the pin proves the auth statement in 2.64 s
 on four x86 P-cores (1.93 s on 8) under load 3–5; at 7.12's ratio (the
@@ -2378,6 +2414,206 @@ and `constants::` among it
 `8f58ae0c` the first merge, `a4fdb6d4` the pin and the measurements, the
 second merge, `d421c7ee` and `583b6c5a` this record and its formatting,
 then the review's folds.
+
+## Step 7.17: levers 1–4
+
+Branch `s7/7.17`, from vos-core `cdeecba2` (7.16 merged). Levers in the
+order 7.16's breakdown ranked them, each its own commit and measured on x86
+before and after; lever 1 stopped at its design note for Fable's check.
+
+**Lever 1, the device io-hash through Poseidon2: proposed, not built.**
+`proving.md` §8 (*The device io-hash `H_io`*) and pin J: a device kernel's
+io-hash over `C`, the encoded parts `E` as `compute_io_hash` encodes them,
+packed three bytes a word, eight words a block, zero-padded, the chain from
+`T(io)` (a seventh tag) a `C` a block, ending with `C` of a block holding
+`E`'s length (Merkle–Damgård strengthening, so binding rests on `C`'s
+collisions alone); `E` of 2^24 bytes or more refused; `#[attestable(device)]`
+kernels only, node kernels and formats 35 and 41 keep BLAKE2b; the verifier
+and DeviceIoChip unchanged, ingress recomputing `H_io` from the request's
+words. First written with the length in the IV (`1f983e6b`); the review
+found that argument leaning on a preimage of `C`, which a truncated
+permutation without feed-forward does not resist with both halves free, and
+the note now puts the length last (`cd2f219f`). **Awaiting Fable's design
+check**; nothing built. Its expected effect [est, from the breakdown]:
+BLAKE2b (3,136 columns) and the AND table (12 columns at 2^16) leave the
+auth kernel's shape, 49% of its 6,351 columns and 32% of its 44.9M cells;
+about −45% bytes (1.82 → about 1.0 MB at the pin) and −25–35% time.
+
+**Lever 2, the lean kernel** (`82bc4842`, the spike's `auth_p2`): its
+arguments read where the witness input left them (`InPlace<N>`, a pointer
+decoded without a copy; the siblings first, so page-aligned, the secret
+8-aligned after them, the public words after the private ones, pin I's
+order among themselves), and the path walked in place in one lane
+`[sibling, node, sibling]`, each level's call reading the half the slot's
+bit picks by its address (never a branch) and writing the parent over the
+node; the call issued directly, no software fallback in the kernel's code.
+The statement is unchanged (the same 129 public bytes, the same io-hash).
+The harness's `kernels` profiles a kernel by function under `S7_PROFILE`
+(the spike patch names a kernel's functions): before, 10,133 of 18,733
+steps were the method's body (byte-wise word conversions of unaligned
+arguments, the masks), 3,764 `memcpy`, 2,664 the compression's copies; after,
+5,665 steps, of which 2,121 `memcpy` and about 1,450 `realloc` and its
+growth are the SDK's end (`attested`: the public arguments re-encoded, the
+return encoded, the io-hash), 1,299 the method. The CPU 2^15 → 2^13 rows,
+the memory ledger 2^17 → 2^15, the registers' 2^16 → 2^14; 52,741 → 11,061
+bytes by loads and stores.
+
+**Lever 3, threads by core class and the preprocessed tree once**
+(`2830989a`, folded in `ff3567cb`):
+- **`DeviceProver`** (`vos_pvm_recair::masked::device`): `install` commits
+  the program's preprocessed tree once (`masked::Committed`: its twiddles
+  and its tree, coefficients kept), and each proof borrows it
+  (`commit_tree`) instead of interpolating, extending and committing it
+  again, across R1's attempts too. `install` is now this prover's program.
+  A gate (`an_installed_prover_proves_as_the_per_proof_path`) shows its
+  proofs byte for byte the per-proof path's under one seed, and two in a
+  row verifying.
+- **`Threads::Auto`** (`vos-device`): the cores this thread may run on,
+  grouped by their stated rate (capacity where the cores' capacities
+  differ, else their highest clock, a class the cores within a sixth of
+  its highest), each class's rate measured on one of its cores (BLAKE2s
+  over 1 MiB, the best of three after 40 ms of warm-up); the work goes to
+  the fastest classes whose count times the slowest kept rate is greatest
+  (an even split runs at its slowest core's rate), every class unpinned
+  when that is all of them, else the kept classes' cores pinned. Weighting
+  by oversubscription (two threads a big core) measured slower on x86, so
+  the rule picks classes, not shares.
+- **`vos_device::thread_pool`**: the pool a `Prover` and the phone bench's
+  device cells run in, its threads' stacks 16 MiB (`STACK_BYTES`, 7.16's
+  overflow). `vos-phone device --cores LIST` pins a thread an entry.
+
+**Lever 4, the Poseidon2 chip's width** (`c2113254`): its 96 ledger
+fractions (addresses of degree 2) stay a column each; the call and the 72
+range checks (denominators of degree 1) are paired (`Logup::SingleThenPairs
+{ singles, total }`, the verifier's batching and the prover's
+`LogupTraceBuilder::single_then_pairs` alike), a pair's constraint of degree
+3: 169 fractions in 133 interaction columns, 1,207 → 1,063 columns, 4,292 →
+4,256 constraints. The degree audit, the device suite's forgery gates
+(the Poseidon2 output, the input word at p, the call without its row, the
+address carry) and leakage pass unchanged. Format 43's reference moves
+with the built set (7,548 → 7,404 DEEP values, 4,292 → 4,256 constraints);
+its counts do not (62.82 affine, 62.01 by powers, recounted; the query term
+binds), nor the candidates' least queries. Format 35 is untouched (its
+chips never take the new batching). Word-wide accesses or aligned pointers
+would take the ledger fractions too, but change pin H's call (an aligned
+pointer the actor's shim does not give), so not here.
+
+**x86** [measured; `vos-phone device` on the 7.16 kernels (before) and the
+lean ones, the pin (blowup 4, 47 queries, PoW 16, Blake2s-M31), 4 threads
+pinned to P-cores 1, 3, 6, 8, 5 reps after a warm-up; quiet, load 1.0–2.9
+(`runs/x86-levers.jsonl`), and three interleaved rounds of the lean, cache
+and chip binaries, 7 reps after 2 warm-ups, load 2–3.3
+(`runs/x86-levers-rounds.jsonl`); the first round's lean cell (0.92 s) an
+outlier against the other two (1.08 s)]:
+
+| lever | steps | columns | cells | prove p50 / p95 | peak | bytes | install |
+|---|---|---|---|---|---|---|---|
+| before (7.16's kernel) | 18,733 | 6,495 | 105.7M | 1.95 / 1.97 s | 3,407 MiB | 1,887,134 | 190 ms |
+| 2: the lean kernel | 5,665 | 6,495 | 45.5M | 1.08 / 1.10 s | 1,571 MiB | 1,858,581 | 130 ms |
+| 3: the tree once | 5,665 | 6,495 | 45.5M | 1.02 / 1.04 s | 1,559–1,586 MiB | 1,853,510 | 124 ms |
+| 4: the chip paired | 5,665 | 6,351 | 44.9M | **1.01 / 1.03 s** | 1,548–1,557 MiB | **1,818,328** | 122–128 ms |
+
+Lever 2 ×0.55 in time, ×0.46 in memory; lever 3's tree ×0.94; lever 4
+×0.99 in time and −2% in bytes. Together **×0.52 in time (1.95 → 1.01 s),
+×0.46 in memory (3.4 → 1.55 GiB)**; the proof still 1.82 MB, its bytes set by
+the columns (lever 1). Verification 23–29 ms in the pool.
+
+**Threads** [measured, the same session; lean kernel, chip paired]:
+
+| cores | pool | prove p50 / p95 | peak |
+|---|---|---|---|
+| 4 P + 4 E (`1,3,6,8,12–15`) | even split, 8 unpinned | 0.82 / 0.84 s | 1,594 MiB |
+| 4 P + 4 E | the 4 P-cores pinned | 1.02 / 1.03 s | 1,562 MiB |
+| 4 P + 4 E | `Auto`: both classes kept, 8 | **0.80 / 0.84 s** | 1,609 MiB |
+| 4 P + 4 E | 2 a P-core + 1 an E-core, 12 pinned (an earlier run, load 2–4) | 0.73 s against the even split's 0.65 s | |
+| all 22 | even split, 22 | 0.84 / 0.86 s | 1,703 MiB |
+| all 22 | `Auto`: the 2 low-power cores dropped, 20 pinned | **0.80 / 0.85 s** | 1,677 MiB |
+
+On x86 the efficient cores pay their way (the split over 4 P + 4 E ×1.27
+the P-cores alone), and `Auto` keeps them, dropping only the low-power
+island; on the phone P4 found the even split over its eight cores 1.17–1.26×
+the four A720s on this statement (and 7.12 the reverse on the credential
+proofs): `Auto` measures rather than assumes, P5 confirms on the phone.
+
+**Lever 5, parameters again** [measured, the lean shape with the chip
+paired, 4 P-cores, the same session]:
+
+| candidate | prove p50 / p95 | peak | bytes | R1 |
+|---|---|---|---|---|
+| blowup 2, 86 queries, PoW 20 | 1.02 / 1.05 s | 1,205 MiB | 3,136,998 | 70 ms |
+| blowup 2, 87, PoW 20 | 1.02 / 1.04 s | 1,206 MiB | 3,175,097 | 71 ms |
+| blowup 4, 43, PoW 20 | 1.02 / 1.04 s | 1,566 MiB | 1,689,303 | 18 ms |
+| **blowup 4, 47, PoW 16 (43)** | 1.01 / 1.03 s | 1,557 MiB | 1,818,328 | 19 ms |
+| blowup 8, 29, PoW 20 | 1.42 / 1.49 s | 2,446 MiB | 1,217,807 | 8 ms |
+
+**No re-pin.** Blowup 2 and 4 still tie in time; blowup 2 takes 23% less
+memory and twice the bytes (3.1 MB against 1.5 MiB, still about 1.9× after
+lever 1's −45% [est]); blowup 8 fits the bytes and loses 40% in time and
+57% in memory. At blowup 4, PoW 20's 43 queries would save 7% of the bytes
+(1.69 against 1.82 MB) for the grind's tail 7.12 measured (PoW 20's p95
+69–72 ms on the phone against 6–7 ms), and P4 found the two tied in time:
+the pin's trade stands. `h` is already per component by its offsets (a
+`|O| = 1` component at half), and every chip of this shape now sits at
+2^11–2^13 rows but the AND table's fixed 2^16: once lever 1 removes that
+table and BLAKE2b, the floors' share grows, and `h = 256` (7.14's option 2)
+is the parameter to count again then.
+
+**Where PG2's 1 s stands:** on x86 the auth statement proves in **1.01 s on
+four P-cores, 0.80 s under `Auto`** (from 1.95 s quiet before the levers),
+peak 1.55 GiB, its proof 1.82 MB. At P4's ARM factor (the phone at
+automatic threads about 3.0× x86 on four P-cores) that is **about 3.0 s on
+the phone [est]** against 1.0 s, about 1.6 GiB on the phone's build
+[est, P4's peaks ×1.05 x86's] against 1 GiB, and a proof 1.16× the 1.5
+MiB budget. PG2 needs about ×3 more. Lever 1 (about −25–35% [est], the
+bytes under budget) brings it to about 2.0–2.3 s; then **7.18's CPU split**
+(the CPU is 785 of 6,351 columns and 29% of the cells at 2^13 rows; after
+lever 1, about 42%) and **7.19's word-level memory** (the ledger at 2^15
+and the registers' at 2^14, 14% of the cells, about 20% after lever 1).
+The Poseidon2 chip, at its floor, is 10% (1,063 columns). The lean
+kernel left 5,665 steps; the SDK's end (2,121 `memcpy`, about 1,450 in
+`realloc`) is the next 30% of them, for lever 1's `attested_device` to
+write the parts once and in place (the CPU at 2^12 under 4,096 steps).
+
+**Also:**
+- **The phone (P4) and the plan's ARM factor:** P4 is recorded in 7.16's
+  section; this step's phone session P5 waits for lever 1.
+- **The derivation still refuses `0x402` in kernels:** the spike patches it
+  (`pvm-proof.patch`); a real path through derivation is 7.20's.
+- **`DeviceProver` keeps the preprocessed tree resident** (its evaluations,
+  coefficients and Merkle layers) between proofs: counted in the peaks
+  above; the install now stores coefficients only to compute the root.
+- **A flaky checker test:** `vos-checker`'s
+  `a_held_tcp_port_takes_no_listener_and_resets_what_connects` failed once
+  in `just check` with `AddrInUse` on its last bind (other agents' runs on
+  the machine); six reruns passed. Not this step's code.
+
+**Review (Opus):** nothing high. The batching checked fraction by fraction
+(order, count, the odd last fraction, the masked blinding joined to it,
+degrees ≤ 3, format 35 untouched, the reference's −36 constraints and −144
+DEEP values); the committed tree's transcript the per-proof path's, never
+mutated, safe across attempts and proofs; the lean walk's order, its
+witness-independent steps and the overlapping call. Folded: M1, the
+io-hash's binding argument (the length now a last block); M2, an oversize
+encoding refused and the fuller list of what moves; M3, `InPlace::bytes`
+unsafe and the arguments' alignment asserted; M4, the installed prover's
+gate; L1, `DeviceProver`'s fields private; L2, the chip's singles read from
+its batching; L3, the spike's head and lane through one pointer each; L4,
+the warm-up 40 ms and the class rule an even split's rate instead of a
+fixed half; a failed thread spawn measures 0 and keeps every class; L6,
+the powers count recounted (62.01, unchanged). Not taken: L5's cgroup quota
+in the pinned branch (pinning names cores the affinity mask allows).
+
+**Gates** [measured; 12 GiB scope, `nice -n 10`, 6 jobs]: the device suite
+30 of 30, `vos-device`'s 10, the circuit suite's degree audits; `just
+check` green at `8a93e17f` (1,652 passed in 125 suites; an earlier run
+hit the flaky checker test above), `just test-proof` green at `8a93e17f`
+(582 passed in 50 suites, `fixtures::` and `constants::` among them: format
+35 byte for byte).
+
+**Commits:** `1f983e6b` lever 1's note (for Fable), `82bc4842` lever 2,
+`2830989a` lever 3, `c2113254` lever 4, `cd2f219f` the note revised,
+`ff3567cb` the review's folds, `7ebe7e3c` P4 in 7.16's section; formatting
+commits; this record and the runs.
 
 ## Step 7.10b: the node API and the gateway
 

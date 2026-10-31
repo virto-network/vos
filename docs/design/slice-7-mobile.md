@@ -444,6 +444,24 @@ pinned by 7.7.
   - read-only pages: a preprocessed permission table per region;
   - arguments: the witness-input precompile; the output: the io-hash in
     φ9..12 only, no memory root out.
+- **The device io-hash** [proposed, 7.17; for Fable's design check]: a
+  device kernel's io-hash is `H_io`, `proving.md` §8's Poseidon2
+  definition, not `compute_io_hash`'s BLAKE2b-256, so a kernel that hashes
+  only through `0x402` reaches neither BLAKE2b nor the AND table and its
+  shape holds neither. The encoded parts `E` are BLAKE2b's (`public_args`,
+  `output`, `roots`, each SCALE-framed, the same bytes); `E` is packed three
+  bytes a word, eight words a block, zero-padded; the chain starts at
+  `T(io)`, takes one `C` a block and ends with `C` of a block holding
+  `E`'s byte length (Merkle–Damgård strengthening, binding by `C`'s
+  collisions alone); an `E` of 2^24 bytes or more is refused; the
+  digest's 8 words, as 32 little-endian bytes, are φ9..12. A device kernel
+  is `#[attestable(device)]`, and a guard's `device = "..."` must name one;
+  node kernels, formats 35 and 41 and their program ids keep BLAKE2b.
+  Ingress computes `H_io` from the request's words exactly as the kernel
+  does and verifies against it; the verifier, DeviceIoChip and format 43's
+  count are unchanged. What moves: every device kernel's code and program
+  id (none pinned before 7.20), the runtime's and the testkit's io-hash of
+  a device kernel's return, the tags (seven, `io` added).
 - **Masked** (c) over the segment chips (7.14): the active-chip mask, a
   finalize hook for the 14 chips that finalize unpaired, a per-component
   `h` by the component's offsets (`|O| = 1` components at half the

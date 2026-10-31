@@ -37,7 +37,7 @@ pub use call::{Call, NAME_BYTES, scope};
 pub use path::PathKeeper;
 pub use prover::{
     CredentialProof, CredentialPublic, JointProof, JointPublic, PEAK_BYTES, Prover, ProverConfig,
-    Threads, verify, verify_joint,
+    STACK_BYTES, Threads, thread_pool, verify, verify_joint,
 };
 pub use secret::{DeviceSecret, derive_secret, member, owner, source_input};
 

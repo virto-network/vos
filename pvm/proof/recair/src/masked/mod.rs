@@ -58,16 +58,18 @@ use stwo::core::fields::qm31::{SECURE_EXTENSION_DEGREE, SecureField};
 use stwo::core::pcs::TreeVec;
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::proof::StarkProof;
+use stwo::core::utils::MaybeOwned;
 use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use stwo::core::verifier::PREPROCESSED_TRACE_IDX;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::simd::column::BaseColumn;
 use stwo::prover::backend::{BackendForChannel, Column};
+use stwo::prover::mempool::BaseColumnPool;
 use stwo::prover::poly::circle::{CircleCoefficients, CircleEvaluation, PolyOps};
 use stwo::prover::poly::twiddles::TwiddleTree;
 use stwo::prover::{
-    CommitmentSchemeProver, ComponentProver, ComponentProvers, DomainEvaluationAccumulator,
-    ProvingError, Trace,
+    CommitmentSchemeProver, CommitmentTreeProver, ComponentProver, ComponentProvers,
+    DomainEvaluationAccumulator, ProvingError, Trace,
 };
 use stwo_constraint_framework::Relation;
 use vos_pvm_final_verifier::masked::{MaskedFormat, shape_of};
@@ -381,15 +383,72 @@ pub(crate) fn prove_masked_checked<MC: MerkleChannel, C: MaskedProvers>(
 where
     SimdBackend: BackendForChannel<MC>,
 {
-    prove_masked_program::<MC, C>(format, &[], trace, rng, checks)
+    prove_masked_program::<MC, C>(format, &[], trace, None, rng, checks)
+}
+
+/// What every proof of one program shares, computed once: the twiddles
+/// at its lifting height and its preprocessed tree, committed as a masked
+/// format commits it (each column interpolated and extended one level), its
+/// coefficients kept.
+pub struct Committed<MC: MerkleChannel>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    twiddles: TwiddleTree<SimdBackend>,
+    tree: CommitmentTreeProver<SimdBackend, MC>,
+}
+
+impl<MC: MerkleChannel> Committed<MC>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    /// The preprocessed columns of components of `log_sizes`, committed
+    /// under `format`. `None` when a log size overflows.
+    pub(crate) fn new(
+        format: &Format,
+        log_sizes: &[u32],
+        preprocessed: Evaluations,
+    ) -> Option<Self> {
+        let lifting = lifting_log_size(format, log_sizes)?;
+        let twiddles =
+            SimdBackend::precompute_twiddles(CanonicCoset::new(lifting).circle_domain().half_coset);
+        let config = format.pcs_config();
+        let tree = CommitmentTreeProver::new(
+            extend_preprocessed(preprocessed, &twiddles),
+            config.fri_config.log_blowup_factor,
+            &twiddles,
+            true,
+            config.lifting_log_size,
+            &BaseColumnPool::new(),
+        );
+        Some(Self { twiddles, tree })
+    }
+
+    /// The preprocessed root.
+    pub fn root(&self) -> <MC::H as MerkleHasherLifted>::Hash {
+        self.tree.commitment.root()
+    }
+}
+
+/// The preprocessed tree a proof commits: its columns, extended and
+/// committed for this proof alone, or a program's, committed once.
+enum Preprocessed<'a, MC: MerkleChannel>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    Columns(Vec<CircleCoefficients<SimdBackend>>),
+    Committed(&'a CommitmentTreeProver<SimdBackend, MC>),
 }
 
 /// [`prove_masked_checked`] of `program`, words the transcript mixes right
-/// after the header (`MaskedFormat::program`).
+/// after the header (`MaskedFormat::program`); its preprocessed tree
+/// `committed`'s when given, which must be the trace's columns committed
+/// under `format` (`trace.preprocessed` is then not read).
 pub(crate) fn prove_masked_program<MC: MerkleChannel, C: MaskedProvers>(
     format: &Format,
     program: &[u64],
     trace: MaskedTrace<'_, C::Relations, C::Active>,
+    committed: Option<&Committed<MC>>,
     rng: MaskRng,
     checks: Checks,
 ) -> Result<(MaskedProof<MC::H>, MaskStats), ProveError>
@@ -416,8 +475,20 @@ where
     let lifting = lifting_log_size(format, trace.log_sizes)
         .ok_or(ProveError::TraceShape("a component's log size overflows"))?;
     let composition = lifting - format.params.log_blowup;
-    let twiddles =
-        SimdBackend::precompute_twiddles(CanonicCoset::new(lifting).circle_domain().half_coset);
+    let own;
+    let (twiddles, preprocessed) = match committed {
+        Some(committed) => (
+            &committed.twiddles,
+            Preprocessed::Committed(&committed.tree),
+        ),
+        None => {
+            own = SimdBackend::precompute_twiddles(
+                CanonicCoset::new(lifting).circle_domain().half_coset,
+            );
+            let columns = extend_preprocessed(trace.preprocessed, &own);
+            (&own, Preprocessed::Columns(columns))
+        }
+    };
     let witness = rng::witness_digest(
         &rng::Statement {
             format,
@@ -451,7 +522,6 @@ where
         .zip(mask_rows.iter().copied())
         .collect();
     let layouts = layout::layouts(&classes)?;
-    let preprocessed = extend_preprocessed(trace.preprocessed, &twiddles);
     let setup = Setup {
         format,
         program,
@@ -461,7 +531,7 @@ where
         public_sums: &public_sums,
         composition,
         lifting,
-        twiddles: &twiddles,
+        twiddles,
         layouts: &layouts,
         log_sizes: trace.log_sizes,
         public: trace.public,
@@ -524,9 +594,9 @@ struct R1 {
 type Attempt<H> = Option<(MaskedProof<H>, R1)>;
 
 /// One attempt from `rng`'s stream.
-fn prove_once<MC: MerkleChannel, C: MaskedProvers>(
-    setup: &Setup<'_, '_, C::Relations, C::Active>,
-    preprocessed: &[CircleCoefficients<SimdBackend>],
+fn prove_once<'a, MC: MerkleChannel, C: MaskedProvers>(
+    setup: &Setup<'a, '_, C::Relations, C::Active>,
+    preprocessed: &Preprocessed<'a, MC>,
     rng: &mut ChaCha20Rng,
 ) -> Result<Attempt<MC::H>, ProveError>
 where
@@ -542,9 +612,14 @@ where
     let mut scheme = Scheme::<MC>::new(config, setup.twiddles);
     scheme.set_store_polynomials_coefficients();
 
-    let mut builder = scheme.tree_builder();
-    builder.extend_polys(preprocessed.to_vec());
-    builder.commit(channel);
+    match preprocessed {
+        Preprocessed::Columns(columns) => {
+            let mut builder = scheme.tree_builder();
+            builder.extend_polys(columns.to_vec());
+            builder.commit(channel);
+        }
+        Preprocessed::Committed(tree) => scheme.commit_tree(MaybeOwned::Borrowed(tree), channel),
+    }
 
     let blinding = commit_main(setup, &mut scheme, rng, channel)?;
 

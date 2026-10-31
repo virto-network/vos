@@ -87,3 +87,61 @@ diff --git a/pvm/runtime/src/precompile.rs b/pvm/runtime/src/precompile.rs
 +    // kernel's, which the derivation does not admit yet.
 +    matches!(id, BLAKE2B_COMPRESS | WITNESS_INPUT | POSEIDON2)
  }
+diff -u a/pvm/compiler/src/derive.rs b/pvm/compiler/src/derive.rs
+--- a/pvm/compiler/src/derive.rs
++++ b/pvm/compiler/src/derive.rs
+@@ -788,10 +788,20 @@
+         // The argument pages, zeros past the read-write data, then the
+         // linked program's own zero pages.
+         heap_pages: elf.heap_pages + input.pages() as u32,
++        symbols: elf.symbols.clone(),
++        names: elf.names.clone(),
+         ..LinkedElf::default()
+     };
+ 
+     let transpiled = transpile_with(&kernel, Link::Kernel)?;
++    if let Some(dir) = std::env::var_os("S7_PROFILE") {
++        let text: String = transpiled
++            .functions
++            .iter()
++            .map(|(at, name)| format!("{at} {name}\n"))
++            .collect();
++        std::fs::write(std::path::Path::new(&dir).join(format!("{method:08x}.functions")), text).unwrap();
++    }
+     checked_blob(graph, &reached, method, transpiled, arguments, input)
+ }
+ 
+diff -u a/pvm/compiler/src/linker.rs b/pvm/compiler/src/linker.rs
+--- a/pvm/compiler/src/linker.rs
++++ b/pvm/compiler/src/linker.rs
+@@ -173,7 +173,7 @@
+     /// Zeroed heap pages beyond `rw_data`.
+     heap_pages: u32,
+     /// Each function's first PVM instruction, and its name, by offset.
+-    functions: crate::Functions,
++    pub(crate) functions: crate::Functions,
+     /// Each `ecalli` emitted, by the address of its `ecall`, and its id.
+     pub(crate) host_calls: Vec<(u64, u32)>,
+ }
+@@ -322,8 +322,10 @@
+         &mut ctx.jump_table,
+         |offsets| moved = Some(offsets.to_vec()),
+     );
+-    let mut functions: Vec<(u32, String)> = match link {
+-        Link::Named => elf
++    let named = link == Link::Named
++        || (link == Link::Kernel && std::env::var_os("S7_PROFILE").is_some());
++    let mut functions: Vec<(u32, String)> = match named {
++        true => elf
+             .symbols
+             .iter()
+             .filter(|symbol| symbol.kind == STT_FUNC)
+@@ -337,7 +339,7 @@
+                 Some((at, format!("{:#}", rustc_demangle::demangle(name))))
+             })
+             .collect(),
+-        Link::Whole | Link::Kernel => Vec::new(),
++        false => Vec::new(),
+     };
+     functions.sort();
+ 
