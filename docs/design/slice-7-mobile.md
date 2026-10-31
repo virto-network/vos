@@ -444,7 +444,7 @@ pinned by 7.7.
   - read-only pages: a preprocessed permission table per region;
   - arguments: the witness-input precompile; the output: the io-hash in
     φ9..12 only, no memory root out.
-- **The device io-hash** [built, 7.17b, but ingress's check, 7.20's;
+- **The device io-hash** [built, 7.17b, ingress's check 7.20's;
   checked by Fable]: a device kernel's io-hash is `H_io`, `proving.md`
   §8's Poseidon2 definition, not `compute_io_hash`'s BLAKE2b-256, so a
   kernel that hashes only through `0x402` reaches neither BLAKE2b nor the
@@ -487,7 +487,10 @@ pinned by 7.7.
   retired unregistered. 7.17's lever 4 counts again on the lighter shape.
 - **The device program id:** the format, the chip mask, the log sizes and
   the preprocessed roots (program memory, data table, permissions), as a
-  segment program's; computed at install, never taken as submitted.
+  segment program's; computed at install, never taken as submitted [built,
+  7.20: the log sizes those a run on auth's public reference statement
+  needs, so every node and the device compute one program from the
+  kernel; `proving.md` §8, *The device program*].
 - **A witness-independent trace** (the Fable review's M8): the prover pads
   every chip to the program id's log sizes and fails on a run that
   exceeds them; a device kernel is written branch-free (the path walked
@@ -1056,7 +1059,7 @@ and adds its set in a file of its own.
   fails or refuses leaves its nullifier free (a second proof of it
   admitted), while the first call's `b` sent again is refused `Replayed`
   [decided, S47]; a 1.4 MiB format-43 body
-  within the frame's size (refused `Format` until 7.20 admits 43), a
+  within the frame's size (refused `Format` until 7.20 admitted 43), a
   600 KiB credential proof refused `Size`; a wrong-PoW proof refused in
   under 1 ms; the origin logged, the proof not; a pay proof refused once
   the row's owner changed, and on a frozen row; a rekeyed row paying to

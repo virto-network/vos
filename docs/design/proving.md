@@ -655,8 +655,8 @@ last for decades.**
   `h`. The device shape proves them masked against its program
   (`vos_pvm_recair::masked::device`, slice 7's 7.15): the program's chips
   mixed after the header, its log sizes pinned, the io-hash the one public
-  sum. No admitted format proves either yet (the device format, 43, is
-  registered and refused until ingress takes device proofs). Node segment, leaf and fold proofs stay unmasked, in the prover
+  sum. The device format, 43, is admitted at a space's ingress for
+  device proofs of auth's statement (slice 7's 7.20). Node segment, leaf and fold proofs stay unmasked, in the prover
   role, as the witness rows do.
 - **Device proofs (format 43, rate 1/4)** serve authorizations a space re-checks at
   its ingress, never settlement.
@@ -1207,8 +1207,8 @@ binding the run like this:
   segment chip reads its running sum's previous row, so each takes the
   full `h` [built, 7.14].
 
-**The device io-hash `H_io`** [built, slice 7's 7.17b, but ingress's
-check, 7.20's; checked by Fable]. A device kernel's io-hash was
+**The device io-hash `H_io`** [built, slice 7's 7.17b, ingress's check
+7.20's; checked by Fable]. A device kernel's io-hash was
 `compute_io_hash`'s BLAKE2b-256, so BLAKE2b (3,136 columns) and its AND
 table stayed in every device shape, the Poseidon2 statement's too: 48% of
 its columns, and the Merkle hashing and the proof's bytes go with the
@@ -1243,8 +1243,8 @@ columns [measured, 7.16]. Over `C`, a kernel that hashes only through
   chain's state, a 24-byte buffer and the length so far) over a lane of 16
   words that `C` compresses in place. The kernel's end absorbs its `E`
   where it wrote it; the testkit checks a device return with
-  `compute_device_io_hash`; ingress (7.20) feeds the request's words part
-  by part: no re-encoding. In a kernel the lane's call is `0x402` issued
+  `compute_device_io_hash`; ingress computes it from the request's auth
+  words (`vos_pvm_recair::device::auth_io`). In a kernel the lane's call is `0x402` issued
   directly (`Poseidon2Call`, which traps where no host serves it, as the
   lean kernel's own calls do), never `poseidon2_compress_into`, which
   would link the software permutation.
@@ -1291,7 +1291,8 @@ columns [measured, 7.16]. Over `C`, a kernel that hashes only through
   kernels (`Derived::devices`). A device kernel's record keeps the node's
   segment shape, never proved and not held to the recursion's leaves; the
   device proves it under the device profile, whose chips its code gives
-  (`device_chips_of_code`), at its install (7.20). Node kernels, formats
+  (`device_chips_of_code`), against the program computed from the kernel
+  (below, *The device program*). Node kernels, formats
   35 and 41 and their program ids keep BLAKE2b; `0x402` stays a device
   kernel's (pin H).
 - **No node attests one:** the runtime and the testkit refuse `Attest` of
@@ -1299,7 +1300,7 @@ columns [measured, 7.16]. Over `C`, a kernel that hashes only through
   methods alone; the macro gives a device method no `AttestableMethod`,
   so a workflow's attest of one does not compile. The prove-later path
   never meets `H_io`.
-- **What the verifier and ingress check** [proposed, 7.20]: the verifier
+- **What the verifier and ingress check** [built, 7.20]: the verifier
   is unchanged (the io-hash's 32 bytes are the public values,
   DeviceIoChip's sum recomputed from them); ingress picks the io-hash by
   the proof's format, 43's being `H_io` (not by the guard), computes it
@@ -1339,8 +1340,36 @@ Blake2s-M31 channel, blowup 4, 47 queries, PoW 16, interaction PoW 8,
 affine DEEP batching, `h = 512` (format 44's parameters); 110 conjectured
 and 62.82 proven bits on its masked reference, every device chip at
 2^17 rows (`DEVICE_MAX_LOG_SIZE`, which install enforces: the memory
-ledger, a row a byte touched, takes 2^17 on the auth statements). It is
-registered and refused until ingress takes device proofs.
+ledger, a row a byte touched, takes 2^17 on the auth statements).
+Admitted at ingress for device proofs of auth's statement (7.20); a proof
+is at most 1.5 MiB (the auth kernel's about 0.98 MB) and its bytes the
+masked proof's postcard encoding alone, canonical, with no io-hash.
+
+**The device program** [built, slice 7's 7.20; `vos_pvm_recair::device`]:
+what a device proof is verified against, computed from the kernel alone,
+never taken from a request. Its chips are those the kernel's code reaches
+(`device_chips_of_code`); its log sizes are those a reference run needs,
+each at least the masking's floor and at most `DEVICE_MAX_LOG_SIZE`; its
+preprocessed root commits its code, data table, regions, permissions and
+entry registers. A kernel of auth's statement takes its reference run on
+auth's public reference statement (`auth_reference`: a fixed, public
+secret's member at slot 0 of the empty tree, a fixed scope and binding),
+so every node computes one program from the installed kernel, and the
+device the same from the same kernel; a branch-free kernel's every
+witness runs to those sizes. The program id, which a binding names, is
+BLAKE2b-256 of `"vos/device/program/v1"`, the format's number and
+parameters (log blowup, queries, PoW, fold step, log last layer,
+interaction PoW, `log h`), the chips, the count of log sizes and each,
+and the root (every integer four little-endian bytes); the transcript
+mixes each of them too. The leader computes it at the install, which
+fails for a guarded device kernel that does not run auth's reference
+within the format's shape; a replica that did not install, at the first
+device proof naming the kernel, then keeps it. Auth's arguments to a
+device kernel are the 32 siblings from the leaf's level up, the secret's
+32 bytes, the slot (four little-endian bytes) and the 129 public bytes,
+in that order (`auth_arguments`), which `vos-device`'s
+`prove_device_auth` writes; a kernel that reads them otherwise does not
+run the reference and is refused at the install.
 
 **What a device proof authorizes** [decided, S24]: exactly what an auth
 credential proof does. A device kernel is an `#[attestable]` method whose
