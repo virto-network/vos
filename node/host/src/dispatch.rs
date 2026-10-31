@@ -95,9 +95,9 @@ impl Inner {
         Some((state.leader?, state.term))
     }
 
-    /// Check an arrival and route it. Only Raft routing runs inline: a
-    /// blob (hashed) and a creation record (committed) run in tasks of
-    /// their own, so no group's consensus waits behind them.
+    /// Check an arrival and route it. A blob, hashed, runs in a task of its
+    /// own, and a placement to store waits for the directory's recording,
+    /// so no group's consensus waits behind them.
     async fn arrive(self: &Arc<Self>, class: Class, incoming: Incoming) {
         self.counters.arrived[class as usize].fetch_add(1, Ordering::Relaxed);
         let Incoming {
@@ -112,10 +112,9 @@ impl Inner {
                 return;
             }
         };
-        if matches!(
-            message,
-            PeerMessage::Blob { .. } | PeerMessage::Directory { .. }
-        ) {
+        // A blob is hashed on an executor, so no group's consensus waits
+        // behind it.
+        if matches!(message, PeerMessage::Blob { .. }) {
             let inner = Arc::clone(self);
             let space = Arc::clone(&self.numbers);
             let (ours, _) = self.space_and_clock();
@@ -142,12 +141,8 @@ impl Inner {
                     inner.drops.count(refusal);
                     return;
                 }
-                match message {
-                    PeerMessage::Blob { hash, bytes } => inner.take_blob(hash, bytes).await,
-                    PeerMessage::Directory { record, placement } => {
-                        inner.on_directory(from, record, placement).await
-                    }
-                    _ => unreachable!("only blobs and records are handled here"),
+                if let PeerMessage::Blob { hash, bytes } = message {
+                    inner.take_blob(hash, bytes).await;
                 }
             });
             return;
@@ -238,9 +233,10 @@ impl Inner {
                 proof,
                 attested,
             } => self.on_proved(from, agent, window, id, (proof, attested)),
-            PeerMessage::Blob { .. } | PeerMessage::Directory { .. } => {
-                unreachable!("blobs and records are handled in tasks")
+            PeerMessage::Directory { record, placement } => {
+                self.on_directory(from, record, placement)
             }
+            PeerMessage::Blob { .. } => unreachable!("blobs are handled in tasks"),
             PeerMessage::SnapshotChunk(chunk) => {
                 let agent = chunk.agent;
                 self.to_inbox(agent, Input::Chunk { from, chunk });

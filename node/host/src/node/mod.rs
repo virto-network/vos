@@ -14,6 +14,7 @@ mod directory;
 mod error;
 mod open;
 mod queue;
+mod recording;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
@@ -137,10 +138,9 @@ pub(crate) struct Inner {
     /// Node-wide tasks: the dispatcher, the directory's resends, and the
     /// work groups hand off.
     tasks: Mutex<Tasks>,
-    /// Held while a record or a placement is checked against the directory
-    /// and stored. It orders `place` against `on_directory`: each reads,
-    /// compares and writes, and neither may store over a newer placement.
-    pub(crate) recording: smol::lock::Mutex<()>,
+    /// The placements waiting to be checked against the directory and
+    /// stored, by one task: none is stored over a newer one.
+    recording: recording::Recording,
     /// Turns through an agent's replicas, for what goes to one of them.
     pub(crate) turn: AtomicU64,
     pub(crate) counters: Counters,

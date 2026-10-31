@@ -145,7 +145,7 @@ impl Node {
             next_agent: smol::lock::Mutex::new(next),
             runtime,
             tasks: Mutex::new(Tasks::default()),
-            recording: smol::lock::Mutex::new(()),
+            recording: Default::default(),
             calls: crate::calls::Calls::default(),
             reads: crate::asking::Waits::default(),
             floor_waits: std::sync::atomic::AtomicUsize::new(0),
@@ -169,6 +169,7 @@ impl Node {
                 .upgrade()
                 .is_some_and(|inner| inner.to_group(agent, crate::group::Local::Wake))
         }));
+        super::recording::start(&inner);
         inner.resume(records, placements);
         let liveness = arrivals.map(|arrivals| start_liveness(&inner, arrivals));
         inner.spawn(super::directory::resend_records(Arc::clone(&inner)));

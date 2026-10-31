@@ -6,7 +6,7 @@ mod apply;
 mod driver;
 mod epochs;
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -173,10 +173,22 @@ pub(crate) struct Campaigns {
     wake: OnceLock<Box<dyn Fn(AgentId) -> bool + Send + Sync>>,
 }
 
+/// The campaigns running, and the groups waiting in turn: in a queue, and
+/// in a set, as every waiting group asks again each round, and a node
+/// starting many may have tens of thousands waiting.
 #[derive(Default)]
 struct Running {
     running: usize,
     waiting: VecDeque<AgentId>,
+    queued: HashSet<AgentId>,
+}
+
+impl Running {
+    fn pop(&mut self) {
+        if let Some(first) = self.waiting.pop_front() {
+            self.queued.remove(&first);
+        }
+    }
 }
 
 impl Campaigns {
@@ -199,13 +211,11 @@ impl Campaigns {
         let mut state = lock(&self.state);
         let first = state.waiting.front().is_none_or(|first| *first == agent);
         if state.running < self.most && first {
-            if !state.waiting.is_empty() {
-                state.waiting.pop_front();
-            }
+            state.pop();
             state.running += 1;
             return Some(Campaign(Arc::clone(self)));
         }
-        if !state.waiting.contains(&agent) {
+        if state.queued.insert(agent) {
             state.waiting.push_back(agent);
         }
         None
@@ -222,7 +232,7 @@ impl Campaigns {
             if wake(first) {
                 return;
             }
-            state.waiting.pop_front();
+            state.pop();
         }
     }
 }

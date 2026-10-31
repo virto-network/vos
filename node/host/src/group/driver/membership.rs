@@ -1,8 +1,6 @@
 //! A group's membership as its placement: when a replica is established
 //! in it, and the placement its leader announces.
 
-use std::sync::Arc;
-
 use vos_raft::Role;
 use vos_raft::core::Core;
 use vos_wire::peer::{NodeNumber, Placement};
@@ -53,10 +51,7 @@ impl Driver {
             return;
         }
         self.announced = Some(order);
-        let inner = Arc::clone(&self.inner);
-        let agent = self.shared.agent;
-        self.inner
-            .spawn(async move { inner.place(agent, placement).await });
+        self.inner.place(self.shared.agent, placement);
     }
 }
 
