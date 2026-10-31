@@ -851,7 +851,7 @@ mod tests {
         }
     }
 
-    /// Every number names one entry; only 28, 35, 39 and 44 are admitted, and a
+    /// Every number names one entry; only 28, 35, 39, 43 and 44 are admitted, and a
     /// segment verifier takes 35 alone; the retired numbers are
     /// refused as retired and name no entry; every other number is refused.
     #[test]
@@ -864,6 +864,7 @@ mod tests {
                     WRAP.number,
                     SEGMENT.number,
                     MASKED_WRAP.number,
+                    DEVICE_PROOF.number,
                     CREDENTIAL_PROOF.number
                 ]
                 .contains(&format.number)
