@@ -3,12 +3,13 @@
 //! one channel, timed, verified, its peak memory read and its bytes
 //! counted.
 //!
-//! A cell is `statement/log_blowup:queries:pow/channel`, the statement a
+//! A cell is `statement/log_blowup:queries:pow[:log_h]/channel`, the statement a
 //! kernel `<statement>.kernel` and its witness input `<statement>.input` in
 //! the kernels' directory, the channel `b2sm31` (Blake2s-M31) or `b2b`
 //! (Blake2b-256). Its format is [`DEVICE_PROOF`] at the cell's parameters,
-//! `h` twice the rows a column reading two rows reveals, `4·2 + 3q`,
-//! rounded up to a power of two. The program is installed once from a
+//! `h` `2^log_h` where the cell names it, else twice the rows a column
+//! reading two rows reveals, `4·2 + 3q`, rounded up to a power of two. The
+//! program is installed once from a
 //! reference run of the same witness (the shape its run needs, each chip at
 //! least its floor), its preprocessed tree committed then; each rep traces
 //! the kernel and proves it against the program.
@@ -47,6 +48,9 @@ pub struct Cell {
     pub log_blowup: u32,
     pub queries: usize,
     pub pow: u32,
+    /// `log2 h`, when the cell names it; else the least power of two at
+    /// least twice the rows a column reading two rows reveals.
+    pub log_mask_rows: Option<u32>,
     pub channel: ChannelKind,
 }
 
@@ -62,7 +66,10 @@ impl Cell {
             .split(':')
             .map(|part| part.parse().expect("a number"))
             .collect();
-        assert_eq!(config.len(), 3, "blowup:queries:pow: {text}");
+        assert!(
+            matches!(config.len(), 3 | 4),
+            "blowup:queries:pow[:log_h]: {text}"
+        );
         let channel = match parts[2] {
             "b2sm31" => ChannelKind::Blake2sM31,
             "b2b" => ChannelKind::Blake2b256,
@@ -73,6 +80,7 @@ impl Cell {
             log_blowup: config[0],
             queries: config[1] as usize,
             pow: config[2],
+            log_mask_rows: config.get(3).copied(),
             channel,
         }
     }
@@ -89,7 +97,7 @@ impl Cell {
                 ..DEVICE_PROOF.params
             },
             masking: Some(Masking {
-                log_mask_rows: h.ilog2(),
+                log_mask_rows: self.log_mask_rows.unwrap_or(h.ilog2()),
                 ..DEVICE_PROOF.masking.expect("the device format's masking")
             }),
             ..DEVICE_PROOF
