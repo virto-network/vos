@@ -59,6 +59,24 @@ impl DeviceProgram {
     pub fn chips(&self) -> u32 {
         self.0.program().active
     }
+
+    /// Verifies `proof`'s bytes under this program against its io-hash,
+    /// which a caller holding the statement's words computes itself.
+    pub fn verify(&self, proof: &DeviceProof) -> Result<(), DeviceError> {
+        if proof.format != DEVICE_FORMAT {
+            return Err(DeviceError::Verify);
+        }
+        self.0
+            .verify(&proof.io, &proof.proof)
+            .map_err(|_| DeviceError::Verify)
+    }
+}
+
+/// The io-hash a device kernel of auth's statement states for its public
+/// arguments `public` (the SCALE encoding of auth's `CredentialPublic`):
+/// `H_io` of them, no output, no root; `None` past `H_io`'s bound.
+pub fn auth_io(public: &[u8]) -> Option<[u8; 32]> {
+    profile::auth_io(public)
 }
 
 /// A device kernel's proof: the io-hash its run states and the proof's

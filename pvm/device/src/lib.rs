@@ -41,7 +41,9 @@ mod secret;
 pub mod wire;
 
 pub use call::{Call, NAME_BYTES, scope};
-pub use kernel::{DEVICE_FORMAT, DEVICE_PEAK_BYTES, DeviceProgram, DeviceProof, verify_device};
+pub use kernel::{
+    DEVICE_FORMAT, DEVICE_PEAK_BYTES, DeviceProgram, DeviceProof, auth_io, verify_device,
+};
 pub use path::PathKeeper;
 pub use prover::{
     CredentialProof, CredentialPublic, JointProof, JointPublic, PEAK_BYTES, Prover, ProverConfig,
