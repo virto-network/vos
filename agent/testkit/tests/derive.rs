@@ -520,3 +520,55 @@ fn every_package_is_built() {
         assert!(actor_elf(name).exists(), "{name}");
     }
 }
+
+/// A device kernel (`#[attestable(device)]`) derives marked: its schema
+/// kind `Device`, its method among the derivation's devices; run as a
+/// device runs it, it returns its statement's parts, its public arguments
+/// auth's 129 bytes and no output, and leaves their Poseidon2 io-hash,
+/// computed through the `0x402` call alone: 36 calls for the statement, 7
+/// for the io-hash. A node's runner, which serves BLAKE2b's call and not
+/// Poseidon2's, traps it, and a member it does not hold traps too.
+#[test]
+fn a_device_kernel_states_its_parts_under_the_poseidon2_io_hash() {
+    use vos_testkit::{device_auth_input, device_parts, run_device_kernel, run_kernel};
+    use vos_wire::abi::{Failure, Kind};
+    use vos_wire::result::KernelReturn;
+    const GAS: u64 = 50_000_000;
+    let derived = derived("device");
+    let schema = Schema::read(&derived.schema).unwrap();
+    let auth = schema.method_id("auth").unwrap();
+    assert_eq!(schema.method(auth).unwrap().kind, Kind::Device);
+    assert_eq!(derived.devices, vec![auth.0]);
+    let kernel = &derived
+        .kernels
+        .iter()
+        .find(|(method, _)| *method == auth.0)
+        .unwrap()
+        .1;
+    let (input, public) = device_auth_input();
+    assert_eq!(public.len(), 129);
+    let ran = run_device_kernel(kernel, &input, GAS).unwrap();
+    let parts = device_parts(&ran.output, &ran.io_hash).expect("the parts and their io-hash");
+    assert_eq!(
+        parts,
+        KernelReturn {
+            public_args: public.clone(),
+            output: vec![],
+            roots: vec![],
+        }
+    );
+    assert_eq!(ran.output.len(), 133);
+    assert_eq!(
+        Some(ran.io_hash),
+        vos_pvm_precompiles::compute_device_io_hash(&public, &[], &[])
+    );
+    assert_ne!(ran.io_hash, parts.io_hash());
+    assert_eq!(ran.compressions, 36 + 7);
+    assert_eq!(run_kernel(kernel, &input, GAS), Err(Failure::Trapped));
+    let mut stranger = input.clone();
+    stranger[1024] ^= 1;
+    assert_eq!(
+        run_device_kernel(kernel, &stranger, GAS),
+        Err(Failure::Trapped)
+    );
+}

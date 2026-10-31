@@ -191,3 +191,48 @@ fn derived_kernels_run_in_the_agent() {
         assert_eq!(run.gas_used, expected.gas_used);
     }
 }
+
+/// No node attests a device kernel's method: the agent refuses the attest
+/// before the kernel runs, as the model does, though the install binds the
+/// kernel.
+#[test]
+fn a_device_kernels_method_is_never_attested() {
+    use vos_testkit::programs::{derivation, derived, package};
+    let derived = derived("device");
+    let instance = InstanceId(9);
+    let kernels: Vec<(MethodId, &[u8])> = derived
+        .kernels
+        .iter()
+        .map(|(method, kernel)| (MethodId(*method), kernel.as_slice()))
+        .collect();
+    let auth = method(&derived.actor, "auth");
+    let attest_raw = method(&derived.actor, "attest_raw");
+    let mut node = Node::new();
+    node.add(&derived.actor);
+    for (_, kernel) in &kernels {
+        node.add(kernel);
+    }
+    let install = Input::Admin(Admin::Install {
+        instance,
+        derivation: derivation(&package("device"), &derived),
+        roles: vec![],
+        target: Target::Vos,
+        space: vos_wire::SpaceId::NONE,
+        clock: vos_wire::WindowClock::DEFAULT,
+    });
+    ran_done(&node.batch(0, vec![install]).steps[0]);
+    let mut kit = Testkit::new(AGENT);
+    kit.install_for(Target::Vos, instance, &derived.actor, &kernels, &[])
+        .unwrap();
+    let (input, _) = vos_testkit::device_auth_input();
+    let arguments = (auth.0, input);
+    let mut sessions = Sessions::new();
+    let result = node.batch(
+        1,
+        vec![sessions.request(ALICE, instance, attest_raw, arguments.clone())],
+    );
+    assert_eq!(failed(&result.steps[0]), Failure::Unknown);
+    kit.batch(1, [0; 32]);
+    let expected = kit.command(ALICE, instance, attest_raw, &arguments.encode());
+    assert_eq!(ran(&result.steps[0]).outcome, expected.outcome);
+}

@@ -13,6 +13,7 @@ mod balance;
 mod chain_standalone;
 mod constants;
 mod cut;
+mod device_kernel;
 mod fixtures;
 mod kernel_shape;
 mod program_identity;
