@@ -3276,9 +3276,9 @@ wiped replica's campaign; unapplied writes over applied rows; 16
 sessions calling at once with four batches in flight; the due floor.
 The checker loop (exactly-once, seeds 7601–7610, with four batches in
 flight for 7601–7608) and the fault suite green. `just check` green at
-`b9a5c89a` (125 suites, 1,659 passed, its log ending `exit=0`); the
-node's and vos-raft's suites, clippy and the checker again on each later
-commit.
+`b9a5c89a` and again at `520219ae` (125 suites, 1,659 passed, each log
+ending `exit=0`); the node's and vos-raft's suites, clippy and the
+checker on each commit between.
 
 **Lever 1, batches in flight: built, measured worse, off by default.**
 T1's shape (run 3: 10^6 users, 5,000 a second, `x` = 98%, 30 minutes),
