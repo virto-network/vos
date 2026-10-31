@@ -1,7 +1,7 @@
 //! Device programs as ingress and a device take them
 //! (`vos_pvm_recair::device`, pin J): a program's id, a proof's bytes, and
 //! a run past the program's log sizes refused by the prover, under format
-//! 43 itself.
+//! 45 itself.
 
 use vos_pvm_compiler::assembler::{Assembler, Reg};
 use vos_pvm_final_verifier::Error;
@@ -27,7 +27,7 @@ fn reader() -> Vec<u8> {
 
 /// A run that needs more rows than its program's log sizes is refused by
 /// the prover, never proved at a larger shape: the reader's program sized
-/// by a 16-byte reference run, then a run of 1,000 bytes; under format 43.
+/// by a 16-byte reference run, then a run of 1,000 bytes; under format 45.
 #[test]
 fn a_run_past_the_programs_log_sizes_is_refused_by_the_prover() {
     let kernel = reader();

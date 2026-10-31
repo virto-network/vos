@@ -1011,7 +1011,7 @@ const DEVICE: InstanceId = InstanceId(4);
 /// A device proof signs in as an auth credential proof does (pin J): the
 /// device actor installed beside the founded space's, its `login` guard
 /// naming its device kernel `auth`; the device library proves the kernel
-/// as a phone proves it (`prove_device_auth`, format 43, the program
+/// as a phone proves it (`prove_device_auth`, format 45, the program
 /// computed from the kernel as ingress computes it), and a follower's
 /// ingress, which computes the program the first time, and the leader's,
 /// which pinned it at the install, admit it: the call runs as the

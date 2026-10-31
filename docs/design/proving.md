@@ -588,7 +588,7 @@ last for decades.**
 | segment proofs (format 35) | ≥ 100 / ≥ 60 | blowup 4 (log 2), 40 queries, PoW 24, plus interaction PoW 8; FRI fold step 1, log last-layer degree bound 0 | 104 / 62 (62.86) |
 | leaf and fold proofs (32) | ≥ 100 / ≥ 60 | blowup 4, 44 queries, PoW 20, plus interaction PoW 8; fold step 1, last layer 2^0 | 108 / 63 |
 | credential proofs (44, by S29; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | blowup 4 (log 2), 47 queries, PoW 16, plus interaction PoW 8; variant (c) | 110 / 62 (62.92) [built, 7.10; registered, 7.12] |
-| device proofs (43; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | chosen by 7.16 among blowup 2 with 86–87 queries, 4 with 43 (or 47 at PoW 16), 8 with 29; variant (c) | ≥ 100 / ≥ 62 |
+| device proofs (45; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | chosen by 7.16 among blowup 2 with 86–87 queries, 4 with 43 (or 47 at PoW 16), 8 with 29; variant (c) | ≥ 100 / ≥ 62 |
 | the final wrap, unmasked (28; tests only) | ≥ 100 / ≥ 80 | blowup 64 (log 6), 20 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching (§3.5) | 146 / 82 (82.60) |
 | the final wrap, masked (39) | ≥ 100 / ≥ 80 | blowup 32 (log 5), 24 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching; variant (c) | 146 / 82 (82.70) |
 
@@ -655,10 +655,10 @@ last for decades.**
   `h`. The device shape proves them masked against its program
   (`vos_pvm_recair::masked::device`, slice 7's 7.15): the program's chips
   mixed after the header, its log sizes pinned, the io-hash the one public
-  sum. The device format, 43, is admitted at a space's ingress for
+  sum. The device format, 45, is admitted at a space's ingress for
   device proofs of auth's statement (slice 7's 7.20). Node segment, leaf and fold proofs stay unmasked, in the prover
   role, as the witness rows do.
-- **Device proofs (format 43, rate 1/4)** serve authorizations a space re-checks at
+- **Device proofs (format 45, rate 1/4)** serve authorizations a space re-checks at
   its ingress, never settlement.
 - **How:** spike 2's variant (c), already prototyped on our pinned Stwo
   fork, with Fable's R1–R8:
@@ -1272,14 +1272,15 @@ binding the run like this:
   one public claimed sum (DeviceIoChip's); a device kernel's io-hash is
   `H_io` below, over Poseidon2, not BLAKE2b;
 - **masking:** a floor of rows per masked component, set by the queries:
-  the randomizer covers twice the rows a column reveals, `4|O| + q(|O| + 1)`
-  for `|O|` offsets a column, rounded to a power of two `h`, and a component
-  has at least `4h` rows. At blowup 2 with 86–87 queries that is 2^12 rows
-  (`h` = 1,024), at blowup 4 with 43 queries 2^11, at blowup 8 with 29
-  2^10 [model, `research/slice-7/device-params.md`]; a component with no
-  next-row read (`|O| = 1`) needs half, so `h` is set per component. Every
-  segment chip reads its running sum's previous row, so each takes the
-  full `h` [built, 7.14].
+  the randomizer covers the rows a column reveals, `4|O| + q(|O| + 1)`
+  for `|O|` offsets a column (§5, how large `h` must be), rounded to a
+  power of two `h`, and a component has at least `4h` rows. Format 43
+  took twice the rows, at blowup 4 with 47 queries `h = 512` and 2^11
+  rows [built, 7.14–7.16]; format 45 takes the rows themselves, 149, so
+  `h = 256` and 2^10 [built, 7.17d]. A component with no next-row read
+  (`|O| = 1`) needs less, so `h` is set per component (at most the
+  format's). Every segment chip reads its running sum's previous row, so
+  each takes the full `h` [built, 7.14].
 
 **The device io-hash `H_io`** [built, slice 7's 7.17b, ingress's check
 7.20's; checked by Fable]. A device kernel's io-hash was
@@ -1377,10 +1378,10 @@ columns [measured, 7.16]. Over `C`, a kernel that hashes only through
 - **What the verifier and ingress check** [built, 7.20]: the verifier
   is unchanged (the io-hash's 32 bytes are the public values,
   DeviceIoChip's sum recomputed from them); ingress picks the io-hash by
-  the proof's format, 43's being `H_io` (not by the guard), computes it
+  the proof's format, 45's being `H_io` (not by the guard), computes it
   from the request's words (`a` the SCALE encoding of
   `CredentialPublic::Auth`, 129 bytes, `o` empty, no roots: `ℓ = 133`, six
-  blocks and the length's) and verifies the proof under 43 against it. A
+  blocks and the length's) and verifies the proof under 45 against it. A
   proof whose kernel ended with BLAKE2b states another io-hash and fails.
 - **What moves:** every device kernel's code and program id (none pinned
   before ingress takes device proofs); the device kernel's end
@@ -1390,7 +1391,7 @@ columns [measured, 7.16]. Over `C`, a kernel that hashes only through
   tags (seven); the spike harness's and `tools/phone`'s kernels; a device
   kernel's gas (seven calls at 2,400 gas each where BLAKE2b's blocks
   were). **What does not:** pin I's auth words, the device chips,
-  DeviceIoChip, format 43's reference and bits (a device program may
+  DeviceIoChip, the device format's reference and bits (a device program may
   still hold BLAKE2b, so the reference keeps it), every node format,
   `compute_io_hash`, `vos_pvm_statement::Statement::io_hash`, `Attest`
   and `KernelReturn`'s codec, and every node kernel's bytes.
@@ -1413,9 +1414,12 @@ columns [measured, 7.16]. Over `C`, a kernel that hashes only through
   and stores; the guest target's own go byte by byte): under 2^11 steps,
   the CPU at the masking's floor, which the gate holds [measured, 7.17c].
 
-**Format 43, device proofs** [measured, slice 7's 7.16]: masked (c), the
-Blake2s-M31 channel, blowup 4, 47 queries, PoW 16, interaction PoW 8,
-affine DEEP batching, `h = 512` (format 44's parameters); 110 conjectured
+**Format 45, device proofs** [measured, slice 7's 7.16 and 7.17d]:
+masked (c), the Blake2s-M31 channel, blowup 4, 47 queries, PoW 16,
+interaction PoW 8, affine DEEP batching (format 44's parameters), `h =
+256`, every chip's floor 2^10 rows. Format 43 was the same at `h = 512`
+(7.16 to 7.17c) and is retired: 45 drops the masking's factor two (§5),
+×0.82 in time and ×0.87 in peak on the phone at P6; 110 conjectured
 and 62.82 proven bits on its masked reference, every device chip at
 2^17 rows (`DEVICE_MAX_LOG_SIZE`, which install enforces: the memory
 ledger, a row a byte touched, takes 2^17 on the auth statements).
@@ -1457,7 +1461,7 @@ credential proof does. A device kernel is an `#[attestable]` method whose
 `public_args` are the SCALE encoding of auth's `CredentialPublic` (its
 kind byte, then `map_root`, `scope`, `nullifier` and `binding`, 32 bytes
 each) and whose output is empty. Ingress takes the words from the request,
-recomputes the io-hash, verifies the proof under format 43 against the
+recomputes the io-hash, verifies the proof under format 45 against the
 device program id the agent's derivation pins for the kernel the guard
 names, and then runs auth's checks (`identity-and-authority.md` §5); the
 binding names that program. The trace is witness-independent: the prover
@@ -1537,7 +1541,7 @@ that narrows the inner proof makes folds cheaper too.
 | **6** | **M3 Statements on chain** | the public-input model; `&self` witnessed reads to the space root at anchored cuts; the prover worker; the Kreivo spaces pallet's design, the verifier kit and the node's client (the pallet is the Kreivo teammate's); the JAM statements service | 18.5–29 weeks |
 | **7** | **M3.9 Simplify and scale** | the anchoring protocol simplified (pin D′: one venue core, five outcomes on the node, no migration, no rotation, equivocation terminal); a scale test across the owner's LAN | 11.5–18 weeks |
 | **7** | **M4 Credential AIR** | slice 6's re-pin batch; the zkPVM Poseidon2 host call and chip; a credential actor keeping a Poseidon2 tree in its own rows; the credential AIR (format 44); the node's binary API and its gateway; its verifier at ingress; device secrets from the Android Keystore or a security key, the device library and a demo in s4's Android client; phone gates | 15.5–22 weeks |
-| **7** | **M5 Device profile** | the segment chips masked; the boundary-free device shape (format 43); levers 1–4; the CPU split by opcode family, word-level memory if needed; the Poseidon2 chip and the levers in the node's segment format (41), as its leaves allow; the ≤ 1 s phone gate | 22–33.5 weeks, 26–39.5 with word-level memory |
+| **7** | **M5 Device profile** | the segment chips masked; the boundary-free device shape (format 45); levers 1–4; the CPU split by opcode family, word-level memory if needed; the Poseidon2 chip and the levers in the node's segment format (41), as its leaves allow; the ≤ 1 s phone gate | 22–33.5 weeks, 26–39.5 with word-level memory |
 | **later** | **M6 Signature chips** | SHA-256, SHA-512, the bignum chip, the P-256 and Edwards drivers; moved past slice 7 by the owner (S1) | 8–14 weeks |
 
 - M0 runs on two tracks. Its critical path is 5.1 → 5.2 → 5.4, and
@@ -1710,15 +1714,16 @@ counts as conjectured / proven at the reference shape [model]:
 |---|---|---|---|---|---|---|
 | 35 | segments | Poseidon2-M31 | 2, 40, 24, 1, 0, 8 | 100 / 60 | 104 / 62 | admitted |
 | 32 | leaf and fold (one padded shape) | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 63 | reserved |
-| 37 | device proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 | reserved |
 | 28 | the final wrap, unmasked (tests only) | Blake2b-256 | 6, 20, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 | admitted |
 | 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 5, 24, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 | admitted; the one production venues accept |
 | 44 | credential proofs, masked (variant (c)) | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 (62.92), on its masked shape | admitted |
+| 45 | device proofs, masked (variant (c)), `h = 256` | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 (62.82), on its masked shape | admitted |
 
 - **30 is retired unregistered** (slice 7's 7.10), and **42 retired**
   (7.12): 44 counts credential proofs on their masked shape, PoW 16 at 47
   queries, picked over 42's PoW 20 at 43 by the phone's grind (S29).
-  **37** retires unregistered when 43 registers.
+  **37** retired unregistered when 43 registered (7.16), and **43
+  retired** (7.17d): 45 takes its parameters at `h = 256`.
 - **Each entry** holds its channel, its parameters, the DEEP batching its
   proven floor assumes and both bit counts.
 - **Every entry uses A.3's encodings** and exactly its parameters.
