@@ -1,9 +1,9 @@
 # Every pinned guest blob's SHA-256, its symbols and relocations stripped,
 # as `just build-blobs` builds it: `just blobs-lock` writes it, `just
 # check-blobs` checks it (the justfile's `_blob-hashes` says which blobs).
-cd9a24a922346b717bcc07740daf816e996a776705b0a66ccd9d2fd17361f640  target/riscv64em-vos/release/final-verify.elf
-aa9b444b038c2c79f56e2603e1979a368fd601a11c4968cc7440ee5d8177b333  target/riscv64em-vos/release/final-verify-test.elf
-93f98b63ab27685a6715f752c23432e18c44d81e2ef05bb76bb483caf828aa85  target/riscv64em-vos/release/statement-service.elf
+4b315e09a9147b06226c47b9d2b398f3ad4af31a1a514a0006d9bafad845096f  target/riscv64em-vos/release/final-verify.elf
+9889779bf69b25d869a5e1b9e3d7a1b45e66b8a363de66140ed8e112bcd7f369  target/riscv64em-vos/release/final-verify-test.elf
+f301fa1ba58c9c7715b1442dde79b07d3e7d5dab1c679e57d5cf2e96473d5a37  target/riscv64em-vos/release/statement-service.elf
 7b88fe03e7dc51c7bea81bf26a16318199457e64e2b01210122655b53cca46a3  agent/programs/target/riscv64em-vos/release/vos-representative.elf
 44af1b301841a8832766ca7983cc36665b006a2feb58d6574e7b808b04c67a66  agent/programs/target/riscv64em-vos/release/vos-credentials.elf
 52bca4cbf81504cab10b873c1ad78e553c48745308a5e234a49de43a244b6069  agent/test-actors/target/riscv64em-vos/release/accounts.elf
