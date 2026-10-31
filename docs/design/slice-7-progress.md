@@ -5878,3 +5878,43 @@ passed in 119 suites, 31 blobs `blobs.lock`'s); `just test-proof` exit 0
 
 **Left:** a phone session at 45 (P6's `h256` cell is its estimate: about
 0.61 s, peak 555 MiB); s4's comments.
+
+## Step 7.18x: the CPU split, counted before it is built
+
+Branch `s7/7.18x`, from vos-core `9430bfee`. An exploration, no library
+change: the CPU chip's own constraints reduced per opcode family, the
+traced kernels' mixes, and the derivation's leaf bound, in a script
+(`spikes/s7-split/`), written up in `research/slice-7/7.18-cell-model.md`
+for the owner's call on 7.18.
+
+- **The 4-way split pays little at the device's size.** Its families
+  (ALU 544 columns, memory 279, control 242, host 219 in the device count)
+  repeat a 109-column core and their per-row lookups: 785 → 1,284 columns.
+  On the auth kernel (1,722 steps, every family at the 2^10 floor) it saves
+  5.4% of the cells, about 607 → 574 ms on the phone [model, scaled from
+  P6]; on node segments 0.7–7.8%. Against an exact power of two of steps it
+  moves the CPU's cells by +2% to −8%, just past one by −42…−54%; averaged
+  over lengths −32…−46% from 2^11 steps on.
+- **A per-program CPU pays more and costs less:** every traced kernel's code
+  uses 48–55 of the 139 opcodes (no division, bit count, rotation, sign
+  extension, min/max, signed MulUpper), so a CPU whose columns follow the
+  code is 535–549 columns at every length: −8.8% of the auth kernel's cells
+  (about 554 ms), −14–17% of heavier kernels', and a narrower node leaf.
+  With a 2-way split (ALU | rest) on top, −14.6% (about 518 ms).
+- **Word-level memory (7.19) is the larger lever at the auth size:** −17%
+  (its byte ledger is at 2^14 rows for 1,722 steps); with the per-program
+  CPU, −26% (about 450 ms).
+- **The first-day count (S32):** at 40 queries no leaf of today's node
+  kernels passes 2^16 `p2` rows under any split (5-way 62,070; `leaf.rs`'s
+  model, ported and checked on the window kernel's 57,700). With the
+  Poseidon2 chip in the shape, the 4- and 5-way splits pass it (66,210,
+  67,884): the 4-way split is device-only; 41 can take the per-program CPU
+  (56,424; 62,278 with the chip) and a 2-way split.
+- **Heavier circuits hit memory first:** 1 GiB of peak on the phone is about
+  26M cells [model, P5/P6's peaks], a device kernel of about 2^12 steps of
+  node-like code at about 1.3 s; 2^14 steps need about 2 GiB.
+- **Recommended:** the per-program CPU (3–5 weeks [est], both formats),
+  then word-level memory; a 2-way split only for kernels past 2^11 steps;
+  not the 4-way split. Two free cuts on the way: seven `MemByteActiveMonoH`
+  columns pinned to zero, and right shifts through MUL (DIVREM leaves every
+  traced kernel's shape: −7% on the auth kernel).

@@ -1,0 +1,361 @@
+## Opcode-family histograms
+
+| kernel | window | steps | alu | alu_ext | memory | control | host |
+|---|---|---|---|---|---|---|---|
+| accounts/150785 | prefix14 | 16384 | 58.3% | 0.0% | 29.0% | 12.7% | 0.0% |
+| accounts/150785 | prefix16 | 65536 | 53.6% | 0.0% | 31.8% | 14.4% | 0.1% |
+| accounts/150785 | whole | 150785 | 52.6% | 0.0% | 31.8% | 15.5% | 0.1% |
+| accounts/210019 | prefix14 | 16384 | 58.1% | 0.0% | 29.1% | 12.8% | 0.0% |
+| accounts/210019 | prefix16 | 65536 | 57.3% | 0.0% | 29.8% | 12.8% | 0.1% |
+| accounts/210019 | whole | 210019 | 48.7% | 0.0% | 39.1% | 12.0% | 0.2% |
+| accounts/248914 | prefix14 | 16384 | 57.9% | 0.0% | 29.2% | 12.9% | 0.0% |
+| accounts/248914 | prefix16 | 65536 | 57.2% | 0.0% | 29.8% | 12.8% | 0.1% |
+| accounts/248914 | whole | 248914 | 50.0% | 0.0% | 36.8% | 13.0% | 0.1% |
+| accounts/248924 | prefix14 | 16384 | 58.1% | 0.0% | 29.1% | 12.8% | 0.0% |
+| accounts/248924 | prefix16 | 65536 | 57.3% | 0.0% | 29.8% | 12.8% | 0.1% |
+| accounts/248924 | whole | 248924 | 50.1% | 0.0% | 36.8% | 13.0% | 0.1% |
+| accounts/35465 | prefix14 | 16384 | 50.9% | 0.0% | 36.8% | 12.3% | 0.1% |
+| accounts/35465 | prefix16 | 35465 | 51.0% | 0.0% | 36.1% | 12.8% | 0.1% |
+| accounts/35465 | whole | 35465 | 51.0% | 0.0% | 36.1% | 12.8% | 0.1% |
+| balance/21733 | prefix14 | 16384 | 51.5% | 0.0% | 34.7% | 13.7% | 0.1% |
+| balance/21733 | prefix16 | 21733 | 52.3% | 0.0% | 32.9% | 14.6% | 0.1% |
+| balance/21733 | whole | 21733 | 52.3% | 0.0% | 32.9% | 14.6% | 0.1% |
+| device/auth | prefix14 | 1722 | 50.7% | 0.1% | 36.4% | 10.3% | 2.6% |
+| device/auth | prefix16 | 1722 | 50.7% | 0.1% | 36.4% | 10.3% | 2.6% |
+| device/auth | whole | 1722 | 50.7% | 0.1% | 36.4% | 10.3% | 2.6% |
+| window/52178 | prefix14 | 16384 | 49.9% | 0.0% | 36.0% | 14.1% | 0.1% |
+| window/52178 | prefix16 | 52178 | 54.6% | 0.0% | 34.3% | 11.0% | 0.1% |
+| window/52178 | whole | 52178 | 54.6% | 0.0% | 34.3% | 11.0% | 0.1% |
+
+## Columns by component (the full ISA)
+
+| variant | component | opcodes | main | fractions | interaction | constraints | device columns (with 4 blinding) |
+|---|---|---|---|---|---|---|---|
+| today | alu+alu_ext+control+host+memory | 139 | 581 | 99 | 200 | 776 | 785 |
+| today | **sum** | | | | | | **785** |
+| host out | host | 1 | 151 | 31 | 64 | 111 | 219 |
+| host out | alu+alu_ext+control+memory | 138 | 528 | 85 | 172 | 725 | 704 |
+| host out | **sum** | | | | | | **923** |
+| 2-way (ALU | rest) | alu+alu_ext | 85 | 404 | 68 | 136 | 523 | 544 |
+| 2-way (ALU | rest) | control+host+memory | 54 | 299 | 64 | 128 | 357 | 431 |
+| 2-way (ALU | rest) | **sum** | | | | | | **975** |
+| 3-way (ALU | memory | control+host) | alu+alu_ext | 85 | 404 | 68 | 136 | 523 | 544 |
+| 3-way (ALU | memory | control+host) | memory | 30 | 199 | 38 | 76 | 191 | 279 |
+| 3-way (ALU | memory | control+host) | control+host | 24 | 211 | 50 | 100 | 246 | 315 |
+| 3-way (ALU | memory | control+host) | **sum** | | | | | | **1138** |
+| 4-way (ALU | memory | control | host) | alu+alu_ext | 85 | 404 | 68 | 136 | 523 | 544 |
+| 4-way (ALU | memory | control | host) | memory | 30 | 199 | 38 | 76 | 191 | 279 |
+| 4-way (ALU | memory | control | host) | control | 23 | 166 | 36 | 72 | 202 | 242 |
+| 4-way (ALU | memory | control | host) | host | 1 | 151 | 31 | 64 | 111 | 219 |
+| 4-way (ALU | memory | control | host) | **sum** | | | | | | **1284** |
+| 5-way (ALU core | ALU rare | memory | control | host) | alu | 57 | 264 | 47 | 96 | 332 | 364 |
+| 5-way (ALU core | ALU rare | memory | control | host) | alu_ext | 28 | 353 | 64 | 128 | 401 | 485 |
+| 5-way (ALU core | ALU rare | memory | control | host) | memory | 30 | 199 | 38 | 76 | 191 | 279 |
+| 5-way (ALU core | ALU rare | memory | control | host) | control | 23 | 166 | 36 | 72 | 202 | 242 |
+| 5-way (ALU core | ALU rare | memory | control | host) | host | 1 | 151 | 31 | 64 | 111 | 219 |
+| 5-way (ALU core | ALU rare | memory | control | host) | **sum** | | | | | | **1589** |
+
+The full ISA reduced as one component keeps 573 of today's 581 main columns: {'MemByteActiveMonoH': 7, 'IsLoadLocalNotActiveH': 1} are pinned to zero or read by nothing.
+
+## Per-program components (the kernel's code opcodes alone)
+
+| kernel | component | opcodes in code | main | fractions | device columns |
+|---|---|---|---|---|---|
+| device/auth | today: alu+alu_ext+control+host+memory | 48 | 391 | 70 | 535 |
+| device/auth | 4-way (ALU | memory | control | host): alu+alu_ext | 21 | 248 | 45 | 344 |
+| device/auth | 4-way (ALU | memory | control | host): memory | 12 | 195 | 38 | 275 |
+| device/auth | 4-way (ALU | memory | control | host): control | 14 | 151 | 34 | 223 |
+| device/auth | 4-way (ALU | memory | control | host): host | 1 | 142 | 26 | 198 |
+| window/52178 | today: alu+alu_ext+control+host+memory | 55 | 401 | 72 | 549 |
+| window/52178 | 4-way (ALU | memory | control | host): alu+alu_ext | 23 | 248 | 45 | 344 |
+| window/52178 | 4-way (ALU | memory | control | host): memory | 16 | 197 | 38 | 277 |
+| window/52178 | 4-way (ALU | memory | control | host): control | 15 | 151 | 34 | 223 |
+| window/52178 | 4-way (ALU | memory | control | host): host | 1 | 150 | 28 | 210 |
+| accounts/248914 | today: alu+alu_ext+control+host+memory | 52 | 400 | 72 | 548 |
+| accounts/248914 | 4-way (ALU | memory | control | host): alu+alu_ext | 23 | 248 | 45 | 344 |
+| accounts/248914 | 4-way (ALU | memory | control | host): memory | 15 | 196 | 38 | 276 |
+| accounts/248914 | 4-way (ALU | memory | control | host): control | 13 | 151 | 34 | 223 |
+| accounts/248914 | 4-way (ALU | memory | control | host): host | 1 | 150 | 28 | 210 |
+
+## Time against cells [measured points, fits]
+
+- phone: affine -117 ms + 56.4 ms per M cells; proportional 51.3 ms per M cells; residuals: 11.7M: 607 vs 541 / 599,  15.9M: 741 vs 781 / 817,  19.7M: 952 vs 993 / 1010,  44.9M: 2430 vs 2415 / 2304
+- phone peak: 22 MiB + 38.8 MiB per M cells; 1 GiB at 25.8M cells
+- x86 (4 P-cores, one session): 118 ms + 18.0 ms per M cells; phone/x86 at 11.7M 1.85, at 19.7M 2.02
+
+## The auth device kernel (format 45)
+
+Steps 1722: by family {'alu': 873, 'control': 177, 'alu_ext': 1, 'host': 45, 'memory': 626}; host calls [1025, 1026]. The modelled device log sizes equal the measured ones (format 45).
+
+| auth (1,722 steps) | variant | CPU components (columns × 2^log) | CPU cells | total cells | Δ total | phone ms (affine / ∝ cells) | peak MiB |
+|---|---|---|---|---|---|---|---|
+| | today | 785×2^11 | 3.22M | 11.67M | +0.0% | 607 / 607 | 555 |
+| | host out | 198×2^10 + 704×2^11 | 3.29M | 11.75M | +0.6% | 612 / 611 | 558 |
+| | 2-way (ALU | rest) | 544×2^10 + 414×2^10 | 1.96M | 10.42M | -10.7% | 528 / 542 | 498 |
+| | 3-way (ALU | memory | control+host) | 544×2^10 + 279×2^10 + 298×2^10 | 2.30M | 10.75M | -7.9% | 549 / 559 | 513 |
+| | 4-way (ALU | memory | control | host) | 544×2^10 + 279×2^10 + 242×2^10 + 198×2^10 | 2.59M | 11.04M | -5.4% | 567 / 574 | 526 |
+| | 5-way (ALU core | ALU rare | memory | control | host) | 364×2^10 + 485×2^10 + 279×2^10 + 242×2^10 + 198×2^10 | 3.21M | 11.67M | -0.0% | 607 / 607 | 555 |
+| | today, per program | 535×2^11 | 2.19M | 10.65M | -8.8% | 542 / 554 | 509 |
+| | host out, per program | 198×2^10 + 483×2^11 | 2.38M | 10.84M | -7.1% | 554 / 564 | 517 |
+| | 2-way (ALU | rest), per program | 344×2^10 + 391×2^10 | 1.51M | 9.96M | -14.6% | 499 / 518 | 477 |
+| | 3-way (ALU | memory | control+host), per program | 344×2^10 + 275×2^10 + 279×2^10 | 1.84M | 10.30M | -11.8% | 520 / 535 | 493 |
+| | 4-way (ALU | memory | control | host), per program | 344×2^10 + 275×2^10 + 223×2^10 + 198×2^10 | 2.13M | 10.59M | -9.3% | 538 / 551 | 506 |
+| | 5-way (ALU core | ALU rare | memory | control | host), per program | 341×2^10 + 221×2^10 + 275×2^10 + 223×2^10 + 198×2^10 | 2.58M | 11.03M | -5.5% | 567 / 574 | 526 |
+
+## Heavier device kernels (node kernels' runs under the device shape)
+
+balance/21733, its first 16384 steps: by family {'alu': 8433, 'control': 2252, 'host': 17, 'memory': 5682}; device log sizes {'CPU': 14, 'POSEIDON2': 10, 'MEMORY': 16, 'DEVICE_MEMORY': 13, 'DATA_TABLE': 13, 'REGISTER_MEMORY': 16, 'DEVICE_BOUNDARY': 10, 'DEVICE_IO': 10, 'PROGRAM_MEMORY': 16, 'JUMP_TABLE': 10, 'WITNESS_INPUT': 10, 'RANGE_MULTIPLICITY_256': 10, 'BITWISE_LOOKUP': 10, 'POWER_OF_TWO': 10, 'BYTE_TO_BITS': 10, 'MUL': 11, 'BITWISE': 11, 'COMPARE': 11, 'DIVREM': 10}
+
+| balance (16384 steps) | variant | CPU components (columns × 2^log) | CPU cells | total cells | Δ total | phone ms (affine / ∝ cells) | peak MiB |
+|---|---|---|---|---|---|---|---|
+| | today | 785×2^14 | 25.72M | 56.13M | +0.0% | 3048 / 2880 | 2201 |
+| | host out | 198×2^10 + 704×2^14 | 23.47M | 53.88M | -4.0% | 2922 / 2765 | 2114 |
+| | 2-way (ALU | rest) | 544×2^14 + 414×2^13 | 24.61M | 55.02M | -2.0% | 2985 / 2823 | 2158 |
+| | 3-way (ALU | memory | control+host) | 544×2^14 + 279×2^13 + 298×2^12 | 24.84M | 55.24M | -1.6% | 2998 / 2835 | 2167 |
+| | 4-way (ALU | memory | control | host) | 544×2^14 + 279×2^13 + 242×2^12 + 198×2^10 | 24.78M | 55.19M | -1.7% | 2995 / 2832 | 2165 |
+| | 5-way (ALU core | ALU rare | memory | control | host) | 364×2^14 + 485×2^10 + 279×2^13 + 242×2^12 + 198×2^10 | 19.88M | 50.29M | -10.4% | 2719 / 2580 | 1974 |
+| | today, per program | 537×2^14 | 17.60M | 48.00M | -14.5% | 2590 / 2463 | 1886 |
+| | host out, per program | 198×2^10 + 485×2^14 | 16.30M | 46.70M | -16.8% | 2517 / 2397 | 1835 |
+| | 2-way (ALU | rest), per program | 345×2^14 + 392×2^13 | 17.73M | 48.13M | -14.2% | 2597 / 2470 | 1891 |
+| | 3-way (ALU | memory | control+host), per program | 345×2^14 + 276×2^13 + 279×2^12 | 18.11M | 48.52M | -13.6% | 2619 / 2490 | 1906 |
+| | 4-way (ALU | memory | control | host), per program | 345×2^14 + 276×2^13 + 223×2^12 + 198×2^10 | 18.06M | 48.47M | -13.7% | 2616 / 2487 | 1904 |
+| | 5-way (ALU core | ALU rare | memory | control | host), per program | 342×2^14 + 221×2^10 + 276×2^13 + 223×2^12 + 198×2^10 | 18.41M | 48.82M | -13.0% | 2636 / 2505 | 1917 |
+
+window/52178, its first 16384 steps: by family {'alu': 8170, 'control': 2302, 'host': 18, 'memory': 5894}; device log sizes {'CPU': 14, 'POSEIDON2': 10, 'MEMORY': 16, 'DEVICE_MEMORY': 13, 'DATA_TABLE': 13, 'REGISTER_MEMORY': 16, 'DEVICE_BOUNDARY': 10, 'DEVICE_IO': 10, 'PROGRAM_MEMORY': 16, 'JUMP_TABLE': 10, 'WITNESS_INPUT': 11, 'RANGE_MULTIPLICITY_256': 10, 'BITWISE_LOOKUP': 10, 'POWER_OF_TWO': 10, 'BYTE_TO_BITS': 10, 'MUL': 11, 'BITWISE': 11, 'COMPARE': 11, 'DIVREM': 10}
+
+| window (16384 steps) | variant | CPU components (columns × 2^log) | CPU cells | total cells | Δ total | phone ms (affine / ∝ cells) | peak MiB |
+|---|---|---|---|---|---|---|---|
+| | today | 785×2^14 | 25.72M | 56.22M | +0.0% | 3053 / 2885 | 2205 |
+| | host out | 198×2^10 + 704×2^14 | 23.47M | 53.97M | -4.0% | 2926 / 2769 | 2117 |
+| | 2-way (ALU | rest) | 544×2^13 + 414×2^14 | 22.48M | 52.97M | -5.8% | 2870 / 2718 | 2079 |
+| | 3-way (ALU | memory | control+host) | 544×2^13 + 279×2^13 + 298×2^12 | 15.93M | 46.42M | -17.4% | 2501 / 2382 | 1824 |
+| | 4-way (ALU | memory | control | host) | 544×2^13 + 279×2^13 + 242×2^12 + 198×2^10 | 15.87M | 46.36M | -17.5% | 2498 / 2379 | 1822 |
+| | 5-way (ALU core | ALU rare | memory | control | host) | 364×2^13 + 485×2^10 + 279×2^13 + 242×2^12 + 198×2^10 | 13.92M | 44.41M | -21.0% | 2387 / 2279 | 1746 |
+| | today, per program | 537×2^14 | 17.60M | 48.09M | -14.5% | 2595 / 2468 | 1889 |
+| | host out, per program | 198×2^10 + 485×2^14 | 16.30M | 46.79M | -16.8% | 2522 / 2401 | 1839 |
+| | 2-way (ALU | rest), per program | 344×2^13 + 393×2^14 | 18.51M | 49.01M | -12.8% | 2647 / 2515 | 1925 |
+| | 3-way (ALU | memory | control+host), per program | 344×2^13 + 277×2^13 + 279×2^12 | 12.46M | 42.95M | -23.6% | 2305 / 2204 | 1690 |
+| | 4-way (ALU | memory | control | host), per program | 344×2^13 + 277×2^13 + 223×2^12 + 198×2^10 | 12.41M | 42.90M | -23.7% | 2302 / 2201 | 1688 |
+| | 5-way (ALU core | ALU rare | memory | control | host), per program | 341×2^13 + 221×2^10 + 277×2^13 + 223×2^12 + 198×2^10 | 12.81M | 43.30M | -23.0% | 2325 / 2222 | 1703 |
+
+accounts/35465, its first 16384 steps: by family {'alu': 8336, 'control': 2012, 'host': 13, 'memory': 6023}; device log sizes {'CPU': 14, 'POSEIDON2': 10, 'MEMORY': 16, 'DEVICE_MEMORY': 13, 'DATA_TABLE': 13, 'REGISTER_MEMORY': 16, 'DEVICE_BOUNDARY': 10, 'DEVICE_IO': 10, 'PROGRAM_MEMORY': 16, 'JUMP_TABLE': 10, 'WITNESS_INPUT': 11, 'RANGE_MULTIPLICITY_256': 10, 'BITWISE_LOOKUP': 10, 'POWER_OF_TWO': 10, 'BYTE_TO_BITS': 10, 'MUL': 11, 'BITWISE': 11, 'COMPARE': 11, 'DIVREM': 10}
+
+| accounts (16384 steps) | variant | CPU components (columns × 2^log) | CPU cells | total cells | Δ total | phone ms (affine / ∝ cells) | peak MiB |
+|---|---|---|---|---|---|---|---|
+| | today | 785×2^14 | 25.72M | 56.22M | +0.0% | 3053 / 2885 | 2205 |
+| | host out | 198×2^10 + 704×2^14 | 23.47M | 53.97M | -4.0% | 2926 / 2769 | 2117 |
+| | 2-way (ALU | rest) | 544×2^14 + 414×2^13 | 24.61M | 55.10M | -2.0% | 2990 / 2827 | 2161 |
+| | 3-way (ALU | memory | control+host) | 544×2^14 + 279×2^13 + 298×2^11 | 23.62M | 54.11M | -3.7% | 2934 / 2777 | 2123 |
+| | 4-way (ALU | memory | control | host) | 544×2^14 + 279×2^13 + 242×2^11 + 198×2^10 | 23.79M | 54.29M | -3.4% | 2944 / 2786 | 2130 |
+| | 5-way (ALU core | ALU rare | memory | control | host) | 364×2^14 + 485×2^10 + 279×2^13 + 242×2^11 + 198×2^10 | 18.89M | 49.38M | -12.2% | 2668 / 2534 | 1939 |
+| | today, per program | 536×2^14 | 17.56M | 48.06M | -14.5% | 2593 / 2466 | 1888 |
+| | host out, per program | 198×2^10 + 484×2^14 | 16.27M | 46.76M | -16.8% | 2520 / 2399 | 1837 |
+| | 2-way (ALU | rest), per program | 344×2^14 + 392×2^13 | 17.69M | 48.19M | -14.3% | 2600 / 2473 | 1893 |
+| | 3-way (ALU | memory | control+host), per program | 344×2^14 + 276×2^13 + 279×2^11 | 16.94M | 47.43M | -15.6% | 2558 / 2434 | 1863 |
+| | 4-way (ALU | memory | control | host), per program | 344×2^14 + 276×2^13 + 223×2^11 + 198×2^10 | 17.11M | 47.61M | -15.3% | 2568 / 2443 | 1870 |
+| | 5-way (ALU core | ALU rare | memory | control | host), per program | 341×2^14 + 221×2^10 + 276×2^13 + 223×2^11 + 198×2^10 | 17.47M | 47.96M | -14.7% | 2588 / 2461 | 1884 |
+
+accounts/150785, its first 65536 steps: by family {'alu': 35150, 'control': 9451, 'host': 67, 'memory': 20868}; device log sizes {'CPU': 16, 'POSEIDON2': 10, 'MEMORY': 18, 'DEVICE_MEMORY': 15, 'DATA_TABLE': 13, 'REGISTER_MEMORY': 18, 'DEVICE_BOUNDARY': 10, 'DEVICE_IO': 10, 'PROGRAM_MEMORY': 16, 'JUMP_TABLE': 10, 'WITNESS_INPUT': 13, 'RANGE_MULTIPLICITY_256': 10, 'BITWISE_LOOKUP': 10, 'POWER_OF_TWO': 10, 'BYTE_TO_BITS': 10, 'MUL': 12, 'BITWISE': 13, 'COMPARE': 13, 'DIVREM': 12}
+
+| accounts (65536 steps) | variant | CPU components (columns × 2^log) | CPU cells | total cells | Δ total | phone ms (affine / ∝ cells) | peak MiB |
+|---|---|---|---|---|---|---|---|
+| | today | 785×2^16 | 102.89M | 195.87M | +0.0% | 10929 / 10050 | 7627 |
+| | host out | 198×2^10 + 704×2^16 | 92.68M | 185.66M | -5.2% | 10353 / 9526 | 7230 |
+| | 2-way (ALU | rest) | 544×2^16 + 414×2^15 | 98.44M | 191.41M | -2.3% | 10678 / 9822 | 7454 |
+| | 3-way (ALU | memory | control+host) | 544×2^16 + 279×2^15 + 298×2^14 | 99.35M | 192.33M | -1.8% | 10729 / 9869 | 7489 |
+| | 4-way (ALU | memory | control | host) | 544×2^16 + 279×2^15 + 242×2^14 + 198×2^10 | 97.92M | 190.90M | -2.5% | 10649 / 9795 | 7434 |
+| | 5-way (ALU core | ALU rare | memory | control | host) | 364×2^16 + 485×2^10 + 279×2^15 + 242×2^14 + 198×2^10 | 75.32M | 168.30M | -14.1% | 9374 / 8636 | 6556 |
+| | today, per program | 536×2^16 | 70.25M | 163.23M | -16.7% | 9088 / 8376 | 6359 |
+| | host out, per program | 198×2^10 + 484×2^16 | 63.84M | 156.82M | -19.9% | 8727 / 8047 | 6111 |
+| | 2-way (ALU | rest), per program | 344×2^16 + 392×2^15 | 70.78M | 163.75M | -16.4% | 9118 / 8403 | 6380 |
+| | 3-way (ALU | memory | control+host), per program | 344×2^16 + 276×2^15 + 279×2^14 | 72.32M | 165.29M | -15.6% | 9205 / 8482 | 6440 |
+| | 4-way (ALU | memory | control | host), per program | 344×2^16 + 276×2^15 + 223×2^14 + 198×2^10 | 70.89M | 163.86M | -16.3% | 9124 / 8408 | 6384 |
+| | 5-way (ALU core | ALU rare | memory | control | host), per program | 341×2^16 + 221×2^10 + 276×2^15 + 223×2^14 + 198×2^10 | 70.95M | 163.92M | -16.3% | 9127 / 8411 | 6386 |
+
+accounts/248914, its first 65536 steps: by family {'alu': 37508, 'control': 8418, 'host': 53, 'memory': 19557}; device log sizes {'CPU': 16, 'POSEIDON2': 10, 'MEMORY': 18, 'DEVICE_MEMORY': 16, 'DATA_TABLE': 13, 'REGISTER_MEMORY': 18, 'DEVICE_BOUNDARY': 10, 'DEVICE_IO': 10, 'PROGRAM_MEMORY': 16, 'JUMP_TABLE': 10, 'WITNESS_INPUT': 14, 'RANGE_MULTIPLICITY_256': 10, 'BITWISE_LOOKUP': 10, 'POWER_OF_TWO': 10, 'BYTE_TO_BITS': 10, 'MUL': 13, 'BITWISE': 13, 'COMPARE': 13, 'DIVREM': 12}
+
+| accounts (65536 steps) | variant | CPU components (columns × 2^log) | CPU cells | total cells | Δ total | phone ms (affine / ∝ cells) | peak MiB |
+|---|---|---|---|---|---|---|---|
+| | today | 785×2^16 | 102.89M | 206.34M | +0.0% | 11519 / 10588 | 8033 |
+| | host out | 198×2^10 + 704×2^16 | 92.68M | 196.12M | -4.9% | 10943 / 10064 | 7637 |
+| | 2-way (ALU | rest) | 544×2^16 + 414×2^15 | 98.44M | 201.88M | -2.2% | 11268 / 10359 | 7860 |
+| | 3-way (ALU | memory | control+host) | 544×2^16 + 279×2^15 + 298×2^14 | 99.35M | 202.80M | -1.7% | 11320 / 10406 | 7896 |
+| | 4-way (ALU | memory | control | host) | 544×2^16 + 279×2^15 + 242×2^14 + 198×2^10 | 97.92M | 201.37M | -2.4% | 11239 / 10333 | 7840 |
+| | 5-way (ALU core | ALU rare | memory | control | host) | 364×2^16 + 485×2^10 + 279×2^15 + 242×2^14 + 198×2^10 | 75.32M | 178.77M | -13.4% | 9965 / 9173 | 6963 |
+| | today, per program | 536×2^16 | 70.25M | 173.70M | -15.8% | 9679 / 8913 | 6766 |
+| | host out, per program | 198×2^10 + 484×2^16 | 63.84M | 167.29M | -18.9% | 9317 / 8584 | 6517 |
+| | 2-way (ALU | rest), per program | 344×2^16 + 392×2^15 | 70.78M | 174.22M | -15.6% | 9708 / 8940 | 6786 |
+| | 3-way (ALU | memory | control+host), per program | 344×2^16 + 276×2^15 + 279×2^14 | 72.32M | 175.76M | -14.8% | 9795 / 9019 | 6846 |
+| | 4-way (ALU | memory | control | host), per program | 344×2^16 + 276×2^15 + 223×2^14 + 198×2^10 | 70.89M | 174.33M | -15.5% | 9715 / 8946 | 6791 |
+| | 5-way (ALU core | ALU rare | memory | control | host), per program | 341×2^16 + 221×2^10 + 276×2^15 + 223×2^14 + 198×2^10 | 70.95M | 174.39M | -15.5% | 9718 / 8949 | 6793 |
+
+## Device kernels by length: cells, phone time and peak [model]
+
+Node kernels' runs taken as device kernels (their first 2^k steps), today and with the per-program CPU and the 4-way split per program; the phone from the fits (affine / proportional), the peak from its fit.
+
+| kernel | steps | variant | cells | phone ms | peak MiB |
+|---|---|---|---|---|---|
+| accounts | 4096 | today | 36.11M | 1919 / 1853 | 1424 |
+| accounts | 4096 | per-program CPU | 34.07M | 1804 / 1748 | 1345 |
+| accounts | 4096 | 4-way per program | 34.49M | 1828 / 1770 | 1361 |
+| accounts | 8192 | today | 52.86M | 2864 / 2712 | 2074 |
+| accounts | 8192 | per-program CPU | 48.78M | 2634 / 2503 | 1916 |
+| accounts | 8192 | 4-way per program | 49.21M | 2658 / 2525 | 1933 |
+| accounts | 16384 | today | 70.44M | 3855 / 3615 | 2757 |
+| accounts | 16384 | per-program CPU | 62.28M | 3395 / 3196 | 2440 |
+| accounts | 16384 | 4-way per program | 62.74M | 3421 / 3220 | 2458 |
+| accounts | 32768 | today | 124.53M | 6906 / 6390 | 4857 |
+| accounts | 32768 | per-program CPU | 108.22M | 5986 / 5553 | 4224 |
+| accounts | 32768 | 4-way per program | 106.91M | 5912 / 5486 | 4173 |
+| accounts | 65536 | today | 206.34M | 11519 / 10588 | 8033 |
+| accounts | 65536 | per-program CPU | 173.70M | 9679 / 8913 | 6766 |
+| accounts | 65536 | 4-way per program | 174.33M | 9715 / 8946 | 6791 |
+| window | 4096 | today | 25.33M | 1312 / 1300 | 1006 |
+| window | 4096 | per-program CPU | 23.30M | 1197 / 1196 | 927 |
+| window | 4096 | 4-way per program | 23.72M | 1220 / 1217 | 943 |
+| window | 8192 | today | 33.96M | 1798 / 1743 | 1341 |
+| window | 8192 | per-program CPU | 29.90M | 1569 / 1534 | 1183 |
+| window | 8192 | 4-way per program | 30.32M | 1593 / 1556 | 1199 |
+| window | 16384 | today | 56.22M | 3053 / 2885 | 2205 |
+| window | 16384 | per-program CPU | 48.09M | 2595 / 2468 | 1889 |
+| window | 16384 | 4-way per program | 42.90M | 2302 / 2201 | 1688 |
+| window | 32768 | today | 101.57M | 5611 / 5212 | 3966 |
+| window | 32768 | per-program CPU | 85.32M | 4695 / 4378 | 3335 |
+| window | 32768 | 4-way per program | 85.81M | 4722 / 4403 | 3354 |
+
+## The crossover: the CPU's cells against today's, by steps
+
+Each split's CPU cells against today's single CPU (785 columns at twice its padded rows), the components each padded to a power of two at the 2^10 floor. Two points an octave (just past a power of two, and at it), and the mean over 64 log-spaced lengths in the octave `(2^(k-1), 2^k]`.
+
+### the auth mix: alu 50.7%, control 10.3%, alu_ext 0.1%, host 2.6%, memory 36.4%
+
+| steps | today's CPU cells | host out | 2-way | 3-way | 4-way | 5-way | today, per program | 2-way, per program | 4-way, per program |
+|---|---|---|---|---|---|---|---|---|---|
+| 1024 | 1.61M | +18% | +24% | +45% | +64% | +102% | -29% | -4% | +35% |
+| mean over (2^9, 2^10] | | **+18%** | **+24%** | **+45%** | **+64%** | **+102%** | **-29%** | **-4%** | **+35%** |
+| 1025 | 3.22M | -41% | -38% | -28% | -18% | +1% | -29% | -52% | -32% |
+| 2048 | 3.22M | +4% | -3% | +7% | +16% | +24% | -29% | -30% | -11% |
+| mean over (2^10, 2^11] | | **+2%** | **-37%** | **-26%** | **-17%** | **+2%** | **-29%** | **-51%** | **-32%** |
+| 2049 | 6.43M | -48% | -52% | -46% | -42% | -38% | -29% | -65% | -55% |
+| 4096 | 6.43M | -3% | -3% | -3% | +2% | -6% | -29% | -30% | -25% |
+| mean over (2^11, 2^12] | | **-5%** | **-37%** | **-40%** | **-36%** | **-32%** | **-29%** | **-52%** | **-50%** |
+| 4097 | 12.86M | -52% | -52% | -51% | -49% | -53% | -29% | -65% | -62% |
+| 8192 | 12.86M | -7% | -3% | -3% | -6% | -21% | -29% | -30% | -32% |
+| mean over (2^12, 2^13] | | **-8%** | **-37%** | **-45%** | **-43%** | **-47%** | **-29%** | **-52%** | **-57%** |
+| 8193 | 25.72M | -53% | -52% | -51% | -53% | -60% | -29% | -65% | -66% |
+| 16384 | 25.72M | -9% | -3% | -3% | -7% | -26% | -29% | -30% | -33% |
+| mean over (2^13, 2^14] | | **-10%** | **-37%** | **-45%** | **-45%** | **-53%** | **-29%** | **-52%** | **-59%** |
+| 16385 | 51.45M | -54% | -52% | -51% | -54% | -63% | -29% | -65% | -67% |
+| 32768 | 51.45M | -9% | -3% | -3% | -8% | -29% | -29% | -30% | -34% |
+| mean over (2^14, 2^15] | | **-11%** | **-37%** | **-45%** | **-46%** | **-56%** | **-29%** | **-52%** | **-60%** |
+| 32769 | 102.89M | -55% | -52% | -51% | -54% | -65% | -29% | -65% | -67% |
+| 65536 | 102.89M | -9% | -3% | -3% | -8% | -30% | -29% | -30% | -34% |
+| mean over (2^15, 2^16] | | **-11%** | **-37%** | **-45%** | **-46%** | **-57%** | **-29%** | **-52%** | **-60%** |
+| 65537 | 205.78M | -55% | -52% | -51% | -54% | -65% | -29% | -65% | -67% |
+| 131072 | 205.78M | -9% | -3% | -3% | -8% | -31% | -29% | -30% | -34% |
+| mean over (2^16, 2^17] | | **-11%** | **-37%** | **-45%** | **-46%** | **-58%** | **-29%** | **-52%** | **-60%** |
+
+### the node kernels mix: alu 57.2%, control 12.8%, host 0.1%, memory 29.8%
+
+| steps | today's CPU cells | host out | 2-way | 3-way | 4-way | 5-way | today, per program | 2-way, per program | 4-way, per program |
+|---|---|---|---|---|---|---|---|---|---|
+| 1024 | 1.61M | +18% | +24% | +45% | +64% | +102% | -29% | -4% | +35% |
+| mean over (2^9, 2^10] | | **+18%** | **+24%** | **+45%** | **+64%** | **+102%** | **-29%** | **-4%** | **+35%** |
+| 1025 | 3.22M | +4% | -38% | -28% | -18% | +1% | -29% | -52% | -32% |
+| 2048 | 3.22M | +4% | -3% | +7% | +16% | +24% | -29% | -30% | -10% |
+| mean over (2^10, 2^11] | | **+4%** | **-31%** | **-20%** | **-11%** | **+6%** | **-29%** | **-48%** | **-28%** |
+| 2049 | 6.43M | -48% | -52% | -46% | -42% | -38% | -29% | -65% | -55% |
+| 4096 | 6.43M | -3% | -3% | -3% | +2% | -6% | -29% | -30% | -25% |
+| mean over (2^11, 2^12] | | **-3%** | **-34%** | **-37%** | **-32%** | **-31%** | **-29%** | **-50%** | **-48%** |
+| 4097 | 12.86M | -52% | -52% | -51% | -49% | -53% | -29% | -65% | -62% |
+| 8192 | 12.86M | -7% | -3% | -3% | -2% | -17% | -29% | -30% | -28% |
+| mean over (2^12, 2^13] | | **-7%** | **-34%** | **-42%** | **-40%** | **-46%** | **-29%** | **-50%** | **-55%** |
+| 8193 | 25.72M | -53% | -52% | -51% | -51% | -58% | -29% | -65% | -64% |
+| 16384 | 25.72M | -9% | -3% | -3% | -3% | -23% | -29% | -30% | -30% |
+| mean over (2^13, 2^14] | | **-9%** | **-34%** | **-42%** | **-41%** | **-51%** | **-29%** | **-50%** | **-57%** |
+| 16385 | 51.45M | -54% | -52% | -51% | -52% | -61% | -29% | -65% | -65% |
+| 32768 | 51.45M | -9% | -3% | -3% | -4% | -25% | -29% | -30% | -31% |
+| mean over (2^14, 2^15] | | **-9%** | **-34%** | **-42%** | **-42%** | **-54%** | **-29%** | **-50%** | **-58%** |
+| 32769 | 102.89M | -55% | -52% | -51% | -52% | -63% | -29% | -65% | -65% |
+| 65536 | 102.89M | -10% | -3% | -3% | -5% | -27% | -29% | -30% | -31% |
+| mean over (2^15, 2^16] | | **-10%** | **-34%** | **-42%** | **-43%** | **-55%** | **-29%** | **-50%** | **-58%** |
+| 65537 | 205.78M | -55% | -52% | -51% | -52% | -63% | -29% | -65% | -66% |
+| 131072 | 205.78M | -10% | -3% | -3% | -5% | -27% | -29% | -30% | -31% |
+| mean over (2^16, 2^17] | | **-10%** | **-34%** | **-42%** | **-43%** | **-56%** | **-29%** | **-50%** | **-59%** |
+
+## Alternatives beside the split [model]
+
+| kernel | today | per-program CPU | word-level memory (7.19) | right shifts through MUL (DIVREM out) | per-program CPU + word memory |
+|---|---|---|---|---|---|
+| device (1722 steps, 626 accesses) | 11.67M | 10.65M (-9%) | 9.70–9.70M (-17…-17%) | 10.83M (-7%) | 8.67–8.67M (-26…-26%) |
+| accounts (4096 steps, 1156 accesses) | 36.11M | 34.07M (-6%) | 22.69–24.74M (-31…-37%) | 35.26M (-2%) | 20.65–22.70M (-37…-43%) |
+| accounts (8192 steps, 2374 accesses) | 52.86M | 48.78M (-8%) | 32.44–33.36M (-37…-39%) | 52.01M (-2%) | 28.36–29.28M (-45…-46%) |
+| balance (16384 steps, 5682 accesses) | 56.13M | 48.00M (-14%) | 47.53–47.76M (-15…-15%) | 55.28M (-2%) | 39.40–39.63M (-29…-30%) |
+| window (16384 steps, 5894 accesses) | 56.22M | 48.09M (-14%) | 47.61–48.97M (-13…-15%) | 55.37M (-2%) | 39.49–40.85M (-27…-30%) |
+| accounts (65536 steps, 19557 accesses) | 206.34M | 173.70M (-16%) | 165.51–171.86M (-17…-20%) | 202.95M (-2%) | 132.87–139.23M (-33…-36%) |
+
+## Node segments (format 35) and the first-day count (format 41)
+
+The window kernel's class 1 (2^15 steps, mask 0x1f9ffff); its first chunk by family {'alu': 17215, 'control': 4097, 'alu_ext': 2, 'host': 25, 'memory': 11429}.
+
+| shape | CPU components (columns at log) | columns | `p2` / `qm31` / `h8` rows | fits 2^16 / 2^17 / 2^16 |
+|---|---|---|---|---|
+| format 35 (today) | 772 at 15 | 8009 | 57700 / 102685 / 46000 | yes |
+| 41: the shared CPU (`CpuP2`), no Poseidon2 chip | 781 at 15 | 8018 | 57745 / 103131 / 46000 | yes |
+| 41, host out | 206 at 5 + 700 at 15 | 8144 | 58451 / 105136 / 46560 | yes |
+| 41, host out, with the Poseidon2 chip | | 9203 | 64265 / 120031 / 51800 | yes |
+| 41, 2-way (ALU | rest) | 540 at 15 + 422 at 14 | 8200 | 58759 / 101472 / 47280 | yes |
+| 41, 2-way (ALU | rest), with the Poseidon2 chip | | 9259 | 64573 / 119845 / 52080 | yes |
+| 41, 3-way (ALU | memory | control+host) | 540 at 15 + 275 at 14 + 306 at 13 | 8359 | 59643 / 107268 / 47560 | yes |
+| 41, 3-way (ALU | memory | control+host), with the Poseidon2 chip | | 9418 | 65456 / 121809 / 52840 | yes |
+| 41, 4-way (ALU | memory | control | host) | 540 at 15 + 275 at 14 + 238 at 13 + 206 at 5 | 8497 | 60395 / 108285 / 48320 | yes |
+| 41, 4-way (ALU | memory | control | host), with the Poseidon2 chip | | 9556 | 66210 / 120908 / 53840 | **no** |
+| 41, 5-way (ALU core | ALU rare | memory | control | host) | 360 at 15 + 481 at 4 + 275 at 14 + 238 at 13 + 206 at 5 | 8798 | 62070 / 112120 / 49640 | yes |
+| 41, 5-way (ALU core | ALU rare | memory | control | host), with the Poseidon2 chip | | 9857 | 67884 / 123462 / 55320 | **no** |
+| 41, today, per program | 545 at 15 | 7782 | 56424 / 102481 / 44680 | yes |
+| 41, today, per program, with the Poseidon2 chip | | 8841 | 62278 / 117354 / 49920 | yes |
+| 41, host out, per program | 206 at 5 + 481 at 15 | 7925 | 57259 / 100827 / 45800 | yes |
+| 41, host out, per program, with the Poseidon2 chip | | 8984 | 63034 / 115070 / 51120 | yes |
+| 41, 2-way (ALU | rest), per program | 340 at 15 + 401 at 14 | 7979 | 57526 / 104709 / 45560 | yes |
+| 41, 2-way (ALU | rest), per program, with the Poseidon2 chip | | 9038 | 63341 / 119258 / 50840 | yes |
+| 41, 3-way (ALU | memory | control+host), per program | 340 at 15 + 273 at 14 + 287 at 13 | 8138 | 58410 / 106675 / 46320 | yes |
+| 41, 3-way (ALU | memory | control+host), per program, with the Poseidon2 chip | | 9197 | 64224 / 120596 / 51680 | yes |
+| 41, 4-way (ALU | memory | control | host), per program | 340 at 15 + 273 at 14 + 219 at 13 + 206 at 5 | 8276 | 59163 / 100993 / 47920 | yes |
+| 41, 4-way (ALU | memory | control | host), per program, with the Poseidon2 chip | | 9335 | 64977 / 124159 / 52120 | yes |
+| 41, 5-way (ALU core | ALU rare | memory | control | host), per program | 337 at 15 + 217 at 4 + 273 at 14 + 219 at 13 + 206 at 5 | 8490 | 60354 / 109120 / 48200 | yes |
+| 41, 5-way (ALU core | ALU rare | memory | control | host), per program, with the Poseidon2 chip | | 9549 | 66208 / 122058 / 53680 | **no** |
+| 41: `CpuP2` with the Poseidon2 chip (a kernel calling 0x402) | 781 at 15 | 9077 | 63598 / 118004 / 51240 | yes |
+
+Headroom: `CpuP2` widened by 1424 columns first passes the padded shape (65577 / 105973 / 53120); 1416 fit.
+
+Node segment cells (format 35, the CPU's columns × rows; the other chips unchanged), per 2^15-step chunk of the traced node kernels:
+
+| kernel chunk | today's segment cells | CPU share | 4-way | 4-way per program | per program (one CPU) |
+|---|---|---|---|---|---|
+| accounts/150785 @0 | 155.22M | 16% | -0.7% | -5.1% | -4.8% |
+| accounts/150785 @32768 | 174.56M | 14% | -5.7% | -7.7% | -4.3% |
+| accounts/150785 @65536 | 127.41M | 20% | -7.8% | -10.6% | -5.9% |
+| accounts/150785 @98304 | 161.55M | 16% | -0.7% | -4.9% | -4.6% |
+| accounts/210019 @0 | 149.77M | 17% | -1.4% | -5.9% | -5.0% |
+| accounts/210019 @32768 | 173.96M | 15% | -0.7% | -4.5% | -4.3% |
+| accounts/210019 @65536 | 174.05M | 15% | -6.3% | -8.3% | -4.3% |
+| accounts/210019 @98304 | 174.05M | 15% | -6.3% | -8.3% | -4.3% |
+| accounts/210019 @131072 | 174.05M | 15% | -6.3% | -8.2% | -4.3% |
+| accounts/210019 @163840 | 174.34M | 15% | -6.3% | -8.2% | -4.3% |
+| accounts/248914 @0 | 149.77M | 17% | -1.4% | -5.9% | -5.0% |
+| accounts/248914 @32768 | 173.96M | 15% | -0.7% | -4.5% | -4.3% |
+| accounts/248914 @65536 | 174.05M | 15% | -6.3% | -8.3% | -4.3% |
+| accounts/248914 @98304 | 174.05M | 15% | -6.3% | -8.3% | -4.3% |
+| accounts/248914 @131072 | 174.05M | 15% | -6.3% | -8.2% | -4.3% |
+| accounts/248914 @163840 | 174.34M | 15% | -6.3% | -8.2% | -4.3% |
+| accounts/248914 @196608 | 161.55M | 16% | -0.7% | -4.9% | -4.6% |
+| accounts/248924 @0 | 149.77M | 17% | -1.4% | -5.9% | -5.0% |
+| accounts/248924 @32768 | 173.96M | 15% | -0.7% | -4.5% | -4.3% |
+| accounts/248924 @65536 | 174.05M | 15% | -6.3% | -8.3% | -4.3% |
+| accounts/248924 @98304 | 174.05M | 15% | -6.3% | -8.3% | -4.3% |
+| accounts/248924 @131072 | 174.05M | 15% | -6.3% | -8.2% | -4.3% |
+| accounts/248924 @163840 | 174.34M | 15% | -6.3% | -8.2% | -4.3% |
+| accounts/248924 @196608 | 161.55M | 16% | -0.7% | -4.9% | -4.6% |
+| accounts/35465 @0 | 161.71M | 16% | -0.7% | -4.9% | -4.6% |
+| window/52178 @0 | 114.86M | 22% | -1.0% | -6.9% | -6.5% |
+
