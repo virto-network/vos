@@ -892,7 +892,7 @@ mod tests {
             let error = admitted(number).unwrap_err();
             assert!(error.contains("retired"), "{error}");
         }
-        for number in (0..24).chain([38, u32::MAX]) {
+        for number in (0..24).chain([38, 41, 46, u32::MAX]) {
             assert!(lookup(number).is_none());
             assert!(admitted(number).is_err());
         }

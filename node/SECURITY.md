@@ -47,7 +47,7 @@ frame checks and the agent's placement come first, as for any call):
    `SpaceId`, and no proof may bind `NONE`;
 5. the format is one this node admits for a credential (`Format`): the
    credential format the proof registry names, as the final verifier pins
-   it, and the device format, 43;
+   it, and the device format, 45;
 6. the proof within its format's cap (512 KiB for a credential proof,
    1.5 MiB for a device proof), the arguments within `cap::REQUEST`
    (`Size`);
@@ -81,7 +81,7 @@ Ingress calls the final verifier's `credential::verify`, which picks the
 circuit by kind, never the circuit-generic step beneath it, which takes
 any preprocessed root.
 
-**A device proof** (format 43, `slice-7-mobile.md` pin J) authorizes as
+**A device proof** (format 45, `slice-7-mobile.md` pin J) authorizes as
 an auth credential proof does, and only for a method whose auth guard
 names a device kernel. Its program (the kernel's chips, their log sizes
 and the preprocessed root) is the one this node computes from the

@@ -588,7 +588,7 @@ last for decades.**
 | segment proofs (format 35) | ≥ 100 / ≥ 60 | blowup 4 (log 2), 40 queries, PoW 24, plus interaction PoW 8; FRI fold step 1, log last-layer degree bound 0 | 104 / 62 (62.86) |
 | leaf and fold proofs (32) | ≥ 100 / ≥ 60 | blowup 4, 44 queries, PoW 20, plus interaction PoW 8; fold step 1, last layer 2^0 | 108 / 63 |
 | credential proofs (44, by S29; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | blowup 4 (log 2), 47 queries, PoW 16, plus interaction PoW 8; variant (c) | 110 / 62 (62.92) [built, 7.10; registered, 7.12] |
-| device proofs (45; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | chosen by 7.16 among blowup 2 with 86–87 queries, 4 with 43 (or 47 at PoW 16), 8 with 29; variant (c) | ≥ 100 / ≥ 62 |
+| device proofs (45; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | blowup 4, 47 queries, PoW 16, interaction PoW 8 (7.16, among blowup 2 with 86–87 queries, 4 with 43, 8 with 29); variant (c), `h = 256` (7.17d) | 110 / 62 (62.82) |
 | the final wrap, unmasked (28; tests only) | ≥ 100 / ≥ 80 | blowup 64 (log 6), 20 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching (§3.5) | 146 / 82 (82.60) |
 | the final wrap, masked (39) | ≥ 100 / ≥ 80 | blowup 32 (log 5), 24 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching; variant (c) | 146 / 82 (82.70) |
 
@@ -754,8 +754,8 @@ last for decades.**
   - **What would break it:** more offsets (`|O| = 3`: 200 rows, still
     under 256; `|O| = 4`: 251; `|O| = 5`: 302, over) or more queries. R1
     refuses a transcript whose rows pass `h` (`n_rows ≤ h` before the
-    rank), so a shape that broke it would fail to prove, never prove
-    leaky; and `mask_rows` sizes each chip's `h` from its own offsets.
+    rank), so a shape that broke it would fail to prove (after
+    `MAX_ATTEMPTS` refused transcripts), never prove leaky; and `mask_rows` sizes each chip's `h` from its own offsets.
 - **The composition mode:** a test pins that (c) lifts no constraint past
   the blowup. If it did, the prover would re-LDE every column.
 - **On the wrap** (spike 6a): no re-LDE [measured]; the prover ×2.6–2.9
@@ -1412,7 +1412,8 @@ columns [measured, 7.16]. Over `C`, a kernel that hashes only through
   four-byte load a packed word, `padded_device_io_words`) and the kernel
   moves its words whole at any alignment (the PVM serves unaligned loads
   and stores; the guest target's own go byte by byte): under 2^11 steps,
-  the CPU at the masking's floor, which the gate holds [measured, 7.17c].
+  which the gate holds [measured, 7.17c]: the CPU at 2^11 rows, twice the
+  masking's floor of 2^10 at `h = 256`.
 
 **Format 45, device proofs** [measured, slice 7's 7.16 and 7.17d]:
 masked (c), the Blake2s-M31 channel, blowup 4, 47 queries, PoW 16,

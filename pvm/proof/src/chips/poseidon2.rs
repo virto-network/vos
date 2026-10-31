@@ -1,5 +1,5 @@
 //! Poseidon2Chip — the Poseidon2 call (`0x402`, `slice-7-mobile.md` pin H),
-//! one permutation a row, in the shared chip set (formats 41 and 43).
+//! one permutation a row, in the shared chip set (formats 41 and 45).
 //!
 //! A row is a served call at its step's timestamp:
 //!

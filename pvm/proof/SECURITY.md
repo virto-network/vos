@@ -30,7 +30,7 @@ reference shape, from the security tool (`src/security.rs`):
 | 28 | the final wrap, unmasked | Blake2b-256 | 146 / 82.6 | 100 / 80 | admitted: the tests' and the fixtures', linked by the final verifier under `test-formats` alone |
 | 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 146 / 82.70 | 100 / 80 | admitted: what production venues accept |
 | 44 | credential proofs, masked (variant (c)) | Blake2s-M31 | 110 / 62.92 | 100 / 60 | admitted: what a space's ingress takes |
-| 43 | device proofs, masked (variant (c)) | Blake2s-M31 | 110 / 62.82 | 100 / 60 | reserved: proved and verified by `vos-pvm-recair`, refused by every outside verifier until ingress takes device proofs |
+| 45 | device proofs, masked (variant (c)), `h = 256` | Blake2s-M31 | 110 / 62.82 | 100 / 60 | admitted: device proofs of auth's statement at a space's ingress; 43, the same at `h = 512`, retired |
 
 - **Conjectured** bits are PoW plus queries times log blowup (the ethSTARK
   conjecture, refuted as stated in 2025; the parameters carry a margin for

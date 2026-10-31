@@ -36,8 +36,8 @@ fn a_device_kernels_shape_holds_no_blake2b() {
         Some(trace.io_hash),
         vos_pvm_precompiles::compute_device_io_hash(&public, &[], &[])
     );
-    // Under 2^11 steps the CPU takes 2^11 rows, one above the masking's
-    // floor (4h rows, h = 256).
+    // Under 2^11 steps the CPU takes 2^11 rows, twice the masking's floor
+    // (4h rows, 2^10 at h = 256).
     let steps = trace.side_note.steps.len();
     assert!(steps < 1 << 11, "auth: {steps} steps");
     println!("auth: {steps} steps");
@@ -85,4 +85,3 @@ fn every_path_shape_proves_under_one_device_program() {
         proofs[1].1.len()
     );
 }
-

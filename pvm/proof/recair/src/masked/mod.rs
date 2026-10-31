@@ -112,10 +112,11 @@ pub(crate) fn lifting_log_size(format: &Format, log_sizes: &[u32]) -> Option<u32
         .checked_add(format.params.log_blowup)
 }
 
-/// Each component's `log2 h`: twice the rows a column of it reveals,
-/// `4|O| + q(|O| + 1)` for its widest set of offsets `O` and the format's `q`
-/// queries (`docs/design/proving.md` §8), rounded up to a power of two, at
-/// most the format's `h`. A component none of whose masked columns reads a
+/// Each component's `log2 h`: twice the rows a column of it reveals
+/// ([`Reveal`]), rounded up to a power of two, capped at the format's `h`,
+/// which must cover the rows themselves (`docs/design/proving.md` §5, how
+/// large `h` must be); a cap below them leaves R1 refusing every
+/// transcript. A component none of whose masked columns reads a
 /// second row takes about half the `h` of one that does; R1 checks each on
 /// every transcript. `None` for an unmasked format, or a set whose masks do
 /// not fit its trees.

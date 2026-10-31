@@ -48,8 +48,9 @@ pub struct Cell {
     pub log_blowup: u32,
     pub queries: usize,
     pub pow: u32,
-    /// `log2 h`, when the cell names it (unchecked: the prover refuses an
-    /// `h` its columns' reveals do not fit); else the least power of two at
+    /// `log2 h`, when the cell names it (unchecked: an `h` below the
+    /// rows its columns reveal fails R1 on every attempt, and the prover
+    /// gives up); else the least power of two at
     /// least the rows a column reading two rows reveals, the device
     /// format's rule (`proving.md` §5).
     pub log_mask_rows: Option<u32>,

@@ -147,7 +147,7 @@ fn constraints_of<E: EvalAtRow>(
 /// selects it as the host-call continuation selects the other precompiles;
 /// its row reads φ7 and φ8, the input and output pointers, below 2^32, and
 /// hands `(ts, φ7, φ8)` to `Poseidon2Chip` (the `Poseidon2Call` relation),
-/// three fractions after format 35's. Formats 41 and 43 take it; format 35
+/// three fractions after format 35's. Formats 41 and 45 take it; format 35
 /// keeps [`CpuChip`].
 pub struct CpuP2Chip;
 
