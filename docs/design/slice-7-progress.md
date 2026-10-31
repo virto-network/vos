@@ -3191,6 +3191,226 @@ and intervals every second, `every_s` = 1; run
   (`step.sh`, `r56.sh`, `row.py`, `md.py`, `stages.py`,
   `intervals.py`) are in `~/vos-scale/s76c/`.
 
+### 7.6d: the storm, the levers, and the runs again
+
+From vos-core `4744f53d` (runs 2–6 included), on `s7/7.6d`. The owner's
+S59: the quiet groups' election storm first, then levers 1 and 2, each a
+commit with its before and after against runs 3–6. compumax's governor
+was `performance` for every run below (the harness's `check` recorded
+it); the driver on sigma, as in 7.6c.
+
+**The storm's root cause: two, and a third behind the cold restart.**
+- **The pair heartbeat refused its own frames** [measured, in process].
+  At 10^5 idle agents a node leads about 33,000 groups and listed them
+  all, every round, to each peer: nine frames of 4,096, past the liveness
+  queue's budget of four 64 KiB frames. Idle, the network thread drained
+  the queue as fast as the frames came; under load it lagged, the last
+  frames of each round were refused (silently: the send's result was
+  dropped), and the same groups, the end of the listing's order, went
+  unlisted round after round. Their quiet followers woke, the other
+  follower, unlisted too, granted the pre-vote, and they elected: node 1's
+  summed terms 109,000 to 1.24 million in ten minutes. A cluster with
+  listings past its peers' queues reproduces it: listing everything
+  each round, unpaced, moved terms from 1 to 6 in six seconds of calls.
+- **A stream per group starved the elections** [measured, in process].
+  Consensus and requests frames took a QUIC stream per agent, and a
+  peer's connection holds 8,192 at once. With more groups talking than
+  that, those without a stream waited for one that groups still electing
+  kept busy: the cold restart's 6,468 leaders of 100,066 after 20 minutes
+  sit just under the cap. Reproduced: 24 groups, a cap of 8 streams,
+  every node restarted at once: no group elected in the test's three
+  minutes.
+- **The pair heartbeat's thread cost** was the full listing, sent and
+  taken whole twice a second, and a pass over every group per round.
+- **A safety bug, found on the way** (`f00737b0`): the simulator's churn
+  runs with the pair heartbeat committed two entries at one index (seed
+  1760 on the base; 1081 once the listing changed timing). A replica its
+  host wiped, added again and restored from a snapshot older than the
+  log it had held, campaigned by the snapshot's older configuration and
+  won with a replica as far behind. It now campaigns only once its log
+  reaches its vote floor, as it votes only for logs that do. 3,000 more
+  churn seeds pass.
+
+**The commits:**
+- `2c2d91fa` **Lanes:** an agent's frames go on one of `peer_lanes`
+  streams by its id (1,024 a class; the connection's cap 4,096).
+- `f00737b0` The vote floor's campaign rule (above).
+- `1b2b0075` **The pair heartbeat sends what changed:** a round names the
+  changes since the last round the peer acknowledged taking whole, every
+  group changed since at its value now, so a lost or split round loses
+  nothing (vos-raft `pair::Telling`, `PeerTable`); a frame waits for room
+  in the peer's queue, a round ending at the first refused; a follower
+  goes quiet only while its leader's listing names it, and a change wakes
+  it as it arrives; a round scans the groups only while a peer lapses;
+  the groups led are indexed by their drivers. The memory hub now holds a
+  delayed frame's bytes against the class's budget, as QUIC does.
+- `f4421239`, `e3a74620` **A bound on campaigns at once** (4,096 by
+  default, `d26eecd3`): past it a group waits in turn, woken as a campaign
+  is given back (`Core::campaign_due`, `defer_campaign`, `campaign_now`).
+- `f20eab31`, `17eaea9d`, `b9a5c89a` **Lever 1, batches in flight**
+  (below): built and safe, off by default.
+- `eb1925fb` **Lever 2, the due index's floor** (below).
+- `6b5a940e` **The Opus review folded** (Raft safety and liveness, apply
+  order under pipelining). Two bugs: a batch in flight raised its
+  senders' marks for messages its result cut short, which a later batch
+  then acknowledged unapplied (lost messages); and the due floor could
+  pass rows a batch that did not apply had deleted. Fixed: marks are read
+  over the flights' writes, every acknowledgement is at the applied mark,
+  a cut-short result lands before another batch flies, a failed flight
+  resets the floor. Also folded: a refine failure over flights retries on
+  the applied state; a peer's new run reports its old listing as changed;
+  a round's room is shared by its peers; a losing campaign gives back its
+  turn. Not folded: lanes' check against a peer configured with other
+  `peer_lanes` (documented: the same on every node of a space).
+- `d26eecd3` A starting group's store reads (its Raft rows, its recovery
+  cut, its root build's start) run on the executors, not the runtime.
+- `eb76f560` `in_flight` and `campaigns` in the node's config file;
+  `d9824539` the `between` stage runs from a batch's landing.
+
+Tests: the lanes and their check; more groups than streams elect after a
+restart of every node (the regression for the cold start); a listing
+larger than its peers' queues keeps every idle group quiet with no term
+moving under calls (the regression for the storm); the table through
+lost, split and late frames (40 seeds); the campaigns' queue; the
+wiped replica's campaign; unapplied writes over applied rows; 16
+sessions calling at once with four batches in flight; the due floor.
+The checker loop (exactly-once, seeds 7601–7610, with four batches in
+flight for 7601–7608) and the fault suite green. `just check` green at
+`b9a5c89a` (125 suites, 1,659 passed, its log ending `exit=0`); the
+node's and vos-raft's suites, clippy and the checker again on each later
+commit.
+
+**Lever 1, batches in flight: built, measured worse, off by default.**
+T1's shape (run 3: 10^6 users, 5,000 a second, `x` = 98%, 30 minutes),
+transfers [measured]:
+
+| batches in flight | answered/s | p50 / p99 / p99.9 | timed out | batch inputs (node 1, p50) | queued p50 | commit p50 |
+|---|---|---|---|---|---|---|
+| 1 (`r3d-if1`) | 3,999.5 | 328 ms / 2.6 s / 4.2 s | 0 | 27–39 | 98–115 ms | 57–65 ms |
+| 2, each once the last committed (`r3d-committed`) | 3,999.5 | 393 ms / 6.3 s / 14.7 s | 0 | 27–31 | 82 ms | 82 ms |
+| 2 (`r3d-if2`) | 3,818 | 918 ms / 201 s / 268 s | 337,326 | 15–31 | 49–82 ms | 66–115 ms |
+| 4 (`r3d-u1m-5000`) | 3,269 | 3.7 s / 403 s / 537 s | 1,136,789 | 4–9 | 28–49 ms | 131–197 ms |
+
+- The queue's wait fell as planned (63 to 28 ms at four), but the
+  batches shrank with it: more refines, dry runs and log entries a
+  second for the same inputs (the executors 48% each, the runtime thread
+  60% against 46%), and, with one append in flight per follower in the
+  Raft core, each entry's commit waits for the last's. The nodes then
+  answered less than they were offered.
+- **Kept, safe and off:** `Config::in_flight` 1 by default. It would pay
+  where a batch's fixed cost is small against its wait, or with appends
+  pipelined to followers, neither so here.
+
+**Lever 2, the per-batch state read: made incremental.**
+- **The cause** [measured]: `prepare`'s growth (0.36 to 6.4 ms over the
+  soak) was the scan for the first due row, from the due index's start
+  over every row the sweeps and the sessions' moves had deleted there,
+  until the store compacted them: 35 µs with none, 88 ms after 333,000
+  moved rows in one memtable (a probe of the store).
+- **The lever:** the leader keeps a floor, at or below every row the
+  index holds (the first row its last scan found, lowered by each row its
+  own batches write, reset by a batch that did not apply), and its scans
+  and its sweep's list start there.
+- **After:** `prepare` 0.3 ms at T1's shape, and 0.3–0.9 ms through the
+  2-hour soak, against 6.4 ms at its end before.
+- **But the soak's collapse was not it** (below): with `prepare` flat,
+  the runtime thread still stepped from 45% to 75% at minute 30.
+
+**The runs again** (the node at `6b5a940e` to `d26eecd3`, each run's
+revision in its report):
+
+- **T1, run 3** (`20261030T235838Z-r3d-if1`, one batch in flight):
+  transfers p50 328 ms, p99 2.6 s, p99.9 4.2 s at 3,999.5 a second, none
+  timed out, against 393 ms, 10.5 s and 25.2 s with 223 timed out. **T1
+  still missed** (p99 ≤ 50 ms); no session refused. Node CPU 2.5–2.7 of
+  4 cores, the executors 42–47% each.
+- **T3's 10^5 stretch, run 4** (`20261031T014621Z-r4d-idle-100k`, again
+  as `20261031T080020Z-r4e-idle-100k` on `e3a74620`):
+
+  | | before (7.6c) | after |
+  |---|---|---|
+  | RSS, all quiet, before load | 4,330–4,440 MiB | 4,297–4,314 MiB |
+  | `vos-liveness`, idle (the driver reading the agents' records) | 12.5–12.9% | 3.8–4.0% |
+  | quiet replicas under load | 83,000–91,000 of 100,066 | 100,001–100,066 |
+  | elections under load | 1.45 million (node 2) | 0, terms flat at 100,066 |
+  | transfers p50 / p99 / p99.9 | 16.8 s / 58.7 s at 5 min, then OOM | 197 ms / 1.05 s / 2.1 s (run 4e: 197 ms / 1.31 s / 2.1 s) |
+  | timed out | from minute 10, the nodes and the driver OOM-killed | 0 |
+  | RSS under load | to the 12 GiB cap in 10.5 min | 4.4 to 6.0 GiB in 15 min, then flat at 6.1 |
+  | readers' reads | | 15,520 of 15,520, p99 0.52 s (p99 from the close 5.2 s) |
+
+  **The 10^5 stretch met under load.** Idle cost as 7.6c's (43 MiB per
+  1,000 replicas), the liveness thread a third of what it was.
+- **The cold restart at 10^5** (the run-4 agents started again on their
+  data under the baseline load; `r4d-…-b`, `r4e-…-b`, `r4f-…-b`):
+  - Before: each node answered in 3.5 minutes; 20 minutes later 6,468 of
+    100,066 groups led, terms rising 120,000 a second.
+  - With lanes and the bound (deferral by a timeout, 512):
+    `20261031T050500Z-r4d-idle-100k-b`: every group led and quiet at the
+    first poll, each one term up; but the nodes answered only after 9.5
+    minutes, the runtime thread at 100% throughout, and RSS rose to
+    8.8–10.6 GiB in the next minutes (the driver could not connect: the
+    harness's `drive` right after `up` met the API not yet listening, so
+    no load ran).
+  - With the starts' reads on the executors and campaigns in turn
+    (`20261031T113827Z-r4f-idle-100k-b`): the nodes answered in 2.75
+    minutes, but groups elected at about 100 a second (52,000 led at 8
+    minutes), and RSS grew about 1 GiB a minute to the 12 GiB cap: node 3
+    OOM-killed at 12.8 minutes, under load. A group inbox of 64 rather
+    than 1,024 (`r4g`, not committed) did not change the growth.
+  - **Not yet converged within memory.** What grows during a cold
+    restart is not the caches (the store's 1 GiB, the entry caches 0.4
+    GiB): not attributed. The lever, left: bound the start's work end to
+    end (groups started a bounded number at once, so each elects before
+    the next thousand start), and attribute the growth.
+- **T5-partial, run 5** (`20261031T051738Z-r5d-fault-c2`, at `6b5a940e`):
+
+  | | before | after | bound |
+  |---|---|---|---|
+  | agents c2 led at the kill | 21 | 23 | |
+  | each led again elsewhere | p50 2.9 s, at most 4.9 s | p50 2.5 s, at most 3.6 s | 5 s: met |
+  | throughput under 80% after the kill | 33 of the first 60 s | 34 of the first 60 s | 30 s: missed |
+  | answering after its restart | 7.1 s | 7.6 s | 60 s: met |
+  | timed out over the run | 839,000 | 873,473 | |
+
+  As before: the calls in flight to c2 time out at the driver's 30 s and
+  hold their users' next calls; the restart's catch-up then tips the
+  nodes, at their knee at T1's shape, past it, and the run never settles.
+- **T6, run 6** (`20261031T055339Z-r6d-soak`, at `e3a74620`): transfers
+  per 10 minutes as 7.6c's: held for 30 minutes (p99 1.0–2.1 s), then
+  collapsed (the median interval's p99 84 s at 30–40 minutes, 31
+  minutes by the end); 2,790 answered a second over the run against 2,580, 7.74 million
+  timed out against 8.85 million. RSS 1,938–2,215 MiB a node, 11.8% over
+  minute 30's at most. **T6 missed.** `prepare` stayed 0.3–0.9 ms, so the
+  collapse is not the state read: at minute 30 the runtime thread steps
+  from 45–48% to 66–75% on every node at once, its `late` p50 from 0.6 to
+  5–8 ms, with no disk reads (the block cache full from minute 5, the
+  page cache serving) and no session expiry due yet (an hour). The step
+  is the same in 7.6c's soak. Not attributed: compumax has no `perf`,
+  and ptrace is limited to a process's parent. One lead, unchecked: 15
+  windows of 2 minutes is 30 minutes, the horizon of the windows' rows
+  (cuts, undo rows, closes) the leader reads.
+
+**The targets after 7.6d:**
+- **T1 missed** (p99 2.6 s against 50 ms), much nearer than 10.5 s.
+- **T2 not measurable** (S35).
+- **T3 met at 10^4 and at its 10^5 stretch under load**; a cold restart
+  at 10^5 elects every group but does not yet stay within 12 GiB.
+- **T4 met where measured** (15,520 of 15,520 readers' reads in run 4).
+- **T5-partial:** re-election (3.6 s) and rejoin (7.6 s) met; throughput
+  back to 80% within 30 s missed, as before.
+- **T6 missed:** the collapse at minute 30 is not the state read.
+
+**Left:**
+- The cold restart's memory at 10^5, and its election rate.
+- The soak's step at minute 30.
+- Lever 1 pays only with cheaper batches or appends pipelined to
+  followers: carried, off.
+- The runs: `~/vos-scale/runs/` as named above; `r3d-if2`,
+  `r3d-committed`, `r3d-u1m-5000` (four in flight); the scripts in
+  `~/vos-scale/s76d/`, the binaries in `~/vos-scale/bins-7.6d/` (this
+  branch's guests: the agent changed since 7.6c's, so the runs before
+  and after differ in it too).
+
 ## Step 7.10: the credential AIR
 
 Branch `s7/7.10`, from vos-core `84607818`.
