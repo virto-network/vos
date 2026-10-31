@@ -5487,3 +5487,28 @@ never purging, lean on the a720 build, lean at `h = 256`), 5 proofs after
 a warm-up each, then three cold `vos-phone kernel` runs; battery,
 temperature, memory and both clusters' governors around each run, P5's
 waits, the kills since the start, the pushed files removed on exit.
+
+**Review (Opus):** nothing high or medium: the packing (the last word the
+high three bytes of the four at 20), the padded hash against the stream,
+the sibling's side, every `MaybeUninit` word written before it is read,
+`encode_to`'s reserve and length, the asm options, the host paths, and no
+node kernel reached. Folded: L1 and L2, one packing formula on every
+target (the host's `load_u32` an unaligned read), so the host's test
+covers the guest's indexing for every length, and the block typed
+`[u8; 24]`; L3, the gate's comment; L4, `p6.sh` cleans up on an
+interrupt too; nits: the scripts' comments, the resize's note, the cell's
+unchecked `h`. The device actor's ELF did not move again (`blobs.lock`
+as before the folds). Not taken: the default serial (P5's and PG2's
+scripts default to the gate phone too), `ready`'s two `dumpsys` calls.
+
+**Gates** [measured; 12 GiB scope, `nice -n 10`, 8 jobs, another agent's
+scale coordinator beside]: `just check` green at `51f920b0` (exit 0, 1,670
+passed in 119 suites, 31 blobs `blobs.lock`'s); `just test-proof` green
+at `51f920b0` (exit 0, 584 passed in 52 suites, `fixtures::` and
+`constants::` among them: formats 35, 41 and 44 and every node kernel
+byte for byte).
+
+**Commits:** `751a7833` the seeded device cells, `bd893a3f` the end
+hashing in place, `1e889a2c` the lean kernel and its gate, `0055dda4`
+a cell's `h`, `ee101b69` the bench, P6's script and `proving.md`,
+`51f920b0` the review's folds; this record.
