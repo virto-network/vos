@@ -88,6 +88,14 @@ pub enum Kind {
     /// them.
     #[codec(index = 5)]
     Reading = 5,
+    /// An `#[attestable(device)]` method: proved on a device alone (format
+    /// 43), never attested by a node; its io-hash is the Poseidon2 one
+    /// (`vos_pvm_precompiles::compute_device_io_hash`), and its kernel
+    /// returns its statement's parts as that hash encodes them
+    /// ([`crate::result::KernelReturn::from_device_return`]), no root among
+    /// them.
+    #[codec(index = 6)]
+    Device = 6,
 }
 
 impl Kind {
@@ -105,7 +113,10 @@ impl Kind {
 
     /// Whether a method of this kind runs as its kernel, bound at install.
     pub const fn is_attestable(self) -> bool {
-        matches!(self, Kind::Attestable | Kind::Stating | Kind::Reading)
+        matches!(
+            self,
+            Kind::Attestable | Kind::Stating | Kind::Reading | Kind::Device
+        )
     }
 }
 
@@ -332,7 +343,7 @@ pub const fn is_effect(op: Op) -> bool {
 /// ([`in_section`]); outside one, a row operation fails the invocation.
 pub const fn allowed(kind: Kind, op: Op) -> bool {
     match kind {
-        Kind::Attestable | Kind::Stating | Kind::Reading => false,
+        Kind::Attestable | Kind::Stating | Kind::Reading | Kind::Device => false,
         Kind::Workflow => matches!(
             op,
             Op::Input

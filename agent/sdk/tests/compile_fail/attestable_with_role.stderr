@@ -1,4 +1,4 @@
-error: an #[attestable] method takes `gas = N` and `venue_bound` alone: it has no caller
+error: an #[attestable] method takes `gas = N`, `venue_bound` and `device` alone: it has no caller
   --> tests/compile_fail/attestable_with_role.rs:14:5
    |
 14 |     #[attestable(role = "minter")]

@@ -1,0 +1,5 @@
+error: `device = "proof"` names no #[attestable(device)] method of this actor
+  --> tests/compile_fail/guard_names_no_device_kernel.rs:15:38
+   |
+15 |     #[msg(credential = Auth("vote"), device = "proof")]
+   |                                      ^^^^^^

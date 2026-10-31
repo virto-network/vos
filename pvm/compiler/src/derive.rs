@@ -38,7 +38,12 @@
 //!
 //! **A kernel makes no host call but the precompiles and its witness
 //! input:** one whose reachable code does is refused, naming the chain of
-//! functions from the entry to the call.
+//! functions from the entry to the call. A node's kernel calls BLAKE2b's
+//! precompile and never Poseidon2's; a **device kernel**
+//! (`#[attestable(device)]`, its table entry marked) calls Poseidon2's and
+//! never BLAKE2b's, so its shape holds neither BLAKE2b nor its AND table.
+//! Its schema kind is `Device`, and an auth guard's `device = "..."` must
+//! name one.
 //!
 //! **A kernel's leaf fits the recursion:** each class of its shape gives a
 //! leaf whose rows, bounded from the shape alone ([`crate::leaf`]), fit the
@@ -95,6 +100,10 @@ const SERVED_CHUNK: u64 = ARGUMENTS;
 /// arguments, the rows a node serves it at a window's cut.
 const READS_SERVED: u64 = 1 << 32;
 
+/// The `VOS_ATTEST` entry's bit for a device kernel's method
+/// (`vos_sdk::runtime::DEVICE`).
+const DEVICE: u64 = 1 << 33;
+
 /// The largest ELF a derivation reads: an install's body.
 pub use vos_wire::abi::cap::MAX_ELF;
 
@@ -113,8 +122,13 @@ const ATTEST_ENTRY: u64 = 16;
 pub struct Derived {
     pub actor: Vec<u8>,
     pub kernels: Vec<(u32, Vec<u8>)>,
-    /// Each kernel's shape, by its position in `kernels`.
+    /// Each kernel's shape, by its position in `kernels`: a node's segment
+    /// shape. A device kernel's is the device profile's, from its code
+    /// (`vos_pvm_proof::device::device_chips_of_code`), which its install
+    /// takes; no node proves its segments.
     pub shapes: Vec<vos_wire::records::Shape>,
+    /// The device kernels' methods (`#[attestable(device)]`), ascending.
+    pub devices: Vec<u32>,
     pub schema: Vec<u8>,
     /// The pages of the actor's heap past its program's read-write data,
     /// which a workflow's machine maps there.
@@ -172,6 +186,12 @@ pub enum DeriveError {
         chain: Vec<String>,
     },
     #[error(
+        "device kernel {method:#010x} reaches the BLAKE2b precompile through {}: its io-hash \
+         and its shape hold no BLAKE2b",
+        chain.join(" -> ")
+    )]
+    DeviceBlake2b { method: u32, chain: Vec<String> },
+    #[error(
         "attestable method {method:#010x}'s kernel's class {class} leaf takes {rows:?} rows, \
          past the recursion's padded shape {:?}",
         crate::leaf::PADDED
@@ -203,10 +223,15 @@ pub fn derive(elf: &[u8]) -> Result<Derived, DeriveError> {
     let actor = spi_blob(transpile_with(&linked, Link::Whole)?)?;
     let graph = Graph::new(&linked);
     let entries = attestables(&linked)?;
-    reads_as_declared(&schema, &entries)?;
+    kinds_as_declared(&schema, &entries)?;
+    let devices = entries
+        .iter()
+        .filter(|entry| entry.device)
+        .map(|entry| entry.method)
+        .collect();
     let kernels: Vec<(u32, Vec<u8>)> = entries
         .into_iter()
-        .map(|(method, entry, input)| Ok((method, kernel(&graph, method, entry, input)?)))
+        .map(|entry| Ok((entry.method, kernel(&graph, &entry)?)))
         .collect::<Result<_, DeriveError>>()?;
     let shapes = kernels
         .iter()
@@ -226,6 +251,7 @@ pub fn derive(elf: &[u8]) -> Result<Derived, DeriveError> {
         actor,
         kernels,
         shapes,
+        devices,
         schema,
         heap,
         transpiler_version: TRANSPILER_VERSION,
@@ -254,28 +280,88 @@ fn invocation_heap(elf: &mut LinkedElf) -> Result<u32, DeriveError> {
 
 /// Whether each attestable entry reads the rows served at a window's cut
 /// exactly when the schema, its section's bytes `schema`, declares its
-/// method `Reading`: an ELF with attestable entries and a schema that
-/// does not read is refused.
-fn reads_as_declared(schema: &[u8], entries: &[(u32, u64, Input)]) -> Result<(), DeriveError> {
-    if entries.is_empty() {
-        return Ok(());
-    }
+/// method `Reading`, and is a device kernel's exactly when it declares it
+/// `Device`; and whether each auth guard's device kernel names an entry
+/// marked a device kernel's. An ELF with attestable entries and a schema
+/// that does not read is refused.
+fn kinds_as_declared(schema: &[u8], entries: &[AttestEntry]) -> Result<(), DeriveError> {
+    use vos_wire::abi::Kind;
     let table = |why: String| DeriveError::Table(why);
-    let schema = vos_wire::schema::Schema::read(schema)
-        .map_err(|error| table(format!("the schema does not read: {error:?}")))?;
-    for &(method, _, input) in entries {
+    let read = || {
+        vos_wire::schema::Schema::read(schema)
+            .map_err(|error| table(format!("the schema does not read: {error:?}")))
+    };
+    if entries.is_empty() {
+        // An ELF of no attestable method may still guard a method by a
+        // device kernel it lacks: refused below.
+        let Ok(schema) = vos_wire::schema::Schema::read(schema) else {
+            return Ok(());
+        };
+        return devices_as_named(&schema, entries);
+    }
+    let schema = read()?;
+    for entry in entries {
+        let method = entry.method;
         let kind = schema
             .method(vos_wire::ids::MethodId(method))
             .map(|method| method.kind);
-        let served = kind == Some(vos_wire::abi::Kind::Reading);
-        if served != (input == Input::Served) {
+        if (kind == Some(Kind::Reading)) != (entry.input == Input::Served) {
             return Err(table(format!(
                 "method {method:#010x}'s entry and its schema disagree on whether it reads \
                  the rows served at a window's cut"
             )));
         }
+        if (kind == Some(Kind::Device)) != entry.device {
+            return Err(table(format!(
+                "method {method:#010x}'s entry and its schema disagree on whether it is a \
+                 device kernel's"
+            )));
+        }
+    }
+    devices_as_named(&schema, entries)
+}
+
+/// Whether each auth guard's `device = "..."` names a method whose entry
+/// is marked a device kernel's.
+fn devices_as_named(
+    schema: &vos_wire::schema::Schema,
+    entries: &[AttestEntry],
+) -> Result<(), DeriveError> {
+    for guarded in &schema.methods {
+        let Some(vos_wire::schema::CredentialGuard::Auth {
+            device: Some(device),
+            ..
+        }) = guarded.credential.as_deref()
+        else {
+            continue;
+        };
+        let named = core::str::from_utf8(device)
+            .ok()
+            .and_then(|name| schema.method_id(name));
+        if !named.is_some_and(|id| {
+            entries
+                .iter()
+                .any(|entry| entry.method == id.0 && entry.device)
+        }) {
+            return Err(DeriveError::Table(format!(
+                "method {:#010x}'s auth guard names device kernel {:?}, which is no method's \
+                 marked a device kernel's",
+                guarded.id.0,
+                String::from_utf8_lossy(device)
+            )));
+        }
     }
     Ok(())
+}
+
+/// An attestable method's entry in `VOS_ATTEST`: its id, its entry's
+/// address, what its kernel reads, and whether it is a device kernel's.
+#[derive(Clone, Copy, Debug)]
+struct AttestEntry {
+    method: u32,
+    entry: u64,
+    input: Input,
+    device: bool,
 }
 
 /// What a kernel reads through its witness input: its arguments alone, or
@@ -311,9 +397,10 @@ impl Input {
     }
 }
 
-/// The ELF's attestable methods, their entries and what their kernels read,
-/// from its `VOS_ATTEST` table, by method id: none without the table.
-fn attestables(elf: &LinkedElf) -> Result<Vec<(u32, u64, Input)>, DeriveError> {
+/// The ELF's attestable methods, their entries, what their kernels read and
+/// which are device kernels', from its `VOS_ATTEST` table, by method id:
+/// none without the table.
+fn attestables(elf: &LinkedElf) -> Result<Vec<AttestEntry>, DeriveError> {
     let table = |why: &str| DeriveError::Table(why.to_string());
     let Some(symbol) = elf
         .symbols
@@ -353,22 +440,32 @@ fn attestables(elf: &LinkedElf) -> Result<Vec<(u32, u64, Input)>, DeriveError> {
         let word = u64::from_le_bytes(entry[..8].try_into().expect("eight bytes"));
         let raw = u64::from_le_bytes(entry[8..].try_into().expect("eight bytes"));
         let address = relocated.get(&entry_at(index)).copied().unwrap_or(raw);
-        let input = match word & !u64::from(u32::MAX) {
-            0 => Input::Arguments,
-            READS_SERVED => Input::Served,
-            _ => return Err(table("a method word past its id and its served bit")),
+        let (input, device) = match word & !u64::from(u32::MAX) {
+            0 => (Input::Arguments, false),
+            READS_SERVED => (Input::Served, false),
+            DEVICE => (Input::Arguments, true),
+            _ => {
+                return Err(table(
+                    "a method word past its id and one of its served and device bits",
+                ));
+            }
         };
         let method = word as u32;
         if !in_ranges(&elf.code_ranges, address) {
             return Err(table(&format!("method {method:#010x}'s entry is no code")));
         }
-        if entries.insert(method, (address, input)).is_some() {
+        if entries.insert(method, (address, input, device)).is_some() {
             return Err(table(&format!("method {method:#010x} has two entries")));
         }
     }
     Ok(entries
         .into_iter()
-        .map(|(method, (address, input))| (method, address, input))
+        .map(|(method, (entry, input, device))| AttestEntry {
+            method,
+            entry,
+            input,
+            device,
+        })
         .collect())
 }
 
@@ -703,10 +800,16 @@ fn overlapping(sorted: &[(u64, u64)], ranges: &[(u64, u64)]) -> Vec<(u64, u64)> 
     kept
 }
 
-/// The kernel of attestable `method`, whose entry is at `entry`: its code
-/// and data what the entry reaches, linked with an instruction-0 prologue
-/// that reads its `input` and calls it.
-fn kernel(graph: &Graph, method: u32, entry: u64, input: Input) -> Result<Vec<u8>, DeriveError> {
+/// The kernel of an attestable method's `entry`: its code and data what the
+/// entry reaches, linked with an instruction-0 prologue that reads its input
+/// and calls it.
+fn kernel(graph: &Graph, entry: &AttestEntry) -> Result<Vec<u8>, DeriveError> {
+    let &AttestEntry {
+        method,
+        entry,
+        input,
+        device,
+    } = entry;
     let elf = graph.elf;
     let reached = Reached::walk(graph, entry);
 
@@ -792,7 +895,9 @@ fn kernel(graph: &Graph, method: u32, entry: u64, input: Input) -> Result<Vec<u8
     };
 
     let transpiled = transpile_with(&kernel, Link::Kernel)?;
-    checked_blob(graph, &reached, method, transpiled, arguments, input)
+    checked_blob(
+        graph, &reached, method, device, transpiled, arguments, input,
+    )
 }
 
 /// The data a kernel keeps of `elf`, `objects` the ranges it reaches, the
@@ -833,26 +938,40 @@ fn reached_data(elf: &LinkedElf, objects: &[(u64, u64)]) -> (Vec<u8>, Vec<u8>) {
 }
 
 /// The kernel of `method` as its blob, `transpiled` from its linked ELF:
-/// refused if it makes a host call no kernel may, jumps to the halt
-/// statically, or its argument pages are not its read-write data's last.
+/// refused if it makes a host call no kernel of its kind (a `device`
+/// kernel's or a node's) may, jumps to the halt statically, or its argument
+/// pages are not its read-write data's last.
 fn checked_blob(
     graph: &Graph,
     reached: &Reached,
     method: u32,
+    device: bool,
     transpiled: crate::linker::TranspiledElf,
     arguments: u64,
     input: Input,
 ) -> Result<Vec<u8>, DeriveError> {
+    let admitted = if device {
+        vos_pvm::precompile::is_device_kernel_call
+    } else {
+        vos_pvm::precompile::is_kernel_call
+    };
     if let Some(&(address, id)) = transpiled
         .host_calls
         .iter()
-        .find(|&&(_, id)| !vos_pvm::precompile::is_kernel_call(u64::from(id)))
+        .find(|&&(_, id)| !admitted(u64::from(id)))
     {
-        return Err(DeriveError::HostCall {
-            method,
-            id: u64::from(id),
-            chain: reached.chain(graph, address),
-        });
+        let chain = reached.chain(graph, address);
+        return Err(
+            if device && u64::from(id) == vos_pvm::precompile::BLAKE2B_COMPRESS {
+                DeriveError::DeviceBlake2b { method, chain }
+            } else {
+                DeriveError::HostCall {
+                    method,
+                    id: u64::from(id),
+                    chain,
+                }
+            },
+        );
     }
     if let Some(pc) = transpiled.static_halt_target() {
         return Err(DeriveError::HaltTarget(pc));
@@ -1020,7 +1139,7 @@ mod tests {
         const ENTRY: u64 = 0x10_0000;
         let derived = |id| {
             let elf = LinkedElf::text(ENTRY, calling(id));
-            kernel(&Graph::new(&elf), 7, ENTRY, Input::Arguments)
+            kernel(&Graph::new(&elf), &entry(ENTRY, false))
         };
         for id in 110..=114 {
             match derived(id) {
@@ -1047,11 +1166,102 @@ mod tests {
         const ENTRY: u64 = 0x10_0000;
         let poseidon2 = vos_pvm::precompile::POSEIDON2;
         let elf = LinkedElf::text(ENTRY, calling(poseidon2 as i32));
-        match kernel(&Graph::new(&elf), 7, ENTRY, Input::Arguments) {
+        match kernel(&Graph::new(&elf), &entry(ENTRY, false)) {
             Err(DeriveError::HostCall { method, id, .. }) => {
                 assert_eq!((method, id), (7, poseidon2));
             }
             other => panic!("{:?}", other.map(|kernel| kernel.len())),
+        }
+    }
+
+    /// A device kernel makes Poseidon2's call and its witness input's, and
+    /// one that reaches BLAKE2b's precompile is refused, naming it, as one
+    /// reaching an unknown id is.
+    #[test]
+    fn a_device_kernel_calls_poseidon2_and_never_blake2b() {
+        const ENTRY: u64 = 0x10_0000;
+        let derived = |id: u64| {
+            let elf = LinkedElf::text(ENTRY, calling(id as i32));
+            kernel(&Graph::new(&elf), &entry(ENTRY, true))
+        };
+        for admitted in [
+            vos_pvm::precompile::POSEIDON2,
+            vos_pvm::precompile::WITNESS_INPUT,
+        ] {
+            assert!(derived(admitted).is_ok(), "{admitted:#x}");
+        }
+        match derived(vos_pvm::precompile::BLAKE2B_COMPRESS) {
+            Err(DeriveError::DeviceBlake2b { method, .. }) => assert_eq!(method, 7),
+            other => panic!("{:?}", other.map(|kernel| kernel.len())),
+        }
+        match derived(110) {
+            Err(DeriveError::HostCall { method, id, .. }) => assert_eq!((method, id), (7, 110)),
+            other => panic!("{:?}", other.map(|kernel| kernel.len())),
+        }
+    }
+
+    /// An entry's device mark agrees with its schema kind, `Device`, and an
+    /// auth guard's `device = "..."` names a method whose entry is marked.
+    #[test]
+    fn a_device_kernels_mark_is_its_schemas() {
+        use vos_wire::abi::Kind;
+        use vos_wire::ids::MethodId;
+        use vos_wire::schema::{CredentialGuard, MethodSchema, Schema};
+        let method = |id: u32, name: &str, kind: Kind| MethodSchema {
+            id: MethodId(id),
+            name: name.as_bytes().to_vec(),
+            kind,
+            role: None,
+            gas: None,
+            linearizable: false,
+            credential: None,
+        };
+        let guarded = |device: &str| MethodSchema {
+            credential: Some(Box::new(CredentialGuard::Auth {
+                name: b"login".to_vec(),
+                device: Some(device.as_bytes().to_vec()),
+                once: false,
+            })),
+            ..method(8, "login", Kind::Command)
+        };
+        let section = |kind: Kind, device: &str| {
+            Schema {
+                methods: vec![method(7, "auth", kind), guarded(device)],
+                credentials: false,
+            }
+            .section()
+        };
+        let marked = [entry(0x1000, true)];
+        let unmarked = [entry(0x1000, false)];
+        assert!(kinds_as_declared(&section(Kind::Device, "auth"), &marked).is_ok());
+        for (schema, entries) in [
+            (section(Kind::Device, "auth"), &unmarked),
+            (section(Kind::Stating, "auth"), &marked),
+            (section(Kind::Stating, "auth"), &unmarked),
+            (section(Kind::Device, "other"), &marked),
+        ] {
+            assert!(
+                matches!(
+                    kinds_as_declared(&schema, entries),
+                    Err(DeriveError::Table(_))
+                ),
+                "{entries:?}"
+            );
+        }
+        // A guard naming a device kernel of an ELF with no kernel at all.
+        assert!(matches!(
+            kinds_as_declared(&section(Kind::Command, "auth"), &[]),
+            Err(DeriveError::Table(_))
+        ));
+    }
+
+    /// Method 7's entry at `at`, a device kernel's or a node's.
+    fn entry(at: u64, device: bool) -> AttestEntry {
+        AttestEntry {
+            method: 7,
+            entry: at,
+            input: Input::Arguments,
+            device,
         }
     }
 }

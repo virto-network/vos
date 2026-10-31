@@ -455,10 +455,36 @@ pub struct KernelReturn {
 }
 
 impl KernelReturn {
-    /// The io-hash over its parts.
+    /// The io-hash over its parts: a node kernel's.
     pub fn io_hash(&self) -> [u8; 32] {
-        let roots: Vec<vos_pvm_precompiles::RootRead> = self
-            .roots
+        vos_pvm_precompiles::compute_io_hash(&self.public_args, &self.output, &self.root_reads())
+    }
+
+    /// The io-hash over its parts as a device kernel's
+    /// ([`crate::abi::Kind::Device`]) states it, over Poseidon2; `None`
+    /// when their encoding holds 2^24 bytes or more.
+    pub fn device_io_hash(&self) -> Option<[u8; 32]> {
+        vos_pvm_precompiles::compute_device_io_hash(
+            &self.public_args,
+            &self.output,
+            &self.root_reads(),
+        )
+    }
+
+    /// A device kernel's return read back as its parts: its bytes are the
+    /// io-hash's encoding `E` (`vos_pvm_precompiles::device_return_parts`),
+    /// not this type's codec, and it reads no root.
+    pub fn from_device_return(returned: &[u8]) -> Option<Self> {
+        let (public_args, output) = vos_pvm_precompiles::device_return_parts(returned)?;
+        Some(Self {
+            public_args: public_args.to_vec(),
+            output: output.to_vec(),
+            roots: Vec::new(),
+        })
+    }
+
+    fn root_reads(&self) -> Vec<vos_pvm_precompiles::RootRead> {
+        self.roots
             .iter()
             .map(|root| vos_pvm_precompiles::RootRead {
                 kind: match root.kind {
@@ -468,7 +494,6 @@ impl KernelReturn {
                 window: root.window,
                 root: root.root,
             })
-            .collect();
-        vos_pvm_precompiles::compute_io_hash(&self.public_args, &self.output, &roots)
+            .collect()
     }
 }

@@ -1,0 +1,37 @@
+error[E0277]: the trait bound `Proof: AttestableMethod` is not satisfied
+  --> tests/compile_fail/attest_of_a_device_method.rs:17:20
+   |
+17 |         ctx.attest(poll::Proof { root }).await.is_ok()
+   |             ------ ^^^^^^^^^^^^^^^^^^^^ the trait `AttestableMethod` is not implemented for `Proof`
+   |             |
+   |             required by a bound introduced by this call
+   |
+note: required by a bound in `vos_sdk::context::Command::<A>::attest`
+  --> src/context.rs
+   |
+   |     pub async fn attest<M: AttestableMethod<Actor = A>>(
+   |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `Command::<A>::attest`
+
+error[E0277]: the trait bound `Proof: AttestableMethod` is not satisfied
+  --> tests/compile_fail/attest_of_a_device_method.rs:17:9
+   |
+17 |         ctx.attest(poll::Proof { root }).await.is_ok()
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `AttestableMethod` is not implemented for `Proof`
+   |
+note: required by a bound in `vos_sdk::context::Command::<A>::attest`
+  --> src/context.rs
+   |
+   |     pub async fn attest<M: AttestableMethod<Actor = A>>(
+   |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `Command::<A>::attest`
+
+error[E0277]: the trait bound `Proof: AttestableMethod` is not satisfied
+  --> tests/compile_fail/attest_of_a_device_method.rs:17:42
+   |
+17 |         ctx.attest(poll::Proof { root }).await.is_ok()
+   |                                          ^^^^^ the trait `AttestableMethod` is not implemented for `Proof`
+   |
+note: required by a bound in `vos_sdk::context::Command::<A>::attest`
+  --> src/context.rs
+   |
+   |     pub async fn attest<M: AttestableMethod<Actor = A>>(
+   |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `Command::<A>::attest`

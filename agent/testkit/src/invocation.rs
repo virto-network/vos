@@ -522,6 +522,9 @@ impl<'a> Invocation<'a> {
         {
             Some(Kind::Attestable) => false,
             Some(Kind::Stating) => true,
+            // No node attests a device kernel's method: refused before its
+            // kernel runs.
+            Some(Kind::Device) => return Err(Failure::Unknown),
             _ => return Err(Failure::Unknown),
         };
         // Bounded compressions: the kernel runs within its method's

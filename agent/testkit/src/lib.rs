@@ -25,7 +25,9 @@ use vos_wire::batch::{Await, Body};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, WorkflowId};
 use vos_wire::keys;
 use vos_wire::records::versioned;
-use vos_wire::result::{Attest, CommittedWrite, InstanceGas, Outcome, Outgoing, Page, Write};
+use vos_wire::result::{
+    Attest, CommittedWrite, InstanceGas, KernelReturn, Outcome, Outgoing, Page, Write,
+};
 use vos_wire::schema::{Schema, SchemaError};
 use vos_wire::{Decode, SpaceId, WindowClock};
 
@@ -623,6 +625,66 @@ pub fn run_kernel(program: &[u8], input: &[u8], gas: u64) -> Result<KernelRan, F
         gas_used: run.gas_used,
         compressions: run.compressions,
     })
+}
+
+/// Run device kernel `program` (`#[attestable(device)]`) on `input`, its
+/// witness input, with `gas`, as a device runs it: the Poseidon2 call
+/// served, BLAKE2b's refused.
+pub fn run_device_kernel(program: &[u8], input: &[u8], gas: u64) -> Result<KernelRan, Failure> {
+    let run = memory::run_kernel_serving(
+        program,
+        input,
+        gas,
+        vos_wire::abi::cap::REPLY,
+        vos_pvm::precompile::is_device_kernel_call,
+    )
+    .map_err(|(code, _)| code)?;
+    Ok(KernelRan {
+        output: run.output,
+        io_hash: run.io_hash,
+        gas_used: run.gas_used,
+        compressions: run.compressions,
+    })
+}
+
+/// A device kernel's return as its statement's parts, read back whole
+/// ([`KernelReturn::from_device_return`]), their io-hash, the Poseidon2
+/// one, the one it left; `None` otherwise.
+pub fn device_parts(returned: &[u8], io_hash: &[u8; 32]) -> Option<KernelReturn> {
+    KernelReturn::from_device_return(returned)
+        .filter(|parts| parts.device_io_hash().as_ref() == Some(io_hash))
+}
+
+/// The device test actor's `auth` statement over a credential tree: its
+/// witness input (the siblings, the secret, the slot, then auth's
+/// `CredentialPublic`: the kind byte, `map_root`, `scope`, `nullifier` and
+/// `binding`) and its public arguments, those last 129 bytes.
+pub fn device_auth_input() -> (Vec<u8>, Vec<u8>) {
+    use vos_wire::credentials::{DEPTH, EMPTY, Tag, compress, digest, leaf, root_of};
+    let secret: [u32; 8] = core::array::from_fn(|i| 0x0123_4567 + 7_919 * i as u32);
+    let slot = 0x1234_5678u32;
+    let mut siblings: [[u32; 8]; DEPTH] = core::array::from_fn(|level| EMPTY[level]);
+    for (n, level) in [0, 5, 17].into_iter().enumerate() {
+        siblings[level] = core::array::from_fn(|i| (n as u32 + 1) * 1_000_003 + i as u32);
+    }
+    let member = compress(&Tag::Member.block(), &secret);
+    let root = root_of(&leaf(&member), slot, &siblings);
+    let scope: [u32; 8] = core::array::from_fn(|i| 0x5c5c_0000 + i as u32);
+    let nullifier = compress(&compress(&Tag::Nf.block(), &secret), &scope);
+    let binding: [u32; 8] = core::array::from_fn(|i| 0x0b1b_0000 + i as u32);
+    let mut input = Vec::new();
+    for sibling in &siblings {
+        input.extend_from_slice(&digest(sibling));
+    }
+    input.extend_from_slice(&digest(&secret));
+    input.extend_from_slice(&slot.to_le_bytes());
+    let public_at = input.len();
+    input.push(0);
+    for words in [root, scope, nullifier, binding] {
+        input.extend_from_slice(&digest(&words));
+    }
+    let public = input[public_at..].to_vec();
+    (input, public)
 }
 
 /// Decode a reply as `T`.

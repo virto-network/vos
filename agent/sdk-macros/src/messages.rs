@@ -27,6 +27,8 @@ struct Handler {
     public: Vec<bool>,
     reply: Type,
     error: Option<Type>,
+    /// Its auth guard's device kernel, by name, where the guard names one.
+    guard_device: Option<(String, Span)>,
 }
 
 impl Handler {
@@ -55,7 +57,8 @@ fn reply_and_error(output: &ReturnType) -> (Type, Option<Type>) {
 }
 
 /// A handler's options, from `#[msg(role = "...", gas = N, linearizable)]`,
-/// or an attestable method's, from `#[attestable(gas = N, venue_bound)]`.
+/// or an attestable method's, from `#[attestable(gas = N, venue_bound,
+/// device)]`.
 #[derive(Default)]
 struct Options {
     role: Option<String>,
@@ -69,6 +72,8 @@ struct Options {
     credential: Option<(CredentialGuard, Span)>,
     /// An auth guard's device kernel, `device = "..."`.
     device: Option<(String, Span)>,
+    /// An attestable method that is a device kernel, `device`.
+    device_kernel: Option<Span>,
     /// An auth guard that admits each nullifier once, `once`.
     once: Option<Span>,
 }
@@ -123,7 +128,11 @@ fn msg_options(attribute: &Attribute) -> syn::Result<Options> {
                 options.credential = Some((credential_arg(&meta)?, span));
             } else if meta.path.is_ident("device") {
                 let span = meta.path.span();
-                options.device = Some((string_arg(&meta)?, span));
+                if meta.input.peek(syn::Token![=]) {
+                    options.device = Some((string_arg(&meta)?, span));
+                } else {
+                    options.device_kernel = Some(span);
+                }
             } else if meta.path.is_ident("once") {
                 options.once = Some(meta.path.span());
             } else if meta.path.is_ident("gas") {
@@ -138,7 +147,7 @@ fn msg_options(attribute: &Attribute) -> syn::Result<Options> {
             } else {
                 return Err(meta.error(
                     "expected `role = \"...\"`, `gas = N`, `linearizable`, `venue_bound`, \
-                     `credential = ...`, `device = \"...\"` or `once`",
+                     `device`, `credential = ...`, `device = \"...\"` or `once`",
                 ));
             }
             Ok(())
@@ -219,7 +228,17 @@ fn handler(
     {
         return Err(Error::new(
             attribute.span(),
-            "an #[attestable] method takes `gas = N` and `venue_bound` alone: it has no caller",
+            "an #[attestable] method takes `gas = N`, `venue_bound` and `device` alone: it has \
+             no caller",
+        ));
+    }
+    if let Some(span) = options.device_kernel
+        && marked != Some(Kind::Attestable)
+    {
+        return Err(Error::new(
+            span,
+            "only an #[attestable] method is a device kernel: `device = \"...\"` names one \
+             beside an auth guard",
         ));
     }
     if let Some(span) = options.venue_bound
@@ -238,6 +257,13 @@ fn handler(
                 return Err(Error::new(
                     receiver.span(),
                     "a #[workflow] takes no `self`: it holds only its own memory",
+                ));
+            }
+            if let Some(span) = options.device_kernel {
+                return Err(Error::new(
+                    span,
+                    "an #[attestable(device)] method takes no `self`: a device reads no root, \
+                     and no node serves it rows",
                 ));
             }
             if receiver.reference.is_none() || receiver.mutability.is_some() {
@@ -276,6 +302,7 @@ fn handler(
             "only a query (`&self`) is `linearizable`: what runs through the log already is",
         ));
     }
+    let guard_device = options.device.clone();
     guard(&mut options, kind)?;
     let Arguments {
         has_context,
@@ -292,6 +319,7 @@ fn handler(
     // An attestable method's kind says what its kernel returns, and whether
     // it reads at a window's cut.
     let kind = match kind {
+        Kind::Attestable if options.device_kernel.is_some() => Kind::Device,
         Kind::Attestable if reads => Kind::Reading,
         Kind::Attestable if options.venue_bound.is_some() || public.contains(&true) => {
             Kind::Stating
@@ -320,6 +348,7 @@ fn handler(
         public,
         reply,
         error,
+        guard_device,
     })
 }
 
@@ -370,7 +399,7 @@ fn arguments<'a>(
                 Kind::Query => is_named(&reference.elem, "Query") && !mutable,
                 Kind::Command => is_named(&reference.elem, "Command") && mutable,
                 Kind::Workflow => is_named(&reference.elem, "Workflow") && mutable,
-                Kind::Attestable | Kind::Stating | Kind::Reading => false,
+                Kind::Attestable | Kind::Stating | Kind::Reading | Kind::Device => false,
             };
             if !expected {
                 return Err(Error::new(
@@ -378,7 +407,7 @@ fn arguments<'a>(
                     match kind {
                         Kind::Query => "a `&self` handler takes `&Query<Self>`",
                         Kind::Command => "a `&mut self` handler takes `&mut Command<Self>`",
-                        Kind::Attestable | Kind::Stating | Kind::Reading => {
+                        Kind::Attestable | Kind::Stating | Kind::Reading | Kind::Device => {
                             "an #[attestable] method takes no context"
                         }
                         Kind::Workflow => "a #[workflow] takes `&mut Workflow<Self>`",
@@ -462,6 +491,22 @@ pub(crate) fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn:
             input.self_ty.span(),
             "#[messages] needs `fn new() -> Self`, the state of a new instance",
         ));
+    }
+    for (device, span) in handlers
+        .iter()
+        .filter_map(|handler| handler.guard_device.as_ref())
+    {
+        if !handlers
+            .iter()
+            .any(|handler| handler.name == *device && handler.kind == Kind::Device)
+        {
+            return Err(Error::new(
+                *span,
+                format!(
+                    "`device = \"{device}\"` names no #[attestable(device)] method of this actor"
+                ),
+            ));
+        }
     }
 
     let mut generated = Generated {
@@ -606,6 +651,13 @@ impl Generated {
             .clone()
             .unwrap_or_else(|| syn::parse_quote!(::vos_sdk::context::Never));
         match handler.kind {
+            Kind::Device => {
+                // No `AttestableMethod`: no node attests a device kernel's
+                // method, so a workflow's attest of one does not compile.
+                let (entry, attestable) = attestable_entry(handler, actor, view, module, &message);
+                self.entries.push(entry);
+                self.attestables.push(attestable);
+            }
             Kind::Attestable | Kind::Stating | Kind::Reading => {
                 let method = if handler.kind == Kind::Reading {
                     quote!(AtCutMethod)
@@ -676,7 +728,9 @@ fn attestable_entry(
     let id = handler.id;
     let names = handler.names();
     let entry = format_ident!("__vos_attest_{}", handler.name);
-    let body = if handler.kind != Kind::Attestable {
+    let body = if handler.kind == Kind::Device {
+        device_body(handler, module, message)
+    } else if handler.kind != Kind::Attestable {
         parts_body(handler, view, module, message)
     } else {
         quote! {
@@ -712,10 +766,10 @@ fn attestable_entry(
             #body
         }
     };
-    let word = if handler.kind == Kind::Reading {
-        quote!(#id as u64 | ::vos_sdk::runtime::READS_SERVED)
-    } else {
-        quote!(#id as u64)
+    let word = match handler.kind {
+        Kind::Reading => quote!(#id as u64 | ::vos_sdk::runtime::READS_SERVED),
+        Kind::Device => quote!(#id as u64 | ::vos_sdk::runtime::DEVICE),
+        _ => quote!(#id as u64),
     };
     let row = quote! {
         ::vos_sdk::runtime::Attestable {
@@ -724,6 +778,39 @@ fn attestable_entry(
         }
     };
     (function, row)
+}
+
+/// A device kernel's entry's body: its parts written once, in place, and
+/// their io-hash the Poseidon2 one ([`vos_sdk::runtime::DeviceReturn`]),
+/// whatever parts it states.
+fn device_body(handler: &Handler, module: &Ident, message: &Ident) -> Tokens {
+    let method = &handler.method.sig.ident;
+    let names = handler.names();
+    let venue = handler.options.venue_bound.map(|_| quote!(venue,));
+    let bound = handler
+        .options
+        .venue_bound
+        .map(|_| quote!(::vos_sdk::Encode::encode_to(&venue, parts.public_args());));
+    let publics = handler
+        .arguments
+        .iter()
+        .zip(&handler.public)
+        .filter(|(_, public)| **public)
+        .map(|((name, _), _)| quote!(::vos_sdk::Encode::encode_to(&#name, parts.public_args());));
+    quote! {
+        let ::core::result::Result::Ok((#module::#message { #venue #(#names),* }, _)) =
+            <#module::#message as ::vos_sdk::Decode>::decode(input)
+        else {
+            ::core::panic!("undecodable arguments")
+        };
+        let mut parts = ::vos_sdk::runtime::DeviceReturn::new();
+        #bound
+        #(#publics)*
+        let output = Self::#method(#(#names),*);
+        ::vos_sdk::Encode::encode_to(&output, parts.output());
+        // SAFETY: the caller's contract.
+        unsafe { parts.end(io_hash) }
+    }
 }
 
 /// An attestable entry's body when its method states parts beside its

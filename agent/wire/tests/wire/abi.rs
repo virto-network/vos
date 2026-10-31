@@ -37,7 +37,7 @@ fn kinds_reach_only_their_operations() {
     for op in handlers {
         assert!(abi::allowed(Kind::Command, op));
         assert_eq!(abi::allowed(Kind::Query, op), !writes.contains(&op));
-        for kind in [Kind::Attestable, Kind::Stating, Kind::Reading] {
+        for kind in [Kind::Attestable, Kind::Stating, Kind::Reading, Kind::Device] {
             assert!(!abi::allowed(kind, op));
         }
         assert_eq!(abi::allowed(Kind::Workflow, op), !stateful.contains(&op));
@@ -106,6 +106,7 @@ fn kinds_index_as_they_encode() {
         Kind::Workflow,
         Kind::Stating,
         Kind::Reading,
+        Kind::Device,
     ];
     for kind in kinds {
         assert_eq!(kind.encode(), [kind.index()]);
@@ -115,7 +116,10 @@ fn kinds_index_as_they_encode() {
         );
         assert_eq!(
             kind.is_attestable(),
-            matches!(kind, Kind::Attestable | Kind::Stating | Kind::Reading)
+            matches!(
+                kind,
+                Kind::Attestable | Kind::Stating | Kind::Reading | Kind::Device
+            )
         );
     }
 }
@@ -370,7 +374,8 @@ fn kinds_encode_as_the_index_the_agent_passes() {
     assert_eq!(Kind::Workflow.encode(), [3]);
     assert_eq!(Kind::Stating.encode(), [4]);
     assert_eq!(Kind::Reading.encode(), [5]);
-    assert!(Kind::decode(&[6]).is_err());
+    assert_eq!(Kind::Device.encode(), [6]);
+    assert!(Kind::decode(&[7]).is_err());
 }
 
 /// A row operation's rows register: the tag, the transform's tag, then the

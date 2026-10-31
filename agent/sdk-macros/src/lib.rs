@@ -84,6 +84,11 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   `#[attestable(gas = N)]` sets the gas limit its kernel runs within on
 ///   a target that bounds kernels' BLAKE2b compressions, which its install
 ///   checks; it takes no role.
+/// - **Device kernels:** `#[attestable(device)]` marks a method a device
+///   proves (`proving.md` §8): it takes no `self`, its kernel returns its
+///   statement's parts and leaves their Poseidon2 io-hash, may make the
+///   Poseidon2 call and must reach no BLAKE2b, and no node attests it. An
+///   auth guard's `device = "..."` must name one of the actor's.
 /// - **Options:** `#[msg(role = "...", gas = N)]`, the role a caller needs
 ///   and the handler's gas limit; `#[workflow(role = "...", gas = N)]`
 ///   alike, the role checked when it starts and the gas each step's.

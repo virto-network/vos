@@ -1,0 +1,5 @@
+error: only an #[attestable] method is a device kernel: `device = "..."` names one beside an auth guard
+  --> tests/compile_fail/device_on_a_handler.rs:15:11
+   |
+15 |     #[msg(device)]
+   |           ^^^^^^

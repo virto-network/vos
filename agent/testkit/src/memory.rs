@@ -82,6 +82,24 @@ pub(crate) fn kernel(
     gas: u64,
     output: usize,
 ) -> Result<KernelRun, (Failure, u64)> {
+    run_kernel_serving(
+        program,
+        input,
+        gas,
+        output,
+        vos_pvm::precompile::is_kernel_call,
+    )
+}
+
+/// [`kernel`] for a kernel that makes the calls `calls` admits: a node's
+/// kernel's, or a device kernel's (the Poseidon2 precompile, never BLAKE2b's).
+pub(crate) fn run_kernel_serving(
+    program: &[u8],
+    input: &[u8],
+    gas: u64,
+    output: usize,
+    calls: fn(u64) -> bool,
+) -> Result<KernelRun, (Failure, u64)> {
     let mut witness = WitnessInput::new(input).ok_or((Failure::Cap, 0))?;
     let mut machine = Machine::load(program, &[], gas).map_err(|_| (Failure::Trapped, 0))?;
     let failed = |machine: &Machine, code| Err((code, gas - machine.gas_remaining()));
@@ -104,7 +122,7 @@ pub(crate) fn kernel(
                     Err(WitnessFault::Unwritable) => return failed(&machine, Failure::Trapped),
                 }
             }
-            ExitReason::HostCall(id) if vos_pvm::precompile::is_kernel_call(id) => {
+            ExitReason::HostCall(id) if calls(id) => {
                 compressions += 1;
                 if let Err(code) = precompile(&mut machine, id) {
                     return failed(&machine, code);

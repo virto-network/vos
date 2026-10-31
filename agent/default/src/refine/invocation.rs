@@ -530,6 +530,9 @@ impl<'a> Invocation<'a> {
         let stating = match schema.kind {
             Kind::Attestable => false,
             Kind::Stating => true,
+            // No node attests a device kernel's method: refused before its
+            // kernel runs.
+            Kind::Device => return Err(Failure::Unknown),
             _ => return Err(Failure::Unknown),
         };
         let declared = schema.gas;

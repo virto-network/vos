@@ -87,6 +87,13 @@ pub const fn is_kernel_call(id: u64) -> bool {
     matches!(id, BLAKE2B_COMPRESS | WITNESS_INPUT)
 }
 
+/// Whether `id` names a call a device kernel may make: the Poseidon2
+/// precompile, or its witness input. A device kernel's shape holds no
+/// BLAKE2b, so it makes no BLAKE2b call.
+pub const fn is_device_kernel_call(id: u64) -> bool {
+    matches!(id, POSEIDON2 | WITNESS_INPUT)
+}
+
 /// A kernel's witness input as one run reads it, call by call: its bytes,
 /// borrowed or held, and how many the calls have read.
 #[derive(Clone, Debug)]
@@ -550,6 +557,8 @@ mod witness_tests {
         assert!(WitnessInput::new(&bytes[..]).is_none());
         assert!(is_kernel_call(WITNESS_INPUT) && is_kernel_call(BLAKE2B_COMPRESS));
         assert!(is_precompile(POSEIDON2) && !is_kernel_call(POSEIDON2));
+        assert!(is_device_kernel_call(WITNESS_INPUT) && is_device_kernel_call(POSEIDON2));
+        assert!(!is_device_kernel_call(BLAKE2B_COMPRESS));
         assert!(!is_precompile(WITNESS_INPUT) && price(WITNESS_INPUT).is_none());
     }
 }
@@ -566,7 +575,10 @@ mod id_tests {
     fn ids_110_to_114_are_no_precompile() {
         let mut memory = Memory::sparse(1 << 32);
         for id in 110..=114 {
-            assert!(!is_precompile(id) && !is_kernel_call(id), "{id}");
+            assert!(
+                !is_precompile(id) && !is_kernel_call(id) && !is_device_kernel_call(id),
+                "{id}"
+            );
             assert_eq!(price(id), None, "{id}");
             let mut gas = 10;
             assert!(charge(id, &mut gas) && gas == 10, "{id}");
