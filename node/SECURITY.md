@@ -86,14 +86,20 @@ an auth credential proof does, and only for a method whose auth guard
 names a device kernel. Its program (the kernel's chips, their log sizes
 and the preprocessed root) is the one this node computes from the
 installed kernel by a run on auth's public reference statement
-(`vos_pvm_recair::device::Program::auth`), never one a request names: the
-leader computes it at the install, which fails for a kernel that does not
-run that statement within the format's shape, and a replica that did not
-install computes it at the first device proof naming the kernel, on an
-executor, then keeps it, a failure too, so a kernel costs one computation
-(about 0.2 s) a replica however many requests name it. The binding names
-the program's id; the io-hash is `H_io` of the request's auth words,
-computed here, so the proof's bytes carry no statement of their own.
+(`vos_pvm_recair::device::Program::auth`), never one a request names, and
+kept as its verifier alone (the program and its id). The leader computes
+it at the install, which fails for a guarded kernel that is no device
+kernel, or does not run that statement within the format's shape. A
+replica that did not install it, or has restarted since, computes it on
+an executor when a device proof naming the kernel has passed every check
+before the binding (format, size, expiry, guard, kind), once however many
+such requests wait on it (about 0.2 s), then keeps it, a failure too; a
+kernel the replica does not hold yet answers `Unavailable` and is tried
+again. The binding names the program's id; the io-hash is `H_io` of the
+request's auth words, computed here (each word below `p`, as a credential
+proof's), so the proof's bytes carry no statement of their own. A run is
+traced with at most about a million gas (`device::GAS`), so neither the
+install nor a device traces far past a program's shape.
 
 ## At apply
 
@@ -202,7 +208,8 @@ a member's phone (`slice-7-mobile.md` 7.13):
   the auth words it computed before the proof leaves the device, and the
   masked proof hides the run. What a hostile kernel still steers is
   whether its run fits its program's shape, so whether the device answers
-  a proof or an error, and how long it takes: about one bit a sign-in.
+  a proof or an error, and how long the refusal takes (the run is traced
+  to at most `device::GAS`): a few bits a sign-in.
 - **What the gateway relays.** It forwards a facility's `Credentialed`
   request as it is, after checking it names the demo's agent and the
   screen's instance and method; any other is refused before a node sees

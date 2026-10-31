@@ -1020,7 +1020,8 @@ const DEVICE: InstanceId = InstanceId(4);
 /// device kernel (`Kind`); one sent as a credential proof (`Size`) and a
 /// credential proof sent as a device proof (its binding names its
 /// circuit, not the device program: `Binding`); a device proof stating
-/// another nullifier and one cut by a byte (`Proof`).
+/// another nullifier, one with a word at `p` and one cut by a byte
+/// (`Proof`).
 #[test]
 fn a_device_kernels_proof_signs_in_as_an_auth_proof_does() {
     use vos_device::wire::{self, Answer};
@@ -1174,6 +1175,16 @@ fn a_device_kernels_proof_signs_in_as_an_auth_proof_does() {
         send(at, &fresh, &other),
         Answer::Refused(CredentialRefusal::Proof),
         "another io-hash"
+    );
+    let mut wide = proof.clone();
+    let vos_device::CredentialPublic::Auth { nullifier, .. } = &mut wide.public else {
+        unreachable!()
+    };
+    nullifier.0[0] = tree::P;
+    assert_eq!(
+        send(at, &fresh, &wide),
+        Answer::Refused(CredentialRefusal::Proof),
+        "a word at p"
     );
     let mut cut = proof.clone();
     cut.proof.pop();

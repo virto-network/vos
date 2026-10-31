@@ -1362,9 +1362,12 @@ parameters (log blowup, queries, PoW, fold step, log last layer,
 interaction PoW, `log h`), the chips, the count of log sizes and each,
 and the root (every integer four little-endian bytes); the transcript
 mixes each of them too. The leader computes it at the install, which
-fails for a guarded device kernel that does not run auth's reference
-within the format's shape; a replica that did not install, at the first
-device proof naming the kernel, then keeps it. Auth's arguments to a
+fails for a guarded kernel that is no device kernel or does not run
+auth's reference within the format's shape; a replica that did not
+install it (or restarted), once a device proof naming the kernel passes
+the checks before the binding, one computation however many requests
+wait, then keeps its verifier. A run is traced with at most about a
+million gas (`device::GAS`). Auth's arguments to a
 device kernel are the 32 siblings from the leaf's level up, the secret's
 32 bytes, the slot (four little-endian bytes) and the 129 public bytes,
 in that order (`auth_arguments`), which `vos-device`'s

@@ -26,7 +26,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use vos_pvm_final_verifier::credential::{self as verifier, CredentialKind};
-use vos_pvm_recair::device::{self as device, Program};
+use vos_pvm_recair::device::{self as device, Verifier};
+use vos_wire::abi::Kind;
 use vos_wire::abi::cap;
 use vos_wire::batch::CredentialedInput;
 use vos_wire::credentials::{self, Bound, Ring};
@@ -51,22 +52,40 @@ const ADMITTED: [(u32, usize); 2] = [
     (device::FORMAT.number, device::MAX_PROOF_BYTES),
 ];
 
-/// The device programs this node computed, by their kernel's program
-/// hash: `None` for a kernel whose program could not be computed (it does
-/// not run auth's reference, or its run is past the device format's
-/// shape), so a request naming it costs no second attempt.
+/// A device program's place, by its kernel's program hash: computed once
+/// however many requests wait on it; `None` for a kernel whose program
+/// cannot be computed (it does not run auth's reference, or its run is past
+/// the device format's shape), so a request naming it costs no second
+/// attempt.
+type Place = Arc<smol::lock::OnceCell<Option<Arc<Verifier>>>>;
+
+/// The device programs this node holds, their verifiers alone.
 #[derive(Default)]
-pub(crate) struct DevicePrograms(Mutex<HashMap<[u8; 32], Option<Arc<Program>>>>);
+pub(crate) struct DevicePrograms(Mutex<HashMap<[u8; 32], Place>>);
 
 impl DevicePrograms {
     /// Keeps `programs`, each by its kernel's program hash: an install's,
     /// computed before its entry is queued.
-    pub(crate) fn pin(&self, programs: Vec<([u8; 32], Arc<Program>)>) {
+    pub(crate) fn pin(&self, programs: Vec<([u8; 32], Verifier)>) {
         let mut held = lock(&self.0);
         for (kernel, program) in programs {
-            held.insert(kernel, Some(program));
+            held.insert(kernel, Arc::new(Some(Arc::new(program)).into()));
         }
     }
+
+    /// The place of `kernel`'s program, made empty if it has none.
+    fn place(&self, kernel: [u8; 32]) -> Place {
+        Arc::clone(lock(&self.0).entry(kernel).or_default())
+    }
+}
+
+/// What the checks before the binding found: the space, the guard, the
+/// kind, and for a device proof the kernel its guard names.
+struct Front {
+    space: SpaceId,
+    guard: CredentialGuard,
+    kind: CredentialKind,
+    kernel: Option<[u8; 32]>,
 }
 
 /// A verification's place among those in flight, given back when the
@@ -110,7 +129,10 @@ enum Statement {
         words: Option<Vec<u32>>,
     },
     /// A device proof of `program` stating the io-hash `io`.
-    Device { program: Arc<Program>, io: [u8; 32] },
+    Device {
+        program: Arc<Verifier>,
+        io: [u8; 32],
+    },
 }
 
 impl Statement {
@@ -122,7 +144,13 @@ impl Statement {
                 words: Some(words),
             } => verifier::verify_bytes(*kind, words, bytes).is_ok(),
             Statement::Credential { words: None, .. } => false,
-            Statement::Device { program, io } => program.verify(io, bytes).is_ok(),
+            // A malformed proof that panics the verifier proves nothing.
+            Statement::Device { program, io } => {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    program.verify(io, bytes).is_ok()
+                }))
+                .unwrap_or(false)
+            }
         }
     }
 
@@ -181,7 +209,22 @@ impl Inner {
             Ok(run) => run,
             Err(error) => return error.into(),
         };
-        let program = self.device_program(agent, &call).await;
+        // A device proof's program, once every check before the binding
+        // has passed: computed from the installed kernel the first time.
+        let kernel = match self.front(&self.store.snapshot(), agent, &call) {
+            Ok(front) => front.kernel,
+            Err(refused) => return refused.into(),
+        };
+        let program = match kernel {
+            Some(kernel) => match self.device_program(kernel).await {
+                Ok(Some(program)) => Some((kernel, program)),
+                Ok(None) => {
+                    return Response::Rejected(Rejection::Credential(CredentialRefusal::Kind));
+                }
+                Err(refused) => return refused.into(),
+            },
+            None => None,
+        };
         let checked = match self.check(agent, call, program) {
             Ok(checked) => checked,
             Err(refused) => return refused.into(),
@@ -229,49 +272,44 @@ impl Inner {
         }
     }
 
-    /// The device program of the kernel `call`'s guard names, for a device
-    /// proof: computed on an executor from the installed kernel the first
-    /// time, then kept. `None` for any other call, or when the method, its
-    /// guard, the kernel or its program is missing, which [`Inner::check`]
-    /// refuses in its order.
-    async fn device_program(&self, agent: AgentId, call: &Credentialed) -> Option<Arc<Program>> {
-        if call.format != device::FORMAT.number {
-            return None;
-        }
-        let snapshot = self.store.snapshot();
-        let installed = installed(&snapshot, agent, call.instance).ok()??;
-        let Some(CredentialGuard::Auth {
-            device: Some(name), ..
-        }) = installed.schema.method(call.method)?.credential.as_deref()
-        else {
-            return None;
-        };
-        let method = installed
-            .schema
-            .method_id(core::str::from_utf8(name).ok()?)?;
-        let kernel = installed.kernel(method)?.0;
-        if let Some(program) = lock(&self.calls.devices.0).get(&kernel) {
-            return program.clone();
-        }
-        let blob = self.blobs.get(&kernel).ok()??;
-        let program = self
-            .offload(move || Program::auth(&blob).ok().map(Arc::new))
-            .await?;
-        lock(&self.calls.devices.0).insert(kernel, program.clone());
-        program
+    /// The device program of `kernel`: computed on an executor from the
+    /// stored kernel the first time, one computation however many requests
+    /// wait on it, then kept; `None` for a kernel whose program cannot be
+    /// computed. A kernel this replica does not hold yet, or an executor
+    /// gone, is `Unavailable`, retryable, and not kept.
+    async fn device_program(&self, kernel: [u8; 32]) -> Result<Option<Arc<Verifier>>, Refused> {
+        let place = self.calls.devices.place(kernel);
+        let blobs = self.blobs.clone();
+        place
+            .get_or_try_init(|| async move {
+                self.offload(move || {
+                    let blob = blobs
+                        .get(&kernel)
+                        .ok()
+                        .flatten()
+                        .ok_or(Refused::Unavailable)?;
+                    Ok(device::Program::auth(&blob)
+                        .ok()
+                        .map(|program| Arc::new(program.verifier())))
+                })
+                .await
+                .ok_or(Refused::Unavailable)?
+            })
+            .await
+            .cloned()
     }
 
-    /// Every check of `call` but the proof's, in order, on this replica's
-    /// applied state; `device` the program a device proof is verified
-    /// against ([`Inner::device_program`]).
-    fn check(
+    /// The checks before the binding, in order, on `snapshot`: the space,
+    /// the format, the sizes, the expiry, the method's guard and the kind;
+    /// for a device proof, that the guard names a device kernel the
+    /// instance installed, whose program hash it returns.
+    fn front(
         &self,
+        snapshot: &Snapshot,
         agent: AgentId,
-        call: Credentialed,
-        device: Option<Arc<Program>>,
-    ) -> Result<Checked, Refused> {
-        let snapshot = self.store.snapshot();
-        let space = read::<SpaceId>(&snapshot, agent, &keys::space())?
+        call: &Credentialed,
+    ) -> Result<Front, Refused> {
+        let space = read::<SpaceId>(snapshot, agent, &keys::space())?
             .filter(|space| *space != SpaceId::NONE)
             .ok_or(CredentialRefusal::NoSpace)?;
         let (_, cap) = ADMITTED
@@ -285,23 +323,60 @@ impl Inner {
         if call.expires_ms < now || call.expires_ms > now + defaults::CREDENTIAL_HORIZON_MS {
             return Err(CredentialRefusal::Expiry { now }.into());
         }
-        let guard = guard(&snapshot, agent, call.instance, &call)?;
+        let installed =
+            installed(snapshot, agent, call.instance)?.ok_or(CredentialRefusal::Method)?;
+        let guard = installed
+            .schema
+            .method(call.method)
+            .and_then(|method| method.credential.as_deref().cloned())
+            .ok_or(CredentialRefusal::Method)?;
         let kind = match (&guard, &call.public) {
             (CredentialGuard::Auth { .. }, CredentialPublic::Auth { .. }) => CredentialKind::Auth,
             (CredentialGuard::Owner, CredentialPublic::Owner { .. }) => CredentialKind::Owner,
             _ => return Err(CredentialRefusal::Kind.into()),
         };
-        // A device proof answers only a guard naming a device kernel whose
-        // program this node holds.
-        let device = match (call.format == device::FORMAT.number, &guard) {
+        // A device proof answers only a guard naming a device kernel.
+        let kernel = match (call.format == device::FORMAT.number, &guard) {
             (false, _) => None,
             (
                 true,
                 CredentialGuard::Auth {
-                    device: Some(_), ..
+                    device: Some(name), ..
                 },
-            ) => Some(device.ok_or(CredentialRefusal::Kind)?),
+            ) => Some(device_kernel(&installed, name).ok_or(CredentialRefusal::Kind)?),
             (true, _) => return Err(CredentialRefusal::Kind.into()),
+        };
+        Ok(Front {
+            space,
+            guard,
+            kind,
+            kernel,
+        })
+    }
+
+    /// Every check of `call` but the proof's, in order, on this replica's
+    /// applied state; `device` the kernel and program a device proof is
+    /// verified against ([`Inner::device_program`]), which must still be
+    /// the guard's.
+    fn check(
+        &self,
+        agent: AgentId,
+        call: Credentialed,
+        device: Option<([u8; 32], Arc<Verifier>)>,
+    ) -> Result<Checked, Refused> {
+        let snapshot = self.store.snapshot();
+        let Front {
+            space,
+            guard,
+            kind,
+            kernel,
+        } = self.front(&snapshot, agent, &call)?;
+        // An install between the program's lookup and this snapshot: asked
+        // again, the call meets the new kernel's program.
+        let device = match (kernel, device) {
+            (None, _) => None,
+            (Some(kernel), Some((held, program))) if held == kernel => Some(program),
+            (Some(_), _) => return Err(Refused::Unavailable),
         };
         if let (CredentialGuard::Auth { name, .. }, CredentialPublic::Auth { scope, .. }) =
             (&guard, &call.public)
@@ -350,9 +425,15 @@ impl Inner {
             CredentialPublic::Owner { .. } => None,
         };
         let statement = match device {
-            // An auth statement's 129 bytes are far under `H_io`'s bound.
+            // A word at or above p proves nothing, whatever the kernel
+            // compares; an auth statement's 129 bytes are far under
+            // `H_io`'s bound.
             Some(program) => Statement::Device {
-                io: device::auth_io(&call.public.encode()).ok_or(CredentialRefusal::Proof)?,
+                io: call
+                    .public
+                    .words()
+                    .and_then(|_| device::auth_io(&call.public.encode()))
+                    .ok_or(CredentialRefusal::Proof)?,
                 program,
             },
             None => Statement::Credential {
@@ -376,24 +457,16 @@ impl Inner {
     }
 }
 
-/// The credential guard of `call`'s method of `instance`, if both exist
-/// and it has one.
-fn guard(
-    snapshot: &Snapshot,
-    agent: AgentId,
-    instance: InstanceId,
-    call: &Credentialed,
-) -> Result<CredentialGuard, Refused> {
-    installed(snapshot, agent, instance)?
-        .and_then(|installed| {
-            installed
-                .schema
-                .method(call.method)?
-                .credential
-                .as_deref()
-                .cloned()
-        })
-        .ok_or(CredentialRefusal::Method.into())
+/// The program hash of the device kernel `name` names in `installed`: a
+/// method of the `Device` kind whose kernel the install bound.
+fn device_kernel(installed: &Installed, name: &[u8]) -> Option<[u8; 32]> {
+    let method = installed
+        .schema
+        .method_id(core::str::from_utf8(name).ok()?)?;
+    (installed.schema.method(method)?.kind == Kind::Device)
+        .then(|| installed.kernel(method))
+        .flatten()
+        .map(|kernel| kernel.0)
 }
 
 /// The installed record of `instance`, if it has one.

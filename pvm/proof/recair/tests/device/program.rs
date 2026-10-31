@@ -37,8 +37,7 @@ fn a_run_past_the_programs_log_sizes_is_refused_by_the_prover() {
     program.verify(&proof.io, &bytes).expect("verifies");
     let error = program
         .prove(&[9; 1000], MaskRng::default())
-        .err()
-        .expect("past the shape");
+        .expect_err("past the shape");
     assert!(
         matches!(&error, ProveError::Segment(message) if message.contains("its shape")),
         "{error:?}"

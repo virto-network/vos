@@ -26,9 +26,12 @@ and what a node does with one is `node/SECURITY.md`'s.
   nullifier's key `C(T(nf), s)`; the secret's words in the circuit's
   statement after each proof, a panic unwinding included; the circuit's
   private values (every row of the witness but its public outputs) once
-  the prover has taken them.
+  the prover has taken them; a device kernel's arguments (the secret's
+  bytes and the path) once its run is proved.
 - **What it does not:** the circuit builder's own copy of the values
-  (recair's `Context`), the prover's trace and its masked polynomials,
+  (recair's `Context`), a device kernel's traced run (its witness pages,
+  registers and memory ledger, which hold the secret's bytes) and its
+  main trace, the prover's trace and its masked polynomials,
   which hold the secret's words and every value derived from it, are
   freed with the proof's other buffers, not overwritten; so are BLAKE2b's
   and the Poseidon2 permutation's internal states, and copies the

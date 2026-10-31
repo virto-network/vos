@@ -275,7 +275,10 @@ impl Inner {
                     Ok(ProgramHash(hash.0))
                 };
                 let derivation = derived.derivation(&elf);
-                let guarded = guarded_devices(&derived.schema);
+                let guarded = match derived.devices.is_empty() {
+                    true => Vec::new(),
+                    false => guarded_devices(&derived.schema)?,
+                };
                 pooled(derived.actor)?;
                 let mut devices = Vec::new();
                 for (method, kernel) in derived.kernels {
@@ -359,11 +362,15 @@ impl Inner {
 }
 
 /// The methods of the schema in `section` an auth guard names as its device
-/// kernel: the kernels whose device programs ingress verifies against.
-fn guarded_devices(section: &[u8]) -> Vec<u32> {
+/// kernel: the kernels whose device programs ingress verifies against. A
+/// guard naming a method that is not a device kernel fails the install, as
+/// a schema that does not read does (a package with device kernels).
+fn guarded_devices(section: &[u8]) -> Result<Vec<u32>, CallError> {
     use vos_wire::schema::{CredentialGuard, Schema};
     let Ok(schema) = Schema::read(section) else {
-        return Vec::new();
+        return Err(CallError::Failed(
+            "the package's schema does not read".into(),
+        ));
     };
     schema
         .methods
@@ -371,10 +378,26 @@ fn guarded_devices(section: &[u8]) -> Vec<u32> {
         .filter_map(|method| match method.credential.as_deref() {
             Some(CredentialGuard::Auth {
                 device: Some(name), ..
-            }) => schema.method_id(core::str::from_utf8(name).ok()?),
+            }) => Some(name),
             _ => None,
         })
-        .map(|id| id.0)
+        .map(|name| {
+            core::str::from_utf8(name)
+                .ok()
+                .and_then(|name| schema.method_id(name))
+                .filter(|id| {
+                    schema
+                        .method(*id)
+                        .is_some_and(|method| method.kind == vos_wire::abi::Kind::Device)
+                })
+                .map(|id| id.0)
+                .ok_or_else(|| {
+                    CallError::Failed(format!(
+                        "a guard names {:?}, no device kernel of the package",
+                        String::from_utf8_lossy(name)
+                    ))
+                })
+        })
         .collect()
 }
 
@@ -385,9 +408,9 @@ fn guarded_devices(section: &[u8]) -> Vec<u32> {
 fn device_program(
     method: u32,
     kernel: &[u8],
-) -> Result<std::sync::Arc<vos_pvm_recair::device::Program>, CallError> {
+) -> Result<vos_pvm_recair::device::Verifier, CallError> {
     vos_pvm_recair::device::Program::auth(kernel)
-        .map(std::sync::Arc::new)
+        .map(|program| program.verifier())
         .map_err(|error| {
             CallError::Failed(format!(
                 "device kernel {method:#010x}: no program under the device format: {error}"

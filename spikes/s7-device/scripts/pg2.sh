@@ -14,7 +14,8 @@
 # temperature and free memory are recorded before each round; what was
 # pushed is removed at the end. Exits 0 when every round ran.
 #
-# <vos-phone> is `tools/phone/build.sh`'s `vos-phone-timing`. With
+# <vos-phone> is `tools/phone/build.sh`'s `vos-phone-timing`; the phone
+# is adb's PG2_SERIAL (the gate phone's by default). With
 # PG2_LOCAL=1 the "phone" is this host and <vos-phone> an x86 build
 # (`cargo build --release -p vos-phone`): the script's dry run.
 set -e
@@ -22,7 +23,7 @@ phone=$1; out=$2; rounds=${3:-3}
 root=$(cd "$(dirname "$0")/../../.." && pwd)
 host=$(mktemp -d "${TMPDIR:-/var/tmp}/pg2.XXXXXX")
 dir=/data/local/tmp/s7-pg2
-a="adb -s 7689b5a9"
+a="adb -s ${PG2_SERIAL:-7689b5a9}"
 if [ "${PG2_LOCAL:-0}" = 1 ]; then dir=$host/phone; fi
 on_phone() {
   if [ "${PG2_LOCAL:-0}" = 1 ]; then (cd "$dir" && sh -c "$*"); else $a shell "cd $dir && $*"; fi
@@ -37,6 +38,11 @@ state() {
   if [ "${PG2_LOCAL:-0}" = 1 ]; then uptime; grep MemAvailable /proc/meminfo; return; fi
   $a shell "dumpsys battery | grep -E '^  (level|temperature):'; grep MemAvailable /proc/meminfo"
 }
+# Whatever ends the run, the witness inputs and proofs pushed are removed.
+cleanup() {
+  if [ "${PG2_LOCAL:-0}" = 1 ]; then rm -rf "$dir"; else $a shell rm -rf $dir; fi
+}
+trap cleanup EXIT
 # Waits up to two minutes for the host's file $1.
 wait_file() {
   waited=0
@@ -77,7 +83,6 @@ wait_file() {
   wait $node || status=$?
   echo "== the node's answers"
   cat "$host/rounds.jsonl"
-  if [ "${PG2_LOCAL:-0}" = 1 ]; then rm -rf "$dir"; else $a shell rm -rf $dir; fi
   date
   echo "exit=$status"
 } > "$out" 2>&1

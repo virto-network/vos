@@ -48,9 +48,12 @@ pub const FORMAT: Format = DEVICE_PROOF;
 /// The longest device proof a decode reads, in bytes: ingress's cap.
 pub const MAX_PROOF_BYTES: usize = 1536 << 10;
 
-/// The most gas a device kernel's run takes: its CPU's rows are at most
-/// `2^DEVICE_MAX_LOG_SIZE`, far under it.
-pub const GAS: u64 = 50_000_000;
+/// The most gas a device kernel's run is traced with, about a million: a
+/// step a unit (eight times the most steps the device format's CPU holds,
+/// `2^DEVICE_MAX_LOG_SIZE`), a Poseidon2 call 2,400 (auth's 43 take about a
+/// tenth of it). A longer run stops out of gas rather than being traced
+/// far past any program's shape.
+pub const GAS: u64 = 8 << vos_pvm_proof::device::DEVICE_MAX_LOG_SIZE;
 
 /// The bytes of auth's public arguments: the kind byte and four digests.
 pub const AUTH_PUBLIC_BYTES: usize = 1 + 4 * 32;
@@ -134,16 +137,45 @@ impl Program {
     /// Verifies the proof in `bytes` ([`decode`]) of this program's kernel
     /// stating the io-hash `io`.
     pub fn verify(&self, io: &[u8; 32], bytes: &[u8]) -> Result<(), Error> {
-        let proof = DeviceProof {
-            io: *io,
-            proof: decode(bytes)?,
-        };
-        crate::masked::device::verify_device::<Blake2sM31MerkleChannel>(
-            &FORMAT,
-            self.program(),
-            &proof,
-        )
+        verify(self.program(), io, bytes)
     }
+
+    /// What a verifier keeps of it: the program and its id, without the
+    /// prover's committed tree.
+    pub fn verifier(&self) -> Verifier {
+        Verifier {
+            program: self.program().clone(),
+            id: self.id,
+        }
+    }
+}
+
+/// A device program as its verifier keeps it: what [`Program::verify`]
+/// reads, and the id.
+#[derive(Clone, Debug)]
+pub struct Verifier {
+    program: DeviceProgram<Hasher>,
+    id: [u8; 32],
+}
+
+impl Verifier {
+    /// Its id, which a binding names.
+    pub fn id(&self) -> &[u8; 32] {
+        &self.id
+    }
+
+    /// [`Program::verify`].
+    pub fn verify(&self, io: &[u8; 32], bytes: &[u8]) -> Result<(), Error> {
+        verify(&self.program, io, bytes)
+    }
+}
+
+fn verify(program: &DeviceProgram<Hasher>, io: &[u8; 32], bytes: &[u8]) -> Result<(), Error> {
+    let proof = DeviceProof {
+        io: *io,
+        proof: decode(bytes)?,
+    };
+    crate::masked::device::verify_device::<Blake2sM31MerkleChannel>(&FORMAT, program, &proof)
 }
 
 /// `kernel`'s run on `arguments`, traced to its halt.

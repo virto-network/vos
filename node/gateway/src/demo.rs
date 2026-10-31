@@ -3,7 +3,7 @@
 //! credential actor and the `purses` ledger of one agent. *Sign in* offers
 //! the credential proof (the poll's `login`) and, where the file names the
 //! device actor, a device proof of its kernel `auth` (its `login`, whose
-//! guard names that kernel; 7.20): the enrollment pins the kernel's bytes,
+//! guard names that kernel): the enrollment pins the kernel's bytes,
 //! which the device proves under the device profile. The proofs are
 //! the member's device's: the client's `vos.credential` facility, which the
 //! app asks and whose answer, a node-API `Credentialed` request, the gateway
