@@ -39,7 +39,8 @@ use vos_pvm_proof::side_note::SideNote;
 use vos_pvm_recair_air::masked::MaskedComponents;
 
 use super::{
-    Checks, Committed, MaskRng, MaskStats, MaskedProof, MaskedProvers, MaskedTrace, mask_rows,
+    Checks, Committed, MaskRng, MaskStats, MaskedProof, MaskedProvers, MaskedTrace, Reveal,
+    mask_rows, reveals,
 };
 use crate::prove::ProveError;
 use crate::trace::FirstRowFraction;
@@ -92,6 +93,21 @@ pub fn device_floors(format: &Format, active: u32) -> Option<Vec<u32>> {
     let chips = vos_pvm_proof::masked::Device::chips(active)?;
     let layout = DeviceComponents::layout(active, &vec![any; chips.len()])?;
     Some(mask_rows(format, &layout)?.iter().map(|h| h + 2).collect())
+}
+
+/// What each of the chips `active` names, at `log_sizes`, reveals of its
+/// randomizer under `format` ([`Reveal`]), beside its `log2 h`
+/// ([`mask_rows`]), in `DEVICE_ORDER`. `None` for an unmasked format or a
+/// shape the device set refuses.
+pub fn device_reveals(
+    format: &Format,
+    active: u32,
+    log_sizes: &[u32],
+) -> Option<Vec<(Reveal, u32)>> {
+    let layout = DeviceComponents::layout(active, log_sizes)?;
+    let reveals = reveals(format, &layout)?;
+    let rows = mask_rows(format, &layout)?;
+    Some(reveals.into_iter().zip(rows).collect())
 }
 
 /// The device shape of kernel `blob` under `format`: the chips its code can

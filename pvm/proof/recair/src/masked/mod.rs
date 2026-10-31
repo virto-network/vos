@@ -121,6 +121,34 @@ pub(crate) fn lifting_log_size(format: &Format, log_sizes: &[u32]) -> Option<u32
 /// not fit its trees.
 pub fn mask_rows(format: &Format, set: &impl MaskedComponents) -> Option<Vec<u32>> {
     let format_rows = format.masking?.log_mask_rows;
+    reveals(format, set)?
+        .into_iter()
+        .map(|reveal| {
+            if reveal.offsets == 0 {
+                return Some(format_rows);
+            }
+            let rows = reveal.rows.checked_mul(2)?.checked_next_power_of_two()?;
+            Some(rows.ilog2().min(format_rows))
+        })
+        .collect()
+}
+
+/// The most a component's masked column reveals of its randomizer in one
+/// transcript (`docs/design/proving.md` §5's count): its widest set of
+/// offsets `O` (0 when none of its masked columns is sampled) and
+/// `4|O| + q(|O| + 1)` rows, four for each out-of-domain sample, one for
+/// each of the `q` decommitted queries and one for each of the
+/// composition's `|O|` reads at a query. Coinciding points reveal fewer;
+/// R1 counts a transcript's own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reveal {
+    pub offsets: usize,
+    pub rows: usize,
+}
+
+/// [`Reveal`] for each of `set`'s components under `format`'s queries.
+/// `None` for a set with no component, or a count that overflows.
+pub fn reveals(format: &Format, set: &impl MaskedComponents) -> Option<Vec<Reveal>> {
     let queries = format.params.n_queries;
     let air_level = air::air_log_size(set)?;
     set.components()
@@ -134,14 +162,10 @@ pub fn mask_rows(format: &Format, set: &impl MaskedComponents) -> Option<Vec<u32
                 .map(Vec::len)
                 .max()
                 .unwrap_or(0);
-            if offsets == 0 {
-                return Some(format_rows);
-            }
-            let revealed = offsets
+            let rows = offsets
                 .checked_mul(4)?
                 .checked_add(queries.checked_mul(offsets.checked_add(1)?)?)?;
-            let rows = revealed.checked_mul(2)?.checked_next_power_of_two()?;
-            Some(rows.ilog2().min(format_rows))
+            Some(Reveal { offsets, rows })
         })
         .collect()
 }
