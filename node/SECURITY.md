@@ -31,7 +31,11 @@ holds is `pvm/device/SECURITY.md`'s, and what a verified proof proves is
   access and over QUIC to the client keys it lists in `gateways`, a
   transport's admission and no authority. Its operator commands are
   signed by a key it lists in `operators`, each for that node, with a
-  nonce and an expiry; no bearer token admits one.
+  nonce and an expiry; no bearer token admits one. This holds of
+  `vos-gateway`, a process apart from the node; the SSH demo's binary
+  (`node/gateway/demo`) runs a node, its gateway and its operator in one
+  process, so there the gateway's process holds the node's keys and the
+  operator's: the demo's arrangement, not a deployment's.
 - **The node's clock** (`Time`) is unsigned. A relay that lies about it
   makes the client pick an expiry the node refuses, which costs a new
   proof; it cannot extend a proof's life, since ingress judges the expiry
@@ -53,7 +57,7 @@ frame checks and the agent's placement come first, as for any call):
    `SpaceId`, and no proof may bind `NONE`;
 5. the format is one this node admits for a credential (`Format`): the
    credential format the proof registry names, as the final verifier pins
-   it, and the device format, 45;
+   it, and the device format, 46;
 6. the proof within its format's cap (512 KiB for a credential proof,
    1.5 MiB for a device proof), the arguments within `cap::REQUEST`
    (`Size`);
@@ -158,6 +162,17 @@ serve its requests:
   activity in one scope), each payment's owner digest (a public payer),
   each credentialed call's arguments in clear, and the metadata every
   call leaks.
+- **From the root an auth call names.** The log keeps each auth call's
+  `map_root` (`CredentialedInput.root`), which the apply checks for
+  freshness. A member proves against the root of its last fetched path
+  until its next refresh: while the tree changes often, few members hold
+  one root at once, so the roots logged on calls in different scopes link
+  those calls' pseudonyms to one holder, a fingerprint across scopes that
+  the nullifiers keep apart. The next slice's fix: the library fetches
+  its path at every moved root, so every online member proves against
+  the newest, or the log keeps the root's position in the ring (the
+  newest, or how many roots it trails) in place of the root
+  (`identity-and-authority.md` §7).
 - **From a tree change:** every online member's library fetches its path
   within 10 s of seeing `root()` move, so each enrollment or revocation
   shows which member digests are online then; the spread, and the

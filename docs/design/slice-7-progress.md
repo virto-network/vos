@@ -6365,6 +6365,12 @@ acceptance") at `vos-core` `2f70c200`.
     caught the phone's home screen).
   - The first attempt, during session P4 (2026-10-30), ended when the
     blowup-8 bench cell's memory pressure killed the foreground app.
+  - **What the demo does not show** (noted at the slice-end review): the
+    demo binary runs the node, its gateway and its operator in one
+    process (`node/gateway/demo/src/lib.rs`, `LocalSpace`), so its
+    gateway's process holds the node's keys and the operator's. "The
+    gateway holds no authority" is a property of `vos-gateway`, a process
+    apart from the node, which PG3 did not run (`node/SECURITY.md`).
 
 **Reviews:** Fable on 7.8a (merge; L1–L4 folded), 7.9 (merge; L1–L6
 folded, L4's quiet re-measure handed off), 7.10 (accept; M1, M2, L1–L6
