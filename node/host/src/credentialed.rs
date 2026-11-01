@@ -216,9 +216,9 @@ impl Inner {
         let (snapshot, front, program) = match front.kernel {
             None => (snapshot, front, None),
             Some(kernel) => match self.device_program(kernel).await {
-                // Its program may have been computed meanwhile: the rest
-                // is checked on the state as it is now, against the
-                // kernel the program is of.
+                // The lookup awaited, and the state may have moved (an
+                // install, a guard): the rest is checked on the state as
+                // it is now, against the kernel the program is of.
                 Ok(Some(program)) => {
                     let snapshot = self.store.snapshot();
                     let front = match self.front(&snapshot, agent, &call) {

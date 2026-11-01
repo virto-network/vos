@@ -138,6 +138,8 @@ type Held = ([u8; 32], [u8; 16]);
 pub(crate) struct Nonces {
     store: Fjall,
     recorded: Mutex<Recorded>,
+    /// Held across a record's write, so the floor stored never goes back.
+    writing: smol::lock::Mutex<()>,
     /// The most kept at once: past them, a command is answered `Busy`.
     most: usize,
 }
@@ -163,6 +165,8 @@ fn may_forget(expires: u64, now: u64) -> bool {
 /// Why a nonce was not recorded.
 enum Unrecorded {
     Replayed,
+    /// At or below the floor.
+    Floor,
     Full,
 }
 
@@ -201,9 +205,18 @@ impl Nonces {
             batch.operator_floor(recorded.floor);
             batch.commit(PersistMode::SyncAll)?;
         }
+        if recorded.floor > now.saturating_add(HORIZON_MS) {
+            tracing::warn!(
+                floor = recorded.floor,
+                now,
+                "the operators' nonce floor is ahead of this node's clock, which ran ahead: \
+                 operator commands are refused until the clock passes it"
+            );
+        }
         Ok(Self {
             store: store.clone(),
             recorded: Mutex::new(recorded),
+            writing: smol::lock::Mutex::new(()),
             most,
         })
     }
@@ -221,8 +234,11 @@ impl Nonces {
     ) -> Result<Forgotten, Unrecorded> {
         let mut recorded = lock(&self.recorded);
         let Recorded { nonces, floor } = &mut *recorded;
-        if nonces.contains_key(&(key, nonce)) || expires <= *floor {
+        if nonces.contains_key(&(key, nonce)) {
             return Err(Unrecorded::Replayed);
+        }
+        if expires <= *floor {
+            return Err(Unrecorded::Floor);
         }
         let mut forgotten = Vec::new();
         let mut raised = None;
@@ -276,9 +292,10 @@ impl Api {
             return Err(refused(OperatorRefusal::Expiry { now }));
         }
         // At or below the floor, a command may be a replay of one whose
-        // nonce was forgotten under a clock since stepped back.
+        // nonce was forgotten under a clock since stepped back: it is
+        // answered as expired, by the node's time.
         if kind.records_nonce() && expires_ms <= self.nonces.floor() {
-            return Err(refused(OperatorRefusal::Replayed));
+            return Err(refused(OperatorRefusal::Expiry { now }));
         }
         let checked = self
             .inner
@@ -316,10 +333,17 @@ impl Api {
                 {
                     Ok(forgotten) => forgotten,
                     Err(Unrecorded::Replayed) => return Err(refused(OperatorRefusal::Replayed)),
+                    Err(Unrecorded::Floor) => {
+                        return Err(refused(OperatorRefusal::Expiry { now }));
+                    }
                     Err(Unrecorded::Full) => return Err(Response::Busy),
                 };
             // Synced before the command runs: a command that ran is refused
             // after a restart.
+            // One write at a time, each storing the floor as it is then: a
+            // later raise never lands before an earlier one.
+            let _writing = self.nonces.writing.lock().await;
+            let floor = floor.map(|_| self.nonces.floor());
             let store = self.nonces.store.clone();
             let (nonce, expires) = (operated.nonce, operated.expires_ms);
             let written = self
@@ -434,7 +458,7 @@ mod tests {
         // the horizon still refuses its replay.
         assert!(matches!(
             nonces.insert([1; 32], [1; 16], 10, 0),
-            Err(Unrecorded::Replayed)
+            Err(Unrecorded::Floor)
         ));
     }
 

@@ -26,6 +26,14 @@ statements service's controls. First, how an operator reaches a node.
   header, and no token admits one. A space file's last column is each
   node's contact, which redirects carry: its gateway's URL, or its API's
   `quic://` address.
+- A node keeps each operator command's nonce until two minutes past its
+  expiry, and then the latest expiry it forgot (the floor), for good: a
+  command expiring no later is refused `Expiry`, so a replay is refused
+  even under a clock stepped back. A node whose clock ran ahead, and
+  forgot nonces while it did, refuses every operator command once its
+  clock is set right, until real time passes the floor (it warns at its
+  start); the reads (`Stats`, `Status`) still answer. Keep the node's
+  clock synchronized.
 - Every node of a space spreads its groups' frames over the same number
   of streams a peer, `peer_lanes` (1,024; the settings file names none,
   an embedder's `Config` may). A node whose pair heartbeat names other

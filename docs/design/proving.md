@@ -1640,7 +1640,8 @@ install it (or restarted), once a device proof naming the kernel passes
 the checks before the binding, one computation however many requests
 wait, then keeps its verifier. A run is traced with at most 2^18 gas
 (`device::GAS`): the CPU's most steps, and as much again for its
-Poseidon2 calls. Auth's arguments to a
+Poseidon2 calls (about 109 a run, fewer as its steps grow; a kernel past
+them fails its install out of gas). Auth's arguments to a
 device kernel are the 32 siblings from the leaf's level up, the secret's
 32 bytes, the slot (four little-endian bytes) and the 129 public bytes,
 in that order (`auth_arguments`), which `vos-device`'s

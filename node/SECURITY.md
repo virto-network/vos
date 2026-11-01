@@ -114,8 +114,9 @@ again. The binding names the program's id; the io-hash is `H_io` of the
 request's auth words, computed here (each word below `p`, as a credential
 proof's), so the proof's bytes carry no statement of their own. A run is
 traced with at most 2^18 gas (`device::GAS`, twice the most steps a
-program's CPU holds), so neither the
-install nor a device traces far past a program's shape.
+program's CPU holds; about 109 Poseidon2 calls, fewer as its steps
+grow), so neither the install nor a device traces far past a program's
+shape.
 
 **A device kernel is trusted as its actor's code is.** It is the
 installed actor's own attestable method, and what its proof states is

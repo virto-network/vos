@@ -265,7 +265,7 @@ fn a_replay_under_a_clock_stepped_back_past_the_horizon_is_refused() {
     let later = served.operated(Kind::CreateAgent, Vec::new());
     assert!(matches!(ask(&later), Response::Created(_)));
     served.clock.store(start, Ordering::SeqCst);
-    assert_eq!(ask(&first), refused(OperatorRefusal::Replayed));
+    assert_eq!(ask(&first), refused(OperatorRefusal::Expiry { now: start }));
 }
 
 /// Past the nonces kept, a command is busy; a read still runs.
