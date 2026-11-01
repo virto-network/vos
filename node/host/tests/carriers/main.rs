@@ -43,3 +43,12 @@ mod harness;
 
 mod audit;
 mod credentials;
+
+/// Every debug output's environment, set once in the process before its
+/// first run starts a thread: each run is audited with them on.
+fn debug_environment() {
+    static SET: std::sync::Once = std::sync::Once::new();
+    // SAFETY: once, before the process's first run starts any thread that
+    // reads the environment; its tests run one at a time.
+    SET.call_once(|| unsafe { vos_checker::carriers::debug_environment_on() });
+}

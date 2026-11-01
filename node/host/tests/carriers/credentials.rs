@@ -19,12 +19,14 @@
 //! fetched on one of their own.
 //!
 //! Carriers that leave the device: every byte of each API connection each
-//! way, every request and answer over HTTP and through the gateway, each
+//! way, every request and its answer's status and body over HTTP and
+//! through the gateway, each
 //! credentialed call's log entry on each node, the device library's
 //! values as its `Debug` and `Display` show them, every log line of the
 //! process at every level (the nodes', the gateway's), and standard
-//! error. Searched there: the secret, the proofs' masks and the member's
-//! place, but in the path's own fetch, which holds the place by design.
+//! error. Searched there: the secret (`s`'s single words among it), the
+//! proofs' masks and the member's place, but in the path's own fetch,
+//! which holds the place by design.
 //! Carriers within the replicas (their stores, logs, work results, disks
 //! and frames), which hold the members' digests and the tree, are searched
 //! for the secret and the masks.
@@ -46,6 +48,7 @@ use vos_device::{
     DeviceProgram, Prover, ProverConfig, Threads,
 };
 use vos_node::client::{self, Client, Target};
+use vos_node::store::EntryKind;
 use vos_pvm_final_verifier::credential as verifier;
 use vos_pvm_recair::credential::{AuthPublic, AuthWitness as CircuitWitness, Statement, prove};
 use vos_pvm_recair::masked::{MaskRng, drawn_in};
@@ -314,6 +317,7 @@ fn credentialed_steps(node: &vos_node::Node, agent: AgentId) -> Vec<Step> {
     let through = node.applied(agent).unwrap_or(0);
     (1..=through)
         .filter_map(|index| node.store().log_entry(agent, index).ok().flatten())
+        .filter(|entry| entry.kind == EntryKind::Result)
         .filter_map(|entry| WorkResult::decode(&entry.body).ok())
         .flat_map(|(result, _)| result.steps)
         .filter(|step| match step {
@@ -326,6 +330,7 @@ fn credentialed_steps(node: &vos_node::Node, agent: AgentId) -> Vec<Step> {
 
 #[test]
 fn no_carrier_holds_a_members_device_secret_or_its_place() {
+    crate::debug_environment();
     let stderr = carriers::Stderr::capture(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")));
     let logs = Logs::install();
     let founded = Founded::new();
@@ -565,7 +570,26 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
         .collect();
     let front = Front::serve(upstreams, GATEWAY);
     let http = Target::loopback(&format!("http://{}", founded.cluster.ingress(at))).unwrap();
-    let mut https: Vec<(String, Credentialed, Response)> = Vec::new();
+    // Each request's bytes and each answer's status and body as they came.
+    let mut https: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
+    let route = format!("/agents/{}/credentialed", agent.0);
+    let mut post = |name: String, target: &Target, call: &Credentialed| {
+        let body = call.encode();
+        let (status, answer) = client::post(target, &route, &body).unwrap();
+        let decoded = Response::decode_exact(&answer).expect("an answer");
+        let kept = [
+            status.to_string().into_bytes(),
+            answer,
+            format!("{decoded:?}").into_bytes(),
+        ]
+        .concat();
+        https.push((
+            name,
+            [body, format!("{call:?}").into_bytes()].concat(),
+            kept,
+        ));
+        decoded
+    };
     for (name, target) in [("the node's HTTP", &http), ("the gateway", front.target())] {
         let call = founded.call(at, POLL, "login", ());
         let proof = prover
@@ -573,7 +597,7 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
             .unwrap();
         let mut cut = request(&call, &proof);
         cut.proof.pop();
-        let answer = client::credentialed(target, agent, &cut).unwrap();
+        let answer = post(format!("{name}: a cut proof"), target, &cut);
         assert_eq!(
             answer,
             Response::Rejected(vos_wire::ingress::Rejection::Credential(
@@ -581,9 +605,11 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
             )),
             "{name}"
         );
-        https.push((format!("{name}: a cut proof"), cut, answer));
-        let whole = request(&call, &proof);
-        let answer = client::credentialed(target, agent, &whole).unwrap();
+        let answer = post(
+            format!("{name}: a sign-in"),
+            target,
+            &request(&call, &proof),
+        );
         assert!(
             matches!(
                 answer,
@@ -594,7 +620,6 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
             ),
             "{name}: {answer:?}"
         );
-        https.push((format!("{name}: a sign-in"), whole, answer));
     }
 
     // Frame errors, each closing its connection: a frame of no kind, and
@@ -635,7 +660,7 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
         ]
         .concat(),
     );
-    front.block_on(async { tracing::trace!(canary = CANARY, "a gateway's task") });
+    front.run(async { tracing::trace!(canary = CANARY, "a gateway's task") });
     eprintln!("{CANARY}: standard error");
 
     // The device library's values, as a client's log would show them.
@@ -683,17 +708,9 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
     for (name, socket) in &errors {
         socket.carriers(&mut audit, &format!("a frame {name}"));
     }
-    for (name, call, answer) in https {
-        audit.carrier(
-            format!("{name}: the request"),
-            Reach::Leaves,
-            [call.encode(), format!("{call:?}").into_bytes()].concat(),
-        );
-        audit.carrier(
-            format!("{name}: the answer"),
-            Reach::Leaves,
-            [answer.encode(), format!("{answer:?}").into_bytes()].concat(),
-        );
+    for (name, request, answer) in https {
+        audit.carrier(format!("{name}: the request"), Reach::Leaves, request);
+        audit.carrier(format!("{name}: the answer"), Reach::Leaves, answer);
     }
     audit.carrier(
         "the device library's values",

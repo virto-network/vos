@@ -103,18 +103,12 @@ fn no_carrier_that_leaves_the_prover_role_holds_a_small_value() {
     run(Values::Small);
 }
 
-/// The environment set once in the process, before its first run starts
-/// a thread.
-static DEBUG_ENVIRONMENT: std::sync::Once = std::sync::Once::new();
-
 fn run(values: Values) {
     let floor = match values {
         Values::Wide => carriers::ROW_FLOOR,
         Values::Small => carriers::SMALL_FLOOR,
     };
-    // SAFETY: once, before the process's first run starts any thread that
-    // reads the environment; its tests run one at a time.
-    DEBUG_ENVIRONMENT.call_once(|| unsafe { carriers::debug_environment_on() });
+    crate::debug_environment();
     let stderr = carriers::Stderr::capture(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")));
     let logs = Logs::install();
     let anchoring = Anchoring::new();

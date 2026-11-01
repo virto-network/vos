@@ -255,7 +255,8 @@ impl Cluster {
         *slot.held.lock().unwrap() = Some(HeldPort::tcp(slot.ingress));
     }
 
-    /// Node `number`'s data directory.
+    /// Node `number`'s data directory: the carrier audit's.
+    #[allow(dead_code)]
     pub fn dir(&self, number: NodeNumber) -> &std::path::Path {
         self.slot(number).dir.path()
     }
