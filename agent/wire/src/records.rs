@@ -48,13 +48,21 @@ pub struct Kernel {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Shape {
     /// The version of the policy that chose the classes and sized them
-    /// (`vos_pvm_compiler::shape::POLICY`): a new policy derives other
+    /// ([`Shape::POLICY`]): a new policy derives other
     /// shapes from the same code, so a record names the one it holds.
     pub policy: u32,
     /// Bit i: chip i of the segment AIR, in its order.
     pub chips: u32,
     /// Cheapest first, at most [`MAX_CLASSES`].
     pub classes: Vec<SegmentClass>,
+}
+
+impl Shape {
+    /// The shape policy's version (`vos_pvm_compiler::shape`'s classes and
+    /// each chip's capacity in them): a change to either derives other
+    /// shapes from the same code, so it takes a new version, and a record
+    /// of another version is refused where it is read.
+    pub const POLICY: u32 = 2;
 }
 
 /// A class of segment: the cut it holds its segments to, and the log size

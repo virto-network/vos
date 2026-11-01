@@ -44,10 +44,8 @@ const SELECTED: u32 = 1 << chip::BLAKE2B
 pub const ALWAYS: u32 = ((1 << SEGMENT_CHIPS) - 1) & !SELECTED;
 
 /// The version of the policy below, the classes and each chip's capacity
-/// in them, that a shape's record names (`Shape::policy`): a change to
-/// either derives other shapes from the same code, so it takes a new
-/// version.
-pub const POLICY: u32 = 2;
+/// in them, that a shape's record names (`Shape::policy`).
+pub const POLICY: u32 = Shape::POLICY;
 
 /// The classes a kernel's segments prove at, cheapest first, as
 /// `(log_steps, pages)`: a short segment's; the 32k cut's; and a short

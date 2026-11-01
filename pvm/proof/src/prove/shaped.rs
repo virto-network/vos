@@ -93,7 +93,9 @@ pub struct KernelSegment {
 /// rows need more refuses it before any commitment; a class of fewer steps
 /// than the window's is skipped, as its CPU holds a row a step. A window
 /// none holds is cut in half, down to one step; a step no class holds is
-/// refused with [`ProvingError::Shape`].
+/// refused with [`ProvingError::Shape`]: one touching more pages than the
+/// largest class's (24, or 17 for a shape holding the Poseidon2 chip), as
+/// a witness-input call writing more than about 64 KiB at once.
 pub fn prove_kernel(
     full: &SideNote,
     shape: &KernelShape,

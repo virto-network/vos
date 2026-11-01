@@ -45,6 +45,14 @@
 //! Its schema kind is `Device`, and an auth guard's `device = "..."` must
 //! name one.
 //!
+//! **A step's pages fit a class:** a node cuts a kernel's run before a
+//! step, never inside one, so a step touching more pages than the shape's
+//! largest class (24, or 17 for a kernel holding the Poseidon2 chip,
+//! [`crate::shape::POSEIDON2_CLASSES`]) has no proof: a witness-input call
+//! writing more than about 64 KiB at once (`vos_wire::abi::precompile::
+//! WITNESS_INPUT`). The derivation does not see a run's calls; a kernel
+//! reads a larger input in several.
+//!
 //! **A kernel's leaf fits the recursion:** each class of its shape gives a
 //! leaf whose rows, bounded from the shape alone ([`crate::leaf`]), fit the
 //! recursion AIR's padded shape; a kernel past it is refused, naming the

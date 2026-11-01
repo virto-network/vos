@@ -306,3 +306,38 @@ fn a_node_kernels_seventeen_page_class_proves_in_its_leaf() {
     let proofs: Vec<Proof> = segments.into_iter().map(|segment| segment.proof).collect();
     verify_kernel_chain(proofs, &program, &entry).expect("the chain verifies");
 }
+
+/// A step past the chip's largest class has no proof, and says so: the
+/// kernel reading twenty pages of argument in one witness call, a step
+/// whose pages no class holds (17 at most with the chip), is refused with
+/// the chip whose size passes its pin, not cut or proved wrong.
+#[test]
+fn a_witness_read_past_the_largest_class_is_refused_as_a_shape() {
+    const PAST: i32 = 20 * 4096;
+    let blob = blob_reading(PAST);
+    let record = record(&blob);
+    let largest = record.shape.classes.iter().map(|class| class.pages).max();
+    assert_eq!(largest, Some(17));
+    let (program, _) = vos_pvm_recair::leaf::kernel_program(
+        &blob,
+        &record,
+        vos_pvm_compiler::TRANSPILER_VERSION,
+        &SEGMENT,
+    )
+    .expect("the kernel's program");
+    let mut input = witness();
+    input.extend((0..PAST).map(|i| i as u8));
+    let full = run_on(&blob, &input);
+    match prove_kernel(&full, &program.shape, 0, &SEGMENT) {
+        Err(
+            error @ vos_pvm_proof::ProvingError::Shape {
+                log_size, pinned, ..
+            },
+        ) => {
+            assert!(log_size > pinned, "{error}");
+            eprintln!("refused: {error}");
+        }
+        Err(error) => panic!("refused otherwise: {error}"),
+        Ok(segments) => panic!("proved in {} segments", segments.len()),
+    }
+}

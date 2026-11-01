@@ -448,6 +448,11 @@ impl BuiltInComponent for MulChip {
                         * (result[i].clone() - upl[i].clone() - mul_high[i].clone()),
                 );
             }
+            // The low half's gate is IsShloR without the padding factor:
+            // inert, as a gate only adds constraints, and a padding row's
+            // tuple is consumed at multiplicity −is_real = 0, so its
+            // IsShloR binds nothing; the CPU's rows that produce a shift
+            // have IsMul, which padding pins to 0.
             for i in 0..WORD_SIZE {
                 let shifted = result[i].clone()
                     - mul_high[i].clone()
