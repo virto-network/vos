@@ -10,22 +10,14 @@ use std::process::Command;
 use vos_checker::carriers::{Audit, Kind, Reach};
 use vos_pvm_recair::device::{auth_arguments, auth_public};
 use vos_wire::SpaceId;
-use vos_wire::credentials::{self as tree, DEPTH, EMPTY, Siblings, Tag, Words, leaf, root_of};
+use vos_wire::credentials::{self as tree, Siblings, Tag, leaf, root_of};
 use vos_wire::ids::{AgentId, InstanceId};
 
-/// The bench's own fixed member (`main.rs`): its source's output and the
-/// space's handle, its slot and its path's occupied siblings.
-const SOURCE_OUTPUT: [u8; 32] = [0x6f; 32];
-const HANDLE: [u8; 32] = [0x48; 32];
-const SLOT: u32 = 0x1234_5678;
+#[allow(dead_code)]
+#[path = "../src/member.rs"]
+mod member;
 
-fn siblings() -> [Words; DEPTH] {
-    let mut siblings: [Words; DEPTH] = core::array::from_fn(|level| EMPTY[level]);
-    for (n, level) in [0, 5, 17].into_iter().enumerate() {
-        siblings[level] = core::array::from_fn(|i| (n as u32 + 1) * 1_000_003 + i as u32);
-    }
-    siblings
-}
+use member::{HANDLE, SLOT, SOURCE_OUTPUT, siblings};
 
 /// The bench run with `args`: its standard output and error, as carriers.
 fn run(audit: &mut Audit, name: &str, args: &[&str]) {

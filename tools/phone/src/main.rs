@@ -49,16 +49,16 @@ use vos_device::{
     AuthWitness, Call, Digest, Prover, ProverConfig, Threads, derive_secret, member, verify,
     verify_joint,
 };
-use vos_wire::credentials::{DEPTH, EMPTY, leaf, root_of};
+use vos_wire::credentials::{leaf, root_of};
 
 mod device;
+mod member;
+
+use member::{HANDLE, SLOT, SOURCE_OUTPUT};
 
 /// The cells, in order.
 const CELLS: [&str; 3] = ["auth", "owner", "joint"];
-/// The fixed handle, source output, slot and guard name of every cell.
-const HANDLE: [u8; 32] = [0x48; 32];
-const SOURCE_OUTPUT: [u8; 32] = [0x6f; 32];
-const SLOT: u32 = 0x1234_5678;
+/// The guard name of every cell.
 const NAME: &[u8] = b"login";
 /// The seeded build's masks.
 #[cfg(feature = "seeded")]
@@ -78,13 +78,9 @@ fn call() -> Call {
     }
 }
 
-/// The member's path in a tree whose other leaves are a few fixed
-/// digests: the siblings at levels 0, 5 and 17 occupied.
+/// The member's path ([`member::siblings`]).
 fn witness(member: &Digest) -> AuthWitness {
-    let mut siblings: [[u32; 8]; DEPTH] = core::array::from_fn(|level| EMPTY[level]);
-    for (n, level) in [0, 5, 17].into_iter().enumerate() {
-        siblings[level] = core::array::from_fn(|i| (n as u32 + 1) * 1_000_003 + i as u32);
-    }
+    let siblings = member::siblings();
     let root = root_of(&leaf(&member.0), SLOT, &siblings);
     AuthWitness {
         root: Digest(root),
