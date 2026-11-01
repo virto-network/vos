@@ -6291,11 +6291,37 @@ the CPU's single-caller helpers inlined; stale comments and widths;
 `proving.md`'s derive and retired lists. A test `just check` caught: the
 device kernel runs alike on a node's runner now.
 
+**Owner (S64, 2026-11-01):** `POSEIDON2_CLASSES` accepted: kernels
+holding the chip take (12, 8), (15, 8) and (12, 17); kernels without it
+keep 24 pages.
+
+**Review (Fable, at `f6ace70b0`): SOUND TO MERGE**, no soundness finding.
+Folded, no AIR change and no re-pin:
+- **F1 (Low, liveness):** the cutter cuts only before a step, so one step
+  touching more pages than the largest class (17 with the chip, 24
+  without; a witness-input read over about 64 KiB in one call) has no
+  proof. Documented in `derive`'s, `prove_kernel`'s and `WITNESS_INPUT`'s
+  docs; a test reads 20 pages in one call and `prove_kernel` refuses it
+  with `ProvingError::Shape` (chip 4 at 2^19, its shape 2^18). Serving
+  reads in chunks would change the witness ABI across the runtime, the
+  tracer, the agent and the testkit, so it is not built.
+- **F2 (Low):** `Shape::policy` was not checked on load. The policy is
+  `vos_wire::records::Shape::POLICY` (2), the compiler's `POLICY` is it,
+  and `KernelShape::try_from` refuses a record of another policy (tested,
+  one below and one above).
+- **F3 (Info):** MulChip's `ShloR` gate on the low half lacks the padding
+  factor: inert (a padding row's tuple is consumed at multiplicity
+  −is_real = 0, and the producer's `IsMul` is 0 on padding); a comment
+  says so, the AIR is as it was.
+- **F4, F5 (Info):** no change asked; the AIR is as it was.
+
+Gates after the folds: `just check` exit 0, 1,696 passed in 125 suites;
+`just test-proof` exit 0, 599 passed in 58 suites.
+
 **Left:**
-- The owner's call on `POSEIDON2_CLASSES` (above).
 - An install record stored before 7.21 decodes wrongly (26 log sizes a
-  class, the chips' bits moved): pre-production, no store is migrated;
-  `Shape::policy` is not read on load.
+  class, the chips' bits moved): pre-production, no store is migrated; a
+  record's policy is now checked on load.
 - s4's comments naming 43; a phone session at 46 (P8's pass).
 - Node kernels' before/after x86 time on one machine (only the
   throughput test against slice 6's 46.5 s here).

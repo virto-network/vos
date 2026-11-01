@@ -411,3 +411,11 @@ S61. **A device program's log sizes**: from the installed kernel's run on
   a fixed public auth statement (`auth_reference`), computed alike by
   every node and the phone; not declared in the schema. Each further
   device statement kind brings its own reference input.
+
+## On 7.21's review (2026-11-01)
+
+S64. **The Poseidon2 chip's classes**: Poseidon2-holding kernels' third
+  shape class is 17 pages, (12,8), (15,8), (12,17); kernels without the
+  chip keep 24. A single step touching more pages than the largest class
+  (a witness-input read over about 64 KiB in one call) has no proof; the
+  cap is stated in `derive`'s and the kernel ABI's docs. (2026-11-01)
