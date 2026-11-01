@@ -21,7 +21,7 @@ use vos_statement::{ProgramId, Statement};
 use vos_testkit::Step;
 use vos_testkit::Testkit;
 use vos_testkit::programs::{derivation, derived, method, package, table_tag};
-use vos_tree::{BatchProof, Blake2b, Hash, Leaf, MemStore};
+use vos_tree::{BatchProof, Blake2b, Hash, MemStore};
 use vos_venue::{ModelVenue, VenueClient};
 use vos_wire::abi::cap::Target;
 use vos_wire::abi::{AttestError, Failure};
@@ -117,20 +117,6 @@ impl Rng {
     }
 }
 
-/// A tree over `writes`, salted from `seed`, into `store`: its root.
-fn put(store: &mut MemStore, seed: &[u8; 32], writes: &[(Vec<u8>, Vec<u8>)]) -> Hash {
-    let mut leaves: Vec<(Vec<u8>, Option<Leaf>)> = writes
-        .iter()
-        .map(|(key, value)| (key.clone(), Some(Leaf::salted(&Blake2b, seed, key, value))))
-        .collect();
-    leaves.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut root = [0; 32];
-    for batch in leaves.chunks(1 << 16) {
-        root = vos_tree::update(&Blake2b, store, batch).expect("the tree updates");
-    }
-    root
-}
-
 /// The representative's side of a cut: its root, the agent's leaf's salt
 /// and the path of the agent's row (or of its absence).
 #[derive(Clone)]
@@ -145,9 +131,8 @@ impl Representative {
     /// `window − 2..=window`, the others random; `agent`'s at `window`
     /// `agent_root`, or, unless `reported`, none.
     pub fn new(agent: AgentId, window: u64, agent_root: Hash, agents: u32, reported: bool) -> Self {
-        let seed = [7u8; 32];
         let mut rng = Rng(0x7e9_0000 + u64::from(agents));
-        let mut writes = Vec::with_capacity(3 * agents as usize);
+        let mut roots = Vec::with_capacity(3 * agents as usize);
         let others = (1..=agents).filter(|other| *other != agent.0);
         for other in others.chain([agent.0]) {
             for at in window - 2..=window {
@@ -159,20 +144,12 @@ impl Representative {
                     }
                     root = agent_root;
                 }
-                let key = representative_row(AgentId(other), RootKind::Space, at);
-                writes.push((key, root.to_vec()));
+                roots.push((AgentId(other), at, root));
             }
         }
-        let mut store = MemStore::default();
-        let root = put(&mut store, &seed, &writes);
-        let key = representative_row(agent, RootKind::Space, window);
-        Self {
-            root,
-            salt: vos_tree::salt(&Blake2b, &seed, &key),
-            path: BatchProof::generate(&store, std::slice::from_ref(&key))
-                .expect("proves")
-                .encode(),
-        }
+        let (root, salt, path) =
+            vos_testkit::served::representative(&[7u8; 32], &roots, (agent, window));
+        Self { root, salt, path }
     }
 }
 
@@ -203,7 +180,7 @@ impl Cut {
         let seed = [2u8; 32];
         others.extend(known.iter().cloned());
         let mut agent_tree = MemStore::default();
-        let agent_root = put(&mut agent_tree, &seed, &others);
+        let agent_root = vos_testkit::served::salted_tree(&mut agent_tree, &seed, &others);
         drop(others);
         Self {
             space,

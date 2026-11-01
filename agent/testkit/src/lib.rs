@@ -15,6 +15,7 @@ mod invocation;
 mod memory;
 pub mod node;
 pub mod programs;
+pub mod served;
 mod workflows;
 
 use std::collections::BTreeMap;

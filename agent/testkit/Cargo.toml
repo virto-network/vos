@@ -12,7 +12,8 @@ vos-pvm = { workspace = true }
 # For `programs` only: linking and deriving the guest programs tests and
 # benches load.
 vos-pvm-compiler = { workspace = true }
-# The tree's longest key, which a read at a cut's rows are held to.
+# The tree's longest key, which a read at a cut's rows are held to, and
+# the served rows' trees (`served`).
 vos-tree = { workspace = true }
 vos-wire = { workspace = true }
 

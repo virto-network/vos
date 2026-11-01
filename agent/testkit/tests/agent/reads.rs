@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use vos_pvm_compiler::Derived;
 use vos_testkit::programs::{derived, kernel, method, package};
 use vos_testkit::{Testkit, run_kernel};
-use vos_tree::{BatchProof, Blake2b, Leaf, MemStore};
+use vos_tree::{BatchProof, Blake2b, MemStore};
 use vos_wire::abi::cap::{self, Target};
 use vos_wire::abi::{AttestError, Failure, Kind, price};
 use vos_wire::batch::{Body, Input, Message, Request};
@@ -24,7 +24,7 @@ use vos_wire::ids::{AgentId, InstanceId, MethodId, ProgramHash, RequestId, Sessi
 use vos_wire::keys::{self, Due, Transform};
 use vos_wire::records::{PendingRead, Workflow, WorkflowState, unstored, unversioned};
 use vos_wire::result::{Attest, InputRef, Outcome, Run, Step, WorkResult};
-use vos_wire::served::{Served, representative_row, space_root};
+use vos_wire::served::{Served, space_root};
 use vos_wire::vos_anchor::{MIN_LENGTH_MS, RootKind, RootRead, VenueId};
 use vos_wire::{Decode, Encode, SpaceId, WindowClock, defaults};
 
@@ -356,17 +356,7 @@ type Change = (&'static str, fn(&mut Served));
 /// A tree over `rows`, each leaf salted from `seed`: its store and root.
 fn tree(seed: &[u8; 32], rows: Vec<(Vec<u8>, Vec<u8>)>) -> (MemStore, [u8; 32]) {
     let mut store = MemStore::default();
-    if rows.is_empty() {
-        return (store, vos_tree::empty_root(&Blake2b));
-    }
-    let leaves: Vec<(Vec<u8>, Option<Leaf>)> = rows
-        .into_iter()
-        .map(|(key, value)| {
-            let leaf = Leaf::salted(&Blake2b, seed, &key, &value);
-            (key, Some(leaf))
-        })
-        .collect();
-    let root = vos_tree::update(&Blake2b, &mut store, &leaves).unwrap();
+    let root = vos_testkit::served::salted_tree(&mut store, seed, &rows);
     (store, root)
 }
 
@@ -376,19 +366,7 @@ fn representative(
     roots: &[(AgentId, u64, [u8; 32])],
     of: (AgentId, u64),
 ) -> ([u8; 32], [u8; 16], Vec<u8>) {
-    let mut rows: Vec<(Vec<u8>, Vec<u8>)> = roots
-        .iter()
-        .map(|&(agent, window, root)| {
-            let row = representative_row(agent, RootKind::Space, window);
-            (row, root.to_vec())
-        })
-        .collect();
-    rows.sort();
-    let (store, root) = tree(&REP_SEED, rows);
-    let row = representative_row(of.0, RootKind::Space, of.1);
-    let salt = vos_tree::salt(&Blake2b, &REP_SEED, &row);
-    let path = BatchProof::generate(&store, &[row]).unwrap().encode();
-    (root, salt, path)
+    vos_testkit::served::representative(&REP_SEED, roots, of)
 }
 
 /// The full keys of the reader's entries under `keys`, sorted, as a read
