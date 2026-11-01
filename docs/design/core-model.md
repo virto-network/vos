@@ -1,8 +1,10 @@
 # VOS core model
 
-Draft 6 (2026-10-24): draft 5 (2026-10-08) in line with what slice 6
-built. Drafts 3 and 4 were each reviewed by a second-opinion architecture
-review, and the owner decided the questions they raised.
+Draft 7 (2026-11-01): draft 6 (2026-10-24) in line with what slice 7
+built; draft 6 put draft 5 (2026-10-08) in line with slice 6. Drafts 3
+and 4 were each reviewed by a second-opinion architecture review, and the
+owner decided the questions they raised. Slice 7's owner decisions are
+cited by their S-numbers (`research/slice-7/owner-decisions.md`).
 Measurements come from the run 3 spikes in `spikes.md`, cited by name:
 S1–S6, S5b and SJ. Tags:
 
@@ -14,6 +16,24 @@ S1–S6, S5b and SJ. Tags:
 This is the model for a new core built on branch `vos-core` (from master
 `d2378274`). The v2 service layer on master, the saga's agent layer and
 everything specific to JAR are not ported; section 17 lists what is reused.
+
+## Changes from draft 6
+
+What slice 7 built (`slice-7-progress.md`), stated where each part lives:
+- **The node keeps one binary API** [decided, S41]: framed requests over
+  a unix socket and over QUIC with mutual TLS; HTTP, public TLS, SSH and
+  limits before authentication live in a gateway that holds no authority
+  (sections 4, 5, 13; `node-api.md`).
+- **Credentialed calls:** a session-less input kind whose authority is a
+  credential proof verified at ingress, logged as the origin it proves
+  (`Anonymous`, `Owner`), with the `once` guard (section 8.6).
+- **Device kernels:** `#[attestable(device)]` methods a device proves and
+  a node never attests, their io-hash over Poseidon2 (section 11.1); the
+  Poseidon2 precompile `0x402` (section 11.2).
+- **Replication at scale:** lanes of streams per peer, a pair heartbeat
+  that sends what changed, quiet groups, a bound on campaigns at once,
+  placements stored many to a write, the vote floor's campaign rule
+  (section 10).
 
 ## Changes from draft 5
 
@@ -128,7 +148,8 @@ What slice 6 built (`slice-6-progress.md`), stated where each part lives:
 | Term | Meaning |
 |---|---|
 | Space | A trust domain: nodes run by one operator (or mutually trusting operators), plus member devices. |
-| Node | A VOS process: storage, networking, ingress, PVM execution, logs, CRDT sync, optional prover. |
+| Node | A VOS process: storage, networking, its binary API (ingress), PVM execution, logs, CRDT sync, the prover. |
+| Gateway | A process in front of a space's nodes (`vos-gateway`): HTTP, public TLS, SSH and per-address limits, translated onto the nodes' API. It relays and holds no authority. |
 | Agent | Unit of deployment, state, ordering, replication and placement: an agent program, its state and its installed instances. |
 | Agent program | The agent's PVM code (refine and accumulate): the default agent or a custom `#[agent]`. |
 | Package | Content-addressed, vendor-signed bundle: actor and workflow programs, schema, attestable programs, metadata, license terms. |
@@ -142,6 +163,7 @@ What slice 6 built (`slice-6-progress.md`), stated where each part lives:
 | Lane | A field's state class: Linear (agent log) or Merge (CRDT). |
 | Machine pool | The node's reusable machines, keyed by program hash and reset between uses. |
 | Precompile | A pure memory transform (hash, curve operation) a guest invokes with `ecalli`; served natively by VOS nodes and proven by a dedicated chip. |
+| Origin | Who a logged input acts for, as the agent sees it: a client's key, an agent, the calling instance, or a credential proof's pseudonym or owner digest (`Principal`). |
 
 ## 5. Trust model [decided]
 
@@ -154,6 +176,14 @@ What slice 6 built (`slice-6-progress.md`), stated where each part lives:
   authorized for, never Linear state.
 - Ingress authenticates clients into principals; the node hands the
   authenticated origin to the agent. No signed evidence inside guests.
+  A credentialed call's evidence is a proof, verified at ingress and
+  logged as the origin it proves, never the proof (section 8.6).
+- **Gateways hold no authority** [decided, S41]: the node verifies every
+  signature and proof and runs every ingress check, whoever relays the
+  request. A compromised gateway can drop, delay, reorder and read what
+  it relays; it forges nothing, replays no operator request (each signed
+  with a nonce the node records) and gets a credentialed call run once
+  (its binding).
 - Proofs exist for parties outside the space. They reveal only the
   attestable method's return value (section 11.4).
 - Agents on JAM are public. Spaces trust their state as far as JAM's
@@ -180,9 +210,10 @@ accumulate (IC 5).
     and peek-and-hash.
   - precompiles (section 11.2). On JAM, the unknown id returns `WHAT` and
     the guest computes in software.
-- Proofs from other spaces are verified at ingress on VOS, before refine
-  sees them. On JAM, the agent runs the verifier program in refine (section
-  11.1).
+- Proofs from other spaces, and credential and device proofs, are
+  verified at ingress on VOS, before refine sees them. On JAM, the agent
+  runs the verifier program in refine (section 11.1), or takes a
+  credentialed input its builder's ingress verified (section 8.6).
 - **Accumulate** uses JAM's accumulate host calls (read, write, transfer,
   provide, solicit, checkpoint, log) plus VOS extensions for page storage,
   Merge emission, external replies and timers.
@@ -319,6 +350,10 @@ agent program, which serves them. Precompiles are the one exception
   precompiles run (section 11.1).
 - An actor cannot touch another instance's state; everything else is a call
   or a message. Custom agents can add operations.
+- **The caller** is the input's origin (section 8.6): for a credentialed
+  call, `ctx.nullifier()` reads an auth proof's pseudonym and `ctx.owner()`
+  an owner proof's digest; the caller's buffer holds the largest, an
+  `Anonymous`'s 65 bytes.
 
 **No node-side fast path** [decided by S2]:
 
@@ -378,8 +413,9 @@ agent program, which serves them. Precompiles are the one exception
 ### 7.1 Inputs
 
 - **Input kinds:** client requests (through ingress, in client sessions,
-  section 8.4); messages from other agents (with per-pair sequence numbers);
-  replies to waiting workflows; timer firings.
+  section 8.4); credentialed calls (through ingress, with no session,
+  section 8.6); messages from other agents (with per-pair sequence
+  numbers); replies to waiting workflows; timer firings.
 - The node leading the agent's log batches inputs, by count, bytes or about
   1–5 ms, into one work package.
 - Admission control limits queued inputs per agent. Excess requests are
@@ -633,6 +669,47 @@ Why handlers run to completion:
   batch is decoded, so nodes that reserve differently refine a batch
   differently. Slice 5 changed it, adding the per-kernel share when
   kernels' records gained their shapes.
+
+### 8.6 Credentialed calls and origins [decided, S21–S24, S39, S43, S47]
+
+`identity-and-authority.md` §5 pins them; the core model's part:
+- **The origins** are the logged caller's variants (`vos_wire::ids::Principal`):
+  `Client(key)` 0, `Agent(id)` 1, `Instance(id)` 2, `Anonymous { scope,
+  nullifier }` 3 (an auth credential proof's pseudonym in its scope) and
+  `Owner(digest)` 4 (an owner proof's digest); `Identity` 5 and `Jam` 6
+  reserved. No role is ever granted to `Anonymous` or `Owner`.
+- **The request** is the node API's `Credentialed` (kind `0x0104`, a
+  gateway's `POST /agents/{agent}/credentialed`): an instance, a method,
+  its arguments, a nonce, an expiry by the node's clock (the API's `Time`
+  request), the proof's format, its public words and the proof. Its kind
+  is read before its body, so the node sizes it first (at most 1.5 MiB
+  plus `cap::REQUEST` plus 4 KiB). Ingress runs its checks in order on
+  the replica's applied state, verifies the proof on an executor within a
+  verification budget (past it `Busy`), and sends the call to the
+  agent's leader.
+- **No session:** the log carries `Input::Credentialed` (index 10), the
+  session-less kind: the origin, the call, the binding digest `b`, the
+  expiry and auth's root, never the proof, the nonce or the format, so a
+  log entry's size is unchanged. Exactly-once is the binding's, not a
+  sequence's: apply records `binding(b) → expires_ms` whatever the method
+  does, swept 60 s past the expiry through the due index, and refuses a
+  recorded `b` (`Replayed`, without the first outcome, S39). A refused
+  input writes nothing, so a proof replayed at another replica runs once.
+- **The guards** live in the method's schema (`MethodSchema::credential`):
+  `#[msg(credential = Auth("login"))]` admits `Anonymous` origins of that
+  scope name, `#[msg(credential = Owner)]` admits `Owner` origins (the
+  handler compares the digest with the live row it debits); a method
+  without one refuses both. An `Auth` guard needs its agent's credential
+  actor, found through the system row `credentials → instance`.
+- **The `once` guard** [decided, S43, S47]: `#[msg(credential =
+  Auth("vote"), once)]` admits a nullifier once in its scope; apply
+  records `once(scope ‖ nullifier) → t` for good, only when the handler
+  returns `Ok`, in the same apply, so a refused call leaves the member
+  free to try again with a new proof.
+- **Device proofs** authorize what an auth proof does [decided, S24]: a
+  guard's `device = "..."` names the device kernel (section 11.1) whose
+  proofs it also takes, verified against the program every node computes
+  from the installed kernel.
 
 ## 9. State
 
@@ -924,6 +1001,49 @@ outbox sequence numbers, which receivers deduplicate.
   it, so idle groups heartbeat slowly or quiesce. 1,000 idle groups at a
   500 ms heartbeat cost about 1.6% of a core per node, 5 threads and about
   8 KiB per replica (S3).
+- **Liveness at scale** [built; measured on the scale test,
+  `research/slice-7/scale-report.md`]:
+  - **Quiet groups:** a group whose only deadline is one the pair
+    heartbeat stands in for (a follower whose leader the pair heartbeat
+    vouches for, a leader idle, caught up and hearing every member's
+    node) waits on no timer of its own, only for a message, a local
+    input or a safety round of ten election timeouts; a pair heartbeat
+    round wakes the quiet groups it no longer vouches for. Its inbox
+    takes memory only as it fills (its 1,024-input bound kept by count).
+  - **The pair heartbeat sends what changed:** each round names the groups
+    a node leads that changed since the round its peer last acknowledged
+    taking whole, at their value now, so a lost or split round loses
+    nothing; a frame waits for room in the peer's queue, and a round ends
+    at the first refused. A follower goes quiet only while its leader's
+    listing names it. Listing every group every round, at 10^5 groups, had
+    overflowed the peers' queues and set off elections among the groups
+    left unlisted.
+  - **Lanes:** an agent's consensus frames, and its requests, go on one
+    of `peer_lanes` streams a peer by the agent's id, so no group waits for
+    a stream however many talk at once. `peer_lanes` is the same on every
+    node of a space.
+  - **A bound on campaigns at once** (`campaigns`, 4,096): past it a group
+    whose election is due puts it off and is woken, in turn, as a campaign
+    is given back, so a node that wakes many leaderless groups (its start,
+    a lost peer) elects them in turn. A replica campaigns only once its log
+    reaches its vote floor, as it votes only for logs that do.
+  - **Placements stored many to a write:** a node stores the placements
+    its peers announce in batches of up to 4,096 agents, one task, one
+    write, then acknowledges each sender; a placement that supersedes none
+    held is acknowledged at once. A group's start reads its store on the
+    executors, not the runtime thread.
+  - **Batches in flight** (`in_flight`) are built and safe, and off (1) by
+    default: at T1's load more batches in flight split the inputs into
+    more, dearer batches, with one append in flight per follower.
+  - **Measured** on three nodes of one host [measured]: idle cost 45.6 MiB
+    of RSS and 0.16% of a core per 1,000 replicas (T3's budget 64 MiB and
+    5%); 10^5 replicas a node quiet and loaded with no election; a cold
+    restart at 10^5 every group led and quiet at the first poll, within
+    6.3 GiB; a leader's node killed under load, its agents led again
+    within 5.3 s; at 10^6 users and 5,000 calls a second, transfers p99
+    2.6–3.1 s against T1's 50 ms, the shared disk's commit binding
+    (S59 carries the commit-to-apply gap, the disk and batched signature
+    checks).
 - **Many active agents per node** are not yet within budget. With S3's
   prototype node writer, p99 was 16–56 ms at 16 active agents and up to
   191 ms at 64, and leaders were lost at 1,000 (section 14; work item 16).
@@ -964,6 +1084,19 @@ outbox sequence numbers, which receivers deduplicate.
   once the venue holds its roots anchored, submits it to the space's
   venue. A statement whose anchor would pass `MaxRootAge` by the venue's
   time before its proof ends is dead, never proved.
+- **Device kernels** [built]: `#[attestable(device)]` marks a method a
+  member's device proves, never a node: `DEVICE` (`1 << 33`) in its method
+  word, its schema kind `Device`; it takes no `&self` (a device reads no
+  root) and is not venue-bound. Its io-hash is `H_io`, over the Poseidon2
+  compression (`proving.md` §8), so its code may call `0x402` and never
+  BLAKE2b's `0x400`, which the derivation checks; its end
+  (`vos_sdk::device::DeviceReturn`) writes the public arguments and the
+  output once and hashes them in place. No node attests one: the agent
+  refuses `Attest` of a `Device` method before its kernel runs, and a
+  workflow's attest of one does not compile. A credential guard names it
+  (`device = "..."`), and ingress verifies its proofs (section 8.6). Its
+  install record keeps a node segment shape, never proved; the node
+  computes its device program from the installed kernel instead.
 - **Verification** [proposed]:
   - On VOS, the receiving node verifies a proof at ingress, where trust
     changes, before the message enters the log. Refine sees only verified
@@ -979,7 +1112,10 @@ outbox sequence numbers, which receivers deduplicate.
 
 - A precompile is an `ecalli` host call with a VOS-owned id in
   `0x400..=0x47f`, outside every id JAM assigns (the Gray Paper calls, and
-  JIP-1 `log` at 100). BLAKE2b compression is `0x400`. VOS extension calls
+  JIP-1 `log` at 100). BLAKE2b compression is `0x400`; the witness input
+  `0x401`; the Poseidon2-M31 compression `0x402` (64 bytes of 16 M31
+  words in, each below p or the call traps, 32 bytes out), which the
+  credential actor's tree and device kernels hash with. VOS extension calls
   take `0x480..=0x4ff` (`instantiate` is `0x480`). The whole block
   `0x400..=0x4ff` should be reserved through a JIP, because a future Gray
   Paper id in it would silently break the fallback.
@@ -1004,7 +1140,11 @@ outbox sequence numbers, which receivers deduplicate.
     on VOS.
   - VOS prices each precompile, and the prover binds that price wherever a
     proof binds final gas. A BLAKE2b compression costs 600 gas, from its
-    native serving cost (slice 1).
+    native serving cost (slice 1); a Poseidon2 compression 2,400, about
+    four BLAKE2b compressions natively, and about 37,600 gas in software
+    on JAM [measured]. The agent charges the batch for serving an inner
+    machine's call by precompile (`POSEIDON2_SERVING` 60,000), since JAM
+    pays the software permutation.
 - **Cost per BLAKE2b compression** (S5b): 66 steps plus about 35 ms and
   50 MiB of proving. Hashing in the PVM costs about 4,760 steps, 0.4 s and
   800 MiB per hash. The marginal cost rises near a slice's memory cap:
@@ -1229,8 +1369,8 @@ These form a prover track that runs alongside the core slices (section 16).
 - **`no_std + alloc` core crates:** wire types, the agent and actor SDK, the
   PVM interpreter and inner machines, vos-raft, merkle-crdt, storage traits
   and the proof verifier.
-- **`std` adapters at the edges:** the LSM engine, libp2p, the JIT and
-  ingress.
+- **`std` adapters at the edges:** the LSM engine, the networking, the
+  JIT and the node's API; the gateway (tokio) never links into the node.
 - **Nodes may require Linux ≥ 6.7** [decided], for userfaultfd-based
   dirty-page tracking, if slice 1's measurement picks it.
 - A future bare-metal light client runs Merge replicas and proof
@@ -1511,8 +1651,13 @@ knowledge and aggregation are the longest work and gate goal 8.
 18. **The node host and native extensions:** designed for one node in
     `slice-2-one-node.md`.
     - **Decided:** the prover is a built-in node component for good, not
-      an extension, because proving is essential to VOS. The HTTP ingress
-      is built in for now.
+      an extension, because proving is essential to VOS.
+    - **Decided** (S41): the node keeps one binary API, over its unix
+      socket and QUIC with mutual TLS (`node-api.md`); HTTP, public TLS,
+      the SSH surface (s4's screens and the `vos-api` subsystem) and the
+      limits before authentication are the gateway's. The node's own HTTP
+      remains only as a translation onto the same handler until S50's
+      gate deletes it.
     - **Decided:** the node knows no JAM. A
       program is deployed on JAM with JAM's tooling, and VOS ships the
       JAM statements service and the agent-as-JAM-service build; the JAM
