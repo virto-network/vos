@@ -11,8 +11,8 @@ There are two verifying paths:
 
 - **A segment proof,** verified by `vos-pvm-proof-verifier`
   (`verify_standalone`, `verify_kernel_segment`, the chain verifiers):
-  format 35. Peers and tests use it.
-- **A statement,** a kernel's whole run: its segments (35) verified in
+  format 41. Peers and tests use it.
+- **A statement,** a kernel's whole run: its segments (41) verified in
   leaves, folded (32), the root wrapped (28), the wrap verified by
   `vos-pvm-final-verifier` and judged by `vos-statement`. This is what a venue
   (a chain's pallet, the JAM agent) accepts.
@@ -25,12 +25,12 @@ reference shape, from the security tool (`src/security.rs`):
 
 | format | proofs | channel | counts | floors | status |
 |---|---|---|---|---|---|
-| 35 | segments, hardened AIR | Poseidon2-M31 | 104 / 62.86 | 100 / 60 | admitted |
+| 41 | segments, the shared chip set (the Poseidon2 call among a node kernel's) | Poseidon2-M31 | 104 / 62.81 | 100 / 60 | admitted; 35, the same before the node shared the chip set, retired |
 | 32 | leaves and folds | Poseidon2-M31 | 108 / 63 | 100 / 60 | reserved: proved and verified inside the recursion, refused by every outside verifier |
 | 28 | the final wrap, unmasked | Blake2b-256 | 146 / 82.6 | 100 / 80 | admitted: the tests' and the fixtures', linked by the final verifier under `test-formats` alone |
 | 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 146 / 82.70 | 100 / 80 | admitted: what production venues accept |
 | 44 | credential proofs, masked (variant (c)) | Blake2s-M31 | 110 / 62.92 | 100 / 60 | admitted: what a space's ingress takes |
-| 45 | device proofs, masked (variant (c)), `h = 256` | Blake2s-M31 | 110 / 62.82 | 100 / 60 | admitted: device proofs of auth's statement at a space's ingress; 43, the same at `h = 512`, retired |
+| 46 | device proofs, masked (variant (c)), `h = 256` | Blake2s-M31 | 110 / 62.82 | 100 / 60 | admitted: device proofs of auth's statement at a space's ingress; 43, the same at `h = 512`, and 45, at `h = 256` before the shared chip set's 7.21 form, retired |
 
 - **Conjectured** bits are PoW plus queries times log blowup (the ethSTARK
   conjecture, refuted as stated in 2025; the parameters carry a margin for
@@ -41,12 +41,11 @@ reference shape, from the security tool (`src/security.rs`):
   quotient batches, one coefficient each: a column's samples and, for a
   column sampled at two points, the periodicity value the fork adds
   (`deep_values_of_column`); `c`, the most of one column, is counted the
-  same way, 3. The segment shape batches 10,016 values over 9,020 samples;
-  35's query term binds, 62.86 either way. The masked device reference
-  (every device chip at 2^17 rows) batches 7,404; 43 counts 62.82 by
-  affine batching, 62.01 by powers.
+  same way, 3. The segment shape batches 11,091 values; 41's query term
+  binds, 62.81. The masked device reference (every device chip at 2^17
+  rows) batches 7,403; 46 counts 62.82 by affine batching, 62.01 by powers.
 - A verifier rejects a number the registry does not admit, a retired one
-  (24 to 27, 29, 30, 31, 33, 34; 37, the device format reserved at an
+  (24 to 27, 29, 30, 31, 33 to 35, 43, 45; 37, the device format reserved at an
   unmasked count; 42, the credential format at PoW 20,
   retired when the gate phone's grind passed 50 ms at its 95th
   percentile; 36, the legacy segment format, whose 57
@@ -56,7 +55,7 @@ reference shape, from the security tool (`src/security.rs`):
   proof's configuration must equal the format's, and its counts at its own
   shape must reach the floors.
 
-**End to end, the proven bound is the weakest inner format's: 62.86 bits,
+**End to end, the proven bound is the weakest inner format's: 62.81 bits,
 not the wrap's 82.6.** Forging a leaf's segment forges the statement. The
 conjectured bound is 104. Under Grover's heuristic that is about 31 proven
 and 52 conjectured bits against a quantum prover: post-quantum readiness
@@ -300,7 +299,7 @@ panic-freedom does:
   spaces carries BCHKS25 Theorem 4.2's improved `ε_lin`. It carries the
   wrap from 74.7 to 82.6 proven bits, and needs a cryptographer's review of
   the citation and the count: if it is wrong, the wrap is at 74.7, below
-  its 80-bit floor (the end-to-end bound, 62.86, is the inner formats'
+  its 80-bit floor (the end-to-end bound, 62.81, is the inner formats'
   either way).
   - **Format 39 rests on it more:** batched by powers, the batching term
     caps 39 at 76.98 (74.48 at blowup 64), at its 538 batched values, and

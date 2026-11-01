@@ -81,7 +81,7 @@ Ingress calls the final verifier's `credential::verify`, which picks the
 circuit by kind, never the circuit-generic step beneath it, which takes
 any preprocessed root.
 
-**A device proof** (format 45, `slice-7-mobile.md` pin J) authorizes as
+**A device proof** (format 46, `slice-7-mobile.md` pin J) authorizes as
 an auth credential proof does, and only for a method whose auth guard
 names a device kernel. Its program (the kernel's chips, their log sizes
 and the preprocessed root) is the one this node computes from the

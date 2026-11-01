@@ -251,7 +251,7 @@ Ingress verifies the proof and logs only the origin it proves.
       pub arguments: Vec<u8>,          // at most cap::REQUEST
       pub nonce: [u8; 16],             // the client's, at random
       pub expires_ms: u64,             // by the node's clock
-      pub format: u32,                 // 44 (S29); 45 for a device proof
+      pub format: u32,                 // 44 (S29); 46 for a device proof
       pub public: CredentialPublic,
       pub proof: Vec<u8>,
   }
@@ -287,7 +287,7 @@ Ingress verifies the proof and logs only the origin it proves.
   - `#[msg(credential = Auth("login"))]` is
     `CredentialGuard::Auth { name, device: None }`. It admits `Anonymous`
     origins; `name`, 1–64 bytes, is the scope's. Its `device` field names
-    the attestable kernel whose device proofs (format 45) it also takes,
+    the attestable kernel whose device proofs (format 46) it also takes,
     from M5 (`#[msg(credential = Auth("login"), device = "auth")]`); the
     field exists from the start, so M5 moves no pinned blob.
   - `#[msg(credential = Owner)]` is `CredentialGuard::Owner`. It admits
@@ -390,7 +390,7 @@ Ingress verifies the proof and logs only the origin it proves.
 - **On JAM,** an agent whose builder is one of the space's nodes takes a
   credentialed input as it takes any: its builder's ingress verified the
   proof, under the trust-boundary rule above.
-- **Device proofs** (format 45, M5) authorize exactly what an auth proof
+- **Device proofs** (format 46, M5) authorize exactly what an auth proof
   does [decided, S24] and take the same checks (`proving.md` §8).
 
 **Guards are the same on VOS and on JAM.** Inside a space the evidence is
