@@ -958,7 +958,7 @@ an agent, but approving a payment is a member's grant like any other.
     refused, no resume, the record a tombstone; the space founds again
     under a new `SpaceId`, its credential actor installed with the same
     handle and re-seeded from the ended space's `member` digests [decided,
-    S11];
+    S11; S25's amendment];
   - **no migration:** a space anchors at one venue for good; one that
     changes venue founds again [decided, S9] (`proving.md` §7);
   - integrity comes only from a proof that names the anchor.
@@ -1011,8 +1011,8 @@ an agent, but approving a payment is a member's grant like any other.
     spaces other than Virto above X, plus a sunset date.
 - **A space's own keys** (its builder's signing key, behind
   `package::identity(service)`) rotate by a governance decision applied
-  in accumulate; on Kreivo, the controller (an `AccountId`) rotates the
-  authorities and anchor keys.
+  in accumulate; on Kreivo, the controller (an `AccountId`) lists and
+  delists the authorities and the node keys the venue accepts.
 - **Exit and disputes** need rules, not yet designed. A space's name on
   exit is released only after its deposit's delay, so exit cannot be
   used to squat.
