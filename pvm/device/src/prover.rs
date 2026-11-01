@@ -340,7 +340,7 @@ impl Prover {
 }
 
 /// Verifies `proof` against `call` as ingress does: its format the
-/// registry's, its binding `call`'s under its kind's program, for auth its
+/// registry's, `call`'s arguments within `cap::REQUEST`, its binding `call`'s under its kind's program, for auth its
 /// scope the one the guard named `name` gives, then the proof under the
 /// program its kind picks.
 pub fn verify(
@@ -348,7 +348,7 @@ pub fn verify(
     call: &Call,
     name: Option<&[u8]>,
 ) -> Result<(), DeviceError> {
-    if proof.format != FORMAT {
+    if proof.format != FORMAT || call.check().is_err() {
         return Err(DeviceError::Verify);
     }
     let kind = proof.public.kind();
