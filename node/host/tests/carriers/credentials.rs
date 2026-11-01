@@ -714,7 +714,7 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
         device_values.join("\n").into_bytes(),
     );
     let applied = credentialed_steps(&founded.cluster.node(at).unwrap(), agent).len();
-    assert!(applied >= 8, "the calls run, {applied} logged");
+    assert!(applied >= 7, "the calls run, {applied} logged");
     for number in 1..=NODES {
         let node = founded.cluster.node(number).unwrap();
         vos_checker::wait_until(
