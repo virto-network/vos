@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use vos_checker::calls::install_of;
 use vos_checker::processes::{self, Running, first_run, read_log};
-use vos_checker::spaces::{HeldPort, free_tcp_port, free_udp_port};
+use vos_checker::spaces::{HeldPort, free_udp_port};
 use vos_node::client::{Operator, Target};
 use vos_wire::ids::AgentId;
 use vos_wire::ingress::Response;
@@ -171,17 +171,18 @@ fn io_stalled() -> f64 {
 pub struct Process {
     running: Mutex<Running>,
     pub number: u8,
+    /// The address the space file names it by, which redirects give.
     pub url: String,
+    /// Its API's socket.
     pub target: Target,
-    /// Its data directory, where it writes its operator's token at each
-    /// start.
+    /// Its data directory: its store, its keys and its API's socket.
     data: PathBuf,
     /// How it is started again: its arguments, its pinning, its log.
     args: Vec<String>,
     cpus: Option<String>,
     log: PathBuf,
-    /// Its ingress and peer addresses, held from its kill to its restart.
-    addresses: (SocketAddr, SocketAddr),
+    /// Its peer address, held from its kill to its restart.
+    peer: SocketAddr,
     held: Mutex<Vec<HeldPort>>,
 }
 
@@ -204,17 +205,26 @@ impl Process {
         self.running.lock().unwrap().pid()
     }
 
+    /// Its operator, signing with the operator key its data directory
+    /// holds.
     pub fn operator(&self) -> Operator {
-        let token =
-            std::fs::read_to_string(self.data.join(vos_node::ADMIN_TOKEN)).unwrap_or_default();
-        Operator::new(&self.target, &token)
+        let hex = |name: &str| {
+            let text = std::fs::read_to_string(self.data.join(name)).unwrap();
+            let mut bytes = [0u8; 32];
+            hex::decode_to_slice(text.trim(), &mut bytes).unwrap();
+            bytes
+        };
+        Operator::signing(
+            &self.target,
+            ed25519_dalek::SigningKey::from_bytes(&hex(vos_node::OPERATOR_KEY)),
+            vos_wire::ingress::NodeId(hex(vos_node::NODE_KEY)),
+        )
     }
 
-    /// Kill it (SIGKILL), holding its ports until it restarts.
+    /// Kill it (SIGKILL), holding its peer port until it restarts.
     pub fn kill(&self) {
         self.running.lock().unwrap().kill();
-        let (ingress, peer) = self.addresses;
-        *self.held.lock().unwrap() = vec![HeldPort::tcp(ingress), HeldPort::udp(peer)];
+        *self.held.lock().unwrap() = vec![HeldPort::udp(self.peer)];
     }
 
     /// Its store, opened while it is killed.
@@ -290,8 +300,8 @@ pub fn vos() -> PathBuf {
 }
 
 /// Run `vos node run` with `args`, pinned to `cpus` if any, its log
-/// appended to `log`: the process, once it printed its address, and its
-/// key.
+/// appended to `log`: the process, once it printed its key and its API's
+/// socket, and its key.
 pub fn launch(args: &[&str], cpus: Option<&str>, log: &Path) -> (Running, String) {
     let started = processes::run(&vos(), args, log, None, cpus)
         .unwrap_or_else(|| panic!("{}", read_log(log)));
@@ -329,13 +339,9 @@ impl Space {
                 )
             })
             .collect();
-        let ingress: Vec<u16> = (0..NODES).map(|_| free_tcp_port()).collect();
         let peers: Vec<u16> = (0..NODES).map(|_| free_udp_port()).collect();
-        let tls = std::env::var("TLS").is_ok_and(|tls| tls == "1");
-        let scheme = if tls { "https" } else { "http" };
-        let urls: Vec<String> = ingress
-            .iter()
-            .map(|port| format!("{scheme}://127.0.0.1:{port}"))
+        let urls: Vec<String> = (1..=NODES)
+            .map(|number| format!("http://node-{number}"))
             .collect();
         let nodes = (0..NODES).map(|at| {
             let peer = SocketAddr::from(([127, 0, 0, 1], peers[at]));
@@ -347,40 +353,30 @@ impl Space {
             .map(|number| {
                 let at = usize::from(number) - 1;
                 let data = dir.path().join(format!("node-{number}"));
-                let listen = format!("127.0.0.1:{}", ingress[at]);
                 let log = dir.path().join(format!("node-{number}.log"));
-                let mut args: Vec<String> = [
+                let args: Vec<String> = [
                     "--data",
                     data.to_str().unwrap(),
-                    "--listen",
-                    &listen,
                     "--space",
                     space_file.to_str().unwrap(),
                 ]
                 .iter()
                 .map(|arg| arg.to_string())
                 .collect();
-                if tls {
-                    args.push("--tls".into());
-                }
                 let pinning = pinned.then(|| cpus[at].clone());
                 let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
                 let (running, key) = launch(&borrowed, pinning.as_deref(), &log);
                 assert_eq!(key, keys[at]);
-                let url = format!("{scheme}://{listen}");
                 Process {
                     running: Mutex::new(running),
                     number,
-                    target: processes::target(&url, &key, tls),
-                    url,
+                    target: Target::socket(data.join("api.sock")),
+                    url: urls[at].clone(),
                     data,
                     args,
                     cpus: pinning,
                     log,
-                    addresses: (
-                        SocketAddr::from(([127, 0, 0, 1], ingress[at])),
-                        SocketAddr::from(([127, 0, 0, 1], peers[at])),
-                    ),
+                    peer: SocketAddr::from(([127, 0, 0, 1], peers[at])),
                     held: Mutex::new(Vec::new()),
                 }
             })

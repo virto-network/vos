@@ -14,7 +14,7 @@ impl Served {
     /// Install the rounds actor with its workflows, and at a second agent
     /// the rounds its tours ask and tell.
     fn tours(&self) -> Tours {
-        let operator = Operator::new(&self.target, &self.token);
+        let operator = self.operator();
         let Ok(Response::Created(other)) = operator.create_agent(Vec::new()) else {
             panic!("another agent")
         };

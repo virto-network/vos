@@ -3,9 +3,8 @@
 //! credential actor, the poll, the purses' ledger and the device actor; a
 //! member's device secret derived from a known source output, its path
 //! fetched, and its calls proved by the device library as a phone proves
-//! them and sent to the nodes' ingress over each transport: the API's
-//! socket, the node's HTTP, and a gateway relaying HTTP onto the API over
-//! QUIC. Then every carrier the run produced is searched for the member's
+//! them and sent to the nodes over each transport: the API's socket, and
+//! a gateway relaying HTTP onto the API over QUIC. Then every carrier the run produced is searched for the member's
 //! secret, which only the device holds, and for where the member sits,
 //! which a credentialed call never carries ([`vos_checker::carriers`]).
 //!
@@ -19,8 +18,8 @@
 //! fetched on one of their own.
 //!
 //! Carriers that leave the device: every byte of each API connection each
-//! way, every request and its answer's status and body over HTTP and
-//! through the gateway, each
+//! way, every request and its answer's status and body through the
+//! gateway, each
 //! credentialed call's log entry on each node, the device library's
 //! values as its `Debug` and `Display` show them, every log line of the
 //! process at every level (the nodes', the gateway's), and standard
@@ -550,8 +549,7 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
     };
     answers.push(ran(send(&watched, &watched_proof)));
 
-    // The node's HTTP, and a gateway relaying onto the nodes' API over
-    // QUIC.
+    // A gateway relaying onto the nodes' API over QUIC.
     let gateway_key = SigningKey::from_bytes(&GATEWAY).verifying_key().to_bytes();
     let upstreams = founded
         .cluster
@@ -569,7 +567,6 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
         })
         .collect();
     let front = Front::serve(upstreams, GATEWAY);
-    let http = Target::loopback(&format!("http://{}", founded.cluster.ingress(at))).unwrap();
     // Each request's bytes and each answer's status and body as they came.
     let mut https: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
     let route = format!("/agents/{}/credentialed", agent.0);
@@ -590,7 +587,7 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
         ));
         decoded
     };
-    for (name, target) in [("the node's HTTP", &http), ("the gateway", front.target())] {
+    for (name, target) in [("the gateway", front.target())] {
         let call = founded.call(at, POLL, "login", ());
         let proof = prover
             .prove_auth(&secret, &witness, b"login", &call)

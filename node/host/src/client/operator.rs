@@ -1,5 +1,4 @@
-//! The node's operator: commands signed by an operator key for one node,
-//! or, over the node's own HTTP, its admin token.
+//! The node's operator: commands signed by an operator key for one node.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -20,18 +19,11 @@ use crate::lock;
 /// much either way takes it.
 const GOOD_FOR_MS: u64 = 60_000;
 
-/// What an operator's requests carry.
-enum Authority {
-    /// The node's admin token, over its own HTTP.
-    Token(String),
-    /// An operator key the node lists, signing each request for the node
-    /// `node`.
-    Key { key: Box<SigningKey>, node: NodeId },
-}
-
-/// The node's operator.
+/// The node's operator: an operator key the node lists, signing each
+/// request for the node `node`.
 pub struct Operator {
-    authority: Authority,
+    key: Box<SigningKey>,
+    node: NodeId,
     transport: Transport,
     /// How far the node's time is ahead of this client's clock, as the node
     /// last reported it.
@@ -39,64 +31,37 @@ pub struct Operator {
 }
 
 impl Operator {
-    /// The operator by the node's admin token, over its HTTP.
-    pub fn new(target: &Target, token: &str) -> Self {
-        Self::with(
-            Transport::new(target),
-            Authority::Token(token.trim().to_string()),
-        )
-    }
-
-    /// One whose commands' answers are read within `answer`, each read
-    /// and write of them: for a caller that tries another node when one
-    /// is slow.
-    pub fn within(target: &Target, token: &str, answer: Duration) -> Self {
-        Self::with(
-            Transport::within(target, answer),
-            Authority::Token(token.trim().to_string()),
-        )
-    }
-
     /// The operator by `key`, which node `node` lists, signing each
-    /// request for that node alone: over the node API, or over HTTP, the
-    /// node's or a gateway's, in the `Authorization` header.
+    /// request for that node alone: over the node API, or over a gateway's
+    /// HTTP in the `Authorization` header.
     pub fn signing(target: &Target, key: SigningKey, node: NodeId) -> Self {
-        Self::with(
-            Transport::new(target),
-            Authority::Key {
-                key: Box::new(key),
-                node,
-            },
-        )
+        Self::with(Transport::new(target), key, node)
     }
 
-    /// [`Operator::signing`], answered within `answer`.
+    /// [`Operator::signing`], its commands' answers read within `answer`,
+    /// each read and write of them: for a caller that tries another node
+    /// when one is slow.
     pub fn signing_within(
         target: &Target,
         key: SigningKey,
         node: NodeId,
         answer: Duration,
     ) -> Self {
-        Self::with(
-            Transport::within(target, answer),
-            Authority::Key {
-                key: Box::new(key),
-                node,
-            },
-        )
+        Self::with(Transport::within(target, answer), key, node)
     }
 
-    fn with(transport: Transport, authority: Authority) -> Self {
+    fn with(transport: Transport, key: SigningKey, node: NodeId) -> Self {
         Self {
-            authority,
+            key: Box::new(key),
+            node,
             transport,
             offset: Mutex::new(0),
         }
     }
 
     /// The `Authorization` header's value for a request of `method` to
-    /// `path` holding `body`: the token, or the envelope signed over the
-    /// route's kind and inner body.
+    /// `path` holding `body`: the envelope signed over the route's kind and
+    /// inner body.
     fn authorization(
         &self,
         method: &str,
@@ -104,37 +69,32 @@ impl Operator {
         body: &[u8],
         nonce: [u8; 16],
     ) -> Option<String> {
-        match &self.authority {
-            Authority::Token(token) => Some(format!("Bearer {token}")),
-            Authority::Key { key, node } => {
-                let request = vos_http::Request {
-                    method: method.to_string(),
-                    path: path.to_string(),
-                    headers: Vec::new(),
-                    body: body.to_vec(),
-                    peer: None,
-                    large: None,
-                };
-                let Routed::Operator {
-                    kind,
-                    inner: Ok(inner),
-                    ..
-                } = routes::route(&request)
-                else {
-                    return None;
-                };
-                let now = crate::wall_clock().saturating_add_signed(*lock(&self.offset));
-                let operated = signed_operated(
-                    *node,
-                    key,
-                    kind,
-                    nonce,
-                    now.saturating_add(GOOD_FOR_MS),
-                    inner,
-                );
-                Some(operated_header(&operated))
-            }
-        }
+        let request = vos_http::Request {
+            method: method.to_string(),
+            path: path.to_string(),
+            headers: Vec::new(),
+            body: body.to_vec(),
+            peer: None,
+            large: None,
+        };
+        let Routed::Operator {
+            kind,
+            inner: Ok(inner),
+            ..
+        } = routes::route(&request)
+        else {
+            return None;
+        };
+        let now = crate::wall_clock().saturating_add_signed(*lock(&self.offset));
+        let operated = signed_operated(
+            self.node,
+            &self.key,
+            kind,
+            nonce,
+            now.saturating_add(GOOD_FOR_MS),
+            inner,
+        );
+        Some(operated_header(&operated))
     }
 
     /// A request, signed again once at the node's time if the node says
@@ -168,14 +128,12 @@ impl Operator {
     ) -> Result<Response, ClientError> {
         let authorization = self.authorization(method, path, body, nonce);
         // A signed command runs once by its nonce: it may go again on a
-        // fresh connection when a kept one failed. A token's command may
-        // not be idempotent: never sent twice.
-        let repeatable = matches!(self.authority, Authority::Key { .. });
+        // fresh connection when a kept one failed.
         let (status, answer) = match method {
             "GET" => self.transport.get(path, authorization.as_deref())?,
             _ => self
                 .transport
-                .post(path, authorization.as_deref(), body, repeatable)?,
+                .post(path, authorization.as_deref(), body, true)?,
         };
         decode_answer(status, &answer)
     }

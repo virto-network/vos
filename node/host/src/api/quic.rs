@@ -12,7 +12,7 @@ use quinn::VarInt;
 use vos_api::{Event, FrameError, Framing, Kind, Reader, Requests, error_frame, frame};
 use vos_net::api::{Runner, Runtime, Spawner};
 
-use super::{Api, LargePlace, Via};
+use super::{Api, LargePlace};
 use crate::timeout;
 
 /// A connection quiet this long closes.
@@ -283,7 +283,7 @@ async fn request(
             let large = large.take().map(|place| Box::new(place) as LargePlace);
             // On the node's thread, as every request is handled.
             let answer = runtime
-                .spawn(async move { api.handle(kind, request.body, Via::Quic, large).await })
+                .spawn(async move { api.handle(kind, request.body, large).await })
                 .await;
             frame(Framing::Quic, request.kind, 0, &answer)
         }

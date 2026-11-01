@@ -9,7 +9,6 @@ use super::wall_clock;
 use crate::Hooks;
 use crate::blobs::Horizons;
 use crate::space::Space;
-use crate::tls::IngressTls;
 
 /// How a node reaches the other nodes of its space.
 #[derive(Clone)]
@@ -57,9 +56,6 @@ pub struct Config {
     /// Milliseconds since the Unix epoch: work-result time, and ingress's
     /// freshness checks. A test moves it.
     pub clock: Arc<dyn Fn() -> u64 + Send + Sync>,
-    /// TLS on the ingress. Without it, the ingress serves loopback
-    /// addresses only.
-    pub ingress_tls: Option<IngressTls>,
     /// The space this node runs in. Without one, it is a space of one, as
     /// node 0.
     pub space: Option<Space>,
@@ -147,9 +143,6 @@ pub struct Config {
     /// The longest a read of a workflow waits for it to end: at most
     /// [`vos_wire::ingress::MAX_WORKFLOW_WAIT_MS`].
     pub workflow_wait: Duration,
-    /// The most connections the ingress holds open at once: one past them
-    /// is closed as it is accepted.
-    pub ingress_connections: usize,
     /// How many queries may wait at once for their replica to apply
     /// through the index they ask for: one past them is answered behind
     /// at once, and its client asks another replica.
@@ -201,7 +194,6 @@ impl Config {
             #[cfg(feature = "faults")]
             faults: None,
             clock: Arc::new(wall_clock),
-            ingress_tls: None,
             space: None,
             venue: None,
             prover: None,
@@ -227,11 +219,10 @@ impl Config {
             snapshot_timeout_ms: 60_000,
             workflow_waits: 64,
             workflow_wait: Duration::from_millis(vos_wire::ingress::MAX_WORKFLOW_WAIT_MS),
-            ingress_connections: 1024,
             floor_waits: 256,
             api_connections: 1024,
             api_in_flight: 1024,
-            api_frame_deadline: vos_http::server::REQUEST_DEADLINE,
+            api_frame_deadline: Duration::from_secs(60),
             operators: Vec::new(),
             local_operator: true,
             operator_nonces: 1 << 16,
@@ -271,7 +262,6 @@ pub(crate) struct Settings {
     pub(crate) snapshot_timeout_ms: u64,
     pub(crate) workflow_waits: usize,
     pub(crate) workflow_wait: Duration,
-    pub(crate) ingress_connections: usize,
     pub(crate) floor_waits: usize,
     pub(crate) api_connections: usize,
     pub(crate) api_in_flight: usize,
@@ -312,7 +302,6 @@ impl Settings {
             workflow_wait: config.workflow_wait.min(Duration::from_millis(
                 vos_wire::ingress::MAX_WORKFLOW_WAIT_MS,
             )),
-            ingress_connections: config.ingress_connections,
             floor_waits: config.floor_waits,
             api_connections: config.api_connections,
             api_in_flight: config.api_in_flight,

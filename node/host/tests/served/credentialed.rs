@@ -18,7 +18,7 @@ use ed25519_dalek::SigningKey;
 use vos_checker::Nodes;
 use vos_checker::calls::installed;
 use vos_checker::programs::{actor, actor_elf, credentials, credentials_elf, method};
-use vos_node::client::{self, Client, Target};
+use vos_node::client::{self, Client};
 use vos_pvm_final_verifier::credential as verifier;
 use vos_pvm_recair::credential::{AuthPublic, AuthWitness, OwnerPublic, Statement, prove};
 use vos_pvm_recair::masked::MaskRng;
@@ -397,14 +397,20 @@ fn every_ingress_refusal_comes_in_its_check_order() {
     let target = founded.cluster.target(at).clone();
     let agent = founded.agent;
 
-    // Over HTTP: the size refused from the head, the body unread (the
-    // API's frames are refused from their header, `ingress::api`).
-    let http = Target::loopback(&format!("http://{}", founded.cluster.ingress(at))).unwrap();
+    // Over a gateway's HTTP: the size refused from the head, the body
+    // unread (the API's frames are refused from their header,
+    // `ingress::api`).
+    let key = founded.cluster.node(at).unwrap().id().0;
+    let socket = founded.cluster.dir(at).join("api.sock");
+    let front = vos_checker::processes::Front::serve(
+        vec![(key, format!("unix:{}", socket.display()))],
+        [0x9a; 32],
+    );
     let path = format!("/agents/{}/credentialed", agent.0);
     let largest = vec![0; vos_api::CREDENTIALED_HTTP];
-    let (status, _) = client::post(&http, &path, &largest).unwrap();
+    let (status, _) = client::post(front.target(), &path, &largest).unwrap();
     assert_eq!(status, 400, "the largest body is read");
-    let mut stream = std::net::TcpStream::connect(founded.cluster.ingress(at)).unwrap();
+    let mut stream = std::net::TcpStream::connect(front.target().authority()).unwrap();
     let head = format!(
         "POST {path} HTTP/1.1\r\nHost: node\r\nContent-Length: {}\r\n\r\n",
         vos_api::CREDENTIALED_HTTP + 1
@@ -648,7 +654,7 @@ fn a_verified_call_holds_no_large_place_while_it_waits_to_apply() {
     let founded = &founded;
     let free = |at: NodeNumber| {
         let node = founded.cluster.node(at).unwrap();
-        node.credentialed_places_free() == vos_http::CREDENTIALED_LARGE
+        node.credentialed_places_free() == vos_node::CREDENTIALED_BODIES
     };
     let verified = |at: NodeNumber| {
         let node = founded.cluster.node(at).unwrap();

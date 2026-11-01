@@ -3,7 +3,7 @@ name = "vos-node"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "The VOS node host: storage, the leader loops and ingress."
+description = "The VOS node host: storage, the leader loops and its binary API."
 
 [features]
 # Faults a test injects into a running node (`vos_node::faults`): never
@@ -29,19 +29,18 @@ fjall = { workspace = true }
 ed25519-dalek = "2"
 quick_cache = { version = "0.6.24", default-features = false }
 event-listener = "5"
-futures-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 getrandom = "0.2"
 # The space's genesis file, in hex.
 hex = "0.4"
 httparse = "1"
-rcgen = { version = "0.13", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 smol = "2"
-subtle = { workspace = true }
 tracing = "0.1"
 vos-api = { workspace = true, features = ["quic"] }
 quinn = { version = "0.11.12", default-features = false }
-# The HTTP front the node serves until the gateway carries every route.
+# The client's HTTP to a gateway, the route table its requests over the
+# node API are translated by, and a timeout on any runtime. The node
+# serves no HTTP.
 vos-http = { workspace = true }
 vos-net = { workspace = true }
 vos-pvm = { workspace = true }
@@ -70,7 +69,6 @@ vos-checker = { path = "../checker" }
 vos-device = { workspace = true }
 # A kernel run alone, as an attest runs it.
 vos-testkit = { path = "../../agent/testkit" }
-rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 proptest = "1"
 tempfile = "3"
 # JAM's tree over the whole keyspace, which the agent's root is a node of.

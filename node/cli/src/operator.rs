@@ -151,7 +151,8 @@ pub(crate) fn operator_of(args: &OperatorArgs) -> Result<Operator, String> {
     };
     let key = SigningKey::from_bytes(&read(OPERATOR_KEY)?);
     let node = vos_wire::ingress::NodeId(read(NODE_KEY)?);
-    // On the node's host, its data directory holds its key.
-    let target = args.node.target_or(Some(&args.data.join(NODE_KEY)))?;
+    // On the node's host, its data directory holds its key and its API's
+    // socket.
+    let target = args.node.target_or(Some(&args.data))?;
     Ok(Operator::signing(&target, key, node))
 }

@@ -17,11 +17,10 @@ use vos_wire::peer::{NodeNumber, Placement};
 use vos_wire::records::unstored;
 use vos_wire::result::Outcome;
 
-use super::open::write_private;
-use super::{ADMIN_TOKEN, CallError, Error, Inner, Node, Pending, ReplaceError, Reply};
+use super::{CallError, Error, Inner, Node, Pending, ReplaceError, Reply};
+use crate::lock;
 use crate::queries::Asked;
 use crate::store::Fjall;
-use crate::{lock, random};
 
 impl Inner {
     /// This node's replica of `agent`, if it runs one: its Raft state, or
@@ -363,40 +362,6 @@ impl Node {
             .pool
             .program(&CodeHash(*program))
             .is_some()
-    }
-
-    /// Serve the HTTP ingress on `address` (`127.0.0.1:0` picks a port):
-    /// the address it listens on. The operator's token goes to the data
-    /// directory, readable by its owner only. Without TLS, only a loopback
-    /// address is served (`0.0.0.0` and `::` are not loopback).
-    pub fn serve(&self, address: SocketAddr) -> Result<SocketAddr, Error> {
-        let tls = match &self.ingress_tls {
-            Some(tls) => Some(crate::tls::server_config(tls, &self.secret).map_err(Error::Data)?),
-            None if address.ip().is_loopback() => None,
-            None => {
-                return Err(Error::Data(format!(
-                    "{address}: plain HTTP serves loopback addresses only; give the ingress TLS"
-                )));
-            }
-        };
-        let token = random();
-        write_private(&self.data.join(ADMIN_TOKEN), &token)
-            .map_err(|error| Error::Data(error.to_string()))?;
-        let listener = smol::block_on(smol::net::TcpListener::bind(address))
-            .map_err(|error| Error::Data(error.to_string()))?;
-        let local = listener
-            .local_addr()
-            .map_err(|error| Error::Data(error.to_string()))?;
-        let (stop, stopped) = smol::channel::bounded(1);
-        let task = self.inner.runtime.spawn(crate::ingress::serve(
-            Arc::clone(&self.api),
-            token,
-            listener,
-            tls,
-            stopped,
-        ));
-        lock(&self.fronts).push((task, stop));
-        Ok(local)
     }
 
     /// Serve the node API on a unix socket at `path`, its file given

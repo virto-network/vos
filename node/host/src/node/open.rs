@@ -26,17 +26,16 @@ use crate::storage::StorageThread;
 use crate::store::{Fjall, PersistMode};
 use crate::{lock, random};
 
-/// The node's data directory: its store, and the operator's token. A
+/// The node's data directory: its store, its keys and its API's socket. A
 /// stopped node's store may be opened at `STORE` in it.
 pub const STORE: &str = "store";
 const BLOBS: &str = "blobs";
-pub const ADMIN_TOKEN: &str = "admin.token";
 /// The node's public key, in hex, in its data directory: for operator
-/// commands on the node's host to pin its TLS by.
+/// commands on the node's host to sign for it, and to pin its QUIC by.
 pub const NODE_KEY: &str = "node.key";
 
 impl Node {
-    /// Open the node's data directory `data` (its store and admin token),
+    /// Open the node's data directory `data` (its store and its keys),
     /// join its space and start every agent it replicates.
     pub fn open(data: impl AsRef<Path>, config: Config) -> Result<Self, Error> {
         if config.refine_gas < defaults::min_refine_gas(config.max_inputs.max(1)) {
@@ -182,9 +181,7 @@ impl Node {
         Ok(Self {
             api: Arc::new(api),
             inner,
-            data,
             secret,
-            ingress_tls: config.ingress_tls,
             fronts: Mutex::new(Vec::new()),
             quic_api: Mutex::new(None),
             stop: Some(stop),
@@ -441,7 +438,7 @@ fn collect_blobs(inner: &Inner, stopped: &mpsc::Receiver<()>) {
     }
 }
 
-/// Write a secret, the operator's token or key, in hex, readable by its
+/// Write a secret, the operator's key, in hex, readable by its
 /// owner only.
 pub(crate) fn write_private(path: &Path, token: &[u8; 32]) -> std::io::Result<()> {
     use std::io::Write;

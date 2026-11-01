@@ -1,13 +1,12 @@
 //! Signed operator requests over the node API, on both transports: each
 //! refusal in its order, a command's nonce once (two copies at once, and
-//! after a restart), the reads' none, the nonces' bound, the node's own
-//! HTTP taking the envelope in its header, and the local operator key.
+//! after a restart), the reads' none, the nonces' bound, and the local
+//! operator key.
 
 use std::os::unix::net::UnixStream;
 
 use ed25519_dalek::Signer;
-use vos_api::{Kind, Operated, operator_message};
-use vos_http::routes::operated_header;
+use vos_api::{Kind, operator_message};
 use vos_node::client::signed_operated;
 use vos_wire::ingress::{NodeId, OperatorRefusal};
 
@@ -230,43 +229,6 @@ fn past_the_nonces_kept_a_command_is_busy() {
     assert!(matches!(ask(Kind::CreateAgent), Response::Created(_)));
     assert_eq!(ask(Kind::CreateAgent), Response::Busy);
     assert!(matches!(ask(Kind::Stats), Response::Stats(_)));
-}
-
-/// The node's own HTTP takes the envelope in its `Authorization` header,
-/// the route's path and body as they are.
-#[test]
-fn the_nodes_http_takes_the_envelope_in_its_header() {
-    let served = Served::plain();
-    let request = |kind: Kind, method: &str, path: &str, inner: Vec<u8>, body: &[u8]| {
-        let operated: Operated = Operated::decode_exact(&served.operated(kind, inner)).unwrap();
-        format!(
-            "{method} {path} HTTP/1.1\r\nHost: node\r\nAuthorization: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            operated_header(&operated),
-            body.len()
-        )
-    };
-    let stats = request(Kind::Stats, "GET", "/stats", Vec::new(), &[]);
-    assert_eq!(
-        status_line(served.address, stats.as_bytes()),
-        "HTTP/1.1 200 OK"
-    );
-    let path = format!("/agents/{}/status", served.agent.0);
-    let status = request(Kind::Status, "GET", &path, served.agent.encode(), &[]);
-    assert_eq!(
-        status_line(served.address, status.as_bytes()),
-        "HTTP/1.1 200 OK"
-    );
-    // Signed for another agent than the path's: the signature fails.
-    let other = request(Kind::Status, "GET", &path, AgentId(9).encode(), &[]);
-    assert_eq!(
-        status_line(served.address, other.as_bytes()),
-        "HTTP/1.1 401 Unauthorized"
-    );
-    let unreadable = "GET /stats HTTP/1.1\r\nHost: node\r\nAuthorization: Operated !!\r\nConnection: close\r\n\r\n";
-    assert_eq!(
-        status_line(served.address, unreadable.as_bytes()),
-        "HTTP/1.1 401 Unauthorized"
-    );
 }
 
 /// The node makes its local operator key at its first start, its public

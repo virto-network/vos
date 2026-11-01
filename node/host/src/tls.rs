@@ -1,6 +1,6 @@
-//! TLS 1.3 on the client ingress. The node serves either a certificate
-//! made for its own key, which clients pin by the key, or one from PEM
-//! files, which clients trust through its CA. Plain HTTP serves loopback
+//! A client's TLS 1.3 to a gateway's HTTPS: a certificate made for the
+//! gateway's own key, which clients pin by the key, or one from PEM files,
+//! which clients trust through its CA. Plain HTTP reaches loopback
 //! addresses only.
 
 use std::path::Path;
@@ -12,14 +12,13 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 
 use vos_http::tls::{ALPN, certificates, provider};
-pub use vos_http::tls::{IngressTls, server_config};
 
-/// How a client trusts a node's ingress.
+/// How a client trusts the HTTPS it reaches.
 #[derive(Clone, Debug)]
 pub enum Trust {
     /// Plain HTTP, to a loopback address only.
     Loopback,
-    /// TLS from the node with this key.
+    /// TLS from the node with this key: its API over QUIC.
     NodeKey([u8; 32]),
     /// TLS from a gateway with this key, in front of nodes it routes to:
     /// kept across redirects, and the node key it answers not compared.

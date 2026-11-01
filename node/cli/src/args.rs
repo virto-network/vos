@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use vos_node::client::Target;
-use vos_node::tls::{IngressTls, Trust};
+use vos_node::tls::Trust;
 
 use crate::{at, failed, key_bytes};
 
@@ -90,8 +90,8 @@ pub enum Command {
 
 #[derive(Subcommand)]
 pub enum NodeCommand {
-    /// Run a node until it is killed. Without TLS, it listens on a
-    /// loopback address only.
+    /// Run a node until it is killed: its API on a unix socket in its
+    /// data directory, and over QUIC when its settings name `api_listen`.
     Run(RunArgs),
     /// Print a node's public key, its identity.
     Info {
@@ -105,21 +105,19 @@ pub struct RunArgs {
     /// The node's data directory: its store, its keys and its API's socket.
     #[arg(long)]
     pub data: PathBuf,
-    #[arg(long, default_value = "127.0.0.1:7700")]
-    pub listen: SocketAddr,
     /// The agent program, as built by `just build-agent`.
     #[arg(long, env = "VOS_AGENT")]
     pub agent: PathBuf,
-    #[command(flatten)]
-    pub tls: TlsArgs,
-    /// The space's nodes, one per line: number, key, peer address and
-    /// ingress address. Without it, the node is a space of one.
+    /// The space's nodes, one per line: number, key, peer address and the
+    /// address of the gateway in front of it. Without it, the node is a
+    /// space of one.
     #[arg(long)]
     pub space: Option<PathBuf>,
     /// The node's settings, a TOML file: `executors`, `queue`,
-    /// `max_inputs`, `max_bytes`, `linger_ms`, `ingress_connections`,
-    /// `election_timeout_ms` (its two ends) and `heartbeat_ms`, each
-    /// optional. Without it, the defaults.
+    /// `max_inputs`, `max_bytes`, `linger_ms`, `election_timeout_ms` (its
+    /// two ends), `heartbeat_ms`, the API's (`api_socket`, `api_listen`,
+    /// `gateways`, …) and the operators', each optional. Without it, the
+    /// defaults.
     #[arg(long)]
     pub config: Option<PathBuf>,
     /// Bind the peer endpoint here rather than at the address the
@@ -139,7 +137,7 @@ pub enum SpaceCommand {
     /// belongs to no space forever. Then copy `<space>.genesis` beside
     /// every node's space file and restart the nodes.
     Up {
-        /// The space file: number, key, peer address and ingress address
+        /// The space file: number, key, peer address and gateway address
         /// per line.
         #[arg(long)]
         space: PathBuf,
@@ -251,56 +249,31 @@ pub struct RoleArgs {
     pub role: Granted,
 }
 
-/// TLS on a node's ingress.
-#[derive(clap::Args)]
-pub struct TlsArgs {
-    /// Serve TLS with a certificate for the node's own key, which clients
-    /// pin.
-    #[arg(long, conflicts_with = "tls_cert")]
-    tls: bool,
-    /// A name the certificate for the node's key holds: a host name or an
-    /// address. Repeat for more.
-    #[arg(long = "tls-name", requires = "tls")]
-    tls_names: Vec<String>,
-    /// Serve TLS with this PEM certificate chain, which clients trust by
-    /// its CA.
-    #[arg(long, requires = "tls_key")]
-    tls_cert: Option<PathBuf>,
-    /// The PEM key of `--tls-cert`.
-    #[arg(long, requires = "tls_cert")]
-    tls_key: Option<PathBuf>,
-}
-
-impl TlsArgs {
-    pub fn ingress(self) -> Option<IngressTls> {
-        match (self.tls_cert, self.tls_key) {
-            (Some(chain), Some(key)) => Some(IngressTls::Files { chain, key }),
-            _ if self.tls => Some(IngressTls::NodeKey {
-                names: self.tls_names,
-            }),
-            _ => None,
-        }
-    }
-}
-
 /// A node to reach, and how to trust it.
 #[derive(clap::Args)]
 pub struct NodeArgs {
-    /// The node's address: `http://` reaches a loopback address only,
-    /// `https://` needs `--node-key` or `--ca`; `unix:PATH` reaches its
-    /// API's socket, `quic://HOST:PORT` its API over QUIC, which needs
-    /// `--node-key` and `--api-key`.
-    #[arg(long, default_value = "http://127.0.0.1:7700")]
-    node: String,
+    /// The node's address: `unix:PATH` reaches its API's socket,
+    /// `quic://HOST:PORT` its API over QUIC, which needs `--node-key` and
+    /// `--api-key`; `http://` reaches a gateway on a loopback address,
+    /// `https://` a gateway pinned by `--gateway-key` or trusted through
+    /// `--ca`. An operator's command reaches the socket in the node's data
+    /// directory by default.
+    #[arg(long)]
+    node: Option<String>,
     /// The seed file of the key this client presents over QUIC, which the
     /// node lists in its `gateways`.
     #[arg(long, env = "VOS_API_KEY")]
     api_key: Option<PathBuf>,
-    /// The node's key, in hex, which its TLS must show: as `vos node run`
-    /// printed it. It wins over `--ca`.
+    /// The node's key, in hex, which its QUIC must show: as `vos node run`
+    /// printed it.
     #[arg(long, env = "VOS_NODE_KEY")]
     node_key: Option<String>,
-    /// A PEM file of the CAs that the node's TLS certificate must chain to.
+    /// The gateway's key, in hex, which its HTTPS must show. It wins over
+    /// `--ca`.
+    #[arg(long, env = "VOS_GATEWAY_KEY")]
+    gateway_key: Option<String>,
+    /// A PEM file of the CAs that the gateway's TLS certificate must chain
+    /// to.
     #[arg(long, env = "VOS_CA")]
     ca: Option<PathBuf>,
 }
@@ -310,11 +283,20 @@ impl NodeArgs {
         self.target_or(None)
     }
 
-    /// The target, pinned by the key in `kept` when neither a key nor a CA
-    /// is given for an `https://` node.
-    pub fn target_or(&self, kept: Option<&Path>) -> Result<Target, String> {
-        if self.node.starts_with("quic://") {
-            let node = match (&self.node_key, kept) {
+    /// The target; with `data`, a node's data directory, its API's socket
+    /// when no address is given, and its QUIC pinned by the key the
+    /// directory holds when no key is given.
+    pub fn target_or(&self, data: Option<&Path>) -> Result<Target, String> {
+        let node = match (&self.node, data) {
+            (Some(node), _) => node.clone(),
+            (None, Some(data)) => {
+                format!("unix:{}", data.join(crate::config::API_SOCKET).display())
+            }
+            (None, None) => return Err("--node: the node's or a gateway's address".into()),
+        };
+        if node.starts_with("quic://") {
+            let kept = data.map(|data| data.join(vos_node::NODE_KEY));
+            let key = match (&self.node_key, &kept) {
                 (Some(key), _) => key_bytes(key)?,
                 (None, Some(kept)) => key_bytes(&std::fs::read_to_string(kept).map_err(at(kept))?)?,
                 (None, None) => return Err("a quic:// node needs --node-key".into()),
@@ -324,19 +306,14 @@ impl NodeArgs {
                 .as_ref()
                 .ok_or("a quic:// node needs --api-key")?;
             let client = key_bytes(&std::fs::read_to_string(seed).map_err(at(seed))?)?;
-            return Target::quic(&self.node, node, client).map_err(failed);
+            return Target::quic(&node, key, client).map_err(failed);
         }
-        let kept = kept.filter(|_| self.node.starts_with("https://"));
-        let trust = match (&self.node_key, &self.ca, kept) {
-            (Some(key), _, _) => Trust::NodeKey(key_bytes(key)?),
-            (None, Some(ca), _) => Trust::ca_file(ca)?,
-            (None, None, Some(kept)) => {
-                let key = std::fs::read_to_string(kept).map_err(at(kept))?;
-                Trust::NodeKey(key_bytes(&key)?)
-            }
-            (None, None, None) => Trust::Loopback,
+        let trust = match (&self.gateway_key, &self.ca) {
+            (Some(key), _) => Trust::Gateway(key_bytes(key)?),
+            (None, Some(ca)) => Trust::ca_file(ca)?,
+            (None, None) => Trust::Loopback,
         };
-        Target::new(&self.node, trust).map_err(failed)
+        Target::new(&node, trust).map_err(failed)
     }
 }
 
@@ -344,9 +321,9 @@ impl NodeArgs {
 pub struct OperatorArgs {
     #[command(flatten)]
     pub node: NodeArgs,
-    /// The node's data directory, which holds its operator key and its
-    /// node key: operator commands run on the node's host, signed for that
-    /// node.
+    /// The node's data directory, which holds its operator key, its node
+    /// key and, by default, its API's socket: operator commands run on the
+    /// node's host, signed for that node.
     #[arg(long)]
     pub data: PathBuf,
 }

@@ -3,6 +3,7 @@
 //! requests in flight on a connection and the connections at once, the
 //! frame deadline, the node's time, and the socket's file.
 
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
@@ -124,11 +125,11 @@ fn unknown_kinds_and_truncated_frames_are_refused_and_closed() {
     assert_eq!(refused(&mut stream, 5), FrameError::Truncated);
 }
 
-/// Every kind answers over the socket as over HTTP: the node's key, its
-/// time, an agent's record, a schema, a malformed body, an operator's
-/// command bare on the socket.
+/// Every kind answers over the socket: the node's key, its time, an
+/// agent's record, a schema, a malformed body, an operator's command
+/// signed, and one bare, which is no envelope.
 #[test]
-fn the_socket_answers_what_http_does() {
+fn every_kind_answers_over_the_socket() {
     let served = Served::plain();
     let mut stream = connect(&served.socket);
     send(&mut stream, Kind::NodeKey as u16, 1, &[]);

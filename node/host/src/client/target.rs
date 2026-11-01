@@ -1,5 +1,5 @@
-//! A node as a client reaches it: its HTTP address, or its API's socket or
-//! QUIC address, and how the client trusts it.
+//! A node as a client reaches it: its API's socket or QUIC address, or a
+//! gateway's HTTP address, and how the client trusts it.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
@@ -19,7 +19,7 @@ pub(super) enum Api {
     Quic { client: [u8; 32] },
 }
 
-/// A node's ingress or API, and how this client trusts it.
+/// A node's API, or a gateway's HTTP, and how this client trusts it.
 #[derive(Clone)]
 pub struct Target {
     /// The `host:port` to connect to, which is also the `Host` header; a
@@ -47,7 +47,7 @@ impl Target {
         self.tls.clone()
     }
 
-    /// The node at `url` (`http://` or `https://`, then a host and an
+    /// The gateway at `url` (`http://` or `https://`, then a host and an
     /// optional port), trusted as `trust` says. Plain HTTP reaches
     /// loopback addresses only, and HTTPS needs a key or a CA to trust (or
     /// a gateway's key). `unix:` and a path reaches the node API's socket,
@@ -145,7 +145,7 @@ impl Target {
         })
     }
 
-    /// The node at `url`, over plain HTTP on a loopback address.
+    /// The gateway at `url`, over plain HTTP on a loopback address.
     pub fn loopback(url: &str) -> Result<Self, ClientError> {
         Self::new(url, Trust::Loopback)
     }
@@ -184,7 +184,33 @@ pub(super) fn authority(url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::authority;
+    use super::{Target, authority};
+    use crate::tls::Trust;
+
+    #[test]
+    fn addresses_and_trust_must_agree() {
+        let key = Trust::NodeKey([1; 32]);
+        for (url, trust) in [
+            ("http://10.1.2.3:7700", Trust::Loopback),
+            ("http://example.org", Trust::Loopback),
+            ("https://127.0.0.1:7700", Trust::Loopback),
+            ("http://127.0.0.1:7700", key.clone()),
+            ("https://127.0.0.1:7700/path", key.clone()),
+            ("ftp://127.0.0.1:7700", key.clone()),
+            ("https://127.0.0.1:port", key.clone()),
+        ] {
+            assert!(Target::new(url, trust).is_err(), "{url} was taken");
+        }
+        for (url, trust) in [
+            ("http://127.0.0.1:7700", Trust::Loopback),
+            ("http://localhost:7700/", Trust::Loopback),
+            ("http://[::1]:7700", Trust::Loopback),
+            ("https://10.1.2.3:7700", key.clone()),
+            ("https://node.example.org", key),
+        ] {
+            assert!(Target::new(url, trust).is_ok(), "{url} was refused");
+        }
+    }
 
     /// A replica's address matches the target made from it, the scheme's
     /// port written or not.

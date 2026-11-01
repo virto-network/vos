@@ -27,8 +27,6 @@ pub struct Settings {
     campaigns: Option<usize>,
     /// How long a leader waits for more inputs after the first.
     linger_ms: Option<u64>,
-    /// The most connections the ingress holds open at once.
-    ingress_connections: Option<usize>,
     /// A group's election timeout, drawn between its two ends.
     election_timeout_ms: Option<(u64, u64)>,
     /// How often a group's leader sends heartbeats.
@@ -101,7 +99,6 @@ impl Settings {
         set(self.max_bytes, &mut config.max_bytes);
         set(self.in_flight, &mut config.in_flight);
         set(self.campaigns, &mut config.campaigns);
-        set(self.ingress_connections, &mut config.ingress_connections);
         if let Some(linger) = self.linger_ms {
             config.linger = Duration::from_millis(linger);
         }
@@ -128,7 +125,6 @@ impl Settings {
             ("max_bytes", config.max_bytes),
             ("in_flight", config.in_flight),
             ("campaigns", config.campaigns),
-            ("ingress_connections", config.ingress_connections),
             ("api_connections", config.api_connections),
             ("api_in_flight", config.api_in_flight),
         ] {
@@ -183,7 +179,6 @@ mod tests {
         assert_eq!(config.election_timeout_ms, (1000, 2000));
         assert_eq!(config.heartbeat_ms, 200);
         assert_eq!(config.queue, defaults.queue);
-        assert_eq!(config.ingress_connections, defaults.ingress_connections);
         assert!(applied("").is_ok());
         let fronts =
             toml::from_str::<Settings>("api_socket = \"/run/vos.sock\"\napi_socket_mode = 0o600\n")
@@ -227,7 +222,6 @@ mod tests {
             "max_bytes",
             "in_flight",
             "campaigns",
-            "ingress_connections",
             "api_connections",
             "api_in_flight",
         ] {

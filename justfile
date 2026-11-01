@@ -113,8 +113,8 @@ test-proof: build-test-actors judge-wasm
 # debug output's environment set, and every carrier of the run searched for
 # the proof's internals, the served rows, their keys, every value written
 # and their hashes, once over wide values and once over small ones; and a
-# member's credentialed calls over the node API's socket, the node's HTTP
-# and a gateway over QUIC, every carrier searched for its device secret,
+# member's credentialed calls over the node API's socket and a gateway
+# over QUIC, every carrier searched for its device secret,
 # its proofs' masks and its place in the tree. Its tests one at a time in
 # one process, which they capture whole (its logs at every level, its
 # standard error). Then the phone bench's lines and proofs searched for

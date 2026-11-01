@@ -1,7 +1,8 @@
 //! The node's costs on three node processes: three release builds of
 //! `vos node run`, each pinned to a third of the laptop (`taskset`) and on
 //! its own data directory, joined over QUIC; a driver on the rest of the
-//! machine sends calls over HTTP, every one signed before its timed window.
+//! machine sends calls over the node API's sockets, every one signed before
+//! its timed window.
 //! - **agent:** one agent, the most commits per second, closed loop, over
 //!   sessions; then at half load, max(10k/s, half the most), open loop.
 //! - **agents:** 64 agents, the most, closed loop at 4 and 16 sessions
@@ -33,9 +34,7 @@
 //!   the driver, separated by `/`;
 //! - `DATA` where the stores go;
 //! - `VOS_BIN` another `vos` to run the nodes, to compare two builds;
-//! - `LOGS` a directory to keep the nodes' logs in;
-//! - `TLS=1` serves every node's ingress over TLS, each client pinning the
-//!   node's key, for the rows against plain HTTP.
+//! - `LOGS` a directory to keep the nodes' logs in.
 //!
 //! `machine.sh`, beside this bench's directory, runs the rows on a machine
 //! of its own, each node on cores of its own.
@@ -336,7 +335,8 @@ fn query(space: &Space, signed: &Signed, follower: usize, consistency: Consisten
                 .map(|_| Plan {
                     counts: None,
                     node: follower,
-                    path: format!("/agents/{}/queries", signed.agent.0),
+                    kind: vos_api::Kind::Query,
+                    agent: signed.agent,
                     bodies: Bodies::Ready(vec![body.clone(); per].into_iter()),
                 })
                 .collect();

@@ -1,5 +1,5 @@
-//! The gateway (`docs/design/node-api.md` §6): the node's HTTP routes, byte
-//! for byte, onto the node API of the nodes behind it, with public TLS,
+//! The gateway (`docs/design/node-api.md` §6): VOS's HTTP routes onto the
+//! node API of the nodes behind it, with public TLS,
 //! limits per address and leader-aware routing; with the `ssh` feature,
 //! s4's SSH port and its `vos-api` subsystem. It holds no authority: every
 //! signature, proof and check is a node's.

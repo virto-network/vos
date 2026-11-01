@@ -22,8 +22,8 @@
 //! entries and rows, and no node panicked or halted but those whose disk
 //! failed.
 //!
-//! In the clear or over TLS by the seed's parity, its clients one request
-//! at a time or pipelined by the next bit. The seed is printed;
+//! Its clients on the nodes' API sockets, one request at a time or
+//! pipelined by the seed's second bit. The seed is printed;
 //! `FAULTS_SEED` runs one again.
 
 #![cfg(feature = "faults")]
@@ -542,22 +542,16 @@ fn five_processes_apply_once_through_faults() {
         .ok()
         .and_then(|seed| seed.parse().ok())
         .unwrap_or(0x5eed_0003_u64);
-    let (tls, mode, api) = (
-        !seed.is_multiple_of(2),
-        if (seed >> 1).is_multiple_of(2) {
-            Mode::OneAtATime
-        } else {
-            Mode::Pipelined
-        },
-        !(seed >> 2).is_multiple_of(2),
-    );
-    println!("seed {seed}: tls {tls}, {mode:?}, api {api}");
+    let mode = if (seed >> 1).is_multiple_of(2) {
+        Mode::OneAtATime
+    } else {
+        Mode::Pipelined
+    };
+    println!("seed {seed}: {mode:?}");
     let space = Processes::start(
         env!("CARGO_BIN_EXE_vos"),
         NODES,
         Options {
-            tls,
-            api,
             settings: SETTINGS.to_string(),
             ..Options::default()
         },
