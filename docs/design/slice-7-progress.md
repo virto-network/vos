@@ -6164,3 +6164,226 @@ with their group (`load_sign` consumed by every load); L2, the mask from
 the whole program-memory table; L3, the right shift's MUL growth and
 arithmetic shifts; L4, word memory's width light; L5, the crossover's
 host calls per kernel.
+
+## M3.9 accepted: simplify and scale
+
+M3.9 is 7.0–7.6: the docs, the picks and the probes (7.0), the venue side,
+the node's anchoring and reads simplified (7.1–7.3, C1–C11), the scale
+harness and its load model (7.4, 7.5), and the scale runs with their levers
+(7.6, 7.6b–e). Its acceptance (the plan's "M3.9 acceptance") at `vos-core`
+`2f70c200` (`011ec39c` and this acceptance's fix).
+
+**Recorded** [measured]:
+- **The scale runs 1–6,** consolidated in `research/slice-7/scale-report.md`
+  (the targets by verdict, the hardware and governors, the runs' ids, the
+  cost, what binds, the levers measured and what remains):
+  - **T1 missed:** at 10^6 users and 5,000 calls a second, transfers p99
+    2.6 s at best (`r3d-if1`), 3.1 s over the final two-hour soak, against
+    50 ms; no session refused.
+  - **T2 not measurable** on one node host (S35); one host's knee about
+    8,000–9,000 calls a second at 10^5 users, about 5,000 at 10^6.
+  - **T3 met:** 45.6 MiB and 0.16% of a core per 1,000 idle replicas; the
+    10^5 stretch's idle cost met (43 MiB per 1,000), and the nodes held
+    the baseline load at 10^5 agents.
+  - **T4 met where measured:** every read at a cut served, p99.9 at most
+    6.3 s from the close, none `NotClosed`; C9's fail rate 0 of 139,467 at
+    the LAN's 1–10 ms skew; C10's proportionality not separated.
+  - **T5-partial:** re-election met in 7.6c and 7.6d (at most 4.9 and 3.6
+    s), 5.3 s at the final node (0.3 s over, at the polls' 1 s grain);
+    rejoin met (2.2–7.6 s); throughput back to 80% within 30 s missed in
+    every round (33–36 s).
+  - **T6 missed on p99** (0.8 → 2.1 s over two hours, the shared disk's
+    commit), RSS met on 10-minute means (+7.6–8.9%); no collapse, none
+    timed out.
+  - Carried (S59): the commit-to-apply gap, the disk and batched signature
+    checks; left: leaders' rebalance after a cold restart, the 120
+    `Expired` / `StaleSession` refusals, T5's host kill and T2 on more
+    machines.
+- **`simplify.md`'s counts redone** (its §8, against `011ec39c`, with the
+  method): one anchor rule, one freshness formula, one `anchored`, a
+  start bound for the range and no resume, where `f83f744b` had 3 (+2),
+  8, 7, 8 and 3; the leader's anchoring state 4 fields from 9, its waits
+  one 2 s recheck reached 8 ways and 3 settle paths, from 16 paths; but
+  the outcome variants 139 → 133 (not −70: 46 went, 40 came, the leader
+  now seeing one five-way answer), the node side's lines −110 and the
+  venue side's +530 (the shared core and jam-dev's reader), against §4's
+  estimates of −1,000–1,400 and −1,200–1,600.
+
+**Gates** [measured; each under a 12 GiB scope, `nice -n 10`,
+`CARGO_BUILD_JOBS=8`, `CARGO_INCREMENTAL=0`, one heavy run at a time; the
+logs in the coordinator's job directory, `tmp/accept/`]:
+- **`just ci-full`** at `2f70c200` (`ci-full.log`, ending `exit=0`):
+  green in 5,856 s; 189 suites, 2,397 passed, 0 failed: `ci` 135 suites,
+  1,810 passed; `test-proof` (the leakage gates at their medium N) and
+  `test-bench-proof` 54 suites, 587 passed, the carrier audit clean (451
+  `WrapRandomness` needles); `just fuzz 60`, the eleven targets a minute
+  each (`prove_verify_roundtrip` its 39 runs in 481 s), no crash.
+- **The checker loop** at `2f70c200` (`checker.log`, ending `exit=0`):
+  `EXACTLY_ONCE_SEED` 7901–7912 with `CUTS_FULL`, the three exactly-once
+  tests and `cuts` each: 48 of 48 green, 2,375 s, 111–301 s a seed at load
+  10–26 (another agent's runs beside it); 11–31 anchors a seed at the
+  venue, one a window, no evidence; of 209–630 reads an agent, 14–118
+  not served in time (the run's stops, partitions and clock jumps), 0
+  unserved.
+- **Failed first, and fixed** (rule: fix what is hit):
+  - The first `ci-full` (at `011ec39c`, `ci-full-1.log`) failed
+    `test-reads`, 7 of 7: `vos-testkit` and `vos-statement` in this
+    worktree's target had been built from the merged `s7-7.18x`
+    worktree's path, whose target was since deleted, so `programs.rs`'s
+    `env!("CARGO_MANIFEST_DIR")` named the deleted test actors' ELFs
+    (their dep-info the only two naming that path). Cargo's fingerprints,
+    relative to the workspace, held them fresh. Touched, rebuilt, green:
+    no code change.
+  - The second (`ci-full-2.log`) was green through `ci` (135 suites),
+    `test-proof` and `test-bench-proof`, then `just fuzz` failed at
+    `api_reader`: libFuzzer refuses a corpus directory that does not
+    exist, and the four targets slice 7 added (`api_reader`,
+    `operated_decode`, `credentialed_decode`, `credential_verify_bytes`)
+    have replay seeds but nothing seeds a corpus for them, so `ci-full`
+    failed on any checkout that had not run them by hand. `2f70c200`:
+    the recipe makes each target's corpus directory first. The third run
+    is the gate above.
+
+**Reviews:**
+- **Fable on 7.1–7.3** (`7.1-fable.md`, `7.2-fable.md`, `7.3-fable.md`),
+  each fix-then-merge, folded and recorded in their steps' "review's
+  fixes" (7.2's M1 with the owner's S34).
+- **Fable on the scale report:** accept after fixes, no High; four
+  mediums (the runs' node revisions as their reports name them, the
+  driver's lateness per run, T6's RSS measure, T4's metric and its
+  readers) and six lows folded (the report's "Review").
+
+**M3.9 accepted** on these gates; the push is the coordinator's.
+
+## M4 accepted: the credential AIR
+
+M4 is 7.7–7.13: the design round (7.7), the re-pins (7.8a, 7.8b), the
+Poseidon2 host call and the credential actor (7.9), the credential AIR
+(7.10), the node API and the gateway (7.10b), the verifier at ingress
+(7.11), the device library and PG1 (7.12), the honest proof refused and
+fixed, and the demo in s4 (7.13) with PG3. Its acceptance (the plan's "M4
+acceptance") at `vos-core` `2f70c200`.
+
+**Recorded** [measured, from the steps' entries unless marked]:
+- **The credential AIR's rows** (7.10): two masked components, `p2` and
+  `qm31`, each at 2^11 rows, the masking's floor (`4h`, `h = 512`);
+  log sizes `[11, 11]`, tree widths `[50, 341, 32, 20]`, 467 DEEP values;
+  the circuits use 36 permutations (auth), 1 (owner), 37 (membership
+  and payment), each padded to the same floor, so every kind costs the
+  same; columns at 2^12, the composition at 2^13, every tree at 2^15.
+  No AIR change for the tagged row (no column, constraint or degree).
+- **Proof bytes:** 195–221 KB on x86 under formats 42 and 44 (the Merkle
+  witnesses follow the coins); on the phone under 44, auth 216,762 B,
+  owner 216,815 B, membership and payment 220,441 B (7.12, PG1); at most
+  512 KiB admitted (`MAX_PROOF_BYTES`).
+- **Proving on x86** (format 44, 4 threads on P-cores, quiet): auth p50 /
+  p95 44.6 / 47.5 ms, owner 44.0 / 47.2, membership and payment 43.7 /
+  47.6 (7.10's re-timing after the fork's grind fix); `vos-phone`'s timing
+  build 44.0 / 46.8, 41.4 / 44.6, 42.6 / 49.2, peak 137–153 MiB (7.12).
+  Within the 60 ms target at p95; owner at most auth's (7.10's Q1).
+- **Proving on the phone** (PG1, session P2, Fairphone 6, format 44):
+  automatic threads auth p50 163.8–170.1 ms, p95 at most 197.1; owner
+  161.4–179.0, p95 at most 203.4; membership and payment 161.4–164.0, p95
+  at most 193.4; four big cores 129.4 / 146.7, 130.7 / 153.9, 126.1 /
+  141.5; peak 113–133 MiB; the seeded build's bytes equal x86's. PG1's
+  hard budgets met (≤ 250 ms, ≤ 256 MiB); owner's 150 ms and auth's
+  150 ms target missed at automatic threads.
+- **Verify at ingress** (`credential_ingress`, one thread): under 42,
+  quiet, auth 1.87 / 2.11 ms (p50 / p95), owner 1.78 / 1.85 ms, a wrong
+  PoW refused in 0.66 / 0.70 ms, a byte cut in 0.18 ms (pin I: ≤ 10 ms,
+  ≤ 1 ms); under 44 only under another agent's load (auth 5.52 / 10.26
+  ms, wrong PoW 1.56 / 2.18 ms, the cut 2.4 times its quiet time).
+  On the phone, verify 23.6–26.6 ms at automatic threads, 3.8–3.9 ms on a
+  big core. The executors' bound (S44) on the laptop held to `k` = 8
+  (800 a second, credentialed p99 14.7 ms against signed 4.6 ms) and
+  missed at 16 and 22; S55's run on compumax, the gate's own, is not done.
+- **`0x402`'s price** (7.9): `POSEIDON2_GAS` 2,400 (four BLAKE2b prices,
+  from 3,640–5,190 TSC cycles a native compression under load, about
+  1,800 quiet [est]); an actor's call 3,121 gas; serving it costs the agent
+  5,756 on VOS and 38,630 on JAM (`POSEIDON2_SERVING` 60,000); 37,585 gas
+  in software. The quiet native re-measure (7.9's Fable L4) is still
+  open.
+- **The re-pinned constants:**
+  - 7.8a: none of `pvm/proof/src/constants.rs` moved; the fixtures did
+    (`wrap.proof` 146,564 → 148,612 B, `wrap-midway.proof`,
+    `wrap-prefix.proof`, `statements.cases`) and the conformance
+    vectors' wrap hashes and lengths.
+  - 7.11: `BALANCE_PROGRAM` (a `Failure` variant more in its row key's
+    format); `WINDOW_PROGRAM`, `PREDICATE_PROGRAM` and the derive pins
+    unchanged.
+  - 7.12: the credential format 44 (`FORMAT`, `CONFIG`, `PARAMS`
+    `[2, 47, 16, 1, 0, 8]`); the preprocessed roots unchanged
+    (`AUTH_ROOT` `da4d5578…`, `OWNER_ROOT` `2af93263…`), both program ids
+    new (`AUTH_PROGRAM` `a8636f24…`, `OWNER_PROGRAM` `38b84e06…`); 42
+    retired.
+  - 7.8b: `blobs.lock`, 30 guest blobs, no pinned value moved; the
+    completeness fix (the fork's `9e9b4ff6`) moved no pinned root or id.
+- **A call's cost through the gateway beside the node API's** [measured
+  by every scale run, `gateway.json`, not before reported]: 38 runs, 500
+  `Time` requests each way from the coordinating desktop to the first
+  node, the gateway on loopback in front of the same API: direct p50
+  1,116–1,425 µs (median of runs 1,313), through the gateway 1,103–1,501
+  µs (1,338.5); the gateway's added p50 −48 to +130 µs, median +19 µs;
+  p99 median 2,339 direct against 2,505 µs. The localhost smoke (7.10b):
+  173 / 500 µs p50 / p99 through it against 144 / 721 µs. Both are a
+  query (`Time`); a signed call through the gateway was not measured
+  apart.
+
+**Gates:**
+- **`just ci-full`** and **the checker loop:** M3.9's runs above, on the
+  same commit.
+- **PG1** (7.12, session P2, 2026-10-27): met: auth and membership and
+  payment within 250 ms (medians 166 and 163 ms, worst p95 197 and 193
+  ms), each within 256 MiB (at most 133 MiB), every proof verified on the
+  phone and on x86, the seeded build's bytes equal x86's.
+- **PG3** (phone session P3, attempt 2, 2026-11-01 00:05–00:33; the
+  owner at the Fairphone 6) **passed.** The demo `vos-gateway-demo`
+  (`node/gateway/demo`, built 2026-10-30 from vos-core, s4 at
+  `6f60229e`) over `adb reverse tcp:2222`; the s4 app from s4's
+  `vos-pg3` (on `vos` `8e2d37f`, with the fix below), its facility
+  proving credential format 44. The flows:
+  - **enroll:** the secret from the Keystore behind the biometric
+    prompt, the device's digests shown on its own screen; the operator
+    invited the member digest and the row `alice`; Claim answered
+    "Claimed", the member at slot 0 and the row `alice`;
+  - **sign in:** after a mint of 50, the facility's "Prove membership:
+    login" chrome and a membership proof, admitted;
+  - **pay:** 20 to `shop` in the device's own form, "Paid 20 to shop
+    (proved in 163 ms)"; the demo's log reads alice 50 → 30 and shop 0 →
+    20.
+  - **Found and fixed in the session:** the app crashed at the Keystore
+    prompt (`SecurityException: Must have USE_BIOMETRIC permission`): the
+    manifest lacked `USE_BIOMETRIC`, and the bridge did not catch a
+    refused prompt. Fixed on s4's `vos-pg3`, going to s4's `vos` through
+    its CI hook.
+  - **By design, seen:** the facility refused re-enrolling the same
+    device at the same gateway for another space (`NOT_PINNED`, S48),
+    and the app refused a changed host key (TOFU).
+  - **Recorded:** the app's screens after enrolling and after paying in
+    `spikes/s7-device/runs/pg3/`; the demo's logs, the phone's logcat and
+    the screen recordings kept outside the repository (the recordings
+    caught the phone's home screen).
+  - The first attempt, during session P4 (2026-10-30), ended when the
+    blowup-8 bench cell's memory pressure killed the foreground app.
+
+**Reviews:** Fable on 7.8a (merge; L1–L4 folded), 7.9 (merge; L1–L6
+folded, L4's quiet re-measure handed off), 7.10 (accept; M1, M2, L1–L6
+folded), 7.10b (fix-then-merge; M1, M2 and the lows folded, L7 and L8
+open as acceptable) and 7.11 (fix-then-merge; M1–M3 and the lows
+folded), each recorded in its step. 7.8b, outside the plan's list, had
+its Opus review.
+
+**Left, as follow-ups:**
+- The demo's Claim enrolls the member at the credential actor before it
+  claims the row: a wrong row name leaves the member enrolled with no row
+  and no retry but a fresh space. The row's invitation should be checked
+  first, or the two made one step.
+- S55's run of the executors' bound on compumax (7.11's gate as the
+  owner worded it); the laptop's table held to `k` = 8.
+- The verifier's one-core time under format 44 on a quiet machine (only
+  measured under another agent's load), and 7.9's quiet native
+  re-measure of `0x402`.
+- A signed call's cost through the gateway, apart from the `Time` query
+  measured.
+
+**M4 accepted** with PG3 passed; the push is the coordinator's.

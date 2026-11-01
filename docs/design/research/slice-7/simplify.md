@@ -465,3 +465,106 @@ it). Each answer is recorded in `owner-decisions.md`.
     Reverses `proving.md` §7's "`S_w` over every agent's root".
 11. **C11, no anchor for a window no one reported?** (a) Yes; (b) anchor
     every window. **Recommended: (a).** Reverses nothing.
+
+## 8. The counts after the picks
+
+M3.9's gate redoes §1's and §4's counts against vos-core `011ec39c`, after
+7.1–7.3 built C1–C11 [measured]. §1–§7 above stay as written at
+`f83f744b`.
+
+**Method.** Lines are split at each file's `#[cfg(test)]` module: the
+lines before it are non-test, the rest of the file and whole files under
+`tests/` are test; blank and comment lines are counted, except for the
+queue's "code lines", which are non-blank, non-comment (its 241 at
+`f83f744b` reproduces exactly). §1's other baselines reproduce within
+0.3% by this split (`git show f83f744b:<path>`). Enums are those whose
+variants are a venue's or a client's answer, refusal, code, fate, alert
+or job state; call, event, item and encoding types, transport `Sent` /
+`Unsent`, the mock's `DispatchError` / `TokenError` and the client's copy
+of the pallet's `Error` are left out. Rule sites are `git grep`s over
+non-test venue, client and statement source (`MAX_ROOT_AGE`, `fn
+anchored|fn fresh|fn aged`, `range.contains|start_window|end_window`,
+`resume|equivocator`). Two baselines were never listed by file and
+could not be rebuilt: the node side's 4,750 / 6,200 lines and the "20
+enums, about 110 / 150"; both are re-measured below on a reconstructed
+set, at `f83f744b` and now alike.
+
+**The outcome enums:**
+
+| | `f83f744b` | now |
+|---|---|---|
+| anchor and submit outcomes | 14 enums, 101 variants (72 without the pallet's `Error`) | 16 enums, 101 variants (75 without it) |
+| with registration, migration, control and status | 21 enums, 139 variants | 24 enums, 133 variants |
+
+- Gone: `Anchored`, the client's `AnchorRefusal`, `NotAccepted`,
+  `Unjudged`, Kreivo's `Answer`, `MigrateRefusal`, `MigrateCode` (35
+  variants), and 11 from enums that shrank (`Fate` 4 → 2, `RegisterCode`
+  8 → 5, the pallet's `Error` 29 → 26, `Refusal`, the JAM `Verdict`,
+  `ControlCode`).
+- New: the clients' one answer `AnchorOutcome` (5: §3 C5's `Taken`,
+  `NotYet`, `Never`, `Unlisted`, `Stopped`), `SubmitOutcome` 3, `Held` 3;
+  the core's `Anchoring` 3, `AnchorRefusal` 7, `RegisterRefusal` 4,
+  `KeyRefusal` 3, `Status` 3; the leader's `AnchorAlert` 5 and `Offered`
+  4.
+- **So §4's "about 70 of the 150 variants go" did not happen as
+  variants:** 46 went and 40 came, net −6. What changed is where they
+  sit: the leader sees only the five-way `AnchorOutcome`; the venue's
+  pinned codes are mapped once a client; `Again`, `Window` and `Key`
+  survive only in the venue's codes and the core's `Anchoring::Again`
+  and `AnchorRefusal::{Key, Window}`.
+
+**The leader's anchoring** (`node/host/src/leader/anchor.rs`):
+
+| | `f83f744b` | §4's plan | now |
+|---|---|---|---|
+| state | 9 fields | 2 | 4: `settled`, `tried` (the last pass and the cuts built then), `alerted`, and the node's `anchor_handed` (the handoff's window, one a node across leaderships) |
+| waits | 16 wait, retry or settle paths | 4 | one recheck (`ANCHOR_RECHECK`, 2 s), reached 8 ways (the venue's time unread, the held root unread, another root held with the space stopped, the guard run, the rows unread, `NotYet`, `Unlisted`, `Stopped`); the guard's bounded wait inside a pass (`GUARD_WAIT` 2 s, `GUARD_GRACE` 200 ms once a quorum agrees); 3 settle paths (aged, settled unsent; the venue holding this root; `Never`); the queue's resend (`Fate::Again`) on the client |
+| lines | 411 (+ `anchor_keys.rs` 139) | | 421 (7.2's 355, then its review's evidence and divergence alerts and the guard's grace) |
+
+**The rules written more than once:**
+
+| rule | `f83f744b` | now |
+|---|---|---|
+| the anchor rule | 3 venues, re-derived by 2 clients | 1, `vos_anchor::venue::anchor`, called by the model venue, the Kreivo mock and the JAM service's accumulate; no client re-derives it |
+| freshness, `now − B_w ≤ MaxRootAge` | 8 sites | 1 formula (`expiry`), behind `fresh`, `aged` and `seen_expiry` |
+| "is this root anchored" | 7 | 1 (`anchored`), 8 adapters calling it |
+| the range check | 8 sites, 2 definitions | 1 start bound, `w < space.start` |
+| resume's "no equivocator listed" | 3 | 0 (no resume) |
+
+`just check-venue-rules` refuses the rule's arithmetic outside
+`vos_anchor::venue` and requires its 18 named calls. The clients call
+the core's `aged` and `passed` to decide sending and settling. The node
+computes `B_w + MaxRootAge` itself for the prover's job deadlines and
+retention at 4 sites (1 at `f83f744b`): these are not the venue's rule.
+
+**Sizes** (non-test / test lines):
+
+| component | §1 | `f83f744b`, re-measured | now |
+|---|---|---|---|
+| `vos-venue` without the mock and conformance (the queue in it) | 2,988 | 2,982 | 2,878 |
+| the Kreivo mock | 2,129 | 2,125 / 136 | 2,034 / 137 |
+| the conformance generator (test) | 3,208 | 3,199 | 3,108 |
+| the JAM statements service | 2,238 / 1,393 | 2,234 / 1,387 | 2,151 / 1,473 |
+| `vos-anchor` | 887 / 454 | 885 / 452 | 1,610 / 495 (the core `venue.rs` 386; the feature-gated `suite.rs` 354) |
+| `vos-statement`'s `lib.rs` and `model.rs` | 777 / 417 | 777 / 415 | 687 / 326 |
+| jam-dev's client | 510 / 258 | 510 / 257 | 680 / 269 (its reader thread, 7.2) |
+| **the venue side** | about 9,500 / 6,000 | 9,513 / 5,846 | 10,040 / 5,808 (9,686 / 6,162 with `suite.rs` as test) |
+| **the node side** (reconstructed set) | about 4,750 / 6,200 | 4,351 / 5,708 | 4,239 / 5,937 |
+
+The venue side's test totals include `vos-venue`'s own tests (1,628 at
+`f83f744b`, 1,653 now), which §1's "about 6,000" left out. The node set:
+`leader/{anchor,close,cut,serve,window}.rs`, `roots/*`, `anchor_keys.rs`,
+`raft/reports.rs`, the agent's `refine/closes.rs`, the host's
+`prover.rs`, the prover's `job.rs` and `worker.rs`, and `vos-venue`'s
+`queue.rs`; its tests the cluster's anchoring (was `anchor_keys`), cuts,
+representative, prover, Kreivo and roots suites, `tests/cuts/*`,
+`served/cuts.rs`, the worker's tests and the inline modules.
+
+**Against §4's estimate:** the duplication went as planned (one rule,
+one formula, one `anchored`, no resume, a start bound for the range),
+and the leader's waits are one recheck. The lines did not fall by the
+estimate's 1,000–1,400 on the node and 1,200–1,600 on the venue side:
+the node side fell by about 110 non-test lines; the venue side grew by
+about 530, the core that every venue now calls (`vos-anchor` +725) and
+jam-dev's reader thread (+170) outweighing the removals. The outcome
+variants fell by 6, not 70.
