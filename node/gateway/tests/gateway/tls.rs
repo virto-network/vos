@@ -100,14 +100,13 @@ fn a_client_trusts_a_ca() {
     let pinned = Target::new(&url, Trust::Gateway(gateway)).unwrap();
     assert!(vos_node::client::node_id(&pinned).is_err());
 
-    // A client pinning the certificate's own key as a node's gets through
-    // TLS, but the node names itself by its own key: not the node pinned.
+    // A client pinning the certificate's own key as a gateway's gets
+    // through TLS; as a node's it is refused before it dials: a node's key
+    // pins QUIC alone.
     let key: [u8; 32] = leaf_key.public_key_raw().try_into().unwrap();
-    let certificate_key = Target::new(&url, Trust::NodeKey(key)).unwrap();
-    assert!(matches!(
-        vos_node::client::node_id(&certificate_key),
-        Err(ClientError::NotTheNode)
-    ));
+    let certificate_key = Target::new(&url, Trust::Gateway(key)).unwrap();
+    assert!(vos_node::client::node_id(&certificate_key).is_ok());
+    assert!(Target::new(&url, Trust::NodeKey(key)).is_err());
 }
 
 #[test]

@@ -454,6 +454,9 @@ async fn read_request(
                 deadline.get_or_insert_with(|| Instant::now() + REQUEST_DEADLINE);
                 buffer.extend_from_slice(&chunk[..read]);
             }
+            // More header lines than it parses: a head too large, as one
+            // past its bytes.
+            Err(httparse::Error::TooManyHeaders) => return Ok(refuse(431)),
             Err(_) => return Ok(refuse(400)),
         }
     }
@@ -500,4 +503,73 @@ async fn write_response(
     answer.extend_from_slice(&response.body);
     stream.write_all(&answer).await?;
     stream.flush().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The status `bytes`, a client's whole sending, is answered from its
+    /// head, if it is.
+    fn answered(bytes: Vec<u8>) -> Option<u16> {
+        let shared = Shared {
+            handler: Arc::new(|_| Box::pin(async { Response::not_found() })),
+            head: None,
+            limits: Limits {
+                body: 1 << 10,
+                install: 1 << 10,
+                credentialed: 1 << 10,
+                idle: Duration::from_secs(5),
+                connections: 1,
+                large: LARGE,
+                credentialed_large: CREDENTIALED_LARGE,
+            },
+            large: Arc::new(AtomicUsize::new(0)),
+            credentialed: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut stream = futures_lite::io::Cursor::new(bytes);
+        let peer = SocketAddr::from(([127, 0, 0, 1], 1));
+        let read = futures_lite::future::block_on(read_request(
+            &mut stream,
+            &mut Vec::new(),
+            peer,
+            &shared,
+        ));
+        match read.expect("a read") {
+            Read::Answered(response, None) => Some(response.status),
+            _ => None,
+        }
+    }
+
+    fn head(lines: &[String], end: bool) -> Vec<u8> {
+        let mut head = String::from("GET / HTTP/1.1\r\n");
+        for line in lines {
+            head.push_str(line);
+            head.push_str("\r\n");
+        }
+        if end {
+            head.push_str("\r\n");
+        }
+        head.into_bytes()
+    }
+
+    #[test]
+    fn a_head_completed_past_the_limit_is_431() {
+        let long = format!("x: {}", "a".repeat(MAX_HEAD));
+        assert_eq!(answered(head(&[long], true)), Some(431));
+    }
+
+    #[test]
+    fn a_head_still_partial_past_the_limit_is_431() {
+        let long = format!("x: {}", "a".repeat(MAX_HEAD + 8192));
+        assert_eq!(answered(head(&[long], false)), Some(431));
+    }
+
+    #[test]
+    fn more_header_lines_than_are_parsed_is_431() {
+        let lines: Vec<String> = (0..40).map(|i| format!("x{i}: 1")).collect();
+        assert_eq!(answered(head(&lines, true)), Some(431));
+        let few: Vec<String> = (0..4).map(|i| format!("x{i}: 1")).collect();
+        assert_eq!(answered(head(&few, true)), None, "a request read");
+    }
 }

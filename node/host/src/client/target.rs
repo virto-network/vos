@@ -81,17 +81,18 @@ impl Target {
             (true, Trust::Loopback) => {
                 return Err(invalid("https:// needs a key or a CA to trust"));
             }
+            (true, Trust::NodeKey(_)) => {
+                return Err(invalid("a node's key pins QUIC: Target::quic"));
+            }
             (true, trust) => {
                 let config = tls::client_config(trust).map_err(ClientError::Http)?;
                 let name = match (ServerName::try_from(bare.to_string()), trust) {
                     (Ok(name), _) => name,
                     // A pinned key does not need the name, which only
                     // goes in the handshake.
-                    (Err(_), Trust::NodeKey(_) | Trust::Gateway(_)) => {
-                        ServerName::try_from("node.vos")
-                            .expect("a host name")
-                            .to_owned()
-                    }
+                    (Err(_), Trust::Gateway(_)) => ServerName::try_from("node.vos")
+                        .expect("a host name")
+                        .to_owned(),
                     (Err(_), _) => return Err(invalid("not a host name or an address")),
                 };
                 Some((config, name))
@@ -183,7 +184,8 @@ mod tests {
 
     #[test]
     fn addresses_and_trust_must_agree() {
-        let key = Trust::NodeKey([1; 32]);
+        let key = Trust::Gateway([1; 32]);
+        let node = Trust::NodeKey([1; 32]);
         for (url, trust) in [
             ("http://10.1.2.3:7700", Trust::Loopback),
             ("http://example.org", Trust::Loopback),
@@ -192,6 +194,9 @@ mod tests {
             ("https://127.0.0.1:7700/path", key.clone()),
             ("ftp://127.0.0.1:7700", key.clone()),
             ("https://127.0.0.1:port", key.clone()),
+            // A node's key pins its API over QUIC, never HTTPS.
+            ("https://10.1.2.3:7700", node.clone()),
+            ("https://node.example.org", node),
         ] {
             assert!(Target::new(url, trust).is_err(), "{url} was taken");
         }
@@ -200,7 +205,7 @@ mod tests {
             ("http://localhost:7700/", Trust::Loopback),
             ("http://[::1]:7700", Trust::Loopback),
             ("https://10.1.2.3:7700", key.clone()),
-            ("https://node.example.org", key),
+            ("https://gateway.example.org", key),
         ] {
             assert!(Target::new(url, trust).is_ok(), "{url} was refused");
         }

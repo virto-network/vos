@@ -318,9 +318,8 @@ fn a_client_pinning_the_gateway_calls_through_it() {
         vos_node::client::node_id(&pinned).unwrap(),
         served.node.id()
     );
-    // Pinned as a node instead, the gateway's key is not the node's.
-    let as_node = Target::new(&url, vos_node::tls::Trust::NodeKey(gateway)).unwrap();
-    assert!(vos_node::client::node_id(&as_node).is_err());
+    // A node's key pins QUIC alone: HTTPS pinned as a node's is refused.
+    assert!(Target::new(&url, vos_node::tls::Trust::NodeKey(gateway)).is_err());
     let mut client = Client::new(&pinned, SigningKey::from_bytes(&[12; 32]));
     let mut total = 0;
     for by in 1..=3u64 {
