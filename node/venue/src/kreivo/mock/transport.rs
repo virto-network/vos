@@ -129,10 +129,7 @@ impl MockChain {
     }
 
     fn inner(&self) -> MutexGuard<'_, Inner> {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut inner = crate::lock(&self.inner);
         if let Some(clock) = &self.clock {
             inner.chain.set_now(clock());
         }

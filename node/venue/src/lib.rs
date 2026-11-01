@@ -269,6 +269,13 @@ pub enum Held {
     Root([u8; 32]),
 }
 
+/// `mutex`, locked, as a holder that panicked left it.
+pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(any(test, feature = "kreivo"))]
 pub mod kreivo;
 #[cfg(any(test, feature = "model"))]

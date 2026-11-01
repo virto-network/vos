@@ -126,9 +126,7 @@ impl ModelVenue {
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        crate::lock(&self.state)
     }
 
     fn view<'a>(&self, state: &'a State) -> View<'a> {

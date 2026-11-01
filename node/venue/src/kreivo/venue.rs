@@ -305,9 +305,7 @@ impl Drop for KreivoVenue {
 
 impl Shared {
     pub(super) fn state(&self) -> MutexGuard<'_, State> {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        crate::lock(&self.state)
     }
 
     fn stopped(&self) -> bool {

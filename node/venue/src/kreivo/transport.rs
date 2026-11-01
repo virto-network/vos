@@ -259,10 +259,7 @@ impl Sender {
     /// anew with the same nonce only once their era has ended, when they
     /// can no longer land. Calls go one at a time.
     pub fn call(&self, call: &[u8]) -> Result<Sent, Unsent> {
-        let _calling = self
-            .calling
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _calling = crate::lock(&self.calling);
         let nonce = self.retry(|| self.transport.nonce())?;
         let mut signed = self.sign(call, nonce)?;
         let mut backoff = Backoff::new(self.backoff);
