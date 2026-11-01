@@ -6554,3 +6554,147 @@ Gates after the folds: `just check` exit 0, 1,696 passed in 125 suites;
 - s4's comments naming 43; a phone session at 46 (P8's pass).
 - Node kernels' before/after x86 time on one machine (only the
   throughput test against slice 6's 46.5 s here).
+
+## Step 7.22: the carrier audit, extended
+
+Branch `s7/7.22`, from vos-core `6aa9c4ca`; s4 on the branch `vos-7.22`
+(the worktree `~/src/virto/s4-vos-7.22`), from `3acea6d` (`vos-pg3`'s
+tip, after `vos`).
+
+**The harness** (`vos_checker::carriers`):
+- **Two kinds:** `DeviceSecret` (the source's output `o`, `w`, `s` and each
+  of its words, the nullifier's key `C(T(nf), s)`, BLAKE2b-256 and BLAKE3
+  of `o` and of `s`, a device kernel's private arguments), searched in
+  every carrier as the proofs are; `MemberPlace` (the member digest, its
+  leaf, its slot from 2^20, its path's occupied siblings), searched in
+  every carrier that leaves. `carriers::credential` derives `s` apart from
+  `vos-device` (the run asserts its member digest is the library's).
+  `Kind::PROVER` and `Kind::CREDENTIAL` name what each run must hold.
+- **`Needle::word`:** an M31 word by its digits, `0x` hex, byte orders
+  and postcard varint, in what leaves.
+- **M6:** every served row's key a needle; every value a run wrote,
+  served or not (`Needles::written`); the run over small values (rows in
+  [2^20, 2^24), `SMALL_FLOOR`), a value below 2^24 searched by its digits
+  and `0x` hex alone (`Needle::digits`); the floors stated in
+  `pvm/proof/SECURITY.md`. A number's `0x` hex is matched whole.
+- **Capture:** `Logs::install` empties the capture for each run; a
+  node's directory walked by file type, a socket, pipe or link named
+  only (the served harness's `api.sock` failed the read);
+  `processes::Front::serve`, a gateway in front of any nodes' API
+  addresses over a socket or QUIC.
+
+**The runs** (`just test-carriers`, one process, tests one at a time):
+- `audit::` twice, over wide values and over small ones: 134 carriers
+  each; needles 91 node-proof, 157 (small: 145) row and argument, 182
+  hash, 10 step, 15 memory-root, 19 register, 451 `WrapRandomness`, 7
+  debug-output.
+- **`credentials::`** (`node/host/tests/carriers/credentials.rs`): three
+  nodes of a founded space with the credential actor, the poll, the
+  purses and the device actor; a member's secret from a known source
+  output, seven members enrolled after it; its time, root and path
+  fetched on a socket connection of their own; on another, auth
+  sign-ins, a replay (`Replayed`), a `once` vote and a second (`Once`), a
+  cut proof (`Proof`), other arguments (`Binding`), an expired call
+  (`Expiry`), a retired format (`Format`), an owner's payment, a device
+  kernel's sign-in (format 46), its replay and its proof to a guard
+  naming no kernel (`Kind`), a sign-in proved on the test thread under
+  `drawn_in` (its masks' randomness as needles); a cut proof and a
+  sign-in over the node's HTTP and through a gateway relaying onto the
+  nodes' API over QUIC; a frame of no kind and one past its limit
+  (`FrameError`). Carriers that leave: every byte each socket connection
+  carried each way, each HTTP request and its answer's status and body,
+  each node's credentialed log entries (the work results' steps), the
+  device library's values as `Debug` and `Display` show them (calls,
+  proofs, publics, answers, `AuthWitness`, every `DeviceError` and four
+  real ones, `ProverConfig`, `FrameError`s), the logs of the nodes and
+  the gateway at every level, standard error; within the replicas: their
+  frames, log, work results, prover table, store and disk. The path's
+  fetch is searched for the secret and the masks only. 107 carriers;
+  needles 17 `DeviceSecret`, 5 `MemberPlace`, 394 `WrapRandomness`;
+  canaries in the logs (a gateway task's), standard error and the
+  connection; 50 s.
+- **The phone bench** (`tools/phone/tests/outputs.rs`): `vos-phone run`
+  (the three cells), `verify` and `kernel` (a device kernel's witness
+  input of the bench's member) run as a phone runs them; their JSON
+  lines, standard error and proofs searched for the bench's member's
+  secret, its kernel's arguments and its place (16 and 6 needles; its
+  `o`, 32 equal bytes, is no needle); 8 s. The member's values shared
+  with the bench (`src/member.rs`).
+
+**Carriers, 41 → about 250 a full run** (slice 6 counted 41 at 6.20's
+fold; the prover runs' 134 count each file apart). Each new carrier
+the brief names:
+
+| carrier | verdict |
+|---|---|
+| the credentialed call (request, answer, refusals) over the socket | audited, raw bytes each way |
+| its log entry on each replica | audited (the credentialed steps of the work results), secret and place |
+| the `path` and `root()` queries and answers | audited for the secret and masks; the place by design (`node/SECURITY.md`) |
+| `vos-device`'s errors, `Debug`, `Display` | audited (every `DeviceError`, the types a client logs); by construction too: `DeviceSecret` has no `Debug`, `AuthWitness`'s hides its fields |
+| node API frames on the socket, `FrameError` | audited raw; `FrameError` carries a limit at most |
+| node API frames over QUIC | the bodies audited as the gateway's HTTP bodies; the frames inside TLS not taken apart (same codec as the socket's) |
+| the node's HTTP and the gateway's HTTP | audited, status and body as read |
+| the gateway's logs | audited at every level (its own `debug!` and `warn!`, and quinn's, rustls's, hyper's lines) |
+| the gateway's s4 SSH surface | by construction: the `vos-api` subsystem relays the same frames through `Upstream::request`; its one log line is s4-server's error; the demo's screens show public values (a nullifier's first 8 bytes, amounts, balances; the claimed slot to the member enrolling, whose claim the gateway sent) |
+| the device kernel's ingress (format 46) and its refusals | audited (sign-in, `Replayed`, `Kind`), its arguments a needle |
+| the phone bench's lines and proofs | audited (`run`, `verify`, `kernel`); `device`/`device-cell` read: fixed public kernels, sizes and times |
+| s4's `vos.credential` facility | audited in s4 (below) |
+| `KeystoreBridge` and `SecurityKeyBridge` | read (below) |
+
+**Found and fixed (s4, `vos-7.22`, not pushed):**
+- **The store's error reached the server with a file's text**
+  (`ddbd545`): `refused(STORE, error)` passed TOML's quote of a line it
+  could not parse; `enroll` reads every other origin's enrollment file,
+  so one server could read another's member digest and handle. The
+  server now gets a fixed message.
+- **`o` and `s` left in freed heap blocks** (`f786f23`): `o` came back by
+  value through a blocking task's cell, `DeviceSecret` moved by value
+  into the proving tasks, and `enroll` held `s` in its future's state.
+  Now `Box<Zeroizing<[u8; 32]>>`, `Box<DeviceSecret>`, and the digests
+  derived in a plain function.
+- **The SSH security key's PIN** (`9fc12c2`): zero-filled when no bridge
+  takes it.
+- **The test** (`7de206e`, `credential/tests/leaks.rs`): through the C
+  ABI as the client drives it, with a known HMAC source: enroll, sign in
+  on a path at slot 5, pay, and six failures (a declined and a failed
+  source, an undecodable time, non-CBOR bytes, a missing field, another
+  origin's corrupt file); every chrome form, answer, enrollment file,
+  standard error and every freed heap block of 16 KiB or less searched for
+  `o`, `s`, its words, `w`, the nullifier's key and the siblings. Before
+  the fixes it failed on all three. Freed blocks through
+  `vos_pvm_recair` (9 holding `s`, 1 the nullifier's key: recair's
+  `Context`) are counted and printed, not failed: the gap
+  `pvm/device/SECURITY.md` states.
+- **Java, read:** `KeystoreBridge` zero-fills the HMAC output in
+  `finally`; it logs only that the key was made and whether StrongBox
+  holds it; the key is AndroidKeyStore HMAC, user authentication at each
+  use. `SecurityKeyBridge` zero-fills `output1` and clears the PIN and
+  salt on every end.
+- No leak found in VOS.
+
+**The review** (Opus), folded: H1 (the HTTP carriers were the decoded
+values: now the bytes sent and the status and body read; the QUIC frames
+recorded as above, not overclaimed); M2 (the logs carried every earlier
+run's lines: emptied at each install); M3 (the small run's binary forms
+collided by chance: a value below 2^24 by its digits alone, drawn from
+2^20); M4 (docs: the place's reach, `s`'s words in what leaves, the Role
+kinds); M5 (the bench's member shared); L1 (the walk by file type, a
+link never followed); L3 (entries by kind); L4 (the gateway canary from
+a spawned task); L6 (the slot); L7 (the debug environment set for every
+run). Left: M1's SSH surface and phone `device` commands by construction
+(the table); L2 (zero-padded hex not a form); L5 (only one proof's masks
+watched: the library's pooled proofs draw on its pool's threads, and a
+device kernel's masks are the same module's); L8's split of the
+credential run's one function.
+
+**Known gaps:** recair's `Context`, the traces and the prover's
+polynomials hold `s` until freed (stated); copies in YubiKit, the
+Keystore's parcels and the PIN's `Editable` (L3 of 7.13); a source's
+failure text reaches the server as the platform wrote it (no secret, the
+platform named: a fixed message would close it); a small integer below
+2^20 (a slot, a count) is no needle; the phone bench's own member has a
+public `o`.
+
+**Gates:** `just test-carriers` exit 0 (the three runs 287 s, the bench
+8 s); s4's credential suite exit 0 (lib 16, facility 4, leaks 1, warm 1;
+`--offline --features ffi --ignore-rust-version`), fmt and clippy clean.
