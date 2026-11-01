@@ -12,7 +12,7 @@
 //! ([`crate::node::Config::verifications`]), past which a call is answered
 //! `Busy` before its proof is decoded.
 //!
-//! **A device proof** (format 46, `slice-7-mobile.md` pin J) authorizes as
+//! **A device proof** (format 46, `proving.md` §8) authorizes as
 //! an auth credential proof does, for a method whose auth guard names a
 //! device kernel: its program is the one this node computes from the
 //! installed kernel ([`vos_pvm_recair::device::Program::auth`], kept per

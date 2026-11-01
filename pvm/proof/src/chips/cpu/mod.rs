@@ -48,7 +48,7 @@ use columns::PreprocessedColumn;
 pub(crate) use reg_access::{static_destination, step_reg_accesses};
 
 /// The CPU, a row a step. Its host calls are the BLAKE2b precompile, the
-/// witness input and the Poseidon2 call (`slice-7-mobile.md`, pin H), whose
+/// witness input and the Poseidon2 call, whose
 /// row hands `(ts, φ7, φ8)` to `Poseidon2Chip` (the `Poseidon2Call`
 /// relation). The node's segments and the device shape share it.
 pub struct CpuChip;

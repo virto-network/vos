@@ -1,5 +1,5 @@
 //! Device programs as a space's ingress and a member's device both take
-//! them (`slice-7-mobile.md` pin J, `proving.md` §8): a device kernel's
+//! them (`proving.md` §8): a device kernel's
 //! program under format 46, its id, a proof's bytes, and the auth
 //! statement's arguments and io-hash.
 //!

@@ -20,16 +20,7 @@
 //!   Poseidon2 call, the Poseidon2 chip, the logical right shifts through
 //!   the multiplication, no column a constraint pins to zero), and 32's
 //!   leaves verify it. The numbers that named its earlier forms are
-//!   [`RETIRED`]: refused, and never registered again. 24 to 27 and 29 named
-//!   it before its hardening (the witness input, the removal of the curve
-//!   chips, the AIR audit's fixes); 31, 33 and 34 named the hardened form
-//!   with the columns and next-row masks no constraint reads, 31 at 44
-//!   queries; 35 and 45 named the segment and device formats before the
-//!   chip set was shared with the node (35 without the Poseidon2 call, both
-//!   with the right shifts through the division and the seven
-//!   `MemByteActiveMonoH` columns); 36 named its legacy Blake2s form, below
-//!   the proven floor; 43 named the device format at `h = 512`.
-//!   28, 32 and 39 prove the recursion AIR (`vos-pvm-recair-air`) and keep
+//!   [`RETIRED`]: refused, and never registered again. 28, 32 and 39 prove the recursion AIR (`vos-pvm-recair-air`) and keep
 //!   their numbers; 44 proves its `p2` and `qm31` alone, the credential AIR.
 //! - **Every format** takes exactly its parameters, mixes the boundary
 //!   states as the boundary chips' bytes and grinds its interaction PoW
@@ -60,32 +51,17 @@
 //! - **The device format** (46) is counted on the device shape's masked
 //!   reference ([`DEVICE_REFERENCE`]: every chip a device program may hold
 //!   at `2^17` rows, the most install, the prover and the verifier admit).
-//!   Of the candidates measured (blowup 2 with 85–87 queries, 4 with 43 at
-//!   PoW 20 or 47 at PoW 16, 8 with 29), it takes the credential format's:
-//!   blowup 4, 47 queries, PoW 16, affine batching (62.82 proven bits). On
-//!   the auth statements none meets the device budget's 1 GiB; blowup 8 peaks
-//!   near 5.7 GiB, past a phone's memory, and blowup 2's proofs are about
-//!   twice the 1.5 MiB budget; blowup 4's times tie blowup 2's within the
-//!   noise, its proofs are within about 20% of the budget, and PoW 16's
-//!   grind has the short tail format 44 was chosen for (at PoW 20 the
-//!   BLAKE2b statement's proof fits the budget, at PoW 16 it passes it by
-//!   1%). 37, reserved at an unmasked count before the masking, is retired
-//!   unregistered. 45 took 43's parameters at `h = 256` rather than 512
-//!   (`proving.md` §5, how large `h` must be): every device chip reveals
-//!   at most 149 rows at 47 queries, so `h = 256` holds the masking's
-//!   condition without its factor two, and every chip's floor halves to
-//!   2^10 rows; the bits do not move, `h` being in neither the parameters
-//!   nor the reference. 43, admitted at `h = 512`, is retired. 46 is 45's
-//!   parameters and masking over the shared chip set's current form, a new
-//!   number because a number names one AIR; 45 is retired.
+//!   It takes the credential format's parameters: blowup 4, 47 queries,
+//!   PoW 16, affine batching (62.82 proven bits), with `h = 256`
+//!   (`proving.md` §5, how large `h` must be): every device chip reveals at
+//!   most 149 rows at 47 queries, so `h = 256` holds the masking's
+//!   condition without its factor two, every chip's floor at 2^10 rows.
+//!   The candidates measured are in `proving.md` §4.
 //! - **The credential format** (44) is counted on its masked shape
 //!   ([`CREDENTIAL_REFERENCE`]): two components at the masking's floor of
 //!   2^11 rows, where every blowup costs the same cells, so blowup 4, and
-//!   PoW 16 with the least queries that clear 62 bits beside it, 47. The
-//!   gate phone picked it over 42 (43 queries, PoW 20), whose grind's 95th
-//!   percentile there passed 50 ms; 42 is retired, since a number names one
-//!   set of parameters. 30, reserved for credential proofs at an unmasked
-//!   count, is retired unregistered.
+//!   PoW 16 with the least queries that clear 62 bits beside it, 47: PoW 16's
+//!   grind keeps a short tail on a phone.
 //! - **The wrap** (28) needs DEEP batching with an independent coefficient a
 //!   sampled value ([`DeepBatching::Affine`]) for its proven 80. Stwo batches
 //!   by powers of one coefficient, whose error is the batched values' count
@@ -311,7 +287,7 @@ pub const SEGMENT_REFERENCE: SecurityShape = SecurityShape {
     composition_point_doublings: 0,
 };
 
-/// The device format's reference (pin J), format 46's: the device set
+/// The device format's reference, format 46's: the device set
 /// (`vos_pvm_proof::device`) with every chip a device program may hold at
 /// `2^17` rows (`device::DEVICE_MAX_LOG_SIZE`, which install enforces),
 /// masked under variant (c): its columns at degree bound 2^18, the
@@ -429,7 +405,7 @@ const LEAF_FOLD_PARAMS: FormatParams = FormatParams {
 };
 
 /// Device proofs': credential proofs' parameters (format 44), picked by
-/// 7.16's measurement (see the module's notes).
+/// measurement (see the module's notes).
 const DEVICE: FormatParams = FormatParams {
     log_blowup: 2,
     n_queries: 47,

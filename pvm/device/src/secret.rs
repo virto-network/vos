@@ -1,4 +1,4 @@
-//! The device secret from a secret source (`proving.md` §8, pin K): the
+//! The device secret from a secret source (`proving.md` §8): the
 //! source's HMAC takes [`source_input`] of the space's handle, and its
 //! 32-byte output `o` gives `s` by [`derive_secret`], again at each use.
 

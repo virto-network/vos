@@ -1,4 +1,4 @@
-//! The demo's three screens on the SSH port (`slice-7-mobile.md` 7.13):
+//! The demo's three screens on the SSH port:
 //! *Enroll*, *Sign in* and *Pay*, server-owned s4 documents over the
 //! credential actor and the `purses` ledger of one agent. *Sign in* offers
 //! the credential proof (the poll's `login`) and, where the file names the

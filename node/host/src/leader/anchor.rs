@@ -17,7 +17,7 @@
 //!
 //! A window past `MaxRootAge` by the venue's time is settled unsent; while
 //! the venue's time is unread, nothing is judged. One at which the venue
-//! holds another root goes only past the divergence guard (S34): the
+//! holds another root goes only past the divergence guard: the
 //! replicas are asked for their rows of it, and the anchor, which the
 //! venue keeps as an equivocation's evidence and so ends the space, goes
 //! once a quorum of the group, this replica among it, holds this root;

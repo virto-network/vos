@@ -99,7 +99,7 @@ impl Kind {
         Self::ALL.into_iter().find(|kind| *kind as u16 == number)
     }
 
-    /// The most its body holds, in bytes: today's HTTP limit for its route
+    /// The most its body holds, in bytes: the HTTP limit for its route
     /// plus the agent's id where it names one, and an operator's envelope;
     /// a credentialed call's, the largest proof's 1.5 MiB plus the
     /// arguments' cap and 4 KiB.
@@ -184,9 +184,9 @@ impl FrameError {
 mod tests {
     use super::*;
 
-    /// The table's limits, as the brief pins them.
+    /// The table's limits, pinned.
     #[test]
-    fn the_limits_are_the_briefs() {
+    fn the_limits_are_pinned() {
         let limit = |kind: Kind| kind.limit();
         assert_eq!(limit(Kind::NodeKey), 0);
         assert_eq!(limit(Kind::Time), 0);

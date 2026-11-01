@@ -21,7 +21,7 @@ use vos_api::{Event, FrameError, Framing, Kind, Reader, Requests, error_frame, f
 use crate::Gateway;
 use crate::limits::Limits;
 
-/// The subsystem's name [decided, S49].
+/// The subsystem's name.
 pub const SUBSYSTEM: &str = "vos-api";
 /// Requests in flight on one channel: past them, the gateway reads no
 /// further until one ends.

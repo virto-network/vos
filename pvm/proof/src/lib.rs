@@ -300,7 +300,7 @@ chips! {
     CPU = chips::CpuChip,
     /// Optional: the BLAKE2b precompile's calls.
     BLAKE2B = chips::Blake2bChip,
-    /// Optional: the Poseidon2 call's permutations, one a row (pin H).
+    /// Optional: the Poseidon2 call's permutations, one a row.
     /// Before the range table: its trace-gen counts the bytes it
     /// range-checks.
     POSEIDON2 = chips::Poseidon2Chip,

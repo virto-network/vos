@@ -1,4 +1,4 @@
-//! The phone bench (`slice-7-mobile.md` 7.12, phone gate PG1): the device
+//! The phone bench (`proving.md` §8): the device
 //! library's three credential proofs, auth, owner and membership and
 //! payment, proved through `vos-device` on fixed statements, timed,
 //! verified, their peak memory read, and the PoW grinds timed alone.
@@ -6,13 +6,13 @@
 //! - `vos-phone run [--reps N] [--threads auto|N] [--cells auth,owner,joint] [--grind N] [--out DIR]`:
 //!   a `device` line, one `cell` line a statement (each statement in a
 //!   child process of its own, so its peak resident size is its own), and
-//!   a `grind` line a PoW (20, the retired format 42's, and 16, 44's);
+//!   a `grind` line a PoW (20 and 16);
 //!   every line JSON.
 //! - `vos-phone verify DIR`: verifies the proofs `run --out DIR` wrote,
 //!   against the same calls: a phone's proofs verified on x86.
 //! - `vos-phone device [--kernels DIR] [--cells LIST] [--reps N] [--warmups N] [--threads auto|N] [--out DIR]`:
 //!   device kernels proved masked under the device profile at candidate
-//!   parameters (`device.rs`, 7.16), one `device_cell` line a cell, each in
+//!   parameters (`device.rs`), one `device_cell` line a cell, each in
 //!   a child process of its own; the kernels and their witness inputs read
 //!   from DIR (default `kernels` beside the binary).
 //!
@@ -22,8 +22,7 @@
 //!   ingress computes from the installed kernel; `Prover::prove_kernel`,
 //!   format 46), on its witness input, verified here against the io-hash
 //!   of the input's last 129 bytes, auth's public arguments; the proof's
-//!   bytes written to `--out`, one `kernel` line (PG2's acceptance run,
-//!   `spikes/s7-device/scripts/pg2.sh`).
+//!   bytes written to `--out`, one `kernel` line.
 //!
 //! **Two builds:** the timing build (masks from the operating system, as
 //! the library's every build) and the seeded build (`--features seeded`:

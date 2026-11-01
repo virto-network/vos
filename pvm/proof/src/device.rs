@@ -1,4 +1,4 @@
-//! The device profile's shape (`docs/design/slice-7-mobile.md`, pin J): a
+//! The device profile's shape (`docs/design/proving.md` §8): a
 //! kernel's whole run as one segment, without the page-Merkle boundary.
 //!
 //! - **The chips** are the shared chip set's, the segment AIR's

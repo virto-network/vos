@@ -29,8 +29,7 @@ pub const ECALL_WITNESS_INPUT: u32 = 0x401;
 /// CPU-chip dispatch code for the witness input.
 pub(crate) const DISPATCH_WITNESS_INPUT: u8 = 101;
 
-/// Hostcall ID for the Poseidon2-M31 compression (`slice-7-mobile.md`, pin
-/// H): φ\[7\] points at 64 bytes, sixteen M31 words as little-endian u32,
+/// Hostcall ID for the Poseidon2-M31 compression: φ\[7\] points at 64 bytes, sixteen M31 words as little-endian u32,
 /// each below p; φ\[8\] at the 32 bytes the call writes, the first eight
 /// words of the permutation of the sixteen. A word at or above p (p itself
 /// included) traps the call; it has no other effect.

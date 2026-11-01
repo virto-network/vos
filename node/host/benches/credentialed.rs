@@ -1,4 +1,4 @@
-//! The executors' bound (slice 7's 7.11 gate, S44 as S55 states it): a
+//! The executors' bound: a
 //! node of `k` executor threads, its verification budget their default
 //! `2k`, takes at least `100·k` credentialed calls a second, each an owner
 //! proof's transfer verified at its ingress, and their 99th percentile

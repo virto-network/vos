@@ -22,7 +22,7 @@ use crate::sample::Sample;
 pub const MIX_DEFAULTS: &str = "the mix's defaults (transfers 80%, queries 15%, workflows 4.5%, reads at a cut 0.5%) are the harness's own, pending the owner's";
 
 /// What the runs do not model, stated in every report.
-pub const NOT_MODELED: &str = "not modeled: the per-call identity read, credentialed calls (measured at 7.11), cross-space traffic, proving";
+pub const NOT_MODELED: &str = "not modeled: the per-call identity read, credentialed calls (measured apart), cross-space traffic, proving";
 
 /// T2's assumption, stated in every report with the run's `K`.
 pub const T2: &str = "T2's \"room for 8 million users\" assumes K scales with users: an agent holds at most 65,536 sessions, so 8 million users need K >= 128 ledger agents; the agent is the unit of scaling";

@@ -1,5 +1,4 @@
-//! The device library (`docs/design/proving.md` §8, `slice-7-mobile.md`
-//! pins K and L): what a member's phone runs to prove facts about its
+//! The device library (`docs/design/proving.md` §8): what a member's phone runs to prove facts about its
 //! device secret to its space's ingress, and nothing a client or a gateway
 //! has to encode itself.
 //!

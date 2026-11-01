@@ -1,4 +1,4 @@
-//! The credential AIR's gates (pin I, 7.10).
+//! The credential AIR's gates.
 //!
 //! - **Soundness:** a statement its witness does not satisfy, proved all
 //!   the same (the honest prover's constraints hold, the wiring does not

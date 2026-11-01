@@ -376,8 +376,8 @@ pub enum OperatorRefusal {
     /// Its nonce ran a command already.
     #[codec(index = 1)]
     Replayed,
-    /// Taken on the node's unix socket only. Retired: every transport
-    /// takes signed operator requests.
+    /// Never sent: every transport takes signed operator requests. The
+    /// index stays reserved, so the encoding is stable.
     #[codec(index = 2)]
     SocketOnly,
     /// It is signed for another node.

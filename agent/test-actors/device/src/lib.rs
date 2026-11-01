@@ -1,5 +1,5 @@
 //! A device kernel: membership of the credential actor's Poseidon2 tree
-//! (`proving.md` §8, pin J), as `#[attestable(device)]`. Its public
+//! (`proving.md` §8), as `#[attestable(device)]`. Its public
 //! arguments are auth's `CredentialPublic` (the kind byte, then `map_root`,
 //! `scope`, `nullifier` and `binding`), its output empty; it hashes only
 //! through the `0x402` call, its io-hash the Poseidon2 one, so its shape

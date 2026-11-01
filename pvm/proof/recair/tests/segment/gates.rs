@@ -1,5 +1,5 @@
 //! The masking's soundness gates on the masked segment
-//! (`docs/design/proving.md` §5; slice 6's 6.6): masked acceptance at every
+//! (`docs/design/proving.md` §5): masked acceptance at every
 //! size on both channels, R1 over every column class; a broken constraint
 //! on the first, the last and the wrap row refused by the prover and, forced,
 //! by the verifier; an unbalanced relation refused, and the blinding unable

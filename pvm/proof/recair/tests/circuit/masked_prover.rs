@@ -372,7 +372,7 @@ impl MaskedProvers for P2Only {
     }
 }
 
-/// A one-component set is refused (pin I): the prover refuses to prove it,
+/// A one-component set is refused: the prover refuses to prove it,
 /// and the verifier refuses any proof laid out as it, before any other
 /// check. The masked prover's genericity is the credential set's
 /// (`tests/credential`), two components on any channel.

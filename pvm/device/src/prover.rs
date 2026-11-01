@@ -50,7 +50,7 @@ pub enum Threads {
     /// classes. On x86's four performance and four efficient cores the even
     /// split over both is about 1.3 times the performance cores alone; on
     /// the Fairphone 6 the A720s alone were about 1.2 times the split over
-    /// them and the A520s [measured, slice 7's 7.17 and 7.12].
+    /// them and the A520s [measured].
     Auto,
     /// This many threads, unpinned.
     Count(usize),
