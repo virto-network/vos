@@ -17,10 +17,7 @@ use vos_wire::{SpaceId, WindowClock};
 
 use vos_wire::defaults::READ_WINDOWS;
 
-use crate::job::{
-    Job, MAX_ATTEMPTS, MAX_RESUBMITS, REFUSED_KERNEL, REFUSED_RERUN, REFUSED_ROOTLESS,
-    REFUSED_UNWITNESSED, State, deadline,
-};
+use crate::job::{Job, MAX_ATTEMPTS, MAX_RESUBMITS, Refusal, State, deadline};
 
 /// The longest wait before a statement not accepted goes again: the
 /// longest window a space's clock registers.
@@ -95,16 +92,16 @@ pub trait Jobs {
     fn set_stopping(&self, stopping: bool) -> Result<(), String>;
 }
 
-/// Why a statement is not proved.
+/// Why a statement is not proved. Each reason is static, so that it holds
+/// nothing of the run's values and may be logged.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProveError {
     /// The kernel's re-run on the record's witness does not make the
     /// record's statement: refused for good.
-    Rerun(String),
+    Rerun(&'static str),
     /// The record names no kernel this prover proves: refused for good.
-    Kernel(String),
-    /// The prover failed: tried again. Its reason is static, so that it
-    /// holds nothing of the run's values and may be logged.
+    Kernel(&'static str),
+    /// The prover failed: tried again.
     Failed(&'static str),
 }
 
@@ -409,7 +406,7 @@ impl<H: Host, J: Jobs> Worker<H, J> {
             ) {
                 (true, _) => {
                     tracing::warn!(agent = agent.0, "a record at a cut states no root: refused");
-                    State::Refused(REFUSED_ROOTLESS)
+                    State::Refused(Refusal::Rootless)
                 }
                 (false, Some(proof)) => State::Proved { proof },
                 (false, None) => State::Queued,
@@ -553,7 +550,7 @@ impl<H: Host, J: Jobs> Worker<H, J> {
         }
         let (Some(statement), Some(attest)) = (job.statement(), job.attest.clone()) else {
             self.jobs
-                .put(&id, &job.to(State::Refused(REFUSED_KERNEL)))?;
+                .put(&id, &job.to(State::Refused(Refusal::Kernel)))?;
             return Ok(true);
         };
         if self.dead(&statement, self.options.expected.max(self.longest)) {
@@ -571,13 +568,13 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                 "a statement's proof never ended: refused"
             );
             self.jobs
-                .put(&id, &job.to(State::Refused(REFUSED_KERNEL)))?;
+                .put(&id, &job.to(State::Refused(Refusal::Kernel)))?;
             return Ok(true);
         }
         if attest.witness_input.is_empty() {
             tracing::error!(agent, "a statement's record holds no witness: refused");
             self.jobs
-                .put(&id, &job.to(State::Refused(REFUSED_UNWITNESSED)))?;
+                .put(&id, &job.to(State::Refused(Refusal::Unwitnessed)))?;
             return Ok(true);
         }
         let Some(kernel) = self.host.program(job.agent, &attest.program) else {
@@ -604,14 +601,19 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                 tracing::info!(agent, seconds = took.as_secs_f64(), "a statement proved");
                 self.host.record(recorder, window, id, proof, attested);
             }
-            Err(ProveError::Rerun(_)) => {
-                tracing::error!(agent, "a record's re-run is not its statement: refused");
-                self.jobs.put(&id, &job.to(State::Refused(REFUSED_RERUN)))?;
-            }
-            Err(ProveError::Kernel(_)) => {
-                tracing::error!(agent, "a record's kernel is not provable: refused");
+            Err(ProveError::Rerun(reason)) => {
+                tracing::error!(
+                    agent,
+                    reason,
+                    "a record's re-run is not its statement: refused"
+                );
                 self.jobs
-                    .put(&id, &job.to(State::Refused(REFUSED_KERNEL)))?;
+                    .put(&id, &job.to(State::Refused(Refusal::Rerun)))?;
+            }
+            Err(ProveError::Kernel(reason)) => {
+                tracing::error!(agent, reason, "a record's kernel is not provable: refused");
+                self.jobs
+                    .put(&id, &job.to(State::Refused(Refusal::Kernel)))?;
             }
             Err(ProveError::Failed(reason)) => {
                 tracing::warn!(
@@ -665,7 +667,7 @@ impl<H: Host, J: Jobs> Worker<H, J> {
             };
             let Some(statement) = job.statement() else {
                 self.jobs
-                    .put(&id, &job.to(State::Refused(REFUSED_KERNEL)))?;
+                    .put(&id, &job.to(State::Refused(Refusal::Kernel)))?;
                 continue;
             };
             if self.dead(&statement, Duration::ZERO) {
@@ -705,7 +707,7 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                     let state = if job.attest.is_some() {
                         State::Queued
                     } else {
-                        State::Refused(REFUSED_KERNEL)
+                        State::Refused(Refusal::Kernel)
                     };
                     self.release(&id, job, proof, state)?;
                 }
@@ -746,7 +748,7 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                     code,
                     "a statement refused by the venue"
                 );
-                return Some(State::Refused(code));
+                return Some(State::Refused(Refusal::Venue(code)));
             }
             SubmitOutcome::Retry(code) => code,
         };
@@ -758,7 +760,7 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                     code,
                     "a statement the venue failed to judge, every time: refused"
                 );
-                return Some(State::Refused(code));
+                return Some(State::Refused(Refusal::Venue(code)));
             }
         }
         let wait = self.retry_later(id);

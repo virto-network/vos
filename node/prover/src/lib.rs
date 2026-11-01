@@ -64,10 +64,7 @@ pub mod masked;
 pub mod program;
 
 pub use internals::{Internals, NodeProof};
-pub use job::{
-    Job, MAX_ATTEMPTS, MAX_RESUBMITS, REFUSED_KERNEL, REFUSED_RERUN, REFUSED_ROOTLESS,
-    REFUSED_UNWITNESSED, State, deadline,
-};
+pub use job::{Job, MAX_ATTEMPTS, MAX_RESUBMITS, Refusal, State, deadline};
 pub use worker::{
     Backlog, FORMAT, Host, Jobs, Options, ProveError, Prover, Record, Stepped, Worker, statement,
 };

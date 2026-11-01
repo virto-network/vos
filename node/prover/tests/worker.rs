@@ -13,10 +13,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use vos_node_prover::{
-    Jobs, MAX_ATTEMPTS, MAX_RESUBMITS, Options, REFUSED_KERNEL, REFUSED_RERUN, REFUSED_ROOTLESS,
-    REFUSED_UNWITNESSED, State,
-};
+use vos_node_prover::{Jobs, MAX_ATTEMPTS, MAX_RESUBMITS, Options, Refusal, State};
 use vos_venue::vos_statement::ProgramId;
 use vos_wire::result::Attest;
 use vos_wire::vos_anchor::MAX_ROOT_AGE_MS;
@@ -136,7 +133,7 @@ fn a_prover_that_panics_gives_up_after_three_attempts() {
     }
     let mut worker = worker(&node, &jobs, &prover, &venue);
     worker.step().unwrap();
-    assert_eq!(states(&jobs), [State::Refused(REFUSED_KERNEL)]);
+    assert_eq!(states(&jobs), [State::Refused(Refusal::Kernel)]);
     assert_eq!(venue.submissions.load(Ordering::SeqCst), 0);
 }
 
@@ -285,7 +282,7 @@ fn jobs_age_out_and_outlast_their_agents_absence() {
             .count()
     };
     assert_eq!(count(&jobs, State::Queued), 2);
-    assert_eq!(count(&jobs, State::Refused(REFUSED_ROOTLESS)), 1);
+    assert_eq!(count(&jobs, State::Refused(Refusal::Rootless)), 1);
     let aged = CLOCK.boundary(3).unwrap() + MAX_ROOT_AGE_MS + 1;
     venue.now.store(aged, Ordering::SeqCst);
     assert_eq!(worker.prune().unwrap(), 1, "the rootless one, of window 3");
@@ -386,7 +383,7 @@ fn a_witnessless_record_is_refused_for_it() {
     for _ in 0..4 {
         worker.step().unwrap();
     }
-    assert_eq!(states(&jobs), [State::Refused(REFUSED_UNWITNESSED)]);
+    assert_eq!(states(&jobs), [State::Refused(Refusal::Unwitnessed)]);
     assert_eq!(prover.made.load(Ordering::SeqCst), 0);
 }
 
@@ -443,7 +440,7 @@ fn an_io_hash_mismatch_is_refused() {
     }
     let mut states = states(&jobs);
     states.sort_by_key(|state| matches!(state, State::Accepted));
-    assert_eq!(states, [State::Refused(REFUSED_RERUN), State::Accepted]);
+    assert_eq!(states, [State::Refused(Refusal::Rerun), State::Accepted]);
     assert_eq!(node.blobs(), 1);
     assert_eq!(agent.lock().unwrap().proven.len(), 1);
     assert_eq!(venue.accepted(), 1);
@@ -496,7 +493,10 @@ fn a_transient_refusal_is_submitted_again() {
         worker.step().unwrap();
     }
     let finished = states(&jobs);
-    assert!(finished.contains(&State::Refused(3)), "3: final");
+    assert!(
+        finished.contains(&State::Refused(Refusal::Venue(3))),
+        "3: final"
+    );
     assert!(finished.contains(&State::Accepted));
 }
 
@@ -518,7 +518,7 @@ fn resubmissions_are_bounded() {
     let mut worker = worker_with(&node, &jobs, &prover, &venue, options);
     *venue.refuse.lock().unwrap() = vec![0x1001; 64];
     let start = std::time::Instant::now();
-    while states(&jobs) != [State::Refused(0x1001)] {
+    while states(&jobs) != [State::Refused(Refusal::Venue(0x1001))] {
         assert!(
             start.elapsed() < Duration::from_secs(30),
             "{:?}",
@@ -595,7 +595,7 @@ fn resubmissions_are_counted_across_restarts() {
     let options = Options { retry, ..options() };
     *venue.refuse.lock().unwrap() = vec![0x1001; 64];
     let start = std::time::Instant::now();
-    while states(&jobs) != [State::Refused(0x1001)] {
+    while states(&jobs) != [State::Refused(Refusal::Venue(0x1001))] {
         assert!(
             start.elapsed() < Duration::from_secs(30),
             "{:?}",

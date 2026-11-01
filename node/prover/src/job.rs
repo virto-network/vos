@@ -7,25 +7,69 @@ use vos_wire::result::Attest;
 use vos_wire::vos_anchor::{MAX_ROOT_AGE_MS, WindowClock};
 use vos_wire::{Decode, Encode, scale};
 
-/// A job's code when the prover refuses its record: the kernel's re-run on
-/// the record's witness does not return the record's output, public
-/// arguments and roots, or its io-hash is not theirs. Past every venue's
-/// codes.
-pub const REFUSED_RERUN: u32 = 0x1_0001;
+/// Why a statement is refused for good: by the venue, with its code, or by
+/// the prover. A job's row holds its code, a `u32`, the prover's past every
+/// venue's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// The venue's code: below the prover's.
+    Venue(u32),
+    /// The kernel's re-run on the record's witness does not return the
+    /// record's output, public arguments and roots, or its io-hash is not
+    /// theirs.
+    Rerun,
+    /// The record names no kernel the prover can prove: its program's blob
+    /// does not derive a kernel, or the kernel does not run.
+    Kernel,
+    /// The record at a cut states no root: no venue takes it.
+    Rootless,
+    /// The record holds no witness: no re-run proves it.
+    Unwitnessed,
+}
 
-/// A job's code when its record names no kernel the prover can prove: its
-/// program's blob does not derive a kernel, or the kernel does not run.
-pub const REFUSED_KERNEL: u32 = 0x1_0002;
+impl Refusal {
+    const RERUN: u32 = 0x1_0001;
+    const KERNEL: u32 = 0x1_0002;
+    const ROOTLESS: u32 = 0x1_0003;
+    const UNWITNESSED: u32 = 0x1_0004;
 
-/// A job's code when its record at a cut states no root: no venue takes
-/// it.
-pub const REFUSED_ROOTLESS: u32 = 0x1_0003;
+    /// Its code, as a job's row holds it.
+    pub fn code(self) -> u32 {
+        match self {
+            Self::Venue(code) => code,
+            Self::Rerun => Self::RERUN,
+            Self::Kernel => Self::KERNEL,
+            Self::Rootless => Self::ROOTLESS,
+            Self::Unwitnessed => Self::UNWITNESSED,
+        }
+    }
 
-/// A job's code when its record holds no witness: no re-run proves it.
-pub const REFUSED_UNWITNESSED: u32 = 0x1_0004;
+    /// The refusal a job's row's code names.
+    pub fn of(code: u32) -> Self {
+        match code {
+            Self::RERUN => Self::Rerun,
+            Self::KERNEL => Self::Kernel,
+            Self::ROOTLESS => Self::Rootless,
+            Self::UNWITNESSED => Self::Unwitnessed,
+            code => Self::Venue(code),
+        }
+    }
+}
+
+impl Encode for Refusal {
+    fn encode_to(&self, buf: &mut Vec<u8>) {
+        self.code().encode_to(buf);
+    }
+}
+
+impl Decode for Refusal {
+    fn decode(data: &[u8]) -> Result<(Self, usize), vos_wire::DecodeError> {
+        u32::decode(data).map(|(code, used)| (Self::of(code), used))
+    }
+}
 
 /// The times proving a statement may begin before it is refused
-/// ([`REFUSED_KERNEL`]): a kernel whose proof panics or stops the node.
+/// ([`Refusal::Kernel`]): a kernel whose proof panics or stops the node.
 pub const MAX_ATTEMPTS: u32 = 3;
 
 /// The times a statement goes again after a venue failed to judge it
@@ -54,10 +98,9 @@ pub enum State {
     /// The venue holds it accepted: accepted now, or before (a repeat).
     #[codec(index = 4)]
     Accepted,
-    /// Refused, with the venue's code, or [`REFUSED_RERUN`] or
-    /// [`REFUSED_KERNEL`] by the prover.
+    /// Refused, by the venue or the prover.
     #[codec(index = 5)]
-    Refused(u32),
+    Refused(Refusal),
     /// Its anchor passed `MaxRootAge` by the venue's time, or would before
     /// its proof ends: no venue takes it.
     #[codec(index = 6)]
@@ -173,4 +216,27 @@ pub fn deadline(statement: &Statement, clock: &WindowClock) -> Option<u64> {
                 .map_or(0, |boundary| boundary.saturating_add(MAX_ROOT_AGE_MS))
         })
         .min()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A refused job's row holds its code as a `u32`, the prover's past
+    /// every venue's, and reads back as the refusal it was.
+    #[test]
+    fn a_refusal_is_its_code_in_the_row() {
+        for (refusal, code) in [
+            (Refusal::Venue(3), 3u32),
+            (Refusal::Venue(0x1001), 0x1001),
+            (Refusal::Rerun, 0x1_0001),
+            (Refusal::Kernel, 0x1_0002),
+            (Refusal::Rootless, 0x1_0003),
+            (Refusal::Unwitnessed, 0x1_0004),
+        ] {
+            let row = State::Refused(refusal).encode();
+            assert_eq!(row, [&[5][..], &code.to_le_bytes()].concat());
+            assert_eq!(State::decode_exact(&row), Some(State::Refused(refusal)));
+        }
+    }
 }

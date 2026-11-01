@@ -227,7 +227,7 @@ impl Prover for Proofs {
             panic!("the prover fails");
         }
         if self.refused.lock().unwrap().as_ref() == Some(&attest.output) {
-            return Err(ProveError::Rerun("the io-hash is not the record's".into()));
+            return Err(ProveError::Rerun("the io-hash is not the record's"));
         }
         let made = self.made.fetch_add(1, Ordering::SeqCst);
         Ok([b"proof".as_slice(), &attest.output, &made.to_le_bytes()].concat())

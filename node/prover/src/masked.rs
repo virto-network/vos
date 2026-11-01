@@ -38,12 +38,11 @@ pub struct MaskedProver {
 
 /// The install's record of `blob`, a kernel, recomputed from it: its hash,
 /// its shape from its code and its image root.
-pub fn kernel_record(blob: &[u8]) -> Result<Kernel, String> {
-    let shape = vos_pvm_compiler::shape::kernel_shape(blob)
-        .ok_or_else(|| String::from("not a kernel's program"))?;
+pub fn kernel_record(blob: &[u8]) -> Result<Kernel, &'static str> {
+    let shape = vos_pvm_compiler::shape::kernel_shape(blob).ok_or("not a kernel's program")?;
     let image_root = vos_pvm_program::parse_standard_program(blob)
         .and_then(|program| program.image_root())
-        .ok_or_else(|| String::from("not a standard program"))?;
+        .ok_or("not a standard program")?;
     Ok(Kernel {
         method: MethodId(0),
         program: ProgramHash::of(blob),
@@ -60,7 +59,7 @@ impl MaskedProver {
     /// `kernel`'s program and entry, from its blob.
     fn kernel(&self, kernel: &[u8]) -> Result<Program, ProveError> {
         let hash = ProgramHash::of(kernel);
-        if let Some(program) = self.lock().get(&hash) {
+        if let Some(program) = self.programs().get(&hash) {
             return Ok(Arc::clone(program));
         }
         let record = kernel_record(kernel).map_err(ProveError::Kernel)?;
@@ -70,16 +69,14 @@ impl MaskedProver {
             vos_pvm_compiler::TRANSPILER_VERSION,
             &SEGMENT,
         )
-        .map_err(ProveError::Kernel)?;
+        .map_err(|_| ProveError::Kernel("the kernel's program does not build"))?;
         let program = Arc::new(program);
-        self.lock().insert(hash, Arc::clone(&program));
+        self.programs().insert(hash, Arc::clone(&program));
         Ok(program)
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ProgramHash, Program>> {
-        self.programs
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn programs(&self) -> std::sync::MutexGuard<'_, HashMap<ProgramHash, Program>> {
+        lock(&self.programs)
     }
 
     /// `kernel` re-run on `attest`'s witness: its trace, when the run reads
@@ -88,7 +85,7 @@ impl MaskedProver {
     /// output alone, so its record has none.
     pub fn rerun(&self, kernel: &[u8], attest: &Attest) -> Result<KernelTrace, ProveError> {
         let trace = trace_kernel(kernel, &attest.witness_input, RERUN_GAS)
-            .map_err(|error| ProveError::Rerun(format!("the kernel does not re-run: {error:?}")))?;
+            .map_err(|_| ProveError::Rerun("the kernel does not re-run"))?;
         let parts = KernelReturn {
             public_args: attest.public_args.clone(),
             output: attest.output.clone(),
@@ -104,21 +101,19 @@ impl MaskedProver {
         };
         if !returned {
             return Err(ProveError::Rerun(
-                "the re-run returns other public arguments, output or roots than the record's"
-                    .into(),
+                "the re-run returns other public arguments, output or roots than the record's",
             ));
         }
         if trace.io_hash != parts.io_hash() {
             return Err(ProveError::Rerun(
-                "the re-run's io-hash is not the record's".into(),
+                "the re-run's io-hash is not the record's",
             ));
         }
         let read: usize = trace.reads.iter().map(|read| read.count).sum();
         if read != attest.witness_input.len() {
-            return Err(ProveError::Rerun(format!(
-                "the re-run reads {read} of the witness's {} bytes",
-                attest.witness_input.len()
-            )));
+            return Err(ProveError::Rerun(
+                "the re-run does not read the witness whole",
+            ));
         }
         Ok(trace)
     }
@@ -213,12 +208,19 @@ impl MaskedProver {
                 // can be made.
                 TreeError::Empty
                 | TreeError::Segment(ProvingError::Shape { .. } | ProvingError::MalformedShape) => {
-                    ProveError::Kernel(format!("{error:?}"))
+                    ProveError::Kernel("the run does not fit its kernel's shape")
                 }
                 error => ProveError::Failed(failed(&error)),
             }
         })
     }
+}
+
+/// `mutex`, locked, as a holder that panicked left it.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// What failed, and nothing of the values it failed on: an error's `Debug`
@@ -259,10 +261,7 @@ pub struct Disclosing {
 impl Disclosing {
     /// Every statement proved so far: its record and its proof's internals.
     pub fn made(&self) -> Vec<(Attest, Internals)> {
-        self.made
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+        lock(&self.made).clone()
     }
 }
 
@@ -274,10 +273,7 @@ impl Prover for Disclosing {
 
     fn prove(&self, kernel: &[u8], attest: &Attest) -> Result<Vec<u8>, ProveError> {
         let (proof, internals) = self.masked.prove_disclosing(kernel, attest)?;
-        self.made
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push((attest.clone(), internals));
+        lock(&self.made).push((attest.clone(), internals));
         Ok(proof)
     }
 }
