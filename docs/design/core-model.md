@@ -11,7 +11,9 @@ S1–S6, S5b and SJ. Tags:
 - **[decided]**: confirmed by the project owner, or settled by a spike the
   owner delegated the choice to;
 - **[proposed]**: recommendation awaiting review;
-- **[open]**: left for a later run.
+- **[open]**: left for a later run;
+- **[built]**: what the code holds; **[measured]**, **[model]**, **[est]**:
+  numbers from a run, a model, or arithmetic on measured numbers.
 
 This is the model for a new core built on branch `vos-core` (from master
 `d2378274`). The v2 service layer on master, the saga's agent layer and
@@ -1015,9 +1017,9 @@ outbox sequence numbers, which receivers deduplicate.
     taking whole, at their value now, so a lost or split round loses
     nothing; a frame waits for room in the peer's queue, and a round ends
     at the first refused. A follower goes quiet only while its leader's
-    listing names it. Listing every group every round, at 10^5 groups, had
-    overflowed the peers' queues and set off elections among the groups
-    left unlisted.
+    listing names it. A full listing every round overflows the peers'
+    queues at 10^5 groups and sets off elections among the groups left
+    unlisted [measured].
   - **Lanes:** an agent's consensus frames, and its requests, go on one
     of `peer_lanes` streams a peer by the agent's id, so no group waits for
     a stream however many talk at once. `peer_lanes` is the same on every
@@ -1044,9 +1046,11 @@ outbox sequence numbers, which receivers deduplicate.
     2.6–3.1 s against T1's 50 ms, the shared disk's commit binding
     (S59 carries the commit-to-apply gap, the disk and batched signature
     checks).
-- **Many active agents per node** are not yet within budget. With S3's
-  prototype node writer, p99 was 16–56 ms at 16 active agents and up to
-  191 ms at 64, and leaders were lost at 1,000 (section 14; work item 16).
+- **Many active agents per node:** with S3's prototype node writer, p99
+  was 16–56 ms at 16 active agents and up to 191 ms at 64, and leaders
+  were lost at 1,000. The scale runs above hold 10^5 replicas a node with
+  no election; what still misses is T1's latency under load (section 14;
+  work item 16).
 - Rebalancing uses membership changes (joint consensus exists in vos-raft).
 
 ## 11. `#[attestable]` [decided intent and direction; sizes proposed]
@@ -1127,8 +1131,8 @@ outbox sequence numbers, which receivers deduplicate.
   not know the id.
 - The prover attaches each call to its chip (BLAKE2b) inside the same
   slice. The Ristretto and scalar ids 110–114 are no precompile: their
-  chips were removed as unsound, and a generic bignum chip (slice 7)
-  replaces them. The STARK alone rejects a tampered call input (S5b).
+  chips were removed as unsound, and a generic bignum chip (M6, after
+  slice 7) replaces them. The STARK alone rejects a tampered call input (S5b).
 - **On JAM,** the unknown id returns `WHAT` and the guest computes in
   software, with identical results for runs that complete.
 - **Gas** [decided; delegated by the owner]:
@@ -1541,8 +1545,8 @@ prototypes exist where noted.
     by the recursion (slice 5).
 13. ~~Move Ristretto and the scalar operations (ids 110–114) into the VOS
     range.~~ Removed instead: their chips and ids are gone from the prover,
-    the runtime and the shims; a generic bignum chip (slice 7) takes their
-    place.
+    the runtime and the shims; a generic bignum chip (M6, after slice 7)
+    takes their place.
 
 **Storage**
 
@@ -1566,7 +1570,7 @@ prototypes exist where noted.
     - eager commit notification;
     - one shared executor;
     - heartbeats that never wait on log I/O, combined per node pair, with
-      quiescence for idle groups.
+      quiescence for idle groups (built: section 10).
 20. Incremental merkle-crdt apply per sync scope, with author chains, local
     operations in place, storage-backed CRDT types and read-time filtering
     (S6, section 9.4).
