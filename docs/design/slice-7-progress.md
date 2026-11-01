@@ -7009,3 +7009,55 @@ it).
 `838d4f382` (the node's HTTP deleted, its clients moved), `ded9cd397`
 (`vos-scale`), `77be3da50` (docs), `2ff1caf21` (the review folded),
 `2796df149` (the carrier audit's count).
+
+## Scale run 3, final build
+
+Step 7.23's run 3 again on the final build, and S50's T1 re-measured over
+the node API, on branch `s7/run3`. The build is vos-core `88fc26e18` in
+release, under `~/vos-scale/bins-s7run3`. The shape was `r3d-if1`'s: 10^6
+users, 5,000 calls a second, `x` = 98%, 1,860 s, `K` = 64, one batch in
+flight, a full deploy.
+
+The inventory changed for C10: `ingress = 770N` became `api = 870N`, and
+the old file is kept as `~/vos-scale/inventory.pre-c10.toml`.
+
+compumax's governor was `performance`. sigma's was `powersave`, as its
+restart left it; it was warned of and not changed, and the driver was
+late by at most 23 ms, as before.
+
+**The two runs** (`20261101T182528Z-r3f-api-1`, `20261101T185808Z-r3f-api-2`):
+
+| | `r3d-if1` | each final run |
+|---|---|---|
+| transfers answered | 3,999.5 a second | 3,999.5 a second |
+| transfers p50 / p99 / p99.9 | 328 ms / 2.6 s / 4.2 s | 197 ms / 1.31 s / 2.1 s |
+| timed out, sessions refused, leader changes | 0 | 0 |
+| node CPU (of 4 cores) | 2.5–2.7 | 2.6–2.8 |
+| RSS | 2,068–2,097 MiB | 1,916–1,998 MiB |
+| runtime thread | 42–46% | 23–26% |
+| executors, each | 42–47% | 52–56% |
+
+The runtime thread fell because the node's HTTP server no longer runs on
+it.
+
+**What the gain comes from:**
+- Mostly 7.6e's node. `r6e-soak`, still over HTTP, had the same median
+  10-second p99 (786 ms) over its first 31 minutes.
+- The API trims the worst intervals: the maximum interval p99 is 2.6 s,
+  against 3.7 s in `r6e-soak` and 6.3 s in `r3d-if1`.
+- **The stream bound:** the driver's one connection a node held up to
+  4,768 requests against the node's `api_in_flight` of 1,024. Waits for a
+  stream count in the latency, and the harness warns of it. A run with it
+  raised would separate that wait from the nodes' own time.
+
+**The binary:** the release `vos` grew from 11.1 to 25.6 MB.
+- The growth is code, not debug info: `.text` went from 7.7 to 21.0 MB.
+- Most of it is the device-proof verifier (`vos_pvm_proof`, stwo, rayon),
+  which `vos-node` links through `vos-pvm-recair` since `6ac865b68`.
+- This load sends no credentialed calls, so that code never ran here.
+
+**T1 still missed:** p99 1.31 s against 50 ms, 26 times the target (52
+times at 7.6d). The one shared disk's fsync still binds.
+
+The scale report's new section, "Run 3 on the final build (over the node
+API)", gives the details. Both hosts were left with 0 units.

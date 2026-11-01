@@ -5,7 +5,8 @@ targets T1–T6 (`slice-7-mobile.md`, S26, narrowed by S35 and S36). The
 runs were made in five rounds, each recorded in `slice-7-progress.md`:
 7.6 (run 1), 7.6b (the per-replica levers, run 1 again), 7.6c (runs 2–6),
 7.6d (the election storm, levers 1 and 2, runs 3–6 again) and 7.6e (the
-soak's step, the cold restart's memory, runs 4–6 again). This report
+soak's step, the cold restart's memory, runs 4–6 again), then run 3 once
+more on the final build over the node API (7.23). This report
 gathers them; every number is from those entries or from the runs' own
 reports under `~/vos-scale/runs/` on the coordinating desktop. Tags:
 [measured] from a run; [derived] arithmetic on measured numbers, shown.
@@ -14,7 +15,7 @@ reports under `~/vos-scale/runs/` on the coordinating desktop. Tags:
 
 | target | verdict | best final numbers | runs |
 |---|---|---|---|
-| T1 users: 10^6 users, 5,000 calls/s, `x` = 98%, client p99 ≤ 50 ms, no session refused | **missed** (p99) | 3,999.5 transfers/s answered at offer; transfers p50 / p99 / p99.9 328 ms / 2.6 s / 4.2 s, none timed out, no session refused (7.6d). At the final node over the soak's two hours: 328 ms / 3.1 s / 6.3 s, its first half hour's p99 (median 10-minute interval) 786 ms (7.6e) | `20261030T235838Z-r3d-if1`; `20261031T160903Z-r6e-soak` |
+| T1 users: 10^6 users, 5,000 calls/s, `x` = 98%, client p99 ≤ 50 ms, no session refused | **missed** (p99) | final build over the node API (7.23, two runs): 3,999.5 transfers/s answered at offer; transfers p50 / p99 / p99.9 197 ms / 1.31 s / 2.1 s, none timed out, no session refused. Over node HTTP: 328 ms / 2.6 s / 4.2 s (7.6d). At the final node over the soak's two hours: 328 ms / 3.1 s / 6.3 s, its first half hour's p99 (median 10-minute interval) 786 ms (7.6e) | `20261101T182528Z-r3f-api-1`, `20261101T185808Z-r3f-api-2`; `20261030T235838Z-r3d-if1`; `20261031T160903Z-r6e-soak` |
 | T2 headroom: knee ≥ 40,000 calls/s on ≥ 4 node hosts | **not measurable** (S35: one node host) | one host's knee about 8,000–9,000 calls/s at 10^5 users (`x` = 98%), about 10,000 at `x` = 30%, about 5,000 at 10^6 users; not re-measured after 7.6d–e's levers | run 2's steps (7.6c), `20261027T184355Z-r3-u1m-6400` |
 | T3 agents: 10^4 a space, idle ≤ 5% of a core and ≤ 64 MiB per 1,000 replicas | **met**, the 10^5 stretch's idle cost met; beyond the target, 10^5 agents also held the baseline load | 45.6 MiB and 0.16% of a core per 1,000 replicas (1k → 10k, 7.6b); 46 MiB per 1,000 at 10^4 under load (7.6c). 10^5: 43 MiB per 1,000 idle; under the baseline load 0 elections, transfers p50 / p99 / p99.9 197 ms / 1.05–1.31 s / 2.1 s, RSS flat at 6.1 GiB a node (7.6d) | `20261027T072743Z-r1b-idle-10k`, `20261027T192015Z-r4-idle-10k`, `20261031T014621Z-r4d-idle-100k`, `20261031T080020Z-r4e-idle-100k` |
 | T4 windows: every read served by `B_w + D + 10 s`, none `NotClosed` without a fault | **met where measured** (p99.9 at most 6.3 s from the close, none `NotClosed`; the maximum is not recorded); the representative's work per reader not separated | readers' reads 15,520 of 15,520 at 10^5 agents (p99 / p99.9 4.2 / 5.2 s from the close); reads at a cut 0 errors in every run that kept up (181,856 over the final soak, p99.9 6.3 s from the close); C9's fail rate 0 of 139,467 at the LAN's 1–10 ms skew (7.6c) | `20261031T014621Z-r4d-idle-100k`, `20261031T160903Z-r6e-soak` |
@@ -218,6 +219,113 @@ Run 3's shape for two hours:
   56 → 92 ms, the writer's fsync mean 28 → 40 ms as the state grows, on the
   one shared disk.
 
+## Run 3 on the final build (over the node API)
+
+Step 7.23's rerun of run 3 on the final build, and S50's T1 re-measured
+over the node API (the node's HTTP was deleted in C10). It uses vos-core
+`88fc26e18`, built under `~/vos-scale/bins-s7run3`. The shape is the one
+recorded for `r3d-if1`: `--shards 64 --users 1000000 --rate 5000 --secs 1860
+--identity --representative`, `x` = 98%, one batch in flight (the node's
+default), a full deploy, and the same hosts and cores. Two repetitions,
+on 2026-11-01.
+
+- **Governors:** compumax `performance` on all 32 cores (`check` read the
+  nodes' cores as such). sigma came back from a restart (an unrelated hang)
+  with `powersave` (intel_pstate, `balance_performance`), which `check`
+  warned of, and it was not changed. The driver used 0.25 cores and was
+  late by at most 23 ms (0.00% of sends past 10 ms), as in `r3d-if1`.
+- **The inventory:** `ingress = 7701–7703` became `api = 8701–8703`. The
+  file named no `transport`, `driver_connections` or
+  `ingress_connections`.
+
+Transfers [measured]:
+
+| run | node | transport | answered/s | p50 / p99 / p99.9 | timed out | refused | node CPU (of 4) | RSS MiB |
+|---|---|---|---|---|---|---|---|---|
+| `20261030T235838Z-r3d-if1` | `eb76f560` | node HTTPS, 512 connections a node | 3,999.5 | 328 ms / 2.6 s / 4.2 s | 0 | 0 | 2.48–2.70 | 2,068–2,097 |
+| `20261101T182528Z-r3f-api-1` | `88fc26e18` | node API, QUIC, one connection a node | 3,999.5 | 197 ms / 1.31 s / 2.1 s | 0 | 0 | 2.63–2.79 | 1,960–1,998 |
+| `20261101T185808Z-r3f-api-2` | `88fc26e18` | the same | 3,999.5 | 197 ms / 1.31 s / 2.1 s | 0 | 0 | 2.66–2.78 | 1,916–1,974 |
+
+- **Every kind:** each run answered all 9,299,728 calls, with 0 errors, 0
+  sessions refused and 0 leader changes. Queries p99 0.66–0.79 s (was
+  1.8 s), workflows 1.8–2.1 s (was 4.2 s), reads at a cut p99 from the
+  close 3.7–4.2 s (was 6.3 s).
+- **The histograms' grain:** the harness's buckets are a quarter-octave
+  wide, so 1.31 s and 2.6 s are bucket bounds. The halving is eight
+  buckets.
+- **The 10-second intervals:** the transfers' p99 in each 10-second
+  interval over the run had a median of 786 ms in both runs (was 1.31 s),
+  a 90th percentile of 1.3–1.6 s (was 2.6 s) and a maximum of 2.6 s (was
+  6.3 s).
+- **The nodes' stages, p50:**
+
+  | stage | `r3d-if1` | final build |
+  |---|---|---|
+  | batch | 131 ms | 98 ms |
+  | commit | 49–57 ms | 41 ms |
+  | queued | 82 ms | 57–65 ms |
+  | disk time per I/O | 16.8 ms | 12.8–13.2 ms |
+  | NVMe `%util` | 66% | 70% |
+
+**What differs from `r3d-if1`, and what it explains:**
+- **The node's code:** `eb76f560` to `88fc26e18`, 150 commits.
+  - On this path: 7.6d's last two (`d26eecd3`, the starts' reads on the
+    executors; `d9824539`, `between` from a batch's landing).
+  - 7.6e's scan that ends at its prefix (`63b2f033`), the placements
+    stored by one task, and the campaigns handed on.
+  - C10's deletion of the node's HTTP.
+  - The rest (the credential and device-proof checks, the cuts, the
+    code-quality steps) adds no work to an uncredentialed call.
+- **Most of the gain came with 7.6e's node, not with the transport.**
+  `r6e-soak` (`24f11862`, still over node HTTPS) had a median 10-second
+  p99 of 786 ms over its first 31 minutes, the same as here. Its 90th
+  percentile was 1.8 s and its maximum 3.7 s, against 1.3–1.6 s and 2.6 s
+  here. Over the same span the API adds no tail that HTTP did not have;
+  it trims the worst intervals somewhat. A run of `24f11862` on the same
+  day would separate the two, but it was not made.
+- **The node's CPU moved off the runtime thread:**
+  - `vos-node` dropped from 42–46% of a core to 23–26%. The HTTP server,
+    its parsing and its 512 connections a node ran there.
+  - The executors rose from 42–47% to 52–56% each, and the total node
+    CPU from 2.5–2.7 to 2.6–2.8 cores.
+  - `vos-net` stayed at 18–20%.
+  - The busiest threads, from the samples over the report's window
+    (`~/vos-scale/s7run3/threads.py`).
+- **The driver's stream bound:**
+  - The driver keeps one QUIC connection a node, and a node takes 1,024
+    requests at once on it (`api_in_flight`). At most 4,756–4,768 were in
+    flight on one connection.
+  - The rest waited for a stream, and their wait counts in the latency,
+    since each call is timed from its scheduled send. The report warns
+    "the stream bound".
+  - `r3d-if1` had 7,182 requests in use at most across its 512
+    connections a node.
+  - So the final build's tail may include a client-side wait. A run with
+    `[node] api_in_flight` raised (4,096 or 8,192) would separate it.
+- **The binary:**
+  - The final `vos` is 25.6 MB against 11.1 MB (`bins-7.6e3`). Neither is
+    stripped and neither has debug sections (`readelf -S`: `.symtab`
+    only). The growth is code: `.text` is 21.0 MB against 7.7 MB.
+  - Most of it is `vos_pvm_proof` (7.7 MB), `stwo_constraint_framework`
+    (1.6 MB), `stwo` and `rayon` (1.8 MB). This is the device-proof
+    verifier, which `vos-node` links through `vos-pvm-recair` since
+    `6ac865b68` (credentialed calls, format 43, then 45).
+  - It is not the `prover` feature: `vos-cli`'s only default feature is
+    `mimalloc`.
+  - Only a credentialed call with a device proof runs it, and this load
+    sends none ("not modeled: credentialed calls"), so the comparison is
+    like for like on the path measured.
+- **Unchanged:** the hosts, the cores, the 8 GiB caps, the one shared
+  NVMe, the mix, `K` = 64, and the space freshly deployed.
+
+**T1 over the node API: still missed.** The transfers' p99 is 1.31 s
+against 50 ms, 26 times the target [derived: 1,310.72 ms ÷ 50 ms = 26.2].
+At `r3d-if1` it was 52 times. The rate was met (3,999.5 transfers a second
+of 5,000 calls offered, every call answered) and no session was refused.
+The bind is unchanged: the commit's fsync on the one disk the three nodes
+share (NVMe 70% busy, commit p99 262–328 ms), with the 4-core cpusets at
+66–70%.
+
 ## The cost
 
 Per node at T1's shape (10^6 users, 5,000 calls a second, `x` = 98%; every
@@ -298,7 +406,8 @@ Per idle agent (three replicas, one a node):
 - **The 120 `Expired` / `StaleSession` refusals** past the soak's hour:
   sessions the agents expired that the driver still held; not
   investigated.
-- **T1's 50 ms:** the best p99 at T1's shape 2.6 s; no measured step at
+- **T1's 50 ms:** the best p99 at T1's shape 1.31 s (the final build,
+  over the node API; 2.6 s over node HTTP at 7.6d); no measured step at
   any rate has reached 50 ms (229 ms at 1,000 a second, 10^5 users).
 - **T2, and run 2 without its slowest host:** need four node hosts (S35).
   The one host's knee was not re-measured after 7.6d–e.
@@ -318,7 +427,7 @@ Per idle agent (three replicas, one a node):
 `summary.json`, `nodes.jsonl`, `faults.json`); the inventories
 `inventory.toml`, `inventory.r4-12g.toml` and `inventory.r5.toml`; the
 scripts in `~/vos-scale/s76c/`, `s76d/` and `s76e/`; the binaries in
-`bins-7.6c`, `bins-7.6d`, `bins-7.6e3` and `bins-7.6e-prof`; the profiles
+`bins-7.6c`, `bins-7.6d`, `bins-7.6e3`, `bins-7.6e-prof` and `bins-s7run3` (the final build); the final build's scripts in `~/vos-scale/s7run3/`; the profiles
 in `compumax:~/vos-scale/prof/`.
 
 ## Review
