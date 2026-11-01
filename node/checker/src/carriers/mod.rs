@@ -4,8 +4,11 @@
 //! A run knows what it must not show: the segment, leaf and fold proofs it
 //! built, the rows it served, the plain hashes of its private arguments,
 //! its step counts, its memory roots, its registers past the io-hash's
-//! φ9..φ12 and the masked wrap's randomness. [`Needles`] holds them, from the prover's internals
-//! (`vos_node_prover::Internals`) and each statement's record; [`Audit`]
+//! φ9..φ12 and the masked wrap's randomness; a credentialed run, its
+//! member's device secret, where the member sits in the tree and its
+//! proofs' masks. [`Needles`] holds them, from the prover's internals
+//! (`vos_node_prover::Internals`), each statement's record and a member's
+//! secret source ([`credential`]); [`Audit`]
 //! holds the carriers, each as it [`Reach`]es: out of the role (a venue's
 //! call, a log line, a client's answer, a node that does not replicate the
 //! agent), a venue's own record of what it was sent (a chain's logs and
@@ -17,6 +20,7 @@
 //! forms in those that stay too.
 //!
 //! - [`needles`]: the needles and the forms each is searched in;
+//! - [`credential`]: a member's device secret and place as needles;
 //! - [`audit`]: the carriers and the search;
 //! - [`capture`]: what takes a run's carriers: a venue's client
 //!   ([`Tapped`]), the process's logs ([`Logs`]) and standard error
@@ -24,6 +28,7 @@
 
 pub mod audit;
 pub mod capture;
+pub mod credential;
 pub mod needles;
 
 pub use audit::{Audit, Carrier, Finding};
@@ -31,7 +36,7 @@ pub use capture::{
     Canary, DEBUG_ENVIRONMENT, Frames, Logs, Stderr, Tapped, anchor_carriers, debug_environment_on,
     directory, finish_logs, node_carriers, store, submission_carriers, tap_frames,
 };
-pub use needles::{DEBUG_OUTPUTS, DISTINCT, Needle, Needles, SHORTEST};
+pub use needles::{DEBUG_OUTPUTS, DISTINCT, Needle, Needles, ROW_FLOOR, SHORTEST, SMALL_FLOOR};
 
 /// What a needle is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -52,19 +57,44 @@ pub enum Kind {
     MemoryRoot,
     /// A register past φ9..φ12, or the file φ0..φ8.
     Register,
-    /// The masked wrap's randomness: its attempts' entropy and seeds, the
-    /// witness digest it is hedged with, its blinding values and the seeds
-    /// of its mask, salt and `R` columns.
+    /// A masked proof's randomness, the wrap's or a credential proof's:
+    /// its attempts' entropy and seeds, the witness digest it is hedged
+    /// with, its blinding values and the seeds of its mask, salt and `R`
+    /// columns.
     WrapRandomness,
     /// A debug output's own text, which only `debug-internals` builds
     /// print: each instruction a run steps through, the recompiler's
     /// registers, a trace's rows.
     DebugOutput,
+    /// A member's device secret (`proving.md` §8): the secret source's
+    /// output `o`, the derivation's `w`, `s` and each of its words, the
+    /// nullifier's key, their plain hashes, and a device kernel's
+    /// arguments, which hold `s`.
+    DeviceSecret,
+    /// Where a member sits in the credential actor's tree: its member
+    /// digest, its leaf and the occupied siblings of its path. A path
+    /// query's answer holds them; a credentialed call, its log entry and
+    /// its answer never do, or the call is linked to its member.
+    MemberPlace,
 }
 
 impl Kind {
-    /// Every kind, each a run's audit must hold needles of.
-    pub const ALL: [Kind; 8] = [
+    /// Every kind.
+    pub const ALL: [Kind; 10] = [
+        Self::NodeProof,
+        Self::ServedRow,
+        Self::PrivateHash,
+        Self::StepCount,
+        Self::MemoryRoot,
+        Self::Register,
+        Self::WrapRandomness,
+        Self::DebugOutput,
+        Self::DeviceSecret,
+        Self::MemberPlace,
+    ];
+
+    /// The kinds a run that proves a statement must hold needles of.
+    pub const PROVER: [Kind; 8] = [
         Self::NodeProof,
         Self::ServedRow,
         Self::PrivateHash,
@@ -75,11 +105,14 @@ impl Kind {
         Self::DebugOutput,
     ];
 
+    /// The kinds a run of credentialed calls must hold needles of.
+    pub const CREDENTIAL: [Kind; 3] = [Self::DeviceSecret, Self::MemberPlace, Self::WrapRandomness];
+
     /// Whether no carrier at all may hold it, the role's own included.
     fn nowhere(self) -> bool {
         matches!(
             self,
-            Self::NodeProof | Self::MemoryRoot | Self::WrapRandomness
+            Self::NodeProof | Self::MemoryRoot | Self::WrapRandomness | Self::DeviceSecret
         )
     }
 }

@@ -222,12 +222,21 @@ fn context(bytes: &[u8], start: usize, end: usize) -> String {
 }
 
 /// Whether the match of `len` bytes at `at` is a whole run of digits in
-/// `haystack`, or no run of digits at all.
+/// `haystack`, or no run of digits at all; and a number's `0x` hex, whole:
+/// no hex digit follows it.
 fn whole(haystack: &[u8], at: usize, len: usize) -> bool {
-    let digits = haystack[at..at + len].iter().all(u8::is_ascii_digit);
+    let matched = &haystack[at..at + len];
+    let after = haystack.get(at + len);
+    if matched.len() > 2
+        && matches!(&matched[..2], b"0x" | b"0X")
+        && matched[2..].iter().all(u8::is_ascii_hexdigit)
+    {
+        return after.is_none_or(|b| !b.is_ascii_hexdigit());
+    }
+    let digits = matched.iter().all(u8::is_ascii_digit);
     !digits
         || (haystack
             .get(at.wrapping_sub(1))
             .is_none_or(|b| !b.is_ascii_digit())
-            && haystack.get(at + len).is_none_or(|b| !b.is_ascii_digit()))
+            && after.is_none_or(|b| !b.is_ascii_digit()))
 }

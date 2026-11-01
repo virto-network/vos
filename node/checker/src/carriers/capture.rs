@@ -120,7 +120,7 @@ pub fn submission_carriers(statement: &Statement, proof: &[u8]) -> Vec<(String, 
 
 /// Every file under `dir`, read whole, in path order, and then the names of
 /// every file and directory under it, one a line, as `<dir>: names`: what a
-/// node wrote to its disk. Fails on a directory or file that cannot be
+/// node wrote to its disk. A socket, a pipe or a link is named only. Fails on a directory or file that cannot be
 /// read, rather than leave its bytes unsearched; a file removed since it
 /// was listed is named and not read.
 pub fn directory(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
@@ -139,6 +139,9 @@ pub fn directory(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
             names.push(path.display().to_string());
             if path.is_dir() {
                 pending.push(path);
+            } else if std::fs::symlink_metadata(&path).is_ok_and(|meta| !meta.is_file()) {
+                // A socket, a pipe or a link: no bytes of its own on the
+                // disk, its name among the names.
             } else {
                 match std::fs::read(&path) {
                     Ok(bytes) => files.push((path.display().to_string(), bytes)),

@@ -121,7 +121,7 @@ fn attest(value: u64) -> (Attest, usize) {
         rep_salt: core::array::from_fn(|at| 80 + at as u8),
         space_path: (1..=24).collect(),
         rows: vec![(
-            vec![1],
+            (60..80).collect(),
             Some((
                 [4, 8, 15, 16, 23, 42, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
                 value.encode(),
@@ -147,7 +147,7 @@ fn attest(value: u64) -> (Attest, usize) {
 fn a_records_rows_and_private_arguments_are_needles() {
     let (attest, arguments) = attest(0x1234_5678_9abc);
     let mut needles = Needles::default();
-    needles.attest("read", &attest, arguments);
+    needles.attest("read", &attest, arguments, ROW_FLOOR);
     assert_eq!(needles.named(Kind::ServedRow, "row 0's value").count(), 2);
     assert_eq!(needles.named(Kind::ServedRow, "argument part").count(), 1);
     let private: Vec<u8> = (10..30).collect();
@@ -196,7 +196,7 @@ fn a_rootless_records_private_arguments_are_needles() {
         roots: Vec::new(),
     };
     let mut needles = Needles::default();
-    needles.attest("rootless", &attest, attest.witness_input.len());
+    needles.attest("rootless", &attest, attest.witness_input.len(), ROW_FLOOR);
     assert_eq!(needles.named(Kind::ServedRow, "argument part").count(), 1);
     assert_eq!(needles.named(Kind::ServedRow, "row").count(), 0);
     let mut audit = Audit {
@@ -211,7 +211,7 @@ fn a_rootless_records_private_arguments_are_needles() {
 #[should_panic(expected = "no rows served after its arguments")]
 fn a_record_whose_rows_are_not_after_its_arguments_fails() {
     let (attest, arguments) = attest(7);
-    Needles::default().attest("read", &attest, arguments - 1);
+    Needles::default().attest("read", &attest, arguments - 1, ROW_FLOOR);
 }
 
 /// A proof's internals give the needle of the gas its re-run left from the
@@ -294,4 +294,102 @@ fn a_public_constant_is_no_needle() {
             ("steps", "storage")
         ]
     );
+}
+
+/// A served row's key is a needle; its value is a number's at the floor the
+/// run asks, a small one only in the run over small values; every value a
+/// run wrote is a needle at the same floor.
+#[test]
+fn keys_written_values_and_small_values_are_needles() {
+    let (attest, arguments) = attest(0x12_3456);
+    let mut needles = Needles::default();
+    needles.attest("read", &attest, arguments, ROW_FLOOR);
+    assert_eq!(needles.named(Kind::ServedRow, "row 0's key").count(), 1);
+    assert_eq!(needles.named(Kind::ServedRow, "row 0's value").count(), 1);
+    let mut small = Needles::default();
+    small.attest("read", &attest, arguments, SMALL_FLOOR);
+    assert_eq!(small.named(Kind::ServedRow, "row 0's value").count(), 2);
+    let mut audit = Audit {
+        needles: small,
+        ..Audit::default()
+    };
+    audit.carrier("a log", Reach::Leaves, b"value=1193046".to_vec());
+    assert_eq!(audit.findings().len(), 1);
+
+    let mut written = Needles::default();
+    written.written("run", [40_000, 0x12_3456, 1 << 40], SMALL_FLOOR);
+    assert_eq!(written.0.len(), 2, "a value below the floor is no needle");
+    let mut audit = Audit {
+        needles: written,
+        ..Audit::default()
+    };
+    audit.carrier("a log", Reach::Leaves, b"wrote 1099511627776".to_vec());
+    assert_eq!(audit.findings().len(), 1);
+}
+
+/// A number's hex is matched whole: not as the start of a longer number.
+#[test]
+fn a_numbers_hex_is_matched_whole() {
+    let steps = || Needle::number(Kind::StepCount, "steps", 123_457);
+    assert_eq!(audit(Reach::Leaves, b"at 0x1e241.", steps()).len(), 1);
+    assert!(audit(Reach::Leaves, b"at 0x1e2417", steps()).is_empty());
+    assert!(audit(Reach::Leaves, b"at 0x1e241f", steps()).is_empty());
+}
+
+/// An M31 word is found by its digits, its bytes and its varint; a small
+/// word is no needle.
+#[test]
+fn a_word_is_found_in_its_forms() {
+    let word = 0x2345_6789u32;
+    let needle = || Needle::word(Kind::DeviceSecret, "word", word).unwrap();
+    let varint = postcard::to_allocvec(&word).unwrap();
+    for carrier in [
+        format!("s=[{word}, 1]").into_bytes(),
+        word.to_le_bytes().to_vec(),
+        [b"x".as_slice(), &varint].concat(),
+    ] {
+        assert_eq!(audit(Reach::Leaves, &carrier, needle()).len(), 1);
+    }
+    assert!(Needle::word(Kind::DeviceSecret, "small", 40_000).is_none());
+}
+
+/// A member's secret as the device library derives it, each of its forms a
+/// needle searched everywhere; its place but the empty siblings.
+#[test]
+fn a_members_secret_and_place_are_needles() {
+    use vos_wire::credentials::{DEPTH, EMPTY, Path, Siblings, digest};
+
+    let mut needles = Needles::default();
+    let words = needles.device_secret("member", &[0x6f; 32], &[0x48; 32]);
+    let (w, again) = super::credential::derive(&[0x6f; 32], &[0x48; 32]);
+    assert_eq!(words, again);
+    assert!(words.iter().all(|&word| word < vos_wire::credentials::P));
+    assert!(needles.named(Kind::DeviceSecret, "s's word").count() >= 7);
+    let mut audit = Audit {
+        needles: needles.clone(),
+        ..Audit::default()
+    };
+    audit.carrier("a store", Reach::Role, [b"x".as_slice(), &w].concat());
+    assert_eq!(audit.findings().len(), 1, "w is found within the role too");
+
+    let mut siblings: [[u8; 32]; DEPTH] = core::array::from_fn(|level| digest(&EMPTY[level]));
+    siblings[3] = [7; 32];
+    siblings[3][..4].copy_from_slice(&[1, 2, 3, 4]);
+    let path = Path {
+        root: [9; 32],
+        slot: 8,
+        siblings: Siblings(siblings),
+    };
+    let mut place = Needles::default();
+    place.member_place("member", &digest(&words), &path);
+    assert_eq!(place.named(Kind::MemberPlace, "sibling").count(), 1);
+    assert_eq!(place.named(Kind::MemberPlace, "the leaf").count(), 1);
+    let mut audit = Audit {
+        needles: place,
+        ..Audit::default()
+    };
+    audit.carrier("a store", Reach::Role, digest(&words).to_vec());
+    assert!(audit.findings().is_empty(), "a replica holds the members");
+    audit.carrier("a log entry", Reach::Leaves, digest(&words).to_vec());
+    assert_eq!(audit.findings().len(), 1);
 }

@@ -7,7 +7,8 @@
 //!   limbs' decimal list, as `P2Hash`'s and an array's `Debug` print them,
 //!   the `M31(…)` list, and postcard's varint encoding;
 //! - a number, in the carriers that leave: its decimal digits, its little-
-//!   and big-endian bytes, and its `0x` hex;
+//!   and big-endian bytes, and its `0x` hex, digits and hex matched whole;
+//!   an M31 word (one of a digest's) its postcard varint too;
 //! - a register file: its values' little-endian bytes, their `Debug` list
 //!   and hex;
 //! - a debug output's text, in the carriers that leave.
@@ -44,6 +45,16 @@ pub const DEBUG_OUTPUTS: [&str; 7] = [
 /// appears by chance. A row of such a value is still searched by its salt.
 pub const SHORTEST: usize = 8;
 pub const DISTINCT: usize = 4;
+
+/// The least row value searched as a number in a run whose rows hold any
+/// values: below it a log's counters and sizes hold its digits by chance.
+pub const ROW_FLOOR: u64 = 1 << 24;
+
+/// The least row value searched as a number in the run over small values:
+/// a value below it is a port, a size or a count of any log's by chance,
+/// and its byte forms have fewer than [`DISTINCT`] distinct bytes. Such a
+/// row is still searched by its salt, its key and its hashes.
+pub const SMALL_FLOOR: u64 = 1 << 16;
 
 /// The domains `vos-wire` and its venues hash under, each a prefix of the
 /// hashed bytes: a private value hashed under any of them is a needle too.
@@ -183,6 +194,22 @@ impl Needle {
             leaving,
             value: Some(value),
         }
+    }
+
+    /// An M31 word of a digest: [`Needle::number`]'s forms and its postcard
+    /// varint, in the carriers that leave; none for a word below
+    /// [`SMALL_FLOOR`], whose digits any log holds by chance.
+    pub fn word(kind: Kind, name: impl Into<String>, word: u32) -> Option<Self> {
+        if u64::from(word) < SMALL_FLOOR {
+            return None;
+        }
+        let mut needle = Self::number(kind, name, u64::from(word));
+        let mut varint_form = Vec::new();
+        varint(word, &mut varint_form);
+        if distinct(&varint_form) >= DISTINCT {
+            needle.leaving.push(varint_form);
+        }
+        Some(needle)
     }
 
     /// A register file's values, in order: their little-endian bytes and
@@ -332,12 +359,15 @@ impl Needles {
 
     /// What `attest`'s record holds privately, its witness its kernel's
     /// `arguments` bytes and then, for a statement at a window's cut, the
-    /// rows served: the rows, their salts and the cut's roots and paths, each
-    /// part of its arguments that is not a public argument's encoding, and
-    /// the plain and domain-prefixed hashes of each. A rootless statement's
-    /// witness is its arguments alone. Fails if the rows do not decode
-    /// where the arguments end, or a rootless witness runs past them.
-    pub fn attest(&mut self, statement: &str, attest: &Attest, arguments: usize) {
+    /// rows served: the rows' keys, values and salts and the cut's roots
+    /// and paths, each part of its arguments that is not a public
+    /// argument's encoding, and the plain and domain-prefixed hashes of
+    /// each; a row's value that decodes as a number of at least `floor`
+    /// is a number's needle too ([`ROW_FLOOR`], or [`SMALL_FLOOR`] in the
+    /// run over small values). A rootless statement's witness is its
+    /// arguments alone. Fails if the rows do not decode where the arguments
+    /// end, or a rootless witness runs past them.
+    pub fn attest(&mut self, statement: &str, attest: &Attest, arguments: usize, floor: u64) {
         let witness = &attest.witness_input;
         let (arguments, rows) = witness.split_at(arguments);
         let mut private: Vec<(String, Vec<u8>)> = vec![("the witness".into(), witness.clone())];
@@ -350,7 +380,7 @@ impl Needles {
             let served = Served::decode_exact(rows)
                 .unwrap_or_else(|| panic!("{statement}: no rows served after its arguments"));
             private.push(("the served rows".into(), rows.to_vec()));
-            self.served(statement, &served, &mut private);
+            self.served(statement, &served, &mut private, floor);
         }
         for (at, part) in unpublished(arguments, &attest.public_args).enumerate() {
             let name = format!("argument part {at}");
@@ -366,7 +396,13 @@ impl Needles {
 
     /// The needles of the rows `served` for `statement`, each row's value
     /// pushed onto `private` to be hashed.
-    fn served(&mut self, statement: &str, served: &Served, private: &mut Vec<(String, Vec<u8>)>) {
+    fn served(
+        &mut self,
+        statement: &str,
+        served: &Served,
+        private: &mut Vec<(String, Vec<u8>)>,
+        floor: u64,
+    ) {
         let cut = [
             ("the agent's root at the cut", served.agent_root.to_vec()),
             ("the representative's root", served.rep_root.to_vec()),
@@ -381,7 +417,12 @@ impl Needles {
                 &bytes,
             ));
         }
-        for (row, (_, value)) in served.rows.iter().enumerate() {
+        for (row, (key, value)) in served.rows.iter().enumerate() {
+            self.push(Needle::bytes(
+                Kind::ServedRow,
+                format!("{statement}: row {row}'s key"),
+                key,
+            ));
             let Some((salt, value)) = value else {
                 continue;
             };
@@ -392,10 +433,23 @@ impl Needles {
             ));
             let name = format!("{statement}: row {row}'s value");
             self.push(Needle::bytes(Kind::ServedRow, &name, value));
-            if let Some(number) = u64::decode_exact(value).filter(|&number| number >= 1 << 24) {
+            if let Some(number) = u64::decode_exact(value).filter(|&number| number >= floor) {
                 self.0.push(Needle::number(Kind::ServedRow, &name, number));
             }
             private.push((format!("row {row}'s value"), value.clone()));
+        }
+    }
+
+    /// Every value `run` wrote to its rows, served or not, each of at
+    /// least `floor` a number's needle: a row's value leaves the role only
+    /// as a statement's output does.
+    pub fn written(&mut self, run: &str, values: impl IntoIterator<Item = u64>, floor: u64) {
+        for value in values.into_iter().filter(|&value| value >= floor) {
+            self.0.push(Needle::number(
+                Kind::ServedRow,
+                format!("{run}: the written value {value}"),
+                value,
+            ));
         }
     }
 
