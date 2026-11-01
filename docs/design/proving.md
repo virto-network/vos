@@ -1845,9 +1845,9 @@ its hex, its `Debug` list and, for a number, its digits and byte orders:
   a device kernel's among them; needles the member's device secret (its
   source's output, `w`, `s` and each word, the nullifier's key, their
   hashes, a device kernel's arguments), a credential proof's masks as
-  drawn, and its place in the tree (its digest, its leaf, its occupied
-  siblings), the place searched in all but the path's own fetch; and the
-  phone bench's lines and proofs;
+  drawn, and its place in the tree (its digest, its leaf, its slot, its
+  occupied siblings), the place searched in every carrier that leaves
+  but the path's own fetch; and the phone bench's lines and proofs;
 - **the guards:** each capture path shown to capture by a canary; each
   needle found when planted in each of its forms; the audit's seams and
   the debug outputs reach no production build (`just

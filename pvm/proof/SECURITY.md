@@ -423,11 +423,13 @@ searched (`node/checker/src/carriers/needles.rs`):
   whole;
 - a single register below 2^24 is not a needle, nor a step count of at
   most 255 or a power of two, nor an M31 word of a device secret below
-  2^16;
+  2^20;
 - a row's value below 2^24 is not a number's needle in a run of any
   values; the run over small values (every row's value in
-  [2^16, 2^24)) searches each from 2^16, where a value's digits stop
-  being a log's ports, sizes and counts by chance.
+  [2^20, 2^24)) searches each from 2^20 by its digits and `0x` hex,
+  matched whole: below 2^20 a value's digits are a log's ports, sizes,
+  counts and process ids by chance, and below 2^24 its bytes, three and
+  zeros, a binary carrier's fields.
 
 Every served row's key, value and salt and every value the run wrote,
 served or not, are needles; so are each served value's plain and
