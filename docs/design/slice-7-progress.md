@@ -6777,3 +6777,49 @@ test-proof` exit 0 (602 passed in 59 suites; `fixtures::` and
 `constants::` as pinned, no re-pin); `just check-release-names` exit 0
 (the release `vos` with the prover names no debug output); `just
 conformance` moved only the `about` lines.
+
+## Step 7.23c: the docs
+
+Branch `s7/7.23c`, from vos-core `78c99ccb6`. Docs only; no section
+renumbered, so every cross-reference resolves as before.
+
+- **`proving.md`, draft 7** (`78e215a02`): the formats as registered (41
+  node segments, 44 credential, 46 device; 30, 35, 37, 42, 43 and 45
+  retired, A.4); one chip set for both shapes (§3.2): the `0x402` call and
+  the Poseidon2 chip in node segments, its 17-page class (S64), the two
+  cuts (S63) and the throughput (33.3 s against 46.5 s); the leaves as
+  built (§3.4); the masked segment chips and their cost (§5), `h = 256`'s
+  argument (S62); the Stwo fork's pin and its branches, NEON's
+  compression among them, and the audit's slice-7 scope (§4); §8's device
+  profile as built: `H_io`, the lean kernel, `device_floors`, the device
+  program from a public reference run (S61), the device kernel at
+  ingress, format 46, the library's device API and `Threads::Auto`;
+  PG1's, PG2's (P7) and PG3's measured numbers and the levers' table;
+  the cell model's conclusions (per-program CPU and word memory to the
+  next slice, S63) in §8 and §9; §10's risks retired; §11's M5 row; §12
+  item 16 (slice 7's decisions); stale statements fixed (no phone run,
+  the bignum chip in slice 7, the projected levers).
+- **`core-model.md`, draft 7** (`f7cb2deb7`): "Changes from draft 6"; the
+  gateway and origins in §4–§5 (S41); the caller in §6.5; credentialed
+  calls as an input kind (§7.1) and a new §8.6 (the origins, the request
+  `0x0104`, the binding's exactly-once, the guards, `once`, device
+  proofs); §10's liveness at scale (quiet groups, the pair heartbeat's
+  changes, lanes, the campaign bound, the vote floor, batched placements,
+  batches in flight off) with the scale runs' figures; device kernels in
+  §11.1 and `0x402` in §11.2; question 18's node API.
+- **`identity-and-authority.md`, draft 6** (`7ddd54a79`): §2 as built;
+  §5's checks at format 46, device proofs' program (S61); §6's signed
+  operator requests and the credential actor as built and measured; §7's
+  nullifier, the device secret (its input tag S51, its sources S42), the
+  device side as built (`vos-device`, `PathKeeper`, s4's `vos.credential`
+  facility, pinning at enrollment, S48, S49), the carrier audit and the
+  gaps 7.22 (and 7.13, M4) recorded; §11's anchors under S9, S11, S13;
+  §14's slice-7 decisions; §15 step 0 built.
+- **Review (Opus):** no High; 9 accuracy findings (PG2 called met where
+  its second pass P8 is pending, PG1's targets, five figures, the order
+  of the formats' shared parameters, the facility's linking), 9 stale
+  statements (a device program "pinned by the derivation", DIVREM in the
+  `h = 256` table, many active agents, the bignum chip in slice 7, anchor
+  key rotation, quiescence as open work, word-level memory in the
+  estimate, retired numbers, the ARM factor), 2 narrative sentences and
+  the tag lists; all folded (`abf383498`, `a1c085ed7`, `f9fec624d`).
