@@ -1,6 +1,6 @@
-//! The device profile's masked segment (`vos_pvm_proof::device`, pin J): a
+//! The device profile's masked segment (`vos_pvm_proof::device`): a
 //! kernel's whole run proved masked over the shared chip set without the
-//! page boundary, verified against its program; the Poseidon2 chip (pin H);
+//! page boundary, verified against its program; the Poseidon2 chip;
 //! and their forgery and leakage gates.
 
 #[path = "../common/mod.rs"]

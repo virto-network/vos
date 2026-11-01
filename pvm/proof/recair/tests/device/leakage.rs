@@ -1,13 +1,13 @@
 //! The masking's leakage gates on the device shape
-//! (`docs/design/proving.md` §5; slice 6's 6.6; pin J),
+//! (`docs/design/proving.md` §5),
 //! at N proofs a witness: 16 in `just check`; under `heavy-gates`,
 //! `LEAKAGE_SEGMENT_N`, [`MEDIUM`] unless it is set (`just test-proof`;
 //! `just slice-gate` sets the full N).
 //!
 //! The device shape states the io-hash alone, so two witnesses of the
 //! kernel, which differ in the 64 bytes it reads and hashes and agree on
-//! its io-hash, have **equal public values**: slice 6's pairs, with no
-//! deviation.
+//! its io-hash, have **equal public values**: the equal-public pairs,
+//! with no deviation.
 //!
 //! - **Witness indistinguishability:** N proofs of one witness against N of
 //!   the other: per field a two-sample χ² on its top bits, one pooled KS. The

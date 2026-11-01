@@ -47,7 +47,7 @@ fn a_device_kernels_shape_holds_no_blake2b() {
 /// siblings, the last slot under a path whose every sibling is filled)
 /// each give the program ingress computes from the kernel, auth's reference
 /// run's, its id and log sizes; each proves under it and verifies against
-/// its own io-hash alone: pin J's witness-independent trace.
+/// its own io-hash alone: a witness-independent trace.
 #[test]
 fn every_path_shape_proves_under_one_device_program() {
     use vos_pvm_recair::device::{MAX_PROOF_BYTES, Program, auth_io, encode};

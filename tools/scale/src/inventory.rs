@@ -50,7 +50,7 @@ pub struct Host {
     pub api: u16,
     /// A memory cap for its unit, over the harness's.
     pub memory_max: Option<String>,
-    /// Run on a kernel older than the JIT's 6.7, the owner having
+    /// Run on a kernel older than the JIT's 6.7, the operator having
     /// weighted it down: `check` warns instead of refusing it.
     #[serde(default)]
     pub old_kernel: bool,

@@ -242,7 +242,7 @@ fn no_call_writes_a_report(node: &mut Node, a: AgentId) {
 }
 
 /// A row of a window's close that does not decode is quarantined, the
-/// step going on (S30): the representative holding a sender's last report
+/// step going on: the representative holding a sender's last report
 /// that does not decode moves it aside under `keys::quarantined`, its
 /// bytes kept, and stores the report as the sender's first. An agent
 /// whose mark of its last report does not decode moves it aside too, and

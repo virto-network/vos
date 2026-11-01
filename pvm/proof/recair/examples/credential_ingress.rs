@@ -1,4 +1,4 @@
-//! What a credential proof costs ingress (slice 7's 7.11 gates): the final
+//! What a credential proof costs ingress: the final
 //! verifier's `verify_bytes` on one thread, the time to refuse a proof
 //! whose PoW, or whose interaction PoW, is wrong, and one whose last byte
 //! is cut, each the median and the 95th percentile of `ROUNDS` after two

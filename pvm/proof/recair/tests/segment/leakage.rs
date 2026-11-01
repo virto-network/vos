@@ -1,5 +1,5 @@
 //! The masking's leakage gates on the masked segment
-//! (`docs/design/proving.md` §5; slice 6's 6.6), at N proofs a kernel: 16 in
+//! (`docs/design/proving.md` §5), at N proofs a kernel: 16 in
 //! `just check`; under `heavy-gates`, `LEAKAGE_SEGMENT_N`, [`MEDIUM`] unless
 //! it is set (`just test-proof`; `just slice-gate` sets the full N).
 //!
@@ -7,7 +7,7 @@
 //!   acceptance gate's (`gates.rs`).
 //! - **Witness indistinguishability:** N proofs of the small kernel against
 //!   N of the kernel whose φ9 is one more: per field a two-sample χ² on its
-//!   top bits, one pooled KS. A deviation from slice 6's pairs: a segment of
+//!   top bits, one pooled KS. A deviation from the equal-public pairs: a segment of
 //!   the node's shape publishes its whole boundary (every register, the pc,
 //!   the timestamps and both memory roots), so under equal public values a
 //!   run has no other witness; the two kernels' public values differ in φ9.

@@ -1,5 +1,5 @@
 //! The device shape's acceptance and forgery gates
-//! (`docs/design/slice-7-mobile.md`, pins H and J): every run below is the kernel's
+//! (`docs/design/proving.md` §8): every run below is the kernel's
 //! own but for the one property its gate forges, so the refusal is that
 //! property's. A constraint a forged trace breaks is refused by the honest
 //! prover and, its proof forced past the prover's check, by the verifier

@@ -343,7 +343,7 @@ fn forge_row(cluster: &Cluster, number: NodeNumber, representative: AgentId, roo
     batch.commit(PersistMode::SyncAll).unwrap();
 }
 
-/// The majority decides (S34): a compromised replica anchored a forged
+/// The majority decides: a compromised replica anchored a forged
 /// root at window 0 with its listed key and answers the guard with it as
 /// its row. A quorum, the leader and the other replica, holds the leader's
 /// row, so the evidence goes all the same and the space ends; the

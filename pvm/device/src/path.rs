@@ -1,5 +1,4 @@
-//! The path held, refreshed apart from proofs (`slice-7-mobile.md` pin G,
-//! pin L) [decided, S38]: fetched when `root()` moves and on a jittered
+//! The path held, refreshed apart from proofs (`proving.md` §8): fetched when `root()` moves and on a jittered
 //! timer, never because a proof is about to be made, so a fetch's time
 //! says nothing of a proof's. The client polls `root()` on a jittered timer
 //! of its own and sends the queries on a connection of their own, apart

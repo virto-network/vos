@@ -1,10 +1,10 @@
-//! The s4 demo on a local space (`slice-7-mobile.md` 7.13): one node of a
+//! The s4 demo on a local space: one node of a
 //! founded space whose agent holds the credential actor, the poll, the
 //! `purses` ledger and the device actor (whose `login` takes a device proof
 //! of its kernel `auth` beside a credential proof), an operator who
 //! invites members and mints, and the
 //! gateway's SSH port serving the demo's screens over the node's socket.
-//! The phone gate (PG3) runs it through `adb reverse`; the end-to-end test
+//! A phone runs it through `adb reverse`; the end-to-end test
 //! drives it with a headless client.
 
 use std::net::SocketAddr;

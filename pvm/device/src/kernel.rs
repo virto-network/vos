@@ -1,5 +1,5 @@
-//! Device kernels proved under the device profile (`proving.md` §8,
-//! `slice-7-mobile.md` pins J and L): a kernel's program, computed from the
+//! Device kernels proved under the device profile (`proving.md` §8): a
+//! kernel's program, computed from the
 //! kernel as a space's ingress computes it, a run of it proved against
 //! that program, and auth's statement proved by a device kernel, which
 //! ingress takes as it takes auth's credential proof.
@@ -8,14 +8,14 @@ use vos_pvm_recair::device::{self as profile, Program};
 use vos_wire::credentials::Words;
 use zeroize::Zeroize;
 
-use crate::prover::auth_public;
+use crate::prover::auth_digests;
 use crate::secret::DeviceSecret;
 use crate::{AuthWitness, Call, CredentialProof, CredentialPublic, DeviceError, Prover, scope};
 
 /// The device format's number, the registry's: format 46.
 pub const DEVICE_FORMAT: u32 = profile::FORMAT.number;
 
-/// The most memory a device kernel's proof takes, in bytes: PG2's budget,
+/// The most memory a device kernel's proof takes, in bytes: the device budget,
 /// above the auth kernel's peak resident size measured on the gate phone
 /// (0.70 GiB). A prover allowing less refuses to prove one.
 pub const DEVICE_PEAK_BYTES: u64 = 1 << 30;
@@ -130,7 +130,7 @@ impl Prover {
         call: &Call,
         program: &DeviceProgram,
     ) -> Result<CredentialProof, DeviceError> {
-        let public = auth_public(secret, witness, name, call, program.id(), 0)?;
+        let public = auth_digests(secret, witness, name, call, program.id(), 0)?;
         let bytes = profile::auth_public(
             &public.map_root.to_bytes(),
             &public.scope.to_bytes(),

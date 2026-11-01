@@ -1,6 +1,5 @@
-//! A device proof accepted at a space's ingress (phone gate PG2's
-//! acceptance, `slice-7-mobile.md` pin J), the host's side: one node of a founded
-//! space, the credential actor and the device actor installed, a member
+//! A device proof accepted at a space's ingress (`proving.md` §8), the
+//! host's side: one node of a founded space, the credential actor and the device actor installed, a member
 //! enrolled; for each round a sign-in to the device actor's `login`, whose
 //! guard names its device kernel `auth`. The kernel and each round's
 //! witness input are written for a prover, the proof it writes back is

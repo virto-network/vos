@@ -1,5 +1,5 @@
 //! Device programs as ingress and a device take them
-//! (`vos_pvm_recair::device`, pin J): a program's id, a proof's bytes, and
+//! (`vos_pvm_recair::device`): a program's id, a proof's bytes, and
 //! a run past the program's log sizes refused by the prover, under format
 //! 45 itself.
 

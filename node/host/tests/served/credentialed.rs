@@ -1008,7 +1008,7 @@ fn the_device_librarys_proofs_are_admitted() {
 
 const DEVICE: InstanceId = InstanceId(4);
 
-/// A device proof signs in as an auth credential proof does (pin J): the
+/// A device proof signs in as an auth credential proof does: the
 /// device actor installed beside the founded space's, its `login` guard
 /// naming its device kernel `auth`; the device library proves the kernel
 /// as a phone proves it (`prove_device_auth`, format 46, the program

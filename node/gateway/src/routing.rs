@@ -29,7 +29,7 @@ pub struct Gateway {
 }
 
 /// The frame error a relay answers when no node did.
-pub fn unavailable() -> Answer {
+fn unavailable() -> Answer {
     (FRAME_ERROR, FrameError::Unavailable.encode())
 }
 

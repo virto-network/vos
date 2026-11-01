@@ -13,7 +13,7 @@ use crate::{Decode, Encode};
 /// little-endian bytes, then the schema: its methods, each without its
 /// credential guard, then, only when the program is the credential actor
 /// or a method has a guard, the [`Credentials`] that say which. A program
-/// with neither carries the section it carried before guards were.
+/// with neither carries its methods alone.
 pub const MAGIC: [u8; 4] = *b"VOSS";
 
 /// The most a schema may hold: what a refine reads before installing.

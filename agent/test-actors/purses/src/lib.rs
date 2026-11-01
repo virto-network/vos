@@ -1,5 +1,5 @@
 //! A ledger of named rows, each paid from by its owner's proof
-//! (`slice-7-mobile.md` 7.11): a row is `(owner, balance, frozen)`, its
+//! (`identity-and-authority.md` §7): a row is `(owner, balance, frozen)`, its
 //! `owner` an owner digest, and `transfer` runs under
 //! `#[msg(credential = Owner)]`, debiting a row only while its live owner
 //! is the proof's digest and it is not frozen. Rows come by an operator's

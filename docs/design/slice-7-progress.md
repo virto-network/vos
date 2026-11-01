@@ -6823,3 +6823,67 @@ renumbered, so every cross-reference resolves as before.
   key rotation, quiescence as open work, word-level memory in the
   estimate, retired numbers, the ARM factor), 2 narrative sentences and
   the tag lists; all folded (`abf383498`, `a1c085ed7`, `f9fec624d`).
+
+## Step 7.23b: the code-quality review
+
+Branch `s7/7.23b`, from vos-core `78c99ccb6`. This is the slice's
+code-quality review, by Opus, over the Rust that slice 7 added or changed
+(`git diff 8b6c9d34..HEAD`, `spikes/` left out). The review covered module
+splits, Rust idiom, concision and timeless comments, and returned about
+150 findings. The ones that are clearly behaviour-preserving and worth
+their cost are folded in. Proof bytes are unchanged: `fixtures::` and
+`constants::` pass with no re-pin, and the conformance vectors are
+untouched.
+
+**Guest bytes.** The guest build remaps paths but keeps panic locations.
+So a line shift in a crate linked into a PVM guest moves that guest's
+bytes, and with them its program id. The affected crates are `vos-wire`,
+`vos-sdk`, `vos-agent`, `vos-credentials`, the test actors, the
+precompiles, the anchor, the statement and the recursion AIR. In those
+crates only comment lines were changed, one for one. `just check-blobs`
+holds every blob's hash. `vos-sdk-macros` was split freely: its generated
+tokens carry the call site's spans, not its own.
+
+| finding group | found | folded | skipped, and why |
+|---|---|---|---|
+| comments and narrative | 20 | 17 (T-03, T-22, T-28, T-30, N-26, N-41, P-N1–P-N5, P-P3, A-07, A-08, A-27–A-29), plus every other plan pin, step or decision tag a grep found in the touched code | 3: P-N6 (long comment lines, cosmetic); A-09 and A-30 (`vos-wire` and `vos-sdk` docs that would shift guest lines) |
+| dead code and visibility | 8 | 5: P-P9 (`DeviceLayout::initial_byte`), N-15, P-R12, T-36 (`LANDING`, plus its wrong and shared docs), T-13 (`wall_ms`) | 3: N-20 (`vos_http::server::timeout` now has the host as a caller); N-23 (`keeps_open` stays as the frame error's tested API); P-P11 (needs a test-seam feature) |
+| duplication | 30 | 3: T-04 (the report's own kind list, now `REPORTED`); T-31 (the phone's two cell loops); the host's second `timeout`, found while folding (it uses `vos-http`'s) | 27. Guest bytes: X-2, X-4, T-15, P-C1. Behaviour moves: X-1 (error text, an added fsync), N-13 (key file format), P-P4 (the tracer's Poseidon2 path), P-P6 (the device mask), P-F1 (refusal order). Cost over value at the slice's end: X-3, X-5, X-6, N-14, N-31, N-2–N-4, N-19, N-21, N-22, P-D2, P-R3, P-R6, P-R7, P-R10, T-14, T-16–T-18, T-32, A-14–A-16 |
+| module splits | 27 | 15: T-01, T-05, T-07 (Zipf and tests), T-08 and T-09 (tests), N-1, N-5, N-27, N-32, N-39, N-40, P-D1 (the thread pool), P-P1 (reference shapes, tests, masked tests), P-R1 (commitments), A-11 | 12. Guest bytes: A-01, A-03, A-21. Cost over value: N-34, N-38, P-R9, P-K1, P-T1, A-25, A-32, T-34, T-20's CLI move |
+| long functions | 13 | 1: T-02 (`report()`: the load window, a node's summary and a driver's summary apart, from 290 lines to about 120) | 12: T-06, T-21, N-6, N-16, N-33, N-35, N-36, P-R2, P-K2, A-12, A-13, T-20. Each is an order-sensitive loop, a test read as one, or a diagnostic order to keep |
+| idiom and concision | 46 | 1: P-D3 (the device's two `auth_public`s, the crate's own now `auth_digests`) | 45. Local spellings with no reader-facing gain (N-9–N-12, N-17, N-25, N-29, P-D5–P-D8, P-P2, P-P7, P-P8, P-P10, T-19, T-23, T-26, T-27, T-29, T-35, A-31, A-33, A-34, …). Guest bytes: A-04, A-05, A-17–A-20, A-22. Wire-sensitive: T-10 |
+| clones and allocations | 7 | 0 | 7. P-R4 and P-R5 touch a proof's encoding and verification paths and want a byte-equality test first. T-25 and the rest are one-time costs |
+| `unwrap` and `expect` | 6 | 0 | 6. Invariants (P-U1, A-31's `just taken`, the checker's test-side hex), or guest bytes (A-06) |
+| error types | 2 | 0 | 2. P-R8 must keep each site's text. The rest are consistent per crate (`String` in the tools, enums in the node and the PVM) |
+
+**For the owner:**
+- P-D9: `vos_device::verify` does not run `call.check()`, but
+  `verify_joint` and `verify_device` do. Making them agree changes
+  behaviour, so it is not folded here.
+- The splits of guest-linked crates (A-01, A-03, A-21) and the credential
+  derivations' helpers in `vos-wire` (X-2) would fit the next re-pin.
+
+Commits:
+- `48c9ffdcd` comments
+- `27edcd003` dead code and visibility
+- `293a394fb` scale
+- `a4ea57fef` gateway and phone
+- `6978ace87` node
+- `d0523d4ee` checker
+- `36aa3a576` proof, recair and device
+- `57883c4b7` sdk-macros
+- `31c5380d5` the doc links that two folded comments broke
+
+The test names in the split test binaries gained their module, for
+example `routes::every_route_…`. No recipe filters by those names.
+
+**Gates** (at `31c5380d5`, run under a 12 GiB scope with `nice -n 10`, 8
+jobs, no incremental builds):
+- `just check`: exit 0. 1,705 passed in 119 suites, the same count as
+  7.23a.
+- `just test-proof`: exit 0. 602 passed in 59 suites, with `fixtures::`
+  and `constants::` as pinned and no re-pin. It ran `test-carriers`
+  inside it.
+- Not run, because the disk was at its floor: `just test-gateway-ssh`
+  (the demo's split is linted by `cargo clippy -p vos-gateway --features
+  ssh`, which is clean) and `just check-blobs`.

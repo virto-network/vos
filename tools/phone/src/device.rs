@@ -1,4 +1,4 @@
-//! The device cells (`slice-7-mobile.md` 7.16, pin J): a device kernel
+//! The device cells (`proving.md` §8): a device kernel
 //! proved masked under the device profile at one candidate's parameters, on
 //! one channel, timed, verified, its peak memory read and its bytes
 //! counted.

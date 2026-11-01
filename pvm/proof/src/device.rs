@@ -1,4 +1,4 @@
-//! The device profile's shape (`docs/design/slice-7-mobile.md`, pin J): a
+//! The device profile's shape (`docs/design/proving.md` §8): a
 //! kernel's whole run as one segment, without the page-Merkle boundary.
 //!
 //! - **The chips** are the shared chip set's, the segment AIR's
@@ -223,20 +223,6 @@ impl DeviceLayout {
         self.regions
             .iter()
             .position(|range| range.first <= page && page < range.end)
-    }
-
-    /// The byte a first touch of `address` reads: its data table's in a
-    /// data region, zero elsewhere.
-    pub fn initial_byte(&self, address: u32) -> u8 {
-        self.data
-            .iter()
-            .find_map(|(base, bytes)| {
-                address
-                    .checked_sub(*base)
-                    .and_then(|offset| bytes.get(offset as usize))
-                    .copied()
-            })
-            .unwrap_or(0)
     }
 
     /// The data table's entries, address and byte.

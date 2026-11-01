@@ -20,16 +20,7 @@
 //!   Poseidon2 call, the Poseidon2 chip, the logical right shifts through
 //!   the multiplication, no column a constraint pins to zero), and 32's
 //!   leaves verify it. The numbers that named its earlier forms are
-//!   [`RETIRED`]: refused, and never registered again. 24 to 27 and 29 named
-//!   it before its hardening (the witness input, the removal of the curve
-//!   chips, the AIR audit's fixes); 31, 33 and 34 named the hardened form
-//!   with the columns and next-row masks no constraint reads, 31 at 44
-//!   queries; 35 and 45 named the segment and device formats before the
-//!   chip set was shared with the node (35 without the Poseidon2 call, both
-//!   with the right shifts through the division and the seven
-//!   `MemByteActiveMonoH` columns); 36 named its legacy Blake2s form, below
-//!   the proven floor; 43 named the device format at `h = 512`.
-//!   28, 32 and 39 prove the recursion AIR (`vos-pvm-recair-air`) and keep
+//!   [`RETIRED`]: refused, and never registered again. 28, 32 and 39 prove the recursion AIR (`vos-pvm-recair-air`) and keep
 //!   their numbers; 44 proves its `p2` and `qm31` alone, the credential AIR.
 //! - **Every format** takes exactly its parameters, mixes the boundary
 //!   states as the boundary chips' bytes and grinds its interaction PoW
@@ -60,32 +51,17 @@
 //! - **The device format** (46) is counted on the device shape's masked
 //!   reference ([`DEVICE_REFERENCE`]: every chip a device program may hold
 //!   at `2^17` rows, the most install, the prover and the verifier admit).
-//!   Of the candidates measured (blowup 2 with 85–87 queries, 4 with 43 at
-//!   PoW 20 or 47 at PoW 16, 8 with 29), it takes the credential format's:
-//!   blowup 4, 47 queries, PoW 16, affine batching (62.82 proven bits). On
-//!   the auth statements none meets the device budget's 1 GiB; blowup 8 peaks
-//!   near 5.7 GiB, past a phone's memory, and blowup 2's proofs are about
-//!   twice the 1.5 MiB budget; blowup 4's times tie blowup 2's within the
-//!   noise, its proofs are within about 20% of the budget, and PoW 16's
-//!   grind has the short tail format 44 was chosen for (at PoW 20 the
-//!   BLAKE2b statement's proof fits the budget, at PoW 16 it passes it by
-//!   1%). 37, reserved at an unmasked count before the masking, is retired
-//!   unregistered. 45 took 43's parameters at `h = 256` rather than 512
-//!   (`proving.md` §5, how large `h` must be): every device chip reveals
-//!   at most 149 rows at 47 queries, so `h = 256` holds the masking's
-//!   condition without its factor two, and every chip's floor halves to
-//!   2^10 rows; the bits do not move, `h` being in neither the parameters
-//!   nor the reference. 43, admitted at `h = 512`, is retired. 46 is 45's
-//!   parameters and masking over the shared chip set's current form, a new
-//!   number because a number names one AIR; 45 is retired.
+//!   It takes the credential format's parameters: blowup 4, 47 queries,
+//!   PoW 16, affine batching (62.82 proven bits), with `h = 256`
+//!   (`proving.md` §5, how large `h` must be): every device chip reveals at
+//!   most 149 rows at 47 queries, so `h = 256` holds the masking's
+//!   condition without its factor two, every chip's floor at 2^10 rows.
+//!   The candidates measured are in `proving.md` §4.
 //! - **The credential format** (44) is counted on its masked shape
 //!   ([`CREDENTIAL_REFERENCE`]): two components at the masking's floor of
 //!   2^11 rows, where every blowup costs the same cells, so blowup 4, and
-//!   PoW 16 with the least queries that clear 62 bits beside it, 47. The
-//!   gate phone picked it over 42 (43 queries, PoW 20), whose grind's 95th
-//!   percentile there passed 50 ms; 42 is retired, since a number names one
-//!   set of parameters. 30, reserved for credential proofs at an unmasked
-//!   count, is retired unregistered.
+//!   PoW 16 with the least queries that clear 62 bits beside it, 47: PoW 16's
+//!   grind keeps a short tail on a phone.
 //! - **The wrap** (28) needs DEEP batching with an independent coefficient a
 //!   sampled value ([`DeepBatching::Affine`]) for its proven 80. Stwo batches
 //!   by powers of one coefficient, whose error is the batched values' count
@@ -126,6 +102,13 @@ use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;
 
 use crate::security::{SecurityBits, SecurityShape};
+
+mod reference;
+
+pub use reference::{
+    CREDENTIAL_REFERENCE, DEVICE_REFERENCE, LEAF_FOLD_REFERENCE, MASKED_WRAP_REFERENCE,
+    SEGMENT_REFERENCE, WRAP_REFERENCE,
+};
 
 /// What a format proves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -291,118 +274,6 @@ impl Format {
     }
 }
 
-/// Every segment AIR's widest relation (`Blake2bCompression`, 265 limbs),
-/// rounded up.
-const SEGMENT_RELATION_WIDTH: u64 = 265;
-/// The recursion AIR's one relation, `Gate`: an address and four limbs.
-const RECURSION_RELATION_WIDTH: u64 = 5;
-
-/// Every chip of the segment AIR at 2^20 rows (`framework_access`'s
-/// `security_shape` of the full component set; a test recomputes it).
-pub const SEGMENT_REFERENCE: SecurityShape = SecurityShape {
-    log_degree_bound: 20,
-    log_trace_length: 20,
-    log_composition_degree_bound: 21,
-    sampled_values: 11_091,
-    max_samples_per_column: 3,
-    constraints: 5_750,
-    logup_fractions: 1_837_105_152,
-    relation_width: SEGMENT_RELATION_WIDTH,
-    composition_point_doublings: 0,
-};
-
-/// The device format's reference (pin J), format 46's: the device set
-/// (`vos_pvm_proof::device`) with every chip a device program may hold at
-/// `2^17` rows (`device::DEVICE_MAX_LOG_SIZE`, which install enforces),
-/// masked under variant (c): its columns at degree bound 2^18, the
-/// composition whole at 2^19, sampled at `π(z)`; 7,403 values in the DEEP
-/// batch, 4,262 constraints, every fraction a masked row evaluates (the
-/// blinding's among them), the widest relation's 265 limbs. A test in
-/// `vos-pvm-recair` derives it from the built set.
-pub const DEVICE_REFERENCE: SecurityShape = SecurityShape {
-    log_degree_bound: 19,
-    log_trace_length: 18,
-    log_composition_degree_bound: 19,
-    sampled_values: 7_403,
-    max_samples_per_column: 3,
-    constraints: 4_262,
-    logup_fractions: 155_058_176,
-    relation_width: SEGMENT_RELATION_WIDTH,
-    composition_point_doublings: 1,
-};
-
-/// The recursion AIR's padded shape (`recursion-air.md` §0, §1.2): `p2`,
-/// `qm31` and `h8` at 2^16, 2^17 and 2^16 rows; 458 columns, each counted at
-/// two DEEP values (an upper bound: the batch holds 486), a column at most
-/// three; 313 constraints of degree 3; 5, 4 and 6 fractions a row.
-pub const LEAF_FOLD_REFERENCE: SecurityShape = SecurityShape {
-    log_degree_bound: 18,
-    log_trace_length: 17,
-    log_composition_degree_bound: 19,
-    sampled_values: 2 * 458,
-    max_samples_per_column: 3,
-    constraints: 313,
-    logup_fractions: (5 << 16) + (4 << 17) + (6 << 16),
-    relation_width: RECURSION_RELATION_WIDTH,
-    composition_point_doublings: 0,
-};
-
-/// The wrap (`recursion-air.md` §7): the same AIR at 2^14, 2^15 and 2^11
-/// rows.
-pub const WRAP_REFERENCE: SecurityShape = SecurityShape {
-    log_degree_bound: 16,
-    log_trace_length: 15,
-    log_composition_degree_bound: 17,
-    logup_fractions: (5 << 14) + (4 << 15) + (6 << 11),
-    ..LEAF_FOLD_REFERENCE
-};
-
-/// The values the masked wrap's DEEP quotient batches, exactly: one for
-/// each sampled column (57 preprocessed, 373 main and 40 interaction
-/// columns, the composition's 4 whole and the FRI mask's 8; the salts are
-/// never sampled), and two more for each of the 28 columns read at the
-/// previous row, `p2`'s 16 and each component's running sum, sampled twice
-/// and given a periodicity value.
-const MASKED_WRAP_DEEP_VALUES: u64 = (57 + 373 + 40 + 4 + 8) + 2 * (16 + 3 * 4);
-
-/// The wrap masked under variant (c), format 39's reference: the AIR of
-/// [`WRAP_REFERENCE`] at its tallest component's 2^15 rows, its columns at
-/// degree bound 2^16, its composition whole at 2^17 and sampled at `π(z)`
-/// ([`SecurityShape::variant_c`]), plus what the masking commits beside it:
-/// the shape of the built masked components, which a test derives. The batch
-/// is counted exactly (`MASKED_WRAP_DEEP_VALUES`); it enters only the count
-/// by powers. R2's blinding adds a fraction a row a component on a relation
-/// nothing else uses: `p2`'s pairs with its lone fraction, and `qm31`'s and
-/// `h8`'s take a new pair column and its constraint each.
-pub const MASKED_WRAP_REFERENCE: SecurityShape = SecurityShape {
-    sampled_values: MASKED_WRAP_DEEP_VALUES,
-    constraints: WRAP_REFERENCE.constraints + 2,
-    logup_fractions: (6 << 14) + (5 << 15) + (7 << 11),
-    ..WRAP_REFERENCE.variant_c()
-};
-
-/// The credential AIR (`proving.md` §8), format 44's reference: the
-/// recursion AIR's `p2` and `qm31` at the masking's floor of 2^11 rows,
-/// masked under variant (c) (columns at degree bound 2^12, the composition
-/// whole at 2^13, sampled at `π(z)`), as the built set lays it out: 50
-/// preprocessed, 333 main (each component's blinding among them) and 24
-/// interaction columns, the composition's 4 and the FRI mask's 8, each
-/// sampled once, and 24 sampled twice (`p2`'s 16 columns read at the
-/// previous row and each running sum's 4), each with a periodicity value;
-/// `p2`'s constraints, `qm31`'s and the blinding's new pair's; 6 and 5
-/// fractions a row. A test derives it from the built set.
-pub const CREDENTIAL_REFERENCE: SecurityShape = SecurityShape {
-    log_degree_bound: 13,
-    log_trace_length: 12,
-    log_composition_degree_bound: 13,
-    sampled_values: (50 + 333 + 24 + 4 + 8) + 2 * (16 + 2 * 4),
-    max_samples_per_column: 3,
-    constraints: 303 + 3 + 1,
-    logup_fractions: (6 << 11) + (5 << 11),
-    relation_width: RECURSION_RELATION_WIDTH,
-    composition_point_doublings: 1,
-};
-
 /// Segments': fewer queries and more PoW than [`LEAF_FOLD_PARAMS`], for the
 /// kernel leaf's rows, which grow with the queries times the segment's width.
 /// Counted on format 41's reference: 62.81 proven bits.
@@ -429,7 +300,7 @@ const LEAF_FOLD_PARAMS: FormatParams = FormatParams {
 };
 
 /// Device proofs': credential proofs' parameters (format 44), picked by
-/// 7.16's measurement (see the module's notes).
+/// measurement (see the module's notes).
 const DEVICE: FormatParams = FormatParams {
     log_blowup: 2,
     n_queries: 47,
@@ -696,271 +567,7 @@ pub fn admitted_segment(number: u32) -> Result<&'static Format, alloc::string::S
 }
 
 #[cfg(test)]
-#[path = "format_masked_tests.rs"]
 mod masked_tests;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::framework_access::{
-        AllLookupElements, air_layout, create_verifier_components, draw_all_lookup_elements,
-    };
-    use alloc::vec::Vec;
-    use num_traits::Zero;
-    use stwo::core::air::Component;
-    use stwo::core::fields::qm31::SecureField;
-    use stwo::core::pcs::TreeVec;
-    use stwo_constraint_framework::TraceLocationAllocator;
-
-    /// The segment AIR's shape with every chip at `2^log_size` rows.
-    fn segment_air_shape(log_size: u32, format: &Format) -> SecurityShape {
-        let count = crate::chip_idx::COUNT;
-        let mask = ((1u64 << count) - 1) as u32;
-        let log_sizes = alloc::vec![log_size; count];
-        let (trace_sizes, preprocessed) =
-            create_verifier_components::trace_and_preprocessed_sizes(&log_sizes, mask);
-        let mut trees = TreeVec::concat_cols(trace_sizes.into_iter());
-        trees[0] = preprocessed;
-        let mut lookups = AllLookupElements::default();
-        draw_all_lookup_elements(
-            &mut lookups,
-            &mut stwo::core::channel::Blake2sChannel::default(),
-            mask,
-        );
-        let components = create_verifier_components::components(
-            &mut TraceLocationAllocator::default(),
-            &lookups,
-            &log_sizes,
-            &alloc::vec![SecureField::zero(); count],
-            mask,
-        );
-        let refs: Vec<&dyn Component> = components.iter().map(|c| &**c).collect();
-        air_layout(&format.pcs_config(), &refs, &trees)
-            .unwrap()
-            .security_shape(&refs)
-    }
-
-    /// The registry's segment reference shape is the segment AIR's, every
-    /// chip at 2^20 rows (the device's, the masked device set's, is
-    /// `vos-pvm-recair`'s device tests').
-    #[test]
-    fn the_reference_shapes_are_the_segment_airs() {
-        assert_eq!(segment_air_shape(20, &SEGMENT), SEGMENT_REFERENCE);
-        assert_eq!(
-            crate::lookups::MAX_RELATION_WIDTH as u64,
-            SEGMENT_RELATION_WIDTH
-        );
-    }
-
-    /// The tool's two counts, pinned per format at its reference shape:
-    /// every format clears its floors, the wrap with affine batching.
-    #[test]
-    fn the_bit_counts_are_pinned_per_format() {
-        let pinned: Vec<(u32, u32, u32)> = REGISTRY
-            .iter()
-            .map(|format| {
-                let bits =
-                    crate::security::security_bits(&format.params, &format.reference).unwrap();
-                assert_eq!(bits, format.bits, "format {}", format.number);
-                (format.number, bits.conjectured, bits.proven)
-            })
-            .collect();
-        assert_eq!(
-            pinned,
-            [
-                (28, 146, 82),
-                (32, 108, 63),
-                (39, 146, 82),
-                (41, 104, 62),
-                (44, 110, 62),
-                (46, 110, 62),
-            ]
-        );
-        assert!(REGISTRY.iter().all(Format::meets_floors));
-        // Every format grinds an interaction PoW: the prover always grinds
-        // and the verifier always checks one.
-        assert!(
-            REGISTRY
-                .iter()
-                .all(|format| format.interaction_pow_bits() > 0)
-        );
-    }
-
-    /// The unrounded counts the parameters were chosen by: the segments'
-    /// 62.81 at 40 queries and PoW 24, no less than 44 queries at PoW 20
-    /// give the same shape, and the device and credential formats' least
-    /// query count whose count clears 62.
-    #[test]
-    fn the_parameters_are_the_least_that_clear_their_margins() {
-        let count = |params: &FormatParams, shape: &SecurityShape| {
-            crate::security::proven_count(params, shape).unwrap()
-        };
-        let segment = count(&SEGMENT.params, &SEGMENT_REFERENCE);
-        assert!((62.81..62.82).contains(&segment), "{segment}");
-        let at_44 = count(&LEAF_FOLD.params, &SEGMENT_REFERENCE);
-        assert!((62.74..62.75).contains(&at_44), "{at_44}");
-        for format in [DEVICE_PROOF, CREDENTIAL_PROOF] {
-            let fewer = FormatParams {
-                n_queries: format.params.n_queries - 1,
-                ..format.params
-            };
-            assert!(count(&format.params, &format.reference) >= 62.0);
-            assert!(
-                count(&fewer, &format.reference) < 62.0,
-                "format {}",
-                format.number
-            );
-        }
-    }
-
-    /// The wrap counts 82.6 proven bits under affine batching, and needs 19
-    /// queries for its floor of 80. Batched by powers of one coefficient it
-    /// counts 74.7 at blowup 64 with 18 queries or 20, and as many queries
-    /// as the analysis takes: that batching term binds, and it grows with
-    /// the blowup; at blowup 8 it reaches 80 with 41 queries. The verifier's
-    /// check says so.
-    #[test]
-    fn the_wrap_needs_affine_batching() {
-        let count = |batching, log_blowup, n_queries| {
-            let params = FormatParams {
-                log_blowup,
-                n_queries,
-                batching,
-                ..WRAP.params
-            };
-            crate::security::proven_count(&params, &WRAP_REFERENCE).unwrap()
-        };
-        assert_eq!(WRAP.params.batching, DeepBatching::Affine);
-        let affine = count(DeepBatching::Affine, 6, 20);
-        assert!((82.60..82.61).contains(&affine), "{affine}");
-        let least =
-            |batching, log_blowup| (1..=256).find(|&q| count(batching, log_blowup, q) >= 80.0);
-        assert_eq!(least(DeepBatching::Affine, 6), Some(19));
-
-        for queries in [18, 20, 256] {
-            let bits = count(DeepBatching::Powers, 6, queries);
-            assert!((74.71..74.72).contains(&bits), "{queries} queries: {bits}");
-        }
-        assert_eq!(
-            [6, 4, 3].map(|log_blowup| least(DeepBatching::Powers, log_blowup)),
-            [None, None, Some(41)]
-        );
-        let powers = Format {
-            params: FormatParams {
-                batching: DeepBatching::Powers,
-                ..WRAP.params
-            },
-            ..WRAP
-        };
-        let error =
-            crate::proof::check_format_security(&powers, &powers.pcs_config(), &WRAP_REFERENCE)
-                .unwrap_err();
-        assert!(
-            error.contains("74 proven bits, below format 28's floor of 80"),
-            "{error}"
-        );
-        assert_eq!(
-            crate::proof::check_format_security(&WRAP, &WRAP.pcs_config(), &WRAP_REFERENCE),
-            Ok(WRAP.bits)
-        );
-    }
-
-    /// A proof's config does not carry its batching: deserialized, it reads
-    /// powers, and the verifier takes the format's.
-    #[test]
-    fn the_verifier_takes_the_batching_from_the_format() {
-        let carried = PcsConfig {
-            deep_batching: DeepBatching::Powers,
-            ..WRAP.pcs_config()
-        };
-        assert_eq!(WRAP.verifier_config(&carried), WRAP.pcs_config());
-        assert_eq!(WRAP.pcs_config().deep_batching, DeepBatching::Affine);
-        assert!(crate::proof::check_format_security(&WRAP, &carried, &WRAP_REFERENCE).is_ok());
-        for format in [SEGMENT, LEAF_FOLD] {
-            assert_eq!(format.pcs_config().deep_batching, DeepBatching::Powers);
-        }
-    }
-
-    /// Every number names one entry; only 28, 39, 41, 44 and 46 are
-    /// admitted, and a segment verifier takes 41 alone; the retired numbers
-    /// are refused as retired and name no entry; every other number is
-    /// refused.
-    #[test]
-    fn the_registry_numbers_round_trip() {
-        for format in REGISTRY {
-            assert_eq!(lookup(format.number), Some(&format));
-            assert_eq!(
-                admitted(format.number).is_ok(),
-                [
-                    WRAP.number,
-                    SEGMENT.number,
-                    MASKED_WRAP.number,
-                    DEVICE_PROOF.number,
-                    CREDENTIAL_PROOF.number
-                ]
-                .contains(&format.number)
-            );
-            assert_eq!(
-                admitted_segment(format.number).is_ok(),
-                format.number == SEGMENT.number
-            );
-            assert!(!RETIRED.contains(&format.number), "{}", format.number);
-        }
-        assert!(REGISTRY.windows(2).all(|w| w[0].number < w[1].number));
-        for number in RETIRED {
-            assert!(lookup(number).is_none());
-            let error = admitted(number).unwrap_err();
-            assert!(error.contains("retired"), "{error}");
-        }
-        for number in (0..24).chain([38, 47, u32::MAX]) {
-            assert!(lookup(number).is_none());
-            assert!(admitted(number).is_err());
-        }
-        assert_eq!(SEGMENT.number, crate::proof::PROOF_FORMAT_VERSION);
-    }
-
-    /// A proof below either floor is refused: fewer queries than the
-    /// conjectured floor allows, less PoW than the proven floor allows, a
-    /// shape whose proven count falls short, and parameters other than the
-    /// format's.
-    #[test]
-    fn a_proof_below_a_floor_is_refused() {
-        let check = crate::proof::check_format_security;
-        let config = SEGMENT.pcs_config();
-        assert_eq!(
-            check(&SEGMENT, &config, &SEGMENT_REFERENCE).unwrap(),
-            SEGMENT.bits
-        );
-
-        let mut fewer = config;
-        fewer.fri_config.n_queries = 37;
-        let error = check(&SEGMENT, &fewer, &SEGMENT_REFERENCE).unwrap_err();
-        assert!(error.contains("98 conjectured bits"), "{error}");
-
-        // 20 + 40 · 2 = 100 conjectured, but the query term tends to
-        // 20 + 40 = 60 proven bits, and falls short of it.
-        let mut less_pow = config;
-        less_pow.pow_bits = 20;
-        let error = check(&SEGMENT, &less_pow, &SEGMENT_REFERENCE).unwrap_err();
-        assert!(
-            error.contains("59 proven bits, below format 41's floor of 60"),
-            "{error}"
-        );
-
-        // 2^30 sampled values over a 2^28-row trace: the batching term binds.
-        let wide = SecurityShape {
-            log_degree_bound: 28,
-            log_trace_length: 28,
-            log_composition_degree_bound: 29,
-            sampled_values: 1 << 30,
-            ..SEGMENT_REFERENCE
-        };
-        let error = check(&SEGMENT, &config, &wide).unwrap_err();
-        assert!(error.contains("proven bits"), "{error}");
-
-        let mut stronger = config;
-        stronger.fri_config.n_queries = 41;
-        let error = check(&SEGMENT, &stronger, &SEGMENT_REFERENCE).unwrap_err();
-        assert!(error.contains("differ from format 41"), "{error}");
-    }
-}
+mod tests;

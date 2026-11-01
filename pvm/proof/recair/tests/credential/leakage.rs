@@ -1,5 +1,5 @@
 //! The masking's leakage gates on credential proofs (`docs/design/proving.md`
-//! §5; slice 6's 6.6, gates 2, 3 and 5, with 4 and 7) at N proofs a
+//! §5's leakage gates 2, 3 and 5, with 4 and 7) at N proofs a
 //! witness: 16 in `just check`; under `heavy-gates`,
 //! `LEAKAGE_CREDENTIAL_N`, [`MEDIUM`] unless it is set (`just test-proof`;
 //! `just slice-gate` sets the full N).
