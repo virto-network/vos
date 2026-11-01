@@ -6699,3 +6699,81 @@ public `o`.
 scope, `nice -n 10`, 8 jobs); `just test-carriers` exit 0 (the three runs
 287 s, the bench 8 s); `test-proof` not run: no proof code changed; s4's credential suite exit 0 (lib 16, facility 4, leaks 1, warm 1;
 `--offline --features ffi --ignore-rust-version`), fmt and clippy clean.
+
+## Step 7.23a: the carried rest
+
+Branch `s7/7.23a`, from vos-core `d1f09900e`: slice 6's carried items the
+plan lands at 7.23 (`slice-7-mobile.md`, "Where the carried items land"),
+each defined in `slice-6-on-chain.md`'s carried lists and
+`research/slice-6/quality-review.md`. Behaviour-preserving, proof bytes
+unchanged: `fixtures::` and `constants::` pass with no re-pin, the
+conformance vectors moved only in their `about` lines.
+
+| item | what it was | what was done | commit |
+|---|---|---|---|
+| M5 | a live run's fault text (`ExitReason`'s `Debug`, an executor panic's message) in the warn log and a query's answer | the stop named by its kind (`fault::stopped`: a page fault's address and a host call's number gone); an undecodable output named so, none of its bytes (`DecodeError` carries them); a caught panic's message kept only when literal, a formatted one "withheld"; tested. The audited run with a faulting kernel is carried (decision D6). The place stays on standard error, where the default hook prints it: installing a hook to note it would replace the prover's redacting hook when a proof ran first (decision D1) | `d669690ab` |
+| M5(d) | the binary scan of the release build (`_debug-names-absent` scanned the debug `vos`) | `check-release-names` (in `ci-full`): `vos` with the prover in the release profile, scanned for the debug outputs' names; `release` scans the musl binary it builds; `_names-absent <binary>` shared | `322a85162` |
+| L1 | a cheap seeded-hash pin of the small masked circuit in `check` | `masked_prover::the_seeded_proof_of_a_small_circuit_is_pinned`: the BLAKE2b-256 of the seed-7 proof of circuit 5, in `test-recair` | `dbad52311` |
+| L8's rest | the generated `ABOUT` strings (spike label, "the teammate's"); `core-model.md`'s draft heading | the strings name the pallet and its sweep; `just conformance` moved only the `about` lines. The heading: done since (`core-model.md` is draft 6) | `72c19e9df` |
+| L9: `tamper` | `wrap::prove_masked`'s public, ungated `tamper` | `wrap::prove_masked` and `prove::prove_masked_on` take none; `prove_masked_tampered` under `seeded-masks` | `1d5d7d470` |
+| L9: `ProveError` | `Rerun` and `Kernel` formatted values (a re-run's error, the witness's length) | both `&'static str`, as `Failed`; the worker logs each reason; `kernel_record`'s error static | `fd2c4bc8c` |
+| L9: `stwo=warn` | Stwo's `info!(proof_size_estimate)` at the node's default level | the node's subscriber caps the `stwo` target at `warn` | `b4f0d4e3f` |
+| L9: `check-no-faults` | in `ci` only, `-e features`, the host target | rows of `_forbidden`'s table (`--workspace`, `vos-cli` with and without the prover: normal and build edges, every target), and in `check` | `322a85162` |
+| 14 | `masked_gates.rs` split; the 244-line case table | `masked_gates/{soundness,malformed,freshness,shape}.rs` over the shared helpers; `malformations()` | `657e1afbc` |
+| 30 | `derive.rs`'s split | `derive/{graph,kernel,prologue}.rs`; program ids unmoved (`constants::`, `derive_bounds`) | `5012592dc` |
+| 31 | `prove_on` (238 lines) | `prepare`, `traced_sizes`, `commit_trees` apart, the same steps in the same order; `ProveRequest` and `Sizes` in `prove/request.rs`; fixtures byte for byte (`test-proof`) | `0654f77dd` |
+| 35 | `vos_kit.py`'s `Manifests.write` (105 lines) | `package_of`, `features_of`, `lints_of`; the vendored manifests byte for byte the same (vendored before and after, diffed); the script's own hash moves, so the next drop to the teammate carries it | `51c290c3f` |
+| 50 | `store/open.rs` | the opening, the journals' sync, the unfinished files' clearing and the layout check in `store/open.rs` | `190de187c` |
+| 70 | served-row and representative-tree fixtures written three times | `vos_testkit::served` (`salted_tree`, `representative`), used by the reads tests and the kernel cut tests. `node/host/tests/cuts/model.rs` keeps its own: a history model of leaf hashes by version, not a served tree | `df8a99790` |
+| 77 | long test functions; fixed sleeps; the two Kreivo mocks' registration | `fixtures::generate` into `proofs()` and the cases' table; `proved_window()`; the chain run's audit rest and registrations as named steps (`anchor_keys.rs` gone with 7.2); `vos_checker::stays` for the nine "nothing happened" sleeps of the cluster tests (stronger: checked throughout). The mocks' registration paths kept apart: one writes storage, the other goes through the calls, and unifying them changes a test's setup (decision D5) | `4ba77462e`, `b68714a47` |
+| 1 (owner's call) | the generated `ABOUT` strings | as L8's rest | `72c19e9df` |
+| 5 (owner's call) | a poison-tolerant `lock` helper for the many sites | per crate, as the review recommended (sharing across crates is worth little): `vos_venue::lock` (five sites), the masked prover's `lock`; jam-dev and the checker had one each already; the node's `lock` panics on poison by design | `429d2b357`, `fd2c4bc8c` |
+| 34 (owner's call) | the fuzz `Mutation` enum split into byte and structural mutations | not done: it re-maps the checked-in replay corpus, whose inputs would decode to other mutations (decision D2) | — |
+| 46 (owner's call) | `vos_jam::Error::Node(String)` built only by jam-dev | `Error::Chain(String)`: a `Chain`'s own failure, how the live chain outside the crate reports through the trait the builder takes; jam-dev's own error type would still need this variant (decision D3) | `d8f37580c` |
+| 54 (owner's call) | test-only and stringly API | `Fjall::dump` gated at 6.22; `ProveError` static (above); `AnchorKeys::rotate` gone with 7.2. Kept: the `Host` and `Jobs` traits' and the genesis functions' `String` errors, each a store's or file's failure text for a log or an operator, which no caller branches on (decision D4) | `fd2c4bc8c` |
+| 58 (owner's call) | `State::Refused(u32)` mixing the venue's codes with the prover's | `Refusal { Venue(u32), Rerun, Kernel, Rootless, Unwitnessed }`, encoded as its `u32` code: the job rows byte for byte (tested). The performance half landed at 7.6 | `fd2c4bc8c` |
+
+**Decisions for the coordinator** (each the option the docs or the
+slice-6 review point to; none blocks):
+- **D1 (M5):** a panic's place is not added to the log line or the
+  answer; it stays on standard error. Capturing it needs a process panic
+  hook, which would end the prover's message redaction if installed after
+  a proof.
+- **D2 (item 34):** the `Mutation` split stays undone; the replay corpus's
+  meaning is worth more than two `_ => {}` arms.
+- **D3 (item 46):** the variant renamed, not removed.
+- **D4 (item 54):** the remaining `String` errors kept.
+- **D5 (item 77):** the two Kreivo mocks' registration paths kept apart.
+- **D6 (M5):** the carrier audit's run with a faulting kernel, and
+  `node/SECURITY.md`'s row for it, carried to 7.23's audit work. Standard
+  error still gets an executor panic's place and whole message from the
+  default hook outside a proof (stated in `panic_message`'s doc).
+
+### The review's fixes
+
+One Opus review of the series, no High; folded into the commits they
+belong to:
+- **M1:** `pvm::decode`'s `undecodable output: {error:?}` carried the
+  output's own bytes (`DecodeError`'s discriminator, code and counts) to
+  a query's answer: now a fixed text, tested.
+- **M2:** the audited faulting run, not landed: recorded (D6).
+- **L1:** `gates::pins` allowed `masked_gates.rs` by path: now
+  `masked_gates/mod.rs` (`check` caught it).
+- **L2:** `panic_message`'s doc no longer implies standard error is clean.
+- **L3:** the trailing leader's `stays` no longer checks the leader every
+  50 ms (an election back to it is not the test's concern); the final
+  assertion keeps it.
+- **L4:** `_names-absent` quotes its path.
+- **Nits:** `stays`' import with the external crates; `vos-tree`'s
+  dependency comment in the testkit.
+- Left: `1d5d7d470` leaves `fixtures.rs` unformatted until `4ba77462e`
+  (a bisect over `fmt-check` skips it); `check-no-faults`' plain debug
+  build of `vos-cli` kept in `check`, as the plan places the gate there.
+
+**Gates** (at `b68714a47`; 12 GiB scope, `nice -n 10`, 8 jobs, not
+incremental): `just check` exit 0 (1,705 passed in 119 suites, the
+fault gate's rows and the debug names' scan among them); `just
+test-proof` exit 0 (602 passed in 59 suites; `fixtures::` and
+`constants::` as pinned, no re-pin); `just check-release-names` exit 0
+(the release `vos` with the prover names no debug output); `just
+conformance` moved only the `about` lines.
