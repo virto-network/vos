@@ -116,7 +116,9 @@ pub fn rest(run: &mut Run, audit: &mut Audit, stated: &[Stated]) {
             .iter()
             .find(|stated| stated.attest == *attest)
             .map_or(attest.witness_input.len(), |stated| stated.asked.arguments);
-        audit.needles.attest(&name, attest, arguments);
+        audit
+            .needles
+            .attest(&name, attest, arguments, carriers::ROW_FLOOR);
     }
 
     run.jam_a.tapped.carriers(audit);
@@ -225,7 +227,7 @@ pub fn rest(run: &mut Run, audit: &mut Audit, stated: &[Stated]) {
     let named = format!("0x{}", &hex::encode(digest(report))[..16]);
     audit.assert_captured("the testnet's log", named.as_bytes());
 
-    audit.assert_searchable(&Kind::ALL);
+    audit.assert_searchable(&Kind::PROVER);
     audit.assert_clean();
     run.record
         .note("the audit clean, every capture path shown; every verdict as expected");

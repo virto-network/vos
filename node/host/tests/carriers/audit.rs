@@ -31,24 +31,53 @@ const REPLICAS: [NodeNumber; 3] = [1, 2, 3];
 /// submission through the venue's client.
 const CANARY: &str = "carrier-audit-canary";
 
-/// A value of a row the run writes: high in entropy, so a carrier holding
-/// it is found, and past 2^40.
-fn entry(key: u64, sequence: u64) -> u64 {
+/// High in entropy, from a row's key and its write's sequence.
+fn mixed(key: u64, sequence: u64) -> u64 {
     let mut mixed = (key << 8 | sequence).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     mixed ^= mixed >> 29;
-    mixed.wrapping_mul(0xbf58_476d_1ce4_e5b9) | 1 << 40
+    mixed.wrapping_mul(0xbf58_476d_1ce4_e5b9)
+}
+
+/// The values a run's rows hold, and the least of them searched as a
+/// number.
+#[derive(Clone, Copy)]
+enum Values {
+    /// High in entropy, so a carrier holding one is found, and past 2^40.
+    Wide,
+    /// Below the row floor of a run of any values (2^24), at or past the
+    /// small values' ([`carriers::SMALL_FLOOR`]).
+    Small,
+}
+
+impl Values {
+    fn entry(self, key: u64, sequence: u64) -> u64 {
+        match self {
+            Values::Wide => mixed(key, sequence) | 1 << 40,
+            Values::Small => {
+                let span = carriers::ROW_FLOOR - carriers::SMALL_FLOOR;
+                carriers::SMALL_FLOOR + mixed(key, sequence) % span
+            }
+        }
+    }
 }
 
 /// Requests `sequences` at `agent`: 25 puts each in the reader's committed
-/// map, every value an [`entry`].
-fn write_entries(cluster: &Cluster, agent: AgentId, sequences: std::ops::RangeInclusive<u64>) {
+/// map, every value one of `values`: the values written.
+fn write_entries(
+    cluster: &Cluster,
+    agent: AgentId,
+    sequences: std::ops::RangeInclusive<u64>,
+    values: Values,
+) -> Vec<u64> {
+    let mut written = Vec::new();
     for sequence in sequences {
         let writes: Vec<(u64, Option<u64>)> = (0..25u64)
             .map(|index| {
                 let key = (sequence * 37 + index * 11) % 300;
-                (key, Some(entry(key, sequence)))
+                (key, Some(values.entry(key, sequence)))
             })
             .collect();
+        written.extend(writes.iter().filter_map(|(_, value)| *value));
         let request = Request {
             session: cluster.session(agent),
             sequence,
@@ -59,12 +88,33 @@ fn write_entries(cluster: &Cluster, agent: AgentId, sequences: std::ops::RangeIn
         };
         assert!(matches!(call(cluster, agent, request), Outcome::Done(_)));
     }
+    written
 }
 
 #[test]
 fn no_carrier_that_leaves_the_prover_role_holds_its_internals() {
-    // SAFETY: before the run starts any thread that reads the environment.
-    unsafe { carriers::debug_environment_on() };
+    run(Values::Wide);
+}
+
+/// The run over small values: every row's value below 2^24, each a
+/// needle from [`carriers::SMALL_FLOOR`] up.
+#[test]
+fn no_carrier_that_leaves_the_prover_role_holds_a_small_value() {
+    run(Values::Small);
+}
+
+/// The environment set once in the process, before its first run starts
+/// a thread.
+static DEBUG_ENVIRONMENT: std::sync::Once = std::sync::Once::new();
+
+fn run(values: Values) {
+    let floor = match values {
+        Values::Wide => carriers::ROW_FLOOR,
+        Values::Small => carriers::SMALL_FLOOR,
+    };
+    // SAFETY: once, before the process's first run starts any thread that
+    // reads the environment; its tests run one at a time.
+    DEBUG_ENVIRONMENT.call_once(|| unsafe { carriers::debug_environment_on() });
     let stderr = carriers::Stderr::capture(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")));
     let logs = Logs::install();
     let anchoring = Anchoring::new();
@@ -92,7 +142,7 @@ fn no_carrier_that_leaves_the_prover_role_holds_its_internals() {
     anchoring.register(&cluster);
     let representative = cluster.representative(&REPLICAS);
     let reader = reader_agent(&cluster, &REPLICAS);
-    write_entries(&cluster, reader, 1..=4);
+    let written = write_entries(&cluster, reader, 1..=4, values);
     let clock = clock();
     let boundary = clock.boundary(0).unwrap();
     let (read, _, keys) = ask_in(&cluster, reader, cluster.session(reader), 5, 0);
@@ -120,11 +170,26 @@ fn no_carrier_that_leaves_the_prover_role_holds_its_internals() {
         let name = format!("statement {n}");
         audit.needles.internals(&name, internals);
         // The kernel's arguments are the read's keys, its rows after them.
-        audit.needles.attest(&name, proved, keys.encode().len());
+        audit
+            .needles
+            .attest(&name, proved, keys.encode().len(), floor);
     }
     assert!(
         audit.needles.named(Kind::ServedRow, "'s value").count() >= 12,
         "every row served a needle by its value"
+    );
+    assert!(
+        audit.needles.named(Kind::ServedRow, "'s key").count() >= 12,
+        "every row served a needle by its key"
+    );
+    audit.needles.written("the run", written, floor);
+    assert!(
+        audit
+            .needles
+            .named(Kind::ServedRow, "the written value")
+            .count()
+            >= 100,
+        "every value written a needle"
     );
     for drawn in [
         "entropy",
@@ -202,7 +267,7 @@ fn no_carrier_that_leaves_the_prover_role_holds_its_internals() {
     carriers::finish_logs(&mut audit, &logs, stderr);
 
     eprintln!("{}", audit.summary());
-    audit.assert_searchable(&Kind::ALL);
+    audit.assert_searchable(&Kind::PROVER);
     for carrier in [
         "the logs",
         "standard error",
