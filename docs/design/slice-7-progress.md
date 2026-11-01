@@ -7059,3 +7059,9 @@ storing the floor as it is then (L2); a split doc comment (L3); the
 device gas's Poseidon2 budget stated (L4); a comment (nit). Left: the
 large places' free count may read one high for a moment (a status
 number); a refused peer's frames take a lock while any peer is refused.
+
+**Gates** (12 GiB scope, `nice -n 10`, 8 jobs, no incremental builds), at
+`4379ee7b5`: `just check` exit 0 (1,708 passed in 118 suites); `just
+test-proof` exit 0 (602 passed, the carrier audit among them, no fixture
+or constant re-pinned); `just test-carriers` exit 0 (its own run). s4's
+`just vos` steps on `vos-7.23d`: fmt, clippy and tests pass.
