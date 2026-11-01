@@ -148,6 +148,7 @@ fn every_other_message_survives_the_wire() {
             }],
             unlisted: vec![AgentId(8)],
             took: (5, 6),
+            lanes: 7,
         },
         forward(),
         PeerMessage::ReadIndex {
@@ -221,6 +222,7 @@ fn a_frame_is_one_whole_message() {
         leading: Vec::new(),
         unlisted: Vec::new(),
         took: (0, 0),
+        lanes: 1,
     }
     .encode();
     assert_eq!(

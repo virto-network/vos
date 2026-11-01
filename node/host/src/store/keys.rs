@@ -53,6 +53,9 @@ pub(super) enum NodeRow {
     /// An operator request's nonce, by its key and nonce: until when it is
     /// kept (a u64 big-endian, milliseconds by the node's clock).
     OperatorNonce = 0x15,
+    /// The latest expiry among the operators' nonces forgotten (a u64
+    /// big-endian): a request expiring no later may be a replay of one.
+    OperatorFloor = 0x16,
 }
 
 /// The keyspace layout this build reads and writes, as the store's layout

@@ -789,6 +789,16 @@ the device never exports, evaluated once a use after the user's consent
     activity in one scope), each payment's owner digest (a public payer,
     S22), each credentialed call's arguments in clear (a payment's payee
     and amount beside its payer), and the metadata every cell leaks (§3);
+  - from the root each auth call names (`CredentialedInput.root`, logged
+    for the apply's freshness check): a member proves against the root of
+    its last fetched path until its next refresh, so while the tree moves
+    often, few members hold one root at once, and the roots logged on
+    calls in different scopes link those calls' pseudonyms to one holder,
+    a fingerprint across scopes the nullifiers alone do not give. The
+    fix, the next slice's: the library fetches its path at every moved
+    root, so every online member proves against the newest one, or the
+    log keeps the root's class (its position in the ring: the newest,
+    or how many roots it trails) in place of the root;
   - from a tree change: every online member's library refreshes its path
     when `root()` moves, so each enrollment or revocation shows which
     member digests are online then (the timer's jitter spreads the

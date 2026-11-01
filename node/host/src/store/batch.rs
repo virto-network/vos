@@ -271,6 +271,15 @@ impl Batch {
         }
     }
 
+    /// Record the latest expiry among the operators' nonces forgotten.
+    pub fn operator_floor(&mut self, floor: u64) {
+        self.batch.insert(
+            self.store.system(),
+            node_record(NodeRow::OperatorFloor, &[]),
+            floor.to_be_bytes(),
+        );
+    }
+
     /// Record an operator request's `nonce`, by `key`, until `expires_ms`;
     /// or forget it (`None`).
     pub fn operator_nonce(&mut self, key: &[u8; 32], nonce: &[u8; 16], expires_ms: Option<u64>) {

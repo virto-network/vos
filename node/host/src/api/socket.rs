@@ -204,7 +204,7 @@ async fn connection(
         if large.is_none()
             && let Some(places) = api.large_places(&reader, Framing::Stream)
         {
-            large = Some(places.acquire_arc().await);
+            large = Some(places.take().await);
             started = Some(Instant::now());
         }
     }

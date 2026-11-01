@@ -1,7 +1,7 @@
 //! Device programs as ingress and a device take them
 //! (`vos_pvm_recair::device`): a program's id, a proof's bytes, and
 //! a run past the program's log sizes refused by the prover, under format
-//! 45 itself.
+//! 46 itself.
 
 use vos_pvm_compiler::assembler::{Assembler, Reg};
 use vos_pvm_final_verifier::Error;
@@ -97,4 +97,29 @@ fn a_device_proofs_bytes_are_canonical() {
     let mut io = proof.io;
     io[0] ^= 1;
     assert!(program.verify(&io, &bytes).is_err());
+}
+
+/// A queried value written as itself plus `p`, the same field element in
+/// other bytes, decodes and re-encodes to its own bytes, and the verifier
+/// refuses it before any check of its values: a proof's bytes are one
+/// encoding of its values.
+#[test]
+fn a_queried_value_plus_p_is_refused() {
+    use stwo::core::fields::m31::{BaseField, P};
+    let program = Program::install(&blob(), &witness(1)).expect("installs");
+    let (proof, _) = program
+        .prove(&witness(3), MaskRng::default())
+        .expect("proves");
+    let mut wide = proof.proof.clone();
+    let value = &mut wide.stark_proof.0.queried_values[0][0][0];
+    *value = BaseField::from_u32_unchecked(value.0 + P);
+    let bytes = encode(&wide).expect("encodes");
+    assert_eq!(
+        encode(&decode(&bytes).expect("decodes")),
+        Some(bytes.clone())
+    );
+    assert!(matches!(
+        program.verify(&proof.io, &bytes),
+        Err(Error::Noncanonical)
+    ));
 }

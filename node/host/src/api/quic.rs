@@ -224,7 +224,8 @@ async fn request(
     deadline: Duration,
 ) {
     let mut reader = Reader::requests(Framing::Quic, Requests::All);
-    let mut started: Option<Instant> = None;
+    // The stream's deadline runs from its accept, not its first bytes.
+    let until = Instant::now() + deadline;
     // The request's place among the large bodies, if it is large: past
     // them, it is answered `Unavailable` before its body is read.
     let mut large = None;
@@ -235,7 +236,7 @@ async fn request(
         if large.is_none()
             && let Some(places) = api.large_places(&reader, Framing::Quic)
         {
-            match places.try_acquire_arc() {
+            match places.try_take() {
                 Some(place) => large = Some(place),
                 None => {
                     let _ = receive.stop(STOPPED);
@@ -247,26 +248,18 @@ async fn request(
                 }
             }
         }
-        let read = match started {
-            Some(started) => {
-                let left = (started + deadline).saturating_duration_since(Instant::now());
-                match timeout(left, receive.read_chunk(usize::MAX, true)).await {
-                    Some(read) => read,
-                    // Past its deadline: no answer, the stream reset.
-                    None => {
-                        let _ = receive.stop(STOPPED);
-                        let _ = send.reset(STOPPED);
-                        return;
-                    }
-                }
+        let left = until.saturating_duration_since(Instant::now());
+        let read = match timeout(left, receive.read_chunk(usize::MAX, true)).await {
+            Some(read) => read,
+            // Past its deadline: no answer, the stream reset.
+            None => {
+                let _ = receive.stop(STOPPED);
+                let _ = send.reset(STOPPED);
+                return;
             }
-            None => receive.read_chunk(usize::MAX, true).await,
         };
         match read {
-            Ok(Some(chunk)) => {
-                started.get_or_insert_with(Instant::now);
-                reader.push(&chunk.bytes);
-            }
+            Ok(Some(chunk)) => reader.push(&chunk.bytes),
             Ok(None) => match reader.finish() {
                 Some(event) => break event,
                 // An empty stream: nothing to answer.

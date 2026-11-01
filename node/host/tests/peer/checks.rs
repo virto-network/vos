@@ -136,6 +136,7 @@ fn only_configured_nodes_are_heard() {
         leading: Vec::new(),
         unlisted: Vec::new(),
         took: (0, 0),
+        lanes: 1,
     };
     assert_eq!(check(&SPACE, 4, &liveness, unfollowed), Ok(()));
     assert_eq!(

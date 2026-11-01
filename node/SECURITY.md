@@ -31,7 +31,11 @@ holds is `pvm/device/SECURITY.md`'s, and what a verified proof proves is
   access and over QUIC to the client keys it lists in `gateways`, a
   transport's admission and no authority. Its operator commands are
   signed by a key it lists in `operators`, each for that node, with a
-  nonce and an expiry; no bearer token admits one.
+  nonce and an expiry; no bearer token admits one. This holds of
+  `vos-gateway`, a process apart from the node; the SSH demo's binary
+  (`node/gateway/demo`) runs a node, its gateway and its operator in one
+  process, so there the gateway's process holds the node's keys and the
+  operator's: the demo's arrangement, not a deployment's.
 - **The node's clock** (`Time`) is unsigned. A relay that lies about it
   makes the client pick an expiry the node refuses, which costs a new
   proof; it cannot extend a proof's life, since ingress judges the expiry
@@ -53,7 +57,7 @@ frame checks and the agent's placement come first, as for any call):
    `SpaceId`, and no proof may bind `NONE`;
 5. the format is one this node admits for a credential (`Format`): the
    credential format the proof registry names, as the final verifier pins
-   it, and the device format, 45;
+   it, and the device format, 46;
 6. the proof within its format's cap (512 KiB for a credential proof,
    1.5 MiB for a device proof), the arguments within `cap::REQUEST`
    (`Size`);
@@ -68,7 +72,11 @@ frame checks and the agent's placement come first, as for any call):
     expiry;
 12. the binding digest is not recorded (`Replayed`);
 13. for a `once` guard, the nullifier is not admitted in its scope
-    (`Once`);
+    (`Once`), before the proof as the plan's order puts it: anyone who
+    holds a scope's nullifier, the log's readers among them, learns
+    whether it was admitted by a request bound to its own arguments and
+    a proof of nothing. Checking it after the proof would spend a
+    verification on every such probe;
 14. for auth, the root is in the credential actor's ring (`RootUnknown`,
     retryable: an honest member meets it on a lagging replica, after a
     later write replaced its root at the same batch time, or once 64 later
@@ -99,13 +107,26 @@ kernel, or does not run that statement within the format's shape. A
 replica that did not install it, or has restarted since, computes it on
 an executor when a device proof naming the kernel has passed every check
 before the binding (format, size, expiry, guard, kind), once however many
-such requests wait on it (about 0.2 s), then keeps it, a failure too; a
-kernel the replica does not hold yet answers `Unavailable` and is tried
+such requests wait on it (about 0.2 s), then keeps it, and a failure of
+the kernel's own (its shape, its run) too; a kernel the replica does not
+hold yet, or any other failure, answers `Unavailable` and is tried
 again. The binding names the program's id; the io-hash is `H_io` of the
 request's auth words, computed here (each word below `p`, as a credential
 proof's), so the proof's bytes carry no statement of their own. A run is
-traced with at most about a million gas (`device::GAS`), so neither the
-install nor a device traces far past a program's shape.
+traced with at most 2^18 gas (`device::GAS`, twice the most steps a
+program's CPU holds; about 109 Poseidon2 calls, fewer as its steps
+grow), so neither the install nor a device traces far past a program's
+shape.
+
+**A device kernel is trusted as its actor's code is.** It is the
+installed actor's own attestable method, and what its proof states is
+what the kernel computes: a kernel that skipped its root's compare, or
+its nullifier's derivation, would admit anyone to the guarded methods of
+its own instance. The node's checks around the proof still hold whatever
+the kernel does: the scope, the binding, the replay, `once`, and the
+root it names in the ring and fresh (though such a kernel ties no member
+to it), so such a kernel opens its own instance alone, as a handler with
+no check would.
 
 ## At apply
 
@@ -158,6 +179,17 @@ serve its requests:
   activity in one scope), each payment's owner digest (a public payer),
   each credentialed call's arguments in clear, and the metadata every
   call leaks.
+- **From the root an auth call names.** The log keeps each auth call's
+  `map_root` (`CredentialedInput.root`), which the apply checks for
+  freshness. A member proves against the root of its last fetched path
+  until its next refresh: while the tree changes often, few members hold
+  one root at once, so the roots logged on calls in different scopes link
+  those calls' pseudonyms to one holder, a fingerprint across scopes that
+  the nullifiers keep apart. The next slice's fix: the library fetches
+  its path at every moved root, so every online member proves against
+  the newest, or the log keeps the root's position in the ring (the
+  newest, or how many roots it trails) in place of the root
+  (`identity-and-authority.md` §7).
 - **From a tree change:** every online member's library fetches its path
   within 10 s of seeing `root()` move, so each enrollment or revocation
   shows which member digests are online then; the spread, and the
@@ -189,7 +221,10 @@ TLS: their bodies are the HTTP bodies above, framed by the same codec as
 the socket's. And no carrier of a credentialed call holds where its
 member sits (its digest, its leaf, its occupied siblings): the call's
 bytes each way, its answers, its log entries, the logs. Only the path's
-fetch does, as above.
+fetch does, as above. The member's slot is searched for as a number
+only from 2^20 up (`carriers::SMALL_FLOOR`): a smaller one's digits are in
+any log by chance, so a slot under 2^20 is searched for through its
+digest, leaf and siblings alone.
 
 ## The demo's SSH surface
 
@@ -309,10 +344,23 @@ a member's phone (`slice-7-mobile.md` 7.13):
   the binding rows until the load falls, and while more than 96 bindings
   are due before a session's or a workflow's row, that row waits for them
   to drain.
-- A proof's verification takes about 2 ms on one x86 core; one whose PoW
-  is wrong is refused in about 0.7 ms (the composition check runs before
-  the PoW in the verifier's order), one cut short in about 0.2 ms
-  [measured, `slice-7-progress.md` 7.11].
+- What a proof costs a verification slot, by format, on one x86 core
+  (medians of 200 runs; the 95th percentile within 25%): the verifier's
+  order is the decode and its canonical re-encoding, the interaction PoW,
+  the logup totals, the composition at the OODS point, then the PoW, then
+  the decommitments, so a wrong PoW is refused after every step but the
+  decommitments [measured, `slice-7-progress.md` 7.23d]:
+  - **format 44, a credential proof** (about 220 KB): verified in about
+    2.0 ms; a wrong PoW refused in 0.7 ms, a wrong interaction PoW in
+    0.5 ms, one cut short in 0.2 ms
+    (`cargo run --release -p vos-pvm-recair --example credential_ingress`);
+  - **format 46, a device proof** of auth's kernel (about 880 KB):
+    verified in about 11.7 ms; a wrong PoW refused in 8.0 ms, a wrong
+    interaction PoW in 5.8 ms, one cut short in 1.1 ms
+    (`cargo run --release -p vos-phone --example device_ingress`). A
+    device proof's slot is held about six times a credential proof's, so
+    the verification budget bounds about a sixth as many device proofs a
+    second; "a wrong PoW refused in under 1 ms" is format 44's alone.
 - The request's decode and the verifier's bytes are fuzzed
   (`credentialed_decode`, `credential_verify_bytes`).
 - The gateway adds its own limits per address before any of this.

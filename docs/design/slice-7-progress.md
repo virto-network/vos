@@ -6365,6 +6365,12 @@ acceptance") at `vos-core` `2f70c200`.
     caught the phone's home screen).
   - The first attempt, during session P4 (2026-10-30), ended when the
     blowup-8 bench cell's memory pressure killed the foreground app.
+  - **What the demo does not show** (noted at the slice-end review): the
+    demo binary runs the node, its gateway and its operator in one
+    process (`node/gateway/demo/src/lib.rs`, `LocalSpace`), so its
+    gateway's process holds the node's keys and the operator's. "The
+    gateway holds no authority" is a property of `vos-gateway`, a process
+    apart from the node, which PG3 did not run (`node/SECURITY.md`).
 
 **Reviews:** Fable on 7.8a (merge; L1–L4 folded), 7.9 (merge; L1–L6
 folded, L4's quiet re-measure handed off), 7.10 (accept; M1, M2, L1–L6
@@ -7084,3 +7090,53 @@ pseudonym.
 One program id (`953c7cd8…`) and one set of log sizes. **PG2 passes its
 second time, a day after P7, on the format the slice ships**: the gate is
 met. The log is `spikes/s7-device/runs/phone-pg2-p8.txt`.
+
+## Step 7.23d: the slice-end review's fixes
+
+Fable's slice-end review: "accept after listed fixes", no Critical or
+High defect in code. H1 and H2 (the slice gate's record, P8 and P9) are
+the coordinator's; M1 (scale run 3) runs elsewhere. M5 was already
+resolved: s4's leak fixes are on s4's `vos` at `7de206e` (the review read
+a stale local branch). Folded here with Fable's review of 7.20, C10 and
+format 46's parameters (M9: all three judged sound; lows and docs). No
+proof's bytes moved: no fixture or constant was re-pinned.
+
+| Finding | What was done | Commit |
+|---|---|---|
+| M2: a replayed signed `Install` decoded before its nonce was refused | the nonce looked up right after the signature, recorded after the parse (which checks again); an `operator_body` stage counts the package decodes; a test that the replay is refused with one decode | `b2be13276` |
+| M3: a `peer_lanes` mismatch partitions a node silently | the pair heartbeat names its sender's lanes (**a peer wire change**: `PeerMessage::Liveness` gains `lanes`, every node in the tests agrees); a peer naming other lanes is refused whole (`Refusal::OtherLanes`), with a `warn!` naming the peer and both values when it first names them, and taken again once it agrees; `operations.md` and `core-model.md`'s claim; a unit test and a three-node test | `e6f00a492` |
+| M4: the logged `map_root` a cross-scope fingerprint | stated in `node/SECURITY.md` and `identity-and-authority.md` §7, with the next slice's fix (a fetch at every moved root, or the root's ring position logged) | `94125ae2f` |
+| M6: the demo binary runs node, gateway and operator in one process | noted in `node/SECURITY.md` and in M4's PG3 record above | `94125ae2f` |
+| M7: "wrong PoW under 1 ms" is format 44's | `vos-phone`'s `device_ingress` example times format 46 as `credential_ingress` times 44; `node/SECURITY.md` states each format's bound and the verifier's order. Measured on the desktop (one thread, medians of 200, another agent driving remote hosts): 44, verified 2.0 ms, wrong PoW 0.7, wrong interaction PoW 0.5, cut 0.2; 46 (auth's kernel, 880 KB), verified 11.7 ms, wrong PoW 8.0, wrong interaction PoW 5.8, cut 1.1 | `7523ac1ea`, `e5904b357` |
+| M8: the 17-page step cap checked at proof time only | derive refuses a kernel whose prologue's one witness-input step writes more pages than its shape's largest class (`DeriveError::StepPages`): 17 pages for either input, which both class sets hold; a test | `eb1c4b9c0` |
+| L1: a clock stepped back past the horizon | the floor: the latest expiry of a nonce forgotten, stored (`NodeRow::OperatorFloor`), below which a command is refused `Expiry`; its writes in order; a clock that ran ahead warned at start and documented; unit and end-to-end tests | `5f631ef09`, `83931bf6b` |
+| L2: no `batch_time` row | `RootUnknown` | `315b9a31b` |
+| L3: any device program error kept | only the kernel's own failures (shape, run, witness, wiring, masking) kept; the rest `Unavailable` | `315b9a31b` |
+| L4: the two verifiers' panics | one `catch_unwind` around both | `315b9a31b` |
+| L5: `Once` before the proof | documented in `node/SECURITY.md` (the plan's order, pin I, keeps it there) | `e5904b357` |
+| L6: the sweep's binding budget | **not taken**: the budget is the default agent's refine's, a consensus rule beside `SWEEP_RESERVE`'s gas and JAM's builder; its behaviour stays documented (`defaults::SWEEP_BINDINGS`, `node/SECURITY.md`) for the next slice | — |
+| L7: a QUIC stream's deadline | from its accept (`node-api.md`) | `315b9a31b` |
+| L8: `credentialed_free` | an atomic count of the places held (`Places`) | `315b9a31b` |
+| L9: `front` twice a request | once for a credential proof; a device proof's checks run again after its program's lookup, which awaits | `315b9a31b` |
+| L10 (s4): `refresh` on the server's word | honoured only when the facility's own root poll shows the held path's root moved, the 30 s bound counting honoured ones; the facility test's refresh cases | s4 `vos-7.23d` `5c5a018` (from `7de206e`, not pushed) |
+| L11: stale records | 7.20's "L6 not taken" is closed by `stark_is_canonical`, now tested (a queried value plus `p` refused `Noncanonical`); 7.23b's P-D9 is fixed (`vos_device::verify` runs `call.check()`); `node/SECURITY.md`'s device format 46; `node-api.md`'s `contact` column and `vos_wire::ingress`'s `message`; the slot's needle only from 2^20 up, stated | `94125ae2f`, `315b9a31b`, `7523ac1ea`, `e5904b357` |
+| M9 review: A1 | a device kernel's run traced with 2^18 gas (the CPU's most steps and as much again: about 109 Poseidon2 calls), not 2^20; no program id or fixture moves | `e5904b357`, `83931bf6b` |
+| M9 review: A2 | `node/SECURITY.md`: a device kernel is trusted as its actor's code is | `e5904b357` |
+| M9 review: B1 | httparse's `TooManyHeaders` answered 431; `vos-http` unit tests of a head completed past the limit, one still partial past it, and too many lines | `e971c14f4` |
+| M9 review: B2 | `(https, Trust::NodeKey)` refused ("a node's key pins QUIC: Target::quic"); its test rows and the gateway's two tests flipped | `e971c14f4` |
+| M9 review: B3 | `slice-7-mobile.md`: the `--tls` and `ingress_connections` deleted at C10 | `e971c14f4` |
+| M9 review: C1 | `format.rs`: the masked formats' shapes pinned at or under the reference shape, no recount | `e971c14f4` |
+
+**Review (Opus):** no blocking defect; nothing touches proof bytes.
+Folded: the floor answered `Expiry`, not `Replayed`, and a clock that ran
+ahead warned and documented (M1); the floor's writes serialized, each
+storing the floor as it is then (L2); a split doc comment (L3); the
+device gas's Poseidon2 budget stated (L4); a comment (nit). Left: the
+large places' free count may read one high for a moment (a status
+number); a refused peer's frames take a lock while any peer is refused.
+
+**Gates** (12 GiB scope, `nice -n 10`, 8 jobs, no incremental builds), at
+`4379ee7b5`: `just check` exit 0 (1,708 passed in 118 suites); `just
+test-proof` exit 0 (602 passed, the carrier audit among them, no fixture
+or constant re-pinned); `just test-carriers` exit 0 (its own run). s4's
+`just vos` steps on `vos-7.23d`: fmt, clippy and tests pass.

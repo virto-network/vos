@@ -47,8 +47,61 @@ pub(crate) struct Api {
     /// Requests the API's transports brought.
     pub(crate) frames: AtomicU64,
     /// The large bodies' places: installs', and credentialed calls'.
-    pub(crate) large: Arc<smol::lock::Semaphore>,
-    pub(crate) credentialed: Arc<smol::lock::Semaphore>,
+    pub(crate) large: Places,
+    pub(crate) credentialed: Places,
+}
+
+/// A pool of large bodies' places, and how many are held.
+pub(crate) struct Places {
+    places: Arc<smol::lock::Semaphore>,
+    held: Arc<AtomicUsize>,
+    most: usize,
+}
+
+/// A place taken from [`Places`], given back when dropped.
+pub(crate) struct Place {
+    _place: smol::lock::SemaphoreGuardArc,
+    held: Arc<AtomicUsize>,
+}
+
+impl Drop for Place {
+    fn drop(&mut self) {
+        self.held.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl Places {
+    fn new(most: usize) -> Self {
+        Self {
+            places: Arc::new(smol::lock::Semaphore::new(most)),
+            held: Arc::new(AtomicUsize::new(0)),
+            most,
+        }
+    }
+
+    fn held(&self, place: smol::lock::SemaphoreGuardArc) -> Place {
+        self.held.fetch_add(1, Ordering::SeqCst);
+        Place {
+            _place: place,
+            held: Arc::clone(&self.held),
+        }
+    }
+
+    /// A place, if one is free now.
+    pub(crate) fn try_take(&self) -> Option<Place> {
+        self.places.try_acquire_arc().map(|place| self.held(place))
+    }
+
+    /// A place, once one is free.
+    pub(crate) async fn take(&self) -> Place {
+        let place = self.places.acquire_arc().await;
+        self.held(place)
+    }
+
+    /// The places free now, without taking one.
+    fn free(&self) -> usize {
+        self.most.saturating_sub(self.held.load(Ordering::SeqCst))
+    }
 }
 
 /// A read's place among those waiting, given back when it ends, however it
@@ -107,11 +160,7 @@ fn large(kind: Kind, body: u32) -> Option<Large> {
 impl Api {
     /// The places the frame `reader` has part read takes one of, if its
     /// body is large.
-    fn large_places(
-        &self,
-        reader: &vos_api::Reader,
-        framing: vos_api::Framing,
-    ) -> Option<&Arc<smol::lock::Semaphore>> {
+    fn large_places(&self, reader: &vos_api::Reader, framing: vos_api::Framing) -> Option<&Places> {
         let header = reader.header()?;
         let body = header.body(framing)?;
         match large(Kind::from_u16(header.kind)?, body)? {
@@ -122,9 +171,7 @@ impl Api {
 
     /// The credentialed calls' places free now.
     pub(crate) fn credentialed_free(&self) -> usize {
-        std::iter::from_fn(|| self.credentialed.try_acquire())
-            .collect::<Vec<_>>()
-            .len()
+        self.credentialed.free()
     }
 }
 
@@ -140,8 +187,8 @@ impl Api {
             operators,
             nonces,
             frames: AtomicU64::new(0),
-            large: Arc::new(smol::lock::Semaphore::new(LARGE_BODIES)),
-            credentialed: Arc::new(smol::lock::Semaphore::new(CREDENTIALED_BODIES)),
+            large: Places::new(LARGE_BODIES),
+            credentialed: Places::new(CREDENTIALED_BODIES),
         }
     }
 

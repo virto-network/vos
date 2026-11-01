@@ -48,12 +48,15 @@ pub const FORMAT: Format = DEVICE_PROOF;
 /// The longest device proof a decode reads, in bytes: ingress's cap.
 pub const MAX_PROOF_BYTES: usize = 1536 << 10;
 
-/// The most gas a device kernel's run is traced with, about a million: a
-/// step a unit (eight times the most steps the device format's CPU holds,
-/// `2^DEVICE_MAX_LOG_SIZE`), a Poseidon2 call 2,400 (auth's 43 take about a
-/// tenth of it). A longer run stops out of gas rather than being traced
-/// far past any program's shape.
-pub const GAS: u64 = 8 << vos_pvm_proof::device::DEVICE_MAX_LOG_SIZE;
+/// The most gas a device kernel's run is traced with, 2^18: a step a unit,
+/// a Poseidon2 call 2,400, so the most steps the device format's CPU holds,
+/// `2^DEVICE_MAX_LOG_SIZE`, and as much again for its Poseidon2 calls
+/// (auth's 43 take 103,200 beside its 19,000 or so steps): about 109
+/// Poseidon2 calls a run, fewer as its steps grow, which a device kernel's
+/// install meets as a run out of gas. A longer run stops out of gas rather
+/// than being traced past twice any program's steps, on an executor that
+/// bounds no memory.
+pub const GAS: u64 = 2 << vos_pvm_proof::device::DEVICE_MAX_LOG_SIZE;
 
 /// The bytes of auth's public arguments: the kind byte and four digests.
 pub const AUTH_PUBLIC_BYTES: usize = 1 + 4 * 32;

@@ -95,8 +95,13 @@
 //!   its randomizer's size, which a prover and a verifier take from the
 //!   format, never from a proof.
 //! - **The bit counts** are [`crate::security`]'s, at each entry's reference
-//!   shape; the verifier counts again at the proof's own shape and refuses a
-//!   proof below either floor.
+//!   shape. The segment's and the recursion's verifiers count again at the
+//!   proof's own shape and refuse a proof below either floor; the masked
+//!   formats' (39, 44, 46) do not: their shapes are pinned at or under the
+//!   reference shape (a fixed layout, the credential circuits, a device
+//!   program's log sizes at most `DEVICE_MAX_LOG_SIZE`), and every term of
+//!   the count is monotone in the shape, so the reference's count bounds
+//!   every proof's.
 
 use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;

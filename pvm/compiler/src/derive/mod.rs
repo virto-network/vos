@@ -217,6 +217,11 @@ pub enum DeriveError {
         class: usize,
         rows: [usize; 3],
     },
+    #[error(
+        "attestable method {method:#010x}'s kernel's prologue writes {pages} pages in one \
+         witness-input step, past its shape's largest class, {most} pages: no cut holds the step"
+    )]
+    StepPages { method: u32, pages: u64, most: u16 },
 }
 
 /// Derive an actor's program and its kernels from its ELF.
@@ -245,19 +250,22 @@ pub fn derive(elf: &[u8]) -> Result<Derived, DeriveError> {
         .filter(|entry| entry.device)
         .map(|entry| entry.method)
         .collect();
+    let inputs: Vec<Input> = entries.iter().map(|entry| entry.input).collect();
     let kernels: Vec<(u32, Vec<u8>)> = entries
         .into_iter()
         .map(|entry| Ok((entry.method, kernel(&graph, &entry)?)))
         .collect::<Result<_, DeriveError>>()?;
     let shapes = kernels
         .iter()
-        .map(|(method, kernel)| {
+        .zip(inputs)
+        .map(|((method, kernel), input)| {
             let shape = crate::shape::kernel_shape(kernel).expect("a kernel is a standard program");
             // No node cuts a device kernel into segments: its leaves are
             // never proved.
             if devices.contains(method) {
                 return Ok(shape);
             }
+            step_fits(*method, input, &shape)?;
             match crate::leaf::oversized_leaves(&shape).first() {
                 Some(&(class, rows)) => Err(DeriveError::Leaf {
                     method: *method,
@@ -277,6 +285,32 @@ pub fn derive(elf: &[u8]) -> Result<Derived, DeriveError> {
         heap,
         transpiler_version: TRANSPILER_VERSION,
     })
+}
+
+/// That the prologue's one witness-input step, which writes its whole
+/// read at once, touches no more pages than `shape`'s largest class holds:
+/// a step is never cut, so a step past every class would fail at proof
+/// time, whatever the kernel's run.
+fn step_fits(
+    method: u32,
+    input: Input,
+    shape: &vos_wire::records::Shape,
+) -> Result<(), DeriveError> {
+    let most = shape
+        .classes
+        .iter()
+        .map(|class| class.pages)
+        .max()
+        .unwrap_or(0);
+    let pages = input.step_pages();
+    if pages > u64::from(most) {
+        return Err(DeriveError::StepPages {
+            method,
+            pages,
+            most,
+        });
+    }
+    Ok(())
 }
 
 /// Leave the heap's arena past [`INVOCATION_HEAP`] out of the read-write
@@ -408,6 +442,16 @@ impl Input {
     /// fills them is too long, and the prologue traps.
     const fn pages(self) -> u64 {
         (self.most() + 1).div_ceil(PAGE)
+    }
+
+    /// The most pages one witness-input call of its prologue writes: the
+    /// whole read from the argument pages' first byte, or a chunk from
+    /// any byte of a page.
+    const fn step_pages(self) -> u64 {
+        match self.chunk() {
+            None => self.pages(),
+            Some(chunk) => (PAGE - 1 + chunk - 1) / PAGE + 1,
+        }
     }
 
     /// What one witness-input call asks for at most, where it is bounded.
@@ -618,6 +662,41 @@ mod tests {
                 kinds_as_declared(&section(kind, "auth"), &[]),
                 Err(DeriveError::Table(_))
             ));
+        }
+    }
+
+    /// The prologue's one witness-input step fits the largest class of a
+    /// kernel holding the Poseidon2 chip, 17 pages, for either input; a
+    /// shape whose classes hold fewer is refused at derive.
+    #[test]
+    fn the_prologues_step_fits_the_largest_class() {
+        use vos_wire::records::{SegmentClass, Shape};
+        let shape = |classes: &[(u8, u16)]| Shape {
+            policy: crate::shape::POLICY,
+            chips: 0,
+            classes: classes
+                .iter()
+                .map(|&(log_steps, pages)| SegmentClass {
+                    log_steps,
+                    pages,
+                    log_sizes: [0; vos_wire::records::SEGMENT_CHIPS],
+                })
+                .collect(),
+        };
+        assert_eq!(Input::Arguments.step_pages(), 17);
+        assert_eq!(Input::Served.step_pages(), 17);
+        for input in [Input::Arguments, Input::Served] {
+            for classes in [&crate::shape::POSEIDON2_CLASSES, &crate::shape::CLASSES] {
+                assert!(step_fits(7, input, &shape(classes)).is_ok(), "{input:?}");
+            }
+            match step_fits(7, input, &shape(&[(12, 8), (15, 8), (12, 16)])) {
+                Err(DeriveError::StepPages {
+                    method: 7,
+                    pages: 17,
+                    most: 16,
+                }) => {}
+                other => panic!("{input:?}: {other:?}"),
+            }
         }
     }
 

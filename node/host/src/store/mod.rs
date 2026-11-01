@@ -362,6 +362,15 @@ impl Fjall {
         Ok(nonces)
     }
 
+    /// The latest expiry among the operators' nonces forgotten, or 0.
+    pub fn operator_floor(&self) -> Result<u64> {
+        Ok(self
+            .system()
+            .get(node_record(NodeRow::OperatorFloor, &[]))?
+            .and_then(|value| value[..].try_into().ok())
+            .map_or(0, u64::from_be_bytes))
+    }
+
     /// The node's last run, as its pair heartbeat numbered it.
     pub fn incarnation(&self) -> Result<u64> {
         Ok(self

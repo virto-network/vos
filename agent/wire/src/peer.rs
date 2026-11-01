@@ -48,7 +48,9 @@ pub enum PeerMessage {
     /// 0, are listed whole: each group in `leading` at its term, none in
     /// `unlisted`. A round comes in `parts` frames, this one `part`. `took`
     /// is the receiver's run and the last of its rounds the sender took
-    /// whole, or zeros.
+    /// whole, or zeros. `lanes` is the sender's streams a class (its
+    /// `peer_lanes`): a peer with other lanes would refuse its groups'
+    /// frames, so the receiver refuses the sender whole, loudly.
     #[codec(index = 5)]
     Liveness {
         incarnation: u64,
@@ -59,6 +61,7 @@ pub enum PeerMessage {
         leading: Vec<Leading>,
         unlisted: Vec<AgentId>,
         took: (u64, u64),
+        lanes: u32,
     },
     /// Where an agent runs, with its creation record: from its creator at
     /// creation, then from its leader as its replicas change, or from a

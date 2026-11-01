@@ -725,6 +725,10 @@ M4's 7.7, 7.8a, 7.9, 7.10 and 7.10b and M5's 7.14 run beside them
     run, with its inventory, versions, host facts, summary, and the
     binding resource of each host at the knee (CPU, iowait, the NIC
     against its link speed).
+- **Deleted at C10** (step 7.10b): the node's HTTP, its `--tls` and
+  `ingress_connections`; the harness reaches nodes over the node API's
+  QUIC with their keys pinned; the `--tls` above and the
+  `ingress_connections` below are the plan as written.
 - **Node changes it needs:** a `--config node.toml` exposing `Config`
   (executors, queue, linger, `max_inputs`, `ingress_connections`,
   elections, heartbeat); an admin route and `vos space representative` to
