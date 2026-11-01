@@ -297,24 +297,34 @@ fn a_public_constant_is_no_needle() {
 }
 
 /// A served row's key is a needle; its value is a number's at the floor the
-/// run asks, a small one only in the run over small values; every value a
-/// run wrote is a needle at the same floor.
+/// run asks, a small one only in the run over small values and by its
+/// digits alone; every value a run wrote is a needle at the same floor.
 #[test]
 fn keys_written_values_and_small_values_are_needles() {
     let (attest, arguments) = attest(0x12_3456);
     let mut needles = Needles::default();
     needles.attest("read", &attest, arguments, ROW_FLOOR);
     assert_eq!(needles.named(Kind::ServedRow, "row 0's key").count(), 1);
-    assert_eq!(needles.named(Kind::ServedRow, "row 0's value").count(), 1);
+    assert_eq!(needles.named(Kind::ServedRow, "row 0's value").count(), 0);
     let mut small = Needles::default();
     small.attest("read", &attest, arguments, SMALL_FLOOR);
-    assert_eq!(small.named(Kind::ServedRow, "row 0's value").count(), 2);
+    assert_eq!(small.named(Kind::ServedRow, "row 0's value").count(), 1);
     let mut audit = Audit {
         needles: small,
         ..Audit::default()
     };
     audit.carrier("a log", Reach::Leaves, b"value=1193046".to_vec());
     assert_eq!(audit.findings().len(), 1);
+    audit.carrier(
+        "a frame",
+        Reach::Leaves,
+        0x12_3456u64.to_le_bytes().to_vec(),
+    );
+    assert_eq!(
+        audit.findings().len(),
+        1,
+        "a small value's bytes are no form"
+    );
 
     let mut written = Needles::default();
     written.written("run", [40_000, 0x12_3456, 1 << 40], SMALL_FLOOR);

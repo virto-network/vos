@@ -51,10 +51,13 @@ pub const DISTINCT: usize = 4;
 pub const ROW_FLOOR: u64 = 1 << 24;
 
 /// The least row value searched as a number in the run over small values:
-/// a value below it is a port, a size or a count of any log's by chance,
-/// and its byte forms have fewer than [`DISTINCT`] distinct bytes. Such a
-/// row is still searched by its salt, its key and its hashes.
-pub const SMALL_FLOOR: u64 = 1 << 16;
+/// a value below it is a port, a size, a count or a process id of any
+/// log's by chance. A row value below [`ROW_FLOOR`] is searched by its
+/// digits and its `0x` hex alone, matched whole ([`Needle::digits`]): its
+/// byte forms, three bytes and zeros, a binary carrier's fields hold by
+/// chance. Such a row is still searched by its salt, its key and its
+/// hashes.
+pub const SMALL_FLOOR: u64 = 1 << 20;
 
 /// The domains `vos-wire` and its venues hash under, each a prefix of the
 /// hashed bytes: a private value hashed under any of them is a needle too.
@@ -193,6 +196,32 @@ impl Needle {
             forms: Vec::new(),
             leaving,
             value: Some(value),
+        }
+    }
+
+    /// A row's value below [`ROW_FLOOR`]: its decimal digits and its `0x`
+    /// hex, matched whole, in the carriers that leave.
+    pub fn digits(kind: Kind, name: impl Into<String>, value: u64) -> Self {
+        Self {
+            kind,
+            name: name.into(),
+            forms: Vec::new(),
+            leaving: vec![
+                value.to_string().into_bytes(),
+                format!("{value:#x}").into_bytes(),
+                format!("{value:#X}").into_bytes(),
+            ],
+            value: Some(value),
+        }
+    }
+
+    /// A row's value of at least `floor`: [`Needle::number`] from
+    /// [`ROW_FLOOR`] up, [`Needle::digits`] below it.
+    fn row_value(kind: Kind, name: impl Into<String>, value: u64, floor: u64) -> Option<Self> {
+        match value {
+            value if value >= ROW_FLOOR => Some(Self::number(kind, name, value)),
+            value if value >= floor => Some(Self::digits(kind, name, value)),
+            _ => None,
         }
     }
 
@@ -432,9 +461,14 @@ impl Needles {
                 salt,
             ));
             let name = format!("{statement}: row {row}'s value");
-            self.push(Needle::bytes(Kind::ServedRow, &name, value));
-            if let Some(number) = u64::decode_exact(value).filter(|&number| number >= floor) {
-                self.0.push(Needle::number(Kind::ServedRow, &name, number));
+            match u64::decode_exact(value) {
+                Some(number) => {
+                    if number >= ROW_FLOOR {
+                        self.push(Needle::bytes(Kind::ServedRow, &name, value));
+                    }
+                    self.push(Needle::row_value(Kind::ServedRow, &name, number, floor));
+                }
+                None => self.push(Needle::bytes(Kind::ServedRow, &name, value)),
             }
             private.push((format!("row {row}'s value"), value.clone()));
         }
@@ -444,11 +478,12 @@ impl Needles {
     /// least `floor` a number's needle: a row's value leaves the role only
     /// as a statement's output does.
     pub fn written(&mut self, run: &str, values: impl IntoIterator<Item = u64>, floor: u64) {
-        for value in values.into_iter().filter(|&value| value >= floor) {
-            self.0.push(Needle::number(
+        for value in values {
+            self.push(Needle::row_value(
                 Kind::ServedRow,
                 format!("{run}: the written value {value}"),
                 value,
+                floor,
             ));
         }
     }

@@ -9,7 +9,7 @@ use std::fmt;
 use blake2::{Blake2b512, Digest as _};
 use vos_wire::credentials::{self, EMPTY, P, Path, Tag, Words};
 
-use super::{Kind, Needle, Needles};
+use super::{Kind, Needle, Needles, SMALL_FLOOR};
 
 /// The derivation's domain, as `vos_device::derive_secret` hashes it.
 const SECRET_DOMAIN: &[u8] = b"vos/device/secret/v1";
@@ -82,9 +82,10 @@ impl Needles {
         words
     }
 
-    /// Where `member` sits: its member digest `digest`, its leaf, and each
-    /// sibling of `path` that is not the empty subtree at its level (which
-    /// every tree holds).
+    /// Where `member` sits: its member digest `digest`, its leaf, its slot
+    /// from [`SMALL_FLOOR`] up (by its digits and hex, matched whole), and
+    /// each sibling of `path` that is not the empty subtree at its level
+    /// (which every tree holds).
     pub fn member_place(&mut self, member: &str, digest: &credentials::Digest, path: &Path) {
         let name = |what: &str| format!("{member}: {what}");
         self.push(Needle::field(
@@ -97,6 +98,13 @@ impl Needles {
                 Kind::MemberPlace,
                 name("the leaf"),
                 &credentials::digest(&credentials::leaf(&words)),
+            ));
+        }
+        if u64::from(path.slot) >= SMALL_FLOOR {
+            self.0.push(Needle::digits(
+                Kind::MemberPlace,
+                name("the slot"),
+                u64::from(path.slot),
             ));
         }
         for (level, sibling) in path.siblings.0.iter().enumerate() {

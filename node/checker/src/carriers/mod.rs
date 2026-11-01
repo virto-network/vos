@@ -8,16 +8,15 @@
 //! member's device secret, where the member sits in the tree and its
 //! proofs' masks. [`Needles`] holds them, from the prover's internals
 //! (`vos_node_prover::Internals`), each statement's record and a member's
-//! secret source ([`credential`]); [`Audit`]
-//! holds the carriers, each as it [`Reach`]es: out of the role (a venue's
-//! call, a log line, a client's answer, a node that does not replicate the
-//! agent), a venue's own record of what it was sent (a chain's logs and
-//! database), or within the agent's replicas (its log, its blobs, the
-//! frames between them). Every needle is searched in every form in each
+//! secret source ([`credential`]); [`Audit`] holds the carriers, each as
+//! it [`Reach`]es: out of the role (a venue's call, a log line, a client's
+//! answer, a node that does not replicate the agent), a venue's own record
+//! of what it was sent (a chain's logs and database), or within the
+//! agent's replicas (its log, its blobs, the frames between them). Every needle is searched in every form in each
 //! carrier that leaves; every needle in its full forms alone in a venue's
 //! record (see [`Reach::Recorded`]); the proofs, memory roots, register
-//! files and the wrap's randomness, which no carrier may hold, in its full
-//! forms in those that stay too.
+//! files, the masks' randomness and a device secret, which no carrier may
+//! hold, in their full forms in those that stay too.
 //!
 //! - [`needles`]: the needles and the forms each is searched in;
 //! - [`credential`]: a member's device secret and place as needles;
@@ -79,20 +78,6 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// Every kind.
-    pub const ALL: [Kind; 10] = [
-        Self::NodeProof,
-        Self::ServedRow,
-        Self::PrivateHash,
-        Self::StepCount,
-        Self::MemoryRoot,
-        Self::Register,
-        Self::WrapRandomness,
-        Self::DebugOutput,
-        Self::DeviceSecret,
-        Self::MemberPlace,
-    ];
-
     /// The kinds a run that proves a statement must hold needles of.
     pub const PROVER: [Kind; 8] = [
         Self::NodeProof,

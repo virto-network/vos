@@ -120,9 +120,9 @@ pub fn submission_carriers(statement: &Statement, proof: &[u8]) -> Vec<(String, 
 
 /// Every file under `dir`, read whole, in path order, and then the names of
 /// every file and directory under it, one a line, as `<dir>: names`: what a
-/// node wrote to its disk. A socket, a pipe or a link is named only. Fails on a directory or file that cannot be
-/// read, rather than leave its bytes unsearched; a file removed since it
-/// was listed is named and not read.
+/// node wrote to its disk. A socket, a pipe or a link is named only. Fails
+/// on a directory or file that cannot be read, rather than leave its bytes
+/// unsearched; a file removed since it was listed is named and not read.
 pub fn directory(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
     let mut files = Vec::new();
     let mut names = Vec::new();
@@ -137,12 +137,16 @@ pub fn directory(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
                 })
                 .path();
             names.push(path.display().to_string());
-            if path.is_dir() {
+            // A socket, a pipe or a link has no bytes of its own on the
+            // disk: named only.
+            let kind = match std::fs::symlink_metadata(&path) {
+                Ok(meta) => meta.file_type(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => panic!("{} is not read: {error}", path.display()),
+            };
+            if kind.is_dir() {
                 pending.push(path);
-            } else if std::fs::symlink_metadata(&path).is_ok_and(|meta| !meta.is_file()) {
-                // A socket, a pipe or a link: no bytes of its own on the
-                // disk, its name among the names.
-            } else {
+            } else if kind.is_file() {
                 match std::fs::read(&path) {
                     Ok(bytes) => files.push((path.display().to_string(), bytes)),
                     // Removed since it was listed, by a process still
@@ -244,10 +248,12 @@ pub struct Logs(Arc<Mutex<Vec<u8>>>);
 
 impl Logs {
     /// The process's capture, installed as its global subscriber on the
-    /// first call. Fails if another subscriber is installed already.
+    /// first call, emptied on each: a run's own lines from now on, a run
+    /// before it in the process left out. Fails if another subscriber is
+    /// installed already.
     pub fn install() -> Self {
         static LOGS: OnceLock<Logs> = OnceLock::new();
-        LOGS.get_or_init(|| {
+        let logs = LOGS.get_or_init(|| {
             let logs = Logs::default();
             let subscriber = tracing_subscriber::fmt()
                 .with_max_level(tracing::Level::TRACE)
@@ -258,8 +264,9 @@ impl Logs {
             tracing::subscriber::set_global_default(subscriber)
                 .expect("the process's only subscriber");
             logs
-        })
-        .clone()
+        });
+        lock(&logs.0).clear();
+        logs.clone()
     }
 
     /// What was captured so far.

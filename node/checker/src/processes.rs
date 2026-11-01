@@ -328,9 +328,15 @@ impl Front {
         &self.target
     }
 
-    /// Runs `task` on the gateway's runtime, to its end.
-    pub fn block_on<T>(&self, task: impl std::future::Future<Output = T>) -> T {
-        self.runtime.block_on(task)
+    /// Runs `task` as one of the gateway's tasks, on its runtime's
+    /// workers, to its end.
+    pub fn run<T: Send + 'static>(
+        &self,
+        task: impl std::future::Future<Output = T> + Send + 'static,
+    ) -> T {
+        self.runtime
+            .block_on(self.runtime.spawn(task))
+            .expect("the task ends")
     }
 }
 
