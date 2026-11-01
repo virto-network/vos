@@ -40,3 +40,5 @@ russh = { version = "0.61", default-features = false, features = ["ring", "flate
 vos-node = { path = "../host" }
 vos-checker = { path = "../checker" }
 tempfile = "3"
+# A CA and the certificate it signs, for a client trusting the CA.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
