@@ -31,6 +31,7 @@ pub(crate) use canonical::preprocessed_root;
 #[cfg(feature = "debug-internals")]
 mod debug;
 mod profile;
+mod request;
 mod shaped;
 
 pub use canonical::{
@@ -40,6 +41,7 @@ pub use canonical::{
 #[cfg(feature = "debug-internals")]
 pub use debug::{debug_assert_constraints_explicit, debug_claimed_sums};
 pub use profile::ProveProfile;
+pub(crate) use request::{ProveRequest, Sizes};
 pub use shaped::{KernelSegment, program_commitment_for_shape, prove_kernel, prove_shaped};
 
 /// Why a proof was not produced.
@@ -394,56 +396,6 @@ pub fn prove_chip_isolated_format(
     Ok(proof)
 }
 
-/// A proof to make: its target, its chips (`component_mask` names them, 0
-/// for an explicit set), their sizes, whether to profile the run, and the
-/// boundary states the forgery seam ships instead of the trace's.
-pub(crate) struct ProveRequest<'a> {
-    pub target: Target,
-    pub components: &'a [&'a dyn crate::framework::MachineProverComponent],
-    pub component_mask: u32,
-    pub sizes: Sizes<'a>,
-    pub profile: bool,
-    pub boundary_override: Option<(SegmentState, SegmentState)>,
-}
-
-impl<'a> ProveRequest<'a> {
-    /// A proof under `target` of `components` at `sizes`, unprofiled, with
-    /// the trace's boundary states.
-    pub(crate) fn new(
-        target: Target,
-        components: &'a [&'a dyn crate::framework::MachineProverComponent],
-        component_mask: u32,
-        sizes: Sizes<'a>,
-    ) -> Self {
-        Self {
-            target,
-            components,
-            component_mask,
-            sizes,
-            profile: false,
-            boundary_override: None,
-        }
-    }
-}
-
-/// The log sizes a proof's chips take: at least floors (none: natural
-/// sizes), or exactly a shape's.
-#[derive(Clone, Copy)]
-pub(crate) enum Sizes<'a> {
-    Floors(&'a [u32]),
-    Pinned(&'a [u32]),
-}
-
-impl<'a> Sizes<'a> {
-    pub(crate) const NATURAL: Sizes<'static> = Sizes::Floors(&[]);
-
-    fn floors(self) -> &'a [u32] {
-        match self {
-            Self::Floors(sizes) | Self::Pinned(sizes) => sizes,
-        }
-    }
-}
-
 /// The components' main traces: the producers in order, filling the side
 /// note's multiplicities, then the consumers in parallel.
 pub(crate) fn generate_component_traces(
@@ -595,61 +547,11 @@ where
     let format = target.format;
     let config = format.pcs_config();
 
-    // This must precede memory-page ingestion and every component trace
-    // allocation: malformed/fault traces are a caller-boundary error, not an
-    // expensive attempt at an unsatisfiable proof.
-    validate_memory_witnesses(side_note)?;
+    prepare(side_note)?;
 
-    // RegisterMemoryBoundaryChip needs `initial_regs`
-    // populated.
-    backfill_initial_regs(side_note);
-
-    // Refresh `final_regs` when the closing chip is in the
-    // component set, so a caller that constructed the SideNote with
-    // stale final_regs can't accidentally produce a proof whose
-    // claimed final state diverges from the actual trace's last step.
-    // Skipped for chip-isolated harnesses that opted out of the
-    // closing chip — those proofs leave `final_regs` untouched (the
-    // field is unused without the chip).
-    if side_note.closing_chip_active {
-        backfill_final_regs(side_note);
-    }
-
-    // Build the memory-page Merkle boundary payload (listed pages,
-    // entering/exit images, multiproof, merge schedule, `merkle_blake2b_calls`)
-    // before trace generation — `MemoryChip` injects the per-page ledger entries
-    // from it, `MemoryPageChip` / `MemoryMerkleChip` / `MemoryRootBoundaryChip`
-    // produce the leaf/merge/root tuples, and `Blake2bBoundaryChip` proves the
-    // compressions.  Prove-path only; idempotent.
-    side_note.ingest_memory_pages();
-
-    // Trace gen — split into a sequential *producer* pass and a parallel
-    // *consumer* pass.  Producers (CpuChip, Blake2bChip) write per-row
-    // multiplicities + entries into `side_note` while filling their main
-    // trace; consumer chips (ALU/range/lookup tables, boundary chips,
-    // memory ledgers, …) only read those, so they run on
-    // rayon with shared `&SideNote`.  Mirrors the producer/consumer
-    // split already used by interaction-trace generation a few stages
-    // below.
     let t = Instant::now();
     let traces = generate_component_traces(side_note, components, sizes.floors());
-    let log_sizes: Vec<u32> = traces.iter().map(ComponentTrace::log_size).collect();
-    if let Sizes::Pinned(pinned) = sizes
-        && let Some((position, (&log_size, &pinned))) = log_sizes
-            .iter()
-            .zip(pinned)
-            .enumerate()
-            .find(|(_, (log_size, pinned))| log_size != pinned)
-    {
-        let chip = crate::chips_of_mask(component_mask)
-            .nth(position)
-            .unwrap_or(position);
-        return Err(ProvingError::Shape {
-            chip,
-            log_size,
-            pinned,
-        });
-    }
+    let log_sizes = traced_sizes(&traces, sizes, component_mask)?;
     let trace_gen = t.elapsed();
 
     let twiddles = canonical::twiddles_for(components, &log_sizes, &config);
@@ -664,25 +566,22 @@ where
     // memory but is the only supported path for our chip shape.
     commitment_scheme.set_store_polynomials_coefficients();
 
-    // Preprocessed trace.
     let t = Instant::now();
-    let mut tree_builder = commitment_scheme.tree_builder();
-    for component_trace in &traces {
-        tree_builder.extend_evals(component_trace.to_circle_evaluation(PREPROCESSED_TRACE_IDX));
-    }
-    tree_builder.commit(prover_channel);
+    commit_trees(
+        &mut commitment_scheme,
+        prover_channel,
+        &traces,
+        PREPROCESSED_TRACE_IDX,
+    );
     let preprocess_commit = t.elapsed();
 
-    // Main trace.
     let t = Instant::now();
-    let mut tree_builder = commitment_scheme.tree_builder();
-    let mut total_main_columns = 0;
-    for component_trace in &traces {
-        let evals = component_trace.to_circle_evaluation(ORIGINAL_TRACE_IDX);
-        total_main_columns += evals.len();
-        tree_builder.extend_evals(evals);
-    }
-    tree_builder.commit(prover_channel);
+    let total_main_columns = commit_trees(
+        &mut commitment_scheme,
+        prover_channel,
+        &traces,
+        ORIGINAL_TRACE_IDX,
+    );
     let main_commit = t.elapsed();
 
     // The shipped boundary states: the trace's, or the forgery seam's.
@@ -811,4 +710,78 @@ where
         },
         prof,
     ))
+}
+
+/// What a proof needs of `side_note` before its traces: its memory
+/// witnesses checked (a malformed or faulting trace is the caller's error,
+/// not an expensive attempt at an unsatisfiable proof), its boundary
+/// registers filled, and its memory pages' Merkle payload built.
+fn prepare(side_note: &mut SideNote) -> Result<(), ProvingError> {
+    validate_memory_witnesses(side_note)?;
+    // RegisterMemoryBoundaryChip needs `initial_regs` populated.
+    backfill_initial_regs(side_note);
+    // Refresh `final_regs` when the closing chip is in the component set,
+    // so a caller that constructed the SideNote with stale final_regs can't
+    // produce a proof whose claimed final state diverges from the trace's
+    // last step. Chip-isolated harnesses without the closing chip leave
+    // `final_regs` untouched (the field is unused without the chip).
+    if side_note.closing_chip_active {
+        backfill_final_regs(side_note);
+    }
+    // The memory-page Merkle boundary payload (listed pages, entering and
+    // exit images, multiproof, merge schedule, `merkle_blake2b_calls`),
+    // before trace generation: `MemoryChip` injects the per-page ledger
+    // entries from it, `MemoryPageChip`, `MemoryMerkleChip` and
+    // `MemoryRootBoundaryChip` produce the leaf, merge and root tuples, and
+    // `Blake2bBoundaryChip` proves the compressions. Idempotent.
+    side_note.ingest_memory_pages();
+    Ok(())
+}
+
+/// The traces' log sizes, each the shape's when `sizes` pins them.
+fn traced_sizes(
+    traces: &[ComponentTrace],
+    sizes: Sizes<'_>,
+    component_mask: u32,
+) -> Result<Vec<u32>, ProvingError> {
+    let log_sizes: Vec<u32> = traces.iter().map(ComponentTrace::log_size).collect();
+    if let Sizes::Pinned(pinned) = sizes
+        && let Some((position, (&log_size, &pinned))) = log_sizes
+            .iter()
+            .zip(pinned)
+            .enumerate()
+            .find(|(_, (log_size, pinned))| log_size != pinned)
+    {
+        let chip = crate::chips_of_mask(component_mask)
+            .nth(position)
+            .unwrap_or(position);
+        return Err(ProvingError::Shape {
+            chip,
+            log_size,
+            pinned,
+        });
+    }
+    Ok(log_sizes)
+}
+
+/// Commit the traces' columns of tree `tree`, in the components' order:
+/// how many there are.
+fn commit_trees<MC: PcsStack>(
+    commitment_scheme: &mut CommitmentSchemeProver<'_, SimdBackend, MC>,
+    channel: &mut MC::C,
+    traces: &[ComponentTrace],
+    tree: usize,
+) -> usize
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    let mut tree_builder = commitment_scheme.tree_builder();
+    let mut columns = 0;
+    for component_trace in traces {
+        let evals = component_trace.to_circle_evaluation(tree);
+        columns += evals.len();
+        tree_builder.extend_evals(evals);
+    }
+    tree_builder.commit(channel);
+    columns
 }
