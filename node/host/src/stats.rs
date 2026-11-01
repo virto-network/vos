@@ -83,6 +83,9 @@ pub(crate) struct Stats {
     pub(crate) resume: Histogram,
     /// A signature check of a call or a query, on an executor.
     pub(crate) verify: Histogram,
+    /// An operator command's body decoded on an executor: an `Install`'s
+    /// package.
+    pub(crate) operator_body: Histogram,
     /// A credential proof's verification waiting for an executor, from
     /// its verification slot taken, and its run there.
     pub(crate) credential_queue: Histogram,
@@ -151,6 +154,7 @@ impl Stats {
             stage("between", &self.between),
             stage("resume", &self.resume),
             stage("verify", &self.verify),
+            stage("operator_body", &self.operator_body),
             stage("credential_queue", &self.credential_queue),
             stage("credential", &self.credential),
             stage("root_build_queue", &self.root_build_queue),

@@ -210,6 +210,40 @@ fn a_command_replayed_after_a_restart_is_refused() {
     );
 }
 
+/// A replayed `Install` is refused before its package is decoded: the node
+/// decodes one package, the first copy's.
+#[test]
+fn a_replayed_install_is_refused_before_its_package_is_decoded() {
+    let served = Served::plain();
+    let programs = vos_checker::programs::Programs::load();
+    let decoded = || {
+        served
+            .node
+            .stats()
+            .stages
+            .iter()
+            .find(|stage| stage.name == "operator_body")
+            .map_or(0, |stage| stage.counts.iter().sum::<u64>())
+    };
+    let agent = served.node.create_agent().unwrap();
+    let install = vos_wire::ingress::Install {
+        instance: InstanceId(9),
+        elf: programs.counter_elf.clone(),
+        roles: Vec::new(),
+    };
+    let request = served.operated(Kind::Install, (agent, install).encode());
+    let mut stream = connect(&served.socket);
+    let mut ask = || {
+        send(&mut stream, Kind::Install as u16, 1, &request);
+        Response::decode_exact(&receive(&mut stream).unwrap().2).unwrap()
+    };
+    let first = ask();
+    assert!(!matches!(first, Response::Rejected(_)), "{first:?}");
+    assert_eq!(decoded(), 1);
+    assert_eq!(ask(), refused(OperatorRefusal::Replayed));
+    assert_eq!(decoded(), 1, "the replay's package was not decoded");
+}
+
 /// Past the nonces kept, a command is busy; a read still runs.
 #[test]
 fn past_the_nonces_kept_a_command_is_busy() {

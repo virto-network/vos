@@ -59,8 +59,14 @@ pub(super) async fn parse(inner: &Inner, kind: Kind, body: Vec<u8>) -> Result<Co
         Kind::CreateRepresentative => Command::CreateRepresentative(create(&body)?),
         Kind::Install => {
             // A package may be large: decode it off the leaders' thread.
+            let stats = Arc::clone(&inner.stats);
             let decoded = inner
-                .offload(move || decode::<(AgentId, Install)>(&body))
+                .offload(move || {
+                    let started = Instant::now();
+                    let decoded = decode::<(AgentId, Install)>(&body);
+                    stats.operator_body.took(started.elapsed());
+                    decoded
+                })
                 .await
                 .ok_or(Response::Unavailable)??;
             Command::Install(decoded.0, decoded.1)
@@ -148,6 +154,13 @@ enum Unrecorded {
 }
 
 impl Nonces {
+    /// Whether `key`'s `nonce` is recorded: a replay, refused before its
+    /// body is decoded. [`Nonces::insert`] checks again, in the step that
+    /// records it.
+    fn holds(&self, key: [u8; 32], nonce: [u8; 16]) -> bool {
+        lock(&self.recorded).contains_key(&(key, nonce))
+    }
+
     /// The nonces `store` holds, less those it may forget by `now`.
     pub(crate) fn load(store: &Fjall, now: u64, most: usize) -> crate::store::Result<Self> {
         let mut recorded = HashMap::new();
@@ -255,6 +268,11 @@ impl Api {
             Some(checked) => checked?,
             None => return Err(Response::Unavailable),
         };
+        // A replay is refused before its body is decoded: an `Install`'s
+        // package is the largest decode an operator's request asks for.
+        if kind.records_nonce() && self.nonces.holds(key, operated.nonce) {
+            return Err(refused(OperatorRefusal::Replayed));
+        }
         let command = parse(&self.inner, kind, operated.body).await?;
         if kind.records_nonce() {
             let now = (self.inner.clock)();
