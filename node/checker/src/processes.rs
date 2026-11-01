@@ -254,32 +254,44 @@ pub struct Processes {
 }
 
 /// A gateway on its own runtime, and what stops it.
-struct Front {
+pub struct Front {
     target: Target,
     _stop: tokio::sync::oneshot::Sender<()>,
-    _runtime: tokio::runtime::Runtime,
+    runtime: tokio::runtime::Runtime,
 }
 
 impl Front {
     /// A gateway in front of the sockets of the nodes whose keys, in hex,
     /// are `keys` and whose data directories `data` names.
     fn start(keys: &[String], data: impl Fn(usize) -> PathBuf) -> Self {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
         let upstreams = keys
             .iter()
             .enumerate()
             .map(|(at, key)| {
                 let mut node = [0u8; 32];
                 hex::decode_to_slice(key, &mut node).unwrap();
-                vos_gateway::upstream::Upstream::new(
-                    node,
-                    vos_gateway::upstream::Address::Socket(data(at + 1).join("api.sock")),
-                    [0x9a; 32],
-                )
+                let socket = data(at + 1).join("api.sock");
+                (node, format!("unix:{}", socket.display()))
+            })
+            .collect();
+        Self::serve(upstreams, [0x9a; 32])
+    }
+
+    /// A gateway whose QUIC key's seed is `secret`, in front of the nodes
+    /// `upstreams` names, each by its key and its API's address
+    /// (`unix:/path` or `quic://host:port`), serving HTTP on a loopback
+    /// port, no limit binding.
+    pub fn serve(upstreams: Vec<([u8; 32], String)>, secret: [u8; 32]) -> Self {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let upstreams = upstreams
+            .into_iter()
+            .map(|(node, address)| {
+                let address = vos_gateway::upstream::Address::parse(&address).unwrap();
+                vos_gateway::upstream::Upstream::new(node, address, secret)
             })
             .collect();
         let gateway = std::sync::Arc::new(vos_gateway::Gateway::new(upstreams));
@@ -307,8 +319,18 @@ impl Front {
         Self {
             target: Target::loopback(&format!("http://{address}")).unwrap(),
             _stop: stop,
-            _runtime: runtime,
+            runtime,
         }
+    }
+
+    /// Its HTTP front, as a client reaches it.
+    pub fn target(&self) -> &Target {
+        &self.target
+    }
+
+    /// Runs `task` on the gateway's runtime, to its end.
+    pub fn block_on<T>(&self, task: impl std::future::Future<Output = T>) -> T {
+        self.runtime.block_on(task)
     }
 }
 
