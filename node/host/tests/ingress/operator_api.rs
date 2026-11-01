@@ -244,6 +244,30 @@ fn a_replayed_install_is_refused_before_its_package_is_decoded() {
     assert_eq!(decoded(), 1, "the replay's package was not decoded");
 }
 
+/// A command whose nonce a clock stepped forward forgot is still refused
+/// once the clock steps back past the horizon: the floor, the latest expiry
+/// forgotten, refuses it.
+#[test]
+fn a_replay_under_a_clock_stepped_back_past_the_horizon_is_refused() {
+    let served = Served::start_with(Arc::new(vos_node::NoHooks), |config| {
+        config.operator_nonces = 1;
+    });
+    let mut stream = connect(&served.socket);
+    let mut ask = |request: &[u8]| {
+        send(&mut stream, Kind::CreateAgent as u16, 1, request);
+        Response::decode_exact(&receive(&mut stream).unwrap().2).unwrap()
+    };
+    let first = served.operated(Kind::CreateAgent, Vec::new());
+    assert!(matches!(ask(&first), Response::Created(_)));
+    let start = served.now();
+    served.clock.store(start + 3_600_000, Ordering::SeqCst);
+    // The one nonce kept is forgotten for the next.
+    let later = served.operated(Kind::CreateAgent, Vec::new());
+    assert!(matches!(ask(&later), Response::Created(_)));
+    served.clock.store(start, Ordering::SeqCst);
+    assert_eq!(ask(&first), refused(OperatorRefusal::Replayed));
+}
+
 /// Past the nonces kept, a command is busy; a read still runs.
 #[test]
 fn past_the_nonces_kept_a_command_is_busy() {

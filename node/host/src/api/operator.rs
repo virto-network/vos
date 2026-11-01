@@ -131,13 +131,26 @@ type Held = ([u8; 32], [u8; 16]);
 /// The operators' commands' nonces, by key and nonce, each until its
 /// expiry and a horizon past it: a command whose nonce is recorded never
 /// runs again, across restarts too, and a clock stepped back by up to the
-/// horizon still finds it.
+/// horizon still finds it. Past that, the floor: the latest expiry of a
+/// nonce forgotten, kept for good, below which no command runs, so a clock
+/// stepped back further, after a step forward forgot a nonce, refuses its
+/// replay too.
 pub(crate) struct Nonces {
     store: Fjall,
-    recorded: Mutex<HashMap<Held, u64>>,
+    recorded: Mutex<Recorded>,
     /// The most kept at once: past them, a command is answered `Busy`.
     most: usize,
 }
+
+#[derive(Default)]
+struct Recorded {
+    nonces: HashMap<Held, u64>,
+    floor: u64,
+}
+
+/// What recording a nonce forgot: the nonces, to delete, and the floor,
+/// when it rose.
+type Forgotten = (Vec<Held>, Option<u64>);
 
 /// Whether a nonce expiring at `expires` may be forgotten at `now`: once
 /// `now` is past its expiry by more than the horizon. A clock stepped back
@@ -158,23 +171,34 @@ impl Nonces {
     /// body is decoded. [`Nonces::insert`] checks again, in the step that
     /// records it.
     fn holds(&self, key: [u8; 32], nonce: [u8; 16]) -> bool {
-        lock(&self.recorded).contains_key(&(key, nonce))
+        lock(&self.recorded).nonces.contains_key(&(key, nonce))
+    }
+
+    /// The latest expiry of a nonce forgotten: a command expiring no later
+    /// is refused.
+    fn floor(&self) -> u64 {
+        lock(&self.recorded).floor
     }
 
     /// The nonces `store` holds, less those it may forget by `now`.
     pub(crate) fn load(store: &Fjall, now: u64, most: usize) -> crate::store::Result<Self> {
-        let mut recorded = HashMap::new();
+        let mut recorded = Recorded {
+            nonces: HashMap::new(),
+            floor: store.operator_floor()?,
+        };
         let mut batch = store.batch();
         let mut expired = false;
         for (key, nonce, expires) in store.operator_nonces()? {
             if may_forget(expires, now) {
                 batch.operator_nonce(&key, &nonce, None);
+                recorded.floor = recorded.floor.max(expires);
                 expired = true;
             } else {
-                recorded.insert((key, nonce), expires);
+                recorded.nonces.insert((key, nonce), expires);
             }
         }
         if expired {
+            batch.operator_floor(recorded.floor);
             batch.commit(PersistMode::SyncAll)?;
         }
         Ok(Self {
@@ -187,33 +211,37 @@ impl Nonces {
     /// Record `key`'s `nonce` until `expires`, if it is not recorded:
     /// one step, so two copies of one request cannot both pass. Past the
     /// most kept, those it may forget by `now` go first; they are
-    /// returned, to delete.
+    /// returned, to delete, with the floor they raise.
     fn insert(
         &self,
         key: [u8; 32],
         nonce: [u8; 16],
         expires: u64,
         now: u64,
-    ) -> Result<Vec<Held>, Unrecorded> {
+    ) -> Result<Forgotten, Unrecorded> {
         let mut recorded = lock(&self.recorded);
-        if recorded.contains_key(&(key, nonce)) {
+        let Recorded { nonces, floor } = &mut *recorded;
+        if nonces.contains_key(&(key, nonce)) || expires <= *floor {
             return Err(Unrecorded::Replayed);
         }
         let mut forgotten = Vec::new();
-        if recorded.len() >= self.most {
-            recorded.retain(|held, expires| {
+        let mut raised = None;
+        if nonces.len() >= self.most {
+            nonces.retain(|held, expires| {
                 let keep = !may_forget(*expires, now);
                 if !keep {
                     forgotten.push(*held);
+                    *floor = (*floor).max(*expires);
+                    raised = Some(*floor);
                 }
                 keep
             });
         }
-        if recorded.len() >= self.most {
+        if nonces.len() >= self.most {
             return Err(Unrecorded::Full);
         }
-        recorded.insert((key, nonce), expires);
-        Ok(forgotten)
+        nonces.insert((key, nonce), expires);
+        Ok((forgotten, raised))
     }
 }
 
@@ -247,6 +275,11 @@ impl Api {
         if expires_ms < now || expires_ms > now.saturating_add(HORIZON_MS) {
             return Err(refused(OperatorRefusal::Expiry { now }));
         }
+        // At or below the floor, a command may be a replay of one whose
+        // nonce was forgotten under a clock since stepped back.
+        if kind.records_nonce() && expires_ms <= self.nonces.floor() {
+            return Err(refused(OperatorRefusal::Replayed));
+        }
         let checked = self
             .inner
             .offload({
@@ -276,14 +309,15 @@ impl Api {
         let command = parse(&self.inner, kind, operated.body).await?;
         if kind.records_nonce() {
             let now = (self.inner.clock)();
-            let forgotten = match self
-                .nonces
-                .insert(key, operated.nonce, operated.expires_ms, now)
-            {
-                Ok(forgotten) => forgotten,
-                Err(Unrecorded::Replayed) => return Err(refused(OperatorRefusal::Replayed)),
-                Err(Unrecorded::Full) => return Err(Response::Busy),
-            };
+            let (forgotten, floor) =
+                match self
+                    .nonces
+                    .insert(key, operated.nonce, operated.expires_ms, now)
+                {
+                    Ok(forgotten) => forgotten,
+                    Err(Unrecorded::Replayed) => return Err(refused(OperatorRefusal::Replayed)),
+                    Err(Unrecorded::Full) => return Err(Response::Busy),
+                };
             // Synced before the command runs: a command that ran is refused
             // after a restart.
             let store = self.nonces.store.clone();
@@ -294,6 +328,9 @@ impl Api {
                     let mut batch = store.batch();
                     for (key, nonce) in &forgotten {
                         batch.operator_nonce(key, nonce, None);
+                    }
+                    if let Some(floor) = floor {
+                        batch.operator_floor(floor);
                     }
                     batch.operator_nonce(&key, &nonce, Some(expires));
                     batch.commit(PersistMode::SyncAll)
@@ -387,10 +424,32 @@ mod tests {
             Err(Unrecorded::Full)
         ));
         // Past it, it is forgotten for a new one.
-        let forgotten = nonces
+        let (forgotten, floor) = nonces
             .insert([3; 32], [1; 16], 30, 11 + HORIZON_MS)
             .ok()
             .unwrap();
         assert_eq!(forgotten, [([1; 32], [1; 16])]);
+        assert_eq!(floor, Some(10));
+        // Forgotten, it is refused by the floor: a clock stepped back past
+        // the horizon still refuses its replay.
+        assert!(matches!(
+            nonces.insert([1; 32], [1; 16], 10, 0),
+            Err(Unrecorded::Replayed)
+        ));
+    }
+
+    #[test]
+    fn the_floor_is_kept_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Fjall::open(dir.path()).unwrap();
+        let mut batch = store.batch();
+        batch.operator_nonce(&[1; 32], &[1; 16], Some(50));
+        batch.commit(PersistMode::SyncAll).unwrap();
+        let nonces = Nonces::load(&store, 51 + HORIZON_MS, 4).unwrap();
+        assert_eq!(nonces.floor(), 50);
+        drop(nonces);
+        let nonces = Nonces::load(&store, 0, 4).unwrap();
+        assert_eq!(nonces.floor(), 50, "the floor, read back");
+        assert!(!nonces.holds([1; 32], [1; 16]));
     }
 }
