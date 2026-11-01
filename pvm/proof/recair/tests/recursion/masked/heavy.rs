@@ -40,8 +40,7 @@ fn proofs_of(name: &str, root: &Node, program: &IdPreimage) -> Proofs {
     let mut fields = Fields::default();
     let mut first = Vec::new();
     for seed in 0..n() as u64 {
-        let (proof, _) =
-            wrap::prove_masked(&finalized, MaskRng::Seeded(seed), |_| {}).expect("proves");
+        let (proof, _) = wrap::prove_masked(&finalized, MaskRng::Seeded(seed)).expect("proves");
         let values = published(&proof.stark_proof, &proof.claimed_sums);
         fields.add(&values);
         if first.len() < 2 {
@@ -77,7 +76,7 @@ fn gate_proofs() -> &'static (Vec<Vec<u8>>, [u32; PUBLIC_WORDS]) {
         let bytes = (1_000..1_000 + GATE_SEEDS as u64)
             .map(|seed| {
                 let (proof, _) =
-                    wrap::prove_masked(&finalized, MaskRng::Seeded(seed), |_| {}).expect("proves");
+                    wrap::prove_masked(&finalized, MaskRng::Seeded(seed)).expect("proves");
                 wrap::proof_bytes(&proof).expect("format 39's bytes")
             })
             .collect();

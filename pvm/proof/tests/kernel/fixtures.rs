@@ -436,7 +436,6 @@ mod statements {
         let (proof, _) = wrap::prove_masked(
             &finalized(root, program, lenient),
             MaskRng::Seeded(SEED),
-            |_| {},
         )
         .expect("the wrap proves");
         assert_eq!(proof.format_version, masked::FORMAT);

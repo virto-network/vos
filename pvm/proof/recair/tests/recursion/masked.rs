@@ -73,8 +73,7 @@ fn masked_wrap() -> &'static Masked {
         let words = wrap::public_words(&finalized);
         assert_eq!(words, one.wrapped.words);
         let started = Instant::now();
-        let (proof, stats) =
-            wrap::prove_masked(&finalized, MaskRng::Seeded(39), |_| {}).expect("proves");
+        let (proof, stats) = wrap::prove_masked(&finalized, MaskRng::Seeded(39)).expect("proves");
         let bytes = wrap::proof_bytes(&proof).expect("format 39's bytes");
         let postcard = postcard::to_allocvec(&proof).expect("encodes");
         eprintln!(

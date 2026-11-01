@@ -300,8 +300,37 @@ where
 /// Proves `witness` over `circuit`, whose wiring must check, masked under
 /// `format`, a masked format of the recursion AIR, on `MC`
 /// ([`masked::prove_masked`] over [`WrapComponents`]), its randomness from
-/// `rng`; the main trace passed through `tamper` before it is masked.
+/// `rng`.
 pub fn prove_masked_on<MC: MerkleChannel>(
+    format: &Format,
+    circuit: &Circuit,
+    witness: &Witness<SecureField>,
+    rng: MaskRng,
+) -> Result<(RecairProof<MC::H>, MaskStats), ProveError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    prove_masked_with::<MC>(format, circuit, witness, rng, |_| {})
+}
+
+/// [`prove_masked_on`], the main trace passed through `tamper` before it is
+/// masked: the refusal tests' seam. Only the prover's tests have it
+/// (`seeded-masks`).
+#[cfg(feature = "seeded-masks")]
+pub fn prove_masked_tampered<MC: MerkleChannel>(
+    format: &Format,
+    circuit: &Circuit,
+    witness: &Witness<SecureField>,
+    rng: MaskRng,
+    tamper: impl FnOnce(&mut MainTrace),
+) -> Result<(RecairProof<MC::H>, MaskStats), ProveError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    prove_masked_with::<MC>(format, circuit, witness, rng, tamper)
+}
+
+fn prove_masked_with<MC: MerkleChannel>(
     format: &Format,
     circuit: &Circuit,
     witness: &Witness<SecureField>,

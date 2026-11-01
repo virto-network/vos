@@ -29,7 +29,7 @@ use vos_pvm_proof::format::{DeepBatching, Format, FormatParams, MASKED_WRAP, Mas
 use vos_pvm_recair::masked::{
     MaskRng, MaskStats, MaskedProvers, MaskedTrace, prove_masked, rank_m31, verifier_format,
 };
-use vos_pvm_recair::prove::prove_masked_on;
+use vos_pvm_recair::prove::{prove_masked_on, prove_masked_tampered};
 use vos_pvm_recair::trace::{self, FirstRowFraction};
 use vos_pvm_recair::{Finalized, ProveError, RecairProof};
 use vos_pvm_recair_air::gate::{GateRelation, Layout, public_logup_sum};
@@ -101,7 +101,7 @@ pub(crate) fn prove<MC: MerkleChannel>(
 where
     SimdBackend: BackendForChannel<MC>,
 {
-    prove_masked_on::<MC>(format, &finalized.circuit, &finalized.witness, rng, |_| {})
+    prove_masked_on::<MC>(format, &finalized.circuit, &finalized.witness, rng)
 }
 
 /// The public terms' logup sum of a small circuit's outputs, at a node's
@@ -157,7 +157,6 @@ fn r1_refuses_too_small_a_randomizer() {
         &finalized.circuit,
         &finalized.witness,
         MaskRng::default(),
-        |_| {},
     )
     .unwrap();
     assert_eq!(stats.attempts, 1);
@@ -251,7 +250,7 @@ fn fri_mask_coefficients_independent() {
 fn an_invalid_witness_is_refused() {
     let finalized = circuit(3);
     for (component, column) in [(1, 0), (0, 16)] {
-        let refused = prove_masked_on::<Blake2bMerkleChannel>(
+        let refused = prove_masked_tampered::<Blake2bMerkleChannel>(
             &format(),
             &finalized.circuit,
             &finalized.witness,

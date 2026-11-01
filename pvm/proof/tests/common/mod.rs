@@ -605,7 +605,7 @@ fn masked_wrap(
     let load = load();
     resident_peak_mib(true);
     let ((proof, stats), proving, peak_mib) = measured(|| {
-        vos_pvm_recair::wrap::prove_masked(finalized, MaskRng::default(), |_| {})
+        vos_pvm_recair::wrap::prove_masked(finalized, MaskRng::default())
             .expect("the masked wrap proves")
     });
     let resident_mib = resident_peak_mib(false);

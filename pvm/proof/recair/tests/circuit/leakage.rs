@@ -130,7 +130,6 @@ fn masked(witness: &Witness, n: usize) -> Fields {
                 &finalized.circuit,
                 &finalized.witness,
                 MaskRng::Seeded(seed),
-                |_| {},
             )
             .expect("proves");
             fields.add(&published(&proof.stark_proof, &proof.claimed_sums));
