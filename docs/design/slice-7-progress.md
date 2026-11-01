@@ -7140,3 +7140,37 @@ number); a refused peer's frames take a lock while any peer is refused.
 test-proof` exit 0 (602 passed, the carrier audit among them, no fixture
 or constant re-pinned); `just test-carriers` exit 0 (its own run). s4's
 `just vos` steps on `vos-7.23d`: fmt, clippy and tests pass.
+
+## Session P9: PG1 and PG3 on the final build
+
+2026-11-01, 23:21–23:53, the Fairphone 6 (battery 100%, 27 °C, governor
+`walt`), with the owner at the phone for PG3. PG2's two passes are P7
+(format 45) and P8 (format 46, the shipped format); P8's phone binary
+(built at `6aa9c4caa`) serves PG1 here too: no proof byte moved since
+(`fixtures::` and `constants::` pass unchanged through 7.23d).
+
+**PG1** (`vos-phone run --reps 20 --grind 50`, three rounds a minute apart,
+automatic threads: the four big cores pinned; every proof verified on the
+phone; format 44):
+
+| statement | gate | rounds' p50 (ms) | rounds' p95 (ms) | peak | bytes |
+|---|---|---|---|---|---|
+| auth | ≤ 250 (target 150) | 126.8 / 127.5 / 128.3 | 130.7 / 137.8 / 141.3 | 114–115 MiB | 214–225 KB |
+| owner | ≤ 150 | 127.0 / 128.4 / 126.1 | 140.8 / 141.0 / 147.3 | 114–117 MiB | 214–216 KB |
+| membership and payment | ≤ 250 | 127.9 / 128.0 / 127.9 | 147.2 / 146.1 / 143.6 | 116–118 MiB | 213–220 KB |
+
+PoW grinds: 16 bits p50 2.9–3.1 ms, p95 6.8–9.1 ms; 20 bits p50 13.2–13.8
+ms, p95 50.2–50.6 ms. **PG1 is met in full, its two targets with it**:
+auth's 150 ms target and owner's 150 ms gate, both missed at automatic
+threads in P2 (166 and 161–179 ms), now hold at the median and the 95th
+percentile, `Threads::Auto` pinning the four big cores (7.17).
+
+**PG3** (the demo server built at `2a163b274`, s4's app from s4 `vos` at
+`5c5a018`, the facility proving format 44; a fresh space; the app's data
+cleared first): enroll with the Keystore secret behind the biometric
+prompt; the operator's invite of the member digest and the row `alice`;
+Claim; mint 50; Sign in (the facility's membership proof); Pay 20 to
+`shop` in the device's own form, "Paid 20 to shop (proved in 165 ms)";
+balances afterwards alice 30, shop 20. No crash; the app's three screens
+(app content only, no screen recording this time) and the demo's log are
+in `spikes/s7-device/runs/p9/`. **PG3 passes on the final build.**
