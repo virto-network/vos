@@ -105,22 +105,7 @@ fn wire(audit: &mut Audit, jam: &Jam) -> Vec<Vec<u8>> {
 /// The rest of the audit: the needles, what left the role, the chain's
 /// record, the logs; each capture path's canary; then the search.
 pub fn rest(run: &mut Run, audit: &mut Audit, stated: &[Stated]) {
-    audit.needles.debug_outputs();
-    let made = run.prover.made();
-    assert!(made.len() > stated.len(), "each statement proved");
-    for (n, (attest, internals)) in made.iter().enumerate() {
-        assert!(!internals.proofs.is_empty() && !internals.memory_roots.is_empty());
-        let name = format!("statement {n}");
-        audit.needles.internals(&name, internals);
-        let arguments = stated
-            .iter()
-            .find(|stated| stated.attest == *attest)
-            .map_or(attest.witness_input.len(), |stated| stated.asked.arguments);
-        audit
-            .needles
-            .attest(&name, attest, arguments, carriers::ROW_FLOOR);
-    }
-
+    needles(run, audit, stated);
     run.jam_a.tapped.carriers(audit);
     run.jam_b.tapped.carriers(audit);
     for (number, (.., tapped)) in run.kreivo_clients.lock().unwrap().iter() {
@@ -132,60 +117,8 @@ pub fn rest(run: &mut Run, audit: &mut Audit, stated: &[Stated]) {
         }
     }
     let reports = [wire(audit, &run.jam_a), wire(audit, &run.jam_b)].concat();
-    for jam in [&run.jam_a, &run.jam_b] {
-        let accounting = jam
-            .venue
-            .statements
-            .account(jam.baseline, || {
-                jam.wire
-                    .sent()
-                    .into_iter()
-                    .map(|sent| sent.package)
-                    .collect()
-            })
-            .expect("the service's storage");
-        run.record.note(format!(
-            "JAM {}'s storage: {} entries, as many named from the packages watched, {} outcomes \
-             among them",
-            jam.name, accounting.held, accounting.outcomes
-        ));
-        assert_eq!(
-            accounting.held, accounting.named,
-            "JAM {}: every outcome the service holds is of a package watched",
-            jam.name
-        );
-        let storage: Vec<u8> = accounting
-            .rows
-            .iter()
-            .flat_map(|(key, value)| [key.as_slice(), value].concat())
-            .collect();
-        // The service's storage holds the venue's layout constants and the
-        // space's clock: a number of the run's equal to one is no leak there.
-        audit.carrier_except(
-            format!("JAM {}'s storage", jam.name),
-            Reach::Leaves,
-            storage,
-            &[
-                SLOT_MS,
-                BUCKET_MS,
-                MAX_ROOT_AGE_MS,
-                run.clock.origin_ms,
-                run.clock.length_ms,
-            ],
-        );
-    }
-    for (n, envelope) in run.kreivo.envelopes().into_iter().enumerate() {
-        audit.carrier(format!("Kreivo's extrinsic {n}"), Reach::Leaves, envelope);
-    }
-    audit.carrier("Kreivo's storage", Reach::Leaves, run.kreivo.storage());
-    let log = std::fs::read(&run.testnet.log).expect("the testnet's log");
-    audit.carrier("the testnet's log", Reach::Recorded, log);
-    let chain = carriers::directory(&run.testnet.chain());
-    assert!(!chain.is_empty(), "the testnet's chain holds files");
-    for (path, bytes) in chain {
-        let name = format!("the testnet's chain: {path}");
-        audit.carrier(name, Reach::Recorded, bytes);
-    }
+    jam_storage(run, audit);
+    chain_record(run, audit);
     std::thread::spawn(|| eprintln!("{CANARY}: a thread of the process"))
         .join()
         .unwrap();
@@ -231,6 +164,90 @@ pub fn rest(run: &mut Run, audit: &mut Audit, stated: &[Stated]) {
     audit.assert_clean();
     run.record
         .note("the audit clean, every capture path shown; every verdict as expected");
+}
+
+/// Every statement proved, its internals and its record's values as
+/// needles: the debug outputs' too.
+fn needles(run: &Run, audit: &mut Audit, stated: &[Stated]) {
+    audit.needles.debug_outputs();
+    let made = run.prover.made();
+    assert!(made.len() > stated.len(), "each statement proved");
+    for (n, (attest, internals)) in made.iter().enumerate() {
+        assert!(!internals.proofs.is_empty() && !internals.memory_roots.is_empty());
+        let name = format!("statement {n}");
+        audit.needles.internals(&name, internals);
+        let arguments = stated
+            .iter()
+            .find(|stated| stated.attest == *attest)
+            .map_or(attest.witness_input.len(), |stated| stated.asked.arguments);
+        audit
+            .needles
+            .attest(&name, attest, arguments, carriers::ROW_FLOOR);
+    }
+}
+
+/// Each JAM statements service's storage, every entry its packages named:
+/// a carrier that leaves, the public numbers excepted.
+fn jam_storage(run: &mut Run, audit: &mut Audit) {
+    for jam in [&run.jam_a, &run.jam_b] {
+        let accounting = jam
+            .venue
+            .statements
+            .account(jam.baseline, || {
+                jam.wire
+                    .sent()
+                    .into_iter()
+                    .map(|sent| sent.package)
+                    .collect()
+            })
+            .expect("the service's storage");
+        run.record.note(format!(
+            "JAM {}'s storage: {} entries, as many named from the packages watched, {} outcomes \
+             among them",
+            jam.name, accounting.held, accounting.outcomes
+        ));
+        assert_eq!(
+            accounting.held, accounting.named,
+            "JAM {}: every outcome the service holds is of a package watched",
+            jam.name
+        );
+        let storage: Vec<u8> = accounting
+            .rows
+            .iter()
+            .flat_map(|(key, value)| [key.as_slice(), value].concat())
+            .collect();
+        // The service's storage holds the venue's layout constants and the
+        // space's clock: a number of the run's equal to one is no leak there.
+        audit.carrier_except(
+            format!("JAM {}'s storage", jam.name),
+            Reach::Leaves,
+            storage,
+            &[
+                SLOT_MS,
+                BUCKET_MS,
+                MAX_ROOT_AGE_MS,
+                run.clock.origin_ms,
+                run.clock.length_ms,
+            ],
+        );
+    }
+}
+
+/// What the chains recorded: Kreivo's extrinsics and storage, the testnet's
+/// log and its chain's files.
+fn chain_record(run: &Run, audit: &mut Audit) {
+    for (n, envelope) in run.kreivo.envelopes().into_iter().enumerate() {
+        audit.carrier(format!("Kreivo's extrinsic {n}"), Reach::Leaves, envelope);
+    }
+    audit.carrier("Kreivo's storage", Reach::Leaves, run.kreivo.storage());
+    let log = std::fs::read(&run.testnet.log).expect("the testnet's log");
+    audit.carrier("the testnet's log", Reach::Recorded, log);
+    let chain = carriers::directory(&run.testnet.chain());
+    assert!(!chain.is_empty(), "the testnet's chain holds files");
+    for (path, bytes) in chain {
+        let name = format!("the testnet's chain: {path}");
+        audit.carrier(name, Reach::Recorded, bytes);
+    }
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {

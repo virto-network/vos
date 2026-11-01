@@ -433,11 +433,9 @@ mod statements {
     /// The wrap of `root` under `format::MASKED_WRAP`, masked from the seeded seam: its
     /// fixed layout.
     fn masked_wrap(root: &NodeRun, program: &KernelProgram, lenient: bool) -> Vec<u8> {
-        let (proof, _) = wrap::prove_masked(
-            &finalized(root, program, lenient),
-            MaskRng::Seeded(SEED),
-        )
-        .expect("the wrap proves");
+        let (proof, _) =
+            wrap::prove_masked(&finalized(root, program, lenient), MaskRng::Seeded(SEED))
+                .expect("the wrap proves");
         assert_eq!(proof.format_version, masked::FORMAT);
         wrap::proof_bytes(&proof).expect("the fixed layout holds it")
     }
@@ -450,10 +448,26 @@ mod statements {
         postcard::to_allocvec(&proof).expect("encodes")
     }
 
-    /// The fixtures, by file name.
-    pub fn generate() -> Vec<(String, Vec<u8>)> {
-        let base = statement();
-        let (program, entry, segments) = proved(&base, &CUTS);
+    /// A verdict's class: what a case's verdict must be.
+    type Class = fn(u32) -> bool;
+
+    /// A case: its name, its proof's file, the patch to it, its input and
+    /// its verdict's class.
+    type Row = (&'static str, &'static str, Option<Patch>, Input, Class);
+
+    /// The fixtures' wraps of `base`, and its kernel's program id.
+    struct Proofs {
+        pinned: ProgramId,
+        valid: Vec<u8>,
+        prefix: Vec<u8>,
+        midway: Vec<u8>,
+        valid_28: Vec<u8>,
+    }
+
+    /// `base` proved: the whole run's wrap, a prefix's and a mid-way
+    /// part's, masked, and the whole run's under format 28.
+    fn proofs(base: &Statement) -> Proofs {
+        let (program, entry, segments) = proved(base, &CUTS);
         let word = FoldCircuit::word();
         let fold = FoldCircuit::new();
         let leaf = |segment: usize, position: u32| {
@@ -481,7 +495,24 @@ mod statements {
         let midway = masked_wrap(&tail, &program, true);
         let valid_28 = unmasked_wrap(&whole, &program);
 
-        let pinned = ProgramId(program.id().words());
+        Proofs {
+            pinned: ProgramId(program.id().words()),
+            valid,
+            prefix,
+            midway,
+            valid_28,
+        }
+    }
+
+    /// The cases, each judged on its proof as the generator wrote it.
+    fn cases(base: Statement, proofs: &Proofs) -> Vec<Row> {
+        let Proofs {
+            pinned,
+            valid,
+            valid_28,
+            ..
+        } = proofs;
+        let pinned = *pinned;
         let other = ProgramId(pinned.0.map(|word| (word + 1) % ((1 << 31) - 1)));
         let s = Statement {
             program: pinned,
@@ -533,24 +564,23 @@ mod statements {
             policy.record(&accepted.statement);
             policy
         };
-        let after_39 = accepted_under(masked::FORMAT, &valid);
-        let after_28 = accepted_under(unmasked::FORMAT, &valid_28);
+        let after_39 = accepted_under(masked::FORMAT, valid);
+        let after_28 = accepted_under(unmasked::FORMAT, valid_28);
 
         let flip = |bytes: &Vec<u8>| {
             let mut flipped = bytes.clone();
             flipped[bytes.len() / 2] ^= 1;
             Patch::between(bytes, &flipped)
         };
-        type Class = fn(u32) -> bool;
         let accepted: Class = |code| code == 0;
         let by_proof: Class = vos_venue::proof_refused;
         let by_words: Class = common::by_words;
-        let cases: Vec<(&str, &str, Option<Patch>, Input, Class)> = vec![
+        vec![
             ("valid", "wrap.proof", None, input(&|_| {}), accepted),
             (
                 "tampered",
                 "wrap.proof",
-                Some(flip(&valid)),
+                Some(flip(valid)),
                 input(&|_| {}),
                 by_proof,
             ),
@@ -714,7 +744,7 @@ mod statements {
             (
                 "tampered, format 28 at the test venue",
                 "wrap-28.proof",
-                Some(flip(&valid_28)),
+                Some(flip(valid_28)),
                 input(&at_test_venue_28),
                 by_proof,
             ),
@@ -735,12 +765,19 @@ mod statements {
                 input(&|i| i.policy = after_28.clone()),
                 |code| code == Refusal::Repeated.code(),
             ),
-        ];
+        ]
+    }
+
+    /// The fixtures, by file name.
+    pub fn generate() -> Vec<(String, Vec<u8>)> {
+        let base = statement();
+        let made = proofs(&base);
+        let cases = cases(base, &made);
         let proofs = [
-            ("wrap.proof", &valid),
-            ("wrap-prefix.proof", &prefix),
-            ("wrap-midway.proof", &midway),
-            ("wrap-28.proof", &valid_28),
+            ("wrap.proof", &made.valid),
+            ("wrap-prefix.proof", &made.prefix),
+            ("wrap-midway.proof", &made.midway),
+            ("wrap-28.proof", &made.valid_28),
         ];
         let cases: Vec<Case> = cases
             .into_iter()

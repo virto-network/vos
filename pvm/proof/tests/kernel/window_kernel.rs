@@ -654,49 +654,10 @@ fn the_windows_leaves_and_folds_prove_and_verify() {
 /// it ([`rows_off_the_cut_are_refused`]).
 #[test]
 fn the_window_is_stated_at_the_model_venue() {
-    let cut = large();
-    let live = honest(&cut);
-    let attest = live.attest().clone();
-    let path_compressions = cut::path_compressions(&live.served) as f64;
-    let path_bytes = cut::path_bytes(&live.served) as f64;
-    let representative = cut.representative.clone();
-    let missing = cut::Representative::new(AGENT, WINDOW, cut.agent_root, AGENTS, false);
-    drop((live, cut));
-    let (blob, record) = cut::kernel_of("window", &attest);
-    let trace = traced(&attest, &blob);
-    let steps = trace.side_note.steps.len();
-    eprintln!(
-        "the window: {steps} steps, {} compressions, witness input {} B; the path: {} \
-         compressions (+1 for S_w), {path_bytes} B",
-        trace.side_note.blake2b_calls.len(),
-        attest.witness_input.len(),
-        path_compressions - 1.0,
-    );
-    assert!(steps <= 1_000_000, "{steps} steps");
-    assert!(
-        path_compressions <= BUDGET_PATH_COMPRESSIONS * 1.2,
-        "{path_compressions}"
-    );
-    assert!(path_bytes <= BUDGET_PATH_BYTES * 1.2, "{path_bytes}");
-
-    let started = Instant::now();
-    let (program, root, segments, mut totals) =
-        cut::prove_whole("the window", &blob, &record, &trace, CUT);
-    drop(trace);
-    let (_, _, proof) = common::wrap_root("the window", &program, &root, &mut totals.wrap);
-    totals.report("the window");
-    eprintln!(
-        "the window: {segments} segments, proved end to end in {:.0}s",
-        started.elapsed().as_secs_f64()
-    );
-
-    let program = ProgramId(program.id().words());
-    let statement = cut::masked_statement(&attest, program, space());
+    let (statement, proof, representative, missing) = proved_window();
+    let program = statement.program;
     let root = statement.roots[0];
-    assert_eq!(
-        root.root,
-        space_root(&space(), WINDOW, &representative.root)
-    );
+    assert_eq!(root.root, space_root(&space(), WINDOW, &representative));
     let venue = |id: VenueId| Venue::pinned(id, &[genesis(1), genesis(2)], program);
     let anchored = || {
         let venue = venue(VENUE);
@@ -777,7 +738,7 @@ fn the_window_is_stated_at_the_model_venue() {
     let without = venue(VENUE);
     without
         .anchor(&RootRead {
-            root: space_root(&space(), WINDOW, &missing.root),
+            root: space_root(&space(), WINDOW, &missing),
             ..root
         })
         .expect("anchored without the agent's row");
@@ -807,4 +768,49 @@ fn the_window_is_stated_at_the_model_venue() {
         Refusal::Unanchored.code(),
         "a venue mismatch"
     );
+}
+
+/// The window stated over the large cut, proved end to end and its steps,
+/// path and proving measured: its masked statement, its final proof, and
+/// the representative's roots with the agent's row and without it.
+fn proved_window() -> (Statement, Vec<u8>, [u8; 32], [u8; 32]) {
+    let cut = large();
+    let live = honest(&cut);
+    let attest = live.attest().clone();
+    let path_compressions = cut::path_compressions(&live.served) as f64;
+    let path_bytes = cut::path_bytes(&live.served) as f64;
+    let representative = cut.representative.clone();
+    let missing = cut::Representative::new(AGENT, WINDOW, cut.agent_root, AGENTS, false);
+    drop((live, cut));
+    let (blob, record) = cut::kernel_of("window", &attest);
+    let trace = traced(&attest, &blob);
+    let steps = trace.side_note.steps.len();
+    eprintln!(
+        "the window: {steps} steps, {} compressions, witness input {} B; the path: {} \
+         compressions (+1 for S_w), {path_bytes} B",
+        trace.side_note.blake2b_calls.len(),
+        attest.witness_input.len(),
+        path_compressions - 1.0,
+    );
+    assert!(steps <= 1_000_000, "{steps} steps");
+    assert!(
+        path_compressions <= BUDGET_PATH_COMPRESSIONS * 1.2,
+        "{path_compressions}"
+    );
+    assert!(path_bytes <= BUDGET_PATH_BYTES * 1.2, "{path_bytes}");
+
+    let started = Instant::now();
+    let (program, root, segments, mut totals) =
+        cut::prove_whole("the window", &blob, &record, &trace, CUT);
+    drop(trace);
+    let (_, _, proof) = common::wrap_root("the window", &program, &root, &mut totals.wrap);
+    totals.report("the window");
+    eprintln!(
+        "the window: {segments} segments, proved end to end in {:.0}s",
+        started.elapsed().as_secs_f64()
+    );
+
+    let program = ProgramId(program.id().words());
+    let statement = cut::masked_statement(&attest, program, space());
+    (statement, proof, representative.root, missing.root)
 }

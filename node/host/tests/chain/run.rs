@@ -238,57 +238,8 @@ impl Run {
             Cluster::in_space(3, Some(clock), tune(Arc::new(venue)))
         };
 
-        // At Kreivo: registered with a founder's signature, each node an
-        // authority paired with its anchor key.
-        let genesis = at_kreivo.space.genesis().unwrap().clone();
-        let founder = at_kreivo
-            .node(1)
-            .sign_registration(&kreivo::VENUE, &kreivo::controller())
-            .expect("node 1 founded the space");
-        kreivo.register(&genesis, founder, &genesis.nodes);
-        let id = at_kreivo.space.id();
-        let registered = kreivo.account(&kreivo.sovereign_of(&id));
-        record.note(format!(
-            "the space {} at Kreivo: windows of {} s from {}, D {} s, three nodes; registered \
-             from window {}, 3 authorities; the sovereign account free {}, held for the \
-             registration {}",
-            hex::encode(&id.0[..8]),
-            LENGTH_MS / 1_000,
-            clock.origin_ms,
-            delay(&clock) / 1_000,
-            kreivo.start(&id),
-            registered.free,
-            registered.held_registration
-        ));
-
-        // At JAM `a`: registered with a founder's signature under an
-        // ed25519 controller.
-        let genesis = at_jam.space.genesis().unwrap().clone();
-        let controller = SigningKey::from_bytes(&blake2b_256(&[b"vos/e2e-chain/jam/controller"]))
-            .verifying_key()
-            .to_bytes();
-        let jam = &jam_a.venue;
-        let (key, signature) = at_jam
-            .node(1)
-            .sign_registration(&jam.id(), &controller)
-            .expect("node 1 founded the space");
-        let code = jam
-            .register_signed(&genesis, controller, key, signature)
-            .expect("the registration lands");
-        assert_eq!(code, 0, "registered at the JAM service");
-        let id = at_jam.space.id();
-        let start = jam.space(&id).unwrap().expect("registered").start;
-        // The client reads the space on its own thread, as Kreivo's does:
-        // its nodes replicate the representative once it lists their keys.
-        vos_checker::wait_until(
-            "JAM a's client reads the registration",
-            Duration::from_secs(60),
-            || jam.status(&id) == Status::Active,
-        );
-        record.note(format!(
-            "the space {} at JAM a: the same clock, three nodes; registered from window {start}",
-            hex::encode(&id.0[..8]),
-        ));
+        register_at_kreivo(&kreivo, &at_kreivo, &clock, &mut record);
+        register_at_jam(&jam_a, &at_jam, &mut record);
 
         let space = |venue, cluster: Cluster| {
             let frames = carriers::tap_frames(&cluster.hub);
@@ -619,4 +570,65 @@ fn replay(jam: &Jam, statement: &Statement, proof: &[u8]) -> u32 {
         }
     }
     panic!("the replay never landed");
+}
+
+/// The space at Kreivo registered with a founder's signature, each node an
+/// authority paired with its anchor key.
+fn register_at_kreivo(
+    kreivo: &Kreivo,
+    cluster: &Cluster,
+    clock: &WindowClock,
+    record: &mut Record,
+) {
+    let genesis = cluster.space.genesis().unwrap().clone();
+    let founder = cluster
+        .node(1)
+        .sign_registration(&kreivo::VENUE, &kreivo::controller())
+        .expect("node 1 founded the space");
+    kreivo.register(&genesis, founder, &genesis.nodes);
+    let id = cluster.space.id();
+    let registered = kreivo.account(&kreivo.sovereign_of(&id));
+    record.note(format!(
+        "the space {} at Kreivo: windows of {} s from {}, D {} s, three nodes; registered \
+         from window {}, 3 authorities; the sovereign account free {}, held for the \
+         registration {}",
+        hex::encode(&id.0[..8]),
+        LENGTH_MS / 1_000,
+        clock.origin_ms,
+        delay(clock) / 1_000,
+        kreivo.start(&id),
+        registered.free,
+        registered.held_registration
+    ));
+}
+
+/// The space at JAM `a` registered with a founder's signature under an
+/// ed25519 controller, once its client reads the registration.
+fn register_at_jam(jam: &Jam, cluster: &Cluster, record: &mut Record) {
+    let genesis = cluster.space.genesis().unwrap().clone();
+    let controller = SigningKey::from_bytes(&blake2b_256(&[b"vos/e2e-chain/jam/controller"]))
+        .verifying_key()
+        .to_bytes();
+    let jam = &jam.venue;
+    let (key, signature) = cluster
+        .node(1)
+        .sign_registration(&jam.id(), &controller)
+        .expect("node 1 founded the space");
+    let code = jam
+        .register_signed(&genesis, controller, key, signature)
+        .expect("the registration lands");
+    assert_eq!(code, 0, "registered at the JAM service");
+    let id = cluster.space.id();
+    let start = jam.space(&id).unwrap().expect("registered").start;
+    // The client reads the space on its own thread, as Kreivo's does:
+    // its nodes replicate the representative once it lists their keys.
+    vos_checker::wait_until(
+        "JAM a's client reads the registration",
+        Duration::from_secs(60),
+        || jam.status(&id) == Status::Active,
+    );
+    record.note(format!(
+        "the space {} at JAM a: the same clock, three nodes; registered from window {start}",
+        hex::encode(&id.0[..8]),
+    ));
 }
