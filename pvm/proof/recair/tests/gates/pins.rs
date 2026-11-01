@@ -46,7 +46,7 @@ fn only_checked_wirings_are_committed() {
         "pvm/proof/recair-air/src/credential.rs",
         // The masking's soundness gates: a circuit turned so that a chained
         // row is row 0, which the wiring check refuses, to test the wrap row.
-        "pvm/proof/recair/tests/circuit/masked_gates.rs",
+        "pvm/proof/recair/tests/circuit/masked_gates/mod.rs",
         "pvm/proof/recair/tests/gates/pins.rs",
     ];
     let mut callers = Vec::new();
