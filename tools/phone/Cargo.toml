@@ -32,3 +32,10 @@ stwo = { workspace = true }
 rayon = { workspace = true }
 sha2 = "0.10"
 mimalloc = { version = "0.1.52", optional = true }
+
+[dev-dependencies]
+# Its outputs searched for the member's secret (`tests/outputs.rs`): dev
+# edges only.
+vos-checker = { path = "../../node/checker" }
+vos-testkit = { path = "../../agent/testkit" }
+tempfile = "3"
