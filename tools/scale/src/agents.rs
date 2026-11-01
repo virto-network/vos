@@ -169,16 +169,20 @@ fn install(
 }
 
 /// Write the identity agent's rows `0..rows`, [`FILL`] a call, from a few
-/// clients at once.
+/// clients at once, over the API as the driver key `client`.
 fn fill_identities(
     deployed: &Deployed,
+    client: [u8; 32],
     identity: &Placed,
     rows: u64,
     seed: u64,
 ) -> Result<(), String> {
     let agent = AgentId(identity.agent);
     let instance = InstanceId(identity.instance);
-    let target = target(&deployed.nodes[usize::from(identity.replicas[0]) - 1])?;
+    let target = target(
+        &deployed.nodes[usize::from(identity.replicas[0]) - 1],
+        client,
+    )?;
     // The install is answered by one replica; this one may apply it later.
     let schema = installed(INSTALLED, Duration::from_millis(200), || {
         vos_node::client::schema(&target, agent, instance).map_err(|error| error.to_string())
@@ -362,7 +366,13 @@ pub fn create(inventory: &Inventory, request: &Request) -> Result<Agents, String
     if request.identity_rows > 0 {
         let every: Vec<u8> = (1..=hosts.len() as u8).collect();
         let identity = place_one(&operators, every)?;
-        fill_identities(&deployed, &identity, request.identity_rows, request.seed)?;
+        fill_identities(
+            &deployed,
+            crate::nodes::driver_seed(inventory)?,
+            &identity,
+            request.identity_rows,
+            request.seed,
+        )?;
         eprintln!(
             "the identity agent: agent {} on every node, {} rows",
             identity.agent, request.identity_rows

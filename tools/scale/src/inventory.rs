@@ -39,13 +39,11 @@ pub struct Host {
     /// The cores its process runs on, as `taskset -c` lists them; all
     /// when absent.
     pub cores: Option<String>,
-    /// The node's ingress port (TLS, pinned by the node's key).
-    #[serde(default)]
-    pub ingress: u16,
     /// The node's peer port (QUIC, UDP).
     #[serde(default)]
     pub peer: u16,
-    /// The node API's QUIC port (UDP): the ingress's plus 1000 when absent.
+    /// The node API's port (QUIC, UDP), which the drivers and the
+    /// coordinator reach it at.
     #[serde(default)]
     pub api: u16,
     /// A memory cap for its unit, over the harness's.
@@ -80,21 +78,8 @@ impl Host {
         format!("vos-scale-{part}-{}", self.name)
     }
 
-    pub fn ingress_url(&self) -> String {
-        format!("https://{}:{}", self.address, self.ingress)
-    }
-
-    /// The node API's QUIC port.
-    pub fn api_port(&self) -> u16 {
-        if self.api == 0 {
-            self.ingress.saturating_add(1000)
-        } else {
-            self.api
-        }
-    }
-
     pub fn api_url(&self) -> String {
-        format!("quic://{}:{}", self.address, self.api_port())
+        format!("quic://{}:{}", self.address, self.api)
     }
 
     pub fn memory_max<'a>(&'a self, harness: &'a Harness) -> &'a str {
@@ -133,24 +118,6 @@ pub struct Harness {
     /// the coordinator, which `check` otherwise refuses.
     #[serde(default)]
     pub smoke: bool,
-    /// The most connections each driver keeps to each node over HTTP: the
-    /// drivers' together within the nodes' `ingress_connections`.
-    #[serde(default = "driver_connections")]
-    pub driver_connections: usize,
-    /// How the drivers reach the nodes: over the node API's QUIC, one
-    /// connection a node and a stream a request (`api`, the default), or
-    /// over HTTPS (`http`).
-    #[serde(default)]
-    pub transport: Transport,
-}
-
-/// How the drivers reach the nodes.
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum Transport {
-    #[default]
-    Api,
-    Http,
 }
 
 fn runs() -> PathBuf {
@@ -167,9 +134,6 @@ fn max_clock_offset_ms() -> u64 {
 }
 fn every_s() -> u64 {
     10
-}
-fn driver_connections() -> usize {
-    512
 }
 fn start_s() -> u64 {
     90
@@ -341,23 +305,19 @@ impl Inventory {
             }
             dirs.push((host.machine(), host.dir.as_str(), host.name.as_str()));
             if host.role == Role::Node {
-                if host.ingress == 0 || host.peer == 0 {
+                if host.api == 0 || host.peer == 0 {
                     return Err(format!(
-                        "host {}: a node needs ingress and peer ports",
+                        "host {}: a node needs api and peer ports",
                         host.name
                     ));
                 }
                 if host.weight == 0 {
                     return Err(format!("host {}: a node's weight is at least 1", host.name));
                 }
-                for (kind, port) in [
-                    ("tcp", host.ingress),
-                    ("udp", host.peer),
-                    ("udp", host.api_port()),
-                ] {
-                    if !ports.insert((&host.address, kind, port)) {
+                for port in [host.peer, host.api] {
+                    if !ports.insert((&host.address, port)) {
                         return Err(format!(
-                            "host {}: {kind} port {port} at {} is taken by another entry",
+                            "host {}: udp port {port} at {} is taken by another entry",
                             host.name, host.address
                         ));
                     }
@@ -404,7 +364,7 @@ mod tests {
         address = "127.0.0.1"
         role = "node"
         dir = "/tmp/a"
-        ingress = 7001
+        api = 7001
         peer = 7101
 
         [[host]]
@@ -414,7 +374,7 @@ mod tests {
         role = "node"
         weight = 2
         dir = "/tmp/b"
-        ingress = 7002
+        api = 7002
         peer = 7102
 
         [[host]]
@@ -424,7 +384,7 @@ mod tests {
         role = "node"
         dir = "/data/vos"
         cores = "0-3"
-        ingress = 7001
+        api = 7001
         peer = 7101
 
         [[host]]
@@ -461,8 +421,17 @@ mod tests {
 
     #[test]
     fn clashing_or_short_inventories_are_refused() {
-        let clash = THREE.replace("ingress = 7002", "ingress = 7001");
+        let clash = THREE.replace("api = 7002", "api = 7001");
         assert!(Inventory::parse(&clash).unwrap_err().contains("taken"));
+        // A node's api port clashing with another entry's peer port.
+        let crossed = THREE.replace("api = 7002", "api = 7101");
+        assert!(Inventory::parse(&crossed).unwrap_err().contains("taken"));
+        let no_api = THREE.replace("api = 7002\n", "");
+        assert!(
+            Inventory::parse(&no_api)
+                .unwrap_err()
+                .contains("api and peer")
+        );
         let same_dir = THREE.replace("\"/tmp/b\"", "\"/tmp/a\"");
         assert!(Inventory::parse(&same_dir).unwrap_err().contains("dir"));
         let twice = THREE.replace("name = \"b\"", "name = \"a\"");
@@ -492,7 +461,6 @@ mod tests {
         assert_eq!(drivers.len(), 2);
         assert_ne!(drivers[0].unit("drive"), drivers[1].unit("drive"));
         assert_eq!(drivers[0].machine(), drivers[1].machine());
-        assert_eq!(inventory.harness.driver_connections, 512);
     }
 
     #[test]

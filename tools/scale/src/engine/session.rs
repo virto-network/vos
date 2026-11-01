@@ -52,7 +52,6 @@ pub struct Agent {
     pub id: AgentId,
     pub identity: [u8; 32],
     pub replicas: Vec<usize>,
-    pub paths: [String; 3],
 }
 
 /// A user's session at its agent, as the driver keeps it.

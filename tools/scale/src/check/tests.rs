@@ -10,7 +10,7 @@ fn inventory() -> Inventory {
             address = "10.0.0.1"
             role = "node"
             dir = "/data/a"
-            ingress = 7001
+            api = 7001
             peer = 7101
             [[host]]
             name = "b"
@@ -18,7 +18,7 @@ fn inventory() -> Inventory {
             address = "127.0.0.1"
             role = "node"
             dir = "/srv/b"
-            ingress = 7002
+            api = 7002
             peer = 7102
             [[host]]
             name = "c"
@@ -26,7 +26,7 @@ fn inventory() -> Inventory {
             address = "127.0.0.1"
             role = "node"
             dir = "/srv/c"
-            ingress = 7003
+            api = 7003
             peer = 7103
             "#,
     )
@@ -161,7 +161,7 @@ fn a_machine_whose_caps_do_not_fit_or_that_mixes_roles_is_refused() {
             address = "10.0.0.1"
             role = "node"
             dir = "/data/a"
-            ingress = 7001
+            api = 7001
             peer = 7101
             [[host]]
             name = "b"
@@ -169,7 +169,7 @@ fn a_machine_whose_caps_do_not_fit_or_that_mixes_roles_is_refused() {
             address = "10.0.0.1"
             role = "node"
             dir = "/data/b"
-            ingress = 7002
+            api = 7002
             peer = 7102
             [[host]]
             name = "c"
@@ -177,7 +177,7 @@ fn a_machine_whose_caps_do_not_fit_or_that_mixes_roles_is_refused() {
             address = "10.0.0.3"
             role = "node"
             dir = "/data/c"
-            ingress = 7001
+            api = 7001
             peer = 7101
             [[host]]
             name = "d"
@@ -252,7 +252,7 @@ fn three_nodes_on_one_machine_and_the_drivers_on_the_coordinator_pass() {
     let mut text = String::from("[harness]\nmemory_max = \"8G\"\n");
     for at in 1..=3 {
         text += &format!(
-            "[[host]]\nname = \"c{at}\"\nssh = \"owner@10.0.0.2\"\naddress = \"10.0.0.2\"\nrole = \"node\"\ndir = \"/srv/vos-scale/n{at}\"\ncores = \"{}-{}\"\ningress = {}\npeer = {}\n",
+            "[[host]]\nname = \"c{at}\"\nssh = \"owner@10.0.0.2\"\naddress = \"10.0.0.2\"\nrole = \"node\"\ndir = \"/srv/vos-scale/n{at}\"\ncores = \"{}-{}\"\napi = {}\npeer = {}\n",
             4 * (at - 1),
             4 * at - 1,
             7700 + at,
@@ -325,7 +325,7 @@ fn a_driver_on_wifi_is_warned_of_and_a_node_on_wifi_refused() {
     let mut text = String::new();
     for at in 1..=3 {
         text += &format!(
-            "[[host]]\nname = \"n{at}\"\nssh = \"me@10.0.0.2\"\naddress = \"10.0.0.2\"\nrole = \"node\"\ndir = \"/srv/n{at}\"\ningress = {}\npeer = {}\n",
+            "[[host]]\nname = \"n{at}\"\nssh = \"me@10.0.0.2\"\naddress = \"10.0.0.2\"\nrole = \"node\"\ndir = \"/srv/n{at}\"\napi = {}\npeer = {}\n",
             7000 + at,
             7100 + at
         );

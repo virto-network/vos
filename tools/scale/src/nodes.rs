@@ -1,12 +1,11 @@
 //! `up` and `down`: each node a `vos node run` in a user unit under the
-//! harness's memory cap, its ingress over the node's own TLS (clients pin
-//! its key; the harness makes no certificates) and its API over QUIC, with
-//! a sampler beside it; stopped by their units' names.
+//! harness's memory cap, its API over QUIC (clients pin its key and
+//! present the deployed driver key, which every node lists in its
+//! `gateways`), with a sampler beside it; stopped by their units' names.
 
 use std::time::Duration;
 
 use vos_node::client::{Operator, Target};
-use vos_node::tls::Trust;
 
 use crate::check::{self, Facts};
 use crate::deploy::{Deployed, DeployedNode};
@@ -22,15 +21,21 @@ pub fn units_of(host: &Host) -> Vec<String> {
         .collect()
 }
 
-/// Where `node`'s ingress is reached, pinned to its key.
-pub fn target(node: &DeployedNode) -> Result<Target, String> {
-    let mut key = [0u8; 32];
-    hex::decode_to_slice(&node.key, &mut key).map_err(|error| error.to_string())?;
-    Target::new(&node.url, Trust::NodeKey(key)).map_err(|error| error.to_string())
+/// `node`'s API over QUIC, pinned to its key, as the client whose seed is
+/// `client`: the deployed driver key, which every node lists in its
+/// `gateways`, a transport admission with no authority.
+pub fn target(node: &DeployedNode, client: [u8; 32]) -> Result<Target, String> {
+    Target::quic(&node.api, crate::keys::hex32(&node.key)?, client)
+        .map_err(|error| error.to_string())
+}
+
+/// The deployed driver key's seed.
+pub fn driver_seed(inventory: &Inventory) -> Result<[u8; 32], String> {
+    crate::keys::seed(&Deployed::dir(inventory).join(crate::keys::DRIVER))
 }
 
 /// `node`'s operator: the harness's operator key, which every node
-/// lists, signing for that node alone.
+/// lists, signing for that node alone over its API.
 pub fn operator(
     inventory: &Inventory,
     node: &DeployedNode,
@@ -38,7 +43,7 @@ pub fn operator(
 ) -> Result<Operator, String> {
     let seed = crate::keys::seed(&Deployed::dir(inventory).join(crate::keys::OPERATOR))?;
     Ok(Operator::signing_within(
-        &target(node)?,
+        &target(node, driver_seed(inventory)?)?,
         ed25519_dalek::SigningKey::from_bytes(&seed),
         vos_wire::ingress::NodeId(crate::keys::hex32(&node.key)?),
         answer,
@@ -47,24 +52,18 @@ pub fn operator(
 
 fn node_unit<'a>(host: &'a Host, run: &Run, inventory: &'a Inventory) -> Unit<'a> {
     let dir = &host.dir;
-    let listen = format!("{}:{}", host.address, host.ingress);
     let command = [
         &format!("{dir}/bin/vos"),
         "node",
         "run",
         "--data",
         &format!("{dir}/data"),
-        "--listen",
-        &listen,
         "--space",
         &format!("{dir}/space"),
         "--agent",
         &format!("{dir}/guests/vos-agent.elf"),
         "--config",
         &format!("{dir}/node.toml"),
-        "--tls",
-        "--tls-name",
-        &host.address,
     ]
     .map(str::to_string)
     .to_vec();
@@ -164,7 +163,7 @@ fn answers(
     let node = deployed
         .node(host)
         .ok_or_else(|| format!("{}: not deployed", host.name))?;
-    let target = target(node)?;
+    let target = target(node, driver_seed(inventory)?)?;
     hosts::wait_for(
         &format!("{} answers", host.name),
         Duration::from_secs(inventory.harness.start_s),
@@ -189,7 +188,7 @@ fn answers(
             }
         },
     )?;
-    eprintln!("{}: node {} up at {}", host.name, node.number, node.url);
+    eprintln!("{}: node {} up at {}", host.name, node.number, node.api);
     Ok(())
 }
 

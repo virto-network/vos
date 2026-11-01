@@ -2,23 +2,21 @@ use super::*;
 
 /// What the plan's agents are, read from the nodes, a few at once: the
 /// shards, the idle agents (only when readers read them), then the
-/// identity agent. Each reader keeps one connection a node: a connection
-/// a read would leave one socket a read in `TIME_WAIT`, and 10^5 idle
-/// agents run the driver out of local ports.
+/// identity agent. The readers share one client a node: one connection a
+/// node, a stream a read, not a handshake a reader the node would refuse
+/// past its few at once from one address.
 pub(super) fn agents(placed: &[&Placed], targets: &[Target]) -> Result<Vec<Agent>, String> {
-    let one = |clients: &mut Vec<Option<vos_node::client::Client>>,
-               placed: &Placed|
-     -> Result<Agent, String> {
+    let clients: Vec<vos_node::client::Client> = targets
+        .iter()
+        .map(|target| {
+            vos_node::client::Client::new(target, ed25519_dalek::SigningKey::from_bytes(&[7; 32]))
+        })
+        .collect();
+    let one = |placed: &Placed| -> Result<Agent, String> {
         let agent = AgentId(placed.agent);
         let mut last = String::from("no replica answered");
         for replica in &placed.replicas {
-            let at = usize::from(*replica) - 1;
-            let client = clients[at].get_or_insert_with(|| {
-                vos_node::client::Client::new(
-                    &targets[at],
-                    ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                )
-            });
+            let client = &clients[usize::from(*replica) - 1];
             match client.identity(agent) {
                 Ok(identity) => {
                     return Ok(Agent {
@@ -29,8 +27,6 @@ pub(super) fn agents(placed: &[&Placed], targets: &[Target]) -> Result<Vec<Agent
                             .iter()
                             .map(|node| usize::from(*node) - 1)
                             .collect(),
-                        paths: ["calls", "queries", "workflows"]
-                            .map(|kind| format!("/agents/{}/{kind}", agent.0)),
                     });
                 }
                 Err(vos_node::client::ClientError::NoAgent) => {
@@ -45,12 +41,11 @@ pub(super) fn agents(placed: &[&Placed], targets: &[Target]) -> Result<Vec<Agent
     let read: Vec<Vec<(usize, Result<Agent, String>)>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..readers)
             .map(|reader| {
+                let one = &one;
                 scope.spawn(move || {
-                    let mut clients: Vec<Option<vos_node::client::Client>> =
-                        targets.iter().map(|_| None).collect();
                     (reader..placed.len())
                         .step_by(readers)
-                        .map(|at| (at, one(&mut clients, placed[at])))
+                        .map(|at| (at, one(placed[at])))
                         .collect()
                 })
             })

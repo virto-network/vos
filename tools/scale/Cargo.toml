@@ -13,25 +13,20 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 ed25519-dalek = "2"
-futures-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 hex = "0.4"
-httparse = "1"
 libc = "0.2"
 # The allocator `vos` uses: a driver's clients free across threads.
 mimalloc = "0.1.52"
 serde = { workspace = true }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde_json = "1"
 # The drivers' sending thread: one executor, its connections and timers.
 smol = "2"
 toml = "1"
-# The harness's clients: the operator's admin commands and signed calls,
-# each node pinned by its key over TLS.
+# The harness's clients: the operator's signed commands and the agents'
+# reads, each node's API over QUIC pinned by its key.
 vos-node = { path = "../../node/host" }
-# The drivers over the node API: its frames, its QUIC, and the route
-# table that turns their requests into frames.
+# The drivers over the node API: its frames and its QUIC.
 vos-api = { workspace = true, features = ["quic"] }
-vos-http = { workspace = true }
 vos-net = { workspace = true }
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-smol", "rustls-ring"] }
 # The gateway's cost, measured in front of a node from the coordinator.
