@@ -296,7 +296,39 @@ class Manifests:
         unknown = set(manifest) - DROPPED - {"package", "lib", "features", "dependencies", "build-dependencies", "lints"}
         if unknown:
             raise KitError(f"{crate}: sections the kit does not vendor: {sorted(unknown)}")
+        package = self.package_of(crate, directory, manifest)
+        lib = dict(manifest.get("lib", {}))
+        lib.update({"test": False, "doctest": False, "bench": False})
+        sections = {}
+        for kind in ("dependencies", "build-dependencies"):
+            entries = manifest.get(kind, {})
+            if entries:
+                sections[kind] = {
+                    name: self.dependency(crate, name, spec, False)
+                    for name, spec in entries.items()
+                }
+        features, expected = self.features_of(crate, directory, manifest, sections)
 
+        lines = [
+            f"# Vendored from VOS's `{directory}/Cargo.toml` by `vos_kit.py`: the",
+            "# workspace's fields and dependencies made concrete; the tests,",
+            "# dev-dependencies and bins left in VOS. Change it there and vendor",
+            "# again.",
+            "",
+        ]
+        lines += table("package", package)
+        lines += table("lib", lib)
+        if features:
+            lines += table("features", features)
+        for kind, entries in sections.items():
+            lines += table(kind, entries)
+        for tool, entries in self.lints_of(crate, manifest, expected).items():
+            lines += table(f"lints.{tool}", entries)
+        return ("\n".join(lines).rstrip("\n") + "\n").encode()
+
+    def package_of(self, crate: str, directory: str, manifest: dict) -> dict:
+        """The crate's package table, the workspace's values made concrete,
+        never published, built or searched for targets."""
         package = {}
         for key, value in manifest["package"].items():
             if key not in PACKAGE_KEYS:
@@ -318,18 +350,12 @@ class Manifests:
                 "autobenches": False,
             }
         )
+        return package
 
-        lib = dict(manifest.get("lib", {}))
-        lib.update({"test": False, "doctest": False, "bench": False})
-
-        sections = {}
-        for kind in ("dependencies", "build-dependencies"):
-            entries = manifest.get(kind, {})
-            if entries:
-                sections[kind] = {
-                    name: self.dependency(crate, name, spec, False)
-                    for name, spec in entries.items()
-                }
+    def features_of(self, crate: str, directory: str, manifest: dict, sections: dict) -> tuple[dict, list[str]]:
+        """The crate's features without those the kit leaves in VOS, and of
+        those, the ones its sources read; its optional dependencies no
+        feature names dropped from `sections`."""
         features = dict(manifest.get("features", {}))
         # A dropped feature's code compiles out: it stays an expected cfg
         # value, so a source that reads it builds without a warning.
@@ -363,20 +389,11 @@ class Manifests:
                 dependency = item.removeprefix("dep:").split("/")[0].rstrip("?")
                 if dependency not in names and dependency not in features:
                     raise KitError(f"{crate}: feature {feature} names {item}, not vendored")
+        return features, expected
 
-        lines = [
-            f"# Vendored from VOS's `{directory}/Cargo.toml` by `vos_kit.py`: the",
-            "# workspace's fields and dependencies made concrete; the tests,",
-            "# dev-dependencies and bins left in VOS. Change it there and vendor",
-            "# again.",
-            "",
-        ]
-        lines += table("package", package)
-        lines += table("lib", lib)
-        if features:
-            lines += table("features", features)
-        for kind, entries in sections.items():
-            lines += table(kind, entries)
+    def lints_of(self, crate: str, manifest: dict, expected: list[str]) -> dict:
+        """The crate's lints, the workspace's made concrete, with the
+        dropped features it reads as expected cfg values."""
         lints = manifest.get("lints")
         if isinstance(lints, dict) and lints.get("workspace"):
             if self.lints is None:
@@ -392,9 +409,7 @@ class Manifests:
                 "level": "warn",
                 "check-cfg": [f"cfg(feature, values({values}))"],
             }
-        for tool, entries in lints.items():
-            lines += table(f"lints.{tool}", entries)
-        return ("\n".join(lines).rstrip("\n") + "\n").encode()
+        return lints
 
 
 def normalize(path: str) -> str:
