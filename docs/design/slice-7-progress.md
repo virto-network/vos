@@ -6284,7 +6284,7 @@ and pinned ids, no vendored source (`teammate-note.md`).
 
 **Review (Opus):** no High; the shift's encoding, the flag slot, the
 monotonicity substitution and the chip on node segments checked against
-the code. Folded (`379f77daa`, `…`): a built leaf at the 17-page class
+the code. Folded (`379f77daa`): a built leaf at the 17-page class
 (the test gap); DIVREM's and `CONSTRAINTS.md`'s stale notes (logical
 shifts, the even-block rule); the closing timestamp's Poseidon2 calls;
 the CPU's single-caller helpers inlined; stale comments and widths;
