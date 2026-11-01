@@ -794,3 +794,62 @@ fn heavy_device_proofs_verify_at_the_device_parameters() {
         }
     }
 }
+
+/// A kernel shifting a word right by 3 and by 0 (`ShloRImm64`), the
+/// results its io-hash's first two words: through MUL, so its device shape
+/// holds MUL and no DIVREM.
+fn shift_kernel() -> Vec<u8> {
+    let mut asm = Assembler::new();
+    asm.set_stack_pages(1);
+    asm.load_imm_64(Reg::T0, 0x8123_4567_89ab_cdef);
+    for (register, amount) in [(Reg::A2, 3u8), (Reg::A3, 0)] {
+        // ShloRImm64: `register = T0 >> amount`, the destination in the
+        // register byte's low nibble, the source in its high one.
+        asm.emit_raw(152, true);
+        asm.emit_raw(register as u8 | (Reg::T0 as u8) << 4, false);
+        asm.emit_raw(amount, false);
+    }
+    for (register, word) in [Reg::A4, Reg::A5].into_iter().zip(IO) {
+        asm.load_imm(register, word as i32);
+    }
+    asm.load_imm(Reg::T0, 0).jump_ind(Reg::RA, 0);
+    asm.build()
+}
+
+/// A logical right shift's result other than its multiplication's high
+/// word (its low word when the amount is 0) is refused on the device
+/// shape: the shift by 3's result, and the shift by 0's, each changed in
+/// the run and every later step's register file with it. The honest run's
+/// shape holds MUL and no DIVREM.
+#[test]
+fn a_logical_right_shifts_forged_result_is_refused() {
+    use vos_pvm_proof::device::device_chip::{DIVREM, MUL};
+    let kernel = shift_kernel();
+    let program = program_of(&kernel);
+    assert_ne!(program.active & 1 << MUL, 0);
+    assert_eq!(program.active & 1 << DIVREM, 0);
+    let honest = || {
+        vos_pvm_proof::kernel::trace_kernel(&kernel, &[], 10_000)
+            .expect("halts")
+            .side_note
+    };
+    prove_device::<P2>(&format(), &program, &mut honest(), MaskRng::Seeded(7))
+        .expect("the honest run proves");
+    for register in [Reg::A2 as usize, Reg::A3 as usize] {
+        refused_as_a_broken_constraint(&program, || {
+            let mut side_note = honest();
+            let at = side_note
+                .steps
+                .iter()
+                .position(|step| step.reg_write == Some(register))
+                .expect("the shift's step");
+            let forged = side_note.steps[at].regs_after[register] ^ 1 << 40;
+            side_note.steps[at].regs_after[register] = forged;
+            for step in &mut side_note.steps[at + 1..] {
+                step.regs_before[register] = forged;
+                step.regs_after[register] = forged;
+            }
+            side_note
+        });
+    }
+}

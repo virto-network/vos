@@ -35,7 +35,7 @@ use vos_pvm_proof::framework_access::AllLookupElements;
 use vos_pvm_proof::harness::{MachineComponent, MachineProverComponent};
 use vos_pvm_proof::pcs::ChannelRef;
 use vos_pvm_proof::trace::component::ComponentTrace;
-use vos_pvm_proof::{AirColumn, SideNote, chips};
+use vos_pvm_proof::{AirColumn, SideNote};
 
 // ── A chip whose trace the adversary rewrites ────────────────────────────
 
