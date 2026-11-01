@@ -431,7 +431,12 @@ fn every_ingress_refusal_comes_in_its_check_order() {
         .unwrap()
         .create_replicated((1..=NODES).collect())
         .unwrap();
-    let unfounded = client::credentialed(&target, bare, &fresh).unwrap();
+    // The target answers `NoAgent` until it learns the new agent's placement.
+    let mut unfounded = Response::NoAgent;
+    vos_checker::wait_until("the bare agent placed", Duration::from_secs(30), || {
+        unfounded = client::credentialed(&target, bare, &fresh).unwrap();
+        unfounded != Response::NoAgent
+    });
     assert_eq!(refused(unfounded), CredentialRefusal::NoSpace);
 
     // Every check from the format on fails; each mended in turn.
