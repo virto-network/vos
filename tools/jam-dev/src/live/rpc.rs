@@ -180,7 +180,7 @@ mod tests {
         let fetched = node.fetch(&[4; 32], &[0, 1]);
         assert!(fetched.is_err(), "a missing segment: {fetched:?}");
         let error = node.call("parameters", json!([])).unwrap_err();
-        assert!(matches!(&error, Error::Node(said) if said.contains("Invalid params")));
+        assert!(matches!(&error, Error::Chain(said) if said.contains("Invalid params")));
         let calls = served.join().unwrap();
         assert_eq!(calls[0]["method"], "parameters");
         assert_eq!(calls[1]["method"], "finalizedBlock");

@@ -103,7 +103,7 @@ impl Parameters {
 }
 
 fn failed(what: impl std::fmt::Display) -> Error {
-    Error::Node(what.to_string())
+    Error::Chain(what.to_string())
 }
 
 impl PolkaJam {

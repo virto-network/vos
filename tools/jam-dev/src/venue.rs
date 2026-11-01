@@ -447,7 +447,7 @@ impl Jam {
         let mut outcomes = self.statements.land(&[(payload, extrinsics)], LANDING)?;
         outcomes
             .pop()
-            .ok_or_else(|| Error::Node("no outcome".into()))
+            .ok_or_else(|| Error::Chain("no outcome".into()))
     }
 
     /// Register the space `genesis` founds under `controller` (an ed25519

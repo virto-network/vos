@@ -77,9 +77,10 @@ pub enum Error {
     Corrupt(&'static str),
     #[error("the tree: {0}")]
     Tree(#[from] vos_tree::Error),
-    /// The JAM node, or its tools, failed.
-    #[error("the JAM node: {0}")]
-    Node(String),
+    /// A [`Chain`] failed of its own: a live chain's JAM node or its
+    /// tools.
+    #[error("the chain: {0}")]
+    Chain(String),
     #[error("a call not signed by its session's key")]
     Signature,
     /// A package's ELF derives no programs.
