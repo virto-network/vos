@@ -1,4 +1,3 @@
-
 use super::{Facts, judge, judge_machines, kernel_at_least, size_kb};
 use crate::inventory::Inventory;
 
