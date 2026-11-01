@@ -156,7 +156,6 @@ impl RunArgs {
             )
             .init();
         let mut config = Config::new(link(&self.agent)?);
-        config.ingress_tls = self.tls.ingress();
         config.space = self.space.as_deref().map(Space::read).transpose()?;
         config.peer_bind = self.peer_bind;
         let settings = match &self.config {
@@ -179,15 +178,11 @@ impl RunArgs {
             }
         }
         let node = Node::open(&self.data, config).map_err(|error| format!("{error:?}"))?;
-        let address = node
-            .serve(self.listen)
-            .map_err(|error| format!("{error:?}"))?;
         let socket = fronts
             .api_socket
             .unwrap_or_else(|| self.data.join(config::API_SOCKET));
         node.serve_socket(&socket, fronts.api_socket_mode)
             .map_err(|error| format!("{error:?}"))?;
-        println!("listening on {address}");
         println!("node {}", hex::encode(node.id().0));
         println!("api on {}", socket.display());
         if let Some(listen) = fronts.api_listen {

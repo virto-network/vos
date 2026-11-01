@@ -41,9 +41,9 @@ vos-wire = { workspace = true }
 libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
-futures-rustls = { version = "0.26", default-features = false, features = ["ring"] }
-httparse = "1"
 smol = "2"
+# The node API's frames, which the processes bench's driver sends.
+vos-api = { workspace = true }
 vos-checker = { path = "../checker" }
 # The agent-as-JAM-service builder's derivation, which an install's must
 # equal.

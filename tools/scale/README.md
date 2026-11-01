@@ -9,7 +9,7 @@ drives it, with one `[[host]]` entry for each node or driver.
 |---|---|
 | `check` | Reads every host: architecture, kernel, clock offset, free memory and disk, the data disk's type, CPU and governor, the link's speed, the tools, the user manager, and whether the ports are free. It refuses a host that would make the numbers mislead, and exits 1 if it refuses any host. |
 | `deploy` | Ships the static `vos` and `vos-scale` and the agent's ELF to every host with `rsync`, wipes the nodes' data, makes each node's key, and founds a new space. |
-| `up` | Starts a run: each node and each host's sampler in a `systemd-run --user` unit under a memory cap. Ingress uses each node's own TLS, pinned by its key, so the harness makes no certificates. |
+| `up` | Starts a run: each node and each host's sampler in a `systemd-run --user` unit under a memory cap. The drivers and the coordinator reach each node over its API's QUIC, pinned by its key, so the harness makes no certificates. |
 | `agents` | Creates the `K` ledger shards and `I` idle agents on three nodes each, picked by weight, with the shard actor installed in each, `--creators` of them at once (16); `--identity-rows U` creates the stand-in identity agent on every node and writes its rows; `--representative` creates the space's representative first. |
 | `drive` | Drives the load model from every driver host while it polls each node's `/stats` and `/agents/*/status`. |
 | `collect` | Copies each host's samples, node log and driver record into the run's directory. |
@@ -68,17 +68,16 @@ second while active (`--per-user`, 0.1; or `--rate` for `U·a·r` itself).
   from the close).
 - **The drivers** split the users and the rate. Each signs its calls ahead
   of their schedule and sends each call once (no retry, no redirect
-  followed). By default (`[harness] transport = "api"`) a driver keeps one
-  QUIC connection to each node's API, a stream a request, its key (the
-  deployed `driver.key`) listed in every node's `gateways`; with
-  `transport = "http"` it keeps at most `[harness] driver_connections`
-  (512) HTTPS connections a node, and all the drivers' connections
-  together must fit in the nodes' `[node] ingress_connections` (1,024 by
-  default), or `drive` refuses. The coordinator's operator key (the
-  deployed `operator.key`), which every node lists, signs its commands
-  and its polls. A run over the API ends with the gateway's cost, a row of
-  its own: the node's time asked of the first node's API directly and
-  through a gateway in front of it, 500 times each. A
+  followed). A driver keeps one QUIC connection to each node's API, a
+  stream a request, as the deployed driver key (`driver.key`), which every
+  node lists in its `gateways`: a transport admission, no authority. A
+  node takes at most `[node] api_in_flight` (1,024) requests at once on
+  one connection. The coordinator reaches the nodes the same way, as the
+  same key; its operator key (the deployed `operator.key`), which every
+  node lists in its `operators`, signs its commands and its polls. A run
+  ends with the gateway's cost, a row of its own: the node's time asked of
+  the first node's API directly and through a gateway in front of it, 500
+  times each. A
   call goes to its agent's leader as last learned, a query to a follower;
   a node that does not answer, or answers `Unavailable` or names no
   leader, is left out for 2 s and the leader's place moves to the next
@@ -89,12 +88,12 @@ second while active (`--per-user`, 0.1; or `--rate` for `U·a·r` itself).
   its window's close, after a jitter of up to 0.5 s, every 0.5 s.
 - **The record**, every interval: a line a kind (sent, answered, refusals
   by name, rate, p50, p99, p99.9, sends late, signatures the sending thread
-  made), and a line for the mix with the driver's CPU in the interval, the
-  requests that waited for a connection and the most in use. The totals
+  made), and a line for the mix with the driver's CPU in the interval and
+  the most requests in flight at once on one node's connection. The totals
   add the load's span (its first and last sends, the report's window), the
   mix as sent against its target, the CPU over the load, and each shard's
-  distinct users and sessions opened. The report warns when the
-  connections bound or the driver fell behind. A machine may run several
+  distinct users and sessions opened. The report warns when the nodes'
+  `api_in_flight` bound or the driver fell behind. A machine may run several
   drivers, each its own entry, directory and cores.
 - **The capacity probe:** a plan with `"probe": true`, given to
   `vos-scale drive-local --plan` by hand, sends every request to a node
@@ -141,8 +140,8 @@ Every host, nodes and drivers alike, needs:
 - **The `performance` CPU governor** for timed runs
   (`sudo cpupower frequency-set -g performance`). Laptops run on AC
   power with their lid open. `check` warns about any other governor.
-- **Open ports** between the hosts: each node's `ingress` (TCP), `peer`
-  (UDP) and `api` (UDP).
+- **Open ports** between the hosts: each node's `peer` and `api` (both
+  UDP).
 
 The coordinator also needs the repository, built from its root:
 
@@ -182,8 +181,8 @@ Copy `inventory.example.toml` to `inventory.toml` and give one
 - `cores`: optional, as `taskset -c` takes them, e.g. `0-11`. Use it
   when the desktop runs two nodes, giving each its own cores, ports and
   `dir`.
-- `ingress` and `peer`: the node's TCP and UDP ports; `api`, its API's
-  QUIC port (UDP), the ingress's plus 1,000 when absent.
+- `api` and `peer`: a node's two UDP ports, both needed: its API's QUIC,
+  which the drivers and the coordinator reach it at, and its peers'.
 - `memory_max`: optional; it overrides `harness.memory_max` for this host.
   On each machine, the caps of all its entries plus a 2 GiB reserve must
   fit in its free memory, or `check` refuses it.
@@ -193,8 +192,10 @@ length, the clock bound, the sampling interval, and `start_s`, how long a
 node may take to answer once started (90 s; a node opens every group it
 replicates first, so 10^5 idle agents need more). `[node]` holds the
 nodes' settings (`vos node run --config`): `executors`, `queue`,
-`max_inputs`, `max_bytes`, `linger_ms`, `ingress_connections`,
-`election_timeout_ms = [low, high]` and `heartbeat_ms`.
+`max_inputs`, `max_bytes`, `linger_ms`, `api_connections`,
+`api_in_flight`, `election_timeout_ms = [low, high]` and `heartbeat_ms`.
+The harness sets `operators`, `gateways` and `api_listen` itself; an
+`ingress_connections`, a setting of the node's deleted HTTP, is refused.
 
 ## Running `check`
 
@@ -206,8 +207,8 @@ From the repository's root:
 every refusal, or leave that host out with `--exclude NAME`. Warnings,
 such as the governor, a rotating disk or a slow link, are recorded with
 every run, and they name what may bind. Once every host passes, the
-step's gate is one command (raise `ingress_connections` in `[node]`
-when many users call at once):
+step's gate is one command (raise `api_in_flight` in `[node]` when the
+report says it bound):
 
     target/x86_64-unknown-linux-musl/release/vos-scale -i inventory.toml run \
         --shards 100 --identity --representative --users 10000 --rate 200 --secs 300 --label gate

@@ -36,20 +36,6 @@ const QUERY_HORIZON_MS: u64 = 300_000;
 /// body only as one ends, and QUIC answers `Unavailable`.
 const LARGE_BODIES: usize = 4;
 
-/// The transport a request came by.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Via {
-    /// The unix socket: its file mode is the access.
-    Socket,
-    /// QUIC, from a key the node lists in `gateways`.
-    Quic,
-    /// The node's own HTTP, an operator's envelope in its header.
-    Http,
-    /// The node's own HTTP: an operator's bare body, once the node's
-    /// bearer token admitted it.
-    Token,
-}
-
 pub(crate) struct Api {
     pub(crate) inner: Arc<Inner>,
     /// Owners' reads of workflows waiting now.
@@ -58,7 +44,7 @@ pub(crate) struct Api {
     operators: HashSet<[u8; 32]>,
     /// The operators' commands' nonces, until their expiries.
     nonces: Nonces,
-    /// Requests the API's transports brought, the node's HTTP's aside.
+    /// Requests the API's transports brought.
     pub(crate) frames: AtomicU64,
     /// The large bodies' places: installs', and credentialed calls'.
     pub(crate) large: Arc<smol::lock::Semaphore>,
@@ -91,8 +77,10 @@ impl Drop for Waiting<'_> {
 /// Credentialed calls' bodies past a call's limit held at once, from the
 /// socket and QUIC together, apart from the installs' large bodies. A
 /// credentialed call gives its place back once its proof is verified, so
-/// they bound proofs held and verified, not calls waiting to apply.
-const CREDENTIALED_BODIES: usize = vos_http::CREDENTIALED_LARGE;
+/// they bound proofs held and verified, not calls waiting to apply: about
+/// 100 MiB of them at their largest, as many as a gateway's HTTP holds
+/// (`vos_http::CREDENTIALED_LARGE`).
+pub const CREDENTIALED_BODIES: usize = 64;
 
 /// A large body's place among those its kind's pool holds, given back when
 /// dropped: by the transport once the answer is out, or by a credentialed
@@ -157,19 +145,16 @@ impl Api {
         }
     }
 
-    /// The answer to a request of `kind` holding `body`, which came `via`
-    /// a transport holding `large`, its body's place if it is large, in
+    /// The answer to a request of `kind` holding `body`, which came by a
+    /// transport holding `large`, its body's place if it is large, in
     /// SCALE.
     pub(crate) async fn handle(
         &self,
         kind: Kind,
         body: Vec<u8>,
-        via: Via,
         large: Option<LargePlace>,
     ) -> Vec<u8> {
-        if matches!(via, Via::Socket | Via::Quic) {
-            self.frames.fetch_add(1, Ordering::Relaxed);
-        }
+        self.frames.fetch_add(1, Ordering::Relaxed);
         match kind {
             Kind::NodeKey => self.inner.node_id.encode(),
             Kind::Time => (self.inner.clock)().encode(),
@@ -179,26 +164,14 @@ impl Api {
             Kind::Schema => <(AgentId, InstanceId)>::decode_exact(&body)
                 .and_then(|(agent, instance)| self.schema(agent, instance))
                 .encode(),
-            _ => self.respond(kind, body, via, large).await.encode(),
+            _ => self.respond(kind, body, large).await.encode(),
         }
     }
 
     /// The answer to a kind answering a [`Response`].
-    async fn respond(
-        &self,
-        kind: Kind,
-        body: Vec<u8>,
-        via: Via,
-        large: Option<LargePlace>,
-    ) -> Response {
+    async fn respond(&self, kind: Kind, body: Vec<u8>, large: Option<LargePlace>) -> Response {
         if kind.operator() {
-            return match via {
-                Via::Token => match operator::parse(&self.inner, kind, body).await {
-                    Ok(command) => operator::run(&self.inner, command).await,
-                    Err(answer) => answer,
-                },
-                Via::Socket | Via::Quic | Via::Http => self.operated(kind, body).await,
-            };
+            return self.operated(kind, body).await;
         }
         match kind {
             Kind::Call => match decode(&body) {

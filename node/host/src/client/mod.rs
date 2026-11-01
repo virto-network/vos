@@ -1,4 +1,4 @@
-//! A blocking client of a node's ingress: a client key's sessions, signed
+//! A blocking client of a node's API, or of a gateway's HTTP: a client key's sessions, signed
 //! calls and queries, its workflows' results, and the operator's commands.
 
 mod api;
@@ -383,8 +383,12 @@ impl Client {
             Trust::Ca(roots) => Trust::Ca(roots.clone()),
             // A gateway routes again: its pin holds wherever it sends.
             Trust::Gateway(key) => Trust::Gateway(*key),
+            // A contact's HTTPS is a gateway's, whose key no contact names.
             Trust::NodeKey(_) | Trust::Loopback if contact.address.starts_with("https://") => {
-                Trust::NodeKey(contact.node.0)
+                return Err(ClientError::Http(format!(
+                    "{}: a gateway's HTTPS needs its key pinned or a CA",
+                    contact.address
+                )));
             }
             Trust::NodeKey(_) | Trust::Loopback => Trust::Loopback,
         };

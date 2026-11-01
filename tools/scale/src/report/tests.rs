@@ -112,7 +112,7 @@ fn the_window_is_the_load_not_the_drain() {
         lines += &format!("{{\"t_ms\":{t},\"total\":false,\"kind\":\"all\",\"sent\":1}}\n");
     }
     lines += "{\"t_ms\":400000,\"total\":true,\"kind\":\"cut_read\",\"sent\":0,\"ok\":5,\"errors\":1,\"by_error\":{\"Workflow(Attesting)\":1},\"not_closed\":3}\n";
-    lines += "{\"t_ms\":400000,\"total\":true,\"kind\":\"all\",\"sent\":1000,\"conn_waits\":50,\"load_from_ms\":100000,\"load_to_ms\":160000}\n";
+    lines += "{\"t_ms\":400000,\"total\":true,\"kind\":\"all\",\"sent\":1000,\"in_use_max\":1024,\"load_from_ms\":100000,\"load_to_ms\":160000}\n";
     let hosts = run.dir.join("hosts").join("d");
     std::fs::create_dir_all(&hosts).unwrap();
     std::fs::write(hosts.join("r.drive.jsonl"), lines).unwrap();
@@ -126,7 +126,7 @@ fn the_window_is_the_load_not_the_drain() {
         summary
             .warnings
             .iter()
-            .any(|warning| warning.contains("the pool bound")),
+            .any(|warning| warning.contains("the stream bound")),
         "{:?}",
         summary.warnings
     );

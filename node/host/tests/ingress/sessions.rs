@@ -77,7 +77,7 @@ fn signatures_are_checked() {
     );
     // Signed for one agent, sent to another: the agent's identity is in
     // the signed bytes.
-    let operator = Operator::new(&served.target, &served.token);
+    let operator = served.operator();
     let Ok(Response::Created(other)) = operator.create_agent(Vec::new()) else {
         panic!("another agent")
     };

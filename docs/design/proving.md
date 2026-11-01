@@ -2079,7 +2079,7 @@ its hex, its `Debug` list and, for a number, its digits and byte orders:
   files and the wrap's randomness, which no carrier may hold;
 - **the credentialed run** (`node/host/tests/carriers/credentials.rs`):
   a member's calls proved by the device library and sent over the node
-  API's socket, the node's HTTP and a gateway over QUIC, refused at
+  API's socket and a gateway over QUIC, refused at
   ingress in each way a device meets, a device kernel's among them;
   needles the member's device secret (its source's output, `w`, `s` and
   each word, the nullifier's key, their hashes, a device kernel's

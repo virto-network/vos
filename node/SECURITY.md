@@ -26,7 +26,12 @@ holds is `pvm/device/SECURITY.md`'s, and what a verified proof proves is
   `POST /agents/{agent}/credentialed` and `GET /time` onto the node API
   and runs none of the checks: every check is the node's, whoever relays
   the frame. A compromised gateway can drop, delay or reorder requests and
-  read what it relays; it can forge nothing.
+  read what it relays; it can forge nothing. The node serves no HTTP of
+  its own: its binary API alone, on a unix socket whose file mode is the
+  access and over QUIC to the client keys it lists in `gateways`, a
+  transport's admission and no authority. Its operator commands are
+  signed by a key it lists in `operators`, each for that node, with a
+  nonce and an expiry; no bearer token admits one.
 - **The node's clock** (`Time`) is unsigned. A relay that lies about it
   makes the client pick an expiry the node refuses, which costs a new
   proof; it cannot extend a proof's life, since ingress judges the expiry
@@ -40,7 +45,8 @@ request and this replica's applied state alone. A refusal is
 frame checks and the agent's placement come first, as for any call):
 
 1. the frame within its kind's size (1,642,496 bytes), from its header,
-   before a byte of the body is read; over HTTP from the request's head;
+   before a byte of the body is read; at a gateway's HTTP from the
+   request's head;
 2. the body decodes exactly;
 3. this node serves the agent;
 4. the agent's space has a genesis (`NoSpace`): a binding names its
@@ -168,15 +174,15 @@ serve its requests:
 a member's sign-ins, `once` votes, payment and device kernel's sign-in,
 and ingress's refusals (a replay, `Once`, a cut proof, another call's
 arguments, an expired call, a retired format, a device proof to a guard
-naming no kernel, two frame errors), over the API's socket, the node's
-HTTP and a gateway relaying onto the API over QUIC. No carrier holds the
-member's device secret (its source's output, `w`, `s`, the nullifier's
-key, their hashes, a device kernel's arguments; `s`'s single words in
-what leaves the device) or a proof's masks as drawn: every byte the
-socket's connections carried each way, each HTTP request and its
-answer's status and body as sent and read, at the node and through the
-gateway, each node's log entries, work results, store, disk and frames,
-the device library's values as `Debug` and `Display` show them, and
+naming no kernel, two frame errors), over the API's socket and a
+gateway relaying onto the API over QUIC. No carrier holds the member's
+device secret (its source's output, `w`, `s`, the nullifier's key, their
+hashes, a device kernel's arguments; `s`'s single words in what leaves
+the device) or a proof's masks as drawn: every byte the socket's
+connections carried each way, each HTTP request and its answer's status
+and body as sent and read through the gateway, each node's log entries,
+work results, store, disk and frames, the device library's values as
+`Debug` and `Display` show them, and
 every log line of the nodes and the gateway at every level. The QUIC
 frames between the gateway and the nodes are not taken apart from the
 TLS: their bodies are the HTTP bodies above, framed by the same codec as
@@ -278,16 +284,17 @@ a member's phone (`slice-7-mobile.md` 7.13):
 ## Denial of service
 
 - Every check but the proof's costs microseconds and runs first; the
-  frame's size is refused from its header, over HTTP from the head.
+  frame's size is refused from its header, at a gateway's HTTP from the
+  head.
 - There is no bucket per scope or method to drain: the bounds are the
   node's connections and its verification budget, past which a call is
   answered `Busy` before its proof is decoded; a statement with a word at
   or above p is refused `Proof` without spending a verification.
 - Credentialed bodies past a call's size (every one with a proof) take
   places of their own, 64 at once on the node's socket and QUIC together
-  and 64 on the node's HTTP (about 100 MiB at the largest), apart from
-  the installs' four: past them, QUIC and HTTP answer at once from the
-  header or head, the socket reads the next only as one ends. A body is
+  (about 100 MiB at the largest), apart from the installs' four: past
+  them, QUIC answers at once from the header, the socket reads the next
+  only as one ends. A body is
   dropped once decoded, and its place given back with its proof once the
   proof is verified, never held through the apply or a forward's wait:
   the places bound proofs held and verified at once, so 64 valid proofs

@@ -18,7 +18,6 @@ mod recording;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
@@ -39,7 +38,6 @@ use crate::pvm::Machines;
 use crate::space::Space;
 use crate::storage::StorageThread;
 use crate::store::Fjall;
-use crate::tls::IngressTls;
 use crate::{lock, timeout};
 
 pub(crate) use config::Settings;
@@ -47,7 +45,7 @@ pub use config::{Config, Peers};
 pub(crate) use directory::{Directory, Known};
 pub use error::{CallError, Error, ReplaceError, Reply};
 pub(crate) use open::write_private;
-pub use open::{ADMIN_TOKEN, NODE_KEY, STORE, wall_clock};
+pub use open::{NODE_KEY, STORE, wall_clock};
 pub(crate) use queue::{Agent, Answered, Pending};
 
 /// An agent this node replicates: its queue, its group's shared state, the
@@ -273,7 +271,7 @@ impl Inner {
     pub(crate) fn contact(&self, number: NodeNumber) -> Option<Contact> {
         let node = self.space.as_ref()?.node(number)?;
         Some(Contact {
-            address: node.ingress.clone(),
+            address: node.contact.clone(),
             node: NodeId(node.key),
         })
     }
@@ -550,14 +548,12 @@ impl Tasks {
 /// A VOS node on one process.
 pub struct Node {
     inner: Arc<Inner>,
-    data: PathBuf,
     /// The seed of the node's key.
     secret: [u8; 32],
-    ingress_tls: Option<IngressTls>,
     /// The node API's one handler, whichever transport brings a request.
     api: Arc<crate::api::Api>,
-    /// The servers on the node's thread (the HTTP ingress, the API's
-    /// socket), and what stops each.
+    /// The API's socket servers on the node's thread, and what stops
+    /// each.
     fronts: Mutex<Vec<(smol::Task<()>, smol::channel::Sender<()>)>>,
     /// The API's QUIC endpoint, on its own thread.
     quic_api: Mutex<Option<crate::api::quic::Served>>,

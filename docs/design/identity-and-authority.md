@@ -809,8 +809,8 @@ the device never exports, evaluated once a use after the user's consent
   secret (its source's output, `w`, `s` and its words, the nullifier's
   key, their hashes, a device kernel's arguments) and a proof's masks in
   every carrier, and its place in the tree in every carrier that leaves
-  but the path's own fetch, over the node API's socket, the node's HTTP
-  and a gateway over QUIC; the device library's errors and `Debug`
+  but the path's own fetch, over the node API's socket and a gateway over
+  QUIC; the device library's errors and `Debug`
   output; the phone bench's output; and s4's facility through its C ABI,
   its every freed heap block included. No leak was found in VOS.
 - **Known gaps,** each stated where it lives:

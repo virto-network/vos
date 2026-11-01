@@ -246,7 +246,7 @@ impl Unit<'_> {
             format!("--property=MemoryMax={}", self.memory_max),
             "--property=MemorySwapMax=0".into(),
             format!("--property=RuntimeMaxSec={}", self.runtime_max_s),
-            // A node's ingress and a driver's clients hold a socket each.
+            // A node's connections and stores, and a driver's clients, hold descriptors.
             "--property=LimitNOFILE=65536".into(),
             format!("--property=StandardOutput=append:{}", self.stdout),
             format!("--property=StandardError=append:{}", self.stderr),

@@ -15,7 +15,7 @@ use vos_checker::percentiles;
 use vos_checker::processes::{Running, space_file};
 use vos_checker::programs;
 use vos_checker::rounds::{ROUNDS, Rounds, Tour};
-use vos_checker::spaces::{free_tcp_port, free_udp_port};
+use vos_checker::spaces::free_udp_port;
 use vos_node::{Config, Node, Reply, Space};
 use vos_wire::batch::{Answer, Await, Body, Message, Request};
 use vos_wire::ids::{AgentId, Principal, Session, WorkflowId};
@@ -103,11 +103,9 @@ pub fn measure(cpus: &[String], pinned: bool) {
     keys.extend((2..=NODES).map(|number| {
         vos_checker::processes::first_run(&crate::nodes::vos(), &data(number), &log(number))
     }));
-    let ingress: Vec<u16> = (0..NODES).map(|_| free_tcp_port()).collect();
     let peers: Vec<u16> = (0..NODES).map(|_| free_udp_port()).collect();
-    let urls: Vec<String> = ingress
-        .iter()
-        .map(|port| format!("http://127.0.0.1:{port}"))
+    let urls: Vec<String> = (1..=NODES)
+        .map(|number| format!("http://node-{number}"))
         .collect();
     let space_path = dir.path().join("space");
     let listed = (0..NODES).map(|at| {
@@ -117,13 +115,10 @@ pub fn measure(cpus: &[String], pinned: bool) {
     std::fs::write(&space_path, space_file(listed)).unwrap();
     let _followers: Vec<Running> = (2..=NODES)
         .map(|number| {
-            let listen = format!("127.0.0.1:{}", ingress[number - 1]);
             let data = data(number);
             let args = [
                 "--data",
                 data.to_str().unwrap(),
-                "--listen",
-                &listen,
                 "--space",
                 space_path.to_str().unwrap(),
             ];
@@ -142,10 +137,7 @@ pub fn measure(cpus: &[String], pinned: bool) {
                 }
                 let mut config = Config::new(program);
                 config.space = Some(Space::read(&space_path).unwrap());
-                let node = Node::open(data(1), config).unwrap();
-                node.serve(format!("127.0.0.1:{}", ingress[0]).parse().unwrap())
-                    .unwrap();
-                node
+                Node::open(data(1), config).unwrap()
             })
             .join()
             .unwrap()

@@ -1,12 +1,12 @@
 //! `drive-local`: one driver's share of the load model, open loop. A
 //! planning thread draws the operations in time order and signs each ahead
 //! of its scheduled send; the sending thread sends each at its time, one
-//! attempt, over at most the plan's connections a node, and counts every
+//! attempt, over one QUIC connection a node, and counts every
 //! refusal by its kind. A user's calls go one at a time in its session, in
 //! order: one scheduled while the last is unanswered waits for it, its
 //! latency still timed from its schedule. Every interval a line a kind goes
 //! to the record, and a line for the mix with the driver's own counts: its
-//! CPU, the waits for a connection and the most in use.
+//! CPU and the most requests in flight on one node's connection.
 
 mod pool;
 mod routes;
@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use smol::{LocalExecutor, Timer};
+use vos_api::Kind as ApiKind;
 use vos_node::client::{Target, signed_workflow_read, workflow_read_not_after};
 use vos_wire::Encode;
 use vos_wire::ids::{AgentId, InstanceId, WorkflowId};
@@ -41,9 +42,6 @@ use pool::{Pool, PoolStats};
 use session::{Agent, Body, Fate, Methods, Op, ShardCounts, Shared, fate};
 use stats::{KindStats, REPORTED, Stats, cpu_seconds, mix_line, refusal, thread_seconds};
 
-/// The most connections a driver keeps to one node, unless its plan says
-/// otherwise.
-pub const MAX_CONNECTIONS: usize = 512;
 /// How far ahead of its schedule an operation is signed.
 const LOOKAHEAD: Duration = Duration::from_millis(500);
 /// How early an operation may go rather than wait for a timer. It is timed
@@ -52,16 +50,10 @@ const LOOKAHEAD: Duration = Duration::from_millis(500);
 const EARLY: Duration = Duration::from_micros(200);
 /// The least the planning thread sleeps once far enough ahead.
 const PLAN_NAP: Duration = Duration::from_millis(50);
-/// How long one request may take before the driver counts it failed:
-/// past it, a reaper that wakes every [`REAP`] closes its connection. A
-/// timer a request would cost as much as the request, at the driver's
-/// rates.
+/// How long one request may take before the driver counts it failed.
 const ANSWER: Duration = Duration::from_secs(30);
-const REAP: Duration = Duration::from_secs(1);
 /// How long a node that failed a request is left out of the routes.
 const BACKOFF: Duration = Duration::from_secs(2);
-/// Connections opened to each node before the load starts.
-const WARM: usize = 64;
 /// How long a read of a workflow waits for it to end.
 const WORKFLOW_WAIT_MS: u64 = 2_000;
 /// A read at a cut, once its window closed: a jitter before the first
@@ -241,7 +233,9 @@ impl Engine {
                 .borrow()
                 .query(op.agent, &agent.replicas, op.user, Instant::now()),
         };
-        let answer = self.pools[node].post(&agent.paths[1], body, ANSWER).await;
+        let answer = self.pools[node]
+            .post(ApiKind::Query, agent.id, body, ANSWER)
+            .await;
         if !self.probe && unserved(&answer) {
             self.routes
                 .borrow_mut()
@@ -263,7 +257,9 @@ impl Engine {
             true => self.elsewhere(op.agent),
             false => self.routes.borrow().call(op.agent),
         };
-        let answer = self.pools[node].post(&agent.paths[0], signed, ANSWER).await;
+        let answer = self.pools[node]
+            .post(ApiKind::Call, agent.id, signed, ANSWER)
+            .await;
         // A probe's calls are refused before they reach a session: its
         // sequences go on as if each ran, as they would at the leader.
         let fate = match self.probe {
@@ -385,7 +381,8 @@ impl Engine {
         };
         let answer = self.pools[node]
             .post(
-                &agent.paths[2],
+                ApiKind::Workflow,
+                agent.id,
                 &read,
                 ANSWER + Duration::from_millis(wait_ms),
             )
@@ -490,8 +487,6 @@ impl Engine {
 
 /// A line's counts of the driver's connections.
 fn pool_fields(line: &mut serde_json::Value, pooled: &PoolStats) {
-    line["conn_waits"] = pooled.waits.into();
-    line["conn_wait_p99_us"] = pooled.wait.quantile(0.99).into();
     line["in_use_max"] = pooled.in_use_max.into();
 }
 
@@ -499,10 +494,11 @@ fn pool_fields(line: &mut serde_json::Value, pooled: &PoolStats) {
 /// a kind every interval, then the totals and the mix as sent.
 pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
     plan.model.validate(plan.shards.len())?;
+    let client = crate::keys::hex32(&plan.driver_key)?;
     let targets = plan
         .nodes
         .iter()
-        .map(target)
+        .map(|node| target(node, client))
         .collect::<Result<Vec<_>, _>>()?;
     let reading = plan.model.readers > 0.0;
     let idle: &[Placed] = if reading { &plan.idle } else { &[] };
@@ -545,26 +541,16 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
     if identity.is_none() {
         model.identity_hz = 0.0;
     }
-    // Over the node API, one QUIC connection a node as the drivers' key;
-    // else HTTPS connections, as many as the plan allows.
-    let pools = match &plan.driver_key {
-        Some(seed) => {
-            let client = crate::keys::hex32(seed)?;
-            plan.nodes
-                .iter()
-                .map(|node| Pool::quic(&node.api, crate::keys::hex32(&node.key)?, client))
-                .collect::<Result<Vec<_>, String>>()?
-        }
-        None => targets
-            .iter()
-            .map(|target| Pool::new(target, plan.connections))
-            .collect::<Result<Vec<_>, _>>()?,
-    };
+    let pools = plan
+        .nodes
+        .iter()
+        .map(|node| Pool::quic(&node.api, crate::keys::hex32(&node.key)?, client))
+        .collect::<Result<Vec<_>, String>>()?;
     let mut file =
         std::fs::File::create(out).map_err(|error| format!("{}: {error}", out.display()))?;
     let secs = plan.secs as f64;
     let (sender, receiver) = smol::channel::unbounded::<Op>();
-    // The load starts once the sending thread opened its first connections:
+    // The load starts once the sending thread opened its connections:
     // its start, and its start in ms since the epoch.
     let (started, starting) = std::sync::mpsc::channel::<(Instant, u64)>();
     let (ready, planned_ready) = std::sync::mpsc::channel::<()>();
@@ -638,7 +624,6 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
         let mut load_cpu = 0.0;
         smol::block_on(ex.run(async {
             let warming: Vec<_> = (0..engine.pools.len())
-                .flat_map(|node| (0..WARM.min(plan.connections)).map(move |_| node))
                 .map(|node| {
                     let engine = Rc::clone(&engine);
                     ex.spawn(async move { engine.pools[node].warm().await })
@@ -665,18 +650,6 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
                     }
                 }
             };
-            let reaper = {
-                let engine = Rc::clone(&engine);
-                async move {
-                    loop {
-                        Timer::after(REAP).await;
-                        for pool in &engine.pools {
-                            pool.reap();
-                        }
-                    }
-                }
-            };
-            let reporter = smol::future::or(reporter, reaper);
             let load = async {
                 while let Ok(op) = receiver.recv().await {
                     if op.due > Instant::now() + EARLY {
@@ -719,7 +692,6 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
         total["active_users"] = load::Plan::new(&model, &users, plan.driver, plan.drivers)
             .slots()
             .into();
-        total["connections"] = plan.connections.into();
         pool_fields(&mut total, &engine.pooled.borrow());
         {
             let counts = shared.counts.lock().expect("counts");

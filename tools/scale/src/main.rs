@@ -550,11 +550,9 @@ fn run(cli: Cli) -> Result<(), String> {
                 .map(|()| {
                     // The gateway's cost, a row of its own, while the
                     // nodes still run.
-                    if inventory.harness.transport == inventory::Transport::Api {
-                        match gateway::measure(&inventory, &run) {
-                            Ok(cost) => eprintln!("{}", cost.line()),
-                            Err(error) => eprintln!("the gateway's cost: {error}"),
-                        }
+                    match gateway::measure(&inventory, &run) {
+                        Ok(cost) => eprintln!("{}", cost.line()),
+                        Err(error) => eprintln!("the gateway's cost: {error}"),
                     }
                 });
             let stopped = nodes::down(&inventory);

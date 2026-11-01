@@ -113,11 +113,10 @@ pub struct DriverSummary {
     /// The mix as sent against its target: the worst share's distance.
     pub mix_error: f64,
     pub mix: serde_json::Value,
-    /// Requests that waited for a connection, the most in use at once on
-    /// one node, and the cap a node.
-    pub conn_waits: u64,
+    /// The most requests in flight at once on one node's connection, and
+    /// the nodes' cap on them (`api_in_flight`).
     pub in_use_max: u64,
-    pub connections: u64,
+    pub in_flight_cap: u64,
     /// Each shard's distinct users and the sessions opened at it.
     pub shard_users: Vec<u64>,
     pub shard_sessions: Vec<u64>,
@@ -216,6 +215,16 @@ fn every_s(run: &Run) -> u64 {
         .map_or(10, |every| every.max(1) as u64)
 }
 
+/// The most requests in flight on one connection of a node's API, as the
+/// run's inventory sets it: the node's default when unset.
+fn api_in_flight(run: &Run) -> u64 {
+    std::fs::read_to_string(run.file("inventory.toml"))
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|table| table.get("node")?.get("api_in_flight")?.as_integer())
+        .map_or(1_024, |cap| cap.max(1) as u64)
+}
+
 /// Summarise `run` over `window` (milliseconds since the epoch), the
 /// drivers' span when `None`; written to the run's `summary.json` and
 /// `report.txt`.
@@ -306,8 +315,9 @@ pub fn report(
             .push(node_summary(number, &polls, window, &hosts_of, &mut terms));
     }
     summary.leader_changes = terms.values().map(|(low, high)| high - low).sum();
+    let in_flight_cap = api_in_flight(run);
     for (name, lines) in &records {
-        let driver = driver_summary(name, lines, &mut summary.warnings);
+        let driver = driver_summary(name, lines, in_flight_cap, &mut summary.warnings);
         summary.rate += driver.rate;
         summary.drivers.push(driver);
     }
@@ -470,10 +480,12 @@ fn node_summary(
 fn driver_summary(
     name: &str,
     lines: &[serde_json::Value],
+    in_flight_cap: u64,
     warnings: &mut Vec<String>,
 ) -> DriverSummary {
     let mut driver = DriverSummary {
         name: name.to_string(),
+        in_flight_cap,
         ..DriverSummary::default()
     };
     let totals: Vec<&serde_json::Value> =
@@ -503,9 +515,7 @@ fn driver_summary(
         driver.mix = total["mix"].clone();
         driver.mix_error = total["mix"]["worst_error"].as_f64().unwrap_or(0.0);
         driver.cores = total["load_cores"].as_f64().unwrap_or(0.0);
-        driver.conn_waits = total["conn_waits"].as_u64().unwrap_or(0);
         driver.in_use_max = total["in_use_max"].as_u64().unwrap_or(0);
-        driver.connections = total["connections"].as_u64().unwrap_or(0);
         driver.shard_users =
             serde_json::from_value(total["shard_users"].clone()).unwrap_or_default();
         driver.shard_sessions =
@@ -519,10 +529,10 @@ fn driver_summary(
         driver.by_error = serde_json::from_value(total["by_error"].clone()).unwrap_or_default();
         driver.late_us = total["late_us"].as_u64().unwrap_or(0);
         let sent = total["sent"].as_u64().unwrap_or(0);
-        if driver.conn_waits as f64 > LATE_SHARE * sent as f64 {
+        if driver.in_use_max >= in_flight_cap {
             warnings.push(format!(
-                "driver {name}: {} of its {sent} requests waited for a connection, {} at once in use at most of {} a node: the pool bound; raise [harness] driver_connections with [node] ingress_connections",
-                driver.conn_waits, driver.in_use_max, driver.connections
+                "driver {name}: {} requests in flight at once on one node's connection, the nodes' cap of {in_flight_cap}: the stream bound; raise [node] api_in_flight",
+                driver.in_use_max
             ));
         }
         driver.late_share = total["late_sends"].as_u64().unwrap_or(0) as f64 / sent.max(1) as f64;

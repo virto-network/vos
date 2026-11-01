@@ -201,8 +201,8 @@ pub enum Rejection {
     /// `now`: start one with a time near it.
     #[codec(index = 5)]
     StaleSession { now: u64 },
-    /// An operator command without the node's admin token, or signed by a
-    /// key the node does not list.
+    /// An operator command unsigned, or signed by a key the node does not
+    /// list.
     #[codec(index = 6)]
     Unauthorized,
     #[codec(index = 7)]

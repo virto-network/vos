@@ -1,6 +1,7 @@
 //! Node processes, each a `vos node run` of the `vos` binary a test
 //! names, with its own data directory, ports, log and faults file, joined
-//! through a relay the test controls, served in the clear or over TLS.
+//! through a relay the test controls, their clients on their API's
+//! sockets or through a gateway.
 
 mod faults;
 mod front;
@@ -18,13 +19,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use vos_node::client::{Operator, Target};
-use vos_node::tls::Trust;
 use vos_wire::ids::AgentId;
 use vos_wire::ingress::{ReplicaStatus, Response};
 use vos_wire::peer::NodeNumber;
 
 use crate::programs::agent_elf;
-use crate::spaces::{HeldPort, free_tcp_port, free_udp_port};
+use crate::spaces::{HeldPort, free_udp_port};
 use crate::{Log, Nodes, wait_until};
 use relay::Relay;
 
@@ -58,17 +58,17 @@ impl Drop for Running {
     }
 }
 
-/// A node that started: the address it listens on, and its key in hex.
+/// A node that started: its key in hex, and its API's socket.
 pub struct Started {
     pub running: Running,
-    pub address: String,
     pub key: String,
+    pub socket: PathBuf,
 }
 
 /// Start `vos node run` of the binary `vos` with `args`, the default
 /// agent, `faults` as its faults file, and pinned to `cpus` (as `taskset
-/// -c` lists them) if given: the node, once it printed its address and
-/// key, or `None` if it exited first. Its stderr goes to `log`, appended
+/// -c` lists them) if given: the node, once it printed its key and its
+/// API's socket, or `None` if it exited first. Its stderr goes to `log`, appended
 /// to; its stdout is read to the end, so the node never writes to a
 /// closed pipe.
 pub fn run(
@@ -111,7 +111,7 @@ pub fn run(
             let _ = lines.send(line);
         }
     });
-    let Ok(listening) = read.recv_timeout(PROCESS_WAIT) else {
+    let Ok(named) = read.recv_timeout(PROCESS_WAIT) else {
         // Where a node that never says it listens is: each thread's name,
         // state and kernel wait, which /proc shows without tracing it.
         let threads = std::fs::read_dir(format!("/proc/{}/task", running.pid()))
@@ -138,23 +138,23 @@ pub fn run(
         let _ = std::fs::write(log.with_extension("stuck"), threads);
         return None;
     };
-    let address = listening.strip_prefix("listening on ")?.to_string();
-    let key = read
+    let key = named.strip_prefix("node ")?.to_string();
+    let socket = read
         .recv_timeout(PROCESS_WAIT)
         .ok()?
-        .strip_prefix("node ")?
-        .to_string();
+        .strip_prefix("api on ")?
+        .into();
     Some(Started {
         running,
-        address,
         key,
+        socket,
     })
 }
 
 /// The key, in hex, a first run of `vos` alone makes at `data`, logging
 /// to `log`.
 pub fn first_run(vos: &Path, data: &Path, log: &Path) -> String {
-    let args = ["--data", data.to_str().unwrap(), "--listen", "127.0.0.1:0"];
+    let args = ["--data", data.to_str().unwrap()];
     run(vos, &args, log, None, None)
         .unwrap_or_else(|| panic!("a node alone starts: {}", read_log(log)))
         .key
@@ -166,7 +166,7 @@ pub fn read_log(log: &Path) -> String {
 }
 
 /// A space file's text: a line for each of `nodes`, numbered from 1, of
-/// its key in hex, its peer address and its ingress URL.
+/// its key in hex, its peer address and its contact.
 pub fn space_file<'a>(nodes: impl IntoIterator<Item = (&'a str, SocketAddr, &'a str)>) -> String {
     nodes
         .into_iter()
@@ -175,26 +175,9 @@ pub fn space_file<'a>(nodes: impl IntoIterator<Item = (&'a str, SocketAddr, &'a 
         .collect()
 }
 
-/// Where the node at `url` is reached: pinned to its key, `key` in hex,
-/// over `tls`; else on a loopback address in the clear.
-pub fn target(url: &str, key: &str, tls: bool) -> Target {
-    let trust = if tls {
-        let mut pinned = [0; 32];
-        hex::decode_to_slice(key, &mut pinned).unwrap();
-        Trust::NodeKey(pinned)
-    } else {
-        Trust::Loopback
-    };
-    Target::new(url, trust).unwrap()
-}
-
 /// How the nodes run.
 #[derive(Clone, Default)]
 pub struct Options {
-    /// TLS on the ingress, clients pinning the nodes' keys.
-    pub tls: bool,
-    /// Clients reach the nodes over the node API's sockets, not HTTP.
-    pub api: bool,
     /// A gateway in front of the nodes' sockets, which clients may reach
     /// over HTTP ([`Processes::gateway`]).
     pub gateway: bool,
@@ -220,7 +203,7 @@ struct Slot {
     /// Its operator, with the start it was made for: kept, so that what
     /// polls the node goes on one connection.
     operator: Mutex<Option<(u64, Arc<Operator>)>>,
-    /// Its ports, held from its kill to its restart.
+    /// Its peer port, held from its kill to its restart.
     held: Mutex<Vec<HeldPort>>,
 }
 
@@ -232,7 +215,6 @@ pub struct Processes {
     pub dir: tempfile::TempDir,
     pub count: usize,
     keys: Vec<String>,
-    ingress: Vec<u16>,
     bound: Vec<SocketAddr>,
     pub relay: Relay,
     slots: Vec<Slot>,
@@ -273,9 +255,10 @@ impl Processes {
         self.dir.path().join(format!("node-{number}.faults"))
     }
 
+    /// Node `number`'s contact in the space file, which redirects carry
+    /// and no process serves.
     pub(crate) fn url(&self, number: usize) -> String {
-        let scheme = if self.options.tls { "https" } else { "http" };
-        format!("{scheme}://127.0.0.1:{}", self.ingress[number - 1])
+        format!("http://node-{number}")
     }
 
     /// The gateway in front of every node, over HTTP, when the options
@@ -284,7 +267,7 @@ impl Processes {
         self.front.as_ref().map(|front| &front.target)
     }
 
-    /// Where node `number`'s ingress is reached.
+    /// Node `number`'s API's socket, as clients reach it.
     pub fn target(&self, number: usize) -> &Target {
         &self.targets[number - 1]
     }
@@ -356,24 +339,18 @@ impl Processes {
             })
             .collect();
         for _attempt in 0..5 {
-            let ingress: Vec<u16> = (0..count).map(|_| free_tcp_port()).collect();
             let bound: Vec<SocketAddr> = (0..count)
                 .map(|_| format!("127.0.0.1:{}", free_udp_port()).parse().unwrap())
                 .collect();
             let relay = Relay::start(&bound).expect("the relay starts");
-            let scheme = if options.tls { "https" } else { "http" };
-            let urls: Vec<String> = ingress
-                .iter()
-                .map(|port| format!("{scheme}://127.0.0.1:{port}"))
+            let urls: Vec<String> = (1..=count)
+                .map(|number| format!("http://node-{number}"))
                 .collect();
             let nodes = (0..count).map(|at| (&*keys[at], relay.listed(at + 1), &*urls[at]));
             std::fs::write(dir.path().join("space"), space_file(nodes)).unwrap();
-            let targets = (0..count)
-                .map(|at| match options.api {
-                    true => {
-                        Target::socket(dir.path().join(format!("node-{}", at + 1)).join("api.sock"))
-                    }
-                    false => target(&urls[at], &keys[at], options.tls),
+            let targets = (1..=count)
+                .map(|number| {
+                    Target::socket(dir.path().join(format!("node-{number}")).join("api.sock"))
                 })
                 .collect();
             let processes = Processes {
@@ -381,7 +358,6 @@ impl Processes {
                 dir,
                 count,
                 keys: keys.clone(),
-                ingress,
                 bound,
                 relay,
                 slots: (0..count).map(|_| Slot::default()).collect(),
@@ -424,26 +400,20 @@ impl Processes {
 
     fn launch(&self, number: usize) -> Option<Running> {
         let data = self.data(number);
-        let listen = format!("127.0.0.1:{}", self.ingress[number - 1]);
         let space = self.dir.path().join("space");
         let bind = self.bound[number - 1].to_string();
         let faults = self.faults_file(number);
         if !faults.exists() {
             self.write_faults(number);
         }
-        let mut args = vec![
+        let args = vec![
             "--data",
             data.to_str().unwrap(),
-            "--listen",
-            &listen,
             "--space",
             space.to_str().unwrap(),
             "--peer-bind",
             &bind,
         ];
-        if self.options.tls {
-            args.extend(["--tls", "--tls-name", "127.0.0.1"]);
-        }
         self.slot(number).held.lock().unwrap().clear();
         let started = run(
             &self.vos,
@@ -458,14 +428,11 @@ impl Processes {
 
     /// Kill node `number` with SIGKILL, clearing its own faults: a fault
     /// left in place would meet its restart. Every node's clock offset
-    /// stays, and its ports are held until it restarts.
+    /// stays, and its peer port is held until it restarts.
     pub fn kill(&self, number: usize) {
         self.end(number);
         let slot = self.slot(number);
-        *slot.held.lock().unwrap() = vec![
-            HeldPort::tcp(SocketAddr::from(([127, 0, 0, 1], self.ingress[number - 1]))),
-            HeldPort::udp(self.bound[number - 1]),
-        ];
+        *slot.held.lock().unwrap() = vec![HeldPort::udp(self.bound[number - 1])];
         slot.paused.store(false, Ordering::SeqCst);
         slot.faults.lock().unwrap().clear();
         slot.jump.store(0, Ordering::SeqCst);

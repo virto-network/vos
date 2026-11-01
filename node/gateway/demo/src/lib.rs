@@ -74,7 +74,7 @@ impl LocalSpace {
                 number: 1,
                 key,
                 peer,
-                ingress: "http://127.0.0.1:1".into(),
+                contact: "http://127.0.0.1:1".into(),
             }])?;
             let genesis = space.found(WindowClock::DEFAULT, vos_node::wall_clock(), random())?;
             space.with_genesis(genesis)?

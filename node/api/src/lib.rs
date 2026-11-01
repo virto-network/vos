@@ -25,9 +25,9 @@ const AGENT: u32 = 4;
 /// the nonce 16, the expiry 8, the inner body's length 4 and the
 /// signature 64.
 pub const OPERATED: u32 = 156;
-/// A client request's body as the HTTP ingress takes it.
+/// A client request's body as a gateway's HTTP takes it.
 const REQUEST: u32 = (cap::REQUEST + ENVELOPE) as u32;
-/// An install's body as the HTTP ingress takes it.
+/// An install's body as a gateway's HTTP takes it.
 const INSTALL: u32 = (cap::MAX_ELF + ENVELOPE) as u32;
 /// An operator read's inner body, at most: an agent, with room to spare.
 const OPERATOR_READ: u32 = ENVELOPE as u32;

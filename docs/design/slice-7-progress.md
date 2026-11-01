@@ -6887,3 +6887,125 @@ jobs, no incremental builds):
 - Not run, because the disk was at its floor: `just test-gateway-ssh`
   (the demo's split is linted by `cargo clippy -p vos-gateway --features
   ssh`, which is clean) and `just check-blobs`.
+
+## Step 7.10b, C10: the node's HTTP deleted
+
+Branch `s7/7.10b-c10`, from vos-core `26acae03f`. S50's gate is met:
+7.6's runs are done (7.6e and the M3.9 scale report,
+`research/slice-7/scale-report.md`), and 7.23 reruns scale run 3 on the
+final build over the node API, both recorded. The node keeps its binary
+API alone (S41); every operator command is signed (S46).
+
+**Deleted** from the node:
+- its HTTP server (`node/host/src/ingress.rs`) and `Node::serve`; `vos
+  node run`'s `--listen`, `--tls`, `--tls-name`, `--tls-cert` and
+  `--tls-key`; `Config::ingress_tls` and `ingress_connections`, and the
+  TOML's `ingress_connections`; `vos node run` prints `node <key>` then
+  `api on <socket>` (and `api on quic://…` with `api_listen`);
+- `admin.token` (`ADMIN_TOKEN`), its writing, and the bare operator body
+  it admitted: `api::Via` is gone, `api::handle` takes no transport, and
+  every request counts among the API's frames;
+- the client's token operator (`Operator::new`, `Operator::within`):
+  `Operator::signing` and `signing_within` remain;
+- the node's server use of `vos-http` (its server, route translation and
+  public TLS); `vos-http`'s `Authorization::Bearer` (a bearer header
+  reads as unreadable, 401 at the gateway, as before);
+- the node's unused `futures-rustls`, `rcgen` and `subtle`.
+`vos-node` still depends on `vos-http` for its client alone (HTTP to a
+gateway, the route table its API requests are translated by) and the
+runtime-neutral `timeout` that 7.23b's fold shares.
+
+**Moved:**
+- **The gateway's differential test** (`node/gateway/tests/gateway/routes.rs`):
+  its corpus run through the gateway alone, each request's status and
+  body pinned to what both fronts answered at `26acae03f` (the masked
+  answers; the node's key, time, record and schema checked as such).
+  Two fixes on the way: "a first call" opens its session at the node's
+  time (it answered `StaleSession` once the run passed a minute), and "an
+  operator's route, signed for another agent" signs for another agent
+  (it signed for the path's own).
+- **A head past 16 KiB** was taken when the read that completed it
+  brought it past the limit (the check ran only on a partial head):
+  `vos-http` now answers 431 either way, as `node-api.md` says; pinned.
+- **The client's TLS tests** (`ingress_tls.rs`) through the gateway
+  (`tests/gateway/tls.rs`): pinning its key, a CA, plain HTTP refused at
+  a TLS front, `localhost` without a resolver, a kept connection across
+  the gateway's restart; the address-and-trust table a unit test of
+  `client::target`.
+- **The host's tests** over the API's socket: `ingress` (operators
+  signing with a listed key, a stranger's key refused; pipelined calls
+  as frames on one connection; the HTTP-only refusals, 413 and 411 and
+  the envelope in a header, are the gateway corpus's), `served` (every
+  seed on the sockets, the clients routed by key; a down node fails a
+  request at once), `cluster`'s query at a follower, and the credentialed
+  size refusals from the head through a gateway.
+- **The carrier audit** (`just test-carriers`): the node's HTTP carriers
+  gone, the gateway's kept.
+- **The checker's processes**: the `tls` and `api` options gone, clients
+  on the sockets (or the gateway, `Options::gateway`); the space file
+  names `http://node-N`, which redirects carry and no process serves.
+  The fault suite's seed picks only the pacing; its TLS bit is gone.
+- **`vos`** (`node/cli`): `--node` has no default; an operator command
+  reaches the socket in `--data` unless told otherwise; `https://` pins
+  a gateway by `--gateway-key` (or `--ca`), `--node-key` is QUIC's. The
+  CLI's tests run over the socket and QUIC (the TLS test became
+  `an_operator_reaches_a_node_over_quic_by_its_key`).
+- **The processes bench** (T1's driver): calls and queries as API frames
+  on each node's socket; `TLS=1` is gone.
+- **`vos-scale`**: the drivers and the coordinator over each node's API
+  QUIC alone, as the deployed driver key: the pool's HTTP(S) path gone
+  (`Pool::post` sends kinds), `Plan.driver_key` required, the operator
+  and `up`'s wait over QUIC; the node's unit and first run without
+  `--listen`/`--tls`; the space file's contact each node's `quic://` API,
+  which the drivers' redirects match. An inventory names `api` (UDP, now
+  required) where it named `ingress`; `[harness] transport` and
+  `driver_connections` are gone, and `[node] ingress_connections` is
+  refused with a hint (compumax's inventory needs `ingress = N` → `api =
+  N + 1000`, the old default, and a fresh `deploy`). The pool's report
+  keeps its streams in flight at most, warned against `api_in_flight`.
+  The agents' readers share one client a node and the identity writers
+  are four, under the node's eight handshakes at once from one address.
+- **The space file's last column** is each node's contact, the address
+  redirects carry: a gateway's URL, or the node API's `quic://` address
+  (`SpaceNode::contact`, was `ingress`). A client trusting no gateway
+  refuses an `https://` contact rather than pinning a node's key a
+  gateway's certificate cannot hold.
+- **Docs:** `node-api.md` (C10 done, the "until C10" hedges gone),
+  `core-model.md` (open question 18, and T1's row: measured over HTTP,
+  re-measured over the API at 7.23), `node/SECURITY.md` (the node's
+  surface; HTTP only at a gateway), `docs/operations.md` (reaching a
+  node), `proving.md` and `identity-and-authority.md` (the audit's
+  transports).
+
+Not in this repository: a Dockerfile, a compose file or a smoke test.
+`just e2e-chain` reaches no node HTTP (its clusters run in process), so
+it was not run; its test builds (`--features chain`).
+
+**Gates** (12 GiB scope, `nice -n 10`, 8 jobs, no incremental builds):
+- `just check` at `2ff1caf21`: exit 0, 1,698 passed in 124 suites
+  (7.23b's 1,705 less the node's HTTP-only tests), `vos-scale`'s among
+  them.
+- `just test-carriers` at `2796df149`: exit 0 (its first run counted the
+  sign-in over the node's HTTP among the calls applied: one fewer now).
+- `just test-gateway-ssh` at `2796df149`: exit 0, 23 passed.
+- `vos-node --features chain` builds its tests; `just e2e-chain` not run
+  (no node HTTP in it, and it needs PolkaJam).
+
+**Review (Opus):** no authority leak: every operator kind goes through
+the signed envelope's checks, and nothing admits a bare body or a token.
+Folded: M1 (an `https://` contact followed with no gateway pin is
+refused, not pinned to the node's key), M2 (the space file's contact
+column named once, `SpaceNode::contact`), M3 and M4 (the scale
+harness's identity writers follow redirects and dial four connections,
+not eight), M5 (`[node] ingress_connections` refused), M6 (the unread
+answers test named for what it tests), M8 (`vos` through a gateway), L9
+(`Target::tls`, the TCP port hold and `free_tcp_port` gone), L10, L11,
+L12, L13 (the fault suite's mode by the seed's parity), L14. Left: M7
+(the scale pool's tests of a dead node and of one connection a node,
+QUIC's to write), L15 (the 431 fix's unit test; the gateway corpus pins
+it).
+
+**Commits:** `fe131b9c3` (gateway tests), `a3521a741` (vos-http's 431),
+`838d4f382` (the node's HTTP deleted, its clients moved), `ded9cd397`
+(`vos-scale`), `77be3da50` (docs), `2ff1caf21` (the review folded),
+`2796df149` (the carrier audit's count).

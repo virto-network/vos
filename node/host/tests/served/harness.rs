@@ -1,16 +1,15 @@
-//! Three nodes on a hub, each serving its ingress at an address the space
-//! names, so redirects reach it: the cluster the HTTP tests share, with
+//! Three nodes on a hub, each serving its API's socket, which clients
+//! reach by the node's key: the cluster the served tests share, with
 //! hooks that stop a leader between its apply and its answer, or hold a
 //! node's refines or commits, and a clock offset per node.
 
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use vos_checker::hooks::Gate;
 use vos_checker::programs::agent;
-use vos_checker::spaces::{HeldPort, free_tcp_port, space};
+use vos_checker::spaces::space;
 use vos_checker::{Log, Nodes};
 use vos_net::memory::Hub;
 use vos_node::client::Target;
@@ -53,11 +52,10 @@ impl Hooks for Trip {
     }
 }
 
-/// One node's slot: its node while it runs, its ingress port held while
-/// it does not, how often it started, its hook and its clock's offset.
+/// One node's slot: its node while it runs, how often it started, its hook
+/// and its clock's offset.
 pub struct Slot {
     node: Mutex<Option<Arc<Node>>>,
-    held: Mutex<Option<HeldPort>>,
     starts: AtomicU64,
     /// Messages its earlier runs sent across nodes.
     pub sent_across: AtomicU64,
@@ -66,7 +64,6 @@ pub struct Slot {
     pub trip: Arc<Trip>,
     pub offset: Arc<AtomicI64>,
     dir: tempfile::TempDir,
-    ingress: SocketAddr,
 }
 
 /// [`NODES`] nodes on a hub whose losses follow its seed.
@@ -75,8 +72,7 @@ pub struct Cluster {
     pub space: Space,
     agent: Vec<u8>,
     slots: Vec<Slot>,
-    /// Each node, as clients reach it: its HTTP ingress, or its API's
-    /// socket.
+    /// Each node, as clients reach it: its API's socket.
     targets: Vec<Target>,
     /// What happened: printed, so a run shows what it tried, and the
     /// latest events, for a failure to show what led to it.
@@ -103,14 +99,9 @@ impl Cluster {
         let agent = agent();
         let dirs: Vec<tempfile::TempDir> =
             (1..=NODES).map(|_| tempfile::tempdir().unwrap()).collect();
-        // Below the ephemeral range, so no client's connection takes one
-        // while its node is down.
-        let ingresses: Vec<SocketAddr> = (1..=NODES)
-            .map(|_| SocketAddr::from(([127, 0, 0, 1], free_tcp_port())))
-            .collect();
-        let mut space = space(&agent, &dirs, |number| {
-            format!("http://{}", ingresses[usize::from(number) - 1])
-        });
+        // The space's gateways, which its nodes name in their redirects:
+        // none serves, the clients reaching each node by its key.
+        let mut space = space(&agent, &dirs, |number| format!("http://node-{number}"));
         if let Some(clock) = clock {
             let mut genesis = space
                 .found(WindowClock::DEFAULT, vos_node::wall_clock(), [11; 16])
@@ -120,28 +111,19 @@ impl Cluster {
         }
         let slots: Vec<Slot> = dirs
             .into_iter()
-            .zip(ingresses)
-            .map(|(dir, ingress)| Slot {
+            .map(|dir| Slot {
                 node: Mutex::new(None),
-                held: Mutex::new(None),
                 starts: AtomicU64::new(0),
                 sent_across: AtomicU64::new(0),
                 installed: AtomicU64::new(0),
                 trip: Arc::new(Trip::default()),
                 offset: Arc::new(AtomicI64::new(0)),
                 dir,
-                ingress,
             })
             .collect();
-        // Clients reach the nodes over HTTP on even seeds and over the node
-        // API's sockets on odd ones: one table run two ways.
-        let api = !seed.is_multiple_of(2);
         let targets = slots
             .iter()
-            .map(|slot| match api {
-                true => Target::socket(slot.dir.path().join("api.sock")),
-                false => Target::loopback(&format!("http://{}", slot.ingress)).unwrap(),
-            })
+            .map(|slot| Target::socket(slot.dir.path().join("api.sock")))
             .collect();
         let offset = Arc::new(AtomicI64::new(0));
         let venue_offset = Arc::clone(&offset);
@@ -215,23 +197,13 @@ impl Cluster {
             )
         });
         let node = Node::open(slot.dir.path(), config).unwrap();
-        // Its port, held while it was down, let go of just before it binds
-        // it: only a moment's bind elsewhere, as another process's probe
-        // for a free port, still waits.
-        drop(slot.held.lock().unwrap().take());
-        let until = Instant::now() + Duration::from_secs(5);
-        while let Err(error) = node.serve(slot.ingress) {
-            assert!(Instant::now() < until, "node {number}: {error:?}");
-            std::thread::sleep(Duration::from_millis(10));
-        }
         node.serve_socket(&slot.dir.path().join("api.sock"), 0o600)
             .unwrap();
         slot.starts.fetch_add(1, Ordering::SeqCst);
         *slot.node.lock().unwrap() = Some(Arc::new(node));
     }
 
-    /// Stop node `number`, holding its ingress port until it starts
-    /// again.
+    /// Stop node `number`.
     pub fn stop(&self, number: NodeNumber) {
         let slot = self.slot(number);
         let Some(mut node) = slot.node.lock().unwrap().take() else {
@@ -252,18 +224,12 @@ impl Cluster {
         slot.installed
             .fetch_add(node.snapshots_installed(), Ordering::SeqCst);
         node.shutdown();
-        *slot.held.lock().unwrap() = Some(HeldPort::tcp(slot.ingress));
     }
 
-    /// Node `number`'s data directory: the carrier audit's.
+    /// Node `number`'s data directory, which holds its API's socket.
     #[allow(dead_code)]
     pub fn dir(&self, number: NodeNumber) -> &std::path::Path {
         self.slot(number).dir.path()
-    }
-
-    /// Node `number`'s ingress address.
-    pub fn ingress(&self, number: NodeNumber) -> SocketAddr {
-        self.slot(number).ingress
     }
 
     pub fn node(&self, number: NodeNumber) -> Option<Arc<Node>> {
@@ -319,7 +285,7 @@ impl Nodes for Cluster {
         self.space
             .nodes()
             .iter()
-            .find(|node| node.ingress == address)
+            .find(|node| node.contact == address)
             .map(|node| node.number)
     }
 
@@ -416,14 +382,12 @@ pub fn query(
     ))
 }
 
-/// While a node is down its ingress port is held: no other listener takes
-/// it, and a request there fails at once rather than waiting out its
-/// answer's deadline. Started again, the node serves there.
+/// A request to a down node fails at once rather than waiting out its
+/// answer's deadline. Started again, the node serves on its socket.
 #[test]
-fn a_down_nodes_port_takes_no_other_listener() {
+fn a_down_node_fails_a_request_at_once_and_serves_again() {
     let cluster = Cluster::new(1);
     cluster.stop(3);
-    assert!(std::net::TcpListener::bind(cluster.ingress(3)).is_err());
     let asked = Instant::now();
     assert!(vos_node::client::node_id(cluster.target(3)).is_err());
     assert!(

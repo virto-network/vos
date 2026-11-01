@@ -41,7 +41,7 @@ fn vos_fails(args: impl IntoIterator<Item: AsRef<OsStr>>) -> String {
 }
 
 /// `vos install` of `elf` as `agent`'s `instance`, at the node at `url`
-/// whose data directory is `data`.
+/// (its API's socket, `unix:PATH`) whose data directory is `data`.
 fn install(url: &str, data: &str, agent: &str, instance: &str, elf: &Path) -> Vec<String> {
     let elf = elf.to_str().unwrap();
     [
@@ -95,8 +95,8 @@ impl Client<'_> {
 /// prints its log.
 struct Node {
     running: Running,
-    address: String,
     key: String,
+    socket: PathBuf,
     log: PathBuf,
 }
 
@@ -109,29 +109,36 @@ impl Drop for Node {
     }
 }
 
-/// `vos node run` with `args`, its log in `dir`: once it listens.
+/// `vos node run` with `args`, its log in `dir`: once it serves its API.
 fn node_run(dir: &Path, args: &[&str]) -> Node {
     let log = dir.join("node.log");
     let Started {
         running,
-        address,
         key,
+        socket,
     } = run(Path::new(VOS), args, &log, None, None)
         .unwrap_or_else(|| panic!("the node starts: {}", read_log(&log)));
     Node {
         running,
-        address,
         key,
+        socket,
         log,
     }
 }
 
+impl Node {
+    /// Its API's socket, as `--node` names it.
+    fn url(&self) -> String {
+        format!("unix:{}", self.socket.display())
+    }
+}
+
 /// A node of its own in `dir`, its data directory `dir/node`: the node,
-/// its data directory and its URL.
+/// its data directory and its API's address.
 fn single_node(dir: &Path) -> (Node, String, String) {
     let data = dir.join("node").to_str().unwrap().to_string();
-    let node = node_run(dir, &["--data", &data, "--listen", "127.0.0.1:0"]);
-    let url = format!("http://{}", node.address);
+    let node = node_run(dir, &["--data", &data]);
+    let url = node.url();
     (node, data, url)
 }
 
@@ -222,22 +229,23 @@ fn a_node_holding_agents_founds_no_space() {
 #[test]
 fn the_founding_node_creates_the_representative_once() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut first, data, _) = single_node(dir.path());
+    let (mut first, data, url) = single_node(dir.path());
     first.running.kill();
-    let ingress = vos_checker::spaces::free_tcp_port();
     let peer = vos_checker::spaces::free_udp_port();
-    let url = format!("http://127.0.0.1:{ingress}");
     let space = dir.path().join("space");
     let space = space.to_str().unwrap();
-    std::fs::write(space, format!("1 {} 127.0.0.1:{peer} {url}\n", first.key)).unwrap();
+    std::fs::write(
+        space,
+        format!("1 {} 127.0.0.1:{peer} http://node-1\n", first.key),
+    )
+    .unwrap();
     vos(["space", "up", "--space", space, "--data", &data]);
     let config = dir.path().join("node.toml");
     let config = config.to_str().unwrap();
     std::fs::write(config, "executor = 2\n").unwrap();
-    let listen = format!("127.0.0.1:{ingress}");
     let agent = agent_elf();
     let run = [
-        "node", "run", "--data", &data, "--listen", &listen, "--space", space, "--config", config,
+        "node", "run", "--data", &data, "--space", space, "--config", config,
     ];
     let refused = vos_fails(
         run.iter()
@@ -253,7 +261,9 @@ fn the_founding_node_creates_the_representative_once() {
         .expect("the representative's id");
     let refused = vos_fails(representative);
     assert!(refused.contains("representative exists"), "{refused}");
-    let created = vos(["agent", "create", "--node", &url, "--data", &data]);
+    // On the node's host, an operator's command reaches the socket in its
+    // data directory unless told otherwise.
+    let created = vos(["agent", "create", "--data", &data]);
     assert_ne!(created.parse::<u32>().unwrap(), id);
 }
 
@@ -360,7 +370,7 @@ fn an_operator_installs_a_package() {
 /// none.
 #[test]
 fn malformed_arguments_exit_with_code_2() {
-    let url = "http://127.0.0.1:1";
+    let url = "unix:/nowhere/api.sock";
     let client = Client {
         url,
         key: "client.key",
@@ -441,57 +451,82 @@ fn a_client_reads_the_workflow_it_started() {
     );
 }
 
+/// A client and an operator through a gateway in front of a node's socket:
+/// the operator's command carries its signed envelope in a header.
 #[test]
-fn an_operator_reaches_a_tls_node_by_its_key() {
+fn a_client_and_an_operator_reach_a_node_through_a_gateway() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, data, _) = single_node(dir.path());
+    let mut key = [0u8; 32];
+    hex::decode_to_slice(&node.key, &mut key).unwrap();
+    let front = vos_checker::processes::Front::serve(vec![(key, node.url())], [0x9a; 32]);
+    let url = format!("http://{}", front.target().authority());
+    assert_eq!(vos(["node", "info", "--node", &url]), node.key);
+    let created = vos(["agent", "create", "--node", &url, "--data", &data]);
+    assert!(created.parse::<u32>().is_ok(), "{created}");
+}
+
+/// A node's API over QUIC, to a client key it lists in `gateways`: the
+/// client pins the node's key, or, an operator on the node's host, the key
+/// its data directory holds; another key, no key, or an unlisted client is
+/// refused.
+#[test]
+fn an_operator_reaches_a_node_over_quic_by_its_key() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("node");
     let data = data.to_str().unwrap();
-    let agent = agent_elf();
-
-    // Without TLS, a node listens on a loopback address only.
-    let refused = vos_fails([
-        "node",
-        "run",
-        "--data",
-        data,
-        "--listen",
-        "0.0.0.0:0",
-        "--agent",
-        agent.to_str().unwrap(),
-    ]);
-    assert!(refused.contains("loopback"), "{refused}");
-
+    let api_key = dir.path().join("api.key").to_str().unwrap().to_string();
+    let listed = vos(["key", "new", "--out", &api_key]);
+    let port = vos_checker::spaces::free_udp_port();
+    let config = dir.path().join("node.toml");
+    std::fs::write(
+        &config,
+        format!("api_listen = \"127.0.0.1:{port}\"\ngateways = [\"{listed}\"]\n"),
+    )
+    .unwrap();
     let node = node_run(
         dir.path(),
-        &["--tls", "--data", data, "--listen", "127.0.0.1:0"],
+        &["--data", data, "--config", config.to_str().unwrap()],
     );
-    let (address, key) = (&node.address, node.key.clone());
-    let url = format!("https://{address}");
-
-    assert_eq!(
-        vos(["node", "info", "--node", &url, "--node-key", &key]),
-        key
-    );
+    let key = node.key.clone();
+    let url = format!("quic://127.0.0.1:{port}");
+    let quic = |more: &[&str]| -> Vec<String> {
+        ["--node", &url, "--api-key", &api_key]
+            .iter()
+            .chain(more)
+            .map(|arg| arg.to_string())
+            .collect()
+    };
+    let info = |more: &[&str]| [vec!["node".into(), "info".into()], quic(more)].concat();
+    assert_eq!(vos(info(&["--node-key", &key])), key);
     let created = vos([
-        "agent",
-        "create",
-        "--node",
-        &url,
-        "--node-key",
-        &key,
-        "--data",
-        data,
-    ]);
+        vec!["agent".into(), "create".into()],
+        quic(&["--node-key", &key, "--data", data]),
+    ]
+    .concat());
     assert!(created.parse::<u32>().is_ok(), "{created}");
     // On the node's host, operator commands pin the key the node keeps in
     // its data directory.
-    let created = vos(["agent", "create", "--node", &url, "--data", data]);
+    let created = vos([
+        vec!["agent".into(), "create".into()],
+        quic(&["--data", data]),
+    ]
+    .concat());
     assert!(created.parse::<u32>().is_ok(), "{created}");
-    // Another key, no key, or plain HTTP: refused.
-    let other = "11".repeat(32);
-    vos_fails(["node", "info", "--node", &url, "--node-key", &other]);
-    vos_fails(["node", "info", "--node", &url]);
-    vos_fails(["node", "info", "--node", &format!("http://{address}")]);
+    // Another key, no key, or a client the node does not list: refused.
+    vos_fails(info(&["--node-key", &"11".repeat(32)]));
+    vos_fails(info(&[]));
+    let stranger = new_key(dir.path(), "stranger.key");
+    vos_fails([
+        "node",
+        "info",
+        "--node",
+        &url,
+        "--api-key",
+        &stranger,
+        "--node-key",
+        &key,
+    ]);
 }
 
 /// Stops the leader loop once, after the commit it is armed for and before
@@ -537,8 +572,9 @@ fn a_pending_call_whose_session_was_collected_is_lost() {
             Arc::new(move || clock.load(Ordering::SeqCst))
         };
         let node = vos_node::Node::open(&data, config).unwrap();
-        let address = node.serve("127.0.0.1:0".parse().unwrap()).unwrap();
-        (node, format!("http://{address}"))
+        let socket = data.join("api.sock");
+        node.serve_socket(&socket, 0o600).unwrap();
+        (node, format!("unix:{}", socket.display()))
     };
     let (node, url) = open();
     let data = data.to_str().unwrap();

@@ -1,8 +1,8 @@
-//! The node's HTTP ingress and its API's socket, end to end on the default
-//! agent and the counter actor: client-named sessions, signed calls in
-//! their sequences, the reply window, expiry, the operator's token,
-//! workflows started by clients and read by their owners, and the API's
-//! frames.
+//! The node's API, end to end on the default agent and the counter actor:
+//! client-named sessions, signed calls in their sequences, the reply
+//! window, expiry, the operator's signed commands, workflows started by
+//! clients and read by their owners, and the API's frames on its socket
+//! and QUIC.
 
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -16,8 +16,7 @@ mod sessions;
 mod transports;
 mod workflows;
 
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -25,13 +24,13 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::SigningKey;
 use std::collections::HashMap;
 
-use vos_checker::calls::{done, install_of, installed};
+use vos_checker::calls::{done, installed};
 use vos_checker::hooks::{FailNextSync, Gate, carries};
 use vos_checker::programs::Programs;
 use vos_checker::rounds::{ASKED, ROUNDS, Rounds, TOLD, Tour, TourMethods, signed_read};
 use vos_checker::spaces::wait_in_process as wait_until;
 use vos_node::client::{self, Client, ClientError, Operator, Target};
-use vos_node::{ADMIN_TOKEN, Config, Hooks, Node};
+use vos_node::{Config, Hooks, Node};
 use vos_wire::abi::Refusal;
 use vos_wire::batch::Batch;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Session, WorkflowId};
@@ -47,15 +46,14 @@ const COUNTER: InstanceId = InstanceId(1);
 /// The seed of the operator key every served node lists.
 const OPERATOR: [u8; 32] = [31; 32];
 
-/// A node serving ingress, with one agent running the counter.
+/// A node serving its API's socket, with one agent running the counter.
 struct Served {
     node: Node,
-    address: SocketAddr,
+    /// The node API's socket, as clients reach it.
     target: Target,
     /// The node API's unix socket.
     socket: std::path::PathBuf,
     clock: Arc<AtomicU64>,
-    token: String,
     agent: AgentId,
     increment: MethodId,
     value: MethodId,
@@ -87,27 +85,26 @@ impl Served {
         config.operators = vec![SigningKey::from_bytes(&OPERATOR).verifying_key().to_bytes()];
         configure(&mut config);
         let node = Node::open(dir.path(), config).unwrap();
-        let address = node.serve("127.0.0.1:0".parse().unwrap()).unwrap();
         let socket = dir.path().join("api.sock");
         node.serve_socket(&socket, 0o600).unwrap();
-        let target = Target::loopback(&format!("http://{address}")).unwrap();
-        let token = std::fs::read_to_string(dir.path().join(ADMIN_TOKEN)).unwrap();
-        let operator = Operator::new(&target, &token);
-        let Ok(Response::Created(agent)) = operator.create_agent(Vec::new()) else {
-            panic!("an agent")
-        };
-        let install = install_of(COUNTER, &programs.counter_elf);
-        installed(operator.install(agent, &install).unwrap());
+        let target = Target::socket(socket.clone());
+        // Made in the node's process: a test's bounds on the operators'
+        // nonces and the API's connections are its own.
+        let agent = node.create_agent().unwrap();
+        installed(smol::block_on(node.install(
+            agent,
+            COUNTER,
+            &programs.counter_elf,
+            Vec::new(),
+        )));
         let schema = vos_node::client::schema(&target, agent, COUNTER)
             .unwrap()
             .expect("an installed schema");
         Self {
             node,
-            address,
             target,
             socket,
             clock,
-            token,
             agent,
             increment: schema.method_id("increment").unwrap(),
             value: schema.method_id("value").unwrap(),
@@ -131,6 +128,24 @@ impl Served {
             body,
         )
         .encode()
+    }
+
+    /// The listed operator, signing for this node.
+    fn operator(&self) -> Operator {
+        Operator::signing(
+            &self.target,
+            SigningKey::from_bytes(&OPERATOR),
+            self.node.id(),
+        )
+    }
+
+    /// An operator by a key the node does not list.
+    fn stranger(&self) -> Operator {
+        Operator::signing(
+            &self.target,
+            SigningKey::from_bytes(&[3; 32]),
+            self.node.id(),
+        )
     }
 
     fn client(&self, seed: u8) -> Client {
@@ -194,17 +209,4 @@ fn fresh_nonce() -> [u8; 16] {
     let mut nonce = [0u8; 16];
     nonce[..8].copy_from_slice(&NEXT.fetch_add(1, Ordering::SeqCst).to_le_bytes());
     nonce
-}
-
-/// The status line a raw request gets.
-fn status_line(address: SocketAddr, request: &[u8]) -> String {
-    let mut stream = TcpStream::connect(address).unwrap();
-    stream.write_all(request).unwrap();
-    let mut response = Vec::new();
-    let _ = stream.read_to_end(&mut response);
-    String::from_utf8_lossy(&response)
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .to_string()
 }

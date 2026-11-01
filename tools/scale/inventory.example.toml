@@ -28,8 +28,9 @@ max_run_s = 21600
 smoke = false
 
 # The nodes' settings (`vos node run --config`), the same on every node:
-# executors, queue, max_inputs, max_bytes, linger_ms, ingress_connections,
-# election_timeout_ms = [low, high], heartbeat_ms. Unset, the defaults.
+# executors, queue, max_inputs, max_bytes, linger_ms, api_connections,
+# api_in_flight, election_timeout_ms = [low, high], heartbeat_ms. Unset,
+# the defaults. The harness sets operators, gateways and api_listen.
 [node]
 
 [[host]]
@@ -49,7 +50,9 @@ weight = 1
 dir = "/srv/vos-scale/c1"
 # The cores it may use (taskset -c); all when unset.
 cores = "0-3"
-ingress = 7701
+# The node API's port (QUIC, UDP), which the drivers and the coordinator
+# reach it at, and its peer port (QUIC, UDP).
+api = 7701
 peer = 7801
 
 [[host]]
@@ -59,7 +62,7 @@ address = "192.168.1.20"
 role = "node"
 dir = "/srv/vos-scale/c2"
 cores = "4-7"
-ingress = 7702
+api = 7702
 peer = 7802
 
 [[host]]
@@ -69,7 +72,7 @@ address = "192.168.1.20"
 role = "node"
 dir = "/srv/vos-scale/c3"
 cores = "8-11"
-ingress = 7703
+api = 7703
 peer = 7803
 
 [[host]]

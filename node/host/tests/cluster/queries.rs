@@ -24,11 +24,10 @@ fn a_linearizable_method_reads_a_write_its_follower_has_not_applied() {
     let agent = cluster.counter_agent(&[1, 2, 3]);
     cluster.converged(agent);
     let (_, follower) = cluster.leader_and_follower(agent);
-    let address = cluster
-        .node(follower)
-        .serve("127.0.0.1:0".parse().unwrap())
-        .unwrap();
-    let target = Target::loopback(&format!("http://{address}")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("api.sock");
+    cluster.node(follower).serve_socket(&socket, 0o600).unwrap();
+    let target = Target::socket(socket);
     let record = agent_info(&target, agent).unwrap().unwrap().record;
     let identity = vos_node::identity(&record);
     let key = SigningKey::from_bytes(&[13; 32]);

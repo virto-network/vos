@@ -1,6 +1,6 @@
 //! The load: increments signed ahead or as they go, in plans of a session
-//! each, sent over HTTP connections kept open by the driver, which paces
-//! them and times them.
+//! each, sent as the node API's frames on socket connections kept open by
+//! the driver, which paces them and times them.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
 use smol::io::{AsyncReadExt, AsyncWriteExt};
+use vos_api::{Framing, Kind, MAX_ANSWER, frame};
 use vos_node::client::{Target, signed_call};
 use vos_wire::ids::{AgentId, MethodId, Session};
 use vos_wire::ingress::Response;
@@ -59,13 +60,14 @@ pub fn signed(space: &Space, agent: AgentId) -> Signed {
     }
 }
 
-/// One session's calls: the node it starts at, and each call's path and
-/// body in order.
+/// One session's requests: the node it starts at, their kind (calls or
+/// queries), the agent they ask, and each one's body in order.
 pub struct Plan {
     /// The agent whose counter its calls increment, if they do.
     pub counts: Option<AgentId>,
     pub node: usize,
-    pub path: String,
+    pub kind: Kind,
+    pub agent: AgentId,
     pub bodies: Bodies,
 }
 
@@ -174,7 +176,8 @@ fn session_plan(signed: &Signed, number: u64, calls: usize, node: usize) -> Plan
     Plan {
         counts: Some(signed.agent),
         node,
-        path: format!("/agents/{}/calls", signed.agent.0),
+        kind: Kind::Call,
+        agent: signed.agent,
         bodies: Bodies::Ready(bodies.into_iter()),
     }
 }
@@ -191,7 +194,8 @@ pub fn signing_plan(
     Plan {
         counts: Some(signed.agent),
         node,
-        path: format!("/agents/{}/calls", signed.agent.0),
+        kind: Kind::Call,
+        agent: signed.agent,
         bodies: Bodies::Signing(Box::new(Signing {
             signed: *signed,
             number,
@@ -275,86 +279,44 @@ pub fn open_calls(per_session: f64, measure: Duration) -> usize {
     ((per_session * (WARM + measure).as_secs_f64()) * 1.2) as usize + 16
 }
 
-trait Stream: smol::io::AsyncRead + smol::io::AsyncWrite + Unpin + Send {}
-impl<T: smol::io::AsyncRead + smol::io::AsyncWrite + Unpin + Send> Stream for T {}
-
-/// HTTP/1.1 on a connection kept open.
-struct Http {
-    stream: Box<dyn Stream>,
-    authority: String,
-    buffer: Vec<u8>,
+/// The node API on a socket connection kept open, a request at a time.
+struct Api {
+    stream: smol::net::unix::UnixStream,
+    next: u64,
 }
 
-impl Http {
+impl Api {
     async fn connect(target: &Target) -> std::io::Result<Self> {
-        let tcp = smol::net::TcpStream::connect(target.authority()).await?;
-        tcp.set_nodelay(true)?;
-        let stream: Box<dyn Stream> = match target.tls() {
-            Some((config, name)) => Box::new(
-                futures_rustls::TlsConnector::from(config)
-                    .connect(name, tcp)
-                    .await?,
-            ),
-            None => Box::new(tcp),
-        };
         Ok(Self {
-            stream,
-            authority: target.authority().to_string(),
-            buffer: Vec::with_capacity(4096),
+            stream: smol::net::unix::UnixStream::connect(target.authority()).await?,
+            next: 1,
         })
     }
 
-    async fn post(&mut self, path: &str, body: &[u8]) -> std::io::Result<Response> {
-        let head = format!(
-            "POST {path} HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\n\r\n",
-            self.authority,
-            body.len()
-        );
-        let mut request = Vec::with_capacity(head.len() + body.len());
-        request.extend_from_slice(head.as_bytes());
-        request.extend_from_slice(body);
-        self.stream.write_all(&request).await?;
-        self.stream.flush().await?;
+    /// A signed request of `kind` to `agent`, `body` its encoding: the
+    /// node's answer.
+    async fn ask(&mut self, kind: Kind, agent: AgentId, body: &[u8]) -> std::io::Result<Response> {
+        let id = self.next;
+        self.next += 1;
+        let request = [agent.encode(), body.to_vec()].concat();
+        self.stream
+            .write_all(&frame(Framing::Stream, kind as u16, id, &request))
+            .await?;
         let invalid = |why: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, why);
-        let mut chunk = [0u8; 8192];
-        loop {
-            let mut headers = [httparse::EMPTY_HEADER; 16];
-            let mut response = httparse::Response::new(&mut headers);
-            if let httparse::Status::Complete(head) = response
-                .parse(&self.buffer)
-                .map_err(|_| invalid("not HTTP"))?
-            {
-                let length = response
-                    .headers
-                    .iter()
-                    .find(|header| header.name.eq_ignore_ascii_case("content-length"))
-                    .and_then(|header| {
-                        std::str::from_utf8(header.value)
-                            .ok()?
-                            .trim()
-                            .parse::<usize>()
-                            .ok()
-                    })
-                    .ok_or_else(|| invalid("no length"))?;
-                while self.buffer.len() < head + length {
-                    let read = self.stream.read(&mut chunk).await?;
-                    if read == 0 {
-                        return Err(invalid("closed"));
-                    }
-                    self.buffer.extend_from_slice(&chunk[..read]);
-                }
-                let answer = Response::decode(&self.buffer[head..head + length])
-                    .map(|(answer, _)| answer)
-                    .map_err(|_| invalid("no answer"));
-                self.buffer.drain(..head + length);
-                return answer;
-            }
-            let read = self.stream.read(&mut chunk).await?;
-            if read == 0 {
-                return Err(invalid("closed"));
-            }
-            self.buffer.extend_from_slice(&chunk[..read]);
+        let mut header = [0u8; 14];
+        self.stream.read_exact(&mut header).await?;
+        let length = u32::from_le_bytes(header[..4].try_into().expect("four bytes"));
+        let answered = u64::from_le_bytes(header[6..].try_into().expect("eight bytes"));
+        let length = length
+            .checked_sub(10)
+            .filter(|length| *length <= MAX_ANSWER)
+            .ok_or_else(|| invalid("no answer"))?;
+        if answered != id {
+            return Err(invalid("another request's answer"));
         }
+        let mut answer = vec![0u8; length as usize];
+        self.stream.read_exact(&mut answer).await?;
+        Response::decode_exact(&answer).ok_or_else(|| invalid("no answer"))
     }
 }
 
@@ -390,13 +352,13 @@ pub enum Pace {
     Open(Duration),
 }
 
-/// Send one call until it is answered, following the leader: its answer,
+/// Send one request until it is answered, following the leader: its answer,
 /// or none once the run ends.
 async fn call(
     space: &Space,
-    http: &mut Option<Http>,
+    api: &mut Option<Api>,
     node: &mut usize,
-    path: &str,
+    (kind, agent): (Kind, AgentId),
     body: &[u8],
     until: Instant,
 ) -> Option<Response> {
@@ -404,14 +366,14 @@ async fn call(
         if Instant::now() >= until + Duration::from_secs(10) {
             return None;
         }
-        if http.is_none() {
-            *http = Http::connect(&space.processes[*node].target).await.ok();
+        if api.is_none() {
+            *api = Api::connect(&space.processes[*node].target).await.ok();
         }
-        let Some(connection) = http.as_mut() else {
+        let Some(connection) = api.as_mut() else {
             smol::Timer::after(Duration::from_millis(10)).await;
             continue;
         };
-        match connection.post(path, body).await {
+        match connection.ask(kind, agent, body).await {
             Ok(answer @ Response::Ran { .. }) => return Some(answer),
             Ok(Response::NotLeader {
                 leader: Some(leader),
@@ -419,7 +381,7 @@ async fn call(
                 if let Some(at) = space.by_url(&leader.address) {
                     *node = at;
                 }
-                *http = None;
+                *api = None;
             }
             Ok(
                 Response::Busy
@@ -431,7 +393,7 @@ async fn call(
             }
             Ok(other) => return Some(other),
             Err(_) => {
-                *http = None;
+                *api = None;
                 smol::Timer::after(Duration::from_millis(10)).await;
             }
         }
@@ -499,7 +461,7 @@ pub fn drive(
                 let samples = &samples;
                 executor.spawn(async move {
                     let mut node = plan.node;
-                    let mut http = None;
+                    let mut api = None;
                     let mut mine: Vec<Samples> = (0..windows).map(|_| Samples::default()).collect();
                     let mut scheduled = start
                         + match pace {
@@ -533,8 +495,15 @@ pub fn drive(
                             Pace::Closed => sent,
                             Pace::Open(_) => scheduled,
                         };
-                        let answer =
-                            call(space, &mut http, &mut node, &plan.path, &body, end).await;
+                        let answer = call(
+                            space,
+                            &mut api,
+                            &mut node,
+                            (plan.kind, plan.agent),
+                            &body,
+                            end,
+                        )
+                        .await;
                         let answered = Instant::now();
                         if matches!(
                             answer,

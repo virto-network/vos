@@ -1,5 +1,5 @@
-//! The node's HTTP routes, byte for byte, translated onto the node API by the
-//! route table the node's own HTTP runs. An operator route carries the
+//! VOS's HTTP routes, translated onto the node API by `vos-http`'s route
+//! table. An operator route carries the
 //! operator's signed envelope in its `Authorization` header: the gateway
 //! holds no token and no key that could act for anyone.
 

@@ -1,8 +1,8 @@
 //! Today's HTTP routes as node-API requests: each route's kind and frame
 //! body, the answers given without a node (a path naming no agent, an
 //! unknown path), an operator route's authorization, and an answer
-//! frame's HTTP form. The node's own HTTP and the gateway run this one
-//! table, so the two answer alike.
+//! frame's HTTP form. The gateway runs it, and the node API's client
+//! translates its requests by it.
 
 use base64::Engine;
 use vos_api::{CREDENTIALS, FRAME_ERROR, FrameError, Kind, Operated};
@@ -21,11 +21,10 @@ pub const OPERATED_SCHEME: &str = "Operated ";
 pub enum Authorization {
     /// No header.
     None,
-    /// A bearer token: the node's own HTTP takes its own.
-    Bearer(Vec<u8>),
     /// An operator's envelope's fields, its body the route's.
     Operated(Box<[u8; CREDENTIALS]>),
-    /// A header that is neither.
+    /// A header that holds no envelope: a bearer token, or an envelope
+    /// that does not decode.
     Unreadable,
 }
 
@@ -34,9 +33,6 @@ impl Authorization {
         let Some(value) = request.header("authorization") else {
             return Authorization::None;
         };
-        if let Some(token) = value.strip_prefix(b"Bearer ") {
-            return Authorization::Bearer(token.to_vec());
-        }
         let Some(encoded) = value.strip_prefix(OPERATED_SCHEME.as_bytes()) else {
             return Authorization::Unreadable;
         };
@@ -311,7 +307,7 @@ mod tests {
         assert_eq!(
             route(&stats),
             Routed::Operator {
-                authorization: Authorization::Bearer(b"00".to_vec()),
+                authorization: Authorization::Unreadable,
                 kind: Kind::Stats,
                 inner: Ok(Vec::new()),
             }

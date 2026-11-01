@@ -1,5 +1,6 @@
-//! The gateway in front of real nodes: every route answering as the node's
-//! own HTTP does, the operator's envelope in the header, a signed call a
+//! The gateway in front of real nodes: every route answering its pinned
+//! status and body, a client's TLS to it, the operator's envelope in the
+//! header, a signed call a
 //! compromised gateway alters refused by the node, leader-aware routing
 //! and a client's pin across it, the limits per address, refusals for size
 //! and from the head that never reach a node, the budget of install-size
@@ -24,10 +25,11 @@ use vos_gateway::upstream::{Address, Upstream};
 use vos_http::routes::operated_header;
 use vos_node::client::{Client, Operator, Target, signed_call, signed_operated, signed_query};
 use vos_node::{Config, Node, Peers};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, WorkflowId};
+use vos_wire::ids::{AgentId, InstanceId, MethodId, Session, WorkflowId};
 use vos_wire::ingress::{
     Consistency, Contact, NodeId, OperatorRefusal, Rejection, Response, WorkflowRead,
 };
+use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode};
 
 const COUNTER: InstanceId = InstanceId(1);
@@ -40,6 +42,7 @@ mod dead_node;
 mod limits;
 mod redirects;
 mod routes;
+mod tls;
 
 fn fresh_nonce() -> [u8; 16] {
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -130,11 +133,10 @@ impl Drop for Front {
     }
 }
 
-/// One node with the counter installed, its own HTTP and its socket, and
-/// a gateway on the socket.
+/// One node with the counter installed, its socket, and a gateway on the
+/// socket.
 struct Served {
     node: Node,
-    http: SocketAddr,
     socket: PathBuf,
     clock: Arc<AtomicU64>,
     agent: AgentId,
@@ -150,7 +152,6 @@ impl Served {
         let dir = tempfile::tempdir().unwrap();
         let clock = Arc::new(AtomicU64::new(vos_node::wall_clock()));
         let node = Node::open(dir.path(), config(&programs, &clock)).unwrap();
-        let http = node.serve("127.0.0.1:0".parse().unwrap()).unwrap();
         let socket = dir.path().join("api.sock");
         node.serve_socket(&socket, 0o600).unwrap();
         let target = Target::socket(socket.clone());
@@ -168,7 +169,6 @@ impl Served {
             .unwrap();
         let front = Front::start(vec![(node.id().0, Address::Socket(socket.clone()))], per);
         Self {
-            http,
             socket,
             clock,
             agent,
@@ -238,9 +238,8 @@ fn request(method: &str, path: &str, headers: &[String], body: &[u8]) -> Vec<u8>
     [head.into_bytes(), body.to_vec()].concat()
 }
 
-/// An answer with what legitimately differs between two runs of one
-/// request zeroed: an applied index, a created id, the stats and a
-/// replica's status.
+/// An answer with what differs from run to run zeroed: an applied index,
+/// a created id, the stats and a replica's status.
 fn masked(status: u16, body: &[u8]) -> (u16, Vec<u8>) {
     let Some(answer) = Response::decode_exact(body) else {
         return (status, body.to_vec());

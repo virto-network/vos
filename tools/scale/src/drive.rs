@@ -42,26 +42,16 @@ pub struct Plan {
     /// `drive-local`: every request goes to a node that does not
     /// replicate its agent, which answers `Elsewhere` at once, before any
     /// signature check. The driver does all its work (the plan, the
-    /// signatures, the connections, the answers), the nodes almost none:
+    /// signatures, the requests, the answers), the nodes almost none:
     /// its own cost at its rate, apart from theirs. It needs a node
     /// outside every called agent's replicas, and writes no identity rows
     /// (that agent is on every node).
     #[serde(default)]
     pub probe: bool,
-    /// The most connections the driver keeps to each node: within the
-    /// node's `ingress_connections`, its drivers' together.
-    #[serde(default = "connections")]
-    pub connections: usize,
     /// The seed, in hex, of the key the driver presents to the nodes'
-    /// APIs over QUIC, which every node admits: with it, the driver keeps
-    /// one QUIC connection a node and sends a stream a request; without
-    /// it, HTTPS connections.
-    #[serde(default)]
-    pub driver_key: Option<String>,
-}
-
-fn connections() -> usize {
-    crate::engine::MAX_CONNECTIONS
+    /// APIs over QUIC, which every node admits: one connection a node, a
+    /// stream a request.
+    pub driver_key: String,
 }
 
 impl Plan {
@@ -127,19 +117,7 @@ pub fn drive(inventory: &Inventory, run: &Run, load: &Load) -> Result<(), String
     load.model.validate(agents.agents.len())?;
     load.model
         .check_representative(agents.representative.is_some())?;
-    let connections = inventory.harness.driver_connections;
-    let ingress = inventory
-        .node
-        .get("ingress_connections")
-        .and_then(toml::Value::as_integer)
-        .map_or(1_024, |value| value.max(0) as usize);
-    let api = inventory.harness.transport == crate::inventory::Transport::Api;
-    if !api && connections * drivers.len() > ingress {
-        return Err(format!(
-            "{} drivers keep {connections} connections a node each, past the nodes' ingress_connections ({ingress}): raise [node] ingress_connections, or lower [harness] driver_connections",
-            drivers.len()
-        ));
-    }
+    let driver_key = hex::encode(crate::nodes::driver_seed(inventory)?);
     leaders(inventory, &deployed, &mut agents.agents);
     if load.model.readers > 0.0 {
         leaders(inventory, &deployed, &mut agents.idle);
@@ -171,13 +149,7 @@ pub fn drive(inventory: &Inventory, run: &Run, load: &Load) -> Result<(), String
             drivers: drivers.len() as u64,
             window,
             probe: false,
-            connections,
-            driver_key: api
-                .then(|| {
-                    crate::keys::seed(&Deployed::dir(inventory).join(crate::keys::DRIVER))
-                        .map(hex::encode)
-                })
-                .transpose()?,
+            driver_key: driver_key.clone(),
         };
         drain_s = plan.drain_ms().div_ceil(1_000);
         let local = run.file(&format!("drive-{}.json", host.name));

@@ -28,11 +28,10 @@ pub struct Artifacts {
 pub struct DeployedNode {
     pub number: u8,
     pub name: String,
-    /// Its key, in hex: clients pin its TLS to it.
+    /// Its key, in hex: clients pin its QUIC to it.
     pub key: String,
-    pub url: String,
-    /// Its API over QUIC: `quic://address:port`.
-    #[serde(default)]
+    /// Its API over QUIC, `quic://address:port`: the contact the space
+    /// file gives, which redirects carry.
     pub api: String,
 }
 
@@ -150,7 +149,7 @@ fn output_of(command: &mut Command) -> String {
 /// node is stopped by the PID its shell started it under.
 const FIRST_RUN: &str = r#"
 cd "$DIR"
-timeout 60 "$DIR/bin/vos" node run --data "$DIR/data" --listen 127.0.0.1:0 --agent "$DIR/guests/vos-agent.elf" > logs/first.out 2> logs/first.log &
+timeout 60 "$DIR/bin/vos" node run --data "$DIR/data" --agent "$DIR/guests/vos-agent.elf" > logs/first.out 2> logs/first.log &
 pid=$!
 for _ in $(seq 600); do
   grep -q '^node ' logs/first.out && break
@@ -256,7 +255,6 @@ pub fn deploy(inventory: &Inventory, artifacts: &Artifacts) -> Result<Deployed, 
             number,
             name: host.name.clone(),
             key,
-            url: host.ingress_url(),
             api: host.api_url(),
         })
         .collect();
@@ -266,7 +264,7 @@ pub fn deploy(inventory: &Inventory, artifacts: &Artifacts) -> Result<Deployed, 
         .map(|(node, host)| {
             format!(
                 "{} {} {}:{} {}\n",
-                node.number, node.key, host.address, host.peer, node.url
+                node.number, node.key, host.address, host.peer, node.api
             )
         })
         .collect();
@@ -283,7 +281,7 @@ pub fn deploy(inventory: &Inventory, artifacts: &Artifacts) -> Result<Deployed, 
         settings.insert("gateways".into(), vec![driver.clone()].into());
         settings.insert(
             "api_listen".into(),
-            format!("{}:{}", host.address, host.api_port()).into(),
+            format!("{}:{}", host.address, host.api).into(),
         );
         let settings = toml::to_string(&settings).map_err(|error| error.to_string())?;
         let file = local.join(format!("{}.node.toml", host.name));

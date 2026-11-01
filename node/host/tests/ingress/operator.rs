@@ -1,11 +1,12 @@
-//! The operator's routes: its token, and a replica's status.
+//! The operator's commands, signed by a key the node lists, and a
+//! replica's status.
 
 use super::*;
 
 #[test]
-fn operator_commands_need_the_token() {
+fn operator_commands_need_a_listed_key() {
     let served = Served::plain();
-    let stranger = Operator::new(&served.target, &"00".repeat(32));
+    let stranger = served.stranger();
     assert_eq!(
         stranger.create_agent(Vec::new()).unwrap(),
         Response::Rejected(Rejection::Unauthorized)
@@ -28,12 +29,12 @@ fn operator_commands_need_the_token() {
 #[test]
 fn the_operator_sets_an_agent_to_report_every_window() {
     let served = Served::plain();
-    let stranger = Operator::new(&served.target, &"00".repeat(32));
+    let stranger = served.stranger();
     assert_eq!(
         stranger.report_every_window(served.agent, true).unwrap(),
         Response::Rejected(Rejection::Unauthorized)
     );
-    let operator = Operator::new(&served.target, &served.token);
+    let operator = served.operator();
     let set = || {
         served
             .node
@@ -59,38 +60,13 @@ fn the_operator_sets_an_agent_to_report_every_window() {
     }
 }
 
-/// A bearer token of 64 bytes that are not 64 hex digits, here multi-byte
-/// characters a pair of bytes would split, is refused like any wrong
-/// token, more often than the ingress holds connections: each connection's
-/// place is given back, and the ingress goes on answering.
-#[test]
-fn a_token_that_is_not_hex_is_refused_and_frees_its_connection() {
-    let connections = 4;
-    let served = Served::start_with(Arc::new(vos_node::NoHooks), |config| {
-        config.ingress_connections = connections;
-    });
-    let token = format!("a{}", "€".repeat(21));
-    assert_eq!(token.len(), 64);
-    let request = format!(
-        "GET /stats HTTP/1.1\r\nHost: node\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
-    );
-    for _ in 0..3 * connections {
-        assert_eq!(
-            status_line(served.address, request.as_bytes()),
-            "HTTP/1.1 401 Unauthorized"
-        );
-    }
-    let operator = Operator::new(&served.target, &served.token);
-    assert!(matches!(operator.stats(), Ok(Response::Stats(_))));
-}
-
 /// A node's stats count its replica groups: a node of one holds and leads
 /// each of its agents, at a term of one at least. They give what its
 /// groups' entry caches hold, which a leader's own entries fill.
 #[test]
 fn the_stats_count_the_groups_a_node_holds_and_leads() {
     let served = Served::plain();
-    let operator = Operator::new(&served.target, &served.token);
+    let operator = served.operator();
     let Ok(Response::Stats(stats)) = operator.stats() else {
         panic!("the stats")
     };
@@ -107,14 +83,14 @@ fn the_stats_count_the_groups_a_node_holds_and_leads() {
 fn the_status_route_reports_a_replica_and_a_halt() {
     let hooks = Arc::new(FailNextSync::default());
     let served = Served::start(hooks.clone());
-    let operator = Operator::new(&served.target, &served.token);
+    let operator = served.operator();
     let Ok(Response::Status(status)) = operator.status(served.agent) else {
         panic!("a status")
     };
     assert!(status.leads && !status.halted, "{status:?}");
     assert!(status.applied >= 1 && status.commit >= status.applied);
     assert!(status.last_index >= status.commit);
-    let stranger = Operator::new(&served.target, &"00".repeat(32));
+    let stranger = served.stranger();
     assert_eq!(
         stranger.status(served.agent).unwrap(),
         Response::Rejected(Rejection::Unauthorized)

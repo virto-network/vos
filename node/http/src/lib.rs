@@ -1,7 +1,8 @@
 //! VOS's HTTP front: a small HTTP/1.1 server on any runtime
 //! ([`server`]), its public TLS ([`tls`]), and the route table
-//! ([`routes`]) that translates today's HTTP routes onto the node API,
-//! which the node's own HTTP and the gateway share.
+//! ([`routes`]) that translates VOS's HTTP routes onto the node API, which
+//! the gateway serves and the node API's client translates its requests
+//! by.
 
 pub mod routes;
 pub mod server;

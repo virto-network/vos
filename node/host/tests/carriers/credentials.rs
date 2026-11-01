@@ -3,11 +3,11 @@
 //! credential actor, the poll, the purses' ledger and the device actor; a
 //! member's device secret derived from a known source output, its path
 //! fetched, and its calls proved by the device library as a phone proves
-//! them and sent to the nodes' ingress over each transport: the API's
-//! socket, the node's HTTP, and a gateway relaying HTTP onto the API over
-//! QUIC. Then every carrier the run produced is searched for the member's
-//! secret, which only the device holds, and for where the member sits,
-//! which a credentialed call never carries ([`vos_checker::carriers`]).
+//! them and sent to the nodes over each transport: the API's socket, and
+//! a gateway relaying HTTP onto the API over QUIC. Then every carrier the
+//! run produced is searched for the member's secret, which only the
+//! device holds, and for where the member sits, which a credentialed call
+//! never carries ([`vos_checker::carriers`]).
 //!
 //! The calls: auth sign-ins, a replay (`Replayed`), a `once` vote and a
 //! second (`Once`), a proof cut by a byte (`Proof`), another call's
@@ -19,8 +19,8 @@
 //! fetched on one of their own.
 //!
 //! Carriers that leave the device: every byte of each API connection each
-//! way, every request and its answer's status and body over HTTP and
-//! through the gateway, each
+//! way, every request and its answer's status and body through the
+//! gateway, each
 //! credentialed call's log entry on each node, the device library's
 //! values as its `Debug` and `Display` show them, every log line of the
 //! process at every level (the nodes', the gateway's), and standard
@@ -550,8 +550,7 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
     };
     answers.push(ran(send(&watched, &watched_proof)));
 
-    // The node's HTTP, and a gateway relaying onto the nodes' API over
-    // QUIC.
+    // A gateway relaying onto the nodes' API over QUIC.
     let gateway_key = SigningKey::from_bytes(&GATEWAY).verifying_key().to_bytes();
     let upstreams = founded
         .cluster
@@ -569,7 +568,6 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
         })
         .collect();
     let front = Front::serve(upstreams, GATEWAY);
-    let http = Target::loopback(&format!("http://{}", founded.cluster.ingress(at))).unwrap();
     // Each request's bytes and each answer's status and body as they came.
     let mut https: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
     let route = format!("/agents/{}/credentialed", agent.0);
@@ -590,37 +588,35 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
         ));
         decoded
     };
-    for (name, target) in [("the node's HTTP", &http), ("the gateway", front.target())] {
-        let call = founded.call(at, POLL, "login", ());
-        let proof = prover
-            .prove_auth(&secret, &witness, b"login", &call)
-            .unwrap();
-        let mut cut = request(&call, &proof);
-        cut.proof.pop();
-        let answer = post(format!("{name}: a cut proof"), target, &cut);
-        assert_eq!(
+    let target = front.target();
+    let call = founded.call(at, POLL, "login", ());
+    let proof = prover
+        .prove_auth(&secret, &witness, b"login", &call)
+        .unwrap();
+    let mut cut = request(&call, &proof);
+    cut.proof.pop();
+    let answer = post("the gateway: a cut proof".to_string(), target, &cut);
+    assert_eq!(
+        answer,
+        Response::Rejected(vos_wire::ingress::Rejection::Credential(
+            CredentialRefusal::Proof
+        ))
+    );
+    let answer = post(
+        "the gateway: a sign-in".to_string(),
+        target,
+        &request(&call, &proof),
+    );
+    assert!(
+        matches!(
             answer,
-            Response::Rejected(vos_wire::ingress::Rejection::Credential(
-                CredentialRefusal::Proof
-            )),
-            "{name}"
-        );
-        let answer = post(
-            format!("{name}: a sign-in"),
-            target,
-            &request(&call, &proof),
-        );
-        assert!(
-            matches!(
-                answer,
-                Response::Ran {
-                    outcome: Outcome::Done(_),
-                    ..
-                }
-            ),
-            "{name}: {answer:?}"
-        );
-    }
+            Response::Ran {
+                outcome: Outcome::Done(_),
+                ..
+            }
+        ),
+        "{answer:?}"
+    );
 
     // Frame errors, each closing its connection: a frame of no kind, and
     // one past its kind's limit, from its header.
@@ -718,7 +714,7 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
         device_values.join("\n").into_bytes(),
     );
     let applied = credentialed_steps(&founded.cluster.node(at).unwrap(), agent).len();
-    assert!(applied >= 8, "the calls run, {applied} logged");
+    assert!(applied >= 7, "the calls run, {applied} logged");
     for number in 1..=NODES {
         let node = founded.cluster.node(number).unwrap();
         vos_checker::wait_until(

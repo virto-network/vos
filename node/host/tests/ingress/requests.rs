@@ -1,6 +1,5 @@
-//! Requests through the ingress: batches that sweep, pipelined and
-//! duplicate requests, a request resent with its sequence, and bodies the
-//! ingress refuses.
+//! Requests through the node API: batches that sweep, unread and
+//! duplicate answers, and a request resent with its sequence.
 
 use super::*;
 
@@ -27,13 +26,16 @@ fn a_busy_leader_sweeps_in_its_batches() {
     assert!(!served.holds(&held));
 }
 
+/// Calls sent on one connection, their answers never read, the connection
+/// then dropped: their replies come from the window. Each goes once the
+/// one before applied, since frames on a connection run at once, in no
+/// order a session's sequence would take.
 #[test]
-fn pipelined_requests_recover_their_lost_replies() {
+fn unread_answers_come_back_from_the_window() {
     let served = Served::plain();
     let client = served.client(1);
-    let address = served.address;
-    let mut stream = TcpStream::connect(address).unwrap();
-    for (sequence, by) in [(1u64, 1u64), (2, 2), (3, 3)] {
+    let mut stream = super::api::connect(&served.socket);
+    for (sequence, by, total) in [(1u64, 1u64, 1u64), (2, 2, 3), (3, 3, 6)] {
         let body = client
             .call_body(
                 served.agent,
@@ -43,15 +45,14 @@ fn pipelined_requests_recover_their_lost_replies() {
                 &by.encode(),
             )
             .unwrap();
-        let head = format!(
-            "POST /agents/{}/calls HTTP/1.1\r\nHost: node\r\nContent-Length: {}\r\n\r\n",
-            served.agent.0,
-            body.len()
+        super::api::send(
+            &mut stream,
+            vos_api::Kind::Call as u16,
+            sequence,
+            &[served.agent.encode(), body].concat(),
         );
-        stream.write_all(head.as_bytes()).unwrap();
-        stream.write_all(&body).unwrap();
+        wait_until("the call applies", || served.value(&client) == total);
     }
-    wait_until("all three apply", || served.value(&client) == 6);
     drop(stream);
     let replies: Vec<u64> = [(1u64, 1u64), (2, 2), (3, 3)]
         .into_iter()
@@ -151,20 +152,4 @@ fn a_request_not_consumed_is_resent_with_its_sequence() {
         .map(|sequence| done(served.increment(&client, sequence, sequence)))
         .collect();
     assert_eq!(rest, [3, 6]);
-}
-
-#[test]
-fn bodies_past_the_limit_or_without_a_length_are_refused_with_a_reason() {
-    let served = Served::plain();
-    let calls = format!("/agents/{}/calls", served.agent.0);
-    let large = format!("POST {calls} HTTP/1.1\r\nContent-Length: 10000000\r\n\r\n");
-    assert_eq!(
-        status_line(served.address, large.as_bytes()),
-        "HTTP/1.1 413 Content Too Large"
-    );
-    let chunked = format!("POST {calls} HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n");
-    assert_eq!(
-        status_line(served.address, chunked.as_bytes()),
-        "HTTP/1.1 411 Length Required"
-    );
 }

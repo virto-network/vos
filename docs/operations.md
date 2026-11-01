@@ -3,7 +3,29 @@
 What an operator does about a space's anchors at its venue (pin D′,
 `design/slice-7-mobile.md`). The protocol is `design/proving.md` §7; the
 venue's calls are `design/spaces-pallet.md` (Kreivo) and the JAM
-statements service's controls.
+statements service's controls. First, how an operator reaches a node.
+
+## Reaching a node
+
+- A node serves no HTTP: its binary API alone (`design/node-api.md`), on
+  a unix socket, `api.sock` in its data directory unless its settings
+  name `api_socket` (mode `api_socket_mode`, 0660 by default), and over
+  QUIC when they name `api_listen`, to the client keys `gateways` lists.
+  Firewall `api_listen` to the gateways and drivers.
+- An operator's commands are signed with an operator key the node lists:
+  `operator.key` in its data directory, listed unless `local_operator =
+  false`, and the keys `operators` names. On the node's host,
+  `vos agent create --data DIR` reaches the socket in `DIR` (`--node
+  unix:PATH` reaches one `api_socket` names elsewhere), signing for
+  the node whose key `DIR` holds; with `--node quic://HOST:PORT --api-key
+  FILE` it reaches that node's QUIC instead, as a client key `gateways`
+  lists, pinned by the same key.
+- Clients over HTTP, and s4's SSH, reach a space through a gateway
+  (`vos-gateway`), which holds no authority: an operator's route through
+  it carries the operator's signed envelope in its `Authorization`
+  header, and no token admits one. A space file's last column is each
+  node's contact, which redirects carry: its gateway's URL, or its API's
+  `quic://` address.
 
 ## The node key is the anchor key
 

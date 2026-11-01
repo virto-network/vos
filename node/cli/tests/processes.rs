@@ -24,7 +24,7 @@ use vos_wire::ingress::{Consistency, Response, WorkflowStatus};
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode, keys};
 
-/// Three nodes, in the clear.
+/// Three nodes, their clients on the API's sockets.
 fn start() -> Processes {
     Processes::start(env!("CARGO_BIN_EXE_vos"), 3, Options::default())
 }
@@ -33,14 +33,7 @@ fn start() -> Processes {
 /// followed by the nodes' keys.
 #[test]
 fn a_leader_cut_off_by_the_relay_is_replaced_and_catches_up() {
-    let space = Processes::start(
-        env!("CARGO_BIN_EXE_vos"),
-        3,
-        Options {
-            api: true,
-            ..Options::default()
-        },
-    );
+    let space = Processes::start(env!("CARGO_BIN_EXE_vos"), 3, Options::default());
     let agent = space.counter_agent(COUNTER);
     let mut client =
         Client::new(space.target(1), SigningKey::from_bytes(&[31; 32])).with_routes(space.routes());
@@ -184,7 +177,8 @@ fn a_workflow_mid_await_completes_once_through_a_kill_and_a_partition() {
     // round awaits.
     let (cut, other) = (asked_on[0], asked_on[1]);
     space.relay.isolate(cut);
-    let mut client = Client::new(space.target(other), SigningKey::from_bytes(&[41; 32]));
+    let mut client = Client::new(space.target(other), SigningKey::from_bytes(&[41; 32]))
+        .with_routes(space.routes());
     let tour = Tour::light(asked, vec![2, 3, 4], 0);
     let started = client
         .call(touring, ROUNDS, methods.tour, &tour.arguments())
@@ -303,7 +297,8 @@ mod faults {
         let space = start();
         let agent = space.counter_agent(COUNTER);
         let stalled = space.leader(agent);
-        let mut client = Client::new(space.target(stalled), SigningKey::from_bytes(&[32; 32]));
+        let mut client = Client::new(space.target(stalled), SigningKey::from_bytes(&[32; 32]))
+            .with_routes(space.routes());
         let add = served_method(&mut client, agent, COUNTER, "increment");
         assert_eq!(increment(&mut client, agent, COUNTER, add, 1), 1);
         space.set_faults(stalled, "hold_commits\n");
@@ -329,7 +324,8 @@ mod faults {
         let agent = space.counter_agent(COUNTER);
         let failing = space.leader(agent);
         let other = (1..=3).find(|number| *number != failing).unwrap();
-        let mut client = Client::new(space.target(other), SigningKey::from_bytes(&[34; 32]));
+        let mut client = Client::new(space.target(other), SigningKey::from_bytes(&[34; 32]))
+            .with_routes(space.routes());
         let add = served_method(&mut client, agent, COUNTER, "increment");
         assert_eq!(increment(&mut client, agent, COUNTER, add, 1), 1);
         space.set_faults(failing, "fail_commits after\n");
@@ -364,7 +360,8 @@ mod faults {
     fn a_gray_failure_deposes_its_leader() {
         let space = start();
         let agent = space.counter_agent(COUNTER);
-        let mut client = Client::new(space.target(1), SigningKey::from_bytes(&[33; 32]));
+        let mut client = Client::new(space.target(1), SigningKey::from_bytes(&[33; 32]))
+            .with_routes(space.routes());
         let add = served_method(&mut client, agent, COUNTER, "increment");
         assert_eq!(increment(&mut client, agent, COUNTER, add, 1), 1);
         let gray = space.leader(agent);

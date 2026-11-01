@@ -3,7 +3,7 @@ name = "vos-http"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "VOS's HTTP front: a small HTTP/1.1 server on any runtime, its public TLS, and the route table that translates today's HTTP routes onto the node API."
+description = "VOS's HTTP front: a small HTTP/1.1 server on any runtime, its public TLS, and the route table that translates VOS's HTTP routes onto the node API: the gateway's."
 
 [dependencies]
 # Timers on any runtime: async-io drives its own reactor when none runs.

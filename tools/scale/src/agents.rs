@@ -169,16 +169,20 @@ fn install(
 }
 
 /// Write the identity agent's rows `0..rows`, [`FILL`] a call, from a few
-/// clients at once.
+/// clients at once, over the API as the driver key `client`.
 fn fill_identities(
     deployed: &Deployed,
+    client: [u8; 32],
     identity: &Placed,
     rows: u64,
     seed: u64,
 ) -> Result<(), String> {
     let agent = AgentId(identity.agent);
     let instance = InstanceId(identity.instance);
-    let target = target(&deployed.nodes[usize::from(identity.replicas[0]) - 1])?;
+    let target = target(
+        &deployed.nodes[usize::from(identity.replicas[0]) - 1],
+        client,
+    )?;
     // The install is answered by one replica; this one may apply it later.
     let schema = installed(INSTALLED, Duration::from_millis(200), || {
         vos_node::client::schema(&target, agent, instance).map_err(|error| error.to_string())
@@ -187,15 +191,29 @@ fn fill_identities(
     let method = schema
         .method_id("fill_identities")
         .ok_or("the shard actor has no fill_identities")?;
+    // Each node by its key, where a writer's redirect goes.
+    let routes = deployed
+        .nodes
+        .iter()
+        .map(|node| {
+            Ok((
+                crate::keys::hex32(&node.key)?,
+                crate::nodes::target(node, client)?,
+            ))
+        })
+        .collect::<Result<std::collections::HashMap<_, _>, String>>()?;
     let calls = rows.div_ceil(FILL);
-    let writers = calls.min(8);
+    // Each writer dials its own connection: well within the handshakes a
+    // node takes at once from one address.
+    let writers = calls.min(4);
     std::thread::scope(|scope| {
         let handles: Vec<_> = (0..writers)
             .map(|writer| {
-                let target = target.clone();
+                let (target, routes) = (target.clone(), routes.clone());
                 scope.spawn(move || -> Result<(), String> {
                     let (key, _) = crate::load::user(seed ^ 0xf111, writer);
-                    let mut client = Client::new(&target, SigningKey::from_bytes(&key));
+                    let mut client =
+                        Client::new(&target, SigningKey::from_bytes(&key)).with_routes(routes);
                     for call in (writer..calls).step_by(writers as usize) {
                         let start = call * FILL;
                         let count = FILL.min(rows - start) as u32;
@@ -362,7 +380,13 @@ pub fn create(inventory: &Inventory, request: &Request) -> Result<Agents, String
     if request.identity_rows > 0 {
         let every: Vec<u8> = (1..=hosts.len() as u8).collect();
         let identity = place_one(&operators, every)?;
-        fill_identities(&deployed, &identity, request.identity_rows, request.seed)?;
+        fill_identities(
+            &deployed,
+            crate::nodes::driver_seed(inventory)?,
+            &identity,
+            request.identity_rows,
+            request.seed,
+        )?;
         eprintln!(
             "the identity agent: agent {} on every node, {} rows",
             identity.agent, request.identity_rows

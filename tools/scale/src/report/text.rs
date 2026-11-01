@@ -175,16 +175,15 @@ pub fn text(summary: &Summary) -> String {
         }
         let most = |counts: &[u64]| counts.iter().max().copied().unwrap_or(0);
         text += &format!(
-            "  {}: {} users and {} sessions over {} shards, {} users and {} sessions at the busiest; {} requests waited for a connection, {} in use at most of {} a node\n",
+            "  {}: {} users and {} sessions over {} shards, {} users and {} sessions at the busiest; {} requests in flight at most on one node's connection, of {}\n",
             driver.name,
             driver.shard_users.iter().sum::<u64>(),
             driver.shard_sessions.iter().sum::<u64>(),
             driver.shard_sessions.len(),
             most(&driver.shard_users),
             most(&driver.shard_sessions),
-            driver.conn_waits,
             driver.in_use_max,
-            driver.connections
+            driver.in_flight_cap
         );
     }
     if let Some(gateway) = &summary.gateway {

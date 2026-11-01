@@ -33,7 +33,7 @@ address = "127.0.0.1"
 role = "node"
 dir = "/var/tmp/vos-scale/n1"
 cores = "3,4,6,7"
-ingress = 7911
+api = 7931
 peer = 7921
 
 [[host]]
@@ -43,7 +43,7 @@ address = "127.0.0.1"
 role = "node"
 dir = "/var/tmp/vos-scale/n2"
 cores = "8-11"
-ingress = 7912
+api = 7932
 peer = 7922
 
 [[host]]
@@ -53,7 +53,7 @@ address = "127.0.0.1"
 role = "node"
 dir = "/var/tmp/vos-scale/n3"
 cores = "12-15"
-ingress = 7913
+api = 7933
 peer = 7923
 
 [[host]]
@@ -63,7 +63,7 @@ address = "127.0.0.1"
 role = "node"
 dir = "/var/tmp/vos-scale/n4"
 cores = "16-19"
-ingress = 7914
+api = 7934
 peer = 7924
 
 [[host]]
