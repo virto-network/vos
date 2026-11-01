@@ -7061,3 +7061,26 @@ times at 7.6d). The one shared disk's fsync still binds.
 
 The scale report's new section, "Run 3 on the final build (over the node
 API)", gives the details. Both hosts were left with 0 units.
+
+## Session P8: PG2's second pass, format 46
+
+2026-11-01, from 20:35 (a day after P7), `pg2.sh` with 9 rounds on the
+Fairphone 6 (battery 73–77%, 27 °C, governor `walt`): the phone binary
+built at `6aa9c4caa` (format 46: `h = 256`, the NEON Blake2s, the lean
+kernel with the 7.21 cuts), the node at `88fc26e18` (node API only). Each
+round the phone proved the sign-in's device kernel (automatic threads),
+verified it there, and the node's ingress ran `login` as the member's
+pseudonym.
+
+| | value | gate |
+|---|---|---|
+| prove (9 rounds) | 646, 651, 610, 653, 634, 636, 645, 635, 688 ms | |
+| median of three groups' medians | **645 ms** (636–646) | ≤ 1.0 s |
+| largest | 688 ms | |
+| peak resident | 427 MiB | ≤ 1 GiB |
+| proof | 866,827–881,935 bytes | ≤ 1.5 MiB |
+| ingress | 9 of 9 ran, one pseudonym, answered in 54–71 ms | accepted |
+
+One program id (`953c7cd8…`) and one set of log sizes. **PG2 passes its
+second time, a day after P7, on the format the slice ships**: the gate is
+met. The log is `spikes/s7-device/runs/phone-pg2-p8.txt`.

@@ -1,0 +1,117 @@
+with-env { CARGO_INCREMENTAL: "0" } { cd agent/programs; cargo build --release -p vos-agent --target ../../pvm/guest/riscv64em-vos.json }
+    Finished `release` profile [optimized] target(s) in 0.18s
+with-env { CARGO_INCREMENTAL: "0" } { cd agent/programs; cargo build --release -p vos-credentials --target ../../pvm/guest/riscv64em-vos.json }
+    Finished `release` profile [optimized] target(s) in 0.12s
+with-env { CARGO_INCREMENTAL: "0" } { cd agent/test-actors; cargo build --release --target ../../pvm/guest/riscv64em-vos.json }
+    Finished `release` profile [optimized] target(s) in 0.21s
+   Compiling vos-wire v0.1.0 (/home/daniel/src/virto/vos/.worktrees/vos-core/agent/wire)
+   Compiling vos-pvm v0.1.0 (/home/daniel/src/virto/vos/.worktrees/vos-core/pvm/runtime)
+   Compiling vos-statement v0.1.0 (/home/daniel/src/virto/vos/.worktrees/vos-core/pvm/proof/statement)
+   Compiling rcgen v0.13.2
+   Compiling vos-venue v0.1.0 (/home/daniel/src/virto/vos/.worktrees/vos-core/node/venue)
+   Compiling vos-api v0.1.0 (/home/daniel/src/virto/vos/.worktrees/vos-core/node/api)
+   Compiling vos-statement-service v0.1.0 (/home/daniel/src/virto/vos/.worktrees/vos-core/pvm/proof/statement/service)
+   Compiling vos-pvm-proof v0.1.0 (/home/daniel/src/virto/vos/.worktrees/vos-core/pvm/proof)
+   Compiling vos-pvm-compiler v0.1.0 (/home/daniel/src/virto/vos/.worktrees/vos-core/pvm/compiler)
+   Compiling vos-http v0.1.0 (/home/daniel/src/virto/vos/.worktrees/vos-core/node/http)
+   Compiling vos-node-prover v0.1.0 (/home/daniel/src/virto/vos/.worktrees/vos-core/node/prover)
+   Compiling vos-jam v0.1.0 (/home/daniel/src/virto/vos/.worktrees/vos-core/node/jam)
+   Compiling vos-testkit v0.1.0 (/home/daniel/src/virto/vos/.worktrees/vos-core/agent/testkit)
+   Compiling vos-gateway v0.1.0 (/home/daniel/src/virto/vos/.worktrees/vos-core/node/gateway)
+   Compiling vos-pvm-recair v0.1.0 (/home/daniel/src/virto/vos/.worktrees/vos-core/pvm/proof/recair)
+   Compiling vos-node v0.1.0 (/home/daniel/src/virto/vos/.worktrees/vos-core/node/host)
+   Compiling vos-device v0.1.0 (/home/daniel/src/virto/vos/.worktrees/vos-core/pvm/device)
+   Compiling vos-checker v0.1.0 (/home/daniel/src/virto/vos/.worktrees/vos-core/node/checker)
+   Compiling vos-jam-dev v0.1.0 (/home/daniel/src/virto/vos/.worktrees/vos-core/tools/jam-dev)
+    Finished `release` profile [optimized] target(s) in 10m 22s
+Fairphone 6
+Fairphone/FP6/FP6:16/FP6.QREL.16.115.0/WS1R:user/release-keys
+/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/p8/vos-phone-timing: 1 file pushed, 0 skipped. 112.7 MB/s (13488824 bytes in 0.114s)
+/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/pg2.UBuxiL/auth.kernel: 1 file pushed, 0 skipped. 39.7 MB/s (7045 bytes in 0.000s)
+e5af540fc49d2bcbe889d1071248bf49220f742a91694338ce635daa4f0915f4  vos-phone
+c62f09eeb15c93fdadaa290be61e834f38d770378fe318aef1eb2f9469f88b46  auth.kernel
+== round 1
+Sun Nov  1 08:45:30 PM CET 2026
+  level: 77
+  temperature: 270
+MemAvailable:    3891560 kB
+/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/pg2.UBuxiL/1.input: 1 file pushed, 0 skipped. 9.3 MB/s (1189 bytes in 0.000s)
+{"kind":"kernel","threads":4,"program":"953c7cd8d9769dfb42687727ea81b6f3e5fb5de652bab6dd03b85cfe754d9aed","log_sizes":[11, 10, 14, 11, 13, 12, 10, 10, 13, 10, 11, 10, 10, 10, 10, 10, 10, 10],"install_ms":179.0,"prove_ms":645.7,"verify_ms":21.45,"proof_bytes":874685,"io":"1b49e13090b545619a05ed2cd0deec72fbb5886d6ae49636c983195b31994c1e","verified":true,"peak_rss_mib":419.1}
+/data/local/tmp/s7-pg2/1.proof: 1 file pulled, 0 skipped. 31.1 MB/s (874685 bytes in 0.027s)
+== round 2
+Sun Nov  1 08:45:32 PM CET 2026
+  level: 77
+  temperature: 270
+MemAvailable:    3900992 kB
+/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/pg2.UBuxiL/2.input: 1 file pushed, 0 skipped. 7.6 MB/s (1189 bytes in 0.000s)
+{"kind":"kernel","threads":4,"program":"953c7cd8d9769dfb42687727ea81b6f3e5fb5de652bab6dd03b85cfe754d9aed","log_sizes":[11, 10, 14, 11, 13, 12, 10, 10, 13, 10, 11, 10, 10, 10, 10, 10, 10, 10],"install_ms":270.2,"prove_ms":650.6,"verify_ms":96.44,"proof_bytes":881935,"io":"c377855e1ce1de0bf7cb826046eaff079662ed14df53224cb4acce09de429d2f","verified":true,"peak_rss_mib":425.6}
+/data/local/tmp/s7-pg2/2.proof: 1 file pulled, 0 skipped. 31.9 MB/s (881935 bytes in 0.026s)
+== round 3
+Sun Nov  1 08:45:34 PM CET 2026
+  level: 77
+  temperature: 270
+MemAvailable:    3900784 kB
+/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/pg2.UBuxiL/3.input: 1 file pushed, 0 skipped. 8.7 MB/s (1189 bytes in 0.000s)
+{"kind":"kernel","threads":4,"program":"953c7cd8d9769dfb42687727ea81b6f3e5fb5de652bab6dd03b85cfe754d9aed","log_sizes":[11, 10, 14, 11, 13, 12, 10, 10, 13, 10, 11, 10, 10, 10, 10, 10, 10, 10],"install_ms":178.8,"prove_ms":610.2,"verify_ms":82.97,"proof_bytes":877535,"io":"04de3d5e18c9117b41d19673a534b7160d2a3b19c8c5a87e1ffbe12751737665","verified":true,"peak_rss_mib":426.8}
+/data/local/tmp/s7-pg2/3.proof: 1 file pulled, 0 skipped. 32.0 MB/s (877535 bytes in 0.026s)
+== round 4
+Sun Nov  1 08:45:36 PM CET 2026
+  level: 77
+  temperature: 270
+MemAvailable:    3903788 kB
+/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/pg2.UBuxiL/4.input: 1 file pushed, 0 skipped. 7.7 MB/s (1189 bytes in 0.000s)
+{"kind":"kernel","threads":4,"program":"953c7cd8d9769dfb42687727ea81b6f3e5fb5de652bab6dd03b85cfe754d9aed","log_sizes":[11, 10, 14, 11, 13, 12, 10, 10, 13, 10, 11, 10, 10, 10, 10, 10, 10, 10],"install_ms":170.8,"prove_ms":652.8,"verify_ms":77.24,"proof_bytes":878581,"io":"0f554602d3097a27fe83373cbd110c1d08e0cc474a1cd50d8e747c3a2864ce32","verified":true,"peak_rss_mib":419.4}
+/data/local/tmp/s7-pg2/4.proof: 1 file pulled, 0 skipped. 34.0 MB/s (878581 bytes in 0.025s)
+== round 5
+Sun Nov  1 08:45:38 PM CET 2026
+  level: 77
+  temperature: 270
+MemAvailable:    3901876 kB
+/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/pg2.UBuxiL/5.input: 1 file pushed, 0 skipped. 9.0 MB/s (1189 bytes in 0.000s)
+{"kind":"kernel","threads":4,"program":"953c7cd8d9769dfb42687727ea81b6f3e5fb5de652bab6dd03b85cfe754d9aed","log_sizes":[11, 10, 14, 11, 13, 12, 10, 10, 13, 10, 11, 10, 10, 10, 10, 10, 10, 10],"install_ms":253.9,"prove_ms":633.5,"verify_ms":119.02,"proof_bytes":874569,"io":"ac626b5c65a0f4398b54212387a6a07c27fdc25c2153ae74d67787072a25ae2b","verified":true,"peak_rss_mib":417.3}
+/data/local/tmp/s7-pg2/5.proof: 1 file pulled, 0 skipped. 32.2 MB/s (874569 bytes in 0.026s)
+== round 6
+Sun Nov  1 08:45:39 PM CET 2026
+  level: 77
+  temperature: 270
+MemAvailable:    3904884 kB
+/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/pg2.UBuxiL/6.input: 1 file pushed, 0 skipped. 8.7 MB/s (1189 bytes in 0.000s)
+{"kind":"kernel","threads":4,"program":"953c7cd8d9769dfb42687727ea81b6f3e5fb5de652bab6dd03b85cfe754d9aed","log_sizes":[11, 10, 14, 11, 13, 12, 10, 10, 13, 10, 11, 10, 10, 10, 10, 10, 10, 10],"install_ms":164.9,"prove_ms":635.8,"verify_ms":21.01,"proof_bytes":877195,"io":"417ce55f358142386d36603f476aca7b0bc13342419f675752ed097febfc7941","verified":true,"peak_rss_mib":427.0}
+/data/local/tmp/s7-pg2/6.proof: 1 file pulled, 0 skipped. 33.8 MB/s (877195 bytes in 0.025s)
+== round 7
+Sun Nov  1 08:45:41 PM CET 2026
+  level: 77
+  temperature: 270
+MemAvailable:    3898932 kB
+/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/pg2.UBuxiL/7.input: 1 file pushed, 0 skipped. 10.1 MB/s (1189 bytes in 0.000s)
+{"kind":"kernel","threads":4,"program":"953c7cd8d9769dfb42687727ea81b6f3e5fb5de652bab6dd03b85cfe754d9aed","log_sizes":[11, 10, 14, 11, 13, 12, 10, 10, 13, 10, 11, 10, 10, 10, 10, 10, 10, 10],"install_ms":215.4,"prove_ms":645.3,"verify_ms":129.34,"proof_bytes":866827,"io":"2ba74205785e4553c1aec86aeb1ee87d3d47882bb0f55e4c533726341e58e07c","verified":true,"peak_rss_mib":420.6}
+/data/local/tmp/s7-pg2/7.proof: 1 file pulled, 0 skipped. 33.7 MB/s (866827 bytes in 0.025s)
+== round 8
+Sun Nov  1 08:45:43 PM CET 2026
+  level: 77
+  temperature: 270
+MemAvailable:    3900616 kB
+/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/pg2.UBuxiL/8.input: 1 file pushed, 0 skipped. 9.1 MB/s (1189 bytes in 0.000s)
+{"kind":"kernel","threads":4,"program":"953c7cd8d9769dfb42687727ea81b6f3e5fb5de652bab6dd03b85cfe754d9aed","log_sizes":[11, 10, 14, 11, 13, 12, 10, 10, 13, 10, 11, 10, 10, 10, 10, 10, 10, 10],"install_ms":226.9,"prove_ms":635.3,"verify_ms":20.91,"proof_bytes":872701,"io":"181c573ae089156aa7c482526d457371363a8975a8ac2c7ccae3f1242fa4eb3f","verified":true,"peak_rss_mib":418.1}
+/data/local/tmp/s7-pg2/8.proof: 1 file pulled, 0 skipped. 30.5 MB/s (872701 bytes in 0.027s)
+== round 9
+Sun Nov  1 08:45:45 PM CET 2026
+  level: 77
+  temperature: 270
+MemAvailable:    3905096 kB
+/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/pg2.UBuxiL/9.input: 1 file pushed, 0 skipped. 6.6 MB/s (1189 bytes in 0.000s)
+{"kind":"kernel","threads":4,"program":"953c7cd8d9769dfb42687727ea81b6f3e5fb5de652bab6dd03b85cfe754d9aed","log_sizes":[11, 10, 14, 11, 13, 12, 10, 10, 13, 10, 11, 10, 10, 10, 10, 10, 10, 10],"install_ms":284.7,"prove_ms":688.1,"verify_ms":90.00,"proof_bytes":877698,"io":"1d838c3a04e7790fa51bab156fe37025813c227e3901b832b2ce6914a59f1540","verified":true,"peak_rss_mib":425.8}
+/data/local/tmp/s7-pg2/9.proof: 1 file pulled, 0 skipped. 33.6 MB/s (877698 bytes in 0.025s)
+== the node's answers
+{"kind":"round","round":1,"format":46,"proof_bytes":874685,"answer_ms":71.1,"answer":"Ran(Done([1, 113, 90, 78, 124, 156, 27, 143, 108, 219, 248, 56, 60, 20, 154, 148, 38, 75, 121, 134, 19, 106, 86, 154, 48, 233, 202, 231, 87, 0, 147, 252, 24]))","ran":true}
+{"kind":"round","round":2,"format":46,"proof_bytes":881935,"answer_ms":68.8,"answer":"Ran(Done([1, 113, 90, 78, 124, 156, 27, 143, 108, 219, 248, 56, 60, 20, 154, 148, 38, 75, 121, 134, 19, 106, 86, 154, 48, 233, 202, 231, 87, 0, 147, 252, 24]))","ran":true}
+{"kind":"round","round":3,"format":46,"proof_bytes":877535,"answer_ms":66.8,"answer":"Ran(Done([1, 113, 90, 78, 124, 156, 27, 143, 108, 219, 248, 56, 60, 20, 154, 148, 38, 75, 121, 134, 19, 106, 86, 154, 48, 233, 202, 231, 87, 0, 147, 252, 24]))","ran":true}
+{"kind":"round","round":4,"format":46,"proof_bytes":878581,"answer_ms":70.3,"answer":"Ran(Done([1, 113, 90, 78, 124, 156, 27, 143, 108, 219, 248, 56, 60, 20, 154, 148, 38, 75, 121, 134, 19, 106, 86, 154, 48, 233, 202, 231, 87, 0, 147, 252, 24]))","ran":true}
+{"kind":"round","round":5,"format":46,"proof_bytes":874569,"answer_ms":67.6,"answer":"Ran(Done([1, 113, 90, 78, 124, 156, 27, 143, 108, 219, 248, 56, 60, 20, 154, 148, 38, 75, 121, 134, 19, 106, 86, 154, 48, 233, 202, 231, 87, 0, 147, 252, 24]))","ran":true}
+{"kind":"round","round":6,"format":46,"proof_bytes":877195,"answer_ms":68.4,"answer":"Ran(Done([1, 113, 90, 78, 124, 156, 27, 143, 108, 219, 248, 56, 60, 20, 154, 148, 38, 75, 121, 134, 19, 106, 86, 154, 48, 233, 202, 231, 87, 0, 147, 252, 24]))","ran":true}
+{"kind":"round","round":7,"format":46,"proof_bytes":866827,"answer_ms":66.8,"answer":"Ran(Done([1, 113, 90, 78, 124, 156, 27, 143, 108, 219, 248, 56, 60, 20, 154, 148, 38, 75, 121, 134, 19, 106, 86, 154, 48, 233, 202, 231, 87, 0, 147, 252, 24]))","ran":true}
+{"kind":"round","round":8,"format":46,"proof_bytes":872701,"answer_ms":54.0,"answer":"Ran(Done([1, 113, 90, 78, 124, 156, 27, 143, 108, 219, 248, 56, 60, 20, 154, 148, 38, 75, 121, 134, 19, 106, 86, 154, 48, 233, 202, 231, 87, 0, 147, 252, 24]))","ran":true}
+{"kind":"round","round":9,"format":46,"proof_bytes":877698,"answer_ms":68.4,"answer":"Ran(Done([1, 113, 90, 78, 124, 156, 27, 143, 108, 219, 248, 56, 60, 20, 154, 148, 38, 75, 121, 134, 19, 106, 86, 154, 48, 233, 202, 231, 87, 0, 147, 252, 24]))","ran":true}
+{"kind":"done","rounds":9,"ran":9}
+Sun Nov  1 08:45:47 PM CET 2026
+exit=0
