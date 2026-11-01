@@ -10,7 +10,7 @@ fn pinnable(core: usize) -> bool {
 }
 
 /// A pool as `threads` says, each thread's stack [`STACK_BYTES`]: what a
-/// [`Prover`] proves in, and what a device kernel's proof runs in.
+/// [`Prover`](crate::Prover) proves in, and what a device kernel's proof runs in.
 pub fn thread_pool(threads: &Threads) -> Result<rayon::ThreadPool, DeviceError> {
     let builder = rayon::ThreadPoolBuilder::new().stack_size(STACK_BYTES);
     let auto = match threads {

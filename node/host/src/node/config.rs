@@ -38,7 +38,7 @@ pub struct Config {
     /// One by default: on one host's three nodes, at 5,000 calls a second
     /// and 10^6 users, more split the inputs into more, smaller batches,
     /// whose refines and log entries cost more than the queue's wait they
-    /// save [measured].
+    /// save (measured).
     pub in_flight: usize,
     /// How long a leader waits for more inputs after the first, when it
     /// found its queue empty.
