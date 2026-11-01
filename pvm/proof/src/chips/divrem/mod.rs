@@ -8,7 +8,7 @@
 //!      the quotient, remainder, high half `H` (DivCorrHi) and every carry
 //!      are Range256-checked bytes, so no equation wraps in M31.
 //!   2. `H` pinned by the operation:
-//!      - unsigned division and logical right shift (ShloR): `H = 0`;
+//!      - unsigned division: `H = 0`;
 //!      - signed division (DivS/RemS):
 //!        `H ≡ sq·d + sd·q + sr − sb + k (mod 2^W)`, with `k` the overflow
 //!        of `MIN / −1`, the one quotient that does not fit;

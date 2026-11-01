@@ -249,7 +249,7 @@ impl BuiltInComponent for DivRemChip {
         }
 
         // ── The high half ──
-        // Unsigned division and logical right shift: `q·d + r = b`.
+        // Unsigned division: `q·d + r = b`.
         for hi in &div_corr_hi {
             eval.add_constraint(zero_high_h[0].clone() * hi.clone());
         }

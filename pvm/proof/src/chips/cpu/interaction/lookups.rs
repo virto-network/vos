@@ -17,41 +17,33 @@ pub(super) fn table_lookups(
 ) {
     // Power-of-two lookup: (shift_amount, val_d[8]) when shift is constrained.
     // Two emissions: one keyed on ShiftAmount with multiplicity
-    // `is_shift_c · (1 − is_rotate_r64 − is_rotate_r32)`, and one keyed
-    // on ShiftAmountCompl with multiplicity `is_rotate_r64 + is_rotate_r32`.
+    // `is_shift_c · (1 − is_rotate_r64 − is_rotate_r32 − is_shlo_r)`, and
+    // one keyed on ShiftAmountCompl with multiplicity
+    // `is_rotate_r64 + is_rotate_r32 + is_shlo_r`.
     let pow2_lookup: &PowerOfTwoLookupElements = lookup_elements.as_ref();
-    let shift_amount_col = &row.shift_amount;
-    let is_shift_constrained = &row.is_shift_constrained;
-    let is_rotate_r64_col_pow2 = &row.is_rotate_r64;
-    let is_rotate_r32_col_pow2 = &row.is_rotate_r32;
-    let shift_amount_compl_col = &row.shift_amount_compl;
     let val_d_cols = &row.val_d;
     {
-        let mut tuple: Vec<_> = vec![shift_amount_col[0].clone()];
+        let mut tuple: Vec<_> = vec![row.shift_amount[0].clone()];
         tuple.extend_from_slice(val_d_cols);
         logup.add_to_relation_with(
             pow2_lookup,
-            [
-                is_shift_constrained[0].clone(),
-                is_rotate_r64_col_pow2[0].clone(),
-                is_rotate_r32_col_pow2[0].clone(),
-            ],
-            |[shc, r64, r32]| (shc - r64 - r32).into(),
+            [row.shift_amount_pow2_h[0].clone()],
+            |[active]| active.into(),
             &tuple,
         );
     }
-    // Separate PowerOfTwo emission for RotR64 / RotR32 keyed on
-    // ShiftAmountCompl.
+    // The second emission, keyed on ShiftAmountCompl.
     {
-        let mut tuple: Vec<_> = vec![shift_amount_compl_col[0].clone()];
+        let mut tuple: Vec<_> = vec![row.shift_amount_compl[0].clone()];
         tuple.extend_from_slice(val_d_cols);
         logup.add_to_relation_with(
             pow2_lookup,
             [
-                is_rotate_r64_col_pow2[0].clone(),
-                is_rotate_r32_col_pow2[0].clone(),
+                row.is_rotate_r64[0].clone(),
+                row.is_rotate_r32[0].clone(),
+                row.is_shlo_r[0].clone(),
             ],
-            |[r64, r32]| (r64 + r32).into(),
+            |[r64, r32, shlo_r]| (r64 + r32 + shlo_r).into(),
             &tuple,
         );
     }

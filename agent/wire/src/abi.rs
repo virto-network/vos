@@ -509,8 +509,7 @@ pub mod precompile {
     /// One Poseidon2-M31 compression: φ7 sixteen words (64 bytes, each a
     /// little-endian `u32` below p), φ8 the first eight words of their
     /// permutation (32 bytes, written). A word at or above p traps the
-    /// call. Handlers may make it; kernels may not, since the node's
-    /// segments do not prove it.
+    /// call. Handlers and kernels may make it.
     pub const POSEIDON2: u64 = 0x402;
 
     /// A kernel's witness input: φ7 the destination, φ8 the capacity. The
@@ -518,6 +517,15 @@ pub mod precompile {
     /// the attest supplies and returns their count in φ7, 0 at its end, and
     /// records what the kernel read in the attest. It serves it to kernels
     /// alone: a handler's call of it is an id the agent does not serve.
+    ///
+    /// **One call's pages are one segment's:** a node cuts a kernel's run
+    /// before a step, never inside one, so the pages a call writes, with
+    /// the other pages of its step, must fit its shape's largest class: 24
+    /// pages, or 17 for a kernel holding the Poseidon2 chip
+    /// (`vos_pvm_compiler::shape::POSEIDON2_CLASSES`), about 64 KiB written
+    /// at once. A run with a call past it attests, but its proof is refused
+    /// (`ProvingError::Shape`); a kernel reads a larger input in several
+    /// calls.
     pub const WITNESS_INPUT: u64 = 0x401;
 
     /// A witness-input call's price to its kernel, before its bytes: the

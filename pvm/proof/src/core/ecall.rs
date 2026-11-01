@@ -33,28 +33,25 @@ pub(crate) const DISPATCH_WITNESS_INPUT: u8 = 101;
 /// H): φ\[7\] points at 64 bytes, sixteen M31 words as little-endian u32,
 /// each below p; φ\[8\] at the 32 bytes the call writes, the first eight
 /// words of the permutation of the sixteen. A word at or above p (p itself
-/// included) traps the call; it has no other effect. Only the shared chip
-/// set's CPU (`chips::CpuP2Chip`) acknowledges it; format 35's CPU ends a
-/// run at it.
+/// included) traps the call; it has no other effect.
 pub const ECALL_POSEIDON2: u32 = 0x402;
 /// CPU-chip dispatch code for the Poseidon2 call.
 pub(crate) const DISPATCH_POSEIDON2: u8 = 102;
 
 /// Whether the proof runtime has a deterministic handler for this `ecalli`
 /// identifier: exactly the calls [`crate::core::tracing::TracingPvm`]
-/// serves by default.
+/// serves.
 ///
 /// This is a kernel's calls (`vos_pvm::precompile::is_kernel_call`): the
-/// BLAKE2b precompile and the witness input. Any other id, 110 to 114
-/// included, has no handler: a program reaching one does not trace. The
-/// runtime's Poseidon2 precompile is served only by a tracer that enables
-/// it (`TracingPvm::with_poseidon2`), for the shared chip set's proofs.
+/// BLAKE2b precompile, the Poseidon2 call and the witness input. Any other
+/// id, 110 to 114 included, has no handler: a program reaching one does not
+/// trace.
 ///
 /// ProgramMemory commits the dispatch identifier, which is non-zero exactly
 /// for the calls a proof's CPU may acknowledge, so an untrusted prover cannot
 /// mark an unknown call as acknowledged and continue execution past it.
 pub(crate) const fn is_proof_host_call_allowed(id: u64) -> bool {
-    proof_precompile_dispatch_id(id) != 0 && id != ECALL_POSEIDON2 as u64
+    proof_precompile_dispatch_id(id) != 0
 }
 
 /// Exact proof-chip dispatch identifier for a precompile or the witness
@@ -75,7 +72,8 @@ mod tests {
     use super::*;
 
     /// The tracer serves exactly the calls a kernel may make, the refine
-    /// host's BLAKE2b precompile and the witness input; 110 to 114 are none.
+    /// host's BLAKE2b and Poseidon2 precompiles and the witness input; 110
+    /// to 114 are none.
     #[test]
     fn tracer_serves_exactly_the_kernel_calls() {
         assert_eq!(

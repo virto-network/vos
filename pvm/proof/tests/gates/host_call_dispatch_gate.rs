@@ -15,7 +15,9 @@ use vos_pvm::interpreter::Interpreter;
 use vos_pvm::{ExitReason, PVM_REGISTER_COUNT, PVM_ZONE_SIZE};
 use vos_pvm_proof::chips::CpuChip;
 use vos_pvm_proof::chips::cpu::Column;
-use vos_pvm_proof::core::ecall::{ECALL_WITNESS_INPUT, proof_precompile_dispatch_id};
+use vos_pvm_proof::core::ecall::{
+    ECALL_POSEIDON2, ECALL_WITNESS_INPUT, proof_precompile_dispatch_id,
+};
 use vos_pvm_proof::core::tracing::{ECALL_BLAKE2B_COMPRESS, TracingPvm};
 use vos_pvm_proof::framework_access::AllLookupElements;
 use vos_pvm_proof::harness::{MachineComponent, MachineProverComponent};
@@ -26,9 +28,10 @@ const ARG0_ADDR: u64 = PVM_ZONE_SIZE as u64 + 0x1000;
 const ARG1_ADDR: u64 = ARG0_ADDR + 0x100;
 const ARG2_ADDR: u64 = ARG1_ADDR + 0x100;
 
-const PRECOMPILE_SELECTORS: [(u32, Column); 2] = [
+const PRECOMPILE_SELECTORS: [(u32, Column); 3] = [
     (ECALL_BLAKE2B_COMPRESS, Column::IsBlakeEcall),
     (ECALL_WITNESS_INPUT, Column::IsWitnessEcall),
+    (ECALL_POSEIDON2, Column::IsP2Ecall),
 ];
 
 fn traced_side_note(id: u32) -> SideNote {
@@ -74,6 +77,23 @@ fn blake_side_note() -> SideNote {
     let side_note = tracing.into_side_note().with_memory(memory);
     assert!(side_note.steps[0].host_call_acknowledged);
     assert_eq!((side_note.steps[0].pc, side_note.steps[0].next_pc), (0, 3));
+    side_note
+}
+
+fn poseidon2_side_note() -> SideNote {
+    let [id_lo, id_hi, ..] = ECALL_POSEIDON2.to_le_bytes();
+    let code = vec![Opcode::Ecalli as u8, id_lo, id_hi, Opcode::Trap as u8];
+    let bitmask = vec![1, 0, 0, 1];
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[7] = ARG0_ADDR;
+    regs[8] = ARG1_ADDR;
+    let memory = vec![0u8; PVM_ZONE_SIZE as usize + 0x2000];
+    let pvm = Interpreter::new(code, bitmask, vec![], regs, memory.clone(), 10_000);
+    let mut tracing = TracingPvm::new(pvm);
+    assert_eq!(tracing.run_with_precompiles(), ExitReason::Panic);
+    let side_note = tracing.into_side_note().with_memory(memory);
+    assert_eq!(side_note.poseidon2_ops.len(), 1);
+    assert!(side_note.steps[0].host_call_acknowledged);
     side_note
 }
 
@@ -214,5 +234,26 @@ fn acknowledged_blake_call_cannot_omit_handler_record() {
     assert!(
         rejected,
         "SOUNDNESS GAP: acknowledged Ecalli 100 verified without its handler record"
+    );
+}
+
+/// The Poseidon2 call's row without its handler record: the call served and
+/// acknowledged by the CPU on a node segment, the chip's row and its memory
+/// accesses gone, is refused; the complete record proves.
+#[test]
+fn acknowledged_poseidon2_call_cannot_omit_handler_record() {
+    let mut honest = poseidon2_side_note();
+    let proof = vos_pvm_proof::prove(&mut honest).expect("complete Poseidon2 call prove");
+    vos_pvm_proof::verify(proof, &honest).expect("complete Poseidon2 call verify");
+
+    let mut forged = poseidon2_side_note();
+    forged.poseidon2_ops.clear();
+    let rejected = match vos_pvm_proof::prove(&mut forged) {
+        Err(_) => true,
+        Ok(proof) => vos_pvm_proof::verify(proof, &forged).is_err(),
+    };
+    assert!(
+        rejected,
+        "SOUNDNESS GAP: acknowledged Ecalli 102 verified without its handler record"
     );
 }

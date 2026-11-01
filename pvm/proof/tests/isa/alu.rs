@@ -527,6 +527,41 @@ fn prove_shlo_r64_by_63() {
     prove_three_reg(Opcode::ShloR64, 2, 0, 1, u64::MAX, 63, 1);
 }
 
+/// A logical right shift by 0, or by its width, through the
+/// multiplication: `val_d` is 1, the product's high word 0, and the result
+/// its low word, the operand.
+#[test]
+fn prove_shlo_r_by_zero() {
+    let x = 0x8123_4567_89ab_cdef;
+    prove_three_reg(Opcode::ShloR64, 2, 0, 1, x, 0, x);
+    prove_three_reg(Opcode::ShloR64, 2, 0, 1, x, 64, x);
+    prove_three_reg(Opcode::ShloR64, 2, 0, 1, x, 128 + 64, x);
+    prove_three_reg(Opcode::ShloR32, 2, 0, 1, 0x7654_3210, 32, 0x7654_3210);
+    prove_three_reg(
+        Opcode::ShloR32,
+        2,
+        0,
+        1,
+        0x8765_4321,
+        96,
+        0xFFFF_FFFF_8765_4321,
+    );
+}
+
+/// Logical right shifts by every amount, 64- and 32-bit, the high word of
+/// the multiplication by `2^(width − n)`.
+#[test]
+fn prove_shlo_r_by_every_amount() {
+    let x: u64 = 0xf0e1_d2c3_b4a5_9687;
+    for n in [1u64, 7, 8, 31, 32, 33, 56, 63] {
+        prove_three_reg(Opcode::ShloR64, 2, 0, 1, x, n, x >> n);
+    }
+    for n in [1u64, 15, 16, 31] {
+        let shifted = (x as u32 >> n) as i32 as i64 as u64;
+        prove_three_reg(Opcode::ShloR32, 2, 0, 1, x, n, shifted);
+    }
+}
+
 #[test]
 fn prove_rem_u32_bit31_by_zero() {
     prove_three_reg(

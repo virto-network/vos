@@ -1,6 +1,6 @@
 //! Device programs as a space's ingress and a member's device both take
 //! them (`slice-7-mobile.md` pin J, `proving.md` §8): a device kernel's
-//! program under format 45, its id, a proof's bytes, and the auth
+//! program under format 46, its id, a proof's bytes, and the auth
 //! statement's arguments and io-hash.
 //!
 //! - **The program** ([`Program`]) is computed from the kernel alone: the
@@ -42,7 +42,7 @@ use crate::masked::device::{DeviceProgram, DeviceProof, DeviceProver, device_sha
 use crate::masked::{MaskRng, MaskStats, MaskedProof};
 use crate::prove::ProveError;
 
-/// The device format: format 45.
+/// The device format: format 46.
 pub const FORMAT: Format = DEVICE_PROOF;
 
 /// The longest device proof a decode reads, in bytes: ingress's cap.
@@ -67,7 +67,7 @@ const PROGRAM_DOMAIN: &[u8] = b"vos/device/program/v1";
 
 type Hasher = Blake2sM31MerkleHasher;
 
-/// A device kernel's program under format 45, as its prover and its
+/// A device kernel's program under format 46, as its prover and its
 /// verifier pin it, and the kernel it proves.
 pub struct Program {
     prover: DeviceProver<Blake2sM31MerkleChannel>,
@@ -183,7 +183,7 @@ fn trace(
     kernel: &[u8],
     arguments: &[u8],
 ) -> Result<vos_pvm_proof::side_note::SideNote, ProveError> {
-    vos_pvm_proof::kernel::trace_device_kernel(kernel, arguments, GAS)
+    vos_pvm_proof::kernel::trace_kernel(kernel, arguments, GAS)
         .map(|trace| trace.side_note)
         .map_err(|error| ProveError::Segment(format!("{error:?}")))
 }
@@ -242,7 +242,7 @@ pub fn encode(proof: &MaskedProof<Hasher>) -> Option<Vec<u8>> {
 }
 
 /// The proof in `bytes`: at most [`MAX_PROOF_BYTES`], read whole and
-/// canonical (re-encoded, the same bytes), its format 45.
+/// canonical (re-encoded, the same bytes), its format 46.
 pub fn decode(bytes: &[u8]) -> Result<MaskedProof<Hasher>, Error> {
     if bytes.len() > MAX_PROOF_BYTES {
         return Err(Error::Length);

@@ -156,7 +156,7 @@ impl Target {
     }
 }
 
-/// Prove under the segment format (35), over the trace's natural shape.
+/// Prove under the segment format (41), over the trace's natural shape.
 pub fn prove(side_note: &mut SideNote) -> Result<Proof, ProvingError> {
     install_thread_pool();
     let (proof, _) = prove_impl(side_note, Target::SEGMENT, false)?;
@@ -196,8 +196,9 @@ fn segment_memory_roots(side_note: &SideNote) -> ([u8; 32], [u8; 32]) {
 /// a dense `initial_memory`.
 fn compute_final_memory_commitment(side_note: &SideNote) -> [u8; 32] {
     // Replay ALL of this (segment's) writes — regular stores AND precompile
-    // output writes (blake2b's, which live in
-    // `blake2b_mem_ops`, not `step.mem_write`) — over the initial memory. Using
+    // output writes (BLAKE2b's and Poseidon2's, which live in
+    // `blake2b_mem_ops` and `poseidon2_ops`, not `step.mem_write`) — over the
+    // initial memory. Using
     // step writes alone leaves precompile-output bytes stale, so a downstream
     // segment's initial-memory commitment (which DOES reflect those writes,
     // via `segment::replay_writes`) would mismatch and `verify_chain`'s

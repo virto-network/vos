@@ -58,12 +58,14 @@ pub fn actor(id: u64) -> bool {
     ACTOR_ABI.contains(&id) || PRECOMPILES.contains(&id)
 }
 
-/// An attestable method's kernel's call: the BLAKE2b precompile or its
-/// witness input, the calls the node's segments prove, which its
-/// derivation checks.
+/// An attestable method's kernel's call: the BLAKE2b or the Poseidon2
+/// precompile, or its witness input, the calls the node's segments prove,
+/// which its derivation checks.
 pub fn kernel(id: u64) -> bool {
     matches!(
         id,
-        super::precompile::BLAKE2B_COMPRESS | super::precompile::WITNESS_INPUT
+        super::precompile::BLAKE2B_COMPRESS
+            | super::precompile::POSEIDON2
+            | super::precompile::WITNESS_INPUT
     )
 }

@@ -10,12 +10,13 @@
 //! the integers: the schoolbook is the exact product `b·d`, the
 //! correction the exact `result + term_a + term_b ≡ uph (mod 2^64)`.
 //!
-//! Lookup tuple (47 limbs): val_b\[8\] + val_d\[8\] + result\[8\] +
-//! mul_high\[8\] + unsigned_product_low\[8\] + sign_bit_b + sign_bit_d +
-//! 5 flags.  CpuChip witnesses val_b/val_d/result/mul_high/
-//! unsigned_product_low + sign_bit_b/d (the latter two pinned by
-//! CpuChip's existing nibble-AND lookups); MulChip's AIR pins them all
-//! via the schoolbook + sign-correction chain.
+//! Lookup tuple (37 limbs): val_b\[8\] + val_d\[8\] + result\[8\] +
+//! sign_bit_b + sign_bit_d + the 4 rotate flags + the logical right
+//! shift's flag and its zero-amount flag + 5 mul flags.  CpuChip witnesses
+//! val_b/val_d/result + sign_bit_b/d (the latter two pinned by CpuChip's
+//! nibble-AND lookups); MulChip witnesses mul_high and the product's
+//! words, and its AIR pins them all via the schoolbook + sign-correction
+//! chain.
 
 use crate::prelude::*;
 use num_traits::{One, Zero};
@@ -109,6 +110,13 @@ pub enum Column {
     IsRotateL32,
     #[size = 1]
     IsRotateR32,
+    /// A logical right shift: the result is the product's high word, its
+    /// low word when the amount is 0 (`ShiftZero`). Pinned via the lookup
+    /// tuple to CpuChip's IsShloR and ShiftZero.
+    #[size = 1]
+    IsShloR,
+    #[size = 1]
+    ShiftZero,
     /// 1 iff this row is a low-output mul variant.
     #[size = 1]
     IsMulLo,
@@ -150,14 +158,18 @@ pub enum Column {
     /// `(1 - IsPadding) · Is32Bit` — full 32-bit row selector.
     #[size = 1]
     Is32BitActive,
-    /// `MulLoActive · (1 - IsRotateL64 - IsRotateR64)` —
+    /// `MulLoActive · (1 - IsRotateL64 - IsRotateR64 - IsShloR)` —
     /// full mul_lo 64-bit non-rotate selector for `result = upl` binding.
     #[size = 1]
     MulLoNoRotate64,
-    /// `Is32BitActive · (1 - IsRotateL32 - IsRotateR32)` —
+    /// `Is32BitActive · (1 - IsRotateL32 - IsRotateR32 - IsShloR)` —
     /// full 32-bit non-rotate selector for `result = upl` binding.
     #[size = 1]
     Is32BitNoRotate32,
+    /// `NotPadding64bit · IsShloR` — the 64-bit logical right shift's
+    /// selector for its result's high four bytes.
+    #[size = 1]
+    ShloR64Active,
 
     /// 64-bit schoolbook partial-sum helper at position k:
     /// `PartialSum64[k] := Σ_{i+j=k, i,j<8} ValB[i]·ValD[j]` (deg 2 def).
@@ -215,6 +227,8 @@ impl BuiltInComponent for MulChip {
         let is_rot_r64 = crate::trace::trace_eval!(trace_eval, Column::IsRotateR64);
         let is_rot_l32 = crate::trace::trace_eval!(trace_eval, Column::IsRotateL32);
         let is_rot_r32 = crate::trace::trace_eval!(trace_eval, Column::IsRotateR32);
+        let is_shlo_r = crate::trace::trace_eval!(trace_eval, Column::IsShloR);
+        let shift_zero = crate::trace::trace_eval!(trace_eval, Column::ShiftZero);
         let is_mul_lo = crate::trace::trace_eval!(trace_eval, Column::IsMulLo);
         let is_mu_uu = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperUU);
         let is_mu_su = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSU);
@@ -229,6 +243,7 @@ impl BuiltInComponent for MulChip {
         let is_32bit_active = crate::trace::trace_eval!(trace_eval, Column::Is32BitActive);
         let mul_lo_no_rotate64 = crate::trace::trace_eval!(trace_eval, Column::MulLoNoRotate64);
         let is_32bit_no_rotate32 = crate::trace::trace_eval!(trace_eval, Column::Is32BitNoRotate32);
+        let shlo_r64_active = crate::trace::trace_eval!(trace_eval, Column::ShloR64Active);
         let partial_sum_64 = crate::trace::trace_eval!(trace_eval, Column::PartialSum64);
         let partial_sum_32 = crate::trace::trace_eval!(trace_eval, Column::PartialSum32);
         let sign_d_a = crate::trace::trace_eval!(trace_eval, Column::SignDA);
@@ -265,14 +280,19 @@ impl BuiltInComponent for MulChip {
             mul_upper_active[0].clone() - not_padding_64bit[0].clone() * is_mul_upper_e.clone(),
         );
         eval.add_constraint(is_32bit_active[0].clone() - is_real.clone() * is_32bit[0].clone());
-        let one_minus_rotate_64 = E::F::one() - is_rot_l64[0].clone() - is_rot_r64[0].clone();
-        let one_minus_rotate_32 = E::F::one() - is_rot_l32[0].clone() - is_rot_r32[0].clone();
+        let one_minus_rotate_64 =
+            E::F::one() - is_rot_l64[0].clone() - is_rot_r64[0].clone() - is_shlo_r[0].clone();
+        let one_minus_rotate_32 =
+            E::F::one() - is_rot_l32[0].clone() - is_rot_r32[0].clone() - is_shlo_r[0].clone();
         eval.add_constraint(
             mul_lo_no_rotate64[0].clone() - mul_lo_active[0].clone() * one_minus_rotate_64.clone(),
         );
         eval.add_constraint(
             is_32bit_no_rotate32[0].clone()
                 - is_32bit_active[0].clone() * one_minus_rotate_32.clone(),
+        );
+        eval.add_constraint(
+            shlo_r64_active[0].clone() - not_padding_64bit[0].clone() * is_shlo_r[0].clone(),
         );
 
         // PartialSum64[k] = Σ_{i+j=k, i,j<8} ValB[i]·ValD[j] for k=0..16.
@@ -399,6 +419,9 @@ impl BuiltInComponent for MulChip {
         //   sum, no carry — bits non-overlapping by construction of rotation).
         // For non-rotate is_mul_lo 32-bit: result[0..4] = upl[0..4].
         // For RotL32 / RotR32: result[0..4] = upl[0..4] + mul_high[0..4].
+        // For a logical right shift: result = mul_high, the product's high
+        // word, plus upl when the amount is 0 (val_d = 1, mul_high = 0); on
+        // a 32-bit one over bytes 0..4.
         // 32-bit upper result limbs (i ∈ 4..8) are pinned by CpuChip's
         // sign-extension constraint (on CpuChip side).
         {
@@ -424,6 +447,18 @@ impl BuiltInComponent for MulChip {
                     is_rotate_32_either.clone()
                         * (result[i].clone() - upl[i].clone() - mul_high[i].clone()),
                 );
+            }
+            // The low half's gate is IsShloR without the padding factor:
+            // inert, as a gate only adds constraints, and a padding row's
+            // tuple is consumed at multiplicity −is_real = 0, so its
+            // IsShloR binds nothing; the CPU's rows that produce a shift
+            // have IsMul, which padding pins to 0.
+            for i in 0..WORD_SIZE {
+                let shifted = result[i].clone()
+                    - mul_high[i].clone()
+                    - shift_zero[0].clone() * upl[i].clone();
+                let gate = if i < 4 { &is_shlo_r } else { &shlo_r64_active };
+                eval.add_constraint(gate[0].clone() * shifted);
             }
         }
 
@@ -451,9 +486,10 @@ impl BuiltInComponent for MulChip {
         }
 
         // ── Lookup consumer ──
-        // Tuple (35 limbs): val_b[8] + val_d[8] + result[8] +
-        //   sign_bit_b + sign_bit_d + 4 rotate flags + 5 mul flags.
-        let mut tuple: Vec<E::F> = Vec::with_capacity(35);
+        // Tuple (37 limbs): val_b[8] + val_d[8] + result[8] +
+        //   sign_bit_b + sign_bit_d + 4 rotate flags + is_shlo_r +
+        //   shift_zero + 5 mul flags.
+        let mut tuple: Vec<E::F> = Vec::with_capacity(37);
         tuple.extend_from_slice(&val_b);
         tuple.extend_from_slice(&val_d);
         tuple.extend_from_slice(&result);
@@ -463,6 +499,8 @@ impl BuiltInComponent for MulChip {
         tuple.push(is_rot_r64[0].clone());
         tuple.push(is_rot_l32[0].clone());
         tuple.push(is_rot_r32[0].clone());
+        tuple.push(is_shlo_r[0].clone());
+        tuple.push(shift_zero[0].clone());
         tuple.push(is_mul_lo[0].clone());
         tuple.push(is_mu_uu[0].clone());
         tuple.push(is_mu_su[0].clone());
@@ -534,6 +572,8 @@ impl BuiltInProverComponent for MulChip {
             trace.fill_columns(row, e.is_rotate_r64, Column::IsRotateR64);
             trace.fill_columns(row, e.is_rotate_l32, Column::IsRotateL32);
             trace.fill_columns(row, e.is_rotate_r32, Column::IsRotateR32);
+            trace.fill_columns(row, e.is_shlo_r, Column::IsShloR);
+            trace.fill_columns(row, e.shift_zero, Column::ShiftZero);
             trace.fill_columns(row, e.is_mul_lo, Column::IsMulLo);
             trace.fill_columns(row, e.is_mul_upper_uu, Column::IsMulUpperUU);
             trace.fill_columns(row, e.is_mul_upper_su, Column::IsMulUpperSU);
@@ -549,14 +589,15 @@ impl BuiltInProverComponent for MulChip {
             let mlo_active = np_64 && e.is_mul_lo;
             let mup_active = np_64 && mu_e;
             let i32_active = real && e.is_32bit;
-            let no_rot_64 = !e.is_rotate_l64 && !e.is_rotate_r64;
-            let no_rot_32 = !e.is_rotate_l32 && !e.is_rotate_r32;
+            let no_rot_64 = !e.is_rotate_l64 && !e.is_rotate_r64 && !e.is_shlo_r;
+            let no_rot_32 = !e.is_rotate_l32 && !e.is_rotate_r32 && !e.is_shlo_r;
             trace.fill_columns(row, np_64, Column::NotPadding64bit);
             trace.fill_columns(row, mlo_active, Column::MulLoActive);
             trace.fill_columns(row, mup_active, Column::MulUpperActive);
             trace.fill_columns(row, i32_active, Column::Is32BitActive);
             trace.fill_columns(row, mlo_active && no_rot_64, Column::MulLoNoRotate64);
             trace.fill_columns(row, i32_active && no_rot_32, Column::Is32BitNoRotate32);
+            trace.fill_columns(row, np_64 && e.is_shlo_r, Column::ShloR64Active);
 
             // PartialSum helpers — values can exceed u8, so fill via BaseField.
             use stwo::core::fields::m31::BaseField;
@@ -636,6 +677,8 @@ impl BuiltInProverComponent for MulChip {
         let is_rot_r64 = crate::trace::original_base_column!(component_trace, Column::IsRotateR64);
         let is_rot_l32 = crate::trace::original_base_column!(component_trace, Column::IsRotateL32);
         let is_rot_r32 = crate::trace::original_base_column!(component_trace, Column::IsRotateR32);
+        let is_shlo_r = crate::trace::original_base_column!(component_trace, Column::IsShloR);
+        let shift_zero = crate::trace::original_base_column!(component_trace, Column::ShiftZero);
         let is_mul_lo = crate::trace::original_base_column!(component_trace, Column::IsMulLo);
         let is_mu_uu = crate::trace::original_base_column!(component_trace, Column::IsMulUpperUU);
         let is_mu_su = crate::trace::original_base_column!(component_trace, Column::IsMulUpperSU);
@@ -674,6 +717,8 @@ impl BuiltInProverComponent for MulChip {
         tuple.push(is_rot_r64[0].clone());
         tuple.push(is_rot_l32[0].clone());
         tuple.push(is_rot_r32[0].clone());
+        tuple.push(is_shlo_r[0].clone());
+        tuple.push(shift_zero[0].clone());
         tuple.push(is_mul_lo[0].clone());
         tuple.push(is_mu_uu[0].clone());
         tuple.push(is_mu_su[0].clone());

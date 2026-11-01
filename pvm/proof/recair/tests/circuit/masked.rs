@@ -136,7 +136,7 @@ fn the_masked_degree_audit_passes() {
 #[test]
 fn the_segment_chips_pass_the_degree_audit_under_c() {
     let count = vos_pvm_proof::chip_idx::COUNT;
-    assert_eq!(count, 25);
+    assert_eq!(count, 26);
     let mask = ((1u64 << count) - 1) as u32;
     let mut lookups = AllLookupElements::default();
     draw_all_lookup_elements(&mut lookups, &mut Blake2sChannel::default(), mask);
@@ -152,12 +152,12 @@ fn the_segment_chips_pass_the_degree_audit_under_c() {
         degrees.extend(counted);
     }
     assert_eq!(degrees.len(), SEGMENT_REFERENCE.constraints as usize);
-    assert_eq!(histogram(&degrees), [0, 23, 4395, 759]);
+    assert_eq!(histogram(&degrees), [0, 16, 4668, 1066]);
 }
 
 /// R5 on the masked segment: each chip's masked evaluation (its constraints,
 /// its blinding fraction joined to its last batch) keeps every constraint of
-/// the chip at its degree, so the masked set holds the segment AIR's 5,177
+/// the chip at its degree, so the masked set holds the segment AIR's 5,750
 /// constraints, none above 3; and the set built at its layout declares them.
 #[test]
 fn the_masked_segment_chips_pass_the_degree_audit() {
@@ -180,8 +180,8 @@ fn the_masked_segment_chips_pass_the_degree_audit() {
         degrees.extend(counted);
     }
     assert_eq!(degrees.len(), SEGMENT_REFERENCE.constraints as usize);
-    assert_eq!(histogram(&degrees), [0, 23, 4395, 759]);
-    let built = SegmentComponents::layout(mask, &[10; 25]).unwrap();
+    assert_eq!(histogram(&degrees), [0, 16, 4668, 1066]);
+    let built = SegmentComponents::layout(mask, &[10; vos_pvm_proof::chip_idx::COUNT]).unwrap();
     assert_eq!(
         built
             .components()
@@ -199,12 +199,11 @@ fn the_masked_segment_chips_pass_the_degree_audit() {
 }
 
 /// R5 on the device's masked segment: every chip a device shape may hold
-/// (the shared chip set's CPU, the Poseidon2 chip, the device's boundary
-/// chips, format 35's tables and arithmetic) keeps every constraint at
-/// degree 3 or under, masked; the shared CPU holds format 35's CPU's
-/// constraints and four more (the call's selector and its pointers'
-/// high bytes); and the set built at its layout declares them, each bounded
-/// at `log_size + 2`.
+/// (the shared chip set's CPU and Poseidon2 chip, the device's boundary
+/// chips, the tables and the arithmetic) keeps every constraint at degree 3
+/// or under, masked; the CPU is the node segment's, its fractions the same;
+/// and the set built at its layout declares them, each bounded at
+/// `log_size + 2`.
 #[test]
 fn the_masked_device_chips_pass_the_degree_audit() {
     use vos_pvm_proof::device::{DEVICE_ALL, device_chip, device_chips_of_mask};
@@ -230,7 +229,7 @@ fn the_masked_device_chips_pass_the_degree_audit() {
         if chip == device_chip::CPU {
             let plain = drive_masked_chip(chip, 10, &lookups, &blind, InfoEvaluator::empty());
             let fractions = |info: &InfoEvaluator| info.logup.fracs.len();
-            assert_eq!(fractions(&info), fractions(&plain) + 3);
+            assert_eq!(fractions(&info), fractions(&plain));
         }
     }
     let count = device_chips_of_mask(DEVICE_ALL).count();
@@ -252,12 +251,13 @@ fn the_masked_device_chips_pass_the_degree_audit() {
 }
 
 /// The cubic census (the review's option 4), a measurement: which of the
-/// masked segment's 759 cubic constraints are logup batches (the pairs'
+/// masked segment's 1,066 cubic constraints are logup batches (the pairs'
 /// `Δ·d_1·d_2 − (n_1·d_2 + n_2·d_1)`, the blinding's constant denominator
 /// adding no degree) and which are gates; and the degree the masked AIR
 /// would have with every chip's fractions batched alone (`Logup::Single`,
-/// `Δ·d − n`), with the interaction columns that costs. Measured: 723
-/// batches and 36 gates (the CPU's 34, the memory ledger's 2); so batching
+/// `Δ·d − n`), with the interaction columns that costs. Measured: 856
+/// batches and 210 gates (the Poseidon2 chip's 166, the CPU's 34, the
+/// logical right shift's 8 in MulChip, the memory ledger's 2); so batching
 /// alone leaves the AIR cubic.
 #[test]
 fn the_masked_segments_cubic_census() {
@@ -311,14 +311,15 @@ fn the_masked_segments_cubic_census() {
         gates.iter().sum::<usize>() + batches.iter().sum::<usize>(),
         SEGMENT_REFERENCE.constraints as usize
     );
-    // 723 of the 759 cubic constraints are the pairs' batches; 36 are gates
-    // (the CPU's 34, the memory ledger's 2), which batching alone leaves
-    // cubic. Alone, every fraction is quadratic, at 1,464 interaction QM31
-    // columns against 741.
-    assert_eq!(gates, [0, 23, 4377, 36]);
-    assert_eq!(batches, [0, 0, 18, 723]);
-    assert_eq!(single_max, 2);
-    assert_eq!((single_columns, paired_columns), (1464, 741));
+    // 856 of the 1,066 cubic constraints are the pairs' batches; 210 are
+    // gates (the Poseidon2 chip's 166, the CPU's 34, MulChip's 8, the memory
+    // ledger's 2), which batching alone leaves cubic. Alone, every fraction
+    // is at most cubic (the Poseidon2 chip's, its addresses of degree 2), at
+    // 1,636 interaction QM31 columns against 876.
+    assert_eq!(gates, [0, 16, 4648, 210]);
+    assert_eq!(batches, [0, 0, 20, 856]);
+    assert_eq!(single_max, 3);
+    assert_eq!((single_columns, paired_columns), (1636, 876));
 }
 
 /// The masked wrap's shape, read from the built components' own layout:

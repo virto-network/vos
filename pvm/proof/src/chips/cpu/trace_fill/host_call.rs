@@ -11,7 +11,8 @@ pub(super) struct HostCall {
     pub flag_inv: BaseField,
 }
 
-/// The host calls: the BLAKE2b call's registers and the witness input's count.
+/// The host calls: the BLAKE2b call's registers, the witness input's count
+/// and the Poseidon2 call's selector.
 pub(super) fn host_call(out: &mut Sinks, s: Step, ops: &Operands) -> HostCall {
     let Sinks {
         trace,
@@ -29,6 +30,8 @@ pub(super) fn host_call(out: &mut Sinks, s: Step, ops: &Operands) -> HostCall {
     let ecall = step.served_ecall();
     let is_blake_ecall = ecall == Some(ECALL_BLAKE2B_COMPRESS as u64);
     trace.fill_columns(row, is_blake_ecall, Column::IsBlakeEcall);
+    let is_p2_ecall = ecall == Some(u64::from(crate::core::ecall::ECALL_POSEIDON2));
+    trace.fill_columns(row, is_p2_ecall, Column::IsP2Ecall);
     // Witness input: its selector, whether its count is non-zero with
     // the count's inverse, and the comparison count ≤ φ8 CompareChip
     // proves.

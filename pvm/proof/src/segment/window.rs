@@ -19,8 +19,8 @@ use crate::side_note::SideNote;
 ///   precompile reads of values written earlier bottom out at the right
 ///   bytes;
 /// - the captured BLAKE2b precompile records, a parallel
-///   `call ↔ mem_op` pair, filtered to those whose `mem_op.ts` lies in
-///   the segment's timestamp window `[steps[a].ts, steps[b].ts)`;
+///   `call ↔ mem_op` pair, and the Poseidon2 calls, filtered to those whose
+///   timestamp lies in the segment's window `[steps[a].ts, steps[b].ts)`;
 /// - `jump_table` (program-static, shared by all segments).
 ///
 /// Lookup-multiplicity counts are NOT carried: the chips re-derive them
@@ -43,7 +43,7 @@ pub fn segment_side_note(full: &SideNote, a: usize, b: usize) -> SideNote {
     // Memory state entering the segment: replay EVERY write with
     // `ts < ts_lo` in timestamp order — both regular stores
     // (`step.mem_write`) AND precompile output writes (blake2b's
-    // `blake2b_mem_ops`), which are NOT recorded in
+    // `blake2b_mem_ops`, Poseidon2's `poseidon2_ops`), which are NOT recorded in
     // `step.mem_write`. Missing the precompile writes leaves stale bytes
     // at their output addresses, so a later segment's read of an
     // earlier-segment precompile result fails the memory-ledger
@@ -101,6 +101,12 @@ fn build_segment_with_memory(full: &SideNote, a: usize, b: usize, mem: SegmentMe
     });
     sn.blake2b_calls = bc;
     sn.blake2b_mem_ops = bm;
+    sn.poseidon2_ops = full
+        .poseidon2_ops
+        .iter()
+        .filter(|op| in_window(op.ts))
+        .cloned()
+        .collect();
 
     sn
 }
@@ -111,8 +117,9 @@ fn build_segment_with_memory(full: &SideNote, a: usize, b: usize, mem: SegmentMe
 /// ENTERING step `t`); `None` applies all writes (the FINAL memory).
 ///
 /// Crucially this includes **precompile output writes** (blake2b's
-/// 64-byte hash at `h_ptr`), which the per-step
-/// `mem_write` does NOT capture — they live in the `*_mem_ops` records.
+/// 64-byte hash at `h_ptr`, Poseidon2's 32 bytes at its output), which the
+/// per-step `mem_write` does NOT capture — they live in `blake2b_mem_ops`
+/// and `poseidon2_ops`.
 /// Used both for a segment's threaded initial memory (`segment_side_note`)
 /// and its final memory commitment (`prove`'s boundary state); the two
 /// MUST agree or `verify_chain`'s boundary-continuity check rejects.

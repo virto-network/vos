@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use crate::core::step::PvmStep;
 use crate::side_note::SideNote;
 
-use crate::core::tracing::Blake2bMemOp;
+use crate::core::tracing::{Blake2bMemOp, Poseidon2Op};
 
 /// Content-budgeted segmentation: split the trace into maximal windows
 /// holding BOTH budgets — at most `max_steps` steps AND at most
@@ -57,6 +57,7 @@ pub fn segment_bounds_budgeted(
     let mut cutter = BudgetedCutter::new(max_steps, max_pages);
     let mut bounds = Vec::new();
     let mut cb = 0;
+    let mut cp = 0;
     let mut ranges: Vec<(u32, u32)> = Vec::new();
     for step in &full.steps {
         let ts = step.timestamp;
@@ -68,6 +69,13 @@ pub fn segment_bounds_budgeted(
             ts,
             |o| o.ts,
             |o| blake2b_op_ranges(o, &mut ranges),
+        );
+        take_at(
+            &full.poseidon2_ops,
+            &mut cp,
+            ts,
+            |o| o.ts,
+            |o| poseidon2_op_ranges(o, &mut ranges),
         );
 
         let (before, after) = cutter.feed(&ranges);
@@ -95,6 +103,12 @@ fn step_ranges(s: &PvmStep, out: &mut Vec<(u32, u32)>) {
 fn blake2b_op_ranges(o: &Blake2bMemOp, out: &mut Vec<(u32, u32)>) {
     out.push((o.h_ptr, o.h_bytes.len() as u32));
     out.push((o.m_ptr, o.m_bytes.len() as u32));
+}
+
+// The touched ranges of one Poseidon2 call: its input and its output.
+fn poseidon2_op_ranges(o: &Poseidon2Op, out: &mut Vec<(u32, u32)>) {
+    out.push((o.in_ptr, o.input.len() as u32));
+    out.push((o.out_ptr, o.output.len() as u32));
 }
 
 /// The incremental budgeted-cut decision behind

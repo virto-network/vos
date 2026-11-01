@@ -130,7 +130,7 @@ fn the_agent_serves_the_precompiles_a_node_does_at_its_price() {
             "{id:#x}"
         );
     }
-    assert!(!surface::kernel(abi::precompile::POSEIDON2));
+    assert!(surface::kernel(abi::precompile::POSEIDON2));
     assert_eq!(
         vos_pvm::precompile::WITNESS_INPUT_MAX,
         vos_wire::abi::cap::WORK_RESULT

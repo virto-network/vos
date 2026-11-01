@@ -49,13 +49,13 @@ use common::Rng;
 /// Each chip's log size at the window kernel's class 1, as the baseline
 /// counted them.
 const LOG_SIZES: [u32; chip_idx::COUNT] = [
-    15, 14, 16, 18, 9, 8, 4, 17, 4, 4, 4, 16, 8, 16, 8, 8, 6, 8, 8, 8, 15, 15, 15, 15, 16,
+    15, 14, 8, 16, 18, 9, 8, 4, 17, 4, 4, 4, 16, 8, 16, 8, 8, 6, 8, 8, 8, 15, 15, 15, 15, 16,
 ];
 
 /// Each chip's fused gate rows in the re-baselined count, the full shape.
 const BASELINE: [usize; chip_idx::COUNT] = [
-    2850, 12307, 5341, 202, 4876, 709, 76, 191, 19, 26, 37, 48, 19, 126, 10, 12, 18, 11, 12, 18,
-    830, 353, 141, 1199, 12,
+    2901, 12307, 4758, 5341, 202, 4876, 709, 76, 191, 19, 26, 37, 48, 19, 126, 10, 12, 18, 11, 12,
+    18, 859, 353, 141, 1199, 12,
 ];
 
 /// Each chip's compiled rows, pinned: a change of a chip that changes its
@@ -64,7 +64,7 @@ const PINNED: [usize; chip_idx::COUNT] = BASELINE;
 
 /// The full shape's rows: the chips' rows with what they share counted
 /// once, then the relations' `α` powers.
-const PINNED_SHAPE: (usize, usize) = (29443, 573);
+const PINNED_SHAPE: (usize, usize) = (34281, 589);
 
 fn lookup(seed: u64) -> AllLookupElements {
     let mut channel = Poseidon2M31Channel::default();

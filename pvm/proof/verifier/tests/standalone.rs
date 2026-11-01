@@ -426,7 +426,7 @@ fn standalone_verify_rejects_weak_pcs_config() {
         .expect_err("verify_standalone must refuse a weakened config");
     let msg = format!("{err:?}");
     assert!(
-        msg.contains("below format 35's floor"),
+        msg.contains("below format 41's floor"),
         "expected the format's floor, got: {msg}"
     );
 }

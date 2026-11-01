@@ -526,8 +526,8 @@ fn every_package_is_built() {
 /// device runs it, it returns its statement's parts, its public arguments
 /// auth's 129 bytes and no output, and leaves their Poseidon2 io-hash,
 /// computed through the `0x402` call alone: 36 calls for the statement, 7
-/// for the io-hash. A node's runner, which serves BLAKE2b's call and not
-/// Poseidon2's, traps it, and a member it does not hold traps too.
+/// for the io-hash. A node's runner, which serves both precompiles, runs it
+/// alike, and a member it does not hold traps it.
 #[test]
 fn a_device_kernel_states_its_parts_under_the_poseidon2_io_hash() {
     use vos_testkit::{device_auth_input, device_parts, run_device_kernel, run_kernel};
@@ -564,7 +564,7 @@ fn a_device_kernel_states_its_parts_under_the_poseidon2_io_hash() {
     );
     assert_ne!(ran.io_hash, parts.io_hash());
     assert_eq!(ran.compressions, 36 + 7);
-    assert_eq!(run_kernel(kernel, &input, GAS), Err(Failure::Trapped));
+    assert_eq!(run_kernel(kernel, &input, GAS), Ok(ran.clone()));
     let mut stranger = input.clone();
     stranger[1024] ^= 1;
     assert_eq!(

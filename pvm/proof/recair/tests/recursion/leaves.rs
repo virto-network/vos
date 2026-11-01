@@ -286,32 +286,34 @@ const fn term(
     }
 }
 
-/// The terms, measured and model. The deltas: the lifting height is 2^20,
+/// The terms, measured on format 41's window shape (its logical right
+/// shifts multiplying, so no DIVREM) and `count-35.log`'s model of format
+/// 35's, which held DIVREM's 213 columns. The deltas: the lifting height is 2^20,
 /// not the model's 2^21 (Stwo's composition bound is the largest component's
 /// log size plus one, split once), a path level and a FRI layer fewer a
 /// query; 16 sample points, not 18 (the largest columns' periodicity points
 /// coincide with their second samples'); the transcript absorbs the proof's
-/// 8,997 sampled values where the model's channel counts DEEP's 9,985
-/// samples, the periodicity ones among them (494 permutations), and the
+/// 8,592 sampled values where the model's channel counts DEEP's 9,985
+/// samples, the periodicity ones among them, and the
 /// statement header and the 296 boundary bytes, which it leaves out; the
 /// PoW nonces' 16-bit limb checks, 100
 /// rows each, and the boundary chips' public terms, which the model leaves
 /// out; the header and preprocessed root checked against the shape.
 const WINDOW_TERMS: [Term; 17] = [
-    term("p2: leaf hashes, four trees", 0, true, 1_004, 1_004),
+    term("p2: leaf hashes, four trees", 0, true, 954, 1_004),
     term("p2: Merkle paths, four trees", 0, true, 78, 84),
     term("p2: FRI leaves and paths", 0, true, 243, 266),
-    term("p2: channel, PoWs and query draws", 0, false, 4_655, 5_082),
+    term("p2: channel, PoWs and query draws", 0, false, 4_451, 5_082),
     term("qm31: query word and 31 bits", 1, true, 64, 63),
     term("qm31: query point from bits", 1, true, 75, 84),
     term("qm31: DEEP, per point", 1, true, 96, 108),
-    term("qm31: DEEP, samples off the h8 runs", 1, true, 785, 769),
+    term("qm31: DEEP, samples off the h8 runs", 1, true, 784, 769),
     term("qm31: FRI folds and twiddles", 1, true, 106, 133),
     term(
         "qm31: OODS (compiled, accumulation, challenge powers, point, vanishing, check)",
         1,
         false,
-        35_216,
+        33_851,
         29_420 + 5_175 + 573 + 54,
     ),
     term(
@@ -325,7 +327,7 @@ const WINDOW_TERMS: [Term; 17] = [
         "qm31: DEEP sums of sampled values",
         1,
         false,
-        20_445,
+        19_627,
         20_458,
     ),
     term("qm31: proof-of-work checks", 1, false, 246, 64),
@@ -333,15 +335,15 @@ const WINDOW_TERMS: [Term; 17] = [
         "qm31: header and preprocessed root against the shape",
         1,
         false,
-        34,
+        33,
         0,
     ),
     term("qm31: the context's constants", 1, false, 2, 0),
-    term("h8: DEEP, 8-sample runs", 2, true, 1_150, 1_152),
+    term("h8: DEEP, 8-sample runs", 2, true, 1_099, 1_152),
     term("h8: nothing else", 2, false, 0, 0),
 ];
 
-/// The window kernel's class-1 leaf topology (mask `0x01f9ffff`), built
+/// The window kernel's class-1 leaf topology (mask `0x02f3fffb`), built
 /// without values: each term's rows as measured, pinned, beside
 /// `count-35.log`'s model (59,242 / 102,049 / 46,080), the segment's
 /// verification without the leaf's own work, and the totals within 2^16 /
@@ -428,7 +430,7 @@ fn the_window_kernels_leaf_rows_per_term() {
         totals[1][term.component] += term.model * times;
     }
     assert_eq!(totals[0], context.rows(), "the terms cover every row");
-    assert_eq!(totals[0], [57_655, 101_638, 46_000]);
+    assert_eq!(totals[0], [55_451, 99_414, 43_960]);
     assert_eq!(
         totals[1],
         [59_242, 102_049, 46_080],

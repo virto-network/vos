@@ -411,7 +411,7 @@ pub fn prove_leaf(
     // A derivation's bound: the built rows exactly, and the finalizing's
     // within its allowance.
     let mut sizes = program.shape.classes[class].log_sizes.iter();
-    let record: [u8; 25] = core::array::from_fn(|chip| {
+    let record: [u8; vos_pvm_proof::chip_idx::COUNT] = core::array::from_fn(|chip| {
         if program.shape.components & 1 << chip != 0 {
             *sizes.next().expect("a size a chip")
         } else {

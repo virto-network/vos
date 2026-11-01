@@ -203,7 +203,7 @@ fn padding_is_a_bit() {
             Cpu::NonShiftGateNotTruncH,
             Cpu::NonShiftGateTruncH,
             Cpu::RealShiftCH,
-            Cpu::IsRotateRGateH,
+            Cpu::ShiftComplGateH,
             Cpu::RealNotFlagBoolH,
             Cpu::RealFlagBoolH,
             Cpu::IsRealTrapH,

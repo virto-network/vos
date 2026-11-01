@@ -9,8 +9,9 @@
 //!   boundaries, the program's memory and boundary, the page Merkle chips
 //!   and the fixed tables.
 //! - **A class** is a cut: at most 2^`log_steps` steps and `pages` pages a
-//!   segment. Each chip's log size is the class's capacity for it: the
-//!   fixed tables' sizes, the program's code and jump table's, and for the
+//!   segment ([`CLASSES`]; [`POSEIDON2_CLASSES`] for a kernel holding the
+//!   Poseidon2 chip, whose leaf would not fit the 24-page class). Each
+//!   chip's log size is the class's capacity for it: the fixed tables' sizes, the program's code and jump table's, and for the
 //!   chips whose rows a run fills, a size the cut's budgets bound or
 //!   provision. A segment whose rows overflow a class proves at the next
 //!   that holds it; a prover cuts it again when none does.
@@ -20,7 +21,7 @@
 //! tests hold this module to them, opcode by opcode and size by size.
 
 use vos_pvm::instruction::{Opcode, decode_opcode_fast};
-use vos_pvm::precompile::{BLAKE2B_COMPRESS, WITNESS_INPUT};
+use vos_pvm::precompile::{BLAKE2B_COMPRESS, POSEIDON2, WITNESS_INPUT};
 use vos_wire::records::{SEGMENT_CHIPS, SegmentClass, Shape};
 
 /// The segment AIR's chips, in its order.
@@ -28,6 +29,7 @@ pub use vos_wire::records::segment_chip as chip;
 
 /// The chips a code selects: the rest are in every shape.
 const SELECTED: u32 = 1 << chip::BLAKE2B
+    | 1 << chip::POSEIDON2
     | 1 << chip::JUMP_TABLE
     | 1 << chip::WITNESS_INPUT
     | 1 << chip::POPCOUNT
@@ -42,10 +44,8 @@ const SELECTED: u32 = 1 << chip::BLAKE2B
 pub const ALWAYS: u32 = ((1 << SEGMENT_CHIPS) - 1) & !SELECTED;
 
 /// The version of the policy below, the classes and each chip's capacity
-/// in them, that a shape's record names (`Shape::policy`): a change to
-/// either derives other shapes from the same code, so it takes a new
-/// version.
-pub const POLICY: u32 = 1;
+/// in them, that a shape's record names (`Shape::policy`).
+pub const POLICY: u32 = Shape::POLICY;
 
 /// The classes a kernel's segments prove at, cheapest first, as
 /// `(log_steps, pages)`: a short segment's; the 32k cut's; and a short
@@ -54,7 +54,16 @@ pub const POLICY: u32 = 1;
 /// around it.
 pub const CLASSES: [(u8, u16); 3] = [(12, 8), (15, 8), (12, 24)];
 
+/// The classes of a kernel holding the Poseidon2 chip: [`CLASSES`] with the
+/// third holding 17 pages, a whole argument written at once and no more.
+/// The chip's columns, beside BLAKE2b's, take a leaf of the 24-page class
+/// past the recursion's 2^17 `qm31` rows (its page boundary at 2^18 rows);
+/// at 17 pages the boundary is at 2^17 and the leaf fits
+/// ([`crate::leaf`]). A segment of more pages is cut again.
+pub const POSEIDON2_CLASSES: [(u8, u16); 3] = [(12, 8), (15, 8), (12, 17)];
+
 const _: () = assert!(CLASSES.len() <= vos_wire::records::MAX_CLASSES);
+const _: () = assert!(POSEIDON2_CLASSES.len() <= vos_wire::records::MAX_CLASSES);
 
 /// The rows of a SIMD lane, the least a chip has: 2^4.
 const LOG_LANES: u8 = 4;
@@ -64,10 +73,10 @@ pub fn opcode_chips(op: Opcode) -> u32 {
     use Opcode::*;
     match op {
         Mul64 | MulImm64 | Mul32 | MulImm32 | MulUpperUU | MulUpperSU | MulUpperSS | ShloL64
-        | ShloLImm64 | ShloLImmAlt64 | ShloL32 | ShloLImm32 | ShloLImmAlt32 | RotL64 | RotL32
+        | ShloLImm64 | ShloLImmAlt64 | ShloL32 | ShloLImm32 | ShloLImmAlt32 | ShloR64
+        | ShloRImm64 | ShloRImmAlt64 | ShloR32 | ShloRImm32 | ShloRImmAlt32 | RotL64 | RotL32
         | RotR64 | RotR64Imm | RotR64ImmAlt | RotR32 | RotR32Imm | RotR32ImmAlt => 1 << chip::MUL,
-        DivU64 | DivU32 | DivS64 | DivS32 | RemU64 | RemU32 | RemS64 | RemS32 | ShloR64
-        | ShloRImm64 | ShloRImmAlt64 | ShloR32 | ShloRImm32 | ShloRImmAlt32 | SharR64
+        DivU64 | DivU32 | DivS64 | DivS32 | RemU64 | RemU32 | RemS64 | RemS32 | SharR64
         | SharRImm64 | SharRImmAlt64 | SharR32 | SharRImm32 | SharRImmAlt32 => 1 << chip::DIVREM,
         And | AndImm | Or | OrImm | Xor | XorImm | AndInv | OrInv | Xnor => 1 << chip::BITWISE,
         SetLtU | SetLtUImm | SetLtS | SetLtSImm | SetGtUImm | SetGtSImm | CmovIz | CmovIzImm
@@ -89,6 +98,7 @@ pub fn opcode_chips(op: Opcode) -> u32 {
 pub(crate) fn host_call_chips(id: u64) -> u32 {
     match id {
         id if id == BLAKE2B_COMPRESS => 1 << chip::BLAKE2B,
+        id if id == POSEIDON2 => 1 << chip::POSEIDON2,
         id if id == WITNESS_INPUT => 1 << chip::WITNESS_INPUT | 1 << chip::COMPARE,
         _ => 0,
     }
@@ -132,6 +142,9 @@ fn capacity(index: usize, log_steps: u8, pages: u16, code: usize, jump_table: us
         chip::CPU => s,
         // 96 rows a compression.
         chip::BLAKE2B => s - 1,
+        // A row a permutation, provisioned for a call every eight steps;
+        // a segment of denser calls overflows the class and is cut again.
+        chip::POSEIDON2 => s - 3,
         // 96 rows a compression: a listed page's leaf before and after, 64,
         // and its share of the merges above, about 8 for clustered pages.
         chip::BLAKE2B_BOUNDARY => lanes(96 * 72 * listed),
@@ -170,7 +183,12 @@ pub fn kernel_shape(blob: &[u8]) -> Option<Shape> {
     let program = vos_pvm_program::parse_standard_program(blob)?;
     let code = &program.code;
     let chips = code_chips(&code.code, &code.bitmask);
-    let classes = CLASSES
+    let classes = if chips & 1 << chip::POSEIDON2 != 0 {
+        &POSEIDON2_CLASSES
+    } else {
+        &CLASSES
+    };
+    let classes = classes
         .iter()
         .map(|&(log_steps, pages)| SegmentClass {
             log_steps,

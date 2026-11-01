@@ -186,7 +186,7 @@ fn the_fixtures_composition_is_compiled() {
     check_real(&common::segment_fixture());
 }
 
-/// A run proved over all 25 chips, the ones it does not use padded.
+/// A run proved over every chip, the ones it does not use padded.
 #[test]
 fn a_full_shape_proofs_composition_is_compiled() {
     check_real(common::full_shape_proof());

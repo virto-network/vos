@@ -80,11 +80,10 @@ pub const WITNESS_INPUT_BYTE_GAS: crate::Gas = 24;
 /// (`vos_wire::abi::cap::WORK_RESULT`): the attest that records it fits one.
 pub const WITNESS_INPUT_MAX: usize = 4 << 20;
 
-/// Whether `id` names a call a kernel may make: the BLAKE2b precompile, or
-/// its witness input. The node's segments prove no Poseidon2 call, so a
-/// kernel makes none.
+/// Whether `id` names a call a kernel may make: the BLAKE2b or the
+/// Poseidon2 precompile, or its witness input.
 pub const fn is_kernel_call(id: u64) -> bool {
-    matches!(id, BLAKE2B_COMPRESS | WITNESS_INPUT)
+    matches!(id, BLAKE2B_COMPRESS | POSEIDON2 | WITNESS_INPUT)
 }
 
 /// Whether `id` names a call a device kernel may make: the Poseidon2
@@ -556,7 +555,7 @@ mod witness_tests {
         assert!(WitnessInput::new(&bytes[..WITNESS_INPUT_MAX]).is_some());
         assert!(WitnessInput::new(&bytes[..]).is_none());
         assert!(is_kernel_call(WITNESS_INPUT) && is_kernel_call(BLAKE2B_COMPRESS));
-        assert!(is_precompile(POSEIDON2) && !is_kernel_call(POSEIDON2));
+        assert!(is_precompile(POSEIDON2) && is_kernel_call(POSEIDON2));
         assert!(is_device_kernel_call(WITNESS_INPUT) && is_device_kernel_call(POSEIDON2));
         assert!(!is_device_kernel_call(BLAKE2B_COMPRESS));
         assert!(!is_precompile(WITNESS_INPUT) && price(WITNESS_INPUT).is_none());

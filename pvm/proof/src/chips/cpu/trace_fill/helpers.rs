@@ -284,9 +284,6 @@ pub(super) fn helpers(
         Column::IsCmpOrBranchEqH,
     );
     trace.fill_columns(row, is_branch_b && bt, Column::IsBranchTakenH);
-
-    // ── Memory monotonicity helper ──
-    trace.fill_columns_bytes(row, &[0u8; 7], Column::MemByteActiveMonoH);
 }
 
 /// The selectors that are products of booleans.
@@ -352,7 +349,11 @@ pub(super) fn selectors(
         Column::NonShiftGateTruncH,
     );
     trace.fill_columns(row, is_shift_c_b, Column::RealShiftCH);
-    trace.fill_columns(row, real_b && is_rot_r_either_b, Column::IsRotateRGateH);
+    trace.fill_columns(
+        row,
+        real_b && (is_rot_r_either_b || flags.is_shlo_r),
+        Column::ShiftComplGateH,
+    );
     // Flag helpers.
     trace.fill_columns(row, real_b && !flag_bool_b, Column::RealNotFlagBoolH);
     trace.fill_columns(row, real_b && flag_bool_b, Column::RealFlagBoolH);
@@ -446,11 +447,12 @@ pub(super) fn residual(out: &mut Sinks, s: Step, shift: &Shift, div: &DivRem, co
         0
     };
     trace.fill_columns_base_field(row, &[BaseField::from(dsap_v)], Column::DivSActivePartialH);
-    // Lookup-multiplicity helper: IsShiftCNotRotrH = is_shift_c · (1 - rot_r64 - rot_r32).
-    let no_rotr = !flags.is_rotate_r64 && !flags.is_rotate_r32;
+    // Lookup-multiplicity helper: ShiftAmountPow2H =
+    // is_shift_c · (1 - rot_r64 - rot_r32 - shlo_r).
+    let by_amount = !flags.is_rotate_r64 && !flags.is_rotate_r32 && !flags.is_shlo_r;
     trace.fill_columns(
         row,
-        is_shift_constrained && no_rotr,
-        Column::IsShiftCNotRotrH,
+        is_shift_constrained && by_amount,
+        Column::ShiftAmountPow2H,
     );
 }

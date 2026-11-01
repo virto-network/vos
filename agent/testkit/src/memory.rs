@@ -73,9 +73,9 @@ pub(crate) struct KernelRun {
 
 /// Run an attestable method's kernel: laid out with no arguments, which it
 /// reads through its witness input from `input`, output by the halt
-/// convention, and no host calls but the BLAKE2b precompile. An input past
-/// a work result's cap is refused. A failed run's error comes with the gas
-/// it used.
+/// convention, and no host calls but the BLAKE2b and Poseidon2 precompiles
+/// and its witness input. An input past a work result's cap is refused. A
+/// failed run's error comes with the gas it used.
 pub(crate) fn kernel(
     program: &[u8],
     input: &[u8],

@@ -278,6 +278,9 @@ pub struct MulEntry {
     pub is_rotate_r64: bool,
     pub is_rotate_l32: bool,
     pub is_rotate_r32: bool,
+    /// A logical right shift, and whether its amount is 0.
+    pub is_shlo_r: bool,
+    pub shift_zero: bool,
     pub is_mul_lo: bool,
     pub is_mul_upper_uu: bool,
     pub is_mul_upper_su: bool,

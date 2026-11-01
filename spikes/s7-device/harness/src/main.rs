@@ -310,7 +310,7 @@ fn kernels(elf: &Path, data: &Path, out: &Path) {
         ("p2", &b"auth_p2"[..], p2_input()),
     ] {
         let kernel = kernel_of(&elf, method);
-        let trace = vos_pvm_proof::kernel::trace_device_kernel(&kernel, &input, GAS)
+        let trace = vos_pvm_proof::kernel::trace_kernel(&kernel, &input, GAS)
             .expect("the kernel runs to its halt");
         println!(
             "{name}: kernel {} B, input {} B, {} steps",
@@ -817,7 +817,7 @@ fn device_cell(cell: &Cell, run: &Run, input: &[u8], reps: usize) {
     use vos_pvm_recair_air::masked::MaskedComponents;
     let format = masked_format(cell);
     let trace = || {
-        vos_pvm_proof::kernel::trace_device_kernel(&run.kernel, input, GAS)
+        vos_pvm_proof::kernel::trace_kernel(&run.kernel, input, GAS)
             .expect("the kernel runs")
             .side_note
     };

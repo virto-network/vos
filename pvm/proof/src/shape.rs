@@ -152,9 +152,10 @@ impl KernelShape {
 }
 
 /// The shape a kernel's install records: its chips, and each class's log
-/// sizes of those chips in chip order. Refused when the record names a chip
-/// past the segment AIR, sizes a chip outside its chips, leaves out a chip
-/// every proof holds, or has more than [`MAX_CLASSES`] classes, or the
+/// sizes of those chips in chip order. Refused when the record is of
+/// another shape policy, names a chip past the segment AIR, sizes a chip
+/// outside its chips, leaves out a chip every proof holds, or has more than
+/// [`MAX_CLASSES`] classes, or the
 /// shape is otherwise not one [`KernelShape::check`] accepts; so a record a
 /// verifier takes is of exactly one shape.
 #[cfg(feature = "wire")]
@@ -162,6 +163,13 @@ impl TryFrom<&vos_wire::records::Shape> for KernelShape {
     type Error = String;
 
     fn try_from(record: &vos_wire::records::Shape) -> Result<Self, String> {
+        if record.policy != vos_wire::records::Shape::POLICY {
+            return Err(alloc::format!(
+                "the record's shape policy is {}, not {}",
+                record.policy,
+                vos_wire::records::Shape::POLICY
+            ));
+        }
         if record.chips & !chip_idx::ALL != 0 {
             return Err(alloc::format!(
                 "the record names chips past the segment AIR: {:#x}",
@@ -296,7 +304,7 @@ mod tests {
     fn record() -> vos_wire::records::Shape {
         let shape = shape();
         vos_wire::records::Shape {
-            policy: 1,
+            policy: vos_wire::records::Shape::POLICY,
             chips: shape.components,
             classes: shape
                 .classes
@@ -334,9 +342,10 @@ mod tests {
         assert_eq!(shape.classes[0].log_sizes[position], 9);
     }
 
-    /// A record naming a chip past the AIR, sizing a chip outside its
-    /// chips, without a chip every proof holds, or with more classes than
-    /// the cap is refused.
+    /// A record of another shape policy (one stored before the policy
+    /// moved, its classes laid out otherwise), naming a chip past the AIR,
+    /// sizing a chip outside its chips, without a chip every proof holds,
+    /// or with more classes than the cap is refused.
     #[cfg(feature = "wire")]
     #[test]
     fn a_malformed_record_is_refused() {
@@ -345,6 +354,8 @@ mod tests {
             change(&mut record);
             KernelShape::try_from(&record).unwrap_err()
         };
+        assert!(refusal(|r| r.policy -= 1).contains("policy"));
+        assert!(refusal(|r| r.policy += 1).contains("policy"));
         assert!(refusal(|r| r.chips |= 1 << chip_idx::COUNT).contains("past"));
         assert!(refusal(|r| r.chips |= 1 << 31).contains("past"));
         assert!(refusal(|r| r.classes[1].log_sizes[chip_idx::DIVREM] = 12).contains("outside"));

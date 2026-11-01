@@ -6,7 +6,7 @@
 
 use vos_pvm_proof::chip_idx;
 use vos_pvm_proof::device::{device_chip, device_chips_of_code};
-use vos_pvm_proof::kernel::{kernel_side_note, trace_device_kernel};
+use vos_pvm_proof::kernel::{kernel_side_note, trace_kernel};
 use vos_testkit::programs::{derived, kernel};
 
 /// The `auth` kernel's device chips: Poseidon2's and the witness input's,
@@ -27,7 +27,7 @@ fn a_device_kernels_shape_holds_no_blake2b() {
     assert_ne!(chips & 1 << device_chip::POSEIDON2, 0);
     assert_ne!(chips & 1 << chip_idx::WITNESS_INPUT, 0);
     let (input, public) = vos_testkit::device_auth_input();
-    let trace = trace_device_kernel(&blob, &input, 50_000_000).expect("halts");
+    let trace = trace_kernel(&blob, &input, 50_000_000).expect("halts");
     assert_eq!(
         vos_pvm_precompiles::device_return_parts(&trace.output),
         Some((&public[..], &[][..]))

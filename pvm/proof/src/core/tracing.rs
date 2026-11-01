@@ -77,8 +77,6 @@ pub struct TracingPvm {
     witness_input: Option<WitnessInput<Vec<u8>>>,
     /// Each witness-input call served, in order.
     pub witness_reads: Vec<WitnessRead>,
-    /// Whether the Poseidon2 call is served (`with_poseidon2`).
-    poseidon2: bool,
     /// Each Poseidon2 call served, in order.
     pub poseidon2_ops: Vec<Poseidon2Op>,
     timestamp: u64,
@@ -96,7 +94,6 @@ impl TracingPvm {
             blake2b_mem_ops: Vec::new(),
             witness_input: None,
             witness_reads: Vec::new(),
-            poseidon2: false,
             poseidon2_ops: Vec::new(),
             timestamp: 1, // 0 is reserved for initial memory entries
         }
@@ -110,19 +107,9 @@ impl TracingPvm {
         Some(self)
     }
 
-    /// Serve the Poseidon2 call (`ECALL_POSEIDON2`) as the runtime does, at
-    /// its price, for the shared chip set's proofs: only that chip set's CPU
-    /// acknowledges it, so a node segment's tracer, built without this,
-    /// ends a run at it.
-    pub fn with_poseidon2(mut self) -> Self {
-        self.poseidon2 = true;
-        self
-    }
-
     /// Whether this tracer serves call `id`.
     fn serves(&self, id: u64) -> bool {
         crate::core::ecall::is_proof_host_call_allowed(id)
-            || (self.poseidon2 && id == u64::from(crate::core::ecall::ECALL_POSEIDON2))
     }
 
     /// The witness input's bytes read so far, and how many remain.
@@ -297,9 +284,7 @@ impl TracingPvm {
                     return Some(ExitReason::Panic);
                 }
             }
-            ExitReason::HostCall(id)
-                if self.poseidon2 && id == u64::from(crate::core::ecall::ECALL_POSEIDON2) =>
-            {
+            ExitReason::HostCall(id) if id == u64::from(crate::core::ecall::ECALL_POSEIDON2) => {
                 // A range the machine cannot read or write, or an input
                 // word at or above p, traps the call.
                 if !self.handle_poseidon2() {

@@ -1,5 +1,5 @@
 //! Minimal on-device proving benchmark: trace + prove + verify a tiny
-//! ADD-chain fixture under the segment format (35), reporting wall-clock
+//! ADD-chain fixture under the segment format (41), reporting wall-clock
 //! times and peak RSS.  This is the artifact to cross-compile and push
 //! to a phone for the ARM bring-up numbers.
 //!
@@ -56,7 +56,7 @@ fn main() {
         .unwrap_or(14);
     let n_steps = 1usize << log_size;
     println!(
-        "mobile_bench: arch={} log_size={log_size} ({n_steps} steps), format 35",
+        "mobile_bench: arch={} log_size={log_size} ({n_steps} steps), format 41",
         std::env::consts::ARCH
     );
 

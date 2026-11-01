@@ -11,7 +11,7 @@
 //!     cargo bench --bench prove -- log16
 //!     cargo bench --bench prove -- profile_log14 scale_sweep
 //!
-//! Every proof is under the segment format (35).
+//! Every proof is under the segment format (41).
 //!
 //! Requires the `prover` feature (on by default).
 

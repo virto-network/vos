@@ -27,7 +27,7 @@ fn reader() -> Vec<u8> {
 
 /// A run that needs more rows than its program's log sizes is refused by
 /// the prover, never proved at a larger shape: the reader's program sized
-/// by a 16-byte reference run, then a run of 1,000 bytes; under format 45.
+/// by a 16-byte reference run, then a run of 1,000 bytes; under format 46.
 #[test]
 fn a_run_past_the_programs_log_sizes_is_refused_by_the_prover() {
     let kernel = reader();

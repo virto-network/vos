@@ -157,7 +157,9 @@ pub(in crate::chips::cpu) fn active_bytes<E: EvalAtRow>(eval: &mut E, row: &Row<
         // (`control::control_flow_helpers`).
         // Monotonicity.
         for i in 0..WORD_SIZE - 1 {
-            eval.add_constraint(row.mem_byte_active_mono_h[i].clone());
+            eval.add_constraint(
+                row.mem_byte_active[i + 1].clone() * (E::F::one() - row.mem_byte_active[i].clone()),
+            );
         }
         // MemSize equals the count of active bytes.
         let mut active_sum = E::F::zero();

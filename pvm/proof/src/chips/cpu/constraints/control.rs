@@ -67,13 +67,6 @@ pub(in crate::chips::cpu) fn control_flow_helpers<E: EvalAtRow>(eval: &mut E, ro
                 row.mem_byte_active[i].clone() * (E::F::one() - row.mem_byte_active[i].clone()),
             );
         }
-        for i in 0..WORD_SIZE - 1 {
-            eval.add_constraint(
-                row.mem_byte_active_mono_h[i].clone()
-                    - row.mem_byte_active[i + 1].clone()
-                        * (E::F::one() - row.mem_byte_active[i].clone()),
-            );
-        }
     }
 }
 

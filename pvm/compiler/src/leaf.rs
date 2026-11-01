@@ -22,7 +22,7 @@
 //! the tables to the AIR and the bound to the built circuit, term by term,
 //! on the window kernel's classes, the full shape and kernels of their own.
 //!
-//! The segment format the bound is for is 35's (`vos_pvm_proof::format`):
+//! The segment format the bound is for is 41's (`vos_pvm_proof::format`):
 //! blowup 4, [`QUERIES`] queries, FRI at fold step 1.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -86,7 +86,7 @@ const POW: [usize; 3] = [6, 246, 0];
 const CONTEXT: [usize; 3] = [0, 2, 0];
 
 /// The segment AIR's relations, each its tuple's size.
-pub const RELATIONS: [(&str, u32); 20] = [
+pub const RELATIONS: [(&str, u32); 21] = [
     ("Range256", 1),
     ("MemoryAccess", 15),
     ("ProgramExecution", 12),
@@ -98,12 +98,13 @@ pub const RELATIONS: [(&str, u32); 20] = [
     ("JumpTable", 8),
     ("Popcount", 2),
     ("Bitcount", 3),
-    ("Multiplication", 35),
+    ("Multiplication", 37),
     ("Bitwise", 30),
     ("Compare", 17),
     ("DivRem", 41),
     ("ByteToBits", 9),
     ("WitnessCall", 13),
+    ("Poseidon2Call", 16),
     ("BitwiseAndByte", 3),
     ("Blake2bCompression", 265),
     ("MerkleNode", 66),
@@ -114,11 +115,11 @@ pub const CHIPS: [Chip; SEGMENT_CHIPS] = [
     // CPU
     Chip {
         preprocessed: 0,
-        main: &[(Current, 56), (Next, 1), (Current, 523)],
-        interaction: &[(Current, 188), (Previous, 4)],
-        relations: 0x1ffff,
-        gates: 2850,
-        constraints: 815,
+        main: &[(Current, 56), (Next, 1), (Current, 520)],
+        interaction: &[(Current, 196), (Previous, 4)],
+        relations: 0x3ffff,
+        gates: 2901,
+        constraints: 823,
     },
     // BLAKE2B
     Chip {
@@ -135,9 +136,18 @@ pub const CHIPS: [Chip; SEGMENT_CHIPS] = [
             (Current, 236),
         ],
         interaction: &[(Current, 1340), (Previous, 4)],
-        relations: 0x20023,
+        relations: 0x40023,
         gates: 12307,
         constraints: 2043,
+    },
+    // POSEIDON2
+    Chip {
+        preprocessed: 0,
+        main: &[(Current, 527)],
+        interaction: &[(Current, 528), (Previous, 4)],
+        relations: 0x20003,
+        gates: 4758,
+        constraints: 556,
     },
     // BLAKE2B_BOUNDARY
     Chip {
@@ -152,7 +162,7 @@ pub const CHIPS: [Chip; SEGMENT_CHIPS] = [
             (Current, 237),
         ],
         interaction: &[(Current, 432), (Previous, 4)],
-        relations: 0x60001,
+        relations: 0xc0001,
         gates: 5341,
         constraints: 1022,
     },
@@ -187,7 +197,7 @@ pub const CHIPS: [Chip; SEGMENT_CHIPS] = [
             (Current, 49),
         ],
         interaction: &[(Current, 516), (Previous, 4)],
-        relations: 0xc0002,
+        relations: 0x180002,
         gates: 4876,
         constraints: 480,
     },
@@ -196,7 +206,7 @@ pub const CHIPS: [Chip; SEGMENT_CHIPS] = [
         preprocessed: 0,
         main: &[(Current, 268)],
         interaction: &[(Current, 8), (Previous, 4)],
-        relations: 0xc0000,
+        relations: 0x180000,
         gates: 709,
         constraints: 80,
     },
@@ -205,7 +215,7 @@ pub const CHIPS: [Chip; SEGMENT_CHIPS] = [
         preprocessed: 0,
         main: &[(Current, 65)],
         interaction: &[(Previous, 4)],
-        relations: 0x80000,
+        relations: 0x100000,
         gates: 76,
         constraints: 2,
     },
@@ -343,11 +353,11 @@ pub const CHIPS: [Chip; SEGMENT_CHIPS] = [
     // MUL
     Chip {
         preprocessed: 0,
-        main: &[(Current, 162)],
+        main: &[(Current, 165)],
         interaction: &[(Current, 128), (Previous, 4)],
         relations: 0x00801,
-        gates: 830,
-        constraints: 191,
+        gates: 859,
+        constraints: 200,
     },
     // BITWISE
     Chip {
@@ -381,7 +391,7 @@ pub const CHIPS: [Chip; SEGMENT_CHIPS] = [
         preprocessed: 3,
         main: &[(Current, 1)],
         interaction: &[(Previous, 4)],
-        relations: 0x20000,
+        relations: 0x40000,
         gates: 12,
         constraints: 1,
     },
@@ -837,14 +847,15 @@ mod tests {
 
     use super::*;
 
-    /// The window kernel's class-1 shape (`0x01f9ffff`).
+    /// The window kernel's class-1 shape (`0x02f3fffb`): its logical right
+    /// shifts multiply, so it holds no DIVREM.
     fn window() -> Shape {
         let sizes = [
-            15, 14, 16, 18, 9, 8, 4, 17, 4, 4, 4, 16, 8, 16, 8, 8, 6, 0, 0, 8, 15, 15, 15, 15, 16,
+            15, 14, 0, 16, 18, 9, 8, 4, 17, 4, 4, 4, 16, 8, 16, 8, 8, 6, 0, 0, 8, 15, 15, 15, 0, 16,
         ];
         Shape {
             policy: crate::shape::POLICY,
-            chips: 0x01f9_ffff,
+            chips: 0x02f3_fffb,
             classes: vec![SegmentClass {
                 log_steps: 15,
                 pages: 8,
@@ -861,16 +872,16 @@ mod tests {
         let terms = leaf_terms(shape.chips, &shape.classes[0].log_sizes);
         assert_eq!(
             (terms.points, terms.blocks, terms.singles),
-            (16, 1_150, 785)
+            (16, 1_099, 784)
         );
-        assert_eq!(terms.merkle[0], 40 * (1_004 + 78));
+        assert_eq!(terms.merkle[0], 40 * (954 + 78));
         assert_eq!(terms.fri, [40 * 243, 40 * 106, 0]);
-        assert_eq!(terms.oods[1], 35_216);
-        assert_eq!(terms.deep_once[1], 20_445);
-        assert_eq!(terms.rows(), [57_700, 102_173, 46_000]);
+        assert_eq!(terms.oods[1], 33_851);
+        assert_eq!(terms.deep_once[1], 19_627);
+        assert_eq!(terms.rows(), [55_496, 99_949, 43_960]);
         assert_eq!(
             leaf_rows(shape.chips, &shape.classes[0].log_sizes),
-            [57_700, 102_173 + FINALIZE, 46_000]
+            [55_496, 99_949 + FINALIZE, 43_960]
         );
         assert!(oversized_leaves(&shape).is_empty());
     }
@@ -890,6 +901,6 @@ mod tests {
         assert!(rows[1] > PADDED[1], "{rows:?}");
         assert_eq!(oversized_leaves(&shape), vec![(1, rows)]);
         let terms = leaf_terms(shape.chips, &flat.log_sizes);
-        assert!(terms.singles > 2 * 785, "{} single samples", terms.singles);
+        assert!(terms.singles > 2 * 784, "{} single samples", terms.singles);
     }
 }

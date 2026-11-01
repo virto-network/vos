@@ -11,7 +11,7 @@
 //! - **The set** ([`Components`], over a [`ChipSet`]): the chips its
 //!   active-chip mask names, in the set's order, each at its log size; the
 //!   relations drawn chip by chip in that order. Two sets: the node's
-//!   segment ([`SegmentComponents`], format 35's chips in chip order) and
+//!   segment ([`SegmentComponents`], format 41's chips in chip order) and
 //!   the device's ([`DeviceComponents`], `crate::device`'s).
 //! - **The public sums:** the claimed sums the public values fix stay
 //!   unblinded, every other is blinded. The node's are its four boundary
@@ -154,7 +154,7 @@ pub trait ChipSet: 'static {
     fn public_sums(active: u32) -> Vec<usize>;
 }
 
-/// The node's segment: format 35's chips in chip order, its boundary chips'
+/// The node's segment: format 41's chips in chip order, its boundary chips'
 /// claimed sums public (the registers in and out, the program's boundary,
 /// the memory roots).
 pub enum Node {}

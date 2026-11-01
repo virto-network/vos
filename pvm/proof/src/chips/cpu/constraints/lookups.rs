@@ -23,36 +23,39 @@ pub(in crate::chips::cpu) fn table_lookups<E: EvalAtRow>(
 
     // Power-of-two lookup: proves val_d = 2^shift_amount for constrained shifts.
     //
-    // The classic emission is gated on
-    //   is_shift_c · (1 − is_rotate_r64 − is_rotate_r32)
-    // so RotR64 + RotR32 rows fall through.  For those rows val_d
-    // gets pinned to `2^ShiftAmountCompl` instead, via a second
-    // emission keyed on `ShiftAmountCompl` and gated on
-    // `is_rotate_r64 + is_rotate_r32`.  Classic-shift and RotL64 /
-    // RotL32 rows use the first emission with ShiftAmount = n_real.
+    // The first emission is gated on
+    //   is_shift_c · (1 − is_rotate_r64 − is_rotate_r32 − is_shlo_r)
+    // so the rotate-right and logical right shift rows fall through.  For
+    // those rows val_d gets pinned to `2^ShiftAmountCompl` instead, via a
+    // second emission keyed on `ShiftAmountCompl` and gated on
+    // `is_rotate_r64 + is_rotate_r32 + is_shlo_r`.  Left shifts, arithmetic
+    // right shifts and RotL64 / RotL32 rows use the first emission with
+    // ShiftAmount = n_real.
     {
         let mut tuple: Vec<E::F> = vec![row.shift_amount[0].clone()];
         tuple.extend_from_slice(&row.val_d);
-        // Route `is_shift_c · (1 - rot_r64 - rot_r32)` through
-        // IsShiftCNotRotrH so the lookup multiplicity stays at deg 1.
-        // Helper-defining constraint below.
+        // Route the gate through ShiftAmountPow2H so the lookup
+        // multiplicity stays at deg 1.
         eval.add_constraint(
-            row.is_shift_c_not_rotr_h[0].clone()
+            row.shift_amount_pow2_h[0].clone()
                 - row.is_shift_constrained[0].clone()
-                    * (E::F::one() - row.is_rotate_r64[0].clone() - row.is_rotate_r32[0].clone()),
+                    * (E::F::one()
+                        - row.is_rotate_r64[0].clone()
+                        - row.is_rotate_r32[0].clone()
+                        - row.is_shlo_r[0].clone()),
         );
         eval.add_to_relation(RelationEntry::new(
             pow2_lookup,
-            row.is_shift_c_not_rotr_h[0].clone().into(),
+            row.shift_amount_pow2_h[0].clone().into(),
             &tuple,
         ));
     }
-    // Separate PowerOfTwo emission for RotR64 + RotR32 keyed on
-    // ShiftAmountCompl.
+    // The second PowerOfTwo emission, keyed on ShiftAmountCompl.
     {
         let mut tuple: Vec<E::F> = vec![row.shift_amount_compl[0].clone()];
         tuple.extend_from_slice(&row.val_d);
-        let mult = row.is_rotate_r64[0].clone() + row.is_rotate_r32[0].clone();
+        let mult =
+            row.is_rotate_r64[0].clone() + row.is_rotate_r32[0].clone() + row.is_shlo_r[0].clone();
         eval.add_to_relation(RelationEntry::new(pow2_lookup, mult.into(), &tuple));
     }
 
@@ -99,13 +102,14 @@ pub(in crate::chips::cpu) fn mul_lookup<E: EvalAtRow>(
     lookups: &Lookups,
 ) {
     // ── MultiplicationLookup producer ──
-    // Tuple (35 limbs): val_b[8] + val_d[8] + result[8] +
-    //   sign_bit_b + sign_bit_d + 4 rotate flags + 5 mul flags.
+    // Tuple (37 limbs): val_b[8] + val_d[8] + result[8] +
+    //   sign_bit_b + sign_bit_d + 4 rotate flags + is_shlo_r +
+    //   shift_zero + 5 mul flags.
     // MulChip consumes the same tuple per real row and runs:
     //   - the schoolbook carry chain: pins upl/uph/mul_high.
     //   - sign correction: pins result for is_mul_upper rows.
     //   - result-variant dispatch: pins result for non-upper mul rows
-    //     from upl ± mul_high based on rotate flags.
+    //     from upl and mul_high by the rotate and right-shift flags.
     let is_mul_lo = MUL_UPPER
         .iter()
         .fold(row.is_mul[0].clone(), |is_mul_lo, &upper| {

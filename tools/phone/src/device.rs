@@ -155,7 +155,7 @@ fn measure<MC: MerkleChannel>(
     let format = cell.format();
     let (kernel, input) = statement(dir, &cell.statement);
     let trace = || {
-        vos_pvm_proof::kernel::trace_device_kernel(&kernel, &input, GAS)
+        vos_pvm_proof::kernel::trace_kernel(&kernel, &input, GAS)
             .expect("the kernel runs to its halt")
             .side_note
     };

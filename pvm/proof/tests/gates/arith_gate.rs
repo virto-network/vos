@@ -35,7 +35,7 @@ use vos_pvm_proof::framework_access::AllLookupElements;
 use vos_pvm_proof::harness::{MachineComponent, MachineProverComponent};
 use vos_pvm_proof::pcs::ChannelRef;
 use vos_pvm_proof::trace::component::ComponentTrace;
-use vos_pvm_proof::{AirColumn, SideNote, chips};
+use vos_pvm_proof::{AirColumn, SideNote};
 
 // ── A chip whose trace the adversary rewrites ────────────────────────────
 
@@ -184,38 +184,12 @@ impl MachineProverComponent for Forged {
 
 /// The AIR's chips in their canonical order.
 fn real_chips() -> Vec<&'static dyn MachineProverComponent> {
-    vec![
-        &chips::CpuChip,
-        &chips::Blake2bChip,
-        &chips::Blake2bBoundaryChip,
-        &chips::MemoryChip,
-        &chips::MemoryPageChip,
-        &chips::MemoryMerkleChip,
-        &chips::MemoryRootBoundaryChip,
-        &chips::RegisterMemoryChip,
-        &chips::RegisterMemoryBoundaryChip,
-        &chips::RegisterMemoryClosingChip,
-        &chips::ProgramBoundaryChip,
-        &chips::ProgramMemoryChip,
-        &chips::JumpTableChip,
-        &chips::WitnessInputChip,
-        &chips::RangeMultiplicity256,
-        &chips::BitwiseLookupChip,
-        &chips::PowerOfTwoChip,
-        &chips::PopcountChip,
-        &chips::BitcountChip,
-        &chips::ByteToBitsChip,
-        &chips::MulChip,
-        &chips::BitwiseChip,
-        &chips::CompareChip,
-        &chips::DivRemChip,
-        &chips::BitwiseAndByteChip,
-    ]
+    vos_pvm_proof::all_components().to_vec()
 }
 
-const CPU: usize = 0;
-const MUL: usize = 20;
-const DIVREM: usize = 23;
+const CPU: usize = vos_pvm_proof::chip_idx::CPU;
+const MUL: usize = vos_pvm_proof::chip_idx::MUL;
+const DIVREM: usize = vos_pvm_proof::chip_idx::DIVREM;
 
 /// Prove `steps` with the chips at the given indices replaced by forged
 /// ones, and verify the proof with the real chips. `Ok` means the forgery
@@ -582,13 +556,13 @@ fn divu64_carries_solved_in_m31_refused() {
     ));
 }
 
-/// X-DIVHI / G3-4: `0x1000 >> 12` proven as `1 + 2^52`. The quotient times
-/// 2^12 wraps to the dividend; every carry is a byte and the high half is
-/// the product's own (1), so only a pinned high half refuses it.
+/// X-DIVHI / G3-4: `0x1000 / 2^12` proven as `1 + 2^52`. The quotient
+/// times 2^12 wraps to the dividend; every carry is a byte and the high half
+/// is the product's own (1), so only a pinned high half refuses it.
 #[test]
-fn shlo_r64_quotient_top_bits_refused() {
+fn divu64_quotient_top_bits_refused() {
     let forged = 1 + (1u64 << 52);
-    let (steps, code, bitmask) = forged_steps(Opcode::ShloR64, 0x1000, 12, forged);
+    let (steps, code, bitmask) = forged_steps(Opcode::DivU64, 0x1000, 1 << 12, forged);
     assert_refused(prove_forged(
         steps,
         &code,
@@ -603,9 +577,33 @@ fn shlo_r64_quotient_top_bits_refused() {
     ));
 }
 
+/// `1025 >> 1` proven as the product's two words' sum, `512 + 2^63`, a
+/// rotation's: the row claims its amount is 0 (`ShiftZero`, and a zero
+/// inverse, so `ShiftZero = 1 − compl·inv` holds), so MulChip takes the low
+/// word too and its constraints hold. The complement, 63, is not 0:
+/// `ShiftZero · compl = 0` refuses it.
+#[test]
+fn shlo_r64_amount_claimed_zero_refused() {
+    let forged = 512 | 1 << 63;
+    let (steps, code, bitmask) = forged_steps(Opcode::ShloR64, 1025, 1, forged);
+    assert_refused(prove_forged(
+        steps,
+        &code,
+        &bitmask,
+        vec![(
+            CPU,
+            producer(|trace, side_note| {
+                set(trace, Cpu::ShiftZero, 0, f(1));
+                set(trace, Cpu::ShiftComplInv, 0, f(0));
+                side_note.mul_entries[0].shift_zero = true;
+            }),
+        )],
+    ));
+}
+
 /// G3-4: `-1024 >> 3` (arithmetic, -128) proven as the logical shift
 /// `2^61 - 128`, a witness of byte carries and a zero high half: only a
-/// tuple flag telling SharR from ShloR refuses it.
+/// tuple flag telling SharR from an unsigned division refuses it.
 #[test]
 fn shar_r64_sign_dropped_refused() {
     let logical = (-1024i64 as u64) >> 3;
@@ -799,6 +797,40 @@ fn shar_r64_flag_cleared_refused() {
     ));
 }
 
+/// [`shar_r64_flag_cleared_refused`] with the cleared flag's bit kept by
+/// `IsShloR`: flag byte 0's bit 3 commits `IsSharR + IsShloR`, which still
+/// reads 1, so the byte-to-bits table holds, but a logical right shift
+/// multiplies, and `IsShloR · (1 − IsMul) = 0` refuses it on a row that
+/// divides.
+#[test]
+fn shar_r64_flag_moved_to_shlo_r_refused() {
+    let logical = (-1024i64 as u64) >> 3;
+    let (steps, code, bitmask) = forged_steps(Opcode::SharR64, -1024i64 as u64, 3, logical);
+    assert_refused(prove_forged(
+        steps,
+        &code,
+        &bitmask,
+        vec![(
+            CPU,
+            producer(move |trace, side_note| {
+                set(trace, Cpu::IsSharR, 0, f(0));
+                set(trace, Cpu::IsShloR, 0, f(1));
+                forge_cpu_quotient(trace, side_note, logical, 0);
+                let e = &side_note.divrem_entries[0];
+                let before: Vec<u8> = divrem::range_checked_bytes(e).collect();
+                let e = divrem::witness(e.val_b, e.val_d, logical, 0, false, false, false, false);
+                for b in before {
+                    side_note.range256_counts[b as usize] -= 1;
+                }
+                for b in divrem::range_checked_bytes(&e) {
+                    side_note.range256_counts[b as usize] += 1;
+                }
+                side_note.divrem_entries[0] = e;
+            }),
+        )],
+    ));
+}
+
 /// `0x9000_0005 rem 0x10` in 32 bits (5) with the quotient's high word,
 /// which no chain of an unsigned 32-bit row reads, forged to all ones:
 /// only its binding to the low word's sign refuses it.
@@ -852,11 +884,11 @@ fn mul64_honest_carries_refused() {
     assert_refused(prove_forged(steps, &code, &bitmask, vec![]));
 }
 
-/// `0x1000 >> 12` with the quotient's bits below 2^52 forged: the
+/// `0x1000 / 2^12` with the quotient's bits below 2^52 forged: the
 /// schoolbook itself refuses it.
 #[test]
-fn shlo_r64_quotient_low_bits_refused() {
-    let (steps, code, bitmask) = forged_steps(Opcode::ShloR64, 0x1000, 12, 2);
+fn divu64_quotient_low_bits_refused() {
+    let (steps, code, bitmask) = forged_steps(Opcode::DivU64, 0x1000, 1 << 12, 2);
     assert_refused(prove_forged(
         steps,
         &code,

@@ -97,7 +97,8 @@ fn huge_page_budget_degenerates_to_step_cut() {
 ///     `replay_writes`' resize growth);
 ///   - window 1: at ts 5, output at 0x180;
 ///   - window 2: at ts 9 (slice-only — no later window observes its
-///     write).
+///     write);
+/// and a Poseidon2 call in windows 0 and 1, at ts 3 and 7.
 /// Regular stores carry distinct non-zero values, so a missed or
 /// misplaced write/slice can't vanish into an all-zero image. The
 /// register history is CONSISTENT (a non-zero seeded file threaded
@@ -163,6 +164,16 @@ fn threaded_trace() -> SideNote {
             out_bytes: core::array::from_fn(|i| seed ^ i as u8),
         });
     }
+    // A Poseidon2 call in each of the first two windows: ts 3 and 7.
+    for (ts, out_ptr, seed) in [(3, 0x200, 0x11u8), (7, 0x240, 0x22)] {
+        sn.poseidon2_ops.push(crate::core::tracing::Poseidon2Op {
+            in_ptr: 0x340,
+            out_ptr,
+            ts,
+            input: [7; 64],
+            output: core::array::from_fn(|i| seed ^ i as u8),
+        });
+    }
     sn
 }
 
@@ -187,6 +198,7 @@ fn assert_windows_equal(via_cursor: &SideNote, via_slice: &SideNote) {
     assert_eq!(via_cursor.jump_table_counts, via_slice.jump_table_counts);
     assert_eq!(via_cursor.blake2b_calls, via_slice.blake2b_calls);
     assert_eq!(via_cursor.blake2b_mem_ops, via_slice.blake2b_mem_ops);
+    assert_eq!(via_cursor.poseidon2_ops, via_slice.poseidon2_ops);
     assert_eq!(via_cursor.range256_counts, via_slice.range256_counts);
     assert_eq!(via_cursor.memory_layout(), via_slice.memory_layout());
 }
@@ -214,6 +226,17 @@ fn cursor_matches_segment_side_note_on_a_full_pass() {
     let second_out: [u8; 64] = core::array::from_fn(|i| 0x30 ^ i as u8);
     assert_eq!(w2.initial_memory[0x180..0x1C0], second_out);
     assert_eq!(w2.initial_memory[0x2C0..0x300], [0u8; 64]);
+    // The Poseidon2 calls' outputs likewise: window 1 enters with window
+    // 0's and not its own, window 2 with both; each window holds its own
+    // call alone.
+    let first_p2: [u8; 32] = core::array::from_fn(|i| 0x11 ^ i as u8);
+    let second_p2: [u8; 32] = core::array::from_fn(|i| 0x22 ^ i as u8);
+    assert_eq!(w1.initial_memory[0x200..0x220], first_p2);
+    assert_eq!(w1.initial_memory[0x240..0x260], [0u8; 32]);
+    assert_eq!(w2.initial_memory[0x240..0x260], second_p2);
+    assert_eq!(w1.poseidon2_ops.len(), 1);
+    assert_eq!(w1.poseidon2_ops[0].ts, 7);
+    assert!(w2.poseidon2_ops.is_empty());
 }
 
 #[test]

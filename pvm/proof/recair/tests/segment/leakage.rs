@@ -13,7 +13,7 @@
 //!   run has no other witness; the two kernels' public values differ in φ9.
 //!   The fields are every published value but the public ones (the
 //!   preprocessed tree's, the boundary chips' claimed sums). The control:
-//!   the unmasked prover (format 35) fails the same test.
+//!   the unmasked prover (format 41) fails the same test.
 //! - **Uniformity:** each field of the first kernel's N proofs against
 //!   uniform M31.
 //! - **Hidden states:** a value the run holds and no boundary state does (φ7
@@ -111,7 +111,7 @@ fn masked_fields() -> &'static [Fields; 2] {
     })
 }
 
-/// A kernel's whole run proved unmasked under format 35 (the segment's).
+/// A kernel's whole run proved unmasked under format 41 (the segment's).
 fn unmasked(io: [u32; 4]) -> vos_pvm_proof::Proof {
     vos_pvm_proof::prove_format(&mut run(io), &SEGMENT).expect("proves")
 }
@@ -121,7 +121,7 @@ fn poseidon(proof: &vos_pvm_proof::Proof) -> &StarkProof<vos_pvm_proof::poseidon
     match &proof.stark_proof {
         StarkProofAny::Poseidon2M31(stark) => stark,
         StarkProofAny::Blake2s(_) | StarkProofAny::Blake2sM31(_) => {
-            panic!("format 35 is on the Poseidon2-M31 channel")
+            panic!("format 41 is on the Poseidon2-M31 channel")
         }
     }
 }
@@ -257,7 +257,7 @@ fn drawn_relations<MC: MerkleChannel>(
     SegmentComponents::draw_relations(proof.active, &mut channel)
 }
 
-/// The claimed sums' control. Unmasked (format 35), the sums a right guess
+/// The claimed sums' control. Unmasked (format 41), the sums a right guess
 /// of the run computes under the proof's relations are the proof's; masked,
 /// only the boundary chips' are (public, unblinded), the others' not, though
 /// their total is.

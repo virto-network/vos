@@ -189,7 +189,7 @@ fn a_leaf_states_its_segment() {
     assert_eq!(rows("leaf: output"), [7, 2, 0]);
 
     // A derivation's bound counts the rows exactly.
-    let sizes: [u8; 25] = core::array::from_fn(|chip| {
+    let sizes: [u8; vos_pvm_proof::chip_idx::COUNT] = core::array::from_fn(|chip| {
         let mask = segment.proof.component_mask;
         let position = (mask & ((1 << chip) - 1)).count_ones() as usize;
         if mask & 1 << chip != 0 {

@@ -126,7 +126,7 @@ fn fixture() -> &'static Real {
     FIXTURE.get_or_init(|| Real::new(common::segment_fixture()))
 }
 
-/// A run proved over all 25 chips, the ones it does not use padded.
+/// A run proved over every chip, the ones it does not use padded.
 fn full_shape() -> &'static Real {
     static FULL: OnceLock<Real> = OnceLock::new();
     FULL.get_or_init(|| Real::new(common::full_shape_proof().clone()))
@@ -392,7 +392,7 @@ fn a_proof_of_another_shape_is_refused() {
     assert_eq!(
         check(&|p| p.format_version = 32),
         Err(ShapeMismatch::Format {
-            circuit: 35,
+            circuit: 41,
             proof: 32
         })
     );

@@ -181,14 +181,15 @@ stwo_constraint_framework::relation!(BitwiseLookupElements, REL_BITWISE_LOOKUP_S
 //
 // Tuple: (val_b[8], val_d[8], result[8], sign_bit_b,
 //   sign_bit_d, is_rotate_l64, is_rotate_r64, is_rotate_l32,
-//   is_rotate_r32, is_mul_lo, is_mul_upper_uu, is_mul_upper_su,
-//   is_mul_upper_ss, is_32bit) — 35 limbs.
+//   is_rotate_r32, is_shlo_r, shift_zero, is_mul_lo, is_mul_upper_uu,
+//   is_mul_upper_su, is_mul_upper_ss, is_32bit) — 37 limbs.
 //
 // The tuple omits mul_high[8] and unsigned_product_low[8] (MulChip
 // witnesses both internally; result-variant binding lives in MulChip).
-// The 4 rotate flags let MulChip's variant-dispatch constraint fire
-// correctly per row.
-const REL_MULTIPLICATION_LOOKUP_SIZE: usize = WORD_SIZE * 3 + 11;
+// The 4 rotate flags and the logical right shift's flag, with whether its
+// amount is 0, let MulChip's variant-dispatch constraint fire correctly
+// per row.
+const REL_MULTIPLICATION_LOOKUP_SIZE: usize = WORD_SIZE * 3 + 13;
 stwo_constraint_framework::relation!(MultiplicationLookupElements, REL_MULTIPLICATION_LOOKUP_SIZE);
 
 // ByteToBits lookup.  256-row preprocessed table proving
@@ -242,7 +243,7 @@ const REL_MERKLE_NODE_LOOKUP_SIZE: usize = 1 + 1 + 32 + 32;
 stwo_constraint_framework::relation!(MerkleNodeLookupElements, REL_MERKLE_NODE_LOOKUP_SIZE);
 
 // (ts[8], in_ptr[4], out_ptr[4]) — one tuple per served Poseidon2 call
-// (`0x402`). The CPU of the shared chip set produces it from the call's row
+// (`0x402`). The CPU produces it from the call's row
 // (its timestamp, φ[7]'s and φ[8]'s low four bytes); Poseidon2Chip consumes
 // it at the call's row, which reads the 64 input bytes and writes the 32
 // output bytes at that timestamp.

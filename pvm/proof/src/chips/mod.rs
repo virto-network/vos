@@ -40,7 +40,7 @@ pub use bitwise_lookup::BitwiseLookupChip;
 pub use blake2b::{Blake2bBoundaryChip, Blake2bCall, Blake2bChip, blake2b_compress};
 pub use byte_to_bits::ByteToBitsChip;
 pub use compare::CompareChip;
-pub use cpu::{CpuChip, CpuP2Chip};
+pub use cpu::CpuChip;
 pub use data_table::DataTableChip;
 pub use device_boundary::{DeviceBoundaryChip, DeviceIoChip};
 pub use device_memory::DeviceMemoryChip;

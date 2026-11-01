@@ -237,3 +237,35 @@ pub(super) fn witness_input(
         }
     }
 }
+
+/// The Poseidon2 call: its register reads of φ7 and φ8, then
+/// `(ts, φ7, φ8)` handed to `Poseidon2Chip`, gated by `IsP2Ecall`; the
+/// CPU's last three fractions.
+pub(super) fn poseidon2_call(
+    logup: &mut LogupTraceBuilder,
+    row: &RowTrace<'_>,
+    lookup_elements: &AllLookupElements,
+) {
+    use crate::trace::component::FinalizedColumn;
+    let is_p2 = &row.is_p2_ecall[0];
+    let reg_lookup: &RegisterMemoryLookupElements = lookup_elements.as_ref();
+    for (reg_idx, value) in [(7u32, &row.h_ptr), (8u32, &row.m_ptr)] {
+        let mut tuple: Vec<FinalizedColumn<'_>> = Vec::with_capacity(18);
+        tuple.push(FinalizedColumn::Constant(BaseField::from(reg_idx)));
+        tuple.extend_from_slice(value);
+        tuple.extend_from_slice(&row.timestamp);
+        tuple.push(FinalizedColumn::Constant(BaseField::from(0u32)));
+        logup.add_to_relation_with(
+            reg_lookup,
+            [is_p2.clone()],
+            |[active]| active.into(),
+            &tuple,
+        );
+    }
+    let p2_call: &Poseidon2CallLookupElements = lookup_elements.as_ref();
+    let mut call: Vec<FinalizedColumn<'_>> = Vec::with_capacity(16);
+    call.extend_from_slice(&row.timestamp);
+    call.extend_from_slice(&row.h_ptr[..4]);
+    call.extend_from_slice(&row.m_ptr[..4]);
+    logup.add_to_relation_with(p2_call, [is_p2.clone()], |[active]| active.into(), &call);
+}

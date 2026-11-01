@@ -5,8 +5,9 @@
 use super::columns::Column::{self, *};
 
 /// MultiplicationLookup's tuple up to IsMulLo: the operands, the result,
-/// the operands' signs and the rotate flags.
-pub(super) const MUL_HEAD: [Column; 9] = [
+/// the operands' signs, the rotate flags, and the logical right shift's
+/// flag with whether its amount is 0.
+pub(super) const MUL_HEAD: [Column; 11] = [
     ValB,
     ValD,
     Result,
@@ -16,6 +17,8 @@ pub(super) const MUL_HEAD: [Column; 9] = [
     IsRotateR64,
     IsRotateL32,
     IsRotateR32,
+    IsShloR,
+    ShiftZero,
 ];
 
 /// The multiplication's upper-half flags. IsMulLo, the tuple's limb after
@@ -106,7 +109,7 @@ pub(super) const FLAG_BYTES: [(Column, [&[Column]; 8]); 6] = [
             &[IsAdd],
             &[IsSub],
             &[IsMul],
-            &[IsSharR],
+            &[IsSharR, IsShloR],
             &BITWISE_FLAGS,
             &[IsShift],
             &COMPARE_FLAGS,

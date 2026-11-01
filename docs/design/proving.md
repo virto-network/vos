@@ -320,6 +320,14 @@ attribution). Its full design is `recursion-air.md`.
     102,227 of 2^17 [measured, slice 5's 5.11–5.12]. At 44 queries over
     the 8,024-column shape it would have been about 64.8k, 1% spare
     [model], which is why segments take 40 queries with PoW 24 (§4).
+    Under format 41 (7.21) its logical right shifts multiply, so its shape
+    holds no DIVREM: 55,451 / 99,414 / 43,960 rows built [measured], and
+    every test actor's kernel's classes within 57,825 / 129,629 / 46,040
+    [model, the derivation's bound]. A kernel holding the Poseidon2 chip
+    beside BLAKE2b's takes the chip's classes (the third at 17 pages, not
+    24: at 24 its leaf passes 2^17 `qm31` rows, about 135k); with them every
+    test actor's kernel, the chip added, fits within 63,637 / 111,167 /
+    51,520 [model].
   - **The levers,** if a count passes 2^16 (a wider kernel, or the next
     fix that widens the AIR): fewer queries with more PoW (a new segment
     format, as 35 was), FRI fold step 3 in inner proofs, or `p2` at 2^17
@@ -585,18 +593,20 @@ last for decades.**
 
 | proof | target | example | conjectured / proven |
 |---|---|---|---|
-| segment proofs (format 35) | ≥ 100 / ≥ 60 | blowup 4 (log 2), 40 queries, PoW 24, plus interaction PoW 8; FRI fold step 1, log last-layer degree bound 0 | 104 / 62 (62.86) |
+| segment proofs (format 41) | ≥ 100 / ≥ 60 | blowup 4 (log 2), 40 queries, PoW 24, plus interaction PoW 8; FRI fold step 1, log last-layer degree bound 0 | 104 / 62 (62.81) |
 | leaf and fold proofs (32) | ≥ 100 / ≥ 60 | blowup 4, 44 queries, PoW 20, plus interaction PoW 8; fold step 1, last layer 2^0 | 108 / 63 |
 | credential proofs (44, by S29; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | blowup 4 (log 2), 47 queries, PoW 16, plus interaction PoW 8; variant (c) | 110 / 62 (62.92) [built, 7.10; registered, 7.12] |
-| device proofs (45; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | blowup 4, 47 queries, PoW 16, interaction PoW 8 (7.16, among blowup 2 with 86–87 queries, 4 with 43, 8 with 29); variant (c), `h = 256` (7.17d) | 110 / 62 (62.82) |
+| device proofs (46; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | blowup 4, 47 queries, PoW 16, interaction PoW 8 (7.16, among blowup 2 with 86–87 queries, 4 with 43, 8 with 29); variant (c), `h = 256` (7.17d); the shared chip set's current form (7.21) | 110 / 62 (62.82) |
 | the final wrap, unmasked (28; tests only) | ≥ 100 / ≥ 80 | blowup 64 (log 6), 20 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching (§3.5) | 146 / 82 (82.60) |
 | the final wrap, masked (39) | ≥ 100 / ≥ 80 | blowup 32 (log 5), 24 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching; variant (c) | 146 / 82 (82.70) |
 
 - **The counts** are the security tool's (`pvm/proof/src/security.rs`) at
   each format's reference shape [model], pinned by the format tests.
-- **The numbers:** 35 and 37 name the segment AIR; the default prover
-  produces 35. 24 to 27, 29, 31, 33, 34 and 36, which named its earlier
-  forms, are retired: refused, and never registered again.
+- **The numbers:** 41 and 46 name the segment AIR, the chip set the node's
+  segments and the device shape share (slice 7's 7.21); the default prover
+  produces 41. 24 to 27, 29, 31, 33 to 36, 43 and 45, which named its
+  earlier forms or their parameters, are retired: refused, and never
+  registered again (A.4 lists every retired number).
 - **The inner grind:** a segment's PoW 24 costs 0.43 s on average on 8
   threads (median 0.26 s, 95th percentile 1.44 s), against 0.028 s at 20
   [measured, 128 grinds each, SIMD]; interaction PoW 8 is negligible.
@@ -608,19 +618,22 @@ last for decades.**
   columns the leaf needs 64,717 of `p2`'s 65,536 rows; at 40, 59,300, 9.5%
   to spare [model, `count-35.log`]. PoW 24 keeps the proven count, 62.86
   against 62.74 at 44 queries and PoW 20, where the batching term binds.
+  Counted again on format 41's own reference (every chip at 2^20 rows, the
+  Poseidon2 chip among them; 11,091 sampled values, 5,750 constraints): 40
+  queries and PoW 24 count 62.81 proven bits, so they stand (7.21).
 - **Devices:** 86 is the least query count whose proven count clears 60 by
   2 bits; 84 gave 61.2.
 
 - **Inner soundness carries through:** forging a fold's input forges the
   final proof. **The system's proven bound is therefore the weakest inner
-  format's, 62.86 bits (format 35), not the wrap's 82.6;** its conjectured
+  format's, 62.81 bits (format 41), not the wrap's 82.6;** its conjectured
   bound is 104. Under Grover's heuristic that is about 31 proven and 52
   conjectured bits against a quantum prover, so post-quantum readiness
   rests on the conjectured count. All counts are the security tool's own
   [model], pinned by tests and not yet reviewed outside.
 - **Format 36,** the legacy Blake2s segment format, counted 96 / 57:
   below the 60-bit proven floor. It is retired, and the refine-bundle path
-  that used it deleted; the default prover produces 35.
+  that used it deleted; the default prover produces 41.
 - **Salts:** 8 M31 (248 bits).
 - **Interaction PoW** applies to every proof with logup, folds included.
 - **An external audit,** before value rides on a proof, of:
@@ -655,10 +668,10 @@ last for decades.**
   `h`. The device shape proves them masked against its program
   (`vos_pvm_recair::masked::device`, slice 7's 7.15): the program's chips
   mixed after the header, its log sizes pinned, the io-hash the one public
-  sum. The device format, 45, is admitted at a space's ingress for
+  sum. The device format, 46, is admitted at a space's ingress for
   device proofs of auth's statement (slice 7's 7.20). Node segment, leaf and fold proofs stay unmasked, in the prover
   role, as the witness rows do.
-- **Device proofs (format 45, rate 1/4)** serve authorizations a space re-checks at
+- **Device proofs (format 46, rate 1/4)** serve authorizations a space re-checks at
   its ingress, never settlement.
 - **How:** spike 2's variant (c), already prototyped on our pinned Stwo
   fork, with Fable's R1–R8:
@@ -772,7 +785,7 @@ last for decades.**
     `MAX_ATTEMPTS` refused transcripts), never prove leaky; the device
     install refuses such a format before any proof (`device_floors`).
     `mask_rows` sizes each chip's `h` from its own offsets only below the
-    format's cap: at format 45 every device chip reaches the cap, 256.
+    format's cap: at format 46 every device chip reaches the cap, 256.
 - **The composition mode:** a test pins that (c) lifts no constraint past
   the blowup. If it did, the prover would re-LDE every column.
 - **On the wrap** (spike 6a): no re-LDE [measured]; the prover ×2.6–2.9
@@ -1293,8 +1306,8 @@ binding the run like this:
   for `|O|` offsets a column (§5, how large `h` must be), rounded to a
   power of two `h`, and a component has at least `4h` rows. Format 43
   took twice the rows, at blowup 4 with 47 queries `h = 512` and 2^11
-  rows [built, 7.14–7.16]; format 45 takes the rows themselves, 149, so
-  `h = 256` and 2^10 [built, 7.17d]. A component with no next-row read
+  rows [built, 7.14–7.16]; format 45 took the rows themselves, 149, so
+  `h = 256` and 2^10 [built, 7.17d], and 46 keeps them. A component with no next-row read
   (`|O| = 1`) needs less, so `h` is set per component (at most the
   format's). Every segment chip reads its running sum's previous row, so
   each takes the full `h` [built, 7.14].
@@ -1377,16 +1390,17 @@ columns [measured, 7.16]. Over `C`, a kernel that hashes only through
   and `H_io` (a device kernel always returns its parts, however few). An
   auth guard's `device = "..."` must name one, else the macro refuses, and
   the derivation checks it again on the marks. The derivation admits
-  `0x402` only in a marked kernel and refuses `0x400` there, naming the
+  `0x402` in any kernel (only in a marked one before format 41) and
+  refuses `0x400` in a marked one, naming the
   chain of functions that reaches it; it refuses a mark its schema kind
   contradicts and a `Device` method of no entry, and names the device
   kernels (`Derived::devices`). A device kernel's record keeps the node's
   segment shape, never proved and not held to the recursion's leaves; the
   device proves it under the device profile, whose chips its code gives
   (`device_chips_of_code`), against the program computed from the kernel
-  (below, *The device program*). Node kernels, formats
-  35 and 41 and their program ids keep BLAKE2b; `0x402` stays a device
-  kernel's (pin H).
+  (below, *The device program*). Node kernels keep BLAKE2b's io-hash;
+  under format 41 they may make the `0x402` call too (7.21), a device
+  kernel never BLAKE2b's.
 - **No node attests one:** the runtime and the testkit refuse `Attest` of
   a `Device` method before its kernel runs, and `AttestAt` takes `Reading`
   methods alone; the macro gives a device method no `AttestableMethod`,
@@ -1395,10 +1409,10 @@ columns [measured, 7.16]. Over `C`, a kernel that hashes only through
 - **What the verifier and ingress check** [built, 7.20]: the verifier
   is unchanged (the io-hash's 32 bytes are the public values,
   DeviceIoChip's sum recomputed from them); ingress picks the io-hash by
-  the proof's format, 45's being `H_io` (not by the guard), computes it
+  the proof's format, 46's being `H_io` (not by the guard), computes it
   from the request's words (`a` the SCALE encoding of
   `CredentialPublic::Auth`, 129 bytes, `o` empty, no roots: `ℓ = 133`, six
-  blocks and the length's) and verifies the proof under 45 against it. A
+  blocks and the length's) and verifies the proof under 46 against it. A
   proof whose kernel ended with BLAKE2b states another io-hash and fails.
 - **What moves:** every device kernel's code and program id (none pinned
   before ingress takes device proofs); the device kernel's end
@@ -1432,12 +1446,14 @@ columns [measured, 7.16]. Over `C`, a kernel that hashes only through
   which the gate holds [measured, 7.17c]: the CPU at 2^11 rows, twice the
   masking's floor of 2^10 at `h = 256`.
 
-**Format 45, device proofs** [measured, slice 7's 7.16 and 7.17d]:
+**Format 46, device proofs** [measured, slice 7's 7.16, 7.17d and 7.21]:
 masked (c), the Blake2s-M31 channel, blowup 4, 47 queries, PoW 16,
 interaction PoW 8, affine DEEP batching (format 44's parameters), `h =
 256`, every chip's floor 2^10 rows. Format 43 was the same at `h = 512`
-(7.16 to 7.17c) and is retired: 45 drops the masking's factor two (§5),
-×0.82 in time and ×0.87 in peak on the phone at P6; 110 conjectured
+(7.16 to 7.17c) and is retired: 45 dropped the masking's factor two (§5),
+×0.82 in time and ×0.87 in peak on the phone at P6, and is retired in turn:
+46 takes its parameters over the shared chip set's current form (7.21: the
+seven columns pinned to zero gone, the logical right shifts through MUL); 110 conjectured
 and 62.82 proven bits on its masked reference, every device chip at
 2^17 rows (`DEVICE_MAX_LOG_SIZE`, which install enforces: the memory
 ledger, a row a byte touched, takes 2^17 on the auth statements).
@@ -1479,7 +1495,7 @@ credential proof does. A device kernel is an `#[attestable]` method whose
 `public_args` are the SCALE encoding of auth's `CredentialPublic` (its
 kind byte, then `map_root`, `scope`, `nullifier` and `binding`, 32 bytes
 each) and whose output is empty. Ingress takes the words from the request,
-recomputes the io-hash, verifies the proof under format 45 against the
+recomputes the io-hash, verifies the proof under format 46 against the
 device program id the agent's derivation pins for the kernel the guard
 names, and then runs auth's checks (`identity-and-authority.md` §5); the
 binding names that program. The trace is witness-independent: the prover
@@ -1730,28 +1746,31 @@ counts as conjectured / proven at the reference shape [model]:
 
 | number | proofs | channel | parameters | floors | counts | status |
 |---|---|---|---|---|---|---|
-| 35 | segments | Poseidon2-M31 | 2, 40, 24, 1, 0, 8 | 100 / 60 | 104 / 62 | admitted |
+| 41 | segments | Poseidon2-M31 | 2, 40, 24, 1, 0, 8 | 100 / 60 | 104 / 62 | admitted |
 | 32 | leaf and fold (one padded shape) | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 63 | reserved |
 | 28 | the final wrap, unmasked (tests only) | Blake2b-256 | 6, 20, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 | admitted |
 | 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 5, 24, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 | admitted; the one production venues accept |
 | 44 | credential proofs, masked (variant (c)) | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 (62.92), on its masked shape | admitted |
-| 45 | device proofs, masked (variant (c)), `h = 256` | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 (62.82), on its masked shape | admitted |
+| 46 | device proofs, masked (variant (c)), `h = 256` | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 (62.82), on its masked shape | admitted |
 
 - **30 is retired unregistered** (slice 7's 7.10), and **42 retired**
   (7.12): 44 counts credential proofs on their masked shape, PoW 16 at 47
   queries, picked over 42's PoW 20 at 43 by the phone's grind (S29).
   **37** retired unregistered when 43 registered (7.16), and **43
-  retired** (7.17d): 45 takes its parameters at `h = 256`.
+  retired** (7.17d): 45 took its parameters at `h = 256`. **35 and 45
+  retired** (7.21): 41 and 46 take their parameters over the shared chip
+  set's current form, the node's segments with the Poseidon2 call.
 - **Each entry** holds its channel, its parameters, the DEEP batching its
   proven floor assumes and both bit counts.
 - **Every entry uses A.3's encodings** and exactly its parameters.
-- **35 takes fewer queries and more PoW than 32** (40 and 24 bits against
+- **41 takes fewer queries and more PoW than 32** (40 and 24 bits against
   44 and 20): a kernel leaf's rows grow with the segment's width times its
   queries, and a fold verifies under half the recursion AIR's shape. On the
-  segment shape 35's count is its query term's, 62.86; 32's parameters give
+  segment shape 41's count is its query term's, 62.81; 32's parameters give
   62.74, their batching term binding.
-- **35 and 37 name the segment AIR,** hardened and without the columns and
-  next-row masks no constraint reads (§3.2); 28, 32 and 39 prove the
+- **41 and 46 name the segment AIR,** hardened, without the columns and
+  next-row masks no constraint reads (§3.2), its chip set shared by the
+  node's segments and the device shape (7.21); 28, 32 and 39 prove the
   recursion AIR, 32's leaves verifying the segment AIR, and 44 its `p2`
   and `qm31` alone. A reserved entry is
   refused until its AIR and channel exist. 32's exist from slice 5's 5.8:
@@ -1766,7 +1785,8 @@ counts as conjectured / proven at the reference shape [model]:
   names one AIR and one set of parameters". 40, spike 6a's blowup-64
   shape, is retired unregistered; 38 stays unassigned, the fixtures' "a
   number no format holds".
-- **24 to 27, 29, 31, 33, 34, 36 and 40 are retired.** 24 to 27 and 29
+- **24 to 27, 29, 31, 33 to 36, 40 and 45 are retired** (35 and 45 by
+  7.21, their chip set before the node shared it). 24 to 27 and 29
   named the segment AIR before its hardening, and 31, 33 and 34 the
   hardened AIR with its unread columns (31 at 44 queries); 36 named the
   legacy Blake2s segment format, once the default prover's and the

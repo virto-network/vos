@@ -29,8 +29,9 @@ use crate::lookups::{
     Blake2bCallLookupElements, ByteToBitsLookupElements, CompareLookupElements,
     ComponentLookupElements, DivRemLookupElements, JumpTableLookupElements,
     MemoryAccessLookupElements, MultiplicationLookupElements, PopcountLookupElements,
-    PowerOfTwoLookupElements, ProgramExecutionLookupElements, ProgramMemoryLookupElements,
-    Range256LookupElements, RegisterMemoryLookupElements, WitnessCallLookupElements,
+    Poseidon2CallLookupElements, PowerOfTwoLookupElements, ProgramExecutionLookupElements,
+    ProgramMemoryLookupElements, Range256LookupElements, RegisterMemoryLookupElements,
+    WitnessCallLookupElements,
 };
 
 /// The relations the CPU chip's rows enter, drawn in field order: the
@@ -81,6 +82,7 @@ lookups! {
     divrem_lookup: DivRemLookupElements,
     byte_to_bits_lookup: ByteToBitsLookupElements,
     witness_call_lookup: WitnessCallLookupElements,
+    p2_call_lookup: Poseidon2CallLookupElements,
 }
 
 /// The values of `columns`, in order: a tuple of [`tuples`](super::tuples).

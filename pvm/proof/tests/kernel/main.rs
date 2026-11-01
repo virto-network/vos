@@ -16,6 +16,7 @@ mod cut;
 mod device_kernel;
 mod fixtures;
 mod kernel_shape;
+mod poseidon2_kernel;
 mod program_identity;
 mod prove_chain;
 mod reads;

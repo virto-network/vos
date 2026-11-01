@@ -383,7 +383,7 @@ mod tests {
             ]
         );
         let format = shape + 4 + 2 * (2 + chips);
-        assert_eq!(&words[format..format + 3], &[35, 0, 1_000]);
+        assert_eq!(&words[format..format + 3], &[41, 0, 1_000]);
         assert_eq!(&words[words.len() - 2..], &[0xbdbc, 0xbfbe]);
         let id = program.id_preimage().words();
         assert_eq!(id[..8], program.kernel_digest().0);
@@ -391,8 +391,8 @@ mod tests {
         assert_eq!(
             program.id().words(),
             [
-                2135066872, 100226137, 1685726148, 2064667428, 305260091, 2132776637, 2063760913,
-                1333887263
+                516780486, 207875457, 2406931, 629014697, 1148913467, 195088781, 791654061,
+                66240038
             ],
             "the golden vector"
         );

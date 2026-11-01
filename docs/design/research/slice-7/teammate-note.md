@@ -52,7 +52,10 @@ program id moves); at 7.8b the kit's `vos-anchor` and
 encoding unchanged; `Anchor::decode_from`; the codec's flag and option
 pieces; `ProgramId::decode_from`; the test program alone computing the
 anchor vectors), the vectors and fixtures unchanged and no pinned program
-id moved; the fixtures and program ids
-once more at the slice's end (7.21), if VOS's node segment format changes
-(no change to the pallet's code, only the vendored tree and the pinned
-ids).
+id moved; at 7.21, VOS's node segment format moving from 35 to 41, the
+fourth: the kit's fixtures (`segment-41.*` in place of `segment-35.*`, the
+four wraps and `statements.cases`), the conformance vectors (the space
+records' program-id keys and the wraps' hashes and lengths) and the pinned
+program ids (`WINDOW_PROGRAM`, `BALANCE_PROGRAM`, `PREDICATE_PROGRAM`); no
+code: no vendored source moves, and `H_fold` and the wraps' roots are
+unchanged.

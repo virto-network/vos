@@ -64,8 +64,11 @@ pub(in crate::chips::cpu) fn register_helpers<E: EvalAtRow>(eval: &mut E, row: &
             row.real_shift_ch[0].clone() - is_real.clone() * row.is_shift_constrained[0].clone(),
         );
         eval.add_constraint(
-            row.is_rotate_r_gate_h[0].clone()
-                - is_real.clone() * (row.is_rotate_r64[0].clone() + row.is_rotate_r32[0].clone()),
+            row.shift_compl_gate_h[0].clone()
+                - is_real.clone()
+                    * (row.is_rotate_r64[0].clone()
+                        + row.is_rotate_r32[0].clone()
+                        + row.is_shlo_r[0].clone()),
         );
     }
     // Flag-related helpers.
@@ -234,9 +237,10 @@ pub(in crate::chips::cpu) fn register_accesses<E: EvalAtRow>(
                     - thirty_two.clone() * bits_value(&row.shift_quotient)),
         );
 
-        // Complementary identity on RotR64 / RotR32 rows:
+        // Complementary identity on rotate-right and logical right shift
+        // rows:
         //   RegValD[0] + ShiftAmountCompl = 32·k, k's four bits, k even
-        // on a 64-bit rotate. Combined with the ShiftAmountCompl ∈
+        // on a 64-bit op. Combined with the ShiftAmountCompl ∈
         // [0, 31 or 0, 63] bound (pow2 table size + the
         // val_d-high-bytes-zero constraint for 32-bit), this uniquely
         // determines ShiftAmountCompl = (modulus − n_real) mod modulus.
@@ -247,10 +251,24 @@ pub(in crate::chips::cpu) fn register_accesses<E: EvalAtRow>(
             (E::F::one() - row.is32_bit[0].clone()) * row.shift_quotient_compl[0].clone(),
         );
         eval.add_constraint(
-            row.is_rotate_r_gate_h[0].clone()
+            row.shift_compl_gate_h[0].clone()
                 * (row.reg_val_d[0].clone() + row.shift_amount_compl[0].clone()
                     - thirty_two * bits_value(&row.shift_quotient_compl)),
         );
+        // ShiftZero is 1 exactly when the complement is 0, on every row:
+        // ShiftZero = 1 − compl·inv, and ShiftZero·compl = 0 forces it to
+        // 0 when the complement is not.
+        eval.add_constraint(
+            row.shift_zero[0].clone() - E::F::one()
+                + row.shift_amount_compl[0].clone() * row.shift_compl_inv[0].clone(),
+        );
+        eval.add_constraint(row.shift_zero[0].clone() * row.shift_amount_compl[0].clone());
+        // Flag byte 0's bit 3 commits a right shift, IsSharR + IsShloR:
+        // a logical one multiplies and an arithmetic one divides, so each
+        // flag is the bit where its own category flag is, and zero
+        // elsewhere.
+        eval.add_constraint(row.is_shlo_r[0].clone() * (E::F::one() - row.is_mul[0].clone()));
+        eval.add_constraint(row.is_shar_r[0].clone() * row.is_mul[0].clone());
         // Every shift and rotate row binds its amount: the flag gating
         // the identities is the instruction's shift flag.
         eval.add_constraint(row.is_shift_constrained[0].clone() - row.is_shift[0].clone());
