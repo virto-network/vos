@@ -16,6 +16,9 @@ Tags as in the plan: [decided] the owner's; [proposed] open to review;
 
 ## 1. What exists
 
+Before the step: the node's ingress, its bearer token and its TLS are
+gone since C10 (§7).
+
 - **The ingress** (`node/host/src/ingress.rs`) serves HTTP/1.1
   (`http.rs`, `Content-Length` bodies only, keep-alive, 16 KiB heads,
   30 s idle, 60 s a request) in plain HTTP on loopback or TLS 1.3
@@ -298,7 +301,7 @@ its expiry; socket-only until built.
   beside it, and lists that public key unless `local_operator = false`,
   so the CLI on the node's host signs as today's token file allows
   [orchestrator, Q3(a)]; after the first start the node reads only
-  `operator.pub`. `admin.token` goes with the node's HTTP (C10). The
+  `operator.pub`. `admin.token` went with the node's HTTP (C10). The
   client's `Operator` learns the node's time from `Expiry { now }`, as
   `with_learned_time` does for queries, and signs again once, with the
   same nonce: a relay that holds the first copy back and forges the
@@ -312,10 +315,9 @@ its expiry; socket-only until built.
   QUIC they are answered `Rejected(Operator(SocketOnly))`. Once it lands,
   every operator kind is signed on both transports and an unsigned one is
   refused everywhere, the socket included: a co-located gateway on the
-  socket must hold no authority either. `api::handle`'s transport
-  argument then matters only to the node's own HTTP, whose bearer token
-  admits a bare operator body until that HTTP is deleted (C10);
-  `SocketOnly` stays a retired index.
+  socket must hold no authority either. With the node's HTTP deleted
+  (C10), no transport admits a bare operator body, and `api::handle`
+  takes no transport argument; `SocketOnly` stays a retired index.
 - **The gateway and s4's console only relay** (S46): they carry an
   `Operated` the operator built in their own client; nothing they keep
   can be replayed past its nonce, sent to another node, or outlive its
@@ -376,10 +378,10 @@ its expiry; socket-only until built.
   them is answered `Behind` at once, so slow reads cannot hold a
   connection's in-flight places for long.
 - **One handler:** `Ingress::handle`'s routing becomes
-  `api::handle(kind, body, transport) → answer bytes`, which both
-  transports and, while it exists, the node's HTTP call: the HTTP ingress
-  becomes a translation onto it, the gateway's translation (§6), so the
-  differential test compares one table run two ways.
+  `api::handle(kind, body) → answer bytes`, which both transports call;
+  the gateway's HTTP is a translation onto it (§6). Until C10 the node's
+  own HTTP was the same translation, and the differential test compared
+  the two; its corpus is now pinned to what both answered.
 
 ## 6. The gateway
 
@@ -399,8 +401,9 @@ its expiry; socket-only until built.
     in place of `smol::net::TcpListener` and the node's runtime), the
     public TLS (`tls.rs`'s server half, moved), and the route table (path
     parsing, `status`, the operator header, the answer's HTTP form). The
-    node's HTTP imports it until C10 deletes that import; the gateway
-    imports it for good.
+    gateway imports it; so does the node's client, for HTTP to a gateway
+    and to translate its requests onto the API. The node serves no HTTP
+    (C10).
   - `vos-gateway` (`node/gateway`), a library and the binary
     `vos-gateway`, depending on `vos-api`, `vos-http`, `vos-wire`,
     `vos-net`'s TLS builders and `s4-server`, never on the node.
@@ -422,7 +425,7 @@ its expiry; socket-only until built.
 - **Large bodies** (the Fable review's M1): `vos-http` holds at most four
   bodies past its ordinary limit (an install's) at once, from every
   connection (`Limits::large`), and answers a request past them 503 from
-  its head, the body unread; the node's own HTTP takes the same budget.
+  its head, the body unread.
   Before that, the gateway answers an operator's route from its head, as
   the whole request would be answered: 401 with no `Operated` header (or
   one that is not 152 bytes), 421 `Operator(OtherNode)` for an envelope
@@ -447,9 +450,9 @@ its expiry; socket-only until built.
   empty `GET`s. A path whose id is not a `u32` is answered as today's
   authorized request is (an encoded `NoAgent`, 404), before any frame: the
   gateway cannot form one. A missing or unreadable header is
-  `Rejected(Unauthorized)`, 401, as a wrong token is today. Until C10 the
-  node's own HTTP takes either a bearer token (its own, as today) or the
-  same `Operated` header, through the same table.
+  `Rejected(Unauthorized)`, 401, as a wrong token was; with the node's
+  HTTP deleted (C10) no front takes a bearer token, which reads as an
+  unreadable header.
 - **Its configuration** (a TOML file): the upstream nodes, each by its key
   and API address (`quic://host:port`, or `unix:/path` for a co-located
   one); its key file `gateway.key` (its QUIC client key, which the nodes
@@ -522,7 +525,7 @@ its expiry; socket-only until built.
   takes `unix:/path` and `quic://host:port` (pinning the node's key,
   required) beside `http://` and `https://`. `Operator` signs `Operated`
   with an operator key: over the API as the body, over HTTP in the
-  `Authorization` header; a token over HTTP while the node's HTTP exists.
+  `Authorization` header.
 - **Pinning:** over QUIC the client pins the node's key at the handshake,
   and `GET /`'s check (`NotTheNode`) stays the node-API transport's.
   Through a gateway a client trusts the gateway: `Trust::Gateway(key)`
@@ -545,12 +548,15 @@ its expiry; socket-only until built.
      `gateways` by `deploy`; `collect` signs `Stats` and `Status` with the
      harness's operator key; the gateway's cost a row of its own (S41);
   4. the end-to-end suites through the gateway.
-- **The differential test** runs while both exist (§8).
-- **Deleting the node's HTTP** (`ingress.rs`, its `vos-http` import,
-  `admin.token`, the `--tls` flags, which move to the gateway) waits on
-  S50: the gateway carries every route, the HTTP tests pass through it,
-  and 7.6's final scale run is done, or T1 is re-measured over the node
-  API and both recorded [decided].
+- **The differential test** ran while both existed (§8); its corpus is
+  pinned since.
+- **Deleting the node's HTTP** (`ingress.rs`, its listener and
+  `--listen`, its `vos-http` import, `admin.token` and the bare operator
+  body, the `--tls` flags and `ingress_connections`) waited on S50: the
+  gateway carries every route, the HTTP tests pass through it, and 7.6's
+  final scale run is done, or T1 is re-measured over the node API and
+  both recorded [decided]. Done (C10) after 7.6's final run; 7.23 reruns
+  scale run 3 over the node API, both recorded.
 
 ## 8. The tests
 
@@ -558,7 +564,7 @@ From §7.10b's list, then this brief's additions and the review's (L12).
 
 | # | test | where |
 |---|---|---|
-| 1 | every route through the gateway answers as the node's HTTP: one corpus (each route, valid, malformed, a bad id, oversize by one, unknown paths, `Expect`, chunked; the operator routes with an `Operated` header, a bad one, none) sent to one node by its own HTTP and through a gateway on its socket; statuses and bodies equal | gateway |
+| 1 | every route through the gateway answers as the node's HTTP: one corpus (each route, valid, malformed, a bad id, oversize by one, unknown paths, `Expect`, chunked; the operator routes with an `Operated` header, a bad one, none) sent to one node by its own HTTP and through a gateway on its socket; statuses and bodies equal. Since C10, each pinned to what both answered | gateway |
 | 2 | each kind's body one past its limit refused `Oversize { limit }` from the header alone (the test sends the header and no body) | node, gateway |
 | 3 | an unknown kind, `0xffff` among them, `UnknownKind`; a length below the header `Truncated` (id 0 on a stream); a body cut short then the write side shut, `Truncated`; each followed by the stream's or connection's close | node |
 | 4 | a QUIC client with an unlisted key, and one with another ALPN, refused at the handshake | node |
@@ -593,10 +599,10 @@ implementing agent.
 | C7 | `vos-gateway`'s binary: tokio, config, HTTP onto the API, leader-following, limits, public TLS; tests 1, 5, 9, 15, 18 | 3 |
 | C8 | s4: the named-subsystem hook (its repository, on its `vos` branch, under its own gate); the gateway's SSH port, `vos-api`, `app.key`; tests 8, 13 | 2, plus s4's review and the rev pin |
 | C9 | `vos-scale` over the node API, the gateway's cost row; the end-to-end suites through the gateway; tests 10, 16 | 2 |
-| C10 | (gated by S50) the node's HTTP deleted | 0.5 |
+| C10 | (gated by S50) the node's HTTP deleted: done | 0.5 |
 
-About 19 days, past the plan's 2–3 weeks by a few days. C10 lands when
-S50's gate is met, which may be after the step's review. Fable reviewed
+About 19 days, past the plan's 2–3 weeks by a few days. C10 landed once
+S50's gate was met, after 7.6's final scale run. Fable reviewed
 this brief before C1; the Opus review takes the branch.
 
 **s4's pin** [owner, Q-C]: s4 is a git dependency on codeberg's
@@ -643,6 +649,7 @@ orchestrator's calls unless marked the owner's.
 10. **The binding digest's `arguments`** (Q10): hashed as the codec writes
     them, a `u32` LE length then the bytes; `identity-and-authority.md`
     §5, `proving.md` §8 and pin I say so, "compact" dropped.
-11. **Where the node's HTTP lives until C10** (Q-E): `vos-http`, imported
+11. **Where the node's HTTP lived until C10** (Q-E): `vos-http`, imported
     by the node and the gateway; the node never depends on tokio, russh or
-    s4 (M6).
+    s4 (M6). Since C10 the node serves no HTTP; its client keeps
+    `vos-http` for a gateway's.
