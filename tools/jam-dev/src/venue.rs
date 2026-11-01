@@ -49,7 +49,7 @@ use vos_venue::queue::{AnchorQueue, AnchorSend, Fate};
 use vos_venue::{AnchorOutcome, Held as Holding, Status, SubmitOutcome, UNJUDGED, VenueClient};
 
 /// How long an item's outcome may take to land.
-pub const LANDING: Duration = Duration::from_secs(120);
+const LANDING: Duration = Duration::from_secs(120);
 
 /// A JAM statements service, its calls waiting for their items to land.
 pub struct Jam {
@@ -112,9 +112,10 @@ struct Shared<S = Jam> {
     stopping: AtomicBool,
 }
 
-/// How long the queue waits to offer an anchor again: a slot, or a window's
-/// worth of slots when the venue waits for someone to act.
+/// How long the queue waits to offer an anchor again: a slot.
 const SLOT: Duration = Duration::from_secs(6);
+/// How long the queue waits to offer an anchor again when the venue waits
+/// for someone to act: a window's worth of slots.
 const AWHILE: Duration = Duration::from_secs(120);
 
 /// What a service's code is checked for.
@@ -490,7 +491,7 @@ impl Jam {
     }
 
     /// Submit `statement` with its final proof as the item's extrinsic: the
-    /// service's code (`vos_statement::code`'s) and the statement's id.
+    /// service's code (`vos_statement::code`'s).
     pub fn submit_code(&self, statement: &Statement, proof: &[u8]) -> Result<u32, Error> {
         let payload = Item::Submit(statement.encode()).encode();
         Ok(self.land(payload, vec![proof.to_vec()])?.code)

@@ -36,9 +36,6 @@ const AMOUNT: u64 = 1;
 /// creation.
 pub const FORGET: Duration = Duration::from_secs(55 * 60);
 
-pub fn wall_ms() -> u64 {
-    crate::now_ms()
-}
 
 /// The methods the load calls, by name in the shard actor's schema.
 #[derive(Clone, Copy)]
@@ -218,11 +215,11 @@ pub struct Shared {
 
 impl Shared {
     pub fn agent_now(&self) -> u64 {
-        wall_ms().saturating_add_signed(self.offset_ms.load(Ordering::Relaxed))
+        crate::now_ms().saturating_add_signed(self.offset_ms.load(Ordering::Relaxed))
     }
 
     pub fn learn_time(&self, now: u64) {
-        let offset = i128::from(now) - i128::from(wall_ms());
+        let offset = i128::from(now) - i128::from(crate::now_ms());
         self.offset_ms.store(
             offset.clamp(i64::MIN.into(), i64::MAX.into()) as i64,
             Ordering::Relaxed,
@@ -238,7 +235,7 @@ impl Shared {
         input.extend(self.seed.to_le_bytes());
         input.extend(user.to_le_bytes());
         input.extend(generation.to_le_bytes());
-        input.extend(wall_ms().to_le_bytes());
+        input.extend(crate::now_ms().to_le_bytes());
         vos_pvm::precompile::blake2b_256(&input)[..16]
             .try_into()
             .expect("16 bytes")

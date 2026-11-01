@@ -273,7 +273,7 @@ fn kernel_at_least(release: &str, (major, minor): (u32, u32)) -> bool {
     found >= (major, minor)
 }
 
-/// Bytes in a systemd size: `16G`, `512M`, or plain bytes.
+/// KiB in a systemd size: `16G`, `512M`, or plain bytes.
 fn size_kb(text: &str) -> Option<u64> {
     let (digits, unit) = text.split_at(
         text.find(|c: char| !c.is_ascii_digit())

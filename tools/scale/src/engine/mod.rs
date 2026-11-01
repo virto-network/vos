@@ -10,7 +10,7 @@
 
 mod pool;
 mod session;
-mod stats;
+pub(crate) mod stats;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -33,7 +33,7 @@ use crate::drive::{LATE_US, Plan};
 use crate::load::{self, Kind, Readers, Users};
 use crate::nodes::target;
 use pool::{Pool, PoolStats};
-use session::{Agent, Body, Fate, Methods, Op, ShardCounts, Shared, fate, wall_ms};
+use session::{Agent, Body, Fate, Methods, Op, ShardCounts, Shared, fate};
 use stats::{KindStats, REPORTED, Stats, cpu_seconds, mix_line, refusal, thread_seconds};
 
 /// The most connections a driver keeps to one node, unless its plan says
@@ -206,7 +206,7 @@ impl Engine {
         let late = now.saturating_duration_since(op.due).as_micros() as u64;
         // Timed from its schedule, or from its send if that came first.
         op.due = op.due.min(now);
-        let at = wall_ms();
+        let at = crate::now_ms();
         self.sends.set(Some(
             self.sends.get().map_or((at, at), |(first, _)| (first, at)),
         ));
@@ -514,7 +514,7 @@ impl Engine {
         for pool in &self.pools {
             pooled.absorb(&pool.take_stats());
         }
-        let t_ms = wall_ms();
+        let t_ms = crate::now_ms();
         for name in REPORTED {
             if let Some(stats) = taken.kinds.get(name) {
                 let _ = writeln!(file, "{}", stats.line(t_ms, seconds, name, false));
@@ -787,7 +787,7 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
             // Signed ahead from now: the first operations a little later.
             let _ = started.send((
                 Instant::now() + LOOKAHEAD,
-                wall_ms() + LOOKAHEAD.as_millis() as u64,
+                crate::now_ms() + LOOKAHEAD.as_millis() as u64,
             ));
             let cpu_before = cpu_seconds();
             engine.flushed.set((Instant::now(), cpu_before));
@@ -834,7 +834,7 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
         let _ = planner.join();
         engine.flush(&mut file);
         let whole = std::mem::take(&mut *engine.whole.borrow_mut());
-        let t_ms = wall_ms();
+        let t_ms = crate::now_ms();
         let (from_ms, to_ms) = engine.sends.get().unwrap_or((t_ms, t_ms));
         let span = ((to_ms - from_ms) as f64 / 1e3).max(1.0);
         for name in REPORTED {

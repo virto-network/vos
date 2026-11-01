@@ -46,12 +46,10 @@ pub use node::{
 pub use space::{Space, SpaceNode, write_genesis};
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::hash::Hash;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-use smol::future::FutureExt;
 use vos_wire::Encode;
 use vos_wire::batch::Batch;
 use vos_wire::ids::AgentId;
@@ -63,15 +61,7 @@ pub fn identity(record: &CreationRecord) -> [u8; 32] {
     vos_pvm::precompile::blake2b_256(&record.encode())
 }
 
-/// `work`'s output, if it ends within `limit`.
-pub(crate) async fn timeout<T>(limit: Duration, work: impl Future<Output = T>) -> Option<T> {
-    let work = async { Some(work.await) };
-    work.or(async {
-        smol::Timer::after(limit).await;
-        None
-    })
-    .await
-}
+pub(crate) use vos_http::server::timeout;
 
 /// `mutex`, locked. A lock a panic poisoned panics here too.
 #[track_caller]

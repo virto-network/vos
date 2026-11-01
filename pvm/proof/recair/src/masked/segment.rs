@@ -158,7 +158,7 @@ where
 
 /// The masked format `format` pins for the chips `active` names at
 /// `log_sizes`, as its verifier takes it, and the chips laid out.
-pub fn segment_format<'a>(
+fn segment_format<'a>(
     format: &Format,
     active: u32,
     log_sizes: &'a [u32],

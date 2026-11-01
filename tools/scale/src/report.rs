@@ -14,6 +14,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::check::Facts;
+use crate::engine::stats::REPORTED;
 use crate::histogram::quantile;
 use crate::runs::Run;
 use crate::sample::Sample;
@@ -130,18 +131,6 @@ pub struct KindSummary {
     pub p99_us: u64,
     pub p999_us: u64,
 }
-
-/// The kinds a report lists, in its order.
-const KINDS: [&str; 8] = [
-    "transfer",
-    "query",
-    "workflow",
-    "cut",
-    "cut_read",
-    "identity",
-    "reader",
-    "reader_read",
-];
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Summary {
@@ -365,9 +354,6 @@ fn stage_quantiles(
     })
 }
 
-/// Summarise `run` over `window` (milliseconds since the epoch), the
-/// drivers' span when `None`; written to the run's `summary.json` and
-/// `report.txt`.
 /// A share of late sends above which the driver, not the nodes, may have
 /// bound the run.
 const LATE_SHARE: f64 = 0.01;
@@ -381,6 +367,9 @@ fn every_s(run: &Run) -> u64 {
         .map_or(10, |every| every.max(1) as u64)
 }
 
+/// Summarise `run` over `window` (milliseconds since the epoch), the
+/// drivers' span when `None`; written to the run's `summary.json` and
+/// `report.txt`.
 pub fn report(
     run: &Run,
     window: Option<(u64, u64)>,
@@ -799,7 +788,7 @@ pub fn text(summary: &Summary) -> String {
             driver.cores,
             100.0 * driver.mix_error
         );
-        for kind in KINDS {
+        for kind in REPORTED {
             if let Some(stats) = driver.kinds.get(kind) {
                 text += &format!(
                     "    {kind:<9} {:>9} sent {:>9} ok {:>7} errors {:?}, {:.1}/s, p50 {} us, p99 {} us, p99.9 {} us{}\n",

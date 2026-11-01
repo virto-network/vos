@@ -225,20 +225,6 @@ impl DeviceLayout {
             .position(|range| range.first <= page && page < range.end)
     }
 
-    /// The byte a first touch of `address` reads: its data table's in a
-    /// data region, zero elsewhere.
-    pub fn initial_byte(&self, address: u32) -> u8 {
-        self.data
-            .iter()
-            .find_map(|(base, bytes)| {
-                address
-                    .checked_sub(*base)
-                    .and_then(|offset| bytes.get(offset as usize))
-                    .copied()
-            })
-            .unwrap_or(0)
-    }
-
     /// The data table's entries, address and byte.
     pub fn data_entries(&self) -> impl Iterator<Item = (u32, u8)> + '_ {
         self.data.iter().flat_map(|(base, bytes)| {
