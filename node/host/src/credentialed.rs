@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use vos_pvm_final_verifier::credential::{self as verifier, CredentialKind};
+use vos_pvm_recair::ProveError;
 use vos_pvm_recair::device::{self as device, Verifier};
 use vos_wire::abi::Kind;
 use vos_wire::abi::cap;
@@ -136,22 +137,18 @@ enum Statement {
 }
 
 impl Statement {
-    /// Whether the proof in `bytes` proves it.
+    /// Whether the proof in `bytes` proves it. A malformed proof that
+    /// panics either verifier proves nothing.
     fn verify(&self, bytes: &[u8]) -> bool {
-        match self {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match self {
             Statement::Credential {
                 kind,
                 words: Some(words),
             } => verifier::verify_bytes(*kind, words, bytes).is_ok(),
             Statement::Credential { words: None, .. } => false,
-            // A malformed proof that panics the verifier proves nothing.
-            Statement::Device { program, io } => {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    program.verify(io, bytes).is_ok()
-                }))
-                .unwrap_or(false)
-            }
-        }
+            Statement::Device { program, io } => program.verify(io, bytes).is_ok(),
+        }))
+        .unwrap_or(false)
     }
 
     /// Whether it can be proven at all: no verification is spent on one
@@ -211,21 +208,32 @@ impl Inner {
         };
         // A device proof's program, once every check before the binding
         // has passed: computed from the installed kernel the first time.
-        let kernel = match self.front(&self.store.snapshot(), agent, &call) {
-            Ok(front) => front.kernel,
+        let snapshot = self.store.snapshot();
+        let front = match self.front(&snapshot, agent, &call) {
+            Ok(front) => front,
             Err(refused) => return refused.into(),
         };
-        let program = match kernel {
+        let (snapshot, front, program) = match front.kernel {
+            None => (snapshot, front, None),
             Some(kernel) => match self.device_program(kernel).await {
-                Ok(Some(program)) => Some((kernel, program)),
+                // Its program may have been computed meanwhile: the rest
+                // is checked on the state as it is now, against the
+                // kernel the program is of.
+                Ok(Some(program)) => {
+                    let snapshot = self.store.snapshot();
+                    let front = match self.front(&snapshot, agent, &call) {
+                        Ok(front) => front,
+                        Err(refused) => return refused.into(),
+                    };
+                    (snapshot, front, Some((kernel, program)))
+                }
                 Ok(None) => {
                     return Response::Rejected(Rejection::Credential(CredentialRefusal::Kind));
                 }
                 Err(refused) => return refused.into(),
             },
-            None => None,
         };
-        let checked = match self.check(agent, call, program) {
+        let checked = match self.check(&snapshot, front, agent, call, program) {
             Ok(checked) => checked,
             Err(refused) => return refused.into(),
         };
@@ -274,8 +282,9 @@ impl Inner {
 
     /// The device program of `kernel`: computed on an executor from the
     /// stored kernel the first time, one computation however many requests
-    /// wait on it, then kept; `None` for a kernel whose program cannot be
-    /// computed. A kernel this replica does not hold yet, or an executor
+    /// wait on it, then kept; `None`, kept too, for a kernel whose program
+    /// cannot be computed from its bytes (its shape, its run). A kernel
+    /// this replica does not hold yet, any other failure, or an executor
     /// gone, is `Unavailable`, retryable, and not kept.
     async fn device_program(&self, kernel: [u8; 32]) -> Result<Option<Arc<Verifier>>, Refused> {
         let place = self.calls.devices.place(kernel);
@@ -288,9 +297,11 @@ impl Inner {
                         .ok()
                         .flatten()
                         .ok_or(Refused::Unavailable)?;
-                    Ok(device::Program::auth(&blob)
-                        .ok()
-                        .map(|program| Arc::new(program.verifier())))
+                    match device::Program::auth(&blob) {
+                        Ok(program) => Ok(Some(Arc::new(program.verifier()))),
+                        Err(error) if of_the_kernel(&error) => Ok(None),
+                        Err(_) => Err(Refused::Unavailable),
+                    }
                 })
                 .await
                 .ok_or(Refused::Unavailable)?
@@ -354,23 +365,24 @@ impl Inner {
         })
     }
 
-    /// Every check of `call` but the proof's, in order, on this replica's
-    /// applied state; `device` the kernel and program a device proof is
-    /// verified against ([`Inner::device_program`]), which must still be
-    /// the guard's.
+    /// Every check of `call` after `front`'s, in order, on `snapshot`,
+    /// this replica's applied state, which `front` was checked on;
+    /// `device` the kernel and program a device proof is verified against
+    /// ([`Inner::device_program`]), which must still be the guard's.
     fn check(
         &self,
+        snapshot: &Snapshot,
+        front: Front,
         agent: AgentId,
         call: Credentialed,
         device: Option<([u8; 32], Arc<Verifier>)>,
     ) -> Result<Checked, Refused> {
-        let snapshot = self.store.snapshot();
         let Front {
             space,
             guard,
             kind,
             kernel,
-        } = self.front(&snapshot, agent, &call)?;
+        } = front;
         // An install between the program's lookup and this snapshot: asked
         // again, the call meets the new kernel's program.
         let device = match (kernel, device) {
@@ -419,7 +431,7 @@ impl Inner {
                 {
                     return Err(CredentialRefusal::Once.into());
                 }
-                fresh(&snapshot, agent, &map_root)?;
+                fresh(snapshot, agent, &map_root)?;
                 Some(map_root)
             }
             CredentialPublic::Owner { .. } => None,
@@ -457,6 +469,20 @@ impl Inner {
     }
 }
 
+/// Whether a device program's computation failed for its kernel's bytes,
+/// as it fails every time: its layout or shape, its run, its witness, the
+/// wiring or the masking's layout. Any other failure may pass again.
+fn of_the_kernel(error: &ProveError) -> bool {
+    matches!(
+        error,
+        ProveError::TraceShape(_)
+            | ProveError::Segment(_)
+            | ProveError::Witness(_)
+            | ProveError::Wiring(_)
+            | ProveError::Masking(_)
+    )
+}
+
 /// The program hash of the device kernel `name` names in `installed`: a
 /// method of the `Device` kind whose kernel the install bound.
 fn device_kernel(installed: &Installed, name: &[u8]) -> Option<[u8; 32]> {
@@ -482,11 +508,13 @@ fn installed(
 
 /// That `root` is in the credential actor's ring and fresh by this
 /// replica's latest applied batch time: `RootUnknown` (retryable) when the
-/// ring does not hold it, or the agent has no credential actor; `RootStale`
-/// when it was superseded more than [`defaults::ROOT_MAX_AGE`] before.
+/// ring does not hold it, the agent has no credential actor, or this
+/// replica has applied no batch time yet; `RootStale` when it was
+/// superseded more than [`defaults::ROOT_MAX_AGE`] before.
 fn fresh(snapshot: &Snapshot, agent: AgentId, root: &[u8; 32]) -> Result<(), Refused> {
     let ring = ring(snapshot, agent)?.ok_or(CredentialRefusal::RootUnknown)?;
-    let time = read::<u64>(snapshot, agent, &keys::batch_time())?.unwrap_or(0);
+    let time =
+        read::<u64>(snapshot, agent, &keys::batch_time())?.ok_or(CredentialRefusal::RootUnknown)?;
     ring.accepts(root, time).map_err(|refusal| match refusal {
         credentials::RootRefusal::Unknown => CredentialRefusal::RootUnknown.into(),
         credentials::RootRefusal::Stale => CredentialRefusal::RootStale.into(),

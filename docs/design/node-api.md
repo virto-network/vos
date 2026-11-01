@@ -257,7 +257,7 @@ its expiry; socket-only until built.
   `"vos/operator/1" ‖ node ‖ kind ‖ nonce ‖ expires_ms ‖ body`: `node`
   the addressed node's `NodeId` (32 bytes), `kind` 2 bytes LE,
   `expires_ms` 8 LE, `body` as SCALE (a `u32` LE length, then the bytes),
-  in `ingress.rs`'s `message` form (domain, then an identity, then the
+  in `vos_wire::ingress`'s `message` form (domain, then an identity, then the
   fields). A request is good at one node for one kind: a relay cannot
   send it to another, and a node's own nonce store is enough. The
   envelope names its node (the review's M1) so a relay can route it to
@@ -366,7 +366,8 @@ its expiry; socket-only until built.
   `vos_api::LARGE`) are held at once across the socket and QUIC: the
   socket reads a large frame's body only once it holds a place, its
   deadline running from then, and QUIC answers `Unavailable` from the
-  header (L6). A frame's deadline runs from its own first byte. After a
+  header (L6). A frame's deadline runs from its own first byte on a byte
+  stream, and from the stream's accept on QUIC. After a
   frame error on the socket, the requests in flight run on detached
   while the connection's place is given back, so a local client can have
   more running than `api_connections × api_in_flight`; the socket's mode
@@ -529,7 +530,7 @@ its expiry; socket-only until built.
   pins the gateway's own-key TLS (or `Trust::Ca` its CA's), keeps that pin
   across redirects (the review's M8), and skips `NotTheNode`, since `GET
   /` still answers a node's key [orchestrator, Q5(a)]. Every node's
-  `ingress` column names its gateway, so a redirect through a gateway
+  `contact` column names its gateway, so a redirect through a gateway
   converges on the gateway, which routes again.
 - **Redirects over the API** need a node's API address for a `Contact`:
   the node-API client takes them from its own table, by node key (its
@@ -631,7 +632,7 @@ orchestrator's calls unless marked the owner's.
    atomically and synced before the command runs (M4).
 5. **Addresses and pinning through a gateway** (Q5(a)): the node-API
    client maps contacts by key from its own table; HTTP clients through a
-   gateway pin it with `Trust::Gateway` (M8); the space file's `ingress`
+   gateway pin it with `Trust::Gateway` (M8); the space file's `contact`
    column names each node's gateway.
 6. **The API's QUIC endpoint** (Q6(a)): its own UDP port and thread, its
    bidi cap `api_in_flight` (M5).
