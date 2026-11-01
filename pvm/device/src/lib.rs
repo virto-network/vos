@@ -37,6 +37,7 @@ mod kernel;
 mod path;
 mod prover;
 mod secret;
+mod threads;
 pub mod wire;
 
 pub use call::{Call, NAME_BYTES, scope};
@@ -46,9 +47,10 @@ pub use kernel::{
 pub use path::PathKeeper;
 pub use prover::{
     CredentialProof, CredentialPublic, JointProof, JointPublic, PEAK_BYTES, Prover, ProverConfig,
-    STACK_BYTES, Threads, thread_pool, verify, verify_joint,
+    STACK_BYTES, Threads, verify, verify_joint,
 };
 pub use secret::{DeviceSecret, derive_secret, member, owner, source_input};
+pub use threads::thread_pool;
 
 use vos_wire::credentials::{self, P};
 

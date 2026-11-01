@@ -8,7 +8,7 @@ use vos_pvm_recair::device::{self as profile, Program};
 use vos_wire::credentials::Words;
 use zeroize::Zeroize;
 
-use crate::prover::auth_public;
+use crate::prover::auth_digests;
 use crate::secret::DeviceSecret;
 use crate::{AuthWitness, Call, CredentialProof, CredentialPublic, DeviceError, Prover, scope};
 
@@ -130,7 +130,7 @@ impl Prover {
         call: &Call,
         program: &DeviceProgram,
     ) -> Result<CredentialProof, DeviceError> {
-        let public = auth_public(secret, witness, name, call, program.id(), 0)?;
+        let public = auth_digests(secret, witness, name, call, program.id(), 0)?;
         let bytes = profile::auth_public(
             &public.map_root.to_bytes(),
             &public.scope.to_bytes(),
