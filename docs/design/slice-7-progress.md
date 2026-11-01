@@ -6695,6 +6695,7 @@ platform named: a fixed message would close it); a small integer below
 2^20 (a slot, a count) is no needle; the phone bench's own member has a
 public `o`.
 
-**Gates:** `just test-carriers` exit 0 (the three runs 287 s, the bench
-8 s); s4's credential suite exit 0 (lib 16, facility 4, leaks 1, warm 1;
+**Gates:** `just check` exit 0 (1,700 passed in 119 suites; 12 GiB
+scope, `nice -n 10`, 8 jobs); `just test-carriers` exit 0 (the three runs
+287 s, the bench 8 s); `test-proof` not run: no proof code changed; s4's credential suite exit 0 (lib 16, facility 4, leaks 1, warm 1;
 `--offline --features ffi --ignore-rust-version`), fmt and clippy clean.
