@@ -285,7 +285,7 @@ impl Nodes for Cluster {
         self.space
             .nodes()
             .iter()
-            .find(|node| node.ingress == address)
+            .find(|node| node.contact == address)
             .map(|node| node.number)
     }
 

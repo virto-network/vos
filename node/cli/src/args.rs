@@ -108,9 +108,9 @@ pub struct RunArgs {
     /// The agent program, as built by `just build-agent`.
     #[arg(long, env = "VOS_AGENT")]
     pub agent: PathBuf,
-    /// The space's nodes, one per line: number, key, peer address and the
-    /// address of the gateway in front of it. Without it, the node is a
-    /// space of one.
+    /// The space's nodes, one per line: number, key, peer address and
+    /// contact, where redirects send clients (a gateway's URL, or the node
+    /// API's `quic://` address). Without it, the node is a space of one.
     #[arg(long)]
     pub space: Option<PathBuf>,
     /// The node's settings, a TOML file: `executors`, `queue`,
@@ -137,8 +137,7 @@ pub enum SpaceCommand {
     /// belongs to no space forever. Then copy `<space>.genesis` beside
     /// every node's space file and restart the nodes.
     Up {
-        /// The space file: number, key, peer address and gateway address
-        /// per line.
+        /// The space file: number, key, peer address and contact per line.
         #[arg(long)]
         space: PathBuf,
         /// The founding node's data directory, its node stopped: the
@@ -256,8 +255,9 @@ pub struct NodeArgs {
     /// `quic://HOST:PORT` its API over QUIC, which needs `--node-key` and
     /// `--api-key`; `http://` reaches a gateway on a loopback address,
     /// `https://` a gateway pinned by `--gateway-key` or trusted through
-    /// `--ca`. An operator's command reaches the socket in the node's data
-    /// directory by default.
+    /// `--ca`. An operator's command reaches `api.sock` in the node's data
+    /// directory by default; a socket its `api_socket` puts elsewhere is
+    /// named here.
     #[arg(long)]
     node: Option<String>,
     /// The seed file of the key this client presents over QUIC, which the

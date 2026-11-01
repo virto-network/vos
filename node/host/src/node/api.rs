@@ -1,5 +1,5 @@
 //! The node's own API: its counters, its agents created, replaced and
-//! called, their state, and its ingress served.
+//! called, their state, and its API served on a socket and over QUIC.
 
 use std::future::Future;
 use std::net::SocketAddr;

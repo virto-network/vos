@@ -268,6 +268,13 @@ impl Inventory {
     }
 
     fn validate(&self) -> Result<(), String> {
+        if self.node.contains_key("ingress_connections") {
+            return Err(
+                "[node] ingress_connections: the node serves no HTTP; its API's bounds are \
+                 api_connections and api_in_flight"
+                    .into(),
+            );
+        }
         let mut names = BTreeSet::new();
         let mut dirs: Vec<(&str, &str, &str)> = Vec::new();
         let mut ports = BTreeSet::new();
@@ -409,6 +416,9 @@ mod tests {
         assert_eq!(inventory.node["executors"].as_integer(), Some(2));
         assert_eq!(inventory.hosts[0].unit("node"), "vos-scale-node-a");
         assert!(inventory.hosts[0].is_local() && !inventory.hosts[2].is_local());
+        let http = THREE.replace("executors = 2", "executors = 2\ningress_connections = 64");
+        let refused = Inventory::parse(&http).unwrap_err();
+        assert!(refused.contains("api_connections"), "{refused}");
     }
 
     #[test]

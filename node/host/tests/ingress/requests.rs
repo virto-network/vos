@@ -1,5 +1,5 @@
-//! Requests through the node API: batches that sweep, pipelined and
-//! duplicate requests, and a request resent with its sequence.
+//! Requests through the node API: batches that sweep, unread and
+//! duplicate answers, and a request resent with its sequence.
 
 use super::*;
 
@@ -28,9 +28,10 @@ fn a_busy_leader_sweeps_in_its_batches() {
 
 /// Calls sent on one connection, their answers never read, the connection
 /// then dropped: their replies come from the window. Each goes once the
-/// one before applied, since frames on a connection run at once.
+/// one before applied, since frames on a connection run at once, in no
+/// order a session's sequence would take.
 #[test]
-fn pipelined_requests_recover_their_lost_replies() {
+fn unread_answers_come_back_from_the_window() {
     let served = Served::plain();
     let client = served.client(1);
     let mut stream = super::api::connect(&served.socket);

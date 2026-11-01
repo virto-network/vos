@@ -4,9 +4,10 @@
 //! member's device secret derived from a known source output, its path
 //! fetched, and its calls proved by the device library as a phone proves
 //! them and sent to the nodes over each transport: the API's socket, and
-//! a gateway relaying HTTP onto the API over QUIC. Then every carrier the run produced is searched for the member's
-//! secret, which only the device holds, and for where the member sits,
-//! which a credentialed call never carries ([`vos_checker::carriers`]).
+//! a gateway relaying HTTP onto the API over QUIC. Then every carrier the
+//! run produced is searched for the member's secret, which only the
+//! device holds, and for where the member sits, which a credentialed call
+//! never carries ([`vos_checker::carriers`]).
 //!
 //! The calls: auth sign-ins, a replay (`Replayed`), a `once` vote and a
 //! second (`Once`), a proof cut by a byte (`Proof`), another call's
@@ -587,37 +588,35 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
         ));
         decoded
     };
-    for (name, target) in [("the gateway", front.target())] {
-        let call = founded.call(at, POLL, "login", ());
-        let proof = prover
-            .prove_auth(&secret, &witness, b"login", &call)
-            .unwrap();
-        let mut cut = request(&call, &proof);
-        cut.proof.pop();
-        let answer = post(format!("{name}: a cut proof"), target, &cut);
-        assert_eq!(
+    let target = front.target();
+    let call = founded.call(at, POLL, "login", ());
+    let proof = prover
+        .prove_auth(&secret, &witness, b"login", &call)
+        .unwrap();
+    let mut cut = request(&call, &proof);
+    cut.proof.pop();
+    let answer = post("the gateway: a cut proof".to_string(), target, &cut);
+    assert_eq!(
+        answer,
+        Response::Rejected(vos_wire::ingress::Rejection::Credential(
+            CredentialRefusal::Proof
+        ))
+    );
+    let answer = post(
+        "the gateway: a sign-in".to_string(),
+        target,
+        &request(&call, &proof),
+    );
+    assert!(
+        matches!(
             answer,
-            Response::Rejected(vos_wire::ingress::Rejection::Credential(
-                CredentialRefusal::Proof
-            )),
-            "{name}"
-        );
-        let answer = post(
-            format!("{name}: a sign-in"),
-            target,
-            &request(&call, &proof),
-        );
-        assert!(
-            matches!(
-                answer,
-                Response::Ran {
-                    outcome: Outcome::Done(_),
-                    ..
-                }
-            ),
-            "{name}: {answer:?}"
-        );
-    }
+            Response::Ran {
+                outcome: Outcome::Done(_),
+                ..
+            }
+        ),
+        "{answer:?}"
+    );
 
     // Frame errors, each closing its connection: a frame of no kind, and
     // one past its kind's limit, from its header.

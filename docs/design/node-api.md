@@ -14,10 +14,7 @@ Tags as in the plan: [decided] the owner's; [proposed] open to review;
 [measured] by a run. Everything not tagged is [proposed]; the answers of
 §10 are the orchestrator's calls unless marked the owner's.
 
-## 1. What exists
-
-Before the step: the node's ingress, its bearer token and its TLS are
-gone since C10 (§7).
+## 1. What existed before the step
 
 - **The ingress** (`node/host/src/ingress.rs`) serves HTTP/1.1
   (`http.rs`, `Content-Length` bodies only, keep-alive, 16 KiB heads,
@@ -350,7 +347,7 @@ its expiry; socket-only until built.
   `gateways` key is a transport admission, no authority: a driver of
   `vos-scale` or a remote `vos` is listed the same way.
 - **Limits** (the review's M5): `api_connections` connections per
-  transport (default today's `ingress_connections`, 1,024), more refused
+  transport (default 1,024), more refused
   at accept (the socket) or the handshake (QUIC); `api_in_flight`
   requests in flight per connection on both transports (default 1,024),
   past which the node stops reading the socket, and QUIC's

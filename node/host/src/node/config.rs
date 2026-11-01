@@ -222,6 +222,7 @@ impl Config {
             floor_waits: 256,
             api_connections: 1024,
             api_in_flight: 1024,
+            // A gateway's HTTP request's deadline too.
             api_frame_deadline: Duration::from_secs(60),
             operators: Vec::new(),
             local_operator: true,

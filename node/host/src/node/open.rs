@@ -228,7 +228,7 @@ impl Node {
             let _ = stop.send(());
             let _ = thread.join();
         }
-        // End the ingress, the API's socket and their connections while the
+        // End the API's socket servers and their connections while the
         // runtime still runs them, so none outlives the node holding its
         // store.
         drop(lock(&self.quic_api).take());
@@ -440,10 +440,10 @@ fn collect_blobs(inner: &Inner, stopped: &mpsc::Receiver<()>) {
 
 /// Write a secret, the operator's key, in hex, readable by its
 /// owner only.
-pub(crate) fn write_private(path: &Path, token: &[u8; 32]) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &Path, secret: &[u8; 32]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let hex = hex::encode(token);
+    let hex = hex::encode(secret);
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)

@@ -1,13 +1,13 @@
 //! The space a node runs in: its nodes, each with its number, its key, the
-//! address its peers reach it at, and the address its clients do.
+//! address its peers reach it at, and its contact, the address its clients
+//! are sent to: a gateway's URL, or the node API's `quic://` address.
 //!
 //! A space file holds one node per line, as four fields: the number, the
-//! key in hex, the peer address, and the ingress address. A `#` starts a
-//! comment.
+//! key in hex, the peer address, and the contact. A `#` starts a comment.
 //!
 //! ```text
-//! # number  key                                                               peer            ingress
-//! 1         7f3a...e2                                                          10.0.0.1:7800   https://10.0.0.1:7700
+//! # number  key                                                               peer            contact
+//! 1         7f3a...e2                                                          10.0.0.1:7800   https://gateway.example
 //! ```
 //!
 //! Beside it, `<space file>.genesis` holds the space's genesis
@@ -39,8 +39,9 @@ pub struct SpaceNode {
     pub key: [u8; 32],
     /// Where its peers reach it.
     pub peer: SocketAddr,
-    /// Where its clients reach it: an `http://` or `https://` address.
-    pub ingress: String,
+    /// Where its clients are sent, by a redirect naming it: a gateway's
+    /// URL, or the node API's `quic://` address.
+    pub contact: String,
 }
 
 /// The nodes of a space, and its genesis once it has one.
@@ -215,10 +216,8 @@ impl Space {
             }
             let at = |why: &str| format!("line {}: {why}", line + 1);
             let fields: Vec<&str> = content.split_whitespace().collect();
-            let [number, key, peer, ingress] = fields[..] else {
-                return Err(at(
-                    "four fields: number, key, peer address, ingress address",
-                ));
+            let [number, key, peer, contact] = fields[..] else {
+                return Err(at("four fields: number, key, peer address, contact"));
             };
             nodes.push(SpaceNode {
                 number: number.parse().map_err(|_| at("a node number, 0 to 255"))?,
@@ -226,7 +225,7 @@ impl Space {
                 peer: peer
                     .parse()
                     .map_err(|_| at("a peer address: host and port"))?,
-                ingress: ingress.to_string(),
+                contact: contact.to_string(),
             });
         }
         Self::new(nodes)
@@ -294,7 +293,7 @@ mod tests {
         let space = Space::parse(&text).unwrap();
         assert_eq!(space.numbers(), [1, 2]);
         assert_eq!(
-            space.by_key(&[2; 32]).unwrap().ingress,
+            space.by_key(&[2; 32]).unwrap().contact,
             "https://10.0.0.2:7700"
         );
         assert_eq!(space.peers()[0].address, "10.0.0.1:7800".parse().unwrap());
@@ -362,7 +361,7 @@ mod tests {
                     number,
                     key: [number; 32],
                     peer: "10.0.0.1:7800".parse().unwrap(),
-                    ingress: "x".into(),
+                    contact: "x".into(),
                 })
                 .collect()
         };

@@ -78,7 +78,8 @@ impl Drop for Waiting<'_> {
 /// socket and QUIC together, apart from the installs' large bodies. A
 /// credentialed call gives its place back once its proof is verified, so
 /// they bound proofs held and verified, not calls waiting to apply: about
-/// 100 MiB of them at their largest.
+/// 100 MiB of them at their largest, as many as a gateway's HTTP holds
+/// (`vos_http::CREDENTIALED_LARGE`).
 pub const CREDENTIALED_BODIES: usize = 64;
 
 /// A large body's place among those its kind's pool holds, given back when

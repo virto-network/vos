@@ -166,7 +166,7 @@ pub fn read_log(log: &Path) -> String {
 }
 
 /// A space file's text: a line for each of `nodes`, numbered from 1, of
-/// its key in hex, its peer address and the URL of its gateway.
+/// its key in hex, its peer address and its contact.
 pub fn space_file<'a>(nodes: impl IntoIterator<Item = (&'a str, SocketAddr, &'a str)>) -> String {
     nodes
         .into_iter()
@@ -255,8 +255,8 @@ impl Processes {
         self.dir.path().join(format!("node-{number}.faults"))
     }
 
-    /// The URL the space file names node `number`'s gateway by: the
-    /// redirects' address, which no process serves.
+    /// Node `number`'s contact in the space file, which redirects carry
+    /// and no process serves.
     pub(crate) fn url(&self, number: usize) -> String {
         format!("http://node-{number}")
     }

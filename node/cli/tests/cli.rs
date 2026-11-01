@@ -451,6 +451,21 @@ fn a_client_reads_the_workflow_it_started() {
     );
 }
 
+/// A client and an operator through a gateway in front of a node's socket:
+/// the operator's command carries its signed envelope in a header.
+#[test]
+fn a_client_and_an_operator_reach_a_node_through_a_gateway() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, data, _) = single_node(dir.path());
+    let mut key = [0u8; 32];
+    hex::decode_to_slice(&node.key, &mut key).unwrap();
+    let front = vos_checker::processes::Front::serve(vec![(key, node.url())], [0x9a; 32]);
+    let url = format!("http://{}", front.target().authority());
+    assert_eq!(vos(["node", "info", "--node", &url]), node.key);
+    let created = vos(["agent", "create", "--node", &url, "--data", &data]);
+    assert!(created.parse::<u32>().is_ok(), "{created}");
+}
+
 /// A node's API over QUIC, to a client key it lists in `gateways`: the
 /// client pins the node's key, or, an operator on the node's host, the key
 /// its data directory holds; another key, no key, or an unlisted client is

@@ -23,7 +23,7 @@
 //! failed.
 //!
 //! Its clients on the nodes' API sockets, one request at a time or
-//! pipelined by the seed's second bit. The seed is printed;
+//! pipelined by the seed's parity. The seed is printed;
 //! `FAULTS_SEED` runs one again.
 
 #![cfg(feature = "faults")]
@@ -542,7 +542,7 @@ fn five_processes_apply_once_through_faults() {
         .ok()
         .and_then(|seed| seed.parse().ok())
         .unwrap_or(0x5eed_0003_u64);
-    let mode = if (seed >> 1).is_multiple_of(2) {
+    let mode = if seed.is_multiple_of(2) {
         Mode::OneAtATime
     } else {
         Mode::Pipelined

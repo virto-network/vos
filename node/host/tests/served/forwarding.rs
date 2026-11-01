@@ -1,4 +1,4 @@
-//! Calls and queries over HTTP to a follower, to a node that does not
+//! Calls and queries over the node API to a follower, to a node that does not
 //! replicate the agent, and to a leader whose clock, refines or commits a
 //! test holds: forwarded once and checked first, answered only once
 //! applied where they were sent, and read where the write is.

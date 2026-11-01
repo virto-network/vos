@@ -41,12 +41,6 @@ impl Target {
         &self.authority
     }
 
-    /// The TLS a connection to it speaks, and the name it presents, for a
-    /// caller with its own connections; none for plain HTTP.
-    pub fn tls(&self) -> Option<(Arc<rustls::ClientConfig>, ServerName<'static>)> {
-        self.tls.clone()
-    }
-
     /// The gateway at `url` (`http://` or `https://`, then a host and an
     /// optional port), trusted as `trust` says. Plain HTTP reaches
     /// loopback addresses only, and HTTPS needs a key or a CA to trust (or

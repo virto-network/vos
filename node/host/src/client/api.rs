@@ -101,7 +101,7 @@ impl Api {
             } => {
                 let Authorization::Operated(credentials) = authorization else {
                     return Err(ClientError::Http(
-                        "the node API takes a signed operator request, not a token".into(),
+                        "the node API takes a signed operator request only".into(),
                     ));
                 };
                 match inner {

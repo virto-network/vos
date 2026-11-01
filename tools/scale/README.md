@@ -194,7 +194,8 @@ replicates first, so 10^5 idle agents need more). `[node]` holds the
 nodes' settings (`vos node run --config`): `executors`, `queue`,
 `max_inputs`, `max_bytes`, `linger_ms`, `api_connections`,
 `api_in_flight`, `election_timeout_ms = [low, high]` and `heartbeat_ms`.
-The harness sets `operators`, `gateways` and `api_listen` itself.
+The harness sets `operators`, `gateways` and `api_listen` itself; an
+`ingress_connections`, a setting of the node's deleted HTTP, is refused.
 
 ## Running `check`
 

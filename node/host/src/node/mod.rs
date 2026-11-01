@@ -271,7 +271,7 @@ impl Inner {
     pub(crate) fn contact(&self, number: NodeNumber) -> Option<Contact> {
         let node = self.space.as_ref()?.node(number)?;
         Some(Contact {
-            address: node.ingress.clone(),
+            address: node.contact.clone(),
             node: NodeId(node.key),
         })
     }

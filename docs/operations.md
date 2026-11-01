@@ -15,15 +15,17 @@ statements service's controls. First, how an operator reaches a node.
 - An operator's commands are signed with an operator key the node lists:
   `operator.key` in its data directory, listed unless `local_operator =
   false`, and the keys `operators` names. On the node's host,
-  `vos agent create --data DIR` reaches the socket in `DIR`, signing for
+  `vos agent create --data DIR` reaches the socket in `DIR` (`--node
+  unix:PATH` reaches one `api_socket` names elsewhere), signing for
   the node whose key `DIR` holds; with `--node quic://HOST:PORT --api-key
   FILE` it reaches that node's QUIC instead, as a client key `gateways`
   lists, pinned by the same key.
 - Clients over HTTP, and s4's SSH, reach a space through a gateway
   (`vos-gateway`), which holds no authority: an operator's route through
   it carries the operator's signed envelope in its `Authorization`
-  header, and no token admits one. A space file's last column names each
-  node's gateway, which redirects carry.
+  header, and no token admits one. A space file's last column is each
+  node's contact, which redirects carry: its gateway's URL, or its API's
+  `quic://` address.
 
 ## The node key is the anchor key
 

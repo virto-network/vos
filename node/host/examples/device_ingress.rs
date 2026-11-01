@@ -101,8 +101,8 @@ struct Served {
 fn start() -> Served {
     let programs = Programs::load();
     let dir = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
-    let ingress = format!("http://127.0.0.1:{}", vos_checker::spaces::free_tcp_port());
-    let space = vos_checker::spaces::space(&programs.agent, &[dir.path()], |_| ingress.clone());
+    let contact = "http://node-1".to_string();
+    let space = vos_checker::spaces::space(&programs.agent, &[dir.path()], |_| contact.clone());
     let genesis = space
         .found(WindowClock::DEFAULT, vos_node::wall_clock(), [3; 16])
         .unwrap();

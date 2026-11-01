@@ -191,15 +191,29 @@ fn fill_identities(
     let method = schema
         .method_id("fill_identities")
         .ok_or("the shard actor has no fill_identities")?;
+    // Each node by its key, where a writer's redirect goes.
+    let routes = deployed
+        .nodes
+        .iter()
+        .map(|node| {
+            Ok((
+                crate::keys::hex32(&node.key)?,
+                crate::nodes::target(node, client)?,
+            ))
+        })
+        .collect::<Result<std::collections::HashMap<_, _>, String>>()?;
     let calls = rows.div_ceil(FILL);
-    let writers = calls.min(8);
+    // Each writer dials its own connection: well within the handshakes a
+    // node takes at once from one address.
+    let writers = calls.min(4);
     std::thread::scope(|scope| {
         let handles: Vec<_> = (0..writers)
             .map(|writer| {
-                let target = target.clone();
+                let (target, routes) = (target.clone(), routes.clone());
                 scope.spawn(move || -> Result<(), String> {
                     let (key, _) = crate::load::user(seed ^ 0xf111, writer);
-                    let mut client = Client::new(&target, SigningKey::from_bytes(&key));
+                    let mut client =
+                        Client::new(&target, SigningKey::from_bytes(&key)).with_routes(routes);
                     for call in (writer..calls).step_by(writers as usize) {
                         let start = call * FILL;
                         let count = FILL.min(rows - start) as u32;
