@@ -8,9 +8,9 @@ use std::thread::JoinHandle;
 
 type Job = Box<dyn FnOnce() + Send>;
 
-/// A job that panicked: its message, if it had one.
+/// A job that panicked: its message, as [`crate::panic_message`] gives it.
 #[derive(Debug)]
-pub(crate) struct Panicked(pub String);
+pub(crate) struct Panicked(pub &'static str);
 
 pub(crate) struct Executors {
     jobs: smol::channel::Sender<Job>,
@@ -71,11 +71,11 @@ impl Executors {
         let sent = self.jobs.try_send(job).is_ok();
         async move {
             if !sent {
-                return Err(Panicked("the executors stopped".into()));
+                return Err(Panicked("the executors stopped"));
             }
             wait.recv()
                 .await
-                .unwrap_or_else(|_| Err(Panicked("an executor dropped the job".into())))
+                .unwrap_or_else(|_| Err(Panicked("an executor dropped the job")))
         }
     }
 }

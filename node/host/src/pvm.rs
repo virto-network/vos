@@ -19,7 +19,7 @@ use vos_wire::result::Write;
 use vos_wire::{Decode, Encode, defaults};
 
 use crate::blobs::Blobs;
-use crate::fault::Fault;
+use crate::fault::{self, Fault};
 use crate::lock;
 use crate::store::Snapshot;
 
@@ -175,8 +175,8 @@ impl Machines {
             )))
         } else if invocation.exit != ExitReason::Halt {
             Err(Fault::Agent(format!(
-                "refine stopped: {:?}",
-                invocation.exit
+                "refine stopped: {}",
+                fault::stopped(&invocation.exit)
             )))
         } else {
             invocation
@@ -215,7 +215,10 @@ impl Machines {
         let exit = invocation.exit.clone();
         self.program.restore(invocation);
         if exit != ExitReason::Halt {
-            return Err(Fault::Agent(format!("accumulate stopped: {exit:?}")));
+            return Err(Fault::Agent(format!(
+                "accumulate stopped: {}",
+                fault::stopped(&exit)
+            )));
         }
         Ok(storage
             .written
@@ -275,7 +278,7 @@ impl ServiceStorage for Overlay {
 pub(crate) fn decode<T: Decode>(bytes: &[u8]) -> Result<T, Fault> {
     T::decode(bytes)
         .map(|(value, _)| value)
-        .map_err(|error| Fault::Agent(format!("undecodable output: {error:?}")))
+        .map_err(|_| Fault::Agent("its output does not decode".into()))
 }
 
 #[cfg(test)]

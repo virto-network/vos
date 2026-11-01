@@ -137,13 +137,16 @@ pub(crate) fn random<const N: usize>() -> [u8; N] {
     bytes
 }
 
-/// What a caught panic said.
-pub(crate) fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+/// What a caught panic said, for a log or an answer: its message when it
+/// is a literal, and never a formatted one, as an assertion's values or an
+/// error's may be a run's. Neither names the place. Standard error is
+/// another carrier: outside a proof the default hook prints the place and
+/// the whole message there.
+pub(crate) fn panic_message(panic: &(dyn std::any::Any + Send)) -> &'static str {
     panic
-        .downcast_ref::<&str>()
-        .map(|message| (*message).to_string())
-        .or_else(|| panic.downcast_ref::<String>().cloned())
-        .unwrap_or_default()
+        .downcast_ref::<&'static str>()
+        .copied()
+        .unwrap_or("its message withheld")
 }
 
 /// Points where a test breaks the node as a crash or a bug would.
