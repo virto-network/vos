@@ -604,9 +604,9 @@ last for decades.**
   each format's reference shape [model], pinned by the format tests.
 - **The numbers:** 41 and 46 name the segment AIR, the chip set the node's
   segments and the device shape share (slice 7's 7.21); the default prover
-  produces 41. 24 to 27, 29, 31, 33 to 37, 43 and 45, which named its
+  produces 41. 24 to 27, 29, 31, 33 to 36, 43 and 45, which named its
   earlier forms or their parameters, are retired: refused, and never
-  registered again.
+  registered again (A.4 lists every retired number).
 - **The inner grind:** a segment's PoW 24 costs 0.43 s on average on 8
   threads (median 0.26 s, 95th percentile 1.44 s), against 0.028 s at 20
   [measured, 128 grinds each, SIMD]; interaction PoW 8 is negligible.
@@ -1390,7 +1390,8 @@ columns [measured, 7.16]. Over `C`, a kernel that hashes only through
   and `H_io` (a device kernel always returns its parts, however few). An
   auth guard's `device = "..."` must name one, else the macro refuses, and
   the derivation checks it again on the marks. The derivation admits
-  `0x402` only in a marked kernel and refuses `0x400` there, naming the
+  `0x402` in any kernel (only in a marked one before format 41) and
+  refuses `0x400` in a marked one, naming the
   chain of functions that reaches it; it refuses a mark its schema kind
   contradicts and a `Device` method of no entry, and names the device
   kernels (`Derived::devices`). A device kernel's record keeps the node's

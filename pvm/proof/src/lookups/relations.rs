@@ -243,7 +243,7 @@ const REL_MERKLE_NODE_LOOKUP_SIZE: usize = 1 + 1 + 32 + 32;
 stwo_constraint_framework::relation!(MerkleNodeLookupElements, REL_MERKLE_NODE_LOOKUP_SIZE);
 
 // (ts[8], in_ptr[4], out_ptr[4]) — one tuple per served Poseidon2 call
-// (`0x402`). The CPU of the shared chip set produces it from the call's row
+// (`0x402`). The CPU produces it from the call's row
 // (its timestamp, φ[7]'s and φ[8]'s low four bytes); Poseidon2Chip consumes
 // it at the call's row, which reads the 64 input bytes and writes the 32
 // output bytes at that timestamp.

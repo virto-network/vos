@@ -144,7 +144,7 @@ fn installs_keep_their_bytes() {
         &1u32.to_le_bytes(),
         &[15],
         &0x0809u16.to_le_bytes(),
-        &(0..25).collect::<Vec<u8>>(),
+        &(0..26).collect::<Vec<u8>>(),
     ]
     .concat();
     let empty = [

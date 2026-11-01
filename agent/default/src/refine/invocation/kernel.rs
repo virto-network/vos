@@ -45,8 +45,9 @@ pub(crate) struct KernelRun {
 /// out with no arguments, its registers the loader's for none, it reads them
 /// through its witness input from `input`; output by the halt convention, at
 /// most `output` bytes, and no host calls but the BLAKE2b and Poseidon2
-/// precompiles and the witness input, which the agent serves. An input past a work result's cap is
-/// refused. A failed run's error comes with the gas it used.
+/// precompiles and the witness input, which the agent serves. An input past
+/// a work result's cap is refused. A failed run's error comes with the gas
+/// it used.
 pub(crate) fn kernel(
     meter: &Meter,
     program: &ProgramHash,

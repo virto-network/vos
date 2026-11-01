@@ -10,8 +10,8 @@
 //!   and the fixed tables.
 //! - **A class** is a cut: at most 2^`log_steps` steps and `pages` pages a
 //!   segment ([`CLASSES`]; [`POSEIDON2_CLASSES`] for a kernel holding the
-//!   Poseidon2 chip, whose leaf would not fit the 24-page class). Each chip's log size is the class's capacity for it: the
-//!   fixed tables' sizes, the program's code and jump table's, and for the
+//!   Poseidon2 chip, whose leaf would not fit the 24-page class). Each
+//!   chip's log size is the class's capacity for it: the fixed tables' sizes, the program's code and jump table's, and for the
 //!   chips whose rows a run fills, a size the cut's budgets bound or
 //!   provision. A segment whose rows overflow a class proves at the next
 //!   that holds it; a prover cuts it again when none does.
@@ -144,8 +144,8 @@ fn capacity(index: usize, log_steps: u8, pages: u16, code: usize, jump_table: us
         chip::CPU => s,
         // 96 rows a compression.
         chip::BLAKE2B => s - 1,
-        // A row a permutation, its call's 96 bytes the memory ledger's: a
-        // call every eight steps, the ledger's eight bytes a step.
+        // A row a permutation, provisioned for a call every eight steps;
+        // a segment of denser calls overflows the class and is cut again.
         chip::POSEIDON2 => s - 3,
         // 96 rows a compression: a listed page's leaf before and after, 64,
         // and its share of the merges above, about 8 for clustered pages.

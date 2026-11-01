@@ -237,7 +237,9 @@ pub fn closing_ts_for(side_note: &SideNote) -> u64 {
     match side_note.steps.last() {
         Some(last) => last.timestamp + 1,
         None => {
-            let max_precompile_ts = side_note.blake2b_mem_ops.iter().map(|m| m.ts).max();
+            let max_precompile_ts = (side_note.blake2b_mem_ops.iter().map(|m| m.ts))
+                .chain(side_note.poseidon2_ops.iter().map(|op| op.ts))
+                .max();
             match max_precompile_ts {
                 Some(ts) => ts + 1,
                 None => 0,

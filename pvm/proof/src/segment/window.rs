@@ -117,8 +117,9 @@ fn build_segment_with_memory(full: &SideNote, a: usize, b: usize, mem: SegmentMe
 /// ENTERING step `t`); `None` applies all writes (the FINAL memory).
 ///
 /// Crucially this includes **precompile output writes** (blake2b's
-/// 64-byte hash at `h_ptr`, Poseidon2's 32 bytes at its output), which the per-step
-/// `mem_write` does NOT capture — they live in the `*_mem_ops` records.
+/// 64-byte hash at `h_ptr`, Poseidon2's 32 bytes at its output), which the
+/// per-step `mem_write` does NOT capture — they live in `blake2b_mem_ops`
+/// and `poseidon2_ops`.
 /// Used both for a segment's threaded initial memory (`segment_side_note`)
 /// and its final memory commitment (`prove`'s boundary state); the two
 /// MUST agree or `verify_chain`'s boundary-continuity check rejects.

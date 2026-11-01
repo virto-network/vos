@@ -25,18 +25,35 @@ use vos_wire::records::Kernel;
 /// The Poseidon2 calls the kernel chains.
 const CALLS: i32 = 1_500;
 
+/// The bytes of [`blob_reading`]'s second witness read: sixteen pages, so
+/// the segment holding it needs the chip's 17-page class.
+const ARGUMENT: i32 = 16 * 4096;
+
 /// The kernel: 64 witness bytes onto its stack, then [`CALLS`] Poseidon2
 /// calls, each over the 64 bytes and writing its 32 over their first half,
 /// then a BLAKE2b compression of the 64 bytes as its state and the next 128
 /// as its message, its io-hash φ9..12 set and its output empty.
 fn blob() -> Vec<u8> {
+    blob_reading(0)
+}
+
+/// [`blob`] reading `argument` more witness bytes after its first 64, onto
+/// its stack a page on.
+fn blob_reading(argument: i32) -> Vec<u8> {
     let mut asm = Assembler::new();
-    asm.set_heap_pages(1).set_stack_pages(1);
-    asm.add_imm_64(Reg::S0, Reg::SP, -512)
+    asm.set_heap_pages(1).set_stack_pages(24);
+    asm.add_imm_64(Reg::S0, Reg::SP, -0x1_7800)
         .move_reg(Reg::A0, Reg::S0)
         .load_imm(Reg::A1, 64)
-        .ecalli(ECALL_WITNESS_INPUT)
-        .load_imm(Reg::T2, 0);
+        .ecalli(ECALL_WITNESS_INPUT);
+    if argument > 0 {
+        asm.add_imm_64(Reg::A0, Reg::S0, 0x1000)
+            .load_imm(Reg::A1, argument)
+            .ecalli(ECALL_WITNESS_INPUT);
+    }
+    // A fallthrough ends the block, so the loop's first instruction starts
+    // one, as a branch's target must.
+    asm.load_imm(Reg::T2, 0).fallthrough();
     let start = asm.current_offset();
     asm.move_reg(Reg::A0, Reg::S0)
         .move_reg(Reg::A1, Reg::S0)
@@ -69,11 +86,16 @@ fn witness() -> Vec<u8> {
         .collect()
 }
 
-/// The kernel's run.
-fn run(blob: &[u8]) -> SideNote {
-    trace_kernel(blob, &witness(), 100_000_000)
+/// The kernel's run, its witness input `input`.
+fn run_on(blob: &[u8], input: &[u8]) -> SideNote {
+    trace_kernel(blob, input, 100_000_000)
         .expect("halts")
         .side_note
+}
+
+/// The kernel's run.
+fn run(blob: &[u8]) -> SideNote {
+    run_on(blob, &witness())
 }
 
 /// The kernel's install record, its shape the derivation's.
@@ -237,4 +259,50 @@ fn a_call_without_its_row_is_refused_on_a_node_segment() {
     let mut forged = short_run();
     forged.poseidon2_ops.clear();
     refused(forged, "a Poseidon2 call without its row");
+}
+
+/// A segment of the chip's 17-page class proves and verifies in its leaf:
+/// the kernel reading sixteen pages of argument in one witness call, a step
+/// whose pages' boundary no 8-page class holds.
+#[test]
+fn a_node_kernels_seventeen_page_class_proves_in_its_leaf() {
+    let blob = blob_reading(ARGUMENT);
+    let record = record(&blob);
+    let (program, entry) = vos_pvm_recair::leaf::kernel_program(
+        &blob,
+        &record,
+        vos_pvm_compiler::TRANSPILER_VERSION,
+        &SEGMENT,
+    )
+    .expect("the kernel's program");
+    let mut input = witness();
+    input.extend((0..ARGUMENT).map(|i| i as u8));
+    let full = run_on(&blob, &input);
+    let segments = prove_kernel(&full, &program.shape, 0, &SEGMENT).expect("proves");
+    let (position, segment) = segments
+        .iter()
+        .enumerate()
+        .find(|(_, segment)| segment.class == 2)
+        .expect("a segment of the 17-page class");
+    assert_eq!(
+        verify_kernel_segment(segment.proof.clone(), &program).unwrap(),
+        2
+    );
+    let fold_word = vos_pvm_proof::poseidon2::P2Hash(core::array::from_fn(|i| {
+        stwo::core::fields::m31::BaseField::from(9_100 + i as u32)
+    }));
+    let leaf = common::prove_leaf(
+        &program,
+        &entry,
+        2,
+        &segment.proof,
+        position as u32,
+        fold_word,
+    );
+    eprintln!(
+        "segment {position}: steps {:?}, class 2, leaf {:?} rows",
+        segment.steps, leaf.rows
+    );
+    let proofs: Vec<Proof> = segments.into_iter().map(|segment| segment.proof).collect();
+    verify_kernel_chain(proofs, &program, &entry).expect("the chain verifies");
 }

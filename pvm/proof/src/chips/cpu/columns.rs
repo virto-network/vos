@@ -156,7 +156,8 @@ pub enum Column {
     // ── Shift auxiliary ──
     #[size = 1]
     ShiftAmount,
-    /// 1 when is_shift AND shift_op ∈ {0,1} (left shift or logical right shift)
+    /// 1 on every shift and rotate row (`IsShift`, which a constraint
+    /// equates it with)
     #[size = 1]
     IsShiftConstrained,
     /// Raw u64 of `regs_before[reg_a_or_b]` whenever ValBIsReg=1.

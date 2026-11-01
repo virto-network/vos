@@ -25,8 +25,8 @@ fundamental columns.  Multiplicities should be **degree ≤ 1** too.  A tuple
 expression like `is_op_a * val_d[0]` is degree 2 and will blow the bound when
 paired.  If you need a derived value, materialise it as a column.
 
-**Subtlety: pair parity matters at the chip level.**  CpuChip's
-`add_constraints` must emit an EVEN number of `add_to_relation` calls.  The
+**Subtlety: pair parity matters at the chip level.**  CpuChip's emissions
+pair in emission order on both sides, an odd last one alone.  The
 prover-side `LogupTraceBuilder::add_to_relation_with` /
 `add_to_relation_computed` always pair adjacent emissions into shared
 interaction-trace columns; `finalize_logup_in_pairs` on the verifier side
@@ -35,9 +35,8 @@ matches that column structure 1:1.  Switching the verifier side to plain
 mismatch and stwo panics with `Option::unwrap() on a None value` in
 `pcs/utils.rs`.
 
-So if you add a single new emission, you **must** add a partner alongside —
-or defer until another commit adds its own and ship them together.  Two
-common patterns:
+So a single emission added in the middle shifts every later pair (§2);
+at the end it closes alone.  Two common patterns for even blocks:
 
 - **Pair within a feature.**  The SignExtend block emits 4 lookups in a
   trailing block; pair count even, no parity flip elsewhere.
@@ -59,8 +58,11 @@ that was within the degree bound may exceed it — even though every
 emission individually is degree-bounded.
 
 **Rule.** Add new emissions at the **end** of `add_constraints` (and
-`generate_interaction_trace`), in **even-count blocks**, so they pair within
-themselves and never reshuffle pre-existing pair shapes.
+`generate_interaction_trace`), so they never reshuffle pre-existing pair
+shapes. An odd tail closes in a column of its own on both sides (the
+Poseidon2 call's three fractions end the CPU's): every pair, the tail's
+included, must stay at degree ≤ 3, which the masked degree audits
+(`vos-pvm-recair`'s `circuit` tests) check on the built chip.
 
 This is what the SignExtend constraints require: the 4 nibble-AND lookups
 sit in a final block right before `finalize_logup_in_pairs` rather than

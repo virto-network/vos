@@ -246,9 +246,7 @@ pub(super) fn poseidon2_call(
     row: &RowTrace<'_>,
     lookup_elements: &AllLookupElements,
 ) {
-    use crate::lookups::Poseidon2CallLookupElements;
     use crate::trace::component::FinalizedColumn;
-
     let is_p2 = &row.is_p2_ecall[0];
     let reg_lookup: &RegisterMemoryLookupElements = lookup_elements.as_ref();
     for (reg_idx, value) in [(7u32, &row.h_ptr), (8u32, &row.m_ptr)] {

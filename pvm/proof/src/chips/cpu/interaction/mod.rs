@@ -27,9 +27,9 @@ use crate::lookups::{
     AllLookupElements, BitcountLookupElements, BitwiseAndLookupElements, BitwiseLookupElements,
     Blake2bCallLookupElements, ByteToBitsLookupElements, CompareLookupElements,
     DivRemLookupElements, JumpTableLookupElements, LogupTraceBuilder, MemoryAccessLookupElements,
-    MultiplicationLookupElements, PopcountLookupElements, PowerOfTwoLookupElements,
-    ProgramExecutionLookupElements, ProgramMemoryLookupElements, Range256LookupElements,
-    RegisterMemoryLookupElements, WitnessCallLookupElements,
+    MultiplicationLookupElements, PopcountLookupElements, Poseidon2CallLookupElements,
+    PowerOfTwoLookupElements, ProgramExecutionLookupElements, ProgramMemoryLookupElements,
+    Range256LookupElements, RegisterMemoryLookupElements, WitnessCallLookupElements,
 };
 use crate::trace::component::ComponentTrace;
 
@@ -52,30 +52,23 @@ pub(super) fn generate_interaction_trace(
     SecureField,
 ) {
     let mut logup = LogupTraceBuilder::new(component_trace.log_size());
-    fractions(&mut logup, &RowTrace::new(component_trace), lookup_elements);
+    let row = &RowTrace::new(component_trace);
+    // The fractions in the AIR's order.
+    result_bytes(&mut logup, row, lookup_elements);
+    memory::memory_access(&mut logup, row, lookup_elements);
+    control::program_execution(&mut logup, row, lookup_elements);
+    lookups::table_lookups(&mut logup, row, lookup_elements);
+    registers::registers(&mut logup, row, lookup_elements);
+    signs::sign_extension(&mut logup, row, lookup_elements);
+    program::program_memory(&mut logup, row, lookup_elements);
+    program::flag_bits(&mut logup, row, lookup_elements);
+    control::jump_table(&mut logup, row, lookup_elements);
+    signs::sign_nibbles(&mut logup, row, lookup_elements);
+    lookups::arithmetic(&mut logup, row, lookup_elements);
+    registers::witness_input(&mut logup, row, lookup_elements);
+    next_timestamp(&mut logup, row, lookup_elements);
+    registers::poseidon2_call(&mut logup, row, lookup_elements);
     logup.finalize()
-}
-
-/// The CPU's fractions, in the AIR's order.
-fn fractions(
-    logup: &mut LogupTraceBuilder,
-    row: &RowTrace<'_>,
-    lookup_elements: &AllLookupElements,
-) {
-    result_bytes(logup, row, lookup_elements);
-    memory::memory_access(logup, row, lookup_elements);
-    control::program_execution(logup, row, lookup_elements);
-    lookups::table_lookups(logup, row, lookup_elements);
-    registers::registers(logup, row, lookup_elements);
-    signs::sign_extension(logup, row, lookup_elements);
-    program::program_memory(logup, row, lookup_elements);
-    program::flag_bits(logup, row, lookup_elements);
-    control::jump_table(logup, row, lookup_elements);
-    signs::sign_nibbles(logup, row, lookup_elements);
-    lookups::arithmetic(logup, row, lookup_elements);
-    registers::witness_input(logup, row, lookup_elements);
-    next_timestamp(logup, row, lookup_elements);
-    registers::poseidon2_call(logup, row, lookup_elements);
 }
 
 /// The result's bytes, range-checked on every real row.

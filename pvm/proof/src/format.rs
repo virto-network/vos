@@ -54,8 +54,9 @@
 //!   reference (every chip, the Poseidon2 chip among them, at 2^20 rows),
 //!   the query term binding, and 104 conjectured. A kernel leaf's rows grow
 //!   with the segment's width times its queries, and 4 fewer queries keep
-//!   the leaf's `p2` under 2^16 with room. Leaves and folds (32) take 44 queries and 20
-//!   bits: a fold verifies under half the recursion AIR's shape.
+//!   the leaf's `p2` under 2^16 with room. Leaves and folds (32) take 44
+//!   queries and 20 bits: a fold verifies under half the recursion AIR's
+//!   shape.
 //! - **The device format** (46) is counted on the device shape's masked
 //!   reference ([`DEVICE_REFERENCE`]: every chip a device program may hold
 //!   at `2^17` rows, the most install, the prover and the verifier admit).
@@ -404,8 +405,7 @@ pub const CREDENTIAL_REFERENCE: SecurityShape = SecurityShape {
 
 /// Segments': fewer queries and more PoW than [`LEAF_FOLD_PARAMS`], for the
 /// kernel leaf's rows, which grow with the queries times the segment's width.
-/// Counted again on format 41's own reference: 62.81 proven bits, so 40
-/// queries and PoW 24 stand.
+/// Counted on format 41's reference: 62.81 proven bits.
 const SEGMENT_PARAMS: FormatParams = FormatParams {
     log_blowup: 2,
     n_queries: 40,
@@ -881,9 +881,10 @@ mod tests {
         }
     }
 
-    /// Every number names one entry; only 28, 39, 41, 44 and 46 are admitted, and a
-    /// segment verifier takes 41 alone; the retired numbers are
-    /// refused as retired and name no entry; every other number is refused.
+    /// Every number names one entry; only 28, 39, 41, 44 and 46 are
+    /// admitted, and a segment verifier takes 41 alone; the retired numbers
+    /// are refused as retired and name no entry; every other number is
+    /// refused.
     #[test]
     fn the_registry_numbers_round_trip() {
         for format in REGISTRY {
