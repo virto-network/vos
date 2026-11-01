@@ -484,3 +484,21 @@ fn every_masked_value_is_fresh_and_the_seam_reproduces_bytes() {
     assert_eq!(seeded, bytes(MaskRng::Seeded(7)));
     assert_ne!(seeded, bytes(MaskRng::Seeded(8)));
 }
+
+/// The seeded seam's proof of a small circuit, pinned by its hash: a cheap
+/// echo, in `check`, of the masked prover's byte-for-byte guard over the
+/// golden fixtures (`just test-proof`). A change of the masked prover's
+/// draws, transcript or layout moves it.
+#[test]
+fn the_seeded_proof_of_a_small_circuit_is_pinned() {
+    use blake2::Digest;
+    const PINNED: &str = "a9a343f12d1be5c67d36798875012a0c1fadfc2d4e253dbcbcb0542e8ae844e9";
+    let proof = prove::<Blake2bMerkleChannel>(&format(), &circuit(5), MaskRng::Seeded(7))
+        .unwrap()
+        .0;
+    let digest = blake2::Blake2b::<blake2::digest::consts::U32>::digest(
+        postcard::to_allocvec(&proof).unwrap(),
+    );
+    let hash: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(hash, PINNED);
+}
