@@ -224,6 +224,29 @@ fn more_groups_than_streams_elect_after_every_node_restarts() {
     assert!(took < Duration::from_secs(15), "{took:?}");
 }
 
+/// A node whose `peer_lanes` differ from its peers' is refused whole by
+/// each of them, and refuses them, each counting it: it would refuse the
+/// frames of the groups whose lanes differ, a partition no log names.
+#[test]
+fn a_peer_on_other_lanes_is_refused_whole() {
+    let cluster = Cluster::over_quic_tuned(3, |number, config| {
+        if number == 3 {
+            config.peer_lanes = 2;
+        }
+    });
+    let refused = |at: NodeNumber| {
+        cluster
+            .node(at)
+            .dropped(vos_node::peer::Refusal::OtherLanes)
+    };
+    wait_until("each side refuses the other", || {
+        refused(1) > 0 && refused(2) > 0 && refused(3) > 0
+    });
+    // Nodes 1 and 2 agree: a group of theirs elects.
+    let agent = cluster.node(1).create_replicated(vec![1, 2]).unwrap();
+    cluster.leader(agent);
+}
+
 /// A store whose every write is slow, as a disk all a host's nodes share
 /// is under load.
 #[derive(Default)]

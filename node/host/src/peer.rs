@@ -270,10 +270,14 @@ pub enum Refusal {
     /// An agent's creation record naming another space than the node's:
     /// an agent belongs to one space, and its replicas to it.
     OtherSpace = 14,
+    /// A frame from a peer whose pair heartbeat names other lanes than
+    /// this node's: its groups' frames would go on streams this node
+    /// refuses, so the peer is refused whole until it names this node's.
+    OtherLanes = 15,
 }
 
 impl Refusal {
-    pub const ALL: [Refusal; 15] = [
+    pub const ALL: [Refusal; 16] = [
         Refusal::Undecodable,
         Refusal::Stranger,
         Refusal::NotTheLeaderNamed,
@@ -289,6 +293,7 @@ impl Refusal {
         Refusal::Unplaced,
         Refusal::Full,
         Refusal::OtherSpace,
+        Refusal::OtherLanes,
     ];
 }
 

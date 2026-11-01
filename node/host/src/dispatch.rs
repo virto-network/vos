@@ -105,6 +105,12 @@ impl Inner {
             stream,
             frame,
         } = incoming;
+        // A peer on other lanes is refused whole, its warning logged once
+        // by the pair heartbeat, which keeps hearing it.
+        if self.liveness.refuses(from) {
+            self.drops.count(peer::Refusal::OtherLanes);
+            return;
+        }
         let message = match peer::decode(&frame) {
             Ok(message) => message,
             Err(refusal) => {

@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -67,6 +67,12 @@ pub(crate) struct Liveness {
     /// When the heartbeat last went round, in milliseconds since the node
     /// started: a group goes quiet only while it goes round on time.
     beaten: AtomicU64,
+    /// The peers whose last heartbeat named other lanes than this node's,
+    /// with the lanes it named: each is refused whole until it names this
+    /// node's.
+    other_lanes: Mutex<HashMap<NodeNumber, u32>>,
+    /// Whether `other_lanes` holds any: every frame from a peer asks.
+    refusing: AtomicBool,
 }
 
 impl Liveness {
@@ -78,7 +84,40 @@ impl Liveness {
             started: Instant::now(),
             round: AtomicU64::new(0),
             beaten: AtomicU64::new(0),
+            other_lanes: Mutex::new(HashMap::new()),
+            refusing: AtomicBool::new(false),
         }
+    }
+
+    /// Whether `from`, its heartbeat naming `theirs` lanes, agrees with
+    /// this node's `ours`. A peer that does not is refused whole, and
+    /// logged as a warning when it first names those lanes; one that
+    /// agrees again is taken again.
+    pub(crate) fn lanes_agree(&self, from: NodeNumber, theirs: u32, ours: u32) -> bool {
+        let mut other = lock(&self.other_lanes);
+        if theirs == ours {
+            if other.remove(&from).is_some() {
+                tracing::info!(peer = from, lanes = ours, "a peer's lanes agree again");
+            }
+            self.refusing.store(!other.is_empty(), Ordering::Relaxed);
+            return true;
+        }
+        if other.insert(from, theirs) != Some(theirs) {
+            tracing::warn!(
+                peer = from,
+                theirs,
+                ours,
+                "a peer's peer_lanes differ from this node's: it is refused until they agree, \
+                 as each would refuse the other's groups' frames"
+            );
+        }
+        self.refusing.store(true, Ordering::Relaxed);
+        false
+    }
+
+    /// Whether `from`'s last heartbeat named other lanes than this node's.
+    pub(crate) fn refuses(&self, from: NodeNumber) -> bool {
+        self.refusing.load(Ordering::Relaxed) && lock(&self.other_lanes).contains_key(&from)
     }
 
     /// The next round to send.
@@ -235,7 +274,13 @@ async fn beat(inner: Arc<Inner>) -> Ended {
                 .or_default()
                 .round(round, listed);
             let took = inner.liveness.table().taken(peer).unwrap_or((0, 0));
-            let frames = frames(inner.liveness.incarnation, round, told, took, size);
+            let frames = frames(
+                (inner.liveness.incarnation, inner.settings.lanes),
+                round,
+                told,
+                took,
+                size,
+            );
             // A frame the peer's queue has no room for ends the round
             // there: the next names its changes again.
             for frame in frames {
@@ -247,10 +292,11 @@ async fn beat(inner: Arc<Inner>) -> Ended {
     }
 }
 
-/// One round's heartbeat to one peer: `told` in frames of at most `size`
-/// groups, and one frame when it names none.
+/// One round's heartbeat to one peer, from this node's run `incarnation`
+/// on its `lanes`: `told` in frames of at most `size` groups, and one
+/// frame when it names none.
 fn frames(
-    incarnation: u64,
+    (incarnation, lanes): (u64, u32),
     round: u64,
     told: Round<AgentId>,
     took: (u64, u64),
@@ -287,6 +333,7 @@ fn frames(
             leading,
             unlisted,
             took,
+            lanes,
         })
         .collect()
 }
@@ -504,10 +551,15 @@ impl Inner {
             leading,
             unlisted,
             took,
+            lanes,
         } = message
         else {
             return;
         };
+        if !self.liveness.lanes_agree(from, lanes, self.settings.lanes) {
+            self.drops.count(peer::Refusal::OtherLanes);
+            return;
+        }
         let frame = Frame {
             incarnation,
             round,
@@ -566,6 +618,19 @@ mod tests {
     }
 
     #[test]
+    fn a_peer_on_other_lanes_is_refused_until_it_agrees() {
+        let liveness = Liveness::new(1);
+        assert!(!liveness.refuses(2));
+        assert!(liveness.lanes_agree(2, 8, 8));
+        assert!(!liveness.lanes_agree(2, 4, 8));
+        assert!(liveness.refuses(2));
+        assert!(!liveness.refuses(3));
+        assert!(!liveness.lanes_agree(2, 4, 8), "still refused");
+        assert!(liveness.lanes_agree(2, 8, 8));
+        assert!(!liveness.refuses(2));
+    }
+
+    #[test]
     fn rounds_go_on_across_the_heartbeats_restarts() {
         let liveness = Liveness::new(1);
         assert_eq!(liveness.next_round(), 1);
@@ -586,7 +651,13 @@ mod tests {
                 leading,
                 unlisted: Vec::new(),
             };
-            let frames = frames(u64::MAX, u64::MAX, told, (u64::MAX, u64::MAX), size);
+            let frames = frames(
+                (u64::MAX, u32::MAX),
+                u64::MAX,
+                told,
+                (u64::MAX, u64::MAX),
+                size,
+            );
             assert_eq!(frames.len(), 1);
             assert!(frames[0].encode().len() <= limit, "{limit}");
         }
@@ -601,7 +672,7 @@ mod tests {
             leading: leading.clone(),
             unlisted: vec![AgentId(9)],
         };
-        let frames = frames(7, 3, told, (8, 6), 2);
+        let frames = frames((7, 5), 3, told, (8, 6), 2);
         assert_eq!(frames.len(), 3);
         let (mut listed, mut gone) = (Vec::new(), Vec::new());
         for (frame, at) in frames.into_iter().zip(0..) {
@@ -614,13 +685,14 @@ mod tests {
                 leading,
                 unlisted,
                 took,
+                lanes,
             } = frame
             else {
                 panic!("a liveness frame");
             };
             assert_eq!(
-                (incarnation, round, since, part, parts, took),
-                (7, 3, 4, at, 3, (8, 6))
+                (incarnation, round, since, part, parts, took, lanes),
+                (7, 3, 4, at, 3, (8, 6), 5)
             );
             assert!(leading.len() + unlisted.len() <= 2);
             listed.extend(leading.into_iter().map(|led| (led.agent, led.term)));
@@ -633,7 +705,7 @@ mod tests {
             leading: Vec::new(),
             unlisted: Vec::new(),
         };
-        let one = super::frames(7, 4, empty, (0, 0), 2);
+        let one = super::frames((7, 5), 4, empty, (0, 0), 2);
         assert_eq!(one.len(), 1, "one frame for none");
     }
 }

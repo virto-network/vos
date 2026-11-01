@@ -1022,8 +1022,11 @@ outbox sequence numbers, which receivers deduplicate.
     unlisted [measured].
   - **Lanes:** an agent's consensus frames, and its requests, go on one
     of `peer_lanes` streams a peer by the agent's id, so no group waits for
-    a stream however many talk at once. `peer_lanes` is the same on every
-    node of a space.
+    a stream however many talk at once. `peer_lanes` must be the same on
+    every node of a space, or each refuses the other's groups' frames:
+    the pair heartbeat names the sender's, and a node refuses a peer that
+    names others whole, with a warning naming both values, until it
+    names the same.
   - **A bound on campaigns at once** (`campaigns`, 4,096): past it a group
     whose election is due puts it off and is woken, in turn, as a campaign
     is given back, so a node that wakes many leaderless groups (its start,

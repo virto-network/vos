@@ -737,6 +737,7 @@ fn peer_messages_keep_their_bytes() {
             leading: vec![],
             unlisted: vec![],
             took: (0, 0),
+            lanes: 0,
         },
         PeerMessage::Directory {
             placement: Placement::created(&record),
@@ -824,10 +825,11 @@ fn peer_messages_keep_their_bytes() {
         [&[15][..], &agent_bytes, &4u32.to_le_bytes(), &[1]].concat()
     );
     // A pair heartbeat's frame: its run, round, the round its changes run
-    // from, its part of how many, its two lists' lengths and what it took.
+    // from, its part of how many, its two lists' lengths, what it took and
+    // its lanes.
     assert_eq!(
         frames[5].encode(),
-        [&[5][..], &[0; 24], &[0; 8], &[0; 8], &[0; 16]].concat()
+        [&[5][..], &[0; 24], &[0; 8], &[0; 8], &[0; 16], &[0; 4]].concat()
     );
 }
 
