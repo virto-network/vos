@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use vos_checker::stays;
 use vos_node::{Config, Node};
 use vos_node_prover::{FORMAT, Job, Options, ProveError, Prover, State};
 use vos_venue::VenueClient;
@@ -305,7 +306,11 @@ fn a_leader_change_submits_a_recorded_statement_once() {
                 .is_none_or(|backlog| backlog.proving == 0 && backlog.queued == 0)
         })
     });
-    std::thread::sleep(Duration::from_secs(2));
+    stays(
+        "accepted once, proved twice",
+        Duration::from_secs(2),
+        || judging.accepted.lock().unwrap().len() == 1 && proofs.made.load(Ordering::SeqCst) == 2,
+    );
     assert_eq!(judging.accepted.lock().unwrap().len(), 1, "accepted once");
     assert_eq!(proofs.made.load(Ordering::SeqCst), 2);
     for (_, node) in cluster.running() {

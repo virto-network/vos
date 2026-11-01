@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use parity_scale_codec::Decode;
+use vos_checker::stays;
 use vos_node::Config;
 use vos_venue::kreivo::calls::{Call, RuntimeCall};
 use vos_venue::kreivo::mock::transport::MockChain;
@@ -309,7 +310,11 @@ fn a_blocked_space_is_sent_no_anchor() {
     let calls = kreivo.anchor_calls();
     close(&kreivo, &cluster, &clock, 1);
     closed(&cluster, representative, 1);
-    std::thread::sleep(Duration::from_secs(5));
+    stays(
+        "nothing sent or handed over while blocked",
+        Duration::from_secs(5),
+        || kreivo.sent() == [0] && kreivo.anchor_calls() == calls,
+    );
     assert_eq!(kreivo.sent(), [0], "nothing sent while blocked");
     assert_eq!(kreivo.anchor_calls(), calls, "nothing handed over");
     kreivo.set_status(&cluster, SpaceStatus::Active);

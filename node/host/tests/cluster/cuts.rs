@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use vos_checker::stays;
 use vos_node::roots::{self, CutProof, ReadRow};
 use vos_tree::{Blake2b, Hash};
 use vos_venue::VenueClient;
@@ -55,7 +56,11 @@ fn an_idle_agents_leader_appends_one_marker_at_its_own_clock() {
     for number in (1..=3).filter(|number| *number != leader) {
         cluster.set_clock(number, b0 + 2_000);
     }
-    std::thread::sleep(Duration::from_secs(1));
+    stays(
+        "a trailing leader cuts nothing",
+        Duration::from_secs(1),
+        || cuts(node, agent).is_empty() && results(node, agent, applied).is_empty(),
+    );
     assert_eq!(cluster.leader(agent), leader, "the leader stayed");
     assert!(
         cuts(node, agent).is_empty(),
@@ -100,7 +105,9 @@ fn an_idle_agents_leader_appends_one_marker_at_its_own_clock() {
         });
     }
     let marked = stored_applied(node, agent);
-    std::thread::sleep(Duration::from_secs(1));
+    stays("one marker a window", Duration::from_secs(1), || {
+        results(node, agent, marked).is_empty()
+    });
     assert!(
         results(node, agent, marked).is_empty(),
         "one marker a window"
@@ -122,7 +129,9 @@ fn an_idle_agent_appends_no_marker() {
     let applied = stored_applied(node, agent);
     for window in 0..2 {
         cluster.set_clocks(clock.boundary(window).unwrap() + 1_000);
-        std::thread::sleep(Duration::from_secs(2));
+        stays("no marker", Duration::from_secs(2), || {
+            results(node, agent, applied).is_empty()
+        });
     }
     assert!(results(node, agent, applied).is_empty(), "no marker");
     for number in 1..=3 {
@@ -153,7 +162,11 @@ fn an_agent_of_no_space_gets_no_marker() {
     for number in 1..=3 {
         cluster.set_clock(number, boundary + 1_000);
     }
-    std::thread::sleep(Duration::from_secs(2));
+    stays("no marker", Duration::from_secs(2), || {
+        results(node, agent, applied)
+            .iter()
+            .all(|(_, result)| !result.steps.is_empty())
+    });
     // A marker is an empty result; the install's, should a loaded host
     // apply it only now, is not.
     let appended = results(node, agent, applied);
@@ -193,7 +206,9 @@ fn a_leaders_clock_jumping_ahead_cuts_every_window_it_passes_at_one_version() {
     let mark: u64 = vos_checker::applied(node.store(), agent, &keys::batch_time()).unwrap();
     assert!(mark >= ahead, "the mark at the leader's clock");
     cluster.offsets[usize::from(leader) - 1].store(0, Ordering::SeqCst);
-    std::thread::sleep(Duration::from_secs(1));
+    stays("nothing more", Duration::from_secs(1), || {
+        (1..=3).all(|number| cuts(cluster.node(number), agent) == jumped)
+    });
     for number in 1..=3 {
         assert_eq!(cuts(cluster.node(number), agent), jumped, "nothing more");
         let held: u64 =

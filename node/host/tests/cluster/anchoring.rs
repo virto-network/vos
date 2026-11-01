@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::{Signer, SigningKey};
+use vos_checker::stays;
 use vos_node::store::PersistMode;
 use vos_node::{AnchorAlert, Config, Hooks, ReplaceError, roots};
 use vos_venue::{AnchorOutcome, Held, ModelVenue, Status, VenueClient};
@@ -399,7 +400,9 @@ fn without_a_quorum_the_guard_waits() {
             })
         })
     });
-    std::thread::sleep(Duration::from_secs(3));
+    stays("nothing sent", Duration::from_secs(3), || {
+        offers.of(0).is_empty() && anchoring.venue.evidence().is_empty()
+    });
     assert!(offers.of(0).is_empty(), "nothing sent");
     assert!(anchoring.venue.evidence().is_empty());
     assert_eq!(anchoring.venue.status(&cluster.space.id()), Status::Active);
@@ -509,7 +512,9 @@ fn one_handoff_a_window() {
             to: None,
         })
     });
-    std::thread::sleep(Duration::from_secs(5));
+    stays("once a window", Duration::from_secs(5), || {
+        handed(&cluster) == 1
+    });
     assert_eq!(handed(&cluster), 1, "once a window");
     assert_eq!(cluster.leader(representative), leader);
     assert!(windows(&anchoring, &cluster).is_empty());

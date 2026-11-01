@@ -105,6 +105,22 @@ pub fn wait_until(what: &str, within: Duration, done: impl FnMut() -> bool) {
     );
 }
 
+/// `holds` throughout `during`, checked every 50 ms from the start: a wait
+/// in which nothing may happen, its invariant checked all along rather than
+/// only at its end.
+#[track_caller]
+pub fn stays(what: &str, during: Duration, mut holds: impl FnMut() -> bool) {
+    let at = std::panic::Location::caller();
+    let until = Instant::now() + during;
+    loop {
+        assert!(holds(), "{what} at {at}: no longer holds");
+        if Instant::now() >= until {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// A value of `agent`'s applied state in `store`, decoded: `None` while
 /// it holds none.
 pub fn applied<T: Decode>(store: &Fjall, agent: AgentId, key: &[u8]) -> Option<T> {
