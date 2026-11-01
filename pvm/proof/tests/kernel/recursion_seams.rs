@@ -42,7 +42,7 @@ fn side_note() -> SideNote {
 }
 
 #[test]
-fn the_seams_replay_one_transcript_on_a_format_35_proof() {
+fn the_seams_replay_one_transcript_on_a_format_41_proof() {
     let mut side_note = side_note();
     let proof = prove_format(&mut side_note, &SEGMENT).expect("proves");
     let stark = proof.stark_proof.clone();

@@ -329,7 +329,7 @@ pub fn segment_fixture() -> vos_pvm_proof::Proof {
         env!("CARGO_MANIFEST_DIR"),
         "/../fixtures/segment-41.proof"
     ))
-    .expect("the format-35 fixture");
+    .expect("the format-41 fixture");
     postcard::from_bytes(&bytes).expect("a proof")
 }
 
