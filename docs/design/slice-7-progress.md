@@ -6164,3 +6164,138 @@ with their group (`load_sign` consumed by every load); L2, the mask from
 the whole program-memory table; L3, the right shift's MUL growth and
 arithmetic shifts; L4, word memory's width light; L5, the crossover's
 host calls per kernel.
+
+## Step 7.21: the second re-pin, the node's segment format 41
+
+Branch `s7/7.21`, from vos-core `011ec39c1`. The plan's §7.21 under S23,
+S32 and S63 (2026-10-31: per-program CPU and word-level memory go to the
+next slice, the 4-way split is not built, and 7.18x's two cuts join this
+re-pin).
+
+**Built** (the AIR and format change is `99d6adcec`):
+- **One CPU:** the segment AIR's CPU is the shared chip set's, `IsP2Ecall`
+  a column of its own (dispatch 102); `CpuP2Chip` and format 35's CPU are
+  gone. **The Poseidon2 chip joins the segment AIR** at index 2, optional
+  (`SEGMENT_CHIPS` 25 → 26, the install record's `Shape` re-encoded; the
+  device's own chips continue `chip_idx::COUNT`). The tracer always serves
+  `0x402`; `is_kernel_call`, the surface table, the agent's kernel runs
+  and `derive` admit it in node kernels; a node segment cuts (`bounds`),
+  replays (`cursor`, `window`) and pages its calls.
+- **The chip's classes** (shape policy 2): a kernel holding the chip takes
+  `POSEIDON2_CLASSES`, `(12, 8)`, `(15, 8)` and `(12, 17)`. Found counting
+  the leaves: with BLAKE2b's chips and the chip's 1,059 columns, the
+  24-page class's leaf passes 2^17 `qm31` rows (134–136k for every test
+  actor's kernel, the chip added), its page boundary at 2^18 rows; at 17
+  pages it is at 2^17 and the leaf fits. A segment of more pages is cut
+  again; a 64 KiB argument written in one step fits 17. A policy choice
+  for the owner: under the old classes `derive` would refuse every node
+  kernel making the call beside its BLAKE2b io-hash.
+- **Cut 1:** the seven `MemByteActiveMonoH` columns gone, monotonicity
+  `active[i+1]·(1 − active[i]) = 0` directly (degree 2, the same
+  constraint).
+- **Cut 2:** logical right shifts multiply by `2^((width − n) mod width)`
+  (`ShiftAmountCompl`, as a rotate right) and take the product's high
+  word, its low word when the amount is 0 (`ShiftZero = 1 −
+  compl·ShiftComplInv`, `ShiftZero·compl = 0`, on every row); MulChip
+  binds the result (bytes 0..4 gated by `IsShloR`, 4..8 by
+  `ShloR64Active`), the MUL tuple 35 → 37 limbs. Flag byte 0's bit 3, once
+  `IsSharR`, commits a right shift, `IsSharR + IsShloR`, told apart by
+  `IsShloR·(1 − IsMul) = 0` and `IsSharR·IsMul = 0`: no new flag byte.
+  DIVREM keeps division and the arithmetic shifts.
+- **Formats:** 41 admitted for segments, 35 retired; **46** admitted for
+  device proofs, 45 retired. The device number: 45's AIR identity is not
+  its program ids alone (a number names one AIR and one set of
+  parameters, the registry's rule since 33/34 → 35 dropped unread
+  columns), and both cuts change the device AIR, so a new number; 46 is
+  45's parameters and masking. Nothing pins 45 outside the registry:
+  `vos_device::DEVICE_FORMAT`, ingress and the phone take `FORMAT.number`,
+  and S61's reference run computes the program at install; the s4 side
+  needs no change (it reads `DEVICE_FORMAT`; its comments still say 43).
+
+**Recounted** (M9):
+- **41's parameters on its own reference** (every chip at 2^20, the
+  Poseidon2 chip among them: 11,091 sampled values, 5,750 constraints):
+  40 queries and PoW 24 count **62.81 proven, 104 conjectured**: they
+  stand. 46 on the device reference (7,403 values, 4,262 constraints):
+  62.82 / 110 (62.01 by powers), as 45. The end-to-end bound is 62.81.
+- **The kernel leaves as built:** the window kernel's class 1 (its shifts
+  multiply, so no DIVREM: mask `0x02f3fffb`) **55,451 / 99,414 / 43,960**
+  rows (was 57,655 / 101,638 / 46,000); a node kernel making the call
+  beside BLAKE2b's, built: class (15, 8) 59,105 / 99,904 / 47,920 and
+  class (12, 17) 59,145 / 105,859 / 47,240. The derivation's bound over
+  every test actor's kernel and class: at most 57,825 / 129,629 / 46,040
+  (balance's class 2); with the chip added to each, at the chip's classes,
+  at most 63,637 / 111,167 / 51,520. All within 2^16 / 2^17 / 2^16.
+- **`H_FOLD`, `WRAP_ROOT_28` and `WRAP_ROOT_39` byte for byte:** the fold
+  and wrap circuits verify the recursion AIR, which did not move. Moved:
+  `WINDOW_PROGRAM`, `BALANCE_PROGRAM`, `PREDICATE_PROGRAM` (the segment
+  format, chip mask and leaf circuits in the preimage).
+
+**What moved** (`7d80b4874`): the fixtures (`segment-41.*` for
+`segment-35.*`, 937,165 → 928,532 bytes; `wrap.proof` 148,612 → 144,260;
+`wrap-midway` 146,308; `wrap-prefix` 145,284; `wrap-28` 123,797 → 125,443;
+`statements.cases`), regenerated through the seeded seam; the conformance
+vectors (program-id keys, the wraps' hashes and lengths); the default
+agent's ELF (its kernel runs serve `0x402`). **`blobs.lock` did not move**
+(31 blobs, rebuilt from clean): `final-verify.elf`,
+`final-verify-test.elf`, the statement service's blob and the Wasm blobs
+link no segment format. The teammate's fourth drop is fixtures, vectors
+and pinned ids, no vendored source (`teammate-note.md`).
+
+**The cuts measured:**
+- **The auth device kernel** (1,722 steps; x86, `vos-phone device-cell`
+  at `p2/2:47:16:8`, seeded builds of `011ec39c1` and this branch,
+  interleaved, 3 rounds of 5 after a warm-up, 4 P-cores, load about 5):
+  19 → 18 chips (DIVREM out), 3,203 → 2,789 columns, **11.67M → 10.82M
+  cells (−7.3%)**, p50 215.9 / 214.8 / 217.4 → 209.1 / 206.3 / 206.9 ms
+  (**−3.9%**), peak 405–414 → 383–387 MiB, proof 977,084 → 874,180 bytes
+  (−10.5%).
+- **Node kernels** (cells at class 1's shape, from the AIR's own column
+  counts): the window kernel 8,001 → 7,600 columns, 228.3M → 215.2M
+  cells (**−5.75%**); balance, whose arithmetic shift keeps DIVREM, 8,001
+  → 8,009 columns (+0.11%: the call's selector and the shift's columns
+  over the seven cut).
+- **The throughput test** (load about 6): the window statement proved in
+  **33.3 s** (35.1 s whole; 3 segments 17.0 s, 3 leaves 5.7 s, 2 folds
+  3.5 s, the masked wrap 7.1 s) against slice 6's 46.5 s; the balance's
+  16.8 s. No regression.
+
+**Gates** [measured; 12 GiB scope, `nice -n 10`, 8 jobs, another agent's
+`ci-full` beside]:
+- `just check`: exit 0, 1,696 passed in 125 suites, 31 blobs
+  `blobs.lock`'s.
+- `just test-proof`: exit 0, 598 passed in 57 suites (segments, leaves,
+  folds, the masked wrap per statement; `fixtures::` and `constants::`;
+  the leakage gates at medium N; the carrier audit).
+- The forgery gates, node shapes: the Poseidon2 chip on a node segment
+  with the page boundary (an output not the permutation's, an input word
+  p and 2^31 + 5, a call without its row, the call's selector cleared or
+  swapped); the shift (a forged result at 3, at 0, as the rotation's sum,
+  32-bit; `ShiftZero` claimed with a non-zero complement; `IsSharR`'s bit
+  moved to `IsShloR`). Device shape: a logical right shift's forged
+  result at 3 and at 0 refused, its shape without DIVREM; 7.15's
+  Poseidon2 gates unchanged.
+- `just repro-aarch64`: the program ids and the circuits' constants on
+  aarch64 are the repository's.
+- `just e2e-chain`: exit 0, 1,056 s: seven statements accepted, the JAM
+  space's at Kreivo and JAM `b` `Retry(5)`, the rootless one 4, the
+  replay past `MaxRootAge` 5; latency 67.8 s at Kreivo, 91.8–127.1 s at
+  JAM, each under its gate; refine 76.6–80.4 M gas; the audit clean.
+
+**Review (Opus):** no High; the shift's encoding, the flag slot, the
+monotonicity substitution and the chip on node segments checked against
+the code. Folded (`379f77daa`, `…`): a built leaf at the 17-page class
+(the test gap); DIVREM's and `CONSTRAINTS.md`'s stale notes (logical
+shifts, the even-block rule); the closing timestamp's Poseidon2 calls;
+the CPU's single-caller helpers inlined; stale comments and widths;
+`proving.md`'s derive and retired lists. A test `just check` caught: the
+device kernel runs alike on a node's runner now.
+
+**Left:**
+- The owner's call on `POSEIDON2_CLASSES` (above).
+- An install record stored before 7.21 decodes wrongly (26 log sizes a
+  class, the chips' bits moved): pre-production, no store is migrated;
+  `Shape::policy` is not read on load.
+- s4's comments naming 43; a phone session at 46 (P8's pass).
+- Node kernels' before/after x86 time on one machine (only the
+  throughput test against slice 6's 46.5 s here).
