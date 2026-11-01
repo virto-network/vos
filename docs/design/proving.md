@@ -1,14 +1,15 @@
 # Proving: layers, formats and verifiers
 
-Design, draft 6. It is the architecture behind slices 5, 6 and 7
-(`slice-5-proving.md`, `slice-6-on-chain.md`). The recursion AIR's own
-design is `recursion-air.md`.
-- **Status:** [decided] marks the owner's decisions; [proposed] marks
-  everything else, which is open to review.
-- **Evidence:** the research is in `research/slice-5/` and
-  `research/slice-6/`, the measurements in `slice-5-progress.md` and
-  `slice-6-progress.md`. Every number below carries its tag there:
-  [measured], [model] or [projected].
+Design, draft 7. It is the architecture behind slices 5, 6 and 7
+(`slice-5-proving.md`, `slice-6-on-chain.md`, `slice-7-mobile.md`). The
+recursion AIR's own design is `recursion-air.md`.
+- **Status:** [decided] marks the owner's decisions (slice 7's by their
+  S-numbers, `research/slice-7/owner-decisions.md`); [built] what the code
+  holds; [proposed] everything else, which is open to review.
+- **Evidence:** the research is in `research/slice-5/`, `research/slice-6/`
+  and `research/slice-7/`, the measurements in `slice-5-progress.md`,
+  `slice-6-progress.md` and `slice-7-progress.md`. Every number below
+  carries its tag there: [measured], [model], [est] or [projected].
 - **History:**
   - draft 2 folded in Fable's review (`research/slice-5/proving-review.md`,
     R1–R13);
@@ -22,7 +23,14 @@ design is `recursion-air.md`.
   - draft 6 folds slice 6's spikes (6a–6c), its design round on roots and
     anchors and Fable's review of it, the owner's decisions of 2026-10-19
     to 2026-10-23, and what slice 6 built: the masked wrap (format 39),
-    statements at anchored cuts, the venues and the carrier audit.
+    statements at anchored cuts, the venues and the carrier audit;
+  - draft 7 states what slice 7 built and its owner's decisions S1–S64:
+    the credential AIR (format 44) and its library; the segment chips
+    masked; the device profile (format 46) with its Poseidon2 io-hash,
+    its lean kernel, `h = 256` and its program computed at install; the
+    Poseidon2 call and chip in the node's segments (format 41) with two
+    AIR cuts; the fork's pin; the phone gates PG1–PG3 as measured; and the
+    levers the cell model leaves to the next slice.
 
 ## 1. What the owner requires [decided]
 
@@ -54,9 +62,11 @@ design is `recursion-air.md`.
 - **Verifying a raw segment on JAM is not viable.**
   - The base AIR was 13,037 columns: Ristretto 42% of them, BLAKE2b
     23% and the page-Merkle boundary 22%, the CPU 6%. The Ristretto
-    chips have since been removed (unsound; slice 7's generic bignum chip
-    replaces them), and the AIR audit's hardening widened what was left:
-    the full shape is now 25 chips and 8,039 columns [measured].
+    chips have since been removed (unsound; a generic bignum chip, M6,
+    replaces them after slice 7), and the AIR audit's hardening widened
+    what was left: the full shape became 25 chips and 8,039 columns
+    [measured]; format 41 adds the Poseidon2 chip, a 26th, and drops seven
+    columns a constraint pinned to zero (§3.2).
   - Verify gas is linear in columns. The best measured segment verify
     is 1.17B gas, and every projected lever stacked still leaves
     0.45–0.7B.
@@ -89,7 +99,11 @@ design is `recursion-air.md`.
     tens of milliseconds [model];
   - signatures in software take minutes. With chips they are about
     8–10M cells.
-  - An ARM build proves byte-identically to x86. No phone has run it yet.
+  - An ARM build proves byte-identically to x86.
+  - **Since measured on a phone** (§8): the Fairphone 6 proves
+    byte-identically to x86; the credential AIR's auth in about 166 ms,
+    and the general zkVM's auth statement under the device profile in
+    about 0.58 s, both masked [measured].
 - **The critique** (Fable):
   - Stwo is the right base;
   - our 96 bits are conjectured, and the proven figure is 58;
@@ -221,6 +235,36 @@ attribution). Its full design is `recursion-air.md`.
   dropped rather than constrained, with the other columns and next-row
   masks no constraint reads (formats 35 to 37): each cost every leaf its
   samples.
+- **One chip set, two shapes** [decided, S23, S32]: the node's segments
+  (format 41) and the device profile (format 46, §8) share one chip set
+  and one CPU; the node's shape keeps the page-Merkle boundary, the
+  device's replaces it (§8). What the set holds [built]:
+  - **the Poseidon2 call, `0x402`** (dispatch 102, §8's `C`): `IsP2Ecall`
+    a CPU column, the call's row handing `(ts, φ7, φ8)` to the Poseidon2
+    chip (one permutation a row, its 64 input bytes read and 32 output
+    bytes written through the memory ledger, each input word
+    range-checked below p, so a call the live PVM traps has no proof), an
+    optional chip at index 2 of the segment's 26 (`SEGMENT_CHIPS`). Node
+    kernels may make the call; `derive` admits it in every kernel;
+  - **the Poseidon2 chip's shape classes** [decided, S64]: a kernel
+    holding the chip takes (12, 8), (15, 8) and (12, 17), its third class
+    at 17 pages, since at 24 its leaf passes 2^17 `qm31` rows beside
+    BLAKE2b's chips; a kernel without the chip keeps 24 pages. One step
+    touching more pages than its largest class (a witness-input read past
+    about 64 KiB in one call) has no proof: the cutter cuts only between
+    steps, `derive`'s and the kernel ABI's docs state the cap, and the
+    prover refuses such a run (`ProvingError::Shape`);
+  - **two cuts** [decided, S63]: the seven `MemByteActiveMonoH` columns,
+    which a constraint pinned to zero, dropped (the memory chip's
+    monotonicity stated directly, degree 2); logical right shifts
+    multiplied through MUL by `2^((width − n) mod width)`, taking the
+    product's high word (its low word for a zero shift), so a kernel
+    whose only division-like opcodes are logical shifts holds no DIVREM.
+    The window kernel's cells fall 5.75% (8,001 → 7,600 columns), the
+    auth device kernel's 7.3% [measured, slice 7's 7.21];
+  - **the throughput:** the window statement proves end to end in 33.3 s
+    on format 41 (3 segments 17.0 s, 3 leaves 5.7 s, 2 folds 3.5 s, the
+    masked wrap 7.1 s), against 46.5 s on format 35 [measured].
 - **Unmasked.** Segments never leave the prover role.
 
 ### 3.3 Leaf circuits
@@ -266,11 +310,11 @@ attribution). Its full design is `recursion-air.md`.
 - **A leaf's size is the kernel's width times the queries, not the
   segment's length** [model]. Four times longer segments add 4% of rows,
   so longer segments make recursion cheaper per step.
-  - **The shape per kernel is load-bearing.** At format 35's 40 queries,
-    a kernel-like shape fits the padded shape up to about 9,033 columns
-    (about 8,100 at 44 queries) [model]. The full 32-chip set (13,037)
-    would have doubled every node; without the Ristretto chips and
-    hardened, the full set is 8,039 columns, inside it [model].
+  - **The shape per kernel is load-bearing.** At the segments' 40
+    queries, a kernel-like shape fits the padded shape up to about 9,033
+    columns (about 8,100 at 44 queries) [model]. The full 32-chip set
+    (13,037) would have doubled every node; without the Ristretto chips and
+    hardened, the full set is about 8,000 columns, inside it [model].
   - At derive time, each kernel's leaf rows are computed from its shape
     (`vos_pvm_compiler::leaf`: the chips' AIR as tables and the in-AIR
     verifier's structure, its DEEP plan among it, the built circuit's rows
@@ -314,24 +358,26 @@ attribution). Its full design is `recursion-air.md`.
   (`LEAF_FOLD_LOG_SIZES`): 2^16 / 2^17 / 2^16 rows. Every child a fold
   verifies has it, so one circuit verifies a leaf or a fold, and only the
   preprocessed root, a witness, tells them apart.
-  - **The kernel leaf fits, with about 1,000 columns to spare.** At
-    format 35's 40 queries over the window kernel's 8,009 columns, its
-    `p2` is 57,700 rows of 2^16 finalized, 12% spare, and its `qm31`
-    102,227 of 2^17 [measured, slice 5's 5.11–5.12]. At 44 queries over
-    the 8,024-column shape it would have been about 64.8k, 1% spare
-    [model], which is why segments take 40 queries with PoW 24 (§4).
-    Under format 41 (7.21) its logical right shifts multiply, so its shape
-    holds no DIVREM: 55,451 / 99,414 / 43,960 rows built [measured], and
-    every test actor's kernel's classes within 57,825 / 129,629 / 46,040
-    [model, the derivation's bound]. A kernel holding the Poseidon2 chip
-    beside BLAKE2b's takes the chip's classes (the third at 17 pages, not
-    24: at 24 its leaf passes 2^17 `qm31` rows, about 135k); with them every
-    test actor's kernel, the chip added, fits within 63,637 / 111,167 /
-    51,520 [model].
+  - **The kernel leaf fits.** At 40 queries over the window kernel's
+    shape, its leaf is 55,451 / 99,414 / 43,960 rows under format 41 (its
+    logical right shifts multiply, so its shape holds no DIVREM)
+    [measured], 15% of `p2` spare; every test actor's kernel's classes fit
+    within 57,825 / 129,629 / 46,040 [model, the derivation's bound]. A
+    kernel holding the Poseidon2 chip beside BLAKE2b's takes the chip's
+    classes (§3.2; at 24 pages its leaf would pass 2^17 `qm31` rows, about
+    135k): built, 59,105 / 99,904 / 47,920 at (15, 8) and 59,145 / 105,859
+    / 47,240 at (12, 17) [measured], and every test actor's kernel, the
+    chip added, within 63,637 / 111,167 / 51,520 [model]. Under format 35,
+    over 8,009 columns, the window kernel's `p2` was 57,700 rows
+    [measured, slice 5]; at 44 queries it would have been about 64.8k, 1%
+    spare [model], which is why segments take 40 queries with PoW 24 (§4).
   - **The levers,** if a count passes 2^16 (a wider kernel, or the next
     fix that widens the AIR): fewer queries with more PoW (a new segment
     format, as 35 was), FRI fold step 3 in inner proofs, or `p2` at 2^17
-    (+70% cells).
+    (+70% cells); no fold-shape change was made in slice 7 [decided,
+    S32]. A per-program CPU (§9) narrows every leaf; a 4-way split of
+    the CPU by opcode family would pass 2^16 `p2` rows on a kernel holding
+    the Poseidon2 chip (66,254) [model].
   - A fold uses under half of the shape, so a child could grow by about
     3,200 columns before the fold outgrows it.
   - A kernel that does not fit is refused (§3.3).
@@ -565,6 +611,14 @@ pub struct Statement {
   - `statement/service` (`vos-statement-service`): the JAM statements
     service (§6), its refine and accumulate over `vos-statement`, built
     as a JAM program (`statement-service.elf`);
+  - the credential AIR and the device profile (§8): `recair`'s
+    `credential` (its circuits and prover) and `device` (the device
+    program, `auth_reference`, `H_io` of auth's words), `masked::device`
+    (the masked device segment); `final-verifier`'s `credential` (the
+    format-44 verifier ingress calls); `vos-pvm-proof`'s `device` (the
+    shape) and `masked` (the masked segment chips);
+  - `device` (`vos-device`, `pvm/device`): the device library (§8), `std`,
+    which s4's Android client links;
   - the golden fixtures, under `fixtures` (A.6).
 
   Every venue uses `final-verifier`, `anchor` and `statement`. The source uses no nightly feature:
@@ -595,18 +649,19 @@ last for decades.**
 |---|---|---|---|
 | segment proofs (format 41) | ≥ 100 / ≥ 60 | blowup 4 (log 2), 40 queries, PoW 24, plus interaction PoW 8; FRI fold step 1, log last-layer degree bound 0 | 104 / 62 (62.81) |
 | leaf and fold proofs (32) | ≥ 100 / ≥ 60 | blowup 4, 44 queries, PoW 20, plus interaction PoW 8; fold step 1, last layer 2^0 | 108 / 63 |
-| credential proofs (44, by S29; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | blowup 4 (log 2), 47 queries, PoW 16, plus interaction PoW 8; variant (c) | 110 / 62 (62.92) [built, 7.10; registered, 7.12] |
-| device proofs (46; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | blowup 4, 47 queries, PoW 16, interaction PoW 8 (7.16, among blowup 2 with 86–87 queries, 4 with 43, 8 with 29); variant (c), `h = 256` (7.17d); the shared chip set's current form (7.21) | 110 / 62 (62.82) |
+| credential proofs (44, by S29; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | blowup 4 (log 2), 47 queries, PoW 16, plus interaction PoW 8; variant (c), `h = 512` | 110 / 62 (62.92) |
+| device proofs (46; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | blowup 4, 47 queries, PoW 16, interaction PoW 8 (chosen among blowup 2 with 86–87 queries, 4 with 43, 8 with 29); variant (c), `h = 256` [decided, S62] | 110 / 62 (62.82) |
 | the final wrap, unmasked (28; tests only) | ≥ 100 / ≥ 80 | blowup 64 (log 6), 20 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching (§3.5) | 146 / 82 (82.60) |
 | the final wrap, masked (39) | ≥ 100 / ≥ 80 | blowup 32 (log 5), 24 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching; variant (c) | 146 / 82 (82.70) |
 
 - **The counts** are the security tool's (`pvm/proof/src/security.rs`) at
   each format's reference shape [model], pinned by the format tests.
-- **The numbers:** 41 and 46 name the segment AIR, the chip set the node's
-  segments and the device shape share (slice 7's 7.21); the default prover
-  produces 41. 24 to 27, 29, 31, 33 to 36, 43 and 45, which named its
-  earlier forms or their parameters, are retired: refused, and never
-  registered again (A.4 lists every retired number).
+- **The numbers:** 41 and 46 name the segment AIR's current form, the
+  chip set the node's segments and the device shape share (§3.2); the
+  default prover produces 41. 24 to 27, 29, 31, 33 to 36, 43 and 45, which
+  named its earlier forms or their parameters, and 30, 37 and 42, are
+  retired: refused, and never registered again (A.4 lists every retired
+  number).
 - **The inner grind:** a segment's PoW 24 costs 0.43 s on average on 8
   threads (median 0.26 s, 95th percentile 1.44 s), against 0.028 s at 20
   [measured, 128 grinds each, SIMD]; interaction PoW 8 is negligible.
@@ -618,11 +673,19 @@ last for decades.**
   columns the leaf needs 64,717 of `p2`'s 65,536 rows; at 40, 59,300, 9.5%
   to spare [model, `count-35.log`]. PoW 24 keeps the proven count, 62.86
   against 62.74 at 44 queries and PoW 20, where the batching term binds.
-  Counted again on format 41's own reference (every chip at 2^20 rows, the
+  Counted on format 41's own reference (every chip at 2^20 rows, the
   Poseidon2 chip among them; 11,091 sampled values, 5,750 constraints): 40
-  queries and PoW 24 count 62.81 proven bits, so they stand (7.21).
-- **Devices:** 86 is the least query count whose proven count clears 60 by
-  2 bits; 84 gave 61.2.
+  queries and PoW 24 count 62.81 proven bits, so they stand.
+- **Devices,** counted on the masked device reference (every chip a device
+  program may hold at 2^17 rows): the least queries clearing 62 proven
+  bits are 85–87 at blowup 2 (PoW 20), 43 at blowup 4 with PoW 20 or 47
+  with PoW 16, and 29 at blowup 8 [model]. Blowup 4 is the device's: blowup
+  2's proofs pass the 1.5 MiB budget (1.66 MB on the device kernel) and
+  prove no faster on the phone, blowup 8 is slower and takes more memory
+  [measured]; PoW 16's
+  grind has the short tail (on the phone a 95th percentile of 6–7 ms,
+  against PoW 20's 69–72 ms) for 4 more queries [measured, S29]. The
+  credential format took the same parameters, one grind for both.
 
 - **Inner soundness carries through:** forging a fold's input forges the
   final proof. **The system's proven bound is therefore the weakest inner
@@ -648,31 +711,67 @@ last for decades.**
     forgery gates first: PROGRAM_MEMORY's decode binding, JUMP_TABLE, the
     lookup tables, MEMORY_PAGE and MEMORY_MERKLE, the witness-input chip,
     the boundary-binding argument;
-  - the fork's divergences (the Blake2b channel, fold step 3, affine DEEP
-    batching, the completeness backport);
+  - the fork's divergences (below);
   - the security tool's counts (`security.rs`);
   - the leaf's binding, the wrap, `vos-pvm-final-verifier` and
-    `vos-statement`, and `derive` with the program id's derivation.
+    `vos-statement`, and `derive` with the program id's derivation;
+  - slice 7's additions: the credential AIR (its tagged `p2` rows, its
+    circuits, its two-component masked set); the masked segment chips
+    (the blinding joined to each chip's last batch, the public sums); the
+    device shape (its four chips in place of the page boundary, the
+    first-touch and permission rules), the Poseidon2 chip on both shapes,
+    `H_io`'s binding argument and the `h = 256` argument (§5); the
+    logical right shift through MUL.
 
   Its owner and timing are the owner's to set, and open
-  (`slice-5-progress.md`, "Carried out of slice 5").
+  (`slice-5-progress.md`, "Carried out of slice 5"). No value rides on a
+  proof before it.
+- **The Stwo fork, as pinned** [built]: olanod/stwo at `e14925a8`, a chain
+  of branches, each a divergence from upstream with its own tests:
+  - `vos/wrap` (`ab294189`): the Blake2b-256 channel (§3.5), FRI fold
+    step above 1 with the first round folding by `2^fold_step`
+    (DIVERGENCE-011), affine DEEP batching opt-in per format
+    (DIVERGENCE-012), and the completeness backport;
+  - `vos/verify-panics` (`c3ec9813`): the DEEP quotient's degenerate
+    lines refused as `InvalidStructure`, not asserted (DIVERGENCE-013),
+    for the verifier's panic-freedom (§6);
+  - `vos/grind-chunks` (`4cd1f83f`): the prover's parallel PoW grind in
+    chunks of 2^14 nonces, the smallest nonce kept, so its nonce is
+    the same at every thread count;
+  - `vos/simd-m31-reduce` (`9e9b4ff6`): the SIMD backend's reduction of a
+    Blake2s-M31 digest word below p made canonical over the whole `u32`
+    range, as the verifier reduces it; before it, about one honest
+    credential proof in 30,000 failed its Merkle check [measured];
+  - `vos/neon-compress16` (`e14925a8`): Blake2s's 16-lane compression
+    run as four NEON groups of four on aarch64, its words unchanged:
+    ×1.27 a compression on the phone's prime core, ×1.76 on a little
+    core, about 3–4% of a device proof [measured].
 
-## 5. Masking [built: format 39]
+  `pvm/proof/SECURITY.md` keeps the open items' detail (011–013).
 
-- **Where:** the final wrap. Device proofs (slice 7) reuse it:
-  the masking is generic over the component set and the channel. The
-  segment chips are built masked too (`vos_pvm_proof::masked`, slice 7's
-  7.14): each chip's blinding fraction joins its last batch of fractions,
-  no column or degree added; the boundary chips' claimed sums, which the
-  boundary states fix, stay unblinded; every chip pads to four times its
-  `h`. The device shape proves them masked against its program
-  (`vos_pvm_recair::masked::device`, slice 7's 7.15): the program's chips
-  mixed after the header, its log sizes pinned, the io-hash the one public
-  sum. The device format, 46, is admitted at a space's ingress for
-  device proofs of auth's statement (slice 7's 7.20). Node segment, leaf and fold proofs stay unmasked, in the prover
-  role, as the witness rows do.
-- **Device proofs (format 46, rate 1/4)** serve authorizations a space re-checks at
-  its ingress, never settlement.
+## 5. Masking [built: formats 39, 44 and 46]
+
+- **Where:** the final wrap (39), credential proofs (44) and device
+  proofs (46): the masking is generic over the component set and the
+  channel. The segment chips mask (`vos_pvm_proof::masked`): each chip's
+  blinding fraction joins its last batch of fractions, so masking adds no
+  column and no degree to any chip; the boundary chips' claimed sums,
+  which the boundary states fix, stay unblinded; the fixed tables pad by
+  repeating their entries with no multiplicity; every chip pads to four
+  times its `h`. The device shape proves them masked against its program
+  (`vos_pvm_recair::masked::device`): the program's chips mixed after the
+  header, its log sizes pinned, the io-hash the one public sum. Node
+  segment, leaf and fold proofs stay unmasked, in the prover role, as the
+  witness rows do.
+- **Its cost on the segment chips** [measured, the auth statement on
+  x86, quiet]: ×2.14–2.19 in time and ×2.1–2.2 in peak memory against
+  the same shape unmasked, the proof ×1.12–1.30: every column at `2N`,
+  the composition at `4N` and every tree lifted one level more. 36 cubic
+  gates (the CPU's 34, the memory ledger's 2) keep the composition at
+  `4N`; rewriting them would save about 20–30% of the masked time [est],
+  an AIR change not made.
+- **Device and credential proofs (rate 1/4)** serve authorizations a
+  space re-checks at its ingress, never settlement.
 - **How:** spike 2's variant (c), already prototyped on our pinned Stwo
   fork, with Fable's R1–R8:
   1. the rank check; the prover retries on R1's failure, a public event
@@ -695,7 +794,7 @@ last for decades.**
   6. parameters pinned in the format;
   7. every carrier audited (A.5);
   8. the cost measured (§3.5).
-- **How large `h` must be** [argued; counted on the device shape, 7.17d]:
+- **How large `h` must be** [argued, checked by Fable; counted on the device shape; decided, S62]:
   - **What a column reveals.** A masked column is `f' = f + v_H·r`, `r`
     uniform over the `h` coefficients of the size-`h` circle FFT basis,
     one `r` a column, drawn independently. Every published value that
@@ -753,7 +852,7 @@ last for decades.**
     witness. Conditioning on it, and the count of attempts, reveal
     nothing. The margin buys only fewer retries, which cost time
     (`MAX_ATTEMPTS`, 8, then the prover fails without a proof).
-  - **The device shape at 47 queries** (format 43's parameters; the auth
+  - **The device shape at 47 queries** (format 46's parameters; the auth
     kernel's program at `h = 256`; each chip's widest offsets read off the
     built device set's mask points): every chip reads its previous row,
     the logup running sum's `[-1, 0]` at least, and none a third row, so
@@ -774,7 +873,8 @@ last for decades.**
     the floor, 2^10 rows, `h = N/4` exactly. **`h = 256` meets the
     condition for every chip, with 107 rows spare (×1.72)**; R1 measured
     149 on the auth kernel's transcripts at `h = 256` and accepted each at
-    its first attempt (7.17c). A column of one offset would reveal
+    its first attempt [measured]; a leakage gate at `h = 256` (128 proofs,
+    121,099 hypotheses) refused none [measured]. A column of one offset would reveal
     `4 + 2·47 = 98`. The rule's other limits: `h = 512` at 47
     queries kept ×2 (298); `h = 256` keeps ×2 up to 40 queries, and
     holds the condition up to 82 (`8 + 3q ≤ 256`).
@@ -867,8 +967,10 @@ last for decades.**
     compares the whole `RootRead`, kind among it.
   - **Fail-closed:** a runtime without the verifier rejects every proof,
     and a failed submit pays its full weight.
-  - **Built-in handlers:** `Record`; a `Credential` handler with slice 7's
-    credential AIR; the Clerk's settlement handler with the Clerk. Every
+  - **Built-in handlers:** `Record`; a `Credential` handler once a
+    cross-space credential exists (the in-space credential is verified at
+    its own space's ingress, §8, and reaches no venue); the Clerk's
+    settlement handler with the Clerk. Every
     value-moving handler is two-sided or spends the submitting space's
     own escrow. No handler runs a STARK in `validate`.
   - **Its home:** `pallet-spaces`, in Kreivo, built by the Kreivo teammate
@@ -1005,9 +1107,9 @@ last for decades.**
     take (§8). The in-space credential's tree needs none: it lives in its
     actor's rows, and only its space's ingress reads it.
 
-## 8. Mobile [decided: credential AIR first, then the device profile; device-held secrets first, then chips]
+## 8. Mobile [decided: credential AIR first, then the device profile; device-held secrets first, then chips; built: both, with the phone gates met]
 
-**1. The credential AIR** comes first [decided, S21–S25]. Two fixed circuits over the recursion
+**1. The credential AIR** [decided, S21–S25; built]. Two fixed circuits over the recursion
 AIR's `p2` and `qm31` components prove facts about a device secret `s`,
 and a space's ingress verifies them. This section pins what they hash,
 the tree they read, the format and the secret's derivation; the actor
@@ -1085,10 +1187,11 @@ enrollment costs 33 calls of `C`, the leaf and 32 levels; a revocation 32.
   owner)` and `freeze(row)`, under an operator role, do [decided, S37].
 - **Membership and payment together** [decided, S37], measured, not
   admitted: a third circuit on the same shape proves auth's leaf, path and
-  nullifier and owner's digest from one `s` (37 permutations). Slice 7
-  times it on the phone against auth's budget, so the later private
-  payment's statement (`identity-and-authority.md` §8) is known to fit; it
-  has no `CredentialKind` and no ingress path. It is a floor for a
+  nullifier and owner's digest from one `s` (37 permutations). On the
+  phone it proves in 161–164 ms at the median, within auth's 250 ms
+  budget [measured, PG1], so the later private payment's floor
+  (`identity-and-authority.md` §8) fits; it has no `CredentialKind` and
+  no ingress path. It is a floor for a
   shielded spend, not its estimate: notes, values and range checks cost
   far more than its 37 permutations.
 - **The public words bind the proof:** each is a public value of the
@@ -1109,7 +1212,7 @@ enrollment costs 33 calls of `C`, the leaf and 32 levels; a revocation 32.
   padded to the masking floor, 2^11 rows (`h = 512`). Auth and owner share
   the shape, so their proofs are the same size.
 
-**Format 44, credential proofs** [decided, S29, on the phone at 7.12]:
+**Format 44, credential proofs** [decided, S29 and S57, on the phone]:
 masked (c), the Blake2s-M31 channel (the fork's
 `Blake2sM31MerkleChannel`), blowup 4 (log 2), 47 queries, PoW 16,
 interaction PoW 8, fold step 1, last layer 2^0, affine DEEP batching (the
@@ -1122,16 +1225,30 @@ threads (110–119 ms on its four big cores), above 50 ms; PoW 16's was
 6.2–6.9 ms [measured, `research/slice-7/phone-fairphone6-p2.txt`]. 42 is
 retired: proofs were made under it, and a number names one set of
 parameters. 30, reserved at an unmasked count, is retired unregistered.
-Ingress takes a proof of at most 512 KiB; a proof is about 215–222 KB
+Ingress takes a proof of at most 512 KiB; a proof is about 196–222 KB
 [measured].
-- **Built** (slice 7's 7.10, `vos_pvm_recair::credential`,
+- **Built** (`vos_pvm_recair::credential`,
   `vos_pvm_final_verifier::credential`): each `C(T(name), x)` is one `p2`
   row of the tagged form (`recursion-air.md` §1.3: a constant block on
   the left of a wire pair, from three modes' selectors, no AIR change);
   the set is `p2` and `qm31` alone, each at 2^11 rows, `h8` absent; the
   verifier pins both kinds' preprocessed roots and program ids (the
   circuit hash of the registry's format, its parameters, the log sizes
-  `[11, 11, 0]` and the root), re-pinned under 44 at 7.12.
+  `[11, 11, 0]` and the root).
+- **Its cost** [measured]: the floor, not the statement, sets it: every
+  kind pads to `4h = 2^11` rows a component, so auth (36 permutations),
+  owner (1) and the joint circuit (37) cost alike. On x86, 4 threads:
+  about 44 ms each at the median, 47–49 ms at the 95th percentile, peak
+  137–153 MiB. On the Fairphone 6 (PG1, automatic threads): auth p50
+  164–170 ms, p95 at most 197 ms; owner 161–179 ms, p95 at most 203 ms;
+  the joint 161–164 ms, p95 at most 193 ms; on the four big cores alone
+  126–131 ms; peak 113–133 MiB; the seeded build's bytes equal x86's.
+  PG1's budgets (≤ 250 ms, ≤ 256 MiB) hold; owner's 150 ms target is
+  missed at automatic threads, the floor being the masking's. Verified at
+  ingress on one quiet x86 core in 1.87 ms (auth, p50; p95 2.11 ms), a
+  wrong PoW refused in 0.66 ms, before any decommitment is read, both
+  under 42's parameters; 44's quiet one-core time is not yet measured
+  (under another agent's load: 5.5 ms, and 1.6 ms for a wrong PoW).
 
 **The device secret, from a secret source** [decided, S25, S42]:
 - **The source** is an HMAC-SHA-256 under a key the device never
@@ -1200,11 +1317,26 @@ impl Prover {
                       call: &Call) -> Result<CredentialProof, DeviceError>;
     pub fn prove_owner(&self, s: &DeviceSecret, call: &Call)
                        -> Result<CredentialProof, DeviceError>;
+    /// A device kernel's run on `arguments`, under the device format.
     pub fn prove_kernel(&self, program: &DeviceProgram, arguments: &[u8])
-                        -> Result<DeviceProof, DeviceError>;   // M5
+                        -> Result<DeviceProof, DeviceError>;
+    /// Auth's statement by a device kernel: a `CredentialProof` under the
+    /// device format, its binding naming the program.
+    pub fn prove_device_auth(&self, s: &DeviceSecret, witness: &AuthWitness,
+                             name: &[u8], call: &Call, program: &DeviceProgram)
+                             -> Result<CredentialProof, DeviceError>;
 }
 pub fn verify(proof: &CredentialProof, call: &Call, name: Option<&[u8]>)
               -> Result<(), DeviceError>;
+
+/// A device kernel's program, computed from its bytes as every node computes it.
+pub struct DeviceProgram(/* the chips, the log sizes, the committed tree */);
+impl DeviceProgram {
+    pub fn auth(kernel: &[u8]) -> Result<Self, DeviceError>;   // on `auth_reference`
+    pub fn id(&self) -> &[u8; 32];
+}
+pub fn verify_device(proof: &CredentialProof, call: &Call, name: &[u8],
+                     program: &DeviceProgram) -> Result<(), DeviceError>;
 
 // The wire (identity-and-authority.md §5–§6): node-API requests, each its
 // kind and SCALE body (the transport adds the length and any request id).
@@ -1238,8 +1370,15 @@ impl PathKeeper {
   `root` by the path, else `DeviceError::Witness` before any proving.
 - **`DeviceError`** is `Config`, `Memory`, `Witness`, `Prove`, `Decode` or
   `Verify`: it names what failed and carries no value.
-- **`Threads::Auto`** weights work by core class (7.17) [decided, S28];
-  until 7.17 it is rayon's even split over every core.
+- **`Threads::Auto`** [decided, S28; built]: the cores the thread may
+  run on, grouped by the rate the system states for each (its capacity,
+  else its highest clock), each class's rate measured on one of its cores;
+  the work goes to the fastest classes whose count times the slowest kept
+  rate is greatest, one thread pinned to each of their cores (every core
+  unpinned when every class is kept). On the Fairphone 6 it keeps the
+  four big cores, pinned: the same four unpinned are ×1.20 slower, the
+  split over all eight ×1.3 [measured]. The pool's stacks are 16 MiB
+  (`STACK_BYTES`): a nested join overflowed rayon's default 2 MiB.
 - **`path_query` and `root_query` sign with a key drawn for that query
   alone,** so fetches link to no client key; a proof uses the path
   `PathKeeper` holds, and no fetch precedes it. `path_answer` is `None`
@@ -1248,7 +1387,7 @@ impl PathKeeper {
   build check). The client's bridge zero-fills its `byte[]` of `o` once
   the library has copied it; the library zeroizes its copies of `o` and
   `s`.
-- **Built** (slice 7's 7.12, `pvm/device`, its `SECURITY.md`): as
+- **Built** (`pvm/device`, its `SECURITY.md`): as
   sketched, and beside it `Prover::prove_membership_and_payment` and
   `verify_joint` (the joint statement's binding names its own program and
   the kind byte `0xff`, which no `CredentialPublic` takes); the masks
@@ -1277,17 +1416,24 @@ hashed through `0x402`, and no venue checks a Poseidon2 root. `RootKind`
 1 stays reserved for the cross-space credential, which will prove its
 root's place under `S_w` by a BLAKE2b path outside the proof, its issuer
 reporting every window (C10).
-- **The zkPVM gains a Poseidon2 chip** (pin H, 7.15): one permutation a
-  row, about 300 columns at degree ≤ 3, like the recursion AIR's `p2`.
-  Kernels that call `0x402` then prove it, cheaper than BLAKE2b in-AIR.
-- **The host serves Poseidon2 natively** [built, 7.9], at 2,400 gas a
+- **The zkPVM has a Poseidon2 chip** [built] (§3.2): one permutation a
+  row, the S-boxes as the recursion AIR's `p2` (284 columns, degree 3);
+  with its 96 byte accesses through the memory ledger and its range
+  checks, about 1,060 columns a row once its single-denominator fractions
+  are paired. At its floor of 2^10 rows a device kernel's 43 calls cost
+  the chip's floor, not its calls.
+- **The host serves Poseidon2 natively** [built], at 2,400 gas a
   call. A JAM-deployed agent pays it in software, about 37,600 gas a
   permutation [measured], as it does BLAKE2b.
 
-**2. The device profile** comes next [built: the shape, slice 7's 7.15;
-`vos_pvm_proof::device`]. The general zkVM runs on phones, for any
-attestable kernel. It proves one segment with no page-Merkle boundary,
-binding the run like this:
+**2. The device profile** [built: `vos_pvm_proof::device`,
+`vos_pvm_recair::device`; PG2 met, below]. The general zkVM runs on
+phones, for any device kernel. It proves one segment with no page-Merkle
+boundary, over the shared chip set (§3.2) and four chips of its own
+(DeviceMemoryChip, a row a byte the run touches, its region and first
+touch; the data table; DeviceBoundaryChip, the registers' entry as the
+program's constants and their halt blinded; DeviceIoChip, φ9..12 to the
+io-hash), binding the run like this:
 - **code:** program memory, preprocessed;
 - **first touches** (`ts = 0` ledger entries), by address region:
   - the data region: a preprocessed data table;
@@ -1304,21 +1450,24 @@ binding the run like this:
 - **masking:** a floor of rows per masked component, set by the queries:
   the randomizer covers the rows a column reveals, `4|O| + q(|O| + 1)`
   for `|O|` offsets a column (§5, how large `h` must be), rounded to a
-  power of two `h`, and a component has at least `4h` rows. Format 43
-  took twice the rows, at blowup 4 with 47 queries `h = 512` and 2^11
-  rows [built, 7.14–7.16]; format 45 took the rows themselves, 149, so
-  `h = 256` and 2^10 [built, 7.17d], and 46 keeps them. A component with no next-row read
-  (`|O| = 1`) needs less, so `h` is set per component (at most the
-  format's). Every segment chip reads its running sum's previous row, so
-  each takes the full `h` [built, 7.14].
+  power of two `h`, and a component has at least `4h` rows. Format 46
+  takes the rows themselves, 149 at blowup 4 with 47 queries, so `h =
+  256` and a floor of 2^10 rows [decided, S62]; `device_floors` refuses at
+  install a format whose `h` is below a chip's revealed rows. A component
+  with no next-row read (`|O| = 1`) would need less, so `h` is set per
+  component (at most the format's); every segment chip reads its running
+  sum's previous row, so each takes the full `h` [built]. Taking `h` at
+  the rows rather than twice them cost nothing in bits and took ×0.82 the
+  time and ×0.87 the peak on the phone [measured].
 
-**The device io-hash `H_io`** [built, slice 7's 7.17b, ingress's check
-7.20's; checked by Fable]. A device kernel's io-hash was
-`compute_io_hash`'s BLAKE2b-256, so BLAKE2b (3,136 columns) and its AND
-table stayed in every device shape, the Poseidon2 statement's too: 48% of
-its columns, and the Merkle hashing and the proof's bytes go with the
-columns [measured, 7.16]. Over `C`, a kernel that hashes only through
-`0x402` reaches neither.
+**The device io-hash `H_io`** [built; checked by Fable]. A device
+kernel's io-hash is over `C`, not `compute_io_hash`'s BLAKE2b-256: with
+BLAKE2b's, BLAKE2b (3,136 columns) and its AND table stayed in every
+device shape, the Poseidon2 statement's too, 48% of its columns, and the
+Merkle hashing and the proof's bytes go with the columns [measured]. A
+kernel that hashes only through `0x402` reaches neither: on the phone
+its proof took ×0.40 the time, ×0.39 the peak and ×0.54 the bytes of the
+same statement under BLAKE2b's io-hash [measured].
 - **The bytes:** `E`, exactly what `compute_io_hash` hashes after its
   domain: `compact(|a|) ‖ a ‖ compact(|o|) ‖ o ‖ compact(|R|)`, then each
   root read's kind byte, space, window (8 bytes little-endian) and root;
@@ -1390,42 +1539,37 @@ columns [measured, 7.16]. Over `C`, a kernel that hashes only through
   and `H_io` (a device kernel always returns its parts, however few). An
   auth guard's `device = "..."` must name one, else the macro refuses, and
   the derivation checks it again on the marks. The derivation admits
-  `0x402` in any kernel (only in a marked one before format 41) and
-  refuses `0x400` in a marked one, naming the
+  `0x402` in any kernel and refuses `0x400` in a marked one, naming the
   chain of functions that reaches it; it refuses a mark its schema kind
   contradicts and a `Device` method of no entry, and names the device
   kernels (`Derived::devices`). A device kernel's record keeps the node's
   segment shape, never proved and not held to the recursion's leaves; the
   device proves it under the device profile, whose chips its code gives
   (`device_chips_of_code`), against the program computed from the kernel
-  (below, *The device program*). Node kernels keep BLAKE2b's io-hash;
-  under format 41 they may make the `0x402` call too (7.21), a device
-  kernel never BLAKE2b's.
+  (below, *The device program*). Node kernels keep BLAKE2b's io-hash and
+  may make the `0x402` call too (§3.2); a device kernel never calls
+  BLAKE2b's.
 - **No node attests one:** the runtime and the testkit refuse `Attest` of
   a `Device` method before its kernel runs, and `AttestAt` takes `Reading`
   methods alone; the macro gives a device method no `AttestableMethod`,
   so a workflow's attest of one does not compile. The prove-later path
   never meets `H_io`.
-- **What the verifier and ingress check** [built, 7.20]: the verifier
-  is unchanged (the io-hash's 32 bytes are the public values,
+- **What the verifier and ingress check** [built]: the verifier
+  is the device segment's (the io-hash's 32 bytes are the public values,
   DeviceIoChip's sum recomputed from them); ingress picks the io-hash by
   the proof's format, 46's being `H_io` (not by the guard), computes it
   from the request's words (`a` the SCALE encoding of
   `CredentialPublic::Auth`, 129 bytes, `o` empty, no roots: `ℓ = 133`, six
   blocks and the length's) and verifies the proof under 46 against it. A
   proof whose kernel ended with BLAKE2b states another io-hash and fails.
-- **What moves:** every device kernel's code and program id (none pinned
-  before ingress takes device proofs); the device kernel's end
-  (`DeviceReturn`); a device kernel's io-hash wherever its return is
-  checked (`KernelReturn::device_io_hash`, the testkit's `device_parts`
-  and `run_device_kernel`); the schema's kinds (`Device`, index 6); the
-  tags (seven); the spike harness's and `tools/phone`'s kernels; a device
-  kernel's gas (seven calls at 2,400 gas each where BLAKE2b's blocks
-  were). **What does not:** pin I's auth words, the device chips,
-  DeviceIoChip, the device format's reference and bits (a device program may
-  still hold BLAKE2b, so the reference keeps it), every node format,
-  `compute_io_hash`, `vos_pvm_statement::Statement::io_hash`, `Attest`
-  and `KernelReturn`'s codec, and every node kernel's bytes.
+- **Where it lives:** the device kernel's end (`DeviceReturn`); a device
+  return's check (`KernelReturn::device_io_hash`, the testkit's
+  `device_parts` and `run_device_kernel`); the schema's kind `Device`
+  (index 6); the seventh tag. Node kernels' io-hash
+  (`compute_io_hash`, `vos_pvm_statement::Statement::io_hash`), `Attest`
+  and `KernelReturn`'s codec are BLAKE2b's and untouched by it; the device
+  format's reference keeps BLAKE2b's chips, since a device program may
+  still hold them.
 - **Its cost:** seven calls for auth (the Poseidon2 chip's rows 36 to 43,
   under its floor) and the packing's steps. The lever pays only if no
   BLAKE2b call site (`ecalli 0x400`) is reachable from a device kernel's
@@ -1437,31 +1581,36 @@ columns [measured, 7.16]. Over `C`, a kernel that hashes only through
   `Bound::digest`); a kernel takes the tags as `Tag::word()`'s constants.
   The derivation refuses one that does, and a gate holds the auth kernel's
   device chips to neither BLAKE2b's nor the AND table's
-  (`device_kernel::a_device_kernels_shape_holds_no_blake2b`). The auth
-  kernel then takes 2,860 steps, from 5,665: its end writes the parts once
-  [measured, 7.17b]; and 1,722 once the end hashes `E` where it lies (one
-  four-byte load a packed word, `padded_device_io_words`) and the kernel
-  moves its words whole at any alignment (the PVM serves unaligned loads
-  and stores; the guest target's own go byte by byte): under 2^11 steps,
-  which the gate holds [measured, 7.17c]: the CPU at 2^11 rows, twice the
-  masking's floor of 2^10 at `h = 256`.
+  (`device_kernel::a_device_kernels_shape_holds_no_blake2b`).
 
-**Format 46, device proofs** [measured, slice 7's 7.16, 7.17d and 7.21]:
-masked (c), the Blake2s-M31 channel, blowup 4, 47 queries, PoW 16,
-interaction PoW 8, affine DEEP batching (format 44's parameters), `h =
-256`, every chip's floor 2^10 rows. Format 43 was the same at `h = 512`
-(7.16 to 7.17c) and is retired: 45 dropped the masking's factor two (§5),
-×0.82 in time and ×0.87 in peak on the phone at P6, and is retired in turn:
-46 takes its parameters over the shared chip set's current form (7.21: the
-seven columns pinned to zero gone, the logical right shifts through MUL); 110 conjectured
-and 62.82 proven bits on its masked reference, every device chip at
-2^17 rows (`DEVICE_MAX_LOG_SIZE`, which install enforces: the memory
-ledger, a row a byte touched, takes 2^17 on the auth statements).
-Admitted at ingress for device proofs of auth's statement (7.20); a proof
-is at most 1.5 MiB (the auth kernel's about 0.98 MB) and its bytes the
-masked proof's postcard encoding alone, canonical, with no io-hash.
+**The lean kernel** [built; the `device` test actor's `auth`]: the auth
+statement in 1,722 steps, under 2^11, which a gate holds, so the CPU sits
+at 2^11 rows [measured]. Its arguments are read where the witness input
+left them (a pointer decoded in place, no copy; the siblings first, so
+page-aligned); its path is walked in one lane `[sibling, node, sibling]`,
+each level's `0x402` call reading the half the slot's bit picks by its
+address, never a branch, and writing the parent over the node; its end
+writes the parts once into a buffer with room for their lengths and
+hashes `E` where it lies, one four-byte load a packed word
+(`padded_device_io_words`); it moves its words whole at any alignment
+(the PVM serves unaligned loads and stores; the guest target's own go
+byte by byte). The first kernel of this statement took 18,733 steps, most
+of them argument copies and byte-wise conversions [measured].
 
-**The device program** [built, slice 7's 7.20; `vos_pvm_recair::device`]:
+**Format 46, device proofs** [built; measured]: masked (c), the
+Blake2s-M31 channel, blowup 4, 47 queries, PoW 16, interaction PoW 8,
+affine DEEP batching (format 44's parameters), `h = 256` [decided, S62],
+every chip's floor 2^10 rows, over the shared chip set's current form
+(§3.2); 110 conjectured and 62.82 proven bits on its masked reference,
+every device chip at 2^17 rows (`DEVICE_MAX_LOG_SIZE`, which install, the
+prover and the verifier enforce: the memory ledger, a row a byte touched,
+reached 2^17 on the first auth kernels). The device's earlier forms are
+retired (A.4): 37 at an unmasked count, 43 at `h = 512`, 45 before the
+two cuts. Admitted at ingress for device proofs of auth's statement; a
+proof is at most 1.5 MiB (the auth kernel's about 0.87 MB) and its bytes
+the masked proof's postcard encoding alone, canonical, with no io-hash.
+
+**The device program** [built, `vos_pvm_recair::device`; decided, S61]:
 what a device proof is verified against, computed from the kernel alone,
 never taken from a request. Its chips are those the kernel's code reaches
 (`device_chips_of_code`); its log sizes are those a reference run needs,
@@ -1502,13 +1651,62 @@ binding names that program. The trace is witness-independent: the prover
 pads every chip to the program id's log sizes and fails on a run past
 them, and the kernel walks its path with selects.
 
-Its levers:
-1. no boundary, −58% [measured proxy];
-2. lean kernels and narrow BLAKE2b chips, about −54% of the rest;
-3. blowup 2, −20%;
-4. threads weighted by core class.
+**The phone gate PG2** [decided, S3, S20, S27]: the auth statement under
+the device profile, masked, on the Fairphone 6 (Snapdragon 7s Gen 3, four
+A720-class and four A520 cores), at most **1.0 s** (the median of three
+rounds' medians, automatic threads), peak resident at most **1 GiB**
+(target 768 MiB), the proof at most **1.5 MiB**, verified on the phone
+and accepted at a space's ingress. **Met** [measured, session P7,
+2026-10-31, format 45, the lean kernel]: 581 ms (95th percentile 646 ms),
+peak 513 MiB, proofs 976–983 KB, every proof verified on the phone; in
+the acceptance run the phone proved each round's sign-in in 618–648 ms
+(peak 440–445 MiB) and the node's ingress ran the guarded method as the
+member's pseudonym in 34–38 ms, one pseudonym every round. The plan's
+second pass a day apart (session P8), at format 46, is pending; on x86
+format 46 proves the same kernel 3.9% faster with a proof 10.5% smaller
+[measured].
 
-It projects to 0.36–0.9 s on Apple-class phones [projected].
+**What brought it there,** each lever measured on the phone (the auth
+statement over the credential actor's Poseidon2 tree, masked, blowup 4,
+47 queries, PoW 16, automatic threads, the median) [measured]:
+
+| shape | steps | time | peak | proof |
+|---|---|---|---|---|
+| the first device kernel, BLAKE2b's io-hash, `h = 512`, an even split over eight cores | 18,733 | 5.79–5.98 s | 3.6 GiB | 1.89 MB |
+| arguments in place and the path in one lane; the preprocessed tree committed once at install; the Poseidon2 chip's fractions paired; `Threads::Auto` | 5,665 | 2.43 s | 1.8 GiB | 1.82 MB |
+| `H_io` over Poseidon2 (BLAKE2b and the AND table out of the shape) | 2,860 | 0.97 s | 0.70 GiB | 0.98 MB |
+| the end hashing in place, words moved whole: the lean kernel | 1,722 | 0.74 s | 636 MiB | 0.99 MB |
+| `h = 256` (format 45) | 1,722 | 0.60 s | 543 MiB | 0.98 MB |
+| the fork's NEON compression | 1,722 | 0.58 s | 513 MiB | 0.98 MB |
+
+- **Not taken:** blowup 2 (its proof past 1.5 MiB, no faster); a
+  `cortex-a720` build (the phone's cores refuse it); little cores pinned
+  beside the big ones (slower); the grind and the query count (under 1% of
+  a proof at PoW 16). mimalloc never purging tightens the tail, within
+  noise at the median.
+- **Where a proof goes** [measured, x86]: the main tree 29%, the
+  composition 23%, the interaction tree 19%, DEEP and FRI 17%, the trace
+  5%, R1 4%; Blake2s-M31's compression a third, the FFTs about 8%.
+- **The ARM factor** on this shape: the phone at automatic threads about
+  2.4× x86 on four performance cores, 2.8× x86 on four performance and
+  four efficient ones [measured].
+
+**The cell model** [model, `research/slice-7/7.18-cell-model.md`]: on the
+phone 1.0 s is about 20M committed cells and 1 GiB of peak 26–40M, so
+time binds first, at about a device kernel of 2^11–2^12 steps of
+node-like code. The CPU split by opcode family pays little at the
+device's size: a 4-way split widens the CPU (785 → 1,284 columns, a
+109-column core repeated) and saves 5.4% of the auth kernel's cells, 1–8%
+of a node segment's. What pays [decided, S63; the next slice's levers]:
+- **a per-program CPU,** its columns following the program's code (every
+  traced kernel uses 48–55 of the 139 opcodes): 785 → 535–549 columns at
+  every length, −8.8% of the auth kernel's cells (about 554 ms), −14–17%
+  of heavier kernels', and a narrower node leaf, in both formats;
+- **word-level memory:** −17% of the auth kernel's cells, its memory
+  ledger byte-level at 2^14 rows for 1,722 steps; −26% beside the
+  per-program CPU (about 450 ms).
+The 4-way split is not built; the two cheap cuts the model found are
+format 41's and 46's (§3.2).
 
 **3. Signature chips** come last, for flows that must prove a standard
 signature [decided, after the hash credentials]:
@@ -1520,12 +1718,17 @@ signature [decided, after the hash credentials]:
 Each signature statement is then about 8–10M cells [model]. They are not
 post-quantum.
 
-**A real phone:** the auth statement, as built and without the boundary,
-ran on the owner's Fairphone 6 (2026-10-25, slice 5's kit, unmasked): as
-built 6.2–6.5 s on 4 threads, the floor 2.6–3.0 s, 2.2 s on 8; every proof
-byte-identical to x86's; the ARM factor about 3.5× [measured,
-`research/slice-7/phone-fairphone6-s5kit.txt`]. The device profile's
-budgets and its gate are slice 7's (`slice-7-mobile.md`, pin J).
+**The phone** is the owner's Fairphone 6, the gate device [decided, S3,
+S33], reached over adb in batched sessions. Its first run (slice 5's kit,
+unmasked, before the device shape) took 6.2–6.5 s as built and 2.2–3.0 s
+without the boundary, every proof byte-identical to x86's [measured,
+`research/slice-7/phone-fairphone6-s5kit.txt`]. The gates as met: PG1
+(credential proofs, above), PG2 (the device profile, above) and PG3, the
+s4 demo's enroll, sign-in and pay flows end to end on the phone through a
+gateway, its secret from the Keystore behind the biometric prompt
+(`identity-and-authority.md` §7) [measured]. The phone bench is
+`tools/phone` (`vos-phone`): a timing build and a `seeded-masks` build
+whose proofs are compared with x86's byte for byte.
 
 ## 9. Node proving levers, named with their numbers
 
@@ -1533,10 +1736,13 @@ budgets and its gate are slice 7's (`slice-7-mobile.md`, pin J).
 |---|---|---|---|
 | a shape per kernel | −38% verify, −14% bytes, −10% RSS [measured] | about 1 week | slice 5 |
 | the reference Poseidon2 and a SIMD hasher | segments on Poseidon2 at 1.75–1.85× Blake2s, against 6.4–6.9× before; a leaf's commitment 0.63 s [measured] | 2–3 weeks | slice 5 |
-| narrow BLAKE2b chips | −2,200 columns; −30–45% of BLAKE2b's cells [model] | 3–5 weeks | slice 7 (mobile needs it; folds gain) |
+| the seven zero columns dropped; logical right shifts through MUL | the window kernel −5.75% of its cells; its statement 33.3 s end to end against 46.5 s [measured] | built | slice 7 (format 41, S63) |
+| a per-program CPU (its columns the program's opcodes') | 785 → 535–549 CPU columns; −8.8% to −17% of a kernel's cells; a narrower leaf [model] | 3–5 weeks | the next slice (S63) |
+| word-level memory | MEMORY 4–8× fewer rows; −17% of the auth kernel's cells [model] | 4–6 weeks | the next slice (S63) |
+| the CPU split by opcode family | 4-way: −5.4% of the auth kernel's cells, 1–8% of a segment's, under 1% at a class's fixed shape, wider by 499 columns, past a leaf with the Poseidon2 chip [model] | 6–10 weeks | not built (S63); a 2-way split on the per-program CPU only where padding pays |
+| narrow BLAKE2b chips | −2,200 columns; −30–45% of BLAKE2b's cells [model] | 3–5 weeks | later (device kernels hold no BLAKE2b, §8; folds gain) |
 | a lighter page boundary (Poseidon2 page hashing), or one memory argument across segments | about −1,100 / −2,800 columns; up to −49% of prover cells | 3–5 / 6–10 weeks | later |
-| word-level memory | MEMORY 4–8× fewer rows | 4–6 weeks | later |
-| CPU components per opcode family | −50–70% of the CPU's cells | 6–10 weeks | later |
+| the 36 cubic gates rewritten | the masked composition at `2N`: about −20–30% of a masked proof's time [est] | an AIR change | later |
 
 A fold costs the inner proof's columns times its queries, so every lever
 that narrows the inner proof makes folds cheaper too.
@@ -1562,7 +1768,13 @@ that narrows the inner proof makes folds cheaper too.
 | a deadline between parties is read from a space's clock | a test that every deadline is the venue's time | slice 6, M3 |
 | a forgery in the recursion AIR | the recursion AIR's forgery gates | slice 6, M2 |
 | a prover's internals leave the role | the carrier audit (A.5) on the model venue and on chain | slice 6, M3 |
-| the credential AIR misses sub-second | masked auth and payment proofs on a real flagship | slice 7 |
+| the credential AIR misses sub-second | **retired:** PG1, masked auth, owner and joint proofs in 161–179 ms on the Fairphone 6 [measured] | slice 7, M4 |
+| an honest proof is refused | **retired:** the fork's SIMD reduction of a Blake2s-M31 digest word made canonical; 180,000 proofs at 42's parameters and 20,000 at 44's, none refused [measured] | slice 7, M4 |
+| the device profile misses 1 s on the phone | **retired once:** PG2 at 581 ms, 513 MiB, 0.98 MB, accepted at ingress (P7); the second pass a day apart (P8) pending | slice 7, M5 |
+| masking the segment chips leaks or breaks the nodes' proofs | soundness 1–10 and leakage 1–7 on a masked segment and on the device shape (two witnesses at equal public values); format 35's proofs byte for byte until 41 [measured] | slice 7, M5 |
+| `h = 256` reveals more than its randomizer covers | the revealed-rows argument (§5), checked by Fable; R1 on every transcript; `device_floors` at install; a leakage gate at `h = 256` | slice 7, M5 |
+| format 41's wider AIR overflows a kernel leaf | the leaves counted as built, within 2^16 / 2^17 / 2^16; the Poseidon2 chip's 17-page class (S64); no fold-shape change (S32) | slice 7, M5 |
+| a device proof's shape leaks its witness | the trace padded to the program's log sizes, which a public reference run sets (S61); branch-free kernels; a test of two path shapes under one program | slice 7, M5 |
 | the signature chips' cost or soundness | a gate ladder per chip; a phone run | after slice 7 (S1) |
 
 ## 11. Slices and milestones [decided: three slices]
@@ -1574,8 +1786,8 @@ that narrows the inner proof makes folds cheaper too.
 | **6** | **M2 Masking** | R1–R8 on the final wrap, generic over components and channel for slice 7; format 39; 248-bit salts; leakage and soundness gates; the items carried from slice 5 | 8.5–13 weeks |
 | **6** | **M3 Statements on chain** | the public-input model; `&self` witnessed reads to the space root at anchored cuts; the prover worker; the Kreivo spaces pallet's design, the verifier kit and the node's client (the pallet is the Kreivo teammate's); the JAM statements service | 18.5–29 weeks |
 | **7** | **M3.9 Simplify and scale** | the anchoring protocol simplified (pin D′: one venue core, five outcomes on the node, no migration, no rotation, equivocation terminal); a scale test across the owner's LAN | 11.5–18 weeks |
-| **7** | **M4 Credential AIR** | slice 6's re-pin batch; the zkPVM Poseidon2 host call and chip; a credential actor keeping a Poseidon2 tree in its own rows; the credential AIR (format 44); the node's binary API and its gateway; its verifier at ingress; device secrets from the Android Keystore or a security key, the device library and a demo in s4's Android client; phone gates | 15.5–22 weeks |
-| **7** | **M5 Device profile** | the segment chips masked; the boundary-free device shape (format 45); levers 1–4; the CPU split by opcode family, word-level memory if needed; the Poseidon2 chip and the levers in the node's segment format (41), as its leaves allow; the ≤ 1 s phone gate | 22–33.5 weeks, 26–39.5 with word-level memory |
+| **7** | **M4 Credential AIR** | slice 6's re-pin batch; the zkPVM Poseidon2 host call; a credential actor keeping a Poseidon2 tree in its own rows; the credential AIR (format 44); the node's binary API and its gateway; its verifier at ingress; device secrets from the Android Keystore or a security key, the device library and a demo in s4's Android client; PG1 and PG3 | 15.5–22 weeks |
+| **7** | **M5 Device profile** | the segment chips masked; the boundary-free device shape and its Poseidon2 chip; the device io-hash over Poseidon2, the lean kernel, threads by core class, `h = 256` and the fork's NEON compression; the device program at ingress (format 46); the Poseidon2 chip and two cuts in the node's segment format (41); PG2. The CPU split and word-level memory left to the next slice's per-program CPU and word memory (S63) | 22–33.5 weeks |
 | **later** | **M6 Signature chips** | SHA-256, SHA-512, the bignum chip, the P-256 and Edwards drivers; moved past slice 7 by the owner (S1) | 8–14 weeks |
 
 - M0 runs on two tracks. Its critical path is 5.1 → 5.2 → 5.4, and
@@ -1590,9 +1802,8 @@ that narrows the inner proof makes folds cheaper too.
 - The Clerk across spaces follows slice 6.
 - Slice 7 is about 55–81 engineer-weeks, up to 87 with word-level memory,
   with its acceptance and the slice-6 items it carries
-  (`slice-7-mobile.md`, "Estimates"). Its 12–20 weeks for M4 and M5 here
-  before left out M3.9, the re-pins, the node API, the ingress verifier, the demo,
-  masking the segment chips and the CPU split.
+  (`slice-7-mobile.md`, "Estimates"); its record is
+  `slice-7-progress.md`.
 
 ## 12. Decisions
 
@@ -1639,6 +1850,25 @@ that narrows the inner proof makes folds cheaper too.
     no sooner than a crash would.
 15. **The JAM client is development tooling** (2026-10-23): `vos` and the
     node know no JAM (§6).
+16. **Slice 7's, on proving** (`research/slice-7/owner-decisions.md`):
+    - one chip set for the device format and the node's segment format,
+      as the kernel leaves allow, and no fold-shape change (S23, S32);
+    - the credential format 44: blowup 4, 47 queries, PoW 16, by the
+      phone's grind (S29, S57);
+    - a device proof authorizes what an auth proof does (S24);
+    - the gate on the phone: the auth statement in at most 1 s and 1 GiB
+      (S3, S20, S27), threads chosen by the library (S28);
+    - a device program's log sizes from the installed kernel's run on a
+      fixed public statement, computed alike by every node and the phone
+      (S61);
+    - the device format at `h = 256`, its argument checked by Fable, the
+      fork's NEON compression, cheap levers before the CPU split (S60,
+      S62);
+    - the seven zero columns dropped and logical right shifts through MUL
+      in formats 41 and 46; the per-program CPU and word-level memory to
+      the next slice; the 4-way CPU split not built (S63);
+    - the Poseidon2 chip's shape classes, (12, 8), (15, 8), (12, 17)
+      (S64).
 
 **Decided on the evidence, and the owner's to override:**
 - reads at the last anchored cut, to the space root;
@@ -1753,13 +1983,12 @@ counts as conjectured / proven at the reference shape [model]:
 | 44 | credential proofs, masked (variant (c)) | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 (62.92), on its masked shape | admitted |
 | 46 | device proofs, masked (variant (c)), `h = 256` | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 (62.82), on its masked shape | admitted |
 
-- **30 is retired unregistered** (slice 7's 7.10), and **42 retired**
-  (7.12): 44 counts credential proofs on their masked shape, PoW 16 at 47
-  queries, picked over 42's PoW 20 at 43 by the phone's grind (S29).
-  **37** retired unregistered when 43 registered (7.16), and **43
-  retired** (7.17d): 45 took its parameters at `h = 256`. **35 and 45
-  retired** (7.21): 41 and 46 take their parameters over the shared chip
-  set's current form, the node's segments with the Poseidon2 call.
+- **The credential and device numbers:** 30 and 37, reserved at unmasked
+  counts, are retired unregistered; 42 (credential proofs at 43 queries
+  and PoW 20) is retired, 44 picked over it by the phone's grind (S29); 43
+  (device proofs at `h = 512`) and 45 (at `h = 256`, before the two cuts)
+  are retired, 46 their successor over the shared chip set's current form.
+  Proofs were made under each, so none is registered again.
 - **Each entry** holds its channel, its parameters, the DEEP batching its
   proven floor assumes and both bit counts.
 - **Every entry uses A.3's encodings** and exactly its parameters.
@@ -1770,7 +1999,7 @@ counts as conjectured / proven at the reference shape [model]:
   62.74, their batching term binding.
 - **41 and 46 name the segment AIR,** hardened, without the columns and
   next-row masks no constraint reads (§3.2), its chip set shared by the
-  node's segments and the device shape (7.21); 28, 32 and 39 prove the
+  node's segments and the device shape; 28, 32 and 39 prove the
   recursion AIR, 32's leaves verifying the segment AIR, and 44 its `p2`
   and `qm31` alone. A reserved entry is
   refused until its AIR and channel exist. 32's exist from slice 5's 5.8:
@@ -1785,13 +2014,14 @@ counts as conjectured / proven at the reference shape [model]:
   names one AIR and one set of parameters". 40, spike 6a's blowup-64
   shape, is retired unregistered; 38 stays unassigned, the fixtures' "a
   number no format holds".
-- **24 to 27, 29, 31, 33 to 36, 40 and 45 are retired** (35 and 45 by
-  7.21, their chip set before the node shared it). 24 to 27 and 29
+- **24 to 27, 29, 31, 33 to 36 and 40 are retired.** 24 to 27 and 29
   named the segment AIR before its hardening, and 31, 33 and 34 the
   hardened AIR with its unread columns (31 at 44 queries); 36 named the
   legacy Blake2s segment format, once the default prover's and the
-  refine bundles': its parameters the proof's own under a
-  96-bit conjectured floor, no interaction PoW and the boundary states
+  refine bundles'; 35, the hardened AIR without its unread columns, before
+  the shared chip set: its parameters are 41's. 36's parameters were the
+  proof's own under a 96-bit conjectured floor, no interaction PoW and
+  the boundary states
   mixed a word at a time, 57 proven bits at its MOBILE shape, below the
   60-bit floor; 40 was never registered, but spike 6a's measured masked
   wrap at blowup 64 was made under it. They are refused and never
@@ -1839,15 +2069,19 @@ its hex, its `Debug` list and, for a number, its digits and byte orders:
   chance; what stays within the agent's replicas (their logs, blobs,
   stores, disks once stopped, frames) for proofs, memory roots, register
   files and the wrap's randomness, which no carrier may hold;
-- **the credentialed run** (slice 7's 7.22): a member's calls proved by
-  the device library and sent over the node API's socket, the node's HTTP
-  and a gateway over QUIC, refused at ingress in each way a device meets,
-  a device kernel's among them; needles the member's device secret (its
-  source's output, `w`, `s` and each word, the nullifier's key, their
-  hashes, a device kernel's arguments), a credential proof's masks as
-  drawn, and its place in the tree (its digest, its leaf, its slot, its
-  occupied siblings), the place searched in every carrier that leaves
-  but the path's own fetch; and the phone bench's lines and proofs;
+- **the credentialed run** (`node/host/tests/carriers/credentials.rs`):
+  a member's calls proved by the device library and sent over the node
+  API's socket, the node's HTTP and a gateway over QUIC, refused at
+  ingress in each way a device meets, a device kernel's among them;
+  needles the member's device secret (its source's output, `w`, `s` and
+  each word, the nullifier's key, their hashes, a device kernel's
+  arguments), a credential proof's masks as drawn, and its place in the
+  tree (its digest, its leaf, its slot, its occupied siblings), the place
+  searched in every carrier that leaves but the path's own fetch; and the
+  phone bench's lines and proofs. A run over small values (rows from
+  2^20) searches a number below 2^24 by its digits and hex alone. s4's
+  facility is audited in s4, through its C ABI and every freed heap block;
+  its known gaps are `identity-and-authority.md` §7's;
 - **the guards:** each capture path shown to capture by a canary; each
   needle found when planted in each of its forms; the audit's seams and
   the debug outputs reach no production build (`just
