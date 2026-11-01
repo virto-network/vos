@@ -36,7 +36,6 @@ const AMOUNT: u64 = 1;
 /// creation.
 pub const FORGET: Duration = Duration::from_secs(55 * 60);
 
-
 /// The methods the load calls, by name in the shard actor's schema.
 #[derive(Clone, Copy)]
 pub struct Methods {
