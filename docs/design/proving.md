@@ -1822,8 +1822,9 @@ its hex, its `Debug` list and, for a number, its digits and byte orders:
 - **the needles:** every segment, leaf and fold proof's roots, encoding
   and output digests; each segment's steps and the gas its re-run left;
   each boundary's memory roots and registers φ0..φ8; the served rows,
-  their salts, the cut's roots and paths, the private arguments and their
-  plain and domain-prefixed hashes; the masked wrap's randomness (each
+  their keys and salts, every value the run wrote, the cut's roots and
+  paths, the private arguments and their plain and domain-prefixed
+  hashes (a run over high-entropy values and a run over small ones); the masked wrap's randomness (each
   attempt's entropy and seed, the witness digest, the blinding values,
   the seeds of the mask, salt and `R` columns), shown by the prover's
   watch seam (`vos-pvm-recair`'s `watch`, a dev edge only); each debug
@@ -1838,6 +1839,15 @@ its hex, its `Debug` list and, for a number, its digits and byte orders:
   chance; what stays within the agent's replicas (their logs, blobs,
   stores, disks once stopped, frames) for proofs, memory roots, register
   files and the wrap's randomness, which no carrier may hold;
+- **the credentialed run** (slice 7's 7.22): a member's calls proved by
+  the device library and sent over the node API's socket, the node's HTTP
+  and a gateway over QUIC, refused at ingress in each way a device meets,
+  a device kernel's among them; needles the member's device secret (its
+  source's output, `w`, `s` and each word, the nullifier's key, their
+  hashes, a device kernel's arguments), a credential proof's masks as
+  drawn, and its place in the tree (its digest, its leaf, its occupied
+  siblings), the place searched in all but the path's own fetch; and the
+  phone bench's lines and proofs;
 - **the guards:** each capture path shown to capture by a canary; each
   needle found when planted in each of its forms; the audit's seams and
   the debug outputs reach no production build (`just

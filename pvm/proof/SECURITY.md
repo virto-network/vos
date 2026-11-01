@@ -419,18 +419,21 @@ testnet's own logs and database.
 searched (`node/checker/src/carriers/needles.rs`):
 - a byte needle needs at least 8 bytes, 4 of them distinct;
 - a number's forms need 4 distinct bytes, so most values below about
-  2^16 are dropped;
-- a single register and a trace row's value below 2^24 are not needles,
-  nor a step count of at most 255 or a power of two;
-- the served rows' keys are not needles, and of the rows a run wrote,
-  only those served are.
+  2^16 are searched by their digits and `0x` hex alone, each matched
+  whole;
+- a single register below 2^24 is not a needle, nor a step count of at
+  most 255 or a power of two, nor an M31 word of a device secret below
+  2^16;
+- a row's value below 2^24 is not a number's needle in a run of any
+  values; the run over small values (every row's value in
+  [2^16, 2^24)) searches each from 2^16, where a value's digits stop
+  being a log's ports, sizes and counts by chance.
 
-What compensates: each served value's salt and its plain and
-domain-prefixed hashes are needles; the served rows and the witness blobs
-are searched whole; the re-run's gas is a needle; and the audit's run
-writes high-entropy rows by design (`node/host/tests/carriers/audit.rs`),
-so its values clear the floor. The served keys and every written value as
-needles, and a run over small values, are carried.
+Every served row's key, value and salt and every value the run wrote,
+served or not, are needles; so are each served value's plain and
+domain-prefixed hashes, and the served rows and the witness blobs are
+searched whole. The audit runs twice: over high-entropy rows past 2^40,
+and over small values (`node/host/tests/carriers/audit.rs`).
 
 | carrier | what it carries | reach | checked by |
 |---|---|---|---|

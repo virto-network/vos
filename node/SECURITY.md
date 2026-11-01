@@ -164,6 +164,22 @@ serve its requests:
   nullifiers stay apart, since the scope names the space. The app shows and
   pins a space's handle at a member's first enrollment.
 
+**Audited** (`just test-carriers`, `node/host/tests/carriers/credentials.rs`):
+a member's sign-ins, `once` votes, payment and device kernel's sign-in,
+and ingress's refusals (a replay, `Once`, a cut proof, another call's
+arguments, an expired call, a retired format, a device proof to a guard
+naming no kernel, two frame errors), over the API's socket, the node's
+HTTP and a gateway over QUIC. No carrier holds the member's device
+secret (its source's output, `w`, `s` and each word, the nullifier's key,
+their hashes, a device kernel's arguments) or a proof's masks as drawn:
+every byte each connection carried, every request and answer, each
+node's log entries, work results, store, disk and frames, the device
+library's values as `Debug` and `Display` show them, and every log line
+of the nodes and the gateway at every level. And no carrier of a
+credentialed call holds where its member sits (its digest, its leaf, its
+path's occupied siblings): the call's bytes each way, its answers, its
+log entries, the logs. Only the path's fetch does, as above.
+
 ## The demo's SSH surface
 
 The gateway's SSH port serves s4's screens and the `vos-api` subsystem to
