@@ -371,6 +371,9 @@ async fn read_request(
         let mut headers = [httparse::EMPTY_HEADER; 32];
         let mut parsed = httparse::Request::new(&mut headers);
         match parsed.parse(buffer) {
+            // A head past the limit is refused, the read that completes it
+            // too.
+            Ok(httparse::Status::Complete(head)) if head > MAX_HEAD => return Ok(refuse(431)),
             Ok(httparse::Status::Complete(head)) => {
                 let mut request = Request {
                     method: parsed.method.unwrap_or_default().to_string(),
