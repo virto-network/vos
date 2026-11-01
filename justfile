@@ -320,9 +320,9 @@ e2e-chain: build-test-actors build-agent build-representative build-statement-se
 
 # A plain build of `vos` carries no faults: building the fault suite's
 # `vos` with the feature must not leak into it, and no workspace member
-# turns the feature on for vos-node.
-check-no-faults:
-    let resolved = (cargo tree --workspace -e features -i vos-node | complete); if $resolved.exit_code != 0 { print -e $resolved.stderr; error make { msg: "cargo tree failed" } }; if ($resolved.stdout | str contains 'feature "faults"') { error make { msg: "a workspace member enables vos-node's faults" } }
+# turns the feature on for vos-node, in any build's normal or build edges
+# for any target (`_forbidden`).
+check-no-faults: (_forbidden "faults")
     cargo build -p vos-cli
     if ((^target/debug/vos --version) | str contains "faults") { error make { msg: "a plain build of vos injects faults" } } else { print "no faults in a plain build of vos" }
 
@@ -336,6 +336,9 @@ check-no-faults:
 _forbidden +gates:
     let table = [ \
         [gate args features packages]; \
+        [faults "--workspace" [faults] []] \
+        [faults "-p vos-cli" [faults] []] \
+        [faults "-p vos-cli --features prover" [faults] []] \
         [jam-dev "-p vos-cli" [] [vos-jam-dev vos-jam]] \
         [jam-dev "-p vos-cli --features prover" [] [vos-jam-dev vos-jam]] \
         [jam-dev "-p vos-node" [] [vos-jam-dev vos-jam]] \
@@ -398,7 +401,18 @@ _seeded-masks-unimplied:
 # outputs' environment variables nor the instruction trace's message.
 _debug-names-absent:
     cargo build -p vos-cli --features prover
-    let binary = (open --raw target/debug/vos); for name in [GREY_PVM_DEBUG CPU_DUMP CPU_EXPR_DUMP ZKPVM_PROFILE pvm-inst] { if ($binary | bytes index-of ($name | into binary)) >= 0 { error make { msg: $"the node's binary names ($name)" } } }
+    just _names-absent target/debug/vos
+
+# `binary` names none of the debug outputs' environment variables nor the
+# instruction trace's message.
+_names-absent binary:
+    let path = '{{binary}}'; let binary = (open --raw $path); for name in [GREY_PVM_DEBUG CPU_DUMP CPU_EXPR_DUMP ZKPVM_PROFILE pvm-inst] { if ($binary | bytes index-of ($name | into binary)) >= 0 { error make { msg: $"($path) names ($name)" } } }; print $"($path) names no debug output"
+
+# The release build of the node's binary with the prover, the release
+# profile's code, scanned as `_debug-names-absent` scans the debug build.
+check-release-names:
+    with-env { CARGO_INCREMENTAL: "0" } { cargo build --release --locked -p vos-cli --features prover }
+    just _names-absent target/release/vos
 
 # The venue rules are written once, in `vos_anchor::venue`: no venue's
 # source outside its tests (the clients, jam-dev's commands among them)
@@ -629,7 +643,7 @@ fuzz secs="60":
 # Left to `just ci`: the slow fault runs (the five-process fault suite, the
 # fault build's process tests), the PVM vectors, the bench and prover
 # library tests, and the lints of other feature sets.
-check: fmt-check doc-check check-venue-rules check-no-std check-no-leaks check-kit build-test-actors build-agent build-representative build-credentials fuzz-replay
+check: fmt-check doc-check check-venue-rules check-no-std check-no-leaks check-no-faults check-kit build-test-actors build-agent build-representative build-credentials fuzz-replay
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     cargo clippy -p vos-venue --all-targets --quiet -- -D warnings
     just clippy-prover
@@ -654,14 +668,14 @@ test-reads:
 # planned stage of work.
 ci: fmt-check doc-check check-no-std clippy jar-check test vectors test-bench test-agent check-no-faults check-no-leaks check-kit fuzz-replay
 
-# The gate at a milestone: `ci` plus the prover suites, the soundness gates
-# (the leakage tests at their medium N), the bench tests that prove and the
-# fuzz targets a minute each. Run it under a 12 GiB limit, e.g.
+# The gate at a milestone: `ci` plus the release binary's scan, the prover
+# suites, the soundness gates (the leakage tests at their medium N), the
+# bench tests that prove and the fuzz targets a minute each. Run it under a 12 GiB limit, e.g.
 # `systemd-run --user --scope -p MemoryMax=12G -p MemorySwapMax=0 just ci-full`.
 # Run alone on the machine, its builds may take `CARGO_BUILD_JOBS` 8 to 12:
 # the proving tests keep their own thread limits (`test-proof`'s
 # `--test-threads`), so the peak stays under the cap.
-ci-full: ci test-proof test-bench-proof (fuzz "60")
+ci-full: ci check-release-names test-proof test-bench-proof (fuzz "60")
 
 # The gate at a slice's end: `ci-full`'s, with the leakage tests at their
 # full N (2,000 proofs a witness on the small circuit, 32 on the real wrap,
@@ -678,6 +692,7 @@ slice-gate: ci test-bench-proof
 release:
     with-env { CARGO_INCREMENTAL: "0" } { cargo build --release --locked --target x86_64-unknown-linux-musl -p vos-cli }
     with-env { CARGO_INCREMENTAL: "0" } { cargo build --release --locked --target x86_64-unknown-linux-musl -p vos-scale }
+    just _names-absent target/x86_64-unknown-linux-musl/release/vos
 
 # Use the repository's hooks: fmt and clippy before commits, `just ci`
 # before pushes.
