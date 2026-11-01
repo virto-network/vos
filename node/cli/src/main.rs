@@ -136,14 +136,24 @@ impl RunArgs {
     /// Run the node until it is killed.
     fn serve(self) -> Result<(), String> {
         // The node's log, on stderr: `VOS_LOG` names the level, `info`
-        // unless it says otherwise.
+        // unless it says otherwise. The prover library's lines (a proof's
+        // size estimates) at `warn` at most.
+        use tracing_subscriber::filter::{LevelFilter, Targets};
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
         let level = std::env::var("VOS_LOG")
             .ok()
             .and_then(|level| level.parse().ok())
-            .unwrap_or(tracing_subscriber::filter::LevelFilter::INFO);
+            .unwrap_or(LevelFilter::INFO);
         tracing_subscriber::fmt()
             .with_writer(std::io::stderr)
             .with_max_level(level)
+            .finish()
+            .with(
+                Targets::new()
+                    .with_default(level)
+                    .with_target("stwo", level.min(LevelFilter::WARN)),
+            )
             .init();
         let mut config = Config::new(link(&self.agent)?);
         config.ingress_tls = self.tls.ingress();
