@@ -12,8 +12,12 @@
 //! node wrote, each agent's log entries and work results, and the prover
 //! worker's table.
 //!
-//! Run alone in its process (`just test-carriers`): it captures the whole
-//! process's logs.
+//! The run goes twice: over rows of high-entropy values, and over small
+//! values. [`credentials`] audits a member's credentialed calls, its
+//! device secret and its place in the tree.
+//!
+//! Run alone in its process (`just test-carriers`), its tests one at a
+//! time: each captures the whole process's logs.
 
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -33,4 +37,9 @@ const BOUNDS: common::Bounds = common::Bounds {
 #[path = "../cluster/support.rs"]
 mod support;
 
+#[allow(dead_code)]
+#[path = "../served/harness.rs"]
+mod harness;
+
 mod audit;
+mod credentials;

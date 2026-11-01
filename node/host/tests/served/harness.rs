@@ -255,6 +255,11 @@ impl Cluster {
         *slot.held.lock().unwrap() = Some(HeldPort::tcp(slot.ingress));
     }
 
+    /// Node `number`'s data directory.
+    pub fn dir(&self, number: NodeNumber) -> &std::path::Path {
+        self.slot(number).dir.path()
+    }
+
     /// Node `number`'s ingress address.
     pub fn ingress(&self, number: NodeNumber) -> SocketAddr {
         self.slot(number).ingress

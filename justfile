@@ -111,11 +111,17 @@ test-proof: build-test-actors judge-wasm
 # The carrier audit (`proving.md` §5's R7, `vos_checker::carriers`):
 # three nodes proving a read's statement with the masked prover, every
 # debug output's environment set, and every carrier of the run searched for
-# the proof's internals, the served rows and their hashes; alone in its
-# process, which it captures whole (its logs at every level, its standard
-# error). About two minutes and 6 GiB.
-test-carriers: build-test-actors build-agent build-representative
-    cargo test -p vos-node --features disclosing --test carriers audit:: -- --nocapture --test-threads=1
+# the proof's internals, the served rows, their keys, every value written
+# and their hashes, once over wide values and once over small ones; and a
+# member's credentialed calls over the node API's socket, the node's HTTP
+# and a gateway over QUIC, every carrier searched for its device secret,
+# its proofs' masks and its place in the tree. Its tests one at a time in
+# one process, which they capture whole (its logs at every level, its
+# standard error). Then the phone bench's lines and proofs searched for
+# its member's secret. About eight minutes and 6 GiB.
+test-carriers: build-test-actors build-agent build-representative build-credentials
+    cargo test -p vos-node --features disclosing --test carriers -- audit:: credentials:: --nocapture --test-threads=1
+    cargo test -p vos-phone --test outputs -- --nocapture
 
 # The golden fixtures (`pvm/proof/fixtures`) judged in Wasm, by the final
 # verifier's blobs built as a runtime builds them, under the PVF's semantics
