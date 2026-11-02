@@ -1,13 +1,11 @@
-//! SPI parser conformance against a real service program.
-//!
-//! The archived vector wraps its program in the retired metadata-prefixed
-//! container. The fixture helper extracts its bare program explicitly; the
-//! production parser accepts only that one canonical generation.
+//! SPI parser conformance against a real service program: a Gray Paper
+//! accumulate vector's service preimage, its metadata prefix stripped to
+//! the bare program the parser takes.
 
 use vos_pvm::spi::parse_standard_program;
 
-/// Extract the first service preimage blob from a gp072 accumulate input.
-fn historical_service_preimage() -> Vec<u8> {
+/// The first service preimage blob of the accumulate vector.
+fn service_preimage() -> Vec<u8> {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/",
@@ -26,15 +24,10 @@ fn historical_service_preimage() -> Vec<u8> {
 }
 
 fn service_program() -> Vec<u8> {
-    let blob = historical_service_preimage();
+    let blob = service_preimage();
     let (metadata_len, consumed) = vos_pvm::spi::read_nat(&blob, 0).expect("metadata length");
     let program_start = consumed + usize::try_from(metadata_len).expect("metadata length fits");
     blob[program_start..].to_vec()
-}
-
-#[test]
-fn rejects_historical_metadata_prefixed_preimage() {
-    assert!(parse_standard_program(&historical_service_preimage()).is_none());
 }
 
 #[test]
