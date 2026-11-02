@@ -70,7 +70,7 @@ fn every_program_calls_only_its_surface() {
 }
 
 /// The JAM-only host charges PolkaJam's prices where they differ from the
-/// Gray Paper's base, as the probe in `spikes/sj-jam-b` measured them:
+/// Gray Paper's base, as measured against PolkaJam:
 /// `gas` 48, `log` 1,000 and answering `WHAT`, a call it does not serve
 /// 1,000, a segment's `fetch` 171 (Gray Paper 0.8.0's per-kind price of an
 /// import), an `export` 3,521, and

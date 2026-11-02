@@ -1,21 +1,21 @@
 #!/bin/sh
 # p7.sh <old vos-phone-timing> <new vos-phone-timing> <lean> <bench> <out.txt>:
-# format 45 on the gate phone, over adb (P7_SERIAL, the gate phone's by
-# default): the device format's `h = 256` and Stwo's NEON Blake2s compress,
-# each alone and together, against P6's lean baseline.
+# two timing builds A/B on the gate phone, over adb (P7_SERIAL, the gate
+# phone's by default): the mask height `h = 256` against 512 and Stwo's NEON
+# Blake2s compress against the scalar one, each alone and together.
 #
-# - <old vos-phone-timing>: P6's timing build (format 43, `h = 512`, the
-#   scalar Blake2s compress); <new vos-phone-timing>: `tools/phone/build.sh`'s
-#   timing build at format 45 (`h = 256`, Stwo's NEON compress16);
-# - <lean>: the lean device kernel (1,722 steps), `p2.kernel` and `p2.input`;
+# - <old vos-phone-timing>: a timing build with the scalar Blake2s compress;
+#   <new vos-phone-timing>: `tools/phone/build.sh`'s timing build (Stwo's
+#   NEON compress16);
+# - <lean>: the lean device kernel, `p2.kernel` and `p2.input`;
 # - <bench>: Stwo's `blake2s_compress_bench` example for aarch64 Android.
 #
 # Three rounds, each interleaving four runs of 5 proofs after a warm-up,
 # every proof verified on the phone, automatic threads:
-# 1. A: the old build, `h = 512` (P6's `lean`);
-# 2. B: the old build, `h = 256` (`p2/2:47:16:8`, P6's `h256`);
+# 1. A: the old build, `h = 512` (`p2/2:47:16:9`);
+# 2. B: the old build, `h = 256` (`p2/2:47:16:8`);
 # 3. C: the new build, `h = 512` (`p2/2:47:16:9`): NEON alone;
-# 4. D: the new build, its default (`h = 256`): format 45 as shipped;
+# 4. D: the new build, its default (`h = 256`);
 # then the microbench single-threaded: the 16-way compress old against new
 # on the prime core (cpu7) and on a little core (cpu0), and the Merkle
 # layer on the prime core. The battery, the temperature, the free memory
@@ -64,7 +64,7 @@ trap 'exit 130' INT TERM HUP
   $a shell chmod 755 $dir/vos-phone-old $dir/vos-phone $dir/blake2s_compress_bench
   $a shell sha256sum $dir/vos-phone-old $dir/vos-phone $dir/blake2s_compress_bench $dir/lean/p2.kernel
   for n in 1 2 3; do
-    run "round $n, A (old, h=512)" ./vos-phone-old device $cells --cells p2/2:47:16/b2sm31
+    run "round $n, A (old, h=512)" ./vos-phone-old device $cells --cells p2/2:47:16:9/b2sm31
     run "round $n, B (old, h=256)" ./vos-phone-old device $cells --cells p2/2:47:16:8/b2sm31
     run "round $n, C (new, h=512)" ./vos-phone device $cells --cells p2/2:47:16:9/b2sm31
     run "round $n, D (new, default)" ./vos-phone device $cells --cells p2/2:47:16/b2sm31

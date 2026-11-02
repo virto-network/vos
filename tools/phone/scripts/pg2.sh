@@ -1,6 +1,6 @@
 #!/bin/sh
 # pg2.sh <vos-phone> <out.txt> [rounds]: phone gate PG2's acceptance at a
-# space's ingress (slice 7's 7.20), the gate phone over adb.
+# space's ingress, the gate phone over adb.
 #
 # The host runs one node of a founded space (`cargo run --release -p
 # vos-node --example device_ingress`): the credential actor and the device
@@ -8,7 +8,7 @@
 # writes the device kernel's witness input for a sign-in to the device
 # actor's `login`, good for 110 s by the node's clock; the phone proves it
 # with `vos-phone kernel` (the device library's `DeviceProgram::auth` and
-# `Prover::prove_kernel`, format 43, automatic threads), verifies it there
+# `Prover::prove_kernel`, the device format, automatic threads), verifies it there
 # and writes its bytes; the host pulls them and sends them to the node's
 # ingress, which must run the call as the member's pseudonym. Battery,
 # temperature and free memory are recorded before each round; what was
