@@ -14,7 +14,7 @@ use vos_wire::result::Write;
 
 const AGENT: AgentId = AgentId(1);
 const ROWS: u64 = 1_000;
-/// Small memtables, sealed and flushed every few commits: the flushes,
+/// Small memtables, sealed and flushed every score of commits: the flushes,
 /// and the compactions of the tables they write, run beside the reads
 /// however slowly the commits go.
 const MEMTABLE_BYTES: u64 = 2 << 20;
@@ -80,8 +80,7 @@ fn snapshots_never_see_part_of_a_commit() {
     let mut checks = 0u64;
     while rotations < ROTATIONS || checks < CHECKS {
         // A bound that fails the test rather than hang it, should the
-        // memtables stop rotating: at a load of 40 on 22 cores the test
-        // takes about 5 s.
+        // memtables stop rotating; a loaded host takes seconds.
         assert!(
             started.elapsed() < Duration::from_secs(120),
             "the memtable rotated {rotations} times, {checks} snapshots checked"

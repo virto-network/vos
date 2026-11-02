@@ -454,6 +454,10 @@ fn leading_some(cluster: &Cluster, number: NodeNumber, agents: &[AgentId]) -> Ve
             return true;
         }
         let other = cluster.leader(agents[0]);
+        // Moved to it since: read again.
+        if other == number {
+            return false;
+        }
         let moved: Vec<AgentId> = agents
             .iter()
             .copied()

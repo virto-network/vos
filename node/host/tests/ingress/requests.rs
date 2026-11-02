@@ -79,7 +79,7 @@ fn a_duplicate_in_flight_waits_for_its_answer() {
         std::thread::spawn(move || served.increment(&client, 1, 5))
     };
     wait_until("the second waits on the first", || {
-        served.node.calls_in_flight() == 2
+        served.node.calls_in_flight() == 2 || second.is_finished()
     });
     drop(closed);
     assert_eq!(done(first.join().unwrap()), 5);
@@ -129,17 +129,19 @@ fn a_request_not_consumed_is_resent_with_its_sequence() {
         let (served, client) = (Arc::clone(&served), Arc::clone(&client));
         std::thread::spawn(move || served.increment(&client, sequence, sequence))
     };
-    let queued = |calls| {
+    // Queued, or answered at once: then its answer fails the test, rather
+    // than the wait.
+    let queued = |calls, sent: &std::thread::JoinHandle<Response>| {
         wait_until(&format!("{calls} calls queued"), || {
-            served.node.calls_in_flight() == calls
+            served.node.calls_in_flight() == calls || sent.is_finished()
         })
     };
     let first = send(1);
     wait_until("the first is refined", || gate.refines.reached() > 0);
     let second = send(2);
-    queued(2);
+    queued(2, &second);
     let third = send(3);
-    queued(3);
+    queued(3, &third);
     // The batch of 2 and 3 will wait at its commit, so they stay in flight.
     let commits = gate.commits.close();
     let reached = gate.commits.reached();
@@ -150,7 +152,7 @@ fn a_request_not_consumed_is_resent_with_its_sequence() {
     });
     // Resent while 2 and 3 are in flight: the lane went back to before 1.
     let resent = send(1);
-    queued(3);
+    queued(3, &resent);
     drop(commits);
     assert_eq!(second.join().unwrap(), Response::Refused(Refusal::Sequence));
     assert_eq!(third.join().unwrap(), Response::Refused(Refusal::Sequence));

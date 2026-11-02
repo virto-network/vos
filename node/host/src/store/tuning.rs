@@ -20,8 +20,9 @@ pub struct Tuning {
     pub hash_ratio: f32,
     /// Keep every level's filter and index blocks in the cache.
     pub pin_all: bool,
-    /// The size past which its active memtable is sealed and flushed:
-    /// fjall's default, 64 MiB.
+    /// The size past which the partition's active memtable is sealed and
+    /// flushed: fjall's default, 64 MiB. Kept with the partition when it is
+    /// created, so it tunes a new store only.
     pub memtable_bytes: u64,
 }
 

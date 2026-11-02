@@ -267,12 +267,9 @@ fn a_held_writer_reports_a_stall_until_it_drains() {
     // Stalled once the commit has waited past the 50 ms, however late its
     // thread reaches the writer; the bound only fails a writer that never
     // reports one.
-    let until = std::time::Instant::now() + Duration::from_secs(30);
+    let until = Instant::now() + Duration::from_secs(30);
     while !writer.stalled() {
-        assert!(
-            std::time::Instant::now() < until,
-            "the writer never stalled"
-        );
+        assert!(Instant::now() < until, "the writer never stalled");
         std::thread::sleep(Duration::from_millis(5));
     }
     hold.0.store(false, Ordering::Relaxed);

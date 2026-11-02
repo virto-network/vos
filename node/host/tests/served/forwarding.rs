@@ -214,8 +214,9 @@ fn a_resend_of_a_queued_first_call_joins_it_past_the_skew() {
         std::thread::sleep(Duration::from_millis(2_000));
         let second = scope.spawn(|| post_within(target, &path, &body, ANSWERED));
         let node = cluster.node(leader).unwrap();
+        // Joined, or answered at once: then its answer fails the test.
         wait_until("the resend joins the first", ANSWERED, || {
-            node.calls_in_flight() == 2
+            node.calls_in_flight() == 2 || second.is_finished()
         });
         drop(node);
         drop(closed);
