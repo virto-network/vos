@@ -260,9 +260,8 @@ fn the_scope_and_the_binding_name_the_call() {
     );
 }
 
-/// Auth, owner and membership and payment prove and verify against their
-/// calls; each is refused against another call, another name, another
-/// format or another kind's words.
+/// A method's id and a transfer's arguments are what the node derives and
+/// decodes.
 #[test]
 fn a_method_id_and_a_transfer_s_arguments_are_the_node_s() {
     assert_eq!(vos_device::method_id("increment"), 0xf251_d1d4);
@@ -288,6 +287,9 @@ fn a_method_id_and_a_transfer_s_arguments_are_the_node_s() {
     );
 }
 
+/// Auth, owner and membership and payment prove and verify against their
+/// calls; each is refused against another call, another name, another
+/// format or another kind's words.
 #[test]
 fn each_proof_verifies_against_its_call_alone() {
     let prover = prover();

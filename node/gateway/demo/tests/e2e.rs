@@ -50,7 +50,9 @@ impl Source for Software {
         Box::pin(async move {
             let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&self.0).expect("any key");
             mac.update(&input);
-            Ok(Output::new(mac.finalize().into_bytes().into()))
+            Ok(Output::new(zeroize::Zeroizing::new(
+                mac.finalize().into_bytes().into(),
+            )))
         })
     }
 }
