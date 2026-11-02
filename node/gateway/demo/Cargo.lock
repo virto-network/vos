@@ -4896,7 +4896,6 @@ dependencies = [
 name = "vos-pvm-proof"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "impl-trait-for-tuples",
  "num-traits",
  "rayon",
