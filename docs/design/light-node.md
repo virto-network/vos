@@ -476,8 +476,10 @@ strongly consistent delivery service; the rule is the `messaging` branch's
   first unlock, malware in the app's process) can touch the group's keys:
   committing needs the owner's biometric, and a probation device commits
   nothing.
-- **Allowed proposals:** Add, Remove and Update, nothing else: no ReInit,
-  no external commit or join, no PSK, no group-context change. The
+- **Allowed proposals:** Add and Remove, by value, in a commit with a
+  path; a device's `update` is its own commit with a path and no
+  proposals. Nothing else: no ReInit, no external commit or join, no PSK,
+  no group-context change. The
   declared effect (`update`, `add(d)`, `remove(d₁, …)`) names matured,
   admin-signed device-set operations for every Add and Remove (§3.5),
   which the agent checks; **a commit may carry every matured removal at
@@ -640,15 +642,16 @@ the S8-P1 session]:
 | secret | what for | held as |
 |---|---|---|
 | the member secret `s` of each space | membership proofs (auth, owner) | derived at each use from the keystore's HMAC over the space's handle, behind the prompt (a biometric or the PIN), as today [built, `identity-and-authority.md` §7]; in the process during a use, as that design states |
-| the **admin key** (Ed25519) | the client key of admin calls: device-set operations and commits | **a Keystore signing key in the TEE**, never leaving it: per-use authentication by a strong biometric (`setUserAuthenticationParameters(0, AUTH_BIOMETRIC_STRONG)`), with key attestation where the phone offers it. On Android 13 and later only: KeyMint's TEE implementations must support curve 25519 for signing (Ed25519) and StrongBox implementations do not support it (`IKeyMintDevice.aidl`), so the key lives in the TEE, not StrongBox. On a phone with no strong biometric, or on Android 11–12, the device is a **delayed admin** (below) |
+| the **admin key** (Ed25519) | the client key of admin calls: device-set operations and commits | **a Keystore signing key in the TEE**, never leaving it: per-use authentication by a strong biometric (`setUserAuthenticationParameters(0, AUTH_BIOMETRIC_STRONG)`), with key attestation where the phone offers it. **Decided by capability, not by version:** the app makes the admin key as a keystore Ed25519 key and reads its attestation; the device is a strong admin only if the key is hardware-backed (attested security level TEE) and a Class 3 biometric is enrolled. KeyMint's TEE implementations must support curve 25519 for signing and StrongBox implementations do not (`IKeyMintDevice.aidl`), so the key lives in the TEE. Ed25519 appears with KeyMint 2 (Android 13), but a newer framework over older TEE firmware (a custom ROM over Keymaster, such as a Pixel 1 on LineageOS 15) has none, or only keystore2's software fallback. Such a device, and any device without a Class 3 biometric, is a **delayed admin** (below) |
 | the **sync key** (ed25519) | the client key at the personal agent; signing DAG nodes and confirmations | wrapped under a keystore key usable **after the first unlock** since boot, no per-use prompt, no unlocked-screen requirement: background sync runs on a locked phone |
 | the MLS state, the key archive, `R` | sealing and opening envelopes, processing commits | the same after-first-unlock wrap; kept out of Android's backups (§8, A11) |
 
 - **Ed25519 only** [proposed]: ingress client keys are ed25519
   (`agent/wire/src/ingress.rs`), and an admin key is a client key, so
   admin keys are Ed25519 too. A second client-key curve (P-256) at ingress
-  would serve only Android 11–12 phones, at the cost of new ingress code
-  and its carrier and fuzz cover; those phones are delayed admins instead.
+  would serve only phones whose TEE has no Ed25519, at the cost of new
+  ingress code and its carrier and fuzz cover; those phones are delayed
+  admins instead.
   The device set records whether each admin key's attestation showed a
   TEE key requiring a strong biometric, and the chrome shows an unattested
   one.
@@ -659,9 +662,9 @@ the S8-P1 session]:
   app's process cannot reach it.
 - **Delayed admins:** a device that cannot hold the admin key as above
   administers anyway, under a delay: on a phone without a strong
-  biometric its TEE key is authenticated by the PIN; on Android 11–12,
-  whose keystore has no Ed25519, the admin key is a software Ed25519 key
-  wrapped under a per-use-authenticated keystore key, so it is in the
+  biometric its TEE key is authenticated by the PIN; on a phone whose
+  TEE has no Ed25519, the admin key is a software Ed25519 key wrapped
+  under a per-use-authenticated AES keystore key, so it is in the
   process during each use. Either way every operation it signs, adds
   included, waits 72 h and can be contested (its commits carry only
   operations already matured), which bounds what malware that captures
