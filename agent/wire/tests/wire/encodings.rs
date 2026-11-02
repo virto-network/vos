@@ -2,7 +2,7 @@
 //! PolkaJam.
 
 use vos_wire::abi::Failure;
-use vos_wire::batch::{Admin, Answer, Await, Batch, Body, Input, Message};
+use vos_wire::batch::{Admin, Answer, Await, Batch, Body, Input, Merge, Message, Work};
 use vos_wire::ids::{
     AgentId, InstanceId, MapId, MethodId, Principal, ProgramHash, Session, SessionId, WorkflowId,
     derive_id,
@@ -971,4 +971,37 @@ fn packages_keep_their_bytes() {
     ]
     .concat();
     assert_eq!(exports.encode(), bytes);
+}
+
+/// A merge's work: variant 3, its fields in order; a merge's step names
+/// its input as variant 10, with no fields.
+#[test]
+fn a_merge_encodes_in_field_order() {
+    let merge = Merge {
+        version: 1,
+        time: 2,
+        seed: [3; 32],
+        caller: Principal::Client([4; 32]),
+        instance: InstanceId(5),
+        method: MethodId(6),
+        arguments: vec![7],
+    };
+    let bytes = [
+        &[3][..],
+        &1u64.to_le_bytes(),
+        &2u64.to_le_bytes(),
+        &[3; 32],
+        &[0],
+        &[4; 32],
+        &5u32.to_le_bytes(),
+        &6u32.to_le_bytes(),
+        &1u32.to_le_bytes(),
+        &[7],
+    ]
+    .concat();
+    let work = Work::Merge(merge);
+    assert_eq!(work.encode(), bytes);
+    assert_eq!(work.batch(), None);
+    round_trip(&work);
+    assert_eq!(InputRef::Merge.encode(), [10]);
 }

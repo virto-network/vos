@@ -1,7 +1,8 @@
 //! Refine: a batch's inputs as steps, each an actor invocation served
 //! against overlays of this refine's writes, or a workflow's step; or a
-//! query on applied state. On JAM, a batch comes as a package with the
-//! witness of the state it touches ([`jam`]).
+//! query on applied state; or a merge, a device's call with no log
+//! ([`merge`]). On JAM, a batch comes as a package with the witness of the
+//! state it touches ([`jam`]).
 
 mod admin;
 mod base;
@@ -11,6 +12,7 @@ mod credentialed;
 mod inputs;
 mod invocation;
 mod jam;
+mod merge;
 mod sessions;
 mod snapshots;
 mod workflows;
@@ -55,6 +57,7 @@ pub fn run(arguments: &[u8]) -> Vec<u8> {
         }
         Work::Query(query) => run_query(agent, query).encode(),
         Work::Package(package) => jam::run(agent, package),
+        Work::Merge(call) => merge::run(agent, call),
     }
 }
 

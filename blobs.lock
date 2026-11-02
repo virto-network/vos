@@ -4,7 +4,7 @@
 4b315e09a9147b06226c47b9d2b398f3ad4af31a1a514a0006d9bafad845096f  target/riscv64em-vos/release/final-verify.elf
 9889779bf69b25d869a5e1b9e3d7a1b45e66b8a363de66140ed8e112bcd7f369  target/riscv64em-vos/release/final-verify-test.elf
 a60473356976a2322b1fc3955b45bc8c3939a05cfd221d709fd4d5b6870495f9  target/riscv64em-vos/release/statement-service.elf
-f296c0d9e9a5bb35b885f1641173f702bf03f7e0cf25d820804b6f8bd0c92b79  agent/programs/target/riscv64em-vos/release/vos-agent.elf
+2299e05bd66815210c5a9ddf6016c40280bc1ea76ae2e224bbbaa902a5bd614a  agent/programs/target/riscv64em-vos/release/vos-agent.elf
 7b88fe03e7dc51c7bea81bf26a16318199457e64e2b01210122655b53cca46a3  agent/programs/target/riscv64em-vos/release/vos-representative.elf
 44af1b301841a8832766ca7983cc36665b006a2feb58d6574e7b808b04c67a66  agent/programs/target/riscv64em-vos/release/vos-credentials.elf
 7ce698a05ad8f542c8c967224ef5e7aadfdb7d9d975ee3396b2f2ab691685135  pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm

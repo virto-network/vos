@@ -14,7 +14,7 @@ use crate::result::Outcome;
 use crate::served::AgentPath;
 
 /// A refine's work item payload: a batch through the log, a query on
-/// applied state, or a batch on JAM.
+/// applied state, a batch on JAM, or a merge on a device.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Work {
     /// Refine returns the encoded [`crate::result::WorkResult`].
@@ -29,6 +29,10 @@ pub enum Work {
     /// result and its pages.
     #[codec(index = 2)]
     Package(crate::package::Package),
+    /// Refine returns the encoded [`crate::result::WorkResult`] of the
+    /// merge's one step, and an empty page section, as for a batch.
+    #[codec(index = 3)]
+    Merge(Merge),
 }
 
 impl Work {
@@ -47,7 +51,7 @@ impl Work {
         match self {
             Work::Batch(batch) => Some(batch),
             Work::Package(package) => Some(&package.batch),
-            Work::Query(_) => None,
+            Work::Query(_) | Work::Merge(_) => None,
         }
     }
 }
@@ -63,6 +67,23 @@ fn tagged(index: u8, value: &impl Encode) -> Vec<u8> {
 /// are the last applied work result's.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Query {
+    pub time: u64,
+    pub seed: [u8; 32],
+    pub caller: Principal,
+    pub instance: InstanceId,
+    pub method: MethodId,
+    pub arguments: Vec<u8>,
+}
+
+/// A call on a device, with no log (`core-model.md` §9.2): its handler runs
+/// on the state as it stands, version `version`, at the device's time and
+/// seed, and its step is the work result the device applies in one batch.
+/// The step may only write rows: a handler that sends a message, attests,
+/// writes a committed map or starts a workflow fails `Trapped`, with
+/// nothing written.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Merge {
+    pub version: u64,
     pub time: u64,
     pub seed: [u8; 32],
     pub caller: Principal,

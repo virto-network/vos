@@ -233,7 +233,7 @@ fn the_binding_and_the_scope_are_their_fields_hashes() {
     );
     let words = credentials::compress(&Tag::Scope.block(), &credentials::reduced(&hash));
     assert_eq!(scope, credentials::digest(&words));
-    // The device library's vector (`vos-device`'s `SCOPE_VECTOR`): the
+    // The device library's vector (`vos-light`'s `SCOPE_VECTOR`): the
     // name in SCALE, as `proving.md` §8 pins it.
     assert_eq!(
         credentials::scope(&SpaceId([0x51; 32]), AgentId(4), InstanceId(2), b"login"),
