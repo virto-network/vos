@@ -53,6 +53,9 @@ pub struct Path {
 ///
 /// Every bit pattern of its size is a valid value, it holds no padding, no
 /// pointer and no interior mutability, and its alignment is at most eight.
+/// Its `Encode` and `Decode`, where it has them, are its bytes
+/// ([`encode_in_place`], [`decode_in_place`]): a client encodes a device
+/// kernel's message by value and the kernel reads the same bytes in place.
 pub unsafe trait InPlace: Copy + 'static {}
 
 // SAFETY: plain integers and arrays of in-place values, with no padding.
@@ -71,7 +74,8 @@ unsafe impl<T: InPlace, const N: usize> InPlace for [T; N] {}
 /// The `T` at `*at` in `input`, in place, its end then `*at`: a device
 /// kernel's argument by reference, which [`InPlace`]'s size, a multiple of
 /// eight bytes, keeps the next one aligned after. Bytes too few, or not at
-/// `T`'s alignment, trap.
+/// `T`'s alignment, trap: on the PVM a kernel's witness input starts
+/// page-aligned, and a caller elsewhere must hand it 8-aligned bytes.
 #[inline(always)]
 pub fn in_place<'a, T: InPlace>(input: &'a [u8], at: &mut usize) -> &'a T {
     const {

@@ -2,7 +2,8 @@
 //! (`light-node.md` §4.2): `auth` and `owner` as a developer writes them,
 //! their arguments by reference read in place and their hashes
 //! `vos_sdk::p2`'s, measured against the hand-lean kernels' steps (the
-//! `device` test actor's `auth`, and `owner_lean` here).
+//! `device` test actor's `auth`, and `owner_lean` here: owner by hand over
+//! `p2`'s call and word accesses alone).
 //!
 //! Each claim is the kernel's public arguments: auth's `map_root`,
 //! `scope`, `nullifier` and the call's `binding`, owner's `owner` and
@@ -35,7 +36,9 @@ pub struct OwnerClaim {
 }
 
 /// `N` bytes of a kernel's arguments where its witness input left them,
-/// decoded as their address: the hand-lean kernel's argument.
+/// decoded as their address: the hand-lean kernel's argument. Valid only
+/// while the bytes it was decoded from live, which a kernel's arguments do
+/// for its run; nothing else may encode one.
 #[derive(Clone, Copy)]
 pub struct Raw<const N: usize>(*const u8);
 

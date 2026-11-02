@@ -1,0 +1,13 @@
+error: a device kernel's argument by reference is `&T`, read in place for its run
+  --> tests/compile_fail/device_reference_mut.rs:15:26
+   |
+15 |     pub fn touch(digest: &mut Digest) {
+   |                          ^^^^^^^^^^^
+
+warning: unused import: `vos_sdk::p2::Digest`
+ --> tests/compile_fail/device_reference_mut.rs:1:5
+  |
+1 | use vos_sdk::p2::Digest;
+  |     ^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default

@@ -37,8 +37,9 @@ pub(crate) fn in_place_impl(input: DeriveInput) -> syn::Result<Tokens> {
     };
     Ok(quote! {
         // SAFETY: `#[repr(C)]` of in-place fields, which the bounds below
-        // check, and no padding, which the size's assertion checks: every
-        // bit pattern is a value, and its alignment its fields' largest.
+        // check, no padding and an alignment of at most eight, which the
+        // assertions check: every bit pattern is a value. Its encoding,
+        // below, is its bytes.
         unsafe impl ::vos_sdk::p2::InPlace for #name
         where
             #(#types: ::vos_sdk::p2::InPlace,)*
@@ -48,6 +49,11 @@ pub(crate) fn in_place_impl(input: DeriveInput) -> syn::Result<Tokens> {
         const _: () = ::core::assert!(
             ::core::mem::size_of::<#name>() == 0 #(+ ::core::mem::size_of::<#types>())*,
             "an in-place struct holds no padding"
+        );
+
+        const _: () = ::core::assert!(
+            ::core::mem::align_of::<#name>() <= 8,
+            "an in-place struct is aligned to eight bytes at most"
         );
 
         impl ::vos_sdk::Encode for #name {

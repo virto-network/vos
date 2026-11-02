@@ -111,7 +111,8 @@ fn device_steps(blob: &[u8], input: &[u8], public: &[u8]) -> usize {
 
 /// The credential statements written with the SDK (`light-node.md` §4.2,
 /// the `sdk-device` test actor) run within 1.15× the hand-lean kernels'
-/// steps: auth beside the `device` actor's, on the same statement, and
+/// steps: auth beside the `device` actor's, the same credential statement
+/// in its own layout (an eight-byte slot, a claim with no kind byte), and
 /// owner beside `owner_lean`; a wrong claim traps each.
 #[test]
 fn sdk_form_kernels_run_within_the_lean_kernels_steps() {
@@ -140,10 +141,13 @@ fn sdk_form_kernels_run_within_the_lean_kernels_steps() {
         "owner: {sdk_owner} against {lean_owner}"
     );
     assert!(sdk_auth < 1 << 11, "auth: {sdk_auth} steps");
-    let mut wrong = input.clone();
-    let nullifier = wrong.len() - 64;
-    wrong[nullifier] ^= 1;
-    assert!(trace_kernel(&sdk, &wrong, 50_000_000).is_err());
+    for field in [128, 64] {
+        // The claim's `map_root`, then its `nullifier`.
+        let mut wrong = input.clone();
+        let at = wrong.len() - field;
+        wrong[at] ^= 1;
+        assert!(trace_kernel(&sdk, &wrong, 50_000_000).is_err());
+    }
     let mut wrong = owner_input.clone();
     wrong[32] ^= 1;
     assert!(trace_kernel(&kernel("sdk-device", "owner"), &wrong, 50_000_000).is_err());

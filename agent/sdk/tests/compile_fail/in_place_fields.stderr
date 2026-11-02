@@ -1,0 +1,102 @@
+error: an in-place struct takes no generics
+  --> tests/compile_fail/in_place_fields.rs:21:19
+   |
+21 | pub struct Generic<T: Copy> {
+   |                   ^^^^^^^^^
+
+error[E0277]: the trait bound `bool: InPlace` is not satisfied
+ --> tests/compile_fail/in_place_fields.rs:4:23
+  |
+4 | #[derive(Clone, Copy, InPlace)]
+  |                       ^^^^^^^ the trait `InPlace` is not implemented for `bool`
+  |
+  = help: the following other types implement trait `InPlace`:
+            Digest
+            Flagged
+            Wide
+            [T; N]
+            u16
+            u32
+            u64
+            u8
+            vos_sdk::p2::Path
+  = help: see issue #48214
+  = note: this error originates in the derive macro `InPlace` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: add `#![feature(trivial_bounds)]` to the crate attributes to enable
+  |
+1 + #![feature(trivial_bounds)]
+  |
+
+error[E0080]: evaluation panicked: an in-place struct holds no padding
+ --> tests/compile_fail/in_place_fields.rs:4:23
+  |
+4 | #[derive(Clone, Copy, InPlace)]
+  |                       ^^^^^^^ evaluation of `_` failed here
+
+error[E0277]: the trait bound `bool: InPlace` is not satisfied
+ --> tests/compile_fail/in_place_fields.rs:4:23
+  |
+4 | #[derive(Clone, Copy, InPlace)]
+  |                       ^^^^^^^ the trait `InPlace` is not implemented for `bool`
+  |
+  = help: the following other types implement trait `InPlace`:
+            Digest
+            Flagged
+            Wide
+            [T; N]
+            u16
+            u32
+            u64
+            u8
+            vos_sdk::p2::Path
+note: required for `Flagged` to implement `InPlace`
+ --> tests/compile_fail/in_place_fields.rs:4:23
+  |
+4 | #[derive(Clone, Copy, InPlace)]
+  |                       ^^^^^^^ unsatisfied trait bound introduced in this `derive` macro
+5 | #[repr(C)]
+6 | pub struct Flagged {
+  |            ^^^^^^^
+note: required by a bound in `encode_in_place`
+ --> src/p2.rs
+  |
+  | pub fn encode_in_place<T: InPlace>(value: &T, buf: &mut Vec<u8>) {
+  |                           ^^^^^^^ required by this bound in `encode_in_place`
+  = note: this error originates in the derive macro `InPlace` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: the trait bound `bool: InPlace` is not satisfied
+ --> tests/compile_fail/in_place_fields.rs:4:23
+  |
+4 | #[derive(Clone, Copy, InPlace)]
+  |                       ^^^^^^^ the trait `InPlace` is not implemented for `bool`
+  |
+  = help: the following other types implement trait `InPlace`:
+            Digest
+            Flagged
+            Wide
+            [T; N]
+            u16
+            u32
+            u64
+            u8
+            vos_sdk::p2::Path
+note: required for `Flagged` to implement `InPlace`
+ --> tests/compile_fail/in_place_fields.rs:4:23
+  |
+4 | #[derive(Clone, Copy, InPlace)]
+  |                       ^^^^^^^ unsatisfied trait bound introduced in this `derive` macro
+5 | #[repr(C)]
+6 | pub struct Flagged {
+  |            ^^^^^^^
+note: required by a bound in `decode_in_place`
+ --> src/p2.rs
+  |
+  | pub fn decode_in_place<T: InPlace>(data: &[u8]) -> Result<(T, usize), DecodeError> {
+  |                           ^^^^^^^ required by this bound in `decode_in_place`
+  = note: this error originates in the derive macro `InPlace` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0080]: evaluation panicked: an in-place struct is aligned to eight bytes at most
+  --> tests/compile_fail/in_place_fields.rs:12:23
+   |
+12 | #[derive(Clone, Copy, InPlace)]
+   |                       ^^^^^^^ evaluation of `_` failed here
