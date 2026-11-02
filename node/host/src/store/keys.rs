@@ -25,45 +25,29 @@ pub const NODE_AGENT: AgentId = AgentId(u32::MAX);
 pub(super) enum NodeRow {
     Applied = 0x00,
     Agent = 0x01,
-    // 0x02 to 0x05 are unused.
-    Hard = 0x06,
-    LogStart = 0x07,
-    Membership = 0x08,
-    Epoch = 0x09,
-    Secret = 0x0a,
-    LastResult = 0x0b,
-    Placement = 0x0c,
-    Incarnation = 0x0d,
-    VoteFloor = 0x0e,
-    // 0x0f is reserved: it held the node's rotated anchor keys (a u64
-    // big-endian number to a 32-byte ed25519 seed), and stores from earlier
-    // builds may hold such rows. A reuse keeps that layout, or takes a new
-    // tag.
-    // 0x10 is reserved: it held the node's venue-account seeds (a u64
-    // big-endian number to a 32-byte sr25519 mini secret), and stores from
-    // earlier builds may hold such rows. A reuse keeps that layout, or
-    // takes a new tag.
-    ProverJob = 0x11,
-    // 0x12 is reserved: it held, by agent, the last index of its log the
-    // prover read into jobs (a u64 big-endian), and stores from earlier
-    // builds may hold such rows. A reuse keeps that layout, or takes a new
-    // tag.
-    Layout = 0x13,
-    ProverStopping = 0x14,
+    Hard = 0x02,
+    LogStart = 0x03,
+    Membership = 0x04,
+    Epoch = 0x05,
+    Secret = 0x06,
+    LastResult = 0x07,
+    Placement = 0x08,
+    Incarnation = 0x09,
+    VoteFloor = 0x0a,
+    ProverJob = 0x0b,
+    Layout = 0x0c,
+    ProverStopping = 0x0d,
     /// An operator request's nonce, by its key and nonce: until when it is
     /// kept (a u64 big-endian, milliseconds by the node's clock).
-    OperatorNonce = 0x15,
+    OperatorNonce = 0x0e,
     /// The latest expiry among the operators' nonces forgotten (a u64
     /// big-endian): a request expiring no later may be a replay of one.
-    OperatorFloor = 0x16,
+    OperatorFloor = 0x0f,
 }
 
 /// The keyspace layout this build reads and writes, as the store's layout
-/// row names it. Layout 1 kept an instance's committed maps under the
-/// instance's own owner byte; layout 2 keeps them under an owner byte of
-/// their own, `0x03` ([`vos_wire::keys`]). A change to where rows live
-/// takes the next number.
-pub const LAYOUT: u32 = 2;
+/// row names it. A change to where rows live takes the next number.
+pub const LAYOUT: u32 = 1;
 
 pub(super) fn agent_key(agent: AgentId, epoch: u8, key: &[u8]) -> Vec<u8> {
     [&agent.0.to_be_bytes()[..], &[epoch], key].concat()

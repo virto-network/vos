@@ -100,10 +100,9 @@ impl Fjall {
 
     /// Check the store's layout row against [`LAYOUT`], writing it, synced,
     /// to a store that holds no rows yet. A store whose rows were written
-    /// under another layout, or that holds rows and names no layout (it
-    /// was written before layouts were numbered), is refused with a
-    /// [`LayoutMismatch`] rather than read as if its rows were where this
-    /// build looks for them.
+    /// under another layout, or that holds rows and names no layout, is
+    /// refused with a [`LayoutMismatch`] rather than read as if its rows
+    /// were where this build looks for them.
     fn check_layout(&self) -> Result<()> {
         let key = node_record(NodeRow::Layout, &[]);
         let found = match self.system().get(&key)? {
@@ -186,8 +185,7 @@ impl std::fmt::Display for LayoutMismatch {
             ),
             Layout::Unnamed => write!(
                 f,
-                "the store holds rows and names no layout: it was written before \
-                 layouts were numbered, and this build reads layout {LAYOUT}"
+                "the store holds rows and names no layout, and this build reads layout {LAYOUT}"
             ),
             Layout::Unreadable => write!(f, "the store's layout row is unreadable"),
         }?;

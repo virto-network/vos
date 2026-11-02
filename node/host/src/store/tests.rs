@@ -543,8 +543,7 @@ fn layout_row(store: &Fjall) -> Option<Vec<u8>> {
         .map(|value| value.to_vec())
 }
 
-/// Set a store's layout row, or remove it, as an earlier build would have
-/// left it, beside a row of an agent's.
+/// Set a store's layout row, or remove it, beside a row of an agent's.
 fn written_as(path: &Path, layout: Option<&[u8]>) {
     let store = Fjall::open(path).unwrap();
     let mut batch = store.batch();
@@ -594,8 +593,7 @@ fn a_store_in_another_layout_is_refused() {
     assert_eq!(refused(dir.path()), Layout::Unreadable);
 }
 
-/// A store with rows and no layout row was written before layouts were
-/// numbered, under layout 1 or 2: it is refused, not guessed at.
+/// A store with rows and no layout row is refused, not guessed at.
 #[test]
 fn a_store_with_rows_and_no_layout_is_refused() {
     let dir = tempfile::tempdir().unwrap();

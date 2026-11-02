@@ -228,8 +228,7 @@ is answered `Busy`.
   |---|---|---|
   | 0 | `Expiry { now }`: `expires_ms` outside `now ..= now + 120 s` | 403, as `Credential(Expiry)` |
   | 1 | `Replayed`: the `(key, nonce)` of a write kind recorded | 409 |
-  | 2 | `SocketOnly`: an operator kind over QUIC before C5; retired since, never sent | 403 |
-  | 3 | `OtherNode`: the envelope names another node | 421 |
+  | 2 | `OtherNode`: the envelope names another node | 421 |
 
   An unlisted key keeps `Unauthorized` (6, 401), a bad signature
   `BadSignature` (0, 401); a body that is not an `Operated` is
@@ -309,12 +308,12 @@ its expiry; socket-only until built.
   the operator reads from the node (the Fable review's L10).
 - **The interim** [decided, S46]: until the envelope lands (commit C5,
   §9), operator kinds take their bare body, on the unix socket only; over
-  QUIC they are answered `Rejected(Operator(SocketOnly))`. Once it lands,
+  QUIC they were refused. Once it lands,
   every operator kind is signed on both transports and an unsigned one is
   refused everywhere, the socket included: a co-located gateway on the
   socket must hold no authority either. With the node's HTTP deleted
   (C10), no transport admits a bare operator body, and `api::handle`
-  takes no transport argument; `SocketOnly` stays a retired index.
+  takes no transport argument.
 - **The gateway and s4's console only relay** (S46): they carry an
   `Operated` the operator built in their own client; nothing they keep
   can be replayed past its nonce, sent to another node, or outlive its
@@ -567,7 +566,7 @@ From §7.10b's list, then this brief's additions and the review's (L12).
 | 3 | an unknown kind, `0xffff` among them, `UnknownKind`; a length below the header `Truncated` (id 0 on a stream); a body cut short then the write side shut, `Truncated`; each followed by the stream's or connection's close | node |
 | 4 | a QUIC client with an unlisted key, and one with another ALPN, refused at the handshake | node |
 | 5 | a gateway that flips a byte of a signed call's arguments: `BadSignature` from the node | gateway |
-| 6 | an operator kind over QUIC `Operator(SocketOnly)` before C5 | node |
+| 6 | an operator kind over QUIC refused before C5 | node |
 | 7 | after C5: an operator kind unsigned (`Malformed`), by an unlisted key (`Unauthorized`), with a bad signature (`BadSignature`), signed for another node (`OtherNode`), replayed (`Replayed`), two copies at once (one runs), replayed after a restart, expired and too far ahead (`Expiry`), each refused, over both transports; a read replayed answered; the store's bound answering `Busy` | node |
 | 8 | over `vos-api`, each kind outside the relay set answered `NotRelayed`, the channel closed, and the node's count of API frames unchanged; an upstream gone answered `Unavailable` with the channel kept; 16 in flight on one channel | gateway |
 | 9 | the gateway following `NotLeader` and `Elsewhere`; passing 421 past 4 or for an unknown key; never redirecting an operator kind; the HTTP client pinning the gateway and following a 421 through it | gateway |

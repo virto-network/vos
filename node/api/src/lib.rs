@@ -263,8 +263,7 @@ mod tests {
                 vec![10, 0, 1, 0, 0, 0, 0, 0, 0, 0],
             ),
             (OperatorRefusal::Replayed, vec![10, 1]),
-            (OperatorRefusal::SocketOnly, vec![10, 2]),
-            (OperatorRefusal::OtherNode, vec![10, 3]),
+            (OperatorRefusal::OtherNode, vec![10, 2]),
         ];
         for (refusal, bytes) in refusals {
             assert_eq!(Rejection::Operator(refusal).encode(), bytes);

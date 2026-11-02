@@ -91,7 +91,7 @@ fn resolve_backend(backend: PvmBackend) -> Result<ResolvedBackend, String> {
                             return Ok(ResolvedBackend::Recompiler);
                             #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
                             return Err(
-                                "VOS_PVM_BACKEND=recompiler is unavailable on this platform".into()
+                                "VOS_PVM_BACKEND=recompiler is unavailable on this platform".into(),
                             );
                         }
                         _ => {} // fall through to platform default
