@@ -2074,7 +2074,7 @@ check:
 | tampered; tampered, format 28 at the test venue | `0x112` | 47.6M; test guest 52.8M |
 | wrong program; wrong io-hash; the nonce; the roots' order; a root dropped | `0x108` | 11.0M |
 | prefix; mid-way | `0x109` | 11.1M |
-| unaccepted format (30); format 28 at a production venue | `0x2` | 0.1M |
+| unaccepted format (38); format 28 at a production venue | `0x2` | 0.1M |
 | another program than the pin | `0x3` | 0.1M |
 | another space; the space; rootless; rooted, of no space | `0x4` | 0.1M |
 | unanchored root; a root's window; a root; replayed past MaxRootAge | `0x5` | 0.1M |

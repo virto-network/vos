@@ -35,9 +35,9 @@ const PKCS8_PREFIX: [u8; 16] = [
 
 /// What the stateless-reset key is derived under, apart from every other
 /// use of the node's secret.
-const RESET_DOMAIN: &[u8] = b"vos/net/stateless-reset/1";
+const RESET_DOMAIN: &[u8] = b"vos/net/stateless-reset/v1";
 /// What the key that marks this node's connection ids is derived under.
-const CONNECTION_IDS_DOMAIN: &[u8] = b"vos/net/connection-ids/1";
+const CONNECTION_IDS_DOMAIN: &[u8] = b"vos/net/connection-ids/v1";
 /// A connection id's random bytes, then its mark's.
 const ID_RANDOM: usize = 8;
 const ID_MARK: usize = 8;

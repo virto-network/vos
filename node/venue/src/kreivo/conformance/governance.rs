@@ -330,7 +330,7 @@ pub(super) fn g15(fx: &Fixtures) -> Vector {
         Expect::Err(Error::TooEarly),
     );
     w.call(Origin::Programs, format(41, NOW + delay), Expect::Ok);
-    w.call(Origin::Root, format(42, NOW), Expect::Ok);
+    w.call(Origin::Root, format(38, NOW), Expect::Ok);
     w.finish(
         "G15",
         "dispatch_as_sovereign: a transfer from the sovereign (SovereignDispatched); set_status \

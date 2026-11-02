@@ -51,7 +51,7 @@ verifier, and the gates its build passed.
    DEEP rows before the leaf's own work [measured: the topology built; the
    model 59,242 / 102,049 / 46,080]; on the current segment format, whose
    window shape holds no DIVREM, 55,451 / 99,412 / 43,960 [measured,
-   2026-11-01]: the padded shape 2^16 / 2^17 / 2^16, `p2` 15% spare,
+   2026-11-02]: the padded shape 2^16 / 2^17 / 2^16, `p2` 15% spare,
    **33.2M cells, 0.14× the segment's own 230.4M** [model], 0.6–1.4 GiB
    and 1.2–2.6 s [projected].
 5. **Per verified column and query it spends 56 cells, StarkWare's circuit 824**

@@ -155,6 +155,7 @@ _at-fixed-path dir +args:
     fixed=/tmp/vos-checkout
     exec 9>"$fixed.lock"
     flock 9
+    if [ -e "$fixed" ] && [ ! -L "$fixed" ]; then echo "$fixed is not a symbolic link" >&2; exit 1; fi
     ln -sfn "$(pwd -P)" "$fixed"
     cd "{{dir}}"
     CARGO_INCREMENTAL=0 cargo build --manifest-path "$fixed/{{dir}}/Cargo.toml" {{args}}
