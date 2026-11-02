@@ -26,8 +26,7 @@ pub use preflight::{
 /// [`crate::format`]. A proof's `format_version` names its entry there, and
 /// verifiers refuse a number the registry does not admit.
 ///
-/// What each format number changed: `docs/status.md`, "Proof format
-/// history".
+/// What each format number names: the registry in `src/format.rs`.
 pub const PROOF_FORMAT_VERSION: u32 = crate::format::SEGMENT.number;
 
 /// Whether consecutive segments chain: each one's final state is the next

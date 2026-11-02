@@ -7,9 +7,8 @@
 //! protocol.
 //!
 //! See the crate-level `README.md` for the architecture overview,
-//! `docs/status.md` for soundness coverage, `SECURITY.md` for the trust
-//! boundary, and `docs/plans/roadmap.md` for the chain-prove /
-//! low-RAM direction.
+//! `docs/status.md` for soundness coverage, and `SECURITY.md` for the
+//! trust boundary.
 //!
 //! ## Quick start
 //!

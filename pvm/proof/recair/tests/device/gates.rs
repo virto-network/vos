@@ -758,11 +758,11 @@ fn the_io_hash_is_the_one_public_sum() {
 }
 
 /// Masked acceptance at the device candidates' parameters
-/// (`device-params.md`): blowup 4 with 43 queries (`h = 512`, every chip at
-/// `2^11` rows at least) and blowup 2 with 86 (`h = 1,024`, `2^12`), and the
-/// device format's, blowup 4 with 47 (`h = 256`, `2^10`), on Blake2s; R1 in
-/// one attempt, within the `4·2 + 3q` rows a column reveals, two witnesses
-/// under one program.
+/// (`proving.md` §8, "The device parameters"): blowup 4 with 43 queries
+/// (`h = 512`, every chip at `2^11` rows at least) and blowup 2 with 86
+/// (`h = 1,024`, `2^12`), and the device format's, blowup 4 with 47
+/// (`h = 256`, `2^10`), on Blake2s; R1 in one attempt, within the
+/// `4·2 + 3q` rows a column reveals, two witnesses under one program.
 #[cfg(feature = "heavy-gates")]
 #[test]
 fn heavy_device_proofs_verify_at_the_device_parameters() {

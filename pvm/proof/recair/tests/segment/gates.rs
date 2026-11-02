@@ -194,7 +194,8 @@ fn masked_segments_verify_at_every_size_on_both_channels() {
     assert_eq!(first.proof.claimed_sums, again.proof.claimed_sums);
 }
 
-/// Masked acceptance at the device candidates' floors (`device-params.md`):
+/// Masked acceptance at the device candidates' floors (`proving.md` §8,
+/// "The device parameters"):
 /// blowup 4 with 43 queries (`h = 512`, every chip at `2^11` rows at
 /// least) and blowup 2 with 86 (`h = 1,024`, `2^12`), on Blake2s; R1 in one
 /// attempt over every class, 137 and 266 rows revealed.

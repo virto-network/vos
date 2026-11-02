@@ -213,9 +213,9 @@ type Candidate = (u32, usize, u32);
 /// Conjectured and proven bits.
 type Bits = (u32, u32);
 
-/// The candidates measured (`device-params.md`), each counted on the
-/// reference: `(log blowup, queries, PoW)`, its bits by powers and by
-/// affine batching.
+/// The candidates measured (`proving.md` §8, "The device parameters"),
+/// each counted on the reference: `(log blowup, queries, PoW)`, its bits by
+/// powers and by affine batching.
 #[test]
 fn the_candidates_count_on_the_reference() {
     let candidates: [(Candidate, Bits, Bits); 5] = [

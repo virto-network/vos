@@ -25,12 +25,12 @@ reference shape, from the security tool (`src/security.rs`):
 
 | format | proofs | channel | counts | floors | status |
 |---|---|---|---|---|---|
-| 41 | segments, the shared chip set (the Poseidon2 call among a node kernel's) | Poseidon2-M31 | 104 / 62.81 | 100 / 60 | admitted; 35, the same before the node shared the chip set, retired |
+| 41 | segments, the shared chip set (the Poseidon2 call among a node kernel's) | Poseidon2-M31 | 104 / 62.81 | 100 / 60 | admitted |
 | 32 | leaves and folds | Poseidon2-M31 | 108 / 63 | 100 / 60 | reserved: proved and verified inside the recursion, refused by every outside verifier |
 | 28 | the final wrap, unmasked | Blake2b-256 | 146 / 82.6 | 100 / 80 | admitted: the tests' and the fixtures', linked by the final verifier under `test-formats` alone |
 | 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 146 / 82.70 | 100 / 80 | admitted: what production venues accept |
 | 44 | credential proofs, masked (variant (c)) | Blake2s-M31 | 110 / 62.92 | 100 / 60 | admitted: what a space's ingress takes |
-| 46 | device proofs, masked (variant (c)), `h = 256` | Blake2s-M31 | 110 / 62.82 | 100 / 60 | admitted: device proofs of auth's statement at a space's ingress; 43, the same at `h = 512`, and 45, at `h = 256` before the shared chip set's 7.21 form, retired |
+| 46 | device proofs, masked (variant (c)), `h = 256` | Blake2s-M31 | 110 / 62.82 | 100 / 60 | admitted: device proofs of auth's statement at a space's ingress |
 
 - **Conjectured** bits are PoW plus queries times log blowup (the ethSTARK
   conjecture, refuted as stated in 2025; the parameters carry a margin for
@@ -44,16 +44,9 @@ reference shape, from the security tool (`src/security.rs`):
   same way, 3. The segment shape batches 11,091 values; 41's query term
   binds, 62.81. The masked device reference (every device chip at 2^17
   rows) batches 7,403; 46 counts 62.82 by affine batching, 62.01 by powers.
-- A verifier rejects a number the registry does not admit, a retired one
-  (24 to 27, 29, 30, 31, 33 to 35, 43, 45; 37, the device format reserved at an
-  unmasked count; 42, the credential format at PoW 20,
-  retired when the gate phone's grind passed 50 ms at its 95th
-  percentile; 36, the legacy segment format, whose 57
-  proven bits at its MOBILE shape were below the 60-bit floor; and 40, the
-  blowup-64 masked wrap a measured proof was made under, never registered)
-  among them, and a proof on another channel than its format's. The
-  proof's configuration must equal the format's, and its counts at its own
-  shape must reach the floors.
+- A verifier rejects a number the registry does not admit
+  (`format::lookup`), and a proof on another channel than its format's. The proof's configuration must equal
+  the format's, and its counts at its own shape must reach the floors.
 
 **End to end, the proven bound is the weakest inner format's: 62.81 bits,
 not the wrap's 82.6.** Forging a leaf's segment forges the statement. The
@@ -63,16 +56,17 @@ rests on the conjectured count.
 
 ## The segment AIR
 
-- **Hardened in slice 5.** An audit of the AIR in four groups (G1 the CPU
-  and the register ledger; G2 memory, page permissions, the root boundary
-  and the host verifier; G3 arithmetic; G4 BLAKE2b) found holes that years
-  of tamper tests had not. Each was fixed only after a forgery gate, a
-  consistent forged trace, was written and accepted by the unfixed AIR; the
-  gates stay as tests (`tests/*_gate.rs`). 25 chips, 5,177 constraints.
+- **Hardened by audit.** An audit of the AIR in four parts (the CPU and
+  the register ledger; memory, page permissions, the root boundary and the
+  host verifier; arithmetic; BLAKE2b) found holes that the tamper tests had
+  not. Each was fixed only after a forgery gate, a consistent forged
+  trace, was written and accepted by the unfixed AIR; the gates stay as
+  tests (`tests/gates/*_gate.rs`).
 - **Not yet under a forgery gate of that kind:** PROGRAM_MEMORY's decode
   binding, JUMP_TABLE (one padding fix), the lookup tables, MEMORY_PAGE and
   MEMORY_MERKLE, the witness-input chip, the boundary-binding argument
-  (formats v5/v6), the segment cut and closing-flag rule. These are in the
+  (the boundary states recomputed into the boundary chips' claimed sums),
+  the segment cut and closing-flag rule. These are in the
   external audit's scope (below).
 - **Recorded, unfixed:** an invalid dynamic jump cannot be proved (no
   kernel needs it); the ledgers cannot prove a gap of 2^27 steps between
@@ -159,17 +153,19 @@ the boundary binding, then Stwo's verifier, in that order.
   never on a proof's bytes (one proof has many encodings, and many proofs
   state one statement). The id does not hash the final format: one run
   wrapped under two formats during a transition is one statement.
-- **The rootless rule:** only a root binds a statement's space. A rootless
-  statement must claim no space (`SpaceId::NONE`), or one proof would take
-  a new id under every space. A kernel that does not state its roots in
-  its io-hash (the window kernel, until the SDK does) leaves its handler
-  to check what its output says it read.
-- **Not yet bound to a venue.** A rootless statement is valid at every
-  venue, forever; a rooted one is bound to a venue only by the rule that a
-  space anchors on one venue at a time, which `judge` does not check. A
-  venue domain, or migration refusing windows in code, is slice 6's
-  design. Until a kernel states its roots, no venue should act on its
-  statements beyond tests.
+- **Rooted statements alone.** Only a root binds a statement's space: the
+  proof states none, so a rootless statement's space would be whatever its
+  submitter writes, and one accepted proof could be applied at every
+  venue. `judge` refuses a statement of no root, and one claiming
+  `SpaceId::NONE`. The io-hash covers the roots, so the proof binds them.
+- **Bound to a venue by the space's discipline.** A rooted statement is
+  accepted only where its space's roots are anchored: at the venues its
+  space registered at. A space anchors at one venue for good, but nothing
+  at a venue sees another: a genesis registered at two venues makes each
+  accept the same statement (same roots) or forks the space unseen
+  (different roots). An anchor gives ordering and non-equivocation, not
+  integrity, so a value-moving handler is two-sided or spends the
+  submitting space's own escrow.
 - **Every re-pin is a governance event.** A segment format bump (any
   hardening of the base AIR) changes every program id; a change to the
   recursion's compiler or gates changes every leaf circuit's hash, the fold
@@ -203,7 +199,7 @@ every input by construction:
   (DIVERGENCE-013).
 - **Fuzzing:** seven targets (`fuzz/`), a checked-in corpus replayed by
   `just check` (`just fuzz-replay`), and `just fuzz`, a minute a target in
-  `ci-full` and five in `slice-gate`.
+  `ci-full` and five in the full gate (`just slice-gate`).
 
 ### Stwo's verify path, audited
 
@@ -259,8 +255,29 @@ The channel's draws and `verify_pow_nonce` index nothing from the proof.
 `fuzz/replay/<target>/` holds each target's corpus, minimized by
 `cargo fuzz cmin` after a five-minute run and kept small; `just
 fuzz-replay` (in `just check`) runs every input once; `cargo run --example
-paths` lists what each input reaches. The paths it covers are recorded in
-`docs/design/slice-6-progress.md`.
+paths` lists what each input reaches. It covers:
+
+- format 39 by bytes: every header word, the decode, non-canonical
+  encodings, the shape (four commitments, a tree's sampled columns, four
+  trees of sampled values); format 28: the decode and the format;
+- 39 and 28 mutated: the format, non-canonical encodings, the circuit,
+  the interaction PoW, the logup sums, the shapes (four trees or
+  commitments, a column's samples, a tree's queried columns, FRI's
+  layers), OODS, PoW, Merkle (queried-value shape, root, witness short
+  and long), FRI (first and inner layers' evaluations and commitments,
+  the layer count), and mutations that cancel, accepted;
+- 39 reshaped: non-canonical encodings, Merkle (shape, root, witness
+  short and long), FRI's first and inner layers' evaluations and
+  commitments;
+- the venue: a short or non-canonical statement, the format, the
+  program, the venue, the space, an unanchored root, a repeat, and the
+  proof's decode, format, non-canonical encoding and shape;
+- the anchor: each decoder's short, non-canonical and trailing inputs,
+  and a decode.
+
+Not covered: FRI's last layer (its evaluations; its degree, which the
+layout holds) and the two degenerate DEEP lines (the fork's unit
+tests).
 
 ## The Stwo fork's open divergences
 
@@ -323,22 +340,57 @@ proofs must never leave the prover role.
 
 **Format 39,** the masked wrap, is admitted: `vos-pvm-recair-air`'s masked
 AIR, `vos-pvm-recair`'s masked prover and `vos-pvm-final-verifier`'s masked
-verifier (pin B's transcript, every pin the format's, the shape checked
-before any Stwo call), its bytes a fixed layout with one encoding a proof.
+verifier (the masked transcript below, every parameter the format's, the
+shape checked before any Stwo call), its bytes a fixed layout with one
+encoding a proof.
 The verifier leaves three facts to Stwo, each pinned and tested: the
 trees' widths `verify_values` zips; the FRI rounds `FriVerifier::commit`
 derives from the largest column (`[3, 3, 3, 2]`); and FRI's degree bound,
 the last committed tree's height less the blowup (17), so the composition
-tree is the last and tallest commitment. Its count is the security tool's
-under masking variant (c) (`docs/design/research/slice-5/spike2-masking.md`
-§3b, `docs/design/research/slice-6/spike6b-masked-bits.md`):
+tree is the last and tallest commitment.
 
-- **What (c) moves:** every main and interaction column is `f + v_H·r`, of
-  degree bound `2N` for a tallest component of `N` rows; the composition
-  is committed whole at `4N`, never split, and sampled at `π(z)`. So FRI
-  tests `k = 4N` at 39's blowup 32, the DEEP term takes `k = 2N`, `d = 3`
-  and a factor 2 for `π(z)`, and every other formula stays. The salts
-  enter no term (Blake2b-256's collision resistance, which the tool does
+**The masked transcript,** prover and verifier alike, in this order: the
+header (format 39's number and configuration); the preprocessed root
+(unsalted); the main root (each component's masked columns, then its
+blinding columns, then the salts); the 24 public words; the interaction
+PoW; the `Gate` relation, then `BlindRelation`; the blinded claimed sums;
+the interaction root (masked, salted); the composition coefficient; the
+composition tree (the whole composition, the FRI mask `R`'s 8 columns,
+salts); the OODS point `z`, each component sampled at its own level, the
+composition at `π(z)`, `R` at `z`; then the affine DEEP coefficients,
+drawn after every commitment and every sample is mixed; FRI; the PoW; the
+queries. The verifier never calls `stwo::core::verifier::verify` (its
+composition split is hardcoded, DIVERGENCE-004): it runs over the
+commitment scheme's `commit` and `verify_values`.
+
+**Variant (c).** Every main and interaction column is masked,
+`f' = f + v_H·r` with `r` of `h` uniform coefficients, so its degree bound
+is `2N` for a tallest component of `N` rows; the composition, of bound
+`4N`, is committed whole, never split. The masked columns are lifted one
+doubling more than the quotients, so the AIR is evaluated at level `m+1`
+and the composition is sampled at `π(z)`. A cubic constraint's masked
+quotient fits `2N` while `h ≤ 2N/3`; `h ≤ N/4` covers quartic too. What
+(c) adds to soundness: the `4N` composition bound doubles the DEEP-ALI
+error, and `π(z)`, uniform on half the circle, doubles it again; lifting
+at `m+2` adds one FRI layer. The constraint degree bound (3, or 4 at
+`h ≤ N/4`) limits the honest prover, not soundness.
+
+**The prover's guards:** R1, the rank check (under zero knowledge
+below); R2, the claimed sums blinded, one blinding QM31 a component on
+one row through `BlindRelation`; R3, the FRI mask's rank: `R`'s 8 columns
+take independent affine coefficients, which span M31^4 except with
+probability about 2^-155, so it holds by construction with no check; R4,
+hedged randomness: each attempt's stream is seeded with
+`BLAKE2b-256("vos/mask/seed/v1" ‖ 32 OS bytes ‖ witness digest ‖
+attempt)`, the witness digest binding the statement and the main
+columns, so a witness proved again from a replayed OS state never reuses
+a mask.
+
+Its count is the security tool's under (c):
+
+- **What (c) moves:** FRI tests `k = 4N` at 39's blowup 32, the DEEP
+  term takes `k = 2N`, `d = 3` and a factor 2 for `π(z)`, and every other
+  formula stays. The salts enter no term (Blake2b-256's collision resistance, which the tool does
   not model, binds them as it binds every tree).
 - **146 / 82.70** at 24 queries, PoW 26, the query term binding at
   `m = 5`; 23 queries is the least that clears 80 (80.84). The DEEP term
@@ -372,8 +424,11 @@ under masking variant (c) (`docs/design/research/slice-5/spike2-masking.md`
 
 **Zero knowledge** is the argument's: honest-verifier zero knowledge of
 the masked IOP, so zero knowledge in the programmable random-oracle model,
-conditional on R1 (the randomizer's revealed functionals of full rank),
-which the prover checks on every transcript and retries on, and on the FRI
+conditional on the rank check (R1: for every column class, the
+randomizer's revealed functionals have full row rank over M31), which the
+prover checks on every transcript and retries on with fresh masks (at
+most 8 attempts; whether a transcript passes is a function of public
+coins, so a retry leaks nothing), and on the FRI
 mask `R`'s DEEP coefficients being of rank 4 (all but about 2^-155 of
 draws, its 8 columns): `R` is witness-independent, so a simulator draws it
 as the prover does, and the real and simulated batches differ by an
@@ -446,7 +501,7 @@ and over small values (`node/host/tests/carriers/audit.rs`).
 | a chain's own record of what it was sent: its nodes' logs and database | blocks, guarantees, the packages and their extrinsics, the services' code | leaves | the audit (`just e2e-chain`, `Reach::Recorded`): every needle's bytes, whole hex and `Debug` list, a register file's bytes; not a number's digits, hex or bytes, a hash's hex prefix or a debug output's text, which the chain's own counters, gas, hashes and program bytes hold by chance. What it was sent is searched in every form as the packages and reports above; a statement's encoding and a work report are shown to be in its database as bytes, a report's hash in its log |
 | a client's answer | the method's outcome: a read's output | leaves | the audit |
 | the JAM statements service's storage, read over RPC at the finalized block | the spaces, anchors, evidence, `Seen` entries and items' outcomes: what the items carried, and the verdicts | leaves | the audit, every form (`just e2e-chain`), but the venue's layout constants and the space's clock, public in this carrier alone (`Audit::carrier_except`) and needles in every other |
-| a live run's fault text: `ExitReason`'s `Debug` in `Fault::Agent` (a page fault's address among it; `node/host/src/pvm.rs:177-180, 218`), an executor panic's message (`node/host/src/executor.rs:67-68`, `node/host/src/fault.rs:58-61`) | text of the agent's own run, data-dependent | leaves: the applying node logs it at warn (`node/host/src/group/apply.rs:232-236`), and a query returns it to its caller as `CallError::Failed` (`node/host/src/queries.rs:331`) | not audited: the audit runs happy paths. The replica's logs and an authorized caller hold the agent's state already, so this is not the prover role leaking, but its content is not bounded; the fix (the variant alone, a static panic message with its place) and one audited run of a faulting kernel are carried |
+| a live run's fault text: `ExitReason`'s `Debug` in `Fault::Agent` (a page fault's address among it; `node/host/src/pvm.rs:177-180, 218`), an executor panic's message (`node/host/src/executor.rs:67-68`, `node/host/src/fault.rs:58-61`) | text of the agent's own run, data-dependent | leaves: the applying node logs it at warn (`node/host/src/group/apply.rs:232-236`), and a query returns it to its caller as `CallError::Failed` (`node/host/src/queries.rs:331`) | not audited: the audit runs happy paths. The replica's logs and an authorized caller hold the agent's state already, so this is not the prover role leaking, but its content is not bounded; the fix (the variant alone, a static panic message with its place) and one audited run of a faulting kernel are not made |
 | a panic while a proof is made; a failed proof's error | the panic's place (file and line), not its message; `ProveError::Failed`, which names what failed and no value | leaves (standard error, the logs) | the redacting hook (`node/prover/src/redact.rs`) while a proof is in flight; the audit over the logs |
 | logs, at every level | ids, windows, codes, the prover's backlog counts, each proof's time in seconds, and Stwo's `info!` of a proof's size estimate; at debug level, an agent's guest log lines (`refine_host`'s `log`), text the agent's own code writes, which carries whatever that code puts in it | leaves | the audit, for the node's own lines; an agent's are its author's, audited with its code; the time and the size estimate are side channels as below |
 | standard error | the node's log: `vos` writes its tracing there, at `VOS_LOG`'s level (info by default); no debug output in a production build | leaves | the audit (the run captures both) |
@@ -460,8 +515,7 @@ and over small values (`node/host/tests/carriers/audit.rs`).
 | the prover's table | each job's record (`witness_input` among it) until it finishes, its statement, its proof's hash; an unfinished job is dead once its roots age past `MaxRootAge`, and a job of an agent the node no longer replicates goes (`node/prover/src/worker.rs`'s `prune`) | the prover's node | the audit: as above |
 | an agent on JAM: its work packages and results (`vos-jam`) | its batch, its rows' witness and its attests whole, served rows included | JAM's validators and DA | by design: an agent on JAM keeps no row from JAM, so a statement of one hides nothing from it |
 
-`RefinePayload`, which carried memory roots, went with the refine-bundle
-path (format 36). A proof's time and Stwo's size estimate in the logs,
+A proof's time and Stwo's size estimate in the logs,
 and the operator's gas stages, reveal the trace's size, as the prover's
 time does (the side channel below); a statement is published at the
 window's cadence for it.
@@ -486,7 +540,7 @@ Required before value rides on a proof. Its scope:
   the wrap, `vos-pvm-final-verifier` and `vos-statement`;
 - `derive` (layout to preprocessed columns, its refusals) and the program
   id's derivation;
-- the masking: the masked transcript (pin B), R1 to R4, the blinding's
+- the masking: the masked transcript's order, R1 to R4, the blinding's
   soundness, and the zero-knowledge argument's premises; later, the public
   sums' re-cut.
 
