@@ -10,7 +10,7 @@ work. Tags:
 - **[built]**: what the code holds; **[measured]**, **[model]**, **[est]**:
   numbers from a run, a model, or arithmetic on measured numbers.
 
-Measurements without other hardware named ran on the development laptop:
+Measurements without other hardware named ran on the development desktop:
 Intel Core Ultra 7 155H, 62 GB RAM, one consumer NVMe, Linux 7.1, release
 builds. Each gives its date.
 
@@ -1342,7 +1342,7 @@ Around the proof:
   - every read is witnessed, and every package's work result, read back
     from the chain, equals a VOS node's byte for byte.
   - It runs on PolkaJam's interpreter backend. Its recompiler fails at
-    start on the development laptop: PolkaVM's sandbox reads every CPU's
+    start on the development desktop: PolkaVM's sandbox reads every CPU's
     L3 cache entry, which its low-power cores lack.
 
 ## 13. Portability [decided direction]
@@ -1384,8 +1384,8 @@ Around the proof:
 | Actor invocation, refine and accumulate, one node | ≤ 50 µs | the default agent on one node with fjall storage, counter increments under load: 21–24 µs per request on the JIT, 85 µs on the interpreter, plus a 0.9 ms synced commit per batch of 165–210 requests [measured, 2026-10-10] | passes on the JIT; the interpreter, kept for tracing and platforms without the JIT, misses |
 | Committed-map write on the apply path [proposed] | ≤ 5 µs; background root building keeps up with apply | about 4.3 µs a committed write at 1M keys: accumulate 1.05 µs on the JIT, the store's value and dirty rows 3.2–3.3 µs. The root builder at 20k committed writes a second for 30 s: 19.9k rows a second built, a median build of 137 ms, at most 14 versions behind, caught up in 162 ms [measured, 2026-10-15] | passes; the builder near its capacity, a faster native BLAKE2b its lever |
 | Fixed cost per refine [proposed] | ≤ 50 µs; pooled acquire and reset ≤ 5 µs; a new machine ≤ 50 µs | an empty refine on a kept agent machine 13 µs (JIT) and 10 µs (interpreter); pooled acquire, use and reset 1.6 and 1.1 µs; a new machine 7–10 and about 32 µs [measured, 2026-10-09 and 2026-10-10] | passes |
-| Replicated agent on 3 LAN nodes, simple mutations | ≥ 20k per second per agent; p99 commit ≤ 10 ms at half load | three node processes over QUIC, signed calls through an HTTP ingress since replaced by the node API [measured, 2026-10-13]. The most, closed loop at 256 sessions: 18.6–19.5k/s on the reference pinning, 19.7–20.1k/s with the leader on cores of its own. The half-load p99, open loop: 6.7–14.2 ms in five runs (8.2 ms over HTTPS), and 7.0–10.9 ms in four with cores of its own (three within 10 ms) | at the edge on the laptop: capacity just short or just met; the half-load p99 not met reliably; not re-measured over the node API or on a machine of its own |
-| Many active agents per node [proposed] | 64 active agents: ≥ 40k commits per second in total, p99 ≤ 20 ms | three node processes, reference pinning: 33.9k/s most at 16 sessions each (p99 45 ms); open loop p99 6.8 ms at 20k/s and 106 ms at 25k/s, so the knee lies between; closed, the nodes 4.6–5.3 of their 6 logical CPUs busy, hyperthreads included [measured, 2026-10-13] | misses on the laptop; the scale test (section 14.1) measures many agents on a larger host |
+| Replicated agent on 3 LAN nodes, simple mutations | ≥ 20k per second per agent; p99 commit ≤ 10 ms at half load | three node processes over QUIC, signed calls through an HTTP ingress since replaced by the node API [measured, 2026-10-13]. The most, closed loop at 256 sessions: 18.6–19.5k/s on the reference pinning, 19.7–20.1k/s with the leader on cores of its own. The half-load p99, open loop: 6.7–14.2 ms in five runs (8.2 ms over HTTPS), and 7.0–10.9 ms in four with cores of its own (three within 10 ms) | at the edge on the development desktop: capacity just short or just met; the half-load p99 not met reliably; not re-measured over the node API or on a machine of its own |
+| Many active agents per node [proposed] | 64 active agents: ≥ 40k commits per second in total, p99 ≤ 20 ms | three node processes, reference pinning: 33.9k/s most at 16 sessions each (p99 45 ms); open loop p99 6.8 ms at 20k/s and 106 ms at 25k/s, so the knee lies between; closed, the nodes 4.6–5.3 of their 6 logical CPUs busy, hyperthreads included [measured, 2026-10-13] | misses on the development desktop; the scale test (section 14.1) measures many agents on a larger host |
 | Workflow snapshot capture plus restore, up to 50 KB | ≤ 1 ms | through a real workflow step on the JIT, beyond an empty refine: a typical suspension (3 pages restored, 2 captured) 176–252 µs; 50 KB (15 restored, 14 captured) 0.62–0.81 ms on a quiet machine, 1.47 ms under contention [measured, 2026-10-15]. Page hashing, one precompile call per 128-byte block, is about a fifth of it. The runtime's own capture and restore are microseconds (section 6.6) | passes on a quiet machine, so the leader's live-machine cache is not built |
 | A workflow's resume, a reply in to its step applied [proposed] | — | one node in process, synced commits: median 1.3–1.6 ms, p99 2.1 ms [measured, 2026-10-15]. Three nodes, the leader in process and its followers `vos` processes over QUIC: median 1.77–1.92 ms, p99 2.48–2.77 ms, replication adding about 0.45 ms to the commit; on tmpfs 0.92–0.97 ms [measured, 2026-10-16] | measured |
 | Fan-in across nodes [proposed] | — | three nodes over QUIC, one receiving agent: 13.2k messages a second applied from 4 senders, 17.6k from 8; past the receiver's queue, its refine bounds it (97–98% busy, about 1.1 frames a message when nothing drops); after a full queue drains, the receiver asks its dropped senders to resend, so 32 senders' backlog drains in about 5 s [measured, 2026-10-15] | refine-bound; no frame batching needed |
@@ -1396,7 +1396,7 @@ Around the proof:
 | Merge apply, cost per operation at 1M operations | ≤ 2× the cost at 1k | 1.5–1.8× with an incremental-apply prototype on LWW maps, in memory [measured, 2026-10-08] | the prototype passes; the Merge lane is not built (section 9.4) |
 | 1,000 mostly idle Raft groups per node | no thread per group; idle CPU ≤ 5% of one core | 0.16% of a core and 45.6 MiB of RSS per 1,000 idle replicas, on the scale test's nodes (section 14.1) [measured, 2026-10-27] | passes |
 
-- Rows without other hardware named ran on the development laptop, with
+- Rows without other hardware named ran on the development desktop, with
   all three replicas sharing one disk and a warm page cache. Runs with
   many active agents varied up to 4×.
 - The three-process rows ran release node processes, their stores on
@@ -1455,7 +1455,8 @@ The setup [measured, 2026-10-27 to 2026-11-01]:
   unit with 4 cores and an 8 GiB memory cap (12 GiB at 10^5 agents), all
   three on one shared Samsung 970 PRO NVMe and one 1 GbE link; governor
   `performance`;
-- the driver on an Intel i5-1340P, wired, over the node API (QUIC);
+- the driver on an Intel i5-1340P, wired, over node HTTP; T1's final
+  numbers over the node API (QUIC);
 - every agent replicated on all three nodes; `K` = 64 shard agents, a
   stand-in identity row per user, the space's representative, L = 2 min;
 - the default mix: transfers 80%, queries 15%, workflows 4.5%, reads at a

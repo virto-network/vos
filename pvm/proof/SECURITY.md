@@ -382,9 +382,17 @@ take independent affine coefficients, which span M31^4 except with
 probability about 2^-155, so it holds by construction with no check; R4,
 hedged randomness: each attempt's stream is seeded with
 `BLAKE2b-256("vos/mask/seed/v1" ‖ 32 OS bytes ‖ witness digest ‖
-attempt)`, the witness digest binding the statement and the main
-columns, so a witness proved again from a replayed OS state never reuses
-a mask.
+attempt)`, so a witness proved again from a replayed OS state never
+reuses a mask. The witness digest is `BLAKE2b-256("vos/mask/witness/v1"
+‖ statement ‖ each main column's hash)`: the statement as u64
+little-endian words (the header's word count, then the header the
+transcript mixes: the format's number, its configuration and each log
+size; then the DEEP batching, the interaction PoW, the channel's tag and
+the masking's salt columns, FRI mask columns and log mask rows), the
+public values' count as u64 and each value's 4 limbs as u32, all
+little-endian; then each main column's `BLAKE2b-256` over its values, 4
+bytes little-endian each, in commitment order. Every private value of
+the witness is in the main columns (`recair/src/masked/rng.rs`).
 
 Its count is the security tool's under (c):
 

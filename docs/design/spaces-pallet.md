@@ -904,7 +904,7 @@ port adds it):
 - `node/venue/conformance/*.json` and the mock that writes them
   (`vos-venue`'s `kreivo-mock` feature; `just conformance` regenerates them);
 - the scenarios of `KreivoVenue`'s tests over the mock
-  (`node/venue/src/kreivo/tests.rs`, `node/host/tests/cluster/kreivo.rs`),
+  (`node/venue/src/kreivo/tests/`, `node/host/tests/cluster/kreivo.rs`),
   which set the mock's state directly: the port states them again over
   its transport against a dev chain carrying the pallet, its state set by
   the pallet's calls (the live Kreivo leg);

@@ -10,8 +10,10 @@ proofs a phone makes. The recursion AIR's own design is
 - **Evidence:** every number carries its tag: [measured, hardware, date],
   [model] (a count from the design's own cost model or the security tool),
   [derived], [est] or [projected]. "x86 dev machine" is the development
-  desktop (Core Ultra 7 155H); the phone is a Fairphone 6 (Snapdragon 7s
-  Gen 3: four Cortex-A720-class and four A520 cores).
+  desktop (Intel Core Ultra 7 155H); the phone is a Fairphone 6
+  (Snapdragon 7s Gen 3: four Cortex-A720-class and four A520 cores). A
+  [measured] number with no hardware or date ran on the x86 dev machine,
+  on or before 2026-11-01.
 - **Open work** is listed in `open.md`.
 
 ## 1. Requirements [decided]
@@ -980,6 +982,12 @@ last for decades.**
 
 ## 7. Roots and anchors [proposed]
 
+The anchoring protocol keeps as few states as it can: its state machine
+had grown hard to reason about, so equivocation is terminal, a node has
+one key, a space never migrates, a read is never re-cut, nothing is
+handed back, and an agent reports only for windows a read waits on; each
+removes a state, at the cost named where it is stated (§11).
+
 - **The kernel verifies its rows up to the space root.** Its witness
   carries the full path: row → map root → agent root → space root. So
   `RootRead.root` is the anchored space root, which the venue compares.
@@ -1080,7 +1088,8 @@ or the two together) in at most 250 ms (owner's 150 ms, auth's target
 150 ms) and 256 MiB; the auth statement
 under the device profile in at most 1.0 s, 1 GiB of peak resident memory
 and a 1.5 MiB proof, verified on the phone and accepted at a space's
-ingress. All are met (below).
+ingress, its verify at ingress at most 40 ms on one x86 core. All are
+met (below).
 
 **1. The credential AIR** [built]. Two fixed circuits over the recursion
 AIR's `p2` and `qm31` components prove facts about a device secret `s`,
@@ -1194,8 +1203,10 @@ DEEP batching (the fork's Blake2s-M31 path takes it); at least 62 proven
 and 100 conjectured bits on its masked shape (62.92 and 110, counted on
 the built set). The same at 43 queries and PoW 20 counts 62.93 and 106,
 but its grind has the long tail: on the phone PoW 20's 95th percentile is
-about 50 ms, PoW 16's 7–9 ms [measured, Fairphone 6, 2026-11-01], so PoW
-16 takes 4 more queries for a short tail. Ingress takes a proof of at
+50.2–50.6 ms, still above the 50 ms rule (69–72 ms when the format was
+chosen, 2026-10-27, before the prover pinned the big cores), PoW 16's
+6.8–9.1 ms [measured, Fairphone 6, 2026-11-01], so PoW 16 takes 4 more
+queries for a short tail. Ingress takes a proof of at
 most 512 KiB; a proof is about 213–225 KB [measured, Fairphone 6,
 2026-11-01].
 - **Built** (`vos_pvm_recair::credential`,
@@ -1210,7 +1221,8 @@ most 512 KiB; a proof is about 213–225 KB [measured, Fairphone 6,
   to `4h = 2^11` rows a component, so auth (36 permutations), owner (1)
   and the joint circuit (37) cost alike.
   - On x86, 4 threads: about 44 ms each at the median, 47–49 ms at the
-    95th percentile, peak 137–153 MiB [measured, x86 dev machine].
+    95th percentile, peak 137–153 MiB [measured, x86 dev machine,
+    2026-10-27].
   - On the phone, automatic threads (the four big cores pinned): auth,
     owner and the joint circuit 126–128 ms at the median, at most 147 ms
     at the 95th percentile, peak 114–118 MiB; every proof verified on
@@ -1349,7 +1361,7 @@ impl PathKeeper {
   rate is greatest, one thread pinned to each of their cores (every core
   unpinned when every class is kept). On the Fairphone 6 it keeps the
   four big cores, pinned: the same four unpinned are ×1.20 slower, the
-  split over all eight ×1.3 [measured]. The pool's stacks are 16 MiB
+  split over all eight ×1.3 [measured, Fairphone 6, 2026-10-31]. The pool's stacks are 16 MiB
   (`STACK_BYTES`): a nested join overflowed rayon's default 2 MiB.
 - **`path_query` and `root_query` sign with a key drawn for that query
   alone,** so fetches link to no client key; a proof uses the path
@@ -1378,8 +1390,9 @@ impl PathKeeper {
   share one computation. The keeper's timer is 30 s with a uniform jitter of half a
   period either way, halved on each `RootUnknown` (to 1 s) and doubled
   back on a fetch that finds the root unmoved. A
-  credential proof peaks at 113–133 MiB on the Fairphone 6 and 137–153
-  MiB on x86 [measured]; `Prover::new` refuses an allowance below
+  credential proof peaks at 114–118 MiB on the Fairphone 6 [measured,
+  2026-11-01] and 137–153 MiB on x86 [measured, x86 dev machine,
+  2026-10-27]; `Prover::new` refuses an allowance below
   `PEAK_BYTES`, 192 MiB.
 
 **No Poseidon2 root kind for the in-space credential** [decided]: the
@@ -1396,7 +1409,7 @@ reporting every window (§7).
   the chip's floor, not its calls.
 - **The host serves Poseidon2 natively** [built], at 2,400 gas a
   call. A JAM-deployed agent pays it in software, about 37,600 gas a
-  permutation [measured], as it does BLAKE2b.
+  permutation [measured, 2026-10-26], as it does BLAKE2b.
 
 **2. The device profile** [built: `vos_pvm_proof::device`,
 `vos_pvm_recair::device`]. The general zkVM runs on
@@ -1437,7 +1450,8 @@ io-hash), binding the run like this:
 kernel's io-hash is over `C`, not `compute_io_hash`'s BLAKE2b-256: with
 BLAKE2b's, BLAKE2b (3,136 columns) and its AND table stayed in every
 device shape, the Poseidon2 statement's too, 48% of its columns, and the
-Merkle hashing and the proof's bytes go with the columns [measured]. A
+Merkle hashing and the proof's bytes go with the columns [measured,
+2026-10-30]. A
 kernel that hashes only through `0x402` reaches neither: on the phone
 its proof took ×0.40 the time, ×0.39 the peak and ×0.54 the bytes of the
 same statement under BLAKE2b's io-hash [measured, Fairphone 6,
@@ -1559,7 +1573,7 @@ same statement under BLAKE2b's io-hash [measured, Fairphone 6,
 
 **The lean kernel** [built; the `device` test actor's `auth`]: the auth
 statement in 1,722 steps, under 2^11, which a gate holds, so the CPU sits
-at 2^11 rows [measured]. Its arguments are read where the witness input
+at 2^11 rows [measured, 2026-10-31]. Its arguments are read where the witness input
 left them (a pointer decoded in place, no copy; the siblings first, so
 page-aligned); its path is walked in one lane `[sibling, node, sibling]`,
 each level's `0x402` call reading the half the slot's bit picks by its
@@ -1569,7 +1583,8 @@ hashes `E` where it lies, one four-byte load a packed word
 (`padded_device_io_words`); it moves its words whole at any alignment
 (the PVM serves unaligned loads and stores; the guest target's own go
 byte by byte). A kernel of the same statement that copies its arguments
-and converts them byte by byte takes 18,733 steps [measured].
+and converts them byte by byte takes 18,733 steps [measured,
+2026-10-30].
 
 **Format 46, device proofs** [built; measured]: masked (c), the
 Blake2s-M31 channel, blowup 4, 47 queries, PoW 16, interaction PoW 8,
@@ -1581,9 +1596,10 @@ prover and the verifier enforce: the memory ledger, a row a byte touched,
 reached 2^17 on the first auth kernels). Admitted at ingress for device
 proofs of auth's statement; a proof is at most 1.5 MiB (the auth kernel's
 about 0.87 MB) and its bytes the masked proof's postcard encoding alone,
-canonical, with no io-hash. Verified on one x86 thread in 11.7 ms, a wrong
-PoW refused in 8.0 ms and a wrong interaction PoW in 5.8 ms [measured,
-x86 dev machine, 2026-11-01].
+canonical, with no io-hash. Verified on one x86 thread in 11.7 ms
+(the budget: at most 40 ms on one x86 core), a wrong PoW refused in 8.0
+ms and a wrong interaction PoW in 5.8 ms [measured, x86 dev machine,
+2026-11-01].
 
 **The device parameters** [decided]. Counted on the masked device
 reference (every chip a device program may hold at 2^17 rows), the least
@@ -1688,12 +1704,13 @@ statement over the credential actor's Poseidon2 tree, masked, blowup 4,
   beside the big ones (slower); the grind and the query count (under 1% of
   a proof at PoW 16). mimalloc never purging tightens the tail, within
   noise at the median.
-- **Where a proof goes** [measured, x86]: the main tree 29%, the
+- **Where a proof goes** [measured, x86 dev machine, 2026-10-31]: the main tree 29%, the
   composition 23%, the interaction tree 19%, DEEP and FRI 17%, the trace
   5%, R1 4%; Blake2s-M31's compression a third, the FFTs about 8%.
 - **The ARM factor** on this shape: the phone at automatic threads about
   2.4× x86 on four performance cores, 2.8× x86 on four performance and
-  four efficient ones [measured].
+  four efficient ones [measured, Fairphone 6 and x86 dev machine,
+  2026-10-31].
 
 **The cell model** [model]: on the phone 1.0 s is about 20M committed
 cells and 1 GiB of peak 26–40M, so time binds first, at about a device
@@ -1753,7 +1770,7 @@ that narrows the inner proof makes folds cheaper too.
 
 | risk | retired or held by |
 |---|---|
-| the ARM factor is wrong | **retired:** the phone at 2.4–2.8× x86 on the device shape (§8) [measured] |
+| the ARM factor is wrong | **retired:** the phone at 2.4–2.8× x86 on the device shape (§8) [measured, 2026-10-31] |
 | the Poseidon2 segment channel is too slow to prove | **retired:** a segment's proving plus its leaf beats the Blake2s route's projection (§3.2) [measured, projected] |
 | our permutation is not the reference Poseidon2 | the reference arrangement and Plonky3's parameters, checked on their vectors |
 | the recursion AIR does not converge | **retired:** a fold verifies two folds within the constant shape (§3.4) [measured] |
@@ -1770,9 +1787,9 @@ that narrows the inner proof makes folds cheaper too.
 | a deadline between parties is read from a space's clock | a test that every deadline is the venue's time |
 | a forgery in the recursion AIR | the recursion AIR's forgery gates |
 | a prover's internals leave the role | the carrier audit (A.5) on the model venue and on chain |
-| the credential AIR misses its budget | **retired:** masked auth, owner and joint proofs in about 127 ms on the phone (§8) [measured] |
-| an honest proof is refused | **retired:** the fork's SIMD reduction of a Blake2s-M31 digest word made canonical; 180,000 credential proofs at 43 queries and PoW 20 and 20,000 at format 44's parameters, none refused [measured] |
-| the device profile misses 1 s on the phone | **retired:** 645 ms, 427 MiB, 0.87–0.88 MB, accepted at ingress (§8) [measured] |
+| the credential AIR misses its budget | **retired:** masked auth, owner and joint proofs in about 127 ms on the phone (§8) [measured, Fairphone 6, 2026-11-01] |
+| an honest proof is refused | **retired:** the fork's SIMD reduction of a Blake2s-M31 digest word made canonical; 180,000 credential proofs at 43 queries and PoW 20 and 20,000 at format 44's parameters, none refused [measured, 2026-10-27] |
+| the device profile misses 1 s on the phone | **retired:** 645 ms, 427 MiB, 0.87–0.88 MB, accepted at ingress (§8) [measured, Fairphone 6, 2026-11-01] |
 | masking the segment chips leaks or breaks the nodes' proofs | soundness and leakage gates on a masked segment and on the device shape (two witnesses at equal public values); the unmasked proofs byte for byte unchanged |
 | `h = 256` reveals more than its randomizer covers | the revealed-rows argument (§5); R1 on every transcript; `device_floors` at install; a leakage gate at `h = 256` |
 | format 41's wider AIR overflows a kernel leaf | the leaves counted as built, within 2^16 / 2^17 / 2^16; the Poseidon2 chip's 17-page class (§3.2) |
@@ -1801,6 +1818,17 @@ Each is stated, with its reason, in the section it governs:
   node's kernel leaves fit the fold's fixed shape (§3.2).
 - **Reads at the last anchored cut, to the space root; windows of venue
   time** (§7).
+- **Anchoring cut to the fewest states,** since its state machine had
+  grown hard to reason about (§7). Equivocation is terminal: no
+  suspension or resume; the space re-founds, its Clerk pairs reset. One
+  node key, no rotation: a compromised key means replacing the node. No
+  migration ranges or `venue_bound`: a space that changes venue re-founds,
+  so Clerk counterparties share a venue for good. No re-cuts: a read not
+  closed in time fails `NotClosed` and the caller asks again. No
+  hand-back or re-sign: the close writes `S_w` in a replicated row and
+  the leader signs from it alone. Reports only for windows a read waits
+  on, not `S_w` over every agent's root: a window no agent reported is not
+  anchored, and an issuer opts in to every window.
 - **Runtime format selection, with lossless encodings** (§3.6, A.3);
   **interaction PoW** on every proof with logup and **248-bit salts**
   (§4); **one padded fold shape** as a format constant (§3.4).

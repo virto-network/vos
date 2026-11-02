@@ -1,6 +1,6 @@
 //! What an update costs on a tree of hashed keys: hashes, node rows
 //! rewritten, and µs per update on the in-memory store, single and in
-//! batches of 10,000 (S4's committed-roots measurement, on this crate).
+//! batches of 10,000 (the committed roots' measurement, on this crate).
 //!
 //! `cargo bench -p vos-tree --bench update -- [keys …]`, 1M and 10M keys
 //! by default.

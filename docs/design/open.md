@@ -42,10 +42,13 @@ The scale results are in `core-model.md` §14, "The scale test".
 - **The storage engine's tuning:** compaction under sustained writes, cache
   sizing per node, cold reads (`core-model.md` §9.5).
 - **Placement:** agents placed and rebalanced through membership changes.
-- **The executors' verification bound** on a many-core host: the per-core
-  verification table is measured on the development machine only; a bound
-  per verification under full load (within 5 ms on average) is not yet a
-  gate.
+- **The executors' verification gate** (`node/SECURITY.md`, "Denial of
+  service": at least 100 credentialed verifications a second per
+  verifying thread, scaling linearly): its own run, the node pinned to a
+  many-core host's performance cores and the generator on another machine
+  over QUIC, is not done; the development desktop's table holds to 8
+  threads and misses at 16 and 22. A bound per verification under full
+  load (within 5 ms on average) is not yet a gate.
 
 ## Proving
 

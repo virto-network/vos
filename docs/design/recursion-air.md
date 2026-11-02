@@ -11,22 +11,20 @@ verifier, and the gates its build passed.
   - **[measured]**: counted by running code: our chips and the recursion
     AIR's components driven through constraint-framework's recording
     evaluator, compiled to gates, or timed. Unless a line says otherwise,
-    on the x86 development machine (Intel Core Ultra 7 155H), the built
+    on the x86 development desktop (Intel Core Ultra 7 155H), the built
     circuits on 2026-10-18 over the window kernel's 8,009-column segment
     shape, and the current segment format's on 2026-11-01;
-  - **[model]**: computed from measured counts with the verifier's structure
-    (`SP/count/src/model.rs`); the segment verifier's terms and totals are
-    in "Appendix: the verifier cost model", the older pre-hardening count
-    in `SP/logs/count.log`;
+  - **[model]**: computed from measured counts with the verifier's
+    structure; the segment verifier's terms and totals are in "Appendix:
+    the verifier cost model", pinned term by term by
+    `recair/tests/recursion/leaves.rs`. The counts marked pre-hardening
+    are an older count over the pre-hardening shape, not recounted;
   - **[projected]**: time and memory from other provers' measured rates.
 - **Paths:**
   - `P` = vos-core's `pvm/proof` (at `b5d42dc2`);
-  - `ST` = Stwo at the pin `e1286720` (`crates/`);
+  - `ST` = Stwo at the fork's pin `e14925a8` (`olanod/stwo`, `crates/`);
   - `UP` = `starkware-libs/proving` at `916aefb5` (`crates/`);
   - `AR` = the tag `voucher-recursion-archive` (`053bd607`);
-  - `SP` = `spikes/s5-recair` on branch `spike/s5-recair` (`a2784b49`, local):
-    the counting crate `count/` and its logs `logs/count.log`,
-    `logs/permute-bench.log`.
 
 ## 0. Summary
 
@@ -114,8 +112,8 @@ verifier, and the gates its build passed.
 
 ### 1.2 The components, measured
 
-Driven through `InfoEvaluator` and `ExprEvaluator` (`SP/count/src/rec.rs`)
-[measured, `SP/logs/count.log` §2]:
+Driven through `InfoEvaluator` and `ExprEvaluator` [measured,
+pre-hardening count]:
 
 | component | pre | main | inter | total | constraints | max degree | fractions | OODS gates (fused) |
 |---|---|---|---|---|---|---|---|---|
@@ -179,7 +177,7 @@ they are.
 - **Absorbed values are yielded where they are hashed.** A queried value
   enters the circuit as a limb of a wire the leaf row yields; the DEEP rows use
   it. So a verified column costs one eighth of a row and no guess row.
-- **The check** (`SP/count/src/main.rs` `p2_check`) builds a row's honest
+- **The check** (`p2_check`) builds a row's honest
   witness with vos's own round functions, evaluates the recorded constraints in
   leaf-continue, node (both bits) and channel-continue modes, and compares the
   outputs with `poseidon2::permute`: all pass, and one changed cell fails a
@@ -248,7 +246,7 @@ they are.
 
 ## 3. The gate compiler
 
-**Pipeline** (`SP/count/src/record.rs`, `SP/count/src/dag.rs`):
+**Pipeline:**
 1. drive a chip's own `add_constraints` with `ExprEvaluator` through
    `drive_chip_oods` (`P/src/framework_access.rs:100-167`), and its
    `InfoEvaluator` for the mask offsets;
@@ -285,7 +283,7 @@ they are.
   tree 0, by id.
 
 **Measured, the window kernel's shape** (mask `0x807cffff`, 32k cut;
-`SP/logs/count.log` §1):
+pre-hardening count):
 - 7,519 columns (163 + 5,100 + 2,248 + 8), 8,493 samples, 4,223 constraints
   and 1,109 fractions, max degree 3, 20 relations, as the AIR audit
   counted.
@@ -375,7 +373,7 @@ rows [model].
 **The leaf's own work** [model]:
 - the entry and exit digests over 148 bytes each, 19 permutations apiece, and
   the output preimage, 7: about 45 permutation rows, some 25 beyond
-  `SP/logs/count.log`'s allowance;
+  the pre-hardening count's allowance [model];
 - the io-hash's 16 limbs from φ9..12's bytes, `b0 + 256·b1`;
 - the flags checked against leaf-circuit constants (`proving.md` §3.3).
 
@@ -455,7 +453,7 @@ shape is fixed, and a circuit pins it.
 
 ### 4.7 Cost per verified column and per query
 
-Window kernel, 39 queries (`SP/logs/count.log`, "slopes"; at 40 queries
+Window kernel, 39 queries (pre-hardening count [model]; at 40 queries
 over the 8,009-column shape, 56.2, 506 and 139,808 cells, the Appendix)
 against StarkWare's measured slopes:
 
@@ -524,7 +522,7 @@ columns (8,009 in the window kernel's shape). The rows below are at 40
 queries over that shape [model, the Appendix, with a leaf's own work],
 beside the built circuits [measured]; §4.8 gives the current segment
 format's window leaf. The solvency predicate's row is the 39-query count
-over the pre-hardening shape (`SP/logs/count.log`), not recounted. The
+over the pre-hardening shape [model], not recounted. The
 five more queries make a fold about 13% dearer than 39 [model]. Memory and
 time [projected] at 5.0–10.9 B per extended cell and 51–110M extended
 cells per second, the range of StarkWare's circuit prover and a proxy
@@ -574,8 +572,7 @@ Every leaf has the recursion AIR's 458 columns; what varies is the rows.
 - **Poseidon2 hashing on the prover.** A leaf proof commits about 25M
   permutations (one per eight extended cells, the lifted leaf's prefix reuse,
   `P/src/poseidon2/mod.rs:716-760`, plus nodes and FRI) [model]. vos's scalar
-  permutation takes 0.8–2.4 µs by the machine's load [measured,
-  `SP/logs/permute-bench.log`]: 20–60 s on one thread, 2.5–7.5 s on eight.
+  permutation takes 0.8–2.4 µs by the machine's load [measured]: 20–60 s on one thread, 2.5–7.5 s on eight.
   The rates above assume the SIMD Poseidon2 hasher.
 - **Per window** (8 journals: 16 segments at 32k, 4 at 131k): 31 or 7 nodes
   of the padded shape plus the wrap, about 42–90 s or 13–28 s against 368 s
@@ -721,8 +718,7 @@ for x86 and wasm32, and the JAM build runs on the pinned nightly with
 build-std. It holds:
 - **`vos-pvm-recair-air`** (`pvm/proof/recair-air`), the three components'
   constraint bodies, no_std, with no prover dependency, shared with the
-  prover `vos-pvm-recair` (`pvm/proof/recair`; the bodies `SP/count/src/rec.rs`
-  states);
+  prover `vos-pvm-recair` (`pvm/proof/recair`);
 - the wrap's constants: its preprocessed root, component log sizes, column
   ids, the parameters of §7, the format number;
 - Stwo's core verifier at the pin, FRI fold step 3 and a 2^6 last layer
@@ -788,8 +784,7 @@ judging a statement; the Wasm blob (305 KB) exports both.
 **From the archive** (`AR`, the owner's code; its linear layers are Stwo's
 example code, Apache-2.0, and keep that attribution):
 - `zkpvm/tests/recursion_common/mod.rs:78-132`, `:427-536`: the linear layers
-  and the permutation body (re-cut to two columns per S-box, already done in
-  `SP/count/src/rec.rs`);
+  and the permutation body (re-cut to two columns per S-box);
 - `zkpvm/tests/fri_fold_chip.rs:9-16`, `:81-99`, `fri_twiddle_chip.rs:85-137`:
   the fold's closed form and the twiddle from query bits;
 - `zkpvm/tests/merkle_decommit_trees.rs:328-409`: the leaf sponge and the path
@@ -848,12 +843,13 @@ needs the SIMD Poseidon2 hasher for speed, not for correctness.
 
 ## Appendix: the verifier cost model
 
-The gate-count model [model] (`SP/count`, ported to vos-core) over the
+The gate-count model [model] over the
 25-chip segment AIR without the fifteen unread CPU columns and twelve
 next-row masks (§3), at the segment parameters: blowup 4, 40 queries, PoW
 24, interaction PoW 8, FRI fold step 1, log last-layer degree bound 0. The
 gate counts are measured; the rows are the model's. Run on the x86
-development machine (Intel Core Ultra 7 155H), release build, 2026-10-18.
+development desktop (Intel Core Ultra 7 155H), release build, 2026-10-18;
+"Appendix: reproduce" pins it.
 
 - **The window kernel's shape:** 23 chips (mask `0x01f9ffff`, all but
   POPCOUNT and BITCOUNT), class 1 at 2^15 steps and 8 pages (class 0 at
@@ -949,13 +945,13 @@ to the verification. Every leaf pads to 2^16 / 2^17 / 2^16 (tallest 2^17,
 
 ## Appendix: reproduce
 
-```sh
-cd .worktrees/s5-recair/spikes/s5-recair/count   # branch spike/s5-recair, local
-cargo build --release --offline                  # nightly-2025-07-14, the repo's toolchain
-./target/release/s5-recair-count > ../logs/count.log
-```
+The appendix's numbers are pinned by
+`pvm/proof/recair/tests/recursion/leaves.rs`
+(`the_window_kernels_leaf_rows_per_term`): it builds the window kernel's
+leaf topology, checks each term's rows against the model's, and asserts
+the class-1 totals 59,242 / 102,049 / 46,080 (the built rows 55,451 /
+99,414 / 43,960 on the current segment format):
 
-Under `systemd-run --user --scope -p MemoryMax=16G -p MemorySwapMax=0 nice -n 10`;
-the run takes about 2 s. The only change outside `spikes/` lets
-`drive_chip_oods` reach BITWISE_AND_BYTE (`6acdc7df`), as the audit's
-`d165a7b6` did.
+```sh
+cargo test --release -p vos-pvm-recair --test recursion leaves
+```

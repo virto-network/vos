@@ -1,6 +1,6 @@
 # The scale test's inventory: copy it to `inventory.toml`, one `[[host]]`
 # a node or a driver, and run `vos-scale check` until every host passes.
-# This is the runs' layout (S35): three nodes on `compumax`, each with its
+# This is the runs' layout: three nodes on one host, each with its
 # own ports, cores and directory; the driver on the desktop, which is
 # also the coordinator.
 # Every host is x86-64 Linux 6.7 or later on a wired link, reached by
