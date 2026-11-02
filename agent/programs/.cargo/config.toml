@@ -5,7 +5,14 @@ rustflags = [
     "-Clink-arg=-T../../pvm/guest/pvm.ld",
 ]
 
+# Every source path a program holds, a panic's location among them, is
+# trimmed to its package's name and version: none holds the path it was
+# built from.
+[profile.release]
+trim-paths = "all"
+
 [unstable]
 json-target-spec = true
+trim-paths = true
 build-std = ["core", "alloc", "compiler_builtins"]
 build-std-features = ["compiler-builtins-mem"]

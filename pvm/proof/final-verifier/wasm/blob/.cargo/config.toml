@@ -8,5 +8,12 @@ rustflags = [
     "-C", "link-arg=--export=__heap_base",
 ]
 
+# Every source path the blob holds, a panic's location among them, is
+# trimmed to its package's name and version: it holds no path it was built
+# from.
+[profile.release]
+trim-paths = "all"
+
 [unstable]
 build-std = ["core", "alloc"]
+trim-paths = true

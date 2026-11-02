@@ -135,12 +135,29 @@ judge-wasm: build-wasm-blobs
     cd pvm/proof/final-verifier/wasm/run; cargo build --release
     let run = "pvm/proof/final-verifier/wasm/run/target/release/vos-pvm-final-verifier-wasm-run"; for case in [[blob task]; ["wasm32-unknown-unknown" ["judge" "pvm/proof/fixtures" "39"]] ["test-formats/wasm32-unknown-unknown" ["judge" "pvm/proof/fixtures" "28,39"]] ["wasm32-unknown-unknown" ["anchors"]]] { for semantics in [pvf client] { ^$run $"pvm/proof/final-verifier/wasm/blob/target/($case.blob)/release/vos_pvm_final_verifier_wasm.wasm" $semantics ...$case.task } }
 
-# The final verifier's Wasm blobs, built as a runtime builds them: the
-# production blob, and the test blob (`test-formats`) in a target
-# directory of its own.
+# The final verifier's Wasm blobs, built as a runtime builds them, from
+# the fixed path (`_at-fixed-path`): the production blob, and the test blob
+# (`test-formats`) in a target directory of its own.
 build-wasm-blobs:
-    with-env { CARGO_INCREMENTAL: "0" } { cd pvm/proof/final-verifier/wasm/blob; cargo build --release }
-    with-env { CARGO_INCREMENTAL: "0" } { cd pvm/proof/final-verifier/wasm/blob; cargo build --release --features test-formats --target-dir target/test-formats }
+    just _at-fixed-path pvm/proof/final-verifier/wasm/blob --release
+    just _at-fixed-path pvm/proof/final-verifier/wasm/blob --release --features test-formats --target-dir target/test-formats
+
+# `cargo build` of the workspace at `dir` (from the repository's root) as
+# if the checkout were at `/tmp/vos-checkout`, a symbolic link to it held
+# under a lock for the build. Cargo hashes a package outside its
+# workspace's root by its absolute path into its symbols, whose order
+# lays out the program's code: built from the fixed path, a guest whose
+# path dependencies lie outside its workspace is the same bytes from any
+# checkout.
+_at-fixed-path dir +args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    fixed=/tmp/vos-checkout
+    exec 9>"$fixed.lock"
+    flock 9
+    ln -sfn "$(pwd -P)" "$fixed"
+    cd "{{dir}}"
+    CARGO_INCREMENTAL=0 cargo build --manifest-path "$fixed/{{dir}}/Cargo.toml" {{args}}
 
 # The proof fixtures under `pvm/proof/fixtures` (`proving.md` A.6), written
 # anew by their generator, `pvm/proof/tests/kernel/fixtures.rs`: at a format bump,
@@ -222,10 +239,10 @@ build-representative: (_build-program "vos-representative")
 # workspace.
 build-credentials: (_build-program "vos-credentials")
 
-# One of the agent's guest programs, alone: its features never unified
-# with another's.
+# One of the agent's guest programs, alone, from the fixed path
+# (`_at-fixed-path`): its features never unified with another's.
 _build-program package:
-    with-env { CARGO_INCREMENTAL: "0" } { cd agent/programs; cargo build --release -p {{package}} --target ../../pvm/guest/riscv64em-vos.json }
+    just _at-fixed-path agent/programs --release -p {{package}} --target ../../pvm/guest/riscv64em-vos.json
 
 # The JAM statements service's program, `statement-service.elf`.
 build-statement-service: (_venue-guest "vos-statement-service" "statement-service" "pvm-guest")
@@ -235,20 +252,20 @@ build-statement-service: (_venue-guest "vos-statement-service" "statement-servic
 build-final-verify: (_venue-guest "vos-statement" "final-verify" "pvm-guest") (_venue-guest "vos-statement" "final-verify-test" "pvm-guest,test-formats")
 
 # Every guest blob `blobs.lock` pins, its hash then its path from the
-# repository's root: the venue's programs, the representative, the
-# credential actor and the test actors (the bins of their workspace, so an
-# ELF another branch left in its target is none). Each ELF is hashed with
-# its symbols and relocations stripped (the toolchain's `rust-objcopy`): an
-# out-of-tree workspace's symbol names hash its path dependencies' absolute
-# paths (cargo's `-C metadata`), so its symbol table differs between
-# checkouts while its code does not. The default agent and the final
-# verifier's Wasm blobs are left out: their code too differs between
-# checkouts, for the same reason.
+# repository's root: the venue's programs, the default agent, the
+# representative, the credential actor, the final verifier's Wasm blobs
+# and the test actors (the bins of their workspace, so an ELF another
+# branch left in its target is none). Each is hashed with its symbols and
+# relocations stripped (the toolchain's `rust-objcopy`): an out-of-tree
+# workspace's symbol names hash its path dependencies' absolute paths
+# (cargo's `-C metadata`), so its symbol table differs between checkouts
+# while its code does not. The agent's programs and the Wasm blobs, whose
+# code that hash orders, are built from a fixed path (`_at-fixed-path`).
 _blob-hashes:
-    if ($env.CARGO_TARGET_DIR? | is-not-empty) { error make { msg: "the blobs are hashed where the recipes build them: unset CARGO_TARGET_DIR" } }; let fixed = ["target/riscv64em-vos/release/final-verify.elf" "target/riscv64em-vos/release/final-verify-test.elf" "target/riscv64em-vos/release/statement-service.elf" "agent/programs/target/riscv64em-vos/release/vos-representative.elf" "agent/programs/target/riscv64em-vos/release/vos-credentials.elf"]; let actors = (cargo metadata --manifest-path agent/test-actors/Cargo.toml --no-deps --format-version 1 | from json | get packages.targets | flatten | where {|target| "bin" in $target.kind } | get name | sort | each {|name| $"agent/test-actors/target/riscv64em-vos/release/($name).elf" }); let sysroot = (rustc --print sysroot | str trim); let objcopy = ($sysroot | path join lib rustlib (rustc -vV | lines | parse "host: {host}" | get host.0) bin rust-objcopy); let stripped = (mktemp -t); for path in ($fixed ++ $actors) { with-env { LD_LIBRARY_PATH: ($sysroot | path join lib) } { ^$objcopy --strip-all $path $stripped }; print $"(open --raw $stripped | hash sha256)  ($path)" }; rm $stripped
+    if ($env.CARGO_TARGET_DIR? | is-not-empty) { error make { msg: "the blobs are hashed where the recipes build them: unset CARGO_TARGET_DIR" } }; let fixed = ["target/riscv64em-vos/release/final-verify.elf" "target/riscv64em-vos/release/final-verify-test.elf" "target/riscv64em-vos/release/statement-service.elf" "agent/programs/target/riscv64em-vos/release/vos-agent.elf" "agent/programs/target/riscv64em-vos/release/vos-representative.elf" "agent/programs/target/riscv64em-vos/release/vos-credentials.elf" "pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm" "pvm/proof/final-verifier/wasm/blob/target/test-formats/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm"]; let actors = (cargo metadata --manifest-path agent/test-actors/Cargo.toml --no-deps --format-version 1 | from json | get packages.targets | flatten | where {|target| "bin" in $target.kind } | get name | sort | each {|name| $"agent/test-actors/target/riscv64em-vos/release/($name).elf" }); let sysroot = (rustc --print sysroot | str trim); let objcopy = ($sysroot | path join lib rustlib (rustc -vV | lines | parse "host: {host}" | get host.0) bin rust-objcopy); let stripped = (mktemp -t); for path in ($fixed ++ $actors) { with-env { LD_LIBRARY_PATH: ($sysroot | path join lib) } { ^$objcopy --strip-all $path $stripped }; print $"(open --raw $stripped | hash sha256)  ($path)" }; rm $stripped
 
 # Every guest blob `blobs.lock` pins, built as `check` builds it.
-build-blobs: build-final-verify build-statement-service build-representative build-credentials build-test-actors
+build-blobs: build-final-verify build-statement-service build-agent build-representative build-credentials build-wasm-blobs build-test-actors
 
 # `blobs.lock` written anew from the blobs as built: after a change that
 # moves one, which the lock's diff then shows.
