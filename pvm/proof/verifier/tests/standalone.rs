@@ -352,9 +352,8 @@ fn standalone_verify_rejects_wrong_commitment() {
 }
 
 // format_version is checked first, before any cryptographic
-// work.  A proof with a mismatched format_version (simulating a future-
-// AIR proof presented to today's verifier, or a deserialized older
-// proof that lacks the field — serde-default 0) is rejected immediately.
+// work: a proof under a number the registry does not admit is rejected
+// immediately.
 #[test]
 fn standalone_verify_rejects_format_version_mismatch() {
     let code = vec![Opcode::Trap as u8];

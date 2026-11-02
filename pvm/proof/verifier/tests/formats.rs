@@ -51,7 +51,11 @@ fn side_note() -> SideNote {
 /// One proof under `format` and the side note it was proved over, made once.
 fn proved(format: &'static Format) -> &'static (Proof, SideNote) {
     static SEGMENT: OnceLock<(Proof, SideNote)> = OnceLock::new();
-    assert_eq!(format.number, format::SEGMENT.number, "proved here: 35");
+    assert_eq!(
+        format.number,
+        format::SEGMENT.number,
+        "proved here: the segment format"
+    );
     SEGMENT.get_or_init(|| {
         let mut side_note = side_note();
         let proof = vos_pvm_proof::prove_format(&mut side_note, format).expect("proves");
@@ -107,7 +111,7 @@ fn every_admitted_format_round_trips() {
 
 /// A proof is refused under every other number: a registered format the
 /// registry does not admit, the wrap's (admitted, but not a segment format),
-/// a retired number, and an unregistered one.
+/// and unregistered ones, one an earlier format took.
 #[test]
 fn a_proof_under_one_format_is_refused_under_another() {
     for format in admitted() {
@@ -125,12 +129,7 @@ fn a_proof_under_one_format_is_refused_under_another() {
             };
             refused_both(relabelled, side_note, expected);
         }
-        for number in format::RETIRED {
-            let mut relabelled = proof.clone();
-            relabelled.format_version = number;
-            refused_both(relabelled, side_note, "retired");
-        }
-        for number in [23, 38] {
+        for number in [23, 35, 38] {
             let mut relabelled = proof.clone();
             relabelled.format_version = number;
             refused_both(relabelled, side_note, "not registered");

@@ -29,7 +29,8 @@ use super::{Kind, Reach};
 /// The text each debug output prints, which a production build never does:
 /// the PVM's instruction trace, the recompiler's registers at a run's entry
 /// and exit and its native code's dump, `CPU_DUMP`'s rows,
-/// `CPU_EXPR_DUMP`'s constraints and a segment's profile (`ZKPVM_PROFILE`).
+/// `CPU_EXPR_DUMP`'s constraints and a segment's profile
+/// (`VOS_PROOF_PROFILE`).
 pub const DEBUG_OUTPUTS: [&str; 7] = [
     "pvm-inst",
     "recompiler::run() entry",

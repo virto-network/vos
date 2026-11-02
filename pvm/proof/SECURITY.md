@@ -25,12 +25,12 @@ reference shape, from the security tool (`src/security.rs`):
 
 | format | proofs | channel | counts | floors | status |
 |---|---|---|---|---|---|
-| 41 | segments, the shared chip set (the Poseidon2 call among a node kernel's) | Poseidon2-M31 | 104 / 62.81 | 100 / 60 | admitted; 35, the same before the node shared the chip set, retired |
+| 41 | segments, the shared chip set (the Poseidon2 call among a node kernel's) | Poseidon2-M31 | 104 / 62.81 | 100 / 60 | admitted |
 | 32 | leaves and folds | Poseidon2-M31 | 108 / 63 | 100 / 60 | reserved: proved and verified inside the recursion, refused by every outside verifier |
 | 28 | the final wrap, unmasked | Blake2b-256 | 146 / 82.6 | 100 / 80 | admitted: the tests' and the fixtures', linked by the final verifier under `test-formats` alone |
 | 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 146 / 82.70 | 100 / 80 | admitted: what production venues accept |
 | 44 | credential proofs, masked (variant (c)) | Blake2s-M31 | 110 / 62.92 | 100 / 60 | admitted: what a space's ingress takes |
-| 46 | device proofs, masked (variant (c)), `h = 256` | Blake2s-M31 | 110 / 62.82 | 100 / 60 | admitted: device proofs of auth's statement at a space's ingress; 43, the same at `h = 512`, and 45, at `h = 256` before the shared chip set's 7.21 form, retired |
+| 46 | device proofs, masked (variant (c)), `h = 256` | Blake2s-M31 | 110 / 62.82 | 100 / 60 | admitted: device proofs of auth's statement at a space's ingress |
 
 - **Conjectured** bits are PoW plus queries times log blowup (the ethSTARK
   conjecture, refuted as stated in 2025; the parameters carry a margin for
@@ -44,14 +44,8 @@ reference shape, from the security tool (`src/security.rs`):
   same way, 3. The segment shape batches 11,091 values; 41's query term
   binds, 62.81. The masked device reference (every device chip at 2^17
   rows) batches 7,403; 46 counts 62.82 by affine batching, 62.01 by powers.
-- A verifier rejects a number the registry does not admit, a retired one
-  (24 to 27, 29, 30, 31, 33 to 35, 43, 45; 37, the device format reserved at an
-  unmasked count; 42, the credential format at PoW 20,
-  retired when the gate phone's grind passed 50 ms at its 95th
-  percentile; 36, the legacy segment format, whose 57
-  proven bits at its MOBILE shape were below the 60-bit floor; and 40, the
-  blowup-64 masked wrap a measured proof was made under, never registered)
-  among them, and a proof on another channel than its format's. The
+- A verifier rejects a number the registry does not admit, and a proof
+  on another channel than its format's. The
   proof's configuration must equal the format's, and its counts at its own
   shape must reach the floors.
 
@@ -450,7 +444,7 @@ and over small values (`node/host/tests/carriers/audit.rs`).
 | a panic while a proof is made; a failed proof's error | the panic's place (file and line), not its message; `ProveError::Failed`, which names what failed and no value | leaves (standard error, the logs) | the redacting hook (`node/prover/src/redact.rs`) while a proof is in flight; the audit over the logs |
 | logs, at every level | ids, windows, codes, the prover's backlog counts, each proof's time in seconds, and Stwo's `info!` of a proof's size estimate; at debug level, an agent's guest log lines (`refine_host`'s `log`), text the agent's own code writes, which carries whatever that code puts in it | leaves | the audit, for the node's own lines; an agent's are its author's, audited with its code; the time and the size estimate are side channels as below |
 | standard error | the node's log: `vos` writes its tracing there, at `VOS_LOG`'s level (info by default); no debug output in a production build | leaves | the audit (the run captures both) |
-| the debug outputs: the PVM's instruction trace, `GREY_PVM_DEBUG`'s registers and native code, `CPU_DUMP`, `CPU_EXPR_DUMP`, `ZKPVM_PROFILE` | a run's steps, pcs, registers and trace rows | only a `debug-internals` build (`vos-pvm`'s, this crate's) | `just check-no-debug-internals`: no production edge enables it, and the node's binary names none of them |
+| the debug outputs: the PVM's instruction trace, `VOS_PVM_DEBUG`'s registers and native code, `CPU_DUMP`, `CPU_EXPR_DUMP`, `VOS_PROOF_PROFILE` | a run's steps, pcs, registers and trace rows | only a `debug-internals` build (`vos-pvm`'s, this crate's) | `just check-no-debug-internals`: no production edge enables it, and the node's binary names none of them |
 | the operator's `/stats` | stage histograms, `refine_gas` and `step_gas` among them: a kernel's gas, so its steps, within a quarter and in sums | the node's operator | not audited: the operator runs the replica |
 | the tests' `target/tmp/wrap/` | final wraps (28 of test circuits, 39), their formats, words and judgements' inputs | the test machine | `kernel`'s `wrap_files`: each verifies as a final wrap, and nothing else is there |
 | the agent's log, snapshots and peer frames | `Resume` with the served rows; work results with each `Attest` (witness, output, public arguments, roots); `Proven` with the proof's hash | the agent's replicas | the audit: no node proof, memory root or register file |

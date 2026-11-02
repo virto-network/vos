@@ -25,14 +25,14 @@ use vos_pvm::interpreter::Interpreter;
 
 use vos_pvm_proof::core::tracing::TracingPvm;
 use vos_pvm_proof::{
-    PROOF_FORMAT_VERSION, SideNote, program_commitment_hex, program_commitment_of_proof, prove,
-    verify, verify_chain,
+    SideNote, format, program_commitment_hex, program_commitment_of_proof, prove, verify,
+    verify_chain,
 };
 use vos_pvm_proof_verifier::verify_standalone;
 
 fn main() {
     println!("vos-pvm-proof prove_and_verify example");
-    println!("PROOF_FORMAT_VERSION = {PROOF_FORMAT_VERSION}");
+    println!("segment format {}", format::SEGMENT.number);
     println!();
 
     // ── Step 1: program ────────────────────────────────────────────

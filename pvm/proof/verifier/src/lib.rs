@@ -31,14 +31,14 @@ use stwo_constraint_framework::{PREPROCESSED_TRACE_IDX, TraceLocationAllocator};
 use vos_pvm_proof::format::Format;
 use vos_pvm_proof::pcs::{PcsStack, ProofHash};
 
-// The proof type, the format registry `verify_standalone` admits a proof's
-// number from, and the number the default prover produces.
+// The proof type, and the format registry `verify_standalone` admits a
+// proof's number from.
+pub use vos_pvm_proof::Proof;
 pub use vos_pvm_proof::format;
 pub use vos_pvm_proof::program_id::{
     ENTRY_TIMESTAMP, HALT_PC, KernelEntry, KernelProgram, LeafCircuits, ProgramId,
 };
 pub use vos_pvm_proof::shape::{KernelShape, SegmentClass};
-pub use vos_pvm_proof::{PROOF_FORMAT_VERSION, Proof};
 
 use vos_pvm_proof::framework_access::{
     AllLookupElements, create_verifier_components, draw_all_lookup_elements,
@@ -114,19 +114,16 @@ fn preflight_standalone(
 ) -> Result<&'static Format, VerificationError> {
     let format = vos_pvm_proof::proof::preflight_proof_structure(proof, max_log_size)
         .map_err(VerificationError::InvalidStructure)?;
-    // `component_mask = 0` is a back-compat sentinel meaning "fall back
-    // to count-based inference over the full BASE_COMPONENTS", predating
-    // dynamic chip selection. With `format_version` bumped past those
-    // proofs, the only producer of `mask = 0` is the chip-isolated
-    // `prove_with_explicit_components` path, whose proofs are documented
-    // as "not verifiable via verify_standalone".
+    // `component_mask = 0` reads as every chip, and its only producer is
+    // the chip-isolated `prove_with_explicit_components` path, whose proofs
+    // are not verifiable via `verify_standalone`.
     //
     // Reject early, before any cryptographic work: such a proof names no
     // positions for the boundary chips, through which the standalone
     // verifier binds `proof.{initial,final}_state`.
     if proof.component_mask == 0 {
         return Err(VerificationError::InvalidStructure(
-            "component_mask = 0 is invalid at format_version >= 2 \
+            "component_mask = 0 is invalid here \
              (chip-isolated proofs must use verify_with_explicit_components)"
                 .to_string(),
         ));

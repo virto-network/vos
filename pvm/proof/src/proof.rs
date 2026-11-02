@@ -22,14 +22,6 @@ pub use preflight::{
     proof_owned_bytes, stark_fields_are_canonical,
 };
 
-/// The format the default prover produces: the segment format of
-/// [`crate::format`]. A proof's `format_version` names its entry there, and
-/// verifiers refuse a number the registry does not admit.
-///
-/// What each format number changed: `docs/status.md`, "Proof format
-/// history".
-pub const PROOF_FORMAT_VERSION: u32 = crate::format::SEGMENT.number;
-
 /// Whether consecutive segments chain: each one's final state is the next
 /// one's initial state.
 pub fn check_continuity(proofs: &[Proof]) -> Result<(), stwo::core::verifier::VerificationError> {
@@ -98,7 +90,6 @@ pub struct SegmentState {
     /// genuinely forces memory continuity.  A segment binds `initial_state
     /// .memory_root` (entering image) and `final_state.memory_root` (exit
     /// image); the two are equal across a chain boundary by struct-eq.
-    #[serde(default)]
     pub memory_root: [u8; 32],
 }
 
@@ -108,11 +99,9 @@ pub struct Proof {
     /// decides the channel `stark_proof` must be in, the parameters and the
     /// encodings. A number the registry does not admit is rejected with
     /// `VerificationError::InvalidStructure` before any cryptographic work.
-    #[serde(default = "proof_format_version_default")]
     pub format_version: u32,
     pub stark_proof: StarkProofAny,
     /// The interaction PoW nonce (A.1's fourth item).
-    #[serde(default)]
     pub interaction_pow: u64,
     pub claimed_sums: Vec<SecureField>,
     pub log_sizes: Vec<u32>,
@@ -122,7 +111,6 @@ pub struct Proof {
     /// reconstruct the exact active-chip selection the prover used.
     /// `0` reads as every chip: a chip-isolated proof's, which only
     /// `verify_with_explicit_components` takes.
-    #[serde(default)]
     pub component_mask: u32,
     pub pcs_config: PcsConfig,
     /// State at segment start. pc/timestamp, registers, and `memory_root`
@@ -134,12 +122,6 @@ pub struct Proof {
     pub initial_state: SegmentState,
     /// State at segment end. Same binding scope as `initial_state`.
     pub final_state: SegmentState,
-}
-
-/// Serde default for `format_version` so older serialized proofs (which
-/// pre-date the field) deserialize as version 0 → guaranteed reject.
-fn proof_format_version_default() -> u32 {
-    0
 }
 
 impl Proof {

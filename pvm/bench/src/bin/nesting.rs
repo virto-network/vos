@@ -411,8 +411,8 @@ fn main() {
     let transfers = requests(n, b'T', 0x9e37_79b9_7f4a_7c15);
     let queries = requests(n, b'Q', 0x2545_f491_4f6c_dd1d);
 
-    // Profiling: repeat one fixed-cost scenario, e.g. S2_PROFILE=jit:nested.
-    if let Ok(profile) = std::env::var("S2_PROFILE") {
+    // Profiling: repeat one fixed-cost scenario, e.g. VOS_BENCH_PROFILE=jit:nested.
+    if let Ok(profile) = std::env::var("VOS_BENCH_PROFILE") {
         let (backend_name, scenario) = profile.split_once(':').expect("backend:scenario");
         let (_, backend, model) = backends()
             .into_iter()

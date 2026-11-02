@@ -1,20 +1,18 @@
 //! Format 46 counted on the device shape's masked reference, the built set
 //! with every chip a device program may hold at the most rows a device
-//! program takes; the candidates measured beside it counted on the same
-//! shape.
+//! program takes.
 
 use stwo::core::air::Component;
 use stwo::core::channel::Blake2sChannel;
 use stwo::core::circle::CirclePoint;
 use stwo::core::fields::qm31::SecureField;
-use stwo::core::pcs::DeepBatching;
 use stwo::core::pcs::quotients::deep_values_of_column;
 use stwo_constraint_framework::InfoEvaluator;
 use vos_pvm_proof::device::{DEVICE_ALL, DEVICE_MAX_LOG_SIZE, device_chips_of_mask};
-use vos_pvm_proof::format::{DEVICE_PROOF, DEVICE_REFERENCE, FormatParams, RETIRED, lookup};
+use vos_pvm_proof::format::{DEVICE_PROOF, DEVICE_REFERENCE, FormatParams, lookup};
 use vos_pvm_proof::framework_access::MAX_RELATION_WIDTH;
 use vos_pvm_proof::masked::{DeviceComponents, drive_masked_device_chip};
-use vos_pvm_proof::security::{SecurityBits, SecurityShape, proven_count, security_bits};
+use vos_pvm_proof::security::{SecurityShape, proven_count, security_bits};
 use vos_pvm_recair::masked::device::{device_floors, device_reveals};
 use vos_pvm_recair::masked::mask_pins;
 use vos_pvm_recair_air::masked::{
@@ -81,22 +79,6 @@ fn device_shape(log_size: u32) -> SecurityShape {
     }
 }
 
-/// Format 43's parameters at another blowup, query count, PoW and batching.
-fn candidate(
-    log_blowup: u32,
-    n_queries: usize,
-    pow_bits: u32,
-    batching: DeepBatching,
-) -> FormatParams {
-    FormatParams {
-        log_blowup,
-        n_queries,
-        pow_bits,
-        batching,
-        ..DEVICE_PROOF.params
-    }
-}
-
 /// The registry's reference for format 46 is the built device set's
 /// masked shape at `DEVICE_MAX_LOG_SIZE`, field for field; 46 counts its
 /// pinned bits on it (62.82), and one query fewer falls under 62.
@@ -115,9 +97,6 @@ fn the_device_reference_shape_is_the_built_sets() {
     };
     assert!(proven_count(&fewer, &built).unwrap() < 62.0);
     assert_eq!(lookup(46), Some(&DEVICE_PROOF));
-    for retired in [37, 43, 45] {
-        assert!(RETIRED.contains(&retired) && lookup(retired).is_none());
-    }
 }
 
 /// The masking's condition (`proving.md` §5, how large `h` must be) on
@@ -176,69 +155,5 @@ fn the_reference_bounds_smaller_programs() {
             count >= reference,
             "2^{log_size}: {count} against {reference}"
         );
-    }
-}
-
-/// The least queries clearing 62 proven bits on the reference, by blowup,
-/// PoW and batching: blowup 2 at PoW 20 87 by powers and 85 affine; blowup
-/// 4 43 at PoW 20 and 47 at PoW 16; blowup 8 29 at PoW 20; either batching
-/// where one count is given.
-#[test]
-fn the_least_queries_that_clear_62_bits() {
-    let least = |log_blowup, pow_bits, batching| {
-        (1..=256).find(|&n_queries| {
-            let params = candidate(log_blowup, n_queries, pow_bits, batching);
-            proven_count(&params, &DEVICE_REFERENCE).unwrap() >= 62.0
-        })
-    };
-    for (log_blowup, pow_bits, powers, affine) in [
-        (1, 20, 87, 85),
-        (2, 20, 43, 43),
-        (2, 16, 47, 47),
-        (3, 20, 29, 29),
-    ] {
-        assert_eq!(
-            least(log_blowup, pow_bits, DeepBatching::Powers),
-            Some(powers)
-        );
-        assert_eq!(
-            least(log_blowup, pow_bits, DeepBatching::Affine),
-            Some(affine)
-        );
-    }
-}
-
-/// A candidate's log blowup, queries and PoW.
-type Candidate = (u32, usize, u32);
-/// Conjectured and proven bits.
-type Bits = (u32, u32);
-
-/// The candidates measured (`device-params.md`), each counted on the
-/// reference: `(log blowup, queries, PoW)`, its bits by powers and by
-/// affine batching.
-#[test]
-fn the_candidates_count_on_the_reference() {
-    let candidates: [(Candidate, Bits, Bits); 5] = [
-        ((1, 86, 20), (106, 61), (106, 62)),
-        ((1, 87, 20), (107, 62), (107, 63)),
-        ((2, 43, 20), (106, 62), (106, 62)),
-        ((2, 47, 16), (110, 62), (110, 62)),
-        ((3, 29, 20), (107, 62), (107, 63)),
-    ];
-    for ((log_blowup, n_queries, pow_bits), powers, affine) in candidates {
-        for (batching, (conjectured, proven)) in [
-            (DeepBatching::Powers, powers),
-            (DeepBatching::Affine, affine),
-        ] {
-            let params = candidate(log_blowup, n_queries, pow_bits, batching);
-            assert_eq!(
-                security_bits(&params, &DEVICE_REFERENCE),
-                Some(SecurityBits {
-                    conjectured,
-                    proven
-                }),
-                "{log_blowup}:{n_queries}:{pow_bits} {batching:?}"
-            );
-        }
     }
 }

@@ -382,7 +382,7 @@ fn done(answer: &Response) -> &[u8] {
 /// Each check refuses in its order: a request failing every check from
 /// one on is refused by that one's code, then mended one check at a time.
 /// The frame's size and its decode first, then the agent and its space,
-/// the format (a retired one's), the size (a 1.4 MiB body within the frame
+/// the format (an unregistered one), the size (a 1.4 MiB body within the frame
 /// and the device format's size, past the credential format's; a 600 KiB
 /// credential proof), the
 /// expiry, the method's guard, the kind, the scope, the binding, a
@@ -474,7 +474,7 @@ fn every_ingress_refusal_comes_in_its_check_order() {
         (CredentialRefusal::Expiry { .. }, CredentialRefusal::Expiry { .. }) => {}
         (answer, code) => assert_eq!(answer, code, "{what}"),
     };
-    check(&call, CredentialRefusal::Format, "a retired format");
+    check(&call, CredentialRefusal::Format, "an unregistered format");
     call.format = vos_pvm_recair::device::FORMAT.number;
     check(
         &call,

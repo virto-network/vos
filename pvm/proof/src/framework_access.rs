@@ -145,8 +145,7 @@ impl AirLayout {
 /// Select the active-chip indices from the proof's
 /// `component_mask`.  Bit i set ⇔ chip i was active.
 ///
-/// Back-compat: `mask == 0` (default for older proofs) falls back to
-/// "all chips active" — older proofs predate dynamic selection.
+/// `mask == 0`, a chip-isolated proof's, reads as every chip active.
 fn active_indices_from_mask(mask: u32) -> alloc::vec::Vec<usize> {
     let mask = if mask == 0 {
         crate::chip_idx::ALL

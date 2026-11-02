@@ -19,7 +19,7 @@
 //!   the call ran as the member's pseudonym.
 //!
 //! Exits 0 when every round ran. After `just build-agent build-credentials
-//! build-test-actors`. `spikes/s7-device/scripts/pg2.sh` drives it with a
+//! build-test-actors`. `tools/phone/scripts/pg2.sh` drives it with a
 //! phone.
 
 use std::path::{Path, PathBuf};

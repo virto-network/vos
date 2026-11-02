@@ -11,7 +11,7 @@
 //!
 //! The calls: auth sign-ins, a replay (`Replayed`), a `once` vote and a
 //! second (`Once`), a proof cut by a byte (`Proof`), another call's
-//! arguments (`Binding`), an expired call (`Expiry`), a retired format
+//! arguments (`Binding`), an expired call (`Expiry`), an unregistered format
 //! (`Format`), an owner's payment, a device kernel's sign-in (format 46),
 //! its replay and its proof sent to a guard naming no kernel (`Kind`), a
 //! frame of no kind and one past its kind's limit (`FrameError`), each on
@@ -415,7 +415,7 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
     answers.push(refused(send(&again, &voted_again), CredentialRefusal::Once));
 
     // Refused: a proof cut by a byte, another call's arguments, an expired
-    // call and a retired format.
+    // call and an unregistered format.
     let fresh = founded.call(at, POLL, "login", ());
     let mut proof = prover
         .prove_auth(&secret, &witness, b"login", &fresh)
@@ -438,11 +438,14 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
     let answer = send(&expired, &whole);
     assert!(matches!(answer, Ok(Answer::Expiry { .. })), "{answer:?}");
     answers.push(answer.unwrap());
-    let retired = CredentialProof {
+    let unregistered = CredentialProof {
         format: 42,
         ..whole.clone()
     };
-    answers.push(refused(send(&fresh, &retired), CredentialRefusal::Format));
+    answers.push(refused(
+        send(&fresh, &unregistered),
+        CredentialRefusal::Format,
+    ));
     answers.push(ran(send(&fresh, &whole)));
 
     // Owner: a payment from the row the member's owner digest claims.

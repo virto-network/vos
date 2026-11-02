@@ -184,10 +184,10 @@ pub fn store(store: &vos_node::store::Fjall) -> Vec<u8> {
 /// them: a run under it shows the outputs [`DEBUG_OUTPUTS`](super::DEBUG_OUTPUTS) names unless
 /// they are compiled out.
 pub const DEBUG_ENVIRONMENT: [&str; 4] = [
-    "GREY_PVM_DEBUG",
+    "VOS_PVM_DEBUG",
     "CPU_DUMP",
     "CPU_EXPR_DUMP",
-    "ZKPVM_PROFILE",
+    "VOS_PROOF_PROFILE",
 ];
 
 /// Turns every debug output on, as an operator could: none prints in a

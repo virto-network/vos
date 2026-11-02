@@ -170,7 +170,7 @@ pub fn status(answer: &Answer) -> u16 {
                 | CredentialRefusal::Proof => 403,
             },
             Rejection::Operator(refusal) => match refusal {
-                OperatorRefusal::Expiry { .. } | OperatorRefusal::SocketOnly => 403,
+                OperatorRefusal::Expiry { .. } => 403,
                 OperatorRefusal::Replayed => 409,
                 OperatorRefusal::OtherNode => 421,
             },

@@ -1,11 +1,10 @@
 //! The credential proofs' timings: auth, owner, and membership and payment
 //! together, each proved masked under the registry's credential format on
 //! the Blake2s-M31 channel, `ROUNDS` times after two warm-ups; the median
-//! and the 95th percentile of the prove times, the PoW grinds alone (20
-//! bits, the retired 42's, and 16, 44's: `GRINDS` of each, the evidence
-//! the format was picked on), R1, the verify time and the proof's bytes. Each thread count named on the command line (1, 4 and 8
-//! if none) runs in a rayon pool of its own; the cores are the caller's
-//! (`taskset`).
+//! and the 95th percentile of the prove times, the format's PoW grind
+//! alone (`GRINDS` of it), R1, the verify time and the proof's bytes. Each
+//! thread count named on the command line (1, 4 and 8 if none) runs in a
+//! rayon pool of its own; the cores are the caller's (`taskset`).
 //!
 //! `cargo run --release -p vos-pvm-recair --example credential_timing -- 4`
 
@@ -155,8 +154,7 @@ fn main() {
             .expect("a pool");
         println!("{threads} threads:");
         pool.install(|| {
-            grinds(20);
-            grinds(16);
+            grinds(CREDENTIAL_PROOF.params.pow_bits);
             for (name, statement) in statements() {
                 proves(name, &statement, &CREDENTIAL_PROOF);
             }

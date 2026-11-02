@@ -15,8 +15,9 @@
 //!   awaits the next reply.
 //!
 //! `cargo bench -p vos-node --bench acceptance` (after `just build-agent
-//! build-test-actors`); `GREY_PVM=interpreter` runs the interpreter. Data
-//! goes under `target/`: on the reference laptop `/tmp` is tmpfs.
+//! build-test-actors`); `VOS_PVM_BACKEND=interpreter` runs the
+//! interpreter. Data goes under `target/`: on the reference laptop `/tmp`
+//! is tmpfs.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -244,7 +245,7 @@ fn main() {
     } = Programs::load();
     let increment_method = method(&counter, "increment");
     let value = method(&counter, "value");
-    let backend = std::env::var("GREY_PVM").unwrap_or_else(|_| "default".into());
+    let backend = std::env::var("VOS_PVM_BACKEND").unwrap_or_else(|_| "default".into());
 
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let timing = Arc::new(Timing::default());

@@ -927,7 +927,7 @@ delete and ingestion.
 
 **The store names its layout** [decided]. A row in the system partition
 holds the number of the keyspace layout the store was written in (layout
-2: an instance's committed maps under their own owner byte, `0x03`). A
+1: an instance's committed maps under their own owner byte, `0x03`). A
 new store writes it; opening checks it, and refuses a store in another
 layout, or one that holds rows and names none, rather than read its rows
 where they no longer are. A change to where rows live takes the next
@@ -1568,7 +1568,7 @@ prototypes exist where noted.
 
 **Replication and merge**
 
-19. The vos-raft driver (S3; prototype in `spikes/s3-raft/vos-raft-eager`):
+19. The vos-raft driver (S3):
     - group commit and replicate-on-propose;
     - eager commit notification;
     - one shared executor;

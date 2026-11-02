@@ -194,38 +194,6 @@ fn masked_segments_verify_at_every_size_on_both_channels() {
     assert_eq!(first.proof.claimed_sums, again.proof.claimed_sums);
 }
 
-/// Masked acceptance at the device candidates' floors (`device-params.md`):
-/// blowup 4 with 43 queries (`h = 512`, every chip at `2^11` rows at
-/// least) and blowup 2 with 86 (`h = 1,024`, `2^12`), on Blake2s; R1 in one
-/// attempt over every class, 137 and 266 rows revealed.
-#[cfg(feature = "heavy-gates")]
-#[test]
-fn heavy_masked_segments_verify_at_the_device_floors() {
-    for (log_blowup, queries, log_mask_rows, floor) in [(2, 43, 9, 11), (1, 86, 10, 12)] {
-        let format = Format {
-            params: vos_pvm_proof::format::FormatParams {
-                log_blowup,
-                ..small_format(ChannelKind::Blake2s, log_mask_rows, queries).params
-            },
-            ..small_format(ChannelKind::Blake2s, log_mask_rows, queries)
-        };
-        let (proof, stats) =
-            prove::<Blake2sMerkleChannel>(&format, IO, MaskRng::Seeded(9)).expect("proves");
-        verify::<Blake2sMerkleChannel>(&format, &proof).expect("verifies");
-        assert!(proof.log_sizes.iter().all(|&log_size| log_size >= floor));
-        assert_eq!(stats.attempts, 1);
-        assert_eq!(
-            stats.classes,
-            column_classes(&format, proof.active, &proof.log_sizes)
-        );
-        assert!(2 * stats.revealed_rows <= 1 << log_mask_rows, "{stats:?}");
-        eprintln!(
-            "blowup 2^{log_blowup}, {queries} queries: chips at {:?}; R1 over {} classes, {} rows",
-            proof.log_sizes, stats.classes, stats.revealed_rows
-        );
-    }
-}
-
 /// A broken constraint is refused on the first row, the last and the wrap
 /// row: the register ledger's `BothRealH` (in no relation's tuple) moved at
 /// row 0, at the last row (whose constraint reads row 0 across the wrap)

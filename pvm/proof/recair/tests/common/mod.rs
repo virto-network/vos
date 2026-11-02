@@ -257,8 +257,8 @@ pub fn bump_m31(value: &mut BaseField) {
     *value += BaseField::from(1);
 }
 
-/// The `.rs` files under `dir`, every level, past `target`, `.git`, the
-/// spikes and the worktrees.
+/// The `.rs` files under `dir`, every level, past `target`, `.git` and the
+/// worktrees.
 pub fn sources(dir: &Path) -> Vec<PathBuf> {
     fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -269,7 +269,7 @@ pub fn sources(dir: &Path) -> Vec<PathBuf> {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if path.is_dir() {
-                if !matches!(name.as_ref(), "target" | ".git" | "spikes" | ".worktrees") {
+                if !matches!(name.as_ref(), "target" | ".git" | ".worktrees") {
                     walk(&path, found);
                 }
             } else if name.ends_with(".rs") {

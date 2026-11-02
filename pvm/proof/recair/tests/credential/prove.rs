@@ -1,9 +1,9 @@
 //! Proving and verifying: each kind proved under format 44 on the
 //! Blake2s-M31 channel and verified by the final verifier against its
 //! pinned program; the pins computed from the circuits; the joint circuit
-//! proved and verified, and a proof under the retired 42's parameters
-//! refused; the prover generic over the channel; the built set's shape the
-//! registry's reference.
+//! proved and verified, and a proof under other parameters refused; the
+//! prover generic over the channel; the built set's shape the registry's
+//! reference.
 
 use num_traits::Zero;
 use stwo::core::air::Component;
@@ -73,42 +73,36 @@ fn the_pinned_programs_are_the_circuits() {
     .unwrap()
     .0;
     assert!(!roots.contains(&joint));
-    // The retired 42 committed the same columns at the same blowup: one
-    // root, another program id, which hashes the format.
-    let at_42 = credential::preprocessed_root::<Blake2sM31MerkleChannel>(
-        &retired_42(),
+    // Other parameters over the same columns at the same blowup: one root,
+    // another program id, which hashes the format's number and parameters.
+    let other = other_params();
+    let at_other = credential::preprocessed_root::<Blake2sM31MerkleChannel>(
+        &other,
         &credential::circuit(Some(CredentialKind::Auth)),
     )
     .unwrap()
     .0;
-    assert_eq!(at_42, AUTH_ROOT);
-    let params = |format: &Format| {
-        let p = format.params;
-        [
-            p.log_blowup,
-            p.n_queries as u32,
-            p.pow_bits,
-            p.fold_step,
-            p.log_last_layer,
-            p.interaction_pow_bits,
-        ]
-    };
+    assert_eq!(at_other, AUTH_ROOT);
+    let p = other.params;
+    let params = [
+        p.log_blowup,
+        p.n_queries as u32,
+        p.pow_bits,
+        p.fold_step,
+        p.log_last_layer,
+        p.interaction_pow_bits,
+    ];
     assert_ne!(
-        vos_pvm_recair_air::credential::program_id(
-            42,
-            params(&retired_42()),
-            &LOG_SIZES,
-            &AUTH_ROOT
-        ),
+        vos_pvm_recair_air::credential::program_id(other.number, params, &LOG_SIZES, &AUTH_ROOT),
         Some(AUTH_PROGRAM)
     );
 }
 
-/// The retired format 42: 43 queries and PoW 20, its number refused by
-/// the registry; the tests prove under it to show 44 refuses its proofs.
-fn retired_42() -> Format {
+/// An unregistered format beside 44: 43 queries and PoW 20, the same
+/// columns and blowup.
+fn other_params() -> Format {
     Format {
-        number: 42,
+        number: 47,
         params: FormatParams {
             n_queries: 43,
             pow_bits: 20,
@@ -192,10 +186,10 @@ fn the_slot_does_not_move_the_shape() {
 }
 
 /// Membership and payment together proves and verifies over its own
-/// circuit, measured and not admitted; and auth under the retired 42's
+/// circuit, measured and not admitted; and auth proved under other
 /// parameters is refused under 44.
 #[test]
-fn the_joint_circuit_proves_and_a_retired_42_proof_is_refused() {
+fn the_joint_circuit_proves_and_another_formats_proof_is_refused() {
     let statement = joint(3);
     let finalized = credential::witness(&statement).unwrap();
     let root = credential::preprocessed_root::<Blake2sM31MerkleChannel>(
@@ -221,21 +215,17 @@ fn the_joint_circuit_proves_and_a_retired_42_proof_is_refused() {
 
     let statement = auth(4);
     let finalized = credential::witness(&statement).unwrap();
+    let other = other_params();
     let (proof, _) = credential::prove_on::<Blake2sM31MerkleChannel>(
-        &retired_42(),
+        &other,
         &finalized.circuit,
         &finalized.witness,
         MaskRng::default(),
     )
     .unwrap();
     let root = stwo::core::vcs::blake2_hash::Blake2sHash(AUTH_ROOT);
-    credential::verify_on::<Blake2sM31MerkleChannel>(
-        &retired_42(),
-        root,
-        &statement.words(),
-        &proof,
-    )
-    .unwrap();
+    credential::verify_on::<Blake2sM31MerkleChannel>(&other, root, &statement.words(), &proof)
+        .unwrap();
     assert!(
         credential::verify_on::<Blake2sM31MerkleChannel>(
             &CREDENTIAL_PROOF,
@@ -244,7 +234,7 @@ fn the_joint_circuit_proves_and_a_retired_42_proof_is_refused() {
             &proof
         )
         .is_err(),
-        "a format-42 proof is not a format-44 proof"
+        "another format's proof is not a format-44 proof"
     );
 }
 
@@ -336,14 +326,13 @@ fn credential_shape() -> SecurityShape {
 fn the_credential_reference_shape_is_the_built_sets() {
     let built = credential_shape();
     assert_eq!(built, CREDENTIAL_REFERENCE);
-    for format in [CREDENTIAL_PROOF, retired_42()] {
-        let count = proven_count(&format.params, &built).unwrap();
-        eprintln!("format {}: {count:.3} proven bits", format.number);
-        assert!(count >= 62.0);
-        let fewer = FormatParams {
-            n_queries: format.params.n_queries - 1,
-            ..format.params
-        };
-        assert!(proven_count(&fewer, &built).unwrap() < 62.0);
-    }
+    let params = CREDENTIAL_PROOF.params;
+    let count = proven_count(&params, &built).unwrap();
+    eprintln!("format 44: {count:.3} proven bits");
+    assert!(count >= 62.0);
+    let fewer = FormatParams {
+        n_queries: params.n_queries - 1,
+        ..params
+    };
+    assert!(proven_count(&fewer, &built).unwrap() < 62.0);
 }
