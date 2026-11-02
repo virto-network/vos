@@ -234,7 +234,10 @@ impl Reader {
                 known.limit()
             }
         };
-        let Some(mark) = Mark::from_u8(header.mark) else {
+        // An answer is unmarked: only a request carries a transport.
+        let Some(mark) = Mark::from_u8(header.mark)
+            .filter(|mark| matches!(self.mode, Mode::Requests(_)) || *mark == Mark::Unmarked)
+        else {
             return self.fail(FrameError::UnknownMark, id);
         };
         if body > limit {
@@ -339,6 +342,20 @@ mod tests {
                     matches!(reader.event(), Some(Event::Frame(frame)) if frame.mark == mark),
                     "{mark:?}"
                 );
+                // An answer carries none.
+                let mut reader = Reader::answers(framing);
+                reader.push(&marked(framing, Kind::Time as u16, mark, id, &[]));
+                let event = reader.event();
+                match mark {
+                    Mark::Unmarked => assert!(matches!(event, Some(Event::Frame(_)))),
+                    _ => assert_eq!(
+                        event,
+                        Some(Event::Error {
+                            error: FrameError::UnknownMark,
+                            id
+                        })
+                    ),
+                }
             }
             for byte in [3u8, 0x80, 0xff] {
                 let mut header = Header::of(framing, Kind::Call as u16, id, 100);

@@ -59,7 +59,9 @@ run. Everything here is built.
 - **The transport mark** [decided, `light-node.md` §3.3, E17, E22]: the
   transport a gateway received a request on, which it writes on every
   frame it relays (`vos_api::Mark`): 1, clearnet, from its HTTP and SSH
-  ports; 2, onion, from its onion service's (`light-node.md` §6.1). A
+  ports; 2, onion, from its onion service's (`light-node.md` §6.1; the
+  gateway's `Http.mark` and the SSH relay's mark, every port it opens
+  today clearnet, the onion port with the onion service). A
   relay never passes a client's mark on: the `vos-api` subsystem relays
   each frame anew under its port's mark. Every other sender (a local
   tool on the socket, a driver, a test, the node's own client) sends 0,
@@ -80,7 +82,8 @@ run. Everything here is built.
   2. `kind` not in the table: `UnknownKind`, `0xffff` among them (a frame
      error is an answer, never a request);
   3. on a relay, `kind` not relayable there: `NotRelayed` (§6);
-  4. `mark` not 0, 1 or 2: `UnknownMark`, a request's or an answer's;
+  4. `mark` not 0, 1 or 2 on a request, or not 0 on an answer:
+     `UnknownMark`;
   5. the body (`length` less the header's rest) past the kind's limit:
      `Oversize { limit }`, before any body byte is read or allocated;
   6. the stream or connection ending before `length` bytes:
@@ -115,8 +118,8 @@ run. Everything here is built.
   `Time`, the `Option`s), hence the frame error's `Unavailable`. A node
   answers the `Response` kinds' own `Unavailable` instead.
 - **Close:** after one of the five framing errors (`Oversize`,
-  `UnknownKind`, `Truncated`, `NotRelayed`, `UnknownMark`) the node (or relay) writes it,
-  then closes the QUIC stream (finishes its side and stops reading), or
+  `UnknownKind`, `Truncated`, `NotRelayed`, `UnknownMark`) the node (or
+  relay) writes it, then closes the QUIC stream (finishes its side and stops reading), or
   the whole connection on a byte stream, whose framing it may no longer
   trust: answers in flight on that connection are dropped. A well-behaved
   client never meets one. **`Unavailable` does not close:** the framing is
@@ -255,8 +258,7 @@ budget, past which it is answered `Busy`.
   forwarded between replicas was checked at the replica that took it.
 - **`Rejection` variants** (`vos_wire::ingress`): index 9 is
   `Credential(CredentialRefusal)` (`identity-and-authority.md` §5);
-  index 11 is `Admission(AdmissionRefusal)`: 0 `OnionOnly`, 1
-  `UnknownKey`, both 403; index 10 is `Operator(OperatorRefusal)`:
+  index 10 is `Operator(OperatorRefusal)`:
 
   | index | `OperatorRefusal` | HTTP |
   |---|---|---|
@@ -266,7 +268,8 @@ budget, past which it is answered `Busy`.
 
   An unlisted key keeps `Unauthorized` (6, 401), a bad signature
   `BadSignature` (0, 401); a body that is not an `Operated` is
-  `Malformed`.
+  `Malformed`. Index 11 is `Admission(AdmissionRefusal)`: 0 `OnionOnly`,
+  1 `UnknownKey`, both 403.
 
 ## 4. Operator requests
 

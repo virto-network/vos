@@ -1,0 +1,23 @@
+error: `known_keys` reads `admitted` as a `Table<[u8; 32], V>` of the default transform: ingress looks a key up by its 32 bytes
+ --> tests/compile_fail/known_keys_admitted_ordered.rs:5:15
+  |
+5 |     admitted: Table<[u8; 32], (), Ordered>,
+  |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0412]: cannot find type `Gated` in this scope
+ --> tests/compile_fail/known_keys_admitted_ordered.rs:9:6
+  |
+9 | impl Gated {
+  |      ^^^^^ not found in this scope
+
+error[E0412]: cannot find type `Gated` in module `super`
+ --> tests/compile_fail/known_keys_admitted_ordered.rs:9:6
+  |
+9 | impl Gated {
+  |      ^^^^^ not found in `super`
+
+error[E0433]: failed to resolve: use of undeclared type `Gated`
+ --> tests/compile_fail/known_keys_admitted_ordered.rs:9:6
+  |
+9 | impl Gated {
+  |      ^^^^^ use of undeclared type `Gated`

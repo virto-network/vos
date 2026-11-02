@@ -153,15 +153,15 @@ impl Gates {
     }
 }
 
-/// The node's signature verifications so far.
+/// The node's signature verifications and credential proofs checked so
+/// far.
 fn verifications(node: &Node) -> u64 {
     let stats = node.stats();
-    let verify = stats
-        .stages
-        .iter()
-        .find(|stage| stage.name == "verify")
-        .expect("the verify stage");
-    verify.counts.iter().sum()
+    let count = |name: &str| -> u64 {
+        let stage = stats.stages.iter().find(|stage| stage.name == name);
+        stage.expect("a stage").counts.iter().sum()
+    };
+    count("verify") + count("credential")
 }
 
 fn send(stream: &mut UnixStream, kind: Kind, mark: Mark, id: u64, body: &[u8]) {

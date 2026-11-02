@@ -205,7 +205,8 @@ pub enum FrameError {
     /// A relay's upstream gave no answer.
     #[codec(index = 4)]
     Unavailable,
-    /// The header's mark is not a [`Mark`].
+    /// The header's mark is not a [`Mark`], or an answer's is not
+    /// [`Mark::Unmarked`].
     #[codec(index = 5)]
     UnknownMark,
 }

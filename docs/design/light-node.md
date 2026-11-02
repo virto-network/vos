@@ -425,8 +425,10 @@ Nothing in the node knows a personal agent: any agent's actor may ask.
   workflow read, a credentialed call; a schema read answers none. The
   gateway marks each request it relays with the transport it came in on
   (the frame's `mark`, `node-api.md` §2: 1 clearnet from its HTTP and SSH
-  ports, 2 onion from its onion service's), never passing a client's own
-  on; a node treats a missing mark (0) as clearnet (the unix socket's
+  ports, 2 onion from its onion service's, which comes with the onion
+  service itself, plan 8.25: until then no gateway port marks onion, and
+  an onion-only agent is reached only by a test's port), never passing a
+  client's own on; a node treats a missing mark (0) as clearnet (the unix socket's
   tools and test clients send none). The node trusts the mark as it trusts
   any API client, the gateway being inside the operator's network. The
   mark is the gateway's word, defence in depth against a client bug and
