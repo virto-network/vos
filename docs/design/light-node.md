@@ -1020,13 +1020,13 @@ each a short Rust function in the actor whose state it concerns:
 - any actor's own, under the same rules.
 
 ```rust
-// vos-credentials, beside the tree it proves membership of. Today only
-// `auth` exists as a kernel (the `device` test actor's, hand-lean); `owner`
-// is new.
+// vos-credentials, beside the tree it proves membership of. Both are built
+// and measured as the `sdk-device` test actor's (below); the credential
+// actor takes them with the reference attribute (plan 8.4, 8.5).
 #[attestable(device, reference = reference::auth)]
 pub fn auth(path: &Path, secret: &Secret, #[public] claim: &AuthClaim) {
     let member = Tag::Member.hash(secret);
-    assert_eq!(path.root(Tag::Leaf.hash(&member)), claim.map_root);
+    assert_eq!(path.root(&Tag::Leaf.hash(&member)), claim.map_root);
     assert_eq!(Tag::Nf.hash(secret).hash(&claim.scope), claim.nullifier);
 }
 
@@ -1039,31 +1039,78 @@ pub fn owner(secret: &Secret, #[public] claim: &OwnerClaim) {
 Each claim struct ends with the call's `binding` (§4.3), which the kernel
 carries without reading, as auth's does today.
 
-**High-level code at the lean kernel's cost.** Today's auth kernel takes
-1,722 steps because it is written by hand: arguments decoded in place by
-`InPlace`, word loads through inline assembly, the path walked in one lane
-(`agent/test-actors/device/src/lib.rs`); the same statement written
-plainly took 18,733 steps [measured, `proving.md` §8], about ×11, which the
-cell model puts at about 3 s on the phone [model]. The tricks move into the
-SDK and the toolchain, so the code above is what a developer writes:
-- **in-place arguments by the macro:** a device kernel's arguments of fixed
-  size (`Digest`, `[Digest; N]`, `Path`, plain structs of them) are decoded
-  as references into the argument pages, never copied; the macro lays
-  them out siblings-first so they are page-aligned (what `InPlace` and
-  `auth_arguments` do by hand today);
-- **`vos_sdk::p2`:** `Digest`, `Tag`, `Tag::hash`, `Digest::hash` and
-  `Path::root` over `0x402`, written once, lean (the lane walk with
-  selects, no branch on the slot's bits), and shared by every kernel and by
-  cipher-clerk through its hash trait (§5.3);
+**High-level code at the lean kernel's cost.** The `device` test actor's
+auth kernel takes 1,722 steps because it is written by hand: arguments
+decoded in place by `InPlace`, word loads through inline assembly, the path
+walked in one lane (`agent/test-actors/device/src/lib.rs`); the same
+statement written plainly took 18,733 steps [measured, `proving.md` §8],
+about ×11, which the cell model puts at about 3 s on the phone [model].
+The tricks are in the SDK [built], so the code above is what a developer
+writes (the `sdk-device` test actor's `auth` and `owner`):
+- **in-place arguments by the macro:** a device kernel's arguments by
+  reference, `&T` with `T: vos_sdk::p2::InPlace` (`Digest`, `[T; N]`,
+  `Path`, integers, and `#[derive(InPlace)]` `#[repr(C)]` structs of them
+  with no padding), come first and are read where the witness input left
+  them (`vos_sdk::p2::in_place`: the bounds and the alignment checked,
+  never a copy); the macro refuses one after an argument by value, since
+  each in-place size is whole words and the first lies page-aligned. A
+  `Digest` is 8-aligned, so the code moves it as four plain `u64` loads
+  and stores. The device argument layout is the arguments' in order, a
+  `Path` its 32 siblings then its slot as eight bytes (1,032 bytes), and a
+  claim its digests alone: the stock kernels' claims carry no kind byte,
+  the guard naming the kernel (§4.3);
+- **`vos_sdk::p2`:** `Digest`, `Tag` with `TagHash::hash`, `Digest::hash`
+  and `Path::root` over `0x402`, written once, lean (the lane walk with
+  selects, no branch on the slot's bits, a digest's equality by every word
+  without an early exit), and shared by every kernel and by cipher-clerk
+  through its hash trait (§5.3). Its unaligned word accesses
+  (`load_u64`, `store_u64`, for a public argument appended to the
+  device's return) are inline assembly until the target change below;
 - **word loads from the compiler:** the guest target built with LLVM's
   `unaligned-scalar-mem` feature, so an unaligned `u64` load is one `ld`
   (the PVM serves unaligned accesses; today the target's own unaligned
-  reads go byte by byte, which is why the kernel uses assembly) [est: to
-  measure first, §9.1]. A target change rebuilds every guest ELF
-  (`pvm/guest/riscv64em-vos.json`), so every pinned blob and program id
-  moves: measured on a branch in M0, landed with M2's re-pin;
-- **a gate:** the SDK-form auth kernel within 1.15× the hand-lean kernel's
-  steps.
+  reads go byte by byte, which is why the SDK uses assembly), measured on
+  a side branch kept apart from the re-pin (below). A target change rebuilds
+  every guest ELF (`pvm/guest/riscv64em-vos.json`), so every pinned blob
+  and program id moves: it lands with M2's re-pin (plan 8.10), and with it
+  the SDK's assembly becomes plain `read_unaligned`/`write_unaligned`;
+- **the gate** (`device_kernel::sdk_form_kernels_run_within_the_lean_kernels_steps`):
+  the SDK-form kernels within 1.15× the hand-lean kernels' steps. **Met**
+  [measured, step counts of the traced run on the host, Intel Core Ultra 7
+  155H, 2026-11-02]:
+
+| kernel | today's target | with `unaligned-scalar-mem` | and the SDK's words as plain accesses |
+|---|---|---|---|
+| auth by hand (`device`) | 1,722 | 1,635 | 1,624 |
+| auth in SDK form | 1,839 (×1.068) | 1,770 (×1.083) | 1,710 (×1.053) |
+| owner by hand (`owner_lean`, over `p2`'s call and word accesses) | 708 | 639 | 604 |
+| owner in SDK form | 708 (×1.00) | 639 (×1.00) | 619 (×1.025) |
+
+  The SDK-form auth's device program has the hand-lean one's log sizes
+  (the CPU at 2^11 rows, the memory ledger at 2^14) and its proof the same
+  size, about 0.88 MB; owner's CPU sits at the 2^10 floor, its proof about
+  0.85 MB [measured, the same host]. Its extra steps (about 117) are the
+  in-place checks and the digests copied once more into each call's block
+  where the hand-lean kernel computes into the lane. With the target
+  feature and the SDK's plain accesses, the SDK-form auth (1,710) runs
+  under today's hand-lean kernel on today's target (1,722). So **the
+  SDK-form kernels are the stock ones** (Q7), and the hand-lean kernels
+  stay as the test actors' references; the fallback (the hand-lean
+  kernels shipped as stock, the assembly kept inside `vos_sdk::p2`) is not
+  taken.
+- **The transpiler and `unaligned-scalar-mem`** [measured, 2026-11-02, on
+  a side branch]: LLVM emits plain misaligned `ld`/`sd`/`lw`/`sw`
+  where it emitted byte loops, and the transpiler takes them: the test actors,
+  the default agent, the representative and the credential actor rebuilt
+  with the feature (every one of their ELFs moves), the SDK's and the
+  node's suites (`vos-sdk` through `vos-scale`, about 740 tests) pass but
+  for the pinned program ids, which move as expected, and one timing test
+  that passes alone; the proof crate's kernel tests pass through the
+  device kernels, the balance kernel and the fixtures, the pinned
+  constants again failing as expected (the chain-proving tests, run one
+  process for all past the 12 GiB cap, are left to 8.10's gate). The
+  step counts above come from it. Not built with it: the final verifier's
+  and the statements service's guests.
 
 ### 4.3 What the node checks at ingress
 
@@ -1863,7 +1910,8 @@ No proving code beyond the levers' format.
 ### 7.4 The SDK macros and the derivation
 
 - `#[attestable(device)]` methods may take references to fixed-size
-  argument types (decoded in place) and declare `reference` and
+  argument types (decoded in place, first among the arguments: built,
+  §4.2) and declare `reference` and
   `headroom`; the derivation records the reference's symbol and refuses a
   device kernel without one.
 - `#[msg(proven = k)]` names a device kernel of the actor or of the agent's
@@ -2452,7 +2500,8 @@ agent. (8.14)
 - **The remaining design choices,** at their recommendations [E11]:
   generic proven calls, `#[msg(proven = k)]` (Q6); SDK kernels measured
   first, the hand-lean kernels the stock ones if the 1.15× gate misses
-  (Q7); glue in the light node's Rust for device effects (Q8); a
+  (Q7; the gate met, the SDK-form kernels the stock ones, §4.2); glue in
+  the light node's Rust for device effects (Q8); a
   `recursion` feature on `vos-pvm-recair` (Q9); arti in the gateway behind
   a `tor` feature, PoW when a release declares it, a C tor sidecar the
   documented fallback (Q11); the pool's integrity and note delivery with
