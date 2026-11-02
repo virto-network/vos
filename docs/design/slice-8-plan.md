@@ -1,12 +1,12 @@
 # Slice 8: the light node and the personal agent — plan
 
-**Accepted for implementation pending the owner's sign-off,
-2026-11-02.** The design is `light-node.md`; this file orders it into
-milestones, steps, gates and estimates, and places what slice 7 carried.
+**Accepted for implementation, 2026-11-02 (owner sign-off).** The design
+is `light-node.md`; this file orders it into milestones, steps, gates and
+estimates, and places what slice 7 carried.
 
-- **Status:** [proposed] until the owner signs off. The steps take the
-  owner's decisions E1–E21 (`light-node.md` §1.1) and the answers of its
-  §9.1; no question is open.
+- **Status:** the steps take the owner's decisions E1–E23
+  (`light-node.md` §1.1) and the answers of its §9.1; no question is
+  open.
 - **Precondition:** slice 7's cleanup before master: the code and the
   documents (merged at `543c05e07`), the single re-pin that resets the
   version counters, and s4's VOS pin moved off the retired device format
@@ -49,7 +49,7 @@ ingress. Every gate has a limit it can miss.
 |---|---|---|---|
 | **PG1′ owner** | the stock `owner` kernel | ≤ 0.5 s, ≤ 512 MiB | M1 (format 46), M2 (47) |
 | **PG2′ sign-in** | the stock `auth` kernel | ≤ 1.0 s at format 46; at format 47 **the gate 0.65 s, the target 0.55 s** (a miss holds M2, the 4-way CPU split the next lever); ≤ 1 GiB; the proof ≤ 1.5 MiB | M1, M2, slice end |
-| **PG3′ flows** | enroll, sign-in and pay (P1); claim at a home-only test space with a phrase kit and with a security-key kit; pair a second device (enrolled in every other space at once, its open claim in the background); sync both ways; retire a phone; a removal let through, one contested and resolved by the kit, and the kit alone removing a phone that holds only a sync key; a restore cancelled by liveness, then one completed on a fresh install; a regroup; move home (two homes); the yearly re-proof with its leaf renewal; every secret behind its prompt; on test homes with delays and the lease in minutes and a low claim difficulty; recorded | each completes; over Tor at the median: a sign-in ≤ 4 s, a P1 payment ≤ 5 s, pairing ≤ 60 s from the scan to the second device's first read, arti warm | M1 (P1, clearnet), M4 (the personal space, clearnet), M5 (over Tor), slice end |
+| **PG3′ flows** | enroll, sign-in and pay (P1); claim at a home-only test space with a phrase kit and with a security-key kit; pair a second device (enrolled in every other space at once, its open claim in the background); sync both ways; retire a phone; a removal let through, one contested and resolved by the kit, and the kit alone removing a phone that holds only a sync key; a restore cancelled by liveness, then one completed on a fresh install; a regroup; move home (two homes); the yearly re-proof with its leaf renewal; every secret behind its prompt; on test homes with delays and the lease in minutes and a low claim difficulty; recorded | each completes; over Tor at the median: a sign-in ≤ 4 s, a P1 payment ≤ 5 s, pairing ≤ 60 s from the scan to the second device's first read, arti and its SSH connections warm | M1 (P1, clearnet), M4 (the personal space, clearnet), M5 (over Tor), slice end |
 | **PG5 footprint** | the light node with arti, `vos-mls` and mls-rs | `.so` growth from `vos-mls` and mls-rs ≤ 2 MB (a miss: trim mls-rs's features, then the owner decides); from arti ≤ 10 MB, provisional until 8.1; idle ≤ 96 MiB; warm bootstrap ≤ 3 s p50; a day of background jobs ≤ 2% of the battery; ≤ 30 rendezvous an hour in the foreground after 8.27 | M0 (first numbers), slice end |
 | **PG6 sync** | the background job; a 1 MiB catch-up; a commit | on a locked phone after first unlock: the job ≤ 30 s and ≤ 1 MB down with nothing new, p50; the 1 MiB catch-up over Tor ≤ 20 s p50; a candidate processed on its copy ≤ 200 ms. **Recorded, as inputs to the windows:** the job in the "rare" bucket, after 3 days offline, after a force-stop, and the latency from a pending operation to its local notification | M4 (clearnet), M5 and slice end (Tor) |
 
@@ -68,11 +68,13 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
 
 ### 8.1 arti on the phone and at a gateway (spike) — E
 - arti-client (`default-features = false`; `tokio`, `rustls`,
-  `compression`, `onion-service-client`) in the facility's build; a
-  throwaway gateway hosting an onion service in process.
+  `compression`, `onion-service-client`, `bridge-client`) in the
+  facility's build; a throwaway gateway hosting an onion service in
+  process, with SSH on it.
 - **Measure:** the `.so`'s growth, idle memory, cold and warm bootstrap,
-  onion connection (p50, p95), a 1 MB upload, a `Time` round trip, 16
-  pipelined queries.
+  a bootstrap through a plain bridge, onion connection (p50, p95), an SSH
+  handshake over it, a 1 MB upload, a `Time` round trip over `vos-api`
+  over SSH, 16 pipelined queries.
 - **Gate:** PG5's arti numbers within twice their limits, or a recorded
   reason and a re-plan of M5. **Phone:** S8-P1. **Estimate:** 1–1.5
   weeks.
@@ -378,9 +380,12 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
 ## M5 — Tor (stream E)
 
 ### 8.25 The gateway's onion service
-- A `tor` feature; ports 22, 80 and `vos-api` (`Call`, and `Credentialed`
-  behind the in-flight cap, per-circuit, per-agent and per-onion caps);
-  the transport mark; full vanguards; PoW behind a flag; the onion set
+- A `tor` feature; the onion serving SSH (22) and HTTP (80), the
+  clearnet's protocols and nothing else [E23]; the SSH `vos-api`
+  subsystem's relay set adding `Call` and `Credentialed` (behind the
+  in-flight cap, per-connection, per-circuit, per-agent and per-onion
+  caps); the transport mark, and a space's option to refuse anonymous
+  calls without it, or to be onion-only [E22]; full vanguards; PoW behind a flag; the onion set
   served by the registrar; every node listed as an upstream; the C tor
   sidecar documented and run once.
 - **Gate:** a flood of well-formed junk proofs through Tor measured
@@ -388,12 +393,19 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   8.5, 8.11. **Estimate:** 2–2.5 weeks.
 
 ### 8.26 The client over arti
-- One `TorClient`; isolation by purpose and identity; a spare circuit for
-  proven calls; dormant mode; s4's SSH over a socketpair descriptor; the
-  pinned onion set and its refresh; the clock named when bootstrap fails;
-  the personal agent's and `Homes`' kinds with no clearnet route at all;
-  no bridges [E19].
-- **Dep:** 8.6, 8.25. **Estimate:** 2–3 weeks.
+- One `TorClient`; `vos-api` over SSH over the onion [E23], one SSH
+  connection per isolation group under its own SSH key, kept open while
+  in use; a spare connected ahead for proven calls; dormant mode; s4's
+  screens over the same Tor through a socketpair descriptor; the pinned
+  onion set and its refresh; the clock named when bootstrap fails.
+- **The Tor policy** [E22]: Tor the default for every space, a per-space
+  opt-out for key-signed calls with a plain warning; no clearnet route at
+  all for anonymous calls or for the personal agent's and `Homes`' kinds;
+  plain bridges pasted in the chrome.
+- **Gate:** an anonymous call refused by the client on a clearnet-only
+  path; a bootstrap through a pasted bridge on the phone; two isolation
+  groups never sharing a circuit or an SSH key in a capture.
+- **Dep:** 8.6, 8.25. **Estimate:** 3–4 weeks.
 
 ### 8.27 The credential tree's feed
 - **Carried in:** tree syncing and the `map_root` fingerprint: each tree
@@ -433,7 +445,7 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   (stream D, week 4–5.5); 8.23a on 8.13, 8.14 and 8.16 (D, in that order
   after 8.11 and 8.12, week 10–13.5); none later than C reaches them.
 - Then M4's acceptance (1–1.5), M5's over Tor with its flood test (1–1.5;
-  Tor ready on stream E by week 13.5–19.5), M6 (2.5–3): **19.5–27
+  Tor ready on stream E by week 14.5–20.5), M6 (2.5–3): **19.5–27
   implementer weeks.**
 - **The heavy-run queue:** M1's and M2's `ci-full` and phone sessions, M3's
   `ci-full` and 8.15's scale run take turns on the machines: about a week
@@ -443,7 +455,8 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   of fixes each): about 4–6 weeks.
 - **The slice: about 24–34 weeks** on six streams. Off the path: A 12–18
   weeks with 8.21; B 7.5–10.5 with 8.23c; D 13–17.5 with 8.23b; E
-  11.5–16; F 5.5–7.5 of its own plus 8.3's keystore half.
+  12.5–17 (8.26 grown by the bridges and SSH connections, still off the
+  path); F 5.5–7.5 of its own plus 8.3's keystore half.
 - **Milestones,** in implementer weeks from the start (before the queue
   and reviews): M0 by week 2–3; M1 by 7–9; M2 by 12–17; M3 by 12–16; M4
   by 16–22.5; M5 by 17–24; M6, the slice's end, by 19.5–27.

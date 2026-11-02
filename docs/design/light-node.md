@@ -1,14 +1,15 @@
 # The light node, the personal agent, one proving path and Tor
 
-Design [proposed]. **Accepted for implementation pending the owner's
-sign-off, 2026-11-02.** The architecture of slice 8
+Design. **Accepted for implementation, 2026-11-02 (owner sign-off).** The
+architecture of slice 8
 (`slice-8-plan.md`): a light node of VOS on the user's devices, a personal
 agent in a space that keeps the user's devices in step, one proving path
 for every device statement, payments rebuilt on cipher-clerk as the
 showcase of attestable Rust, and clients reaching a space over Tor.
-- **Status:** everything here is [proposed] unless tagged [decided] (an
-  owner decision, listed in §1.1 by its number, E1–E21, or cited from
-  another document) or [built] (what `vos-core` holds at `543c05e07`).
+- **Status:** everything here is [proposed], to be built as stated,
+  unless tagged [decided] (an owner decision, listed in §1.1 by its
+  number, E1–E23, or cited from another document) or [built] (what
+  `vos-core` holds at `543c05e07`).
 - **Numbers** carry their tag: [measured] (a run, cited), [model] (the
   cell model, `proving.md` §8), [est] (arithmetic on those, unmeasured).
 - **It amends:** `proving.md` §8 (the credential AIR retired),
@@ -68,9 +69,11 @@ devices decrypt each other's messages".
 | E16 | Recovery in slice 8: the phrase or printed kit, and a FIDO2 security key as a kit (the `hmac-secret` path). An encrypted export file is later. |
 | E17 | Tor-only is a rule for the personal agent: it refuses anything that did not come through the onion service. Bridges and pluggable transports weighed for slice 8 against later (§6.5). |
 | E18 | cipher-clerk v0.4 (the shielded redesign, R1–R11) moves to slice 9 with P2; P1 runs on v0.3.0 unchanged. |
-| E19 | No bridges in slice 8: plain Tor only; a network that blocks Tor pauses the personal space's sync, a stated limit. Bridges and pluggable transports later. |
+| E19 | No bridges in slice 8. Reversed for plain bridges by E22. |
 | E20 | Virto runs a public home-only space, listed in the app as the default; others may run their own, and users may pick them. |
 | E21 | The light node runs in its own `:vos` Android process behind Binder in slice 8, for crash isolation and background sync without the UI process. |
+| E22 | Tor is the light node's default transport for every space, with a per-space opt-out and a plain warning; anonymous (credentialed or proven) calls never leave the client over the clearnet in any space, enforced by the client and optionally by a space's ingress through the gateway's transport mark; a space may declare itself onion-only (the home is, E17); key-signed calls may use the clearnet where the space allows. Plain bridges in slice 8; obfs4 and Snowflake later. |
+| E23 | The gateway's onion serves only HTTP (plain inside the onion) and SSH, the clearnet's protocols; no raw node-API port. The light node speaks `vos-api` over SSH over the onion, whose relay set gains `Call` and `Credentialed`; the SSH handshake is paid once per kept-open connection. SSH over QUIC or a roaming transport later, when UDP over Tor exists. |
 
 ### 1.2 Goals
 
@@ -97,7 +100,8 @@ devices decrypt each other's messages".
    and the CRDT fields; the claim is about what VOS maintains as proving and transport
    code, not a smaller dependency graph.
 6. **Network privacy.** Clients reach a space's gateway as a Tor onion
-   service, so no node or gateway learns a member's network address.
+   service by default, and anonymous calls only so, so no node or gateway
+   learns a member's network address [E22].
 7. **The rule stays:** `vos` and the node know no JAM and no Kreivo
    [decided, `core-model.md` §13]; the same holds for Tor and for MLS:
    the node stores and orders opaque bytes for them (§3, §6, §7).
@@ -135,7 +139,7 @@ devices decrypt each other's messages".
 | **release artifacts** | the transpiled programs of the local actors and the stock kernels' device programs, computed at release and embedded with their ELF bytes; the phone runs no transpiler and no reference run (§4.4) | the release build [new] |
 | **local store** | fjall, as the node's, with small caches (8–16 MiB block cache [est]) | `vos-node`'s `store` [built] |
 | **device prover** | the device profile (format 46, then 47 after the levers, §4.4), masked, `Threads::Auto` | `vos-pvm-proof` and `vos-pvm-recair`'s masked device segment, its recursion prover featured out (§7.1) |
-| **node-API client** | the multiplexed `vos-api` client over any futures-io byte stream: an arti onion stream (§6), or SSH's `vos-api` subsystem as today | `vos-api` [built] |
+| **node-API client** | the multiplexed `vos-api` client over SSH's `vos-api` subsystem, over an arti onion stream (§6) [E23] | `vos-api` [built] |
 | **sync** | merkle-crdt DAGs of the local actors' Merge fields, its `Store` over fjall, sealed before they leave the device (§3.6) | `support/merkle-crdt` [built, no dependent today] |
 | **MLS** | the user's device group, through `vos-mls` over mls-rs, on the host side, native, never in a guest | `vos-mls` [new]; the storage providers and copy-and-swap adapted from the `messaging` branch (§3.4) |
 | **secrets** | per device, as today: the member secret from the keystore's HMAC; the admin key in the hardware keystore; the sync key and MLS state wrapped after first unlock; a security-key kit through the `hmac-secret` path (§3.5) | `vos-device`'s `secret` [built, extended] |
@@ -409,10 +413,10 @@ reads from the agent's own state, as it reads the credential ring:
   clearnet route at all for any kind addressed to the personal agent or to
   `Homes` (not a policy checked at send time); the facility exposes only
   its named operations, never a generic call or query, so no page can
-  steer it; and s4's SSH session, whose `vos-api` subsystem relays
-  queries under an ephemeral key that `Personal` answers nothing, itself
-  runs over Tor (§6.5, §7.3). No facility operation may add a generic
-  call.
+  steer it; and every SSH connection the app opens (the light node's
+  `vos-api` connections and s4's screens alike) runs over Tor, each on its
+  own circuit and SSH key (§6.1, §6.5, §7.3). No facility operation may
+  add a generic call.
 - **Reads are gated in the handlers:** a `Query` is signed by any key
   (`agent/wire/src/ingress.rs`, `QueryCall`) and admission covers
   sessions, so every `Personal` query checks `Query::caller()`
@@ -1515,27 +1519,40 @@ with the service's key from the gateway's key directory; the returned
 stream of `RendRequest`s goes through `tor_hsservice::handle_rend_requests`,
 which yields one `StreamRequest` a client stream (a `BEGIN` to a virtual
 port); accepting it gives a `DataStream`, `AsyncRead + AsyncWrite` for
-futures and tokio. The gateway serves, by virtual port:
-- **22:** s4's SSH, the same `s4-server` handler its TCP port runs;
-- **80:** the HTTP routes, the same `vos-http` server over the stream
-  (`tokio_util::compat`, as today's TCP);
-- **7000 (`vos-api`):** the node API's frames over the stream, the kinds
-  `vos-api` over SSH relays today plus `Call` (the personal agent's
-  pushes, commits and device-set operations) and `Credentialed`, with the
-  gateway's leader-aware routing behind it. `Credentialed` is behind the
-  node's in-flight cap on large requests, per-circuit caps and a cap per
-  onion; Tor itself bounds a flood of well-formed junk proofs (about 1 MB
-  each) to far below a node's verification budget, and malformed short
-  ones fail their decode in microseconds. The pre-check that would refuse
-  a well-formed junk proof in under 1 ms is an optimization with a target,
-  not a precondition (plan 8.5), and a flood through Tor is measured in M5
-  (§6.6). The light node's `vos-api` client runs over the `DataStream`
-  unchanged (a multiplexed client over any futures-io stream).
+futures and tokio. **The onion serves what the clearnet serves, and
+nothing else** [decided, E23]:
+- **22, SSH:** the same `s4-server` handler its TCP port runs, with its
+  `vos-api` subsystem relaying the node API's frames;
+- **80, HTTP:** the same `vos-http` routes (`tokio_util::compat`, as
+  today's TCP), plain inside the onion, whose own encryption and
+  self-authenticating address stand in for TLS.
+
+No third port carries raw node-API frames. **The light node speaks
+`vos-api` over SSH over the onion,** as s4 does today, and the subsystem's
+relay set (`NodeKey`, `Time`, `AgentInfo`, `Schema`, `Query`;
+`node/api/src/lib.rs`, `Kind::relayed`) gains `Call` (the personal agent's
+pushes, commits and device-set operations, and member calls) and
+`Credentialed`, with the gateway's leader-aware routing behind them.
+- **`Credentialed` is capped:** behind the node's in-flight cap on large
+  requests, a cap per SSH connection, per circuit and per onion. Tor
+  itself bounds a flood of well-formed junk proofs (about 1 MB each) to far
+  below a node's verification budget, and malformed short ones fail their
+  decode in microseconds. The pre-check that would refuse a well-formed
+  junk proof in under 1 ms is an optimization with a target, not a
+  precondition (plan 8.5), and a flood through Tor is measured in M5
+  (§6.6).
+- **One SSH connection per isolation group** (§6.2), each authenticated by
+  an SSH key drawn for that connection alone, so the gateway cannot join
+  two groups by their SSH identity; the `vos-api` frames inside carry
+  their own signatures, as today. The handshake is paid once a connection,
+  and the connection is kept open while the group is in use (§6.3).
+- **Later:** SSH over QUIC, or a roaming transport in the manner of mosh;
+  Tor carries streams only, so both wait for UDP over Tor (§9.3).
 
 **Tor carries streams, not datagrams:** no QUIC end to end; UDP over Tor
 is a proposal (339), not deployed. iroh's experimental Tor transport
 tunnels QUIC packets over a stream; we need not, since the gateway already
-speaks streams (HTTP, SSH, framed `vos-api`).
+speaks streams (HTTP and SSH).
 
 **The onion address is the gateway's identity:** self-authenticating, so
 a client that pinned it needs no TLS certificate for it; the SSH host key
@@ -1562,17 +1579,20 @@ could serve a forged set, as it could forge any answer it relays
   one client, `isolated_client()` handles, `set_dormant` when the app is
   in the background, persisted state.
 - **Isolation by purpose:** each of these gets its own circuit
-  (`isolated_client()` or a `StreamPrefs` isolation group), so the
-  gateway cannot join them by circuit:
+  (`isolated_client()` or a `StreamPrefs` isolation group) and its own
+  SSH connection under its own SSH key, so the gateway cannot join them by
+  circuit or by connection:
   - the credential tree's feed (§6.7, plan 8.27): one long-lived circuit,
     since every member reads the same feed; until the feed lands, root
     polls and path fetches each take their own, a rendezvous each (about
     120 an hour in the foreground at today's 30 s polls, a cost PG5
     counts);
   - proven calls (each its own, from a spare: the client keeps one
-    circuit to the onion built ahead for the next proven call and builds
-    the next spare once it is used, since each isolated circuit to an
-    onion service is a new rendezvous, a second or more, heavy-tailed);
+    circuit to the onion built ahead, its SSH handshake done, for the next
+    proven call, and builds the next spare once it is used, since each
+    isolated circuit to an onion service is a new rendezvous, a second or
+    more, heavy-tailed);
+  - the member's own key-signed calls in each space (one group a space);
   - the personal agent's traffic (its own group; its background schedule
     its own, §3.10), never sharing a circuit with the member's proofs;
   - s4's screen session (its own).
@@ -1587,11 +1607,12 @@ could serve a forged set, as it could forge any answer it relays
 | cold bootstrap (consensus and about 8,800 microdescriptors, a few MB) | 10–30 s, timing out at 30 s on a lossy network [unverified, onionmasq's log] | first run, or after a long time offline |
 | warm bootstrap (cached directory) | about 1–3 s [est] | each app start; hidden behind the UI's own start |
 | onion connection (descriptor, introduction and rendezvous circuits) | about 1 to several seconds, heavy-tailed; arti's own issue reports onion connections timing out [unverified, onionperf, arti#2482] | once a purpose a session; pre-built when the app opens (§6.2) |
-| a request on an open circuit (six hops each way) | 0.3–1 s round trip [est] | every call |
-| a proven call without a spare circuit ready | adds an onion connection, 1 to several seconds | a second proven call within a spare's build time |
+| an SSH handshake over the circuit (key exchange and user authentication, about three round trips) | about 1–3 s [est] | once a connection, kept open while its group is in use; done ahead for a proven call's spare |
+| a request on an open connection (six hops each way) | 0.3–1 s round trip [est] | every call |
+| a proven call without a spare ready | adds an onion connection and an SSH handshake, 2 to several seconds | a second proven call within a spare's build time |
 | a proof's upload | a device proof is about 0.9 MB (a spend about 1.2 MB [est]); at the 0.5–2 MB/s an onion circuit sustains, 0.5–2 s [est] | every proven call |
 
-**A sign-in end to end** (an open circuit, the path held): prove 0.45–0.65
+**A sign-in end to end** (a spare connected, the path held): prove 0.45–0.65
 s, upload 0.5–2 s, the round trip 0.3–1 s, the node's apply 35 ms
 [measured, `proving.md` §8]: **about 1.3–3.6 s** [est], against about 0.8 s on the
 clearnet. **A private payment:** 2–4.5 s [est]. The proof's bytes are now
@@ -1611,35 +1632,41 @@ since Zashi 2.1, 2025-08-07, with a prompt to turn Tor off when it is
 slow); the Tor Project's own Android VPN (onionmasq) runs arti and is
 still in beta; Orbot still bundles C tor.
 
-### 6.5 Fallbacks, the Tor-only rule, and blocked networks
+### 6.5 The Tor policy, bridges, and blocked networks
 
-- **The clearnet gateway, by the space's policy,** for calls to a space
-  (not the personal agent): a space declares `tor = required | preferred |
-  off` in what enrollment pins. Under `preferred` the client falls back to
-  the gateway's TLS or SSH address after a bootstrap failure, and its
-  chrome says the call is not private; under `required` it does not.
-  Recommended default: `preferred` for sign-in and the transparent ledger,
-  `required` for the shielded pool's calls (slice 9).
-- **The personal agent is Tor-only, by rule** [decided, E17]: the light
-  node has no clearnet route for any kind addressed to the personal agent
-  or `Homes`, and the agent refuses a request its gateway did not receive
-  on the onion (§3.3). Over the clearnet it would hand the home's operators
-  the device's address beside its pseudonym.
-- **No bridges in slice 8** [decided, E19]: plain Tor only. Bridges
-  (arti's bridge client, which would defeat networks that block Tor by its
-  public relay list) and pluggable transports (obfs4 through lyrebird,
-  Snowflake, WebTunnel, which defeat deep packet inspection but each bring
-  a Go binary run as a managed subprocess on Android) are later work
-  (§9.3).
-- **What a user behind a network that blocks Tor sees** in slice 8:
-  sign-in and P1 calls fall back to the clearnet where the space allows
-  it, saying so; the personal space keeps working locally, does not sync,
-  and shows "backup paused: this network blocks Tor" with the last sync
-  time. **The stated limit:** its timed safeguards run without the device
-  meanwhile. It can neither veto a removal (72 h) nor post the `alive`
-  that cancels a restore (7 days), so a leaked kit's restore can mature
-  against a user whose every device stays behind such a network for a week
-  (§8, H2).
+- **Tor is the default for every space** [decided, E22]: the light node
+  reaches every space through its onion. Per space, the user may opt out
+  for **key-signed calls** (a member's own signed calls, P1 payments)
+  where the space allows the clearnet, after a plain warning that the
+  space's operators then see the device's address.
+- **Anonymous calls never use the clearnet,** in any space: a credentialed
+  or proven call (sign-in, owner proofs, later spends) leaves the client
+  only through Tor, whatever the user's or the space's setting; the client
+  has no clearnet route for those kinds. A space's ingress may enforce it
+  too, refusing them without the gateway's onion mark (§3.3).
+- **A space may declare itself onion-only** in what enrollment pins, so no
+  clearnet route to it exists at all.
+- **The personal agent's home is onion-only, by rule** [decided, E17]: the
+  light node has no clearnet route for any kind addressed to the personal
+  agent or `Homes`, and the agent refuses a request its gateway did not
+  receive on the onion (§3.3). Over the clearnet it would hand the home's
+  operators the device's address beside its pseudonym.
+- **Plain bridges in slice 8** [decided, E22]: arti's bridge client with
+  bridge lines the user pastes (from the Tor Project's bridge
+  distribution), which defeats networks that block Tor by its public relay
+  list, as many campus and corporate networks do. Pluggable transports
+  (obfs4 through lyrebird, Snowflake, WebTunnel), which defeat deep packet
+  inspection but each bring a Go binary run as a managed subprocess on
+  Android, are later work (§9.3).
+- **What a user behind a network that blocks Tor by inspection sees** in
+  slice 8: key-signed calls fall back to the clearnet where the space
+  allows it and the user opted out for it; anonymous calls and the
+  personal space wait, the app saying "this network blocks Tor" with the
+  last sync time. **The stated limit:** the personal space's timed
+  safeguards run without the device meanwhile. It can neither veto a
+  removal (72 h) nor post the `alive` that cancels a restore (7 days), so
+  a leaked kit's restore can mature against a user whose every device
+  stays behind such a network for a week (§8, H2).
 - **A wrong clock:** Tor refuses a consensus outside its validity, so a
   phone whose clock was set by hand fails to bootstrap; the chrome names
   the clock as the cause.
@@ -1777,7 +1804,7 @@ version a release and budget an upgrade step each slice.
 | `vos-wire`, `vos-api` | `Credentialed.claim` in place of `CredentialPublic`; `CredentialedInput` carries the claim; `Principal::Kernel { program }` (index 7); `CredentialKind` deleted; the frame's transport mark (`node-api.md` §2; a missing mark is clearnet, §3.3) |
 | `merkle-crdt` | the incremental apply (`core-model.md` §9.4); the author, its sequence and signature in the payload; a `Store` over fjall; fetching by batch, asynchronously (today's `fetch_missing` walks one node at a time, synchronously, `src/sync.rs`); the `redb` store and feature deleted (one storage engine) |
 | `vos-credentials` | the stock `auth` kernel (from the `device` test actor, in SDK form) and a new `owner` kernel, with their references; each stock guard's compatibility window of program ids (§4.4); the stock kernels' ingress checks stay in the node (§4.3); the registrar's open claim priced by work (§3.3), its person records, `enroll_device` and `revoke_device` (§3.8) |
-| `vos-gateway` | the onion service behind a `tor` feature (§6); a `vos-api` byte-stream port on it; the transport mark on every relayed request; per-circuit, per-agent and per-onion limits; every node of its space listed as an upstream when it serves a home (§3.3) |
+| `vos-gateway` | the onion service behind a `tor` feature, serving the same HTTP and SSH as the clearnet and nothing else (§6.1); the SSH `vos-api` subsystem's relay set adding `Call` and `Credentialed`, with caps per connection, circuit, agent and onion; the transport mark on every relayed request; every node of its space listed as an upstream when it serves a home (§3.3) |
 | new system actors | `Homes` (the pool, claims, the indexes by nullifier and by kit key, the yearly re-proof and the lease) and `Personal` (the device set and its contests, liveness, the commit log and confirmations, sealed scopes, checkpoint acknowledgements, the inbox, quotas, gated queries, an append-only layout), each one package; `Payments` (replacing the `purses` test actor) |
 | new tool | the operator's keeper: topping up the pool, granting `Homes` its role, upgrading `Personal` in batches (§3.3) |
 
@@ -1798,11 +1825,11 @@ No proving code beyond the levers' format.
   an ordinary agent running ordinary actors: nothing in the node knows
   what a personal agent is.
 - **The gateway** keeps HTTP, TLS and SSH, and adds the onion service
-  (§6): the same routes and the SSH port behind an onion address, and a
-  port carrying the node API's frames over the onion stream. Its relay
-  set is wider than the `vos-api` subsystem's today (`NodeKey`, `Time`,
-  `AgentInfo`, `Schema`, `Query`; `node/api/src/lib.rs`, `Kind::relayed`):
-  it adds `Credentialed` and `Call`, which a light node sends there.
+  (§6): the same HTTP routes and SSH behind an onion address, and nothing
+  else [E23]. Its SSH `vos-api` subsystem's relay set is wider than
+  today's (`NodeKey`, `Time`, `AgentInfo`, `Schema`, `Query`;
+  `node/api/src/lib.rs`, `Kind::relayed`): it adds `Credentialed` and
+  `Call`, which the light node sends through it.
 - **Limits that bind the personal agent** [built]: 64 KiB a call's
   arguments, a reply and a row; 256 KiB a step's writes; 16 in flight on
   one `vos-api` channel; one answer a request, no push
@@ -2269,16 +2296,18 @@ target 0.55 s; format 47 ships at what it measures under the gate, and the
 ### 8.7 The network
 
 **H1. The onion is flooded** before arti's service PoW is declared ready.
-*Mitigation:* introduction-point, circuit, per-agent and per-onion caps;
+*Mitigation:* introduction-point, SSH-connection, circuit, per-agent and per-onion caps;
 the in-flight cap on large requests; Tor's own throughput bounding junk
 proofs; a flood measured in M5; the C tor sidecar as the fallback (Q11).
 (8.25)
 
-**H2. Tor is blocked on the user's network.** *Known limit* [decided,
-E19]: no bridges in slice 8, so the personal space does not sync there and
-says so; its veto and `alive` windows run without the device; calls to a
-space may fall back to the clearnet by its policy. Bridges and pluggable
-transports are later work (§6.5). (8.26)
+**H2. Tor is blocked on the user's network.** *Mitigation:* plain bridges
+pasted in the chrome defeat blocking by the public relay list [E22].
+*Known limit:* against deep packet inspection, slice 8 has no pluggable
+transport, so anonymous calls and the personal space wait, saying so, and
+the personal space's veto and `alive` windows run without the device;
+key-signed calls may use the clearnet where the space allows it and the
+user opted out for it (§6.5). (8.26)
 
 **H3. arti's library breaks monthly.** *Mitigation:* one pinned version a
 release, an upgrade step each slice. (8.25, 8.26)
@@ -2303,6 +2332,19 @@ long-lived circuit (8.27); PG5 counts rendezvous. (8.26, 8.27)
 
 **H9. A wrong clock stops Tor.** *Mitigation:* the chrome names the clock.
 (8.26)
+
+**H10. One SSH connection could join two identities.** The light node
+reaches every gateway through SSH over the onion (E23); one connection for
+everything would let the gateway link the member's calls, proven calls
+and the personal agent by their shared SSH session. *Mitigation:* one SSH
+connection per isolation group, each on its own circuit and under an SSH
+key drawn for it alone; a proven call's spare connection is made ahead.
+(8.26)
+
+**H11. A user opts out of Tor for a space.** *Mitigation:* the opt-out
+covers that space's key-signed calls only, after a plain warning;
+anonymous calls and the personal agent stay on Tor whatever the user
+chooses [E22]. (8.26)
 
 ### 8.8 Linkability and membership
 
@@ -2401,8 +2443,10 @@ agent. (8.14)
 - **MLS or a simpler scheme:** MLS, as one `vos-mls` layer [E12].
 - **The home:** a home-only space by default [E14], Virto's listed in the
   app [E20]; **the lease:** a yearly re-proof [E15]; **recovery:** a
-  phrase or a security key [E16]; **Tor:** a rule for the personal agent
-  [E17], with no bridges in slice 8 [E19].
+  phrase or a security key [E16]; **Tor:** the default for every space,
+  anonymous calls only over Tor, onion-only spaces, the home onion-only,
+  plain bridges in slice 8 [E17, E22]; **the ingresses:** HTTP and SSH on
+  the onion, `vos-api` over SSH [E23].
 - **The light node's process:** its own `:vos` process behind Binder
   [E21] (Q5).
 - **The remaining design choices,** at their recommendations [E11]:
@@ -2447,7 +2491,9 @@ One list; `open.md` takes it at the slice's end.
 - History horizons and garbage collection of covered envelopes; a blob
   store for media (§3.4, §3.6).
 - An encrypted export file under the kit's key [E16].
-- Bridges and pluggable transports [E19].
+- Pluggable transports (obfs4, Snowflake) [E22].
+- SSH over QUIC, or a roaming transport in the manner of mosh, once UDP over
+  Tor exists [E23].
 - Excising a device's operations after the fact (§8, C1).
 - A consent model per program id for developers' kernels over private data
   (§4.4).
