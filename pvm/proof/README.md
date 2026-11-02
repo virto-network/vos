@@ -24,8 +24,8 @@ vos_pvm_proof_verifier::verify_standalone(proof, program).expect("valid proof");
 
 Large executions use `prove_chain`. Each segment is bound to the same program
 commitment, and the verifier checks the state boundary between adjacent
-segments. The [prover extension](../../extensions/prover) adds streaming and
-content-addressed storage around these primitives.
+segments. The node's [prover worker](../../node/prover) proves a kernel's
+statements on top of these primitives.
 
 ## Commands
 

@@ -1,9 +1,10 @@
 # vos-scale: the scale test's harness
 
-`vos-scale` runs the scale test (`docs/design/slice-7-mobile.md`, "The
-scale test") on the owner's LAN machines. It runs on one machine, the
-coordinator, and reaches every other host over ssh. An `inventory.toml`
-drives it, with one `[[host]]` entry for each node or driver.
+`vos-scale` runs the scale test (`docs/design/core-model.md` §14, "The
+scale test", which defines its targets T1–T6) on a LAN's machines. It
+runs on one machine, the coordinator, and reaches every other host over
+ssh. An `inventory.toml` drives it, with one `[[host]]` entry for each
+node or driver.
 
 | command | what it does |
 |---|---|
@@ -17,7 +18,8 @@ drives it, with one `[[host]]` entry for each node or driver.
 | `report` | Summarises a run: each host's binding resource, the nodes' stages, leader changes, the drivers' rates and latencies, and the slowest node host. `--compare RUN` sets two runs side by side. |
 | `run` | Does all of these with one command: deploy, up, agents, drive, collect, down, report. |
 
-`--kill NAME`, given to `run` or `drive`, is T5's fault: that node host's
+`--kill NAME`, given to `run` or `drive`, is the recovery target T5's
+fault: that node host's
 unit is killed outright (SIGKILL) `--kill-at-s` seconds into the load (600
 by default) and started again on its data at `--restart-at-s` (900). The
 kill, the unit's end, the restart and the node's first answer are written
@@ -51,7 +53,7 @@ second while active (`--per-user`, 0.1; or `--rate` for `U·a·r` itself).
 - **Calls** arrive open loop, as a Poisson process, and each one's latency
   is timed from its scheduled send.
 - **The mix** (`--mix`, `transfer=0.8,query=0.15,workflow=0.045,cut=0.005`
-  by default, the harness's own shares pending the owner's): transfers, a share `x` of them to a payee in another shard
+  by default): transfers, a share `x` of them to a payee in another shard
   (`--cross`; random payees' `1 − 1/K` by default), sent to the shard's
   leader; queries on a follower; workflows, read until they end; and reads
   at a cut, read again once their window closes (`B_w + D`) and timed from
@@ -62,7 +64,8 @@ second while active (`--per-user`, 0.1; or `--rate` for `U·a·r` itself).
 - **The identity agent** (`run --identity`, or `agents --identity-rows`)
   holds a row a user, replicated on every node; the first driver writes
   it `--identity-hz` times a second (10).
-- **The readers** (`--readers`, 0 by default; T4's is 1%): a share of all
+- **The readers** (`--readers`, 0 by default; the window target T4's is
+  1%): a share of all
   the agents, the shards and the idle ones, each read once at a cut every
   window, at a uniform time within it (`reader`, and `reader_read` timed
   from the close).
@@ -207,7 +210,7 @@ From the repository's root:
 every refusal, or leave that host out with `--exclude NAME`. Warnings,
 such as the governor, a rotating disk or a slow link, are recorded with
 every run, and they name what may bind. Once every host passes, the
-step's gate is one command (raise `api_in_flight` in `[node]` when the
+gate run is one command (raise `api_in_flight` in `[node]` when the
 report says it bound):
 
     target/x86_64-unknown-linux-musl/release/vos-scale -i inventory.toml run \
@@ -224,9 +227,10 @@ more, rerun without it and compare the two runs:
 It lists four nodes and a driver as `localhost` entries, and is marked
 `smoke = true`.
 
-The runs' layout (`inventory.example.toml`, decided S35): three nodes on
-one machine, each its own entry with its own ports, cores and `dir`, and
-the driver and the coordinator on the desktop. `check` sums a machine's
+The runs' layout (`inventory.example.toml`), for a LAN of two machines:
+three nodes on one machine, each its own entry with its own ports, cores
+and `dir`, and the driver and the coordinator on the desktop, reaching
+the nodes over the real LAN. `check` sums a machine's
 caps against its memory and its nodes' disk needs against the disk they
 share, and refuses a node's machine only when a driver or the coordinator
 is on it. With every node on one host, the rerun without the slowest

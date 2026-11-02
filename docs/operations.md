@@ -1,8 +1,7 @@
 # Operating a space's nodes: anchoring
 
-What an operator does about a space's anchors at its venue (pin D′,
-`design/slice-7-mobile.md`). The protocol is `design/proving.md` §7; the
-venue's calls are `design/spaces-pallet.md` (Kreivo) and the JAM
+What an operator does about a space's anchors at its venue. The protocol
+is `design/proving.md` §7; the venue's calls are `design/spaces-pallet.md` (Kreivo) and the JAM
 statements service's controls. First, how an operator reaches a node.
 
 ## Reaching a node
@@ -111,9 +110,9 @@ stop once), and keeps the latest (`Node::anchor_alerts`):
   logged as a warning. Statements over that window's root are refused.
 - **divergent replicas:** the venue holds another root at a window, and a
   replica of the representative, named with the root it holds, holds
-  another row of it than the leader's. The majority decides (S34): with a
-  quorum holding the leader's row the evidence goes all the same; without
-  one, nothing is sent and the leader asks again every 2 s. The named
+  another row of it than the leader's. The majority decides, so a
+  minority's dissent alone never holds the evidence back: with a quorum
+  holding the leader's row the evidence goes all the same; without one, nothing is sent and the leader asks again every 2 s. The named
   root tells which side is wrong: equal to the venue's held root, that
   replica (or a fork of it) is the equivocator, its key compromised;
   equal to neither, it is an apply bug, a cloned store or a compromise.
@@ -154,7 +153,7 @@ genesis, so a new `SpaceId`:
   `dispatch_as_sovereign`, which stays callable on an ended space (its
   existential deposit stays); the registration deposit is released to it
   when the space ends;
-- the credential actor (pin G, from step 7.9) is installed again with the
-  same handle, and its tree re-seeded from the ended space's `member`
+- the credential actor (`vos-credentials`, `design/identity-and-authority.md`
+  §6) is installed again with the same handle, and its tree re-seeded from the ended space's `member`
   digests, with no member action;
 - the Clerk's pair commitments with every counterparty reset.

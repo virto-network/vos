@@ -72,7 +72,7 @@ frame checks and the agent's placement come first, as for any call):
     expiry;
 12. the binding digest is not recorded (`Replayed`);
 13. for a `once` guard, the nullifier is not admitted in its scope
-    (`Once`), before the proof as the plan's order puts it: anyone who
+    (`Once`), before the proof: anyone who
     holds a scope's nullifier, the log's readers among them, learns
     whether it was admitted by a request bound to its own arguments and
     a proof of nothing. Checking it after the proof would spend a
@@ -95,7 +95,9 @@ Ingress calls the final verifier's `credential::verify`, which picks the
 circuit by kind, never the circuit-generic step beneath it, which takes
 any preprocessed root.
 
-**A device proof** (format 46, `slice-7-mobile.md` pin J) authorizes as
+**A device proof** (format 46: the device profile, one masked segment
+without the page-Merkle boundary, every chip at most 2^17 rows, the
+proof at most 1.5 MiB; `proving.md` §8) authorizes as
 an auth credential proof does, and only for a method whose auth guard
 names a device kernel. Its program (the kernel's chips, their log sizes
 and the preprocessed root) is the one this node computes from the
@@ -185,7 +187,8 @@ serve its requests:
   until its next refresh: while the tree changes often, few members hold
   one root at once, so the roots logged on calls in different scopes link
   those calls' pseudonyms to one holder, a fingerprint across scopes that
-  the nullifiers keep apart. The next slice's fix: the library fetches
+  the nullifiers keep apart. The fix, not built (`docs/design/open.md`):
+  the library fetches
   its path at every moved root, so every online member proves against
   the newest, or the log keeps the root's position in the ring (the
   newest, or how many roots it trails) in place of the root
@@ -229,7 +232,9 @@ digest, leaf and siblings alone.
 ## The demo's SSH surface
 
 The gateway's SSH port serves s4's screens and the `vos-api` subsystem to
-a member's phone (`slice-7-mobile.md` 7.13):
+a member's phone, for the demo in s4 (`node/gateway/demo`): enroll, sign
+in and pay, the proofs made on the phone by s4's `vos.credential`
+facility (`identity-and-authority.md` §7):
 
 - **No one in particular.** The port takes any public key as an identity
   for its connection alone (s4's anonymous policy): no session is parked
@@ -349,18 +354,56 @@ a member's phone (`slice-7-mobile.md` 7.13):
   order is the decode and its canonical re-encoding, the interaction PoW,
   the logup totals, the composition at the OODS point, then the PoW, then
   the decommitments, so a wrong PoW is refused after every step but the
-  decommitments [measured, `slice-7-progress.md` 7.23d]:
+  decommitments [measured, x86 development desktop (Intel Core Ultra 7
+  155H), one thread, 2026-11-01]:
   - **format 44, a credential proof** (about 220 KB): verified in about
     2.0 ms; a wrong PoW refused in 0.7 ms, a wrong interaction PoW in
     0.5 ms, one cut short in 0.2 ms
     (`cargo run --release -p vos-pvm-recair --example credential_ingress`);
   - **format 46, a device proof** of auth's kernel (about 880 KB):
-    verified in about 11.7 ms; a wrong PoW refused in 8.0 ms, a wrong
+    verified in about 11.7 ms, within the device budget's gate of at most
+    40 ms on one x86 core; a wrong PoW refused in 8.0 ms, a wrong
     interaction PoW in 5.8 ms, one cut short in 1.1 ms
     (`cargo run --release -p vos-phone --example device_ingress`). A
     device proof's slot is held about six times a credential proof's, so
     the verification budget bounds about a sixth as many device proofs a
     second; "a wrong PoW refused in under 1 ms" is format 44's alone.
+- **The executors' verification gate** [decided]: at `k` verifying
+  threads, at least `100·k` credentialed calls a second, scaling linearly
+  to `N` threads, p99 within 50 ms of a signed call's at the same rate;
+  no absolute rate is claimed. Measured with `k` = 1, 2, 4 and up to the
+  host's physical performance cores, the node pinned to those cores, the
+  load generator on another machine over QUIC, each run at least 10 s,
+  and `N` recorded as the physical cores and the logical threads
+  (`cargo bench -p vos-node --bench credentialed`, its `serve` and
+  `drive`). `100·k` a second on `k` executors leaves each call 10 ms of
+  an executor, verification and apply together, so a host whose threads
+  verify in more than about 7 ms under full load misses the gate,
+  whatever the node does.
+- **Measured** [measured, x86 development desktop (Intel Core Ultra 7
+  155H: 6 P-cores with SMT, 8 E-cores, 2 LP E-cores; 22 logical
+  threads, 16 physical cores), 2026-10-27; an earlier credential
+  parameter set; the node and the generator in one process, other builds
+  sharing the machine, so not the gate's own setup]: one node of a founded space of one, 4 agents, owner
+  transfers over the API's socket, open loop at `100·k` a second for
+  10 s, a signed increment at the same rate beside:
+
+  | k | asked | achieved | credentialed p50 / p99 | signed p50 / p99 | verify mean | |
+  |---|---|---|---|---|---|---|
+  | 1 | 100 | 100 | 5.2 / 7.0 ms | 3.6 / 5.1 ms | 1.81 ms | within |
+  | 2 | 200 | 200 | 5.4 / 6.7 ms | 3.2 / 4.3 ms | 1.98 ms | within |
+  | 4 | 400 | 400 | 5.8 / 7.1 ms | 3.2 / 4.4 ms | 2.29 ms | within |
+  | 8 | 800 | 799 | 6.8 / 14.7 ms | 3.3 / 4.6 ms | 2.72 ms | within |
+  | 16 | 1,600 | 1,037 | 2.6 / 5.4 s | 5.6 / 11.1 ms | 14.4 ms | missed |
+  | 22 | 2,200 | 953 | 6.5 / 13.0 s | 8.9 / 18.1 ms | 17.7 ms | missed |
+
+  Within the bound to `k` = 8, where a verification takes 1.8–2.7 ms and
+  waits for no executor. At 16 and 22 each verification takes 11–18 ms
+  (1.8 ms on a performance core alone), so the executors saturate, shared
+  with the generator, the node's runtime and other builds; the calls in
+  flight stop at the generator's 96 senders, not at the 64 places. The
+  gate's own run, on a many-core host with the generator apart, is open
+  (`docs/design/open.md`).
 - The request's decode and the verifier's bytes are fuzzed
   (`credentialed_decode`, `credential_verify_bytes`).
 - The gateway adds its own limits per address before any of this.

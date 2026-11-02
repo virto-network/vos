@@ -422,7 +422,8 @@ check-release-names:
 # strict signature check past the one verifier each venue hands the core;
 # and each venue calls the core's rules. A tripwire on the rules'
 # arithmetic, not a proof that no rule is restated: the clients' reads of a
-# space's status and listed keys, which pin D′ keeps, are not flagged.
+# space's status and listed keys, which a re-founded space's anchoring
+# keeps, are not flagged.
 check-venue-rules:
     let roots = [pvm/proof/statement/src pvm/proof/statement/service/src node/venue/src tools/jam-dev/src]; \
     let markers = ['MAX_ROOT_AGE_MS' '\.boundary\(' 'verify_strict' 'SMALL_ORDER' 'small_order\(' 'registrable' 'MIN_LENGTH_MS' 'MAX_LENGTH_MS' 'MAX_FOUNDING_KEYS' '[<>]=?\s*last\b' '\blast\s*[<>]']; \

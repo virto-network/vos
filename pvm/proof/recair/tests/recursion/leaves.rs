@@ -3,11 +3,13 @@
 //!
 //! - **COMPARE's leaf:** a chip-isolated COMPARE proof of
 //!   `format::SEGMENT`, verified natively and in a circuit, the circuit
-//!   proved and verified; its rows against `count-35.log`'s "verify COMPARE
-//!   alone"; a tampered OODS sample, queried value, Merkle sibling, FRI
-//!   value and nonce each refused by its check.
+//!   proved and verified; its rows against the verifier cost model's
+//!   (`recursion-air.md`, Appendix) "verify COMPARE alone"; a tampered OODS
+//!   sample, queried value, Merkle sibling, FRI value and nonce each refused
+//!   by its check.
 //! - **The window kernel's class-1 leaf topology,** built without values:
-//!   its rows pinned term by term, each beside `count-35.log`'s model.
+//!   its rows pinned term by term, each beside the verifier cost model
+//!   (`recursion-air.md`, Appendix).
 
 use std::sync::OnceLock;
 
@@ -31,15 +33,16 @@ use vos_pvm_recair::{Context, NoValue};
 
 /// COMPARE, with the byte-range table its range checks look up: COMPARE
 /// commits no preprocessed column and a proof's preprocessed tree is never
-/// empty, so the table's one column is it (`count-35.log`'s model counts one
-/// preprocessed column too).
+/// empty, so the table's one column is it (the verifier cost model,
+/// `recursion-air.md`, Appendix, counts one preprocessed column too).
 const COMPARE_MASK: u32 = 1 << chip_idx::RANGE_MULTIPLICITY_256 | 1 << chip_idx::COMPARE;
 /// The model's COMPARE at 2^12 rows; the table at its own 2^8.
 const COMPARE_FLOORS: [u32; 2] = [0, 12];
 
-/// `count-35.log`'s "verify COMPARE alone" at 40 queries: the verifier's
-/// rows, without a leaf's own work (the boundary terms and digests, which a
-/// chip-isolated proof has none of).
+/// The verifier cost model's (`recursion-air.md`, Appendix) "verify
+/// COMPARE alone" at 40 queries: the verifier's rows, without a leaf's own
+/// work (the boundary terms and digests, which a chip-isolated proof has
+/// none of).
 const COMPARE_MODEL: [usize; 3] = [8_644, 10_352, 280];
 
 struct Compare {
@@ -260,8 +263,9 @@ fn a_chip_isolated_shape_holds_no_boundary_chip() {
 
 // ── The window kernel's leaf rows ──────────────────────────────────────────
 
-/// A term of `count-35.log`'s "verify window kernel class 1": its
-/// component, whether it is per query, its measured rows and the model's.
+/// A term of the verifier cost model's (`recursion-air.md`, Appendix)
+/// "verify window kernel class 1": its component, whether it is per query,
+/// its measured rows and the model's.
 struct Term {
     name: &'static str,
     component: usize,
@@ -287,8 +291,9 @@ const fn term(
 }
 
 /// The terms, measured on format 41's window shape (its logical right
-/// shifts multiplying, so no DIVREM) and `count-35.log`'s model of format
-/// 35's, which held DIVREM's 213 columns. The deltas: the lifting height is 2^20,
+/// shifts multiplying, so no DIVREM) and the verifier cost model
+/// (`recursion-air.md`, Appendix) of the segment format's earlier shape,
+/// which held DIVREM's 213 columns. The deltas: the lifting height is 2^20,
 /// not the model's 2^21 (Stwo's composition bound is the largest component's
 /// log size plus one, split once), a path level and a FRI layer fewer a
 /// query; 16 sample points, not 18 (the largest columns' periodicity points
@@ -345,7 +350,8 @@ const WINDOW_TERMS: [Term; 17] = [
 
 /// The window kernel's class-1 leaf topology (mask `0x02f3fffb`), built
 /// without values: each term's rows as measured, pinned, beside
-/// `count-35.log`'s model (59,242 / 102,049 / 46,080), the segment's
+/// the verifier cost model's (`recursion-air.md`, Appendix) (59,242 /
+/// 102,049 / 46,080), the segment's
 /// verification without the leaf's own work, and the totals within 2^16 /
 /// 2^17 / 2^16.
 #[test]
@@ -434,7 +440,7 @@ fn the_window_kernels_leaf_rows_per_term() {
     assert_eq!(
         totals[1],
         [59_242, 102_049, 46_080],
-        "count-35.log's totals"
+        "the cost model's totals"
     );
     let rows = context.rows();
     assert!(
