@@ -78,6 +78,14 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
 - **Gate:** PG5's arti numbers within twice their limits, or a recorded
   reason and a re-plan of M5. **Phone:** S8-P1. **Estimate:** 1–1.5
   weeks.
+- **Desktop result** (2026-11-02, `light-node.md` §6.3–§6.4; the phone's
+  at S8-P1): PG5's arti numbers pass within twice their limits. The
+  `.so` grows +13.85 MB, or +8.84 MB under fat LTO; arti's idle memory is
+  about 24–27 MiB; the warm bootstrap takes 1.6 s. Separately, the
+  over-Tor sign-in misses PG3′: about 6 s with a spare ready, set by a
+  1 MiB upload at about 0.15 MB/s. That is the recorded reason to re-plan
+  M5. The choices: shrink the device proof, split the upload over
+  circuits, or move PG3′'s over-Tor limit (the owner's call).
 
 ### 8.2 SDK-form kernels, measured — A
 - `vos_sdk::p2`; in-place device arguments; `unaligned-scalar-mem` checked

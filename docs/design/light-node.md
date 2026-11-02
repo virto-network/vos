@@ -205,7 +205,7 @@ actors, and calls a space through its gateway.
 | state | budget | basis |
 |---|---|---|
 | idle, foreground (store open, arti bootstrapped, no proof) | ≤ 96 MiB resident, of which arti ≤ 48 MiB | [est]: interpreter and pool a few MiB, fjall's caches 8–16 MiB, arti's directory and circuits (§6.4), MLS state under 1 MiB for a few devices |
-| the facility's `.so` | growth from arti ≤ 10 MB [provisional until 8.1 measures arm64 with rustls and the onion client]; from `vos-mls` and mls-rs ≤ 2 MB, a limit 8.3 can miss | arti [est], to measure (plan 8.1); mls-rs +0.86 MB stripped [measured, arm64-v8a, 2026-11-02, §3.4] |
+| the facility's `.so` | growth from arti ≤ 10 MB [provisional]; from `vos-mls` and mls-rs ≤ 2 MB, a limit 8.3 can miss | arti: +13.85 MB stripped on arm64, missing the limit by 39% (within twice it); +8.84 MB under fat LTO [measured, §6.4, 2026-11-02]; mls-rs +0.86 MB stripped [measured, arm64-v8a, 2026-11-02, §3.4] |
 | local actor call | ≤ 1 ms on the interpreter | 85 µs an invocation on the node's interpreter [measured, `core-model.md` §14], with the fsync of a local commit dominating |
 | proving a sign-in | ≤ 1 GiB peak (target 768 MiB) | 513 MiB [measured, `proving.md` §8] |
 | background sync job | ≤ 30 s wall, ≤ 1 MB down a run with nothing new | [est]: arti from a warm directory, one onion connection, one cursor query a scope and one for the device-set log |
@@ -1600,6 +1600,35 @@ nothing else** [decided, E23]:
   today's TCP), plain inside the onion, whose own encryption and
   self-authenticating address stand in for TLS.
 
+**What hosting takes in arti-client 0.47** [measured, plan 8.1's spike
+gateway, 2026-11-02]:
+- `launch_onion_service_with_hsid` sits behind the `experimental-api`
+  feature as well as `onion-service-service`, and it refuses a nickname
+  whose key the keystore already holds. A restarted gateway launches with
+  `launch_onion_service`, which takes the stored key: the gateway inserts
+  its key once, and arti's keystore in its state directory holds it after
+  that.
+- The stream types: `RendRequest`s through `handle_rend_requests` give
+  `StreamRequest`s whose `request()` is a
+  `tor_proto::stream::IncomingStreamRequest`; a `Begin` to port 22 is
+  accepted with `Connected::new_empty()`, anything else refused with
+  `End::new_misc()`.
+- **s4-server serves only a `TcpListener`** (`serve_on`). The spike handed
+  each accepted onion stream to the gateway's SSH port on a loopback
+  listener. Through loopback every onion client arrives from 127.0.0.1,
+  so it shares one address's limits (64 connections, 200 requests a
+  second), and the gateway cannot mark the request as onion-borne. The
+  product needs s4-server to serve a given stream (russh's `run_stream`
+  takes any `AsyncRead + AsyncWrite`), so the gateway can mark the stream
+  and apply §6.6's limits to it.
+- Seen from a client, an arti-hosted onion showed no difference from a
+  C tor-hosted one [measured, x86, 2026-11-02, n = 20 each]. Isolated
+  connections from one warm client to the spike's onion took a median of
+  4.6 s (p95 12.3 s, 0 failed); to the Tor Project's C tor-hosted website
+  onion, 5.0 s (p95 8.0 s, 2 failed). The descriptor publisher reported
+  `DegradedUnreachable` after one HsDir upload timed out, stayed in that
+  state for the whole two-hour session, and kept serving.
+
 No third port carries raw node-API frames. **The light node speaks
 `vos-api` over SSH over the onion,** as s4 does today, and the subsystem's
 relay set (`NodeKey`, `Time`, `AgentInfo`, `Schema`, `Query`;
@@ -1643,14 +1672,39 @@ could serve a forged set, as it could forge any answer it relays
 
 - **One `TorClient` a process,** created in the light node on the
   facility's tokio runtime (`arti-client` with `default-features = false`
-  and `tokio`, `rustls`, `compression` and `onion-service-client`: the
+  and `tokio`, `rustls`, `compression`, `onion-service-client`,
+  `bridge-client` and `static-sqlite`: the
   defaults are `tokio`, `native-tls` and `compression`, and
   `onion-service-client` is not among them; `static` is not taken, since it
-  vendors native-tls and so OpenSSL), its
+  vendors native-tls and so OpenSSL, but `static-sqlite`, its other half,
+  is: without it the directory cache's rusqlite links the system's
+  `libsqlite3`, which the NDK does not offer to apps), its
   state directory in the app's private storage so later starts skip the
   cold bootstrap. Zcash's `zcash_client_backend::tor::Client` is the model:
   one client, `isolated_client()` handles, `set_dormant` when the app is
   in the background, persisted state.
+- **What the embedding needs** [measured, plan 8.1, 2026-11-02]:
+  - With `rustls`, the application installs rustls's process-wide
+    `CryptoProvider` before it creates the client; ring's, the one russh
+    and the gateway use already, so no second crypto library comes in.
+  - arti-client 0.47 declares Rust 1.92. The facility's pinned nightly
+    (2025-07-14, a 1.90 nightly) builds it under `--ignore-rust-version`
+    once `typed-index-collections` is held at 3.2.3 (3.4 and 3.5 call
+    `reverse` in a const fn, not stable on that nightly). No newer
+    nightly was found: the one tried (2026-03-20) does not build Stwo at
+    the facility's pinned revision (`array_chunks` is gone). So every
+    arti upgrade may hit the same wall until the prover's nightly moves,
+    and §6.7's "an upgrade step each slice" includes checking this.
+  - **A bootstrap through an unreachable bridge never ends:**
+    `create_bootstrapped` with one bridge line whose address refused TCP
+    ran for 15 minutes, cold and then warm, without an error, until the
+    harness stopped it. The light node bounds it, and says "this bridge does
+    not answer".
+  - **Nothing else ends on its own either:** one run hung after its
+    second connection, and in another the SSH connection dropped while a
+    channel was opening. The light node puts a deadline on the onion
+    connection, the SSH handshake and each `vos-api` request, and treats
+    a missed one as a lost connection.
 - **Isolation by purpose:** each of these gets its own circuit
   (`isolated_client()` or a `StreamPrefs` isolation group) and its own
   SSH connection under its own SSH key, so the gateway cannot join them by
@@ -1693,6 +1747,53 @@ the largest term, which makes the device format's proof size a lever of
 its own (§4.4): the per-program CPU and word-level memory cut columns, and
 so bytes, by the same fraction as cells.
 
+**Measured on a desktop** [measured, x86: Intel Core Ultra 7 155H, a home
+connection in Europe; arti-client 0.47.0; 2026-11-02]. A light-node client
+with §6.2's feature set reached a spike gateway through the gateway's
+in-process arti onion, over the live Tor network. The gateway was
+vos-gateway's SSH port with its `vos-api` subsystem, in front of one
+node. The runs: 3 cold bootstraps, 5 warm, and a cold and a warm one
+through a plain bridge. Each run opened 3–8 connections, each from its
+own `isolated_client()`, so each was its own rendezvous. Each connection
+went: onion stream, SSH under a fresh key, the `vos-api` channel, a
+`Time`. On its last connection a run then made 5–20 `Time` round trips,
+three batches of 16 pipelined `Query`s (the counter's `value`), and 1 MiB
+uploads on a second SSH channel, each timed to the gateway's 8-byte
+acknowledgement. Phone figures come from the phone session (§6.4).
+
+| phase | estimate above | measured: median, range or p95 (n) |
+|---|---|---|
+| cold bootstrap, empty state | 10–30 s | 4.6 s, 3.9–14.8 s (3) |
+| warm bootstrap | 1–3 s | 1.6 s, 1.4–2.7 s (5); the gateway's own 1.1 s |
+| bootstrap through a plain bridge | — | cold 8.6 s, warm 1.3 s (1 each), through a vanilla line from `bridges.torproject.org`; the other line given refused TCP (§6.2) |
+| cold start to the first onion stream | — | 7.8 s, 35.8 s and 65.7 s (3 runs): the first rendezvous after a cold bootstrap is the slowest |
+| onion connection, warm client | 1 to several s | 4.7 s, p95 58 s (30), with one run's five of seven connections at 43–84 s; without that run 3.7 s, p95 13.6 s (28). Against this onion 8 of 52 attempts failed: 4 passed 120 s and 4 failed within 3–5 s ("failed to obtain hidden service circuit") |
+| SSH handshake (key exchange, user authentication, the subsystem) | 1–3 s | 3.5 s, p95 5.2 s (30), above the estimate: key exchange 1.1 s, authentication 1.5 s, subsystem 0.9 s |
+| a `Time` on an open connection | 0.3–1 s | 0.55 s, the median of 4 runs' medians; the first on a new connection 0.49 s, p95 1.0 s (30) |
+| 16 pipelined `Query`s, all answered | — | 1.0 s, p95 1.15 s (12 batches), about two round trips |
+| a 1 MiB upload | 0.5–2 s | 6.7 s, 3.8–15.1 s (16 uploads in 6 runs), about 0.15 MB/s; through the bridge 6.3 s cold, 26 s warm |
+| the same over loopback TCP, no Tor | — | SSH 47 ms, `Time` under 1 ms, 16 queries about 50 ms, 1 MiB 65 ms |
+
+**What this changes:**
+- **The upload dominates.** SSH's 2 MiB channel window does not limit
+  it; the onion circuit does, at 0.07–0.27 MB/s (0.15 MB/s at the
+  median), not the 0.5–2 MB/s assumed. A sign-in with a spare ready is
+  then about 0.6 s of proving plus about 5.5 s for a 0.9 MB proof at the
+  median rate, its reply included: **about 6 s**, against the 1.3–3.6 s
+  estimated above. A P1 payment carries no proof, so it stays near one
+  round trip. The levers: smaller device proofs (format 47 and §4.4's
+  levers cut bytes), and an upload split over several circuits.
+  Congestion control on onion circuits would be a third; it is listed as
+  experimental in arti's 2.5.1 notes (§6.8) and was not tested.
+- **Spares carry the load.** With an onion connection at a median of
+  3.7–4.7 s and a tail of tens of seconds, plus 3.5 s of SSH, a purpose's
+  connection costs about 8 s at the median. §6.2's spare, built ahead
+  with its handshake done, and connections kept open are what make calls
+  usable. A call that finds no spare waits that long.
+- **Pipelining works:** sixteen queries take about twice one round trip,
+  so one SSH connection a purpose carries its group's reads without a
+  second rendezvous.
+
 ### 6.4 What it costs on the phone
 
 No published figures exist for arti's library size, idle memory or
@@ -1704,6 +1805,24 @@ iOS (exchange rates since 2024; transaction submission and fetching in beta
 since Zashi 2.1, 2025-08-07, with a prompt to turn Tor off when it is
 slow); the Tor Project's own Android VPN (onionmasq) runs arti and is
 still in beta; Orbot still bundles C tor.
+
+**Measured for arm64 and on a desktop** [measured, plan 8.1, 2026-11-02;
+arti-client 0.47.0 with §6.2's features, plus rustls's ring provider and
+tokio's multi-threaded runtime, which the light node brings anyway]:
+
+| what | measured | limit (§2.3) |
+|---|---|---|
+| the facility's `.so` growth from arti, `aarch64-linux-android`, built as the APK builds it (`cargo ndk -P 30 build --release`, stripped as packaging strips) | 15.16 MB → 29.01 MB: **+13.85 MB** (+5.82 MB gzipped). `compression` accounts for 0.18 MB and `bridge-client` for 0.45 MB. With fat LTO and one codegen unit: 11.35 MB → 20.19 MB, **+8.84 MB** (+4.27 MB gzipped) | ≤ 10 MB, provisional: missed without LTO, met with it |
+| the spike client's arm64 binary, with arti and without (both stripped) | 2.84 MB → 16.32 MB: +13.5 MB, the same growth | — |
+| resident memory, x86 client (arti bootstrapped, an SSH connection open, idle) | 34–38 MiB, of which arti about 24–27 MiB; the same process over loopback TCP without Tor takes 10.4 MiB. `set_dormant(Soft)` leaves it unchanged: arti does not hand its memory back | ≤ 96 MiB, arti ≤ 48 MiB: met on x86 |
+| the gateway hosting the onion (vos-gateway's SSH and arti), x86 | 31–43 MiB, median 37 MiB, over about 2 h (133 one-minute samples) | — |
+| the state directory | 8.0 MB after a cold bootstrap: the directory cache 7.98 MB, state and keystore 11–14 kB. 11.4 MB after about 1.5 h of runs, once the directory refreshed | — |
+| warm bootstrap, x86 | 1.6 s median (5) | ≤ 3 s p50: met on x86 |
+
+The phone's own figures are the phone session's: both phones' idle
+memory, cold and warm bootstrap, and the rows of §6.3. The Fairphone 6
+holds the limits, and a Pixel 1 (Snapdragon 821) gives an ungated point
+for slow phones.
 
 ### 6.5 The Tor policy, bridges, and blocked networks
 
