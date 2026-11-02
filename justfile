@@ -406,7 +406,7 @@ _debug-names-absent:
 # `binary` names none of the debug outputs' environment variables nor the
 # instruction trace's message.
 _names-absent binary:
-    let path = '{{binary}}'; let binary = (open --raw $path); for name in [GREY_PVM_DEBUG CPU_DUMP CPU_EXPR_DUMP ZKPVM_PROFILE pvm-inst] { if ($binary | bytes index-of ($name | into binary)) >= 0 { error make { msg: $"($path) names ($name)" } } }; print $"($path) names no debug output"
+    let path = '{{binary}}'; let binary = (open --raw $path); for name in [VOS_PVM_DEBUG CPU_DUMP CPU_EXPR_DUMP VOS_PROOF_PROFILE pvm-inst] { if ($binary | bytes index-of ($name | into binary)) >= 0 { error make { msg: $"($path) names ($name)" } } }; print $"($path) names no debug output"
 
 # The release build of the node's binary with the prover, the release
 # profile's code, scanned as `_debug-names-absent` scans the debug build.
@@ -473,8 +473,8 @@ check-no-seeded-masks: (_forbidden "seeded-masks") _seeded-masks-unimplied
     print "no seeded masks in a production build"
 
 # The debug outputs (`vos-pvm`'s and `vos-pvm-proof`'s `debug-internals`:
-# the PVM's instruction trace, `GREY_PVM_DEBUG`'s registers and native code,
-# `CPU_DUMP`, `CPU_EXPR_DUMP`, `ZKPVM_PROFILE`), which show a run's steps,
+# the PVM's instruction trace, `VOS_PVM_DEBUG`'s registers and native code,
+# `CPU_DUMP`, `CPU_EXPR_DUMP`, `VOS_PROOF_PROFILE`), which show a run's steps,
 # registers and rows, and the carrier audit's seams (`vos-node`'s and
 # `vos-node-prover`'s `disclosing`, `vos-pvm-recair`'s `watch`), which hand
 # a proof's internals out, reach no production build: no normal or build

@@ -1194,7 +1194,7 @@ impl RecompiledPvm {
     }
 }
 
-/// Whether `GREY_PVM_DEBUG` is set, read once: the recompiler's debug
+/// Whether `VOS_PVM_DEBUG` is set, read once: the recompiler's debug
 /// outputs, which show a run's registers, exist only under
 /// `debug-internals`.
 #[cfg(feature = "debug-internals")]
@@ -1206,7 +1206,7 @@ fn debug_from_environment() -> bool {
         2 => true,
         1 => false,
         _ => {
-            let set = std::env::var_os("GREY_PVM_DEBUG").is_some();
+            let set = std::env::var_os("VOS_PVM_DEBUG").is_some();
             CACHED.store(if set { 2 } else { 1 }, Ordering::Relaxed);
             set
         }

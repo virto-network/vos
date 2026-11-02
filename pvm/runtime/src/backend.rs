@@ -9,7 +9,7 @@ use alloc::{string::String, sync::Arc, vec};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PvmBackend {
     /// Use recompiler if available (x86-64 Linux), else interpreter.
-    /// Reads `GREY_PVM` env var: "interpreter" forces interpreter,
+    /// Reads `VOS_PVM_BACKEND` env var: "interpreter" forces interpreter,
     /// "recompiler" forces recompiler.
     Default,
     /// Always use the software interpreter.
@@ -80,10 +80,10 @@ fn resolve_backend(backend: PvmBackend) -> Result<ResolvedBackend, String> {
             return Err("requested recompiler is unavailable on this platform".into());
         }
         PvmBackend::Default => {
-            // Check GREY_PVM env var
+            // Check VOS_PVM_BACKEND env var
             #[cfg(feature = "std")]
             {
-                if let Ok(val) = std::env::var("GREY_PVM") {
+                if let Ok(val) = std::env::var("VOS_PVM_BACKEND") {
                     match val.as_str() {
                         "interpreter" => return Ok(ResolvedBackend::Interpreter),
                         "recompiler" => {
@@ -91,7 +91,7 @@ fn resolve_backend(backend: PvmBackend) -> Result<ResolvedBackend, String> {
                             return Ok(ResolvedBackend::Recompiler);
                             #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
                             return Err(
-                                "GREY_PVM=recompiler is unavailable on this platform".into()
+                                "VOS_PVM_BACKEND=recompiler is unavailable on this platform".into()
                             );
                         }
                         _ => {} // fall through to platform default

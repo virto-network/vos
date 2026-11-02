@@ -682,13 +682,13 @@ where
     };
 
     // Printed only in a build with `debug-internals`, on the explicit
-    // `profile` flag or whenever `ZKPVM_PROFILE` is set in the environment
-    // (so the phase breakdown is reachable through paths that hard-code
-    // `profile = false`, e.g. `prove_canonical`): a segment's sizes are its
-    // step counts. A production build returns the profile to its caller
-    // and prints nothing.
+    // `profile` flag or whenever `VOS_PROOF_PROFILE` is set in the
+    // environment (so the phase breakdown is reachable through paths that
+    // hard-code `profile = false`, e.g. `prove_canonical`): a segment's
+    // sizes are its step counts. A production build returns the profile to
+    // its caller and prints nothing.
     #[cfg(feature = "debug-internals")]
-    if profile || std::env::var_os("ZKPVM_PROFILE").is_some() {
+    if profile || std::env::var_os("VOS_PROOF_PROFILE").is_some() {
         eprintln!("{prof}");
     }
     #[cfg(not(feature = "debug-internals"))]
