@@ -205,7 +205,7 @@ actors, and calls a space through its gateway.
 | state | budget | basis |
 |---|---|---|
 | idle, foreground (store open, arti bootstrapped, no proof) | ≤ 96 MiB resident, of which arti ≤ 48 MiB | [est]: interpreter and pool a few MiB, fjall's caches 8–16 MiB, arti's directory and circuits (§6.4), MLS state under 1 MiB for a few devices |
-| the facility's `.so` | growth from arti ≤ 10 MB [provisional until 8.1 measures arm64 with rustls and the onion client]; from `vos-mls` and mls-rs ≤ 2 MB, a limit 8.3 can miss | [est], to measure (plan 8.1, 8.3) |
+| the facility's `.so` | growth from arti ≤ 10 MB [provisional until 8.1 measures arm64 with rustls and the onion client]; from `vos-mls` and mls-rs ≤ 2 MB, a limit 8.3 can miss | arti [est], to measure (plan 8.1); mls-rs +0.86 MB stripped [measured, arm64-v8a, 2026-11-02, §3.4] |
 | local actor call | ≤ 1 ms on the interpreter | 85 µs an invocation on the node's interpreter [measured, `core-model.md` §14], with the fsync of a local commit dominating |
 | proving a sign-in | ≤ 1 GiB peak (target 768 MiB) | 513 MiB [measured, `proving.md` §8] |
 | background sync job | ≤ 30 s wall, ≤ 1 MB down a run with nothing new | [est]: arti from a warm directory, one onion connection, one cursor query a scope and one for the device-set log |
@@ -564,6 +564,46 @@ A5).
 **The suite:** ciphersuite 1 (X25519, AES-128-GCM, SHA-256, Ed25519)
 unless mls-rs maintains a hybrid post-quantum suite by plan 8.3 (§9.1); a
 later change is a successor group, never two suites in one group (§8, F2).
+None is maintained [read 2026-11-02]: mls-rs 0.57.0 (2026-10-28) has
+`ML_KEM_768_X25519`, X-Wing over suite 1's AEAD, hash and signature, but
+on a private code point (65100, "no official PQ cipher suites" in its
+source), behind mls-rs-core's `post-quantum` feature, implemented only by
+the aws-lc provider under aws-lc-rs's `unstable` feature and used by
+mls-rs itself only for benchmarks; the RustCrypto provider has none. The
+IETF's `MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519`
+(draft-ietf-mls-pq-ciphersuites-06, 2026-07-21, KEM 0x647a) has no code
+point yet. So ciphersuite 1; the successor group follows once a code
+point is assigned and a provider ships it outside an unstable feature.
+
+**Measured on mls-rs 0.57** [measured, Core Ultra 7 155H under load and
+an arm64-v8a build of the facility, 2026-11-02; spike outside the tree]:
+- **Features:** `default-features = false` with `private_message` only
+  (encrypted handshakes); no `std`, `rayon`, `x509`, `psk`,
+  `by_ref_proposal`, `out_of_order`, `prior_epoch`, `custom_proposal` or
+  `tree_index`; the RustCrypto provider 0.22 (0.23's
+  `curve25519-dalek` 5.0.0 cannot share a build with russh 0.61's
+  5.0.0-pre.6; russh 0.65 takes 5.0.0).
+- **The facility's `.so`** (s4's `libs4_credential.so`, release, arm64,
+  stripped as packaged): +0.86 MB with the device-group scenario linked
+  (+0.38 MB compressed), +0.96 MB with `std`: within PG5's 2 MB.
+- **A candidate processed on a copy:** about 1 ms p50 (0.9–3 ms as the
+  host's load varied) in a group of 3 or 8, whether the copy is a clone
+  of the in-memory group or loaded from its persisted bytes and written
+  back; PG6's limit is 200 ms.
+- **Sizes:** a key package 343 B; an update commit 734 B (3 devices) and
+  1,374 B (8); add(2) 1,374 B with a 1,387 B Welcome carrying the tree;
+  remove 606 B; the persisted group state 1.1–2.7 KB; a held own commit
+  (`CommitSecrets`) 2.8 KB.
+- **What the API gives:** `Group` is `Clone`, so the copy is a clone; a
+  device's own commit is built with `build_detached` and applied with
+  `apply_detached_commit` on confirmation, never touching the current
+  state before; a received commit's processing is deterministic, so the
+  copy need not be persisted (after a crash the device processes the
+  logged candidate again), and only the held own commit must be, in the
+  same batch as the call that posts it. A rival candidate processed on a
+  copy and dropped leaves the next one processable; processed in place it
+  does not. `MlsRules::filter_proposals` refuses other proposal types on
+  both sending and receiving. The Safe Exporter is not in 0.57.
 
 ### 3.5 Device secrets and the rules for changing devices
 
@@ -2254,7 +2294,10 @@ the UI to report it. (8.24b)
 ### 8.5 Cryptography's future
 
 **F1. Harvest now, decrypt later.** *Mitigation:* a hybrid post-quantum
-suite if mls-rs maintains one by 8.3; 180-day retention of handshakes.
+suite if mls-rs maintains one by 8.3 (it does not: an X-Wing suite on a
+private code point behind an unstable feature of the aws-lc provider,
+§3.4 [read 2026-11-02]), then by a successor group (F2); 180-day
+retention of handshakes.
 *Known limit:* a hostile operator keeps what it wants. (8.3, 8.19)
 
 **F2. Changing the suite or the protocol.** *Mitigation:* a successor
@@ -2421,6 +2464,12 @@ agent. (8.14)
   https://eprint.iacr.org/2024/1616
 - Padmé padding, PoPETs 2019:
   https://www.petsymposium.org/popets/2019/popets-2019-0056.php
+- draft-ietf-mls-pq-ciphersuites-06 (2026-07-21):
+  https://datatracker.ietf.org/doc/html/draft-ietf-mls-pq-ciphersuites-06 ;
+  mls-rs 0.57.0 and mls-rs-crypto-awslc 0.27.0 (2026-10-28), their
+  sources `mls-rs-core/src/crypto/cipher_suite.rs` and
+  `mls-rs-crypto-awslc/src/lib.rs`: https://github.com/awslabs/mls-rs
+  (read 2026-11-02)
 
 ## 9. Decisions, risks, and later work
 
@@ -2439,7 +2488,8 @@ agent. (8.14)
   pinned after PG6's measurements of the background job, and set per
   space on test homes.
 - **The suite:** ciphersuite 1 unless 8.3 finds a maintained hybrid
-  post-quantum suite in mls-rs that fits the phone.
+  post-quantum suite in mls-rs that fits the phone; 8.3 found none
+  (§3.4), so ciphersuite 1.
 - **MLS or a simpler scheme:** MLS, as one `vos-mls` layer [E12].
 - **The home:** a home-only space by default [E14], Virto's listed in the
   app [E20]; **the lease:** a yearly re-proof [E15]; **recovery:** a
