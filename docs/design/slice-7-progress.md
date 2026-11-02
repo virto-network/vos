@@ -7174,3 +7174,72 @@ Claim; mint 50; Sign in (the facility's membership proof); Pay 20 to
 balances afterwards alice 30, shop 20. No crash; the app's three screens
 (app content only, no screen recording this time) and the demo's log are
 in `spikes/s7-device/runs/p9/`. **PG3 passes on the final build.**
+
+## Slice 7 accepted
+
+2026-11-02, at `vos-core` `2a163b274` (the code) and its records after it.
+The slice's plan is `slice-7-mobile.md` (draft 4 and its amendments); the
+owner's decisions are S1–S64 (`research/slice-7/owner-decisions.md`). 393
+commits on `8b6c9d34..2a163b274`.
+
+### The final gate
+
+At `2a163b274`, each log ending `exit=0`:
+
+| gate | result |
+|---|---|
+| `just slice-gate` (`ci`, `test-bench-proof`, `test-proof` at leakage N = 2000, wrap N = 32, segment N = 256, `fuzz 300`) | 195 suites, 2,426 passed, 0 failed; 11 fuzz targets 300 s each, no crash; 3.6 h |
+| `check-release-names`, `check-blobs` | the release binary clean; 31 blobs `blobs.lock`'s |
+| `just e2e-chain` | on PolkaJam, 1,077 s |
+| the checker loop, seeds 7951–7962, `CUTS_FULL` | 48 of 48 |
+
+### The phone gates (the Fairphone 6)
+
+| gate | sessions | result |
+|---|---|---|
+| PG1, the credential proofs (format 44) | P2, then P9 on the final build | **met in full**: auth, owner, membership and payment about 127 ms at the median, at most 147 ms at the 95th percentile, ≤ 118 MiB; the two 150 ms targets P2 missed now hold |
+| PG2, the device proof (format 46) at a space's ingress | P7 (format 45), P8 a day later (format 46) | **met**: 645 ms (the median of three groups' medians), 427 MiB, 0.87–0.88 MB, 9 of 9 accepted at ingress |
+| PG3, the s4 demo's three flows | P3 (attempt 2), then P9 on the final build | **passed**: enroll, claim, sign in, pay ("proved in 165 ms"), balances 30 and 20 |
+
+### The milestones
+
+- **M3.9** ([M3.9 accepted](#m39-accepted-simplify-and-scale)): the
+  anchoring simplified; the scale runs reported
+  (`research/slice-7/scale-report.md`): T3 and T4 met, T5 in part, T1
+  and T6 missed (T1's p99 1.31 s on the final build over the node API,
+  2.6 s before, against 50 ms; the shared disk's commit binds), T2 not
+  measurable on one node host.
+- **M4** ([M4 accepted](#m4-accepted-the-credential-air)): the credential
+  actor, the Poseidon2 call, the credential AIR (format 44), the node API
+  and the gateway, credentialed ingress.
+- **M5**, the device profile: the Poseidon2 chip shared by the node's
+  segments (format 41) and the device (format 46); the device io-hash,
+  the lean kernel, `h = 256` with its count, the NEON Blake2s (the fork's
+  `e14925a`), the two cuts; the device kernel at ingress (S61); PG2.
+- **7.10b's C10**: the node's own HTTP deleted; the node keeps its binary
+  API, the gateway serves HTTP.
+- **7.22–7.23**: the carrier audit extended (about 250 carriers, s4's
+  three leaks fixed); the carried rest; the code-quality review; the docs
+  (`proving.md` draft 7, `core-model.md` draft 7,
+  `identity-and-authority.md` draft 6); the slice-end review's fixes.
+
+### Reviews
+
+One Opus review a step; Fable at every (S) step, at 7.17b's design, the
+`h = 256` argument, the fork's NEON change, 7.21, the scale report, and
+at the slice's end (`research/slice-7/slice-end-fable.md`: accept after
+fixes, folded in 7.23d), with its M9 reviews (7.16's parameters, 7.20,
+C10: sound); the Opus code-quality review (7.23b), folded.
+
+### Carried
+
+As `research/slice-7/slice-end-fable.md` lists them: S55; T1, T5 and T6
+(S59's levers 4–6); T2 and T5's host kill; the per-program CPU and
+word-level memory (S63); the per-call identity read; the identity agent
+per node; the non-repudiation store; tree syncing and the `map_root`
+fingerprint; 7.9's quiet `0x402` re-measure; the binding sweep's budget;
+reproducible path-dependent blobs (S58); s4's VOS pin (still at
+`a743254c`, its device-kernel sign-in on a retired format; the credential
+path unaffected). Before anything reaches master: the heavy cleanup; the
+external audit, its scope gaining the credential AIR, the device shape,
+the Poseidon2 chip and their masking.
