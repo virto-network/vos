@@ -1,15 +1,16 @@
 //! The node API (`docs/design/node-api.md`): one handler for every kind,
-//! whichever transport brought it. Signed calls run in their sessions'
-//! sequences (as `calls` says), signed queries and owners' reads of their
-//! workflows are checked here, and operator kinds run the operator's
-//! commands.
+//! whichever transport brought it, given the frame's mark. Signed calls run
+//! in their sessions' sequences (as `calls` says), signed queries and
+//! owners' reads of their workflows are checked here, and operator kinds
+//! run the operator's commands. An agent's admission (`admission`) is
+//! checked before any signature or proof.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use vos_api::Kind;
+use vos_api::{Kind, Mark};
 use vos_wire::ids::{AgentId, InstanceId, Principal};
 use vos_wire::ingress::{
     AgentInfo, QueryCall, Rejection, Response, WorkflowRead, workflow_read_horizon,
@@ -192,12 +193,14 @@ impl Api {
         }
     }
 
-    /// The answer to a request of `kind` holding `body`, which came by a
-    /// transport holding `large`, its body's place if it is large, in
-    /// SCALE.
+    /// The answer to a request of `kind` marked `mark` holding `body`,
+    /// which came by a transport holding `large`, its body's place if it is
+    /// large, in SCALE. The mark is a gateway's word, trusted as any API
+    /// client is; an unmarked request counts as clearnet.
     pub(crate) async fn handle(
         &self,
         kind: Kind,
+        mark: Mark,
         body: Vec<u8>,
         large: Option<LargePlace>,
     ) -> Vec<u8> {
@@ -208,29 +211,37 @@ impl Api {
             Kind::AgentInfo => AgentId::decode_exact(&body)
                 .and_then(|agent| self.agent_info(agent))
                 .encode(),
+            // An onion-only agent's schema is read through the onion alone.
             Kind::Schema => <(AgentId, InstanceId)>::decode_exact(&body)
+                .filter(|(agent, _)| self.inner.admits(*agent, mark, None).is_ok())
                 .and_then(|(agent, instance)| self.schema(agent, instance))
                 .encode(),
-            _ => self.respond(kind, body, large).await.encode(),
+            _ => self.respond(kind, mark, body, large).await.encode(),
         }
     }
 
     /// The answer to a kind answering a [`Response`].
-    async fn respond(&self, kind: Kind, body: Vec<u8>, large: Option<LargePlace>) -> Response {
+    async fn respond(
+        &self,
+        kind: Kind,
+        mark: Mark,
+        body: Vec<u8>,
+        large: Option<LargePlace>,
+    ) -> Response {
         if kind.operator() {
             return self.operated(kind, body).await;
         }
         match kind {
             Kind::Call => match decode(&body) {
-                Ok((agent, call)) => self.inner.client_call(agent, call).await,
+                Ok((agent, call)) => self.inner.client_call(agent, mark, call).await,
                 Err(answer) => answer,
             },
             Kind::Query => match decode(&body) {
-                Ok((agent, query)) => self.query(agent, query).await,
+                Ok((agent, query)) => self.query(agent, mark, query).await,
                 Err(answer) => answer,
             },
             Kind::Workflow => match decode(&body) {
-                Ok((agent, read)) => self.workflow(agent, read).await,
+                Ok((agent, read)) => self.workflow(agent, mark, read).await,
                 Err(answer) => answer,
             },
             // The body goes once decoded; the proof and the place go once
@@ -238,6 +249,9 @@ impl Api {
             Kind::Credentialed => match decode(&body) {
                 Ok((agent, call)) => {
                     drop(body);
+                    if let Err(answer) = self.inner.admits(agent, mark, None) {
+                        return answer;
+                    }
                     self.inner.credentialed(agent, call, large).await
                 }
                 Err(answer) => answer,
@@ -262,11 +276,14 @@ impl Api {
         })
     }
 
-    async fn query(&self, agent: AgentId, query: QueryCall) -> Response {
+    async fn query(&self, agent: AgentId, mark: Mark, query: QueryCall) -> Response {
         let run = match self.inner.present(agent) {
             Ok(run) => run,
             Err(error) => return error.into(),
         };
+        if let Err(answer) = self.inner.admits(agent, mark, None) {
+            return answer;
+        }
         let message = query.message(&run.shared.identity);
         if let Err(answer) = self
             .signed(
@@ -294,11 +311,14 @@ impl Api {
     /// An owner's read of a workflow's status, waiting for it to end, as
     /// long as it asks and the node allows, and only while fewer reads than
     /// the node allows wait: past them, it answers at once.
-    async fn workflow(&self, agent: AgentId, read: WorkflowRead) -> Response {
+    async fn workflow(&self, agent: AgentId, mark: Mark, read: WorkflowRead) -> Response {
         let run = match self.inner.present(agent) {
             Ok(run) => run,
             Err(error) => return error.into(),
         };
+        if let Err(answer) = self.inner.admits(agent, mark, None) {
+            return answer;
+        }
         let message = read.message(&run.shared.identity);
         let horizon = workflow_read_horizon(read.wait_ms);
         if let Err(answer) = self

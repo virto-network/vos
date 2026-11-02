@@ -105,6 +105,11 @@ codes! {
         /// at another instance: an agent's guards read the one actor its
         /// row `credentials` names ([`crate::keys::credentials`]).
         Credentials = 15,
+        /// An install of a program declaring an admission at another
+        /// instance than the one the row `admission` names, or of a program
+        /// declaring none at that instance: an agent's ingress reads the
+        /// one actor its row names ([`crate::keys::admission`]).
+        Admission = 16,
     }
 }
 

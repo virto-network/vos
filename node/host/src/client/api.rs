@@ -191,7 +191,7 @@ impl Api {
                 }
             }
         };
-        let asked = vos_api::quic::request(&connection, kind, body);
+        let asked = vos_api::quic::request(&connection, kind, vos_api::Mark::Unmarked, body);
         match smol::block_on(crate::timeout(self.answer, asked)) {
             Some(Ok(answered)) => Ok(answered),
             Some(Err(error)) => Err(ClientError::Http(error.to_string())),
@@ -254,15 +254,16 @@ fn socket_exchange(
         .write_all(&frame(Framing::Stream, kind, id, body))
         .map_err(|error| (error, false))?;
     let invalid = |why: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, why.to_string());
-    let mut header = [0u8; 14];
+    let mut header = [0u8; Framing::Stream.header()];
     stream
         .read_exact(&mut header)
         .map_err(|error| (error, false))?;
     let length = u32::from_le_bytes(header[..4].try_into().expect("four bytes"));
     let answered = u16::from_le_bytes(header[4..6].try_into().expect("two bytes"));
-    let answer_id = u64::from_le_bytes(header[6..].try_into().expect("eight bytes"));
+    // The mark, header[6], is an answer's none: unread.
+    let answer_id = u64::from_le_bytes(header[7..].try_into().expect("eight bytes"));
     let Some(body_length) = length
-        .checked_sub(10)
+        .checked_sub(Framing::Stream.header() as u32 - 4)
         .filter(|length| *length <= MAX_ANSWER)
     else {
         return Err((invalid("an answer larger than any the node gives"), true));

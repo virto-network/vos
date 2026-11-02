@@ -129,7 +129,7 @@ impl Pool {
         let asked = async {
             let connection = self.connection().await?;
             let _in_flight = InFlight::new(self);
-            vos_api::quic::request(&connection, kind as u16, &framed)
+            vos_api::quic::request(&connection, kind as u16, vos_api::Mark::Unmarked, &framed)
                 .await
                 .map_err(|error| error.to_string())
         };

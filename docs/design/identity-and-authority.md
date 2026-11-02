@@ -314,6 +314,7 @@ Ingress verifies the proof and logs only the origin it proves.
   |---|---|---|---|
   | 1 | the frame within its kind's size | the frame error `Oversize` (not a credential code) | 413 |
   | 2 | it decodes, exactly | `Malformed` (not a credential code) | 400 |
+  | 2a | an onion-only agent's: the gateway marked it onion (`node-api.md` §2–§3) | `Admission(OnionOnly)` (not a credential code) | 403 |
   | 3 | this node serves the agent | `NoAgent`, `Elsewhere`, as for calls | 404, 421 |
   | 4 | the node's space has a genesis (its `SpaceId` is not `NONE`) | `NoSpace`, 0 | 403 |
   | 5 | `format` is a credential or device format this node admits | `Format`, 1 | 403 |

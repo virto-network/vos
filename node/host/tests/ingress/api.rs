@@ -30,7 +30,7 @@ pub(super) fn send(stream: &mut UnixStream, kind: u16, id: u64, body: &[u8]) {
 /// The next answer frame's kind, id and body; `None` once the node closed
 /// the connection.
 pub(super) fn receive(stream: &mut UnixStream) -> Option<(u16, u64, Vec<u8>)> {
-    let mut header = [0u8; 14];
+    let mut header = [0u8; Framing::Stream.header()];
     match stream.read_exact(&mut header) {
         Ok(()) => {}
         Err(error)
@@ -45,8 +45,13 @@ pub(super) fn receive(stream: &mut UnixStream) -> Option<(u16, u64, Vec<u8>)> {
     }
     let length = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
     let kind = u16::from_le_bytes(header[4..6].try_into().unwrap());
-    let id = u64::from_le_bytes(header[6..].try_into().unwrap());
-    let mut body = vec![0u8; length - 10];
+    assert_eq!(
+        header[6],
+        vos_api::Mark::Unmarked as u8,
+        "an answer is unmarked"
+    );
+    let id = u64::from_le_bytes(header[7..].try_into().unwrap());
+    let mut body = vec![0u8; length - (Framing::Stream.header() - 4)];
     stream.read_exact(&mut body).unwrap();
     Some((kind, id, body))
 }

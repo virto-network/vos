@@ -7,6 +7,7 @@ pub mod blobs;
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod admission;
 mod api;
 mod asking;
 mod calls;

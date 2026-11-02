@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use vos_api::Mark;
 use vos_api::client::{Answer, Multiplexed, multiplexed};
 
 /// Socket connections the gateway keeps to a co-located node.
@@ -126,22 +127,23 @@ impl Upstream {
         })
     }
 
-    /// A request of `kind` holding `body`: the answer frame's kind and
-    /// body. Sent once: a request whose node failed mid-way may have run,
-    /// so it is answered unavailable, never sent again.
-    pub async fn request(&self, kind: u16, body: &[u8]) -> Result<Answer, Unanswered> {
+    /// A request of `kind` marked `mark` holding `body`: the answer
+    /// frame's kind and body. Sent once: a request whose node failed
+    /// mid-way may have run, so it is answered unavailable, never sent
+    /// again.
+    pub async fn request(&self, kind: u16, mark: Mark, body: &[u8]) -> Result<Answer, Unanswered> {
         let asked = async {
             match &self.address {
                 Address::Socket(path) => {
                     let client = self.socket(path).await?;
                     client
-                        .request(kind, body)
+                        .request(kind, mark, body)
                         .await
                         .map_err(|error| Unanswered(error.to_string()))
                 }
                 Address::Quic(authority) => {
                     let connection = self.connection(authority).await?;
-                    let answered = vos_api::quic::request(&connection, kind, body).await;
+                    let answered = vos_api::quic::request(&connection, kind, mark, body).await;
                     if answered.is_err() {
                         // Only this connection: one dialed since stays.
                         let mut kept = self.quic.lock().await;

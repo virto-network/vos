@@ -718,7 +718,7 @@ fn a_gateway_altering_a_signed_call_is_refused() {
     let (kind, answer) = served
         .front
         .runtime
-        .block_on(upstream.request(Kind::Call as u16, &body))
+        .block_on(upstream.request(Kind::Call as u16, vos_api::Mark::Clearnet, &body))
         .unwrap();
     assert_eq!(kind, Kind::Call as u16);
     assert_eq!(

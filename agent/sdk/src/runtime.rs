@@ -9,6 +9,7 @@ use core::mem::ManuallyDrop;
 use core::pin::pin;
 use core::task::{Context, Poll, Waker};
 use vos_wire::result::KernelReturn;
+use vos_wire::schema::Admission;
 use vos_wire::served::{Served, representative_row, space_root};
 use vos_wire::vos_anchor::{RootKind, RootRead};
 
@@ -274,22 +275,79 @@ macro_rules! actor_program {
     };
 }
 
-/// The schema section a program carries: `marked` when its actor is the
-/// agent's credential actor (`#[actor(credentials)]`), else `plain`, each
-/// `N` bytes long as `credentials` picks. `#[messages]` makes both.
-pub const fn schema_section<const N: usize>(
-    plain: &[u8],
-    marked: &[u8],
+/// The length of the schema section a program carries, from the section
+/// its methods make when marked as the credential actor (`marked` bytes
+/// long, of which `methods` its methods' encoding): its methods alone, or
+/// with the credentials' part when the actor is the credential actor, a
+/// method is `guarded` or the actor asks an admission, then the admission
+/// when it asks one ([`vos_wire::schema::Schema::section`]).
+pub const fn schema_len(
+    marked: usize,
+    methods: usize,
+    guarded: bool,
     credentials: bool,
+    admission: Admission,
+) -> usize {
+    if !(credentials || guarded || admission.asks()) {
+        8 + methods
+    } else if admission.asks() {
+        marked + 2
+    } else {
+        marked
+    }
+}
+
+/// The schema section a program carries, `N` bytes long as [`schema_len`]
+/// gives, from the section `marked` its methods make when marked as the
+/// credential actor, its methods' encoding `methods` bytes of it: the
+/// mark set as `credentials` says, the admission after it when it asks
+/// one. `#[messages]` makes `marked`; `#[actor(...)]` gives the marks.
+pub const fn schema_section<const N: usize>(
+    marked: &[u8],
+    methods: usize,
+    credentials: bool,
+    admission: Admission,
 ) -> [u8; N] {
-    let from = if credentials { marked } else { plain };
     let mut section = [0u8; N];
+    write_section(&mut section, marked, methods, credentials, admission);
+    section
+}
+
+/// [`schema_section`] into `section`, as long as [`schema_len`] gives.
+const fn write_section(
+    section: &mut [u8],
+    marked: &[u8],
+    methods: usize,
+    credentials: bool,
+    admission: Admission,
+) {
     let mut at = 0;
-    while at < N {
-        section[at] = from[at];
+    while at < 4 {
+        section[at] = marked[at];
         at += 1;
     }
-    section
+    let length = ((section.len() - 8) as u32).to_le_bytes();
+    while at < 8 {
+        section[at] = length[at - 4];
+        at += 1;
+    }
+    while at < 8 + methods {
+        section[at] = marked[at];
+        at += 1;
+    }
+    if at == section.len() {
+        return;
+    }
+    section[at] = credentials as u8;
+    at += 1;
+    while at < marked.len() {
+        section[at] = marked[at];
+        at += 1;
+    }
+    if admission.asks() {
+        section[at] = admission.known_keys as u8;
+        section[at + 1] = admission.onion_only as u8;
+    }
 }
 
 /// Run a handler or a workflow to completion. Every operation either
@@ -302,5 +360,65 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
     match pin!(future).poll(&mut context) {
         Poll::Ready(output) => output,
         Poll::Pending => panic!("awaited something that is not ready"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::boxed::Box;
+    use alloc::vec;
+
+    use vos_wire::abi::Kind;
+    use vos_wire::ids::MethodId;
+    use vos_wire::schema::{CredentialGuard, MethodSchema, Schema};
+
+    use super::*;
+
+    /// Every mark an actor may carry, on methods guarded or not, gives the
+    /// section the schema writes.
+    #[test]
+    fn the_sections_built_are_the_schemas() {
+        let method = |id, credential: Option<CredentialGuard>| MethodSchema {
+            id: MethodId(id),
+            name: b"m".to_vec(),
+            kind: Kind::Command,
+            role: None,
+            gas: None,
+            linearizable: false,
+            credential: credential.map(Box::new),
+        };
+        let admissions = [(false, false), (true, false), (false, true), (true, true)].map(
+            |(known_keys, onion_only)| Admission {
+                known_keys,
+                onion_only,
+            },
+        );
+        for guarded in [false, true] {
+            let guard = guarded.then_some(CredentialGuard::Owner);
+            let methods = vec![method(1, None), method(2, guard)];
+            let schema = |credentials, admission| Schema {
+                methods: methods.clone(),
+                credentials,
+                admission,
+            };
+            let marked = schema(true, Admission::default()).section();
+            let bare = Schema {
+                methods: vec![method(1, None), method(2, None)],
+                credentials: false,
+                admission: Admission::default(),
+            }
+            .section();
+            let encoded = bare.len() - 8;
+            for credentials in [false, true] {
+                for admission in admissions {
+                    let expected = schema(credentials, admission).section();
+                    let len = schema_len(marked.len(), encoded, guarded, credentials, admission);
+                    assert_eq!(len, expected.len());
+                    let mut built = vec![0u8; len];
+                    write_section(&mut built, &marked, encoded, credentials, admission);
+                    assert_eq!(built, expected, "{credentials} {admission:?}");
+                }
+            }
+        }
     }
 }

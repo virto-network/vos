@@ -2,7 +2,7 @@
 //! the stream finished, its answer read to the stream's end. quinn's own
 //! API, so any runtime quinn runs on serves.
 
-use crate::{Event, Framing, MAX_ANSWER, Reader, frame};
+use crate::{Event, Framing, MAX_ANSWER, Mark, Reader, marked};
 
 /// Why a request over QUIC got no answer.
 #[derive(Debug)]
@@ -24,16 +24,17 @@ impl std::fmt::Display for Failed {
 
 impl std::error::Error for Failed {}
 
-/// Send a request of `kind` holding `body` on its own stream of
-/// `connection`: the answer frame's kind and body.
+/// Send a request of `kind` marked `mark` holding `body` on its own stream
+/// of `connection`: the answer frame's kind and body.
 pub async fn request(
     connection: &quinn::Connection,
     kind: u16,
+    mark: Mark,
     body: &[u8],
 ) -> Result<(u16, Vec<u8>), Failed> {
     let failed = |error: &dyn std::fmt::Display| Failed::Stream(error.to_string());
     let (mut send, mut receive) = connection.open_bi().await.map_err(|e| failed(&e))?;
-    send.write_all(&frame(Framing::Quic, kind, 0, body))
+    send.write_all(&marked(Framing::Quic, kind, mark, 0, body))
         .await
         .map_err(|e| failed(&e))?;
     send.finish().map_err(|e| failed(&e))?;

@@ -73,7 +73,7 @@ pub fn measure(inventory: &Inventory, run: &Run) -> Result<Cost, String> {
     for _ in 0..REQUESTS {
         let asked = Instant::now();
         runtime
-            .block_on(direct.request(Kind::Time as u16, &[]))
+            .block_on(direct.request(Kind::Time as u16, vos_api::Mark::Unmarked, &[]))
             .map_err(|error| error.to_string())?;
         samples.push(asked.elapsed().as_micros() as u64);
     }
@@ -96,6 +96,7 @@ pub fn measure(inventory: &Inventory, run: &Run) -> Result<Cost, String> {
         Http {
             tls: None,
             connections: 4,
+            mark: vos_api::Mark::Clearnet,
         },
         async {
             let _ = stopped.await;

@@ -6,7 +6,7 @@ use vos_wire::abi::cap::{Limits, Refused, Target};
 use vos_wire::abi::{Failure, Kind, cap};
 use vos_wire::batch::Admin;
 use vos_wire::ids::InstanceId;
-use vos_wire::records::{Derivation, Installed};
+use vos_wire::records::{Admitting, Derivation, Installed};
 use vos_wire::result::{InputRef, Outcome, Step, Write};
 use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode, SpaceId, WindowClock, keys};
@@ -52,11 +52,16 @@ pub(crate) fn admin(base: &Base, admin: Admin) -> Step {
                 Ok(credentials) => credentials,
                 Err(outcome) => return failed(outcome),
             };
+            let admission = match admission(base, instance, &installed.schema) {
+                Ok(admission) => admission,
+                Err(outcome) => return failed(outcome),
+            };
             let mut writes = alloc::vec![Write {
                 key: keys::installed(instance),
                 value: Some(installed.encode()),
             }];
             writes.extend(credentials);
+            writes.extend(admission);
             if agent.is_none() {
                 writes.extend([
                     Write {
@@ -132,6 +137,35 @@ fn credentials(
         None if schema.credentials => Ok(Some(Write {
             key: keys::credentials(),
             value: Some(instance.encode()),
+        })),
+        _ => Ok(None),
+    }
+}
+
+/// The row naming the actor that declares the agent's admission, which an
+/// install of `schema` at `instance` writes, if it declares one; or its
+/// failure, [`Failure::Admission`]: a second declaring actor at another
+/// instance, or the declaring actor's instance replaced by a program that
+/// declares none. An install over the declaring actor writes the row
+/// again, with what it asks now.
+fn admission(base: &Base, instance: InstanceId, schema: &Schema) -> Result<Option<Write>, Outcome> {
+    let recorded = base
+        .decoded::<Admitting>(&keys::admission())
+        .map_err(|_| Outcome::failed(Failure::Trapped))?;
+    let asks = schema.admission.asks();
+    match recorded {
+        Some(recorded) if (recorded.instance == instance) != asks => {
+            Err(Outcome::failed(Failure::Admission))
+        }
+        _ if asks => Ok(Some(Write {
+            key: keys::admission(),
+            value: Some(
+                Admitting {
+                    instance,
+                    admission: schema.admission,
+                }
+                .encode(),
+            ),
         })),
         _ => Ok(None),
     }

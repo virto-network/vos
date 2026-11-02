@@ -635,6 +635,7 @@ mod tests {
             Schema {
                 methods: vec![method(7, "auth", kind), guarded(device)],
                 credentials: false,
+                admission: Default::default(),
             }
             .section()
         };

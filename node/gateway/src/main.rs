@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
+use vos_api::Mark;
 use vos_gateway::Gateway;
 use vos_gateway::app::AppClient;
 use vos_gateway::config::{Config, seed};
@@ -48,7 +49,10 @@ fn run(cli: Cli) -> Result<(), String> {
     let app = config
         .app_key
         .as_ref()
-        .map(|path| seed(path).map(|seed| Arc::new(AppClient::new(seed, Arc::clone(&gateway)))))
+        .map(|path| {
+            seed(path)
+                .map(|seed| Arc::new(AppClient::new(seed, Arc::clone(&gateway), Mark::Clearnet)))
+        })
         .transpose()?;
     let limits = Limits::new(config.per_address());
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
@@ -71,9 +75,11 @@ fn run(cli: Cli) -> Result<(), String> {
             app.clone(),
         )
         .await?;
+        // The HTTP and SSH ports are the clearnet's.
         let http = Http {
             tls,
             connections: config.connections.unwrap_or(1024),
+            mark: Mark::Clearnet,
         };
         front::serve(gateway, limits, listener, http, async {
             let _ = tokio::signal::ctrl_c().await;

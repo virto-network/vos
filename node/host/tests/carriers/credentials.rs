@@ -122,7 +122,12 @@ impl Socket {
         let mut chunk = vec![0; 64 << 10];
         loop {
             match self.reader.event() {
-                Some(Event::Frame(frame)) => return frame,
+                // The mark carries nothing of the request: an answer's is
+                // none.
+                Some(Event::Frame(frame)) => {
+                    assert_eq!(frame.mark, vos_api::Mark::Unmarked, "an answer's mark");
+                    return frame;
+                }
                 Some(Event::Error { error, .. }) => panic!("an answer's framing: {error:?}"),
                 None => {}
             }

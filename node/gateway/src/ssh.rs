@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use s4_server::rui::{App, Cx, Id, View, ViewContext, view};
 use s4_server::{Server, SubsystemChannel};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use vos_api::{Event, FrameError, Framing, Kind, Reader, Requests, error_frame, frame};
+use vos_api::{Event, FrameError, Framing, Kind, Mark, Reader, Requests, error_frame, frame};
 
 use crate::Gateway;
 use crate::limits::Limits;
@@ -47,13 +47,14 @@ impl App for Screen {
     }
 }
 
-/// The SSH server, relaying through `gateway`, past each address's rate
-/// refusing its channels; with `demo`, its screens, whose claims go as the
-/// app's key.
+/// The SSH server, relaying through `gateway` marked `mark`, the
+/// transport its port is, past each address's rate refusing its channels;
+/// with `demo`, its screens, whose claims go as the app's key.
 pub fn server(
     host_key: russh::keys::PrivateKey,
     gateway: Arc<Gateway>,
     limits: Arc<Limits>,
+    mark: Mark,
     demo: Option<(crate::demo::Demo, Arc<crate::app::AppClient>)>,
 ) -> Server {
     let server = match demo {
@@ -61,6 +62,7 @@ pub fn server(
             let service = Arc::new(crate::demo::Service::new(
                 demo.clone(),
                 Arc::clone(&gateway),
+                mark,
                 app,
             ));
             Server::new(crate::demo::APPLICATION, move || {
@@ -91,7 +93,7 @@ pub fn server(
                     },
                     None => None,
                 };
-                relay(gateway, channel, Some((limits, address))).await;
+                relay(gateway, channel, mark, Some((limits, address))).await;
                 drop(place);
             }
         })
@@ -122,7 +124,8 @@ pub async fn start(
         (Some(_), None) => return Err("the demo's screens need app_key".into()),
         (None, _) => None,
     };
-    let server = server(host_key, gateway, limits, demo);
+    // The port the file names is the clearnet's.
+    let server = server(host_key, gateway, limits, Mark::Clearnet, demo);
     Ok(Some(tokio::spawn(async move {
         if let Err(error) = server.serve_on(listener).await {
             tracing::warn!(%error, "the SSH port ended");
@@ -130,13 +133,15 @@ pub async fn start(
     })))
 }
 
-/// Relay one channel's frames until it ends, or a frame error closes it.
-/// With `limits`, each frame takes a token of its address's rate (past
-/// it, the channel closes) and, while in flight, a place among its
-/// address's (past them, it is answered `Unavailable`).
+/// Relay one channel's frames until it ends, or a frame error closes it,
+/// each marked `mark`, whatever the client marked it. With `limits`, each
+/// frame takes a token of its address's rate (past it, the channel closes)
+/// and, while in flight, a place among its address's (past them, it is
+/// answered `Unavailable`).
 pub async fn relay(
     gateway: Arc<Gateway>,
     channel: SubsystemChannel,
+    mark: Mark,
     limits: Option<(Arc<Limits>, Option<IpAddr>)>,
 ) {
     let (mut reading, writer) = channel.into_split();
@@ -199,7 +204,7 @@ pub async fn relay(
                     let (gateway, writer) = (Arc::clone(&gateway), Arc::clone(&writer));
                     requests.spawn(async move {
                         let _place = place;
-                        let (answered, body) = gateway.relay(kind, &request.body).await;
+                        let (answered, body) = gateway.relay(kind, mark, &request.body).await;
                         let bytes = frame(Framing::Stream, answered, request.id, &body);
                         // Whole: an answer never interleaves another.
                         let _ = writer.lock().await.write_all(&bytes).await;

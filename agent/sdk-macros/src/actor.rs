@@ -13,7 +13,20 @@ use syn::{Attribute, Error, Fields, ItemStruct, Meta, PathArguments, Type};
 use crate::names::Ids;
 use crate::{is_named, string_arg};
 
-pub(crate) fn actor_impl(mut input: ItemStruct, credentials: bool) -> syn::Result<Tokens> {
+/// What `#[actor(...)]` marks an actor as.
+#[derive(Default)]
+pub(crate) struct Marks {
+    pub(crate) credentials: bool,
+    pub(crate) known_keys: bool,
+    pub(crate) onion_only: bool,
+}
+
+pub(crate) fn actor_impl(mut input: ItemStruct, marks: Marks) -> syn::Result<Tokens> {
+    let Marks {
+        credentials,
+        known_keys,
+        onion_only,
+    } = marks;
     let name = input.ident.clone();
     let Fields::Named(fields) = &mut input.fields else {
         return Err(Error::new(
@@ -78,6 +91,11 @@ pub(crate) fn actor_impl(mut input: ItemStruct, credentials: bool) -> syn::Resul
 
         impl ::vos_sdk::state::Marked for #name {
             const CREDENTIALS: bool = #credentials;
+            const ADMISSION: ::vos_sdk::schema::Admission =
+                ::vos_sdk::schema::Admission {
+                    known_keys: #known_keys,
+                    onion_only: #onion_only,
+                };
         }
 
         impl ::vos_sdk::state::Tables for #name {

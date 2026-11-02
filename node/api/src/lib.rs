@@ -11,7 +11,9 @@ mod operated;
 #[cfg(feature = "quic")]
 pub mod quic;
 
-pub use frame::{Event, Frame, Framing, Header, MAX_ANSWER, Reader, Requests, error_frame, frame};
+pub use frame::{
+    Event, Frame, Framing, Header, MAX_ANSWER, Reader, Requests, error_frame, frame, marked,
+};
 pub use operated::{CREDENTIALS, OPERATOR_DOMAIN, Operated, operator_message};
 
 use scale::{Decode, Encode};
@@ -152,6 +154,38 @@ impl Kind {
     }
 }
 
+/// The transport a gateway received a request on, which it marks on the
+/// frame it relays (`node-api.md` §2). The gateway's word, trusted as any
+/// API client is: defence in depth for an agent that admits only requests
+/// that came through the onion, never a privacy guarantee. A node takes an
+/// unmarked request as clearnet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Mark {
+    /// No mark: every answer, and every request from a client of the node
+    /// itself (the socket's tools, a driver, a test).
+    Unmarked = 0,
+    /// The gateway received it on the clearnet: its HTTP or SSH port.
+    Clearnet = 1,
+    /// The gateway received it on its onion service.
+    Onion = 2,
+}
+
+impl Mark {
+    pub const ALL: [Mark; 3] = [Mark::Unmarked, Mark::Clearnet, Mark::Onion];
+
+    /// The mark whose byte is `byte`, if one is.
+    pub fn from_u8(byte: u8) -> Option<Self> {
+        Self::ALL.into_iter().find(|mark| *mark as u8 == byte)
+    }
+
+    /// Whether the request came through the onion: no other mark, nor
+    /// none, does.
+    pub fn onion(self) -> bool {
+        self == Mark::Onion
+    }
+}
+
 /// Why a frame was not taken: the body of a frame of kind
 /// [`FRAME_ERROR`]. Every variant but [`FrameError::Unavailable`] closes
 /// the QUIC stream, or the byte stream's connection, once written.
@@ -171,6 +205,9 @@ pub enum FrameError {
     /// A relay's upstream gave no answer.
     #[codec(index = 4)]
     Unavailable,
+    /// The header's mark is not a [`Mark`].
+    #[codec(index = 5)]
+    UnknownMark,
 }
 
 impl FrameError {
@@ -244,6 +281,18 @@ mod tests {
         assert!(!Kind::Call.operator());
     }
 
+    /// The marks' bytes, pinned; no other byte is one.
+    #[test]
+    fn marks_are_pinned() {
+        assert_eq!(Mark::ALL.map(|mark| mark as u8), [0, 1, 2]);
+        for mark in Mark::ALL {
+            assert_eq!(Mark::from_u8(mark as u8), Some(mark));
+        }
+        assert_eq!(Mark::from_u8(3), None);
+        let onion: Vec<Mark> = Mark::ALL.into_iter().filter(|m| m.onion()).collect();
+        assert_eq!(onion, [Mark::Onion]);
+    }
+
     /// The frame error's encodings, pinned.
     #[test]
     fn frame_errors_are_pinned() {
@@ -255,6 +304,8 @@ mod tests {
         assert_eq!(FrameError::Truncated.encode(), [2]);
         assert_eq!(FrameError::NotRelayed.encode(), [3]);
         assert_eq!(FrameError::Unavailable.encode(), [4]);
+        assert_eq!(FrameError::UnknownMark.encode(), [5]);
+        assert!(!FrameError::UnknownMark.keeps_open());
         assert!(FrameError::Unavailable.keeps_open());
         use vos_wire::ingress::{OperatorRefusal, Rejection};
         let refusals = [

@@ -392,23 +392,46 @@ space reaches every agent. That is the configuration a home requires, for
 spaces of three to a few dozen nodes. Forwarding between nodes, for a
 gateway that lists only some, is later work (§9.3).
 
-**Admission** [proposed]: a personal agent sets two flags that ingress
-reads from the agent's own state, as it reads the credential ring:
+**Admission** [built, `node-api.md` §2–§3]: a personal agent sets two
+flags that ingress reads from the agent's own state, as it reads the
+credential ring. `Personal` declares them,
+`#[actor(known_keys, onion_only)]`; its schema carries them and its
+install writes the agent's row `admission` (the declaring instance and
+the flags). One actor of an agent declares them, for good: a second
+declaring actor at another instance, or a program declaring none
+installed over the declaring one, fails the install (`Admission`).
+Nothing in the node knows a personal agent: any agent's actor may ask.
 - **known keys only:** a session-creating call from a key absent from the
-  agent's admitted-keys rows is refused. The lookup runs **before** the
-  signature check (the key is only an index into the rows; the check that
-  the call creates a session reads the session row), so an unknown key
-  costs two point reads, not a verification. A key admitted in the last
-  batch may be refused until the leader applies it, and the client
-  retries. `Personal` admits the device set's sync and admin keys, the
-  recovery keys' ed25519 halves and open pairing slots' keys.
+  agent's admitted-keys rows is refused `Admission(UnknownKey)`. The rows
+  are the declaring actor's hashed table `admitted`, keyed by the 32-byte
+  key, any value (the node reads a row's presence; `Personal` may keep
+  what a key is in it). The lookup runs **before** the signature check
+  (the key is only an index into the rows; the check that the call
+  creates a session reads the session row), so an unknown key costs three
+  point reads (the agent's `admission` row, the session's, the key's), no
+  verification and no write [measured, the ingress suite on a debug
+  build, x86-64 workstation, 2026-11-03: 10^4 attempts, each a session of
+  its own, refused with the node's verifications and the agent's applied
+  index unchanged, about 0.36 ms each end to end over the socket]. A
+  key admitted in the last batch may be refused until the replica that
+  takes the call applies it, and the client retries. A call in a session
+  the agent holds is not looked up: a key removed keeps its sessions until
+  they expire (an hour idle), so `Personal`'s handlers check the caller
+  against the device set as well. `Personal` admits the device set's sync
+  and admin keys, the recovery keys' ed25519 halves and open pairing
+  slots' keys.
 - **onion only** [decided, E17]: a request the gateway did not receive on
-  its onion service is refused. The gateway marks each request it relays
-  with the transport it came in on (a field of the frame,
-  `node-api.md` §2); a node treats a missing mark as clearnet (the unix
-  socket and test clients send none). The mark is the gateway's word,
-  defence in depth against a client bug and against strangers on the
-  clearnet, not a privacy guarantee. **The enforcement is the client's,
+  its onion service is refused `Admission(OnionOnly)`: a call, a query, a
+  workflow read, a credentialed call; a schema read answers none. The
+  gateway marks each request it relays with the transport it came in on
+  (the frame's `mark`, `node-api.md` §2: 1 clearnet from its HTTP and SSH
+  ports, 2 onion from its onion service's), never passing a client's own
+  on; a node treats a missing mark (0) as clearnet (the unix socket's
+  tools and test clients send none). The node trusts the mark as it trusts
+  any API client, the gateway being inside the operator's network. The
+  mark is the gateway's word, defence in depth against a client bug and
+  against strangers on the clearnet, not a privacy guarantee. **The
+  enforcement is the client's,
   in three parts:** the light node routes by destination agent and has no
   clearnet route at all for any kind addressed to the personal agent or to
   `Homes` (not a policy checked at send time); the facility exposes only

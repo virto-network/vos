@@ -370,9 +370,11 @@ pub(crate) fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn:
         attestables: Vec::new(),
         schema: Schema {
             methods: Vec::new(),
-            // The actor's mark, which `#[actor]` gives: both sections are
-            // made, and it picks one.
+            // The actor's marks, which `#[actor]` gives: the section is
+            // made marked as the credential actor, and the program's set
+            // from it as they say.
             credentials: false,
+            admission: Default::default(),
         },
     };
     for handler in &handlers {
@@ -391,8 +393,27 @@ pub(crate) fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn:
         ..schema.clone()
     }
     .section();
-    let plain = schema.section();
-    let (plain_len, marked_len) = (plain.len(), marked.len());
+    let guarded = schema
+        .methods
+        .iter()
+        .any(|method| method.credential.is_some());
+    // The methods' encoding: a section with no guard and no mark holds it
+    // alone, after its eight bytes of magic and length.
+    let methods = Schema {
+        methods: schema
+            .methods
+            .iter()
+            .map(|method| MethodSchema {
+                credential: None,
+                ..method.clone()
+            })
+            .collect(),
+        ..schema.clone()
+    }
+    .section()
+    .len()
+        - 8;
+    let marked_len = marked.len();
     let attestable_count = attestables.len();
     let impl_block = &input;
     let viewed = (!viewed.is_empty()).then(|| {
@@ -433,16 +454,28 @@ pub(crate) fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn:
                 }
             }
 
-            const SCHEMA_PLAIN: [u8; #plain_len] = [#(#plain),*];
             const SCHEMA_MARKED: [u8; #marked_len] = [#(#marked),*];
             const CREDENTIALS: bool = <super::#actor as ::vos_sdk::state::Marked>::CREDENTIALS;
-            const SCHEMA_LEN: usize = if CREDENTIALS { #marked_len } else { #plain_len };
+            const ADMISSION: ::vos_sdk::schema::Admission =
+                <super::#actor as ::vos_sdk::state::Marked>::ADMISSION;
+            const SCHEMA_LEN: usize = ::vos_sdk::runtime::schema_len(
+                #marked_len,
+                #methods,
+                #guarded,
+                CREDENTIALS,
+                ADMISSION,
+            );
 
             /// The schema's section bytes; `vos_sdk::actor_program!` places
             /// them in `.vos_schema`, first in the program's read-only data.
-            /// The actor's `#[actor(credentials)]` mark picks which.
-            pub const SCHEMA: [u8; SCHEMA_LEN] =
-                ::vos_sdk::runtime::schema_section(&SCHEMA_PLAIN, &SCHEMA_MARKED, CREDENTIALS);
+            /// The actor's `#[actor(...)]` marks set its mark and its
+            /// admission.
+            pub const SCHEMA: [u8; SCHEMA_LEN] = ::vos_sdk::runtime::schema_section(
+                &SCHEMA_MARKED,
+                #methods,
+                CREDENTIALS,
+                ADMISSION,
+            );
 
             /// Each attestable method's entry, which
             /// `vos_sdk::actor_program!` places in `.vos_attest`.

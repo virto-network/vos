@@ -218,6 +218,26 @@ pub enum Rejection {
     /// An operator request refused: why.
     #[codec(index = 10)]
     Operator(OperatorRefusal),
+    /// A request the agent's admission refuses
+    /// ([`crate::schema::Admission`]): why.
+    #[codec(index = 11)]
+    Admission(AdmissionRefusal),
+}
+
+/// Why an agent's admission refused a request at ingress, in the order its
+/// checks run, both before any signature or proof is checked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum AdmissionRefusal {
+    /// The agent is onion-only and the request came without the gateway's
+    /// onion mark: over the clearnet, or unmarked.
+    #[codec(index = 0)]
+    OnionOnly,
+    /// The agent admits only known keys, and a call that would create a
+    /// session came from a key its admitted table does not hold, by this
+    /// replica's applied state: a key admitted in the latest batch may be
+    /// refused here until its replica applies it, and its client retries.
+    #[codec(index = 1)]
+    UnknownKey,
 }
 
 /// Why ingress refused a credentialed call, each code in the order its

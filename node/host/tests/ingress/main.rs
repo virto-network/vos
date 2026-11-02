@@ -1,12 +1,13 @@
 //! The node's API, end to end on the default agent and the counter actor:
 //! client-named sessions, signed calls in their sequences, the reply
 //! window, expiry, the operator's signed commands, workflows started by
-//! clients and read by their owners, and the API's frames on its socket
-//! and QUIC.
+//! clients and read by their owners, the API's frames on its socket
+//! and QUIC, and an agent's admission at ingress.
 
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod admission;
 mod api;
 mod operator;
 mod operator_api;

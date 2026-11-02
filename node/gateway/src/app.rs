@@ -8,25 +8,28 @@
 use std::sync::Arc;
 
 use ed25519_dalek::{Signer, SigningKey};
-use vos_api::Kind;
 use vos_api::client::Answer;
+use vos_api::{Kind, Mark};
 use vos_wire::Encode;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Session};
 use vos_wire::ingress::{Call, Consistency, QueryCall};
 
 use crate::Gateway;
 
-/// The app's key, and the gateway its requests go through.
+/// The app's key, the gateway its requests go through, and the mark they
+/// go with: the transport of the port its screens are served on.
 pub struct AppClient {
     key: SigningKey,
     gateway: Arc<Gateway>,
+    mark: Mark,
 }
 
 impl AppClient {
-    pub fn new(seed: [u8; 32], gateway: Arc<Gateway>) -> Self {
+    pub fn new(seed: [u8; 32], gateway: Arc<Gateway>, mark: Mark) -> Self {
         Self {
             key: SigningKey::from_bytes(&seed),
             gateway,
+            mark,
         }
     }
 
@@ -58,7 +61,7 @@ impl AppClient {
         };
         call.signature = self.key.sign(&call.message(identity)).to_bytes();
         self.gateway
-            .relay(Kind::Call, &(agent, call).encode())
+            .relay(Kind::Call, self.mark, &(agent, call).encode())
             .await
     }
 
@@ -84,7 +87,7 @@ impl AppClient {
         };
         query.signature = self.key.sign(&query.message(identity)).to_bytes();
         self.gateway
-            .relay(Kind::Query, &(agent, query).encode())
+            .relay(Kind::Query, self.mark, &(agent, query).encode())
             .await
     }
 }

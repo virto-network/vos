@@ -17,7 +17,7 @@ use std::sync::Arc;
 use s4_server::rui::{App, Cx, Effect, EffectOutput, EffectRequest, View, ViewContext, view};
 use s4_server::{HostServiceError, HostServiceRequest, Identifier, Value};
 use tokio::sync::{Mutex, OnceCell};
-use vos_api::{FRAME_ERROR, Kind};
+use vos_api::{FRAME_ERROR, Kind, Mark};
 use vos_wire::abi::Failure;
 use vos_wire::credentials::{CredentialError, RootEntry};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Session, derive_id};

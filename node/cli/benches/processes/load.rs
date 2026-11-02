@@ -303,12 +303,12 @@ impl Api {
             .write_all(&frame(Framing::Stream, kind as u16, id, &request))
             .await?;
         let invalid = |why: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, why);
-        let mut header = [0u8; 14];
+        let mut header = [0u8; Framing::Stream.header()];
         self.stream.read_exact(&mut header).await?;
         let length = u32::from_le_bytes(header[..4].try_into().expect("four bytes"));
-        let answered = u64::from_le_bytes(header[6..].try_into().expect("eight bytes"));
+        let answered = u64::from_le_bytes(header[7..].try_into().expect("eight bytes"));
         let length = length
-            .checked_sub(10)
+            .checked_sub(Framing::Stream.header() as u32 - 4)
             .filter(|length| *length <= MAX_ANSWER)
             .ok_or_else(|| invalid("no answer"))?;
         if answered != id {

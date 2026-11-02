@@ -1,11 +1,12 @@
-//! Frames: a `u32` little-endian length of what follows, a `u16` kind,
-//! on a byte stream a `u64` request id, then the body. Read without I/O:
-//! a [`Reader`] takes bytes as they arrive and gives frames, or the frame
-//! error to answer, checking each header before its body is kept.
+//! Frames: a `u32` little-endian length of what follows, a `u16` kind, a
+//! `u8` transport mark, on a byte stream a `u64` request id, then the
+//! body. Read without I/O: a [`Reader`] takes bytes as they arrive and
+//! gives frames, or the frame error to answer, checking each header before
+//! its body is kept.
 
 use scale::Encode;
 
-use crate::{FRAME_ERROR, FrameError, Kind};
+use crate::{FRAME_ERROR, FrameError, Kind, Mark};
 
 /// The largest answer body a client takes: past it, the connection is
 /// closed unread.
@@ -20,11 +21,12 @@ pub enum Framing {
 }
 
 impl Framing {
-    /// The header's bytes: the length, the kind, and on a stream the id.
+    /// The header's bytes: the length, the kind, the mark, and on a
+    /// stream the id.
     pub const fn header(self) -> usize {
         match self {
-            Framing::Quic => 6,
-            Framing::Stream => 14,
+            Framing::Quic => 7,
+            Framing::Stream => 15,
         }
     }
 
@@ -40,24 +42,41 @@ pub struct Header {
     /// The bytes after the length: the rest of the header, and the body.
     pub length: u32,
     pub kind: u16,
+    /// The transport mark's byte, as it came: a [`Mark`] once the reader
+    /// checked it.
+    pub mark: u8,
     /// The request's id: 0 over QUIC.
     pub id: u64,
 }
 
 impl Header {
-    /// The header of a frame of `kind` holding `body` bytes.
+    /// The header of an unmarked frame of `kind` holding `body` bytes.
     pub fn of(framing: Framing, kind: u16, id: u64, body: usize) -> Self {
         let length = u32::try_from(body)
             .ok()
             .and_then(|body| body.checked_add(framing.rest()))
             .expect("a body a frame can carry");
-        Self { length, kind, id }
+        Self {
+            length,
+            kind,
+            mark: Mark::Unmarked as u8,
+            id,
+        }
+    }
+
+    /// The same header, marked `mark`.
+    pub fn marked(self, mark: Mark) -> Self {
+        Self {
+            mark: mark as u8,
+            ..self
+        }
     }
 
     pub fn encode(&self, framing: Framing) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(framing.header());
         bytes.extend_from_slice(&self.length.to_le_bytes());
         bytes.extend_from_slice(&self.kind.to_le_bytes());
+        bytes.push(self.mark);
         if framing == Framing::Stream {
             bytes.extend_from_slice(&self.id.to_le_bytes());
         }
@@ -70,10 +89,11 @@ impl Header {
     }
 }
 
-/// A frame whole: its kind's number, its id, its body.
+/// A frame whole: its kind's number, its mark, its id, its body.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
     pub kind: u16,
+    pub mark: Mark,
     pub id: u64,
     pub body: Vec<u8>,
 }
@@ -108,8 +128,8 @@ enum Mode {
 
 /// Frames from bytes as they arrive. Each header is checked before its
 /// body is kept: the length against the header, the kind against the
-/// table, the body's length against its kind's limit; the first failure
-/// is the reader's last event.
+/// table, the mark against its own, the body's length against its kind's
+/// limit; the first failure is the reader's last event.
 pub struct Reader {
     framing: Framing,
     mode: Mode,
@@ -162,11 +182,12 @@ impl Reader {
         let header = bytes.get(..self.framing.header())?;
         let id = match self.framing {
             Framing::Quic => 0,
-            Framing::Stream => u64::from_le_bytes(header[6..14].try_into().expect("eight")),
+            Framing::Stream => u64::from_le_bytes(header[7..15].try_into().expect("eight")),
         };
         Some(Header {
             length: u32::from_le_bytes(header[..4].try_into().expect("four bytes")),
             kind: u16::from_le_bytes(header[4..6].try_into().expect("two bytes")),
+            mark: header[6],
             id,
         })
     }
@@ -192,9 +213,14 @@ impl Reader {
         }
         let id = match framing {
             Framing::Quic => 0,
-            Framing::Stream => u64::from_le_bytes(bytes[6..14].try_into().expect("eight")),
+            Framing::Stream => u64::from_le_bytes(bytes[7..15].try_into().expect("eight")),
         };
-        let header = Header { length, kind, id };
+        let header = Header {
+            length,
+            kind,
+            mark: bytes[6],
+            id,
+        };
         let body = header.body(framing).expect("checked above");
         let limit = match self.mode {
             Mode::Answers => MAX_ANSWER,
@@ -208,6 +234,9 @@ impl Reader {
                 known.limit()
             }
         };
+        let Some(mark) = Mark::from_u8(header.mark) else {
+            return self.fail(FrameError::UnknownMark, id);
+        };
         if body > limit {
             return self.fail(FrameError::Oversize { limit }, id);
         }
@@ -217,7 +246,12 @@ impl Reader {
         }
         let body = bytes[framing.header()..end].to_vec();
         self.at += end;
-        Some(Event::Frame(Frame { kind, id, body }))
+        Some(Event::Frame(Frame {
+            kind,
+            mark,
+            id,
+            body,
+        }))
     }
 
     /// The peer ended its side: a frame part read is `Truncated`.
@@ -228,7 +262,7 @@ impl Reader {
         let bytes = &self.buffer[self.at..];
         let id = match self.framing {
             Framing::Stream if bytes.len() >= Framing::Stream.header() => {
-                u64::from_le_bytes(bytes[6..14].try_into().expect("eight"))
+                u64::from_le_bytes(bytes[7..15].try_into().expect("eight"))
             }
             _ => 0,
         };
@@ -242,9 +276,18 @@ impl Reader {
     }
 }
 
-/// A frame of `kind` holding `body`.
+/// An unmarked frame of `kind` holding `body`: every answer, and every
+/// request but a gateway's.
 pub fn frame(framing: Framing, kind: u16, id: u64, body: &[u8]) -> Vec<u8> {
-    let mut bytes = Header::of(framing, kind, id, body.len()).encode(framing);
+    marked(framing, kind, Mark::Unmarked, id, body)
+}
+
+/// A frame of `kind` marked `mark` holding `body`: a request a gateway
+/// relays, marked with the transport it came in on.
+pub fn marked(framing: Framing, kind: u16, mark: Mark, id: u64, body: &[u8]) -> Vec<u8> {
+    let mut bytes = Header::of(framing, kind, id, body.len())
+        .marked(mark)
+        .encode(framing);
     bytes.extend_from_slice(body);
     bytes
 }
@@ -265,14 +308,54 @@ mod tests {
         let header = Header::of(Framing::Stream, Kind::Call as u16, 0x0102_0304_0506_0708, 3);
         assert_eq!(
             header.encode(Framing::Stream),
-            [13, 0, 0, 0, 0x01, 0x01, 8, 7, 6, 5, 4, 3, 2, 1]
+            [14, 0, 0, 0, 0x01, 0x01, 0, 8, 7, 6, 5, 4, 3, 2, 1]
+        );
+        assert_eq!(
+            header.marked(Mark::Onion).encode(Framing::Stream),
+            [14, 0, 0, 0, 0x01, 0x01, 2, 8, 7, 6, 5, 4, 3, 2, 1]
         );
         let header = Header::of(Framing::Quic, Kind::Time as u16, 0, 0);
-        assert_eq!(header.encode(Framing::Quic), [2, 0, 0, 0, 0x02, 0x00]);
+        assert_eq!(header.encode(Framing::Quic), [3, 0, 0, 0, 0x02, 0x00, 0]);
+        assert_eq!(
+            marked(Framing::Quic, Kind::Time as u16, Mark::Clearnet, 0, &[]),
+            [3, 0, 0, 0, 0x02, 0x00, 1]
+        );
         assert_eq!(
             error_frame(Framing::Stream, 9, FrameError::UnknownKind),
-            [11, 0, 0, 0, 0xff, 0xff, 9, 0, 0, 0, 0, 0, 0, 0, 1]
+            [12, 0, 0, 0, 0xff, 0xff, 0, 9, 0, 0, 0, 0, 0, 0, 0, 1]
         );
+    }
+
+    /// Each mark reads back as it was written; a byte that is no mark is
+    /// refused under the frame's id, from its header, before its body.
+    #[test]
+    fn marks_read_back_and_unknown_ones_are_refused() {
+        for framing in [Framing::Quic, Framing::Stream] {
+            let id = if framing == Framing::Quic { 0 } else { 8 };
+            for mark in Mark::ALL {
+                let mut reader = requests(framing);
+                reader.push(&marked(framing, Kind::Time as u16, mark, id, &[]));
+                assert!(
+                    matches!(reader.event(), Some(Event::Frame(frame)) if frame.mark == mark),
+                    "{mark:?}"
+                );
+            }
+            for byte in [3u8, 0x80, 0xff] {
+                let mut header = Header::of(framing, Kind::Call as u16, id, 100);
+                header.mark = byte;
+                for mut reader in [requests(framing), Reader::answers(framing)] {
+                    reader.push(&header.encode(framing));
+                    assert_eq!(
+                        reader.event(),
+                        Some(Event::Error {
+                            error: FrameError::UnknownMark,
+                            id
+                        }),
+                        "{byte:#04x}"
+                    );
+                }
+            }
+        }
     }
 
     fn read_all(reader: &mut Reader, chunks: &[&[u8]]) -> Vec<Event> {
@@ -401,6 +484,7 @@ mod tests {
             reader.event(),
             Some(Event::Frame(Frame {
                 kind: FRAME_ERROR,
+                mark: Mark::Unmarked,
                 id: 0,
                 body: vec![2]
             }))
@@ -417,8 +501,8 @@ mod tests {
         ));
     }
 
-    /// A frame's kind and body, as a proptest draws them.
-    fn frames() -> impl Strategy<Value = Vec<(u16, u64, Vec<u8>)>> {
+    /// A frame's kind, mark, id and body, as a proptest draws them.
+    fn frames() -> impl Strategy<Value = Vec<(u16, Mark, u64, Vec<u8>)>> {
         let kinds = prop::sample::select(vec![
             Kind::AgentInfo as u16,
             Kind::Schema as u16,
@@ -428,10 +512,10 @@ mod tests {
         ]);
         let one = (
             kinds,
+            prop::sample::select(Mark::ALL.to_vec()),
             any::<u64>(),
             prop::collection::vec(any::<u8>(), 0..4),
-        )
-            .prop_map(|(kind, id, body)| (kind, id, body));
+        );
         prop::collection::vec(one, 0..8)
     }
 
@@ -446,10 +530,10 @@ mod tests {
             let framing = if quic { Framing::Quic } else { Framing::Stream };
             let mut bytes = Vec::new();
             let mut expected = Vec::new();
-            for (kind, id, body) in &frames {
+            for (kind, mark, id, body) in &frames {
                 let id = if quic { 0 } else { *id };
-                bytes.extend(frame(framing, *kind, id, body));
-                expected.push(Event::Frame(Frame { kind: *kind, id, body: body.clone() }));
+                bytes.extend(marked(framing, *kind, *mark, id, body));
+                expected.push(Event::Frame(Frame { kind: *kind, mark: *mark, id, body: body.clone() }));
             }
             let mut at: Vec<usize> = cuts.iter().map(|cut| cut.index(bytes.len() + 1)).collect();
             at.sort_unstable();

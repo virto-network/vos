@@ -197,6 +197,7 @@ fn schemas_read_back_from_their_section_and_validate() {
     let schema = Schema {
         methods: vec![method(7, Kind::Command), linearizable],
         credentials: false,
+        admission: Default::default(),
     };
     let mut ro_data = schema.section();
     ro_data.extend_from_slice(b"the rest of the read-only data");
@@ -214,6 +215,7 @@ fn schemas_read_back_from_their_section_and_validate() {
     let duplicate = Schema {
         methods: vec![method(7, Kind::Command), method(7, Kind::Query)],
         credentials: false,
+        admission: Default::default(),
     };
     assert_eq!(
         Schema::read(&duplicate.section()),
@@ -222,6 +224,7 @@ fn schemas_read_back_from_their_section_and_validate() {
     let reserved = Schema {
         methods: vec![method(0, Kind::Command)],
         credentials: false,
+        admission: Default::default(),
     };
     assert_eq!(
         Schema::read(&reserved.section()),
@@ -233,11 +236,87 @@ fn schemas_read_back_from_their_section_and_validate() {
             ..method(7, Kind::Command)
         }],
         credentials: false,
+        admission: Default::default(),
     };
     assert_eq!(
         Schema::read(&command.section()),
         Err(SchemaError::Linearizable(MethodId(7)))
     );
+}
+
+/// An admission follows the credentials' part, which an actor that asks
+/// one but is no credential actor and guards nothing carries empty: a
+/// section without one keeps its bytes. An admission that asks nothing, an
+/// empty mark with none after it, or bytes past it do not read.
+#[test]
+fn an_admission_follows_the_credentials_part() {
+    use vos_wire::schema::{Admission, MethodSchema, Schema, SchemaError};
+    let schema = |credentials, admission| Schema {
+        methods: vec![MethodSchema {
+            id: MethodId(5),
+            name: b"push".to_vec(),
+            kind: Kind::Command,
+            role: None,
+            gas: None,
+            linearizable: false,
+            credential: None,
+        }],
+        credentials,
+        admission,
+    };
+    let plain = schema(false, Admission::default()).section();
+    let asks = [
+        (
+            Admission {
+                known_keys: true,
+                onion_only: false,
+            },
+            [1, 0],
+        ),
+        (
+            Admission {
+                known_keys: false,
+                onion_only: true,
+            },
+            [0, 1],
+        ),
+        (
+            Admission {
+                known_keys: true,
+                onion_only: true,
+            },
+            [1, 1],
+        ),
+    ];
+    for (admission, bytes) in asks {
+        for credentials in [false, true] {
+            let asked = schema(credentials, admission);
+            let section = asked.section();
+            let mark = [u8::from(credentials), 0, 0, 0, 0];
+            assert_eq!(&section[plain.len()..], [&mark[..], &bytes].concat());
+            assert_eq!(Schema::read(&section), Ok(asked));
+        }
+    }
+    let with = |tail: &[u8]| {
+        let mut section = plain.clone();
+        section.extend_from_slice(tail);
+        let len = (section.len() - 8) as u32;
+        section[4..8].copy_from_slice(&len.to_le_bytes());
+        Schema::read(&section)
+    };
+    assert_eq!(
+        with(&[0, 0, 0, 0, 0, 1, 1]).map(|s| s.admission.asks()),
+        Ok(true)
+    );
+    for tail in [
+        &[0, 0, 0, 0, 0, 0, 0][..],
+        &[1, 0, 0, 0, 0, 0, 0],
+        &[0, 0, 0, 0, 0, 1],
+        &[0, 0, 0, 0, 0, 1, 1, 0],
+        &[0, 0, 0, 0, 0, 2, 0],
+    ] {
+        assert_eq!(with(tail), Err(SchemaError::Undecodable), "{tail:?}");
+    }
 }
 
 /// A credential guard sits on a command alone, with no role and not
@@ -264,6 +343,7 @@ fn credential_guards_validate_and_the_mark_is_last() {
     let schema = |methods| Schema {
         methods,
         credentials: true,
+        admission: Default::default(),
     };
     let fine = schema(vec![
         guarded(Kind::Command, auth(b"vote")),
@@ -282,6 +362,7 @@ fn credential_guards_validate_and_the_mark_is_last() {
             ..guarded(Kind::Command, CredentialGuard::Owner)
         }],
         credentials,
+        admission: Default::default(),
     };
     let plain = unguarded(false).section();
     let marked = unguarded(true).section();
@@ -428,6 +509,7 @@ fn codes_keep_their_values() {
         (Failure::Target, 13),
         (Failure::Space, 14),
         (Failure::Credentials, 15),
+        (Failure::Admission, 16),
     ];
     for (failure, code) in failures {
         assert_eq!(failure.code(), code);
@@ -451,7 +533,7 @@ fn codes_keep_their_values() {
         assert_eq!(Refusal::from_code(code), Some(refusal));
         assert_eq!(refusal.encode(), code.to_le_bytes());
     }
-    for outside in [0u32, 16, u32::MAX] {
+    for outside in [0u32, 17, u32::MAX] {
         assert!(Failure::decode(&outside.to_le_bytes()).is_err());
     }
     // An install's refusal, its failure's detail.
