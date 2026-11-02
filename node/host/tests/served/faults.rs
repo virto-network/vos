@@ -28,12 +28,13 @@ const _: () = assert!(CLUSTER_JUMP >= defaults::SESSION_SKEW_MS as i64 + 2 * NOD
 /// Failures a run goes through; clients send until they are over.
 const FAULTS: usize = 16;
 
-/// A follower of `agent` stays down until its leader has compacted the log
-/// past the follower's last entry, so it comes back by a snapshot however
-/// slowly the clients go (within three minutes: a loaded host's clients
-/// take more than one to fill a compaction's entries). A skip, or the
-/// minutes run out, is logged as such: a later missing snapshot can be
-/// traced to it.
+/// A follower of `agent` stays down until every running replica has
+/// compacted the log past the follower's last entry, so it comes back by
+/// a snapshot whichever of them leads, however slowly the clients go
+/// (within three minutes: a loaded host's clients take more than one to
+/// fill a compaction's entries); the faults go on once it has installed
+/// one. A skip, or the minutes run out, is logged as such: a later
+/// missing snapshot can be traced to it.
 fn follower_down_past_compaction(cluster: &Cluster, agent: AgentId) {
     let follower = || {
         let leader = cluster.leader(agent)?;
@@ -45,43 +46,41 @@ fn follower_down_past_compaction(cluster: &Cluster, agent: AgentId) {
                     .is_some_and(|node| node.replica(agent).is_some())
             })
     };
-    let until = Instant::now() + Duration::from_secs(10);
-    let number = loop {
-        if let Some(found) = follower() {
-            break found;
-        }
-        if Instant::now() >= until {
-            cluster.saw("fault: a follower down past compaction, skipped: no leader and follower");
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    // Bounded as a request is: a loaded host may take as long to elect.
+    let mut found = None;
+    if !vos_checker::poll(ANSWERED, || {
+        found = follower();
+        found.is_some()
+    }) {
+        cluster.saw("fault: a follower down past compaction, skipped: no leader and follower");
+        return;
+    }
+    let number = found.unwrap();
     cluster.saw("fault: a follower down past compaction");
     cluster.stop(number);
+    let running = || (1..=NODES).filter_map(|number| cluster.node(number)?.replica(agent));
     // The running replicas' last entry, read once it is down: it took
     // what the leader sent until it stopped, past what it held a moment
     // before, but nothing past what the leader holds.
-    let last = (1..=NODES)
-        .filter_map(|number| cluster.node(number)?.replica(agent))
-        .map(|status| status.last_index)
-        .max()
-        .unwrap_or(0);
-    let until = Instant::now() + Duration::from_secs(180);
-    loop {
-        let compacted = cluster
-            .leader(agent)
-            .and_then(|leader| cluster.node(leader)?.replica(agent))
-            .is_some_and(|status| status.log_start > last);
-        if compacted {
-            break;
-        }
-        if Instant::now() >= until {
-            cluster.saw("fault: a follower down past compaction, the minutes run out");
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
+    let last = running().map(|status| status.last_index).max().unwrap_or(0);
+    // Each running replica's own log, not only the leader's: one that
+    // still held the follower's next entry could lead and send it.
+    if !vos_checker::poll(Duration::from_secs(180), || {
+        running().all(|status| status.log_start > last)
+    }) {
+        cluster.saw("fault: a follower down past compaction, the minutes run out");
     }
     cluster.start(number);
+    // Bounded as a request is: the stream goes on while clients load the
+    // leader.
+    let installed = vos_checker::poll(ANSWERED, || {
+        cluster
+            .node(number)
+            .is_some_and(|node| node.snapshots_installed() > 0)
+    });
+    if !installed {
+        cluster.saw("fault: a follower down past compaction, no snapshot installed");
+    }
 }
 
 /// Workflow `workflow`'s state in `node`'s applied state at `agent`.
