@@ -1,85 +1,18 @@
 # VOS core model
 
-Draft 7 (2026-11-01): draft 6 (2026-10-24) in line with what slice 7
-built; draft 6 put draft 5 (2026-10-08) in line with slice 6. Drafts 3
-and 4 were each reviewed by a second-opinion architecture review, and the
-owner decided the questions they raised. Slice 7's owner decisions are
-cited by their S-numbers (`research/slice-7/owner-decisions.md`).
-Measurements come from the run 3 spikes in `spikes.md`, cited by name:
-S1–S6, S5b and SJ. Tags:
+The model of the VOS core: agents and actors, execution, state,
+replication, proving and JAM. `open.md` lists the known gaps and the next
+work. Tags:
 
-- **[decided]**: confirmed by the project owner, or settled by a spike the
-  owner delegated the choice to;
-- **[proposed]**: recommendation awaiting review;
-- **[open]**: left for a later run;
+- **[decided]**: a settled design choice;
+- **[proposed]**: a recommendation not yet settled;
+- **[open]**: not yet designed (`open.md`);
 - **[built]**: what the code holds; **[measured]**, **[model]**, **[est]**:
   numbers from a run, a model, or arithmetic on measured numbers.
 
-This is the model for a new core built on branch `vos-core` (from master
-`d2378274`). The v2 service layer on master, the saga's agent layer and
-everything specific to JAR are not ported; section 17 lists what is reused.
-
-## Changes from draft 6
-
-What slice 7 built (`slice-7-progress.md`), stated where each part lives:
-- **The node keeps one binary API** [decided, S41]: framed requests over
-  a unix socket and over QUIC with mutual TLS; HTTP, public TLS, SSH and
-  limits before authentication live in a gateway that holds no authority
-  (sections 4, 5, 13; `node-api.md`).
-- **Credentialed calls:** a session-less input kind whose authority is a
-  credential proof verified at ingress, logged as the origin it proves
-  (`Anonymous`, `Owner`), with the `once` guard (section 8.6).
-- **Device kernels:** `#[attestable(device)]` methods a device proves and
-  a node never attests, their io-hash over Poseidon2 (section 11.1); the
-  Poseidon2 precompile `0x402` (section 11.2).
-- **Replication at scale:** lanes of streams per peer, a pair heartbeat
-  that sends what changed, quiet groups, a bound on campaigns at once,
-  placements stored many to a write, the vote floor's campaign rule
-  (section 10).
-
-## Changes from draft 5
-
-What slice 6 built (`slice-6-progress.md`), stated where each part lives:
-- **Attestable methods** read committed fields as `&self`, through a
-  served witness at an anchored window's cut, their read set declared; a
-  run is recorded as an `Attest`, whose witness input is the arguments
-  and the served witness (sections 8, 11).
-- **The store names its layout:** the keyspace layout's number in the
-  system partition, checked at open (section 9).
-- **A stalled writer hands over leadership** past the stall bound
-  (section 9).
-- **The prover is built into each node:** the leader of an agent proves
-  its statements at a window's cut, records the proof, and submits it to
-  the space's venue once the roots are anchored there; the final proof is
-  masked (format 39), and the carrier audit checks what leaves the
-  prover role (section 11).
-
-## Changes from draft 4
-
-- **Agents on JAM are public** [decided]. They hold global data that spaces
-  agree on, such as one agent per space holding the space's aggregate
-  balance, or a collective in which each space's agent votes. They verify
-  proofs but produce none. Privacy lives inside VOS spaces (sections 1, 12).
-- **Attestable methods are restricted, and the macro enforces it**
-  [decided]. They read only their arguments and committed fields, use no
-  context, and return their writes privately to the enclosing command
-  (section 11.1).
-- **Gas is nested** [proposed]. A callee draws from its caller's
-  remaining gas, and a step is dispatched only if the refine can cover its
-  limit, so outcomes never depend on batch packing (section 8.1).
-- **Preemption keeps steps atomic** [proposed]. An effect-free workflow
-  step stays live across refines. Once a step has effects, it runs under a
-  fixed limit to the end of the step (section 8.3).
-- **Sessions keep a window of replies,** use server-assigned ids that are
-  never reused, and refuse expired sessions (section 8.4).
-- **Committed roots are built in the background** from dirty keys, off the
-  apply path (section 9.3).
-- **Leaves are salted,** and published proofs carry nothing beyond the
-  public output and a fixed shape class (sections 9.3, 11.4).
-- **Proofs are verified at ingress,** before a claim enters the log
-  (section 11.1).
-- **Merge authors are chains per (key, principal),** with fresh keys after
-  a crash or restore (section 9.4).
+Measurements without other hardware named ran on the development laptop:
+Intel Core Ultra 7 155H, 62 GB RAM, one consumer NVMe, Linux 7.1, release
+builds. Each gives its date.
 
 ## 1. Goals
 
@@ -137,13 +70,14 @@ What slice 6 built (`slice-6-progress.md`), stated where each part lives:
 - **JAM first.** Every VOS extension degrades to something a JAM node does:
   an equivalent JAM call, or an unknown-call answer (`WHAT`) the guest
   handles with identical results for runs that complete.
-- **Batch before anything else.** An fsync costs 0.35–0.5 ms (S3), and a
-  proof has a fixed cost of about 2 s (S5). Logs, storage and proofs are
-  batched.
+- **Batch before anything else.** An fsync costs 0.35–0.5 ms, and a
+  segment proof has a fixed cost of about 2 s [measured, 2026-10-08].
+  Logs, storage and proofs are batched.
 - **Untrusted code is checked at run time.** Actors are separately compiled
   vendor code. Macros make correct use easy, but the agent enforces every
   rule when serving calls.
-- **Measure.** Every slice ships with performance tests against section 14.
+- **Measure.** Performance tests hold every hot path to section 14's
+  budgets.
 
 ## 4. Concepts
 
@@ -180,7 +114,7 @@ What slice 6 built (`slice-6-progress.md`), stated where each part lives:
   authenticated origin to the agent. No signed evidence inside guests.
   A credentialed call's evidence is a proof, verified at ingress and
   logged as the origin it proves, never the proof (section 8.6).
-- **Gateways hold no authority** [decided, S41]: the node verifies every
+- **Gateways hold no authority** [decided]: the node verifies every
   signature and proof and runs every ingress check, whoever relays the
   request. A compromised gateway can drop, delay, reorder and read what
   it relays; it forges nothing, replays no operator request (each signed
@@ -240,11 +174,11 @@ impl Ledger {
 
     /// Query: any replica, applied state, outside the log.
     #[msg]
-    async fn balance(&self, id: AccountId, ctx: &Context<Self>) -> u64 { /* ... */ }
+    async fn balance(&self, ctx: &Query<Self>, id: AccountId) -> u64 { /* ... */ }
 
     /// Command: through the agent's log, atomic, within one refine.
     #[msg(role = LedgerRole::Member)]
-    async fn transfer(&mut self, req: Transfer, ctx: &mut Context<Self>) -> Result<Receipt, Error> {
+    async fn transfer(&mut self, ctx: &mut Command<Self>, req: Transfer) -> Result<Receipt, Error> {
         let fee = ctx.call(FEES, Quote(req.amount)).await?; // same agent: nested, completes here
         /* ... */
     }
@@ -254,26 +188,50 @@ impl Ledger {
     #[attestable]
     fn settle(&mut self, window: Window) -> Settlement { /* ... */ }
 
-    /// Merge: any replica or device, no log.
+    /// Merge: any replica or device, no log (not built, section 9.4).
     #[msg(merge)]
-    async fn note(&mut self, text: String, ctx: &mut MergeContext<Self>) { /* ... */ }
+    async fn note(&mut self, ctx: &mut MergeContext<Self>, text: String) { /* ... */ }
 
     /// Workflow: suspends across refines; no access to `self`.
     #[workflow]
-    async fn checked_transfer(wf: &mut Workflow, req: Transfer) -> Result<Receipt, Error> { /* ... */ }
+    async fn checked_transfer(ctx: &mut Workflow<Self>, req: Transfer) -> Result<Receipt, Error> { /* ... */ }
 }
 ```
 
-- This is the shape on master today (`#[actor]`, `#[messages]`, `async fn`
-  handlers with a `Context`). Roles stay as on master.
+- `#[actor]` marks the struct and `#[messages]` its impl block. Handlers
+  are `async fn`s taking `&self` (a query) or `&mut self` (a command) and
+  a context. `#[msg(role = ...)]` names the role a caller needs, from the
+  package's schema; the agent checks it before dispatch.
 - **The context is the actor's whole ABI:** calls, sends, workflow starts,
   `now`, `random`, the caller's identity and logging (section 6.5). The
   context type differs by handler kind, so a query cannot reach a mutating
-  operation.
+  operation [decided]:
+  - `Query<A>` (`&self` handlers): `caller`, `me` (agent and instance),
+    `now`, `random`, `log`, and `call` to a query of the same agent;
+  - `Command<A>` (`&mut self` handlers): all of that, plus `call` to any
+    method of an instance of the same agent (nested and synchronous,
+    section 8.1), `send` to any agent (delivered after the step commits)
+    and `attest` (section 11.1);
+  - `Workflow<A>`: `call`, `send`, `request` (a call to another agent,
+    awaited), `start` and `result` of workflows, `sleep_until`, attests
+    at a window's cut, and the sections `read` and `update` on its
+    actor's state (section 6.5).
+  - A call returns `CallError::Failed` for the callee's own error,
+    `Forbidden` for a role refusal and `Undecodable`; any other callee
+    failure fails the whole step, so the caller never sees it.
+- `#[messages]` generates a module named after the actor with a type per
+  handler, its arguments as fields: `ledger::Transfer { from, to, amount
+  }`, sent to a `Ref<Ledger>`.
+- Tables are fields, used directly (`self.accounts.get(&id)`); the agent
+  serves them through `get`, `put` and `scan`.
+- **Queries see the latest applied work result's time and seed,** so a
+  query's `now` and `random` are deterministic for the state version it
+  reads.
 - **Attestable methods take no context.** The macro rejects any use of
   fields that are not committed maps, and any call outside the method
   (section 11.1).
-- The v1 API is decided in `slice-2-one-node.md` ("Contexts").
+- Merge fields and `#[msg(merge)]` handlers (`MergeContext`) belong to the
+  Merge lane, which is not built (section 9.4).
 
 ### 6.3 Execution order and `.await` [decided]
 
@@ -357,19 +315,19 @@ agent program, which serves them. Precompiles are the one exception
   an owner proof's digest; the caller's buffer holds the largest, an
   `Anonymous`'s 65 bytes.
 
-**No node-side fast path** [decided by S2]:
+**No node-side fast path** [decided]:
 
 - Serving actor calls through the agent costs 2.4–3.6 µs more per transfer
-  than the node serving them directly. That is about 20 agent host calls
-  at about 0.12 µs each, about 7% of one core for an agent at 25k
-  transfers per second.
+  than the node serving them directly [measured, 2026-10-08]. That is
+  about 20 agent host calls at about 0.12 µs each, about 7% of one core
+  for an agent at 25k transfers per second.
 - A fast path would duplicate the ABI in the node, with no JAM counterpart.
 - Fewer, larger memory copies per call (one peek for key and value, one for
   the reply) recover part of the cost first.
 - Revisit only if real workloads spend more than about 20% of refine CPU in
   the agent's serving layer.
 
-### 6.6 Machines [decided by S1, S2 and the owner]
+### 6.6 Machines [decided]
 
 - **Pool.** The node keeps reusable machines keyed by program hash, for
   actors and for agent programs alike. A pooled machine is reused across
@@ -387,28 +345,31 @@ agent program, which serves them. Precompiles are the one exception
   - A differential test (pooled against fresh, adversarial sequences)
     gates the pool.
   - `instantiate` produces the same layout as the JAM loader, bit for bit.
-  - S2 measured a full reset of a small actor's writable image at
-    about 1.4 µs. Slice 1's pool resets only the pages written since the
-    last reset: acquire plus reset after a use costs 2.4 µs on the
-    interpreter and 3.5 µs on the JIT for S2's actor.
+  - The pool resets only the pages written since the last reset: acquire
+    plus reset after a use costs 2.4 µs on the interpreter and 3.5 µs on
+    the JIT for a small ledger actor [measured, 2026-10-09, `pvm/bench
+    nesting`].
 - **Prepared programs** (decoded, and JIT-compiled) are cached by hash.
-  Preparing one costs 64–140 µs per KB (S2), so it happens at install or
-  first use, never per invocation.
+  Preparing one costs 64–140 µs per KB [measured, 2026-10-08], so it
+  happens at install or first use, never per invocation.
 - **Memory structures follow mapped pages**, never the 4 GiB address space:
   - the interpreter's page table and permissions grow with mapped pages;
   - the JIT syncs permissions only for ranges that changed.
 
-  Today's address-space-sized structures cost 0.1–1 ms per machine (S2).
-- **Dirty pages are tracked natively** on both backends. S1 estimated
-  capture at about 16 µs by copying and hashing a known delta; the tracking
-  itself is not yet measured.
+  Structures sized to the address space cost 0.1–1 ms per machine
+  [measured, 2026-10-08].
+- **Dirty pages are tracked natively** on both backends. Capturing a
+  typical suspension's 3 pages costs 0.2–0.6 µs on the interpreter and
+  6–19 µs on the JIT under load (8–12 µs quiet); scanning every writable
+  page instead costs 350–630 µs [measured, 2026-10-09, `pvm/bench
+  snapshots`].
 - **The JIT (the recompiler to native code) is the default backend**
   [decided] for agents, actors and workflows. The interpreter serves
   tracing for proofs and platforms without the JIT.
-  - On short handlers the JIT is only about 1.6× faster today, because
+  - On short handlers the JIT is only about 1.6× faster, because
     host-call exits dominate. That is headroom to optimize, not a reason to
     defer it.
-  - On computation it is about 11× faster (S1).
+  - On computation it is about 11× faster [measured, 2026-10-08].
 
 ## 7. Execution [decided]
 
@@ -515,7 +476,8 @@ all state (section 12), so it has two paths: VOS and JAM.
   wait for them.
 - **Gas is nested** [proposed]:
   - Each step has a fixed gas limit, declared per handler with an agent
-    default.
+    default (`defaults::HANDLER_GAS`, 10M; at most 100M). A refine's
+    budget is 1G by default.
   - A nested call draws its gas from its caller's remaining gas, so a
     step's total never exceeds its limit.
   - The agent dispatches a step only if the refine's remaining gas covers
@@ -545,13 +507,14 @@ Why handlers run to completion:
 - A workflow holds no shared state: only its own memory, which its
   snapshots preserve.
 - A step ends where an `.await` pauses, on another agent, a timer, or a
-  preemption (section 8.3), or at completion. Its synchronous calls' effects, its outgoing messages and
-  its snapshot commit together. If a step traps, nothing from it commits
-  and the workflow fails. Earlier steps stay committed; multi-step
+  preemption (section 8.3), or at completion. Its synchronous calls'
+  effects, its outgoing messages and its snapshot commit together. If a
+  step traps, nothing from it commits and the workflow fails. Earlier steps stay committed; multi-step
   atomicity uses reservation (saga) patterns.
-- Every await on another agent has a deadline (default per agent,
-  overridable). An expired deadline returns an error to the awaiting code,
-  so stuck workflows cannot pin pages and programs forever.
+- Every await on another agent has a deadline (60 s past the awaiting
+  step's batch time unless the call sets one). An expired deadline
+  returns an error to the awaiting code, so stuck workflows cannot pin
+  pages and programs forever.
 - A workflow is started by a message in a session or pair sequence. Its
   result is sent to whoever started it.
 - Long computations run as workflows, preferably in their own agent so their
@@ -563,8 +526,8 @@ Why handlers run to completion:
 - A snapshot is: program hash, program counter, registers, and the page
   table (page index → page), with the host call a step ended at when it
   ended before serving one. It holds no gas: every step starts a unit at
-  its workflow's limit, which the agent sets (slice 4). Pages are 4 KiB. Zero pages and pages
-  unchanged from the program image are not stored.
+  its workflow's limit, which the agent sets. Pages are 4 KiB. Zero pages
+  and pages unchanged from the program image are not stored.
 - On VOS, a snapshot is taken when a workflow step ends.
 - **Preemption** [proposed]. A step's atomicity never depends on gas:
   - **Effect-free:** a step has no effects until its first call, send or
@@ -583,17 +546,17 @@ Why handlers run to completion:
 - After failover, a workflow resumes from its last committed snapshot.
 - On JAM, machines do not survive a refine, so every work package ends with
   a snapshot (the CoreVM model).
-- Changed pages ship in full in the work result, compressed with LZ4. They
-  are never referenced by hash alone unless the large-entry path pins them
-  (open question 3). Later: XOR deltas against the previous version.
-- Measured cost (S1):
+- Changed pages ship in full in the work result, compressed with LZ4. A
+  work result of 64 KiB or more takes the blob path (section 9.5). Later:
+  XOR deltas against the previous version.
+- Measured cost:
   - a typical suspension changes 3 pages, under 1 KiB after LZ4;
   - a long computation's first snapshot ships 2 MiB, and later ones about
-    136 KiB, because random data does not compress.
-  - Restore was measured on fresh machines: about 0.1 ms to instantiate on
-    the JIT, plus about 0.5 ms on the first resume until the full-span
-    permission sync is removed. On the interpreter it takes 2.3 ms today.
-    Restore from pooled images is not yet measured.
+    136 KiB, because random data does not compress [measured,
+    2026-10-08];
+  - restoring 3 pages costs 28–34 µs on a fresh JIT machine and
+    0.2–0.3 µs on a pooled one; 34 changed pages of a long computation
+    440–500 µs fresh [measured, 2026-10-09, `pvm/bench snapshots`].
 - A Merkle root over the page table is computed only for JAM and for
   attestable runs.
 - The leader caches live machines keyed by (workflow, last committed
@@ -617,8 +580,8 @@ Why handlers run to completion:
     refused until the client catches up.
 - **Client sessions:**
   - **Ids:** a client names its session: its key, a random 128-bit name
-    and a creation time t0, in every signed request (slice 3, owner's
-    decision). The triple is the session's identity. The agent creates a session only if t0 is within a skew of
+    and a creation time t0, in every signed request. The triple is the
+    session's identity. The agent creates a session only if t0 is within a skew of
     the batch time, and collects one only once it has expired and the
     batch time is past t0 plus the skew, so a collected session is never
     created again. Caps on live sessions refuse new ones and never evict.
@@ -630,8 +593,9 @@ Why handlers run to completion:
     ones are refused. A liveness cost, never a replay.
   - **Sequences** are kept per (session, receiver agent), so requests to
     different agents never leave gaps in each other's sequence.
-  - **State:** the high-water mark and the window of replies, kept until
-    the session expires after inactivity. Expiry is computed from
+  - **State:** the high-water mark and the window of replies (W = 64),
+    kept until the session expires after an hour of inactivity (the skew
+    is a minute). Expiry is computed from
     work-result time, never a local clock. State is O(active clients), not
     O(requests).
   - **Expiry:** a request in an expired session, or naming an absent one
@@ -669,10 +633,9 @@ Why handlers run to completion:
   which covers a kernel's record of up to `records::MAX_CLASSES` classes).
   The agent traps a refine whose gas does not cover its budget once the
   batch is decoded, so nodes that reserve differently refine a batch
-  differently. Slice 5 changed it, adding the per-kernel share when
-  kernels' records gained their shapes.
+  differently.
 
-### 8.6 Credentialed calls and origins [decided, S21–S24, S39, S43, S47]
+### 8.6 Credentialed calls and origins [decided]
 
 `identity-and-authority.md` §5 pins them; the core model's part:
 - **The origins** are the logged caller's variants (`vos_wire::ids::Principal`):
@@ -695,7 +658,7 @@ Why handlers run to completion:
   log entry's size is unchanged. Exactly-once is the binding's, not a
   sequence's: apply records `binding(b) → expires_ms` whatever the method
   does, swept 60 s past the expiry through the due index, and refuses a
-  recorded `b` (`Replayed`, without the first outcome, S39). A refused
+  recorded `b` (`Replayed`, without the first call's outcome). A refused
   input writes nothing, so a proof replayed at another replica runs once.
 - **The guards** live in the method's schema (`MethodSchema::credential`):
   `#[msg(credential = Auth("login"))]` admits `Anonymous` origins of that
@@ -703,12 +666,14 @@ Why handlers run to completion:
   handler compares the digest with the live row it debits); a method
   without one refuses both. An `Auth` guard needs its agent's credential
   actor, found through the system row `credentials → instance`.
-- **The `once` guard** [decided, S43, S47]: `#[msg(credential =
-  Auth("vote"), once)]` admits a nullifier once in its scope; apply
-  records `once(scope ‖ nullifier) → t` for good, only when the handler
-  returns `Ok`, in the same apply, so a refused call leaves the member
-  free to try again with a new proof.
-- **Device proofs** authorize what an auth proof does [decided, S24]: a
+- **The `once` guard** [decided]: `#[msg(credential = Auth("vote"),
+  once)]` admits a nullifier once in its scope (space, agent, instance,
+  name), so no handler keeps its own set; apply records `once(scope ‖
+  nullifier) → t` for good, only when the handler returns `Ok`, in the
+  same apply, so a failed or refused call leaves the member free to try
+  again with a new proof. The binding is recorded whatever the handler
+  does, so a replay is still refused.
+- **Device proofs** authorize what an auth proof does [decided]: a
   guard's `device = "..."` names the device kernel (section 11.1) whose
   proofs it also takes, verified against the program every node computes
   from the installed kernel.
@@ -746,15 +711,15 @@ The Local (replica-only) lane is deferred until a use case needs it.
 
 - `Table<K, V>` (with map, set and vector variants) stores rows in the
   agent's keyspace: point reads and writes, ordered scans with cursors.
-  Memory use follows touched rows, not table size. At 10M rows (slice 2,
-  warm cache), writes cost 2.2–2.9 µs and compacted reads 2.5 µs, within
+  Memory use follows touched rows, not table size. At 10M rows with a
+  warm cache, writes cost 2.2–2.9 µs and compacted reads 2.5 µs, within
   the 5 µs budget; reads behind fresh writes in the memtable and level 0
-  cost 5.0–5.2 µs.
+  cost 5.0–5.2 µs [measured, 2026-10-10].
 - `CommittedMap<K, V>` also yields a Merkle root and multiproofs
   (`BatchProof`) for attestable methods and JAM witnesses. Only branching
   nodes are stored: about log₂(n) rows per key path.
-- **Each table chooses how its keys enter the keyspace** [decided,
-  slice 4]: as Substrate maps choose a hasher.
+- **Each table chooses how its keys enter the keyspace** [decided]:
+  as Substrate maps choose a hasher.
   - **Hashed,** the default: `H128(key) ‖ key`. It is balanced whatever
     keys clients choose, and scans in hash order.
   - **Ordered,** `Table<K, V, Ordered>`: the key itself, with keys of at
@@ -762,7 +727,7 @@ The Local (replica-only) lane is deferred until a use case needs it.
   - Both are escaped so that every row key in the keyspace is
     prefix-free, and a scan returns rows in the same order on every
     host.
-- **The compressed tree** [decided; built in slice 4, `vos-tree`]:
+- **The compressed tree** [decided; built, `vos-tree`]:
   - **A leaf** commits a domain tag, its key's length and bytes, and
     `vh = H(tag ‖ salt ‖ value)`. The salt sits inside `vh`, so a proof
     that opens a neighbour's leaf never shows a hash of its bare value.
@@ -782,8 +747,8 @@ The Local (replica-only) lane is deferred until a use case needs it.
     seed is kept, inside the space. Keys and the tree's shape stay
     visible in any shared path, so paths remain private witnesses.
 
-  An update costs 8 to 25 hashes, as S4 measured.
-- **Root maintenance** [decided; built in slice 4]:
+  An update costs 8 to 25 hashes [measured, 2026-10-08].
+- **Root maintenance** [decided; built]:
   - Accumulate writes each committed value with its version, a dirty
     row (version first) and a seed row per version. It hashes nothing.
   - **A root builder on every replica:**
@@ -801,7 +766,8 @@ The Local (replica-only) lane is deferred until a use case needs it.
     statement, against the agent root at a window cut, generated by the
     held build.
   - **Cost:** a committed write takes about 4.3 µs on the apply path,
-    and the builder keeps up at 20k committed writes a second (slice 4).
+    and the builder keeps up at 20k committed writes a second [measured,
+    2026-10-15].
   - **Window cuts** [decided; built]. In an agent of a
     space, apply records `cut(w)`, the version before the first result
     timed at or past a window's boundary, for each boundary a result
@@ -828,26 +794,34 @@ The Local (replica-only) lane is deferred until a use case needs it.
   both hosts fail on it. A space has a root per window, built by its
   representative (`proving.md` §7).
 
-### 9.4 Merge lane
+### 9.4 Merge lane [proposed; not built]
+
+The Merge lane is designed and not built: no actor field, handler or node
+path serves it yet. `support/merkle-crdt` holds the DAG and the sync
+format it builds on. Its open questions are in `open.md`: masking and
+read-time filtering in each CRDT type, property tests for the
+authorization rule, the storage-backed types' design, and whether devices
+run Merge handlers locally or as thin clients.
 
 - **One DAG per sync scope** [proposed]. A scope is one instance's Merge
   fields, or a declared group of them. Each scope has its own merkle-crdt
   DAG and epoch chain, so a device fetches only the scopes it belongs to.
   A DAG node is a batch of CRDT operations with stable operation ids, its
   parents and its author.
-- **Incremental apply** [decided by S6]. merkle-crdt's DAG and sync format
-  are reused; its apply path is rewritten:
+- **Incremental apply** [decided]. merkle-crdt's DAG and sync format are
+  reused; its apply path is rewritten:
   - validate and apply only newly fetched nodes, in causal order, onto the
     current state;
   - derive which heads are subsumed from the fetched nodes;
   - apply local operations in place, with no state clone.
 
-  Full validation and rebuild remain only for recovery and audits. Today's
-  library takes 8.7 s to sync one operation onto a 1M-operation history; a
-  40-line incremental prototype takes about 1.9 µs, 1.5–1.8× its cost at
-  1k (S6, an LWW map on an in-memory store without signature checks).
-- CRDT types are storage-backed. The v2 `List` rebuilds its whole order on
-  every call and never drops tombstones, so it is replaced.
+  Full validation and rebuild remain only for recovery and audits.
+  merkle-crdt's full apply takes 8.7 s to sync one operation onto a
+  1M-operation history; an incremental prototype takes about 1.9 µs,
+  1.5–1.8× its cost at 1k (an LWW map on an in-memory store without
+  signature checks) [measured, 2026-10-08].
+- CRDT types are storage-backed. A list type that rebuilds its whole order
+  on every call and never drops tombstones does not meet the budget.
 - **Linear-emitted chain.** Linear handlers may emit Merge operations, for
   materialized views, membership epochs and checkpoints that let devices
   bootstrap without full history.
@@ -906,7 +880,7 @@ with one journal and a partition per data class. It holds:
   timers;
 - the node log.
 
-**Why an LSM** (S4):
+**Why an LSM** [measured against redb, 2026-10-08]:
 
 - at 10M rows, random updates cost about 1.5 µs per row on fjall against
   18 µs on redb;
@@ -914,11 +888,12 @@ with one journal and a partition per data class. It holds:
 - redb reclaims space only after durable commits: a 0.7 GB table loaded
   without them grew to 24.6 GiB.
 
-S4 measured reads at 5.2–5.6 µs at 10M rows with a 1 GiB warm cache (redb:
-1.6 µs), and about 0.1 ms cold. Slice 2 brought compacted reads to 2.5 µs
-by skipping last-level filters where reads mostly hit (step 2.2); reads
-behind fresh writes stay at 5.0–5.2 µs, and steady-state read cost under
-continuous writes is slice 3's measurement.
+Reads at 10M rows with a 1 GiB warm cache cost 2.5 µs compacted, with
+last-level filters skipped where reads mostly hit, 5.0–5.2 µs behind
+fresh writes, and about 0.1 ms cold [measured, 2026-10-10]; under
+continuous writes of 64 agents, a mean of 2.7 µs and a p99 of 3.8 µs
+[measured, 2026-10-13]. Compaction under sustained writes, cache sizing
+per node and cold reads are not yet tuned (`open.md`).
 
 **Layout** [proposed]: agents share each partition under agent key
 prefixes; a tree per agent would multiply memtables and background work. A
@@ -938,8 +913,8 @@ node-level log, keyed by (agent, index):
 
 - the writer drains the pending writes of all agents, commits them with one
   fsync, then acknowledges each;
-- a flush is capped in bytes, so one large entry cannot hold back every
-  agent (open question 3);
+- a flush is capped in bytes (8 MiB), a guard against one large entry
+  holding back every agent;
 - storage I/O never runs on executor threads;
 - writes that only move the commit index are not fsynced;
 - **a stalled writer hands over leadership** [decided]: a commit waiting
@@ -948,6 +923,23 @@ node-level log, keyed by (agent, index):
   commits counted with its sync, marks the writer stalled, and
   the node stops leading the groups it leads, which elect elsewhere. A
   slow sync so costs leadership no sooner than a crash would be detected.
+
+**Large entries take the blob path** [decided; built]. One agent's
+large entries inline in the log stall every agent's small ones, and
+64 KiB entries alone already show a p99 of about 50 ms [measured,
+2026-10-10]:
+
+- a work result of 64 KiB or more (`LARGE_RESULT`) is a content-addressed
+  blob (BLAKE2b-256), written by the node's blob writer on its own thread,
+  files and syncs, with group commit; the log entry carries its hash and
+  length;
+- a replica appends the reference only after its own copy of the blob is
+  durable (invariant 7 below); the leader sends the blob ahead of the
+  append that names it;
+- smaller entries stay inline in the log partition;
+- programs always take the blob path (an install body may hold 64 MiB),
+  pinned while installed; snapshot pages and witnesses reuse it; a work
+  result's blob lives until log compaction passes its entry.
 
 **Applied state without fsync** [proposed]. Accumulate writes each entry as
 one atomic batch without fsync. This is safe under seven invariants:
@@ -981,30 +973,24 @@ outbox sequence numbers, which receivers deduplicate.
 - The log carries work results, not inputs; followers only accumulate.
 - Raft snapshots of agent state bound log size. Installing one costs
   O(state), never O(history).
-- **New vos-raft driver** [decided by S3]. The protocol core stays, and the
-  driver changes:
+- **The vos-raft driver** [decided; built]. vos-raft's protocol core is
+  `no_std`; its driver:
   - queued proposals are appended in one batch (group commit);
   - new entries go to followers at once, with one append in flight per
     peer;
   - commit-index updates go out eagerly, combined per node pair (section
     7.5);
-  - every group runs on one shared executor; the thread-per-group `Worker`
-    is dropped;
+  - every group runs on one shared executor, with no thread per group;
   - followers answer heartbeats without waiting for the store, and
     heartbeats are combined per node pair.
 
-  A 165-line prototype of the first two changes passed all of vos-raft's
-  tests. It reached about 25k commits/s at p99 8 ms, peaking at 44k/s,
-  where the current driver managed 1.2k/s at p99 58 ms; openraft managed
-  2.5k/s on the same store. Those runs were on redb, in one process, with
-  three replicas on one disk, under closed-loop load, measuring leader-side
-  latency only (S3).
-- **The heartbeat sets failure detection only.** Commits no longer wait for
-  it, so idle groups heartbeat slowly or quiesce. 1,000 idle groups at a
-  500 ms heartbeat cost about 1.6% of a core per node, 5 threads and about
-  8 KiB per replica (S3).
-- **Liveness at scale** [built; measured on the scale test,
-  `research/slice-7/scale-report.md`]:
+  Group commit and replicate-on-propose are what lift a group's commit
+  rate: a thread-per-group driver without them managed 1.2k commits/s at
+  p99 58 ms, with them about 25k/s at p99 8 ms [measured, one process on
+  redb, 2026-10-08].
+- **The heartbeat sets failure detection only.** Commits never wait for
+  it, so idle groups heartbeat slowly or go quiet.
+- **Liveness at scale** [built; measured, section 14.1]:
   - **Quiet groups:** a group whose only deadline is one the pair
     heartbeat stands in for (a follower whose leader the pair heartbeat
     vouches for, a leader idle, caught up and hearing every member's
@@ -1040,20 +1026,15 @@ outbox sequence numbers, which receivers deduplicate.
   - **Batches in flight** (`in_flight`) are built and safe, and off (1) by
     default: at T1's load more batches in flight split the inputs into
     more, dearer batches, with one append in flight per follower.
-  - **Measured** on three nodes of one host [measured]: idle cost 45.6 MiB
-    of RSS and 0.16% of a core per 1,000 replicas (T3's budget 64 MiB and
-    5%); 10^5 replicas a node quiet and loaded with no election; a cold
-    restart at 10^5 every group led and quiet at the first poll, within
-    6.3 GiB; a leader's node killed under load, its agents led again
-    within 5.3 s; at 10^6 users and 5,000 calls a second, transfers p99
-    2.6–3.1 s against T1's 50 ms, the shared disk's commit binding
-    (S59 carries the commit-to-apply gap, the disk and batched signature
-    checks).
-- **Many active agents per node:** with S3's prototype node writer, p99
-  was 16–56 ms at 16 active agents and up to 191 ms at 64, and leaders
-  were lost at 1,000. The scale runs above hold 10^5 replicas a node with
-  no election; what still misses is T1's latency under load (section 14;
-  work item 16).
+  - **Measured** on three nodes of one host (section 14.1): idle cost
+    45.6 MiB of RSS and 0.16% of a core per 1,000 replicas [measured,
+    2026-10-27]; 10^5 replicas a node quiet and loaded with no election;
+    a cold restart at 10^5 every group led and quiet at the first poll,
+    within 6.3 GiB a node; a leader's node killed under load, its agents
+    led again within 5.3 s [measured, 2026-10-31].
+- **Many active agents per node:** the scale runs hold 10^5 replicas a
+  node with no election; what still misses is client latency under load
+  (section 14.1, `open.md`).
 - Rebalancing uses membership changes (joint consensus exists in vos-raft).
 
 ## 11. `#[attestable]` [decided intent and direction; sizes proposed]
@@ -1115,7 +1096,7 @@ outbox sequence numbers, which receivers deduplicate.
     spaces pallet). A node reaches its venue through a `VenueClient`
     (`proving.md` §6).
 
-### 11.2 Precompiles [decided direction; prototyped in S5b]
+### 11.2 Precompiles [decided; built]
 
 - A precompile is an `ecalli` host call with a VOS-owned id in
   `0x400..=0x47f`, outside every id JAM assigns (the Gray Paper calls, and
@@ -1133,12 +1114,13 @@ outbox sequence numbers, which receivers deduplicate.
   unchanged. `WHAT` in φ[7] can therefore only come from a host that does
   not know the id.
 - The prover attaches each call to its chip (BLAKE2b) inside the same
-  slice. The Ristretto and scalar ids 110–114 are no precompile: their
-  chips were removed as unsound, and a generic bignum chip (M6, after
-  slice 7) replaces them. The STARK alone rejects a tampered call input (S5b).
+  slice; the STARK alone rejects a tampered call input (`pvm/bench`'s
+  `precompile_tamper` test). The Ristretto and scalar ids 110–114 are no
+  precompile, for want of a sound chip; a generic bignum chip, not built
+  (`open.md`), takes their place.
 - **On JAM,** the unknown id returns `WHAT` and the guest computes in
   software, with identical results for runs that complete.
-- **Gas** [decided; delegated by the owner]:
+- **Gas** [decided]:
   - Results are promised identical only for runs that complete. Whether a
     run exhausts its gas depends on the environment: a hash costs about 66
     steps on VOS and about 4,760 on the JAM fallback, and the `gas` call is
@@ -1147,25 +1129,24 @@ outbox sequence numbers, which receivers deduplicate.
     on VOS.
   - VOS prices each precompile, and the prover binds that price wherever a
     proof binds final gas. A BLAKE2b compression costs 600 gas, from its
-    native serving cost (slice 1); a Poseidon2 compression 2,400, about
-    four BLAKE2b compressions natively, and about 37,600 gas in software
-    on JAM [measured]. The agent charges the batch for serving an inner
+    native serving cost; a Poseidon2 compression 2,400, about four
+    BLAKE2b compressions natively, and about 37,600 gas in software on
+    JAM [measured, 2026-10-26, `pvm/bench precompile`]. The agent charges the batch for serving an inner
     machine's call by precompile (`POSEIDON2_SERVING` 60,000), since JAM
     pays the software permutation.
-- **Cost per BLAKE2b compression** (S5b): 66 steps plus about 35 ms and
-  50 MiB of proving. Hashing in the PVM costs about 4,760 steps, 0.4 s and
-  800 MiB per hash. The marginal cost rises near a slice's memory cap:
+- **Cost per BLAKE2b compression** [measured, 2026-10-08]: 66 steps plus
+  about 35 ms and 50 MiB of proving. Hashing in the PVM costs about 4,760
+  steps, 0.4 s and 800 MiB per hash. The marginal cost rises near a slice's memory cap:
   about 20 ms per compression up to 100 calls, 46 ms between 200 and 400.
 
 ### 11.3 Cost and size guideline [proposed]
 
-The proving figures below are S5's measurements of the retired segment
-formats. The current ones are `proving.md` A.7 and `slice-5-progress.md`
-("Slice 5 accepted", "Measured"): on format 35 a class-1 segment proves in
-6.7–10.7 s at 4.79 GiB of heap.
+The proving figures below were measured on earlier segment formats
+[measured, 2026-10-08]; the current costs per statement are in
+`proving.md` A.7. The guideline they set still holds.
 
 - **Prover memory per segment** ≈ 4.6 GiB + 170 KiB × steps + 39 MiB ×
-  compressions (S5, S5b). Steps include the 66 a compression takes, so a
+  compressions [model]. Steps include the 66 a compression takes, so a
   compression costs about 50 MiB in all. Segments are sized to the prover's memory, not to
   steps alone. On a 24 GiB prover that means about 2^16 steps with about
   200 compressions; a 2^16-step segment of hash-heavy code (about 1,000
@@ -1183,16 +1164,17 @@ formats. The current ones are `proving.md` A.7 and `slice-5-progress.md`
     and is checked once a transfer kernel is proved.
   - Kernels hash tree nodes with the compress-level call (one block for a
     76-byte node). The streaming `blake2b_hash` in the shim costs about 325
-    steps per hash (slice 1, S5b rerun), five times the target's 66, which
+    steps per hash [measured, 2026-10-09, `pvm/bench precompile`], five
+    times the target's 66, which
     would put a 1,000-transfer window at 15–33M steps.
 
 ### 11.4 Privacy [decided: top priority; requirements]
 
-The owner's model: an actor's state is private; an `#[attestable]` method's
+The model: an actor's state is private; an `#[attestable]` method's
 arguments and the state it reads are private inputs to the circuit; its
 return value is the public output that on-chain agents act on.
 
-Status today (checked in the code, not only by the review):
+Status:
 
 - **Hiding where a proof leaves.** The final proof is masked (format 39,
   variant (c), `proving.md` §5); segment, leaf and fold proofs are not,
@@ -1202,8 +1184,7 @@ Status today (checked in the code, not only by the review):
   private hashes, step counts, memory roots, registers and the masking's
   randomness.
 - **Witness-free verification:** a statement's final proof binds the
-  whole run (its entry, its halt and its io-hash). The refine-bundle path
-  (format 36) is retired, and deleted.
+  whole run (its entry, its halt and its io-hash).
 - **No plain hash of private inputs leaves:** the io-hash covers the
   public arguments, the output and the roots.
 
@@ -1222,11 +1203,11 @@ Requirements before any proof leaves a space:
    - the public output: the return value, the roots and the program hash;
    - a fixed shape class.
 5. **Fixed shape classes** (met by the shape per kernel and the padded
-   fold shape, slice 5): segment counts and trace sizes are padded to a
-   few canonical shapes (the existing canonical-shape work), so a proof
+   fold shape): segment counts and trace sizes are padded to a
+   few canonical shapes, so a proof
    does not reveal how busy a window was.
 6. **Window aggregation** for on-chain verification (met by the
-   recursion, slice 5). A window is many
+   recursion, `recursion-air.md`). A window is many
    segments, and it must fit a JAM work package and the on-chain verifier's
    gas.
 
@@ -1240,8 +1221,6 @@ Around the proof:
   VOS spaces; only final proofs, their statements and the space's anchors
   reach a venue (the JAM statements service, Kreivo's spaces pallet).
 
-These form a prover track that runs alongside the core slices (section 16).
-
 ## 12. JAM integration [decided: early]
 
 - **What runs on JAM** [decided]: public agents holding global data that
@@ -1253,19 +1232,16 @@ These form a prover track that runs alongside the core slices (section 16).
     accounts stay private, so the space works like a mixer to the outside.
   - **Collectives:** each space joins through an on-chain agent that
     represents it and votes.
-- Agent programs are valid JAM services from the first slice. A JAM
-  host-call CI harness runs them from slice 2.
-- **One PVM version for everything: Gray Paper 0.8.0** [decided by SJ]:
+- Agent programs are valid JAM services; a JAM host-call CI harness runs
+  them.
+- **One PVM version for everything: Gray Paper 0.8.0** [decided]:
   - it covers the runtime, compiler, prover and agents;
-  - the saga's 0.8.0 PVM layer is the base, and its interpreter and JIT
-    both charge the exact 0.8.0 block gas model;
-  - in SJ, a Rust service linked with our toolchain ran unchanged on a
+  - the interpreter and the JIT both charge the exact 0.8.0 block gas
+    model;
+  - a Rust service linked with the VOS toolchain runs unchanged on a
     PolkaJam 0.1.29 testnet: refine on the guarantors, accumulate on all
-    seven validators.
-- **JAR is gone** [decided]. Its capability-manifest encoding, the `ecall`
-  opcode paths, JAR lifecycle stubs and capability calls in the prover's
-  allow-list, and JAR blob tests are removed.
-- **JAM mode, as built in slice 4:**
+    seven validators [measured, 2026-10-08].
+- **JAM mode** [built]:
   - **The work.** A work package carries a batch, the agent's root
     before, and a witness: a multiproof over every key the refine reads
     or writes, and a range proof per scan. Every table's rows are under
@@ -1287,8 +1263,8 @@ These form a prover track that runs alongside the core slices (section 16).
       which is how the builder learns where pages live;
     - solicits the program preimages the package names.
     - It verifies nothing else: the builder is trusted for the batch's
-      content; statements are verified by the statements service
-      (slice 6), batches are not proved.
+      content; statements are verified by the statements service,
+      batches are not proved.
   - **Root continuity serializes an agent's packages.** The builder
     chains them, and recovers from a refused, late or foreign package.
   - **Pages:**
@@ -1315,7 +1291,7 @@ These form a prover track that runs alongside the core slices (section 16).
     several blocks.
   - **Witnessed reads cost gas:** software BLAKE2b runs about 20k gas a
     compression on JAM, so a witnessed read costs about 190k to 255k gas
-    and a scanned range about 85k a row (slice 4).
+    and a scanned range about 85k a row [measured, 2026-10-15].
   - The Merge lane is VOS-only in v1.
 - **The builder** (`vos-jam`):
   - simulates refine off-chain, recording every key it touches, and
@@ -1334,7 +1310,7 @@ These form a prover track that runs alongside the core slices (section 16).
   that the worst step on JAM, ending a workflow that holds them all with
   its effects at their limits, fits a package (about 839M of 950M
   usable); at VOS's caps the ending alone takes about 913M.
-- **Limits per target** [decided by the owner]. An agent runs on one
+- **Limits per target** [decided]. An agent runs on one
   host, so its target, VOS or JAM, is the agent's: its first install
   records it (`keys::target`), a later install naming another is refused
   (`Failure::Target`), and a JAM builder takes installs for JAM alone,
@@ -1358,18 +1334,16 @@ These form a prover track that runs alongside the core slices (section 16).
     within the least of its caller's gas, its method's and that most.
   - **One page price everywhere:** the limits cap a step and never price
     it; VOS pays JAM's page prices.
-- **The first end-to-end run held on a PolkaJam testnet** (slice 4,
-  `just jam-testnet`):
-  - the default agent and two actors ran as a service;
-  - a workflow started in one package resumed across three later ones,
+- **The end-to-end run on a PolkaJam testnet** (`just jam-testnet`):
+  - the default agent and two actors, installed for JAM, run as a
+    service;
+  - a workflow started in one package resumes across three later ones,
     its pages exported and imported by segment root;
-  - every read was witnessed, and every package's work result, read
-    back from the chain, equalled a VOS node's byte for byte.
-  - It ran on PolkaJam's interpreter backend, and again in slice 5 with
-    the actors installed for JAM. Its recompiler, the kernel setting now
-    granted, fails at start on the laptop: PolkaVM's sandbox reads every
-    CPU's L3 cache entry, which its low-power cores lack.
-- **Next:** the Clerk's settlement follows slice 6.
+  - every read is witnessed, and every package's work result, read back
+    from the chain, equals a VOS node's byte for byte.
+  - It runs on PolkaJam's interpreter backend. Its recompiler fails at
+    start on the development laptop: PolkaVM's sandbox reads every CPU's
+    L3 cache entry, which its low-power cores lack.
 
 ## 13. Portability [decided direction]
 
@@ -1378,35 +1352,54 @@ These form a prover track that runs alongside the core slices (section 16).
   and the proof verifier.
 - **`std` adapters at the edges:** the LSM engine, the networking, the
   JIT and the node's API; the gateway (tokio) never links into the node.
-- **Nodes may require Linux ≥ 6.7** [decided], for userfaultfd-based
-  dirty-page tracking, if slice 1's measurement picks it.
+- **The node keeps one binary API** [decided; built]: `vos_wire` frames
+  over a unix socket (a co-located gateway) and over QUIC with mutual TLS
+  (`node-api.md`). HTTP, public TLS, the SSH surface and the limits before
+  authentication are the gateway's, so the node serves no HTTP and its
+  attack surface is the one framed API. Operators sign every request with
+  a key the node's config lists, a nonce and an expiry, so a gateway
+  relays operator requests without holding authority.
+- **The prover is built into the node** [decided], never an extension:
+  proving is essential to VOS.
+- **The node knows no JAM** [decided]. A program is deployed on JAM with
+  JAM's tooling; VOS ships the JAM statements service and the
+  agent-as-JAM-service build. The JAM client VOS has (a PolkaJam node's
+  RPC and `jamt`, the statements service's client and venue) is
+  development and test tooling (`tools/jam-dev`), which no node links.
+  Venues, JAM's among them, are meant to attach to a node through
+  extensions; the extension host is not designed (`open.md`).
+- **The JIT needs Linux ≥ 6.7** [decided; built]: it tracks dirty pages
+  with userfaultfd write-protect in async mode and `PAGEMAP_SCAN`, which
+  costs no barrier per store (a store barrier cost 13% on computation).
+  On older kernels the default backend falls back to the interpreter and
+  warns once.
 - A future bare-metal light client runs Merge replicas and proof
   verification on the interpreter.
 - The shared-executor Raft driver keeps vos-raft's core free of threads.
 
-## 14. Performance budgets [decided; measured in run 3 and slices 1 to 4]
+## 14. Performance budgets [decided]
 
 | Path | Budget | Measured | Status |
 |---|---|---|---|
-| Actor invocation, refine and accumulate, one node | ≤ 50 µs | the default agent on one node with fjall storage, counter increments under load: 21–24 µs per request on the JIT, 85 µs on the interpreter, plus a 0.9 ms synced commit per batch of 165–210 requests (slice 2) | passes on the JIT; the interpreter, kept for tracing and platforms without the JIT, misses |
-| Committed-map write on the apply path [proposed] | ≤ 5 µs; background root building keeps up with apply | about 4.3 µs a committed write at 1M keys: accumulate 1.05 µs on the JIT, the store's value and dirty rows 3.2–3.3 µs. The root builder at 20k committed writes a second for 30 s: 19.9k rows a second built, a median build of 137 ms, at most 14 versions behind, caught up in 162 ms (slice 4) | passes; the builder near its capacity, a faster native BLAKE2b its lever |
-| Fixed cost per refine [proposed] | ≤ 50 µs; pooled acquire and reset ≤ 5 µs; a new machine ≤ 50 µs | an empty refine on a kept agent machine 13 µs (JIT) and 10 µs (interpreter); pooled acquire, use and reset 1.6 and 1.1 µs; a new machine 7–10 and about 32 µs (slices 1 and 2) | passes |
-| Replicated agent on 3 LAN nodes, simple mutations | ≥ 20k per second per agent; p99 commit ≤ 10 ms at half load | three node processes over QUIC, signed calls over HTTP (slice 3). The most, closed loop at 256 sessions: 18.6–19.5k/s on the reference pinning, 19.7–20.1k/s with the leader on cores of its own. The half-load p99, open loop: 6.7–14.2 ms in five runs (one of four over HTTP within 10 ms, 8.2 ms over HTTPS), and 7.0–10.9 ms in four with cores of its own (three within 10 ms). The prototype driver's 25k/s at p99 8 ms (S3) was one process, unsigned. The node's HTTP is since deleted (7.10b's C10): 7.23 measures again over the node API, both recorded (S50) | at the edge on the laptop: capacity just short or just met; the half-load p99 not met reliably; awaiting a machine of its own |
-| Many active agents per node [proposed] | 64 active agents: ≥ 40k commits per second in total, p99 ≤ 20 ms | three node processes, reference pinning (slice 3): 33.9k/s most at 16 sessions each (p99 45 ms); open loop p99 6.8 ms at 20k/s and 106 ms at 25k/s, so the knee lies between; closed, the nodes 4.6–5.3 of their 6 logical CPUs busy, hyperthreads included | misses on the laptop; awaiting a machine of its own and the owner's contract levers |
-| Workflow snapshot capture plus restore, up to 50 KB | ≤ 1 ms | through a real workflow step on the JIT, beyond an empty refine: a typical suspension (3 pages restored, 2 captured) 176–252 µs; 50 KB (15 restored, 14 captured) 0.62–0.81 ms on a quiet machine, 1.47 ms under contention (slice 4). Page hashing, one precompile call per 128-byte block, is about a fifth of it. The runtime's own capture and restore are microseconds (slice 1, S1) | passes on a quiet machine, so the leader's live-machine cache is not built |
-| A workflow's resume, a reply in to its step applied [proposed] | — | one node in process, synced commits: median 1.3–1.6 ms, p99 2.1 ms (slice 4). Three nodes, the leader in process and its followers `vos` processes over QUIC: median 1.77–1.92 ms, p99 2.48–2.77 ms, replication adding about 0.45 ms to the commit; on tmpfs 0.92–0.97 ms (slice 5) | measured |
-| Fan-in across nodes [proposed] | — | three nodes over QUIC, one receiving agent: 13.2k messages a second applied from 4 senders, 17.6k from 8; past the receiver's queue, its refine bounds it (97–98% busy, about 1.1 frames a message when nothing drops); after a full queue drains, the receiver asks its dropped senders to resend, so 32 senders' backlog drains in about 5 s, not 9–26 (slice 4) | refine-bound; no frame batching needed |
-| A witnessed read on JAM [proposed] | — | beyond the VOS run, on the JAM-only host at PolkaJam's prices: about 255k gas for a read alone, about 192k each among 64, about 85k a row of a scanned range; a workflow package's own work at most about 4.9M; the milestone's refines 0.26M–41M of a 1e9 limit (slice 4) | far within the refine limit |
-| Table point read or write at 10M rows (host cost) | ≤ 5 µs | write 2.5–3.3 µs; read 2.5–3.2 µs compacted, 5.0–5.2 µs with 620k fresh updates in the memtable and level 0, about 0.1 ms cold (slice 2); read under the 64-agent run's writes at 31–32k inputs/s, over a whole memtable cycle, at the store: mean 2.68–2.72 µs, p99 3.70–3.81 µs, against 2.29–2.34 and 3.54–3.68 alone (slice 3, two runs) | passes compacted and under continuous writes; at the edge behind a bulk of fresh writes to the table itself |
-| Query on a follower | ≤ 100 µs | through a node's query path (executor round trip, snapshot, refine in query mode, one actor): median 49 µs and p99 115–175 µs on the JIT, median 87 µs on the interpreter (slice 2); a follower of three processes (two runs over HTTP, one over HTTPS): p50 0.12–0.23 ms, p99 0.22–0.34 ms client to answer, 86–92 µs of the follower's CPU a query; linearizable, p50 0.36–0.41 ms and 244 µs (slice 3) | open: met at the median, missed at p99; the percentile is the owner's call |
-| Request latency on a quiet node [proposed] | ≤ 5 ms at p99 | one request at a time on one node: about 3 ms in process, the batch's 2 ms linger plus a 0.9 ms synced commit; its execution, 260–340 µs, is idle-core cost (slice 2); three processes over HTTP, one call at a time: p50 2.7 ms, p99 3.3 ms (slice 3) | passes |
-| Merge apply, cost per operation at 1M operations | ≤ 2× the cost at 1k | 1.5–1.8× with incremental apply on LWW maps, in memory (S6) | passes with section 16 work |
-| 1,000 mostly idle Raft groups per node | no thread per group; idle CPU ≤ 5% of one core | about 1.6% at a 500 ms heartbeat (S3); three node processes with 1,000–1,065 groups each: 1.0–1.4% of one core, 16–17 threads (slice 3) | passes |
+| Actor invocation, refine and accumulate, one node | ≤ 50 µs | the default agent on one node with fjall storage, counter increments under load: 21–24 µs per request on the JIT, 85 µs on the interpreter, plus a 0.9 ms synced commit per batch of 165–210 requests [measured, 2026-10-10] | passes on the JIT; the interpreter, kept for tracing and platforms without the JIT, misses |
+| Committed-map write on the apply path [proposed] | ≤ 5 µs; background root building keeps up with apply | about 4.3 µs a committed write at 1M keys: accumulate 1.05 µs on the JIT, the store's value and dirty rows 3.2–3.3 µs. The root builder at 20k committed writes a second for 30 s: 19.9k rows a second built, a median build of 137 ms, at most 14 versions behind, caught up in 162 ms [measured, 2026-10-15] | passes; the builder near its capacity, a faster native BLAKE2b its lever |
+| Fixed cost per refine [proposed] | ≤ 50 µs; pooled acquire and reset ≤ 5 µs; a new machine ≤ 50 µs | an empty refine on a kept agent machine 13 µs (JIT) and 10 µs (interpreter); pooled acquire, use and reset 1.6 and 1.1 µs; a new machine 7–10 and about 32 µs [measured, 2026-10-09 and 2026-10-10] | passes |
+| Replicated agent on 3 LAN nodes, simple mutations | ≥ 20k per second per agent; p99 commit ≤ 10 ms at half load | three node processes over QUIC, signed calls through an HTTP ingress since replaced by the node API [measured, 2026-10-13]. The most, closed loop at 256 sessions: 18.6–19.5k/s on the reference pinning, 19.7–20.1k/s with the leader on cores of its own. The half-load p99, open loop: 6.7–14.2 ms in five runs (8.2 ms over HTTPS), and 7.0–10.9 ms in four with cores of its own (three within 10 ms) | at the edge on the laptop: capacity just short or just met; the half-load p99 not met reliably; not re-measured over the node API or on a machine of its own |
+| Many active agents per node [proposed] | 64 active agents: ≥ 40k commits per second in total, p99 ≤ 20 ms | three node processes, reference pinning: 33.9k/s most at 16 sessions each (p99 45 ms); open loop p99 6.8 ms at 20k/s and 106 ms at 25k/s, so the knee lies between; closed, the nodes 4.6–5.3 of their 6 logical CPUs busy, hyperthreads included [measured, 2026-10-13] | misses on the laptop; the scale test (section 14.1) measures many agents on a larger host |
+| Workflow snapshot capture plus restore, up to 50 KB | ≤ 1 ms | through a real workflow step on the JIT, beyond an empty refine: a typical suspension (3 pages restored, 2 captured) 176–252 µs; 50 KB (15 restored, 14 captured) 0.62–0.81 ms on a quiet machine, 1.47 ms under contention [measured, 2026-10-15]. Page hashing, one precompile call per 128-byte block, is about a fifth of it. The runtime's own capture and restore are microseconds (section 6.6) | passes on a quiet machine, so the leader's live-machine cache is not built |
+| A workflow's resume, a reply in to its step applied [proposed] | — | one node in process, synced commits: median 1.3–1.6 ms, p99 2.1 ms [measured, 2026-10-15]. Three nodes, the leader in process and its followers `vos` processes over QUIC: median 1.77–1.92 ms, p99 2.48–2.77 ms, replication adding about 0.45 ms to the commit; on tmpfs 0.92–0.97 ms [measured, 2026-10-16] | measured |
+| Fan-in across nodes [proposed] | — | three nodes over QUIC, one receiving agent: 13.2k messages a second applied from 4 senders, 17.6k from 8; past the receiver's queue, its refine bounds it (97–98% busy, about 1.1 frames a message when nothing drops); after a full queue drains, the receiver asks its dropped senders to resend, so 32 senders' backlog drains in about 5 s [measured, 2026-10-15] | refine-bound; no frame batching needed |
+| A witnessed read on JAM [proposed] | — | beyond the VOS run, on the JAM-only host at PolkaJam's prices: about 255k gas for a read alone, about 192k each among 64, about 85k a row of a scanned range; a workflow package's own work at most about 4.9M; the end-to-end run's refines 0.26M–41M of a 1e9 limit [measured, 2026-10-15] | far within the refine limit |
+| Table point read or write at 10M rows (host cost) | ≤ 5 µs | write 2.5–3.3 µs; read 2.5–3.2 µs compacted, 5.0–5.2 µs with 620k fresh updates in the memtable and level 0, about 0.1 ms cold [measured, 2026-10-10]; read under the 64-agent run's writes at 31–32k inputs/s, over a whole memtable cycle, at the store: mean 2.68–2.72 µs, p99 3.70–3.81 µs, against 2.29–2.34 and 3.54–3.68 alone [measured, 2026-10-13] | passes compacted and under continuous writes; at the edge behind a bulk of fresh writes to the table itself |
+| Query on a follower | ≤ 100 µs | through a node's query path (executor round trip, snapshot, refine in query mode, one actor): median 49 µs and p99 115–175 µs on the JIT, median 87 µs on the interpreter [measured, 2026-10-10]; a follower of three processes, over the former HTTP ingress: p50 0.12–0.23 ms, p99 0.22–0.34 ms client to answer, 86–92 µs of the follower's CPU a query; linearizable, p50 0.36–0.41 ms and 244 µs [measured, 2026-10-13] | met at the median, missed at p99 |
+| Request latency on a quiet node [proposed] | ≤ 5 ms at p99 | one request at a time on one node: about 3 ms in process, the batch's 2 ms linger plus a 0.9 ms synced commit; its execution, 260–340 µs, is idle-core cost [measured, 2026-10-10]; three processes over the former HTTP ingress, one call at a time: p50 2.7 ms, p99 3.3 ms [measured, 2026-10-13] | passes |
+| Merge apply, cost per operation at 1M operations | ≤ 2× the cost at 1k | 1.5–1.8× with an incremental-apply prototype on LWW maps, in memory [measured, 2026-10-08] | the prototype passes; the Merge lane is not built (section 9.4) |
+| 1,000 mostly idle Raft groups per node | no thread per group; idle CPU ≤ 5% of one core | 0.16% of a core and 45.6 MiB of RSS per 1,000 idle replicas, on the scale test's nodes (section 14.1) [measured, 2026-10-27] | passes |
 
-- All measurements ran on one laptop (Core Ultra 7 155H, consumer NVMe),
-  with all three replicas sharing one disk and a warm page cache. Runs
-  with many active agents varied up to 4×.
-- Slice 3's rows ran three release node processes, their stores on
+- Rows without other hardware named ran on the development laptop, with
+  all three replicas sharing one disk and a warm page cache. Runs with
+  many active agents varied up to 4×.
+- The three-process rows ran release node processes, their stores on
   tmpfs, a driver signing every call before its window, and two
   pinnings:
   - **the reference:** each node on two hyperthread pairs of P-cores
@@ -1414,9 +1407,9 @@ These form a prover track that runs alongside the core slices (section 16).
   - **cores of its own:** the leader on two P-cores whose siblings stay
     idle, and two E-cores.
 
-  Refine an input costs about 40 µs on the reference pinning against
+  Refining an input costs about 40 µs on the reference pinning against
   17–20 µs in one process, so a machine of its own may move the
-  replicated rows. The slice 3 progress log has every run.
+  replicated rows.
 - No hot path may grow with history length.
 - **A heap per kind of invocation:** an actor configures one heap, its
   arena the last section of its read-write data (`.vos_heap`), from whose
@@ -1434,6 +1427,56 @@ These form a prover track that runs alongside the core slices (section 16).
   workflow's entry marks it, and it allocates from the whole arena. A
   derivation refuses an ELF whose arena does not end its read-write data
   from a page.
+
+### 14.1 The scale test
+
+A space at scale on LAN hardware, run by `tools/scale` (its README). The
+targets [decided], from one rate: `a` = 5% of users active at once, `r` =
+0.1 calls a second each:
+
+- **T1 users:** 10^6 users in one space at 5,000 calls a second, 98%
+  cross-shard, client p99 ≤ 50 ms, no session refused.
+- **T2 headroom:** a knee of at least 40,000 calls a second (8× T1) on
+  four or more node hosts, p99 ≤ 50 ms below it, no leader lost.
+- **T3 agents:** 10^4 agents a space, idle cost ≤ 5% of a core and
+  ≤ 64 MiB of RSS per 1,000 replicas (10^5 a stretch).
+- **T4 windows:** at L = 2 min, with 1% of agents reading each window,
+  every read served by the window's close plus 10 s, none `NotClosed`
+  without a fault; the representative's work proportional to readers.
+- **T5 faults:** a node killed under load (on one node host, its unit):
+  every agent led again ≤ 5 s, throughput back to 80% ≤ 30 s, the node
+  rejoined ≤ 60 s after its restart.
+- **T6 soak:** 2 hours at T1, RSS within 10% after minute 30, p99 within
+  20% of the first half hour's.
+
+The setup [measured, 2026-10-27 to 2026-11-01]:
+
+- three nodes on one AMD Threadripper 2990WX host, each its own systemd
+  unit with 4 cores and an 8 GiB memory cap (12 GiB at 10^5 agents), all
+  three on one shared Samsung 970 PRO NVMe and one 1 GbE link; governor
+  `performance`;
+- the driver on an Intel i5-1340P, wired, over the node API (QUIC);
+- every agent replicated on all three nodes; `K` = 64 shard agents, a
+  stand-in identity row per user, the space's representative, L = 2 min;
+- the default mix: transfers 80%, queries 15%, workflows 4.5%, reads at a
+  cut 0.5%.
+
+| Target | Verdict | Final numbers |
+|---|---|---|
+| T1 | missed (p99) | of 5,000 calls/s offered, 3,999.5 transfers/s answered, every call answered; transfers p50 / p99 / p99.9 197 ms / 1.31 s / 2.1 s; none timed out, no session refused |
+| T2 | not measurable (one node host) | one host's knee about 8,000–9,000 calls/s at 10^5 users, about 5,000 at 10^6 |
+| T3 | met | idle: 45.6 MiB and 0.16% of a core per 1,000 replicas; 10^5 agents also held the baseline load with 0 elections, RSS flat at 6.1 GiB a node |
+| T4 | met where measured | over the 2-hour soak, 181,856 reads at a cut, p99.9 6.3 s from the close, none `NotClosed`; the representative's work per reader not separated |
+| T5 (a node's unit) | partly met | led again within 5.3 s (at the polls' 1 s grain), answering 2.2 s after its restart; throughput under 80% for 36 s |
+| T6 | missed (p99); RSS met | 2 hours answered at the offered rate, 0 timed out; RSS's 10-minute means +7.6–8.9%; p99 0.8 s in the first half hour, 2.1 s in the last ten minutes |
+
+- **What binds at T1:** the commit's fsync on the disk the three nodes
+  share (NVMe 70% busy, commit p99 262–328 ms), with the 4-core cpusets
+  66–70% busy.
+- **The cost at T1:** 2.5–2.9 of a node's 4 cores, about 0.5–0.6 ms of
+  node CPU a call; a node settles near 2.0–2.3 GiB of RSS. An idle agent
+  takes about 130–140 KiB of RSS across its three replicas.
+- `open.md` lists what remains.
 
 ## 15. Worked examples
 
@@ -1511,173 +1554,3 @@ channels they belong to.
    rejected, or filtered when read where already applied. Every replica
    reaches the same result.
 4. Feed reads use local Merge state on the device or any node.
-
-## 16. Work the spikes and reviews require
-
-Each item is required for the budget, decision or finding it names;
-prototypes exist where noted.
-
-**PVM runtime**
-
-1. Memory structures proportional to mapped pages: the interpreter's page
-   table and the JIT's permission sync (S1, S2).
-2. Native dirty-page tracking on both backends, including host writes (S1,
-   section 6.6).
-3. The machine pool and the prepared-program cache, keyed by program hash,
-   gated by the pooled-against-fresh differential test (S2).
-4. Precompiles on the refine path, BLAKE2b first (S5b; prototype on branch
-   `exp/gp-precompiles`), priced in VOS gas (section 11.2).
-5. Remove every JAR leftover (section 12).
-6. JIT host-call exit cost, the main lever on short handlers (section
-   6.6). Tuned once a real agent exists to profile (build step 2).
-
-**Prover and privacy track** (alongside the core slices)
-
-7. Chained segments on the refine path, sized by prover memory (S5, S5b).
-8. Reduce the BLAKE2b chip's memory per compression (S5b).
-9. ~~Zero-knowledge proving (section 11.4, requirement 1).~~ Done by
-   format 39's masking of the final proof (`proving.md` §5), on the
-   pinned Stwo fork with no Stwo move.
-10. ~~Witness-free verification of attestable programs, with no plain hash
-    of private inputs (requirements 2 and 3).~~ Done by the statement
-    (slice 5).
-11. ~~The minimal published proof format and fixed shape classes
-    (requirements 4 and 5).~~ Done by the statement and the shape per
-    kernel (slice 5).
-12. ~~Window aggregation for on-chain verification (requirement 6).~~ Done
-    by the recursion (slice 5).
-13. ~~Move Ristretto and the scalar operations (ids 110–114) into the VOS
-    range.~~ Removed instead: their chips and ids are gone from the prover,
-    the runtime and the shims; a generic bignum chip (M6, after slice 7)
-    takes their place.
-
-**Storage**
-
-14. The LSM engine: one keyspace, partitions per data class, agent prefixes,
-    and reads within budget (S4).
-15. The node log writer with capped flushes, non-durable apply under
-    section 9.5's invariants, and Raft snapshot export and ingestion
-    (S3, S4).
-16. Many active agents per node within budget: writer batching, liveness
-    and executor scheduling under load, with a test of 64 or more active
-    agents (S3, section 14).
-17. The compressed root format with salted leaves, across `CommittedMap`,
-    `BatchProof`, the witness math and cipher-clerk; dirty-key recording
-    in accumulate and background root building (S4, section 9.3).
-18. A path for large entries (open question 3), settled before item 15.
-
-**Replication and merge**
-
-19. The vos-raft driver (S3; prototype in `spikes/s3-raft/vos-raft-eager`):
-    - group commit and replicate-on-propose;
-    - eager commit notification;
-    - one shared executor;
-    - heartbeats that never wait on log I/O, combined per node pair, with
-      quiescence for idle groups (built: section 10).
-20. Incremental merkle-crdt apply per sync scope, with author chains, local
-    operations in place, storage-backed CRDT types and read-time filtering
-    (S6, section 9.4).
-21. LZ4-compressed snapshot pages (S1).
-
-**Build order** [proposed]:
-
-1. **PVM base:** items 1–5, BLAKE2b precompile only.
-2. **One node:** the actor framework with restricted attestable methods,
-   the default agent, the actor ABI with run-time enforcement and nested
-   gas, the LSM engine (item 14), client sessions, and the JAM host-call
-   CI harness. Then item 6, profiled on this agent.
-3. **Replication:** large entries (item 18) first, then items 15, 16 and
-   19.
-4. **JAM:** the compressed root format and witnessed state reads (item
-   17), workflows and snapshots (item 21), then the first JAM milestone.
-5. **Attestable methods and Clerk,** on the prover track's results (items
-   7–13).
-6. **The Merge lane** (item 20).
-
-The prover and privacy track (items 7–13) starts with step 1, because zero
-knowledge and aggregation are the longest work and gate goal 8.
-
-## 17. Reused from earlier code
-
-- **PVM:** the saga's Gray Paper 0.8.0 layer (runtime, JIT, compiler,
-  conformance vectors, standard inner machines, refine host). It brings the
-  precompile change from `exp/gp-precompiles` and the work in section 16.
-  Master's JAR runtime is not ported.
-- **Prover:** `pvm/proof` (prover, chain segments, verifier, settlement
-  verifier, BLAKE2b chips), on the refine path, without its JAR paths. Its
-  Ristretto chips were removed.
-- **`support/vos-raft`:** the consensus core. Its `std` driver is replaced
-  (section 10).
-- **`support/merkle-crdt`:** the DAG and sync format; the apply path is
-  rewritten (section 9.4).
-- **State:** the storage handles and `CommittedMap` / `BatchProof` API
-  (`vos::storage`, `vos::zk::state`), on the compressed root format.
-- The v2 CRDT field types' API, reimplemented storage-backed.
-- From the macros: the `#[actor]` / `#[messages]` shape, roles, schema and
-  typed-argument code.
-- Clerk actors and cipher-clerk as the flagship application, moved to the
-  compressed root format.
-- libp2p networking, HTTP and SSH ingress, vosx, native extensions, the
-  Substrate light client.
-
-## 18. Open questions
-
-1. Masking and read-time filtering in each CRDT type; property tests for
-   the authorization rule.
-2. Storage-backed CRDT type design.
-3. **Large log entries** (to settle before build step 3):
-   - in S3, 64 KiB entries managed only 613 commits/s, cause unknown;
-   - snapshot pages (2 MiB on a first compute snapshot) and witnesses
-     ride the log;
-   - candidate: content-addressed blobs pinned at propose and replicated
-     with the entry that references them.
-4. LSM tuning: compaction under sustained writes, cache sizing per node,
-   cold reads.
-5. ~~The context API of the actor framework (section 6.2).~~ Decided for
-   v1 in `slice-2-one-node.md`.
-6. ~~Zero-knowledge proving: the approach in the prover and its chips, and
-   its cost.~~ Variant (c) on the final wrap (`proving.md` §5).
-7. ~~Window aggregation: recursion or another scheme, and its on-chain
-   gas.~~ The recursion (`recursion-air.md`).
-8. Refining on any replica with read-set validation: when it becomes
-   necessary.
-9. Licensing model, metering, bytecode visibility.
-10. Agent placement and rebalancing.
-11. Upgrades: state migration for actors.
-12. JAM witness format. (DA retention for long-waiting workflows:
-    decided, section 12, from the Gray Paper's 28 days.)
-13. Devices running merge handlers locally (local-first) versus thin
-    clients.
-14. Workflow deadline defaults and timer precision; session expiry and the
-    reply window W.
-15. Whether workflows need external signals beyond replies and timers.
-16. Default gas limits per handler kind, and how an agent declares them.
-17. The JAM agents' designs: the per-space aggregate-balance agent (how a
-    space's net positions settle, and what a mixer-like space reveals by
-    its flows), and collectives that vote.
-18. **The node host and native extensions:** designed for one node in
-    `slice-2-one-node.md`.
-    - **Decided:** the prover is a built-in node component for good, not
-      an extension, because proving is essential to VOS.
-    - **Decided** (S41): the node keeps one binary API, over its unix
-      socket and QUIC with mutual TLS (`node-api.md`); HTTP, public TLS,
-      the SSH surface (s4's screens and the `vos-api` subsystem) and the
-      limits before authentication are the gateway's. The node serves no
-      HTTP: its own was deleted once S50's gate was met (7.10b's C10), and
-      its operators sign every command (S46).
-    - **Decided:** the node knows no JAM. A
-      program is deployed on JAM with JAM's tooling, and VOS ships the
-      JAM statements service and the agent-as-JAM-service build; the JAM
-      client VOS wrote (a PolkaJam node's RPC and `jamt`, the statements
-      service's client and venue) is development and test tooling
-      (`tools/jam-dev`), which no node links. Venues, JAM's among them,
-      attach to a node through extensions.
-    - **Open:** the extension host itself and its multi-node form,
-      deferred until after the planned slices:
-      - the node process and its scheduler across agents;
-      - storage and networking ownership;
-      - ingress;
-      - how native extensions attach: the SSH transport, the Substrate
-        light client, and a JAM light node through which agents call
-        agents on JAM with work packages and their proofs. On master the
-        first two are small capability adapters behind an extension host.
