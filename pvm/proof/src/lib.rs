@@ -57,8 +57,8 @@
 //!
 //! ## Features
 //!
-//! - `prover` (default) — trace generation, proof creation, blake3
-//!   commitments, rayon parallelism.  Pulls in heavy deps.
+//! - `prover` (default) — trace generation, proof creation, rayon
+//!   parallelism.  Pulls in heavy deps.
 //! - `debug-internals` — exposes `debug_claimed_sums` for bisecting
 //!   prover-side logup imbalances when adding a new constraint, and
 //!   `prove_chip_isolated_format`, a chip's proof alone for measuring

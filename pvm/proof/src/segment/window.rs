@@ -15,7 +15,7 @@ use crate::side_note::SideNote;
 /// - `initial_regs` = `full.steps[a].regs_before`;
 /// - `initial_memory` = `full.initial_memory` with every memory write in
 ///   `full.steps[..a]` applied — the memory state *entering* the
-///   segment, so the boundary memory commitment chains and in-segment
+///   segment, so the boundary memory root chains and in-segment
 ///   precompile reads of values written earlier bottom out at the right
 ///   bytes;
 /// - the captured BLAKE2b precompile records, a parallel
@@ -121,7 +121,7 @@ fn build_segment_with_memory(full: &SideNote, a: usize, b: usize, mem: SegmentMe
 /// per-step `mem_write` does NOT capture — they live in `blake2b_mem_ops`
 /// and `poseidon2_ops`.
 /// Used both for a segment's threaded initial memory (`segment_side_note`)
-/// and its final memory commitment (`prove`'s boundary state); the two
+/// and its exit image (the boundary's memory root, `page_merkle`); the two
 /// MUST agree or `verify_chain`'s boundary-continuity check rejects.
 pub(crate) fn replay_writes(side_note: &SideNote, ts_upper: Option<u64>) -> Vec<u8> {
     let writes = collect_writes(side_note, ts_upper);

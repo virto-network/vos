@@ -60,7 +60,7 @@ pub fn debug_claimed_sums(side_note: &mut SideNote) -> bool {
         .collect();
 
     let mut lookup_elements = AllLookupElements::default();
-    let channel = &mut stwo::core::channel::Blake2sChannel::default();
+    let channel = &mut stwo::core::channel::Blake2sM31Channel::default();
     for c in components {
         c.draw_lookup_elements(&mut lookup_elements, channel.as_ref_channel());
     }
@@ -97,7 +97,7 @@ pub fn debug_assert_constraints_explicit(
         .collect();
 
     let mut lookup_elements = AllLookupElements::default();
-    let channel = &mut stwo::core::channel::Blake2sChannel::default();
+    let channel = &mut stwo::core::channel::Blake2sM31Channel::default();
     for c in components {
         c.draw_lookup_elements(&mut lookup_elements, channel.as_ref_channel());
     }

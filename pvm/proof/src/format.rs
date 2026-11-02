@@ -131,7 +131,6 @@ pub enum ProofKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ChannelKind {
-    Blake2s = 0,
     Poseidon2M31 = 1,
     Blake2sM31 = 2,
     Blake2b256 = 3,

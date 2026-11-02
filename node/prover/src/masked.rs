@@ -149,10 +149,9 @@ impl MaskedProver {
                     for state in [&segment.proof.initial_state, &segment.proof.final_state] {
                         internals.steps.push(state.timestamp);
                         internals.registers.push(state.registers);
-                        for root in [state.memory_root, state.memory_commitment] {
-                            if root != public_root && root != [0; 32] {
-                                internals.memory_roots.push(root);
-                            }
+                        let root = state.memory_root;
+                        if root != public_root && root != [0; 32] {
+                            internals.memory_roots.push(root);
                         }
                     }
                     (format!("segment {}", lengths.len() - 1), Vec::new())

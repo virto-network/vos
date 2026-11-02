@@ -22,7 +22,7 @@ fn segment_air_shape(log_size: u32, format: &Format) -> SecurityShape {
     let mut lookups = AllLookupElements::default();
     draw_all_lookup_elements(
         &mut lookups,
-        &mut stwo::core::channel::Blake2sChannel::default(),
+        &mut stwo::core::channel::Blake2sM31Channel::default(),
         mask,
     );
     let components = create_verifier_components::components(

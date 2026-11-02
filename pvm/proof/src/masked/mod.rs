@@ -34,7 +34,7 @@ use core::array::from_fn;
 
 use num_traits::{One, Zero};
 use stwo::core::air::Component;
-use stwo::core::channel::{Blake2sChannel, Channel};
+use stwo::core::channel::{Blake2sM31Channel, Channel};
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo_constraint_framework::{
@@ -366,7 +366,7 @@ impl<S: ChipSet> MaskedComponents for Components<S> {
     }
 
     fn layout(active: u32, log_sizes: &[u32]) -> Option<Self> {
-        let channel = &mut Blake2sChannel::default();
+        let channel = &mut Blake2sM31Channel::default();
         let relations = Self::draw_relations(active, channel);
         let blind = BlindRelation::draw(channel);
         Self::build(

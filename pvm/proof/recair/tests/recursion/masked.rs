@@ -584,8 +584,8 @@ impl Needle {
 /// No hidden state of the run is in any carrier of its masked
 /// wrap (its fixed-layout bytes, its postcard encoding, its public words):
 /// neither the segment's step count (its final timestamp), its pcs, its
-/// registers but φ9..12 (the io-hash's, public), its memory roots and
-/// `memory_commitment` at both ends, nor the root proof's commitments and
+/// registers but φ9..12 (the io-hash's, public), its memory roots at both
+/// ends, nor the root proof's commitments and
 /// claimed sums (the wrap's private witness), nor a plain BLAKE2b-256 of the
 /// run's arguments (this kernel runs on none).
 #[test]
@@ -610,10 +610,6 @@ fn no_hidden_state_is_in_the_masked_wraps_carriers() {
         needles.push(Needle::digest(
             format!("{end} memory root"),
             &state.memory_root,
-        ));
-        needles.push(Needle::digest(
-            format!("{end} memory commitment"),
-            &state.memory_commitment,
         ));
     }
     let root = &one.root.proof;

@@ -222,9 +222,7 @@ parameters are in the registry, `src/format.rs`; the trust boundary is
   are the committed boundary columns, and those are the trace's.
   The states and the full PCS configuration enter the Fiat–Shamir
   transcript.
-- **`memory_commitment`** stays unbound metadata: it is computed
-  outside the circuit and has no committed column.  The memory root
-  is what binds RAM.
+- **The memory root** is what binds RAM.
 
 ### Precompile
 - **Blake2b ECALL** — `Blake2bChip` proves one full 12-round

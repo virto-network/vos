@@ -193,46 +193,6 @@ fn segment_memory_roots(side_note: &SideNote) -> ([u8; 32], [u8; 32]) {
     }
 }
 
-/// The blake3 hash of the final memory state: every write applied to the
-/// initial memory. O(initial_memory.len() + Σ writes), with a full clone of
-/// a dense `initial_memory`.
-fn compute_final_memory_commitment(side_note: &SideNote) -> [u8; 32] {
-    // Replay ALL of this (segment's) writes — regular stores AND precompile
-    // output writes (BLAKE2b's and Poseidon2's, which live in
-    // `blake2b_mem_ops` and `poseidon2_ops`, not `step.mem_write`) — over the
-    // initial memory. Using
-    // step writes alone leaves precompile-output bytes stale, so a downstream
-    // segment's initial-memory commitment (which DOES reflect those writes,
-    // via `segment::replay_writes`) would mismatch and `verify_chain`'s
-    // boundary-continuity check would reject. `ts_upper = None` ⇒ all writes.
-    if side_note.sparse_initial_memory.is_some() {
-        let image = crate::segment::replay_sparse_writes(side_note, None);
-        sparse_memory_commitment(&image)
-    } else {
-        let mem = crate::segment::replay_writes(side_note, None);
-        *blake3::hash(&mem).as_bytes()
-    }
-}
-
-fn initial_memory_commitment(side_note: &SideNote) -> [u8; 32] {
-    side_note.sparse_initial_memory.as_ref().map_or_else(
-        || *blake3::hash(&side_note.initial_memory).as_bytes(),
-        sparse_memory_commitment,
-    )
-}
-
-fn sparse_memory_commitment(image: &crate::SparseMemoryImage) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"vos/pvm/sparse-memory/v1\0");
-    hasher.update(&image.span().to_le_bytes());
-    hasher.update(&(image.pages().len() as u64).to_le_bytes());
-    for page in image.pages() {
-        hasher.update(&page.page_index.to_le_bytes());
-        hasher.update(&page.bytes);
-    }
-    *hasher.finalize().as_bytes()
-}
-
 /// Normalize a `SideNote` the way the production prove path does before
 /// trace generation: activate the closing chip (its rows, the ledger's
 /// closing reads and component selection key off it) and backfill the
@@ -439,8 +399,8 @@ pub(crate) fn generate_component_traces(
         .collect()
 }
 
-/// The boundary states a proof ships: the sparse-image hashes and the
-/// page-Merkle roots the boundary chips bind.
+/// The boundary states a proof ships, with the page-Merkle roots the
+/// boundary chips bind.
 pub(crate) fn derive_segment_states(side_note: &SideNote) -> (SegmentState, SegmentState) {
     let (root_before, root_after) = segment_memory_roots(side_note);
     let initial_state = if side_note.steps.is_empty() {
@@ -448,7 +408,6 @@ pub(crate) fn derive_segment_states(side_note: &SideNote) -> (SegmentState, Segm
             pc: 0,
             timestamp: 0,
             registers: [0; 13],
-            memory_commitment: [0; 32],
             memory_root: root_before,
         }
     } else {
@@ -457,7 +416,6 @@ pub(crate) fn derive_segment_states(side_note: &SideNote) -> (SegmentState, Segm
             pc: first.pc,
             timestamp: first.timestamp,
             registers: side_note.initial_regs,
-            memory_commitment: initial_memory_commitment(side_note),
             memory_root: root_before,
         }
     };
@@ -466,7 +424,6 @@ pub(crate) fn derive_segment_states(side_note: &SideNote) -> (SegmentState, Segm
             pc: 0,
             timestamp: 0,
             registers: [0; 13],
-            memory_commitment: [0; 32],
             memory_root: root_after,
         }
     } else {
@@ -478,7 +435,6 @@ pub(crate) fn derive_segment_states(side_note: &SideNote) -> (SegmentState, Segm
             pc: last.next_pc,
             timestamp: last.timestamp + 1,
             registers,
-            memory_commitment: compute_final_memory_commitment(side_note),
             memory_root: root_after,
         }
     };

@@ -31,9 +31,8 @@ pub use recursion::{
 /// columns (boundary-binding check — see `boundary_binding`), so the
 /// continuity equality forces real state continuity: pc/timestamp via CpuChip
 /// trace pinning, registers via the register-ledger read-consistency binding,
-/// and `memory_root` via the in-AIR page-Merkle trie. (`memory_commitment`,
-/// a blake3 of the image, is also compared but is unbound/vestigial —
-/// `memory_root` carries continuity.) This is a host-side capability (it
+/// and `memory_root` via the in-AIR page-Merkle trie. This is a host-side
+/// capability (it
 /// consumes prover-derived side notes); `vos_pvm_proof_verifier::verify_chain_standalone`
 /// is the side-note-free, trust-boundary variant.
 pub fn verify_chain(proofs: &[Proof], side_notes: &[&SideNote]) -> Result<(), VerificationError> {

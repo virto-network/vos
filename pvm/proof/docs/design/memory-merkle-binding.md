@@ -1,8 +1,7 @@
 # In-circuit Merkle binding of the RAM boundary (`initial_root`/`final_root`)
 
 Each segment states Merkle roots of its RAM that are **bound in-circuit**,
-so chain verification is sound for memory. (`memory_commitment = blake3(flat
-image)` stays beside them as unbound metadata.) The recursion rests on this
+so chain verification is sound for memory. The recursion rests on this
 per-segment binding: a fold checks state continuity between adjacent
 segments (`docs/design/recursion-air.md` §6), and for memory that is the
 roots' equality. The choices: Merkle memory, a tree keyed by **page
@@ -252,9 +251,8 @@ All four are **unconditionally active** (the page set is never empty, §0).
 
 ## 4. Plumbing
 
-- `SegmentState` carries `memory_root: [u8; 32]` beside the unbound
-  `memory_commitment`; derived `PartialEq` extends both chain-continuity
-  struct-eqs to it.
+- `SegmentState` carries `memory_root: [u8; 32]`; derived `PartialEq`
+  extends both chain-continuity struct-eqs to it.
 - FS mix: the roots enter the channel immediately after the `final_ts` mix,
   identically at the three sites (`prove.rs`, `verify.rs`,
   `verifier/src/lib.rs`) — before lookup-element draw, so the claimed-sum

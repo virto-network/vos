@@ -10,7 +10,7 @@
 // 32-bit targets — CODE_WINDOW_SIZE = 1 << 32 overflows usize), and the
 // workspace stwo pin is feature-less, with `std,prover,parallel` added
 // back only by vos-pvm-proof's `prover` feature — so this crate's normal-dep graph
-// carries no vos_pvm / rayon / vos-pvm-proof-blake3.
+// carries no vos_pvm / rayon.
 
 #![no_std]
 
@@ -275,8 +275,7 @@ fn verify_standalone_on<MC: PcsStack>(
     // boundary states (the `component_mask = 0` reject above guarantees a
     // proof with the boundary and closing chips) and the interaction PoW
     // precede the relation elements, which therefore depend on the claimed
-    // boundary states. `memory_commitment` stays unmixed (computed outside
-    // the circuit). The proof's own PCS config, the format's, checked above;
+    // boundary states. The proof's own PCS config, the format's, checked above;
     // the DEEP batching is the format's, which a proof does not carry.
     let verifier_channel = &mut MC::C::default();
     let commitment_scheme =
@@ -393,9 +392,7 @@ fn verify_standalone_on<MC: PcsStack>(
 /// genuine blake2b Merkle root of the listed RAM pages, and
 /// `check_boundary_claimed_sums` pins it to the public boundary state). The
 /// entering image is anchored by `expected_initial_root`; the returned final
-/// root pins the post-state. (`SegmentState.memory_commitment`, a
-/// `blake3(flat_mem)` field, is unbound but vestigial — `memory_root`
-/// supersedes it for continuity.) So a chain accepted here proves: one
+/// root pins the post-state. So a chain accepted here proves: one
 /// program, per-segment validity, and full register / pc / timestamp /
 /// memory continuity from `expected_initial_root` to the returned final
 /// root.

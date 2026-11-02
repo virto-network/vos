@@ -76,7 +76,7 @@ fn from_scratch_boundary_forgery_is_rejected() {
         // `boundary_binding::expected_memory_root_sum` over the honest
         // MemoryRootBoundaryChip columns, exactly as registers/pc/timestamp are.
         // A from-scratch prover shipping a forged root over honest columns must
-        // be rejected (else `memory_commitment` continuity is unbound).
+        // be rejected (else memory continuity is unbound).
         ("initial memory_root", |ini, _| ini.memory_root[0] ^= 0xff),
         ("final memory_root", |_, fin| fin.memory_root[0] ^= 0xff),
     ];

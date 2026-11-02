@@ -38,7 +38,6 @@ pub fn preflight_proof_structure_readonly(
 ) -> Result<(&'static Format, usize), alloc::string::String> {
     let format = proof_format(proof)?;
     let bytes = match &proof.stark_proof {
-        StarkProofAny::Blake2s(stark) => preflight_structure(proof, stark, max_log_size),
         StarkProofAny::Poseidon2M31(stark) => preflight_structure(proof, stark, max_log_size),
         StarkProofAny::Blake2sM31(stark) => preflight_structure(proof, stark, max_log_size),
     }?;
@@ -261,7 +260,6 @@ pub fn stark_fields_are_canonical<H: MerkleHasherLifted>(
 /// attacker-controlled columns are not free in the accounting.
 pub fn proof_owned_bytes(proof: &Proof) -> Option<usize> {
     match &proof.stark_proof {
-        StarkProofAny::Blake2s(stark) => proof_owned_bytes_of(proof, stark),
         StarkProofAny::Poseidon2M31(stark) => proof_owned_bytes_of(proof, stark),
         StarkProofAny::Blake2sM31(stark) => proof_owned_bytes_of(proof, stark),
     }
@@ -323,7 +321,6 @@ pub fn preflight_proof_structure(
 ) -> Result<&'static Format, alloc::string::String> {
     let (format, _bounded_bytes) = preflight_proof_structure_readonly(proof, max_log_size)?;
     match &mut proof.stark_proof {
-        StarkProofAny::Blake2s(stark) => normalize_last_layer(stark),
         StarkProofAny::Poseidon2M31(stark) => normalize_last_layer(stark),
         StarkProofAny::Blake2sM31(stark) => normalize_last_layer(stark),
     }

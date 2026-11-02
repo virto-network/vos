@@ -82,9 +82,11 @@ fn verify_standalone_rejects_wrong_program_hash() {
     let (code, bitmask, steps) = trace_reverse_bytes_program();
     let proof = prove_program(&code, &bitmask, steps);
 
-    let wrong =
-        ProgramCommitment::from_bytes(vos_pvm_proof::format::ChannelKind::Blake2s, &[0xFFu8; 32])
-            .unwrap();
+    let wrong = ProgramCommitment::from_bytes(
+        vos_pvm_proof::format::ChannelKind::Poseidon2M31,
+        &[0x01u8; 32],
+    )
+    .unwrap();
     let res = verify_standalone(proof, wrong);
     assert!(res.is_err(), "verifier must reject a wrong program hash");
 }

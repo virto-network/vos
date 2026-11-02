@@ -18,7 +18,7 @@ use stwo::core::circle::CirclePoint;
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::utils::{bit_reverse_index, coset_index_to_circle_domain_index};
-use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
+use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use stwo::core::verifier::VerificationError;
 use stwo::prover::ProvingError;
@@ -178,8 +178,8 @@ fn masked_segments_verify_at_every_size_on_both_channels() {
     for (queries, floor) in [(4, 8), (12, 9), (24, 10)] {
         let poseidon = small_format(ChannelKind::Poseidon2M31, 8, queries);
         accepted::<P2MerkleChannel>(&poseidon, floor);
-        let blake = small_format(ChannelKind::Blake2s, 8, queries);
-        accepted::<Blake2sMerkleChannel>(&blake, floor);
+        let blake = small_format(ChannelKind::Blake2sM31, 8, queries);
+        accepted::<Blake2sM31MerkleChannel>(&blake, floor);
     }
     let format = format();
     let [first, again] = [(); 2].map(|_| {

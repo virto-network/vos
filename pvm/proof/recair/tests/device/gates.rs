@@ -13,7 +13,7 @@ use stwo::core::channel::MerkleChannel;
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::utils::{bit_reverse_index, coset_index_to_circle_domain_index};
-use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
+use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 use stwo::core::verifier::VerificationError;
 use stwo::prover::ProvingError;
 use stwo::prover::backend::BackendForChannel;
@@ -151,7 +151,7 @@ fn a_device_run_proves_and_verifies() {
         }
     }
     accepted::<P2>(&format());
-    accepted::<Blake2sMerkleChannel>(&small_format(ChannelKind::Blake2s, 6, 4));
+    accepted::<Blake2sM31MerkleChannel>(&small_format(ChannelKind::Blake2sM31, 6, 4));
 }
 
 /// A prover installed once proves as the per-proof path does, byte for
@@ -758,7 +758,7 @@ fn the_io_hash_is_the_one_public_sum() {
 }
 
 /// Masked acceptance at the device format's parameters, blowup 4 with 47
-/// queries (`h = 256`, every chip at `2^10` rows at least), on Blake2s; R1
+/// queries (`h = 256`, every chip at `2^10` rows at least), on Blake2s-M31; R1
 /// in one attempt, within the `4·2 + 3q` rows a column reveals, two
 /// witnesses under one program.
 #[cfg(feature = "heavy-gates")]
@@ -768,14 +768,14 @@ fn heavy_device_proofs_verify_at_the_device_parameters() {
     let format = Format {
         params: vos_pvm_proof::format::FormatParams {
             log_blowup,
-            ..small_format(ChannelKind::Blake2s, log_mask_rows, queries).params
+            ..small_format(ChannelKind::Blake2sM31, log_mask_rows, queries).params
         },
-        ..small_format(ChannelKind::Blake2s, log_mask_rows, queries)
+        ..small_format(ChannelKind::Blake2sM31, log_mask_rows, queries)
     };
-    let program = program::<Blake2sMerkleChannel>(&format, &blob());
+    let program = program::<Blake2sM31MerkleChannel>(&format, &blob());
     assert!(program.log_sizes.iter().all(|&log_size| log_size >= floor));
     for seed in [1, 2] {
-        let (proof, stats) = prove::<Blake2sMerkleChannel>(
+        let (proof, stats) = prove::<Blake2sM31MerkleChannel>(
             &format,
             &program,
             &blob(),
@@ -783,7 +783,7 @@ fn heavy_device_proofs_verify_at_the_device_parameters() {
             MaskRng::Seeded(seed),
         )
         .expect("proves");
-        verify_device::<Blake2sMerkleChannel>(&format, &program, &proof).expect("verifies");
+        verify_device::<Blake2sM31MerkleChannel>(&format, &program, &proof).expect("verifies");
         assert_eq!(stats.attempts, 1);
         assert!(stats.revealed_rows <= 8 + 3 * queries, "{stats:?}");
         assert!(stats.revealed_rows <= 1 << log_mask_rows, "{stats:?}");

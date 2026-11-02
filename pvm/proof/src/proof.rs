@@ -83,7 +83,6 @@ pub struct SegmentState {
     pub pc: u32,
     pub timestamp: u64,
     pub registers: [u64; 13],
-    pub memory_commitment: [u8; 32], // blake3(flat_mem); computed outside the circuit, unbound
     /// Page-Merkle root of the RAM image AT THIS boundary:
     /// bound in-circuit by the boundary multiproof + `MemoryRootBoundaryChip`,
     /// so cross-segment continuity (`final_state == next.initial_state`)
@@ -117,8 +116,7 @@ pub struct Proof {
     /// are bound to the committed boundary columns (boundary-binding check):
     /// pc/ts pinned to the trace via CpuChip chaining, registers via
     /// register-ledger read-consistency, `memory_root` via the in-AIR
-    /// page-Merkle trie. `memory_commitment` is unbound/vestigial metadata
-    /// (see `SegmentState`).
+    /// page-Merkle trie.
     pub initial_state: SegmentState,
     /// State at segment end. Same binding scope as `initial_state`.
     pub final_state: SegmentState,

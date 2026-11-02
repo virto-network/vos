@@ -9,7 +9,7 @@
 //! ledger, filling every column as the chip's own trace does, and the
 //! ledger must still refuse it.
 
-use stwo::core::channel::Blake2sChannel;
+use stwo::core::channel::Blake2sM31Channel;
 use stwo::core::fields::m31::BaseField;
 use vos_pvm::PVM_REGISTER_COUNT;
 use vos_pvm::instruction::Opcode;
@@ -155,7 +155,7 @@ fn ledger(rows: &[Row]) -> ComponentTrace {
 
 fn assert_ledger(trace: &ComponentTrace, side_note: &SideNote) {
     let mut lookup_elements = AllLookupElements::default();
-    let channel = &mut Blake2sChannel::default();
+    let channel = &mut Blake2sM31Channel::default();
     RegisterMemoryChip.draw_lookup_elements(&mut lookup_elements, channel.into());
     let (interaction_trace, claimed_sum) =
         RegisterMemoryChip.generate_interaction_trace(trace, side_note, &lookup_elements);

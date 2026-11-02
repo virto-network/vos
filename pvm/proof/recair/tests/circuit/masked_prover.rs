@@ -18,7 +18,7 @@ use stwo::core::channel::{Channel, MerkleChannel};
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::quotients::{DeepCoefficients, deep_values_of_column};
-use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
+use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 use stwo::core::vcs_lifted::blake2b_merkle::Blake2bMerkleChannel;
 use stwo::prover::backend::BackendForChannel;
 use stwo::prover::backend::simd::SimdBackend;
@@ -391,7 +391,7 @@ fn a_one_component_set_is_refused() {
         vec![p2]
     };
     let format = format();
-    let refused = prove_masked::<Blake2sMerkleChannel, P2Only>(
+    let refused = prove_masked::<Blake2sM31MerkleChannel, P2Only>(
         &format,
         MaskedTrace {
             active: (),
@@ -420,12 +420,12 @@ fn a_one_component_set_is_refused() {
     assert_eq!(blinded_components(&layout), 1);
     assert!(!blinds_its_sums(&layout));
     let (proof, _) =
-        prove::<Blake2sMerkleChannel>(&format, &finalized, MaskRng::default()).unwrap();
+        prove::<Blake2sM31MerkleChannel>(&format, &finalized, MaskRng::default()).unwrap();
     let pinned = MaskedFormat {
         log_sizes: &log_sizes,
         ..verifier_format(&format, &proof.log_sizes, &wrap_layout(&proof.log_sizes)).unwrap()
     };
-    let refused = verify_masked::<Blake2sMerkleChannel, P2Only>(
+    let refused = verify_masked::<Blake2sM31MerkleChannel, P2Only>(
         &pinned,
         &Claim {
             log_sizes: &log_sizes,
@@ -442,7 +442,7 @@ fn a_one_component_set_is_refused() {
     assert!(matches!(refused, Err(Error::Shape(_))), "{refused:?}");
     // Three components, each blinded, prove and verify.
     assert!(blinds_its_sums(&wrap_layout(&proof.log_sizes)));
-    verify::<Blake2sMerkleChannel>(&format, &proof).unwrap();
+    verify::<Blake2sM31MerkleChannel>(&format, &proof).unwrap();
 }
 
 /// Two proofs of one witness share only the preprocessed root: every masked

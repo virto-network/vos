@@ -51,8 +51,6 @@
 //!   to equal the trace's actual final register state. Combined with the
 //!   metadata→column binding here, registers are a fully bound public
 //!   input (gate: `tests/gates/ledger_readconsistency_gate.rs`).
-//!   `memory_commitment` has no committed column and stays OUTSIDE this
-//!   binding entirely.
 //!
 //! A consequence of the closing-chip equality: a proof over an EMPTY
 //! trace (no steps, all-zero boundary metadata) is rejected — the

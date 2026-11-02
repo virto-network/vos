@@ -33,7 +33,7 @@ use stwo::core::channel::{Channel, MerkleChannel};
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::proof::StarkProof;
-use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
+use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use vos_pvm_proof::masked::{
     DeviceComponents, DeviceSizes, device_io_position, device_public_values, masked_device_trace,
@@ -229,7 +229,7 @@ fn no_hidden_state_is_in_a_proof() {
 /// digest too.
 #[test]
 fn every_opening_is_fresh() {
-    let differing = |a: &Proof<Blake2sMerkleChannel>, b: &Proof<Blake2sMerkleChannel>| {
+    let differing = |a: &Proof<Blake2sM31MerkleChannel>, b: &Proof<Blake2sM31MerkleChannel>| {
         let a = private_fields(&a.proof.stark_proof, &a.proof.claimed_sums);
         let b: BTreeMap<_, _> = private_fields(&b.proof.stark_proof, &b.proof.claimed_sums)
             .into_iter()
@@ -242,10 +242,10 @@ fn every_opening_is_fresh() {
         assert!(shared.is_empty(), "openings shared: {shared:?}");
         a.len()
     };
-    let blake = small_format(vos_pvm_proof::format::ChannelKind::Blake2s, 6, 4);
-    let program = program::<Blake2sMerkleChannel>(&blake, &blob());
+    let blake = small_format(vos_pvm_proof::format::ChannelKind::Blake2sM31, 6, 4);
+    let program = program::<Blake2sM31MerkleChannel>(&blake, &blob());
     let [first, second] = [(); 2].map(|_| {
-        prove::<Blake2sMerkleChannel>(
+        prove::<Blake2sM31MerkleChannel>(
             &blake,
             &program,
             &blob(),
@@ -257,7 +257,7 @@ fn every_opening_is_fresh() {
     });
     let n = differing(&first, &second);
     let [a, b] = WITNESSES.map(|seed| {
-        prove::<Blake2sMerkleChannel>(
+        prove::<Blake2sM31MerkleChannel>(
             &blake,
             &program,
             &blob(),

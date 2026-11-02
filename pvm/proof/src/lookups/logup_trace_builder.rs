@@ -204,7 +204,7 @@ mod tests {
     };
     use crate::side_note::SideNote;
     use crate::trace::component::ComponentTrace;
-    use stwo::core::channel::Blake2sChannel;
+    use stwo::core::channel::Blake2sM31Channel;
     use stwo::prover::backend::Column as _;
 
     /// A real `Blake2bBoundaryChip` component trace over a handful of
@@ -303,7 +303,7 @@ mod tests {
         let trace = boundary_component_trace();
         let mut lookups = AllLookupElements::default();
         Blake2bBoundaryChip
-            .draw_lookup_elements(&mut lookups, (&mut Blake2sChannel::default()).into());
+            .draw_lookup_elements(&mut lookups, (&mut Blake2sM31Channel::default()).into());
 
         let (cols_skip, sum_skip) = replay_cols(&trace, &lookups, true);
         let (cols_ref, sum_ref) = replay_cols(&trace, &lookups, false);

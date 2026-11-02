@@ -14,7 +14,7 @@
 //!
 //! 2. **Boundary continuity** — segment N's `final_state` must
 //!    equal segment N+1's `initial_state`, byte-for-byte (pc,
-//!    timestamp, registers, memory_commitment).
+//!    timestamp, registers, memory_root).
 //!
 //! The boundary states are produced by `prove` directly from the
 //! per-segment trace's first/last steps and the side note's
@@ -121,8 +121,8 @@ fn main() {
     // Initial memory is the same (no memory writes in this program).
     // For programs that DO write memory across the cut, segment 2's
     // initial_memory would need to be initial_memory + segment-1
-    // writes applied (which compute_final_memory_commitment in
-    // prove.rs computes for the boundary commitment).
+    // writes applied, whose page-Merkle root is the boundary's
+    // `memory_root`.
     let mut sn1 = SideNote::new(seg1_steps.to_vec(), code.clone(), bitmask.clone())
         .with_memory(initial_memory.clone());
     let mut sn2 = SideNote::new(seg2_steps.to_vec(), code.clone(), bitmask.clone())

@@ -11,13 +11,14 @@ use stwo::core::circle::CirclePoint;
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::quotients::deep_values_of_column;
-use stwo::core::vcs_lifted::blake2_merkle::{Blake2sM31MerkleChannel, Blake2sMerkleChannel};
+use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 use stwo_constraint_framework::Relation;
 use vos_pvm_final_verifier::credential::{
     self as verifier, AUTH_PROGRAM, AUTH_ROOT, CredentialProof, MAX_PROOF_BYTES, OWNER_PROGRAM,
     OWNER_ROOT, PINS,
 };
 use vos_pvm_proof::format::{CREDENTIAL_PROOF, CREDENTIAL_REFERENCE, Format, FormatParams};
+use vos_pvm_proof::poseidon2::P2MerkleChannel;
 use vos_pvm_proof::security::{SecurityShape, proven_count};
 use vos_pvm_recair::credential::{self, LOG_SIZES, Statement};
 use vos_pvm_recair::masked::MaskRng;
@@ -239,7 +240,7 @@ fn the_joint_circuit_proves_and_another_formats_proof_is_refused() {
 }
 
 /// The prover and the verifier are generic over the channel: auth on the
-/// plain Blake2s trees, under format 44's parameters, and a tampered
+/// Poseidon2-M31 trees, under format 44's parameters, and a tampered
 /// sample refused.
 #[test]
 fn the_prover_is_generic_over_the_channel() {
@@ -250,20 +251,19 @@ fn the_prover_is_generic_over_the_channel() {
         ..CREDENTIAL_PROOF
     };
     let root =
-        credential::preprocessed_root::<Blake2sMerkleChannel>(&format, &finalized.circuit).unwrap();
-    let (proof, _) = credential::prove_on::<Blake2sMerkleChannel>(
+        credential::preprocessed_root::<P2MerkleChannel>(&format, &finalized.circuit).unwrap();
+    let (proof, _) = credential::prove_on::<P2MerkleChannel>(
         &format,
         &finalized.circuit,
         &finalized.witness,
         MaskRng::default(),
     )
     .unwrap();
-    credential::verify_on::<Blake2sMerkleChannel>(&format, root, &statement.words(), &proof)
-        .unwrap();
+    credential::verify_on::<P2MerkleChannel>(&format, root, &statement.words(), &proof).unwrap();
     let mut tampered = proof.clone();
     tampered.stark_proof.0.sampled_values[1][0][0] += SecureField::from(BaseField::from(1));
     assert!(
-        credential::verify_on::<Blake2sMerkleChannel>(&format, root, &statement.words(), &tampered)
+        credential::verify_on::<P2MerkleChannel>(&format, root, &statement.words(), &tampered)
             .is_err()
     );
 }

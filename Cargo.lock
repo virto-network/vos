@@ -5275,7 +5275,6 @@ name = "vos-pvm-proof"
 version = "0.1.0"
 dependencies = [
  "bincode",
- "blake3",
  "cipher-clerk",
  "ed25519-dalek 2.2.0",
  "impl-trait-for-tuples",

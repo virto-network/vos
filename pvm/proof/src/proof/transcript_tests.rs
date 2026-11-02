@@ -16,7 +16,6 @@ fn state(register: u64) -> SegmentState {
         pc: 0x1000,
         timestamp: 1,
         registers,
-        memory_commitment: [0; 32],
         memory_root: [9; 32],
     }
 }

@@ -17,7 +17,7 @@ use stwo::core::fri::FriConfig;
 use stwo::core::pcs::utils::prepare_preprocessed_query_positions;
 use stwo::core::pcs::{CommitmentSchemeVerifier, PcsConfig, TreeVec};
 use stwo::core::poly::circle::CanonicCoset;
-use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
+use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 use stwo::core::verifier::verify;
 use stwo::prover::backend::{BackendForChannel, simd::SimdBackend};
 use stwo::prover::poly::{
@@ -131,7 +131,7 @@ fn evaluations(
 /// preprocessed values against the positions they were read at.
 #[test]
 fn the_replay_draws_the_verifiers_query_positions() {
-    replay_draws_the_verifiers_query_positions::<Blake2sMerkleChannel>();
+    replay_draws_the_verifiers_query_positions::<Blake2sM31MerkleChannel>();
     replay_draws_the_verifiers_query_positions::<P2MerkleChannel>();
 }
 
@@ -236,7 +236,7 @@ where
 /// counts its queries.
 #[test]
 fn a_preprocessed_tree_below_the_lifting_height_verifies() {
-    preprocessed_tree_below_the_lifting_height_verifies::<Blake2sMerkleChannel>();
+    preprocessed_tree_below_the_lifting_height_verifies::<Blake2sM31MerkleChannel>();
     preprocessed_tree_below_the_lifting_height_verifies::<P2MerkleChannel>();
 }
 

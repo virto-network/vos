@@ -6,8 +6,8 @@ license = "Apache-2.0"
 
 [features]
 default = ["prover", "wire"]
-# Prover-side: trace generation, proof creation, the tracer, blake3 commitments,
-# and parallel iteration.  Disable for a verifier-only build (smaller dep tree,
+# Prover-side: trace generation, proof creation, the tracer and parallel
+# iteration.  Disable for a verifier-only build (smaller dep tree,
 # no_std-friendly, builds for wasm32-unknown-unknown).
 #
 # `javm` (the reference PVM interpreter the tracer drives) is prover-only:
@@ -24,7 +24,6 @@ prover = [
     "dep:vos-pvm",
     "vos-pvm-poseidon2/packed",
     "dep:rayon",
-    "dep:blake3",
     "stwo/std",
     "stwo/prover",
     "stwo/parallel",
@@ -76,7 +75,6 @@ vos-pvm-poseidon2 = { workspace = true }
 vos-pvm-recair-air = { workspace = true }
 vos-wire = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
-blake3 = { version = "1", optional = true }
 
 [dev-dependencies]
 vos-pvm-compiler = { workspace = true }

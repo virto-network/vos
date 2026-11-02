@@ -17,9 +17,8 @@
 //! - **Uniformity:** each field of the first kernel's N proofs against
 //!   uniform M31.
 //! - **Hidden states:** a value the run holds and no boundary state does (φ7
-//!   between its sum and its clearing), and each boundary's
-//!   `memory_commitment`, which the masked transcript never mixes, are in no
-//!   proof's bytes.
+//!   between its sum and its clearing), and each boundary's memory root,
+//!   are in no proof's bytes.
 //! - **Fresh randomness:** two proofs of one run share no opening, nor two
 //!   kernels' proofs from one seed.
 //! - **The claimed sums' control:** a right guess of the run's sums under the
@@ -35,7 +34,7 @@ use num_traits::Zero;
 use stwo::core::channel::{Channel, MerkleChannel};
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::proof::StarkProof;
-use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
+use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use vos_pvm_proof::StarkProofAny;
 use vos_pvm_proof::format::SEGMENT;
@@ -120,7 +119,7 @@ fn unmasked(io: [u32; 4]) -> vos_pvm_proof::Proof {
 fn poseidon(proof: &vos_pvm_proof::Proof) -> &StarkProof<vos_pvm_proof::poseidon2::P2MerkleHasher> {
     match &proof.stark_proof {
         StarkProofAny::Poseidon2M31(stark) => stark,
-        StarkProofAny::Blake2s(_) | StarkProofAny::Blake2sM31(_) => {
+        StarkProofAny::Blake2sM31(_) => {
             panic!("format 41 is on the Poseidon2-M31 channel")
         }
     }
@@ -169,7 +168,7 @@ fn the_published_values_do_not_depend_on_the_witness() {
 
 /// No hidden state in a proof's bytes: φ7's value between its sum and its
 /// clearing (its 8 bytes, its low half; its high half is the sign's), and each boundary's
-/// `memory_commitment`, which nothing the masked transcript mixes holds.
+/// memory root.
 #[test]
 fn no_hidden_state_is_in_a_proof() {
     let format = format();
@@ -188,12 +187,12 @@ fn no_hidden_state_is_in_a_proof() {
         ("φ7's value", secret.to_vec()),
         ("its low half", secret[..4].to_vec()),
         (
-            "the entering memory commitment",
-            proof.initial_state.memory_commitment.to_vec(),
+            "the entering memory root",
+            proof.initial_state.memory_root.to_vec(),
         ),
         (
-            "the exit memory commitment",
-            proof.final_state.memory_commitment.to_vec(),
+            "the exit memory root",
+            proof.final_state.memory_root.to_vec(),
         ),
     ];
     for (name, needle) in &needles {
@@ -209,7 +208,7 @@ fn no_hidden_state_is_in_a_proof() {
 /// digest too.
 #[test]
 fn every_opening_is_fresh() {
-    let differing = |a: &Proof<Blake2sMerkleChannel>, b: &Proof<Blake2sMerkleChannel>| {
+    let differing = |a: &Proof<Blake2sM31MerkleChannel>, b: &Proof<Blake2sM31MerkleChannel>| {
         let a = private_fields(&a.proof.stark_proof, &a.proof.claimed_sums);
         let b: BTreeMap<_, _> = private_fields(&b.proof.stark_proof, &b.proof.claimed_sums)
             .into_iter()
@@ -222,15 +221,15 @@ fn every_opening_is_fresh() {
         assert!(shared.is_empty(), "openings shared: {shared:?}");
         a.len()
     };
-    let blake = crate::support::small_format(vos_pvm_proof::format::ChannelKind::Blake2s, 6, 4);
+    let blake = crate::support::small_format(vos_pvm_proof::format::ChannelKind::Blake2sM31, 6, 4);
     let [first, second] = [(); 2].map(|_| {
-        prove::<Blake2sMerkleChannel>(&blake, IO, MaskRng::default())
+        prove::<Blake2sM31MerkleChannel>(&blake, IO, MaskRng::default())
             .expect("proves")
             .0
     });
     let n = differing(&first, &second);
     let [a, b] = [IO, IO_OTHER].map(|io| {
-        prove::<Blake2sMerkleChannel>(&blake, io, MaskRng::Seeded(15))
+        prove::<Blake2sM31MerkleChannel>(&blake, io, MaskRng::Seeded(15))
             .expect("proves")
             .0
     });

@@ -109,7 +109,7 @@ rests on the conjectured count.
 | `proof.stark_proof` | no | verified by Stwo, after a hostile-input preflight of every nested length |
 | `proof.claimed_sums` | no | must sum to zero; the boundary chips' must equal the sums recomputed from the boundary states |
 | `proof.log_sizes` | no | capped by `DEFAULT_MAX_LOG_SIZE` (overridable) |
-| `proof.initial_state`, `proof.final_state` | bound | registers, pc and ts bound to the committed boundary columns and to the trace; `memory_root` to the in-AIR page tree of the images; `memory_commitment` is unbound metadata |
+| `proof.initial_state`, `proof.final_state` | bound | registers, pc and ts bound to the committed boundary columns and to the trace; `memory_root` to the in-AIR page tree of the images |
 | `proof.pcs_config` | no | the format's exactly; Fiat–Shamir-bound |
 | `hash`, the preprocessed root | **yes** | the class's program identity: its code, layout and permissions, at its shape. For a kernel, the install's record derives it, and the program id covers it |
 

@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use stwo::core::air::Component;
-use stwo::core::channel::Blake2sChannel;
+use stwo::core::channel::Blake2sM31Channel;
 use stwo::core::circle::CirclePoint;
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
@@ -139,7 +139,7 @@ fn the_segment_chips_pass_the_degree_audit_under_c() {
     assert_eq!(count, 26);
     let mask = ((1u64 << count) - 1) as u32;
     let mut lookups = AllLookupElements::default();
-    draw_all_lookup_elements(&mut lookups, &mut Blake2sChannel::default(), mask);
+    draw_all_lookup_elements(&mut lookups, &mut Blake2sM31Channel::default(), mask);
     let mut degrees = Vec::new();
     for chip in 0..count {
         let name = vos_pvm_proof::chip_idx::NAMES[chip];
@@ -163,7 +163,7 @@ fn the_segment_chips_pass_the_degree_audit_under_c() {
 fn the_masked_segment_chips_pass_the_degree_audit() {
     let count = vos_pvm_proof::chip_idx::COUNT;
     let mask = vos_pvm_proof::chip_idx::ALL;
-    let channel = &mut Blake2sChannel::default();
+    let channel = &mut Blake2sM31Channel::default();
     let lookups = SegmentComponents::draw_relations(mask, channel);
     let blind = BlindRelation::draw(channel);
     let mut degrees = Vec::new();
@@ -208,7 +208,7 @@ fn the_masked_segment_chips_pass_the_degree_audit() {
 fn the_masked_device_chips_pass_the_degree_audit() {
     use vos_pvm_proof::device::{DEVICE_ALL, device_chip, device_chips_of_mask};
     use vos_pvm_proof::masked::{DeviceComponents, drive_masked_device_chip};
-    let channel = &mut Blake2sChannel::default();
+    let channel = &mut Blake2sM31Channel::default();
     let lookups = DeviceComponents::draw_relations(DEVICE_ALL, channel);
     let blind = BlindRelation::draw(channel);
     let mut total = 0;
@@ -262,7 +262,7 @@ fn the_masked_device_chips_pass_the_degree_audit() {
 #[test]
 fn the_masked_segments_cubic_census() {
     let mask = vos_pvm_proof::chip_idx::ALL;
-    let channel = &mut Blake2sChannel::default();
+    let channel = &mut Blake2sM31Channel::default();
     let lookups = SegmentComponents::draw_relations(mask, channel);
     let blind = BlindRelation::draw(channel);
     let (mut gates, mut batches) = ([0usize; 4], [0usize; 4]);

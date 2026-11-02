@@ -3,7 +3,7 @@
 //! program takes.
 
 use stwo::core::air::Component;
-use stwo::core::channel::Blake2sChannel;
+use stwo::core::channel::Blake2sM31Channel;
 use stwo::core::circle::CirclePoint;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::quotients::deep_values_of_column;
@@ -44,7 +44,7 @@ fn device_shape(log_size: u32) -> SecurityShape {
         })
         .max()
         .unwrap();
-    let channel = &mut Blake2sChannel::default();
+    let channel = &mut Blake2sM31Channel::default();
     let relations = DeviceComponents::draw_relations(DEVICE_ALL, channel);
     let blind = BlindRelation::draw(channel);
     let fractions: u64 = chips

@@ -11,7 +11,7 @@
 //! the logup balance of every chip.
 
 use crate::forge::*;
-use stwo::core::channel::Blake2sChannel;
+use stwo::core::channel::Blake2sM31Channel;
 use stwo::core::fields::m31::BaseField;
 use vos_pvm::PVM_REGISTER_COUNT;
 use vos_pvm::instruction::Opcode;
@@ -503,7 +503,7 @@ fn accepts(
 ) -> bool {
     use num_traits::Zero;
     let mut lookup_elements = AllLookupElements::default();
-    let channel = &mut Blake2sChannel::default();
+    let channel = &mut Blake2sM31Channel::default();
     for component in components {
         component.draw_lookup_elements(&mut lookup_elements, channel.into());
     }
