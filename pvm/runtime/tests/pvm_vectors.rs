@@ -2378,7 +2378,7 @@ fn graypaper_v080_block_gas_matches_checked_in_oracle() {
             if !value["expected"]["resume"].is_null() {
                 let resume = &value["expected"]["resume"];
                 assert!(
-                    jit.acknowledge_host_call(),
+                    jit.resume_after_host_call(),
                     "{file}: JIT resume follows a standard host call"
                 );
                 let exit = jit.run();
@@ -2457,7 +2457,7 @@ fn v080_external_exit_counters_and_host_resume_are_exact() {
         let host_gas = jit.gas();
         assert_eq!(jit.run(), ExitReason::HostCall(7));
         assert_eq!(jit.gas(), host_gas);
-        assert!(jit.acknowledge_host_call());
+        assert!(jit.resume_after_host_call());
         assert_eq!(jit.run(), ExitReason::Panic);
         assert_eq!(jit.pc(), 0);
         assert_eq!(jit.gas(), host_gas);

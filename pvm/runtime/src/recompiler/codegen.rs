@@ -26,17 +26,6 @@ use crate::args::{self, Args};
 use crate::gas_sim::GasSimulator;
 use crate::instruction::Opcode;
 
-/// Compute skip(i) — distance to next instruction start.
-fn compute_skip(pc: usize, bitmask: &[u8]) -> usize {
-    for j in 0..25 {
-        let idx = pc + 1 + j;
-        let bit = if idx < bitmask.len() { bitmask[idx] } else { 1 };
-        if bit == 1 {
-            return j;
-        }
-    }
-    24
-}
 /// Map PVM register index (0..12) to x86-64 register.
 /// All 13 PVM registers live in x86 registers.
 const REG_MAP: [Reg; 13] = [
@@ -59,19 +48,6 @@ const REG_MAP: [Reg; 13] = [
 const SCRATCH: Reg = Reg::RDX;
 /// R15 = base of guest memory (flat buffer). JitContext is at negative offset.
 const CTX: Reg = Reg::R15;
-
-/// Caller-saved PVM registers that need saving around helper calls.
-#[allow(dead_code)]
-const CALLER_SAVED: [Reg; 8] = [
-    Reg::RSI,
-    Reg::RDI,
-    Reg::R8,
-    Reg::R9,
-    Reg::R10,
-    Reg::R11,
-    Reg::RAX,
-    Reg::RCX,
-];
 
 /// JitContext field offsets — all NEGATIVE from R15 (guest memory base).
 ///
@@ -558,14 +534,8 @@ impl Compiler {
                 }
             };
 
-            // Cross-instruction fusions are intentionally disabled: every
-            // decoded PC is a legal fresh entry.
-            let fused: Option<usize> = None;
-
-            if let Some(advance) = fused {
-                pc += advance;
-                continue;
-            }
+            // No fusion across instructions: every decoded PC is a legal
+            // fresh entry.
 
             if is_terminator {
                 self.asm.mov_store32_imm(CTX, CTX_GAS_CHARGED, 0);
@@ -701,248 +671,6 @@ impl Compiler {
                 mmap_cap: 0,
             },
         }
-    }
-
-    /// Save caller-saved registers (PVM registers in caller-saved x86-64 regs).
-    #[allow(dead_code)]
-    fn save_caller_saved(&mut self) {
-        for &reg in &CALLER_SAVED {
-            self.asm.push(reg);
-        }
-    }
-
-    /// Restore caller-saved registers (reverse order).
-    #[allow(dead_code)]
-    fn restore_caller_saved(&mut self) {
-        for &reg in CALLER_SAVED.iter().rev() {
-            self.asm.pop(reg);
-        }
-    }
-
-    /// Load the JitContext pointer (R15 - CTX_OFFSET) into a register.
-    #[allow(dead_code)]
-    fn emit_ctx_ptr(&mut self, dst: Reg) {
-        self.asm.lea(dst, CTX, -CTX_OFFSET);
-    }
-
-    /// Peephole: fuse scaled-index from raw code (no pre-decoded array).
-    /// Pattern: add64 D,A,A / add64 D,D,D / add64 D2,BASE,D / load/store_ind R,D2,0
-    #[allow(dead_code)]
-    fn try_fuse_scaled_index_raw(
-        &mut self,
-        code: &[u8],
-        bitmask: &[u8],
-        pc: usize,
-        args: &Args,
-        gas_sim: &mut GasSimulator,
-    ) -> Option<usize> {
-        let Args::ThreeReg {
-            ra: a1_ra,
-            rb: a1_rb,
-            rd: a1_rd,
-        } = args
-        else {
-            return None;
-        };
-        if a1_ra != a1_rb {
-            return None;
-        }
-        let idx_reg = *a1_ra;
-        let d1 = *a1_rd;
-
-        // Peek instruction 2
-        let skip1 = compute_skip(pc, bitmask);
-        let pc2 = pc + 1 + skip1;
-        if pc2 >= code.len() || (pc2 < bitmask.len() && bitmask[pc2] != 1) {
-            return None;
-        }
-        let op2 = Opcode::from_byte(code[pc2])?;
-        if op2 != Opcode::Add64 {
-            return None;
-        }
-        let skip2 = compute_skip(pc2, bitmask);
-        let args2 = args::decode_args(code, pc2, skip2, op2.category());
-        let Args::ThreeReg {
-            ra: a2_ra,
-            rb: a2_rb,
-            rd: a2_rd,
-        } = args2
-        else {
-            return None;
-        };
-        if a2_ra != d1 || a2_rb != d1 || a2_rd != d1 {
-            return None;
-        }
-
-        // Peek instruction 3
-        let pc3 = pc2 + 1 + skip2;
-        if pc3 >= code.len() || (pc3 < bitmask.len() && bitmask[pc3] != 1) {
-            return None;
-        }
-        let op3 = Opcode::from_byte(code[pc3])?;
-        if op3 != Opcode::Add64 {
-            return None;
-        }
-        let skip3 = compute_skip(pc3, bitmask);
-        let args3 = args::decode_args(code, pc3, skip3, op3.category());
-        let Args::ThreeReg {
-            ra: a3_ra,
-            rb: a3_rb,
-            rd: a3_rd,
-        } = args3
-        else {
-            return None;
-        };
-        let base_reg;
-        if a3_rb == d1 && a3_ra != d1 {
-            base_reg = a3_ra;
-        } else if a3_ra == d1 && a3_rb != d1 {
-            base_reg = a3_rb;
-        } else {
-            return None;
-        }
-        let addr_reg = a3_rd;
-
-        // Peek instruction 4
-        let pc4 = pc3 + 1 + skip3;
-        if pc4 >= code.len() || (pc4 < bitmask.len() && bitmask[pc4] != 1) {
-            return None;
-        }
-        let op4 = Opcode::from_byte(code[pc4])?;
-        let skip4 = compute_skip(pc4, bitmask);
-        let args4 = args::decode_args(code, pc4, skip4, op4.category());
-
-        // Validate the complete pattern before mutating the online gas
-        // simulator. A rejected near-match is compiled normally by the outer
-        // loop, so feeding a peeked instruction here would charge it twice.
-        let is_load = matches!(
-            op4,
-            Opcode::LoadIndU8
-                | Opcode::LoadIndI8
-                | Opcode::LoadIndU16
-                | Opcode::LoadIndI16
-                | Opcode::LoadIndU32
-                | Opcode::LoadIndI32
-                | Opcode::LoadIndU64
-        );
-        let is_store = matches!(
-            op4,
-            Opcode::StoreIndU8 | Opcode::StoreIndU16 | Opcode::StoreIndU32 | Opcode::StoreIndU64
-        );
-        if !is_load && !is_store {
-            return None;
-        }
-        let Args::TwoRegImm { ra, rb, imm } = args4 else {
-            return None;
-        };
-        if rb != addr_reg || imm as i32 != 0 {
-            return None;
-        }
-
-        // Feed instructions 2-4 to gas sim (using decoded args, no redundant decode)
-        for &(opc, a, p) in &[(op2, &args2, pc2), (op3, &args3, pc3), (op4, &args4, pc4)] {
-            let fc = crate::gas_cost::fast_cost_from_decoded(opc as u8, a, p as u32, code, bitmask);
-            gas_sim.feed(&fc);
-        }
-
-        // Bind labels for all 4 instructions
-        // With post-terminator-only gas blocks, fused instructions (add, mul,
-        // load, store) are never terminators, so none of these PCs are gas block
-        // starts. No label binding needed.
-
-        self.asm
-            .lea_sib_scaled_32(SCRATCH, REG_MAP[base_reg], REG_MAP[idx_reg], 2);
-        let ra_reg = REG_MAP[ra];
-        if is_load {
-            let fn_addr = self.read_fn_for(op4);
-            self.emit_mem_read(ra_reg, SCRATCH, fn_addr, pc4 as u32);
-            self.emit_sign_extend(op4, ra_reg);
-        } else {
-            let fn_addr = self.write_fn_for(op4);
-            self.emit_mem_write(true, ra_reg, fn_addr, pc4 as u32);
-        }
-        Some(pc4 + 1 + skip4 - pc)
-    }
-
-    /// Peephole: fuse Mul64 + MulUpper from raw code.
-    /// Currently disabled: corrupts results when φ[11] (RAX) is both source and destination.
-    /// Kept for future fix (needs proper RAX aliasing handling in push/pop sequence).
-    #[allow(dead_code)]
-    fn try_fuse_mul_pair_raw(
-        &mut self,
-        code: &[u8],
-        bitmask: &[u8],
-        pc: usize,
-        args: &Args,
-        gas_sim: &mut GasSimulator,
-    ) -> Option<usize> {
-        let Args::ThreeReg {
-            ra: m_ra,
-            rb: m_rb,
-            rd: m_rd,
-        } = args
-        else {
-            return None;
-        };
-
-        let skip1 = compute_skip(pc, bitmask);
-        let pc2 = pc + 1 + skip1;
-        if pc2 >= code.len() || (pc2 < bitmask.len() && bitmask[pc2] != 1) {
-            return None;
-        }
-        let op2 = Opcode::from_byte(code[pc2])?;
-        let signed = match op2 {
-            Opcode::MulUpperSS => true,
-            Opcode::MulUpperUU => false,
-            _ => return None,
-        };
-        let skip2 = compute_skip(pc2, bitmask);
-        let args2 = args::decode_args(code, pc2, skip2, op2.category());
-        let Args::ThreeReg {
-            ra: u_ra,
-            rb: u_rb,
-            rd: u_rd,
-        } = args2
-        else {
-            return None;
-        };
-        if u_ra != *m_ra || u_rb != *m_rb {
-            return None;
-        }
-
-        // Feed instruction 2 to gas sim (using decoded args, no redundant decode)
-        let fc =
-            crate::gas_cost::fast_cost_from_decoded(op2 as u8, &args2, pc2 as u32, code, bitmask);
-        gas_sim.feed(&fc);
-
-        // Bind labels
-        // Fused mul-pair instructions are never terminators — no gas block binding.
-
-        let (a, b) = (REG_MAP[*m_ra], REG_MAP[*m_rb]);
-        let (rd_lo, rd_hi) = (REG_MAP[*m_rd], REG_MAP[u_rd]);
-
-        self.asm.push(Reg::RAX);
-        self.asm.push(SCRATCH);
-        self.asm.mov_rr(Reg::RAX, a);
-        let mul_src = if b == Reg::RAX {
-            self.asm.mov_load64(SCRATCH, Reg::RSP, 8);
-            SCRATCH
-        } else {
-            b
-        };
-        if signed {
-            self.asm.imul_rdx_rax(mul_src);
-        } else {
-            self.asm.mul_rdx_rax(mul_src);
-        }
-        self.asm.push(SCRATCH);
-        self.asm.push(Reg::RAX);
-        self.asm.mov_load64(SCRATCH, Reg::RSP, 16);
-        self.asm.mov_load64(Reg::RAX, Reg::RSP, 24);
-        self.asm.mov_load64(rd_lo, Reg::RSP, 0);
-        self.asm.mov_load64(rd_hi, Reg::RSP, 8);
-        self.asm.add_ri(Reg::RSP, 32);
-        Some(pc2 + 1 + skip2 - pc)
     }
 
     /// Emit memory read. Address in SCRATCH (RDX). Result in dst.
@@ -2542,12 +2270,6 @@ impl Compiler {
             self.asm.shift_cl64(shift_op, dst);
             self.asm.pop(Reg::RCX);
         }
-    }
-
-    /// Three-register 64-bit ALU: rd = ra OP rb
-    #[allow(dead_code)]
-    fn emit_alu3_64(&mut self, args: &Args, op: impl FnOnce(&mut Assembler, Reg, Reg)) {
-        self.emit_alu3_64_comm(args, false, op);
     }
 
     /// Three-register 64-bit ALU with optional commutativity optimization.

@@ -1160,7 +1160,7 @@ impl RecompiledPvm {
 
     /// Commit the successor of the currently surfaced standard host call.
     /// Rerunning before this acknowledgement reproduces the same host exit.
-    pub fn acknowledge_host_call(&mut self) -> bool {
+    pub fn resume_after_host_call(&mut self) -> bool {
         if self.ctx().host_pending == 0 {
             return false;
         }
@@ -1175,11 +1175,6 @@ impl RecompiledPvm {
         // so preserve the funded marker just like Interpreter and VmInstance.
         ctx.gas_charged = 1;
         true
-    }
-
-    /// Compatibility spelling shared with the interpreter API.
-    pub fn resume_after_host_call(&mut self) -> bool {
-        self.acknowledge_host_call()
     }
 
     /// Set gas.
@@ -1365,7 +1360,7 @@ mod tests {
         let after_host_call = pvm.gas();
         assert_eq!(pvm.run(), ExitReason::HostCall(42));
         assert_eq!(pvm.gas(), after_host_call);
-        assert!(pvm.acknowledge_host_call());
+        assert!(pvm.resume_after_host_call());
         assert_eq!(pvm.run(), ExitReason::Panic);
         assert_eq!(pvm.gas(), after_host_call);
     }
@@ -1414,7 +1409,7 @@ mod tests {
             signal::SIGNAL_STATE.with(|cell| assert!(cell.get().is_null()));
             assert_eq!(recompiled.run(), ExitReason::HostCall(7));
             assert_eq!(recompiled.gas(), initial_gas - block_cost);
-            assert!(recompiled.acknowledge_host_call());
+            assert!(recompiled.resume_after_host_call());
             assert_eq!(recompiled.run(), ExitReason::Panic);
             assert_eq!(recompiled.gas(), initial_gas - block_cost);
             signal::SIGNAL_STATE.with(|cell| assert!(cell.get().is_null()));
@@ -1781,7 +1776,7 @@ mod tests {
         .expect("compilation should succeed");
         assert_eq!(recompiled.run(), ExitReason::HostCall(7));
         assert_eq!(recompiled.gas(), 50);
-        assert!(recompiled.acknowledge_host_call());
+        assert!(recompiled.resume_after_host_call());
         assert_eq!(recompiled.run(), ExitReason::Panic);
         assert_eq!(recompiled.gas(), 50);
         assert!(interpreter.gas_charged);
