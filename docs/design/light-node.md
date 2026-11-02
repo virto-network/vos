@@ -653,8 +653,10 @@ the S8-P1 session]:
   ingress code and its carrier and fuzz cover; those phones are delayed
   admins instead.
   The device set records whether each admin key's attestation showed a
-  TEE key requiring a strong biometric, and the chrome shows an unattested
-  one.
+  TEE key requiring a strong biometric, and the attested verified-boot
+  state; the chrome shows an unattested key, and a device whose boot is
+  unverified (an unlocked bootloader, a custom ROM), without changing its
+  admin class [decided, E24].
 - **Why the bars differ:** a sign-in or a P1 transfer is one action the
   user sees; device changes are lasting control of every device's data. So
   the member secret keeps its decided PIN fallback and in-process exposure
