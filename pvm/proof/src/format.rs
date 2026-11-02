@@ -19,9 +19,10 @@
 //!   segments and the device shape share (the CPU acknowledging the
 //!   Poseidon2 call, the Poseidon2 chip, the logical right shifts through
 //!   the multiplication, no column a constraint pins to zero), and 32's
-//!   leaves verify it. The numbers that named its earlier forms are
-//!   [`RETIRED`]: refused, and never registered again. 28, 32 and 39 prove the recursion AIR (`vos-pvm-recair-air`) and keep
-//!   their numbers; 44 proves its `p2` and `qm31` alone, the credential AIR.
+//!   leaves verify it. 28, 32 and 39 prove the recursion AIR
+//!   (`vos-pvm-recair-air`); 44 proves its `p2` and `qm31` alone, the
+//!   credential AIR. A number not in [`REGISTRY`] is refused as
+//!   unregistered.
 //! - **Every format** takes exactly its parameters, mixes the boundary
 //!   states as the boundary chips' bytes and grinds its interaction PoW
 //!   before the relation challenges. 46 is admitted: a space's ingress
@@ -499,45 +500,6 @@ pub const REGISTRY: [Format; 6] = [
     DEVICE_PROOF,
 ];
 
-/// The numbers no format takes again, each refused:
-/// - **superseded AIRs:** 24 and its Poseidon2-M31 variant 25, and 26, 27
-///   and 29, the registry's first segment, leaf and device formats, all of
-///   the segment AIR before its hardening; 31, 33 and 34, the segment,
-///   legacy and device formats of the hardened AIR with the columns no
-///   constraint reads;
-/// - **36, below the floor:** the legacy Blake2s segment format of the
-///   current AIR, its parameters the proof's own under a 96-bit conjectured
-///   floor, 57 proven bits at its MOBILE shape, below the inner formats'
-///   60; its boundary states mixed a word at a time and no interaction PoW;
-/// - **40, never registered:** the masked wrap at blowup 64 and 20 queries,
-///   proved and measured as a candidate for 39. A proof was made under it,
-///   so no later format takes it;
-/// - **30, reserved, never admitted:** credential proofs at blowup 2 and 86
-///   queries, counted on an unmasked shape; 44 is the credential format,
-///   counted on its masked one;
-/// - **42, admitted, then retired:** credential proofs at 43 queries and
-///   PoW 20 (106 / 62), whose grind's 95th percentile on the gate phone
-///   passed 50 ms; 44 takes PoW 16 at 47 queries. Proofs were made under
-///   it, so no later format takes it;
-/// - **37, reserved, never admitted:** device proofs at blowup 2 and 86
-///   queries, counted on an unmasked shape; the device format is counted
-///   on its masked one;
-/// - **43, admitted, then retired:** device proofs at 46's parameters
-///   with `h = 512`, twice the rows a column reveals; 45 took `h = 256`,
-///   its floors 2^10 rows. Proofs were made under it, so no later format
-///   takes it;
-/// - **35 and 45, admitted, then retired:** the segment and device formats
-///   of the chip set before the node shared it: 35's CPU ended a run at the
-///   Poseidon2 call, and both divided for a logical right shift and held
-///   seven columns a constraint pins to zero. 41 and 46 take their
-///   parameters over the current form. Proofs were made under them, so no
-///   later format takes them.
-///
-/// So a number names one AIR and one set of parameters.
-pub const RETIRED: [u32; 16] = [
-    24, 25, 26, 27, 29, 30, 31, 33, 34, 35, 36, 37, 40, 42, 43, 45,
-];
-
 /// The entry for `number`, admitted or not.
 pub fn lookup(number: u32) -> Option<&'static Format> {
     REGISTRY.iter().find(|format| format.number == number)
@@ -550,9 +512,6 @@ pub fn admitted(number: u32) -> Result<&'static Format, alloc::string::String> {
         Some(format) => Err(alloc::format!(
             "proof format {number} ({:?}) is registered but not admitted",
             format.kind
-        )),
-        None if RETIRED.contains(&number) => Err(alloc::format!(
-            "proof format {number} is retired: no format takes it again"
         )),
         None => Err(alloc::format!("proof format {number} is not registered")),
     }

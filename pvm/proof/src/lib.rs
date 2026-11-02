@@ -562,7 +562,7 @@ pub(crate) fn active_components_verifier(
 
 pub use format::Format;
 pub use pcs::{Commitment, StarkProofAny};
-pub use proof::{PROOF_FORMAT_VERSION, Proof, SegmentState};
+pub use proof::{Proof, SegmentState};
 #[doc(hidden)]
 #[cfg(feature = "prover")]
 pub use prove::prove_with_boundary_override;

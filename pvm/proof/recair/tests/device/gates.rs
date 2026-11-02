@@ -757,18 +757,14 @@ fn the_io_hash_is_the_one_public_sum() {
     );
 }
 
-/// Masked acceptance at the device candidates' parameters
-/// (`device-params.md`): blowup 4 with 43 queries (`h = 512`, every chip at
-/// `2^11` rows at least) and blowup 2 with 86 (`h = 1,024`, `2^12`), and the
-/// device format's, blowup 4 with 47 (`h = 256`, `2^10`), on Blake2s; R1 in
-/// one attempt, within the `4·2 + 3q` rows a column reveals, two witnesses
-/// under one program.
+/// Masked acceptance at the device format's parameters, blowup 4 with 47
+/// queries (`h = 256`, every chip at `2^10` rows at least), on Blake2s; R1
+/// in one attempt, within the `4·2 + 3q` rows a column reveals, two
+/// witnesses under one program.
 #[cfg(feature = "heavy-gates")]
 #[test]
 fn heavy_device_proofs_verify_at_the_device_parameters() {
-    for (log_blowup, queries, log_mask_rows, floor) in
-        [(2, 43, 9, 11), (1, 86, 10, 12), (2, 47, 8, 10)]
-    {
+    for (log_blowup, queries, log_mask_rows, floor) in [(2, 47, 8, 10)] {
         let format = Format {
             params: vos_pvm_proof::format::FormatParams {
                 log_blowup,

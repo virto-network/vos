@@ -35,12 +35,12 @@ fn challenges(
 }
 
 /// Two boundary states apart only by p in one 32-bit word of a register
-/// draw different challenges. The retired encoding, `reduce(lo32),
-/// reduce(hi32)`, absorbed them alike.
+/// draw different challenges, where reducing each word mod p,
+/// `reduce(lo32), reduce(hi32)`, would absorb them alike.
 #[test]
 fn boundary_states_apart_by_p_in_a_word_draw_different_challenges() {
     let p = u64::from(P);
-    let retired = |value: u64| {
+    let reduced = |value: u64| {
         [
             BaseField::reduce(value & 0xffff_ffff),
             BaseField::reduce(value >> 32),
@@ -48,7 +48,7 @@ fn boundary_states_apart_by_p_in_a_word_draw_different_challenges() {
     };
     let end = state(0);
     for (low, high) in [(5, 5 + p), (5 << 32, (5 + p) << 32)] {
-        assert_eq!(retired(low), retired(high), "the retired encoding collides");
+        assert_eq!(reduced(low), reduced(high), "the reduction collides");
         assert_ne!(
             challenges(&state(low), &end),
             challenges(&state(high), &end)

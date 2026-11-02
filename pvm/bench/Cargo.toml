@@ -16,7 +16,7 @@ vos-pvm-poseidon2 = { workspace = true }
 blake2 = "0.10"
 lz4_flex = "0.11"
 libc = "0.2"
-# Format 35's proof bytes, for the proof's size.
+# The segment proof's bytes, for the proof's size.
 postcard = { version = "1", features = ["alloc"] }
 
 [features]

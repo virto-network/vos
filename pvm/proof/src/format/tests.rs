@@ -177,9 +177,8 @@ fn the_verifier_takes_the_batching_from_the_format() {
 }
 
 /// Every number names one entry; only 28, 39, 41, 44 and 46 are
-/// admitted, and a segment verifier takes 41 alone; the retired numbers
-/// are refused as retired and name no entry; every other number is
-/// refused.
+/// admitted, and a segment verifier takes 41 alone; every other number,
+/// one an earlier format took among them, is refused as unregistered.
 #[test]
 fn the_registry_numbers_round_trip() {
     for format in REGISTRY {
@@ -199,19 +198,16 @@ fn the_registry_numbers_round_trip() {
             admitted_segment(format.number).is_ok(),
             format.number == SEGMENT.number
         );
-        assert!(!RETIRED.contains(&format.number), "{}", format.number);
     }
     assert!(REGISTRY.windows(2).all(|w| w[0].number < w[1].number));
-    for number in RETIRED {
+    for number in (0..64).chain([u32::MAX]) {
+        if REGISTRY.iter().any(|format| format.number == number) {
+            continue;
+        }
         assert!(lookup(number).is_none());
         let error = admitted(number).unwrap_err();
-        assert!(error.contains("retired"), "{error}");
+        assert!(error.contains("not registered"), "{error}");
     }
-    for number in (0..24).chain([38, 47, u32::MAX]) {
-        assert!(lookup(number).is_none());
-        assert!(admitted(number).is_err());
-    }
-    assert_eq!(SEGMENT.number, crate::proof::PROOF_FORMAT_VERSION);
 }
 
 /// A proof below either floor is refused: fewer queries than the
