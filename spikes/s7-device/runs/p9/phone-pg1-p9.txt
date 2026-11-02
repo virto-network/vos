@@ -1,0 +1,214 @@
+== round 1 23:21:38
+  level: 100
+  temperature: 270
+walt
+{"kind":"device","arch":"aarch64","os":"android","threads":8,"cpus_allowed":"0-7","cpu_max_khz":[1804800,1804800,1804800,1804800,2400000,2400000,2400000,2496000],"build":"timing","format":44}
+  auth rep 1/20: 130.1 ms
+  auth rep 2/20: 124.2 ms
+  auth rep 3/20: 125.1 ms
+  auth rep 4/20: 125.2 ms
+  auth rep 5/20: 127.2 ms
+  auth rep 6/20: 100.5 ms
+  auth rep 7/20: 123.7 ms
+  auth rep 8/20: 122.5 ms
+  auth rep 9/20: 125.7 ms
+  auth rep 10/20: 124.8 ms
+  auth rep 11/20: 130.1 ms
+  auth rep 12/20: 128.5 ms
+  auth rep 13/20: 127.1 ms
+  auth rep 14/20: 128.0 ms
+  auth rep 15/20: 126.2 ms
+  auth rep 16/20: 126.8 ms
+  auth rep 17/20: 127.0 ms
+  auth rep 18/20: 130.7 ms
+  auth rep 19/20: 127.6 ms
+  auth rep 20/20: 121.0 ms
+{"kind":"cell","cell":"auth","format":44,"threads":4,"reps":20,"prove_ms_p50":126.8,"prove_ms_p95":130.7,"prove_ms_min":100.5,"prove_ms_max":130.7,"prove_ms_runs":[130.1,124.2,125.1,125.2,127.2,100.5,123.7,122.5,125.7,124.8,130.1,128.5,127.1,128.0,126.2,126.8,127.0,130.7,127.6,121.0],"verify_ms":28.39,"proof_bytes":219724,"distinct_proofs":20,"proof_sha256":"89af7b00287f86a2f1abf6ebd7666a8bfc1141b6e5fd3f36258727a503eec15b","matches_x86":null,"verified":true,"peak_rss_mib":115.2}
+  owner rep 1/20: 127.6 ms
+  owner rep 2/20: 126.8 ms
+  owner rep 3/20: 124.5 ms
+  owner rep 4/20: 119.6 ms
+  owner rep 5/20: 139.8 ms
+  owner rep 6/20: 118.9 ms
+  owner rep 7/20: 128.0 ms
+  owner rep 8/20: 126.7 ms
+  owner rep 9/20: 122.6 ms
+  owner rep 10/20: 127.5 ms
+  owner rep 11/20: 140.8 ms
+  owner rep 12/20: 128.7 ms
+  owner rep 13/20: 127.8 ms
+  owner rep 14/20: 125.6 ms
+  owner rep 15/20: 126.9 ms
+  owner rep 16/20: 127.0 ms
+  owner rep 17/20: 124.6 ms
+  owner rep 18/20: 124.1 ms
+  owner rep 19/20: 127.4 ms
+  owner rep 20/20: 127.8 ms
+{"kind":"cell","cell":"owner","format":44,"threads":4,"reps":20,"prove_ms_p50":127.0,"prove_ms_p95":140.8,"prove_ms_min":118.9,"prove_ms_max":140.8,"prove_ms_runs":[127.6,126.8,124.5,119.6,139.8,118.9,128.0,126.7,122.6,127.5,140.8,128.7,127.8,125.6,126.9,127.0,124.6,124.1,127.4,127.8],"verify_ms":27.78,"proof_bytes":216089,"distinct_proofs":20,"proof_sha256":"a5fc3a71a96e0967d20920725a9a4cd9c8e71ed22d1cdd3e2e7662da19f1e839","matches_x86":null,"verified":true,"peak_rss_mib":114.0}
+  joint rep 1/20: 129.4 ms
+  joint rep 2/20: 127.9 ms
+  joint rep 3/20: 135.3 ms
+  joint rep 4/20: 134.4 ms
+  joint rep 5/20: 123.4 ms
+  joint rep 6/20: 127.1 ms
+  joint rep 7/20: 127.2 ms
+  joint rep 8/20: 128.7 ms
+  joint rep 9/20: 127.1 ms
+  joint rep 10/20: 135.6 ms
+  joint rep 11/20: 128.7 ms
+  joint rep 12/20: 124.5 ms
+  joint rep 13/20: 126.8 ms
+  joint rep 14/20: 124.6 ms
+  joint rep 15/20: 130.8 ms
+  joint rep 16/20: 123.7 ms
+  joint rep 17/20: 147.2 ms
+  joint rep 18/20: 130.9 ms
+  joint rep 19/20: 126.7 ms
+  joint rep 20/20: 126.2 ms
+{"kind":"cell","cell":"joint","format":44,"threads":4,"reps":20,"prove_ms_p50":127.9,"prove_ms_p95":147.2,"prove_ms_min":123.4,"prove_ms_max":147.2,"prove_ms_runs":[129.4,127.9,135.3,134.4,123.4,127.1,127.2,128.7,127.1,135.6,128.7,124.5,126.8,124.6,130.8,123.7,147.2,130.9,126.7,126.2],"verify_ms":27.47,"proof_bytes":212656,"distinct_proofs":20,"proof_sha256":"360b516d7c0e3551f88b263759b5c64523cd5cc0f0b721d9aa8bc4563bd6d4e0","matches_x86":null,"verified":true,"peak_rss_mib":116.4}
+{"kind":"grind","channel":"blake2s-m31","bits":20,"n":50,"threads":8,"mean_ms":19.12,"p50_ms":13.76,"p95_ms":50.23,"max_ms":72.54}
+{"kind":"grind","channel":"blake2s-m31","bits":16,"n":50,"threads":8,"mean_ms":3.53,"p50_ms":2.87,"p95_ms":6.79,"max_ms":10.93}
+{"kind":"done"}
+== round 2 23:22:50
+  level: 100
+  temperature: 270
+walt
+{"kind":"device","arch":"aarch64","os":"android","threads":8,"cpus_allowed":"0-7","cpu_max_khz":[1804800,1804800,1804800,1804800,2400000,2400000,2400000,2496000],"build":"timing","format":44}
+  auth rep 1/20: 132.1 ms
+  auth rep 2/20: 125.7 ms
+  auth rep 3/20: 126.1 ms
+  auth rep 4/20: 128.1 ms
+  auth rep 5/20: 129.6 ms
+  auth rep 6/20: 121.7 ms
+  auth rep 7/20: 125.4 ms
+  auth rep 8/20: 123.9 ms
+  auth rep 9/20: 126.4 ms
+  auth rep 10/20: 122.2 ms
+  auth rep 11/20: 137.8 ms
+  auth rep 12/20: 128.8 ms
+  auth rep 13/20: 126.2 ms
+  auth rep 14/20: 128.2 ms
+  auth rep 15/20: 127.5 ms
+  auth rep 16/20: 128.8 ms
+  auth rep 17/20: 132.6 ms
+  auth rep 18/20: 124.3 ms
+  auth rep 19/20: 122.1 ms
+  auth rep 20/20: 127.6 ms
+{"kind":"cell","cell":"auth","format":44,"threads":4,"reps":20,"prove_ms_p50":127.5,"prove_ms_p95":137.8,"prove_ms_min":121.7,"prove_ms_max":137.8,"prove_ms_runs":[132.1,125.7,126.1,128.1,129.6,121.7,125.4,123.9,126.4,122.2,137.8,128.8,126.2,128.2,127.5,128.8,132.6,124.3,122.1,127.6],"verify_ms":28.01,"proof_bytes":214240,"distinct_proofs":20,"proof_sha256":"cf2ef85dd9fbd1c9843dafa4203598dea2775985f0a36dcdeeb01b4909287a54","matches_x86":null,"verified":true,"peak_rss_mib":114.4}
+  owner rep 1/20: 126.7 ms
+  owner rep 2/20: 126.7 ms
+  owner rep 3/20: 130.0 ms
+  owner rep 4/20: 127.2 ms
+  owner rep 5/20: 135.6 ms
+  owner rep 6/20: 124.8 ms
+  owner rep 7/20: 126.9 ms
+  owner rep 8/20: 126.0 ms
+  owner rep 9/20: 131.7 ms
+  owner rep 10/20: 128.9 ms
+  owner rep 11/20: 141.0 ms
+  owner rep 12/20: 125.8 ms
+  owner rep 13/20: 126.5 ms
+  owner rep 14/20: 130.8 ms
+  owner rep 15/20: 128.4 ms
+  owner rep 16/20: 128.9 ms
+  owner rep 17/20: 131.5 ms
+  owner rep 18/20: 128.4 ms
+  owner rep 19/20: 128.5 ms
+  owner rep 20/20: 128.4 ms
+{"kind":"cell","cell":"owner","format":44,"threads":4,"reps":20,"prove_ms_p50":128.4,"prove_ms_p95":141.0,"prove_ms_min":124.8,"prove_ms_max":141.0,"prove_ms_runs":[126.7,126.7,130.0,127.2,135.6,124.8,126.9,126.0,131.7,128.9,141.0,125.8,126.5,130.8,128.4,128.9,131.5,128.4,128.5,128.4],"verify_ms":27.76,"proof_bytes":214861,"distinct_proofs":20,"proof_sha256":"ca8aa5a16b91c0c7e41d0b93131710fed0c8a313267b834735d9e46258451c05","matches_x86":null,"verified":true,"peak_rss_mib":117.2}
+  joint rep 1/20: 130.9 ms
+  joint rep 2/20: 129.5 ms
+  joint rep 3/20: 126.9 ms
+  joint rep 4/20: 135.5 ms
+  joint rep 5/20: 124.1 ms
+  joint rep 6/20: 128.0 ms
+  joint rep 7/20: 127.3 ms
+  joint rep 8/20: 127.5 ms
+  joint rep 9/20: 130.3 ms
+  joint rep 10/20: 134.1 ms
+  joint rep 11/20: 130.1 ms
+  joint rep 12/20: 122.2 ms
+  joint rep 13/20: 128.5 ms
+  joint rep 14/20: 127.1 ms
+  joint rep 15/20: 123.8 ms
+  joint rep 16/20: 123.6 ms
+  joint rep 17/20: 146.1 ms
+  joint rep 18/20: 122.7 ms
+  joint rep 19/20: 126.5 ms
+  joint rep 20/20: 128.1 ms
+{"kind":"cell","cell":"joint","format":44,"threads":4,"reps":20,"prove_ms_p50":128.0,"prove_ms_p95":146.1,"prove_ms_min":122.2,"prove_ms_max":146.1,"prove_ms_runs":[130.9,129.5,126.9,135.5,124.1,128.0,127.3,127.5,130.3,134.1,130.1,122.2,128.5,127.1,123.8,123.6,146.1,122.7,126.5,128.1],"verify_ms":27.79,"proof_bytes":219356,"distinct_proofs":20,"proof_sha256":"4bcc92ebad5240c2eea12d822b335cdfb072fc8eb4d72a699a8eac57a6e23075","matches_x86":null,"verified":true,"peak_rss_mib":116.9}
+{"kind":"grind","channel":"blake2s-m31","bits":20,"n":50,"threads":8,"mean_ms":18.94,"p50_ms":13.57,"p95_ms":50.56,"max_ms":69.76}
+{"kind":"grind","channel":"blake2s-m31","bits":16,"n":50,"threads":8,"mean_ms":3.70,"p50_ms":2.96,"p95_ms":8.52,"max_ms":12.80}
+{"kind":"done"}
+== round 3 23:24:03
+  level: 100
+  temperature: 270
+walt
+{"kind":"device","arch":"aarch64","os":"android","threads":8,"cpus_allowed":"0-7","cpu_max_khz":[1804800,1804800,1804800,1804800,2400000,2400000,2400000,2496000],"build":"timing","format":44}
+  auth rep 1/20: 128.3 ms
+  auth rep 2/20: 130.3 ms
+  auth rep 3/20: 128.6 ms
+  auth rep 4/20: 129.6 ms
+  auth rep 5/20: 137.4 ms
+  auth rep 6/20: 122.9 ms
+  auth rep 7/20: 123.8 ms
+  auth rep 8/20: 126.4 ms
+  auth rep 9/20: 127.6 ms
+  auth rep 10/20: 130.8 ms
+  auth rep 11/20: 141.3 ms
+  auth rep 12/20: 128.3 ms
+  auth rep 13/20: 133.2 ms
+  auth rep 14/20: 127.2 ms
+  auth rep 15/20: 130.1 ms
+  auth rep 16/20: 123.9 ms
+  auth rep 17/20: 134.8 ms
+  auth rep 18/20: 126.7 ms
+  auth rep 19/20: 123.9 ms
+  auth rep 20/20: 124.1 ms
+{"kind":"cell","cell":"auth","format":44,"threads":4,"reps":20,"prove_ms_p50":128.3,"prove_ms_p95":141.3,"prove_ms_min":122.9,"prove_ms_max":141.3,"prove_ms_runs":[128.3,130.3,128.6,129.6,137.4,122.9,123.8,126.4,127.6,130.8,141.3,128.3,133.2,127.2,130.1,123.9,134.8,126.7,123.9,124.1],"verify_ms":27.08,"proof_bytes":224724,"distinct_proofs":20,"proof_sha256":"4a51f63bcc535509e772e39c6cd3953e588025353b24a4e9583cf553f3ac52f8","matches_x86":null,"verified":true,"peak_rss_mib":113.5}
+  owner rep 1/20: 128.9 ms
+  owner rep 2/20: 121.8 ms
+  owner rep 3/20: 120.0 ms
+  owner rep 4/20: 126.1 ms
+  owner rep 5/20: 139.3 ms
+  owner rep 6/20: 123.1 ms
+  owner rep 7/20: 124.6 ms
+  owner rep 8/20: 131.2 ms
+  owner rep 9/20: 128.0 ms
+  owner rep 10/20: 124.8 ms
+  owner rep 11/20: 133.3 ms
+  owner rep 12/20: 130.2 ms
+  owner rep 13/20: 123.0 ms
+  owner rep 14/20: 123.3 ms
+  owner rep 15/20: 122.6 ms
+  owner rep 16/20: 126.1 ms
+  owner rep 17/20: 123.0 ms
+  owner rep 18/20: 147.3 ms
+  owner rep 19/20: 124.4 ms
+  owner rep 20/20: 133.5 ms
+{"kind":"cell","cell":"owner","format":44,"threads":4,"reps":20,"prove_ms_p50":126.1,"prove_ms_p95":147.3,"prove_ms_min":120.0,"prove_ms_max":147.3,"prove_ms_runs":[128.9,121.8,120.0,126.1,139.3,123.1,124.6,131.2,128.0,124.8,133.3,130.2,123.0,123.3,122.6,126.1,123.0,147.3,124.4,133.5],"verify_ms":27.14,"proof_bytes":215332,"distinct_proofs":20,"proof_sha256":"ebf20b125f4ab68e8843658567d7ab94164e8a947600013900128e83b5bd99ec","matches_x86":null,"verified":true,"peak_rss_mib":113.7}
+  joint rep 1/20: 129.6 ms
+  joint rep 2/20: 126.0 ms
+  joint rep 3/20: 130.2 ms
+  joint rep 4/20: 134.5 ms
+  joint rep 5/20: 127.9 ms
+  joint rep 6/20: 129.8 ms
+  joint rep 7/20: 126.3 ms
+  joint rep 8/20: 126.4 ms
+  joint rep 9/20: 126.2 ms
+  joint rep 10/20: 125.9 ms
+  joint rep 11/20: 130.1 ms
+  joint rep 12/20: 121.9 ms
+  joint rep 13/20: 127.3 ms
+  joint rep 14/20: 129.3 ms
+  joint rep 15/20: 125.5 ms
+  joint rep 16/20: 127.7 ms
+  joint rep 17/20: 143.6 ms
+  joint rep 18/20: 132.9 ms
+  joint rep 19/20: 126.1 ms
+  joint rep 20/20: 129.2 ms
+{"kind":"cell","cell":"joint","format":44,"threads":4,"reps":20,"prove_ms_p50":127.9,"prove_ms_p95":143.6,"prove_ms_min":121.9,"prove_ms_max":143.6,"prove_ms_runs":[129.6,126.0,130.2,134.5,127.9,129.8,126.3,126.4,126.2,125.9,130.1,121.9,127.3,129.3,125.5,127.7,143.6,132.9,126.1,129.2],"verify_ms":27.72,"proof_bytes":219872,"distinct_proofs":20,"proof_sha256":"18bee6cee75fae1bcbd08893d5cb6bb1363429e401dd4fda4795f3d2d201272d","matches_x86":null,"verified":true,"peak_rss_mib":117.5}
+{"kind":"grind","channel":"blake2s-m31","bits":20,"n":50,"threads":8,"mean_ms":18.65,"p50_ms":13.17,"p95_ms":50.59,"max_ms":67.04}
+{"kind":"grind","channel":"blake2s-m31","bits":16,"n":50,"threads":8,"mean_ms":3.84,"p50_ms":3.11,"p95_ms":9.07,"max_ms":10.95}
+{"kind":"done"}
+exit=0
