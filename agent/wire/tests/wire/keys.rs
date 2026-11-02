@@ -129,19 +129,19 @@ fn keys_keep_their_bytes() {
     assert_eq!(keys::closed_prefix(), [0x00, 0x1e]);
     assert_eq!(keys::closed_entry(&keys::closed(sequence)), Some(sequence));
     assert_eq!(keys::closed_entry(&keys::cut(sequence)), None);
-    assert_eq!(keys::cut_mark(), [0x00, 0x20]);
-    assert_eq!(keys::reading(), [0x00, 0x24]);
-    assert_eq!(keys::every_window(), [0x00, 0x25]);
-    assert_eq!(keys::quarantined(&[7, 8]), [0x00, 0x26, 7, 8]);
-    assert_eq!(keys::quarantined_prefix(), [0x00, 0x26]);
-    assert_eq!(keys::close_mark(), [0x00, 0x21]);
+    assert_eq!(keys::cut_mark(), [0x00, 0x1f]);
+    assert_eq!(keys::reading(), [0x00, 0x23]);
+    assert_eq!(keys::every_window(), [0x00, 0x24]);
+    assert_eq!(keys::quarantined(&[7, 8]), [0x00, 0x25, 7, 8]);
+    assert_eq!(keys::quarantined_prefix(), [0x00, 0x25]);
+    assert_eq!(keys::close_mark(), [0x00, 0x20]);
     assert_eq!(
         keys::reports(AgentId(0x0102_0304)),
-        [0x00, 0x22, 0x01, 0x02, 0x03, 0x04]
+        [0x00, 0x21, 0x01, 0x02, 0x03, 0x04]
     );
     assert_eq!(
         keys::proven(sequence, &[0xab; 32]),
-        cat(&[&[0x00, 0x23], &at, &[0xab; 32]])
+        cat(&[&[0x00, 0x22], &at, &[0xab; 32]])
     );
     assert_eq!(keys::closing(sequence), cat(&[&[0x02, 0x07], &at]));
     assert_eq!(keys::closings(), [0x02, 0x07]);

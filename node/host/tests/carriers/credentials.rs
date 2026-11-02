@@ -439,7 +439,7 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
     assert!(matches!(answer, Ok(Answer::Expiry { .. })), "{answer:?}");
     answers.push(answer.unwrap());
     let unregistered = CredentialProof {
-        format: 42,
+        format: 38,
         ..whole.clone()
     };
     answers.push(refused(

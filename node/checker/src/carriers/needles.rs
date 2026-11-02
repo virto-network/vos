@@ -63,9 +63,9 @@ pub const SMALL_FLOOR: u64 = 1 << 20;
 /// The domains `vos-wire` and its venues hash under, each a prefix of the
 /// hashed bytes: a private value hashed under any of them is a needle too.
 const DOMAINS: [&[u8]; 11] = [
-    b"vos/call/1",
-    b"vos/query/1",
-    b"vos/workflow/1",
+    b"vos/call/v1",
+    b"vos/query/v1",
+    b"vos/workflow/v1",
     b"vos/space/id",
     b"vos/space/v1",
     b"vos/anchor/v1",

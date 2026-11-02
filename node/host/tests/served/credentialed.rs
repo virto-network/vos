@@ -458,7 +458,7 @@ fn every_ingress_refusal_comes_in_its_check_order() {
     };
     let mut call = Credentialed {
         method: founded.method(POLL, "tally"),
-        format: 42,
+        format: 38,
         proof: vec![7; 1_400 << 10],
         expires_ms: real.expires_ms + 600_000,
         public: CredentialPublic::Owner {

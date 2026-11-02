@@ -3,9 +3,12 @@
 # check-blobs` checks it (the justfile's `_blob-hashes` says which blobs).
 4b315e09a9147b06226c47b9d2b398f3ad4af31a1a514a0006d9bafad845096f  target/riscv64em-vos/release/final-verify.elf
 9889779bf69b25d869a5e1b9e3d7a1b45e66b8a363de66140ed8e112bcd7f369  target/riscv64em-vos/release/final-verify-test.elf
-f301fa1ba58c9c7715b1442dde79b07d3e7d5dab1c679e57d5cf2e96473d5a37  target/riscv64em-vos/release/statement-service.elf
+a60473356976a2322b1fc3955b45bc8c3939a05cfd221d709fd4d5b6870495f9  target/riscv64em-vos/release/statement-service.elf
+f296c0d9e9a5bb35b885f1641173f702bf03f7e0cf25d820804b6f8bd0c92b79  agent/programs/target/riscv64em-vos/release/vos-agent.elf
 7b88fe03e7dc51c7bea81bf26a16318199457e64e2b01210122655b53cca46a3  agent/programs/target/riscv64em-vos/release/vos-representative.elf
 44af1b301841a8832766ca7983cc36665b006a2feb58d6574e7b808b04c67a66  agent/programs/target/riscv64em-vos/release/vos-credentials.elf
+7ce698a05ad8f542c8c967224ef5e7aadfdb7d9d975ee3396b2f2ab691685135  pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm
+92ee320c6bf8f1c0ae85abd538ea90bb1f3500c0cd19b002d3d302c68b7d0da4  pvm/proof/final-verifier/wasm/blob/target/test-formats/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm
 52bca4cbf81504cab10b873c1ad78e553c48745308a5e234a49de43a244b6069  agent/test-actors/target/riscv64em-vos/release/accounts.elf
 b52686b72e6df59d7750f9200963f127bf60d5d162b81a96821dcfb4f3b683a2  agent/test-actors/target/riscv64em-vos/release/ample.elf
 6ba098a6b31117d81ff758f920f3609f7f7ed0ebf29041766bb3c600a46d7075  agent/test-actors/target/riscv64em-vos/release/balance.elf

@@ -8,7 +8,7 @@ use crate::Kind;
 
 /// What an operator's signature starts with, apart from a client's call,
 /// query or workflow read.
-pub const OPERATOR_DOMAIN: &[u8] = b"vos/operator/1";
+pub const OPERATOR_DOMAIN: &[u8] = b"vos/operator/v1";
 
 /// An operator kind's body: `body`, the kind's request, signed by `key`
 /// for node `node`.
@@ -104,7 +104,7 @@ mod tests {
     #[test]
     fn the_message_is_pinned() {
         let message = operated().message(Kind::Install);
-        let mut expected = b"vos/operator/1".to_vec();
+        let mut expected = b"vos/operator/v1".to_vec();
         expected.extend([1; 32]);
         expected.extend([0x05, 0x02]);
         expected.extend([3; 16]);

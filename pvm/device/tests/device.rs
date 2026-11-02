@@ -325,7 +325,7 @@ fn each_proof_verifies_against_its_call_alone() {
         );
     }
     let relabelled = vos_device::CredentialProof {
-        format: 42,
+        format: 38,
         ..auth.clone()
     };
     assert_eq!(

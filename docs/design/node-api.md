@@ -237,7 +237,7 @@ could replay, and a relay keeps nothing it can reuse.
   }
   ```
   The key signs
-  `"vos/operator/1" ‖ node ‖ kind ‖ nonce ‖ expires_ms ‖ body`: `node`
+  `"vos/operator/v1" ‖ node ‖ kind ‖ nonce ‖ expires_ms ‖ body`: `node`
   the addressed node's `NodeId` (32 bytes), `kind` 2 bytes LE,
   `expires_ms` 8 LE, `body` as SCALE (a `u32` LE length, then the bytes),
   in `vos_wire::ingress`'s `message` form (domain, then an identity, then

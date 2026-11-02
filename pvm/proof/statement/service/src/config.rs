@@ -16,7 +16,7 @@ use vos_statement::vos_anchor::codec::Reader;
 use vos_statement::{DecodeError, ProgramId};
 
 /// The block's first bytes, found once in a linked program.
-pub const MARKER: [u8; 32] = *b"vos/statement-service/config/v2\0";
+pub const MARKER: [u8; 32] = *b"vos/statement-service/config/v1\0";
 /// The most programs a deployment pins.
 pub const MAX_PINS: usize = 16;
 /// A pin's bytes: the program id.

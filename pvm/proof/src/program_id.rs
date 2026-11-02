@@ -31,7 +31,7 @@
 //! 5. the segment format its proofs are in (a u32), which names their
 //!    channel;
 //! 6. each class's preprocessed root, in the classes' order, in the format's
-//!    channel: eight words for Poseidon2-M31, 16 limbs for Blake2s;
+//!    channel: eight words for Poseidon2-M31, 16 limbs for Blake2s-M31;
 //! 7. the image root, the page tree's over the kernel's initial memory (32
 //!    bytes).
 //!
@@ -58,7 +58,7 @@ use crate::shape::{KernelShape, MAX_CLASSES};
 pub const DOMAIN: &[u8; 14] = b"vos/program-id";
 
 /// The preimage's version.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 1;
 
 /// The leaf-circuit hashes an id's preimage holds: one a class.
 pub const MAX_LEAF_CIRCUITS: usize = MAX_CLASSES;
@@ -281,9 +281,7 @@ impl KernelProgram {
         for root in &self.preprocessed_roots {
             match root {
                 Commitment::Poseidon2M31(hash) => words.extend(hash.0),
-                Commitment::Blake2s(_) | Commitment::Blake2sM31(_) => {
-                    words.extend(byte_limbs(&root.to_bytes()))
-                }
+                Commitment::Blake2sM31(_) => words.extend(byte_limbs(&root.to_bytes())),
             }
         }
         words.extend(byte_limbs(&self.image_root));
@@ -368,7 +366,7 @@ mod tests {
             &words[..7],
             &[0x6f76, 0x2f73, 0x7270, 0x676f, 0x6172, 0x2d6d, 0x6469]
         );
-        assert_eq!(&words[7..11], &[3, 0, 3, 0]);
+        assert_eq!(&words[7..11], &[1, 0, 3, 0]);
         assert_eq!(&words[11..13], &[0x0100, 0x0302]);
         let shape = 27;
         assert_eq!(
@@ -391,8 +389,8 @@ mod tests {
         assert_eq!(
             program.id().words(),
             [
-                516780486, 207875457, 2406931, 629014697, 1148913467, 195088781, 791654061,
-                66240038
+                355615325, 1545380536, 453447273, 279479272, 1435617632, 1368078553, 1372432483,
+                1394946262
             ],
             "the golden vector"
         );
@@ -464,7 +462,7 @@ mod tests {
     #[test]
     fn a_malformed_program_is_refused() {
         let mut blake = program();
-        blake.preprocessed_roots[0] = Commitment::Blake2s(Default::default());
+        blake.preprocessed_roots[0] = Commitment::Blake2sM31(Default::default());
         assert!(blake.check().unwrap_err().contains("channel"));
         let mut short = program();
         short.preprocessed_roots.pop();

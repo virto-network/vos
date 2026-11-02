@@ -36,7 +36,7 @@ fn statements_are_judged_through_the_client() {
         "known accepted, whatever the proof"
     );
     let mut format = statement.clone();
-    format.format = 30;
+    format.format = 38;
     let sent = chain.sends().len();
     assert_eq!(
         venue.submit(&format, &fx.proof),

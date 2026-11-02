@@ -50,7 +50,7 @@ pub(super) fn g7(fx: &Fixtures) -> Vector {
         change(&mut statement);
         statement.encode()
     };
-    w.refused(changed(&|s| s.format = 30), proof.clone(), 2);
+    w.refused(changed(&|s| s.format = 38), proof.clone(), 2);
     w.refused(changed(&|s| s.program.0[0] += 1), proof.clone(), 3);
     w.refused(
         changed(&|s| s.space = SpaceId([0xb2; 32])),
@@ -94,7 +94,7 @@ pub(super) fn g7(fx: &Fixtures) -> Vector {
     w.finish(
         "G7",
         "one mutant per refusal class, each Refused { code } and DepositForfeited: 1 (the \
-         statement cut short), 2 (format 30), 3 (a program not in Programs), 4 (a space not its \
+         statement cut short), 2 (format 38), 3 (a program not in Programs), 4 (a space not its \
          roots'), 5 (a root not anchored), 0x1xx (the proof's byte flipped); 6 is G8's, its \
          deposit released. Then the statement itself against \
          activation windows: 2 while Formats[39].until_ms is now (retired), and while its \

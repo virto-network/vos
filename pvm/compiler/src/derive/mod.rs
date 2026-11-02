@@ -86,7 +86,7 @@ use kernel::kernel;
 
 /// The derivation's version: it changes whenever the bytes it derives from
 /// the same ELF may, so a derived program's hash is pinned per version.
-pub const TRANSPILER_VERSION: u32 = 3;
+pub const TRANSPILER_VERSION: u32 = 1;
 
 /// The bytes of its actor's heap arena a handler's or a kernel's program
 /// holds, [`vos_wire::abi::INVOCATION_HEAP`], the most the SDK's allocator

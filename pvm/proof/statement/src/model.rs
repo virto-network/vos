@@ -294,7 +294,7 @@ mod tests {
     #[test]
     fn a_venue_refuses_by_its_checks() {
         assert_eq!(refusal(|_| {}), 0x100 | 1, "undecodable proof bytes");
-        assert_eq!(refusal(|i| i.statement.format = 30), 2);
+        assert_eq!(refusal(|i| i.statement.format = 38), 2);
         assert_eq!(refusal(|i| i.policy.formats.clear()), 2);
         // A format the venue accepts but this build does not link.
         assert_eq!(

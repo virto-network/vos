@@ -198,7 +198,7 @@ pub const CHIPS: [Chip; SEGMENT_CHIPS] = [
         ],
         interaction: &[(Current, 516), (Previous, 4)],
         relations: 0x180002,
-        gates: 4876,
+        gates: 4874,
         constraints: 480,
     },
     // MEMORY_MERKLE
@@ -876,12 +876,12 @@ mod tests {
         );
         assert_eq!(terms.merkle[0], 40 * (954 + 78));
         assert_eq!(terms.fri, [40 * 243, 40 * 106, 0]);
-        assert_eq!(terms.oods[1], 33_851);
+        assert_eq!(terms.oods[1], 33_849);
         assert_eq!(terms.deep_once[1], 19_627);
-        assert_eq!(terms.rows(), [55_496, 99_949, 43_960]);
+        assert_eq!(terms.rows(), [55_496, 99_947, 43_960]);
         assert_eq!(
             leaf_rows(shape.chips, &shape.classes[0].log_sizes),
-            [55_496, 99_949 + FINALIZE, 43_960]
+            [55_496, 99_947 + FINALIZE, 43_960]
         );
         assert!(oversized_leaves(&shape).is_empty());
     }

@@ -149,17 +149,16 @@ enum Row {
     Request = 0x1c,
     Reported = 0x1d,
     Closed = 0x1e,
-    // 0x1f: reserved.
-    CutMark = 0x20,
-    CloseMark = 0x21,
-    Reports = 0x22,
-    Proven = 0x23,
-    Reading = 0x24,
-    EveryWindow = 0x25,
-    Quarantined = 0x26,
-    Credentials = 0x27,
-    Binding = 0x28,
-    Once = 0x29,
+    CutMark = 0x1f,
+    CloseMark = 0x20,
+    Reports = 0x21,
+    Proven = 0x22,
+    Reading = 0x23,
+    EveryWindow = 0x24,
+    Quarantined = 0x25,
+    Credentials = 0x26,
+    Binding = 0x27,
+    Once = 0x28,
 }
 
 /// The root builder's rows, each tagged after [`Owner::Tree`]: the rows of

@@ -305,8 +305,7 @@ pub enum Refusal {
 impl Refusal {
     /// The refusal's class, as every venue reports it: never 0, which
     /// reports an acceptance. A refused proof is `0x100` and the final
-    /// verifier's code (`vos_pvm_final_verifier::Error::code`). Code 7, a
-    /// statement bound to another venue, is retired and never reused.
+    /// verifier's code (`vos_pvm_final_verifier::Error::code`).
     pub fn code(&self) -> u32 {
         match self {
             Self::Statement(_) => 1,

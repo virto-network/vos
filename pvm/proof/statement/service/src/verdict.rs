@@ -74,7 +74,7 @@ impl Judged {
     }
 }
 
-/// Refine's output for an item; tag 1 is retired, never reused.
+/// Refine's output for an item.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {
     /// A registration whose genesis and signature passed.
@@ -102,27 +102,26 @@ pub enum Verdict {
     Refused { kind: Option<Kind>, code: u32 },
 }
 
-/// A verdict's tag, its first byte; 1 is retired, never reused. Not an
-/// item's [`Kind`]: a control's verdict is 5 where its item is 4, and 4 is
-/// a refusal's.
+/// A verdict's tag, its first byte: an item's [`Kind`] for the verdict
+/// of its kind, and 4 for a refusal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 enum Tag {
     Register = 0,
-    Anchor = 2,
-    Submit = 3,
+    Anchor = 1,
+    Submit = 2,
+    Control = 3,
     Refused = 4,
-    Control = 5,
 }
 
 impl Tag {
     const fn from_u8(byte: u8) -> Option<Self> {
         Some(match byte {
             0 => Self::Register,
-            2 => Self::Anchor,
-            3 => Self::Submit,
+            1 => Self::Anchor,
+            2 => Self::Submit,
+            3 => Self::Control,
             4 => Self::Refused,
-            5 => Self::Control,
             _ => return None,
         })
     }
@@ -299,8 +298,7 @@ macro_rules! codes {
 }
 
 codes! {
-/// A registration's outcome (`vos_anchor::venue::RegisterRefusal`'s); 4, 6
-/// and 7 are retired, never reused.
+/// A registration's outcome (`vos_anchor::venue::RegisterRefusal`'s).
 pub enum RegisterCode {
     Registered = 0,
     /// The item does not decode.
@@ -313,7 +311,7 @@ pub enum RegisterCode {
     /// signature does not verify.
     Founder = 3,
     /// The space is registered already, ended or not.
-    Again = 5,
+    Again = 4,
 }
 }
 
@@ -367,7 +365,7 @@ impl From<AnchorRefusal> for AnchorCode {
 }
 
 codes! {
-/// A control's outcome; 7 is retired, never reused.
+/// A control's outcome.
 pub enum ControlCode {
     Done = 0,
     Item = 1,
@@ -435,7 +433,7 @@ mod tests {
             let bytes = verdict.encode();
             assert_eq!(Verdict::decode_prefix(&bytes), Ok((verdict, bytes.len())));
         }
-        assert!(Verdict::decode_prefix(&[1]).is_err());
+        assert!(Verdict::decode_prefix(&[5]).is_err());
     }
 
     /// A code names its variant, and no variant another code.
@@ -454,7 +452,7 @@ mod tests {
         }
         assert_eq!(AnchorCode::try_from(10), Ok(AnchorCode::Equivocation));
         assert_eq!(AnchorCode::try_from(11), Err(11));
-        assert_eq!(RegisterCode::try_from(4), Err(4));
+        assert_eq!(RegisterCode::try_from(5), Err(5));
         assert_eq!(ControlCode::try_from(7), Err(7));
     }
 }

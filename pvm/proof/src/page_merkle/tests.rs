@@ -21,11 +21,11 @@ fn default_chain_is_consistent() {
 fn page_domains_are_pinned() {
     assert_eq!(
         leaf_hash(&[0u8; PAGE_SIZE]),
-        hex_to_32("fd2c1ac593371c52c7fb0dc8fce568b2edea3cc192ca663a07fed4cd714f8fa3"),
+        hex_to_32("93fec685500f53c5f8ec66fabaee18366173ff75c2df95ab62fb8277b26b6c63"),
     );
     assert_eq!(
         default_hashes()[0],
-        hex_to_32("dbc4371ac97d12de7d3e4e3ead46e41971eae7c94206e9fa4188d30349aceecc"),
+        hex_to_32("54ff60b64289b5d6bb7e00c09649ddca115abba8224d1c974fcaf7d07df5d5b4"),
     );
 }
 
@@ -410,7 +410,7 @@ fn dedup_multiplicities_balance_in_fraction_space() {
     use crate::chips::Blake2bBoundaryChip;
     use crate::harness::MachineComponent;
     use crate::lookups::{AllLookupElements, Blake2bCompressionLookupElements};
-    use stwo::core::channel::Blake2sChannel;
+    use stwo::core::channel::Blake2sM31Channel;
     use stwo::core::fields::FieldExpOps;
     use stwo::core::fields::m31::BaseField;
     use stwo::core::fields::qm31::SecureField;
@@ -436,7 +436,7 @@ fn dedup_multiplicities_balance_in_fraction_space() {
     assert!(calls.len() < raw.len(), "the fixture must actually dedup");
 
     let mut all = AllLookupElements::default();
-    let channel = &mut Blake2sChannel::default();
+    let channel = &mut Blake2sM31Channel::default();
     Blake2bBoundaryChip.draw_lookup_elements(&mut all, channel.into());
     let el: &Blake2bCompressionLookupElements = all.as_ref();
     // (h_in[64] ‖ m[128] ‖ t[8] ‖ f[1] ‖ h_out[64]) as byte limbs — the

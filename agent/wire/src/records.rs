@@ -259,7 +259,7 @@ impl Workflow {
     /// new format needs the records migrated before any replica runs it.
     /// The node reads the record too, as its [`WorkflowHead`], to answer
     /// its owner: a new format changes that reader with the agent.
-    pub const FORMAT: u8 = 5;
+    pub const FORMAT: u8 = 1;
 
     /// The batch time from which its next step finds its pages no longer
     /// kept, on a target that keeps them for a time and while it holds

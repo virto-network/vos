@@ -178,7 +178,7 @@ fn an_honest_proof_of_another_statement_is_refused() {
         );
     }
     let mut relabelled = proof.clone();
-    relabelled.format_version = 42;
+    relabelled.format_version = 38;
     assert!(matches!(verify(&statement, relabelled), Err(Error::Format)));
 
     let owner = owner_statement(34);

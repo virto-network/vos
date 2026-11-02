@@ -307,7 +307,7 @@ fn signed_messages_keep_their_bytes() {
     for len in [0usize, 1, 255, 256, 70_000] {
         let arguments: Vec<u8> = (0..len).map(|i| i as u8).collect();
         let call = [
-            b"vos/call/1".as_slice(),
+            b"vos/call/v1".as_slice(),
             &identity,
             &session.encode(),
             &4u64.encode(),
@@ -321,7 +321,7 @@ fn signed_messages_keep_their_bytes() {
             call
         );
         let query = [
-            b"vos/query/1".as_slice(),
+            b"vos/query/v1".as_slice(),
             &identity,
             &[9; 32],
             &10u64.encode(),
@@ -347,7 +347,7 @@ fn signed_messages_keep_their_bytes() {
     let call = call_message(&identity, &session, 4, instance, method, &[0xaa, 0xbb]);
     assert!(call.ends_with(&[5, 0, 0, 0, 6, 0, 0, 0, 2, 0, 0, 0, 0xaa, 0xbb]));
     let read = [
-        b"vos/workflow/1".as_slice(),
+        b"vos/workflow/v1".as_slice(),
         &identity,
         &[9; 32],
         &10u64.to_le_bytes(),

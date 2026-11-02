@@ -162,9 +162,6 @@ The scale results are in `core-model.md` §14, "The scale test".
 - **s4's VOS pin:** s4's app pins a VOS revision whose device format is
   retired, so its device sign-in is refused until the pin moves.
 
-- **Reproducible path-dependent blobs:** the default agent's ELF and the two
-  Wasm blobs hash by their checkout path, so they stay out of `blobs.lock`.
-  `trim-paths` does not fix them (out-of-root path dependencies hash by
-  absolute path and reorder `.text`); a fixed build path does.
-- **Version counters and retired indices** reset before the first release,
-  in one re-pin of program ids and fixtures.
+- **Kreivo's retired indices:** the spaces pallet's calls, events, errors
+  and statuses keep their holes (`spaces-pallet.md`) until the pallet's
+  port compacts them and regenerates the conformance vectors.

@@ -332,7 +332,7 @@ attribution). Its full design is `recursion-air.md`.
   verifies has it, so one circuit verifies a leaf or a fold, and only the
   preprocessed root, a witness, tells them apart.
   - **The kernel leaf fits.** At 40 queries over the window kernel's
-    shape, its leaf is 55,451 / 99,414 / 43,960 rows under format 41 (its
+    shape, its leaf is 55,451 / 99,412 / 43,960 rows under format 41 (its
     logical right shifts multiply, so its shape holds no DIVREM)
     [measured], 15% of `p2` spare; every test actor's kernel's classes fit
     within 57,825 / 129,629 / 46,040 [model, the derivation's bound]. A
@@ -1902,16 +1902,12 @@ alike.
     16-bit limbs, little-endian; a u32 is two; a 32-byte hash is 16.
     The Poseidon2 channel's `mix_u64` (log sizes) and the PoW nonces
     take the four limbs, never a 32-bit half reduced mod p, which would
-    fold a word ≥ p onto a smaller one. Stwo's Blake2s channel hashes the
-    eight bytes, so it is lossless already.
+    fold a word ≥ p onto a smaller one.
   - The io-hash's 16 limbs come from φ9..12's bound bytes by linear
     gates, `b0 + 256·b1`.
 - **A state digest** hashes 148 words, in order: the 13 registers (8
-  bytes each), pc (4), ts (8), the memory root (32). A segment state's
-  `memory_commitment`, the prover's blake3 of the flat memory, is left out
-  on purpose: no committed column binds it and no transcript mixes it, so
-  a digest over it would bind nothing. Memory continuity is the memory
-  root's, which the boundary chips bind.
+  bytes each), pc (4), ts (8), the memory root (32). Memory continuity
+  is the memory root's, which the boundary chips bind.
 - **A node outputs** one 8-word Poseidon2-M31 digest, the leaf sponge over
   its preimage's 52 words, in this order, each field on whole wires of
   four:

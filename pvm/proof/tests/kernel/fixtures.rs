@@ -139,7 +139,6 @@ fn generate(format: &'static Format, other: u32) -> Vec<(String, Vec<u8>)> {
         values[1][0][0] += SecureField::from_u32_unchecked(1, 0, 0, 0);
     };
     match &mut tampered.stark_proof {
-        StarkProofAny::Blake2s(stark) => sample(&mut stark.0.sampled_values.0),
         StarkProofAny::Poseidon2M31(stark) => sample(&mut stark.0.sampled_values.0),
         StarkProofAny::Blake2sM31(stark) => sample(&mut stark.0.sampled_values.0),
     }
@@ -281,7 +280,7 @@ fn the_fixtures_are_judged() {
 ///   root;
 /// - **prefix**, **mid-way:** `S` with the wraps of a part of the run;
 /// - **repeated:** `S` after the venue accepted it;
-/// - **unaccepted format:** `S` under 30, an unregistered number;
+/// - **unaccepted format:** `S` under 38, an unregistered number;
 /// - **`format::WRAP` at a production venue:** `S` under 28, with its wrap;
 /// - **wrong io-hash:** `S` with its output changed;
 /// - **another program than the pin:** the statement names another program
@@ -628,7 +627,7 @@ mod statements {
                 "unaccepted format",
                 "wrap.proof",
                 None,
-                input(&|i| i.statement.format = 30),
+                input(&|i| i.statement.format = 38),
                 |code| code == Refusal::Format.code(),
             ),
             (

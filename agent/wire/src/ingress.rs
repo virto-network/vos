@@ -13,9 +13,9 @@ use crate::ids::{AgentId, InstanceId, MethodId, Principal, Session, WorkflowId};
 use crate::peer::{CreationRecord, NodeNumber};
 use crate::result::Outcome;
 
-const CALL_DOMAIN: &[u8] = b"vos/call/1";
-const QUERY_DOMAIN: &[u8] = b"vos/query/1";
-const WORKFLOW_DOMAIN: &[u8] = b"vos/workflow/1";
+const CALL_DOMAIN: &[u8] = b"vos/call/v1";
+const QUERY_DOMAIN: &[u8] = b"vos/query/v1";
+const WORKFLOW_DOMAIN: &[u8] = b"vos/workflow/v1";
 
 /// The longest a read of a workflow waits for it to end, in milliseconds.
 pub const MAX_WORKFLOW_WAIT_MS: u64 = 30_000;

@@ -318,7 +318,7 @@ const WINDOW_TERMS: [Term; 17] = [
         "qm31: OODS (compiled, accumulation, challenge powers, point, vanishing, check)",
         1,
         false,
-        33_851,
+        33_849,
         29_420 + 5_175 + 573 + 54,
     ),
     term(
@@ -436,7 +436,7 @@ fn the_window_kernels_leaf_rows_per_term() {
         totals[1][term.component] += term.model * times;
     }
     assert_eq!(totals[0], context.rows(), "the terms cover every row");
-    assert_eq!(totals[0], [55_451, 99_414, 43_960]);
+    assert_eq!(totals[0], [55_451, 99_412, 43_960]);
     assert_eq!(
         totals[1],
         [59_242, 102_049, 46_080],

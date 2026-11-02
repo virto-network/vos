@@ -5,19 +5,17 @@
 //!   `vos_anchor::register_digest` (64), as Kreivo's `register` takes them.
 //!   On JAM the controller is an ed25519 key: the service holds no
 //!   accounts;
-//! - **`Anchor`** (2): a `vos_anchor::Anchor`, its signature over its
+//! - **`Anchor`** (1): a `vos_anchor::Anchor`, its signature over its
 //!   digest at this venue;
-//! - **`Submit`** (3): a statement's canonical encoding, at most
+//! - **`Submit`** (2): a statement's canonical encoding, at most
 //!   [`MAX_STATEMENT_BYTES`] and [`MAX_ROOTS`] roots; its final proof is
 //!   the item's first extrinsic (`fetch` kind 4), at most
 //!   `MAX_PROOF_BYTES`;
-//! - **`Control`** (4): the controller's management of its space, the
+//! - **`Control`** (3): the controller's management of its space, the
 //!   space's spaces-pallet calls 2–4 and 1 on JAM: add or remove an anchor
 //!   key, set another controller; each with the space's next nonce, so
 //!   none is replayed, and the controller's signature over
 //!   [`control_digest`].
-//!
-//! Tag 1 and op 2 are retired, never reused.
 //!
 //! JAM-NP's CE 133 bounds a work package, payloads among it, at 204,802
 //! bytes, below the 256 KiB a proof may take: the proof goes as an
@@ -47,9 +45,9 @@ pub const CONTROL_DOMAIN: &[u8] = b"vos/space/control";
 #[repr(u8)]
 pub enum Kind {
     Register = 0,
-    Anchor = 2,
-    Submit = 3,
-    Control = 4,
+    Anchor = 1,
+    Submit = 2,
+    Control = 3,
 }
 
 impl Kind {
@@ -57,9 +55,9 @@ impl Kind {
     pub const fn from_u8(byte: u8) -> Option<Self> {
         Some(match byte {
             0 => Self::Register,
-            2 => Self::Anchor,
-            3 => Self::Submit,
-            4 => Self::Control,
+            1 => Self::Anchor,
+            2 => Self::Submit,
+            3 => Self::Control,
             _ => return None,
         })
     }
@@ -102,13 +100,13 @@ pub enum Op {
     SetController([u8; 32]),
 }
 
-/// An [`Op`]'s tag, its first byte; 2 is retired, never reused.
+/// An [`Op`]'s tag, its first byte.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 enum OpTag {
     AddKey = 0,
     RemoveKey = 1,
-    SetController = 3,
+    SetController = 2,
 }
 
 impl OpTag {
@@ -116,7 +114,7 @@ impl OpTag {
         Some(match byte {
             0 => Self::AddKey,
             1 => Self::RemoveKey,
-            3 => Self::SetController,
+            2 => Self::SetController,
             _ => return None,
         })
     }
@@ -317,9 +315,9 @@ mod tests {
             more.push(0);
             assert_eq!(Item::decode(&more), Err(DecodeError::Trailing));
         }
-        assert_eq!(Item::decode(&[3, 1, 2]), Ok(Item::Submit(vec![1, 2])));
-        for retired in [1, 5] {
-            assert_eq!(Item::decode(&[retired]), Err(DecodeError::Noncanonical));
+        assert_eq!(Item::decode(&[2, 1, 2]), Ok(Item::Submit(vec![1, 2])));
+        for unknown in [4, u8::MAX] {
+            assert_eq!(Item::decode(&[unknown]), Err(DecodeError::Noncanonical));
         }
         assert_eq!(Item::decode(&[]), Err(DecodeError::Short));
     }

@@ -48,7 +48,7 @@ fn the_request_and_its_refusals_encode_as_pinned() {
         arguments: vec![0xaa, 0xbb],
         nonce: [5; 16],
         expires_ms: 9,
-        format: 42,
+        format: 38,
         public: CredentialPublic::Owner {
             owner: [6; 32],
             binding: [8; 32],
@@ -62,7 +62,7 @@ fn the_request_and_its_refusals_encode_as_pinned() {
         &[0xaa, 0xbb],
         &[5; 16],
         &9u64.to_le_bytes(),
-        &42u32.to_le_bytes(),
+        &38u32.to_le_bytes(),
         &[1],
         &[6; 32],
         &[8; 32],
@@ -265,14 +265,14 @@ fn the_binding_and_the_scope_are_their_fields_hashes() {
 /// due index names its 32 bytes, and reads back.
 #[test]
 fn the_credential_rows_are_their_own_and_read_back() {
-    assert_eq!(keys::credentials(), [0x00, 0x27]);
+    assert_eq!(keys::credentials(), [0x00, 0x26]);
     assert_eq!(
         keys::binding(&[1; 32]),
-        [&[0x00, 0x28][..], &[1; 32]].concat()
+        [&[0x00, 0x27][..], &[1; 32]].concat()
     );
     assert_eq!(
         keys::once(&[2; 32], &[3; 32]),
-        [&[0x00, 0x29][..], &[2; 32], &[3; 32]].concat()
+        [&[0x00, 0x28][..], &[2; 32], &[3; 32]].concat()
     );
     let row = keys::due(7, Due::Binding([9; 32]));
     assert_eq!(

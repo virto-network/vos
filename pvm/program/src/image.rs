@@ -19,9 +19,9 @@ pub const DEPTH: u32 = 32 - PAGE_SIZE.trailing_zeros();
 
 const BLOCK: usize = 128;
 /// The leaf's domain, zero-padded to the first block of its message.
-pub const LEAF_TAG: &[u8] = b"zkpvm/page-merkle/leaf/v1";
+pub const LEAF_TAG: &[u8] = b"vos/page-merkle/leaf/v1";
 /// The node's domain, zero-padded to the first block of its message.
-pub const NODE_TAG: &[u8] = b"zkpvm/page-merkle/node/v1";
+pub const NODE_TAG: &[u8] = b"vos/page-merkle/node/v1";
 
 /// BLAKE2b-256 of `tag` zero-padded to a block, then `payload`.
 fn tagged(tag: &[u8], payload: &[u8]) -> [u8; 32] {

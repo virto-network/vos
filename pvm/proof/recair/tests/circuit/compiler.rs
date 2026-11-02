@@ -54,7 +54,7 @@ const LOG_SIZES: [u32; chip_idx::COUNT] = [
 
 /// Each chip's fused gate rows in the re-baselined count, the full shape.
 const BASELINE: [usize; chip_idx::COUNT] = [
-    2901, 12307, 4758, 5341, 202, 4876, 709, 76, 191, 19, 26, 37, 48, 19, 126, 10, 12, 18, 11, 12,
+    2901, 12307, 4758, 5341, 202, 4874, 709, 76, 191, 19, 26, 37, 48, 19, 126, 10, 12, 18, 11, 12,
     18, 859, 353, 141, 1199, 12,
 ];
 
@@ -64,7 +64,7 @@ const PINNED: [usize; chip_idx::COUNT] = BASELINE;
 
 /// The full shape's rows: the chips' rows with what they share counted
 /// once, then the relations' `α` powers.
-const PINNED_SHAPE: (usize, usize) = (34281, 589);
+const PINNED_SHAPE: (usize, usize) = (34279, 589);
 
 fn lookup(seed: u64) -> AllLookupElements {
     let mut channel = Poseidon2M31Channel::default();
