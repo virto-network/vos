@@ -1,8 +1,9 @@
 //! Proving and verifying: each kind proved under format 44 on the
 //! Blake2s-M31 channel and verified by the final verifier against its
 //! pinned program; the pins computed from the circuits; the joint circuit
-//! proved and verified; the prover generic over the channel; the built
-//! set's shape the registry's reference.
+//! proved and verified, and a proof under other parameters refused; the
+//! prover generic over the channel; the built set's shape the registry's
+//! reference.
 
 use num_traits::Zero;
 use stwo::core::air::Component;
@@ -72,6 +73,43 @@ fn the_pinned_programs_are_the_circuits() {
     .unwrap()
     .0;
     assert!(!roots.contains(&joint));
+    // Other parameters over the same columns at the same blowup: one root,
+    // another program id, which hashes the format's number and parameters.
+    let other = other_params();
+    let at_other = credential::preprocessed_root::<Blake2sM31MerkleChannel>(
+        &other,
+        &credential::circuit(Some(CredentialKind::Auth)),
+    )
+    .unwrap()
+    .0;
+    assert_eq!(at_other, AUTH_ROOT);
+    let p = other.params;
+    let params = [
+        p.log_blowup,
+        p.n_queries as u32,
+        p.pow_bits,
+        p.fold_step,
+        p.log_last_layer,
+        p.interaction_pow_bits,
+    ];
+    assert_ne!(
+        vos_pvm_recair_air::credential::program_id(other.number, params, &LOG_SIZES, &AUTH_ROOT),
+        Some(AUTH_PROGRAM)
+    );
+}
+
+/// An unregistered format beside 44: 43 queries and PoW 20, the same
+/// columns and blowup.
+fn other_params() -> Format {
+    Format {
+        number: 47,
+        params: FormatParams {
+            n_queries: 43,
+            pow_bits: 20,
+            ..CREDENTIAL_PROOF.params
+        },
+        ..CREDENTIAL_PROOF
+    }
 }
 
 /// Auth and owner prove under format 44 and verify against their kinds'
@@ -148,9 +186,10 @@ fn the_slot_does_not_move_the_shape() {
 }
 
 /// Membership and payment together proves and verifies over its own
-/// circuit, measured and not admitted.
+/// circuit, measured and not admitted; and auth proved under other
+/// parameters is refused under 44.
 #[test]
-fn the_joint_circuit_proves_and_verifies() {
+fn the_joint_circuit_proves_and_another_formats_proof_is_refused() {
     let statement = joint(3);
     let finalized = credential::witness(&statement).unwrap();
     let root = credential::preprocessed_root::<Blake2sM31MerkleChannel>(
@@ -173,6 +212,30 @@ fn the_joint_circuit_proves_and_verifies() {
         &proof,
     )
     .unwrap();
+
+    let statement = auth(4);
+    let finalized = credential::witness(&statement).unwrap();
+    let other = other_params();
+    let (proof, _) = credential::prove_on::<Blake2sM31MerkleChannel>(
+        &other,
+        &finalized.circuit,
+        &finalized.witness,
+        MaskRng::default(),
+    )
+    .unwrap();
+    let root = stwo::core::vcs::blake2_hash::Blake2sHash(AUTH_ROOT);
+    credential::verify_on::<Blake2sM31MerkleChannel>(&other, root, &statement.words(), &proof)
+        .unwrap();
+    assert!(
+        credential::verify_on::<Blake2sM31MerkleChannel>(
+            &CREDENTIAL_PROOF,
+            root,
+            &statement.words(),
+            &proof
+        )
+        .is_err(),
+        "another format's proof is not a format-44 proof"
+    );
 }
 
 /// The prover and the verifier are generic over the channel: auth on the

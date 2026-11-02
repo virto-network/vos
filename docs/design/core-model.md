@@ -1568,7 +1568,7 @@ prototypes exist where noted.
 
 **Replication and merge**
 
-19. The vos-raft driver (S3; prototype in `spikes/s3-raft/vos-raft-eager`):
+19. The vos-raft driver (S3):
     - group commit and replicate-on-propose;
     - eager commit notification;
     - one shared executor;

@@ -1652,29 +1652,6 @@ impl Assembler {
         self.flush_instbuf(ib);
     }
 
-    /// lea r32, [base32 + index32 * (1 << scale_log2)]
-    /// scale_log2: 0=*1, 1=*2, 2=*4, 3=*8
-    #[inline(always)]
-    pub fn lea_sib_scaled_32(&mut self, dst: Reg, base: Reg, index: Reg, scale_log2: u8) {
-        debug_assert!(scale_log2 <= 3);
-        let mut ib = InstBuf::new();
-        let rex = 0x40 | (dst.hi() << 2) | (index.hi() << 1) | base.hi();
-        if rex != 0x40 {
-            ib.push(rex);
-        }
-        ib.push(0x8D);
-        let scale_bits = scale_log2 << 6;
-        if base.lo() == 5 {
-            ib.push(0x44 | (dst.lo() << 3));
-            ib.push(scale_bits | (index.lo() << 3) | base.lo());
-            ib.push(0x00);
-        } else {
-            ib.push((dst.lo() << 3) | 0x04);
-            ib.push(scale_bits | (index.lo() << 3) | base.lo());
-        }
-        self.flush_instbuf(ib);
-    }
-
     // -- Misc --
 
     /// ud2 (undefined instruction, for traps)

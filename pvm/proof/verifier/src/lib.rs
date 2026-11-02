@@ -31,8 +31,8 @@ use stwo_constraint_framework::{PREPROCESSED_TRACE_IDX, TraceLocationAllocator};
 use vos_pvm_proof::format::Format;
 use vos_pvm_proof::pcs::{PcsStack, ProofHash};
 
-// The proof type, the format registry `verify_standalone` admits a proof's
-// number from, and the number the default prover produces.
+// The proof type, and the format registry `verify_standalone` admits a
+// proof's number from.
 pub use vos_pvm_proof::Proof;
 pub use vos_pvm_proof::format;
 pub use vos_pvm_proof::program_id::{

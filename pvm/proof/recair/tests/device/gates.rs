@@ -764,30 +764,29 @@ fn the_io_hash_is_the_one_public_sum() {
 #[cfg(feature = "heavy-gates")]
 #[test]
 fn heavy_device_proofs_verify_at_the_device_parameters() {
-    for (log_blowup, queries, log_mask_rows, floor) in [(2, 47, 8, 10)] {
-        let format = Format {
-            params: vos_pvm_proof::format::FormatParams {
-                log_blowup,
-                ..small_format(ChannelKind::Blake2s, log_mask_rows, queries).params
-            },
-            ..small_format(ChannelKind::Blake2s, log_mask_rows, queries)
-        };
-        let program = program::<Blake2sMerkleChannel>(&format, &blob());
-        assert!(program.log_sizes.iter().all(|&log_size| log_size >= floor));
-        for seed in [1, 2] {
-            let (proof, stats) = prove::<Blake2sMerkleChannel>(
-                &format,
-                &program,
-                &blob(),
-                &witness(seed),
-                MaskRng::Seeded(seed),
-            )
-            .expect("proves");
-            verify_device::<Blake2sMerkleChannel>(&format, &program, &proof).expect("verifies");
-            assert_eq!(stats.attempts, 1);
-            assert!(stats.revealed_rows <= 8 + 3 * queries, "{stats:?}");
-            assert!(stats.revealed_rows <= 1 << log_mask_rows, "{stats:?}");
-        }
+    let (log_blowup, queries, log_mask_rows, floor) = (2, 47, 8, 10);
+    let format = Format {
+        params: vos_pvm_proof::format::FormatParams {
+            log_blowup,
+            ..small_format(ChannelKind::Blake2s, log_mask_rows, queries).params
+        },
+        ..small_format(ChannelKind::Blake2s, log_mask_rows, queries)
+    };
+    let program = program::<Blake2sMerkleChannel>(&format, &blob());
+    assert!(program.log_sizes.iter().all(|&log_size| log_size >= floor));
+    for seed in [1, 2] {
+        let (proof, stats) = prove::<Blake2sMerkleChannel>(
+            &format,
+            &program,
+            &blob(),
+            &witness(seed),
+            MaskRng::Seeded(seed),
+        )
+        .expect("proves");
+        verify_device::<Blake2sMerkleChannel>(&format, &program, &proof).expect("verifies");
+        assert_eq!(stats.attempts, 1);
+        assert!(stats.revealed_rows <= 8 + 3 * queries, "{stats:?}");
+        assert!(stats.revealed_rows <= 1 << log_mask_rows, "{stats:?}");
     }
 }
 

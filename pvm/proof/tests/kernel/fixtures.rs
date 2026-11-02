@@ -281,7 +281,7 @@ fn the_fixtures_are_judged() {
 ///   root;
 /// - **prefix**, **mid-way:** `S` with the wraps of a part of the run;
 /// - **repeated:** `S` after the venue accepted it;
-/// - **unaccepted format:** `S` under 30, a retired number;
+/// - **unaccepted format:** `S` under 30, an unregistered number;
 /// - **`format::WRAP` at a production venue:** `S` under 28, with its wrap;
 /// - **wrong io-hash:** `S` with its output changed;
 /// - **another program than the pin:** the statement names another program
