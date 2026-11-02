@@ -1,6 +1,6 @@
 # The light node, the personal agent, one proving path and Tor
 
-Design, draft 3 [proposed]. The architecture of slice 8
+Design, draft 4 [proposed]. The architecture of slice 8
 (`slice-8-plan.md`): a light node of VOS on the user's devices, a personal
 agent in a space that keeps the user's devices in step, one proving path
 for every device statement, payments rebuilt on cipher-clerk as the
@@ -18,24 +18,35 @@ showcase of attestable Rust, and clients reaching a space over Tor.
   documents keep their text until the steps that change the code change
   them.
 
-**Changes from draft 2:**
-- The `Relay` actor, the shared root secret `m`, `k_sync = H(m)` and
-  removal by rotation are gone. In their place: a **personal agent** per
-  user in a space the user belongs to (§3), MLS among the user's devices
-  for keys (§3.4), and per-device secrets as today (E2).
-- Sealed scopes: the space's nodes hold the user's encrypted DAG in the
-  personal agent's replicated tables and never decrypt it (§3.6).
-- Calls reach an agent through any gateway: a node forwards a request for
-  an agent it does not replicate (§3.3).
-- Rules for device changes against a thief: an admin key behind the
-  keystore's prompt, a probation for new devices, a delay with veto for
-  removing another device, a recovery key (§3.5).
-- A section of edge scenarios (§8), 73 of them, each with its mitigation
-  or stated as a known limit.
-- The plan splits: the shielded pool and the wallet (P2) move to slice 9,
-  cipher-clerk v0.4 still released in slice 8 (§9, N1, the owner's word
-  needed: E3 asked for P2 in slice 8).
-- arti's hosting status restated from new sources (§6).
+**Changes from draft 3** (its Opus review):
+- **Device changes are symmetric:** a target keeps its rights and may
+  veto; a contested removal is resolved only by two other devices or the
+  recovery kit (§3.5).
+- **Key-confirmed epochs** replace void epochs: no data is sealed under an
+  epoch until every device in it has confirmed the same keys; a `nack` or
+  a timeout voids the commit; proposals are allow-listed (§3.4).
+- **The lease is kept by activity,** with membership proven at the claim
+  only; an agent is reaped after 360 days unused, and the kit's calls
+  count (§3.3).
+- **The kit is split:** recovery envelopes at every confirmed epoch, under
+  a wrap key whose second half the agent releases only to a matured
+  restore, so a leaked kit alone reads nothing (§3.5).
+- **Sync keys work after the first unlock,** so background sync runs on a
+  locked phone; the device-clock floor is gone (§3.5).
+- **Only known keys open sessions** at a personal agent; forwarding has a
+  hop rule and its own lane (§3.3).
+- **Checkpoints are cut at the agent's positions** and trusted once two
+  other devices acknowledge them; history horizons, garbage collection
+  and live handover move to later work (§3.6, §3.9).
+- **The light node has no log:** local actors are Merge-only, so it runs
+  merge and query dispatch over its store, with no refine, accumulate or
+  carve-out of `vos-node` (§2.1).
+- **E5 restated** against the home's operators, with what they can still
+  correlate (§3.10).
+- P2 in slice 8 with a device-local wallet, off the critical path, is now
+  the recommendation (N1 (c)); MLS against a simpler scheme is asked
+  (N7).
+- The plan's large steps are split and re-estimated (`slice-8-plan.md`).
 
 ## 1. Goals and non-goals
 
@@ -69,7 +80,7 @@ devices decrypt each other's messages".
 |---|---|
 | E1 | Retire the credential AIR (format 44) in M1: one proving path; sign-in about 0.6 s until the levers bring it to about 0.45 s. |
 | E2 | Per-device secrets, as today: a member leaf, an owner digest and a wallet per device; the personal space syncs everything but secrets; paying from another device's funds is a transfer between one's own devices. |
-| E3 | Payments P1 (cipher-clerk's ledger with owner proofs, replacing `purses`) then P2 (the shielded pool and a local wallet). Draft 3 recommends P2 in slice 9 (N1). |
+| E3 | Payments P1 (cipher-clerk's ledger with owner proofs, replacing `purses`) then P2 (the shielded pool and a local wallet), both in slice 8; N1 weighs how. |
 | E4 | No relay held by a gateway: a space has several gateways, and two devices on different ones would never meet. Each user gets a **personal agent** in a space they belong to (the home space): a small log for rare operations (the device set, MLS ordering, quotas), the space's nodes as durable ciphertext replicas of the user's DAG, and an inbox with expiring entries. |
 | E5 | The personal agent is owned by a pseudonym, not by the member key. |
 | E6 | The space's nodes keep full ciphertext replicas of the user's DAG (durable, a backup), not only expiring mailboxes. |
@@ -95,8 +106,8 @@ devices decrypt each other's messages".
    recursion: the credential AIR (format 44) and its code are deleted.
 4. **Payments as the showcase.** A short, readable pair of actors on
    cipher-clerk, whose spend is one Rust function proved on the phone
-   (§5). P1, pseudonymous, in slice 8; P2, private, designed here and
-   built in slice 9 (N1).
+   (§5). P1, pseudonymous, and P2, private, both in slice 8, P2's wallet
+   on each device alone until slice 9 syncs it (N1 (c)).
 5. **Fewer pieces.** One crate in (`vos-light`), one out (`vos-device`),
    one proving path in place of two. The slice adds arti's and mls-rs's
    dependency trees, two system actors (`Homes`, `Personal`) and the CRDT
@@ -110,8 +121,8 @@ devices decrypt each other's messages".
 
 ### 1.3 Non-goals for slice 8
 
-- The shielded pool and the wallet (P2): designed in §5, built in slice 9
-  (N1). cipher-clerk v0.4 is released in slice 8.
+- A wallet synced across devices: P2's wallet stays on the device that
+  holds its notes in slice 8 (N1 (c)); slice 9 syncs it.
 - A pool shared across spaces, or one whose integrity does not trust its
   space's operators (`identity-and-authority.md` §8).
 - Messaging between members, in a space or across spaces. The personal
@@ -137,7 +148,8 @@ devices decrypt each other's messages".
 |---|---|---|
 | **PVM runtime** | the interpreter, its machine pool and inner machines; no JIT (the recompiler is x86-64 Linux only, `pvm/runtime/src/lib.rs`) | `vos-pvm` [built] |
 | **the agent program** | the default agent, `vos-agent`: local actors are installed into it as into a node's agent; it gains merge dispatch, CRDT fields' storage and scopes (none exists today in `agent/default` or `agent/sdk-macros`) | `agent/default` [built, extended] |
-| **a single-replica host** | refine and accumulate driven by a local loop over a local log; the actor ABI's host calls; no Raft, no leader, no peers | carved from `vos-node` (§7.1) |
+| **merge and query dispatch** | local actors are Merge-only (`#[msg(merge)]` handlers and `&self` queries; `core-model.md` §9.2: a merge handler runs on "any replica or device, no log"), so the light node runs the agent program's merge and query entries over its store, one fjall batch per operation; no refine, no accumulate, no work results, sessions or sweeps; no Raft, no leader, no peers | the executor's host-call layer, reused from `vos-node` without its pipeline (§7.1) |
+| **the transpiler** | turning a local actor's ELF into a PVM program, and computing the stock kernels' device programs from the code the light node ships (§4.4) | `vos-pvm-compiler` [built] |
 | **local store** | fjall, as the node's, with small caches (8–16 MiB block cache [est]) | `vos-node`'s `store` [built] |
 | **device prover** | the device profile (format 46, then 47 after the levers, §4.4), masked, `Threads::Auto` | `vos-pvm-proof` and `vos-pvm-recair`'s masked device segment, its recursion prover featured out (§7.1) |
 | **node-API client** | the multiplexed `vos-api` client over any futures-io byte stream: an arti onion stream (§6), or SSH's `vos-api` subsystem as today | `vos-api` [built] |
@@ -184,8 +196,9 @@ actors, and calls a space through its gateway.
   store, bootstraps arti from its cached directory, syncs and exits. No
   foreground service, no persistent socket, no wake lock beyond a job's.
 - **Every write is crash-safe:** Android kills a backgrounded process
-  without notice, so the light node's local log, its MLS state and its
-  push queue are each committed in one fjall batch per step (§8, D6).
+  without notice, so each local operation (with its DAG node), each
+  change of MLS state and each change of the push queue is committed in
+  one fjall batch (§8, D6).
 - **Isolation (option):** the facility in a separate Android process
   (`android:process=":vos"`, Binder between them) keeps the prover's peak
   and the secrets' unwrapped bytes out of the UI process and lets the OS
@@ -218,29 +231,29 @@ A user's **personal space** is two things:
   a full replica and works offline; nothing waits on a network.
 - **A personal agent** [decided, E4] in a space the user belongs to (the
   home space): an ordinary agent of that space, run by its nodes, with
-  one system actor, `Personal`, installed. It orders the rare operations
-  that need one order (the device set, MLS's handshakes), stores the
-  user's sealed DAG nodes durably on every replica [decided, E6], and
-  holds an inbox. It never holds a key that opens the user's data.
+  one system actor, `Personal`, installed. It orders the few operations
+  that need one order (the device set, the device group's commits),
+  stores the user's sealed DAG nodes durably on every replica [decided,
+  E6], and holds an inbox. It never holds a key that opens the user's
+  data.
 
 Devices sync with the personal agent, never with each other directly in
 slice 8; the agent is where two devices that are never online together
 meet. Any gateway of the home space reaches it (§3.3).
 
 **Local first:** a new user's personal space starts on one device with no
-personal agent at all. The agent is claimed when the user pairs a second
-device or turns on backup, and the claim waits a random interval when
-nothing forces it (§3.3), so a claim's time does not follow an
-enrollment's.
+personal agent. The agent is claimed when the user pairs a second device
+or turns on backup.
 
 **The first local actors:**
 - the credential book: the spaces the user is a member of, each device's
-  handles there, the pinned agents and methods s4's facility pins today,
-  and the trees the device keeps synced (§6.7);
+  handles there, the pinned agents and methods s4's facility pins today.
+  The member trees a device keeps for its proofs (§6.7) stay on the
+  device, outside any synced scope: a space's whole tree has no place in
+  the personal agent;
 - the device book: labels and settings of the user's devices (the device
   set's authority is the personal agent's log, §3.5; this is its
-  user-facing mirror);
-- the wallet, with P2 in slice 9 (§5.4).
+  user-facing mirror).
 
 Each actor instance is one sync scope: one merkle-crdt DAG, so a device
 syncs scopes, not the whole space (`core-model.md` §9.4's "one DAG per
@@ -257,26 +270,33 @@ travel inside it.
 - **The CRDT types the SDK gives, first:** `crdt::Set<T>` (an add-wins
   observed-remove set), `crdt::Map<K, V>` (last-writer-wins a key, its
   clock a Lamport counter and the author's id), and `crdt::GSet<T>`
-  (grow-only). Storage-backed, as `core-model.md` §9.4 requires.
+  (grow-only). Storage-backed, as `core-model.md` §9.4 requires, and
+  **stored per author:** a map keeps the latest write per (key, author)
+  and a read takes the latest among authors not filtered out
+  (`core-model.md` §9.4, rule 6), so a removed device's writes that a
+  device applied before it learned of the removal are filtered at read,
+  never unapplied (§3.5's frontier).
 - **The conflict model** is the types' own: concurrent adds both stay, a
   remove wins only over the adds it observed, a map key's later write wins
   by (counter, author). No operation needs another device's agreement.
-- **Where conflicts are real, a log decides:** the device set and the MLS
-  group are ordered by the personal agent's log (§3.4, §3.5); a payment
-  is decided by the space that holds the ledger. A CRDT never has to
-  choose between two such outcomes.
+- **Where conflicts are real, a log decides:** the device set and the
+  device group are ordered by the personal agent's log (§3.4, §3.5); a
+  payment is decided by the space that holds the ledger.
 - **Authorship:** each device signs the DAG nodes it authors with its
-  sync key (§3.5), an ed25519 key drawn at install. merkle-crdt's
-  `DagNode` has no author field (`support/merkle-crdt/src/node.rs`), so
-  the author's key, sequence number and signature travel inside the
-  payload, which is sealed (§3.6).
+  sync key (§3.5). merkle-crdt's `DagNode` has no author field
+  (`support/merkle-crdt/src/node.rs`), so the author's key, sequence
+  number and signature travel inside the payload, which is sealed (§3.6).
+- **Operations are versioned:** an operation of a kind a device does not
+  know (a newer app on another device) is kept and applied once the
+  device updates, never quarantined as garbage, so devices on different
+  app versions do not diverge.
 - **Incremental apply** [decided, `core-model.md` §9.4]: merkle-crdt's
   DAG and format are reused and its apply path rewritten to apply only
   newly fetched nodes in causal order (about 1.9 µs an operation at 1M
   operations, against 8.7 s for today's full rebuild [measured,
   `core-model.md` §9.4]).
 
-### 3.3 The personal agent: claimed, owned, reached
+### 3.3 The personal agent: claimed, reached, kept
 
 **Agents exist only by an operator's command today** [built]:
 `CreateAgent`, `Install` and `Grant` are operator kinds
@@ -285,160 +305,207 @@ travel inside it.
 agent, and no agent is ever deleted. Rather than give actors that power,
 the design uses a **pool of agents the operator makes ahead of time**:
 - **`Homes`**, a system actor installed in the agent that already holds
-  the space's credential actor (its ring and tree; an `Auth` guard reads
-  the ring of the agent it guards, `node/host/src/credentialed.rs`, so
-  `Homes` must live beside it). It keeps the pool: agent ids the operator
-  created with `Personal` installed and handed over with
-  `homes.stock(ids)`, an operator-role call.
+  the space's credential actor (an `Auth` guard reads the ring of the
+  agent it guards, `node/host/src/credentialed.rs`, so `Homes` must live
+  beside it). It keeps the pool: agent ids the operator created with
+  `Personal` installed and handed over with `homes.stock(ids)`, an
+  operator-role call.
 - **The operator's keeper** (a small tool in `tools/`, holding an
-  operator key) tops the pool up in bulk: creating an agent costs about
-  2 s, 0.15–0.17 s each sixteen at a time [measured, `core-model.md`
-  §14.1], so a pool of a few hundred hides creation from users entirely,
-  and an agent's creation time says nothing about who will own it.
-- **The claim** is a credentialed call, `homes.claim(keys)` under
+  operator key) tops the pool up in bulk: it creates agents, installs
+  `Personal`, and grants `Principal::Agent(homes)` the role under which
+  `Personal` takes `assign` and `wipe` (`Grant`; `Install` carries no
+  configuration, `agent/wire/src/ingress.rs`). Creating an agent costs
+  about 2 s, 0.15–0.17 s each sixteen at a time [measured,
+  `core-model.md` §14.1], so a pool of a few hundred hides creation from
+  users, and an agent's creation time says nothing about its owner. The
+  keeper also upgrades `Personal` in every pooled and assigned agent, in
+  bulk, when a new version ships.
+- **The claim** is a credentialed call, `homes.claim(keys, kit)` under
   `#[msg(credential = Auth("home"))]`: a member proves membership
   anonymously; the pseudonym is the nullifier of scope "home" (stable for
   that device and space, unlinkable to its `member` digest,
-  `identity-and-authority.md` §7). `Homes` assigns a pooled agent to the
-  pseudonym and sends that agent `assign(keys)` (the claiming device's
-  sync and admin keys and the recovery kit's public keys, which seed the
-  device set), a message between agents; `Personal` trusts `Principal::Agent(homes)` and nothing else
-  for it (the keeper configures `Homes`' agent id at install). It is
-  owned by a pseudonym, not the member key [decided, E5].
-- **Ownership is a lease** (prior art: a credential renewed by period,
-  so leaving needs no revocation that would link the pseudonym to the
-  member): `Homes` records `nullifier → (agent, until)`, `until` 35 days
-  on. Any device in the agent's device set renews it with a fresh
-  `Auth("home")` proof of its own. Each device has its own nullifier under
-  E2, so the lease lists the device set's pseudonyms: a device that
-  joins names its own nullifier to `Personal` (it computes it without a
-  proof), `Personal` passes it to `Homes` by a message, and the device
-  renews with proofs under it from then on. Naming another member's
-  nullifier only lets that member renew this lease, which harms no one. A member removed from the space can no longer prove, the
-  lease lapses, and the agent goes read-only for a grace period (30 days:
-  devices may still fetch and export), then `Homes` sends `wipe`, the
-  agent clears its tables and returns to the pool. **No agent is
-  deleted; an expired one is recycled.** Logs compact; the store
-  reclaims rows by compaction.
+  `identity-and-authority.md` §7). It is the agent's owner [decided, E5;
+  E5's scope is this "home" scope]. `Homes` refuses a nullifier that
+  already holds an agent, assigns a pooled agent, records it under the
+  nullifier and under `H(the recovery public key)` (`kit`; §3.5), and
+  sends the agent `assign(keys, kit)`: the claiming device's sync and
+  admin keys and the recovery kit's public keys, which seed the device
+  set. `Command::send` is one-way (`agent/sdk/src/context.rs`), so
+  `Personal` answers with a message of its own, `assigned` or `refused`,
+  and `Homes` releases a refused assignment.
+- **"home" is reserved:** the light node proves in that scope only for
+  its own claim, and the facility refuses any request naming `Homes`'
+  agent and instance, so a space's page cannot make a device publish its
+  home pseudonym in the member's context.
+- **Kept by activity, not by proofs** [proposed]: membership is proven
+  once, at the claim. After that, any call or query a device-set key
+  makes counts as activity (`Personal` records the batch time of the
+  last one; no proof, no prompt). An agent with no activity for 360 days
+  may be reaped: the keeper calls `Personal::reap`, which succeeds only
+  then, wipes every table and tells `Homes`, which returns the agent to
+  the pool. The check is lazy: nothing runs on a timer, so idle agents
+  stay idle (`node/host/src/leader/cut.rs`). A recovery key's call is
+  activity too, so a kit stays good for 360 days after the last use of
+  any device (§3.5). **No agent is deleted; an unused one is recycled.**
+  A recycled agent's tenancy number goes up, so a returning device of
+  the old tenant sees "recycled", not a rollback (§8, B13).
+- **What activity does not check:** whether the owner is still a member.
+  A member who leaves the space keeps their personal agent while they use
+  it; the operators cannot evict it without knowing whose it is, which is
+  the point of the pseudonym. Space policy bounds it by quota, and a
+  periodic re-proof (say yearly, at a sign-in the user makes anyway) is a
+  later option (§8, B14).
 - **Replicas:** three by default, the space's policy; a pooled agent's
   replica count is fixed when the keeper makes it (`replace` keeps the
   count, `admin.rs`). One replica is allowed by policy for small spaces
   and stated in the device's chrome (§8, B10).
 - **Its cost:** about 46 KiB and 1.6 µs/s a replica when idle, 130–140
   KiB an agent across three replicas [measured, `core-model.md` §14];
-  10^4 users on a three-node space is about 0.45 GiB and 1.6% of a core a
-  node [est]. An idle agent appends nothing at window boundaries
-  (`node/host/src/leader/cut.rs`). Unmeasured: 10^4 agents that wake for a
-  few commits an hour each, and their session sweeps (plan 8.12's gate).
+  10^4 users on a three-node space is about 0.45 GiB of memory and 1.6% of
+  a core a node [est]. Storage: a 64 MiB quota an agent by default (§3.6),
+  so 10^4 full agents on three replicas is up to about 1.9 TB a space, and
+  a Raft snapshot of a full agent is 64 MiB. Unmeasured, and the plan's
+  scale gate: 10^4 agents that wake for a few calls an hour, their
+  sessions, a full agent's snapshot and a `replace` (plan 8.15).
 
 **Any gateway reaches it: nodes forward** [proposed]. Today a node that
 does not replicate an agent answers `Elsewhere { replicas }`
 (`node/host/src/node/mod.rs`, `absent`) and a gateway retries only among
 the nodes in its own configuration, so a gateway that lists none of an
-agent's replicas cannot reach it. Two fixes were weighed:
-- **gateways learn placement and connect to every node:** each gateway
-  holds QUIC connections and keys for every node, and its configuration
-  grows with the space;
-- **a node forwards** a request for an agent it does not replicate to one
-  of its replicas over the peer network, and relays the answer
-  [chosen]. Every node already knows every agent's placement (the
-  directory, `node/host/src/node/directory.rs`); `PeerMessage::Forward`
-  and `ForwardCredentialed` already carry calls from a replica to its
-  leader (`agent/wire/src/peer.rs`). The new message carries the
-  **request as received**, before ingress, because only a replica holds
-  the agent's ring to verify a credentialed call; the replica that takes
-  it runs ingress as for a gateway's request. One hop more inside the
-  operator's network; gateways stay as they are, and every agent, not
-  only personal ones, becomes reachable through any gateway.
+agent's replicas cannot reach it. Two fixes were weighed: gateways that
+learn placement and keep a connection to every node (their configuration
+grows with the space), or **nodes that forward** [chosen]:
+- A node that does not replicate the agent sends the client's request
+  **as received**, before ingress, to one of the replicas, and relays
+  the answer. Only a replica holds the agent's ring to verify a
+  credentialed call, so the replica that takes it runs ingress as for a
+  gateway's request. Every node already knows every agent's placement
+  (`node/host/src/node/directory.rs`).
+- **The hop rule:** a non-replica forwards once; a replica never forwards
+  to a non-replica. A replica that is a follower uses the existing
+  `PeerMessage::Forward` and `ForwardCredentialed` to its leader
+  (`agent/wire/src/peer.rs`), as for a gateway's request. So a request
+  crosses at most two hops inside the operator's network.
+- **Its lane:** forwarded requests (a credentialed one up to 1.6 MB) go
+  on a peer stream of their own, never on the lane that carries Raft and
+  heartbeats (`peer_lanes`), so a burst cannot delay an election.
+- **What is never forwarded:** operator kinds (an `Operated` envelope
+  names its node, `node-api.md` §4). A forwarded request counts against
+  the forwarding node's budget toward that peer.
+- Gateways stay as they are, and every agent, not only personal ones,
+  becomes reachable through any gateway.
 
-**Sessions:** a device's calls to its personal agent are signed by its
-sync key, a client key like any other. A session expires after an hour
-idle (`SESSION_EXPIRY_MS`, `agent/wire/src/defaults.rs`), so a phone that
-syncs every 15 minutes in the foreground keeps one, and a background job
+**Only known keys open sessions** [proposed]. Any ed25519 key may open a
+session at any agent today, up to `MAX_SESSIONS` (65,536,
+`agent/wire/src/defaults.rs`), each a commit, and pooled agents' ids are
+sequential (`AgentId`, `agent/wire/src/peer.rs`), so over the onion,
+which hides addresses, anyone could exhaust a user's sessions or fill its
+log. An agent may set **admission by known keys:** ingress refuses a
+session-creating call from a key absent from the agent's admitted-keys
+rows, before any commit, as it reads the credential ring today.
+`Personal` sets it and admits the device set's keys, the recovery key and
+open pairing slots' keys. Gateways add a cap of calls per agent per
+circuit (§6.6).
+
+**Sessions:** a device's calls are signed by its sync key. A session
+expires after an hour idle (`SESSION_EXPIRY_MS`), so a background job
 opens one per run (a commit, then a sweep): at 10^4 users syncing four
-times an hour, about 11 session commits a second across a space [est],
-small beside the transfers a node sustains. Queries need no session.
+times an hour, about 11 session commits a second across a space [est].
+Queries need no session.
 
-### 3.4 Keys: MLS among the user's devices
+### 3.4 Keys: MLS among the user's devices, with confirmed epochs
 
 **The device group** [decided, E7]: one MLS group (RFC 9420) per user,
 its members the user's devices, each a leaf whose credential is the
 device's sync key and admin key (§3.5). mls-rs runs on the light node's
 host side, natively; the node never runs MLS, parses it or holds its
-keys. Encrypted handshakes (MLS `PrivateMessage`) and padding.
+keys. Encrypted handshakes (MLS `PrivateMessage`) and padding. §9.1 N7
+weighs MLS against a simpler scheme for this group.
 
-**The personal agent is the group's delivery service** (RFC 9750 §5.2.1's
-"strongly consistent" kind; its prior art in the `messaging` branch's
-`msg-ctl`, whose rule carries over):
-- Handshakes are calls to `Personal::commit(epoch, effect, handshake,
-  welcome)`, made under an active or probation device's sync key. `epoch` is the number the commit
-  starts; the agent accepts it only if it is the current epoch plus one,
-  refusing `EpochTaken` (another commit won) or `EpochGap`, so one commit
-  per epoch, first come first served, the loser rereading and
-  re-proposing.
-- The agent cannot read a commit and does not validate it. A commit call
-  declares its effect in clear (`none`, `add(d)` or `remove(d)`); the
-  agent enforces what it can see: who may post (§3.5's states), the epoch
-  rule, and that a declared add or remove names a device-set operation
-  that has matured in its log (§3.5). **Devices enforce the rest:** a
-  device applies a commit only if it is valid MLS and its membership
-  change equals its declared effect and that matured operation.
-- **A commit no device can apply is a void epoch:** its number is taken,
-  and its keys are the previous epoch's (`k(scope, n) = k(scope, n − 1)`).
-  MLS processing is deterministic, so every device in the same state
-  reaches the same verdict; a device posting garbage (a bug, or a thief
-  with the sync key) cannot stall the group, only waste an epoch, and the
-  chrome names it. A device whose verdict differs from others' is in a
-  fork (§8, B4).
-- **Never ahead of the log:** a device merges its own pending commit only
-  once the agent accepted it at that epoch (mls-rs's pending-commit
-  API, applied on confirmation), the first cause of forks in deployed MLS
-  (§8, A9).
-- **Retention:** the agent keeps handshakes for 180 days and the newest
-  group info; a device offline longer re-pairs (§8, A5). Retention also
-  bounds what a "harvest now, decrypt later" adversary can take from a log
-  kept by operators, if they honour it (§8, F1).
+**The personal agent orders the group's commits** (RFC 9750 §5.2.1's
+"strongly consistent" delivery service; the rule is the `messaging`
+branch's `msg-ctl`'s):
+- A commit is a call, `Personal::commit(epoch, effect, handshake,
+  welcome)`, under a device's sync key. The agent accepts it as the
+  **candidate** for `epoch` only if `epoch` is the confirmed epoch plus one
+  and no candidate is pending, refusing `EpochTaken` or `EpochGap`; the
+  loser rereads and re-proposes.
+- **Allowed proposals:** Add, Remove and Update, nothing else; no ReInit,
+  no external commit or external join, no PSK, no group-context change.
+  A commit's effect is declared in clear (`update`, `add(d)`,
+  `remove(d)`); an `add` or `remove` must name a device-set operation
+  that has matured, admin-signed (§3.5), which the agent checks.
+- **Never ahead of the log:** a device processes a candidate but keeps its
+  prior state until the epoch is confirmed (mls-rs's pending commit,
+  applied on confirmation), the first cause of forks in deployed MLS (§8,
+  A9).
 
-**Epochs are named by the log:** epoch `n` is the state after the `n`th
-accepted commit, void ones included (a device maps the agent's numbers to
-MLS's own epoch counter, which a void commit does not advance). Every device that follows the log reaches the same `n`
-for the same commits; an operator that shows two devices different
-commits for one `n` gives them different keys, which every sealed
-envelope then exposes (§3.6).
+**Key-confirmed epochs** [proposed]: an epoch's keys are used only once
+every device in it has shown it holds the same keys.
+- After a candidate, every device in the new epoch (the old set, minus a
+  removed device, plus an added one) posts, signed end to end by its sync
+  key, either `confirm(epoch, h)`, `h = BLAKE2b-256("vos/personal/confirm"
+  ‖ agent ‖ epoch ‖ epoch_authenticator)`, or `nack(epoch)` if it cannot
+  process the commit.
+- **Confirmed:** every device in it has posted `confirm` with the same
+  `h`. Each device checks the others' signed confirmations itself; the
+  agent's verdict is advisory.
+- **Void:** any `nack`, two different `h`, or 72 h without every
+  confirmation. Every device drops the candidate and stays on the prior
+  epoch; the agent flags the committer in the device set; the epoch
+  number is free again.
+- **Data is sealed only under a confirmed epoch.** So a commit that is
+  valid for some devices and not for others (a committer encrypting good
+  path secrets to one subtree and garbage to another) is voided by the
+  others' `nack`, and nothing is ever sealed to one side alone. An
+  operator showing two devices two different commits gets two different
+  `h`, signed by devices it cannot impersonate, and the epoch is void.
+- **The cost:** one signed call a device per epoch; epochs change only at
+  device changes and updates. A device asleep for more than 72 h voids
+  every commit until it returns or is removed (its removal needs no
+  confirmation from it, §8, A5). Data keeps flowing meanwhile under the
+  confirmed epoch: a device just added reads and writes through the
+  archive it received at pairing (§3.8), so only the key change waits.
+- **Between a removal's maturity and its confirmed epoch,** the agent
+  already refuses the removed device's keys (§3.5); only an agent that
+  serves a removed device anyway (its operators colluding with it) could
+  hand it data sealed under the prior epoch (§8, B8).
+
+**Retention:** the agent keeps handshakes and confirmations for 180 days;
+a device offline longer re-pairs (§8, A5). It keeps no plaintext group
+information; the group's public state lives on the devices. Retention
+also bounds what a "harvest now, decrypt later" adversary can take from a
+log, if the operators honour it (§8, F1).
 
 **The data keys** [decided, E7; prior art: Keyhive's causal keys,
 any-sync's key chain, p2panda's data scheme]:
 - `k(scope, n) = MLS-Exporter("vos/personal/scope", scope_id, 32)` in
-  epoch `n`. One key a scope and epoch, so delivery order does not
-  matter (a DAG node is opened by its epoch's key whatever arrives
-  first), unlike MLS's per-message ratchet, which a CRDT's unordered,
-  repeated delivery would break. When mls-rs offers the extensions
-  draft's Safe Exporter (a secret per component, deleted once used), the
-  derivation moves to it with `scope_id` its component; the scheme is
-  the same.
-- **The key archive** of a scope: every past `k(scope, ·)` the scope
-  still reads, a union indexed by epoch, sealed under the current
-  epoch's key and pushed by the device that commits a new epoch, or by
-  any device that finds it missing (one envelope a scope an epoch; 32
-  bytes an epoch; duplicates are harmless). A new device derives the
-  current key from its Welcome and opens the newest archive; archives are
-  monotone, so two archives at different epochs union (§8, C9).
+  confirmed epoch `n`. One key a scope and epoch, so delivery order does
+  not matter, unlike MLS's per-message ratchet, which a CRDT's unordered,
+  repeated delivery would break. When mls-rs offers the Safe Exporter
+  (draft-ietf-mls-extensions), the derivation moves to it, `scope_id` its
+  component; the scheme is the same.
+- **Scope ids** are `BLAKE2b-128("vos/personal/scope-id" ‖ naming ‖ name)`,
+  `naming` a random secret drawn when the group is created and carried in
+  the archive, so a device that joins at any epoch finds every scope
+  (a device that joins cannot run an earlier epoch's exporter).
+- **The key archive:** every past `k(scope, ·)` and the naming secret, a
+  union indexed by epoch, sealed under the current epoch's key and pushed
+  by the committer once an epoch is confirmed, or by any device that
+  finds it missing (32 bytes a scope an epoch; duplicates are harmless).
+  A new device receives the archive over the pairing channel (§3.8) and
+  thereafter from the agent. Two archives that disagree on a key are kept
+  whole: every candidate key is tried, and the AEAD decides (§8, C9).
 - **No forward secrecy for history, by design:** the personal space must
   let a new device read the past, so whoever holds the current epoch's
-  key holds every older one a scope keeps. Forward secrecy is offered
-  only by a **history horizon** a scope may set (say, the inbox's 30
-  days): keys older than it leave the archive and the agent deletes the
-  envelopes sealed under them (§3.6). Post-compromise security holds for
-  new data: a removed device learns no key after its removal.
-- **The admin key and the archive:** the archive lives on a device under
-  its unlock-bound key, as the materialized data does (§3.5); a stolen,
-  unlocked phone exposes both, and that is stated (§8, A3).
+  key holds every older one. Post-compromise security holds for new data:
+  a removed device learns no key after its removal. Forward secrecy by
+  history horizons (dropping old keys and envelopes) is later work.
 
-**The suite:** MLS ciphersuite 1 (X25519, AES-128-GCM, SHA-256,
-Ed25519) unless mls-rs offers a maintained hybrid post-quantum suite by
-the step (plan 8.3 checks); a later change is a ReInit into a successor
-group, its archive resealed, old envelopes left under their old keys,
-never two suites in one group (§8, F1).
+**The suite:** MLS ciphersuite 1 (X25519, AES-128-GCM, SHA-256, Ed25519)
+unless mls-rs offers a maintained hybrid post-quantum suite by plan 8.3
+(N6); a later change is a successor group, its archive resealed, old
+envelopes left under their keys, never two suites in one group (§8, F2).
 
 ### 3.5 Device secrets and the rules for changing devices
 
@@ -446,139 +513,151 @@ never two suites in one group (§8, F1).
 
 | secret | what for | wrapped at rest under |
 |---|---|---|
-| the member secret `s` of each space | membership proofs (auth, owner) | none: derived at each use from the keystore's HMAC over the space's handle, behind the user's prompt, as today [built] |
-| the **admin key** (ed25519) | signing device-set operations at the personal agent: add, remove, veto, approve | a keystore key requiring strong biometric authentication at every use (BiometricPrompt with `BIOMETRIC_STRONG` alone, no PIN fallback; StrongBox when present). A device without a strong biometric is a **sync-only** device: paired and removed by others, administering nothing |
-| the **sync key** (ed25519) | the device's client key at the personal agent (pushes, fetches, commits); signing the DAG nodes it authors | a keystore key bound to the device's unlock, no per-use prompt: a background job has no user to ask |
-| the MLS state (leaf keys, group secrets, the key archive) | sealing and opening envelopes, processing commits | the unlock-bound key, kept out of OS backups (§8, A11) |
+| the member secret `s` of each space | membership proofs (auth, owner) | none: derived at each use from the keystore's HMAC over the space's handle, behind the user's prompt (a biometric or the PIN), as today [built, `identity-and-authority.md` §7] |
+| the **admin key** (ed25519) | signing device-set operations | a keystore key requiring authentication at every use: a strong biometric (`BIOMETRIC_STRONG`, no PIN) on a phone that has one; the PIN otherwise, which makes the device a **delayed admin** (below) |
+| the **sync key** (ed25519) | the device's client key at the personal agent; signing the DAG nodes it authors and its confirmations | a keystore key usable **after the first unlock** since boot, with no per-use authentication and no unlocked-screen requirement, so a background job runs on a locked phone |
+| the MLS state and the key archive | sealing and opening envelopes, processing commits | the same after-first-unlock key; kept out of Android's backups (§8, A11) |
 
-**Membership authority is the admin key's,** behind the prompt.
-- **Signed end to end:** a device-set operation (add, remove, veto,
-  approve, handover, collect) carries the admin key's ed25519 signature
-  over `(agent, operation, the device-set log's head)`, and it is sent as
-  a call under that admin key's own session. The agent checks the session
-  at ingress and stores the signature; **every device verifies the
-  signature itself** before acting on the operation. The operators run the
-  ingress and could append anything to the agent's log, so a device
-  trusts an operation only by its signature, never because the log holds
-  it (§8, B6). No guest verifies a signature.
-- **Time has a floor on the device:** a device acts on a matured
-  operation only once its own monotonic clock has seen the operation for
-  the delay too (a device offline when it was posted waits the delay from
-  when it learns of it), so operators who advance the agent's batch time
-  cannot shorten a delay (§8, B7).
+- **Why the bars differ:** a sign-in or a P1 transfer is one action the
+  user sees; membership changes are lasting control of every device's
+  data. The member secret keeps its decided PIN fallback; the admin key
+  does not. A shoulder-surfed PIN therefore lets a thief sign in and pay
+  from P1 (`rekey` and the space's limits are P1's remedy) but not take
+  the personal space (§8, A4; N5).
+- **Delayed admins:** a device whose phone has no strong biometric
+  administers with its PIN, and every operation it signs, adds included,
+  waits the 72 h delay and can be contested. A user whose devices are all
+  delayed admins can still pair: the new device simply joins 72 h later.
+- **After first unlock:** a phone powered on and unlocked once since boot
+  can use the sync key and the MLS state while its screen is locked; a
+  thief who keeps it powered and runs code on it (an OS exploit, forensic
+  tools) reads the personal space. Before the first unlock nothing opens
+  (§8, A2).
 
-A thief holding an unlocked phone, the app open, has the sync key and the
-MLS state, so can read what the phone reads; without the owner's
-biometric they cannot add a device, remove one, or veto. The admin key
-is unwrapped only after the prompt, for a short validity window; the
-user's biometrics changing invalidates the wrapping key (Android's
-`setInvalidatedByBiometricEnrollment`), and the device then asks another
-device, or the recovery key, to register a new admin key (§8, A12).
+**Operations are signed end to end:** every device-set operation (add,
+remove, veto, resolve, kit rotation, the recovery key's restore) carries
+its signer's ed25519 signature over `(agent, operation, the control log's
+head)` and is sent as a call under that key's own session. The agent
+checks the session at ingress and stores the signature; **every device
+verifies every signature itself** before acting. The operators run
+ingress and could append anything to the log, so a device trusts an
+operation only by its signature (§8, B6). No guest verifies a signature.
+Delays run on the agent's batch time alone, the same for every device; a
+device whose clock disagrees with the agent's by more than an hour raises
+an alarm and otherwise acts as the log says (§8, B7).
 
-**The device set** is a table in `Personal`, written only through its log:
-each device's sync key, admin key, a sealed label, and a state:
+**The device set** is a table in `Personal`, written only through its
+log: each device's sync key, admin key, admin class (strong or delayed),
+a sealed label and a state: **probation** (72 h from its add: it may sync
+and post its own updates and confirmations, not sign operations),
+**active**, or **removed** (with its frontier).
 
-| state | may | how a device enters it |
-|---|---|---|
-| **probation** (72 h) | sync; commit MLS updates of its own leaf | added by an active device (§3.8) |
-| **active** | everything below | probation's end |
-| **removing** (72 h) | sync, until removed | another device's `remove` |
-| **removed** | nothing; its frontier recorded | the delay's end, or an immediate removal |
+**The rules** [proposed; symmetric, with one tie-break]:
+1. **Add** (pairing, §3.8): signed by an active strong admin, immediate;
+   the new device is in probation for 72 h. Signed by a delayed admin, it
+   waits 72 h first.
+2. **Remove `d`:** signed by an active device, it is **pending** for 72 h,
+   then matures unless contested.
+3. **Being targeted suspends no right:** a device with a removal pending
+   against it keeps every right, its own veto included.
+4. **Veto:** any active device, the target included, may veto a pending
+   removal; the removal becomes **contested** and does not mature.
+5. **A contest is resolved** only by two active devices other than the
+   target signing `resolve`, or by the recovery key, which acts at once in
+   a contest. Two removals aimed at each other (thief and owner) are one
+   contest.
+6. **Immediate removal:** two active devices other than the target sign
+   it.
+7. **The recovery key's own operations** (restore, kit rotation, removal)
+   wait 7 days and are **cancelled** by any active device's veto: a leaked
+   kit alone can neither win a contest nor start one it could resolve.
+8. **Probation devices** cannot sign operations or veto; they are removed
+   like any device.
 
-- **Adding is immediate, then probation:** pairing (§3.8) needs the
-  adding device's admin key; the new device syncs at once, but for 72 h
-  it can neither add, remove nor veto, and any active device removes it
-  at once. Exposure does not grow by it: a device that could pair already
-  held everything the new one receives.
-- **Removing another device is delayed:** `remove(d)`, signed by an
-  active device's admin key, matures after 72 h unless any other active
-  device vetoes it. **A device cannot veto its own removal,** and a
-  device being removed cannot remove others. It is immediate when two
-  active devices other than its target sign it; the recovery key's
-  operations have their own delay (below).
-  The delay is measured by the agent's batch time, never a device's clock.
-  Every device is told through the inbox (§3.7).
-- **Self-removal is immediate.**
-- **The removal frontier** (prior art: Keyhive's open problem of
-  backdated operations): when a removal matures, the agent records, for
-  each scope, the position of the removed device's last accepted
-  envelope (§3.6). An envelope authored by a removed device is valid only
-  at or before its frontier. Seal-at-push (§3.6) already keeps it from
-  sealing under a later epoch; the frontier keeps it from pushing under an
-  old one through another path.
-- **Then MLS follows the log:** a matured add or remove is carried out
-  by the next commit that names it, posted by any active device; devices
-  check that the commit's membership change equals the matured
-  operation.
-- **Probation devices may commit their own updates** (MLS's update of
-  their own leaf, for post-compromise security), nothing else.
+*The honest limit:* a thief who passes the owner's strong biometric holds
+an active device and can always contest. The owner wins with one device
+and the kit, or with two other devices. With the kit alone (every other
+device lost) the owner cannot win: the kit's operations are cancelled by
+the thief's veto, which is exactly the protection a leaked kit needs, and
+the two cases look the same to the agent. With neither, nobody wins
+(§8, A4).
 
-**The recovery key** [proposed; prior art: Signal's recovery key, Apple's
+**The removal frontier:** when a removal matures, the agent records, for
+each scope, the position of the removed device's last accepted envelope;
+its envelopes after that are invalid, and its writes before it stay
+(filtered at read only if a later rule says so, §3.2). The frontier is
+the agent's word, so operators colluding with a removed device could
+place backdated writes before it (§8, B8).
+
+**The recovery kit** [proposed; prior art: Signal's recovery key, Apple's
 recovery key and security delay]:
-- 32 random bytes shown once as a 24-word phrase, with the home space's
-  handle and the personal agent's id beside it (a recovery kit), drawn
-  when the personal agent is claimed. Its public halves (ed25519 for
-  signing, X25519 for sealing) are registered in the device set as a
-  **recovery entry**, not an MLS leaf: it is never online, so as a leaf
-  it would be a stale one that every commit encrypts to.
-- **What it seals:** every 30 days, and at each device change, an active
-  device pushes a recovery envelope (HPKE to the recovery key) holding
-  every scope's key archive and scope ids, into a scope of its own whose
-  id derives from the recovery public key, so devices do not try to open
-  it.
-- **What it may do:** any device-set operation, but **after a 7-day delay
-  that any active device may veto,** and immediately only together with
-  an active device's admin signature. A leaked phrase therefore gives the
-  user a week's notice, not the attacker the space; when every device is
-  lost, nobody vetoes, and the delay costs only time. Its operations are
-  signed end to end like a device's.
-- **Restore** (all devices lost, §8, D1): a fresh install enrolls in the
-  home space as a new member device (the registrar's ordinary path,
-  §3.8), reads the kit, signs a query and calls with the recovery key
-  (a client key the agent knows), opens the recovery envelopes, removes
-  every old device, starts a new MLS group as its sole member (the old
-  group has no reachable member to commit; the agent's control log
-  restarts under the new group by the recovery key's `regroup`, delayed as
-  its operations are), reseals the archives under the new group, and has its own "home" pseudonym added to the lease: the
-  recovery key calls `Personal::reclaim(nullifier)` (the device computes
-  its own nullifier without a proof), delayed as above, and at maturity
-  `Personal` tells `Homes` to add it; the device renews with a proof under
-  it from then on.
-- **Not strongly nudged but required:** a claim needs a recovery kit; the
-  user may store it, print it or decline to see it again, and the chrome
-  says losing every device and the kit loses the personal space.
+- Drawn at the claim, required for it: 32 random bytes shown once as a
+  24-word phrase, beside the home space's handle and its current onion
+  addresses. The kit's public halves (ed25519, X25519) enter the device
+  set as a **recovery entry**, not an MLS leaf (never online, it would be
+  a stale leaf every commit encrypts to). `Homes` indexes the agent by
+  `H(recovery public key)`, so the kit needs no agent id: restore looks
+  the agent up, and a new home registers the same hash.
+- **A split wrap key:** at the claim the device draws a recovery wrap key
+  `R` and splits it, `R = R1 ⊕ R2`. `R1` is sealed (HPKE) to the kit's
+  X25519 key and kept at the agent; `R2` is kept at the agent in clear,
+  released only to a matured restore. The devices hold `R` in their
+  archive.
+- **Recovery envelopes, at every confirmed epoch:** the committer pushes
+  that epoch's new scope keys (and, at first, the naming secret), sealed
+  under `R`, a few hundred bytes, into a scope of their own, so the kit's
+  copy of the keys never lags the data (§8, D1).
+- **What a leaked kit can do:** nothing at once. It opens `R1` but not
+  `R2`; it can only post a restore, which waits 7 days, shows on every
+  device and is cancelled by any of them. Operators alone hold `R2` but
+  not `R1`. **Operators and a leaked kit together read everything and,
+  under N4 (a), spend every device's notes** (§8, D3).
+- **Restore** (every device lost, §8, D1): a fresh install enrolls in
+  the home space as a member device by the registrar's ordinary process,
+  reads the kit, finds the agent by `H(recovery public key)`, and posts
+  `restore` with the kit. After 7 days unvetoed, the agent releases `R2`;
+  the device opens the recovery envelopes, removes every old device, starts
+  a new group as its only member (the agent's control log restarts under
+  it), reseals the archives, and its own keys become the device set. The
+  kit's calls are activity, so the agent is not reaped meanwhile (§3.3).
+  **Restoring elsewhere:** the same restore at the old agent releases
+  `R2`; the new group lives at an agent claimed in another space, and the
+  data is fetched from the old one.
+- **Kit rotation** is an operation: a new kit, a new `R`, a new `R1`,
+  and the old `R2` deleted, so the old phrase opens nothing. Signed by
+  two active devices it is immediate; by one it is pending 72 h and
+  contestable, so a thief with the biometric cannot quietly lock the
+  owner's kit out (rule 2–5 apply).
 
-**What the personal agent's log shows the operators:** the device count
-and its changes, each device's two public keys, the times of device
-changes and commits, and the recovery entry's existence. Not the labels,
-not the data, not which member owns the agent (§3.10).
+**What the control log shows the operators:** the device count and its
+changes, each device's public keys and admin class, the times of device
+changes, commits and confirmations, contests, and the recovery entry.
+Not the labels, not the data. §3.10 says what that lets them link.
 
 ### 3.6 Sealed scopes: storage and sync
 
 **An amendment to `core-model.md` §9.4:** a sync scope is either
 - **plaintext** (§9.4 as designed: nodes validate and apply operations,
-  author chains, epoch nodes emitted by Linear steps, the Linear-emitted
-  chain): not built in slice 8; or
+  author chains, epoch nodes emitted by Linear steps): not built in slice
+  8; or
 - **sealed** [this design]: the scope's DAG nodes are ciphertext to every
   node; devices validate (signatures, the device set, frontiers) and
   apply; nodes store, order and serve envelopes, and enforce what they
-  can see (who may push, the epoch, quotas). `core-model.md` §9.4's authorization rule
-  runs on the devices, against the personal agent's device-set log in
-  place of epoch nodes: a node author is valid in epoch `n` if its sync
-  key was in the device set (active or probation) when the envelope was
-  accepted, and within its frontier if later removed.
+  can see (who may push, the epoch, quotas). `core-model.md` §9.4's
+  authorization rule runs on the devices, against the personal agent's
+  control log in place of epoch nodes: an author is valid if its sync key
+  was in the device set (probation, active, or with a removal pending)
+  when its envelope was accepted, and within its frontier if later
+  removed.
 
 **Where the envelopes live: the personal agent's replicated tables,
 written through its log** [proposed; N2]. A node cannot apply what it
-cannot read, so `core-model.md` §9.4's node machinery (merge dispatch on replicas,
-gossip between nodes) would do nothing for a sealed scope; what a sealed
-scope needs is durable, replicated storage and an atomic check of the
-push's epoch against the device set and the MLS log. The agent's log
-gives both, and every push's cost is a commit at a personal rate (a push a
-minute while the app is open, one a background job [est]). The
-alternative, a node-side Merge store replicated outside Raft, needs a new
-peer protocol and still consults the log for the epoch; it is kept for
-plaintext scopes.
+cannot read, so `core-model.md` §9.4's node machinery (merge dispatch on
+replicas, gossip between nodes) does nothing for a sealed scope; what a
+sealed scope needs is durable replicated storage and an atomic check of
+each push against the confirmed epoch and the device set. The agent's log
+gives both; every push is a commit at a personal rate. A node-side Merge
+store, replicated outside Raft, stays the design for plaintext scopes.
 
 **An envelope:**
 ```text
@@ -588,205 +667,190 @@ sealed    = XChaCha20-Poly1305(k(scope, epoch), nonce, Padmé(body), AAD = heade
 body      = { author: sync key, seq, signature, parents: [cid], ops, view }
 view      = { log_index, log_chain }   (the writer's view of the agent's control log)
 ```
-- `scope` is an opaque id the devices derive from the scope's name and a
-  group secret (`MLS-Exporter("vos/personal/scope-id", name, 16)` at the
-  group's first epoch), so the operators see that scopes exist, not what
-  they are.
 - **No structure in clear:** parents, author, CIDs and operations are
   inside; the operators see sizes (padded, Padmé: at most 12% overhead),
-  times and scope ids, not the DAG's shape (prior art: Beelay leaves
-  heads and parent hashes in clear, and its server sees the shape).
-- **An envelope's id** is the BLAKE2b-256 of its bytes, so a retried
-  push is deduplicated (§8, A10); a node's CID, over its plaintext,
-  stays inside.
+  times and opaque scope ids, not the DAG's shape (prior art: Beelay leaves
+  heads and parent hashes in clear).
+- **An envelope's id** is the BLAKE2b-256 of its bytes. A device keeps
+  the sealed bytes in its push queue and reseals only after `StaleEpoch`,
+  and the agent deduplicates by id before checking the epoch, so a retry
+  is never stored twice (§8, A10).
 - **Size:** at most 60 KiB an envelope, under `cap::VALUE` and
-  `cap::REQUEST` (64 KiB each, `agent/wire/src/abi/cap.rs`); a larger DAG
-  node or checkpoint is chunked into a chain of envelopes. A push call
-  carries 64 KiB of arguments: one full envelope, or several small ones;
-  pushes pipeline (16 in flight on one channel), each a step of the
-  agent. A blob kind for
-  large objects through the node's existing blob store is a later lever,
-  taken when a measured checkpoint makes chunking the bottleneck (plan
-  8.16's gate).
+  `cap::REQUEST` (64 KiB each, `agent/wire/src/abi/cap.rs`); a larger node
+  or checkpoint is chunked. A push call carries 64 KiB of arguments: one
+  full envelope or several small ones; pushes pipeline, 16 in flight on
+  one channel.
 
 **Seal at push, not at write** [prior art: DCGKA's dominating update]:
-a device keeps its unsynced operations in its local store, encrypted at
-rest under its own key, and seals them only when it pushes, under the
-epoch it read from the agent just before. `Personal::push(scope, epoch,
-envelopes)` refuses an epoch other than the current one (`StaleEpoch`),
-and the device reseals and retries. So a device that wrote offline
-while another was removed cannot hand the removed one new data under an
-old key.
+a device keeps its unsynced operations in its local store and seals them
+only when it pushes, under the confirmed epoch it read just before.
+`Personal::push` refuses another epoch (`StaleEpoch`). So a device that
+wrote offline while another was removed cannot hand the removed one new
+data under an old key.
 
-**Sync is a cursor, not a walk:** the agent numbers a scope's envelopes
-in the order it accepts them; `Personal::since(scope, position)` is a
-query returning up to 64 KiB of envelopes from a position, so a device
-catches up in a few pipelined queries (16 in flight on one `vos-api`
-channel) instead of a round trip a DAG level. Positions reveal only the
-arrival order the operators see anyway. Each device keeps, per scope, the
-last position applied and the set of its own envelopes accepted; nothing
-like set reconciliation is needed while one agent holds the order.
+**Sync is a cursor:** the agent numbers a scope's envelopes in the order
+it accepts them; `Personal::since(scope, position)` is a query returning
+up to 64 KiB of envelopes from a position, so a device catches up in a few
+pipelined queries. Positions reveal only the arrival order the operators
+see anyway. With the agent ordering every envelope, the DAG's parents
+serve causal integrity inside; merkle-crdt's walk is not needed for
+transport.
 
 **Fork and rollback detection** [prior art: XMTP's commit logs, SUNDR's
 fork consistency]: the agent's **control log** is its device-set
-operations and handshakes in log order. Each device keeps the highest
-`(log_index, log_chain)` it has seen (`log_chain` a hash chain over the
-control log's entries, signatures included) and refuses a log that is
-shorter or diverges. Every envelope carries its
-writer's view inside; a device that opens an envelope whose view
-conflicts with its own raises a fork alarm. An operator who rolls the
-agent back, or shows two devices two histories, is detected the next time
-either device reads the other's writes. Nodes sign nothing a device can
-show a third party, so detection is not proof (§8, B4).
+operations, commits and confirmations in log order. Each device keeps the
+highest `(log_index, log_chain)` it has seen (`log_chain` a hash chain
+over the entries, signatures included) and refuses a log that is shorter
+or diverges; every envelope carries its writer's view inside, so a device
+that opens an envelope whose view conflicts with its own raises an alarm.
+Confirmed epochs (§3.4) already stop an operator from splitting the keys;
+views catch a split of the device set's history. Nodes sign nothing a
+device can show a third party, so detection is not proof (§8, B4).
 
-**Checkpoints and compaction:**
-- a checkpoint is a scope's state at a frontier, sealed like any envelope
-  (chunked), carrying the frontier's CIDs inside; boundaries are
-  deterministic (every 4,096 operations, by the operations' count in the
-  DAG's causal order) so two devices checkpointing at once produce the
-  same state;
-- a new device fetches the newest checkpoint and the envelopes after it;
-- **garbage collection is a log operation with a delay:**
-  `collect(scope, position)` drops envelopes before `position` once a
-  checkpoint covering them has been acknowledged by a second device and
-  72 h have passed without a veto, so a rogue device cannot erase
-  history alone.
+**Checkpoints at the agent's positions** [proposed]:
+- a checkpoint is a scope's state after every envelope at or before a
+  position `P` whose causal past is complete; every device that has read
+  to `P` computes the same state, whatever order it received envelopes in;
+- the author pushes it sealed (chunked) with `P` and its state's hash
+  inside; another device that recomputes the state at `P` and matches
+  posts an acknowledgement, signed by its sync key;
+- a new device accepts a checkpoint acknowledged by two devices other than
+  its author, or replays from the start; a wrong checkpoint (a buggy
+  device, a sync-key thief) is never acknowledged and so never trusted.
+- Deleting what a checkpoint covers (garbage collection) is later work:
+  the quota lasts.
 
-**Quotas** (per agent, the space's policy; enforced by `Personal` in
-`push` and `commit`): bytes held (say 256 MiB), envelopes a day,
-handshakes a day, inbox slots; a refused push leaves the device's queue
-intact and the chrome says why. Per agent, not per device: a quota per
-device would let the operators tell devices apart by their limits.
+**Quotas** (per agent; the space's policy; enforced by `Personal`):
+bytes held (64 MiB by default), envelopes and commits a day, inbox items.
+Admin-signed operations, the commits that carry matured ones, and
+confirmations are exempt, so no device can block its own removal by
+filling a quota. Each device also has an unadvertised share (at most half
+the agent's bytes and calls), so one device cannot starve the others. A
+refused push keeps the device's queue intact and the chrome says why. Not
+per device in what the operators see: a visible per-device limit would
+tell devices apart.
 
-**Background sync:** a WorkManager job, in a random minute of its window
-(jitter), pushes queued operations, reads the device-set log and each
-scope's cursor, applies, and stops. Personal-agent traffic goes only over
-Tor, on its own circuits (§6.2): never the clearnet fallback, which
-would hand the operators the device's address beside its pseudonym.
+**Background sync:** a WorkManager job, in a random minute of its window,
+pushes queued operations, reads the control log and each scope's cursor,
+applies, and stops; it raises a local notification (no push service
+involved) when a device-set operation is pending. Personal-agent traffic
+goes only over Tor, on its own circuits (§6.2).
 
 ### 3.7 The inbox
 
-A table in `Personal`, keyed by `(expiry, id)`, swept by a timer
-workflow that deletes expired rows in batches (no expiring rows exist in
-the node today; `keys::due` serves only system rows,
-`agent/wire/src/keys.rs`).
-- **Who writes** in slice 8: the user's devices (device-set
-  notifications: "a removal of the phone was requested"), the agent
-  itself (lease and quota warnings), and a **pairing slot's** holder
-  (§3.8). Others' messages (member messaging) wait for slice 9, with
-  sender tokens or proof of work against spam (§8, C7).
+A table in `Personal`, keyed by `(expiry, id)`. **Expiry is lazy:** reads
+skip expired items, and each write deletes a few expired ones; no timer
+runs.
+- **Who writes** in slice 8: the user's devices (notes to one another),
+  and a pairing slot's holder (§3.8). Others' messages (member messaging)
+  wait for slice 9, with sender tokens or proof of work against spam (§8,
+  C7).
 - **Who reads:** the user's devices, by their sync keys; a pairing slot
-  is read by its two parties.
+  by its two parties.
 - Items are sealed to the device group, or to a pairing slot's key; the
-  operators see counts, sizes (padded) and times.
+  operators see counts, padded sizes and times.
 - **Bounds:** 64 items, 16 KiB each, a TTL of at most 7 days, pairing
   slots 10 minutes and single-use.
 
 ### 3.8 Pairing a new device, and its memberships
 
-1. **The existing device** (A, active) opens a pairing slot at its
-   personal agent (`Personal::pair_open`, signed by A's admin key behind
-   the prompt): a random slot id, a slot key the agent will accept posts
-   under, a 10-minute TTL. A shows a QR code: the home space's onion
-   address and the agent's id, the slot id and key, A's ephemeral X25519
-   key, and a 128-bit code.
+1. **The existing device** (A, active) opens a pairing slot
+   (`Personal::pair_open`, under A's admin key, behind the prompt): a
+   random slot id, a slot key the agent admits for that slot alone, a
+   10-minute TTL. A shows a QR code: the home's onion addresses and its
+   handle, the slot id and key, A's ephemeral X25519 key, and a 128-bit
+   code.
 2. **The new device** (B) scans it, draws its sync key, admin key and an
    MLS KeyPackage, and runs `Noise_XXpsk3_25519_ChaChaPoly_BLAKE2b` with A
    through the slot, the code its pre-shared key. The code never crosses
    the agent, so an agent that substitutes keys fails the handshake.
-3. **B sends** its two public keys and its KeyPackage over the Noise
-   channel. **A adds B:** `Personal::add(B's keys)` signed by A's admin
-   key, then the MLS commit adding B with B's Welcome. B is in probation
-   (§3.5).
-4. **B joins:** processes its Welcome, opens the key archives (pushed
-   with the commit), fetches each scope's newest checkpoint and the
-   envelopes after it, and applies.
-5. **B's memberships** (E2: each device has its own secrets): the
-   credential book lists the spaces the user belongs to. In each, B needs
-   its own leaf. A asks the space's registrar for it:
-   `registrar.enroll_device(member(s_B))` under
-   `#[msg(credential = Owner)]` from A, which the registrar's policy
-   admits up to a number of devices per member. The registrar thereby
-   knows that A's and B's leaves are one member's; it already knows each
-   member's identity, and the tree still hides which leaf proves.
+3. **Over the Noise channel,** B sends its public keys and KeyPackage; A
+   sends the key archive, the naming secret and `R` (§3.4, §3.5), so B
+   has history even if A is lost a moment later.
+4. **A adds B:** `Personal::add(B's keys)`, admin-signed, then the commit
+   adding B with B's Welcome; B confirms the epoch with the others, and
+   is in probation.
+5. **B joins:** fetches each scope's newest acknowledged checkpoint and
+   the envelopes after it, and applies.
+6. **B's memberships** (E2: each device has its own secrets): B needs its
+   own leaf in each space the user belongs to. The registrar's
+   `enroll_device(member(s_B), owner(s_B))` is called by A under
+   `#[msg(credential = Owner)]`; the registrar keeps a person record
+   (member and owner digests of each device, their count, its
+   per-member limit), which a credential actor alone cannot (member and
+   owner digests are unlinkable by design). **When:** not right after
+   pairing, but at A's next ordinary sign-in in that space, on the same
+   prompt, so an enrollment in the home space does not follow a device
+   change at the personal agent by seconds; the chrome offers "enroll
+   now" for a user who accepts that link (§3.10).
    - **`once` scopes and several leaves:** a member with three device
-     leaves has three nullifiers in a `once` scope (a vote). The design
-     keeps one **person leaf** per member in a second ring for agents that
-     use `once` (§8, L6; N3).
-   - P1's accounts are per owner digest (per device); a payment from
-     "the user" comes from one device's account, and moving funds between
-     one's devices is a transfer the operators see (§8, L4).
+     leaves has three nullifiers in a `once` scope (a vote). Agents that
+     use `once` read a second ring of **person leaves**, one per member,
+     held by one device and moved by re-enrollment; their guard names the
+     ring (§8, L6; N3).
+   - P1's accounts are per owner digest, so per device (§5.2).
 
-**Removing a device** is §3.5's `remove`, its MLS commit, and, in each
-space, `registrar.revoke_device` from another of the user's devices. A
-lost device's notes in P2 are slice 9's question (N4).
+**Removing a device** is §3.5's removal, its commit, and, in each space,
+`registrar.revoke_device` at the user's next sign-in there.
 
-### 3.9 Home spaces: several, a handover, and a lost home
+### 3.9 Home spaces: several, and a lost home
 
 **Several homes** [decided, E8: allowed, one built]. A second home is
 another personal agent holding the same envelopes, a replica the devices
-push to as well. **Exactly one home orders the group** (the handshake
-home): two logs ordering one MLS group would fork it. A second home
-mirrors the first's handshakes, pushed by devices, which also gives
-devices a second view against which to check the first for equivocation.
-Mirroring is built after slice 8.
+push to as well. **Exactly one home orders the group;** two logs ordering
+one MLS group would fork it. A second home mirroring the first's control
+log, and a live handover from one home to another, are later work (§9.4).
 
-**Handover** (built in slice 8, plan 8.17): moving the user to a new
-home while both are live.
-1. A device claims an agent in the new space (§3.3).
-2. It posts `handover(new home, new agent)` to the old agent, signed by
-   an active admin key, delayed and vetoable as a removal is (72 h).
-3. At maturity, the next commit on the old agent carries a group-context
-   extension naming the new home and that log position; the new agent's
-   log starts from that commit's hash, and devices accept the new home
-   only from it.
-4. Devices push every envelope they hold to the new agent; the old agent
-   goes read-only, and its lease is released.
-
-What the old operators held they keep; deletion there cannot be
-verified, so everything they held stays, to them, held.
-
-**A lost home** (the space vanishes, or turns hostile):
-- **slice 8:** devices are full replicas, so nothing is lost but the
-  agent. The user claims an agent in another space, creates a new group
-  from one device, pairs the others again (QR), and pushes everything:
-  pairing and claiming are all it takes.
-- **later:** a successor group with a resumption PSK bound to the last
-  agreed epoch, so other devices join without a QR; the PSK alone would
-  let a stolen phone found one too, so the admin key and the probation
-  rules apply to it.
+**A lost home** (the space vanishes, turns hostile, or the user wants out):
+devices are full replicas, so nothing is lost but the agent. The user
+claims an agent in another space, creates a new group from one device,
+pairs the others again (QR), and pushes everything. The old operators keep
+what they held; deletion there cannot be verified.
 
 ### 3.10 What the operators see, and the door to messaging
 
-**The home space's operators see:**
-- that a personal agent exists, when it was assigned (to a pseudonym),
-  its lease renewals and its device count over time;
-- the device set's public keys and the times of every device change,
-  commit, push and fetch (Tor hides from where);
-- envelope counts and padded sizes per opaque scope id;
-- the recovery entry's existence.
+**E5, stated against the home's operators** [decided, E5; restated]: the
+personal agent is owned by a pseudonym that outsiders and other members
+cannot link to the member. **The home's operators can,** when the home is
+also a space where the user is a member (the usual case), by correlating:
+- device changes at the agent (adds, removals, restores) with the
+  registrar's device enrollments and revocations for one person, and the
+  device count at the agent with a person's device count at the
+  registrar (deferring enrollments to sign-ins, §3.8, blurs the timing,
+  not the counts);
+- sync times with sign-in times: foreground sync starts when the user
+  opens the app, which is when they sign in (§8, L2);
+- the claim with the member's first sign-ins (the claim needs the user's
+  prompt, so it cannot be moved to a random moment without asking the user
+  again).
 
-**They do not see:** the data, the scopes' names, the DAG's shape, which
-member owns the agent, or the devices' addresses. They can withhold,
-delay, roll back or equivocate, which devices detect (§3.6), and delete,
-which devices survive (they are full replicas).
+A home that is not one of the user's other spaces (E8 allows it) removes
+the first item. The chrome recommends one when the user's spaces offer it.
+
+**They see:** that a personal agent exists and when it was assigned, its
+activity, its device set's public keys and changes, envelope counts and
+padded sizes per opaque scope, and the recovery entry. **They do not
+see:** the data, the scopes' names, the DAG's shape, or the devices'
+addresses. They can withhold, delay, roll back or equivocate, which
+devices detect (§3.4, §3.6), and delete, which devices survive (they are
+full replicas).
 
 **Linkability rules** [decided, E10]:
 - sign-in, owner and spend proofs go from the device to their target,
   never through the personal agent;
-- the personal agent's traffic has its own Tor isolation group, on its own
-  jittered schedule, never triggered by the member's own activity;
+- the personal agent's traffic has its own Tor isolation group, and its
+  background schedule is its own;
 - the sync key and the admin key are used nowhere else, and the member
   key signs nothing the personal agent stores;
-- no push-notification token (FCM, APNs: tied to a Google or Apple
-  account and seen by whoever pushes) is given to any space; devices poll.
+- no push-notification token (FCM, APNs) is given to any space; devices
+  poll, and raise local notifications.
 
-**Messaging later** (slice 9): a member-to-member group's delivery
-service is an agent, as the personal agent is for the device group; the
-user's devices would appear as one member through MLS virtual clients (the
-device group as the emulation group), so other members see one leaf per
-person, not one per device. The device group built here is that emulation
-group; nothing in slice 8 needs to change for it.
+**Messaging later** (slice 9): a member-to-member group's delivery service
+is an agent, as the personal agent is for the device group. MLS virtual
+clients would make the user's devices one leaf in other members' groups,
+with the device group as the emulation group; but they share that virtual
+leaf's signature and HPKE keys across the user's devices, a secret that
+syncs, against E2's letter. Slice 9 asks the owner first (§9.1 N7).
 
 ## 4. One proving path
 
@@ -961,13 +1025,18 @@ format, the chips, the sizes and the root. Today only auth's reference
   and a kernel that branches declares `headroom = k` (each size raised by
   `k` powers of two). The testkit's `device_fits` property test runs
   random witnesses against the reference's sizes.
-- **Which kernels see a secret:** the light node puts a member secret or a
-  spending key only into kernels whose device programs it computes from
-  code it ships (the stock `auth` and `owner`; cipher-clerk's spend in
-  slice 9), and refuses to prove one of them if the space's installed
-  program differs from its own. A kernel whose bytes a space serves may
-  take only the user's public data: otherwise a space could install a
-  kernel whose public claim is the secret itself (§8, G2).
+- **Which kernels see a secret** [proposed, the slice-8 rule]: the light
+  node puts a member secret or a spending key only into kernels whose
+  device programs it computes from code it ships: the stock `auth` and
+  `owner`, and the pool's `spend` and `join` from its own build of
+  cipher-clerk's `shielded::check` (§5.4). It refuses to prove one of
+  them if the space's installed program differs from its own. A kernel
+  whose bytes a space serves may take only the user's public data:
+  otherwise a space could install a kernel whose public claim is the
+  secret itself (§8, G2). So in slice 8 a developer's own device kernel
+  proves over public data and over data the user explicitly hands it,
+  never over keys; a consent model per program id (the chrome naming
+  the space, the method and the data) is later work (§9.4).
 - **Pins:** the binding names the program id, so a proof of one kernel
   authorizes nothing under another; a new kernel version is a new id, its
   space's install the only governance step. No venue pins device ids
@@ -1010,9 +1079,11 @@ format, the chips, the sizes and the root. Today only auth's reference
 
 ## 5. Payments as the showcase
 
-P1 is built in slice 8; P2 (§5.2's second stage, the pool and the wallet)
-is designed here and built in slice 9 [proposed, N1], cipher-clerk v0.4
-(§5.3) released in slice 8 so that slice 9 starts from it.
+P1 and P2 are both built in slice 8 [decided, E3; how, N1 (c)]: P2's
+wallet keeps each device's notes on that device alone, since under E2
+only that device's key spends them, so P2 needs proven calls,
+cipher-clerk v0.4 and the pool, not the personal space; slice 9 syncs the
+wallet across the user's devices.
 
 ### 5.1 The shape
 
@@ -1022,8 +1093,9 @@ Two actors and one library:
   pool (note commitments, nullifiers, encrypted notes). It never sees a
   note's value or owner.
 - **`Wallet`**, a local actor in the user's personal space (§3): the notes
-  the user's devices hold and the nullifiers they have spent, synced across
-  the devices, each note marked with the device whose key spends it (E2).
+  the device holds and the nullifiers it has spent, each note marked with
+  the device whose key spends it (E2); on that device alone in slice 8,
+  synced across the user's devices in slice 9.
   It plans spends; the light node builds and proves them with the
   device's key, which never enters the actor's state.
 - **cipher-clerk**, redesigned (§5.3): the ledger kernel, and a shielded
@@ -1048,15 +1120,15 @@ circuit" (cipher-clerk's Phase 3 entry criterion 11) holds by construction.
    Accounts are per owner digest, so per device (E2): a payment comes from
    one device's account, and moving funds between one's devices is a
    transfer the operators see linking the two (§8, L4).
-2. **P2, private** [slice 9, N1]: the shielded pool and the
+2. **P2, private** [slice 8, N1 (c)]: the shielded pool and the
    wallet. Payer, payee and amount hidden from the operators and every
    other member inside the pool; deposits into and withdrawals from the
    pool visible as transparent legs.
 
 ### 5.3 cipher-clerk, redesigned
 
-cipher-clerk (`~/src/virto/cipher-clerk`, v0.3.0 at `0235d06`; VOS pins
-tag `v0.3.0`, `Cargo.toml:241`, and uses its codec, `Account`, `Layer`,
+cipher-clerk (`~/src/virto/cipher-clerk`; VOS pins tag `v0.3.0`, the
+merge commit `b841640`, `Cargo.toml:239`, and uses its codec, `Account`, `Layer`,
 `Value` and `settlement::window` in the `accounts` and `window` test
 actors) has a sound transparent kernel (its tests are most of the 315 the
 workspace runs with every feature; about 114 are the privacy modules') and a notes
@@ -1075,7 +1147,7 @@ repository:**
 |---|---|---|---|
 | R1 | **One hash, Poseidon2-M31's compression `C`**, behind a trait `Compress { fn compress(l: &Digest, r: &Digest) -> Digest }`; cipher-clerk ships no permutation; VOS's SDK implements it over `0x402` in a kernel and natively on hosts; cipher-clerk's tests take golden vectors from VOS | the zkVM proves `0x402` in one chip row and BLAKE2b or a curve not at all cheaply; one hash keeps device shapes free of BLAKE2b (`proving.md` §8, `H_io`) | 8 |
 | R2 | **Hash commitments, not Pedersen**: `cm = C(C(T(note), [asset, v₀, v₁, v₂, 0…]), C(rho, C(owner, r)))`, value in three 24-bit words; `r` a 248-bit blinding the caller passes (randomness as a parameter, v0.3.0's rule kept). The order lets a pool compute a deposit's `cm` from a public amount, a protocol `rho` and the depositor's `C(owner, r)` (§5.4) | the spend proof checks the balance in Rust, so no homomorphism is needed; no curve in the kernel | 4 |
-| R3 | **Keys hash-only, per device**: `sk` per device and pool, 32 random bytes drawn by the light node, wrapped under a per-use keystore key and sealed to the recovery key (N4), never synced (E2); `owner = C(T(note-owner), sk)`, `nk = C(T(note-nf), sk)`; the device proves knowledge of `sk` | spend authorization without an embedded curve: option 1 of item 1 ("the device proves, with `ak = Poseidon(ask)`"); no delegated proving, which the light node does not need | 1, 2 |
+| R3 | **Keys hash-only, per device**: `sk` per device and pool, 32 random bytes drawn by the light node, wrapped under a per-use keystore key; under N4 (a) also sealed under the recovery wrap key `R` (§3.5), so only a matured restore recovers it; `owner = C(T(note-owner), sk)`, `nk = C(T(note-nf), sk)`; the device proves knowledge of `sk` | spend authorization without an embedded curve: option 1 of item 1 ("the device proves, with `ak = Poseidon(ask)`"); no delegated proving, which the light node does not need | 1, 2 |
 | R4 | **Nullifier** `nf = C(nk, C(pool, cm))`, scoped to the pool's id; **`rho` of each output** `C(T(rho), C(nf₀, [i, 0…]))` (two calls), bound to the transaction's first nullifier; **a deposit's `rho`** `C(T(rho-deposit), W(b))`, `b` the deposit call's binding digest, unique and recorded | unique per note, unlinkable to `cm` without `nk`; `rho` fixed by the protocol closes Faerie Gold (F3) for spends and deposits alike; `nk`'s tag apart from the credential's `T(nf)`; a note of one pool spends in no other | 3 |
 | R5 | **Fixed-shape transactions**, `Tx<const I, const O>`: `asset` (the transaction's one asset, its fee's too), `anchor`, `nullifiers: [Digest; I]`, `commitments: [Digest; O]`, `memos_hash`, `value_balance: i64` (a withdrawal's amount, or 0), `leg` (the withdrawal's destination account id, or zero), `fee: u64`, `pool: Digest`, `binding`; deposits are not transactions (§5.4) | a proof's shape is its kernel's; two kernels, 1-in-2-out (`spend`) and 2-in-1-out (`join`), cover payments and consolidation; the transparent leg and the fee's asset are in what the proof binds | 4, 5 |
 | R6 | **`shielded::check::<H, I, O>(tx, witness) -> Result<(), SpendError>`**: `no_std`, no allocation, fixed arrays, no `BTreeMap`, no panic; `Witness` the input notes, their positions and paths, `sk`, the output notes; plus `shielded::Plan` and `shielded::build` (host side, taking the device's `sk`) | the device kernel's body; the same function runs on hosts as the reference | 11 |
@@ -1162,13 +1234,15 @@ impl Payments {
 }
 ```
 
-The wallet, a local actor:
+The wallet, a local actor (Merge fields, so slice 9 syncs it by giving
+its scope to the personal space; in slice 8 its scope stays on the
+device):
 
 ```rust
 #[actor]
 pub struct Wallet {
     notes: crdt::GSet<Owned>,           // notes received: the note, its position, its device
-    spent: crdt::GSet<Digest>,          // nullifiers the user's devices spent or saw spent
+    spent: crdt::GSet<Digest>,          // nullifiers spent or seen spent
     tree: crdt::Map<u64, Digest>,       // the pool's leaves seen so far, for paths
 }
 
@@ -1200,9 +1274,10 @@ impl Wallet {
 **What the light node does around it** (a `pay` operation of the
 facility, §7.3): calls `prepare` on the local wallet, builds the
 transaction and its witness with the device's `sk` and fresh randomness
-(`shielded::build`), proves the pool's `spend` kernel on them (the kernel's bytes come from the space's
-installed package, fetched once and pinned at enrollment), sends the
-proven call, and on `Ok` records `spent(nf)`. A local workflow with
+(`shielded::build`), proves the `spend` kernel on them (its device
+program computed from the light node's own build of cipher-clerk and
+checked equal to the pool's installed one, §4.4), sends the proven call
+over Tor, and on `Ok` records `spent(nf)`. A local workflow with
 device effects (`ctx.prove`, `ctx.call_remote`) would move that glue into
 the actor; it is a later extension of the local host (§9 Q8).
 
@@ -1212,7 +1287,7 @@ the actor; it is a later extension of the local host (§9 Q8).
 - the payer knows `sk` behind the input note's `owner`;
 - the input note's commitment is a leaf of the pool's tree under `anchor`
   at the witnessed position;
-- each nullifier is `C(nk, cm)` of its input;
+- each nullifier is `C(nk, C(pool, cm))` of its input (R4);
 - each output's commitment is well formed, its `rho` the protocol's;
 - `Σ inputs = Σ outputs + fee + value_balance`, every value and sum in
   `u64` with checked arithmetic (the 64-bit range checks);
@@ -1268,7 +1343,7 @@ Over Tor (§6), not the address it came from.
 - `join` (2 in, 1 out) adds a path and a nullifier: about 100 calls,
   4,500–5,500 steps, 2^13 rows, 1.4–1.9 s today [est]; it runs in the
   background, not on a user's tap.
-- **The gate** (slice 9's PG4): the spend at most 1.0 s at the median
+- **The gate** (the plan's PG4): the spend at most 1.0 s at the median
   with the levers, at most 1.5 s without them.
 
 
@@ -1304,8 +1379,12 @@ futures and tokio. The gateway serves, by virtual port:
 - **80:** the HTTP routes, the same `vos-http` server over the stream
   (`tokio_util::compat`, as today's TCP);
 - **7000 (`vos-api`):** the node API's frames over the stream, the kinds
-  `vos-api` over SSH relays today plus `Credentialed` and `Call` (the
-  personal agent's pushes, commits and device-set operations), with the gateway's leader-aware routing behind it. The light
+  `vos-api` over SSH relays today plus `Call` (the personal agent's
+  pushes, commits and device-set operations) and `Credentialed`, with the
+  gateway's leader-aware routing behind it. **`Credentialed` joins the
+  onion only once the verifier refuses a junk proof well under 1 ms**
+  (plan 8.5's pre-check): without addresses, a flood of junk proofs at
+  5.8–8 ms each would deny every member's sign-in (§6.6). The light
   node's `vos-api` client runs over the `DataStream` unchanged (a
   multiplexed client over any futures-io stream).
 
@@ -1315,8 +1394,16 @@ tunnels QUIC packets over a stream; we need not, since the gateway already
 speaks streams (HTTP, SSH, framed `vos-api`).
 
 **The onion address is the gateway's identity:** self-authenticating, so
-a client that pinned it at enrollment needs no TLS certificate for it; the
-SSH host key stays pinned as today (§7.3).
+a client that pinned it needs no TLS certificate for it; the SSH host key
+stays pinned as today (§7.3). **A space has several gateways, so several
+onions** (arti offers no load-balanced onion): enrollment pins the set,
+the registrar serves the current set as a query, and a device refreshes
+its pinned set through any onion of it. The recovery kit carries the set
+current at the claim; a space whose onions have all changed since is
+found only by its handle through the registry of spaces, which is not
+built (`open.md`, "The registry and the root space"; §8, D4). A gateway
+could serve a forged set, as it could forge any answer it relays
+(`open.md`, "Node-signed roots").
 
 ### 6.2 The client embedding arti
 
@@ -1333,14 +1420,17 @@ SSH host key stays pinned as today (§7.3).
 - **Isolation by purpose:** each of these gets its own circuit
   (`isolated_client()` or a `StreamPrefs` isolation group), so the
   gateway cannot join them by circuit:
-  - root polls and path fetches (one isolation each, as today's drawn
-    keys separate them);
+  - the credential tree's feed (§6.7, plan 8.27): one long-lived circuit,
+    since every member reads the same feed; until the feed lands, root
+    polls and path fetches each take their own, a rendezvous each (about
+    120 an hour in the foreground at today's 30 s polls, a cost PG5
+    counts);
   - proven calls (each its own, from a spare: the client keeps one
     circuit to the onion built ahead for the next proven call and builds
     the next spare once it is used, since each isolated circuit to an
     onion service is a new rendezvous, a second or more, heavy-tailed);
-  - the personal agent's traffic (its own group, on its own jittered
-    schedule, §3.10), never sharing a circuit with the member's proofs;
+  - the personal agent's traffic (its own group; its background schedule
+    its own, §3.10), never sharing a circuit with the member's proofs;
   - s4's screen session (its own).
 - **Dormant and awake:** awake while the app is in the foreground or a sync
   job runs; dormant otherwise (no circuit kept, no timer firing), so
@@ -1411,13 +1501,16 @@ place:
   other limits hold alone, and the fallback is C tor beside the gateway
   (§9 Q11).
 - **Limits per circuit and per service:** streams per rendezvous circuit,
-  requests a second per stream, and a global cap of proven calls in flight
-  through the onion (the node's verification budget behind it, `Busy` past
-  it).
+  requests a second per stream, calls per agent per circuit (so one
+  circuit cannot fill a personal agent's log), and a global cap of proven
+  calls in flight through the onion (the node's verification budget
+  behind it, `Busy` past it). Personal agents also admit only known keys
+  (§3.3).
 - **The proof's own cost:** a proven call carries the device format's PoW
-  (16 bits), checked before any decommitment; a junk proof costs the node
-  5.8–8 ms today [measured, format 46], less once the decode and setup
-  are profiled (§4.3).
+  (16 bits), a grinding parameter more than a price: a junk proof costs
+  the node 5.8–8 ms today [measured, format 46]. The pre-check that
+  refuses one well under 1 ms (§4.3, plan 8.5) is the precondition for
+  `Credentialed` on the onion (§6.1).
 - **Restricted discovery** (onion-service client authorization): stable
   since arti 1.7.0 (2025-11). Only clients holding an authorized key can
   read the service's descriptor, which hides it from scanners. Not offered
@@ -1441,10 +1534,10 @@ place:
 
 **Does not fix:**
 - **timing:** a gateway sees when a fetch and a proof arrive; jitter
-  (`PathKeeper`'s) spreads them, and syncing the tree (§3, the wallet's
-  `tree` and the credential book's) removes path fetches altogether, which
-  is the real fix the carried list names;
-- **the `map_root` fingerprint** (carried, plan 8.20): fixed by proving against
+  (`PathKeeper`'s) spreads them, and keeping each tree from its feed on
+  the device (plan 8.27; the wallet's `tree` likewise) removes path
+  fetches altogether, which is the real fix the carried list names;
+- **the `map_root` fingerprint** (carried, plan 8.27): fixed by proving against
   the newest root, which a synced tree gives the device, or by logging the
   root's place in the ring in place of the root;
 - **small anonymity sets:** a pool or a member tree of fifty is a set of
@@ -1513,33 +1606,35 @@ version a release and budget an upgrade step each slice.
 | crate | change |
 |---|---|
 | `vos-device` (`pvm/device`) | folds into `vos-light`; its secret, wire and path-keeper modules move, its credential prover goes (§4.1) |
-| `vos-light` (new, `node/light`) | the light node: the single-replica host, the store, the prover's device path, the node-API client, sync of sealed scopes, the device group over mls-rs, arti's client behind a feature; replaces `vos-device` one for one |
-| `vos-node` (`node/host`) | forwarding a request for an agent it does not replicate (§3.3); its executor and store usable without Raft. The crate is about 27.6k lines and depends without option on `vos-pvm-recair`, `vos-venue`, `vos-node-prover`, `vos-net`, `vos-raft`, quinn and the compiler; its `dispatch` is peer-arrival dispatch over `vos-net`, and `calls.rs` reads `vos_raft::Role`. Plan 8.6 opens with a carve-out spike choosing between a `server` feature and moving the executor and store into `vos-light`'s own single-replica host; `credentialed.rs`'s use of `vos_pvm_recair::device` moves either way |
+| `vos-light` (new, `node/light`) | the light node: merge and query dispatch over its store (no log), the transpiler for local packages and stock kernels, the prover's device path, the node-API client, sync of sealed scopes, the device group over mls-rs, arti's client behind a feature; replaces `vos-device` one for one |
+| `vos-node` (`node/host`) | forwarding a request for an agent it does not replicate, with its hop rule and peer stream (§3.3); admission by known keys at ingress (§3.3); ingress and apply reading the ring a guard names (§3.8). The light node does not carve it up: it needs only the executor's host-call layer, which moves to a crate both link (plan 8.6); `credentialed.rs`'s use of `vos_pvm_recair::device` moves with it |
 | `vos-pvm-recair` | `credential` deleted; the leaves, folds and wrap behind a `recursion` feature, on by default (the masking needs `context`, `circuit` and `trace`, which stay), so a device links less of the recursion prover (§9 Q9) |
 | `vos-pvm-final-verifier` | `credential` and `credential-bytes` deleted |
 | `vos-sdk`, `vos-sdk-macros` | `#[attestable(device, reference = …, headroom = …)]`; `#[msg(proven = kernel)]`; in-place kernel arguments; `vos_sdk::p2` (digests, tags, paths); `crdt::{GSet, Set, Map}` and `#[msg(merge)]` on the light node |
 | `vos-wire` | `Credentialed.claim` in place of `CredentialPublic`; `CredentialedInput` carries the claim; `Principal::Kernel { program }` (index 7); `CredentialKind` deleted; a peer message carrying a request as received, for forwarding (§3.3) |
 | `merkle-crdt` | the incremental apply (`core-model.md` §9.4); the author, its sequence and signature in the payload; a `Store` over fjall; fetching by batch, asynchronously (today's `fetch_missing` walks one node at a time, synchronously, `src/sync.rs`); the `redb` store and feature deleted (one storage engine) |
-| `vos-credentials` | the stock `auth` kernel (from the `device` test actor, in SDK form) and a new `owner` kernel, with their references; the stock kernels' ingress checks stay in the node (§4.3); a second ring for person leaves where `once` is used (§3.8, N3) |
+| `vos-credentials` | the stock `auth` kernel (from the `device` test actor, in SDK form) and a new `owner` kernel, with their references; the stock kernels' ingress checks stay in the node (§4.3); a second ring for person leaves where `once` is used, named by the guard (§3.8, N3); the registrar's person records, `enroll_device` and `revoke_device` |
 | `vos-gateway` | the onion service behind a `tor` feature (§6); a `vos-api` byte-stream port on it; per-circuit limits |
-| new system actors | `Homes` (the pool, claims, leases, recycling) and `Personal` (the device set, the MLS log, sealed scopes, the inbox, quotas), each one package; `Payments` (replacing the `purses` test actor) |
-| new tool | the operator's keeper, topping up the pool of personal agents (§3.3) |
+| new system actors | `Homes` (the pool, claims, the index by the kit's key) and `Personal` (the device set and its contests, the commit log and confirmations, sealed scopes, checkpoint acknowledgements, the inbox, quotas, activity and reaping), each one package; `Payments` (replacing the `purses` test actor, then the pool) and `Wallet` |
+| new tool | the operator's keeper: topping up the pool, granting `Homes` its role, reaping unused agents, upgrading `Personal` in bulk (§3.3) |
 
 **Net:** one crate in (`vos-light`), one out (`vos-device`); the
 credential AIR's modules, one feature, one format, its fixtures and its
 fuzz target out; merkle-crdt's redb out; cipher-clerk's `notes`,
 `pvm-precompile`, `fmd-experimental` and `stealth-experimental` and its VOS
 dependency out. In: arti's dependency tree (in the gateway and the light
-node), mls-rs's (in the light node), three actors, a tool, the SDK's CRDT
-fields and merge dispatch, and node forwarding. No proving code beyond the
-levers' format.
+node), mls-rs's (in the light node), four actors, a tool, the SDK's CRDT
+fields and merge dispatch, node forwarding and admission by known keys.
+No proving code beyond the levers' format.
 
 ### 7.2 The node and the gateway
 
 - **The node** gains no transport and no knowledge of Tor, MLS, JAM or
-  Kreivo. Its ingress generalizes (§4.3); its install computes a device
-  program for every device kernel (§4.4); format 44 goes; it forwards
-  requests for agents it does not replicate (§3.3). The personal agent is
+  Kreivo. Its ingress generalizes (§4.3), refuses a junk proof before
+  the verifier's bulk (§6.6) and, for an agent that asks, admits only
+  known keys to sessions (§3.3); its install computes a device program for
+  every device kernel (§4.4); format 44 goes; it forwards requests for
+  agents it does not replicate (§3.3). The personal agent is
   an ordinary agent running ordinary actors: nothing in the node knows
   what a personal agent is.
 - **The gateway** keeps HTTP, TLS and SSH, and adds the onion service
@@ -1559,9 +1654,12 @@ levers' format.
 - **The facility** `vos.credential` becomes `vos.node`: `enroll`,
   `sign_in` and `pay` as today (the trusted chrome, the pins, the two
   prompts [decided, `identity-and-authority.md` §7]), plus `claim` (the
-  personal agent, with the recovery kit), `pair` (§3.8), `devices`
-  (list, remove, veto, approve; each behind the admin key's prompt),
-  `restore` (from a recovery kit) and `move_home` (§3.9).
+  personal agent, with the recovery kit), `pair` (§3.8, a QR shown and
+  scanned), `devices` (list, remove, veto, resolve, contests, kit
+  rotation; each behind the admin key's prompt), `restore` (from a kit),
+  `move_home` (§3.9), `wallet` (balance, receive, private pay) and local
+  notifications for pending device operations. These are new Kotlin
+  screens in s4's client, estimated as their own plan step (8.24).
 - **Tor in s4's client:** its SSH connection to the gateway goes to the
   onion address pinned at enrollment, through the facility's `TorClient`;
   the host key is pinned as today.
@@ -1603,402 +1701,444 @@ entry names the situation and its consequence, then its handling: a
 
 ### 8.1 Devices and keys
 
-**A1. Two devices change the device set at once,** one offline (phone
-removes the tablet while the tablet, offline, adds a laptop). Two commits
-claim one epoch. *Mitigation:* the agent's log orders them; the first wins
-and the other is refused `EpochTaken`; the loser rereads and re-proposes
-only if its intent still holds (an add proposed by a device since removed
-dies with it). No device commits offline. (8.12, 8.16)
+**A1. Two devices change the device set at once,** one offline (the phone
+removes the tablet while the tablet, offline, pairs a laptop). *Mitigation:*
+the agent's log orders operations and commits; one candidate commit per
+epoch (`EpochTaken`); the loser rereads and re-proposes only if its intent
+still holds; no device commits offline. (8.13, 8.19)
 
-**A2. A device is lost or stolen, locked.** Its keys are wrapped under
-keystore keys bound to the unlock and to the prompt; nothing is readable
-without them. *Mitigation:* the owner removes it from another device (72
-h, or at once with two other devices) or with the recovery key (7 days). (8.17)
+**A2. A device is lost or stolen, locked.** Before its first unlock since
+boot, nothing opens: every key needs the keystore, and the keystore needs
+the unlock. After a first unlock, the sync key and the MLS state work
+while the screen is locked (§3.5), so a thief who keeps the phone powered
+and runs code on it (an OS exploit, forensic tools) reads the personal
+space; the admin key and the member secret still need the owner's prompt.
+*Mitigation:* the owner removes it from another device (72 h, or at once
+with two other devices) or with the kit. *Known limit:* after-first-unlock
+exposure, the price of background sync on a locked phone; stated in the
+light node's `SECURITY.md`. (8.13, 8.31)
 
 **A3. A device is stolen unlocked, the app open,** without the owner's
-biometric. The thief reads what the phone reads: the materialized data
-and, through the key archive, the history the agent holds. *Known limit,*
-inherent to any device that shows the user their data; it cannot change
-membership or veto (the admin key needs the prompt). The chrome says
-history up to the theft is exposed. (stated in 8.22)
+biometric. The thief reads what the phone reads, history included, and
+holds its sync key: he can push garbage (C1), post nacks (A16) and fill
+the device's share of the quota (C5). He cannot sign an operation or veto.
+*Known limit* for what the phone shows; the rest is bounded. (8.13, 8.20)
 
-**A4. A thief who also passes the prompt** (coercion, or a biometric the
-phone accepts too easily) can add a device, start removals and veto.
-*Mitigation:* the admin key accepts only strong biometrics, never the
-PIN fallback (§3.5); a removal of another device takes 72 h and its
-target cannot veto it, so the owner's other device vetoes the thief's
-removals and removes the stolen phone; two active devices remove at once.
-*Known limit:* a thief holding the phone and the owner's biometric can
-veto the kit's operations on the devices he holds (each may veto the
-other's removal). The owner's last remedy is restoring **elsewhere** from
-the kit: a new group at a new home, opened from the archives the kit
-holds, which no device of the old group can veto or join; the thief keeps
-what the phone already held. (8.17)
+**A4. A thief who passes the owner's strong biometric** (coercion, or a
+weak biometric sensor) holds an active device. *Mitigation:* the symmetric
+rules (§3.5): he can remove nothing uncontested while the owner vetoes;
+the owner wins a contest with one device and the kit, or with two other
+devices. *Known limit:* he can always contest; with only the kit left the
+owner cannot win, since the kit's own operations are cancelled by his veto
+(a leaked kit and a lone owner look alike to the agent). Property-tested
+against an adversary holding one active device and its biometric. (8.13)
 
 **A5. A device returns after months.** Within the 180-day retention it
-replays the handshakes it missed and derives every epoch's keys (data
-keys come from the exporter, so no ratchet window applies). Beyond it,
-the handshakes are gone. *Mitigation:* a device silent for 90 days is
-marked stale in the chrome and removed by any active device under the
-normal delay; past retention it re-pairs (a QR from a live device).
-(8.16)
+reads the commits and confirmations it missed and derives each confirmed
+epoch's keys (data keys come from the exporter, so no ratchet window
+applies). *Mitigation:* while it is away, every commit's confirmation
+waits for it and voids at 72 h (§3.4), so the group cannot change keys;
+a device silent for 30 days is shown as asleep, and any active device
+removes it under the normal rules (its removal needs no confirmation from
+it). Past retention it re-pairs. (8.19, 8.23)
 
 **A6. A long replay on a phone,** killed by Android midway. *Mitigation:*
 each commit is applied in one fjall batch with the stored epoch checked
-before and after (prior art: XMTP's local commit log); a gap of more than
-a few hundred commits prefers re-pairing to replay. (8.16)
+before and after; a gap of more than a few hundred commits prefers
+re-pairing. (8.19)
 
-**A7. A removed device backdates DAG writes,** sealing under an old epoch
-it still knows, with old parents. *Mitigation:* seal-at-push (§3.6) means
-the agent takes only the current epoch, which the removed device does not
-have; the agent refuses its keys; devices accept its envelopes only at or
-before its frontier. (8.16)
+**A7. A removed device backdates DAG writes.** *Mitigation:* seal at push
+takes only the confirmed epoch, which a removed device never learns; the
+agent refuses its keys; devices accept its envelopes only up to its
+frontier, and the CRDT types filter its writes at read (§3.2). (8.18,
+8.20)
 
-**A8. A write made offline leaks to a device removed meanwhile** (DCGKA's
-dominating-update case). *Mitigation:* seal at push under the epoch read
-just before; `StaleEpoch` otherwise. (8.16)
+**A8. A write made offline leaks to a device removed meanwhile.**
+*Mitigation:* seal at push under the confirmed epoch read just before;
+`StaleEpoch` otherwise. (8.20)
 
-**A9. A device applies its own commit before the log accepts it,** the
-first cause of forks in deployed MLS. *Mitigation:* mls-rs's pending
-commit merged only on the agent's acceptance at that epoch. (8.16)
+**A9. A device applies a commit before it is confirmed,** the first cause
+of forks in deployed MLS. *Mitigation:* candidates are processed but the
+prior state is kept until the epoch is confirmed. (8.19)
 
-**A10. Retries and leader changes,** a push or commit landing twice or
-another commit slipping between. *Mitigation:* envelopes deduplicated by
-the hash of their bytes; a commit is accepted once at its epoch; devices
-reread the log on every retry. (8.12)
+**A10. Retries and leader changes.** *Mitigation:* the push queue keeps
+sealed bytes and reseals only after `StaleEpoch`; the agent deduplicates
+by envelope id before checking the epoch; a commit is a candidate once.
+(8.14, 8.20)
 
 **A11. An OS backup or a cloned phone restores MLS state on a second
-device.** Two instances of one leaf fork the group. *Mitigation:* MLS
-state, the archive and the push queue are excluded from Android's backup
-and wrapped under a hardware key that does not migrate, so a restored
-copy cannot open them and starts as a new device (A13). Data sealing uses
-random 24-byte nonces, not MLS's secret tree, so a clone does not reuse
-nonces on data; a clone's commit forks the group and is detected (B4).
-(8.16)
+device.** *Mitigation:* MLS state, the archive and the queue are excluded
+from Android's backup and wrapped under a hardware key that does not
+migrate, so a restored copy starts as a new device (A13). A clone that
+commits produces a candidate the original cannot confirm consistently,
+and the epoch is void. (8.19, 8.22)
 
 **A12. The user's biometrics change,** and Android invalidates the key
-wrapping the admin key. The device syncs but cannot administer.
-*Mitigation:* another active device, or the recovery key, registers the
-device's new admin key; the device returns to probation, since a new
-admin key is as strong as a new device. (8.17)
+wrapping the admin key. *Mitigation:* another active device, or the kit,
+registers the device's new admin key as an operation; the device returns
+to probation. (8.23)
 
 **A13. The app is reinstalled on the same phone.** Keystore keys are gone;
-the phone is a new device, and its old leaf a ghost. *Mitigation:* it
-pairs from another device or restores from the kit, then removes the
-ghost. (8.17)
+the phone is a new device, its old leaf a ghost. *Mitigation:* it pairs
+from another device or restores from the kit, then removes the ghost; a
+ghost never confirms, so it is removed like an asleep device (A5). (8.23)
 
 **A14. A thief who passed the prompt pairs his own device.** *Mitigation:*
-probation: for 72 h the new device cannot add, remove or veto, and any
-active device removes it at once. It has received the history the stolen
-phone already held, no more. (8.17)
+probation: for 72 h it cannot sign or veto; the owner removes it, and if
+the thief's other device vetoes, the contest goes to the kit or two other
+devices (A4). It received what the stolen phone already held. (8.13)
 
-**A15. Clocks are wrong.** *Mitigation:* delays, leases and TTLs run on
-the agent's batch time, with the device's monotonic clock as a floor
-(B7); device clocks never order CRDT operations (Lamport counters do) or
-decide membership; MLS leaf lifetimes are generous (a year, renewed by
-updates). (8.12, 8.16)
+**A15. Clocks are wrong.** *Mitigation:* delays, probation, retention and
+activity run on the agent's batch time alone, the same for every device;
+a device whose clock disagrees by more than an hour raises an alarm and
+acts as the log says; Lamport counters order CRDT operations; MLS leaf
+lifetimes are a year. (8.13, 8.19)
+
+**A16. A committer forks the group selectively,** encrypting good path
+secrets to some devices and garbage to others (any sync-key holder: a
+thief with an unlocked phone, a probation device, malware). *Mitigation:*
+key-confirmed epochs: the devices that cannot process it post `nack`, the
+epoch is void for everyone, nothing was sealed under it, and the committer
+is flagged. A device that nacks every commit stalls key changes, not the
+group's data, until it is removed. (8.19, 8.21)
+
+**A17. A commit carries a proposal the design does not use** (ReInit, an
+external commit, a PSK, a group-context change) to steer the group.
+*Mitigation:* devices refuse any commit outside Add, Remove and Update,
+and an Add or Remove that does not match a matured signed operation; the
+refusal is a `nack`. (8.19)
+
+**A18. A device without a strong biometric.** *Mitigation:* it administers
+with its PIN as a delayed admin: every operation it signs waits 72 h and
+can be contested; pairing still works, 72 h later (§3.5). (8.13, 8.23)
+
+**A19. A shoulder-surfed PIN.** The thief signs in and pays from P1 (the
+member secret keeps its PIN fallback, as decided), but cannot touch the
+personal space (strong biometric) unless the device is a delayed admin, in
+which case every operation he signs is delayed and contestable. *Known
+limit,* stated; P1's remedy is `rekey` (N5). (8.7, 8.13)
 
 ### 8.2 The home space and its operators
 
-**B1. The operators withhold or delay sync.** Devices cannot tell an
-outage from withholding. *Mitigation:* devices work offline and are full
-replicas; after 7 days without the agent the chrome offers to move home
-(§3.9). (8.16)
+**B1. The operators withhold or delay sync.** *Mitigation:* devices work
+offline and are full replicas; after 7 days without the agent the chrome
+offers to move home (§3.9). (8.20)
 
-**B2. The operators delete envelopes.** *Mitigation:* each device
-periodically fetches a random sample of the positions it pushed and
-re-pushes what is missing, which also tells the user. (8.16)
+**B2. The operators delete envelopes.** *Mitigation:* each device fetches
+a random sample of positions it pushed, and re-pushes what is missing.
+(8.21)
 
-**B3. The operators roll the agent back** (a restored snapshot).
-*Mitigation:* each device refuses a control log shorter than or diverging
-from the highest `(log_index, log_chain)` it saw, and raises an alarm.
-(8.16)
+**B3. The operators roll the agent back.** *Mitigation:* each device
+refuses a control log shorter than, or diverging from, the highest
+`(log_index, log_chain)` it saw, and raises an alarm. (8.21)
 
-**B4. The operators equivocate,** showing two devices different handshakes
-for one epoch. The devices then hold different keys. *Mitigation:* every
-envelope carries its writer's view; a device that opens (or fails to
-open) another device's envelope sees the split and raises a fork alarm;
-recovery is moving home and re-pairing (prior art: remove-and-re-add,
-never roll back). *Known limit:* nodes sign nothing a device can show a
-third party, so the alarm is not proof of misbehaviour; carried with
-node-signed answers (`open.md`, "Node-signed roots"). (8.16)
+**B4. The operators equivocate.** *Mitigation:* on keys, confirmed epochs:
+two commits for one epoch give two `h`, signed by devices the operators
+cannot impersonate, and the epoch is void; on the device set's history,
+the views every envelope carries. Recovery is moving home and re-pairing.
+*Known limit:* nodes sign nothing a device can show a third party, so an
+alarm is not proof; carried with node-signed answers (`open.md`,
+"Node-signed roots"). (8.19, 8.21)
 
-**B5. The operators inject or replay.** They cannot seal (no key), so a
-forged envelope fails its AEAD and is dropped; a replayed envelope is a
-duplicate (its id, and its CID inside); a replayed commit breaks the
-epoch rule and the chain. *Mitigation:* as stated. (8.16)
+**B5. The operators inject or replay.** A forged envelope fails its AEAD;
+a replayed one is a duplicate; a replayed commit breaks the epoch rule.
+*Mitigation:* as stated. (8.20)
 
 **B6. The operators forge device-set operations.** They run ingress, so
-they can append to the agent's log anything, including "remove the
-laptop" in a device's name, and honest devices would carry it out.
-*Mitigation:* operations are signed end to end by the admin key and every
-device verifies the signature before acting (§3.5); a forged operation is
-ignored and raises an alarm. MLS commits authenticate themselves. (8.12,
-8.16)
+they can append anything to the log. *Mitigation:* every device verifies
+every operation's signature, and every confirmation's, itself. (8.13,
+8.19)
 
 **B7. The operators advance the agent's clock,** maturing a genuine but
-hostile removal at once. *Mitigation:* the device's own monotonic elapsed
-time is a floor on every delay. (8.16)
+hostile removal early, or reaping early. *Known limit:* delays trust the
+operators' clock; devices alarm on a clock that runs ahead of theirs by
+more than an hour. It only helps a thief who already passed the owner's
+biometric (A4), or the operators acting alone, whose reach B8 states.
+(8.13)
 
-**B8. The operators collude with a thief who passed the prompt:** they can
-drop the owner's vetoes and order the thief's commits first. *Known
-limit:* the home is trusted for availability and order (`core-model.md`
-§5); the owner's remedy is two devices' immediate removal and moving home.
-Stated in `SECURITY.md`. (8.22)
+**B8. The operators collude** with a thief who passed the prompt, or with
+a removed device. They can drop the owner's vetoes, order the thief's
+operations first, place a removed device's backdated writes before its
+frontier, and serve it data sealed before its removal's epoch is
+confirmed. *Known limit:* the home is trusted for availability, order and
+time (`core-model.md` §5); the owner's remedy is two devices' immediate
+removal and moving home. Stated in the light node's `SECURITY.md`. (8.31)
 
 **B9. The agent loses its quorum.** Sync and device changes stop; local
-work continues. *Mitigation:* devices queue and retry; the lease is kept by
-`Homes`, a different agent, so it does not lapse for that. (8.12)
+work continues. *Mitigation:* devices queue and retry; inactivity is
+counted from the last call the agent accepted, so a long outage does not
+reap it (the keeper reaps only on the agent's own word). (8.14)
 
-**B10. A home with one replica** (a policy for small spaces) holds the
-user's backup on one disk. *Mitigation:* the chrome shows the replica
-count; devices remain full replicas. *Known limit* for durability against
-the user losing every device at the same time as that disk. (8.12)
-
-**B11. The pool runs out.** *Mitigation:* `Homes` answers `PoolEmpty`, the
-keeper is alerted, the device stays local-only and retries. (8.12)
-
-**B12. `Homes` assigns one agent twice** (a bug). *Mitigation:* assignment
-is a Linear write in `Homes` checked unique; `Personal` refuses `assign`
-while owned and not wiped. (8.12)
-
-**B13. A recycled agent keeps its last tenant's residue.** *Mitigation:*
-`wipe` clears every table before the agent returns to the pool; the
-residue was ciphertext under keys the new tenant never sees; the last
-tenant's devices find their keys absent from the new device set and are
-refused. (8.12)
-
-**B14. The member leaves or is removed from the home space.** Revoking the
-pseudonym would link it to the member. *Mitigation:* the lease simply
-lapses (no renewal proof is possible), the agent goes read-only for 30
-days, then is wiped; the chrome warns well ahead and offers to move home.
+**B10. A home with one replica** holds the backup on one disk.
+*Mitigation:* the chrome shows the replica count; devices remain full
+replicas. *Known limit:* losing that disk and every device at once.
 (8.12)
 
-**B15. The home space vanishes or turns hostile.** *Mitigation:* §3.9's
-slice-8 path: claim elsewhere, a new group, re-pair, push everything;
-nothing is lost while one device holds the data. *Known limit:* devices
-must pair again by QR; the successor group with a resumption PSK is
-carried to slice 9. (8.17)
+**B11. The pool runs out.** *Mitigation:* `Homes` answers `PoolEmpty`;
+the keeper tops it up; the device stays local-only and retries. (8.12)
 
-**B16. A thief who passed the prompt moves the user's home** to a space he
-runs. *Mitigation:* a handover is delayed and vetoable like a removal
-(72 h) and signed end to end. (8.17)
+**B12. `Homes` assigns one agent twice, or one nullifier claims twice.**
+*Mitigation:* assignments and the nullifier index are Linear writes in
+`Homes`, checked unique; `Personal` answers `assign` with `assigned` or
+`refused`, and `Homes` releases a refused one. (8.12)
+
+**B13. A reaped agent returns to the pool with its last tenant's residue,**
+or the last tenant's device returns to it. *Mitigation:* `reap` clears
+every table; the residue was ciphertext under keys the new tenant never
+holds; the tenancy number goes up, so the old device sees "recycled", not
+a rollback. (8.14)
+
+**B14. The member leaves or is removed from the home space.** *Known
+limit:* activity keeps the agent; the operators cannot evict a pseudonym
+they cannot name. Quotas bound the cost; a yearly re-proof at a sign-in
+the user makes anyway is the later option. (§3.3; carried, §9.4)
+
+**B15. The user stops using every device for a long time** with the kit in
+a drawer. *Mitigation:* the agent is reapable only after 360 days without
+activity, any call by the kit counts, and the chrome says so when the kit
+is made. *Known limit:* past 360 days the backup may be gone. (8.14)
+
+**B16. The home space vanishes or turns hostile.** *Mitigation:* claim
+elsewhere, a new group, re-pair, push everything; nothing is lost while one
+device holds the data. *Known limit:* pairing again by QR; a successor
+group and a live handover are later work (§9.4). (8.23)
+
+**B17. Personal agents fill the space's disks.** *Mitigation:* a 64 MiB
+default quota (about 1.9 TB for 10^4 users on three replicas); the scale
+gate measures a full agent's snapshot install and one `replace`, with
+limits it must meet (plan 8.15). (8.15)
+
+**B18. `Personal`'s code is the operators'.** They install and upgrade it,
+so its delays and quotas are theirs to change. *Mitigation:* devices
+enforce what they verify (signatures, confirmations, frontiers by their
+own reading, the allow-listed proposals), not the constants. *Known
+limit:* a hostile upgrade is B8. The keeper upgrades every agent in bulk,
+and a state migration is written with each new version (state migration
+in general is unbuilt, `open.md`, "Upgrades"). (8.12)
 
 ### 8.3 Data, storage and quotas
 
-**C1. A buggy or malicious device of the user writes garbage** that opens
-correctly. *Mitigation:* apply validates each operation against its CRDT
-type and schema; a node that fails is quarantined (kept in the DAG, not
-applied) and the chrome names its author device. *Known limit:* excising a
-device's range of operations after the fact is carried to slice 9; in
-slice 8 the remedy is removing the device. (8.15)
+**C1. A device writes garbage** that opens correctly (a bug, or a thief
+with the sync key). *Mitigation:* apply validates each operation against
+its type and schema; a node that fails is quarantined (kept, not applied)
+and the chrome names its author. *Known limit:* excising a device's range
+after the fact is later work; the remedy is removing the device. (8.18)
 
-**C2. The DAG grows without bound.** *Mitigation:* checkpoints at
-deterministic boundaries and delayed collection (§3.6). (8.16)
+**C2. The DAG grows without bound.** *Mitigation:* checkpoints let new
+devices start late; the quota bounds the agent. *Known limit:* garbage
+collection is later work. (8.21)
 
-**C3. Two devices checkpoint at once.** *Mitigation:* boundaries are
-deterministic, so both checkpoints hold the same state; the second is
-redundant and dropped by its inner hash on read. (8.16)
+**C3. Two devices checkpoint at once.** *Mitigation:* checkpoints are cut
+at agent positions, so both hold the same state at the same `P`. (8.21)
 
-**C4. A rogue device collects history to erase it.** *Mitigation:*
-`collect` needs a checkpoint a second device acknowledged and a 72 h delay
-without a veto. (8.16)
+**C4. A wrong checkpoint** (a bug, a thief) misleads a new device.
+*Mitigation:* a new device trusts a checkpoint only when two devices other
+than its author acknowledged recomputing it, or it replays. (8.21)
 
-**C5. Quotas fill** (the user's data, or a compromised device of theirs).
-*Mitigation:* quotas per agent; a refused push keeps the device's queue
-intact; the chrome says why and offers checkpoint-and-collect. (8.12)
+**C5. Quotas fill,** perhaps to block the owner's removal of the filler.
+*Mitigation:* admin-signed operations, the commits carrying matured ones,
+and confirmations are exempt; each device has an unadvertised share of at
+most half the agent's bytes and calls. (8.14)
 
 **C6. Large objects.** A 1 MiB checkpoint is 17 envelopes and 17 push
-calls under today's caps (64 KiB of arguments a call); large log entries
-are the log's slow case.
-*Mitigation:* chunking (§3.6), and plan 8.12's gate measures pushes of
-full 256 KiB steps across many agents. A blob kind through the node's
-blob store is the lever if it binds. (8.12, 8.16)
+calls under today's caps. *Mitigation:* chunking; the scale gate pushes
+full 256 KiB steps among 10^4 agents. A blob kind through the node's blob
+store is the lever if chunking binds. (8.15, 8.20)
 
-**C7. Inbox spam.** *Mitigation:* in slice 8 only the user's devices, the
-agent, and a pairing slot's holder write; slots are single-use and last 10
-minutes; 64 items at most. Others' messages, with sender tokens or proof
-of work, come with messaging (slice 9). (8.12)
+**C7. Inbox spam.** *Mitigation:* only the user's devices and a pairing
+slot's holder write; slots are single-use and last 10 minutes; 64 items at
+most; admission by known keys (§3.3). (8.14)
 
 **C8. Sizes and timing describe the user.** *Mitigation:* Padmé padding,
-opaque scope ids, the DAG's shape inside the ciphertext, jittered
-background pushes. *Known limit:* counts and times remain; cover traffic
-is not built. (8.16)
+opaque scope ids, the DAG's shape inside the ciphertext, a background
+schedule of its own. *Known limit:* counts and times remain; foreground
+sync follows app use (L2); no cover traffic. (8.20)
 
-**C9. Two key archives at different epochs.** *Mitigation:* archives are
-unions indexed by epoch; a device unions every archive it opens. (8.16)
+**C9. Two key archives disagree** (a bug, a thief's bogus archive).
+*Mitigation:* every candidate key is kept and the AEAD decides. (8.20)
 
-**C10. Fetching old envelopes on demand reveals what the user reads.**
-*Mitigation:* devices are full replicas and fetch everything on a
-schedule, never on demand. *Known limit:* a device too small for a full
-replica (a watch) is later work. (8.16)
+**C10. Fetching on demand reveals what the user reads.** *Mitigation:*
+devices are full replicas and fetch everything on a schedule; member trees
+for proofs stay device-local, outside the synced scopes. *Known limit:* a
+device too small for a full replica is later work. (8.20)
 
 **C11. The phone's storage fills.** *Mitigation:* the local store refuses
-writes before the disk fills; sync pauses; the chrome says so. (8.15)
+writes before the disk fills; sync pauses; the chrome says so. (8.18)
 
 ### 8.4 Recovery and the device's life
 
-**D1. Every device is lost; the kit is kept.** *Mitigation:* §3.5's
-restore: 7 days, then a new group from the archives; memberships
-re-enrolled in each space by its registrar; P1 accounts moved by the
-operator's `rekey`; P2 notes (slice 9) swept with keys sealed to the kit
-if N4 is taken. *Known limit:* the kit holds keys, not data; the
-recovery envelopes and the data are at the home, so a home that is gone
-or withholding at that moment leaves the kit nothing to open. A second
-home's mirror (slice 9) is the remedy. (8.17)
+**D1. Every device is lost; the kit is kept.** *Mitigation:* restore
+(§3.5): 7 days, then `R2` released, the recovery envelopes opened (they
+follow every confirmed epoch, so no data is lost to lag), a new group;
+memberships re-enrolled by each registrar; P1 accounts by `rekey`; P2
+notes swept with the keys `R` sealed, under N4 (a). *Known limit:* the kit
+holds keys, not data; a home gone or withholding at that moment leaves it
+nothing to open. (8.23)
 
 **D2. Every device and the kit are lost.** *Known limit:* the personal
-space is gone; memberships and P1 accounts are recovered by each space's
-ordinary process; P2 notes are lost. Stated at the claim. (8.17)
+space is gone; memberships and P1 accounts come back by each space's
+ordinary process; P2 notes are lost. Stated when the kit is made. (8.23)
 
-**D3. The recovery phrase leaks.** *Mitigation:* its operations wait 7
-days, any active device vetoes them, and a device being removed by the kit
-cannot veto its own removal; the user rotates the kit (two devices at
-once, or one device and the 7 days). (8.17)
+**D3. The kit leaks.** *Mitigation:* alone it opens `R1`, not `R2`, so it
+reads nothing and spends nothing; its restore waits 7 days, shows on every
+device and is cancelled by any of them; the owner rotates the kit, which
+deletes the old `R2`. *Known limit:* the operators and a leaked kit
+together read everything and, under N4 (a), spend every device's notes.
+(8.13, 8.23)
 
-**D4. The kit points at an old home** after a move. *Mitigation:* the
-phrase stays valid; the chrome shows the new pointer after every move and
-asks the user to update the kit. *Known limit:* a user who never does must
-find their agent in the old home's records or lose the backup. (8.17)
+**D4. The kit points at old onions** after the space changed gateways.
+*Mitigation:* the kit carries the handle and the onions current at the
+claim; the agent is found by the kit's key, not an id (§3.5). *Known
+limit:* a space whose onions all changed is found only through the
+registry of spaces, not built. (8.23)
 
-**D5. A device sleeps through a veto window** (a laptop off for a long
-weekend; Doze deferring the job). *Mitigation:* 72 h for removals, 7 days
-for the kit, both chosen against a device checking in at least every
-couple of days; the chrome shows pending operations at the next open. No
-push notification exists to wake it (L3). *Known limit:* a user whose only
-other device sleeps longer than the delay cannot veto in time. (8.17)
+**D5. A device sleeps through a veto window.** *Mitigation:* 72 h for
+removals, 7 days for the kit; the background job raises a local
+notification when an operation is pending. *Known limit:* a user whose
+only other device sleeps longer than the delay cannot veto in time. (8.22)
 
-**D6. Android kills the process mid-write.** *Mitigation:* the local log,
-MLS state and push queue are each written in one fjall batch per step;
-pushes and commits are idempotent (A10). (8.6, 8.16)
+**D6. Android kills the process mid-write.** *Mitigation:* each local
+operation, each MLS state change and each queue change is one fjall batch;
+pushes and commits are idempotent (A10). (8.6, 8.19)
 
-**D7. A local actor's new version changes its state's shape.** State
-migration is unbuilt (`open.md`, "Upgrades"). *Known limit:* a local
-actor that changes its CRDT schema starts a new scope and the device
-re-imports; carried with upgrades. (8.15)
+**D7. A local actor's new version changes its state's shape.** *Known
+limit:* state migration is unbuilt; such an actor starts a new scope and
+the device re-imports. (8.18; carried, `open.md`, "Upgrades")
 
-**D8. A format or kernel change needs an app update** (format 47's
-re-pin). Proofs under the old format are refused. *Mitigation:* the light
-node computes stock kernels' programs from code it ships and asks for an
-update when the space's format moves; the chrome re-confirms a pinned
-method when its installed kernel changes. (8.4, 8.10)
+**D8. A format or kernel change needs an app update** (format 47).
+*Mitigation:* the light node computes stock kernels' programs from code it
+ships and asks for an update when they differ from the space's (§4.4).
+(8.4, 8.10)
+
+**D9. Devices run different app versions.** *Mitigation:* operations are
+versioned; an unknown kind waits for the update instead of being
+quarantined, so devices do not diverge. (8.18)
+
+**D10. A device-local wallet's phone is lost** (P2 in slice 8, N1 (c)).
+*Mitigation:* under N4 (a) the device's `sk` was sealed under `R` at its
+creation, so a restore (D1) sweeps its notes. *Known limit:* before the
+kit exists (no personal agent claimed) the notes go with the phone; the
+wallet asks for a kit before receiving. (8.30)
 
 ### 8.5 Cryptography's future
 
-**F1. Harvest now, decrypt later.** Operators may keep every handshake;
-with X25519 broken, they recover every epoch's keys and every envelope.
-*Mitigation:* a hybrid post-quantum suite if mls-rs offers a maintained
-one (checked in 8.3); otherwise ciphersuite 1 and a ReInit later; 180-day
-retention of handshakes, which honest operators keep. *Known limit:* a
-hostile operator keeps what it wants. (8.3, 8.16)
+**F1. Harvest now, decrypt later.** *Mitigation:* a hybrid post-quantum
+suite if mls-rs maintains one by 8.3 (N6); otherwise ciphersuite 1 and a
+successor group later; 180-day retention of handshakes. *Known limit:* a
+hostile operator keeps what it wants. (8.3, 8.19)
 
-**F2. Changing the suite or the protocol.** *Mitigation:* a ReInit into a
-successor group, the archives resealed under it, old envelopes left under
-their keys; never two suites in one group. A successor group derives new
-scope ids, so its envelopes are distinguished without a version byte.
-(design; later)
+**F2. Changing the suite or the protocol.** *Mitigation:* a successor
+group, the archives resealed, old envelopes left under their keys; never
+two suites in one group; new scope ids distinguish the new group's
+envelopes without a version byte. (later)
 
 **F3. RFC 9420's exporter is not forward-secure.** *Mitigation:* moot for
-history, which the archive keeps on purpose; the derivation moves to the
-Safe Exporter when mls-rs has it. (8.16)
+history, which the archive keeps on purpose; the Safe Exporter when
+mls-rs has it. (8.19)
 
 **F4. An mls-rs defect, or a change in its state format.** *Mitigation:*
-one pinned version a release, an upgrade step a slice; a state the new
-version cannot read means re-pairing that device. (8.16)
+one pinned version a release; a state the new version cannot read means
+re-pairing that device. (8.19)
 
 ### 8.6 Proving and payments
 
-**G1. Proofs for spent nullifiers or junk proofs** cost the node a
-verification each. *Mitigation:* the format's PoW checked first, the
-verification budget answering `Busy`, as today (`node/SECURITY.md`).
-(8.5)
+**G1. Junk proofs.** *Mitigation:* the pre-check refusing a junk proof
+well under 1 ms (plan 8.5), the format's PoW, the verification budget
+answering `Busy`. (8.5)
 
-**G2. A space installs a kernel that leaks a secret,** for example one
-whose public claim must equal the member secret. The device would prove
-it, publishing the secret. *Mitigation:* the light node puts a member
-secret or a spending key only into kernels whose device programs it
-computes from code it ships (the stock `auth` and `owner`, and in slice 9
-cipher-clerk's spend), never into a kernel whose bytes a space serves;
-other kernels may take only the user's public data. (8.4, 8.6)
+**G2. A space installs a kernel that leaks a secret** (its public claim
+the member secret). *Mitigation:* secrets enter only kernels the light
+node computes from code it ships, the pool's spend among them (§4.4).
+(8.4, 8.29)
 
-**G3. A space upgrades the package holding a stock kernel.** Its program
-id changes. *Mitigation:* the device compares the installed program with
-its own computation; a mismatch refuses to prove and the chrome says the
-space runs another version. (8.4)
+**G3. A space upgrades a stock kernel's package.** *Mitigation:* the
+device compares the installed program with its own and refuses to prove
+on a mismatch, saying so. (8.4)
 
-**G4. Balances split per device** under P1 (E2). *Known limit:* a payment
-comes from one device's account; consolidating is a visible transfer
-(L4). P2's notes carry the same split, without the visibility. (8.7)
+**G4. Balances split per device** (E2). *Known limit:* a payment comes
+from one device; consolidating under P1 is a visible transfer (L4), under
+P2 a private one. (8.7, 8.30)
+
+**G5. A developer's own kernel wants the user's private data.** *Known
+limit:* in slice 8 only data the user explicitly hands it, never keys; a
+consent model per program id is later work (§4.4). (8.4)
 
 ### 8.7 The network
 
-**H1. The onion is flooded** before arti's service PoW is declared ready.
-*Mitigation:* introduction-point limits, per-circuit and per-service
-limits, a cap on proven calls in flight, the device format's PoW; the C
-tor sidecar as the fallback (§9 Q11). (8.18)
+**H1. The onion is flooded with junk proofs** before arti declares its
+service PoW ready. *Mitigation:* `Credentialed` joins the onion only after
+the pre-check (§6.1); introduction-point, circuit and per-agent limits; a
+cap on proven calls in flight; the C tor sidecar as the fallback (Q11).
+(8.5, 8.25)
 
 **H2. Tor is blocked.** *Mitigation:* bridges and pluggable transports;
 calls to a space may fall back to the clearnet by its policy; the personal
-agent's traffic waits. (8.19)
+agent's traffic waits. (8.26)
 
 **H3. arti's library breaks monthly.** *Mitigation:* one pinned version a
-release, an upgrade step each slice. (8.18, 8.19)
+release, an upgrade step each slice. (8.25, 8.26)
 
-**H4. A background job starts cold** (a 10–30 s bootstrap) and runs out of
-time. *Mitigation:* arti's state persisted between runs; a job that does
-not finish leaves everything consistent (D6) and the next resumes. (8.19)
+**H4. A background job starts cold** (a 10–30 s bootstrap). *Mitigation:*
+arti's state persisted; an unfinished job leaves everything consistent
+(D6) and the next resumes. (8.22)
 
-**H5. A gateway's onion key is stolen.** The thief can impersonate the
-gateway: read, drop and delay what it relays, as any gateway can; it
-forges nothing (calls are signed, envelopes sealed). *Known limit:* the
-address is pinned at enrollment; re-pinning needs the space's announcement
-through another channel. (8.18)
+**H5. A gateway's onion key is stolen.** The thief reads, drops and
+delays what that gateway relays, and forges nothing. *Mitigation:* the
+pinned set is refreshed from the registrar (§6.1). *Known limit:* answers
+are unsigned (`open.md`, "Node-signed roots"). (8.25)
 
-**H6. Forwarding loops or amplification.** *Mitigation:* a forwarded
-request is never forwarded again (the receiver answers `Elsewhere` if it
-no longer replicates the agent); forwards count against the sending
-node's per-peer budget. (8.11)
+**H6. Forwarding loops, amplification, or starved elections.**
+*Mitigation:* the hop rule (a non-replica forwards once; a follower uses
+the existing forward to its leader), a peer stream of its own, forwards
+counted against the sender's budget, operator kinds never forwarded.
+(8.11)
+
+**H7. Strangers flood a personal agent's sessions** over Tor (agent ids
+are sequential). *Mitigation:* admission by known keys refuses them at
+ingress before any commit; per-agent circuit caps at the gateway. (8.11,
+8.25)
+
+**H8. One rendezvous per poll** costs battery. *Mitigation:* the tree
+feed on one long-lived circuit (8.27); until then PG5 counts rendezvous.
+(8.26, 8.27)
 
 ### 8.8 Linkability and membership
 
-**L1. The claim follows the enrollment in time.** *Mitigation:* the
-personal space starts local; the claim waits a random interval of up to a
-day unless the user pairs or turns on backup sooner. (8.17)
+**L1. The claim follows the member's first sign-ins.** *Known limit:* the
+claim needs the user's prompt, so it happens when the user is present; a
+home that is not one of the user's other spaces removes the link to the
+registrar (§3.10). (8.23)
 
 **L2. One device acts as a member and as the pseudonym.** *Mitigation:*
-separate Tor isolation groups per identity, keys used nowhere else,
-decorrelated schedules (§3.10). (8.19)
+separate Tor isolation groups, keys used nowhere else. *Known limit:*
+foreground sync starts when the user opens the app, as sign-ins do. (8.26)
 
 **L3. Push-notification tokens identify the user.** *Mitigation:* none is
-given to any space; devices poll. *Known limit:* fresher delivery waits
-for a push relay that sees no agent ids, later work. (design)
+given to any space; devices poll and raise local notifications. (8.22)
 
-**L4. P1 transfers between one's own devices** link their owner digests
-for the operators. *Known limit:* P1 is pseudonymous; P2 removes it.
-(8.7)
+**L4. P1 transfers between one's own devices** link their owner digests.
+*Known limit:* P1 is pseudonymous; P2 hides it. (8.7)
 
-**L5. The device count is visible** to the home's operators (the device
-set) and, in messaging, to other members. *Known limit* for the home;
-MLS virtual clients hide it from other members later. (design)
+**L5. Device changes and counts link the agent to the member** at a home
+that is also the user's space (§3.10). *Mitigation:* `enroll_device`
+deferred to the next ordinary sign-in; a home-only space recommended.
+*Known limit:* counts still match. (8.16, 8.23)
 
-**L6. `once` scopes with one leaf per device** let a member with three
-devices vote three times. *Mitigation:* agents that use `once` install a
-second credential ring of **person leaves**, one per member, held by one
-of the member's devices and moved by re-enrollment; other scopes use the
-device leaves (N3). (8.13)
+**L6. `once` scopes with one leaf per device.** *Mitigation:* a ring of
+person leaves, one per member, named by the guards that use `once` (N3).
+(8.16)
 
-**L7. The registrar learns which device leaves are one member's**
-(`enroll_device`). It already knows each member; the tree still hides
-which leaf proves. *Known limit,* stated. (8.13)
+**L7. The registrar learns which device leaves are one member's.** It
+already knows each member; the tree still hides which leaf proves. *Known
+limit,* stated. (8.16)
 
-**L8. Path fetches and the logged `map_root`** link a member's proofs
-(`open.md`, "Tree syncing"). *Mitigation:* the credential book syncs the
-tree's leaves through a paged feed, so no path is fetched, and every proof
-names the newest root. (8.20)
+**L8. Path fetches and the logged `map_root`** link a member's proofs.
+*Mitigation:* the credential tree's feed, so no path is fetched and every
+proof names the newest root (8.27). (8.27)
 
-**L9. Lease renewals reveal the device count over time** (each device
-renews under its own nullifier). *Known limit,* the same fact as L5.
-(8.12)
+**L9. A space's page asks the device to prove in the "home" scope.**
+*Mitigation:* the scope is reserved: the facility refuses any request
+naming `Homes`' agent and instance. (8.12, 8.23)
 
 ### 8.9 Sources for the prior art
 
@@ -2033,72 +2173,113 @@ renews under its own nullifier). *Known limit,* the same fact as L5.
 - Padmé padding, PoPETs 2019:
   https://www.petsymposium.org/popets/2019/popets-2019-0056.php
 
-## 9. Open questions for the owner, and risks
+## 9. Open questions for the owner, risks, and later work
 
 ### 9.1 New questions
 
 Ranked by how much of the slice each one moves. Each has options and a
 recommendation.
 
-**N1. Move P2 (the shielded pool and the wallet) to slice 9?**
-- (a) Slice 8 builds P1, the personal agent and Tor; cipher-clerk v0.4 is
-  designed, built and released in its own repository during slice 8; P2
-  (the pool, the wallet, the spend kernel, PG4) opens slice 9.
-- (b) Keep P2 in slice 8 as E3 asked: the slice grows by about 8–11 weeks
-  on its critical path (the wallet is a local actor on the personal space,
-  so it follows all of M4), to about 30–36 weeks.
-- **Recommended: (a).** The wallet needs the personal space finished
-  (sync, pairing, the recovery key, since a lost device's notes are only
-  recoverable through it, N4); P2's privacy rests on Tor and on the
-  personal agent's unlinkability rules being in place first; and the
-  slice is already the largest yet. E3's order (P1, then P2) holds; only
-  the slice boundary moves.
+**N1. How P2 (the shielded pool and the wallet) fits.**
+- (a) Move P2 to slice 9: slice 8 builds P1, the personal space and Tor;
+  cipher-clerk v0.4 is released in slice 8; the pool and a synced wallet
+  open slice 9.
+- (b) P2 in slice 8 with a synced wallet: the wallet follows all of the
+  personal space, adding about 8–11 weeks to the critical path.
+- (c) **P2 in slice 8 with a device-local wallet:** under E2 a note is
+  spent only by the key of the device that holds it, so the wallet needs
+  no sync to work; P2 then needs proven calls (8.4, 8.5), cipher-clerk
+  v0.4 (8.28), the pool and the wallet (8.29, 8.30), and Tor for the
+  pool's `required` policy, not the personal space. Its own stream, off
+  the critical path; slice 9 syncs the wallet. The kit's protection of a
+  lost device's notes (N4) arrives with M4 in the same slice.
+- **Recommended: (c).** It honours E3 without lengthening the slice's
+  critical path. Its costs: a sixth stream; PG4 and P2's flows in the
+  slice-end gate; P2's privacy depends on Tor landing (M5), so P2 is
+  shown over Tor at M5's end. If the cipher-clerk stream slips, P2 moves
+  to slice 9 without holding anything else back, which is (a).
 
-**N2. Where sealed scopes live on the nodes?**
+**N2. Where sealed scopes live on the nodes.**
 - (a) In the personal agent's replicated tables, written through its log
-  (§3.6): durable, consistent, the epoch checked atomically against the
-  device set and the MLS log; a commit per push at personal rates.
-- (b) A node-side Merge store replicated outside Raft by gossip: no log
+  (§3.6): durable, consistent, each push checked atomically against the
+  confirmed epoch; a commit per push at personal rates.
+- (b) A node-side Merge store replicated by gossip outside Raft: no log
   entry per push, but a new peer protocol and durability path, and each
-  push still consults the log for the epoch.
-- **Recommended: (a).** It realizes E6 (nodes as durable ciphertext
-  replicas) with no new node machinery; (b) is kept for plaintext scopes,
-  where nodes merge what they read.
+  push still consults the log.
+- **Recommended: (a).** It realizes E6 with no new node machinery; (b)
+  stays the design for plaintext scopes.
 
 **N3. `once` scopes under per-device secrets (E2).**
-- (a) A second credential ring of **person leaves**, one per member,
-  held by one of the member's devices, in agents that use `once` (§3.8,
-  L6); every other scope uses device leaves.
-- (b) A nullifier key synced across the user's devices, so every device
-  of a member derives the same nullifier: a secret that syncs, against E2.
+- (a) A second ring of **person leaves**, one per member, held by one of
+  the member's devices, in agents that use `once`, named by the guard;
+  the registrar keeps person records (§3.8).
+- (b) A nullifier key synced across the user's devices: a secret that
+  syncs, against E2.
 - (c) Accept one vote per device.
 - **Recommended: (a).** It keeps E2 and costs a second tree only where a
-  space uses `once`.
+  space uses `once`; it needs ingress and apply to read the ring a guard
+  names (plan 8.16).
 
-**N4. Spending keys and recovery (decides the recovery kit's contents in
-slice 8, used by P2 in slice 9).**
-- (a) Each device's spending key `sk` is random, wrapped under a per-use
-  keystore key, and sealed to the recovery key, so a lost device's notes
-  are swept to a new device on restore.
-- (b) Spending keys bound to hardware, like the member secret: a lost
-  device's notes are lost.
-- **Recommended: (a).** Cash-like loss is acceptable for a membership
-  (re-enrollment fixes it), not for money.
+**N4. Spending keys and recovery.**
+- (a) Each device's `sk` is random, wrapped under a per-use keystore key,
+  and also sealed under the recovery wrap key `R` (§3.5) at the agent:
+  an encrypted secret leaving the device, which E2's "syncs everything
+  but secrets" did not foresee. A matured restore (7 days, cancelled by
+  any of the user's devices) sweeps a lost device's notes. A leaked kit
+  alone cannot spend (it lacks `R2`); **the home's operators together
+  with a leaked kit can spend every device's notes at once.**
+- (b) Spending keys bound to the device, like the member secret: a lost
+  device's notes are lost; nothing about money leaves the device.
+- **Recommended: (a).** Losing money with a phone is worse for most users
+  than the stated collusion risk; the chrome states both when the kit is
+  made, and a user may choose (b) per device.
 
 **N5. The device-change parameters.**
-- Proposed: probation 72 h; removing another device, a handover and a
-  collection 72 h; the recovery key's operations 7 days; immediate with two
-  active devices; the admin key behind strong biometrics only; a recovery
-  kit required to claim a personal agent; handshakes retained 180 days.
-- **Recommended:** these, each a constant of `Personal` a space cannot
-  shorten, revisited after PG3′'s flows are timed on real use.
+- Proposed: probation 72 h; removing another device 72 h; the kit's
+  operations 7 days; immediate with two active devices other than the
+  target; contests resolved by two other devices or the kit; the admin
+  key behind a strong biometric, the PIN making a delayed admin; the
+  member secret keeping its PIN fallback (so P1 money has the lower bar,
+  `rekey` its remedy); a kit required to claim; reapable after 360 days
+  unused; handshakes retained 180 days; confirmations voided at 72 h.
+- **These are the operators' constants:** `Personal` is their code (§8,
+  B18). Devices enforce only what they verify: signatures, confirmations,
+  allow-listed proposals and the frontiers they read.
+- **Recommended:** these values, revisited after PG3′'s flows are timed in
+  real use.
 
 **N6. The MLS suite.**
-- (a) Ciphersuite 1 (X25519) now, a ReInit to a hybrid post-quantum
-  suite when mls-rs maintains one.
-- (b) Make a hybrid suite a precondition of plan 8.16.
+- (a) Ciphersuite 1 (X25519) now; a successor group on a hybrid
+  post-quantum suite when mls-rs maintains one.
+- (b) A hybrid suite as a precondition of plan 8.19.
 - **Recommended: (a), with 8.3 checking mls-rs first:** if a maintained
-  hybrid suite exists at that step and fits the phone, take it then.
+  hybrid suite exists then and fits the phone, take it.
+
+**N7. MLS (E7), or per-epoch keys sealed to each device's public key?**
+- **The simpler scheme:** at each device change or rotation, the device
+  that makes it draws a random epoch key, seals it with HPKE to each
+  device's X25519 key, and posts the sealed copies with its admin-signed
+  operation; scope keys derive from the epoch key; the archive, the kit
+  and the cursor are unchanged. Key-confirmed epochs still apply (a
+  committer could seal garbage to some devices), with the same
+  confirmation step.
+- **What MLS buys here:** a standard, analysed protocol and its
+  implementation; post-compromise security by updates, which the simple
+  scheme matches by rotating the epoch key; tree-based efficiency, which
+  does not matter for ten devices; and the path to slice 9's messaging,
+  where the device group becomes the emulation group of MLS virtual
+  clients, so other members see one leaf per user.
+- **What MLS costs here:** mls-rs on the phone and its version churn
+  (§8, F4); the TreeKEM state machine, pending commits, the proposal
+  allow-list, handshake retention for devices that come back; perhaps
+  1–2 weeks of the critical path (8.19) over the simple scheme.
+- **Recommended: keep MLS (E7).** With key-confirmed epochs both schemes
+  need the same confirmation step, so the simple scheme saves the TreeKEM
+  machinery but not the protocol's hard part; MLS's value is slice 9's
+  messaging, which the owner named. The comparison is not clear-cut the
+  other way. If 8.3 finds mls-rs too heavy on the phone, or slice 9's
+  messaging is not taken up through virtual clients, switch to the simple
+  scheme then: nothing above the key layer changes.
 
 ### 9.2 Draft 2's questions, taken at their recommendations
 
@@ -2111,40 +2292,57 @@ Provisional [E11]: each stands until the owner says otherwise.
 - **Q7** (SDK kernels as lean as hand-written): measured first, plan 8.2,
   the 1.15× gate; nothing in M2 starts before it.
 - **Q8** (local workflows with device effects): glue in the light node's
-  Rust for slice 8; a local `#[workflow]` with `ctx.prove` and
-  `ctx.call_remote` later.
+  Rust for slice 8; a local `#[workflow]` later.
 - **Q9** (the device prover outside `vos-pvm-recair`): a `recursion`
-  feature on `vos-pvm-recair`, default on, the light node without it; no
-  crate moves.
+  feature on `vos-pvm-recair`, default on, the light node without it.
 - **Q10** (the pool's integrity): the operators' for the in-space pool,
   stated in its documentation and chrome; a proved pool designed next.
-  Moves with P2 (N1).
 - **Q11** (arti for hosting): arti in the gateway behind a `tor` feature,
-  PoW when a release declares it. The risk is a flood before then (§8,
-  H1); the fallback, should it happen, is C tor beside the gateway
-  (stable PoW, a second process and a C dependency, against the owner's
-  "arti in the ingress"), kept documented and tested once in 8.18.
-- **Q12** (note delivery): memos with view tags in the pool. Moves with P2
-  (N1).
+  PoW when a release declares it; the risk is a flood before then (§8,
+  H1); the fallback is C tor beside the gateway (stable PoW, a second
+  process and a C dependency, against the owner's "arti in the
+  ingress"), documented and run once in 8.25.
+- **Q12** (note delivery): memos with view tags in the pool.
 
 ### 9.3 Risks
 
-- **The slice's size.** Even with P2 moved, it is the largest so far
-  (`slice-8-plan.md`, about 21–28 weeks on five streams); the personal
-  space chain (8.6 → 8.15 → 8.16 → 8.17) is the critical path.
-- **The Merge lane is unbuilt:** merkle-crdt has no dependent, the SDK
-  has no CRDT fields, the incremental apply is a prototype (`core-model.md`
+- **The slice's size:** the largest so far (`slice-8-plan.md`: about
+  25–34 weeks with reviews, six streams); the personal space on devices is the
+  critical path.
+- **The Merge lane is unbuilt:** merkle-crdt has no dependent, the SDK has
+  no CRDT fields, the incremental apply is a prototype (`core-model.md`
   §9.4). Slice 8 builds the device side and sealed scopes, not plaintext
   scopes on nodes.
-- **MLS on the device is new code in a new place:** mls-rs on Android,
-  its state under the keystore's keys, a delivery service written as an
-  actor. The `messaging` branch built mls-rs for VOS before, in another
-  architecture; its storage providers and the one-commit-an-epoch rule
-  carry over, nothing else.
+- **MLS on the device is new code in a new place,** with key-confirmed
+  epochs on top; the `messaging` branch's storage providers and its
+  one-commit-an-epoch rule carry over, nothing else (N7).
 - **10^4 personal agents waking a few times an hour** are unmeasured
-  (idle agents are: `core-model.md` §14.1); plan 8.12's gate measures them.
+  (plan 8.15's gate).
 - **Proof bytes over Tor** dominate a call's latency (§6.3).
 - **cipher-clerk v0.4 is a redesign** of a not-for-value prototype; its
   notes stay not for value until the external audit (`proving.md` §4).
 - **Android's background limits** bound how fresh a backgrounded device
-  is and how fast it sees a pending removal (§8, D5).
+  is and how soon it sees a pending removal (§8, D5).
+
+### 9.4 Later work this design leaves
+
+One list, so nothing deferred is lost; `open.md` takes it at the slice's
+end.
+- A synced wallet (P2's wallet across devices, if N1 (c)).
+- Messaging between members, on MLS virtual clients, with the owner's word
+  on the shared virtual-leaf keys against E2 (§3.10).
+- Plaintext Merge scopes on nodes (`core-model.md` §9.4 as designed).
+- Actors the user installs in the personal agent (E9).
+- A second home mirroring the first; a live handover between homes; a
+  successor group after a lost home (§3.9).
+- History horizons (forward secrecy for chosen scopes) and garbage
+  collection of covered envelopes (§3.4, §3.6).
+- Excising a device's operations after the fact (§8, C1).
+- A blob kind for large objects (§8, C6).
+- A consent model per program id for developers' kernels over private data
+  (§4.4).
+- A yearly re-proof of the home's membership (§8, B14).
+- Node-signed answers, so an alarm becomes proof (§8, B4).
+- Local workflows with device effects (Q8); the light node in its own
+  Android process (Q5).
+- A device too small for a full replica (§8, C10).

@@ -1,15 +1,15 @@
 # Slice 8: the light node and the personal agent — plan
 
-Draft 3 [proposed]. The design is `light-node.md` (draft 3); this file
+Draft 4 [proposed]. The design is `light-node.md` (draft 4); this file
 orders it into milestones, steps, gates and estimates, and places what
 slice 7 carried.
 
 - **Status:** [proposed] throughout. The steps take the owner's decisions
   E1–E11 (`light-node.md` §1.1), draft 2's Q5–Q12 at their
   recommendations, provisionally (§9.2), and the recommended answers to
-  the new questions N1–N6 (§9.1); a different answer changes the steps it
-  names. **N1 moves P2 (the shielded pool and the wallet) to slice 9;**
-  E3 asked for it in slice 8, so this needs the owner's word.
+  N1–N7 (§9.1); a different answer changes the steps it names. With N1
+  (c), P2 is built in slice 8 on its own stream; with N1 (a), steps
+  8.29–8.30 and PG4 move to slice 9 and nothing else changes.
 - **Precondition:** slice 7's cleanup before master: the code and the
   documents (merged at `543c05e07`), the single re-pin that resets the
   version counters, and s4's VOS pin moved off the retired device format
@@ -22,11 +22,23 @@ slice 7 carried.
   minute a target and leakage at medium N at milestones, 5-minute fuzz and
   full-N leakage at the slice end. cipher-clerk's steps run in its own
   repository and release by tag; VOS takes the tag.
-- **Estimates** are one implementer's weeks, before review. The critical
-  path assumes five streams: proving (M1's proving steps, then M2's 8.8);
-  a second proving implementer (M2's 8.9); the light node and the
-  personal space on devices (8.6, 8.14–8.17); the node side and Tor (8.11–
-  8.13, 8.18–8.20); cipher-clerk (8.21).
+- **One heavy run at a time:** proving gates (leakage, `ci-full`, phone
+  sessions) and the scale run (8.15) are scheduled one after another on
+  the machines, never together; two implementers coding in M2 share the
+  queue, not the machine.
+- **Estimates** are one implementer's weeks, before review, unless a line
+  says otherwise. The critical path is re-derived with reviews at the end.
+
+**Streams:**
+
+| stream | steps |
+|---|---|
+| A, proving | 8.2, 8.4, 8.5, 8.8, 8.10 |
+| B, second proving | 8.3, 8.7, 8.9 |
+| C, the light node (the critical path) | 8.6, 8.18, 8.19, 8.20, 8.23 |
+| D, the node side | 8.11–8.16, then 8.21 |
+| E, transport and Android | 8.1, 8.17, 8.22, 8.24, 8.25–8.27 |
+| F, cipher-clerk and P2 | 8.28–8.30 (N1 (c)) |
 
 ## Phone gates, restated for one proving path
 
@@ -34,360 +46,357 @@ PG1 (the credential AIR's 250 ms) retires with format 44. Every gate is on
 the Fairphone 6 [decided, `proving.md` §8], automatic threads, three rounds
 of five, the gate the median of the rounds' medians, the 95th percentile
 beside it, each proof verified on the phone and accepted at a space's
-ingress.
+ingress. Every gate has a limit it can miss.
 
-| gate | what | budget | when |
+| gate | what | limit | when |
 |---|---|---|---|
 | **PG1′ owner** | the stock `owner` kernel, SDK form | ≤ 0.5 s, ≤ 512 MiB | M1 (format 46), M2 (47) |
-| **PG2′ sign-in** | the stock `auth` kernel, SDK form | ≤ 1.0 s at format 46 (M1); **≤ 0.55 s** at format 47 (M2; the model's 0.45–0.48 s leaves a 0.5 s gate a 4% margin); ≤ 1 GiB (target 768 MiB); the proof ≤ 1.5 MiB | M1, M2, slice end |
-| **PG3′ flows** | enroll, sign-in, pay (P1), claim a personal agent (with its recovery kit), pair a second device, sync both ways, remove a device (delayed, then vetoed once and let through once), restore from the kit on a fresh install, move home; through the gateway's onion service, every secret behind the keystore's prompt; recorded (a capture, the gateway's and node's logs) | each flow completes; the latencies recorded beside `light-node.md` §6.3's model | M1 (enroll, sign-in, P1 on the clearnet), M4 (the personal space on the clearnet), M5 (all, over Tor), slice end |
-| **PG5 footprint** | the light node with arti and mls-rs: the `.so`'s growth, idle resident memory, warm and cold bootstrap, an onion connection, a day of background syncs' battery | `.so` growth ≤ 12 MB, idle ≤ 96 MiB, warm bootstrap ≤ 3 s p50; the rest recorded | M0 (first numbers), slice end |
-| **PG6 sync** | a background sync job with nothing new; a catch-up of 1 MiB of envelopes; a commit's processing on the phone | the job ≤ 30 s wall and ≤ 1 MB down at p50; the catch-up and the commit recorded, over Tor | M4 (clearnet), M5 and slice end (Tor) |
-
-PG4 (the spend) moves with P2 to slice 9 (N1).
+| **PG2′ sign-in** | the stock `auth` kernel, SDK form | ≤ 1.0 s at format 46; **≤ 0.55 s** at format 47; ≤ 1 GiB; the proof ≤ 1.5 MiB | M1, M2, slice end |
+| **PG3′ flows** | enroll, sign-in and pay (P1); claim with a kit; pair a second device; sync both ways; a removal let through, and one contested and resolved by the kit; restore from the kit on a fresh install; move home (two spaces); every secret behind its prompt; recorded (a capture, the gateway's and node's logs) | each flow completes; over Tor, at the median: a sign-in ≤ 4 s, a P1 payment ≤ 5 s, pairing ≤ 60 s from the scan to the second device's first read | M1 (the P1 flows, clearnet), M4 (the personal-space flows on the clearnet, two local spaces), M5 (over Tor, but moving home), slice end |
+| **PG4 spend** (N1 (c)) | the pool's `spend` kernel (1 in, 2 out) | ≤ 1.5 s at format 46, ≤ 1.0 s at 47; ≤ 1 GiB; the proof ≤ 1.5 MiB; a private payment over Tor ≤ 6 s | 8.30, slice end |
+| **PG5 footprint** | the light node with arti and mls-rs | `.so` growth ≤ 12 MB; idle ≤ 96 MiB; warm bootstrap ≤ 3 s p50; a day of the background job ≤ 2% of the battery; rendezvous an hour in the foreground ≤ 30 after 8.27 | M0 (first numbers), slice end |
+| **PG6 sync** | the background job on a locked phone; a catch-up of 1 MiB of envelopes; a commit's processing and confirmation | the job ≤ 30 s and ≤ 1 MB down with nothing new, p50, on a locked phone; the 1 MiB catch-up over Tor ≤ 20 s p50; a commit processed ≤ 200 ms | M4 (clearnet), M5 and slice end (Tor) |
 
 **The second device** for pairing is the owner's to name (another phone,
-or an emulator for the second side; the restore flow needs a fresh
-install, which the Fairphone itself can be).
+or an emulator for the second side; the restore needs a fresh install,
+which the Fairphone itself can be).
 
-**Phone sessions** (each asked a week ahead): S8-P1 at M0 (arti and
-mls-rs, PG5's first numbers); S8-P2 at M1's end (PG1′, PG2′ on 46, PG3′'s
-first flows on the clearnet); S8-P3 at M2's exit and S8-P4 a day later
-(PG1′, PG2′ on 47, twice); S8-P5 at M4's end (the personal space's flows,
-PG6 on the clearnet, two devices); S8-P6 at M5's end (PG3′ and PG6 over
-Tor); S8-P7 at the slice end (every gate on the final build).
+**Phone sessions** (each asked a week ahead): S8-P1 at M0 (arti, mls-rs,
+the keystore's after-first-unlock keys); S8-P2 at M1's end; S8-P3 at M2's
+exit and S8-P4 a day later; S8-P5 at M4's end (two devices); S8-P6 at M5's
+end (over Tor); S8-P7 at the slice end. PG4 joins the session nearest
+8.30's end.
 
 ## M0 — Measure first (2–3 weeks)
 
-### 8.1 arti on the phone and at a gateway (spike)
+### 8.1 arti on the phone and at a gateway (spike) — stream E
 - arti-client (`default-features = false`; `tokio`, `rustls`,
-  `compression`, `onion-service-client`) linked into the facility's
-  build; a throwaway gateway prototype hosting an onion service in
-  process (`launch_onion_service_with_hsid`, `handle_rend_requests`) with
-  one echo port and one `vos-api` port.
-- **Measure:** the `.so`'s growth, idle resident memory, cold and warm
-  bootstrap, onion connection time (p50, p95), a 1 MB upload, the round
-  trip of a `Time` request, and 16 pipelined queries on one channel; on
-  x86 too.
-- **Gate:** PG5's first numbers recorded; `light-node.md` §6.3–§6.4
-  updated with them. **Phone:** S8-P1. **Dep:** none. **Estimate:** 1–1.5
+  `compression`, `onion-service-client`) in the facility's build; a
+  throwaway gateway hosting an onion service in process with an echo port
+  and a `vos-api` port.
+- **Measure:** the `.so`'s growth, idle memory, cold and warm bootstrap,
+  onion connection (p50, p95), a 1 MB upload, a `Time` round trip, 16
+  pipelined queries on one channel; on x86 too.
+- **Gate:** PG5's first numbers within twice their limits, or a recorded
+  reason and a re-plan of M5. **Phone:** S8-P1. **Estimate:** 1–1.5
   weeks.
 
-### 8.2 SDK-form kernels, measured
-- `vos_sdk::p2` (`Digest`, `Tag::hash`, `Path::root`, lean, no branch on
-  path bits); in-place device arguments by the macro; the guest target's
-  `unaligned-scalar-mem` checked through the transpiler on a branch (it
-  rebuilds every guest ELF and moves every pinned blob, so it lands only
-  with 8.10's re-pin).
-- `auth` and `owner` written in SDK form in a test actor; steps counted
-  against the hand-lean kernel (1,722).
-- **Gate:** the SDK-form auth ≤ 1.15× the lean kernel's steps, or a
-  recorded reason and the fallback (`light-node.md` §9.2, Q7).
-  **Dep:** none. **Estimate:** 1.5–2 weeks.
+### 8.2 SDK-form kernels, measured — stream A
+- `vos_sdk::p2`; in-place device arguments by the macro; the guest
+  target's `unaligned-scalar-mem` checked through the transpiler on a
+  branch (it lands with 8.10's re-pin).
+- `auth` and `owner` in SDK form; steps against the hand-lean 1,722.
+- **Gate:** the SDK-form auth ≤ 1.15× the lean kernel's steps, or the
+  fallback (`light-node.md` §9.2, Q7). **Estimate:** 1.5–2 weeks.
 
-### 8.3 mls-rs on the phone (spike)
-- mls-rs (the version current at the step, ciphersuite 1, the storage
-  providers from the `messaging` branch adapted to fjall) in the
-  facility's build; a group of three: create, add, remove, an update, the
-  exporter's keys; whether a maintained hybrid post-quantum suite exists
-  and what it costs (N6).
-- **Measure:** the `.so`'s growth, a commit's processing time and memory
-  on the phone, the state's size per device.
-- **Gate:** numbers recorded in `light-node.md` §2.3 and §3.4; the suite
-  chosen (N6). **Phone:** S8-P1. **Dep:** none. **Estimate:** 1 week.
+### 8.3 mls-rs and the keystore on the phone (spike) — stream B
+- mls-rs (ciphersuite 1; the `messaging` branch's storage providers
+  adapted to fjall) in the facility's build: a group of three, create,
+  add, remove, update, the exporter; whether a maintained hybrid
+  post-quantum suite exists and what it costs (N6).
+- An after-first-unlock keystore key used by a WorkManager job on a locked
+  Fairphone; a strong-biometric key refusing the PIN.
+- **Gate:** a commit processed ≤ 200 ms and the `.so` growth ≤ 2 MB, or
+  N7's simpler scheme taken instead; the locked-phone job works, or PG6's
+  locked-phone limit is dropped and stated. **Phone:** S8-P1.
+  **Estimate:** 1–1.5 weeks.
 
-## M1 — One ingress path, the light node crate, P1 payments (6–9 weeks)
+## M1 — One ingress path, the light node's core, P1 (6–8 weeks)
 
-### 8.4 Device programs for every kernel
-- `#[attestable(device, reference = …, headroom = …)]`; the derivation
-  records the reference and refuses a device kernel without one; the
-  install computes each device kernel's program; the testkit's
-  `device_fits`.
-- **Which kernels see a secret** (`light-node.md` §4.4, §8 G2): the light
-  node's own computation of the stock kernels' programs, compared with the
-  space's before a secret enters a proof.
-- **Carried in:** reproducible path-dependent blobs: a device computes a
-  kernel's program id from bytes, so the bytes must be reproducible
-  (`open.md`, "Repository").
-- **Dep:** 8.2. **Estimate:** 1.5–2 weeks.
+### 8.4 Device programs for every kernel — stream A
+- `#[attestable(device, reference = …, headroom = …)]`; the install
+  computes each device kernel's program; the testkit's `device_fits`; the
+  light node's own computation of the stock kernels' programs, compared
+  with the space's before a secret enters a proof (`light-node.md` §4.4).
+- **Carried in:** reproducible path-dependent blobs.
+- **Gate:** a kernel whose program differs from the light node's is
+  refused before proving, in a test. **Dep:** 8.2. **Estimate:** 1.5–2
+  weeks.
 
-### 8.5 Proven calls, and format 44 deleted
+### 8.5 Proven calls, format 44 deleted, the pre-check — stream A
 - `#[msg(proven = k)]`; `Credentialed.claim`; `CredentialedInput` carrying
-  the claim (capped at 1 KiB) in place of `root`; `Principal::Kernel`
-  (index 7); the stock kernels' checks (auth's scope, ring and `once`)
-  kept in the node's Rust with their refusal codes; an actor kernel's
-  checks at apply only; `auth` and `owner` as stock kernels in
-  `vos-credentials`, the `device` test actor's hand-lean kernel kept as a
-  bench only.
-- Format 44 and the credential AIR deleted (`light-node.md` §4.1's list,
-  E1); PG1's bench cases go; the phone bench takes the kernels.
-- The verifier's first milliseconds profiled (decode, canonical
-  re-encoding, setup: a wrong interaction PoW already costs 5.8 ms), and a
-  refusal target set from the profile.
-- **Carried in:** the binding sweep's budget (`open.md`, "Proving"),
-  since the binding rows' writer changes here.
-- **Gate:** the carrier audit over proven calls; `node/SECURITY.md` and
-  `identity-and-authority.md` §5 restated. **Dep:** 8.4.
+  the claim (≤ 1 KiB); `Principal::Kernel` (index 7); the stock kernels'
+  checks kept in the node's Rust; an actor kernel's checks at apply only;
+  `auth` and `owner` as stock kernels in `vos-credentials`.
+- Format 44 and the credential AIR deleted (E1).
+- **The pre-check:** the verifier's first milliseconds profiled (decode,
+  canonical re-encoding, setup) and a junk proof refused well under 1 ms.
+- **Carried in:** the binding sweep's budget.
+- **Gate:** a junk device proof refused in ≤ 1 ms at the 95th percentile
+  on one x86 core; the carrier audit over proven calls. **Dep:** 8.4.
   **Estimate:** 2.5–3.5 weeks.
 
-### 8.6 `vos-light`
-- **A carve-out spike first** (one week): `vos-node` is about 27.6k lines
-  and depends without option on recair, the venue, the node prover,
-  `vos-net`, `vos-raft`, quinn and the compiler; its `dispatch` is peer
-  dispatch and `calls.rs` reads Raft's role. The spike chooses between a
-  `server` feature and a single-replica host of `vos-light`'s own over the
-  executor and the store, moved.
-- Then: the single-replica host; every local write in one fjall batch per
-  step (`light-node.md` §8 D6); `vos-device`'s modules placed (`secret`,
-  `wire`, `path` and `call` into `vos-light`'s client side; `kernel`,
-  `prover` and `threads` into its prover side, the credential prover
-  deleted with 8.5), the crate deleted; `credentialed.rs`'s use of
-  `vos_pvm_recair::device` moved; s4's facility repointed.
-- `vos-pvm-recair`'s `recursion` feature (Q9: the leaves, folds and wrap
-  out of a device's build); the `.so` size recorded before and after.
-- **Dep:** none (parallel with 8.4–8.5). **Estimate:** 4–6 weeks.
+### 8.6 The light node's core — stream C
+- `vos-light`: the PVM interpreter and machine pool; the agent program's
+  merge and query entries over fjall, one batch per operation; no log, no
+  refine or accumulate (`light-node.md` §2.1). The executor's host-call
+  layer moves out of `vos-node` into a crate both link; `vos-device`'s
+  modules placed and the crate deleted; s4's facility repointed.
+- `vos-pvm-recair`'s `recursion` feature (Q9); the `.so` size before and
+  after.
+- **Gate:** a local actor installed and called on the phone build; a
+  process killed mid-operation leaves the store consistent (a fault-
+  injection test). **Dep:** none. **Estimate:** 2–3 weeks.
 
-### 8.7 Payments P1 on cipher-clerk
-- `Payments` (the L0 kernel, user accounts held by owner digests, one a
-  device, `transfer` under `credential = Owner`), replacing `purses`; s4's
-  demo `pay` on it; the chrome shows each device's balance and the
-  transfer between one's devices (`light-node.md` §8 G4, L4).
+### 8.7 Payments P1 on cipher-clerk — stream B
+- `Payments` (the L0 kernel, accounts by owner digest, one a device;
+  `transfer` under `credential = Owner`), replacing `purses`; s4's demo
+  `pay` on it.
 - **Dep:** 8.5. **Estimate:** 1.5–2 weeks.
 
 ### M1 acceptance
-- **Gates:** `ci-full`, the checker loop, PG1′ and PG2′ on format 46, PG3′'s
-  first flows on the clearnet (enroll, sign-in, pay on P1). **Phone:**
-  S8-P2. Fable at the milestone's end.
+- `ci-full`, the checker loop, PG1′ and PG2′ on format 46, PG3′'s P1 flows
+  on the clearnet (S8-P2). Fable.
 
-## M2 — The levers in the device format (5.5–8 weeks with two implementers, 8.5–13 with one; parallel with M3 and M4)
+## M2 — The levers in the device format (5.5–8 weeks with two implementers; parallel)
 
-### 8.8 A per-program CPU
-- The CPU's columns from the program's opcodes (785 → 535–549 [model]),
-  in the device format only; the node's segment format is a later step of
-  its own (a new leaf, folds, wrap and venue pins; `light-node.md` §4.4).
+### 8.8 A per-program CPU — stream A
+- The CPU's columns from the program's opcodes, device format only.
 - **Dep:** M1. **Estimate:** 3–5 weeks.
 
-### 8.9 Word-level memory
-- The device memory ledger by words; −17% of auth's cells alone, −26%
-  with 8.8 [model, `proving.md` §8].
-- **Dep:** M1 (parallel with 8.8, a second implementer).
-  **Estimate:** 4–6 weeks.
+### 8.9 Word-level memory — stream B
+- The device memory ledger by words.
+- **Dep:** M1. **Estimate:** 4–6 weeks.
 
-### 8.10 Format 47, one re-pin
-- 8.8 and 8.9 land as one device format (47); the guest target's
-  `unaligned-scalar-mem` (8.2) lands with it, so every guest ELF, pinned
-  blob and program id moves once; the leakage and fuzz gates on it; the
-  light node's update prompt when the space's format moves
-  (`light-node.md` §8 D8).
-- **Carried in:** the quiet re-measure of `0x402` (with the re-pin).
-- **Gate:** PG1′ and PG2′ on format 47 twice, a day apart (S8-P3,
-  S8-P4); `ci-full` at milestone tier. Fable at the milestone's end.
-- **Dep:** 8.8, 8.9. **Estimate:** 1.5–2 weeks.
+### 8.10 Format 47, one re-pin — stream A
+- 8.8 and 8.9 as one device format; `unaligned-scalar-mem` with it; every
+  guest ELF, blob and program id moves once; the light node's update
+  prompt.
+- **Carried in:** the quiet re-measure of `0x402`.
+- **Gate:** PG1′ and PG2′ on 47 twice, a day apart (S8-P3, S8-P4).
+  Fable. **Dep:** 8.8, 8.9. **Estimate:** 1.5–2 weeks.
 
-## M3 — The personal agent in the space (6–9 weeks; from M0, parallel with M1)
+## M3 — The personal agent in the space (stream D, 10.5–14.5 weeks from M0)
 
-### 8.11 Forwarding for agents a node does not replicate
-- A peer message carrying a request as received; the receiving replica
-  runs ingress as for a gateway's request; never forwarded twice;
-  forwards counted against the per-peer budget (`light-node.md` §3.3, §8
-  H6).
-- **Gate:** every client kind (`Call`, `Query`, `Credentialed`,
-  `Workflow`) through a gateway whose upstreams hold no replica of the
-  agent; the end-to-end suites with gateways listing one node each.
-- **Dep:** none. **Estimate:** 1.5–2 weeks.
+### 8.11 Forwarding and admission by known keys
+- A peer message carrying a request as received; the hop rule; its own
+  peer stream; operator kinds never forwarded; forwards counted against
+  the sender's budget (`light-node.md` §3.3).
+- An agent's admitted-keys rows read at ingress, refusing a
+  session-creating call from an unknown key before any commit.
+- **Gate:** every client kind through a gateway whose upstreams hold no
+  replica; a forwarding burst during an election leaves leadership
+  unchanged; an unknown key's 10^4 session attempts write nothing.
+  **Estimate:** 2–2.5 weeks.
 
-### 8.12 `Homes`, the pool and `Personal`
-- **`Homes`** (beside the space's credential actor): `stock` (the
-  operator's role), `claim` under `Auth("home")`, the lease (35 days,
-  renewal by any device's proof, its pseudonyms), `PoolEmpty`, lapse,
-  read-only grace, `wipe` and return to the pool; unique assignment
-  (`light-node.md` §8 B11–B14).
-- **`Personal`:** the device set and its states (probation, active,
-  removing, removed with frontiers), operations signed end to end and
-  stored with their signatures, the delays and vetoes on batch time, the
-  recovery entry and its 7-day operations; the MLS log (`commit` with
-  `EpochTaken`/`EpochGap`, 180-day retention, the matured-operation check
-  on adds and removes); sealed scopes (`push` with `StaleEpoch`,
-  deduplication, positions, `since`, quotas, delayed `collect`); the
-  inbox (TTL table, a sweeping timer workflow, pairing slots); `assign`
-  and `wipe` from `Homes` alone; `handover`.
-- **The keeper** (`tools/`): tops the pool up in bulk with an operator
-  key.
-- **Gate:** property tests of the device-set rules (no sequence of
-  operations lets a device veto its own removal, act in probation, or
-  mature a delay early); a forged operation without its signature never
-  leaves the log as valid to a device (the devices' check, tested against
-  `Personal`'s log); **10^4 personal agents on a three-node space** each
-  waking for a push and a fetch every 15 minutes for an hour, with
-  sessions opening and sweeping: resident memory, CPU and the commit
-  latency of the space's other agents recorded beside `core-model.md`
-  §14.1's idle numbers, and pushes of full 256 KiB steps among them.
-- **Dep:** none for the actors; 8.11 for the gate's gateways.
-  **Estimate:** 4–6 weeks.
+### 8.12 `Homes` and the keeper
+- `Homes` beside the credential actor: `stock`, `claim` under
+  `Auth("home")`, the nullifier and kit-key indexes, `PoolEmpty`, the
+  `assigned`/`refused` reply; the "home" scope reserved in the facility.
+- The keeper (`tools/`): create, install, `Grant` the role, stock, reap,
+  bulk upgrade of `Personal`.
+- **Gate:** a pool of 200 made and claimed; a double claim refused; a
+  refused assignment released. **Estimate:** 1.5–2 weeks.
 
-### 8.13 Device memberships
-- The registrar's `enroll_device` under `credential = Owner` with a
-  per-member device limit, and `revoke_device`; the person-leaf ring for
-  agents that use `once` (N3), its enrollment one per member.
+### 8.13 `Personal`: the device set
+- States, admin classes, operations signed end to end and stored with
+  their signatures; delays on batch time; vetoes, contests and their
+  resolution; immediate removal by two; the recovery entry and its 7-day
+  operations; kit rotation; `R1`/`R2` and their release to a matured
+  restore.
+- **Gate:** property tests against an adversary holding one active device
+  and its biometric (`light-node.md` §8, A4): the owner with one device
+  and the kit, or two other devices, always removes it within the delay;
+  it never removes an owner device the owner contests; a leaked kit alone
+  completes nothing an active device cancels. **Estimate:** 2–3 weeks.
+
+### 8.14 `Personal`: commits, envelopes and the inbox
+- The commit log (candidates, `EpochTaken`/`EpochGap`, declared effects
+  against matured operations) and signed confirmations, voided at 72 h;
+  sealed scopes (`push` with dedup then `StaleEpoch`, positions, `since`),
+  checkpoint acknowledgements, recovery envelopes' scope; quotas and their
+  exemptions and per-device shares; the inbox with lazy expiry; activity
+  and `reap`; the tenancy number.
+- **Gate:** the scenarios of `light-node.md` §8 that name 8.14 as tests.
+  **Estimate:** 2–3 weeks.
+
+### 8.15 The scale gate
+- 10^4 personal agents on a three-node space, each pushing and fetching
+  every 15 minutes for an hour with sessions opening and sweeping, among
+  them pushes of full 256 KiB steps; one agent filled to its 64 MiB quota,
+  its snapshot installed, and one `replace`.
+- **Gate:** the space's other agents' commit p99 within 20% of the same
+  run without personal agents; resident memory ≤ 64 KiB a personal-agent
+  replica above the idle figure; a full agent's snapshot installed ≤ 30 s;
+  the `replace` within its run's time recorded. Scheduled alone (one heavy
+  run at a time). **Estimate:** 1–1.5 weeks.
+
+### 8.16 Device memberships
+- The registrar's person records (member and owner digests per device,
+  counts, a limit), `enroll_device` under `credential = Owner`,
+  `revoke_device`; a second credential ring of person leaves; guards
+  naming their ring, and ingress and apply reading it
+  (`node/host/src/credentialed.rs`'s single ring generalized).
 - **Gate:** a member with three devices votes once in a `once` scope and
-  signs in from each device elsewhere. **Dep:** 8.5. **Estimate:** 1–1.5
+  signs in from each device elsewhere. **Dep:** 8.5. **Estimate:** 2–2.5
   weeks.
 
 ### M3 acceptance
-- **Gates:** `ci-full`, the 10^4-agent run (8.12), the property tests,
-  the carrier audit over `Personal`'s logs (no plaintext of user data, no
-  member key). Fable at the milestone's end.
+- `ci-full`, 8.15's gate, 8.13's property tests, the carrier audit over
+  `Personal`'s logs. Fable.
 
-## M4 — The personal space on devices (11.5–16.5 weeks after 8.6)
+## M4 — The personal space on devices (stream C, with D and E)
 
-### 8.14 merkle-crdt for devices
-- The incremental apply (`core-model.md` §9.4); the author, sequence and
-  signature in the payload; a `Store` over fjall; batched, asynchronous
-  fetching; the `redb` store and feature deleted.
+### 8.17 merkle-crdt for devices — stream E
+- The incremental apply; the author, sequence and signature in the
+  payload; a `Store` over fjall; batched fetching; the `redb` store
+  deleted.
 - **Dep:** none. **Estimate:** 2–3 weeks.
 
-### 8.15 Local actors on the light node
-- `crdt::{GSet, Set, Map}` in the SDK; `#[msg(merge)]` in the macros and
-  merge dispatch in the default agent (none exists today); scope storage;
-  the single-replica host emitting one DAG a scope; the light node
-  refuses Linear fields and workflows in a local package; validation on
-  apply with quarantine (`light-node.md` §8 C1); the credential book and
-  the device book as the first local actors.
-- `core-model.md` §9.4 amended: plaintext and sealed scopes
-  (`light-node.md` §3.6).
-- **Dep:** 8.6, 8.14. **Estimate:** 5–7 weeks.
+### 8.18 Local actors and the CRDT types — stream C
+- `crdt::{GSet, Set, Map}` stored per author, read filtered (§3.2);
+  `#[msg(merge)]` and merge dispatch; versioned operations, unknown ones
+  held; validation and quarantine; the credential book and the device
+  book; `core-model.md` §9.4 amended (plaintext and sealed scopes).
+- **Dep:** 8.6, 8.17. **Estimate:** 4–6 weeks.
 
-### 8.16 The device group and sealed sync
-- mls-rs in `vos-light` (the suite of 8.3); the agent as delivery
-  service: commits posted and merged only on acceptance, membership
-  changes checked against matured, verified device-set operations; epoch
-  keys from the exporter, the key archive per scope, history horizons;
-  envelopes (Padmé, opaque scope ids, the writer's view inside),
-  seal-at-push, cursor sync, fork and rollback detection, the audit of
-  one's own pushes; checkpoints at deterministic boundaries; the
-  background job (jittered, Tor-only); the device-local floor on delays;
-  MLS state out of Android's backups.
-- **Gate:** PG6 on the clearnet; a model test of two devices and a
-  hostile agent (rollback, equivocation, a dropped veto, a forged
-  operation, a stale-epoch push, a backdated envelope from a removed
-  device): each detected or refused as `light-node.md` §8 says.
-- **Dep:** 8.3, 8.12, 8.15. **Estimate:** 4–6 weeks.
+### 8.19 The device group — stream C
+- mls-rs (or N7's scheme) in `vos-light`; candidates processed, the prior
+  state kept; the allow-list; signed confirmations, void on a `nack`, a
+  mismatch or 72 h; exporter keys, scope ids from the naming secret, the
+  key archive.
+- **Gate:** a committer that encrypts garbage to one device never gets
+  data sealed to the other side (a test with three devices); every
+  disallowed proposal is nacked. **Dep:** 8.3, 8.14, 8.18. **Estimate:**
+  3–4 weeks.
 
-### 8.17 Pairing, removal, recovery and moving home
-- Pairing through an inbox slot (QR, `Noise_XXpsk3`), the add and its
-  Welcome, probation; `enroll_device` from the paired device (8.13);
-  removal with its delay, veto and two-device path; the admin key behind
-  `BIOMETRIC_STRONG`, sync-only devices; the recovery kit at the claim,
-  recovery envelopes, restore (here or elsewhere), kit rotation; the
-  claim's random wait (`light-node.md` §8 L1); handover between two live
-  homes; moving after a lost home by re-pairing; the facility's `claim`,
-  `pair`, `devices`, `restore` and `move_home` in s4's chrome.
-- **Gate:** PG3′'s personal-space flows on the clearnet with two devices
-  (S8-P5). **Dep:** 8.16. **Estimate:** 2.5–3.5 weeks.
+### 8.20 Sealed sync — stream C
+- Envelopes (Padmé, opaque scope ids, the writer's view inside),
+  seal-at-push, the push queue's sealed bytes, the cursor; archives pushed
+  at confirmed epochs; recovery envelopes under `R`; the device's quota
+  share; Tor-only traffic.
+- **Gate:** PG6's catch-up on the clearnet. **Dep:** 8.19. **Estimate:**
+  2.5–3.5 weeks.
+
+### 8.21 Checkpoints and detection — stream D
+- Checkpoints at agent positions and their acknowledgements; a new
+  device's acceptance rule; control-log views, rollback and equivocation
+  alarms; the sample audit of one's own pushes.
+- **Gate:** a model test of two devices and a hostile agent (a rollback,
+  equivocation on commits and on operations, a dropped veto, a forged
+  operation, a stale-epoch push, a backdated envelope, a wrong
+  checkpoint): each detected or refused as `light-node.md` §8 says.
+  **Dep:** 8.20. **Estimate:** 2–3 weeks.
+
+### 8.22 The background job — stream E
+- WorkManager, a random minute of its window, on the after-first-unlock
+  keys; local notifications for pending operations; the job's state
+  consistent if killed.
+- **Gate:** PG6's job limits on a locked phone. **Dep:** 8.6, 8.20.
+  **Estimate:** 1–1.5 weeks.
+
+### 8.23 Pairing, claim, kit, restore and contests — stream C
+- Pairing through an inbox slot (QR, Noise `XXpsk3`), the archive and `R`
+  over the channel; the claim with its kit; removal, veto, contest and
+  resolution flows; delayed admins; restore here and elsewhere; kit
+  rotation; a new admin key after a biometric change; moving home after a
+  lost one; `enroll_device` at the next sign-in.
+- **Gate:** PG3′'s personal-space flows with two devices on the clearnet,
+  two local spaces for the move (S8-P5). **Dep:** 8.13, 8.16, 8.20.
+  **Estimate:** 3–4 weeks.
+
+### 8.24 s4's screens — stream E
+- Kotlin screens in s4's client: claim and kit, pairing (show and scan a
+  QR), devices (list, remove, veto, resolve, contests, kit rotation),
+  restore, move home, the wallet (N1 (c)), the prompts (strong biometric
+  for the admin key), local notifications.
+- **Gate:** each screen drives its flow on the phone. **Dep:** the
+  facility operations of 8.23 (developed against their stubs first).
+  **Estimate:** 3–4 weeks.
 
 ### M4 acceptance
-- **Gates:** `ci-full`, PG3′'s personal-space flows and PG6 on the
-  clearnet (S8-P5), the carrier audit over the light node's logs and the
-  agent's. Fable at the milestone's end.
+- `ci-full`, PG3′'s personal-space flows and PG6 on the clearnet (S8-P5),
+  8.21's model test, the carrier audit over the light node's and the
+  agent's logs. Fable.
 
-## M5 — Tor (5–7 weeks, from M0's 8.1, parallel with M3 and M4)
+## M5 — Tor (stream E)
 
-### 8.18 The gateway's onion service
-- A `tor` feature; the onion's key in the gateway's key directory; ports
-  22, 80 and `vos-api` (its relay set adding `Credentialed` and `Call`);
-  full vanguards; per-circuit and per-service limits and a cap on proven
-  calls in flight; PoW behind a flag until a release declares it; the C
-  tor sidecar documented and run once as the fallback (Q11).
-- **Dep:** 8.1. **Estimate:** 2 weeks.
+### 8.25 The gateway's onion service
+- A `tor` feature; the onion's key; ports 22, 80 and `vos-api` (`Call`,
+  and `Credentialed` once 8.5's pre-check gate is met); full vanguards;
+  per-circuit, per-agent and per-service limits; PoW behind a flag; the
+  onion set served by the registrar; the C tor sidecar documented and run
+  once.
+- **Dep:** 8.1, 8.5. **Estimate:** 2 weeks.
 
-### 8.19 The client over arti
-- One `TorClient` in the light node; isolation by purpose and by
-  identity (the member's calls, each proven call, the personal agent's
-  traffic, s4's screens); a spare circuit for proven calls; dormant mode;
-  s4's SSH over a socketpair descriptor the facility pumps to the onion
-  stream (`light-node.md` §2.2); the onion address pinned at enrollment;
-  the space's `tor` policy and its fallbacks in the chrome, the personal
-  agent's traffic Tor-only.
-- **Dep:** 8.6, 8.18. **Estimate:** 2–3 weeks.
+### 8.26 The client over arti
+- One `TorClient`; isolation by purpose and identity; a spare circuit for
+  proven calls; dormant mode; s4's SSH over a socketpair descriptor; the
+  pinned onion set and its refresh; the space's `tor` policy, the
+  personal agent's traffic Tor-only.
+- **Dep:** 8.6, 8.25. **Estimate:** 2–3 weeks.
 
-### 8.20 The path leak and the root fingerprint
-- **Carried in:** tree syncing and the `map_root` fingerprint (`open.md`,
-  "Tree syncing"): the credential book syncs the credential tree's leaves
-  through a paged feed, so no `path(member)` is fetched and every proof
-  names the newest root; the log keeps the root's place in the ring.
-- **Dep:** 8.5, 8.15. **Estimate:** 1.5–2 weeks.
+### 8.27 The credential tree's feed
+- **Carried in:** tree syncing and the `map_root` fingerprint: the device
+  keeps each space's tree from a paged feed on one long-lived circuit, no
+  path fetched, every proof against the newest root, the log keeping the
+  root's place in the ring.
+- **Dep:** 8.5, 8.18. **Estimate:** 1.5–2 weeks.
 
 ### M5 acceptance
-- **Gates:** PG3′ and PG6 over Tor, every flow (S8-P6), which needs M4;
-  the carrier audit with the onion in the path; `node/SECURITY.md` and a
-  light node `SECURITY.md` stating what Tor fixes and what it does not,
-  and the personal agent's threat model (`light-node.md` §8). Fable.
-  **Dep:** M4, 8.19, 8.20.
+- PG3′ and PG6 over Tor (S8-P6); PG5's rendezvous limit; the carrier audit
+  with the onion in the path; `node/SECURITY.md` and the light node's
+  `SECURITY.md` (what Tor fixes and does not; the personal agent's threat
+  model, `light-node.md` §8's known limits). Fable. **Dep:** M4, 8.26,
+  8.27.
 
-## Alongside — cipher-clerk v0.4
+## Alongside — cipher-clerk and P2 (stream F)
 
-### 8.21 cipher-clerk v0.4 (in cipher-clerk's repository)
-- A design note reviewed before code (cipher-clerk's Phase 3 rule), then
-  R1–R11 (`light-node.md` §5.3): one hash trait, hash commitments, keys
-  per device (N4), pool-scoped nullifiers and protocol `rho` (spends and
-  deposits), `Tx<I, O>` with its asset and transparent leg,
-  `shielded::check`, `Plan`, `build`, `commit` and `deposit_rho`, the
-  incremental note tree, the pool leg, memos, the deletions, the refusal
-  tests; the fit check extended to the spend on the PVM (its steps
-  counted, the spend's cost of `light-node.md` §5.7 checked).
-- **Released:** tag `v0.4.0`. VOS takes the tag in slice 9 with P2; in
-  slice 8 VOS keeps v0.3.0 for P1 unless v0.4.0's L0 kernel is unchanged
-  enough to take at once (the step says which).
-- **Dep:** none (starts at M0). **Estimate:** 4–6 weeks.
+### 8.28 cipher-clerk v0.4 (in cipher-clerk's repository)
+- A design note reviewed before code, then R1–R11 (`light-node.md`
+  §5.3); the fit check extended to the spend on the PVM, its steps
+  counted against §5.7.
+- **Released:** tag `v0.4.0`. **Dep:** none. **Estimate:** 4–6 weeks.
+
+### 8.29 The pool (N1 (c))
+- `Payments`' `spend` and `join` kernels, `pay`, `deposit`, `withdraw`,
+  the feeds, the anchor ring; VOS on cipher-clerk v0.4; the light node
+  computing the spend program from its own build.
+- **Dep:** 8.5, 8.28. **Estimate:** 2–3 weeks.
+
+### 8.30 The device-local wallet and PG4 (N1 (c))
+- The `Wallet` local actor, its scope kept on the device; scanning with
+  view tags; the facility's `wallet` operations; `sk` sealed under `R`
+  (N4 (a)) once a kit exists, and the wallet asking for one before
+  receiving; the random wait before spending a fresh note; background
+  joins.
+- **Gate:** PG4 (the nearest phone session; over Tor once M5 lands).
+  **Dep:** 8.18, 8.29. **Estimate:** 2–2.5 weeks.
 
 ## M6 — Slice end (2.5–3 weeks)
 
-### 8.22 Documents and the audit's scope
+### 8.31 Documents and the audit's scope
 - `proving.md` §8, `identity-and-authority.md` §5–§8, `core-model.md`
   §9.4, §10 and §11, `node-api.md` §3 and §6 rewritten to what was built;
-  `light-node.md` to [built]; `open.md` updated (P2, messaging, plaintext
-  scopes, user-installed actors, mirroring and the successor group, the
-  blob kind, excision, node-signed answers); `SECURITY.md` for the
-  personal agent (`light-node.md` §8's known limits, B8 among them).
-- **Carried in:** the external audit's scope, now the device format, the
-  Poseidon2 chip, their masking, the stock kernels, and the personal
-  agent's protocol (the credential AIR out); cipher-clerk's `shielded`
-  module and the spend kernel added when P2 lands.
+  `light-node.md` to [built]; `open.md` takes `light-node.md` §9.4's list;
+  the light node's `SECURITY.md`.
+- **Carried in:** the external audit's scope: the device format, the
+  Poseidon2 chip, their masking, the stock kernels, the personal agent's
+  protocol, cipher-clerk's `shielded` and the spend kernel.
 
-### 8.23 The slice gate
-- `ci-full` at slice tier (5-minute fuzz, full-N leakage), the checker
-  loop, every phone gate on the final build (S8-P7), the slice-end Fable
-  review, the code-quality review folded as a behaviour-preserving step.
+### 8.32 The slice gate
+- `ci-full` at slice tier, the checker loop, every phone gate on the final
+  build (S8-P7), the slice-end Fable review, the code-quality review
+  folded as a behaviour-preserving step.
 
 ## The critical path
 
-- **Proving:** 8.2 → 8.4 → 8.5 → (8.8 ∥ 8.9) → 8.10: 11–15.5 weeks with
-  two implementers on M2, 14–20.5 with one.
-- **The personal space** (the longest): 8.6 (4–6) → 8.15 (5–7, with 8.14
-  beside 8.6) → 8.16 (4–6) → 8.17 (2.5–3.5): **15.5–22.5 weeks** from the
-  start, then M4's acceptance. 8.16 also waits on 8.12 (ready by week
-  6–8) and 8.3 (week 1).
-- **The node side:** 8.11 ∥ 8.12, then 8.13: 5–7.5 weeks, off the
-  critical path.
-- **Tor:** 8.1 → 8.18 → 8.19, then M5's acceptance after M4.
-- **cipher-clerk:** 8.21, 4–6 weeks, off the critical path.
-
-**The slice: about 21–28 weeks** with five streams (the personal space's
-chain, M4 and M5's acceptances, then M6's 2.5–3 weeks), 25–33 with four
-[est]. If it slips, the order of what ships is: M1 (one proving path and
-P1) and M2 (format 47) first; then the personal space on the clearnet
-(M3, M4); Tor last. With P2 in slice 8 (N1 (b)), add 8–11 weeks to the
-personal-space chain: about 30–36 weeks.
-
-## Slice 9, as this plan leaves it
-
-P2: the shielded pool, the wallet, the spend and join kernels, VOS on
-cipher-clerk v0.4, PG4 (Q10, Q12); messaging between members on MLS
-virtual clients; plaintext Merge scopes on nodes; actors the user installs
-in the personal agent (E9); a second home's mirroring and the successor
-group (§3.9); excising a device's operations (§8 C1); the blob kind for
-large objects (§8 C6); local workflows with device effects (Q8 (b)); the
-light node in its own Android process (Q5 (b)).
+- **Stream C:** 8.6 (2–3) → 8.18 (4–6) → 8.19 (3–4) → 8.20 (2.5–3.5) →
+  8.23 (3–4) = 14.5–20.5 weeks. 8.18 waits on 8.17 (E, ready by week 3–4.5)
+  and 8.19 on 8.14 (D, ready by week 7.5–10.5), which can cost up to about
+  1.5 weeks: **16–22 weeks.**
+- Then M4's acceptance (about 1–1.5), M5's over Tor (about 1, Tor ready
+  well before on stream E), M6 (2.5–3): **20.5–28 implementer weeks.**
+- **Reviews:** a step's Opus review and its folds on the chain (six steps,
+  about 0.3–0.5 week each) and four Fable rounds on the chain (M3's
+  through M6's, about 0.5–1 week of fixes each): about 4–6 weeks.
+- **The slice: about 25–34 weeks** with six streams (five with N1 (a); the
+  path is the same). Off the path: proving 10–14.5 weeks (A), 6.5–9.5 (B),
+  the node side 12.5–17.5 including 8.21 (D), transport and Android
+  12.5–17 (E), cipher-clerk and P2 8–11.5 (F).
+- **If it slips,** what ships first: M1 and M2 (one proving path, P1,
+  format 47); then the personal space on the clearnet (M3, M4); then Tor;
+  P2 on its own stream moves to slice 9 without holding anything back.
 
 ## Carried from slice 7
 
@@ -396,17 +405,17 @@ From slice 7's end review, now in `open.md`:
 | item | where |
 |---|---|
 | the per-program CPU and word-level memory | 8.8, 8.9, 8.10 (the device format; the node's segment format later) |
-| tree syncing (the path leak) and the `map_root` fingerprint | 8.20 |
+| tree syncing (the path leak) and the `map_root` fingerprint | 8.27 |
 | the binding sweep's budget | 8.5 |
 | the quiet re-measure of `0x402` | 8.10 |
 | reproducible path-dependent blobs | 8.4 |
-| the external audit's scope | 8.22, rescoped |
+| the external audit's scope | 8.31, rescoped |
 | the cleanup before master | the precondition |
-| the executors' verification gate on a many-core host; T1's and T6's p99, T5's throughput; T2 and a host's kill | **not in slice 8:** a node-performance track, the owner's to schedule (it needs compumax and more machines, and shares no code with this slice); 8.12's 10^4-agent run is the only scale measurement here |
-| the per-call identity read; the identity agent replicated per node; the non-repudiation side store | **not in slice 8:** the identity track (`open.md`, "Identity and privacy"), unchanged by the light node |
+| the executors' verification gate on a many-core host; T1's and T6's p99, T5's throughput; T2 and a host's kill | **not in slice 8:** a node-performance track, the owner's to schedule; 8.15 is the only scale run here |
+| the per-call identity read; the identity agent replicated per node; the non-repudiation side store | **not in slice 8:** the identity track (`open.md`, "Identity and privacy") |
 
 ## Open before the steps are pinned
 
-The owner's answers to `light-node.md` §9.1 (N1–N6), and any change to
-§9.2's provisional answers; the second device (PG3′); the phone sessions'
+The owner's answers to `light-node.md` §9.1 (N1–N7), and any change to
+§9.2's provisional answers; the second device; the phone sessions'
 windows.
