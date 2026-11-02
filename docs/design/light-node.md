@@ -575,35 +575,63 @@ IETF's `MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519`
 point yet. So ciphersuite 1; the successor group follows once a code
 point is assigned and a provider ships it outside an unstable feature.
 
-**Measured on mls-rs 0.57** [measured, Core Ultra 7 155H under load and
-an arm64-v8a build of the facility, 2026-11-02; spike outside the tree]:
+**Measured on mls-rs 0.57** [measured, 2026-11-02; spike outside the
+tree; timings on x86 (Core Ultra 7 155H, under load), the `.so` an
+arm64-v8a build; the phone's timings and the keystore's results wait for
+the S8-P1 session]:
 - **Features:** `default-features = false` with `private_message` only
   (encrypted handshakes); no `std`, `rayon`, `x509`, `psk`,
   `by_ref_proposal`, `out_of_order`, `prior_epoch`, `custom_proposal` or
   `tree_index`; the RustCrypto provider 0.22 (0.23's
   `curve25519-dalek` 5.0.0 cannot share a build with russh 0.61's
-  5.0.0-pre.6; russh 0.65 takes 5.0.0).
+  `=5.0.0-rc.0`; a russh taking 5.0.0 lifts this).
 - **The facility's `.so`** (s4's `libs4_credential.so`, release, arm64,
   stripped as packaged): +0.86 MB with the device-group scenario linked
-  (+0.38 MB compressed), +0.96 MB with `std`: within PG5's 2 MB.
-- **A candidate processed on a copy:** about 1 ms p50 (0.9–3 ms as the
-  host's load varied) in a group of 3 or 8, whether the copy is a clone
-  of the in-memory group or loaded from its persisted bytes and written
-  back; PG6's limit is 200 ms.
+  (+0.38 MB gzip -9), +0.96 MB with `std`: within PG5's 2 MB. The growth
+  includes a second RustCrypto generation beside the facility's own.
+- **A candidate processed on a copy** (x86): about 1 ms p50 (0.9–3 ms as
+  the host's load varied) in a group of 3 or 8, whether the copy is a
+  clone of the in-memory group or loaded from its persisted bytes and
+  written back; PG6's limit, on the phone, is 200 ms.
 - **Sizes:** a key package 343 B; an update commit 734 B (3 devices) and
   1,374 B (8); add(2) 1,374 B with a 1,387 B Welcome carrying the tree;
   remove 606 B; the persisted group state 1.1–2.7 KB; a held own commit
   (`CommitSecrets`) 2.8 KB.
-- **What the API gives:** `Group` is `Clone`, so the copy is a clone; a
-  device's own commit is built with `build_detached` and applied with
-  `apply_detached_commit` on confirmation, never touching the current
-  state before; a received commit's processing is deterministic, so the
-  copy need not be persisted (after a crash the device processes the
-  logged candidate again), and only the held own commit must be, in the
-  same batch as the call that posts it. A rival candidate processed on a
-  copy and dropped leaves the next one processable; processed in place it
-  does not. `MlsRules::filter_proposals` refuses other proposal types on
-  both sending and receiving. The Safe Exporter is not in 0.57.
+- **What the API gives, and what `vos-mls` must add:**
+  - `Group` is `Clone`, and processing writes nothing to storage, so the
+    copy is a clone; a copy is never written through the current
+    namespace's storage (it shares the handle).
+  - A device's own commit is built with `build_detached` and applied
+    with `apply_detached_commit` on confirmation. Building it spends a
+    handshake-key generation of the current state (the commit is a
+    `PrivateMessage`), so the current state is persisted in the same
+    batch as the held commit, and the held commit before the call that
+    posts it: a device cannot process its own commit, so a lost one means
+    re-pairing. The held commit carries the next epoch's secrets and the
+    leaf's signing key, under the same after-first-unlock wrap.
+    `apply_detached_commit` checks nothing: `vos-mls` checks that the
+    confirmed candidate's hash is the held commit's and that the current
+    epoch is the one before, and deletes the held commit on a void.
+  - A received commit is processed with the log's batch time
+    (`process_incoming_message_with_time`): deterministic, so the copy
+    need not be persisted (after a crash the device processes the logged
+    candidate again), and with leaf and key-package lifetimes checked;
+    without `std` and without a time, mls-rs checks no lifetime.
+  - A rival candidate processed on a copy and dropped leaves the next one
+    processable; processed in place it does not.
+  - `MlsRules::filter_proposals` refuses other proposal types on both
+    sending and receiving. Update proposals exist only by reference
+    (`by_ref_proposal`), and RFC 9420 never commits a committer's own
+    Update by value: the allow-list is Add and Remove by value with a
+    path required, and a device's `update` is its own commit with a path
+    and no proposals.
+  - Handshakes are encrypted, so only devices can check that a commit's
+    proposals are the logged effect's: `vos-mls` gives its rules the
+    logged effect before processing, and its identity provider checks
+    each Add's credential (sync and admin key) against the matured
+    operation. A leaf credential change (an admin key replaced) is not
+    yet exercised.
+  - The Safe Exporter is not in 0.57.
 
 ### 3.5 Device secrets and the rules for changing devices
 
