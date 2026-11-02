@@ -283,7 +283,7 @@ enum Command {
         #[command(flatten)]
         fault: FaultArgs,
         /// Ledger shards to create, `K`.
-        #[arg(long, alias = "agents")]
+        #[arg(long)]
         shards: u32,
         /// Idle agents beside them, `I`.
         #[arg(long, default_value_t = 0)]
