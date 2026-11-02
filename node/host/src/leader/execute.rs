@@ -19,7 +19,7 @@ use crate::fault::Fault;
 use crate::group::{DryRun, Local};
 use crate::node::Inner;
 use crate::node::Pending;
-use crate::pvm;
+use crate::pvm::{self, AgentState};
 use crate::stats::Histogram;
 use crate::store::{BlobRef, EntryKind, LARGE_RESULT, LogEntry, Snapshot};
 
@@ -266,7 +266,7 @@ impl Leader {
             if hooks.fail_refine(id, batch(&work)) {
                 return Err(Fault::Agent("a hook failed the refine".into()));
             }
-            machines.refine(snapshot, id, &work, gas)
+            machines.refine(AgentState::shared(snapshot, id), id, &work, gas)
         })
         .await
     }
@@ -288,7 +288,8 @@ impl Leader {
             if hooks.fail_dry_run(id, batch(&work)) {
                 return Err(Fault::Agent("a hook failed accumulate".into()));
             }
-            machines.accumulate(snapshot, id, Arc::unwrap_or_clone(result), gas)
+            let state = AgentState::of(snapshot, id);
+            machines.accumulate(&state, id, Arc::unwrap_or_clone(result), gas)
         })
         .await
     }

@@ -5003,6 +5003,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "vos-exec"
+version = "0.1.0"
+dependencies = [
+ "fjall",
+ "hex",
+ "tempfile",
+ "tracing",
+ "vos-pvm",
+ "vos-pvm-program",
+ "vos-wire",
+]
+
+[[package]]
 name = "vos-gateway"
 version = "0.1.0"
 dependencies = [
@@ -5127,6 +5140,7 @@ dependencies = [
  "vos-api",
  "vos-checker",
  "vos-device",
+ "vos-exec",
  "vos-http",
  "vos-jam",
  "vos-jam-dev",

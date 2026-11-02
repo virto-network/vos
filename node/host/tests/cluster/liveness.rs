@@ -435,44 +435,50 @@ fn a_flaky_then_cut_link_moves_no_term() {
 /// it leads elect leaders elsewhere.
 #[test]
 fn the_groups_of_a_node_whose_writer_stalls_elect_elsewhere() {
-    let commits = Arc::new(Gate::default());
-    let held = Arc::clone(&commits);
+    // A gate on each node's commits: the one closed is that of the node
+    // leading the most groups, which may be any of the three.
+    let gates: Vec<Arc<Gate>> = (0..3).map(|_| Arc::new(Gate::default())).collect();
+    let held = gates.clone();
     let cluster = Cluster::tuned(3, move |number, config| {
-        if number == 1 {
-            config.hooks = held.clone();
-        }
+        config.hooks = held[usize::from(number) - 1].clone();
     });
     let agents = agents(&cluster, 30);
     for &agent in &agents {
         cluster.install(agent);
     }
-    // Node 1 leads some; one of them takes a call its writer holds.
-    let mut led = Vec::new();
-    wait_until("node 1 leads some", || {
-        led = agents
-            .iter()
-            .copied()
-            .filter(|&agent| cluster.leader(agent) == 1)
-            .collect();
-        !led.is_empty()
-    });
+    let leaders: Vec<NodeNumber> = agents.iter().map(|&agent| cluster.leader(agent)).collect();
+    let stalled = (1..=3)
+        .max_by_key(|&number| leaders.iter().filter(|&&leader| leader == number).count())
+        .unwrap();
+    let led: Vec<AgentId> = agents
+        .iter()
+        .zip(&leaders)
+        .filter(|&(_, &leader)| leader == stalled)
+        .map(|(&agent, _)| agent)
+        .collect();
+    let others: Vec<NodeNumber> = (1..=3).filter(|&number| number != stalled).collect();
+    // The stalled node leads some; one of them takes a call its writer
+    // holds.
     std::thread::scope(|scope| {
         // Inside the scope: a failure opens it before the scope waits.
-        let closed = commits.close();
+        let closed = gates[usize::from(stalled) - 1].close();
         let cluster = &cluster;
         let held = led[0];
-        let call = scope.spawn(move || cluster.increment(1, held, 1, 1));
+        let call = scope.spawn(move || cluster.increment(stalled, held, 1, 1));
         // The group whose driver waits on the held write still believes
         // it leads, until the write returns.
-        wait_until("another node leads each group node 1 led", || {
-            led.iter()
-                .all(|&agent| cluster.node(2).leads(agent) || cluster.node(3).leads(agent))
+        wait_until("another node leads each group the stalled node led", || {
+            led.iter().all(|&agent| {
+                others
+                    .iter()
+                    .any(|&number| cluster.node(number).leads(agent))
+            })
         });
         drop(closed);
         let _ = call.join();
     });
     for &agent in &led {
-        assert_ne!(cluster.leader(agent), 1);
+        assert_ne!(cluster.leader(agent), stalled);
     }
 }
 

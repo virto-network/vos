@@ -115,7 +115,7 @@ impl Node {
             machines: Machines {
                 program: Arc::new(program),
                 pool,
-                blobs: blobs.clone(),
+                programs: Arc::new(blobs.clone()),
             },
             blobs,
             executors: Executors::spawn(config.executors),

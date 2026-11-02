@@ -1,0 +1,19 @@
+[package]
+name = "vos-exec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The agent program run over an agent's state on any host: its machines, the programs it may load, the calls a host serves it, and the faults of a run; what the node and the light node both link."
+
+[dependencies]
+# Its stores' errors, and their mending at open.
+fjall = { workspace = true }
+hex = "0.4"
+tracing = "0.1"
+vos-pvm = { workspace = true }
+vos-wire = { workspace = true }
+
+[dev-dependencies]
+# A program laid out as the loader lays it out.
+vos-pvm-program = { workspace = true }
+tempfile = "3"

@@ -3,73 +3,9 @@
 
 use super::*;
 
-/// Sync every journal file under `dir`, and the directories holding them.
-fn sync_journals(dir: &Path) -> Result<()> {
-    let mut pending = vec![dir.to_path_buf()];
-    while let Some(dir) = pending.pop() {
-        let mut journals = false;
-        for entry in std::fs::read_dir(&dir)? {
-            let path = entry?.path();
-            if path.is_dir() {
-                pending.push(path);
-            } else if path.extension().is_some_and(|extension| extension == "jnl") {
-                std::fs::File::open(&path)?.sync_all()?;
-                journals = true;
-            }
-        }
-        if journals {
-            std::fs::File::open(&dir)?.sync_all()?;
-        }
-    }
-    Ok(())
-}
-
-/// Clear a store fjall began creating and never finished: one whose
-/// `version` marker, which fjall writes last, is missing or empty. Such a
-/// store holds no data, but fjall takes it for a new one and its creation
-/// fails on the journal or lock the interrupted creation left
-/// (`AlreadyExists`), so a node killed during its store's creation could
-/// never open it again. fjall's own entries (its journals, its lock, its
-/// keyspaces' folder and the empty marker) are removed, and the directory
-/// synced, so the creation starts over.
-fn clear_unfinished(dir: &Path) -> Result<()> {
-    let finished = std::fs::metadata(dir.join("version")).is_ok_and(|marker| marker.len() > 0);
-    if finished {
-        return Ok(());
-    }
-    let mut cleared = false;
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("");
-        if name == "keyspaces" && path.is_dir() {
-            std::fs::remove_dir_all(&path)?;
-        } else if name == "lock"
-            || name == "version"
-            || path.extension().is_some_and(|extension| extension == "jnl")
-        {
-            std::fs::remove_file(&path)?;
-        } else {
-            continue;
-        }
-        cleared = true;
-    }
-    if cleared {
-        tracing::warn!(?dir, "cleared a store whose creation was cut short");
-        std::fs::File::open(dir)?.sync_all()?;
-    }
-    Ok(())
-}
-
 impl Fjall {
-    /// Open the store at `path`. Everything it will recover is synced
-    /// first: rows a crashed process left in the page cache could otherwise
-    /// still be lost to a power cut after the node relied on them. (This
-    /// rests on fjall 3.1's files: it syncs its tables and a journal before
-    /// rotating it, so only journals can hold unsynced rows. Re-check it on
-    /// an upgrade.)
+    /// Open the store at `path`, mended first ([`vos_exec::store::recover`]):
+    /// everything it will recover synced.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_tuned(path, Tuning::default())
     }
@@ -77,10 +13,7 @@ impl Fjall {
     /// Open the store at `path` with `tuning`, as [`Fjall::open`] does.
     #[doc(hidden)]
     pub fn open_tuned(path: impl AsRef<Path>, tuning: Tuning) -> Result<Self> {
-        if path.as_ref().exists() {
-            clear_unfinished(path.as_ref())?;
-            sync_journals(path.as_ref())?;
-        }
+        vos_exec::store::recover(path.as_ref())?;
         let db = Database::builder(path.as_ref())
             .cache_size(tuning.cache_bytes)
             .open()?;

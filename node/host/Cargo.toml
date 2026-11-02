@@ -44,6 +44,8 @@ quinn = { version = "0.11.12", default-features = false }
 vos-http = { workspace = true }
 vos-net = { workspace = true }
 vos-pvm = { workspace = true }
+# The agent program's runs, over the node's snapshots and blobs.
+vos-exec = { workspace = true }
 # An install's package is an ELF: the node derives its programs.
 vos-pvm-compiler = { workspace = true }
 vos-raft = { workspace = true }
