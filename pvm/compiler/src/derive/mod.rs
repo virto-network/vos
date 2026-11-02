@@ -153,6 +153,14 @@ pub struct Derived {
 }
 
 impl Derived {
+    /// Its programs in the order a derivation names them: the actor's,
+    /// then each kernel's.
+    pub fn programs(&self) -> Vec<Vec<u8>> {
+        let mut programs = vec![self.actor.clone()];
+        programs.extend(self.kernels.iter().map(|(_, kernel)| kernel.clone()));
+        programs
+    }
+
     /// The derivation an install of the package `elf`, derived as this,
     /// names.
     pub fn derivation(&self, elf: &[u8]) -> vos_wire::records::Derivation {

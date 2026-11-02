@@ -113,7 +113,9 @@ pub fn light(args: &[String]) {
     );
 }
 
-/// Whether the store is one prefix of the operations, each whole.
+/// Whether the store is one prefix of the operations, each whole: the
+/// counter the sum of the calls its state version counts, and the latest
+/// time its rows hold the one its last operation recorded.
 fn check(light: &Light, methods: &Methods) -> bool {
     let applied = version(light);
     let calls = applied.saturating_sub(1);
@@ -126,7 +128,20 @@ fn check(light: &Light, methods: &Methods) -> bool {
         ),
     };
     let expected = calls * (calls + 1) / 2;
-    let consistent = applied == 0 || value == expected;
+    let latest = light
+        .store()
+        .snapshot()
+        .get(&keys::batch_time())
+        .expect("a read")
+        .and_then(|bytes| u64::decode(unstored(&bytes)?).ok())
+        .map(|(time, _)| time);
+    let last = light
+        .store()
+        .snapshot()
+        .last()
+        .expect("a read")
+        .map(|(time, _)| time);
+    let consistent = applied == 0 || (value == expected && latest == last);
     println!(
         r#"{{"light":"check","version":{applied},"calls":{calls},"value":{value},"expected":{expected},"consistent":{consistent}}}"#
     );

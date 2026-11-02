@@ -43,12 +43,9 @@ impl Package {
 #[cfg(feature = "release")]
 pub fn package(elf: &[u8]) -> Result<Package, String> {
     let derived = vos_pvm_compiler::derive(elf).map_err(|error| error.to_string())?;
-    let derivation = derived.derivation(elf);
-    let mut programs = vec![derived.actor];
-    programs.extend(derived.kernels.into_iter().map(|(_, kernel)| kernel));
     Ok(Package {
-        derivation,
-        programs,
+        derivation: derived.derivation(elf),
+        programs: derived.programs(),
     })
 }
 

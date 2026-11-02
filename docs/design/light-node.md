@@ -142,8 +142,28 @@ devices decrypt each other's messages".
 | **node-API client** | the multiplexed `vos-api` client over SSH's `vos-api` subsystem, over an arti onion stream (§6) [E23] | `vos-api` [built] |
 | **sync** | merkle-crdt DAGs of the local actors' Merge fields, its `Store` over fjall, sealed before they leave the device (§3.6) | `support/merkle-crdt` [built, no dependent today] |
 | **MLS** | the user's device group, through `vos-mls` over mls-rs, on the host side, native, never in a guest | `vos-mls` [new]; the storage providers and copy-and-swap adapted from the `messaging` branch (§3.4) |
-| **secrets** | per device, as today: the member secret from the keystore's HMAC; the admin key in the hardware keystore; the sync key and MLS state wrapped after first unlock; a security-key kit through the `hmac-secret` path (§3.5) | `vos-device`'s `secret` [built, extended] |
+| **secrets** | per device, as today: the member secret from the keystore's HMAC; the admin key in the hardware keystore; the sync key and MLS state wrapped after first unlock; a security-key kit through the `hmac-secret` path (§3.5) | `vos-light`'s `secret` [built, extended] |
 | **Tor** | arti's client, one `TorClient` per process | arti (§6) |
+
+**What the core is, as built** [built, `node/light`, `node/exec`]:
+- **The entries:** a call is the agent program's merge entry
+  (`Work::Merge`): refine runs the handler as a command's step and returns
+  that one step as a work result, which the light node applies natively
+  with the code a node's accumulate runs (`vos_wire::apply`), so no
+  accumulate runs in the PVM. An install is a batch of one install
+  through refine, applied alike. Until the CRDT fields and `#[msg(merge)]`
+  (plan 8.18a), the entry runs `&mut self` handlers and fails, `Trapped`
+  with nothing written, a run that sends, attests, writes a committed map
+  or starts a workflow: Merge-only in effect.
+- **The host-call layer** is `vos-exec`, which `vos-node` and `vos-light`
+  link; ingress's device programs (`credentialed.rs`'s use of
+  `vos_pvm_recair::device`) stay in the node, as the light node never
+  computes one from a kernel once they are release artifacts.
+- **Not yet release artifacts:** the stock kernels' device programs. The
+  device library still computes one from its kernel
+  (`DeviceProgram::auth`, a reference run) until the references are
+  generalized (plan 8.4); the local actors and the agent program already
+  are (`vos_light::release`).
 
 **Not embedded:** Raft (`vos-raft`) and every group loop; ingress serving
 of any kind (the light node listens on no socket; sync and calls are
@@ -217,7 +237,11 @@ release, two runs]: the light node opens in 0.2–1.1 s, installs the counter in
 43–123 ms, and a call through the merge entry, its synced batch included,
 takes 2.0–6.2 ms at p50 and 3.3–19.6 ms at p95; a query 1.1–1.9 ms. The
 host's load moves them threefold; the phone's numbers are the gate's run
-(`tools/phone/scripts/light.sh`).
+(`tools/phone/scripts/light.sh`). The host's calls miss the 1 ms budget
+above: each is a synced commit, and how much of a call its fsync takes is not
+yet split out. If the phone misses it too, a call's durability (synced, or buffered
+and synced in a group) is the lever, against §2.2's rule that every write
+is crash-safe.
 
 Proving is the only heavy phase: about 0.65 s of wall time on the four
 big cores at full load a sign-in [measured, `proving.md` §8: 645 ms]. A

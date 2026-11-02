@@ -111,7 +111,8 @@ impl Light {
         // One operation runs at a time: one machine kept idle.
         let program = OuterMachines::with_idle_limit(agent, PvmBackend::ForceInterpreter, 1)
             .map_err(unloadable)?;
-        let pool = Arc::new(MachinePool::new());
+        // A phone's pool: few idle machines, as one operation runs at a time.
+        let pool = Arc::new(MachinePool::with_idle_limits(8, 2));
         for (_, program) in store.programs()? {
             pool.install(&program).map_err(unloadable)?;
         }
@@ -254,7 +255,9 @@ impl Light {
             Some(bytes) => unstored(&bytes)
                 .and_then(|bytes| u64::decode(bytes).ok())
                 .map(|(version, _)| version)
-                .ok_or(Error::Store(StoreError::Layout(None)))?,
+                .ok_or_else(|| {
+                    Error::Fault(Fault::Invariant("the state version does not read".into()))
+                })?,
             None => 0,
         };
         let latest = snapshot.last()?.map_or(0, |(time, _)| time);

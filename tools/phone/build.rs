@@ -22,12 +22,9 @@ fn main() {
     let (agent, counter) = match (std::fs::read(&agent_elf), std::fs::read(&counter_elf)) {
         (Ok(agent), Ok(counter)) => {
             let derived = vos_pvm_compiler::derive(&counter).expect("the counter derives");
-            let derivation = derived.derivation(&counter);
-            let mut programs = vec![derived.actor];
-            programs.extend(derived.kernels.into_iter().map(|(_, kernel)| kernel));
             (
                 vos_pvm_compiler::link_elf_spi(&agent).expect("the agent links"),
-                (derivation, programs).encode(),
+                (derived.derivation(&counter), derived.programs()).encode(),
             )
         }
         _ => (Vec::new(), Vec::new()),

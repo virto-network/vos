@@ -20,7 +20,8 @@ use vos_wire::apply::State;
 use vos_wire::ids::AgentId;
 
 /// The number of the store's layout: where its rows live. A store written
-/// in another is refused at open.
+/// in another is refused at open. Numbered apart from the node's store's
+/// layouts.
 pub const LAYOUT: u32 = 1;
 
 /// The block cache the store keeps by default: a phone's.
@@ -175,7 +176,8 @@ impl Store {
     }
 }
 
-/// The programs installed, the local agent's every one.
+/// The programs installed, the local agent's every one: the store holds one
+/// agent, and nothing uninstalls, so each stored program is pinned.
 impl ProgramStore for Store {
     fn get(&self, hash: &[u8; 32]) -> Option<Vec<u8>> {
         self.0
@@ -185,7 +187,8 @@ impl ProgramStore for Store {
             .map(|bytes| bytes.to_vec())
     }
 
-    fn pinned_by(&self, hash: &[u8; 32], _: AgentId) -> bool {
+    fn pinned_by(&self, hash: &[u8; 32], agent: AgentId) -> bool {
+        debug_assert_eq!(agent, crate::LOCAL);
         self.0.programs.contains_key(hash).expect("a program read")
     }
 }

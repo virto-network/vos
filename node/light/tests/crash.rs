@@ -22,8 +22,9 @@ const DEVICE: Principal = Principal::Client([0xd1; 32]);
 const ROUNDS: Rounds = Rounds::twelve("VOS_LIGHT_CRASH_WRITER", "", 40);
 /// At most this many bytes of the journal are torn.
 const TEAR: u64 = 512;
-/// The most operations a tear can take: each one's batch holds its row of
-/// the last time and seed alone more than 32 bytes.
+/// The most operations a tear can take: each operation's batch is over 32
+/// bytes (its row of the last time and seed alone is 40), so a tear of
+/// `TEAR` bytes reaches at most `TEAR / 32` operations.
 const TEAR_REACH: u64 = TEAR / 32;
 
 fn artifacts() -> (Vec<u8>, Package) {
@@ -69,7 +70,7 @@ fn main() {
     let value = programs::method(&counter.programs[0], "value");
     let mut last = 0;
     ROUNDS.run(writer, journal(TEAR), |round| {
-        check(round, &agent, value, &mut last)
+        check(round, &agent, &counter, value, &mut last)
     });
     println!(
         "light crash: {} rounds reopened on one prefix each",
@@ -77,10 +78,17 @@ fn main() {
     );
 }
 
-/// The store reopened on one prefix of the operations, at least through
+/// The store reopened on one prefix of the operations, its install's
+/// programs with its rows, at least through
 /// the calls the child reported, or else through those `last` round
 /// reopened on, but for what a tear takes.
-fn check(round: Round, agent: &[u8], value: vos_wire::ids::MethodId, last: &mut u64) {
+fn check(
+    round: Round,
+    agent: &[u8],
+    counter: &Package,
+    value: vos_wire::ids::MethodId,
+    last: &mut u64,
+) {
     let reported = round.reported.unwrap_or(*last);
     let floor = round.floor(reported, TEAR_REACH);
     let light = Light::open(round.dir, agent, Config::default()).unwrap();
@@ -93,6 +101,21 @@ fn check(round: Round, agent: &[u8], value: vos_wire::ids::MethodId, last: &mut 
         round.how()
     );
     if applied > 0 {
+        let held: Vec<[u8; 32]> = light
+            .store()
+            .programs()
+            .unwrap()
+            .into_iter()
+            .map(|(hash, _)| hash)
+            .collect();
+        assert!(
+            counter
+                .derivation
+                .programs()
+                .all(|program| held.contains(&program.0)),
+            "round {}: the install's rows without its programs",
+            round.number
+        );
         let outcome = light.query(DEVICE, COUNTER, value, Vec::new()).unwrap();
         let Outcome::Done(bytes) = outcome else {
             panic!("round {}: {outcome:?}", round.number);

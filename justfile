@@ -665,6 +665,8 @@ fuzz secs="60":
 check: fmt-check doc-check check-venue-rules check-no-std check-no-leaks check-no-faults check-kit build-test-actors build-agent build-representative build-credentials fuzz-replay
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     cargo clippy -p vos-venue --all-targets --quiet -- -D warnings
+    cargo clippy -p vos-pvm-recair --no-default-features --lib --quiet -- -D warnings
+    cargo clippy -p vos-light --lib --quiet -- -D warnings
     just clippy-prover
     cargo test {{core_crates}}
     just test-recair

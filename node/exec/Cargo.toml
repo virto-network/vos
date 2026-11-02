@@ -16,4 +16,3 @@ vos-wire = { workspace = true }
 [dev-dependencies]
 # A program laid out as the loader lays it out.
 vos-pvm-program = { workspace = true }
-tempfile = "3"

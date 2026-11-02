@@ -24,7 +24,7 @@
 set -e
 phone=$1; out=$2; rounds=${3:-10}
 host=$(mktemp -d "${TMPDIR:-/var/tmp}/light.XXXXXX")
-dir=/data/local/tmp/s8-light
+dir=/data/local/tmp/vos-light
 a="adb -s ${LIGHT_SERIAL:-7689b5a9}"
 if [ "${LIGHT_LOCAL:-0}" = 1 ]; then dir=$host/phone; fi
 on_phone() {

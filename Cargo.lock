@@ -4985,7 +4985,6 @@ version = "0.1.0"
 dependencies = [
  "fjall",
  "hex",
- "tempfile",
  "tracing",
  "vos-pvm",
  "vos-pvm-program",

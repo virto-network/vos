@@ -18,6 +18,10 @@ root=$(cd "$(dirname "$0")/../.." && pwd)
 out=${1:-$root/target/phone}
 export ANDROID_NDK_HOME=${ANDROID_NDK_HOME:-/opt/android-sdk/ndk/28.2.13676358}
 cd "$root"
+for elf in agent/programs/target/riscv64em-vos/release/vos-agent.elf \
+  agent/test-actors/target/riscv64em-vos/release/counter.elf; do
+  [ -f "$elf" ] || { echo "$elf: run \`just build-agent build-test-actors\` first" >&2; exit 1; }
+done
 mkdir -p "$out"
 cargo build --release -p vos-phone --features seeded
 references=$(target/release/vos-phone run --reps 1 --grind 0 2>/dev/null \

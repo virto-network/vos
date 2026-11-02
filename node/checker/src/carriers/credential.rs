@@ -1,5 +1,5 @@
 //! A member's device credential as needles (`proving.md` §8,
-//! `pvm/device/SECURITY.md`): what its secret source gives and all that
+//! `node/light/SECURITY.md`): what its secret source gives and all that
 //! follows from it, which nothing but the device holds, and where the
 //! member sits in the credential actor's tree, which a credentialed call
 //! never carries.

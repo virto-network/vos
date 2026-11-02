@@ -1,5 +1,5 @@
 //! The carrier audit over credentialed calls (`identity-and-authority.md`
-//! §5, `pvm/device/SECURITY.md`): three nodes of a founded space with the
+//! §5, `node/light/SECURITY.md`): three nodes of a founded space with the
 //! credential actor, the poll, the purses' ledger and the device actor; a
 //! member's device secret derived from a known source output, its path
 //! fetched, and its calls proved by the device library as a phone proves
