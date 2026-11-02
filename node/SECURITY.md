@@ -382,9 +382,9 @@ facility (`identity-and-authority.md` §7):
   whatever the node does.
 - **Measured** [measured, x86 development desktop (Intel Core Ultra 7
   155H: 6 P-cores with SMT, 8 E-cores, 2 LP E-cores; 22 logical
-  threads, 16 physical cores), 2026-10-27; an earlier credential parameter set; the node and the
-  generator in one process, other builds sharing the machine, so not the
-  gate's own setup]: one node of a founded space of one, 4 agents, owner
+  threads, 16 physical cores), 2026-10-27; an earlier credential
+  parameter set; the node and the generator in one process, other builds
+  sharing the machine, so not the gate's own setup]: one node of a founded space of one, 4 agents, owner
   transfers over the API's socket, open loop at `100·k` a second for
   10 s, a signed increment at the same rate beside:
 
