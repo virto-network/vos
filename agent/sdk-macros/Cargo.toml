@@ -3,7 +3,7 @@ name = "vos-sdk-macros"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "The VOS actor SDK's macros: #[actor] and #[messages]."
+description = "The VOS actor SDK's macros: #[actor], #[messages] and #[derive(InPlace)]."
 
 [lib]
 proc-macro = true

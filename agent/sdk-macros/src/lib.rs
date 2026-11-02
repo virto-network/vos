@@ -6,15 +6,19 @@
 //!   dispatcher, which routes to handlers and workflows alike, and the
 //!   program's schema; and for each `#[attestable]` method, the entry its
 //!   kernel is derived from.
+//! - `#[derive(InPlace)]` on a `#[repr(C)]` struct of in-place fields: read
+//!   in place, its encoding its bytes (`vos_sdk::p2`).
 
 mod actor;
+mod in_place;
 mod messages;
 mod names;
 
 use proc_macro::TokenStream;
-use syn::{Error, ItemImpl, ItemStruct, LitStr, Type, parse_macro_input};
+use syn::{DeriveInput, Error, ItemImpl, ItemStruct, LitStr, Type, parse_macro_input};
 
 use actor::actor_impl;
+use in_place::in_place_impl;
 use messages::messages_impl;
 
 pub(crate) fn last_segment(ty: &Type) -> Option<&syn::PathSegment> {
@@ -88,7 +92,12 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   proves (`proving.md` §8): it takes no `self`, its kernel returns its
 ///   statement's parts and leaves their Poseidon2 io-hash, may make the
 ///   Poseidon2 call and must reach no BLAKE2b, and no node attests it. An
-///   auth guard's `device = "..."` must name one of the actor's.
+///   auth guard's `device = "..."` must name one of the actor's. Its
+///   arguments by reference, `&T` with `T` in place
+///   (`vos_sdk::p2::InPlace`: digests, paths, `#[derive(InPlace)]`
+///   structs), come first and are read where its witness input left them,
+///   never copied; its message type holds them by value, its encoding
+///   the same bytes.
 /// - **Options:** `#[msg(role = "...", gas = N)]`, the role a caller needs
 ///   and the handler's gas limit; `#[workflow(role = "...", gas = N)]`
 ///   alike, the role checked when it starts and the gas each step's.
@@ -118,6 +127,20 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
     parse_macro_input!(attr with parser);
     let input = parse_macro_input!(item as ItemImpl);
     messages_impl(input, module)
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
+// ===== #[derive(InPlace)] =====
+
+/// A `#[repr(C)]` struct whose fields are all in place (`vos_sdk::p2::InPlace`:
+/// integers, digests, arrays and other such structs), with no padding: its
+/// value is its bytes, so a device kernel takes it by reference, read where
+/// its argument bytes lie, and its encoding is those bytes.
+#[proc_macro_derive(InPlace)]
+pub fn in_place(item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as DeriveInput);
+    in_place_impl(input)
         .unwrap_or_else(Error::into_compile_error)
         .into()
 }

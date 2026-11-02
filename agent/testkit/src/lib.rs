@@ -698,6 +698,41 @@ pub fn device_auth_arguments(seed: u32, slot: u32, filled: &[usize]) -> (Vec<u8>
     (input, public)
 }
 
+/// The `sdk-device` test actor's `auth` arguments for the same statement as
+/// [`device_auth_arguments`]'s (the secret `seed` gives at `slot`, the
+/// siblings at the levels `filled` nonzero): its witness input (the
+/// siblings, the slot as eight little-endian bytes, the secret, then the
+/// claim: `map_root`, `scope`, `nullifier` and `binding`) and its public
+/// arguments, the claim's 128 bytes.
+pub fn device_sdk_auth_arguments(seed: u32, slot: u32, filled: &[usize]) -> (Vec<u8>, Vec<u8>) {
+    let (lean, public) = device_auth_arguments(seed, slot, filled);
+    let (siblings, rest) = lean.split_at(1024);
+    let (secret, _) = rest.split_at(32);
+    let mut input = siblings.to_vec();
+    input.extend_from_slice(&u64::from(slot).to_le_bytes());
+    input.extend_from_slice(secret);
+    input.extend_from_slice(&public[1..]);
+    (input, public[1..].to_vec())
+}
+
+/// An owner kernel's arguments for the secret `seed` gives (word `i` is
+/// `seed + 7,919·i`): its witness input (the secret, then the claim:
+/// `owner = C(T(owner), s)` and a binding) and its public arguments, the
+/// claim's 64 bytes. The `sdk-device` test actor's `owner` and
+/// `owner_lean` both read it.
+pub fn device_owner_arguments(seed: u32) -> (Vec<u8>, Vec<u8>) {
+    use vos_wire::credentials::{Tag, compress, digest};
+    let secret: [u32; 8] = core::array::from_fn(|i| seed + 7_919 * i as u32);
+    let owner = compress(&Tag::Owner.block(), &secret);
+    let binding: [u32; 8] = core::array::from_fn(|i| 0x0b1b_0000 + i as u32);
+    let mut input = digest(&secret).to_vec();
+    for words in [owner, binding] {
+        input.extend_from_slice(&digest(&words));
+    }
+    let public = input[32..].to_vec();
+    (input, public)
+}
+
 /// Decode a reply as `T`.
 pub fn decode<T: Decode>(bytes: &[u8]) -> Option<T> {
     T::decode(bytes).ok().map(|(value, _)| value)

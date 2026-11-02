@@ -9,12 +9,15 @@
 #![no_std]
 
 extern crate alloc;
+// `#[derive(InPlace)]` names this crate `::vos_sdk`, here too.
+extern crate self as vos_sdk;
 
 pub mod context;
 pub mod device;
 pub mod heap;
 pub mod host;
 pub mod mem;
+pub mod p2;
 pub mod runtime;
 pub mod state;
 pub mod table;

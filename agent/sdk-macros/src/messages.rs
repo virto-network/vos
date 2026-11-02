@@ -44,6 +44,15 @@ impl Handler {
     }
 }
 
+/// `T` for a device kernel's argument by reference, `&T`, which its entry
+/// reads in place; `None` for an argument by value.
+fn in_place(ty: &Type) -> Option<&Type> {
+    match ty {
+        Type::Reference(reference) => Some(&reference.elem),
+        _ => None,
+    }
+}
+
 /// `T` and `Some(E)` for `Result<T, E>`, else the type and `None`.
 fn reply_and_error(output: &ReturnType) -> (Type, Option<Type>) {
     let ty: Type = match output {
@@ -283,6 +292,31 @@ fn arguments<'a>(
                 "a `venue_bound` method's leading argument is `venue`: name this one otherwise",
             ));
         }
+        if let Type::Reference(reference) = &*typed.ty {
+            if options.device_kernel.is_none() {
+                return Err(Error::new(
+                    typed.ty.span(),
+                    "only an #[attestable(device)] method takes an argument by reference, read \
+                     in place",
+                ));
+            }
+            if reference.mutability.is_some() || reference.lifetime.is_some() {
+                return Err(Error::new(
+                    typed.ty.span(),
+                    "a device kernel's argument by reference is `&T`, read in place for its run",
+                ));
+            }
+            if arguments
+                .iter()
+                .any(|(_, ty): &(Ident, Type)| in_place(ty).is_none())
+            {
+                return Err(Error::new(
+                    typed.ty.span(),
+                    "a device kernel's arguments by reference come first, so each lies aligned \
+                     where its witness input leaves it",
+                ));
+            }
+        }
         arguments.push((pattern.ident.clone(), (*typed.ty).clone()));
         public.push(marked_public.is_some());
     }
@@ -475,12 +509,12 @@ impl Generated {
             .options
             .venue_bound
             .map(|_| quote!(pub venue: ::vos_sdk::VenueId));
-        let fields = venue.into_iter().chain(
-            handler
-                .arguments
-                .iter()
-                .map(|(name, ty)| quote!(pub #name: #ty)),
-        );
+        let fields = venue
+            .into_iter()
+            .chain(handler.arguments.iter().map(|(name, ty)| {
+                let ty = in_place(ty).unwrap_or(ty);
+                quote!(pub #name: #ty)
+            }));
         self.schema.methods.push(MethodSchema {
             id: MethodId(id),
             name: handler.name.clone().into_bytes(),

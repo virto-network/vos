@@ -1,0 +1,11 @@
+error: an in-place struct is `#[repr(C)]`: its layout is its encoding
+  --> tests/compile_fail/in_place_with_padding.rs:13:12
+   |
+13 | pub struct Unordered {
+   |            ^^^^^^^^^
+
+error[E0080]: evaluation panicked: an in-place struct holds no padding
+ --> tests/compile_fail/in_place_with_padding.rs:4:23
+  |
+4 | #[derive(Clone, Copy, InPlace)]
+  |                       ^^^^^^^ evaluation of `_` failed here

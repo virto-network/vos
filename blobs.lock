@@ -29,6 +29,7 @@ f64519924390d5ac8747927ded62e90e0b81dc3c7defa15930c1d6cb7ffe58d4  agent/test-act
 e393a0947a9a2765f625a6580e0d9ebf8a494a6dc6ee4e9fb29e04a3051bb9c3  agent/test-actors/target/riscv64em-vos/release/reader.elf
 3d650786c3daec44a34a1509b59c61a4e29c557850e61c7b055b74d51d5279ab  agent/test-actors/target/riscv64em-vos/release/roomy.elf
 0f1dfcf4873a1bdc24a8b1b00ee386881f87f753480e54ed0067e2ea52ef9151  agent/test-actors/target/riscv64em-vos/release/rounds.elf
+dce7eda3e5fcc2892641f6a2ad7bb9e52b35fe3efb729cd0c1c24a0aa5ab72ae  agent/test-actors/target/riscv64em-vos/release/sdk-device.elf
 aa2b1ca174b912a177798e74f2cb945248a87ec0e67089c08c35e6cb8e9fbee6  agent/test-actors/target/riscv64em-vos/release/shard.elf
 36739b742e991edb58b355dff05aef5ba533bf334027483b90ef41d7c8e6fc77  agent/test-actors/target/riscv64em-vos/release/shop.elf
 ef35eee108c9f048b8325b154003ad069219efbb98636b5bea97f67745125c8a  agent/test-actors/target/riscv64em-vos/release/tainted.elf

@@ -1,0 +1,13 @@
+error: only an #[attestable(device)] method takes an argument by reference, read in place
+  --> tests/compile_fail/reference_on_an_attestable.rs:15:25
+   |
+15 |     pub fn echo(digest: &Digest) -> u32 {
+   |                         ^^^^^^^
+
+warning: unused import: `vos_sdk::p2::Digest`
+ --> tests/compile_fail/reference_on_an_attestable.rs:1:5
+  |
+1 | use vos_sdk::p2::Digest;
+  |     ^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default

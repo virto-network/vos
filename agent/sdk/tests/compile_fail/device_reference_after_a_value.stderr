@@ -1,0 +1,13 @@
+error: a device kernel's arguments by reference come first, so each lies aligned where its witness input leaves it
+  --> tests/compile_fail/device_reference_after_a_value.rs:15:37
+   |
+15 |     pub fn owner(slot: u32, secret: &Secret, #[public] owner: &Digest) {
+   |                                     ^^^^^^^
+
+warning: unused imports: `Digest`, `Secret`, `TagHash`, and `Tag`
+ --> tests/compile_fail/device_reference_after_a_value.rs:1:19
+  |
+1 | use vos_sdk::p2::{Digest, Secret, Tag, TagHash};
+  |                   ^^^^^^  ^^^^^^  ^^^  ^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default

@@ -76,24 +76,66 @@ pub(super) fn attestable_entry(
     (function, row)
 }
 
-/// A device kernel's entry's body: its parts written once, in place, and
-/// their io-hash the Poseidon2 one ([`vos_sdk::device::DeviceReturn`]),
-/// whatever parts it states.
+/// A device kernel's entry's body: its arguments decoded in order, each by
+/// reference read in place (`vos_sdk::p2::in_place`), never copied, or its
+/// message decoded whole when none is by reference; its
+/// parts written once, in place, and their io-hash the Poseidon2 one
+/// ([`vos_sdk::device::DeviceReturn`]), whatever parts it states.
 pub(super) fn device_body(handler: &Handler, module: &Ident, message: &Ident) -> Tokens {
     let method = &handler.method.sig.ident;
     let names = handler.names();
+    let by_reference = handler
+        .arguments
+        .iter()
+        .any(|(_, ty)| in_place(ty).is_some());
+    let decodes = handler
+        .arguments
+        .iter()
+        .map(|(name, ty)| match in_place(ty) {
+            Some(inner) => quote! {
+                let #name: &#inner = ::vos_sdk::p2::in_place::<#inner>(input, &mut at);
+            },
+            None => quote! {
+                let #name: #ty = match <#ty as ::vos_sdk::Decode>::decode(&input[at..]) {
+                    ::core::result::Result::Ok((value, used)) => {
+                        at += used;
+                        value
+                    }
+                    ::core::result::Result::Err(_) => ::core::panic!("undecodable arguments"),
+                };
+            },
+        });
     let publics = handler
         .arguments
         .iter()
         .zip(&handler.public)
         .filter(|(_, public)| **public)
-        .map(|((name, _), _)| quote!(::vos_sdk::Encode::encode_to(&#name, parts.public_args());));
+        .map(|((name, ty), _)| {
+            let value = if in_place(ty).is_some() {
+                quote!(#name)
+            } else {
+                quote!(&#name)
+            };
+            quote!(::vos_sdk::Encode::encode_to(#value, parts.public_args());)
+        });
+    // With no argument by reference, the message decoded whole.
+    let decode = if by_reference {
+        quote! {
+            let mut at = 0usize;
+            #(#decodes)*
+            let _ = at;
+        }
+    } else {
+        quote! {
+            let ::core::result::Result::Ok((#module::#message { #(#names),* }, _)) =
+                <#module::#message as ::vos_sdk::Decode>::decode(input)
+            else {
+                ::core::panic!("undecodable arguments")
+            };
+        }
+    };
     quote! {
-        let ::core::result::Result::Ok((#module::#message { #(#names),* }, _)) =
-            <#module::#message as ::vos_sdk::Decode>::decode(input)
-        else {
-            ::core::panic!("undecodable arguments")
-        };
+        #decode
         let mut parts = ::vos_sdk::device::DeviceReturn::new();
         #(#publics)*
         let output = Self::#method(#(#names),*);
