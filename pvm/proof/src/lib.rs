@@ -612,8 +612,8 @@ pub use verify::{
 /// Chip-isolated harness surface — re-exports the trait
 /// objects callers need to assemble an explicit component slice for
 /// `prove_with_explicit_components` / `verify_with_explicit_components`.
-/// Intended only for the v2.x chip-rewrite validation harness; production
-/// code should use `prove` / `verify`.  Callers build their own
+/// Intended only for chip-isolated tests; production code should use
+/// `prove` / `verify`.  Callers build their own
 /// `&[&dyn MachineProverComponent]` slice from the chip structs in
 /// `crate::chips`.
 #[doc(hidden)]

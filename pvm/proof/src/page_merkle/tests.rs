@@ -18,7 +18,7 @@ fn default_chain_is_consistent() {
 }
 
 #[test]
-fn page_domains_remain_stable_across_v10_through_v19() {
+fn page_domains_are_pinned() {
     assert_eq!(
         leaf_hash(&[0u8; PAGE_SIZE]),
         hex_to_32("fd2c1ac593371c52c7fb0dc8fce568b2edea3cc192ca663a07fed4cd714f8fa3"),
