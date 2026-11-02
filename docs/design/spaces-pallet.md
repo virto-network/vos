@@ -1,12 +1,11 @@
 # `pallet-spaces`: a handoff design for Kreivo
 
-Status: v2, the design for the Kreivo teammate who implements it. v1 was
-handed over with VOS's slice-6 plan; v2 comes with VOS's slice-7 step 7.1,
-which simplified the anchoring protocol (`slice-7-mobile.md`, pin D′):
-no migration, equivocation ends a space for good, registration from the
-venue's next window, rooted statements only, and the venue rules written
-once, in `vos_anchor::venue`, which the pallet calls. "Changes from v1"
-below lists what moved. VOS writes no pallet code. VOS delivers three
+Status: v2, the design for the Kreivo teammate who implements it. v2
+simplified the anchoring protocol: no migration, equivocation ends a
+space for good, registration from the venue's next window, rooted
+statements only, and the venue rules written once, in
+`vos_anchor::venue`, which the pallet calls. "Changes from v1" below
+lists what moved. VOS writes no pallet code. VOS delivers three
 things:
 - this design;
 - the verifier crates, packaged for vendoring with a sync check (§3.1);
@@ -14,20 +13,14 @@ things:
   of the interface in §9; the transport that takes that client to a live
   Kreivo node is a port of master's substrate extension (§9.1).
 
-The supporting research, with file:line citations, is
-`docs/design/research/slice-6/spaces-pallet-research.md`. `KR` below is Kreivo's `runtime/kreivo/src`
-at master 87f8728.
+`KR` below is Kreivo's `runtime/kreivo/src` at master 87f8728.
 
 **VOS-side contract, the sources this design follows:**
-- `docs/design/slice-7-mobile.md` (VOS's slice-7 plan): pin D′, the
-  anchoring protocol simplified, and the owner's decisions S8–S19;
-- `docs/design/slice-6-on-chain.md` (VOS's slice-6 plan): pin D (spaces, windows,
-  anchors), pin F (the check order), decisions 9–12, as pin D′ amends them;
-- `docs/design/research/slice-6/owner-decisions.md` (2026-10-19) and
-  `docs/design/research/slice-7/owner-decisions.md`;
+- the anchoring protocol: `docs/design/proving.md` §7, and `vos-anchor`
+  (`pvm/proof/anchor`), whose types and rules §3 lists;
 - the background on why anchors and statements exist:
   `docs/design/identity-and-authority.md` §5, §11 and §12, and
-  `docs/design/proving.md` §12.
+  `docs/design/proving.md` §11.
 
 ## 0. Changes from v1
 
@@ -138,13 +131,14 @@ Each §3 API is in VOS's tagged crates:
 - value-moving handlers (only `Record` is admitted). **Every value-moving
   handler admitted later must be two-sided or spend the submitting space's
   own escrow:** an anchor gives ordering and non-equivocation, not
-  integrity (pin D), so a one-sided `Credit` is not admissible;
+  integrity (a space can anchor any root of its own making), so a
+  one-sided `Credit` is not admissible;
 - anonymous authentication by proof (§11, a later stage);
 - the migration of communities (§12);
 - a space's migration to another venue: a space anchors at one venue for
   good, and changes venue by founding again.
 
-## 2. Defaults taken by the owner
+## 2. Defaults
 
 | Topic | Default |
 |---|---|
@@ -159,20 +153,22 @@ Each §3 API is in VOS's tagged crates:
 
 ## 3. Glossary and the VOS crates
 
-The vendored crates live under Kreivo's `vendor/vos-verifier/` (decision 9:
-vendored with a `VENDOR` file and a sync check, §3.1). The pallet calls
+The vendored crates live under Kreivo's `vendor/vos-verifier/`, vendored
+with a `VENDOR` file and a sync check against a VOS tag (§3.1), so
+Kreivo needs no VOS crate from crates.io (frame-contrib and crates.io
+later). The pallet calls
 them and never re-implements their encodings.
 
 | Item | Definition | Crate API the pallet uses |
 |---|---|---|
-| `SpaceGenesis` | pin D's: the version (1 byte, `GENESIS_VERSION` = 1, which the encoding writes and the type holds no field of); the founding nodes, a compact count, then each its number (`NodeNumber`, 1 byte) and ed25519 key (32), numbers strictly ascending; the clock `WindowClock { origin_ms, length_ms }` (8 and 8, LE); the founder's time (8, LE); a nonce (16). The decode is canonical (a shortest compact, at least one node, nothing left over) and reads any count; **the venue registers 1 to 16 founding keys** (`MAX_FOUNDING_KEYS`) | `vos_anchor::SpaceGenesis::decode(&[u8])`, `vos_anchor::MAX_FOUNDING_KEYS` |
+| `SpaceGenesis` | the space's genesis: the version (1 byte, `GENESIS_VERSION` = 1, which the encoding writes and the type holds no field of); the founding nodes, a compact count, then each its number (`NodeNumber`, 1 byte) and ed25519 key (32), numbers strictly ascending; the clock `WindowClock { origin_ms, length_ms }` (8 and 8, LE); the founder's time (8, LE); a nonce (16). The decode is canonical (a shortest compact, at least one node, nothing left over) and reads any count; **the venue registers 1 to 16 founding keys** (`MAX_FOUNDING_KEYS`) | `vos_anchor::SpaceGenesis::decode(&[u8])`, `vos_anchor::MAX_FOUNDING_KEYS` |
 | `SpaceId` | `[u8; 32]` = `BLAKE2b-256("vos/space/id" ‖ SCALE(genesis))` | `vos_anchor::space_id(&genesis)` |
 | `VenueId` | Kreivo's genesis block hash | from `frame_system::block_hash(0)`, as `vos_anchor::VenueId` |
 | window of time t | `w = ⌊(t − origin_ms) / length_ms⌋`; `B_w = origin_ms + (w+1)·length_ms`; none for `t < origin_ms`, when no window is closed | `vos_anchor::WindowClock::{window, boundary}`, both `Option` |
 | registrable length | `length_ms` from 120,000 to 3,600,000 ms (`MIN_LENGTH_MS`, `MAX_LENGTH_MS`) | `WindowClock::registrable()` |
 | anchor digest | `BLAKE2b-256("vos/anchor/v1" ‖ venue ‖ space ‖ w (8, LE) ‖ kind (1) ‖ root)` | `vos_anchor::anchor_digest(&venue, &space, w, kind, &root)`, `kind` a `RootKind` |
 | registration digest | `BLAKE2b-256("vos/space/register" ‖ venue ‖ space ‖ controller (32))` | `vos_anchor::register_digest(&venue, &space, &controller)` |
-| `RootKind` | `u8`; `0` = Space; every other value is refused (1 is reserved for slice 7's Poseidon2 root) | `vos_anchor::RootKind::from_u8`, `None` → `BadKind` |
+| `RootKind` | `u8`; `0` = Space; every other value is refused (1 is reserved for a Poseidon2 root) | `vos_anchor::RootKind::from_u8`, `None` → `BadKind` |
 | `MaxRootAge` | 24 h, the kit's constant, which the venue rules read: not a `Config` item, so no pallet can anchor on one bound and expire `Seen` entries on another (§6.5) | `vos_anchor::MAX_ROOT_AGE_MS` |
 | `ProgramId` | `[u32; 8]` (8 M31 words) | `vos_statement::ProgramId` |
 | `StatementId` | `[u8; 32]`, returned by `judge` | `vos_statement::StatementId` |
@@ -324,13 +320,13 @@ they are the kit's constants (`vos_anchor::MAX_ROOT_AGE_MS`,
 
 - **In Kreivo:**
   - runtime name `Spaces`, **pallet index 90**. It takes the slot of the
-    spike's `VosVerifier`, which never shipped;
+    earlier `VosVerifier` prototype, which never shipped;
   - the storage prefix is `"Spaces"`.
 - **Suggested deposits:**
   - `RegistrationDeposit = UNITS / 2`, the same as `CommunityDepositAmount`
     (`KR/config/communities/mod.rs:23`), but held, not paid;
   - `SubmitDeposit = UNITS / 2`, about one masked proof's length fee [est].
-  - The owner can tune both.
+  - Both are tunable.
 
 ## 5. Storage
 
@@ -413,12 +409,12 @@ node (`remove_authority`, then `add_authority` of the new one). A node may
 be added as a replica of the space's representative only while it holds a
 listed key (checked when it is added).
 
-`AnchorArg` is pin D's `Anchor`:
+`AnchorArg` is `vos_anchor::Anchor`:
 `{ space: [u8;32], window: u64, kind: u8, root: [u8;32], signer: [u8;32], signature: [u8;64] }`,
 where `signer` is the ed25519 anchor key and `signature` is ed25519 over
 the anchor digest.
 
-### 6.1 `anchor`, the anchor rule (pin D′)
+### 6.1 `anchor`, the anchor rule
 
 The pallet checks the pause (anchor) and decodes the kind (`BadKind` for
 any but 0), then calls `vos_anchor::venue::anchor(&StorageVenue, &anchor)`,
@@ -497,7 +493,7 @@ the space forks unseen. One venue a space is the space's discipline, and
 an anchor gives no integrity: a value-moving handler is two-sided or spends
 the submitting space's own escrow (§1).
 
-### 6.3 `submit` (pin F's order)
+### 6.3 `submit`, in the venues' check order
 
 Failures that are dispatch errors move no deposit; only the signer's or
 the sovereign's fee is spent:
@@ -512,7 +508,7 @@ and it reports through events:
 5. hold `SubmitDeposit`;
 6. decode the statement (refusal 1);
 7. `Formats[statement.format]` active now, else refusal 2: the format
-   before the program, as pin F orders them, so a statement failing both
+   before the program, as every venue orders them, so a statement failing both
    reports 2 at every venue;
 8. `program = statement.program` when `Programs` has it active now, else
    refusal 3;
@@ -538,7 +534,7 @@ The outcome:
 - declared: `submit_accept`;
 - actual: `submit_refused_early` for refusals before the proof (codes 1–6);
 - the full weight for a proof refusal, which costs nearly a full verify
-  (spike 6c: 2.7 of 4.0 ms).
+  (2.7 of 4.0 ms, measured).
 
 ### 6.4 Formats and programs: the delay
 
@@ -566,7 +562,7 @@ The outcome:
   before the new kit takes effect, adds `new − old` to every `Seen`
   expiry: an anchor still fresh stays anchored until `B_w + new`, and its
   statements' entries must last as long, or a replay is accepted once an
-  entry computed with the old bound is pruned (pin F). Pruned anchors stay
+  entry computed with the old bound is pruned. Pruned anchors stay
   pruned: a root older than the old bound was refused already.
 
 ## 7. Fees: the sovereign account pays for its authorities
@@ -617,7 +613,7 @@ a block by proof_size: hundreds of UNITS a minute, with the controller's
 - Pool validity stays local: `validate` reads `Budget` as it reads
   `Authorities`.
 - frame-contrib's `feat/private-communities` has a per-community `Budget`
-  that the communities fold-in (§12, S2) can merge with (§13).
+  that the communities fold-in (§12, stage 2) can merge with (§13).
 
 **The pallet-only fallback, if the extension is refused:**
 - `#[pallet::feeless_if]` on `anchor` and `submit`, when the signer is an
@@ -714,7 +710,7 @@ The node's client (`vos-venue`'s `kreivo` module, over a `Transport`, §9.1):
 | submit a statement (the worker) | 8 | the node's sr25519 authority account | `Accepted { id }` → accepted; `Refused { 6 }` → accepted; `Refused { c }` → `Refusal(c)` | 7, 19–21 → a configuration or funding alert; `InvalidTransaction::Payment` → the budget or the sovereign's funds, an alert |
 
 **The anchor's outcomes, and what the client does.** The node's leader
-knows five outcomes of an anchor (pin D′): taken, not yet, never,
+knows five outcomes of an anchor: taken, not yet, never,
 unlisted and stopped, each with the venue's raw code for its log. The
 client pre-checks nothing of the anchor rule. It answers from its last
 read of the space (not yet while unregistered, unread or paused; stopped
@@ -781,12 +777,13 @@ integration on `sube`: `extensions/substrate`. It runs sube over the
 smoldot light client and submits externally signed V4 transactions. Its
 submission is replay-safe, and it hardens nonces and cancellation. It is
 written against master's old extension ABI, and vos-core has no extension
-host yet (`core-model.md` §18, open question 18).
+host yet (`open.md`, "The extension host").
 - The node-side Kreivo transport is expected to be a port of that
   extension onto vos-core's extension host.
 - **Who owns what:**
-  - the port is VOS's work, after the planned slices, once the extension
-    host exists (owner decision 12d);
+  - the port is VOS's work, once the extension host exists: chain
+    transports become extensions, while the prover stays built into the
+    node;
   - the pallet is the teammate's;
   - the live Kreivo leg (the client over the port, on a dev chain
     carrying the pallet) waits on both.
@@ -798,7 +795,7 @@ host yet (`core-model.md` §18, open question 18).
   `Connect` the client's reader thread calls until Kreivo is reached.
 - An earlier subxt transport, parked unmerged, is
   `node/venue/src/kreivo/chain.rs` at VOS commit `9e63e5a9`. Its review
-  (`slice-6-progress.md`) found the behaviours below.
+  found the behaviours below.
 
 **What the transport must provide** ("ext": master's extension already
 covers it; "part": it covers part, and the port finishes it; unmarked: the
@@ -892,8 +889,7 @@ port adds it):
 - **The release gate.** No release build reaches Kreivo until the pallet
   passes G1–G17 in its mock runtime (the `fees` vectors in Kreivo's
   runtime tests) and the client passes an end to end run on a Kreivo dev
-  chain over the port (`slice-6-on-chain.md`, the deferred Kreivo
-  gates).
+  chain over the port (the live Kreivo leg, `open.md`).
 - **The CLI,** over `calls::Call` and the `Sender`:
   - the node's Kreivo venue;
   - showing and rotating its account;
@@ -966,7 +962,7 @@ tag's, byte for byte.
     call's parts may also be `{repeat, count}`, one byte repeated, which
     the length bounds' steps use. `unpinned` lists the raw keys a harness
     leaves out of every step's storage: `PruneCursor`'s (§5, §6.5);
-  - `mutations.json`: spike 6c's proof mutants (120) and statement mutants
+  - `mutations.json`: the proof mutants (120) and statement mutants
     (284), and format 39's masked fields tampered (12 the fixed layout
     holds), each a patch of the `valid` fixture's proof or statement and
     the code its judgement reaches at that fixture's venue state, for the
@@ -1034,7 +1030,7 @@ pre-state's storage did.
     not on crates.io or wired in Kreivo;
   - frame-contrib 3.x's device call filters can limit such a device to
     `Spaces::{anchor, submit}`.
-- **Anonymous authorities** (after VOS slice 7's credential AIR):
+- **Anonymous authorities** (on VOS's credential AIR, `proving.md` §8):
   - the pallet keeps `AuthorityRoot: SpaceId → [u8;32]`, a Merkle root
     over the authority keys, which the controller sets alongside the map;
   - `anchor_anon` and `submit_anon` use `#[pallet::authorize]`. That needs
@@ -1043,7 +1039,7 @@ pre-state's storage did.
   - each carries a credential proof "a key in R_auth" and a nullifier per
     `(space, kind, w)` or per statement;
   - verification goes through `fc_traits_proof_verifier::ProofVerifier`,
-    the trait on the owner's `feat/private-communities` branch;
+    the trait on frame-contrib's `feat/private-communities` branch;
   - fees and the deposit come from the sovereign account in dispatch,
     since an authorized origin pays nothing at the transaction layer;
   - pool DoS is bounded by `provides` tags, a per-space cap per window,
@@ -1053,27 +1049,26 @@ pre-state's storage did.
 
 | Stage | What | Risk |
 |---|---|---|
-| S0 (now, the teammate) | `pallet-spaces` as above, plus `ChargeSpaceFee`; communities untouched. A community governs a space by being its controller: the community account, through `dispatch_as_account` | low |
-| S1 | Kreivo treats space sovereigns like community accounts where it already special-cases them (pass `SkipConsideration`, payments' sender origin: `KR/config/system.rs:229-234`, `KR/config/payments.rs:34-37`) | low |
-| S2 | fold communities' features in: a `SpaceRef { Vos(SpaceId), Legacy(u16) }` key; legacy ids keep the `kv/cmtys` + u16 account and their index for tracks, `MultiAddress::Index` and XCM `Plurality{Index}`; membership, the origin and voting move over (built-in membership, as on `feat/private-communities`); a migration for `Info`, `CommunityIdFor`, `CommunityDecisionMethod`, the vote locks, and the NFT memberships with their gas attributes | high: funds, referenda in flight, XCM |
-| S3 | move to frame-contrib, with the VOS verifier behind `ProofVerifier`, implemented in Kreivo's runtime; anonymous authorities (§11) | medium |
+| 0 (now, the teammate) | `pallet-spaces` as above, plus `ChargeSpaceFee`; communities untouched. A community governs a space by being its controller: the community account, through `dispatch_as_account` | low |
+| 1 | Kreivo treats space sovereigns like community accounts where it already special-cases them (pass `SkipConsideration`, payments' sender origin: `KR/config/system.rs:229-234`, `KR/config/payments.rs:34-37`) | low |
+| 2 | fold communities' features in: a `SpaceRef { Vos(SpaceId), Legacy(u16) }` key; legacy ids keep the `kv/cmtys` + u16 account and their index for tracks, `MultiAddress::Index` and XCM `Plurality{Index}`; membership, the origin and voting move over (built-in membership, as on `feat/private-communities`); a migration for `Info`, `CommunityIdFor`, `CommunityDecisionMethod`, the vote locks, and the NFT memberships with their gas attributes | high: funds, referenda in flight, XCM |
+| 3 | move to frame-contrib, with the VOS verifier behind `ProofVerifier`, implemented in Kreivo's runtime; anonymous authorities (§11) | medium |
 
-## 13. Open questions for the owner (ordered)
+## 13. Open questions (ordered)
 
-Each has a recommended default for the teammate and the owner to confirm.
-They do not block VOS's slice 6: its mock and node client follow the
-defaults, and another answer regenerates the conformance vectors. Also
-recorded: frame-contrib's `feat/private-communities` keeps a per-community
-`Budget`, which §7's spend budget can merge with at the communities
-fold-in (S2).
+Each has a recommended default, to be confirmed with the teammate. VOS's
+mock and node client follow the defaults, and another answer regenerates
+the conformance vectors. Also recorded: frame-contrib's
+`feat/private-communities` keeps a per-community `Budget`, which §7's
+spend budget can merge with at the communities fold-in (stage 2).
 
 1. **How the sovereign account pays for an authority's transaction.**
    - The options: (B) the `ChargeSpaceFee` wrapper; (A′) pallet-only
      `feeless_if` with an in-dispatch charge; (A) nodes pay their own fees,
      topped up from the sovereign account.
    - **Recommended: (B)**, exact fees with no client change.
-2. **Anchor signatures.** Answered (S13): pin D's ed25519 anchor key,
-   one per node, paired with its sr25519 authority and set once; verified
+2. **Anchor signatures.** Answered: the node's ed25519 node key, its only
+   anchor key (a compromised key means replacing the node), one per node, paired with its sr25519 authority and set once; verified
    strictly, a key of small order never listed.
 3. **The sovereign account's derivation.**
    - The options: from the `SpaceId`, which can be funded before
@@ -1092,12 +1087,14 @@ fold-in (S2).
 8. **The on-chain end to end.** Settled: VOS's end to end runs the
    Kreivo leg over the mock, its acceptance gate; the live leg runs once
    the pallet and the port exist.
-9. **Communities fold-in (S2):** after slice 6 (recommended).
-10. **Anonymous authorities:** after slice 7's credential AIR (recommended).
+9. **Communities fold-in (stage 2):** after this pallet runs on Kreivo
+   (recommended).
+10. **Anonymous authorities:** a later stage on VOS's credential AIR (§11;
+    recommended).
 11. **A blocked space's roots.** Answered: unanchored, as an ended
     space's are (`vos_anchor::venue::anchored` reads `Active`); G15 pins
     it.
-12. **Anchor keys beyond the founding ones.** Answered (S13): none. An
+12. **Anchor keys beyond the founding ones.** Answered: none. An
     authority's key is set once, by `add_authority`; a node's key changes
     only by replacing the node. A founding key may be paired with a new
     authority, and an unpaired one removed (`remove_anchor_key`). A space
