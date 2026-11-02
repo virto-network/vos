@@ -211,6 +211,14 @@ actors, and calls a space through its gateway.
 | background sync job | ≤ 30 s wall, ≤ 1 MB down a run with nothing new | [est]: arti from a warm directory, one onion connection, one cursor query a scope and one for the device-set log |
 | battery | no work while backgrounded beyond the periodic job; no persistent circuit | the design's rule, measured by the plan's PG5 |
 
+**The light node's local calls, first numbers** [measured, x86-64 dev
+host shared with other builds (load 20–55), 2026-11-02, `vos-phone light`,
+release, two runs]: the light node opens in 0.2–1.1 s, installs the counter in
+43–123 ms, and a call through the merge entry, its synced batch included,
+takes 2.0–6.2 ms at p50 and 3.3–19.6 ms at p95; a query 1.1–1.9 ms. The
+host's load moves them threefold; the phone's numbers are the gate's run
+(`tools/phone/scripts/light.sh`).
+
 Proving is the only heavy phase: about 0.65 s of wall time on the four
 big cores at full load a sign-in [measured, `proving.md` §8: 645 ms]. A
 phone that signs in twenty times a day spends about 13 s of wall time on
@@ -1814,6 +1822,16 @@ fuzz target out; merkle-crdt's redb out. In: arti's dependency tree (in
 the gateway and the light node), mls-rs's (in `vos-mls`), three actors, a
 tool, the SDK's CRDT fields and merge dispatch, and admission at ingress.
 No proving code beyond the levers' format.
+
+**What the `recursion` feature saves** [measured, x86-64 host building
+for arm64 Android (NDK 28.2, API 30), stripped, 2026-11-02]: a
+facility-shaped `cdylib` linking `vos-light` (a local actor installed,
+called and queried; a device kernel proved; the three credential proofs)
+is 9,933,368 bytes without the feature and 9,979,576 with it under fat LTO
+(46 KB, 0.5%), and 13,684,120 against 13,894,072 without LTO (210 KB,
+1.5%): the linker already drops most of the recursion prover a device
+never calls. The feature stays (it costs one `cfg` a module and builds the
+device's crates faster); Q9's size argument for it is small.
 
 ### 7.2 The node and the gateway
 

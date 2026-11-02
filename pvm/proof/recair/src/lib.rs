@@ -17,6 +17,17 @@
 //! - [`verifier`] verifies a proof in a circuit, piece by piece: the
 //!   channel, Merkle openings, FRI, DEEP, OODS and the logup sums; a segment
 //!   proof's prefix, and what every AIR's verifier shares.
+//! - [`masked`] is the masked prover (masking variant (c)), over any component
+//!   set and Merkle channel: the masks, salts, blinding and FRI mask in the
+//!   masked transcript's order, R1 checked on the transcript, the randomness
+//!   hedged.
+//! - [`credential`] proves the credential statements (auth, owner, and
+//!   membership and payment together) masked over `p2` and `qm31` alone,
+//!   under format 44 on the Blake2s-M31 channel.
+//!
+//! Behind the `recursion` feature, on by default (a device builds without
+//! it):
+//!
 //! - [`leaf`] is a kernel leaf: a segment verified, its boundary states
 //!   digested and flagged, and the node output it states.
 //! - [`fold`] is a fold node: two children of the padded shape, leaves or
@@ -26,29 +37,26 @@
 //!   and run checked, the program id and io-hash its public words, proved
 //!   masked under `format::MASKED_WRAP` on the Blake2b-256 channel, or
 //!   unmasked under `format::WRAP`.
-//! - [`masked`] is the masked prover (masking variant (c)), over any component
-//!   set and Merkle channel: the masks, salts, blinding and FRI mask in the
-//!   masked transcript's order, R1 checked on the transcript, the randomness
-//!   hedged.
 //! - [`tree`] proves a run's tree node by node: leaves, folds, the wrap.
-//! - [`credential`] proves the credential statements (auth, owner, and
-//!   membership and payment together) masked over `p2` and `qm31` alone,
-//!   under format 44 on the Blake2s-M31 channel.
 
 pub mod circuit;
 pub mod compile;
 pub mod context;
 pub mod credential;
 pub mod device;
+#[cfg(feature = "recursion")]
 pub mod fold;
 pub mod gadgets;
+#[cfg(feature = "recursion")]
 pub mod leaf;
 pub mod masked;
 pub mod prove;
 pub mod trace;
+#[cfg(feature = "recursion")]
 pub mod tree;
 pub mod value;
 pub mod verifier;
+#[cfg(feature = "recursion")]
 pub mod wrap;
 
 pub use circuit::{Circuit, Entry, Qm31Op, WiringError};
