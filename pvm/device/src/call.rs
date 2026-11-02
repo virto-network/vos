@@ -1,10 +1,11 @@
 //! The call a proof authorizes (`identity-and-authority.md` §5): its scope
 //! and its binding, computed here so a client never builds them.
 
+use scale::Encode as _;
 use vos_wire::SpaceId;
 use vos_wire::abi::cap;
 use vos_wire::credentials;
-use vos_wire::ids::{AgentId, InstanceId, MethodId};
+use vos_wire::ids::{AgentId, InstanceId, MethodId, derive_id};
 
 use crate::{DeviceError, Digest};
 
@@ -96,4 +97,17 @@ pub fn scope(space: &[u8; 32], agent: u32, instance: u32, name: &[u8]) -> Option
     }
     let scope = credentials::scope(&SpaceId(*space), AgentId(agent), InstanceId(instance), name);
     Some(Digest::from_bytes(&scope).expect("a compression's words are below p"))
+}
+
+/// The id of the method named `name`, as an actor's handler derives it:
+/// [`derive_id`] in `vos/method/`.
+pub fn method_id(name: &str) -> u32 {
+    derive_id("vos/method/", name)
+}
+
+/// The arguments of a ledger's owner-guarded `transfer(from, to, amount)`,
+/// its rows named by their bytes: each name as the codec writes bytes, then
+/// the amount.
+pub fn transfer_arguments(from: &str, to: &str, amount: u64) -> Vec<u8> {
+    (from.as_bytes().to_vec(), to.as_bytes().to_vec(), amount).encode()
 }

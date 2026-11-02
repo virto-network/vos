@@ -264,6 +264,31 @@ fn the_scope_and_the_binding_name_the_call() {
 /// calls; each is refused against another call, another name, another
 /// format or another kind's words.
 #[test]
+fn a_method_id_and_a_transfer_s_arguments_are_the_node_s() {
+    assert_eq!(vos_device::method_id("increment"), 0xf251_d1d4);
+    assert_eq!(
+        vos_device::method_id("transfer"),
+        derive_id("vos/method/", "transfer")
+    );
+    let arguments = vos_device::transfer_arguments("alice", "bob", 7);
+    assert_eq!(
+        arguments,
+        [
+            &5u32.to_le_bytes()[..],
+            b"alice",
+            &3u32.to_le_bytes(),
+            b"bob",
+            &7u64.to_le_bytes(),
+        ]
+        .concat()
+    );
+    assert_eq!(
+        <(Vec<u8>, Vec<u8>, u64)>::decode(&arguments).unwrap(),
+        ((b"alice".to_vec(), b"bob".to_vec(), 7), arguments.len())
+    );
+}
+
+#[test]
 fn each_proof_verifies_against_its_call_alone() {
     let prover = prover();
     let secret = secret(1);

@@ -40,7 +40,7 @@ mod secret;
 mod threads;
 pub mod wire;
 
-pub use call::{Call, NAME_BYTES, scope};
+pub use call::{Call, NAME_BYTES, method_id, scope, transfer_arguments};
 pub use kernel::{
     DEVICE_FORMAT, DEVICE_PEAK_BYTES, DeviceProgram, DeviceProof, auth_io, verify_device,
 };

@@ -12,7 +12,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use scale::{Decode, Encode};
 use vos_api::Kind;
 use vos_wire::credentials::{Path, RootEntry};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, derive_id};
+use vos_wire::ids::{AgentId, InstanceId, MethodId};
 use vos_wire::ingress::{
     self, Consistency, CredentialRefusal, Credentialed, QueryCall, Rejection, Response,
     query_message,
@@ -60,7 +60,7 @@ fn query(
         not_after,
         consistency: Consistency::Applied { at: 0 },
         instance: InstanceId(instance),
-        method: MethodId(derive_id("vos/method/", method)),
+        method: MethodId(crate::method_id(method)),
         arguments,
         signature: [0; 64],
     };
