@@ -109,14 +109,14 @@ The scale results are in `core-model.md` §14, "The scale test".
   the `Identity` origin; rate limiting keyed by origin kind
   (`identity-and-authority.md` §5).
 - **Credentials across spaces:** membership and solvency proven to another
-  space or to JAM, then reputation, and opt-in linking (§7).
+  space or to JAM, then reputation, and opt-in linking (`identity-and-authority.md` §7).
 - **Secret sources:** sources that span devices, iOS, and recovery across
   devices.
 - **Node-signed roots,** so a gateway cannot mark the root a proof names
   (`node/SECURITY.md`).
 - **The credential facility's gaps** (`identity-and-authority.md` §7):
   forgetting an enrollment, the claim order.
-- **The registry and the root space** (§12): the registry agent on JAM, the
+- **The registry and the root space** (`identity-and-authority.md` §12): the registry agent on JAM, the
   root space under a charter, the handover triggers' numbers, and the rules
   for exit and disputes.
 
