@@ -682,16 +682,26 @@ fn a_scan_ends_at_its_prefix() {
     batch.apply(A, 0, 2, &deletes);
     batch.commit(PersistMode::Buffer).unwrap();
     let view = store.snapshot();
-    let started = std::time::Instant::now();
-    for _ in 0..1_000 {
-        assert!(rows(&view, A, &keys::outbox_to(empty), None).is_empty());
-    }
-    let took = started.elapsed();
-    // Past the prefix, each scan reads the 100,000 deleted rows: seconds.
-    assert!(took < std::time::Duration::from_millis(500), "{took:?}");
+    let timed = |scans: u32, prefix: &[u8]| {
+        let started = std::time::Instant::now();
+        for _ in 0..scans {
+            rows(&view, A, prefix, None);
+        }
+        started.elapsed() / scans
+    };
+    assert!(rows(&view, A, &keys::outbox_to(empty), None).is_empty());
     assert_eq!(
         rows(&view, A, &keys::outbox_prefix(), None),
         [keys::outbox(last, 0)]
+    );
+    // Past the prefix, each scan would read the 100,000 deleted rows, as a
+    // scan of the whole outbox does: the empty target's scan is timed
+    // against that one's, on the same host at the same moment.
+    let through = timed(2, &keys::outbox_prefix());
+    let empty_scan = timed(100, &keys::outbox_to(empty));
+    assert!(
+        empty_scan * 10 < through,
+        "{empty_scan:?} a scan, through the deleted rows {through:?}"
     );
     // A cursor past the prefix reads nothing.
     let past = keys::outbox(AgentId(u32::MAX), 0);

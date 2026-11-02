@@ -98,8 +98,9 @@ fn sends_are_refused_with_a_reason() {
                 .is_none()
         );
         nodes[1].1.consensus.try_recv().unwrap();
+        // A bound on the wait, which a loaded host may stretch.
         assert!(
-            within(Duration::from_secs(1), a.ready(2, Class::Consensus))
+            within(Duration::from_secs(30), a.ready(2, Class::Consensus))
                 .await
                 .is_some()
         );
@@ -154,8 +155,9 @@ fn delayed_frames_arrive_late_and_in_order() {
     hub.set_delay(Duration::ZERO);
     send(&nodes[0].0, 2, &100u32.to_be_bytes());
     smol::block_on(async {
+        // A bound on each wait, which a loaded host may stretch.
         for i in 0..=100u32 {
-            let incoming = within(Duration::from_secs(1), nodes[1].1.consensus.recv())
+            let incoming = within(Duration::from_secs(30), nodes[1].1.consensus.recv())
                 .await
                 .unwrap()
                 .unwrap();

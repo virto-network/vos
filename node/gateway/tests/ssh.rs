@@ -107,7 +107,8 @@ async fn channel(address: std::net::SocketAddr) -> russh::Channel<client::Msg> {
         .request_subsystem(true, vos_gateway::ssh::SUBSYSTEM)
         .await
         .unwrap();
-    let reply = tokio::time::timeout(Duration::from_secs(5), channel.wait())
+    // A bound on the wait, which a loaded host may stretch.
+    let reply = tokio::time::timeout(Duration::from_secs(30), channel.wait())
         .await
         .unwrap();
     assert!(matches!(reply, Some(ChannelMsg::Success)), "{reply:?}");

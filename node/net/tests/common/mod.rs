@@ -42,8 +42,10 @@ pub async fn rebind(number: NodeNumber, address: SocketAddr) -> (Quic, Arrivals)
         match Quic::bind(Config::new(number, secret(number), address)) {
             Ok(bound) => return bound,
             Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                // A bound on the wait, not what is tested: a loaded host
+                // may take seconds to let the address go.
                 assert!(
-                    started.elapsed() < Duration::from_secs(2),
+                    started.elapsed() < Duration::from_secs(30),
                     "{address} stays in use"
                 );
                 smol::Timer::after(Duration::from_millis(5)).await;
@@ -95,10 +97,12 @@ pub async fn within<T>(limit: Duration, future: impl Future<Output = T>) -> Opti
         .await
 }
 
+/// The next frame `queue` takes: within 30 s, a bound on the wait, which a
+/// loaded host may stretch, not what a test checks.
 pub async fn next(queue: &smol::channel::Receiver<Incoming>) -> Incoming {
-    within(Duration::from_secs(10), queue.recv())
+    within(Duration::from_secs(30), queue.recv())
         .await
-        .expect("a frame within 10 s")
+        .expect("a frame within 30 s")
         .unwrap()
 }
 

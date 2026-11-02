@@ -50,12 +50,11 @@ fn a_dead_node_delays_no_other_nodes_requests() {
         (statuses, started.elapsed())
     };
     let (statuses, took) = reads(8);
+    // Answered while the dial still runs: not held up behind it.
+    let dialing = !to_the_dead.is_finished();
     let (status, waited) = to_the_dead.join().unwrap();
     assert_eq!(statuses, vec![200; 8]);
-    assert!(
-        took < Duration::from_secs(2),
-        "while it is dialed: {took:?}"
-    );
+    assert!(dialing, "while it is dialed: {took:?}, the dial {waited:?}");
     assert_eq!(status, 503);
     assert!(waited >= Duration::from_secs(5), "its dial ran: {waited:?}");
     // Down after its failed dial: its own requests are answered at once.
@@ -73,6 +72,8 @@ fn a_dead_node_delays_no_other_nodes_requests() {
         &request("GET", "/stats", &[format!("Authorization: {stats}")], b""),
     );
     assert_eq!(status, 503);
-    assert!(started.elapsed() < Duration::from_millis(900));
+    // No dial again: well within the one it ran.
+    let again = started.elapsed();
+    assert!(again < waited / 2, "{again:?}, its dial {waited:?}");
     drop(silent);
 }
