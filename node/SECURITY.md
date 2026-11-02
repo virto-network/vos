@@ -72,7 +72,7 @@ frame checks and the agent's placement come first, as for any call):
     expiry;
 12. the binding digest is not recorded (`Replayed`);
 13. for a `once` guard, the nullifier is not admitted in its scope
-    (`Once`), before the proof as the plan's order puts it: anyone who
+    (`Once`), before the proof: anyone who
     holds a scope's nullifier, the log's readers among them, learns
     whether it was admitted by a request bound to its own arguments and
     a proof of nothing. Checking it after the proof would spend a
@@ -95,7 +95,9 @@ Ingress calls the final verifier's `credential::verify`, which picks the
 circuit by kind, never the circuit-generic step beneath it, which takes
 any preprocessed root.
 
-**A device proof** (format 46, `slice-7-mobile.md` pin J) authorizes as
+**A device proof** (format 46: the device profile, one masked segment
+without the page-Merkle boundary, every chip at most 2^17 rows, the
+proof at most 1.5 MiB; `proving.md` §8) authorizes as
 an auth credential proof does, and only for a method whose auth guard
 names a device kernel. Its program (the kernel's chips, their log sizes
 and the preprocessed root) is the one this node computes from the
@@ -185,7 +187,8 @@ serve its requests:
   until its next refresh: while the tree changes often, few members hold
   one root at once, so the roots logged on calls in different scopes link
   those calls' pseudonyms to one holder, a fingerprint across scopes that
-  the nullifiers keep apart. The next slice's fix: the library fetches
+  the nullifiers keep apart. The fix, not built (`docs/design/open.md`):
+  the library fetches
   its path at every moved root, so every online member proves against
   the newest, or the log keeps the root's position in the ring (the
   newest, or how many roots it trails) in place of the root
@@ -229,7 +232,9 @@ digest, leaf and siblings alone.
 ## The demo's SSH surface
 
 The gateway's SSH port serves s4's screens and the `vos-api` subsystem to
-a member's phone (`slice-7-mobile.md` 7.13):
+a member's phone, for the demo in s4 (`node/gateway/demo`): enroll, sign
+in and pay, the proofs made on the phone by s4's `vos.credential`
+facility (`identity-and-authority.md` §7):
 
 - **No one in particular.** The port takes any public key as an identity
   for its connection alone (s4's anonymous policy): no session is parked
@@ -349,7 +354,8 @@ a member's phone (`slice-7-mobile.md` 7.13):
   order is the decode and its canonical re-encoding, the interaction PoW,
   the logup totals, the composition at the OODS point, then the PoW, then
   the decommitments, so a wrong PoW is refused after every step but the
-  decommitments [measured, `slice-7-progress.md` 7.23d]:
+  decommitments [measured, x86 dev machine (Core Ultra 7 155H), one
+  thread, 2026-11-01]:
   - **format 44, a credential proof** (about 220 KB): verified in about
     2.0 ms; a wrong PoW refused in 0.7 ms, a wrong interaction PoW in
     0.5 ms, one cut short in 0.2 ms

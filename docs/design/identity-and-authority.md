@@ -1,40 +1,19 @@
 # Identity and authority
 
-Draft 6 of a design run on who acts in a space, how a request proves
-it, what each actor may do, and what anyone outside a space learns.
-- Draft 2 adopted the owner's idea of personal spaces.
-- Draft 3 folded a second opinion (Fable): two axes, one attestation
-  primitive, ingress verifying, personal spaces as device runtimes, the
-  anonymous sender's transport.
-- **Draft 4 folds the owner's answers:**
-  - the recommendations on draft 3's questions are taken, subject to
-    the reviewer's check;
-  - **VOS builds primitives, and each space chooses its privacy
-    model** from them;
-  - full privacy (a shared shielded pool, personal spaces, a relay
-    layer such as Tor or Arti bundled in the node) is postponed;
-  - the review of cipher-clerk is folded into §13.
-- **Draft 5 folds the second opinion on draft 4** (Fable):
-  - the trust-boundary rule per executor, a space or a public JAM agent;
-  - the identity replica's consistency contract;
-  - the input kinds and the full origin ABI reserved in the first build;
-  - a size rule for authority sets;
-  - the path-fetch leak of credentials.
-- **The in-space credential** (§5–§7) carries slice 7's pins with the
-  owner's S21–S25: the origins `Anonymous` and `Owner`, credentialed
-  calls and their checks, the credential actor, and its threat model.
-- **Draft 6 states it as slice 7 built it** (`slice-7-progress.md`), with
-  the owner's S37–S64 (`research/slice-7/owner-decisions.md`): the
-  credential actor and its tree, credentialed calls at the node API's
-  ingress, the `once` guard, device proofs, signed operator requests, the
-  device library and s4's `vos.credential` facility with its secret
-  sources, and the gaps the carrier audit recorded (§7); §11's anchors
-  follow slice 7's simplified protocol.
+Who acts in a space, how a request proves it, what each actor may do,
+and what anyone outside a space learns. VOS builds primitives (origins,
+attestations, credentials, proofs, personal spaces) and each space
+composes its privacy model from them. The in-space credential (§5–§7)
+is built: the credential actor and its tree, credentialed calls at the
+node API's ingress, the `once` guard, device proofs, signed operator
+requests, and the device library with s4's `vos.credential` facility.
+Full privacy (§8) is postponed; known gaps and next work are in
+`open.md`.
 
-Tags as in the core model. **[decided]** marks the owner's answers;
-the rest is still proposed.
+Tags as in the core model: **[decided]** a settled choice, **[built]**,
+**[measured]** by a run; the rest is proposed.
 
-## 1. What the owner asks for
+## 1. Requirements
 
 - **Members of different weight.** Some members run nodes in an agent's
   consensus. Some run light nodes that sync only a few agents or
@@ -69,7 +48,7 @@ the rest is still proposed.
   call each other under a permission model, and the space's attestable
   proofs disclose the minimum.
 
-## 2. What exists today
+## 2. What is built
 
 - **A caller is a principal:** a client's key or another agent.
 - **Each agent keeps a table** from principals to role bytes, set by the
@@ -80,7 +59,7 @@ the rest is still proposed.
 - **Ingress authenticates clients into principals,** and the agent
   receives the authenticated origin. Guests never check signatures
   (core model §5). The ingress is the node's binary API; a gateway in
-  front of it relays and holds no authority [decided, S41].
+  front of it relays and holds no authority [decided] (`node-api.md`).
 - **Credentialed calls** carry a credential proof instead of a signature
   and a session: ingress verifies it and logs the origin it proves,
   `Anonymous` (a pseudonym in a scope) or `Owner` (a digest) (§5–§7).
@@ -109,12 +88,9 @@ primitives that serve it.
 - **Across spaces,** every cell discloses only what a proof returns.
 - **Metadata** (network addresses, timing, sizes) leaks in every cell.
   The relay layer (§8) addresses it; spaces that need it opt in.
-- **When each cell arrives:**
-  - the first build delivers the top-left cell, and with the
-    messenger, the bottom-left;
-  - the anonymous column needs the membership credential, so it
-    arrives with §15 step 3;
-  - the bottom-right is postponed.
+- **What is built:** the top-left cell, and with the messenger, the
+  bottom-left; the top-right in a space, through the membership
+  credential (§5–§7); the bottom-right is postponed (§8).
 
 ## 4. Five concepts
 
@@ -168,7 +144,7 @@ and there are two kinds of executor:
   non-repudiation for disputes can turn on an ingress option, off by
   default, that keeps request signatures in a side store.
 
-**The rule, as the core model will state it:**
+**The rule:**
 
 > Authority is verified at the executor's trust boundary. A space's
 > boundary is its nodes' ingress, which reduces evidence to an origin
@@ -201,7 +177,7 @@ compare it, and on JAM its size is paid as payload.
   pseudonym in `scope` (§7, `proving.md` §8), stable across its calls;
 - `Owner(digest)`, 4: an owner credential proof's. The sender knows the
   secret behind `digest`, the owner a row names: a public payer
-  [decided, S22];
+  [decided];
 - `Jam { service }`, at index 6, reserved: a JAM service, authenticated by
   the chain or a light client.
 
@@ -246,12 +222,12 @@ wants one says "from agent G, with claim `decision(d)`".
 - credentials across spaces lapse by freshness (§7). No revocation list
   ever crosses a space boundary, so none leaks who was revoked.
 
-**Credentialed calls** [decided, S21–S24]: a call whose authority is a
+**Credentialed calls** [decided]: a call whose authority is a
 credential proof (`proving.md` §8), with no session and no signature.
 Ingress verifies the proof and logs only the origin it proves.
 - **The request:** `Credentialed`, a request kind of the node's binary
   API (`vos_wire` frames over a unix socket or QUIC with mutual TLS)
-  addressed to an agent [decided, S41]. Its kind is read before its body,
+  addressed to an agent [decided]. Its kind is read before its body,
   so the node sizes the frame before decoding it: at most 1.5 MiB plus
   `cap::REQUEST` plus the 4 KiB envelope. A gateway serves it over HTTP as
   `POST /agents/{agent}/credentialed`, `413` past the size; the gateway
@@ -265,7 +241,7 @@ Ingress verifies the proof and logs only the origin it proves.
       pub arguments: Vec<u8>,          // at most cap::REQUEST
       pub nonce: [u8; 16],             // the client's, at random
       pub expires_ms: u64,             // by the node's clock
-      pub format: u32,                 // 44 (S29); 46 for a device proof
+      pub format: u32,                 // 44 for a credential proof; 46 for a device proof
       pub public: CredentialPublic,
       pub proof: Vec<u8>,
   }
@@ -313,14 +289,14 @@ Ingress verifies the proof and logs only the origin it proves.
   - An `Auth` guard needs its agent's credential actor (§6): installing a
     program with one into an agent without that actor fails
     `Failure::Credentials` (15).
-  - **`once`** [decided, S43]: `#[msg(credential = Auth("vote"), once)]`
+  - **`once`** [decided]: `#[msg(credential = Auth("vote"), once)]`
     admits each nullifier once in its scope. The nullifier is a stable
     pseudonym, so the guard, not the handler, keeps the set: apply records
     the system row `once(scope ‖ nullifier) → t`, `t` the batch time of
     its admission, kept for good; the scope digest names the space, agent,
     instance and guard name, so the rows are scoped by construction. The
     row is written only when the handler returns `Ok`, in the apply that
-    ran it [decided, S47]: a refused ballot is not a cast vote, so a call
+    ran it [decided]: a refused ballot is not a cast vote, so a call
     the handler fails or refuses leaves the member free to try again,
     with a new proof (its `b` stays recorded). A repeat of an admitted
     nullifier is refused (`CredentialRefusal::Once` at ingress,
@@ -363,7 +339,8 @@ Ingress verifies the proof and logs only the origin it proves.
   an attacker to drain: the bounds are the node's connections and its
   verification budget.
 - **The log carries** `Input::Credentialed` (index 10 of the batch's
-  `Input`: the session-less kind §15 step 0 reserves), never the proof,
+  `Input`: the session-less kind, which anonymous inputs of a shared
+  pool (§8) will also take), never the proof,
   the nonce or the format, so `cap::REQUEST` and a log entry's size are
   unchanged:
 
@@ -393,21 +370,22 @@ Ingress verifies the proof and logs only the origin it proves.
      the input);
   7. a `once` guard: the row `once(scope ‖ nullifier) → t` recorded only
      if the method returned `Ok`, in this apply, beside its writes
-     [decided, S47].
+     [decided].
 
   A refused input writes nothing. So a proof replayed at another replica
   runs once, and a revocation binds every replica at the same batch. A
   duplicate is answered `Refusal::Replayed` at apply (or
   `CredentialRefusal::Replayed` at an ingress that has applied the
-  first), without the first call's outcome [decided, S39]: a client that
+  first), without the first call's outcome [decided]: a client that
   lost its answer reads state (a balance, a record).
 - **On JAM,** an agent whose builder is one of the space's nodes takes a
   credentialed input as it takes any: its builder's ingress verified the
   proof, under the trust-boundary rule above.
 - **Device proofs** (format 46) authorize exactly what an auth proof
-  does [decided, S24] and take the same checks (`proving.md` §8). Their
+  does [decided] and take the same checks (`proving.md` §8). Their
   program is the one the node computes from the installed kernel, on a
-  fixed public auth statement [decided, S61]: the leader at the install,
+  fixed public auth statement [decided], so every node and the device
+  compute one program from the kernel: the leader at the install,
   which fails for a guarded kernel that does not run it; a replica that
   did not install it, once, at the first device proof naming the kernel
   that passes the checks before the binding. The binding names that
@@ -440,7 +418,7 @@ origin is the sending service or space, and the authority is a proof
     node outside the quorum holds a read-only follower: a snapshot,
     then the log's tail. That is either a non-voting role added to
     vos-raft, or the identity agent's applied state shipped to
-    non-members (§14).
+    non-members; it is chosen when the replica is built (`open.md`).
   - **Bootstrap.** A node serves ingress only once its replica has
     applied a snapshot no older than the leader's commit at its join.
     Until then it forwards the request (`PeerMessage::Forward`) or
@@ -473,7 +451,7 @@ origin is the sending service or space, and the authority is a proof
   operator's identity, so hosting and acting are two grants, never one
   key for both.
 - **Operator requests** (creating agents and representatives, installs,
-  replicas, roles, reports) [decided, S46]: requests of the node's binary
+  replicas, roles, reports) [decided]: requests of the node's binary
   API, each signed by an operator key the node's config lists, with a
   nonce and an expiry as a call's; the node records the nonce until the
   expiry and refuses an unlisted key, a replay or an expired request. A
@@ -488,10 +466,10 @@ origin is the sending service or space, and the authority is a proof
   and lists its public half unless told not to, so the CLI on its host
   signs as an operator.
 - **Registration of identities** is the space's choice: open
-  self-registration, invitation (the onboarding tokens master had), or
+  self-registration, invitation (onboarding tokens), or
   a governance decision.
 
-**The credential actor** [decided, S21 and S25; its tree is `proving.md`
+**The credential actor** [decided; its tree is `proving.md`
 §8's]: `vos-credentials`, a library actor installed in the agent whose
 methods it guards. A guard reads only its own agent's state, so a
 credential guards the methods of the agent its actor lives in; credentials
@@ -502,7 +480,7 @@ across a space's agents wait for the identity agent above.
   instance, fails `Failure::Credentials`. Ingress and refine find it there.
 - **Its install** takes the space's **handle**: 32 bytes the founder draws
   once and keeps across re-foundings, so members' device secrets survive
-  one [decided, S25]. It is public: the app shows it and pins it at a
+  one [decided]. It is public: the app shows it and pins it at a
   member's first enrollment. The actor takes it by `found(handle)`, role
   `registrar`, once and never zeros, which also writes the ring's first
   root; it takes no other write before.
@@ -535,7 +513,9 @@ across a space's agents wait for the identity agent above.
   is `RootUnknown`, so 64 tree-changing batches within `ROOT_MAX_AGE` make
   an honest root unknown before it is stale. `RootUnknown` is retryable by
   a path refetch, and the device library refreshes its path well within
-  64 batches' time (`slice-7-mobile.md` pin L).
+  64 batches' time: its timer's period is well under the time the space
+  takes to make 64 tree-changing batches, not merely under
+  `ROOT_MAX_AGE` (§7).
 - **Its methods:**
   - `enroll(member) → slot`, role `registrar`: the lowest free slot, else
     `next`; refused for a member enrolled;
@@ -549,7 +529,7 @@ across a space's agents wait for the identity agent above.
     `revoke` withdraws it or a new `invite` replaces it. The
     invitation names the digest, so whoever intercepts the claim cannot
     enroll another (the demo's ledger rows take the same two steps,
-    `invite_row` and `claim_row`, `slice-7-mobile.md` 7.11). A member with
+    `invite_row` and `claim_row`). A member with
     no client key of its own has its claim sent by the app that serves it
     (the demo's gateway app, under its own client key): an ordinary
     client's authority, bounded by the invitation, which names the
@@ -576,10 +556,13 @@ across a space's agents wait for the identity agent above.
   library share; a reference built from `proving.md` §8 alone equals the
   actor's tree over random enrollments and revocations, on a VOS host and
   on the JAM-only host [measured].
-- **Re-founding** (`slice-7-mobile.md`, pin D′): the runbook installs the
-  new space's credential actor with the ended space's handle and re-seeds
-  it with `enroll_many` from the ended space's `member` digests, with no
-  member action. Slots may move, and a member fetches its path again.
+- **Re-founding:** a space that changes venue, or whose anchors
+  equivocated, ends and founds again under a new `SpaceId` (§11); its
+  sovereign funds leave by its controller and its Clerk pairs reset. The
+  re-founding runbook installs the new space's credential actor with the
+  ended space's handle and re-seeds it with `enroll_many` from the ended
+  space's `member` digests, with no member action. Slots may move, and a
+  member fetches its path again.
 
 ## 7. Credentials: facts proven about oneself
 
@@ -605,7 +588,7 @@ across a space's agents wait for the identity agent above.
 - **Timing links:** a credential issued in A and proven in B within one
   window links by time, so proofs should wait or batch.
 - **A nullifier is scoped:** one pseudonym a scope, never global, or it
-  becomes the global handle the owner refuses. A method that admits a
+  becomes the global handle §1 rules out. A method that admits a
   member once a scope takes the `once` guard (§5), which keeps the
   nullifiers it has admitted.
 - **Across spaces, a leaf is keyed by the identity and its revocation
@@ -620,7 +603,7 @@ across a space's agents wait for the identity agent above.
   its leaf sits in (the syncing axis, §9), or fetches paths
   anonymously.
 
-**In a space first** [decided, S21–S25]: the first credentials are proven
+**In a space first** [decided]: the first credentials are proven
 to their own space's ingress, not across spaces. Membership (auth) proves
 a leaf of the space's credential actor (§6) and yields an `Anonymous`
 origin; ownership (owner) proves the secret behind a row's owner digest
@@ -643,7 +626,7 @@ space three of them take a simpler form:
   token), unlinkable across scopes and to `member` or `owner`. A method
   that admits it once takes the `once` guard (§5).
 
-**The device secret** [decided, S25, S42, S51; built, `vos-device`]: the
+**The device secret** [decided; built, `vos-device`]: the
 member's `s` comes from a secret source, a keyed HMAC-SHA-256 whose key
 the device never exports, evaluated once a use after the user's consent
 (`proving.md` §8 pins it):
@@ -656,7 +639,7 @@ the device never exports, evaluated once a use after the user's consent
   `s_i = u64_le(w[8i..8i+8]) mod p` for `i < 8`; derived again at each
   use, never stored; `member(s) = C(T(member), s)` goes to the credential
   actor, `owner(s) = C(T(owner), s)` to a ledger row;
-- **the sources** [decided, S42]: by default an Android Keystore HMAC key
+- **the sources** [decided]: by default an Android Keystore HMAC key
   (non-exportable, user authentication by a biometric or the PIN at every
   use through `BiometricPrompt` with the `Mac` as its crypto object,
   StrongBox-backed when the phone has it, Android 11 or later), its
@@ -675,13 +658,12 @@ the device never exports, evaluated once a use after the user's consent
   ingress calls), proves auth, owner and device-kernel statements, and
   builds every node-API request and decodes every answer, so neither the
   client nor a gateway encodes a credential's bytes. Its `PathKeeper`
-  holds the member's path and refreshes it apart from proofs [decided,
-  S38]: on a 30 s timer jittered by half a period either way, a moved
+  holds the member's path and refreshes it apart from proofs [decided]: on a 30 s timer jittered by half a period either way, a moved
   `root()` bringing the fetch forward to a time drawn below 10 s, a
   `RootUnknown` dropping the path and halving the period (to 1 s), a fetch
   that finds the root unmoved doubling it back. Its queries are signed by
   a key drawn for each. Its `SECURITY.md` states the secret's containment.
-- **s4's `vos.credential` facility** [decided, S40, S48, S49]: a client
+- **s4's `vos.credential` facility** [decided]: a client
   facility of s4's Android client, called by a server's document and
   gated by the client's grant, implemented in Rust over `vos-device` (a
   library the client loads), unsupported below Android 11. Its
@@ -699,7 +681,7 @@ the device never exports, evaluated once a use after the user's consent
     sign-in;
   - `pay`: an owner proof of `transfer(from, to, amount)` encoded from the
     facility's own chrome form, which the server's request only
-    pre-fills and the member may edit [decided, S48], so the binding
+    pre-fills and the member may edit [decided], so the binding
     covers what the member saw;
   - the grant (per connection) and a call's confirmation (per call, a
     form answering only after 600 ms on screen) are two prompts.
@@ -707,8 +689,7 @@ the device never exports, evaluated once a use after the user's consent
   SSH key drawn per connection, as no one in particular, with no resume
   and no remembered grant; the gateway's host key is pinned as for any
   host. Paths and the node's time come over the gateway's `vos-api` SSH
-  subsystem on connections of their own, each under a fresh key [decided,
-  S49]; a path is used only when its root is one the root polls saw; a
+  subsystem on connections of their own, each under a fresh key [decided]; a path is used only when its root is one the root polls saw; a
   node time more than five minutes from the device's is refused.
 - **Claims:** a member here has no VOS client key, so the gateway's s4
   app sends `claim(member)` and the ledger's `claim_row` under its own
@@ -724,7 +705,7 @@ the device never exports, evaluated once a use after the user's consent
   evidence turns on the non-repudiation side store, which keeps the
   proofs.
 - **The device secret's containment, as it is** (its sources are
-  `proving.md` §8's [decided, S42]):
+  `proving.md` §8's [decided]):
   - `s` lives in the library, zeroized on drop. Its source's key never
     leaves the Keystore (or the security key), but the source's output
     `o`, from which anyone holding the public handle derives `s`, crosses
@@ -748,10 +729,10 @@ the device never exports, evaluated once a use after the user's consent
     so the member's past pseudonyms link to it. Revoking the leaf stops
     auth within `ROOT_MAX_AGE`; it does not stop payment, which reads no
     tree: the ledger's `rekey(row, owner)` and `freeze(row)`, under an
-    operator role, do [decided, S37].
+    operator role, do [decided].
   - **The in-space ledger is custodial by design:** an operator who can
     `rekey` can move any row to a key of its choosing. It is the tier
-    such a space picks [decided, S37]; the log attributes each `rekey` to
+    such a space picks [decided]; the log attributes each `rekey` to
     the operator's origin, so the power is visible, not hidden. A space
     that refuses custody waits for full privacy's pool (§8).
 - **Replay** is bound by the binding digest (§5): another space (its
@@ -778,7 +759,7 @@ the device never exports, evaluated once a use after the user's consent
     address. The query's key is drawn for it alone and links nothing, and
     the library refreshes its path apart from its proofs (when `root()`
     moves and on a timer, never just before a proof, on a connection of
-    its own) [decided, S38], so a fetch's time says nothing of a proof's.
+    its own) [decided], so a fetch's time says nothing of a proof's.
     The leak is reduced, not closed: a proof from the same address still
     links its nullifier to the digest, and the digest to whoever the
     registrar enrolled. So `Anonymous` hides the member from the log's
@@ -786,8 +767,8 @@ the device never exports, evaluated once a use after the user's consent
     the nodes and gateways that serve its requests; that is full
     privacy's (§3, §8);
   - from the log: each auth call's scope and nullifier (a pseudonym's
-    activity in one scope), each payment's owner digest (a public payer,
-    S22), each credentialed call's arguments in clear (a payment's payee
+    activity in one scope), each payment's owner digest (a public payer),
+    each credentialed call's arguments in clear (a payment's payee
     and amount beside its payer), and the metadata every cell leaks (§3);
   - from the root each auth call names (`CredentialedInput.root`, logged
     for the apply's freshness check): a member proves against the root of
@@ -795,7 +776,7 @@ the device never exports, evaluated once a use after the user's consent
     often, few members hold one root at once, and the roots logged on
     calls in different scopes link those calls' pseudonyms to one holder,
     a fingerprint across scopes the nullifiers alone do not give. The
-    fix, the next slice's: the library fetches its path at every moved
+    fix, not built (`open.md`): the library fetches its path at every moved
     root, so every online member proves against the newest one, or the
     log keeps the root's class (its position in the ring: the newest,
     or how many roots it trails) in place of the root;
@@ -846,10 +827,10 @@ space A", and only to whom they choose.
 **Postponed** [decided]. These are the primitives that serve the "hidden
 from the operators, actor anonymous" cell, recorded so that the
 primitives built first don't preclude them. A space opts in: each space
-chooses its privacy tier [decided, S37]. Fully private, cash-like
+chooses its privacy tier [decided]. Fully private, cash-like
 payments are this section's: membership proven privately, a hidden
-payer, the shielded pool. Slice 7 measures only that a proof of
-membership and payment together fits the phone's budget (`proving.md`
+payer, the shielded pool. Of these, only a proof of membership and
+payment together is measured, to fit the phone's budget (`proving.md`
 §8).
 
 - **A personal space** is the VOS runtime inside the person's wallet
@@ -863,7 +844,7 @@ membership and payment together fits the phone's budget (`proving.md`
     otherwise it is custody.
 - **The shielded pool needs integrity without trusting its host,** not
   only secrecy. Its users are exactly those who do not want to trust
-  operators. So it runs as a JAM agent (slice 4's JAM mode), or in a
+  operators. So it runs as a JAM agent (JAM mode), or in a
   space that proves its transitions, and it verifies each spend's proof
   in its guest.
 - **One pool shared by many spaces,** not one per space. The anonymity
@@ -877,7 +858,7 @@ membership and payment together fits the phone's budget (`proving.md`
   - self-authenticating, deduplicated by its nullifier;
   - no acknowledgement;
   - carrying a fee note inside its proof.
-- **Note discovery** (§14):
+- **Note discovery:**
   - scanning by the personal space, with a one-byte view tag per note;
   - the sender's direct delivery through the end-to-end encrypted
     messenger as the fast path;
@@ -918,8 +899,8 @@ an agent, but approving a payment is a member's grant like any other.
   - the space reads it through a JAM light client, with proofs of
     inclusion against JAM's state root, and the input enters with the
     origin `Jam { service }`;
-  - **the light client** (header finality tracking) is a slice of its
-    own.
+  - **the light client** (header finality tracking) is a design of its
+    own, not built (`open.md`).
 - **Guards are the same on both sides:**
   - a VOS actor can require an input from a given JAM service;
   - a JAM agent can require one from a registered space's
@@ -929,19 +910,18 @@ an agent, but approving a payment is a member's grant like any other.
 
 ## 11. Anchors: the root chain, per space
 
-- **The ordered root sequence already exists:** JAM mode's root chain,
+- **The ordered root sequence** is JAM mode's root chain,
   in which each package's accumulate swaps one root for the next, in
-  order (slice 4). A space cannot prove two transitions from one root
+  order. A space cannot prove two transitions from one root
   to two parties.
-- **Missing is a root for the space,** not just for each agent:
+- **A root for the space,** not just for each agent:
   - a space has many agents, each with its committed root;
   - its representative agent keeps a space-level root over its agents'
     roots, per window: a committed map keyed `(agent, kind, w)`, the
     value an agent's root at its cut of w, itself cut at `B_w + D` (the
     window's boundary plus a close delay of `min(L/5, 2 min)`); the space
     root is `S_w = BLAKE2b-256("vos/space/v1" ‖ space ‖ w ‖ A_rep)`, over
-    the representative's agent root at that cut (`slice-6-on-chain.md`,
-    on spaces, windows, roots and anchors).
+    the representative's agent root at that cut (`proving.md` §7).
 - **Windows** run at a fixed cadence, minutes apart. A root that moved
   only on activity would leak activity. They are Unix time from the
   space's genesis, whose hash is the `SpaceId` and which freezes the
@@ -960,17 +940,15 @@ an agent, but approving a payment is a member's grant like any other.
     client is development tooling (`tools/jam-dev`), the node knowing no
     JAM. The anchor's signer is checked against the node keys the
     space's controller lists at the venue; a node's key is its only
-    anchor key, so a compromised key means replacing the node [decided,
-    S13]. A leader the venue does not list hands its leadership to a
+    anchor key, so a compromised key means replacing the node [decided]. A leader the venue does not list hands its leadership to a
     replica it does. The anchor gives outsiders ordering;
   - two anchors of one window under different roots are an
     equivocation, and end the space for good: its roots
     refused, no resume, the record a tombstone; the space founds again
     under a new `SpaceId`, its credential actor installed with the same
-    handle and re-seeded from the ended space's `member` digests [decided,
-    S11; S25's amendment];
+    handle and re-seeded from the ended space's `member` digests [decided];
   - **no migration:** a space anchors at one venue for good; one that
-    changes venue founds again [decided, S9] (`proving.md` §7);
+    changes venue founds again [decided] (`proving.md` §7);
   - integrity comes only from a proof that names the anchor.
 - **A venue anchors only a window its own clock has closed;** every
   deadline between parties is the venue's time.
@@ -980,7 +958,8 @@ an agent, but approving a payment is a member's grant like any other.
     plus a refundable deposit, all paid by the space's sovereign account;
     on JAM a statement is about 80M gas of refine;
   - "this root is in the sequence" is a witnessed read in the
-    representative agent's state, which slice 4 made cheap: on JAM,
+    representative agent's state, which JAM mode's witnessed reads make
+    cheap: on JAM,
     later; on Kreivo the pallet stores the anchors.
 - **Statements disclose only their return value:**
   - "this window's net settlement with space B is X";
@@ -1031,67 +1010,78 @@ an agent, but approving a payment is a member's grant like any other.
 
 ## 13. cipher-clerk
 
-A design and implementation review (2026-10-15) found:
-- **The plain double-entry kernel** is careful, with about 320 tests
-  worth keeping as its specification.
-- **One critical gap in the kernel:** an entry's currency is never
-  checked against its account's, so a debtor converts currencies at
-  1:1 on their own signature. Master's `clerk-ledger` inherits it and
-  is being fixed.
-- **The privacy stack proves nothing yet:**
-  - every shipped verification is the issuer's signature;
-  - the disclosure and settlement statements read no state;
-  - the voucher statement names no recipient and sequences no roots;
-  - the spend check lacks owner binding and unique nullifiers, so a
-    sender can spend a note back.
+The Clerk's ledger kernel is cipher-clerk, a plain double-entry kernel
+whose tests are its specification:
+- **An entry's currency and ledger are its account's,** checked at
+  apply, so no debtor converts currencies on its own signature.
+- **The shape a VOS agent needs:**
+  - plain integer amounts (`Value(u64)`, behind a seam a confidential
+    value may later fill);
+  - authority from ingress, per event, instead of signatures in the
+    kernel;
+  - explicit encodings, with version bytes, domain tags and pinned
+    vectors;
+  - no roots of its own;
+  - settlement as a pure function whose output names both spaces, the
+    window and a sequence.
+- **No private tier:** the note model is redesigned on paper and
+  reviewed before any private-tier code; it follows §8 and is postponed
+  with it.
 
-**The fix,** in cipher-clerk's `docs/viability-plan.md` (branch
-`viability`, local):
-1. the soundness fixes;
-2. then the shape a VOS agent needs:
-   - plain integer amounts;
-   - authority from ingress instead of signatures in the kernel;
-   - explicit encodings;
-   - no roots of its own;
-   - settlement as a pure function whose output names both spaces, the
-     window and a sequence;
-3. the note model redesigned on paper and reviewed before any private
-   tier code. That last phase follows §8 and is postponed with it.
+## 14. Design choices
 
-## 14. Decisions and what remains open
-
-**Taken** [decided], subject to the reviewer's check:
-- **The trust-boundary rule, per executor (§5):**
-  - a space verifies at ingress;
-  - a public JAM agent takes only chain-authenticated origins and
-    proofs;
-  - non-repudiation is an ingress option, off by default.
-- **The identity replica's contract (§6):** bootstrap, two-sided lag,
-  schema-declared linearizable epochs, monotone epochs.
-- **The origin ABI and input kinds reserved in step 0 (§15).**
-- **One attestation primitive** (§5).
-- **Two axes and primitives per cell;** spaces choose (§3).
-- **The identity agent replicated on every node** (§6).
-- **Epochs plus short expiries** (§5).
-- **First credentials:** membership, then solvency (§7).
-- **Postponed:** full privacy, personal spaces, the shared pool, the
-  relay layer and the holder-side prover for personal spaces (§8). The
-  in-space credential, its AIR and the device profile are built
-  (`proving.md` §8; §5–§7 here).
-- **Slice 7's** (`research/slice-7/owner-decisions.md`): the credential
-  in the actor's own rows, its stable handle and no epoch (S21, S25);
-  a public payer (S22); a device proof authorizes what an auth proof does
-  (S24); revocation does not stop payment, the ledger's `rekey` and
-  `freeze` do, and each space chooses its privacy tier (S37); paths
-  refreshed apart from proofs (S38); a duplicate answered `Replayed`
-  (S39); the demo in s4 (S40); the node's binary API and an untrusted
-  gateway (S41); the Keystore and security keys as secret sources, no
-  passkeys (S42); the `once` guard, its row only on `Ok` (S43, S47);
-  signed operator requests (S46); the facility's own confirmation form
-  (S48); the `vos-api` subsystem for paths and time (S49); the source
-  input's tag (S51).
-- **Registry:** a charter with handover triggers, a delay on version
-  changes, pseudonymous registration (§12).
+- **The trust boundary, per executor** (§5): a space verifies at
+  ingress, so guests never verify signatures and every replica and
+  witness evaluates the same logged bytes; a public JAM agent, whose
+  builder is anyone, takes only chain-authenticated origins and proofs;
+  evidence is never logged, so members keep deniability, and
+  non-repudiation is an ingress option, off by default.
+- **The origin ABI with fixed codec indexes** (§5): `Client`, `Agent`,
+  `Instance`, `Anonymous` and `Owner` built, `Identity` and `Jam`
+  reserved, so their arrival changes no encoding; a session-less input
+  kind, `Credentialed`, beside requests in a session.
+- **One attestation primitive,** in clear or committed, the issuer
+  choosing at issue, so a grant that never leaves the space pays nothing
+  for anchoring (§5).
+- **Two axes and primitives per cell;** each space chooses its cells and
+  its privacy tier (§3).
+- **The identity agent replicated on every node** [decided; not built],
+  so ingress resolves a device and checks its epoch on every request with
+  no round trip; its replica's contract is bootstrap, two-sided lag,
+  schema-declared linearizable epochs and monotone epochs (§6).
+- **Epochs plus short expiries** (§5): one bump voids every earlier
+  grant at one local read, and no revocation list crosses a space.
+- **Credentials in a space first** (§6–§7): membership in the credential
+  actor's own rows, under a stable handle so members' secrets survive a
+  re-founding, and no epoch in the leaf, since revocation removes it;
+  then solvency, across spaces.
+- **A public payer:** an owner proof shows knowledge of the secret behind
+  a row's owner digest, bound to the call and compared with the live row
+  at apply.
+- **A device proof authorizes exactly what an auth proof does,** and its
+  program is computed by every node from the installed kernel (§5).
+- **Revocation does not stop payment:** an owner proof reads no tree, so
+  the ledger's `rekey` and `freeze`, under an operator role, stop a thief
+  and recover a lost secret; the in-space ledger is custodial by design
+  (§7).
+- **Paths refreshed apart from proofs,** on a connection and a key of
+  their own, so a fetch's time says nothing of a proof's (§7).
+- **A duplicate answered `Replayed`,** without the first call's outcome:
+  a client that lost its answer reads state (§5).
+- **The `once` guard keeps the nullifier set,** not the handler, its row
+  written only when the handler returns `Ok`: a refused ballot is not a
+  cast vote (§5).
+- **The node's binary API and a gateway with no authority;** operator
+  requests signed for one node with a nonce and an expiry, so a relay
+  keeps nothing it can reuse (§6, `node-api.md`).
+- **Secret sources the device never exports** (§7): an Android Keystore
+  HMAC key or a security key's `hmac-secret`, each taking the user's
+  consent at every use; no passkeys, Credential Manager or Play services.
+- **The facility's own confirmation form** (§7): the payee and the amount
+  confirmed in the client's trusted chrome, the server's request only a
+  pre-fill, so the binding covers what the member saw.
+- **The registry** (§12): a charter with handover triggers, a delay on
+  version changes, pseudonymous registration.
 - **Who pays:**
   - a member acting in a space: the space, with rate limits per
     identity;
@@ -1102,46 +1092,4 @@ A design and implementation review (2026-10-15) found:
   - anonymous payments: a fee inside the proof;
   - registered spaces: a deposit plus fees.
 
-**Open,** each deferred by the owner to a named point:
-1. **The identity replica's shape:** a non-voting role added to
-   vos-raft, or the applied state shipped to non-members as a
-   read-only follower (§6). Decided when the first build is planned.
-2. **The handover triggers' numbers** for the registry's governance.
-   Decided with the registry slice.
-3. **Where the shared pool first runs:** a JAM agent, or a proving
-   space run by the root space. Decided when full privacy is
-   unpostponed.
-
-## 15. Proposed staging
-
-0. **Into the core model** (§5, §6.5):
-   - the attestation primitive;
-   - the trust-boundary rule, as quoted in §5;
-   - the origin ABI with its kinds and their codec indexes (§5):
-     `Client`, `Agent`, `Instance`, `Anonymous` and `Owner` built;
-     `Identity` and `Jam` reserved;
-   - the input kinds: `Request` in a session, and the session-less
-     `Credentialed` (§5), built, which anonymous inputs of the shared
-     pool (§8) will also take;
-   - rate limiting keyed by origin kind.
-1. **Second opinions on each draft** (Fable): draft 4's are folded
-   here.
-2. **First build** (the operator-readable row, independent of proving):
-   - the identity agent replicated on every node;
-   - authenticators and signature verification at ingress (ed25519,
-     P-256);
-   - origins and guards;
-   - grants with epochs;
-   - device-signed sessions.
-3. **With slice 5's prover and Clerk:**
-   - masking first;
-   - space-level anchors;
-   - Clerk's first tier on cipher-clerk's `viability` branch, with its
-     window-settlement attestable;
-   - credentials (membership, solvency);
-   - anonymous origins with scoped nullifiers on the client path.
-4. **The registry and the root space,** with the JAM light client.
-5. **Postponed, opt-in per space:** personal spaces, the shared pool,
-   the holder-side prover for personal spaces, the relay layer and note
-   discovery, with
-   cipher-clerk's note redesign as their first application.
+What remains open, and what is not yet built, is in `open.md`.
