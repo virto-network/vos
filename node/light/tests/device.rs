@@ -12,8 +12,8 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use scale::{Decode, Encode};
 use sha2::Sha256;
 use vos_api::Kind;
-use vos_device::wire::{self, Answer};
-use vos_device::{
+use vos_light::wire::{self, Answer};
+use vos_light::{
     AuthWitness, Call, CredentialPublic, DeviceError, Digest, FORMAT, PEAK_BYTES, PathKeeper,
     Prover, ProverConfig, Threads, derive_secret, member, owner, scope, source_input, verify,
     verify_joint,
@@ -95,7 +95,7 @@ impl Tree {
     }
 }
 
-fn secret(seed: u8) -> vos_device::DeviceSecret {
+fn secret(seed: u8) -> vos_light::DeviceSecret {
     derive_secret(&[seed; 32], &HANDLE)
 }
 
@@ -120,7 +120,7 @@ fn prover() -> Prover {
 }
 
 /// A tree holding `secret`'s member at `slot` and others beside it.
-fn tree_with(secret: &vos_device::DeviceSecret, slot: u32) -> Tree {
+fn tree_with(secret: &vos_light::DeviceSecret, slot: u32) -> Tree {
     let mut tree = Tree::default();
     tree.enroll(slot, &member(secret));
     for other in [0, 1, 0xffff_ffff] {
@@ -264,12 +264,12 @@ fn the_scope_and_the_binding_name_the_call() {
 /// decodes.
 #[test]
 fn a_method_id_and_a_transfer_s_arguments_are_the_node_s() {
-    assert_eq!(vos_device::method_id("increment"), 0xf251_d1d4);
+    assert_eq!(vos_light::method_id("increment"), 0xf251_d1d4);
     assert_eq!(
-        vos_device::method_id("transfer"),
+        vos_light::method_id("transfer"),
         derive_id("vos/method/", "transfer")
     );
-    let arguments = vos_device::transfer_arguments("alice", "bob", 7);
+    let arguments = vos_light::transfer_arguments("alice", "bob", 7);
     assert_eq!(
         arguments,
         [
@@ -337,7 +337,7 @@ fn each_proof_verifies_against_its_call_alone() {
         (map_root, Digest(compress(&nullifier.0, &nullifier.0))),
         (Tree::default().root(), nullifier),
     ] {
-        let changed = vos_device::CredentialProof {
+        let changed = vos_light::CredentialProof {
             public: CredentialPublic::Auth {
                 map_root,
                 scope: s,
@@ -351,7 +351,7 @@ fn each_proof_verifies_against_its_call_alone() {
             Err(DeviceError::Verify)
         );
     }
-    let relabelled = vos_device::CredentialProof {
+    let relabelled = vos_light::CredentialProof {
         format: 38,
         ..auth.clone()
     };
@@ -381,7 +381,7 @@ fn each_proof_verifies_against_its_call_alone() {
         Err(DeviceError::Verify)
     );
     // Another secret's owner digest under this proof: refused.
-    let other = vos_device::CredentialProof {
+    let other = vos_light::CredentialProof {
         public: CredentialPublic::Owner {
             owner: owner(&self::secret(2)),
             binding: *paid.public.binding(),

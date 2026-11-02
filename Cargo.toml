@@ -8,6 +8,7 @@ members = [
     "agent/tree",
     "node/host",
     "node/exec",
+    "node/light",
     "node/api",
     "node/http",
     "node/gateway",
@@ -35,7 +36,6 @@ members = [
     "pvm/proof/anchor",
     "pvm/proof/derive",
     "pvm/proof/verifier",
-    "pvm/device",
     "pvm/bench",
     "tools/jam-dev",
     "tools/scale",
@@ -52,6 +52,7 @@ default-members = [
     "agent/tree",
     "node/host",
     "node/exec",
+    "node/light",
     "node/api",
     "node/http",
     "node/gateway",
@@ -78,7 +79,6 @@ default-members = [
     "pvm/proof/anchor",
     "pvm/proof/derive",
     "pvm/proof/verifier",
-    "pvm/device",
     "pvm/bench",
 ]
 exclude = [
@@ -217,7 +217,7 @@ vos-pvm-poseidon2 = { path = "pvm/proof/poseidon2" }
 vos-pvm-recair-air = { path = "pvm/proof/recair-air" }
 vos-pvm-recair = { path = "pvm/proof/recair" }
 vos-pvm-final-verifier = { path = "pvm/proof/final-verifier" }
-vos-device = { path = "pvm/device" }
+vos-light = { path = "node/light" }
 vos-statement = { path = "pvm/proof/statement" }
 vos-anchor = { path = "pvm/proof/anchor" }
 vos-statement-service = { path = "pvm/proof/statement/service" }

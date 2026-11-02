@@ -1,6 +1,15 @@
-//! The device library (`docs/design/proving.md` §8): what a member's phone runs to prove facts about its
-//! device secret to its space's ingress, and nothing a client or a gateway
-//! has to encode itself.
+//! The light node (`docs/design/light-node.md` §2): what a member's phone
+//! runs as VOS.
+//!
+//! - **Local actors** ([`Light`]): one local agent, the default agent's
+//!   program, on the interpreter over the light node's own store
+//!   ([`Store`]), with no log; each operation one entry of the agent
+//!   program, committed in one batch. Its actors and the agent program are
+//!   release artifacts ([`release`]): the phone transpiles nothing.
+//!
+//! **The device library** (`docs/design/proving.md` §8): what the phone
+//! runs to prove facts about its device secret to its space's ingress, and
+//! nothing a client or a gateway has to encode itself.
 //!
 //! - **The secret** ([`derive_secret`]) is derived again at each use from a
 //!   secret source's 32-byte output for the space's handle, whose message
@@ -34,9 +43,12 @@
 
 mod call;
 mod kernel;
+mod light;
 mod path;
 mod prover;
+pub mod release;
 mod secret;
+pub mod store;
 mod threads;
 pub mod wire;
 
@@ -44,12 +56,14 @@ pub use call::{Call, NAME_BYTES, method_id, scope, transfer_arguments};
 pub use kernel::{
     DEVICE_FORMAT, DEVICE_PEAK_BYTES, DeviceProgram, DeviceProof, auth_io, verify_device,
 };
+pub use light::{Config, Error, LOCAL, Light};
 pub use path::PathKeeper;
 pub use prover::{
     CredentialProof, CredentialPublic, JointProof, JointPublic, PEAK_BYTES, Prover, ProverConfig,
     STACK_BYTES, Threads, verify, verify_joint,
 };
 pub use secret::{DeviceSecret, derive_secret, member, owner, source_input};
+pub use store::{Store, StoreError};
 pub use threads::thread_pool;
 
 use vos_wire::credentials::{self, P};

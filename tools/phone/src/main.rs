@@ -1,6 +1,6 @@
 //! The phone bench (`proving.md` §8): the device
 //! library's three credential proofs, auth, owner and membership and
-//! payment, proved through `vos-device` on fixed statements, timed,
+//! payment, proved through `vos-light` on fixed statements, timed,
 //! verified, their peak memory read, and the PoW grinds timed alone.
 //!
 //! - `vos-phone run [--reps N] [--threads auto|N] [--cells auth,owner,joint] [--grind N] [--out DIR]`:
@@ -24,6 +24,11 @@
 //!   of the input's last 129 bytes, auth's public arguments; the proof's
 //!   bytes written to `--out`, one `kernel` line.
 //!
+//! - `vos-phone light --store DIR [--calls N] [--check]`: the light node
+//!   (`light.rs`): a local actor installed from the release artifacts the
+//!   binary embeds, called and queried over a store at DIR, timed; or, with
+//!   `--check`, the store checked after a kill.
+//!
 //! **Two builds:** the timing build (masks from the operating system, as
 //! the library's every build) and the seeded build (`--features seeded`:
 //! each proof's masks from a fixed seed, so its bytes are any machine's;
@@ -44,13 +49,14 @@ use sha2::{Digest as _, Sha256};
 use stwo::core::channel::{Blake2sM31Channel, Channel};
 use stwo::core::proof_of_work::GrindOps;
 use stwo::prover::backend::simd::SimdBackend;
-use vos_device::{
+use vos_light::{
     AuthWitness, Call, Digest, Prover, ProverConfig, Threads, derive_secret, member, verify,
     verify_joint,
 };
 use vos_wire::credentials::{leaf, root_of};
 
 mod device;
+mod light;
 mod member;
 
 use member::{HANDLE, SLOT, SOURCE_OUTPUT};
@@ -264,7 +270,7 @@ fn cell(cell: &str, options: &Options) {
     };
     println!(
         "{{\"kind\":\"cell\",\"cell\":\"{cell}\",\"format\":{},\"threads\":{},\"reps\":{},\"prove_ms_p50\":{:.1},\"prove_ms_p95\":{:.1},\"prove_ms_min\":{:.1},\"prove_ms_max\":{:.1},\"prove_ms_runs\":[{}],\"verify_ms\":{verify_ms:.2},\"proof_bytes\":{},\"distinct_proofs\":{distinct},\"proof_sha256\":\"{last}\",\"matches_x86\":{matches_x86},\"verified\":true,\"peak_rss_mib\":{:.1}}}",
-        vos_device::FORMAT,
+        vos_light::FORMAT,
         prover.threads(),
         options.reps,
         quantile(&sorted, 0.5),
@@ -341,7 +347,7 @@ fn device() {
         } else {
             "timing"
         },
-        vos_device::FORMAT,
+        vos_light::FORMAT,
     );
 }
 
@@ -388,7 +394,7 @@ fn device_run(args: &[String]) {
 /// (`Threads::Auto` by default, by core class).
 fn device_cell(name: &str, args: &[String]) {
     let options = options(args);
-    let pool = vos_device::thread_pool(&threads(&options)).expect("the pool");
+    let pool = vos_light::thread_pool(&threads(&options)).expect("the pool");
     let kernels = options.kernels.clone().unwrap_or_else(|| {
         let exe = std::env::current_exe().expect("this binary's path");
         exe.with_file_name("kernels")
@@ -469,11 +475,11 @@ fn kernel(args: &[String]) {
     let out = out.expect("--out");
     let prover = Prover::new(ProverConfig {
         threads,
-        max_memory: vos_device::DEVICE_PEAK_BYTES,
+        max_memory: vos_light::DEVICE_PEAK_BYTES,
     })
     .expect("a prover");
     let started = Instant::now();
-    let program = vos_device::DeviceProgram::auth(&kernel).expect("the kernel's program");
+    let program = vos_light::DeviceProgram::auth(&kernel).expect("the kernel's program");
     let install = started.elapsed();
     let started = Instant::now();
     let proof = prover
@@ -482,7 +488,7 @@ fn kernel(args: &[String]) {
     let proved = started.elapsed();
     let public = &input[input.len().saturating_sub(129)..];
     let started = Instant::now();
-    let verified = Some(proof.io) == vos_device::auth_io(public) && program.verify(&proof).is_ok();
+    let verified = Some(proof.io) == vos_light::auth_io(public) && program.verify(&proof).is_ok();
     let verify = started.elapsed();
     std::fs::write(&out, &proof.proof).expect("the proof written");
     println!(
@@ -513,11 +519,13 @@ fn main() {
         Some("device") => device_run(&args[1..]),
         Some("device-cell") => device_cell(&args[1], &args[2..]),
         Some("kernel") => kernel(&args[1..]),
+        Some("light") => light::light(&args[1..]),
         _ => {
             eprintln!(
                 "vos-phone run [--reps N] [--threads auto|N] [--cells LIST] [--grind N] [--out DIR] | verify DIR \
                  | device [--kernels DIR] [--cells LIST] [--reps N] [--warmups N] [--threads auto|N] [--out DIR] \
-                 | kernel --kernel PATH --input PATH --out PATH [--threads auto|N]"
+                 | kernel --kernel PATH --input PATH --out PATH [--threads auto|N] \
+                 | light --store DIR [--calls N] [--check]"
             );
             std::process::exit(2);
         }

@@ -4,7 +4,9 @@
 # allocator:
 #
 # - `vos-phone-timing`: the device library's proofs timed and verified,
-#   masks from the operating system;
+#   masks from the operating system; and the light node's gate
+#   (`scripts/light.sh`), its release artifacts embedded from the agent's
+#   and the counter's ELFs (`just build-agent build-test-actors` first);
 # - `vos-phone-seeded`: the same with seeded masks and the x86 proofs'
 #   SHA-256 compiled in, every proof checked byte for byte.
 #

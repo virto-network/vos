@@ -38,9 +38,9 @@ hmac = "0.12"
 sha2 = "0.10"
 zeroize = "1"
 
-# The facility's device library is this tree's.
+# The facility's light node is this tree's.
 [patch."https://codeberg.org/Virto/VOS"]
-vos-device = { path = "../../../pvm/device" }
+vos-light = { path = "../../light" }
 vos-api = { path = "../../api" }
 vos-wire = { path = "../../../agent/wire" }
 

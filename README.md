@@ -31,7 +31,7 @@ origin rather than who the member is.
 - The security notes: [`node/SECURITY.md`](node/SECURITY.md) (the
   credential surface), [`pvm/proof/SECURITY.md`](pvm/proof/SECURITY.md)
   (what a verified proof proves) and
-  [`pvm/device/SECURITY.md`](pvm/device/SECURITY.md) (the device library).
+  [`node/light/SECURITY.md`](node/light/SECURITY.md) (the light node and its device library).
 
 ## The crates
 

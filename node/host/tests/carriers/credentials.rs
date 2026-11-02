@@ -42,8 +42,8 @@ use vos_checker::calls::installed;
 use vos_checker::carriers::{self, Audit, Kind, Logs, Reach};
 use vos_checker::processes::Front;
 use vos_checker::programs::{actor, actor_elf, credentials, credentials_elf, method};
-use vos_device::wire::{self, Answer};
-use vos_device::{
+use vos_light::wire::{self, Answer};
+use vos_light::{
     AuthWitness, Call, CredentialProof, CredentialPublic, DEVICE_PEAK_BYTES, DeviceError,
     DeviceProgram, Prover, ProverConfig, Threads,
 };
@@ -344,8 +344,8 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
     let words = audit
         .needles
         .device_secret("the member", &source_output(), &HANDLE);
-    let secret = vos_device::derive_secret(&source_output(), &HANDLE);
-    let member = vos_device::member(&secret);
+    let secret = vos_light::derive_secret(&source_output(), &HANDLE);
+    let member = vos_light::member(&secret);
     assert_eq!(
         member.to_bytes(),
         tree::digest(&tree::compress(&Tag::Member.block(), &words)),
@@ -449,7 +449,7 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
     answers.push(ran(send(&fresh, &whole)));
 
     // Owner: a payment from the row the member's owner digest claims.
-    let owner = vos_device::owner(&secret).to_bytes();
+    let owner = vos_light::owner(&secret).to_bytes();
     let expires = founded.time(at) + 60_000;
     let shop = tree::digest(&tree::compress(&Tag::Owner.block(), &other(1)));
     for (row, digest) in [("device", owner), ("shop", shop)] {
@@ -512,7 +512,7 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
 
     // A sign-in proved on this thread, its masks' randomness watched.
     let watched = founded.call(at, POLL, "login", ());
-    let scope = vos_device::scope(&founded.space.0, agent.0, POLL.0, b"login").unwrap();
+    let scope = vos_light::scope(&founded.space.0, agent.0, POLL.0, b"login").unwrap();
     let nullifier = tree::compress(&tree::compress(&Tag::Nf.block(), &words), &scope.0);
     let binding = watched.binding(verifier::program(verifier::CredentialKind::Auth), 0);
     let statement = Statement::Auth(
@@ -542,11 +542,11 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
     }
     audit.needles.drawn("a sign-in", &drawn);
     let watched_proof = CredentialProof {
-        format: vos_device::FORMAT,
+        format: vos_light::FORMAT,
         public: CredentialPublic::Auth {
             map_root: witness.root,
             scope,
-            nullifier: vos_device::Digest(nullifier),
+            nullifier: vos_light::Digest(nullifier),
             binding,
         },
         proof: verifier::encode(&proved).unwrap(),
@@ -688,14 +688,14 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
             .unwrap_err(),
         prover
             .prove_auth(
-                &vos_device::derive_secret(&[1; 32], &HANDLE),
+                &vos_light::derive_secret(&[1; 32], &HANDLE),
                 &witness,
                 b"login",
                 &login,
             )
             .unwrap_err(),
         wire::path_answer(&[0xff]).unwrap_err(),
-        vos_device::verify(&proof, &fresh, Some(b"login")).unwrap_err(),
+        vos_light::verify(&proof, &fresh, Some(b"login")).unwrap_err(),
     ];
     for error in refusals {
         device_values.push(format!("{error} {error:?}"));

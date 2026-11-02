@@ -4,10 +4,10 @@ default:
     @just --list
 
 # The fast suites' crates, which `test` and `check` run.
-core_crates := "-p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-device -p vos-anchor -p vos-statement -p vos-statement-service --features vos-anchor/vectors,vos-statement/fixtures"
+core_crates := "-p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-anchor -p vos-statement -p vos-statement-service --features vos-anchor/vectors,vos-statement/fixtures"
 
 # The agent's suites' crates, which `test-agent` and `check` run.
-agent_crates := "-p vos-exec -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-api -p vos-http -p vos-gateway -p vos-node -p vos-node-prover -p vos-venue -p vos-net -p vos-cli -p vos-jam-dev -p vos-scale"
+agent_crates := "-p vos-exec -p vos-light -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-api -p vos-http -p vos-gateway -p vos-node -p vos-node-prover -p vos-venue -p vos-net -p vos-cli -p vos-jam-dev -p vos-scale"
 
 # A guest build for the PVM: the statement's target, its standard library
 # built from source. Every guest and blob build sets `CARGO_INCREMENTAL` to
@@ -368,7 +368,7 @@ _forbidden +gates:
         [venue-clients "-p vos-node --features prover" [kreivo-mock kreivo model] []] \
         [seeded-masks "--workspace" [seeded-masks] []] \
         [seeded-masks "-p vos-cli --features prover" [seeded-masks] []] \
-        [seeded-masks "-p vos-device" [seeded-masks] []] \
+        [seeded-masks "-p vos-light" [seeded-masks] []] \
         [seeded-masks "--manifest-path agent/programs/Cargo.toml --workspace" [seeded-masks] []] \
         [seeded-masks "--manifest-path pvm/proof/fuzz/Cargo.toml" [seeded-masks] []] \
         [seeded-masks "--manifest-path pvm/proof/final-verifier/wasm/run/Cargo.toml" [seeded-masks] []] \

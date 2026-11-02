@@ -626,7 +626,7 @@ space three of them take a simpler form:
   token), unlinkable across scopes and to `member` or `owner`. A method
   that admits it once takes the `once` guard (§5).
 
-**The device secret** [decided; built, `vos-device`]: the
+**The device secret** [decided; built, `vos-light`]: the
 member's `s` comes from a secret source, a keyed HMAC-SHA-256 whose key
 the device never exports, evaluated once a use after the user's consent
 (`proving.md` §8 pins it):
@@ -653,7 +653,7 @@ the device never exports, evaluated once a use after the user's consent
   pinned.
 
 **The device side, as built:**
-- **The device library** (`vos-device`, `proving.md` §8): it derives `s`,
+- **The device library** (`vos-light`, `proving.md` §8): it derives `s`,
   computes the scope and the binding (`vos_wire`'s functions, the ones
   ingress calls), proves auth, owner and device-kernel statements, and
   builds every node-API request and decodes every answer, so neither the
@@ -665,7 +665,7 @@ the device never exports, evaluated once a use after the user's consent
   a key drawn for each. Its `SECURITY.md` states the secret's containment.
 - **s4's `vos.credential` facility** [decided]: a client
   facility of s4's Android client, called by a server's document and
-  gated by the client's grant, implemented in Rust over `vos-device` (a
+  gated by the client's grant, implemented in Rust over `vos-light` (a
   library the client loads), unsupported below Android 11. Its
   operations:
   - `enroll`: the space, its handle, the agents and their identities, the
@@ -807,7 +807,7 @@ the device never exports, evaluated once a use after the user's consent
 - **Known gaps,** each stated where it lives:
   - `s` stays in freed memory inside the prover: the recursion
     `Context`'s copy, the traces and the prover's polynomials, until
-    reused (`pvm/device/SECURITY.md`);
+    reused (`node/light/SECURITY.md`);
   - copies outside the library's reach: YubiKit's, the Keystore's
     parcels, and the PIN's `Editable` in the client;
   - a secret source's failure text reaches the server as the platform

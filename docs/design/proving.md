@@ -591,7 +591,7 @@ pub struct Statement {
     (the masked device segment); `final-verifier`'s `credential` (the
     format-44 verifier ingress calls); `vos-pvm-proof`'s `device` (the
     shape) and `masked` (the masked segment chips);
-  - `device` (`vos-device`, `pvm/device`): the device library (§8), `std`,
+  - `device` (`vos-light`, `node/light`): the device library (§8), `std`,
     which s4's `vos.credential` facility (a `cdylib` the Android client
     loads) links;
   - the golden fixtures, under `fixtures` (A.6).
@@ -1267,7 +1267,7 @@ most 512 KiB; a proof is about 213–225 KB [measured, Fairphone 6,
 - **What `s` is exposed to** is `identity-and-authority.md` §7's threat
   model.
 
-**The device library** (`vos-device`, `std`, aarch64 and x86_64; linked
+**The device library** (`vos-light`, `std`, aarch64 and x86_64; linked
 as a Rust crate by s4's Android client, a Rust `cdylib`, so VOS has no JNI
 shim of its own; built for `aarch64-linux-android` with `cargo-ndk`
 against the client's NDK; mimalloc, no other C dependency). Neither the
@@ -1371,7 +1371,7 @@ impl PathKeeper {
   production build (`just check-no-seeded-masks`). The client's bridge zero-fills its `byte[]` of `o` once
   the library has copied it; the library zeroizes its copies of `o` and
   `s`.
-- **Built** (`pvm/device`, its `SECURITY.md`): as
+- **Built** (`node/light`, its `SECURITY.md`): as
   sketched, and beside it `Prover::prove_membership_and_payment` and
   `verify_joint` (the joint statement's binding names its own program and
   the kind byte `0xff`, which no `CredentialPublic` takes); the masks
@@ -1660,7 +1660,7 @@ Poseidon2 calls (about 109 a run, fewer as its steps grow; a kernel past
 them fails its install out of gas). Auth's arguments to a
 device kernel are the 32 siblings from the leaf's level up, the secret's
 32 bytes, the slot (four little-endian bytes) and the 129 public bytes,
-in that order (`auth_arguments`), which `vos-device`'s
+in that order (`auth_arguments`), which `vos-light`'s
 `prove_device_auth` writes; a kernel that reads them otherwise does not
 run the reference and is refused at the install.
 
