@@ -90,9 +90,10 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   processed on a copy of the state and swapped; whether a maintained
   hybrid post-quantum suite exists (N6).
 - The keystore: an after-first-unlock key used by a WorkManager job on a
-  locked Fairphone; a hardware signing key with per-use
-  `AUTH_BIOMETRIC_STRONG` (P-256 and, on Android 13, Ed25519), its
-  attestation read; the security key's `hmac-secret` through YubiKit.
+  locked Fairphone; an Ed25519 signing key in the TEE with per-use
+  `AUTH_BIOMETRIC_STRONG`, signing one admin call of up to 15 KiB per
+  prompt, its attestation read; the security key's `hmac-secret` through
+  YubiKit.
 - **Gate:** PG5's `vos-mls` limit; a candidate processed ≤ 200 ms; the
   locked-phone job works, or PG6's locked-phone limit is dropped and
   stated. **Phone:** S8-P1. **Estimate:** 1–1.5 weeks.
@@ -187,8 +188,8 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   **Estimate:** 1–1.5 weeks.
 
 ### 8.12 `Personal`: commits, envelopes, the inbox
-- The commit log (candidates, each **admin-signed and verified in the
-  guest**, `EpochTaken`/`EpochGap`, declared effects carrying every matured
+- The commit log (candidates, each an **admin call** whose origin is
+  checked against the device set, `EpochTaken`/`EpochGap`, declared effects carrying every matured
   removal), signed confirmations and nacks, the confirming set (devices
   with a call in the last 72 h) written into the candidate's log entry,
   removed devices' votes ignored; the lapsed agent's grace rules (removal
@@ -198,9 +199,12 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   inbox with lazy expiry; queries answering only admitted keys.
 - **The append-only layout:** a test installs the next version over a
   populated agent and reads every envelope and operation back.
-- **Gate:** the §8 scenarios naming 8.12 as tests; an unsigned commit
-  refused; the gas of a P-256 and an Ed25519 verification in the guest
-  measured and within `commit`'s limit. **Estimate:** 3–4 weeks.
+- **Evidence:** `evidence(operation, message, signature)` stored as data
+  beside each admin call's operation, its message's arguments compared
+  byte for byte with the operation.
+- **Gate:** the §8 scenarios naming 8.12 as tests; a commit from a sync
+  key, or from an admin key whose device may not commit, refused.
+  **Estimate:** 3–4 weeks.
 
 ### 8.13 `Personal`: the device set
 - States, admin classes and curves, seasoning; operations signed end to
@@ -284,14 +288,16 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
 ### 8.19 `vos-mls` and the device group — C
 - `vos-mls` over mls-rs: storage providers over fjall, copy-and-swap, the
   confirmation hash, the device group's proposal policy; in `vos-light`:
-  admin-signed commits (an Update on the yearly prompt), candidates on a
+  commits as admin calls with their evidence (an Update on the yearly
+  prompt), candidates on a
   copy, confirmations against the logged set and nacks, sleepers deferred
   with their alarm, exporter keys, scope ids from the naming secret, the
   key archive.
 - **Gate:** a committer that encrypts garbage to one awake device never
   gets data sealed to the other side; to a sleeping one, the sleeper
-  alarms and re-pairs or regroups on return; a commit without an admin
-  signature is refused by the agent and by every device; two attacker
+  alarms and re-pairs or regroups on return; a commit that is not an
+  admin call is refused by the agent, and an operation or commit without
+  valid evidence moves no device; two attacker
   devices are removed by one commit; every disallowed proposal is nacked;
   two devices shown different confirming sets raise the split-log alarm. **Dep:** 8.3, 8.12, 8.18a.
   **Estimate:** 3.5–5 weeks.

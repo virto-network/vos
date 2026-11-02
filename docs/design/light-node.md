@@ -396,10 +396,8 @@ reads from the agent's own state, as it reads the credential ring:
   the call creates a session reads the session row), so an unknown key
   costs two point reads, not a verification. A key admitted in the last
   batch may be refused until the leader applies it, and the client
-  retries. `Personal` admits the device set's sync keys, the recovery
-  keys' ed25519 halves and open pairing slots' keys: the session keys
-  ingress verifies. Admin keys never open a session (their signatures
-  ride inside calls made under the sync key, §3.5).
+  retries. `Personal` admits the device set's sync and admin keys, the
+  recovery keys' ed25519 halves and open pairing slots' keys.
 - **onion only** [decided, E17]: a request the gateway did not receive on
   its onion service is refused. The gateway marks each request it relays
   with the transport it came in on (a field of the frame,
@@ -463,15 +461,17 @@ stack in VOS is fewer pieces than an MLS stack and a second key scheme.
 **The personal agent orders the group's commits** (RFC 9750 §5.2.1's
 strongly consistent delivery service; the rule is the `messaging` branch's
 `msg-ctl`'s):
-- A commit is a call, `Personal::commit(epoch, effect, handshake,
-  welcome)`, made under a device's sync key and **signed by its admin
-  key** over `(agent, epoch, the commit's hash)`, which the agent checks as
-  it checks the declared effect and every device verifies. It is accepted
-  as the **candidate** for `epoch` only if `epoch` is the confirmed epoch
-  plus one and no candidate is pending (`EpochTaken`, `EpochGap`). So no
-  holder of a sync key alone (a phone after first unlock, malware in the
-  app's process) can touch the group's keys: committing needs the owner's
-  biometric, and a probation device commits nothing.
+- A commit is an **admin call** (§3.5), `Personal::commit(epoch, effect,
+  handshake, welcome_hash)`: signed by the device's admin key and verified
+  at ingress like any client call; the agent checks that the caller is the
+  admin key of an active device, and accepts it as the **candidate** for
+  `epoch` only if `epoch` is the confirmed epoch plus one and no candidate
+  is pending (`EpochTaken`, `EpochGap`). The Welcome, which can exceed what
+  the keystore signs in one operation, follows in the commit's evidence
+  call, bound by its hash. So no holder of a sync key alone (a phone after
+  first unlock, malware in the app's process) can touch the group's keys:
+  committing needs the owner's biometric, and a probation device commits
+  nothing.
 - **Allowed proposals:** Add, Remove and Update, nothing else: no ReInit,
   no external commit or join, no PSK, no group-context change. The
   declared effect (`update`, `add(d)`, `remove(d₁, …)`) names matured,
@@ -568,45 +568,74 @@ later change is a successor group, never two suites in one group (§8, F2).
 | secret | what for | held as |
 |---|---|---|
 | the member secret `s` of each space | membership proofs (auth, owner) | derived at each use from the keystore's HMAC over the space's handle, behind the prompt (a biometric or the PIN), as today [built, `identity-and-authority.md` §7]; in the process during a use, as that design states |
-| the **admin key** | signing device-set operations | **a hardware-backed Keystore signing key** that never leaves the keystore: per-use authentication by a strong biometric (`setUserAuthenticationParameters(0, AUTH_BIOMETRIC_STRONG)`); P-256 on Android 11–12, Ed25519 from Android 13; with key attestation where the phone offers it. On a phone with no strong biometric: the same key authenticated by the PIN, which makes the device a **delayed admin** (below) |
+| the **admin key** (Ed25519) | the client key of admin calls: device-set operations and commits | **a Keystore signing key in the TEE**, never leaving it: per-use authentication by a strong biometric (`setUserAuthenticationParameters(0, AUTH_BIOMETRIC_STRONG)`), with key attestation where the phone offers it. On Android 13 and later only: KeyMint's TEE implementations must support curve 25519 for signing (Ed25519) and StrongBox implementations do not support it (`IKeyMintDevice.aidl`), so the key lives in the TEE, not StrongBox. On a phone with no strong biometric, or on Android 11–12, the device is a **delayed admin** (below) |
 | the **sync key** (ed25519) | the client key at the personal agent; signing DAG nodes and confirmations | wrapped under a keystore key usable **after the first unlock** since boot, no per-use prompt, no unlocked-screen requirement: background sync runs on a locked phone |
 | the MLS state, the key archive, `R` | sealing and opening envelopes, processing commits | the same after-first-unlock wrap; kept out of Android's backups (§8, A11) |
 
-- **Why an operation signature need not be ed25519:** devices verify it,
-  not ingress. The device set records each admin key's curve and whether
-  its attestation showed a hardware key requiring a strong biometric;
-  devices verify each signature by the recorded curve, and the chrome
-  shows an unattested key. The call carrying the operation is made under
-  the device's sync key; the operation's own signature is the admin key's.
+- **Ed25519 only** [proposed]: ingress client keys are ed25519
+  (`agent/wire/src/ingress.rs`), and an admin key is a client key, so
+  admin keys are Ed25519 too. A second client-key curve (P-256) at ingress
+  would serve only Android 11–12 phones, at the cost of new ingress code
+  and its carrier and fuzz cover; those phones are delayed admins instead.
+  The device set records whether each admin key's attestation showed a
+  TEE key requiring a strong biometric, and the chrome shows an unattested
+  one.
 - **Why the bars differ:** a sign-in or a P1 transfer is one action the
   user sees; device changes are lasting control of every device's data. So
   the member secret keeps its decided PIN fallback and in-process exposure
   (stated in `SECURITY.md`); the admin key is held where malware with the
   app's process cannot reach it.
-- **Delayed admins:** a device without a strong biometric signs with its
-  PIN, and every operation it signs, adds included, waits 72 h and can be
-  contested.
+- **Delayed admins:** a device that cannot hold the admin key as above
+  administers anyway, under a delay: on a phone without a strong
+  biometric its TEE key is authenticated by the PIN; on Android 11–12,
+  whose keystore has no Ed25519, the admin key is a software Ed25519 key
+  wrapped under a per-use-authenticated keystore key, so it is in the
+  process during each use. Either way every operation it signs, adds
+  included, waits 72 h and can be contested (its commits carry only
+  operations already matured), which bounds what malware that captures
+  such a key can do.
 - **After first unlock:** a phone unlocked once since boot uses the sync
   key and the MLS state while locked; a thief who keeps it powered and
   runs code on it reads the personal space. Before the first unlock
   nothing opens (§8, A2).
 
-**Operations are signed end to end:** every device-set operation (add,
-remove, veto, resolve, kit rotation, restore, regroup, admin-key
-replacement) carries its signer's signature over `(agent, operation, the
-control log's head)`; the agent stores it and **every device verifies it**
-before acting. The operators run ingress and could append anything to the
-log, so a device trusts an operation only by its signature (§8, B6).
-**`Personal` verifies one kind itself:** a commit's admin signature
-(§3.4), since the agent must refuse an unsigned candidate rather than let
-it hold the epoch; a P-256 or Ed25519 verification in software in the
-guest is a few million instructions [est], at most a few a day an agent,
-under a handler gas limit raised for `commit` (measured in plan 8.12). Delays run on the
-agent's batch time alone; a device whose clock disagrees with the agent's
-by more than an hour raises an alarm and otherwise acts as the log says.
+**Admin calls, verified at ingress and end to end:**
+- **One call, one prompt:** every device-set operation (add, remove, veto,
+  resolve, kit rotation, restore, regroup, admin-key replacement) and
+  every commit is a one-shot client call whose key is the device's admin
+  key (or the kit's, for its own operations), its arguments including the
+  control log's head it was made against. The prompt authorizes the one
+  signature the call needs; ingress verifies it as it verifies any client
+  call, and the agent checks the origin, `Principal::Client(key)`, against
+  the device set: whose key it is, and whether that device's state (active,
+  seasoned, delayed) allows the operation. No guest verifies a signature
+  (`core-model.md` §5: no signed evidence inside guests).
+- **Prompts:** pairing is one prompt (the add and its commit are one call,
+  §3.8); a removal is the operation's prompt and, once it matures, the
+  commit that carries it, made by the next device whose user authenticates
+  (the agent already refuses the removed device's keys at maturity); a
+  veto, a resolve or a kit rotation is one each; the yearly re-proof and the
+  leaf renewal share one.
+- **Size:** the keystore signs at most 16 KiB in one Ed25519 operation
+  (`IKeyMintDevice.aidl`), so an admin call's arguments stay under 15
+  KiB; anything larger (a commit's Welcome) rides in its evidence call,
+  bound by hash.
+- **The evidence:** the logged request carries no signature, so the device
+  that made the call then posts, under its sync key and with no prompt,
+  `evidence(operation, message, signature)`: the exact signed call message
+  and its signature. The agent stores them as data, compares the message's
+  arguments byte for byte with the operation it recorded, and verifies
+  nothing. **Every device verifies the signature** against the admin key
+  before acting, and acts on no operation without its evidence; the device
+  that made the call re-posts the evidence until it is stored. The
+  operators run ingress and could append anything to the log, so a device
+  trusts an operation only by its signature (§8, B6).
+- Delays run on the agent's batch time alone; a device whose clock
+  disagrees with the agent's by more than an hour raises an alarm and
+  otherwise acts as the log says.
 
 **The device set** (a table in `Personal`): each device's sync key, admin
-key, its curve and attestation, its admin class (strong or delayed), its
+key and its attestation, its admin class (strong or delayed), its
 "home" nullifier, a sealed label and a state: **probation** (72 h from
 its add: it may sync and post confirmations, not sign operations or
 commits), **active**, or **removed** (with its frontier). A device is
@@ -718,7 +747,7 @@ the control log restarts under it.
   nothing at the new home (§3.9).
 
 **What the control log shows the operators:** the device count and its
-changes, each device's public keys, curves and admin class, the times of
+changes, each device's public keys and admin class, the times of
 device changes, commits and confirmations, contests, liveness, and the
 recovery entries. Not the labels, not the data.
 
@@ -824,8 +853,8 @@ skip expired items, each write deletes a few; no timer).
 
 **Pairing:**
 1. **The existing device** (A, active) opens a pairing slot under its
-   admin key, behind the prompt: a random slot id and a slot key the agent
-   admits for that slot alone, 10 minutes. A shows a QR code: the home's
+   sync key (a slot grants nothing; only the add does): a random slot id
+   and a slot key the agent admits for that slot alone, 10 minutes. A shows a QR code: the home's
    handle and onion addresses, the slot id and key, A's ephemeral X25519
    key, and a 128-bit code.
 2. **The new device** (B) scans it, generates its admin key in its
@@ -835,10 +864,14 @@ skip expired items, each write deletes a few; no timer).
 3. **Over the Noise channel,** B sends its public keys, the admin key's
    attestation and its KeyPackage; A sends the key archive, the naming
    secret, `R`, and its newest checkpoint's hash per scope.
-4. **A adds B:** the admin-signed `add` with B's "home" nullifier (B
-   computes it from its own member secret; its membership in the home
-   follows below), then the commit adding B with its Welcome; B is in
-   probation, and reads and writes at once through the archive.
+4. **A adds B in one admin call, on one prompt:** for a strong admin an
+   add is immediate, so the add and its commit are one call,
+   `commit(epoch, add(B's keys, B's "home" nullifier), handshake,
+   welcome_hash)` (B computes its nullifier from its own member secret;
+   its membership in the home follows below), with B's Welcome in the
+   evidence call. B is in probation, and reads and writes at once through
+   the archive. A delayed admin's add is an operation first and its
+   commit, after the 72 h, a second call.
 5. **B joins:** fetches each scope's checkpoint (A's, by the hash it was
    given) and the envelopes after it.
 
@@ -1961,9 +1994,9 @@ remove the old one, revoke its leaves everywhere, and offer to wipe it.
 (8.23a, 8.24)
 
 **A23. A sync-key thief waits for the owner's other device to go quiet,**
-then commits garbage to it. *Mitigation:* commits need an admin signature,
-which the agent and every device check, so a sync key alone commits
-nothing. (8.12, 8.19)
+then commits garbage to it. *Mitigation:* a commit is an admin call,
+verified at ingress and by every device through its evidence, so a sync
+key alone commits nothing. (8.12, 8.19)
 
 **A24. A device cannot follow the confirmed epoch and has no device to
 re-pair from** (a buggy commit, a lost committer, a lockout). *Mitigation:*
@@ -1994,7 +2027,9 @@ replayed one is a duplicate; a replayed commit breaks the epoch rule.
 *Mitigation:* as stated. (8.20)
 
 **B6. The operators forge device-set operations.** *Mitigation:* every
-device verifies every operation's and confirmation's signature itself.
+device verifies every operation's and confirmation's signature itself,
+from the evidence stored beside it; an operation without evidence moves no
+device.
 (8.13, 8.19)
 
 **B7. The operators advance the agent's clock,** maturing a hostile
@@ -2390,8 +2425,6 @@ agent. (8.14)
   commits and copy-and-swap on top; `vos-mls` carries the `messaging`
   branch's storage providers, snapshot-and-restore and one-commit-an-epoch
   rule, nothing else.
-- **A signature verified in the guest** (a commit's admin signature) is
-  new for an actor; its gas is measured in plan 8.12.
 - **10^4 personal agents waking a few times an hour** are unmeasured (plan
   8.15).
 - **Android's background limits** decide how soon a device sees a pending
