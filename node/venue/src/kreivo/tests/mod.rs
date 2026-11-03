@@ -67,11 +67,12 @@ fn options() -> Options {
     }
 }
 
-/// Wait until `done`, a few seconds at most.
+/// Wait until `done`: within 60 s, a bound on the wait, which a loaded
+/// host may stretch, not what a test checks.
 fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
     let start = Instant::now();
     while !done() {
-        assert!(start.elapsed() < Duration::from_secs(10), "{what}");
+        assert!(start.elapsed() < Duration::from_secs(60), "{what}");
         std::thread::sleep(Duration::from_millis(5));
     }
 }

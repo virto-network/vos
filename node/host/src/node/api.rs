@@ -85,6 +85,12 @@ impl Node {
         self.api.credentialed_free()
     }
 
+    /// The calls this node queued in their lanes as their agent's leader
+    /// and has not answered yet, with the duplicates waiting on them.
+    pub fn calls_in_flight(&self) -> usize {
+        self.inner.calls.in_flight()
+    }
+
     /// Snapshots this node's groups switched to.
     pub fn snapshots_installed(&self) -> u64 {
         self.inner.counters.installed.load(Ordering::Relaxed)

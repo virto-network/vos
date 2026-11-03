@@ -71,6 +71,18 @@ pub(crate) struct Calls {
     pub(crate) devices: crate::credentialed::DevicePrograms,
 }
 
+impl Calls {
+    /// The calls queued in their lanes and not yet answered, with the
+    /// duplicates waiting on them.
+    pub(crate) fn in_flight(&self) -> usize {
+        lock(&self.lanes)
+            .values()
+            .flat_map(|lane| lane.inflight.values())
+            .map(|waiting| 1 + waiting.len())
+            .sum()
+    }
+}
+
 /// A forwarded call's place among those running, given back when it ends,
 /// however it ends.
 struct Running<'a> {

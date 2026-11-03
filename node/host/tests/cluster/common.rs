@@ -706,9 +706,9 @@ impl Impersonation {
     }
 
     /// The first request to arrive that `answer` takes, past the others
-    /// the nodes send, within 10 s.
+    /// the nodes send, within [`IN_PROCESS_WAIT`].
     pub fn answer<T>(&self, mut answer: impl FnMut(PeerMessage) -> Option<T>) -> T {
-        let until = Instant::now() + Duration::from_secs(10);
+        let until = Instant::now() + IN_PROCESS_WAIT;
         loop {
             let left = until.saturating_duration_since(Instant::now());
             let incoming = smol::block_on(async {

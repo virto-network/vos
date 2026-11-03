@@ -238,9 +238,10 @@ mod tests {
         queue.push(&anchor(1, 3));
         queue.push(&anchor(1, 3));
         queue.push(&anchor(1, 4));
+        // Bounds on the waits, which a loaded host may stretch.
         let start = Instant::now();
         while sends.tries.load(Ordering::SeqCst) == 0 {
-            assert!(start.elapsed() < Duration::from_secs(10));
+            assert!(start.elapsed() < Duration::from_secs(60));
             std::thread::sleep(Duration::from_millis(1));
         }
         for window in [6, 5, 7] {
@@ -248,7 +249,7 @@ mod tests {
         }
         sends.held.store(false, Ordering::SeqCst);
         while sends.sent.lock().unwrap().len() < 3 {
-            assert!(start.elapsed() < Duration::from_secs(10));
+            assert!(start.elapsed() < Duration::from_secs(60));
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(*sends.sent.lock().unwrap(), [(2, 5), (2, 6), (2, 7)]);

@@ -417,7 +417,13 @@ fn a_flaky_then_cut_link_moves_no_term() {
     let cluster = Cluster::new(3);
     let agents = agents(&cluster, 40);
     cluster.install(agents[0]);
-    std::thread::sleep(Duration::from_millis(1_000));
+    // Settled once every group is quiet: none still electing.
+    wait_until("every replica is quiet", || {
+        cluster.running().all(|(_, node)| {
+            let groups = node.stats().groups;
+            groups.quiet == groups.replicas
+        })
+    });
     let before = terms(&cluster, &agents);
     // Lossy enough that the vouches between 1 and 2 lapse now and then.
     cluster.hub.set_link_loss(1, 2, 950_000);
@@ -429,6 +435,47 @@ fn a_flaky_then_cut_link_moves_no_term() {
     std::thread::sleep(Duration::from_millis(1_000));
     assert_eq!(terms(&cluster, &agents), before);
     assert_eq!(done(cluster.increment_at_leader(agents[0], 1, 7)), 7);
+}
+
+/// The agents of `agents` node `number` leads, some at least. Which node
+/// wins an election is chance, which a loaded host can tilt against one
+/// node for every group, its writer slow while it creates them: while it
+/// leads none, the node leading the first is cut off until the groups it
+/// led elect again, among them `number`.
+fn leading_some(cluster: &Cluster, number: NodeNumber, agents: &[AgentId]) -> Vec<AgentId> {
+    let mut led = Vec::new();
+    wait_until(&format!("node {number} leads some"), || {
+        led = agents
+            .iter()
+            .copied()
+            .filter(|&agent| cluster.leader(agent) == number)
+            .collect();
+        if !led.is_empty() {
+            return true;
+        }
+        let other = cluster.leader(agents[0]);
+        // Moved to it since: read again.
+        if other == number {
+            return false;
+        }
+        let moved: Vec<AgentId> = agents
+            .iter()
+            .copied()
+            .filter(|&agent| cluster.leader(agent) == other)
+            .collect();
+        println!("node {number} leads none: node {other} cut off");
+        cluster.hub.isolate(other);
+        wait_until(&format!("the groups node {other} led elect again"), || {
+            moved.iter().all(|&agent| {
+                cluster
+                    .running()
+                    .any(|(at, node)| at != other && node.leads(agent))
+            })
+        });
+        cluster.hub.heal();
+        false
+    });
+    led
 }
 
 /// A node whose writer stalls stops being vouched for: the quiet groups
@@ -447,15 +494,7 @@ fn the_groups_of_a_node_whose_writer_stalls_elect_elsewhere() {
         cluster.install(agent);
     }
     // Node 1 leads some; one of them takes a call its writer holds.
-    let mut led = Vec::new();
-    wait_until("node 1 leads some", || {
-        led = agents
-            .iter()
-            .copied()
-            .filter(|&agent| cluster.leader(agent) == 1)
-            .collect();
-        !led.is_empty()
-    });
+    let led = leading_some(&cluster, 1, &agents);
     std::thread::scope(|scope| {
         // Inside the scope: a failure opens it before the scope waits.
         let closed = commits.close();

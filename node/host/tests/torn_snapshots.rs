@@ -7,13 +7,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use vos_node::store::{Fjall, PersistMode};
+use vos_node::store::{Fjall, PersistMode, Tuning};
 use vos_wire::ids::{AgentId, InstanceId};
 use vos_wire::keys::{self, Transform};
 use vos_wire::result::Write;
 
 const AGENT: AgentId = AgentId(1);
 const ROWS: u64 = 1_000;
+/// Small memtables, sealed and flushed every score of commits: the flushes,
+/// and the compactions of the tables they write, run beside the reads
+/// however slowly the commits go.
+const MEMTABLE_BYTES: u64 = 2 << 20;
+/// The rotations, and the snapshots checked, the test sees at least.
+const ROTATIONS: u32 = 4;
+const CHECKS: u64 = 100;
 
 /// The table the commits write, in the state partition.
 fn table() -> Vec<u8> {
@@ -29,7 +36,14 @@ fn key(index: u64, row: u64) -> Vec<u8> {
 #[test]
 fn snapshots_never_see_part_of_a_commit() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Fjall::open(dir.path()).unwrap();
+    let store = Fjall::open_tuned(
+        dir.path(),
+        Tuning {
+            memtable_bytes: MEMTABLE_BYTES,
+            ..Tuning::default()
+        },
+    )
+    .unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let writer = {
         let store = store.clone();
@@ -58,15 +72,18 @@ fn snapshots_never_see_part_of_a_commit() {
     };
     // The commits fill the state partition's memtable, which rotates and
     // is flushed once full: the flushes this test needs beside the reads.
-    // Each rotation empties the active memtable, which the reads watch.
+    // Each rotation empties the active memtable, which the reads watch:
+    // the test reads until it has seen enough of them, not for a time.
     let mut rotations = 0;
     let mut filled = 0;
     let started = Instant::now();
     let mut checks = 0u64;
-    while started.elapsed() < Duration::from_secs(4) || rotations < 2 {
+    while rotations < ROTATIONS || checks < CHECKS {
+        // A bound that fails the test rather than hang it, should the
+        // memtables stop rotating; a loaded host takes seconds.
         assert!(
-            started.elapsed() < Duration::from_secs(60),
-            "the memtable rotated {rotations} times"
+            started.elapsed() < Duration::from_secs(120),
+            "the memtable rotated {rotations} times, {checks} snapshots checked"
         );
         let bytes = store.state_memtable_bytes();
         if bytes < filled {
@@ -99,5 +116,4 @@ fn snapshots_never_see_part_of_a_commit() {
     }
     stop.store(true, Ordering::SeqCst);
     writer.join().unwrap();
-    assert!(checks > 100, "{checks} snapshots checked");
 }
