@@ -808,18 +808,32 @@ run Merge handlers locally or as thin clients.
   DAG and epoch chain, so a device fetches only the scopes it belongs to.
   A DAG node is a batch of CRDT operations with stable operation ids, its
   parents and its author.
-- **Incremental apply** [decided]. merkle-crdt's DAG and sync format are
-  reused; its apply path is rewritten:
+- **Incremental apply** [decided; built in `support/merkle-crdt`, no
+  dependent yet]:
   - validate and apply only newly fetched nodes, in causal order, onto the
-    current state;
+    current state; a node whose parents have not arrived is held, durably,
+    and applied in the batch that brings them;
   - derive which heads are subsumed from the fetched nodes;
-  - apply local operations in place, with no state clone.
+  - apply local operations in place, with no state clone;
+  - one store commit an ingest or a local operation: the nodes, the
+    author index, the heads, the cursor and the CRDT's rows.
 
-  Full validation and rebuild remain only for recovery and audits.
-  merkle-crdt's full apply takes 8.7 s to sync one operation onto a
-  1M-operation history; an incremental prototype takes about 1.9 µs,
-  1.5–1.8× its cost at 1k (an LWW map on an in-memory store without
-  signature checks) [measured, 2026-10-08].
+  Full validation and rebuild remain only for recovery and audits. The
+  former full apply took 8.7 s to sync one operation onto a 1M-operation
+  history; an incremental prototype took about 1.9 µs, 1.5–1.8× its cost
+  at 1k (an LWW map on an in-memory store without signature checks)
+  [measured, 2026-10-08]. The library, signatures checked, on fjall
+  (`cargo bench -p merkle-crdt --bench apply`, an LWW map over 100k keys):
+  a node of a batch of 100 costs 55–99 µs at 1k operations, 64 µs at
+  100k and 63–68 µs at 1M, of which the stateless checks (decoding,
+  canonical form, CID, strict ed25519) are 41–78, 43 and 45–46 µs; the
+  replica's own work is 14–22 µs at 1k, 21 µs at 100k and 19–22 µs at 1M. One node alone, or a local
+  operation, costs 0.5–0.8 ms, the synced commit. On the in-memory store
+  the replica's own work is 3–4 µs at 1k, 4 µs at 100k and 10–12 µs at 1M [measured,
+  Intel Core Ultra 7 155H under other builds' load, 2026-11-03]. A
+  profile at 1M on the in-memory store puts about 95% of the time in
+  ed25519; caching decompressed author keys and batch verification are
+  the levers left.
 - CRDT types are storage-backed. A list type that rebuilds its whole order
   on every call and never drops tombstones does not meet the budget.
 - **Linear-emitted chain.** Linear handlers may emit Merge operations, for
@@ -1393,7 +1407,7 @@ Around the proof:
 | Table point read or write at 10M rows (host cost) | ≤ 5 µs | write 2.5–3.3 µs; read 2.5–3.2 µs compacted, 5.0–5.2 µs with 620k fresh updates in the memtable and level 0, about 0.1 ms cold [measured, 2026-10-10]; read under the 64-agent run's writes at 31–32k inputs/s, over a whole memtable cycle, at the store: mean 2.68–2.72 µs, p99 3.70–3.81 µs, against 2.29–2.34 and 3.54–3.68 alone [measured, 2026-10-13] | passes compacted and under continuous writes; at the edge behind a bulk of fresh writes to the table itself |
 | Query on a follower | ≤ 100 µs | through a node's query path (executor round trip, snapshot, refine in query mode, one actor): median 49 µs and p99 115–175 µs on the JIT, median 87 µs on the interpreter [measured, 2026-10-10]; a follower of three processes, over the former HTTP ingress: p50 0.12–0.23 ms, p99 0.22–0.34 ms client to answer, 86–92 µs of the follower's CPU a query; linearizable, p50 0.36–0.41 ms and 244 µs [measured, 2026-10-13] | met at the median, missed at p99 |
 | Request latency on a quiet node [proposed] | ≤ 5 ms at p99 | one request at a time on one node: about 3 ms in process, the batch's 2 ms linger plus a 0.9 ms synced commit; its execution, 260–340 µs, is idle-core cost [measured, 2026-10-10]; three processes over the former HTTP ingress, one call at a time: p50 2.7 ms, p99 3.3 ms [measured, 2026-10-13] | passes |
-| Merge apply, cost per operation at 1M operations | ≤ 2× the cost at 1k | 1.5–1.8× with an incremental-apply prototype on LWW maps, in memory [measured, 2026-10-08] | the prototype passes; the Merge lane is not built (section 9.4) |
+| Merge apply, cost per operation at 1M operations | ≤ 2× the cost at 1k | 1.5–1.8× with an incremental-apply prototype on LWW maps, in memory [measured, 2026-10-08]; `support/merkle-crdt` on fjall, signatures checked, a node of a batch of 100: 63–68 µs at 1M against 55–99 µs at 1k [measured, 2026-11-03] | the library passes on fjall; no handler runs over it yet (section 9.4) |
 | 1,000 mostly idle Raft groups per node | no thread per group; idle CPU ≤ 5% of one core | 0.16% of a core and 45.6 MiB of RSS per 1,000 idle replicas, on the scale test's nodes (section 14.1) [measured, 2026-10-27] | passes |
 
 - Rows without other hardware named ran on the development desktop, with

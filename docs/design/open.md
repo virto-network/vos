@@ -144,9 +144,13 @@ The scale results are in `core-model.md` §14, "The scale test".
 
 ## The core model's unbuilt parts
 
-- **The merge lane** (`core-model.md` §9.4): incremental apply per scope,
-  author chains, storage-backed CRDT types, masking and read-time
-  filtering per type, and devices running merge handlers locally.
+- **The merge lane** (`core-model.md` §9.4): storage-backed CRDT types,
+  masking and read-time filtering per type (equivocations and removed
+  authors), the authorization rule's epochs and cutoffs, and devices
+  running merge handlers locally. `support/merkle-crdt` applies a scope
+  incrementally with signed author chains, detects equivocations, and
+  fetches in batches from a DAG walk or a cursor, over its fjall store;
+  nothing runs a merge handler over it yet.
 - **Refine on any replica,** with read-set validation (§7.2).
 - **Attestable writes** ("the root after", §9.2, §11.1).
 - **Upgrades:** state migration for actors.

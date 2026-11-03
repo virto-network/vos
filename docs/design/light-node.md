@@ -140,7 +140,7 @@ devices decrypt each other's messages".
 | **local store** | fjall, as the node's, with small caches (8–16 MiB block cache [est]) | `vos-node`'s `store` [built] |
 | **device prover** | the device profile (format 46, then 47 after the levers, §4.4), masked, `Threads::Auto` | `vos-pvm-proof` and `vos-pvm-recair`'s masked device segment, its recursion prover featured out (§7.1) |
 | **node-API client** | the multiplexed `vos-api` client over SSH's `vos-api` subsystem, over an arti onion stream (§6) [E23] | `vos-api` [built] |
-| **sync** | merkle-crdt DAGs of the local actors' Merge fields, its `Store` over fjall, sealed before they leave the device (§3.6) | `support/merkle-crdt` [built, no dependent today] |
+| **sync** | merkle-crdt DAGs of the local actors' Merge fields, its `Store` over fjall, sealed before they leave the device (§3.6) | `support/merkle-crdt` [built: incremental apply, author chains, `FjallStore`, batched fetching; no dependent today] |
 | **MLS** | the user's device group, through `vos-mls` over mls-rs, on the host side, native, never in a guest | `vos-mls` [new]; the storage providers and copy-and-swap adapted from the `messaging` branch (§3.4) |
 | **secrets** | per device, as today: the member secret from the keystore's HMAC; the admin key in the hardware keystore; the sync key and MLS state wrapped after first unlock; a security-key kit through the `hmac-secret` path (§3.5) | `vos-light`'s `secret` [built, extended] |
 | **Tor** | arti's client, one `TorClient` per process | arti (§6) |
@@ -317,10 +317,14 @@ operation and travel inside it.
 - **Operations are versioned:** an operation of a kind a device does not
   know is kept and applied once the device updates, never quarantined, so
   devices on different app versions do not diverge.
-- **Incremental apply** [decided, `core-model.md` §9.4]: only newly
-  fetched nodes are applied, in causal order (about 1.9 µs an operation at
-  1M operations against 8.7 s for today's full rebuild [measured,
-  `core-model.md` §9.4]).
+- **Incremental apply** [decided, `core-model.md` §9.4; built in
+  `support/merkle-crdt`]: only newly fetched nodes are applied, in causal
+  order, one fjall batch an ingest; on fjall a node of a batch costs
+  63–68 µs at 1M operations, most of it the ed25519 check, and a node
+  alone 0.5–0.8 ms, its synced commit [measured, Intel Core Ultra 7 155H, 2026-11-03, `core-model.md`
+  §9.4]. Nodes arriving before their parents, as a cursor serves them,
+  are held until the parents arrive. Equivocations are found at apply and
+  listed; filtering them at read is the types' (8.18a).
 
 ### 3.3 The home and the personal agent
 
@@ -2098,7 +2102,7 @@ version a release and budget an upgrade step each slice.
 | `vos-pvm-final-verifier` | `credential` and `credential-bytes` deleted |
 | `vos-sdk`, `vos-sdk-macros` | `#[attestable(device, reference = …, headroom = …)]`; `#[msg(proven = kernel)]`; in-place kernel arguments; `vos_sdk::p2` (digests, tags, paths); `crdt::{GSet, Set, Map}` and `#[msg(merge)]` on the light node |
 | `vos-wire`, `vos-api` | `Credentialed.claim` in place of `CredentialPublic`; `CredentialedInput` carries the claim; `Principal::Kernel { program }` (index 7); `CredentialKind` deleted; the frame's transport mark (`node-api.md` §2; a missing mark is clearnet, §3.3) |
-| `merkle-crdt` | the incremental apply (`core-model.md` §9.4); the author, its sequence and signature in the payload; a `Store` over fjall; fetching by batch, asynchronously (today's `fetch_missing` walks one node at a time, synchronously, `src/sync.rs`); the `redb` store and feature deleted (one storage engine) |
+| `merkle-crdt` | [built] the incremental apply (`core-model.md` §9.4); the author, its sequence and signature in the payload; a `Store` over fjall (`FjallStore`, the `fjall` feature; the core stays `no_std`); fetching by batch, sans I/O so an asynchronous client drives the round trips (`Replica::want` and `serve` for a DAG walk, `Replica::cursor` and `ingest` for `since`); the `redb` store and feature deleted (one storage engine) |
 | `vos-credentials` | the stock `auth` kernel (from the `device` test actor, in SDK form) and a new `owner` kernel, with their references; each stock guard's compatibility window of program ids (§4.4); the stock kernels' ingress checks stay in the node (§4.3); the registrar's open claim priced by work (§3.3), its person records, `enroll_device` and `revoke_device` (§3.8) |
 | `vos-gateway` | the onion service behind a `tor` feature, serving the same HTTP and SSH as the clearnet and nothing else (§6.1); the SSH `vos-api` subsystem's relay set adding `Call` and `Credentialed`, with caps per connection, circuit, agent and onion; the transport mark on every relayed request; every node of its space listed as an upstream when it serves a home (§3.3) |
 | new system actors | `Homes` (the pool, claims, the indexes by nullifier and by kit key, the yearly re-proof and the lease) and `Personal` (the device set and its contests, liveness, the commit log and confirmations, sealed scopes, checkpoint acknowledgements, the inbox, quotas, gated queries, an append-only layout), each one package; `Payments` (replacing the `purses` test actor) |

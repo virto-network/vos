@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 71d25e3d40e9d417ad874c36b32a272bc934f3a9c9439ade6b1ae37eb250b02a # shrinks to steps = [Record { author: 0, ops: [], pick: 0 }, Record { author: 0, ops: [], pick: 0 }, Record { author: 0, ops: [], pick: 0 }, Record { author: 0, ops: [], pick: 0 }, Record { author: 0, ops: [], pick: 0 }], locals = [(0, 0)], seed = 4557052922108183690

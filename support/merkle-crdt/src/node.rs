@@ -1,27 +1,26 @@
-use crate::{Cid, Decode, Encode, Hasher};
+use crate::{Author, Cid, Decode, Encode, Hasher};
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
-/// A node in the Merkle-DAG.
+/// A node in the Merkle-DAG: a payload and the CIDs of its parents, the
+/// earlier events it follows.
 ///
-/// Each node contains an arbitrary payload and references to its children (previous events).
-/// The node's content identifier ([`Cid`]) is computed by hashing the payload and children,
-/// making the DAG self-verifying and content-addressed.
-///
-/// Corresponds to the node triple `(α, P, C)` from the paper where `α` is the CID,
-/// `P` is the payload, and `C` is the set of children CIDs.
+/// The node's [`Cid`] is the hash of its bytes ([`to_bytes`](Self::to_bytes)),
+/// so the DAG is self-verifying and content-addressed. A node has no author
+/// field: a replica's nodes carry their author in the payload
+/// ([`Signed`](crate::Signed)).
 pub struct DagNode<H: Hasher, P> {
-    /// The payload carried by this node (a CRDT operation or state).
+    /// The payload: in a replica, the author's signed operations.
     pub payload: P,
-    /// CIDs of this node's children (older events / previous roots).
-    pub children: BTreeSet<Cid<H>>,
+    /// The CIDs of the events this node follows.
+    pub parents: BTreeSet<Cid<H>>,
 }
 
 impl<H: Hasher, P: Clone> Clone for DagNode<H, P> {
     fn clone(&self) -> Self {
         Self {
             payload: self.payload.clone(),
-            children: self.children.clone(),
+            parents: self.parents.clone(),
         }
     }
 }
@@ -30,91 +29,101 @@ impl<H: Hasher, P: core::fmt::Debug> core::fmt::Debug for DagNode<H, P> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("DagNode")
             .field("payload", &self.payload)
-            .field("children", &self.children)
+            .field("parents", &self.parents)
             .finish()
     }
 }
 
-impl<H: Hasher, P> DagNode<H, P> {
-    /// Create a new node with the given payload and children.
-    pub fn new(payload: P, children: BTreeSet<Cid<H>>) -> Self {
-        Self { payload, children }
-    }
-
-    /// Create a leaf node (no children).
-    pub fn leaf(payload: P) -> Self {
-        Self {
-            payload,
-            children: BTreeSet::new(),
-        }
-    }
-}
-
 impl<H: Hasher, P: Encode> DagNode<H, P> {
-    /// Compute the content identifier for this node.
-    ///
-    /// The CID is `Hash(len(payload_bytes) || payload_bytes || num_children || child_cids...)`.
-    /// This encoding is deterministic and unambiguous.
+    /// The node's content identifier: the hash of its bytes.
     pub fn cid(&self) -> Cid<H> {
         Cid(H::hash(&self.to_bytes()))
     }
 
-    /// Serialize this node to bytes. The format matches the CID input:
-    /// `[payload_len:u64 LE][payload_bytes][children_count:u64 LE][child_cids...]`
+    /// The node's bytes:
+    /// `[payload_len: u64 LE][payload][parent_count: u64 LE][parent CIDs, ascending]`.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        let payload_bytes = self.payload.encode();
-        buf.extend_from_slice(&(payload_bytes.len() as u64).to_le_bytes());
-        buf.extend_from_slice(&payload_bytes);
-        buf.extend_from_slice(&(self.children.len() as u64).to_le_bytes());
-        for child in &self.children {
-            buf.extend_from_slice(child.as_ref());
+        let payload = self.payload.encode();
+        buf.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&payload);
+        buf.extend_from_slice(&(self.parents.len() as u64).to_le_bytes());
+        for parent in &self.parents {
+            buf.extend_from_slice(parent.as_ref());
         }
         buf
     }
 }
 
 impl<H: Hasher, P: Decode> DagNode<H, P> {
-    /// Deserialize a node from bytes (inverse of `to_bytes`).
+    /// Decode a node from its bytes: the inverse of
+    /// [`to_bytes`](DagNode::to_bytes), refusing trailing bytes and a
+    /// parent named twice.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        let mut pos: usize = 0;
-        let payload_len = {
-            let b = bytes.get(pos..pos.checked_add(8)?)?;
-            pos += 8;
-            u64::from_le_bytes(b.try_into().ok()?) as usize
-        };
-        let payload_end = pos.checked_add(payload_len)?;
-        if payload_end > bytes.len() {
+        let (payload, parents) = split::<H>(bytes)?;
+        Some(DagNode {
+            payload: P::decode(payload)?,
+            parents: distinct(parents)?,
+        })
+    }
+}
+
+/// A node's bytes split into its payload's bytes and its parents, which
+/// are checked for count and order only when collected.
+fn split<H: Hasher>(bytes: &[u8]) -> Option<(&[u8], impl Iterator<Item = Option<Cid<H>>> + '_)> {
+    let (len, rest) = bytes.split_first_chunk::<8>()?;
+    let len = usize::try_from(u64::from_le_bytes(*len)).ok()?;
+    let payload = rest.get(..len)?;
+    let (count, parents) = rest[len..].split_first_chunk::<8>()?;
+    let count = usize::try_from(u64::from_le_bytes(*count)).ok()?;
+    let width = core::mem::size_of::<H::Output>();
+    if parents.len() != count.checked_mul(width)? {
+        return None;
+    }
+    Some((
+        payload,
+        parents
+            .chunks_exact(width)
+            .map(|cid| H::Output::decode(cid).map(Cid)),
+    ))
+}
+
+/// The parents as a set, refusing one named twice.
+fn distinct<H: Hasher>(parents: impl Iterator<Item = Option<Cid<H>>>) -> Option<BTreeSet<Cid<H>>> {
+    let mut set = BTreeSet::new();
+    for parent in parents {
+        if !set.insert(parent?) {
             return None;
         }
-        let payload_bytes = &bytes[pos..payload_end];
-        let mut payload_pos = 0;
-        let payload = P::decode_from(payload_bytes, &mut payload_pos)?;
-        if payload_pos != payload_bytes.len() {
-            return None;
-        }
-        pos = payload_end;
-        let count = {
-            if pos + 8 > bytes.len() {
-                return None;
-            }
-            let b = &bytes[pos..pos + 8];
-            pos += 8;
-            u64::from_le_bytes(b.try_into().ok()?) as usize
-        };
-        let hash_len = core::mem::size_of::<H::Output>();
-        let mut children = BTreeSet::new();
-        for _ in 0..count {
-            if pos + hash_len > bytes.len() {
-                return None;
-            }
-            let h = H::Output::decode_from(bytes, &mut pos)?;
-            children.insert(Cid(h));
-        }
-        if pos != bytes.len() || children.len() != count {
-            return None;
-        }
-        Some(DagNode { payload, children })
+    }
+    Some(set)
+}
+
+/// What a node's bytes say in clear without decoding its operations: its
+/// author, sequence number and parents. A peer serving the DAG reads only
+/// this; the operations and the signature are its reader's to check.
+#[derive(Debug)]
+pub struct Header<H: Hasher> {
+    /// The author's key.
+    pub author: Author,
+    /// The author's sequence number.
+    pub seq: u64,
+    /// The node's parents.
+    pub parents: BTreeSet<Cid<H>>,
+}
+
+impl<H: Hasher> Header<H> {
+    /// Read the header of a replica's node bytes
+    /// (`DagNode<H, Signed<O>>`) of any operation type.
+    pub fn read(bytes: &[u8]) -> Option<Self> {
+        let (payload, parents) = split::<H>(bytes)?;
+        let (author, rest) = payload.split_first_chunk::<32>()?;
+        let (seq, _) = rest.split_first_chunk::<8>()?;
+        Some(Header {
+            author: Author(*author),
+            seq: u64::from_le_bytes(*seq),
+            parents: distinct(parents)?,
+        })
     }
 }
 
@@ -135,20 +144,30 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_truncation_trailing_bytes_and_duplicate_children() {
+    fn decode_rejects_truncation_trailing_bytes_and_duplicate_parents() {
         assert!(DagNode::<TestHasher, u64>::from_bytes(&[]).is_none());
-        let node = DagNode::<TestHasher, u64>::leaf(7);
+        let node = DagNode::<TestHasher, u64> {
+            payload: 7,
+            parents: BTreeSet::new(),
+        };
         let mut trailing = node.to_bytes();
         trailing.push(0);
         assert!(DagNode::<TestHasher, u64>::from_bytes(&trailing).is_none());
 
-        let child = Cid::<TestHasher>([1; 32]);
+        let parent = Cid::<TestHasher>([1; 32]);
         let mut duplicate = Vec::new();
         duplicate.extend_from_slice(&8u64.to_le_bytes());
         duplicate.extend_from_slice(&7u64.to_le_bytes());
         duplicate.extend_from_slice(&2u64.to_le_bytes());
-        duplicate.extend_from_slice(child.as_ref());
-        duplicate.extend_from_slice(child.as_ref());
+        duplicate.extend_from_slice(parent.as_ref());
+        duplicate.extend_from_slice(parent.as_ref());
         assert!(DagNode::<TestHasher, u64>::from_bytes(&duplicate).is_none());
+        assert!(Header::<TestHasher>::read(&duplicate).is_none());
+
+        let mut huge = Vec::new();
+        huge.extend_from_slice(&8u64.to_le_bytes());
+        huge.extend_from_slice(&7u64.to_le_bytes());
+        huge.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert!(DagNode::<TestHasher, u64>::from_bytes(&huge).is_none());
     }
 }

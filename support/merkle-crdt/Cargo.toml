@@ -1,6 +1,6 @@
 [package]
 name = "merkle-crdt"
-description = "Generic no_std implementation of Merkle-CRDTs: Merkle-DAGs meet CRDTs. Used by VOS for the `crdt` consistency mode."
+description = "Generic no_std Merkle-CRDTs: a DAG of signed, authored nodes per sync scope, applied incrementally in causal order, fetched in batches from a peer that walks the DAG or from a cursor over a server that cannot. Used by VOS for the Merge lane."
 keywords = ["crdt", "merkle", "no-std", "p2p", "vos"]
 categories = ["data-structures", "no-std", "algorithms"]
 version.workspace = true
@@ -11,12 +11,21 @@ homepage.workspace = true
 authors.workspace = true
 
 [features]
-default = ["std"]
-std = []
-redb = ["std", "dep:redb"]
+default = ["fjall"]
+std = ["ed25519-dalek/std"]
+# The `Store` over fjall, the light node's database.
+fjall = ["std", "dep:fjall"]
 
 [dependencies]
-redb = { version = "2", optional = true }
+# Each node's author signature.
+ed25519-dalek = { version = "2", default-features = false, features = ["fast", "zeroize"] }
+fjall = { workspace = true, optional = true }
 
 [dev-dependencies]
-sha2 = "0.10"
+blake2 = "0.10"
+proptest = "1"
+tempfile = "3"
+
+[[bench]]
+name = "apply"
+harness = false
