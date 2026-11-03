@@ -1,68 +1,58 @@
 //! # Merkle-CRDTs
 //!
-//! A generic `no_std` implementation of [Merkle-CRDTs](https://arxiv.org/abs/2004.00107),
-//! a transport and persistence layer for Conflict-Free Replicated Data Types (CRDTs) built
-//! on Merkle-DAGs.
+//! A `no_std` implementation of [Merkle-CRDTs](https://arxiv.org/abs/2004.00107):
+//! one scope's operations as a Merkle-DAG, each node a batch of operations
+//! signed by its author, applied to a storage-backed CRDT in causal order.
 //!
-//! ## Key Ideas
+//! - **Nodes** ([`Node`]) are content-addressed: a node's [`Cid`] is the
+//!   hash of its bytes, and it names its parents by theirs. Its payload
+//!   ([`Signed`]) carries its author's key, the author's sequence number
+//!   and an ed25519 signature over the operations and the parents.
+//! - **A replica** ([`Replica`]) applies only the nodes it has not applied,
+//!   in causal order, onto the rows it already has; a node whose parents
+//!   are missing is held until they arrive. A local operation is applied
+//!   in place. Each batch is one atomic [`Store`] commit.
+//! - **Authors' chains**: an author numbers its nodes from 0, each naming
+//!   the previous among its parents. Two nodes at one number are an
+//!   [`Equivocation`]: both kept, reported, and filtered by the CRDT's reads.
+//! - **Fetching** is batched ([`sync`]): from a peer that walks the DAG,
+//!   by wanted CIDs and each author's highest number, or from a cursor over
+//!   a server that only numbers what it accepted.
+//! - **The CRDT** ([`Apply`]) writes only through [`Rows`], so its state
+//!   commits with the nodes it came from; [`rebuild`] replays a whole DAG
+//!   for recovery and audits.
 //!
-//! - **Merkle-Clock**: A Merkle-DAG used as a logical clock. Each node represents an event,
-//!   and new events become root nodes pointing to previous roots. Merging two clocks is
-//!   simply the union of their DAG node sets — a Grow-Only Set (G-Set) CRDT.
+//! The DAG gives causal delivery, not convergence: [`Apply`] must give the
+//! same rows for every causal order of the same nodes.
 //!
-//! - **Merkle-CRDT**: A Merkle-Clock whose nodes carry CRDT payloads. The DAG structure
-//!   provides causal ordering, content-addressing enables efficient sync, and the whole
-//!   system works without coordination between replicas.
-//!
-//! The Merkle-DAG is causal transport and durable storage; it does **not** make an
-//! arbitrary payload convergent. `Payload::apply` must itself implement a CRDT whose
-//! result is independent of every valid causal replay order. Command logs that overwrite
-//! ordinary mutable state are not CRDTs.
-//!
-//! ## Properties
-//!
-//! - **Transport-agnostic**: works over any network (DHT, PubSub, sneakernet)
-//! - **No coordination**: replicas operate independently, sync when convenient
-//! - **Self-verifying**: content-addressed nodes can be fetched from untrusted sources
-//! - **Cryptographic deduplication**: identical events have identical CIDs
-//! - **Cryptographic causal ordering**: the DAG encodes happened-before relationships
-//!
-//! ## Quick Example
-//!
-//! ```rust
-//! use merkle_crdt::*;
+//! ```
+//! use merkle_crdt::{Event, Hasher, MemStore, Replica, Rows};
+//! use ed25519_dalek::SigningKey;
 //!
 //! # struct H; impl Hasher for H { type Output = [u8; 32]; fn hash(d: &[u8]) -> [u8; 32] {
-//! #   let mut o = [0u8; 32]; for (i, b) in d.iter().enumerate() { o[i % 32] ^= b; } o
+//! #   let mut o = [0u8; 32]; for (i, b) in d.iter().enumerate() { o[i % 32] ^= b.rotate_left(i as u32 % 8); } o
 //! # }}
-//! // Define your CRDT operation
-//! #[derive(Clone, Debug)]
-//! struct AddItem(String);
-//!
-//! impl Encode for AddItem {
-//!     fn encode_to(&self, buf: &mut Vec<u8>) { self.0.encode_to(buf); }
+//! // A grow-only set of strings, one row an element.
+//! fn add(event: Event<'_, H, String>, rows: &mut dyn Rows) {
+//!     rows.write(event.ops.as_bytes(), Some(&[]));
 //! }
 //!
-//! impl Payload for AddItem {
-//!     type State = std::collections::BTreeSet<String>;
-//!     fn apply(state: &mut Self::State, op: &Self) { state.insert(op.0.clone()); }
-//! }
+//! let phone_key = SigningKey::from_bytes(&[1; 32]);
+//! let laptop_key = SigningKey::from_bytes(&[2; 32]);
+//! let mut phone = Replica::<H, String, _>::open(MemStore::new()).unwrap();
+//! let mut laptop = Replica::<H, String, _>::open(MemStore::new()).unwrap();
 //!
-//! // Create two independent replicas
-//! let mut alice: MerkleCrdt<H, AddItem, MemStore<H, AddItem>> = MerkleCrdt::default();
-//! let mut bob: MerkleCrdt<H, AddItem, MemStore<H, AddItem>> = MerkleCrdt::default();
+//! phone.record(&phone_key, "eggs".into(), &mut add).unwrap();
+//! laptop.record(&laptop_key, "milk".into(), &mut add).unwrap();
 //!
-//! alice.apply(AddItem("apple".into())).unwrap();
-//! bob.apply(AddItem("banana".into())).unwrap();
+//! // Each pushes its outbox; the other ingests it, in one batch.
+//! let to_laptop = phone.outbox().unwrap().into_iter().map(|node| node.bytes);
+//! let to_phone = laptop.outbox().unwrap().into_iter().map(|node| node.bytes);
+//! laptop.ingest(to_laptop, None, &mut add).unwrap();
+//! phone.ingest(to_phone, None, &mut add).unwrap();
 //!
-//! // Sync (in any order, any number of times)
-//! let bob_roots: Vec<_> = bob.roots().iter().cloned().collect();
-//! for root in bob_roots { alice.sync(&root, bob.store()).unwrap(); }
-//! let alice_roots: Vec<_> = alice.roots().iter().cloned().collect();
-//! for root in alice_roots { bob.sync(&root, alice.store()).unwrap(); }
-//!
-//! // Both replicas converge to the same state
-//! assert_eq!(alice.state(), bob.state());
+//! assert_eq!(phone.store().rows(), laptop.store().rows());
+//! assert_eq!(phone.heads(), laptop.heads());
 //! ```
 
 #![no_std]
@@ -73,65 +63,29 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+mod apply;
 mod cid;
-mod clock;
-mod crdt;
 mod encode;
 mod hasher;
 mod node;
+mod rebuild;
+mod replica;
+mod signed;
 mod store;
 pub mod sync;
 
+#[cfg(feature = "fjall")]
+mod store_fjall;
+
+pub use apply::{Apply, Event, Rows};
 pub use cid::Cid;
-pub use clock::MerkleClock;
-pub use crdt::{MerkleCrdt, Payload};
 pub use encode::{Decode, Encode};
 pub use hasher::Hasher;
-pub use node::DagNode;
-pub use store::{MemStore, Store};
-pub use sync::{AcceptAll, NodeValidator};
+pub use node::{DagNode, Header};
+pub use rebuild::{Rebuilt, rebuild};
+pub use replica::{Equivocation, Error, Ingested, Outgoing, Replica};
+pub use signed::{Author, Node, Refusal, Signed, message, validate};
+pub use store::{Applied, Changes, Loaded, MemStore, Store};
 
-#[cfg(feature = "redb")]
-mod store_redb;
-#[cfg(feature = "redb")]
-pub use store_redb::{RedbStore, RedbStoreError};
-
-/// Error type for single-store operations.
-#[derive(Debug)]
-pub enum Error<E> {
-    /// An error from the underlying store.
-    Store(E),
-    /// A referenced node was not found.
-    MissingNode,
-    /// Stored bytes do not match the content identifier under which they were found.
-    InvalidCid,
-    /// A stored node failed the application-provided author or payload policy.
-    InvalidAuthor,
-}
-
-impl<E> From<E> for Error<E> {
-    fn from(e: E) -> Self {
-        Error::Store(e)
-    }
-}
-
-impl<E: core::fmt::Display> core::fmt::Display for Error<E> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Error::Store(e) => write!(f, "store error: {e}"),
-            Error::MissingNode => write!(f, "referenced node not found in store"),
-            Error::InvalidCid => write!(f, "stored node CID verification failed"),
-            Error::InvalidAuthor => write!(f, "stored node author validation failed"),
-        }
-    }
-}
-
-#[cfg(feature = "std")]
-impl<E: std::error::Error + 'static> std::error::Error for Error<E> {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Error::Store(e) => Some(e),
-            Error::MissingNode | Error::InvalidCid | Error::InvalidAuthor => None,
-        }
-    }
-}
+#[cfg(feature = "fjall")]
+pub use store_fjall::{FjallError, FjallStore};

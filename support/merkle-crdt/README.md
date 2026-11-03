@@ -1,97 +1,54 @@
 # merkle-crdt
 
-Sync shared data between devices without a central server or leader.
+One sync scope's operations as a Merkle-DAG of signed nodes, applied
+incrementally to a storage-backed CRDT. `no_std`; the fjall store is behind
+the default `fjall` feature.
 
-## The problem
+Based on H. Sanjuán, S. Pöyhtäri, P. Teixeira, I. Psaras, *"Merkle-CRDTs:
+Merkle-DAGs meet CRDTs"*, 2020 ([arXiv:2004.00107](https://arxiv.org/abs/2004.00107)).
+VOS uses it for the Merge lane (`docs/design/core-model.md` §9.4) and the
+light node's sealed scopes (`docs/design/light-node.md` §3.6).
 
-When multiple devices or users edit the same data (a document, a shopping list, a database),
-someone needs to decide the order of changes. Traditional approaches elect a "leader" to
-collect and order everyone's edits — but the leader is a bottleneck, requires reliable
-connectivity, and if it goes down the whole system stalls.
+## The model
 
-## The solution
+- **A node** (`Node<H, O>` = `DagNode<H, Signed<O>>`) is content-addressed:
+  its CID is the hash of its canonical bytes, and it names its parents by
+  theirs. The payload carries the author's ed25519 key, the author's
+  sequence number, a signature over the operations and the parents, and the
+  operations.
+- **Authors' chains:** an author numbers its nodes from 0; each later node
+  names the author's previous one among its parents. A node that does not is
+  refused, with its descendants. Two nodes at one number are an
+  equivocation: both applied, reported once, and listed for the CRDT's reads
+  to filter.
+- **A replica** (`Replica`) keeps in memory only the heads, each author's
+  latest number, the equivocations, the cursor, the outbox and the held
+  nodes' missing parents. `ingest` checks each node statelessly (`validate`:
+  canonical bytes, CID, strict signature), then applies only the new nodes,
+  in causal order, onto the current rows, holding (durably) those whose
+  parents have not arrived. `record` applies a local operation in place.
+  Each is one atomic `Store` commit: nodes, index, heads, cursor, outbox and
+  the CRDT's rows together.
+- **The CRDT** (`Apply`) reads and writes rows through `Rows` only, so its
+  state commits with the nodes it came from. Its result must not depend on
+  the order of concurrent nodes. `rebuild` replays a whole DAG from nothing,
+  for recovery and audits.
+- **Fetching** (`sync`), in batches, sans I/O: `Replica::wanted` and
+  `Replica::have` say what to ask a peer that walks the DAG (`serve` answers
+  up to a byte budget), and `Replica::cursor` where to read a feed that only
+  numbers what it accepted (`since(position)`); `ingest` takes what came
+  back. `Replica::sync` and `Replica::catch_up` drive both over blocking
+  `Source` and `Feed` implementations.
 
-This crate implements [Merkle-CRDTs](https://arxiv.org/abs/2004.00107), which eliminate the
-need for a leader entirely. Every participant keeps their own copy and edits freely — even
-offline. When two participants reconnect, they sync by exchanging a single hash (a "root CID")
-and fetching only what they're missing. The data structure guarantees everyone converges to the
-same state regardless of sync order, timing, or network topology.
+## Stores
 
-This works because of two ideas combined:
-
-- **CRDTs** (Conflict-free Replicated Data Types) — data structures designed so that concurrent
-  edits always merge cleanly without conflicts.
-- **Merkle-DAGs** (hash-linked graphs) — every edit is hashed and linked to previous edits,
-  creating a tamper-proof history where you can efficiently find what's new.
-
-The hash-linked history acts as a logical clock that replaces version vectors, leader election,
-and consensus protocols.
-
-## Properties
-
-- **No leader, no coordination** — every replica is equal, edits locally, syncs when convenient
-- **Works over any transport** — TCP, UDP, Bluetooth, USB stick, carrier pigeon
-- **Self-verifying** — data can be fetched from untrusted sources, the hash proves correctness
-- **Efficient sync** — only missing pieces are transferred, shared history is skipped
-- **`no_std`** — runs on embedded devices, WASM, or servers with zero required dependencies
-
-## Quick example
-
-```rust
-use merkle_crdt::*;
-
-// Define what an "edit" looks like
-#[derive(Clone, Debug)]
-struct AddItem(String);
-
-impl Encode for AddItem {
-    fn encode_to(&self, buf: &mut Vec<u8>) { self.0.encode_to(buf); }
-}
-
-impl Payload for AddItem {
-    type State = std::collections::BTreeSet<String>;
-    fn apply(state: &mut Self::State, op: &Self) { state.insert(op.0.clone()); }
-}
-
-// Two devices working independently
-let mut phone: MerkleCrdt<MyHasher, AddItem, MemStore<_, _>> = MerkleCrdt::default();
-let mut laptop: MerkleCrdt<MyHasher, AddItem, MemStore<_, _>> = MerkleCrdt::default();
-
-phone.apply(AddItem("eggs".into())).unwrap();
-laptop.apply(AddItem("milk".into())).unwrap();
-
-// Later, they sync (in any order, any number of times)
-for root in phone.roots().clone() { laptop.sync(&root, phone.store()).unwrap(); }
-for root in laptop.roots().clone() { phone.sync(&root, laptop.store()).unwrap(); }
-
-// Both have the same list: {"eggs", "milk"}
-assert_eq!(phone.state(), laptop.state());
-```
-
-## Use cases
-
-- **P2P collaboration** — real-time document editing without a central server
-- **Offline-first apps** — edit while disconnected, sync seamlessly when back online
-- **IoT networks** — sensor data from devices that connect intermittently
-- **Distributed databases** — replicated key-value stores across data centers
-- **Encrypted group sync** — combine with MLS/Megolm for private collaborative spaces
-
-## Crate structure
-
-| Trait / Type | Role |
+| Store | |
 |---|---|
-| `Hasher` | Pluggable hash function (SHA-256, BLAKE3, etc.) |
-| `Encode` | Deterministic serialization for content addressing |
-| `Store` | Where nodes live (memory, disk, IPFS, network) |
-| `Payload` | Your CRDT logic (what an edit does to the state) |
-| `MerkleClock` | Low-level DAG clock — tracks roots, records events, merges |
-| `MerkleCrdt` | High-level wrapper — clock + store + automatic state tracking |
-| `sync::fetch_missing` | Anti-entropy algorithm — find and fetch what's missing |
+| `MemStore` | in memory: tests, benchmarks |
+| `FjallStore` | one scope in keyspaces `<name>.*` of a fjall database the caller opens and may share; its rows in `<name>.rows` or a keyspace the caller names; each commit one synced batch |
 
-## Based on
+## Cost
 
-> H. Sanjuán, S. Pöyhtäri, P. Teixeira, I. Psaras.
-> *"Merkle-CRDTs: Merkle-DAGs meet CRDTs"*, 2020.
-> [arXiv:2004.00107](https://arxiv.org/abs/2004.00107)
-
-License: MIT OR Apache-2.0
+`cargo bench -p merkle-crdt --bench apply` measures applying one node, a
+batch of 100 and a local operation onto 1k, 100k and 1M operations; the
+results are recorded in `docs/design/core-model.md` §9.4.

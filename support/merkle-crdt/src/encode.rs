@@ -4,7 +4,10 @@ const MAX_DECODE_ITEMS: usize = 1_000_000;
 
 /// Deterministic serialization for CID computation.
 ///
-/// Implementations must produce identical output for identical values.
+/// Implementations must produce identical output for identical values, and
+/// [`Decode`] must accept only that output: a node is refused unless its
+/// bytes re-encode to themselves, so no second encoding of one node gets a
+/// second CID.
 /// Variable-length types should be length-prefixed to ensure unambiguous encoding
 /// when composed (e.g. in tuples).
 pub trait Encode {
@@ -97,16 +100,6 @@ impl<T: Encode + Ord> Encode for alloc::collections::BTreeSet<T> {
     }
 }
 
-impl<K: Encode + Ord, V: Encode> Encode for alloc::collections::BTreeMap<K, V> {
-    fn encode_to(&self, buf: &mut Vec<u8>) {
-        buf.extend_from_slice(&(self.len() as u64).to_le_bytes());
-        for (k, v) in self {
-            k.encode_to(buf);
-            v.encode_to(buf);
-        }
-    }
-}
-
 impl<T: Encode> Encode for Option<T> {
     fn encode_to(&self, buf: &mut Vec<u8>) {
         match self {
@@ -164,7 +157,11 @@ impl Decode for () {
 
 impl Decode for bool {
     fn decode_from(buf: &[u8], pos: &mut usize) -> Option<Self> {
-        Some(*take(buf, pos, 1)?.first()? != 0)
+        match *take(buf, pos, 1)?.first()? {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
     }
 }
 
@@ -227,7 +224,8 @@ impl<T: Decode> Decode for Option<T> {
     fn decode_from(buf: &[u8], pos: &mut usize) -> Option<Self> {
         match *take(buf, pos, 1)?.first()? {
             0 => Some(None),
-            _ => Some(Some(T::decode_from(buf, pos)?)),
+            1 => Some(Some(T::decode_from(buf, pos)?)),
+            _ => None,
         }
     }
 }
@@ -255,6 +253,13 @@ mod tests {
         let mut pos = usize::MAX;
         assert_eq!(take(&[], &mut pos, 1), None);
         assert_eq!(pos, usize::MAX);
+    }
+
+    #[test]
+    fn only_canonical_tags_decode() {
+        assert_eq!(bool::decode(&[2]), None);
+        assert_eq!(Option::<u8>::decode(&[2, 0]), None);
+        assert_eq!(Option::<u8>::decode(&[1, 7]), Some(Some(7)));
     }
 
     #[test]

@@ -9,14 +9,14 @@ use core::fmt::Debug;
 /// # Example
 ///
 /// ```
-/// use sha2::{Sha256, Digest};
+/// use blake2::{digest::consts::U32, Blake2b, Digest};
 ///
-/// struct Sha256Hasher;
+/// struct Blake2b256;
 ///
-/// impl merkle_crdt::Hasher for Sha256Hasher {
+/// impl merkle_crdt::Hasher for Blake2b256 {
 ///     type Output = [u8; 32];
 ///     fn hash(data: &[u8]) -> [u8; 32] {
-///         Sha256::new().chain_update(data).finalize().into()
+///         Blake2b::<U32>::digest(data).into()
 ///     }
 /// }
 /// ```

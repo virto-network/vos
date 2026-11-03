@@ -200,6 +200,20 @@ opt-level = 3
 opt-level = 3
 [profile.test.package.ppv-lite86]
 opt-level = 3
+# Ed25519 signing and strict verification: merkle-crdt's suites sign and
+# check every node of thousands of generated DAGs.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+[profile.test.package.curve25519-dalek]
+opt-level = 3
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+[profile.test.package.ed25519-dalek]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.test.package.sha2]
+opt-level = 3
 
 [workspace.dependencies]
 # Exact: the workspace nightly is a 1.90 pre-release, which a later fjall

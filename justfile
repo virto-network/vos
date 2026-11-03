@@ -532,8 +532,9 @@ check-no-store-dump: (_forbidden "store-dump")
 check-no-heap-peak: (_forbidden "heap-peak")
     print "no heap peak in a production build"
 
-# The builds without std. vos-raft for an embedded target, on core and alloc
-# alone, built from the toolchain's source. The proof verifier, which reads
+# The builds without std. vos-raft and merkle-crdt (without its fjall store)
+# for an embedded target, on core and alloc alone, built from the
+# toolchain's source. The proof verifier, which reads
 # every admitted format, with the proof crate's verifier path under it: both are `no_std`
 # crates, so a `std` path in either fails the build. The verifier builds for
 # the same embedded target, where no dependency has std either, and for
@@ -558,6 +559,7 @@ check-no-heap-peak: (_forbidden "heap-peak")
 # `blobs.lock` (`check-blobs`).
 check-no-std:
     cargo build -p vos-raft --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
+    cargo build -p merkle-crdt --no-default-features --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
     cargo build -p vos-pvm-proof-verifier --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
     cargo build -p vos-pvm-proof-verifier --target wasm32-unknown-unknown
     cargo build -p vos-pvm-final-verifier --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
