@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use futures_lite::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::{Event, Framing, Reader, frame};
+use crate::{Event, Framing, Mark, Reader, marked};
 
 /// An answer frame's kind and body.
 pub type Answer = (u16, Vec<u8>);
@@ -120,8 +120,10 @@ impl Drop for Waiting<'_> {
 }
 
 impl Multiplexed {
-    /// Send a request of `kind` holding `body`: its answer, once it comes.
-    pub async fn request(&self, kind: u16, body: &[u8]) -> Result<Answer, Closed> {
+    /// Send a request of `kind` marked `mark` holding `body`: its answer,
+    /// once it comes. Only a gateway marks a request it relays; every other
+    /// client sends [`Mark::Unmarked`].
+    pub async fn request(&self, kind: u16, mark: Mark, body: &[u8]) -> Result<Answer, Closed> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = async_channel::bounded(1);
         match self.pending.lock().expect("the pending requests").as_mut() {
@@ -133,7 +135,7 @@ impl Multiplexed {
             id,
         };
         self.frames
-            .send(frame(Framing::Stream, kind, id, body))
+            .send(marked(Framing::Stream, kind, mark, id, body))
             .await
             .map_err(|_| Closed::Ended)?;
         receiver.recv().await.map_err(|_| Closed::Ended)
@@ -170,16 +172,23 @@ mod tests {
                 }
                 // The second answered first.
                 for request in seen.iter().rev() {
-                    let answer = frame(Framing::Stream, request.kind, request.id, &request.body);
+                    let answer =
+                        crate::frame(Framing::Stream, request.kind, request.id, &request.body);
                     theirs.write_all(&answer).await.unwrap();
                 }
+                let mut seen: Vec<_> = seen.into_iter().map(|r| (r.body[0], r.mark)).collect();
+                seen.sort_by_key(|(first, _)| *first);
+                seen.into_iter().map(|(_, mark)| mark).collect()
             });
-            let first = client.request(crate::Kind::AgentInfo as u16, &[1, 0, 0, 0]);
-            let second = client.request(crate::Kind::AgentInfo as u16, &[2, 0, 0, 0]);
+            let first =
+                client.request(crate::Kind::AgentInfo as u16, Mark::Unmarked, &[1, 0, 0, 0]);
+            let second = client.request(crate::Kind::AgentInfo as u16, Mark::Onion, &[2, 0, 0, 0]);
             let (first, second) = futures_lite::future::zip(first, second).await;
             assert_eq!(first.unwrap().1, [1, 0, 0, 0]);
             assert_eq!(second.unwrap().1, [2, 0, 0, 0]);
-            server.await;
+            // Each request went with its own mark.
+            let marks: Vec<Mark> = server.await;
+            assert_eq!(marks, [Mark::Unmarked, Mark::Onion]);
             drop(client);
             reading.cancel().await;
         });
@@ -192,13 +201,15 @@ mod tests {
             let (ours, theirs) = smol::net::unix::UnixStream::pair().unwrap();
             let (client, reading) = multiplexed(ours.clone(), ours);
             let reading = smol::spawn(reading);
-            let asked = client.request(crate::Kind::Time as u16, &[]);
+            let asked = client.request(crate::Kind::Time as u16, Mark::Unmarked, &[]);
             drop(theirs);
             assert_eq!(asked.await, Err(Closed::Ended));
             reading.await;
             assert!(client.is_closed());
             assert_eq!(
-                client.request(crate::Kind::Time as u16, &[]).await,
+                client
+                    .request(crate::Kind::Time as u16, Mark::Unmarked, &[])
+                    .await,
                 Err(Closed::Ended)
             );
         });

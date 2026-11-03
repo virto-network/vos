@@ -276,7 +276,7 @@ async fn request(
             let large = large.take().map(|place| Box::new(place) as LargePlace);
             // On the node's thread, as every request is handled.
             let answer = runtime
-                .spawn(async move { api.handle(kind, request.body, large).await })
+                .spawn(async move { api.handle(kind, request.mark, request.body, large).await })
                 .await;
             frame(Framing::Quic, request.kind, 0, &answer)
         }

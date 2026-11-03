@@ -4944,6 +4944,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "vos-api",
  "vos-gateway",
  "vos-net",
  "vos-node",

@@ -170,7 +170,7 @@ async fn connection(
                     let runtime = Arc::clone(&api.inner.runtime);
                     let large = large.take().map(|place| Box::new(place) as LargePlace);
                     requests.push(runtime.spawn(async move {
-                        let answer = api.handle(kind, request.body, large).await;
+                        let answer = api.handle(kind, request.mark, request.body, large).await;
                         let bytes = frame(Framing::Stream, request.kind, request.id, &answer);
                         // Written whole: an answer never interleaves another.
                         let _ = writer.lock().await.write_all(&bytes).await;

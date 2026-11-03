@@ -261,6 +261,7 @@ fn the_install_reserve_and_record_price_cover_the_largest_install() {
     let schema = Schema {
         methods,
         credentials: false,
+        admission: Default::default(),
     };
     let section = schema.section();
     assert!(section.len() - 8 <= MAX_LEN && section.len() - 8 > MAX_LEN - 4096);

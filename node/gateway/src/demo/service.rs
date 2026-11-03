@@ -15,6 +15,8 @@ struct Space {
 pub struct Service {
     demo: Demo,
     gateway: Arc<Gateway>,
+    /// The transport of the port the screens are served on.
+    mark: Mark,
     app: Arc<AppClient>,
     space: OnceCell<Space>,
     /// The app key's session with the agent and its next sequence: one
@@ -117,10 +119,11 @@ fn response(answer: &Response, errors: Errors) -> Result<Vec<u8>, String> {
 }
 
 impl Service {
-    pub fn new(demo: Demo, gateway: Arc<Gateway>, app: Arc<AppClient>) -> Self {
+    pub fn new(demo: Demo, gateway: Arc<Gateway>, mark: Mark, app: Arc<AppClient>) -> Self {
         Self {
             demo,
             gateway,
+            mark,
             app,
             space: OnceCell::new(),
             session: Mutex::new(None),
@@ -132,7 +135,7 @@ impl Service {
     }
 
     async fn time(&self) -> Result<u64, HostServiceError> {
-        let body = answered(self.gateway.relay(Kind::Time, &[]).await)?;
+        let body = answered(self.gateway.relay(Kind::Time, self.mark, &[]).await)?;
         u64::decode_exact(&body).ok_or_else(|| failed("the node's time does not decode"))
     }
 
@@ -141,7 +144,7 @@ impl Service {
             .get_or_try_init(|| async {
                 let body = answered(
                     self.gateway
-                        .relay(Kind::AgentInfo, &self.agent().encode())
+                        .relay(Kind::AgentInfo, self.mark, &self.agent().encode())
                         .await,
                 )?;
                 let info = Option::<AgentInfo>::decode_exact(&body)
@@ -364,7 +367,11 @@ impl Service {
                 "the request names another agent or method than this screen's",
             ));
         }
-        let answer = answered(self.gateway.relay(Kind::Credentialed, body).await)?;
+        let answer = answered(
+            self.gateway
+                .relay(Kind::Credentialed, self.mark, body)
+                .await,
+        )?;
         let answer = Response::decode_exact(&answer)
             .ok_or_else(|| failed("an answer that does not decode"))?;
         let root_unknown = matches!(

@@ -159,6 +159,7 @@ enum Row {
     Credentials = 0x26,
     Binding = 0x27,
     Once = 0x28,
+    Admission = 0x29,
 }
 
 /// The root builder's rows, each tagged after [`Owner::Tree`]: the rows of
@@ -496,6 +497,24 @@ pub fn member(principal: &Principal) -> Vec<u8> {
 /// guards read: written by the actor's install, once.
 pub fn credentials() -> Vec<u8> {
     Row::Credentials.prefix().to_vec()
+}
+
+/// What the agent's ingress asks of its requests
+/// ([`crate::records::Admitting`]): written by the install of the actor
+/// that declares it.
+pub fn admission() -> Vec<u8> {
+    Row::Admission.prefix().to_vec()
+}
+
+/// The row of `key` in the [`crate::schema::ADMITTED`] table of the actor
+/// at `instance`, hashed: present when the agent admits the key to create
+/// a session.
+pub fn admitted(instance: InstanceId, key: &[u8; 32]) -> Vec<u8> {
+    let rows = Rows::Table {
+        tag: crate::ids::derive_id("vos/table/", crate::schema::ADMITTED),
+        transform: Transform::Hashed,
+    };
+    row(instance, rows, key).expect("a hashed row's key")
 }
 
 /// A credentialed call's binding digest `b`, recorded at its apply with its

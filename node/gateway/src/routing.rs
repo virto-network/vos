@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use vos_api::client::Answer;
-use vos_api::{FRAME_ERROR, FrameError, Kind};
+use vos_api::{FRAME_ERROR, FrameError, Kind, Mark};
 use vos_wire::ingress::{Contact, OperatorRefusal, Rejection, Response};
 use vos_wire::{Decode, Encode};
 
@@ -59,9 +59,11 @@ impl Gateway {
             .position(|upstream| upstream.key == *key)
     }
 
-    /// A request of `kind` holding `body`, relayed to the node it goes to:
-    /// the answer frame's kind and body.
-    pub async fn relay(&self, kind: Kind, body: &[u8]) -> Answer {
+    /// A request of `kind` holding `body`, relayed to the node it goes to
+    /// marked `mark`, the transport it came in on: the answer frame's kind
+    /// and body. Whatever a client's own frame was marked, the relay marks
+    /// it anew.
+    pub async fn relay(&self, kind: Kind, mark: Mark, body: &[u8]) -> Answer {
         if self.upstreams.is_empty() {
             return unavailable();
         }
@@ -72,7 +74,7 @@ impl Gateway {
                 .get(..32)
                 .and_then(|node| <[u8; 32]>::try_from(node).ok());
             return match node.and_then(|node| self.by_key(&node)) {
-                Some(at) => self.send(at, kind, body).await,
+                Some(at) => self.send(at, kind, mark, body).await,
                 None => (
                     kind as u16,
                     Response::Rejected(Rejection::Operator(OperatorRefusal::OtherNode)).encode(),
@@ -91,7 +93,7 @@ impl Gateway {
         let mut at = learned.unwrap_or_else(|| self.next());
         let mut redirects = 0;
         loop {
-            let answer = self.send(at, kind, body).await;
+            let answer = self.send(at, kind, mark, body).await;
             if !matches!(kind, Kind::Call | Kind::Query | Kind::Workflow) || answer.0 != kind as u16
             {
                 return answer;
@@ -134,9 +136,9 @@ impl Gateway {
             .unwrap_or(first % count)
     }
 
-    async fn send(&self, at: usize, kind: Kind, body: &[u8]) -> Answer {
+    async fn send(&self, at: usize, kind: Kind, mark: Mark, body: &[u8]) -> Answer {
         self.sent.fetch_add(1, Ordering::Relaxed);
-        match self.upstreams[at].request(kind as u16, body).await {
+        match self.upstreams[at].request(kind as u16, mark, body).await {
             Ok(answer) => answer,
             Err(error) => {
                 tracing::debug!(%error, "a node gave no answer");

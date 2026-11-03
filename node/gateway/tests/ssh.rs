@@ -2,7 +2,7 @@
 //! key: the relay set relayed and the node's time through it; any other
 //! kind refused `NotRelayed`, the channel closed and no node asked; a node
 //! gone answered `Unavailable` with the channel kept; at most 16 requests
-//! in flight a channel.
+//! in flight a channel; each frame marked with its port's transport.
 
 #![cfg(feature = "ssh")]
 
@@ -70,14 +70,25 @@ fn served() -> Served {
 
 /// An SSH port relaying to the node at `socket`, and its address.
 async fn port(key: [u8; 32], socket: PathBuf) -> std::net::SocketAddr {
+    port_marked(key, socket, vos_api::Mark::Clearnet).await
+}
+
+/// An SSH port relaying to the node at `socket`, marking each frame
+/// `mark`, and its address.
+async fn port_marked(key: [u8; 32], socket: PathBuf, mark: vos_api::Mark) -> std::net::SocketAddr {
     let gateway = Arc::new(Gateway::new(vec![Upstream::new(
         key,
         Address::Socket(socket),
         [41; 32],
     )]));
     let host_key = ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[3; 32]));
-    let server =
-        vos_gateway::ssh::server(host_key, gateway, Limits::new(PerAddress::default()), None);
+    let server = vos_gateway::ssh::server(
+        host_key,
+        gateway,
+        Limits::new(PerAddress::default()),
+        mark,
+        None,
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -128,12 +139,14 @@ impl Answers {
         channel: &mut russh::Channel<client::Msg>,
     ) -> Option<(u16, u64, Vec<u8>)> {
         loop {
-            if self.buffer.len() >= 14 {
+            let header = vos_api::Framing::Stream.header();
+            if self.buffer.len() >= header {
                 let length = u32::from_le_bytes(self.buffer[..4].try_into().unwrap()) as usize;
                 if self.buffer.len() >= 4 + length {
                     let kind = u16::from_le_bytes(self.buffer[4..6].try_into().unwrap());
-                    let id = u64::from_le_bytes(self.buffer[6..14].try_into().unwrap());
-                    let body = self.buffer[14..4 + length].to_vec();
+                    assert_eq!(self.buffer[6], 0, "an answer is unmarked");
+                    let id = u64::from_le_bytes(self.buffer[7..15].try_into().unwrap());
+                    let body = self.buffer[header..4 + length].to_vec();
                     self.buffer.drain(..4 + length);
                     return Some((kind, id, body));
                 }
@@ -286,4 +299,64 @@ async fn sixteen_requests_in_flight_a_channel() {
         ids.push(answers.next(&mut channel).await.unwrap().1);
     }
     assert!(ids.contains(&17));
+}
+
+/// The subsystem marks every frame it relays with its port's transport,
+/// whatever the client marked: an onion-marked query over the clearnet
+/// port to the onion-only gated agent is refused `OnionOnly`; over a port
+/// marking as the onion service's would, it is answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_relay_marks_each_frame_with_its_port() {
+    use vos_api::Mark;
+    use vos_wire::ingress::AdmissionRefusal;
+    const GATED: InstanceId = InstanceId(1);
+    let served = served();
+    let target = Target::socket(served.socket.clone());
+    let operator = Operator::signing(&target, SigningKey::from_bytes(&OPERATOR), served.node.id());
+    let (gated, identity) = tokio::task::spawn_blocking(move || {
+        let Ok(Response::Created(agent)) = operator.create_agent(Vec::new()) else {
+            panic!("an agent")
+        };
+        let elf = vos_checker::programs::package("gated");
+        vos_checker::calls::installed(
+            operator
+                .install(agent, &vos_checker::calls::install_of(GATED, &elf))
+                .unwrap(),
+        );
+        let identity = Client::new(&target, SigningKey::from_bytes(&[1; 32]))
+            .identity(agent)
+            .unwrap();
+        (agent, identity)
+    })
+    .await
+    .unwrap();
+    let query = signed_query(
+        &identity,
+        &SigningKey::from_bytes(&[72; 32]),
+        served.clock.load(Ordering::SeqCst) + 10_000,
+        Consistency::Applied { at: 0 },
+        GATED,
+        vos_wire::ids::MethodId(vos_wire::ids::derive_id("vos/method/", "count")),
+        Vec::new(),
+    );
+    let body = (gated, query).encode();
+    for mark in [Mark::Clearnet, Mark::Onion] {
+        let address = port_marked(served.node.id().0, served.socket.clone(), mark).await;
+        let mut channel = channel(address).await;
+        let mut answers = Answers { buffer: Vec::new() };
+        channel
+            .data(&vos_api::marked(Framing::Stream, Kind::Query as u16, Mark::Onion, 1, &body)[..])
+            .await
+            .unwrap();
+        let (kind, id, answer) = answers.next(&mut channel).await.unwrap();
+        assert_eq!((kind, id), (Kind::Query as u16, 1));
+        let answer = Response::decode_exact(&answer).unwrap();
+        match mark {
+            Mark::Onion => assert!(matches!(answer, Response::Ran { .. }), "{answer:?}"),
+            _ => assert_eq!(
+                answer,
+                Response::Rejected(Rejection::Admission(AdmissionRefusal::OnionOnly))
+            ),
+        }
+    }
 }

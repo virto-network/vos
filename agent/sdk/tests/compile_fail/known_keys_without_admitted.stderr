@@ -1,0 +1,23 @@
+error: `known_keys` needs a table `admitted: Table<[u8; 32], V>`, whose rows ingress reads as the admitted keys
+ --> tests/compile_fail/known_keys_without_admitted.rs:4:12
+  |
+4 | pub struct Gated {
+  |            ^^^^^
+
+error[E0412]: cannot find type `Gated` in this scope
+ --> tests/compile_fail/known_keys_without_admitted.rs:9:6
+  |
+9 | impl Gated {
+  |      ^^^^^ not found in this scope
+
+error[E0412]: cannot find type `Gated` in module `super`
+ --> tests/compile_fail/known_keys_without_admitted.rs:9:6
+  |
+9 | impl Gated {
+  |      ^^^^^ not found in `super`
+
+error[E0433]: failed to resolve: use of undeclared type `Gated`
+ --> tests/compile_fail/known_keys_without_admitted.rs:9:6
+  |
+9 | impl Gated {
+  |      ^^^^^ use of undeclared type `Gated`

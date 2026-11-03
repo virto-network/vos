@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
-use vos_api::{ENVELOPE, Operated};
+use vos_api::{ENVELOPE, Mark, Operated};
 use vos_http::routes::{self, Authorization, Routed};
 use vos_http::{Handler, Head, Limits as HttpLimits, Serve, Spawned};
 use vos_wire::Encode;
@@ -53,6 +53,10 @@ pub struct Http {
     pub tls: Option<Arc<rustls::ServerConfig>>,
     /// The most connections at once, from every address.
     pub connections: usize,
+    /// The transport its listener is, which every request it relays is
+    /// marked with: [`Mark::Clearnet`] for a TCP port, [`Mark::Onion`] for
+    /// the onion service's.
+    pub mark: Mark,
 }
 
 /// Serve HTTP on `listener` in front of `gateway` until `stop` resolves.
@@ -66,11 +70,12 @@ pub async fn serve(
     http: Http,
     stop: impl Future<Output = ()>,
 ) {
+    let mark = http.mark;
     let handler: Handler = {
         let gateway = Arc::clone(&gateway);
         Arc::new(move |request| {
             let gateway = Arc::clone(&gateway);
-            Box::pin(async move { handle(&gateway, request).await })
+            Box::pin(async move { handle(&gateway, mark, request).await })
         })
     };
     let head: Head = {
@@ -141,8 +146,13 @@ fn unauthorized() -> vos_http::Response {
     routes::respond(&Response::Rejected(Rejection::Unauthorized))
 }
 
-/// A request's answer: its route's, through a node where it needs one.
-pub async fn handle(gateway: &Gateway, request: vos_http::Request) -> vos_http::Response {
+/// A request's answer: its route's, through a node where it needs one,
+/// marked `mark`, the transport it came in on.
+pub async fn handle(
+    gateway: &Gateway,
+    mark: Mark,
+    request: vos_http::Request,
+) -> vos_http::Response {
     let (kind, body) = match routes::route(&request) {
         Routed::Answer(answer) => return answer,
         Routed::Request { kind, body } => (kind, body),
@@ -159,6 +169,6 @@ pub async fn handle(gateway: &Gateway, request: vos_http::Request) -> vos_http::
         },
         Routed::Operator { .. } => return unauthorized(),
     };
-    let (answered, bytes) = gateway.relay(kind, &body).await;
+    let (answered, bytes) = gateway.relay(kind, mark, &body).await;
     routes::answer(answered, &bytes)
 }

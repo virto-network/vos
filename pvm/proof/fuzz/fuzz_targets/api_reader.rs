@@ -5,13 +5,15 @@
 //! Properties: **no panic, no abort**; **every frame within its bound**
 //! (a request's body within its kind's limit, of a known kind, relayed
 //! where the reader relays; an answer's within `MAX_ANSWER`); **a frame
-//! error is the reader's last event**; and **splitting changes nothing:**
-//! the same bytes in one push give the same events.
+//! error is the reader's last event**; **splitting changes nothing:**
+//! the same bytes in one push give the same events; and **the frames are
+//! the bytes:** the frames read, written again with their marks and ids,
+//! are the bytes they were read from, so no mark byte is lost or remade.
 
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use vos_api::{Event, Framing, Kind, Reader, Requests, MAX_ANSWER};
+use vos_api::{marked, Event, Framing, Kind, Reader, Requests, MAX_ANSWER};
 
 /// Every event `reader` gives for `chunks`, then at their end.
 fn events(mut reader: Reader, chunks: &[&[u8]]) -> Vec<Event> {
@@ -51,6 +53,23 @@ fuzz_target!(|data: &[u8]| {
             );
             let split = events(reader, &chunks);
             assert_eq!(whole, split, "splitting changed the events");
+            let mut written = Vec::new();
+            for event in &split {
+                if let Event::Frame(frame) = event {
+                    written.extend(marked(
+                        framing,
+                        frame.kind,
+                        frame.mark,
+                        frame.id,
+                        &frame.body,
+                    ));
+                }
+            }
+            assert_eq!(
+                &data[..written.len()],
+                &written[..],
+                "a frame is not its bytes"
+            );
             for (at, event) in split.iter().enumerate() {
                 match event {
                     Event::Frame(frame) => match relay {

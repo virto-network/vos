@@ -221,14 +221,22 @@ impl From<CallError> for Response {
 }
 
 impl Inner {
-    /// A client's call, as ingress takes it: its signature checked on an
-    /// executor, then run here if this replica leads the agent, else
-    /// forwarded to the leader.
-    pub(crate) async fn client_call(self: &Arc<Self>, agent: AgentId, call: Call) -> Response {
+    /// A client's call, as ingress takes it, marked `mark`: the agent's
+    /// admission checked, then its signature on an executor, then run here
+    /// if this replica leads the agent, else forwarded to the leader.
+    pub(crate) async fn client_call(
+        self: &Arc<Self>,
+        agent: AgentId,
+        mark: vos_api::Mark,
+        call: Call,
+    ) -> Response {
         let run = match self.present(agent) {
             Ok(run) => run,
             Err(error) => return error.into(),
         };
+        if let Err(answer) = self.admits(agent, mark, Some(&call.session)) {
+            return answer;
+        }
         let identity = run.shared.identity;
         let stats = Arc::clone(&self.stats);
         let checked = self

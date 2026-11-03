@@ -11,9 +11,10 @@ use crate::{Decode, Encode};
 
 /// The section starts with these bytes, then the schema's length as four
 /// little-endian bytes, then the schema: its methods, each without its
-/// credential guard, then, only when the program is the credential actor
-/// or a method has a guard, the [`Credentials`] that say which. A program
-/// with neither carries its methods alone.
+/// credential guard, then, only when the program is the credential actor,
+/// a method has a guard or the actor asks an [`Admission`], the
+/// [`Credentials`] that say which, then, only when it asks one, the
+/// [`Admission`]. A program with none of them carries its methods alone.
 pub const MAGIC: [u8; 4] = *b"VOSS";
 
 /// The most a schema may hold: what a refine reads before installing.
@@ -33,7 +34,39 @@ pub struct Schema {
     /// its install records the row [`crate::keys::credentials`], whose ring
     /// the agent's auth guards read.
     pub credentials: bool,
+    /// What ingress asks of its agent's requests
+    /// (`#[actor(known_keys, onion_only)]`): its install records the row
+    /// [`crate::keys::admission`], which ingress reads.
+    pub admission: Admission,
 }
+
+/// What an agent's ingress asks of the requests it takes, as one actor of
+/// the agent declares (`light-node.md` §3.3). Ingress reads it from the row
+/// [`crate::keys::admission`] its install writes; the agent's refine does
+/// not check it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
+pub struct Admission {
+    /// A call that would create a session is refused unless its key is a
+    /// row of the declaring actor's [`ADMITTED`] table, looked up before
+    /// its signature is checked.
+    pub known_keys: bool,
+    /// A call, query, workflow read, credentialed call or schema read is
+    /// refused unless the gateway marked it as received on its onion
+    /// service; an unmarked one counts as clearnet.
+    pub onion_only: bool,
+}
+
+impl Admission {
+    /// Whether it asks anything.
+    pub const fn asks(self) -> bool {
+        self.known_keys || self.onion_only
+    }
+}
+
+/// The table of the admitted keys an actor declaring
+/// [`Admission::known_keys`] keeps: its rows' keys the ed25519 keys, any
+/// value; ingress reads a row's presence ([`crate::keys::admitted`]).
+pub const ADMITTED: &str = "admitted";
 
 /// A method in a program's section: its schema but its guard.
 #[derive(Encode, Decode)]
@@ -47,7 +80,8 @@ struct Plain {
 }
 
 /// What follows a section's methods when the program is the credential
-/// actor or guards a method: the mark, and each guard by its method.
+/// actor, guards a method or asks an [`Admission`]: the mark, and each
+/// guard by its method.
 #[derive(Encode, Decode)]
 pub struct Credentials {
     pub actor: bool,
@@ -172,12 +206,15 @@ impl Schema {
             .iter()
             .filter_map(|method| Some((method.id, (**method.credential.as_ref()?).clone())))
             .collect();
-        if self.credentials || !guards.is_empty() {
+        if self.credentials || !guards.is_empty() || self.admission.asks() {
             Credentials {
                 actor: self.credentials,
                 guards,
             }
             .encode_to(&mut body);
+        }
+        if self.admission.asks() {
+            self.admission.encode_to(&mut body);
         }
         let mut section = Vec::with_capacity(8 + body.len());
         section.extend_from_slice(&MAGIC);
@@ -215,12 +252,22 @@ impl Schema {
                 })
                 .collect(),
             credentials: false,
+            admission: Admission::default(),
         };
         if used != len {
-            let credentials =
-                Credentials::decode_exact(&body[used..]).ok_or(SchemaError::Undecodable)?;
-            // An empty mark says nothing: the section carries none.
-            if !credentials.actor && credentials.guards.is_empty() {
+            let (credentials, read) =
+                Credentials::decode(&body[used..]).map_err(|_| SchemaError::Undecodable)?;
+            let rest = &body[used + read..];
+            if !rest.is_empty() {
+                schema.admission = Admission::decode_exact(rest).ok_or(SchemaError::Undecodable)?;
+                // An admission that asks nothing says nothing: the section
+                // carries none.
+                if !schema.admission.asks() {
+                    return Err(SchemaError::Undecodable);
+                }
+            }
+            // An empty mark says nothing, unless an admission follows it.
+            if !credentials.actor && credentials.guards.is_empty() && !schema.admission.asks() {
                 return Err(SchemaError::Undecodable);
             }
             schema.credentials = credentials.actor;

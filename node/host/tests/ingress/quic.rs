@@ -57,15 +57,26 @@ pub(super) fn dial(
         let connection = connecting.await.map_err(|error| error.to_string())?;
         // A refused key shows once the server's verdict arrives: a
         // stream's round trip waits for it.
-        vos_api::quic::request(&connection, Kind::NodeKey as u16, &[])
-            .await
-            .map_err(|error| error.to_string())?;
+        vos_api::quic::request(
+            &connection,
+            Kind::NodeKey as u16,
+            vos_api::Mark::Unmarked,
+            &[],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
         Ok(connection)
     })
 }
 
 pub(super) fn ask(connection: &quinn::Connection, kind: u16, body: &[u8]) -> (u16, Vec<u8>) {
-    smol::block_on(vos_api::quic::request(connection, kind, body)).unwrap()
+    smol::block_on(vos_api::quic::request(
+        connection,
+        kind,
+        vos_api::Mark::Unmarked,
+        body,
+    ))
+    .unwrap()
 }
 
 #[test]
@@ -121,7 +132,7 @@ fn frames_over_quic_are_sized_from_their_headers() {
         });
         assert_eq!(&answer[4..6], &FRAME_ERROR.to_le_bytes(), "{kind:?}");
         assert_eq!(
-            FrameError::decode_exact(&answer[6..]),
+            FrameError::decode_exact(&answer[Framing::Quic.header()..]),
             Some(FrameError::Oversize { limit })
         );
     }
@@ -141,7 +152,7 @@ fn frames_over_quic_are_sized_from_their_headers() {
         receive.read_to_end(1 << 10).await.unwrap()
     });
     assert_eq!(
-        FrameError::decode_exact(&answer[6..]),
+        FrameError::decode_exact(&answer[Framing::Quic.header()..]),
         Some(FrameError::Truncated)
     );
 }
@@ -200,7 +211,7 @@ fn install_size_bodies_over_quic_are_bounded() {
     let answer = fifth(header.clone()).unwrap();
     assert_eq!(&answer[4..6], &FRAME_ERROR.to_le_bytes());
     assert_eq!(
-        FrameError::decode_exact(&answer[6..]),
+        FrameError::decode_exact(&answer[Framing::Quic.header()..]),
         Some(FrameError::Unavailable)
     );
     // A body that is not large holds no place.

@@ -7,7 +7,9 @@
 use base64::Engine;
 use vos_api::{CREDENTIALS, FRAME_ERROR, FrameError, Kind, Operated};
 use vos_wire::abi::Refusal;
-use vos_wire::ingress::{CredentialRefusal, OperatorRefusal, Rejection, Response as Answer};
+use vos_wire::ingress::{
+    AdmissionRefusal, CredentialRefusal, OperatorRefusal, Rejection, Response as Answer,
+};
 use vos_wire::{Decode, Encode};
 
 use crate::server::{Request, Response};
@@ -174,6 +176,9 @@ pub fn status(answer: &Answer) -> u16 {
                 OperatorRefusal::Replayed => 409,
                 OperatorRefusal::OtherNode => 421,
             },
+            // A key admitted in the latest batch retries; a stranger's
+            // retries are refused alike.
+            Rejection::Admission(AdmissionRefusal::OnionOnly | AdmissionRefusal::UnknownKey) => 403,
         },
         Answer::NotConsumed => 500,
         Answer::NoAgent => 404,

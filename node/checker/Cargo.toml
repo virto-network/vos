@@ -41,6 +41,7 @@ vos-testkit = { path = "../../agent/testkit" }
 vos-wire = { workspace = true }
 # The end-to-end suites through a gateway in front of the nodes' sockets.
 vos-gateway = { path = "../gateway" }
+vos-api = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync"] }
 
 [dev-dependencies]

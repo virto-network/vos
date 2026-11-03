@@ -18,6 +18,11 @@ pub trait Marked {
     /// `#[actor(credentials)]`: its agent's credential actor, whose ring
     /// the agent's auth guards read.
     const CREDENTIALS: bool;
+    /// `#[actor(known_keys, onion_only)]`: what its agent's ingress asks of
+    /// the requests it takes (`light-node.md` §3.3). An actor that asks
+    /// known keys keeps them as the rows of its table `admitted`
+    /// ([`vos_wire::schema::ADMITTED`]).
+    const ADMISSION: vos_wire::schema::Admission;
 }
 
 /// The state of a new instance. `#[messages]` implements it with the

@@ -10,10 +10,25 @@ use quote::{format_ident, quote};
 use syn::spanned::Spanned;
 use syn::{Attribute, Error, Fields, ItemStruct, Meta, PathArguments, Type};
 
+use vos_wire::schema::ADMITTED;
+
 use crate::names::Ids;
 use crate::{is_named, string_arg};
 
-pub(crate) fn actor_impl(mut input: ItemStruct, credentials: bool) -> syn::Result<Tokens> {
+/// What `#[actor(...)]` marks an actor as.
+#[derive(Default)]
+pub(crate) struct Marks {
+    pub(crate) credentials: bool,
+    pub(crate) known_keys: bool,
+    pub(crate) onion_only: bool,
+}
+
+pub(crate) fn actor_impl(mut input: ItemStruct, marks: Marks) -> syn::Result<Tokens> {
+    let Marks {
+        credentials,
+        known_keys,
+        onion_only,
+    } = marks;
     let name = input.ident.clone();
     let Fields::Named(fields) = &mut input.fields else {
         return Err(Error::new(
@@ -25,6 +40,7 @@ pub(crate) fn actor_impl(mut input: ItemStruct, credentials: bool) -> syn::Resul
     let mut binds = Vec::new();
     let mut views = Vec::new();
     let mut viewed = Vec::new();
+    let mut admitted = false;
     for field in &mut fields.named {
         let ident = field.ident.clone().expect("named field");
         let mut table_name = None;
@@ -52,6 +68,16 @@ pub(crate) fn actor_impl(mut input: ItemStruct, credentials: bool) -> syn::Resul
             continue;
         }
         let table_name = table_name.unwrap_or_else(|| ident.to_string());
+        if known_keys && table_name == ADMITTED {
+            if !admitted_table(&field.ty) {
+                return Err(Error::new(
+                    field.ty.span(),
+                    "`known_keys` reads `admitted` as a `Table<[u8; 32], V>` of the default \
+                     transform: ingress looks a key up by its 32 bytes",
+                ));
+            }
+            admitted = true;
+        }
         let tag = tags.take("vos/table/", &table_name, field.span())?;
         field.attrs.push(syn::parse_quote!(#[codec(skip)]));
         binds.push(quote! {
@@ -66,6 +92,13 @@ pub(crate) fn actor_impl(mut input: ItemStruct, credentials: bool) -> syn::Resul
             });
         }
     }
+    if known_keys && !admitted {
+        return Err(Error::new(
+            name.span(),
+            "`known_keys` needs a table `admitted: Table<[u8; 32], V>`, whose rows ingress \
+             reads as the admitted keys",
+        ));
+    }
     let vis = &input.vis;
     let view = format_ident!("{}View", name);
     let doc = format!(
@@ -78,6 +111,11 @@ pub(crate) fn actor_impl(mut input: ItemStruct, credentials: bool) -> syn::Resul
 
         impl ::vos_sdk::state::Marked for #name {
             const CREDENTIALS: bool = #credentials;
+            const ADMISSION: ::vos_sdk::schema::Admission =
+                ::vos_sdk::schema::Admission {
+                    known_keys: #known_keys,
+                    onion_only: #onion_only,
+                };
         }
 
         impl ::vos_sdk::state::Tables for #name {
@@ -100,6 +138,30 @@ pub(crate) fn actor_impl(mut input: ItemStruct, credentials: bool) -> syn::Resul
             }
         }
     })
+}
+
+/// Whether `ty` is `Table<[u8; 32], V>`, of the default (hashed)
+/// transform: the rows ingress reads for `known_keys`.
+fn admitted_table(ty: &Type) -> bool {
+    let Some(segment) = crate::last_segment(ty).filter(|segment| segment.ident == "Table") else {
+        return false;
+    };
+    let PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+        return false;
+    };
+    let types: Vec<&Type> = arguments
+        .args
+        .iter()
+        .filter_map(|argument| match argument {
+            syn::GenericArgument::Type(ty) => Some(ty),
+            _ => None,
+        })
+        .collect();
+    let key = quote!([u8; 32]).to_string();
+    match types.as_slice() {
+        [first, _] => quote!(#first).to_string() == key,
+        _ => false,
+    }
 }
 
 /// A committed map's type as its view holds it: a `ServedMap` of the same

@@ -264,11 +264,13 @@ impl LocalSpace {
             Address::Socket(self.socket.clone()),
             random(),
         )]));
-        let app = Arc::new(AppClient::new(app, Arc::clone(&gateway)));
+        let mark = vos_api::Mark::Clearnet;
+        let app = Arc::new(AppClient::new(app, Arc::clone(&gateway), mark));
         let server = vos_gateway::ssh::server(
             host_key,
             gateway,
             Limits::new(PerAddress::default()),
+            mark,
             Some((self.demo(), app)),
         );
         tokio::spawn(async move {

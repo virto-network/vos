@@ -50,20 +50,37 @@ pub(crate) fn string_arg(meta: &syn::meta::ParseNestedMeta) -> syn::Result<Strin
 /// `#[actor(credentials)]` marks its agent's credential actor
 /// (`identity-and-authority.md` §6): its program's schema says so, and its
 /// install records the instance whose ring the agent's auth guards read.
+///
+/// `#[actor(known_keys)]` and `#[actor(onion_only)]` ask its agent's
+/// ingress to admit a call that would create a session only from a key
+/// its table `admitted` holds, and only requests the gateway received on
+/// its onion service (`light-node.md` §3.3): its program's schema says so,
+/// and its install records the instance whose table ingress reads. An
+/// actor asking `known_keys` holds `admitted: Table<[u8; 32], V>`.
 #[proc_macro_attribute]
 pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let mut credentials = false;
+    let mut marks = actor::Marks::default();
     let parser = syn::meta::parser(|meta| {
-        if meta.path.is_ident("credentials") {
-            credentials = true;
-            Ok(())
+        let mark = if meta.path.is_ident("credentials") {
+            &mut marks.credentials
+        } else if meta.path.is_ident("known_keys") {
+            &mut marks.known_keys
+        } else if meta.path.is_ident("onion_only") {
+            &mut marks.onion_only
         } else {
-            Err(meta.error("expected `credentials`, or no argument"))
+            return Err(
+                meta.error("expected `credentials`, `known_keys` or `onion_only`, or no argument")
+            );
+        };
+        if *mark {
+            return Err(meta.error("a mark given twice"));
         }
+        *mark = true;
+        Ok(())
     });
     parse_macro_input!(attr with parser);
     let input = parse_macro_input!(item as ItemStruct);
-    actor_impl(input, credentials)
+    actor_impl(input, marks)
         .unwrap_or_else(Error::into_compile_error)
         .into()
 }

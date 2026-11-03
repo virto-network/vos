@@ -43,31 +43,50 @@ run. Everything here is built.
   |---|---|---|
   | `length` | 4, `u32` LE | the bytes that follow it |
   | `kind` | 2, `u16` LE | §3's number; `0xffff` the frame error |
+  | `mark` | 1 | the transport mark: 0 none, 1 clearnet, 2 onion (below) |
   | `id` | 8, `u64` LE | **on a byte stream only** (the socket, the `vos-api` channel) |
-  | body | `length − 2` (QUIC) or `length − 10` (stream) | the kind's request or answer, in SCALE |
+  | body | `length − 3` (QUIC) or `length − 11` (stream) | the kind's request or answer, in SCALE |
 
-  The header is 6 bytes over QUIC and 14 over a byte stream. Little-endian
+  The header is 7 bytes over QUIC and 15 over a byte stream. Little-endian
   throughout, as the codec, where `vos-net`'s peer frames carry a
   big-endian length: the two never meet (separate ports and ALPNs, §5). A
   `u32` length bounds a frame at 4 GiB, past every limit (the largest, an
   install, is 64 MiB plus 4 KiB plus 160).
 - **An answer frame** carries the request's `kind`, or `0xffff` for a
-  frame error, and (on a stream) the request's `id`, then the answer's
-  body. A request has exactly one answer frame, or none if the connection
+  frame error, mark 0, and (on a stream) the request's `id`, then the
+  answer's body. A request has exactly one answer frame, or none if the connection
   ends first.
+- **The transport mark** [decided, `light-node.md` §3.3, E17, E22]: the
+  transport a gateway received a request on, which it writes on every
+  frame it relays (`vos_api::Mark`): 1, clearnet, from its HTTP and SSH
+  ports; 2, onion, from its onion service's (`light-node.md` §6.1; the
+  gateway's `Http.mark` and the SSH relay's mark, every port it opens
+  today clearnet, the onion port with the onion service). A
+  relay never passes a client's mark on: the `vos-api` subsystem relays
+  each frame anew under its port's mark. Every other sender (a local
+  tool on the socket, a driver, a test, the node's own client) sends 0,
+  none, and the node takes none as clearnet. The node trusts the mark as
+  it trusts any API client (the socket's file mode, a QUIC key in its
+  `gateways`): it is the gateway's word, read only for an agent that asks
+  to be onion-only (§3), defence in depth against a client's bug and
+  against strangers on the clearnet. The enforcement of "anonymous calls
+  never over the clearnet" is the client's routing, which has no
+  clearnet route for them (`light-node.md` §6.5).
 - **Ids** are the client's: the node echoes them and keeps no table, so
   an id reused while in flight gives the client two answers it cannot
   tell apart. Clients count from 1. A frame error the node cannot tie to a
   request (a length too short to hold an id) carries id 0. A relay keeps
   the only table: its own upstream ids, mapped back to the client's.
 - **Read before decoding,** in this order, each failure a frame error:
-  1. `length` below the header's rest (2, or 10): `Truncated`;
+  1. `length` below the header's rest (3, or 11): `Truncated`;
   2. `kind` not in the table: `UnknownKind`, `0xffff` among them (a frame
      error is an answer, never a request);
   3. on a relay, `kind` not relayable there: `NotRelayed` (§6);
-  4. the body (`length` less the header's rest) past the kind's limit:
+  4. `mark` not 0, 1 or 2 on a request, or not 0 on an answer:
+     `UnknownMark`;
+  5. the body (`length` less the header's rest) past the kind's limit:
      `Oversize { limit }`, before any body byte is read or allocated;
-  5. the stream or connection ending before `length` bytes:
+  6. the stream or connection ending before `length` bytes:
      `Truncated` (answered if the peer still reads, else nothing).
 
   Then the body is decoded exactly (`decode_exact`). A body that does not
@@ -90,15 +109,17 @@ run. Everything here is built.
       NotRelayed,                // a relay's only (§6); a node never sends it
       #[codec(index = 4)]
       Unavailable,               // a relay's only: no node answered (§6)
+      #[codec(index = 5)]
+      UnknownMark,
   }
   ```
   A relay whose upstream fails mid-request must answer every kind, and
   three kinds answer types with no `Unavailable` of their own (`NodeKey`,
   `Time`, the `Option`s), hence the frame error's `Unavailable`. A node
   answers the `Response` kinds' own `Unavailable` instead.
-- **Close:** after one of the four framing errors (`Oversize`,
-  `UnknownKind`, `Truncated`, `NotRelayed`) the node (or relay) writes it,
-  then closes the QUIC stream (finishes its side and stops reading), or
+- **Close:** after one of the five framing errors (`Oversize`,
+  `UnknownKind`, `Truncated`, `NotRelayed`, `UnknownMark`) the node (or
+  relay) writes it, then closes the QUIC stream (finishes its side and stops reading), or
   the whole connection on a byte stream, whose framing it may no longer
   trust: answers in flight on that connection are dropped. A well-behaved
   client never meets one. **`Unavailable` does not close:** the framing is
@@ -203,6 +224,38 @@ budget, past which it is answered `Busy`.
 - **The credential actor's `path(member)` and `root()`** are `Query`s
   like any other, signed by a key the device library draws for each
   (`identity-and-authority.md` §6); no kind of their own.
+- **An agent's admission** [decided, `light-node.md` §3.3]: an actor
+  declares it, `#[actor(known_keys, onion_only)]`, and its schema carries
+  it (`vos_wire::schema::Admission`, after the credentials' part of the
+  section); its install writes the agent's row `admission`
+  (`vos_wire::keys::admission`: the declaring instance and the two flags),
+  which ingress reads as it reads the credential ring. One actor of an
+  agent declares it: an install declaring one at another instance, or
+  installing a program that declares none over the declaring instance,
+  fails `Admission` (16). Ingress checks it before any signature or
+  proof, reading this replica's applied state:
+  - **onion only:** a `Call`, `Query`, `Workflow` or `Credentialed` whose
+    frame is not marked onion is refused `Admission(OnionOnly)`, and a
+    `Schema` read of the agent answered `None`. `AgentInfo` (the
+    directory's record and replicas, no read of the agent's state) and
+    the node's kinds stay open.
+  - **known keys only:** a `Call` whose session the agent does not hold
+    (its row `session_index` absent) is refused `Admission(UnknownKey)`
+    unless its session's key is a row of the declaring actor's hashed
+    table `admitted` (`vos_wire::keys::admitted`; any value, its presence
+    read). So an unknown key costs three point reads (the agent's row
+    `admission`, the session's, the key's), no verification and no write:
+    10^4 session attempts verified nothing and wrote nothing (§8, test
+    18). A call in a session the agent holds is not looked up: admission
+    covers the creation of sessions; a key no longer admitted keeps its
+    sessions until they expire, and the actor's handlers judge the rest.
+    A key admitted in the latest batch may be refused at a replica that
+    has not applied it; the client retries. Queries and workflow reads
+    are signed by any key and not looked up: the actor's handlers gate
+    them. A credentialed call has no key: its guard admits it.
+
+  Apply does not check either: the rows are ingress's filter, so a call
+  forwarded between replicas was checked at the replica that took it.
 - **`Rejection` variants** (`vos_wire::ingress`): index 9 is
   `Credential(CredentialRefusal)` (`identity-and-authority.md` §5);
   index 10 is `Operator(OperatorRefusal)`:
@@ -215,7 +268,8 @@ budget, past which it is answered `Busy`.
 
   An unlisted key keeps `Unauthorized` (6, 401), a bad signature
   `BadSignature` (0, 401); a body that is not an `Operated` is
-  `Malformed`.
+  `Malformed`. Index 11 is `Admission(AdmissionRefusal)`: 0 `OnionOnly`,
+  1 `UnknownKey`, both 403.
 
 ## 4. Operator requests
 
@@ -295,7 +349,8 @@ could replay, and a relay keeps nothing it can reuse.
   the command's outcome, which the operator reads from the node.
 - **Every transport, the socket included:** an unsigned operator body is
   refused everywhere, since a co-located gateway on the socket must hold
-  no authority either; `api::handle` takes no transport argument.
+  no authority either; `api::handle` takes no transport argument, only
+  the frame's mark, which no operator kind reads.
 - **The gateway and s4's console only relay:** they carry an `Operated`
   the operator built in their own client; nothing they keep can be
   replayed past its nonce, sent to another node, or outlive its expiry.
@@ -462,7 +517,8 @@ could replay, and a relay keeps nothing it can reuse.
   reads each header, answers `NotRelayed` for any kind outside the relay
   set (`NodeKey`, `Time`, `AgentInfo`, `Schema`, `Query`) without reading
   its body or sending anything to a node, checks the limit, then relays
-  the frame to a node under a fresh upstream id and maps the answer back.
+  the frame to a node under a fresh upstream id and its port's mark (§2),
+  and maps the answer back.
   The relay set is the public, unsigned or self-signed reads: an
   anonymous relay lying about `AgentInfo` costs a `BadSignature` and
   nothing more. At most 16 requests in flight a channel, past which it
@@ -544,6 +600,9 @@ could replay, and a relay keeps nothing it can reuse.
 | 15 | `vos-scale`'s localhost inventory driving over the node API, a short run | scale |
 | 16 | `api_connections` refused at accept (the socket) and at the handshake (QUIC); the 60 s frame deadline on both; a stale socket file replaced, and a twin refused by the lock | node |
 | 17 | the gateway's 413 never reaching the node (its count of API frames unchanged) | gateway |
+| 18 | an agent's admission: an unknown key's 10^4 session attempts, each a session of its own with no valid signature, all `UnknownKey`, the node's verifications and the agent's applied index unchanged; a key admitted by another agent's message refused until applied, then its session created; a key revoked keeping its session and creating no other; every kind that reads an onion-only agent refused unmarked and clearnet, over the socket and QUIC, before any verification; the installs that would leave no declaring actor failing `Admission` | node |
+| 19 | the mark on the relay path: an HTTP port marking clearnet and one marking onion in front of the onion-only agent, the clearnet's call `OnionOnly`, the onion's `UnknownKey` then run; the `vos-api` subsystem relaying an onion-marked query under its clearnet port's mark (`OnionOnly`) and under an onion port's (answered) | gateway |
+| 20 | the codec: the mark pinned, each read back, an unknown one `UnknownMark` from the header; the fuzz target's frames written again being the bytes read | `vos-api` |
 
 ## 9. Design choices
 

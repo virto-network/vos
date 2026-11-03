@@ -404,3 +404,44 @@ fn the_representatives_rows_keep_their_bytes() {
         keys::committed(&representative_map(), &Transform::Ordered.apply(&raw))
     );
 }
+
+/// The admission row, and an admitted key's row: the declaring actor's
+/// hashed table `admitted`, keyed by the key's bytes. Ingress refuses or
+/// admits by them.
+#[test]
+fn the_admission_rows_keep_their_bytes() {
+    use vos_wire::Decode;
+    use vos_wire::ingress::{AdmissionRefusal, Rejection};
+    use vos_wire::records::Admitting;
+    use vos_wire::schema::{ADMITTED, Admission};
+    assert_eq!(keys::admission(), [0x00, 0x29]);
+    let key = [7u8; 32];
+    let rows = Rows::Table {
+        tag: vos_wire::ids::derive_id("vos/table/", ADMITTED),
+        transform: Transform::Hashed,
+    };
+    assert_eq!(
+        keys::admitted(InstanceId(3), &key),
+        keys::row(InstanceId(3), rows, &key).unwrap()
+    );
+    let admitting = Admitting {
+        instance: InstanceId(0x0102_0304),
+        admission: Admission {
+            known_keys: true,
+            onion_only: false,
+        },
+    };
+    assert_eq!(admitting.encode(), [4, 3, 2, 1, 1, 0]);
+    assert_eq!(
+        Admitting::decode_exact(&[4, 3, 2, 1, 1, 0]),
+        Some(admitting)
+    );
+    assert_eq!(
+        Rejection::Admission(AdmissionRefusal::OnionOnly).encode(),
+        [11, 0]
+    );
+    assert_eq!(
+        Rejection::Admission(AdmissionRefusal::UnknownKey).encode(),
+        [11, 1]
+    );
+}

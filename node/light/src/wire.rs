@@ -1,8 +1,8 @@
 //! The node-API requests a client sends for its credentials, and the
 //! answers it decodes (`identity-and-authority.md` §5–§6, `node-api.md`):
 //! each request is its kind's two little-endian bytes, then its SCALE
-//! body; the transport adds the frame's length and any request id. So
-//! neither a client nor a gateway encodes a credential's bytes.
+//! body; the transport adds the frame's length, its mark and any request
+//! id. So neither a client nor a gateway encodes a credential's bytes.
 //!
 //! A query of `path` or `root()` is a `QueryCall` signed by an ed25519 key
 //! drawn for that query alone, so a fetch links to no client key; it reads

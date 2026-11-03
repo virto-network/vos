@@ -4,7 +4,8 @@
 //! compromised gateway alters refused by the node, leader-aware routing
 //! and a client's pin across it, the limits per address, refusals for size
 //! and from the head that never reach a node, the budget of install-size
-//! bodies, and a dead node delaying no other's requests.
+//! bodies, a dead node delaying no other's requests, and the transport
+//! mark an onion-only agent reads.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -14,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use vos_api::Kind;
+use vos_api::{Kind, Mark};
 use vos_checker::calls::{install_of, installed};
 use vos_checker::programs::Programs;
 use vos_checker::spaces::wait_in_process as wait_until;
@@ -38,6 +39,7 @@ const OPERATOR: [u8; 32] = [31; 32];
 /// The gateway's seed.
 const GATEWAY: [u8; 32] = [41; 32];
 
+mod admission;
 mod dead_node;
 mod limits;
 mod redirects;
@@ -89,6 +91,18 @@ impl Front {
         per: PerAddress,
         tls: Option<Arc<rustls::ServerConfig>>,
     ) -> Self {
+        Self::start_marked(listener, upstreams, per, tls, Mark::Clearnet)
+    }
+
+    /// A gateway on `listener` marking what it relays `mark`: the onion
+    /// service's port, where `mark` is [`Mark::Onion`].
+    fn start_marked(
+        listener: std::net::TcpListener,
+        upstreams: Vec<([u8; 32], Address)>,
+        per: PerAddress,
+        tls: Option<Arc<rustls::ServerConfig>>,
+        mark: Mark,
+    ) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -113,6 +127,7 @@ impl Front {
             Http {
                 tls,
                 connections: 64,
+                mark,
             },
             async {
                 let _ = stopped.await;

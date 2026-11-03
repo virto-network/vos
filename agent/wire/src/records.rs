@@ -6,7 +6,7 @@ use crate::abi::cap::Target;
 use crate::batch::Await;
 use crate::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash};
 use crate::result::Outcome;
-use crate::schema::Schema;
+use crate::schema::{Admission, Schema};
 use crate::{Decode, Encode};
 
 /// The programs a node derived from a package's ELF at its install, by
@@ -172,6 +172,16 @@ impl Derivation {
     pub fn programs(&self) -> impl Iterator<Item = ProgramHash> + '_ {
         core::iter::once(self.program).chain(self.kernels.iter().map(|kernel| kernel.program))
     }
+}
+
+/// What the agent's ingress asks of its requests, under
+/// [`crate::keys::admission`]: the instance whose actor declared it, whose
+/// table [`crate::schema::ADMITTED`] holds the admitted keys, and what it
+/// asks. Written by that actor's install, and by each install over it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Admitting {
+    pub instance: InstanceId,
+    pub admission: Admission,
 }
 
 /// An installed instance, under [`crate::keys::installed`]: the programs
