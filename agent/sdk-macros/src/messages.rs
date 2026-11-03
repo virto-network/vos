@@ -104,6 +104,29 @@ fn handler(
              beside an auth guard",
         ));
     }
+    if options.device_kernel.is_none()
+        && let Some(span) = options
+            .reference
+            .as_ref()
+            .map(Spanned::span)
+            .or(options.headroom.map(|(_, span)| span))
+    {
+        return Err(Error::new(
+            span,
+            "only an #[attestable(device)] method takes `reference = path` and `headroom = k`: \
+             they size a device kernel's program",
+        ));
+    }
+    if let Some(span) = options.device_kernel
+        && options.reference.is_none()
+    {
+        return Err(Error::new(
+            span,
+            "an #[attestable(device)] method names its reference run, `reference = path`: a \
+             function returning its message, a public, valid witness, whose run sizes its \
+             device program",
+        ));
+    }
     if let Some(span) = options.venue_bound
         && marked != Some(Kind::Attestable)
     {
@@ -578,6 +601,9 @@ impl Generated {
                 let (entry, attestable) = attestable_entry(handler, actor, view, module, &message);
                 self.entries.push(entry);
                 self.attestables.push(attestable);
+                let (entry, reference) = reference_entry(handler, actor, module, &message);
+                self.entries.push(entry);
+                self.attestables.push(reference);
             }
             Kind::Attestable | Kind::Stating | Kind::Reading => {
                 let method = if handler.kind == Kind::Reading {

@@ -49,6 +49,60 @@ pub struct AgentInfo {
     pub replicas: Vec<Contact>,
 }
 
+/// An installed instance's device window (`light-node.md` §4.4,
+/// `Kind::Devices`): the device formats the answering node admits now,
+/// newest first, and for each of the instance's device kernels the
+/// programs its guard admits, newest first. A light node proves with the
+/// newest program it ships that the window holds, in a format it holds,
+/// and with none says the app or the space must update.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct DeviceWindow {
+    pub formats: Vec<FormatWindow>,
+    pub kernels: Vec<KernelWindow>,
+}
+
+/// A device format a node admits, and when it retires, if that is set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct FormatWindow {
+    pub format: u32,
+    pub retires_ms: Option<u64>,
+}
+
+/// A device kernel's window: the programs its guard admits, newest first,
+/// at most its release's and its previous release's.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct KernelWindow {
+    pub method: MethodId,
+    pub programs: Vec<ProgramWindow>,
+}
+
+/// A device program a guard admits: its id, which a proof's binding
+/// names, the format it is of, and when it retires, if it is a previous
+/// release's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct ProgramWindow {
+    pub id: [u8; 32],
+    pub format: u32,
+    pub retires_ms: Option<u64>,
+}
+
+/// An operator's retirement (`light-node.md` §4.4, `Kind::Retire`): a
+/// device kernel's previous release in an instance, which the agent's log
+/// records, or a device format at the node that takes it, at `at_ms` if
+/// that is earlier than its date, now included.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum Retire {
+    #[codec(index = 0)]
+    Previous {
+        agent: AgentId,
+        instance: InstanceId,
+        method: MethodId,
+        at_ms: u64,
+    },
+    #[codec(index = 1)]
+    Format { format: u32, at_ms: u64 },
+}
+
 /// `POST /agents/{agent}/calls`: a command, in its session's sequence for
 /// that agent. The session's key signs it.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]

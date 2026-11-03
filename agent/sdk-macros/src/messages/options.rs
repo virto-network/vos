@@ -4,7 +4,7 @@ use super::*;
 
 /// A handler's options, from `#[msg(role = "...", gas = N, linearizable)]`,
 /// or an attestable method's, from `#[attestable(gas = N, venue_bound,
-/// device)]`.
+/// device, reference = path, headroom = k)]`.
 #[derive(Default)]
 pub(super) struct Options {
     pub(super) role: Option<String>,
@@ -20,6 +20,12 @@ pub(super) struct Options {
     pub(super) device: Option<(String, Span)>,
     /// An attestable method that is a device kernel, `device`.
     pub(super) device_kernel: Option<Span>,
+    /// A device kernel's reference run, `reference = path`: the function
+    /// giving its reference arguments, a public, valid witness.
+    pub(super) reference: Option<syn::Path>,
+    /// A device kernel's headroom, `headroom = k`: each log size of its
+    /// program raised by `k` over its reference run's.
+    pub(super) headroom: Option<(u8, Span)>,
     /// An auth guard that admits each nullifier once, `once`.
     pub(super) once: Option<Span>,
 }
@@ -85,6 +91,28 @@ pub(super) fn msg_options(attribute: &Attribute) -> syn::Result<Options> {
                     }
                     options.device_kernel = Some(span);
                 }
+            } else if meta.path.is_ident("reference") {
+                if options.reference.is_some() {
+                    return Err(meta.error("`reference = ...` given twice"));
+                }
+                options.reference = Some(meta.value()?.parse::<syn::Path>()?);
+            } else if meta.path.is_ident("headroom") {
+                let span = meta.path.span();
+                let Expr::Lit(ExprLit {
+                    lit: Lit::Int(value),
+                    ..
+                }) = meta.value()?.parse::<Expr>()?
+                else {
+                    return Err(meta.error("expected an integer headroom"));
+                };
+                let headroom: u8 = value.base10_parse()?;
+                if headroom > vos_wire::records::MAX_HEADROOM {
+                    return Err(meta.error(format!(
+                        "a device kernel's headroom is at most {}",
+                        vos_wire::records::MAX_HEADROOM
+                    )));
+                }
+                options.headroom = Some((headroom, span));
             } else if meta.path.is_ident("once") {
                 options.once = Some(meta.path.span());
             } else if meta.path.is_ident("gas") {
@@ -99,7 +127,8 @@ pub(super) fn msg_options(attribute: &Attribute) -> syn::Result<Options> {
             } else {
                 return Err(meta.error(
                     "expected `role = \"...\"`, `gas = N`, `linearizable`, `venue_bound`, \
-                     `device`, `credential = ...`, `device = \"...\"` or `once`",
+                     `device`, `reference = path`, `headroom = k`, `credential = ...`, \
+                     `device = \"...\"` or `once`",
                 ));
             }
             Ok(())

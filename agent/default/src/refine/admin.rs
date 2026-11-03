@@ -1,4 +1,5 @@
-//! Operator commands: installs, roles and reporting every window.
+//! Operator commands: installs, roles, reporting every window, and
+//! retiring a device kernel's previous release.
 
 use alloc::vec::Vec;
 
@@ -6,7 +7,7 @@ use vos_wire::abi::cap::{Limits, Refused, Target};
 use vos_wire::abi::{Failure, Kind, cap};
 use vos_wire::batch::Admin;
 use vos_wire::ids::InstanceId;
-use vos_wire::records::{Admitting, Derivation, Installed};
+use vos_wire::records::{Admitting, Derivation, Installed, Previous, RETIREMENT_MS};
 use vos_wire::result::{InputRef, Outcome, Step, Write};
 use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode, SpaceId, WindowClock, keys};
@@ -43,11 +44,15 @@ pub(crate) fn admin(base: &Base, admin: Admin) -> Step {
                 });
             }
             let agent_target = agent.map(|agent| agent.target);
-            let installed =
+            let mut installed =
                 match install(agent_target, host_target(base), derivation, roles, target) {
                     Ok(installed) => installed,
                     Err(outcome) => return failed(outcome),
                 };
+            let Ok(over) = base.decoded::<Installed>(&keys::installed(instance)) else {
+                return failed(Outcome::failed(Failure::Trapped));
+            };
+            installed.previous = previous(over.as_ref(), &installed, base.time);
             let credentials = match credentials(base, instance, &installed.schema) {
                 Ok(credentials) => credentials,
                 Err(outcome) => return failed(outcome),
@@ -99,6 +104,35 @@ pub(crate) fn admin(base: &Base, admin: Admin) -> Step {
             };
             (alloc::vec![write], Vec::new())
         }
+        Admin::Retire {
+            instance,
+            method,
+            at_ms,
+        } => {
+            let mut installed = match base.decoded::<Installed>(&keys::installed(instance)) {
+                Ok(Some(installed)) => installed,
+                Ok(None) => return failed(Outcome::failed(Failure::Unknown)),
+                Err(_) => return failed(Outcome::failed(Failure::Trapped)),
+            };
+            for previous in &mut installed.previous {
+                if previous.method == method {
+                    previous.retires_ms = previous.retires_ms.min(at_ms);
+                }
+            }
+            installed
+                .previous
+                .retain(|previous| previous.retires_ms > base.time);
+            let kept = installed
+                .previous
+                .iter()
+                .find(|previous| previous.method == method)
+                .map(|previous| previous.retires_ms);
+            let write = Write {
+                key: keys::installed(instance),
+                value: Some(installed.encode()),
+            };
+            (alloc::vec![write], kept.encode())
+        }
     };
     let written: usize = writes
         .iter()
@@ -110,6 +144,45 @@ pub(crate) fn admin(base: &Base, admin: Admin) -> Step {
     let mut run = consumed(InputRef::Admin, Outcome::Done(reply));
     run.writes.extend(writes);
     Step::Ran(run)
+}
+
+/// The device kernels' previous releases an install of `installed` over
+/// `over` keeps at batch time `now`, by method in ascending order: for a
+/// device kernel whose release the install replaces, the replaced one,
+/// admitted for [`RETIREMENT_MS`]; for one it keeps, the previous release
+/// `over` kept, while it is admitted. Nothing older than one release is
+/// kept, and a method that is no device kernel now keeps none.
+fn previous(over: Option<&Installed>, installed: &Installed, now: u64) -> Vec<Previous> {
+    let Some(over) = over else {
+        return Vec::new();
+    };
+    let mut previous: Vec<Previous> = installed
+        .derivation
+        .references
+        .iter()
+        .filter_map(|reference| {
+            let method = reference.method;
+            let release = installed.derivation.device(method)?;
+            let was = over
+                .schema
+                .method(method)
+                .filter(|schema| schema.kind == Kind::Device)
+                .and_then(|_| over.derivation.device(method))?;
+            if was != release {
+                return Some(Previous {
+                    method,
+                    release: was,
+                    retires_ms: now.saturating_add(RETIREMENT_MS),
+                });
+            }
+            over.previous
+                .iter()
+                .find(|kept| kept.method == method && kept.retires_ms > now)
+                .copied()
+        })
+        .collect();
+    previous.sort_by_key(|kept| kept.method);
+    previous
 }
 
 /// The row naming the agent's credential actor that an install of
@@ -268,12 +341,34 @@ fn package(derivation: Derivation, roles: Vec<(Vec<u8>, u8)>, target: Target) ->
         roles,
         schema,
         target,
+        previous: Vec::new(),
     };
     for kernel in &installed.derivation.kernels {
         let schema = installed.schema.method(kernel.method)?;
         if !schema.kind.is_attestable() {
             return None;
         }
+    }
+    // A reference to each device kernel and to nothing else, once each.
+    let devices = installed
+        .schema
+        .methods
+        .iter()
+        .filter(|method| method.kind == Kind::Device)
+        .count();
+    for reference in &installed.derivation.references {
+        installed.derivation.device(reference.method)?;
+        if installed.schema.method(reference.method)?.kind != Kind::Device {
+            return None;
+        }
+    }
+    let references = &installed.derivation.references;
+    if references.len() != devices
+        || references
+            .windows(2)
+            .any(|pair| pair[0].method >= pair[1].method)
+    {
+        return None;
     }
     let mut attestables = 0;
     for method in &installed.schema.methods {

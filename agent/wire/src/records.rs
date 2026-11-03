@@ -11,11 +11,11 @@ use crate::{Decode, Encode};
 
 /// The programs a node derived from a package's ELF at its install, by
 /// their hashes: the actor's program, which holds its handlers and its
-/// workflows, and a kernel for each attestable method, by method in
-/// ascending order; their provenance, the ELF's hash and the version of
-/// the transpiler that derived them; and the pages of the actor's heap its
-/// program leaves out. The same ELF and version derive the same bytes on
-/// any machine.
+/// workflows, a kernel for each attestable method, by method in ascending
+/// order, and each device kernel's reference program, likewise; their
+/// provenance, the ELF's hash and the version of the transpiler that
+/// derived them; and the pages of the actor's heap its program leaves out.
+/// The same ELF and version derive the same bytes on any machine.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Derivation {
     pub program: ProgramHash,
@@ -26,7 +26,53 @@ pub struct Derivation {
     /// which a workflow's machine maps there: a handler and a kernel run
     /// on the heap their programs hold, a workflow on the whole.
     pub heap: u32,
+    /// Each device kernel's reference, by method in ascending order.
+    pub references: Vec<Reference>,
 }
+
+/// A device kernel's reference (`#[attestable(device, reference = path,
+/// headroom = k)]`): the program whose run returns the kernel's reference
+/// arguments, a public, valid witness, and the headroom over that run's
+/// sizes. A device program is the kernel's chips at the log sizes its run
+/// on those arguments needs, each raised by `headroom`
+/// (`vos_pvm_recair::device::Program`), so every node and every release
+/// computes the same program from the same three.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Reference {
+    pub method: MethodId,
+    pub program: ProgramHash,
+    pub headroom: u8,
+}
+
+/// The most headroom a device kernel declares: each log size raised by at
+/// most four.
+pub const MAX_HEADROOM: u8 = 4;
+
+/// A device kernel's release: its kernel, its reference program and its
+/// headroom, from which its device program is computed. Two installs of
+/// the same release compute one program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Encode, Decode)]
+pub struct DeviceRelease {
+    pub kernel: ProgramHash,
+    pub reference: ProgramHash,
+    pub headroom: u8,
+}
+
+/// A device kernel's previous release, which its guard still admits until
+/// `retires_ms` by the agent's batch time (`light-node.md` §4.4): kept by
+/// an install that replaced the kernel, at most one a method, deleted at
+/// the next install or retirement past its date.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Previous {
+    pub method: MethodId,
+    pub release: DeviceRelease,
+    pub retires_ms: u64,
+}
+
+/// How long an install keeps a device kernel's previous release admitted
+/// by default: 60 days. The operator may retire it at any earlier time,
+/// now included ([`crate::batch::Admin::Retire`]).
+pub const RETIREMENT_MS: u64 = 60 * 24 * 60 * 60 * 1000;
 
 /// An attestable method's kernel: its program; the root of the page tree
 /// over its initial memory, laid out with no arguments, from which a proof
@@ -136,6 +182,7 @@ impl Derivation {
         actor: &[u8],
         kernels: &[(u32, Vec<u8>)],
         shapes: &[Shape],
+        references: &[(u32, Vec<u8>, u8)],
         transpiler: u32,
         heap: u32,
     ) -> Self {
@@ -157,6 +204,14 @@ impl Derivation {
             elf: crate::result::digest(elf),
             transpiler,
             heap,
+            references: references
+                .iter()
+                .map(|(method, program, headroom)| Reference {
+                    method: MethodId(*method),
+                    program: ProgramHash::of(program),
+                    headroom: *headroom,
+                })
+                .collect(),
         }
     }
 
@@ -168,9 +223,25 @@ impl Derivation {
             .map(|kernel| kernel.program)
     }
 
-    /// Every program it derived, the actor's first: what its agent pins.
+    /// The release of device kernel `method`: its kernel and its reference.
+    pub fn device(&self, method: MethodId) -> Option<DeviceRelease> {
+        let reference = self
+            .references
+            .iter()
+            .find(|reference| reference.method == method)?;
+        Some(DeviceRelease {
+            kernel: self.kernel(method)?,
+            reference: reference.program,
+            headroom: reference.headroom,
+        })
+    }
+
+    /// Every program it derived, the actor's first, then the kernels', then
+    /// the references': what its agent pins.
     pub fn programs(&self) -> impl Iterator<Item = ProgramHash> + '_ {
-        core::iter::once(self.program).chain(self.kernels.iter().map(|kernel| kernel.program))
+        core::iter::once(self.program)
+            .chain(self.kernels.iter().map(|kernel| kernel.program))
+            .chain(self.references.iter().map(|reference| reference.program))
     }
 }
 
@@ -194,6 +265,10 @@ pub struct Installed {
     pub roles: Vec<(Vec<u8>, u8)>,
     pub schema: Schema,
     pub target: Target,
+    /// The device kernels' previous releases its guards still admit, by
+    /// method in ascending order: each kernel's window is its release in
+    /// the derivation and its previous one here (`light-node.md` §4.4).
+    pub previous: Vec<Previous>,
 }
 
 impl Installed {
@@ -214,9 +289,29 @@ impl Installed {
         self.derivation.kernel(method)
     }
 
-    /// Every program the instance runs, its own first: what its agent pins.
+    /// Every program the instance runs, its own first, then its device
+    /// kernels' previous releases': what its agent pins.
     pub fn programs(&self) -> impl Iterator<Item = ProgramHash> + '_ {
-        self.derivation.programs()
+        self.derivation.programs().chain(
+            self.previous
+                .iter()
+                .flat_map(|previous| [previous.release.kernel, previous.release.reference]),
+        )
+    }
+
+    /// Device kernel `method`'s window: its release, then its previous one
+    /// while that is admitted at `now`, by the agent's batch time.
+    pub fn window(&self, method: MethodId, now: u64) -> Vec<DeviceRelease> {
+        let previous = self
+            .previous
+            .iter()
+            .find(|previous| previous.method == method && previous.retires_ms > now)
+            .map(|previous| previous.release);
+        self.derivation
+            .device(method)
+            .into_iter()
+            .chain(previous)
+            .collect()
     }
 }
 

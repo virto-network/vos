@@ -16,6 +16,49 @@ extern crate alloc;
 use vos_sdk::p2::{Digest, InPlace, Path, Secret, Tag, TagHash};
 use vos_sdk::prelude::*;
 
+/// The kernels' reference runs: the credential kernels' public reference
+/// statement (`vos_sdk::p2::reference`), each in its kernel's arguments.
+mod reference {
+    use alloc::vec::Vec;
+
+    use vos_sdk::p2::reference::{BINDING, PATH, SCOPE, SECRET};
+
+    use super::*;
+
+    pub fn auth() -> sdk_device::Auth {
+        let member = Tag::Member.hash(&SECRET);
+        sdk_device::Auth {
+            path: PATH,
+            secret: SECRET,
+            claim: AuthClaim {
+                map_root: PATH.root(&Tag::Leaf.hash(&member)),
+                scope: SCOPE,
+                nullifier: Tag::Nf.hash(&SECRET).hash(&SCOPE),
+                binding: BINDING,
+            },
+        }
+    }
+
+    pub fn owner() -> sdk_device::Owner {
+        sdk_device::Owner {
+            secret: SECRET,
+            claim: OwnerClaim {
+                owner: Tag::Owner.hash(&SECRET),
+                binding: BINDING,
+            },
+        }
+    }
+
+    /// Owner's reference in `owner_lean`'s arguments: their bytes, kept for
+    /// the run, decoded where they lie.
+    pub fn owner_lean() -> sdk_device::OwnerLean {
+        let bytes: &'static [u8] = Vec::leak(owner().encode());
+        sdk_device::OwnerLean::decode(bytes)
+            .expect("owner's arguments are owner_lean's")
+            .0
+    }
+}
+
 /// Auth's claim: the member's leaf under `map_root`, and `nullifier` its
 /// pseudonym in `scope`.
 #[derive(Clone, Copy, InPlace)]
@@ -79,7 +122,7 @@ impl SdkDevice {
 
     /// The secret's member's leaf lies under `map_root` by `path`, and
     /// `nullifier` is its nullifier in `scope`.
-    #[attestable(device)]
+    #[attestable(device, reference = reference::auth)]
     pub fn auth(path: &Path, secret: &Secret, #[public] claim: &AuthClaim) {
         let member = Tag::Member.hash(secret);
         assert_eq!(path.root(&Tag::Leaf.hash(&member)), claim.map_root);
@@ -87,7 +130,7 @@ impl SdkDevice {
     }
 
     /// The secret's owner digest is `owner`.
-    #[attestable(device)]
+    #[attestable(device, reference = reference::owner)]
     pub fn owner(secret: &Secret, #[public] claim: &OwnerClaim) {
         assert_eq!(Tag::Owner.hash(secret), claim.owner);
     }
@@ -95,7 +138,7 @@ impl SdkDevice {
     /// Owner's statement by hand: the secret's 8-aligned words and the
     /// tag's written into one block, the call, and the result compared with
     /// the claim's word by word, never stopping early.
-    #[attestable(device)]
+    #[attestable(device, reference = reference::owner_lean)]
     pub fn owner_lean(secret: Raw<32>, #[public] owner: Raw<32>, #[public] binding: Raw<32>) {
         let _ = binding;
         let mut block = [0u64; 8];

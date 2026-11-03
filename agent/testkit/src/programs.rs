@@ -90,6 +90,7 @@ pub fn bare(program: ProgramHash) -> Derivation {
         elf: [0; 32],
         transpiler: vos_pvm_compiler::TRANSPILER_VERSION,
         heap: 0,
+        references: Vec::new(),
     }
 }
 

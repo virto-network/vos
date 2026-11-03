@@ -76,6 +76,65 @@ pub(super) fn attestable_entry(
     (function, row)
 }
 
+/// A device kernel's reference run's entry, `__vos_reference_<name>`, and
+/// its row in the program's table: it reads no argument and returns as its
+/// output the encoding of the message its `reference = path` gives, which
+/// is the kernel's arguments as its witness input reads them (an argument
+/// in place encodes as its bytes). Its row marks it a device kernel's
+/// reference and carries its headroom.
+pub(super) fn reference_entry(
+    handler: &Handler,
+    actor: &Ident,
+    module: &Ident,
+    message: &Ident,
+) -> (Tokens, Tokens) {
+    let id = handler.id;
+    let entry = format_ident!("__vos_reference_{}", handler.name);
+    let path = handler
+        .options
+        .reference
+        .as_ref()
+        .expect("a device kernel names its reference");
+    let headroom = handler.options.headroom.map_or(0, |(headroom, _)| headroom);
+    // A reference of another type is refused where it is named.
+    let reference = quote::quote_spanned! {path.span()=>
+        let reference: #module::#message = #path();
+    };
+    let function = quote! {
+        /// The device kernel's reference arguments, encoded as its witness
+        /// input reads them, returned as this entry's output with their
+        /// io-hash at `io_hash`: the root of the reference program, whose
+        /// run gives the arguments the kernel's device program is sized on.
+        ///
+        /// # Safety
+        ///
+        /// `io_hash` must point at 32 writable bytes.
+        #[doc(hidden)]
+        #[inline(never)]
+        pub unsafe extern "C" fn #entry(
+            _arguments: *const u8,
+            _len: u64,
+            io_hash: *mut [u8; 32],
+        ) -> ::vos_sdk::runtime::Output {
+            #reference
+            let mut parts = ::vos_sdk::device::DeviceReturn::new();
+            ::vos_sdk::Encode::encode_to(&reference, parts.output());
+            // SAFETY: the caller's contract.
+            unsafe { parts.end(io_hash) }
+        }
+    };
+    let row = quote! {
+        ::vos_sdk::runtime::Attestable {
+            method: #id as u64
+                | ::vos_sdk::runtime::DEVICE
+                | ::vos_sdk::runtime::REFERENCE
+                | (#headroom as u64) << ::vos_sdk::runtime::HEADROOM_SHIFT,
+            entry: super::#actor::#entry,
+        }
+    };
+    (function, row)
+}
+
 /// A device kernel's entry's body: its arguments decoded in order, each by
 /// reference read in place (`vos_sdk::p2::in_place`), never copied, or its
 /// message decoded whole when none is by reference; its
