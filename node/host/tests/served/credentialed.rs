@@ -812,7 +812,7 @@ fn a_revoked_members_root_goes_stale_and_owners_pay_their_rows() {
     assert_eq!(balance, Some(75));
 }
 
-/// `vos-device`'s `SCOPE_VECTOR`: `scope([0x51; 32], 4, 2, "login")`, the
+/// `vos-light`'s `SCOPE_VECTOR`: `scope([0x51; 32], 4, 2, "login")`, the
 /// name in SCALE.
 const SCOPE_VECTOR: [u8; 32] = [
     176, 47, 24, 3, 211, 3, 208, 103, 92, 44, 198, 75, 144, 255, 58, 99, 210, 27, 59, 25, 235, 172,
@@ -843,10 +843,10 @@ fn device_send(founded: &Founded, at: NodeNumber, request: &[u8]) -> Vec<u8> {
 /// a `RootUnknown` answer decodes as the library's.
 #[test]
 fn the_device_librarys_proofs_are_admitted() {
-    use vos_device::wire::{self, Answer};
+    use vos_light::wire::{self, Answer};
 
     assert_eq!(
-        vos_device::scope(&[0x51; 32], 4, 2, b"login")
+        vos_light::scope(&[0x51; 32], 4, 2, b"login")
             .unwrap()
             .to_bytes(),
         SCOPE_VECTOR
@@ -860,25 +860,25 @@ fn the_device_librarys_proofs_are_admitted() {
     let at = founded.follower();
     let space = founded.space.0;
     let agent = founded.agent;
-    let secret = vos_device::derive_secret(&[0x5e; 32], &[0x42; 32]);
-    let member = vos_device::member(&secret).to_bytes();
+    let secret = vos_light::derive_secret(&[0x5e; 32], &[0x42; 32]);
+    let member = vos_light::member(&secret).to_bytes();
     founded.write(CREDENTIALS, "enroll", member);
-    let prover = vos_device::Prover::new(vos_device::ProverConfig {
-        threads: vos_device::Threads::Count(4),
-        ..vos_device::ProverConfig::default()
+    let prover = vos_light::Prover::new(vos_light::ProverConfig {
+        threads: vos_light::Threads::Count(4),
+        ..vos_light::ProverConfig::default()
     })
     .unwrap();
     let time = || client::time(founded.cluster.target(at)).unwrap();
     let identity = founded.operator.lock().unwrap().identity(agent).unwrap();
 
-    let mut keeper = vos_device::PathKeeper::new(vos_device::member(&secret));
+    let mut keeper = vos_light::PathKeeper::new(vos_light::member(&secret));
     let now = time();
     assert!(keeper.due(now, None));
     let query = wire::path_query(
         agent.0,
         &identity,
         CREDENTIALS.0,
-        &vos_device::member(&secret),
+        &vos_light::member(&secret),
         now + 60_000,
     )
     .unwrap();
@@ -889,7 +889,7 @@ fn the_device_librarys_proofs_are_admitted() {
 
     let name = b"login";
     let login = |expires_ms| {
-        vos_device::Call::new(
+        vos_light::Call::new(
             space,
             agent.0,
             POLL.0,
@@ -903,8 +903,8 @@ fn the_device_librarys_proofs_are_admitted() {
     let proof = prover
         .prove_auth(&secret, keeper.witness().unwrap(), name, &call)
         .unwrap();
-    vos_device::verify(&proof, &call, Some(name)).unwrap();
-    let vos_device::CredentialPublic::Auth {
+    vos_light::verify(&proof, &call, Some(name)).unwrap();
+    let vos_light::CredentialPublic::Auth {
         scope, nullifier, ..
     } = proof.public
     else {
@@ -959,7 +959,7 @@ fn the_device_librarys_proofs_are_admitted() {
         agent.0,
         &identity,
         CREDENTIALS.0,
-        &vos_device::member(&secret),
+        &vos_light::member(&secret),
         now + 60_000,
     )
     .unwrap();
@@ -983,7 +983,7 @@ fn the_device_librarys_proofs_are_admitted() {
     ));
 
     // An owner proof pays from the row its digest claims.
-    let owner = vos_device::owner(&secret).to_bytes();
+    let owner = vos_light::owner(&secret).to_bytes();
     let expires = time() + 60_000;
     for (row, digest) in [("device", owner), ("shop", Secret::new(9).owner())] {
         let row = row.as_bytes().to_vec();
@@ -992,7 +992,7 @@ fn the_device_librarys_proofs_are_admitted() {
         founded.write(PURSES, "mint", (row, 50u64));
     }
     let arguments = (b"device".to_vec(), b"shop".to_vec(), 20u64).encode();
-    let pay = vos_device::Call::new(
+    let pay = vos_light::Call::new(
         space,
         agent.0,
         PURSES.0,
@@ -1035,8 +1035,8 @@ const DEVICE: InstanceId = InstanceId(4);
 /// (`Proof`).
 #[test]
 fn a_device_kernels_proof_signs_in_as_an_auth_proof_does() {
-    use vos_device::wire::{self, Answer};
-    use vos_device::{
+    use vos_light::wire::{self, Answer};
+    use vos_light::{
         Call, DEVICE_FORMAT, DEVICE_PEAK_BYTES, DeviceProgram, Prover, ProverConfig, Threads,
     };
 
@@ -1053,19 +1053,15 @@ fn a_device_kernels_proof_signs_in_as_an_auth_proof_does() {
     let login = method(&device, "login");
     let at = founded.follower();
     let leader = founded.cluster.leader(agent).unwrap();
-    let secret = vos_device::derive_secret(&[0x6d; 32], &[0x42; 32]);
-    founded.write(
-        CREDENTIALS,
-        "enroll",
-        vos_device::member(&secret).to_bytes(),
-    );
+    let secret = vos_light::derive_secret(&[0x6d; 32], &[0x42; 32]);
+    founded.write(CREDENTIALS, "enroll", vos_light::member(&secret).to_bytes());
     let time = || client::time(founded.cluster.target(at)).unwrap();
     let identity = founded.operator.lock().unwrap().identity(agent).unwrap();
     let query = wire::path_query(
         agent.0,
         &identity,
         CREDENTIALS.0,
-        &vos_device::member(&secret),
+        &vos_light::member(&secret),
         time() + 60_000,
     )
     .unwrap();
@@ -1091,7 +1087,7 @@ fn a_device_kernels_proof_signs_in_as_an_auth_proof_does() {
         .unwrap()
     };
     let name = b"login";
-    let send = |at: NodeNumber, call: &Call, proof: &vos_device::CredentialProof| {
+    let send = |at: NodeNumber, call: &Call, proof: &vos_light::CredentialProof| {
         wire::credentialed_answer(&device_send(&founded, at, &wire::credentialed(call, proof)))
             .unwrap()
     };
@@ -1108,8 +1104,8 @@ fn a_device_kernels_proof_signs_in_as_an_auth_proof_does() {
         .prove_device_auth(&secret, &witness, name, &signin, &program)
         .unwrap();
     assert_eq!(proof.format, DEVICE_FORMAT);
-    vos_device::verify_device(&proof, &signin, name, &program).unwrap();
-    let vos_device::CredentialPublic::Auth { nullifier, .. } = proof.public else {
+    vos_light::verify_device(&proof, &signin, name, &program).unwrap();
+    let vos_light::CredentialPublic::Auth { nullifier, .. } = proof.public else {
         unreachable!()
     };
     assert_eq!(
@@ -1155,7 +1151,7 @@ fn a_device_kernels_proof_signs_in_as_an_auth_proof_does() {
     let proof = prover
         .prove_device_auth(&secret, &witness, name, &fresh, &program)
         .unwrap();
-    let as_credential = vos_device::CredentialProof {
+    let as_credential = vos_light::CredentialProof {
         format: verifier::FORMAT,
         ..proof.clone()
     };
@@ -1168,7 +1164,7 @@ fn a_device_kernels_proof_signs_in_as_an_auth_proof_does() {
     let proved = prover
         .prove_auth(&secret, &witness, name, &credential)
         .unwrap();
-    let as_device = vos_device::CredentialProof {
+    let as_device = vos_light::CredentialProof {
         format: DEVICE_FORMAT,
         ..proved
     };
@@ -1178,7 +1174,7 @@ fn a_device_kernels_proof_signs_in_as_an_auth_proof_does() {
         "a credential proof's binding names its circuit, not the device program"
     );
     let mut other = proof.clone();
-    let vos_device::CredentialPublic::Auth { nullifier, .. } = &mut other.public else {
+    let vos_light::CredentialPublic::Auth { nullifier, .. } = &mut other.public else {
         unreachable!()
     };
     nullifier.0[0] ^= 1;
@@ -1188,7 +1184,7 @@ fn a_device_kernels_proof_signs_in_as_an_auth_proof_does() {
         "another io-hash"
     );
     let mut wide = proof.clone();
-    let vos_device::CredentialPublic::Auth { nullifier, .. } = &mut wide.public else {
+    let vos_light::CredentialPublic::Auth { nullifier, .. } = &mut wide.public else {
         unreachable!()
     };
     nullifier.0[0] = tree::P;

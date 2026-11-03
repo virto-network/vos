@@ -7,6 +7,8 @@ members = [
     "agent/testkit",
     "agent/tree",
     "node/host",
+    "node/exec",
+    "node/light",
     "node/api",
     "node/http",
     "node/gateway",
@@ -34,7 +36,6 @@ members = [
     "pvm/proof/anchor",
     "pvm/proof/derive",
     "pvm/proof/verifier",
-    "pvm/device",
     "pvm/bench",
     "tools/jam-dev",
     "tools/scale",
@@ -50,6 +51,8 @@ default-members = [
     "agent/testkit",
     "agent/tree",
     "node/host",
+    "node/exec",
+    "node/light",
     "node/api",
     "node/http",
     "node/gateway",
@@ -76,7 +79,6 @@ default-members = [
     "pvm/proof/anchor",
     "pvm/proof/derive",
     "pvm/proof/verifier",
-    "pvm/device",
     "pvm/bench",
 ]
 exclude = [
@@ -213,9 +215,9 @@ vos-pvm-proof-verifier = { path = "pvm/proof/verifier" }
 vos-pvm-precompiles = { path = "pvm/proof/precompiles" }
 vos-pvm-poseidon2 = { path = "pvm/proof/poseidon2" }
 vos-pvm-recair-air = { path = "pvm/proof/recair-air" }
-vos-pvm-recair = { path = "pvm/proof/recair" }
+vos-pvm-recair = { path = "pvm/proof/recair", default-features = false }
 vos-pvm-final-verifier = { path = "pvm/proof/final-verifier" }
-vos-device = { path = "pvm/device" }
+vos-light = { path = "node/light" }
 vos-statement = { path = "pvm/proof/statement" }
 vos-anchor = { path = "pvm/proof/anchor" }
 vos-statement-service = { path = "pvm/proof/statement/service" }
@@ -226,6 +228,7 @@ vos-pvm-codec = { path = "pvm/codec", default-features = false }
 vos-pvm-codec-derive = { path = "pvm/codec-derive" }
 vos-wire = { path = "agent/wire" }
 vos-tree = { path = "agent/tree" }
+vos-exec = { path = "node/exec" }
 vos-net = { path = "node/net" }
 vos-api = { path = "node/api" }
 vos-http = { path = "node/http" }

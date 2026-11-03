@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::SigningKey;
 use vos_checker::calls::installed;
 use vos_checker::programs::{Programs, actor, credentials, credentials_elf, method, package};
-use vos_device::{DEVICE_FORMAT, DeviceProgram, Prover, ProverConfig, Threads};
+use vos_light::{DEVICE_FORMAT, DeviceProgram, Prover, ProverConfig, Threads};
 use vos_node::client::{self, Client, Target};
 use vos_node::{Config, Node};
 use vos_pvm_recair::device::{auth_arguments, auth_public};
@@ -272,7 +272,7 @@ fn main() {
     let prover = options.prove.then(|| {
         Prover::new(ProverConfig {
             threads: Threads::Auto,
-            max_memory: vos_device::DEVICE_PEAK_BYTES,
+            max_memory: vos_light::DEVICE_PEAK_BYTES,
         })
         .expect("a prover")
     });

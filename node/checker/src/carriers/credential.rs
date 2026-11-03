@@ -1,5 +1,5 @@
 //! A member's device credential as needles (`proving.md` §8,
-//! `pvm/device/SECURITY.md`): what its secret source gives and all that
+//! `node/light/SECURITY.md`): what its secret source gives and all that
 //! follows from it, which nothing but the device holds, and where the
 //! member sits in the credential actor's tree, which a credentialed call
 //! never carries.
@@ -11,7 +11,7 @@ use vos_wire::credentials::{self, EMPTY, P, Path, Tag, Words};
 
 use super::{Kind, Needle, Needles, SMALL_FLOOR};
 
-/// The derivation's domain, as `vos_device::derive_secret` hashes it.
+/// The derivation's domain, as `vos_light::derive_secret` hashes it.
 const SECRET_DOMAIN: &[u8] = b"vos/device/secret/v1";
 
 /// `w` and `s` from a secret source's output `source_output` for the

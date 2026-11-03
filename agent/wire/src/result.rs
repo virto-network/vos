@@ -312,6 +312,9 @@ pub enum InputRef {
     /// binding digest.
     #[codec(index = 9)]
     Credentialed { binding: [u8; 32] },
+    /// A merge on a device ([`crate::batch::Merge`]).
+    #[codec(index = 10)]
+    Merge,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]

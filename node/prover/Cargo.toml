@@ -28,7 +28,7 @@ tracing = "0.1"
 vos-venue = { workspace = true }
 vos-wire = { workspace = true }
 vos-pvm-proof = { workspace = true, optional = true }
-vos-pvm-recair = { workspace = true, optional = true }
+vos-pvm-recair = { workspace = true, optional = true, features = ["recursion"] }
 vos-pvm-compiler = { workspace = true, optional = true }
 vos-pvm-program = { workspace = true, optional = true }
 

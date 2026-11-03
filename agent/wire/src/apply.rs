@@ -349,7 +349,8 @@ impl Apply<'_> {
             | InputRef::Report { .. }
             | InputRef::Close { .. }
             | InputRef::Proven { .. }
-            | InputRef::Credentialed { .. } => {}
+            | InputRef::Credentialed { .. }
+            | InputRef::Merge => {}
             InputRef::Ack { to, sequence } => {
                 // Monotonic and idempotent: a stale ack does nothing, one
                 // past what was sent stops there, and one ack clears at most

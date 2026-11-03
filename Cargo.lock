@@ -4980,26 +4980,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "vos-device"
+name = "vos-exec"
 version = "0.1.0"
 dependencies = [
- "blake2 0.10.6",
- "ed25519-dalek 2.2.0",
- "getrandom 0.2.17",
- "libc",
- "num-traits",
- "rayon",
- "sha2 0.10.9",
- "stwo",
- "vos-api",
- "vos-pvm-codec",
- "vos-pvm-final-verifier",
- "vos-pvm-precompiles",
- "vos-pvm-proof",
- "vos-pvm-recair",
- "vos-pvm-recair-air",
+ "fjall",
+ "hex",
+ "tracing",
+ "vos-pvm",
+ "vos-pvm-program",
  "vos-wire",
- "zeroize",
 ]
 
 [[package]]
@@ -5089,6 +5078,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "vos-light"
+version = "0.1.0"
+dependencies = [
+ "blake2 0.10.6",
+ "ed25519-dalek 2.2.0",
+ "fjall",
+ "getrandom 0.2.17",
+ "libc",
+ "num-traits",
+ "rayon",
+ "sha2 0.10.9",
+ "stwo",
+ "tempfile",
+ "vos-api",
+ "vos-checker",
+ "vos-exec",
+ "vos-light",
+ "vos-pvm",
+ "vos-pvm-codec",
+ "vos-pvm-compiler",
+ "vos-pvm-final-verifier",
+ "vos-pvm-precompiles",
+ "vos-pvm-proof",
+ "vos-pvm-recair",
+ "vos-pvm-recair-air",
+ "vos-testkit",
+ "vos-wire",
+ "zeroize",
+]
+
+[[package]]
 name = "vos-net"
 version = "0.1.0"
 dependencies = [
@@ -5126,10 +5146,11 @@ dependencies = [
  "tracing",
  "vos-api",
  "vos-checker",
- "vos-device",
+ "vos-exec",
  "vos-http",
  "vos-jam",
  "vos-jam-dev",
+ "vos-light",
  "vos-net",
  "vos-node-prover",
  "vos-pvm",
@@ -5172,7 +5193,8 @@ dependencies = [
  "stwo",
  "tempfile",
  "vos-checker",
- "vos-device",
+ "vos-light",
+ "vos-pvm-compiler",
  "vos-pvm-proof",
  "vos-pvm-recair",
  "vos-pvm-recair-air",

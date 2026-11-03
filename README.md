@@ -31,7 +31,7 @@ origin rather than who the member is.
 - The security notes: [`node/SECURITY.md`](node/SECURITY.md) (the
   credential surface), [`pvm/proof/SECURITY.md`](pvm/proof/SECURITY.md)
   (what a verified proof proves) and
-  [`pvm/device/SECURITY.md`](pvm/device/SECURITY.md) (the device library).
+  [`node/light/SECURITY.md`](node/light/SECURITY.md) (the light node and its device library).
 
 ## The crates
 
@@ -42,7 +42,6 @@ origin rather than who the member is.
     (`recair`, `recair-air`), Poseidon2, the final verifier, the statement
     a venue judges, `anchor` (a space's identity, windows and roots), the
     JAM statements service and the precompile shims.
-  - `device`: the device library, a member's credential proofs.
   - `guest/`: the guest toolchain; `bench`: benches and cross-host checks.
 - `agent/`: the agent side.
   - `wire` (shared wire types), `sdk` and `sdk-macros` (`#[actor]`,
@@ -50,8 +49,11 @@ origin rather than who the member is.
     (a native host and the reference model of the default agent).
   - The guest programs: `default` (the default agent), `representative`,
     `credentials`, `test-actors`.
-- `node/`: the node.
-  - `host` (storage, the leader loops, the API), `api` (the binary API),
+- `node/`: the node, and the light node.
+  - `host` (storage, the leader loops, the API), `exec` (the agent
+    program's runs, which the node and the light node share), `light` (the
+    light node: local actors over its own store, and the device library,
+    a member's credential proofs), `api` (the binary API),
     `net` (node-to-node channels), `prover` (the leader's prover worker),
     `venue` (anchoring and submitting statements), `jam` (an agent as a
     JAM service), `cli` (the `vos` command).

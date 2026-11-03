@@ -8,7 +8,7 @@ denial of service. It is descriptive, not a formal argument. The design is
 `docs/design/identity-and-authority.md` (§5 the request, its checks and
 the apply rule; §6 the credential actor; §7 the threat model) and
 `docs/design/proving.md` §8 (the statements). What the device library
-holds is `pvm/device/SECURITY.md`'s, and what a verified proof proves is
+holds is `node/light/SECURITY.md`'s, and what a verified proof proves is
 `pvm/proof/SECURITY.md`'s.
 
 ## Who is trusted

@@ -220,6 +220,7 @@ pub(crate) fn step() -> impl Strategy<Value = Step> {
             sequence,
         }),
         Just(InputRef::Admin),
+        Just(InputRef::Merge),
         any::<u64>().prop_map(|id| InputRef::Due {
             workflow: WorkflowId(id),
         }),

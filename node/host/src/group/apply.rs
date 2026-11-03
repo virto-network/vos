@@ -13,6 +13,7 @@ use vos_wire::{Decode, keys};
 use super::Shared;
 use crate::fault::{Fault, read};
 use crate::node::Inner;
+use crate::pvm::AgentState;
 use crate::storage::Change;
 use crate::store::{EntryKind, LogEntry, Snapshot};
 use crate::{Backoff, lock, timeout};
@@ -265,7 +266,7 @@ async fn accumulate(
     let gas = shared.record.accumulate_gas;
     let accumulated = inner
         .executors
-        .run(move || machines.accumulate(state, agent, result, gas))
+        .run(move || machines.accumulate(&AgentState::of(state, agent), agent, result, gas))
         .await;
     match accumulated.map_err(Fault::from).flatten() {
         Ok(writes) => Ok(writes),

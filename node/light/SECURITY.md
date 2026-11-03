@@ -1,12 +1,32 @@
-# vos-device: security considerations
+# vos-light: security considerations
 
-What the device library holds, what it exposes the member's secret to, and
-what it leaves to the client that links it. It is descriptive, not a
+What the light node's local agent keeps, and what the device library
+holds, what it exposes the member's secret to, and what it leaves to the
+client that links it. It is descriptive, not a
 formal argument. The design is `docs/design/proving.md` §8 (the
 derivation, the statements, the library) and
 `docs/design/identity-and-authority.md` §7 (the in-space credential's
 threat model); what a verified proof proves is `pvm/proof/SECURITY.md`'s,
 and what a node does with one is `node/SECURITY.md`'s.
+
+## The local agent
+
+- **Its programs are the app's:** the agent program and each local
+  actor's programs are release artifacts the app embeds
+  (`light-node.md` §4.4); an install checks each program's hash against
+  the derivation it names, and the phone runs no transpiler.
+- **Its store is plaintext on the device:** the local agent's rows, its
+  programs and its last operation's time and seed, in a fjall database
+  under the directory the client names. The client keeps it in the app's
+  private storage; sealing what leaves the device is sync's, not the
+  store's.
+- **Each operation is one synced batch:** a process killed at any point
+  leaves the store before the operation or after it, never between; the
+  store is mended at open as a node's is (`vos_exec::store::recover`),
+  and one written in another layout is refused.
+- **A local call writes rows only:** the merge entry fails a handler
+  that sends, attests, writes a committed map or starts a workflow, with
+  nothing written.
 
 ## The secret and its containment
 

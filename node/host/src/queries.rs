@@ -21,7 +21,7 @@ use crate::asking::{PAUSE, REASK, pause};
 use crate::fault::Fault;
 use crate::group::Local;
 use crate::node::{CATCH_UP, CallError, Inner, Run};
-use crate::pvm;
+use crate::pvm::{self, AgentState};
 use crate::store::Snapshot;
 use crate::timeout;
 
@@ -354,7 +354,12 @@ impl Inner {
                 method,
                 arguments,
             });
-            let (output, _) = machines.refine(Arc::new(snapshot), agent, &work, gas)?;
+            let (output, _) = machines.refine(
+                AgentState::shared(Arc::new(snapshot), agent),
+                agent,
+                &work,
+                gas,
+            )?;
             Ok(Queried::Ran(pvm::decode::<Outcome>(&output)?, at))
         };
         self.executors

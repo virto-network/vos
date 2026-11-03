@@ -44,6 +44,8 @@ quinn = { version = "0.11.12", default-features = false }
 vos-http = { workspace = true }
 vos-net = { workspace = true }
 vos-pvm = { workspace = true }
+# The agent program's runs, over the node's snapshots and blobs.
+vos-exec = { workspace = true }
 # An install's package is an ELF: the node derives its programs.
 vos-pvm-compiler = { workspace = true }
 vos-raft = { workspace = true }
@@ -66,7 +68,7 @@ webpki = { package = "rustls-webpki", version = "0.103", default-features = fals
 # vos-node the checker's types do not unify with.
 vos-checker = { path = "../checker" }
 # The device library's requests and proofs, admitted by ingress end to end.
-vos-device = { workspace = true }
+vos-light = { workspace = true }
 # A kernel run alone, as an attest runs it.
 vos-testkit = { path = "../../agent/testkit" }
 proptest = "1"
