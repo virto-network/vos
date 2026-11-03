@@ -3507,7 +3507,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s4-credential"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=702f322cd933444172e0ec233ae32480dabfeca0#702f322cd933444172e0ec233ae32480dabfeca0"
+source = "git+https://codeberg.org/Virto/s4?rev=a11a57f806b944f62e16e63adc2f62eb81a28474#a11a57f806b944f62e16e63adc2f62eb81a28474"
 dependencies = [
  "getrandom 0.2.17",
  "hex",
@@ -3519,7 +3519,7 @@ dependencies = [
  "tokio",
  "toml 0.9.12+spec-1.1.0",
  "vos-api",
- "vos-device",
+ "vos-light",
  "vos-wire",
  "zeroize",
 ]
@@ -3527,7 +3527,7 @@ dependencies = [
 [[package]]
 name = "s4-protocol"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=702f322cd933444172e0ec233ae32480dabfeca0#702f322cd933444172e0ec233ae32480dabfeca0"
+source = "git+https://codeberg.org/Virto/s4?rev=a11a57f806b944f62e16e63adc2f62eb81a28474#a11a57f806b944f62e16e63adc2f62eb81a28474"
 dependencies = [
  "base64",
  "ciborium",
@@ -3539,7 +3539,7 @@ dependencies = [
 [[package]]
 name = "s4-rui"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=702f322cd933444172e0ec233ae32480dabfeca0#702f322cd933444172e0ec233ae32480dabfeca0"
+source = "git+https://codeberg.org/Virto/s4?rev=a11a57f806b944f62e16e63adc2f62eb81a28474#a11a57f806b944f62e16e63adc2f62eb81a28474"
 dependencies = [
  "base64",
  "libc",
@@ -3557,7 +3557,7 @@ dependencies = [
 [[package]]
 name = "s4-server"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=702f322cd933444172e0ec233ae32480dabfeca0#702f322cd933444172e0ec233ae32480dabfeca0"
+source = "git+https://codeberg.org/Virto/s4?rev=a11a57f806b944f62e16e63adc2f62eb81a28474#a11a57f806b944f62e16e63adc2f62eb81a28474"
 dependencies = [
  "rand 0.10.3",
  "russh",
@@ -3570,7 +3570,7 @@ dependencies = [
 [[package]]
 name = "s4-widgets"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=702f322cd933444172e0ec233ae32480dabfeca0#702f322cd933444172e0ec233ae32480dabfeca0"
+source = "git+https://codeberg.org/Virto/s4?rev=a11a57f806b944f62e16e63adc2f62eb81a28474#a11a57f806b944f62e16e63adc2f62eb81a28474"
 dependencies = [
  "s4-protocol",
  "serde",
@@ -4672,26 +4672,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "vos-device"
+name = "vos-exec"
 version = "0.1.0"
 dependencies = [
- "blake2 0.10.6",
- "ed25519-dalek 2.2.0",
- "getrandom 0.2.17",
- "libc",
- "num-traits",
- "rayon",
- "sha2 0.10.9",
- "stwo",
- "vos-api",
- "vos-pvm-codec",
- "vos-pvm-final-verifier",
- "vos-pvm-precompiles",
- "vos-pvm-proof",
- "vos-pvm-recair",
- "vos-pvm-recair-air",
+ "fjall",
+ "hex",
+ "tracing",
+ "vos-pvm",
  "vos-wire",
- "zeroize",
 ]
 
 [[package]]
@@ -4761,6 +4749,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "vos-light"
+version = "0.1.0"
+dependencies = [
+ "blake2 0.10.6",
+ "ed25519-dalek 2.2.0",
+ "fjall",
+ "getrandom 0.2.17",
+ "libc",
+ "num-traits",
+ "rayon",
+ "sha2 0.10.9",
+ "stwo",
+ "vos-api",
+ "vos-exec",
+ "vos-pvm",
+ "vos-pvm-codec",
+ "vos-pvm-final-verifier",
+ "vos-pvm-precompiles",
+ "vos-pvm-proof",
+ "vos-pvm-recair",
+ "vos-pvm-recair-air",
+ "vos-wire",
+ "zeroize",
+]
+
+[[package]]
 name = "vos-net"
 version = "0.1.0"
 dependencies = [
@@ -4790,6 +4804,7 @@ dependencies = [
  "smol",
  "tracing",
  "vos-api",
+ "vos-exec",
  "vos-http",
  "vos-net",
  "vos-node-prover",

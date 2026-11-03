@@ -32,7 +32,7 @@ vos-net = { workspace = true }
 vos-wire = { workspace = true }
 # An agent's identity, its creation record's BLAKE2b-256.
 vos-pvm-precompiles = { workspace = true }
-s4-server = { git = "https://codeberg.org/Virto/s4", rev = "702f322cd933444172e0ec233ae32480dabfeca0", optional = true }
+s4-server = { git = "https://codeberg.org/Virto/s4", rev = "a11a57f806b944f62e16e63adc2f62eb81a28474", optional = true }
 russh = { version = "0.61", default-features = false, features = ["ring", "flate2"], optional = true }
 
 [dev-dependencies]
