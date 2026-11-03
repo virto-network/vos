@@ -157,6 +157,7 @@ range, is the rule.
 | `0x0002` | `Time` | `GET /time` | empty | `u64`, ms by the node's clock | 0 |
 | `0x0003` | `AgentInfo` | `GET /agents/{a}` | `Agent` | `Option<AgentInfo>` | 4 |
 | `0x0004` | `Schema` | `GET /agents/{a}/instances/{i}/schema` | `(Agent, InstanceId)` | `Option<Schema>` | 8 |
+| `0x0005` | `Devices` | `GET /agents/{a}/instances/{i}/devices` | `(Agent, InstanceId)` | `Option<DeviceWindow>` | 8 |
 | `0x0101` | `Call` | `POST /agents/{a}/calls` | `(Agent, Call)` | `Response` | 69,636 |
 | `0x0102` | `Query` | `POST /agents/{a}/queries` | `(Agent, QueryCall)` | `Response` | 69,636 |
 | `0x0103` | `Workflow` | `POST /agents/{a}/workflows` | `(Agent, WorkflowRead)` | `Response` | 69,636 |
@@ -169,6 +170,7 @@ range, is the rule.
 | `0x0206` | `Replace` | `POST /agents/{a}/replicas` | `Operated` of `(Agent, Replace)` | `Response` | 69,792 |
 | `0x0207` | `Grant` | `POST /agents/{a}/roles` | `Operated` of `(Agent, Grant)` | `Response` | 69,792 |
 | `0x0208` | `Reports` | `POST /agents/{a}/reports` | `Operated` of `(Agent, bool)` | `Response` | 69,792 |
+| `0x0209` | `Retire` | `POST /retire` | `Operated` of `Retire` | `Response` | 69,792 |
 
 `0x0000` is never assigned; a kind's number never changes or returns.
 `0xffff` is the frame error's, an answer only: as a request it is
@@ -185,7 +187,7 @@ budget, past which it is answered `Busy`.
 
   | kind | sender | over `vos-api` | repeated |
   |---|---|---|---|
-  | `NodeKey`, `AgentInfo`, `Schema` | any API client | relayed | yes: reads |
+  | `NodeKey`, `AgentInfo`, `Schema`, `Devices` | any API client | relayed | yes: reads |
   | `Time` | any | relayed | yes |
   | `Query` | any; its key signs it | relayed | yes: a read |
   | `Workflow` | any; the workflow's owner signs it | no | yes: a read |
@@ -212,8 +214,8 @@ budget, past which it is answered `Busy`.
   `MAX_ELF` lives in `vos-wire` (`vos_wire::abi::cap::MAX_ELF`), so the
   API's table pulls no compiler into the gateway or a client.
 - **Answers are the HTTP bodies,** so the gateway passes them through:
-  `NodeKey` the 32 bytes of `GET /`; `AgentInfo` and `Schema` as
-  `Option`s, `None` for the gateway's empty 404 (the gateway strips the
+  `NodeKey` the 32 bytes of `GET /`; `AgentInfo`, `Schema` and
+  `Devices` as `Option`s, `None` for the gateway's empty 404 (the gateway strips the
   tag byte and sends the rest, never re-encoding); `Response` with its
   HTTP status from one `status` function (§6).
 - **An empty inner body** of `CreateAgent` or `CreateRepresentative` is
@@ -221,6 +223,24 @@ budget, past which it is answered `Busy`.
 - **`Time`** answers the node's clock (`Inner::clock`, wall time in ms),
   unsigned: a relay that lies about it costs a client a new proof
   (`identity-and-authority.md` §5).
+- **`Devices`** (`light-node.md` §4.4): an installed instance's device
+  window as this node holds it: the device formats it admits now, newest
+  first, each with its retirement if one is set, and for each device
+  kernel the programs its guard admits, newest first (its release's, and
+  its previous release's until that retires), each its id, its format and
+  its date. The node computes a program the first time a read or a proof
+  names it, on an executor, once a release. A light node reads it before
+  it proves, and proves with the newest program it ships that the window
+  holds. An onion-only agent's window is read through the onion alone,
+  as its schema is.
+- **`Retire`** (`light-node.md` §4.4): `Previous { agent, instance,
+  method, at_ms }` sets device kernel `method`'s previous release's
+  retirement to `at_ms` if that is earlier (now included), through the
+  agent's log (`Admin::Retire`, its outcome the date kept); `Format {
+  format, at_ms }` sets device format `format`'s at the node that takes
+  it, until it restarts (`Config::retired_formats` keeps one across
+  restarts), its outcome the date kept, `Malformed` for a format the node
+  does not verify. Neither ever moves a date later.
 - **The credential actor's `path(member)` and `root()`** are `Query`s
   like any other, signed by a key the device library draws for each
   (`identity-and-authority.md` §6); no kind of their own.
@@ -236,7 +256,7 @@ budget, past which it is answered `Busy`.
   proof, reading this replica's applied state:
   - **onion only:** a `Call`, `Query`, `Workflow` or `Credentialed` whose
     frame is not marked onion is refused `Admission(OnionOnly)`, and a
-    `Schema` read of the agent answered `None`. `AgentInfo` (the
+    `Schema` or `Devices` read of the agent answered `None`. `AgentInfo` (the
     directory's record and replicas, no read of the agent's state) and
     the node's kinds stay open.
   - **known keys only:** a `Call` whose session the agent does not hold
@@ -515,7 +535,7 @@ could replay, and a relay keeps nothing it can reuse.
   paths, roots and the node's time on a connection apart from the one
   that carries its proofs, under a key that links to nothing. The gateway
   reads each header, answers `NotRelayed` for any kind outside the relay
-  set (`NodeKey`, `Time`, `AgentInfo`, `Schema`, `Query`) without reading
+  set (`NodeKey`, `Time`, `AgentInfo`, `Schema`, `Devices`, `Query`) without reading
   its body or sending anything to a node, checks the limit, then relays
   the frame to a node under a fresh upstream id and its port's mark (§2),
   and maps the answer back.
@@ -623,7 +643,7 @@ could replay, and a relay keeps nothing it can reuse.
 - **The API's own QUIC endpoint:** its own port, allowlist and thread, so
   API load never shares the consensus network's.
 - **`vos-api` relays public reads only:** `NodeKey`, `Time`,
-  `AgentInfo`, `Schema` and `Query`, what a device needs beside its
+  `AgentInfo`, `Schema`, `Devices` and `Query`, what a device needs beside its
   proofs; anything that changes state goes through a signed or proven
   request on another path.
 - **`FrameError::Unavailable` keeps the channel:** an upstream failure is

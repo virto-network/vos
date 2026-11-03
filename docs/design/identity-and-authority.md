@@ -317,13 +317,13 @@ Ingress verifies the proof and logs only the origin it proves.
   | 2a | an onion-only agent's: the gateway marked it onion (`node-api.md` §2–§3) | `Admission(OnionOnly)` (not a credential code) | 403 |
   | 3 | this node serves the agent | `NoAgent`, `Elsewhere`, as for calls | 404, 421 |
   | 4 | the node's space has a genesis (its `SpaceId` is not `NONE`) | `NoSpace`, 0 | 403 |
-  | 5 | `format` is a credential or device format this node admits | `Format`, 1 | 403 |
+  | 5 | `format` is a credential or device format this node admits, a device format until its retirement (`light-node.md` §4.4) | `Format`, 1 | 403 |
   | 6 | `proof` within its format's cap (44: 512 KiB; 46: 1.5 MiB), `arguments` within `cap::REQUEST` | `Size`, 2 | 403 |
   | 7 | `now ≤ expires_ms ≤ now + 120 s`, `now` the node's clock | `Expiry { now }`, 3 | 403 |
   | 8 | the instance's method exists and has a credential guard | `Method`, 4 | 403 |
   | 9 | `public`'s kind is the guard's, and the format proves it for this method (46: auth, for a guard that names a device kernel) | `Kind`, 5 | 403 |
   | 10 | auth: `scope` is the one the guard's name gives | `Scope`, 6 | 403 |
-  | 11 | `binding` is `C(T(binding), W(b))` of this request | `Binding`, 7 | 403 |
+  | 11 | `binding` is `C(T(binding), W(b))` of this request (a device proof's `b` under one of the programs the guard's window admits) | `Binding`, 7 | 403 |
   | 12 | `b` is not recorded | `Replayed`, 8 | 409 |
   | 13 | auth with `once`: `(scope, nullifier)` not recorded | `Once`, 9 | 409 |
   | 14 | auth: `map_root` is in the credential actor's ring | `RootUnknown`, 10 (`RootRefusal::Unknown`): retryable, fetch the path again, or ask another replica; an honest member meets it on a replica's lag, a root replaced at its own batch time, or one past the ring's 64 entries (§6) | 503 |
@@ -384,14 +384,16 @@ Ingress verifies the proof and logs only the origin it proves.
   proof, under the trust-boundary rule above.
 - **Device proofs** (format 46) authorize exactly what an auth proof
   does [decided] and take the same checks (`proving.md` §8). Their
-  program is the one the node computes from the installed kernel, on a
-  fixed public auth statement [decided], so every node and the device
-  compute one program from the kernel: the leader at the install,
-  which fails for a guarded kernel that does not run it; a replica that
-  did not install it, once, at the first device proof naming the kernel
-  that passes the checks before the binding. The binding names that
-  program, and the io-hash is `H_io` of the request's auth words, picked
-  by the format.
+  program is one the node computes from a release of the installed
+  kernel, on the public statement its reference program returns
+  [decided], so every node and the device's release build compute one
+  program from the kernel: the leader at the install, which fails for a
+  device kernel whose reference does not run; a replica that did not
+  install it, once, at the first device proof naming the kernel that
+  passes the checks before the binding. The guard admits its kernel's
+  release and, until its date, the previous one (`light-node.md` §4.4);
+  the binding names which, and the io-hash is `H_io` of the request's
+  auth words, picked by the format.
 
 **Guards are the same on VOS and on JAM.** Inside a space the evidence is
 signatures and grants, checked at ingress. Across the boundary the
