@@ -18,6 +18,8 @@ seeded-masks = ["vos-pvm-recair/seeded-masks"]
 [dependencies]
 # The local agent's store.
 fjall = { workspace = true }
+# Each local instance's scope: its DAG of signed nodes, over the store.
+merkle-crdt = { workspace = true, features = ["fjall"] }
 # The agent program's runs over it, and the interpreter they run on.
 vos-exec = { workspace = true }
 vos-pvm = { workspace = true }
@@ -57,6 +59,8 @@ vos-testkit = { path = "../../agent/testkit" }
 # The crash rounds.
 vos-checker = { path = "../checker" }
 tempfile = "3"
+# The merge fields' convergence, on their native model.
+proptest = "1"
 
 [[test]]
 name = "crash"

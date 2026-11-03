@@ -16,17 +16,31 @@ and what a node does with one is `node/SECURITY.md`'s.
   (`light-node.md` §4.4); an install checks each program's hash against
   the derivation it names, and the phone runs no transpiler.
 - **Its store is plaintext on the device:** the local agent's rows, its
-  programs and its last operation's time and seed, in a fjall database
-  under the directory the client names. The client keeps it in the app's
-  private storage; sealing what leaves the device is sync's, not the
-  store's.
+  programs, its scopes' nodes, its last local operation's time and seed,
+  and its author key (the ed25519 seed its scopes' nodes are signed with),
+  in a fjall database under the directory the client names. The client
+  keeps it in the app's private storage; sealing what leaves the device
+  is sync's, not the store's.
+- **Its author key is the store's:** drawn from the operating system when
+  the store is made, never copied out of it, so a new install or a
+  restore signs as a new author and a backup never reuses a sequence
+  number under an old key. Whoever reads the store can sign as it in its
+  scopes until the device set removes it.
 - **Each operation is one synced batch:** a process killed at any point
-  leaves the store before the operation or after it, never between; the
-  store is mended at open as a node's is (`vos_exec::store::recover`),
-  and one written in another layout is refused.
-- **A local call writes rows only:** the merge entry fails a handler
-  that sends, attests, writes a committed map or starts a workflow, with
-  nothing written.
+  leaves the store before the operation or after it, never between, a
+  scope's nodes with the rows they wrote; the store is mended at open as
+  a node's is (`vos_exec::store::recover`), and one written in another
+  layout is refused.
+- **A local call is a merge handler's operation:** the merge entry runs
+  `#[msg(merge)]` handlers alone, writing their merge fields alone and
+  reading none, and records nothing for a handler that fails. A peer's
+  node is applied only if its author signed it for the scope, and its
+  operations run through the same entry, so a peer reaches only what a
+  merge handler writes. Validation of what a well-formed operation
+  writes, and quarantine, are not built (`light-node.md` §8, C1).
+- **Reads filter, never unapply:** an author that equivocated, and one
+  the client cuts off (a removal past its frontier), are filtered when a
+  merge field is read, from their cutoff on; their rows stay.
 
 ## The secret and its containment
 

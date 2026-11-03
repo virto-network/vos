@@ -6,6 +6,10 @@
 //!   ([`Store`]), with no log; each operation one entry of the agent
 //!   program, committed in one batch. Its actors and the agent program are
 //!   release artifacts ([`release`]): the phone transpiles nothing.
+//! - **Sync** ([`mod@sync`]): each local instance one scope, a merkle-crdt
+//!   DAG of nodes the store's author key signs; a call is a merge
+//!   handler's operation recorded as a node, and a peer's nodes run
+//!   through the same handlers; the merge fields read filtered.
 //!
 //! **The device library** (`docs/design/proving.md` §8): what the phone
 //! runs to prove facts about its device secret to its space's ingress, and
@@ -49,6 +53,7 @@ mod prover;
 pub mod release;
 mod secret;
 pub mod store;
+pub mod sync;
 mod threads;
 pub mod wire;
 
@@ -56,7 +61,7 @@ pub use call::{Call, NAME_BYTES, method_id, scope, transfer_arguments};
 pub use kernel::{
     DEVICE_FORMAT, DEVICE_PEAK_BYTES, DeviceProgram, DeviceProof, auth_io, verify_device,
 };
-pub use light::{Config, Error, LOCAL, Light};
+pub use light::{Config, Error, LOCAL, Light, ScopeError};
 pub use path::PathKeeper;
 pub use prover::{
     CredentialProof, CredentialPublic, JointProof, JointPublic, PEAK_BYTES, Prover, ProverConfig,
