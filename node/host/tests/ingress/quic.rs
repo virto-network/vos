@@ -132,7 +132,7 @@ fn frames_over_quic_are_sized_from_their_headers() {
         });
         assert_eq!(&answer[4..6], &FRAME_ERROR.to_le_bytes(), "{kind:?}");
         assert_eq!(
-            FrameError::decode_exact(&answer[6..]),
+            FrameError::decode_exact(&answer[Framing::Quic.header()..]),
             Some(FrameError::Oversize { limit })
         );
     }
@@ -152,7 +152,7 @@ fn frames_over_quic_are_sized_from_their_headers() {
         receive.read_to_end(1 << 10).await.unwrap()
     });
     assert_eq!(
-        FrameError::decode_exact(&answer[6..]),
+        FrameError::decode_exact(&answer[Framing::Quic.header()..]),
         Some(FrameError::Truncated)
     );
 }
@@ -211,7 +211,7 @@ fn install_size_bodies_over_quic_are_bounded() {
     let answer = fifth(header.clone()).unwrap();
     assert_eq!(&answer[4..6], &FRAME_ERROR.to_le_bytes());
     assert_eq!(
-        FrameError::decode_exact(&answer[6..]),
+        FrameError::decode_exact(&answer[Framing::Quic.header()..]),
         Some(FrameError::Unavailable)
     );
     // A body that is not large holds no place.
