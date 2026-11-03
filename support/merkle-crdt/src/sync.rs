@@ -30,7 +30,9 @@ pub struct Want<H: Hasher> {
     pub ids: Vec<Cid<H>>,
     /// Each author's highest sequence number the replica has applied. An
     /// author's chain is linked, so the replica has every earlier node of
-    /// it on that chain, and the peer skips them.
+    /// it on that chain, and the peer skips them. An equivocating author's
+    /// other branch is skipped too; the replica asks for its nodes by CID
+    /// as its held nodes name them, a round trip a node of the branch.
     pub have: BTreeMap<Author, u64>,
 }
 
@@ -140,6 +142,12 @@ pub struct Page {
 /// cannot read them: `since(position)` returns a page after `position`
 /// (from the start for `None`). For a sealed scope the feed opens each
 /// envelope and returns the node inside.
+///
+/// The replica stores the page's last position as read, and a cursor's
+/// server serves nothing by CID, so a page must end before the first item
+/// the feed cannot open yet (an envelope of an epoch whose key has not
+/// arrived): a feed truncates its page there, and returns no item it
+/// cannot open.
 pub trait Feed {
     /// Why reading failed.
     type Error;

@@ -12,7 +12,7 @@ mod common;
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
-use common::{H, key};
+use common::{H, SCOPE, key};
 use ed25519_dalek::SigningKey;
 use fjall::Database;
 use merkle_crdt::{Cid, Event, FjallStore, Hasher, MemStore, Node, Replica, Rows, Store, validate};
@@ -64,7 +64,7 @@ impl Writer {
             }
             None => 0,
         };
-        let node = Node::<H, Op>::sign(&self.keys[author], seq, op(self.next), parents);
+        let node = Node::<H, Op>::sign(&self.keys[author], &SCOPE, seq, op(self.next), parents);
         self.next += 1;
         let bytes = node.to_bytes();
         let cid = Cid(H::hash(&bytes));
@@ -137,7 +137,7 @@ fn measure<S: Store<H>>(
         let batch = peer.peer(replica.heads(), 100);
         let started = Instant::now();
         for bytes in &batch {
-            validate::<H, Op>(bytes).unwrap();
+            validate::<H, Op>(&SCOPE, bytes).unwrap();
         }
         checks.push(started.elapsed() / 100);
         let started = Instant::now();
@@ -185,7 +185,7 @@ fn main() {
             "memory",
             history,
             &nodes,
-            Replica::open(MemStore::new()).unwrap(),
+            Replica::open(MemStore::new(), SCOPE).unwrap(),
         )];
         let db = Database::builder(dir.path().join(history.to_string()))
             .open()
@@ -195,7 +195,7 @@ fn main() {
             "fjall",
             history,
             &nodes,
-            Replica::open(store).unwrap(),
+            Replica::open(store, SCOPE).unwrap(),
         ));
         for row in rows {
             println!(

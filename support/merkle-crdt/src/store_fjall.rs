@@ -22,6 +22,9 @@ pub enum FjallError {
     Fjall(fjall::Error),
     /// A stored row does not read as the store wrote it.
     Corrupt,
+    /// The scope's name does not make fjall keyspace names: at most 240
+    /// bytes of ASCII letters, digits, `_`, `-`, `.`, `#` or `$`.
+    Name,
 }
 
 impl From<fjall::Error> for FjallError {
@@ -35,6 +38,7 @@ impl core::fmt::Display for FjallError {
         match self {
             FjallError::Fjall(error) => write!(f, "the store: {error}"),
             FjallError::Corrupt => f.write_str("a stored row does not read as written"),
+            FjallError::Name => f.write_str("the scope's name is not a keyspace name"),
         }
     }
 }
@@ -43,7 +47,7 @@ impl std::error::Error for FjallError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             FjallError::Fjall(error) => Some(error),
-            FjallError::Corrupt => None,
+            FjallError::Corrupt | FjallError::Name => None,
         }
     }
 }
@@ -71,12 +75,19 @@ pub struct FjallStore {
 impl FjallStore {
     /// The scope `name` in `db`, its rows in `<name>.rows`.
     pub fn open(db: &Database, name: &str) -> Result<Self, FjallError> {
+        if name.len() > 240 {
+            return Err(FjallError::Name);
+        }
         let rows = db.keyspace(&format!("{name}.rows"), KeyspaceCreateOptions::default)?;
         Self::with_rows(db, name, rows)
     }
 
     /// The scope `name` in `db`, its rows in `rows`.
     pub fn with_rows(db: &Database, name: &str, rows: Keyspace) -> Result<Self, FjallError> {
+        let allowed = |c: u8| c.is_ascii_alphanumeric() || b"_-.#$".contains(&c);
+        if name.is_empty() || name.len() > 240 || !name.bytes().all(allowed) {
+            return Err(FjallError::Name);
+        }
         let keyspace =
             |kind: &str| db.keyspace(&format!("{name}.{kind}"), KeyspaceCreateOptions::default);
         Ok(Self {
@@ -132,6 +143,10 @@ impl<H: Hasher> Store<H> for FjallStore {
 
     fn contains(&self, cid: &Cid<H>) -> Result<bool, Self::Error> {
         Ok(self.nodes.contains_key(cid)?)
+    }
+
+    fn nodes(&self) -> Result<Vec<Cid<H>>, Self::Error> {
+        self.nodes.iter().map(|row| cid(&row.key()?)).collect()
     }
 
     fn held(&self, cid: &Cid<H>) -> Result<Option<Vec<u8>>, Self::Error> {

@@ -824,12 +824,12 @@ run Merge handlers locally or as thin clients.
   at 1k (an LWW map on an in-memory store without signature checks)
   [measured, 2026-10-08]. The library, signatures checked, on fjall
   (`cargo bench -p merkle-crdt --bench apply`, an LWW map over 100k keys):
-  a node of a batch of 100 costs 55–99 µs at 1k operations and 63–68 µs
-  at 1M, of which the stateless checks (decoding, canonical form, CID,
-  strict ed25519) are 41–78 µs and 45–46 µs; the replica's own work is
-  14–22 µs at 1k and 19–22 µs at 1M. One node alone, or a local
+  a node of a batch of 100 costs 55–99 µs at 1k operations, 64 µs at
+  100k and 63–68 µs at 1M, of which the stateless checks (decoding,
+  canonical form, CID, strict ed25519) are 41–78, 43 and 45–46 µs; the
+  replica's own work is 14–22 µs at 1k, 21 µs at 100k and 19–22 µs at 1M. One node alone, or a local
   operation, costs 0.5–0.8 ms, the synced commit. On the in-memory store
-  the replica's own work is 3–4 µs at 1k and 10–12 µs at 1M [measured,
+  the replica's own work is 3–4 µs at 1k, 4 µs at 100k and 10–12 µs at 1M [measured,
   Intel Core Ultra 7 155H under other builds' load, 2026-11-03]. A
   profile at 1M on the in-memory store puts about 95% of the time in
   ed25519; caching decompressed author keys and batch verification are

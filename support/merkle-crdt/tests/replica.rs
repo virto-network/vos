@@ -6,18 +6,18 @@ mod common;
 
 use std::collections::BTreeSet;
 
-use common::{H, Ops, Rng, Step, crdt, deliveries, generate, key};
+use common::{H, Ops, Rng, SCOPE, Step, crdt, deliveries, generate, key};
 use merkle_crdt::sync::{Feed, Page, Source, Want, serve};
 use merkle_crdt::{
-    Author, Changes, Cid, DagNode, Error, Loaded, MemStore, Node, Refusal, Replica, Signed, Store,
-    rebuild,
+    Author, Changes, Cid, DagNode, Error, Loaded, MemStore, Node, Refusal, Replica, Scope, Signed,
+    Store, rebuild,
 };
 use proptest::prelude::*;
 
 type Mem = Replica<H, Ops, MemStore<H>>;
 
 fn replica() -> Mem {
-    Replica::open(MemStore::new()).unwrap()
+    Replica::open(MemStore::new(), SCOPE).unwrap()
 }
 
 fn step() -> impl Strategy<Value = Step> {
@@ -27,6 +27,7 @@ fn step() -> impl Strategy<Value = Step> {
         3 => (any::<u8>(), any::<u8>()).prop_map(|(from, to)| Step::Learn { from, to }),
         1 => (any::<u8>(), any::<u64>()).prop_map(|(author, value)| Step::Equivocate { author, value }),
         1 => any::<u8>().prop_map(|author| Step::BreakChain { author: author % 2 }),
+        1 => any::<u64>().prop_map(|value| Step::Forge { value }),
     ]
 }
 
@@ -55,11 +56,13 @@ proptest! {
             }
             prop_assert_eq!(replica.held(), 0);
             prop_assert_eq!(&refused, &dag.refused);
-            let rebuilt = rebuild::<H, Ops, _, _>(replica.store(), &mut crdt).unwrap();
+            let rebuilt = rebuild::<H, Ops, _, _>(replica.store(), &SCOPE, &mut crdt).unwrap();
             prop_assert_eq!(replica.store().rows(), &rebuilt.rows);
             prop_assert_eq!(replica.heads(), &rebuilt.heads);
             prop_assert_eq!(replica.equivocations(), &rebuilt.equivocations);
             prop_assert_eq!(replica.equivocations(), &dag.equivocations);
+            prop_assert_eq!(&replica.have(), &rebuilt.latest);
+            prop_assert!(replica.wanted().is_empty());
             let applied: BTreeSet<&Cid<H>> = dag.nodes.iter().map(|(c, _)| c).collect();
             prop_assert_eq!(rebuilt.nodes, applied.len() - dag.refused.len());
             replicas.push(replica);
@@ -91,7 +94,7 @@ proptest! {
             replica.record(&own, vec![op], &mut crdt).unwrap();
         }
         replica.record(&own, vec![(0, 0)], &mut crdt).unwrap();
-        let rebuilt = rebuild::<H, Ops, _, _>(replica.store(), &mut crdt).unwrap();
+        let rebuilt = rebuild::<H, Ops, _, _>(replica.store(), &SCOPE, &mut crdt).unwrap();
         prop_assert_eq!(replica.store().rows(), &rebuilt.rows);
         prop_assert_eq!(replica.heads(), &rebuilt.heads);
         prop_assert_eq!(replica.heads().len(), 1);
@@ -101,9 +104,9 @@ proptest! {
 #[test]
 fn equivocation_is_detected_kept_and_reported_once() {
     let author = key(0);
-    let first = Node::<H, Ops>::sign(&author, 0, vec![(1, 1)], BTreeSet::new());
-    let twin = Node::<H, Ops>::sign(&author, 0, vec![(1, 2)], BTreeSet::new());
-    let third = Node::<H, Ops>::sign(&author, 0, vec![(1, 3)], BTreeSet::new());
+    let first = Node::<H, Ops>::sign(&author, &SCOPE, 0, vec![(1, 1)], BTreeSet::new());
+    let twin = Node::<H, Ops>::sign(&author, &SCOPE, 0, vec![(1, 2)], BTreeSet::new());
+    let third = Node::<H, Ops>::sign(&author, &SCOPE, 0, vec![(1, 3)], BTreeSet::new());
     let mut replica = replica();
     let report = replica.ingest([first.to_bytes()], None, &mut crdt).unwrap();
     assert!(report.equivocations.is_empty());
@@ -123,7 +126,7 @@ fn equivocation_is_detected_kept_and_reported_once() {
     );
 
     // A node after one twin is still applied: other authors may cite either.
-    let other = Node::<H, Ops>::sign(&key(1), 0, vec![], BTreeSet::from([twin.cid()]));
+    let other = Node::<H, Ops>::sign(&key(1), &SCOPE, 0, vec![], BTreeSet::from([twin.cid()]));
     let report = replica.ingest([other.to_bytes()], None, &mut crdt).unwrap();
     assert_eq!(report.applied, vec![other.cid()]);
 }
@@ -131,7 +134,7 @@ fn equivocation_is_detected_kept_and_reported_once() {
 #[test]
 fn signatures_are_refused_unless_the_authors() {
     let author = key(0);
-    let node = Node::<H, Ops>::sign(&author, 0, vec![(1, 1)], BTreeSet::new());
+    let node = Node::<H, Ops>::sign(&author, &SCOPE, 0, vec![(1, 1)], BTreeSet::new());
 
     // Operations changed after signing.
     let mut tampered = node.clone();
@@ -171,7 +174,7 @@ fn signatures_are_refused_unless_the_authors() {
     let mut trailing = node.to_bytes();
     trailing.push(0);
     let parents = BTreeSet::from([Cid([1; 32]), Cid([2; 32])]);
-    let two = Node::<H, Ops>::sign(&author, 0, vec![], parents);
+    let two = Node::<H, Ops>::sign(&author, &SCOPE, 0, vec![], parents);
     let mut swapped = two.to_bytes();
     let end = swapped.len();
     let (front, back) = swapped[end - 64..].split_at_mut(32);
@@ -190,9 +193,9 @@ fn signatures_are_refused_unless_the_authors() {
 #[test]
 fn a_broken_chain_is_refused_with_its_descendants() {
     let author = key(0);
-    let first = Node::<H, Ops>::sign(&author, 0, vec![], BTreeSet::new());
-    let gap = Node::<H, Ops>::sign(&author, 2, vec![], BTreeSet::from([first.cid()]));
-    let child = Node::<H, Ops>::sign(&key(1), 0, vec![], BTreeSet::from([gap.cid()]));
+    let first = Node::<H, Ops>::sign(&author, &SCOPE, 0, vec![], BTreeSet::new());
+    let gap = Node::<H, Ops>::sign(&author, &SCOPE, 2, vec![], BTreeSet::from([first.cid()]));
+    let child = Node::<H, Ops>::sign(&key(1), &SCOPE, 0, vec![], BTreeSet::from([gap.cid()]));
     let mut replica = replica();
     // The child arrives first and is held; the gap's refusal releases it.
     let report = replica.ingest([child.to_bytes()], None, &mut crdt).unwrap();
@@ -210,7 +213,7 @@ fn a_broken_chain_is_refused_with_its_descendants() {
     );
     assert_eq!(replica.held(), 0);
     // Later arrivals naming a refused node are refused at once.
-    let late = Node::<H, Ops>::sign(&key(2), 0, vec![], BTreeSet::from([gap.cid()]));
+    let late = Node::<H, Ops>::sign(&key(2), &SCOPE, 0, vec![], BTreeSet::from([gap.cid()]));
     let report = replica.ingest([late.to_bytes()], None, &mut crdt).unwrap();
     assert_eq!(
         report.refused,
@@ -365,12 +368,12 @@ fn a_cursor_catches_up_out_of_causal_order_and_resumes() {
         )
         .unwrap();
     let held = local.held();
-    let mut local = Mem::open(local.into_store()).unwrap();
+    let mut local = Mem::open(local.into_store(), SCOPE).unwrap();
     assert_eq!(local.held(), held, "held nodes survive reopening");
     local.catch_up(&mut server, &mut crdt).unwrap();
     assert_eq!(local.cursor(), Some(last));
     assert_eq!(local.held(), 0);
-    let rebuilt = rebuild::<H, Ops, _, _>(local.store(), &mut crdt).unwrap();
+    let rebuilt = rebuild::<H, Ops, _, _>(local.store(), &SCOPE, &mut crdt).unwrap();
     assert_eq!(local.store().rows(), &rebuilt.rows);
     assert_eq!(rebuilt.nodes, dag.nodes.len());
 
@@ -414,6 +417,9 @@ impl Store<H> for Flaky {
     fn contains(&self, cid: &Cid<H>) -> Result<bool, Self::Error> {
         Ok(self.inner.contains(cid).unwrap())
     }
+    fn nodes(&self) -> Result<Vec<Cid<H>>, Self::Error> {
+        Ok(self.inner.nodes().unwrap())
+    }
     fn held(&self, cid: &Cid<H>) -> Result<Option<Vec<u8>>, Self::Error> {
         Ok(self.inner.held(cid).unwrap())
     }
@@ -445,10 +451,13 @@ fn a_failed_commit_moves_nothing_and_a_retry_completes() {
         .into_iter()
         .map(|node| node.bytes)
         .collect();
-    let mut local = Replica::<H, Ops, _>::open(Flaky {
-        inner: MemStore::new(),
-        fail: false,
-    })
+    let mut local = Replica::<H, Ops, _>::open(
+        Flaky {
+            inner: MemStore::new(),
+            fail: false,
+        },
+        SCOPE,
+    )
     .unwrap();
     // Hold the last five, then fail the batch that would release them.
     local
@@ -458,7 +467,7 @@ fn a_failed_commit_moves_nothing_and_a_retry_completes() {
     let heads = local.heads().clone();
     let mut inner = local.into_store();
     inner.fail = true;
-    let mut failing = Replica::<H, Ops, _>::open(inner).unwrap();
+    let mut failing = Replica::<H, Ops, _>::open(inner, SCOPE).unwrap();
     assert!(matches!(
         failing.ingest(bytes[..5].to_vec(), Some(2), &mut crdt),
         Err(Error::Store("injected"))
@@ -475,7 +484,7 @@ fn a_failed_commit_moves_nothing_and_a_retry_completes() {
 
     let mut inner = failing.into_store();
     inner.fail = false;
-    let mut retry = Replica::<H, Ops, _>::open(inner).unwrap();
+    let mut retry = Replica::<H, Ops, _>::open(inner, SCOPE).unwrap();
     let report = retry
         .ingest(bytes[..5].to_vec(), Some(2), &mut crdt)
         .unwrap();
@@ -497,7 +506,7 @@ fn the_outbox_holds_local_nodes_until_pushed() {
         vec![0, 1, 2, 3]
     );
     local.pushed(&[(Author::from(&own), 1)]).unwrap();
-    let local = Mem::open(local.into_store()).unwrap();
+    let local = Mem::open(local.into_store(), SCOPE).unwrap();
     assert_eq!(
         local
             .outbox()
@@ -512,4 +521,54 @@ fn the_outbox_holds_local_nodes_until_pushed() {
         DagNode::from_bytes(&local.outbox().unwrap()[0].bytes).unwrap();
     assert_eq!(node.payload.seq, 2);
     assert!(node.parents.contains(&outbox[1].cid));
+}
+
+#[test]
+fn a_forged_parent_releases_its_held_children_refused() {
+    let honest = Node::<H, Ops>::sign(&key(0), &SCOPE, 0, vec![], BTreeSet::new());
+    let mut forged = Node::<H, Ops>::sign(&key(1), &SCOPE, 0, vec![(1, 1)], BTreeSet::new());
+    forged.payload.ops = vec![(1, 2)];
+    let other = Node::<H, Ops>::sign(&key(2), &SCOPE, 0, vec![], BTreeSet::new());
+    // Waits on the forged node and on one that never comes.
+    let child = Node::<H, Ops>::sign(
+        &key(3),
+        &SCOPE,
+        0,
+        vec![],
+        BTreeSet::from([forged.cid(), other.cid()]),
+    );
+    let mut replica = replica();
+    let report = replica
+        .ingest([child.to_bytes(), honest.to_bytes()], None, &mut crdt)
+        .unwrap();
+    assert_eq!(report.held, vec![child.cid()]);
+    assert_eq!(replica.wanted().len(), 2);
+    let report = replica
+        .ingest([forged.to_bytes()], None, &mut crdt)
+        .unwrap();
+    assert_eq!(
+        report.refused,
+        vec![
+            (Some(forged.cid()), Refusal::BadSignature),
+            (Some(child.cid()), Refusal::RefusedParent)
+        ]
+    );
+    assert_eq!(replica.held(), 0);
+    assert!(
+        replica.wanted().is_empty(),
+        "nothing waits on the other parent"
+    );
+    let replica = Mem::open(replica.into_store(), SCOPE).unwrap();
+    assert_eq!(replica.held(), 0);
+}
+
+#[test]
+fn a_node_signed_for_another_scope_is_refused() {
+    let node = Node::<H, Ops>::sign(&key(0), &Scope([8; 16]), 0, vec![(1, 1)], BTreeSet::new());
+    let mut replica = replica();
+    let report = replica.ingest([node.to_bytes()], None, &mut crdt).unwrap();
+    assert_eq!(
+        report.refused,
+        vec![(Some(node.cid()), Refusal::BadSignature)]
+    );
 }

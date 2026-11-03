@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest};
 use ed25519_dalek::SigningKey;
-use merkle_crdt::{Author, Cid, Event, Hasher, Node, Rows};
+use merkle_crdt::{Author, Cid, Event, Hasher, Node, Rows, Scope};
 
 pub struct Blake2b256;
 
@@ -21,6 +21,8 @@ impl Hasher for Blake2b256 {
 }
 
 pub type H = Blake2b256;
+/// The scope every generated node is signed for.
+pub const SCOPE: Scope = Scope([7; 16]);
 /// A node's operations: (key, value) pairs.
 pub type Ops = Vec<(u64, u64)>;
 
@@ -67,6 +69,8 @@ pub enum Step {
     Equivocate { author: u8, value: u64 },
     /// `author` signs a node that skips its previous one.
     BreakChain { author: u8 },
+    /// A node with a forged signature, and a node after it.
+    Forge { value: u64 },
 }
 
 /// A generated DAG: every node's bytes, the equivocations signed, and the
@@ -118,7 +122,7 @@ pub fn generate(authors: u8, steps: &[Step]) -> Dag {
                     }
                     None => 0,
                 };
-                let node = Node::<H, Ops>::sign(&keys[a], seq, ops.clone(), parents);
+                let node = Node::<H, Ops>::sign(&keys[a], &SCOPE, seq, ops.clone(), parents);
                 let cid = add(&mut dag, node, &mut parents_of);
                 views[a].insert(cid.clone());
                 latest[a] = Some((seq, cid));
@@ -134,24 +138,45 @@ pub fn generate(authors: u8, steps: &[Step]) -> Dag {
                     continue;
                 };
                 let parents = parents_of[&cid].clone();
-                let node = Node::<H, Ops>::sign(&keys[a], seq, vec![(0, *value)], parents);
+                let node = Node::<H, Ops>::sign(&keys[a], &SCOPE, seq, vec![(0, *value)], parents);
                 let twin = add(&mut dag, node, &mut parents_of);
                 if twin != cid {
                     views[a].insert(twin);
                     dag.equivocations.insert((Author::from(&keys[a]), seq));
                 }
             }
+            Step::Forge { value } => {
+                let mut forged =
+                    Node::<H, Ops>::sign(&key(200), &SCOPE, 0, vec![(3, *value)], BTreeSet::new());
+                forged.payload.ops.push((4, 4));
+                let forged = add(&mut dag, forged, &mut parents_of);
+                let after = Node::<H, Ops>::sign(
+                    &key(201),
+                    &SCOPE,
+                    0,
+                    vec![(5, *value)],
+                    BTreeSet::from([forged.clone()]),
+                );
+                let after = add(&mut dag, after, &mut parents_of);
+                dag.refused.insert(forged);
+                dag.refused.insert(after);
+            }
             Step::BreakChain { author } => {
                 // A key of its own, so the honest chains stay valid: its
                 // second node names no previous node, and a node after it
                 // descends from a refused node.
                 let rogue = key(100 + *author);
-                let first = Node::<H, Ops>::sign(&rogue, 0, vec![(9, 9)], BTreeSet::new());
+                let first = Node::<H, Ops>::sign(&rogue, &SCOPE, 0, vec![(9, 9)], BTreeSet::new());
                 let first = add(&mut dag, first, &mut parents_of);
-                let broken = Node::<H, Ops>::sign(&rogue, 1, vec![(9, 1)], BTreeSet::new());
+                let broken = Node::<H, Ops>::sign(&rogue, &SCOPE, 1, vec![(9, 1)], BTreeSet::new());
                 let broken = add(&mut dag, broken, &mut parents_of);
-                let after =
-                    Node::<H, Ops>::sign(&rogue, 2, vec![(9, 2)], BTreeSet::from([broken.clone()]));
+                let after = Node::<H, Ops>::sign(
+                    &rogue,
+                    &SCOPE,
+                    2,
+                    vec![(9, 2)],
+                    BTreeSet::from([broken.clone()]),
+                );
                 let after = add(&mut dag, after, &mut parents_of);
                 dag.refused.insert(broken);
                 dag.refused.insert(after);

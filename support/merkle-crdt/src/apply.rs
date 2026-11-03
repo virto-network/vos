@@ -40,7 +40,10 @@ pub struct Event<'a, H: Hasher, O> {
 /// are filtered when read, by the replica's
 /// [`equivocations`](crate::Replica::equivocations).
 ///
-/// An error aborts the whole batch: nothing it applied is committed.
+/// An error aborts the whole batch: nothing it applied is committed, and a
+/// feed's page that fails stays unread. An operation the implementation
+/// cannot apply yet (a kind it does not know) is therefore kept in its own
+/// rows and applied later, never returned as an error.
 pub trait Apply<H: Hasher, O> {
     /// Why applying failed.
     type Error;

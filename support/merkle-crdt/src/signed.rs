@@ -72,12 +72,19 @@ impl<O: Decode> Decode for Signed<O> {
     }
 }
 
+/// A sync scope's id: one DAG. Every signature names it, so a node signed
+/// for one scope does not verify in another, where replaying it could
+/// frame its author as equivocating.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Scope(pub [u8; 16]);
+
 const DOMAIN: &[u8] = b"merkle-crdt/node\0";
 
-/// The bytes an author signs: a domain tag, the author, the sequence
-/// number, the operations' bytes and the parents. The parents are signed,
-/// so the author attests to where in the DAG its operations stand.
+/// The bytes an author signs: a domain tag, the scope, the author, the
+/// sequence number, the operations' bytes and the parents. The parents are
+/// signed, so the author attests to where in the DAG its operations stand.
 pub fn message<H: Hasher>(
+    scope: &Scope,
     author: &Author,
     seq: u64,
     ops: &[u8],
@@ -85,6 +92,7 @@ pub fn message<H: Hasher>(
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(DOMAIN.len() + 56 + ops.len() + 32 * parents.len());
     buf.extend_from_slice(DOMAIN);
+    buf.extend_from_slice(&scope.0);
     buf.extend_from_slice(&author.0);
     buf.extend_from_slice(&seq.to_le_bytes());
     ops.encode_to(&mut buf);
@@ -96,12 +104,19 @@ pub fn message<H: Hasher>(
 }
 
 impl<H: Hasher, O: Encode> DagNode<H, Signed<O>> {
-    /// A node of `ops` at `seq` in `key`'s chain, after `parents`, signed.
-    pub fn sign(key: &SigningKey, seq: u64, ops: O, parents: BTreeSet<Cid<H>>) -> Self {
+    /// A node of `ops` at `seq` in `key`'s chain of `scope`, after
+    /// `parents`, signed.
+    pub fn sign(
+        key: &SigningKey,
+        scope: &Scope,
+        seq: u64,
+        ops: O,
+        parents: BTreeSet<Cid<H>>,
+    ) -> Self {
         use ed25519_dalek::Signer;
         let author = Author::from(key);
         let signature = key
-            .sign(&message(&author, seq, &ops.encode(), &parents))
+            .sign(&message(scope, &author, seq, &ops.encode(), &parents))
             .to_bytes();
         DagNode {
             payload: Signed {
@@ -114,11 +129,11 @@ impl<H: Hasher, O: Encode> DagNode<H, Signed<O>> {
         }
     }
 
-    /// Whether the signature is the author's over the node. Strict: a
+    /// Whether the signature is the author's over the node in `scope`. Strict: a
     /// signature with a non-canonical scalar, or a weak key, is refused, so
     /// no third party can turn one signed node into a second that verifies
     /// and so frame its author as equivocating.
-    pub fn verify(&self) -> bool {
+    pub fn verify(&self, scope: &Scope) -> bool {
         let Signed {
             author,
             seq,
@@ -129,7 +144,7 @@ impl<H: Hasher, O: Encode> DagNode<H, Signed<O>> {
             return false;
         };
         key.verify_strict(
-            &message(author, *seq, &ops.encode(), &self.parents),
+            &message(scope, author, *seq, &ops.encode(), &self.parents),
             &Signature::from_bytes(signature),
         )
         .is_ok()
@@ -164,15 +179,16 @@ impl core::fmt::Display for Refusal {
 }
 
 /// The stateless checks of a node's bytes: they decode, canonically, and the
-/// signature is the author's. Returns the node and its CID; the CID is known
-/// for a node refused for its signature.
+/// signature is the author's over it in `scope`. Returns the node and its
+/// CID; the CID is known for a node refused for its signature.
 #[allow(clippy::type_complexity)]
 pub fn validate<H: Hasher, O: Encode + Decode>(
+    scope: &Scope,
     bytes: &[u8],
 ) -> Result<(Cid<H>, Node<H, O>), (Option<Cid<H>>, Refusal)> {
     let node = decode::<H, O>(bytes).ok_or((None, Refusal::Malformed))?;
     let cid = Cid(H::hash(bytes));
-    if !node.verify() {
+    if !node.verify(scope) {
         return Err((Some(cid), Refusal::BadSignature));
     }
     Ok((cid, node))

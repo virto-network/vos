@@ -2,7 +2,7 @@ use crate::apply::Overlay;
 use crate::replica::Error;
 use crate::signed::validate;
 use crate::sync::causal_order;
-use crate::{Apply, Author, Cid, Decode, Encode, Event, Hasher, Store};
+use crate::{Apply, Author, Cid, Decode, Encode, Event, Hasher, Scope, Store};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
@@ -16,44 +16,49 @@ pub struct Rebuilt<H: Hasher> {
     pub heads: BTreeSet<Cid<H>>,
     /// The (author, sequence number) pairs signed more than once.
     pub equivocations: BTreeSet<(Author, u64)>,
+    /// Each author's highest sequence number.
+    pub latest: BTreeMap<Author, u64>,
     /// The number of nodes replayed.
     pub nodes: usize,
 }
 
-/// The full validation and replay, for recovery and audits: walk the whole
-/// DAG from the store's heads, check every node as an ingest would (its
-/// bytes, its CID, its signature, its author's chain), and apply all of
-/// them in causal order onto empty rows. The store is only read.
+/// The full validation and replay, for recovery and audits: read every
+/// applied node the store holds, check each as an ingest would (its bytes,
+/// its CID, its signature in `scope`, its parents present, its author's
+/// chain), and apply all of them in causal order onto empty rows. The
+/// store is only read.
 ///
-/// An incremental replica's rows equal the rows this returns for its store;
-/// a recovery writes them back.
+/// An incremental replica's rows, heads, equivocations and authors' latest
+/// numbers equal what this returns for its store; a recovery writes the
+/// rows back.
 pub fn rebuild<H: Hasher, O: Encode + Decode, S: Store<H>, A: Apply<H, O>>(
     store: &S,
+    scope: &Scope,
     crdt: &mut A,
 ) -> Result<Rebuilt<H>, Error<S::Error, A::Error>> {
-    let loaded = store.load().map_err(Error::Store)?;
     let mut nodes = BTreeMap::new();
-    let mut stack: Vec<Cid<H>> = loaded.heads.into_iter().collect();
-    while let Some(cid) = stack.pop() {
-        if nodes.contains_key(&cid) {
-            continue;
-        }
+    for cid in store.nodes().map_err(Error::Store)? {
         let bytes = store
             .node(&cid)
             .map_err(Error::Store)?
             .ok_or(Error::Corrupt)?;
-        let (found, node) = validate::<H, O>(&bytes).map_err(|_| Error::Corrupt)?;
+        let (found, node) = validate::<H, O>(scope, &bytes).map_err(|_| Error::Corrupt)?;
         if found != cid {
             return Err(Error::Corrupt);
         }
-        stack.extend(node.parents.iter().cloned());
         nodes.insert(cid.clone(), (node.parents.clone(), (cid, node)));
+    }
+    for (parents, _) in nodes.values() {
+        if !parents.iter().all(|parent| nodes.contains_key(parent)) {
+            return Err(Error::Corrupt);
+        }
     }
 
     let mut rows = Overlay::<H, S>::new(None);
     let mut authored: BTreeMap<(Author, u64), Vec<Cid<H>>> = BTreeMap::new();
     let mut heads = BTreeSet::new();
     let mut equivocations = BTreeSet::new();
+    let mut latest = BTreeMap::new();
     let count = nodes.len();
     for (cid, node) in causal_order(nodes) {
         let signed = &node.payload;
@@ -72,6 +77,8 @@ pub fn rebuild<H: Hasher, O: Encode + Decode, S: Store<H>, A: Apply<H, O>>(
             equivocations.insert((signed.author, signed.seq));
         }
         same.push(cid.clone());
+        let at = latest.entry(signed.author).or_insert(signed.seq);
+        *at = (*at).max(signed.seq);
         for parent in &node.parents {
             heads.remove(parent);
         }
@@ -93,6 +100,7 @@ pub fn rebuild<H: Hasher, O: Encode + Decode, S: Store<H>, A: Apply<H, O>>(
             .collect(),
         heads,
         equivocations,
+        latest,
         nodes: count,
     })
 }

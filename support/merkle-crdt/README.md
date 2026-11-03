@@ -51,4 +51,4 @@ light node's sealed scopes (`docs/design/light-node.md` §3.6).
 
 `cargo bench -p merkle-crdt --bench apply` measures applying one node, a
 batch of 100 and a local operation onto 1k, 100k and 1M operations; the
-results are recorded in `docs/design/core-model.md` §9.4.
+results, at 1k, 100k and 1M, are recorded in `docs/design/core-model.md` §9.4.

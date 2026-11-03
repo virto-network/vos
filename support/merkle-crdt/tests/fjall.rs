@@ -7,7 +7,7 @@ mod common;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use common::{H, Ops, Rng, Step, crdt, generate};
+use common::{H, Ops, Rng, SCOPE, Step, crdt, generate};
 use fjall::Database;
 use merkle_crdt::sync::{Feed, Page};
 use merkle_crdt::{FjallStore, Replica, Store, rebuild};
@@ -16,7 +16,7 @@ type Fjall = Replica<H, Ops, FjallStore>;
 
 fn open(dir: &std::path::Path) -> (Database, Fjall) {
     let db = Database::builder(dir).open().unwrap();
-    let replica = Replica::open(FjallStore::open(&db, "scope").unwrap()).unwrap();
+    let replica = Replica::open(FjallStore::open(&db, "scope").unwrap(), SCOPE).unwrap();
     (db, replica)
 }
 
@@ -104,7 +104,7 @@ fn a_reopened_store_is_the_replica_it_was() {
     let mut server = Server(items.clone(), 32);
     replica.catch_up(&mut server, &mut crdt).unwrap();
     assert_eq!(replica.held(), 0);
-    let rebuilt = rebuild::<H, Ops, _, _>(replica.store(), &mut crdt).unwrap();
+    let rebuilt = rebuild::<H, Ops, _, _>(replica.store(), &SCOPE, &mut crdt).unwrap();
     assert_eq!(rows(replica.store()), rebuilt.rows);
     assert_eq!(replica.heads(), &rebuilt.heads);
     assert!(!rebuilt.equivocations.is_empty());
@@ -167,12 +167,12 @@ fn a_killed_writer_leaves_whole_batches() {
         child.wait().unwrap();
 
         let (_db, replica) = open(dir.path());
-        let rebuilt = rebuild::<H, Ops, _, _>(replica.store(), &mut crdt).unwrap();
+        let rebuilt = rebuild::<H, Ops, _, _>(replica.store(), &SCOPE, &mut crdt).unwrap();
         assert_eq!(rows(replica.store()), rebuilt.rows, "round {round}");
         assert_eq!(replica.heads(), &rebuilt.heads, "round {round}");
         let read = replica.cursor().unwrap_or(0) as usize;
         for (position, bytes) in &items {
-            let (cid, _) = merkle_crdt::validate::<H, Ops>(bytes).unwrap();
+            let (cid, _) = merkle_crdt::validate::<H, Ops>(&SCOPE, bytes).unwrap();
             let stored = replica.store().contains(&cid).unwrap()
                 || Store::<H>::held(replica.store(), &cid).unwrap().is_some();
             assert_eq!(
@@ -185,6 +185,6 @@ fn a_killed_writer_leaves_whole_batches() {
     let (_db, mut replica) = open(dir.path());
     replica.catch_up(&mut Server(items, 64), &mut crdt).unwrap();
     assert_eq!(replica.held(), 0);
-    let rebuilt = rebuild::<H, Ops, _, _>(replica.store(), &mut crdt).unwrap();
+    let rebuilt = rebuild::<H, Ops, _, _>(replica.store(), &SCOPE, &mut crdt).unwrap();
     assert_eq!(rows(replica.store()), rebuilt.rows);
 }

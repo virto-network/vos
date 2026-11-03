@@ -21,6 +21,9 @@ pub trait Store<H: Hasher> {
     /// Whether a node is applied.
     fn contains(&self, cid: &Cid<H>) -> Result<bool, Self::Error>;
 
+    /// Every applied node's CID: for audits.
+    fn nodes(&self) -> Result<Vec<Cid<H>>, Self::Error>;
+
     /// A held node's bytes.
     fn held(&self, cid: &Cid<H>) -> Result<Option<Vec<u8>>, Self::Error>;
 
@@ -186,6 +189,10 @@ impl<H: Hasher> Store<H> for MemStore<H> {
 
     fn contains(&self, cid: &Cid<H>) -> Result<bool, Self::Error> {
         Ok(self.nodes.contains_key(cid))
+    }
+
+    fn nodes(&self) -> Result<Vec<Cid<H>>, Self::Error> {
+        Ok(self.nodes.keys().cloned().collect())
     }
 
     fn held(&self, cid: &Cid<H>) -> Result<Option<Vec<u8>>, Self::Error> {

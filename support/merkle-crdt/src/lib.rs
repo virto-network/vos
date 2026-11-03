@@ -26,7 +26,7 @@
 //! same rows for every causal order of the same nodes.
 //!
 //! ```
-//! use merkle_crdt::{Event, Hasher, MemStore, Replica, Rows};
+//! use merkle_crdt::{Event, Hasher, MemStore, Replica, Rows, Scope};
 //! use ed25519_dalek::SigningKey;
 //!
 //! # struct H; impl Hasher for H { type Output = [u8; 32]; fn hash(d: &[u8]) -> [u8; 32] {
@@ -37,10 +37,11 @@
 //!     rows.write(event.ops.as_bytes(), Some(&[]));
 //! }
 //!
+//! const SCOPE: Scope = Scope([1; 16]);
 //! let phone_key = SigningKey::from_bytes(&[1; 32]);
 //! let laptop_key = SigningKey::from_bytes(&[2; 32]);
-//! let mut phone = Replica::<H, String, _>::open(MemStore::new()).unwrap();
-//! let mut laptop = Replica::<H, String, _>::open(MemStore::new()).unwrap();
+//! let mut phone = Replica::<H, String, _>::open(MemStore::new(), SCOPE).unwrap();
+//! let mut laptop = Replica::<H, String, _>::open(MemStore::new(), SCOPE).unwrap();
 //!
 //! phone.record(&phone_key, "eggs".into(), &mut add).unwrap();
 //! laptop.record(&laptop_key, "milk".into(), &mut add).unwrap();
@@ -84,7 +85,7 @@ pub use hasher::Hasher;
 pub use node::{DagNode, Header};
 pub use rebuild::{Rebuilt, rebuild};
 pub use replica::{Equivocation, Error, Ingested, Outgoing, Replica};
-pub use signed::{Author, Node, Refusal, Signed, message, validate};
+pub use signed::{Author, Node, Refusal, Scope, Signed, message, validate};
 pub use store::{Applied, Changes, Loaded, MemStore, Store};
 
 #[cfg(feature = "fjall")]

@@ -1,7 +1,7 @@
 use crate::apply::Overlay;
 use crate::signed::{self, validate};
 use crate::store::{Applied, Changes};
-use crate::{Apply, Author, Cid, Decode, Encode, Event, Hasher, Node, Refusal, Store};
+use crate::{Apply, Author, Cid, Decode, Encode, Event, Hasher, Node, Refusal, Scope, Store};
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 use core::convert::Infallible;
@@ -137,8 +137,12 @@ pub struct Replica<H: Hasher, O, S: Store<H>> {
     equivocations: BTreeSet<(Author, u64)>,
     cursor: Option<u64>,
     outbox: BTreeMap<(Author, u64), Cid<H>>,
+    /// The scope the nodes are signed for.
+    scope: Scope,
     /// Each held node's count of parents not applied.
     missing: BTreeMap<Cid<H>, usize>,
+    /// Each held node's parents not applied when it was held.
+    waits: BTreeMap<Cid<H>, Vec<Cid<H>>>,
     /// For each parent not applied, the held nodes waiting on it.
     waiting: BTreeMap<Cid<H>, BTreeSet<Cid<H>>>,
     /// Nodes refused since the replica opened.
@@ -147,10 +151,13 @@ pub struct Replica<H: Hasher, O, S: Store<H>> {
 }
 
 impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
-    /// Open the replica its store holds; an empty store is an empty scope.
-    pub fn open(store: S) -> Result<Self, S::Error> {
-        let loaded = store.load()?;
+    /// Open the replica of `scope` its store holds; an empty store is an
+    /// empty scope.
+    pub fn open(store: S, scope: Scope) -> Result<Self, Error<S::Error>> {
+        let loaded = store.load().map_err(Error::Store)?;
         let mut replica = Self {
+            scope,
+            waits: BTreeMap::new(),
             store,
             heads: loaded.heads,
             latest: loaded.latest,
@@ -163,21 +170,20 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
             ops: PhantomData,
         };
         for (cid, bytes) in loaded.held {
-            let Some(header) = crate::Header::<H>::read(&bytes) else {
-                continue;
-            };
-            let mut missing = 0;
+            let header = crate::Header::<H>::read(&bytes).ok_or(Error::Corrupt)?;
+            let mut waits = Vec::new();
             for parent in header.parents {
-                if !replica.store.contains(&parent)? {
+                if !replica.store.contains(&parent).map_err(Error::Store)? {
                     replica
                         .waiting
-                        .entry(parent)
+                        .entry(parent.clone())
                         .or_default()
                         .insert(cid.clone());
-                    missing += 1;
+                    waits.push(parent);
                 }
             }
-            replica.missing.insert(cid, missing);
+            replica.missing.insert(cid.clone(), waits.len());
+            replica.waits.insert(cid, waits);
         }
         Ok(replica)
     }
@@ -257,7 +263,7 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
             }
             None => 0,
         };
-        let node = Node::<H, O>::sign(key, seq, ops, parents);
+        let node = Node::<H, O>::sign(key, &self.scope, seq, ops, parents);
         let bytes = node.to_bytes();
         let cid = Cid(H::hash(&bytes));
         let mut rows = Overlay::new(Some(&self.store));
@@ -351,17 +357,15 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
     ) -> Result<Ingested<H>, Error<S::Error, A::Error>> {
         let mut report = Ingested::default();
         let mut refused = BTreeSet::new();
+        let mut forged = BTreeSet::new();
         let mut fresh: Fresh<H, O> = BTreeMap::new();
         for bytes in items {
-            match validate::<H, O>(&bytes) {
-                Err((cid, refusal)) => {
-                    if let Some(cid) = &cid
-                        && (self.refused.contains(cid) || !refused.insert(cid.clone()))
-                    {
+            match validate::<H, O>(&self.scope, &bytes) {
+                Err((None, refusal)) => report.refused.push((None, refusal)),
+                Err((Some(cid), _)) => {
+                    if self.refused.contains(&cid) || !forged.insert(cid) {
                         report.duplicates += 1;
-                        continue;
                     }
-                    report.refused.push((cid, refusal));
                 }
                 Ok((cid, node)) => {
                     if fresh.contains_key(&cid) || self.known(&cid).map_err(Error::Store)? {
@@ -383,7 +387,7 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
         for (cid, (node, _)) in &fresh {
             let mut count = 0;
             for parent in &node.parents {
-                if self.refused.contains(parent) || refused.contains(parent) {
+                if self.refused.contains(parent) || forged.contains(parent) {
                     dead.push(cid.clone());
                 }
                 if !self.store.contains(parent).map_err(Error::Store)? {
@@ -438,6 +442,16 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
                 }
             }
         };
+        // A forged node releases the held nodes waiting on it, refused.
+        for cid in forged {
+            refuse(
+                cid,
+                Refusal::BadSignature,
+                &mut report,
+                &mut refused,
+                &mut released,
+            );
+        }
         for cid in dead {
             refuse(
                 cid,
@@ -577,6 +591,14 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
         for cid in report.applied.iter().chain(&refused) {
             self.missing.remove(cid);
             self.waiting.remove(cid);
+            for parent in self.waits.remove(cid).into_iter().flatten() {
+                if let Some(kids) = self.waiting.get_mut(&parent) {
+                    kids.remove(cid);
+                    if kids.is_empty() {
+                        self.waiting.remove(&parent);
+                    }
+                }
+            }
         }
         for (cid, count) in remaining {
             if self.missing.contains_key(&cid) {
@@ -585,17 +607,20 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
         }
         let applied: BTreeSet<&Cid<H>> = report.applied.iter().collect();
         for cid in &report.held {
-            let mut count = 0;
-            for parent in waits.get(cid).into_iter().flatten() {
-                if !applied.contains(parent) {
-                    self.waiting
-                        .entry(parent.clone())
-                        .or_default()
-                        .insert(cid.clone());
-                    count += 1;
-                }
+            let parents: Vec<Cid<H>> = waits
+                .remove(cid)
+                .into_iter()
+                .flatten()
+                .filter(|parent| !applied.contains(parent))
+                .collect();
+            for parent in &parents {
+                self.waiting
+                    .entry(parent.clone())
+                    .or_default()
+                    .insert(cid.clone());
             }
-            self.missing.insert(cid.clone(), count);
+            self.missing.insert(cid.clone(), parents.len());
+            self.waits.insert(cid.clone(), parents);
         }
         self.refused.extend(refused);
         Ok(report)
