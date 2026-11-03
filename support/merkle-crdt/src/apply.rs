@@ -28,6 +28,10 @@ pub struct Event<'a, H: Hasher, O> {
     pub parents: &'a BTreeSet<Cid<H>>,
     /// Its operations.
     pub ops: &'a O,
+    /// Whether an applied node of its author already has its sequence
+    /// number: it equivocates, and the CRDT's reads filter its author's
+    /// chain from `seq` on, in the batch that applies it.
+    pub equivocation: bool,
 }
 
 /// The CRDT a scope's nodes apply to: storage-backed, writing only
@@ -38,7 +42,9 @@ pub struct Event<'a, H: Hasher, O> {
 /// depend on it: that, and keeping nothing outside the rows, is the
 /// implementation's contract. Equivocating nodes are applied too; they
 /// are filtered when read, by the replica's
-/// [`equivocations`](crate::Replica::equivocations).
+/// [`equivocations`](crate::Replica::equivocations), which the second of
+/// two nodes at one number also tells its apply
+/// ([`Event::equivocation`]), so the filter's rows commit with it.
 ///
 /// An error aborts the whole batch: nothing it applied is committed, and a
 /// feed's page that fails stays unread. An operation the implementation

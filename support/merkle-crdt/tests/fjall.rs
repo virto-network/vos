@@ -110,6 +110,27 @@ fn a_reopened_store_is_the_replica_it_was() {
     assert!(!rebuilt.equivocations.is_empty());
 }
 
+/// A caller's own writes ride in a commit's batch: committed with the
+/// scope's changes, in the caller's keyspace.
+#[test]
+fn a_commit_carries_the_callers_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::builder(dir.path()).open().unwrap();
+    let own = db
+        .keyspace("own", fjall::KeyspaceCreateOptions::default)
+        .unwrap();
+    let mut store = FjallStore::open(&db, "scope").unwrap();
+    let changes = merkle_crdt::Changes::<H> {
+        rows: [(b"row".to_vec(), Some(b"value".to_vec()))].into(),
+        ..Default::default()
+    };
+    store
+        .commit_with(changes, |batch| batch.insert(&own, "mine", "yes"))
+        .unwrap();
+    assert_eq!(rows(&store)[&b"row".to_vec()], b"value");
+    assert_eq!(&*own.get("mine").unwrap().unwrap(), b"yes");
+}
+
 const CHILD: &str = "MERKLE_CRDT_CRASH_DIR";
 
 /// The writer the crash test kills: catches up a page at a time, and

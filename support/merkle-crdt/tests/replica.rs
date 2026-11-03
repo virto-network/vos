@@ -131,6 +131,44 @@ fn equivocation_is_detected_kept_and_reported_once() {
     assert_eq!(report.applied, vec![other.cid()]);
 }
 
+/// The apply of a node is told it equivocates: the first node at a number
+/// is not, every later one is, whichever batch brings it, and a rebuild
+/// tells it alike.
+#[test]
+fn an_equivocating_node_is_marked_at_its_apply() {
+    let author = key(0);
+    let first = Node::<H, Ops>::sign(&author, &SCOPE, 0, vec![(1, 1)], BTreeSet::new());
+    let twin = Node::<H, Ops>::sign(&author, &SCOPE, 0, vec![(1, 2)], BTreeSet::new());
+    let next = Node::<H, Ops>::sign(&author, &SCOPE, 1, vec![], BTreeSet::from([twin.cid()]));
+    let mut marked = Vec::new();
+    let mut mark = |event: merkle_crdt::Event<'_, H, Ops>, _: &mut dyn merkle_crdt::Rows| {
+        marked.push((event.cid.clone(), event.equivocation));
+    };
+    let mut replica = replica();
+    replica.ingest([first.to_bytes()], None, &mut mark).unwrap();
+    replica
+        .ingest([next.to_bytes(), twin.to_bytes()], None, &mut mark)
+        .unwrap();
+    assert_eq!(
+        marked,
+        [
+            (first.cid(), false),
+            (twin.cid(), true),
+            (next.cid(), false)
+        ]
+    );
+    let mut rebuilt = Vec::new();
+    rebuild::<H, Ops, _, _>(
+        replica.store(),
+        &SCOPE,
+        &mut |event: merkle_crdt::Event<'_, H, Ops>, _: &mut dyn merkle_crdt::Rows| {
+            rebuilt.push(event.equivocation);
+        },
+    )
+    .unwrap();
+    assert_eq!(rebuilt.iter().filter(|marked| **marked).count(), 1);
+}
+
 #[test]
 fn signatures_are_refused_unless_the_authors() {
     let author = key(0);

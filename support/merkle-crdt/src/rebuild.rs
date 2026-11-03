@@ -73,7 +73,8 @@ pub fn rebuild<H: Hasher, O: Encode + Decode, S: Store<H>, A: Apply<H, O>>(
             }
         }
         let same = authored.entry((signed.author, signed.seq)).or_default();
-        if !same.is_empty() {
+        let equivocation = !same.is_empty();
+        if equivocation {
             equivocations.insert((signed.author, signed.seq));
         }
         same.push(cid.clone());
@@ -89,6 +90,7 @@ pub fn rebuild<H: Hasher, O: Encode + Decode, S: Store<H>, A: Apply<H, O>>(
             seq: signed.seq,
             parents: &node.parents,
             ops: &signed.ops,
+            equivocation,
         };
         crdt.apply(event, &mut rows).map_err(Error::Apply)?;
     }
