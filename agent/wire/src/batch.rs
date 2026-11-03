@@ -78,13 +78,12 @@ pub struct Query {
 /// An operation on a device, with no log (`core-model.md` §9.2): a
 /// `#[msg(merge)]` handler run on the state as it stands, at the time and
 /// seed of the device that issued the operation, as `origin`, the
-/// operation's author its caller ([`Principal::Client`]); its step is the
+/// operation's author its caller ([`Principal::Client`]). Its step is the
 /// work result, of version 0 (a device keeps no log), which the device
-/// applies in one batch. Every device that applies the operation runs it so. Only
-/// a merge handler runs here, and its step writes its instance's merge
-/// fields alone: any other method is `Unknown`, and a handler that writes
-/// another row, or reads a merge field, fails `Trapped`, with nothing
-/// written.
+/// applies in one batch; every device that applies the operation runs it
+/// so. Only a merge handler runs here, and its step writes its instance's
+/// merge fields alone: any other method is `Unknown`, and a handler that
+/// writes another row or reads any fails `Trapped`, with nothing written.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Merge {
     pub time: u64,

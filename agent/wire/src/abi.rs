@@ -99,7 +99,7 @@ pub enum Kind {
     /// A `#[msg(merge)]` handler: run on a device's merge entry alone, on
     /// every device that applies its operation, never through a log
     /// (`core-model.md` §9.2). It writes its instance's merge fields
-    /// ([`Rows::Merge`]) and nothing else, and reads no merge field: its
+    /// ([`Rows::Merge`]) and nothing else, and reads no row: its
     /// effects are its operation's alone, so every device that applies it
     /// writes the same.
     #[codec(index = 7)]
@@ -401,8 +401,8 @@ pub const fn is_effect(op: Op) -> bool {
 /// ([`in_section`]); outside one, a row operation fails the invocation.
 pub const fn allowed(kind: Kind, op: Op) -> bool {
     match kind {
-        // Its rows the agent narrows further: `Get` the struct alone,
-        // `Put` and `Delete` its merge fields alone.
+        // Its rows the agent narrows further: `Put` and `Delete` its merge
+        // fields alone. It reads no row.
         Kind::Merge => matches!(
             op,
             Op::Input
@@ -411,7 +411,6 @@ pub const fn allowed(kind: Kind, op: Op) -> bool {
                 | Op::Log
                 | Op::Now
                 | Op::Random
-                | Op::Get
                 | Op::Put
                 | Op::Delete
                 | Op::SelfId

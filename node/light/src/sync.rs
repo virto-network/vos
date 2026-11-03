@@ -145,16 +145,24 @@ fn write(rows: &mut dyn Rows, key: &[u8], value: &impl vos_wire::Encode) {
     rows.write(key, Some(&stored(&value.encode())));
 }
 
+/// Hold `op`, the operation `origin` names in the node `cid` of
+/// `instance`'s scope, in the scope's rows: its origin and its bytes, for
+/// a build that runs it.
+pub fn hold(instance: InstanceId, cid: &Cid, origin: &Origin, op: &Op, rows: &mut dyn Rows) {
+    let key = keys::held(instance, &cid.0, origin.index);
+    write(rows, &key, &(*origin, op.encode()));
+}
+
 /// Apply `event`, a node of `instance`'s scope, through `rows`: its Lamport
 /// clock, one more than its parents' greatest; its author's cutoff from its
 /// sequence number where it equivocates; then each operation in order, a
-/// call by `run` with its origin, and one of a kind not known held in the
-/// scope's rows.
+/// call by `run` with its node's CID and its origin, and one of a kind not
+/// known held ([`hold`]).
 pub fn apply_node<E: From<CorruptRow>>(
     instance: InstanceId,
     event: &Event<'_, Blake2b256, Ops>,
     rows: &mut dyn Rows,
-    mut run: impl FnMut(&Origin, &Call, &mut dyn Rows) -> Result<(), E>,
+    mut run: impl FnMut(&Cid, &Origin, &Call, &mut dyn Rows) -> Result<(), E>,
 ) -> Result<(), E> {
     let mut lamport = 0;
     for parent in event.parents {
@@ -172,21 +180,15 @@ pub fn apply_node<E: From<CorruptRow>>(
         }
     }
     for (index, op) in event.ops.iter().enumerate() {
-        let index = u32::try_from(index).map_err(|_| CorruptRow)?;
+        let origin = Origin {
+            author,
+            seq: event.seq,
+            lamport,
+            index: u32::try_from(index).map_err(|_| CorruptRow)?,
+        };
         match op {
-            Op::Call(call) => {
-                let origin = Origin {
-                    author,
-                    seq: event.seq,
-                    lamport,
-                    index,
-                };
-                run(&origin, call, rows)?;
-            }
-            Op::Unknown { .. } => {
-                let key = keys::held(instance, &author, event.seq, index);
-                rows.write(&key, Some(&stored(&op.encode())));
-            }
+            Op::Call(call) => run(event.cid, &origin, call, rows)?,
+            Op::Unknown { .. } => hold(instance, event.cid, &origin, op, rows),
         }
     }
     Ok(())

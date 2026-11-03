@@ -546,26 +546,20 @@ pub fn cutoff(instance: InstanceId, author: &[u8; 32]) -> Vec<u8> {
     key(&[&Row::Cutoff.prefix(), &instance.0.to_be_bytes(), author])
 }
 
-/// The prefix of the cutoffs in `instance`'s scope.
-pub fn cutoffs(instance: InstanceId) -> Vec<u8> {
-    key(&[&Row::Cutoff.prefix(), &instance.0.to_be_bytes()])
-}
-
 /// A device's DAG node's Lamport clock, by its CID: one more than its
 /// parents' greatest, the order a merge field's latest entry is chosen in.
 pub fn lamport(cid: &[u8; 32]) -> Vec<u8> {
     key(&[&Row::Lamport.prefix(), cid])
 }
 
-/// An operation of a kind the device does not know, kept until it does:
-/// in `instance`'s scope, by its id, its author, sequence number and index
-/// in its node.
-pub fn held(instance: InstanceId, author: &[u8; 32], seq: u64, index: u32) -> Vec<u8> {
+/// An operation of a kind, or a method, the device does not know, kept
+/// until it does, with its origin: in `instance`'s scope, by its node's
+/// CID and its index there, so two equivocating nodes' never share a row.
+pub fn held(instance: InstanceId, cid: &[u8; 32], index: u32) -> Vec<u8> {
     key(&[
         &Row::Held.prefix(),
         &instance.0.to_be_bytes(),
-        author,
-        &seq.to_be_bytes(),
+        cid,
         &index.to_be_bytes(),
     ])
 }

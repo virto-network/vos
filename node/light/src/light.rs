@@ -68,6 +68,9 @@ impl Default for Config {
     }
 }
 
+/// Rows an operation writes (`Some`) or deletes (`None`).
+type Written = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
+
 /// A scope's replica, its nodes in the light node's store.
 type Scope = Replica<Blake2b256, Ops, ScopeStore>;
 
@@ -92,7 +95,8 @@ pub enum Error {
     /// The agent program's work result does not apply to the state it was
     /// refined on: the agent program's fault.
     NotApplied,
-    /// Nodes of an instance not installed here: no handler could run them.
+    /// A scope of an instance not installed here: no handler could run its
+    /// nodes.
     NotInstalled,
 }
 
@@ -105,6 +109,12 @@ impl From<StoreError> for Error {
 impl From<Fault> for Error {
     fn from(fault: Fault) -> Self {
         Error::Fault(fault)
+    }
+}
+
+impl From<FjallError> for Error {
+    fn from(error: FjallError) -> Self {
+        Error::Scope(merkle_crdt::Error::Store(error))
     }
 }
 
@@ -286,7 +296,8 @@ impl Light {
     /// operation of the light node's author, at its time and seed, run on
     /// the merge entry and recorded as a node of the instance's scope,
     /// signed, its rows and its node committed in one batch. The handler's
-    /// outcome; one that is not `Done` records and writes nothing.
+    /// outcome; one that is not `Done` records and writes nothing, as for
+    /// an instance not installed (`Unknown`).
     pub fn call(
         &self,
         instance: InstanceId,
@@ -295,6 +306,9 @@ impl Light {
     ) -> Result<Outcome, Error> {
         let mut writing = self.writing();
         let snapshot = self.store.snapshot();
+        if snapshot.get(&keys::installed(instance))?.is_none() {
+            return Ok(Outcome::failed(Failure::Unknown));
+        }
         let (time, seed) = self.next(&snapshot)?;
         let ops = vec![Op::Call(Call {
             method,
@@ -329,11 +343,8 @@ impl Light {
         cursor: Option<u64>,
     ) -> Result<Ingested<Blake2b256>, Error> {
         let mut writing = self.writing();
-        let snapshot = self.store.snapshot();
-        if snapshot.get(&keys::installed(instance))?.is_none() {
-            return Err(Error::NotInstalled);
-        }
         let scope = self.scope(&mut writing, instance)?;
+        let snapshot = self.store.snapshot();
         let mut merging = Merging::new(self, instance, snapshot, false);
         match scope
             .ingest(nodes, cursor, &mut merging)
@@ -358,9 +369,7 @@ impl Light {
     pub fn pushed(&self, instance: InstanceId, nodes: &[(Author, u64)]) -> Result<(), Error> {
         let mut writing = self.writing();
         let scope = self.scope(&mut writing, instance)?;
-        scope
-            .pushed(nodes)
-            .map_err(|error| Error::Scope(merkle_crdt::Error::Store(error)))
+        Ok(scope.pushed(nodes)?)
     }
 
     /// Each author's highest sequence number applied in `instance`'s
@@ -431,7 +440,8 @@ impl Light {
         self.writing.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// `instance`'s scope, opened in the store at its first use.
+    /// `instance`'s scope, opened in the store at its first use; none for
+    /// an instance not installed.
     fn scope<'w>(
         &self,
         scopes: &'w mut BTreeMap<InstanceId, Scope>,
@@ -440,13 +450,16 @@ impl Light {
         match scopes.entry(instance) {
             std::collections::btree_map::Entry::Occupied(scope) => Ok(scope.into_mut()),
             std::collections::btree_map::Entry::Vacant(vacant) => {
+                let installed = self.store.snapshot().get(&keys::installed(instance))?;
+                if installed.is_none() {
+                    return Err(Error::NotInstalled);
+                }
                 let name = format!("scope-{:08x}", instance.0);
                 let store = FjallStore::with_rows(
                     self.store.database(),
                     &name,
                     self.store.rows_keyspace().clone(),
-                )
-                .map_err(|error| Error::Scope(merkle_crdt::Error::Store(error)))?;
+                )?;
                 let id = sync::scope(&self.config.realm, instance);
                 let replica = Replica::open(ScopeStore::new(store), id).map_err(Error::Scope)?;
                 Ok(vacant.insert(replica))
@@ -471,12 +484,7 @@ impl Light {
     /// An install's refine output applied over `snapshot` as a node's
     /// accumulate applies it: its one step's outcome, and the rows the
     /// operation writes.
-    #[allow(clippy::type_complexity)]
-    fn applied(
-        &self,
-        snapshot: &Snapshot,
-        output: &[u8],
-    ) -> Result<(Outcome, BTreeMap<Vec<u8>, Option<Vec<u8>>>), Error> {
+    fn applied(&self, snapshot: &Snapshot, output: &[u8]) -> Result<(Outcome, Written), Error> {
         let (result, pages) = split_output(output).ok_or_else(unexpected)?;
         let outcome = match result.steps.as_slice() {
             [Step::Ran(run)] => run.outcome.clone(),
@@ -564,7 +572,7 @@ struct Merging<'a> {
     instance: InstanceId,
     snapshot: Arc<Snapshot>,
     /// The batch's writes so far, which later runs read above the store.
-    written: Arc<BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
+    written: Arc<Written>,
     /// A local operation: its handler's failure declines it.
     local: bool,
     /// A local operation's outcome.
@@ -583,13 +591,31 @@ impl<'a> Merging<'a> {
         }
     }
 
-    /// Run `call` as `origin`, its writes through `rows`.
-    fn run(&mut self, origin: &Origin, call: &Call, rows: &mut dyn Rows) -> Result<(), Halt> {
+    /// Run `call` as `origin`, of the node `cid`, its writes through
+    /// `rows`. A peer's operation that its run fails, by its handler's
+    /// failure or trap, writes nothing, as on every device; one this
+    /// build's program does not run (`Unknown`), or whose run faults, is
+    /// held for a build that runs it, so no peer's node stops the scope's
+    /// sync.
+    fn run(
+        &mut self,
+        cid: &sync::Cid,
+        origin: &Origin,
+        call: &Call,
+        rows: &mut dyn Rows,
+    ) -> Result<(), Halt> {
         let state = Arc::new(Layered {
             snapshot: Arc::clone(&self.snapshot),
             written: Arc::clone(&self.written),
         });
-        let run = self.light.merge(self.instance, origin, call, state)?;
+        let run = match self.light.merge(self.instance, origin, call, state) {
+            Ok(run) => run,
+            Err(error) if self.local => return Err(Halt::Error(error)),
+            Err(_) => {
+                sync::hold(self.instance, cid, origin, &Op::Call(call.clone()), rows);
+                return Ok(());
+            }
+        };
         match run.outcome {
             Outcome::Done(_) => {
                 let mut mirrored = Mirrored {
@@ -602,16 +628,10 @@ impl<'a> Merging<'a> {
                 }
             }
             outcome if self.local => return Err(Halt::Declined(outcome)),
-            // A method this build's program does not run waits for one
-            // that does.
             Outcome::Failed {
                 code: Failure::Unknown,
                 ..
-            } => {
-                let key = keys::held(self.instance, &origin.author, origin.seq, origin.index);
-                let op = merkle_crdt::Encode::encode(&Op::Call(call.clone()));
-                rows.write(&key, Some(&stored(&op)));
-            }
+            } => sync::hold(self.instance, cid, origin, &Op::Call(call.clone()), rows),
             _ => {}
         }
         if self.local {
@@ -629,8 +649,8 @@ impl Apply<Blake2b256, Ops> for Merging<'_> {
         event: Event<'_, Blake2b256, Ops>,
         rows: &mut dyn Rows,
     ) -> Result<(), Halt> {
-        sync::apply_node(self.instance, &event, rows, |origin, call, rows| {
-            self.run(origin, call, rows)
+        sync::apply_node(self.instance, &event, rows, |cid, origin, call, rows| {
+            self.run(cid, origin, call, rows)
         })
     }
 }
@@ -639,7 +659,7 @@ impl Apply<Blake2b256, Ops> for Merging<'_> {
 /// operation's run reads.
 struct Layered {
     snapshot: Arc<Snapshot>,
-    written: Arc<BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
+    written: Arc<Written>,
 }
 
 impl StateReader for Layered {

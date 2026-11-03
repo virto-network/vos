@@ -34,8 +34,8 @@ fn kinds_reach_only_their_operations() {
     let stateful = [Op::Caller, Op::Attest];
     // Its instance's rows it reaches only inside a section.
     let rows = [Op::Get, Op::Put, Op::Delete, Op::Scan];
-    // A merge handler's: its rows (the agent narrows which), no caller,
-    // nothing that reaches past its instance.
+    // A merge handler's: its writes (the agent narrows which), no read, no
+    // caller, nothing that reaches past its instance.
     let merging = [
         Op::Input,
         Op::Reply,
@@ -43,7 +43,6 @@ fn kinds_reach_only_their_operations() {
         Op::Log,
         Op::Now,
         Op::Random,
-        Op::Get,
         Op::Put,
         Op::Delete,
         Op::SelfId,

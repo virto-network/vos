@@ -46,7 +46,7 @@ fn element_row(field: u8, element: u8) -> Vec<u8> {
 
 /// An operation's writes, as the agent makes a merge handler's: each the
 /// operation's entry, kept against the author's stored one.
-fn run(origin: &Origin, call: &Call, rows: &mut dyn Rows) -> Result<(), sync::CorruptRow> {
+fn run(_: &Cid, origin: &Origin, call: &Call, rows: &mut dyn Rows) -> Result<(), sync::CorruptRow> {
     let writes = Vec::<Write>::decode_exact(&call.arguments).expect("a model operation");
     for (at, (field, element, value)) in writes.into_iter().enumerate() {
         let keep = FIELDS[field as usize].1;

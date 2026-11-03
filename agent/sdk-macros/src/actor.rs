@@ -145,22 +145,20 @@ pub(crate) fn actor_impl(mut input: ItemStruct, marks: Marks) -> syn::Result<Tok
     })
 }
 
-/// Whether `ty` is a merge field, `crdt::GSet`, `crdt::Set` or `crdt::Map`
-/// (or one of them imported by its name).
+/// Whether `ty` is a merge field: `crdt::GSet`, `crdt::Set` or `crdt::Map`,
+/// named through the `crdt` module so a type of the actor's own named
+/// `Set` or `Map` stays a plain field.
 fn is_merge_field(ty: &Type) -> bool {
     let Type::Path(path) = ty else {
         return false;
     };
     let segments: Vec<_> = path.path.segments.iter().collect();
-    let in_crdt = match segments.as_slice() {
-        [_] => true,
-        [.., module, _] => module.ident == "crdt",
-        [] => false,
-    };
-    in_crdt
-        && segments
-            .last()
-            .is_some_and(|last| ["GSet", "Set", "Map"].iter().any(|name| last.ident == name))
+    matches!(
+        segments.as_slice(),
+        [.., module, last]
+            if module.ident == "crdt"
+                && ["GSet", "Set", "Map"].iter().any(|name| last.ident == name)
+    )
 }
 
 /// Whether `ty` is `Table<[u8; 32], V>`, of the default (hashed)

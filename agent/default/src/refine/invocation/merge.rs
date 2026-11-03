@@ -44,17 +44,12 @@ impl Invocation<'_> {
         let merging = self.entry == Kind::Merge;
         let querying = self.entry == Kind::Query;
         match (op, rows) {
-            (Op::Get, Rows::Struct) if merging => {
-                let key = row(machine, instance, r[7], r[8], r[9])?;
-                let value = self.read_state(&key)?;
-                self.copy_value(machine, value.as_deref())
-            }
             (Op::Get, Rows::Merge { .. }) if querying => {
                 if !machine.charge(price::SCAN) {
                     return Err(Failure::OutOfGas);
                 }
                 let element = row(machine, instance, r[7], r[8], r[9])?;
-                let value = self.merge_read(instance, &element)?;
+                let value = self.merge_read(machine, instance, &element)?;
                 self.copy_value(machine, value.as_deref())
             }
             (Op::Put | Op::Delete, Rows::Merge { keep, .. }) if merging => {
@@ -94,11 +89,8 @@ impl Invocation<'_> {
                     .map(|cursor| keys::row(instance, rows, &cursor))
                     .transpose()?;
                 let capacity = (r[11] as usize).min(cap::SCAN);
-                let (out, full, walked) =
-                    self.merge_scan(instance, &prefix, after, capacity, transform)?;
-                if !machine.charge(walked as u64 * price::KEY_BYTE) {
-                    return Err(Failure::OutOfGas);
-                }
+                let (out, full) =
+                    self.merge_scan(machine, instance, &prefix, after, capacity, transform)?;
                 write(machine, r[10], &out)?;
                 machine.set_register(7, if full { code::FULL } else { out.len() as u64 });
                 Ok(())
@@ -143,6 +135,7 @@ impl Invocation<'_> {
     /// removal or none is admitted.
     fn merge_read(
         &mut self,
+        machine: &mut Machine,
         instance: InstanceId,
         element: &[u8],
     ) -> Result<Option<Vec<u8>>, Failure> {
@@ -155,33 +148,34 @@ impl Invocation<'_> {
             };
             after = last.clone();
             for (key, value) in page {
+                pay(machine, &key, &value)?;
                 entries.push((author(element, &key)?, value));
             }
         }
-        self.latest(instance, &entries)
+        self.latest(machine, instance, &entries)
     }
 
     /// A query's scan of a merge field's rows under `prefix`, after the
     /// element whose row is `after` when given: each element whose latest
     /// admitted entry holds a value, its raw key and the value as a
-    /// table's scan packs them (`Op::Scan`), until `capacity`; whether the
-    /// first alone did not fit; and the bytes of the keys walked, which
-    /// the scan pays for.
+    /// table's scan packs them (`Op::Scan`), until `capacity`; and whether
+    /// the first alone did not fit. Each row walked is paid as it is read,
+    /// so a field of removals stops where the gas does.
     fn merge_scan(
         &mut self,
+        machine: &mut Machine,
         instance: InstanceId,
         prefix: &[u8],
         after: Option<Vec<u8>>,
         capacity: usize,
         transform: Transform,
-    ) -> Result<(Vec<u8>, bool, usize), Failure> {
+    ) -> Result<(Vec<u8>, bool), Failure> {
         // After an element: past every entry of it.
         let mut after = match after {
             Some(element) => keys::merge_entry(&element, &[0xff; AUTHOR]),
             None => Vec::new(),
         };
         let mut out = Vec::new();
-        let mut walked = 0;
         let mut element: Option<Vec<u8>> = None;
         let mut entries = Entries::new();
         loop {
@@ -194,8 +188,8 @@ impl Invocation<'_> {
             let rows = page.into_iter().map(Some).chain(done.then_some(None));
             for row in rows {
                 let next = match &row {
-                    Some((key, _)) => {
-                        walked += key.len();
+                    Some((key, value)) => {
+                        pay(machine, key, value)?;
                         let split = key.len().checked_sub(AUTHOR).ok_or(Corrupt)?;
                         Some(&key[..split])
                     }
@@ -203,11 +197,11 @@ impl Invocation<'_> {
                 };
                 if element.is_some() && element.as_deref() != next {
                     let closed = element.take().expect("an element");
-                    if let Some(value) = self.latest(instance, &entries)? {
+                    if let Some(value) = self.latest(machine, instance, &entries)? {
                         let raw = transform.raw(&closed[prefix.len()..]).ok_or(Corrupt)?;
                         if out.len() + 8 + raw.len() + value.len() > capacity {
                             let full = out.is_empty();
-                            return Ok((out, full, walked));
+                            return Ok((out, full));
                         }
                         (raw.len() as u32).encode_to(&mut out);
                         out.extend_from_slice(&raw);
@@ -226,7 +220,7 @@ impl Invocation<'_> {
                 }
             }
             if done {
-                return Ok((out, false, walked));
+                return Ok((out, false));
             }
         }
     }
@@ -235,12 +229,13 @@ impl Invocation<'_> {
     /// admit, if it holds one.
     fn latest(
         &mut self,
+        machine: &mut Machine,
         instance: InstanceId,
         entries: &Entries,
     ) -> Result<Option<Vec<u8>>, Failure> {
         let mut cutoffs = BTreeMap::new();
         for (author, _) in entries {
-            cutoffs.insert(*author, self.cutoff(instance, author)?);
+            cutoffs.insert(*author, self.cutoff(machine, instance, author)?);
         }
         let entries = entries
             .iter()
@@ -250,14 +245,19 @@ impl Invocation<'_> {
         Ok(latest.and_then(|entry| entry.value).map(<[u8]>::to_vec))
     }
 
-    /// `author`'s cutoff in `instance`'s scope, read once a step.
+    /// `author`'s cutoff in `instance`'s scope, read, and paid, once a
+    /// step.
     fn cutoff(
         &mut self,
+        machine: &mut Machine,
         instance: InstanceId,
         author: &[u8; 32],
-    ) -> Result<Option<Cutoff>, Corrupt> {
+    ) -> Result<Option<Cutoff>, Failure> {
         if let Some(cutoff) = self.cutoffs.get(&(instance, *author)) {
             return Ok(*cutoff);
+        }
+        if !machine.charge(price::GET) {
+            return Err(Failure::OutOfGas);
         }
         let cutoff = match self.read_state(&keys::cutoff(instance, author))? {
             Some(bytes) => Some(Cutoff::decode_exact(&bytes).ok_or(Corrupt)?),
@@ -265,6 +265,17 @@ impl Invocation<'_> {
         };
         self.cutoffs.insert((instance, *author), cutoff);
         Ok(cutoff)
+    }
+}
+
+/// Pay for a merge field's row a read walks: its key's bytes as a scan's
+/// are, and its value's as a copy's.
+fn pay(machine: &mut Machine, key: &[u8], value: &[u8]) -> Result<(), Failure> {
+    let cost = key.len() as u64 * price::KEY_BYTE + value.len() as u64 * price::PER_BYTE;
+    if machine.charge(cost) {
+        Ok(())
+    } else {
+        Err(Failure::OutOfGas)
     }
 }
 

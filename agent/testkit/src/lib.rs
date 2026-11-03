@@ -4,7 +4,9 @@
 //!
 //! It is the reference model for the agent's differential test, so it
 //! shares no overlay, dispatch or enforcement code with the agent: only
-//! the wire definitions in `vos_wire`.
+//! the wire definitions in `vos_wire`. It models no merge lane: an
+//! operation on a merge field's rows traps here, so an actor's merge
+//! fields are tested on the light node (`vos-light`).
 //!
 //! Beside it, for tests and benches: [`programs`], the guest programs,
 //! linked; and [`node`], what a VOS node serves the agent beyond the
