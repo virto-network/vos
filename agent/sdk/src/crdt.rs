@@ -19,8 +19,8 @@
 //!   write of no value.
 //!
 //! Elements and keys are keyed as a table's ([`TableKey`]), under the
-//! field's transform ([`Hashed`] by default, or [`crate::table::Ordered`]),
-//! which also orders iteration.
+//! field's transform ([`crate::table::Hashed`] by default, or
+//! [`crate::table::Ordered`]), which also orders iteration.
 
 use core::marker::PhantomData;
 
