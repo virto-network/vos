@@ -264,8 +264,14 @@ fn a_held_writer_reports_a_stall_until_it_drains() {
         let writer = Arc::clone(&writer);
         std::thread::spawn(move || smol::block_on(writer.commit(vec![hard(1, true)])))
     };
-    std::thread::sleep(Duration::from_millis(100));
-    assert!(writer.stalled());
+    // Stalled once the commit has waited past the 50 ms, however late its
+    // thread reaches the writer; the bound only fails a writer that never
+    // reports one.
+    let until = Instant::now() + Duration::from_secs(30);
+    while !writer.stalled() {
+        assert!(Instant::now() < until, "the writer never stalled");
+        std::thread::sleep(Duration::from_millis(5));
+    }
     hold.0.store(false, Ordering::Relaxed);
     pending.join().unwrap().unwrap();
     assert!(!writer.stalled());

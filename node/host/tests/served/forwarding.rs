@@ -9,7 +9,7 @@ use std::time::Duration;
 use ed25519_dalek::SigningKey;
 use vos_checker::calls::{Total, install_at_leader, signed_query};
 use vos_checker::programs::{actor, method, package};
-use vos_checker::{ANSWERED, ATTEMPT, COUNTER, Nodes, wait_until};
+use vos_checker::{ANSWERED, COUNTER, Nodes, wait_until};
 use vos_node::client::{Client, post_within, signed_call};
 use vos_wire::ids::{AgentId, MethodId, Session};
 use vos_wire::ingress::{Call, Consistency, Rejection, Response};
@@ -111,7 +111,7 @@ fn a_follower_forwards_no_call_it_cannot_verify() {
     let mut call = Call::decode(&body).unwrap().0;
     call.arguments = 6u64.encode();
     let path = format!("/agents/{}/calls", agent.0);
-    let answer = post_within(cluster.target(follower), &path, &call.encode(), ATTEMPT);
+    let answer = post_within(cluster.target(follower), &path, &call.encode(), ANSWERED);
     assert!(
         matches!(answer, Ok(Response::Rejected(Rejection::BadSignature))),
         "{answer:?}"
@@ -207,13 +207,18 @@ fn a_resend_of_a_queued_first_call_joins_it_past_the_skew() {
         // Inside the scope: a failure opens it before the scope waits.
         let closed = refines.close();
         let first = scope.spawn(|| post_within(target, &path, &body, ANSWERED));
-        wait_until("the first is refined", Duration::from_secs(10), || {
+        wait_until("the first is refined", ANSWERED, || {
             refines.reached() > reached
         });
         // Past the skew now.
         std::thread::sleep(Duration::from_millis(2_000));
         let second = scope.spawn(|| post_within(target, &path, &body, ANSWERED));
-        std::thread::sleep(Duration::from_millis(300));
+        let node = cluster.node(leader).unwrap();
+        // Joined, or answered at once: then its answer fails the test.
+        wait_until("the resend joins the first", ANSWERED, || {
+            node.calls_in_flight() == 2 || second.is_finished()
+        });
+        drop(node);
         drop(closed);
         for answer in [first.join().unwrap(), second.join().unwrap()] {
             let answer = answer.unwrap();
@@ -247,7 +252,7 @@ fn a_follower_holding_back_its_apply_holds_back_its_answer() {
             let _ = answered.send(client.call(agent, COUNTER, increment, &3u64.encode()));
         });
         let node = cluster.node(leader).unwrap();
-        wait_until("the leader runs it", Duration::from_secs(10), || {
+        wait_until("the leader runs it", ANSWERED, || {
             query(&node, agent, COUNTER, value) == Ok(Outcome::Done(3u64.encode()))
         });
         std::thread::sleep(Duration::from_millis(300));

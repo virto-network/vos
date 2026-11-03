@@ -4,7 +4,7 @@ use fjall::KeyspaceCreateOptions;
 
 use super::{Fjall, Result};
 
-/// Read tuning for the `state` partition. The defaults are the fastest
+/// Tuning for the `state` partition. The read defaults are the fastest
 /// configuration the store benchmark found at 10M rows.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
@@ -20,6 +20,10 @@ pub struct Tuning {
     pub hash_ratio: f32,
     /// Keep every level's filter and index blocks in the cache.
     pub pin_all: bool,
+    /// The size past which the partition's active memtable is sealed and
+    /// flushed: fjall's default, 64 MiB. Kept with the partition when it is
+    /// created, so it tunes a new store only.
+    pub memtable_bytes: u64,
 }
 
 impl Default for Tuning {
@@ -29,6 +33,7 @@ impl Default for Tuning {
             expect_hits: true,
             hash_ratio: 0.0,
             pin_all: false,
+            memtable_bytes: 64 << 20,
         }
     }
 }
@@ -38,7 +43,8 @@ impl Tuning {
         use fjall::config::{HashRatioPolicy, PinningPolicy};
         let mut options = KeyspaceCreateOptions::default()
             .expect_point_read_hits(self.expect_hits)
-            .data_block_hash_ratio_policy(HashRatioPolicy::all(self.hash_ratio));
+            .data_block_hash_ratio_policy(HashRatioPolicy::all(self.hash_ratio))
+            .max_memtable_size(self.memtable_bytes);
         if self.pin_all {
             options = options
                 .filter_block_pinning_policy(PinningPolicy::all(true))
