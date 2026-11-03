@@ -50,10 +50,10 @@ fn a_device_kernels_shape_holds_no_blake2b() {
 /// its own io-hash alone: a witness-independent trace.
 #[test]
 fn every_path_shape_proves_under_one_device_program() {
-    use vos_pvm_recair::device::{MAX_PROOF_BYTES, Program, auth_io, encode};
+    use vos_pvm_recair::device::{MAX_PROOF_BYTES, Program, auth_io, auth_reference, encode};
     use vos_pvm_recair::masked::MaskRng;
     let blob = kernel("device", "auth");
-    let program = Program::auth(&blob).expect("the kernel's program");
+    let program = Program::install(&blob, &auth_reference(), 0).expect("the kernel's program");
     let full: Vec<usize> = (0..32).collect();
     let shapes = [
         vos_testkit::device_auth_arguments(0x0101_0101, 0, &[]),
@@ -61,7 +61,7 @@ fn every_path_shape_proves_under_one_device_program() {
     ];
     let mut proofs = Vec::new();
     for (input, public) in &shapes {
-        let own = Program::install(&blob, input).expect("its own run's program");
+        let own = Program::install(&blob, input, 0).expect("its own run's program");
         assert_eq!(own.id(), program.id());
         assert_eq!(own.log_sizes(), program.log_sizes());
         let (proof, stats) = program
@@ -175,7 +175,7 @@ fn sdk_form_kernels_prove_under_their_programs() {
     ];
     for (method, (reference, _), (input, public)) in cases {
         let blob = kernel("sdk-device", method);
-        let program = Program::install(&blob, &reference).expect("the kernel's program");
+        let program = Program::install(&blob, &reference, 0).expect("the kernel's program");
         let (proof, _) = program
             .prove(&input, MaskRng::default())
             .expect("proves under the kernel's program");
@@ -191,4 +191,170 @@ fn sdk_form_kernels_prove_under_their_programs() {
             bytes.len()
         );
     }
+}
+
+/// Device kernel `method` of the package whose ELF is `elf`: its kernel,
+/// its reference program and its headroom, as its install derives them.
+fn release(elf: &[u8], method: &str) -> (Vec<u8>, Vec<u8>, u8) {
+    let derived = vos_pvm_compiler::derive(elf).expect("derives");
+    let id = vos_testkit::programs::method(&derived.actor, method).0;
+    let kernel = derived
+        .kernels
+        .iter()
+        .find(|(bound, _)| *bound == id)
+        .map(|(_, kernel)| kernel.clone())
+        .expect("a kernel");
+    let (_, reference, headroom) = derived
+        .references
+        .into_iter()
+        .find(|(bound, _, _)| *bound == id)
+        .expect("a reference");
+    (kernel, reference, headroom)
+}
+
+/// The credential actor's ELF.
+fn credentials() -> Vec<u8> {
+    std::fs::read(vos_testkit::programs::credentials_elf()).expect("the credential actor")
+}
+
+/// A device kernel's reference program returns its reference arguments:
+/// the `device` actor's, auth's reference statement in the hand-lean
+/// layout (`auth_reference`), and its program is the one those arguments
+/// size; the stock kernels' and the SDK-form test kernels' each give a
+/// program their own arguments prove under.
+#[test]
+fn a_reference_program_returns_its_kernels_reference_arguments() {
+    use vos_pvm_recair::device::{Program, auth_reference, reference_arguments};
+    let (kernel, reference, headroom) = release(&vos_testkit::programs::package("device"), "auth");
+    assert_eq!(headroom, 0);
+    let arguments = reference_arguments(&reference).expect("the reference runs");
+    assert_eq!(arguments, auth_reference());
+    let program = Program::of(&kernel, &reference, headroom).expect("its program");
+    let sized = Program::install(&kernel, &auth_reference(), 0).expect("its program");
+    assert_eq!(program.id(), sized.id());
+    let credentials = credentials();
+    let sdk_device = vos_testkit::programs::package("sdk-device");
+    for (elf, method) in [
+        (&credentials, "auth"),
+        (&credentials, "owner"),
+        (&sdk_device, "auth"),
+        (&sdk_device, "owner"),
+        (&sdk_device, "owner_lean"),
+    ] {
+        let (kernel, reference, headroom) = release(elf, method);
+        let arguments = reference_arguments(&reference).expect("the reference runs");
+        let program = Program::of(&kernel, &reference, headroom).expect("its program");
+        program.fits(&arguments).expect("its reference fits");
+        println!("{method}: log sizes {:?}", program.log_sizes());
+    }
+    // The stock kernels are the SDK-form test kernels: one program each.
+    for method in ["auth", "owner"] {
+        let (stock, stock_reference, _) = release(&credentials, method);
+        let (test, test_reference, _) = release(&sdk_device, method);
+        assert_eq!(
+            reference_arguments(&stock_reference).unwrap(),
+            reference_arguments(&test_reference).unwrap(),
+            "{method}'s reference arguments"
+        );
+        let stock = Program::of(&stock, &stock_reference, 0).unwrap();
+        let test = Program::of(&test, &test_reference, 0).unwrap();
+        assert_eq!(stock.log_sizes(), test.log_sizes(), "{method}");
+    }
+}
+
+/// A headroom of one raises each of the program's log sizes by one: a new
+/// program id, whose proofs a witness still gives and its verifier takes.
+#[test]
+fn a_headroom_raises_every_log_size() {
+    use vos_pvm_recair::device::{Program, encode};
+    use vos_pvm_recair::masked::MaskRng;
+    let (kernel, reference, _) = release(&credentials(), "owner");
+    let program = Program::of(&kernel, &reference, 0).unwrap();
+    let raised = Program::of(&kernel, &reference, 1).unwrap();
+    assert_ne!(program.id(), raised.id());
+    let expected: Vec<u32> = program.log_sizes().iter().map(|size| size + 1).collect();
+    assert_eq!(raised.log_sizes(), &expected[..]);
+    let (input, public) = vos_testkit::device_owner_arguments(0x0303_0303);
+    let (proof, _) = raised.prove(&input, MaskRng::default()).expect("proves");
+    assert_eq!(
+        Some(proof.io),
+        vos_pvm_precompiles::compute_device_io_hash(&public, &[], &[])
+    );
+    raised
+        .verify(&proof.io, &encode(&proof.proof).unwrap())
+        .expect("verifies");
+}
+
+/// `device_fits`: random witnesses of the stock kernels (a secret, a
+/// slot, siblings filled at random levels) and of the `device` actor's
+/// hand-lean `auth` run within the programs their references size, so
+/// every one proves under one program.
+#[test]
+fn random_witnesses_fit_the_reference_programs() {
+    use vos_pvm_recair::device::Program;
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let credentials = credentials();
+    let programs = [
+        ("auth", release(&credentials, "auth")),
+        ("owner", release(&credentials, "owner")),
+        (
+            "lean",
+            release(&vos_testkit::programs::package("device"), "auth"),
+        ),
+    ]
+    .map(|(name, (kernel, reference, headroom))| {
+        (
+            name,
+            Program::of(&kernel, &reference, headroom).expect("its program"),
+        )
+    });
+    for _ in 0..12 {
+        let seed = next() as u32 & 0x3fff_ffff;
+        let slot = next() as u32;
+        let filled: Vec<usize> = (0..32).filter(|_| next() & 1 == 1).collect();
+        for (name, program) in &programs {
+            let input = match *name {
+                "auth" => vos_testkit::device_sdk_auth_arguments(seed, slot, &filled).0,
+                "owner" => vos_testkit::device_owner_arguments(seed).0,
+                _ => vos_testkit::device_auth_arguments(seed, slot, &filled).0,
+            };
+            program
+                .fits(&input)
+                .unwrap_or_else(|error| panic!("{name}, seed {seed:#x}: {error}"));
+        }
+    }
+}
+
+/// The `device` actor's release and its next one (`device-next`, its
+/// kernel written otherwise) are two programs of one statement: each runs
+/// on the other's arguments and states the same public parts, so the same
+/// io-hash and the same nullifier; their program ids differ.
+#[test]
+fn two_releases_compute_one_claim() {
+    use vos_pvm_recair::device::Program;
+    let (lean, lean_reference, _) = release(&vos_testkit::programs::package("device"), "auth");
+    let (next, next_reference, _) = release(&vos_testkit::programs::package("device-next"), "auth");
+    let full: Vec<usize> = (0..32).collect();
+    for (seed, slot, filled) in [
+        (0x0101_0101, 0, &[][..]),
+        (0x0202_0202, u32::MAX, &full[..]),
+    ] {
+        let (input, public) = vos_testkit::device_auth_arguments(seed, slot, filled);
+        let lean_run = trace_kernel(&lean, &input, 50_000_000).expect("halts");
+        let next_run = trace_kernel(&next, &input, 50_000_000).expect("halts");
+        assert_eq!(lean_run.io_hash, next_run.io_hash);
+        assert_eq!(
+            vos_pvm_precompiles::device_return_parts(&next_run.output),
+            Some((&public[..], &[][..]))
+        );
+    }
+    let lean = Program::of(&lean, &lean_reference, 0).unwrap();
+    let next = Program::of(&next, &next_reference, 0).unwrap();
+    assert_ne!(lean.id(), next.id());
 }

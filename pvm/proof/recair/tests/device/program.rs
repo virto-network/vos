@@ -31,7 +31,7 @@ fn reader() -> Vec<u8> {
 #[test]
 fn a_run_past_the_programs_log_sizes_is_refused_by_the_prover() {
     let kernel = reader();
-    let program = Program::install(&kernel, &[7; 16]).expect("installs");
+    let program = Program::install(&kernel, &[7; 16], 0).expect("installs");
     let (proof, _) = program.prove(&[9; 16], MaskRng::default()).expect("proves");
     let bytes = encode(&proof.proof).expect("encodes");
     program.verify(&proof.io, &bytes).expect("verifies");
@@ -42,7 +42,7 @@ fn a_run_past_the_programs_log_sizes_is_refused_by_the_prover() {
         matches!(&error, ProveError::Segment(message) if message.contains("its shape")),
         "{error:?}"
     );
-    let larger = Program::install(&kernel, &[7; 1000]).expect("installs");
+    let larger = Program::install(&kernel, &[7; 1000], 0).expect("installs");
     assert_ne!(larger.log_sizes(), program.log_sizes());
     assert_ne!(larger.id(), program.id());
 }
@@ -52,8 +52,8 @@ fn a_run_past_the_programs_log_sizes_is_refused_by_the_prover() {
 /// sizes or another format another id.
 #[test]
 fn a_programs_id_names_its_kernel_its_shape_and_its_format() {
-    let program = Program::install(&blob(), &witness(1)).expect("installs");
-    let again = Program::install(&blob(), &witness(2)).expect("installs");
+    let program = Program::install(&blob(), &witness(1), 0).expect("installs");
+    let again = Program::install(&blob(), &witness(2), 0).expect("installs");
     assert_eq!(program.id(), again.id());
     assert_eq!(*program.id(), program_id(&FORMAT, program.program()));
     let mut taller = program.program().clone();
@@ -64,7 +64,7 @@ fn a_programs_id_names_its_kernel_its_shape_and_its_format() {
         ..FORMAT
     };
     assert_ne!(program_id(&other, program.program()), *program.id());
-    let reader = Program::install(&reader(), &[7; 64]).expect("installs");
+    let reader = Program::install(&reader(), &[7; 64], 0).expect("installs");
     assert_ne!(reader.id(), program.id());
 }
 
@@ -73,7 +73,7 @@ fn a_programs_id_names_its_kernel_its_shape_and_its_format() {
 /// and they hold no io-hash, which the verifier takes from its caller.
 #[test]
 fn a_device_proofs_bytes_are_canonical() {
-    let program = Program::install(&blob(), &witness(1)).expect("installs");
+    let program = Program::install(&blob(), &witness(1), 0).expect("installs");
     let (proof, _) = program
         .prove(&witness(3), MaskRng::default())
         .expect("proves");
@@ -106,7 +106,7 @@ fn a_device_proofs_bytes_are_canonical() {
 #[test]
 fn a_queried_value_plus_p_is_refused() {
     use stwo::core::fields::m31::{BaseField, P};
-    let program = Program::install(&blob(), &witness(1)).expect("installs");
+    let program = Program::install(&blob(), &witness(1), 0).expect("installs");
     let (proof, _) = program
         .prove(&witness(3), MaskRng::default())
         .expect("proves");

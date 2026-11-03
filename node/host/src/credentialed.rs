@@ -14,11 +14,20 @@
 //!
 //! **A device proof** (format 46, `proving.md` §8) authorizes as
 //! an auth credential proof does, for a method whose auth guard names a
-//! device kernel: its program is the one this node computes from the
-//! installed kernel ([`vos_pvm_recair::device::Program::auth`], kept per
-//! kernel), its io-hash the Poseidon2 `H_io` of the request's auth words,
+//! device kernel: its program is one this node computes from a release of
+//! the installed kernel ([`vos_pvm_recair::device::Program::of`], kept per
+//! release), its io-hash the Poseidon2 `H_io` of the request's auth words,
 //! and the binding names that program's id. A guard that names no device
 //! kernel takes no device proof (`Kind`).
+//!
+//! **Compatibility windows** (`light-node.md` §4.4): a guard admits its
+//! kernel's release and, until its date, the previous release an install
+//! replaced (`Installed::window`), and the binding names which; ingress
+//! admits the device formats this node verifies, the current and the
+//! previous, each until its retirement ([`DEVICE_FORMATS`], with the
+//! operator's earlier date if it set one). A proof of a retired release
+//! names a program no guard admits (`Binding`); one of a retired format is
+//! refused at once (`Format`).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -34,8 +43,9 @@ use vos_wire::batch::CredentialedInput;
 use vos_wire::credentials::{self, Bound, Ring};
 use vos_wire::ids::{AgentId, InstanceId};
 use vos_wire::ingress::{CredentialPublic, CredentialRefusal, Credentialed, Rejection, Response};
+use vos_wire::ingress::{DeviceWindow, FormatWindow, KernelWindow, ProgramWindow};
 use vos_wire::keys;
-use vos_wire::records::{Installed, unstored};
+use vos_wire::records::{DeviceRelease, Installed, unstored};
 use vos_wire::schema::CredentialGuard;
 use vos_wire::{Decode, Encode, SpaceId, defaults};
 
@@ -45,48 +55,94 @@ use crate::lock;
 use crate::node::Inner;
 use crate::store::Snapshot;
 
-/// The proof formats ingress admits for a credential, each with its
-/// proof's cap: the credential format the proof registry names, as the
-/// final verifier pins it, and the device format.
-const ADMITTED: [(u32, usize); 2] = [
-    (verifier::FORMAT, verifier::MAX_PROOF_BYTES),
-    (device::FORMAT.number, device::MAX_PROOF_BYTES),
-];
+/// The credential format the proof registry names, as the final verifier
+/// pins it, with its proof's cap.
+const CREDENTIAL: (u32, usize) = (verifier::FORMAT, verifier::MAX_PROOF_BYTES);
 
-/// A device program's place, by its kernel's program hash: computed once
-/// however many requests wait on it; `None` for a kernel whose program
-/// cannot be computed (it does not run auth's reference, or its run is past
-/// the device format's shape), so a request naming it costs no second
-/// attempt.
+/// The device formats this node verifies, newest first, each with the
+/// retirement its release set, if any: at most the current and the
+/// previous (`light-node.md` §4.4). A release that brings a new format
+/// sets the previous one's to 60 days on; the operator may set any earlier
+/// date ([`DevicePrograms::retire_format`]).
+pub(crate) const DEVICE_FORMATS: [(u32, Option<u64>); 1] = [(device::FORMAT.number, None)];
+
+/// A device program's place, by its release: computed once however many
+/// requests wait on it; `None` for a release whose program cannot be
+/// computed (its reference does not run, its kernel does not run on it, or
+/// its run is past the device format's shape), so a request naming it
+/// costs no second attempt.
 type Place = Arc<smol::lock::OnceCell<Option<Arc<Verifier>>>>;
 
-/// The device programs this node holds, their verifiers alone.
+/// The device programs this node holds, their verifiers alone, by release;
+/// and the device formats' retirements its operator set.
 #[derive(Default)]
-pub(crate) struct DevicePrograms(Mutex<HashMap<[u8; 32], Place>>);
+pub(crate) struct DevicePrograms {
+    programs: Mutex<HashMap<DeviceRelease, Place>>,
+    retired: Mutex<HashMap<u32, u64>>,
+}
 
 impl DevicePrograms {
-    /// Keeps `programs`, each by its kernel's program hash: an install's,
-    /// computed before its entry is queued.
-    pub(crate) fn pin(&self, programs: Vec<([u8; 32], Verifier)>) {
-        let mut held = lock(&self.0);
-        for (kernel, program) in programs {
-            held.insert(kernel, Arc::new(Some(Arc::new(program)).into()));
+    /// Keeps `programs`, each by its release: an install's, computed before
+    /// its entry is queued.
+    pub(crate) fn pin(&self, programs: Vec<(DeviceRelease, Verifier)>) {
+        let mut held = lock(&self.programs);
+        for (release, program) in programs {
+            held.insert(release, Arc::new(Some(Arc::new(program)).into()));
         }
     }
 
-    /// The place of `kernel`'s program, made empty if it has none.
-    fn place(&self, kernel: [u8; 32]) -> Place {
-        Arc::clone(lock(&self.0).entry(kernel).or_default())
+    /// The place of `release`'s program, made empty if it has none.
+    fn place(&self, release: DeviceRelease) -> Place {
+        Arc::clone(lock(&self.programs).entry(release).or_default())
+    }
+
+    /// Retires device format `format` at `at_ms`, if that is earlier than
+    /// its retirement: its date kept, if this node verifies the format.
+    pub(crate) fn retire_format(&self, format: u32, at_ms: u64) -> Option<u64> {
+        let (_, released) = DEVICE_FORMATS
+            .into_iter()
+            .find(|(number, _)| *number == format)?;
+        let mut retired = lock(&self.retired);
+        let date = retired
+            .get(&format)
+            .copied()
+            .into_iter()
+            .chain(released)
+            .chain([at_ms])
+            .min()
+            .expect("a date");
+        retired.insert(format, date);
+        Some(date)
+    }
+
+    /// The device formats admitted at `now`, newest first, each with its
+    /// retirement, if one is set.
+    pub(crate) fn formats(&self, now: u64) -> Vec<FormatWindow> {
+        let retired = lock(&self.retired);
+        DEVICE_FORMATS
+            .into_iter()
+            .map(|(format, released)| FormatWindow {
+                format,
+                retires_ms: retired
+                    .get(&format)
+                    .copied()
+                    .into_iter()
+                    .chain(released)
+                    .min(),
+            })
+            .filter(|window| window.retires_ms.is_none_or(|date| date > now))
+            .collect()
     }
 }
 
 /// What the checks before the binding found: the space, the guard, the
-/// kind, and for a device proof the kernel its guard names.
+/// kind, and for a device proof the window of releases of the kernel its
+/// guard names, newest first.
 struct Front {
     space: SpaceId,
     guard: CredentialGuard,
     kind: CredentialKind,
-    kernel: Option<[u8; 32]>,
+    window: Option<Vec<DeviceRelease>>,
 }
 
 /// A verification's place among those in flight, given back when the
@@ -206,34 +262,40 @@ impl Inner {
             Ok(run) => run,
             Err(error) => return error.into(),
         };
-        // A device proof's program, once every check before the binding
-        // has passed: computed from the installed kernel the first time.
+        // A device proof's programs, once every check before the binding
+        // has passed: each computed from its release the first time.
         let snapshot = self.store.snapshot();
         let front = match self.front(&snapshot, agent, &call) {
             Ok(front) => front,
             Err(refused) => return refused.into(),
         };
-        let (snapshot, front, program) = match front.kernel {
+        let (snapshot, front, programs) = match front.window.clone() {
             None => (snapshot, front, None),
-            Some(kernel) => match self.device_program(kernel).await {
-                // The lookup awaited, and the state may have moved (an
-                // install, a guard): the rest is checked on the state as
-                // it is now, against the kernel the program is of.
-                Ok(Some(program)) => {
-                    let snapshot = self.store.snapshot();
-                    let front = match self.front(&snapshot, agent, &call) {
-                        Ok(front) => front,
+            Some(window) => {
+                let mut programs = Vec::with_capacity(window.len());
+                for release in &window {
+                    match self.device_program(*release).await {
+                        Ok(Some(program)) => programs.push((*release, program)),
+                        Ok(None) => {}
                         Err(refused) => return refused.into(),
-                    };
-                    (snapshot, front, Some((kernel, program)))
+                    }
                 }
-                Ok(None) => {
+                if programs.is_empty() {
                     return Response::Rejected(Rejection::Credential(CredentialRefusal::Kind));
                 }
-                Err(refused) => return refused.into(),
-            },
+                // The lookups awaited, and the state may have moved (an
+                // install, a guard, a retirement): the rest is checked on
+                // the state as it is now, against the releases the
+                // programs are of.
+                let snapshot = self.store.snapshot();
+                let front = match self.front(&snapshot, agent, &call) {
+                    Ok(front) => front,
+                    Err(refused) => return refused.into(),
+                };
+                (snapshot, front, Some(programs))
+            }
         };
-        let checked = match self.check(&snapshot, front, agent, call, program) {
+        let checked = match self.check(&snapshot, front, agent, call, programs) {
             Ok(checked) => checked,
             Err(refused) => return refused.into(),
         };
@@ -280,24 +342,26 @@ impl Inner {
         }
     }
 
-    /// The device program of `kernel`: computed on an executor from the
-    /// stored kernel the first time, one computation however many requests
-    /// wait on it, then kept; `None`, kept too, for a kernel whose program
-    /// cannot be computed from its bytes (its shape, its run). A kernel
-    /// this replica does not hold yet, any other failure, or an executor
-    /// gone, is `Unavailable`, retryable, and not kept.
-    async fn device_program(&self, kernel: [u8; 32]) -> Result<Option<Arc<Verifier>>, Refused> {
-        let place = self.calls.devices.place(kernel);
+    /// The device program of `release`: computed on an executor from the
+    /// stored kernel and reference the first time, one computation however
+    /// many requests wait on it, then kept; `None`, kept too, for a release
+    /// whose program cannot be computed from its bytes (its shape, its
+    /// runs). A program this replica does not hold yet, any other failure,
+    /// or an executor gone, is `Unavailable`, retryable, and not kept.
+    async fn device_program(
+        &self,
+        release: DeviceRelease,
+    ) -> Result<Option<Arc<Verifier>>, Refused> {
+        let place = self.calls.devices.place(release);
         let blobs = self.blobs.clone();
         place
             .get_or_try_init(|| async move {
                 self.offload(move || {
-                    let blob = blobs
-                        .get(&kernel)
-                        .ok()
-                        .flatten()
-                        .ok_or(Refused::Unavailable)?;
-                    match device::Program::auth(&blob) {
+                    let blob = |hash: [u8; 32]| {
+                        blobs.get(&hash).ok().flatten().ok_or(Refused::Unavailable)
+                    };
+                    let (kernel, reference) = (blob(release.kernel.0)?, blob(release.reference.0)?);
+                    match device::Program::of(&kernel, &reference, release.headroom) {
                         Ok(program) => Ok(Some(Arc::new(program.verifier()))),
                         Err(error) if of_the_kernel(&error) => Ok(None),
                         Err(_) => Err(Refused::Unavailable),
@@ -310,10 +374,57 @@ impl Inner {
             .cloned()
     }
 
+    /// The device window of `instance` of `agent` as this replica's applied
+    /// state and this node hold it: the device formats it admits now, and
+    /// for each device kernel the programs its guard admits, newest first,
+    /// each with its retirement (`Kind::Devices`). `None` for an instance
+    /// not installed; a release whose program cannot be computed is left
+    /// out.
+    pub(crate) async fn device_window(
+        &self,
+        agent: AgentId,
+        instance: InstanceId,
+    ) -> Option<DeviceWindow> {
+        let now = (self.clock)();
+        let installed = installed(&self.store.snapshot(), agent, instance).ok()??;
+        let formats = self.calls.devices.formats(now);
+        let format = formats.first().map(|window| window.format);
+        let mut kernels = Vec::new();
+        for method in &installed.schema.methods {
+            if method.kind != Kind::Device {
+                continue;
+            }
+            let retires = |release: &DeviceRelease| {
+                installed
+                    .previous
+                    .iter()
+                    .find(|previous| previous.method == method.id && previous.release == *release)
+                    .map(|previous| previous.retires_ms)
+            };
+            let mut programs = Vec::new();
+            for release in installed.window(method.id, now) {
+                if let (Some(format), Ok(Some(program))) =
+                    (format, self.device_program(release).await)
+                {
+                    programs.push(ProgramWindow {
+                        id: *program.id(),
+                        format,
+                        retires_ms: retires(&release),
+                    });
+                }
+            }
+            kernels.push(KernelWindow {
+                method: method.id,
+                programs,
+            });
+        }
+        Some(DeviceWindow { formats, kernels })
+    }
+
     /// The checks before the binding, in order, on `snapshot`: the space,
     /// the format, the sizes, the expiry, the method's guard and the kind;
     /// for a device proof, that the guard names a device kernel the
-    /// instance installed, whose program hash it returns.
+    /// instance installed, whose window of releases it returns.
     fn front(
         &self,
         snapshot: &Snapshot,
@@ -323,14 +434,24 @@ impl Inner {
         let space = read::<SpaceId>(snapshot, agent, &keys::space())?
             .filter(|space| *space != SpaceId::NONE)
             .ok_or(CredentialRefusal::NoSpace)?;
-        let (_, cap) = ADMITTED
-            .into_iter()
-            .find(|(format, _)| *format == call.format)
-            .ok_or(CredentialRefusal::Format)?;
+        let now = (self.clock)();
+        let device = call.format != CREDENTIAL.0;
+        let cap = match device {
+            false => CREDENTIAL.1,
+            true if self
+                .calls
+                .devices
+                .formats(now)
+                .iter()
+                .any(|window| window.format == call.format) =>
+            {
+                device::MAX_PROOF_BYTES
+            }
+            true => return Err(CredentialRefusal::Format.into()),
+        };
         if call.proof.len() > cap || call.arguments.len() > cap::REQUEST {
             return Err(CredentialRefusal::Size.into());
         }
-        let now = (self.clock)();
         if call.expires_ms < now || call.expires_ms > now + defaults::CREDENTIAL_HORIZON_MS {
             return Err(CredentialRefusal::Expiry { now }.into());
         }
@@ -347,47 +468,61 @@ impl Inner {
             _ => return Err(CredentialRefusal::Kind.into()),
         };
         // A device proof answers only a guard naming a device kernel.
-        let kernel = match (call.format == device::FORMAT.number, &guard) {
+        let window = match (device, &guard) {
             (false, _) => None,
             (
                 true,
                 CredentialGuard::Auth {
                     device: Some(name), ..
                 },
-            ) => Some(device_kernel(&installed, name).ok_or(CredentialRefusal::Kind)?),
+            ) => Some(device_window(&installed, name, now).ok_or(CredentialRefusal::Kind)?),
             (true, _) => return Err(CredentialRefusal::Kind.into()),
         };
         Ok(Front {
             space,
             guard,
             kind,
-            kernel,
+            window,
         })
     }
 
     /// Every check of `call` after `front`'s, in order, on `snapshot`,
     /// this replica's applied state, which `front` was checked on;
-    /// `device` the kernel and program a device proof is verified against
-    /// ([`Inner::device_program`]), which must still be the guard's.
+    /// `programs` the releases and programs a device proof may be verified
+    /// against ([`Inner::device_program`]), which must still be in the
+    /// guard's window: the binding names the one it is.
     fn check(
         &self,
         snapshot: &Snapshot,
         front: Front,
         agent: AgentId,
         call: Credentialed,
-        device: Option<([u8; 32], Arc<Verifier>)>,
+        programs: Option<Vec<(DeviceRelease, Arc<Verifier>)>>,
     ) -> Result<Checked, Refused> {
         let Front {
             space,
             guard,
             kind,
-            kernel,
+            window,
         } = front;
-        // An install between the program's lookup and this snapshot: asked
-        // again, the call meets the new kernel's program.
-        let device = match (kernel, device) {
+        // An install or a retirement between the programs' lookup and this
+        // snapshot: a release no longer in the window is not admitted, and
+        // one new to it was not looked up, so the call is asked again.
+        let programs = match (window, programs) {
             (None, _) => None,
-            (Some(kernel), Some((held, program))) if held == kernel => Some(program),
+            (Some(window), Some(programs))
+                if window
+                    .iter()
+                    .all(|release| programs.iter().any(|(held, _)| held == release)) =>
+            {
+                Some(
+                    programs
+                        .into_iter()
+                        .filter(|(release, _)| window.contains(release))
+                        .map(|(_, program)| program)
+                        .collect::<Vec<_>>(),
+                )
+            }
             (Some(_), _) => return Err(Refused::Unavailable),
         };
         if let (CredentialGuard::Auth { name, .. }, CredentialPublic::Auth { scope, .. }) =
@@ -396,20 +531,30 @@ impl Inner {
         {
             return Err(CredentialRefusal::Scope.into());
         }
-        let binding = Bound {
-            space: &space,
-            agent,
-            instance: call.instance,
-            method: call.method,
-            program: device
-                .as_ref()
-                .map_or(verifier::program(kind), |program| program.id()),
-            kind: call.public.kind(),
-            arguments: &call.arguments,
-            nonce: &call.nonce,
-            expires_ms: call.expires_ms,
-        }
-        .digest();
+        let bound = |program: &[u8; 32]| {
+            Bound {
+                space: &space,
+                agent,
+                instance: call.instance,
+                method: call.method,
+                program,
+                kind: call.public.kind(),
+                arguments: &call.arguments,
+                nonce: &call.nonce,
+                expires_ms: call.expires_ms,
+            }
+            .digest()
+        };
+        // The binding names the program: a device proof's, one of the
+        // window's; a credential proof's, its circuit.
+        let (binding, device) = match programs {
+            None => (bound(verifier::program(kind)), None),
+            Some(programs) => programs
+                .into_iter()
+                .map(|program| (bound(program.id()), Some(program)))
+                .find(|(binding, _)| credentials::binding(binding) == *call.public.binding())
+                .ok_or(CredentialRefusal::Binding)?,
+        };
         if credentials::binding(&binding) != *call.public.binding() {
             return Err(CredentialRefusal::Binding.into());
         }
@@ -483,16 +628,18 @@ fn of_the_kernel(error: &ProveError) -> bool {
     )
 }
 
-/// The program hash of the device kernel `name` names in `installed`: a
-/// method of the `Device` kind whose kernel the install bound.
-fn device_kernel(installed: &Installed, name: &[u8]) -> Option<[u8; 32]> {
+/// The window of the device kernel `name` names in `installed` at `now`:
+/// a method of the `Device` kind, its release and its previous one while
+/// admitted, newest first.
+fn device_window(installed: &Installed, name: &[u8], now: u64) -> Option<Vec<DeviceRelease>> {
     let method = installed
         .schema
         .method_id(core::str::from_utf8(name).ok()?)?;
-    (installed.schema.method(method)?.kind == Kind::Device)
-        .then(|| installed.kernel(method))
-        .flatten()
-        .map(|kernel| kernel.0)
+    if installed.schema.method(method)?.kind != Kind::Device {
+        return None;
+    }
+    let window = installed.window(method, now);
+    (!window.is_empty()).then_some(window)
 }
 
 /// The installed record of `instance`, if it has one.

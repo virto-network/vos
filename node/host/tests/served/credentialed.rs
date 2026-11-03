@@ -26,8 +26,12 @@ use vos_wire::abi::Refusal;
 use vos_wire::credentials::{self as tree, Bound, Digest, Path, RootEntry, Tag, Words};
 use vos_wire::defaults::ROOT_MAX_AGE;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
-use vos_wire::ingress::{CredentialPublic, CredentialRefusal, Credentialed, Rejection, Response};
+use vos_wire::ingress::{
+    CredentialPublic, CredentialRefusal, Credentialed, DeviceWindow, FormatWindow, Rejection,
+    Response,
+};
 use vos_wire::peer::NodeNumber;
+use vos_wire::records::RETIREMENT_MS;
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode, SpaceId, WindowClock};
 
@@ -1073,8 +1077,8 @@ fn a_device_kernels_proof_signs_in_as_an_auth_proof_does() {
         max_memory: DEVICE_PEAK_BYTES,
     })
     .unwrap();
-    let kernel = vos_testkit::programs::kernel("device", "auth");
-    let program = DeviceProgram::auth(&kernel).unwrap();
+    let device = vos_light::release::device(&vos_testkit::programs::package("device"), "auth");
+    let program = DeviceProgram::released(&device.unwrap()).unwrap();
     let call = |instance: InstanceId, method: MethodId| {
         Call::new(
             founded.space.0,
@@ -1200,4 +1204,236 @@ fn a_device_kernels_proof_signs_in_as_an_auth_proof_does() {
         Answer::Refused(CredentialRefusal::Proof)
     );
     assert!(matches!(send(at, &fresh, &proof), Answer::Ran { .. }));
+}
+
+/// The device window of `instance`, as node `at` answers it.
+fn window(founded: &Founded, at: NodeNumber, instance: InstanceId) -> DeviceWindow {
+    client::devices(founded.cluster.target(at), founded.agent, instance)
+        .unwrap()
+        .expect("an installed instance's window")
+}
+
+/// Compatibility windows (`light-node.md` §4.4), on device kernels' release
+/// artifacts as an app embeds them: the `device` actor's `auth` (release
+/// one) and `device-next`'s (release two, its kernel written otherwise,
+/// the same claims). The space's window names the programs the artifacts
+/// name, computed from the same ELFs. An app shipping release one alone
+/// signs in at a space upgraded to release two, as the member's pseudonym;
+/// an app shipping both proves with release two, and the `once` guard
+/// refuses it, the same nullifier in one scope. Retired now, release one
+/// leaves the window: the old app refuses before proving, saying which
+/// side must update, and its proof made before is refused at ingress. A
+/// rollback keeps release two's program until its date, 60 days on: then
+/// it leaves the window, by the clock alone. A device format retired now
+/// empties the window's formats, and a device proof is refused `Format`.
+#[test]
+fn an_app_one_release_behind_signs_in_until_its_window_closes() {
+    use vos_light::wire::{self, Answer};
+    use vos_light::{Call, DEVICE_PEAK_BYTES, DeviceError, DeviceProgram, Prover, ProverConfig};
+
+    let founded = Founded::new();
+    let agent = founded.agent;
+    let elf = |name: &str| std::fs::read(actor_elf(name)).unwrap();
+    install(&founded.cluster, agent, DEVICE, &elf("device"), "operator");
+    let auth = method(&actor("device"), "auth");
+    let login = method(&actor("device"), "login");
+    let one = vos_light::release::device(&elf("device"), "auth").unwrap();
+    let two = vos_light::release::device(&elf("device-next"), "auth").unwrap();
+    assert_ne!(one.id, two.id);
+    let (old_app, new_app) = (vec![one.clone()], vec![two.clone(), one.clone()]);
+
+    let at = founded.follower();
+    let secret = vos_light::derive_secret(&[0x6e; 32], &[0x43; 32]);
+    founded.write(CREDENTIALS, "enroll", vos_light::member(&secret).to_bytes());
+    let time = || client::time(founded.cluster.target(at)).unwrap();
+    let identity = founded.operator.lock().unwrap().identity(agent).unwrap();
+    let query = wire::path_query(
+        agent.0,
+        &identity,
+        CREDENTIALS.0,
+        &vos_light::member(&secret),
+        time() + 60_000,
+    )
+    .unwrap();
+    let witness = wire::path_answer(&device_send(&founded, at, &query))
+        .unwrap()
+        .expect("an enrolled member's path");
+    let prover = Prover::new(ProverConfig {
+        threads: vos_light::Threads::Count(4),
+        max_memory: DEVICE_PEAK_BYTES,
+    })
+    .unwrap();
+    let signin = || {
+        Call::new(
+            founded.space.0,
+            agent.0,
+            DEVICE.0,
+            login.0,
+            ().encode(),
+            time() + 60_000,
+        )
+        .unwrap()
+    };
+    // The app's sign-in: the newest program it ships that the space's
+    // window admits, chosen before anything is proved.
+    let sign_in = |app: &[vos_light::release::Device]| {
+        let chosen = vos_light::choose(app, &window(&founded, at, DEVICE), auth)?;
+        let program = DeviceProgram::released(chosen).unwrap();
+        let call = signin();
+        let proof = prover
+            .prove_device_auth(&secret, &witness, b"login", &call, &program)
+            .unwrap();
+        Ok::<_, DeviceError>((chosen.id, call, proof))
+    };
+    let send = |call: &Call, proof: &vos_light::CredentialProof| {
+        wire::credentialed_answer(&device_send(&founded, at, &wire::credentialed(call, proof)))
+            .unwrap()
+    };
+
+    // Release one alone: the window names the artifact's program, the
+    // format the device format; the new app proves with release one.
+    let before = window(&founded, at, DEVICE);
+    let programs = |window: &DeviceWindow| -> Vec<([u8; 32], Option<u64>)> {
+        window
+            .kernels
+            .iter()
+            .find(|kernel| kernel.method == auth)
+            .unwrap()
+            .programs
+            .iter()
+            .map(|program| (program.id, program.retires_ms))
+            .collect()
+    };
+    assert_eq!(programs(&before), [(one.id, None)]);
+    assert_eq!(
+        before.formats,
+        [FormatWindow {
+            format: vos_light::DEVICE_FORMAT,
+            retires_ms: None
+        }]
+    );
+    let (chosen, _, _) = sign_in(&new_app).unwrap();
+    assert_eq!(chosen, one.id, "the newest the space admits");
+
+    // The space upgrades to release two: both are admitted, release one
+    // for 60 days.
+    let upgraded = time();
+    install(
+        &founded.cluster,
+        agent,
+        DEVICE,
+        &elf("device-next"),
+        "operator",
+    );
+    let applied = |first: [u8; 32]| {
+        vos_checker::spaces::wait_in_process("the install applied", || {
+            programs(&window(&founded, at, DEVICE))[0].0 == first
+        });
+    };
+    applied(two.id);
+    let window_two = programs(&window(&founded, at, DEVICE));
+    assert_eq!(window_two[0], (two.id, None));
+    assert_eq!(window_two[1].0, one.id);
+    let retires = window_two[1].1.expect("release one's date");
+    // By the leader's batch time, within a second of this node's clock.
+    assert!(
+        retires + 1_000 >= upgraded + RETIREMENT_MS && retires <= time() + RETIREMENT_MS + 1_000,
+        "60 days after the upgrade"
+    );
+
+    // The app one release behind signs in, as the member's pseudonym.
+    let (chosen, call, proof) = sign_in(&old_app).unwrap();
+    assert_eq!(chosen, one.id);
+    let made_before = sign_in(&old_app).unwrap();
+    let vos_light::CredentialPublic::Auth { nullifier, .. } = proof.public else {
+        unreachable!()
+    };
+    match send(&call, &proof) {
+        Answer::Ran {
+            outcome: Outcome::Done(reply),
+            ..
+        } => assert_eq!(
+            Option::<[u8; 32]>::decode_exact(&reply).unwrap(),
+            Some(nullifier.to_bytes())
+        ),
+        other => panic!("the old app's sign-in: {other:?}"),
+    }
+    // The new app proves with release two: the same nullifier, so the
+    // `once` scope admitted it already.
+    let (chosen, call, proof) = sign_in(&new_app).unwrap();
+    assert_eq!(chosen, two.id);
+    let vos_light::CredentialPublic::Auth {
+        nullifier: again, ..
+    } = proof.public
+    else {
+        unreachable!()
+    };
+    assert_eq!(again, nullifier, "one claim in the window");
+    assert_eq!(
+        send(&call, &proof),
+        Answer::Refused(CredentialRefusal::Once)
+    );
+
+    // The operator retires release one now.
+    let retired = smol::block_on(founded.cluster.leading(agent).retire(
+        agent,
+        DEVICE,
+        auth,
+        time(),
+    ))
+    .unwrap();
+    assert!(matches!(
+        retired,
+        vos_node::Reply::Ran(Outcome::Done(ref kept)) if Option::<u64>::decode_exact(kept) == Some(None)
+    ));
+    vos_checker::spaces::wait_in_process("the retirement applied", || {
+        programs(&window(&founded, at, DEVICE)) == [(two.id, None)]
+    });
+    match sign_in(&old_app) {
+        Err(DeviceError::Window) => {}
+        other => panic!("the old app proved: {:?}", other.map(|(id, _, _)| id)),
+    }
+    assert_eq!(
+        DeviceError::Window.to_string(),
+        "the space admits none of this app's programs for the kernel: the app or the space \
+         must update"
+    );
+    let (_, call, proof) = made_before;
+    assert_eq!(
+        send(&call, &proof),
+        Answer::Refused(CredentialRefusal::Binding),
+        "a retired release's proof names a program no guard admits"
+    );
+
+    // A rollback to release one keeps release two until its date; then the
+    // clock alone closes the window on it.
+    install(&founded.cluster, agent, DEVICE, &elf("device"), "operator");
+    applied(one.id);
+    let two_only = vec![two.clone()];
+    assert_eq!(sign_in(&two_only).map(|(id, _, _)| id), Ok(two.id));
+    founded.later(RETIREMENT_MS as i64 + 60_000);
+    assert_eq!(programs(&window(&founded, at, DEVICE)), [(one.id, None)]);
+    assert!(matches!(sign_in(&two_only), Err(DeviceError::Window)));
+    let (_, call, proof) = sign_in(&old_app).unwrap();
+    assert!(matches!(send(&call, &proof), Answer::Ran { .. }));
+
+    // A device format retired now: no device proof is admitted.
+    let now = time();
+    let node = founded.cluster.node(at).unwrap();
+    assert_eq!(node.retire_format(vos_light::DEVICE_FORMAT, now), Some(now));
+    assert_eq!(node.retire_format(verifier::FORMAT, now), None);
+    let (_, call, proof) = {
+        let program = DeviceProgram::released(&one).unwrap();
+        let call = signin();
+        let proof = prover
+            .prove_device_auth(&secret, &witness, b"login", &call, &program)
+            .unwrap();
+        (one.id, call, proof)
+    };
+    assert!(window(&founded, at, DEVICE).formats.is_empty());
+    assert!(matches!(sign_in(&old_app), Err(DeviceError::Window)));
+    assert_eq!(
+        send(&call, &proof),
+        Answer::Refused(CredentialRefusal::Format)
+    );
 }

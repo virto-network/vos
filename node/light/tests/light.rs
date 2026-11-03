@@ -77,7 +77,7 @@ fn a_local_actor_installed_from_release_artifacts_is_called() {
 /// A handler's failure writes nothing of its own; a call doing more than
 /// writing rows (a message, a committed map) fails `Trapped` with nothing
 /// written; a query that writes traps; and a package whose programs are
-/// not its derivation's installs nothing.
+/// not its derivation's, or another transpiler's, installs nothing.
 #[test]
 fn the_merge_entry_writes_rows_alone() {
     let (agent, counter) = artifacts();
@@ -88,6 +88,12 @@ fn the_merge_entry_writes_rows_alone() {
     assert!(matches!(
         light.install(COUNTER, &forged, Vec::new()),
         Err(Error::Package)
+    ));
+    let mut other = counter.clone();
+    other.derivation.transpiler += 1;
+    assert!(matches!(
+        light.install(COUNTER, &other, Vec::new()),
+        Err(Error::Transpiler(version)) if version == release::TRANSPILER + 1
     ));
     light.install(COUNTER, &counter, Vec::new()).unwrap();
     let call = |name: &str, arguments: Vec<u8>| {

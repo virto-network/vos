@@ -474,8 +474,8 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
 
     // A device kernel's sign-in (format 46), its replay, and its proof
     // sent to a guard naming no kernel.
-    let kernel = vos_testkit::programs::kernel("device", "auth");
-    let program = DeviceProgram::auth(&kernel).unwrap();
+    let device = vos_light::release::device(&vos_testkit::programs::package("device"), "auth");
+    let program = DeviceProgram::released(&device.unwrap()).unwrap();
     let device_login = founded.call(at, DEVICE, "login", ());
     let device_proof = prover
         .prove_device_auth(&secret, &witness, b"login", &device_login, &program)
