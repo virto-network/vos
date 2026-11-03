@@ -40,10 +40,10 @@ pub(crate) fn string_arg(meta: &syn::meta::ParseNestedMeta) -> syn::Result<Strin
 // ===== #[actor] =====
 
 /// The actor's state: a struct whose encoding is stored under the instance,
-/// and whose `Table` and `CommittedMap` fields are handles to rows stored
-/// beside it.
+/// and whose `Table`, `CommittedMap` and merge fields (`crdt::GSet`,
+/// `crdt::Set`, `crdt::Map`) are handles to rows stored beside it.
 ///
-/// A table's tag derives from its field's name, or from
+/// A table's or merge field's tag derives from its field's name, or from
 /// `#[table(name = "...")]`, which keeps rows reachable when the field is
 /// renamed. Its key transform is its type's.
 ///
@@ -118,6 +118,12 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// - **Options:** `#[msg(role = "...", gas = N)]`, the role a caller needs
 ///   and the handler's gas limit; `#[workflow(role = "...", gas = N)]`
 ///   alike, the role checked when it starts and the gas each step's.
+/// - **Merge handlers:** `#[msg(merge)]` on a `&mut self` handler, its
+///   context `&mut MergeContext<Self>` if it uses one: it runs on a
+///   device's merge entry alone, on every device that applies its
+///   operation, and writes its actor's merge fields alone. It takes no
+///   role; its message type implements no `Method`, so no handler calls or
+///   sends to it.
 /// - **Linearizable:** on a query, `#[msg(linearizable)]` always reads
 ///   after a read index, whatever consistency its client asks. That governs
 ///   the query a client names: a method it calls reads its snapshot.

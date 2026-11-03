@@ -265,6 +265,33 @@ impl<A> Command<A> {
     }
 }
 
+/// The context of a `#[msg(merge)]` handler: the time and random bytes of
+/// the operation, which travel inside it from the device that issued it,
+/// so every device that applies it reads the same, and logs. Nothing that
+/// reads state or reaches another instance: a merge handler's effects are
+/// its operation's alone (`core-model.md` §9.2), its writes its merge
+/// fields'.
+pub struct MergeContext<A> {
+    _actor: PhantomData<fn() -> A>,
+}
+
+impl<A> MergeContext<A> {
+    #[doc(hidden)]
+    pub const fn new() -> Self {
+        Self {
+            _actor: PhantomData,
+        }
+    }
+
+    /// This agent and instance.
+    pub fn me(&self) -> (AgentId, InstanceId) {
+        let (instance, agent) = host::self_id();
+        (AgentId(agent), InstanceId(instance))
+    }
+
+    batch_reads!();
+}
+
 /// Why an await of another agent returned an error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RequestError<E> {

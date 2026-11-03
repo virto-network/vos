@@ -143,10 +143,16 @@ fn handler(
     } else {
         match inputs.next() {
             Some(FnArg::Receiver(receiver)) if receiver.reference.is_some() => {
-                if receiver.mutability.is_some() {
-                    Kind::Command
-                } else {
-                    Kind::Query
+                match (receiver.mutability.is_some(), options.merge) {
+                    (true, Some(_)) => Kind::Merge,
+                    (true, None) => Kind::Command,
+                    (false, None) => Kind::Query,
+                    (false, Some(span)) => {
+                        return Err(Error::new(
+                            span,
+                            "a #[msg(merge)] handler takes `&mut self`: it writes merge fields",
+                        ));
+                    }
                 }
             }
             _ => {
@@ -157,6 +163,15 @@ fn handler(
             }
         }
     };
+    if let Some(span) = options.merge
+        && (kind != Kind::Merge || options.role.is_some())
+    {
+        return Err(Error::new(
+            span,
+            "`merge` marks a `&mut self` #[msg] handler alone, with no role: it runs on every \
+             device that applies its operation, by its author",
+        ));
+    }
     if let Some(span) = options.linearizable
         && kind != Kind::Query
     {
@@ -253,7 +268,7 @@ fn arguments<'a>(
         }
         if index == 0
             && let Type::Reference(reference) = &*typed.ty
-            && ["Query", "Command", "Workflow"]
+            && ["Query", "Command", "Workflow", "MergeContext"]
                 .iter()
                 .any(|context| is_named(&reference.elem, context))
         {
@@ -262,6 +277,7 @@ fn arguments<'a>(
                 Kind::Query => is_named(&reference.elem, "Query") && !mutable,
                 Kind::Command => is_named(&reference.elem, "Command") && mutable,
                 Kind::Workflow => is_named(&reference.elem, "Workflow") && mutable,
+                Kind::Merge => is_named(&reference.elem, "MergeContext") && mutable,
                 Kind::Attestable | Kind::Stating | Kind::Reading | Kind::Device => false,
             };
             if !expected {
@@ -274,6 +290,7 @@ fn arguments<'a>(
                             "an #[attestable] method takes no context"
                         }
                         Kind::Workflow => "a #[workflow] takes `&mut Workflow<Self>`",
+                        Kind::Merge => "a #[msg(merge)] handler takes `&mut MergeContext<Self>`",
                     },
                 ));
             }
@@ -607,6 +624,9 @@ impl Generated {
                 });
                 self.arms.push(workflow_arm(handler, actor, &message));
             }
+            // No `Method`: no handler calls or sends to a merge handler,
+            // which runs on the merge entry alone.
+            Kind::Merge => self.arms.push(handler_arm(handler, actor, &message)),
             Kind::Command | Kind::Query => {
                 self.types.push(quote! {
                     impl ::vos_sdk::context::Method for #message {

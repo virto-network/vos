@@ -44,6 +44,7 @@ enum Owner {
 enum Part {
     Struct = 0x00,
     Table = 0x01,
+    Merge = 0x02,
 }
 
 /// How a table's keys become its row keys, as a Substrate map's hasher
@@ -160,6 +161,9 @@ enum Row {
     Binding = 0x27,
     Once = 0x28,
     Admission = 0x29,
+    Cutoff = 0x2a,
+    Lamport = 0x2b,
+    Held = 0x2c,
 }
 
 /// The root builder's rows, each tagged after [`Owner::Tree`]: the rows of
@@ -235,17 +239,19 @@ pub const TABLE_PREFIX: usize = 1 + 4 + 1 + 4 + 1;
 /// map's id.
 pub const COMMITTED_PREFIX: usize = 1 + MAP_LEN;
 
-/// Which keyed rows of an instance: a table's, or a committed map's.
+/// Which keyed rows of an instance: a table's, a committed map's or a
+/// merge field's.
 #[derive(Clone, Copy)]
 enum Kind {
     Table,
     Committed,
+    Merge,
 }
 
-/// Append the prefix of a table's or committed map's rows to `out`: a
-/// table's under its instance, `0x01 ‖ instance ‖ 0x01 ‖ tag ‖ transform`;
-/// a committed map's under its own owner, `0x03 ‖ instance ‖ tag ‖
-/// transform`.
+/// Append the prefix of a table's, committed map's or merge field's rows
+/// to `out`: a table's under its instance, `0x01 ‖ instance ‖ 0x01 ‖ tag ‖
+/// transform`, a merge field's alike after `0x02`; a committed map's under
+/// its own owner, `0x03 ‖ instance ‖ tag ‖ transform`.
 fn prefix_into(
     kind: Kind,
     instance: InstanceId,
@@ -254,10 +260,13 @@ fn prefix_into(
     out: &mut Vec<u8>,
 ) {
     match kind {
-        Kind::Table => {
+        Kind::Table | Kind::Merge => {
             out.push(Owner::Instance as u8);
             out.extend_from_slice(&instance.0.to_be_bytes());
-            out.push(Part::Table as u8);
+            out.push(match kind {
+                Kind::Merge => Part::Merge,
+                _ => Part::Table,
+            } as u8);
         }
         Kind::Committed => {
             out.push(Owner::Committed as u8);
@@ -275,6 +284,7 @@ fn table_of(rows: Rows) -> Option<(Kind, u32, Transform)> {
         Rows::Struct => None,
         Rows::Table { tag, transform } => Some((Kind::Table, tag, transform)),
         Rows::Committed { tag, transform } => Some((Kind::Committed, tag, transform)),
+        Rows::Merge { tag, transform, .. } => Some((Kind::Merge, tag, transform)),
     }
 }
 
@@ -288,7 +298,9 @@ pub fn rows_prefix(instance: InstanceId, rows: Rows) -> Option<(Vec<u8>, Transfo
 }
 
 /// The row of the raw key `key` in `rows`: the struct row under the empty
-/// key, or the key transformed after its table's prefix. A struct key that
+/// key, or the key transformed after its table's prefix; for a merge
+/// field, the prefix of the key's entries, one an author
+/// ([`merge_entry`]). A struct key that
 /// is not empty fails the invocation ([`Failure::Trapped`]); an ordered key
 /// past [`cap::ORDERED_KEY`] exceeds a cap ([`Failure::Cap`]).
 pub fn row(instance: InstanceId, rows: Rows, key: &[u8]) -> Result<Vec<u8>, Failure> {
@@ -515,6 +527,52 @@ pub fn admitted(instance: InstanceId, key: &[u8; 32]) -> Vec<u8> {
         transform: Transform::Hashed,
     };
     row(instance, rows, key).expect("a hashed row's key")
+}
+
+/// The entry of `author` for one element or key of a merge field, after
+/// its row ([`row`] of a [`Rows::Merge`]): the author's 32 bytes last, so
+/// one key's entries lie together and the keys stay prefix-free.
+pub fn merge_entry(row: &[u8], author: &[u8; 32]) -> Vec<u8> {
+    key(&[row, author])
+}
+
+/// The length of the author's part of a merge field's entry.
+pub const AUTHOR: usize = 32;
+
+/// An author's cutoff in `instance`'s scope ([`crate::merge::Cutoff`]): its
+/// operations at this sequence number and later are filtered when a merge
+/// field is read. A device writes it, never an actor.
+pub fn cutoff(instance: InstanceId, author: &[u8; 32]) -> Vec<u8> {
+    key(&[&Row::Cutoff.prefix(), &instance.0.to_be_bytes(), author])
+}
+
+/// The prefix of the cutoffs in `instance`'s scope.
+pub fn cutoffs(instance: InstanceId) -> Vec<u8> {
+    key(&[&Row::Cutoff.prefix(), &instance.0.to_be_bytes()])
+}
+
+/// A device's DAG node's Lamport clock, by its CID: one more than its
+/// parents' greatest, the order a merge field's latest entry is chosen in.
+pub fn lamport(cid: &[u8; 32]) -> Vec<u8> {
+    key(&[&Row::Lamport.prefix(), cid])
+}
+
+/// An operation of a kind the device does not know, kept until it does:
+/// in `instance`'s scope, by its id, its author, sequence number and index
+/// in its node.
+pub fn held(instance: InstanceId, author: &[u8; 32], seq: u64, index: u32) -> Vec<u8> {
+    key(&[
+        &Row::Held.prefix(),
+        &instance.0.to_be_bytes(),
+        author,
+        &seq.to_be_bytes(),
+        &index.to_be_bytes(),
+    ])
+}
+
+/// The prefix of the operations held in `instance`'s scope.
+pub fn held_prefix(instance: InstanceId) -> Vec<u8> {
+    key(&[&Row::Held.prefix(), &instance.0.to_be_bytes()])
 }
 
 /// A credentialed call's binding digest `b`, recorded at its apply with its

@@ -390,6 +390,10 @@ impl<'a> Invocation<'a> {
         instance: InstanceId,
         r: &[u64; 13],
     ) -> Result<(), Failure> {
+        // No merge lane here, as in `memory::row`.
+        if Rows::is_merge(r[7]) {
+            return Err(Failure::Trapped);
+        }
         let cursor = match r[12] {
             0 => None,
             1 => Some(read_key(machine, r[8], r[9])?),

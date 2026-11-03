@@ -1,6 +1,6 @@
 //! The actor ABI: kinds, operations, codes and schemas.
 
-use vos_wire::abi::{self, Failure, Kind, Op, Refusal, Rows};
+use vos_wire::abi::{self, Failure, Keep, Kind, Op, Refusal, Rows};
 use vos_wire::ids::{MethodId, WorkflowId};
 use vos_wire::keys::Transform;
 use vos_wire::result::{InputRef, Outcome, Step};
@@ -34,6 +34,27 @@ fn kinds_reach_only_their_operations() {
     let stateful = [Op::Caller, Op::Attest];
     // Its instance's rows it reaches only inside a section.
     let rows = [Op::Get, Op::Put, Op::Delete, Op::Scan];
+    // A merge handler's: its rows (the agent narrows which), no caller,
+    // nothing that reaches past its instance.
+    let merging = [
+        Op::Input,
+        Op::Reply,
+        Op::Fail,
+        Op::Log,
+        Op::Now,
+        Op::Random,
+        Op::Get,
+        Op::Put,
+        Op::Delete,
+        Op::SelfId,
+    ];
+    for &op in Op::ALL {
+        assert_eq!(
+            abi::allowed(Kind::Merge, op),
+            merging.contains(&op),
+            "{op:?}"
+        );
+    }
     for op in handlers {
         assert!(abi::allowed(Kind::Command, op));
         assert_eq!(abi::allowed(Kind::Query, op), !writes.contains(&op));
@@ -107,13 +128,16 @@ fn kinds_index_as_they_encode() {
         Kind::Stating,
         Kind::Reading,
         Kind::Device,
+        Kind::Merge,
     ];
-    for kind in kinds {
+    for (index, kind) in kinds.into_iter().enumerate() {
         assert_eq!(kind.encode(), [kind.index()]);
+        assert_eq!(usize::from(kind.index()), index);
         assert_eq!(
             kind.is_handler(),
             matches!(kind, Kind::Command | Kind::Query)
         );
+        assert_eq!(kind.is_merge(), kind == Kind::Merge);
         assert_eq!(
             kind.is_attestable(),
             matches!(
@@ -456,11 +480,12 @@ fn kinds_encode_as_the_index_the_agent_passes() {
     assert_eq!(Kind::Stating.encode(), [4]);
     assert_eq!(Kind::Reading.encode(), [5]);
     assert_eq!(Kind::Device.encode(), [6]);
-    assert!(Kind::decode(&[7]).is_err());
+    assert_eq!(Kind::Merge.encode(), [7]);
+    assert!(Kind::decode(&[8]).is_err());
 }
 
-/// A row operation's rows register: the tag, the transform's tag, then the
-/// kind; any other value is refused.
+/// A row operation's rows register: the tag, the transform's tag, the
+/// kind, then a merge field's keep; any other value is refused.
 #[test]
 fn rows_registers_keep_their_bits() {
     let table = Rows::Table {
@@ -474,15 +499,33 @@ fn rows_registers_keep_their_bits() {
     assert_eq!(Rows::Struct.register(), 0);
     assert_eq!(table.register(), 0x0000_0101_a1b2_c3d4);
     assert_eq!(committed.register(), 0x0000_0200_0000_0007);
-    for rows in [Rows::Struct, table, committed] {
+    let merge = |keep| Rows::Merge {
+        tag: 9,
+        transform: Transform::Ordered,
+        keep,
+    };
+    assert_eq!(merge(Keep::Latest).register(), 0x0000_0301_0000_0009);
+    assert_eq!(merge(Keep::Earliest).register(), 0x0001_0301_0000_0009);
+    for rows in [
+        Rows::Struct,
+        table,
+        committed,
+        merge(Keep::Latest),
+        merge(Keep::Earliest),
+    ] {
         assert_eq!(Rows::from_register(rows.register()), Some(rows));
+        assert_eq!(
+            Rows::is_merge(rows.register()),
+            matches!(rows, Rows::Merge { .. })
+        );
     }
     for refused in [
         1,
         1 << 32,
         2 << 32 | 1 << 40,
-        3 << 40,
+        4 << 40,
         1 << 48 | 1 << 40,
+        2 << 48 | 3 << 40,
         u64::MAX,
     ] {
         assert_eq!(Rows::from_register(refused), None, "{refused:#x}");

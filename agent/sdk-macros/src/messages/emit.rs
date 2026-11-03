@@ -241,9 +241,12 @@ pub(super) fn handler_arm(handler: &Handler, actor: &Ident, message: &Ident) -> 
     let context = match (handler.kind, handler.has_context) {
         (Kind::Query, true) => quote!(&::vos_sdk::context::Query::new(),),
         (Kind::Command, true) => quote!(&mut ::vos_sdk::context::Command::new(),),
+        (Kind::Merge, true) => quote!(&mut ::vos_sdk::context::MergeContext::new(),),
         _ => quote!(),
     };
-    let (state, save) = if handler.kind == Kind::Command {
+    // A merge handler's state is saved as a command's: one that changes a
+    // plain field writes the struct, which the merge entry refuses.
+    let (state, save) = if matches!(handler.kind, Kind::Command | Kind::Merge) {
         (
             quote! {
                 let mut state = ::vos_sdk::state::load::<super::#actor>();

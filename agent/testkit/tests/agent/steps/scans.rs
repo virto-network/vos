@@ -301,7 +301,8 @@ fn rows_the_agent_does_not_know_fail_the_invocation() {
     let cases = [
         (Rows::Struct.register(), vec![vec![1u8]], "a struct key"),
         (Rows::Struct.register(), vec![], "a scan of the struct"),
-        (3 << 40, vec![vec![1]], "a fourth kind"),
+        (3 << 40, vec![vec![1]], "a merge field's, from a command"),
+        (4 << 40, vec![vec![1]], "a fifth kind"),
         (table | 2 << 32, vec![vec![1]], "a third transform"),
         (table | 1 << 48, vec![vec![1]], "bits past the kind"),
         (1, vec![vec![1]], "a struct with a tag"),

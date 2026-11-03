@@ -1,0 +1,5 @@
+error: a #[msg(merge)] handler takes `&mut MergeContext<Self>`
+  --> tests/compile_fail/merge_with_command_context.rs:18:38
+   |
+18 |     pub async fn tag(&mut self, ctx: &mut Command<Self>, tag: u64) {
+   |                                      ^^^^^^^^^^^^^^^^^^

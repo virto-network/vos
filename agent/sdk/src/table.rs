@@ -224,14 +224,7 @@ macro_rules! rows_handle {
             /// key order for [`Ordered`]), starting after `after` when
             /// given.
             pub fn iter(&self, after: Option<&K>) -> Iter<K, V> {
-                Iter {
-                    _rows: PhantomData,
-                    rows: self.rows(),
-                    cursor: after.map(encoded),
-                    buffer: Vec::new(),
-                    at: 0,
-                    done: false,
-                }
+                Iter::new(self.rows(), after)
             }
         }
     };
@@ -326,7 +319,7 @@ impl<K: TableKey, V: Decode, T: KeyTransform> ServedMap<K, V, T> {
     }
 }
 
-fn encoded<K: TableKey>(key: &K) -> Vec<u8> {
+pub(crate) fn encoded<K: TableKey>(key: &K) -> Vec<u8> {
     let mut bytes = Vec::new();
     key.encode_key(&mut bytes);
     bytes
@@ -345,6 +338,18 @@ pub struct Iter<K, V> {
 }
 
 impl<K: TableKey, V: Encode + Decode> Iter<K, V> {
+    /// The rows of `rows` after `after` when given.
+    pub(crate) fn new(rows: Rows, after: Option<&K>) -> Self {
+        Self {
+            _rows: PhantomData,
+            rows,
+            cursor: after.map(encoded),
+            buffer: Vec::new(),
+            at: 0,
+            done: false,
+        }
+    }
+
     /// Fetch the next rows into the reused buffer, growing it up to
     /// [`cap::SCAN`], which always holds one row.
     fn refill(&mut self) {
