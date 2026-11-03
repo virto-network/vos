@@ -1,11 +1,11 @@
 //! The programs an agent on JAM runs, as preimages of its service.
 //!
 //! - **Derived** from each package's ELF by the derivation a VOS node runs
-//!   at install ([`vos_pvm_compiler::derive`]): the actor's program and a
-//!   kernel per attestable method, the same bytes and hashes from the same
-//!   ELF and transpiler version, named by the same constructor
-//!   ([`Derivation::new`]), so the two agree whenever a space's proof is
-//!   verified on chain. The builder provides them as preimages and the
+//!   at install ([`vos_pvm_compiler::derive`]): the actor's program, a
+//!   kernel per attestable method and each device kernel's reference
+//!   program, the same bytes and hashes from the same ELF and transpiler
+//!   version, named by the same constructor ([`Derivation::new`]), so the
+//!   two agree whenever a space's proof is verified on chain. The builder provides them as preimages and the
 //!   install names them.
 //! - **Never forgotten:** the agent's accumulate solicits a program when a
 //!   package names it and never forgets one, so a program stays solicited
@@ -23,7 +23,8 @@ use crate::Error;
 #[derive(Clone, Debug)]
 pub struct Installable {
     pub derivation: Derivation,
-    /// The actor's program, then each kernel, by method.
+    /// The actor's program, then each kernel, by method, then each device
+    /// kernel's reference program, in the derivation's order.
     pub programs: Vec<Vec<u8>>,
     pub schema: Schema,
 }
@@ -49,13 +50,9 @@ pub fn derive(elf: &[u8]) -> Result<Installable, Error> {
             method.gas.unwrap_or_default(),
         )));
     }
-    let derivation = derived.derivation(elf);
-    let programs = core::iter::once(derived.actor)
-        .chain(derived.kernels.into_iter().map(|(_, kernel)| kernel))
-        .collect();
     Ok(Installable {
-        derivation,
-        programs,
+        derivation: derived.derivation(elf),
+        programs: derived.programs(),
         schema,
     })
 }

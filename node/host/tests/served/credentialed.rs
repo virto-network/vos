@@ -1243,21 +1243,25 @@ fn an_app_one_release_behind_signs_in_until_its_window_closes() {
     let (old_app, new_app) = (vec![one.clone()], vec![two.clone(), one.clone()]);
 
     let at = founded.follower();
-    let secret = vos_light::derive_secret(&[0x6e; 32], &[0x43; 32]);
-    founded.write(CREDENTIALS, "enroll", vos_light::member(&secret).to_bytes());
+    let secrets = [0x43, 0x44].map(|handle| vos_light::derive_secret(&[0x6e; 32], &[handle; 32]));
+    for secret in &secrets {
+        founded.write(CREDENTIALS, "enroll", vos_light::member(secret).to_bytes());
+    }
     let time = || client::time(founded.cluster.target(at)).unwrap();
     let identity = founded.operator.lock().unwrap().identity(agent).unwrap();
-    let query = wire::path_query(
-        agent.0,
-        &identity,
-        CREDENTIALS.0,
-        &vos_light::member(&secret),
-        time() + 60_000,
-    )
-    .unwrap();
-    let witness = wire::path_answer(&device_send(&founded, at, &query))
-        .unwrap()
-        .expect("an enrolled member's path");
+    let witnesses = secrets.each_ref().map(|secret| {
+        let query = wire::path_query(
+            agent.0,
+            &identity,
+            CREDENTIALS.0,
+            &vos_light::member(secret),
+            time() + 60_000,
+        )
+        .unwrap();
+        wire::path_answer(&device_send(&founded, at, &query))
+            .unwrap()
+            .expect("an enrolled member's path")
+    });
     let prover = Prover::new(ProverConfig {
         threads: vos_light::Threads::Count(4),
         max_memory: DEVICE_PEAK_BYTES,
@@ -1276,15 +1280,24 @@ fn an_app_one_release_behind_signs_in_until_its_window_closes() {
     };
     // The app's sign-in: the newest program it ships that the space's
     // window admits, chosen before anything is proved.
-    let sign_in = |app: &[vos_light::release::Device]| {
+    let sign_in_as = |member: usize, app: &[vos_light::release::Device]| {
         let chosen = vos_light::choose(app, &window(&founded, at, DEVICE), auth)?;
         let program = DeviceProgram::released(chosen).unwrap();
         let call = signin();
         let proof = prover
-            .prove_device_auth(&secret, &witness, b"login", &call, &program)
+            .prove_device_auth(
+                &secrets[member],
+                &witnesses[member],
+                b"login",
+                &call,
+                &program,
+            )
             .unwrap();
+        vos_light::verify_device(&proof, &call, b"login", &program).unwrap();
         Ok::<_, DeviceError>((chosen.id, call, proof))
     };
+    let sign_in = |app: &[vos_light::release::Device]| sign_in_as(0, app);
+    let (secret, witness) = (&secrets[0], &witnesses[0]);
     let send = |call: &Call, proof: &vos_light::CredentialProof| {
         wire::credentialed_answer(&device_send(&founded, at, &wire::credentialed(call, proof)))
             .unwrap()
@@ -1373,6 +1386,31 @@ fn an_app_one_release_behind_signs_in_until_its_window_closes() {
         send(&call, &proof),
         Answer::Refused(CredentialRefusal::Once)
     );
+    // The other way round for another member: release two's proof signs in,
+    // and release one's is refused, its pseudonym admitted once.
+    let (chosen, call, proof) = sign_in_as(1, &new_app).unwrap();
+    assert_eq!(chosen, two.id);
+    let vos_light::CredentialPublic::Auth {
+        nullifier: second, ..
+    } = proof.public
+    else {
+        unreachable!()
+    };
+    match send(&call, &proof) {
+        Answer::Ran {
+            outcome: Outcome::Done(reply),
+            ..
+        } => assert_eq!(
+            Option::<[u8; 32]>::decode_exact(&reply).unwrap(),
+            Some(second.to_bytes())
+        ),
+        other => panic!("the new app's sign-in: {other:?}"),
+    }
+    let (_, call, proof) = sign_in_as(1, &old_app).unwrap();
+    assert_eq!(
+        send(&call, &proof),
+        Answer::Refused(CredentialRefusal::Once)
+    );
 
     // The operator retires release one now.
     let retired = smol::block_on(founded.cluster.leading(agent).retire(
@@ -1426,7 +1464,7 @@ fn an_app_one_release_behind_signs_in_until_its_window_closes() {
         let program = DeviceProgram::released(&one).unwrap();
         let call = signin();
         let proof = prover
-            .prove_device_auth(&secret, &witness, b"login", &call, &program)
+            .prove_device_auth(secret, witness, b"login", &call, &program)
             .unwrap();
         (one.id, call, proof)
     };

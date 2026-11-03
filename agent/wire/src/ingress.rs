@@ -69,11 +69,15 @@ pub struct FormatWindow {
 }
 
 /// A device kernel's window: the programs its guard admits, newest first,
-/// at most its release's and its previous release's.
+/// at most its release's and its previous release's; `unavailable` when
+/// the answering node could not compute one of them yet (a blob it does
+/// not hold), so a reader asks again or another replica before taking the
+/// window as whole.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct KernelWindow {
     pub method: MethodId,
     pub programs: Vec<ProgramWindow>,
+    pub unavailable: bool,
 }
 
 /// A device program a guard admits: its id, which a proof's binding

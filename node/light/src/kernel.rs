@@ -88,7 +88,10 @@ impl DeviceProgram {
 /// device kernel `method`, that a space's `window` admits: its program id
 /// among the kernel's admitted programs, its format among the admitted
 /// formats. [`DeviceError::Window`] when it admits none: the app or the
-/// space must update, and nothing is proved. `shipped` is newest first.
+/// space must update, and nothing is proved; [`DeviceError::Unavailable`]
+/// when it admits none of them yet but the node could not compute one of
+/// the window's programs: ask again, or another replica. `shipped` is
+/// newest first.
 pub fn choose<'a>(
     shipped: &'a [Device],
     window: &DeviceWindow,
@@ -112,7 +115,10 @@ pub fn choose<'a>(
                     .iter()
                     .any(|program| program.id == device.id && program.format == device.format)
         })
-        .ok_or(DeviceError::Window)
+        .ok_or(match admitted.unavailable {
+            true => DeviceError::Unavailable,
+            false => DeviceError::Window,
+        })
 }
 
 /// The io-hash a device kernel of auth's statement states for its public
@@ -274,6 +280,7 @@ mod tests {
                 })
                 .collect(),
             kernels: vec![KernelWindow {
+                unavailable: false,
                 method: AUTH,
                 programs: programs
                     .iter()
@@ -313,10 +320,55 @@ mod tests {
             Err(DeviceError::Window),
             "the program in another format"
         );
+        let mut pending = window(&[(3, format)], &[format]);
+        pending.kernels[0].unavailable = true;
+        assert_eq!(
+            id(&pending),
+            Err(DeviceError::Unavailable),
+            "a program the node holds not yet"
+        );
         assert_eq!(
             choose(&app, &window(&[(2, format)], &[format]), MethodId(8)).map(|_| ()),
             Err(DeviceError::Window),
             "no window for the kernel"
         );
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use scale::Encode;
+    use vos_wire::ingress::{FormatWindow, KernelWindow, ProgramWindow};
+
+    use super::*;
+
+    /// A `Devices` request is its kind's bytes then the agent and the
+    /// instance; its answer decodes as the node encodes it.
+    #[test]
+    fn a_devices_request_and_its_answer() {
+        let request = crate::wire::devices_request(5, 9);
+        assert_eq!(&request[..2], &0x0005u16.to_le_bytes());
+        assert_eq!(&request[2..], &[5, 0, 0, 0, 9, 0, 0, 0]);
+        let window = DeviceWindow {
+            formats: vec![FormatWindow {
+                format: DEVICE_FORMAT,
+                retires_ms: Some(7),
+            }],
+            kernels: vec![KernelWindow {
+                method: MethodId(3),
+                programs: vec![ProgramWindow {
+                    id: [1; 32],
+                    format: DEVICE_FORMAT,
+                    retires_ms: None,
+                }],
+                unavailable: false,
+            }],
+        };
+        assert_eq!(
+            crate::wire::devices_answer(&Some(window.clone()).encode()),
+            Ok(Some(window))
+        );
+        assert_eq!(crate::wire::devices_answer(&[0]), Ok(None));
+        assert_eq!(crate::wire::devices_answer(&[2]), Err(DeviceError::Decode));
     }
 }

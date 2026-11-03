@@ -150,6 +150,9 @@ pub enum DeviceError {
     /// kernel (`light-node.md` §4.4): its compatibility window closed, or
     /// the app is newer than the space; refused before proving.
     Window,
+    /// The node could not compute one of the window's programs yet: ask
+    /// again, or another replica.
+    Unavailable,
 }
 
 impl core::fmt::Display for DeviceError {
@@ -161,6 +164,7 @@ impl core::fmt::Display for DeviceError {
             DeviceError::Prove => "the prover failed",
             DeviceError::Decode => "the answer does not decode",
             DeviceError::Verify => "the proof does not verify",
+            DeviceError::Unavailable => "the node holds the space's programs not yet: ask again",
             DeviceError::Window => {
                 "the space admits none of this app's programs for the kernel: the app or the \
                  space must update"

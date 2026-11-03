@@ -59,7 +59,8 @@ pub struct DeviceRelease {
 }
 
 /// A device kernel's previous release, which its guard still admits until
-/// `retires_ms` by the agent's batch time (`light-node.md` §4.4): kept by
+/// `retires_ms`, a date the agent sets from its batch time and ingress
+/// reads by its node's clock (`light-node.md` §4.4): kept by
 /// an install that replaced the kernel, at most one a method, deleted at
 /// the next install or retirement past its date.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
@@ -300,7 +301,7 @@ impl Installed {
     }
 
     /// Device kernel `method`'s window: its release, then its previous one
-    /// while that is admitted at `now`, by the agent's batch time.
+    /// while that is admitted at `now`, by the caller's clock.
     pub fn window(&self, method: MethodId, now: u64) -> Vec<DeviceRelease> {
         let previous = self
             .previous

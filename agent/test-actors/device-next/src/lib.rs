@@ -1,5 +1,6 @@
-//! The `device` test actor's next release (`light-node.md` §4.4): the same
-//! `login` guard and the same `auth` statement in the same arguments, its
+//! The `device` test actor's next release (`light-node.md` §4.4): its
+//! `login` guard in the same scope, now admitting each pseudonym once, and
+//! the same `auth` statement in the same arguments, its
 //! kernel written otherwise, with the SDK, so its device program, and the
 //! program id a binding names, differ while its claims do not. Installed
 //! over the `device` actor, it is an upgrade whose window admits both

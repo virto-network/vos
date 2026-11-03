@@ -7,7 +7,9 @@ use vos_wire::abi::cap::{Limits, Refused, Target};
 use vos_wire::abi::{Failure, Kind, cap};
 use vos_wire::batch::Admin;
 use vos_wire::ids::InstanceId;
-use vos_wire::records::{Admitting, Derivation, Installed, Previous, RETIREMENT_MS};
+use vos_wire::records::{
+    Admitting, Derivation, Installed, MAX_HEADROOM, Previous, RETIREMENT_MS,
+};
 use vos_wire::result::{InputRef, Outcome, Step, Write};
 use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode, SpaceId, WindowClock, keys};
@@ -364,6 +366,9 @@ fn package(derivation: Derivation, roles: Vec<(Vec<u8>, u8)>, target: Target) ->
     }
     let references = &installed.derivation.references;
     if references.len() != devices
+        || references
+            .iter()
+            .any(|reference| reference.headroom > MAX_HEADROOM)
         || references
             .windows(2)
             .any(|pair| pair[0].method >= pair[1].method)

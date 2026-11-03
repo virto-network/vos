@@ -275,12 +275,11 @@ impl Inner {
                 let mut programs = Vec::with_capacity(window.len());
                 for release in &window {
                     match self.device_program(*release).await {
-                        Ok(Some(program)) => programs.push((*release, program)),
-                        Ok(None) => {}
+                        Ok(program) => programs.push((*release, program)),
                         Err(refused) => return refused.into(),
                     }
                 }
-                if programs.is_empty() {
+                if programs.iter().all(|(_, program)| program.is_none()) {
                     return Response::Rejected(Rejection::Credential(CredentialRefusal::Kind));
                 }
                 // The lookups awaited, and the state may have moved (an
@@ -379,7 +378,8 @@ impl Inner {
     /// for each device kernel the programs its guard admits, newest first,
     /// each with its retirement (`Kind::Devices`). `None` for an instance
     /// not installed; a release whose program cannot be computed is left
-    /// out.
+    /// out, and one this node cannot compute yet (a blob it does not hold)
+    /// marks its kernel's window `unavailable`.
     pub(crate) async fn device_window(
         &self,
         agent: AgentId,
@@ -388,7 +388,6 @@ impl Inner {
         let now = (self.clock)();
         let installed = installed(&self.store.snapshot(), agent, instance).ok()??;
         let formats = self.calls.devices.formats(now);
-        let format = formats.first().map(|window| window.format);
         let mut kernels = Vec::new();
         for method in &installed.schema.methods {
             if method.kind != Kind::Device {
@@ -401,21 +400,24 @@ impl Inner {
                     .find(|previous| previous.method == method.id && previous.release == *release)
                     .map(|previous| previous.retires_ms)
             };
-            let mut programs = Vec::new();
+            let (mut programs, mut unavailable) = (Vec::new(), false);
             for release in installed.window(method.id, now) {
-                if let (Some(format), Ok(Some(program))) =
-                    (format, self.device_program(release).await)
-                {
-                    programs.push(ProgramWindow {
+                match self.device_program(release).await {
+                    // Every program is computed under the current device
+                    // format until a second one is verified.
+                    Ok(Some(program)) => programs.push(ProgramWindow {
                         id: *program.id(),
-                        format,
+                        format: device::FORMAT.number,
                         retires_ms: retires(&release),
-                    });
+                    }),
+                    Ok(None) => {}
+                    Err(_) => unavailable = true,
                 }
             }
             kernels.push(KernelWindow {
                 method: method.id,
                 programs,
+                unavailable,
             });
         }
         Some(DeviceWindow { formats, kernels })
@@ -497,7 +499,7 @@ impl Inner {
         front: Front,
         agent: AgentId,
         call: Credentialed,
-        programs: Option<Vec<(DeviceRelease, Arc<Verifier>)>>,
+        programs: Option<Vec<(DeviceRelease, Option<Arc<Verifier>>)>>,
     ) -> Result<Checked, Refused> {
         let Front {
             space,
@@ -515,13 +517,17 @@ impl Inner {
                     .iter()
                     .all(|release| programs.iter().any(|(held, _)| held == release)) =>
             {
-                Some(
-                    programs
-                        .into_iter()
-                        .filter(|(release, _)| window.contains(release))
-                        .map(|(_, program)| program)
-                        .collect::<Vec<_>>(),
-                )
+                // A release whose program cannot be computed admits no
+                // proof; the window's others still do.
+                let admitted = programs
+                    .into_iter()
+                    .filter(|(release, _)| window.contains(release))
+                    .filter_map(|(_, program)| program)
+                    .collect::<Vec<_>>();
+                if admitted.is_empty() {
+                    return Err(CredentialRefusal::Kind.into());
+                }
+                Some(admitted)
             }
             (Some(_), _) => return Err(Refused::Unavailable),
         };

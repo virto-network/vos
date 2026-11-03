@@ -97,6 +97,9 @@ pub(super) fn msg_options(attribute: &Attribute) -> syn::Result<Options> {
                 }
                 options.reference = Some(meta.value()?.parse::<syn::Path>()?);
             } else if meta.path.is_ident("headroom") {
+                if options.headroom.is_some() {
+                    return Err(meta.error("`headroom = k` given twice"));
+                }
                 let span = meta.path.span();
                 let Expr::Lit(ExprLit {
                     lit: Lit::Int(value),

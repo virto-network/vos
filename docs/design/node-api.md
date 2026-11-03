@@ -229,7 +229,8 @@ budget, past which it is answered `Busy`.
   kernel the programs its guard admits, newest first (its release's, and
   its previous release's until that retires), each its id, its format and
   its date. The node computes a program the first time a read or a proof
-  names it, on an executor, once a release. A light node reads it before
+  names it, on an executor, once a release; a kernel's window it could
+  not compute whole yet (a blob it does not hold) says `unavailable`. A light node reads it before
   it proves, and proves with the newest program it ships that the window
   holds. An onion-only agent's window is read through the onion alone,
   as its schema is.

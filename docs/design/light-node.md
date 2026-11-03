@@ -1233,7 +1233,7 @@ writes (the `sdk-device` test actor's `auth` and `owner`):
   taken.
 - **The device end inlined** [measured, step counts of the traced run on
   the host, Intel Core Ultra 7 155H, 2026-11-03]: a crate with several
-  device kernels, or a kernel and its reference entry (plan 8.4), called
+  device kernels, or a kernel and its reference entry, called
   one outlined `DeviceReturn` end and its part writers. With them
   `#[inline(always)]`, on today's target, the SDK-form auth takes 1,546
   steps (from 1,839) and owner 385 (from 708, `owner_lean` 383); the
@@ -1345,13 +1345,16 @@ format, the chips, the sizes and the root.
   `random_witnesses_fit_the_reference_programs`) runs random witnesses of
   the stock kernels and of the hand-lean `auth` against their references'
   sizes [built].
-- **Computed at release, on the phone never** [built]: the release build
-  computes each device kernel's program from the package's ELF as a node's
-  install does (`vos_light::release::devices`), the stock kernels' among
-  them, and the app embeds the artifacts (`release::Device`: the kernel,
-  its chips and log sizes, its id, the ELF's hash) beside the local actors'
-  packages. The phone runs no transpiler and no reference run: it commits
-  a program's preprocessed tree from its artifact and checks the id
+- **Computed at release, on the phone never** [built: the release build
+  and the device's side; s4's facility takes them when its VOS pin moves,
+  plan 8.24b]: the release build computes each device kernel's program
+  from the package's ELF as a node's install does
+  (`vos_light::release::devices`), the stock kernels' among them, and the
+  app embeds the artifacts (`release::Device`: the kernel, its chips and
+  log sizes, its id, the ELF's hash) beside the local actors' packages
+  (the phone bench's `kernel` command takes one, `tools/phone`). The phone
+  runs no transpiler and no reference run: it commits a program's
+  preprocessed tree from its artifact and checks the id
   (`DeviceProgram::released`). "Reproducible" reduces to the app and the
   space taking the same release artifact, the ELF, by its hash: the
   space's window names the ids the app's artifacts name (the window
@@ -1400,11 +1403,15 @@ format, the chips, the sizes and the root.
   - **The light node reads the window first** (`Kind::Devices`: the
     formats and each device kernel's programs, ids, formats and dates) and
     proves with the newest program it ships that the window holds, in a
-    format it holds (`vos_light::choose`). When the space admits none it
-    refuses before proving (`DeviceError::Window`: "the space admits none
-    of this app's programs for the kernel: the app or the space must
-    update"). An app ships the current release's artifacts and the
-    previous one's.
+    format it holds (`vos_light::choose`, `wire::devices_request` [built];
+    the app's sign-in calls them when s4's facility moves to release
+    artifacts, plan 8.24b). When the space admits none it refuses before
+    proving (`DeviceError::Window`: "the space admits none of this app's
+    programs for the kernel: the app or the space must update"); a window
+    a node could not compute whole yet (a blob it does not hold) is marked
+    `unavailable`, and the app asks again rather than saying either side
+    must update. An app ships the current release's artifacts and the
+    previous one's [proposed].
   - **One claim per window:** two versions in one window must compute
     identical claims (auth's nullifier, owner's digest) with identical
     meaning, so a `once` scope admits a member once whichever version

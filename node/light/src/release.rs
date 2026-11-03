@@ -10,7 +10,7 @@
 //!   the same ELF: the kernel, its chips and log sizes, and the program's
 //!   id. The app ships the stock kernels' (and any kernel it puts a secret
 //!   into), the current release's and the previous one's, and proves with
-//!   the newest a space's window admits ([`crate::Window`]): the app and
+//!   the newest a space's window admits ([`crate::choose`]): the app and
 //!   the space take one release artifact, the ELF, by its hash.
 //!
 //! The `release` feature builds them from ELFs (`package`, `agent`,
@@ -45,7 +45,8 @@ pub struct Device {
 }
 
 /// A local actor's release artifact: its derivation, and its programs,
-/// the actor's and then each kernel's, in the derivation's order.
+/// the actor's, then each kernel's, then each reference's, in the
+/// derivation's order.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Package {
     pub derivation: Derivation,
@@ -54,7 +55,7 @@ pub struct Package {
 
 impl Package {
     /// Its programs with their hashes, if they are the derivation's, in its
-    /// order: the actor's, then each kernel's.
+    /// order: the actor's, then each kernel's, then each reference's.
     pub fn checked(&self) -> Option<Vec<([u8; 32], &[u8])>> {
         let named: Vec<[u8; 32]> = self.derivation.programs().map(|hash| hash.0).collect();
         if named.len() != self.programs.len() {

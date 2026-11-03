@@ -113,7 +113,10 @@ has passed every check before the binding (format, size, expiry, guard,
 kind), or a `Devices` read names it, once however many such requests wait
 on it (about 0.2 s), then keeps it, and a failure of the release's own
 (its shape, its runs) too; a program the replica does not hold yet, or
-any other failure, answers `Unavailable` and is tried again. The guard
+any other failure, answers `Unavailable` (a `Devices` read marks the
+kernel's window `unavailable`) and is tried again. A window release
+whose program cannot be computed admits no proof, the window's other
+release still does. The guard
 admits its kernel's release and, until its date, the previous release
 an install replaced (`light-node.md` §4.4); a device format past its
 retirement is refused `Format`. The binding names the program's id, one
