@@ -7,9 +7,7 @@ use vos_wire::abi::cap::{Limits, Refused, Target};
 use vos_wire::abi::{Failure, Kind, cap};
 use vos_wire::batch::Admin;
 use vos_wire::ids::InstanceId;
-use vos_wire::records::{
-    Admitting, Derivation, Installed, MAX_HEADROOM, Previous, RETIREMENT_MS,
-};
+use vos_wire::records::{Admitting, Derivation, Installed, MAX_HEADROOM, Previous, RETIREMENT_MS};
 use vos_wire::result::{InputRef, Outcome, Step, Write};
 use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode, SpaceId, WindowClock, keys};
