@@ -290,11 +290,14 @@ pub(crate) struct Known {
     /// When its probation ends, by the log's time: it signs no operation
     /// or commit before.
     pub(crate) active_from: u64,
+    /// What was left of its probation when a removal against it opened:
+    /// frozen until no removal against it is open.
+    pub(crate) frozen: Option<u64>,
     /// When its removal matured: it has no voice from then.
     pub(crate) matured: Option<u64>,
     /// A confirmed commit removed it from the group.
     pub(crate) out: bool,
-    /// The time of its last logged `alive`.
+    /// The log index of its last logged `alive`, the agent's word.
     pub(crate) alive: u64,
 }
 
@@ -305,6 +308,7 @@ impl Known {
             strong: keys.class == AdminClass::Strong,
             keys,
             active_from,
+            frozen: None,
             matured: None,
             out: false,
             alive: 0,
@@ -342,7 +346,8 @@ pub(crate) enum Act {
 }
 
 /// A device-set admin call the log holds at `index`, as this device
-/// checked it: its signer, origin, method and arguments, and its evidence.
+/// checked it: its signer, origin, method and arguments, its evidence, and
+/// for a removal, the removal it makes one contest with.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub(crate) struct Call {
     pub(crate) index: u64,
@@ -353,6 +358,18 @@ pub(crate) struct Call {
     pub(crate) arguments: Vec<u8>,
     pub(crate) act: Act,
     pub(crate) evidence: Check,
+    pub(crate) rival: Option<u64>,
+}
+
+/// A candidate a device that cannot follow saw, which it does not take:
+/// its epoch, its time, the device it added and its logged effect, kept
+/// only to follow the device set through its verdict.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub(crate) struct Passing {
+    pub(crate) epoch: u64,
+    pub(crate) at: u64,
+    pub(crate) added: Option<DeviceId>,
+    pub(crate) effect: Effect,
 }
 
 /// Whether the evidence supports a maturity the log asserts.
@@ -376,6 +393,8 @@ pub(crate) enum Support {
 pub(crate) struct Claim {
     pub(crate) entry: u64,
     pub(crate) op: u64,
+    /// The removal it was one contest with, when the log asserted it.
+    pub(crate) rival: Option<u64>,
     pub(crate) at: u64,
     pub(crate) every: bool,
     pub(crate) removes: Vec<DeviceId>,
@@ -467,7 +486,8 @@ pub(crate) struct State {
     /// The next log index to read, and the chain through the one before.
     pub(crate) next: u64,
     pub(crate) chain: [u8; 32],
-    /// The latest batch time the log showed.
+    /// The latest batch time the log showed, which no entry after goes
+    /// back on.
     pub(crate) time: u64,
     /// The batch times of this device's calls within the confirming
     /// window, the latest last.
@@ -483,6 +503,7 @@ pub(crate) struct State {
     pub(crate) devices: Vec<(DeviceId, Known)>,
     pub(crate) set: Set,
     pub(crate) pending: Option<Pending>,
+    pub(crate) passing: Option<Passing>,
     pub(crate) own: Option<Own>,
     /// This device's last decision: an epoch, and whether it confirmed it.
     pub(crate) decided: Option<(u64, bool)>,
@@ -642,7 +663,7 @@ impl DeviceGroup {
             id: Some(0),
             next: 0,
             chain: [0; 32],
-            time: now,
+            time: 0,
             calls: vec![now],
             confirmed: 0,
             offset: 0,
@@ -651,6 +672,7 @@ impl DeviceGroup {
             devices: vec![(0, Known::new(me.clone(), now))],
             set: Set::default(),
             pending: None,
+            passing: None,
             own: None,
             decided: None,
             course: Course::Following,
@@ -714,6 +736,7 @@ impl DeviceGroup {
             devices,
             set,
             pending: None,
+            passing: None,
             own: None,
             decided: None,
             course: Course::Following,
@@ -733,7 +756,7 @@ impl DeviceGroup {
     /// read of the agent ([`Restored`]): a new group of this device alone at
     /// the confirmed epoch, following the log from its head; its first
     /// commit carries the removal of every device before it. The store's
-    /// archive is kept, its naming secret new.
+    /// archive is kept.
     pub fn restore(
         store: &Store,
         agent: Agent,
@@ -787,6 +810,7 @@ impl DeviceGroup {
                 ..Set::default()
             },
             pending: None,
+            passing: None,
             own: None,
             decided: None,
             course: Course::Following,

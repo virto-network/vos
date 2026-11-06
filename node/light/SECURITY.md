@@ -81,8 +81,12 @@ and what a node does with one is `node/SECURITY.md`'s.
   operation matured is honoured only once the evidence supports it: the
   operation's own, and either its delay passed with no verified veto of a
   device with a voice, no rival removal and, for a restore, no `alive`
-  since, or a verified second signature, or verified resolutions naming
-  it (the kit's, or two seasoned devices' with strong admins). Evidence
+  since (unsigned, the agent's word), or a verified second signature, or
+  verified resolutions naming it (the kit's, or the latest of each of two
+  seasoned devices with strong admins). A maturity asserted at a time
+  past its entry's is refused, and an entry whose batch time goes back
+  stops the reading; a removal freezes its target's probation as the
+  agent does. Evidence
   posted after the maturity is waited for until the confirm window has
   passed; a maturity it never supports raises `Unsigned` and moves
   nothing. A device whose candidate removes a device on a maturity this
@@ -94,14 +98,19 @@ and what a node does with one is `node/SECURITY.md`'s.
   maturity needs; a home that shortens it shortens both, and one that
   lengthens it holds a void candidate's keys in place longer. A device
   checks operations against the delays the log configured, not against
-  its own.
+  its own: `Configured` is the operators' word, unsigned, so a home that
+  sets a delay to zero makes every removal (and a leaked kit's restore)
+  immediate on every device, and no device alarms on it.
 - **A restore's device trusts the agent for what came before:** it starts
   its group from what it reads of the agent after its restore matured
   (the log's head, the device set, the kit), with no earlier view to
   check them against; from then it checks the log as any device does.
 - **A device that cannot follow** reads on for the device set's
   operations, so its own regroup matures in its view, but takes no other
-  candidate: its regroup's new group names only the devices it knew.
+  candidate: it follows the others' epochs and the removals they carried
+  by the agent's word (which moves no key), and its regroup's new group
+  names only the devices it knew. A regrouper whose removal matures
+  before its new group frees the others to commit.
 - **Data keys come from the confirmed epoch alone**, and scope ids from
   the archive's naming secret, which is the store's from its first scope
   on: a store that named a scope does not join another group.

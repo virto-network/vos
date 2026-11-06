@@ -13,8 +13,8 @@ use vos_wire::personal::{
 };
 
 use super::{
-    Act, Alarm, CONFIRM, Check, Course, DeviceGroup, Event, GroupError, Known, Pending, Processed,
-    Remedy, Why, credential, rows,
+    Act, Alarm, CONFIRM, Check, Course, DeviceGroup, Event, GroupError, Known, Passing, Pending,
+    Processed, Remedy, Why, credential, rows,
 };
 use crate::call::method_id;
 
@@ -57,11 +57,16 @@ impl DeviceGroup {
                 events.push(Event::Alarm(Alarm::Log { index }));
                 break;
             }
+            if entry.at < self.state.time {
+                // Batch time goes back: a rewritten log.
+                events.push(Event::Alarm(Alarm::Log { index }));
+                break;
+            }
             self.state.next += 1;
             self.state.chain = entry.chain;
-            self.state.time = self.state.time.max(entry.at);
+            self.state.time = entry.at;
             self.deadline(entry.at, &mut events)?;
-            self.support(Some(entry.at), &mut events)?;
+            self.support(&mut events)?;
             self.entry(index, entry, &mut events)?;
             self.settle(&mut events)?;
         }
@@ -107,7 +112,7 @@ impl DeviceGroup {
             Body::Matured { device } => self.matured(index, device, events)?,
             Body::Alive { device } => {
                 if let Some(known) = self.state.known_mut(device) {
-                    known.alive = at;
+                    known.alive = index;
                 }
             }
             Body::Candidate { .. } => unreachable!("taken above"),
@@ -153,23 +158,35 @@ impl DeviceGroup {
         else {
             unreachable!("a candidate entry")
         };
+        if let Some(pending) = self.state.pending.clone() {
+            // The agent took the next candidate while this device's count
+            // of the last one is undecided: the agent counted votes this
+            // device does not hold.
+            events.push(Event::Alarm(Alarm::Verdict {
+                epoch: pending.epoch,
+            }));
+            if epoch > pending.epoch && pending.evidence == Check::Valid {
+                self.apply(&pending);
+            }
+            self.stick(pending.epoch, pending.by, events)?;
+        }
+        let decoded = CommitArguments::decode_exact(&call.arguments)
+            .filter(|((named, _), _)| *named == epoch && call.method == method_id("commit"));
         let fresh = self.state.set.fresh;
         let regroup = fresh.is_some() && fresh == self.state.id && fresh == Some(by);
         if matches!(self.state.course, Course::Stuck { .. }) && !regroup {
             // A device that cannot follow takes no candidate but its own
-            // regroup's.
+            // regroup's: it follows the others' epochs and the removals
+            // they carry by the agent's word, which moves no key.
+            self.state.confirmed = self.state.confirmed.max(epoch.saturating_sub(1));
+            self.state.passing = decoded.map(|((_, effect), _)| Passing {
+                epoch,
+                at,
+                added,
+                effect,
+            });
             return Ok(());
         }
-        if let Some(pending) = &self.state.pending {
-            // The agent took the next candidate while this device's count
-            // of the last one is undecided: the agent counted votes this
-            // device does not hold.
-            let (epoch, committer) = (pending.epoch, pending.by);
-            events.push(Event::Alarm(Alarm::Verdict { epoch }));
-            return self.stick(epoch, committer, events);
-        }
-        let decoded = CommitArguments::decode_exact(&call.arguments)
-            .filter(|((named, _), _)| *named == epoch && call.method == method_id("commit"));
         let (mut evidence, effect, handshake, welcome_hash) = match decoded {
             Some(((_, effect), (handshake, hash))) => (Check::Missing, effect, handshake, hash),
             None => (Check::Invalid, Effect::default(), Vec::new(), None),
@@ -344,6 +361,17 @@ impl DeviceGroup {
                 }
                 Verdict::Confirmed(_) => events.push(Event::Alarm(Alarm::Verdict { epoch })),
             },
+            _ if self
+                .state
+                .passing
+                .as_ref()
+                .is_some_and(|passing| passing.epoch == epoch) =>
+            {
+                let passing = self.state.passing.take().expect("passing");
+                if let Verdict::Confirmed(_) = verdict {
+                    self.carried(passing.epoch, &passing.effect.remove);
+                }
+            }
             _ => {
                 let confirmed = matches!(verdict, Verdict::Confirmed(_));
                 if self
@@ -703,7 +731,13 @@ impl DeviceGroup {
                 }
                 Ok(())
             }
-            _ => self.stick(pending.epoch, pending.by, events),
+            _ => {
+                // The agent confirmed it: its effect is the device set's.
+                if pending.evidence == Check::Valid {
+                    self.apply(&pending);
+                }
+                self.stick(pending.epoch, pending.by, events)
+            }
         }
     }
 
@@ -718,15 +752,21 @@ impl DeviceGroup {
                 .push((id, Known::new(keys.clone(), active_from)));
             self.state.set.adds.retain(|add| add != keys);
         }
-        for device in &pending.effect.remove {
+        self.carried(pending.epoch, &pending.effect.remove);
+    }
+
+    /// `epoch` confirmed, its commit carrying the removals of `removed`.
+    fn carried(&mut self, epoch: u64, removed: &[DeviceId]) {
+        for device in removed {
             if let Some(known) = self.state.known_mut(*device) {
                 known.out = true;
             }
         }
-        let set = &mut self.state.set;
-        set.owed
-            .retain(|device| !pending.effect.remove.contains(device));
-        self.state.confirmed = pending.epoch;
+        self.state
+            .set
+            .owed
+            .retain(|device| !removed.contains(device));
+        self.state.confirmed = epoch;
     }
 
     /// The pending candidate void: its copy dropped, and this device's own

@@ -4,19 +4,21 @@
 //! restore with its new kit. Each device honours a maturity only once the
 //! evidence the log carries supports it, a second signature's or a
 //! resolution's posted after the maturity it made among it, so none of
-//! these honest flows raises `Unsigned`.
+//! these honest flows raises `Unsigned`; a maturity asserted before its
+//! delay does, and a device that cannot follow regroups.
 
 use ed25519_dalek::SigningKey;
-use vos_light::group::{Alarm, DeviceGroup, Event, GroupError, Restored, Why};
+use vos_light::group::{Alarm, Course, DeviceGroup, Event, GroupError, Remedy, Restored, Why};
 use vos_wire::Encode;
 use vos_wire::personal::{
-    DeviceView, NewKit, OpState, Operation, Overview, PersonalError, Recorded, RecoveryView, Woken,
-    r2_hash,
+    Body, DeviceView, Effect, Entry, NewKit, OpState, Operation, Overview, PersonalError, Recorded,
+    RecoveryView, Woken, chain, r2_hash,
 };
 
+use crate::garble::{Anything, hostile};
 use crate::home::Home;
 use crate::phone::{Phone, kit, kit_entry};
-use crate::{NOTES, agree, all, household, policy, settle};
+use crate::{NOTES, agree, all, commit_as, confirm_as, household, policy, settle};
 
 /// A household of `count` phones, each seasoned and seen.
 fn seasoned(count: u8) -> (Home, Vec<Phone>) {
@@ -420,4 +422,150 @@ fn a_restore_starts_a_new_group_under_its_new_kit() {
         events[0].contains(&Event::Confirmed { epoch: epoch + 2 }),
         "{events:?}"
     );
+}
+
+/// `entries` with `body` appended at batch time `at`, chained.
+fn append(entries: &mut Vec<(u64, Entry)>, before: [u8; 32], at: u64, body: Body) -> u64 {
+    let (index, last) = entries
+        .last()
+        .map_or((0, before), |(index, entry)| (index + 1, entry.chain));
+    entries.push((
+        index,
+        Entry {
+            at,
+            chain: chain(&last, index, at, &body),
+            body,
+        },
+    ));
+    index
+}
+
+/// Operators assert that a removal matured before its delay passed, or
+/// at a maturity time past the entry's own: neither is supported, so the
+/// device raises `Unsigned` and owes no removal; and an entry whose batch
+/// time goes back stops the reading.
+#[test]
+fn a_maturity_before_its_delay_is_unsigned() {
+    let (mut home, mut phones) = seasoned(3);
+    let removal = operate(
+        &mut home,
+        &phones[0].admin,
+        &phones[0].sync,
+        "remove",
+        2u32.encode(),
+        None,
+    );
+    let matures = home.now + policy().operation_delay_ms;
+    let (cursor, before) = phones[1].group().view();
+    let mut entries = home.log(phones[1].sync_key(), cursor).unwrap();
+    let early = append(
+        &mut entries,
+        before,
+        home.now,
+        Body::Settled {
+            op: removal,
+            state: OpState::Matured { at: home.now },
+        },
+    );
+    append(&mut entries, before, home.now, Body::Matured { device: 2 });
+    let events = phones[1].group().follow(entries).unwrap();
+    assert!(
+        events.contains(&Event::Alarm(Alarm::Unsigned { index: early })),
+        "{events:?}"
+    );
+
+    let (cursor, before) = phones[0].group().view();
+    let mut entries = home.log(phones[0].sync_key(), cursor).unwrap();
+    let ahead = append(
+        &mut entries,
+        before,
+        home.now,
+        Body::Settled {
+            op: removal,
+            state: OpState::Matured { at: matures },
+        },
+    );
+    append(&mut entries, before, home.now, Body::Matured { device: 2 });
+    let back = append(
+        &mut entries,
+        before,
+        home.now - 1,
+        Body::Renewed { until: 0 },
+    );
+    let events = phones[0].group().follow(entries).unwrap();
+    assert!(
+        events.contains(&Event::Alarm(Alarm::Unsigned { index: ahead })),
+        "{events:?}"
+    );
+    assert!(
+        events.contains(&Event::Alarm(Alarm::Log { index: back })),
+        "{events:?}"
+    );
+    for phone in &mut phones[..2] {
+        assert!(owed(&home, phone).is_empty());
+    }
+}
+
+/// A device that cannot follow, with no other device to pair from,
+/// regroups: it reads on for the device set's operations while stuck,
+/// follows the epoch it could not by the agent's word, and once its
+/// regroup of the committer matures starts a new group alone, the first
+/// commit after the confirmed epoch, carrying the removal.
+#[test]
+fn a_device_that_cannot_follow_regroups() {
+    let (mut home, mut phones) = seasoned(2);
+    home.pass(policy().confirm_window_ms + 1);
+    phones[0].alive(&mut home);
+    let mut attacker = hostile(
+        &phones[0].store,
+        Some(Vec::new()),
+        Anything {
+            path: true,
+            encrypt: true,
+        },
+    );
+    let output = attacker.commit_builder().build().unwrap();
+    let handshake = output.commit_message.to_bytes().unwrap();
+    attacker.apply_pending_commit().unwrap();
+    let index = commit_as(&mut home, &phones[0], 2, Effect::default(), handshake, None);
+    let h = vos_mls::confirmation(
+        vos_light::group::CONFIRM,
+        &crate::home::IDENTITY,
+        2,
+        &attacker.epoch_authenticator().unwrap(),
+    );
+    confirm_as(&mut home, &phones[0], 2, index, h);
+    let events = phones[1].read(&mut home);
+    assert!(
+        events.contains(&Event::Alarm(Alarm::CannotFollow {
+            epoch: 2,
+            committer: 0,
+            remedy: Remedy::Regroup,
+        })),
+        "{events:?}"
+    );
+
+    operate(
+        &mut home,
+        &phones[1].admin,
+        &phones[1].sync,
+        "regroup",
+        vec![0u32].encode(),
+        None,
+    );
+    home.pass(policy().operation_delay_ms);
+    phones[1].alive(&mut home);
+    signed(&[phones[1].read(&mut home)]);
+    let prepared = phones[1].group().regroup(Vec::new(), home.now).unwrap();
+    assert_eq!(prepared.epoch, 3);
+    assert_eq!(prepared.effect.remove, vec![0]);
+    let candidacy = phones[1].send(&mut home, &prepared).unwrap();
+    assert_eq!(candidacy.set, vec![1]);
+    let events = phones[1].read(&mut home);
+    assert!(
+        events.contains(&Event::Confirmed { epoch: 3 }),
+        "{events:?}"
+    );
+    assert_eq!(phones[1].group().course(), Course::Following);
+    phones[1].group().key(NOTES).unwrap();
 }

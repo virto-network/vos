@@ -5,12 +5,12 @@
 //! or a resolution, each verified.
 
 use vos_wire::Encode;
-use vos_wire::personal::{AdminCall, DeviceId, Op, Signer};
+use vos_wire::ingress::CallMessage;
+use vos_wire::personal::{AdminCall, AdminClass, DeviceId, Op, Signer};
 
 use super::follow::verifies;
 use super::{Act, Alarm, Call, Check, Claim, DeviceGroup, Event, GroupError, Support};
 use crate::call::method_id;
-use vos_wire::ingress::CallMessage;
 
 /// The method an operation's admin call names, and its arguments as the
 /// agent encodes them.
@@ -44,6 +44,13 @@ fn targets(op: &Op) -> &[DeviceId] {
     }
 }
 
+fn signer(by: Signer) -> Option<DeviceId> {
+    match by {
+        Signer::Device(device) => Some(device),
+        Signer::Kit(_) => None,
+    }
+}
+
 impl Call {
     fn op(&self) -> Option<(&Op, u64)> {
         match &self.act {
@@ -53,10 +60,7 @@ impl Call {
     }
 
     fn device(&self) -> Option<DeviceId> {
-        match self.by {
-            Signer::Device(device) => Some(device),
-            Signer::Kit(_) => None,
-        }
+        signer(self.by)
     }
 }
 
@@ -96,10 +100,7 @@ impl DeviceGroup {
                     (_, Op::Replace { .. }) => policy.probation_ms,
                     _ => policy.operation_delay_ms,
                 };
-                let device = match by {
-                    Signer::Device(device) => Some(device),
-                    Signer::Kit(_) => None,
-                };
+                let device = signer(by);
                 let allowed = match op {
                     Op::Add(_) => device.is_some(),
                     Op::Restore { .. } => device.is_none(),
@@ -124,7 +125,7 @@ impl DeviceGroup {
         } else {
             Check::Invalid
         };
-        self.state.set.operations.push(Call {
+        let mut call = Call {
             index,
             at,
             by,
@@ -133,7 +134,87 @@ impl DeviceGroup {
             arguments: call.arguments,
             method: call.method,
             evidence,
-        });
+            rival: None,
+        };
+        if evidence != Check::Invalid
+            && let Some((op, _)) = call.op()
+        {
+            let targets = removes(op).to_vec();
+            for target in &targets {
+                self.freeze(*target, at);
+            }
+            call.rival = self.contest(&call, &targets);
+            if let Some(rival) = call.rival
+                && let Some(other) = self
+                    .state
+                    .set
+                    .operations
+                    .iter_mut()
+                    .find(|other| other.index == rival)
+            {
+                other.rival = Some(index);
+            }
+        }
+        self.state.set.operations.push(call);
+    }
+
+    /// The open removal `call`, removing `targets`, makes one contest with,
+    /// as the agent pairs them: one of its targets' removal of its signer,
+    /// open and in no contest yet.
+    fn contest(&self, call: &Call, targets: &[DeviceId]) -> Option<u64> {
+        let signer = call.device()?;
+        let state = &self.state;
+        state.set.operations.iter().find_map(|other| {
+            let (theirs, _) = other.op()?;
+            let by = other.device()?;
+            (other.evidence != Check::Invalid
+                && other.rival.is_none()
+                && !state.set.closed.contains(&other.index)
+                && targets.contains(&by)
+                && removes(theirs).contains(&signer))
+            .then_some(other.index)
+        })
+    }
+
+    /// Freeze `device`'s probation, if it is in one, under a removal
+    /// opened at `at`.
+    fn freeze(&mut self, device: DeviceId, at: u64) {
+        if let Some(known) = self.state.known_mut(device)
+            && known.frozen.is_none()
+            && at < known.active_from
+        {
+            known.frozen = Some(known.active_from - at);
+            known.active_from = u64::MAX;
+        }
+    }
+
+    /// Let the frozen probations of the targets of the closed operation at
+    /// `index` run again from `now`, when no removal against them is open.
+    fn thaw(&mut self, index: u64, now: u64) {
+        let Some(targets) = self
+            .state
+            .call_at(index)
+            .and_then(Call::op)
+            .map(|(op, _)| removes(op).to_vec())
+        else {
+            return;
+        };
+        for target in targets {
+            let state = &self.state;
+            let open = state.set.operations.iter().any(|call| {
+                call.evidence != Check::Invalid
+                    && !state.set.closed.contains(&call.index)
+                    && call
+                        .op()
+                        .is_some_and(|(op, _)| removes(op).contains(&target))
+            });
+            if let Some(known) = self.state.known_mut(target)
+                && !open
+                && let Some(left) = known.frozen.take()
+            {
+                known.active_from = now.saturating_add(left);
+            }
+        }
     }
 
     /// The evidence of the device-set call at `of`: valid when its message
@@ -166,11 +247,11 @@ impl DeviceGroup {
             })
             && verifies(&call.origin, message, signature);
         call.evidence = if valid { Check::Valid } else { Check::Invalid };
-        self.support(None, events)
+        self.support(events)
     }
 
     /// The log asserts the operation at `op` matured at `at`, in its entry
-    /// at `entry`.
+    /// at `entry`: unsupported if `at` is after the entry's own time.
     pub(super) fn claim(
         &mut self,
         entry: u64,
@@ -185,16 +266,24 @@ impl DeviceGroup {
         let operation = self.state.call_at(op).and_then(Call::op);
         let every = operation.is_some_and(|(op, _)| matches!(op, Op::Restore { .. }));
         let removes = operation.map_or_else(Vec::new, |(op, _)| removes(op).to_vec());
+        let support = if at > self.state.time {
+            events.push(Event::Alarm(Alarm::Unsigned { index: entry }));
+            Support::Refused
+        } else {
+            Support::Waiting
+        };
+        let rival = self.rival(op);
         self.state.set.claims.push(Claim {
             entry,
             op,
+            rival,
             at,
             every,
             removes,
             removed: Vec::new(),
-            support: Support::Waiting,
+            support,
         });
-        self.support(None, events)
+        self.support(events)
     }
 
     /// The log's entry at `index` says `device`'s removal matured: by the
@@ -242,6 +331,10 @@ impl DeviceGroup {
             return Ok(());
         }
         known.matured = Some(at);
+        if self.state.set.fresh == Some(device) {
+            // A regrouper removed before its new group: the rule lapses.
+            self.state.set.fresh = None;
+        }
         if !self.state.set.owed.contains(&device) {
             self.state.set.owed.push(device);
         }
@@ -252,13 +345,11 @@ impl DeviceGroup {
     }
 
     /// Decide every waiting claim the evidence now decides, in the log's
-    /// order: a supported one takes effect, an unsupported one alarms. At
-    /// `expiry`, a claim still waiting since before it is unsupported.
-    pub(super) fn support(
-        &mut self,
-        expiry: Option<u64>,
-        events: &mut Vec<Event>,
-    ) -> Result<(), GroupError> {
+    /// order: a supported one takes effect, an unsupported one alarms. A
+    /// claim still waiting a confirm window after its maturity is
+    /// unsupported.
+    pub(super) fn support(&mut self, events: &mut Vec<Event>) -> Result<(), GroupError> {
+        let now = self.state.time;
         let mut decided = Vec::new();
         for (i, claim) in self.state.set.claims.iter().enumerate() {
             if claim.support != Support::Waiting {
@@ -266,9 +357,7 @@ impl DeviceGroup {
             }
             let support = match self.supports(claim) {
                 Support::Waiting
-                    if expiry.is_some_and(|expiry| {
-                        claim.at.saturating_add(self.state.policy.confirm_window_ms) <= expiry
-                    }) =>
+                    if claim.at.saturating_add(self.state.policy.confirm_window_ms) < now =>
                 {
                     Support::Refused
                 }
@@ -286,6 +375,7 @@ impl DeviceGroup {
                 _ => events.push(Event::Alarm(Alarm::Unsigned { index: claim.entry })),
             }
             self.state.set.closed.push(claim.op);
+            self.thaw(claim.op, now);
         }
         self.prune();
         Ok(())
@@ -297,6 +387,9 @@ impl DeviceGroup {
     /// signature, or verified resolutions naming it.
     fn supports(&self, claim: &Claim) -> Support {
         let state = &self.state;
+        if state.set.closed.contains(&claim.op) {
+            return Support::Refused;
+        }
         let Some(call) = state.call_at(claim.op) else {
             return Support::Refused;
         };
@@ -332,11 +425,12 @@ impl DeviceGroup {
             }
         }
         let alive = matches!(op, Op::Restore { .. })
-            && state
-                .devices
-                .iter()
-                .any(|(_, known)| known.matured.is_none() && !known.out && known.alive > call.at);
-        let contested = self.rival(claim.op).is_some();
+            && state.devices.iter().any(|(_, known)| {
+                known.matured.is_none_or(|matured| matured > claim.at)
+                    && !known.out
+                    && known.alive > call.index
+            });
+        let contested = claim.rival.is_some();
         if matures <= claim.at && !vetoed && !contested && !alive && !waiting {
             return Support::Held;
         }
@@ -350,33 +444,47 @@ impl DeviceGroup {
                 _ => {}
             }
         }
-        let mut resolvers = Vec::new();
+        // Each device's latest resolution of the contest counts, as the
+        // agent keeps it.
+        let rival = claim.rival;
+        let mut latest: Vec<(DeviceId, Option<u64>, Check, u64)> = Vec::new();
         for resolve in before {
             let Act::Resolve { op: named, upheld } = resolve.act else {
                 continue;
             };
-            let winner = if upheld {
-                Some(named)
-            } else {
-                self.rival(named)
+            if named != claim.op && Some(named) != rival {
+                continue;
+            }
+            let winner = match (upheld, named == claim.op) {
+                (true, _) => Some(named),
+                (false, true) => rival,
+                (false, false) => Some(claim.op),
             };
+            match resolve.by {
+                Signer::Kit(_) => match resolve.evidence {
+                    Check::Valid if winner == Some(claim.op) => return Support::Held,
+                    Check::Missing => waiting = true,
+                    _ => {}
+                },
+                Signer::Device(device) if resolve.evidence != Check::Invalid => {
+                    latest.retain(|(other, ..)| *other != device);
+                    latest.push((device, winner, resolve.evidence, resolve.at));
+                }
+                Signer::Device(_) => {}
+            }
+        }
+        let mut resolvers = 0;
+        for (device, winner, evidence, at) in latest {
             if winner != Some(claim.op) {
                 continue;
             }
-            match (resolve.evidence, resolve.by) {
-                (Check::Valid, Signer::Kit(_)) => return Support::Held,
-                (Check::Valid, Signer::Device(device))
-                    if self.resolves(device, resolve.at, named) =>
-                {
-                    if !resolvers.contains(&device) {
-                        resolvers.push(device);
-                    }
-                }
-                (Check::Missing, _) => waiting = true,
+            match evidence {
+                Check::Valid if self.resolves(device, at, claim) => resolvers += 1,
+                Check::Missing => waiting = true,
                 _ => {}
             }
         }
-        if resolvers.len() >= 2 {
+        if resolvers >= 2 {
             return Support::Held;
         }
         if waiting {
@@ -409,24 +517,18 @@ impl DeviceGroup {
         }
     }
 
-    /// The removal contesting the one at `index`: aimed at its signer by
-    /// one of its targets.
+    /// The open removal contesting the one at `index`.
     fn rival(&self, index: u64) -> Option<u64> {
-        let call = self.state.call_at(index)?;
-        let (op, _) = call.op()?;
-        let signer = call.device()?;
-        self.state.set.operations.iter().find_map(|other| {
-            let (theirs, _) = other.op()?;
-            let by = other.device()?;
-            (other.index != index && removes(theirs).contains(&signer) && removes(op).contains(&by))
-                .then_some(other.index)
-        })
+        let state = &self.state;
+        state
+            .call_at(index)?
+            .rival
+            .filter(|rival| !state.set.closed.contains(rival))
     }
 
-    /// Whether `device` may resolve the contest of the operation at
-    /// `index` at `at`: seasoned with a strong admin, and a target of
-    /// neither side.
-    fn resolves(&self, device: DeviceId, at: u64, index: u64) -> bool {
+    /// Whether `device` may resolve the contest `claim` matured from at
+    /// `at`: seasoned with a strong admin, and a target of neither side.
+    fn resolves(&self, device: DeviceId, at: u64, claim: &Claim) -> bool {
         let state = &self.state;
         let targeted = |index: u64| {
             state
@@ -435,8 +537,8 @@ impl DeviceGroup {
                 .is_some_and(|(op, _)| targets(op).contains(&device))
         };
         self.two_device(device, at)
-            && !targeted(index)
-            && self.rival(index).is_none_or(|rival| !targeted(rival))
+            && !targeted(claim.op)
+            && claim.rival.is_none_or(|rival| !targeted(rival))
     }
 
     /// A supported maturity's effect on what this device knows.
@@ -453,7 +555,7 @@ impl DeviceGroup {
             Op::Replace { device, admin } => {
                 if let Some(known) = self.state.known_mut(*device) {
                     known.admin = admin.key;
-                    known.strong = admin.class == vos_wire::personal::AdminClass::Strong;
+                    known.strong = admin.class == AdminClass::Strong;
                 }
             }
             Op::Rotate(kit) | Op::Restore { kit, .. } => {
@@ -502,7 +604,9 @@ impl DeviceGroup {
                         if *matures <= cutoff && removes(op).contains(&device))
                     && self.rival(call.index).is_none()
                     && !state.set.operations.iter().any(|veto| {
-                        veto.act == Act::Veto(call.index) && veto.evidence != Check::Invalid
+                        veto.act == Act::Veto(call.index)
+                            && veto.evidence != Check::Invalid
+                            && veto.device().is_some_and(|device| state.voiced(device))
                     })
             })
     }
@@ -510,6 +614,7 @@ impl DeviceGroup {
     /// The log closed the operation at `op` without its maturity.
     pub(super) fn cancelled(&mut self, op: u64) {
         self.state.set.closed.push(op);
+        self.thaw(op, self.state.time);
         self.prune();
     }
 }

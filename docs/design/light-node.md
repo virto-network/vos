@@ -777,10 +777,10 @@ the S8-P1 session]:
   it. `Mls::restart` starts a new group, its commit adding the rest from
   their key packages applied and held beside the current group until the
   swap, which deletes the group left; a member joins it by Welcome from
-  the group it is in. The policy refuses, received, anything but Add and Remove by value,
-  an external commit, a committer or adds and removals not the logged
-  effect, a handshake in the clear and a commit whose committer kept its
-  leaf (no path); a leaf's successor must carry the same credential, so a
+  the group it is in. The policy refuses, received, anything but Add and
+  Remove by value, an external commit, a committer or adds and removals
+  not the logged effect, a handshake in the clear and a commit whose
+  committer kept its leaf (no path); a leaf's successor must carry the same credential, so a
   device's keys change only by its removal and a new add (admin-key
   replacement, §3.5, is a new add until it is built).
 - **The device group (`vos_light::group::DeviceGroup`), sans I/O:** the
@@ -797,7 +797,9 @@ the S8-P1 session]:
   `alive` since, or a verified second signature, or verified resolutions
   naming it: the kit's, or two seasoned strong devices'), waiting for
   evidence posted after the maturity until the confirm window has passed,
-  else an alarm (`Unsigned`); takes a candidate only from a device with a
+  else an alarm (`Unsigned`), as is a maturity asserted past its entry's
+  time; stops at an entry whose batch time goes back; freezes a probation
+  under a removal as the agent does; takes a candidate only from a device with a
   voice past its probation, an add only from a strong admin or as a
   matured add operation, for a fresh device number; processes it once
   its evidence verifies, on a copy at the log's time under its logged
@@ -814,7 +816,8 @@ the S8-P1 session]:
   confirmed one plus one, carrying every removal; the rest join it by its
   Welcome, and its epochs count on from the agent's. A device that cannot
   follow reads on for the device set's operations and takes no candidate
-  but its own regroup's. A restore's device starts its new group alone
+  but its own regroup's, following the others' epochs and the removals
+  they carry by the agent's word. A restore's device starts its new group alone
   from what it reads of the agent once the restore matured
   (`DeviceGroup::restore`: the log's head, the device set, the new kit),
   its first commit carrying the removal of every device before it.
@@ -825,12 +828,12 @@ the S8-P1 session]:
   (`MLS-Exporter("vos/personal/archive", "", 32)`, XChaCha20-Poly1305).
   Pushing it to the agent is 8.20's. A store that derived a scope id
   joins no other group.
-- **Not built here:** the probation's freeze on devices (a device takes a
-  paired device's probation as unfrozen, so it may accept a signature the
-  agent refuses first, never the reverse); a replaced admin key's leaf
-  credential (the leaf keeps the key it was added with; the replaced key
-  signs calls); a stuck device's view of adds confirmed while it was
-  stuck.
+- **Not built here:** a replaced admin key's leaf credential (the leaf
+  keeps the key it was added with; the replaced key signs calls, and a
+  replacement whose evidence comes after its maturity leaves the old key
+  in force until it verifies); a stuck device's view of adds confirmed
+  while it was stuck; a restore's device's view of operations opened
+  before its read; an alarm on a `Configured` that lowers a delay.
 
 **The device group measured** [measured, x86-64 Core Ultra 7 155H under
 load (load average 15–20), release, 2026-11-06; `vos-phone group`, the

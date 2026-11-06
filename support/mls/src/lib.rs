@@ -517,9 +517,6 @@ impl Mls {
         time: u64,
     ) -> Result<Commit, Error> {
         let group = self.group.as_mut().ok_or(Error::NoGroup)?;
-        if self.namespace.get(NEXT)?.is_some() {
-            return Err(Error::Held);
-        }
         let members = credentials(group);
         let mut builder = group.commit_builder().commit_time(MlsTime::from(time));
         for package in adds {
