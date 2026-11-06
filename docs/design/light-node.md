@@ -261,6 +261,18 @@ yet split out. If the phone misses it too, a call's durability (synced, or buffe
 and synced in a group) is the lever, against §2.2's rule that every write
 is crash-safe.
 
+**On the phones** [measured, S8-P1, 2026-11-06, `light.sh`, the notes
+actor, a release build]: the Fairphone 6 opens a new store in 263 ms and
+reopens it in 125 ms; a call through the merge entry, synced, takes
+0.46–0.53 ms p50 and 0.52–1.07 ms p95; a query 22–33 ms. Within the 1 ms
+budget. The Pixel 1 opens in 552 and 262 ms; a call takes 7.7–8.1 ms p50
+and 12.5–13.2 ms p95, a query 82–116 ms: its storage's fsync, fifteen
+times the Fairphone's, misses the budget on an ungated phone. On both,
+ten processes killed with SIGKILL 50–800 ms into a run of calls left the
+store one prefix of whole operations. Android's standard library has no
+file locks, so fjall takes its directory's lock with `flock` there
+(the workspace's fjall patch).
+
 Proving is the only heavy phase: about 0.65 s of wall time on the four
 big cores at full load a sign-in [measured, `proving.md` §8: 645 ms]. A
 phone that signs in twenty times a day spends about 13 s of wall time on

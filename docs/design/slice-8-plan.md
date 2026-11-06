@@ -167,6 +167,10 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
 - **Gate:** a local actor installed from release artifacts and called on
   the phone build; a process killed mid-operation leaves the store
   consistent. **Estimate:** 3–4 weeks.
+- **Phone result** (S8-P1, 2026-11-06, `light-node.md` §2.3): the gate
+  passes on the Fairphone 6 and on a Pixel 1, once fjall locks with
+  `flock` on Android; a call takes 0.5 ms p50 on the Fairphone and 8 ms on
+  the Pixel.
 
 ### 8.7 Payments P1 on cipher-clerk v0.3.0 — B
 - `Payments` (the L0 kernel, accounts by owner digest, one a device;
