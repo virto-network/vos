@@ -225,9 +225,10 @@ clippy-prover:
 jar-check:
     let hits = (rg -n --glob '!**/target/**' 'IsaMode|CapabilityManifest|\blink_elf\b|link_elf_with_argument_pages|run_with_vos_stubs|ECALL_VOS_|VOS_OBJECT_CAP|Opcode::Ecall\b|ExitReason::Ecall|ExitReason::Trap\b|vos_pvm::kernel::|InvocationKernel|vm_pool|JAR\\x02|\.gp072\.json|\bGasModel\b|\bPerInstruction\b|\bmem_cycles\b|Opcode::Sbrk|\bsbrk\(|(?i:csr\w*,? 0x800)\b|\(\d, 0x800\)|Some\(0x800\)' pvm | complete); if ($hits.exit_code == 0) { print $hits.stdout; error make { msg: "JAR remnants found" } } else { print "no JAR remnants" }
 
-# The SDK's test actors, built with the guest toolchain in `pvm/guest`.
+# The SDK's test actors, built with the guest toolchain in `pvm/guest`,
+# from the fixed path: some depend on crates outside their workspace.
 build-test-actors:
-    with-env { CARGO_INCREMENTAL: "0" } { cd agent/test-actors; cargo build --release --target ../../pvm/guest/riscv64em-vos.json }
+    just _at-fixed-path agent/test-actors --release --target ../../pvm/guest/riscv64em-vos.json
 
 # The default agent program, built in the agent's guest workspace
 # (`agent/programs`) with the guest toolchain in `pvm/guest`.
