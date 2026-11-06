@@ -47,6 +47,7 @@ use std::collections::BTreeMap;
 
 use vos_mls::{Mls, Namespace};
 use vos_wire::ids::InstanceId;
+use vos_wire::ingress::CallMessage;
 use vos_wire::personal::{
     AdminClass, DeviceId, DeviceView, Effect, NewDevice, Op, Policy, Scope, Signer, Status, Vote,
     welcome_hash,
@@ -56,6 +57,7 @@ use vos_wire::{Decode, Encode};
 use crate::store::{Store, StoreError};
 
 pub use archive::Archive;
+pub(crate) use follow::verifies;
 
 /// The confirmation hash's domain.
 pub const CONFIRM: &[u8] = b"vos/personal/confirm";
@@ -70,7 +72,18 @@ const STATE: &[u8] = b"g/state";
 
 /// The calls a device remembers within the window.
 const CALLS: usize = 32;
+/// The admin calls a device remembers until the log shows them, and the
+/// writers' views past its cursor it keeps to check.
+const MADE: usize = 16;
+const VIEWS: usize = 16;
 const MLS: &[u8] = b"mls/";
+/// The log's chain through each entry read, by the next index: the views
+/// writers name are checked against it.
+const CHAINS: &[u8] = b"g/chain/";
+
+fn chain_key(next: u64) -> Vec<u8> {
+    [CHAINS, &next.to_be_bytes()[..]].concat()
+}
 
 /// The personal agent a device group's commits go through: its identity,
 /// which calls are signed for, and `Personal`'s instance.
@@ -240,6 +253,34 @@ pub enum Alarm {
     /// The device's clock and the agent's batch time disagree by `skew_ms`,
     /// more than an hour: the device acts as the log says.
     Clock { skew_ms: u64 },
+    /// The agent's log head, `next`, is behind what this device read of
+    /// it, or diverges from it there: a rollback.
+    Rollback { next: u64 },
+    /// A writer's view of the log names `index` with a chain this device's
+    /// log does not have there, or an index past what the agent serves this
+    /// device: a split log.
+    View { index: u64 },
+    /// An admin call of this device's that the agent took at `index` is not
+    /// there: dropped, or replaced.
+    Dropped { index: u64 },
+    /// A writer had read `scope` to `position`, and the agent serves this
+    /// device less of it: a partition.
+    Partition { scope: Scope, position: u64 },
+    /// The agent's page of `scope` skips `position`, which it numbered: an
+    /// envelope withheld.
+    Withheld { scope: Scope, position: u64 },
+    /// The envelope at `scope`'s `position` is sealed under an epoch before
+    /// one the agent took earlier there: a push it should have refused.
+    Stale { scope: Scope, position: u64 },
+    /// The node at `scope`'s `position` is not by a device of the set, or by
+    /// a removed device past its frontier: refused.
+    Author { scope: Scope, position: u64 },
+    /// This device's own envelope at `scope`'s `position` is gone: pushed
+    /// again.
+    Deleted { scope: Scope, position: u64 },
+    /// A checkpoint of `scope` at `position` whose hash is not this
+    /// device's reading of the scope there: refused, and not acknowledged.
+    Checkpoint { scope: Scope, position: u64 },
 }
 
 /// What a device that cannot follow does.
@@ -443,6 +484,50 @@ pub(crate) struct Own {
     pub(crate) evidenced: bool,
 }
 
+/// An admin call of this device's that the agent took at `index`: what
+/// the log must hold there.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub(crate) struct Made {
+    pub(crate) index: u64,
+    pub(crate) origin: [u8; 32],
+    pub(crate) method: u32,
+    pub(crate) arguments: Vec<u8>,
+    /// The log holds another entry there: a veto, kept to hold its
+    /// operation back.
+    pub(crate) dropped: bool,
+}
+
+impl Made {
+    /// Whether it is a veto of the operation at `op`.
+    pub(crate) fn vetoes(&self, op: u64) -> bool {
+        self.method == crate::call::method_id("veto") && self.arguments == op.encode()
+    }
+}
+
+/// A checkpoint: a scope's state after every envelope up to `position`,
+/// named by its hash, and where its content starts in the checkpoints'
+/// scope (the position before its first part).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Checkpoint {
+    pub scope: Scope,
+    pub position: u64,
+    pub hash: [u8; 32],
+    pub from: u64,
+}
+
+/// The checkpoints a device starts a scope from.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum Trust {
+    /// Those its pairing device handed it over the pairing channel; none
+    /// for the claiming device.
+    #[codec(index = 0)]
+    Paired(Vec<Checkpoint>),
+    /// One two devices other than its maker acknowledged: a restore's,
+    /// which has no pairing device.
+    #[codec(index = 1)]
+    Acknowledged,
+}
+
 /// Where the device is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Course {
@@ -508,6 +593,11 @@ pub(crate) struct State {
     /// This device's last decision: an epoch, and whether it confirmed it.
     pub(crate) decided: Option<(u64, bool)>,
     pub(crate) course: Course,
+    /// The admin calls of this device's the log has yet to show.
+    pub(crate) made: Vec<Made>,
+    /// Writers' views past the cursor, checked as the device reads on.
+    pub(crate) views: Vec<(u64, [u8; 32])>,
+    pub(crate) trust: Trust,
 }
 
 impl State {
@@ -579,6 +669,7 @@ pub struct Pairing {
     devices: Vec<(DeviceId, Known)>,
     set: Set,
     archive: Archive,
+    checkpoints: Vec<Checkpoint>,
 }
 
 /// What a device a restore added reads from the agent once the restore
@@ -597,6 +688,13 @@ pub struct Restored {
 }
 
 impl Pairing {
+    /// Hand the new device `checkpoint`, which it starts its scope from.
+    pub fn trust(&mut self, checkpoint: Checkpoint) {
+        self.checkpoints
+            .retain(|held| held.scope != checkpoint.scope);
+        self.checkpoints.push(checkpoint);
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         self.encode()
     }
@@ -637,6 +735,8 @@ pub struct DeviceGroup {
     archive: Archive,
     /// The pending candidate's processing, by its log index.
     processed: Option<(u64, Processed)>,
+    /// The log's chains read and not yet written, by the next index.
+    chains: Vec<(u64, [u8; 32])>,
 }
 
 fn namespace(store: &Store) -> Namespace {
@@ -676,6 +776,9 @@ impl DeviceGroup {
             own: None,
             decided: None,
             course: Course::Following,
+            made: Vec::new(),
+            views: Vec::new(),
+            trust: Trust::Paired(Vec::new()),
         };
         let mut mls = Mls::open(namespace(store), &credential(&me), BTreeMap::new())?;
         mls.create(now / 1000, rows(&state, None))?;
@@ -685,6 +788,7 @@ impl DeviceGroup {
             state,
             archive,
             processed: None,
+            chains: Vec::new(),
         })
     }
 
@@ -720,6 +824,7 @@ impl DeviceGroup {
             devices,
             set,
             archive,
+            checkpoints,
         } = pairing;
         let state = State {
             agent,
@@ -740,6 +845,9 @@ impl DeviceGroup {
             own: None,
             decided: None,
             course: Course::Following,
+            made: Vec::new(),
+            views: Vec::new(),
+            trust: Trust::Paired(checkpoints),
         };
         let mut mls = Mls::open(namespace(store), &credential(&me), BTreeMap::new())?;
         mls.write(rows(&state, Some(&archive)))?;
@@ -749,6 +857,7 @@ impl DeviceGroup {
             state,
             archive,
             processed: None,
+            chains: Vec::new(),
         })
     }
 
@@ -814,6 +923,9 @@ impl DeviceGroup {
             own: None,
             decided: None,
             course: Course::Following,
+            made: Vec::new(),
+            views: Vec::new(),
+            trust: Trust::Acknowledged,
         };
         let archive = store.archive()?;
         let mut mls = Mls::open(namespace(store), &credential(&me), BTreeMap::new())?;
@@ -824,6 +936,7 @@ impl DeviceGroup {
             state,
             archive,
             processed: None,
+            chains: Vec::new(),
         })
     }
 
@@ -840,6 +953,7 @@ impl DeviceGroup {
             archive: store.archive()?,
             state,
             processed: None,
+            chains: Vec::new(),
         }))
     }
 
@@ -957,6 +1071,110 @@ impl DeviceGroup {
         if calls.len() > CALLS {
             calls.drain(..calls.len() - CALLS);
         }
+    }
+
+    /// The agent took this device's admin call, signed as `message`, at
+    /// log index `index`: the log must hold that call there, and a veto in
+    /// it holds its operation back until it does ([`Alarm::Dropped`]).
+    pub fn made(&mut self, index: u64, message: &[u8]) -> Result<(), GroupError> {
+        let Some(signed) = CallMessage::parse(message) else {
+            return Ok(());
+        };
+        if index < self.state.next {
+            return Ok(());
+        }
+        let made = &mut self.state.made;
+        made.retain(|made| made.index != index);
+        made.push(Made {
+            index,
+            origin: signed.session.key,
+            method: signed.method.0,
+            arguments: signed.arguments,
+            dropped: false,
+        });
+        if made.len() > MADE {
+            made.remove(0);
+        }
+        let writes = self.writes(false);
+        self.mls.write(writes)?;
+        Ok(())
+    }
+
+    /// Check a writer's view of the control log, `(index, chain)`, against
+    /// this device's: the chain it read through the entry before `index`.
+    /// A view past the cursor is kept and checked as the device reads on,
+    /// or at the agent's head ([`DeviceGroup::head`]); one before what this
+    /// device read of the log passes.
+    pub fn check_view(&mut self, index: u64, chain: [u8; 32]) -> Result<Option<Alarm>, GroupError> {
+        let alarm = Some(Alarm::View { index });
+        if index == 0 {
+            return Ok(alarm.filter(|_| chain != [0; 32]));
+        }
+        if index == self.state.next {
+            return Ok(alarm.filter(|_| chain != self.state.chain));
+        }
+        if index < self.state.next {
+            return Ok(match self.store.group_row(&chain_key(index))? {
+                Some(read) if read[..] != chain[..] => alarm,
+                _ => None,
+            });
+        }
+        let views = &mut self.state.views;
+        if let Some((_, held)) = views.iter().find(|(at, _)| *at == index) {
+            return Ok(alarm.filter(|_| *held != chain));
+        }
+        views.push((index, chain));
+        views.sort_unstable();
+        if views.len() > VIEWS {
+            views.remove(0);
+        }
+        let writes = self.writes(false);
+        self.mls.write(writes)?;
+        Ok(None)
+    }
+
+    /// The agent's log head, `(next, chain)`, as it answers after this
+    /// device read the log to its end: a head behind what this device read,
+    /// or diverging at it, is a rollback; a writer's view past it is a log
+    /// this device is not served.
+    pub fn head(&mut self, next: u64, chain: [u8; 32]) -> Result<Vec<Alarm>, GroupError> {
+        let mut alarms = Vec::new();
+        if next < self.state.next || (next == self.state.next && chain != self.state.chain) {
+            alarms.push(Alarm::Rollback { next });
+        }
+        if next <= self.state.next && !self.state.views.is_empty() {
+            for (index, _) in self.state.views.drain(..) {
+                alarms.push(Alarm::View { index });
+            }
+            let writes = self.writes(false);
+            self.mls.write(writes)?;
+        }
+        Ok(alarms)
+    }
+
+    /// The device of the set whose sync key is `sync`, and whether it is
+    /// removed: a node's author is one, and a removed one's nodes count
+    /// only up to its frontier.
+    pub fn author(&self, sync: &[u8; 32]) -> Option<(DeviceId, bool)> {
+        self.state
+            .devices
+            .iter()
+            .find(|(_, known)| known.keys.sync == *sync)
+            .map(|(id, known)| (*id, known.matured.is_some() || known.out))
+    }
+
+    /// The sync keys of the set's devices, removed ones' included.
+    pub fn sync_keys(&self) -> Vec<(DeviceId, [u8; 32])> {
+        self.state
+            .devices
+            .iter()
+            .map(|(id, known)| (*id, known.keys.sync))
+            .collect()
+    }
+
+    /// The checkpoints this device starts its scopes from.
+    pub fn trust(&self) -> &Trust {
+        &self.state.trust
     }
 
     /// Whether this device's leaf is due its yearly update at `now`.
@@ -1122,6 +1340,7 @@ impl DeviceGroup {
             devices: self.state.devices.clone(),
             set: self.state.set.clone(),
             archive: self.archive.clone(),
+            checkpoints: Vec::new(),
         };
         Ok((prepared, pairing))
     }
@@ -1173,6 +1392,18 @@ impl DeviceGroup {
         self.state.own = None;
         self.mls.void(rows(&self.state, None))?;
         Ok(())
+    }
+}
+
+impl DeviceGroup {
+    /// The group's rows, as [`rows`] gives them, with the log's chains read
+    /// since the last write.
+    pub(crate) fn writes(&mut self, archive: bool) -> vos_mls::Writes {
+        let mut writes = rows(&self.state, archive.then_some(&self.archive));
+        for (next, chain) in self.chains.drain(..) {
+            writes.insert(chain_key(next), Some(chain.to_vec()));
+        }
+        writes
     }
 }
 

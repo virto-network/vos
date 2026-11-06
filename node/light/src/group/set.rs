@@ -355,6 +355,15 @@ impl DeviceGroup {
             if claim.support != Support::Waiting {
                 continue;
             }
+            // A veto of this device's the agent took, and the log does not
+            // show, holds the operation back: it was dropped.
+            if let Some(made) = self.state.made.iter().find(|made| made.vetoes(claim.op)) {
+                if !made.dropped {
+                    events.push(Event::Alarm(Alarm::Dropped { index: made.index }));
+                }
+                decided.push((i, Support::Refused));
+                continue;
+            }
             let support = match self.supports(claim) {
                 Support::Waiting
                     if claim.at.saturating_add(self.state.policy.confirm_window_ms) < now =>
@@ -370,8 +379,11 @@ impl DeviceGroup {
         for (i, support) in decided {
             self.state.set.claims[i].support = support;
             let claim = self.state.set.claims[i].clone();
+            let vetoed = self.state.made.len();
+            self.state.made.retain(|made| !made.vetoes(claim.op));
             match support {
                 Support::Held => self.take_effect(&claim, events)?,
+                _ if self.state.made.len() < vetoed => {}
                 _ => events.push(Event::Alarm(Alarm::Unsigned { index: claim.entry })),
             }
             self.state.set.closed.push(claim.op);
@@ -613,6 +625,7 @@ impl DeviceGroup {
 
     /// The log closed the operation at `op` without its maturity.
     pub(super) fn cancelled(&mut self, op: u64) {
+        self.state.made.retain(|made| !made.vetoes(op));
         self.state.set.closed.push(op);
         self.thaw(op, self.state.time);
         self.prune();
