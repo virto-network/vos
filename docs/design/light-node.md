@@ -400,8 +400,10 @@ operator makes ahead of time**:
   prompt in a home-only one. The lease runs 13 months from the last
   re-proof.
 - **A lapsed lease** (the member left, was removed, or never re-proved)
-  puts the agent in a **grace period** of 180 days: it refuses pushes and
-  any commit but one carrying a removal, and still takes device-set
+  puts the agent in a **grace period** of 180 days: it refuses pushes (but
+  the recovery scope's, which the confirmed epoch of a removal's commit
+  needs [built]), the inbox, pairing slots, and any commit but one
+  carrying a removal and no add, and still takes device-set
   operations, `alive` and confirmations, serves the devices' and the
   kit's reads, a restore (§3.5) and the move to another home (§3.9), so
   the data stays recoverable and a stolen phone can still be removed. A
@@ -493,12 +495,47 @@ commits a second across a space [est].
 **`Personal`'s upgrades over agents that hold data** [proposed]:
 `Admin::Install` replaces the program and touches no table
 (`agent/default/src/refine/admin.rs`), and state migration is unbuilt, so
-`Personal`'s storage layout is **append-only across versions:** new tables
-and new optional fields, never a changed key or encoding. Each release
-installs over a populated agent of the previous release in a test that
-reads every envelope and operation back (plan 8.14); the keeper upgrades
-in batches and stops on the first refusal. A change that cannot be
-append-only waits for state migration (`open.md`, "Upgrades").
+`Personal`'s storage layout is **append-only across versions:** new
+tables, never a changed key or encoding. A field added to the actor's
+struct, or to a row's type, would not decode what the previous version
+wrote (the codec has no optional tail), so `Personal` holds no struct
+field: its state is its tables, and its version answers `version` [built,
+`agent/personal`]. Each release installs over a populated agent of the
+previous release in a test that reads every envelope and operation back
+(plan 8.14; the mechanism's test, the next version built from the same
+tables, is `agent/testkit/tests/agent/personal/upgrade.rs`: it reads every
+row back, and adds no table, since `#[actor]` gives a field no `#[cfg]`);
+the keeper upgrades in batches and stops on the first refusal. The layout
+binds from the first release: until then (plan 8.13's device-set rules,
+`Policy`'s further delays) rows change freely. A change that cannot
+be append-only waits for state migration (`open.md`, "Upgrades").
+
+**`Personal` as built** [built, `agent/personal`, its wire types
+`vos_wire::personal`]: the commit log, the votes and verdicts, evidence,
+sealed scopes, acknowledgements, the recovery scope, quotas, the inbox,
+pairing slots, the lease and its grace, and gated reads, over a device set
+holding what these need: devices with their keys, class, attestation,
+nullifier, sealed label, probation (from its add) and status; the claiming
+device active at `assign`, a strong admin's add inline in its commit, and
+a removal pending for the policy's delay then matured. The rest of the
+device set's rules (vetoes, contests and resolutions, the kit's
+operations, seasoning, immediate removal, a probation frozen under a
+removal, `R1`/`R2` and a restore, admin-key replacement, a delayed admin's
+add as an operation, regroup) are plan 8.13's, added as tables beside
+these. Batch time decides lazily: each call first settles the removals
+that matured (their keys leave `admitted`, a `Matured` entry is logged),
+the slots that expired and the pending candidate's verdict; a refused call
+writes nothing, so its settling waits for the next call that runs, and a
+read computes a device's standing from the time it reads at. The home's
+calls (`configure`, `assign`, `renew`) take the role `homes`; `assign`
+answers its caller, and the `assigned`/`refused` message to `Homes` is
+plan 8.14's. Bounds the rules above leave open: `alive` is logged at
+most once an hour a device (the entry logged last answers between), a
+vote's signed message names its candidate's log index as well as its
+epoch (an epoch's number is free again after a void), an opener holds one
+open pairing slot and an agent four, a slot's holder writes four inbox
+items and a closed slot's items are deleted, and a removal that matured
+inside a candidate's window decides it as the window's end would have.
 
 ### 3.4 Keys: MLS among the user's devices, with confirmed epochs
 
@@ -930,8 +967,23 @@ seals them only when it pushes, under the confirmed epoch read just before;
 `Personal::push` refuses another (`StaleEpoch`).
 
 **Sync is a cursor:** the agent numbers each scope's envelopes in the
-order it accepts them; `since(scope, position)` returns up to 64 KiB from
-a position.
+order it accepts them; `since(scope, position)` returns those after a
+position, up to 60 KiB and at least one.
+
+**What a push and a read cost** [measured, `Personal` on the default
+agent, x86-64 Core Ultra 7 155H, 2026-11-03]: an envelope is three rows
+of its own (its id, author and length; its bytes; its id's position) and
+five it updates (the scope's last position, the device's frontier, its
+last call, the agent's and the device's usage): 492 bytes of keys and
+values beyond the envelope's. A push runs 1.61M gas for 1 KiB, 2.87M for
+16 KiB and 6.58M for 60 KiB (the arguments' and the row's bytes at 24 gas
+each, and the id's hash), within a handler's default 10M; `since`
+answering one envelope 0.47M, 1.06M and 2.79M. Round trip through a node's
+socket with the onion's mark, a release build, one node
+(`node/host/tests/ingress/personal.rs`): a push about 2.6 ms and a push
+with its `since` 2.9 ms for 1 KiB, 3.7 and 4.3 ms for 60 KiB on a quiet
+host; 5–6 and 6.4–7.8 ms, 12–17 and 16–19 ms with the host's load average
+at 18.
 
 **Fork, rollback and partition detection:**
 - each device keeps the highest `(log_index, log_chain)` it has seen
@@ -964,7 +1016,10 @@ envelopes and commits a day, inbox items.
 Admin-signed operations, the commits carrying matured ones, confirmations
 and `alive` are exempt, so no device can block its own removal by filling a
 quota; each device has an unadvertised share of at most half the agent's
-bytes and calls.
+bytes and calls. [built: the bytes held are envelopes' and inbox items';
+the calls counted are pushes, inbox items and commits carrying no removal;
+the share binds while the agent has a second live device, so a sole
+device holds the whole quota.]
 
 **Background sync:** a WorkManager job pushes queued operations, posts
 `alive` if a restore is pending, reads the control log and each scope's

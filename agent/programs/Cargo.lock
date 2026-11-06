@@ -169,6 +169,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "vos-personal"
+version = "0.1.0"
+dependencies = [
+ "vos-sdk",
+ "vos-wire",
+]
+
+[[package]]
 name = "vos-pvm-codec"
 version = "0.1.0"
 dependencies = [

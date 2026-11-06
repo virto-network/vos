@@ -635,6 +635,37 @@ pub fn call_message(
     })
 }
 
+/// A call's signed message, read back: what [`call_message`] wrote.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallMessage {
+    pub identity: [u8; 32],
+    pub session: Session,
+    pub sequence: u64,
+    pub instance: InstanceId,
+    pub method: MethodId,
+    pub arguments: Vec<u8>,
+}
+
+impl CallMessage {
+    /// `message` read as [`call_message`] writes it, every byte; `None`
+    /// for anything else.
+    pub fn parse(message: &[u8]) -> Option<Self> {
+        let rest = message.strip_prefix(CALL_DOMAIN)?;
+        let (identity, rest) = rest.split_first_chunk::<32>()?;
+        let ((session, sequence, instance), used) =
+            <(Session, u64, InstanceId)>::decode(rest).ok()?;
+        let (method, arguments) = <(MethodId, Vec<u8>)>::decode_exact(&rest[used..])?;
+        Some(Self {
+            identity: *identity,
+            session,
+            sequence,
+            instance,
+            method,
+            arguments,
+        })
+    }
+}
+
 /// What a client signs for a query to the agent whose identity is
 /// `identity`.
 pub fn query_message(

@@ -19,6 +19,7 @@ pub mod jam;
 pub mod keys;
 pub mod package;
 pub mod peer;
+pub mod personal;
 pub mod records;
 pub mod result;
 pub mod schema;
