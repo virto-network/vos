@@ -17,7 +17,7 @@ use vos_node::client::{signed_call, signed_query};
 use vos_node::{CallError, Reply};
 use vos_wire::abi::Failure;
 use vos_wire::ids::derive_id;
-use vos_wire::ingress::{AdmissionRefusal, CredentialPublic, Credentialed};
+use vos_wire::ingress::{AdmissionRefusal, Credentialed};
 use vos_wire::schema::Schema;
 
 use super::api::{connect, receive};
@@ -153,8 +153,7 @@ impl Gates {
     }
 }
 
-/// The node's signature verifications and credential proofs checked so
-/// far.
+/// The node's signature verifications and device proofs checked so far.
 fn verifications(node: &Node) -> u64 {
     let stats = node.stats();
     let count = |name: &str| -> u64 {
@@ -332,10 +331,7 @@ fn an_onion_only_agent_refuses_clearnet_and_unmarked_requests() {
         nonce: [1; 16],
         expires_ms: gates.served.now() + 10_000,
         format: 0,
-        public: CredentialPublic::Owner {
-            owner: [2; 32],
-            binding: [3; 32],
-        },
+        claim: vec![2; 64],
         proof: vec![0; 64],
     };
     let requests = [

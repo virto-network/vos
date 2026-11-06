@@ -1,22 +1,25 @@
-//! The carrier audit over credentialed calls (`identity-and-authority.md`
-//! §5, `node/light/SECURITY.md`): three nodes of a founded space with the
+//! The carrier audit over proven calls (`identity-and-authority.md` §5,
+//! `node/light/SECURITY.md`): three nodes of a founded space with the
 //! credential actor, the poll, the purses' ledger and the device actor; a
 //! member's device secret derived from a known source output, its path
 //! fetched, and its calls proved by the device library as a phone proves
-//! them and sent to the nodes over each transport: the API's socket, and
-//! a gateway relaying HTTP onto the API over QUIC. Then every carrier the
-//! run produced is searched for the member's secret, which only the
-//! device holds, and for where the member sits, which a credentialed call
-//! never carries ([`vos_checker::carriers`]).
+//! them, by the stock kernels' release artifacts, and sent to the nodes
+//! over each transport: the API's socket, and a gateway relaying HTTP onto
+//! the API over QUIC. Then every carrier the run produced is searched for
+//! the member's secret, which only the device holds, and for where the
+//! member sits, which a proven call never carries
+//! ([`vos_checker::carriers`]).
 //!
-//! The calls: auth sign-ins, a replay (`Replayed`), a `once` vote and a
-//! second (`Once`), a proof cut by a byte (`Proof`), another call's
-//! arguments (`Binding`), an expired call (`Expiry`), an unregistered format
-//! (`Format`), an owner's payment, a device kernel's sign-in (format 46),
-//! its replay and its proof sent to a guard naming no kernel (`Kind`), a
-//! frame of no kind and one past its kind's limit (`FrameError`), each on
-//! a connection the device keeps for its calls; its time, path and root
-//! fetched on one of their own.
+//! The calls: auth sign-ins by the stock `auth` kernel, a replay
+//! (`Replayed`), a `once` vote and a second (`Once`), a proof cut by a
+//! byte (`Proof`), another call's arguments (`Binding`), an expired call
+//! (`Expiry`), an unregistered format (`Format`), an owner's payment by the
+//! stock `owner` kernel, an actor's own kernel's sign-in (the device
+//! actor's hand-lean `auth`, its claim checked by the handler), its replay
+//! and its proof sent to a stock guard (`Kind`), a frame of no kind and
+//! one past its kind's limit (`FrameError`), each on a connection the
+//! device keeps for its calls; its time, path and root fetched on one of
+//! their own.
 //!
 //! Carriers that leave the device: every byte of each API connection each
 //! way, every request and its answer's status and body through the
@@ -44,15 +47,13 @@ use vos_checker::processes::Front;
 use vos_checker::programs::{actor, actor_elf, credentials, credentials_elf, method};
 use vos_light::wire::{self, Answer};
 use vos_light::{
-    AuthWitness, Call, CredentialProof, CredentialPublic, DEVICE_PEAK_BYTES, DeviceError,
-    DeviceProgram, Prover, ProverConfig, Threads,
+    AuthWitness, Call, DEVICE_FORMAT, DeviceError, DeviceProgram, Proven, Prover, ProverConfig,
+    Threads,
 };
 use vos_node::client::{self, Client, Target};
 use vos_node::store::EntryKind;
-use vos_pvm_final_verifier::credential as verifier;
-use vos_pvm_recair::credential::{AuthPublic, AuthWitness as CircuitWitness, Statement, prove};
 use vos_pvm_recair::masked::{MaskRng, drawn_in};
-use vos_wire::credentials::{self as tree, Path, Siblings, Tag, Words};
+use vos_wire::credentials::{self as tree, AuthClaim, Path, Siblings, Tag, Words};
 use vos_wire::ids::{AgentId, InstanceId, Principal};
 use vos_wire::ingress::{CredentialRefusal, Credentialed, Response};
 use vos_wire::peer::NodeNumber;
@@ -293,7 +294,7 @@ fn other(seed: u32) -> Words {
 
 /// The credentialed request `call` under `proof`, as the HTTP routes take
 /// it: the device's request after its kind and the agent.
-fn request(call: &Call, proof: &CredentialProof) -> Credentialed {
+fn request(call: &Call, proof: &Proven) -> Credentialed {
     Credentialed::decode_exact(&wire::credentialed(call, proof)[6..]).unwrap()
 }
 
@@ -392,11 +393,16 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
 
     let prover = Prover::new(ProverConfig {
         threads: Threads::Count(4),
-        max_memory: DEVICE_PEAK_BYTES,
+        ..ProverConfig::default()
     })
     .unwrap();
+    let credentials_elf = std::fs::read(credentials_elf()).unwrap();
+    let stock = |kernel| vos_light::release::device(&credentials_elf, kernel).unwrap();
+    let (auth, owner_kernel) = (stock("auth"), stock("owner"));
+    let auth_program = DeviceProgram::released(&auth).unwrap();
+    let owner_program = DeviceProgram::released(&owner_kernel).unwrap();
     let mut calls = Socket::connect(&founded.cluster.dir(at).join("api.sock"));
-    let mut send = |call: &Call, proof: &CredentialProof| {
+    let mut send = |call: &Call, proof: &Proven| {
         wire::credentialed_answer(&calls.send(&wire::credentialed(call, proof)))
     };
     let mut answers: Vec<Answer> = Vec::new();
@@ -404,18 +410,18 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
     // Auth: a sign-in, its replay, a `once` vote and a second.
     let login = founded.call(at, POLL, "login", ());
     let signin = prover
-        .prove_auth(&secret, &witness, b"login", &login)
+        .prove_auth(&secret, &witness, b"login", &login, &auth_program)
         .unwrap();
     answers.push(ran(send(&login, &signin)));
     answers.push(refused(send(&login, &signin), CredentialRefusal::Replayed));
     let vote = founded.call(at, POLL, "vote", 1u8);
     let voted = prover
-        .prove_auth(&secret, &witness, b"vote", &vote)
+        .prove_auth(&secret, &witness, b"vote", &vote, &auth_program)
         .unwrap();
     answers.push(ran(send(&vote, &voted)));
     let again = founded.call(at, POLL, "vote", 2u8);
     let voted_again = prover
-        .prove_auth(&secret, &witness, b"vote", &again)
+        .prove_auth(&secret, &witness, b"vote", &again, &auth_program)
         .unwrap();
     answers.push(refused(send(&again, &voted_again), CredentialRefusal::Once));
 
@@ -423,7 +429,7 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
     // call and an unregistered format.
     let fresh = founded.call(at, POLL, "login", ());
     let mut proof = prover
-        .prove_auth(&secret, &witness, b"login", &fresh)
+        .prove_auth(&secret, &witness, b"login", &fresh, &auth_program)
         .unwrap();
     let whole = proof.clone();
     proof.proof.pop();
@@ -443,7 +449,7 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
     let answer = send(&expired, &whole);
     assert!(matches!(answer, Ok(Answer::Expiry { .. })), "{answer:?}");
     answers.push(answer.unwrap());
-    let unregistered = CredentialProof {
+    let unregistered = Proven {
         format: 38,
         ..whole.clone()
     };
@@ -469,71 +475,78 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
         "transfer",
         (b"device".to_vec(), b"shop".to_vec(), 20u64),
     );
-    let paid = prover.prove_owner(&secret, &pay).unwrap();
+    let paid = prover.prove_owner(&secret, &pay, &owner_program).unwrap();
     answers.push(ran(send(&pay, &paid)));
 
-    // A device kernel's sign-in (format 46), its replay, and its proof
-    // sent to a guard naming no kernel.
+    // An actor's own kernel's sign-in, its replay, and its proof sent to a
+    // stock guard.
     let device = vos_light::release::device(&vos_testkit::programs::package("device"), "auth");
     let program = DeviceProgram::released(&device.unwrap()).unwrap();
+    let siblings = witness.siblings.map(|sibling| sibling.0);
+    let device_proof_of = |call: &Call| {
+        let scope = tree::scope(&founded.space, agent, DEVICE, b"login");
+        let nullifier = tree::digest(&tree::compress(
+            &tree::compress(&Tag::Nf.block(), &words),
+            &tree::words(&scope).unwrap(),
+        ));
+        let public = vos_pvm_recair::device::auth_public(
+            &witness.root.to_bytes(),
+            &scope,
+            &nullifier,
+            &call.binding(program.id()).to_bytes(),
+        );
+        let arguments =
+            vos_pvm_recair::device::auth_arguments(&siblings, &words, witness.slot, &public);
+        let proof = prover.prove_kernel(&program, &arguments).unwrap();
+        (
+            Proven {
+                format: DEVICE_FORMAT,
+                claim: public.to_vec(),
+                proof: proof.proof,
+            },
+            arguments,
+        )
+    };
     let device_login = founded.call(at, DEVICE, "login", ());
-    let device_proof = prover
-        .prove_device_auth(&secret, &witness, b"login", &device_login, &program)
-        .unwrap();
+    let (device_proof, arguments) = device_proof_of(&device_login);
     answers.push(ran(send(&device_login, &device_proof)));
     answers.push(refused(
         send(&device_login, &device_proof),
         CredentialRefusal::Replayed,
     ));
     let to_poll = founded.call(at, POLL, "login", ());
-    let to_poll_proof = prover
-        .prove_device_auth(&secret, &witness, b"login", &to_poll, &program)
-        .unwrap();
+    let (to_poll_proof, _) = device_proof_of(&to_poll);
     answers.push(refused(
         send(&to_poll, &to_poll_proof),
         CredentialRefusal::Kind,
     ));
-    let CredentialPublic::Auth {
-        map_root,
-        scope,
-        nullifier,
-        binding,
-    } = device_proof.public
-    else {
-        unreachable!()
-    };
-    let public = vos_pvm_recair::device::auth_public(
-        &map_root.to_bytes(),
-        &scope.to_bytes(),
-        &nullifier.to_bytes(),
-        &binding.to_bytes(),
-    );
-    let siblings = witness.siblings.map(|sibling| sibling.0);
-    let arguments =
-        vos_pvm_recair::device::auth_arguments(&siblings, &words, witness.slot, &public);
     audit
         .needles
-        .kernel_arguments("the member", &arguments, public.len());
+        .kernel_arguments("the member's device kernel", &arguments, 129);
 
-    // A sign-in proved on this thread, its masks' randomness watched.
+    // A sign-in by the stock kernel proved on this thread, its masks'
+    // randomness watched; its arguments as the kernel reads them.
     let watched = founded.call(at, POLL, "login", ());
     let scope = vos_light::scope(&founded.space.0, agent.0, POLL.0, b"login").unwrap();
     let nullifier = tree::compress(&tree::compress(&Tag::Nf.block(), &words), &scope.0);
-    let binding = watched.binding(verifier::program(verifier::CredentialKind::Auth), 0);
-    let statement = Statement::Auth(
-        AuthPublic {
-            map_root: witness.root.0,
-            scope: scope.0,
-            nullifier,
-            binding: binding.0,
-        },
-        CircuitWitness {
-            secret: words,
-            slot: witness.slot,
-            siblings,
-        },
-    );
-    let ((proved, _), drawn) = drawn_in(|| prove(&statement, MaskRng::default()).unwrap());
+    let claim = AuthClaim {
+        map_root: witness.root.to_bytes(),
+        scope: scope.to_bytes(),
+        nullifier: tree::digest(&nullifier),
+        binding: watched.binding(auth_program.id()).to_bytes(),
+    }
+    .encode();
+    let mut arguments = path.siblings.0.concat();
+    arguments.extend_from_slice(&u64::from(witness.slot).to_le_bytes());
+    arguments.extend_from_slice(&tree::digest(&words));
+    arguments.extend_from_slice(&claim);
+    audit
+        .needles
+        .kernel_arguments("the member", &arguments, claim.len());
+    let kernel =
+        vos_pvm_recair::device::Program::released(&auth.kernel, auth.chips, &auth.log_sizes)
+            .unwrap();
+    let ((proved, _), drawn) = drawn_in(|| kernel.prove(&arguments, MaskRng::default()).unwrap());
     let drawn: Vec<(&str, Vec<u8>)> = drawn.into_iter().map(|d| (d.what, d.bytes)).collect();
     for what in [
         "an attempt's entropy",
@@ -546,15 +559,10 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
         );
     }
     audit.needles.drawn("a sign-in", &drawn);
-    let watched_proof = CredentialProof {
-        format: vos_light::FORMAT,
-        public: CredentialPublic::Auth {
-            map_root: witness.root,
-            scope,
-            nullifier: vos_light::Digest(nullifier),
-            binding,
-        },
-        proof: verifier::encode(&proved).unwrap(),
+    let watched_proof = Proven {
+        format: DEVICE_FORMAT,
+        claim,
+        proof: vos_pvm_recair::device::encode(&proved.proof).unwrap(),
     };
     answers.push(ran(send(&watched, &watched_proof)));
 
@@ -599,7 +607,7 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
     let target = front.target();
     let call = founded.call(at, POLL, "login", ());
     let proof = prover
-        .prove_auth(&secret, &witness, b"login", &call)
+        .prove_auth(&secret, &witness, b"login", &call, &auth_program)
         .unwrap();
     let mut cut = request(&call, &proof);
     cut.proof.pop();
@@ -675,7 +683,10 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
         device_values.push(format!("{call:?}"));
     }
     for proof in [&signin, &paid, &device_proof, &watched_proof] {
-        device_values.push(format!("{proof:?} {:?}", proof.public));
+        device_values.push(format!(
+            "{proof:?} {:?}",
+            AuthClaim::decode_exact(&proof.claim)
+        ));
     }
     for error in [
         DeviceError::Config,
@@ -689,7 +700,7 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
     }
     let refusals = [
         prover
-            .prove_auth(&secret, &witness, b"", &login)
+            .prove_auth(&secret, &witness, b"", &login, &auth_program)
             .unwrap_err(),
         prover
             .prove_auth(
@@ -697,10 +708,11 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
                 &witness,
                 b"login",
                 &login,
+                &auth_program,
             )
             .unwrap_err(),
         wire::path_answer(&[0xff]).unwrap_err(),
-        vos_light::verify(&proof, &fresh, Some(b"login")).unwrap_err(),
+        vos_light::verify(&proof, &fresh, &auth_program, Some(b"login")).unwrap_err(),
     ];
     for error in refusals {
         device_values.push(format!("{error} {error:?}"));

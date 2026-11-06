@@ -1,13 +1,17 @@
 //! A device kernel: membership of the credential actor's Poseidon2 tree
-//! (`proving.md` §8), as `#[attestable(device)]`. Its public
-//! arguments are auth's `CredentialPublic` (the kind byte, then `map_root`,
-//! `scope`, `nullifier` and `binding`), its output empty; it hashes only
-//! through the `0x402` call, its io-hash the Poseidon2 one, so its shape
-//! holds no BLAKE2b.
+//! (`proving.md` §8), as `#[attestable(device)]`, written by hand: the
+//! reference the SDK form is measured against. Its public arguments are a
+//! kind byte, then `map_root`, `scope`, `nullifier` and `binding`, its
+//! output empty; it hashes only through the `0x402` call, its io-hash the
+//! Poseidon2 one, so its shape holds no BLAKE2b.
 //!
-//! `login` is an auth guard naming it, so a member signs in with a
-//! credential proof or a device proof of `auth`; the agent needs the
-//! credential actor.
+//! `login` is a kernel guard naming it (`proven = auth`): ingress checks
+//! the proof and its binding, and the handler the claim, as an actor's own
+//! kernel's checks run, at apply. It admits each nullifier once, which it
+//! keeps itself, and checks nothing else of the claim: neither its root
+//! against a ring nor its scope, so any secret under a tree of its own
+//! signs in. A test of the kernel path, not a model of a handler: a
+//! membership check is the stock guard's, `credential = Auth("name")`.
 //!
 //! Its arguments are read where the witness input left them ([`InPlace`],
 //! the siblings first, so page-aligned), never copied, and the path is
@@ -309,20 +313,55 @@ mod reference {
     }
 }
 
+/// `auth`'s claim, its public arguments as their encoding reads: the kind
+/// byte, then the four digests.
+#[derive(Clone, Copy, Debug, Encode, Decode)]
+pub struct AuthClaim {
+    pub kind: u8,
+    pub map_root: [u8; 32],
+    pub scope: [u8; 32],
+    pub nullifier: [u8; 32],
+    pub binding: [u8; 32],
+}
+
+/// Why `login` refused a claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum LoginError {
+    /// The nullifier signed in already.
+    #[codec(index = 0)]
+    Seen,
+}
+
 #[actor]
-pub struct Device {}
+pub struct Device {
+    /// Each nullifier signed in, and the program its proof was of.
+    seen: Table<[u8; 32], [u8; 32]>,
+}
 
 #[messages]
 impl Device {
     pub fn new() -> Self {
-        Self {}
+        Self {
+            seen: Table::default(),
+        }
     }
 
-    /// A member signed in, by a credential proof or a device proof of
-    /// `auth`: its pseudonym in the scope `"login"`.
-    #[msg(credential = Auth("login"), device = "auth")]
-    pub async fn login(&mut self, ctx: &mut Command<Self>) -> Option<[u8; 32]> {
-        ctx.nullifier()
+    /// A member signed in by a device proof of `auth`, once a nullifier:
+    /// the nullifier, its claim's, and the program the proof was of.
+    #[msg(proven = auth)]
+    pub async fn login(
+        &mut self,
+        ctx: &mut Command<Self>,
+        claim: AuthClaim,
+    ) -> Result<([u8; 32], [u8; 32]), LoginError> {
+        let Principal::Kernel { program } = ctx.caller() else {
+            unreachable!("a kernel guard admits a kernel's proof alone");
+        };
+        if self.seen.get(&claim.nullifier).is_some() {
+            return Err(LoginError::Seen);
+        }
+        self.seen.insert(&claim.nullifier, &program);
+        Ok((claim.nullifier, program))
     }
 
     /// Asks a node to attest method `method` on `arguments`, which it

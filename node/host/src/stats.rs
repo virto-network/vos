@@ -86,7 +86,7 @@ pub(crate) struct Stats {
     /// An operator command's body decoded on an executor: an `Install`'s
     /// package.
     pub(crate) operator_body: Histogram,
-    /// A credential proof's verification waiting for an executor, from
+    /// A proven call's verification waiting for an executor, from
     /// its verification slot taken, and its run there.
     pub(crate) credential_queue: Histogram,
     pub(crate) credential: Histogram,

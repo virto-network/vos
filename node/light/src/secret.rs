@@ -61,6 +61,16 @@ pub fn owner(secret: &DeviceSecret) -> Digest {
     Digest(compress(&Tag::Owner.block(), &secret.0))
 }
 
+impl DeviceSecret {
+    /// Appends its 32 bytes to `bytes`, a kernel's arguments, which their
+    /// holder zeroizes.
+    pub(crate) fn append_to(&self, bytes: &mut Vec<u8>) {
+        for word in &self.0 {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+    }
+}
+
 /// `nullifier = C(C(T(nf), s), scope)`: the member's pseudonym in `scope`.
 pub(crate) fn nullifier(secret: &DeviceSecret, scope: &Digest) -> Digest {
     let mut key = compress(&Tag::Nf.block(), &secret.0);

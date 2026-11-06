@@ -406,7 +406,20 @@ pub fn verify_device<MC: MerkleChannel>(
     proof: &DeviceProof<MC::H>,
 ) -> Result<(), Error> {
     let header = program.header();
-    let (masked, layout) = device_format(format, program, &header).ok_or(Error::Format)?;
+    let (masked, _) = device_format(format, program, &header).ok_or(Error::Format)?;
+    verify_device_in::<MC>(&masked, program, proof.clone())
+}
+
+/// [`verify_device`] under `masked`, the program's masked format as
+/// [`device_format`] gives it: a verifier holding a program computes that
+/// once.
+pub fn verify_device_in<MC: MerkleChannel>(
+    masked: &MaskedFormat<'_>,
+    program: &DeviceProgram<MC::H>,
+    proof: DeviceProof<MC::H>,
+) -> Result<(), Error> {
+    let layout =
+        DeviceComponents::layout(program.active, &program.log_sizes).ok_or(Error::Format)?;
     let public = device_public_values(&proof.io);
     let zero = |_: &AllLookupElements| SecureField::zero();
     let bound = |relations: &AllLookupElements, sums: &[SecureField]| {
@@ -421,5 +434,5 @@ pub fn verify_device<MC: MerkleChannel>(
         interaction_pow: proof.proof.interaction_pow,
         claimed_sums: &proof.proof.claimed_sums,
     };
-    verify_masked::<MC, DeviceComponents>(&masked, &claim, &layout, proof.proof.stark_proof.clone())
+    verify_masked::<MC, DeviceComponents>(masked, &claim, &layout, proof.proof.stark_proof)
 }

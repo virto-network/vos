@@ -3,7 +3,7 @@ name = "vos-phone"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "The phone bench, which no VOS node links: the light node installing and calling a local actor from release artifacts, its device group and its sealed sync; the device library's credential proofs timed on a phone and on x86, verified, their memory measured, the PoW grinds timed, and a seeded build's proofs compared byte for byte with x86's; and device kernels proved under the device profile at candidate parameters."
+description = "The phone bench, which no VOS node links: the light node installing and calling a local actor from release artifacts, its device group and its sealed sync; the device library's proven calls by the stock kernels timed on a phone and on x86, verified, their memory measured, the PoW grinds timed, and a seeded build's proofs compared byte for byte with x86's; and device kernels proved under the device profile at candidate parameters."
 publish = false
 
 [[bin]]
@@ -35,10 +35,11 @@ sha2 = "0.10"
 ed25519-dalek = "2"
 mimalloc = { version = "0.1.52", optional = true }
 
-# The release build of the light node's artifacts (`build.rs`): the
-# transpiler, on the host alone.
+# The release build of the light node's artifacts and the stock kernels'
+# (`build.rs`): the transpiler and the release build, on the host alone.
 [build-dependencies]
 vos-pvm-compiler = { workspace = true }
+vos-light = { workspace = true, features = ["release"] }
 vos-wire = { workspace = true }
 
 [dev-dependencies]

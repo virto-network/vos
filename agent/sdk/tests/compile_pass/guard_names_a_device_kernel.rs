@@ -11,11 +11,17 @@ impl Poll {
         Self { votes: 0 }
     }
 
-    /// The guard takes device proofs of `proof`, a device kernel.
-    #[msg(credential = Auth("vote"), device = "proof")]
-    pub fn vote(&mut self) {
-        self.votes += 1;
+    /// The guard takes device proofs of `proof`, a device kernel: the
+    /// handler takes its claim first.
+    #[msg(proven = proof)]
+    pub fn vote(&mut self, claim: [u8; 32], weight: u64) {
+        let _ = claim;
+        self.votes += weight;
     }
+
+    /// The stock `owner` kernel's guard, by its name.
+    #[msg(proven = owner)]
+    pub fn pay(&mut self) {}
 
     /// Sized on a run of its reference, with a size's headroom.
     #[attestable(device, reference = reference, headroom = 1)]

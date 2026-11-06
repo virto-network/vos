@@ -405,15 +405,15 @@ impl Node {
         Outcome::decode(&self.refine(&work)).unwrap().0
     }
 
-    /// A sweep of the rows of the due index due at `time`, as a leader
+    /// A sweep of the rows of the due indexes due at `time`, as a leader
     /// lists them: the earliest first, within a sweep's budget.
     pub fn sweep(&self, time: u64) -> Input {
-        let prefix = keys::due_prefix();
-        let rows = self
-            .state
-            .range(prefix.clone()..)
-            .map(|(key, _)| Ok::<_, ()>(key));
-        let due = keys::due_rows(rows, time, vos_wire::defaults::SWEEP_LIMIT).unwrap();
+        let scan = |index: keys::DueIndex| {
+            self.state
+                .range(index.prefix().to_vec()..)
+                .map(|(key, _)| Ok::<_, ()>(key))
+        };
+        let due = keys::sweep_rows(scan, time, vos_wire::defaults::SWEEP_LIMIT).unwrap();
         Input::Sweep { due }
     }
 

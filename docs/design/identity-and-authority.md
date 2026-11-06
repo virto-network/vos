@@ -60,9 +60,10 @@ Tags as in the core model: **[decided]** a settled choice, **[built]**,
   receives the authenticated origin. Guests never check signatures
   (core model §5). The ingress is the node's binary API; a gateway in
   front of it relays and holds no authority [decided] (`node-api.md`).
-- **Credentialed calls** carry a credential proof instead of a signature
-  and a session: ingress verifies it and logs the origin it proves,
-  `Anonymous` (a pseudonym in a scope) or `Owner` (a digest) (§5–§7).
+- **Proven calls** carry a device kernel's proof and its claim instead
+  of a signature and a session: ingress verifies it and logs the origin
+  it proves, `Anonymous` (a pseudonym in a scope), `Owner` (a digest) or
+  `Kernel` (an actor kernel's program) (§5–§7).
 - **Operator requests** are signed by an operator key the node lists,
   with a nonce and an expiry (§6).
 - **Nodes** have keys of their own, and a space's nodes trust each other:
@@ -172,18 +173,21 @@ compare it, and on JAM its size is paid as payload.
 - `Agent(id)`, 1: another agent of this space;
 - `Instance(id)`, 2: the calling instance of the same agent, for a nested
   call;
-- `Anonymous { scope, nullifier }`, 3: an auth credential proof's. The
+- `Anonymous { scope, nullifier }`, 3: the stock `auth` kernel's. The
   sender knows the secret behind a member's leaf; `nullifier` is its
   pseudonym in `scope` (§7, `proving.md` §8), stable across its calls;
-- `Owner(digest)`, 4: an owner credential proof's. The sender knows the
+- `Owner(digest)`, 4: the stock `owner` kernel's. The sender knows the
   secret behind `digest`, the owner a row names: a public payer
   [decided];
 - `Jam { service }`, at index 6, reserved: a JAM service, authenticated by
-  the chain or a light client.
+  the chain or a light client;
+- `Kernel { program }`, 7: an actor's own device kernel's, `program` the
+  id of the kernel's program the proof is of; its handler takes the
+  kernel's claim and judges it (`light-node.md` §4).
 
 Each digest is 32 bytes, eight M31 words as little-endian `u32`s. No role
-is ever granted to an `Anonymous` or `Owner` principal: a `Grant` naming
-one is `Malformed`.
+is ever granted to an `Anonymous`, `Owner` or `Kernel` principal: a
+`Grant` naming one is `Malformed`.
 
 **A collective decision is not an origin kind.** It is a message from a
 governance agent carrying an attestation (`decision(d)`). A guard that
@@ -222,9 +226,10 @@ wants one says "from agent G, with claim `decision(d)`".
 - credentials across spaces lapse by freshness (§7). No revocation list
   ever crosses a space boundary, so none leaks who was revoked.
 
-**Credentialed calls** [decided]: a call whose authority is a
-credential proof (`proving.md` §8), with no session and no signature.
-Ingress verifies the proof and logs only the origin it proves.
+**Proven calls** [decided]: a call whose authority is a device kernel's
+proof (format 46, `proving.md` §8; `light-node.md` §4), with no session
+and no signature. Ingress verifies the proof and logs the origin it
+proves and the kernel's claim.
 - **The request:** `Credentialed`, a request kind of the node's binary
   API (`vos_wire` frames over a unix socket or QUIC with mutual TLS)
   addressed to an agent [decided]. Its kind is read before its body,
@@ -238,21 +243,18 @@ Ingress verifies the proof and logs only the origin it proves.
   pub struct Credentialed {
       pub instance: InstanceId,
       pub method: MethodId,
-      pub arguments: Vec<u8>,          // at most cap::REQUEST
+      pub arguments: Vec<u8>,          // at most cap::REQUEST - cap::CLAIM
       pub nonce: [u8; 16],             // the client's, at random
       pub expires_ms: u64,             // by the node's clock
-      pub format: u32,                 // 44 for a credential proof; 46 for a device proof
-      pub public: CredentialPublic,
+      pub format: u32,                 // 46, the device format
+      pub claim: Vec<u8>,              // the kernel's public arguments, at most cap::CLAIM (1 KiB)
       pub proof: Vec<u8>,
   }
-  pub enum CredentialPublic {
-      #[codec(index = 0)]
-      Auth { map_root: [u8; 32], scope: [u8; 32], nullifier: [u8; 32], binding: [u8; 32] },
-      #[codec(index = 1)]
-      Owner { owner: [u8; 32], binding: [u8; 32] },
-  }
   ```
-  The enum's index is the statement's `kind`.
+  The claim is the kernel's public arguments, SCALE-encoded, its last 32
+  bytes the binding: the stock `auth` kernel's `AuthClaim { map_root,
+  scope, nullifier, binding }` (128 bytes), the stock `owner` kernel's
+  `OwnerClaim { owner, binding }` (64), an actor kernel's its own.
 - **The node's clock:** the API's `Time` request answers the node's time
   in milliseconds, a SCALE `u64` (a gateway's `GET /time`). A client reads
   it before it picks `expires_ms`, because the proof binds that value and
@@ -262,33 +264,45 @@ Ingress verifies the proof and logs only the origin it proves.
   expiry against its own clock. The node's key, which clients pin, keeps
   its own request (a gateway's `GET /`).
 - **The binding digest:**
-  `b = BLAKE2b-256("vos/cred/binding/v1" ‖ space ‖ agent ‖ instance ‖ method ‖ program ‖ kind ‖ arguments ‖ nonce ‖ expires_ms)`:
+  `b = BLAKE2b-256("vos/cred/binding/v1" ‖ space ‖ agent ‖ instance ‖ method ‖ program ‖ arguments ‖ nonce ‖ expires_ms)`:
   `space` the `SpaceId`'s 32 bytes; `agent`, `instance` and `method` 4
-  little-endian bytes each; `program` the statement's program id as 32
-  bytes (the circuit's, or for a device proof the kernel's); `kind` one
-  byte; `arguments` as the codec writes them (a `u32` little-endian
-  length, then the bytes); `nonce`
-  16 bytes; `expires_ms` 8 little-endian bytes. The proof's public
-  `binding` is `C(T(binding), W(b))` (`proving.md` §8). So a proof
-  authorizes one call: one space, agent, instance and method, one
-  statement, one set of arguments, once, before `expires_ms`.
+  little-endian bytes each; `program` the id of the kernel's program as
+  32 bytes; `arguments` as the codec writes them (a `u32` little-endian
+  length, then the bytes); `nonce` 16 bytes; `expires_ms` 8
+  little-endian bytes. The claim's `binding` is `C(T(binding), W(b))`
+  (`proving.md` §8). So a proof authorizes one call: one space, agent,
+  instance and method, one program, one set of arguments, once, before
+  `expires_ms`.
 - **The guards,** from the handler's attribute into its
   `MethodSchema::credential`:
   - `#[msg(credential = Auth("login"))]` is
-    `CredentialGuard::Auth { name, device: None }`. It admits `Anonymous`
-    origins; `name`, 1–64 bytes, is the scope's. Its `device` field names
-    the device kernel whose device proofs (format 46) it also takes
-    (`#[msg(credential = Auth("login"), device = "auth")]`); a guard
-    naming one still takes credential proofs, under the same pseudonym.
-  - `#[msg(credential = Owner)]` is `CredentialGuard::Owner`. It admits
-    `Owner` origins; the handler compares the digest with the owner of the
-    row it debits (`ctx.owner()`), at apply, on the live row.
+    `CredentialGuard::Auth { name, once: false }`, proven by the stock
+    `auth` kernel. It admits `Anonymous` origins; `name`, 1–64 bytes, is
+    the scope's.
+  - `#[msg(proven = owner)]` is `CredentialGuard::Owner`, proven by the
+    stock `owner` kernel (`#[msg(credential = Owner)]` is the same guard).
+    It admits `Owner` origins; the handler compares the digest with the
+    owner of the row it debits (`ctx.owner()`), at apply, on the live row.
+  - `#[msg(proven = k)]`, `k` one of the actor's own device kernels, is
+    `CredentialGuard::Kernel { name }`. It admits `Kernel { program }`
+    origins, `program` one of the kernel's window; the handler's first
+    argument is the claim, decoded whole from its own part as the
+    kernel's public arguments (`vos_sdk::device::Claim`), which it checks
+    at apply (`light-node.md` §4); apply runs it only while the guard
+    still names the kernel the proof is of (`CredentialedInput.kernel`).
+    An actor's own kernel takes its name before a stock one's. With no
+    own `auth`, `#[msg(proven = auth)]` is refused: the stock auth
+    kernel's guard is `credential = Auth(..)`, which names its scope.
+  - The stock kernels' checks (the auth scope, the root's ring and
+    freshness, `once`) are the node's, in Rust, at ingress and at apply;
+    an actor kernel's are its handler's, at apply.
   - Only a `&mut self` handler takes one, and no role or `linearizable`
-    beside it. A method without a credential guard refuses `Anonymous` and
-    `Owner` callers (`Failure::Forbidden`).
-  - An `Auth` guard needs its agent's credential actor (§6): installing a
-    program with one into an agent without that actor fails
-    `Failure::Credentials` (15).
+    beside it, nor `credential` and `proven` together. A method without
+    a guard refuses `Anonymous`, `Owner` and `Kernel` callers
+    (`Failure::Forbidden`).
+  - A stock guard needs its agent's credential actor (§6), whose
+    release holds the stock kernels: installing a program with one into
+    an agent without that actor fails `Failure::Credentials` (15).
   - **`once`** [decided]: `#[msg(credential = Auth("vote"), once)]`
     admits each nullifier once in its scope. The nullifier is a stable
     pseudonym, so the guard, not the handler, keeps the set: apply records
@@ -301,14 +315,14 @@ Ingress verifies the proof and logs only the origin it proves.
     with a new proof (its `b` stays recorded). A repeat of an admitted
     nullifier is refused (`CredentialRefusal::Once` at ingress,
     `Refusal::Once` at apply). A new round takes a new name, so a new
-    scope. `once` needs an `Auth` guard
-    and is part of `CredentialGuard::Auth`, so it moves no pinned blob.
+    scope. `once` needs an `Auth` guard and is part of
+    `CredentialGuard::Auth`.
 - **Ingress's checks, in order,** each cheap one before any dearer, every
   state read on this replica's applied state; each refusal is
   `Rejected(Credential(code))` (index 9 of `Rejection`), `code` a
-  `CredentialRefusal` of the index shown, the codes in check order. Apply
-  refuses under refine's `Refusal`, another enum; where both have a name
-  (`Replayed`, `Once`), the text says which:
+  `CredentialRefusal` of the index shown. Apply refuses under refine's
+  `Refusal`, another enum; where both have a name (`Replayed`, `Once`),
+  the text says which:
 
   | # | check | refusal | a gateway's HTTP |
   |---|---|---|---|
@@ -317,62 +331,67 @@ Ingress verifies the proof and logs only the origin it proves.
   | 2a | an onion-only agent's: the gateway marked it onion (`node-api.md` §2–§3) | `Admission(OnionOnly)` (not a credential code) | 403 |
   | 3 | this node serves the agent | `NoAgent`, `Elsewhere`, as for calls | 404, 421 |
   | 4 | the node's space has a genesis (its `SpaceId` is not `NONE`) | `NoSpace`, 0 | 403 |
-  | 5 | `format` is a credential or device format this node admits, a device format until its retirement (`light-node.md` §4.4) | `Format`, 1 | 403 |
-  | 6 | `proof` within its format's cap (44: 512 KiB; 46: 1.5 MiB), `arguments` within `cap::REQUEST` | `Size`, 2 | 403 |
+  | 5 | `format` is the device format, until its retirement (`light-node.md` §4.4) | `Format`, 1 | 403 |
+  | 6 | `proof` within 1.5 MiB, `claim` within `cap::CLAIM`, `arguments` within `cap::REQUEST - cap::CLAIM` | `Size`, 2 | 403 |
   | 7 | `now ≤ expires_ms ≤ now + 120 s`, `now` the node's clock | `Expiry { now }`, 3 | 403 |
-  | 8 | the instance's method exists and has a credential guard | `Method`, 4 | 403 |
-  | 9 | `public`'s kind is the guard's, and the format proves it for this method (46: auth, for a guard that names a device kernel) | `Kind`, 5 | 403 |
-  | 10 | auth: `scope` is the one the guard's name gives | `Scope`, 6 | 403 |
-  | 11 | `binding` is `C(T(binding), W(b))` of this request (a device proof's `b` under one of the programs the guard's window admits) | `Binding`, 7 | 403 |
-  | 12 | `b` is not recorded | `Replayed`, 8 | 409 |
-  | 13 | auth with `once`: `(scope, nullifier)` not recorded | `Once`, 9 | 409 |
-  | 14 | auth: `map_root` is in the credential actor's ring | `RootUnknown`, 10 (`RootRefusal::Unknown`): retryable, fetch the path again, or ask another replica; an honest member meets it on a replica's lag, a root replaced at its own batch time, or one past the ring's 64 entries (§6) | 503 |
-  | 15 | auth: `map_root` is the ring's newest, or was superseded at most `ROOT_MAX_AGE` before the replica's latest applied batch time | `RootStale`, 11 | 403 |
-  | 16 | a verification slot is free: fewer verifications in flight than the node's budget (by default twice its executor threads) | `Busy` (not a credential code) | 503 |
-  | 17 | on an executor, the proof decodes; its interaction PoW and its PoW hold, checked before any Merkle decommitment is read; then it verifies under the program for its kind | `Proof`, 12 | 403 |
+  | 8 | the instance's method exists and has a guard | `Method`, 4 | 403 |
+  | 9 | the claim's shape is the guard's (auth 128 bytes, owner 64, an actor kernel's at least 32), and the guard's kernel has a window: the credential actor's for a stock kernel, the method's actor's for its own | `Kind`, 5 | 403 |
+  | 10 | the window's programs are held, at least one computed | `Unavailable` while one is computed (retryable), else `Kind`, 5 | 503, 403 |
+  | 11 | auth: the claim's `scope` is the one the guard's name gives | `Scope`, 6 | 403 |
+  | 12 | the claim's `binding` is `C(T(binding), W(b))` of this request, `b` under one of the window's programs | `Binding`, 7 | 403 |
+  | 13 | `b` is not recorded | `Replayed`, 8 | 409 |
+  | 14 | auth with `once`: `(scope, nullifier)` not recorded | `Once`, 9 | 409 |
+  | 15 | auth: `map_root` is in the credential actor's ring | `RootUnknown`, 10 (`RootRefusal::Unknown`): retryable, fetch the path again, or ask another replica; an honest member meets it on a replica's lag, a root replaced at its own batch time, or one past the ring's 64 entries (§6) | 503 |
+  | 16 | auth: `map_root` is the ring's newest, or was superseded at most `ROOT_MAX_AGE` before the replica's latest applied batch time | `RootStale`, 11 | 403 |
+  | 17 | a verification slot is free: fewer verifications in flight than the node's budget (by default twice its executor threads) | `Busy` (not a credential code) | 503 |
+  | 18 | on an executor, the proof's interaction PoW holds over its leading fields before it is decoded; then it decodes and verifies under the program the binding names against `H_io` of the claim | `Proof`, 12 | 403 |
 
   Then the call goes to the agent's leader as `Input::Credentialed`,
   forwarded as a call is by a replica that does not lead, and its answer
   is `Ran { outcome, at }` once this replica has applied it, or apply's
   refusal under the same codes. `Proof` is one code for every failure, so
-  a refusal says nothing of where a proof failed; a proof with a wrong PoW
-  costs the node a few hashes. There is no bucket per scope or method for
-  an attacker to drain: the bounds are the node's connections and its
-  verification budget.
+  a refusal says nothing of where a proof failed. There is no bucket per
+  scope or method for an attacker to drain: the bounds are the node's
+  connections and its verification budget.
 - **The log carries** `Input::Credentialed` (index 10 of the batch's
   `Input`: the session-less kind, which anonymous inputs of a shared
-  pool (§8) will also take), never the proof,
-  the nonce or the format, so `cap::REQUEST` and a log entry's size are
-  unchanged:
+  pool (§8) will also take), never the proof, the nonce or the format;
+  a log entry grows by at most the claim's cap:
 
   ```rust
   pub struct CredentialedInput {
-      pub origin: Principal,           // Anonymous { scope, nullifier }, or Owner(digest)
+      pub origin: Principal,           // Anonymous, Owner or Kernel
       pub instance: InstanceId,
       pub method: MethodId,
       pub arguments: Vec<u8>,
       pub binding: [u8; 32],           // b
       pub expires_ms: u64,
-      pub root: Option<[u8; 32]>,      // auth's map_root
+      pub claim: Vec<u8>,              // the kernel's public arguments
   }
   ```
 - **At apply** (refine, in the batch's order, at the batch's time `t`):
   1. `expires_ms < t`: refused, `Refusal::CredentialExpired` (7);
   2. `b` recorded: refused, `Refusal::Replayed` (8);
-  3. auth: `root` neither the ring's newest nor superseded at most
-     `ROOT_MAX_AGE` before `t`: refused, `Refusal::StaleRoot` (9);
+  3. auth: the claim's `map_root` neither the ring's newest nor
+     superseded at most `ROOT_MAX_AGE` before `t`: refused,
+     `Refusal::StaleRoot` (9);
   4. a `once` guard: `once(scope ‖ nullifier)` recorded: refused,
      `Refusal::Once` (10);
   5. `b` recorded, the system row `binding(b) → expires_ms`, collected by
-     the sweep at `expires_ms` plus 60 s through the due index (the
-     sweep's step lists the bindings it forgets beside its sessions);
-  6. the method runs, its caller the origin, under its guard; whatever it
+     the sweep at `expires_ms` plus 60 s through the bindings' due index
+     (the sweep's step lists the bindings it forgets beside its sessions,
+     64 at most);
+  6. the method runs, its caller the origin, under its guard, an actor
+     kernel's handler on the claim then the arguments; whatever it
      returns, `b` stays recorded (`Failure::Forbidden` or a trap consumes
      the input);
   7. a `once` guard: the row `once(scope ‖ nullifier) → t` recorded only
      if the method returned `Ok`, in this apply, beside its writes
      [decided].
 
+  A batch runs at most 64 proven calls (`defaults::BATCH_CREDENTIALED`):
+  the first past them cuts it short, and the leader holds the rest for
+  the next, so the sweeps forget bindings as fast as batches record them.
   A refused input writes nothing. So a proof replayed at another replica
   runs once, and a revocation binds every replica at the same batch. A
   duplicate is answered `Refusal::Replayed` at apply (or
@@ -380,20 +399,17 @@ Ingress verifies the proof and logs only the origin it proves.
   first), without the first call's outcome [decided]: a client that
   lost its answer reads state (a balance, a record).
 - **On JAM,** an agent whose builder is one of the space's nodes takes a
-  credentialed input as it takes any: its builder's ingress verified the
+  proven input as it takes any: its builder's ingress verified the
   proof, under the trust-boundary rule above.
-- **Device proofs** (format 46) authorize exactly what an auth proof
-  does [decided] and take the same checks (`proving.md` §8). Their
-  program is one the node computes from a release of the installed
-  kernel, on the public statement its reference program returns
-  [decided], so every node and the device's release build compute one
-  program from the kernel: the leader at the install, which fails for a
-  device kernel whose reference does not run; a replica that did not
-  install it, once, at the first device proof naming the kernel that
+- **The kernel's program** is one the node computes from a release of
+  the installed kernel, on the public statement its reference program
+  returns [decided], so every node and the device's release build
+  compute one program from the kernel: the leader at the install, which
+  fails for a device kernel whose reference does not run; a replica that
+  did not install it, once, at the first proof naming the kernel that
   passes the checks before the binding. The guard admits its kernel's
   release and, until its date, the previous one (`light-node.md` §4.4);
-  the binding names which, and the io-hash is `H_io` of the request's
-  auth words, picked by the format.
+  the binding names which.
 
 **Guards are the same on VOS and on JAM.** Inside a space the evidence is
 signatures and grants, checked at ingress. Across the boundary the
@@ -610,7 +626,7 @@ across a space's agents wait for the identity agent above.
 to their own space's ingress, not across spaces. Membership (auth) proves
 a leaf of the space's credential actor (§6) and yields an `Anonymous`
 origin; ownership (owner) proves the secret behind a row's owner digest
-and yields an `Owner` origin (§5). Their circuits, words and format are
+and yields an `Owner` origin (§5). Their stock kernels, words and format are
 `proving.md` §8's. Across spaces the pitfalls above hold as written; in a
 space three of them take a simpler form:
 - **No epoch in the leaf** (`member = C(T(member), s)`): revocation removes

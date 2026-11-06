@@ -50,7 +50,7 @@ fn a_device_kernels_shape_holds_no_blake2b() {
 /// its own io-hash alone: a witness-independent trace.
 #[test]
 fn every_path_shape_proves_under_one_device_program() {
-    use vos_pvm_recair::device::{MAX_PROOF_BYTES, Program, auth_io, auth_reference, encode};
+    use vos_pvm_recair::device::{MAX_PROOF_BYTES, Program, auth_reference, claim_io, encode};
     use vos_pvm_recair::masked::MaskRng;
     let blob = kernel("device", "auth");
     let program = Program::install(&blob, &auth_reference(), 0).expect("the kernel's program");
@@ -69,7 +69,7 @@ fn every_path_shape_proves_under_one_device_program() {
             .expect("proves under the kernel's program");
         // R1's rows within `h` (`proving.md` §5): 149 at most.
         assert!(stats.revealed_rows <= 149, "{stats:?}");
-        assert_eq!(Some(proof.io), auth_io(public));
+        assert_eq!(Some(proof.io), claim_io(public));
         let bytes = encode(&proof.proof).expect("encodes");
         assert!(bytes.len() <= MAX_PROOF_BYTES, "{} bytes", bytes.len());
         program.verify(&proof.io, &bytes).expect("verifies");

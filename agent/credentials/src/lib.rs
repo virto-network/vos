@@ -282,12 +282,18 @@ impl Credentials {
     }
 
     /// The secret's member's leaf lies under `map_root` by `path`, and
-    /// `nullifier` is its nullifier in `scope`.
+    /// `nullifier` is its nullifier in `scope`. The next release's checks
+    /// the nullifier first: another program, the same claims.
     #[attestable(device, reference = reference::auth)]
     pub fn auth(path: &p2::Path, secret: &Secret, #[public] claim: &AuthClaim) {
+        if cfg!(feature = "next") {
+            assert_eq!(Tag::Nf.hash(secret).hash(&claim.scope), claim.nullifier);
+        }
         let member = Tag::Member.hash(secret);
         assert_eq!(path.root(&Tag::Leaf.hash(&member)), claim.map_root);
-        assert_eq!(Tag::Nf.hash(secret).hash(&claim.scope), claim.nullifier);
+        if !cfg!(feature = "next") {
+            assert_eq!(Tag::Nf.hash(secret).hash(&claim.scope), claim.nullifier);
+        }
     }
 
     /// The secret's owner digest is `owner`.

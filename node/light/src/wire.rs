@@ -20,7 +20,7 @@ use vos_wire::ingress::{
 use vos_wire::result::Outcome;
 use zeroize::Zeroize;
 
-use crate::{AuthWitness, Call, CredentialProof, CredentialPublic, DeviceError, Digest};
+use crate::{AuthWitness, Call, DeviceError, Digest, Proven};
 
 /// `kind`'s request holding `body`.
 fn request(kind: u16, body: impl Encode) -> Vec<u8> {
@@ -158,31 +158,9 @@ pub fn root_answer(body: &[u8]) -> Result<(Digest, u64), DeviceError> {
     ))
 }
 
-impl From<&CredentialPublic> for ingress::CredentialPublic {
-    fn from(public: &CredentialPublic) -> Self {
-        match *public {
-            CredentialPublic::Auth {
-                map_root,
-                scope,
-                nullifier,
-                binding,
-            } => ingress::CredentialPublic::Auth {
-                map_root: map_root.to_bytes(),
-                scope: scope.to_bytes(),
-                nullifier: nullifier.to_bytes(),
-                binding: binding.to_bytes(),
-            },
-            CredentialPublic::Owner { owner, binding } => ingress::CredentialPublic::Owner {
-                owner: owner.to_bytes(),
-                binding: binding.to_bytes(),
-            },
-        }
-    }
-}
-
 /// The credentialed request of `call` under `proof`, addressed to
 /// `call.agent` (`identity-and-authority.md` §5).
-pub fn credentialed(call: &Call, proof: &CredentialProof) -> Vec<u8> {
+pub fn credentialed(call: &Call, proof: &Proven) -> Vec<u8> {
     let body = Credentialed {
         instance: InstanceId(call.instance),
         method: MethodId(call.method),
@@ -190,7 +168,7 @@ pub fn credentialed(call: &Call, proof: &CredentialProof) -> Vec<u8> {
         nonce: call.nonce,
         expires_ms: call.expires_ms,
         format: proof.format,
-        public: ingress::CredentialPublic::from(&proof.public),
+        claim: proof.claim.clone(),
         proof: proof.proof.clone(),
     };
     request(Kind::Credentialed as u16, (AgentId(call.agent), body))

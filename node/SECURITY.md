@@ -1,7 +1,7 @@
 # The node's credential surface: security considerations
 
 What a node takes on when it serves credentialed calls, calls whose
-authority is a credential proof rather than a client's signature: what
+authority is a device kernel's proof rather than a client's signature: what
 ingress verifies and in what order, what the log keeps, what the operators
 and the gateways that relay requests learn, and where the node is open to
 denial of service. It is descriptive, not a formal argument. The design is
@@ -14,9 +14,11 @@ holds is `node/light/SECURITY.md`'s, and what a verified proof proves is
 ## Who is trusted
 
 - **A space trusts its nodes.** Ingress verifies the proof and logs only
-  the origin it proved, `Anonymous { scope, nullifier }` for an auth
-  proof or `Owner(digest)` for an owner proof, never the proof. Every
-  replica applies the origin as logged; none verifies again. An operator
+  the origin it proved and the claim, never the proof:
+  `Anonymous { scope, nullifier }` for the stock auth kernel,
+  `Owner(digest)` for the stock owner kernel, `Kernel { program }` for an
+  actor's own kernel. Every replica applies the origin as logged; none
+  verifies again. An operator
   can therefore log an origin it never verified, as it could run any call:
   members trust their space's nodes for integrity. A space that wants
   evidence keeps the proofs in the non-repudiation side store (not built).
@@ -43,8 +45,11 @@ holds is `node/light/SECURITY.md`'s, and what a verified proof proves is
 
 ## What ingress checks, in order
 
-Each check is cheaper than the next; every one but the last reads the
-request and this replica's applied state alone. A refusal is
+A proven call carries its kernel's claim (the kernel's public arguments,
+SCALE-encoded, the call's binding its last 32 bytes, at most 1 KiB) and
+one device proof (format 46) of the kernel's run stating it. Each check
+is cheaper than the next; every one but the last reads the request and
+this replica's applied state alone. A refusal is
 `Rejected(Credential(code))`, the codes in this order (the node API's
 frame checks and the agent's placement come first, as for any call):
 
@@ -55,62 +60,69 @@ frame checks and the agent's placement come first, as for any call):
 3. this node serves the agent;
 4. the agent's space has a genesis (`NoSpace`): a binding names its
    `SpaceId`, and no proof may bind `NONE`;
-5. the format is one this node admits for a credential (`Format`): the
-   credential format the proof registry names, as the final verifier pins
-   it, and the device format, 46;
-6. the proof within its format's cap (512 KiB for a credential proof,
-   1.5 MiB for a device proof), the arguments within `cap::REQUEST`
+5. the format is the device format, 46, while admitted (`Format`);
+6. the proof within the format's cap (1.5 MiB), the claim within
+   `cap::CLAIM` (1 KiB), the arguments within `cap::REQUEST` less it
    (`Size`);
 7. `now ≤ expires_ms ≤ now + 120 s` by the node's clock (`Expiry`);
-8. the method exists and carries a credential guard (`Method`);
-9. the statement's kind is the guard's (`Kind`); a device proof needs an
-   auth guard naming a device kernel whose program this node holds;
-10. for auth, the scope is the one the guard's name gives in this space,
+8. the method exists and carries a guard (`Method`): `auth` or `owner`,
+   the stock kernels, or one of the actor's own device kernels;
+9. the claim's shape is the guard's (`Kind`): a stock auth claim's 128
+   bytes (root, scope, nullifier, binding), a stock owner claim's 64
+   (owner, binding), an actor kernel's at least the binding's 32; and the
+   kernel's window is installed: the credential actor's for a stock
+   kernel, the method's actor's for its own;
+10. the window's programs are held (`Unavailable` while one is computed,
+    below), at least one computed (`Kind`);
+11. for auth, the scope is the one the guard's name gives in this space,
     agent and instance (`Scope`);
-11. the binding is this request's (`Binding`): its space, agent,
-    instance, method, statement program and kind, arguments, nonce and
-    expiry;
-12. the binding digest is not recorded (`Replayed`);
-13. for a `once` guard, the nullifier is not admitted in its scope
+12. the binding is this request's under one of the window's programs
+    (`Binding`): its space, agent, instance, method, program, arguments,
+    nonce and expiry;
+13. the binding digest is not recorded (`Replayed`);
+14. for a `once` auth guard, the nullifier is not admitted in its scope
     (`Once`), before the proof: anyone who
     holds a scope's nullifier, the log's readers among them, learns
     whether it was admitted by a request bound to its own arguments and
     a proof of nothing. Checking it after the proof would spend a
     verification on every such probe;
-14. for auth, the root is in the credential actor's ring (`RootUnknown`,
+15. for auth, the root is in the credential actor's ring (`RootUnknown`,
     retryable: an honest member meets it on a lagging replica, after a
     later write replaced its root at the same batch time, or once 64 later
     roots pushed it out; it fetches its path again or asks another
     replica);
-15. for auth, the root is the ring's newest or was superseded at most
+16. for auth, the root is the ring's newest or was superseded at most
     `ROOT_MAX_AGE` (10 minutes) before this replica's latest batch time
     (`RootStale`, final);
-16. a verification slot is free (`Busy`): fewer verifications in flight
+17. a verification slot is free (`Busy`): fewer verifications in flight
     than the node's budget, by default twice its executor threads;
-17. on an executor, the proof verifies under the program its kind names
-    (`Proof`, one code for every failure, so a refusal says nothing of
-    where a proof failed).
+18. on an executor, the proof verifies under the program the binding
+    names against `H_io` of the claim, computed here (`Proof`, one code
+    for every failure, so a refusal says nothing of where a proof
+    failed).
 
-Ingress calls the final verifier's `credential::verify`, which picks the
-circuit by kind, never the circuit-generic step beneath it, which takes
-any preprocessed root.
+The origin follows the guard: the auth claim's scope and nullifier, the
+owner claim's owner, or the program's id for an actor's kernel, whose
+handler takes the claim as its first argument and checks it at apply (a
+stock kernel's checks are the node's, above).
 
 **A device proof** (format 46: the device profile, one masked segment
 without the page-Merkle boundary, every chip at most 2^17 rows, the
-proof at most 1.5 MiB; `proving.md` §8) authorizes as
-an auth credential proof does, and only for a method whose auth guard
-names a device kernel. Its program (the kernel's chips, their log sizes
+proof at most 1.5 MiB; `proving.md` §8) is of a device kernel's run: one
+of the credential actor's stock kernels (`auth`, `owner`), or an actor's
+own. Its program (the kernel's chips, their log sizes
 and the preprocessed root) is one this node computes from a release of
 the installed kernel (the kernel, its reference program and its
 headroom) by a run on the arguments the reference returns
 (`vos_pvm_recair::device::Program::of`), never one a request names, and
-kept as its verifier alone (the program and its id), by release. The
+kept as its verifier alone (the program, its masked format and its id),
+by release. The
 leader computes every device kernel's at the install, which fails for a
 kernel whose reference, or whose run on it, does not end within the
 format's shape. A replica that did not install it, or has restarted
-since, computes it on an executor when a device proof naming the kernel
+since, computes it on an executor when a proof naming the kernel
 has passed every check before the binding (format, size, expiry, guard,
-kind), or a `Devices` read names it, once however many such requests wait
+claim), or a `Devices` read names it, once however many such requests wait
 on it (about 0.2 s), then keeps it, and a failure of the release's own
 (its shape, its runs) too; a program the replica does not hold yet, or
 any other failure, answers `Unavailable` (a `Devices` read marks the
@@ -120,24 +132,23 @@ release still does. The guard
 admits its kernel's release and, until its date, the previous release
 an install replaced (`light-node.md` §4.4); a device format past its
 retirement is refused `Format`. The binding names the program's id, one
-of the window's; the io-hash is `H_io` of the
-request's auth words, computed here (each word below `p`, as a credential
-proof's), so the proof's bytes carry no statement of their own. A run is
+of the window's; the io-hash is `H_io` of the claim, computed here, so
+the proof's bytes carry no statement of their own. A run is
 traced with at most 2^18 gas (`device::GAS`, twice the most steps a
 program's CPU holds; about 109 Poseidon2 calls, fewer as its steps
 grow), so neither the install nor a device traces far past a program's
 shape; a reference program, run once a release and never proved, with at
 most 2^22 (`device::REFERENCE_GAS`).
 
-**A device kernel is trusted as its actor's code is.** It is the
-installed actor's own attestable method, and what its proof states is
-what the kernel computes: a kernel that skipped its root's compare, or
-its nullifier's derivation, would admit anyone to the guarded methods of
-its own instance. The node's checks around the proof still hold whatever
-the kernel does: the scope, the binding, the replay, `once`, and the
-root it names in the ring and fresh (though such a kernel ties no member
-to it), so such a kernel opens its own instance alone, as a handler with
-no check would.
+**A device kernel is trusted as its actor's code is.** A stock kernel is
+the credential actor's, and what its proof states is what the kernel
+computes: the stock auth kernel's member under the root and its
+nullifier, the stock owner kernel's owner. An actor's own kernel is its
+attestable method: one that skipped a check would admit anyone to the
+guarded methods of its own instance, as a handler with no check would.
+Its claim reaches its handler, which judges it at apply (a root's
+freshness, a nullifier's reuse); the node's checks around the proof hold
+whatever the kernel does: the binding, the replay and the claim's cap.
 
 ## At apply
 
@@ -148,7 +159,9 @@ fresh by the batch's time (`StaleRoot`), or for a `once` guard if the
 nullifier is admitted (`Once`). Otherwise the binding digest is recorded
 until `expires_ms` plus a minute, whatever the method then does, and the
 method runs as the origin; a `once` nullifier is recorded for good only if
-the method returned `Ok`, in the same apply. So:
+the method returned `Ok`, in the same apply. An actor kernel's handler
+takes the claim first, then the call's arguments. A batch runs at most 64
+proven calls (`defaults::BATCH_CREDENTIALED`). So:
 
 - **a proof replayed at another replica runs once:** both may pass their
   ingresses, the second is refused at apply;
@@ -157,8 +170,8 @@ the method returned `Ok`, in the same apply. So:
 - **a refused vote is not a cast vote:** a handler that fails leaves its
   member free to try again with a new proof (its binding stays recorded).
 
-A guard admits its credential's origin alone, and a method with no guard
-refuses one; no role is ever granted to a credential's origin (a grant
+A guard admits its kernel's origin alone, and a method with no guard
+refuses one; no role is ever granted to a proven call's origin (a grant
 naming one is `Malformed`).
 
 ## What operators learn
@@ -188,11 +201,11 @@ serve its requests:
   halves its period for the space's pace.
 - **From the log:** each auth call's scope and nullifier (a pseudonym's
   activity in one scope), each payment's owner digest (a public payer),
-  each credentialed call's arguments in clear, and the metadata every
+  each proven call's claim and arguments in clear, and the metadata every
   call leaks.
 - **From the root an auth call names.** The log keeps each auth call's
-  `map_root` (`CredentialedInput.root`), which the apply checks for
-  freshness. A member proves against the root of its last fetched path
+  `map_root` (in its claim, `CredentialedInput.claim`), which the apply
+  checks for freshness. A member proves against the root of its last fetched path
   until its next refresh: while the tree changes often, few members hold
   one root at once, so the roots logged on calls in different scopes link
   those calls' pseudonyms to one holder, a fingerprint across scopes that
@@ -215,13 +228,14 @@ serve its requests:
   pins a space's handle at a member's first enrollment.
 
 **Audited** (`just test-carriers`, `node/host/tests/carriers/credentials.rs`):
-a member's sign-ins, `once` votes, payment and device kernel's sign-in,
-and ingress's refusals (a replay, `Once`, a cut proof, another call's
-arguments, an expired call, a retired format, a device proof to a guard
-naming no kernel, two frame errors), over the API's socket and a
+a member's sign-ins and `once` votes by the stock auth kernel, a
+payment by the stock owner kernel, an actor kernel's sign-in, and
+ingress's refusals (a replay, `Once`, a cut proof, another call's
+arguments, an expired call, an unregistered format, an actor kernel's
+proof sent to a stock guard, two frame errors), over the API's socket and a
 gateway relaying onto the API over QUIC. No carrier holds the member's
 device secret (its source's output, `w`, `s`, the nullifier's key, their
-hashes, a device kernel's arguments; `s`'s single words in what leaves
+hashes, a kernel's arguments; `s`'s single words in what leaves
 the device) or a proof's masks as drawn: every byte the socket's
 connections carried each way, each HTTP request and its answer's status
 and body as sent and read through the gateway, each node's log entries,
@@ -279,10 +293,9 @@ facility (`identity-and-authority.md` §7):
   A device kernel pinned with a method at enrollment is the gateway's word
   too. A kernel other than the installed one proves nothing at the node,
   whose binding names the installed kernel's program. The device runs it on
-  the member's secret and path, as it runs the credential circuit: its
-  proof states the io-hash alone, which the library checks is the one of
-  the auth words it computed before the proof leaves the device, and the
-  masked proof hides the run. What a hostile kernel still steers is
+  the member's secret and path: its proof states the io-hash alone, which
+  the library checks is the one of the claim it computed before the proof
+  leaves the device, and the masked proof hides the run. What a hostile kernel still steers is
   whether its run fits its program's shape, so whether the device answers
   a proof or an error, and how long the refusal takes (the run is traced
   to at most `device::GAS`): a few bits a sign-in.
@@ -352,31 +365,40 @@ facility (`identity-and-authority.md` §7):
   the node answers, as it relays the body whole: its 64 places bound the
   credentialed calls in flight through one gateway, under its limits per
   address.
-- A binding digest's row is forgotten by the sweep, up to 64 a sweep
-  beside the 32 sessions' and workflows' rows it lists, a sweep a batch
-  while rows are due: sustained credentialed calls past 64 a batch grow
-  the binding rows until the load falls, and while more than 96 bindings
-  are due before a session's or a workflow's row, that row waits for them
-  to drain.
-- What a proof costs a verification slot, by format, on one x86 core
-  (medians of 200 runs; the 95th percentile within 25%): the verifier's
-  order is the decode and its canonical re-encoding, the interaction PoW,
-  the logup totals, the composition at the OODS point, then the PoW, then
-  the decommitments, so a wrong PoW is refused after every step but the
-  decommitments [measured, x86 development desktop (Intel Core Ultra 7
-  155H), one thread, 2026-11-01]:
-  - **format 44, a credential proof** (about 220 KB): verified in about
-    2.0 ms; a wrong PoW refused in 0.7 ms, a wrong interaction PoW in
-    0.5 ms, one cut short in 0.2 ms
-    (`cargo run --release -p vos-pvm-recair --example credential_ingress`);
-  - **format 46, a device proof** of auth's kernel (about 880 KB):
-    verified in about 11.7 ms, within the device budget's gate of at most
-    40 ms on one x86 core; a wrong PoW refused in 8.0 ms, a wrong
-    interaction PoW in 5.8 ms, one cut short in 1.1 ms
-    (`cargo run --release -p vos-phone --example device_ingress`). A
-    device proof's slot is held about six times a credential proof's, so
-    the verification budget bounds about a sixth as many device proofs a
-    second; "a wrong PoW refused in under 1 ms" is format 44's alone.
+- A binding digest's row is forgotten by the sweep, up to 64 a sweep, in
+  an index of its own beside the sessions' and workflows' rows, so due
+  bindings never hold one of those back; a batch runs at most 64 proven
+  calls (`defaults::BATCH_CREDENTIALED`, a rule of refine's: the first
+  past them cuts the batch short, and the leader holds the rest for the
+  next), so the sweeps, one a batch while rows are due, forget bindings
+  as fast as batches record them.
+- What a proof costs a verification slot, on one x86 core (medians and
+  95th percentiles of 200 runs): before the proof is decoded, a
+  pre-check reads its leading fields and checks its interaction PoW over
+  the program, its first two roots and the io-hash; then the decode and
+  its canonical re-encoding, the interaction PoW again, the logup totals,
+  the composition at the OODS point, the PoW, and the decommitments. A
+  program's masked format is computed once, when the program is
+  installed or pinned, not per proof; its component layout is still
+  built per proof, within the verification's time. A device proof of the stock auth
+  kernel (about 870 KB) [measured, x86 development desktop (Intel Core
+  Ultra 7 155H), one thread, load average 7–21 from other builds,
+  2026-11-06; `cargo run --release -p vos-phone --example
+  device_ingress`]:
+  - verified in 16–48 ms by the load (11.7 ms on a quiet machine,
+    2026-11-01);
+  - a wrong interaction PoW, a main root changed, or the honest proof
+    against another claim's io-hash: refused by the pre-check in
+    0.017 / 0.021 ms;
+  - a wrong PoW: 11–27 ms, after the decode (3.2–8.8 ms, of which the
+    re-encoding is about half) and the composition;
+  - one cut short: 1.6–3.5 ms, a decode to its end.
+
+  The format's interaction PoW is 8 bits, so junk ground for 2^8 nonces,
+  microseconds of work, passes the pre-check; the next check an
+  attacker cannot meet cheaply is the 16-bit PoW, after the decode and
+  the composition. Refusing such junk in under 1 ms needs a heavier
+  interaction PoW, a format change (`docs/design/open.md`).
 - **The executors' verification gate** [decided]: at `k` verifying
   threads, at least `100·k` credentialed calls a second, scaling linearly
   to `N` threads, p99 within 50 ms of a signed call's at the same rate;
@@ -386,33 +408,10 @@ facility (`identity-and-authority.md` §7):
   and `N` recorded as the physical cores and the logical threads
   (`cargo bench -p vos-node --bench credentialed`, its `serve` and
   `drive`). `100·k` a second on `k` executors leaves each call 10 ms of
-  an executor, verification and apply together, so a host whose threads
-  verify in more than about 7 ms under full load misses the gate,
-  whatever the node does.
-- **Measured** [measured, x86 development desktop (Intel Core Ultra 7
-  155H: 6 P-cores with SMT, 8 E-cores, 2 LP E-cores; 22 logical
-  threads, 16 physical cores), 2026-10-27; an earlier credential
-  parameter set; the node and the generator in one process, other builds
-  sharing the machine, so not the gate's own setup]: one node of a founded space of one, 4 agents, owner
-  transfers over the API's socket, open loop at `100·k` a second for
-  10 s, a signed increment at the same rate beside:
-
-  | k | asked | achieved | credentialed p50 / p99 | signed p50 / p99 | verify mean | |
-  |---|---|---|---|---|---|---|
-  | 1 | 100 | 100 | 5.2 / 7.0 ms | 3.6 / 5.1 ms | 1.81 ms | within |
-  | 2 | 200 | 200 | 5.4 / 6.7 ms | 3.2 / 4.3 ms | 1.98 ms | within |
-  | 4 | 400 | 400 | 5.8 / 7.1 ms | 3.2 / 4.4 ms | 2.29 ms | within |
-  | 8 | 800 | 799 | 6.8 / 14.7 ms | 3.3 / 4.6 ms | 2.72 ms | within |
-  | 16 | 1,600 | 1,037 | 2.6 / 5.4 s | 5.6 / 11.1 ms | 14.4 ms | missed |
-  | 22 | 2,200 | 953 | 6.5 / 13.0 s | 8.9 / 18.1 ms | 17.7 ms | missed |
-
-  Within the bound to `k` = 8, where a verification takes 1.8–2.7 ms and
-  waits for no executor. At 16 and 22 each verification takes 11–18 ms
-  (1.8 ms on a performance core alone), so the executors saturate, shared
-  with the generator, the node's runtime and other builds; the calls in
-  flight stop at the generator's 96 senders, not at the 64 places. The
-  gate's own run, on a many-core host with the generator apart, is open
+  an executor, verification and apply together: a device proof's
+  verification alone takes about 12 ms on a quiet x86 core, so the bench
+  drives `50·k`, and the gate's rate for device proofs is open
   (`docs/design/open.md`).
-- The request's decode and the verifier's bytes are fuzzed
-  (`credentialed_decode`, `credential_verify_bytes`).
+- The request's decode and the device verifier's bytes are fuzzed
+  (`credentialed_decode`, `device_verify_bytes`).
 - The gateway adds its own limits per address before any of this.

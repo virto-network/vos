@@ -56,7 +56,7 @@ pub enum Kind {
     MemoryRoot,
     /// A register past φ9..φ12, or the file φ0..φ8.
     Register,
-    /// A masked proof's randomness, the wrap's or a credential proof's:
+    /// A masked proof's randomness, the wrap's or a device proof's:
     /// its attempts' entropy and seeds, the witness digest it is hedged
     /// with, its blinding values and the seeds of its mask, salt and `R`
     /// columns.

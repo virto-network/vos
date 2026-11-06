@@ -21,7 +21,7 @@ vos-pvm-proof = { path = ".." }
 vos-pvm-proof-verifier = { path = "../verifier" }
 # The final verifier on the bytes a venue receives: arbitrary bytes, and the
 # golden wraps' bytes and structure mutated, formats 28 and 39.
-vos-pvm-final-verifier = { path = "../final-verifier", features = ["test-formats", "credential-bytes"] }
+vos-pvm-final-verifier = { path = "../final-verifier", features = ["test-formats"] }
 vos-statement = { path = "../statement", features = ["fixtures"] }
 # A space's genesis, anchors, migrations and golden vectors, as a venue
 # decodes them.
@@ -29,6 +29,12 @@ vos-anchor = { path = "../anchor", features = ["vectors"] }
 # The node API's frame reader and operator envelope, as a node reads them.
 vos-api = { path = "../../../node/api" }
 vos-wire = { path = "../../../agent/wire" }
+# A proven call's claim's io-hash, as ingress computes it.
+vos-pvm-precompiles = { path = "../precompiles" }
+# The device verifier on the bytes ingress receives, under a small kernel's
+# program the assembler builds.
+vos-pvm-recair = { path = "../recair", default-features = false }
+vos-pvm-compiler = { path = "../../compiler" }
 postcard = { version = "1", features = ["alloc"] }
 stwo = { git = "https://github.com/olanod/stwo", rev = "e14925a81606b4d68c6a5d3047d382a20bd953d3", default-features = false }
 
@@ -102,7 +108,7 @@ test = false
 doc = false
 
 [[bin]]
-name = "credential_verify_bytes"
-path = "fuzz_targets/credential_verify_bytes.rs"
+name = "device_verify_bytes"
+path = "fuzz_targets/device_verify_bytes.rs"
 test = false
 doc = false

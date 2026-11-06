@@ -1,10 +1,12 @@
 //! The demo's three screens on the SSH port:
 //! *Enroll*, *Sign in* and *Pay*, server-owned s4 documents over the
 //! credential actor and the `purses` ledger of one agent. *Sign in* offers
-//! the credential proof (the poll's `login`) and, where the file names the
-//! device actor, a device proof of its kernel `auth` (its `login`, whose
-//! guard names that kernel): the enrollment pins the kernel's bytes,
-//! which the device proves under the device profile. The proofs are
+//! the poll's `login`, proven by the stock `auth` kernel, and, where the
+//! file names the device actor, its `login`, proven by its own kernel
+//! `auth`: the enrollment pins the kernel's bytes, which the device proves
+//! under the device profile. That test actor's handler admits any secret
+//! under a tree of its own, so its sign-in shows the kernel path, not
+//! membership, which the poll's shows. The proofs are
 //! the member's device's: the client's `vos.credential` facility, which the
 //! app asks and whose answer, a node-API `Credentialed` request, the gateway
 //! relays as it is after checking it names this agent and the screen's
@@ -50,9 +52,8 @@ pub struct Demo {
     pub credentials: u32,
     pub purses: u32,
     pub poll: u32,
-    /// The device actor, whose `login` also takes a device proof of its
-    /// kernel `auth`: none, and *Sign in* offers the credential proof
-    /// alone.
+    /// The device actor, whose `login` is proven by its own kernel
+    /// `auth`: none, and *Sign in* offers the poll's `login` alone.
     #[serde(default)]
     pub device: Option<DeviceSignIn>,
 }

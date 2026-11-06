@@ -44,10 +44,12 @@ The scale results are in `core-model.md` §14, "The scale test".
 - **Placement:** agents placed and rebalanced through membership changes.
 - **The executors' verification gate** (`node/SECURITY.md`, "Denial of
   service": at least 100 credentialed verifications a second per
-  verifying thread, scaling linearly): its own run, the node pinned to a
+  verifying thread, scaling linearly): a device proof's verification
+  alone takes about 12 ms on a quiet x86 core, past the 10 ms a call
+  that rate leaves, so the gate's rate for device proofs is the owner's to
+  restate (the bench drives `50·k`); its own run, the node pinned to a
   many-core host's performance cores and the generator on another machine
-  over QUIC, is not done; the development desktop's table holds to 8
-  threads and misses at 16 and 22. A bound per verification under full
+  over QUIC, is not done. A bound per verification under full
   load (within 5 ms on average) is not yet a gate.
 
 ## Proving
@@ -64,8 +66,11 @@ The scale results are in `core-model.md` §14, "The scale test".
 - **The signature chips:** SHA-256 and SHA-512, the bignum chip, and the
   P-256 and Ed25519 drivers, so a device can prove over a hardware key's
   signature instead of a device-held secret.
-- **The binding sweep's budget** (a consensus rule in refine) is not bounded
-  separately.
+- **A device format with a heavier interaction PoW:** format 46's is 8
+  bits, so well-formed junk ground for 2^8 nonces passes ingress's
+  pre-check and costs a decode and the composition (11–27 ms on one x86
+  thread) before its 16-bit PoW refuses it; 16 or more bits would refuse
+  such junk in about 0.02 ms, at the prover's grind's cost on the phone.
 - **A quiet re-measure of the device exit `0x402`'s cost** on an idle
   machine.
 - **Segment AIR parts not yet under a forgery gate:** the program memory's
@@ -83,7 +88,7 @@ The scale results are in `core-model.md` §14, "The scale test".
   cryptographer's review; if it falls, the masked wrap takes a new number.
 - **The Blake2b host hook** (`0x400`, Kreivo's `blake2_256`) for the final
   verifier, deferred until a venue's compute weight binds.
-- **The external audit's scope:** the credential AIR, the device shape, the
+- **The external audit's scope:** the device shape, the stock kernels, the
   Poseidon2 chip and their masking, with the recursion AIR, the final
   verifier, `derive` and the security tool's counts. Engage before any
   value rides on VOS.

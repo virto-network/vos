@@ -92,6 +92,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "credentials-next"
+version = "0.1.0"
+dependencies = [
+ "vos-credentials",
+ "vos-sdk",
+]
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -418,6 +426,14 @@ name = "vos-anchor"
 version = "0.1.0"
 dependencies = [
  "blake2",
+]
+
+[[package]]
+name = "vos-credentials"
+version = "0.1.0"
+dependencies = [
+ "vos-sdk",
+ "vos-wire",
 ]
 
 [[package]]

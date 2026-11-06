@@ -2,8 +2,10 @@
 //! (`pvm/proof/fixtures`) and vectors: `final_verifier_bytes` with every
 //! wrap there, `masked_bytes` with `format::MASKED_WRAP`'s past their header,
 //! `statement_decode` with every fixture's judgement (its input, then its
-//! proof) and its statement alone, and `anchor_decode` with `vos-anchor`'s
-//! golden vectors, their geneses, an anchor and a migration of each.
+//! proof) and its statement alone, `anchor_decode` with `vos-anchor`'s
+//! golden vectors, their geneses, an anchor and a migration of each, and
+//! `device_verify_bytes` with an honest proof of its program, its io-hash
+//! first.
 //!
 //! Those four corpora are cleared first: a masked fixture regenerated is
 //! another honest proof of the same words, so a proof of an earlier
@@ -19,7 +21,11 @@ use std::path::Path;
 
 use vos_anchor::vectors;
 use vos_anchor::{Anchor, RootKind};
+use vos_pvm_recair::masked::MaskRng;
 use vos_statement::fixtures;
+
+#[path = "../fuzz_targets/device_program.rs"]
+mod device_program;
 
 /// `format::MASKED_WRAP`'s header in its fixed layout: the format and ten
 /// words.
@@ -32,6 +38,7 @@ fn main() {
         "masked_bytes",
         "statement_decode",
         "anchor_decode",
+        "device_verify_bytes",
     ] {
         match std::fs::remove_dir_all(corpus.join(target)) {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
@@ -96,5 +103,15 @@ fn main() {
         };
         write("anchor_decode", &format!("anchor-{at}"), &anchor.encode());
     }
+    let program = device_program::program();
+    let (proof, _) = program
+        .prove(&device_program::WITNESS, MaskRng::Os)
+        .expect("the kernel proves");
+    let bytes = vos_pvm_recair::device::encode(&proof.proof).expect("encodes");
+    write(
+        "device_verify_bytes",
+        "honest",
+        &[&proof.io[..], &bytes].concat(),
+    );
     println!("{} fixtures seeded under {}", all.len(), corpus.display());
 }

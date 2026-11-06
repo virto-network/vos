@@ -7,6 +7,10 @@ use crate::defaults::MAX_HANDLER_GAS;
 use crate::ids::MethodId;
 
 pub const REQUEST: usize = 64 << 10;
+/// A proven call's claim, its kernel's public arguments (a spend's are
+/// about 240 bytes): the log carries it, and a kernel guard's handler takes
+/// it before the call's arguments, which are at most [`REQUEST`] less it.
+pub const CLAIM: usize = 1 << 10;
 /// The largest package an install carries, the ELF a derivation reads.
 pub const MAX_ELF: usize = 64 << 20;
 pub const REPLY: usize = 64 << 10;

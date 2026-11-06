@@ -18,4 +18,7 @@ pub enum DecodeError {
 
     #[error("string is not UTF-8")]
     NotUtf8,
+
+    #[error("bytes left over past the value")]
+    LeftOver,
 }

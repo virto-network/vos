@@ -206,25 +206,27 @@ pub enum Input {
         proof: [u8; 32],
         attested: [u8; 32],
     },
-    /// A credentialed call, its proof verified at ingress: no session, its
+    /// A proven call, its device proof verified at ingress: no session, its
     /// origin the one the proof proved (`identity-and-authority.md` §5).
-    /// The log carries neither the proof, nor its nonce, nor its format.
+    /// The log carries its claim, but neither the proof, nor its nonce, nor
+    /// its format.
     /// Boxed, so every input does not carry its size.
     #[codec(index = 10)]
     Credentialed(alloc::boxed::Box<CredentialedInput>),
 }
 
-/// A credentialed call as the log carries it. Refine refuses it if
-/// `expires_ms` is before the batch's time, if `binding` is recorded, if
-/// an auth call's `root` is not fresh by the batch's time, or if a `once`
-/// guard's nullifier is recorded; else it records `binding` until
-/// `expires_ms` plus [`crate::defaults::BINDING_KEPT_MS`] and runs the
-/// method, its caller `origin`, recording a `once` guard's nullifier only
-/// if the method returns `Ok`.
+/// A proven call as the log carries it. Refine refuses it if `expires_ms`
+/// is before the batch's time, if `binding` is recorded, if a stock auth
+/// claim's root is not fresh by the batch's time, or if a `once` guard's
+/// nullifier is recorded; else it records `binding` until `expires_ms`
+/// plus [`crate::defaults::BINDING_KEPT_MS`] and runs the method, its
+/// caller `origin`, recording a `once` guard's nullifier only if the
+/// method returns `Ok`. A kernel guard's handler takes `claim` as its first
+/// argument, before `arguments`.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct CredentialedInput {
-    /// `Anonymous { scope, nullifier }` for auth, `Owner(digest)` for
-    /// owner.
+    /// `Anonymous { scope, nullifier }` for the stock auth kernel,
+    /// `Owner(digest)` for owner, `Kernel { program }` for an actor's own.
     pub origin: Principal,
     pub instance: InstanceId,
     pub method: MethodId,
@@ -233,8 +235,13 @@ pub struct CredentialedInput {
     pub binding: [u8; 32],
     /// By batch time.
     pub expires_ms: u64,
-    /// Auth's `map_root`; `None` for owner.
-    pub root: Option<[u8; 32]>,
+    /// The kernel's claim, its public arguments: at most
+    /// [`crate::abi::cap::CLAIM`] bytes.
+    pub claim: Vec<u8>,
+    /// The kernel the proof is of: a method of the credential actor for a
+    /// stock guard, of `instance` for a kernel guard, whose apply runs the
+    /// handler only while its guard still names it.
+    pub kernel: MethodId,
 }
 
 /// A client request, in its session's sequence for this agent.

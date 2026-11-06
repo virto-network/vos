@@ -165,7 +165,7 @@ pub struct Config {
     /// The most operator commands' nonces the node keeps at once: past
     /// them, a command is answered busy until some expire.
     pub operator_nonces: usize,
-    /// The most credential proofs the node verifies at once: past them, a
+    /// The most device proofs the node verifies at once: past them, a
     /// credentialed call is answered busy. `None` for twice its executors.
     pub verifications: Option<usize>,
     /// The device formats the operator retired, each at its time in ms,

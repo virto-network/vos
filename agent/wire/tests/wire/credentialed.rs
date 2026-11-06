@@ -1,25 +1,25 @@
-//! A credentialed call's wire (`identity-and-authority.md` §5): the request,
-//! its public digests and refusal codes, the input the log carries, the
-//! origins, the binding digest and the scope, and the system rows apply
-//! keeps.
+//! A proven call's wire (`identity-and-authority.md` §5): the request, its
+//! claim and refusal codes, the stock claims, the input the log carries,
+//! the origins, the binding digest and the scope, and the system rows
+//! apply keeps.
 
 use vos_wire::abi::Refusal;
 use vos_wire::batch::{CredentialedInput, Input};
-use vos_wire::credentials::{self, Bound, Tag};
+use vos_wire::credentials::{self, AuthClaim, Bound, OwnerClaim, Tag};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
-use vos_wire::ingress::{CredentialPublic, CredentialRefusal, Credentialed, Rejection};
+use vos_wire::ingress::{CredentialRefusal, Credentialed, Rejection};
 use vos_wire::keys::{self, Due};
 use vos_wire::result::InputRef;
-use vos_wire::{Decode, Encode, SpaceId};
+use vos_wire::{Decode, Encode, SpaceId, defaults};
 
 fn blake2b(bytes: &[u8]) -> [u8; 32] {
     vos_pvm::precompile::blake2b_256(bytes)
 }
 
-/// The origins' indexes: `Anonymous` 3 and `Owner` 4, each digest its 32
-/// bytes.
+/// The origins' indexes: `Anonymous` 3, `Owner` 4 and `Kernel` 7, each
+/// digest its 32 bytes; 5 and 6 are reserved.
 #[test]
-fn the_origins_are_indexes_three_and_four() {
+fn the_origins_are_indexes_three_four_and_seven() {
     let anonymous = Principal::Anonymous {
         scope: [1; 32],
         nullifier: [2; 32],
@@ -36,10 +36,20 @@ fn the_origins_are_indexes_three_and_four() {
         Principal::decode_exact(&anonymous.encode()),
         Some(anonymous)
     );
+    let kernel = Principal::Kernel { program: [5; 32] };
+    assert_eq!(kernel.encode(), [&[7u8][..], &[5; 32]].concat());
+    assert_eq!(Principal::decode_exact(&kernel.encode()), Some(kernel));
+    for reserved in [5u8, 6] {
+        assert_eq!(
+            Principal::decode_exact(&[&[reserved][..], &[0; 32]].concat()),
+            None
+        );
+    }
 }
 
-/// The request in SCALE, field by field, its public statement's index its
-/// kind; the refusal codes in check order, under `Rejection`'s index 9.
+/// The request in SCALE, field by field, its claim bytes; the stock claims
+/// their digests alone, a claim's binding its last 32 bytes; the refusal
+/// codes in check order, under `Rejection`'s index 9.
 #[test]
 fn the_request_and_its_refusals_encode_as_pinned() {
     let call = Credentialed {
@@ -48,11 +58,8 @@ fn the_request_and_its_refusals_encode_as_pinned() {
         arguments: vec![0xaa, 0xbb],
         nonce: [5; 16],
         expires_ms: 9,
-        format: 38,
-        public: CredentialPublic::Owner {
-            owner: [6; 32],
-            binding: [8; 32],
-        },
+        format: 46,
+        claim: vec![6; 40],
         proof: vec![0xcc],
     };
     let expected = [
@@ -62,41 +69,41 @@ fn the_request_and_its_refusals_encode_as_pinned() {
         &[0xaa, 0xbb],
         &[5; 16],
         &9u64.to_le_bytes(),
-        &38u32.to_le_bytes(),
-        &[1],
-        &[6; 32],
-        &[8; 32],
+        &46u32.to_le_bytes(),
+        &40u32.to_le_bytes(),
+        &[6; 40],
         &1u32.to_le_bytes(),
         &[0xcc],
     ]
     .concat();
     assert_eq!(call.encode(), expected);
     assert_eq!(Credentialed::decode_exact(&expected), Some(call));
-    let auth = CredentialPublic::Auth {
+    let auth = AuthClaim {
         map_root: [1; 32],
         scope: [2; 32],
         nullifier: [3; 32],
         binding: [4; 32],
     };
-    assert_eq!(auth.encode()[0], 0);
-    assert_eq!(auth.kind(), 0);
-    assert_eq!(auth.binding(), &[4; 32]);
-    assert_eq!(
-        auth.origin(),
-        Principal::Anonymous {
-            scope: [2; 32],
-            nullifier: [3; 32]
-        }
-    );
-    let words = auth.words().expect("words below p");
-    assert_eq!(words.len(), 33);
-    assert_eq!(words[0], 0);
-    assert_eq!(words[1], u32::from_le_bytes([1; 4]));
-    let wide = CredentialPublic::Owner {
-        owner: [0xff; 32],
-        binding: [0; 32],
+    let bytes = auth.encode();
+    assert_eq!(bytes, [[1; 32], [2; 32], [3; 32], [4; 32]].concat());
+    assert_eq!(bytes.len(), AuthClaim::BYTES);
+    assert_eq!(credentials::claim_binding(&bytes), Some(&[4; 32]));
+    let owner = OwnerClaim {
+        owner: [6; 32],
+        binding: [8; 32],
     };
-    assert_eq!(wide.words(), None, "a word at or above p");
+    assert_eq!(owner.encode(), [[6; 32], [8; 32]].concat());
+    assert_eq!(owner.encode().len(), OwnerClaim::BYTES);
+    assert_eq!(
+        OwnerClaim::decode_exact(&bytes),
+        None,
+        "auth's is no owner's"
+    );
+    assert_eq!(credentials::claim_binding(&[1; 31]), None);
+    assert_eq!(
+        credentials::claim_binding(&[&[0u8; 8][..], &[9; 32]].concat()),
+        Some(&[9; 32])
+    );
 
     let codes = [
         CredentialRefusal::NoSpace,
@@ -123,10 +130,12 @@ fn the_request_and_its_refusals_encode_as_pinned() {
     );
 }
 
-/// The log's input at `Input`'s index 10, without the proof, the nonce or
-/// the format; its step's reference at `InputRef`'s index 9.
+/// The log's input at `Input`'s index 10, its claim and its kernel beside
+/// the origin,
+/// without the proof, the nonce or the format; its step's reference at
+/// `InputRef`'s index 9.
 #[test]
-fn the_logged_input_carries_the_origin_alone() {
+fn the_logged_input_carries_the_origin_and_the_claim() {
     let input = CredentialedInput {
         origin: Principal::Owner([1; 32]),
         instance: InstanceId(2),
@@ -134,7 +143,8 @@ fn the_logged_input_carries_the_origin_alone() {
         arguments: vec![4],
         binding: [5; 32],
         expires_ms: 6,
-        root: None,
+        claim: vec![7; 3],
+        kernel: MethodId(8),
     };
     let fields = [
         &Principal::Owner([1; 32]).encode()[..],
@@ -144,7 +154,9 @@ fn the_logged_input_carries_the_origin_alone() {
         &[4],
         &[5; 32],
         &6u64.to_le_bytes(),
-        &[0],
+        &3u32.to_le_bytes(),
+        &[7; 3],
+        &8u32.to_le_bytes(),
     ]
     .concat();
     assert_eq!(
@@ -174,7 +186,6 @@ fn the_binding_and_the_scope_are_their_fields_hashes() {
         instance: InstanceId(5),
         method: MethodId(6),
         program: &program,
-        kind: 1,
         arguments: &[7, 8, 9],
         nonce: &nonce,
         expires_ms: 0x0a0b,
@@ -187,7 +198,6 @@ fn the_binding_and_the_scope_are_their_fields_hashes() {
             &5u32.to_le_bytes(),
             &6u32.to_le_bytes(),
             &[0x22; 32],
-            &[1],
             &3u32.to_le_bytes(),
             &[7, 8, 9],
             &[0x33; 16],
@@ -197,7 +207,10 @@ fn the_binding_and_the_scope_are_their_fields_hashes() {
     );
     assert_eq!(bound.digest(), expected);
     let changed = [
-        Bound { kind: 0, ..bound },
+        Bound {
+            program: &[0x23; 32],
+            ..bound
+        },
         Bound {
             arguments: &[7, 8],
             ..bound
@@ -261,8 +274,10 @@ fn the_binding_and_the_scope_are_their_fields_hashes() {
 }
 
 /// The rows apply keeps: the credential actor's instance, each binding
-/// digest, each admitted nullifier by its scope; a binding's row of the
-/// due index names its 32 bytes, and reads back.
+/// digest, each admitted nullifier by its scope; a binding's due row is
+/// in its own index, its time then its 32 bytes, and reads back; each
+/// index lists its own rows, so due bindings never hold a session's row
+/// back.
 #[test]
 fn the_credential_rows_are_their_own_and_read_back() {
     assert_eq!(keys::credentials(), [0x00, 0x26]);
@@ -277,19 +292,30 @@ fn the_credential_rows_are_their_own_and_read_back() {
     let row = keys::due(7, Due::Binding([9; 32]));
     assert_eq!(
         row,
-        [&[0x00, 0x0f][..], &7u64.to_be_bytes(), &[2], &[9; 32]].concat()
+        [&[0x00, 0x2d][..], &7u64.to_be_bytes(), &[9; 32]].concat()
     );
+    assert_eq!(keys::DueIndex::Bindings.prefix(), [0x00, 0x2d]);
     assert_eq!(keys::due_entry(&row), Some((7, Due::Binding([9; 32]))));
     assert_eq!(keys::due_entry(&row[..row.len() - 1]), None);
+    assert_eq!(keys::due_entry(&[&row[..], &[0]].concat()), None);
     let session = keys::due(7, Due::Session(vos_wire::ids::SessionId(1)));
     assert_eq!(
         keys::due_entry(&[&session[..], &[0]].concat()),
         None,
         "a session's id is eight bytes"
     );
-    let rows = [session.clone(), row.clone()];
-    let listed = keys::due_rows(rows.iter().map(Ok::<_, ()>), 7, 8).unwrap();
-    assert_eq!(listed.len(), 2);
+    // More bindings due than a sweep forgets, all before the session's
+    // row: the sweep lists its most of them, and the session's row too.
+    let bindings: Vec<Vec<u8>> = (0..=defaults::SWEEP_BINDINGS as u8)
+        .map(|byte| keys::due(1, Due::Binding([byte; 32])))
+        .collect();
+    let scan = |index: keys::DueIndex| match index {
+        keys::DueIndex::Rows => vec![Ok::<_, ()>(session.clone())],
+        keys::DueIndex::Bindings => bindings.iter().cloned().map(Ok).collect(),
+    };
+    let listed = keys::sweep_rows(scan, 7, 8).unwrap();
+    assert_eq!(listed.len(), 1 + defaults::SWEEP_BINDINGS);
+    assert_eq!(listed[0], (7, Due::Session(vos_wire::ids::SessionId(1))));
 }
 
 /// The ring's row is the credential actor's hashed table `ring`'s one row,

@@ -1,11 +1,12 @@
 //! The device library: the derivation from a source's output, the scope
-//! and the binding, the three proofs verified against their calls and
-//! refused against others, the witness checked before proving, the
-//! prover's configuration, the wire's requests and answers, and the path
-//! kept apart from proofs, a `RootUnknown` answer fetching it again and
-//! proving anew.
+//! and the binding, the stock kernels' proofs verified against their calls
+//! and refused against others, the witness checked before proving, the
+//! prover's configuration, the wire's requests and answers, the path kept
+//! apart from proofs, a `RootUnknown` answer fetching it again and proving
+//! anew, and the stock kernels' programs from their release artifacts.
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use blake2::{Blake2b512, Digest as _};
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -14,18 +15,17 @@ use sha2::Sha256;
 use vos_api::Kind;
 use vos_light::wire::{self, Answer};
 use vos_light::{
-    AuthWitness, Call, CredentialPublic, DeviceError, Digest, FORMAT, PEAK_BYTES, PathKeeper,
-    Prover, ProverConfig, Threads, derive_secret, member, owner, scope, source_input, verify,
-    verify_joint,
+    AuthWitness, Call, DEVICE_FORMAT, DeviceError, DeviceProgram, Digest, PEAK_BYTES, PathKeeper,
+    Proven, Prover, ProverConfig, Threads, derive_secret, member, owner, scope, source_input,
+    verify,
 };
 use vos_wire::credentials::{
-    self, DEPTH, EMPTY, P, Path, RING, Ring, RootEntry, RootRefusal, Siblings, Tag, Words,
-    compress, leaf,
+    self, AuthClaim, DEPTH, EMPTY, OwnerClaim, P, Path, RING, Ring, RootEntry, RootRefusal,
+    Siblings, Tag, Words, compress, leaf,
 };
 use vos_wire::ids::{AgentId, InstanceId, MethodId, derive_id};
 use vos_wire::ingress::{
-    self, Consistency, CredentialRefusal, Credentialed, QueryCall, Rejection, Response,
-    query_message,
+    Consistency, CredentialRefusal, Credentialed, QueryCall, Rejection, Response, query_message,
 };
 use vos_wire::result::Outcome;
 
@@ -111,6 +111,27 @@ fn call(arguments: &[u8]) -> Call {
     }
 }
 
+/// The stock kernels' programs, `auth`'s and `owner`'s, from their release
+/// artifacts: computed once.
+fn programs() -> &'static (DeviceProgram, DeviceProgram) {
+    static PROGRAMS: OnceLock<(DeviceProgram, DeviceProgram)> = OnceLock::new();
+    PROGRAMS.get_or_init(|| {
+        let elf = std::fs::read(vos_testkit::programs::credentials_elf()).unwrap();
+        let program = |kernel| {
+            DeviceProgram::released(&vos_light::release::device(&elf, kernel).unwrap()).unwrap()
+        };
+        (program("auth"), program("owner"))
+    })
+}
+
+fn auth_program() -> &'static DeviceProgram {
+    &programs().0
+}
+
+fn owner_program() -> &'static DeviceProgram {
+    &programs().1
+}
+
 fn prover() -> Prover {
     Prover::new(ProverConfig {
         threads: Threads::Count(4),
@@ -173,7 +194,7 @@ fn the_secret_is_derived_as_pinned() {
 }
 
 /// The scope hashes the space, agent, instance and the name with its
-/// length; the binding every field of the call, the program and the kind.
+/// length; the binding every field of the call and the program.
 #[test]
 fn the_scope_and_the_binding_name_the_call() {
     let space = [0x51; 32];
@@ -213,7 +234,7 @@ fn the_scope_and_the_binding_name_the_call() {
 
     let base = call(b"args");
     let program = [3; 32];
-    let b = base.binding_digest(&program, 0);
+    let b = base.binding_digest(&program);
     let changed = [
         Call {
             space: [0; 32],
@@ -245,12 +266,11 @@ fn the_scope_and_the_binding_name_the_call() {
         },
     ];
     for other in &changed {
-        assert_ne!(other.binding_digest(&program, 0), b);
+        assert_ne!(other.binding_digest(&program), b);
     }
-    assert_ne!(base.binding_digest(&[4; 32], 0), b);
-    assert_ne!(base.binding_digest(&program, 1), b);
+    assert_ne!(base.binding_digest(&[4; 32]), b);
     assert_eq!(
-        base.binding(&program, 0),
+        base.binding(&program),
         Digest(compress(&Tag::Binding.block(), &credentials::reduced(&b)))
     );
     let fresh = Call::new([0x51; 32], 4, 2, 1, Vec::new(), 1).unwrap();
@@ -287,9 +307,9 @@ fn a_method_id_and_a_transfer_s_arguments_are_the_node_s() {
     );
 }
 
-/// Auth, owner and membership and payment prove and verify against their
+/// Auth and owner prove by the stock kernels and verify against their
 /// calls; each is refused against another call, another name, another
-/// format or another kind's words.
+/// format, another program or another claim.
 #[test]
 fn each_proof_verifies_against_its_call_alone() {
     let prover = prover();
@@ -297,114 +317,93 @@ fn each_proof_verifies_against_its_call_alone() {
     let tree = tree_with(&secret, 0x8000_0001);
     let witness = tree.witness(0x8000_0001);
     let call = call(b"yes");
+    let (auth_program, owner_program) = (auth_program(), owner_program());
 
-    let auth = prover.prove_auth(&secret, &witness, NAME, &call).unwrap();
-    assert_eq!(auth.format, FORMAT);
-    verify(&auth, &call, Some(NAME)).unwrap();
-    let CredentialPublic::Auth {
-        map_root,
-        scope: proved,
-        ..
-    } = auth.public
-    else {
-        panic!("an auth statement");
-    };
-    assert_eq!(map_root, tree.root());
+    let auth = prover
+        .prove_auth(&secret, &witness, NAME, &call, auth_program)
+        .unwrap();
+    assert_eq!(auth.format, DEVICE_FORMAT);
+    verify(&auth, &call, auth_program, Some(NAME)).unwrap();
+    let claim = AuthClaim::decode_exact(&auth.claim).expect("auth's claim, its digests alone");
+    assert_eq!(claim.map_root, tree.root().to_bytes());
     assert_eq!(
-        Some(proved),
-        scope(&call.space, call.agent, call.instance, NAME)
+        Some(claim.scope),
+        scope(&call.space, call.agent, call.instance, NAME).map(|scope| scope.to_bytes())
     );
+    assert_eq!(claim.binding, call.binding(auth_program.id()).to_bytes());
     assert_eq!(
-        verify(&auth, &self::call(b"no"), Some(NAME)),
+        verify(&auth, &self::call(b"no"), auth_program, Some(NAME)),
         Err(DeviceError::Verify)
     );
     assert_eq!(
-        verify(&auth, &call, Some(b"vote")),
+        verify(&auth, &call, auth_program, Some(b"vote")),
         Err(DeviceError::Verify)
     );
-    assert_eq!(verify(&auth, &call, None), Err(DeviceError::Verify));
-    // Words the call does not fix, changed: refused by the proof itself.
-    let CredentialPublic::Auth {
-        scope: s,
-        nullifier,
-        binding,
-        ..
-    } = auth.public
-    else {
-        unreachable!()
-    };
-    for (map_root, nullifier) in [
-        (map_root, Digest(compress(&nullifier.0, &nullifier.0))),
-        (Tree::default().root(), nullifier),
+    assert_eq!(
+        verify(&auth, &call, owner_program, Some(NAME)),
+        Err(DeviceError::Verify),
+        "another program"
+    );
+    // Digests the call does not fix, changed: refused by the proof itself.
+    for changed in [
+        AuthClaim {
+            nullifier: Digest(compress(&[1; 8], &[2; 8])).to_bytes(),
+            ..claim
+        },
+        AuthClaim {
+            map_root: Tree::default().root().to_bytes(),
+            ..claim
+        },
     ] {
-        let changed = vos_light::CredentialProof {
-            public: CredentialPublic::Auth {
-                map_root,
-                scope: s,
-                nullifier,
-                binding,
-            },
+        let changed = Proven {
+            claim: changed.encode(),
             ..auth.clone()
         };
         assert_eq!(
-            verify(&changed, &call, Some(NAME)),
+            verify(&changed, &call, auth_program, Some(NAME)),
             Err(DeviceError::Verify)
         );
     }
-    let relabelled = vos_light::CredentialProof {
+    let relabelled = Proven {
         format: 38,
         ..auth.clone()
     };
     assert_eq!(
-        verify(&relabelled, &call, Some(NAME)),
+        verify(&relabelled, &call, auth_program, Some(NAME)),
         Err(DeviceError::Verify)
     );
     let mut tampered = auth.clone();
     let last = tampered.proof.len() - 1;
     tampered.proof[last] ^= 1;
     assert_eq!(
-        verify(&tampered, &call, Some(NAME)),
+        verify(&tampered, &call, auth_program, Some(NAME)),
         Err(DeviceError::Verify)
     );
 
-    let paid = prover.prove_owner(&secret, &call).unwrap();
-    verify(&paid, &call, None).unwrap();
+    let paid = prover.prove_owner(&secret, &call, owner_program).unwrap();
+    verify(&paid, &call, owner_program, None).unwrap();
+    let claimed = OwnerClaim::decode_exact(&paid.claim).expect("owner's claim");
+    assert_eq!(claimed.owner, owner(&secret).to_bytes());
     assert_eq!(
-        paid.public,
-        CredentialPublic::Owner {
-            owner: owner(&secret),
-            binding: *paid.public.binding()
-        }
+        verify(&paid, &self::call(b"no"), owner_program, None),
+        Err(DeviceError::Verify)
     );
     assert_eq!(
-        verify(&paid, &self::call(b"no"), None),
-        Err(DeviceError::Verify)
+        verify(&paid, &call, owner_program, Some(NAME)),
+        Err(DeviceError::Verify),
+        "an owner claim is no auth claim"
     );
     // Another secret's owner digest under this proof: refused.
-    let other = vos_light::CredentialProof {
-        public: CredentialPublic::Owner {
-            owner: owner(&self::secret(2)),
-            binding: *paid.public.binding(),
-        },
+    let other = Proven {
+        claim: OwnerClaim {
+            owner: owner(&self::secret(2)).to_bytes(),
+            ..claimed
+        }
+        .encode(),
         ..paid.clone()
     };
-    assert_eq!(verify(&other, &call, None), Err(DeviceError::Verify));
-
-    let joint = prover
-        .prove_membership_and_payment(&secret, &witness, NAME, &call)
-        .unwrap();
-    verify_joint(&joint, &call, NAME).unwrap();
-    assert_eq!(joint.public.owner, owner(&secret));
     assert_eq!(
-        joint.public.nullifier,
-        match auth.public {
-            CredentialPublic::Auth { nullifier, .. } => nullifier,
-            _ => unreachable!(),
-        }
-    );
-    assert_ne!(joint.public.binding, *auth.public.binding());
-    assert_eq!(
-        verify_joint(&joint, &self::call(b"no"), NAME),
+        verify(&other, &call, owner_program, None),
         Err(DeviceError::Verify)
     );
 }
@@ -419,7 +418,8 @@ fn a_bad_witness_is_refused_before_proving() {
     let tree = tree_with(&secret, 5);
     let witness = tree.witness(5);
     let call = call(b"yes");
-    let refused = |witness: &AuthWitness| prover.prove_auth(&secret, witness, NAME, &call);
+    let refused =
+        |witness: &AuthWitness| prover.prove_auth(&secret, witness, NAME, &call, auth_program());
     let elsewhere = tree.witness(0);
     assert_eq!(refused(&elsewhere).unwrap_err(), DeviceError::Witness);
     let mut sibling = witness.clone();
@@ -433,22 +433,24 @@ fn a_bad_witness_is_refused_before_proving() {
     assert_eq!(refused(&slot).unwrap_err(), DeviceError::Witness);
     assert_eq!(
         prover
-            .prove_membership_and_payment(&self::secret(2), &witness, NAME, &call)
+            .prove_auth(&self::secret(2), &witness, NAME, &call, auth_program())
             .unwrap_err(),
         DeviceError::Witness
     );
     assert_eq!(
         prover
-            .prove_auth(&secret, &witness, b"", &call)
+            .prove_auth(&secret, &witness, b"", &call, auth_program())
             .unwrap_err(),
         DeviceError::Config
     );
     let long = Call {
-        arguments: vec![0; vos_wire::abi::cap::REQUEST + 1],
+        arguments: vec![0; vos_wire::abi::cap::REQUEST - vos_wire::abi::cap::CLAIM + 1],
         ..call.clone()
     };
     assert_eq!(
-        prover.prove_owner(&secret, &long).unwrap_err(),
+        prover
+            .prove_owner(&secret, &long, owner_program())
+            .unwrap_err(),
         DeviceError::Config
     );
 }
@@ -484,8 +486,10 @@ fn the_configuration_is_checked() {
     .unwrap();
     assert_eq!(pinned.threads(), 2);
     let secret = secret(3);
-    let proof = pinned.prove_owner(&secret, &call(b"")).unwrap();
-    verify(&proof, &call(b""), None).unwrap();
+    let proof = pinned
+        .prove_owner(&secret, &call(b""), owner_program())
+        .unwrap();
+    verify(&proof, &call(b""), owner_program(), None).unwrap();
 }
 
 /// The requests: `Time` its kind alone; `path` and `root()` queries signed
@@ -566,7 +570,7 @@ fn the_wire_requests_and_answers() {
     let prover = prover();
     let secret = secret(1);
     let call = call(b"yes");
-    let proof = prover.prove_owner(&secret, &call).unwrap();
+    let proof = prover.prove_owner(&secret, &call, owner_program()).unwrap();
     let request = wire::credentialed(&call, &proof);
     assert_eq!(request[..2], (Kind::Credentialed as u16).to_le_bytes());
     let (agent, body) = <(AgentId, Credentialed)>::decode_exact(&request[2..]).unwrap();
@@ -579,11 +583,12 @@ fn the_wire_requests_and_answers() {
             arguments: call.arguments.clone(),
             nonce: call.nonce,
             expires_ms: call.expires_ms,
-            format: FORMAT,
-            public: ingress::CredentialPublic::Owner {
+            format: DEVICE_FORMAT,
+            claim: OwnerClaim {
                 owner: owner(&secret).to_bytes(),
-                binding: proof.public.binding().to_bytes(),
-            },
+                binding: call.binding(owner_program().id()).to_bytes(),
+            }
+            .encode(),
             proof: proof.proof.clone(),
         }
     );
@@ -695,7 +700,9 @@ fn a_root_unknown_answer_fetches_the_path_again_and_proves_anew() {
     keeper.update(tree.witness(slot), 10).unwrap();
     let call = call(b"yes");
     let held = keeper.witness().unwrap().clone();
-    let first = prover.prove_auth(&secret, &held, NAME, &call).unwrap();
+    let first = prover
+        .prove_auth(&secret, &held, NAME, &call, auth_program())
+        .unwrap();
     assert_eq!(ring.accepts(&held.root.to_bytes(), 10), Ok(()));
 
     // 64 batches, each enrolling one member: one second apart, well within
@@ -720,30 +727,20 @@ fn a_root_unknown_answer_fetches_the_path_again_and_proves_anew() {
     // Ingress's answer: `Rejected(Credential(RootUnknown))`.
     let answer = [2, 9, 10];
     assert_eq!(wire::credentialed_answer(&answer), Ok(Answer::RootUnknown));
-    verify(&first, &call, Some(NAME)).unwrap();
+    verify(&first, &call, auth_program(), Some(NAME)).unwrap();
     keeper.unknown();
     assert!(keeper.due(now, None));
     keeper.update(tree.witness(slot), now).unwrap();
     let fresh = keeper.witness().unwrap();
     assert_ne!(fresh.root, held.root);
-    let again = prover.prove_auth(&secret, fresh, NAME, &call).unwrap();
-    let CredentialPublic::Auth {
-        map_root,
-        nullifier,
-        ..
-    } = again.public
-    else {
-        panic!("an auth statement");
-    };
-    assert_eq!(ring.accepts(&map_root.to_bytes(), now), Ok(()));
-    verify(&again, &call, Some(NAME)).unwrap();
-    let CredentialPublic::Auth {
-        nullifier: before, ..
-    } = first.public
-    else {
-        unreachable!()
-    };
-    assert_eq!(nullifier, before, "one pseudonym in one scope");
+    let again = prover
+        .prove_auth(&secret, fresh, NAME, &call, auth_program())
+        .unwrap();
+    let claim = AuthClaim::decode_exact(&again.claim).unwrap();
+    assert_eq!(ring.accepts(&claim.map_root, now), Ok(()));
+    verify(&again, &call, auth_program(), Some(NAME)).unwrap();
+    let before = AuthClaim::decode_exact(&first.claim).unwrap().nullifier;
+    assert_eq!(claim.nullifier, before, "one pseudonym in one scope");
 }
 
 /// The stock kernels' release artifacts, computed from the credential
@@ -752,7 +749,6 @@ fn a_root_unknown_answer_fetches_the_path_again_and_proves_anew() {
 /// whose shape or id is not the artifact's refused.
 #[test]
 fn the_stock_kernels_programs_come_from_their_release_artifacts() {
-    use vos_light::DeviceProgram;
     let elf = std::fs::read(vos_testkit::programs::credentials_elf()).unwrap();
     let devices = vos_light::release::devices(&elf).unwrap();
     let methods: Vec<MethodId> = devices.iter().map(|device| device.method).collect();

@@ -21,9 +21,8 @@
 //!   set and Merkle channel: the masks, salts, blinding and FRI mask in the
 //!   masked transcript's order, R1 checked on the transcript, the randomness
 //!   hedged.
-//! - [`credential`] proves the credential statements (auth, owner, and
-//!   membership and payment together) masked over `p2` and `qm31` alone,
-//!   under format 44 on the Blake2s-M31 channel.
+//! - [`device`] is a device kernel's program and proof under the device
+//!   format, on the Blake2s-M31 channel.
 //!
 //! Behind the `recursion` feature, on by default (a device builds without
 //! it):
@@ -42,7 +41,6 @@
 pub mod circuit;
 pub mod compile;
 pub mod context;
-pub mod credential;
 pub mod device;
 #[cfg(feature = "recursion")]
 pub mod fold;

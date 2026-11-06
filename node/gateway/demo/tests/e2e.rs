@@ -5,8 +5,8 @@
 //! tree's device library, its secret source a software HMAC key and its
 //! chrome a script. The client enrolls, the operator invites the two
 //! digests it shows, it claims them, signs in on the path it fetched apart,
-//! by a credential proof and by a device proof of the device actor's
-//! kernel (pinned at enrollment), under one pseudonym, and pays: what the
+//! by the stock auth kernel and by the device actor's own kernel (pinned
+//! at enrollment), under one pseudonym, and pays: what the
 //! chrome confirmed is paid, whatever the document's
 //! fields held, and a request naming another method is refused by the
 //! gateway before any node.
@@ -523,11 +523,8 @@ async fn a_request_naming_another_method_never_reaches_the_node() {
             arguments: Vec::new(),
             nonce: [7; 16],
             expires_ms: 0,
-            format: 44,
-            public: vos_wire::ingress::CredentialPublic::Owner {
-                owner: [0; 32],
-                binding: [0; 32],
-            },
+            format: 46,
+            claim: vec![0; 64],
             proof: vec![0; 64],
         };
         let mut bytes = (vos_api::Kind::Credentialed as u16).to_le_bytes().to_vec();

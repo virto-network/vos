@@ -1,27 +1,17 @@
 //! Device kernels proved under the device profile (`proving.md` §8): a
-//! kernel's program, computed from the
-//! kernel as a space's ingress computes it, a run of it proved against
-//! that program, and auth's statement proved by a device kernel, which
-//! ingress takes as it takes auth's credential proof.
+//! kernel's program, from its release artifact as the app embeds it (or
+//! computed from the kernel as a space's ingress computes it), and a run
+//! of it proved against that program.
 
 use vos_pvm_recair::device::{self as profile, Program};
-use vos_wire::credentials::Words;
 use vos_wire::ids::MethodId;
 use vos_wire::ingress::DeviceWindow;
-use zeroize::Zeroize;
 
-use crate::prover::auth_digests;
 use crate::release::Device;
-use crate::secret::DeviceSecret;
-use crate::{AuthWitness, Call, CredentialProof, CredentialPublic, DeviceError, Prover, scope};
+use crate::{DeviceError, Prover};
 
 /// The device format's number, the registry's: format 46.
 pub const DEVICE_FORMAT: u32 = profile::FORMAT.number;
-
-/// The most memory a device kernel's proof takes, in bytes: the device budget,
-/// above the auth kernel's peak resident size measured on the gate phone
-/// (0.70 GiB). A prover allowing less refuses to prove one.
-pub const DEVICE_PEAK_BYTES: u64 = 1 << 30;
 
 /// A device kernel's program under the device format: the chips its code
 /// reaches, a log size each and the preprocessed root they commit, all
@@ -73,14 +63,17 @@ impl DeviceProgram {
     }
 
     /// Verifies `proof`'s bytes under this program against its io-hash,
-    /// which a caller holding the statement's words computes itself.
+    /// which a caller holding the claim computes itself ([`claim_io`]).
     pub fn verify(&self, proof: &DeviceProof) -> Result<(), DeviceError> {
         if proof.format != DEVICE_FORMAT {
             return Err(DeviceError::Verify);
         }
-        self.0
-            .verify(&proof.io, &proof.proof)
-            .map_err(|_| DeviceError::Verify)
+        self.verify_io(&proof.io, &proof.proof)
+    }
+
+    /// Verifies a proof's bytes `proof` under this program against `io`.
+    pub(crate) fn verify_io(&self, io: &[u8; 32], proof: &[u8]) -> Result<(), DeviceError> {
+        self.0.verify(io, proof).map_err(|_| DeviceError::Verify)
     }
 }
 
@@ -121,11 +114,11 @@ pub fn choose<'a>(
         })
 }
 
-/// The io-hash a device kernel of auth's statement states for its public
-/// arguments `public` (the SCALE encoding of auth's `CredentialPublic`):
-/// `H_io` of them, no output, no root; `None` past `H_io`'s bound.
-pub fn auth_io(public: &[u8]) -> Option<[u8; 32]> {
-    profile::auth_io(public)
+/// The io-hash a device kernel states for its claim `claim`, its public
+/// arguments' encoding: `H_io` of it, no output, no root; `None` past
+/// `H_io`'s bound.
+pub fn claim_io(claim: &[u8]) -> Option<[u8; 32]> {
+    profile::claim_io(claim)
 }
 
 /// A device kernel's proof: the io-hash its run states and the proof's
@@ -142,16 +135,12 @@ impl Prover {
     /// `program`'s kernel run on `arguments`, through its witness input,
     /// proved under the device format in this prover's pool. A run that
     /// does not halt, or needs more rows than the program's shape, is
-    /// [`DeviceError::Prove`]; an allowance below [`DEVICE_PEAK_BYTES`] is
-    /// [`DeviceError::Memory`].
+    /// [`DeviceError::Prove`].
     pub fn prove_kernel(
         &self,
         program: &DeviceProgram,
         arguments: &[u8],
     ) -> Result<DeviceProof, DeviceError> {
-        if self.max_memory < DEVICE_PEAK_BYTES {
-            return Err(DeviceError::Memory);
-        }
         self.pool.install(|| {
             let (proof, _) = program
                 .0
@@ -164,87 +153,6 @@ impl Prover {
             })
         })
     }
-
-    /// Proves auth's statement with device kernel `program`: `secret`'s
-    /// member holds the leaf `witness` places under its root, and its
-    /// nullifier in the scope of the guard named `name`, for `call`, the
-    /// binding naming the program. The witness is checked first, as
-    /// [`Prover::prove_auth`] checks it. The proof is what a `Credentialed`
-    /// request carries under the device format.
-    pub fn prove_device_auth(
-        &self,
-        secret: &DeviceSecret,
-        witness: &AuthWitness,
-        name: &[u8],
-        call: &Call,
-        program: &DeviceProgram,
-    ) -> Result<CredentialProof, DeviceError> {
-        let public = auth_digests(secret, witness, name, call, program.id(), 0)?;
-        let bytes = profile::auth_public(
-            &public.map_root.to_bytes(),
-            &public.scope.to_bytes(),
-            &public.nullifier.to_bytes(),
-            &public.binding.to_bytes(),
-        );
-        let siblings: [Words; vos_wire::credentials::DEPTH] =
-            witness.siblings.map(|sibling| sibling.0);
-        let mut arguments = profile::auth_arguments(&siblings, &secret.0, witness.slot, &bytes);
-        let proved = self.prove_kernel(program, &arguments);
-        arguments.zeroize();
-        let proof = proved?;
-        if Some(proof.io) != profile::auth_io(&bytes) {
-            return Err(DeviceError::Prove);
-        }
-        Ok(CredentialProof {
-            format: DEVICE_FORMAT,
-            public: CredentialPublic::Auth {
-                map_root: public.map_root,
-                scope: public.scope,
-                nullifier: public.nullifier,
-                binding: public.binding,
-            },
-            proof: proof.proof,
-        })
-    }
-}
-
-/// Verifies a device proof of auth's statement against `call` as ingress
-/// does: its format the device format, its binding `call`'s under
-/// `program`'s id, its scope the one the guard named `name` gives, then the
-/// proof under `program` against the io-hash of its words.
-pub fn verify_device(
-    proof: &CredentialProof,
-    call: &Call,
-    name: &[u8],
-    program: &DeviceProgram,
-) -> Result<(), DeviceError> {
-    let CredentialPublic::Auth {
-        map_root,
-        scope: proved,
-        nullifier,
-        binding,
-    } = proof.public
-    else {
-        return Err(DeviceError::Verify);
-    };
-    if proof.format != DEVICE_FORMAT
-        || call.check().is_err()
-        || binding != call.binding(program.id(), 0)
-        || scope(&call.space, call.agent, call.instance, name) != Some(proved)
-    {
-        return Err(DeviceError::Verify);
-    }
-    let bytes = profile::auth_public(
-        &map_root.to_bytes(),
-        &proved.to_bytes(),
-        &nullifier.to_bytes(),
-        &binding.to_bytes(),
-    );
-    let io = profile::auth_io(&bytes).ok_or(DeviceError::Verify)?;
-    program
-        .0
-        .verify(&io, &proof.proof)
-        .map_err(|_| DeviceError::Verify)
 }
 
 #[cfg(test)]

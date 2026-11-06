@@ -229,15 +229,16 @@ impl Builder {
         Ok(result)
     }
 
-    /// The sweep a batch at `time` starts with: the rows of the due index
+    /// The sweep a batch at `time` starts with: the rows of the due indexes
     /// due by then, the earliest first, at most a sweep's, as a VOS leader
     /// lists them; `None` when none is due.
     pub fn sweep(&self, time: u64) -> Result<Option<Input>, Error> {
         let view = self.store.view();
-        let rows = view
-            .rows_from(&keys::due_prefix())
-            .map(|row| row.map(|(key, _)| key));
-        let due = keys::due_rows(rows, time, defaults::SWEEP_LIMIT)?;
+        let scan = |index: keys::DueIndex| {
+            view.rows_from(index.prefix())
+                .map(|row| row.map(|(key, _)| key))
+        };
+        let due = keys::sweep_rows(scan, time, defaults::SWEEP_LIMIT)?;
         Ok((!due.is_empty()).then_some(Input::Sweep { due }))
     }
 

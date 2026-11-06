@@ -1,14 +1,16 @@
-//! Credentialed calls at the node's ingress (`identity-and-authority.md`
-//! §5), on three nodes of a founded space, with proofs made as a device
-//! makes them: each refusal in its check order; a proof replayed, and a
-//! `once` nullifier raced past ingress at another replica, each refused at
-//! apply; a root a replica has not applied, one replaced at its own batch
-//! time and one pushed out of the ring, each `RootUnknown` and admitted
-//! after a path refetch; a revoked member's root refused once
-//! `ROOT_MAX_AGE` has passed by batch time; owner proofs paying from their
-//! rows; no log entry holding a proof; a verified call holding no large
-//! body's place while it waits to apply; and the device library's
-//! requests and proofs admitted as they leave it.
+//! Proven calls at the node's ingress (`identity-and-authority.md` §5,
+//! `light-node.md` §4.3), on three nodes of a founded space, with proofs
+//! made as a device makes them, by the stock kernels' release artifacts:
+//! each refusal in its check order; a proof replayed, and a `once`
+//! nullifier raced past ingress at another replica, each refused at apply;
+//! a root a replica has not applied, one replaced at its own batch time
+//! and one pushed out of the ring, each `RootUnknown` and admitted after a
+//! path refetch; a revoked member's root refused once `ROOT_MAX_AGE` has
+//! passed by batch time; owner proofs paying from their rows; no log entry
+//! holding a proof; a verified call holding no large body's place while it
+//! waits to apply; the device library's requests and proofs admitted as
+//! they leave it; an actor's own kernel's proof run by its handler on its
+//! claim; and compatibility windows across a credential actor's upgrade.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,17 +20,15 @@ use ed25519_dalek::SigningKey;
 use vos_checker::Nodes;
 use vos_checker::calls::installed;
 use vos_checker::programs::{actor, actor_elf, credentials, credentials_elf, method};
+use vos_light::release::Device;
+use vos_light::{AuthWitness, Call, DEVICE_FORMAT, DeviceProgram, Prover, ProverConfig, Threads};
 use vos_node::client::{self, Client};
-use vos_pvm_final_verifier::credential as verifier;
-use vos_pvm_recair::credential::{AuthPublic, AuthWitness, OwnerPublic, Statement, prove};
-use vos_pvm_recair::masked::MaskRng;
 use vos_wire::abi::Refusal;
-use vos_wire::credentials::{self as tree, Bound, Digest, Path, RootEntry, Tag, Words};
+use vos_wire::credentials::{self as tree, AuthClaim, Bound, Digest, Path, RootEntry};
 use vos_wire::defaults::ROOT_MAX_AGE;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
 use vos_wire::ingress::{
-    CredentialPublic, CredentialRefusal, Credentialed, DeviceWindow, FormatWindow, Rejection,
-    Response,
+    CredentialRefusal, Credentialed, DeviceWindow, FormatWindow, Rejection, Response,
 };
 use vos_wire::peer::NodeNumber;
 use vos_wire::records::RETIREMENT_MS;
@@ -45,41 +45,49 @@ const POLL: InstanceId = InstanceId(3);
 /// The registrar's and the operator's role byte: one key holds both.
 const ROLE: u8 = 1;
 const OPERATOR: [u8; 32] = [21; 32];
+/// The space's handle, which the credential actor is founded with.
+const HANDLE: [u8; 32] = [0x42; 32];
 
-fn compress(left: &Words, right: &Words) -> Words {
-    tree::compress(left, right)
-}
-
-/// A member's device secret, and the digests it gives.
-#[derive(Clone, Copy)]
-struct Secret(Words);
+/// A member's device secret, from a source's output of its seed, and the
+/// digests it gives.
+struct Secret(vos_light::DeviceSecret);
 
 impl Secret {
     fn new(seed: u32) -> Self {
-        Self(core::array::from_fn(|i| seed * 1_000 + i as u32 + 1))
+        let mut output = [0u8; 32];
+        output[..4].copy_from_slice(&seed.to_le_bytes());
+        Self(vos_light::derive_secret(&output, &HANDLE))
     }
 
     fn member(&self) -> Digest {
-        tree::digest(&compress(&Tag::Member.block(), &self.0))
+        vos_light::member(&self.0).to_bytes()
     }
 
     fn owner(&self) -> Digest {
-        tree::digest(&compress(&Tag::Owner.block(), &self.0))
-    }
-
-    fn nullifier(&self, scope: &Digest) -> Digest {
-        let key = compress(&Tag::Nf.block(), &self.0);
-        tree::digest(&compress(&key, &tree::words(scope).unwrap()))
+        vos_light::owner(&self.0).to_bytes()
     }
 }
 
-fn words(digest: &Digest) -> Words {
-    tree::words(digest).expect("a digest's words")
+/// The stock kernel `kernel`'s release artifact, from the credential
+/// actor's ELF `elf`, as an app embeds it.
+fn stock(elf: &[u8], kernel: &str) -> Device {
+    vos_light::release::device(elf, kernel).expect("a stock kernel's release artifact")
+}
+
+/// A path as the device library holds it.
+fn witness(path: &Path) -> AuthWitness {
+    let digest = |bytes: &Digest| vos_light::Digest::from_bytes(bytes).expect("a digest");
+    AuthWitness {
+        root: digest(&path.root),
+        slot: path.slot,
+        siblings: path.siblings.0.map(|sibling| digest(&sibling)),
+    }
 }
 
 /// The founded space's agent: the credential actor, the poll and the
 /// purses' ledger installed, the operator's key their registrar and
-/// operator, the actor founded.
+/// operator, the actor founded; the stock kernels' programs, from their
+/// release artifacts, and a prover.
 struct Founded {
     cluster: Cluster,
     agent: AgentId,
@@ -89,6 +97,9 @@ struct Founded {
     poll: Vec<u8>,
     purses: Vec<u8>,
     nonce: AtomicU64,
+    auth: DeviceProgram,
+    owner: DeviceProgram,
+    prover: Prover,
 }
 
 impl Founded {
@@ -100,8 +111,9 @@ impl Founded {
             .create_replicated((1..=NODES).collect())
             .unwrap();
         let elf = |path: std::path::PathBuf| std::fs::read(path).unwrap();
+        let credentials_elf = elf(credentials_elf());
         let installs = [
-            (CREDENTIALS, elf(credentials_elf()), "registrar"),
+            (CREDENTIALS, credentials_elf.clone(), "registrar"),
             (POLL, elf(actor_elf("poll")), "operator"),
             (PURSES, elf(actor_elf("purses")), "operator"),
         ];
@@ -121,6 +133,7 @@ impl Founded {
         let operator = Client::new(cluster.target(leader), key).with_routes(cluster.routes());
         let space = cluster.space.id();
         assert_ne!(space, SpaceId::NONE);
+        let program = |kernel| DeviceProgram::released(&stock(&credentials_elf, kernel)).unwrap();
         let founded = Self {
             cluster,
             agent,
@@ -130,8 +143,15 @@ impl Founded {
             poll: actor("poll"),
             purses: actor("purses"),
             nonce: AtomicU64::new(0),
+            auth: program("auth"),
+            owner: program("owner"),
+            prover: Prover::new(ProverConfig {
+                threads: Threads::Count(4),
+                ..ProverConfig::default()
+            })
+            .unwrap(),
         };
-        founded.write(CREDENTIALS, "found", [0x42u8; 32]);
+        founded.write(CREDENTIALS, "found", HANDLE);
         founded
     }
 
@@ -205,9 +225,43 @@ impl Founded {
         tree::scope(&self.space, self.agent, instance, name.as_bytes())
     }
 
+    /// The device library's call of `instance`'s `name` with a fresh nonce,
+    /// good for a minute by node `at`'s clock.
+    fn call<A: Encode>(
+        &self,
+        at: NodeNumber,
+        instance: InstanceId,
+        name: &str,
+        arguments: A,
+    ) -> Call {
+        self.call_of(at, instance, self.method(instance, name), arguments)
+    }
+
+    /// [`Founded::call`] of `instance`'s `method`.
+    fn call_of<A: Encode>(
+        &self,
+        at: NodeNumber,
+        instance: InstanceId,
+        method: MethodId,
+        arguments: A,
+    ) -> Call {
+        let mut nonce = [0u8; 16];
+        let count = self.nonce.fetch_add(1, Ordering::SeqCst) + 1;
+        nonce[..8].copy_from_slice(&count.to_le_bytes());
+        Call {
+            space: self.space.0,
+            agent: self.agent.0,
+            instance: instance.0,
+            method: method.0,
+            arguments: arguments.encode(),
+            nonce,
+            expires_ms: client::time(self.cluster.target(at)).unwrap() + 60_000,
+        }
+    }
+
     /// An auth call of the poll's `name`, in the guard `scope`'s scope, by
     /// `secret` under `path`, good for a minute by node `at`'s clock: its
-    /// proof made.
+    /// proof made by the stock `auth` kernel.
     fn auth<A: Encode>(
         &self,
         at: NodeNumber,
@@ -216,38 +270,18 @@ impl Founded {
         (name, scope): (&str, &str),
         arguments: A,
     ) -> Credentialed {
-        let scope = self.scope(POLL, scope);
-        let mut call = self.unproved(at, POLL, name, arguments);
-        call.public = CredentialPublic::Auth {
-            map_root: path.root,
-            scope,
-            nullifier: secret.nullifier(&scope),
-            binding: self.binding(&call, 0),
-        };
-        let CredentialPublic::Auth {
-            map_root,
-            nullifier,
-            binding,
-            ..
-        } = call.public
-        else {
-            unreachable!()
-        };
-        let statement = Statement::Auth(
-            AuthPublic {
-                map_root: words(&map_root),
-                scope: words(&scope),
-                nullifier: words(&nullifier),
-                binding: words(&binding),
-            },
-            AuthWitness {
-                secret: secret.0,
-                slot: path.slot,
-                siblings: path.siblings.0.map(|sibling| words(&sibling)),
-            },
-        );
-        call.proof = proof(&statement);
-        call
+        let call = self.call(at, POLL, name, arguments);
+        let proof = self
+            .prover
+            .prove_auth(
+                &secret.0,
+                &witness(path),
+                scope.as_bytes(),
+                &call,
+                &self.auth,
+            )
+            .unwrap();
+        request(&call, proof)
     }
 
     /// An owner call of the purses' `transfer`, by `secret`.
@@ -260,24 +294,16 @@ impl Founded {
         amount: u64,
     ) -> Credentialed {
         let arguments = (from.as_bytes().to_vec(), to.as_bytes().to_vec(), amount);
-        let mut call = self.unproved(at, PURSES, "transfer", arguments);
-        call.public = CredentialPublic::Owner {
-            owner: secret.owner(),
-            binding: self.binding(&call, 1),
-        };
-        let statement = Statement::Owner(
-            OwnerPublic {
-                owner: words(&secret.owner()),
-                binding: words(call.public.binding()),
-            },
-            secret.0,
-        );
-        call.proof = proof(&statement);
-        call
+        let call = self.call(at, PURSES, "transfer", arguments);
+        let proof = self
+            .prover
+            .prove_owner(&secret.0, &call, &self.owner)
+            .unwrap();
+        request(&call, proof)
     }
 
-    /// A call of `instance`'s `name` with a fresh nonce, good for a minute
-    /// by node `at`'s clock, its public statement and proof empty.
+    /// A call of `instance`'s `name` as [`Founded::call`] makes it, its
+    /// claim and proof empty.
     fn unproved<A: Encode>(
         &self,
         at: NodeNumber,
@@ -285,37 +311,26 @@ impl Founded {
         name: &str,
         arguments: A,
     ) -> Credentialed {
-        let mut nonce = [0u8; 16];
-        let count = self.nonce.fetch_add(1, Ordering::SeqCst) + 1;
-        nonce[..8].copy_from_slice(&count.to_le_bytes());
-        Credentialed {
-            instance,
-            method: self.method(instance, name),
-            arguments: arguments.encode(),
-            nonce,
-            expires_ms: client::time(self.cluster.target(at)).unwrap() + 60_000,
-            format: verifier::FORMAT,
-            public: CredentialPublic::Owner {
-                owner: [0; 32],
-                binding: [0; 32],
+        let call = self.call(at, instance, name, arguments);
+        request(
+            &call,
+            vos_light::Proven {
+                format: DEVICE_FORMAT,
+                claim: Vec::new(),
+                proof: Vec::new(),
             },
-            proof: Vec::new(),
-        }
+        )
     }
 
-    /// The public `binding` of `call` as a statement of `kind` states it.
-    fn binding(&self, call: &Credentialed, kind: u8) -> Digest {
-        let program = verifier::program(match kind {
-            0 => verifier::CredentialKind::Auth,
-            _ => verifier::CredentialKind::Owner,
-        });
+    /// The claim's `binding` for `call` under the stock auth kernel's
+    /// program.
+    fn binding(&self, call: &Credentialed) -> Digest {
         let b = Bound {
             space: &self.space,
             agent: self.agent,
             instance: call.instance,
             method: call.method,
-            program,
-            kind,
+            program: self.auth.id(),
             arguments: &call.arguments,
             nonce: &call.nonce,
             expires_ms: call.expires_ms,
@@ -340,6 +355,20 @@ impl Founded {
     }
 }
 
+/// The request the device library sends for `call` under `proof`.
+fn request(call: &Call, proof: vos_light::Proven) -> Credentialed {
+    Credentialed {
+        instance: InstanceId(call.instance),
+        method: MethodId(call.method),
+        arguments: call.arguments.clone(),
+        nonce: call.nonce,
+        expires_ms: call.expires_ms,
+        format: proof.format,
+        claim: proof.claim,
+        proof: proof.proof,
+    }
+}
+
 /// Install `elf` at `instance` of `agent`, its schema's role `role` mapped
 /// to [`ROLE`], at the leader.
 fn install(cluster: &Cluster, agent: AgentId, instance: InstanceId, elf: &[u8], role: &str) {
@@ -357,11 +386,6 @@ fn install(cluster: &Cluster, agent: AgentId, instance: InstanceId, elf: &[u8], 
             }
         }
     });
-}
-
-fn proof(statement: &Statement) -> Vec<u8> {
-    let (proof, _) = prove(statement, MaskRng::default()).expect("proves");
-    verifier::encode(&proof).expect("encodes")
 }
 
 #[track_caller]
@@ -386,12 +410,11 @@ fn done(answer: &Response) -> &[u8] {
 /// Each check refuses in its order: a request failing every check from
 /// one on is refused by that one's code, then mended one check at a time.
 /// The frame's size and its decode first, then the agent and its space,
-/// the format (an unregistered one), the size (a 1.4 MiB body within the frame
-/// and the device format's size, past the credential format's; a 600 KiB
-/// credential proof), the
-/// expiry, the method's guard, the kind, the scope, the binding, a
-/// recorded binding digest, an admitted nullifier, an unknown root, and
-/// the proof. A verified call runs, as its origin.
+/// the format (an unregistered one), the sizes (a proof past the device
+/// format's cap, a claim past its cap, arguments past theirs), the expiry,
+/// the method's guard, the claim (an owner's to an auth guard), the scope,
+/// the binding, a recorded binding digest, an admitted nullifier, an
+/// unknown root, and the proof. A verified call runs, as its origin.
 #[test]
 fn every_ingress_refusal_comes_in_its_check_order() {
     let founded = Founded::new();
@@ -451,24 +474,15 @@ fn every_ingress_refusal_comes_in_its_check_order() {
 
     // Every check from the format on fails; each mended in turn.
     let real = founded.auth(at, &secret, &founded.path(&secret), ("vote", "vote"), 3u8);
-    let CredentialPublic::Auth {
-        scope,
-        nullifier,
-        binding,
-        ..
-    } = real.public
-    else {
-        unreachable!()
-    };
+    let claimed = AuthClaim::decode_exact(&real.claim).expect("auth's claim");
+    let claim = |claim: AuthClaim| claim.encode();
     let mut call = Credentialed {
         method: founded.method(POLL, "tally"),
         format: 38,
-        proof: vec![7; 1_400 << 10],
+        proof: vec![7; vos_pvm_recair::device::MAX_PROOF_BYTES + 1],
         expires_ms: real.expires_ms + 600_000,
-        public: CredentialPublic::Owner {
-            owner: [1; 32],
-            binding: [2; 32],
-        },
+        claim: vec![1; vos_wire::abi::cap::CLAIM + 1],
+        arguments: vec![0; vos_wire::abi::cap::REQUEST - vos_wire::abi::cap::CLAIM + 1],
         ..real.clone()
     };
     let check = |call: &Credentialed, code: CredentialRefusal, what: &str| match (
@@ -479,21 +493,17 @@ fn every_ingress_refusal_comes_in_its_check_order() {
         (answer, code) => assert_eq!(answer, code, "{what}"),
     };
     check(&call, CredentialRefusal::Format, "an unregistered format");
-    call.format = vos_pvm_recair::device::FORMAT.number;
-    check(
-        &call,
-        CredentialRefusal::Expiry { now: 0 },
-        "1.4 MiB under the device format, within its size",
-    );
-    call.format = verifier::FORMAT;
+    call.format = DEVICE_FORMAT;
     check(
         &call,
         CredentialRefusal::Size,
-        "1.4 MiB under the credential format",
+        "a proof past the device format's cap",
     );
-    call.proof = vec![7; 600 << 10];
-    check(&call, CredentialRefusal::Size, "600 KiB");
     call.proof = vec![7; 64];
+    check(&call, CredentialRefusal::Size, "a claim past its cap");
+    call.claim = vec![1; 64];
+    check(&call, CredentialRefusal::Size, "arguments past theirs");
+    call.arguments = real.arguments.clone();
     check(
         &call,
         CredentialRefusal::Expiry { now: 0 },
@@ -502,33 +512,31 @@ fn every_ingress_refusal_comes_in_its_check_order() {
     call.expires_ms = real.expires_ms;
     check(&call, CredentialRefusal::Method, "a method with no guard");
     call.method = real.method;
-    check(&call, CredentialRefusal::Kind, "an owner statement");
-    call.public = CredentialPublic::Auth {
+    check(&call, CredentialRefusal::Kind, "an owner's claim");
+    call.claim = claim(AuthClaim {
         map_root: [3; 32],
         scope: [4; 32],
-        nullifier,
         binding: [5; 32],
-    };
+        ..claimed
+    });
     check(&call, CredentialRefusal::Scope, "another scope");
-    call.public = CredentialPublic::Auth {
+    call.claim = claim(AuthClaim {
         map_root: [3; 32],
-        scope,
-        nullifier,
         binding: [5; 32],
-    };
+        ..claimed
+    });
     check(&call, CredentialRefusal::Binding, "another binding");
-    call.public = CredentialPublic::Auth {
+    assert_eq!(founded.binding(&call), claimed.binding);
+    call.claim = claim(AuthClaim {
         map_root: [3; 32],
-        scope,
-        nullifier,
-        binding,
-    };
+        ..claimed
+    });
     check(
         &call,
         CredentialRefusal::RootUnknown,
         "a root the ring never held",
     );
-    call.public = real.public;
+    call.claim = real.claim.clone();
     check(&call, CredentialRefusal::Proof, "no proof");
     // The proof of one call, sent with another's arguments.
     call.proof = real.proof.clone();
@@ -550,17 +558,20 @@ fn every_ingress_refusal_comes_in_its_check_order() {
         CredentialRefusal::Replayed
     );
     // Another call of the nullifier, on a root unknown: `Once` comes first.
-    let mut again = founded.auth(at, &secret, &founded.path(&secret), ("vote", "vote"), 2u8);
-    let CredentialPublic::Auth { map_root, .. } = &mut again.public else {
-        unreachable!()
+    let again = founded.auth(at, &secret, &founded.path(&secret), ("vote", "vote"), 2u8);
+    let again = Credentialed {
+        claim: claim(AuthClaim {
+            map_root: [3; 32],
+            ..AuthClaim::decode_exact(&again.claim).unwrap()
+        }),
+        ..again
     };
-    *map_root = [3; 32];
     assert_eq!(refused(founded.send(at, &again)), CredentialRefusal::Once);
     // A proof with a wrong PoW: refused as any proof that fails.
     let mut wrong = founded.auth(at, &secret, &founded.path(&secret), ("login", "login"), ());
-    let mut decoded = verifier::decode(&wrong.proof).unwrap();
+    let mut decoded = vos_pvm_recair::device::decode(&wrong.proof).unwrap();
     decoded.stark_proof.0.proof_of_work ^= 1;
-    wrong.proof = verifier::encode(&decoded).unwrap();
+    wrong.proof = vos_pvm_recair::device::encode(&decoded).unwrap();
     assert_eq!(refused(founded.send(at, &wrong)), CredentialRefusal::Proof);
     // No log entry holds a proof's bytes.
     let node = founded.cluster.node(at).unwrap();
@@ -886,6 +897,8 @@ fn the_device_librarys_proofs_are_admitted() {
         now + 60_000,
     )
     .unwrap();
+    // The follower answers from its applied state, which the enrollment
+    // reaches once it replicates.
     vos_checker::wait_until(
         "the follower has the member's path",
         Duration::from_secs(30),
@@ -914,16 +927,19 @@ fn the_device_librarys_proofs_are_admitted() {
     };
     let call = login(time() + 60_000);
     let proof = prover
-        .prove_auth(&secret, keeper.witness().unwrap(), name, &call)
+        .prove_auth(
+            &secret,
+            keeper.witness().unwrap(),
+            name,
+            &call,
+            &founded.auth,
+        )
         .unwrap();
-    vos_light::verify(&proof, &call, Some(name)).unwrap();
-    let vos_light::CredentialPublic::Auth {
+    vos_light::verify(&proof, &call, &founded.auth, Some(name)).unwrap();
+    let AuthClaim {
         scope, nullifier, ..
-    } = proof.public
-    else {
-        unreachable!()
-    };
-    assert_eq!(scope.to_bytes(), founded.scope(POLL, "login"));
+    } = AuthClaim::decode_exact(&proof.claim).unwrap();
+    assert_eq!(scope, founded.scope(POLL, "login"));
     let answer = device_send(&founded, at, &wire::credentialed(&call, &proof));
     let Ok(Answer::Ran {
         outcome: Outcome::Done(reply),
@@ -934,7 +950,7 @@ fn the_device_librarys_proofs_are_admitted() {
     };
     assert_eq!(
         Option::<[u8; 32]>::decode_exact(&reply).unwrap(),
-        Some(nullifier.to_bytes()),
+        Some(nullifier),
         "the poll's `ctx.nullifier` is the library's"
     );
     assert_eq!(
@@ -954,7 +970,13 @@ fn the_device_librarys_proofs_are_admitted() {
     }
     let call = login(time() + 60_000);
     let proof = prover
-        .prove_auth(&secret, keeper.witness().unwrap(), name, &call)
+        .prove_auth(
+            &secret,
+            keeper.witness().unwrap(),
+            name,
+            &call,
+            &founded.auth,
+        )
         .unwrap();
     let leader = founded.cluster.leader(agent).unwrap();
     assert_eq!(
@@ -981,7 +1003,13 @@ fn the_device_librarys_proofs_are_admitted() {
         .unwrap();
     keeper.update(fetched, now).unwrap();
     let proof = prover
-        .prove_auth(&secret, keeper.witness().unwrap(), name, &call)
+        .prove_auth(
+            &secret,
+            keeper.witness().unwrap(),
+            name,
+            &call,
+            &founded.auth,
+        )
         .unwrap();
     assert!(matches!(
         wire::credentialed_answer(&device_send(
@@ -1014,7 +1042,7 @@ fn the_device_librarys_proofs_are_admitted() {
         time() + 60_000,
     )
     .unwrap();
-    let proof = prover.prove_owner(&secret, &pay).unwrap();
+    let proof = prover.prove_owner(&secret, &pay, &founded.owner).unwrap();
     let answer = device_send(&founded, at, &wire::credentialed(&pay, &proof));
     assert!(
         matches!(
@@ -1032,186 +1060,161 @@ fn the_device_librarys_proofs_are_admitted() {
 
 const DEVICE: InstanceId = InstanceId(4);
 
-/// A device proof signs in as an auth credential proof does: the
-/// device actor installed beside the founded space's, its `login` guard
-/// naming its device kernel `auth`; the device library proves the kernel
-/// as a phone proves it (`prove_device_auth`, format 46, the program
-/// computed from the kernel as ingress computes it), and a follower's
-/// ingress, which computes the program the first time, and the leader's,
-/// which pinned it at the install, admit it: the call runs as the
-/// member's pseudonym, the same as a credential proof's in that scope, and
-/// is `Replayed` sent again. Refused: a device proof to a guard naming no
-/// device kernel (`Kind`); one sent as a credential proof (`Size`) and a
-/// credential proof sent as a device proof (its binding names its
-/// circuit, not the device program: `Binding`); a device proof stating
-/// another nullifier, one with a word at `p` and one cut by a byte
-/// (`Proof`).
+/// The hand-lean `auth` kernel's claim (the `device` actor's): its kind
+/// byte, then the four digests.
+fn device_claim(root: &Digest, scope: &Digest, nullifier: &Digest, binding: &Digest) -> Vec<u8> {
+    vos_pvm_recair::device::auth_public(root, scope, nullifier, binding).to_vec()
+}
+
+/// An actor's own kernel's proof (`#[msg(proven = auth)]`, the `device`
+/// actor's hand-lean `auth`): ingress checks the proof and its binding, a
+/// follower computing the program the first time and the leader holding
+/// it from the install, and the handler takes the claim first and checks
+/// it at apply, its caller `Kernel { program }`: it admits the claim's
+/// nullifier once, refusing it after as its own check, and the binding
+/// digest is `Replayed` sent again. Refused at ingress: the stock guard
+/// a claim of the kernel's (`Kind`); a stock auth proof sent to the kernel
+/// guard (its binding names the stock program: `Binding`); a claim stating
+/// another nullifier, one with a word at `p`, and a proof cut by a byte
+/// (`Proof`). Upgraded to `device-next`, whose `auth` is another program
+/// with the same claims, the guard admits both releases' proofs, and the
+/// handler refuses the second of one nullifier whichever proved it.
 #[test]
-fn a_device_kernels_proof_signs_in_as_an_auth_proof_does() {
+fn an_actor_kernels_proof_is_checked_by_its_handler_at_apply() {
     use vos_light::wire::{self, Answer};
-    use vos_light::{
-        Call, DEVICE_FORMAT, DEVICE_PEAK_BYTES, DeviceProgram, Prover, ProverConfig, Threads,
-    };
 
     let founded = Founded::new();
     let agent = founded.agent;
-    install(
-        &founded.cluster,
-        agent,
-        DEVICE,
-        &std::fs::read(actor_elf("device")).unwrap(),
-        "operator",
-    );
+    let elf = |name: &str| std::fs::read(actor_elf(name)).unwrap();
+    install(&founded.cluster, agent, DEVICE, &elf("device"), "operator");
     let device = actor("device");
     let login = method(&device, "login");
     let at = founded.follower();
     let leader = founded.cluster.leader(agent).unwrap();
-    let secret = vos_light::derive_secret(&[0x6d; 32], &[0x42; 32]);
-    founded.write(CREDENTIALS, "enroll", vos_light::member(&secret).to_bytes());
-    let time = || client::time(founded.cluster.target(at)).unwrap();
-    let identity = founded.operator.lock().unwrap().identity(agent).unwrap();
-    let query = wire::path_query(
-        agent.0,
-        &identity,
-        CREDENTIALS.0,
-        &vos_light::member(&secret),
-        time() + 60_000,
-    )
-    .unwrap();
-    // The follower answers from its applied state, which the enrollment
-    // reaches once it replicates.
-    vos_checker::wait_until(
-        "the follower has the member's path",
-        Duration::from_secs(30),
-        || {
-            wire::path_answer(&device_send(&founded, at, &query))
-                .unwrap()
-                .is_some()
-        },
-    );
-    let witness = wire::path_answer(&device_send(&founded, at, &query))
-        .unwrap()
-        .expect("an enrolled member's path");
-    let prover = Prover::new(ProverConfig {
-        threads: Threads::Count(4),
-        max_memory: DEVICE_PEAK_BYTES,
-    })
-    .unwrap();
-    let device = vos_light::release::device(&vos_testkit::programs::package("device"), "auth");
-    let program = DeviceProgram::released(&device.unwrap()).unwrap();
-    let call = |instance: InstanceId, method: MethodId| {
-        Call::new(
-            founded.space.0,
-            agent.0,
-            instance.0,
-            method.0,
-            ().encode(),
-            time() + 60_000,
-        )
-        .unwrap()
+    // The kernel takes the secret's words: a test's member, its secret
+    // public.
+    let words: tree::Words = core::array::from_fn(|i| 0x6d00_0000 + i as u32);
+    let compress = tree::compress;
+    let member = tree::digest(&compress(&tree::Tag::Member.block(), &words));
+    founded.write(CREDENTIALS, "enroll", member);
+    let path = {
+        let path: Option<Path> = founded.read(CREDENTIALS, "path", member);
+        path.expect("an enrolled member's path")
     };
-    let name = b"login";
-    let send = |at: NodeNumber, call: &Call, proof: &vos_light::CredentialProof| {
+    let one = vos_light::release::device(&elf("device"), "auth").unwrap();
+    let program = DeviceProgram::released(&one).unwrap();
+    let call = |method: MethodId, instance: InstanceId, at: NodeNumber| {
+        founded.call_of(at, instance, method, ())
+    };
+    // The member's nullifier in a scope `name` gives: the handler checks
+    // no scope, so each name is another nullifier of one member.
+    let nullifier = |name: &str| {
+        let scope = founded.scope(DEVICE, name);
+        let nullifier = tree::digest(&compress(
+            &compress(&tree::Tag::Nf.block(), &words),
+            &tree::words(&scope).unwrap(),
+        ));
+        (scope, nullifier)
+    };
+    // The kernel's proof of the member for `call`, its claim under
+    // `program` in the scope `name` gives.
+    let prove = |call: &Call, program: &DeviceProgram, name: &str| {
+        let binding = call.binding(program.id()).to_bytes();
+        let (scope, nullifier) = nullifier(name);
+        let claim = device_claim(&path.root, &scope, &nullifier, &binding);
+        let siblings = path
+            .siblings
+            .0
+            .map(|sibling| tree::words(&sibling).unwrap());
+        let public = claim.clone().try_into().expect("auth's public bytes");
+        let arguments =
+            vos_pvm_recair::device::auth_arguments(&siblings, &words, path.slot, &public);
+        let proof = founded
+            .prover
+            .prove_kernel(program, &arguments)
+            .expect("the kernel proves");
+        vos_light::Proven {
+            format: DEVICE_FORMAT,
+            claim,
+            proof: proof.proof,
+        }
+    };
+    let send = |at: NodeNumber, call: &Call, proof: &vos_light::Proven| {
         wire::credentialed_answer(&device_send(&founded, at, &wire::credentialed(call, proof)))
             .unwrap()
     };
-    let pseudonym = |answer: Answer| match answer {
+    let signed_in = |answer: Answer| match answer {
         Answer::Ran {
             outcome: Outcome::Done(reply),
             ..
-        } => Option::<[u8; 32]>::decode_exact(&reply).unwrap(),
+        } => <([u8; 32], [u8; 32])>::decode_exact(&reply).unwrap(),
         other => panic!("not run: {other:?}"),
     };
-
-    let signin = call(DEVICE, login);
-    let proof = prover
-        .prove_device_auth(&secret, &witness, name, &signin, &program)
-        .unwrap();
-    assert_eq!(proof.format, DEVICE_FORMAT);
-    vos_light::verify_device(&proof, &signin, name, &program).unwrap();
-    let vos_light::CredentialPublic::Auth { nullifier, .. } = proof.public else {
-        unreachable!()
+    let refused_by_handler = |answer: Answer| {
+        assert!(
+            matches!(
+                answer,
+                Answer::Ran {
+                    outcome: Outcome::Failed { .. },
+                    ..
+                }
+            ),
+            "the handler's refusal: {answer:?}"
+        )
     };
+
+    let signin = call(login, DEVICE, at);
+    let proof = prove(&signin, &program, "login");
     assert_eq!(
-        pseudonym(send(at, &signin, &proof)),
-        Some(nullifier.to_bytes())
+        signed_in(send(at, &signin, &proof)),
+        (nullifier("login").1, *program.id()),
+        "the claim's nullifier, the caller the kernel's program"
     );
     assert_eq!(
         send(leader, &signin, &proof),
         Answer::Refused(CredentialRefusal::Replayed)
     );
+    // The leader, which pinned the program at the install, admits another
+    // proof; the handler refuses the nullifier it saw.
+    let again = call(login, DEVICE, leader);
+    refused_by_handler(send(leader, &again, &prove(&again, &program, "login")));
 
-    // The leader, which pinned the program at the install, admits another.
-    let again = call(DEVICE, login);
-    let proof = prover
-        .prove_device_auth(&secret, &witness, name, &again, &program)
-        .unwrap();
+    // Refused at ingress.
+    let poll = call(founded.method(POLL, "login"), POLL, at);
     assert_eq!(
-        pseudonym(send(leader, &again, &proof)),
-        Some(nullifier.to_bytes())
-    );
-
-    // A credential proof to the same guard: the same pseudonym.
-    let credential = call(DEVICE, login);
-    let proved = prover
-        .prove_auth(&secret, &witness, name, &credential)
-        .unwrap();
-    assert_eq!(
-        pseudonym(send(at, &credential, &proved)),
-        Some(nullifier.to_bytes())
-    );
-
-    // Refused.
-    let poll = call(POLL, founded.method(POLL, "login"));
-    let proof = prover
-        .prove_device_auth(&secret, &witness, name, &poll, &program)
-        .unwrap();
-    assert_eq!(
-        send(at, &poll, &proof),
+        send(at, &poll, &prove(&poll, &program, "login")),
         Answer::Refused(CredentialRefusal::Kind),
-        "a guard naming no device kernel"
+        "the kernel's claim to the stock guard"
     );
-    let fresh = call(DEVICE, login);
-    let proof = prover
-        .prove_device_auth(&secret, &witness, name, &fresh, &program)
+    let stock = call(login, DEVICE, at);
+    let secret = Secret::new(0x6e);
+    founded.write(CREDENTIALS, "enroll", secret.member());
+    let proved = founded
+        .prover
+        .prove_auth(
+            &secret.0,
+            &witness(&founded.path(&secret)),
+            b"login",
+            &stock,
+            &founded.auth,
+        )
         .unwrap();
-    let as_credential = vos_light::CredentialProof {
-        format: verifier::FORMAT,
-        ..proof.clone()
-    };
     assert_eq!(
-        send(at, &fresh, &as_credential),
-        Answer::Refused(CredentialRefusal::Size),
-        "a device proof's bytes past the credential format's"
-    );
-    let credential = call(DEVICE, login);
-    let proved = prover
-        .prove_auth(&secret, &witness, name, &credential)
-        .unwrap();
-    let as_device = vos_light::CredentialProof {
-        format: DEVICE_FORMAT,
-        ..proved
-    };
-    assert_eq!(
-        send(at, &credential, &as_device),
+        send(at, &stock, &proved),
         Answer::Refused(CredentialRefusal::Binding),
-        "a credential proof's binding names its circuit, not the device program"
+        "a stock proof's binding names the stock program"
     );
-    let mut other = proof.clone();
-    let vos_light::CredentialPublic::Auth { nullifier, .. } = &mut other.public else {
-        unreachable!()
-    };
-    nullifier.0[0] ^= 1;
+    let fresh = call(login, DEVICE, at);
+    let proof = prove(&fresh, &program, "other");
+    let mut stated = proof.clone();
+    stated.claim[1 + 64] ^= 1;
     assert_eq!(
-        send(at, &fresh, &other),
+        send(at, &fresh, &stated),
         Answer::Refused(CredentialRefusal::Proof),
-        "another io-hash"
+        "another nullifier than the proof's"
     );
     let mut wide = proof.clone();
-    let vos_light::CredentialPublic::Auth { nullifier, .. } = &mut wide.public else {
-        unreachable!()
-    };
-    nullifier.0[0] = tree::P;
+    wide.claim[1 + 64..1 + 68].copy_from_slice(&tree::P.to_le_bytes());
     assert_eq!(
         send(at, &fresh, &wide),
         Answer::Refused(CredentialRefusal::Proof),
@@ -1223,7 +1226,35 @@ fn a_device_kernels_proof_signs_in_as_an_auth_proof_does() {
         send(at, &fresh, &cut),
         Answer::Refused(CredentialRefusal::Proof)
     );
-    assert!(matches!(send(at, &fresh, &proof), Answer::Ran { .. }));
+    assert_eq!(signed_in(send(at, &fresh, &proof)).0, nullifier("other").1);
+
+    // Upgraded: both releases' proofs admitted, one nullifier once.
+    let two = vos_light::release::device(&elf("device-next"), "auth").unwrap();
+    assert_ne!(one.id, two.id);
+    install(
+        &founded.cluster,
+        agent,
+        DEVICE,
+        &elf("device-next"),
+        "operator",
+    );
+    vos_checker::spaces::wait_in_process("the upgrade applied", || {
+        window(&founded, at, DEVICE).kernels[0].programs.len() == 2
+    });
+    let next = DeviceProgram::released(&two).unwrap();
+    let first = call(login, DEVICE, at);
+    assert_eq!(
+        signed_in(send(at, &first, &prove(&first, &program, "late"))),
+        (nullifier("late").1, one.id),
+        "release one's proof, after the upgrade"
+    );
+    let second = call(login, DEVICE, at);
+    refused_by_handler(send(at, &second, &prove(&second, &next, "late")));
+    let third = call(login, DEVICE, at);
+    assert_eq!(
+        signed_in(send(at, &third, &prove(&third, &next, "newest"))),
+        (nullifier("newest").1, two.id)
+    );
 }
 
 /// The device window of `instance`, as node `at` answers it.
@@ -1233,99 +1264,73 @@ fn window(founded: &Founded, at: NodeNumber, instance: InstanceId) -> DeviceWind
         .expect("an installed instance's window")
 }
 
-/// Compatibility windows (`light-node.md` §4.4), on device kernels' release
-/// artifacts as an app embeds them: the `device` actor's `auth` (release
-/// one) and `device-next`'s (release two, its kernel written otherwise,
-/// the same claims). The space's window names the programs the artifacts
-/// name, computed from the same ELFs. An app shipping release one alone
-/// signs in at a space upgraded to release two, as the member's pseudonym;
-/// an app shipping both proves with release two, and the `once` guard
-/// refuses it, the same nullifier in one scope. Retired now, release one
-/// leaves the window: the old app refuses before proving, saying which
-/// side must update, and its proof made before is refused at ingress. A
-/// rollback keeps release two's program until its date, 60 days on: then
-/// it leaves the window, by the clock alone. A device format retired now
-/// empties the window's formats, and a device proof is refused `Format`.
+/// Compatibility windows (`light-node.md` §4.4) of the stock `auth`
+/// kernel, on its release artifacts as an app embeds them: the credential
+/// actor's (release one) and `credentials-next`'s (release two, its kernel
+/// written otherwise, the same claims). The space's window, the credential
+/// actor's, names the programs the artifacts name, computed from the same
+/// ELFs. An app shipping release one alone signs in at a space upgraded to
+/// release two, as the member's pseudonym; an app shipping both proves
+/// with release two, and the poll's `once` guard refuses it, the same
+/// nullifier in one scope. Retired now, release one leaves the window: the
+/// old app refuses before proving, saying which side must update, and its
+/// proof made before is refused at ingress. A rollback keeps release two's
+/// program until its date, 60 days on: then it leaves the window, by the
+/// clock alone. A device format retired now empties the window's formats,
+/// and a proof is refused `Format`.
 #[test]
 fn an_app_one_release_behind_signs_in_until_its_window_closes() {
     use vos_light::wire::{self, Answer};
-    use vos_light::{Call, DEVICE_PEAK_BYTES, DeviceError, DeviceProgram, Prover, ProverConfig};
+    use vos_light::{DeviceError, Proven};
 
     let founded = Founded::new();
     let agent = founded.agent;
-    let elf = |name: &str| std::fs::read(actor_elf(name)).unwrap();
-    install(&founded.cluster, agent, DEVICE, &elf("device"), "operator");
-    let auth = method(&actor("device"), "auth");
-    let login = method(&actor("device"), "login");
-    let one = vos_light::release::device(&elf("device"), "auth").unwrap();
-    let two = vos_light::release::device(&elf("device-next"), "auth").unwrap();
+    let auth = founded.method(CREDENTIALS, "auth");
+    let elf = |path: std::path::PathBuf| std::fs::read(path).unwrap();
+    let (release_one, release_two) = (elf(credentials_elf()), elf(actor_elf("credentials-next")));
+    let one = stock(&release_one, "auth");
+    let two = stock(&release_two, "auth");
     assert_ne!(one.id, two.id);
     let (old_app, new_app) = (vec![one.clone()], vec![two.clone(), one.clone()]);
 
     let at = founded.follower();
-    let secrets = [0x43, 0x44].map(|handle| vos_light::derive_secret(&[0x6e; 32], &[handle; 32]));
+    let secrets = [0x43, 0x44].map(Secret::new);
     for secret in &secrets {
-        founded.write(CREDENTIALS, "enroll", vos_light::member(secret).to_bytes());
+        founded.write(CREDENTIALS, "enroll", secret.member());
     }
-    let time = || client::time(founded.cluster.target(at)).unwrap();
-    let identity = founded.operator.lock().unwrap().identity(agent).unwrap();
-    let witnesses = secrets.each_ref().map(|secret| {
-        let query = wire::path_query(
-            agent.0,
-            &identity,
-            CREDENTIALS.0,
-            &vos_light::member(secret),
-            time() + 60_000,
-        )
-        .unwrap();
-        wire::path_answer(&device_send(&founded, at, &query))
-            .unwrap()
-            .expect("an enrolled member's path")
-    });
-    let prover = Prover::new(ProverConfig {
-        threads: vos_light::Threads::Count(4),
-        max_memory: DEVICE_PEAK_BYTES,
-    })
-    .unwrap();
-    let signin = || {
-        Call::new(
-            founded.space.0,
-            agent.0,
-            DEVICE.0,
-            login.0,
-            ().encode(),
-            time() + 60_000,
-        )
-        .unwrap()
-    };
+    let witnesses = secrets
+        .each_ref()
+        .map(|secret| witness(&founded.path(secret)));
     // The app's sign-in: the newest program it ships that the space's
     // window admits, chosen before anything is proved.
-    let sign_in_as = |member: usize, app: &[vos_light::release::Device]| {
-        let chosen = vos_light::choose(app, &window(&founded, at, DEVICE), auth)?;
+    let sign_in_as = |member: usize, app: &[Device]| {
+        let chosen = vos_light::choose(app, &window(&founded, at, CREDENTIALS), auth)?;
         let program = DeviceProgram::released(chosen).unwrap();
-        let call = signin();
-        let proof = prover
-            .prove_device_auth(
-                &secrets[member],
+        let call = founded.call(at, POLL, "vote", 3u8);
+        let proof = founded
+            .prover
+            .prove_auth(
+                &secrets[member].0,
                 &witnesses[member],
-                b"login",
+                b"vote",
                 &call,
                 &program,
             )
             .unwrap();
-        vos_light::verify_device(&proof, &call, b"login", &program).unwrap();
+        vos_light::verify(&proof, &call, &program, Some(b"vote")).unwrap();
         Ok::<_, DeviceError>((chosen.id, call, proof))
     };
-    let sign_in = |app: &[vos_light::release::Device]| sign_in_as(0, app);
-    let (secret, witness) = (&secrets[0], &witnesses[0]);
-    let send = |call: &Call, proof: &vos_light::CredentialProof| {
+    let sign_in = |app: &[Device]| sign_in_as(0, app);
+    let send = |call: &Call, proof: &Proven| {
         wire::credentialed_answer(&device_send(&founded, at, &wire::credentialed(call, proof)))
             .unwrap()
     };
+    let nullifier = |proof: &Proven| AuthClaim::decode_exact(&proof.claim).unwrap().nullifier;
+    let time = || client::time(founded.cluster.target(at)).unwrap();
 
     // Release one alone: the window names the artifact's program, the
     // format the device format; the new app proves with release one.
-    let before = window(&founded, at, DEVICE);
+    let before = window(&founded, at, CREDENTIALS);
     let programs = |window: &DeviceWindow| -> Vec<([u8; 32], Option<u64>)> {
         window
             .kernels
@@ -1341,30 +1346,30 @@ fn an_app_one_release_behind_signs_in_until_its_window_closes() {
     assert_eq!(
         before.formats,
         [FormatWindow {
-            format: vos_light::DEVICE_FORMAT,
+            format: DEVICE_FORMAT,
             retires_ms: None
         }]
     );
     let (chosen, _, _) = sign_in(&new_app).unwrap();
     assert_eq!(chosen, one.id, "the newest the space admits");
 
-    // The space upgrades to release two: both are admitted, release one
-    // for 60 days.
+    // The space upgrades its credential actor to release two: both are
+    // admitted, release one for 60 days.
     let upgraded = time();
     install(
         &founded.cluster,
         agent,
-        DEVICE,
-        &elf("device-next"),
-        "operator",
+        CREDENTIALS,
+        &release_two,
+        "registrar",
     );
     let applied = |first: [u8; 32]| {
         vos_checker::spaces::wait_in_process("the install applied", || {
-            programs(&window(&founded, at, DEVICE))[0].0 == first
+            programs(&window(&founded, at, CREDENTIALS))[0].0 == first
         });
     };
     applied(two.id);
-    let window_two = programs(&window(&founded, at, DEVICE));
+    let window_two = programs(&window(&founded, at, CREDENTIALS));
     assert_eq!(window_two[0], (two.id, None));
     assert_eq!(window_two[1].0, one.id);
     let retires = window_two[1].1.expect("release one's date");
@@ -1378,54 +1383,31 @@ fn an_app_one_release_behind_signs_in_until_its_window_closes() {
     let (chosen, call, proof) = sign_in(&old_app).unwrap();
     assert_eq!(chosen, one.id);
     let made_before = sign_in(&old_app).unwrap();
-    let vos_light::CredentialPublic::Auth { nullifier, .. } = proof.public else {
-        unreachable!()
-    };
     match send(&call, &proof) {
         Answer::Ran {
             outcome: Outcome::Done(reply),
             ..
-        } => assert_eq!(
-            Option::<[u8; 32]>::decode_exact(&reply).unwrap(),
-            Some(nullifier.to_bytes())
-        ),
+        } => assert_eq!(u32::decode_exact(&reply), Some(1), "the vote counted"),
         other => panic!("the old app's sign-in: {other:?}"),
     }
     // The new app proves with release two: the same nullifier, so the
     // `once` scope admitted it already.
-    let (chosen, call, proof) = sign_in(&new_app).unwrap();
+    let (chosen, call, again) = sign_in(&new_app).unwrap();
     assert_eq!(chosen, two.id);
-    let vos_light::CredentialPublic::Auth {
-        nullifier: again, ..
-    } = proof.public
-    else {
-        unreachable!()
-    };
-    assert_eq!(again, nullifier, "one claim in the window");
     assert_eq!(
-        send(&call, &proof),
+        nullifier(&again),
+        nullifier(&proof),
+        "one claim in the window"
+    );
+    assert_eq!(
+        send(&call, &again),
         Answer::Refused(CredentialRefusal::Once)
     );
-    // The other way round for another member: release two's proof signs in,
+    // The other way round for another member: release two's proof votes,
     // and release one's is refused, its pseudonym admitted once.
     let (chosen, call, proof) = sign_in_as(1, &new_app).unwrap();
     assert_eq!(chosen, two.id);
-    let vos_light::CredentialPublic::Auth {
-        nullifier: second, ..
-    } = proof.public
-    else {
-        unreachable!()
-    };
-    match send(&call, &proof) {
-        Answer::Ran {
-            outcome: Outcome::Done(reply),
-            ..
-        } => assert_eq!(
-            Option::<[u8; 32]>::decode_exact(&reply).unwrap(),
-            Some(second.to_bytes())
-        ),
-        other => panic!("the new app's sign-in: {other:?}"),
-    }
+    assert!(matches!(send(&call, &proof), Answer::Ran { .. }));
     let (_, call, proof) = sign_in_as(1, &old_app).unwrap();
     assert_eq!(
         send(&call, &proof),
@@ -1435,7 +1417,7 @@ fn an_app_one_release_behind_signs_in_until_its_window_closes() {
     // The operator retires release one now.
     let retired = smol::block_on(founded.cluster.leading(agent).retire(
         agent,
-        DEVICE,
+        CREDENTIALS,
         auth,
         time(),
     ))
@@ -1445,7 +1427,7 @@ fn an_app_one_release_behind_signs_in_until_its_window_closes() {
         vos_node::Reply::Ran(Outcome::Done(ref kept)) if Option::<u64>::decode_exact(kept) == Some(None)
     ));
     vos_checker::spaces::wait_in_process("the retirement applied", || {
-        programs(&window(&founded, at, DEVICE)) == [(two.id, None)]
+        programs(&window(&founded, at, CREDENTIALS)) == [(two.id, None)]
     });
     match sign_in(&old_app) {
         Err(DeviceError::Window) => {}
@@ -1465,7 +1447,13 @@ fn an_app_one_release_behind_signs_in_until_its_window_closes() {
 
     // A rollback to release one keeps release two until its date; then the
     // clock alone closes the window on it.
-    install(&founded.cluster, agent, DEVICE, &elf("device"), "operator");
+    install(
+        &founded.cluster,
+        agent,
+        CREDENTIALS,
+        &release_one,
+        "registrar",
+    );
     applied(one.id);
     let two_only = vec![two.clone()];
     assert_eq!(sign_in(&two_only).map(|(id, _, _)| id), Ok(two.id));
@@ -1475,25 +1463,40 @@ fn an_app_one_release_behind_signs_in_until_its_window_closes() {
         .cluster
         .offset
         .fetch_add(RETIREMENT_MS as i64 + 60_000, Ordering::SeqCst);
-    assert_eq!(programs(&window(&founded, at, DEVICE)), [(one.id, None)]);
+    assert_eq!(
+        programs(&window(&founded, at, CREDENTIALS)),
+        [(one.id, None)]
+    );
     assert!(matches!(sign_in(&two_only), Err(DeviceError::Window)));
-    let (_, call, proof) = sign_in(&old_app).unwrap();
+    let login = |member: usize| {
+        let program = DeviceProgram::released(&one).unwrap();
+        let call = founded.call(at, POLL, "login", ());
+        let proof = founded
+            .prover
+            .prove_auth(
+                &secrets[member].0,
+                &witnesses[member],
+                b"login",
+                &call,
+                &program,
+            )
+            .unwrap();
+        (call, proof)
+    };
+    let (call, proof) = login(0);
     assert!(matches!(send(&call, &proof), Answer::Ran { .. }));
 
     // A device format retired now: no device proof is admitted.
     let now = time();
     let node = founded.cluster.node(at).unwrap();
-    assert_eq!(node.retire_format(vos_light::DEVICE_FORMAT, now), Some(now));
-    assert_eq!(node.retire_format(verifier::FORMAT, now), None);
-    let (_, call, proof) = {
-        let program = DeviceProgram::released(&one).unwrap();
-        let call = signin();
-        let proof = prover
-            .prove_device_auth(secret, witness, b"login", &call, &program)
-            .unwrap();
-        (one.id, call, proof)
-    };
-    assert!(window(&founded, at, DEVICE).formats.is_empty());
+    assert_eq!(node.retire_format(DEVICE_FORMAT, now), Some(now));
+    assert_eq!(
+        node.retire_format(44, now),
+        None,
+        "a format it never verified"
+    );
+    let (call, proof) = login(1);
+    assert!(window(&founded, at, CREDENTIALS).formats.is_empty());
     assert!(matches!(sign_in(&old_app), Err(DeviceError::Window)));
     assert_eq!(
         send(&call, &proof),

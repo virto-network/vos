@@ -25,8 +25,8 @@ use std::time::{Duration, Instant};
 use smol::future::FutureExt;
 use vos_raft::Role;
 use vos_wire::ids::AgentId;
-use vos_wire::keys;
 use vos_wire::result::{InputRef, Run, Step, WorkResult};
+use vos_wire::{defaults, keys};
 
 use crate::fault::{Fault, read};
 use crate::group::{Local, Shared, State};
@@ -475,11 +475,21 @@ impl Leader {
         let mut bytes = 0;
         let now = Instant::now();
         let max_bytes = self.inner.settings.max_bytes;
+        // Credentialed calls past a batch's most wait for the next.
+        let mut credentialed = 0;
         while taken.len() < self.max_inputs {
-            let fits = |next: &Pending| taken.is_empty() || bytes + next.bytes() <= max_bytes;
+            let fits = |next: &Pending| match next {
+                Pending::Credentialed { .. } if credentialed == defaults::BATCH_CREDENTIALED => {
+                    false
+                }
+                _ => taken.is_empty() || bytes + next.bytes() <= max_bytes,
+            };
             let Some((next, queued)) = queue.pop_front_if(fits) else {
                 break;
             };
+            if let Pending::Credentialed { .. } = next {
+                credentialed += 1;
+            }
             self.inner
                 .stats
                 .queued

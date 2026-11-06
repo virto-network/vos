@@ -109,8 +109,7 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// - **Device kernels:** `#[attestable(device)]` marks a method a device
 ///   proves (`proving.md` §8): it takes no `self`, its kernel returns its
 ///   statement's parts and leaves their Poseidon2 io-hash, may make the
-///   Poseidon2 call and must reach no BLAKE2b, and no node attests it. An
-///   auth guard's `device = "..."` must name one of the actor's. Its
+///   Poseidon2 call and must reach no BLAKE2b, and no node attests it. Its
 ///   arguments by reference, `&T` with `T` in place
 ///   (`vos_sdk::p2::InPlace`: digests, paths, `#[derive(InPlace)]`
 ///   structs), come first and are read where its witness input left them,
@@ -135,13 +134,20 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// - **Linearizable:** on a query, `#[msg(linearizable)]` always reads
 ///   after a read index, whatever consistency its client asks. That governs
 ///   the query a client names: a method it calls reads its snapshot.
-/// - **Credential guards:** `#[msg(credential = Auth("login"))]` admits
-///   the callers proving a member's leaf, each by its pseudonym in the
-///   scope `"login"` names, with `device = "..."` the attestable kernel
-///   whose device proofs it also takes and `once` each pseudonym once;
-///   `#[msg(credential = Owner)]` admits the callers proving an owner
-///   digest's secret, which `ctx.owner()` gives. Only a `&mut self`
-///   handler takes one, with no role and not `linearizable`.
+/// - **Proven calls:** `#[msg(proven = k)]` admits the callers whose
+///   device proof is of kernel `k`, a device kernel of this actor, as
+///   `Principal::Kernel { program }`; the handler takes the kernel's
+///   claim, its public arguments, as its first argument (after its
+///   context), decoded whole from its own part, and checks it: ingress
+///   checks only the proof and its binding. An actor's own kernel takes
+///   its name before a stock kernel's. The stock kernels of the agent's credential actor have their
+///   own guards, whose checks ingress runs: `#[msg(credential =
+///   Auth("login"))]` admits the callers proving a member's leaf, each by
+///   its pseudonym in the scope `"login"` names, with `once` each
+///   pseudonym once, which `ctx.nullifier()` gives; `#[msg(credential =
+///   Owner)]`, or `proven = owner`, the callers proving an owner digest's
+///   secret, which `ctx.owner()` gives. Only a `&mut self` handler takes
+///   a guard, with no role and not `linearizable`.
 /// - **A new instance's state:** the impl block must define
 ///   `fn new() -> Self`.
 #[proc_macro_attribute]

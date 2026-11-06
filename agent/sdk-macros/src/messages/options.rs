@@ -15,10 +15,12 @@ pub(super) struct Options {
     /// An attestable method whose statements bind the venue that judges
     /// them: a leading `venue: VenueId` public argument.
     pub(super) venue_bound: Option<Span>,
-    /// `credential = Auth("name")` or `credential = Owner`.
+    /// `credential = Auth("name")` or `credential = Owner`; a `proven = k`
+    /// guard once its kernel is resolved.
     pub(super) credential: Option<(CredentialGuard, Span)>,
-    /// An auth guard's device kernel, `device = "..."`.
-    pub(super) device: Option<(String, Span)>,
+    /// `proven = k`: the device kernel the handler's proofs are of, this
+    /// actor's or a stock kernel, resolved once every handler is read.
+    pub(super) proven: Option<(String, Span)>,
     /// An attestable method that is a device kernel, `device`.
     pub(super) device_kernel: Option<Span>,
     /// A device kernel's reference run, `reference = path`: the function
@@ -58,11 +60,7 @@ pub(super) fn credential_arg(meta: &syn::meta::ParseNestedMeta) -> syn::Result<C
                     "an auth guard's name takes 1 to {MAX_GUARD_NAME} bytes"
                 )));
             }
-            Ok(CredentialGuard::Auth {
-                name,
-                device: None,
-                once: false,
-            })
+            Ok(CredentialGuard::Auth { name, once: false })
         }
         _ => Err(expected()),
     }
@@ -81,19 +79,18 @@ pub(super) fn msg_options(attribute: &Attribute) -> syn::Result<Options> {
             } else if meta.path.is_ident("credential") {
                 let span = meta.path.span();
                 options.credential = Some((credential_arg(&meta)?, span));
-            } else if meta.path.is_ident("device") {
-                let span = meta.path.span();
-                if meta.input.peek(syn::Token![=]) {
-                    if options.device.is_some() {
-                        return Err(meta.error("`device = \"...\"` given twice"));
-                    }
-                    options.device = Some((string_arg(&meta)?, span));
-                } else {
-                    if options.device_kernel.is_some() {
-                        return Err(meta.error("`device` given twice"));
-                    }
-                    options.device_kernel = Some(span);
+            } else if meta.path.is_ident("proven") {
+                if options.proven.is_some() {
+                    return Err(meta.error("`proven = k` given twice"));
                 }
+                let span = meta.path.span();
+                let kernel = meta.value()?.parse::<Ident>()?;
+                options.proven = Some((kernel.to_string(), span));
+            } else if meta.path.is_ident("device") {
+                if options.device_kernel.is_some() {
+                    return Err(meta.error("`device` given twice"));
+                }
+                options.device_kernel = Some(meta.path.span());
             } else if meta.path.is_ident("reference") {
                 if options.reference.is_some() {
                     return Err(meta.error("`reference = ...` given twice"));
@@ -136,7 +133,7 @@ pub(super) fn msg_options(attribute: &Attribute) -> syn::Result<Options> {
                 return Err(meta.error(
                     "expected `role = \"...\"`, `gas = N`, `linearizable`, `merge`, \
                      `venue_bound`, `device`, `reference = path`, `headroom = k`, \
-                     `credential = ...`, `device = \"...\"` or `once`",
+                     `credential = ...`, `proven = k` or `once`",
                 ));
             }
             Ok(())
@@ -145,51 +142,75 @@ pub(super) fn msg_options(attribute: &Attribute) -> syn::Result<Options> {
     Ok(options)
 }
 
-/// A handler's credential guard, its `device` and `once` folded in: only
-/// a command takes one, with no role and not linearizable; `device` and
-/// `once` only beside an auth guard.
+/// A handler's guard, `once` folded in: only a command takes one, with no
+/// role and not linearizable; `once` only beside an auth guard, and
+/// `credential` and `proven` not together. A `proven` guard's kernel is
+/// resolved later ([`resolve`]).
 pub(super) fn guard(options: &mut Options, kind: Kind) -> syn::Result<()> {
-    let Some((guard, span)) = &mut options.credential else {
-        if let Some(span) = options
-            .device
-            .as_ref()
-            .map(|(_, span)| *span)
-            .or(options.once)
-        {
+    let span = match (&options.credential, &options.proven) {
+        (Some(_), Some((_, span))) => {
             return Err(Error::new(
-                span,
-                "`device` and `once` go with `credential = Auth(\"...\")`",
+                *span,
+                "a handler takes `credential = ...` or `proven = k`, not both",
             ));
         }
-        return Ok(());
+        (Some((_, span)), None) | (None, Some((_, span))) => *span,
+        (None, None) => {
+            if let Some(span) = options.once {
+                return Err(Error::new(
+                    span,
+                    "`once` goes with `credential = Auth(\"...\")`",
+                ));
+            }
+            return Ok(());
+        }
     };
     if kind != Kind::Command || options.role.is_some() || options.linearizable.is_some() {
         return Err(Error::new(
-            *span,
-            "a credential guard sits on a `&mut self` #[msg] handler alone, with no role and not \
+            span,
+            "a guard sits on a `&mut self` #[msg] handler alone, with no role and not \
              `linearizable`: the proof is its caller's authority",
         ));
     }
-    match guard {
-        CredentialGuard::Auth { device, once, .. } => {
-            *device = options.device.take().map(|(name, _)| name.into_bytes());
-            *once = options.once.take().is_some();
-        }
-        CredentialGuard::Owner => {
-            if let Some(span) = options
-                .device
-                .as_ref()
-                .map(|(_, span)| *span)
-                .or(options.once)
-            {
+    match &mut options.credential {
+        Some((CredentialGuard::Auth { once, .. }, _)) => *once = options.once.take().is_some(),
+        _ => {
+            if let Some(span) = options.once {
                 return Err(Error::new(
                     span,
-                    "`device` and `once` go with `credential = Auth(\"...\")`, not `Owner`",
+                    "`once` goes with `credential = Auth(\"...\")` alone",
                 ));
             }
         }
     }
     Ok(())
+}
+
+/// The guard `proven = kernel` names, given `devices`, this actor's device
+/// kernels by name: this actor's kernel of that name, else the stock
+/// `owner`. The stock `auth` takes its scope's name, so it is
+/// `credential = Auth("name")`.
+pub(super) fn resolve(kernel: &str, span: Span, devices: &[&str]) -> syn::Result<CredentialGuard> {
+    if devices.contains(&kernel) {
+        return Ok(CredentialGuard::Kernel {
+            name: kernel.as_bytes().to_vec(),
+        });
+    }
+    match kernel {
+        vos_wire::schema::stock::OWNER => Ok(CredentialGuard::Owner),
+        vos_wire::schema::stock::AUTH => Err(Error::new(
+            span,
+            "the stock `auth` kernel proves a pseudonym in a scope: name it, \
+             `credential = Auth(\"name\")`",
+        )),
+        _ => Err(Error::new(
+            span,
+            format!(
+                "`proven = {kernel}` names no #[attestable(device)] method of this actor, and no \
+                 stock kernel"
+            ),
+        )),
+    }
 }
 
 /// The kind an attribute marks a method to run as, apart from a handler:

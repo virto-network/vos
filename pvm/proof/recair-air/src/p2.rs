@@ -21,7 +21,7 @@
 //! | channel first | `prev[0, 8)` | `h` | an absorption over the last digest; the PoW's second permutation |
 //! | channel continue | `prev[0, 8)` | `prev[8, 16) + h` | an absorption's next chunks |
 //! | wired | `a` | `(c_8, c_9, 0, …)` | a draw, the PoW's first permutation |
-//! | tagged | `c[0, 8)` | `m` | a tag's block and a wire pair: the credential AIR's `C(T(name), x)` |
+//! | tagged | `c[0, 8)` | `m` | a tag's block and a wire pair, `C(T(name), x)` |
 //!
 //! **The tagged row has no selector of its own:** it sets leaf start's and
 //! node's selectors to 1 and channel first's to −1, with `act` zero and its

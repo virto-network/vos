@@ -2,7 +2,9 @@
 //! on the host: the default agent's program, linked, and the notes
 //! actor's package, derived, from their ELFs (`just build-agent
 //! build-test-actors`), written to `OUT_DIR` for `vos-phone light` to
-//! embed. Without the ELFs both are empty, and `light` says so.
+//! embed; and the stock kernels' release artifacts, `auth` and `owner`
+//! from the credential actor's ELF (`just build-credentials`), for `run`.
+//! Without the ELFs they are empty, and the commands say so.
 //!
 //! A package is encoded as `vos_light::release::Package` encodes it: its
 //! derivation, then its programs (`vos-light`'s test decodes one).
@@ -31,4 +33,17 @@ fn main() {
     };
     std::fs::write(out.join("agent.bin"), agent).unwrap();
     std::fs::write(out.join("notes.bin"), notes).unwrap();
+    let credentials_elf =
+        root.join("agent/programs/target/riscv64em-vos/release/vos-credentials.elf");
+    println!("cargo::rerun-if-changed={}", credentials_elf.display());
+    for kernel in ["auth", "owner"] {
+        let device = std::fs::read(&credentials_elf)
+            .map(|elf| {
+                vos_light::release::device(&elf, kernel)
+                    .expect("the stock kernel's release artifact")
+                    .encode()
+            })
+            .unwrap_or_default();
+        std::fs::write(out.join(format!("{kernel}.device")), device).unwrap();
+    }
 }

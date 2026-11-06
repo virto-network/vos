@@ -5,7 +5,7 @@ use std::ops::Bound;
 use std::time::{Duration, Instant};
 
 use vos_wire::ids::AgentId;
-use vos_wire::keys::Due;
+use vos_wire::keys::{Due, DueIndex};
 use vos_wire::result::Write;
 use vos_wire::{defaults, keys};
 
@@ -21,101 +21,103 @@ const SWEEP_RECHECK: Duration = Duration::from_secs(5);
 const SWEEP_PAUSE: Duration = Duration::from_secs(60);
 
 /// The leader's last sweeps, which pace its next, and where its scans of
-/// the due index start.
+/// each due index start.
 #[derive(Default)]
 pub(super) struct Sweeps {
-    /// The first row of the due index when the last sweep applied, or
-    /// failed alone, and when.
+    /// The first due row when the last sweep applied, or failed alone, and
+    /// when.
     swept: Option<((u64, Due), Instant)>,
     /// That a sweep left its first due row in place, said once.
     stuck: bool,
-    /// A key at or below every row the due index holds: the first row the
-    /// last scan found, or past every row when it found none, lowered by
-    /// each row this leadership's batches write since. A sweep deletes
-    /// rows from the index's start, and its scans would otherwise pass
-    /// over each deletion until the store compacts it away. None until a
-    /// scan from the start.
-    floor: Option<Vec<u8>>,
+    /// Per due index ([`DueIndex`]), a key at or below every row it holds:
+    /// the first row the last scan found, or past every row when it found
+    /// none, lowered by each row this leadership's batches write since. A
+    /// sweep deletes rows from an index's start, and its scans would
+    /// otherwise pass over each deletion until the store compacts it away.
+    /// None until a scan from the start.
+    floors: [Option<Vec<u8>>; 2],
 }
 
 impl Sweeps {
-    /// A sweep that found `first` the first row of the due index applied,
-    /// or failed alone: the next waits while it left that row in place.
+    /// A sweep that found `first` the first due row applied, or failed
+    /// alone: the next waits while it left that row in place.
     pub(super) fn swept(&mut self, first: (u64, Due)) {
         self.swept = Some((first, Instant::now()));
     }
 
     /// A batch of this leadership's, about to fly, writes `writes`: a row
-    /// of the due index it writes may sit below the floor.
+    /// of a due index it writes may sit below that index's floor.
     pub(super) fn writes(&mut self, writes: &[Write]) {
-        let Some(floor) = self.floor.as_mut() else {
-            return;
-        };
-        let prefix = keys::due_prefix();
-        for write in writes {
-            if write.value.is_some() && write.key.starts_with(&prefix) && write.key < *floor {
-                floor.clone_from(&write.key);
+        for index in DueIndex::ALL {
+            let Some(floor) = self.floors[index as usize].as_mut() else {
+                continue;
+            };
+            let prefix = index.prefix();
+            for write in writes {
+                if write.value.is_some() && write.key.starts_with(prefix) && write.key < *floor {
+                    floor.clone_from(&write.key);
+                }
             }
         }
     }
 
     /// A batch in flight did not apply as proposed: the rows its writes
-    /// deleted may stand, below the floor its scan left. The next scan
-    /// starts from the index's start.
+    /// deleted may stand, below the floors its scans left. The next scans
+    /// start from each index's start.
     pub(super) fn lost_writes(&mut self) {
-        self.floor = None;
+        self.floors = Default::default();
     }
 
-    /// The first row of `agent`'s due index on `snapshot`, the state with
-    /// every batch of this leadership's that flies over it: the floor rises
-    /// to it.
+    /// Where a scan of `index` starts: its floor, else its start.
+    fn start(&self, index: DueIndex) -> Bound<&[u8]> {
+        self.floors[index as usize]
+            .as_deref()
+            .map_or(Bound::Unbounded, Bound::Included)
+    }
+
+    /// The earliest of the first rows of `agent`'s due indexes on
+    /// `snapshot`, the state with every batch of this leadership's that
+    /// flies over it: each floor rises to its index's first.
     pub(super) fn first_due(
         &mut self,
         snapshot: &Snapshot,
         agent: AgentId,
     ) -> Result<Option<(u64, Due)>, Fault> {
-        let prefix = keys::due_prefix();
-        let start = self
-            .floor
-            .as_deref()
-            .map_or(Bound::Unbounded, Bound::Included);
-        let mut found = None;
-        for row in snapshot.scan_from(agent, &prefix, start) {
-            let (key, _) = row?;
-            if let Some(due) = keys::due_entry(&key) {
-                found = Some((key, due));
-                break;
+        let mut earliest: Option<(u64, Due)> = None;
+        for index in DueIndex::ALL {
+            let mut found = None;
+            for row in snapshot.scan_from(agent, index.prefix(), self.start(index)) {
+                let (key, _) = row?;
+                if let Some(due) = keys::due_entry(&key) {
+                    found = Some((key, due));
+                    break;
+                }
             }
+            let (key, due) = found.unzip();
+            self.floors[index as usize] = Some(key.unwrap_or_else(|| index.past_every_row()));
+            earliest = match (earliest, due) {
+                (Some(earliest), Some(due)) => Some(earliest.min(due)),
+                (earliest, due) => earliest.or(due),
+            };
         }
-        let (key, due) = found.unzip();
-        self.floor = Some(key.unwrap_or_else(past_every_row));
-        Ok(due)
+        Ok(earliest)
     }
 
-    /// The rows of `agent`'s due index due at `time`, earliest first, as
-    /// many as a sweep lists.
+    /// The rows of `agent`'s due indexes due at `time`, earliest first in
+    /// each, as many of each as a sweep lists.
     pub(super) fn due_rows(
         &self,
         snapshot: &Snapshot,
         agent: AgentId,
         time: u64,
     ) -> Result<Vec<(u64, Due)>, Fault> {
-        let prefix = keys::due_prefix();
-        let start = self
-            .floor
-            .as_deref()
-            .map_or(Bound::Unbounded, Bound::Included);
-        let keys = snapshot
-            .scan_from(agent, &prefix, start)
-            .map(|row| row.map(|(key, _)| key));
-        Ok(keys::due_rows(keys, time, defaults::SWEEP_LIMIT)?)
+        let scan = |index: DueIndex| {
+            snapshot
+                .scan_from(agent, index.prefix(), self.start(index))
+                .map(|row| row.map(|(key, _)| key))
+        };
+        Ok(keys::sweep_rows(scan, time, defaults::SWEEP_LIMIT)?)
     }
-}
-
-/// A key past every row of the due index: the last binding's at the last
-/// time.
-fn past_every_row() -> Vec<u8> {
-    keys::due(u64::MAX, Due::Binding([0xff; 32]))
 }
 
 impl Leader {
@@ -224,7 +226,7 @@ mod tests {
             .to_vec();
         apply(&store, 2, &gone);
         assert_eq!(first(&mut sweeps), Some(30));
-        assert_eq!(sweeps.floor.as_deref(), Some(&due(30)[..]));
+        assert_eq!(sweeps.floors[0].as_deref(), Some(&due(30)[..]));
         // A batch of this leadership's writes a row due sooner.
         let sooner = [put(due(15))];
         sweeps.writes(&sooner);
@@ -247,5 +249,30 @@ mod tests {
         sweeps.writes(&later);
         apply(&store, 5, &later);
         assert_eq!(first(&mut sweeps), Some(50));
+    }
+
+    /// Bindings due before a session's row, more than a sweep forgets: the
+    /// sweep lists its most of them and the session's row, each index from
+    /// its own floor, and the first due row is the earliest of both.
+    #[test]
+    fn due_bindings_hold_no_session_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Fjall::open(dir.path()).unwrap();
+        let mut sweeps = Sweeps::default();
+        let bindings: Vec<Write> = (0..2 * defaults::SWEEP_BINDINGS)
+            .map(|n| put(keys::due(5, Due::Binding([n as u8; 32]))))
+            .collect();
+        apply(&store, 1, &bindings);
+        apply(&store, 2, &[put(due(10))]);
+        let first = sweeps.first_due(&store.snapshot(), AGENT).unwrap();
+        assert_eq!(first, Some((5, Due::Binding([0; 32]))));
+        let rows = sweeps.due_rows(&store.snapshot(), AGENT, 10).unwrap();
+        assert_eq!(rows.len(), 1 + defaults::SWEEP_BINDINGS);
+        assert_eq!(rows[0], (10, Due::Session(SessionId(10))));
+        assert!(
+            rows[1..]
+                .iter()
+                .all(|(at, due)| *at == 5 && matches!(due, Due::Binding(_)))
+        );
     }
 }

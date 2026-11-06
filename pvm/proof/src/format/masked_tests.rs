@@ -47,16 +47,12 @@ fn least_queries(base: FormatParams) -> Option<usize> {
 }
 
 /// Variant (c) moves no unmasked count: every format but the masked ones
-/// counted on their masked shapes (39, 44, 46) samples its composition at the
+/// counted on their masked shapes (39, 46) samples its composition at the
 /// out-of-domain point itself and counts what it pins, format 28 82.60;
 /// format 39's reference is 28's at (c)'s levels.
 #[test]
 fn the_unmasked_counts_do_not_move() {
-    let counted_masked = [
-        MASKED_WRAP.number,
-        DEVICE_PROOF.number,
-        CREDENTIAL_PROOF.number,
-    ];
+    let counted_masked = [MASKED_WRAP.number, DEVICE_PROOF.number];
     for format in REGISTRY {
         let doublings = u32::from(counted_masked.contains(&format.number));
         assert_eq!(
@@ -64,7 +60,7 @@ fn the_unmasked_counts_do_not_move() {
             "format {}",
             format.number
         );
-        assert_eq!(format.masked, [39, 44, 46].contains(&format.number));
+        assert_eq!(format.masked, [39, 46].contains(&format.number));
         assert_eq!(
             format.masking.is_some(),
             counted_masked.contains(&format.number),
@@ -300,27 +296,4 @@ fn the_masked_wraps_masking_meets_its_bounds() {
     let smallest = 1usize << 11;
     assert!(4 * h <= smallest && 3 * h <= 2 * smallest);
     assert!(31 * masking.salt_columns >= 248);
-}
-
-/// Format 44 counted on the credential AIR's masked shape at 110 / 62
-/// (62.920; blowup 4, 47 queries, PoW 16), the query term binding, the
-/// DEEP batching 0.01 bits above it.
-#[test]
-fn the_credential_format_counts_on_its_masked_shape() {
-    let params = CREDENTIAL_PROOF.params;
-    let bits = security_bits(&params, &CREDENTIAL_REFERENCE).unwrap();
-    assert_eq!(bits.conjectured, 110);
-    assert!(bits.proven >= INNER_FLOOR.proven);
-    let proven = count(&params, &CREDENTIAL_REFERENCE);
-    let terms = term_bits(&params, &CREDENTIAL_REFERENCE).unwrap();
-    eprintln!(
-        "{} queries: {proven:.3} proven bits, {terms:?}",
-        params.n_queries
-    );
-    assert!((62.92..62.93).contains(&proven), "{proven}");
-    assert_eq!(terms.query, proven);
-    let bits = security_bits(&CREDENTIAL_PROOF.params, &CREDENTIAL_REFERENCE).unwrap();
-    assert_eq!(bits, CREDENTIAL_PROOF.bits);
-    assert!(CREDENTIAL_PROOF.meets_floors());
-    assert_eq!(lookup(44), Some(&CREDENTIAL_PROOF));
 }

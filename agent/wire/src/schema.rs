@@ -88,45 +88,60 @@ pub struct Credentials {
     pub guards: Vec<(MethodId, CredentialGuard)>,
 }
 
-/// What a credentialed call's origin must be for a method to run it
-/// (`identity-and-authority.md` §5), from its handler's attribute. Its
-/// index is the statement's kind.
+/// The device kernel a proven call's proof is of, for a method to run it
+/// (`identity-and-authority.md` §5, `light-node.md` §4.3), from its
+/// handler's attribute: one of the stock kernels of the agent's credential
+/// actor, whose checks ingress runs, or a device kernel of the method's own
+/// actor, whose claim its handler checks at apply.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum CredentialGuard {
-    /// `#[msg(credential = Auth("name"))]`: an `Anonymous` origin of the
-    /// scope `name` gives, 1 to [`MAX_GUARD_NAME`] bytes, in this space,
-    /// agent and instance. `device` names the attestable kernel whose
-    /// device proofs it also takes; `once` admits each nullifier once in
-    /// the scope.
+    /// `#[msg(credential = Auth("name"))]`: the stock `auth` kernel, an
+    /// `Anonymous` origin of the scope `name` gives, 1 to
+    /// [`MAX_GUARD_NAME`] bytes, in this space, agent and instance; `once`
+    /// admits each nullifier once in the scope.
     #[codec(index = 0)]
-    Auth {
-        name: Vec<u8>,
-        device: Option<Vec<u8>>,
-        once: bool,
-    },
-    /// `#[msg(credential = Owner)]`: an `Owner` origin, whose digest the
-    /// handler compares with the row it debits.
+    Auth { name: Vec<u8>, once: bool },
+    /// `#[msg(credential = Owner)]` or `#[msg(proven = owner)]`: the stock
+    /// `owner` kernel, an `Owner` origin, whose digest the handler compares
+    /// with the row it debits.
     #[codec(index = 1)]
     Owner,
+    /// `#[msg(proven = name)]`: the device kernel `name` of this actor, a
+    /// `Kernel` origin naming its program; the handler takes the claim as
+    /// its first argument and checks it.
+    #[codec(index = 2)]
+    Kernel { name: Vec<u8> },
+}
+
+/// The stock kernels' names: the device kernels of the credential actor.
+pub mod stock {
+    /// Auth's: a member's leaf under a root of the ring, and its nullifier
+    /// in a scope.
+    pub const AUTH: &str = "auth";
+    /// Owner's: the secret behind an owner digest.
+    pub const OWNER: &str = "owner";
 }
 
 impl CredentialGuard {
-    /// The statement's kind it admits, its encoding's index.
-    pub const fn kind(&self) -> u8 {
-        match self {
-            CredentialGuard::Auth { .. } => 0,
-            CredentialGuard::Owner => 1,
-        }
-    }
-
-    /// Whether `caller` is an origin it admits: its kind's.
+    /// Whether `caller` is an origin it admits: its kernel's.
     pub fn admits(&self, caller: &crate::ids::Principal) -> bool {
         use crate::ids::Principal;
         matches!(
             (self, caller),
             (CredentialGuard::Auth { .. }, Principal::Anonymous { .. })
                 | (CredentialGuard::Owner, Principal::Owner(_))
+                | (CredentialGuard::Kernel { .. }, Principal::Kernel { .. })
         )
+    }
+
+    /// The device kernel's method name, and whether it is a stock kernel of
+    /// the credential actor rather than one of the method's own actor.
+    pub fn kernel(&self) -> (&[u8], bool) {
+        match self {
+            CredentialGuard::Auth { .. } => (stock::AUTH.as_bytes(), true),
+            CredentialGuard::Owner => (stock::OWNER.as_bytes(), true),
+            CredentialGuard::Kernel { name } => (name, false),
+        }
     }
 }
 
@@ -147,10 +162,10 @@ pub struct MethodSchema {
     /// client names: a method that query calls reads the caller's snapshot,
     /// marked or not.
     pub linearizable: bool,
-    /// The credential a caller proves, if any: only a command takes one,
+    /// The device kernel a caller proves, if any: only a command takes one,
     /// with no role and not linearizable. A method with none refuses an
-    /// `Anonymous` or `Owner` caller, and one with a guard refuses every
-    /// other caller. Boxed, so every method does not carry its size.
+    /// `Anonymous`, `Owner` or `Kernel` caller, and one with a guard refuses
+    /// every other caller. Boxed, so every method does not carry its size.
     pub credential: Option<alloc::boxed::Box<CredentialGuard>>,
 }
 
@@ -178,9 +193,10 @@ pub enum SchemaError {
     /// A method marked linearizable that is not a query: what runs through
     /// the log reads its state as it applies.
     Linearizable(MethodId),
-    /// A credential guard on a method that is not a command, or beside a
-    /// role or `linearizable`, or an auth guard's name empty or past
-    /// [`MAX_GUARD_NAME`], or its device kernel's past [`MAX_NAME`].
+    /// A guard on a method that is not a command, or beside a role or
+    /// `linearizable`, an auth guard's name empty or past
+    /// [`MAX_GUARD_NAME`], or a kernel guard naming no device kernel of the
+    /// program.
     Credential(MethodId),
 }
 
@@ -293,6 +309,15 @@ impl Schema {
         if self.methods.len() > MAX_METHODS {
             return Err(SchemaError::Limits);
         }
+        // The device kernels' names, sorted: a kernel guard's name is looked
+        // up, not compared with every method's.
+        let mut kernels: Vec<&[u8]> = self
+            .methods
+            .iter()
+            .filter(|method| method.kind == Kind::Device)
+            .map(|method| method.name.as_slice())
+            .collect();
+        kernels.sort_unstable();
         let mut ids: Vec<u32> = Vec::with_capacity(self.methods.len());
         for method in &self.methods {
             if method.name.len() > MAX_NAME
@@ -310,7 +335,7 @@ impl Schema {
                 return Err(SchemaError::Linearizable(method.id));
             }
             if let Some(guard) = &method.credential
-                && !guard_fits(method, guard)
+                && !guard_fits(method, guard, &kernels)
             {
                 return Err(SchemaError::Credential(method.id));
             }
@@ -325,13 +350,13 @@ impl Schema {
         }
     }
 
-    /// Whether a method holds an auth guard, which needs the agent's
-    /// credential actor.
-    pub fn guards_auth(&self) -> bool {
+    /// Whether a method's guard names a stock kernel, which needs the
+    /// agent's credential actor.
+    pub fn guards_stock(&self) -> bool {
         self.methods.iter().any(|method| {
             matches!(
                 method.credential.as_deref(),
-                Some(CredentialGuard::Auth { .. })
+                Some(CredentialGuard::Auth { .. } | CredentialGuard::Owner)
             )
         })
     }
@@ -350,16 +375,13 @@ impl Schema {
 }
 
 /// Whether `guard` may sit on `method`: a command's, with no role and not
-/// linearizable, an auth guard's names within their bounds.
-fn guard_fits(method: &MethodSchema, guard: &CredentialGuard) -> bool {
-    let names = match guard {
-        CredentialGuard::Auth { name, device, .. } => {
-            (1..=MAX_GUARD_NAME).contains(&name.len())
-                && device
-                    .as_ref()
-                    .is_none_or(|device| device.len() <= MAX_NAME)
-        }
+/// linearizable; an auth guard's name within its bounds, a kernel guard's
+/// one of `kernels`, the program's device kernels' names, sorted.
+fn guard_fits(method: &MethodSchema, guard: &CredentialGuard, kernels: &[&[u8]]) -> bool {
+    let named = match guard {
+        CredentialGuard::Auth { name, .. } => (1..=MAX_GUARD_NAME).contains(&name.len()),
         CredentialGuard::Owner => true,
+        CredentialGuard::Kernel { name } => kernels.binary_search(&name.as_slice()).is_ok(),
     };
-    names && method.kind == Kind::Command && method.role.is_none() && !method.linearizable
+    named && method.kind == Kind::Command && method.role.is_none() && !method.linearizable
 }

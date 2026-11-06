@@ -223,14 +223,10 @@ struct LaneCensus {
 }
 
 impl Circuit {
-    /// The components' log sizes, for a circuit with all three
-    /// ([`Circuit::check_wiring`], which every caller runs first, refuses
-    /// one without `h8`; its sizes are [`Circuit::log_sizes_without_h8`]).
+    /// The components' log sizes ([`Circuit::check_wiring`], which every
+    /// caller runs first, refuses a circuit without `h8`).
     pub fn log_sizes(&self) -> [u32; 3] {
-        debug_assert!(
-            !self.h8.is_empty(),
-            "a circuit without h8 has two log sizes, log_sizes_without_h8's"
-        );
+        debug_assert!(!self.h8.is_empty(), "a circuit has h8 rows");
         [self.p2.len(), self.qm31.len(), self.h8.len()].map(|rows| rows.ilog2())
     }
 
@@ -283,19 +279,6 @@ impl Circuit {
         let stats = self.check_relation(true)?;
         self.check_reads()?;
         Ok(stats)
-    }
-
-    /// [`Circuit::check_wiring`] for a circuit of `p2` and `qm31` alone (the
-    /// credential AIR's set): no `h8` row, the others as there.
-    pub fn check_wiring_without_h8(&self) -> Result<WiringStats, WiringError> {
-        let stats = self.check_relation(false)?;
-        self.check_reads()?;
-        Ok(stats)
-    }
-
-    /// The log sizes of `p2` and `qm31`, for a circuit without `h8`.
-    pub fn log_sizes_without_h8(&self) -> [u32; 2] {
-        [self.p2.len(), self.qm31.len()].map(|rows| rows.ilog2())
     }
 
     /// Every value a gate reads is a wire's, or a lane some row absorbs:

@@ -164,6 +164,7 @@ enum Row {
     Cutoff = 0x2a,
     Lamport = 0x2b,
     Held = 0x2c,
+    BindingDue = 0x2d,
 }
 
 /// The root builder's rows, each tagged after [`Owner::Tree`]: the rows of
@@ -648,32 +649,76 @@ pub enum Due {
     Binding([u8; 32]),
 }
 
-/// The kind byte of each [`Due`] in its row's key.
+/// The kind byte of a session's or a workflow's [`Due`] in its row's key.
 #[derive(Clone, Copy)]
 #[repr(u8)]
 enum DueKind {
     Session = 0,
     Workflow = 1,
-    Binding = 2,
+}
+
+/// The two indexes of due rows, each scanned from its own start: the
+/// sessions' and workflows' rows, and the bindings' beside them, so a
+/// backlog of either never holds the other back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DueIndex {
+    Rows = 0,
+    Bindings = 1,
+}
+
+impl DueIndex {
+    /// Both, in the order a sweep lists them.
+    pub const ALL: [Self; 2] = [Self::Rows, Self::Bindings];
+
+    /// The index `entry`'s row is in.
+    pub const fn of(entry: &Due) -> Self {
+        match entry {
+            Due::Session(_) | Due::Workflow(_) => Self::Rows,
+            Due::Binding(_) => Self::Bindings,
+        }
+    }
+
+    /// Its keys' prefix.
+    pub const fn prefix(self) -> &'static [u8] {
+        const ROWS: [u8; 2] = Row::Due.prefix();
+        const BINDINGS: [u8; 2] = Row::BindingDue.prefix();
+        match self {
+            Self::Rows => &ROWS,
+            Self::Bindings => &BINDINGS,
+        }
+    }
+
+    /// A key past every row it holds: its last row's at the last time.
+    pub fn past_every_row(self) -> Vec<u8> {
+        match self {
+            Self::Rows => due(u64::MAX, Due::Workflow(WorkflowId(u64::MAX))),
+            Self::Bindings => due(u64::MAX, Due::Binding([0xff; 32])),
+        }
+    }
+
+    /// The most of its rows one sweep lists, `limit` the sessions' and
+    /// workflows'.
+    pub const fn most(self, limit: usize) -> usize {
+        match self {
+            Self::Rows => limit,
+            Self::Bindings => crate::defaults::SWEEP_BINDINGS,
+        }
+    }
 }
 
 /// A row of the due index, which the leader reads to time its sweeps and
-/// lists in them: the batch time it is due at, then its entry's kind and
-/// id, big-endian, so a scan meets the earliest first. A session's row is
-/// due once it may have expired ([`crate::expiry::due`]), and lies at or
-/// before that. A binding's id is its 32 bytes; the kind byte fixes the
-/// id's width, so the keys stay prefix-free.
+/// lists in them: the batch time it is due at, then, for a session or a
+/// workflow, its kind and id, big-endian, so a scan meets the earliest
+/// first. A session's row is due once it may have expired
+/// ([`crate::expiry::due`]), and lies at or before that. A binding's row is
+/// in its own index ([`DueIndex::Bindings`]): its time, then its 32 bytes.
 pub fn due(at: u64, entry: Due) -> Vec<u8> {
     let (kind, number) = match &entry {
         Due::Session(id) => (DueKind::Session, id.0),
         Due::Workflow(id) => (DueKind::Workflow, id.0),
         Due::Binding(binding) => {
-            return key(&[
-                &Row::Due.prefix(),
-                &at.to_be_bytes(),
-                &[DueKind::Binding as u8],
-                binding,
-            ]);
+            return key(&[&Row::BindingDue.prefix(), &at.to_be_bytes(), binding]);
         }
     };
     key(&[
@@ -684,88 +729,93 @@ pub fn due(at: u64, entry: Due) -> Vec<u8> {
     ])
 }
 
-/// The length of a [`due`] key of a session or a workflow; a binding's is
-/// 24 bytes more.
+/// The length of a [`due`] key of a session or a workflow.
 const DUE_LEN: usize = 2 + 8 + 1 + 8;
 
-/// The prefix of the due index.
+/// The length of a [`due`] key of a binding.
+const BINDING_DUE_LEN: usize = 2 + 8 + 32;
+
+/// The prefix of the sessions' and workflows' due index.
 pub fn due_prefix() -> Vec<u8> {
-    Row::Due.prefix().to_vec()
+    DueIndex::Rows.prefix().to_vec()
 }
 
 /// The time and entry a [`due`] key names; `None` for any other key.
 pub fn due_entry(key: &[u8]) -> Option<(u64, Due)> {
-    if key.len() < DUE_LEN || key[..2] != Row::Due.prefix() {
+    if key.len() < 10 {
         return None;
     }
     let at = u64::from_be_bytes(key[2..10].try_into().ok()?);
-    let id = &key[11..];
-    let number = || id.try_into().ok().map(u64::from_be_bytes);
+    if key[..2] == Row::BindingDue.prefix() {
+        return (key.len() == BINDING_DUE_LEN)
+            .then(|| Some((at, Due::Binding(key[10..].try_into().ok()?))))
+            .flatten();
+    }
+    if key.len() != DUE_LEN || key[..2] != Row::Due.prefix() {
+        return None;
+    }
+    let number = u64::from_be_bytes(key[11..].try_into().ok()?);
     let entry = match key[10] {
-        kind if kind == DueKind::Session as u8 => Due::Session(SessionId(number()?)),
-        kind if kind == DueKind::Workflow as u8 => Due::Workflow(WorkflowId(number()?)),
-        kind if kind == DueKind::Binding as u8 => Due::Binding(id.try_into().ok()?),
+        kind if kind == DueKind::Session as u8 => Due::Session(SessionId(number)),
+        kind if kind == DueKind::Workflow as u8 => Due::Workflow(WorkflowId(number)),
         _ => return None,
     };
     Some((at, entry))
 }
 
-/// What one sweep lists of the due index, in its order: at most `limit`
-/// sessions' and workflows' rows, and at most
-/// [`crate::defaults::SWEEP_BINDINGS`] binding digests' beside them, so a
-/// backlog of either kind never holds the other back.
+/// What one sweep lists of the due rows: at most `limit` sessions' and
+/// workflows' rows, and at most [`crate::defaults::SWEEP_BINDINGS`]
+/// binding digests' beside them.
 #[derive(Clone, Copy, Debug)]
 pub struct SweepBudget {
     limit: usize,
-    others: usize,
-    bindings: usize,
+    taken: [usize; 2],
 }
 
 impl SweepBudget {
     pub const fn new(limit: usize) -> Self {
         Self {
             limit,
-            others: 0,
-            bindings: 0,
+            taken: [0; 2],
         }
     }
 
     /// Whether a sweep lists `entry` after those it took: false once its
-    /// kind's count is full.
+    /// index's count is full.
     pub fn take(&mut self, entry: &Due) -> bool {
-        let (count, most) = match entry {
-            Due::Binding(_) => (&mut self.bindings, crate::defaults::SWEEP_BINDINGS),
-            Due::Session(_) | Due::Workflow(_) => (&mut self.others, self.limit),
-        };
-        if *count == most {
+        let index = DueIndex::of(entry);
+        let count = &mut self.taken[index as usize];
+        if *count == index.most(self.limit) {
             return false;
         }
         *count += 1;
         true
     }
 
-    /// The most rows a sweep looks at: both counts' worth.
+    /// The most rows a sweep lists: both counts' worth.
     pub const fn rows(&self) -> usize {
         self.limit + crate::defaults::SWEEP_BINDINGS
     }
 }
 
-/// Of the due index's keys in order, from its start, the rows due at
-/// `time`, earliest first, within a [`SweepBudget`] of `limit`, a row of a
-/// kind whose count is full passed over: at most the budget's rows are
-/// looked at, a key under the index that names no row of it is passed
-/// over, and the keys end at the first past the index.
+/// Of one due index's keys in order, from its start, the rows due at
+/// `time`, earliest first, at most `most` of them: a key under the index
+/// that names no row of it is passed over, and the keys end at the first
+/// past the index or not yet due.
 pub fn due_rows<K: AsRef<[u8]>, E>(
+    index: DueIndex,
     keys: impl IntoIterator<Item = Result<K, E>>,
     time: u64,
-    limit: usize,
+    most: usize,
 ) -> Result<Vec<(u64, Due)>, E> {
-    let prefix = Row::Due.prefix();
-    let mut budget = SweepBudget::new(limit);
+    let prefix = index.prefix();
     let mut due = Vec::new();
-    for key in keys.into_iter().take(budget.rows()) {
+    for key in keys {
+        if due.len() == most {
+            break;
+        }
         let key = key?;
-        if !key.as_ref().starts_with(&prefix) {
+        if !key.as_ref().starts_with(prefix) {
             break;
         }
         let Some((at, entry)) = due_entry(key.as_ref()) else {
@@ -774,9 +824,26 @@ pub fn due_rows<K: AsRef<[u8]>, E>(
         if at > time {
             break;
         }
-        if budget.take(&entry) {
-            due.push((at, entry));
-        }
+        due.push((at, entry));
+    }
+    Ok(due)
+}
+
+/// The rows a sweep at `time` lists, each due index's keys in order as
+/// `scan` gives them from the index's prefix: the sessions' and workflows'
+/// rows, at most `limit`, then the bindings'.
+pub fn sweep_rows<I, K, E>(
+    mut scan: impl FnMut(DueIndex) -> I,
+    time: u64,
+    limit: usize,
+) -> Result<Vec<(u64, Due)>, E>
+where
+    I: IntoIterator<Item = Result<K, E>>,
+    K: AsRef<[u8]>,
+{
+    let mut due = Vec::new();
+    for index in DueIndex::ALL {
+        due.extend(due_rows(index, scan(index), time, index.most(limit))?);
     }
     Ok(due)
 }

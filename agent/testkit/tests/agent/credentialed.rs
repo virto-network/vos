@@ -1,18 +1,19 @@
-//! Credentialed calls at apply (`identity-and-authority.md` §5), in the
-//! default agent: the refusals by the batch's time (an expired call, a
-//! recorded binding digest, a stale root, an admitted `once` nullifier),
-//! each writing nothing; the binding digest recorded whatever the method
-//! does, and forgotten by the sweep; a `once` nullifier recorded only on
-//! `Ok`; the guards (an origin admitted by its guard alone, an auth scope
-//! the guard's); the credential actor's row and its install's refusals;
-//! and the demo's ledger of named rows, paid by its owners' proofs.
+//! Proven calls at apply (`identity-and-authority.md` §5), in the default
+//! agent: the refusals by the batch's time (an expired call, a recorded
+//! binding digest, a stale root, an admitted `once` nullifier), each
+//! writing nothing; the binding digest recorded whatever the method does,
+//! and forgotten by the sweep; a `once` nullifier recorded only on `Ok`;
+//! the guards (an origin admitted by its guard alone, an auth scope the
+//! guard's, a kernel guard's handler taking the claim first); the
+//! credential actor's row and its install's refusals; and the demo's
+//! ledger of named rows, paid by its owners' proofs.
 
 use vos_testkit::programs::{actor, actor_elf, credentials, credentials_elf, method};
 use vos_wire::abi::cap::Target;
 use vos_wire::abi::{Failure, Refusal};
 use vos_wire::batch::{Admin, CredentialedInput, Input, Request};
-use vos_wire::credentials::{self, Digest, Ring, RootEntry};
-use vos_wire::defaults::{BINDING_KEPT_MS, ROOT_MAX_AGE};
+use vos_wire::credentials::{self, AuthClaim, Digest, OwnerClaim, Ring, RootEntry};
+use vos_wire::defaults::{self, BINDING_KEPT_MS, ROOT_MAX_AGE};
 use vos_wire::ids::{InstanceId, Principal, Session};
 use vos_wire::ingress::Grant;
 use vos_wire::keys::{self, Due};
@@ -161,8 +162,9 @@ impl Agent {
         })
     }
 
-    /// A credentialed call of `name` by `origin`, a fresh binding digest,
-    /// good until `expires_ms`.
+    /// A proven call of `name` by `origin`, a fresh binding digest, good
+    /// until `expires_ms`: its claim the stock kernel's the origin is of,
+    /// an auth claim's root `root` (zeros if none).
     fn call<A: Encode>(
         &mut self,
         origin: Principal,
@@ -173,14 +175,31 @@ impl Agent {
         root: Option<Digest>,
     ) -> CredentialedInput {
         self.nonce += 1;
+        let binding = [self.nonce; 32];
+        let claim = match origin {
+            Principal::Anonymous { scope, nullifier } => AuthClaim {
+                map_root: root.unwrap_or([0; 32]),
+                scope,
+                nullifier,
+                binding,
+            }
+            .encode(),
+            Principal::Owner(owner) => OwnerClaim { owner, binding }.encode(),
+            _ => binding.to_vec(),
+        };
+        let kernel = match origin {
+            Principal::Owner(_) => "owner",
+            _ => "auth",
+        };
         CredentialedInput {
             origin,
             instance,
             method: method(self.program(instance), name),
             arguments: arguments.encode(),
-            binding: [self.nonce; 32],
+            binding,
             expires_ms,
-            root,
+            claim,
+            kernel: method(&self.credentials, kernel),
         }
     }
 
@@ -646,4 +665,124 @@ fn a_credentialed_calls_own_work_is_within_a_steps_reserve() {
             "{host}: {each}"
         );
     }
+}
+
+/// A kernel guard's handler takes the claim before the call's arguments,
+/// its caller the kernel's program, and checks the claim itself: the
+/// `device` actor's `login` records each nullifier and refuses it the
+/// second time, the binding digest recorded all the same. Its agent needs
+/// no credential actor, and an auth origin is no kernel's.
+#[test]
+fn a_kernel_guards_handler_takes_the_claim_first() {
+    let mut node = Node::new();
+    let device = InstanceId(4);
+    let elf = std::fs::read(actor_elf("device")).unwrap();
+    let step = Agent::install(&mut node, device, &elf, &[]);
+    assert!(matches!(ran(&step).outcome, Outcome::Done(_)), "{step:?}");
+    let login = method(&actor("device"), "login");
+    let claim = |nullifier: u8, binding: u8| {
+        [
+            &[0u8][..],
+            &[1; 32],
+            &[2; 32],
+            &[nullifier; 32],
+            &[binding; 32],
+        ]
+        .concat()
+    };
+    let auth = method(&actor("device"), "auth");
+    let call = |origin, claim: Vec<u8>, binding| CredentialedInput {
+        origin,
+        instance: device,
+        method: login,
+        arguments: Vec::new(),
+        binding,
+        expires_ms: START + 1_000,
+        claim,
+        kernel: auth,
+    };
+    let program = [0x70; 32];
+    let kernel = Principal::Kernel { program };
+    let step = |node: &mut Node, call: CredentialedInput| {
+        node.batch(START, vec![Input::Credentialed(Box::new(call))])
+            .steps
+            .remove(0)
+    };
+    let first = step(&mut node, call(kernel, claim(7, 1), [1; 32]));
+    match &ran(&first).outcome {
+        Outcome::Done(reply) => assert_eq!(
+            <([u8; 32], [u8; 32])>::decode_exact(reply),
+            Some(([7; 32], program)),
+            "the claim's nullifier, and the program its caller names"
+        ),
+        other => panic!("the first sign-in: {other:?}"),
+    }
+    let seen = step(&mut node, call(kernel, claim(7, 2), [2; 32]));
+    assert_eq!(detail(&seen), 0, "the handler refuses a nullifier it saw");
+    assert_eq!(writes(&seen), 2, "the binding digest recorded all the same");
+    let other = step(&mut node, call(kernel, claim(8, 3), [3; 32]));
+    assert!(matches!(ran(&other).outcome, Outcome::Done(_)));
+    let anonymous = Principal::Anonymous {
+        scope: [2; 32],
+        nullifier: [9; 32],
+    };
+    let wrong = step(&mut node, call(anonymous, claim(9, 4), [4; 32]));
+    assert_eq!(failed(&wrong), Failure::Forbidden, "an auth origin");
+    let short = step(&mut node, call(kernel, claim(9, 5)[..64].to_vec(), [5; 32]));
+    assert!(
+        matches!(ran(&short).outcome, Outcome::Failed { .. }),
+        "a claim the handler cannot decode"
+    );
+    let long = [claim(9, 6), vec![0]].concat();
+    let long = step(&mut node, call(kernel, long, [6; 32]));
+    assert!(
+        matches!(ran(&long).outcome, Outcome::Failed { .. }),
+        "a claim with bytes past its kernel's public arguments"
+    );
+    let mut elsewhere = call(kernel, claim(9, 7), [7; 32]);
+    elsewhere.kernel = login;
+    let elsewhere = step(&mut node, elsewhere);
+    assert_eq!(
+        failed(&elsewhere),
+        Failure::Forbidden,
+        "a proof of another kernel than the guard names"
+    );
+}
+
+/// A batch runs at most `BATCH_CREDENTIALED` credentialed calls: the first
+/// past them cuts it short, and runs in the next batch.
+#[test]
+fn a_batch_runs_at_most_its_credentialed_calls() {
+    let mut agent = Agent::new();
+    let time = START + 10;
+    agent.row(time, "alice", owner(1), 100);
+    agent.row(time, "bob", owner(2), 0);
+    let calls: Vec<CredentialedInput> = (0..=defaults::BATCH_CREDENTIALED)
+        .map(|_| {
+            let transfer = (b"alice".to_vec(), b"bob".to_vec(), 1u64);
+            agent.call(
+                Principal::Owner(owner(1)),
+                PURSES,
+                "transfer",
+                transfer,
+                time,
+                None,
+            )
+        })
+        .collect();
+    let inputs = calls
+        .iter()
+        .map(|call| Input::Credentialed(Box::new(call.clone())))
+        .collect();
+    let result = agent.node.batch(time, inputs);
+    assert_eq!(result.steps.len(), defaults::BATCH_CREDENTIALED);
+    for step in &result.steps {
+        assert!(matches!(ran(step).outcome, Outcome::Done(_)), "{step:?}");
+    }
+    let last = agent.step(time, calls.last().unwrap());
+    assert!(matches!(ran(&last).outcome, Outcome::Done(_)), "{last:?}");
+    assert_eq!(
+        agent.balance("bob"),
+        Some(defaults::BATCH_CREDENTIALED as u64 + 1)
+    );
 }

@@ -31,10 +31,11 @@ struct Handler {
     arguments: Vec<(Ident, Type)>,
     /// Which arguments are `#[public]`, by their position.
     public: Vec<bool>,
+    /// Whether its first argument is a kernel guard's claim, decoded
+    /// whole from its own part (`vos_sdk::device::Claim`).
+    claimed: bool,
     reply: Type,
     error: Option<Type>,
-    /// Its auth guard's device kernel, by name, where the guard names one.
-    guard_device: Option<(String, Span)>,
 }
 
 impl Handler {
@@ -100,8 +101,8 @@ fn handler(
     {
         return Err(Error::new(
             span,
-            "only an #[attestable] method is a device kernel: `device = \"...\"` names one \
-             beside an auth guard",
+            "only an #[attestable] method is a device kernel: `proven = k` names one on a \
+             handler",
         ));
     }
     if options.device_kernel.is_none()
@@ -203,7 +204,6 @@ fn handler(
             "only a query (`&self`) is `linearizable`: what runs through the log already is",
         ));
     }
-    let guard_device = options.device.clone();
     guard(&mut options, kind)?;
     let Arguments {
         has_context,
@@ -247,9 +247,9 @@ fn handler(
         has_context,
         arguments,
         public,
+        claimed: false,
         reply,
         error,
-        guard_device,
     })
 }
 
@@ -420,21 +420,32 @@ pub(crate) fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn:
             "#[messages] needs `fn new() -> Self`, the state of a new instance",
         ));
     }
-    for (device, span) in handlers
+    // A `proven = k` guard names this actor's device kernel `k`, or a stock
+    // kernel; its handler takes the kernel's claim first.
+    let devices: Vec<String> = handlers
         .iter()
-        .filter_map(|handler| handler.guard_device.as_ref())
-    {
-        if !handlers
-            .iter()
-            .any(|handler| handler.name == *device && handler.kind == Kind::Device)
-        {
-            return Err(Error::new(
-                *span,
-                format!(
-                    "`device = \"{device}\"` names no #[attestable(device)] method of this actor"
-                ),
-            ));
+        .filter(|handler| handler.kind == Kind::Device)
+        .map(|handler| handler.name.clone())
+        .collect();
+    let devices: Vec<&str> = devices.iter().map(String::as_str).collect();
+    for handler in &mut handlers {
+        let Some((kernel, span)) = handler.options.proven.take() else {
+            continue;
+        };
+        let guard = resolve(&kernel, span, &devices)?;
+        if let CredentialGuard::Kernel { .. } = guard {
+            if handler.arguments.is_empty() {
+                return Err(Error::new(
+                    span,
+                    format!(
+                        "a `proven = {kernel}` handler takes the kernel's claim as its first \
+                         argument: its public arguments, as their encoding reads"
+                    ),
+                ));
+            }
+            handler.claimed = true;
         }
+        handler.options.credential = Some((guard, span));
     }
 
     let mut generated = Generated {
@@ -584,10 +595,19 @@ impl Generated {
             .map(|_| quote!(pub venue: ::vos_sdk::VenueId));
         let fields = venue
             .into_iter()
-            .chain(handler.arguments.iter().map(|(name, ty)| {
-                let ty = in_place(ty).unwrap_or(ty);
-                quote!(pub #name: #ty)
-            }));
+            .chain(
+                handler
+                    .arguments
+                    .iter()
+                    .enumerate()
+                    .map(|(at, (name, ty))| {
+                        let ty = in_place(ty).unwrap_or(ty);
+                        match handler.claimed && at == 0 {
+                            true => quote!(pub #name: ::vos_sdk::device::Claim<#ty>),
+                            false => quote!(pub #name: #ty),
+                        }
+                    }),
+            );
         self.schema.methods.push(MethodSchema {
             id: MethodId(id),
             name: handler.name.clone().into_bytes(),

@@ -11,7 +11,6 @@
 //! | 32 | leaves and folds | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 63 |
 //! | 39 | the final wrap, masked | Blake2b-256 | 5, 24, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 |
 //! | 41 | segments | Poseidon2-M31 | 2, 40, 24, 1, 0, 8 | 100 / 60 | 104 / 62 |
-//! | 44 | credential proofs, masked | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 |
 //! | 46 | device proofs, masked | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 |
 //!
 //! - **The segment AIR** is the one every segment, leaf and device format
@@ -20,14 +19,13 @@
 //!   Poseidon2 call, the Poseidon2 chip, the logical right shifts through
 //!   the multiplication, no column a constraint pins to zero), and 32's
 //!   leaves verify it. 28, 32 and 39 prove the recursion AIR
-//!   (`vos-pvm-recair-air`); 44 proves its `p2` and `qm31` alone, the
-//!   credential AIR. A number not in [`REGISTRY`] is refused as
-//!   unregistered.
+//!   (`vos-pvm-recair-air`). A number not in [`REGISTRY`] is refused as
+//!   unregistered; 44 is never reused.
 //! - **Every format** takes exactly its parameters, mixes the boundary
 //!   states as the boundary chips' bytes and grinds its interaction PoW
 //!   before the relation challenges. 46 is admitted: a space's ingress
-//!   verifies device proofs of auth's statement against the program it
-//!   computes from the installed kernel (`vos-pvm-recair`'s `device`). 32
+//!   verifies device proofs against the program it computes from the
+//!   installed kernel (`vos-pvm-recair`'s `device`). 32
 //!   is registered and refused
 //!   although its AIR and channel exist: `vos-pvm-recair` proves and verifies
 //!   its proofs natively, pinning each circuit by its hash, and no verifier
@@ -37,10 +35,8 @@
 //!   feature), fold step 3 reviewed in the fork. 39 is admitted: the masked
 //!   wrap, `vos-pvm-recair`'s masked prover and `vos-pvm-final-verifier`'s
 //!   masked verifier, its bytes a fixed layout ([`ProofBytes::FixedLayout`]);
-//!   production venues accept it alone. 44 is admitted: `vos-pvm-recair`'s
-//!   credential prover and `vos-pvm-final-verifier`'s credential verifier,
-//!   on the fork's Blake2s-M31 channel; a space's ingress takes it. A
-//!   segment verifier takes only a segment format ([`admitted_segment`]).
+//!   production venues accept it alone. A segment verifier takes only a
+//!   segment format ([`admitted_segment`]).
 //! - **The inner formats** grind 8 bits of interaction PoW. Segments (41)
 //!   take 40 queries and 24 bits of PoW: 62.81 proven bits on 41's own
 //!   reference (every chip, the Poseidon2 chip among them, at 2^20 rows),
@@ -52,17 +48,13 @@
 //! - **The device format** (46) is counted on the device shape's masked
 //!   reference ([`DEVICE_REFERENCE`]: every chip a device program may hold
 //!   at `2^17` rows, the most install, the prover and the verifier admit).
-//!   It takes the credential format's parameters: blowup 4, 47 queries,
-//!   PoW 16, affine batching (62.82 proven bits), with `h = 256`
+//!   It takes blowup 4, 47 queries, PoW 16 and affine batching (62.82
+//!   proven bits): at a small program's shape every blowup costs the same
+//!   cells, and PoW 16's grind keeps a short tail on a phone; with `h = 256`
 //!   (`proving.md` §5, how large `h` must be): every device chip reveals at
 //!   most 149 rows at 47 queries, so `h = 256` holds the masking's
 //!   condition without its factor two, every chip's floor at 2^10 rows.
 //!   The candidates measured are in `proving.md` §4.
-//! - **The credential format** (44) is counted on its masked shape
-//!   ([`CREDENTIAL_REFERENCE`]): two components at the masking's floor of
-//!   2^11 rows, where every blowup costs the same cells, so blowup 4, and
-//!   PoW 16 with the least queries that clear 62 bits beside it, 47: PoW 16's
-//!   grind keeps a short tail on a phone.
 //! - **The wrap** (28) needs DEEP batching with an independent coefficient a
 //!   sampled value ([`DeepBatching::Affine`]) for its proven 80. Stwo batches
 //!   by powers of one coefficient, whose error is the batched values' count
@@ -98,9 +90,9 @@
 //! - **The bit counts** are [`crate::security`]'s, at each entry's reference
 //!   shape. The segment's and the recursion's verifiers count again at the
 //!   proof's own shape and refuse a proof below either floor; the masked
-//!   formats' (39, 44, 46) do not: their shapes are pinned at or under the
-//!   reference shape (a fixed layout, the credential circuits, a device
-//!   program's log sizes at most `DEVICE_MAX_LOG_SIZE`), and every term of
+//!   formats' (39, 46) do not: their shapes are pinned at or under the
+//!   reference shape (a fixed layout, a device program's log sizes at most
+//!   `DEVICE_MAX_LOG_SIZE`), and every term of
 //!   the count is monotone in the shape, so the reference's count bounds
 //!   every proof's.
 
@@ -112,8 +104,7 @@ use crate::security::{SecurityBits, SecurityShape};
 mod reference;
 
 pub use reference::{
-    CREDENTIAL_REFERENCE, DEVICE_REFERENCE, LEAF_FOLD_REFERENCE, MASKED_WRAP_REFERENCE,
-    SEGMENT_REFERENCE, WRAP_REFERENCE,
+    DEVICE_REFERENCE, LEAF_FOLD_REFERENCE, MASKED_WRAP_REFERENCE, SEGMENT_REFERENCE, WRAP_REFERENCE,
 };
 
 /// What a format proves.
@@ -123,7 +114,6 @@ pub enum ProofKind {
     LeafFold,
     Wrap,
     Device,
-    Credential,
 }
 
 /// The Merkle hash and Fiat–Shamir channel of a format. Its tag (`as u8`)
@@ -304,8 +294,7 @@ const LEAF_FOLD_PARAMS: FormatParams = FormatParams {
     batching: DeepBatching::Powers,
 };
 
-/// Device proofs': credential proofs' parameters (format 44), picked by
-/// measurement (see the module's notes).
+/// Device proofs', picked by measurement (see the module's notes).
 const DEVICE: FormatParams = FormatParams {
     log_blowup: 2,
     n_queries: 47,
@@ -451,53 +440,8 @@ pub const DEVICE_PROOF: Format = Format {
     },
 };
 
-/// Format 44's masking: 8 salt columns a tree; an `R` of 8 columns (R3
-/// under affine batching); and `h = 512`, at least
-/// `2(4|O| + q(|O| + 1)) = 298` for `q = 47` queries and `|O| = 2` offsets,
-/// so each component pads to `4h = 2^11` rows.
-pub const CREDENTIAL_MASKING: Masking = Masking {
-    salt_columns: 8,
-    fri_mask_columns: 8,
-    log_mask_rows: 9,
-};
-
-const CREDENTIAL: FormatParams = FormatParams {
-    log_blowup: 2,
-    n_queries: 47,
-    pow_bits: 16,
-    fold_step: 1,
-    log_last_layer: 0,
-    interaction_pow_bits: 8,
-    batching: DeepBatching::Affine,
-};
-
-/// Credential proofs, masked: see the module's notes.
-pub const CREDENTIAL_PROOF: Format = Format {
-    number: 44,
-    kind: ProofKind::Credential,
-    channel: ChannelKind::Blake2sM31,
-    params: CREDENTIAL,
-    bytes: ProofBytes::Postcard,
-    masked: true,
-    masking: Some(CREDENTIAL_MASKING),
-    floor: INNER_FLOOR,
-    status: Status::Admitted,
-    reference: CREDENTIAL_REFERENCE,
-    bits: SecurityBits {
-        conjectured: 110,
-        proven: 62,
-    },
-};
-
 /// Every registered format, by number.
-pub const REGISTRY: [Format; 6] = [
-    WRAP,
-    LEAF_FOLD,
-    MASKED_WRAP,
-    SEGMENT,
-    CREDENTIAL_PROOF,
-    DEVICE_PROOF,
-];
+pub const REGISTRY: [Format; 5] = [WRAP, LEAF_FOLD, MASKED_WRAP, SEGMENT, DEVICE_PROOF];
 
 /// The entry for `number`, admitted or not.
 pub fn lookup(number: u32) -> Option<&'static Format> {

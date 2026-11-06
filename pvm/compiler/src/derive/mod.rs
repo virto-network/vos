@@ -452,39 +452,6 @@ fn kinds_as_declared(schema: &[u8], entries: &[AttestEntry]) -> Result<(), Deriv
             method.id.0
         )));
     }
-    devices_as_named(&schema, entries)
-}
-
-/// Whether each auth guard's `device = "..."` names a method whose entry
-/// is marked a device kernel's.
-fn devices_as_named(
-    schema: &vos_wire::schema::Schema,
-    entries: &[AttestEntry],
-) -> Result<(), DeriveError> {
-    for guarded in &schema.methods {
-        let Some(vos_wire::schema::CredentialGuard::Auth {
-            device: Some(device),
-            ..
-        }) = guarded.credential.as_deref()
-        else {
-            continue;
-        };
-        let named = core::str::from_utf8(device)
-            .ok()
-            .and_then(|name| schema.method_id(name));
-        if !named.is_some_and(|id| {
-            entries
-                .iter()
-                .any(|entry| entry.method == id.0 && entry.device)
-        }) {
-            return Err(DeriveError::Table(format!(
-                "method {:#010x}'s auth guard names device kernel {:?}, which is no method's \
-                 marked a device kernel's",
-                guarded.id.0,
-                String::from_utf8_lossy(device)
-            )));
-        }
-    }
     Ok(())
 }
 
@@ -698,8 +665,8 @@ mod tests {
         }
     }
 
-    /// An entry's device mark agrees with its schema kind, `Device`, and an
-    /// auth guard's `device = "..."` names a method whose entry is marked.
+    /// An entry's device mark agrees with its schema kind, `Device`, and a
+    /// kernel guard names a method whose entry is marked.
     #[test]
     fn a_device_kernels_mark_is_its_schemas() {
         use vos_wire::abi::Kind;
@@ -715,10 +682,8 @@ mod tests {
             credential: None,
         };
         let guarded = |device: &str| MethodSchema {
-            credential: Some(Box::new(CredentialGuard::Auth {
-                name: b"login".to_vec(),
-                device: Some(device.as_bytes().to_vec()),
-                once: false,
+            credential: Some(Box::new(CredentialGuard::Kernel {
+                name: device.as_bytes().to_vec(),
             })),
             ..method(8, "login", Kind::Command)
         };
@@ -747,14 +712,14 @@ mod tests {
                 "{entries:?}"
             );
         }
-        // An ELF with no kernel at all: a guard naming a device kernel, and
-        // a device method of no entry.
-        for kind in [Kind::Command, Kind::Device] {
-            assert!(matches!(
-                kinds_as_declared(&section(kind, "auth"), &[]),
-                Err(DeriveError::Table(_))
-            ));
-        }
+        // An ELF with no kernel at all: a device method of no entry. A
+        // guard naming a method that is no device kernel is no schema, which
+        // its install refuses.
+        assert!(matches!(
+            kinds_as_declared(&section(Kind::Device, "auth"), &[]),
+            Err(DeriveError::Table(_))
+        ));
+        assert!(Schema::read(&section(Kind::Command, "auth")).is_err());
     }
 
     /// The prologue's one witness-input step fits the largest class of a

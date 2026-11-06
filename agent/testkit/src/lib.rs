@@ -663,9 +663,9 @@ pub fn device_parts(returned: &[u8], io_hash: &[u8; 32]) -> Option<KernelReturn>
 }
 
 /// The device test actor's `auth` statement over a credential tree: its
-/// witness input (the siblings, the secret, the slot, then auth's
-/// `CredentialPublic`: the kind byte, `map_root`, `scope`, `nullifier` and
-/// `binding`) and its public arguments, those last 129 bytes.
+/// witness input (the siblings, the secret, the slot, then its claim: the
+/// kind byte, `map_root`, `scope`, `nullifier` and `binding`) and its
+/// public arguments, those last 129 bytes.
 pub fn device_auth_input() -> (Vec<u8>, Vec<u8>) {
     device_auth_arguments(0x0123_4567, 0x1234_5678, &[0, 5, 17])
 }

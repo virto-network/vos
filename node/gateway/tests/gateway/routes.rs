@@ -149,10 +149,7 @@ fn every_route_through_the_gateway_answers_as_pinned() {
         nonce: [4; 16],
         expires_ms: served.now() + 60_000,
         format: 38,
-        public: vos_wire::ingress::CredentialPublic::Owner {
-            owner: [5; 32],
-            binding: [6; 32],
-        },
+        claim: vec![5; 64],
         proof: vec![7; 4096],
     }
     .encode();
