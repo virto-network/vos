@@ -177,7 +177,7 @@ compare it, and on JAM its size is paid as payload.
   sender knows the secret behind a member's leaf; `nullifier` is its
   pseudonym in `scope` (§7, `proving.md` §8), stable across its calls;
 - `Owner(digest)`, 4: the stock `owner` kernel's. The sender knows the
-  secret behind `digest`, the owner a row names: a public payer
+  secret behind `digest`, the owner an account names: a public payer
   [decided];
 - `Jam { service }`, at index 6, reserved: a JAM service, authenticated by
   the chain or a light client;
@@ -281,8 +281,8 @@ proves and the kernel's claim.
     the scope's.
   - `#[msg(proven = owner)]` is `CredentialGuard::Owner`, proven by the
     stock `owner` kernel (`#[msg(credential = Owner)]` is the same guard).
-    It admits `Owner` origins; the handler compares the digest with the
-    owner of the row it debits (`ctx.owner()`), at apply, on the live row.
+    It admits `Owner` origins; the handler debits the account the digest
+    holds (`ctx.owner()`), at apply, as the account is then.
   - `#[msg(proven = k)]`, `k` one of the actor's own device kernels, is
     `CredentialGuard::Kernel { name }`. It admits `Kernel { program }`
     origins, `program` one of the kernel's window; the handler's first
@@ -547,8 +547,8 @@ across a space's agents wait for the identity agent above.
     at `expires_ms` included. An expired invitation stays until a
     `revoke` withdraws it or a new `invite` replaces it. The
     invitation names the digest, so whoever intercepts the claim cannot
-    enroll another (the demo's ledger rows take the same two steps,
-    `invite_row` and `claim_row`). A member with
+    enroll another (the ledger's accounts take the same two steps,
+    `Payments`' `invite` and `open`). A member with
     no client key of its own has its claim sent by the app that serves it
     (the demo's gateway app, under its own client key): an ordinary
     client's authority, bounded by the invitation, which names the
@@ -625,7 +625,7 @@ across a space's agents wait for the identity agent above.
 **In a space first** [decided]: the first credentials are proven
 to their own space's ingress, not across spaces. Membership (auth) proves
 a leaf of the space's credential actor (§6) and yields an `Anonymous`
-origin; ownership (owner) proves the secret behind a row's owner digest
+origin; ownership (owner) proves the secret behind an account's owner digest
 and yields an `Owner` origin (§5). Their stock kernels, words and format are
 `proving.md` §8's. Across spaces the pitfalls above hold as written; in a
 space three of them take a simpler form:
@@ -657,7 +657,7 @@ the device never exports, evaluated once a use after the user's consent
   `w = BLAKE2b-512("vos/device/secret/v1" ‖ handle ‖ o)`;
   `s_i = u64_le(w[8i..8i+8]) mod p` for `i < 8`; derived again at each
   use, never stored; `member(s) = C(T(member), s)` goes to the credential
-  actor, `owner(s) = C(T(owner), s)` to a ledger row;
+  actor, `owner(s) = C(T(owner), s)` to a ledger account;
 - **the sources** [decided]: by default an Android Keystore HMAC key
   (non-exportable, user authentication by a biometric or the PIN at every
   use through `BiometricPrompt` with the `Mac` as its crypto object,
@@ -711,7 +711,7 @@ the device never exports, evaluated once a use after the user's consent
   subsystem on connections of their own, each under a fresh key [decided]; a path is used only when its root is one the root polls saw; a
   node time more than five minutes from the device's is refused.
 - **Claims:** a member here has no VOS client key, so the gateway's s4
-  app sends `claim(member)` and the ledger's `claim_row` under its own
+  app sends `claim(member)` and the ledger's `open` under its own
   client key, its authority the operator's invitations, which name the
   digests.
 
@@ -738,19 +738,19 @@ the device never exports, evaluated once a use after the user's consent
     account: nothing syncs it, and no restore elsewhere derives `s`. Its
     loss (a factory reset, the screen lock removed, a lost security key)
     loses `s`: the member is revoked and enrolls again, and the ledger's
-    `rekey` moves its rows.
+    `rekey` moves its account.
   - Each use takes the user's consent at the source (a biometric or the
     PIN at the Keystore; the PIN and a touch at a security key), so
     malware cannot evaluate it silently; one use is enough to keep `s`.
   - What `s` gives a thief: auth as its member in every scope of the space
-    (and of every space sharing its handle), payment from every row
-    `owner(s)` owns, and every nullifier the member has used or will use,
+    (and of every space sharing its handle), payment from the account
+    `owner(s)` holds, and every nullifier the member has used or will use,
     so the member's past pseudonyms link to it. Revoking the leaf stops
     auth within `ROOT_MAX_AGE`; it does not stop payment, which reads no
-    tree: the ledger's `rekey(row, owner)` and `freeze(row)`, under an
-    operator role, do [decided].
+    tree: the ledger's `rekey(account, owner)` and `freeze(account)`,
+    under an operator role, do [decided].
   - **The in-space ledger is custodial by design:** an operator who can
-    `rekey` can move any row to a key of its choosing. It is the tier
+    `rekey` can move any account to a key of its choosing. It is the tier
     such a space picks [decided]; the log attributes each `rekey` to
     the operator's origin, so the power is visible, not hidden. A space
     that refuses custody waits for full privacy's pool (§8).
@@ -835,8 +835,8 @@ the device never exports, evaluated once a use after the user's consent
     count);
   - the facility cannot forget an enrollment, and a cancelled call's
     form stays until answered (its proof dropped);
-  - the demo's claim enrolls the member before it claims the row, so a
-    wrong row name leaves a member with no row.
+  - the demo's claim enrolls the member before it opens the account, so
+    a wrong account name leaves a member with no account.
 
 **Opt-in linking:** a holder can prove "the same person as identity X in
 space A", and only to whom they choose.
@@ -1075,8 +1075,8 @@ whose tests are its specification:
   re-founding, and no epoch in the leaf, since revocation removes it;
   then solvency, across spaces.
 - **A public payer:** an owner proof shows knowledge of the secret behind
-  a row's owner digest, bound to the call and compared with the live row
-  at apply.
+  an account's owner digest, bound to the call; the payment debits the
+  account that digest holds at apply.
 - **A device proof authorizes exactly what an auth proof does,** and its
   program is computed by every node from the installed kernel (§5).
 - **Revocation does not stop payment:** an owner proof reads no tree, so

@@ -1,6 +1,6 @@
 //! The carrier audit over proven calls (`identity-and-authority.md` §5,
 //! `node/light/SECURITY.md`): three nodes of a founded space with the
-//! credential actor, the poll, the purses' ledger and the device actor; a
+//! credential actor, the poll, the ledger and the device actor; a
 //! member's device secret derived from a known source output, its path
 //! fetched, and its calls proved by the device library as a phone proves
 //! them, by the stock kernels' release artifacts, and sent to the nodes
@@ -44,7 +44,9 @@ use vos_checker::Nodes;
 use vos_checker::calls::installed;
 use vos_checker::carriers::{self, Audit, Kind, Logs, Reach};
 use vos_checker::processes::Front;
-use vos_checker::programs::{actor, actor_elf, credentials, credentials_elf, method};
+use vos_checker::programs::{
+    actor, actor_elf, credentials, credentials_elf, method, payments, payments_elf,
+};
 use vos_light::wire::{self, Answer};
 use vos_light::{
     AuthWitness, Call, DEVICE_FORMAT, DeviceError, DeviceProgram, Proven, Prover, ProverConfig,
@@ -65,7 +67,7 @@ use crate::harness::{Cluster, NODES};
 /// The hub's seed: odd, so the operator's client reaches the nodes over
 /// the API's sockets.
 const SEED: u64 = 11;
-const PURSES: InstanceId = InstanceId(2);
+const PAYMENTS: InstanceId = InstanceId(2);
 const POLL: InstanceId = InstanceId(3);
 const DEVICE: InstanceId = InstanceId(4);
 const CREDENTIALS: InstanceId = InstanceId(9);
@@ -187,7 +189,7 @@ impl Founded {
         for (instance, elf, role) in [
             (CREDENTIALS, elf(credentials_elf()), "registrar"),
             (POLL, elf(actor_elf("poll")), "operator"),
-            (PURSES, elf(actor_elf("purses")), "operator"),
+            (PAYMENTS, elf(payments_elf()), "operator"),
             (DEVICE, elf(actor_elf("device")), "operator"),
         ] {
             let roles = vec![(role.as_bytes().to_vec(), ROLE)];
@@ -230,7 +232,7 @@ impl Founded {
         let program = match instance {
             CREDENTIALS => credentials(),
             POLL => actor("poll"),
-            PURSES => actor("purses"),
+            PAYMENTS => payments(),
             _ => actor("device"),
         };
         method(&program, name).0
@@ -459,22 +461,17 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
     ));
     answers.push(ran(send(&fresh, &whole)));
 
-    // Owner: a payment from the row the member's owner digest claims.
+    // Owner: a payment from the account the member's owner digest holds.
     let owner = vos_light::owner(&secret).to_bytes();
     let expires = founded.time(at) + 60_000;
     let shop = tree::digest(&tree::compress(&Tag::Owner.block(), &other(1)));
-    for (row, digest) in [("device", owner), ("shop", shop)] {
-        let row = row.as_bytes().to_vec();
-        founded.write(PURSES, "invite_row", (row.clone(), digest, expires));
-        founded.write(PURSES, "claim_row", (row.clone(), digest));
-        founded.write(PURSES, "mint", (row, 50u64));
+    for (name, digest) in [("device", owner), ("shop", shop)] {
+        let name = name.as_bytes().to_vec();
+        founded.write(PAYMENTS, "invite", (name.clone(), digest, expires));
+        founded.write(PAYMENTS, "open", (name.clone(), digest));
+        founded.write(PAYMENTS, "mint", (name, 50u64));
     }
-    let pay = founded.call(
-        at,
-        PURSES,
-        "transfer",
-        (b"device".to_vec(), b"shop".to_vec(), 20u64),
-    );
+    let pay = founded.call(at, PAYMENTS, "transfer", (b"shop".to_vec(), 20u64));
     let paid = prover.prove_owner(&secret, &pay, &owner_program).unwrap();
     answers.push(ran(send(&pay, &paid)));
 

@@ -1,0 +1,25 @@
+# `Payments`, the space's ledger of owner-proven payments
+# (`light-node.md` §5.2): cipher-clerk's kernel in an actor, built for the
+# PVM with the guest toolchain: `just build-payments`.
+[package]
+name = "vos-payments"
+version = "0.1.0"
+edition = "2024"
+publish = false
+workspace = "../programs"
+
+[lib]
+name = "vos_payments"
+path = "src/lib.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "vos-payments"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+vos-sdk = { path = "../sdk" }
+cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", tag = "v0.3.0", default-features = false }

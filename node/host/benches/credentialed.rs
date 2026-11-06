@@ -7,7 +7,7 @@
 //! the host's physical performance cores. No absolute rate is claimed.
 //!
 //! One node of a founded space of one runs `AGENTS` agents of the credential
-//! actor, the purses' ledger and the counter. For each run the proofs are made first, on
+//! actor, the ledger and the counter. For each run the proofs are made first, on
 //! every core of the generator, enough for `--seconds` (10 by default) at
 //! `PER_EXECUTOR·k` a second, each good until 115 s past when making them all is
 //! expected to end (a proof expires at most 120 s after the node's time),
@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::SigningKey;
 use rayon::prelude::*;
 use vos_checker::calls::installed;
-use vos_checker::programs::{Programs, actor, method, package};
+use vos_checker::programs::{Programs, actor, method, package, payments, payments_elf};
 use vos_light::{Call, DeviceProgram, Prover, ProverConfig, Threads};
 use vos_node::client::{self, Client, ClientError, Operator, Target};
 use vos_node::{Config, Node};
@@ -54,7 +54,7 @@ use vos_wire::ingress::{CredentialRefusal, Credentialed, Rejection, Response, St
 use vos_wire::result::Outcome;
 use vos_wire::{Encode, SpaceId, WindowClock};
 
-const PURSES: InstanceId = InstanceId(2);
+const PAYMENTS: InstanceId = InstanceId(2);
 const COUNTER: InstanceId = InstanceId(1);
 const CREDENTIALS: InstanceId = InstanceId(9);
 /// The proven calls a second an executor is asked to take: a stock
@@ -70,15 +70,15 @@ const SENDERS: usize = 96;
 const OPERATOR: [u8; 32] = [21; 32];
 /// The generator's QUIC client key, which a served node lists.
 const DRIVER: [u8; 32] = [22; 32];
-/// The payer's secret source's output, whose secret's owner digest owns
-/// both rows.
+/// The payer's secret source's output, whose secret's owner digest holds
+/// the payer's account.
 const SOURCE: [u8; 32] = [77; 32];
 /// How long a proof may live past the node's time when it is sent: a
 /// margin under the node's horizon (120 s).
 const LIFE_MS: u64 = 115_000;
 
-/// One node of a founded space, its agents ready: each with a row
-/// `payer`, owned by the secret's owner digest and full, and `payee`.
+/// One node of a founded space, its agents ready: each with an account
+/// `payer`, held by the secret's owner digest and full, and `payee`.
 struct Served {
     node: Node,
     socket: Target,
@@ -116,7 +116,7 @@ fn start(executors: usize) -> Served {
     let owner = vos_light::owner(&secret()).to_bytes();
     let operator = Principal::Client(operator_key);
     let mut client = Client::new(&socket, key);
-    let purses = actor("purses");
+    let payments = payments();
     let mut agents = Vec::new();
     for _ in 0..AGENTS {
         let agent = node.create_agent().unwrap();
@@ -129,8 +129,8 @@ fn start(executors: usize) -> Served {
         )));
         installed(smol::block_on(node.install(
             agent,
-            PURSES,
-            &package("purses"),
+            PAYMENTS,
+            &std::fs::read(payments_elf()).unwrap(),
             roles,
         )));
         installed(smol::block_on(node.install(
@@ -141,15 +141,15 @@ fn start(executors: usize) -> Served {
         )));
         installed(smol::block_on(node.set_role(agent, operator, Some(1))));
         let expires = vos_node::wall_clock() + 60_000;
-        for (name, amount) in [("payer", u64::MAX / 2), ("payee", 0)] {
+        for (name, owner, amount) in [("payer", owner, u64::MAX / 2), ("payee", [1; 32], 0)] {
             let name = name.as_bytes().to_vec();
             for (method_name, arguments) in [
-                ("invite_row", (name.clone(), owner, expires).encode()),
-                ("claim_row", (name.clone(), owner).encode()),
+                ("invite", (name.clone(), owner, expires).encode()),
+                ("open", (name.clone(), owner).encode()),
                 ("mint", (name.clone(), amount).encode()),
             ] {
                 let answer = client
-                    .call(agent, PURSES, method(&purses, method_name), &arguments)
+                    .call(agent, PAYMENTS, method(&payments, method_name), &arguments)
                     .unwrap();
                 assert!(ran(&answer), "{method_name}: {answer:?}");
             }
@@ -213,8 +213,8 @@ impl Reached {
     }
 
     fn made(&self, count: usize, expires_ms: u64) -> Vec<(AgentId, Credentialed)> {
-        let transfer = method(&actor("purses"), "transfer");
-        let arguments = (b"payer".to_vec(), b"payee".to_vec(), 1u64).encode();
+        let transfer = method(&payments(), "transfer");
+        let arguments = vos_light::transfer_arguments("payee", 1);
         let elf = std::fs::read(vos_checker::programs::credentials_elf()).unwrap();
         let owner = vos_light::release::device(&elf, "owner").expect("the stock owner kernel");
         let program = DeviceProgram::released(&owner).expect("its program");
@@ -237,7 +237,7 @@ impl Reached {
                     let call = Call {
                         space: self.space.0,
                         agent: agent.0,
-                        instance: PURSES.0,
+                        instance: PAYMENTS.0,
                         method: transfer.0,
                         arguments: arguments.clone(),
                         nonce,
@@ -247,7 +247,7 @@ impl Reached {
                         .prove_owner(&secret, &call, &program)
                         .expect("proves");
                     let call = Credentialed {
-                        instance: PURSES,
+                        instance: PAYMENTS,
                         method: transfer,
                         arguments: arguments.clone(),
                         nonce,
