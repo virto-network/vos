@@ -1200,7 +1200,12 @@ where the text above leaves a choice, this is the one taken]:
   one the log named last, so `R` travels in archives sealed under an
   epoch's archive key, never under an epoch a removed device was in.
   While the log names an `R` a device does not hold, it pushes nothing to
-  the recovery scope.
+  the recovery scope; while a removal it honours is owed it lets no `R`
+  travel at all, so a rotation maturing before the removal's commit (whose
+  re-sealed kit is then the old kit's, taken by neither the agent nor the
+  devices) leaves its `R` with no removed device. A device-drawn `R` that
+  never reached the others (its drawer lost) is re-sealed by the next
+  commit of any device that does not hold it.
 - **Every commit carrying a removal re-seals the kit**
   (`Effect::rekey`: the kit's own entries, each with a new `R1`, and the
   new `R2` in the evidence beside any Welcome, `Attached`); the agent

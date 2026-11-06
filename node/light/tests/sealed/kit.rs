@@ -609,3 +609,168 @@ fn r_rotates_at_a_removal_and_the_removed_device_opens_nothing_after() {
             .is_empty()
     );
 }
+
+/// A chunk of an archive, as sealed sync frames it.
+#[derive(vos_wire::Decode)]
+struct Chunk {
+    _digest: [u8; 32],
+    part: u16,
+    parts: u16,
+    bytes: Vec<u8>,
+}
+
+/// The archives in the archive scope sealed under `key`, each of one
+/// chunk.
+fn archives_under(home: &Home, reader: &Phone, key: &[u8; 32]) -> Vec<Archive> {
+    let scope = reader
+        .group
+        .as_ref()
+        .unwrap()
+        .archive()
+        .scope(vos_light::personal::ARCHIVE_NAME);
+    stored(home, reader, scope)
+        .iter()
+        .filter_map(|envelope| {
+            let (_, body) = sealed::open(&[*key], &home.identity, &envelope.bytes).ok()?;
+            let chunk = Chunk::decode_exact(&body)?;
+            (chunk.part == 0 && chunk.parts == 1)
+                .then(|| Archive::decode_exact(&chunk.bytes))
+                .flatten()
+        })
+        .collect()
+}
+
+/// A kit rotation that matures while the commit carrying a removal is
+/// pending: the commit's re-sealed kit is the old kit's, so neither the
+/// agent nor any device takes it, and the rotation's `R` stands. While the
+/// removal was owed no device let that `R` travel, so no archive sealed
+/// under an epoch the removed device is in holds it.
+#[test]
+fn a_rotation_maturing_before_a_removals_commit_reaches_no_removed_device() {
+    let key = KitSecret::security_key(&mut Touch(6)).unwrap();
+    let (mut home, mut phones, _) = household_with(3, vec![key.key()]);
+    let next = KitSecret::security_key(&mut Touch(16)).unwrap();
+    let rotation = phones[1].group().rotate(&[next.key()]).unwrap();
+    let (admin, sync) = (phones[1].admin.clone(), phones[1].sync.clone());
+    let rotate = operate(
+        &mut home,
+        &admin,
+        &sync,
+        "rotate",
+        rotation.kit.encode(),
+        Some(*rotation.r2()),
+    );
+    let (admin, sync) = (phones[0].admin.clone(), phones[0].sync.clone());
+    let removal = operate(&mut home, &admin, &sync, "remove", 2u32.encode(), None);
+    let (admin, sync) = (phones[1].admin.clone(), phones[1].sync.clone());
+    operate(&mut home, &admin, &sync, "cosign", removal.encode(), None);
+    settle(&mut home, &mut phones[..2]);
+    let removed_key = phones[2].group().archive_key().unwrap();
+    let prepared = phones[0].group().commit(None, home.now).unwrap();
+    let signed = home.sign(&phones[0].admin, "commit", prepared.arguments());
+    phones[0]
+        .group()
+        .signed_commit(signed.message.clone(), signed.signature)
+        .unwrap();
+    let candidacy = home
+        .send(signed)
+        .answer::<vos_wire::personal::Candidacy>()
+        .unwrap();
+    let Event::Evidence {
+        index,
+        message,
+        signature,
+        attached,
+    } = phones[0].group().called_commit(candidacy.index).unwrap()
+    else {
+        unreachable!()
+    };
+    phones[0].evidence(&mut home, index, message, signature, attached);
+
+    home.pass(policy().operation_delay_ms);
+    for phone in &mut phones[..2] {
+        phone.alive(&mut home);
+    }
+    assert!(matches!(
+        state(&home, phones[0].sync_key(), rotate),
+        OpState::Matured { .. }
+    ));
+    // The rotation's R is the drawer's before the commit is decided, and
+    // both push their archives under the epoch the removed device is in.
+    let cursor = phones[1].group().cursor();
+    let entries = home.log(phones[1].sync_key(), cursor).unwrap();
+    phones[1].group().follow(entries).unwrap();
+    assert_eq!(r_of(&mut phones[1]), *rotation.r());
+    let epoch = phones[1].group().confirmed();
+    sync_keys(&mut home, &mut phones[..2]);
+    assert_eq!(phones[1].group().confirmed(), epoch);
+    settle(&mut home, &mut phones[..2]);
+    sync_keys(&mut home, &mut phones[..2]);
+    settle(&mut home, &mut phones[..2]);
+    sync_keys(&mut home, &mut phones[..2]);
+    assert_eq!(phones[0].group().confirmed(), phones[1].group().confirmed());
+    for phone in &mut phones[..2] {
+        assert!(phone.group().holds_recovery());
+        assert_eq!(r_of(phone), *rotation.r(), "the rotation's R stands");
+    }
+    let view: RecoveryView = home
+        .query(phones[0].sync_key(), "recovery", ().encode())
+        .unwrap();
+    assert_eq!(view.entries, rotation.kit.entries);
+    let archives = archives_under(&home, &phones[0], &removed_key);
+    assert!(!archives.is_empty());
+    for archive in archives {
+        assert!(
+            archive
+                .recovery
+                .as_ref()
+                .is_none_or(|held| held.r != *rotation.r()),
+            "no archive the removed device opens holds the rotation's R"
+        );
+    }
+}
+
+/// A kit rotation the kit signs leaves no device holding its `R`: the
+/// devices push nothing to the recovery scope until a device's next
+/// commit re-seals the kit under an `R` of its own.
+#[test]
+fn a_rotation_the_kit_signs_is_re_sealed_by_the_next_commit() {
+    let old = KitSecret::phrase().unwrap();
+    let (mut home, mut phones, _) = household_with(2, vec![old.key()]);
+    let next = KitSecret::phrase().unwrap();
+    let split = Split::draw(&[next.key()], &home.identity).unwrap();
+    let signing = old.signing();
+    operate(
+        &mut home,
+        &signing,
+        &signing,
+        "rotate",
+        split.kit.encode(),
+        Some(*split.r2()),
+    );
+    home.pass(policy().kit_delay_ms);
+    for phone in &mut phones {
+        phone.alive(&mut home);
+    }
+    settle(&mut home, &mut phones);
+    for phone in &mut phones {
+        assert!(!phone.group().holds_recovery());
+        assert_eq!(phone.group().kit(), &[next.key()]);
+        assert_eq!(
+            with(&mut home, phone, &[], |sync| sync.recovery()).unwrap(),
+            Default::default()
+        );
+    }
+    let prepared = phones[0].group().commit(None, home.now).unwrap();
+    assert!(prepared.effect.remove.is_empty());
+    let rekey = prepared.effect.rekey.clone().expect("the kit re-sealed");
+    phones[0].send(&mut home, &prepared).unwrap();
+    settle(&mut home, &mut phones);
+    sync_keys(&mut home, &mut phones);
+    for phone in &mut phones {
+        assert!(phone.group().holds_recovery());
+        assert_eq!(vos_wire::personal::r_hash(&r_of(phone)), rekey.r_hash);
+    }
+    let r = r_of(&mut phones[0]);
+    assert!(open_recovery(&r, &home.identity, &kit_reads(&home, &next)).is_some());
+}

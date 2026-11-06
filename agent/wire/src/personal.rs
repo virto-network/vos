@@ -498,11 +498,21 @@ pub struct Effect {
 
 /// What an admin call's evidence carries beside it, bound by hash in the
 /// call: a commit's Welcome, and the `R2` of a kit rotation, a restore or
-/// a commit that re-seals the kit. `R2` is kept apart and logged nowhere.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
+/// a commit that re-seals the kit. `R2` is kept apart and logged nowhere;
+/// its `Debug` shows only whether it is there.
+#[derive(Clone, Default, PartialEq, Eq, Encode, Decode)]
 pub struct Attached {
     pub welcome: Option<Vec<u8>>,
     pub r2: Option<[u8; 32]>,
+}
+
+impl core::fmt::Debug for Attached {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Attached")
+            .field("welcome", &self.welcome.as_ref().map(Vec::len))
+            .field("r2", &self.r2.is_some())
+            .finish()
+    }
 }
 
 /// An admin call as the agent recorded it: its origin, its method and its

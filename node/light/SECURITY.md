@@ -149,9 +149,13 @@ and what a node does with one is `node/SECURITY.md`'s.
   commit's verdict, the rotation's or restore's verified maturity), and
   never travels before. The other devices take it only from an archive
   sealed under an epoch's archive key whose `R` hashes to the one the
-  admin call named, so no device can give the others another `R`; and a
+  admin call named, so no device can give the others another `R`; a
   device pushes nothing to the recovery scope while the log names an `R`
-  it does not hold.
+  it does not hold; and while a removal it honours is owed (matured, its
+  commit not yet confirmed) it lets no `R` travel at all, neither in its
+  archive nor under it in the recovery scope, since the removed device is
+  still in that epoch. So an `R` a rotation makes the kit's in that window
+  reaches no removed device either.
 - **The kit's sealing keys are a device's own:** the claim's are the
   claiming device's, a rotation's or a restore's those its verified admin
   call carried; a commit re-seals `R1` only to those, never to keys the

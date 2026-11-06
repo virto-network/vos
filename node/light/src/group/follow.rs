@@ -824,7 +824,10 @@ impl DeviceGroup {
         self.processed = None;
         if self.state.id == Some(pending.by) {
             self.state.own = None;
-            self.mls.void(rows(&self.state, None))?;
+            if let Some(rekey) = &pending.effect.rekey {
+                self.archive.forget(&rekey.r_hash);
+            }
+            self.mls.void(rows(&self.state, Some(&self.archive)))?;
         }
         events.push(Event::Voided {
             epoch: pending.epoch,

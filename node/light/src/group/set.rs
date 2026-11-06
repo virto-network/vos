@@ -710,6 +710,12 @@ impl DeviceGroup {
 
     /// The log closed the operation at `op` without its maturity.
     pub(super) fn cancelled(&mut self, op: u64) {
+        if let Some((Op::Rotate(kit) | Op::Restore { kit, .. }, _)) =
+            self.state.call_at(op).and_then(Call::op)
+        {
+            let hash = kit.r_hash;
+            self.archive.forget(&hash);
+        }
         self.state.set.closed.push(op);
         self.thaw(op, self.state.time);
         self.prune();

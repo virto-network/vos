@@ -395,7 +395,10 @@ fn a_restore_starts_a_new_group_under_its_new_kit() {
     restored.group = Some(
         DeviceGroup::restore(&restored.store, home.agent(), restored.keys.clone(), read).unwrap(),
     );
-    assert!(restored.group().holds_recovery());
+    assert!(
+        !restored.group().holds_recovery(),
+        "its R travels from its first commit, which re-seals the kit"
+    );
     assert_eq!(
         restored.group().archive().recovery.as_ref().unwrap().r,
         *split.r()

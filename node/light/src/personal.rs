@@ -944,7 +944,13 @@ impl<'a, L: Link> SealedSync<'a, L> {
             held.push(digest);
             kept.found += 1;
         }
-        let mine = self.group.archive().shareable();
+        // `R` travels only while this device may let it: never under an
+        // epoch a device whose removal is owed is still in.
+        let mine = if self.group.holds_recovery() {
+            self.group.archive().shareable()
+        } else {
+            self.group.archive().without_recovery()
+        };
         let digest = archive_digest(&mine.encode());
         if held.contains(&digest) {
             reading.held = digest;

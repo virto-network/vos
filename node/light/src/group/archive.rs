@@ -151,8 +151,9 @@ impl Archive {
                 .recovery
                 .as_ref()
                 .is_none_or(|mine| theirs.since > mine.since)
+            && let Some(mut old) = self.recovery.replace(theirs.clone())
         {
-            self.recovery = Some(theirs.clone());
+            old.r.zeroize();
         }
         self.merge_keys(other);
     }
@@ -225,11 +226,28 @@ impl Archive {
         else {
             return false;
         };
-        let r = self.drawn.remove(at);
+        let mut r = self.drawn.remove(at);
         if self.recovery.as_ref().is_none_or(|mine| since > mine.since) {
-            self.recovery = Some(Recovery { since, r });
+            if let Some(mut old) = self.recovery.replace(Recovery { since, r }) {
+                old.r.zeroize();
+            }
+        } else {
+            r.zeroize();
         }
         true
+    }
+
+    /// Drop the drawn `R` whose hash is `hash`: the call that named it
+    /// closed without making it the kit's.
+    pub fn forget(&mut self, hash: &[u8; 32]) {
+        if let Some(at) = self
+            .drawn
+            .iter()
+            .position(|r| vos_wire::personal::r_hash(r) == *hash)
+        {
+            let mut r = self.drawn.remove(at);
+            r.zeroize();
+        }
     }
 
     /// The scopes and keys of this archive that `other` lacks, with this

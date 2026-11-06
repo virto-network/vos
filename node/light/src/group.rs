@@ -472,8 +472,9 @@ pub(crate) struct Pending {
     pub(crate) logged: bool,
 }
 
-/// This device's own commit, from its preparation until it is decided.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+/// This device's own commit, from its preparation until it is decided. Its
+/// `Debug` shows no `R2`.
+#[derive(Clone, PartialEq, Eq, Encode, Decode)]
 pub(crate) struct Own {
     pub(crate) epoch: u64,
     pub(crate) welcome: Option<Vec<u8>>,
@@ -488,6 +489,16 @@ pub(crate) struct Own {
     pub(crate) index: Option<u64>,
     /// The log holds its evidence.
     pub(crate) evidenced: bool,
+}
+
+impl std::fmt::Debug for Own {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Own")
+            .field("epoch", &self.epoch)
+            .field("index", &self.index)
+            .field("evidenced", &self.evidenced)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Where the device is.
@@ -1019,11 +1030,16 @@ impl DeviceGroup {
         self.merge_archive(&theirs)
     }
 
-    /// Whether this device holds the `R` the log made the kit's last: not
-    /// while a confirmed commit's re-sealed kit waits on the agent's
-    /// verdict.
+    /// Whether this device holds the `R` the log made the kit's last, and
+    /// may let it travel: not while a removal it honours is owed (the
+    /// removed device is still in the epoch), not while a confirmed
+    /// commit's re-sealed kit waits on the agent's verdict, and not while
+    /// it cannot follow.
     pub fn holds_recovery(&self) -> bool {
-        if self.state.rekeyed.is_some() {
+        if self.state.rekeyed.is_some()
+            || !self.state.set.owed.is_empty()
+            || self.state.course != Course::Following
+        {
             return false;
         }
         match (&self.state.recovery, &self.archive.recovery) {
@@ -1219,14 +1235,13 @@ impl DeviceGroup {
         Ok((remove, removes))
     }
 
-    /// The kit re-sealed for a commit carrying `remove`, or after a kit
-    /// rotation the kit signed: a split of the kit's keys, its `R` held
-    /// aside until the commit's verdict, and its `R2`.
+    /// The kit re-sealed for a commit carrying `remove`, or while the log
+    /// names an `R` this device does not hold (a kit rotation the kit
+    /// signed, or one whose drawer never passed its `R` on): a split of the
+    /// kit's keys, its `R` held aside until the commit's verdict, and its
+    /// `R2`.
     fn rekey(&mut self, remove: &[DeviceId]) -> Result<Option<(Split, [u8; 32])>, GroupError> {
-        let unheld = self
-            .state
-            .recovery
-            .is_some_and(|named| named.by_kit && !self.holds_recovery());
+        let unheld = self.state.recovery.is_some() && !self.holds_recovery();
         if remove.is_empty() && !unheld {
             return Ok(None);
         }
