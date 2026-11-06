@@ -248,7 +248,8 @@ pub(crate) fn household(root: &Path, size: usize) -> (Vec<Device>, Script) {
                 device: 0,
                 kit: Vec::new(),
             });
-            let group = DeviceGroup::create(light.store(), agent(), device, script.now).unwrap();
+            let group = DeviceGroup::create(light.store(), agent(), device, Vec::new(), script.now)
+                .unwrap();
             devices.push(Device {
                 light,
                 group,

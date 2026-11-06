@@ -144,6 +144,8 @@ pub struct Home {
     personal: Vec<u8>,
     sessions: BTreeMap<[u8; 32], (Session, u64, u64)>,
     pub now: u64,
+    /// The agent's identity, which calls are signed for.
+    pub identity: [u8; 32],
 }
 
 /// The release artifacts: the default agent, linked, and `Personal`'s
@@ -161,6 +163,12 @@ pub fn artifacts() -> &'static (Vec<u8>, Package) {
 impl Home {
     /// `Personal` installed, its role `homes` granted to `homes`.
     pub fn new(homes: &SigningKey, policy: Policy) -> Self {
+        Self::at(homes, policy, IDENTITY)
+    }
+
+    /// [`Home::new`] for an agent whose identity is `identity`: another
+    /// home's.
+    pub fn at(homes: &SigningKey, policy: Policy, identity: [u8; 32]) -> Self {
         let (agent, package) = artifacts();
         let backend = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
             PvmBackend::ForceRecompiler
@@ -184,6 +192,7 @@ impl Home {
             personal: package.programs[0].clone(),
             sessions: BTreeMap::new(),
             now: T0,
+            identity,
         };
         let homes_key = homes.verifying_key().to_bytes();
         home.batch(vec![
@@ -213,7 +222,7 @@ impl Home {
     /// The agent as a device group names it.
     pub fn agent(&self) -> vos_light::group::Agent {
         vos_light::group::Agent {
-            identity: IDENTITY,
+            identity: self.identity,
             instance: PERSONAL,
         }
     }
@@ -274,7 +283,14 @@ impl Home {
         let public = key.verifying_key().to_bytes();
         let (session, sequence) = self.session(public);
         let method = self.method(name);
-        let message = call_message(&IDENTITY, &session, sequence, PERSONAL, method, &arguments);
+        let message = call_message(
+            &self.identity,
+            &session,
+            sequence,
+            PERSONAL,
+            method,
+            &arguments,
+        );
         let signature = key.sign(&message).to_bytes();
         Signed {
             request: Request {

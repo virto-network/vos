@@ -8,13 +8,13 @@ use vos_mls::{Expected, Kind};
 use vos_wire::Decode;
 use vos_wire::ingress::CallMessage;
 use vos_wire::personal::{
-    Body, DeviceId, Effect, Entry, OpState, Signer, Verdict, Void, Vote, chain, vote_message,
-    welcome_hash,
+    Attached, Body, DeviceId, Effect, Entry, Op, OpState, Signer, Verdict, Void, Vote, chain,
+    vote_message, welcome_hash,
 };
 
 use super::{
-    Act, Alarm, CONFIRM, Check, Course, DeviceGroup, Event, GroupError, Known, Passing, Pending,
-    Processed, Remedy, Why, credential, rows,
+    Act, Alarm, CONFIRM, Check, Course, DeviceGroup, Event, GroupError, Known, Named, Passing,
+    Pending, Processed, Remedy, Why, rows,
 };
 use crate::call::method_id;
 
@@ -87,7 +87,9 @@ impl DeviceGroup {
         }
         match entry.body {
             Body::Configured(policy) => self.state.policy = policy,
-            Body::Assigned { kit, .. } => self.state.set.kit = kit,
+            // The claim's kit is the claiming device's own, its sealing
+            // keys with it.
+            Body::Assigned { .. } => {}
             Body::Operation {
                 call,
                 by,
@@ -129,7 +131,7 @@ impl DeviceGroup {
                 vote,
                 signature,
             } => self.vote(device, epoch, candidate, vote, &signature, events),
-            Body::Verdict { epoch, verdict } => self.verdict(epoch, verdict, events)?,
+            Body::Verdict { epoch, verdict } => self.verdict(index, epoch, verdict, events)?,
             Body::Renewed { .. } => {}
         }
         Ok(())
@@ -195,6 +197,20 @@ impl DeviceGroup {
         // signed the call, an add is a strong admin's or a matured add
         // operation's and names a new device by a new number, and a matured
         // regroup's new group comes first.
+        let awaits = match self.holds(Signer::Device(by), &call.origin, at) {
+            super::set::Holds::Yes => None,
+            super::set::Holds::Awaiting(replacement) => Some(replacement),
+            super::set::Holds::No => {
+                evidence = Check::Invalid;
+                None
+            }
+        };
+        // A removal re-seals the kit, the kit's own keys each with a new
+        // `R1`.
+        let rekey_holds = match &effect.rekey {
+            Some(rekey) => self.state.kit_is(&rekey.entries),
+            None => effect.remove.is_empty(),
+        };
         let state = &self.state;
         let strong = state.known(by).is_some_and(|known| known.strong);
         let matured = effect
@@ -202,10 +218,7 @@ impl DeviceGroup {
             .as_ref()
             .is_some_and(|add| state.set.adds.contains(add));
         let new = added.is_none_or(|id| state.known(id).is_none());
-        if !state.may_sign(by, at)
-            || state
-                .known(by)
-                .is_none_or(|known| known.admin != call.origin)
+        if !rekey_holds
             || added.is_some() != effect.add.is_some()
             || !new
             || (effect.add.is_some() && !strong && !matured)
@@ -250,6 +263,7 @@ impl DeviceGroup {
             origin: call.origin,
             arguments: call.arguments,
             evidence,
+            awaits,
             welcome: None,
             votes: Vec::new(),
             mine: None,
@@ -344,6 +358,7 @@ impl DeviceGroup {
 
     fn verdict(
         &mut self,
+        index: u64,
         epoch: u64,
         verdict: Verdict,
         events: &mut Vec<Event>,
@@ -381,6 +396,16 @@ impl DeviceGroup {
                 {
                     events.push(Event::Alarm(Alarm::Verdict { epoch }));
                 }
+                // The agent re-seals the kit at its verdict: from this entry
+                // the commit's `R` is the kit's.
+                if let Some((rekeyed, hash)) = self.state.rekeyed
+                    && rekeyed == epoch
+                {
+                    self.state.rekeyed = None;
+                    if confirmed && self.state.decided == Some((epoch, true)) {
+                        self.name_recovery(index, hash, false);
+                    }
+                }
             }
         }
         Ok(())
@@ -396,7 +421,7 @@ impl DeviceGroup {
         };
         let index = pending.index;
         let fresh = self.processed.as_ref().is_none_or(|(at, _)| *at != index);
-        if fresh && pending.evidence != Check::Missing {
+        if fresh && pending.evidence != Check::Missing && pending.awaits.is_none() {
             let processed = self.process()?;
             if matches!(processed, Processed::Refused) {
                 let pending = self.state.pending.as_ref().expect("pending");
@@ -495,7 +520,7 @@ impl DeviceGroup {
     /// its logged effect.
     fn process(&self) -> Result<Processed, GroupError> {
         let pending = self.state.pending.as_ref().expect("pending");
-        if pending.evidence != Check::Valid {
+        if pending.evidence != Check::Valid || pending.awaits.is_some() {
             return Ok(Processed::Refused);
         }
         let time = pending.at / 1000;
@@ -571,7 +596,7 @@ impl DeviceGroup {
         } else {
             pending.epoch.saturating_sub(self.state.offset)
         };
-        if candidate.epoch() != epoch || !self.roster_holds(pending, &candidate) {
+        if candidate.epoch() != epoch || !self.roster_holds(pending, &candidate, !restart) {
             return Ok(Processed::Refused);
         }
         let authenticator = candidate.authenticator()?.ok_or(GroupError::Corrupt)?;
@@ -589,16 +614,25 @@ impl DeviceGroup {
 
     /// Whether `candidate`'s members are the device set after `pending`:
     /// every device in the group but those it removes, and the one it adds,
-    /// each leaf the device's credential. A leaf whose keys changed is
-    /// refused.
-    fn roster_holds(&self, pending: &Pending, candidate: &vos_mls::Candidate) -> bool {
+    /// each leaf the device's credential, the committer's renewed if its
+    /// admin key was replaced and the commit `renews` (a restart keeps the
+    /// leaf). A leaf whose keys changed otherwise is refused.
+    fn roster_holds(
+        &self,
+        pending: &Pending,
+        candidate: &vos_mls::Candidate,
+        renews: bool,
+    ) -> bool {
         let mut want: Vec<Vec<u8>> = self
             .state
             .devices
             .iter()
             .filter(|(id, known)| !known.out && !pending.effect.remove.contains(id))
-            .map(|(_, known)| credential(&known.keys))
-            .chain(pending.effect.add.iter().map(credential))
+            .map(|(id, known)| match known.renewal() {
+                Some(renewed) if renews && *id == pending.by => renewed,
+                _ => known.credential(),
+            })
+            .chain(pending.effect.add.iter().map(super::credential))
             .collect();
         let mut got: Vec<Vec<u8>> = candidate
             .credentials()
@@ -621,15 +655,16 @@ impl DeviceGroup {
             .filter(|_| state.voiced(pending.by))?;
         let mut adds = Vec::new();
         if let Some(add) = &pending.effect.add {
-            let known = state
-                .devices
-                .iter()
-                .any(|(_, known)| known.keys.sync == add.sync || known.keys.admin == add.admin);
+            let known = state.devices.iter().any(|(_, known)| {
+                known.keys.sync == add.sync
+                    || known.keys.admin == add.admin
+                    || known.admin == add.admin
+            });
             let delayed = !committer.strong && !state.set.adds.contains(add);
             if delayed || known || add.sync == add.admin {
                 return None;
             }
-            adds.push(credential(add));
+            adds.push(super::credential(add));
         }
         let mut named = pending.effect.remove.clone();
         named.sort_unstable();
@@ -648,13 +683,14 @@ impl DeviceGroup {
         let removes = named
             .iter()
             .filter_map(|device| state.known(*device))
-            .map(|known| credential(&known.keys))
+            .map(Known::credential)
             .filter(|credential| members.contains(credential))
             .collect();
         Some(Expected {
-            committer: credential(&committer.keys),
+            committer: committer.credential(),
             adds,
             removes,
+            renewed: committer.renewal(),
         })
     }
 
@@ -679,6 +715,9 @@ impl DeviceGroup {
                     self.state.id = pending.added;
                     self.state.renewed = pending.at;
                 }
+                // A restart keeps its regrouper's leaf; any other commit
+                // renews a replaced admin key's.
+                let restart = self.state.set.fresh == Some(pending.by);
                 if self.state.set.fresh == Some(pending.by) {
                     // The regroup's new group: its epochs count on from
                     // the agent's, and a device that could not follow
@@ -690,6 +729,14 @@ impl DeviceGroup {
                 self.state.offset = pending.epoch.saturating_sub(candidate.epoch());
                 if self.state.id == Some(pending.by) {
                     self.state.renewed = pending.at;
+                }
+                if !restart && let Some(committer) = self.state.known_mut(pending.by) {
+                    committer.leaf = committer.admin;
+                }
+                if let Some(rekey) = &pending.effect.rekey
+                    && self.state.kit_is(&rekey.entries)
+                {
+                    self.state.rekeyed = Some((pending.epoch, rekey.r_hash));
                 }
                 // Its epoch is decided: any commit of this device's for it
                 // is void, the swap deleting the held one.
@@ -855,8 +902,44 @@ impl DeviceGroup {
                 index,
                 message: message.clone(),
                 signature: *signature,
-                welcome: own.welcome.clone(),
+                attached: Attached {
+                    welcome: own.welcome.clone(),
+                    r2: own.r2,
+                },
             });
         }
+        // A restore pending asserts every device lost: a device with a
+        // voice answers with `alive` until the log cancels it.
+        let state = &self.state;
+        let me = state.id.filter(|me| state.voiced(*me));
+        let restoring = state.set.operations.iter().find(|call| {
+            call.evidence != Check::Invalid
+                && !state.set.closed.contains(&call.index)
+                && matches!(
+                    &call.act,
+                    Act::Op {
+                        op: Op::Restore { .. },
+                        ..
+                    }
+                )
+        });
+        if let (Some(me), Some(restore)) = (me, restoring)
+            && state
+                .known(me)
+                .is_some_and(|known| known.alive < restore.index)
+        {
+            events.push(Event::Alive);
+        }
+    }
+
+    /// The log made the `R` named `hash` the kit's at `since`: this
+    /// device's, if it drew it; else an archive brings it.
+    pub(super) fn name_recovery(&mut self, since: u64, hash: [u8; 32], by_kit: bool) {
+        self.state.recovery = Some(Named {
+            since,
+            hash,
+            by_kit,
+        });
+        self.archive.name(since, &hash);
     }
 }

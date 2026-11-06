@@ -156,13 +156,13 @@ fn read(personal: &mut Personal, phone: &mut Phone) {
                     index,
                     message,
                     signature,
-                    welcome,
+                    attached,
                 } => {
                     personal
                         .answer::<Recorded>(
                             &mut phone.sync,
                             "evidence",
-                            ((index, message), (signature, welcome)),
+                            ((index, message), (signature, attached)),
                         )
                         .unwrap()
                         .at
@@ -213,7 +213,14 @@ fn household(agent: &[u8]) -> (Personal, Phone, Phone) {
         instance: PERSONAL,
     };
     first.group = Some(
-        DeviceGroup::create(first.light.store(), identity, first.keys.device(), alive.at).unwrap(),
+        DeviceGroup::create(
+            first.light.store(),
+            identity,
+            first.keys.device(),
+            Vec::new(),
+            alive.at,
+        )
+        .unwrap(),
     );
     first.group().called(alive.at);
     let now = personal.served.now();
@@ -235,7 +242,7 @@ fn household(agent: &[u8]) -> (Personal, Phone, Phone) {
         index,
         message,
         signature,
-        welcome,
+        attached,
     } = first.group().called_commit(candidacy.index).unwrap()
     else {
         unreachable!()
@@ -244,7 +251,7 @@ fn household(agent: &[u8]) -> (Personal, Phone, Phone) {
         .answer::<Recorded>(
             &mut first.sync,
             "evidence",
-            ((index, message), (signature, welcome)),
+            ((index, message), (signature, attached)),
         )
         .unwrap();
     read(&mut personal, &mut first);

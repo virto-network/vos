@@ -4,10 +4,12 @@
 
 use ed25519_dalek::{Signer, SigningKey};
 use vos_light::group::{DeviceGroup, Event, Pairing, Prepared};
+use vos_light::kit::{KitKey, KitSecret, SecurityKey, Split};
 use vos_wire::Encode;
 use vos_wire::personal::{
-    AdminClass, Attestation, Candidacy, KitEntry, KitKind, NewDevice, PersonalError, Vote,
+    AdminClass, Attached, Attestation, Candidacy, NewDevice, PersonalError, Recorded, Vote,
 };
+use zeroize::Zeroizing;
 
 use vos_light::{Config, Light, Store};
 
@@ -63,19 +65,32 @@ impl Phone {
         self.keys.sync
     }
 
+    /// Phone `n`, a delayed admin.
+    pub fn delayed(n: u8) -> Self {
+        let mut phone = Self::new(n);
+        phone.keys.class = AdminClass::Delayed;
+        phone
+    }
+
     /// The claiming phone: its group made, the home assigned to it with
-    /// the kit of [`kit`]`(0)`.
-    pub fn claim(&mut self, home: &mut Home, homes: &SigningKey) {
-        let kit = vos_wire::personal::Kit {
-            entries: vec![kit_entry(&kit(0))],
-            r2: [0xc4; 32],
-        };
-        home.call(homes, "assign", (self.keys.clone(), kit).encode())
-            .answer::<vos_wire::personal::Recorded>()
+    /// the kit of [`kit_key`]`(0)`, `R` split: the split.
+    pub fn claim(&mut self, home: &mut Home, homes: &SigningKey) -> Split {
+        self.claim_with(home, homes, vec![kit_key(0)])
+    }
+
+    /// The claiming phone with the kit of `keys`.
+    pub fn claim_with(&mut self, home: &mut Home, homes: &SigningKey, keys: Vec<KitKey>) -> Split {
+        let split = Split::draw(&keys, &home.identity).unwrap();
+        let assigned: Recorded = home
+            .call(homes, "assign", (self.keys.clone(), split.claim()).encode())
+            .answer()
             .unwrap();
-        self.group = Some(
-            DeviceGroup::create(&self.store, home.agent(), self.keys.clone(), home.now).unwrap(),
-        );
+        let mut group =
+            DeviceGroup::create(&self.store, home.agent(), self.keys.clone(), keys, home.now)
+                .unwrap();
+        group.set_recovery(assigned.index, *split.r()).unwrap();
+        self.group = Some(group);
+        split
     }
 
     /// Read the log to its head and act on it, posting every vote and
@@ -104,9 +119,13 @@ impl Phone {
                         index,
                         message,
                         signature,
-                        welcome,
+                        attached,
                     } => {
-                        self.evidence(home, index, message, signature, welcome);
+                        self.evidence(home, index, message, signature, attached);
+                        posted = true;
+                    }
+                    Event::Alive => {
+                        self.alive(home);
                         posted = true;
                     }
                     other => seen.push(other),
@@ -136,12 +155,12 @@ impl Phone {
         index: u64,
         message: Vec<u8>,
         signature: [u8; 64],
-        welcome: Option<Vec<u8>>,
+        attached: Attached,
     ) {
         let reply = home.call(
             &self.sync,
             "evidence",
-            ((index, message), (signature, welcome)).encode(),
+            ((index, message), (signature, attached)).encode(),
         );
         self.group().called(reply.at);
     }
@@ -172,12 +191,12 @@ impl Phone {
                     index,
                     message,
                     signature,
-                    welcome,
+                    attached,
                 } = event
                 else {
                     unreachable!()
                 };
-                self.evidence(home, index, message, signature, welcome);
+                self.evidence(home, index, message, signature, attached);
                 Ok(candidacy)
             }
             Err(error) => {
@@ -218,17 +237,33 @@ impl Phone {
     }
 }
 
-/// Kit `n`'s signing key.
-pub fn kit(n: u8) -> SigningKey {
-    SigningKey::from_bytes(&[0x4b + n; 32])
+/// A security key's double: its `hmac-secret` a hash of its seed and the
+/// salt, the same at every touch.
+pub struct Touch(pub u8);
+
+impl SecurityKey for Touch {
+    type Error = ();
+
+    fn hmac_secret(&mut self, salt: &[u8; 32]) -> Result<Zeroizing<[u8; 32]>, ()> {
+        let mut out = Zeroizing::new([0; 32]);
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = salt[i] ^ self.0.wrapping_mul(31).wrapping_add(i as u8);
+        }
+        Ok(out)
+    }
 }
 
-/// A recovery entry of `key`.
-pub fn kit_entry(key: &SigningKey) -> KitEntry {
-    KitEntry {
-        kind: KitKind::Phrase,
-        signing: key.verifying_key().to_bytes(),
-        sealing: [0x5e; 32],
-        sealed_r1: vec![0x51; 80],
-    }
+/// Kit `n`: the security key [`Touch`]`(n)`'s.
+pub fn kit_secret(n: u8) -> KitSecret {
+    KitSecret::security_key(&mut Touch(0x4b + n)).unwrap()
+}
+
+/// Kit `n`'s signing key.
+pub fn kit(n: u8) -> SigningKey {
+    kit_secret(n).signing()
+}
+
+/// Kit `n`'s keys.
+pub fn kit_key(n: u8) -> KitKey {
+    kit_secret(n).key()
 }

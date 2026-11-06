@@ -113,7 +113,49 @@ and what a node does with one is `node/SECURITY.md`'s.
   before its new group frees the others to commit.
 - **Data keys come from the confirmed epoch alone**, and scope ids from
   the archive's naming secret, which is the store's from its first scope
-  on: a store that named a scope does not join another group.
+  on: a store that named a scope does not join another group. A restored
+  store keeps the recovered group's naming secret beside its own: its old
+  scopes keep their ids, new ones are named by its own, so a leaked old
+  naming secret unmasks no scope made after the restore.
+- **A replaced admin key** signs from its replacement's verified maturity;
+  a call its new key signs while that maturity's evidence is still to come
+  waits for it, and falls if it never verifies. The device's next commit
+  renews its leaf's credential to the new key, which every other device
+  accepts only for that device and that key.
+
+## The recovery kit and `R`
+
+- **The kit's 32 bytes** (a phrase's, or a security key's `hmac-secret`
+  over a fixed salt) give its ed25519 signing key and its X25519 sealing
+  key. `KitSecret` is zeroized on drop, with no `Clone` and no `Debug`; a
+  phrase's words are returned once, zeroized on drop, for the app to show
+  (never as a QR). The security key's output crosses the app's process as
+  YubiKit's answer, as a member secret's does.
+- **`R = R1 ⊕ R2`:** `R1` sealed to each kit entry's X25519 key (an
+  ephemeral agreement, XChaCha20-Poly1305, the agent's identity bound),
+  `R2` at the agent, released only to a matured restore's device. The kit
+  alone opens `R1`; the operators alone hold `R2`; together they read
+  every key the recovery scope holds (§8 D3).
+- **`R` rotates at every removal:** the device that commits a matured
+  removal draws a new `R`, seals its `R1` to each of the kit's keys (no
+  kit holder needed) and hands its `R2` to the agent in the commit's
+  evidence; the agent takes it at the commit's confirmation and re-points
+  the kit's reading of the recovery scope after it; the committer then
+  seals the whole archive under the new `R`. A removed device holds only
+  the `R` before, so with the operators it reads nothing pushed to the
+  recovery scope after its removal. A kit rotation and a restore draw a
+  new `R` too.
+- **A drawn `R` is held aside** until the log makes it the kit's (the
+  commit's verdict, the rotation's or restore's verified maturity), and
+  never travels before. The other devices take it only from an archive
+  sealed under an epoch's archive key whose `R` hashes to the one the
+  admin call named, so no device can give the others another `R`; and a
+  device pushes nothing to the recovery scope while the log names an `R`
+  it does not hold.
+- **The kit's sealing keys are a device's own:** the claim's are the
+  claiming device's, a rotation's or a restore's those its verified admin
+  call carried; a commit re-seals `R1` only to those, never to keys the
+  agent serves.
 
 ## The secret and its containment
 

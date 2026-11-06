@@ -1,9 +1,13 @@
 //! The key archive (`light-node.md` §3.4): the naming secret, from which
-//! every scope's id derives, every scope key of every confirmed epoch, a
-//! union indexed by epoch, and the recovery wrap key `R` (§3.5). A device keeps it in its store; a new device
-//! receives it over the pairing channel; sealed under an epoch's archive
-//! key it travels to the agent. Archives that disagree keep every
-//! candidate key, and the AEAD decides.
+//! every new scope's id derives, and the naming secrets of the groups a
+//! restore recovered, from which their scopes' ids still derive; every
+//! scope key of every confirmed epoch, a union indexed by epoch; and the
+//! recovery wrap key `R` (§3.5), with the ones this device drew that the
+//! control log has not named yet. A device keeps it in its store; a new
+//! device receives it over the pairing channel; sealed under an epoch's
+//! archive key it travels to the agent, `R` with it and the drawn ones
+//! never. Archives that disagree keep every candidate key, and the AEAD
+//! decides.
 
 use blake2::Blake2b;
 use blake2::digest::Digest;
@@ -12,7 +16,10 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use vos_wire::personal::Scope;
 use vos_wire::{Decode, Encode};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
+
+/// The `R`s a device holds drawn and not yet named.
+const DRAWN: usize = 4;
 
 /// The exporter's label for a scope's key: `k(scope, n) =
 /// MLS-Exporter("vos/personal/scope", scope_id, 32)`.
@@ -34,34 +41,41 @@ pub fn scope_id(naming: &[u8; 32], name: &[u8]) -> Scope {
 pub type Keys = ((u64, Scope), Vec<[u8; 32]>);
 
 /// The recovery wrap key `R = R1 ⊕ R2`, which recovery envelopes are
-/// sealed under, and the control log's index of the claim or kit rotation
-/// that drew it: of two, the later stands.
+/// sealed under, and the control log's index of the entry that made it
+/// the kit's (the claim's, a kit rotation's or a restore's maturity, a
+/// re-sealing commit's verdict): of two, the later stands.
 #[derive(Clone, PartialEq, Eq, Encode, Decode)]
 pub struct Recovery {
     pub since: u64,
     pub r: [u8; 32],
 }
 
-/// The archive: the naming secret, the scopes whose keys it records at
-/// each confirmed epoch, the keys, each `(epoch, scope)` with every
-/// candidate key archives disagreeing on, and `R`, once the claim drew it.
+/// The archive: the naming secret, the earlier groups' naming secrets, the
+/// scopes whose keys it records at each confirmed epoch, the keys, each
+/// `(epoch, scope)` with every candidate key archives disagreeing on, `R`
+/// once the claim drew it, and the `R`s this device drew that the log has
+/// not named yet.
 #[derive(Clone, PartialEq, Eq, Encode, Decode)]
 pub struct Archive {
     pub naming: [u8; 32],
+    pub previous: Vec<[u8; 32]>,
     pub scopes: Vec<Scope>,
     pub keys: Vec<Keys>,
     pub recovery: Option<Recovery>,
+    pub drawn: Vec<[u8; 32]>,
 }
 
 impl std::fmt::Debug for Archive {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Archive")
+            .field("previous", &self.previous.len())
             .field("scopes", &self.scopes.len())
             .field("keys", &self.keys.len())
             .field(
                 "recovery",
                 &self.recovery.as_ref().map(|recovery| recovery.since),
             )
+            .field("drawn", &self.drawn.len())
             .finish_non_exhaustive()
     }
 }
@@ -74,15 +88,23 @@ impl Archive {
         getrandom::getrandom(&mut naming).ok()?;
         Some(Self {
             naming,
+            previous: Vec::new(),
             scopes: Vec::new(),
             keys: Vec::new(),
             recovery: None,
+            drawn: Vec::new(),
         })
     }
 
-    /// The id of the scope named `name`.
+    /// The id of the scope named `name`: an earlier group's, if the
+    /// archive tracks that scope, else the naming secret's, so a restored
+    /// device reads its old scopes and names new ones afresh.
     pub fn scope(&self, name: &[u8]) -> Scope {
-        scope_id(&self.naming, name)
+        self.previous
+            .iter()
+            .map(|naming| scope_id(naming, name))
+            .find(|id| self.scopes.binary_search(id).is_ok())
+            .unwrap_or_else(|| scope_id(&self.naming, name))
     }
 
     /// The candidate keys of `scope` in `epoch`.
@@ -120,8 +142,9 @@ impl Archive {
         }
     }
 
-    /// The union of this archive and `other`: every scope and every key of
-    /// either, and the later `R`. The naming secret stays this archive's.
+    /// The union of this archive and `other`: every scope, every earlier
+    /// naming secret and every key of either, and the later `R`. The naming
+    /// secret and the drawn `R`s stay this archive's.
     pub fn merge(&mut self, other: &Archive) {
         if let Some(theirs) = &other.recovery
             && self
@@ -130,6 +153,15 @@ impl Archive {
                 .is_none_or(|mine| theirs.since > mine.since)
         {
             self.recovery = Some(theirs.clone());
+        }
+        self.merge_keys(other);
+    }
+
+    /// `other`'s scopes, earlier naming secrets and keys merged in, its `R`
+    /// left out.
+    pub fn merge_keys(&mut self, other: &Archive) {
+        for naming in &other.previous {
+            self.remember(*naming);
         }
         for scope in &other.scopes {
             self.track(*scope);
@@ -141,14 +173,63 @@ impl Archive {
         }
     }
 
-    /// This archive without `R`: what travels through the agent.
+    /// A recovered group's archive taken in: its naming secret one of the
+    /// earlier groups', its scopes and keys merged, its `R` left out.
+    pub fn inherit(&mut self, other: &Archive) {
+        self.remember(other.naming);
+        self.merge_keys(other);
+    }
+
+    fn remember(&mut self, naming: [u8; 32]) {
+        if naming != self.naming && !self.previous.contains(&naming) {
+            self.previous.push(naming);
+        }
+    }
+
+    /// This archive without `R` and the drawn ones: what the recovery
+    /// scope holds under `R`.
     pub fn without_recovery(&self) -> Archive {
-        let mut archive = self.clone();
+        let mut archive = self.shareable();
         if let Some(mut recovery) = archive.recovery.take() {
-            use zeroize::Zeroize;
             recovery.r.zeroize();
         }
         archive
+    }
+
+    /// This archive without the `R`s this device drew: what a pairing
+    /// hands over, and what travels sealed under an epoch's archive key.
+    pub fn shareable(&self) -> Archive {
+        let mut archive = self.clone();
+        archive.drawn.zeroize();
+        archive.drawn.clear();
+        archive
+    }
+
+    /// Hold `r`, drawn by this device, until the log names it: the newest
+    /// few kept.
+    pub fn draw(&mut self, r: [u8; 32]) {
+        if self.drawn.len() >= DRAWN {
+            let mut oldest = self.drawn.remove(0);
+            oldest.zeroize();
+        }
+        self.drawn.push(r);
+    }
+
+    /// Take as the kit's the `R` this device drew whose hash is `hash`,
+    /// named by the log at `since`: whether it held one.
+    pub fn name(&mut self, since: u64, hash: &[u8; 32]) -> bool {
+        let Some(at) = self
+            .drawn
+            .iter()
+            .position(|r| vos_wire::personal::r_hash(r) == *hash)
+        else {
+            return false;
+        };
+        let r = self.drawn.remove(at);
+        if self.recovery.as_ref().is_none_or(|mine| since > mine.since) {
+            self.recovery = Some(Recovery { since, r });
+        }
+        true
     }
 
     /// The scopes and keys of this archive that `other` lacks, with this
@@ -156,6 +237,12 @@ impl Archive {
     pub fn beyond(&self, other: &Archive) -> Archive {
         Archive {
             naming: self.naming,
+            previous: self
+                .previous
+                .iter()
+                .filter(|naming| !other.previous.contains(naming))
+                .copied()
+                .collect(),
             scopes: self
                 .scopes
                 .iter()
@@ -176,12 +263,13 @@ impl Archive {
                 })
                 .collect(),
             recovery: None,
+            drawn: Vec::new(),
         }
     }
 
-    /// Whether it holds no scope and no key.
+    /// Whether it holds no earlier naming secret, no scope and no key.
     pub fn is_empty(&self) -> bool {
-        self.scopes.is_empty() && self.keys.is_empty()
+        self.previous.is_empty() && self.scopes.is_empty() && self.keys.is_empty()
     }
 
     /// The archive sealed under `key` with `nonce`: XChaCha20-Poly1305 over
@@ -206,8 +294,9 @@ impl Archive {
 
 impl Drop for Archive {
     fn drop(&mut self) {
-        use zeroize::Zeroize;
         self.naming.zeroize();
+        self.previous.zeroize();
+        self.drawn.zeroize();
         for (_, keys) in &mut self.keys {
             keys.zeroize();
         }

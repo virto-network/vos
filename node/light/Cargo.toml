@@ -42,8 +42,12 @@ zeroize = { version = "1", features = ["derive"] }
 ed25519-dalek = "2"
 # The device group's MLS layer.
 vos-mls = { workspace = true }
-# The key archive's seal.
+# The key archive's seal, and a kit's `R1`'s.
 chacha20poly1305 = "0.10"
+# A kit's sealing key, which its `R1` is sealed to.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+# A phrase kit's 24 words.
+bip39 = { version = "2.2", default-features = false, features = ["zeroize"] }
 # A query's key, and an operation's seed.
 getrandom = "0.2"
 # A pool's threads pinned to the cores `Threads::Cores` names.

@@ -18,8 +18,8 @@ use vos_wire::abi::Failure;
 use vos_wire::ids::{Principal, derive_id};
 use vos_wire::ingress::{AdmissionRefusal, CallMessage, Rejection as Rejected};
 use vos_wire::personal::{
-    AdminClass, Attestation, Body, Candidacy, Effect, Entry, Envelope, Header, Kit, KitEntry,
-    KitKind, NewDevice, Overview, PersonalError, Policy, Pushed, Recorded, Voted,
+    AdminClass, Attached, Attestation, Body, Candidacy, Effect, Entry, Envelope, Header, Kit,
+    KitEntry, KitKind, NewDevice, Overview, PersonalError, Policy, Pushed, Recorded, Voted,
 };
 
 use super::api::{connect, receive};
@@ -411,7 +411,7 @@ fn admin_calls_are_verified_at_ingress_and_checked_against_the_device_set() {
             "evidence",
             (
                 (candidacy.index, message),
-                (call.signature, None::<Vec<u8>>),
+                (call.signature, Attached::default()),
             ),
         )
         .unwrap();
@@ -458,7 +458,7 @@ fn a_removed_device_keeps_its_session_and_the_agent_refuses_it() {
             1u64,
             Effect {
                 add: Some(tablet.device()),
-                remove: Vec::new(),
+                ..Effect::default()
             },
         ),
         (vec![0x11_u8; 1374], None::<[u8; 32]>),

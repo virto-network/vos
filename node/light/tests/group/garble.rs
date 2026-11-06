@@ -285,7 +285,7 @@ pub fn hostile(
     let client = Client::builder()
         .group_state_storage(namespace.clone())
         .key_package_repo(namespace)
-        .identity_provider(Identity)
+        .identity_provider(Identity::default())
         .crypto_provider(Garbling { spare })
         .mls_rules(rules)
         .build();

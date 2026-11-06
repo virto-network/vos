@@ -9,15 +9,16 @@
 
 use ed25519_dalek::SigningKey;
 use vos_light::group::{Alarm, Course, DeviceGroup, Event, GroupError, Remedy, Restored, Why};
+use vos_light::kit::KitKey;
 use vos_wire::Encode;
 use vos_wire::personal::{
-    Body, DeviceView, Effect, Entry, NewKit, OpState, Operation, Overview, PersonalError, Recorded,
-    RecoveryView, Woken, chain, r2_hash,
+    Attached, Body, DeviceView, Effect, Entry, OpState, Operation, Overview, PersonalError,
+    Recorded, RecoveryView, Woken, chain,
 };
 
 use crate::garble::{Anything, hostile};
 use crate::home::Home;
-use crate::phone::{Phone, kit, kit_entry};
+use crate::phone::{Phone, kit, kit_key};
 use crate::{NOTES, agree, all, commit_as, confirm_as, household, policy, settle};
 
 /// A household of `count` phones, each seasoned and seen.
@@ -31,23 +32,23 @@ fn seasoned(count: u8) -> (Home, Vec<Phone>) {
 }
 
 /// `signer`'s call of `name` with `arguments`, its evidence posted under
-/// `poster` with what rides beside it: the call's log index.
-fn operate(
+/// `poster` with the `R2` that rides beside it: the call's log index.
+pub(crate) fn operate(
     home: &mut Home,
     signer: &SigningKey,
     poster: &SigningKey,
     name: &str,
     arguments: Vec<u8>,
-    attached: Option<Vec<u8>>,
+    r2: Option<[u8; 32]>,
 ) -> u64 {
     let (index, message, signature) = unevidenced(home, signer, name, arguments);
-    post(home, poster, index, message, signature, attached);
+    post(home, poster, index, message, signature, r2);
     index
 }
 
 /// `signer`'s call of `name` with `arguments`, no evidence posted yet:
 /// its log index, and the message and signature its evidence carries.
-fn unevidenced(
+pub(crate) fn unevidenced(
     home: &mut Home,
     signer: &SigningKey,
     name: &str,
@@ -58,14 +59,15 @@ fn unevidenced(
     (index, reply.message, reply.signature)
 }
 
-fn post(
+pub(crate) fn post(
     home: &mut Home,
     poster: &SigningKey,
     index: u64,
     message: Vec<u8>,
     signature: [u8; 64],
-    attached: Option<Vec<u8>>,
+    r2: Option<[u8; 32]>,
 ) {
+    let attached = Attached { welcome: None, r2 };
     home.call(
         poster,
         "evidence",
@@ -328,29 +330,27 @@ fn woken(home: &mut Home, key: &SigningKey) {
     }
 }
 
-/// Every device lost: the kit restores, carrying the next kit, its `R2`
-/// in the evidence. At maturity the old devices see their removal under
-/// the kit's verified evidence; the restore's device starts a new group
-/// alone from what it reads of the agent, its first commit carrying every
-/// removal, pairs a new phone, and follows the new kit's removal of it,
-/// which the old kit can no longer sign.
+/// Every device lost: the kit restores, carrying the next kit, its `R`
+/// drawn and held in the restoring device's store, its `R2` in the
+/// evidence. At maturity the old devices see their removal under the
+/// kit's verified evidence; the restore's device reads the previous `R2`
+/// and the entries it went with, starts a new group alone from what it
+/// reads of the agent, its `R` the kit's, its first commit carrying every
+/// removal and re-sealing the kit, pairs a new phone, and follows the new
+/// kit's removal of it, which the old kit can no longer sign.
 #[test]
 fn a_restore_starts_a_new_group_under_its_new_kit() {
     let (mut home, mut phones) = household(2);
     let mut restored = Phone::new(9);
-    let next = kit(1);
-    let r2 = [0x77; 32];
-    let new_kit = NewKit {
-        entries: vec![kit_entry(&next)],
-        r2_hash: r2_hash(&r2),
-    };
+    let next = kit_key(1);
+    let split = vos_light::group::restoring(&restored.store, &[next], &home.agent()).unwrap();
     operate(
         &mut home,
         &kit(0),
         &kit(0),
         "restore",
-        (restored.keys.clone(), new_kit).encode(),
-        Some(r2.to_vec()),
+        (restored.keys.clone(), split.kit.clone()).encode(),
+        Some(*split.r2()),
     );
     home.pass(policy().kit_delay_ms);
     home.call(&kit(0), "wake", ().encode())
@@ -376,26 +376,53 @@ fn a_restore_starts_a_new_group_under_its_new_kit() {
     let recovery: RecoveryView = home
         .query(restored.sync_key(), "recovery", ().encode())
         .unwrap();
-    assert_eq!(recovery.released, Some([0xc4; 32]), "the previous R2");
+    assert!(recovery.released.is_some(), "the previous R2");
+    assert_eq!(
+        recovery.previous.iter().map(KitKey::of).collect::<Vec<_>>(),
+        vec![kit_key(0)],
+        "the entries it went with"
+    );
     let read = Restored {
         next: overview.next,
         chain: overview.chain,
         time: home.now,
         confirmed: overview.confirmed,
         policy: policy(),
-        kit: recovery.entries.iter().map(|entry| entry.signing).collect(),
+        kit: vec![next],
+        r_hash: split.kit.r_hash,
         devices,
     };
     restored.group = Some(
         DeviceGroup::restore(&restored.store, home.agent(), restored.keys.clone(), read).unwrap(),
     );
+    assert!(restored.group().holds_recovery());
+    assert_eq!(
+        restored.group().archive().recovery.as_ref().unwrap().r,
+        *split.r()
+    );
     let epoch = overview.confirmed + 1;
-    let candidacy = restored.update(&mut home).unwrap();
+    let prepared = restored.group().commit(None, home.now).unwrap();
+    assert_eq!(prepared.effect.remove, vec![0, 1]);
+    assert!(
+        prepared.effect.rekey.is_some(),
+        "a removal re-seals the kit"
+    );
+    let candidacy = restored.send(&mut home, &prepared).unwrap();
     assert_eq!(candidacy.set, vec![2]);
     let events = settle(&mut home, &mut [&mut restored]);
     assert!(
         events[0].contains(&Event::Confirmed { epoch }),
         "{events:?}"
+    );
+    let recovery: RecoveryView = home
+        .query(restored.sync_key(), "recovery", ().encode())
+        .unwrap();
+    assert_eq!(recovery.released, None, "deleted at its first commit");
+    assert!(restored.group().holds_recovery());
+    assert_ne!(
+        restored.group().archive().recovery.as_ref().unwrap().r,
+        *split.r(),
+        "the commit's R"
     );
 
     let mut paired = Phone::new(10);
@@ -410,7 +437,7 @@ fn a_restore_starts_a_new_group_under_its_new_kit() {
         Err(PersonalError::NotAdmitted),
         "the old kit signs nothing"
     );
-    operate(&mut home, &next, &next, "remove", 3u32.encode(), None);
+    operate(&mut home, &kit(1), &kit(1), "remove", 3u32.encode(), None);
     home.pass(policy().kit_delay_ms);
     restored.alive(&mut home);
     signed(&settle(&mut home, &mut [&mut restored]));
@@ -568,4 +595,159 @@ fn a_device_that_cannot_follow_regroups() {
     );
     assert_eq!(phones[1].group().course(), Course::Following);
     phones[1].group().key(NOTES).unwrap();
+}
+
+/// A delayed admin's add waits its delay: its inline add is refused
+/// (`Delayed`), so it signs an add operation; until it matures its commit
+/// carrying the add is refused too; once it matured the delayed admin's
+/// own commit carries it, and every device confirms the new phone.
+#[test]
+fn a_delayed_admins_add_waits_its_delay() {
+    let homes = crate::homes();
+    let mut home = Home::new(&homes, policy());
+    let mut first = Phone::new(1);
+    first.claim(&mut home, &homes);
+    let mut delayed = Phone::delayed(2);
+    first.pair(&mut home, &mut delayed);
+    settle(&mut home, &mut [&mut first, &mut delayed]);
+    home.pass(policy().seasoning_ms);
+    first.alive(&mut home);
+    delayed.alive(&mut home);
+
+    let mut new = Phone::new(3);
+    let attempt = |home: &mut Home, delayed: &mut Phone, new: &Phone| {
+        let package = DeviceGroup::key_package(&new.store, &new.keys, home.now).unwrap();
+        let (prepared, _) = delayed
+            .group()
+            .pair(new.keys.clone(), package, home.now)
+            .unwrap();
+        delayed.send(home, &prepared)
+    };
+    assert_eq!(
+        attempt(&mut home, &mut delayed, &new),
+        Err(PersonalError::Delayed)
+    );
+    let add = operate(
+        &mut home,
+        &delayed.admin,
+        &delayed.sync,
+        "add",
+        new.keys.encode(),
+        None,
+    );
+    home.pass(policy().operation_delay_ms / 2);
+    delayed.alive(&mut home);
+    delayed.read(&mut home);
+    assert_eq!(
+        attempt(&mut home, &mut delayed, &new),
+        Err(PersonalError::Delayed),
+        "not before its delay"
+    );
+    home.pass(policy().operation_delay_ms / 2);
+    first.alive(&mut home);
+    delayed.alive(&mut home);
+    signed(&settle(&mut home, &mut [&mut first, &mut delayed]));
+    assert!(matches!(state(&home, &first, add), OpState::Matured { .. }));
+    delayed.pair(&mut home, &mut new);
+    let events = settle(&mut home, &mut [&mut first, &mut delayed, &mut new]);
+    signed(&events);
+    for events in &events {
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::Confirmed { .. })),
+            "{events:?}"
+        );
+    }
+    assert_eq!(new.group().id(), Some(2));
+    let epoch = first.group().confirmed();
+    agree(&mut [&mut first, &mut delayed, &mut new], epoch);
+}
+
+/// An admin key replaced (a biometric change): another seasoned device
+/// signs the replacement, the new key signs from its maturity, the old one
+/// no more, and the device's next commit renews its leaf to the new key,
+/// which every device confirms, and the commits after it. A replacement
+/// whose evidence comes after its maturity: the new key's commit waits for
+/// it on every device, refused by none, and is confirmed once it comes.
+#[test]
+fn a_replaced_admin_key_signs_and_renews_its_leaf() {
+    let (mut home, mut phones) = seasoned(3);
+    let new_admin = |n: u8| SigningKey::from_bytes(&[0x70 | n; 32]);
+    let replacement = |key: &SigningKey| vos_wire::personal::NewAdmin {
+        key: key.verifying_key().to_bytes(),
+        class: vos_wire::personal::AdminClass::Strong,
+        attestation: vos_wire::personal::Attestation {
+            hardware: true,
+            verified_boot: true,
+        },
+    };
+    let fresh = new_admin(3);
+    operate(
+        &mut home,
+        &phones[0].admin,
+        &phones[0].sync,
+        "replace",
+        (2u32, replacement(&fresh)).encode(),
+        None,
+    );
+    home.pass(policy().probation_ms);
+    for phone in &mut phones {
+        phone.alive(&mut home);
+    }
+    signed(&settle(&mut home, &mut all(&mut phones)));
+    let old = std::mem::replace(&mut phones[2].admin, fresh);
+    assert_eq!(
+        home.call(&old, "remove", 0u32.encode())
+            .answer::<Recorded>(),
+        Err(PersonalError::NotAdmitted),
+        "the old key signs nothing"
+    );
+    let epoch = phones[0].group().confirmed() + 1;
+    phones[2].update(&mut home).unwrap();
+    let events = settle(&mut home, &mut all(&mut phones));
+    signed(&events);
+    for events in &events {
+        assert!(events.contains(&Event::Confirmed { epoch }), "{events:?}");
+    }
+    for n in [0, 2] {
+        phones[n].update(&mut home).unwrap();
+        signed(&settle(&mut home, &mut all(&mut phones)));
+    }
+    agree(&mut all(&mut phones), epoch + 2);
+
+    // The evidence after the maturity.
+    let late = new_admin(2);
+    let (index, message, signature) = unevidenced(
+        &mut home,
+        &phones[0].admin,
+        "replace",
+        (1u32, replacement(&late)).encode(),
+    );
+    home.pass(policy().probation_ms);
+    for phone in &mut phones {
+        phone.alive(&mut home);
+    }
+    signed(&settle(&mut home, &mut all(&mut phones)));
+    phones[1].admin = late;
+    let epoch = phones[0].group().confirmed() + 1;
+    phones[1].update(&mut home).unwrap();
+    let events = settle(&mut home, &mut all(&mut phones));
+    for events in &events {
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                Event::Alarm(Alarm::Refused { .. } | Alarm::Unsigned { .. })
+                    | Event::Confirmed { .. }
+            )),
+            "it waits: {events:?}"
+        );
+    }
+    post(&mut home, &phones[0].sync, index, message, signature, None);
+    let events = settle(&mut home, &mut all(&mut phones));
+    signed(&events);
+    for events in &events {
+        assert!(events.contains(&Event::Confirmed { epoch }), "{events:?}");
+    }
+    agree(&mut all(&mut phones), epoch);
 }

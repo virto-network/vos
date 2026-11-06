@@ -18,7 +18,7 @@ use vos_light::group::{Alarm, Course, DeviceGroup, Event, Remedy, Why};
 use vos_wire::Encode;
 use vos_wire::ids::InstanceId;
 use vos_wire::personal::{
-    Body, Effect, Entry, Overview, PersonalError, Policy, Recorded, Scope, Vote, chain,
+    Attached, Body, Effect, Entry, Overview, PersonalError, Policy, Recorded, Scope, Vote, chain,
     vote_message,
 };
 
@@ -159,19 +159,20 @@ fn paired_phones_confirm_one_group() {
 }
 
 /// The committer's evidence, signed by its admin key, posted under its
-/// sync key: the evidence call `index`'s message and signature.
+/// sync key: the evidence call `index`'s message and signature, and what
+/// rides beside it.
 fn evidence(
     home: &mut Home,
     phone: &Phone,
     index: u64,
     message: Vec<u8>,
     signature: [u8; 64],
-    welcome: Option<Vec<u8>>,
+    attached: Attached,
 ) {
     let reply = home.call(
         &phone.sync,
         "evidence",
-        ((index, message), (signature, welcome)).encode(),
+        ((index, message), (signature, attached)).encode(),
     );
     reply.answer::<Recorded>().unwrap();
 }
@@ -186,7 +187,23 @@ fn commit_as(
     handshake: Vec<u8>,
     welcome: Option<Vec<u8>>,
 ) -> u64 {
-    let hash = welcome.as_deref().map(vos_wire::personal::welcome_hash);
+    let attached = Attached { welcome, r2: None };
+    commit_attaching(home, phone, epoch, effect, handshake, attached)
+}
+
+/// [`commit_as`] with `attached` beside the evidence.
+fn commit_attaching(
+    home: &mut Home,
+    phone: &Phone,
+    epoch: u64,
+    effect: Effect,
+    handshake: Vec<u8>,
+    attached: Attached,
+) -> u64 {
+    let hash = attached
+        .welcome
+        .as_deref()
+        .map(vos_wire::personal::welcome_hash);
     let reply = home.call(
         &phone.admin,
         "commit",
@@ -196,7 +213,7 @@ fn commit_as(
         .answer::<vos_wire::personal::Candidacy>()
         .unwrap()
         .index;
-    evidence(home, phone, index, reply.message, reply.signature, welcome);
+    evidence(home, phone, index, reply.message, reply.signature, attached);
     index
 }
 
@@ -506,7 +523,7 @@ fn without_valid_evidence_no_device_moves() {
         index,
         reply.message,
         [0x5a; 64],
-        None,
+        Attached::default(),
     );
     let (_, others) = phones.split_at_mut(1);
     let events = settle(&mut home, &mut all(others));
@@ -537,7 +554,7 @@ fn without_valid_evidence_no_device_moves() {
         index,
         reply.message,
         [0x5a; 64],
-        None,
+        Attached::default(),
     );
     home.pass(policy().operation_delay_ms);
     phones[0].alive(&mut home);
@@ -562,17 +579,22 @@ fn without_valid_evidence_no_device_moves() {
     builder = builder.remove_member(leaf).unwrap();
     let output = builder.build().unwrap();
     drop(attacker);
+    let rekey = vos_light::kit::Split::draw(&[phone::kit_key(0)], &home.identity).unwrap();
     let effect = Effect {
         add: None,
         remove: vec![2],
+        rekey: Some(rekey.kit.clone()),
     };
-    commit_as(
+    commit_attaching(
         &mut home,
         &phones[0],
         3,
         effect,
         output.commit_message.to_bytes().unwrap(),
-        None,
+        Attached {
+            welcome: None,
+            r2: Some(*rekey.r2()),
+        },
     );
     let events = phones[1].read(&mut home);
     assert!(
@@ -623,7 +645,14 @@ fn attacker_leaf(roster: &[(u32, Vec<u8>)], credential: &[u8]) -> u32 {
 fn remove(home: &mut Home, phone: &Phone, target: u32) {
     let reply = home.call(&phone.admin, "remove", target.encode());
     let index = reply.answer::<Recorded>().unwrap().index;
-    evidence(home, phone, index, reply.message, reply.signature, None);
+    evidence(
+        home,
+        phone,
+        index,
+        reply.message,
+        reply.signature,
+        Attached::default(),
+    );
 }
 
 /// A20 and A21, the gate: two attacker devices nack every commit, which
@@ -771,7 +800,7 @@ fn every_disallowed_proposal_is_nacked() {
             "add without a path",
             Effect {
                 add: Some(stranger.keys.clone()),
-                remove: Vec::new(),
+                ..Effect::default()
             },
             {
                 let mut group = hostile(
@@ -828,7 +857,7 @@ fn every_disallowed_proposal_is_nacked() {
             "another device's add",
             Effect {
                 add: Some(stranger.keys.clone()),
-                remove: Vec::new(),
+                ..Effect::default()
             },
             {
                 let mut group = hostile(&phones[0].store, None, encrypted);
@@ -883,7 +912,7 @@ fn external_commit(stranger: &mut Phone, info: mls_rs::MlsMessage) -> Vec<u8> {
         mls_rs::identity::basic::BasicCredential::new(vos_light::group::credential(&stranger.keys));
     let identity = mls_rs::identity::SigningIdentity::new(credential.into_credential(), public);
     let client = mls_rs::Client::builder()
-        .identity_provider(vos_mls::Identity)
+        .identity_provider(vos_mls::Identity::default())
         .crypto_provider(crypto)
         .mls_rules(Anything {
             path: true,

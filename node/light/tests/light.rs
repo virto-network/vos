@@ -29,9 +29,11 @@ fn open(dir: &std::path::Path, agent: &[u8]) -> Light {
     let light = Light::open(dir, agent, Config::default()).unwrap();
     let shared = Archive {
         naming: NAMING,
+        previous: Vec::new(),
         scopes: Vec::new(),
         keys: Vec::new(),
         recovery: None,
+        drawn: Vec::new(),
     };
     light.store().adopt(&shared).unwrap();
     light

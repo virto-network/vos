@@ -22,6 +22,9 @@
 //!   every envelope opened and its node applied; the archive pushed at each
 //!   confirmed epoch, and the recovery envelopes under `R`; over the onion
 //!   alone.
+//! - **The recovery kit** ([`kit`]): a phrase or a security key's 32
+//!   bytes, the kit's signing and sealing keys, and `R = R1 ⊕ R2` split
+//!   across the kit and the agent.
 //!
 //! **The device library** (`docs/design/proving.md` §8): what the phone
 //! runs to prove facts about its device secret to its space's ingress, and
@@ -63,6 +66,7 @@
 mod call;
 pub mod group;
 mod kernel;
+pub mod kit;
 mod light;
 mod path;
 pub mod personal;

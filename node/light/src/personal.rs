@@ -17,16 +17,22 @@
 //!   device has not confirmed, or whose key it lacks; one that does not
 //!   open, or is not a node of the scope, is passed over and reported.
 //! - **The archive** ([`SealedSync::archive`]): read from its own scope,
-//!   every archive sealed at the confirmed epoch merged, `R` left out;
-//!   unless one there is this device's whole archive, this device's is
-//!   pushed, chunked, under the epoch's archive key: the committer's push
-//!   once an epoch is confirmed, and any device's that holds keys the
-//!   agent's archives lack.
+//!   every archive sealed at the confirmed epoch merged, its `R` taken only
+//!   when it is the one the log made the kit's; unless one there is this
+//!   device's whole archive, this device's is pushed, chunked, under the
+//!   epoch's archive key: the committer's push once an epoch is confirmed,
+//!   and any device's that holds keys (or the kit's `R`) the agent's
+//!   archives lack. So a new `R`, drawn at a removal, reaches the other
+//!   devices under an epoch the removed device is not in.
 //! - **Recovery envelopes** ([`SealedSync::recovery`]): whatever of the
-//!   archive (the naming secret, every scope key) the recovery scope does
+//!   archive (the naming secrets, every scope key) the recovery scope does
 //!   not hold under `R` yet, sealed under it at the confirmed epoch, so the
-//!   kit's copy never lags: what a kit reads ([`open_recovery`]) after a
-//!   restore releases `R2`.
+//!   kit's copy never lags: what a kit reads ([`open_recovery`],
+//!   [`recover`]) after a restore releases `R2`. A new `R` seals the whole
+//!   archive again.
+//! - **Reading back** ([`read_back`]): a restored device reading a scope
+//!   of the agent it restored at with the archive it recovered, before any
+//!   group of its own.
 //! - **Tor only** (E17): a link names its [`Route`], and every request is
 //!   refused before it leaves unless the route is the onion, so the light
 //!   node has no clearnet route for any kind addressed to the personal
@@ -41,11 +47,14 @@ use blake2::digest::Digest as _;
 use blake2::digest::consts::U32;
 use merkle_crdt::Ingested;
 use vos_wire::ids::InstanceId;
-use vos_wire::personal::{Envelope, PersonalError, Pushed, RECOVERY, Scope, Woken, envelope_id};
+use vos_wire::personal::{
+    Envelope, PersonalError, Pushed, RECOVERY, RecoveryView, Scope, Woken, envelope_id,
+};
 use vos_wire::{Decode, Encode};
 use zeroize::Zeroizing;
 
 use crate::group::{Archive, DeviceGroup, GroupError};
+use crate::kit::{self, KitSecret};
 use crate::light::{Error, Light, Queued};
 use crate::sealed::{self, Body, MAX_BODY, OpenError, View};
 use crate::sync::Blake2b256;
@@ -381,7 +390,8 @@ pub fn open_recovery(r: &[u8; 32], agent: &[u8; 32], envelopes: &[Envelope]) -> 
     let mut reassembly = Reassembly::default();
     let mut merged: Option<Archive> = None;
     for envelope in envelopes {
-        let Ok((header, body)) = sealed::open(&[*key], agent, &envelope.bytes) else {
+        let Ok((header, body)) = sealed::open(core::slice::from_ref(&*key), agent, &envelope.bytes)
+        else {
             continue;
         };
         if header.scope != RECOVERY {
@@ -395,6 +405,93 @@ pub fn open_recovery(r: &[u8; 32], agent: &[u8; 32], envelopes: &[Envelope]) -> 
         }
     }
     merged
+}
+
+/// What a kit recovers at the agent whose identity is `agent` once a
+/// restore of it matured: `R1` opened from the entry of the kit's signing
+/// key among those the restore replaced (`view` as the restore's device
+/// reads it, `R2` released beside them), `R = R1 ⊕ R2`, and the recovery
+/// scope's `envelopes` opened under it; none if the kit is not among them,
+/// nothing was released, or no envelope opens.
+pub fn recover(
+    kit: &KitSecret,
+    view: &RecoveryView,
+    agent: &[u8; 32],
+    envelopes: &[Envelope],
+) -> Option<Archive> {
+    let r2 = Zeroizing::new(view.released?);
+    let signing = kit.key().signing;
+    let entry = view
+        .previous
+        .iter()
+        .find(|entry| entry.signing == signing)?;
+    let r1 = kit.open_r1(entry, agent)?;
+    let r = kit::join(&r1, &r2);
+    open_recovery(&r, agent, envelopes)
+}
+
+/// Read `instance`'s scope at the agent whose identity is `agent` over
+/// `link` from its start, every envelope opened under `archive`'s keys of
+/// its epoch and its node applied, no cursor stored: a restored device
+/// reading its old scopes with the archive it recovered, before any group
+/// of its own. Envelopes that do not open are passed over.
+pub fn read_back<L: Link>(
+    light: &Light,
+    archive: &Archive,
+    agent: &[u8; 32],
+    link: &mut L,
+    instance: InstanceId,
+) -> Result<Caught, SyncError<L::Error>> {
+    if link.route() != Route::Onion {
+        return Err(SyncError::Clearnet);
+    }
+    let scope = light.scope_id(instance)?.0;
+    let mut caught = Caught::default();
+    let mut from = 0;
+    loop {
+        if link.route() != Route::Onion {
+            return Err(SyncError::Clearnet);
+        }
+        let page = link
+            .since(scope, from)
+            .map_err(SyncError::Link)?
+            .map_err(SyncError::Refused)?;
+        if page.is_empty() {
+            return Ok(caught);
+        }
+        let mut nodes = Vec::with_capacity(page.len());
+        for envelope in page {
+            if envelope.position <= from {
+                return Err(SyncError::Disordered);
+            }
+            from = envelope.position;
+            caught.envelopes += 1;
+            caught.bytes += envelope.bytes.len();
+            let why = match sealed::header_of(&envelope.bytes) {
+                _ if envelope_id(&envelope.bytes) != envelope.id => Unusable::Id,
+                Err(error) => Unusable::Opened(error),
+                Ok(header) if header.scope != scope => Unusable::Scope,
+                Ok(header) => {
+                    let keys = Zeroizing::new(archive.keys(header.epoch, &scope).to_vec());
+                    match sealed::open(&keys, agent, &envelope.bytes) {
+                        Ok((_, body)) => match Body::decode_exact(&body) {
+                            Some(body) => {
+                                nodes.push(body.node);
+                                continue;
+                            }
+                            None => Unusable::Body,
+                        },
+                        Err(error) => Unusable::Opened(error),
+                    }
+                }
+            };
+            caught.passed.push(Passed {
+                position: envelope.position,
+                why,
+            });
+        }
+        caught.absorb(light.ingest(instance, nodes, None)?);
+    }
 }
 
 /// The archive scope's reading, stored: its cursor, and the confirmed
@@ -637,11 +734,12 @@ impl<'a, L: Link> SealedSync<'a, L> {
         Ok(report)
     }
 
-    /// The candidate keys of `scope` at `epoch`: the confirmed epoch's
-    /// exported, an earlier one's from the archive.
+    /// The candidate keys of `scope` at `epoch`, from the archive: the
+    /// confirmed epoch's exported key recorded there first, beside any a
+    /// restore recovered of the old group's epoch of that number.
     fn keys(&mut self, scope: Scope, epoch: u64) -> Result<Vec<[u8; 32]>, GroupError> {
         if epoch == self.group.confirmed() {
-            return Ok(vec![self.group.key(scope)?]);
+            drop(Zeroizing::new(self.group.key(scope)?));
         }
         Ok(self.group.archive().keys(epoch, &scope).to_vec())
     }
@@ -820,9 +918,10 @@ impl<'a, L: Link> SealedSync<'a, L> {
     }
 
     /// Read the archive's scope from its cursor, merging every archive
-    /// sealed at the confirmed epoch, `R` left out; then, unless the agent
-    /// holds one at this epoch that is this device's whole archive, push
-    /// this device's there, chunked: the committer's push once an epoch is
+    /// sealed at the confirmed epoch, its `R` only if the log made it the
+    /// kit's; then, unless the agent holds one at this epoch that is this
+    /// device's whole archive, push this device's there, chunked, `R` with
+    /// it and the `R`s it drew not: the committer's push once an epoch is
     /// confirmed, and any device's that holds keys the archives there lack,
     /// are one rule. Archives of earlier epochs are passed over: their keys
     /// are this device's no longer, and a later archive holds theirs.
@@ -841,11 +940,11 @@ impl<'a, L: Link> SealedSync<'a, L> {
         }
         let mut held = vec![reading.held];
         for (digest, archive) in archives {
-            self.group.merge_archive(&archive.without_recovery())?;
+            self.group.merge_read(&archive)?;
             held.push(digest);
             kept.found += 1;
         }
-        let mine = self.group.archive().without_recovery();
+        let mine = self.group.archive().shareable();
         let digest = archive_digest(&mine.encode());
         if held.contains(&digest) {
             reading.held = digest;
@@ -864,11 +963,15 @@ impl<'a, L: Link> SealedSync<'a, L> {
 
     /// Read the recovery scope from its cursor for what the agent holds
     /// sealed under `R`, and push, sealed under it at the confirmed epoch,
-    /// whatever of this device's archive it lacks: the naming secret and
-    /// every scope key, so the kit's copy never lags. Nothing without `R`;
-    /// a new `R` reads the scope again from its start and pushes the whole
-    /// archive under it.
+    /// whatever of this device's archive it lacks: the naming secrets and
+    /// every scope key, so the kit's copy never lags. Nothing without `R`,
+    /// and nothing while the log names an `R` this device does not hold
+    /// yet: a removed device may hold the one before; a new `R` reads the
+    /// scope again from its start and pushes the whole archive under it.
     pub fn recovery(&mut self) -> Result<Kept, SyncError<L::Error>> {
+        if !self.group.holds_recovery() {
+            return Ok(Kept::default());
+        }
         let Some((since, key)) = self
             .group
             .archive()

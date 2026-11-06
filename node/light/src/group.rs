@@ -33,6 +33,17 @@
 //!   ([`DeviceGroup::key`]), scope ids derive from the archive's naming
 //!   secret, and the archive ([`archive`]) records every scope key of every
 //!   confirmed epoch.
+//! - **`R` rotates at every removal:** a commit carrying a removal draws a
+//!   new `R`, its `R1` sealed to each of the kit's keys and its `R2` in the
+//!   evidence ([`Effect::rekey`]); a kit rotation ([`DeviceGroup::rotate`])
+//!   and a restore draw one too. The device that drew it holds it aside
+//!   until the log makes it the kit's (the commit's verdict, the
+//!   operation's verified maturity), then the other devices take it from
+//!   an archive sealed under an epoch the removed device is not in, only
+//!   when its hash is the one the admin call named.
+//! - **A replaced admin key** takes the device's leaf with the device's
+//!   next commit, which renews its credential; a call the new key signs
+//!   while the replacement's evidence is still to come waits for it.
 //!
 //! Sans I/O: the caller makes the calls (the admin key signs commits behind
 //! the owner's prompt, the sync key votes and evidence), reads the log and
@@ -48,11 +59,12 @@ use std::collections::BTreeMap;
 use vos_mls::{Mls, Namespace};
 use vos_wire::ids::InstanceId;
 use vos_wire::personal::{
-    AdminClass, DeviceId, DeviceView, Effect, NewDevice, Op, Policy, Scope, Signer, Status, Vote,
-    welcome_hash,
+    AdminClass, Attached, DeviceId, DeviceView, Effect, KitEntry, NewDevice, Op, Policy, Scope,
+    Signer, Status, Vote, welcome_hash,
 };
 use vos_wire::{Decode, Encode};
 
+use crate::kit::{KitKey, Split};
 use crate::store::{Store, StoreError};
 
 pub use archive::Archive;
@@ -113,6 +125,9 @@ pub enum GroupError {
     NoRegroup,
     /// The agent's device set as read does not name this device.
     Unnamed,
+    /// The kit's keys do not seal: no key, one no agreement is
+    /// contributory with, or no randomness.
+    Kit,
 }
 
 impl From<vos_mls::Error> for GroupError {
@@ -150,6 +165,7 @@ impl std::fmt::Display for GroupError {
             GroupError::Regroup => f.write_str("a regroup's new group comes first"),
             GroupError::NoRegroup => f.write_str("no regroup of this device's has matured"),
             GroupError::Unnamed => f.write_str("the device set does not name this device"),
+            GroupError::Kit => f.write_str("the kit's keys do not seal"),
         }
     }
 }
@@ -168,13 +184,17 @@ pub enum Event {
         message: Vec<u8>,
     },
     /// Post the evidence of this device's admin call at `index`, under its
-    /// sync key. Given again until the log holds it.
+    /// sync key, with what rides beside it. Given again until the log holds
+    /// it.
     Evidence {
         index: u64,
         message: Vec<u8>,
         signature: [u8; 64],
-        welcome: Option<Vec<u8>>,
+        attached: Attached,
     },
+    /// Post `alive` under the sync key: a restore is pending, which
+    /// asserts every device lost. Given again until the log cancels it.
+    Alive,
     /// `epoch` confirmed: its keys are the data keys from now.
     Confirmed {
         epoch: u64,
@@ -240,6 +260,9 @@ pub enum Alarm {
     /// The device's clock and the agent's batch time disagree by `skew_ms`,
     /// more than an hour: the device acts as the log says.
     Clock { skew_ms: u64 },
+    /// The kit signed the operation at `index`: every device shows it for
+    /// as long as it is open, and its user vetoes it or rotates the kit.
+    Kit { index: u64 },
 }
 
 /// What a device that cannot follow does.
@@ -258,7 +281,8 @@ pub fn clock(local: u64, agent: u64) -> Option<Alarm> {
     (skew_ms > vos_wire::personal::HOUR_MS).then_some(Alarm::Clock { skew_ms })
 }
 
-/// A commit this device made, held: what its admin call carries.
+/// A commit this device made, held: what its admin call carries; its `R2`,
+/// when it re-seals the kit, rides in the evidence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Prepared {
     pub epoch: u64,
@@ -280,12 +304,15 @@ impl Prepared {
     }
 }
 
-/// A device the group knows: its leaf's keys, its admin key as replaced,
-/// and whether it has a voice.
+/// A device the group knows: its keys at its add, its admin key as
+/// replaced and the one its leaf carries, and whether it has a voice.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub(crate) struct Known {
     pub(crate) keys: NewDevice,
     pub(crate) admin: [u8; 32],
+    /// The admin key its leaf's credential carries: its add's, until a
+    /// commit of its renews the leaf to a replaced key.
+    pub(crate) leaf: [u8; 32],
     pub(crate) strong: bool,
     /// When its probation ends, by the log's time: it signs no operation
     /// or commit before.
@@ -305,6 +332,7 @@ impl Known {
     pub(crate) fn new(keys: NewDevice, active_from: u64) -> Self {
         Self {
             admin: keys.admin,
+            leaf: keys.admin,
             strong: keys.class == AdminClass::Strong,
             keys,
             active_from,
@@ -313,6 +341,17 @@ impl Known {
             out: false,
             alive: 0,
         }
+    }
+
+    /// Its leaf's credential.
+    pub(crate) fn credential(&self) -> Vec<u8> {
+        [&self.keys.sync[..], &self.leaf[..]].concat()
+    }
+
+    /// The credential its next commit renews its leaf to, its admin key
+    /// replaced since its leaf was made.
+    pub(crate) fn renewal(&self) -> Option<Vec<u8>> {
+        (self.admin != self.leaf).then(|| [&self.keys.sync[..], &self.admin[..]].concat())
     }
 }
 
@@ -359,6 +398,9 @@ pub(crate) struct Call {
     pub(crate) act: Act,
     pub(crate) evidence: Check,
     pub(crate) rival: Option<u64>,
+    /// The replacement whose new key signed it, while its maturity waits
+    /// on its evidence: the call stands or falls with it.
+    pub(crate) awaits: Option<u64>,
 }
 
 /// A candidate a device that cannot follow saw, which it does not take:
@@ -419,6 +461,9 @@ pub(crate) struct Pending {
     pub(crate) origin: [u8; 32],
     pub(crate) arguments: Vec<u8>,
     pub(crate) evidence: Check,
+    /// The replacement whose new key signed it, while its maturity waits
+    /// on its evidence.
+    pub(crate) awaits: Option<u64>,
     pub(crate) welcome: Option<Vec<u8>>,
     /// The votes logged and verified, each device's first.
     pub(crate) votes: Vec<(DeviceId, Vote)>,
@@ -437,6 +482,8 @@ pub(crate) struct Own {
     /// Its call's signed message and signature, written before the call
     /// is made.
     pub(crate) signed: Option<(Vec<u8>, [u8; 64])>,
+    /// The `R2` of the kit it re-seals, for its evidence.
+    pub(crate) r2: Option<[u8; 32]>,
     /// Its call's log index, once the agent took it.
     pub(crate) index: Option<u64>,
     /// The log holds its evidence.
@@ -459,8 +506,9 @@ pub enum Course {
 /// What a device keeps of the device set's operations.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
 pub(crate) struct Set {
-    /// The kit's signing keys, by entry.
-    pub(crate) kit: Vec<[u8; 32]>,
+    /// The kit's keys, by entry: as the claim made them, or a verified
+    /// rotation or restore brought them.
+    pub(crate) kit: Vec<KitKey>,
     /// The admin calls of the operations open, and theirs.
     pub(crate) operations: Vec<Call>,
     pub(crate) claims: Vec<Claim>,
@@ -474,9 +522,19 @@ pub(crate) struct Set {
     pub(crate) fresh: Option<DeviceId>,
 }
 
+/// The `R` the log made the kit's last: the entry that did, the hash its
+/// admin call named it by, and whether the kit signed that call, so no
+/// device drew it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub(crate) struct Named {
+    pub(crate) since: u64,
+    pub(crate) hash: [u8; 32],
+    pub(crate) by_kit: bool,
+}
+
 /// What the device keeps of the log: the agent, itself, its place in the
 /// log, the devices and the open operations it verified, the pending
-/// candidate and its own commit.
+/// candidate and its own commit, and the `R` the log names.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub(crate) struct State {
     pub(crate) agent: Agent,
@@ -508,6 +566,10 @@ pub(crate) struct State {
     /// This device's last decision: an epoch, and whether it confirmed it.
     pub(crate) decided: Option<(u64, bool)>,
     pub(crate) course: Course,
+    pub(crate) recovery: Option<Named>,
+    /// The epoch this device confirmed whose commit re-sealed the kit, and
+    /// its `R`'s hash, until the agent's verdict makes it the kit's.
+    pub(crate) rekeyed: Option<(u64, [u8; 32])>,
 }
 
 impl State {
@@ -561,6 +623,14 @@ impl State {
         owed.sort_unstable();
         owed
     }
+
+    /// Whether `entries` are the kit's keys, in order.
+    pub(crate) fn kit_is(&self, entries: &[KitEntry]) -> bool {
+        entries
+            .iter()
+            .map(KitKey::of)
+            .eq(self.set.kit.iter().copied())
+    }
 }
 
 /// What a device that pairs another hands it over the pairing channel:
@@ -578,13 +648,15 @@ pub struct Pairing {
     policy: Policy,
     devices: Vec<(DeviceId, Known)>,
     set: Set,
+    recovery: Option<Named>,
     archive: Archive,
 }
 
 /// What a device a restore added reads from the agent once the restore
 /// matured, to start its new group: the log's head, the confirmed epoch,
-/// the policy, the kit it carried, and the device set. It has no earlier
-/// view to check them against.
+/// the policy, and the device set; and what it knows itself, the kit it
+/// carried and its `R`'s hash, the `R` it drew held in its store
+/// ([`restoring`]). It has no earlier view to check the agent's against.
 #[derive(Clone, Debug)]
 pub struct Restored {
     pub next: u64,
@@ -592,7 +664,8 @@ pub struct Restored {
     pub time: u64,
     pub confirmed: u64,
     pub policy: Policy,
-    pub kit: Vec<[u8; 32]>,
+    pub kit: Vec<KitKey>,
+    pub r_hash: [u8; 32],
     pub devices: Vec<DeviceView>,
 }
 
@@ -606,9 +679,42 @@ impl Pairing {
     }
 }
 
-/// A device's leaf credential: its sync key and its admin key.
+/// A device's leaf credential at its add: its sync key and its admin key.
 pub fn credential(device: &NewDevice) -> Vec<u8> {
     [&device.sync[..], &device.admin[..]].concat()
+}
+
+/// A restore's split of `keys`, the kit it carries, at `agent`: its `R`
+/// held in `store`'s archive until the restore matures and
+/// [`DeviceGroup::restore`] makes it the kit's. Only for a store with no
+/// device group.
+pub fn restoring(store: &Store, keys: &[KitKey], agent: &Agent) -> Result<Split, GroupError> {
+    if store.group_row(STATE)?.is_some() {
+        return Err(GroupError::Grouped);
+    }
+    let split = Split::draw(keys, &agent.identity).ok_or(GroupError::Kit)?;
+    let mut archive = store.archive()?;
+    archive.draw(*split.r());
+    store.write_group_rows(vec![(
+        crate::store::ARCHIVE_ROW.to_vec(),
+        Some(archive.encode()),
+    )])?;
+    Ok(split)
+}
+
+/// An open operation of the device set as this device verified it, for
+/// the chrome: its index, signer and operation, when it matures, whether
+/// it is contested, the devices whose vetoes verified, and whether its
+/// own evidence did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Open {
+    pub index: u64,
+    pub by: Signer,
+    pub op: Op,
+    pub matures: u64,
+    pub contested: bool,
+    pub vetoes: Vec<DeviceId>,
+    pub verified: bool,
 }
 
 /// A candidate processed on a copy, in memory: after a restart the logged
@@ -645,12 +751,14 @@ fn namespace(store: &Store) -> Namespace {
 
 impl DeviceGroup {
     /// The claiming device's group: this device alone, number 0, at epoch
-    /// 0, following the log from its start; the store's archive, its
-    /// naming secret drawn with the store, kept.
+    /// 0, following the log from its start, its kit `kit`; the store's
+    /// archive, its naming secret drawn with the store, kept. The claim's
+    /// `R` is [`DeviceGroup::set_recovery`]'s.
     pub fn create(
         store: &Store,
         agent: Agent,
         me: NewDevice,
+        kit: Vec<KitKey>,
         now: u64,
     ) -> Result<Self, GroupError> {
         if store.group_row(STATE)?.is_some() {
@@ -670,12 +778,17 @@ impl DeviceGroup {
             renewed: now,
             policy: Policy::DEFAULT,
             devices: vec![(0, Known::new(me.clone(), now))],
-            set: Set::default(),
+            set: Set {
+                kit,
+                ..Set::default()
+            },
             pending: None,
             passing: None,
             own: None,
             decided: None,
             course: Course::Following,
+            recovery: None,
+            rekeyed: None,
         };
         let mut mls = Mls::open(namespace(store), &credential(&me), BTreeMap::new())?;
         mls.create(now / 1000, rows(&state, None))?;
@@ -719,6 +832,7 @@ impl DeviceGroup {
             policy,
             devices,
             set,
+            recovery,
             archive,
         } = pairing;
         let state = State {
@@ -740,6 +854,8 @@ impl DeviceGroup {
             own: None,
             decided: None,
             course: Course::Following,
+            recovery,
+            rekeyed: None,
         };
         let mut mls = Mls::open(namespace(store), &credential(&me), BTreeMap::new())?;
         mls.write(rows(&state, Some(&archive)))?;
@@ -756,7 +872,7 @@ impl DeviceGroup {
     /// read of the agent ([`Restored`]): a new group of this device alone at
     /// the confirmed epoch, following the log from its head; its first
     /// commit carries the removal of every device before it. The store's
-    /// archive is kept.
+    /// archive is kept, the `R` [`restoring`] drew the kit's.
     pub fn restore(
         store: &Store,
         agent: Agent,
@@ -772,6 +888,13 @@ impl DeviceGroup {
             .find(|view| view.device.keys.sync == me.sync && view.device.status == Status::Live)
             .map(|view| view.id)
             .ok_or(GroupError::Unnamed)?;
+        // The restore's `R`, drawn for the kit it carries, is the kit's
+        // from its maturity, before the log's head.
+        let since = read.next.saturating_sub(1);
+        let mut archive = store.archive()?;
+        if !archive.name(since, &read.r_hash) {
+            return Err(GroupError::Kit);
+        }
         let mut devices = Vec::new();
         let mut owed = Vec::new();
         for view in &read.devices {
@@ -814,10 +937,15 @@ impl DeviceGroup {
             own: None,
             decided: None,
             course: Course::Following,
+            recovery: Some(Named {
+                since,
+                hash: read.r_hash,
+                by_kit: false,
+            }),
+            rekeyed: None,
         };
-        let archive = store.archive()?;
         let mut mls = Mls::open(namespace(store), &credential(&me), BTreeMap::new())?;
-        mls.create(read.time / 1000, rows(&state, None))?;
+        mls.create(read.time / 1000, rows(&state, Some(&archive)))?;
         Ok(Self {
             store: store.clone(),
             mls,
@@ -882,13 +1010,105 @@ impl DeviceGroup {
         self.state.agent
     }
 
-    /// Hold `R`, drawn by the claim or the kit rotation logged at `since`,
-    /// in the archive: the recovery envelopes are sealed under it. An `R`
-    /// of a later rotation already held stands.
+    /// Hold `R`, the claim's at `since`, in the archive: the recovery
+    /// envelopes are sealed under it. An `R` the log made the kit's later
+    /// stands.
     pub fn set_recovery(&mut self, since: u64, r: [u8; 32]) -> Result<(), GroupError> {
-        let mut theirs = self.archive.clone();
+        let mut theirs = self.archive.shareable();
         theirs.recovery = Some(archive::Recovery { since, r });
         self.merge_archive(&theirs)
+    }
+
+    /// Whether this device holds the `R` the log made the kit's last: not
+    /// while a confirmed commit's re-sealed kit waits on the agent's
+    /// verdict.
+    pub fn holds_recovery(&self) -> bool {
+        if self.state.rekeyed.is_some() {
+            return false;
+        }
+        match (&self.state.recovery, &self.archive.recovery) {
+            (Some(named), Some(held)) => held.since == named.since,
+            (None, held) => held.is_some(),
+            (Some(_), None) => false,
+        }
+    }
+
+    /// The kit's keys, as this device verified them.
+    pub fn kit(&self) -> &[KitKey] {
+        &self.state.set.kit
+    }
+
+    /// A kit rotation to `keys`: a split at this device's agent, its `R`
+    /// held aside until the rotation's verified maturity makes it the
+    /// kit's. Make the admin call `rotate(kit)` and post its evidence with
+    /// the split's `R2`.
+    pub fn rotate(&mut self, keys: &[KitKey]) -> Result<Split, GroupError> {
+        let split = Split::draw(keys, &self.state.agent.identity).ok_or(GroupError::Kit)?;
+        self.archive.draw(*split.r());
+        self.mls.write(rows(&self.state, Some(&self.archive)))?;
+        Ok(split)
+    }
+
+    /// A recovered group's archive taken in: its naming secret one of the
+    /// earlier groups' (their scopes keep their ids), its keys merged.
+    pub fn inherit(&mut self, recovered: &Archive) -> Result<(), GroupError> {
+        self.archive.inherit(recovered);
+        self.mls.write(rows(&self.state, Some(&self.archive)))?;
+        Ok(())
+    }
+
+    /// An archive read from the agent merged: its keys, and its `R` only
+    /// when it is the one the log made the kit's, by its hash.
+    pub fn merge_read(&mut self, read: &Archive) -> Result<(), GroupError> {
+        let named = self.state.recovery;
+        let mut taken = read.shareable();
+        let theirs = taken.recovery.take();
+        if let (Some(named), Some(theirs)) = (named, theirs)
+            && theirs.since == named.since
+            && vos_wire::personal::r_hash(&theirs.r) == named.hash
+        {
+            taken.recovery = Some(theirs);
+        }
+        self.merge_archive(&taken)
+    }
+
+    /// The device set's open operations, as this device verified them.
+    pub fn operations(&self) -> Vec<Open> {
+        let state = &self.state;
+        state
+            .set
+            .operations
+            .iter()
+            .filter(|call| {
+                call.evidence != Check::Invalid && !state.set.closed.contains(&call.index)
+            })
+            .filter_map(|call| {
+                let Act::Op { op, matures } = &call.act else {
+                    return None;
+                };
+                let vetoes = state
+                    .set
+                    .operations
+                    .iter()
+                    .filter(|veto| {
+                        veto.act == Act::Veto(call.index) && veto.evidence == Check::Valid
+                    })
+                    .filter_map(|veto| match veto.by {
+                        Signer::Device(device) => Some(device),
+                        Signer::Kit(_) => None,
+                    })
+                    .collect::<Vec<_>>();
+                Some(Open {
+                    index: call.index,
+                    by: call.by,
+                    op: op.clone(),
+                    matures: *matures,
+                    contested: call.rival.is_some() || !vetoes.is_empty(),
+                    vetoes,
+                    verified: call.evidence == Check::Valid && call.awaits.is_none(),
+                })
+            })
+            .collect()
     }
 
     /// What the device group stores, in bytes: its MLS group state, what
@@ -981,7 +1201,7 @@ impl DeviceGroup {
     }
 
     /// This device's removals owed, as the next commit carries them: their
-    /// numbers, and the credentials of those in the MLS group.
+    /// numbers, and the leaf credentials of those in the MLS group.
     fn removals(&self) -> Result<(Vec<DeviceId>, Vec<Vec<u8>>), GroupError> {
         let remove = self.state.owed();
         let members: Vec<Vec<u8>> = self
@@ -993,10 +1213,28 @@ impl DeviceGroup {
         let removes = remove
             .iter()
             .filter_map(|device| self.state.known(*device))
-            .map(|known| credential(&known.keys))
+            .map(Known::credential)
             .filter(|credential| members.contains(credential))
             .collect();
         Ok((remove, removes))
+    }
+
+    /// The kit re-sealed for a commit carrying `remove`, or after a kit
+    /// rotation the kit signed: a split of the kit's keys, its `R` held
+    /// aside until the commit's verdict, and its `R2`.
+    fn rekey(&mut self, remove: &[DeviceId]) -> Result<Option<(Split, [u8; 32])>, GroupError> {
+        let unheld = self
+            .state
+            .recovery
+            .is_some_and(|named| named.by_kit && !self.holds_recovery());
+        if remove.is_empty() && !unheld {
+            return Ok(None);
+        }
+        let split =
+            Split::draw(&self.state.set.kit, &self.state.agent.identity).ok_or(GroupError::Kit)?;
+        self.archive.draw(*split.r());
+        let r2 = *split.r2();
+        Ok(Some((split, r2)))
     }
 
     /// This device's own commit, held with the record of it: its call's
@@ -1004,6 +1242,7 @@ impl DeviceGroup {
     fn hold(
         &mut self,
         effect: Effect,
+        r2: Option<[u8; 32]>,
         make: impl FnOnce(
             &mut Mls,
             &mut dyn FnMut(&vos_mls::Commit) -> vos_mls::Writes,
@@ -1023,10 +1262,11 @@ impl DeviceGroup {
                 }
                 .arguments(),
                 signed: None,
+                r2,
                 index: None,
                 evidenced: false,
             });
-            rows(&state, None)
+            rows(&state, Some(&self.archive))
         };
         let commit = make(&mut self.mls, &mut rows_of)?;
         self.state = state;
@@ -1057,22 +1297,26 @@ impl DeviceGroup {
         let (remove, removes) = self.removals()?;
         let mut packages = Vec::new();
         if let Some((keys, package)) = &add {
-            if self
-                .state
-                .devices
-                .iter()
-                .any(|(_, known)| known.keys.sync == keys.sync || known.keys.admin == keys.admin)
-            {
+            if self.state.devices.iter().any(|(_, known)| {
+                known.keys.sync == keys.sync
+                    || known.keys.admin == keys.admin
+                    || known.admin == keys.admin
+            }) {
                 return Err(GroupError::Known);
             }
             packages.push(package.clone());
         }
+        let rekey = self.rekey(&remove)?;
+        let (rekey, r2) = rekey.map(|(split, r2)| (split.kit.clone(), r2)).unzip();
         let effect = Effect {
             add: add.map(|(keys, _)| keys),
             remove,
+            rekey,
         };
-        self.hold(effect, |mls, rows| {
-            mls.commit(&packages, &removes, now / 1000, rows)
+        let renewal = self.state.id.and_then(|me| self.renewal_of(me));
+        self.hold(effect, r2, |mls, rows| match &renewal {
+            Some(credential) => mls.renew(credential, &packages, &removes, now / 1000, rows),
+            None => mls.commit(&packages, &removes, now / 1000, rows),
         })
     }
 
@@ -1095,11 +1339,17 @@ impl DeviceGroup {
         if self.state.set.fresh != Some(me) {
             return Err(GroupError::NoRegroup);
         }
+        let remove = self.state.owed();
+        let rekey = self.rekey(&remove)?;
+        let (rekey, r2) = rekey.map(|(split, r2)| (split.kit.clone(), r2)).unzip();
         let effect = Effect {
             add: None,
-            remove: self.state.owed(),
+            remove,
+            rekey,
         };
-        self.hold(effect, |mls, rows| mls.restart(&packages, now / 1000, rows))
+        self.hold(effect, r2, |mls, rows| {
+            mls.restart(&packages, now / 1000, rows)
+        })
     }
 
     /// Pair `device` at `now`: the commit adding it, and what the new
@@ -1121,7 +1371,8 @@ impl DeviceGroup {
             policy: self.state.policy,
             devices: self.state.devices.clone(),
             set: self.state.set.clone(),
-            archive: self.archive.clone(),
+            recovery: self.state.recovery,
+            archive: self.archive.shareable(),
         };
         Ok((prepared, pairing))
     }
@@ -1148,13 +1399,16 @@ impl DeviceGroup {
         let own = self.state.own.as_mut().ok_or(GroupError::NoCommit)?;
         let (message, signature) = own.signed.clone().ok_or(GroupError::NoCommit)?;
         own.index = Some(index);
-        let welcome = own.welcome.clone();
+        let attached = Attached {
+            welcome: own.welcome.clone(),
+            r2: own.r2,
+        };
         self.mls.write(rows(&self.state, None))?;
         Ok(Event::Evidence {
             index,
             message,
             signature,
-            welcome,
+            attached,
         })
     }
 

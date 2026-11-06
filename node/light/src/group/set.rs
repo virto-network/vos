@@ -11,6 +11,17 @@ use vos_wire::personal::{AdminCall, AdminClass, DeviceId, Op, Signer};
 use super::follow::verifies;
 use super::{Act, Alarm, Call, Check, Claim, DeviceGroup, Event, GroupError, Support};
 use crate::call::method_id;
+use crate::kit::KitKey;
+
+/// Whether a key is its signer's at a time: an active device's admin key
+/// or the kit entry's; not, or the new key of a replacement whose maturity
+/// the log asserted and whose evidence is still to come.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Holds {
+    Yes,
+    No,
+    Awaiting(u64),
+}
 
 /// The method an operation's admin call names, and its arguments as the
 /// agent encodes them.
@@ -66,17 +77,36 @@ impl Call {
 
 impl DeviceGroup {
     /// Whether `origin` is `by`'s key at `at`: an active device's admin
-    /// key, or the kit entry's signing key.
-    fn signer_holds(&self, by: Signer, origin: &[u8; 32], at: u64) -> bool {
+    /// key, or the kit entry's signing key; or the new admin key of a
+    /// replacement of the device whose asserted maturity waits on its
+    /// evidence, which the call then waits on too.
+    pub(super) fn holds(&self, by: Signer, origin: &[u8; 32], at: u64) -> Holds {
         match by {
-            Signer::Device(device) => {
-                self.state.may_sign(device, at)
-                    && self
-                        .state
-                        .known(device)
-                        .is_some_and(|known| known.admin == *origin)
+            Signer::Device(device) if self.state.may_sign(device, at) => {
+                if self
+                    .state
+                    .known(device)
+                    .is_some_and(|known| known.admin == *origin)
+                {
+                    return Holds::Yes;
+                }
+                let awaiting = self.state.set.claims.iter().find_map(|claim| {
+                    let call = self.state.call_at(claim.op)?;
+                    let replaces = matches!(&call.act, Act::Op { op: Op::Replace { device: target, admin }, .. }
+                        if *target == device && admin.key == *origin);
+                    (claim.support == Support::Waiting && replaces).then_some(claim.op)
+                });
+                awaiting.map_or(Holds::No, Holds::Awaiting)
             }
-            Signer::Kit(entry) => self.state.set.kit.get(usize::from(entry)) == Some(origin),
+            Signer::Device(_) => Holds::No,
+            Signer::Kit(entry) => {
+                let key = self.state.set.kit.get(usize::from(entry));
+                if key.is_some_and(|key| key.signing == *origin) {
+                    Holds::Yes
+                } else {
+                    Holds::No
+                }
+            }
         }
     }
 
@@ -116,14 +146,19 @@ impl DeviceGroup {
             Act::Cosign(op) => ("cosign", op.encode(), true),
             Act::Resolve { op, upheld } => ("resolve", (*op, *upheld).encode(), true),
         };
+        let holds = self.holds(by, &call.origin, at);
         let evidence = if allowed
             && call.method == method_id(name)
             && call.arguments == arguments
-            && self.signer_holds(by, &call.origin, at)
+            && holds != Holds::No
         {
             Check::Missing
         } else {
             Check::Invalid
+        };
+        let awaits = match holds {
+            Holds::Awaiting(replacement) => Some(replacement),
+            _ => None,
         };
         let mut call = Call {
             index,
@@ -135,6 +170,7 @@ impl DeviceGroup {
             method: call.method,
             evidence,
             rival: None,
+            awaits,
         };
         if evidence != Check::Invalid
             && let Some((op, _)) = call.op()
@@ -247,6 +283,9 @@ impl DeviceGroup {
             })
             && verifies(&call.origin, message, signature);
         call.evidence = if valid { Check::Valid } else { Check::Invalid };
+        if valid && matches!((call.by, &call.act), (Signer::Kit(_), Act::Op { .. })) {
+            events.push(Event::Alarm(Alarm::Kit { index: of }));
+        }
         self.support(events)
     }
 
@@ -374,6 +413,7 @@ impl DeviceGroup {
                 Support::Held => self.take_effect(&claim, events)?,
                 _ => events.push(Event::Alarm(Alarm::Unsigned { index: claim.entry })),
             }
+            self.settle_awaiting(claim.op, support == Support::Held);
             self.state.set.closed.push(claim.op);
             self.thaw(claim.op, now);
         }
@@ -399,6 +439,7 @@ impl DeviceGroup {
         match call.evidence {
             Check::Invalid => return Support::Refused,
             Check::Missing => return Support::Waiting,
+            Check::Valid if call.awaits.is_some() => return Support::Waiting,
             Check::Valid => {}
         }
         let mut waiting = false;
@@ -419,6 +460,7 @@ impl DeviceGroup {
                     !known.out && known.matured.is_none_or(|matured| matured > claim.at)
                 });
             match veto.evidence {
+                Check::Valid if voiced && veto.awaits.is_some() => waiting = true,
                 Check::Valid if voiced => vetoed = true,
                 Check::Missing if voiced => waiting = true,
                 _ => {}
@@ -439,6 +481,7 @@ impl DeviceGroup {
             .filter(|other| other.act == Act::Cosign(claim.op))
         {
             match cosign.evidence {
+                Check::Valid if cosign.awaits.is_some() => waiting = true,
                 Check::Valid if self.cosigns(cosign, call, op) => return Support::Held,
                 Check::Missing => waiting = true,
                 _ => {}
@@ -460,15 +503,19 @@ impl DeviceGroup {
                 (false, true) => rival,
                 (false, false) => Some(claim.op),
             };
+            let evidence = match resolve.evidence {
+                Check::Valid if resolve.awaits.is_some() => Check::Missing,
+                evidence => evidence,
+            };
             match resolve.by {
-                Signer::Kit(_) => match resolve.evidence {
+                Signer::Kit(_) => match evidence {
                     Check::Valid if winner == Some(claim.op) => return Support::Held,
                     Check::Missing => waiting = true,
                     _ => {}
                 },
-                Signer::Device(device) if resolve.evidence != Check::Invalid => {
+                Signer::Device(device) if evidence != Check::Invalid => {
                     latest.retain(|(other, ..)| *other != device);
-                    latest.push((device, winner, resolve.evidence, resolve.at));
+                    latest.push((device, winner, evidence, resolve.at));
                 }
                 Signer::Device(_) => {}
             }
@@ -559,7 +606,9 @@ impl DeviceGroup {
                 }
             }
             Op::Rotate(kit) | Op::Restore { kit, .. } => {
-                self.state.set.kit = kit.entries.iter().map(|entry| entry.signing).collect();
+                self.state.set.kit = kit.entries.iter().map(KitKey::of).collect();
+                let by_kit = matches!(call.by, Signer::Kit(_));
+                self.name_recovery(claim.entry, kit.r_hash, by_kit);
             }
             Op::Regroup(_) => self.state.set.fresh = call.device(),
         }
@@ -567,6 +616,54 @@ impl DeviceGroup {
             self.mature(*device, claim.at, events)?;
         }
         Ok(())
+    }
+
+    /// The credential `device`'s next commit renews its leaf to: its
+    /// replaced admin key's, or the new key of a replacement of it whose
+    /// asserted maturity waits on its evidence, which the commit waits on
+    /// too.
+    pub(super) fn renewal_of(&self, device: DeviceId) -> Option<Vec<u8>> {
+        let known = self.state.known(device)?;
+        known.renewal().or_else(|| {
+            self.state.set.claims.iter().find_map(|claim| {
+                let call = self.state.call_at(claim.op)?;
+                match &call.act {
+                    Act::Op {
+                        op:
+                            Op::Replace {
+                                device: target,
+                                admin,
+                            },
+                        ..
+                    } if *target == device && claim.support == Support::Waiting => {
+                        Some([&known.keys.sync[..], &admin.key[..]].concat())
+                    }
+                    _ => None,
+                }
+            })
+        })
+    }
+
+    /// The calls the new key of the replacement at `replacement` signed,
+    /// and the pending candidate it signed, waiting on its maturity's
+    /// evidence: they stand with it, or fall.
+    fn settle_awaiting(&mut self, replacement: u64, held: bool) {
+        for call in &mut self.state.set.operations {
+            if call.awaits == Some(replacement) {
+                call.awaits = None;
+                if !held {
+                    call.evidence = Check::Invalid;
+                }
+            }
+        }
+        if let Some(pending) = &mut self.state.pending
+            && pending.awaits == Some(replacement)
+        {
+            pending.awaits = None;
+            if !held {
+                pending.evidence = Check::Invalid;
+            }
+        }
     }
 
     /// Drop the calls of the operations closed, once no claim waits on

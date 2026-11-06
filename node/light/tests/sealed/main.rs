@@ -14,6 +14,8 @@ mod home;
 #[path = "../group/phone.rs"]
 mod phone;
 
+mod kit;
+
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -542,13 +544,14 @@ fn archives_are_pushed_at_confirmed_epochs_and_merged() {
 
 /// C9's other order: the device lacking a key pushes the epoch's archive
 /// first; the device holding it finds that archive short of its keys and
-/// pushes its own, which the first then merges. `R` never travels through
-/// the agent.
+/// pushes its own, which the first then merges. An `R` the log did not
+/// name travels through the agent to no other device.
 #[test]
 fn a_device_holding_keys_the_agents_archive_lacks_pushes_its_own() {
     let (mut home, mut phones) = household(2);
     let first = phones[0].group().confirmed();
-    phones[0].group().set_recovery(0, [0x52; 32]).unwrap();
+    let claimed = phones[1].group().archive().recovery.clone().unwrap();
+    phones[0].group().set_recovery(5, [0x52; 32]).unwrap();
     install(&phones[0].light, OTHER);
     set(&phones[0].light, OTHER, 1, 11);
     with(&mut home, &mut phones[0], &[OTHER], |sync| sync.push(OTHER)).unwrap();
@@ -559,10 +562,17 @@ fn a_device_holding_keys_the_agents_archive_lacks_pushes_its_own() {
     let kept = with(&mut home, &mut phones[0], &[], |sync| sync.archive()).unwrap();
     assert_eq!((kept.found, kept.pushed), (1, 1));
     let kept = with(&mut home, &mut phones[1], &[], |sync| sync.archive()).unwrap();
-    assert_eq!((kept.found, kept.pushed), (2, 0), "its own and the other's");
+    assert_eq!(
+        (kept.found, kept.pushed),
+        (2, 1),
+        "its own and the other's, and its own again: the other's holds an R it does not take"
+    );
     let other = scope_of(&phones[0], OTHER);
     assert!(!phones[1].group().archive().keys(first, &other).is_empty());
-    assert!(phones[1].group().archive().recovery.is_none());
+    assert!(
+        phones[1].group().archive().recovery == Some(claimed),
+        "the claim's R stands"
+    );
     install(&phones[1].light, OTHER);
     let caught = with(&mut home, &mut phones[1], &[OTHER], |sync| {
         sync.catch_up(OTHER)
@@ -593,30 +603,25 @@ fn a_catch_up_reads_page_after_page() {
     assert_eq!(phones[1].light.cursor(NOTES).unwrap(), Some(40));
 }
 
-/// D1's envelopes: once a device holds `R`, what the agent holds under it
-/// is kept whole: the naming secret and every scope key, pushed as the
-/// device's archive gains them (a confirmed epoch's keys, a scope tracked
-/// mid-epoch), each push only what the recovery scope lacks. A kit holding
-/// `R` reads the scope and merges it; another `R` opens nothing; a new `R`
-/// reads the scope again and seals the whole archive under it.
+/// D1's envelopes: once a device holds `R`, the claim's, what the agent
+/// holds under it is kept whole: the naming secret and every scope key,
+/// pushed as the device's archive gains them (a confirmed epoch's keys, a
+/// scope tracked mid-epoch), each push only what the recovery scope lacks.
+/// A kit holding `R` reads the scope and merges it; another `R` opens
+/// nothing; a new `R` reads the scope again and seals the whole archive
+/// under it.
 #[test]
 fn recovery_envelopes_keep_every_key_under_r() {
     let (mut home, mut phones) = household(2);
     let epoch = phones[0].group().confirmed();
-    let r = [0x52; 32];
-    phones[0].group().set_recovery(0, r).unwrap();
-    assert_eq!(
-        with(&mut home, &mut phones[1], &[], |sync| sync.recovery()).unwrap(),
-        Default::default(),
-        "no R, no envelope"
-    );
+    let r = phones[0].group().archive().recovery.as_ref().unwrap().r;
+    assert_eq!(phones[1].group().archive().recovery.as_ref().unwrap().r, r);
     let scope = scope_of(&phones[0], NOTES);
     let key = phones[0].group().key(scope).unwrap();
     let kept = with(&mut home, &mut phones[0], &[], |sync| sync.recovery()).unwrap();
     assert_eq!((kept.found, kept.pushed), (0, 1));
     let kept = with(&mut home, &mut phones[0], &[], |sync| sync.recovery()).unwrap();
     assert_eq!((kept.found, kept.pushed), (1, 0));
-    phones[1].group().set_recovery(0, r).unwrap();
     let kept = with(&mut home, &mut phones[1], &[], |sync| sync.recovery()).unwrap();
     assert_eq!((kept.found, kept.pushed), (1, 0));
 
