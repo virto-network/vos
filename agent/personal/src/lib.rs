@@ -50,8 +50,8 @@ use vos_wire::personal::{
     Acknowledged, AdminCall, AdminClass, Author, Body, Candidacy, Device, DeviceId, DeviceView,
     Effect, Entry, Envelope, Header, Holder, InboxItem, Item, Kit, KitEntry, MAX_ENVELOPE,
     NewAdmin, NewDevice, NewKit, Op, Operation, Overview, PersonalError, Policy, Pushed, RECOVERY,
-    Recipient, Recorded, RecoveryView, Removal, Scope, Signer, Vote, Voted, Woken, commit_id,
-    envelope_id, r2_hash, welcome_hash,
+    Recipient, Recorded, RecoveryView, Removal, Scope, Signer, Status, Vote, Voted, Woken,
+    commit_id, envelope_id, r2_hash, welcome_hash,
 };
 
 use rows::{Candidate, Charge, Group, Head, Lease, ONE, Recovery, Share, Slot, Stored, Usage};
@@ -116,6 +116,9 @@ pub struct Personal {
     frozen: Table<DeviceId, u64>,
     /// The matured add operations no confirmed commit carried yet.
     ready: Table<u64, (), Ordered>,
+    /// The keys open operations bring, and a matured add's until its
+    /// commit: by the operation.
+    claimed: Table<[u8; 32], u64>,
     /// A kit rotation's or a restore's `R2`, from its evidence, until it
     /// matures: served to no read.
     deposits: Table<u64, [u8; 32]>,
@@ -179,6 +182,7 @@ impl Personal {
             resolutions: Table::default(),
             frozen: Table::default(),
             ready: Table::default(),
+            claimed: Table::default(),
             deposits: Table::default(),
             recovery: Table::default(),
             seen: Table::default(),
@@ -287,7 +291,7 @@ impl Personal {
     /// Remove `target`, signed by an active device or the kit: pending for
     /// the signer's delay, then matured unless vetoed, from which the
     /// device has no voice and the next commit carries it.
-    #[msg(gas = 100_000_000)]
+    #[msg(gas = 40_000_000)]
     pub async fn remove(
         &mut self,
         ctx: &mut Command<Self>,
@@ -306,7 +310,7 @@ impl Personal {
 
     /// Add `device` as an operation, a delayed admin's add: once matured,
     /// a commit carries it.
-    #[msg(gas = 100_000_000)]
+    #[msg(gas = 40_000_000)]
     pub async fn add(
         &mut self,
         ctx: &mut Command<Self>,
@@ -329,7 +333,7 @@ impl Personal {
     /// Replace `device`'s admin key, signed by another seasoned device or
     /// the kit: the device keeps its seasoning, and the new key signs from
     /// the operation's maturity, its probation.
-    #[msg(gas = 100_000_000)]
+    #[msg(gas = 40_000_000)]
     pub async fn replace(
         &mut self,
         ctx: &mut Command<Self>,
@@ -353,7 +357,7 @@ impl Personal {
 
     /// Rotate the kit to `kit`, signed by an active device or the kit: its
     /// `R2` in the evidence, the old one deleted at maturity.
-    #[msg(gas = 100_000_000)]
+    #[msg(gas = 40_000_000)]
     pub async fn rotate(
         &mut self,
         ctx: &mut Command<Self>,
@@ -372,7 +376,7 @@ impl Personal {
 
     /// Regroup, signed by a seasoned device: the devices of `remove`
     /// removed and a new group started with the rest.
-    #[msg(gas = 100_000_000)]
+    #[msg(gas = 40_000_000)]
     pub async fn regroup(
         &mut self,
         ctx: &mut Command<Self>,
@@ -396,7 +400,7 @@ impl Personal {
     /// kit's delay with no veto and no `alive`, every device is removed,
     /// `device` added alone and active, `kit` replaces the kit, and the
     /// previous `R2` is released to `device`.
-    #[msg(gas = 100_000_000)]
+    #[msg(gas = 40_000_000)]
     pub async fn restore(
         &mut self,
         ctx: &mut Command<Self>,
@@ -421,7 +425,7 @@ impl Personal {
     /// Veto the operation at `op`, signed by an active device, its target
     /// included: the kit's is cancelled, a device's contested. The kit
     /// vetoes nothing.
-    #[msg(gas = 100_000_000)]
+    #[msg(gas = 40_000_000)]
     pub async fn veto(
         &mut self,
         ctx: &mut Command<Self>,
@@ -442,7 +446,7 @@ impl Personal {
     }
 
     /// The second signature making the operation at `op` immediate.
-    #[msg(gas = 100_000_000)]
+    #[msg(gas = 40_000_000)]
     pub async fn cosign(
         &mut self,
         ctx: &mut Command<Self>,
@@ -461,7 +465,7 @@ impl Personal {
 
     /// Resolve the contest of the operation at `op`: `upheld`, it matures
     /// and its rival is dropped; else the reverse.
-    #[msg(gas = 100_000_000)]
+    #[msg(gas = 40_000_000)]
     pub async fn resolve(
         &mut self,
         ctx: &mut Command<Self>,
@@ -484,7 +488,7 @@ impl Personal {
     /// is pending, its effect carrying every matured removal, and adding
     /// inline for a strong admin or a matured add operation's device. A
     /// commit already taken answers as it did, or `Decided` once decided.
-    #[msg(gas = 100_000_000)]
+    #[msg(gas = 40_000_000)]
     pub async fn commit(
         &mut self,
         ctx: &mut Command<Self>,
@@ -530,10 +534,11 @@ impl Personal {
                 if carries.is_none() && committer.keys.class != AdminClass::Strong {
                     return Err(PersonalError::Delayed);
                 }
-                if added.sync == added.admin
-                    || self.admitted.contains(&added.sync)
-                    || self.admitted.contains(&added.admin)
-                {
+                let taken = |key: &[u8; 32]| {
+                    self.admitted.contains(key)
+                        || self.claimed.get(key).is_some_and(|by| Some(by) != carries)
+                };
+                if added.sync == added.admin || taken(&added.sync) || taken(&added.admin) {
                     return Err(PersonalError::KeyTaken);
                 }
                 carries
@@ -606,7 +611,7 @@ impl Personal {
     /// data, `R2` apart and logged nowhere; its arguments must be the
     /// call's recorded, byte for byte. Only the signer posts it: a device
     /// under its sync key, the kit under its own.
-    #[msg(gas = 100_000_000)]
+    #[msg(gas = 40_000_000)]
     pub async fn evidence(
         &mut self,
         ctx: &mut Command<Self>,
@@ -643,7 +648,11 @@ impl Personal {
             Body::Cosign { call, by, .. } | Body::Resolve { call, by, .. } => (call, by, None),
             _ => return Err(PersonalError::NotAdminCall),
         };
-        if by != caller {
+        let origin = match self.holder(ctx.caller()) {
+            Some((key, Holder::Kit(_))) => Some(key),
+            _ => None,
+        };
+        if by != caller || origin.is_some_and(|key| key != call.origin) {
             return Err(PersonalError::NotYours);
         }
         if self.evidenced.contains(&index) {
@@ -695,7 +704,7 @@ impl Personal {
 
     /// Confirm `epoch`'s candidate with `h`, signed by the device's sync
     /// key over `vote_message`.
-    #[msg(gas = 100_000_000)]
+    #[msg(gas = 40_000_000)]
     pub async fn confirm(
         &mut self,
         ctx: &mut Command<Self>,
@@ -708,7 +717,7 @@ impl Personal {
 
     /// Refuse `epoch`'s candidate, signed by the device's sync key over
     /// `vote_message`.
-    #[msg(gas = 100_000_000)]
+    #[msg(gas = 40_000_000)]
     pub async fn nack(
         &mut self,
         ctx: &mut Command<Self>,
@@ -722,7 +731,7 @@ impl Personal {
     /// once an [`ALIVE_EVERY_MS`] a device, the entry logged last answered
     /// between, so liveness grows the log by a bounded amount however often
     /// it is posted.
-    #[msg(gas = 100_000_000)]
+    #[msg(gas = 40_000_000)]
     pub async fn alive(&mut self, ctx: &mut Command<Self>) -> Result<Recorded, PersonalError> {
         let now = self.settle(ctx.now())?;
         self.assigned()?;
@@ -743,7 +752,7 @@ impl Personal {
     /// Store an envelope, sealed under the confirmed epoch its header
     /// names: one already stored answers where it is, before the epoch is
     /// checked.
-    #[msg(gas = 100_000_000)]
+    #[msg(gas = 40_000_000)]
     pub async fn push(
         &mut self,
         ctx: &mut Command<Self>,
@@ -795,7 +804,7 @@ impl Personal {
 
     /// Acknowledge the checkpoint at `scope`'s `position`, whose state the
     /// device recomputed to `hash`. Answers the batch time.
-    #[msg(gas = 100_000_000)]
+    #[msg(gas = 40_000_000)]
     pub async fn acknowledge(
         &mut self,
         ctx: &mut Command<Self>,
@@ -817,7 +826,7 @@ impl Personal {
     /// Open pairing slot `slot` for `key`, which the agent admits for that
     /// slot alone until the slot closes: at its expiry, by a device, or at
     /// its opener's next add. Answers the batch time.
-    #[msg(gas = 100_000_000)]
+    #[msg(gas = 40_000_000)]
     pub async fn open_slot(
         &mut self,
         ctx: &mut Command<Self>,
@@ -842,9 +851,7 @@ impl Personal {
         {
             return Err(PersonalError::SlotTaken);
         }
-        if self.admitted.contains(&key) {
-            return Err(PersonalError::KeyTaken);
-        }
+        self.fresh(&[key])?;
         let expires = now.saturating_add(self.policy().slot_ttl_ms);
         self.slots.insert(
             &slot,
@@ -862,7 +869,7 @@ impl Personal {
     }
 
     /// Close pairing slot `slot`. Answers the batch time.
-    #[msg(gas = 100_000_000)]
+    #[msg(gas = 40_000_000)]
     pub async fn close_slot(
         &mut self,
         ctx: &mut Command<Self>,
@@ -880,7 +887,7 @@ impl Personal {
     /// Leave `bytes` in the inbox for `to` until `expires`, as `id`: a
     /// device for its devices or a slot, a slot's key for its slot. Answers
     /// the batch time; the same item again is stored once.
-    #[msg(gas = 100_000_000)]
+    #[msg(gas = 40_000_000)]
     pub async fn put(
         &mut self,
         ctx: &mut Command<Self>,
@@ -950,11 +957,22 @@ impl Personal {
     /// refuses with `Settling` while operations are left due. A restore's
     /// device is admitted at ingress only once a call settles its restore,
     /// which the kit's wake does, though the restore replaces the kit.
-    #[msg(gas = 100_000_000)]
+    #[msg(gas = 40_000_000)]
     pub async fn wake(&mut self, ctx: &mut Command<Self>) -> Result<Woken, PersonalError> {
         self.assigned()?;
         let now = ctx.now();
-        self.reader(ctx.caller(), now)?.device_or_kit()?;
+        // Any key of a device still live, or of the kit: a removal only due
+        // may yet be cancelled by what falls due before it.
+        let live = |device: DeviceId| {
+            self.devices
+                .get(&device)
+                .is_some_and(|found| found.status == Status::Live)
+        };
+        match self.holder(ctx.caller()) {
+            Some((_, Holder::Sync(device) | Holder::Admin(device))) if live(device) => {}
+            Some((_, Holder::Kit(_))) => {}
+            _ => return Err(PersonalError::NotAdmitted),
+        }
         let settled = self.settle_some(now);
         Ok(Woken { at: now, settled })
     }

@@ -66,6 +66,8 @@ pub struct Usage {
     pub commits: u32,
     /// Inbox items held, expired ones until a write deletes them.
     pub items: u32,
+    /// The kit's operations today.
+    pub kit_operations: u32,
 }
 
 /// A device's share: its bytes held and its counted calls today.

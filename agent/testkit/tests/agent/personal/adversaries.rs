@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 
 use proptest::prelude::*;
 use vos_wire::personal::{
-    DeviceView, NewAdmin, Op, OpState, Operation, RecoveryView, Signer, Standing,
+    DeviceView, NewAdmin, Op, OpState, Operation, RECOVERY, RecoveryView, Signer, Standing,
 };
 
 use super::*;
@@ -121,9 +121,13 @@ fn theft() -> impl Strategy<Value = Theft> {
         1 => (who, any::<u8>()).prop_map(|(who, mask)| Theft::Regroup { who, mask }),
         1 => who.prop_map(|who| Theft::Add { who }),
         1 => who.prop_map(|who| Theft::Alive { who }),
-        3 => (1u16..150).prop_map(Theft::Pass),
+        3 => (1u16..180).prop_map(Theft::Pass),
     ]
 }
+
+/// The longest the owner takes to react, after its first notice and in its
+/// head start alike: under the delay and the probation, 3 minutes.
+const LAG_S: u64 = 170;
 
 /// The thief's game: its devices, the next kit it may draw, and when the
 /// owner first moved against each of its devices.
@@ -132,6 +136,8 @@ struct Game {
     owner: Owner,
     thief: DeviceId,
     kits: u8,
+    /// The batch time the thief's head start has used.
+    head: u64,
     noticed: BTreeMap<DeviceId, u64>,
     vetoed: BTreeSet<(u64, DeviceId)>,
 }
@@ -152,6 +158,7 @@ impl Game {
             owner,
             thief,
             kits: 0,
+            head: 0,
             noticed: BTreeMap::new(),
             vetoed: BTreeSet::new(),
         }
@@ -180,13 +187,17 @@ impl Game {
     }
 
     /// One call of the thief's, its refusals ignored: a refused call
-    /// writes nothing. In its head start, before the owner notices, its
-    /// batch time passes in small steps.
+    /// writes nothing. Between two of the owner's rounds, and in all of the
+    /// head start before the owner notices, at most [`LAG_S`] passes.
     fn steal(&mut self, theft: &Theft, head_start: bool) {
         let who = match *theft {
             Theft::Pass(seconds) => {
-                let limit = if head_start { 25 } else { 150 };
-                return self.home.pass(u64::from(seconds.min(limit)) * 1000);
+                let mut seconds = u64::from(seconds).min(LAG_S);
+                if head_start {
+                    seconds = seconds.min(LAG_S - self.head);
+                    self.head += seconds;
+                }
+                return self.home.pass(seconds * 1000);
             }
             Theft::Pair => return self.pair(),
             Theft::Remove { who, .. }
@@ -267,11 +278,21 @@ impl Game {
         let Some(&by) = self.thiefs().first() else {
             return;
         };
-        let id = devices(&self.home, self.reader()).len() as u8;
+        let views = devices(&self.home, self.reader());
+        let id = views.len() as u8;
         let epoch = self.home.overview().confirmed + 1;
+        // The commit carries every matured removal it owes.
+        let owed = views
+            .iter()
+            .filter(|view| {
+                view.removal
+                    .is_some_and(|removal| removal.committed.is_none())
+            })
+            .map(|view| view.id)
+            .collect();
         let effect = Effect {
             add: Some(device(id)),
-            remove: Vec::new(),
+            remove: owed,
         };
         let made = self.home.call::<Candidacy>(
             Principal::Client(device_keys(by).admin),
@@ -564,21 +585,25 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(24))]
 
     /// D3: a leaked kit makes any of its operations, in any order, while
-    /// the owner's two devices veto each and post `alive`: none matures,
-    /// no device is removed, the kit stays the owner's and `R2` is
-    /// released to no one.
+    /// the owner's two devices post `alive` and veto each, in either
+    /// order: none matures, no device is removed or added, and the kit and
+    /// the recovery scope stay the owner's.
     #[test]
     fn a_leaked_kit_alone_completes_nothing_while_a_device_vetoes(
-        leaks in prop::collection::vec(leak(), 1..32),
+        leaks in prop::collection::vec((leak(), any::<bool>()), 1..32),
     ) {
         let mut home = Home::with(minutes());
         home.pair(0, 1);
         home.pass(3 * MINUTE);
+        let epoch = home.overview().confirmed;
+        home.push(0, envelope(RECOVERY, epoch, 1, 300)).unwrap();
         let mut kits = 0u8;
         let mut made: Vec<u64> = Vec::new();
         let mut vetoed: BTreeSet<u64> = BTreeSet::new();
-        let leaks = leaks.into_iter().chain(std::iter::repeat_n(Leak::Pass(300), 4));
-        for leak in leaks {
+        let leaks = leaks
+            .into_iter()
+            .chain(std::iter::repeat_n((Leak::Pass(300), false), 4));
+        for (leak, alive_first) in leaks {
             let picked = |home: &Home, pick: u8| {
                 let open = open(home, sync(0));
                 open.get(pick as usize % open.len().max(1)).map(|(index, _)| *index)
@@ -637,8 +662,13 @@ proptest! {
             if let (Leak::Remove(_) | Leak::Restore | Leak::Rotate | Leak::Replace(_), Ok(index)) = (&leak, result) {
                 made.push(index);
             }
-            // The owner's round: a veto of each of the kit's operations,
-            // and its devices' `alive`.
+            // The owner's round: its devices' `alive`, before or after a
+            // veto of each of the kit's operations.
+            if alive_first {
+                for n in 0..2 {
+                    home.call::<Recorded>(sync(n), "alive", ()).unwrap();
+                }
+            }
             for (index, operation) in open(&home, sync(0)) {
                 if matches!(operation.by, Signer::Kit(_)) && vetoed.insert(index) {
                     home.operate(admin((index % 2) as u8), "veto", index).unwrap();
@@ -658,7 +688,7 @@ proptest! {
         }
         let recovery: RecoveryView = home.query(KIT, "recovery", ()).unwrap();
         prop_assert_eq!(recovery.entries, kit().entries);
-        prop_assert_eq!(recovery.released, None);
-        prop_assert_eq!(recovery.from, 0);
+        prop_assert_eq!(recovery.from, 0, "no rotation moved the recovery scope's start");
+        prop_assert_eq!(devices(&home, sync(0)).len(), 2, "no restore added a device");
     }
 }

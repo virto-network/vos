@@ -4,11 +4,15 @@
 //! matures.
 //!
 //! Batch time decides lazily, as everywhere in `Personal`: each call first
-//! matures what fell due, at most [`SETTLE`] operations, and refuses with
+//! settles what fell due, at most [`SETTLE`] steps, and refuses with
 //! `Settling` while more are due, which `wake` settles a few at a time; a
-//! read computes standing from the time it reads at. So no call's work
-//! grows with what an adversary queued, and every operation matures at its
-//! own time, however late the call that settles it.
+//! read computes standing from the time it reads at. A step is one
+//! operation's maturity, or one row of a removed device's silencing (an
+//! operation of its cancelled, a veto of its lifted) or of a replaced kit's
+//! (an operation of its cancelled), queued in the due index at the time it
+//! takes effect. So no step's work grows with what an adversary queued,
+//! and everything takes effect in time order, however late the call that
+//! settles it.
 
 use alloc::vec::Vec;
 
@@ -19,12 +23,17 @@ use vos_wire::personal::{
     Verdict, Void,
 };
 
-use crate::rows::{Charge, ONE, Recovery};
+use crate::rows::{ONE, Recovery};
 use crate::{KIT_ENTRIES, Personal};
 
-/// The operations a call matures before it runs: with the one its own
-/// work may mature, each bounded, within its gas.
-pub const SETTLE: usize = 1;
+/// The steps a call settles before it runs: with the one maturity its own
+/// work may make, each bounded, within its gas.
+pub const SETTLE: usize = 4;
+
+/// A due row that is a chore, not an operation: `CHORE | device` silences
+/// a device, [`RETIRE`] cancels a replaced kit's operations.
+const CHORE: u64 = 1 << 63;
+const RETIRE: u64 = CHORE | 1 << 32;
 
 /// The open operations a signer holds at once, removals aside: a device's,
 /// or a kit entry's. A removal is one open a target.
@@ -88,6 +97,23 @@ fn signer_key(by: Signer) -> u64 {
         Signer::Device(device) => u64::from(device),
         Signer::Kit(entry) => 1 << 32 | u64::from(entry),
     }
+}
+
+/// The keys an operation brings, which no one else may take while it is
+/// open, or while a matured add waits for its commit.
+fn claims(op: &Op) -> Vec<[u8; 32]> {
+    let mut keys = Vec::new();
+    match op {
+        Op::Add(device) => keys.extend([device.sync, device.admin]),
+        Op::Replace { admin, .. } => keys.push(admin.key),
+        Op::Rotate(kit) => keys.extend(kit.entries.iter().map(|entry| entry.signing)),
+        Op::Restore { device, kit } => {
+            keys.extend([device.sync, device.admin]);
+            keys.extend(kit.entries.iter().map(|entry| entry.signing));
+        }
+        Op::Remove(_) | Op::Regroup(_) => {}
+    }
+    keys
 }
 
 /// The rows of an ordered table keyed `(A, B)` whose first part is
@@ -208,6 +234,16 @@ impl Personal {
         by: Signer,
         op: Op,
     ) -> Result<Recorded, PersonalError> {
+        if let (Op::Rotate(_), Signer::Device(_)) = (&op, by)
+            && let Some(index) = self.kinds.get(&(Kind::Kit as u8, 0))
+            && self
+                .operations
+                .get(&index)
+                .is_some_and(|open| matches!(open.by, Signer::Kit(_)))
+        {
+            // A device's rotation is a veto of the kit's pending one.
+            self.cancel(index, Cancel::Veto, now);
+        }
         self.check_operation(now, by, &op)?;
         let removal = matches!(op, Op::Remove(_));
         let held = prefixed!(self.signed, signer_key(by), u64::MAX);
@@ -216,11 +252,11 @@ impl Personal {
         }
         let device = match by {
             Signer::Device(device) => Some(device),
-            Signer::Kit(_) => None,
+            Signer::Kit(_) => {
+                self.charge_kit(now)?;
+                None
+            }
         };
-        if !removal {
-            self.charge(now, device, 0, Charge::Commit)?;
-        }
         let policy = self.policy();
         let delay = match (by, &op) {
             (Signer::Kit(_), _) => policy.kit_delay_ms,
@@ -237,18 +273,24 @@ impl Personal {
                 matures,
             },
         );
-        let rival = match (&op, device) {
-            (Op::Remove(target), Some(signer)) => self
-                .kinds
-                .get(&(Kind::Remove as u8, signer))
-                .filter(|rival| {
-                    self.operations
-                        .get(rival)
-                        .is_some_and(|operation| operation.by == Signer::Device(*target))
-                }),
-            _ => None,
-        };
-        for target in removes(&op) {
+        // A removal aimed at an open removal of its signer by one of its
+        // targets, a regroup's included, is one contest with it.
+        let targets = removes(&op);
+        let rival = device.and_then(|signer| {
+            prefixed!(self.against, signer, u64::MAX)
+                .into_iter()
+                .map(|(rival, ())| rival)
+                .find(|rival| {
+                    !self.rivals.contains(rival)
+                        && self.operations.get(rival).is_some_and(|operation| {
+                            matches!(operation.by, Signer::Device(by) if targets.contains(&by))
+                        })
+                })
+        });
+        for key in claims(&op) {
+            self.claimed.insert(&key, &index);
+        }
+        for target in targets {
             self.freeze(target, now);
             self.against.insert(&(target, index), &());
         }
@@ -297,7 +339,12 @@ impl Personal {
                 }
                 self.fresh(&[keys.sync, keys.admin])
             }
-            Op::Remove(target) => self.live(*target, now),
+            Op::Remove(target) => {
+                if by == Signer::Device(*target) {
+                    return Err(PersonalError::Targeted);
+                }
+                self.live(*target, now)
+            }
             Op::Replace { device, admin } => {
                 self.live(*device, now)?;
                 if let Signer::Device(signer) = by {
@@ -347,10 +394,11 @@ impl Personal {
         }
     }
 
-    /// Keys distinct and admitted to no one.
-    fn fresh(&self, keys: &[[u8; 32]]) -> Result<(), PersonalError> {
+    /// Keys distinct, admitted to no one and brought by no open operation.
+    pub(crate) fn fresh(&self, keys: &[[u8; 32]]) -> Result<(), PersonalError> {
         for (i, key) in keys.iter().enumerate() {
-            if keys[..i].contains(key) || self.admitted.contains(key) {
+            if keys[..i].contains(key) || self.admitted.contains(key) || self.claimed.contains(key)
+            {
                 return Err(PersonalError::KeyTaken);
             }
         }
@@ -557,8 +605,8 @@ impl Personal {
 
     // ===== Settling =====
 
-    /// Mature at most `most` operations due by `now`, in the order they
-    /// fell due: whether none is left due.
+    /// Settle at most `most` steps due by `now`, in the order they fell
+    /// due: whether none is left due.
     pub(crate) fn mature_due(&mut self, now: u64, most: usize) -> bool {
         for _ in 0..most {
             let Some(((at, index), ())) = self.due.first() else {
@@ -567,10 +615,72 @@ impl Personal {
             if at > now {
                 return true;
             }
-            self.due.remove(&(at, index));
-            self.mature(index, at, now);
+            if index & CHORE == 0 {
+                self.due.remove(&(at, index));
+                self.mature(index, at, now);
+            } else if !self.chore(index, at, now) {
+                self.due.remove(&(at, index));
+            }
         }
         self.due.first().is_none_or(|((at, _), ())| at > now)
+    }
+
+    /// Queue `device`'s silencing as of `at`: its operations cancelled, a
+    /// matured add of its included, and its vetoes lifted, a row a step.
+    pub(crate) fn silence(&mut self, device: DeviceId, at: u64) {
+        self.due.insert(&(at, CHORE | u64::from(device)), &());
+    }
+
+    /// One row of the chore `chore`, as of `at`: whether rows are left.
+    fn chore(&mut self, chore: u64, at: u64, now: u64) -> bool {
+        if chore == RETIRE {
+            let open = (0..KIT_ENTRIES as u64).find_map(|entry| {
+                prefixed!(self.signed, 1 << 32 | entry, u64::MAX)
+                    .first()
+                    .map(|(index, _)| *index)
+            });
+            return match open {
+                Some(index) => {
+                    self.cancel(index, Cancel::Retired, now);
+                    true
+                }
+                None => false,
+            };
+        }
+        let device = (chore & u64::from(DeviceId::MAX)) as DeviceId;
+        if let Some((index, _)) = prefixed!(self.signed, u64::from(device), u64::MAX).first() {
+            if self.open.contains(index) {
+                self.cancel(*index, Cancel::Signer, now);
+            } else {
+                self.drop_ready(*index, now);
+            }
+            return true;
+        }
+        if let Some((vetoed, ())) = prefixed!(self.vetoed, device, u64::MAX).first() {
+            self.vetoed.remove(&(device, *vetoed));
+            self.vetoes.remove(&(*vetoed, device));
+            self.reopen(*vetoed, at, now);
+            return true;
+        }
+        false
+    }
+
+    /// Cancel the matured add at `index` its commit never carried: its
+    /// signer has no voice.
+    fn drop_ready(&mut self, index: u64, now: u64) {
+        self.ready.remove(&index);
+        if let Some(mut operation) = self.operations.get(&index) {
+            self.signed.remove(&(signer_key(operation.by), index));
+            for key in claims(&operation.op) {
+                self.claimed.remove(&key);
+            }
+            operation.state = OpState::Cancelled {
+                at: now,
+                why: Cancel::Signer,
+            };
+            self.operations.insert(&index, &operation);
+            self.settled(now, index, operation.state);
+        }
     }
 
     /// Contest the open operation at `index`: it waits on a resolution.
@@ -613,6 +723,9 @@ impl Personal {
         self.open.remove(&index);
         self.due.remove(&(operation.matures, index));
         self.signed.remove(&(signer_key(operation.by), index));
+        for key in claims(&operation.op) {
+            self.claimed.remove(&key);
+        }
         if let Some(key) = kind(&operation.op) {
             self.kinds.remove(&key);
         }
@@ -658,8 +771,16 @@ impl Personal {
             return;
         };
         let r2 = self.deposits.get(&index);
+        let left = |device: DeviceId| {
+            self.devices
+                .get(&device)
+                .is_none_or(|found| found.status != Status::Live)
+        };
+        if matches!(operation.by, Signer::Device(by) if left(by)) {
+            return self.cancel(index, Cancel::Signer, now);
+        }
         let target_left = matches!(operation.op, Op::Remove(target) | Op::Replace { device: target, .. }
-            if self.devices.get(&target).is_none_or(|device| device.status != Status::Live));
+            if left(target));
         if target_left {
             return self.cancel(index, Cancel::Moot, now);
         }
@@ -679,7 +800,15 @@ impl Personal {
         }
         let r2 = r2.unwrap_or_default();
         match operation.op {
-            Op::Add(_) => self.ready.insert(&index, &()),
+            Op::Add(_) => {
+                // Held, its keys claimed, until a commit carries it.
+                self.ready.insert(&index, &());
+                self.signed
+                    .insert(&(signer_key(operation.by), index), &true);
+                for key in claims(&operation.op) {
+                    self.claimed.insert(&key, &index);
+                }
+            }
             Op::Remove(target) => self.remove_device(target, index, at, now),
             Op::Replace { device, admin } => {
                 if let Some(mut found) = self.devices.get(&device) {
@@ -692,7 +821,7 @@ impl Personal {
                 }
             }
             Op::Rotate(kit) => {
-                self.replace_kit(&kit.entries, r2);
+                self.replace_kit(&kit.entries, r2, at);
                 self.recovery.insert(
                     &ONE,
                     &Recovery {
@@ -709,16 +838,12 @@ impl Personal {
             }
             Op::Restore { device, kit } => {
                 let previous = self.secrets.get(&ONE);
-                let open: Vec<u64> = self.open.iter(None).map(|(index, ())| index).collect();
-                for other in open {
-                    self.cancel(other, Cancel::Restored, now);
-                }
                 let live: Vec<DeviceId> = self.live.iter(None).map(|(id, ())| id).collect();
                 for id in live {
                     self.remove_device(id, index, at, now);
                 }
                 self.new_group(now);
-                self.replace_kit(&kit.entries, r2);
+                self.replace_kit(&kit.entries, r2, at);
                 let added = self.add_device(at, at, device).ok();
                 if let Some(added) = added {
                     self.seen.insert(&added, &now);
@@ -757,8 +882,10 @@ impl Personal {
     }
 
     /// The kit replaced by `entries`, its `R2` by `r2`: the previous
-    /// entries' keys admitted no more.
-    fn replace_kit(&mut self, entries: &[KitEntry], r2: [u8; 32]) {
+    /// entries' keys admitted no more, and their open operations queued
+    /// for cancelling.
+    fn replace_kit(&mut self, entries: &[KitEntry], r2: [u8; 32], at: u64) {
+        self.due.insert(&(at, RETIRE), &());
         let previous: Vec<(u8, KitEntry)> = self.kit.iter(None).collect();
         for (i, entry) in previous {
             if self.admitted.get(&entry.signing) == Some(Holder::Kit(i)) {
@@ -782,9 +909,9 @@ impl Personal {
     }
 
     /// `target`'s removal matured at `at` by the operation at `index`: its
-    /// keys admitted no more, and it has no voice. Its open operations are
-    /// cancelled and its vetoes count no more; a pending candidate it was
-    /// to confirm is decided as of `at` by the others' votes.
+    /// keys admitted no more, and it has no voice. Its silencing is queued;
+    /// a pending candidate it was to confirm is decided as of `at` by the
+    /// others' votes.
     fn remove_device(&mut self, target: DeviceId, index: u64, at: u64, now: u64) {
         let Some(mut device) = self.devices.get(&target) else {
             return;
@@ -807,14 +934,7 @@ impl Personal {
         );
         self.frozen.remove(&target);
         self.append(now, Body::Matured { device: target });
-        for (other, _) in prefixed!(self.signed, signer_key(Signer::Device(target)), u64::MAX) {
-            self.cancel(other, Cancel::Signer, now);
-        }
-        for (vetoed, ()) in prefixed!(self.vetoed, target, u64::MAX) {
-            self.vetoed.remove(&(target, vetoed));
-            self.vetoes.remove(&(vetoed, target));
-            self.reopen(vetoed, at, now);
-        }
+        self.silence(target, at);
         if let Some(candidate) = self.group().candidate
             && candidate.set.contains(&target)
             && at
@@ -839,6 +959,10 @@ impl Personal {
     pub(crate) fn carried(&mut self, index: u64, epoch: u64) {
         self.ready.remove(&index);
         if let Some(mut operation) = self.operations.get(&index) {
+            self.signed.remove(&(signer_key(operation.by), index));
+            for key in claims(&operation.op) {
+                self.claimed.remove(&key);
+            }
             operation.state = OpState::Carried { epoch };
             self.operations.insert(&index, &operation);
         }

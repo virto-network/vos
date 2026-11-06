@@ -395,6 +395,16 @@ impl Personal {
                 if let Some(index) = candidate.carries {
                     self.carried(index, candidate.epoch);
                 }
+                // The previous R2 is released until the restore's device
+                // commits a group of its own.
+                let mut recovery = self.recovery.get(&ONE).unwrap_or_default();
+                if recovery
+                    .released
+                    .is_some_and(|(device, _)| device == candidate.by)
+                {
+                    recovery.released = None;
+                    self.recovery.insert(&ONE, &recovery);
+                }
             }
             Verdict::Void(_) => {
                 if let Some(added) = candidate.added
@@ -402,6 +412,7 @@ impl Personal {
                 {
                     device.status = Status::Dropped { at: now };
                     self.live.remove(&added);
+                    self.silence(added, now);
                     self.admitted.remove(&device.keys.sync);
                     self.admitted.remove(&device.keys.admin);
                     self.devices.insert(&added, &device);
@@ -436,6 +447,7 @@ impl Personal {
                 day,
                 envelopes: 0,
                 commits: 0,
+                kit_operations: 0,
                 ..usage
             };
         }
@@ -485,6 +497,27 @@ impl Personal {
 
     /// The devices in probation or active, once a call settled what was
     /// due.
+    /// Count one of the kit's operations against its daily allowance.
+    pub(crate) fn charge_kit(&mut self, now: u64) -> Result<(), PersonalError> {
+        let day = now / DAY_MS;
+        let mut usage = self.usage();
+        if usage.day != day {
+            usage = Usage {
+                day,
+                envelopes: 0,
+                commits: 0,
+                kit_operations: 0,
+                ..usage
+            };
+        }
+        if usage.kit_operations >= self.policy().kit_operations_per_day {
+            return Err(PersonalError::Quota);
+        }
+        usage.kit_operations += 1;
+        self.usage.insert(&ONE, &usage);
+        Ok(())
+    }
+
     pub(crate) fn live_devices(&self) -> usize {
         self.live.iter(None).count()
     }

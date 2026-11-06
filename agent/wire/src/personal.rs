@@ -365,9 +365,9 @@ pub enum Cancel {
     /// A resolution dropped it.
     #[codec(index = 4)]
     Resolved = 4,
-    /// A restore replaced the device set.
+    /// Its kit was replaced, by a rotation or a restore.
     #[codec(index = 5)]
-    Restored = 5,
+    Retired = 5,
     /// It matured without the evidence carrying its `R2`.
     #[codec(index = 6)]
     Unevidenced = 6,
@@ -430,6 +430,9 @@ pub struct Policy {
     /// Envelopes and commits a day.
     pub envelopes_per_day: u32,
     pub commits_per_day: u32,
+    /// The kit's operations a day: a veto or an `alive` that cancels one
+    /// frees its place, so this bounds how often a leaked kit tries.
+    pub kit_operations_per_day: u32,
     /// The inbox's items, each item's bytes and its longest life.
     pub inbox_items: u32,
     pub inbox_item_bytes: u32,
@@ -451,6 +454,7 @@ impl Policy {
         bytes_full: 64 << 20,
         envelopes_per_day: 8192,
         commits_per_day: 32,
+        kit_operations_per_day: 4,
         inbox_items: 64,
         inbox_item_bytes: 16 << 10,
         inbox_ttl_ms: 7 * DAY_MS,

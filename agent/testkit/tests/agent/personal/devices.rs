@@ -71,7 +71,12 @@ fn a_device_is_in_probation_then_active_then_seasoned() {
     let (zero, one) = (view(&home, sync(0), 0), view(&home, sync(0), 1));
     assert_eq!((zero.standing, zero.seasoned), (Standing::Active, false));
     assert_eq!((one.standing, one.seasoned), (Standing::Probation, false));
-    let removal = home.operate(admin(0), "remove", 0u32).unwrap();
+    assert_eq!(
+        home.operate(admin(0), "remove", 0u32),
+        Err(PersonalError::Targeted),
+        "no device removes itself"
+    );
+    let removal = home.operate(KIT, "remove", 0u32).unwrap();
     assert_eq!(
         home.operate(admin(1), "veto", removal),
         Err(PersonalError::Probation)
@@ -585,17 +590,17 @@ fn a_removed_devices_vetoes_and_operations_count_no_more() {
     let removal = home.operate(admin(0), "remove", 2u32).unwrap();
     home.operate(admin(1), "cosign", removal).unwrap();
     assert_eq!(standing(&home, sync(0), 2), Standing::Removed);
+    assert_eq!(state(&home, sync(0), owners), OpState::Contested);
+    // The next call settles the silencing, a row a step, in time order.
+    home.call::<Recorded>(sync(0), "alive", ()).unwrap();
     assert_eq!(
         cancelled(state(&home, sync(0), thiefs)),
         Some(Cancel::Signer)
     );
-    assert_eq!(
-        state(&home, sync(0), owners),
-        OpState::Pending,
-        "its delay passed: due now"
+    assert!(
+        matured(state(&home, sync(0), owners)),
+        "its delay passed: due once its contest lifted"
     );
-    home.call::<Recorded>(sync(0), "alive", ()).unwrap();
-    assert!(matured(state(&home, sync(0), owners)));
 }
 
 /// B6: every operation and veto is an admin call whose evidence its
@@ -629,18 +634,14 @@ fn operations_are_signed_end_to_end_and_their_evidence_stored() {
     )));
 }
 
-/// What one maturity may cost: a handler matures at most one operation
-/// before it runs, and its own work at most one more, both within its
-/// limit, `MAX_HANDLER_GAS`, if each costs under this.
-const CASCADE: u64 = vos_wire::defaults::MAX_HANDLER_GAS / 2;
+/// What one call may cost: half the limit `Personal`'s settling handlers
+/// declare, 40M, so the bound holds with room.
+const BOUND: u64 = 20_000_000;
 
-/// The bounds: a device that vetoed every open operation and holds as
-/// many as it may is removed by a second signature, its operations
-/// cancelled and every contest it alone held lifted; a restore over a full
-/// set, every operation open and contested, matures in one wake. Each
-/// costs under [`CASCADE`].
-#[test]
-fn the_worst_removal_and_restore_fit_their_handlers_gas() {
+/// A full set, eight seasoned devices, each holding as many operations as
+/// it may (device 0 one fewer, for the regroup), each operation vetoed by
+/// every other device and resolved by one: its operations by signer.
+fn full_set() -> (Home, Vec<(u64, u8)>) {
     let mut home = Home::with(minutes());
     for n in 1..8 {
         home.pair(0, n);
@@ -649,76 +650,79 @@ fn the_worst_removal_and_restore_fit_their_handlers_gas() {
     for n in 0..8 {
         home.call::<Recorded>(sync(n), "alive", ()).unwrap();
     }
-    let thief = 7u8;
-    let mut vetoable = Vec::new();
-    for n in 0..7u8 {
-        for k in 0..2u8 {
-            vetoable.push(
-                home.operate(admin(n), "add", device(16 + 2 * n + k))
-                    .unwrap(),
-            );
-        }
-    }
-    for n in 2..7u32 {
-        vetoable.push(home.operate(admin(1), "remove", n).unwrap());
-    }
-    let removal = home.operate(admin(0), "remove", u32::from(thief)).unwrap();
-    for n in 0..7u32 {
-        home.operate(admin(thief), "remove", n).unwrap_or_default();
-    }
-    for index in &vetoable {
-        home.operate(admin(thief), "veto", *index).unwrap();
-    }
-    home.operate(admin(thief), "add", device(40)).unwrap();
-    home.operate(admin(thief), "add", device(41)).unwrap();
-    home.operate(admin(1), "cosign", removal).unwrap();
-    assert_eq!(standing(&home, sync(0), 7), Standing::Removed);
-    for index in &vetoable {
-        assert_eq!(state(&home, sync(0), *index), OpState::Pending);
-    }
-    assert!(home.gas["cosign"] < CASCADE, "{:?}", home.gas);
-
-    // A restore over a full set whose every operation waits on a contest.
-    let mut home = Home::with(minutes());
-    for n in 1..8 {
-        home.pair(0, n);
-    }
-    home.pass(10 * MINUTE);
+    let mut held = Vec::new();
     for n in 0..8u8 {
-        home.call::<Recorded>(sync(n), "alive", ()).unwrap();
-    }
-    for n in 0..8u8 {
-        let next = (n + 1) % 8;
-        for k in 0..2u8 {
+        for k in u8::from(n == 0)..2 {
             let index = home
                 .operate(admin(n), "add", device(16 + 2 * n + k))
                 .unwrap();
-            home.operate(admin(next), "veto", index).unwrap();
+            held.push((index, n));
         }
-        let removal = home
-            .operate(admin(n), "remove", u32::from((n + 2) % 8))
-            .unwrap();
-        home.operate(admin(next), "veto", removal).unwrap();
     }
+    for (index, signer) in &held {
+        let (index, signer) = (index, *signer);
+        for n in (0..8u8).filter(|n| *n != signer) {
+            home.operate(admin(n), "veto", *index).unwrap();
+        }
+        home.operate(admin((signer + 1) % 8), "resolve", (*index, false))
+            .unwrap();
+    }
+    (home, held)
+}
+
+fn within_bound(home: &Home) {
+    for (name, gas) in &home.gas {
+        assert!(*gas < BOUND, "{name}: {gas} gas");
+    }
+}
+
+/// The bounds: a regroup naming seven devices, each of which vetoed every
+/// operation and holds as many as it may, matures, and their silencing
+/// cancels and lifts every one, a row a step; a restore over the same set
+/// matures. Each call stays under [`BOUND`].
+#[test]
+fn the_worst_regroup_and_restore_stay_within_a_calls_gas() {
+    let (mut home, held) = full_set();
+    let regroup = home
+        .operate(admin(0), "regroup", (1..8u32).collect::<Vec<_>>())
+        .unwrap();
+    home.pass(3 * MINUTE);
+    home.wake(sync(0)).unwrap();
+    assert!(matured(state(&home, sync(0), regroup)));
+    for (index, signer) in held {
+        let state = state(&home, sync(0), index);
+        if signer == 0 {
+            assert!(matured(state), "{index}: {state:?}, its vetoers silenced");
+        } else {
+            assert_eq!(cancelled(state), Some(Cancel::Signer), "{index}");
+        }
+    }
+    within_bound(&home);
+
+    let (mut home, _) = full_set();
     let (next, r2) = new_kit(1);
     let restore = (device(50), next);
     let index = home.operate(KIT, "restore", restore.clone()).unwrap();
     home.deposit(KIT, KIT_KEY, index, "restore", restore, r2)
         .unwrap();
     home.pass(7 * MINUTE);
-    home.wake(KIT).unwrap();
+    // The restore replaces the kit: its next wakes are the new kit's.
+    home.wake(KIT)
+        .or_else(|_| home.wake(kit_key(1, 0)))
+        .unwrap();
     assert!(matured(state(&home, kit_key(1, 0), index)));
-    assert!(home.gas["wake"] < CASCADE, "{:?}", home.gas);
+    within_bound(&home);
 }
 
-/// Settling: a call matures one operation due before it runs and refuses
+/// Settling: a call settles a few steps due before it runs and refuses
 /// with `Settling` while more are due, writing nothing; `wake` settles
 /// them a few at a time, and each matures at its own time however late.
 #[test]
 fn a_call_refuses_while_operations_are_left_due_and_wake_settles_them() {
-    let mut home = seasoned(4);
-    let first = home.operate(admin(0), "remove", 2u32).unwrap();
-    let second = home.operate(admin(0), "remove", 3u32).unwrap();
+    let mut home = seasoned(6);
+    let removals: Vec<(u64, u32)> = (2..6u32)
+        .map(|target| (home.operate(admin(0), "remove", target).unwrap(), target))
+        .collect();
     home.pass(10 * MINUTE);
     let refused = home.run(sync(1), "alive", ());
     assert!(matches!(
@@ -730,7 +734,7 @@ fn a_call_refuses_while_operations_are_left_due_and_wake_settles_them() {
     assert!(!woken.settled);
     let woken: Woken = home.call(sync(1), "wake", ()).unwrap();
     assert!(woken.settled);
-    for (index, target) in [(first, 2), (second, 3)] {
+    for (index, target) in removals {
         let operation = home.operation(sync(0), index);
         assert_eq!(
             operation.state,
@@ -744,4 +748,139 @@ fn a_call_refuses_while_operations_are_left_due_and_wake_settles_them() {
         );
     }
     home.call::<Recorded>(sync(1), "alive", ()).unwrap();
+}
+
+/// Rule 5: a regroup naming a device and that device's removal of the
+/// regroup's signer are one contest, in either order.
+#[test]
+fn a_regroup_and_its_targets_removal_of_its_signer_are_one_contest() {
+    let mut home = seasoned(3);
+    let regroup = home.operate(admin(0), "regroup", vec![1u32]).unwrap();
+    let removal = home.operate(admin(1), "remove", 0u32).unwrap();
+    for index in [regroup, removal] {
+        assert_eq!(state(&home, sync(2), index), OpState::Contested);
+    }
+    home.operate(KIT, "resolve", (removal, false)).unwrap();
+    assert!(matured(state(&home, sync(0), regroup)));
+    assert_eq!(standing(&home, sync(0), 1), Standing::Removed);
+}
+
+/// The keys an open operation brings are taken: a pairing slot or an add
+/// cannot squat them to cancel it at maturity.
+#[test]
+fn an_open_operations_keys_cannot_be_squatted() {
+    let mut home = seasoned(2);
+    let replacement = home
+        .operate(admin(0), "replace", (1u32, new_admin(1)))
+        .unwrap();
+    assert_eq!(
+        home.call::<u64>(sync(1), "open_slot", (scope(9), new_admin(1).key)),
+        Err(PersonalError::KeyTaken)
+    );
+    let (kit, _) = new_kit(1);
+    home.operate(admin(1), "rotate", kit.clone()).unwrap();
+    let squat = NewDevice {
+        admin: kit.entries[0].signing,
+        ..device(4)
+    };
+    let effect = Effect {
+        add: Some(squat),
+        remove: Vec::new(),
+    };
+    let epoch = home.overview().confirmed + 1;
+    assert_eq!(
+        home.call::<Candidacy>(admin(0), "commit", commit(epoch, effect, vec![4; 600])),
+        Err(PersonalError::KeyTaken)
+    );
+    home.pass(3 * MINUTE);
+    home.wake(sync(0)).unwrap();
+    assert!(matured(state(&home, sync(0), replacement)));
+}
+
+/// A device's rotation is a veto of the kit's pending restore or
+/// rotation, so a leaked kit cannot hold the kit's place; and the kit's
+/// operations count against the policy's daily allowance.
+#[test]
+fn a_devices_rotation_takes_the_kits_place_and_the_kit_has_an_allowance() {
+    let policy = Policy {
+        kit_operations_per_day: 2,
+        ..minutes()
+    };
+    let mut home = Home::with(policy);
+    let (next, _) = new_kit(1);
+    let restore = home
+        .operate(KIT, "restore", (device(5), next.clone()))
+        .unwrap();
+    let (rotated, _) = new_kit(2);
+    home.operate(admin(0), "rotate", rotated).unwrap();
+    assert_eq!(
+        cancelled(state(&home, sync(0), restore)),
+        Some(Cancel::Veto)
+    );
+    home.operate(KIT, "remove", 0u32).unwrap();
+    assert_eq!(
+        home.operate(KIT, "replace", (0u32, new_admin(3))),
+        Err(PersonalError::Quota)
+    );
+}
+
+/// A device dropped with its void candidate is silenced as a removed one
+/// is: its operations cancelled.
+#[test]
+fn a_dropped_devices_operations_are_cancelled() {
+    let policy = Policy {
+        confirm_window_ms: 10 * MINUTE,
+        ..minutes()
+    };
+    let mut home = Home::with(policy);
+    home.pair(0, 1);
+    let effect = Effect {
+        add: Some(device(2)),
+        remove: Vec::new(),
+    };
+    let candidacy: Candidacy = home
+        .call(admin(0), "commit", commit(2, effect, vec![2; 600]))
+        .unwrap();
+    home.pass(3 * MINUTE);
+    let add = home.operate(admin(2), "add", device(6)).unwrap();
+    home.call::<Voted>(sync(0), "nack", (2u64, [0u8; 64]))
+        .unwrap();
+    assert!(candidacy.set.contains(&0));
+    assert_eq!(standing(&home, sync(0), 2), Standing::Dropped);
+    home.wake(sync(0)).unwrap();
+    assert_eq!(cancelled(state(&home, sync(0), add)), Some(Cancel::Signer));
+}
+
+/// The previous `R2` stays released until the restore's device has
+/// committed a group of its own.
+#[test]
+fn the_released_r2_is_deleted_at_the_restored_devices_first_commit() {
+    let mut home = Home::with(minutes());
+    let removal = home.operate(KIT, "remove", 0u32).unwrap();
+    home.pass(7 * MINUTE);
+    home.wake(KIT).unwrap();
+    assert!(matured(state(&home, KIT, removal)));
+    let (next, r2) = new_kit(1);
+    let restore = (device(5), next);
+    let index = home.operate(KIT, "restore", restore.clone()).unwrap();
+    home.deposit(KIT, KIT_KEY, index, "restore", restore, r2)
+        .unwrap();
+    home.pass(7 * MINUTE);
+    home.wake(KIT)
+        .or_else(|_| home.wake(kit_key(1, 0)))
+        .unwrap();
+    let released: RecoveryView = home.query(sync(5), "recovery", ()).unwrap();
+    assert_eq!(released.released, Some(kit().r2));
+    let effect = Effect {
+        add: None,
+        remove: vec![0],
+    };
+    let candidacy: Candidacy = home
+        .call(admin(5), "commit", commit(1, effect, vec![9; 600]))
+        .unwrap();
+    home.call::<Voted>(sync(5), "confirm", (1u64, [1u8; 32], [0u8; 64]))
+        .unwrap();
+    assert_eq!(candidacy.set, vec![1]);
+    let released: RecoveryView = home.query(sync(5), "recovery", ()).unwrap();
+    assert_eq!(released.released, None);
 }

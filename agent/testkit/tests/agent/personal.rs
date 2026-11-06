@@ -114,6 +114,7 @@ pub fn minutes() -> Policy {
         probation_ms: 3 * MINUTE,
         seasoning_ms: 7 * MINUTE,
         confirm_window_ms: 3 * MINUTE,
+        kit_operations_per_day: 64,
         ..Policy::DEFAULT
     }
 }
