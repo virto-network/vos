@@ -2014,7 +2014,10 @@ circuit" (cipher-clerk's Phase 3 entry criterion 11) holds by construction.
    the proof states, so a payment names no payer; `mint` credits from the
    space's issuance (a debit-normal account whose owner, like the
    journal's registrar, is a non-canonical digest no proof states);
-   `rekey` moves an account to a new digest and lifts a `freeze`. The
+   `rekey` moves an account to a new digest and lifts a `freeze`; a
+   payment to oneself or of nothing is refused; a device reads its own
+   account by its digest (`held`), and an account's digest and balance are
+   readable by the agent's callers, as the log's readers see them. The
    s4 facility proves with the stock kernels' release artifacts it
    embeds, never a kernel a server sends (G2), so the s4 demo signs in by
    the stock `auth` kernel alone.

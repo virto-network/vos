@@ -222,13 +222,16 @@ impl LocalSpace {
     }
 
     /// An account opened by the operator's invitation for `owner`, as a
-    /// shop or another member would hold, minted `amount`.
+    /// shop or another member would hold, minted `amount` unless nothing.
     pub fn open_account(&self, account: &str, owner: [u8; 32], amount: u64) -> Result<(), String> {
         let expires = self.now()? + INVITATION_MS;
         let name = account.as_bytes().to_vec();
         self.write(PAYMENTS, "invite", (name.clone(), owner, expires))?;
         self.write(PAYMENTS, "open", (name, owner))?;
-        self.mint(account, amount)
+        match amount {
+            0 => Ok(()),
+            _ => self.mint(account, amount),
+        }
     }
 
     pub fn mint(&self, account: &str, amount: u64) -> Result<(), String> {

@@ -33,7 +33,7 @@ pub enum Message {
 pub struct Screens {
     demo: Demo,
     screen: Screen,
-    /// The name of the device's account, for its balance.
+    /// The name of the account the member claims.
     account: String,
     payee: String,
     amount: String,
@@ -188,11 +188,15 @@ impl Screens {
         match screen {
             Screen::Pay => {
                 self.status = format!("Paid {} to {}{proving}", self.amount, self.payee);
-                cx.effect(service(
-                    "balance",
-                    object([("account", Value::from(self.account.clone()))]),
-                    Message::Balance,
-                ));
+                // The payer's account, read by the owner digest the device
+                // showed: the one it paid from.
+                if let Some((_, owner)) = self.digests {
+                    cx.effect(service(
+                        "balance",
+                        object([("owner", Value::Bytes(owner.to_vec()))]),
+                        Message::Balance,
+                    ));
+                }
             }
             _ => {
                 let pseudonym = Option::<[u8; 32]>::decode_exact(&reply)
@@ -244,16 +248,12 @@ impl App for Screens {
                 let page = page
                     .text("Pay from this device's account")
                     .child(
-                        view::field(self.account.clone(), Message::Account)
-                            .placeholder("Your account's name"),
-                    )
-                    .child(
                         view::field(self.payee.clone(), Message::Payee).placeholder("To account"),
                     )
                     .child(view::field(self.amount.clone(), Message::Amount).placeholder("Amount"))
                     .button("Send the payment", Message::Pay);
                 match &self.balance {
-                    Some(balance) => page.text(format!("Balance of {}: {balance}", self.account)),
+                    Some(balance) => page.text(balance.clone()),
                     None => page,
                 }
             }
@@ -356,7 +356,14 @@ impl App for Screens {
             Message::Proved(screen, output) => self.proved(screen, output, cx),
             Message::Relayed(screen, output) => self.relayed(screen, output, cx),
             Message::Balance(output) => match output {
-                EffectOutput::HostService(Ok(balance)) => self.balance = Some(display(&balance)),
+                EffectOutput::HostService(Ok(held)) => {
+                    self.balance = Some(
+                        match (map_text(&held, "name"), map_unsigned(&held, "balance")) {
+                            (Some(name), Some(balance)) => format!("Balance of {name}: {balance}"),
+                            _ => "This device holds no account".into(),
+                        },
+                    )
+                }
                 other => self.failed(other),
             },
             Message::Refreshed(_) => {}

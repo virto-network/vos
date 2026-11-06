@@ -369,15 +369,21 @@ fn digest(shown: &str) -> [u8; 32] {
 }
 
 /// The stock kernels' release artifacts of this tree's credential actor,
-/// which the space installs.
+/// which the space installs: the ones s4's facility embeds, so a pin of s4
+/// whose artifacts are another credential actor's fails here.
 fn stock() -> Stock {
     let elf = std::fs::read(vos_testkit::programs::credentials_elf()).unwrap();
     let artifact =
         |kernel| vos_wire::Encode::encode(&vos_light::release::device(&elf, kernel).unwrap());
-    Stock {
+    let stock = Stock {
         auth: artifact("auth"),
         owner: artifact("owner"),
-    }
+    };
+    assert!(
+        stock == Stock::embedded(),
+        "s4's embedded stock artifacts are not this tree's: re-pin s4 after `just vos-release`"
+    );
+    stock
 }
 
 /// A local space and its gateway, and a headless client on its SSH port.

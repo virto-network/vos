@@ -1161,11 +1161,12 @@ kernel.
 - **Owner:** the claim `OwnerClaim { owner, binding }` (64 bytes); its
   arguments the secret, then the claim. Asserts `C(T(owner), s) = owner`.
   No path, no balance and no range check: the payer is public
-  [decided]: pay proves knowing `s` behind the row's owner digest, bound
-  to the call. The ledger's handler compares the live row's owner at
-  apply, so a former owner's proof fails once the row changes hands.
-  Revocation does not stop payment; the ledger's `rekey(row, owner)` and
-  `freeze(row)`, under an operator role, do [decided].
+  [decided]: pay proves knowing `s` behind an account's owner digest,
+  bound to the call. The ledger debits the account the digest holds at
+  apply, so a former owner's proof pays from nothing once the account is
+  rekeyed.
+  Revocation does not stop payment; the ledger's `rekey(account, owner)`
+  and `freeze(account)`, under an operator role, do [decided].
 - **The claim binds the proof:** ingress computes `H_io` of the claim
   (no output, no roots) and verifies the proof against it, so a proof
   verifies under its own claim alone. Neither `scope` nor `binding` is

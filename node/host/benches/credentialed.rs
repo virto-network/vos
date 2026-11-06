@@ -143,11 +143,14 @@ fn start(executors: usize) -> Served {
         let expires = vos_node::wall_clock() + 60_000;
         for (name, owner, amount) in [("payer", owner, u64::MAX / 2), ("payee", [1; 32], 0)] {
             let name = name.as_bytes().to_vec();
-            for (method_name, arguments) in [
+            let mut calls = vec![
                 ("invite", (name.clone(), owner, expires).encode()),
                 ("open", (name.clone(), owner).encode()),
-                ("mint", (name.clone(), amount).encode()),
-            ] {
+            ];
+            if amount > 0 {
+                calls.push(("mint", (name.clone(), amount).encode()));
+            }
+            for (method_name, arguments) in calls {
                 let answer = client
                     .call(agent, PAYMENTS, method(&payments, method_name), &arguments)
                     .unwrap();

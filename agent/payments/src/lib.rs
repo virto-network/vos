@@ -1,6 +1,6 @@
 //! `Payments`, the space's ledger paid from by owner proofs
-//! (`light-node.md` §5.2): cipher-clerk's kernel in an actor, its
-//! accounts held by owner digests, one an owner, so one a device. Each
+//! (`light-node.md` §5.2): cipher-clerk's kernel in an actor, one account
+//! per owner digest, so per device. Each
 //! account has a name, its handle for a payee, kept in its row's
 //! `user_data`; `transfer` runs under `#[msg(credential = Owner)]` and
 //! pays from the account of the digest the caller proved, unless it is
@@ -8,24 +8,26 @@
 //! the digest, opened by any caller before it expires; the operator mints
 //! from the space's issuance, moves an account to a new owner (lifting a
 //! freeze) and freezes one. Pseudonymous and custodial by design: payers,
-//! payees and amounts in clear to the operators, and `rekey` an
-//! operator's (`identity-and-authority.md` §7).
+//! payees and amounts in clear to the operators, an account's owner digest
+//! and balance readable by the agent's callers, and `rekey` an operator's
+//! (`identity-and-authority.md` §7).
 
 #![no_std]
 
 extern crate alloc;
 
 use cipher_clerk::codec;
-use cipher_clerk::conventions::BankCode;
+use cipher_clerk::conventions::{AccountKind, BankCode, Holder};
 use cipher_clerk::ids::ExternalId;
 use cipher_clerk::kernel::TransferBuilder;
 use cipher_clerk::{
-    Account, AccountFlags, AccountId, Authority, Authorized, Direction, EventStatus, Journal,
-    JournalId, Layer, LedgerState, PendingStatus, Transfer, TransferId, Value,
+    Account, AccountFlags, AccountId, Authority, Authorized, EventStatus, Journal, JournalId,
+    Layer, LedgerState, PendingStatus, Transfer, TransferId, Value,
 };
 use vos_sdk::prelude::*;
 
-/// An account's name: 1 to [`MAX_NAME`] bytes of UTF-8, shown verbatim.
+/// An account's name: 1 to [`MAX_NAME`] ASCII letters, digits, `.`, `_` or
+/// `-`, shown verbatim.
 pub type Name = Vec<u8>;
 
 /// An owner digest: eight M31 words, as little-endian `u32`s.
@@ -70,7 +72,7 @@ pub struct Invitation {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum PaymentError {
-    /// A name empty, past [`MAX_NAME`] bytes, or not UTF-8.
+    /// A name empty, past [`MAX_NAME`] bytes, or of another character.
     #[codec(index = 0)]
     BadName,
     /// An account of that name, or of that owner, exists.
@@ -94,7 +96,8 @@ pub enum PaymentError {
     /// The payer's account holds less than the amount.
     #[codec(index = 7)]
     Insufficient,
-    /// A balance would pass `u64::MAX`.
+    /// An account's total credits or debits would pass `u64::MAX`: the
+    /// issuance's debits cap all that is ever minted.
     #[codec(index = 8)]
     Overflow,
     /// The kernel refused the transfer for another reason: its
@@ -104,6 +107,12 @@ pub enum PaymentError {
     /// An owner that is not a digest: a word at or above `p`.
     #[codec(index = 10)]
     BadOwner,
+    /// A payment to the payer's own account.
+    #[codec(index = 11)]
+    SamePayee,
+    /// A transfer or a mint of nothing.
+    #[codec(index = 12)]
+    NoAmount,
 }
 
 #[actor]
@@ -120,7 +129,10 @@ pub struct Payments {
 }
 
 fn named(name: &[u8]) -> Result<(), PaymentError> {
-    let fits = (1..=MAX_NAME).contains(&name.len()) && core::str::from_utf8(name).is_ok();
+    let fits = (1..=MAX_NAME).contains(&name.len())
+        && name
+            .iter()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'));
     fits.then_some(()).ok_or(PaymentError::BadName)
 }
 
@@ -221,6 +233,9 @@ impl Payments {
         to: &Account<Value>,
         amount: u64,
     ) -> Result<(), PaymentError> {
+        if amount == 0 {
+            return Err(PaymentError::NoAmount);
+        }
         let transfer = TransferBuilder::new(TransferId(id(self.paid)), JOURNAL)
             .debit(from, Layer::Settled, Value(amount))
             .credit(to, Layer::Settled, Value(amount))
@@ -246,23 +261,29 @@ impl Payments {
         if let Some(issuance) = self.get_account(&ISSUANCE) {
             return Ok(issuance);
         }
-        let issuance = Account::new(
+        let issuance = Account::open(
             ISSUANCE,
+            AccountKind::Asset,
             JOURNAL,
-            ISSUER,
+            Holder::Operator(ISSUER),
             CURRENCY,
             BankCode::Vault,
-            Direction::Debit,
-        );
+        )
+        .expect("the operator holds an asset");
         self.create(now, issuance)?;
         Ok(self.get_account(&ISSUANCE).expect("the issuance"))
     }
 }
 
-/// An account's settled balance: what the space owes its owner.
+/// An account's settled balance: what the space owes its owner, never
+/// below zero (`BALANCE_MUST_NOT_BE_NEGATIVE`).
 fn balance(account: &Account<Value>) -> u64 {
     let settled = account.balance(Layer::Settled);
-    settled.cr.0 - settled.dr.0
+    settled
+        .cr
+        .0
+        .checked_sub(settled.dr.0)
+        .expect("a user account never below zero")
 }
 
 #[messages]
@@ -292,7 +313,7 @@ impl Payments {
         if !canonical(&owner) {
             return Err(PaymentError::BadOwner);
         }
-        if self.names.get(&name).is_some() {
+        if self.names.get(&name).is_some() || self.owners.get(&owner).is_some() {
             return Err(PaymentError::Exists);
         }
         self.invites
@@ -323,14 +344,15 @@ impl Payments {
         let account = AccountId(id(self.opened));
         let mut label = [0; 32];
         label[..name.len()].copy_from_slice(&name);
-        let row = Account::new(
+        let row = Account::open(
             account,
+            AccountKind::Liability,
             JOURNAL,
-            owner,
+            Holder::User(owner),
             CURRENCY,
             BankCode::Checking,
-            Direction::Credit,
         )
+        .expect("a user holds a liability")
         .with_flags(AccountFlags::BALANCE_MUST_NOT_BE_NEGATIVE)
         .with_user_data(label);
         self.create(ctx.now(), row)?;
@@ -383,7 +405,7 @@ impl Payments {
         }
         let (payee, to) = self.named_account(&to).ok_or(PaymentError::NoAccount)?;
         if payee.0 == held.account {
-            return Ok(());
+            return Err(PaymentError::SamePayee);
         }
         let payer = self
             .get_account(&AccountId(held.account))
@@ -401,6 +423,30 @@ impl Payments {
             balance: balance(&account),
             frozen: held.frozen,
         })
+    }
+
+    /// The name and the account the owner digest `owner` holds, if it
+    /// holds one: what a device reads of its own.
+    #[msg]
+    pub async fn held(&self, owner: Owner) -> Option<(Name, Holding)> {
+        let held = self.owners.get(&owner)?;
+        let account = self
+            .get_account(&AccountId(held.account))
+            .expect("a held account");
+        let name = account
+            .user_data
+            .iter()
+            .copied()
+            .take_while(|byte| *byte != 0)
+            .collect();
+        Some((
+            name,
+            Holding {
+                owner,
+                balance: balance(&account),
+                frozen: held.frozen,
+            },
+        ))
     }
 
     /// The balance of `name`, if there is such an account.

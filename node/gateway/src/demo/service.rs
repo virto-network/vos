@@ -67,7 +67,7 @@ fn method_error(_detail: &[u8]) -> String {
 }
 
 /// The names of the ledger's errors, by index.
-const PAYMENT_ERRORS: [&str; 11] = [
+const PAYMENT_ERRORS: [&str; 13] = [
     "a bad account name",
     "the account exists",
     "no such account",
@@ -79,6 +79,8 @@ const PAYMENT_ERRORS: [&str; 11] = [
     "the balance would overflow",
     "the ledger refused",
     "not an owner digest",
+    "a payment to your own account",
+    "an amount of nothing",
 ];
 
 /// A method's outcome, as the screen says it.
@@ -381,23 +383,33 @@ impl Service {
         })
     }
 
-    /// The account's balance, `null` when there is no such account.
+    /// The name and balance of the account the owner digest `owner`
+    /// holds, `null` when it holds none.
     async fn balance(&self, args: &Value) -> Result<Value, HostServiceError> {
         let space = self.space().await?;
-        let account = text(args, "account")?.as_bytes().to_vec();
+        let owner: [u8; 32] = bytes(args, "owner")?
+            .try_into()
+            .map_err(|_| failed("`owner` is 32 bytes"))?;
         let reply = self
             .query(
                 &space.identity,
                 self.demo.payments,
-                "balance",
-                account.encode(),
+                "held",
+                owner.encode(),
                 payment_error,
             )
             .await?;
-        Ok(match Option::<u64>::decode_exact(&reply) {
-            Some(Some(balance)) => Value::from(balance),
+        type Held = Option<(Vec<u8>, ([u8; 32], u64, bool))>;
+        Ok(match Held::decode_exact(&reply) {
+            Some(Some((name, (_, balance, _)))) => object([
+                (
+                    "name",
+                    Value::from(String::from_utf8_lossy(&name).into_owned()),
+                ),
+                ("balance", Value::from(balance)),
+            ]),
             Some(None) => Value::Null,
-            None => return Err(failed("the balance does not decode")),
+            None => return Err(failed("the account does not decode")),
         })
     }
 

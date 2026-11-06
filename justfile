@@ -268,8 +268,9 @@ build-final-verify: (_venue-guest "vos-statement" "final-verify" "pvm-guest") (_
 # relocations stripped (the toolchain's `rust-objcopy`): an out-of-tree
 # workspace's symbol names hash its path dependencies' absolute paths
 # (cargo's `-C metadata`), so its symbol table differs between checkouts
-# while its code does not. The agent's programs and the Wasm blobs, whose
-# code that hash orders, are built from a fixed path (`_at-fixed-path`).
+# while its code does not. The agent's programs, the test actors and the
+# Wasm blobs, whose code that hash orders, are built from a fixed path
+# (`_at-fixed-path`).
 _blob-hashes:
     if ($env.CARGO_TARGET_DIR? | is-not-empty) { error make { msg: "the blobs are hashed where the recipes build them: unset CARGO_TARGET_DIR" } }; let fixed = ["target/riscv64em-vos/release/final-verify.elf" "target/riscv64em-vos/release/final-verify-test.elf" "target/riscv64em-vos/release/statement-service.elf" "agent/programs/target/riscv64em-vos/release/vos-agent.elf" "agent/programs/target/riscv64em-vos/release/vos-representative.elf" "agent/programs/target/riscv64em-vos/release/vos-credentials.elf" "agent/programs/target/riscv64em-vos/release/vos-personal.elf" "agent/programs/target/riscv64em-vos/release/vos-payments.elf" "pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm" "pvm/proof/final-verifier/wasm/blob/target/test-formats/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm"]; let actors = (cargo metadata --manifest-path agent/test-actors/Cargo.toml --no-deps --format-version 1 | from json | get packages.targets | flatten | where {|target| "bin" in $target.kind } | get name | sort | each {|name| $"agent/test-actors/target/riscv64em-vos/release/($name).elf" }); let sysroot = (rustc --print sysroot | str trim); let objcopy = ($sysroot | path join lib rustlib (rustc -vV | lines | parse "host: {host}" | get host.0) bin rust-objcopy); let stripped = (mktemp -t); for path in ($fixed ++ $actors) { with-env { LD_LIBRARY_PATH: ($sysroot | path join lib) } { ^$objcopy --strip-all $path $stripped }; print $"(open --raw $stripped | hash sha256)  ($path)" }; rm $stripped
 
