@@ -31,6 +31,7 @@ fn open(dir: &std::path::Path, agent: &[u8]) -> Light {
         naming: NAMING,
         scopes: Vec::new(),
         keys: Vec::new(),
+        recovery: None,
     };
     light.store().adopt(&shared).unwrap();
     light

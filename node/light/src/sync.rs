@@ -26,6 +26,7 @@ use vos_wire::merge::{Cutoff, Origin};
 use vos_wire::records::{stored, unstored};
 
 /// The hash a scope's nodes are named by: BLAKE2b-256.
+#[derive(Debug)]
 pub struct Blake2b256;
 
 impl merkle_crdt::Hasher for Blake2b256 {
@@ -197,7 +198,7 @@ pub fn apply_node<E: From<CorruptRow>>(
 /// batch.
 pub(crate) struct ScopeStore {
     inner: FjallStore,
-    staged: Vec<(Keyspace, Vec<u8>, Vec<u8>)>,
+    staged: Vec<(Keyspace, Vec<u8>, Option<Vec<u8>>)>,
 }
 
 impl ScopeStore {
@@ -208,8 +209,9 @@ impl ScopeStore {
         }
     }
 
-    /// Stage `value` under `key` in `keyspace` for the next commit.
-    pub(crate) fn stage(&mut self, keyspace: &Keyspace, key: &[u8], value: Vec<u8>) {
+    /// Stage `value` under `key` in `keyspace` for the next commit; `None`
+    /// deletes it.
+    pub(crate) fn stage(&mut self, keyspace: &Keyspace, key: &[u8], value: Option<Vec<u8>>) {
         self.staged.push((keyspace.clone(), key.to_vec(), value));
     }
 
@@ -255,7 +257,10 @@ impl Store<Blake2b256> for ScopeStore {
         self.inner
             .commit_with(changes, |batch: &mut OwnedWriteBatch| {
                 for (keyspace, key, value) in staged {
-                    batch.insert(&keyspace, key, value);
+                    match value {
+                        Some(value) => batch.insert(&keyspace, key, value),
+                        None => batch.remove(&keyspace, key),
+                    }
                 }
             })
     }

@@ -16,6 +16,12 @@
 //!   each candidate processed on a copy and confirmed by the devices'
 //!   signed votes; data keys exported at the confirmed epoch, and the key
 //!   archive.
+//! - **Sealed sync** ([`personal`]): each scope's nodes sealed at push
+//!   under the confirmed epoch's key ([`sealed`]), the push queue keeping
+//!   the sealed bytes; each scope read by its cursor at the personal agent,
+//!   every envelope opened and its node applied; the archive pushed at each
+//!   confirmed epoch, and the recovery envelopes under `R`; over the onion
+//!   alone.
 //!
 //! **The device library** (`docs/design/proving.md` §8): what the phone
 //! runs to prove facts about its device secret to its space's ingress, and
@@ -61,8 +67,10 @@ pub mod group;
 mod kernel;
 mod light;
 mod path;
+pub mod personal;
 mod prover;
 pub mod release;
+pub mod sealed;
 mod secret;
 pub mod store;
 pub mod sync;
@@ -73,7 +81,7 @@ pub use call::{Call, NAME_BYTES, method_id, scope, transfer_arguments};
 pub use kernel::{
     DEVICE_FORMAT, DEVICE_PEAK_BYTES, DeviceProgram, DeviceProof, auth_io, choose, verify_device,
 };
-pub use light::{Config, Error, LOCAL, Light, ScopeError};
+pub use light::{Config, Error, LOCAL, Light, MAX_ARGUMENTS, Queued, ScopeError};
 pub use path::PathKeeper;
 pub use prover::{
     CredentialProof, CredentialPublic, JointProof, JointPublic, PEAK_BYTES, Prover, ProverConfig,

@@ -877,6 +877,20 @@ impl DeviceGroup {
         &self.archive
     }
 
+    /// The personal agent its commits go through.
+    pub fn agent(&self) -> Agent {
+        self.state.agent
+    }
+
+    /// Hold `R`, drawn by the claim or the kit rotation logged at `since`,
+    /// in the archive: the recovery envelopes are sealed under it. An `R`
+    /// of a later rotation already held stands.
+    pub fn set_recovery(&mut self, since: u64, r: [u8; 32]) -> Result<(), GroupError> {
+        let mut theirs = self.archive.clone();
+        theirs.recovery = Some(archive::Recovery { since, r });
+        self.merge_archive(&theirs)
+    }
+
     /// What the device group stores, in bytes: its MLS group state, what
     /// it keeps of the log, and the key archive.
     pub fn stored_bytes(&self) -> Result<(usize, usize, usize), GroupError> {

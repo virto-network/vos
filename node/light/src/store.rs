@@ -27,7 +27,7 @@ use std::sync::Arc;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable};
 use vos_exec::{ProgramStore, StateReader};
 use vos_wire::apply::State;
-use vos_wire::ids::AgentId;
+use vos_wire::ids::{AgentId, InstanceId};
 use vos_wire::{Decode, Encode};
 
 use crate::group::Archive;
@@ -47,6 +47,9 @@ const AUTHOR_ROW: &[u8] = b"author";
 pub(crate) const ARCHIVE_ROW: &[u8] = b"g/archive";
 /// Set once a scope's id is derived from the archive's naming secret.
 const SCOPED_ROW: &[u8] = b"g/scoped";
+/// The push queue's rows, in the meta keyspace: an instance's sealed
+/// envelopes by its nodes' sequence numbers.
+const QUEUE: &[u8] = b"queue/";
 
 /// An installed program: its hash and its bytes.
 pub type Program = ([u8; 32], Vec<u8>);
@@ -221,6 +224,65 @@ impl Store {
         batch.insert(&self.0.group, ARCHIVE_ROW, archive.encode());
         batch.durability(Some(PersistMode::SyncAll)).commit()?;
         Ok(true)
+    }
+
+    /// Write `rows` of the group keyspace, synced: `None` deletes.
+    pub(crate) fn write_group_rows(
+        &self,
+        rows: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    ) -> Result<(), StoreError> {
+        let mut batch = self.0.db.batch();
+        for (key, value) in rows {
+            match value {
+                Some(value) => batch.insert(&self.0.group, key, value),
+                None => batch.remove(&self.0.group, key),
+            }
+        }
+        Ok(batch.durability(Some(PersistMode::SyncAll)).commit()?)
+    }
+
+    /// The push queue's key for `instance`'s node `seq`, in the meta
+    /// keyspace.
+    pub(crate) fn queue_key(&self, instance: InstanceId, seq: u64) -> (&Keyspace, Vec<u8>) {
+        let mut key = QUEUE.to_vec();
+        key.extend_from_slice(&instance.0.to_be_bytes());
+        key.extend_from_slice(&seq.to_be_bytes());
+        (&self.0.meta, key)
+    }
+
+    /// `instance`'s queued envelopes, by their nodes' sequence numbers.
+    pub(crate) fn queued(&self, instance: InstanceId) -> Result<Vec<(u64, Vec<u8>)>, StoreError> {
+        let (_, prefix) = self.queue_key(instance, 0);
+        let prefix = &prefix[..QUEUE.len() + 4];
+        let mut queued = Vec::new();
+        for row in self.0.meta.prefix(prefix) {
+            let (key, value) = row.into_inner()?;
+            let seq =
+                <[u8; 8]>::try_from(&key[prefix.len()..]).map_err(|_| StoreError::Layout(None))?;
+            queued.push((u64::from_be_bytes(seq), value.to_vec()));
+        }
+        Ok(queued)
+    }
+
+    /// Queue `value` for `instance`'s node `seq`, synced, before it is sent.
+    pub(crate) fn enqueue(
+        &self,
+        instance: InstanceId,
+        seq: u64,
+        value: Vec<u8>,
+    ) -> Result<(), StoreError> {
+        let (meta, key) = self.queue_key(instance, seq);
+        let mut batch = self.0.db.batch();
+        batch.insert(meta, key, value);
+        Ok(batch.durability(Some(PersistMode::SyncAll)).commit()?)
+    }
+
+    /// Delete `instance`'s queued envelope of node `seq`, synced.
+    pub(crate) fn dequeue(&self, instance: InstanceId, seq: u64) -> Result<(), StoreError> {
+        let (meta, key) = self.queue_key(instance, seq);
+        let mut batch = self.0.db.batch();
+        batch.remove(meta, key);
+        Ok(batch.durability(Some(PersistMode::SyncAll)).commit()?)
     }
 
     /// The local agent's rows' keyspace, a scope's rows too.

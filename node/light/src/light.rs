@@ -44,6 +44,20 @@ use crate::sync::{self, Blake2b256, Call, CorruptRow, Mirrored, Op, Ops, ScopeSt
 /// sees it.
 pub const LOCAL: AgentId = AgentId(1);
 
+/// The most bytes of arguments a call takes: its node, sealed with its
+/// writer's view and `seen` positions, fits one envelope
+/// ([`crate::sealed::MAX_BODY`]) with room for its parents. Larger objects
+/// are chunked by the actor, an operation a chunk.
+pub const MAX_ARGUMENTS: usize = 48 << 10;
+
+/// A local node sealed for its push: the epoch it was sealed under, and
+/// the envelope, sent as it is until it is taken or refused for its epoch.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Queued {
+    pub epoch: u64,
+    pub envelope: Vec<u8>,
+}
+
 /// How the light node runs.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -96,6 +110,8 @@ pub enum Error {
     /// A scope of an instance not installed here: no handler could run its
     /// nodes.
     NotInstalled,
+    /// A call's arguments past [`MAX_ARGUMENTS`]: nothing was recorded.
+    TooLarge,
 }
 
 impl From<StoreError> for Error {
@@ -137,6 +153,7 @@ impl std::fmt::Display for Error {
             ),
             Error::NotApplied => f.write_str("the operation's result does not apply"),
             Error::NotInstalled => f.write_str("the instance is not installed"),
+            Error::TooLarge => write!(f, "a call's arguments past {MAX_ARGUMENTS} bytes"),
         }
     }
 }
@@ -310,6 +327,9 @@ impl Light {
         method: MethodId,
         arguments: Vec<u8>,
     ) -> Result<Outcome, Error> {
+        if arguments.len() > MAX_ARGUMENTS {
+            return Err(Error::TooLarge);
+        }
         let mut writing = self.writing();
         let snapshot = self.store.snapshot();
         if snapshot.get(&keys::installed(instance))?.is_none() {
@@ -324,7 +344,7 @@ impl Light {
         })];
         let scope = self.scope(&mut writing, instance)?;
         let (meta, key, last) = self.store.last_row(time, &seed);
-        scope.store_mut().stage(meta, key, last);
+        scope.store_mut().stage(meta, key, Some(last));
         let mut merging = Merging::new(self, instance, snapshot, true);
         let recorded = scope.record(&self.key, ops, &mut merging);
         scope.store_mut().unstage();
@@ -376,6 +396,57 @@ impl Light {
         let mut writing = self.writing();
         let scope = self.scope(&mut writing, instance)?;
         Ok(scope.pushed(nodes)?)
+    }
+
+    /// The position of the agent's feed `instance`'s scope was read to:
+    /// none before its first page.
+    pub fn cursor(&self, instance: InstanceId) -> Result<Option<u64>, Error> {
+        let mut writing = self.writing();
+        Ok(self.scope(&mut writing, instance)?.cursor())
+    }
+
+    /// `instance`'s push queue: its local nodes sealed and not yet taken,
+    /// by sequence number.
+    pub fn queued(&self, instance: InstanceId) -> Result<Vec<(u64, Queued)>, Error> {
+        self.store
+            .queued(instance)?
+            .into_iter()
+            .map(|(seq, value)| Ok((seq, Queued::decode_exact(&value).ok_or(CorruptRow)?)))
+            .collect()
+    }
+
+    /// Queue `queued` for `instance`'s local node `seq`, synced: written
+    /// before it is sent, so a retry after a crash sends the same bytes.
+    pub fn enqueue(&self, instance: InstanceId, seq: u64, queued: &Queued) -> Result<(), Error> {
+        let _writing = self.writing();
+        Ok(self.store.enqueue(instance, seq, queued.encode())?)
+    }
+
+    /// The agent took `instance`'s local node `seq`: it and its author's
+    /// earlier nodes are pushed, and its queued envelope deleted, in one
+    /// batch.
+    pub fn sent(&self, instance: InstanceId, seq: u64) -> Result<(), Error> {
+        let mut writing = self.writing();
+        let author = self.author();
+        let scope = self.scope(&mut writing, instance)?;
+        let (meta, key) = self.store.queue_key(instance, seq);
+        let outgoing = scope
+            .outbox()
+            .map_err(Error::Scope)?
+            .iter()
+            .any(|node| node.author == author && node.seq <= seq);
+        scope.store_mut().stage(meta, &key, None);
+        let pushed = if outgoing {
+            scope.pushed(&[(author, seq)]).map_err(Error::from)
+        } else {
+            Ok(())
+        };
+        scope.store_mut().unstage();
+        pushed?;
+        if !outgoing {
+            self.store.dequeue(instance, seq)?;
+        }
+        Ok(())
     }
 
     /// Each author's highest sequence number applied in `instance`'s

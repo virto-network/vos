@@ -1,6 +1,6 @@
 //! The key archive (`light-node.md` §3.4): the naming secret, from which
-//! every scope's id derives, and every scope key of every confirmed epoch,
-//! a union indexed by epoch. A device keeps it in its store; a new device
+//! every scope's id derives, every scope key of every confirmed epoch, a
+//! union indexed by epoch, and the recovery wrap key `R` (§3.5). A device keeps it in its store; a new device
 //! receives it over the pairing channel; sealed under an epoch's archive
 //! key it travels to the agent. Archives that disagree keep every
 //! candidate key, and the AEAD decides.
@@ -33,14 +33,24 @@ pub fn scope_id(naming: &[u8; 32], name: &[u8]) -> Scope {
 /// The candidate keys of one scope in one epoch.
 pub type Keys = ((u64, Scope), Vec<[u8; 32]>);
 
+/// The recovery wrap key `R = R1 ⊕ R2`, which recovery envelopes are
+/// sealed under, and the control log's index of the claim or kit rotation
+/// that drew it: of two, the later stands.
+#[derive(Clone, Copy, PartialEq, Eq, Encode, Decode)]
+pub struct Recovery {
+    pub since: u64,
+    pub r: [u8; 32],
+}
+
 /// The archive: the naming secret, the scopes whose keys it records at
-/// each confirmed epoch, and the keys, each `(epoch, scope)` with every
-/// candidate key archives disagreeing on.
+/// each confirmed epoch, the keys, each `(epoch, scope)` with every
+/// candidate key archives disagreeing on, and `R`, once the claim drew it.
 #[derive(Clone, PartialEq, Eq, Encode, Decode)]
 pub struct Archive {
     pub naming: [u8; 32],
     pub scopes: Vec<Scope>,
     pub keys: Vec<Keys>,
+    pub recovery: Option<Recovery>,
 }
 
 impl std::fmt::Debug for Archive {
@@ -48,6 +58,7 @@ impl std::fmt::Debug for Archive {
         f.debug_struct("Archive")
             .field("scopes", &self.scopes.len())
             .field("keys", &self.keys.len())
+            .field("recovery", &self.recovery.map(|recovery| recovery.since))
             .finish_non_exhaustive()
     }
 }
@@ -62,6 +73,7 @@ impl Archive {
             naming,
             scopes: Vec::new(),
             keys: Vec::new(),
+            recovery: None,
         })
     }
 
@@ -105,8 +117,14 @@ impl Archive {
     }
 
     /// The union of this archive and `other`: every scope and every key of
-    /// either. The naming secret stays this archive's.
+    /// either, and the later `R`. The naming secret stays this archive's.
     pub fn merge(&mut self, other: &Archive) {
+        if other
+            .recovery
+            .is_some_and(|theirs| self.recovery.is_none_or(|mine| theirs.since > mine.since))
+        {
+            self.recovery = other.recovery;
+        }
         for scope in &other.scopes {
             self.track(*scope);
         }
@@ -143,6 +161,9 @@ impl Drop for Archive {
         self.naming.zeroize();
         for (_, keys) in &mut self.keys {
             keys.zeroize();
+        }
+        if let Some(recovery) = &mut self.recovery {
+            recovery.r.zeroize();
         }
     }
 }

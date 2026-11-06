@@ -20,7 +20,7 @@ pub struct Phone {
     pub sync: SigningKey,
     pub admin: SigningKey,
     pub keys: NewDevice,
-    _dir: tempfile::TempDir,
+    pub _dir: tempfile::TempDir,
 }
 
 impl Phone {
