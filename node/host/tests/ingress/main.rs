@@ -11,6 +11,7 @@ mod admission;
 mod api;
 mod operator;
 mod operator_api;
+mod personal;
 mod quic;
 mod requests;
 mod sessions;

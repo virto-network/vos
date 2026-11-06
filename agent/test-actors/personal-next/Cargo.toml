@@ -1,0 +1,18 @@
+# The personal agent's actor as its next version would be, for the test
+# that installs it over a populated agent: the same tables, answering a
+# later version.
+[package]
+name = "personal-next"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "personal-next"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+vos-sdk = { workspace = true }
+vos-personal = { path = "../../personal", features = ["next"] }

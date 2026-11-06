@@ -9,6 +9,7 @@ mod hosts;
 mod jam;
 mod limits;
 mod messages;
+mod personal;
 mod pricing;
 mod reads;
 mod representative;

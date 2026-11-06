@@ -1,12 +1,13 @@
 # The agent's guest programs, built for the PVM with the guest toolchain,
 # each alone: the default agent (`just build-agent`), the space's
-# representative (`just build-representative`) and the credential actor
-# (`just build-credentials`). One lockfile, toolchain, target configuration
-# and release profile for the three; no `.cargo/config.toml` above it, whose
+# representative (`just build-representative`), the credential actor
+# (`just build-credentials`) and the personal agent's actor (`just
+# build-personal`). One lockfile, toolchain, target configuration and
+# release profile for the four; no `.cargo/config.toml` above it, whose
 # `build-std` would reach the host crates under `agent/`.
 [workspace]
 resolver = "3"
-members = ["../default", "../representative", "../credentials"]
+members = ["../default", "../representative", "../credentials", "../personal"]
 
 [profile.release]
 opt-level = 3

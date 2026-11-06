@@ -1,5 +1,6 @@
 //! The guest programs this repository builds (`just build-agent
-//! build-representative build-credentials build-test-actors`), linked or
+//! build-representative build-credentials build-personal
+//! build-test-actors`), linked or
 //! derived as an install derives them, and their methods by name: for the
 //! tests and benches of the testkit and of the node.
 
@@ -17,7 +18,8 @@ fn guest(path: &str) -> PathBuf {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(path);
     assert!(
         path.exists(),
-        "{}: run `just build-agent build-representative build-credentials build-test-actors`",
+        "{}: run `just build-agent build-representative build-credentials build-personal \
+         build-test-actors`",
         path.display()
     );
     path
@@ -41,6 +43,16 @@ pub fn representative_package() -> Vec<u8> {
 /// The credential actor's ELF.
 pub fn credentials_elf() -> PathBuf {
     guest("programs/target/riscv64em-vos/release/vos-credentials.elf")
+}
+
+/// The personal agent's actor's ELF.
+pub fn personal_elf() -> PathBuf {
+    guest("programs/target/riscv64em-vos/release/vos-personal.elf")
+}
+
+/// The personal agent's actor's package, as its crate builds it.
+pub fn personal_package() -> Vec<u8> {
+    read(&personal_elf())
 }
 
 /// Test actor `name`'s ELF.
@@ -118,6 +130,11 @@ pub fn actor(name: &str) -> Vec<u8> {
 /// The credential actor, linked.
 pub fn credentials() -> Vec<u8> {
     link(&credentials_elf())
+}
+
+/// The personal agent's actor, linked.
+pub fn personal() -> Vec<u8> {
+    link(&personal_elf())
 }
 
 /// The default agent, linked, and the counter actor, linked and as its

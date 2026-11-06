@@ -1,0 +1,30 @@
+# The personal agent's actor (`light-node.md` §3.3–§3.7), installed in each
+# agent of a home's pool, built for the PVM with the guest toolchain:
+# `just build-personal`.
+[package]
+name = "vos-personal"
+version = "0.1.0"
+edition = "2024"
+publish = false
+workspace = "../programs"
+
+[lib]
+name = "vos_personal"
+path = "src/lib.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "vos-personal"
+path = "src/main.rs"
+test = false
+bench = false
+
+[features]
+# The next version of the layout's test (`agent/test-actors/personal-next`):
+# the same tables, answering a later version.
+next = []
+
+[dependencies]
+vos-sdk = { path = "../sdk" }
+vos-wire = { path = "../wire" }
