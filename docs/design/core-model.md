@@ -99,7 +99,7 @@ builds. Each gives its date.
 | Lane | A field's state class: Linear (agent log) or Merge (CRDT). |
 | Machine pool | The node's reusable machines, keyed by program hash and reset between uses. |
 | Precompile | A pure memory transform (hash, curve operation) a guest invokes with `ecalli`; served natively by VOS nodes and proven by a dedicated chip. |
-| Origin | Who a logged input acts for, as the agent sees it: a client's key, an agent, the calling instance, or a credential proof's pseudonym or owner digest (`Principal`). |
+| Origin | Who a logged input acts for, as the agent sees it: a client's key, an agent, the calling instance, or a proven call's pseudonym, owner digest or kernel program (`Principal`). |
 
 ## 5. Trust model [decided]
 
@@ -637,18 +637,19 @@ Why handlers run to completion:
   batch is decoded, so nodes that reserve differently refine a batch
   differently.
 
-### 8.6 Credentialed calls and origins [decided]
+### 8.6 Proven calls and origins [decided]
 
 `identity-and-authority.md` §5 pins them; the core model's part:
 - **The origins** are the logged caller's variants (`vos_wire::ids::Principal`):
   `Client(key)` 0, `Agent(id)` 1, `Instance(id)` 2, `Anonymous { scope,
-  nullifier }` 3 (an auth credential proof's pseudonym in its scope) and
-  `Owner(digest)` 4 (an owner proof's digest); `Identity` 5 and `Jam` 6
-  reserved. No role is ever granted to `Anonymous` or `Owner`.
+  nullifier }` 3 (the stock auth kernel's pseudonym in its scope),
+  `Owner(digest)` 4 (the stock owner kernel's digest) and `Kernel {
+  program }` 7 (an actor kernel's program); `Identity` 5 and `Jam` 6
+  reserved. No role is ever granted to `Anonymous`, `Owner` or `Kernel`.
 - **The request** is the node API's `Credentialed` (kind `0x0104`, a
   gateway's `POST /agents/{agent}/credentialed`): an instance, a method,
   its arguments, a nonce, an expiry by the node's clock (the API's `Time`
-  request), the proof's format, its public words and the proof. Its kind
+  request), the proof's format, the kernel's claim and the proof. Its kind
   is read before its body, so the node sizes it first (at most 1.5 MiB
   plus `cap::REQUEST` plus 4 KiB). Ingress runs its checks in order on
   the replica's applied state, verifies the proof on an executor within a
@@ -656,18 +657,23 @@ Why handlers run to completion:
   agent's leader.
 - **No session:** the log carries `Input::Credentialed` (index 10), the
   session-less kind: the origin, the call, the binding digest `b`, the
-  expiry and auth's root, never the proof, the nonce or the format, so a
-  log entry's size is unchanged. Exactly-once is the binding's, not a
+  expiry and the claim (at most 1 KiB), never the proof, the nonce or the
+  format. Exactly-once is the binding's, not a
   sequence's: apply records `binding(b) → expires_ms` whatever the method
-  does, swept 60 s past the expiry through the due index, and refuses a
-  recorded `b` (`Replayed`, without the first call's outcome). A refused
+  does, swept 60 s past the expiry through the bindings' due index, and
+  refuses a recorded `b` (`Replayed`, without the first call's outcome);
+  a batch runs at most 64 proven calls, as many as a sweep forgets. A refused
   input writes nothing, so a proof replayed at another replica runs once.
 - **The guards** live in the method's schema (`MethodSchema::credential`):
   `#[msg(credential = Auth("login"))]` admits `Anonymous` origins of that
-  scope name, `#[msg(credential = Owner)]` admits `Owner` origins (the
-  handler compares the digest with the live row it debits); a method
-  without one refuses both. An `Auth` guard needs its agent's credential
-  actor, found through the system row `credentials → instance`.
+  scope name, proven by the stock auth kernel; `#[msg(credential =
+  Owner)]` or `#[msg(proven = owner)]` admits `Owner` origins, proven by
+  the stock owner kernel (the handler compares the digest with the live
+  row it debits); `#[msg(proven = k)]` names one of the actor's own device
+  kernels and admits `Kernel` origins, the handler taking the claim first;
+  a method without one refuses them all. A stock guard needs its agent's
+  credential actor, found through the system row `credentials →
+  instance`.
 - **The `once` guard** [decided]: `#[msg(credential = Auth("vote"),
   once)]` admits a nullifier once in its scope (space, agent, instance,
   name), so no handler keeps its own set; apply records `once(scope ‖
@@ -675,9 +681,8 @@ Why handlers run to completion:
   same apply, so a failed or refused call leaves the member free to try
   again with a new proof. The binding is recorded whatever the handler
   does, so a replay is still refused.
-- **Device proofs** authorize what an auth proof does [decided]: a
-  guard's `device = "..."` names the device kernel (section 11.1) whose
-  proofs it also takes, verified against the program every node computes
+- **Every proof is a device proof** [decided]: of the kernel the guard
+  names (section 11.1), verified against the program every node computes
   from the installed kernel.
 
 ## 9. State
@@ -1170,8 +1175,8 @@ outbox sequence numbers, which receivers deduplicate.
   (`vos_sdk::device::DeviceReturn`) writes the public arguments and the
   output once and hashes them in place. No node attests one: the agent
   refuses `Attest` of a `Device` method before its kernel runs, and a
-  workflow's attest of one does not compile. A credential guard names it
-  (`device = "..."`), and ingress verifies its proofs (section 8.6). Its
+  workflow's attest of one does not compile. A guard names it
+  (`proven = k`), and ingress verifies its proofs (section 8.6). Its
   install record keeps a node segment shape, never proved; the node
   computes its device program from the installed kernel and its
   reference program instead (`light-node.md` §4.4), and its guard admits

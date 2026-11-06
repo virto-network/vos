@@ -67,13 +67,9 @@ and what a node does with one is `node/SECURITY.md`'s.
   it, and the caller zeroizes its Rust copy once `derive_secret` returns.
 - **What the library zeroizes:** the derivation's 64-byte `w` and each
   wide word; `DeviceSecret` on drop (no `Clone`, no `Debug`); the
-  nullifier's key `C(T(nf), s)`; the secret's words in the circuit's
-  statement after each proof, a panic unwinding included; the circuit's
-  private values (every row of the witness but its public outputs) once
-  the prover has taken them; a device kernel's arguments (the secret's
+  nullifier's key `C(T(nf), s)`; a kernel's arguments (the secret's
   bytes and the path) once its run is proved.
-- **What it does not:** the circuit builder's own copy of the values
-  (recair's `Context`), a device kernel's traced run (its witness pages,
+- **What it does not:** a kernel's traced run (its witness pages,
   registers and memory ledger, which hold the secret's bytes) and its
   main trace, the prover's trace and its masked polynomials,
   which hold the secret's words and every value derived from it, are
@@ -109,9 +105,9 @@ and what a node does with one is `node/SECURITY.md`'s.
   library's default build and in every production build.
 - **`AuthWitness`'s `Debug` shows nothing** of its root, slot or
   siblings, which place the member's leaf.
-- **A proof's shape is the statement's:** every component pads to the
-  masking's floor, and the auth circuit walks its path with selects, so
-  its rows do not depend on the slot or the secret.
+- **A proof's shape is the program's:** every chip pads to its log size
+  in the release, and the stock auth kernel walks its path with selects,
+  so its rows do not depend on the slot or the secret.
 
 ## The witness and the call
 
@@ -120,12 +116,12 @@ and what a node does with one is `node/SECURITY.md`'s.
   prover refuses a witness word at or above p.
 - **The scope and the binding are computed here** from the `Call` and the
   guard's name, so a client never assembles them; the binding names the
-  space, agent, instance, method, the statement's program and kind, the
-  arguments, the nonce and the expiry. `Call::new` draws the nonce from
-  the operating system.
-- **The joint statement** (membership and payment) binds the kind byte
-  `0xff`, which no `CredentialPublic` takes, and its own program id: no
-  ingress admits it, and its proof authorizes nothing under auth or owner.
+  space, agent, instance, method, the kernel's program, the arguments,
+  the nonce and the expiry, and the claim carries it last. `Call::new`
+  draws the nonce from the operating system.
+- **The claim is computed here** from the secret, the witness and the
+  call, and the proof is checked to state its io-hash before it is
+  returned.
 
 ## Paths, and what fetching them shows
 

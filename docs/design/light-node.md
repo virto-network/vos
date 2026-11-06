@@ -1274,7 +1274,8 @@ with proofs of about 0.2 MB, verified in about 2.0 ms [measured,
 `node/SECURITY.md`]. It is a hand-written circuit over the recursion AIR's
 `p2` and `qm31`: every statement change is a circuit change, a re-pin and
 a new fixture. It is retired, and every device statement becomes a device
-kernel [proposed, the owner's direction].
+kernel [built: the credential AIR and format 44 deleted, the stock
+kernels proving auth and owner].
 
 **Deleted** (at `543c05e07`, about 3,200 lines and one wire enum's arms):
 - `pvm/proof/recair/src/credential/` (`mod.rs`, `circuit.rs`: 609 lines);
@@ -1288,7 +1289,8 @@ kernel [proposed, the owner's direction].
 - the fuzz target `credential_verify_bytes`;
 - in `vos-device`: `prove_auth`, `prove_owner`,
   `prove_membership_and_payment`, `verify`, `verify_joint`,
-  `CredentialProof`'s format-44 path, `PEAK_BYTES`' credential figure;
+  `CredentialProof`'s format-44 path, `PEAK_BYTES`' credential figure
+  (`prove_auth` and `prove_owner` are the stock kernels' now);
 - in the node: ingress's format-44 branch and its constants;
   `vos_pvm_proof::format::CREDENTIAL_PROOF` (44 leaves the registry; the
   numbering itself is reset before the first release, `open.md`,
@@ -1418,19 +1420,22 @@ writes (the `sdk-device` test actor's `auth` and `owner`):
 
 ### 4.3 What the node checks at ingress
 
-**Credentialed calls generalize to proven calls.** Today a credentialed
-call carries a `CredentialPublic` (`Auth` or `Owner`) and a format that
-picks the circuit; ingress knows each kind's checks
-(`identity-and-authority.md` §5, its 17 checks). Proposed:
+**Credentialed calls generalize to proven calls** [built,
+`identity-and-authority.md` §5, `node/SECURITY.md`]. A credentialed call
+carried a statement's kind and its public words, and a format that
+picked the circuit; a proven call carries the kernel's claim:
 - **The request** keeps kind `0x0104` and its envelope (instance, method,
   arguments, nonce, expiry, format, proof) and replaces `public:
   CredentialPublic` with `claim: Vec<u8>`, the kernel's public arguments
   in their SCALE encoding. The format is 46 (or its successor) alone.
-- **The guard names the kernel:** `#[msg(proven = auth)]`,
-  `#[msg(proven = spend)]`, naming a device kernel of this actor or of the
-  agent's credential actor. `#[msg(credential = Auth("login"))]` and
+- **The guard names the kernel:** `#[msg(proven = spend)]`, naming a
+  device kernel of this actor, or `#[msg(proven = owner)]`, the
+  credential actor's. `#[msg(credential = Auth("login"))]` and
   `#[msg(credential = Owner)]` stay as the SDK's sugar for the stock
-  kernels, so purses-style code reads as today.
+  kernels, so purses-style code reads as today. The stock auth kernel is
+  named through `credential = Auth("name")` alone, since its scope needs
+  the guard's name: `proven = auth` is refused, naming that form, unless
+  the actor has its own kernel `auth`, whose name comes first [built].
 - **Ingress's generic checks,** in order: the frame, the decode, the
   agent, the space, the format, the sizes, the expiry, the method and its
   guard; then **the binding**: the claim's last field is `C(T(binding),
@@ -1462,15 +1467,35 @@ picks the circuit; ingress knows each kind's checks
   check and the handler's typed argument both read it; a log entry grows
   by at most the cap.
 - **Verification cost and denial of service:** a device proof verifies in
-  about 11.7 ms on one x86 core and a wrong PoW is refused in 8.0 ms,
-  against 2.0 ms and 0.7 ms for format 44 [measured, `node/SECURITY.md`]:
-  the same budget admits about a sixth as many proofs a second. A wrong
-  *interaction* PoW, checked before the composition, already costs 5.8 ms
-  [measured], so moving the PoW earlier saves about 2 ms, not 7; the bulk
-  is the decode, its canonical re-encoding and the verifier's setup, to be
-  profiled before any target is set (plan 8.5). The levers of §4.4 shrink
-  the columns the verifier reads and so its time. Over Tor, the gateway's
-  onion-service defences replace per-address limits (§6.6).
+  about 11.7 ms on one quiet x86 core [measured, `node/SECURITY.md`],
+  about six times a format-44 proof's 2.0 ms. **Profiled** [measured,
+  Intel Core Ultra 7 155H, one thread, load average 7–21, 2026-11-06;
+  `cargo run --release -p vos-phone --example device_ingress`]: the
+  verifier's setup, the program's masked format and layout computed per
+  proof, took 6.6 ms, and the canonical decode 4.2 ms, of which the
+  re-encoding 2.5 ms; a wrong interaction PoW was refused after both. So
+  the masked format is computed once (the layout, cheaper, still per
+  proof), when a program is installed or pinned,
+  and a **pre-check** before the decode reads the proof's leading fields
+  (its format, its interaction PoW, its claimed sums, its configuration
+  and its roots) and checks the interaction PoW over the program, the
+  first two roots and the io-hash, as the verifier's transcript mixes
+  them [built]: a wrong interaction PoW, a main root changed, or an honest
+  proof sent against another claim's io-hash is refused in 0.017 ms at
+  the median and 0.021 ms at the 95th percentile, within the 1 ms
+  target. The format allows no more: its interaction PoW is 8 bits, so
+  junk ground for 2^8 nonces passes the pre-check, and the next check it
+  cannot meet cheaply, the 16-bit PoW, comes after the decode and the
+  composition (11–27 ms by the load). A heavier interaction PoW is a
+  format change (`open.md`). The levers of §4.4 shrink the columns the
+  verifier reads and so its time. Over Tor, the gateway's onion-service
+  defences replace per-address limits (§6.6).
+- **The binding sweep's budget** [built]: the bindings' due rows are an
+  index of their own, so due bindings never hold a session's or a
+  workflow's row back, and a batch runs at most 64 proven calls
+  (`defaults::BATCH_CREDENTIALED`, refine's rule; the leader holds the
+  rest for the next), as many as a sweep forgets, so the sweeps drain
+  bindings as fast as batches record them.
 
 ### 4.4 The program-id model, and the cost
 
@@ -1970,10 +1995,10 @@ pushes, commits and device-set operations, and member calls) and
   requests, a cap per SSH connection, per circuit and per onion. Tor
   itself bounds a flood of well-formed junk proofs (about 1 MB each) to far
   below a node's verification budget, and malformed short ones fail their
-  decode in microseconds. The pre-check that would refuse a well-formed
-  junk proof in under 1 ms is an optimization with a target, not a
-  precondition (plan 8.5), and a flood through Tor is measured in M5
-  (§6.6).
+  decode in microseconds. The pre-check refuses well-formed junk whose
+  interaction PoW fails in about 0.02 ms; junk ground for its 8 bits
+  costs the node the decode and the composition (§4.3) [measured], and a
+  flood through Tor is measured in M5 (§6.6).
 - **One SSH connection per isolation group** (§6.2), each authenticated by
   an SSH key drawn for that connection alone, so the gateway cannot join
   two groups by their SSH identity; the `vos-api` frames inside carry
@@ -2218,11 +2243,11 @@ place:
   behind it, `Busy` past it). Personal agents also admit only known keys
   (§3.3).
 - **The proof's own cost:** a proven call carries the device format's PoW
-  (16 bits), a grinding parameter more than a price: a well-formed junk
-  proof costs the node 5.8–8 ms today [measured, format 46]. Tor's own
-  throughput to one onion bounds such proofs to tens a second, below a
-  node's budget (about 150 a second a core); M5 measures it, and the
-  pre-check (§4.3, plan 8.5) lowers the cost further when it lands.
+  (16 bits), a grinding parameter more than a price: well-formed junk is
+  refused by the pre-check in about 0.02 ms, and junk ground for the 8-bit
+  interaction PoW costs the node 11–27 ms under load [measured, format
+  46, §4.3]. Tor's own throughput to one onion bounds such proofs to tens
+  a second, below a node's budget; M5 measures it.
 - **Restricted discovery** (onion-service client authorization): stable
   since arti 1.7.0 (2025-11). Only clients holding an authorized key can
   read the service's descriptor, which hides it from scanners. Not offered

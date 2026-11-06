@@ -1030,13 +1030,13 @@ pre-state's storage did.
     not on crates.io or wired in Kreivo;
   - frame-contrib 3.x's device call filters can limit such a device to
     `Spaces::{anchor, submit}`.
-- **Anonymous authorities** (on VOS's credential AIR, `proving.md` §8):
+- **Anonymous authorities** (on VOS's device proofs, `proving.md` §8):
   - the pallet keeps `AuthorityRoot: SpaceId → [u8;32]`, a Merkle root
     over the authority keys, which the controller sets alongside the map;
   - `anchor_anon` and `submit_anon` use `#[pallet::authorize]`. That needs
     `frame_system::AuthorizeCall` in Kreivo's pipeline, which it lacks
     today;
-  - each carries a credential proof "a key in R_auth" and a nullifier per
+  - each carries a device kernel's proof "a key in R_auth" and a nullifier per
     `(space, kind, w)` or per statement;
   - verification goes through `fc_traits_proof_verifier::ProofVerifier`,
     the trait on frame-contrib's `feat/private-communities` branch;
@@ -1089,7 +1089,7 @@ spend budget can merge with at the communities fold-in (stage 2).
    the pallet and the port exist.
 9. **Communities fold-in (stage 2):** after this pallet runs on Kreivo
    (recommended).
-10. **Anonymous authorities:** a later stage on VOS's credential AIR (§11;
+10. **Anonymous authorities:** a later stage on VOS's device proofs (§11;
     recommended).
 11. **A blocked space's roots.** Answered: unanchored, as an ended
     space's are (`vos_anchor::venue::anchored` reads `Active`); G15 pins

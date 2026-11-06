@@ -53,7 +53,7 @@ origin rather than who the member is.
   - `host` (storage, the leader loops, the API), `exec` (the agent
     program's runs, which the node and the light node share), `light` (the
     light node: local actors over its own store, and the device library,
-    a member's credential proofs), `api` (the binary API),
+    a member's proven calls), `api` (the binary API),
     `net` (node-to-node channels), `prover` (the leader's prover worker),
     `venue` (anchoring and submitting statements), `jam` (an agent as a
     JAM service), `cli` (the `vos` command).

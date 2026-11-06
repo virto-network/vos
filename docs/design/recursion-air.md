@@ -157,7 +157,7 @@ they are.
   | channel first | `prev[0,8)` | `act·m` | an absorb after an absorb; the second PoW permutation |
   | channel continue | `prev[0,8)` | `prev[8,16) + act·m` | an absorb's next chunks (`:531-547`) |
   | wired | `m` | `(c_8, c_9, 0…)` | a squeeze `(n_draws, 3)`, the first PoW permutation `(n_bits, 0)` (`:549-580`) |
-  | tagged | `c[0,8)` | `m` | the credential AIR's `C(T(name), x)`: a tag's block and a wire pair (`proving.md` §8) |
+  | tagged | `c[0,8)` | `m` | `C(T(name), x)`: a tag's block and a wire pair (`proving.md` §8) |
 
 - **The tagged row has no selector of its own.** A row's input constraint
   is linear in the selectors, which are preprocessed: the tagged row sets
