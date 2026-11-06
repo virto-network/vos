@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Instant;
 
-use vos_light::personal::{Link, Route, SealedSync};
+use vos_light::personal::{Answer, Frontier, Link, Route, SealedSync};
 use vos_light::release::Package;
 use vos_wire::ids::{InstanceId, MethodId};
 use vos_wire::personal::{
@@ -129,6 +129,11 @@ impl Link for Local<'_> {
             at: self.0.now,
             settled: true,
         }))
+    }
+
+    /// No device is removed in the bench.
+    fn frontier(&mut self, _: u32) -> Answer<Frontier, Self::Error> {
+        Ok(Ok(Vec::new()))
     }
 }
 

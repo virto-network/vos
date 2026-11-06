@@ -35,20 +35,28 @@
 //! A call `Personal` refuses with `Settling` is made again after a `wake`.
 
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 
 use blake2::Blake2b;
 use blake2::digest::Digest as _;
 use blake2::digest::consts::U32;
 use merkle_crdt::Ingested;
 use vos_wire::ids::InstanceId;
-use vos_wire::personal::{Envelope, PersonalError, Pushed, RECOVERY, Scope, Woken, envelope_id};
+use vos_wire::personal::{
+    DeviceId, Envelope, PersonalError, Pushed, RECOVERY, Scope, Woken, envelope_id,
+};
 use vos_wire::{Decode, Encode};
 use zeroize::Zeroizing;
 
-use crate::group::{Archive, DeviceGroup, GroupError};
+use crate::group::{Alarm, Archive, DeviceGroup, GroupError};
 use crate::light::{Error, Light, Queued};
 use crate::sealed::{self, Body, MAX_BODY, OpenError, View};
 use crate::sync::Blake2b256;
+use merkle_crdt::Hasher as _;
+
+mod checkpoint;
+
+pub use checkpoint::{Acknowledging, checkpoint_hash};
 
 /// The envelopes a push sends in one round trip, in flight at once.
 pub const PIPELINE: usize = 16;
@@ -64,6 +72,52 @@ pub const ARCHIVE_NAME: &[u8] = b"vos/personal/archive";
 /// group keyspace: each one's cursor and the epoch read or pushed there.
 const ARCHIVE_ROW: &[u8] = b"s/archive";
 const RECOVERY_ROW: &[u8] = b"s/recovery";
+
+/// The rows of a data scope's reading, in the group keyspace, by the
+/// scope's id: the node's CID read at each position, this device's own
+/// envelopes by position, and what the reading watches for.
+const AT: &[u8] = b"s/at/";
+const OWN: &[u8] = b"s/own/";
+const WATCH: &[u8] = b"s/watch/";
+
+/// `prefix`'s row of `scope`, at `position` if given.
+fn scope_key(prefix: &[u8], scope: &Scope, position: Option<u64>) -> Vec<u8> {
+    let mut key = [prefix, &scope[..]].concat();
+    if let Some(position) = position {
+        key.extend_from_slice(&position.to_be_bytes());
+    }
+    key
+}
+
+/// The position a row of [`scope_key`] names.
+fn position_of(key: &[u8]) -> Option<u64> {
+    let tail = key.len().checked_sub(8)?;
+    Some(u64::from_be_bytes(key[tail..].try_into().ok()?))
+}
+
+/// What a scope's reading watches for: the latest epoch an envelope it
+/// opened there was sealed under, which the agent's order never goes back
+/// on; and the highest position a writer said it had read there, with the
+/// one it last raised the partition alarm at.
+#[derive(Clone, Copy, Default, Encode, Decode)]
+struct Watch {
+    epoch: u64,
+    claimed: u64,
+    alarmed: u64,
+}
+
+/// Raise `alarm` once in `alarms`.
+fn raise(alarms: &mut Vec<Alarm>, alarm: Alarm) {
+    if !alarms.contains(&alarm) {
+        alarms.push(alarm);
+    }
+}
+
+/// A round trip's answer: the agent's, or the link's failure.
+pub type Answer<T, E> = Result<Result<T, PersonalError>, E>;
+
+/// A device's last position in each scope it pushed to.
+pub type Frontier = Vec<(Scope, u64)>;
 
 /// How the link reaches the agent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,6 +156,10 @@ pub trait Link {
 
     /// `wake()`: settle what fell due.
     fn wake(&mut self) -> Result<Result<Woken, PersonalError>, Self::Error>;
+
+    /// `frontier(device)`: the device's last position in each scope it
+    /// pushed to, its frontier once its removal matured.
+    fn frontier(&mut self, device: DeviceId) -> Answer<Frontier, Self::Error>;
 }
 
 /// Why sealed sync stopped.
@@ -126,6 +184,9 @@ pub enum SyncError<E> {
     TooLarge {
         seq: u64,
     },
+    /// No checkpoint at the scope's cursor: it has read nothing yet, or
+    /// holds nodes whose parents it has not read.
+    Incomplete,
 }
 
 impl<E> From<GroupError> for SyncError<E> {
@@ -160,6 +221,7 @@ impl<E: core::fmt::Debug> std::fmt::Display for SyncError<E> {
             SyncError::Disordered => f.write_str("a page out of order"),
             SyncError::Unanswered => f.write_str("a push the link did not answer"),
             SyncError::TooLarge { seq } => write!(f, "node {seq} does not fit an envelope"),
+            SyncError::Incomplete => f.write_str("the scope's causal past is not complete"),
         }
     }
 }
@@ -197,6 +259,12 @@ pub enum Unusable {
     Opened(OpenError),
     /// It opens, and holds no body of a node.
     Body,
+    /// Its node's author is no device of the set, or a removed device past
+    /// its frontier.
+    Author,
+    /// It is sealed under an epoch before one the agent took earlier in the
+    /// scope.
+    Stale,
 }
 
 /// An envelope passed over, at its position: the chrome names it.
@@ -225,6 +293,10 @@ pub struct Caught {
     pub passed: Vec<Passed>,
     pub heard: Vec<Heard>,
     pub waiting: Option<Waiting>,
+    /// What the reading detected (§8, B3, B4, B19, A7).
+    pub alarms: Vec<Alarm>,
+    /// The checkpoint the scope started from, at its position.
+    pub started: Option<u64>,
 }
 
 impl Caught {
@@ -240,6 +312,18 @@ impl Caught {
             None => self.ingested = Some(ingested),
         }
     }
+}
+
+/// What a sample audit of this device's own pushes did (§8, B2).
+#[derive(Debug, Default)]
+pub struct Audited {
+    /// The positions checked.
+    pub checked: Vec<u64>,
+    /// Those gone or replaced, each pushed again: [`Alarm::Deleted`].
+    pub alarms: Vec<Alarm>,
+    /// The push again stopped at `StaleEpoch` for this epoch: follow the
+    /// log.
+    pub stale: Option<u64>,
 }
 
 /// What reading and pushing the archive, or the recovery envelopes, did.
@@ -592,11 +676,13 @@ impl<'a, L: Link> SealedSync<'a, L> {
                 .collect();
             let answers = self.send(&envelopes)?;
             let mut taken = Vec::new();
+            let mut own = Vec::new();
             let mut stop = None;
             for (seq, answer) in round.iter().zip(answers) {
                 match answer {
                     Ok(pushed) => {
                         taken.push(*seq);
+                        own.push((pushed.position, pushed.id, Blake2b256::hash(&nodes[seq])));
                         report.pushed.push((*seq, pushed));
                     }
                     Err(error) => {
@@ -605,6 +691,7 @@ impl<'a, L: Link> SealedSync<'a, L> {
                     }
                 }
             }
+            self.record_own(scope, &own, None)?;
             self.light.sent(instance, &taken)?;
             at += taken.len();
             match stop {
@@ -637,19 +724,37 @@ impl<'a, L: Link> SealedSync<'a, L> {
         Ok(report)
     }
 
-    /// The candidate keys of `scope` at `epoch`: the confirmed epoch's
-    /// exported, an earlier one's from the archive.
+    /// The candidate keys of `scope` at `epoch`: the archive's, and the
+    /// confirmed epoch's exported (a restore's device starts a group of its
+    /// own at the epoch its old devices sealed under, whose keys its
+    /// archive holds).
     fn keys(&mut self, scope: Scope, epoch: u64) -> Result<Vec<[u8; 32]>, GroupError> {
+        let mut keys = self.group.archive().keys(epoch, &scope).to_vec();
         if epoch == self.group.confirmed() {
-            return Ok(vec![self.group.key(scope)?]);
+            let key = self.group.key(scope)?;
+            if !keys.contains(&key) {
+                keys.insert(0, key);
+            }
         }
-        Ok(self.group.archive().keys(epoch, &scope).to_vec())
+        Ok(keys)
     }
 
     /// Read `instance`'s scope from its cursor to the agent's end: each
     /// page's envelopes opened, their nodes applied and the page's position
     /// stored, in one batch a page. Stops before an envelope it cannot open
-    /// yet ([`Caught::waiting`]).
+    /// yet ([`Caught::waiting`]). A scope read for the first time starts
+    /// from the checkpoint this device trusts, if there is one
+    /// ([`Caught::started`]).
+    ///
+    /// What the agent serves is checked as it is read (§8, B3, B4, B19,
+    /// A7): positions are dense, so one skipped is withheld; epochs never go
+    /// back along a scope, so an envelope under an earlier one is a push the
+    /// agent should have refused, passed over; a node's author is a device
+    /// of the set, a removed one's counted only up to its frontier; each
+    /// writer's view of the control log is checked against this device's;
+    /// and each writer's `seen` positions are kept, so that a scope served
+    /// to its end short of where a writer had read it raises the partition
+    /// alarm.
     pub fn catch_up(&mut self, instance: InstanceId) -> Result<Caught, SyncError<L::Error>> {
         let scope = self.light.scope_id(instance)?.0;
         let agent = self.group.agent().identity;
@@ -657,32 +762,55 @@ impl<'a, L: Link> SealedSync<'a, L> {
         // epoch.
         drop(Zeroizing::new(self.group.key(scope)?));
         let mut caught = Caught::default();
+        if self.light.cursor(instance)?.is_none() {
+            caught.started = self.start(instance, scope, &mut caught.alarms)?;
+        }
+        let mut scan = Scan::new(self.tracked()?);
         loop {
             let from = self.light.cursor(instance)?.unwrap_or(0);
             let page = self.since(scope, from)?;
             if page.is_empty() {
+                let watch = self.watch(&mut scan, scope)?;
+                if watch.claimed > from && watch.claimed > watch.alarmed {
+                    watch.alarmed = watch.claimed;
+                    let position = watch.claimed;
+                    raise(&mut caught.alarms, Alarm::Partition { scope, position });
+                }
+                self.store_watches(&scan)?;
                 return Ok(caught);
             }
             let mut nodes = Vec::with_capacity(page.len());
+            let mut at = Vec::with_capacity(page.len());
             let mut to = from;
             for envelope in page {
                 if envelope.position <= to {
                     return Err(SyncError::Disordered);
                 }
+                if envelope.position != to + 1 {
+                    let position = to + 1;
+                    raise(&mut caught.alarms, Alarm::Withheld { scope, position });
+                }
                 let opened = self.open(scope, &agent, &envelope)?;
+                let position = envelope.position;
                 match opened {
-                    Opening::Node(body) => {
-                        nodes.push(body.node);
-                        caught.heard.push(Heard {
-                            position: envelope.position,
-                            view: body.view,
-                            seen: body.seen,
-                        });
+                    Opening::Node(epoch, body) => {
+                        match self.admit(scope, position, epoch, &body, &mut scan, &mut caught)? {
+                            Ok(cid) => {
+                                at.push((
+                                    scope_key(AT, &scope, Some(position)),
+                                    Some(cid.to_vec()),
+                                ));
+                                nodes.push(body.node);
+                                caught.heard.push(Heard {
+                                    position,
+                                    view: body.view,
+                                    seen: body.seen,
+                                });
+                            }
+                            Err(why) => caught.passed.push(Passed { position, why }),
+                        }
                     }
-                    Opening::Passed(why) => caught.passed.push(Passed {
-                        position: envelope.position,
-                        why,
-                    }),
+                    Opening::Passed(why) => caught.passed.push(Passed { position, why }),
                     Opening::Waiting(waiting) => {
                         caught.waiting = Some(waiting);
                         break;
@@ -690,15 +818,197 @@ impl<'a, L: Link> SealedSync<'a, L> {
                 }
                 caught.envelopes += 1;
                 caught.bytes += envelope.bytes.len();
-                to = envelope.position;
+                to = position;
             }
             if to > from {
+                // What was read at each position, written before the page is
+                // applied: a reading again after a crash writes it the same.
+                self.light.store().write_group_rows(at)?;
                 caught.absorb(self.light.ingest(instance, nodes, Some(to))?);
             }
+            self.store_watches(&scan)?;
             if caught.waiting.is_some() {
                 return Ok(caught);
             }
         }
+    }
+
+    /// The scopes this sync reads: their `seen` positions are kept.
+    fn tracked(&self) -> Result<Vec<Scope>, Error> {
+        self.instances
+            .iter()
+            .map(|instance| Ok(self.light.scope_id(*instance)?.0))
+            .collect()
+    }
+
+    /// `scope`'s watch, read once for `scan`.
+    fn watch<'r>(
+        &self,
+        scan: &'r mut Scan,
+        scope: Scope,
+    ) -> Result<&'r mut Watch, SyncError<L::Error>> {
+        Ok(match scan.watches.entry(scope) {
+            Entry::Occupied(held) => held.into_mut(),
+            Entry::Vacant(vacant) => vacant.insert(self.row(&scope_key(WATCH, &scope, None))?),
+        })
+    }
+
+    fn store_watches(&self, scan: &Scan) -> Result<(), SyncError<L::Error>> {
+        let rows = scan
+            .watches
+            .iter()
+            .map(|(scope, watch)| (scope_key(WATCH, scope, None), Some(watch.encode())))
+            .collect();
+        Ok(self.light.store().write_group_rows(rows)?)
+    }
+
+    /// Whether the node an envelope at `scope`'s `position`, sealed under
+    /// `epoch`, holds is admitted: its CID, or why it is passed over, with
+    /// what its writer said checked into `caught`'s alarms.
+    fn admit(
+        &mut self,
+        scope: Scope,
+        position: u64,
+        epoch: u64,
+        body: &Body,
+        scan: &mut Scan,
+        caught: &mut Caught,
+    ) -> Result<Result<[u8; 32], Unusable>, SyncError<L::Error>> {
+        let watch = self.watch(scan, scope)?;
+        if epoch < watch.epoch {
+            raise(&mut caught.alarms, Alarm::Stale { scope, position });
+            return Ok(Err(Unusable::Stale));
+        }
+        watch.epoch = epoch;
+        let Some(header) = merkle_crdt::Header::<Blake2b256>::read(&body.node) else {
+            return Ok(Err(Unusable::Body));
+        };
+        let within = match self.group.author(&header.author.0) {
+            None => false,
+            Some((_, false)) => true,
+            Some((device, true)) => {
+                let frontier = match scan.frontiers.entry(device) {
+                    Entry::Occupied(held) => held.into_mut(),
+                    Entry::Vacant(vacant) => vacant.insert(
+                        self.link()?
+                            .frontier(device)
+                            .map_err(SyncError::Link)?
+                            .map_err(SyncError::Refused)?,
+                    ),
+                };
+                frontier
+                    .iter()
+                    .find(|(at, _)| *at == scope)
+                    .is_some_and(|(_, last)| position <= *last)
+            }
+        };
+        if !within {
+            raise(&mut caught.alarms, Alarm::Author { scope, position });
+            return Ok(Err(Unusable::Author));
+        }
+        if let Some(alarm) = self.group.check_view(body.view.index, body.view.chain)? {
+            raise(&mut caught.alarms, alarm);
+        }
+        for (seen_scope, seen) in &body.seen {
+            // A writer read its envelope's scope before the agent numbered
+            // the envelope after it.
+            if *seen_scope == scope && *seen >= position {
+                let position = *seen;
+                raise(&mut caught.alarms, Alarm::Partition { scope, position });
+            }
+            if scan.tracked.contains(seen_scope) {
+                let watch = self.watch(scan, *seen_scope)?;
+                watch.claimed = watch.claimed.max(*seen);
+            }
+        }
+        Ok(Ok(Blake2b256::hash(&body.node)))
+    }
+
+    /// Record this device's envelopes the agent took in `scope`, each
+    /// `(position, id, cid)`, and drop the record at `moved` if given: what
+    /// the sample audit checks.
+    fn record_own(
+        &self,
+        scope: Scope,
+        own: &[(u64, [u8; 32], [u8; 32])],
+        moved: Option<u64>,
+    ) -> Result<(), SyncError<L::Error>> {
+        let mut rows: Vec<(Vec<u8>, Option<Vec<u8>>)> = own
+            .iter()
+            .map(|(position, id, cid)| {
+                (
+                    scope_key(OWN, &scope, Some(*position)),
+                    Some((*id, *cid).encode()),
+                )
+            })
+            .collect();
+        if let Some(moved) = moved {
+            rows.push((scope_key(OWN, &scope, Some(moved)), None));
+        }
+        if rows.is_empty() {
+            return Ok(());
+        }
+        Ok(self.light.store().write_group_rows(rows)?)
+    }
+
+    /// Audit a sample of `sample` of this device's own envelopes in
+    /// `instance`'s scope (§8, B2): each fetched at its position, and one
+    /// gone or replaced there pushed again, its node sealed anew under the
+    /// confirmed epoch.
+    pub fn audit(
+        &mut self,
+        instance: InstanceId,
+        sample: usize,
+    ) -> Result<Audited, SyncError<L::Error>> {
+        let scope = self.light.scope_id(instance)?.0;
+        let mut own = self
+            .light
+            .store()
+            .group_rows(&scope_key(OWN, &scope, None), None)?;
+        // A uniform sample, drawn without replacement.
+        for i in 0..own.len().min(sample) {
+            let mut draw = [0; 8];
+            getrandom::getrandom(&mut draw).expect("the operating system's randomness");
+            let j = i + (u64::from_le_bytes(draw) % (own.len() - i) as u64) as usize;
+            own.swap(i, j);
+        }
+        own.truncate(sample);
+        let mut audited = Audited::default();
+        for (key, value) in own {
+            let position = position_of(&key).ok_or(SyncError::Group(GroupError::Corrupt))?;
+            let (id, cid) = <([u8; 32], [u8; 32])>::decode_exact(&value)
+                .ok_or(SyncError::Group(GroupError::Corrupt))?;
+            audited.checked.push(position);
+            let page = self.since(scope, position - 1)?;
+            if page
+                .first()
+                .is_some_and(|envelope| envelope.position == position && envelope.id == id)
+            {
+                continue;
+            }
+            raise(&mut audited.alarms, Alarm::Deleted { scope, position });
+            let Some(node) = self
+                .light
+                .node(instance, &merkle_crdt::Cid::<Blake2b256>(cid))?
+            else {
+                continue;
+            };
+            let seq = merkle_crdt::Header::<Blake2b256>::read(&node).map_or(0, |header| header.seq);
+            let queued = self.seal(scope, seq, &node)?;
+            match self.send(&[queued.envelope])?.remove(0) {
+                Ok(pushed) => {
+                    self.record_own(scope, &[(pushed.position, pushed.id, cid)], Some(position))?
+                }
+                Err(PersonalError::StaleEpoch { confirmed })
+                    if confirmed > self.group.confirmed() =>
+                {
+                    audited.stale = Some(confirmed);
+                    return Ok(audited);
+                }
+                Err(error) => return Err(SyncError::Refused(error)),
+            }
+        }
+        Ok(audited)
     }
 
     fn open(
@@ -726,7 +1036,7 @@ impl<'a, L: Link> SealedSync<'a, L> {
         }
         Ok(match sealed::open(&keys, agent, &envelope.bytes) {
             Ok((_, body)) => match Body::decode_exact(&body) {
-                Some(body) => Opening::Node(body),
+                Some(body) => Opening::Node(header.epoch, body),
                 None => Opening::Passed(Unusable::Body),
             },
             Err(error) => Opening::Passed(Unusable::Opened(error)),
@@ -920,9 +1230,29 @@ impl<'a, L: Link> SealedSync<'a, L> {
     }
 }
 
+/// A scope's reading: the scopes whose `seen` positions it keeps, their
+/// watches as read and updated, and the removed devices' frontiers it
+/// asked for.
+struct Scan {
+    tracked: Vec<Scope>,
+    watches: BTreeMap<Scope, Watch>,
+    frontiers: BTreeMap<DeviceId, Frontier>,
+}
+
+impl Scan {
+    fn new(tracked: Vec<Scope>) -> Self {
+        Self {
+            tracked,
+            watches: BTreeMap::new(),
+            frontiers: BTreeMap::new(),
+        }
+    }
+}
+
 /// What opening an envelope of a data scope gave.
 enum Opening {
-    Node(Body),
+    /// A node's body, sealed under its epoch.
+    Node(u64, Body),
     Passed(Unusable),
     Waiting(Waiting),
 }

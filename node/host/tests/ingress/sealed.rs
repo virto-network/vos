@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use ed25519_dalek::Signer as _;
 use vos_light::group::{Agent, DeviceGroup, Event};
-use vos_light::personal::{Link, Route, SealedSync};
+use vos_light::personal::{Answer, Frontier, Link, Route, SealedSync};
 use vos_light::release::{self, Package};
 use vos_light::{Config, Light};
 use vos_testkit::programs;
@@ -36,7 +36,11 @@ impl Phone {
     fn new(personal: &Personal, seed: u8, agent: &[u8]) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let light = Light::open(dir.path(), agent, Config::default()).unwrap();
-        let keys = Keys::of(seed);
+        // The sync key is the light node's: its scopes' author.
+        let keys = Keys {
+            sync: light.sync_key().clone(),
+            ..Keys::of(seed)
+        };
         Self {
             light,
             group: None,
@@ -88,6 +92,10 @@ impl Link for Socket<'_> {
 
     fn wake(&mut self) -> Result<Result<Woken, PersonalError>, Self::Error> {
         Ok(outcome(self.personal.call(self.sync, "wake", Vec::new()).1))
+    }
+
+    fn frontier(&mut self, device: u32) -> Answer<Frontier, Self::Error> {
+        Ok(self.personal.query(&self.key, "frontier", device))
     }
 }
 
