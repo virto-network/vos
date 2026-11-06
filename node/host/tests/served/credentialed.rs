@@ -1449,7 +1449,12 @@ fn an_app_one_release_behind_signs_in_until_its_window_closes() {
     applied(one.id);
     let two_only = vec![two.clone()];
     assert_eq!(sign_in(&two_only).map(|(id, _, _)| id), Ok(two.id));
-    founded.later(RETIREMENT_MS as i64 + 60_000);
+    // Ingress and the window read judge a date by the node's clock alone:
+    // no batch need run after the clock moves.
+    founded
+        .cluster
+        .offset
+        .fetch_add(RETIREMENT_MS as i64 + 60_000, Ordering::SeqCst);
     assert_eq!(programs(&window(&founded, at, DEVICE)), [(one.id, None)]);
     assert!(matches!(sign_in(&two_only), Err(DeviceError::Window)));
     let (_, call, proof) = sign_in(&old_app).unwrap();
