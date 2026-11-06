@@ -367,8 +367,10 @@ pub(crate) enum Check {
     Invalid = 2,
 }
 
-/// What a device-set admin call does.
+/// What a device-set admin call does. An operation carries its `Op`
+/// inline: a device keeps a few open calls, encoded in its state row.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Act {
     /// An operation, maturing at `matures` unless vetoed or contested.
     #[codec(index = 0)]
