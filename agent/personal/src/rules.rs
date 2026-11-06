@@ -8,24 +8,11 @@ use alloc::vec::Vec;
 use vos_sdk::prelude::*;
 use vos_wire::personal::{
     ANSWER_BYTES, Author, Body, DAY_MS, Device, DeviceId, Entry, Holder, Item, NewDevice,
-    PersonalError, Policy, Recipient, Removal, Scope, Standing, Status, Verdict, Void, Vote, Voted,
-    chain,
+    PersonalError, Policy, Recipient, Scope, Standing, Status, Verdict, Void, Vote, Voted, chain,
 };
 
 use crate::Personal;
 use crate::rows::{Charge, Group, Head, ONE, Share, Slot, Usage};
-
-/// A device's standing at `now`: its status, then a matured removal, then
-/// its probation.
-pub fn standing(device: &Device, removal: Option<&Removal>, now: u64) -> Standing {
-    match device.status {
-        Status::Removed { .. } => Standing::Removed,
-        Status::Dropped { .. } => Standing::Dropped,
-        Status::Live if removal.is_some_and(|removal| removal.matures <= now) => Standing::Removed,
-        Status::Live if now < device.active_from => Standing::Probation,
-        Status::Live => Standing::Active,
-    }
-}
 
 /// Rows while their encodings, `size` each, fit one answer: at least the
 /// first.
@@ -117,6 +104,7 @@ impl Personal {
         let id = group.devices;
         group.devices = id.checked_add(1).ok_or(PersonalError::Malformed)?;
         self.group.insert(&ONE, &group);
+        self.live.insert(&id, &());
         self.admitted.insert(&keys.sync, &Holder::Sync(id));
         self.admitted.insert(&keys.admin, &Holder::Admin(id));
         self.devices.insert(
@@ -137,11 +125,6 @@ impl Personal {
             Principal::Client(key) => self.admitted.get(&key).map(|holder| (key, holder)),
             _ => None,
         }
-    }
-
-    fn standing_of(&self, device: DeviceId, now: u64) -> Option<Standing> {
-        let found = self.devices.get(&device)?;
-        Some(standing(&found, self.removals.get(&device).as_ref(), now))
     }
 
     /// The device whose sync key calls, in probation or active.
@@ -196,27 +179,24 @@ impl Personal {
         }
     }
 
-    /// Settle what batch time decided since the last call: removals that
-    /// matured (their keys admitted no more, each logged), a few slots and
-    /// inbox items that expired, and the pending candidate's verdict, as
-    /// its window's end would have decided it. Answers `now`.
-    pub(crate) fn settle(&mut self, now: u64) -> u64 {
-        let mut matured = false;
-        while let Some(((at, device), ())) = self.maturing.first() {
-            if at > now {
-                break;
-            }
-            self.maturing.remove(&(at, device));
-            if let Some(mut found) = self.devices.get(&device)
-                && found.status == Status::Live
-            {
-                found.status = Status::Removed { at };
-                self.admitted.remove(&found.keys.sync);
-                self.admitted.remove(&found.keys.admin);
-                self.devices.insert(&device, &found);
-                self.append(now, Body::Matured { device });
-                matured = true;
-            }
+    /// Settle what batch time decided since the last call, refusing with
+    /// `Settling` while operations are left due: a call runs only on the
+    /// device set as of its batch time. Answers `now`.
+    pub(crate) fn settle(&mut self, now: u64) -> Result<u64, PersonalError> {
+        if self.settle_some(now) {
+            Ok(now)
+        } else {
+            Err(PersonalError::Settling)
+        }
+    }
+
+    /// Settle a few of the operations due by `now` (a removal's device
+    /// admitted no more, each logged) and, once none is left due, a few
+    /// slots and inbox items that expired and the pending candidate's
+    /// timeout: whether none is left due.
+    pub(crate) fn settle_some(&mut self, now: u64) -> bool {
+        if !self.mature_due(now, crate::devices::SETTLE) {
+            return false;
         }
         for _ in 0..crate::SWEEP {
             let Some(((expires, slot), ())) = self.closing.first() else {
@@ -231,17 +211,15 @@ impl Personal {
             }
         }
         self.sweep_inbox(now);
-        if let Some(candidate) = self.group().candidate {
-            let deadline = candidate
+        if let Some(candidate) = self.group().candidate
+            && candidate
                 .created
-                .saturating_add(self.policy().confirm_window_ms);
-            if matured && let Some(verdict) = self.verdict(now.min(deadline)) {
-                self.decide(now, verdict);
-            } else if deadline <= now {
-                self.decide(now, Verdict::Void(Void::Timeout));
-            }
+                .saturating_add(self.policy().confirm_window_ms)
+                <= now
+        {
+            self.decide(now, Verdict::Void(Void::Timeout));
         }
-        now
+        true
     }
 
     /// Slot `slot`, if it is open at `now`: an expired one is closed
@@ -281,11 +259,7 @@ impl Personal {
 
     /// Check that `remove` is exactly the matured removals no confirmed
     /// commit carried yet, each once.
-    pub(crate) fn check_removals(
-        &self,
-        now: u64,
-        remove: &[DeviceId],
-    ) -> Result<(), PersonalError> {
+    pub(crate) fn check_removals(&self, remove: &[DeviceId]) -> Result<(), PersonalError> {
         let named: BTreeSet<DeviceId> = remove.iter().copied().collect();
         if named.len() != remove.len() {
             return Err(PersonalError::Malformed);
@@ -294,8 +268,7 @@ impl Personal {
             .removals
             .iter(None)
             .filter(|(device, removal)| {
-                removal.matures <= now
-                    && removal.committed.is_none()
+                removal.committed.is_none()
                     && self
                         .devices
                         .get(device)
@@ -316,17 +289,12 @@ impl Personal {
     /// window, in probation or active, less those `removing`.
     pub(crate) fn confirming_set(&self, now: u64, removing: &[DeviceId]) -> Vec<DeviceId> {
         let since = now.saturating_sub(self.policy().confirm_window_ms);
-        self.devices
+        self.live
             .iter(None)
-            .filter(|(id, device)| {
-                !removing.contains(id)
-                    && matches!(
-                        standing(device, self.removals.get(id).as_ref(), now),
-                        Standing::Probation | Standing::Active
-                    )
-                    && self.seen.get(id).is_some_and(|seen| seen >= since)
+            .map(|(id, ())| id)
+            .filter(|id| {
+                !removing.contains(id) && self.seen.get(id).is_some_and(|seen| seen >= since)
             })
-            .map(|(id, _)| id)
             .collect()
     }
 
@@ -339,7 +307,7 @@ impl Personal {
         vote: Vote,
         signature: [u8; 64],
     ) -> Result<Voted, PersonalError> {
-        let now = self.settle(ctx.now());
+        let now = self.settle(ctx.now())?;
         self.assigned()?;
         let device = self.sync_caller(ctx.caller(), now)?;
         let candidate = self
@@ -390,7 +358,7 @@ impl Personal {
                 _ => self
                     .removals
                     .get(device)
-                    .is_some_and(|removal| removal.matures <= at),
+                    .is_some_and(|removal| removal.at <= at),
             };
             if removed {
                 continue;
@@ -408,8 +376,8 @@ impl Personal {
     }
 
     /// Apply `verdict` to the pending candidate: confirmed, its epoch is
-    /// the confirmed one and its removals are carried; void, the epoch is
-    /// free again and a device it added is dropped.
+    /// the confirmed one and its removals and add operation are carried;
+    /// void, the epoch is free again and a device it added is dropped.
     pub(crate) fn decide(&mut self, now: u64, verdict: Verdict) {
         let mut group = self.group();
         let Some(candidate) = group.candidate.take() else {
@@ -424,12 +392,27 @@ impl Personal {
                         self.removals.insert(device, &removal);
                     }
                 }
+                if let Some(index) = candidate.carries {
+                    self.carried(index, candidate.epoch);
+                }
+                // The previous R2 is released until the restore's device
+                // commits a group of its own.
+                let mut recovery = self.recovery.get(&ONE).unwrap_or_default();
+                if recovery
+                    .released
+                    .is_some_and(|(device, _)| device == candidate.by)
+                {
+                    recovery.released = None;
+                    self.recovery.insert(&ONE, &recovery);
+                }
             }
             Verdict::Void(_) => {
                 if let Some(added) = candidate.added
                     && let Some(mut device) = self.devices.get(&added)
                 {
                     device.status = Status::Dropped { at: now };
+                    self.live.remove(&added);
+                    self.silence(added, now);
                     self.admitted.remove(&device.keys.sync);
                     self.admitted.remove(&device.keys.admin);
                     self.devices.insert(&added, &device);
@@ -464,6 +447,7 @@ impl Personal {
                 day,
                 envelopes: 0,
                 commits: 0,
+                kit_operations: 0,
                 ..usage
             };
         }
@@ -497,7 +481,7 @@ impl Personal {
                     ..share
                 };
             }
-            if self.live_devices(now) > 1 {
+            if self.live_devices() > 1 {
                 let calls = (policy.envelopes_per_day + policy.commits_per_day) / 2;
                 if share.bytes.saturating_add(bytes) > quota / 2 || share.calls >= calls {
                     return Err(PersonalError::Quota);
@@ -511,16 +495,31 @@ impl Personal {
         Ok(())
     }
 
-    pub(crate) fn live_devices(&self, now: u64) -> usize {
-        self.devices
-            .iter(None)
-            .filter(|(id, device)| {
-                matches!(
-                    standing(device, self.removals.get(id).as_ref(), now),
-                    Standing::Probation | Standing::Active
-                )
-            })
-            .count()
+    /// The devices in probation or active, once a call settled what was
+    /// due.
+    /// Count one of the kit's operations against its daily allowance.
+    pub(crate) fn charge_kit(&mut self, now: u64) -> Result<(), PersonalError> {
+        let day = now / DAY_MS;
+        let mut usage = self.usage();
+        if usage.day != day {
+            usage = Usage {
+                day,
+                envelopes: 0,
+                commits: 0,
+                kit_operations: 0,
+                ..usage
+            };
+        }
+        if usage.kit_operations >= self.policy().kit_operations_per_day {
+            return Err(PersonalError::Quota);
+        }
+        usage.kit_operations += 1;
+        self.usage.insert(&ONE, &usage);
+        Ok(())
+    }
+
+    pub(crate) fn live_devices(&self) -> usize {
+        self.live.iter(None).count()
     }
 
     /// Delete a few expired inbox items, their bytes released.

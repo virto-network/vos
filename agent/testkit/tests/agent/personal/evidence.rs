@@ -3,27 +3,9 @@
 //! call, its arguments compared byte for byte with the call recorded, and
 //! a commit's Welcome bound by its hash.
 
-use vos_wire::ids::{MethodId, Session};
-use vos_wire::ingress::call_message;
 use vos_wire::personal::{Body, Candidacy, Effect, Entry, PersonalError, Recorded, welcome_hash};
 
 use super::*;
-
-/// The message `key` signs for `method` with `arguments`, as a client
-/// signs a call.
-fn message(key: [u8; 32], method: MethodId, arguments: &[u8]) -> Vec<u8> {
-    let session = Session {
-        key,
-        name: [7; 16],
-        t0: T0,
-    };
-    call_message(&IDENTITY, &session, 4, PERSONAL, method, arguments)
-}
-
-/// The evidence call's arguments.
-fn evidence(index: u64, message: Vec<u8>, welcome: Option<Vec<u8>>) -> impl Encode {
-    ((index, message), ([0x5a_u8; 64], welcome))
-}
 
 /// A commit's evidence and a removal's are stored beside them, each once
 /// and only from the device that made the call; a message whose
