@@ -95,18 +95,13 @@ fn the_parameters_are_the_least_that_clear_their_margins() {
     assert!((62.81..62.82).contains(&segment), "{segment}");
     let at_44 = count(&LEAF_FOLD.params, &SEGMENT_REFERENCE);
     assert!((62.74..62.75).contains(&at_44), "{at_44}");
-    for format in [DEVICE_PROOF] {
-        let fewer = FormatParams {
-            n_queries: format.params.n_queries - 1,
-            ..format.params
-        };
-        assert!(count(&format.params, &format.reference) >= 62.0);
-        assert!(
-            count(&fewer, &format.reference) < 62.0,
-            "format {}",
-            format.number
-        );
-    }
+    let device = &DEVICE_PROOF;
+    let fewer = FormatParams {
+        n_queries: device.params.n_queries - 1,
+        ..device.params
+    };
+    assert!(count(&device.params, &device.reference) >= 62.0);
+    assert!(count(&fewer, &device.reference) < 62.0);
 }
 
 /// The wrap counts 82.6 proven bits under affine batching, and needs 19
