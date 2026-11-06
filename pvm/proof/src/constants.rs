@@ -18,12 +18,12 @@
 /// The window kernel's program id: the `window` test actor's `settle`,
 /// eight M31 words.
 pub const WINDOW_PROGRAM: [u32; 8] = [
-    118031075, 938617198, 382975112, 1361086435, 1863666869, 874336167, 672029574, 1127512519,
+    2034007698, 674571909, 1293620082, 1840066569, 1274912095, 564349168, 361165568, 1416507376,
 ];
 
 /// The balance kernel's: the `balance` test actor's `at_least`.
 pub const BALANCE_PROGRAM: [u32; 8] = [
-    1937583797, 15923336, 2121492211, 635193008, 774813104, 1160876096, 830956297, 388634461,
+    863248029, 1195148791, 20854458, 1200105477, 1862493333, 228604465, 1726435859, 544601687,
 ];
 
 /// The solvency predicate's: the `kernels` test actor's `areas`.
