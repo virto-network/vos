@@ -368,6 +368,10 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   forged operation, a stale-epoch push, a backdated envelope, a wrong
   checkpoint): each detected or refused as `light-node.md` §8 says.
   **Dep:** 8.20. **Estimate:** 2–3 weeks.
+- **Host result** (2026-11-06, `light-node.md` §3.6, "Detection as
+  built"): `node/light/tests/sealed/detection.rs`, a test a scenario,
+  with the own-push audit (B2) and the checkpoints a paired device and a
+  restore's device start from; the sync key is the light node's author.
 
 ### 8.22 The background job — F
 - WorkManager on the after-first-unlock keys; `alive` when a restore is

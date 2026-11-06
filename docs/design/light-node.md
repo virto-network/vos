@@ -848,9 +848,11 @@ arm64-v8a build; the phones' timings below are S8-P1's]:
 - **Not built here:** a replaced admin key's leaf credential (the leaf
   keeps the key it was added with; the replaced key signs calls, and a
   replacement whose evidence comes after its maturity leaves the old key
-  in force until it verifies); a stuck device's view of adds confirmed
-  while it was stuck; a restore's device's view of operations opened
-  before its read; an alarm on a `Configured` that lowers a delay.
+  in force until it verifies); a restore's device's view of operations
+  opened before its read (8.23b's restore flow); an alarm on a
+  `Configured` that lowers a delay. A device that cannot follow takes the
+  device a confirmed candidate adds into its set by the agent's word, so
+  that device's nodes have a known author.
 
 **The device group measured** [measured, x86-64 Core Ultra 7 155H under
 load (load average 15–20), release, 2026-11-06; `vos-phone group`, the
@@ -1291,8 +1293,8 @@ the one taken]:
   of a later epoch (`Waiting::Epoch`: follow the log) or of an epoch whose
   key this device lacks (`Waiting::Key`: read the archive); one that does
   not open under any candidate, or holds no body, is passed over and
-  reported with its position (B5). Each opened envelope's view and `seen`
-  positions are returned for 8.21's checks; nothing checks them yet.
+  reported with its position (B5). Each opened envelope is checked as
+  "Detection as built" below says.
 - **The archive** lives in a scope of its own, its id from the naming
   secret (`"vos/personal/archive"`, apart from every instance's
   four-byte name). `SealedSync::archive` reads it from its cursor and
@@ -1322,14 +1324,9 @@ the one taken]:
   whose route is not the onion, and checks it again before every
   request, so no request to the personal agent leaves over the clearnet
   [E17]. The onion transport itself is 8.26's.
-- **Not built here:** the device-side authorization of authors (a node's
-  author is the store's author key, not yet the device's sync key, so no
-  reader maps it to the device set), frontiers on read (so A7 is
-  mitigated on push alone: the agent refuses a removed device and takes
-  only the confirmed epoch), the `seen` and view checks (8.21), pipelined
-  reads, re-reading an envelope passed over once a later archive brings
-  a key that opens it, and garbage collection of covered envelopes and of
-  earlier epochs' archives (§9.3).
+- **Not built here:** pipelined reads, re-reading an envelope passed
+  over once a later archive brings a key that opens it, and garbage
+  collection of covered envelopes and of earlier epochs' archives (§9.3).
 - **Known limits found here:** a scope's reading stops for good at an
   envelope of an epoch whose key never arrives, or of an epoch past any
   confirmed one, which the operators can plant (as they can withhold, B1);
@@ -1339,6 +1336,67 @@ the one taken]:
   there after its removal, which is more than D3's limit (the operators
   and a leaked kit). The remedy is a kit rotation at each removal (a new
   `R`, the old `R2` deleted), 8.23b's to build or the owner's to rule out.
+
+**Detection as built** [built, `vos_light::group` and
+`vos_light::personal`, the model test of two devices and a hostile agent
+in `node/light/tests/sealed/detection.rs`; where the text above leaves a
+choice, this is the one taken]:
+- **One key:** a light node's author key is the device's sync key
+  (`Light::sync_key`), so a node's author is a device of the set, which
+  every reader checks.
+- **The log's views:** a device writes the log's chain through each
+  entry it reads (`g/chain/`, 40 bytes an entry), so a writer's view
+  `(index, chain)` is checked against its own reading at that index; a
+  view past its cursor is kept (sixteen at most) and checked as it reads
+  on, and raises `View` if the agent's head stops short of it. The caller
+  hands the agent's head to `DeviceGroup::head` after reading the log to
+  its end: one behind the device's view, or diverging at it, is a
+  `Rollback` (B3). An entry served again behind the cursor that does not
+  chain as the device read it stops the reading with `Log` (a fork behind
+  the cursor). A view before a paired device's first index passes
+  unchecked.
+- **Calls the agent drops:** the caller gives each admin call the agent
+  took, with its log index, to `DeviceGroup::made`; another entry at that
+  index raises `Dropped`, and a dropped veto holds back the maturity of
+  its operation on this device, which keeps its voice (B8): the alarm is
+  the owner's to act on.
+- **Each envelope read:** positions are dense, so one skipped raises
+  `Withheld`; an envelope under an epoch before one the scope already
+  showed is a push the agent should have refused (`Stale`, passed over;
+  A8, B8); a node whose author is no device's sync key, or a removed
+  device's past its frontier (the agent's `frontier`, asked once a
+  reading), is refused (`Author`; A7, B6); a writer's `seen` position in
+  the envelope's own scope at or past the envelope's position is a
+  renumbering, and each `seen` position of a scope this sync reads is
+  kept, so a scope read to its served end short of one raises `Partition`
+  (B19). What was read at each position (`s/at/`, the node's CID) is
+  written before its page applies.
+- **The sample audit** (`SealedSync::audit`, B2): every envelope a device
+  pushed is recorded by position (`s/own/`); a uniform sample is fetched
+  at its positions, and one gone or replaced raises `Deleted` and its
+  node is sealed and pushed again.
+- **Checkpoints** (`personal::checkpoint`): the hash is over the agent,
+  the scope, `P` and each position up to `P` that held a node with its
+  CID, in order, so two devices cutting at one position hold one (C3);
+  one is cut only where no node waits for a parent. Its content (those
+  nodes by position) is pushed in parts into a checkpoints' scope of its
+  own, with the maker's `made(P, hash)` signed by its sync key; a device
+  that read the scope to `P` recomputes it and signs `acknowledged`, or
+  raises `Checkpoint` (C4). A scope read for the first time starts from
+  the checkpoint its pairing device named over the pairing channel
+  (`Pairing::trust`, with where its parts start), or, for a restore's
+  device, the latest that two devices other than its maker acknowledged,
+  each signature checked against the device set; the content is checked
+  against the hash before it applies, and otherwise the scope is read
+  from its start (C12). `Personal`'s `acknowledge` table is unused: the
+  acknowledgements are sealed and signed, so the operators cannot add one.
+- **Known limits:** the frontier and the device set a restore reads are
+  the agent's word (B8); a restore's device scans the checkpoints' scope
+  from its start; a device that passed over an envelope another opened
+  (M2 above) computes another hash, and raises `Checkpoint` at an honest
+  one; a consistent partition is caught only once an envelope crosses it
+  (a `seen` position, a view); the rows by position and the chain rows
+  grow until garbage collection (§9.3).
 
 **PG6's catch-up on the clearnet** [measured, x86-64 Core Ultra 7 155H,
 load average 5–11, release, 2026-11-06; `node/host/tests/ingress/sealed.rs`
