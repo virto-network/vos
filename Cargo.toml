@@ -20,6 +20,7 @@ members = [
     "node/prover",
     "support/vos-raft",
     "support/merkle-crdt",
+    "support/mls",
     "pvm/runtime",
     "pvm/compiler",
     "pvm/program",
@@ -63,6 +64,7 @@ default-members = [
     "node/prover",
     "support/vos-raft",
     "support/merkle-crdt",
+    "support/mls",
     "pvm/runtime",
     "pvm/compiler",
     "pvm/program",
@@ -233,6 +235,7 @@ vos-pvm-recair = { path = "pvm/proof/recair", default-features = false }
 vos-pvm-final-verifier = { path = "pvm/proof/final-verifier" }
 vos-light = { path = "node/light" }
 merkle-crdt = { path = "support/merkle-crdt" }
+vos-mls = { path = "support/mls" }
 vos-statement = { path = "pvm/proof/statement" }
 vos-anchor = { path = "pvm/proof/anchor" }
 vos-statement-service = { path = "pvm/proof/statement/service" }
