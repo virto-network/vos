@@ -34,6 +34,10 @@
 //!   group (`group.rs`): groups of devices paired and updated round after
 //!   round over stores under DIR, each device's part timed.
 //!
+//! - `vos-phone sync --dir DIR [--rounds N] [--shapes small,large]`: sealed
+//!   sync (`sync.rs`): a mebibyte written on one device, pushed sealed to a
+//!   stand-in agent, and caught up on another, each device's part timed.
+//!
 //! **Two builds:** the timing build (masks from the operating system, as
 //! the library's every build) and the seeded build (`--features seeded`:
 //! each proof's masks from a fixed seed, so its bytes are any machine's;
@@ -65,6 +69,7 @@ mod device;
 mod group;
 mod light;
 mod member;
+mod sync;
 
 use member::{HANDLE, SLOT, SOURCE_OUTPUT};
 
@@ -534,13 +539,15 @@ fn main() {
         Some("kernel") => kernel(&args[1..]),
         Some("light") => light::light(&args[1..]),
         Some("group") => group::group(&args[1..]),
+        Some("sync") => sync::sync(&args[1..]),
         _ => {
             eprintln!(
                 "vos-phone run [--reps N] [--threads auto|N] [--cells LIST] [--grind N] [--out DIR] | verify DIR \
                  | device [--kernels DIR] [--cells LIST] [--reps N] [--warmups N] [--threads auto|N] [--out DIR] \
                  | kernel --device PATH --input PATH --out PATH [--threads auto|N] \
                  | light --store DIR [--calls N] [--check] \
-                 | group --dir DIR [--devices 3,8] [--rounds N]"
+                 | group --dir DIR [--devices 3,8] [--rounds N] \
+                 | sync --dir DIR [--rounds N] [--shapes small,large]"
             );
             std::process::exit(2);
         }

@@ -27,7 +27,7 @@ use vos_wire::personal::{
 
 use crate::light::AGENT;
 
-const IDENTITY: [u8; 32] = [0x1d; 32];
+pub(crate) const IDENTITY: [u8; 32] = [0x1d; 32];
 const INSTANCE: InstanceId = InstanceId(5);
 /// The batch time the script starts at, and a round's step.
 const T0: u64 = 1_800_000_000_000;
@@ -41,10 +41,10 @@ fn agent() -> Agent {
 
 /// The agent's control log, as `Personal` would write it for these
 /// rounds.
-struct Script {
+pub(crate) struct Script {
     entries: Vec<(u64, Entry)>,
     chain: [u8; 32],
-    now: u64,
+    pub(crate) now: u64,
 }
 
 impl Script {
@@ -65,9 +65,9 @@ impl Script {
     }
 }
 
-struct Device {
-    _light: Light,
-    group: DeviceGroup,
+pub(crate) struct Device {
+    pub(crate) light: Light,
+    pub(crate) group: DeviceGroup,
     sync: SigningKey,
     admin: SigningKey,
 }
@@ -228,6 +228,52 @@ fn quantile(times: &mut [u64], q: usize) -> u64 {
         .unwrap_or(0)
 }
 
+/// `size` devices, each a light node's store under `root`, the first
+/// claiming the agent and pairing the rest, each pairing confirmed by every
+/// device: the devices and the agent's log.
+pub(crate) fn household(root: &Path, size: usize) -> (Vec<Device>, Script) {
+    let _ = std::fs::remove_dir_all(root);
+    let mut script = Script {
+        entries: Vec::new(),
+        chain: [0; 32],
+        now: T0,
+    };
+    let mut devices: Vec<Device> = Vec::new();
+    for n in 0..size {
+        let light =
+            Light::open(&root.join(n.to_string()), AGENT, Config::default()).expect("opens");
+        let (sync, admin, device) = keys(n as u8 + 1);
+        if n == 0 {
+            script.append(Body::Assigned {
+                device: 0,
+                kit: Vec::new(),
+            });
+            let group = DeviceGroup::create(light.store(), agent(), device, script.now).unwrap();
+            devices.push(Device {
+                light,
+                group,
+                sync,
+                admin,
+            });
+            continue;
+        }
+        let package = DeviceGroup::key_package(light.store(), &device, script.now).unwrap();
+        let (prepared, pairing) = devices[0]
+            .group
+            .pair(device.clone(), package, script.now)
+            .unwrap();
+        let group = DeviceGroup::join(light.store(), device, pairing).unwrap();
+        devices.push(Device {
+            light,
+            group,
+            sync,
+            admin,
+        });
+        round(&mut devices, 0, &mut script, prepared, 0);
+    }
+    (devices, script)
+}
+
 pub fn group(args: &[String]) {
     let mut dir = None;
     let mut sizes = vec![3usize, 8];
@@ -262,47 +308,7 @@ pub fn group(args: &[String]) {
     }
     for size in sizes {
         let root = Path::new(&dir).join(format!("group-{size}"));
-        let _ = std::fs::remove_dir_all(&root);
-        let mut script = Script {
-            entries: Vec::new(),
-            chain: [0; 32],
-            now: T0,
-        };
-        let mut devices = Vec::new();
-        for n in 0..size {
-            let light =
-                Light::open(&root.join(n.to_string()), AGENT, Config::default()).expect("opens");
-            let (sync, admin, device) = keys(n as u8 + 1);
-            let group = if n == 0 {
-                script.append(Body::Assigned {
-                    device: 0,
-                    kit: Vec::new(),
-                });
-                DeviceGroup::create(light.store(), agent(), device, script.now).unwrap()
-            } else {
-                let package = DeviceGroup::key_package(light.store(), &device, script.now).unwrap();
-                let (prepared, pairing) = devices
-                    .first_mut()
-                    .map(|first: &mut Device| first.group.pair(device.clone(), package, script.now))
-                    .unwrap()
-                    .unwrap();
-                let group = DeviceGroup::join(light.store(), device, pairing).unwrap();
-                devices.push(Device {
-                    _light: light,
-                    group,
-                    sync,
-                    admin,
-                });
-                round(&mut devices, 0, &mut script, prepared, 0);
-                continue;
-            };
-            devices.push(Device {
-                _light: light,
-                group,
-                sync,
-                admin,
-            });
-        }
+        let (mut devices, mut script) = household(&root, size);
         // Past the paired devices' probation, as the log's time runs.
         script.now += vos_wire::personal::Policy::DEFAULT.probation_ms;
         let scope = [0x6e; 16];

@@ -31,7 +31,7 @@ use vos_wire::{Decode, Encode, keys};
 /// the build script computed them; empty when it found no ELFs to build
 /// them from.
 pub static AGENT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/agent.bin"));
-static NOTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/notes.bin"));
+pub static NOTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/notes.bin"));
 
 const INSTANCE: InstanceId = InstanceId(1);
 const DEVICE: Principal = Principal::Client([0xd1; 32]);
