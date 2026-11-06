@@ -21,7 +21,8 @@ use std::rc::Rc;
 
 use ed25519_dalek::SigningKey;
 use vos_light::personal::{
-    Link, Route, SealedSync, SyncError, Unusable, Waiting, open_recovery, recovery_key,
+    Answer, Frontier, Link, Route, SealedSync, SyncError, Unusable, Waiting, open_recovery,
+    recovery_key,
 };
 use vos_light::release::{self, Package};
 use vos_light::sealed::{self, OpenError};
@@ -34,6 +35,8 @@ use vos_wire::{Decode, Encode};
 
 use home::Home;
 use phone::Phone;
+
+mod detection;
 
 const MIN: u64 = 60_000;
 const NOTES: InstanceId = InstanceId(1);
@@ -165,6 +168,12 @@ impl Link for HomeLink<'_> {
     fn wake(&mut self) -> Result<Result<Woken, PersonalError>, Broken> {
         self.requests += 1;
         Ok(self.home.call(&self.sync, "wake", ().encode()).answer())
+    }
+
+    fn frontier(&mut self, device: u32) -> Answer<Frontier, Broken> {
+        self.requests += 1;
+        let key = self.sync.verifying_key().to_bytes();
+        Ok(self.home.query(key, "frontier", device.encode()))
     }
 }
 
@@ -298,6 +307,7 @@ fn paired_phones_sync_sealed_scopes() {
     assert_eq!(caught.envelopes, 5);
     assert_eq!(caught.ingested.as_ref().unwrap().applied.len(), 5);
     assert!(caught.passed.is_empty() && caught.waiting.is_none());
+    assert!(caught.alarms.is_empty(), "{:?}", caught.alarms);
     let view = phones[0].group().view();
     for heard in &caught.heard {
         assert_eq!((heard.view.index, heard.view.chain), view);
@@ -315,6 +325,7 @@ fn paired_phones_sync_sealed_scopes() {
     })
     .unwrap();
     assert_eq!(caught.envelopes, 6, "its own five read back");
+    assert!(caught.alarms.is_empty(), "{:?}", caught.alarms);
     assert_eq!(caught.ingested.as_ref().unwrap().duplicates, 5);
     assert_eq!(caught.heard[5].seen, vec![(scope, 5)]);
     assert_eq!(count(&phones[0].light, NOTES, 7), Some(70));
@@ -599,6 +610,7 @@ fn a_catch_up_reads_page_after_page() {
     })
     .unwrap();
     assert!(caught.bytes > vos_wire::personal::ANSWER_BYTES);
+    assert!(caught.alarms.is_empty(), "{:?}", caught.alarms);
     assert_eq!(caught.ingested.unwrap().applied.len(), 40);
     assert_eq!(phones[1].light.cursor(NOTES).unwrap(), Some(40));
 }

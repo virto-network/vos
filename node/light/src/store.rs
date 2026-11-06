@@ -226,6 +226,28 @@ impl Store {
         Ok(true)
     }
 
+    /// The group keyspace's rows under `prefix`, after `after` if given,
+    /// in order.
+    pub(crate) fn group_rows(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+    ) -> Result<Vec<Row>, StoreError> {
+        let start = match after {
+            Some(after) => Bound::Excluded(after.to_vec()),
+            None => Bound::Included(prefix.to_vec()),
+        };
+        let mut rows = Vec::new();
+        for row in self.0.group.range::<Vec<u8>, _>((start, Bound::Unbounded)) {
+            let (key, value) = row.into_inner()?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            rows.push((key.to_vec(), value.to_vec()));
+        }
+        Ok(rows)
+    }
+
     /// Write `rows` of the group keyspace, synced: `None` deletes.
     pub(crate) fn write_group_rows(
         &self,

@@ -26,14 +26,14 @@ pub struct Phone {
 }
 
 impl Phone {
-    /// Phone `n`: its sync key's seed `[n; 32]`, its admin key's `[n | 0x80;
-    /// 32]`, a strong admin.
+    /// Phone `n`: its sync key its light node's, its scopes' author, its
+    /// admin key's seed `[n | 0x80; 32]`, a strong admin.
     pub fn new(n: u8) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let light =
             Light::open(dir.path(), &crate::home::artifacts().0, Config::default()).unwrap();
         let store = light.store().clone();
-        let sync = SigningKey::from_bytes(&[n; 32]);
+        let sync = light.sync_key().clone();
         let admin = SigningKey::from_bytes(&[n | 0x80; 32]);
         let keys = NewDevice {
             sync: sync.verifying_key().to_bytes(),

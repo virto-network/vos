@@ -14,7 +14,7 @@ use vos_wire::personal::{
 
 use super::{
     Act, Alarm, CONFIRM, Check, Course, DeviceGroup, Event, GroupError, Known, Named, Passing,
-    Pending, Processed, Remedy, Why, rows,
+    Pending, Processed, Remedy, Why,
 };
 use crate::call::method_id;
 
@@ -22,7 +22,7 @@ use crate::call::method_id;
 /// hash.
 type CommitArguments = ((u64, Effect), (Vec<u8>, Option<[u8; 32]>));
 
-pub(super) fn verifies(key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
+pub(crate) fn verifies(key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
     VerifyingKey::from_bytes(key).is_ok_and(|key| {
         key.verify_strict(message, &Signature::from_bytes(signature))
             .is_ok()
@@ -32,12 +32,15 @@ pub(super) fn verifies(key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> 
 impl DeviceGroup {
     /// Read `entries` of the control log, from the cursor on, in order:
     /// what the device must post, and what it saw. An entry that does not
-    /// chain stops the reading with [`Alarm::Log`]; entries before the
-    /// cursor are skipped, and the reading stops at a gap. A device that
-    /// cannot follow reads on for the device set's operations, its own
-    /// regroup's among them, not for others' candidates. The device's
-    /// state is written once a confirmed epoch is swapped in and at the
-    /// end, each time in one batch with its MLS state.
+    /// chain stops the reading with [`Alarm::Log`], and so does one before
+    /// the cursor whose chain is not the one this device read there (a fork
+    /// behind it); the reading stops at a gap. Each entry is checked
+    /// against the writers' views waiting for it ([`Alarm::View`]) and this
+    /// device's admin calls the agent took there ([`Alarm::Dropped`]). A
+    /// device that cannot follow reads on for the device set's operations,
+    /// its own regroup's among them, not for others' candidates. The
+    /// device's state is written once a confirmed epoch is swapped in and
+    /// at the end, each time in one batch with its MLS state.
     pub fn follow(
         &mut self,
         entries: impl IntoIterator<Item = (u64, Entry)>,
@@ -48,6 +51,11 @@ impl DeviceGroup {
                 break;
             }
             if index < self.state.next {
+                let read = self.store.group_row(&super::chain_key(index + 1))?;
+                if read.is_some_and(|read| read[..] != entry.chain[..]) {
+                    events.push(Event::Alarm(Alarm::Log { index }));
+                    break;
+                }
                 continue;
             }
             if index > self.state.next {
@@ -65,14 +73,55 @@ impl DeviceGroup {
             self.state.next += 1;
             self.state.chain = entry.chain;
             self.state.time = entry.at;
+            self.chains.push((self.state.next, entry.chain));
+            self.witness(index, &entry, &mut events);
             self.deadline(entry.at, &mut events)?;
             self.support(&mut events)?;
             self.entry(index, entry, &mut events)?;
             self.settle(&mut events)?;
         }
         self.reposts(&mut events);
-        self.mls.write(rows(&self.state, Some(&self.archive)))?;
+        let writes = self.writes(true);
+        self.mls.write(writes)?;
         Ok(events)
+    }
+
+    /// The entry at `index`, just read, against what waits for it: the
+    /// writers' views of the log through it, and this device's admin call
+    /// the agent said it took there.
+    fn witness(&mut self, index: u64, entry: &Entry, events: &mut Vec<Event>) {
+        let next = self.state.next;
+        if let Some(at) = self.state.views.iter().position(|(view, _)| *view == next) {
+            let (_, chain) = self.state.views.remove(at);
+            if chain != entry.chain {
+                events.push(Event::Alarm(Alarm::View { index: next }));
+            }
+        }
+        let Some(at) = self.state.made.iter().position(|made| made.index == index) else {
+            return;
+        };
+        let made = &self.state.made[at];
+        let call = match &entry.body {
+            Body::Operation { call, .. }
+            | Body::Candidate { call, .. }
+            | Body::Veto { call, .. }
+            | Body::Cosign { call, .. }
+            | Body::Resolve { call, .. } => Some(call),
+            _ => None,
+        };
+        let held = call.is_some_and(|call| {
+            call.origin == made.origin
+                && call.method == made.method
+                && call.arguments == made.arguments
+        });
+        if held || made.method != method_id("veto") {
+            self.state.made.remove(at);
+        } else {
+            self.state.made[at].dropped = true;
+        }
+        if !held {
+            events.push(Event::Alarm(Alarm::Dropped { index }));
+        }
     }
 
     fn entry(
@@ -384,6 +433,14 @@ impl DeviceGroup {
             {
                 let passing = self.state.passing.take().expect("passing");
                 if let Verdict::Confirmed(_) = verdict {
+                    // The device it added is the set's, by the agent's
+                    // word: its nodes' author is known.
+                    if let (Some(id), Some(keys)) = (passing.added, passing.effect.add)
+                        && self.state.known(id).is_none()
+                    {
+                        let active_from = passing.at.saturating_add(self.state.policy.probation_ms);
+                        self.state.devices.push((id, Known::new(keys, active_from)));
+                    }
                     self.carried(passing.epoch, &passing.effect.remove);
                 }
             }
@@ -756,8 +813,8 @@ impl DeviceGroup {
                         .ok_or(GroupError::Corrupt)?;
                     self.archive.record(pending.epoch, scope, key);
                 }
-                self.mls
-                    .swap(*candidate, rows(&self.state, Some(&self.archive)))?;
+                let writes = self.writes(true);
+                self.mls.swap(*candidate, writes)?;
                 events.push(Event::Confirmed {
                     epoch: pending.epoch,
                 });
@@ -766,7 +823,8 @@ impl DeviceGroup {
             Some(Processed::Copy { candidate, h: None }) => {
                 self.apply(&pending);
                 self.state.course = Course::Out;
-                self.mls.swap(*candidate, rows(&self.state, None))?;
+                let writes = self.writes(false);
+                self.mls.swap(*candidate, writes)?;
                 events.push(Event::Removed);
                 Ok(())
             }
@@ -827,7 +885,8 @@ impl DeviceGroup {
             if let Some(rekey) = &pending.effect.rekey {
                 self.archive.forget(&rekey.r_hash);
             }
-            self.mls.void(rows(&self.state, Some(&self.archive)))?;
+            let writes = self.writes(true);
+            self.mls.void(writes)?;
         }
         events.push(Event::Voided {
             epoch: pending.epoch,
@@ -858,7 +917,8 @@ impl DeviceGroup {
         self.state.pending = None;
         self.state.own = None;
         self.processed = None;
-        self.mls.void(rows(&self.state, None))?;
+        let writes = self.writes(false);
+        self.mls.void(writes)?;
         events.push(Event::Alarm(Alarm::CannotFollow {
             epoch,
             committer,
@@ -873,7 +933,8 @@ impl DeviceGroup {
         self.state.pending = None;
         self.state.own = None;
         self.processed = None;
-        self.mls.void(rows(&self.state, None))?;
+        let writes = self.writes(false);
+        self.mls.void(writes)?;
         events.push(Event::Removed);
         Ok(())
     }
