@@ -3944,13 +3944,13 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s4-credential"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=2609b8b13eecd8e59b938a83e0dbcc51ec89ff1d#2609b8b13eecd8e59b938a83e0dbcc51ec89ff1d"
+source = "git+https://codeberg.org/Virto/s4?rev=265111e61b5ccd790f55166c44074687a724a59c#265111e61b5ccd790f55166c44074687a724a59c"
 dependencies = [
  "getrandom 0.2.17",
  "hex",
  "libc",
  "russh",
- "s4-protocol 0.1.0 (git+https://codeberg.org/Virto/s4?rev=2609b8b13eecd8e59b938a83e0dbcc51ec89ff1d)",
+ "s4-protocol 0.1.0 (git+https://codeberg.org/Virto/s4?rev=265111e61b5ccd790f55166c44074687a724a59c)",
  "serde",
  "sha2 0.10.9",
  "tokio",
@@ -3964,7 +3964,7 @@ dependencies = [
 [[package]]
 name = "s4-protocol"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=2609b8b13eecd8e59b938a83e0dbcc51ec89ff1d#2609b8b13eecd8e59b938a83e0dbcc51ec89ff1d"
+source = "git+https://codeberg.org/Virto/s4?rev=265111e61b5ccd790f55166c44074687a724a59c#265111e61b5ccd790f55166c44074687a724a59c"
 dependencies = [
  "base64",
  "ciborium",
@@ -5200,7 +5200,7 @@ dependencies = [
  "hmac 0.12.1",
  "russh",
  "s4-credential",
- "s4-protocol 0.1.0 (git+https://codeberg.org/Virto/s4?rev=2609b8b13eecd8e59b938a83e0dbcc51ec89ff1d)",
+ "s4-protocol 0.1.0 (git+https://codeberg.org/Virto/s4?rev=265111e61b5ccd790f55166c44074687a724a59c)",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
