@@ -774,7 +774,10 @@ the S8-P1 session]:
   record in one batch before it returns; `Mls::own` applies it on a copy
   only for its handshake's hash and the next epoch; `Mls::swap` refuses a
   copy of another epoch and deletes any held commit; `Mls::void` deletes
-  it. The policy refuses, received, anything but Add and Remove by value,
+  it. `Mls::restart` starts a new group, its commit adding the rest from
+  their key packages applied and held beside the current group until the
+  swap, which deletes the group left; a member joins it by Welcome from
+  the group it is in. The policy refuses, received, anything but Add and Remove by value,
   an external commit, a committer or adds and removals not the logged
   effect, a handshake in the clear and a commit whose committer kept its
   leaf (no path); a leaf's successor must carry the same credential, so a
@@ -785,17 +788,36 @@ the S8-P1 session]:
   and the sync key votes and evidence. A commit's signed call is written
   before it is sent, so its evidence is posted again after a crash until
   the log holds it. Reading the log, a device checks each entry's chain;
-  takes a removal only from a device with a voice past its probation, and
-  a maturity only with a removal whose evidence verified behind it
-  (otherwise an alarm); takes a candidate only from such a device, an add
-  only from a strong admin for a fresh device number; processes it once
+  checks each device-set call (operation, veto, second signature,
+  resolution) against its signer's key (an active device's admin key, as
+  replaced, or the kit entry's), what that signer may sign and the delay
+  the configured policy sets; honours a maturity only once the evidence
+  supports it (the operation's own, and its delay passed with no verified
+  veto of a device with a voice, no rival removal and, for a restore, no
+  `alive` since, or a verified second signature, or verified resolutions
+  naming it: the kit's, or two seasoned strong devices'), waiting for
+  evidence posted after the maturity until the confirm window has passed,
+  else an alarm (`Unsigned`); takes a candidate only from a device with a
+  voice past its probation, an add only from a strong admin or as a
+  matured add operation, for a fresh device number; processes it once
   its evidence verifies, on a copy at the log's time under its logged
   effect, and refuses it unless the copy's members are the device set
   after it; votes; verifies each vote of the set against the voter's sync
   key and this device's log; and decides by its own count, an entry past
   the window deciding as of the window's end as the agent does. The
   agent's verdict is advisory: one this device cannot count raises an
-  alarm, and the next candidate stops it (re-pair).
+  alarm, and the next candidate stops it (re-pair). A call refused with
+  `Settling` is made again after a `wake`.
+- **Regroup and restore:** a matured regroup voids the pending candidate,
+  and the next commit is the regrouper's new group (`DeviceGroup::regroup`,
+  with the key packages the rest hand over as a pairing's), its epoch the
+  confirmed one plus one, carrying every removal; the rest join it by its
+  Welcome, and its epochs count on from the agent's. A device that cannot
+  follow reads on for the device set's operations and takes no candidate
+  but its own regroup's. A restore's device starts its new group alone
+  from what it reads of the agent once the restore matured
+  (`DeviceGroup::restore`: the log's head, the device set, the new kit),
+  its first commit carrying the removal of every device before it.
 - **Keys:** `k(scope, n)` only at the confirmed epoch; the archive holds
   the naming secret, drawn with the store (for the claiming device, with
   its group), and every tracked scope's key of every confirmed epoch,
@@ -803,12 +825,12 @@ the S8-P1 session]:
   (`MLS-Exporter("vos/personal/archive", "", 32)`, XChaCha20-Poly1305).
   Pushing it to the agent is 8.20's. A store that derived a scope id
   joins no other group.
-- **Not built here:** the device set's rules beyond what this reads
-  (vetoes, contests, immediate removal by two seasoned devices, the kit's
-  operations, the probation's freeze), which 8.13 adds to the log and the
-  device must then read the same way; a delayed admin's add (refused at
-  the agent and on devices until 8.13 makes it an operation first);
-  regroup (the alarm names it as the remedy).
+- **Not built here:** the probation's freeze on devices (a device takes a
+  paired device's probation as unfrozen, so it may accept a signature the
+  agent refuses first, never the reverse); a replaced admin key's leaf
+  credential (the leaf keeps the key it was added with; the replaced key
+  signs calls); a stuck device's view of adds confirmed while it was
+  stuck.
 
 **The device group measured** [measured, x86-64 Core Ultra 7 155H under
 load (load average 15–20), release, 2026-11-06; `vos-phone group`, the
