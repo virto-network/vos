@@ -375,6 +375,12 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   elsewhere, liveness, the forced rotation; the removal, veto, contest and
   resolution flows; delayed admins; admin-key replacement.
 - **Dep:** 8.13, 8.20. **Estimate:** 2–2.5 weeks.
+- **Built** (2026-11-06, `light-node.md` §3.5 "The kit and its flows as
+  built"): `vos_light::kit`; `R` rotated at every removal [the owner,
+  2026-11-06], the commit re-sealing the kit (`Effect::rekey`); a
+  replaced admin key's leaf renewed (`vos_mls::Mls::renew`); the gate's
+  flows driven through `Personal` in the light tests' home. Pushing a
+  restore-elsewhere's old scopes to the new home is 8.23c's.
 
 ### 8.23c Moving home — B
 - Claim elsewhere, a new group, the kit re-split, push everything,

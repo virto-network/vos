@@ -778,8 +778,9 @@ arm64-v8a build; the phones' timings below are S8-P1's]:
     proposals are the logged effect's: `vos-mls` gives its rules the
     logged effect before processing, and its identity provider checks
     each Add's credential (sync and admin key) against the matured
-    operation. A leaf credential change (an admin key replaced) is not
-    yet exercised.
+    operation. A leaf credential change (an admin key replaced) is the
+    committer's own update, allowed for that leaf and that new credential
+    alone (`Mls::renew`, `Expected::renewed`).
   - The Safe Exporter is not in 0.57.
 
 **As built** (`support/mls`, `node/light/src/group`):
@@ -797,9 +798,10 @@ arm64-v8a build; the phones' timings below are S8-P1's]:
   the group it is in. The policy refuses, received, anything but Add and
   Remove by value, an external commit, a committer or adds and removals
   not the logged effect, a handshake in the clear and a commit whose
-  committer kept its leaf (no path); a leaf's successor must carry the same credential, so a
-  device's keys change only by its removal and a new add (admin-key
-  replacement, §3.5, is a new add until it is built).
+  committer kept its leaf (no path); a leaf's successor must carry the
+  same credential, or the one renewal its logged effect allows: a
+  replaced admin key's, by its device's own commit (`Mls::renew`, held
+  as any commit; the leaf's identity, its sync key, unchanged).
 - **The device group (`vos_light::group::DeviceGroup`), sans I/O:** the
   caller reads the log and makes the calls, the admin key signing commits
   and the sync key votes and evidence. A commit's signed call is written
@@ -845,12 +847,15 @@ arm64-v8a build; the phones' timings below are S8-P1's]:
   (`MLS-Exporter("vos/personal/archive", "", 32)`, XChaCha20-Poly1305).
   It is pushed to the agent at each confirmed epoch (§3.6, "Sealed sync
   as built"). A store that derived a scope id joins no other group.
-- **Not built here:** a replaced admin key's leaf credential (the leaf
-  keeps the key it was added with; the replaced key signs calls, and a
-  replacement whose evidence comes after its maturity leaves the old key
-  in force until it verifies); a stuck device's view of adds confirmed
-  while it was stuck; a restore's device's view of operations opened
-  before its read; an alarm on a `Configured` that lowers a delay.
+- **A replaced admin key** [built]: from the replacement's verified
+  maturity the new key signs and the device's next commit renews its
+  leaf to it, which the others accept for that device and that key
+  alone; a call the new key signs while the maturity's evidence is still
+  to come waits for it (the commit is neither processed nor refused) and
+  falls if it never verifies, so a late evidence makes no false refusal.
+- **Not built here:** a stuck device's view of adds confirmed while it
+  was stuck; a restore's device's view of operations opened before its
+  read; an alarm on a `Configured` that lowers a delay.
 
 **The device group measured** [measured, x86-64 Core Ultra 7 155H under
 load (load average 15–20), release, 2026-11-06; `vos-phone group`, the
@@ -1079,6 +1084,12 @@ the control log restarts under it.
   old `R2` deleted, and the recovery envelopes re-sealed under the new `R`
   by the device that rotates. Two seasoned active devices make it at once;
   one makes it pending 72 h and contestable.
+- **`R` rotates at every removal** [decided, the owner, 2026-11-06]: the
+  device that commits a matured removal draws a new `R`, seals its `R1`
+  to each kit entry's X25519 key (no kit holder needed), stores its `R2`
+  at the agent and re-seals the recovery scope; so a removed device,
+  holding the `R` before, reads nothing pushed there after its removal,
+  even with the operators (§3.6, §8 D3).
 - **Moving home re-splits the kit:** the new agent holds a new `R2` and
   re-pushed recovery envelopes; until the move completes the kit opens
   nothing at the new home (§3.9).
@@ -1159,6 +1170,64 @@ where the rules above leave a choice, this is the one taken]:
   left them.
 - **Not built:** an admin call's arguments naming the control log's head
   it was made against (the devices' check, plan 8.19).
+
+**The kit and its flows as built** [built, `vos_light::kit`, the device
+group and sealed sync, tested against `Personal` in
+`node/light/tests/sealed/kit.rs` and `node/light/tests/group/set.rs`;
+where the text above leaves a choice, this is the one taken]:
+- **The 32 bytes:** a phrase is drawn by the operating system and shown
+  as BIP-39's 24 English words (its checksum checked when read back); a
+  security key's are its `hmac-secret` over `SHA-256("vos/personal/kit/
+  v1")`, behind a `SecurityKey` trait (YubiKit's in the app, a test
+  double here). The signing key is the ed25519 seed `BLAKE2b-256(
+  "vos/personal/kit/signing" ‖ bytes)`, the sealing key the X25519 secret
+  `BLAKE2b-256("vos/personal/kit/sealing" ‖ bytes)`; `Homes` indexes the
+  agent by `BLAKE2b-256("vos/personal/kit/index" ‖ signing key)`, which
+  8.14's `Homes` keeps. The phrase's card carries the home's handle and
+  onions beside the words.
+- **`R1` sealed to an entry:** an ephemeral X25519 key, `R1` under
+  XChaCha20-Poly1305 with a zero nonce and the key `BLAKE2b-256(
+  "vos/personal/kit/r1" ‖ agent ‖ ephemeral ‖ sealing ‖ agreement)`, the
+  agent's identity as AAD: 80 bytes. A non-contributory agreement is
+  refused.
+- **Every new `R` is held aside** by the device that drew it (in its
+  archive, never pushed) until the log makes it the kit's: the claim's at
+  once; a rotation's and a restore's at their verified maturity; a
+  commit's at the agent's verdict confirming it, which is where the agent
+  installs the commit's `R2` and moves the kit's reading of the recovery
+  scope on. Each admin call names its `R` by `r_hash` (`NewKit::r_hash`),
+  and a device takes an `R` another's archive brings only when it is the
+  one the log named last, so `R` travels in archives sealed under an
+  epoch's archive key, never under an epoch a removed device was in.
+  While the log names an `R` a device does not hold, it pushes nothing to
+  the recovery scope.
+- **Every commit carrying a removal re-seals the kit**
+  (`Effect::rekey`: the kit's own entries, each with a new `R1`, and the
+  new `R2` in the evidence beside any Welcome, `Attached`); the agent
+  refuses one without (`Rekey`), and so do devices. A commit also
+  re-seals after a kit rotation the kit signed, which leaves no device
+  holding its `R`. The kit's sealing keys a device seals to are its own
+  knowledge: the claim's, or those a verified rotation or restore
+  carried, never the agent's word.
+- **Restore:** the fresh install draws the next kit's split
+  (`group::restoring`, its `R` held in the store) before the kit signs
+  `restore`; once it matured the device reads the previous `R2` and the
+  entries it went with (`RecoveryView::previous`), opens `R1` with the
+  kit, recovers the archive (`personal::recover`), starts its group
+  (`DeviceGroup::restore`, the next kit's `R` the kit's) and takes the
+  recovered archive in (`DeviceGroup::inherit`): the old group's naming
+  secret kept beside its own, so old scopes keep their ids and new ones
+  are named afresh. **Elsewhere:** the restore at the old agent releases
+  `R2`; the device claims an agent at another home with the next kit
+  split anew there, and reads its old scopes from the old agent with the
+  recovered archive (`personal::read_back`); pushing them to the new home
+  is moving home's (8.23c).
+- **Liveness:** every device with a voice that reads an open restore
+  posts `alive` (`Event::Alive`) until the log cancels it, and shows a
+  kit-signed operation for as long as it is open (`Alarm::Kit`); the
+  owner then rotates the kit.
+- **Delayed admins:** a delayed admin's inline add is refused; its add
+  operation waits the operation delay, then its own commit carries it.
 
 **What the control log shows the operators:** the device count and its
 changes, each device's public keys and admin class, the times of
@@ -1297,18 +1366,21 @@ the one taken]:
   secret (`"vos/personal/archive"`, apart from every instance's
   four-byte name). `SealedSync::archive` reads it from its cursor and
   merges every archive sealed at the confirmed epoch (its chunks
-  reassembled and checked against their digest), `R` left out; unless one
+  reassembled and checked against their digest), its `R` only when it is
+  the one the log named last (by `r_hash`); unless one
   there encodes as this device's whole archive (candidates are kept in
   order, so equal archives encode alike), it pushes its own, chunked,
   under the epoch's archive key. The committer's push and the push of any
   device holding keys the agent's archives lack (a scope it tracked
   alone, a key it recorded mid-epoch) are one rule. Archives of earlier
-  epochs are passed over; a later one holds their keys. `R` never travels
-  through the agent: an archive read there that names one is merged
-  without it, so no device of the group can replace `R` for the others.
+  epochs are passed over; a later one holds their keys. `R` travels only
+  sealed under an epoch's archive key, and a device takes it only as the
+  log names it, so no device of the group can replace `R` for the
+  others, and a new `R` reaches no device removed before its epoch.
 - **`R` and the recovery envelopes:** `R` is held in the archive (the
-  later claim's or rotation's by log index), set by the claim or a
-  rotation and carried by pairing; `SealedSync::recovery` reads the
+  one the log made the kit's last, by log index), set by the claim, a
+  rotation, a restore or a commit carrying a removal (§3.5) and carried
+  by pairing; `SealedSync::recovery` reads the
   recovery scope for what it holds under `R` and pushes, sealed under
   `BLAKE2b-256("vos/personal/recovery" ‖ R)` at the confirmed epoch and
   chunked as the archive is, whatever of this device's archive is not
@@ -1333,12 +1405,14 @@ the one taken]:
 - **Known limits found here:** a scope's reading stops for good at an
   envelope of an epoch whose key never arrives, or of an epoch past any
   confirmed one, which the operators can plant (as they can withhold, B1);
-  the chrome should show a scope waiting long. And `R` is not rotated
-  when a device is removed: a removed device holds `R`, and with the
-  operators, who serve the recovery scope, it reads every key pushed
-  there after its removal, which is more than D3's limit (the operators
-  and a leaked kit). The remedy is a kit rotation at each removal (a new
-  `R`, the old `R2` deleted), 8.23b's to build or the owner's to rule out.
+  the chrome should show a scope waiting long.
+- **`R` rotates at every removal** [built, the owner's decision of
+  2026-11-06]: the commit carrying a removal re-seals the kit under a new
+  `R` (§3.5, "The kit and its flows as built"), and its committer seals
+  the whole archive under it once the agent's verdict installs it. A
+  removed device holds the `R` before, so with the operators, who serve
+  the recovery scope, it reads only what was pushed there before its
+  removal: within D3's limit.
 
 **PG6's catch-up on the clearnet** [measured, x86-64 Core Ultra 7 155H,
 load average 5–11, release, 2026-11-06; `node/host/tests/ingress/sealed.rs`
@@ -3043,8 +3117,11 @@ device is told loudly for those 7 days; the security-key kit cannot be
 photographed, and the chrome never shows the words as a QR; the owner
 rotates the kit, deleting the old `R2`; a restore always rotates it.
 *Known limit:* the operators and a leaked kit together read everything;
-a thief holding the kit, a phone and the owner's biometric wins (A4).
-(8.13, 8.23b)
+a thief holding the kit, a phone and the owner's biometric wins (A4). A
+removed device is not a leaked kit: `R` rotates at every removal (the
+committer draws a new `R`, seals `R1` to the kit and stores `R2` at the
+agent), so the operators and a removed device read nothing the recovery
+scope holds after its removal. (8.13, 8.23b)
 
 **D4. The kit points at old onions.** *Mitigation:* the kit carries the
 handle and the onions at the claim; the agent is found by the kit's key.
