@@ -19,7 +19,7 @@ c0a21a2e4b30a4ae5b9e921d2a481435e80b38a6c8a75fc15fc685f79a41cd33  agent/test-act
 d4638aaa0b2102cd85f4fb9566cddbb094b9ebd2e7228d4b42b1e559ecd5e447  agent/test-actors/target/riscv64em-vos/release/caller.elf
 9f99d8155be6b22e902eb20ec990d598c9e5e4948a36187b8851ee02e0a0e5a0  agent/test-actors/target/riscv64em-vos/release/compact.elf
 a7c578941f1a99dbde49f9354418df79ebe505f31b3b2fcc656924f3001dd60b  agent/test-actors/target/riscv64em-vos/release/counter.elf
-96c44961e31caf4a16bf1b0064c4549efb794a423d3870a56e3e54b41b59e29f  agent/test-actors/target/riscv64em-vos/release/credentials-next.elf
+3d89df076e7f9cc0cc2cee5f5af3671cbd6245ef644caf06797e4c1b95f483b0  agent/test-actors/target/riscv64em-vos/release/credentials-next.elf
 6b749aa923113133b63f6a41ca76ca674ff3f744334c9d2bc42e5067c10d16a8  agent/test-actors/target/riscv64em-vos/release/device.elf
 e4cc4aeacd070d1bcec62d8c829ebe9d0ffc4f13e0e923eea0f74c73ecdcc633  agent/test-actors/target/riscv64em-vos/release/device-next.elf
 0af44ef30d7590cf788e4aed0d033bdba46a830053c82d89693ead4543ac52a6  agent/test-actors/target/riscv64em-vos/release/door.elf
@@ -31,7 +31,7 @@ ddf85b7a834ec6f5a78f3023c626eedc35a40bcb6daf33b3f9d3efb38f6b7819  agent/test-act
 81971c2340227caf65599583a67a38b985f2073895237f2995198d83684b020f  agent/test-actors/target/riscv64em-vos/release/lean.elf
 5733edd3e1d8b1ae5060970c8c88974256653c6b373ee35c11f25bc93fac28f9  agent/test-actors/target/riscv64em-vos/release/ledger.elf
 c5187e4249e7196c0e2f32d363af53e8057066dda6f2b8b67dc30aef77a9c806  agent/test-actors/target/riscv64em-vos/release/notes.elf
-f0704c16e6cb9fc8d7e09cea84859f6a9c116f9577df7a2750f2fd88ec2ad908  agent/test-actors/target/riscv64em-vos/release/personal-next.elf
+0c53c69327fec3afedd5ef37d4ff797ba3a57f3eb1a9feb5640fe4b00da394cb  agent/test-actors/target/riscv64em-vos/release/personal-next.elf
 13410e3dc1b02f7a40133a6890597a902fcc68b7caff21b51632c73f939fb8fc  agent/test-actors/target/riscv64em-vos/release/poll.elf
 5adcafa4dbe79afc4c87e98b4a2ad668c459809e58003075d24a3c0d76043ecf  agent/test-actors/target/riscv64em-vos/release/purses.elf
 3e48a9aae9ea5a455725beb6339f2f07bdc1a780caa89c01e75a98b95cf2c190  agent/test-actors/target/riscv64em-vos/release/reader.elf
