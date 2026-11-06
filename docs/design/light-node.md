@@ -704,8 +704,7 @@ point is assigned and a provider ships it outside an unstable feature.
 
 **Measured on mls-rs 0.57** [measured, 2026-11-02; spike outside the
 tree; timings on x86 (Core Ultra 7 155H, under load), the `.so` an
-arm64-v8a build; the phone's timings and the keystore's results wait for
-the S8-P1 session]:
+arm64-v8a build; the phones' timings below are S8-P1's]:
 - **Features:** `default-features = false` with `private_message` only
   (encrypted handshakes); no `std`, `rayon`, `x509`, `psk`,
   `by_ref_proposal`, `out_of_order`, `prior_epoch`, `custom_proposal` or
@@ -719,7 +718,13 @@ the S8-P1 session]:
 - **A candidate processed on a copy** (x86): about 1 ms p50 (0.9–3 ms as
   the host's load varied) in a group of 3 or 8, whether the copy is a
   clone of the in-memory group or loaded from its persisted bytes and
-  written back; PG6's limit, on the phone, is 200 ms.
+  written back; PG6's limit, on the phone, is 200 ms. **On the phones**
+  [measured, S8-P1, 2026-11-06; 200 runs, 3 rounds each]: the Fairphone
+  6 0.63–0.66 ms p50 in a group of 3, 0.73 ms in a group of 8; the
+  Pixel 1 1.22–1.24 ms and 1.40–1.43 ms; loaded from persisted bytes and
+  written back, 0.66 and 1.30–1.33 ms. The exporter agrees on three
+  devices and the allow-list refuses a `GroupContextExtensions` commit,
+  both built and received.
 - **Sizes:** a key package 343 B; an update commit 734 B (3 devices) and
   1,374 B (8); add(2) 1,374 B with a 1,387 B Welcome carrying the tree;
   remove 606 B; the persisted group state 1.1–2.7 KB; a held own commit
@@ -800,6 +805,30 @@ the S8-P1 session]:
   key and the MLS state while locked; a thief who keeps it powered and
   runs code on it reads the personal space. Before the first unlock
   nothing opens (§8, A2).
+
+**Measured on the phones** [measured, plan 8.3, S8-P1, 2026-11-06; a
+spike app, its log host-verified]:
+- **Fairphone 6** (KeyMint 3, Android 15, bootloader locked): the admin
+  key is an Ed25519 keystore key at security level TEE, its attestation
+  chain 5 certificates long to the Key Attestation CA; StrongBox refuses
+  Ed25519 (`Unsupported StrongBox EC: ed25519`), as `IKeyMintDevice.aidl`
+  says. A Class 3 fingerprint is enrolled, so the device is a **strong
+  admin**. Each signature takes one prompt (2.4–2.6 s from the prompt to
+  the touch, 9–16 ms to sign); a second signature without a prompt is
+  refused. Payloads of 15,360 and 16,384 bytes sign and verify on the
+  host; 16,385 bytes fail after the touch (`Invalid input length`), so
+  the 15 KiB bound above holds with margin.
+- **Pixel 1** (LineageOS on Android 15, Keymaster firmware): no hardware
+  Ed25519; the key is keystore2's software fallback, so the device is a
+  **delayed admin**. Its fallback works: a software Ed25519 key sealed
+  under a per-use-authenticated AES keystore key, opened behind the
+  prompt and refused without it.
+- **After first unlock:** on the Fairphone a one-off job and five
+  periodic jobs (every 15 min for 75 min) ran with the phone locked and
+  unwrapped their key each time; the Pixel's one-off job did too.
+- **A security key:** a YubiKey's `hmac-secret` through YubiKit over USB
+  on the Pixel: the credential made (4.9 s with the touch), the secret
+  read twice, the same 32 bytes each time.
 
 **Admin calls, verified at ingress and end to end:**
 - **One call, one prompt:** every device-set operation (add, remove, veto,
@@ -2150,10 +2179,42 @@ tokio's multi-threaded runtime, which the light node brings anyway]:
 | the state directory | 8.0 MB after a cold bootstrap: the directory cache 7.98 MB, state and keystore 11–14 kB. 11.4 MB after about 1.5 h of runs, once the directory refreshed | — |
 | warm bootstrap, x86 | 1.6 s median (5) | ≤ 3 s p50: met on x86 |
 
-The phone's own figures are the phone session's: both phones' idle
-memory, cold and warm bootstrap, and the rows of §6.3. The Fairphone 6
-holds the limits, and a Pixel 1 (Snapdragon 821) gives an ungated point
-for slow phones.
+**Measured on the phones** [measured, S8-P1, 2026-11-06; the same probe
+as §6.3's, built for `aarch64-linux-android` and run from the shell over
+the live Tor network against the spike gateway's onion; 3 cold and 5 warm
+bootstraps and a cold and a warm one through the plain bridge on each
+phone; the Fairphone 6 (Snapdragon 7s Gen 3, Android 15) and the Pixel 1
+(Snapdragon 821, LineageOS on Android 15), one after the other]:
+
+| what | Fairphone 6 | Pixel 1 | limit |
+|---|---|---|---|
+| warm bootstrap, p50 | **0.80 s** | **2.5 s** | ≤ 3 s p50: met on both |
+| cold bootstrap, p50 | 7.2 s | 6.9 s, max 13.8 s | — |
+| bootstrap through the bridge, cold / warm | 5.2 s / 0.94 s | 12.4 s / 2.5 s | — |
+| cold start to the first onion stream, p50 | 11.4 s | 10.5 s, max 18.0 s | — |
+| onion connection, warm client, p50 / p95 | 2.9 s / 7.6 s; 4 of 42 attempts failed | 3.3 s / 11.7 s; 9 of 45 failed | — |
+| SSH handshake, p50 | 3.0 s | 3.5 s (key exchange 1.2 s, authentication 1.4 s, subsystem 0.9 s) | — |
+| a `Time` on an open connection, p50 | 0.41 s | 0.51 s | — |
+| 16 pipelined `Query`s, p50 | 0.57 s | 0.83 s | — |
+| a 1 MiB upload, p50 / p95 | **2.4 s** / 4.2 s, about 0.4 MB/s | 3.6 s / 5.5 s | — |
+| resident memory, idle with an SSH connection open | **32 MiB** | **27 MiB** (26 MiB dormant, 20 MiB bootstrapped) | ≤ 96 MiB: met on both |
+| the state directory | 10.8 MB | 10.9 MB | — |
+
+- **The limits hold on both phones,** the old one included, its warm
+  bootstrap near the limit.
+- **The sign-in over Tor** at the Fairphone's median: about 0.6 s of
+  proving, 2.2 s for the 0.9 MB proof, 0.4 s for the reply: about 3.2 s,
+  under PG3′'s 4 s. Upload rates vary by circuit (§6.3's 0.15 MB/s on
+  2026-11-02); PG3′'s M5 gate decides.
+- **Connections fail often enough to plan for:** 10–20% of fresh onion
+  connections failed on the phones, as on the desktop, so the client
+  retries on a new circuit and keeps its connections open (§6.2's
+  spare).
+- **arti's state on Android:** under `/data/local/tmp` arti refused its
+  state directory's permissions ("problem with filesystem permissions"),
+  so the probe ran with `ARTI_FS_DISABLE_PERMISSION_CHECKS=1`. The app's
+  private directory has the modes arti expects; 8.26 checks that it
+  opens there without the override.
 
 ### 6.5 The Tor policy, bridges, and blocked networks
 

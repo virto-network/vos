@@ -86,6 +86,12 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   1 MiB upload at about 0.15 MB/s. That is the recorded reason to re-plan
   M5. The choices: shrink the device proof, split the upload over
   circuits, or move PG3′'s over-Tor limit (the owner's call).
+- **Phone result** (S8-P1, 2026-11-06, `light-node.md` §6.4): PG5's arti
+  limits hold on both phones: warm bootstrap 0.80 s on the Fairphone 6
+  and 2.5 s on a Pixel 1, idle memory 32 and 27 MiB. A 1 MiB upload took
+  2.4 s at the Fairphone's median, putting the over-Tor sign-in near
+  3.2 s, under PG3′'s 4 s; M5 measures it, and the levers above stay
+  open if it misses.
 
 ### 8.2 SDK-form kernels, measured — A
 - `vos_sdk::p2`; in-place device arguments; `unaligned-scalar-mem` checked
@@ -107,6 +113,13 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
 - **Gate:** PG5's `vos-mls` limit; a candidate processed ≤ 200 ms; the
   locked-phone job works, or PG6's locked-phone limit is dropped and
   stated. **Phone:** S8-P1. **Estimate:** 1–1.5 weeks.
+- **Phone result** (S8-P1, 2026-11-06, `light-node.md` §3.4 and §3.5):
+  the gate passes. A candidate is processed in 0.63–0.73 ms on the
+  Fairphone 6 and 1.2–1.4 ms on a Pixel 1; the locked-phone job ran and
+  unwrapped its key on both phones; the Fairphone's admin key is an
+  Ed25519 TEE key, attested, signing up to 16 KiB a prompt; the Pixel 1
+  is a delayed admin; the security key's `hmac-secret` reads the same
+  32 bytes twice over USB.
 
 ## M1 — One ingress path, the light node's core, P1 (7–9 weeks)
 
@@ -410,6 +423,10 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   opt-out for key-signed calls with a plain warning; no clearnet route at
   all for anonymous calls or for the personal agent's and `Homes`' kinds;
   plain bridges pasted in the chrome.
+- arti's state in the app's private directory without
+  `ARTI_FS_DISABLE_PERMISSION_CHECKS` (S8-P1 needed it under
+  `/data/local/tmp`); a fresh onion connection retried on a new circuit
+  (10–20% failed on the phones).
 - **Gate:** an anonymous call refused by the client on a clearnet-only
   path; a bootstrap through a pasted bridge on the phone; two isolation
   groups never sharing a circuit or an SSH key in a capture.
