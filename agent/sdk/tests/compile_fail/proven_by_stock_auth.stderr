@@ -1,0 +1,27 @@
+error: the stock `auth` kernel proves a pseudonym in a scope: name it, `credential = Auth("name")`
+  --> tests/compile_fail/proven_by_stock_auth.rs:15:11
+   |
+15 |     #[msg(proven = auth)]
+   |           ^^^^^^
+
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `poll`
+  --> tests/compile_fail/proven_by_stock_auth.rs:26:19
+   |
+26 | fn reference() -> poll::Proof {
+   |                   ^^^^
+   |                   |
+   |                   use of unresolved module or unlinked crate `poll`
+   |                   help: a struct with a similar name exists: `Poll`
+   |
+   = help: if you wanted to use a crate named `poll`, use `cargo add poll` to add it to your `Cargo.toml`
+
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `poll`
+  --> tests/compile_fail/proven_by_stock_auth.rs:27:5
+   |
+27 |     poll::Proof { root: [0; 32] }
+   |     ^^^^
+   |     |
+   |     use of unresolved module or unlinked crate `poll`
+   |     help: a struct with a similar name exists: `Poll`
+   |
+   = help: if you wanted to use a crate named `poll`, use `cargo add poll` to add it to your `Cargo.toml`

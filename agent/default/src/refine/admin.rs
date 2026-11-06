@@ -189,7 +189,7 @@ fn previous(over: Option<&Installed>, installed: &Installed, now: u64) -> Vec<Pr
 /// `schema` at `instance` writes, if it is one; or its failure,
 /// [`Failure::Credentials`]: a second credential actor at another
 /// instance, the actor's instance replaced by a program that is not one,
-/// or an auth guard in an agent with no credential actor.
+/// or a guard naming a stock kernel in an agent with no credential actor.
 fn credentials(
     base: &Base,
     instance: InstanceId,
@@ -206,7 +206,7 @@ fn credentials(
     match actor {
         Some(actor) if actor != instance && schema.credentials => Err(refused()),
         Some(actor) if actor == instance && !schema.credentials => Err(refused()),
-        None if schema.guards_auth() && !schema.credentials => Err(refused()),
+        None if schema.guards_stock() && !schema.credentials => Err(refused()),
         None if schema.credentials => Ok(Some(Write {
             key: keys::credentials(),
             value: Some(instance.encode()),

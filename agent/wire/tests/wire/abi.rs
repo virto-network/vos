@@ -342,16 +342,15 @@ fn an_admission_follows_the_credentials_part() {
     }
 }
 
-/// A credential guard sits on a command alone, with no role and not
-/// linearizable, an auth guard's name 1 to 64 bytes; the credential
-/// actor's mark is the section's last byte.
+/// A guard sits on a command alone, with no role and not linearizable, an
+/// auth guard's name 1 to 64 bytes, a kernel guard's a device kernel of
+/// the program; the credential actor's mark is the section's last byte.
 #[test]
 fn credential_guards_validate_and_the_mark_is_last() {
     use vos_wire::ids::Principal;
     use vos_wire::schema::{CredentialGuard, MethodSchema, Schema, SchemaError};
     let auth = |name: &[u8]| CredentialGuard::Auth {
         name: name.to_vec(),
-        device: None,
         once: true,
     };
     let guarded = |kind, credential| MethodSchema {
@@ -402,7 +401,25 @@ fn credential_guards_validate_and_the_mark_is_last() {
         Err(SchemaError::Undecodable),
         "an empty mark"
     );
-    assert!(fine.guards_auth());
+    assert!(fine.guards_stock());
+    let kernel = |name: &[u8]| CredentialGuard::Kernel {
+        name: name.to_vec(),
+    };
+    let device = MethodSchema {
+        id: MethodId(5),
+        name: b"spend".to_vec(),
+        credential: None,
+        ..guarded(Kind::Device, CredentialGuard::Owner)
+    };
+    let own = schema(vec![
+        guarded(Kind::Command, kernel(b"spend")),
+        device.clone(),
+    ]);
+    assert_eq!(Schema::read(&own.section()), Ok(own.clone()));
+    assert!(
+        !own.guards_stock(),
+        "a kernel guard needs no credential actor"
+    );
     let refused = MethodId(3);
     for methods in [
         vec![guarded(Kind::Query, CredentialGuard::Owner)],
@@ -413,6 +430,16 @@ fn credential_guards_validate_and_the_mark_is_last() {
             role: Some(b"minter".to_vec()),
             ..guarded(Kind::Command, CredentialGuard::Owner)
         }],
+        vec![guarded(Kind::Command, kernel(b"spend"))],
+        vec![guarded(Kind::Command, kernel(b"vote"))],
+        vec![guarded(Kind::Command, kernel(b"other")), device.clone()],
+        vec![
+            guarded(Kind::Command, kernel(b"spend")),
+            MethodSchema {
+                kind: Kind::Stating,
+                ..device.clone()
+            },
+        ],
     ] {
         assert_eq!(
             Schema::read(&schema(methods).section()),
@@ -427,10 +454,14 @@ fn credential_guards_validate_and_the_mark_is_last() {
         nullifier: [2; 32],
     };
     let owner = Principal::Owner([3; 32]);
+    let proven = Principal::Kernel { program: [4; 32] };
     assert!(auth(b"vote").admits(&anonymous) && !auth(b"vote").admits(&owner));
     assert!(CredentialGuard::Owner.admits(&owner) && !CredentialGuard::Owner.admits(&anonymous));
     assert!(!CredentialGuard::Owner.admits(&Principal::Client([3; 32])));
-    assert!(anonymous.is_credential() && owner.is_credential());
+    assert!(kernel(b"spend").admits(&proven) && !kernel(b"spend").admits(&anonymous));
+    assert!(!auth(b"vote").admits(&proven) && !CredentialGuard::Owner.admits(&proven));
+    assert!(anonymous.is_credential() && owner.is_credential() && proven.is_credential());
+    assert_eq!(proven.encode()[0], 7, "a kernel's origin at index 7");
     assert!(!Principal::Client([0; 32]).is_credential());
 }
 
@@ -459,14 +490,23 @@ fn method_schemas_encode_field_by_field() {
         linearizable: false,
         credential: Some(Box::new(vos_wire::schema::CredentialGuard::Auth {
             name: b"v".to_vec(),
-            device: None,
             once: true,
         })),
-        ..method
+        ..method.clone()
     };
     assert_eq!(
         guarded.encode(),
-        hex("040302010300000067657400000000010001000000760001")
+        hex("0403020103000000676574000000000100010000007601")
+    );
+    let proven = MethodSchema {
+        credential: Some(Box::new(vos_wire::schema::CredentialGuard::Kernel {
+            name: b"k".to_vec(),
+        })),
+        ..guarded
+    };
+    assert_eq!(
+        proven.encode(),
+        hex("0403020103000000676574000000000102010000006b")
     );
 }
 

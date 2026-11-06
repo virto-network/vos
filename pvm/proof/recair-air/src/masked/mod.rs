@@ -20,8 +20,7 @@
 //! The masking is the wrap's alone: leaves and folds never read this module,
 //! and their components keep [`crate::LOG_CONSTRAINT_EXPANSION`]. Everything
 //! here is generic over the component set ([`MaskedComponents`]);
-//! [`WrapComponents`] is the recursion AIR's, [`CredentialComponents`] the
-//! credential AIR's (`p2` and `qm31`).
+//! [`WrapComponents`] is the recursion AIR's.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -59,11 +58,9 @@ pub const TREES: usize = 4;
 const AIR_TREES: usize = TREES - 1;
 
 mod component;
-mod credential;
 mod wrap;
 
 pub use component::{MaskedComponent, Rebound};
-pub use credential::{CredentialComponents, CredentialLogSizes, credential_preprocessed_ids};
 pub use wrap::WrapComponents;
 
 relation!(BlindRelation, 1);

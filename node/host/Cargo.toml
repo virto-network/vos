@@ -56,8 +56,6 @@ vos-venue = { workspace = true }
 # recorded and submitted.
 vos-node-prover = { workspace = true }
 vos-wire = { workspace = true }
-# A credentialed call's proof, verified at ingress (its bytes decoded).
-vos-pvm-final-verifier = { workspace = true, features = ["credential-bytes"] }
 # A device proof's program, computed from its installed kernel, and its
 # verifier.
 vos-pvm-recair = { workspace = true }

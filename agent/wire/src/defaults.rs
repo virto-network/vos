@@ -16,12 +16,17 @@ pub const SESSION_BUCKET_MS: u64 = 5 * 60 * 1000;
 pub const SWEEP_LIMIT: usize = 32;
 /// The most binding digests one sweep forgets, beside them
 /// ([`crate::keys::SweepBudget`]): a backlog drains this many a sweep, a
-/// sweep every batch while rows are due, so an agent whose credentialed
-/// calls outrun this many a batch grows its binding rows until the load
-/// falls. A sweep looks at both counts' rows (96), so while more bindings
-/// than that are due before a session's or a workflow's row, that row
-/// waits for them to drain.
+/// sweep every batch while rows are due. Bindings keep an index of their
+/// own ([`crate::keys::due`]), so a backlog of them never holds a
+/// session's or a workflow's row back.
 pub const SWEEP_BINDINGS: usize = 64;
+/// The most credentialed calls one batch runs: as many bindings as a sweep
+/// forgets, so the sweeps, one a batch while rows are due, drain them as
+/// fast as batches record them, and an agent holds at most this many per
+/// batch of the last `CREDENTIAL_HORIZON_MS` and `BINDING_KEPT_MS`. A batch
+/// listing more is cut short before the first past it, which the leader
+/// sends again.
+pub const BATCH_CREDENTIALED: usize = SWEEP_BINDINGS;
 /// The most sessions an agent holds: more are refused until some are
 /// collected.
 pub const MAX_SESSIONS: u64 = 1 << 16;

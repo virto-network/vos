@@ -320,22 +320,6 @@ impl MainTrace {
             component_interaction(&fractions[component], relation, extra[component])
         })
     }
-
-    /// The interaction of `p2` and `qm31` alone, for a circuit without `h8`
-    /// (the credential AIR's set), each component's `extra` fraction a row
-    /// after its own.
-    pub fn interaction_without_h8(
-        &self,
-        circuit: &Circuit,
-        relation: &GateRelation,
-        extra: [Option<FirstRowFraction>; 2],
-    ) -> [(Evaluations, SecureField); 2] {
-        let [p2, qm31, _] = self.fractions(circuit);
-        [
-            component_interaction(&p2, relation, extra[0]),
-            component_interaction(&qm31, relation, extra[1]),
-        ]
-    }
 }
 
 /// A component's interaction columns and claimed sum from its rows'

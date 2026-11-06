@@ -4,6 +4,9 @@
 
 use alloc::vec::Vec;
 
+use vos_wire::scale::DecodeError;
+use vos_wire::{Decode, Encode};
+
 use crate::runtime::Output;
 
 /// A device kernel's end (`#[attestable(device)]`): its statement's parts
@@ -167,4 +170,25 @@ fn trap() -> ! {
     }
     #[cfg(not(target_arch = "riscv64"))]
     panic!("a device return past its bounds")
+}
+
+/// A kernel guard's claim (`#[msg(proven = k)]`), the handler's first
+/// argument: the kernel's public arguments, which the agent passes as one
+/// length-prefixed part ahead of the call's arguments, decoded whole as
+/// `T`. A claim that is not exactly one `T` fails the call's decode, so
+/// the claim never spills into the arguments or they into it.
+pub struct Claim<T>(pub T);
+
+impl<T: Decode> Decode for Claim<T> {
+    fn decode(data: &[u8]) -> Result<(Self, usize), DecodeError> {
+        let (bytes, used) = <Vec<u8> as Decode>::decode(data)?;
+        let claim = T::decode_exact(&bytes).ok_or(DecodeError::LeftOver)?;
+        Ok((Self(claim), used))
+    }
+}
+
+impl<T: Encode> Encode for Claim<T> {
+    fn encode_to(&self, buf: &mut Vec<u8>) {
+        self.0.encode().encode_to(buf);
+    }
 }

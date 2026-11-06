@@ -8,9 +8,8 @@ description = "The recursion AIR's prover: circuits built by a Context, their wi
 [dependencies]
 vos-pvm-recair-air = { workspace = true }
 # The wrap's proof, its public words and its layout, which the prover
-# produces and the final verifier reads; format 39's fixed layout; a
-# credential proof's bytes.
-vos-pvm-final-verifier = { workspace = true, features = ["credential-bytes"] }
+# produces and the final verifier reads; format 39's fixed layout.
+vos-pvm-final-verifier = { workspace = true }
 # Format 28's bytes, a watched tree's proofs' encoding, and a device proof's.
 postcard = { version = "1", features = ["alloc"] }
 vos-pvm-poseidon2 = { workspace = true }
@@ -37,8 +36,8 @@ rayon = { workspace = true }
 [features]
 default = ["recursion"]
 # The recursion prover: kernel leaves, folds, a run's tree and the final
-# wrap (`leaf`, `fold`, `tree`, `wrap`). A device proves its kernels and
-# credentials without it, so the light node builds the crate without it
+# wrap (`leaf`, `fold`, `tree`, `wrap`). A device proves its kernels
+# without it, so the light node builds the crate without it
 # and links less (`light-node.md` §7.1).
 recursion = []
 # The masked prover's test seams, for the prover's tests (a dev edge): its

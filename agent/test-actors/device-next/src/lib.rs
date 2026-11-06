@@ -1,16 +1,14 @@
 //! The `device` test actor's next release (`light-node.md` §4.4): its
-//! `login` guard in the same scope, now admitting each pseudonym once, and
-//! the same `auth` statement in the same arguments, its
-//! kernel written otherwise, with the SDK, so its device program, and the
-//! program id a binding names, differ while its claims do not. Installed
-//! over the `device` actor, it is an upgrade whose window admits both
-//! releases: a member's pseudonym in `"login"` is the same under either,
-//! and its `login` admits each pseudonym once, whichever release proved.
+//! `login` guard naming its `auth` kernel, the same statement in the same
+//! arguments, the kernel written otherwise, with the SDK, so its device
+//! program, and the program id a binding names, differ while its claims do
+//! not. Installed over the `device` actor, it is an upgrade whose window
+//! admits both releases: a member's nullifier is the same under either,
+//! and `login` admits each nullifier once, whichever release proved.
 //!
 //! Its arguments are the `device` actor's: the 32 siblings and the secret
-//! read in place, the slot's four bytes, then auth's public arguments as
-//! `CredentialPublic::Auth` encodes them (the kind byte and four digests),
-//! each digest copied, as the kind byte leaves them unaligned.
+//! read in place, the slot's four bytes, then the kind byte and four
+//! digests, each digest copied, as the kind byte leaves them unaligned.
 
 #![no_std]
 
@@ -46,20 +44,57 @@ mod reference {
     }
 }
 
+/// `auth`'s claim, its public arguments as their encoding reads: the kind
+/// byte, then the four digests.
+#[derive(Clone, Copy, Debug, Encode, Decode)]
+pub struct AuthClaim {
+    pub kind: u8,
+    pub map_root: [u8; 32],
+    pub scope: [u8; 32],
+    pub nullifier: [u8; 32],
+    pub binding: [u8; 32],
+}
+
+/// Why `login` refused a claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum LoginError {
+    /// The nullifier signed in already.
+    #[codec(index = 0)]
+    Seen,
+}
+
 #[actor]
-pub struct DeviceNext {}
+pub struct DeviceNext {
+    /// Each nullifier signed in, and the program its proof was of: the
+    /// `device` actor's table, which an upgrade keeps.
+    seen: Table<[u8; 32], [u8; 32]>,
+}
 
 #[messages]
 impl DeviceNext {
     pub fn new() -> Self {
-        Self {}
+        Self {
+            seen: Table::default(),
+        }
     }
 
-    /// A member signed in, once, by a credential proof or a device proof
-    /// of `auth`, either release's: its pseudonym in the scope `"login"`.
-    #[msg(credential = Auth("login"), device = "auth", once)]
-    pub async fn login(&mut self, ctx: &mut Command<Self>) -> Option<[u8; 32]> {
-        ctx.nullifier()
+    /// A member signed in by a device proof of `auth`, either release's,
+    /// once a nullifier: the nullifier, its claim's, and the program the
+    /// proof was of.
+    #[msg(proven = auth)]
+    pub async fn login(
+        &mut self,
+        ctx: &mut Command<Self>,
+        claim: AuthClaim,
+    ) -> Result<([u8; 32], [u8; 32]), LoginError> {
+        let Principal::Kernel { program } = ctx.caller() else {
+            unreachable!("a kernel guard admits a kernel's proof alone");
+        };
+        if self.seen.get(&claim.nullifier).is_some() {
+            return Err(LoginError::Seen);
+        }
+        self.seen.insert(&claim.nullifier, &program);
+        Ok((claim.nullifier, program))
     }
 
     /// Auth over the Poseidon2 tree: `secret`'s leaf at `slot` under

@@ -1,19 +1,19 @@
 //! A device proof accepted at a space's ingress (`proving.md` §8), the
-//! host's side: one node of a founded space, the credential actor and the device actor installed, a member
-//! enrolled; for each round a sign-in to the device actor's `login`, whose
-//! guard names its device kernel `auth`. The kernel's release artifact and
-//! each round's witness input are written for a prover, the proof it writes back is
-//! sent to the node's ingress as a `Credentialed` request under the device
-//! format, and the answer printed.
+//! host's side: one node of a founded space, the credential actor and the
+//! poll installed, a member enrolled; for each round a sign-in to the
+//! poll's `login`, whose guard is the stock `auth` kernel's. The kernel's
+//! release artifact and each round's witness input are written for a
+//! prover, the proof it writes back is sent to the node's ingress as a
+//! `Credentialed` request under the device format, and the answer printed.
 //!
 //! `cargo run --release -p vos-node --example device_ingress -- DIR
 //! [--rounds N] [--wait S] [--prove]`:
 //! - writes `DIR/auth.device`, the kernel's release artifact (the kernel
 //!   and its device program as the install computes it, the device
 //!   library's `release::Device`), then for round `n`
-//!   `DIR/n.input`, the kernel's witness input (the member's path, its
-//!   secret, its slot, and auth's public arguments for this round's call,
-//!   good for 110 s by the node's clock);
+//!   `DIR/n.input`, the kernel's witness input (the member's path and its
+//!   slot, its secret, and auth's claim for this round's call, good for
+//!   110 s by the node's clock);
 //! - waits up to `S` seconds (90 by default) for `DIR/n.proof`, the proof's
 //!   bytes as `vos-phone kernel` writes them (with `--prove`, this process
 //!   proves it, through the device library as the phone does);
@@ -33,15 +33,14 @@ use vos_checker::programs::{Programs, actor, credentials, credentials_elf, metho
 use vos_light::{DEVICE_FORMAT, DeviceProgram, Prover, ProverConfig, Threads};
 use vos_node::client::{self, Client, Target};
 use vos_node::{Config, Node};
-use vos_pvm_recair::device::{auth_arguments, auth_public};
-use vos_wire::credentials::{self as tree, Bound, Path as TreePath, Tag, Words};
+use vos_wire::credentials::{self as tree, AuthClaim, Bound, Path as TreePath, Tag, Words};
 use vos_wire::ids::{AgentId, InstanceId, Principal};
-use vos_wire::ingress::{CredentialPublic, Credentialed, Response};
+use vos_wire::ingress::{Credentialed, Response};
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode, SpaceId, WindowClock};
 
 const CREDENTIALS: InstanceId = InstanceId(9);
-const DEVICE: InstanceId = InstanceId(4);
+const POLL: InstanceId = InstanceId(3);
 /// The registrar's role byte, the operator's key holding it.
 const ROLE: u8 = 1;
 const OPERATOR: [u8; 32] = [21; 32];
@@ -90,7 +89,7 @@ fn options() -> Options {
 }
 
 /// One node of a founded space, the credential actor founded with
-/// [`HANDLE`] and [`SECRET`]'s member enrolled, the device actor beside it.
+/// [`HANDLE`] and [`SECRET`]'s member enrolled, the poll beside it.
 struct Served {
     _node: Node,
     socket: Target,
@@ -132,9 +131,9 @@ fn start() -> Served {
     )));
     installed(smol::block_on(node.install(
         agent,
-        DEVICE,
-        &package("device"),
-        Vec::new(),
+        POLL,
+        &package("poll"),
+        vec![(b"operator".to_vec(), ROLE)],
     )));
     installed(smol::block_on(node.set_role(
         agent,
@@ -194,28 +193,25 @@ impl Served {
             .expect("an enrolled member's path")
     }
 
-    /// Round `round`'s call of `login`, its public statement, and the
-    /// device kernel's witness input that proves it under `program`.
+    /// Round `round`'s call of `login`, its claim, and the stock auth
+    /// kernel's witness input that proves it under `program`.
     fn round(&self, round: u32, program: &[u8; 32]) -> (Credentialed, Vec<u8>) {
-        let login = method(&actor("device"), "login");
+        let login = method(&actor("poll"), "login");
         let mut nonce = [0u8; 16];
         nonce[..4].copy_from_slice(&round.to_le_bytes());
         getrandom::getrandom(&mut nonce[4..]).expect("the OS's randomness");
         let mut call = Credentialed {
-            instance: DEVICE,
+            instance: POLL,
             method: login,
             arguments: ().encode(),
             nonce,
             expires_ms: client::time(&self.socket).unwrap() + LIFE_MS,
             format: DEVICE_FORMAT,
-            public: CredentialPublic::Owner {
-                owner: [0; 32],
-                binding: [0; 32],
-            },
+            claim: Vec::new(),
             proof: Vec::new(),
         };
         let path = self.path();
-        let scope = tree::scope(&self.space, self.agent, DEVICE, b"login");
+        let scope = tree::scope(&self.space, self.agent, POLL, b"login");
         let words = |digest: &tree::Digest| tree::words(digest).expect("a digest's words");
         let nullifier = tree::digest(&tree::compress(
             &tree::compress(&Tag::Nf.block(), &SECRET),
@@ -227,22 +223,25 @@ impl Served {
             instance: call.instance,
             method: call.method,
             program,
-            kind: 0,
             arguments: &call.arguments,
             nonce: &call.nonce,
             expires_ms: call.expires_ms,
         }
         .digest();
-        let binding = tree::binding(&bound);
-        call.public = CredentialPublic::Auth {
+        call.claim = AuthClaim {
             map_root: path.root,
             scope,
             nullifier,
-            binding,
-        };
-        let public = auth_public(&path.root, &scope, &nullifier, &binding);
-        let siblings = path.siblings.0.map(|sibling| words(&sibling));
-        (call, auth_arguments(&siblings, &SECRET, path.slot, &public))
+            binding: tree::binding(&bound),
+        }
+        .encode();
+        // The kernel's arguments in place: the path's siblings and its slot's
+        // eight bytes, the secret, the claim.
+        let mut input = path.siblings.0.concat();
+        input.extend_from_slice(&u64::from(path.slot).to_le_bytes());
+        input.extend_from_slice(&tree::digest(&SECRET));
+        input.extend_from_slice(&call.claim);
+        (call, input)
     }
 }
 
@@ -267,8 +266,9 @@ fn wait_for(path: &Path, wait: Duration) -> Option<Vec<u8>> {
 fn main() {
     let options = options();
     std::fs::create_dir_all(&options.dir).expect("the directory");
-    let device = vos_light::release::device(&package("device"), "auth")
-        .expect("the kernel's release artifact");
+    let elf = std::fs::read(credentials_elf()).expect("the credential actor");
+    let device =
+        vos_light::release::device(&elf, "auth").expect("the stock kernel's release artifact");
     let program = DeviceProgram::released(&device).expect("the kernel's program");
     let served = start();
     std::fs::write(
@@ -279,7 +279,7 @@ fn main() {
     let prover = options.prove.then(|| {
         Prover::new(ProverConfig {
             threads: Threads::Auto,
-            max_memory: vos_light::DEVICE_PEAK_BYTES,
+            ..ProverConfig::default()
         })
         .expect("a prover")
     });
@@ -310,9 +310,9 @@ fn main() {
         let started = Instant::now();
         let answer = client::credentialed(&served.socket, served.agent, &call);
         let answered = started.elapsed();
-        let CredentialPublic::Auth { nullifier, .. } = call.public else {
-            unreachable!()
-        };
+        let nullifier = AuthClaim::decode_exact(&call.claim)
+            .expect("auth's claim")
+            .nullifier;
         let pseudonym = answer
             .as_ref()
             .ok()

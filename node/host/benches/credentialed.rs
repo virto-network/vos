@@ -1,17 +1,18 @@
 //! The executors' bound: a
 //! node of `k` executor threads, its verification budget their default
-//! `2k`, takes at least `100·k` credentialed calls a second, each an owner
-//! proof's transfer verified at its ingress, and their 99th percentile
+//! `2k`, takes at least `PER_EXECUTOR·k` proven calls a second, each a
+//! stock `owner` kernel's device proof of a transfer, verified at its
+//! ingress, and their 99th percentile
 //! latency is within 50 ms of signed calls' at the same rate, for `k` up to
 //! the host's physical performance cores. No absolute rate is claimed.
 //!
-//! One node of a founded space of one runs `AGENTS` agents of the purses'
-//! ledger and the counter. For each run the proofs are made first, on
+//! One node of a founded space of one runs `AGENTS` agents of the credential
+//! actor, the purses' ledger and the counter. For each run the proofs are made first, on
 //! every core of the generator, enough for `--seconds` (10 by default) at
-//! `100·k` a second, each good until 115 s past when making them all is
+//! `PER_EXECUTOR·k` a second, each good until 115 s past when making them all is
 //! expected to end (a proof expires at most 120 s after the node's time),
 //! the run waiting for that moment if they were made sooner; then they are
-//! sent open loop at `100·k` a second by `SENDERS` threads, a call
+//! sent open loop at `PER_EXECUTOR·k` a second by `SENDERS` threads, a call
 //! answered `Busy` (past the node's verification budget) sent again a
 //! millisecond later as a client would, the latency of each from the time
 //! it was due; then signed increments at the same rate,
@@ -32,7 +33,7 @@
 //!   ends;
 //! - `… -- drive --node quic://HOST:PORT --key HEX --space HEX --agents
 //!   A,B,… [--seconds S] k`: the generator alone, from another host, at
-//!   `100·k` a second over QUIC.
+//!   `PER_EXECUTOR·k` a second over QUIC.
 //!
 //! After `just build-agent build-test-actors`.
 
@@ -45,21 +46,21 @@ use ed25519_dalek::SigningKey;
 use rayon::prelude::*;
 use vos_checker::calls::installed;
 use vos_checker::programs::{Programs, actor, method, package};
+use vos_light::{Call, DeviceProgram, Prover, ProverConfig, Threads};
 use vos_node::client::{self, Client, ClientError, Operator, Target};
 use vos_node::{Config, Node};
-use vos_pvm_final_verifier::credential as verifier;
-use vos_pvm_recair::credential::{OwnerPublic, Statement, prove};
-use vos_pvm_recair::masked::MaskRng;
-use vos_wire::credentials::{self as tree, Bound, Tag, Words};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
-use vos_wire::ingress::{
-    CredentialPublic, CredentialRefusal, Credentialed, Rejection, Response, Stage,
-};
+use vos_wire::ingress::{CredentialRefusal, Credentialed, Rejection, Response, Stage};
 use vos_wire::result::Outcome;
 use vos_wire::{Encode, SpaceId, WindowClock};
 
 const PURSES: InstanceId = InstanceId(2);
 const COUNTER: InstanceId = InstanceId(1);
+const CREDENTIALS: InstanceId = InstanceId(9);
+/// The proven calls a second an executor is asked to take: a stock
+/// kernel's device proof verifies in about 12 ms on one x86 core, so
+/// about 80 a second, and the bound leaves the queue room.
+const PER_EXECUTOR: f64 = 50.0;
 const AGENTS: usize = 4;
 /// A run's length unless `--seconds` says otherwise.
 const SECONDS: f64 = 10.0;
@@ -69,8 +70,9 @@ const SENDERS: usize = 96;
 const OPERATOR: [u8; 32] = [21; 32];
 /// The generator's QUIC client key, which a served node lists.
 const DRIVER: [u8; 32] = [22; 32];
-/// The payer's secret, whose owner digest owns both rows.
-const SECRET: Words = [77, 78, 79, 80, 81, 82, 83, 84];
+/// The payer's secret source's output, whose secret's owner digest owns
+/// both rows.
+const SOURCE: [u8; 32] = [77; 32];
 /// How long a proof may live past the node's time when it is sent: a
 /// margin under the node's horizon (120 s).
 const LIFE_MS: u64 = 115_000;
@@ -85,8 +87,8 @@ struct Served {
     _dir: tempfile::TempDir,
 }
 
-fn owner() -> Words {
-    tree::compress(&Tag::Owner.block(), &SECRET)
+fn secret() -> vos_light::DeviceSecret {
+    vos_light::derive_secret(&SOURCE, &[0; 32])
 }
 
 fn start(executors: usize) -> Served {
@@ -111,7 +113,7 @@ fn start(executors: usize) -> Served {
     let path = dir.path().join("api.sock");
     node.serve_socket(&path, 0o600).unwrap();
     let socket = Target::socket(path);
-    let owner = tree::digest(&owner());
+    let owner = vos_light::owner(&secret()).to_bytes();
     let operator = Principal::Client(operator_key);
     let mut client = Client::new(&socket, key);
     let purses = actor("purses");
@@ -119,6 +121,12 @@ fn start(executors: usize) -> Served {
     for _ in 0..AGENTS {
         let agent = node.create_agent().unwrap();
         let roles = vec![(b"operator".to_vec(), 1)];
+        installed(smol::block_on(node.install(
+            agent,
+            CREDENTIALS,
+            &std::fs::read(vos_checker::programs::credentials_elf()).unwrap(),
+            vec![(b"registrar".to_vec(), 1)],
+        )));
         installed(smol::block_on(node.install(
             agent,
             PURSES,
@@ -207,50 +215,50 @@ impl Reached {
     fn made(&self, count: usize, expires_ms: u64) -> Vec<(AgentId, Credentialed)> {
         let transfer = method(&actor("purses"), "transfer");
         let arguments = (b"payer".to_vec(), b"payee".to_vec(), 1u64).encode();
-        let owner = owner();
+        let elf = std::fs::read(vos_checker::programs::credentials_elf()).unwrap();
+        let owner = vos_light::release::device(&elf, "owner").expect("the stock owner kernel");
+        let program = DeviceProgram::released(&owner).expect("its program");
+        let secret = secret();
         (0..count)
             .into_par_iter()
-            .map(|index| {
-                let agent = self.agents[index % self.agents.len()];
-                let mut nonce = [0u8; 16];
-                nonce[..8].copy_from_slice(&(index as u64).to_le_bytes());
-                nonce[8..].copy_from_slice(&expires_ms.to_le_bytes());
-                let b = Bound {
-                    space: &self.space,
-                    agent,
-                    instance: PURSES,
-                    method: transfer,
-                    program: verifier::program(verifier::CredentialKind::Owner),
-                    kind: 1,
-                    arguments: &arguments,
-                    nonce: &nonce,
-                    expires_ms,
-                }
-                .digest();
-                let binding = tree::binding(&b);
-                let statement = Statement::Owner(
-                    OwnerPublic {
-                        owner,
-                        binding: tree::words(&binding).unwrap(),
-                    },
-                    SECRET,
-                );
-                let (proof, _) = prove(&statement, MaskRng::default()).expect("proves");
-                let call = Credentialed {
-                    instance: PURSES,
-                    method: transfer,
-                    arguments: arguments.clone(),
-                    nonce,
-                    expires_ms,
-                    format: verifier::FORMAT,
-                    public: CredentialPublic::Owner {
-                        owner: tree::digest(&owner),
-                        binding,
-                    },
-                    proof: verifier::encode(&proof).unwrap(),
-                };
-                (agent, call)
-            })
+            .map_init(
+                || {
+                    Prover::new(ProverConfig {
+                        threads: Threads::Count(1),
+                        ..ProverConfig::default()
+                    })
+                    .expect("a prover")
+                },
+                |prover, index| {
+                    let agent = self.agents[index % self.agents.len()];
+                    let mut nonce = [0u8; 16];
+                    nonce[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                    nonce[8..].copy_from_slice(&expires_ms.to_le_bytes());
+                    let call = Call {
+                        space: self.space.0,
+                        agent: agent.0,
+                        instance: PURSES.0,
+                        method: transfer.0,
+                        arguments: arguments.clone(),
+                        nonce,
+                        expires_ms,
+                    };
+                    let proof = prover
+                        .prove_owner(&secret, &call, &program)
+                        .expect("proves");
+                    let call = Credentialed {
+                        instance: PURSES,
+                        method: transfer,
+                        arguments: arguments.clone(),
+                        nonce,
+                        expires_ms,
+                        format: proof.format,
+                        claim: proof.claim,
+                        proof: proof.proof,
+                    };
+                    (agent, call)
+                },
+            )
             .collect()
     }
 
@@ -378,7 +386,7 @@ fn between(before: &[Stage], after: &[Stage], name: &str) -> (u64, f64) {
 /// One run at `k`: the proofs made, the credentialed calls and then the
 /// signed increments sent, and the line that reports them.
 fn run(reached: &Reached, client_target: &Target, executors: usize, seconds: f64) {
-    let rate = 100.0 * executors as f64;
+    let rate = PER_EXECUTOR * executors as f64;
     let started = Instant::now();
     let calls = Arc::new(reached.calls(rate, seconds));
     let count = calls.len();

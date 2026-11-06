@@ -25,12 +25,12 @@
 //! - **A proof's bytes** ([`encode`], [`decode`]) are the masked proof's
 //!   postcard encoding, at most [`MAX_PROOF_BYTES`] and canonical. They
 //!   hold no io-hash: the verifier takes the io-hash from the caller, who
-//!   computes it from the words it holds ([`auth_io`]).
-//! - **Auth's statement as a device kernel** states the SCALE encoding of
-//!   `CredentialPublic::Auth` (the kind byte, then `map_root`, `scope`,
-//!   `nullifier` and `binding`) as its public arguments and no output; its
-//!   arguments are the siblings, the secret, the slot and those public
-//!   bytes, in that order ([`auth_arguments`]).
+//!   computes it from the claim it holds ([`claim_io`]).
+//! - **The hand-lean auth kernel** (the `device` test actor's, the
+//!   reference the SDK form is measured against) states a kind byte, then
+//!   `map_root`, `scope`, `nullifier` and `binding`, as its public
+//!   arguments and no output; its arguments are the siblings, the secret,
+//!   the slot and those public bytes, in that order ([`auth_arguments`]).
 
 use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest as _};
@@ -40,9 +40,12 @@ use vos_pvm_final_verifier::Error;
 use vos_pvm_proof::format::{DEVICE_PROOF, Format};
 use vos_wire::credentials::{self, DEPTH, EMPTY, Tag, Words};
 
-use crate::masked::device::{DeviceProgram, DeviceProof, DeviceProver, device_shape};
+use crate::masked::device::{
+    DeviceProgram, DeviceProof, DeviceProver, device_format, device_shape, verify_device_in,
+};
 use crate::masked::{MaskRng, MaskStats, MaskedProof};
 use crate::prove::ProveError;
+use vos_pvm_final_verifier::masked::MaskedFormat;
 
 /// The device format: format 46.
 pub const FORMAT: Format = DEVICE_PROOF;
@@ -83,6 +86,23 @@ pub struct Program {
     prover: DeviceProver<Blake2sM31MerkleChannel>,
     kernel: Vec<u8>,
     id: [u8; 32],
+    masked: Masked,
+}
+
+/// A program's masked format, its log sizes and words left out: computed
+/// once, at its install ([`masked`]).
+type Masked = MaskedFormat<'static>;
+
+/// `program`'s masked format under format 46, its log sizes and words left
+/// for each verification to fill in from the program.
+fn masked(program: &DeviceProgram<Hasher>) -> Option<Masked> {
+    let header = program.header();
+    let (masked, _) = device_format(&FORMAT, program, &header)?;
+    Some(MaskedFormat {
+        log_sizes: &[],
+        program: &[],
+        ..masked
+    })
 }
 
 impl Program {
@@ -117,10 +137,14 @@ impl Program {
         let prover =
             DeviceProver::<Blake2sM31MerkleChannel>::install(&FORMAT, kernel, active, log_sizes)?;
         let id = program_id(&FORMAT, prover.program());
+        let masked = masked(prover.program()).ok_or(ProveError::TraceShape(
+            "a program outside the format's shape",
+        ))?;
         Ok(Self {
             prover,
             kernel: kernel.to_vec(),
             id,
+            masked,
         })
     }
 
@@ -186,15 +210,16 @@ impl Program {
     /// Verifies the proof in `bytes` ([`decode`]) of this program's kernel
     /// stating the io-hash `io`.
     pub fn verify(&self, io: &[u8; 32], bytes: &[u8]) -> Result<(), Error> {
-        verify(self.program(), io, bytes)
+        verify(self.program(), &self.masked, io, bytes)
     }
 
-    /// What a verifier keeps of it: the program and its id, without the
-    /// prover's committed tree.
+    /// What a verifier keeps of it: the program, its masked format and its
+    /// id, without the prover's committed tree.
     pub fn verifier(&self) -> Verifier {
         Verifier {
             program: self.program().clone(),
             id: self.id,
+            masked: self.masked,
         }
     }
 }
@@ -205,6 +230,7 @@ impl Program {
 pub struct Verifier {
     program: DeviceProgram<Hasher>,
     id: [u8; 32],
+    masked: Masked,
 }
 
 impl Verifier {
@@ -215,16 +241,65 @@ impl Verifier {
 
     /// [`Program::verify`].
     pub fn verify(&self, io: &[u8; 32], bytes: &[u8]) -> Result<(), Error> {
-        verify(&self.program, io, bytes)
+        verify(&self.program, &self.masked, io, bytes)
     }
 }
 
-fn verify(program: &DeviceProgram<Hasher>, io: &[u8; 32], bytes: &[u8]) -> Result<(), Error> {
+fn verify(
+    program: &DeviceProgram<Hasher>,
+    masked: &Masked,
+    io: &[u8; 32],
+    bytes: &[u8],
+) -> Result<(), Error> {
+    let header = program.header();
+    let masked = MaskedFormat {
+        log_sizes: &program.log_sizes,
+        program: &header,
+        ..*masked
+    };
+    precheck(&masked, io, bytes)?;
     let proof = DeviceProof {
         io: *io,
         proof: decode(bytes)?,
     };
-    crate::masked::device::verify_device::<Blake2sM31MerkleChannel>(&FORMAT, program, &proof)
+    verify_device_in::<Blake2sM31MerkleChannel>(&masked, program, proof)
+}
+
+/// A proof's encoding's leading fields, as [`Wire`] and its STARK proof
+/// start: what the interaction PoW is checked over.
+#[derive(serde::Deserialize)]
+struct Head {
+    format_version: u32,
+    interaction_pow: u64,
+    #[allow(dead_code, reason = "read past, to reach the commitments")]
+    claimed_sums: Vec<stwo::core::fields::qm31::SecureField>,
+    #[allow(dead_code, reason = "read past, to reach the commitments")]
+    config: stwo::core::pcs::PcsConfig,
+    commitments: Vec<Blake2sHash>,
+}
+
+/// The device verifier's pre-check, before the proof is decoded whole: its
+/// length within [`MAX_PROOF_BYTES`], its leading fields read, its format
+/// this one's, and its interaction PoW holding over the program `masked`
+/// names, its roots and `io` as the verifier's transcript mixes them. A proof it refuses,
+/// the verifier refuses; well-formed junk that has not ground the
+/// interaction PoW is refused here, at a small fraction of a decode.
+fn precheck(masked: &MaskedFormat<'_>, io: &[u8; 32], bytes: &[u8]) -> Result<(), Error> {
+    if bytes.len() > MAX_PROOF_BYTES {
+        return Err(Error::Length);
+    }
+    let (head, _): (Head, &[u8]) = postcard::take_from_bytes(bytes).map_err(|_| Error::Decode)?;
+    if head.format_version != FORMAT.number {
+        return Err(Error::Format);
+    }
+    let public = vos_pvm_proof::masked::device_public_values(io);
+    let holds = vos_pvm_final_verifier::masked::interaction_pow_holds::<Blake2sM31MerkleChannel>(
+        masked,
+        &public,
+        &head.commitments,
+        head.interaction_pow,
+    );
+    holds.then_some(()).ok_or(Error::InteractionPow)
 }
 
 /// The reference arguments a device kernel's reference program
@@ -326,11 +401,11 @@ pub fn decode(bytes: &[u8]) -> Result<MaskedProof<Hasher>, Error> {
     Ok(proof)
 }
 
-/// The io-hash a device kernel of auth's statement states for the public
-/// arguments `public` (the SCALE encoding of `CredentialPublic::Auth`):
-/// `H_io` of `public`, no output and no root. `None` past `H_io`'s bound.
-pub fn auth_io(public: &[u8]) -> Option<[u8; 32]> {
-    vos_pvm_precompiles::compute_device_io_hash(public, &[], &[])
+/// The io-hash a device kernel states for its claim `claim`, its public
+/// arguments' encoding: `H_io` of `claim`, no output and no root. `None`
+/// past `H_io`'s bound.
+pub fn claim_io(claim: &[u8]) -> Option<[u8; 32]> {
+    vos_pvm_precompiles::compute_device_io_hash(claim, &[], &[])
 }
 
 /// Auth's arguments for a device kernel: the 32 siblings from the leaf's
@@ -406,7 +481,7 @@ mod tests {
         let public = &reference[AUTH_ARGUMENTS_BYTES - AUTH_PUBLIC_BYTES..];
         assert_eq!(public[0], 0, "auth's kind");
         assert_eq!(
-            auth_io(public),
+            claim_io(public),
             vos_pvm_precompiles::compute_device_io_hash(public, &[], &[])
         );
     }

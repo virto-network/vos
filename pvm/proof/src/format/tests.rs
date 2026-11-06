@@ -69,7 +69,6 @@ fn the_bit_counts_are_pinned_per_format() {
             (32, 108, 63),
             (39, 146, 82),
             (41, 104, 62),
-            (44, 110, 62),
             (46, 110, 62),
         ]
     );
@@ -85,8 +84,8 @@ fn the_bit_counts_are_pinned_per_format() {
 
 /// The unrounded counts the parameters were chosen by: the segments'
 /// 62.81 at 40 queries and PoW 24, no less than 44 queries at PoW 20
-/// give the same shape, and the device and credential formats' least
-/// query count whose count clears 62.
+/// give the same shape, and the device format's least query count whose
+/// count clears 62.
 #[test]
 fn the_parameters_are_the_least_that_clear_their_margins() {
     let count = |params: &FormatParams, shape: &SecurityShape| {
@@ -96,7 +95,7 @@ fn the_parameters_are_the_least_that_clear_their_margins() {
     assert!((62.81..62.82).contains(&segment), "{segment}");
     let at_44 = count(&LEAF_FOLD.params, &SEGMENT_REFERENCE);
     assert!((62.74..62.75).contains(&at_44), "{at_44}");
-    for format in [DEVICE_PROOF, CREDENTIAL_PROOF] {
+    for format in [DEVICE_PROOF] {
         let fewer = FormatParams {
             n_queries: format.params.n_queries - 1,
             ..format.params
@@ -176,7 +175,7 @@ fn the_verifier_takes_the_batching_from_the_format() {
     }
 }
 
-/// Every number names one entry; only 28, 39, 41, 44 and 46 are
+/// Every number names one entry; only 28, 39, 41 and 46 are
 /// admitted, and a segment verifier takes 41 alone; every other number,
 /// one an earlier format took among them, is refused as unregistered.
 #[test]
@@ -190,7 +189,6 @@ fn the_registry_numbers_round_trip() {
                 SEGMENT.number,
                 MASKED_WRAP.number,
                 DEVICE_PROOF.number,
-                CREDENTIAL_PROOF.number
             ]
             .contains(&format.number)
         );

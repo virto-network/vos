@@ -1,9 +1,11 @@
 //! The phone bench (`proving.md` §8): the device
-//! library's three credential proofs, auth, owner and membership and
-//! payment, proved through `vos-light` on fixed statements, timed,
+//! library's proven calls by the stock kernels, auth and owner, proved
+//! through `vos-light` on fixed statements under the device format from
+//! the kernels' release artifacts (`release::Device`, which the binary
+//! embeds, computed from the credential actor's ELF at build), timed,
 //! verified, their peak memory read, and the PoW grinds timed alone.
 //!
-//! - `vos-phone run [--reps N] [--threads auto|N] [--cells auth,owner,joint] [--grind N] [--out DIR]`:
+//! - `vos-phone run [--reps N] [--threads auto|N] [--cells auth,owner] [--grind N] [--out DIR]`:
 //!   a `device` line, one `cell` line a statement (each statement in a
 //!   child process of its own, so its peak resident size is its own), and
 //!   a `grind` line a PoW (20 and 16);
@@ -16,14 +18,14 @@
 //!   a child process of its own; the kernels and their witness inputs read
 //!   from DIR (default `kernels` beside the binary).
 //!
-//! - `vos-phone kernel --device PATH --input PATH --out PATH [--threads auto|N]`:
-//!   a device kernel of auth's statement proved as the device library
-//!   proves it for a space's ingress, from its release artifact
-//!   (`release::Device`, the program ingress computes from the installed
-//!   kernel, computed at release: `DeviceProgram::released`;
-//!   `Prover::prove_kernel`, format 46), on its witness input, verified
-//!   here against the io-hash of the input's last 129 bytes, auth's public
-//!   arguments; the proof's bytes written to `--out`, one `kernel` line.
+//! - `vos-phone kernel --device PATH --input PATH --out PATH [--claim N] [--threads auto|N]`:
+//!   a device kernel proved as the device library proves it for a space's
+//!   ingress, from its release artifact (`release::Device`, the program
+//!   ingress computes from the installed kernel, computed at release:
+//!   `DeviceProgram::released`; `Prover::prove_kernel`, format 46), on its
+//!   witness input, verified here against the io-hash of the input's last
+//!   `N` bytes, its claim (128 by default, the stock auth kernel's); the
+//!   proof's bytes written to `--out`, one `kernel` line.
 //!
 //! - `vos-phone light --store DIR [--calls N] [--check]`: the light node
 //!   (`light.rs`): a local actor installed from the release artifacts the
@@ -50,9 +52,10 @@ use sha2::{Digest as _, Sha256};
 use stwo::core::channel::{Blake2sM31Channel, Channel};
 use stwo::core::proof_of_work::GrindOps;
 use stwo::prover::backend::simd::SimdBackend;
+use vos_light::release::Device;
 use vos_light::{
-    AuthWitness, Call, Digest, Prover, ProverConfig, Threads, derive_secret, member, verify,
-    verify_joint,
+    AuthWitness, Call, DEVICE_FORMAT, DeviceProgram, Digest, Proven, Prover, ProverConfig, Threads,
+    derive_secret, member, verify,
 };
 use vos_wire::Decode;
 use vos_wire::credentials::{leaf, root_of};
@@ -64,7 +67,27 @@ mod member;
 use member::{HANDLE, SLOT, SOURCE_OUTPUT};
 
 /// The cells, in order.
-const CELLS: [&str; 3] = ["auth", "owner", "joint"];
+const CELLS: [&str; 2] = ["auth", "owner"];
+
+/// The stock kernels' release artifacts, as the build computed them from
+/// the credential actor's ELF; empty without it.
+static AUTH: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/auth.device"));
+static OWNER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/owner.device"));
+
+/// The stock kernel `cell`'s program, from its embedded release artifact.
+fn program(cell: &str) -> DeviceProgram {
+    let bytes = match cell {
+        "auth" => AUTH,
+        "owner" => OWNER,
+        other => panic!("unknown cell {other}"),
+    };
+    assert!(
+        !bytes.is_empty(),
+        "built without the credential actor's ELF: `just build-credentials` first"
+    );
+    let device = Device::decode_exact(bytes).expect("a release artifact");
+    DeviceProgram::released(&device).expect("the stock kernel's program")
+}
 /// The guard name of every cell.
 const NAME: &[u8] = b"login";
 /// The seeded build's masks.
@@ -185,38 +208,32 @@ fn reference(cell: &str) -> Option<&'static str> {
         .find_map(|pair| pair.strip_prefix(cell)?.strip_prefix('='))
 }
 
-/// One proof of `cell`'s statement, verified against its call: its bytes
-/// and the verification's time.
-fn prove(prover: &Prover, cell: &str) -> (Vec<u8>, Duration) {
+/// One proof of `cell`'s statement by its stock kernel `program`: the
+/// proven call.
+fn proven(prover: &Prover, cell: &str, program: &DeviceProgram) -> Proven {
     let secret = derive_secret(&SOURCE_OUTPUT, &HANDLE);
     let call = call();
-    let timed = |check: &dyn Fn() -> bool| {
-        let started = Instant::now();
-        assert!(check(), "{cell} verifies");
-        started.elapsed()
-    };
     match cell {
-        "auth" => {
-            let proof = prover
-                .prove_auth(&secret, &witness(&member(&secret)), NAME, &call)
-                .expect("auth proves");
-            let took = timed(&|| verify(&proof, &call, Some(NAME)).is_ok());
-            (proof.proof, took)
-        }
-        "owner" => {
-            let proof = prover.prove_owner(&secret, &call).expect("owner proves");
-            let took = timed(&|| verify(&proof, &call, None).is_ok());
-            (proof.proof, took)
-        }
-        "joint" => {
-            let proof = prover
-                .prove_membership_and_payment(&secret, &witness(&member(&secret)), NAME, &call)
-                .expect("membership and payment proves");
-            let took = timed(&|| verify_joint(&proof, &call, NAME).is_ok());
-            (proof.proof, took)
-        }
-        other => panic!("unknown cell {other}"),
+        "auth" => prover
+            .prove_auth(&secret, &witness(&member(&secret)), NAME, &call, program)
+            .expect("auth proves"),
+        _ => prover
+            .prove_owner(&secret, &call, program)
+            .expect("owner proves"),
     }
+}
+
+/// One proof of `cell`'s statement, verified against its call: its bytes
+/// and the verification's time.
+fn prove(prover: &Prover, cell: &str, program: &DeviceProgram) -> (Vec<u8>, Duration) {
+    let proof = proven(prover, cell, program);
+    let started = Instant::now();
+    let name = (cell == "auth").then_some(NAME);
+    assert!(
+        verify(&proof, &call(), program, name).is_ok(),
+        "{cell} verifies"
+    );
+    (proof.proof, started.elapsed())
 }
 
 /// Times `cell`'s proofs, `options.reps` after two warm-ups, and prints its
@@ -229,8 +246,9 @@ fn cell(cell: &str, options: &Options) {
     .expect("a prover");
     #[cfg(feature = "seeded")]
     let prover = prover.seeded(SEED);
+    let program = program(cell);
     for _ in 0..2 {
-        prove(&prover, cell);
+        prove(&prover, cell, &program);
     }
     let mut times = Vec::new();
     let mut verifies = Vec::new();
@@ -238,7 +256,7 @@ fn cell(cell: &str, options: &Options) {
     let mut bytes = Vec::new();
     for rep in 0..options.reps {
         let started = Instant::now();
-        let (proof, verified) = prove(&prover, cell);
+        let (proof, verified) = prove(&prover, cell, &program);
         times.push(ms(started.elapsed() - verified));
         verifies.push(ms(verified));
         eprintln!(
@@ -271,8 +289,9 @@ fn cell(cell: &str, options: &Options) {
         "null".into()
     };
     println!(
-        "{{\"kind\":\"cell\",\"cell\":\"{cell}\",\"format\":{},\"threads\":{},\"reps\":{},\"prove_ms_p50\":{:.1},\"prove_ms_p95\":{:.1},\"prove_ms_min\":{:.1},\"prove_ms_max\":{:.1},\"prove_ms_runs\":[{}],\"verify_ms\":{verify_ms:.2},\"proof_bytes\":{},\"distinct_proofs\":{distinct},\"proof_sha256\":\"{last}\",\"matches_x86\":{matches_x86},\"verified\":true,\"peak_rss_mib\":{:.1}}}",
-        vos_light::FORMAT,
+        "{{\"kind\":\"cell\",\"cell\":\"{cell}\",\"format\":{},\"program\":\"{}\",\"threads\":{},\"reps\":{},\"prove_ms_p50\":{:.1},\"prove_ms_p95\":{:.1},\"prove_ms_min\":{:.1},\"prove_ms_max\":{:.1},\"prove_ms_runs\":[{}],\"verify_ms\":{verify_ms:.2},\"proof_bytes\":{},\"distinct_proofs\":{distinct},\"proof_sha256\":\"{last}\",\"matches_x86\":{matches_x86},\"verified\":true,\"peak_rss_mib\":{:.1}}}",
+        DEVICE_FORMAT,
+        hex(program.id()),
         prover.threads(),
         options.reps,
         quantile(&sorted, 0.5),
@@ -349,7 +368,7 @@ fn device() {
         } else {
             "timing"
         },
-        vos_light::FORMAT,
+        DEVICE_FORMAT,
     );
 }
 
@@ -414,8 +433,6 @@ fn device_cell(name: &str, args: &[String]) {
 
 /// Verifies the proofs `run --out` wrote in `dir` against their calls.
 fn verify_dir(dir: &str) {
-    let secret = derive_secret(&SOURCE_OUTPUT, &HANDLE);
-    let call = call();
     let probe = Prover::new(ProverConfig {
         threads: Threads::Count(1),
         ..ProverConfig::default()
@@ -425,26 +442,12 @@ fn verify_dir(dir: &str) {
         let Ok(bytes) = std::fs::read(PathBuf::from(dir).join(cell)) else {
             continue;
         };
-        // The public words are the statement's: a fresh proof's, the same
-        // whatever its masks.
-        let verified = match cell {
-            "joint" => {
-                let mut proof = probe
-                    .prove_membership_and_payment(&secret, &witness(&member(&secret)), NAME, &call)
-                    .expect("proves");
-                proof.proof = bytes.clone();
-                verify_joint(&proof, &call, NAME).is_ok()
-            }
-            _ => {
-                let mut proof = match cell {
-                    "auth" => probe.prove_auth(&secret, &witness(&member(&secret)), NAME, &call),
-                    _ => probe.prove_owner(&secret, &call),
-                }
-                .expect("proves");
-                proof.proof = bytes.clone();
-                verify(&proof, &call, (cell == "auth").then_some(NAME)).is_ok()
-            }
-        };
+        // The claim is the statement's: a fresh proof's, the same whatever
+        // its masks.
+        let program = program(cell);
+        let mut proof = proven(&probe, cell, &program);
+        proof.proof = bytes.clone();
+        let verified = verify(&proof, &call(), &program, (cell == "auth").then_some(NAME)).is_ok();
         println!(
             "{{\"kind\":\"verify\",\"cell\":\"{cell}\",\"proof_sha256\":\"{}\",\"verified\":{verified}}}",
             hex(&Sha256::digest(&bytes))
@@ -452,11 +455,12 @@ fn verify_dir(dir: &str) {
     }
 }
 
-/// A device kernel of auth's statement proved on its witness input for a
-/// space's ingress, as the device library proves it, verified, its bytes
+/// A device kernel proved on its witness input for a space's ingress, as
+/// the device library proves it, verified against its claim, its bytes
 /// written.
 fn kernel(args: &[String]) {
     let (mut device, mut input, mut out, mut threads) = (None, None, None, Threads::Auto);
+    let mut claim = 128;
     let mut args = args.iter();
     while let Some(flag) = args.next() {
         let value = args.next().expect("a flag's value");
@@ -470,6 +474,7 @@ fn kernel(args: &[String]) {
             }
             "--input" => input = Some(std::fs::read(value).expect("the witness input")),
             "--out" => out = Some(PathBuf::from(value)),
+            "--claim" => claim = value.parse().expect("a claim's bytes"),
             "--threads" => {
                 threads = match value.as_str() {
                     "auto" => Threads::Auto,
@@ -483,7 +488,7 @@ fn kernel(args: &[String]) {
     let out = out.expect("--out");
     let prover = Prover::new(ProverConfig {
         threads,
-        max_memory: vos_light::DEVICE_PEAK_BYTES,
+        ..ProverConfig::default()
     })
     .expect("a prover");
     let started = Instant::now();
@@ -494,9 +499,9 @@ fn kernel(args: &[String]) {
         .prove_kernel(&program, &input)
         .expect("the kernel proves");
     let proved = started.elapsed();
-    let public = &input[input.len().saturating_sub(129)..];
+    let claim = &input[input.len().saturating_sub(claim)..];
     let started = Instant::now();
-    let verified = Some(proof.io) == vos_light::auth_io(public) && program.verify(&proof).is_ok();
+    let verified = Some(proof.io) == vos_light::claim_io(claim) && program.verify(&proof).is_ok();
     let verify = started.elapsed();
     std::fs::write(&out, &proof.proof).expect("the proof written");
     println!(
@@ -532,7 +537,7 @@ fn main() {
             eprintln!(
                 "vos-phone run [--reps N] [--threads auto|N] [--cells LIST] [--grind N] [--out DIR] | verify DIR \
                  | device [--kernels DIR] [--cells LIST] [--reps N] [--warmups N] [--threads auto|N] [--out DIR] \
-                 | kernel --device PATH --input PATH --out PATH [--threads auto|N] \
+                 | kernel --device PATH --input PATH --out PATH [--claim N] [--threads auto|N] \
                  | light --store DIR [--calls N] [--check]"
             );
             std::process::exit(2);

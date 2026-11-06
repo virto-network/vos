@@ -82,7 +82,7 @@ impl Pending {
     pub(crate) fn bytes(&self) -> usize {
         match self {
             Pending::Request { request, .. } => request.arguments.len(),
-            Pending::Credentialed { call, .. } => call.arguments.len(),
+            Pending::Credentialed { call, .. } => call.arguments.len() + call.claim.len(),
             Pending::Message(message) => message.body.payload_len(),
             Pending::Duty(Input::Resume { served, .. }) => served.as_ref().map_or(0, Vec::len),
             // Its batch carries no body.

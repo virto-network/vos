@@ -20,20 +20,19 @@
 //!   is [`source_input`]; [`member`] and [`owner`] are the digests a space
 //!   stores. A [`DeviceSecret`] is zeroized on drop and has no `Clone` and
 //!   no `Debug`.
-//! - **The proofs** ([`Prover`]): auth, a member's leaf under the credential
-//!   actor's root with its nullifier in a scope; owner, the secret behind a
-//!   row's owner digest; and membership and payment together, measured and
-//!   admitted nowhere. A [`Call`] names what a proof authorizes; the scope
-//!   and the binding are computed here, from it. [`verify`] checks a proof
-//!   against its call as ingress does.
-//! - **Device kernels** ([`DeviceProgram`], [`Prover::prove_kernel`]): a
-//!   kernel's run proved under the device profile, format 46, against the
-//!   program ingress computes from the same kernel, which the app embeds
-//!   as a release artifact ([`release::Device`]); auth's statement by a
-//!   device kernel ([`Prover::prove_device_auth`], [`verify_device`]), which
-//!   a guard naming that kernel takes as it takes auth's credential proof.
-//!   The app proves with the newest program it ships that the space's
-//!   compatibility window admits ([`choose`], the window read by
+//! - **Proven calls** ([`Prover`]): a device kernel's run proved under the
+//!   device format, 46, against the program ingress computes from the same
+//!   kernel, which the app embeds as a release artifact
+//!   ([`release::Device`], [`DeviceProgram`]). The stock kernels of the
+//!   credential actor take the secret: auth, a member's leaf under the
+//!   actor's root with its nullifier in a scope ([`Prover::prove_auth`]);
+//!   owner, the secret behind a row's owner digest
+//!   ([`Prover::prove_owner`]). Any other kernel takes only public data
+//!   ([`Prover::prove_kernel`]). A [`Call`] names what a proof authorizes;
+//!   the scope and the binding are computed here, from it. [`verify`]
+//!   checks a proof against its call as ingress does.
+//! - **Windows:** the app proves with the newest program it ships that the
+//!   space's compatibility window admits ([`choose`], the window read by
 //!   [`wire::devices_request`]), and refuses before proving when it admits
 //!   none.
 //! - **The wire** ([`mod@wire`]): the node-API requests a client sends for
@@ -43,9 +42,8 @@
 //!   root moves and on a jittered timer, never because a proof is about to
 //!   be made; an answer that the root is unknown drops it.
 //!
-//! The formats are the registry's credential format
-//! ([`vos_pvm_proof::format::CREDENTIAL_PROOF`]) and its device format
-//! ([`vos_pvm_proof::format::DEVICE_PROOF`]). No witness is logged, and
+//! The format is the registry's device format
+//! ([`vos_pvm_recair::device::FORMAT`]). No witness is logged, and
 //! its proofs' masks are the operating system's (a seeded stream exists
 //! only under the `seeded-masks` test seam, which no production build
 //! enables). `SECURITY.md` states what the secret is exposed to.
@@ -63,25 +61,15 @@ mod threads;
 pub mod wire;
 
 pub use call::{Call, NAME_BYTES, method_id, scope, transfer_arguments};
-pub use kernel::{
-    DEVICE_FORMAT, DEVICE_PEAK_BYTES, DeviceProgram, DeviceProof, auth_io, choose, verify_device,
-};
+pub use kernel::{DEVICE_FORMAT, DeviceProgram, DeviceProof, choose, claim_io};
 pub use light::{Config, Error, LOCAL, Light, ScopeError};
 pub use path::PathKeeper;
-pub use prover::{
-    CredentialProof, CredentialPublic, JointProof, JointPublic, PEAK_BYTES, Prover, ProverConfig,
-    STACK_BYTES, Threads, verify, verify_joint,
-};
+pub use prover::{PEAK_BYTES, Proven, Prover, ProverConfig, STACK_BYTES, Threads, verify};
 pub use secret::{DeviceSecret, derive_secret, member, owner, source_input};
 pub use store::{Store, StoreError};
 pub use threads::thread_pool;
 
 use vos_wire::credentials::{self, P};
-
-/// The credential format's number, the registry's: a credential proof's.
-pub const FORMAT: u32 = vos_pvm_proof::format::CREDENTIAL_PROOF.number;
-
-const _: () = assert!(FORMAT == vos_pvm_final_verifier::credential::FORMAT);
 
 /// A digest: eight M31 words, each below `p`. Its bytes are the words as
 /// little-endian `u32`s.

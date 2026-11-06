@@ -185,7 +185,15 @@ fn a_sweep_lists_the_rows_due_by_its_time() {
         keys::due(9, session(3)),
         keys::batch_time(),
     ];
-    let due = |time, limit| keys::due_rows(rows.iter().map(Ok::<_, ()>), time, limit).unwrap();
+    let due = |time, limit| {
+        keys::due_rows(
+            keys::DueIndex::Rows,
+            rows.iter().map(Ok::<_, ()>),
+            time,
+            limit,
+        )
+        .unwrap()
+    };
     assert_eq!(
         due(8, 10),
         [(5, session(1)), (7, Due::Workflow(WorkflowId(2)))]
@@ -194,7 +202,7 @@ fn a_sweep_lists_the_rows_due_by_its_time() {
     assert_eq!(due(4, 10), []);
     assert_eq!(due(u64::MAX, 10).len(), 3, "none past the index");
     assert_eq!(
-        keys::due_rows([Err::<Vec<u8>, _>("unread")], 9, 10),
+        keys::due_rows(keys::DueIndex::Rows, [Err::<Vec<u8>, _>("unread")], 9, 10),
         Err("unread")
     );
 }

@@ -91,25 +91,3 @@ pub const MASKED_WRAP_REFERENCE: SecurityShape = SecurityShape {
     logup_fractions: (6 << 14) + (5 << 15) + (7 << 11),
     ..WRAP_REFERENCE.variant_c()
 };
-
-/// The credential AIR (`proving.md` §8), format 44's reference: the
-/// recursion AIR's `p2` and `qm31` at the masking's floor of 2^11 rows,
-/// masked under variant (c) (columns at degree bound 2^12, the composition
-/// whole at 2^13, sampled at `π(z)`), as the built set lays it out: 50
-/// preprocessed, 333 main (each component's blinding among them) and 24
-/// interaction columns, the composition's 4 and the FRI mask's 8, each
-/// sampled once, and 24 sampled twice (`p2`'s 16 columns read at the
-/// previous row and each running sum's 4), each with a periodicity value;
-/// `p2`'s constraints, `qm31`'s and the blinding's new pair's; 6 and 5
-/// fractions a row. A test derives it from the built set.
-pub const CREDENTIAL_REFERENCE: SecurityShape = SecurityShape {
-    log_degree_bound: 13,
-    log_trace_length: 12,
-    log_composition_degree_bound: 13,
-    sampled_values: (50 + 333 + 24 + 4 + 8) + 2 * (16 + 2 * 4),
-    max_samples_per_column: 3,
-    constraints: 303 + 3 + 1,
-    logup_fractions: (6 << 11) + (5 << 11),
-    relation_width: RECURSION_RELATION_WIDTH,
-    composition_point_doublings: 1,
-};

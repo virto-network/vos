@@ -23,7 +23,8 @@ pub struct Call {
     pub agent: u32,
     pub instance: u32,
     pub method: u32,
-    /// The method's arguments in SCALE, at most `cap::REQUEST` bytes.
+    /// The method's arguments in SCALE, at most `cap::REQUEST` less
+    /// `cap::CLAIM` bytes.
     pub arguments: Vec<u8>,
     pub nonce: [u8; 16],
     pub expires_ms: u64,
@@ -52,25 +53,24 @@ impl Call {
         })
     }
 
-    /// Its arguments within `cap::REQUEST`.
+    /// Its arguments within `cap::REQUEST` less a claim's cap, as ingress
+    /// takes a proven call's.
     pub(crate) fn check(&self) -> Result<(), DeviceError> {
-        if self.arguments.len() > cap::REQUEST {
+        if self.arguments.len() > cap::REQUEST - cap::CLAIM {
             return Err(DeviceError::Config);
         }
         Ok(())
     }
 
-    /// The binding digest `b` of a proof of the statement whose program id
-    /// is `program` and kind `kind`, as ingress computes it
-    /// ([`credentials::Bound::digest`]).
-    pub fn binding_digest(&self, program: &[u8; 32], kind: u8) -> [u8; 32] {
+    /// The binding digest `b` of a proof of the device program whose id is
+    /// `program`, as ingress computes it ([`credentials::Bound::digest`]).
+    pub fn binding_digest(&self, program: &[u8; 32]) -> [u8; 32] {
         credentials::Bound {
             space: &SpaceId(self.space),
             agent: AgentId(self.agent),
             instance: InstanceId(self.instance),
             method: MethodId(self.method),
             program,
-            kind,
             arguments: &self.arguments,
             nonce: &self.nonce,
             expires_ms: self.expires_ms,
@@ -78,9 +78,9 @@ impl Call {
         .digest()
     }
 
-    /// The proof's public `binding`: `C(T(binding), W(b))`.
-    pub fn binding(&self, program: &[u8; 32], kind: u8) -> Digest {
-        Digest::from_bytes(&credentials::binding(&self.binding_digest(program, kind)))
+    /// The claim's `binding`: `C(T(binding), W(b))`.
+    pub fn binding(&self, program: &[u8; 32]) -> Digest {
+        Digest::from_bytes(&credentials::binding(&self.binding_digest(program)))
             .expect("a compression's words are below p")
     }
 }

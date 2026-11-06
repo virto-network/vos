@@ -64,7 +64,7 @@ pub(crate) struct Calls {
     /// them, each by its token: a call forwarded again while it runs is
     /// answered once, when it ends.
     forwarded: Mutex<HashMap<NodeNumber, HashSet<u64>>>,
-    /// Credential proofs being verified now.
+    /// Device proofs being verified now.
     pub(crate) verifying: Arc<std::sync::atomic::AtomicUsize>,
     /// The device programs of installed kernels, as ingress verifies
     /// against them.

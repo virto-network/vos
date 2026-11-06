@@ -298,8 +298,8 @@ pub enum AdmissionRefusal {
     UnknownKey,
 }
 
-/// Why ingress refused a credentialed call, each code in the order its
-/// check runs (`identity-and-authority.md` §5): every check but the proof's
+/// Why ingress refused a proven call, each code in the order its check
+/// runs (`identity-and-authority.md` §5): every check but the proof's
 /// reads the request and this replica's applied state alone, cheapest
 /// first, and the proof's runs last, on an executor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
@@ -308,28 +308,31 @@ pub enum CredentialRefusal {
     /// binding may name.
     #[codec(index = 0)]
     NoSpace,
-    /// A format this node admits for no credential.
+    /// A device format this node does not admit, or no longer does.
     #[codec(index = 1)]
     Format,
-    /// The proof past its format's cap, or the arguments past
-    /// [`crate::abi::cap::REQUEST`].
+    /// The proof past its format's cap, the claim past
+    /// [`crate::abi::cap::CLAIM`], or the arguments past
+    /// [`crate::abi::cap::REQUEST`] less it.
     #[codec(index = 2)]
     Size,
     /// `expires_ms` before `now`, the node's time, or more than
     /// [`crate::defaults::CREDENTIAL_HORIZON_MS`] after it.
     #[codec(index = 3)]
     Expiry { now: u64 },
-    /// No such instance or method, or a method with no credential guard.
+    /// No such instance or method, or a method with no guard.
     #[codec(index = 4)]
     Method,
-    /// The statement's kind is not the guard's, or its format proves no
-    /// such statement for this method.
+    /// The claim is not the stock kernel's the guard names (its length),
+    /// or the guard's kernel is not installed or has no program this node
+    /// can compute.
     #[codec(index = 5)]
     Kind,
-    /// An auth statement's scope is not the one the guard's name gives.
+    /// An auth claim's scope is not the one the guard's name gives.
     #[codec(index = 6)]
     Scope,
-    /// The statement's binding is not this request's.
+    /// The claim's binding is not this request's under any program the
+    /// guard's window admits.
     #[codec(index = 7)]
     Binding,
     /// The binding digest is recorded: the call ran. Its outcome is not
@@ -357,88 +360,27 @@ pub enum CredentialRefusal {
     Proof,
 }
 
-/// A credential statement's public digests, after its kind: the enum's
-/// index is the statement's `kind` (`proving.md` §8). Each digest is eight
-/// M31 words, as little-endian `u32`s.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
-pub enum CredentialPublic {
-    #[codec(index = 0)]
-    Auth {
-        map_root: [u8; 32],
-        scope: [u8; 32],
-        nullifier: [u8; 32],
-        binding: [u8; 32],
-    },
-    #[codec(index = 1)]
-    Owner { owner: [u8; 32], binding: [u8; 32] },
-}
-
-impl CredentialPublic {
-    /// The statement's kind, its index.
-    pub const fn kind(&self) -> u8 {
-        match self {
-            CredentialPublic::Auth { .. } => 0,
-            CredentialPublic::Owner { .. } => 1,
-        }
-    }
-
-    /// Its `binding`.
-    pub const fn binding(&self) -> &[u8; 32] {
-        match self {
-            CredentialPublic::Auth { binding, .. } | CredentialPublic::Owner { binding, .. } => {
-                binding
-            }
-        }
-    }
-
-    /// The statement's public words: its kind, then each digest's eight;
-    /// `None` when a word is at or above p.
-    pub fn words(&self) -> Option<Vec<u32>> {
-        let digests: &[&[u8; 32]] = match self {
-            CredentialPublic::Auth {
-                map_root,
-                scope,
-                nullifier,
-                binding,
-            } => &[map_root, scope, nullifier, binding],
-            CredentialPublic::Owner { owner, binding } => &[owner, binding],
-        };
-        let mut words = alloc::vec![u32::from(self.kind())];
-        for digest in digests {
-            words.extend(crate::credentials::words(digest)?);
-        }
-        Some(words)
-    }
-
-    /// The origin it proves: `Anonymous { scope, nullifier }` or
-    /// `Owner(owner)`.
-    pub const fn origin(&self) -> Principal {
-        match *self {
-            CredentialPublic::Auth {
-                scope, nullifier, ..
-            } => Principal::Anonymous { scope, nullifier },
-            CredentialPublic::Owner { owner, .. } => Principal::Owner(owner),
-        }
-    }
-}
-
-/// `POST /agents/{agent}/credentialed`: a call whose authority is a
-/// credential proof, with no session and no signature. Ingress verifies
-/// the proof and logs only the origin it proves
-/// ([`crate::batch::CredentialedInput`]).
+/// `POST /agents/{agent}/credentialed`: a proven call, whose authority is
+/// a device proof of the kernel its method's guard names, with no session
+/// and no signature. Ingress verifies the proof and logs the origin it
+/// proves and its claim ([`crate::batch::CredentialedInput`]).
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Credentialed {
     pub instance: InstanceId,
     pub method: MethodId,
-    /// At most [`crate::abi::cap::REQUEST`] bytes.
+    /// At most [`crate::abi::cap::REQUEST`] less
+    /// [`crate::abi::cap::CLAIM`] bytes.
     pub arguments: Vec<u8>,
     /// The client's, drawn at random.
     pub nonce: [u8; 16],
     /// By the node's clock, which `Time` answers.
     pub expires_ms: u64,
-    /// The proof's format number, from the proof registry.
+    /// The proof's device format, from the proof registry.
     pub format: u32,
-    pub public: CredentialPublic,
+    /// The kernel's public arguments in their SCALE encoding, at most
+    /// [`crate::abi::cap::CLAIM`] bytes, its last 32 the call's binding
+    /// ([`crate::credentials::claim_binding`]).
+    pub claim: Vec<u8>,
     pub proof: Vec<u8>,
 }
 

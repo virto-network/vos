@@ -1,20 +1,21 @@
-//! A credentialed call's step (`identity-and-authority.md` §5's apply
-//! rule, at the batch's time): refused, writing nothing, when it expired,
-//! when its binding digest is recorded, when an auth root is not fresh, or
-//! when a `once` guard admitted its nullifier; else its binding digest is
-//! recorded, whatever the method then does, and the method runs as the
-//! call's origin, a `once` guard's nullifier recorded only when the method
-//! returned `Ok`. A ring the meter cannot pay, or that does not read,
-//! fails the call before anything is recorded: nothing of it ran, and it
-//! may come again.
+//! A proven call's step (`identity-and-authority.md` §5's apply rule, at
+//! the batch's time): refused, writing nothing, when it expired, when its
+//! binding digest is recorded, when a stock auth claim's root is not
+//! fresh, or when a `once` guard admitted its nullifier; else its binding
+//! digest is recorded, whatever the method then does, and the method runs
+//! as the call's origin, a `once` guard's nullifier recorded only when the
+//! method returned `Ok`. A kernel guard's handler takes the claim before
+//! the call's arguments, and its checks are its own. A ring the meter
+//! cannot pay, or that does not read, fails the call before anything is
+//! recorded: nothing of it ran, and it may come again.
 
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 
 use vos_wire::abi::{Failure, Refusal};
 use vos_wire::batch::CredentialedInput;
-use vos_wire::credentials::{self, Ring};
-use vos_wire::ids::{InstanceId, Principal};
+use vos_wire::credentials::{self, AuthClaim, Ring};
+use vos_wire::ids::{InstanceId, MethodId, Principal};
 use vos_wire::keys::{self, Due};
 use vos_wire::result::{InputRef, Outcome, Step, Write};
 use vos_wire::schema::CredentialGuard;
@@ -44,16 +45,21 @@ pub(crate) fn credentialed(base: &Base, index: u32, call: CredentialedInput) -> 
     if base.holds(&keys::binding(&call.binding)) {
         return refused(Refusal::Replayed);
     }
-    if let Some(root) = &call.root {
+    let (guard, kernel) = guard(base, call.instance, call.method);
+    // A stock auth claim's root, its first digest: ingress checked the
+    // claim's shape, and one that is not an auth claim runs nothing.
+    if let Some(CredentialGuard::Auth { .. }) = &guard {
+        let Some(claim) = AuthClaim::decode_exact(&call.claim) else {
+            return Stepped::ran(consumed(input, Outcome::failed(Failure::Forbidden)));
+        };
         match ring(base) {
-            Ok(Some(ring)) if ring.accepts(root, base.time).is_ok() => {}
+            Ok(Some(ring)) if ring.accepts(&claim.map_root, base.time).is_ok() => {}
             Ok(_) => return refused(Refusal::StaleRoot),
             // A ring the meter cannot pay, or that does not read: the call
             // fails, nothing recorded.
             Err(code) => return Stepped::ran(consumed(input, Outcome::failed(code))),
         }
     }
-    let guard = guard(base, call.instance, call.method);
     let once = match (&guard, call.origin) {
         (
             Some(CredentialGuard::Auth { once: true, .. }),
@@ -77,22 +83,37 @@ pub(crate) fn credentialed(base: &Base, index: u32, call: CredentialedInput) -> 
             value: Some(Vec::new()),
         },
     ];
-    // An auth origin's scope is its guard's: ingress checked it, and the
-    // guard holds to it.
+    // An auth origin's scope is its guard's, and a kernel origin's kernel
+    // the one its guard names: ingress checked both, and the guard holds
+    // to them.
     let scoped = match (&guard, call.origin) {
         (Some(CredentialGuard::Auth { name, .. }), Principal::Anonymous { scope, .. }) => {
             space(base).is_some_and(|space| {
                 credentials::scope(&space, base.agent, call.instance, name) == scope
             })
         }
+        (Some(CredentialGuard::Kernel { .. }), Principal::Kernel { .. }) => {
+            kernel == Some(call.kernel)
+        }
         _ => true,
+    };
+    // A kernel guard's handler takes the claim first, as one
+    // length-prefixed part its first argument decodes whole, then the
+    // call's arguments; a stock guard's handler, the call's alone.
+    let arguments = match &guard {
+        Some(CredentialGuard::Kernel { .. }) => {
+            let mut arguments = call.claim.encode();
+            arguments.extend_from_slice(&call.arguments);
+            arguments
+        }
+        _ => call.arguments,
     };
     let mut run = if scoped {
         let invoked = Call {
             caller: &call.origin,
             instance: call.instance,
             method: call.method,
-            arguments: &call.arguments,
+            arguments: &arguments,
         };
         command(base, index, input, invoked)
     } else {
@@ -108,19 +129,27 @@ pub(crate) fn credentialed(base: &Base, index: u32, call: CredentialedInput) -> 
     Stepped::ran(run)
 }
 
-/// The guard of `instance`'s `method`, if both exist and it has one.
+/// The guard of `instance`'s `method`, if both exist and it has one, and
+/// a kernel guard's kernel, a method of the same instance.
 fn guard(
     base: &Base,
     instance: InstanceId,
-    method: vos_wire::ids::MethodId,
-) -> Option<CredentialGuard> {
-    let installed = base.installed(instance).ok().flatten()?;
-    installed
+    method: MethodId,
+) -> (Option<CredentialGuard>, Option<MethodId>) {
+    let Some(installed) = base.installed(instance).ok().flatten() else {
+        return (None, None);
+    };
+    let guard = installed
         .schema
-        .method(method)?
-        .credential
-        .as_deref()
-        .cloned()
+        .method(method)
+        .and_then(|method| method.credential.as_deref().cloned());
+    let kernel = match &guard {
+        Some(CredentialGuard::Kernel { name }) => core::str::from_utf8(name)
+            .ok()
+            .and_then(|name| installed.schema.method_id(name)),
+        _ => None,
+    };
+    (guard, kernel)
 }
 
 /// The agent's space, when it has one.

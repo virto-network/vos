@@ -36,11 +36,11 @@ const OPERATOR_READ: u32 = ENVELOPE as u32;
 /// An install's body past this is large. A node holds few at once, from
 /// every transport.
 pub const LARGE: u32 = REQUEST + AGENT + OPERATED;
-/// The most a credential proof holds, in any format: a device proof's
-/// 1.5 MiB.
+/// The most a proven call's proof holds: the device format's 1.5 MiB.
 pub const MAX_CREDENTIAL_PROOF: usize = 3 << 19;
-/// A credentialed call's body as HTTP takes it: the proof, the arguments'
-/// cap and the envelope, less the agent's id a frame's body leads with.
+/// A credentialed call's body as HTTP takes it: the proof, the claim's and
+/// the arguments' cap together and the envelope, less the agent's id a
+/// frame's body leads with.
 pub const CREDENTIALED_HTTP: usize =
     MAX_CREDENTIAL_PROOF + cap::REQUEST + ENVELOPE - AGENT as usize;
 
@@ -66,8 +66,8 @@ pub enum Kind {
     Call = 0x0101,
     Query = 0x0102,
     Workflow = 0x0103,
-    /// A call whose authority is a credential proof: no session, no
-    /// signature.
+    /// A proven call: its authority a device kernel's proof, no session,
+    /// no signature.
     Credentialed = 0x0104,
     Stats = 0x0201,
     Status = 0x0202,

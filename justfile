@@ -104,7 +104,7 @@ test-proof: build-test-actors judge-wasm
     for test in (cargo test -p vos-pvm-proof --features debug-internals --test kernel -- --list --format terse --skip reads:: --skip wrap_files:: | lines | where {|line| $line ends-with ': test' } | each {|line| $line | str replace ': test' '' }) { cargo test -p vos-pvm-proof --features debug-internals --test kernel $test -- --exact --test-threads=1 }
     cargo test -p vos-pvm-proof --features debug-internals --test kernel reads:: -- --test-threads=1
     cargo test -p vos-pvm-proof --test kernel constants:: -- --test-threads=1
-    cargo test -p vos-pvm-recair --features heavy-gates --test circuit --test recursion --test segment --test device --test credential -- leakage heavy --test-threads=1
+    cargo test -p vos-pvm-recair --features heavy-gates --test circuit --test recursion --test segment --test device -- leakage heavy --test-threads=1
     cargo test -p vos-pvm-proof --features debug-internals --test kernel wrap_files:: -- --test-threads=1
     just test-carriers
 
@@ -635,10 +635,10 @@ _kit-workspace:
 # 39's layout past its header and on its queried parts reshaped within the
 # layout's bounds; the statement's and the space's decoders and the venue's
 # check; prove-then-verify on random programs; and a credentialed call's
-# decode and the credential verifier's bytes, ingress's. A target's
-# property is no panic and nothing accepted but a golden (a credential
-# proof: its one encoding).
-fuzz_targets := "final_verifier_bytes final_verifier_mutate statement_decode prove_verify_roundtrip masked_bytes masked_shape anchor_decode api_reader operated_decode credentialed_decode credential_verify_bytes"
+# decode and the device verifier's bytes, ingress's. A target's property
+# is no panic and nothing accepted but a golden (a device proof: its one
+# encoding).
+fuzz_targets := "final_verifier_bytes final_verifier_mutate statement_decode prove_verify_roundtrip masked_bytes masked_shape anchor_decode api_reader operated_decode credentialed_decode device_verify_bytes"
 
 # Each target's checked-in corpus (`pvm/proof/fuzz/replay`) run once, every
 # input, optimized and without a sanitizer: no crash. `cargo run --example

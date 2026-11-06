@@ -530,6 +530,36 @@ pub fn verify_masked<MC: MerkleChannel, C: MaskedComponents>(
         .map_err(Error::Stark)
 }
 
+/// Whether `pow` meets `format`'s interaction PoW where [`replay`] checks
+/// it: the header, the program's words, the first two of `commitments`
+/// (the preprocessed and main roots) and `public` mixed, as there. A
+/// pre-check over a proof's leading fields alone: what it refuses,
+/// [`verify_masked`] refuses.
+pub fn interaction_pow_holds<MC: MerkleChannel>(
+    format: &MaskedFormat<'_>,
+    public: &[SecureField],
+    commitments: &[<MC::H as MerkleHasherLifted>::Hash],
+    pow: u64,
+) -> bool {
+    let [preprocessed_root, main_root, ..] = commitments else {
+        return false;
+    };
+    let mut channel = MC::C::default();
+    mix_header(
+        &mut channel,
+        format.number,
+        &format.config,
+        format.log_sizes,
+    );
+    for &word in format.program {
+        channel.mix_u64(word);
+    }
+    MC::mix_root(&mut channel, *preprocessed_root);
+    MC::mix_root(&mut channel, *main_root);
+    channel.mix_felts(public);
+    channel.verify_pow_nonce(format.interaction_pow_bits, pow)
+}
+
 /// The `format::MASKED_WRAP` proof in `bytes`: at most
 /// [`crate::MAX_PROOF_BYTES`], its fixed layout read whole, its header the
 /// format's, every count its pin or within its bound, nothing after it.

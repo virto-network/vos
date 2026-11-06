@@ -245,7 +245,16 @@ pub(crate) fn run_batch(base: &mut Base, batch: Batch) -> ResultWriter {
         handled: false,
         result: ResultWriter::new(batch.version, batch.time, batch.seed),
     };
+    let mut called_proven = 0;
     for input in batch.inputs {
+        // At most a batch's credentialed calls: the first past them cuts
+        // the batch short.
+        if let Input::Credentialed(_) = input {
+            if called_proven == defaults::BATCH_CREDENTIALED {
+                break;
+            }
+            called_proven += 1;
+        }
         // Dispatch only what the budget can finish, by the meter: the
         // input's reserve first, then its handler's limit, once its
         // installed record, paid for above the reserve, gives it.

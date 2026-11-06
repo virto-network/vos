@@ -41,25 +41,6 @@ impl<V: Value> Context<V> {
         Ok(finalized)
     }
 
-    /// [`Context::finalize`] for a circuit of `p2` and `qm31` alone (the
-    /// credential AIR's set), padded to `sizes` rows: it has no `h8` row,
-    /// and `h8`'s padding, whose inputs use the zero wire, is not added.
-    pub fn finalize_without_h8(mut self, sizes: [usize; 2]) -> Result<Finalized<V>, WiringError> {
-        self.close();
-        let [p2, qm31, h8] = self.rows();
-        if h8 != 0 {
-            return Err(WiringError::Size {
-                component: "h8",
-                rows: h8,
-            });
-        }
-        Self::check_sizes(&["p2", "qm31"], &[p2, qm31], &sizes)?;
-        self.pad([sizes[0], sizes[1], 0]);
-        let finalized = self.wire();
-        finalized.circuit.check_wiring_without_h8()?;
-        Ok(finalized)
-    }
-
     /// The constants fixed and the pending guesses yielded: the rows a
     /// circuit has before its padding.
     fn close(&mut self) {

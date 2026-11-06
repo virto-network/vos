@@ -3,10 +3,10 @@
 # space's ingress, the gate phone over adb.
 #
 # The host runs one node of a founded space (`cargo run --release -p
-# vos-node --example device_ingress`): the credential actor and the device
-# actor installed, a member enrolled. For each round (3 by default) it
-# writes the device kernel's witness input for a sign-in to the device
-# actor's `login`, good for 110 s by the node's clock; the phone proves it
+# vos-node --example device_ingress`): the credential actor and the poll
+# installed, a member enrolled. For each round (3 by default) it writes
+# the stock `auth` kernel's witness input for a sign-in to the poll's
+# `login`, good for 110 s by the node's clock; the phone proves it
 # with `vos-phone kernel` (the device library's `DeviceProgram::released`
 # on the kernel's release artifact, and
 # `Prover::prove_kernel`, the device format, automatic threads), verifies it there

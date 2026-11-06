@@ -656,18 +656,15 @@ pub fn scope(space: &SpaceId, agent: AgentId, instance: InstanceId, name: &[u8])
 }
 
 /// What a binding digest binds: one call of one method, in one space,
-/// under one statement, once, before `expires_ms`.
+/// under one device program, once, before `expires_ms`.
 #[derive(Clone, Copy, Debug)]
 pub struct Bound<'a> {
     pub space: &'a SpaceId,
     pub agent: AgentId,
     pub instance: InstanceId,
     pub method: MethodId,
-    /// The statement's program id: its circuit's, or a device proof's
-    /// kernel's.
+    /// The device program's id, which names the statement.
     pub program: &'a [u8; 32],
-    /// The statement's kind, [`crate::ingress::CredentialPublic`]'s index.
-    pub kind: u8,
     pub arguments: &'a [u8],
     pub nonce: &'a [u8; 16],
     pub expires_ms: u64,
@@ -675,11 +672,10 @@ pub struct Bound<'a> {
 
 impl Bound<'_> {
     /// `b = BLAKE2b-256("vos/cred/binding/v1" ‖ space ‖ agent ‖ instance ‖
-    /// method ‖ program ‖ kind ‖ arguments ‖ nonce ‖ expires_ms)`: the
-    /// agent, instance and method four little-endian bytes each, the kind
-    /// one byte, the arguments as the codec writes them (a `u32`
-    /// little-endian length, then the bytes), `expires_ms` eight
-    /// little-endian bytes.
+    /// method ‖ program ‖ arguments ‖ nonce ‖ expires_ms)`: the agent,
+    /// instance and method four little-endian bytes each, the arguments as
+    /// the codec writes them (a `u32` little-endian length, then the
+    /// bytes), `expires_ms` eight little-endian bytes.
     pub fn digest(&self) -> [u8; 32] {
         let length = (self.arguments.len() as u32).to_le_bytes();
         vos_pvm_precompiles::blake2b_hash::<32>(
@@ -690,7 +686,6 @@ impl Bound<'_> {
                 &self.instance.0.to_le_bytes(),
                 &self.method.0.to_le_bytes(),
                 self.program,
-                &[self.kind],
                 &length,
                 self.arguments,
                 self.nonce,
@@ -698,6 +693,45 @@ impl Bound<'_> {
             ],
         )
     }
+}
+
+/// The stock `auth` kernel's claim, its public arguments: the member's
+/// leaf under `map_root`, a root of the ring, and `nullifier` its
+/// pseudonym in `scope`; then the call's `binding`. 128 bytes, the four
+/// digests in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct AuthClaim {
+    pub map_root: Digest,
+    pub scope: Digest,
+    pub nullifier: Digest,
+    pub binding: Digest,
+}
+
+/// The stock `owner` kernel's claim: `owner` the secret's owner digest,
+/// then the call's `binding`. 64 bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct OwnerClaim {
+    pub owner: Digest,
+    pub binding: Digest,
+}
+
+impl AuthClaim {
+    /// Its encoding's length.
+    pub const BYTES: usize = 4 * 32;
+}
+
+impl OwnerClaim {
+    /// Its encoding's length.
+    pub const BYTES: usize = 2 * 32;
+}
+
+/// A claim's `binding`, its last 32 bytes (`light-node.md` §4.3): every
+/// device kernel's claim ends with it. `None` for a claim shorter.
+pub fn claim_binding(claim: &[u8]) -> Option<&Digest> {
+    claim
+        .len()
+        .checked_sub(32)
+        .map(|at| claim[at..].try_into().expect("a claim's last 32 bytes"))
 }
 
 /// The proof's public `binding` of the binding digest `b`:

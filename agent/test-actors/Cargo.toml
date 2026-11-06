@@ -6,7 +6,7 @@
 members = [
     "counter", "ledger", "purses", "poll", "caller", "tracker", "shop", "rounds", "kernels", "tainted", "bounds", "wide",
     "bulky", "greedy", "window", "reader", "accounts", "balance", "shard", "device", "device-next", "sdk-device", "gated",
-    "home", "personal-next", "notes",
+    "home", "personal-next", "notes", "credentials-next",
 ]
 resolver = "3"
 

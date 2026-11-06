@@ -1,0 +1,18 @@
+# The credential actor as its next release would be, for the test of the
+# stock kernels' compatibility windows: the same tables, its `auth` kernel
+# another program with the same claims.
+[package]
+name = "credentials-next"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "credentials-next"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+vos-sdk = { workspace = true }
+vos-credentials = { path = "../../credentials", features = ["next"] }

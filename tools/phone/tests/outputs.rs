@@ -8,10 +8,9 @@ use std::path::Path;
 use std::process::Command;
 
 use vos_checker::carriers::{Audit, Kind, Reach};
-use vos_pvm_recair::device::{auth_arguments, auth_public};
-use vos_wire::SpaceId;
-use vos_wire::credentials::{self as tree, Siblings, Tag, leaf, root_of};
+use vos_wire::credentials::{self as tree, AuthClaim, Siblings, Tag, leaf, root_of};
 use vos_wire::ids::{AgentId, InstanceId};
+use vos_wire::{Encode, SpaceId};
 
 #[allow(dead_code)]
 #[path = "../src/member.rs"]
@@ -70,25 +69,34 @@ fn the_benchs_lines_and_proofs_hold_no_secret() {
         .needles
         .member_place("the bench's member", &member, &path);
 
-    // A device kernel's witness input for auth's statement by the member.
+    // The stock auth kernel's witness input by the member: the path's
+    // siblings and its slot's eight bytes, the secret, the claim.
     let scope = tree::scope(&SpaceId([0x53; 32]), AgentId(7), InstanceId(3), b"login");
     let nullifier = tree::digest(&tree::compress(
         &tree::compress(&Tag::Nf.block(), &words),
         &tree::words(&scope).unwrap(),
     ));
-    let binding = tree::binding(&[0x62; 32]);
-    let public = auth_public(&path.root, &scope, &nullifier, &binding);
-    let input = auth_arguments(&siblings, &words, SLOT, &public);
+    let claim = AuthClaim {
+        map_root: path.root,
+        scope,
+        nullifier,
+        binding: tree::binding(&[0x62; 32]),
+    }
+    .encode();
+    let mut input = path.siblings.0.concat();
+    input.extend_from_slice(&u64::from(SLOT).to_le_bytes());
+    input.extend_from_slice(&tree::digest(&words));
+    input.extend_from_slice(&claim);
     audit
         .needles
-        .kernel_arguments("the bench's member", &input, public.len());
+        .kernel_arguments("the bench's member", &input, claim.len());
 
     let dir = tempfile::tempdir().unwrap();
     let proofs = dir.path().join("proofs");
     let kernel = dir.path().join("kernel");
     let witness = dir.path().join("input");
     let proved = dir.path().join("kernel.proof");
-    let elf = vos_testkit::programs::package("device");
+    let elf = std::fs::read(vos_testkit::programs::credentials_elf()).unwrap();
     let device = vos_light::release::device(&elf, "auth").unwrap();
     std::fs::write(&kernel, vos_wire::Encode::encode(&device)).unwrap();
     std::fs::write(&witness, &input).unwrap();

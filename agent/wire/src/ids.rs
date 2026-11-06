@@ -87,9 +87,10 @@ pub fn derive_id(domain: &str, name: &str) -> u32 {
 
 /// Who made a request: a client, authenticated at ingress by its key,
 /// another agent, or, for a nested call, the calling instance of the same
-/// agent; or the sender of a credential proof, which ingress verified
-/// (`identity-and-authority.md` §5). Each holds only the roles granted to
-/// it, and a credential's origin none: a guard admits it.
+/// agent; or the sender of a proven call, whose device proof ingress
+/// verified (`identity-and-authority.md` §5). Each holds only the roles
+/// granted to it, and a proven call's origin none: a guard admits it.
+/// Index 5 is reserved for `Identity`, 6 for `Jam`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub enum Principal {
     #[codec(index = 0)]
@@ -110,11 +111,20 @@ pub enum Principal {
     /// owner a row names.
     #[codec(index = 4)]
     Owner([u8; 32]),
+    /// A proof of an actor's own device kernel (`#[msg(proven = k)]`):
+    /// `program` is the kernel's device program the proof was verified
+    /// under. The claim reaches the handler as its first argument, and the
+    /// handler checks it.
+    #[codec(index = 7)]
+    Kernel { program: [u8; 32] },
 }
 
 impl Principal {
-    /// Whether a credential proof made it: no role is ever granted to one.
+    /// Whether a device proof made it: no role is ever granted to one.
     pub const fn is_credential(&self) -> bool {
-        matches!(self, Principal::Anonymous { .. } | Principal::Owner(_))
+        matches!(
+            self,
+            Principal::Anonymous { .. } | Principal::Owner(_) | Principal::Kernel { .. }
+        )
     }
 }

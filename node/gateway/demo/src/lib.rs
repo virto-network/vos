@@ -1,7 +1,7 @@
 //! The s4 demo on a local space: one node of a
 //! founded space whose agent holds the credential actor, the poll, the
-//! `purses` ledger and the device actor (whose `login` takes a device proof
-//! of its kernel `auth` beside a credential proof), an operator who
+//! `purses` ledger and the device actor (whose `login` its own kernel
+//! `auth` proves), an operator who
 //! invites members and mints, and the
 //! gateway's SSH port serving the demo's screens over the node's socket.
 //! A phone runs it through `adb reverse`; the end-to-end test

@@ -327,9 +327,17 @@ pub(super) fn handler_arm(handler: &Handler, actor: &Ident, message: &Ident) -> 
             quote!(),
         ),
     };
+    // A kernel guard's claim, unwrapped from its own part.
+    let arguments = names
+        .iter()
+        .enumerate()
+        .map(|(at, name)| match handler.claimed && at == 0 {
+            true => quote!(message.#name.0),
+            false => quote!(message.#name),
+        });
     let outcome = outcome(
         handler,
-        quote!(state.#method(#context #(message.#names),*)),
+        quote!(state.#method(#context #(#arguments),*)),
         save,
     );
     quote! {
