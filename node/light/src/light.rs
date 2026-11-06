@@ -247,6 +247,20 @@ impl Light {
         Author::from(&self.key)
     }
 
+    /// The device's sync key: its scopes' author, so a reader checks each
+    /// node's author against the device set, and the client key of its
+    /// calls at the personal agent, its votes and its evidence.
+    pub fn sync_key(&self) -> &SigningKey {
+        &self.key
+    }
+
+    /// The node `cid` of `instance`'s scope, if the scope holds it.
+    pub fn node(&self, instance: InstanceId, cid: &sync::Cid) -> Result<Option<Vec<u8>>, Error> {
+        let mut writing = self.writing();
+        let scope = self.scope(&mut writing, instance)?;
+        Ok(merkle_crdt::Store::node(scope.store(), cid)?)
+    }
+
     /// Install `package` as `instance`, its roles `roles`: its programs
     /// checked against its derivation and pooled, the install run as a
     /// node's, and its programs and rows committed in one batch. The

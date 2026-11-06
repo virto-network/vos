@@ -72,8 +72,9 @@ pub(crate) struct Device {
     admin: SigningKey,
 }
 
-fn keys(n: u8) -> (SigningKey, SigningKey, NewDevice) {
-    let sync = SigningKey::from_bytes(&[n; 32]);
+/// Device `n`'s keys: its sync key its light node's, its scopes' author.
+fn keys(light: &Light, n: u8) -> (SigningKey, SigningKey, NewDevice) {
+    let sync = light.sync_key().clone();
     let admin = SigningKey::from_bytes(&[n | 0x80; 32]);
     let device = NewDevice {
         sync: sync.verifying_key().to_bytes(),
@@ -242,7 +243,7 @@ pub(crate) fn household(root: &Path, size: usize) -> (Vec<Device>, Script) {
     for n in 0..size {
         let light =
             Light::open(&root.join(n.to_string()), AGENT, Config::default()).expect("opens");
-        let (sync, admin, device) = keys(n as u8 + 1);
+        let (sync, admin, device) = keys(&light, n as u8 + 1);
         if n == 0 {
             script.append(Body::Assigned {
                 device: 0,
