@@ -264,24 +264,21 @@ impl Store {
         Ok(queued)
     }
 
-    /// Queue `value` for `instance`'s node `seq`, synced, before it is sent.
-    pub(crate) fn enqueue(
+    /// Write `instance`'s queue rows, synced: each node's sealed envelope,
+    /// or (`None`) its deletion.
+    pub(crate) fn write_queue(
         &self,
         instance: InstanceId,
-        seq: u64,
-        value: Vec<u8>,
+        rows: impl IntoIterator<Item = (u64, Option<Vec<u8>>)>,
     ) -> Result<(), StoreError> {
-        let (meta, key) = self.queue_key(instance, seq);
         let mut batch = self.0.db.batch();
-        batch.insert(meta, key, value);
-        Ok(batch.durability(Some(PersistMode::SyncAll)).commit()?)
-    }
-
-    /// Delete `instance`'s queued envelope of node `seq`, synced.
-    pub(crate) fn dequeue(&self, instance: InstanceId, seq: u64) -> Result<(), StoreError> {
-        let (meta, key) = self.queue_key(instance, seq);
-        let mut batch = self.0.db.batch();
-        batch.remove(meta, key);
+        for (seq, value) in rows {
+            let (meta, key) = self.queue_key(instance, seq);
+            match value {
+                Some(value) => batch.insert(meta, key, value),
+                None => batch.remove(meta, key),
+            }
+        }
         Ok(batch.durability(Some(PersistMode::SyncAll)).commit()?)
     }
 

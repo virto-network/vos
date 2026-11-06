@@ -483,20 +483,23 @@ impl<'a, L: Link> SealedSync<'a, L> {
             .map(|node| (node.seq, node.bytes))
             .collect();
         let mut queued: BTreeMap<u64, Queued> = BTreeMap::new();
+        let mut leftover = Vec::new();
         for (seq, entry) in self.light.queued(instance)? {
             if nodes.contains_key(&seq) {
                 queued.insert(seq, entry);
             } else {
-                self.light.sent(instance, seq)?;
+                leftover.push(seq);
             }
         }
+        self.light.sent(instance, &leftover)?;
+        let mut fresh = Vec::new();
         for (seq, node) in &nodes {
             if !queued.contains_key(seq) {
-                let entry = self.seal(scope, *seq, node)?;
-                self.light.enqueue(instance, *seq, &entry)?;
-                queued.insert(*seq, entry);
+                fresh.push((*seq, self.seal(scope, *seq, node)?));
             }
         }
+        self.light.enqueue(instance, &fresh)?;
+        queued.extend(fresh);
         let order: Vec<u64> = queued.keys().copied().collect();
         let mut report = Pushing::default();
         let mut at = 0;
@@ -507,32 +510,42 @@ impl<'a, L: Link> SealedSync<'a, L> {
                 .map(|seq| queued[seq].envelope.clone())
                 .collect();
             let answers = self.send(&envelopes)?;
+            let mut taken = Vec::new();
+            let mut stop = None;
             for (seq, answer) in round.iter().zip(answers) {
                 match answer {
                     Ok(pushed) => {
-                        self.light.sent(instance, *seq)?;
+                        taken.push(*seq);
                         report.pushed.push((*seq, pushed));
-                        at += 1;
                     }
-                    Err(PersonalError::StaleEpoch { confirmed })
-                        if confirmed == self.group.confirmed()
-                            && queued[seq].epoch != confirmed =>
-                    {
-                        for seq in &order[at..] {
-                            if queued[seq].epoch != confirmed {
-                                let entry = self.seal(scope, *seq, &nodes[seq])?;
-                                self.light.enqueue(instance, *seq, &entry)?;
-                                queued.insert(*seq, entry);
-                            }
-                        }
+                    Err(error) => {
+                        stop = Some(error);
                         break;
                     }
-                    Err(PersonalError::StaleEpoch { confirmed }) => {
-                        report.stale = Some(confirmed);
-                        return Ok(report);
-                    }
-                    Err(error) => return Err(SyncError::Refused(error)),
                 }
+            }
+            self.light.sent(instance, &taken)?;
+            at += taken.len();
+            match stop {
+                None => {}
+                Some(PersonalError::StaleEpoch { confirmed })
+                    if confirmed == self.group.confirmed()
+                        && queued[&order[at]].epoch != confirmed =>
+                {
+                    let mut resealed = Vec::new();
+                    for seq in &order[at..] {
+                        if queued[seq].epoch != confirmed {
+                            resealed.push((*seq, self.seal(scope, *seq, &nodes[seq])?));
+                        }
+                    }
+                    self.light.enqueue(instance, &resealed)?;
+                    queued.extend(resealed);
+                }
+                Some(PersonalError::StaleEpoch { confirmed }) => {
+                    report.stale = Some(confirmed);
+                    return Ok(report);
+                }
+                Some(error) => return Err(SyncError::Refused(error)),
             }
         }
         Ok(report)

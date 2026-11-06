@@ -415,38 +415,45 @@ impl Light {
             .collect()
     }
 
-    /// Queue `queued` for `instance`'s local node `seq`, synced: written
-    /// before it is sent, so a retry after a crash sends the same bytes.
-    pub fn enqueue(&self, instance: InstanceId, seq: u64, queued: &Queued) -> Result<(), Error> {
+    /// Queue each `(seq, queued)` for `instance`'s local node `seq`, in one
+    /// synced batch: written before they are sent, so a retry after a crash
+    /// sends the same bytes.
+    pub fn enqueue(&self, instance: InstanceId, queued: &[(u64, Queued)]) -> Result<(), Error> {
         let _writing = self.writing();
-        Ok(self.store.enqueue(instance, seq, queued.encode())?)
+        let rows = queued
+            .iter()
+            .map(|(seq, queued)| (*seq, Some(queued.encode())));
+        Ok(self.store.write_queue(instance, rows)?)
     }
 
-    /// The agent took `instance`'s local node `seq`: it and its author's
-    /// earlier nodes are pushed, and its queued envelope deleted, in one
-    /// batch.
-    pub fn sent(&self, instance: InstanceId, seq: u64) -> Result<(), Error> {
+    /// The agent took `instance`'s local nodes `seqs`: they and their
+    /// author's earlier nodes are pushed, and their queued envelopes
+    /// deleted, in one batch. A node no longer in the outbox only leaves
+    /// the queue.
+    pub fn sent(&self, instance: InstanceId, seqs: &[u64]) -> Result<(), Error> {
+        let Some(last) = seqs.iter().max().copied() else {
+            return Ok(());
+        };
         let mut writing = self.writing();
         let author = self.author();
         let scope = self.scope(&mut writing, instance)?;
-        let (meta, key) = self.store.queue_key(instance, seq);
         let outgoing = scope
             .outbox()
             .map_err(Error::Scope)?
             .iter()
-            .any(|node| node.author == author && node.seq <= seq);
-        scope.store_mut().stage(meta, &key, None);
-        let pushed = if outgoing {
-            scope.pushed(&[(author, seq)]).map_err(Error::from)
-        } else {
-            Ok(())
-        };
-        scope.store_mut().unstage();
-        pushed?;
+            .any(|node| node.author == author && node.seq <= last);
         if !outgoing {
-            self.store.dequeue(instance, seq)?;
+            return Ok(self
+                .store
+                .write_queue(instance, seqs.iter().map(|seq| (*seq, None)))?);
         }
-        Ok(())
+        for seq in seqs {
+            let (meta, key) = self.store.queue_key(instance, *seq);
+            scope.store_mut().stage(meta, &key, None);
+        }
+        let pushed = scope.pushed(&[(author, last)]);
+        scope.store_mut().unstage();
+        Ok(pushed?)
     }
 
     /// Each author's highest sequence number applied in `instance`'s
