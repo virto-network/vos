@@ -179,6 +179,8 @@ pub enum Why {
     Split,
     /// The window passed without the set complete.
     Timeout,
+    /// The agent voided it before this device's count decided it.
+    Agent,
 }
 
 /// What a device raises to its user.
@@ -207,6 +209,9 @@ pub enum Alarm {
     },
     /// The agent's verdict on `epoch` is not this device's count.
     Verdict { epoch: u64 },
+    /// The log's entry at `index` asserts what no verified operation
+    /// supports (a maturity with no signed removal): it is ignored.
+    Unsigned { index: u64 },
     /// The device's clock and the agent's batch time disagree by `skew_ms`,
     /// more than an hour: the device acts as the log says.
     Clock { skew_ms: u64 },
@@ -254,6 +259,9 @@ impl Prepared {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub(crate) struct Known {
     pub(crate) keys: NewDevice,
+    /// When its probation ends, by the log's time: it signs no operation
+    /// or commit before.
+    pub(crate) active_from: u64,
     /// Its removal matured: it has no voice.
     pub(crate) matured: bool,
     /// A confirmed commit removed it from the group.
@@ -314,8 +322,13 @@ pub(crate) struct Pending {
 pub(crate) struct Own {
     pub(crate) epoch: u64,
     pub(crate) welcome: Option<Vec<u8>>,
-    /// Its call's log index, signed message and signature, once made.
-    pub(crate) call: Option<(u64, Vec<u8>, [u8; 64])>,
+    /// Its call's arguments, by which the log's candidate is known as it.
+    pub(crate) arguments: Vec<u8>,
+    /// Its call's signed message and signature, written before the call
+    /// is made.
+    pub(crate) signed: Option<(Vec<u8>, [u8; 64])>,
+    /// Its call's log index, once the agent took it.
+    pub(crate) index: Option<u64>,
     /// The log holds its evidence.
     pub(crate) evidenced: bool,
 }
@@ -383,6 +396,26 @@ impl State {
     pub(crate) fn voiced(&self, device: DeviceId) -> bool {
         self.known(device)
             .is_some_and(|known| !known.matured && !known.out)
+    }
+
+    /// A device with a voice past its probation at `at`: it may sign an
+    /// operation or a commit.
+    pub(crate) fn may_sign(&self, device: DeviceId, at: u64) -> bool {
+        self.voiced(device)
+            && self
+                .known(device)
+                .is_some_and(|known| at >= known.active_from)
+    }
+
+    /// The device's voice at `cutoff`: no matured removal, and none whose
+    /// verified removal matures by then.
+    pub(crate) fn voiced_at(&self, device: DeviceId, cutoff: u64) -> bool {
+        self.voiced(device)
+            && !self.removals.iter().any(|removal| {
+                removal.target == device
+                    && removal.evidence == Check::Valid
+                    && removal.matures <= cutoff
+            })
     }
 
     /// The matured removals with verified evidence no confirmed commit
@@ -497,6 +530,7 @@ impl DeviceGroup {
                 0,
                 Known {
                     keys: me.clone(),
+                    active_from: now,
                     matured: false,
                     out: false,
                 },
@@ -754,12 +788,21 @@ impl DeviceGroup {
         state.own = Some(Own {
             epoch,
             welcome: None,
-            call: None,
+            arguments: Vec::new(),
+            signed: None,
+            index: None,
             evidenced: false,
         });
         let commit = self.mls.commit(&packages, &removes, now / 1000, |commit| {
             if let Some(own) = &mut state.own {
                 own.welcome = commit.welcome.clone();
+                own.arguments = Prepared {
+                    epoch: commit.epoch,
+                    effect: effect.clone(),
+                    handshake: commit.handshake.clone(),
+                    welcome: commit.welcome.clone(),
+                }
+                .arguments();
             }
             rows(&state, None)
         })?;
@@ -795,18 +838,28 @@ impl DeviceGroup {
         Ok((prepared, pairing))
     }
 
-    /// The admin call of this device's held commit was taken at log index
-    /// `index`, its signed message `message` and signature `signature`:
-    /// the evidence to post, which [`DeviceGroup::follow`] gives again
-    /// until the log holds it.
-    pub fn called_commit(
+    /// The admin call of this device's held commit is signed, as
+    /// `message` with `signature`: written before the call is made, so the
+    /// evidence survives a crash between the call and its answer.
+    pub fn signed_commit(
         &mut self,
-        index: u64,
         message: Vec<u8>,
         signature: [u8; 64],
-    ) -> Result<Event, GroupError> {
+    ) -> Result<(), GroupError> {
         let own = self.state.own.as_mut().ok_or(GroupError::NoCommit)?;
-        own.call = Some((index, message.clone(), signature));
+        own.signed = Some((message, signature));
+        self.mls.write(rows(&self.state, None))?;
+        Ok(())
+    }
+
+    /// The agent took this device's signed commit call at log index
+    /// `index`: the evidence to post, which [`DeviceGroup::follow`] gives
+    /// again until the log holds it (and finds by itself in the log after
+    /// a crash).
+    pub fn called_commit(&mut self, index: u64) -> Result<Event, GroupError> {
+        let own = self.state.own.as_mut().ok_or(GroupError::NoCommit)?;
+        let (message, signature) = own.signed.clone().ok_or(GroupError::NoCommit)?;
+        own.index = Some(index);
         let welcome = own.welcome.clone();
         self.mls.write(rows(&self.state, None))?;
         Ok(Event::Evidence {
@@ -825,7 +878,7 @@ impl DeviceGroup {
             .state
             .own
             .as_ref()
-            .is_some_and(|own| own.call.is_some())
+            .is_some_and(|own| own.index.is_some())
         {
             return Err(GroupError::Pending);
         }

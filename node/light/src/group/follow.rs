@@ -9,7 +9,7 @@ use vos_wire::Decode;
 use vos_wire::ids::MethodId;
 use vos_wire::ingress::CallMessage;
 use vos_wire::personal::{
-    AdminCall, AdminClass, Body, DeviceId, Effect, Entry, Verdict, Void, Vote, chain, vote_message,
+    AdminClass, Body, DeviceId, Effect, Entry, Verdict, Void, Vote, chain, vote_message,
     welcome_hash,
 };
 
@@ -58,6 +58,7 @@ impl DeviceGroup {
             self.state.next += 1;
             self.state.chain = entry.chain;
             self.state.time = self.state.time.max(entry.at);
+            self.deadline(entry.at, &mut events)?;
             self.entry(index, entry, &mut events)?;
             self.settle(&mut events)?;
         }
@@ -72,6 +73,10 @@ impl DeviceGroup {
         entry: Entry,
         events: &mut Vec<Event>,
     ) -> Result<(), GroupError> {
+        let at = entry.at;
+        if let Body::Candidate { .. } = entry.body {
+            return self.candidate(index, entry, events);
+        }
         match entry.body {
             Body::Configured(policy) => self.state.policy = policy,
             Body::Removal {
@@ -80,7 +85,12 @@ impl DeviceGroup {
                 target,
                 matures,
             } => {
-                let evidence = if call.method == self.state.agent.remove.0 {
+                // Only a device with a voice, past its probation, removes
+                // another.
+                let evidence = if call.method == self.state.agent.remove.0
+                    && by != target
+                    && self.state.may_sign(by, at)
+                {
                     Check::Missing
                 } else {
                     Check::Invalid
@@ -96,6 +106,15 @@ impl DeviceGroup {
                 });
             }
             Body::Matured { device } => {
+                let signed = self.state.removals.iter().any(|removal| {
+                    removal.target == device
+                        && removal.evidence == Check::Valid
+                        && removal.matures <= at
+                });
+                if !signed {
+                    events.push(Event::Alarm(Alarm::Unsigned { index }));
+                    return Ok(());
+                }
                 if let Some(known) = self.state.known_mut(device) {
                     known.matured = true;
                 }
@@ -103,23 +122,7 @@ impl DeviceGroup {
                     self.out(events)?;
                 }
             }
-            Body::Candidate {
-                call,
-                by,
-                epoch,
-                added,
-                set,
-            } => self.candidate(
-                index,
-                entry.at,
-                entry.chain,
-                call,
-                by,
-                epoch,
-                added,
-                set,
-                events,
-            )?,
+            Body::Candidate { .. } => unreachable!("taken above"),
             Body::Evidence {
                 index: of,
                 message,
@@ -139,19 +142,29 @@ impl DeviceGroup {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// A candidate entry: its call decoded and checked against what the
+    /// device knows of its committer and of the device it adds.
     fn candidate(
         &mut self,
         index: u64,
-        at: u64,
-        chain: [u8; 32],
-        call: AdminCall,
-        by: DeviceId,
-        epoch: u64,
-        added: Option<DeviceId>,
-        set: Vec<DeviceId>,
+        entry: Entry,
         events: &mut Vec<Event>,
     ) -> Result<(), GroupError> {
+        let Entry {
+            at,
+            chain,
+            body:
+                Body::Candidate {
+                    call,
+                    by,
+                    epoch,
+                    added,
+                    set,
+                },
+        } = entry
+        else {
+            unreachable!("a candidate entry")
+        };
         if let Some(pending) = &self.state.pending {
             // The agent took the next candidate while this device's count
             // of the last one is undecided: the agent counted votes this
@@ -162,10 +175,31 @@ impl DeviceGroup {
         }
         let decoded = CommitArguments::decode_exact(&call.arguments)
             .filter(|((named, _), _)| *named == epoch && call.method == self.state.agent.commit.0);
-        let (evidence, effect, handshake, welcome_hash) = match decoded {
+        let (mut evidence, effect, handshake, welcome_hash) = match decoded {
             Some(((_, effect), (handshake, hash))) => (Check::Missing, effect, handshake, hash),
             None => (Check::Invalid, Effect::default(), Vec::new(), None),
         };
+        // The committer has a voice past its probation, an add is a strong
+        // admin's and names a new device by a new number.
+        let state = &self.state;
+        let strong = state
+            .known(by)
+            .is_some_and(|known| known.keys.class == AdminClass::Strong);
+        let fresh = added.is_none_or(|id| state.known(id).is_none());
+        if !state.may_sign(by, at)
+            || added.is_some() != effect.add.is_some()
+            || !fresh
+            || (effect.add.is_some() && !strong)
+        {
+            evidence = Check::Invalid;
+        }
+        if let Some(own) = &mut self.state.own
+            && Some(by) == self.state.id
+            && own.index.is_none()
+            && own.arguments == call.arguments
+        {
+            own.index = Some(index);
+        }
         let window = self.state.policy.confirm_window_ms;
         if let Some(me) = self.state.id
             && self.state.voiced(me)
@@ -276,7 +310,7 @@ impl DeviceGroup {
             self.state.removals[at].evidence = if valid { Check::Valid } else { Check::Invalid };
         }
         if let Some(own) = &mut self.state.own
-            && own.call.as_ref().is_some_and(|(index, _, _)| *index == of)
+            && own.index == Some(of)
         {
             own.evidenced = true;
         }
@@ -335,8 +369,8 @@ impl DeviceGroup {
                 // A void moves no key: taken from the agent.
                 Verdict::Void(void) => {
                     let why = match void {
-                        Void::Nack | Void::Timeout => Why::Timeout,
-                        Void::Split => Why::Split,
+                        Void::Timeout => Why::Timeout,
+                        Void::Nack | Void::Split => Why::Agent,
                     };
                     self.void(why, events)?;
                 }
@@ -389,37 +423,52 @@ impl DeviceGroup {
                 Processed::Copy { h: None, .. } | Processed::Ignored => None,
             };
         }
-        match self.count() {
+        match self.count(None) {
             Some(Verdict::Confirmed(h)) => self.confirm(h, events),
             Some(Verdict::Void(_)) => {
                 let why = self.why();
                 self.void(why, events)
             }
-            None => {
-                let pending = self.state.pending.as_ref().expect("pending");
-                let deadline = pending
-                    .at
-                    .saturating_add(self.state.policy.confirm_window_ms);
-                if self.state.time >= deadline {
-                    self.void(Why::Timeout, events)?;
-                }
-                Ok(())
+            None => Ok(()),
+        }
+    }
+
+    /// An entry at `at` past the pending candidate's window: the candidate
+    /// is decided as of the window's end first, as the agent decides it,
+    /// its voices those whose verified removal had not matured by then.
+    fn deadline(&mut self, at: u64, events: &mut Vec<Event>) -> Result<(), GroupError> {
+        let Some(pending) = &self.state.pending else {
+            return Ok(());
+        };
+        let deadline = pending
+            .at
+            .saturating_add(self.state.policy.confirm_window_ms);
+        if at < deadline {
+            return Ok(());
+        }
+        match self.count(Some(deadline)) {
+            Some(Verdict::Confirmed(h)) => self.confirm(h, events),
+            Some(Verdict::Void(_)) => {
+                let why = self.why();
+                self.void(why, events)
             }
+            None => self.void(Why::Timeout, events),
         }
     }
 
     /// The pending candidate's verdict as this device counts the verified
     /// votes of its set's voices: a nack or a second `h` voids it, one `h`
-    /// from each confirms it.
-    fn count(&self) -> Option<Verdict> {
+    /// from each confirms it. At `cutoff`, a voice is one whose verified
+    /// removal had not matured by then.
+    fn count(&self, cutoff: Option<u64>) -> Option<Verdict> {
         let pending = self.state.pending.as_ref()?;
         let mut confirmed = None;
         let mut complete = true;
-        for device in pending
-            .set
-            .iter()
-            .filter(|device| self.state.voiced(**device))
-        {
+        let voice = |device: DeviceId| match cutoff {
+            Some(cutoff) => self.state.voiced_at(device, cutoff),
+            None => self.state.voiced(device),
+        };
+        for device in pending.set.iter().filter(|device| voice(**device)) {
             match pending.votes.iter().find(|(voter, _)| voter == device) {
                 Some((_, Vote::Nack)) => return Some(Verdict::Void(Void::Nack)),
                 Some((_, Vote::Confirm(h))) => match confirmed {
@@ -495,7 +544,7 @@ impl DeviceGroup {
         if candidate.kind() == Kind::Removed {
             return Ok(Processed::Copy { candidate, h: None });
         }
-        if candidate.epoch() != pending.epoch {
+        if candidate.epoch() != pending.epoch || !self.roster_holds(pending, &candidate) {
             return Ok(Processed::Refused);
         }
         let authenticator = candidate.authenticator()?.ok_or(GroupError::Corrupt)?;
@@ -509,6 +558,29 @@ impl DeviceGroup {
             candidate,
             h: Some(h),
         })
+    }
+
+    /// Whether `candidate`'s members are the device set after `pending`:
+    /// every device in the group but those it removes, and the one it adds,
+    /// each leaf the device's credential. A leaf whose keys changed is
+    /// refused.
+    fn roster_holds(&self, pending: &Pending, candidate: &vos_mls::Candidate) -> bool {
+        let mut want: Vec<Vec<u8>> = self
+            .state
+            .devices
+            .iter()
+            .filter(|(id, known)| !known.out && !pending.effect.remove.contains(id))
+            .map(|(_, known)| credential(&known.keys))
+            .chain(pending.effect.add.iter().map(credential))
+            .collect();
+        let mut got: Vec<Vec<u8>> = candidate
+            .credentials()
+            .into_iter()
+            .map(|(_, credential)| credential)
+            .collect();
+        want.sort();
+        got.sort();
+        want == got
     }
 
     /// The logged effect another device's commit must be, if its operations
@@ -570,6 +642,15 @@ impl DeviceGroup {
                 }
                 if self.state.id == Some(pending.by) {
                     self.state.renewed = pending.at;
+                }
+                // Its epoch is decided: any commit of this device's for it
+                // is void, the swap deleting the held one.
+                if self
+                    .state
+                    .own
+                    .as_ref()
+                    .is_some_and(|own| own.epoch <= pending.epoch)
+                {
                     self.state.own = None;
                 }
                 self.apply(&pending);
@@ -614,6 +695,7 @@ impl DeviceGroup {
                 id,
                 Known {
                     keys: keys.clone(),
+                    active_from: pending.at.saturating_add(self.state.policy.probation_ms),
                     matured: false,
                     out: false,
                 },
@@ -707,11 +789,11 @@ impl DeviceGroup {
             });
         }
         if let Some(own) = &self.state.own
-            && let Some((index, message, signature)) = &own.call
+            && let (Some(index), Some((message, signature))) = (own.index, &own.signed)
             && !own.evidenced
         {
             events.push(Event::Evidence {
-                index: *index,
+                index,
                 message: message.clone(),
                 signature: *signature,
                 welcome: own.welcome.clone(),

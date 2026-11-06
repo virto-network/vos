@@ -98,6 +98,14 @@ impl ProgramStore for Programs {
     }
 }
 
+/// A call signed, not yet sent: its request, and the message and
+/// signature its evidence carries.
+pub struct Signed {
+    pub request: Request,
+    pub message: Vec<u8>,
+    pub signature: [u8; 64],
+}
+
 /// A call's reply: its batch time, and its outcome.
 pub struct Reply {
     pub at: u64,
@@ -234,32 +242,52 @@ impl Home {
     /// A call of `name` with `arguments` signed by `key`, verified as
     /// ingress verifies it, then run alone in a batch.
     pub fn call(&mut self, key: &SigningKey, name: &str, arguments: Vec<u8>) -> Reply {
+        let signed = self.sign(key, name, arguments);
+        self.send(signed)
+    }
+
+    /// A call of `name` with `arguments` signed by `key`, in its session
+    /// for a call now, not yet sent.
+    pub fn sign(&mut self, key: &SigningKey, name: &str, arguments: Vec<u8>) -> Signed {
         let public = key.verifying_key().to_bytes();
         let (session, sequence) = self.session(public);
         let method = self.method(name);
         let message = call_message(&IDENTITY, &session, sequence, PERSONAL, method, &arguments);
-        let signature = key.sign(&message);
-        key.verifying_key()
-            .verify(&message, &signature)
-            .expect("ingress verifies the call");
+        let signature = key.sign(&message).to_bytes();
+        Signed {
+            request: Request {
+                session,
+                sequence,
+                caller: Principal::Client(public),
+                instance: PERSONAL,
+                method,
+                arguments,
+            },
+            message,
+            signature,
+        }
+    }
+
+    /// `signed`, verified as ingress verifies it, then run alone in a
+    /// batch.
+    pub fn send(&mut self, signed: Signed) -> Reply {
+        let key = ed25519_dalek::VerifyingKey::from_bytes(&signed.request.session.key).unwrap();
+        key.verify(
+            &signed.message,
+            &ed25519_dalek::Signature::from_bytes(&signed.signature),
+        )
+        .expect("ingress verifies the call");
         let at = self.now;
-        let steps = self.batch(vec![Input::Request(Request {
-            session,
-            sequence,
-            caller: Principal::Client(public),
-            instance: PERSONAL,
-            method,
-            arguments,
-        })]);
+        let steps = self.batch(vec![Input::Request(signed.request)]);
         let outcome = match steps.into_iter().next() {
             Some(Step::Ran(run)) => run.outcome,
-            other => panic!("{name}: {other:?}"),
+            other => panic!("{other:?}"),
         };
         Reply {
             at,
             outcome,
-            message,
-            signature: signature.to_bytes(),
+            message: signed.message,
+            signature: signed.signature,
         }
     }
 

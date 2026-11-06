@@ -99,7 +99,7 @@ fn agree(members: &[&Member], epoch: u64) {
 /// A group made, added to, updated and removed from, each commit held by
 /// its committer and processed on copies by the others, swapped in only
 /// as a whole: every member's epoch and exported keys agree after each,
-/// and the removed member's next commit does not process.
+/// and the removed member keeps no group.
 #[test]
 fn commits_move_every_member_only_when_swapped() {
     let (mut a, mut b, mut c) = three();

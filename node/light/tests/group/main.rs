@@ -458,10 +458,7 @@ fn without_valid_evidence_no_device_moves() {
     let (mut home, mut phones) = household(3);
     let prepared = phones[0].group().commit(None, home.now).unwrap();
     let reply = home.call(&phones[0].admin, "commit", prepared.arguments());
-    let index = reply
-        .answer::<vos_wire::personal::Candidacy>()
-        .unwrap()
-        .index;
+    reply.answer::<vos_wire::personal::Candidacy>().unwrap();
     let (_, others) = phones.split_at_mut(1);
     let events = settle(&mut home, &mut all(others));
     assert!(
@@ -489,7 +486,6 @@ fn without_valid_evidence_no_device_moves() {
         committer: 0,
         why: Why::Timeout
     }));
-    let _ = index;
     for phone in &mut phones {
         phone.alive(&mut home);
     }
@@ -641,11 +637,18 @@ fn two_attacker_devices_are_removed_by_one_commit() {
     for attacker in attackers.iter_mut() {
         let cursor = attacker.group().cursor();
         let entries = home.log(attacker.sync_key(), cursor).unwrap();
+        let (index, candidate) = entries
+            .iter()
+            .rev()
+            .find(|(_, entry)| matches!(entry.body, Body::Candidate { .. }))
+            .cloned()
+            .unwrap();
         let events = attacker.group().follow(entries).unwrap();
         for event in events {
-            if let Event::Vote { epoch, message, .. } = event {
-                let signed = vote_message_nack(&message);
-                attacker.vote(&mut home, epoch, Vote::Nack, &signed);
+            if let Event::Vote { epoch, .. } = event {
+                let nack =
+                    vote_message(&home::IDENTITY, epoch, index, &candidate.chain, &Vote::Nack);
+                attacker.vote(&mut home, epoch, Vote::Nack, &nack);
             }
         }
     }
@@ -698,20 +701,12 @@ fn two_attacker_devices_are_removed_by_one_commit() {
     agree(&mut all(owners), 4);
 }
 
-/// What an attacker that nacks signs: its vote message with the nack in
-/// place of the vote it was given.
-fn vote_message_nack(message: &[u8]) -> Vec<u8> {
-    let confirm = Vote::Confirm([0; 32]).encode();
-    let mut signed = message[..message.len() - confirm.len()].to_vec();
-    signed.extend(Vote::Nack.encode());
-    signed
-}
-
 /// A17, the gate: every commit the device group does not allow is nacked
 /// by every device that processes it, each epoch void: a group-context
 /// change, a ReInit, a handshake in the clear, an external commit, an add
-/// without a path, a removal the log does not declare, and an add of
-/// another device than the matured operation's.
+/// without a path, a removal the log does not declare, an add of another
+/// device than the matured operation's, and an update changing its leaf's
+/// keys. PSK and by-reference proposals are not compiled into the build.
 #[test]
 fn every_disallowed_proposal_is_nacked() {
     let (mut home, mut phones) = household(3);
@@ -802,6 +797,26 @@ fn every_disallowed_proposal_is_nacked() {
                 .commit_builder()
                 .remove_member(leaf)
                 .unwrap()
+                .build()
+                .unwrap();
+            output.commit_message.to_bytes().unwrap()
+        }),
+        ("a leaf's keys changed by its update", Effect::default(), {
+            use mls_rs::CipherSuiteProvider;
+            use mls_rs::CryptoProvider;
+            let mut group = hostile(&phones[0].store, None, encrypted);
+            let crypto = mls_rs_crypto_rustcrypto::RustCryptoProvider::default();
+            let suite = crypto.cipher_suite_provider(vos_mls::SUITE).unwrap();
+            let (secret, public) = suite.signature_key_generate().unwrap();
+            let mut keys = phones[0].keys.clone();
+            keys.admin = [0xad; 32];
+            let credential =
+                mls_rs::identity::basic::BasicCredential::new(vos_light::group::credential(&keys));
+            let identity =
+                mls_rs::identity::SigningIdentity::new(credential.into_credential(), public);
+            let output = group
+                .commit_builder()
+                .set_new_signing_identity(secret, identity)
                 .build()
                 .unwrap();
             output.commit_message.to_bytes().unwrap()
@@ -977,5 +992,38 @@ fn different_confirming_sets_raise_the_split_log_alarm() {
             .iter()
             .any(|event| matches!(event, Event::Alarm(Alarm::NamedAbsent { epoch: 2, .. }))),
         "{shown:?}"
+    );
+}
+
+/// B6 for maturity: operators append a maturity that no signed removal
+/// supports, which would silence a device's votes. The device ignores it
+/// with the alarm; and the entry forks its log from the agent's, so its
+/// next reading stops where the agent's entries no longer chain.
+#[test]
+fn a_maturity_no_signed_removal_supports_is_ignored() {
+    let (mut home, mut phones) = household(3);
+    let (cursor, before) = phones[1].group().view();
+    let mut entries = home.log(phones[1].sync_key(), cursor).unwrap();
+    let index = cursor + entries.len() as u64;
+    let last = entries.last().map_or(before, |(_, entry)| entry.chain);
+    let body = Body::Matured { device: 2 };
+    entries.push((
+        index,
+        Entry {
+            at: home.now,
+            chain: chain(&last, index, home.now, &body),
+            body,
+        },
+    ));
+    let events = phones[1].group().follow(entries).unwrap();
+    assert!(
+        events.contains(&Event::Alarm(Alarm::Unsigned { index })),
+        "{events:?}"
+    );
+    phones[0].update(&mut home).unwrap();
+    let events = phones[1].read(&mut home);
+    assert!(
+        events.contains(&Event::Alarm(Alarm::Log { index: index + 1 })),
+        "{events:?}"
     );
 }

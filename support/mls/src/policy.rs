@@ -179,7 +179,8 @@ impl MlsRules for Rules {
 
 /// The device group's identities: a basic credential of a device's sync
 /// key and admin key, the leaf's identity its sync key, a successor the
-/// same sync key. Every check against the device set is the caller's,
+/// same credential: a leaf's keys change only by its device's removal and
+/// a new add, never by its own update. Every check against the device set is the caller's,
 /// through [`Expected`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Identity;
@@ -222,7 +223,7 @@ impl IdentityProvider for Identity {
         else {
             return Err(Refused::Credential);
         };
-        Ok(before[..32] == after[..32])
+        Ok(before == after)
     }
 
     fn supported_types(&self) -> Vec<CredentialType> {

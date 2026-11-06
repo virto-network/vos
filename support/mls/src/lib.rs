@@ -97,7 +97,7 @@ pub enum Error {
     /// A commit is held already: confirm or void it first.
     Held,
     /// No commit held, or not the candidate's, or not for the epoch after
-    /// the current one.
+    /// the current one; or a candidate swapped over another epoch.
     NotHeld,
     /// A namespace row that does not read.
     Corrupt,
@@ -489,6 +489,29 @@ impl Mls {
         if self.held_row()?.is_some() {
             return Err(Error::Held);
         }
+        match self.held_commit(adds, removes, time) {
+            Ok(commit) => {
+                self.flush(rows(&commit))?;
+                Ok(commit)
+            }
+            Err(error) => {
+                // Building it may have spent a generation in memory alone:
+                // the group as the store holds it again.
+                self.namespace.unstage();
+                self.reload()?;
+                Err(error)
+            }
+        }
+    }
+
+    /// The commit built detached, and the current state and the held
+    /// commit staged.
+    fn held_commit(
+        &mut self,
+        adds: &[Vec<u8>],
+        removes: &[Vec<u8>],
+        time: u64,
+    ) -> Result<Commit, Error> {
         let group = self.group.as_mut().ok_or(Error::NoGroup)?;
         let members = credentials(group);
         let mut builder = group.commit_builder().commit_time(MlsTime::from(time));
@@ -510,20 +533,18 @@ impl Mls {
             None => None,
         };
         let epoch = group.current_epoch() + 1;
-        group.write_to_storage()?;
         let held = Held {
             hash: handshake_hash(&handshake),
             epoch,
             secrets: secrets.to_bytes()?,
         };
+        group.write_to_storage()?;
         self.namespace.put(HELD, Some(held.encode()));
-        let commit = Commit {
+        Ok(Commit {
             handshake,
             welcome,
             epoch,
-        };
-        self.flush(rows(&commit))?;
-        Ok(commit)
+        })
     }
 
     /// A copy of the current group under `rules`.
@@ -533,7 +554,10 @@ impl Mls {
         let client = client(&namespace, rules, None);
         let group = client
             .load_group(&id)
-            .map_err(|error| self.failure(error))?;
+            .map_err(|error| match namespace.take_failure() {
+                Some(error) => Error::Store(error),
+                None => Error::Mls(error),
+            })?;
         Ok((group, namespace))
     }
 
@@ -655,6 +679,9 @@ impl Mls {
                 self.namespace
                     .put(&[b"state/".as_slice(), &id].concat(), None);
                 self.namespace.put(GROUP, None);
+            }
+            Kind::Own | Kind::Received if group.current_epoch() != self.epoch()? + 1 => {
+                return Err(Error::NotHeld);
             }
             Kind::Joined | Kind::Own | Kind::Received => {
                 group.write_to_storage()?;

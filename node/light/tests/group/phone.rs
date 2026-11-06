@@ -150,14 +150,15 @@ impl Phone {
         home: &mut Home,
         prepared: &Prepared,
     ) -> Result<Candidacy, PersonalError> {
-        let reply = home.call(&self.admin, "commit", prepared.arguments());
+        let signed = home.sign(&self.admin, "commit", prepared.arguments());
+        self.group()
+            .signed_commit(signed.message.clone(), signed.signature)
+            .unwrap();
+        let reply = home.send(signed);
         self.group().called(reply.at);
         match reply.answer::<Candidacy>() {
             Ok(candidacy) => {
-                let event = self
-                    .group()
-                    .called_commit(candidacy.index, reply.message, reply.signature)
-                    .unwrap();
+                let event = self.group().called_commit(candidacy.index).unwrap();
                 let Event::Evidence {
                     index,
                     message,

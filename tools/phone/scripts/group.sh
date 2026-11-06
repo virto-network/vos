@@ -21,6 +21,11 @@ host=$(mktemp -d "${TMPDIR:-/var/tmp}/group.XXXXXX")
 dir=/data/local/tmp/vos-group
 a="adb -s ${LIGHT_SERIAL:-7689b5a9}"
 if [ "${LIGHT_LOCAL:-0}" = 1 ]; then dir=$host/phone; fi
+cleanup() {
+  if [ "${LIGHT_LOCAL:-0}" != 1 ]; then $a shell "rm -rf $dir" || true; fi
+  rm -rf "$host"
+}
+trap cleanup EXIT
 on_phone() {
   if [ "${LIGHT_LOCAL:-0}" = 1 ]; then (cd "$dir" && sh -c "$*"); else $a shell "cd $dir && $*"; fi
 }
@@ -41,6 +46,4 @@ on_phone "chmod +x vos-phone"
   date; state
 } 2>&1 | tee "$out"
 [ "$(grep -c '"group":"rounds"' "$out")" -eq 2 ] || { echo "a group size did not run" >&2; exit 1; }
-if [ "${LIGHT_LOCAL:-0}" != 1 ]; then $a shell "rm -rf $dir"; fi
-rm -rf "$host"
 echo "group: every size ran"

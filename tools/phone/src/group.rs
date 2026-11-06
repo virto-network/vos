@@ -173,10 +173,9 @@ fn round(
         &arguments,
     );
     let signature = devices[committer].admin.sign(&message).to_bytes();
-    devices[committer]
-        .group
-        .called_commit(index, message.clone(), signature)
-        .unwrap();
+    let group = &mut devices[committer].group;
+    group.signed_commit(message.clone(), signature).unwrap();
+    group.called_commit(index).unwrap();
     script.append(Body::Evidence {
         index,
         message,
