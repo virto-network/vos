@@ -506,27 +506,24 @@ previous release in a test that reads every envelope and operation back
 tables, is `agent/testkit/tests/agent/personal/upgrade.rs`: it reads every
 row back, and adds no table, since `#[actor]` gives a field no `#[cfg]`);
 the keeper upgrades in batches and stops on the first refusal. The layout
-binds from the first release: until then (plan 8.13's device-set rules,
-`Policy`'s further delays) rows change freely. A change that cannot
+binds from the first release: until then rows change freely. A change that cannot
 be append-only waits for state migration (`open.md`, "Upgrades").
 
 **`Personal` as built** [built, `agent/personal`, its wire types
 `vos_wire::personal`]: the commit log, the votes and verdicts, evidence,
 sealed scopes, acknowledgements, the recovery scope, quotas, the inbox,
-pairing slots, the lease and its grace, and gated reads, over a device set
-holding what these need: devices with their keys, class, attestation,
-nullifier, sealed label, probation (from its add) and status; the claiming
-device active at `assign`, a strong admin's add inline in its commit, and
-a removal pending for the policy's delay then matured. The rest of the
-device set's rules (vetoes, contests and resolutions, the kit's
-operations, seasoning, immediate removal, a probation frozen under a
-removal, `R1`/`R2` and a restore, admin-key replacement, a delayed admin's
-add as an operation, regroup) are plan 8.13's, added as tables beside
-these. Batch time decides lazily: each call first settles the removals
-that matured (their keys leave `admitted`, a `Matured` entry is logged),
-the slots that expired and the pending candidate's verdict; a refused call
-writes nothing, so its settling waits for the next call that runs, and a
-read computes a device's standing from the time it reads at. The home's
+pairing slots, the lease and its grace, and gated reads, over the device
+set of §3.5 (its rules as built are there): devices with their keys,
+class, attestation, nullifier, sealed label, probation, seasoning and
+status; the claiming device active at `assign`, a strong admin's add
+inline in its commit, and the operations with their vetoes, contests,
+resolutions and second signatures. Batch time decides lazily: each call
+first settles one operation that fell due (a removal's device leaves
+`admitted`, a `Matured` entry is logged), refusing with `Settling` while
+more are due, which `wake` settles one a call; then the slots that expired
+and the pending candidate's timeout. A refused call writes nothing, so its
+settling waits for the next call that runs, and a read computes a device's
+standing from the time it reads at. The home's
 calls (`configure`, `assign`, `renew`) take the role `homes`; `assign`
 answers its caller, and the `assigned`/`refused` message to `Homes` is
 plan 8.14's. Bounds the rules above leave open: `alive` is logged at
@@ -535,7 +532,8 @@ vote's signed message names its candidate's log index as well as its
 epoch (an epoch's number is free again after a void), an opener holds one
 open pairing slot and an agent four, a slot's holder writes four inbox
 items and a closed slot's items are deleted, and a removal that matured
-inside a candidate's window decides it as the window's end would have.
+inside a candidate's window decides it, as of its maturity, by the other
+devices' votes.
 
 ### 3.4 Keys: MLS among the user's devices, with confirmed epochs
 
@@ -920,6 +918,63 @@ the control log restarts under it.
 - **Moving home re-splits the kit:** the new agent holds a new `R2` and
   re-pushed recovery envelopes; until the move completes the kit opens
   nothing at the new home (§3.9).
+
+**The device set as built** [built, `agent/personal/src/devices.rs`,
+property-tested in `agent/testkit/tests/agent/personal/adversaries.rs`;
+where the rules above leave a choice, this is the one taken]:
+- **Operations** (`add`, `remove`, `replace`, `rotate`, `regroup`,
+  `restore`), each an admin call logged with its signer and its maturity:
+  a device's waits the policy's `operation_delay_ms` (72 h), the kit's its
+  `kit_delay_ms` (7 days), and a replacement its `probation_ms` (72 h), the
+  new key admitted only at maturity: the new key's probation is the
+  replacement's wait, so the old key, while it signs, can veto a
+  replacement it did not ask for. `seasoning_ms` (7 days) is the policy's
+  too; a test home sets each in minutes.
+- **Vetoes** (`veto`, an active device's admin key, never the kit's):
+  a device's operation becomes contested, the kit's is cancelled. A
+  contest held only by vetoes lifts when the last vetoer's removal
+  matures (rule 9), and the operation matures at its own time or then,
+  whichever is later. A device whose removal matures has its open
+  operations cancelled.
+- **The two-device rules** need two seasoned devices with **strong**
+  admins other than the targets: a delayed admin's signature makes
+  nothing immediate and resolves nothing (every operation it signs
+  waits); its veto counts. The second signature is `cosign(op)`, which
+  matures a removal, a kit rotation or a regroup at once, contested or
+  not; the kit cosigns only a regroup. `resolve(op, upheld)` names the
+  operation that matures, its rival in a pair dropped (or, not upheld,
+  the reverse): the kit's acts at once, a device's when a second agrees.
+- **A frozen probation** keeps the time it had left when the first removal
+  against it opened, and runs it from when the last one closes.
+- **`R2` never enters a readable row:** a rotation or a restore names its
+  `R2` by `r2_hash` and carries it in its evidence, kept apart and logged
+  nowhere; an operation that matures without it is cancelled
+  (`Unevidenced`).
+- **A restore carries the next kit:** at maturity every open operation is
+  cancelled, every device removed, the restore's device added alone and
+  active, the kit replaced, and the previous `R2` released to that device
+  alone (`recovery`), so the rotation that follows every restore is part of
+  it. A rotation's maturity records the recovery scope's position: the new
+  kit reads only the envelopes after it, those re-sealed under its `R`.
+- **A regroup or a restore voids the pending candidate** (`Regroup`); the
+  agent's epochs run on, the new group's first commit being the confirmed
+  epoch plus one and carrying the removals.
+- **Bounds:** one open operation of each kind a target (a removal, a
+  replacement) or an agent (a rotation or a restore, a regroup); two open
+  operations a signer besides its removals; eight live devices. A call
+  settles one operation, then does its own work, which may mature one
+  more; every handler that settles declares the largest gas a schema may
+  (`MAX_HANDLER_GAS`, 100M), and the worst maturity is within half of
+  it [measured, the agent suite on a debug build, x86-64 Core Ultra 7
+  155H, 2026-11-06; gas is deterministic]: a removal by a second signature
+  of a device that vetoed 19 operations and held 9, 20.3M; a restore over
+  eight devices with 24 operations open and contested, 35.8M in one
+  `wake`; an ordinary operation or veto 1.6–2.6M, `alive` 0.93M.
+  Operations other than removals count as commits against the quotas;
+  removals, vetoes, second signatures and resolutions are free, so no
+  quota stops a removal.
+- **Not built:** an admin call's arguments naming the control log's head
+  it was made against (the devices' check, plan 8.19).
 
 **What the control log shows the operators:** the device count and its
 changes, each device's public keys and admin class, the times of
@@ -2290,7 +2345,10 @@ removal cannot be vetoed without the admin key, and a removed device's
 `alive` is ignored). *Known limit,* and only this: a thief who passes the
 biometric can always contest, so against him the kit alone does not win.
 Property-tested against an adversary with one device and its biometric
-who may also pair devices, and one with a sync key alone. (8.13)
+who may also pair devices, and one with a sync key alone, and a leaked kit
+against devices that veto (`agent/testkit/tests/agent/personal/
+adversaries.rs`): the owner reacting before a paired device's probation
+ends removes every thief device within the delay of its first move. (8.13)
 
 **A5. A device returns after weeks or months.** *Mitigation:* while away
 it is outside the confirming set, so the awake devices are never blocked;
