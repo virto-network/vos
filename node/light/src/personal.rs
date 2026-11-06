@@ -27,7 +27,7 @@
 //!   not hold under `R` yet, sealed under it at the confirmed epoch, so the
 //!   kit's copy never lags: what a kit reads ([`open_recovery`]) after a
 //!   restore releases `R2`.
-//! - **Tor only** [E17]: a link names its [`Route`], and every request is
+//! - **Tor only** (E17): a link names its [`Route`], and every request is
 //!   refused before it leaves unless the route is the onion, so the light
 //!   node has no clearnet route for any kind addressed to the personal
 //!   agent.
