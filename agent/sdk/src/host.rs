@@ -217,10 +217,12 @@ pub fn put_raw(rows: u64, key: &[u8], value: &[u8]) {
 }
 
 pub fn delete(rows: Rows, key: &[u8]) {
-    ecalli!(
-        Op::Delete.id(),
-        [rows.register(), ptr(key), key.len() as u64, 0, 0, 0]
-    );
+    delete_raw(rows.register(), key);
+}
+
+/// [`delete`] by a rows register, any bits the ABI allows.
+pub fn delete_raw(rows: u64, key: &[u8]) {
+    ecalli!(Op::Delete.id(), [rows, ptr(key), key.len() as u64, 0, 0, 0]);
 }
 
 /// The rows of a table or committed map after the key `after`, or from its

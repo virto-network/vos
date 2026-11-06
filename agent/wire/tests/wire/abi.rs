@@ -1,6 +1,6 @@
 //! The actor ABI: kinds, operations, codes and schemas.
 
-use vos_wire::abi::{self, Failure, Keep, Kind, Op, Refusal, Rows};
+use vos_wire::abi::{self, Failure, Keep, Kind, MergeRows, Op, Refusal, Rows};
 use vos_wire::ids::{MethodId, WorkflowId};
 use vos_wire::keys::Transform;
 use vos_wire::result::{InputRef, Outcome, Step};
@@ -498,36 +498,36 @@ fn rows_registers_keep_their_bits() {
     assert_eq!(Rows::Struct.register(), 0);
     assert_eq!(table.register(), 0x0000_0101_a1b2_c3d4);
     assert_eq!(committed.register(), 0x0000_0200_0000_0007);
-    let merge = |keep| Rows::Merge {
+    for rows in [Rows::Struct, table, committed] {
+        assert_eq!(Rows::from_register(rows.register()), Some(rows));
+        assert!(!MergeRows::is(rows.register()));
+    }
+    for refused in [
+        1,
+        1 << 32,
+        2 << 32 | 1 << 40,
+        3 << 40,
+        1 << 48 | 1 << 40,
+        u64::MAX,
+    ] {
+        assert_eq!(Rows::from_register(refused), None, "{refused:#x}");
+    }
+    // A merge field's: kind 3, its keep above it.
+    let merge = |keep| MergeRows {
         tag: 9,
         transform: Transform::Ordered,
         keep,
     };
     assert_eq!(merge(Keep::Latest).register(), 0x0000_0301_0000_0009);
     assert_eq!(merge(Keep::Earliest).register(), 0x0001_0301_0000_0009);
-    for rows in [
-        Rows::Struct,
-        table,
-        committed,
-        merge(Keep::Latest),
-        merge(Keep::Earliest),
-    ] {
-        assert_eq!(Rows::from_register(rows.register()), Some(rows));
-        assert_eq!(
-            Rows::is_merge(rows.register()),
-            matches!(rows, Rows::Merge { .. })
-        );
+    for keep in [Keep::Latest, Keep::Earliest] {
+        let register = merge(keep).register();
+        assert!(MergeRows::is(register));
+        assert_eq!(MergeRows::from_register(register), Some(merge(keep)));
+        assert_eq!(Rows::from_register(register), None);
     }
-    for refused in [
-        1,
-        1 << 32,
-        2 << 32 | 1 << 40,
-        4 << 40,
-        1 << 48 | 1 << 40,
-        2 << 48 | 3 << 40,
-        u64::MAX,
-    ] {
-        assert_eq!(Rows::from_register(refused), None, "{refused:#x}");
+    for refused in [table.register(), 2 << 48 | 3 << 40, 3 << 40 | 2 << 32] {
+        assert_eq!(MergeRows::from_register(refused), None, "{refused:#x}");
     }
 }
 

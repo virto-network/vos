@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 use scale::{Decode, Encode};
 use vos_tree::Blake2b;
 
-use crate::abi::{Failure, Rows, cap};
+use crate::abi::{Failure, MergeRows, Rows, cap};
 use crate::ids::{
     AgentId, InstanceId, MapId, Principal, ProgramHash, Session, SessionId, WorkflowId,
 };
@@ -239,19 +239,17 @@ pub const TABLE_PREFIX: usize = 1 + 4 + 1 + 4 + 1;
 /// map's id.
 pub const COMMITTED_PREFIX: usize = 1 + MAP_LEN;
 
-/// Which keyed rows of an instance: a table's, a committed map's or a
-/// merge field's.
+/// Which keyed rows of an instance: a table's, or a committed map's.
 #[derive(Clone, Copy)]
 enum Kind {
     Table,
     Committed,
-    Merge,
 }
 
-/// Append the prefix of a table's, committed map's or merge field's rows
-/// to `out`: a table's under its instance, `0x01 ‖ instance ‖ 0x01 ‖ tag ‖
-/// transform`, a merge field's alike after `0x02`; a committed map's under
-/// its own owner, `0x03 ‖ instance ‖ tag ‖ transform`.
+/// Append the prefix of a table's or committed map's rows to `out`: a
+/// table's under its instance, `0x01 ‖ instance ‖ 0x01 ‖ tag ‖ transform`;
+/// a committed map's under its own owner, `0x03 ‖ instance ‖ tag ‖
+/// transform`.
 fn prefix_into(
     kind: Kind,
     instance: InstanceId,
@@ -260,13 +258,10 @@ fn prefix_into(
     out: &mut Vec<u8>,
 ) {
     match kind {
-        Kind::Table | Kind::Merge => {
+        Kind::Table => {
             out.push(Owner::Instance as u8);
             out.extend_from_slice(&instance.0.to_be_bytes());
-            out.push(match kind {
-                Kind::Merge => Part::Merge,
-                _ => Part::Table,
-            } as u8);
+            out.push(Part::Table as u8);
         }
         Kind::Committed => {
             out.push(Owner::Committed as u8);
@@ -284,7 +279,6 @@ fn table_of(rows: Rows) -> Option<(Kind, u32, Transform)> {
         Rows::Struct => None,
         Rows::Table { tag, transform } => Some((Kind::Table, tag, transform)),
         Rows::Committed { tag, transform } => Some((Kind::Committed, tag, transform)),
-        Rows::Merge { tag, transform, .. } => Some((Kind::Merge, tag, transform)),
     }
 }
 
@@ -298,9 +292,7 @@ pub fn rows_prefix(instance: InstanceId, rows: Rows) -> Option<(Vec<u8>, Transfo
 }
 
 /// The row of the raw key `key` in `rows`: the struct row under the empty
-/// key, or the key transformed after its table's prefix; for a merge
-/// field, the prefix of the key's entries, one an author
-/// ([`merge_entry`]). A struct key that
+/// key, or the key transformed after its table's prefix. A struct key that
 /// is not empty fails the invocation ([`Failure::Trapped`]); an ordered key
 /// past [`cap::ORDERED_KEY`] exceeds a cap ([`Failure::Cap`]).
 pub fn row(instance: InstanceId, rows: Rows, key: &[u8]) -> Result<Vec<u8>, Failure> {
@@ -529,9 +521,38 @@ pub fn admitted(instance: InstanceId, key: &[u8; 32]) -> Vec<u8> {
     row(instance, rows, key).expect("a hashed row's key")
 }
 
+/// The prefix of a merge field's rows in `instance`'s state, `0x01 ‖
+/// instance ‖ 0x02 ‖ tag ‖ transform`, as a table's after its own part.
+pub fn merge_rows(instance: InstanceId, field: MergeRows) -> Vec<u8> {
+    key(&[
+        &[Owner::Instance as u8],
+        &instance.0.to_be_bytes(),
+        &[Part::Merge as u8],
+        &field.tag.to_be_bytes(),
+        &[field.transform.tag()],
+    ])
+}
+
+/// The row of the raw key `key` in a merge field, the prefix of its
+/// entries, one an author ([`merge_entry`]): the key transformed after the
+/// field's prefix. An ordered key past [`cap::ORDERED_KEY`] exceeds a cap
+/// ([`Failure::Cap`]).
+pub fn merge_element(
+    instance: InstanceId,
+    field: MergeRows,
+    key: &[u8],
+) -> Result<Vec<u8>, Failure> {
+    if field.transform == Transform::Ordered && key.len() > cap::ORDERED_KEY {
+        return Err(Failure::Cap);
+    }
+    let mut row = merge_rows(instance, field);
+    field.transform.append(key, &mut row);
+    Ok(row)
+}
+
 /// The entry of `author` for one element or key of a merge field, after
-/// its row ([`row`] of a [`Rows::Merge`]): the author's 32 bytes last, so
-/// one key's entries lie together and the keys stay prefix-free.
+/// its row ([`merge_element`]): the author's 32 bytes last, so one key's
+/// entries lie together and the keys stay prefix-free.
 pub fn merge_entry(row: &[u8], author: &[u8; 32]) -> Vec<u8> {
     key(&[row, author])
 }

@@ -99,7 +99,7 @@ pub enum Kind {
     /// A `#[msg(merge)]` handler: run on a device's merge entry alone, on
     /// every device that applies its operation, never through a log
     /// (`core-model.md` §9.2). It writes its instance's merge fields
-    /// ([`Rows::Merge`]) and nothing else, and reads no row: its
+    /// ([`MergeRows`]) and nothing else, and reads no row: its
     /// effects are its operation's alone, so every device that applies it
     /// writes the same.
     #[codec(index = 7)]
@@ -144,15 +144,46 @@ pub enum Rows {
     /// A committed map's rows: written, they are marked for the map's
     /// root ([`crate::result::Run::committed`]).
     Committed { tag: u32, transform: Transform },
-    /// A merge field's rows ([`crate::merge`]): one an element or key and
-    /// author. A merge handler's `Put` and `Delete` write its operation's
-    /// entry, kept as `keep` says; a query's `Get` and `Scan` read the
-    /// latest entry among the authors not filtered out.
-    Merge {
-        tag: u32,
-        transform: Transform,
-        keep: Keep,
-    },
+}
+
+impl Rows {
+    /// The register: bits 0..32 the tag, 32..40 the transform's tag, 40..48
+    /// the kind (0 the struct, 1 a table, 2 a committed map), the rest 0.
+    /// The struct's tag and transform are 0.
+    pub const fn register(self) -> u64 {
+        let (kind, tag, transform) = match self {
+            Rows::Struct => (0u64, 0, 0),
+            Rows::Table { tag, transform } => (1, tag, transform.tag()),
+            Rows::Committed { tag, transform } => (2, tag, transform.tag()),
+        };
+        kind << 40 | (transform as u64) << 32 | tag as u64
+    }
+
+    pub const fn from_register(register: u64) -> Option<Self> {
+        let tag = register as u32;
+        let Some(transform) = Transform::from_tag((register >> 32) as u8) else {
+            return None;
+        };
+        match register >> 40 {
+            0 if register == 0 => Some(Rows::Struct),
+            1 => Some(Rows::Table { tag, transform }),
+            2 => Some(Rows::Committed { tag, transform }),
+            _ => None,
+        }
+    }
+}
+
+/// A merge field's rows ([`crate::merge`]), in a row operation's φ7: one
+/// an element or key and author. A merge handler's `Put` and `Delete`
+/// write its operation's entry, kept as `keep` says; a query's `Get` and
+/// `Scan` read the latest entry among the authors not filtered out. Apart
+/// from [`Rows`], which names the rows every other kind of invocation
+/// reaches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MergeRows {
+    pub tag: u32,
+    pub transform: Transform,
+    pub keep: Keep,
 }
 
 /// Which of an author's entries for one element or key a merge field keeps:
@@ -167,28 +198,16 @@ pub enum Keep {
     Earliest = 1,
 }
 
-impl Rows {
-    /// The register: bits 0..32 the tag, 32..40 the transform's tag, 40..48
-    /// the kind (0 the struct, 1 a table, 2 a committed map, 3 a merge
-    /// field), 48..56 a merge field's [`Keep`], the rest 0. The struct's
-    /// tag and transform are 0.
+impl MergeRows {
+    /// The register: as a [`Rows`] register of kind 3, bits 48..56 its
+    /// [`Keep`], the rest 0.
     pub const fn register(self) -> u64 {
-        let (kind, tag, transform, keep) = match self {
-            Rows::Struct => (0u64, 0, 0, 0),
-            Rows::Table { tag, transform } => (1, tag, transform.tag(), 0),
-            Rows::Committed { tag, transform } => (2, tag, transform.tag(), 0),
-            Rows::Merge {
-                tag,
-                transform,
-                keep,
-            } => (3, tag, transform.tag(), keep as u64),
-        };
-        keep << 48 | kind << 40 | (transform as u64) << 32 | tag as u64
+        (self.keep as u64) << 48 | 3 << 40 | (self.transform.tag() as u64) << 32 | self.tag as u64
     }
 
     /// Whether `register` names a merge field's rows, whatever else it
     /// holds.
-    pub const fn is_merge(register: u64) -> bool {
+    pub const fn is(register: u64) -> bool {
         (register >> 40) as u8 == 3
     }
 
@@ -197,23 +216,16 @@ impl Rows {
         let Some(transform) = Transform::from_tag((register >> 32) as u8) else {
             return None;
         };
-        let kind = (register >> 40) as u8;
-        match (register >> 48, kind) {
-            (0, 0) if register == 0 => Some(Rows::Struct),
-            (0, 1) => Some(Rows::Table { tag, transform }),
-            (0, 2) => Some(Rows::Committed { tag, transform }),
-            (0, 3) => Some(Rows::Merge {
-                tag,
-                transform,
-                keep: Keep::Latest,
-            }),
-            (1, 3) => Some(Rows::Merge {
-                tag,
-                transform,
-                keep: Keep::Earliest,
-            }),
-            _ => None,
-        }
+        let keep = match register >> 40 {
+            3 => Keep::Latest,
+            0x103 => Keep::Earliest,
+            _ => return None,
+        };
+        Some(Self {
+            tag,
+            transform,
+            keep,
+        })
     }
 }
 

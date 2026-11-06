@@ -6,14 +6,14 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use vos_wire::abi::{Failure, Keep, Kind, Op, Rows, cap, code, price};
+use vos_wire::abi::{Failure, Keep, Kind, MergeRows, Op, cap, code, price};
 use vos_wire::ids::InstanceId;
 use vos_wire::keys::{self, AUTHOR, Transform};
 use vos_wire::merge::{self, Cutoff, Entry};
 use vos_wire::{Decode, Encode};
 
 use super::Invocation;
-use super::memory::{copy_out, read, read_key, row, write};
+use super::memory::{copy_out, read, read_key, write};
 use crate::machines::Machine;
 use crate::refine::base::Corrupt;
 
@@ -28,8 +28,8 @@ impl From<merge::Malformed> for Corrupt {
 
 impl Invocation<'_> {
     /// A row operation of a merge step, or on a merge field's rows: a merge
-    /// handler reads its struct and writes its merge fields alone; a query
-    /// reads merge fields, filtered; nothing else reaches them. Apart, so
+    /// handler writes its merge fields alone; a query reads merge fields,
+    /// filtered; nothing else reaches them. Apart, so
     /// the operations every other step makes keep their frames.
     #[cold]
     #[inline(never)]
@@ -40,28 +40,32 @@ impl Invocation<'_> {
         op: Op,
     ) -> Result<(), Failure> {
         let r = machine.registers();
-        let rows = Rows::from_register(r[7]).ok_or(Failure::Trapped)?;
+        let field = MergeRows::from_register(r[7]).ok_or(Failure::Trapped)?;
+        let element = |machine: &mut Machine| {
+            let key = read_key(machine, r[8], r[9])?;
+            keys::merge_element(instance, field, &key)
+        };
         let merging = self.entry == Kind::Merge;
         let querying = self.entry == Kind::Query;
-        match (op, rows) {
-            (Op::Get, Rows::Merge { .. }) if querying => {
+        match op {
+            Op::Get if querying => {
                 if !machine.charge(price::SCAN) {
                     return Err(Failure::OutOfGas);
                 }
-                let element = row(machine, instance, r[7], r[8], r[9])?;
+                let element = element(machine)?;
                 let value = self.merge_read(machine, instance, &element)?;
                 self.copy_value(machine, value.as_deref())
             }
-            (Op::Put | Op::Delete, Rows::Merge { keep, .. }) if merging => {
+            Op::Put | Op::Delete if merging => {
                 if !machine.charge(price::GET) {
                     return Err(Failure::OutOfGas);
                 }
-                let element = row(machine, instance, r[7], r[8], r[9])?;
+                let element = element(machine)?;
                 let value = match op {
                     Op::Put => Some(read(machine, r[10], r[11], cap::VALUE)?),
                     _ => None,
                 };
-                if let Some((key, entry)) = self.merge_entry(element, keep, value)? {
+                if let Some((key, entry)) = self.merge_entry(element, field.keep, value)? {
                     self.write_bytes += key.len() + entry.len();
                     self.rows_written += 1;
                     if self.write_bytes > self.limits.step_writes
@@ -77,20 +81,16 @@ impl Invocation<'_> {
                 machine.set_register(7, code::OK);
                 Ok(())
             }
-            (Op::Scan, Rows::Merge { .. }) if querying => {
-                let cursor = match r[12] {
+            Op::Scan if querying => {
+                let after = match r[12] {
                     0 => None,
-                    1 => Some(read_key(machine, r[8], r[9])?),
+                    1 => Some(element(machine)?),
                     _ => return Err(Failure::Trapped),
                 };
-                let (prefix, transform) =
-                    keys::rows_prefix(instance, rows).ok_or(Failure::Trapped)?;
-                let after = cursor
-                    .map(|cursor| keys::row(instance, rows, &cursor))
-                    .transpose()?;
+                let prefix = keys::merge_rows(instance, field);
                 let capacity = (r[11] as usize).min(cap::SCAN);
                 let (out, full) =
-                    self.merge_scan(machine, instance, &prefix, after, capacity, transform)?;
+                    self.merge_scan(machine, instance, &prefix, after, capacity, field.transform)?;
                 write(machine, r[10], &out)?;
                 machine.set_register(7, if full { code::FULL } else { out.len() as u64 });
                 Ok(())

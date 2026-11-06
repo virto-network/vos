@@ -391,7 +391,7 @@ impl<'a> Invocation<'a> {
         r: &[u64; 13],
     ) -> Result<(), Failure> {
         // No merge lane here, as in `memory::row`.
-        if Rows::is_merge(r[7]) {
+        if vos_wire::abi::MergeRows::is(r[7]) {
             return Err(Failure::Trapped);
         }
         let cursor = match r[12] {

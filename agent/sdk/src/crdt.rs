@@ -24,19 +24,20 @@
 
 use core::marker::PhantomData;
 
-use vos_wire::abi::{Keep, Rows};
+use vos_wire::abi::{Keep, MergeRows};
 use vos_wire::{Decode, Encode};
 
 use crate::host;
 use crate::table::{Bind, DefaultTransform, Iter, KeyTransform, TableKey, Tag, encoded};
 
-/// The rows of a merge field of tag `tag`, kept as `keep` says.
-const fn rows<T: KeyTransform>(tag: Tag, keep: Keep) -> Rows {
-    Rows::Merge {
+/// The register of a merge field of tag `tag`, kept as `keep` says.
+const fn rows<T: KeyTransform>(tag: Tag, keep: Keep) -> u64 {
+    MergeRows {
         tag: tag.0,
         transform: T::TRANSFORM,
         keep,
     }
+    .register()
 }
 
 macro_rules! merge_field {
@@ -95,18 +96,18 @@ impl<T: TableKey> Iterator for Elements<T> {
 }
 
 impl<T: TableKey, X: KeyTransform> GSet<T, X> {
-    fn rows(&self) -> Rows {
+    fn rows(&self) -> u64 {
         rows::<X>(self.tag, Keep::Earliest)
     }
 
     /// Add `element`: in a merge handler.
     pub fn insert(&mut self, element: &T) {
-        host::put(self.rows(), &encoded(element), &[]);
+        host::put_raw(self.rows(), &encoded(element), &[]);
     }
 
     /// Whether `element` is in the set: in a query.
     pub fn contains(&self, element: &T) -> bool {
-        host::get(self.rows(), &encoded(element)).is_some()
+        host::get_raw(self.rows(), &encoded(element)).is_some()
     }
 
     /// The elements, after `after` when given: in a query.
@@ -116,23 +117,23 @@ impl<T: TableKey, X: KeyTransform> GSet<T, X> {
 }
 
 impl<T: TableKey, X: KeyTransform> Set<T, X> {
-    fn rows(&self) -> Rows {
+    fn rows(&self) -> u64 {
         rows::<X>(self.tag, Keep::Latest)
     }
 
     /// Add `element`: in a merge handler.
     pub fn insert(&mut self, element: &T) {
-        host::put(self.rows(), &encoded(element), &[]);
+        host::put_raw(self.rows(), &encoded(element), &[]);
     }
 
     /// Remove `element`: in a merge handler.
     pub fn remove(&mut self, element: &T) {
-        host::delete(self.rows(), &encoded(element));
+        host::delete_raw(self.rows(), &encoded(element));
     }
 
     /// Whether `element` is in the set: in a query.
     pub fn contains(&self, element: &T) -> bool {
-        host::get(self.rows(), &encoded(element)).is_some()
+        host::get_raw(self.rows(), &encoded(element)).is_some()
     }
 
     /// The elements, after `after` when given: in a query.
@@ -142,30 +143,30 @@ impl<T: TableKey, X: KeyTransform> Set<T, X> {
 }
 
 impl<K: TableKey, V: Encode + Decode, X: KeyTransform> Map<K, V, X> {
-    fn rows(&self) -> Rows {
+    fn rows(&self) -> u64 {
         rows::<X>(self.tag, Keep::Latest)
     }
 
     /// Write `value` under `key`: in a merge handler.
     pub fn insert(&mut self, key: &K, value: &V) {
-        host::put(self.rows(), &encoded(key), &value.encode());
+        host::put_raw(self.rows(), &encoded(key), &value.encode());
     }
 
     /// Remove `key`'s value: in a merge handler.
     pub fn remove(&mut self, key: &K) {
-        host::delete(self.rows(), &encoded(key));
+        host::delete_raw(self.rows(), &encoded(key));
     }
 
     /// `key`'s value: in a query. A value that does not decode reads as
     /// absent.
     pub fn get(&self, key: &K) -> Option<V> {
-        let bytes = host::get(self.rows(), &encoded(key))?;
+        let bytes = host::get_raw(self.rows(), &encoded(key))?;
         V::decode(&bytes).ok().map(|(value, _)| value)
     }
 
     /// Whether `key` has a value: in a query.
     pub fn contains(&self, key: &K) -> bool {
-        host::get(self.rows(), &encoded(key)).is_some()
+        host::get_raw(self.rows(), &encoded(key)).is_some()
     }
 
     /// The keys with values, and their values, after `after` when given:

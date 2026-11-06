@@ -17,7 +17,9 @@ use alloc::rc::Rc;
 use alloc::vec::Vec;
 
 use vos_wire::abi::cap::{self, Limits};
-use vos_wire::abi::{self, AttestError, Failure, Kind, Op, Rows, code, precompile, price};
+use vos_wire::abi::{
+    self, AttestError, Failure, Kind, MergeRows, Op, Rows, code, precompile, price,
+};
 use vos_wire::batch::{Await, Body};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, RequestId, WorkflowId};
 use vos_wire::merge::{Cutoff, Origin};
@@ -401,7 +403,7 @@ impl<'a> Invocation<'a> {
         } = call;
         let r = machine.registers();
         // A merge field's rows, and every row of a merge step, apart.
-        let merge = |r: &[u64; 13]| self.entry == Kind::Merge || Rows::is_merge(r[7]);
+        let merge = |r: &[u64; 13]| self.entry == Kind::Merge || MergeRows::is(r[7]);
         match op {
             Op::Input => {
                 copy_out(machine, arguments, r[7], r[8], r[9])?;

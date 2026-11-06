@@ -224,7 +224,7 @@ macro_rules! rows_handle {
             /// key order for [`Ordered`]), starting after `after` when
             /// given.
             pub fn iter(&self, after: Option<&K>) -> Iter<K, V> {
-                Iter::new(self.rows(), after)
+                Iter::new(self.rows().register(), after)
             }
         }
     };
@@ -329,7 +329,8 @@ pub(crate) fn encoded<K: TableKey>(key: &K) -> Vec<u8> {
 /// time.
 pub struct Iter<K, V> {
     _rows: PhantomData<fn() -> (K, V)>,
-    rows: Rows,
+    /// The rows' register.
+    rows: u64,
     /// The key of the last row read, which the next fetch starts after.
     cursor: Option<Vec<u8>>,
     buffer: Vec<u8>,
@@ -338,8 +339,8 @@ pub struct Iter<K, V> {
 }
 
 impl<K: TableKey, V: Encode + Decode> Iter<K, V> {
-    /// The rows of `rows` after `after` when given.
-    pub(crate) fn new(rows: Rows, after: Option<&K>) -> Self {
+    /// The rows whose register is `rows`, after `after` when given.
+    pub(crate) fn new(rows: u64, after: Option<&K>) -> Self {
         Self {
             _rows: PhantomData,
             rows,
@@ -357,7 +358,7 @@ impl<K: TableKey, V: Encode + Decode> Iter<K, V> {
         loop {
             self.buffer.clear();
             self.buffer.resize(capacity, 0);
-            let written = host::scan(self.rows, self.cursor.as_deref(), &mut self.buffer);
+            let written = host::scan_raw(self.rows, self.cursor.as_deref(), &mut self.buffer);
             if written != code::FULL {
                 self.buffer.truncate(written as usize);
                 break;

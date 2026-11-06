@@ -12,7 +12,7 @@ use ed25519_dalek::SigningKey;
 use merkle_crdt::{Apply, Author, Event, MemStore, Node, Replica, Rows};
 use proptest::prelude::*;
 use vos_light::sync::{self, Blake2b256, Call, Cid, Op, Ops};
-use vos_wire::abi::Rows as Fields;
+use vos_wire::abi::MergeRows;
 use vos_wire::ids::{InstanceId, MethodId};
 use vos_wire::keys::{self, Transform};
 use vos_wire::merge::{self, Cutoff, Entry, Keep, Origin};
@@ -31,9 +31,9 @@ const FIELDS: [(u32, Keep); 3] = [(1, Keep::Earliest), (2, Keep::Latest), (3, Ke
 /// removal; a grow-only set's always a value).
 type Write = (u8, u8, Option<u8>);
 
-fn field_rows(field: u8) -> Fields {
+fn field_rows(field: u8) -> MergeRows {
     let (tag, keep) = FIELDS[field as usize];
-    Fields::Merge {
+    MergeRows {
         tag,
         transform: Transform::Hashed,
         keep,
@@ -41,7 +41,7 @@ fn field_rows(field: u8) -> Fields {
 }
 
 fn element_row(field: u8, element: u8) -> Vec<u8> {
-    keys::row(INSTANCE, field_rows(field), &[element]).unwrap()
+    keys::merge_element(INSTANCE, field_rows(field), &[element]).unwrap()
 }
 
 /// An operation's writes, as the agent makes a merge handler's: each the

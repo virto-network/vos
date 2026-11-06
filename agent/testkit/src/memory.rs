@@ -34,7 +34,7 @@ pub(crate) fn row(
     address: u64,
     len: u64,
 ) -> Result<Vec<u8>, Failure> {
-    if Rows::is_merge(rows) {
+    if vos_wire::abi::MergeRows::is(rows) {
         return Err(Failure::Trapped);
     }
     let key = read_key(machine, address, len)?;
