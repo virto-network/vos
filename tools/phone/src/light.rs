@@ -30,7 +30,7 @@ use vos_wire::{Decode, Encode, keys};
 /// The default agent's program, linked, and the notes actor's package, as
 /// the build script computed them; empty when it found no ELFs to build
 /// them from.
-static AGENT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/agent.bin"));
+pub static AGENT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/agent.bin"));
 static NOTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/notes.bin"));
 
 const INSTANCE: InstanceId = InstanceId(1);

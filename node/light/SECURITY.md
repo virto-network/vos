@@ -52,6 +52,69 @@ and what a node does with one is `node/SECURITY.md`'s.
   write past its cutoff hides its own earlier write to that element,
   which reads then fall back from to the other authors'.
 
+## The device group
+
+- **Its secrets are in the store, in the clear:** the MLS group state
+  (the leaf's signing key, the epoch's secrets), a held own commit (the
+  next epoch's secrets), key packages' private keys, and the key archive
+  (the naming secret and every confirmed epoch's scope keys), all in the
+  store's `group` keyspace. The client wraps the directory under a key
+  usable after the first unlock and keeps it out of backups
+  (`light-node.md` §3.5, §8 A11); whoever reads the store reads every
+  scope's data, past and present (no forward secrecy for history, by
+  design).
+- **It holds no admin key and no sync key:** commits and votes are signed
+  by the client, the admin key behind the owner's prompt, the sync key
+  after first unlock; the library gives the messages to sign.
+- **It trusts no operation the log shows without its signature:** a
+  candidate is processed only once its evidence verifies against the
+  committer's admin key as this device knows it, each removal it carries
+  a matured operation whose evidence verifies; each vote is verified
+  against the voter's sync key and the candidate's place in this device's
+  log; a log that does not chain stops the reading. A candidate is
+  processed on a copy and swapped in only on confirmation, by this
+  device's own count of the votes, never the agent's verdict.
+- **A maturity is honoured only behind verified evidence:** each device-set
+  call (operation, veto, second signature, resolution) is checked against
+  its signer's key (a device's admin key, or the kit entry's), what that
+  signer may sign and the delay it must wait; the log's word that an
+  operation matured is honoured only once the evidence supports it: the
+  operation's own, and either its delay passed with no verified veto of a
+  device with a voice, no rival removal and, for a restore, no `alive`
+  since (unsigned, the agent's word), or a verified second signature, or
+  verified resolutions naming it (the kit's, or the latest of each of two
+  seasoned devices with strong admins). A maturity asserted at a time
+  past its entry's is refused, and an entry whose batch time goes back
+  stops the reading; a removal freezes its target's probation as the
+  agent does. Evidence
+  posted after the maturity is waited for until the confirm window has
+  passed; a maturity it never supports raises `Unsigned` and moves
+  nothing. A device whose candidate removes a device on a maturity this
+  device does not honour is refused.
+- **The agent's policy is the log's:** operators set the delays, the
+  seasoning, the probation and the confirm window through `Configured`,
+  which every device takes as it reads it. The window bounds how long a
+  candidate waits for its set and how long a device waits for evidence a
+  maturity needs; a home that shortens it shortens both, and one that
+  lengthens it holds a void candidate's keys in place longer. A device
+  checks operations against the delays the log configured, not against
+  its own: `Configured` is the operators' word, unsigned, so a home that
+  sets a delay to zero makes every removal (and a leaked kit's restore)
+  immediate on every device, and no device alarms on it.
+- **A restore's device trusts the agent for what came before:** it starts
+  its group from what it reads of the agent after its restore matured
+  (the log's head, the device set, the kit), with no earlier view to
+  check them against; from then it checks the log as any device does.
+- **A device that cannot follow** reads on for the device set's
+  operations, so its own regroup matures in its view, but takes no other
+  candidate: it follows the others' epochs and the removals they carried
+  by the agent's word (which moves no key), and its regroup's new group
+  names only the devices it knew. A regrouper whose removal matures
+  before its new group frees the others to commit.
+- **Data keys come from the confirmed epoch alone**, and scope ids from
+  the archive's naming secret, which is the store's from its first scope
+  on: a store that named a scope does not join another group.
+
 ## The secret and its containment
 
 - **The source** is a keyed HMAC-SHA-256 whose key the device never

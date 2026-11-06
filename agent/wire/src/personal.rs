@@ -121,16 +121,26 @@ pub fn chain(before: &[u8; 32], index: u64, at: u64, body: &Body) -> [u8; 32] {
 }
 
 /// What a device's sync key signs for its vote on `epoch`'s candidate,
-/// logged at `candidate`, at the agent whose identity is `identity`: the
-/// vote travels with the signature, stored as data, and every device
-/// checks it. The candidate's index binds it to that candidate alone, an
-/// epoch's number being free again after a void.
-pub fn vote_message(identity: &[u8; 32], epoch: u64, candidate: u64, vote: &Vote) -> Vec<u8> {
+/// logged at `candidate` with the log's chain `chain` through it, at the
+/// agent whose identity is `identity`: the vote travels with the
+/// signature, stored as data, and every device checks it. The candidate's
+/// index binds it to that candidate alone, an epoch's number being free
+/// again after a void; the chain binds it to the log the voter read, the
+/// confirming set in it, so a vote shown to a device whose log differs
+/// does not verify there.
+pub fn vote_message(
+    identity: &[u8; 32],
+    epoch: u64,
+    candidate: u64,
+    chain: &[u8; 32],
+    vote: &Vote,
+) -> Vec<u8> {
     let mut message = Vec::new();
     message.extend_from_slice(b"vos/personal/vote");
     message.extend_from_slice(identity);
     epoch.encode_to(&mut message);
     candidate.encode_to(&mut message);
+    message.extend_from_slice(chain);
     vote.encode_to(&mut message);
     message
 }

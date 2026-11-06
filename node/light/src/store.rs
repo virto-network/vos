@@ -8,6 +8,9 @@
 //! - `programs`: the programs installed, by their hash;
 //! - `meta`: the store's layout, its author key, and the last local
 //!   operation's time and seed;
+//! - `group`: the device group's (`crate::group`): its MLS state, what it
+//!   keeps of the control log, and the key archive, whose naming secret is
+//!   drawn with the store and names every scope;
 //!
 //! and each scope's keyspaces, its DAG's (`merkle_crdt::FjallStore`),
 //! named after it.
@@ -25,11 +28,14 @@ use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable};
 use vos_exec::{ProgramStore, StateReader};
 use vos_wire::apply::State;
 use vos_wire::ids::AgentId;
+use vos_wire::{Decode, Encode};
+
+use crate::group::Archive;
 
 /// The number of the store's layout: where its rows live. A store written
 /// in another is refused at open. Numbered apart from the node's store's
 /// layouts.
-pub const LAYOUT: u32 = 2;
+pub const LAYOUT: u32 = 3;
 
 /// The block cache the store keeps by default: a phone's.
 pub const CACHE_BYTES: u64 = 16 << 20;
@@ -37,6 +43,10 @@ pub const CACHE_BYTES: u64 = 16 << 20;
 const LAYOUT_ROW: &[u8] = b"layout";
 const LAST_ROW: &[u8] = b"last";
 const AUTHOR_ROW: &[u8] = b"author";
+/// The key archive, in the group keyspace.
+pub(crate) const ARCHIVE_ROW: &[u8] = b"g/archive";
+/// Set once a scope's id is derived from the archive's naming secret.
+const SCOPED_ROW: &[u8] = b"g/scoped";
 
 /// An installed program: its hash and its bytes.
 pub type Program = ([u8; 32], Vec<u8>);
@@ -53,7 +63,7 @@ pub enum StoreError {
     /// names none, or whose layout row does not read.
     Layout(Option<u32>),
     /// The operating system had no randomness for a new store's author
-    /// key.
+    /// key or naming secret.
     Randomness,
 }
 
@@ -78,7 +88,7 @@ impl std::fmt::Display for StoreError {
                 "the store is laid out as layout {layout}, and this build reads layout {LAYOUT}"
             ),
             StoreError::Layout(None) => f.write_str("the store names no layout it can read"),
-            StoreError::Randomness => f.write_str("no randomness for the author key"),
+            StoreError::Randomness => f.write_str("no randomness for a new store's secrets"),
         }
     }
 }
@@ -92,6 +102,7 @@ struct Keyspaces {
     rows: Keyspace,
     programs: Keyspace,
     meta: Keyspace,
+    group: Keyspace,
 }
 
 impl Store {
@@ -103,6 +114,7 @@ impl Store {
             rows: db.keyspace("rows", KeyspaceCreateOptions::default)?,
             programs: db.keyspace("programs", KeyspaceCreateOptions::default)?,
             meta: db.keyspace("meta", KeyspaceCreateOptions::default)?,
+            group: db.keyspace("group", KeyspaceCreateOptions::default)?,
             db,
         }));
         store.check_layout()?;
@@ -110,14 +122,16 @@ impl Store {
     }
 
     /// The layout row checked, and written, synced, with a fresh author
-    /// key, to a store holding nothing yet: a store made anew, by an
-    /// install or a restore, signs as a new author.
+    /// key and a key archive of a fresh naming secret, to a store holding
+    /// nothing yet: a store made anew, by an install or a restore, signs as
+    /// a new author.
     fn check_layout(&self) -> Result<(), StoreError> {
         let Keyspaces {
             db,
             rows,
             programs,
             meta,
+            group,
         } = &*self.0;
         match meta.get(LAYOUT_ROW)? {
             Some(value) => match <[u8; 4]>::try_from(&value[..]).map(u32::from_be_bytes) {
@@ -125,11 +139,17 @@ impl Store {
                 Ok(layout) => Err(StoreError::Layout(Some(layout))),
                 Err(_) => Err(StoreError::Layout(None)),
             },
-            None if rows.is_empty()? && programs.is_empty()? && meta.is_empty()? => {
+            None if rows.is_empty()?
+                && programs.is_empty()?
+                && meta.is_empty()?
+                && group.is_empty()? =>
+            {
                 let mut seed = zeroize::Zeroizing::new([0u8; 32]);
                 getrandom::getrandom(&mut seed[..]).map_err(|_| StoreError::Randomness)?;
+                let archive = Archive::fresh().ok_or(StoreError::Randomness)?;
                 let mut batch = db.batch();
                 batch.insert(meta, AUTHOR_ROW, &seed[..]);
+                batch.insert(group, ARCHIVE_ROW, archive.encode());
                 batch.insert(meta, LAYOUT_ROW, LAYOUT.to_be_bytes());
                 batch.durability(Some(PersistMode::SyncAll)).commit()?;
                 Ok(())
@@ -153,6 +173,54 @@ impl Store {
     /// The database, which each scope's keyspaces are in.
     pub(crate) fn database(&self) -> &Database {
         &self.0.db
+    }
+
+    /// The device group's keyspace, as `vos-mls` stores in it.
+    pub fn group_store(&self) -> vos_mls::Store {
+        vos_mls::Store::new(self.0.db.clone(), self.0.group.clone())
+    }
+
+    /// The device group's row `key`.
+    pub(crate) fn group_row(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(self.0.group.get(key)?.map(|value| value.to_vec()))
+    }
+
+    /// The key archive.
+    pub fn archive(&self) -> Result<Archive, StoreError> {
+        let bytes = self
+            .group_row(ARCHIVE_ROW)?
+            .ok_or(StoreError::Layout(None))?;
+        Archive::decode_exact(&bytes).ok_or(StoreError::Layout(None))
+    }
+
+    /// Whether a scope's id was derived from the archive's naming secret.
+    pub(crate) fn scoped(&self) -> Result<bool, StoreError> {
+        Ok(self.0.group.contains_key(SCOPED_ROW)?)
+    }
+
+    /// The id of the scope named `name`, from the archive's naming secret:
+    /// from now the naming secret is this store's for good.
+    pub(crate) fn scope_id(&self, name: &[u8]) -> Result<[u8; 16], StoreError> {
+        let id = self.archive()?.scope(name);
+        if !self.scoped()? {
+            let mut batch = self.0.db.batch();
+            batch.insert(&self.0.group, SCOPED_ROW, []);
+            batch.durability(Some(PersistMode::SyncAll)).commit()?;
+        }
+        Ok(id)
+    }
+
+    /// Take `archive` as this store's, as a paired device takes the pairing
+    /// device's: only while no scope's id was derived from the naming
+    /// secret it holds.
+    pub fn adopt(&self, archive: &Archive) -> Result<bool, StoreError> {
+        if self.scoped()? {
+            return Ok(false);
+        }
+        let mut batch = self.0.db.batch();
+        batch.insert(&self.0.group, ARCHIVE_ROW, archive.encode());
+        batch.durability(Some(PersistMode::SyncAll)).commit()?;
+        Ok(true)
     }
 
     /// The local agent's rows' keyspace, a scope's rows too.
@@ -207,6 +275,7 @@ impl Store {
             rows,
             programs,
             meta,
+            ..
         } = &*self.0;
         let mut batch = db.batch();
         for (key, value) in operation.rows {

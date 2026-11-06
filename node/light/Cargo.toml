@@ -44,8 +44,13 @@ num-traits = { workspace = true }
 blake2 = "0.10"
 sha2 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
-# A query's key, drawn for that query alone.
+# A query's key, drawn for that query alone; and the device group's
+# signatures checked: admin calls' evidence and votes.
 ed25519-dalek = "2"
+# The device group's MLS layer.
+vos-mls = { workspace = true }
+# The key archive's seal.
+chacha20poly1305 = "0.10"
 # A query's key, and an operation's seed.
 getrandom = "0.2"
 # A pool's threads pinned to the cores `Threads::Cores` names.
@@ -61,6 +66,11 @@ vos-checker = { path = "../checker" }
 tempfile = "3"
 # The merge fields' convergence, on their native model.
 proptest = "1"
+# The device group's adversaries: a committer running other code over a
+# device's MLS state.
+mls-rs = { version = "=0.57.0", default-features = false, features = ["private_message"] }
+mls-rs-core = { version = "=0.27.0", default-features = false }
+mls-rs-crypto-rustcrypto = { version = "=0.22.1", default-features = false }
 
 [[test]]
 name = "crash"

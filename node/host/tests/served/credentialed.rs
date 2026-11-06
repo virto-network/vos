@@ -886,6 +886,15 @@ fn the_device_librarys_proofs_are_admitted() {
         now + 60_000,
     )
     .unwrap();
+    vos_checker::wait_until(
+        "the follower has the member's path",
+        Duration::from_secs(30),
+        || {
+            wire::path_answer(&device_send(&founded, at, &query))
+                .unwrap()
+                .is_some()
+        },
+    );
     let witness = wire::path_answer(&device_send(&founded, at, &query))
         .unwrap()
         .expect("an enrolled member's path");
@@ -1069,6 +1078,17 @@ fn a_device_kernels_proof_signs_in_as_an_auth_proof_does() {
         time() + 60_000,
     )
     .unwrap();
+    // The follower answers from its applied state, which the enrollment
+    // reaches once it replicates.
+    vos_checker::wait_until(
+        "the follower has the member's path",
+        Duration::from_secs(30),
+        || {
+            wire::path_answer(&device_send(&founded, at, &query))
+                .unwrap()
+                .is_some()
+        },
+    );
     let witness = wire::path_answer(&device_send(&founded, at, &query))
         .unwrap()
         .expect("an enrolled member's path");

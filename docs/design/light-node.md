@@ -643,7 +643,12 @@ devices that are awake have shown they hold the same keys.
   (the reply to every call carries the agent's batch time) sees the entry
   and raises the alarm. Each device in the set posts, signed end to end by
   its sync key, `confirm(epoch, h)`, `h = BLAKE2b-256("vos/personal/confirm"
-  ‖ agent ‖ epoch ‖ epoch_authenticator)`, or `nack(epoch)`.
+  ‖ agent ‖ epoch ‖ epoch_authenticator)`, or `nack(epoch)`. **The signed
+  vote names the candidate's log index and the log's chain through the
+  candidate's entry** [built]: a vote shown to a device whose log differs
+  (another confirming set) does not verify there, so two devices shown
+  two sets each raise the split-log alarm at the other's vote, and
+  neither confirms.
 - **Confirmed:** every device in the logged set confirmed with one `h`.
   Each device checks the signed confirmations itself; the agent's verdict
   is advisory. **Void:** a `nack` or a second `h` from the set,
@@ -776,6 +781,94 @@ arm64-v8a build; the phones' timings below are S8-P1's]:
     operation. A leaf credential change (an admin key replaced) is not
     yet exercised.
   - The Safe Exporter is not in 0.57.
+
+**As built** (`support/mls`, `node/light/src/group`):
+- **`vos-mls`:** mls-rs's storage over a fjall keyspace under a prefix,
+  every write staged and committed with the caller's rows in one synced
+  batch; a copy reads the current rows and writes to memory alone, and a
+  swap moves its writes into the current batch. `Mls::commit` builds
+  detached and writes the current state, the held commit and the caller's
+  record in one batch before it returns; `Mls::own` applies it on a copy
+  only for its handshake's hash and the next epoch; `Mls::swap` refuses a
+  copy of another epoch and deletes any held commit; `Mls::void` deletes
+  it. `Mls::restart` starts a new group, its commit adding the rest from
+  their key packages applied and held beside the current group until the
+  swap, which deletes the group left; a member joins it by Welcome from
+  the group it is in. The policy refuses, received, anything but Add and
+  Remove by value, an external commit, a committer or adds and removals
+  not the logged effect, a handshake in the clear and a commit whose
+  committer kept its leaf (no path); a leaf's successor must carry the same credential, so a
+  device's keys change only by its removal and a new add (admin-key
+  replacement, §3.5, is a new add until it is built).
+- **The device group (`vos_light::group::DeviceGroup`), sans I/O:** the
+  caller reads the log and makes the calls, the admin key signing commits
+  and the sync key votes and evidence. A commit's signed call is written
+  before it is sent, so its evidence is posted again after a crash until
+  the log holds it. Reading the log, a device checks each entry's chain;
+  checks each device-set call (operation, veto, second signature,
+  resolution) against its signer's key (an active device's admin key, as
+  replaced, or the kit entry's), what that signer may sign and the delay
+  the configured policy sets; honours a maturity only once the evidence
+  supports it (the operation's own, and its delay passed with no verified
+  veto of a device with a voice, no rival removal and, for a restore, no
+  `alive` since, or a verified second signature, or verified resolutions
+  naming it: the kit's, or two seasoned strong devices'), waiting for
+  evidence posted after the maturity until the confirm window has passed,
+  else an alarm (`Unsigned`), as is a maturity asserted past its entry's
+  time; stops at an entry whose batch time goes back; freezes a probation
+  under a removal as the agent does; takes a candidate only from a device with a
+  voice past its probation, an add only from a strong admin or as a
+  matured add operation, for a fresh device number; processes it once
+  its evidence verifies, on a copy at the log's time under its logged
+  effect, and refuses it unless the copy's members are the device set
+  after it; votes; verifies each vote of the set against the voter's sync
+  key and this device's log; and decides by its own count, an entry past
+  the window deciding as of the window's end as the agent does. The
+  agent's verdict is advisory: one this device cannot count raises an
+  alarm, and the next candidate stops it (re-pair). A call refused with
+  `Settling` is made again after a `wake`.
+- **Regroup and restore:** a matured regroup voids the pending candidate,
+  and the next commit is the regrouper's new group (`DeviceGroup::regroup`,
+  with the key packages the rest hand over as a pairing's), its epoch the
+  confirmed one plus one, carrying every removal; the rest join it by its
+  Welcome, and its epochs count on from the agent's. A device that cannot
+  follow reads on for the device set's operations and takes no candidate
+  but its own regroup's, following the others' epochs and the removals
+  they carry by the agent's word. A restore's device starts its new group alone
+  from what it reads of the agent once the restore matured
+  (`DeviceGroup::restore`: the log's head, the device set, the new kit),
+  its first commit carrying the removal of every device before it.
+- **Keys:** `k(scope, n)` only at the confirmed epoch; the archive holds
+  the naming secret, drawn with the store (for the claiming device, with
+  its group), and every tracked scope's key of every confirmed epoch,
+  recorded in the swap's batch; it seals under the epoch's archive key
+  (`MLS-Exporter("vos/personal/archive", "", 32)`, XChaCha20-Poly1305).
+  Pushing it to the agent is 8.20's. A store that derived a scope id
+  joins no other group.
+- **Not built here:** a replaced admin key's leaf credential (the leaf
+  keeps the key it was added with; the replaced key signs calls, and a
+  replacement whose evidence comes after its maturity leaves the old key
+  in force until it verifies); a stuck device's view of adds confirmed
+  while it was stuck; a restore's device's view of operations opened
+  before its read; an alarm on a `Configured` that lowers a delay.
+
+**The device group measured** [measured, x86-64 Core Ultra 7 155H under
+load (load average 15–20), release, 2026-11-06; `vos-phone group`, the
+agent's log scripted, each step one synced fjall batch; the phone's
+numbers wait for the phone session, `tools/phone/scripts/group.sh`]:
+- a group of 3, 40 update rounds: the committer's commit, built and held,
+  2.1 ms p50 (7.0 p95); another device's reading of the candidate and its
+  evidence, the commit processed on a copy and its vote, 1.7 ms (2.9);
+  its reading of the votes, counted and the copy swapped in, 1.4 ms (8.5);
+- a group of 8: 3.2 ms (5.0), 2.4 ms (4.6) and 2.0 ms (4.2);
+- sizes: an update's handshake 702 B (3 devices) and 830 B (8); the MLS
+  state 1,468 B and 3,118 B; what a device keeps of the log 712 B and
+  1,337 B; the archive 2,516 B for one scope over 41 epochs (about 61 B a
+  key);
+- a confirmation round is, at the agent, the commit call, its evidence,
+  one vote a device of the set and each device's read of the log: at
+  8.12's measured 2.6–3 ms a call through a node's socket, about 15 ms for
+  three devices on a quiet host, before Tor.
 
 ### 3.5 Device secrets and the rules for changing devices
 
@@ -2392,7 +2485,7 @@ version a release and budget an upgrade step each slice.
 |---|---|
 | `vos-device` (`pvm/device`) | folds into `vos-light`; its secret, wire and path-keeper modules move, its credential prover goes (§4.1) |
 | `vos-light` (new, `node/light`) | the light node: merge and query dispatch over its store (no log), the release artifacts it embeds (local actors' programs, the stock kernels' device programs), the prover's device path, the node-API client, sync of sealed scopes, the device group through `vos-mls`, arti's client behind a feature; replaces `vos-device` one for one |
-| `vos-mls` (new, `support/mls`) | one MLS layer for VOS over mls-rs [decided, E12]: storage providers over fjall, copy-and-swap of group state for candidates, the confirmation hash, a proposal policy per user (the device group's: Add, Remove, Update); the device group its first user, messaging later |
+| `vos-mls` (new, `support/mls`) | [built] one MLS layer for VOS over mls-rs [decided, E12]: storage providers over fjall, copy-and-swap of group state for candidates, the confirmation hash, a proposal policy per user (the device group's: Add, Remove, Update); the device group its first user (`vos_light::group`), messaging later |
 | `vos-node` (`node/host`) | admission at ingress for an agent that asks: known keys looked up before the signature, and the gateway's transport mark for onion-only agents (§3.3); the device-format window at ingress (§4.4). The light node does not carve it up: it needs only the executor's host-call layer, which moves to a crate both link (plan 8.6); `credentialed.rs`'s use of `vos_pvm_recair::device` stays in the node (the light node takes device programs as release artifacts) |
 | `vos-pvm-recair` | `credential` deleted; the leaves, folds and wrap behind a `recursion` feature, on by default (the masking needs `context`, `circuit` and `trace`, which stay), so a device links less of the recursion prover (§9.1) |
 | `vos-pvm-final-verifier` | `credential` and `credential-bytes` deleted |

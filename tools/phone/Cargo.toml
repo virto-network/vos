@@ -31,6 +31,8 @@ postcard = { version = "1", features = ["alloc"] }
 stwo = { workspace = true }
 rayon = { workspace = true }
 sha2 = "0.10"
+# The device group bench's keys.
+ed25519-dalek = "2"
 mimalloc = { version = "0.1.52", optional = true }
 
 # The release build of the light node's artifacts (`build.rs`): the

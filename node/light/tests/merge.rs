@@ -159,7 +159,10 @@ struct Generated {
 }
 
 fn scope() -> merkle_crdt::Scope {
-    sync::scope(&[0; 32], INSTANCE)
+    merkle_crdt::Scope(vos_light::group::archive::scope_id(
+        &[0; 32],
+        &sync::scope_name(INSTANCE),
+    ))
 }
 
 fn generate(steps: &[Step]) -> History {

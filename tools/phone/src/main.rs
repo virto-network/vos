@@ -30,6 +30,10 @@
 //!   binary embeds, called and queried over a store at DIR, timed; or, with
 //!   `--check`, the store checked after a kill.
 //!
+//! - `vos-phone group --dir DIR [--devices 3,8] [--rounds N]`: the device
+//!   group (`group.rs`): groups of devices paired and updated round after
+//!   round over stores under DIR, each device's part timed.
+//!
 //! **Two builds:** the timing build (masks from the operating system, as
 //! the library's every build) and the seeded build (`--features seeded`:
 //! each proof's masks from a fixed seed, so its bytes are any machine's;
@@ -58,6 +62,7 @@ use vos_wire::Decode;
 use vos_wire::credentials::{leaf, root_of};
 
 mod device;
+mod group;
 mod light;
 mod member;
 
@@ -528,12 +533,14 @@ fn main() {
         Some("device-cell") => device_cell(&args[1], &args[2..]),
         Some("kernel") => kernel(&args[1..]),
         Some("light") => light::light(&args[1..]),
+        Some("group") => group::group(&args[1..]),
         _ => {
             eprintln!(
                 "vos-phone run [--reps N] [--threads auto|N] [--cells LIST] [--grind N] [--out DIR] | verify DIR \
                  | device [--kernels DIR] [--cells LIST] [--reps N] [--warmups N] [--threads auto|N] [--out DIR] \
                  | kernel --device PATH --input PATH --out PATH [--threads auto|N] \
-                 | light --store DIR [--calls N] [--check]"
+                 | light --store DIR [--calls N] [--check] \
+                 | group --dir DIR [--devices 3,8] [--rounds N]"
             );
             std::process::exit(2);
         }
