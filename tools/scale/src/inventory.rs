@@ -52,6 +52,10 @@ pub struct Host {
     /// weighted it down: `check` warns instead of refusing it.
     #[serde(default)]
     pub old_kernel: bool,
+    /// A node of the space that no agent is placed on: the node a
+    /// replacement adds, its replica installed from a snapshot.
+    #[serde(default)]
+    pub spare: bool,
 }
 
 fn one() -> u32 {
@@ -256,6 +260,15 @@ impl Inventory {
             .collect()
     }
 
+    /// The nodes' weights for placing agents, in node order: a spare's
+    /// is 0.
+    pub fn placement_weights(&self) -> Vec<u32> {
+        self.nodes()
+            .iter()
+            .map(|host| if host.spare { 0 } else { host.weight })
+            .collect()
+    }
+
     pub fn drivers(&self) -> Vec<&Host> {
         self.hosts
             .iter()
@@ -341,7 +354,14 @@ impl Inventory {
                 ));
             }
         }
-        let nodes = self.nodes().len();
+        let nodes = self.nodes().iter().filter(|host| !host.spare).count();
+        if self
+            .hosts
+            .iter()
+            .any(|host| host.spare && host.role != Role::Node)
+        {
+            return Err("only a node may be a spare".into());
+        }
         if nodes < 3 {
             return Err(format!(
                 "{nodes} node hosts: every agent has three replicas, on three nodes"

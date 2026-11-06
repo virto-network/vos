@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use smol::Timer;
-use vos_api::{FRAME_ERROR, FrameError, Kind};
+use vos_api::{FRAME_ERROR, FrameError, Kind, Mark};
 use vos_wire::ids::AgentId;
 use vos_wire::ingress::Response;
 use vos_wire::{Decode, Encode};
@@ -124,12 +124,50 @@ impl Pool {
         body: &[u8],
         within: Duration,
     ) -> Result<Response, String> {
+        self.post_marked(kind, Mark::Unmarked, agent, body, within)
+            .await
+    }
+
+    /// [`Pool::post`] with the frame marked `mark`: the driver key is a
+    /// gateway every node lists, whose word on the transport a node takes
+    /// as it takes any API client's.
+    pub async fn post_marked(
+        &self,
+        kind: Kind,
+        mark: Mark,
+        agent: AgentId,
+        body: &[u8],
+        within: Duration,
+    ) -> Result<Response, String> {
         let mut framed = agent.0.encode();
         framed.extend_from_slice(body);
+        let bytes = self.request(kind, mark, &framed, within).await?;
+        Response::decode(&bytes)
+            .map(|(response, _)| response)
+            .map_err(|_| "an answer it cannot read".to_string())
+    }
+
+    /// The node's clock, in ms since the epoch.
+    pub async fn time(&self, within: Duration) -> Result<u64, String> {
+        let bytes = self
+            .request(Kind::Time, Mark::Unmarked, &[], within)
+            .await?;
+        u64::decode_exact(&bytes).ok_or_else(|| "a time it cannot read".to_string())
+    }
+
+    /// A frame of `kind` marked `mark` holding `framed`: the answer's body,
+    /// within `within`. An error is the transport's: no answer came.
+    async fn request(
+        &self,
+        kind: Kind,
+        mark: Mark,
+        framed: &[u8],
+        within: Duration,
+    ) -> Result<Vec<u8>, String> {
         let asked = async {
             let connection = self.connection().await?;
             let _in_flight = InFlight::new(self);
-            vos_api::quic::request(&connection, kind as u16, vos_api::Mark::Unmarked, &framed)
+            vos_api::quic::request(&connection, kind as u16, mark, framed)
                 .await
                 .map_err(|error| error.to_string())
         };
@@ -144,9 +182,7 @@ impl Pool {
                 None => "an unreadable frame error".into(),
             });
         }
-        Response::decode(&bytes)
-            .map(|(response, _)| response)
-            .map_err(|_| "an answer it cannot read".to_string())
+        Ok(bytes)
     }
 }
 

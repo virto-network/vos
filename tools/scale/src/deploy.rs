@@ -216,6 +216,7 @@ pub fn deploy(inventory: &Inventory, artifacts: &Artifacts) -> Result<Deployed, 
         "space",
         "space.genesis",
         "agents.json",
+        "personal.json",
         "node.toml",
     ] {
         let _ = std::fs::remove_file(local.join(stale));

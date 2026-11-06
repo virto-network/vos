@@ -28,9 +28,9 @@ const FILL: u64 = 1_000;
 pub const CREATORS: u32 = 16;
 
 /// How long an operator's command may take at one node.
-const ANSWER: Duration = Duration::from_secs(30);
+pub(crate) const ANSWER: Duration = Duration::from_secs(30);
 /// How long an agent may take to elect a leader and take its install.
-const INSTALLED: Duration = Duration::from_secs(120);
+pub(crate) const INSTALLED: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Placed {
@@ -95,12 +95,14 @@ impl Mix {
 }
 
 /// Three distinct nodes of `weights` (node `i + 1` weighs `weights[i]`),
-/// each drawn with probability its weight's share of those left.
+/// each drawn with probability its weight's share of those left; a node
+/// of weight 0 is never drawn.
 pub fn place(weights: &[u32], mix: &mut Mix) -> Vec<u8> {
     let mut left: Vec<(u8, u64)> = weights
         .iter()
         .zip(1..)
         .map(|(weight, number)| (number, u64::from(*weight)))
+        .filter(|(_, weight)| *weight > 0)
         .collect();
     let mut chosen = Vec::with_capacity(3);
     while chosen.len() < 3 && !left.is_empty() {
@@ -123,7 +125,10 @@ pub fn place(weights: &[u32], mix: &mut Mix) -> Vec<u8> {
 }
 
 /// The operators of every node, in node order.
-fn operators(inventory: &Inventory, deployed: &Deployed) -> Result<Vec<Operator>, String> {
+pub(crate) fn operators(
+    inventory: &Inventory,
+    deployed: &Deployed,
+) -> Result<Vec<Operator>, String> {
     inventory
         .nodes()
         .iter()
@@ -136,18 +141,20 @@ fn operators(inventory: &Inventory, deployed: &Deployed) -> Result<Vec<Operator>
         .collect()
 }
 
-/// Install `elf` as `instance` of `agent`, at whichever replica leads it.
-fn install(
+/// Install `elf` as `instance` of `agent`, with `roles` declared, at
+/// whichever replica leads it.
+pub(crate) fn install(
     operators: &[Operator],
     agent: AgentId,
     replicas: &[u8],
     instance: u32,
     elf: &[u8],
+    roles: Vec<(Vec<u8>, u8)>,
 ) -> Result<(), String> {
     let install = Install {
         instance: InstanceId(instance),
         elf: elf.to_vec(),
-        roles: Vec::new(),
+        roles,
     };
     let mut last = String::new();
     wait_for(
@@ -253,14 +260,16 @@ fn installed<T>(
     Ok(found.expect("found once the wait ends"))
 }
 
-fn created(answer: Result<Response, vos_node::client::ClientError>) -> Result<AgentId, String> {
+pub(crate) fn created(
+    answer: Result<Response, vos_node::client::ClientError>,
+) -> Result<AgentId, String> {
     match answer.map_err(|error| error.to_string())? {
         Response::Created(agent) | Response::Unconfirmed(agent) => Ok(agent),
         other => Err(format!("{other:?}")),
     }
 }
 
-fn read_elf(path: &Path) -> Result<Vec<u8>, String> {
+pub(crate) fn read_elf(path: &Path) -> Result<Vec<u8>, String> {
     std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))
 }
 
@@ -287,7 +296,7 @@ pub fn create(inventory: &Inventory, request: &Request) -> Result<Agents, String
     let deployed = Deployed::read(inventory)?;
     let operators = operators(inventory, &deployed)?;
     let hosts: Vec<&Host> = inventory.nodes();
-    let weights: Vec<u32> = hosts.iter().map(|host| host.weight).collect();
+    let weights = inventory.placement_weights();
     let mut mix = Mix(request.seed);
     let mut agents = Agents::default();
     if let Some(path) = request.representative {
@@ -299,6 +308,7 @@ pub fn create(inventory: &Inventory, request: &Request) -> Result<Agents, String
             &replicas,
             vos_wire::served::REPRESENTATIVE.0,
             &read_elf(path)?,
+            Vec::new(),
         )?;
         eprintln!("the representative: agent {} on {replicas:?}", agent.0);
         agents.representative = Some(Placed {
@@ -318,7 +328,14 @@ pub fn create(inventory: &Inventory, request: &Request) -> Result<Agents, String
     let place_one = |operators: &[Operator], replicas: Vec<u8>| -> Result<Placed, String> {
         let creator = &operators[usize::from(replicas[0]) - 1];
         let agent = created(creator.create_agent(replicas.clone()))?;
-        install(operators, agent, &replicas, request.instance, &elf)?;
+        install(
+            operators,
+            agent,
+            &replicas,
+            request.instance,
+            &elf,
+            Vec::new(),
+        )?;
         Ok(Placed {
             agent: agent.0,
             replicas,
@@ -378,7 +395,9 @@ pub fn create(inventory: &Inventory, request: &Request) -> Result<Agents, String
         }
     }
     if request.identity_rows > 0 {
-        let every: Vec<u8> = (1..=hosts.len() as u8).collect();
+        let every: Vec<u8> = (1..=hosts.len() as u8)
+            .filter(|number| !hosts[usize::from(*number) - 1].spare)
+            .collect();
         let identity = place_one(&operators, every)?;
         fill_identities(
             &deployed,
@@ -442,6 +461,11 @@ mod tests {
             "{counts:?}"
         );
         assert_eq!(place(&[1, 1, 1], &mut Mix(1)), vec![1, 2, 3]);
+        // A spare, weighing 0, is never drawn.
+        let mut mix = Mix(5);
+        for _ in 0..1_000 {
+            assert_eq!(place(&[1, 0, 1, 1], &mut mix), vec![1, 3, 4]);
+        }
         assert_eq!(place(&weights, &mut Mix(9)), place(&weights, &mut Mix(9)));
     }
 }

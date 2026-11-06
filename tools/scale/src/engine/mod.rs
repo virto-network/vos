@@ -8,7 +8,7 @@
 //! to the record, and a line for the mix with the driver's own counts: its
 //! CPU and the most requests in flight on one node's connection.
 
-mod pool;
+pub(crate) mod pool;
 mod routes;
 mod session;
 mod setup;

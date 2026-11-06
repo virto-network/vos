@@ -20,6 +20,7 @@ mod inventory;
 mod keys;
 mod load;
 mod nodes;
+mod personal;
 mod report;
 mod runs;
 mod sample;
@@ -115,6 +116,60 @@ struct AgentsArgs {
     /// election.
     #[arg(long, default_value_t = agents::CREATORS)]
     creators: u32,
+    #[command(flatten)]
+    personal: PersonalArgs,
+}
+
+/// The personal agents a space gets beside the load's agents.
+#[derive(clap::Args, Clone)]
+struct PersonalArgs {
+    /// Personal agents to create, `Personal` installed in each and
+    /// assigned by the home's stand-in to a test device; one more is made
+    /// for the fill.
+    #[arg(long, default_value_t = 0)]
+    personal: u32,
+    /// `Personal`'s ELF (`just build-personal`).
+    #[arg(long)]
+    personal_elf: Option<PathBuf>,
+    /// The home's stand-in, the `home` test actor (`just build-test-actors`).
+    #[arg(long)]
+    home_elf: Option<PathBuf>,
+    /// Personal agents created at once.
+    #[arg(long, default_value_t = personal::CREATORS)]
+    personal_creators: u32,
+}
+
+impl PersonalArgs {
+    fn request(&self, seed: u64) -> Option<(PathBuf, PathBuf, u32, u64, u32)> {
+        (self.personal > 0).then(|| {
+            (
+                self.personal_elf.clone().unwrap_or_else(|| {
+                    guest("agent/programs/target/riscv64em-vos/release/vos-personal.elf")
+                }),
+                self.home_elf.clone().unwrap_or_else(|| {
+                    guest("agent/test-actors/target/riscv64em-vos/release/home.elf")
+                }),
+                self.personal,
+                seed,
+                self.personal_creators,
+            )
+        })
+    }
+}
+
+/// The personal agents' wakes and the fill, beside the load.
+#[derive(clap::Args, Clone)]
+struct PersonalLoadArgs {
+    /// How often each personal agent's device wakes, in seconds.
+    #[arg(long, default_value_t = 900)]
+    wake_s: u64,
+    /// The share of pushes at the largest envelope.
+    #[arg(long, default_value_t = 0.02)]
+    full_share: f64,
+    /// Fill the full agent to its quota and replace a replica of it by the
+    /// spare node, this many seconds into the load.
+    #[arg(long)]
+    fill_at_s: Option<u64>,
 }
 
 #[derive(clap::Args)]
@@ -250,6 +305,8 @@ enum Command {
         load: LoadArgs,
         #[command(flatten)]
         fault: FaultArgs,
+        #[command(flatten)]
+        personal: PersonalLoadArgs,
     },
     /// Copy every host's record of the current run into its directory.
     Collect,
@@ -282,6 +339,10 @@ enum Command {
         load: LoadArgs,
         #[command(flatten)]
         fault: FaultArgs,
+        #[command(flatten)]
+        personal: PersonalArgs,
+        #[command(flatten)]
+        personal_load: PersonalLoadArgs,
         /// Ledger shards to create, `K`.
         #[arg(long)]
         shards: u32,
@@ -328,6 +389,14 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// On a driver host: its share of the personal agents' wakes.
+    #[command(hide = true)]
+    PersonalLocal {
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 fn artifacts(args: DeployArgs) -> deploy::Artifacts {
@@ -368,6 +437,18 @@ fn make_agents(inventory: &Inventory, args: &AgentsArgs, run: Option<&Run>) -> R
             creators: args.creators,
         },
     )?;
+    if let Some((personal, home, count, seed, creators)) = args.personal.request(args.seed) {
+        personal::create(
+            inventory,
+            &personal::Request {
+                count,
+                personal: &personal,
+                home: &home,
+                seed,
+                creators,
+            },
+        )?;
+    }
     if let Some(run) = run {
         keep_agents(inventory, run)?;
     }
@@ -376,9 +457,11 @@ fn make_agents(inventory: &Inventory, args: &AgentsArgs, run: Option<&Run>) -> R
 
 /// The deployed agents, copied into `run`.
 fn keep_agents(inventory: &Inventory, run: &Run) -> Result<(), String> {
-    let from = deploy::Deployed::dir(inventory).join("agents.json");
-    if from.exists() {
-        std::fs::copy(&from, run.file("agents.json")).map_err(|error| error.to_string())?;
+    for name in ["agents.json", "personal.json"] {
+        let from = deploy::Deployed::dir(inventory).join(name);
+        if from.exists() {
+            std::fs::copy(&from, run.file(name)).map_err(|error| error.to_string())?;
+        }
     }
     Ok(())
 }
@@ -390,15 +473,27 @@ fn drive_and_poll(
     run: &Run,
     load: &LoadArgs,
     fault: Option<&fault::Fault>,
+    personal: &PersonalLoadArgs,
 ) -> Result<(), String> {
     keep_agents(inventory, run)?;
     let shards = agents::Agents::read(inventory)?.agents.len();
     let model = load.model(shards)?;
+    // The personal agents wake when the space has them.
+    let wakes = personal::Personals::read(inventory)
+        .filter(|personals| !personals.agents.is_empty())
+        .map(|_| drive::PersonalLoad {
+            period_s: personal.wake_s,
+            full_share: personal.full_share,
+        });
     let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {
         let poller = scope.spawn(|| collect::poll(inventory, run, &stop));
         let faulted = scope.spawn(|| match fault {
             Some(fault) => fault::inject(inventory, run, fault, &stop),
+            None => Ok(()),
+        });
+        let filled = scope.spawn(|| match personal.fill_at_s {
+            Some(at_s) => personal::fill_at(inventory, run, at_s, &stop),
             None => Ok(()),
         });
         let driven = drive::drive(
@@ -407,6 +502,7 @@ fn drive_and_poll(
             &drive::Load {
                 model,
                 secs: load.secs,
+                personal: wakes,
             },
         );
         // One more interval of polls past the load's end.
@@ -419,7 +515,8 @@ fn drive_and_poll(
         stop.store(true, Ordering::Relaxed);
         let polled = poller.join().expect("the poller");
         let faulted = faulted.join().expect("the fault");
-        driven.and(polled).and(faulted)
+        let filled = filled.join().expect("the fill");
+        driven.and(polled).and(faulted).and(filled)
     })?;
     collect::gather(inventory, run)
 }
@@ -466,11 +563,15 @@ fn run(cli: Cli) -> Result<(), String> {
             let run = Run::open(&inventory, None).ok();
             make_agents(&inventory, &args, run.as_ref())
         }
-        Command::Drive { load, fault } => {
+        Command::Drive {
+            load,
+            fault,
+            personal,
+        } => {
             let inventory = reached()?;
             let fault = fault.fault(&inventory, load.secs)?;
             let run = Run::open(&inventory, None)?;
-            drive_and_poll(&inventory, &run, &load, fault.as_ref())
+            drive_and_poll(&inventory, &run, &load, fault.as_ref(), &personal)
         }
         Command::Collect => {
             let inventory = reached()?;
@@ -490,6 +591,9 @@ fn run(cli: Cli) -> Result<(), String> {
             let opened = Run::open(&inventory, run.as_deref())?;
             let summary = report::report(&opened, from_ms.zip(to_ms), ramp_s)?;
             print!("{}", report::text(&summary));
+            if let Some(text) = personal::summary(&opened) {
+                print!("{text}");
+            }
             if let Some(other) = compare {
                 let other = Run::open(&inventory, Some(&other))?;
                 let other = report::report(&other, None, ramp_s)?;
@@ -501,6 +605,8 @@ fn run(cli: Cli) -> Result<(), String> {
             deploy,
             load,
             fault,
+            personal,
+            personal_load,
             shards,
             idle,
             creators,
@@ -515,6 +621,9 @@ fn run(cli: Cli) -> Result<(), String> {
             // after them.
             let model = load.model(shards as usize)?;
             model.check_representative(representative)?;
+            if personal_load.fill_at_s.is_some() && personal.personal == 0 {
+                return Err("--fill-at-s fills a personal agent: give --personal".into());
+            }
             let inventory = reached()?;
             let fault = fault.fault(&inventory, load.secs)?;
             // Interrupted, the run's waits end and its units stop.
@@ -543,10 +652,13 @@ fn run(cli: Cli) -> Result<(), String> {
                         representative,
                         seed: load.seed,
                         creators,
+                        personal,
                     };
                     make_agents(&inventory, &args, Some(&run))
                 })
-                .and_then(|()| drive_and_poll(&inventory, &run, &load, fault.as_ref()))
+                .and_then(|()| {
+                    drive_and_poll(&inventory, &run, &load, fault.as_ref(), &personal_load)
+                })
                 .map(|()| {
                     // The gateway's cost, a row of its own, while the
                     // nodes still run.
@@ -561,6 +673,9 @@ fn run(cli: Cli) -> Result<(), String> {
             ran.and(stopped).and(gathered)?;
             let summary = report::report(&run, None, None)?;
             print!("{}", report::text(&summary));
+            if let Some(text) = personal::summary(&run) {
+                print!("{text}");
+            }
             println!("run {} in {}", run.id, run.dir.display());
             Ok(())
         }
@@ -583,6 +698,13 @@ fn run(cli: Cli) -> Result<(), String> {
             let plan: drive::Plan =
                 serde_json::from_str(&text).map_err(|error| error.to_string())?;
             drive::run_local(&plan, &out)
+        }
+        Command::PersonalLocal { plan, out } => {
+            let text = std::fs::read_to_string(&plan)
+                .map_err(|error| format!("{}: {error}", plan.display()))?;
+            let plan: personal::Plan =
+                serde_json::from_str(&text).map_err(|error| error.to_string())?;
+            personal::run_local(&plan, &out)
         }
     }
 }

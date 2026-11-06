@@ -108,6 +108,51 @@ second while active (`--per-user`, 0.1; or `--rate` for `U·a·r` itself).
 - **Not modeled**, as every report says: the per-call identity read,
   credentialed calls, cross-space traffic and proving.
 
+## Personal agents
+
+`--personal N`, given to `run` or `agents`, adds `N` personal agents
+(`agent/personal`, `light-node.md` §3.3–§3.7) beside the load's agents,
+and one more, the full agent, for the fill:
+
+- **Each agent** is created on three nodes by weight, `Personal` installed
+  with its role `homes` declared, and the home's stand-in (the `home` test
+  actor, an agent of its own on three nodes) granted that role; the home
+  then passes a test home's policy (delays in minutes, a 64 MiB quota from
+  the first push) and the agent's assignment to a test device, whose sync
+  and admin keys are derived from the seed and the agent's index, so the
+  drivers hold them without storing them. Once all are made, each device
+  reads its agent's `overview` until it admits the device.
+- **The onion:** `Personal` admits a request only through the onion. The
+  driver key is a gateway every node lists, and it marks the frames it
+  sends to personal agents `Onion`, as a gateway marks what its onion
+  service received: the mark is a gateway's word, which a node takes as it
+  takes any API client's. Nothing in the node changes for the harness.
+- **The wakes** (`personal-local`, a unit on each driver host beside its
+  driver, on its share of the agents): each device wakes once every
+  `--wake-s` seconds (900), at a phase drawn from the seed, and opens a new
+  session: `alive`, `since` (the envelopes after the last it read) on a
+  follower, then `push` of one sealed envelope, opaque random bytes,
+  log-uniform over 1–16 KiB, a share `--full-share` (2%) at the largest an
+  envelope may be (`MAX_ENVELOPE`, 60 KiB). The sessions the wakes open
+  expire and are swept by the nodes as any session is. Every interval, a
+  line a kind (`alive`, `since`, `push`, `wake`) goes to
+  `<run>.personal.jsonl`, and the totals last.
+- **The fill** (`--fill-at-s S`, seconds into the load): the full agent's
+  device pushes envelopes of the largest size from four sessions until its
+  quota refuses one; once its leader's log is compacted past them, one of
+  its followers is replaced by the inventory's spare node
+  (`spare = true`, a node no agent is placed on), which installs the agent
+  from a snapshot. The install is timed from the replacement's start to
+  the spare's replica applying the leader's commit, then the spare serves
+  a `since` through the onion. All of it goes to the run's `fill.json`.
+- **The report** adds each node's RSS before the personal agents'
+  creation, after it and at the load's end, per personal replica the node
+  holds; the wakes' kinds; and the fill.
+
+The gate (`slice-8-plan.md` 8.15) compares two runs of the same load, one
+without personal agents and one with them: the shard agents' commit p99,
+each node's RSS per personal replica, and the full agent's install.
+
 ## On each machine
 
 Every host, nodes and drivers alike, needs:
@@ -187,6 +232,8 @@ Copy `inventory.example.toml` to `inventory.toml` and give one
 - `api` and `peer`: a node's two UDP ports, both needed: its API's QUIC,
   which the drivers and the coordinator reach it at, and its peers'.
 - `memory_max`: optional; it overrides `harness.memory_max` for this host.
+- `spare`: optional, a node only: no agent is placed on it. It is the node
+  the fill's replacement adds. A run still needs three nodes besides it.
   On each machine, the caps of all its entries plus a 2 GiB reserve must
   fit in its free memory, or `check` refuses it.
 

@@ -102,6 +102,84 @@ fn leaders(inventory: &Inventory, deployed: &Deployed, placed: &mut [Placed]) {
 pub struct Load {
     pub model: Model,
     pub secs: u64,
+    /// The personal agents' wakes beside it, when the space has them.
+    pub personal: Option<PersonalLoad>,
+}
+
+/// The personal agents' load: each device wakes once a period.
+#[derive(Clone, Copy, Debug)]
+pub struct PersonalLoad {
+    pub period_s: u64,
+    /// The share of pushes at the largest envelope.
+    pub full_share: f64,
+}
+
+/// Start the personal agents' load on every driver host, each on its share
+/// of the agents: the units started.
+fn start_personal(
+    inventory: &Inventory,
+    run: &Run,
+    deployed: &Deployed,
+    load: &Load,
+    driver_key: &str,
+) -> Result<Vec<String>, String> {
+    let Some(personal) = load.personal else {
+        return Ok(Vec::new());
+    };
+    let personals = crate::personal::Personals::read(inventory)
+        .ok_or("a personal load without personal agents: create them first")?;
+    let drivers = inventory.drivers();
+    let mut started = Vec::new();
+    for (index, host) in drivers.iter().enumerate() {
+        let plan = crate::personal::Plan {
+            nodes: deployed.nodes.clone(),
+            agents: personals
+                .agents
+                .iter()
+                .skip(index)
+                .step_by(drivers.len())
+                .cloned()
+                .collect(),
+            seed: personals.seed,
+            secs: load.secs,
+            period_s: personal.period_s,
+            every_s: inventory.harness.every_s,
+            full_share: personal.full_share,
+            driver_key: driver_key.to_string(),
+        };
+        let local = run.file(&format!("personal-{}.json", host.name));
+        std::fs::write(&local, serde_json::to_string(&plan).expect("json"))
+            .map_err(|error| format!("{}: {error}", local.display()))?;
+        let remote = format!("{}/drive/{}.personal-plan.json", host.dir, run.id);
+        hosts::push(host, &local, &remote)?;
+        let unit = Unit {
+            name: host.unit("personal"),
+            memory_max: "2G",
+            stdout: format!("{}/logs/{}.personal.log", host.dir, run.id),
+            stderr: format!("{}/logs/{}.personal.log", host.dir, run.id),
+            cores: host.cores.as_deref(),
+            env: Vec::new(),
+            command: vec![
+                format!("{}/bin/vos-scale", host.dir),
+                "personal-local".into(),
+                "--plan".into(),
+                remote,
+                "--out".into(),
+                format!("{}/drive/{}.personal.jsonl", host.dir, run.id),
+            ],
+            runtime_max_s: load.secs + 600,
+        };
+        hosts::run(host, &unit.start_script())?;
+        started.push(host.name.clone());
+    }
+    eprintln!(
+        "{} personal agents wake once every {} s for {} s, from {} drivers",
+        personals.agents.len(),
+        personal.period_s,
+        load.secs,
+        drivers.len()
+    );
+    Ok(started)
 }
 
 /// Run `load` from every driver host at once, each on its share of the
@@ -177,6 +255,7 @@ pub fn drive(inventory: &Inventory, run: &Run, load: &Load) -> Result<(), String
         };
         hosts::run(host, &unit.start_script())?;
     }
+    let personal = start_personal(inventory, run, &deployed, load, &driver_key)?;
     eprintln!(
         "{} drivers offer U·a·r = {} · {} · {} = {:.0} calls a second for {} s",
         drivers.len(),
@@ -192,9 +271,15 @@ pub fn drive(inventory: &Inventory, run: &Run, load: &Load) -> Result<(), String
         Duration::from_secs(2),
         || {
             for host in &drivers {
-                let state = hosts::run(host, &hosts::state_script(&host.unit("drive")))?;
-                if matches!(state.trim(), "active" | "activating" | "deactivating") {
-                    return Ok(false);
+                let mut units = vec![host.unit("drive")];
+                if personal.contains(&host.name) {
+                    units.push(host.unit("personal"));
+                }
+                for unit in units {
+                    let state = hosts::run(host, &hosts::state_script(&unit))?;
+                    if matches!(state.trim(), "active" | "activating" | "deactivating") {
+                        return Ok(false);
+                    }
                 }
             }
             Ok(true)
@@ -202,10 +287,56 @@ pub fn drive(inventory: &Inventory, run: &Run, load: &Load) -> Result<(), String
     );
     if ended.is_err() {
         for host in &drivers {
-            hosts::run(host, &hosts::stop_script(&[host.unit("drive")]))?;
+            hosts::run(
+                host,
+                &hosts::stop_script(&[host.unit("drive"), host.unit("personal")]),
+            )?;
         }
     }
     ended?;
+    for host in &drivers {
+        if !personal.contains(&host.name) {
+            continue;
+        }
+        let to = run.dir.join("hosts").join(&host.name);
+        hosts::pull(
+            host,
+            &format!("{}/drive/{}.personal.jsonl", host.dir, run.id),
+            &to,
+        )?;
+        hosts::pull(
+            host,
+            &format!("{}/logs/{}.personal.log", host.dir, run.id),
+            &to,
+        )?;
+        let record = std::fs::read_to_string(to.join(format!("{}.personal.jsonl", run.id)))
+            .unwrap_or_default();
+        let totals: Vec<serde_json::Value> = record
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|line| line["total"] == true)
+            .collect();
+        if totals.is_empty() {
+            return Err(format!(
+                "{}: the personal load ended without its totals: see {}",
+                host.name,
+                to.join(format!("{}.personal.log", run.id)).display()
+            ));
+        }
+        for total in totals.iter().filter(|line| line["kind"] != "all") {
+            eprintln!(
+                "{}: personal {} {} sent, {} ok, {} errors {}, p50 {} us, p99 {} us",
+                host.name,
+                total["kind"],
+                total["sent"],
+                total["ok"],
+                total["errors"],
+                total["by_error"],
+                total["p50_us"],
+                total["p99_us"]
+            );
+        }
+    }
     for host in &drivers {
         let to = run.dir.join("hosts").join(&host.name);
         hosts::pull(
