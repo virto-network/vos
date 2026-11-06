@@ -15,6 +15,15 @@
 //!
 //! Every write but `claim` is under the role `registrar`, and none is
 //! taken before `found` sets the space's handle and the ring's first root.
+//!
+//! **The stock kernels** (`light-node.md` §4.2): `auth` and `owner`, the
+//! device kernels every space gets with this actor, written with the SDK
+//! (`vos_sdk::p2`), their arguments read in place. Each is sized on the
+//! credential kernels' public reference statement
+//! (`vos_sdk::p2::reference`), and a release embeds their device programs.
+//! Each claim ends with the call's `binding`, which the kernel carries
+//! without reading; the claims carry no kind byte, the guard naming the
+//! kernel.
 
 #![no_std]
 
@@ -22,11 +31,64 @@ extern crate alloc;
 
 use alloc::collections::BTreeMap;
 
+use vos_sdk::p2::{self, InPlace, Secret, Tag, TagHash};
 use vos_sdk::prelude::*;
 use vos_wire::credentials::{
     self as tree, CredentialError, DEPTH, Digest, EMPTY, ENROLL_MANY, Path, Ring, RootEntry,
     Siblings, Words, tables::RING_KEY,
 };
+
+/// Auth's claim, the stock `auth` kernel's public arguments: the member's
+/// leaf under `map_root`, and `nullifier` its pseudonym in `scope`.
+#[derive(Clone, Copy, InPlace)]
+#[repr(C)]
+pub struct AuthClaim {
+    pub map_root: p2::Digest,
+    pub scope: p2::Digest,
+    pub nullifier: p2::Digest,
+    pub binding: p2::Digest,
+}
+
+/// Owner's claim, the stock `owner` kernel's public arguments: `owner` the
+/// secret's owner digest.
+#[derive(Clone, Copy, InPlace)]
+#[repr(C)]
+pub struct OwnerClaim {
+    pub owner: p2::Digest,
+    pub binding: p2::Digest,
+}
+
+/// The stock kernels' reference runs: the public reference statement, each
+/// in its kernel's arguments.
+mod reference {
+    use vos_sdk::p2::reference::{BINDING, PATH, SCOPE, SECRET};
+
+    use super::*;
+
+    pub fn auth() -> credentials::Auth {
+        let member = Tag::Member.hash(&SECRET);
+        credentials::Auth {
+            path: PATH,
+            secret: SECRET,
+            claim: AuthClaim {
+                map_root: PATH.root(&Tag::Leaf.hash(&member)),
+                scope: SCOPE,
+                nullifier: Tag::Nf.hash(&SECRET).hash(&SCOPE),
+                binding: BINDING,
+            },
+        }
+    }
+
+    pub fn owner() -> credentials::Owner {
+        credentials::Owner {
+            secret: SECRET,
+            claim: OwnerClaim {
+                owner: Tag::Owner.hash(&SECRET),
+                binding: BINDING,
+            },
+        }
+    }
+}
 
 #[actor(credentials)]
 pub struct Credentials {
@@ -217,6 +279,21 @@ impl Credentials {
     #[msg]
     pub async fn count(&self) -> u64 {
         self.count
+    }
+
+    /// The secret's member's leaf lies under `map_root` by `path`, and
+    /// `nullifier` is its nullifier in `scope`.
+    #[attestable(device, reference = reference::auth)]
+    pub fn auth(path: &p2::Path, secret: &Secret, #[public] claim: &AuthClaim) {
+        let member = Tag::Member.hash(secret);
+        assert_eq!(path.root(&Tag::Leaf.hash(&member)), claim.map_root);
+        assert_eq!(Tag::Nf.hash(secret).hash(&claim.scope), claim.nullifier);
+    }
+
+    /// The secret's owner digest is `owner`.
+    #[attestable(device, reference = reference::owner)]
+    pub fn owner(secret: &Secret, #[public] claim: &OwnerClaim) {
+        assert_eq!(Tag::Owner.hash(secret), claim.owner);
     }
 }
 

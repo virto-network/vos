@@ -587,7 +587,8 @@ pub struct Statement {
     as a JAM program (`statement-service.elf`);
   - the credential AIR and the device profile (§8): `recair`'s
     `credential` (its circuits and prover) and `device` (the device
-    program, `auth_reference`, `H_io` of auth's words), `masked::device`
+    program from a kernel's release, `auth_reference`, `H_io` of auth's
+    words), `masked::device`
     (the masked device segment); `final-verifier`'s `credential` (the
     format-44 verifier ingress calls); `vos-pvm-proof`'s `device` (the
     shape) and `masked` (the masked segment chips);
@@ -1316,7 +1317,7 @@ pub fn verify(proof: &CredentialProof, call: &Call, name: Option<&[u8]>)
 /// A device kernel's program, computed from its bytes as every node computes it.
 pub struct DeviceProgram(/* the chips, the log sizes, the committed tree */);
 impl DeviceProgram {
-    pub fn auth(kernel: &[u8]) -> Result<Self, DeviceError>;   // on `auth_reference`
+    pub fn released(device: &release::Device) -> Result<Self, DeviceError>;  // no run
     pub fn id(&self) -> &[u8; 32];
 }
 pub fn verify_device(proof: &CredentialProof, call: &Call, name: &[u8],
@@ -1639,22 +1640,29 @@ never taken from a request. Its chips are those the kernel's code reaches
 (`device_chips_of_code`); its log sizes are those a reference run needs,
 each at least the masking's floor and at most `DEVICE_MAX_LOG_SIZE`; its
 preprocessed root commits its code, data table, regions, permissions and
-entry registers. A kernel of auth's statement takes its reference run on
-auth's public reference statement (`auth_reference`: a fixed, public
-secret's member at slot 0 of the empty tree, a fixed scope and binding),
-so every node computes one program from the installed kernel, and the
-device the same from the same kernel; a branch-free kernel's every
-witness runs to those sizes. The program id, which a binding names, is
+entry registers. Its reference run is on what the kernel's reference
+program returns (`#[attestable(device, reference = path, headroom = k)]`,
+the derivation's `references`), each size raised by its headroom
+(`Program::of`); the credential kernels' reference is auth's public
+reference statement (`vos_sdk::p2::reference`, and `auth_reference` in
+the hand-lean layout: a fixed, public secret's member at slot 0 of the
+empty tree, a fixed scope and binding), so every node computes one
+program from the installed kernel's release, and a release build the
+same from the same package (`light-node.md` §4.4, which a device embeds
+and commits without a run, `Program::released`); a branch-free kernel's
+every witness runs to those sizes. The program id, which a binding names, is
 BLAKE2b-256 of `"vos/device/program/v1"`, the format's number and
 parameters (log blowup, queries, PoW, fold step, log last layer,
 interaction PoW, `log h`), the chips, the count of log sizes and each,
 and the root (every integer four little-endian bytes); the transcript
-mixes each of them too. The leader computes it at the install, which
-fails for a guarded kernel that is no device kernel or does not run
-auth's reference within the format's shape; a replica that did not
-install it (or restarted), once a device proof naming the kernel passes
-the checks before the binding, one computation however many requests
-wait, then keeps its verifier. A run is traced with at most 2^18 gas
+mixes each of them too. The leader computes every device kernel's at the
+install, which fails for a kernel whose reference or whose run on it does
+not end within the format's shape; a replica that did not install it (or
+restarted), once a device proof naming the kernel passes the checks
+before the binding, or a window read names it, one computation however
+many requests wait, then keeps its verifier. A guard admits its kernel's
+release and, until its date, the previous one (`light-node.md` §4.4,
+compatibility windows); the binding names which. A run is traced with at most 2^18 gas
 (`device::GAS`): the CPU's most steps, and as much again for its
 Poseidon2 calls (about 109 a run, fewer as its steps grow; a kernel past
 them fails its install out of gas). Auth's arguments to a

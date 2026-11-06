@@ -168,14 +168,21 @@ fn the_published_values_do_not_depend_on_the_witness() {
 
 /// No hidden state in a proof's bytes: φ7's value between its sum and its
 /// clearing (its 8 bytes, its low half; its high half is the sign's), and each boundary's
-/// memory root.
+/// memory root. Two proofs of the same run under fresh masks: a needle a
+/// proof leaks is in both, while four bytes of a megabyte of masked field
+/// elements match them by chance about once in four thousand proofs.
 #[test]
 fn no_hidden_state_is_in_a_proof() {
     let format = format();
-    let (proof, _) = prove::<P2MerkleChannel>(&format, IO, MaskRng::default()).expect("proves");
-    verify::<P2MerkleChannel>(&format, &proof).expect("verifies");
-    let bytes = postcard::to_allocvec(&(&proof.proof.stark_proof, &proof.proof.claimed_sums))
-        .expect("encodes");
+    let proved = || {
+        let (proof, _) = prove::<P2MerkleChannel>(&format, IO, MaskRng::default()).expect("proves");
+        verify::<P2MerkleChannel>(&format, &proof).expect("verifies");
+        let bytes = postcard::to_allocvec(&(&proof.proof.stark_proof, &proof.proof.claimed_sums))
+            .expect("encodes");
+        (proof, bytes)
+    };
+    let (proof, bytes) = proved();
+    let (_, again) = proved();
     let value = secret(IO);
     let secret = value.to_le_bytes();
     assert!(
@@ -195,9 +202,10 @@ fn no_hidden_state_is_in_a_proof() {
             proof.final_state.memory_root.to_vec(),
         ),
     ];
+    let holds = |bytes: &[u8], needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
     for (name, needle) in &needles {
         assert!(
-            !bytes.windows(needle.len()).any(|window| window == needle),
+            !(holds(&bytes, needle) && holds(&again, needle)),
             "{name} is in the proof's bytes"
         );
     }

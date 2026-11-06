@@ -745,3 +745,33 @@ fn a_root_unknown_answer_fetches_the_path_again_and_proves_anew() {
     };
     assert_eq!(nullifier, before, "one pseudonym in one scope");
 }
+
+/// The stock kernels' release artifacts, computed from the credential
+/// actor's ELF as a node's install computes their programs: each one's
+/// program committed from the artifact alone, no reference run, and one
+/// whose shape or id is not the artifact's refused.
+#[test]
+fn the_stock_kernels_programs_come_from_their_release_artifacts() {
+    use vos_light::DeviceProgram;
+    let elf = std::fs::read(vos_testkit::programs::credentials_elf()).unwrap();
+    let devices = vos_light::release::devices(&elf).unwrap();
+    let methods: Vec<MethodId> = devices.iter().map(|device| device.method).collect();
+    let mut expected = vec![
+        MethodId(derive_id("vos/method/", "auth")),
+        MethodId(derive_id("vos/method/", "owner")),
+    ];
+    expected.sort();
+    assert_eq!(methods, expected);
+    for device in &devices {
+        assert_eq!(device.elf, vos_wire::result::digest(&elf));
+        let program = DeviceProgram::released(device).unwrap();
+        assert_eq!(program.id(), &device.id);
+        assert_eq!(program.log_sizes(), &device.log_sizes[..]);
+        let mut raised = device.clone();
+        raised.log_sizes[0] += 1;
+        assert!(DeviceProgram::released(&raised).is_err(), "another shape");
+        let mut renamed = device.clone();
+        renamed.id[0] ^= 1;
+        assert!(DeviceProgram::released(&renamed).is_err(), "another id");
+    }
+}

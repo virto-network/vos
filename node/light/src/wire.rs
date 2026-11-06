@@ -29,6 +29,17 @@ fn request(kind: u16, body: impl Encode) -> Vec<u8> {
     bytes
 }
 
+/// The device window of `instance` of `agent`: a `Devices` request.
+pub fn devices_request(agent: u32, instance: u32) -> Vec<u8> {
+    request(Kind::Devices as u16, (AgentId(agent), InstanceId(instance)))
+}
+
+/// The device window from a `Devices` answer: `None` for an instance the
+/// node does not hold.
+pub fn devices_answer(body: &[u8]) -> Result<Option<ingress::DeviceWindow>, DeviceError> {
+    Option::<ingress::DeviceWindow>::decode_exact(body).ok_or(DeviceError::Decode)
+}
+
 /// The node's time: a `Time` request, no body.
 pub fn time_request() -> Vec<u8> {
     (Kind::Time as u16).to_le_bytes().to_vec()

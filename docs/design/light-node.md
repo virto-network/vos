@@ -173,11 +173,15 @@ devices decrypt each other's messages".
   link; ingress's device programs (`credentialed.rs`'s use of
   `vos_pvm_recair::device`) stay in the node, as the light node never
   computes one from a kernel once they are release artifacts.
-- **Not yet release artifacts:** the stock kernels' device programs. The
-  device library still computes one from its kernel
-  (`DeviceProgram::auth`, a reference run) until the references are
-  generalized (plan 8.4); the local actors and the agent program already
-  are (`vos_light::release`).
+- **Release artifacts** (`vos_light::release`, built behind its `release`
+  feature on the host that builds the app): the local actors' packages,
+  the agent program, and the device kernels' programs
+  (`release::Device`: the kernel, its chips, its log sizes, its id, and
+  the hash of the ELF it came from). The device library commits a
+  program's preprocessed tree from its artifact
+  (`DeviceProgram::released`), checking the id; it never runs a reference
+  or the transpiler, and installs no package another transpiler derived
+  (`release::TRANSPILER`).
 
 **Not embedded:** Raft (`vos-raft`) and every group loop; ingress serving
 of any kind (the light node listens on no socket; sync and calls are
@@ -531,27 +535,24 @@ previous release in a test that reads every envelope and operation back
 tables, is `agent/testkit/tests/agent/personal/upgrade.rs`: it reads every
 row back, and adds no table, since `#[actor]` gives a field no `#[cfg]`);
 the keeper upgrades in batches and stops on the first refusal. The layout
-binds from the first release: until then (plan 8.13's device-set rules,
-`Policy`'s further delays) rows change freely. A change that cannot
+binds from the first release: until then rows change freely. A change that cannot
 be append-only waits for state migration (`open.md`, "Upgrades").
 
 **`Personal` as built** [built, `agent/personal`, its wire types
 `vos_wire::personal`]: the commit log, the votes and verdicts, evidence,
 sealed scopes, acknowledgements, the recovery scope, quotas, the inbox,
-pairing slots, the lease and its grace, and gated reads, over a device set
-holding what these need: devices with their keys, class, attestation,
-nullifier, sealed label, probation (from its add) and status; the claiming
-device active at `assign`, a strong admin's add inline in its commit, and
-a removal pending for the policy's delay then matured. The rest of the
-device set's rules (vetoes, contests and resolutions, the kit's
-operations, seasoning, immediate removal, a probation frozen under a
-removal, `R1`/`R2` and a restore, admin-key replacement, a delayed admin's
-add as an operation, regroup) are plan 8.13's, added as tables beside
-these. Batch time decides lazily: each call first settles the removals
-that matured (their keys leave `admitted`, a `Matured` entry is logged),
-the slots that expired and the pending candidate's verdict; a refused call
-writes nothing, so its settling waits for the next call that runs, and a
-read computes a device's standing from the time it reads at. The home's
+pairing slots, the lease and its grace, and gated reads, over the device
+set of §3.5 (its rules as built are there): devices with their keys,
+class, attestation, nullifier, sealed label, probation, seasoning and
+status; the claiming device active at `assign`, a strong admin's add
+inline in its commit, and the operations with their vetoes, contests,
+resolutions and second signatures. Batch time decides lazily: each call
+first settles one operation that fell due (a removal's device leaves
+`admitted`, a `Matured` entry is logged), refusing with `Settling` while
+more are due, which `wake` settles one a call; then the slots that expired
+and the pending candidate's timeout. A refused call writes nothing, so its
+settling waits for the next call that runs, and a read computes a device's
+standing from the time it reads at. The home's
 calls (`configure`, `assign`, `renew`) take the role `homes`; `assign`
 answers its caller, and the `assigned`/`refused` message to `Homes` is
 plan 8.14's. Bounds the rules above leave open: `alive` is logged at
@@ -560,7 +561,8 @@ vote's signed message names its candidate's log index as well as its
 epoch (an epoch's number is free again after a void), an opener holds one
 open pairing slot and an agent four, a slot's holder writes four inbox
 items and a closed slot's items are deleted, and a removal that matured
-inside a candidate's window decides it as the window's end would have.
+inside a candidate's window decides it, as of its maturity, by the other
+devices' votes.
 
 ### 3.4 Keys: MLS among the user's devices, with confirmed epochs
 
@@ -943,7 +945,8 @@ commits), **active**, or **removed** (with its frontier). A device is
 
 *What is conceded, and only this:* a thief who passes the owner's strong
 biometric holds an active device and can always contest. The owner wins
-with one device and the kit, or with two other seasoned devices. With the
+with one device and the kit, or with two other seasoned devices whose
+admins are strong (two delayed admins resolve nothing). With the
 kit alone the owner still wins against a thief holding only a sync key (a
 phone after first unlock, malware): the kit's `remove` of that phone can
 be cancelled only by a veto, which needs the admin key the thief lacks,
@@ -1013,6 +1016,83 @@ the control log restarts under it.
 - **Moving home re-splits the kit:** the new agent holds a new `R2` and
   re-pushed recovery envelopes; until the move completes the kit opens
   nothing at the new home (§3.9).
+
+**The device set as built** [built, `agent/personal/src/devices.rs`,
+property-tested in `agent/testkit/tests/agent/personal/adversaries.rs`;
+where the rules above leave a choice, this is the one taken]:
+- **Operations** (`add`, `remove`, `replace`, `rotate`, `regroup`,
+  `restore`), each an admin call logged with its signer and its maturity:
+  a device's waits the policy's `operation_delay_ms` (72 h), the kit's its
+  `kit_delay_ms` (7 days), and a replacement its `probation_ms` (72 h), the
+  new key admitted only at maturity: the new key's probation is the
+  replacement's wait, so the old key, while it signs, can veto a
+  replacement it did not ask for. `seasoning_ms` (7 days) and the kit's
+  daily allowance (`kit_operations_per_day`, 4) are the policy's too; a
+  test home sets each in minutes. No device removes itself.
+- **Vetoes** (`veto`, an active device's admin key, never the kit's):
+  a device's operation becomes contested, the kit's is cancelled. A
+  contest held only by vetoes lifts when the last vetoer's removal
+  matures (rule 9), and the operation matures at its own time or then,
+  whichever is later. A device whose removal matures, or which is dropped
+  with its void candidate, is **silenced**: its open operations (a
+  matured add its commit never carried included) are cancelled and its
+  vetoes lifted.
+- **Contests:** a removal aimed at an open removal of its signer by one
+  of its targets, a regroup on either side, is one contest with it.
+- **The two-device rules** need two seasoned devices with **strong**
+  admins other than the targets: a delayed admin's signature makes
+  nothing immediate and resolves nothing (every operation it signs
+  waits); its veto counts. The second signature is `cosign(op)`, which
+  matures a removal, a kit rotation or a regroup at once, contested or
+  not; the kit cosigns only a regroup. `resolve(op, upheld)` names the
+  operation that matures, its rival in a pair dropped (or, not upheld,
+  the reverse): the kit's acts at once, a device's when a second agrees.
+- **A frozen probation** keeps the time it had left when the first removal
+  against it opened, and runs it from when the last one closes.
+- **Keys an operation brings are claimed** while it is open (a matured
+  add's until its commit): no pairing slot, add or other operation takes
+  them, so none can be squatted to cancel it.
+- **`R2` never enters a readable row:** a rotation or a restore names its
+  `R2` by `r2_hash` and carries it in its evidence, kept apart and logged
+  nowhere; an operation that matures without it is cancelled
+  (`Unevidenced`). The kit's evidence must come from the very key that
+  signed its operation.
+- **A restore carries the next kit:** at maturity every device is
+  removed, the restore's device added alone and active, the kit replaced,
+  and the previous `R2` released to that device alone (`recovery`) until
+  its first confirmed commit, then deleted; so the rotation that follows
+  every restore is part of it. A rotation's or a restore's maturity
+  cancels the replaced kit's open operations, and records the recovery
+  scope's position: the new kit reads only the envelopes after it, those
+  re-sealed under its `R`. A device's rotation is a veto of the kit's
+  pending rotation or restore, so a leaked kit cannot hold its place.
+- **A regroup or a restore voids the pending candidate** (`Regroup`); the
+  agent's epochs run on, the new group's first commit being the confirmed
+  epoch plus one and carrying the removals.
+- **Quotas:** operations, vetoes, second signatures and resolutions count
+  against no commit quota, so neither a thief device nor a leaked kit can
+  spend the owner's; the kit's operations count against its daily
+  allowance, and a device's against its open operations.
+- **Bounds:** one open operation of each kind a target (a removal, a
+  replacement) or an agent (a rotation or a restore, a regroup); two open
+  operations a signer besides its removals; eight live devices. A call
+  settles four **steps** before it runs: an operation's maturity, or one
+  row of a silencing or of a replaced kit's cancelling, each queued in
+  the due index at the time it takes effect, so everything settles in
+  time order and no step grows with what an adversary queued. Every
+  handler that settles declares 40M gas [measured, the agent suite on a
+  debug build, x86-64 Core Ultra 7 155H, 2026-11-06; gas is
+  deterministic]: the worst call in a full set (eight seasoned devices,
+  each holding two operations, each vetoed by every other device and
+  resolved by one), whether a regroup naming seven of them or a restore
+  matures, 13.9M; an ordinary operation, veto or resolution 1.6–3.9M,
+  `alive` 0.92M.
+- **Reads between calls** compute a device's standing from the removals
+  due by their time, which a call may yet cancel in time order (a
+  removal's signer removed first); the operations read as the last call
+  left them.
+- **Not built:** an admin call's arguments naming the control log's head
+  it was made against (the devices' check, plan 8.19).
 
 **What the control log shows the operators:** the device count and its
 changes, each device's public keys and admin class, the times of
@@ -1302,9 +1382,8 @@ each a short Rust function in the actor whose state it concerns:
 - any actor's own, under the same rules.
 
 ```rust
-// vos-credentials, beside the tree it proves membership of. Both are built
-// and measured as the `sdk-device` test actor's (below); the credential
-// actor takes them with the reference attribute (plan 8.4, 8.5).
+// vos-credentials, beside the tree it proves membership of [built]: the
+// `sdk-device` test actor's (below), each sized on its reference run.
 #[attestable(device, reference = reference::auth)]
 pub fn auth(path: &Path, secret: &Secret, #[public] claim: &AuthClaim) {
     let member = Tag::Member.hash(secret);
@@ -1380,6 +1459,17 @@ writes (the `sdk-device` test actor's `auth` and `owner`):
   stay as the test actors' references; the fallback (the hand-lean
   kernels shipped as stock, the assembly kept inside `vos_sdk::p2`) is not
   taken.
+- **The device end inlined** [measured, step counts of the traced run on
+  the host, Intel Core Ultra 7 155H, 2026-11-03]: a crate with several
+  device kernels, or a kernel and its reference entry, called
+  one outlined `DeviceReturn` end and its part writers. With them
+  `#[inline(always)]`, on today's target, the SDK-form auth takes 1,546
+  steps (from 1,839) and owner 385 (from 708, `owner_lean` 383); the
+  hand-lean auth stays at 1,722. The programs shrink with them: the SDK
+  form's auth at the hand-lean one's sizes but one chip a size smaller
+  (2^12 rows where it had 2^13), owner two chips a size smaller; proofs
+  about 0.88 MB and 0.85 MB as before. The stock kernels in the credential
+  actor are these, one program each with the `sdk-device` actor's.
 - **The transpiler and `unaligned-scalar-mem`** [measured, 2026-11-02, on
   a side branch]: LLVM emits plain misaligned `ld`/`sd`/`lw`/`sw`
   where it emitted byte loops, and the transpiler takes them: the test actors,
@@ -1456,29 +1546,47 @@ picks the circuit; ingress knows each kind's checks
 alone: its chips (what its code reaches), each chip's log size from a
 reference run, and the preprocessed root over its code, data, regions,
 permissions and entry registers; its id the BLAKE2b-256 of a domain, the
-format, the chips, the sizes and the root. Today only auth's reference
-(`auth_reference`) exists, hard-wired in `vos_pvm_recair::device`.
-- **Generalized:** `#[attestable(device, reference = path)]` names a
-  function returning the kernel's reference arguments (a public, valid
-  witness; the credential actor's `auth_reference` and `owner_reference`,
-  later the pool's `spend_reference`). The derivation records it; the
-  leader computes the program at install by running it, as auth's today; a
-  replica that did not install computes it at the first proof naming the
-  kernel, as today.
+format, the chips, the sizes and the root.
+- **The reference** [built]: `#[attestable(device, reference = path,
+  headroom = k)]` names a function returning the kernel's message, its
+  reference arguments (a public, valid witness: the credential kernels'
+  is `vos_sdk::p2::reference`, a fixed public secret's member at slot 0
+  of the empty tree; later the pool's spend's). The macro refuses a device
+  kernel without one. It generates an entry, `__vos_reference_<name>`,
+  whose run returns the message's encoding, and the derivation links it
+  as a **reference program** beside the kernel
+  (`Derivation::references`: the method, the program's hash, the
+  headroom), refusing a device kernel without one. A device kernel's
+  **release** is the three (`DeviceRelease`: kernel, reference,
+  headroom). The install computes every device kernel's program from its
+  release (`vos_pvm_recair::device::Program::of`: the reference run, then
+  the kernel's run on its output), refusing the install when either fails;
+  a replica that did not install computes it from the stored blobs at the
+  first proof or window read naming it, once a release.
 - **Sizes and witnesses:** every chip is padded to the program's sizes, so
   a proof's shape is the program's whatever the witness. A witness whose
   run needs more rows than the reference's fails to prove (an error on the
   device, never a different proof shape); branch-free kernels avoid it,
   and a kernel that branches declares `headroom = k` (each size raised by
-  `k` powers of two). The testkit's `device_fits` property test runs
-  random witnesses against the reference's sizes.
-- **Computed at release, on the phone never** [proposed]: the stock
-  kernels' device programs, and the transpiled programs of the light
-  node's own local actors, are computed by the release build and embedded
-  with their ELF bytes. The phone runs no transpiler and no reference run;
-  it compares the program id a space installed with the one it embeds, and
-  "reproducible" reduces to the app and the space taking the same release
-  artifact by hash.
+  `k` powers of two, `k` at most 4). `device_fits`
+  (`Program::fits`, and the proof crate's
+  `random_witnesses_fit_the_reference_programs`) runs random witnesses of
+  the stock kernels and of the hand-lean `auth` against their references'
+  sizes [built].
+- **Computed at release, on the phone never** [built: the release build
+  and the device's side; s4's facility takes them when its VOS pin moves,
+  plan 8.24b]: the release build computes each device kernel's program
+  from the package's ELF as a node's install does
+  (`vos_light::release::devices`), the stock kernels' among them, and the
+  app embeds the artifacts (`release::Device`: the kernel, its chips and
+  log sizes, its id, the ELF's hash) beside the local actors' packages
+  (the phone bench's `kernel` command takes one, `tools/phone`). The phone
+  runs no transpiler and no reference run: it commits a program's
+  preprocessed tree from its artifact and checks the id
+  (`DeviceProgram::released`). "Reproducible" reduces to the app and the
+  space taking the same release artifact, the ELF, by its hash: the
+  space's window names the ids the app's artifacts name (the window
+  test checks it; the guest blobs are path-independent, `blobs.lock`).
 - **Which kernels see a secret** [proposed, the slice-8 rule]: the light
   node puts a member secret (and, in slice 9, a spending key) only into
   kernels it ships, whose programs it embeds: the stock `auth` and
@@ -1490,26 +1598,61 @@ format, the chips, the sizes and the root. Today only auth's reference
   secret itself (§8, G2). So in slice 8 a developer's own device kernel
   proves over public data and over data the user explicitly hands it,
   never over keys; a consent model per program id is later work (§9.3).
-- **Compatibility windows** [proposed]: so that an app release and a
-  space's upgrade need not land on the same day, each stock kernel's guard
-  admits a **window** of program ids, at most two: the current release's
-  and the previous one's; ingress admits the device formats likewise (at
-  most the current and the previous). A program id embeds its format
-  (§4.4), so a previous program is only ever verified under the previous
-  format.
-  - **How a window ends:** a release adds its ids and sets the previous
-    release's retirement, 60 days on by default; the space's operator may
-    set it to any earlier date, **now** included, when a version is found
-    unsound. At the date the entry is deleted, so nothing older than one
-    release is ever admitted and no version table grows. The light node
-    proves with the newest program it ships that the space admits, and
-    when the space admits none it says the app or the space must update.
+- **Compatibility windows** [built]: so that an app release and a
+  space's upgrade need not land on the same day, each guard naming a
+  device kernel (the stock kernels' among them) admits a **window** of
+  programs, at most two: its release's and the previous one's; ingress
+  admits the device formats likewise (at most the current and the
+  previous). A program id embeds its format (§4.4), so a previous program
+  is only ever verified under the format it was computed in.
+  - **Where a window lives:** the installed record
+    (`Installed::previous`, one a device kernel, pinned with the
+    instance's programs). An install that replaces a device kernel's
+    release keeps the replaced one as its previous release, retiring 60
+    days after that install's batch time (`RETIREMENT_MS`); one that keeps
+    the release keeps the previous one it had; nothing older is ever
+    kept, so no version table grows.
+  - **How a window ends:** at its date, by the node's clock, ingress
+    and the window read stop admitting the previous release, and the next
+    install or retirement deletes its entry. The operator may set any
+    earlier date, **now** included, when a version is found unsound
+    (`Kind::Retire`, `Admin::Retire`, through the agent's log, so every
+    replica agrees; `vos agent retire`); a date is never moved later.
+  - **The formats' window** is each node's: the device formats its binary
+    verifies, at most two, the previous one retiring at the date its
+    release set (60 days after the release that brought the next), or any
+    earlier date the operator sets at that node (`Config::retired_formats`,
+    or `Kind::Retire`'s `Format`, live until a restart). A proof of a
+    retired format is refused `Format` before anything is decoded.
+  - **The proof names its program:** ingress computes the binding under
+    each program the window admits, and the request's binding must be one
+    of them; a proof of a retired or unknown release is refused
+    `Binding`, at no verification's cost.
+  - **The light node reads the window first** (`Kind::Devices`: the
+    formats and each device kernel's programs, ids, formats and dates) and
+    proves with the newest program it ships that the window holds, in a
+    format it holds (`vos_light::choose`, `wire::devices_request` [built];
+    the app's sign-in calls them when s4's facility moves to release
+    artifacts, plan 8.24b). When the space admits none it refuses before
+    proving (`DeviceError::Window`: "the space admits none of this app's
+    programs for the kernel: the app or the space must update"); a window
+    a node could not compute whole yet (a blob it does not hold) is marked
+    `unavailable`, and the app asks again rather than saying either side
+    must update. An app ships the current release's artifacts and the
+    previous one's [proposed].
   - **One claim per window:** two versions in one window must compute
     identical claims (auth's nullifier, owner's digest) with identical
     meaning, so a `once` scope admits a member once whichever version
     proved, and pseudonyms do not change at a release. A kernel whose
     claim changes is a new guard name (a new scope), never a window
-    member.
+    member. The window test signs in through a `once` guard with release
+    one's proof and is refused `Once` with release two's: the same
+    nullifier (`an_app_one_release_behind_signs_in_until_its_window_closes`).
+  - **Until a second device format exists** [decided here, the simplest
+    rule consistent with D8 and G3]: every window entry's program is
+    computed under the node's current device format. Format 47 (plan
+    8.10) pairs each entry with its release's format, the previous
+    release's program verified under the previous format.
 - **Pins:** the binding names the program id, so a proof of one kernel
   authorizes nothing under another. No venue pins device ids (device
   proofs are not folded, `proving.md` §11, "Device proofs are not
@@ -1887,7 +2030,7 @@ gateway, 2026-11-02]:
 
 No third port carries raw node-API frames. **The light node speaks
 `vos-api` over SSH over the onion,** as s4 does today, and the subsystem's
-relay set (`NodeKey`, `Time`, `AgentInfo`, `Schema`, `Query`;
+relay set (`NodeKey`, `Time`, `AgentInfo`, `Schema`, `Devices`, `Query`;
 `node/api/src/lib.rs`, `Kind::relayed`) gains `Call` (the personal agent's
 pushes, commits and device-set operations, and member calls) and
 `Credentialed`, with the gateway's leader-aware routing behind them.
@@ -2285,7 +2428,7 @@ device's crates faster); Q9's size argument for it is small.
 - **The gateway** keeps HTTP, TLS and SSH, and adds the onion service
   (§6): the same HTTP routes and SSH behind an onion address, and nothing
   else [E23]. Its SSH `vos-api` subsystem's relay set is wider than
-  today's (`NodeKey`, `Time`, `AgentInfo`, `Schema`, `Query`;
+  today's (`NodeKey`, `Time`, `AgentInfo`, `Schema`, `Devices`, `Query`;
   `node/api/src/lib.rs`, `Kind::relayed`): it adds `Credentialed` and
   `Call`, which the light node sends through it.
 - **Limits that bind the personal agent** [built]: 64 KiB a call's
@@ -2322,9 +2465,10 @@ device's crates faster); Q9's size argument for it is small.
 
 - `#[attestable(device)]` methods may take references to fixed-size
   argument types (decoded in place, first among the arguments: built,
-  §4.2) and declare `reference` and
-  `headroom`; the derivation records the reference's symbol and refuses a
-  device kernel without one.
+  §4.2) and declare `reference = path` and `headroom = k` [built, §4.4];
+  the macro and the derivation refuse a device kernel without a
+  reference, and the derivation records each reference program by its
+  hash beside its kernel (`Derivation::references`).
 - `#[msg(proven = k)]` names a device kernel of the actor or of the agent's
   credential actor; the method's first argument is the kernel's claim
   type, checked equal at compile time (`pay(tx, memos)`: `tx` first).
@@ -2377,13 +2521,17 @@ other device (A4). *Known limit* for what the phone shows. (8.13)
 **A4. A thief who passes the owner's strong biometric** (coercion, a weak
 sensor) holds an active device. *Mitigation:* the symmetric rules (§3.5):
 he removes nothing uncontested while the owner vetoes; the owner wins a
-contest with one device and the kit, or two other seasoned devices; a
+contest with one device and the kit, or two other seasoned devices with
+strong admins; a
 thief holding only a sync key loses even to the kit alone, in 14 days (its
 removal cannot be vetoed without the admin key, and a removed device's
 `alive` is ignored). *Known limit,* and only this: a thief who passes the
 biometric can always contest, so against him the kit alone does not win.
 Property-tested against an adversary with one device and its biometric
-who may also pair devices, and one with a sync key alone. (8.13)
+who may also pair devices, and one with a sync key alone, and a leaked kit
+against devices that veto (`agent/testkit/tests/agent/personal/
+adversaries.rs`): the owner reacting before a paired device's probation
+ends removes every thief device within the delay of its first move. (8.13)
 
 **A5. A device returns after weeks or months.** *Mitigation:* while away
 it is outside the confirming set, so the awake devices are never blocked;

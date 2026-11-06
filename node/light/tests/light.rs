@@ -193,8 +193,8 @@ fn a_local_actor_installed_from_release_artifacts_is_called() {
 /// alone: a command is `Unknown`; a merge handler that reads a merge field
 /// or writes a table traps; one that fails declines; none of them records
 /// a node or writes a row. A package whose programs are not its
-/// derivation's installs nothing, and nodes of an instance not installed
-/// are refused.
+/// derivation's, or another transpiler's, installs nothing, and nodes of
+/// an instance not installed are refused.
 #[test]
 fn the_merge_entry_runs_merge_handlers_writing_merge_fields() {
     let (agent, notes) = artifacts();
@@ -205,6 +205,12 @@ fn the_merge_entry_runs_merge_handlers_writing_merge_fields() {
     assert!(matches!(
         light.install(NOTES, &forged, Vec::new()),
         Err(Error::Package)
+    ));
+    let mut other = notes.clone();
+    other.derivation.transpiler += 1;
+    assert!(matches!(
+        light.install(NOTES, &other, Vec::new()),
+        Err(Error::Transpiler(version)) if version == release::TRANSPILER + 1
     ));
     assert!(matches!(
         light.ingest(NOTES, Vec::new(), None),

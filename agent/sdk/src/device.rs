@@ -19,9 +19,11 @@ use crate::runtime::Output;
 /// before the public arguments and four before the output; [`Self::end`]
 /// writes each length into its room and closes the gap the output's leaves.
 ///
-/// Its methods are `#[inline]`, so its code is the device kernel's crate's
-/// alone and the SDK's own code, which node kernels reach, is laid out as
-/// without it.
+/// Its methods are `#[inline(always)]`, so its code is each device
+/// kernel's own, never one function the crate's kernels and references
+/// call (a call per part and an outlined end cost a kernel hundreds of
+/// steps), and the SDK's own code, which node kernels reach, is laid out
+/// as without it.
 pub struct DeviceReturn {
     bytes: Vec<u8>,
     /// Where the output's room starts, once [`Self::output`] began it.
@@ -33,7 +35,7 @@ pub struct DeviceReturn {
 const ROOM: usize = 4;
 
 impl Default for DeviceReturn {
-    #[inline]
+    #[inline(always)]
     fn default() -> Self {
         Self::new()
     }
@@ -41,7 +43,7 @@ impl Default for DeviceReturn {
 
 impl DeviceReturn {
     /// An end with room for parts of `DEVICE_RETURN` bytes before it grows.
-    #[inline]
+    #[inline(always)]
     pub fn new() -> Self {
         const DEVICE_RETURN: usize = 256;
         let mut bytes = Vec::with_capacity(DEVICE_RETURN);
@@ -53,14 +55,14 @@ impl DeviceReturn {
     }
 
     /// Where the public arguments' encodings go, in order.
-    #[inline]
+    #[inline(always)]
     pub fn public_args(&mut self) -> &mut Vec<u8> {
         &mut self.bytes
     }
 
     /// Where the output's encoding goes, after the public arguments: once;
     /// a second call traps.
-    #[inline]
+    #[inline(always)]
     pub fn output(&mut self) -> &mut Vec<u8> {
         if self.output_at.is_some() {
             trap();
@@ -78,7 +80,7 @@ impl DeviceReturn {
     /// # Safety
     ///
     /// `io_hash` must point at 32 writable bytes.
-    #[inline]
+    #[inline(always)]
     pub unsafe fn end(self, io_hash: *mut [u8; 32]) -> Output {
         let Self {
             mut bytes,

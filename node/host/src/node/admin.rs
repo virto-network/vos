@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use vos_raft::Role;
 use vos_wire::abi::cap::Target;
 use vos_wire::batch::Admin;
-use vos_wire::ids::{AgentId, InstanceId, ProgramHash};
+use vos_wire::ids::{AgentId, InstanceId, MethodId, ProgramHash};
 use vos_wire::ingress::Unplaced;
 use vos_wire::peer::{CreationRecord, NodeNumber, Placement};
 
@@ -275,19 +275,26 @@ impl Inner {
                     Ok(ProgramHash(hash.0))
                 };
                 let derivation = derived.derivation(&elf);
-                let guarded = match derived.devices.is_empty() {
-                    true => Vec::new(),
-                    false => guarded_devices(&derived.schema)?,
-                };
-                pooled(derived.actor)?;
                 let mut devices = Vec::new();
-                for (method, kernel) in derived.kernels {
-                    let program = match guarded.contains(&method) {
-                        true => Some(device_program(method, &kernel)?),
-                        false => None,
-                    };
-                    let hash = pooled(kernel)?;
-                    devices.extend(program.map(|program| (hash.0, program)));
+                for (method, reference, headroom) in &derived.references {
+                    let kernel = derived
+                        .kernels
+                        .iter()
+                        .find(|(bound, _)| bound == method)
+                        .map(|(_, kernel)| kernel)
+                        .ok_or_else(|| {
+                            CallError::Failed(format!("device kernel {method:#010x}: no kernel"))
+                        })?;
+                    let release = derivation
+                        .device(MethodId(*method))
+                        .expect("a derived device kernel's release");
+                    devices.push((
+                        release,
+                        device_program(*method, kernel, reference, *headroom)?,
+                    ));
+                }
+                for program in derived.programs() {
+                    pooled(program)?;
                 }
                 Ok((derivation, stored, devices))
             })
@@ -361,55 +368,18 @@ impl Inner {
     }
 }
 
-/// The methods of the schema in `section` an auth guard names as its device
-/// kernel: the kernels whose device programs ingress verifies against. A
-/// guard naming a method that is not a device kernel fails the install, as
-/// a schema that does not read does (a package with device kernels).
-fn guarded_devices(section: &[u8]) -> Result<Vec<u32>, CallError> {
-    use vos_wire::schema::{CredentialGuard, Schema};
-    let Ok(schema) = Schema::read(section) else {
-        return Err(CallError::Failed(
-            "the package's schema does not read".into(),
-        ));
-    };
-    schema
-        .methods
-        .iter()
-        .filter_map(|method| match method.credential.as_deref() {
-            Some(CredentialGuard::Auth {
-                device: Some(name), ..
-            }) => Some(name),
-            _ => None,
-        })
-        .map(|name| {
-            core::str::from_utf8(name)
-                .ok()
-                .and_then(|name| schema.method_id(name))
-                .filter(|id| {
-                    schema
-                        .method(*id)
-                        .is_some_and(|method| method.kind == vos_wire::abi::Kind::Device)
-                })
-                .map(|id| id.0)
-                .ok_or_else(|| {
-                    CallError::Failed(format!(
-                        "a guard names {:?}, no device kernel of the package",
-                        String::from_utf8_lossy(name)
-                    ))
-                })
-        })
-        .collect()
-}
-
 /// Device kernel `kernel`'s program under the device format, as ingress
-/// verifies a device proof against it: refused, failing the install, when
-/// the kernel does not run auth's reference statement or its run is past
-/// the format's shape.
+/// verifies a device proof against it: sized on what its reference program
+/// `reference` returns, raised by `headroom`. Refused, failing the install,
+/// when the reference does not run, the kernel does not run on its
+/// arguments, or its run is past the format's shape.
 fn device_program(
     method: u32,
     kernel: &[u8],
+    reference: &[u8],
+    headroom: u8,
 ) -> Result<vos_pvm_recair::device::Verifier, CallError> {
-    vos_pvm_recair::device::Program::auth(kernel)
+    vos_pvm_recair::device::Program::of(kernel, reference, headroom)
         .map(|program| program.verifier())
         .map_err(|error| {
             CallError::Failed(format!(

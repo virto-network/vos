@@ -105,6 +105,10 @@ impl Node {
             .max()
             .unwrap_or(1);
         let settings = Settings::of(&config);
+        let calls = crate::calls::Calls::default();
+        for &(format, at_ms) in &config.retired_formats {
+            calls.devices.retire_format(format, at_ms);
+        }
         let inner = Arc::new(Inner {
             storage: StorageThread::spawn_with(
                 store.clone(),
@@ -145,7 +149,7 @@ impl Node {
             runtime,
             tasks: Mutex::new(Tasks::default()),
             recording: Default::default(),
-            calls: crate::calls::Calls::default(),
+            calls,
             reads: crate::asking::Waits::default(),
             floor_waits: std::sync::atomic::AtomicUsize::new(0),
             anchor_rows: crate::asking::Waits::default(),

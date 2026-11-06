@@ -3,10 +3,14 @@
 //! batch times a test sets: the commit log, the device set's origins, the
 //! votes and verdicts, evidence, sealed scopes, quotas, the inbox, the
 //! lapsed agent's grace, the reads only admitted keys get, the layout read
-//! back after the next version's install, and a push's and a read's cost.
-//! Each `light-node.md` §8 scenario a test answers is named in its doc.
+//! back after the next version's install, and a push's and a read's cost;
+//! the device set's operations, and the adversaries its rules are
+//! property-tested against. Each `light-node.md` §8 scenario a test
+//! answers is named in its doc.
 
+mod adversaries;
 mod commits;
+mod devices;
 mod evidence;
 mod grace;
 mod inbox;
@@ -22,10 +26,11 @@ use vos_wire::abi::cap::Target;
 use vos_wire::batch::{Admin, Input, Query, Request, Work};
 use vos_wire::defaults::SESSION_EXPIRY_MS;
 use vos_wire::ids::{InstanceId, MethodId, Principal, Session};
-use vos_wire::ingress::Grant;
+use vos_wire::ingress::{Grant, call_message};
 use vos_wire::personal::{
     AdminClass, Attestation, Candidacy, DeviceId, Effect, HOUR_MS, Header, Kit, KitEntry, KitKind,
-    NewDevice, Overview, PersonalError, Policy, Pushed, Recorded, Scope, Voted,
+    NewDevice, NewKit, Operation, Overview, PersonalError, Policy, Pushed, Recorded, Scope, Voted,
+    Woken, r2_hash,
 };
 use vos_wire::result::{Outcome, Run, Step};
 use vos_wire::{Decode, Encode, SpaceId, WindowClock};
@@ -97,6 +102,73 @@ pub fn kit() -> Kit {
     }
 }
 
+/// A minute of batch time: a day of a test home's policy.
+pub const MINUTE: u64 = 60_000;
+
+/// A test home's policy, a day of the default's a minute: operations wait
+/// 3, the kit's 7, a probation is 3 and seasoning 7.
+pub fn minutes() -> Policy {
+    Policy {
+        operation_delay_ms: 3 * MINUTE,
+        kit_delay_ms: 7 * MINUTE,
+        probation_ms: 3 * MINUTE,
+        seasoning_ms: 7 * MINUTE,
+        confirm_window_ms: 3 * MINUTE,
+        kit_operations_per_day: 64,
+        ..Policy::DEFAULT
+    }
+}
+
+/// Kit `n`'s entry `entry`'s signing key: `[0xd0 + n; 31] ‖ entry`, `n`
+/// below 32.
+pub fn kit_signing(n: u8, entry: u8) -> [u8; 32] {
+    let mut key = [0xd0 + n % 0x20; 32];
+    key[31] = entry;
+    key
+}
+
+pub fn kit_key(n: u8, entry: u8) -> Principal {
+    Principal::Client(kit_signing(n, entry))
+}
+
+/// Kit `n`, a phrase's entry and a security key's, and its `R2`.
+pub fn new_kit(n: u8) -> (NewKit, [u8; 32]) {
+    let r2 = [n; 32];
+    let entries = [KitKind::Phrase, KitKind::SecurityKey]
+        .into_iter()
+        .enumerate()
+        .map(|(i, kind)| KitEntry {
+            kind,
+            signing: kit_signing(n, i as u8),
+            sealing: [n ^ 0x55; 32],
+            sealed_r1: vec![n; 80],
+        })
+        .collect();
+    (
+        NewKit {
+            entries,
+            r2_hash: r2_hash(&r2),
+        },
+        r2,
+    )
+}
+
+/// The message `key` signs for `method` with `arguments`, as a client
+/// signs a call.
+pub fn message(key: [u8; 32], method: MethodId, arguments: &[u8]) -> Vec<u8> {
+    let session = Session {
+        key,
+        name: [7; 16],
+        t0: T0,
+    };
+    call_message(&IDENTITY, &session, 4, PERSONAL, method, arguments)
+}
+
+/// The evidence call's arguments.
+pub fn evidence(index: u64, message: Vec<u8>, attached: Option<Vec<u8>>) -> impl Encode {
+    ((index, message), ([0x5a_u8; 64], attached))
+}
+
 /// A scope's id.
 pub fn scope(n: u8) -> Scope {
     [n; 16]
@@ -128,15 +200,24 @@ pub fn update(epoch: u64, n: u8) -> Commit {
     commit(epoch, Effect::default(), vec![n; 600])
 }
 
+/// Arguments already encoded.
+struct Raw<'a>(&'a [u8]);
+
+impl Encode for Raw<'_> {
+    fn encode_to(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(self.0);
+    }
+}
+
 /// A step's answer: its reply, or the actor's error.
-fn answer<T: Decode>(outcome: &Outcome) -> Result<T, PersonalError> {
+pub fn answer<T: Decode>(name: &str, outcome: &Outcome) -> Result<T, PersonalError> {
     match outcome {
         Outcome::Done(bytes) => Ok(T::decode_exact(bytes).expect("the reply decodes")),
         Outcome::Failed {
             code: Failure::Handler,
             detail,
         } => Err(PersonalError::decode_exact(detail).expect("the error decodes")),
-        other => panic!("{other:?}"),
+        other => panic!("{name}: {other:?}"),
     }
 }
 
@@ -150,6 +231,8 @@ pub struct Home {
     sessions: BTreeMap<Principal, (Session, u64, u64)>,
     /// The next batch's time; each batch moves it a millisecond on.
     pub now: u64,
+    /// The most gas each method's call used.
+    pub gas: BTreeMap<String, u64>,
 }
 
 impl Home {
@@ -180,6 +263,7 @@ impl Home {
             program: personal(),
             sessions: BTreeMap::new(),
             now: T0,
+            gas: BTreeMap::new(),
         }
     }
 
@@ -248,14 +332,44 @@ impl Home {
         entry.0
     }
 
-    /// `caller`'s call of `name`: its reply, or the actor's error.
+    /// `caller`'s call of `name`: its reply, or the actor's error. Refused
+    /// `Settling`, the caller wakes the agent until it settled what was due
+    /// and calls again, as a device does.
     pub fn call<T: Decode>(
         &mut self,
         caller: Principal,
         name: &str,
         arguments: impl Encode,
     ) -> Result<T, PersonalError> {
-        answer(&self.run(caller, name, arguments).outcome)
+        let arguments = arguments.encode();
+        let answered = self.once(caller, name, &arguments);
+        if answered.as_ref().err() == Some(&PersonalError::Settling) && self.wake(caller).is_ok() {
+            return self.once(caller, name, &arguments);
+        }
+        answered
+    }
+
+    fn once<T: Decode>(
+        &mut self,
+        caller: Principal,
+        name: &str,
+        arguments: &[u8],
+    ) -> Result<T, PersonalError> {
+        let run = self.run(caller, name, Raw(arguments));
+        let gas = run.instances.iter().map(|used| used.gas).sum();
+        let most = self.gas.entry(name.to_string()).or_default();
+        *most = (*most).max(gas);
+        answer(name, &run.outcome)
+    }
+
+    /// `caller`'s wakes until the agent settled everything due.
+    pub fn wake(&mut self, caller: Principal) -> Result<Woken, PersonalError> {
+        loop {
+            let woken: Woken = self.once(caller, "wake", &[])?;
+            if woken.settled {
+                return Ok(woken);
+            }
+        }
     }
 
     /// `caller`'s call of `name`, refused before the handler ran: its
@@ -282,7 +396,7 @@ impl Home {
             method: self.method(name),
             arguments: arguments.encode(),
         });
-        answer(&Outcome::decode(&self.node.refine(&work)).unwrap().0)
+        answer(name, &Outcome::decode(&self.node.refine(&work)).unwrap().0)
     }
 
     pub fn overview(&self) -> Overview {
@@ -344,6 +458,41 @@ impl Home {
             .unwrap();
         self.confirm_all(epoch, &candidacy.set);
         candidacy
+    }
+
+    /// `caller`'s operation `name`: its log index.
+    pub fn operate(
+        &mut self,
+        caller: Principal,
+        name: &str,
+        arguments: impl Encode,
+    ) -> Result<u64, PersonalError> {
+        self.call::<Recorded>(caller, name, arguments)
+            .map(|recorded| recorded.index)
+    }
+
+    /// The operation at `index`, read by `reader`.
+    pub fn operation(&self, reader: Principal, index: u64) -> Operation {
+        self.query(reader, "operation", index).unwrap()
+    }
+
+    /// The evidence of the operation at `index`, `name` with `arguments`
+    /// signed by `key`, posted by `poster` with `R2` beside it.
+    pub fn deposit(
+        &mut self,
+        poster: Principal,
+        key: [u8; 32],
+        index: u64,
+        name: &str,
+        arguments: impl Encode,
+        r2: [u8; 32],
+    ) -> Result<Recorded, PersonalError> {
+        let signed = message(key, self.method(name), &arguments.encode());
+        self.call(
+            poster,
+            "evidence",
+            evidence(index, signed, Some(r2.to_vec())),
+        )
     }
 
     /// `envelope` pushed by device `n`.

@@ -8,7 +8,7 @@ use vos_http::routes::{self, Routed, operated_header};
 use vos_wire::Encode;
 use vos_wire::ids::{AgentId, Principal};
 use vos_wire::ingress::{
-    Create, Grant, Install, NodeId, OperatorRefusal, Rejection, Replace, Response,
+    Create, Grant, Install, NodeId, OperatorRefusal, Rejection, Replace, Response, Retire,
 };
 
 use super::{ClientError, Target, Transport, decode_answer, signed_operated};
@@ -186,6 +186,12 @@ impl Operator {
         every: bool,
     ) -> Result<Response, ClientError> {
         self.post(&format!("/agents/{}/reports", agent.0), &every.encode())
+    }
+
+    /// Retire a device kernel's previous release, at the agent's leader,
+    /// or a device format, at this node (`light-node.md` §4.4).
+    pub fn retire(&self, retire: &Retire) -> Result<Response, ClientError> {
+        self.post("/retire", &retire.encode())
     }
 
     /// Replace `agent`'s replica `remove` by node `add`, at its leader.

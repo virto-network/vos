@@ -37,8 +37,8 @@ fn timed(ok: bool, mut run: impl FnMut() -> bool) -> (Duration, Duration) {
 
 fn main() {
     let kernel = vos_testkit::programs::kernel("device", "auth");
-    let program = Program::auth(&kernel).expect("the kernel's program");
     let arguments = auth_reference();
+    let program = Program::install(&kernel, &arguments, 0).expect("the kernel's program");
     let public = &arguments[arguments.len() - vos_pvm_recair::device::AUTH_PUBLIC_BYTES..];
     let io = auth_io(public).expect("the io-hash");
     let (proof, _) = program

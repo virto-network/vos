@@ -268,7 +268,7 @@ fn kit() -> Kit {
 /// Minutes in place of days: a removal matures in two.
 fn policy() -> Policy {
     Policy {
-        removal_delay_ms: 2 * 60_000,
+        operation_delay_ms: 2 * 60_000,
         probation_ms: 60_000,
         ..Policy::DEFAULT
     }

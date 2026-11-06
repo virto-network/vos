@@ -43,7 +43,12 @@
 //! its table entry marked) calls Poseidon2's and never BLAKE2b's, so its
 //! shape holds neither BLAKE2b nor its AND table.
 //! Its schema kind is `Device`, and an auth guard's `device = "..."` must
-//! name one.
+//! name one. Each device kernel has a **reference program** beside it,
+//! linked as a device kernel from its `reference = path`'s entry (its
+//! table row marked [`REFERENCE`], its headroom in the word): run with no
+//! input, it returns the kernel's reference arguments, on which every node
+//! and every release sizes the kernel's device program. A device kernel
+//! without one, or a reference of no device kernel, is refused.
 //!
 //! **A step's pages fit a class:** a node cuts a kernel's run before a
 //! step, never inside one, so a step touching more pages than the shape's
@@ -119,6 +124,14 @@ const READS_SERVED: u64 = 1 << 32;
 /// (`vos_sdk::runtime::DEVICE`).
 const DEVICE: u64 = 1 << 33;
 
+/// The `VOS_ATTEST` entry's bit, beside [`DEVICE`], for a device kernel's
+/// reference run (`vos_sdk::runtime::REFERENCE`).
+const REFERENCE: u64 = 1 << 34;
+
+/// Where a reference's method word holds its kernel's headroom
+/// (`vos_sdk::runtime::HEADROOM_SHIFT`), eight bits.
+const HEADROOM_SHIFT: u32 = 40;
+
 /// The largest ELF a derivation reads: an install's body.
 pub use vos_wire::abi::cap::MAX_ELF;
 
@@ -145,6 +158,9 @@ pub struct Derived {
     pub shapes: Vec<vos_wire::records::Shape>,
     /// The device kernels' methods (`#[attestable(device)]`), ascending.
     pub devices: Vec<u32>,
+    /// Each device kernel's reference program and headroom, by its method
+    /// in ascending order: one a device kernel.
+    pub references: Vec<(u32, Vec<u8>, u8)>,
     pub schema: Vec<u8>,
     /// The pages of the actor's heap past its program's read-write data,
     /// which a workflow's machine maps there.
@@ -154,10 +170,15 @@ pub struct Derived {
 
 impl Derived {
     /// Its programs in the order a derivation names them: the actor's,
-    /// then each kernel's.
+    /// then each kernel's, then each reference's.
     pub fn programs(&self) -> Vec<Vec<u8>> {
         let mut programs = vec![self.actor.clone()];
         programs.extend(self.kernels.iter().map(|(_, kernel)| kernel.clone()));
+        programs.extend(
+            self.references
+                .iter()
+                .map(|(_, reference, _)| reference.clone()),
+        );
         programs
     }
 
@@ -169,6 +190,7 @@ impl Derived {
             &self.actor,
             &self.kernels,
             &self.shapes,
+            &self.references,
             self.transpiler_version,
             self.heap,
         )
@@ -191,6 +213,11 @@ pub enum DeriveError {
     NoSchema,
     #[error("the attestable methods' table: {0}")]
     Table(String),
+    #[error(
+        "device kernel {0:#010x} names no reference run: `#[attestable(device, reference = \
+         path)]`"
+    )]
+    NoReference(u32),
     #[error(
         "the heap's arena, `.vos_heap`, at {start:#x} for {size:#x} bytes, does not end the \
          read-write data at {end:#x} from a page: build with the guest's linker script"
@@ -251,8 +278,9 @@ pub fn derive(elf: &[u8]) -> Result<Derived, DeriveError> {
     let heap = invocation_heap(&mut linked)?;
     let actor = spi_blob(transpile_with(&linked, Link::Whole)?)?;
     let graph = Graph::new(&linked);
-    let entries = attestables(&linked)?;
+    let (entries, reference_entries) = attestables(&linked)?;
     kinds_as_declared(&schema, &entries)?;
+    references_as_declared(&entries, &reference_entries)?;
     let devices: Vec<u32> = entries
         .iter()
         .filter(|entry| entry.device)
@@ -262,6 +290,13 @@ pub fn derive(elf: &[u8]) -> Result<Derived, DeriveError> {
     let kernels: Vec<(u32, Vec<u8>)> = entries
         .into_iter()
         .map(|entry| Ok((entry.method, kernel(&graph, &entry)?)))
+        .collect::<Result<_, DeriveError>>()?;
+    let references = reference_entries
+        .into_iter()
+        .map(|entry| {
+            let headroom = entry.reference.expect("a reference entry");
+            Ok((entry.method, kernel(&graph, &entry)?, headroom))
+        })
         .collect::<Result<_, DeriveError>>()?;
     let shapes = kernels
         .iter()
@@ -289,10 +324,45 @@ pub fn derive(elf: &[u8]) -> Result<Derived, DeriveError> {
         kernels,
         shapes,
         devices,
+        references,
         schema,
         heap,
         transpiler_version: TRANSPILER_VERSION,
     })
+}
+
+/// Whether each device kernel has exactly one reference entry, each with a
+/// headroom of at most `MAX_HEADROOM`, and each reference entry is a
+/// device kernel's.
+fn references_as_declared(
+    entries: &[AttestEntry],
+    references: &[AttestEntry],
+) -> Result<(), DeriveError> {
+    if let Some(device) = entries.iter().filter(|entry| entry.device).find(|entry| {
+        !references
+            .iter()
+            .any(|reference| reference.method == entry.method)
+    }) {
+        return Err(DeriveError::NoReference(device.method));
+    }
+    for reference in references {
+        let method = reference.method;
+        if !entries
+            .iter()
+            .any(|entry| entry.method == method && entry.device)
+        {
+            return Err(DeriveError::Table(format!(
+                "method {method:#010x}'s reference run is no device kernel's"
+            )));
+        }
+        if reference.reference > Some(vos_wire::records::MAX_HEADROOM) {
+            return Err(DeriveError::Table(format!(
+                "method {method:#010x}'s headroom is past {}",
+                vos_wire::records::MAX_HEADROOM
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// That the prologue's one witness-input step, which writes its whole
@@ -419,13 +489,15 @@ fn devices_as_named(
 }
 
 /// An attestable method's entry in `VOS_ATTEST`: its id, its entry's
-/// address, what its kernel reads, and whether it is a device kernel's.
+/// address, what its kernel reads, whether it is a device kernel's, and
+/// for a device kernel's reference run, its headroom.
 #[derive(Clone, Copy, Debug)]
 struct AttestEntry {
     method: u32,
     entry: u64,
     input: Input,
     device: bool,
+    reference: Option<u8>,
 }
 
 /// What a kernel reads through its witness input: its arguments alone, or
@@ -472,16 +544,17 @@ impl Input {
 }
 
 /// The ELF's attestable methods, their entries, what their kernels read and
-/// which are device kernels', from its `VOS_ATTEST` table, by method id:
-/// none without the table.
-fn attestables(elf: &LinkedElf) -> Result<Vec<AttestEntry>, DeriveError> {
+/// which are device kernels', from its `VOS_ATTEST` table, by method id,
+/// then its device kernels' reference runs, likewise: none without the
+/// table.
+fn attestables(elf: &LinkedElf) -> Result<(Vec<AttestEntry>, Vec<AttestEntry>), DeriveError> {
     let table = |why: &str| DeriveError::Table(why.to_string());
     let Some(symbol) = elf
         .symbols
         .iter()
         .find(|symbol| name_is(&elf.names, symbol.name, b"VOS_ATTEST"))
     else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     };
     if !symbol.size.is_multiple_of(ATTEST_ENTRY) {
         return Err(table("its size is no whole number of entries"));
@@ -514,13 +587,17 @@ fn attestables(elf: &LinkedElf) -> Result<Vec<AttestEntry>, DeriveError> {
         let word = u64::from_le_bytes(entry[..8].try_into().expect("eight bytes"));
         let raw = u64::from_le_bytes(entry[8..].try_into().expect("eight bytes"));
         let address = relocated.get(&entry_at(index)).copied().unwrap_or(raw);
-        let (input, device) = match word & !u64::from(u32::MAX) {
-            0 => (Input::Arguments, false),
-            READS_SERVED => (Input::Served, false),
-            DEVICE => (Input::Arguments, true),
+        let headroom = (word >> HEADROOM_SHIFT) as u8;
+        let (input, device, reference) = match word & !u64::from(u32::MAX) {
+            0 => (Input::Arguments, false, None),
+            READS_SERVED => (Input::Served, false, None),
+            DEVICE => (Input::Arguments, true, None),
+            bits if bits & !(0xff << HEADROOM_SHIFT) == DEVICE | REFERENCE => {
+                (Input::Arguments, true, Some(headroom))
+            }
             _ => {
                 return Err(table(
-                    "a method word past its id and one of its served and device bits",
+                    "a method word past its id and one of its served, device and reference bits",
                 ));
             }
         };
@@ -528,19 +605,25 @@ fn attestables(elf: &LinkedElf) -> Result<Vec<AttestEntry>, DeriveError> {
         if !in_ranges(&elf.code_ranges, address) {
             return Err(table(&format!("method {method:#010x}'s entry is no code")));
         }
-        if entries.insert(method, (address, input, device)).is_some() {
+        let entry = AttestEntry {
+            method,
+            entry: address,
+            input,
+            device,
+            reference,
+        };
+        if entries
+            .insert((reference.is_some(), method), entry)
+            .is_some()
+        {
             return Err(table(&format!("method {method:#010x} has two entries")));
         }
     }
-    Ok(entries
+    let (references, kernels): (Vec<_>, Vec<_>) = entries
         .into_iter()
-        .map(|(method, (entry, input, device))| AttestEntry {
-            method,
-            entry,
-            input,
-            device,
-        })
-        .collect())
+        .partition(|((reference, _), _)| *reference);
+    let entries = |entries: Vec<(_, AttestEntry)>| entries.into_iter().map(|(_, entry)| entry);
+    Ok((entries(kernels).collect(), entries(references).collect()))
 }
 
 #[cfg(test)]
@@ -709,6 +792,34 @@ mod tests {
         }
     }
 
+    /// A device kernel has exactly one reference, of a headroom of at most
+    /// four, and a reference is a device kernel's.
+    #[test]
+    fn a_device_kernel_has_one_reference() {
+        let kernel = entry(0x1000, true);
+        let reference = AttestEntry {
+            reference: Some(1),
+            ..entry(0x2000, true)
+        };
+        assert!(references_as_declared(&[kernel], &[reference]).is_ok());
+        assert!(matches!(
+            references_as_declared(&[kernel], &[]),
+            Err(DeriveError::NoReference(7))
+        ));
+        assert!(matches!(
+            references_as_declared(&[entry(0x1000, false)], &[reference]),
+            Err(DeriveError::Table(_))
+        ));
+        let wide = AttestEntry {
+            reference: Some(5),
+            ..reference
+        };
+        assert!(matches!(
+            references_as_declared(&[kernel], &[wide]),
+            Err(DeriveError::Table(_))
+        ));
+    }
+
     /// Method 7's entry at `at`, a device kernel's or a node's.
     fn entry(at: u64, device: bool) -> AttestEntry {
         AttestEntry {
@@ -716,6 +827,7 @@ mod tests {
             entry: at,
             input: Input::Arguments,
             device,
+            reference: None,
         }
     }
 }

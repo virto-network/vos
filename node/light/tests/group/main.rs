@@ -32,7 +32,7 @@ const NOTES: Scope = [0x6e; 16];
 /// A test home's policy: minutes, not days.
 fn policy() -> Policy {
     Policy {
-        removal_delay_ms: 10 * MIN,
+        operation_delay_ms: 10 * MIN,
         probation_ms: 5 * MIN,
         confirm_window_ms: 30 * MIN,
         ..Policy::DEFAULT
@@ -536,7 +536,7 @@ fn without_valid_evidence_no_device_moves() {
         [0x5a; 64],
         None,
     );
-    home.pass(policy().removal_delay_ms);
+    home.pass(policy().operation_delay_ms);
     phones[0].alive(&mut home);
     phones[1].alive(&mut home);
     settle(&mut home, &mut all(&mut phones[..2]));
@@ -672,7 +672,7 @@ fn two_attacker_devices_are_removed_by_one_commit() {
     );
     agree(&mut all(owners), 3);
 
-    home.pass(policy().removal_delay_ms);
+    home.pass(policy().operation_delay_ms);
     owners[0].alive(&mut home);
     owners[1].alive(&mut home);
     for attacker in attackers.iter_mut() {

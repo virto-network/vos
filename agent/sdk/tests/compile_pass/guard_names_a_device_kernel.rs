@@ -17,10 +17,15 @@ impl Poll {
         self.votes += 1;
     }
 
-    #[attestable(device)]
+    /// Sized on a run of its reference, with a size's headroom.
+    #[attestable(device, reference = reference, headroom = 1)]
     pub fn proof(#[public] root: [u8; 32]) {
         let _ = root;
     }
+}
+
+fn reference() -> poll::Proof {
+    poll::Proof { root: [0; 32] }
 }
 
 fn main() {}

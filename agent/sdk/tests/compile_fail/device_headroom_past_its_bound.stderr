@@ -1,0 +1,5 @@
+error: a device kernel's headroom is at most 4
+  --> tests/compile_fail/device_headroom_past_its_bound.rs:15:49
+   |
+15 |     #[attestable(device, reference = reference, headroom = 5)]
+   |                                                 ^^^^^^^^^^^^

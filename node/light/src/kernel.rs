@@ -6,9 +6,12 @@
 
 use vos_pvm_recair::device::{self as profile, Program};
 use vos_wire::credentials::Words;
+use vos_wire::ids::MethodId;
+use vos_wire::ingress::DeviceWindow;
 use zeroize::Zeroize;
 
 use crate::prover::auth_digests;
+use crate::release::Device;
 use crate::secret::DeviceSecret;
 use crate::{AuthWitness, Call, CredentialProof, CredentialPublic, DeviceError, Prover, scope};
 
@@ -28,21 +31,30 @@ pub struct DeviceProgram(Program);
 
 impl DeviceProgram {
     /// Kernel `kernel`'s program, its log sizes those its run on
-    /// `reference` needs: [`DeviceError::Prove`] when the kernel does not
-    /// run to its halt on it, or needs more than the format's shape.
-    pub fn install(kernel: &[u8], reference: &[u8]) -> Result<Self, DeviceError> {
-        Program::install(kernel, reference)
+    /// `reference` needs, each raised by `headroom`: [`DeviceError::Prove`]
+    /// when the kernel does not run to its halt on it, or needs more than
+    /// the format's shape. A test's, or a bench's: the light node takes its
+    /// programs as release artifacts ([`DeviceProgram::released`]).
+    pub fn install(kernel: &[u8], reference: &[u8], headroom: u8) -> Result<Self, DeviceError> {
+        Program::install(kernel, reference, headroom)
             .map(Self)
             .map_err(|_| DeviceError::Prove)
     }
 
-    /// The program of a device kernel of auth's statement, as a space's
-    /// ingress computes it from the installed kernel: its reference run on
-    /// auth's public reference statement.
-    pub fn auth(kernel: &[u8]) -> Result<Self, DeviceError> {
-        Program::auth(kernel)
-            .map(Self)
-            .map_err(|_| DeviceError::Prove)
+    /// The program a release artifact names: its preprocessed tree
+    /// committed from the kernel at the artifact's chips and log sizes, no
+    /// reference run and no transpiler; [`DeviceError::Prove`] when that is
+    /// no program of the device format, or its id is not the artifact's.
+    pub fn released(device: &Device) -> Result<Self, DeviceError> {
+        if device.format != DEVICE_FORMAT {
+            return Err(DeviceError::Prove);
+        }
+        let program = Program::released(&device.kernel, device.chips, &device.log_sizes)
+            .map_err(|_| DeviceError::Prove)?;
+        if *program.id() != device.id {
+            return Err(DeviceError::Prove);
+        }
+        Ok(Self(program))
     }
 
     /// Its id, which a binding names.
@@ -70,6 +82,43 @@ impl DeviceProgram {
             .verify(&proof.io, &proof.proof)
             .map_err(|_| DeviceError::Verify)
     }
+}
+
+/// The newest of `shipped`, the release artifacts a light node ships for
+/// device kernel `method`, that a space's `window` admits: its program id
+/// among the kernel's admitted programs, its format among the admitted
+/// formats. [`DeviceError::Window`] when it admits none: the app or the
+/// space must update, and nothing is proved; [`DeviceError::Unavailable`]
+/// when it admits none of them yet but the node could not compute one of
+/// the window's programs: ask again, or another replica. `shipped` is
+/// newest first.
+pub fn choose<'a>(
+    shipped: &'a [Device],
+    window: &DeviceWindow,
+    method: MethodId,
+) -> Result<&'a Device, DeviceError> {
+    let admitted = window
+        .kernels
+        .iter()
+        .find(|kernel| kernel.method == method)
+        .ok_or(DeviceError::Window)?;
+    shipped
+        .iter()
+        .filter(|device| device.method == method)
+        .find(|device| {
+            window
+                .formats
+                .iter()
+                .any(|format| format.format == device.format)
+                && admitted
+                    .programs
+                    .iter()
+                    .any(|program| program.id == device.id && program.format == device.format)
+        })
+        .ok_or(match admitted.unavailable {
+            true => DeviceError::Unavailable,
+            false => DeviceError::Window,
+        })
 }
 
 /// The io-hash a device kernel of auth's statement states for its public
@@ -196,4 +245,130 @@ pub fn verify_device(
         .0
         .verify(&io, &proof.proof)
         .map_err(|_| DeviceError::Verify)
+}
+
+#[cfg(test)]
+mod tests {
+    use vos_wire::ingress::{FormatWindow, KernelWindow, ProgramWindow};
+
+    use super::*;
+
+    const AUTH: MethodId = MethodId(7);
+
+    /// A release artifact of `AUTH` whose program id is `id`, in `format`.
+    fn shipped(id: u8, format: u32) -> Device {
+        Device {
+            elf: [id; 32],
+            method: AUTH,
+            kernel: Vec::new(),
+            format,
+            chips: 0,
+            log_sizes: Vec::new(),
+            id: [id; 32],
+        }
+    }
+
+    /// A window admitting `programs` of `AUTH`, each in its format, and the
+    /// formats `formats`.
+    fn window(programs: &[(u8, u32)], formats: &[u32]) -> DeviceWindow {
+        DeviceWindow {
+            formats: formats
+                .iter()
+                .map(|&format| FormatWindow {
+                    format,
+                    retires_ms: None,
+                })
+                .collect(),
+            kernels: vec![KernelWindow {
+                unavailable: false,
+                method: AUTH,
+                programs: programs
+                    .iter()
+                    .map(|&(id, format)| ProgramWindow {
+                        id: [id; 32],
+                        format,
+                        retires_ms: None,
+                    })
+                    .collect(),
+            }],
+        }
+    }
+
+    /// The newest program the app ships that the window admits, in a format
+    /// it admits; none admitted, or no window for the kernel, is
+    /// `DeviceError::Window`, before anything is proved.
+    #[test]
+    fn the_newest_admitted_program_is_chosen() {
+        let app = [shipped(2, DEVICE_FORMAT), shipped(1, DEVICE_FORMAT)];
+        let id = |window: &DeviceWindow| choose(&app, window, AUTH).map(|device| device.id[0]);
+        let format = DEVICE_FORMAT;
+        assert_eq!(id(&window(&[(2, format), (1, format)], &[format])), Ok(2));
+        assert_eq!(id(&window(&[(1, format)], &[format])), Ok(1));
+        assert_eq!(id(&window(&[(3, format), (2, format)], &[format])), Ok(2));
+        assert_eq!(
+            id(&window(&[(3, format)], &[format])),
+            Err(DeviceError::Window),
+            "the app is behind"
+        );
+        assert_eq!(
+            id(&window(&[(2, format)], &[])),
+            Err(DeviceError::Window),
+            "its format retired"
+        );
+        assert_eq!(
+            id(&window(&[(2, format + 1)], &[format, format + 1])),
+            Err(DeviceError::Window),
+            "the program in another format"
+        );
+        let mut pending = window(&[(3, format)], &[format]);
+        pending.kernels[0].unavailable = true;
+        assert_eq!(
+            id(&pending),
+            Err(DeviceError::Unavailable),
+            "a program the node holds not yet"
+        );
+        assert_eq!(
+            choose(&app, &window(&[(2, format)], &[format]), MethodId(8)).map(|_| ()),
+            Err(DeviceError::Window),
+            "no window for the kernel"
+        );
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use scale::Encode;
+    use vos_wire::ingress::{FormatWindow, KernelWindow, ProgramWindow};
+
+    use super::*;
+
+    /// A `Devices` request is its kind's bytes then the agent and the
+    /// instance; its answer decodes as the node encodes it.
+    #[test]
+    fn a_devices_request_and_its_answer() {
+        let request = crate::wire::devices_request(5, 9);
+        assert_eq!(&request[..2], &0x0005u16.to_le_bytes());
+        assert_eq!(&request[2..], &[5, 0, 0, 0, 9, 0, 0, 0]);
+        let window = DeviceWindow {
+            formats: vec![FormatWindow {
+                format: DEVICE_FORMAT,
+                retires_ms: Some(7),
+            }],
+            kernels: vec![KernelWindow {
+                method: MethodId(3),
+                programs: vec![ProgramWindow {
+                    id: [1; 32],
+                    format: DEVICE_FORMAT,
+                    retires_ms: None,
+                }],
+                unavailable: false,
+            }],
+        };
+        assert_eq!(
+            crate::wire::devices_answer(&Some(window.clone()).encode()),
+            Ok(Some(window))
+        );
+        assert_eq!(crate::wire::devices_answer(&[0]), Ok(None));
+        assert_eq!(crate::wire::devices_answer(&[2]), Err(DeviceError::Decode));
+    }
 }

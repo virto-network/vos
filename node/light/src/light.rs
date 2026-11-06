@@ -87,6 +87,9 @@ pub enum Error {
     Refused,
     /// A package whose programs are not its derivation's.
     Package,
+    /// A package another transpiler's version derived: its programs are
+    /// not the ones this light node's release names.
+    Transpiler(u32),
     /// The agent program's work result does not apply to the state it was
     /// refined on: the agent program's fault.
     NotApplied,
@@ -127,6 +130,11 @@ impl std::fmt::Display for Error {
             Error::Fault(fault) => f.write_str(fault.message()),
             Error::Refused => f.write_str("the agent refused the operation"),
             Error::Package => f.write_str("the package's programs are not its derivation's"),
+            Error::Transpiler(version) => write!(
+                f,
+                "the package is transpiler {version}'s, not {}'s",
+                crate::release::TRANSPILER
+            ),
             Error::NotApplied => f.write_str("the operation's result does not apply"),
             Error::NotInstalled => f.write_str("the instance is not installed"),
         }
@@ -233,6 +241,9 @@ impl Light {
         package: &Package,
         roles: Vec<(Vec<u8>, u8)>,
     ) -> Result<Outcome, Error> {
+        if package.derivation.transpiler != crate::release::TRANSPILER {
+            return Err(Error::Transpiler(package.derivation.transpiler));
+        }
         let programs = package.checked().ok_or(Error::Package)?;
         for (_, program) in &programs {
             self.machines

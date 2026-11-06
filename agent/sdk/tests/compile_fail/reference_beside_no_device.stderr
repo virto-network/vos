@@ -1,0 +1,5 @@
+error: only an #[attestable(device)] method takes `reference = path` and `headroom = k`: they size a device kernel's program
+  --> tests/compile_fail/reference_beside_no_device.rs:15:30
+   |
+15 |     #[attestable(reference = reference)]
+   |                              ^^^^^^^^^

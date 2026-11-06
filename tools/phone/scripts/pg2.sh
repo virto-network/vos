@@ -7,7 +7,8 @@
 # actor installed, a member enrolled. For each round (3 by default) it
 # writes the device kernel's witness input for a sign-in to the device
 # actor's `login`, good for 110 s by the node's clock; the phone proves it
-# with `vos-phone kernel` (the device library's `DeviceProgram::auth` and
+# with `vos-phone kernel` (the device library's `DeviceProgram::released`
+# on the kernel's release artifact, and
 # `Prover::prove_kernel`, the device format, automatic threads), verifies it there
 # and writes its bytes; the host pulls them and sends them to the node's
 # ingress, which must run the call as the member's pseudonym. Battery,
@@ -64,17 +65,17 @@ wait_file() {
   target/release/examples/device_ingress "$host" --rounds "$rounds" --wait 110 \
     > "$host/rounds.jsonl" 2> "$host/host.log" &
   node=$!
-  wait_file "$host/auth.kernel"
+  wait_file "$host/auth.device"
   push "$phone" vos-phone
-  push "$host/auth.kernel" auth.kernel
+  push "$host/auth.device" auth.device
   on_phone chmod 755 vos-phone
-  on_phone sha256sum vos-phone auth.kernel
+  on_phone sha256sum vos-phone auth.device
   n=1
   while [ $n -le "$rounds" ]; do
     echo "== round $n"; date; state
     wait_file "$host/$n.input"
     push "$host/$n.input" "$n.input"
-    on_phone ./vos-phone kernel --kernel auth.kernel --input "$n.input" --out "$n.proof" \
+    on_phone ./vos-phone kernel --device auth.device --input "$n.input" --out "$n.proof" \
       || echo "the phone's prove: exit=$?"
     pull "$n.proof" "$host/$n.part" && mv "$host/$n.part" "$host/$n.proof"
     n=$((n + 1))

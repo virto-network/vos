@@ -17,10 +17,14 @@ impl Poll {
         ctx.attest(poll::Proof { root }).await.is_ok()
     }
 
-    #[attestable(device)]
+    #[attestable(device, reference = reference)]
     pub fn proof(#[public] root: [u8; 32]) {
         let _ = root;
     }
+}
+
+fn reference() -> poll::Proof {
+    poll::Proof { root: [0; 32] }
 }
 
 fn main() {}

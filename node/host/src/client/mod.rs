@@ -15,8 +15,8 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use vos_wire::ids::{AgentId, Principal, Session};
-use vos_wire::ingress::{AgentInfo, Contact, Credentialed, NodeId, Response};
+use vos_wire::ids::{AgentId, InstanceId, Principal, Session};
+use vos_wire::ingress::{AgentInfo, Contact, Credentialed, DeviceWindow, NodeId, Response};
 use vos_wire::{Decode, Encode};
 
 use crate::lock;
@@ -120,6 +120,23 @@ pub fn node_id(target: &Target) -> Result<NodeId, ClientError> {
 /// `None` when it knows no such agent.
 pub fn agent_info(target: &Target, agent: AgentId) -> Result<Option<AgentInfo>, ClientError> {
     Transport::new(target).agent_info(agent)
+}
+
+/// The device window of `instance` of `agent`, as the node holds it:
+/// `None` when it holds no such instance.
+pub fn devices(
+    target: &Target,
+    agent: AgentId,
+    instance: InstanceId,
+) -> Result<Option<DeviceWindow>, ClientError> {
+    let path = format!("/agents/{}/instances/{}/devices", agent.0, instance.0);
+    let (status, body) = Transport::new(target).get(&path, None)?;
+    match status {
+        404 => Ok(None),
+        _ => DeviceWindow::decode_exact(&body)
+            .map(Some)
+            .ok_or(ClientError::Undecodable(status)),
+    }
 }
 
 impl Transport {

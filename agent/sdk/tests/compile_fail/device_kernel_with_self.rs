@@ -14,10 +14,12 @@ impl Counter {
     }
 
     /// A device reads no root: a device kernel takes no `self`.
-    #[attestable(device)]
+    #[attestable(device, reference = reference)]
     pub fn entry(&self, key: u32) -> u64 {
         self.entries.get(&key).unwrap_or(0)
     }
 }
+
+fn reference() {}
 
 fn main() {}

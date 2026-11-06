@@ -173,6 +173,7 @@ pub(crate) fn input() -> impl Strategy<Value = Input> {
                             elf,
                             transpiler,
                             heap,
+                            references: Vec::new(),
                         },
                         roles,
                         target,

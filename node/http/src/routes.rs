@@ -114,6 +114,12 @@ pub fn route(request: &Request) -> Routed {
                 _ => Routed::Answer(Response::not_found()),
             }
         }
+        ("GET", ["agents", id, "instances", instance, "devices"]) => {
+            match (agent(id), instance.parse::<u32>()) {
+                (Some(agent), Ok(instance)) => to(Kind::Devices, Ok((agent, instance).encode())),
+                _ => Routed::Answer(Response::not_found()),
+            }
+        }
         ("POST", ["agents", id, "calls"]) => to(Kind::Call, agent_and(id, body)),
         ("POST", ["agents", id, "queries"]) => to(Kind::Query, agent_and(id, body)),
         ("POST", ["agents", id, "workflows"]) => to(Kind::Workflow, agent_and(id, body)),
@@ -126,6 +132,7 @@ pub fn route(request: &Request) -> Routed {
         ("POST", ["agents", id, "replicas"]) => operator(Kind::Replace, agent_and(id, body)),
         ("POST", ["agents", id, "roles"]) => operator(Kind::Grant, agent_and(id, body)),
         ("POST", ["agents", id, "reports"]) => operator(Kind::Reports, agent_and(id, body)),
+        ("POST", ["retire"]) => operator(Kind::Retire, Ok(body.clone())),
         _ => Routed::Answer(Response::not_found()),
     }
 }
@@ -209,7 +216,7 @@ pub fn answer(kind: u16, body: &[u8]) -> Response {
     }
     match Kind::from_u16(kind) {
         Some(Kind::NodeKey | Kind::Time) => Response::new(200, body.to_vec()),
-        Some(Kind::AgentInfo | Kind::Schema) => match body.split_first() {
+        Some(Kind::AgentInfo | Kind::Schema | Kind::Devices) => match body.split_first() {
             Some((0, [])) => Response::not_found(),
             Some((1, value)) => Response::new(200, value.to_vec()),
             _ => unreadable(),

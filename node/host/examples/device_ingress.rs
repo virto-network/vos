@@ -1,14 +1,16 @@
 //! A device proof accepted at a space's ingress (`proving.md` §8), the
 //! host's side: one node of a founded space, the credential actor and the device actor installed, a member
 //! enrolled; for each round a sign-in to the device actor's `login`, whose
-//! guard names its device kernel `auth`. The kernel and each round's
-//! witness input are written for a prover, the proof it writes back is
+//! guard names its device kernel `auth`. The kernel's release artifact and
+//! each round's witness input are written for a prover, the proof it writes back is
 //! sent to the node's ingress as a `Credentialed` request under the device
 //! format, and the answer printed.
 //!
 //! `cargo run --release -p vos-node --example device_ingress -- DIR
 //! [--rounds N] [--wait S] [--prove]`:
-//! - writes `DIR/auth.kernel`, the installed kernel, then for round `n`
+//! - writes `DIR/auth.device`, the kernel's release artifact (the kernel
+//!   and its device program as the install computes it, the device
+//!   library's `release::Device`), then for round `n`
 //!   `DIR/n.input`, the kernel's witness input (the member's path, its
 //!   secret, its slot, and auth's public arguments for this round's call,
 //!   good for 110 s by the node's clock);
@@ -265,10 +267,15 @@ fn wait_for(path: &Path, wait: Duration) -> Option<Vec<u8>> {
 fn main() {
     let options = options();
     std::fs::create_dir_all(&options.dir).expect("the directory");
-    let kernel = vos_testkit::programs::kernel("device", "auth");
-    let program = DeviceProgram::auth(&kernel).expect("the kernel's program");
+    let device = vos_light::release::device(&package("device"), "auth")
+        .expect("the kernel's release artifact");
+    let program = DeviceProgram::released(&device).expect("the kernel's program");
     let served = start();
-    std::fs::write(options.dir.join("auth.kernel"), &kernel).expect("the kernel written");
+    std::fs::write(
+        options.dir.join("auth.device"),
+        vos_wire::Encode::encode(&device),
+    )
+    .expect("the release artifact written");
     let prover = options.prove.then(|| {
         Prover::new(ProverConfig {
             threads: Threads::Auto,

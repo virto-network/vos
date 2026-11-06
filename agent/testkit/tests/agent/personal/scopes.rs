@@ -149,7 +149,7 @@ fn quotas_bound_pushes_and_exempt_what_removes_a_device() {
         envelopes_per_day: 12,
         commits_per_day: 3,
         probation_ms: HOUR_MS,
-        removal_delay_ms: HOUR_MS,
+        operation_delay_ms: HOUR_MS,
         ..Policy::DEFAULT
     };
     let mut home = Home::with(policy);

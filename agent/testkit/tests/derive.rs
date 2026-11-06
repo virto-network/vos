@@ -539,6 +539,12 @@ fn a_device_kernel_states_its_parts_under_the_poseidon2_io_hash() {
     let auth = schema.method_id("auth").unwrap();
     assert_eq!(schema.method(auth).unwrap().kind, Kind::Device);
     assert_eq!(derived.devices, vec![auth.0]);
+    let references: Vec<(u32, u8)> = derived
+        .references
+        .iter()
+        .map(|(method, _, headroom)| (*method, *headroom))
+        .collect();
+    assert_eq!(references, [(auth.0, 0)], "its reference program");
     let kernel = &derived
         .kernels
         .iter()

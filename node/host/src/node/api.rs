@@ -288,6 +288,39 @@ impl Node {
         })
     }
 
+    /// Retire device kernel `method`'s previous release in `instance` of
+    /// `agent` at `at_ms`, if that is earlier than its date (now included):
+    /// answered with the date kept, if one is, encoded.
+    pub fn retire(
+        &self,
+        agent: AgentId,
+        instance: InstanceId,
+        method: MethodId,
+        at_ms: u64,
+    ) -> impl Future<Output = Result<Reply, CallError>> + use<> {
+        let inner = Arc::clone(&self.inner);
+        self.inner.runtime.spawn(async move {
+            inner
+                .admin(
+                    agent,
+                    Admin::Retire {
+                        instance,
+                        method,
+                        at_ms,
+                    },
+                )
+                .await
+                .map(|answered| answered.reply)
+        })
+    }
+
+    /// Retire device format `format` at this node at `at_ms`, if that is
+    /// earlier than its date (now included): the date kept, or `None` for
+    /// a format this node does not verify.
+    pub fn retire_format(&self, format: u32, at_ms: u64) -> Option<u64> {
+        self.inner.calls.devices.retire_format(format, at_ms)
+    }
+
     /// A client request to `agent`, answered once its step is applied here.
     pub fn call(
         &self,

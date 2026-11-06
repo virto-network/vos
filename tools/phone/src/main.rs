@@ -16,13 +16,14 @@
 //!   a child process of its own; the kernels and their witness inputs read
 //!   from DIR (default `kernels` beside the binary).
 //!
-//! - `vos-phone kernel --kernel PATH --input PATH --out PATH [--threads auto|N]`:
+//! - `vos-phone kernel --device PATH --input PATH --out PATH [--threads auto|N]`:
 //!   a device kernel of auth's statement proved as the device library
-//!   proves it for a space's ingress (`DeviceProgram::auth`, the program
-//!   ingress computes from the installed kernel; `Prover::prove_kernel`,
-//!   format 46), on its witness input, verified here against the io-hash
-//!   of the input's last 129 bytes, auth's public arguments; the proof's
-//!   bytes written to `--out`, one `kernel` line.
+//!   proves it for a space's ingress, from its release artifact
+//!   (`release::Device`, the program ingress computes from the installed
+//!   kernel, computed at release: `DeviceProgram::released`;
+//!   `Prover::prove_kernel`, format 46), on its witness input, verified
+//!   here against the io-hash of the input's last 129 bytes, auth's public
+//!   arguments; the proof's bytes written to `--out`, one `kernel` line.
 //!
 //! - `vos-phone light --store DIR [--calls N] [--check]`: the light node
 //!   (`light.rs`): a local actor installed from the release artifacts the
@@ -57,6 +58,7 @@ use vos_light::{
     AuthWitness, Call, Digest, Prover, ProverConfig, Threads, derive_secret, member, verify,
     verify_joint,
 };
+use vos_wire::Decode;
 use vos_wire::credentials::{leaf, root_of};
 
 mod device;
@@ -459,12 +461,18 @@ fn verify_dir(dir: &str) {
 /// space's ingress, as the device library proves it, verified, its bytes
 /// written.
 fn kernel(args: &[String]) {
-    let (mut kernel, mut input, mut out, mut threads) = (None, None, None, Threads::Auto);
+    let (mut device, mut input, mut out, mut threads) = (None, None, None, Threads::Auto);
     let mut args = args.iter();
     while let Some(flag) = args.next() {
         let value = args.next().expect("a flag's value");
         match flag.as_str() {
-            "--kernel" => kernel = Some(std::fs::read(value).expect("the kernel")),
+            "--device" => {
+                let bytes = std::fs::read(value).expect("the device artifact");
+                device = Some(
+                    vos_light::release::Device::decode_exact(&bytes)
+                        .expect("a device kernel's release artifact"),
+                );
+            }
             "--input" => input = Some(std::fs::read(value).expect("the witness input")),
             "--out" => out = Some(PathBuf::from(value)),
             "--threads" => {
@@ -476,7 +484,7 @@ fn kernel(args: &[String]) {
             other => panic!("unknown flag {other}"),
         }
     }
-    let (kernel, input) = (kernel.expect("--kernel"), input.expect("--input"));
+    let (device, input) = (device.expect("--device"), input.expect("--input"));
     let out = out.expect("--out");
     let prover = Prover::new(ProverConfig {
         threads,
@@ -484,7 +492,7 @@ fn kernel(args: &[String]) {
     })
     .expect("a prover");
     let started = Instant::now();
-    let program = vos_light::DeviceProgram::auth(&kernel).expect("the kernel's program");
+    let program = vos_light::DeviceProgram::released(&device).expect("the kernel's program");
     let install = started.elapsed();
     let started = Instant::now();
     let proof = prover
@@ -530,7 +538,7 @@ fn main() {
             eprintln!(
                 "vos-phone run [--reps N] [--threads auto|N] [--cells LIST] [--grind N] [--out DIR] | verify DIR \
                  | device [--kernels DIR] [--cells LIST] [--reps N] [--warmups N] [--threads auto|N] [--out DIR] \
-                 | kernel --kernel PATH --input PATH --out PATH [--threads auto|N] \
+                 | kernel --device PATH --input PATH --out PATH [--threads auto|N] \
                  | light --store DIR [--calls N] [--check] \
                  | group --dir DIR [--devices 3,8] [--rounds N]"
             );

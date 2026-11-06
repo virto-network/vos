@@ -8,9 +8,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use vos_api::{Kind, Operated};
+use vos_wire::Encode;
 use vos_wire::batch::Admin;
 use vos_wire::ids::AgentId;
-use vos_wire::ingress::{Create, Grant, Install, OperatorRefusal, Rejection, Replace, Response};
+use vos_wire::ingress::{
+    Create, Grant, Install, OperatorRefusal, Rejection, Replace, Response, Retire,
+};
+use vos_wire::result::Outcome;
 
 use super::{Api, decode};
 use crate::calls::answer_of;
@@ -39,6 +43,7 @@ pub(super) enum Command {
     Replace(AgentId, Replace),
     Grant(AgentId, Grant),
     Reports(AgentId, bool),
+    Retire(Retire),
 }
 
 /// A `Create` from an operator's body: an empty one is the default.
@@ -88,6 +93,7 @@ pub(super) async fn parse(inner: &Inner, kind: Kind, body: Vec<u8>) -> Result<Co
             let (agent, every) = decode(&body)?;
             Command::Reports(agent, every)
         }
+        Kind::Retire => Command::Retire(decode(&body)?),
         _ => return Err(Response::Rejected(Rejection::Malformed)),
     })
 }
@@ -121,6 +127,34 @@ pub(super) async fn run(inner: &Arc<Inner>, command: Command) -> Response {
         Command::Grant(agent, grant) => answer_of(inner.admin(agent, Admin::SetRole(grant)).await),
         Command::Reports(agent, every) => {
             answer_of(inner.admin(agent, Admin::ReportEveryWindow(every)).await)
+        }
+        Command::Retire(Retire::Previous {
+            agent,
+            instance,
+            method,
+            at_ms,
+        }) => answer_of(
+            inner
+                .admin(
+                    agent,
+                    Admin::Retire {
+                        instance,
+                        method,
+                        at_ms,
+                    },
+                )
+                .await,
+        ),
+        // The node's own window: its outcome the date kept, applied at no
+        // index of any agent's.
+        Command::Retire(Retire::Format { format, at_ms }) => {
+            match inner.calls.devices.retire_format(format, at_ms) {
+                Some(date) => Response::Ran {
+                    outcome: Outcome::Done(Some(date).encode()),
+                    at: 0,
+                },
+                None => Response::Rejected(Rejection::Malformed),
+            }
         }
     }
 }

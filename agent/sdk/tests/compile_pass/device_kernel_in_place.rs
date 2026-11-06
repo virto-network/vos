@@ -18,10 +18,25 @@ impl Kernels {
     }
 
     /// Arguments by reference first, read in place, then one by value.
-    #[attestable(device)]
+    #[attestable(device, reference = reference)]
     pub fn member(path: &Path, secret: &Secret, #[public] claim: &Claim, tag: u32) {
         let _ = tag;
         assert_eq!(path.root(&Tag::Member.hash(secret)), claim.map_root);
+    }
+}
+
+fn reference() -> kernels::Member {
+    kernels::Member {
+        path: Path {
+            siblings: [Digest::default(); vos_sdk::p2::DEPTH],
+            slot: 0,
+        },
+        secret: Digest::default(),
+        claim: Claim {
+            map_root: Digest::default(),
+            binding: Digest::default(),
+        },
+        tag: 0,
     }
 }
 

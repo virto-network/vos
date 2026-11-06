@@ -3,15 +3,17 @@
 //! program under format 46, its id, a proof's bytes, and the auth
 //! statement's arguments and io-hash.
 //!
-//! - **The program** ([`Program`]) is computed from the kernel alone: the
-//!   chips its code reaches (`device_chips_of_code`), and a log size each
-//!   that a reference run needs, at least the masking's floor and at most
-//!   `DEVICE_MAX_LOG_SIZE`; its preprocessed root committed then. A
-//!   kernel that authorizes as auth's credential does ([`Program::auth`])
-//!   takes [`auth_reference`] as its reference run's arguments, so every
-//!   node computes the same program from the installed kernel, and the
-//!   device the same from the same kernel: nothing of the program is taken
-//!   from a request.
+//! - **The program** ([`Program`]) is computed from the kernel's release
+//!   alone (`vos_wire::records::DeviceRelease`): the chips its code reaches
+//!   (`device_chips_of_code`), and a log size each that its reference run
+//!   needs, raised by its headroom, at least the masking's floor and at
+//!   most `DEVICE_MAX_LOG_SIZE`; its preprocessed root committed then. The
+//!   reference run's arguments are what the kernel's reference program
+//!   returns ([`reference_arguments`]), so every node computes the same
+//!   program from the installed kernel, and a release the same from the
+//!   same package: nothing of the program is taken from a request. A
+//!   release embeds the program's shape ([`Program::released`]), so a
+//!   device runs neither the reference nor the transpiler.
 //! - **The trace is the program's shape:** the prover pads every chip to
 //!   the program's log sizes and refuses a run that needs more, so a
 //!   branch-free kernel proves every witness under one program, its
@@ -58,6 +60,11 @@ pub const MAX_PROOF_BYTES: usize = 1536 << 10;
 /// bounds no memory.
 pub const GAS: u64 = 2 << vos_pvm_proof::device::DEVICE_MAX_LOG_SIZE;
 
+/// The most gas a reference program's run takes, 2^22: it is never
+/// proved, and returns a kernel's whole arguments, so it hashes them into
+/// its io-hash beside what it computes.
+pub const REFERENCE_GAS: u64 = 1 << 22;
+
 /// The bytes of auth's public arguments: the kind byte and four digests.
 pub const AUTH_PUBLIC_BYTES: usize = 1 + 4 * 32;
 
@@ -80,14 +87,35 @@ pub struct Program {
 
 impl Program {
     /// Kernel `kernel`'s program, its log sizes the ones its run on
-    /// `reference` needs (each at least its floor). Refused when the kernel
-    /// does not run to its halt on `reference`, or its run needs a chip past
-    /// `DEVICE_MAX_LOG_SIZE`.
-    pub fn install(kernel: &[u8], reference: &[u8]) -> Result<Self, ProveError> {
+    /// `reference` needs (each at least its floor), each raised by
+    /// `headroom`. Refused when the kernel does not run to its halt on
+    /// `reference`, or a raised size is past `DEVICE_MAX_LOG_SIZE`.
+    pub fn install(kernel: &[u8], reference: &[u8], headroom: u8) -> Result<Self, ProveError> {
         let mut run = trace(kernel, reference)?;
         let (active, log_sizes) = device_shape(&FORMAT, kernel, &mut run)?;
+        drop(run);
+        let log_sizes: Vec<u32> = log_sizes
+            .iter()
+            .map(|size| size + u32::from(headroom))
+            .collect();
+        Self::released(kernel, active, &log_sizes)
+    }
+
+    /// The program of a device kernel's release: `kernel` sized on what its
+    /// reference program `reference` returns ([`reference_arguments`]),
+    /// raised by `headroom`.
+    pub fn of(kernel: &[u8], reference: &[u8], headroom: u8) -> Result<Self, ProveError> {
+        Self::install(kernel, &reference_arguments(reference)?, headroom)
+    }
+
+    /// The program of `kernel` at the chips `active` and the log sizes
+    /// `log_sizes`, as a release embeds it: its preprocessed tree committed
+    /// from the kernel, no run of anything. Refused when `active` is not the
+    /// chips the kernel's code reaches, or a size is under its floor or past
+    /// `DEVICE_MAX_LOG_SIZE`.
+    pub fn released(kernel: &[u8], active: u32, log_sizes: &[u32]) -> Result<Self, ProveError> {
         let prover =
-            DeviceProver::<Blake2sM31MerkleChannel>::install(&FORMAT, kernel, active, &log_sizes)?;
+            DeviceProver::<Blake2sM31MerkleChannel>::install(&FORMAT, kernel, active, log_sizes)?;
         let id = program_id(&FORMAT, prover.program());
         Ok(Self {
             prover,
@@ -96,10 +124,28 @@ impl Program {
         })
     }
 
-    /// The program of `kernel`, a device kernel of auth's statement: its
-    /// reference run on [`auth_reference`].
-    pub fn auth(kernel: &[u8]) -> Result<Self, ProveError> {
-        Self::install(kernel, &auth_reference())
+    /// Whether the kernel's run on `arguments` fits the program's shape: it
+    /// runs to its halt, and needs no chip past its log size. A witness
+    /// that does not fit fails to prove (`device_fits`, `light-node.md`
+    /// §4.4).
+    pub fn fits(&self, arguments: &[u8]) -> Result<(), ProveError> {
+        let mut run = trace(&self.kernel, arguments)?;
+        let (active, needed) = device_shape(&FORMAT, &self.kernel, &mut run)?;
+        let program = self.program();
+        if active != program.active
+            || needed
+                .iter()
+                .zip(&program.log_sizes)
+                .any(|(needed, size)| needed > size)
+        {
+            return Err(ProveError::TraceShape("a run past the program's shape"));
+        }
+        Ok(())
+    }
+
+    /// The chips, a device mask.
+    pub fn chips(&self) -> u32 {
+        self.program().active
     }
 
     /// Its id, which a binding names.
@@ -179,6 +225,20 @@ fn verify(program: &DeviceProgram<Hasher>, io: &[u8; 32], bytes: &[u8]) -> Resul
         proof: decode(bytes)?,
     };
     crate::masked::device::verify_device::<Blake2sM31MerkleChannel>(&FORMAT, program, &proof)
+}
+
+/// The reference arguments a device kernel's reference program
+/// `reference` returns: its output, run to its halt on no input within
+/// [`REFERENCE_GAS`], stating no public arguments.
+pub fn reference_arguments(reference: &[u8]) -> Result<Vec<u8>, ProveError> {
+    let run = vos_pvm_proof::kernel::trace_kernel(reference, &[], REFERENCE_GAS)
+        .map_err(|error| ProveError::Segment(format!("the reference: {error:?}")))?;
+    match vos_pvm_precompiles::device_return_parts(&run.output) {
+        Some(([], output)) => Ok(output.to_vec()),
+        _ => Err(ProveError::Segment(
+            "the reference returns no arguments alone".into(),
+        )),
+    }
 }
 
 /// `kernel`'s run on `arguments`, traced to its halt.
@@ -309,10 +369,12 @@ pub fn auth_public(
     public
 }
 
-/// The reference run's arguments of an auth kernel: a fixed secret's
-/// member at slot 0 of the empty tree, its nullifier in a fixed scope, a
-/// fixed binding. A public statement of no member of any space: the
-/// secret's words are the constants below, known to all.
+/// The reference run's arguments of an auth kernel in the hand-lean
+/// layout ([`auth_arguments`]), which the `device` test actor's reference
+/// returns: a fixed secret's member at slot 0 of the empty tree, its
+/// nullifier in a fixed scope, a fixed binding. A public statement of no
+/// member of any space: the secret's words are the constants below, known
+/// to all.
 pub fn auth_reference() -> Vec<u8> {
     let secret: Words = core::array::from_fn(|i| 0x7e1e_0000 + i as u32);
     let scope: Words = core::array::from_fn(|i| 0x5c0e_0000 + i as u32);

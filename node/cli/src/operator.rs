@@ -5,8 +5,8 @@ use ed25519_dalek::SigningKey;
 use vos_node::client::Operator;
 use vos_node::{NODE_KEY, OPERATOR_KEY};
 use vos_wire::Decode;
-use vos_wire::ids::{AgentId, InstanceId, Principal};
-use vos_wire::ingress::{Install, Response};
+use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, derive_id};
+use vos_wire::ingress::{Install, Response, Retire};
 use vos_wire::records::Derivation;
 use vos_wire::result::Outcome;
 use vos_wire::schema::Schema;
@@ -49,6 +49,22 @@ impl AgentCommand {
             } => print_admin_answer(
                 &operator_of(&operator)?
                     .report_every_window(AgentId(agent), every)
+                    .map_err(failed)?,
+            ),
+            AgentCommand::Retire {
+                operator,
+                agent,
+                instance,
+                method,
+                at_ms,
+            } => print_admin_answer(
+                &operator_of(&operator)?
+                    .retire(&Retire::Previous {
+                        agent: AgentId(agent),
+                        instance: InstanceId(instance),
+                        method: MethodId(derive_id("vos/method/", &method)),
+                        at_ms,
+                    })
                     .map_err(failed)?,
             ),
             AgentCommand::Replace {

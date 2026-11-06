@@ -379,13 +379,20 @@ fn check_agent(cluster: &Cluster, agent: AgentId) {
             .collect();
         // A cut at a version already built has no dirty row left, yet waits
         // for its own finishing build: every replica's latest built cut is
-        // the latest recorded.
+        // the latest recorded. A request at a cut and its proof leave once
+        // the window they wait on is served, which a loaded host may apply
+        // after the cut is built.
         applied.windows(2).all(|pair| pair[0] == pair[1])
             && snapshots.iter().all(|snapshot| {
                 let latest = cuts(snapshot, agent).keys().next_back().copied();
-                [keys::dirty_prefix(), keys::undo_prefix()]
-                    .iter()
-                    .all(|prefix| snapshot.scan(agent, prefix, None).next().is_none())
+                [
+                    keys::dirty_prefix(),
+                    keys::undo_prefix(),
+                    keys::request_prefix(),
+                    keys::cut_proofs(),
+                ]
+                .iter()
+                .all(|prefix| snapshot.scan(agent, prefix, None).next().is_none())
                     && roots::latest_built(snapshot, agent).unwrap() == latest
             })
     });
@@ -430,15 +437,6 @@ fn check_agent(cluster: &Cluster, agent: AgentId) {
             assert_eq!(
                 roots::cut_root(snapshot, agent, *window).unwrap(),
                 Some(root)
-            );
-        }
-    }
-    for snapshot in &snapshots {
-        for prefix in [keys::request_prefix(), keys::cut_proofs()] {
-            assert!(
-                snapshot.scan(agent, &prefix, None).next().is_none(),
-                "agent {}: a request or its proof left",
-                agent.0
             );
         }
     }

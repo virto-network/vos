@@ -1,5 +1,5 @@
 error: an #[attestable(device)] method takes no `self`: a device reads no root, and no node serves it rows
   --> tests/compile_fail/device_kernel_with_self.rs:17:18
    |
-17 |     #[attestable(device)]
+17 |     #[attestable(device, reference = reference)]
    |                  ^^^^^^

@@ -9,7 +9,7 @@ use vos_wire::Decode;
 use vos_wire::ids::MethodId;
 use vos_wire::ingress::CallMessage;
 use vos_wire::personal::{
-    AdminClass, Body, DeviceId, Effect, Entry, Verdict, Void, Vote, chain, vote_message,
+    AdminClass, Body, DeviceId, Effect, Entry, Op, Signer, Verdict, Void, Vote, chain, vote_message,
     welcome_hash,
 };
 
@@ -79,10 +79,10 @@ impl DeviceGroup {
         }
         match entry.body {
             Body::Configured(policy) => self.state.policy = policy,
-            Body::Removal {
+            Body::Operation {
                 call,
-                by,
-                target,
+                by: Signer::Device(by),
+                op: Op::Remove(target),
                 matures,
             } => {
                 // Only a device with a voice, past its probation, removes
@@ -137,7 +137,14 @@ impl DeviceGroup {
                 signature,
             } => self.vote(device, epoch, candidate, vote, &signature, events),
             Body::Verdict { epoch, verdict } => self.verdict(epoch, verdict, events)?,
-            Body::Assigned { .. } | Body::Renewed { .. } | Body::Alive { .. } => {}
+            Body::Assigned { .. }
+            | Body::Renewed { .. }
+            | Body::Alive { .. }
+            | Body::Operation { .. }
+            | Body::Veto { .. }
+            | Body::Cosign { .. }
+            | Body::Resolve { .. }
+            | Body::Settled { .. } => {}
         }
         Ok(())
     }
@@ -370,7 +377,7 @@ impl DeviceGroup {
                 Verdict::Void(void) => {
                     let why = match void {
                         Void::Timeout => Why::Timeout,
-                        Void::Nack | Void::Split => Why::Agent,
+                        Void::Nack | Void::Split | Void::Regroup => Why::Agent,
                     };
                     self.void(why, events)?;
                 }

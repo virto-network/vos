@@ -13,6 +13,7 @@ pub(super) fn kernel(graph: &Graph, entry: &AttestEntry) -> Result<Vec<u8>, Deri
         entry,
         input,
         device,
+        ..
     } = entry;
     let elf = graph.elf;
     let reached = Reached::walk(graph, entry);

@@ -88,7 +88,9 @@ fn the_benchs_lines_and_proofs_hold_no_secret() {
     let kernel = dir.path().join("kernel");
     let witness = dir.path().join("input");
     let proved = dir.path().join("kernel.proof");
-    std::fs::write(&kernel, vos_testkit::programs::kernel("device", "auth")).unwrap();
+    let elf = vos_testkit::programs::package("device");
+    let device = vos_light::release::device(&elf, "auth").unwrap();
+    std::fs::write(&kernel, vos_wire::Encode::encode(&device)).unwrap();
     std::fs::write(&witness, &input).unwrap();
     let out = proofs.to_str().unwrap();
     run(
@@ -112,7 +114,7 @@ fn the_benchs_lines_and_proofs_hold_no_secret() {
         "kernel",
         &[
             "kernel",
-            "--kernel",
+            "--device",
             kernel.to_str().unwrap(),
             "--input",
             witness.to_str().unwrap(),

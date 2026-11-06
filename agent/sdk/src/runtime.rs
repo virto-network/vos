@@ -223,6 +223,19 @@ pub const READS_SERVED: u64 = 1 << 32;
 /// may make the Poseidon2 call and never BLAKE2b's, and no node attests it.
 pub const DEVICE: u64 = 1 << 33;
 
+/// The bit of an [`Attestable`]'s method word that marks a device kernel's
+/// reference run (`#[attestable(device, reference = path)]`), beside
+/// [`DEVICE`]: the entry `__vos_reference_<method>`, which returns as its
+/// output the kernel's arguments `path` gives, a public, valid witness
+/// whose run sizes the kernel's device program.
+pub const REFERENCE: u64 = 1 << 34;
+
+/// Where a reference's method word holds its kernel's headroom
+/// (`headroom = k`): each of the device program's log sizes raised by `k`
+/// over the reference run's, `k` at most
+/// [`vos_wire::records::MAX_HEADROOM`].
+pub const HEADROOM_SHIFT: u32 = 40;
+
 /// An actor program: `actor_program!(crate_name::module)`, naming the
 /// module `#[messages]` generates, with a heap of [`PROGRAM_HEAP`] or
 /// `heap = N` bytes, its workflows' too. It places the schema first in the

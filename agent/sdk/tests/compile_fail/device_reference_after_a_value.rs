@@ -11,11 +11,13 @@ impl Kernels {
     }
 
     /// An argument by reference after one by value would lie unaligned.
-    #[attestable(device)]
+    #[attestable(device, reference = reference)]
     pub fn owner(slot: u32, secret: &Secret, #[public] owner: &Digest) {
         let _ = slot;
         assert_eq!(Tag::Owner.hash(secret), *owner);
     }
 }
+
+fn reference() {}
 
 fn main() {}
