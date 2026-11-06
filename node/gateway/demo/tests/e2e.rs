@@ -3,13 +3,13 @@
 //! headless s4 client under a key drawn for its connection, its
 //! `vos.credential` facility s4's own (`s4-credential`) proving with this
 //! tree's device library, its secret source a software HMAC key and its
-//! chrome a script. The client enrolls, the operator invites the two
-//! digests it shows, it claims them, signs in on the path it fetched apart,
-//! by the stock auth kernel and by the device actor's own kernel (pinned
-//! at enrollment), under one pseudonym, and pays: what the
-//! chrome confirmed is paid, whatever the document's
-//! fields held, and a request naming another method is refused by the
-//! gateway before any node.
+//! chrome a script, the stock kernels' release artifacts this tree's
+//! credential actor's. The client enrolls, the operator invites the two
+//! digests it shows, it claims them, signs in on the path it fetched apart
+//! by the stock auth kernel, and pays from its account by the stock owner
+//! kernel: what the chrome confirmed is paid, whatever the document's fields
+//! held, and a request naming another method is refused by the gateway
+//! before any node.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -22,7 +22,7 @@ use s4_credential::api::Gateway;
 use s4_credential::chrome::{Answer, Chrome, Form};
 use s4_credential::enrollment::Store;
 use s4_credential::source::{BoxFuture, Kind, Output, Reference, Source, SourceError};
-use s4_credential::{Facility, Session};
+use s4_credential::{Facility, Session, Stock};
 use s4_protocol::{Message, Value};
 use vos_gateway_demo::{LocalSpace, host_key, local, random};
 
@@ -368,6 +368,18 @@ fn digest(shown: &str) -> [u8; 32] {
     hex::decode(shown).unwrap().try_into().unwrap()
 }
 
+/// The stock kernels' release artifacts of this tree's credential actor,
+/// which the space installs.
+fn stock() -> Stock {
+    let elf = std::fs::read(vos_testkit::programs::credentials_elf()).unwrap();
+    let artifact =
+        |kernel| vos_wire::Encode::encode(&vos_light::release::device(&elf, kernel).unwrap());
+    Stock {
+        auth: artifact("auth"),
+        owner: artifact("owner"),
+    }
+}
+
 /// A local space and its gateway, and a headless client on its SSH port.
 async fn demo(user: Arc<User>) -> (Arc<LocalSpace>, Headless, [tempfile::TempDir; 2]) {
     let data = tempfile::tempdir().unwrap();
@@ -378,9 +390,10 @@ async fn demo(user: Arc<User>) -> (Arc<LocalSpace>, Headless, [tempfile::TempDir
     let address = local(&listener);
     let _gateway = space.gateway(listener, host_key(), random());
     let store = tempfile::tempdir().unwrap();
-    let facility = Facility::with_root_poll(
+    let facility = Facility::with_stock(
         Store::new(store.path()),
         Arc::new(Software(random())),
+        stock(),
         Duration::from_millis(200),
     );
     let phone = Headless::connect(address, facility, user).await;
@@ -399,7 +412,7 @@ async fn enroll_sign_in_and_pay_through_the_gateways_ssh_port() {
 
     // Enroll: the chrome shows what is pinned; the device answers its two
     // digests, which the operator invites before the claim.
-    phone.type_into("Your row's name", "alice").await;
+    phone.type_into("Your account's name", "alice").await;
     user.will(confirm(&[]));
     user.will(confirm(&[]));
     let at = phone.click("Enroll this device").await;
@@ -418,8 +431,8 @@ async fn enroll_sign_in_and_pay_through_the_gateways_ssh_port() {
     );
     tokio::task::block_in_place(|| {
         space.invite(member, "alice", owner).unwrap();
-        space.open_row("shop", some_owner(), 50).unwrap();
-        space.open_row("mallory", some_owner(), 0).unwrap();
+        space.open_account("shop", some_owner(), 50).unwrap();
+        space.open_account("mallory", some_owner(), 0).unwrap();
     });
     let at = phone.click("Claim").await;
     let claimed = phone
@@ -458,33 +471,11 @@ async fn enroll_sign_in_and_pay_through_the_gateways_ssh_port() {
             .any(|(_, value)| value.contains("login (scope “login”)"))
     );
 
-    // Sign in by the device kernel pinned at enrollment: a device proof,
-    // relayed and run in the device actor's scope "login".
-    assert!(
-        enrolled
-            .rows
-            .iter()
-            .any(|(_, value)| value.contains("login (scope “login”, by this device's kernel "))
-    );
-    user.will(confirm(&[]));
-    let at = phone.click("Sign in with my device's kernel").await;
-    let by_kernel = phone
-        .settle(at, &["Signed in as", "Not done", "refused", "failed"])
-        .await;
-    assert!(by_kernel.starts_with("Signed in as"), "{by_kernel}");
-    let form = user.shown.lock().unwrap().last().cloned().unwrap();
-    assert!(
-        form.rows
-            .iter()
-            .any(|(name, value)| name == "Proof" && value.contains("kernel")),
-        "the chrome names the device proof"
-    );
-
     // Pay: the document's fields say 999 to mallory; the user confirms 20
     // to shop in the chrome, and that is what is paid.
     let at = phone.click("Pay").await;
-    phone.settle(at, &["Pay from your row"]).await;
-    phone.type_into("To row", "mallory").await;
+    phone.settle(at, &["Pay from this device's account"]).await;
+    phone.type_into("To account", "mallory").await;
     phone.type_into("Amount", "999").await;
     user.will(confirm(&["shop", "20"]));
     let at = phone.click("Send the payment").await;
@@ -535,7 +526,7 @@ async fn a_request_naming_another_method_never_reaches_the_node() {
     phone.settle(at, &["Sign in with your device"]).await;
     for (instance, name) in [
         (vos_gateway_demo::POLL.0, "vote_again"),
-        (vos_gateway_demo::PURSES.0, "transfer"),
+        (vos_gateway_demo::PAYMENTS.0, "transfer"),
         (vos_gateway_demo::CREDENTIALS.0, "claim"),
     ] {
         phone.hostile = Some(request(instance, name));

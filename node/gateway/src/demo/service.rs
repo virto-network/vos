@@ -66,17 +66,19 @@ fn method_error(_detail: &[u8]) -> String {
     "the method refused".into()
 }
 
-/// The names of the `purses` ledger's errors, by index.
-const PURSE_ERRORS: [&str; 9] = [
-    "a bad row name",
-    "the row exists",
-    "no such row",
+/// The names of the ledger's errors, by index.
+const PAYMENT_ERRORS: [&str; 11] = [
+    "a bad account name",
+    "the account exists",
+    "no such account",
     "not invited",
     "the invitation expired",
-    "not the row's owner",
-    "the row is frozen",
+    "this device holds no account",
+    "the account is frozen",
     "insufficient balance",
     "the balance would overflow",
+    "the ledger refused",
+    "not an owner digest",
 ];
 
 /// A method's outcome, as the screen says it.
@@ -92,10 +94,10 @@ fn outcome(outcome: &Outcome, errors: Errors) -> Result<Vec<u8>, String> {
     }
 }
 
-fn purse_error(detail: &[u8]) -> String {
+fn payment_error(detail: &[u8]) -> String {
     detail
         .first()
-        .and_then(|index| PURSE_ERRORS.get(usize::from(*index)))
+        .and_then(|index| PAYMENT_ERRORS.get(usize::from(*index)))
         .map_or_else(|| "the ledger refused".into(), |name| (*name).into())
 }
 
@@ -269,19 +271,11 @@ impl Service {
             }
             entries
         };
-        let mut methods = vec![
+        let methods = vec![
             object(guarded(demo.poll, LOGIN, "auth", Some((LOGIN, false)))),
             object(guarded(demo.poll, VOTE, "auth", Some((VOTE, true)))),
-            object(guarded(demo.purses, TRANSFER, "owner", None)),
+            object(guarded(demo.payments, TRANSFER, "owner", None)),
         ];
-        // The device actor's `login`, its device kernel pinned with it.
-        if let Some(device) = &demo.device {
-            let kernel = std::fs::read(&device.kernel)
-                .map_err(|error| failed(format!("the device kernel: {error}")))?;
-            let mut login = guarded(device.instance, LOGIN, "auth", Some((LOGIN, false)));
-            login.push(("kernel", Value::Bytes(kernel)));
-            methods.push(object(login));
-        }
         Ok(object([
             ("handle", Value::Bytes(space.handle.to_vec())),
             ("space", Value::Bytes(space.space.0.to_vec())),
@@ -303,9 +297,9 @@ impl Service {
         ]))
     }
 
-    /// The member's and the row's claims, which the operator's invitations
-    /// name: the credential actor's `claim(member)`, then the ledger's
-    /// `claim_row(row, owner)`.
+    /// The member's claim and the account's opening, which the operator's
+    /// invitations name: the credential actor's `claim(member)`, then the
+    /// ledger's `open(account, owner)`.
     async fn claim(&self, args: &Value) -> Result<Value, HostServiceError> {
         let member: [u8; 32] = bytes(args, "member")?
             .try_into()
@@ -313,7 +307,7 @@ impl Service {
         let owner: [u8; 32] = bytes(args, "owner")?
             .try_into()
             .map_err(|_| failed("`owner` is 32 bytes"))?;
-        let row = text(args, "row")?.as_bytes().to_vec();
+        let account = text(args, "account")?.as_bytes().to_vec();
         let slot = self
             .call(
                 self.demo.credentials,
@@ -324,10 +318,10 @@ impl Service {
             .await?;
         let slot = u32::decode_exact(&slot).ok_or_else(|| failed("the slot does not decode"))?;
         self.call(
-            self.demo.purses,
-            "claim_row",
-            (row, owner).encode(),
-            purse_error,
+            self.demo.payments,
+            "open",
+            (account, owner).encode(),
+            payment_error,
         )
         .await?;
         Ok(Value::from(slot))
@@ -338,17 +332,9 @@ impl Service {
     /// node.
     async fn relay(&self, args: &Value) -> Result<Value, HostServiceError> {
         let request = bytes(args, "request")?;
-        let device = self
-            .demo
-            .device
-            .as_ref()
-            .map(|device| (device.instance, LOGIN));
         let allowed: Vec<(u32, &str)> = match text(args, "screen")? {
-            "sign_in" => [(self.demo.poll, LOGIN), (self.demo.poll, VOTE)]
-                .into_iter()
-                .chain(device)
-                .collect(),
-            "pay" => vec![(self.demo.purses, TRANSFER)],
+            "sign_in" => vec![(self.demo.poll, LOGIN), (self.demo.poll, VOTE)],
+            "pay" => vec![(self.demo.payments, TRANSFER)],
             _ => return Err(failed("no such screen")),
         };
         let (kind, body) = request
@@ -380,8 +366,8 @@ impl Service {
                 CredentialRefusal::RootUnknown | CredentialRefusal::RootStale
             ))
         );
-        let errors: Errors = if call.instance == InstanceId(self.demo.purses) {
-            purse_error
+        let errors: Errors = if call.instance == InstanceId(self.demo.payments) {
+            payment_error
         } else {
             method_error
         };
@@ -395,17 +381,17 @@ impl Service {
         })
     }
 
-    /// The row's balance, `null` when there is no such row.
+    /// The account's balance, `null` when there is no such account.
     async fn balance(&self, args: &Value) -> Result<Value, HostServiceError> {
         let space = self.space().await?;
-        let row = text(args, "row")?.as_bytes().to_vec();
+        let account = text(args, "account")?.as_bytes().to_vec();
         let reply = self
             .query(
                 &space.identity,
-                self.demo.purses,
+                self.demo.payments,
                 "balance",
-                row.encode(),
-                purse_error,
+                account.encode(),
+                payment_error,
             )
             .await?;
         Ok(match Option::<u64>::decode_exact(&reply) {

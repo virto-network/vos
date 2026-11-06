@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 publish = false
-description = "The s4 demo on a local space: one node of a founded space with the credential actor, the poll and the purses' ledger, and the gateway's SSH port serving the screens; and its end-to-end test, a headless s4 client proving with the device library."
+description = "The s4 demo on a local space: one node of a founded space with the credential actor, the poll and the ledger, and the gateway's SSH port serving the screens; and its end-to-end test, a headless s4 client proving with the device library."
 
 # Outside VOS's workspace: s4's crates ask a newer Rust than the workspace's
 # nightly, which builds them with `--ignore-rust-version`
@@ -34,6 +34,8 @@ russh = { version = "0.61", default-features = false, features = ["ring", "flate
 # proving with this tree's device library.
 s4-protocol = { git = "https://codeberg.org/Virto/s4", rev = "a11a57f806b944f62e16e63adc2f62eb81a28474" }
 s4-credential = { git = "https://codeberg.org/Virto/s4", rev = "a11a57f806b944f62e16e63adc2f62eb81a28474" }
+# The stock kernels' release artifacts, from this tree's credential actor.
+vos-light = { path = "../../light", features = ["release"] }
 hmac = "0.12"
 sha2 = "0.10"
 zeroize = "1"

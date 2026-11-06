@@ -1,7 +1,6 @@
 //! The s4 demo on a local space: one node of a
-//! founded space whose agent holds the credential actor, the poll, the
-//! `purses` ledger and the device actor (whose `login` its own kernel
-//! `auth` proves), an operator who
+//! founded space whose agent holds the credential actor, the poll and the
+//! ledger (`Payments`), an operator who
 //! invites members and mints, and the
 //! gateway's SSH port serving the demo's screens over the node's socket.
 //! A phone runs it through `adb reverse`; the end-to-end test
@@ -14,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use ed25519_dalek::SigningKey;
 use vos_gateway::Gateway;
 use vos_gateway::app::AppClient;
-use vos_gateway::demo::{Demo, DeviceSignIn};
+use vos_gateway::demo::Demo;
 use vos_gateway::limits::{Limits, PerAddress};
 use vos_gateway::upstream::{Address, Upstream};
 use vos_node::client::{self, Client, Operator, Target};
@@ -27,9 +26,8 @@ use vos_wire::{Decode, Encode, WindowClock};
 
 /// The instances the agent holds.
 pub const CREDENTIALS: InstanceId = InstanceId(9);
-pub const PURSES: InstanceId = InstanceId(2);
+pub const PAYMENTS: InstanceId = InstanceId(2);
 pub const POLL: InstanceId = InstanceId(3);
-pub const DEVICE: InstanceId = InstanceId(4);
 /// The operator's role byte, the registrar's too: one key holds both.
 const ROLE: u8 = 1;
 /// How long an invitation stands.
@@ -42,8 +40,6 @@ pub struct LocalSpace {
     agent: AgentId,
     operator: Mutex<Client>,
     programs: [(InstanceId, Vec<u8>); 3],
-    /// The device actor's kernel `auth`, as the install derived it.
-    kernel: PathBuf,
 }
 
 fn ran(name: &str, answer: Result<Response, client::ClientError>) -> Result<Vec<u8>, String> {
@@ -103,8 +99,11 @@ impl LocalSpace {
                 "registrar",
             ),
             (POLL, elf(actor_elf("poll"))?, "operator"),
-            (PURSES, elf(actor_elf("purses"))?, "operator"),
-            (DEVICE, elf(actor_elf("device"))?, "operator"),
+            (
+                PAYMENTS,
+                elf(vos_testkit::programs::payments_elf())?,
+                "operator",
+            ),
         ];
         for (instance, elf, role) in &installs {
             let install = Install {
@@ -117,9 +116,6 @@ impl LocalSpace {
                 other => return Err(format!("installing {role}: {other:?}")),
             }
         }
-        let kernel = data.join("device.kernel");
-        std::fs::write(&kernel, vos_testkit::programs::kernel("device", "auth"))
-            .map_err(|error| format!("{}: {error}", kernel.display()))?;
         let principal = Principal::Client(key.verifying_key().to_bytes());
         match signed.grant(agent, principal, Some(ROLE)) {
             Ok(Response::Ran { .. }) => {}
@@ -133,9 +129,8 @@ impl LocalSpace {
             programs: [
                 (CREDENTIALS, vos_testkit::programs::credentials()),
                 (POLL, vos_testkit::programs::actor("poll")),
-                (PURSES, vos_testkit::programs::actor("purses")),
+                (PAYMENTS, vos_testkit::programs::payments()),
             ],
-            kernel,
         };
         space.write(CREDENTIALS, "found", handle)?;
         Ok(space)
@@ -158,12 +153,8 @@ impl LocalSpace {
         Demo {
             agent: self.agent.0,
             credentials: CREDENTIALS.0,
-            purses: PURSES.0,
+            payments: PAYMENTS.0,
             poll: POLL.0,
-            device: Some(DeviceSignIn {
-                instance: DEVICE.0,
-                kernel: self.kernel.clone(),
-            }),
         }
     }
 
@@ -218,36 +209,36 @@ impl LocalSpace {
     }
 
     /// Invite a member's two digests: `member` into the credential actor's
-    /// tree, and the row `row` for `owner`, minted `mint` once claimed.
-    pub fn invite(&self, member: [u8; 32], row: &str, owner: [u8; 32]) -> Result<(), String> {
+    /// tree, and the account `account` for `owner`.
+    pub fn invite(&self, member: [u8; 32], account: &str, owner: [u8; 32]) -> Result<(), String> {
         let expires = self.now()? + INVITATION_MS;
         self.write(CREDENTIALS, "invite", (member, expires))?;
         self.write(
-            PURSES,
-            "invite_row",
-            (row.as_bytes().to_vec(), owner, expires),
+            PAYMENTS,
+            "invite",
+            (account.as_bytes().to_vec(), owner, expires),
         )?;
         Ok(())
     }
 
-    /// A row claimed by the operator's invitation for `owner`, as a shop
-    /// or another member would hold, minted `amount`.
-    pub fn open_row(&self, row: &str, owner: [u8; 32], amount: u64) -> Result<(), String> {
+    /// An account opened by the operator's invitation for `owner`, as a
+    /// shop or another member would hold, minted `amount`.
+    pub fn open_account(&self, account: &str, owner: [u8; 32], amount: u64) -> Result<(), String> {
         let expires = self.now()? + INVITATION_MS;
-        let name = row.as_bytes().to_vec();
-        self.write(PURSES, "invite_row", (name.clone(), owner, expires))?;
-        self.write(PURSES, "claim_row", (name.clone(), owner))?;
-        self.mint(row, amount)
+        let name = account.as_bytes().to_vec();
+        self.write(PAYMENTS, "invite", (name.clone(), owner, expires))?;
+        self.write(PAYMENTS, "open", (name, owner))?;
+        self.mint(account, amount)
     }
 
-    pub fn mint(&self, row: &str, amount: u64) -> Result<(), String> {
-        self.write(PURSES, "mint", (row.as_bytes().to_vec(), amount))
+    pub fn mint(&self, account: &str, amount: u64) -> Result<(), String> {
+        self.write(PAYMENTS, "mint", (account.as_bytes().to_vec(), amount))
             .map(|_| ())
     }
 
-    /// `row`'s balance, `None` for no such row.
-    pub fn balance(&self, row: &str) -> Result<Option<u64>, String> {
-        self.read(PURSES, "balance", row.as_bytes().to_vec())
+    /// `account`'s balance, `None` for no such account.
+    pub fn balance(&self, account: &str) -> Result<Option<u64>, String> {
+        self.read(PAYMENTS, "balance", account.as_bytes().to_vec())
     }
 
     /// The gateway on this node's socket, its SSH port on `listener`

@@ -13,7 +13,7 @@ pub enum Screen {
 #[derive(Clone)]
 pub enum Message {
     Show(Screen),
-    Row(String),
+    Account(String),
     Payee(String),
     Amount(String),
     Enroll,
@@ -22,8 +22,6 @@ pub enum Message {
     Claim,
     Claimed(EffectOutput),
     SignIn,
-    /// Sign in with a device proof of the device actor's kernel.
-    SignInKernel,
     Proved(Screen, EffectOutput),
     Relayed(Screen, EffectOutput),
     Pay,
@@ -35,7 +33,8 @@ pub enum Message {
 pub struct Screens {
     demo: Demo,
     screen: Screen,
-    row: String,
+    /// The name of the device's account, for its balance.
+    account: String,
     payee: String,
     amount: String,
     /// The device's member and owner digests, once it enrolled.
@@ -50,7 +49,7 @@ impl Screens {
         Self {
             demo,
             screen: Screen::Enroll,
-            row: String::new(),
+            account: String::new(),
             payee: String::new(),
             amount: String::new(),
             digests: None,
@@ -191,7 +190,7 @@ impl Screens {
                 self.status = format!("Paid {} to {}{proving}", self.amount, self.payee);
                 cx.effect(service(
                     "balance",
-                    object([("row", Value::from(self.row.clone()))]),
+                    object([("account", Value::from(self.account.clone()))]),
                     Message::Balance,
                 ));
             }
@@ -224,7 +223,8 @@ impl App for Screens {
                 let page = page
                     .text("Enroll this device")
                     .child(
-                        view::field(self.row.clone(), Message::Row).placeholder("Your row's name"),
+                        view::field(self.account.clone(), Message::Account)
+                            .placeholder("Your account's name"),
                     )
                     .button("Enroll this device", Message::Enroll);
                 match self.digests {
@@ -237,26 +237,23 @@ impl App for Screens {
                     None => page,
                 }
             }
-            Screen::SignIn => {
-                let page = page
-                    .text("Sign in with your device")
-                    .button("Sign in with my device", Message::SignIn);
-                match self.demo.device {
-                    Some(_) => {
-                        page.button("Sign in with my device's kernel", Message::SignInKernel)
-                    }
-                    None => page,
-                }
-            }
+            Screen::SignIn => page
+                .text("Sign in with your device")
+                .button("Sign in with my device", Message::SignIn),
             Screen::Pay => {
                 let page = page
-                    .text("Pay from your row")
-                    .child(view::field(self.row.clone(), Message::Row).placeholder("From row"))
-                    .child(view::field(self.payee.clone(), Message::Payee).placeholder("To row"))
+                    .text("Pay from this device's account")
+                    .child(
+                        view::field(self.account.clone(), Message::Account)
+                            .placeholder("Your account's name"),
+                    )
+                    .child(
+                        view::field(self.payee.clone(), Message::Payee).placeholder("To account"),
+                    )
                     .child(view::field(self.amount.clone(), Message::Amount).placeholder("Amount"))
                     .button("Send the payment", Message::Pay);
                 match &self.balance {
-                    Some(balance) => page.text(format!("Balance of {}: {balance}", self.row)),
+                    Some(balance) => page.text(format!("Balance of {}: {balance}", self.account)),
                     None => page,
                 }
             }
@@ -270,7 +267,7 @@ impl App for Screens {
                 self.screen = screen;
                 self.status.clear();
             }
-            Message::Row(row) => self.row = row,
+            Message::Account(account) => self.account = account,
             Message::Payee(payee) => self.payee = payee,
             Message::Amount(amount) => self.amount = amount,
             Message::Enroll => {
@@ -308,7 +305,7 @@ impl App for Screens {
                     object([
                         ("member", Value::Bytes(member.to_vec())),
                         ("owner", Value::Bytes(owner.to_vec())),
-                        ("row", Value::from(self.row.clone())),
+                        ("account", Value::from(self.account.clone())),
                     ]),
                     Message::Claimed,
                 ));
@@ -316,25 +313,21 @@ impl App for Screens {
             Message::Claimed(output) => match output {
                 EffectOutput::HostService(Ok(slot)) => {
                     self.status = format!(
-                        "Claimed: member at slot {}, row {}",
+                        "Claimed: member at slot {}, account {}",
                         display(&slot),
-                        self.row
+                        self.account
                     );
                 }
                 other => self.failed(other),
             },
-            Message::SignIn | Message::SignInKernel => {
-                let instance = match (&message, &self.demo.device) {
-                    (Message::SignInKernel, Some(device)) => device.instance,
-                    _ => self.demo.poll,
-                };
+            Message::SignIn => {
                 self.status = "Asking the device…".into();
                 self.proving = None;
                 cx.effect(facility(
                     "sign_in",
                     object([
                         ("agent", Value::from(self.demo.agent)),
-                        ("instance", Value::from(instance)),
+                        ("instance", Value::from(self.demo.poll)),
                         ("method", Value::from(LOGIN)),
                         ("arguments", Value::Bytes(().encode())),
                     ]),
@@ -352,9 +345,8 @@ impl App for Screens {
                     "pay",
                     object([
                         ("agent", Value::from(self.demo.agent)),
-                        ("instance", Value::from(self.demo.purses)),
+                        ("instance", Value::from(self.demo.payments)),
                         ("method", Value::from(TRANSFER)),
-                        ("payer", Value::from(self.row.clone())),
                         ("payee", Value::from(self.payee.clone())),
                         ("amount", Value::from(amount)),
                     ]),
@@ -375,7 +367,7 @@ impl App for Screens {
 fn display(value: &Value) -> String {
     match value {
         Value::Integer(s4_server::rui::protocol::Integer::Unsigned(value)) => value.to_string(),
-        Value::Null => "no such row".into(),
+        Value::Null => "no such account".into(),
         other => format!("{other:?}"),
     }
 }

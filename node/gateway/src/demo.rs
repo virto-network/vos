@@ -1,19 +1,15 @@
 //! The demo's three screens on the SSH port:
 //! *Enroll*, *Sign in* and *Pay*, server-owned s4 documents over the
-//! credential actor and the `purses` ledger of one agent. *Sign in* offers
-//! the poll's `login`, proven by the stock `auth` kernel, and, where the
-//! file names the device actor, its `login`, proven by its own kernel
-//! `auth`: the enrollment pins the kernel's bytes, which the device proves
-//! under the device profile. That test actor's handler admits any secret
-//! under a tree of its own, so its sign-in shows the kernel path, not
-//! membership, which the poll's shows. The proofs are
-//! the member's device's: the client's `vos.credential` facility, which the
-//! app asks and whose answer, a node-API `Credentialed` request, the gateway
-//! relays as it is after checking it names this agent and the screen's
-//! method. The gateway builds no credential bytes and holds no authority;
-//! its app key sends only the claims an operator's invitations allow.
+//! credential actor and the ledger, `Payments`, of one agent. *Sign in*
+//! offers the poll's `login`, proven by the stock `auth` kernel; *Pay* the
+//! ledger's `transfer`, proven by the stock `owner` kernel, from the
+//! account of the device's owner digest. The proofs are the member's
+//! device's: the client's `vos.credential` facility, which the app asks and
+//! whose answer, a node-API `Credentialed` request, the gateway relays as it
+//! is after checking it names this agent and the screen's method. The
+//! gateway builds no credential bytes and holds no authority; its app key
+//! sends only the claims an operator's invitations allow.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use s4_server::rui::{App, Cx, Effect, EffectOutput, EffectRequest, View, ViewContext, view};
@@ -50,21 +46,8 @@ pub const APPLICATION: &str = "vos.gateway";
 pub struct Demo {
     pub agent: u32,
     pub credentials: u32,
-    pub purses: u32,
+    pub payments: u32,
     pub poll: u32,
-    /// The device actor, whose `login` is proven by its own kernel
-    /// `auth`: none, and *Sign in* offers the poll's `login` alone.
-    #[serde(default)]
-    pub device: Option<DeviceSignIn>,
-}
-
-/// The device actor's instance, and the file holding its kernel `auth` as
-/// the install derived it, which the enrollment pins on the device.
-#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct DeviceSignIn {
-    pub instance: u32,
-    pub kernel: PathBuf,
 }
 
 /// The guarded methods the device is asked to pin, and the ledger's.
