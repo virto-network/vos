@@ -280,6 +280,22 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   without personal agents; ≤ 64 KiB resident a personal-agent replica
   above idle; a full agent's snapshot installed ≤ 30 s. Run alone.
   **Estimate:** 1–1.5 weeks.
+- **Early run** (2026-11-06, compumax c1–c3 nodes and c4 spare, sigma
+  driver; slice 7's load of 64 shards at 5,000 calls a second beside
+  10,000 personal agents waking every 15 minutes; the largest push 60 KiB,
+  `Personal`'s envelope cap; the fill a run of its own). Every call of the
+  three runs succeeded. The snapshot gate is met: a 64 MiB agent's
+  replacement installed its snapshot in 1.04 s. The other two missed as
+  measured:
+  - **Commit p99:** the transfers' p99 rose from 1.84 s to 2.62 s (+43%),
+    one bucket of the harness's histogram, with the nodes' CPU unchanged
+    at about 70%. The fill's run, with the same 10,000 agents, was back
+    at 1.84 s.
+  - **Memory:** +50–54 KiB a replica right after creation, but +106–111
+    KiB a replica at the load's end, which counts the 255 MiB the agents
+    pushed and the store's caches.
+  The rerun splits a replica's memory out of the store's and reads the
+  p99 at finer buckets.
 
 ### 8.16 Device memberships
 - The registrar's person records, `enroll_device` under `credential =
