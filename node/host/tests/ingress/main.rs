@@ -14,6 +14,7 @@ mod operator_api;
 mod personal;
 mod quic;
 mod requests;
+mod sealed;
 mod sessions;
 mod transports;
 mod workflows;

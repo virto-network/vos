@@ -25,29 +25,29 @@ use vos_wire::personal::{
 use super::api::{connect, receive};
 use super::*;
 
-const PERSONAL: InstanceId = InstanceId(1);
+pub(super) const PERSONAL: InstanceId = InstanceId(1);
 const HOME: InstanceId = InstanceId(1);
 const HOMES_ROLE: u8 = 1;
 
-fn method(name: &str) -> MethodId {
+pub(super) fn method(name: &str) -> MethodId {
     MethodId(derive_id("vos/method/", name))
 }
 
 /// A device's two keys, from its seed.
-struct Keys {
-    sync: SigningKey,
-    admin: SigningKey,
+pub(super) struct Keys {
+    pub(super) sync: SigningKey,
+    pub(super) admin: SigningKey,
 }
 
 impl Keys {
-    fn of(seed: u8) -> Self {
+    pub(super) fn of(seed: u8) -> Self {
         Self {
             sync: SigningKey::from_bytes(&[seed; 32]),
             admin: SigningKey::from_bytes(&[seed ^ 0x80; 32]),
         }
     }
 
-    fn device(&self) -> NewDevice {
+    pub(super) fn device(&self) -> NewDevice {
         NewDevice {
             sync: self.sync.verifying_key().to_bytes(),
             admin: self.admin.verifying_key().to_bytes(),
@@ -63,7 +63,7 @@ impl Keys {
 }
 
 /// A client key's session at the agent, its next sequence.
-struct Signer {
+pub(super) struct Signer {
     key: SigningKey,
     session: Session,
     next: u64,
@@ -71,16 +71,16 @@ struct Signer {
 
 /// A node serving its socket with a personal agent and the home's agent,
 /// the home granted `homes`.
-struct Personal {
-    served: Served,
+pub(super) struct Personal {
+    pub(super) served: Served,
     agent: AgentId,
     home: AgentId,
-    identity: [u8; 32],
+    pub(super) identity: [u8; 32],
     stream: UnixStream,
 }
 
 impl Personal {
-    fn start() -> Self {
+    pub(super) fn start() -> Self {
         let served = Served::plain();
         let node = &served.node;
         let agent = node.create_agent().unwrap();
@@ -115,7 +115,7 @@ impl Personal {
 
     /// The home's call `name` on the personal agent's behalf, by a client
     /// of the home's agent.
-    fn home(&self, name: &str, arguments: impl Encode) {
+    pub(super) fn home(&self, name: &str, arguments: impl Encode) {
         let arguments = ((self.agent.0, PERSONAL.0), arguments).encode();
         let answer = self
             .served
@@ -126,7 +126,7 @@ impl Personal {
     }
 
     /// A session of `key`, new.
-    fn signer(&self, key: &SigningKey, name: u8) -> Signer {
+    pub(super) fn signer(&self, key: &SigningKey, name: u8) -> Signer {
         Signer {
             key: key.clone(),
             session: Session {
@@ -140,7 +140,12 @@ impl Personal {
 
     /// `signer`'s call of `name` through the onion, at its next sequence:
     /// the call as signed, and the answer.
-    fn call(&mut self, signer: &mut Signer, name: &str, arguments: Vec<u8>) -> (Call, Response) {
+    pub(super) fn call(
+        &mut self,
+        signer: &mut Signer,
+        name: &str,
+        arguments: Vec<u8>,
+    ) -> (Call, Response) {
         let call = signed_call(
             &self.identity,
             &signer.key,
@@ -163,7 +168,7 @@ impl Personal {
     }
 
     /// [`Personal::call`]'s answer, as `Personal` answers it.
-    fn answer<T: Decode>(
+    pub(super) fn answer<T: Decode>(
         &mut self,
         signer: &mut Signer,
         name: &str,
@@ -173,7 +178,7 @@ impl Personal {
     }
 
     /// `key`'s query of `name` through the onion.
-    fn query<T: Decode>(
+    pub(super) fn query<T: Decode>(
         &mut self,
         key: &SigningKey,
         name: &str,
@@ -198,7 +203,7 @@ impl Personal {
 
     /// Wait until `signer`'s call of `name` is no longer refused for an
     /// unknown key: its replica applied the admission.
-    fn admitted<T: Decode>(
+    pub(super) fn admitted<T: Decode>(
         &mut self,
         signer: &mut Signer,
         name: &str,
@@ -223,7 +228,7 @@ fn unknown() -> Response {
 }
 
 /// An answer as `Personal` answers it: its reply, or its error.
-fn outcome<T: Decode>(answer: Response) -> Result<T, PersonalError> {
+pub(super) fn outcome<T: Decode>(answer: Response) -> Result<T, PersonalError> {
     match answer {
         Response::Ran {
             outcome: Outcome::Done(bytes),
@@ -251,7 +256,7 @@ fn ask(stream: &mut UnixStream, kind: Kind, mark: Mark, body: &[u8]) -> Response
     Response::decode_exact(&body).expect("a response")
 }
 
-fn kit() -> Kit {
+pub(super) fn kit() -> Kit {
     Kit {
         entries: vec![KitEntry {
             kind: KitKind::Phrase,
