@@ -6,7 +6,7 @@
 # - `vos-phone-timing`: the device library's proofs timed and verified,
 #   masks from the operating system; and the light node's gate
 #   (`scripts/light.sh`), its release artifacts embedded from the agent's
-#   and the counter's ELFs (`just build-agent build-test-actors` first);
+#   and the notes actor's ELFs (`just build-agent build-test-actors` first);
 # - `vos-phone-seeded`: the same with seeded masks and the x86 proofs'
 #   SHA-256 compiled in, every proof checked byte for byte.
 #
@@ -19,7 +19,7 @@ out=${1:-$root/target/phone}
 export ANDROID_NDK_HOME=${ANDROID_NDK_HOME:-/opt/android-sdk/ndk/28.2.13676358}
 cd "$root"
 for elf in agent/programs/target/riscv64em-vos/release/vos-agent.elf \
-  agent/test-actors/target/riscv64em-vos/release/counter.elf; do
+  agent/test-actors/target/riscv64em-vos/release/notes.elf; do
   [ -f "$elf" ] || { echo "$elf: run \`just build-agent build-test-actors\` first" >&2; exit 1; }
 done
 mkdir -p "$out"

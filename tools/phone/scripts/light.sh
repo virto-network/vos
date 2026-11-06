@@ -52,7 +52,9 @@ on_phone "chmod +x vos-phone"
   while [ "$round" -le "$rounds" ]; do
     wait_ms=$(( ($(od -An -N2 -tu2 /dev/urandom) % 750) + 50 ))
     secs=$(printf '0.%03d' "$wait_ms")
-    on_phone "./vos-phone light --store kills --calls 100000000 > /dev/null 2>&1 & pid=\$!; sleep $secs; kill -9 \$pid; wait \$pid 2>/dev/null; true"
+    # Android's shell may run a background command in a subshell of its
+    # own, so $! can be its parent: the job and its children are killed.
+    on_phone "./vos-phone light --store kills --calls 100000000 > /dev/null 2>&1 & pid=\$!; sleep $secs; kill -9 \$(ps -o PID= --ppid \$pid) \$pid; wait \$pid 2>/dev/null; true"
     echo "round $round, killed after ${wait_ms} ms:"
     on_phone "./vos-phone light --store kills --check"
     round=$((round + 1))
