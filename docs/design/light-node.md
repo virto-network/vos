@@ -1295,27 +1295,50 @@ the one taken]:
   positions are returned for 8.21's checks; nothing checks them yet.
 - **The archive** lives in a scope of its own, its id from the naming
   secret (`"vos/personal/archive"`, apart from every instance's
-  four-byte name). `SealedSync::archive` reads it from its cursor, merges
-  every archive sealed at the confirmed epoch (its chunks reassembled and
-  checked against their digest), and, if it found none, pushes this
-  device's, chunked, under the epoch's archive key: the committer's push
-  and any device's that finds it missing are one rule. Archives of
-  earlier epochs are passed over; a later one holds their keys.
+  four-byte name). `SealedSync::archive` reads it from its cursor and
+  merges every archive sealed at the confirmed epoch (its chunks
+  reassembled and checked against their digest), `R` left out; unless one
+  there encodes as this device's whole archive (candidates are kept in
+  order, so equal archives encode alike), it pushes its own, chunked,
+  under the epoch's archive key. The committer's push and the push of any
+  device holding keys the agent's archives lack (a scope it tracked
+  alone, a key it recorded mid-epoch) are one rule. Archives of earlier
+  epochs are passed over; a later one holds their keys. `R` never travels
+  through the agent: an archive read there that names one is merged
+  without it, so no device of the group can replace `R` for the others.
 - **`R` and the recovery envelopes:** `R` is held in the archive (the
-  later claim's or rotation's by log index, so it travels with pairing
-  and with the archive); `SealedSync::recovery` pushes, once a confirmed
-  epoch, the naming secret and the epoch's keys of every tracked scope
-  sealed under `BLAKE2b-256("vos/personal/recovery" ‖ R)` into the
-  recovery scope, unless one is there; `open_recovery` is the kit's read.
+  later claim's or rotation's by log index), set by the claim or a
+  rotation and carried by pairing; `SealedSync::recovery` reads the
+  recovery scope for what it holds under `R` and pushes, sealed under
+  `BLAKE2b-256("vos/personal/recovery" ‖ R)` at the confirmed epoch and
+  chunked as the archive is, whatever of this device's archive is not
+  there yet: the naming secret and every scope key, so a confirmed epoch's
+  keys, a scope tracked mid-epoch and a key merged from another device's
+  archive all reach the kit. Each push is the difference, a few hundred
+  bytes an epoch. A new `R` reads the scope again and seals the whole
+  archive under it. `open_recovery` is the kit's read: every archive it
+  opens there, merged.
 - **Tor only:** a `Link` names its `Route`; `SealedSync` refuses a link
   whose route is not the onion, and checks it again before every
   request, so no request to the personal agent leaves over the clearnet
   [E17]. The onion transport itself is 8.26's.
 - **Not built here:** the device-side authorization of authors (a node's
   author is the store's author key, not yet the device's sync key, so no
-  reader maps it to the device set), frontiers on read, the `seen` and
-  view checks (8.21), pipelined reads, and garbage collection of covered
-  envelopes and of earlier epochs' archives (§9.3).
+  reader maps it to the device set), frontiers on read (so A7 is
+  mitigated on push alone: the agent refuses a removed device and takes
+  only the confirmed epoch), the `seen` and view checks (8.21), pipelined
+  reads, re-reading an envelope passed over once a later archive brings
+  a key that opens it, and garbage collection of covered envelopes and of
+  earlier epochs' archives (§9.3).
+- **Known limits found here:** a scope's reading stops for good at an
+  envelope of an epoch whose key never arrives, or of an epoch past any
+  confirmed one, which the operators can plant (as they can withhold, B1);
+  the chrome should show a scope waiting long. And `R` is not rotated
+  when a device is removed: a removed device holds `R`, and with the
+  operators, who serve the recovery scope, it reads every key pushed
+  there after its removal, which is more than D3's limit (the operators
+  and a leaked kit). The remedy is a kit rotation at each removal (a new
+  `R`, the old `R2` deleted), 8.23b's to build or the owner's to rule out.
 
 **PG6's catch-up on the clearnet** [measured, x86-64 Core Ultra 7 155H,
 load average 5–11, release, 2026-11-06; `node/host/tests/ingress/sealed.rs`

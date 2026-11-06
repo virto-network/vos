@@ -36,7 +36,7 @@ pub type Keys = ((u64, Scope), Vec<[u8; 32]>);
 /// The recovery wrap key `R = R1 ⊕ R2`, which recovery envelopes are
 /// sealed under, and the control log's index of the claim or kit rotation
 /// that drew it: of two, the later stands.
-#[derive(Clone, Copy, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, PartialEq, Eq, Encode, Decode)]
 pub struct Recovery {
     pub since: u64,
     pub r: [u8; 32],
@@ -58,7 +58,10 @@ impl std::fmt::Debug for Archive {
         f.debug_struct("Archive")
             .field("scopes", &self.scopes.len())
             .field("keys", &self.keys.len())
-            .field("recovery", &self.recovery.map(|recovery| recovery.since))
+            .field(
+                "recovery",
+                &self.recovery.as_ref().map(|recovery| recovery.since),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -93,7 +96,8 @@ impl Archive {
         }
     }
 
-    /// Record `key` as a candidate of `scope` in `epoch`.
+    /// Record `key` as a candidate of `scope` in `epoch`. Candidates are
+    /// kept in order, so two archives holding the same keys encode alike.
     pub fn record(&mut self, epoch: u64, scope: Scope, key: [u8; 32]) {
         match self
             .keys
@@ -101,8 +105,8 @@ impl Archive {
         {
             Ok(found) => {
                 let keys = &mut self.keys[found].1;
-                if !keys.contains(&key) {
-                    keys.push(key);
+                if let Err(at) = keys.binary_search(&key) {
+                    keys.insert(at, key);
                 }
             }
             Err(at) => self.keys.insert(at, ((epoch, scope), vec![key])),
@@ -119,11 +123,13 @@ impl Archive {
     /// The union of this archive and `other`: every scope and every key of
     /// either, and the later `R`. The naming secret stays this archive's.
     pub fn merge(&mut self, other: &Archive) {
-        if other
-            .recovery
-            .is_some_and(|theirs| self.recovery.is_none_or(|mine| theirs.since > mine.since))
+        if let Some(theirs) = &other.recovery
+            && self
+                .recovery
+                .as_ref()
+                .is_none_or(|mine| theirs.since > mine.since)
         {
-            self.recovery = other.recovery;
+            self.recovery = Some(theirs.clone());
         }
         for scope in &other.scopes {
             self.track(*scope);
@@ -133,6 +139,49 @@ impl Archive {
                 self.record(*epoch, *scope, *key);
             }
         }
+    }
+
+    /// This archive without `R`: what travels through the agent.
+    pub fn without_recovery(&self) -> Archive {
+        let mut archive = self.clone();
+        if let Some(mut recovery) = archive.recovery.take() {
+            use zeroize::Zeroize;
+            recovery.r.zeroize();
+        }
+        archive
+    }
+
+    /// The scopes and keys of this archive that `other` lacks, with this
+    /// archive's naming secret and no `R`.
+    pub fn beyond(&self, other: &Archive) -> Archive {
+        Archive {
+            naming: self.naming,
+            scopes: self
+                .scopes
+                .iter()
+                .filter(|scope| other.scopes.binary_search(scope).is_err())
+                .copied()
+                .collect(),
+            keys: self
+                .keys
+                .iter()
+                .filter_map(|((epoch, scope), keys)| {
+                    let theirs = other.keys(*epoch, scope);
+                    let new: Vec<[u8; 32]> = keys
+                        .iter()
+                        .filter(|key| !theirs.contains(key))
+                        .copied()
+                        .collect();
+                    (!new.is_empty()).then_some(((*epoch, *scope), new))
+                })
+                .collect(),
+            recovery: None,
+        }
+    }
+
+    /// Whether it holds no scope and no key.
+    pub fn is_empty(&self) -> bool {
+        self.scopes.is_empty() && self.keys.is_empty()
     }
 
     /// The archive sealed under `key` with `nonce`: XChaCha20-Poly1305 over

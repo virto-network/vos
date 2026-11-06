@@ -461,9 +461,9 @@ fn forged_and_replayed_envelopes_are_passed_over() {
 /// the other does not seals under keys the other never derived; the
 /// other's reading waits for the key, until the first phone's archive,
 /// pushed at the confirmed epoch and chunked past an envelope, is merged.
-/// A device that finds the epoch's archive pushes none of its own. An
-/// archive with a wrong candidate key beside the right one opens all the
-/// same: the AEAD decides.
+/// A device that finds its whole archive there pushes none. An archive
+/// with a wrong candidate key beside the right one opens all the same: the
+/// AEAD decides.
 #[test]
 fn archives_are_pushed_at_confirmed_epochs_and_merged() {
     let (mut home, mut phones) = household(2);
@@ -511,7 +511,11 @@ fn archives_are_pushed_at_confirmed_epochs_and_merged() {
     wrong.record(first, other, [0xee; 32]);
     phones[1].group().merge_archive(&wrong).unwrap();
     let kept = with(&mut home, &mut phones[1], &[], |sync| sync.archive()).unwrap();
-    assert_eq!((kept.found, kept.pushed), (1, 0));
+    assert_eq!(kept.found, 1);
+    assert!(
+        kept.pushed > 0,
+        "it holds a candidate the agent's archive lacks"
+    );
     assert_eq!(phones[1].group().archive().keys(first, &other).len(), 2);
     let caught = with(&mut home, &mut phones[1], &[OTHER], |sync| {
         sync.catch_up(OTHER)
@@ -536,13 +540,67 @@ fn archives_are_pushed_at_confirmed_epochs_and_merged() {
     assert_eq!((kept.found, kept.pushed), (1, 0));
 }
 
-/// D1's envelopes: once the device group holds `R`, each confirmed epoch's
-/// scope keys and naming secret are sealed under it into the recovery
-/// scope, once an epoch: a kit holding `R` opens them, reading the scope
-/// as the kit, and every scope key in them is the epoch's; another `R`
-/// opens nothing.
+/// C9's other order: the device lacking a key pushes the epoch's archive
+/// first; the device holding it finds that archive short of its keys and
+/// pushes its own, which the first then merges. `R` never travels through
+/// the agent.
 #[test]
-fn recovery_envelopes_are_sealed_under_r_at_each_confirmed_epoch() {
+fn a_device_holding_keys_the_agents_archive_lacks_pushes_its_own() {
+    let (mut home, mut phones) = household(2);
+    let first = phones[0].group().confirmed();
+    phones[0].group().set_recovery(0, [0x52; 32]).unwrap();
+    install(&phones[0].light, OTHER);
+    set(&phones[0].light, OTHER, 1, 11);
+    with(&mut home, &mut phones[0], &[OTHER], |sync| sync.push(OTHER)).unwrap();
+    phones[1].update(&mut home).unwrap();
+    settle(&mut home, &mut phones);
+    let kept = with(&mut home, &mut phones[1], &[], |sync| sync.archive()).unwrap();
+    assert_eq!((kept.found, kept.pushed), (0, 1));
+    let kept = with(&mut home, &mut phones[0], &[], |sync| sync.archive()).unwrap();
+    assert_eq!((kept.found, kept.pushed), (1, 1));
+    let kept = with(&mut home, &mut phones[1], &[], |sync| sync.archive()).unwrap();
+    assert_eq!((kept.found, kept.pushed), (2, 0), "its own and the other's");
+    let other = scope_of(&phones[0], OTHER);
+    assert!(!phones[1].group().archive().keys(first, &other).is_empty());
+    assert!(phones[1].group().archive().recovery.is_none());
+    install(&phones[1].light, OTHER);
+    let caught = with(&mut home, &mut phones[1], &[OTHER], |sync| {
+        sync.catch_up(OTHER)
+    })
+    .unwrap();
+    assert_eq!(caught.ingested.unwrap().applied.len(), 1);
+}
+
+/// A catch-up longer than one answer reads it page after page, each
+/// page's position stored with its nodes.
+#[test]
+fn a_catch_up_reads_page_after_page() {
+    let (mut home, mut phones) = household(2);
+    for key in 0..40u64 {
+        let outcome = phones[0]
+            .light
+            .call(NOTES, method("title"), (key, "x".repeat(2000)).encode())
+            .unwrap();
+        assert!(matches!(outcome, Outcome::Done(_)), "{outcome:?}");
+    }
+    with(&mut home, &mut phones[0], &[NOTES], |sync| sync.push(NOTES)).unwrap();
+    let caught = with(&mut home, &mut phones[1], &[NOTES], |sync| {
+        sync.catch_up(NOTES)
+    })
+    .unwrap();
+    assert!(caught.bytes > vos_wire::personal::ANSWER_BYTES);
+    assert_eq!(caught.ingested.unwrap().applied.len(), 40);
+    assert_eq!(phones[1].light.cursor(NOTES).unwrap(), Some(40));
+}
+
+/// D1's envelopes: once a device holds `R`, what the agent holds under it
+/// is kept whole: the naming secret and every scope key, pushed as the
+/// device's archive gains them (a confirmed epoch's keys, a scope tracked
+/// mid-epoch), each push only what the recovery scope lacks. A kit holding
+/// `R` reads the scope and merges it; another `R` opens nothing; a new `R`
+/// reads the scope again and seals the whole archive under it.
+#[test]
+fn recovery_envelopes_keep_every_key_under_r() {
     let (mut home, mut phones) = household(2);
     let epoch = phones[0].group().confirmed();
     let r = [0x52; 32];
@@ -554,46 +612,49 @@ fn recovery_envelopes_are_sealed_under_r_at_each_confirmed_epoch() {
     );
     let scope = scope_of(&phones[0], NOTES);
     let key = phones[0].group().key(scope).unwrap();
-    with(&mut home, &mut phones[0], &[], |sync| sync.archive()).unwrap();
-    with(&mut home, &mut phones[1], &[], |sync| sync.archive()).unwrap();
-    assert_eq!(
-        phones[1]
-            .group()
-            .archive()
-            .recovery
-            .map(|recovery| recovery.r),
-        Some(r)
-    );
     let kept = with(&mut home, &mut phones[0], &[], |sync| sync.recovery()).unwrap();
     assert_eq!((kept.found, kept.pushed), (0, 1));
+    let kept = with(&mut home, &mut phones[0], &[], |sync| sync.recovery()).unwrap();
+    assert_eq!((kept.found, kept.pushed), (1, 0));
+    phones[1].group().set_recovery(0, r).unwrap();
     let kept = with(&mut home, &mut phones[1], &[], |sync| sync.recovery()).unwrap();
     assert_eq!((kept.found, kept.pushed), (1, 0));
 
     let kit = phone::kit(0).verifying_key().to_bytes();
-    let read: Vec<Envelope> = home.query(kit, "since", (RECOVERY, 0u64).encode()).unwrap();
-    assert_eq!(read.len(), 1);
-    let recovered = open_recovery(&r, &home::IDENTITY, &read[0].bytes).unwrap();
-    assert_eq!(recovered.epoch, epoch);
+    let read = |home: &Home| -> Vec<Envelope> {
+        home.query(kit, "since", (RECOVERY, 0u64).encode()).unwrap()
+    };
+    let recovered = open_recovery(&r, &home::IDENTITY, &read(&home)).unwrap();
     assert_eq!(recovered.naming, phones[0].group().archive().naming);
-    assert!(recovered.keys.contains(&(scope, key)));
-    assert_eq!(
-        open_recovery(&[0x53; 32], &home::IDENTITY, &read[0].bytes).map(|_| ()),
-        Err(OpenError::Unopened)
-    );
+    assert_eq!(recovered.keys(epoch, &scope), &[key]);
+    assert!(recovered.recovery.is_none());
+    assert!(open_recovery(&[0x53; 32], &home::IDENTITY, &read(&home)).is_none());
     assert_ne!(*recovery_key(&r), r);
 
+    // A scope tracked mid-epoch, then the next epoch's keys.
+    install(&phones[0].light, OTHER);
+    let other = scope_of(&phones[0], OTHER);
+    let other_key = phones[0].group().key(other).unwrap();
+    let kept = with(&mut home, &mut phones[0], &[], |sync| sync.recovery()).unwrap();
+    assert_eq!((kept.found, kept.pushed), (0, 1));
     phones[0].update(&mut home).unwrap();
     settle(&mut home, &mut phones);
     let kept = with(&mut home, &mut phones[1], &[], |sync| sync.recovery()).unwrap();
-    assert_eq!((kept.found, kept.pushed), (0, 1));
-    let read: Vec<Envelope> = home.query(kit, "since", (RECOVERY, 1u64).encode()).unwrap();
-    let recovered = open_recovery(&r, &home::IDENTITY, &read[0].bytes).unwrap();
-    assert_eq!(recovered.epoch, epoch + 1);
-    assert!(
-        recovered
-            .keys
-            .contains(&(scope, phones[1].group().key(scope).unwrap()))
+    assert_eq!(kept.pushed, 1);
+    let recovered = open_recovery(&r, &home::IDENTITY, &read(&home)).unwrap();
+    assert_eq!(recovered.keys(epoch, &other), &[other_key]);
+    assert_eq!(
+        recovered.keys(epoch + 1, &scope),
+        &[phones[1].group().key(scope).unwrap()]
     );
+
+    // A rotation's new `R`: the whole archive again, under it.
+    let rotated = [0x54; 32];
+    phones[0].group().set_recovery(7, rotated).unwrap();
+    let kept = with(&mut home, &mut phones[0], &[], |sync| sync.recovery()).unwrap();
+    assert_eq!((kept.found, kept.pushed), (0, 1));
+    let recovered = open_recovery(&rotated, &home::IDENTITY, &read(&home)).unwrap();
+    assert_eq!(recovered.keys(epoch, &scope), &[key]);
 }
 
 /// E17: the personal agent is reached through the onion alone. A link

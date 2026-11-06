@@ -17,14 +17,16 @@
 //!   device has not confirmed, or whose key it lacks; one that does not
 //!   open, or is not a node of the scope, is passed over and reported.
 //! - **The archive** ([`SealedSync::archive`]): read from its own scope,
-//!   every archive sealed at the confirmed epoch merged; if none was, this
-//!   device's is pushed, chunked, under the epoch's archive key: the
-//!   committer's push once an epoch is confirmed, or any device's that
-//!   finds it missing.
-//! - **Recovery envelopes** ([`SealedSync::recovery`]): at each confirmed
-//!   epoch, the naming secret and the epoch's scope keys sealed under `R`
-//!   into the recovery scope, unless one is there already: what a kit
-//!   opens ([`open_recovery`]) after a restore releases `R2`.
+//!   every archive sealed at the confirmed epoch merged, `R` left out;
+//!   unless one there is this device's whole archive, this device's is
+//!   pushed, chunked, under the epoch's archive key: the committer's push
+//!   once an epoch is confirmed, and any device's that holds keys the
+//!   agent's archives lack.
+//! - **Recovery envelopes** ([`SealedSync::recovery`]): whatever of the
+//!   archive (the naming secret, every scope key) the recovery scope does
+//!   not hold under `R` yet, sealed under it at the confirmed epoch, so the
+//!   kit's copy never lags: what a kit reads ([`open_recovery`]) after a
+//!   restore releases `R2`.
 //! - **Tor only** [E17]: a link names its [`Route`], and every request is
 //!   refused before it leaves unless the route is the onion, so the light
 //!   node has no clearnet route for any kind addressed to the personal
@@ -262,47 +264,99 @@ struct Chunk {
     bytes: Vec<u8>,
 }
 
+/// A chunk's encoding beyond its bytes: the digest, the two counts and the
+/// bytes' length prefix, at most four.
+const CHUNK_FRAMING: usize = 32 + 2 + 2 + 4;
+
+/// The archive's bytes an envelope's chunk holds.
+const CHUNK_BYTES: usize = MAX_BODY - CHUNK_FRAMING;
+
+const _: () = assert!(CHUNK_BYTES < 1 << 30, "the length prefix stays four bytes");
+
+/// The digest an archive's chunks name it by.
+fn archive_digest(encoding: &[u8]) -> [u8; 32] {
+    digest(b"vos/personal/archive-digest", encoding)
+}
+
 /// An archive's parts read so far: how many it has, those read, and the
 /// position of its first part read.
-type Parts = (u16, BTreeMap<u16, Vec<u8>>, u64);
+type Parts = (u16, BTreeMap<u16, Zeroizing<Vec<u8>>>, u64);
 
-/// The chunk's bytes an envelope holds beside its framing.
-const CHUNK_BYTES: usize = MAX_BODY - 64;
-
-/// A recovery envelope's body: the naming secret and the epoch's scope
-/// keys, every candidate.
-#[derive(Encode, Decode)]
-struct RecoveryBody {
-    naming: [u8; 32],
-    keys: Vec<(Scope, [u8; 32])>,
+/// Archives read in chunks, put back together, each one's parts by its
+/// digest.
+#[derive(Default)]
+struct Reassembly {
+    parts: BTreeMap<[u8; 32], Parts>,
 }
 
-/// What a recovery envelope holds: its epoch, the naming secret, and the
-/// epoch's scope keys.
-#[derive(Clone, PartialEq, Eq)]
-pub struct Recovered {
-    pub epoch: u64,
-    pub naming: [u8; 32],
-    pub keys: Vec<(Scope, [u8; 32])>,
-}
-
-impl std::fmt::Debug for Recovered {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Recovered")
-            .field("epoch", &self.epoch)
-            .field("keys", &self.keys.len())
-            .finish_non_exhaustive()
-    }
-}
-
-impl Drop for Recovered {
-    fn drop(&mut self) {
-        use zeroize::Zeroize;
-        self.naming.zeroize();
-        for (_, key) in &mut self.keys {
-            key.zeroize();
+impl Reassembly {
+    /// A chunk read at `position`: the archive it completes, with its
+    /// digest, if it does.
+    fn add(&mut self, position: u64, body: &[u8]) -> Option<([u8; 32], Archive)> {
+        let chunk = Chunk::decode_exact(body)?;
+        if chunk.part >= chunk.parts {
+            return None;
         }
+        let (count, held, _) =
+            self.parts
+                .entry(chunk.digest)
+                .or_insert((chunk.parts, BTreeMap::new(), position));
+        if *count != chunk.parts {
+            return None;
+        }
+        held.insert(chunk.part, Zeroizing::new(chunk.bytes));
+        if held.len() < *count as usize {
+            return None;
+        }
+        let (_, held, _) = self.parts.remove(&chunk.digest)?;
+        let whole = Zeroizing::new(
+            held.into_values()
+                .flat_map(|part| part.to_vec())
+                .collect::<Vec<u8>>(),
+        );
+        if archive_digest(&whole) != chunk.digest {
+            return None;
+        }
+        Archive::decode_exact(&whole).map(|archive| (chunk.digest, archive))
     }
+
+    /// The position before the first part of an archive not complete yet,
+    /// which reading starts from again.
+    fn rewind(&self) -> Option<u64> {
+        self.parts.values().map(|(_, _, first)| first - 1).min()
+    }
+}
+
+/// `archive` sealed in chunks under `key` for `scope` at `epoch`, with its
+/// digest.
+fn chunks(
+    archive: &Archive,
+    key: &[u8; 32],
+    agent: &[u8; 32],
+    scope: Scope,
+    epoch: u64,
+) -> ([u8; 32], Vec<Vec<u8>>) {
+    let whole = Zeroizing::new(archive.encode());
+    let digest = archive_digest(&whole);
+    let pieces: Vec<&[u8]> = whole.chunks(CHUNK_BYTES).collect();
+    let parts = u16::try_from(pieces.len()).expect("an archive under 3.6 GiB");
+    let envelopes = pieces
+        .into_iter()
+        .enumerate()
+        .map(|(part, bytes)| {
+            let body = Zeroizing::new(
+                Chunk {
+                    digest,
+                    part: part as u16,
+                    parts,
+                    bytes: bytes.to_vec(),
+                }
+                .encode(),
+            );
+            sealed::seal(key, agent, scope, epoch, &body).expect("a chunk fits an envelope")
+        })
+        .collect();
+    (digest, envelopes)
 }
 
 fn digest(domain: &[u8], bytes: &[u8]) -> [u8; 32] {
@@ -318,31 +372,49 @@ pub fn recovery_key(r: &[u8; 32]) -> Zeroizing<[u8; 32]> {
     Zeroizing::new(digest(b"vos/personal/recovery", r))
 }
 
-/// Open a recovery envelope of the agent whose identity is `agent` under
-/// `R`: what a kit reads once a restore released `R2`.
-pub fn open_recovery(
-    r: &[u8; 32],
-    agent: &[u8; 32],
-    envelope: &[u8],
-) -> Result<Recovered, OpenError> {
-    let (header, body) = sealed::open(&[*recovery_key(r)], agent, envelope)?;
-    if header.scope != RECOVERY {
-        return Err(OpenError::Framing);
+/// What the recovery scope's `envelopes` of the agent whose identity is
+/// `agent` hold under `R`: every complete archive in them, merged (the
+/// naming secret and every scope key the devices sealed there), as a kit
+/// reads it once a restore released `R2`; none if no envelope opens.
+pub fn open_recovery(r: &[u8; 32], agent: &[u8; 32], envelopes: &[Envelope]) -> Option<Archive> {
+    let key = recovery_key(r);
+    let mut reassembly = Reassembly::default();
+    let mut merged: Option<Archive> = None;
+    for envelope in envelopes {
+        let Ok((header, body)) = sealed::open(&[*key], agent, &envelope.bytes) else {
+            continue;
+        };
+        if header.scope != RECOVERY {
+            continue;
+        }
+        if let Some((_, archive)) = reassembly.add(envelope.position, &body) {
+            match &mut merged {
+                Some(merged) => merged.merge(&archive),
+                None => merged = Some(archive),
+            }
+        }
     }
-    let body = RecoveryBody::decode_exact(&body).ok_or(OpenError::Framing)?;
-    Ok(Recovered {
-        epoch: header.epoch,
-        naming: body.naming,
-        keys: body.keys,
-    })
+    merged
 }
 
-/// A scope's reading, stored: its cursor, and the epoch at which this
-/// device read or pushed what it keeps there.
+/// The archive scope's reading, stored: its cursor, and the confirmed
+/// epoch and the digest of the archive the agent is known to hold for it,
+/// this device's own or one it read.
 #[derive(Clone, Copy, Default, Encode, Decode)]
 struct Reading {
     cursor: u64,
     epoch: Option<u64>,
+    held: [u8; 32],
+}
+
+/// The recovery scope's reading, stored: its cursor, the `R` (by its
+/// `since`) it was read under, and the scopes and keys the agent holds
+/// sealed under it.
+#[derive(Clone, Default, Encode, Decode)]
+struct Recovering {
+    cursor: u64,
+    since: Option<u64>,
+    held: Option<Archive>,
 }
 
 /// Sealed sync of a light node's scopes with the personal agent of its
@@ -492,10 +564,19 @@ impl<'a, L: Link> SealedSync<'a, L> {
             }
         }
         self.light.sent(instance, &leftover)?;
+        // A node no envelope holds stays local, and so do the nodes after
+        // it: those before it are pushed, then the error.
         let mut fresh = Vec::new();
+        let mut unsealed = None;
         for (seq, node) in &nodes {
             if !queued.contains_key(seq) {
-                fresh.push((*seq, self.seal(scope, *seq, node)?));
+                match self.seal(scope, *seq, node) {
+                    Ok(entry) => fresh.push((*seq, entry)),
+                    Err(error) => {
+                        unsealed = Some(error);
+                        break;
+                    }
+                }
             }
         }
         self.light.enqueue(instance, &fresh)?;
@@ -541,12 +622,17 @@ impl<'a, L: Link> SealedSync<'a, L> {
                     self.light.enqueue(instance, &resealed)?;
                     queued.extend(resealed);
                 }
-                Some(PersonalError::StaleEpoch { confirmed }) => {
+                Some(PersonalError::StaleEpoch { confirmed })
+                    if confirmed > self.group.confirmed() =>
+                {
                     report.stale = Some(confirmed);
                     return Ok(report);
                 }
                 Some(error) => return Err(SyncError::Refused(error)),
             }
+        }
+        if let Some(error) = unsealed {
+            return Err(error);
         }
         Ok(report)
     }
@@ -569,7 +655,7 @@ impl<'a, L: Link> SealedSync<'a, L> {
         let agent = self.group.agent().identity;
         // Tracked from now: the archive records its key at every confirmed
         // epoch.
-        self.group.key(scope)?;
+        drop(Zeroizing::new(self.group.key(scope)?));
         let mut caught = Caught::default();
         loop {
             let from = self.light.cursor(instance)?.unwrap_or(0);
@@ -647,20 +733,19 @@ impl<'a, L: Link> SealedSync<'a, L> {
         })
     }
 
-    fn reading(&self, row: &[u8]) -> Result<Reading, SyncError<L::Error>> {
+    fn row<T: Decode + Default>(&self, row: &[u8]) -> Result<T, SyncError<L::Error>> {
         match self.light.store().group_row(row)? {
-            Some(bytes) => {
-                Reading::decode_exact(&bytes).ok_or(SyncError::Group(GroupError::Corrupt))
-            }
-            None => Ok(Reading::default()),
+            Some(bytes) => T::decode_exact(&bytes).ok_or(SyncError::Group(GroupError::Corrupt)),
+            None => Ok(T::default()),
         }
     }
 
-    fn store_reading(&self, row: &[u8], reading: Reading) -> Result<(), SyncError<L::Error>> {
+    fn store_row(&self, row: &[u8], value: &impl Encode) -> Result<(), SyncError<L::Error>> {
+        let bytes = Zeroizing::new(value.encode());
         Ok(self
             .light
             .store()
-            .write_group_rows(vec![(row.to_vec(), Some(reading.encode()))])?)
+            .write_group_rows(vec![(row.to_vec(), Some(bytes.to_vec()))])?)
     }
 
     /// Push `envelopes` at the confirmed epoch: how many the agent took,
@@ -670,7 +755,9 @@ impl<'a, L: Link> SealedSync<'a, L> {
         for answer in self.send(envelopes)? {
             match answer {
                 Ok(_) => kept.pushed += 1,
-                Err(PersonalError::StaleEpoch { confirmed }) => {
+                Err(PersonalError::StaleEpoch { confirmed })
+                    if confirmed > self.group.confirmed() =>
+                {
                     kept.stale = Some(confirmed);
                     return Ok(kept);
                 }
@@ -680,165 +767,155 @@ impl<'a, L: Link> SealedSync<'a, L> {
         Ok(kept)
     }
 
+    /// Read `scope` after `cursor`, each envelope that opens under `key`
+    /// a chunk of an archive (of the confirmed epoch alone, with
+    /// `epoch`): every archive completed, and the position read to, before
+    /// any archive whose parts are not all in and before an envelope of an
+    /// epoch past the confirmed one.
+    #[allow(clippy::type_complexity)]
+    fn read_archives(
+        &mut self,
+        scope: Scope,
+        key: &[u8; 32],
+        mut cursor: u64,
+        epoch: Option<u64>,
+    ) -> Result<(Vec<([u8; 32], Archive)>, u64), SyncError<L::Error>> {
+        let agent = self.group.agent().identity;
+        let confirmed = self.group.confirmed();
+        let mut reassembly = Reassembly::default();
+        let mut archives = Vec::new();
+        'read: loop {
+            let page = self.since(scope, cursor)?;
+            if page.is_empty() {
+                break;
+            }
+            for envelope in page {
+                if envelope.position <= cursor {
+                    return Err(SyncError::Disordered);
+                }
+                let header = sealed::header_of(&envelope.bytes);
+                if header.is_ok_and(|header| header.epoch > confirmed) {
+                    break 'read;
+                }
+                cursor = envelope.position;
+                if !header.is_ok_and(|header| {
+                    header.scope == scope && epoch.is_none_or(|epoch| header.epoch == epoch)
+                }) {
+                    continue;
+                }
+                let keys = Zeroizing::new([*key]);
+                if let Ok((_, body)) = sealed::open(&*keys, &agent, &envelope.bytes)
+                    && let Some(archive) = reassembly.add(envelope.position, &body)
+                {
+                    archives.push(archive);
+                }
+            }
+        }
+        Ok((
+            archives,
+            reassembly
+                .rewind()
+                .map_or(cursor, |first| first.min(cursor)),
+        ))
+    }
+
     /// Read the archive's scope from its cursor, merging every archive
-    /// sealed at the confirmed epoch; if none was, push this device's
-    /// there, chunked. Archives of earlier epochs are passed over: their
-    /// keys are this device's no longer, and a later archive holds theirs.
+    /// sealed at the confirmed epoch, `R` left out; then, unless the agent
+    /// holds one at this epoch that is this device's whole archive, push
+    /// this device's there, chunked: the committer's push once an epoch is
+    /// confirmed, and any device's that holds keys the archives there lack,
+    /// are one rule. Archives of earlier epochs are passed over: their keys
+    /// are this device's no longer, and a later archive holds theirs.
     pub fn archive(&mut self) -> Result<Kept, SyncError<L::Error>> {
         let scope = self.group.archive().scope(ARCHIVE_NAME);
         let agent = self.group.agent().identity;
         let epoch = self.group.confirmed();
         let key = Zeroizing::new(self.group.archive_key()?);
-        let mut reading = self.reading(ARCHIVE_ROW)?;
+        let mut reading: Reading = self.row(ARCHIVE_ROW)?;
         let mut kept = Kept::default();
-        // The parts of each archive read, by its digest: how many it has,
-        // its parts, and the position of its first part read.
-        let mut parts: BTreeMap<[u8; 32], Parts> = BTreeMap::new();
-        let mut later = false;
-        while !later {
-            let page = self.since(scope, reading.cursor)?;
-            if page.is_empty() {
-                break;
-            }
-            for envelope in page {
-                if envelope.position <= reading.cursor {
-                    return Err(SyncError::Disordered);
-                }
-                let header = sealed::header_of(&envelope.bytes);
-                if header.is_ok_and(|header| header.epoch > epoch) {
-                    later = true;
-                    break;
-                }
-                reading.cursor = envelope.position;
-                if header.is_ok_and(|header| header.epoch == epoch && header.scope == scope)
-                    && let Ok((_, body)) = sealed::open(&[*key], &agent, &envelope.bytes)
-                    && let Some(chunk) = Chunk::decode_exact(&body)
-                    && chunk.part < chunk.parts
-                {
-                    let (count, held, _) = parts.entry(chunk.digest).or_insert((
-                        chunk.parts,
-                        BTreeMap::new(),
-                        envelope.position,
-                    ));
-                    if *count == chunk.parts {
-                        held.insert(chunk.part, chunk.bytes);
-                    }
-                    if held.len() == *count as usize {
-                        let (_, held, _) = parts.remove(&chunk.digest).expect("held");
-                        let whole =
-                            Zeroizing::new(held.into_values().flatten().collect::<Vec<u8>>());
-                        if digest(b"vos/personal/archive-digest", &whole) == chunk.digest
-                            && let Some(archive) = Archive::decode_exact(&whole)
-                        {
-                            self.group.merge_archive(&archive)?;
-                            kept.found += 1;
-                            reading.epoch = Some(epoch);
-                        }
-                    }
-                }
-            }
-        }
-        // An archive whose parts are not all in yet is read again from its
-        // first part.
-        if let Some(first) = parts.values().map(|(_, _, first)| *first).min() {
-            reading.cursor = reading.cursor.min(first - 1);
-        }
-        self.store_reading(ARCHIVE_ROW, reading)?;
+        let (archives, cursor) = self.read_archives(scope, &key, reading.cursor, Some(epoch))?;
+        reading.cursor = cursor;
         if reading.epoch != Some(epoch) {
-            let whole = Zeroizing::new(self.group.archive().encode());
-            let digest = digest(b"vos/personal/archive-digest", &whole);
-            let chunks: Vec<&[u8]> = whole.chunks(CHUNK_BYTES).collect();
-            let parts = u16::try_from(chunks.len()).expect("an archive under 3.6 GiB");
-            let mut envelopes = Vec::with_capacity(chunks.len());
-            for (part, bytes) in chunks.into_iter().enumerate() {
-                let body = Zeroizing::new(
-                    Chunk {
-                        digest,
-                        part: part as u16,
-                        parts,
-                        bytes: bytes.to_vec(),
-                    }
-                    .encode(),
-                );
-                envelopes.push(
-                    sealed::seal(&key, &agent, scope, epoch, &body)
-                        .expect("a chunk fits an envelope"),
-                );
-            }
+            reading.epoch = Some(epoch);
+            reading.held = [0; 32];
+        }
+        let mut held = vec![reading.held];
+        for (digest, archive) in archives {
+            self.group.merge_archive(&archive.without_recovery())?;
+            held.push(digest);
+            kept.found += 1;
+        }
+        let mine = self.group.archive().without_recovery();
+        let digest = archive_digest(&mine.encode());
+        if held.contains(&digest) {
+            reading.held = digest;
+        } else {
+            let (digest, envelopes) = chunks(&mine, &key, &agent, scope, epoch);
             let pushed = self.push_kept(&envelopes)?;
             kept.pushed = pushed.pushed;
             kept.stale = pushed.stale;
             if pushed.stale.is_none() {
-                reading.epoch = Some(epoch);
-                self.store_reading(ARCHIVE_ROW, reading)?;
+                reading.held = digest;
             }
         }
+        self.store_row(ARCHIVE_ROW, &reading)?;
         Ok(kept)
     }
 
-    /// Read the recovery scope from its cursor for an envelope sealed under
-    /// `R` at the confirmed epoch; if none is there, push this device's:
-    /// the naming secret and the epoch's scope keys. Nothing without `R`.
+    /// Read the recovery scope from its cursor for what the agent holds
+    /// sealed under `R`, and push, sealed under it at the confirmed epoch,
+    /// whatever of this device's archive it lacks: the naming secret and
+    /// every scope key, so the kit's copy never lags. Nothing without `R`;
+    /// a new `R` reads the scope again from its start and pushes the whole
+    /// archive under it.
     pub fn recovery(&mut self) -> Result<Kept, SyncError<L::Error>> {
-        let Some(recovery) = self.group.archive().recovery else {
+        let Some((since, key)) = self
+            .group
+            .archive()
+            .recovery
+            .as_ref()
+            .map(|recovery| (recovery.since, recovery_key(&recovery.r)))
+        else {
             return Ok(Kept::default());
         };
-        let key = recovery_key(&recovery.r);
         let agent = self.group.agent().identity;
         let epoch = self.group.confirmed();
-        let mut reading = self.reading(RECOVERY_ROW)?;
+        let mut reading: Recovering = self.row(RECOVERY_ROW)?;
+        if reading.since != Some(since) {
+            reading = Recovering {
+                cursor: 0,
+                since: Some(since),
+                held: None,
+            };
+        }
         let mut kept = Kept::default();
-        'read: loop {
-            let page = self.since(RECOVERY, reading.cursor)?;
-            if page.is_empty() {
-                break;
-            }
-            for envelope in page {
-                if envelope.position <= reading.cursor {
-                    return Err(SyncError::Disordered);
-                }
-                if sealed::header_of(&envelope.bytes).is_ok_and(|header| header.epoch > epoch) {
-                    break 'read;
-                }
-                reading.cursor = envelope.position;
-                if open_recovery(&recovery.r, &agent, &envelope.bytes)
-                    .is_ok_and(|recovered| recovered.epoch == epoch)
-                {
-                    kept.found += 1;
-                    reading.epoch = Some(epoch);
-                }
+        let (archives, cursor) = self.read_archives(RECOVERY, &key, reading.cursor, None)?;
+        reading.cursor = cursor;
+        for (_, archive) in archives {
+            kept.found += 1;
+            match &mut reading.held {
+                Some(held) => held.merge(&archive),
+                None => reading.held = Some(archive),
             }
         }
-        self.store_reading(RECOVERY_ROW, reading)?;
-        if reading.epoch != Some(epoch) {
-            let archive = self.group.archive();
-            let keys = archive
-                .scopes
-                .iter()
-                .flat_map(|scope| {
-                    archive
-                        .keys(epoch, scope)
-                        .iter()
-                        .map(move |key| (*scope, *key))
-                })
-                .collect();
-            let body = Zeroizing::new(
-                RecoveryBody {
-                    naming: archive.naming,
-                    keys,
-                }
-                .encode(),
-            );
-            let envelope = sealed::seal(&key, &agent, RECOVERY, epoch, &body)
-                .map_err(|_| SyncError::TooLarge { seq: epoch })?;
-            let pushed = self.push_kept(&[envelope])?;
+        let mine = self.group.archive().without_recovery();
+        let lacking = match &reading.held {
+            Some(held) if held.naming == mine.naming => mine.beyond(held),
+            _ => mine,
+        };
+        if !lacking.is_empty() || reading.held.is_none() {
+            let (_, envelopes) = chunks(&lacking, &key, &agent, RECOVERY, epoch);
+            let pushed = self.push_kept(&envelopes)?;
             kept.pushed = pushed.pushed;
             kept.stale = pushed.stale;
             if pushed.stale.is_none() {
-                reading.epoch = Some(epoch);
-                self.store_reading(RECOVERY_ROW, reading)?;
+                match &mut reading.held {
+                    Some(held) => held.merge(&lacking),
+                    None => reading.held = Some(lacking),
+                }
             }
         }
+        self.store_row(RECOVERY_ROW, &reading)?;
         Ok(kept)
     }
 }
