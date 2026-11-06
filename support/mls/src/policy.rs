@@ -10,7 +10,9 @@
 //! - **The logged effect:** handshakes are encrypted, so only devices can
 //!   check that a commit's proposals are the ones its log entry declares.
 //!   A candidate is processed under [`Expected`]: its committer's
-//!   credential, and the credentials it adds and removes, exactly.
+//!   credential, and the credentials it adds and removes, exactly; and the
+//!   committer's renewed credential when the device set replaced its
+//!   admin key.
 //! - **Handshakes** are `PrivateMessage`s, padded (Padmé); a Welcome
 //!   carries the ratchet tree, one for every new member.
 
@@ -65,12 +67,14 @@ impl std::error::Error for Refused {}
 impl mls_rs_core::error::IntoAnyError for Refused {}
 
 /// A commit's logged effect, which a received commit must be exactly: its
-/// committer's credential, and the credentials it adds and removes.
+/// committer's credential, the credentials it adds and removes, and the
+/// credential its committer's leaf takes, if another.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Expected {
     pub committer: Vec<u8>,
     pub adds: Vec<Vec<u8>>,
     pub removes: Vec<Vec<u8>>,
+    pub renewed: Option<Vec<u8>>,
 }
 
 /// The device group's rules: the allow-list on what a device sends and
@@ -179,11 +183,24 @@ impl MlsRules for Rules {
 
 /// The device group's identities: a basic credential of a device's sync
 /// key and admin key, the leaf's identity its sync key, a successor the
-/// same credential: a leaf's keys change only by its device's removal and
-/// a new add, never by its own update. Every check against the device set is the caller's,
-/// through [`Expected`].
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Identity;
+/// same credential, or the one renewal allowed: a leaf's keys change by
+/// its device's removal and a new add, and its admin key by the renewal
+/// that follows a matured replacement. Every check against the device set
+/// is the caller's, through [`Expected`].
+#[derive(Clone, Debug, Default)]
+pub struct Identity {
+    renewal: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+impl Identity {
+    /// The identities allowing one leaf's credential `before` to be
+    /// succeeded by `after`.
+    pub fn renewing(before: Vec<u8>, after: Vec<u8>) -> Self {
+        Self {
+            renewal: Some((before, after)),
+        }
+    }
+}
 
 impl IdentityProvider for Identity {
     type Error = Refused;
@@ -223,7 +240,11 @@ impl IdentityProvider for Identity {
         else {
             return Err(Refused::Credential);
         };
-        Ok(before == after)
+        Ok(before == after
+            || self
+                .renewal
+                .as_ref()
+                .is_some_and(|(from, to)| from[..] == *before && to[..] == *after))
     }
 
     fn supported_types(&self) -> Vec<CredentialType> {

@@ -2,8 +2,8 @@
 //! commits held and confirmed on copies; a copy leaving the current state
 //! as it was; a held commit across a reopen, matched by its handshake and
 //! deleted on a void; the device group's policy refusing what it does not
-//! allow, from a member running other rules; a removed member; and a
-//! restart into a new group.
+//! allow, from a member running other rules; a removed member; a leaf's
+//! credential renewed; and a restart into a new group.
 
 use std::collections::BTreeMap;
 
@@ -54,6 +54,7 @@ fn expected(committer: u8, adds: &[u8], removes: &[u8]) -> Expected {
         committer: credential(committer),
         adds: adds.iter().map(|n| credential(*n)).collect(),
         removes: removes.iter().map(|n| credential(*n)).collect(),
+        renewed: None,
     }
 }
 
@@ -317,7 +318,7 @@ fn loose(
     let client = Client::builder()
         .group_state_storage(namespace.clone())
         .key_package_repo(namespace)
-        .identity_provider(Identity)
+        .identity_provider(Identity::default())
         .crypto_provider(RustCryptoProvider::default())
         .mls_rules(rules)
         .build();
@@ -472,4 +473,73 @@ fn a_restart_starts_a_new_group_and_leaves_the_old() {
     };
     assert_eq!(states(&a), 1, "the old group's state is deleted");
     assert_eq!(states(&b), 1);
+}
+
+/// A leaf's credential renewed by its own commit: received only under an
+/// expected renewal to that credential, refused otherwise; held across a
+/// void, which keeps the old one, and the member's from the swap, its next
+/// commit by the new credential; and kept across a reopen.
+#[test]
+fn a_leafs_credential_is_renewed_only_as_expected() {
+    let (mut a, mut b, mut c) = three();
+    let renewed = credential(0x22);
+    let void = b
+        .mls
+        .renew(&renewed, &[], &[], T + 1, |_| BTreeMap::new())
+        .unwrap();
+    assert!(matches!(
+        a.mls.process(&void.handshake, T + 1, expected(2, &[], &[])),
+        Err(Error::Refused(_))
+    ));
+    b.mls.void(BTreeMap::new()).unwrap();
+    assert_eq!(
+        b.mls.credential(),
+        credential(2),
+        "a void keeps the old one"
+    );
+
+    let update = b
+        .mls
+        .renew(&renewed, &[], &[], T + 1, |_| BTreeMap::new())
+        .unwrap();
+    let expecting = Expected {
+        renewed: Some(renewed.clone()),
+        ..expected(2, &[], &[])
+    };
+    let elsewhere = Expected {
+        renewed: Some(credential(0x23)),
+        ..expected(2, &[], &[])
+    };
+    assert!(matches!(
+        a.mls.process(&update.handshake, T + 1, elsewhere),
+        Err(Error::Refused(_))
+    ));
+    let on_a = a
+        .mls
+        .process(&update.handshake, T + 1, expecting.clone())
+        .unwrap();
+    let on_c = c.mls.process(&update.handshake, T + 1, expecting).unwrap();
+    assert!(
+        on_a.credentials()
+            .iter()
+            .any(|(_, credential)| *credential == renewed)
+    );
+    let own = b.mls.own(&update.handshake).unwrap();
+    a.mls.swap(on_a, BTreeMap::new()).unwrap();
+    c.mls.swap(on_c, BTreeMap::new()).unwrap();
+    b.mls.swap(own, BTreeMap::new()).unwrap();
+    agree(&[&a, &b, &c], 2);
+    assert_eq!(b.mls.credential(), renewed);
+    assert_eq!(reopen(&b, 2).credential(), renewed, "kept across a reopen");
+
+    let next = b.mls.commit(&[], &[], T + 2, |_| BTreeMap::new()).unwrap();
+    let by_new = Expected {
+        committer: renewed.clone(),
+        ..Expected::default()
+    };
+    let on_a = a.mls.process(&next.handshake, T + 2, by_new).unwrap();
+    a.mls.swap(on_a, BTreeMap::new()).unwrap();
+    let own = b.mls.own(&next.handshake).unwrap();
+    b.mls.swap(own, BTreeMap::new()).unwrap();
+    agree(&[&a, &b], 3);
 }

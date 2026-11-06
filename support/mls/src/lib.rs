@@ -76,9 +76,10 @@ pub type Config = IntoConfigOutput<
 >;
 
 /// A namespace's rows beside mls-rs's: the leaf's signing key and
-/// identity, the group's id, the held commit, and the id of the new group
-/// a held restart starts.
+/// identity, the identity a held commit renews it to, the group's id, the
+/// held commit, and the id of the new group a held restart starts.
 const SIGNER: &[u8] = b"signer";
+const RENEWED: &[u8] = b"renewed";
 const GROUP: &[u8] = b"group";
 const HELD: &[u8] = b"held";
 const NEXT: &[u8] = b"next";
@@ -264,6 +265,22 @@ fn leaf(group: &Group<Config>, index: u32) -> Option<LeafNode> {
     }
 }
 
+fn encode_signer(
+    secret: &SignatureSecretKey,
+    identity: &SigningIdentity,
+) -> Result<Vec<u8>, Error> {
+    let mut bytes = secret.mls_encode_to_vec().map_err(|_| Error::Corrupt)?;
+    bytes.extend(identity.mls_encode_to_vec().map_err(|_| Error::Corrupt)?);
+    Ok(bytes)
+}
+
+fn decode_signer(bytes: &[u8]) -> Result<(SignatureSecretKey, SigningIdentity), Error> {
+    let mut reader = bytes;
+    let secret = SignatureSecretKey::mls_decode(&mut reader).map_err(|_| Error::Corrupt)?;
+    let identity = SigningIdentity::mls_decode(&mut reader).map_err(|_| Error::Corrupt)?;
+    Ok((secret, identity))
+}
+
 /// A held commit's row: its handshake's hash, its epoch little-endian and
 /// its secrets.
 struct Held {
@@ -301,11 +318,12 @@ fn client(
     namespace: &Namespace,
     rules: Rules,
     signer: Option<(SignatureSecretKey, SigningIdentity)>,
+    identity: Identity,
 ) -> Client<Config> {
     let builder = Client::builder()
         .group_state_storage(namespace.clone())
         .key_package_repo(namespace.clone())
-        .identity_provider(Identity)
+        .identity_provider(identity)
         .crypto_provider(RustCryptoProvider::default())
         .mls_rules(rules);
     match signer {
@@ -320,14 +338,7 @@ impl Mls {
     /// signing key drawn and written in one batch with `rows`.
     pub fn open(namespace: Namespace, credential: &[u8], rows: Writes) -> Result<Self, Error> {
         let signer = match namespace.get(SIGNER)? {
-            Some(bytes) => {
-                let mut reader = &bytes[..];
-                let secret =
-                    SignatureSecretKey::mls_decode(&mut reader).map_err(|_| Error::Corrupt)?;
-                let identity =
-                    SigningIdentity::mls_decode(&mut reader).map_err(|_| Error::Corrupt)?;
-                (secret, identity)
-            }
+            Some(bytes) => decode_signer(&bytes)?,
             None => {
                 let suite = RustCryptoProvider::default()
                     .cipher_suite_provider(SUITE)
@@ -337,14 +348,17 @@ impl Mls {
                 })?;
                 let credential = BasicCredential::new(credential.to_vec()).into_credential();
                 let identity = SigningIdentity::new(credential, public);
-                let mut bytes = secret.mls_encode_to_vec().map_err(|_| Error::Corrupt)?;
-                bytes.extend(identity.mls_encode_to_vec().map_err(|_| Error::Corrupt)?);
-                namespace.put(SIGNER, Some(bytes));
+                namespace.put(SIGNER, Some(encode_signer(&secret, &identity)?));
                 (secret, identity)
             }
         };
         let mut mls = Self {
-            client: client(&namespace, Rules::default(), Some(signer.clone())),
+            client: client(
+                &namespace,
+                Rules::default(),
+                Some(signer.clone()),
+                Identity::default(),
+            ),
             signer,
             namespace,
             group: None,
@@ -373,8 +387,21 @@ impl Mls {
         }
     }
 
-    /// The current group, read from the namespace's rows.
+    /// The current group, read from the namespace's rows, and the signer
+    /// as a renewal swapped in left it.
     fn reload(&mut self) -> Result<(), Error> {
+        if let Some(bytes) = self.namespace.get(SIGNER)? {
+            let signer = decode_signer(&bytes)?;
+            if signer.1 != self.signer.1 {
+                self.client = client(
+                    &self.namespace,
+                    Rules::default(),
+                    Some(signer.clone()),
+                    Identity::default(),
+                );
+                self.signer = signer;
+            }
+        }
         self.group = match self.namespace.get(GROUP)? {
             Some(id) => Some(
                 self.client
@@ -490,10 +517,34 @@ impl Mls {
         time: u64,
         rows: impl FnOnce(&Commit) -> Writes,
     ) -> Result<Commit, Error> {
+        self.commit_as(None, adds, removes, time, rows)
+    }
+
+    /// [`Mls::commit`], the leaf's credential renewed to `credential` (its
+    /// signing key kept): the member's from the commit's swap.
+    pub fn renew(
+        &mut self,
+        credential: &[u8],
+        adds: &[Vec<u8>],
+        removes: &[Vec<u8>],
+        time: u64,
+        rows: impl FnOnce(&Commit) -> Writes,
+    ) -> Result<Commit, Error> {
+        self.commit_as(Some(credential), adds, removes, time, rows)
+    }
+
+    fn commit_as(
+        &mut self,
+        renewed: Option<&[u8]>,
+        adds: &[Vec<u8>],
+        removes: &[Vec<u8>],
+        time: u64,
+        rows: impl FnOnce(&Commit) -> Writes,
+    ) -> Result<Commit, Error> {
         if self.held_row()?.is_some() {
             return Err(Error::Held);
         }
-        match self.held_commit(adds, removes, time) {
+        match self.held_commit(renewed, adds, removes, time) {
             Ok(commit) => {
                 self.flush(rows(&commit))?;
                 Ok(commit)
@@ -512,13 +563,43 @@ impl Mls {
     /// commit staged.
     fn held_commit(
         &mut self,
+        renewed: Option<&[u8]>,
         adds: &[Vec<u8>],
         removes: &[Vec<u8>],
         time: u64,
     ) -> Result<Commit, Error> {
+        let renewal = match renewed {
+            Some(credential) => {
+                let identity = SigningIdentity::new(
+                    BasicCredential::new(credential.to_vec()).into_credential(),
+                    self.signer.1.signature_key.clone(),
+                );
+                // The group as a client allowing the renewal loads it.
+                let id = self.group()?.group_id().to_vec();
+                let allowing = client(
+                    &self.namespace,
+                    Rules::default(),
+                    Some(self.signer.clone()),
+                    Identity::renewing(self.credential(), credential.to_vec()),
+                );
+                self.group = Some(
+                    allowing
+                        .load_group(&id)
+                        .map_err(|error| self.failure(error))?,
+                );
+                self.namespace
+                    .put(RENEWED, Some(encode_signer(&self.signer.0, &identity)?));
+                Some(identity)
+            }
+            None => None,
+        };
+        let secret = self.signer.0.clone();
         let group = self.group.as_mut().ok_or(Error::NoGroup)?;
         let members = credentials(group);
         let mut builder = group.commit_builder().commit_time(MlsTime::from(time));
+        if let Some(identity) = renewal {
+            builder = builder.set_new_signing_identity(secret, identity);
+        }
         for package in adds {
             let message = MlsMessage::from_bytes(package)?;
             builder = builder.add_member(message)?;
@@ -614,11 +695,11 @@ impl Mls {
         })
     }
 
-    /// A copy of the current group under `rules`.
-    fn copy(&self, rules: Rules) -> Result<(Group<Config>, Namespace), Error> {
+    /// A copy of the current group under `rules` and `identity`.
+    fn copy(&self, rules: Rules, identity: Identity) -> Result<(Group<Config>, Namespace), Error> {
         let id = self.group()?.group_id().to_vec();
         let namespace = self.namespace.copy();
-        let client = client(&namespace, rules, None);
+        let client = client(&namespace, rules, None, identity);
         let group = client
             .load_group(&id)
             .map_err(|error| match namespace.take_failure() {
@@ -637,7 +718,7 @@ impl Mls {
                 return Err(Error::NotHeld);
             }
             let namespace = self.namespace.copy();
-            let group = client(&namespace, Rules::default(), None)
+            let group = client(&namespace, Rules::default(), None, Identity::default())
                 .load_group(&next)
                 .map_err(|error| match namespace.take_failure() {
                     Some(error) => Error::Store(error),
@@ -652,7 +733,15 @@ impl Mls {
         if held.hash != handshake_hash(handshake) || held.epoch != self.epoch()? + 1 {
             return Err(Error::NotHeld);
         }
-        let (mut group, namespace) = self.copy(Rules::default())?;
+        let identity = match self.namespace.get(RENEWED)? {
+            Some(bytes) => {
+                let (_, renewed) = decode_signer(&bytes)?;
+                let after = renewed.credential.as_basic().ok_or(Error::Corrupt)?;
+                Identity::renewing(self.credential(), after.identifier.clone())
+            }
+            None => Identity::default(),
+        };
+        let (mut group, namespace) = self.copy(Rules::default(), identity)?;
         let secrets = CommitSecrets::from_bytes(&held.secrets).map_err(|_| Error::Corrupt)?;
         group.apply_detached_commit(secrets)?;
         Ok(Candidate {
@@ -681,7 +770,11 @@ impl Mls {
             return refused(Refusal::Plaintext);
         }
         let current = self.group()?;
-        let (mut group, namespace) = self.copy(Rules::expecting(expected))?;
+        let identity = match &expected.renewed {
+            Some(after) => Identity::renewing(expected.committer.clone(), after.clone()),
+            None => Identity::default(),
+        };
+        let (mut group, namespace) = self.copy(Rules::expecting(expected), identity)?;
         let received = match group.process_incoming_message_with_time(message, MlsTime::from(time))
         {
             Ok(received) => received,
@@ -729,7 +822,12 @@ impl Mls {
             return Err(Error::Refused(Refusal::Malformed));
         };
         let namespace = self.namespace.copy();
-        let client = client(&namespace, Rules::default(), Some(self.signer.clone()));
+        let client = client(
+            &namespace,
+            Rules::default(),
+            Some(self.signer.clone()),
+            Identity::default(),
+        );
         let group = match client.join_group(None, &message, Some(MlsTime::from(time))) {
             Ok((group, _)) => group,
             Err(error) => {
@@ -767,6 +865,11 @@ impl Mls {
                 return Err(Error::NotHeld);
             }
             Kind::Joined | Kind::Own | Kind::Received | Kind::Started => {
+                if kind == Kind::Own
+                    && let Some(renewed) = self.namespace.get(RENEWED)?
+                {
+                    self.namespace.put(SIGNER, Some(renewed));
+                }
                 if let Some(current) = &self.group
                     && current.group_id() != group.group_id()
                 {
@@ -781,6 +884,7 @@ impl Mls {
         }
         self.namespace.put(HELD, None);
         self.namespace.put(NEXT, None);
+        self.namespace.put(RENEWED, None);
         self.flush(rows)
     }
 
@@ -793,6 +897,7 @@ impl Mls {
             self.namespace.put(NEXT, None);
         }
         self.namespace.put(HELD, None);
+        self.namespace.put(RENEWED, None);
         self.flush(rows)
     }
 
