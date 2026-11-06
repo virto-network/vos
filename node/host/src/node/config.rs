@@ -168,6 +168,11 @@ pub struct Config {
     /// The most credential proofs the node verifies at once: past them, a
     /// credentialed call is answered busy. `None` for twice its executors.
     pub verifications: Option<usize>,
+    /// The device formats the operator retired, each at its time in ms,
+    /// where that is earlier than its release's (`light-node.md` §4.4): a
+    /// proof of one is refused from that time. The operator's `Retire`
+    /// sets one live, until the node restarts.
+    pub retired_formats: Vec<(u32, u64)>,
 }
 
 impl Config {
@@ -228,6 +233,7 @@ impl Config {
             local_operator: true,
             operator_nonces: 1 << 16,
             verifications: None,
+            retired_formats: Vec::new(),
         }
     }
 }

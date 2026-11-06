@@ -267,6 +267,48 @@ unsafe fn same(ours: &[u64; 4], theirs: *const u8) -> u64 {
     u64::from(differ == 0)
 }
 
+/// `auth`'s reference run: the credential kernels' public reference
+/// statement (`vos_sdk::p2::reference`) in this kernel's layout, its bytes
+/// kept for the run, each argument where they lie. It shares no code with
+/// the kernel's entry, so the kernel's code is as without it.
+mod reference {
+    use alloc::vec::Vec;
+
+    use vos_sdk::p2::TagHash;
+    use vos_sdk::p2::reference::{BINDING, PATH, SCOPE, SECRET};
+
+    use super::*;
+
+    pub fn auth() -> device::Auth {
+        let member = Tag::Member.hash(&SECRET);
+        let root = PATH.root(&Tag::Leaf.hash(&member));
+        let nullifier = Tag::Nf.hash(&SECRET).hash(&SCOPE);
+        let mut bytes = Vec::with_capacity(1024 + 32 + 129);
+        for digest in PATH.siblings.iter().chain([&SECRET]) {
+            bytes.extend_from_slice(&digest.to_bytes());
+        }
+        let public = bytes.len();
+        for digest in [root, SCOPE, nullifier, BINDING] {
+            bytes.extend_from_slice(&digest.to_bytes());
+        }
+        let at = Vec::leak(bytes).as_ptr();
+        // SAFETY: the leaked bytes live for the run, each argument's within
+        // them.
+        unsafe {
+            device::Auth {
+                siblings: InPlace(at),
+                secret: InPlace(at.add(1024)),
+                slot: 0,
+                kind: 0,
+                map_root: InPlace(at.add(public)),
+                scope: InPlace(at.add(public + 32)),
+                nullifier: InPlace(at.add(public + 64)),
+                binding: InPlace(at.add(public + 96)),
+            }
+        }
+    }
+}
+
 #[actor]
 pub struct Device {}
 
@@ -295,7 +337,7 @@ impl Device {
     /// Anything else traps. The siblings come first, so they lie
     /// page-aligned where the witness input left them, and the secret
     /// 8-aligned after them.
-    #[attestable(gas = 50_000_000, device)]
+    #[attestable(gas = 50_000_000, device, reference = reference::auth)]
     #[allow(clippy::too_many_arguments)]
     pub fn auth(
         siblings: InPlace<1024>,

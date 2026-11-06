@@ -200,6 +200,24 @@ pub enum AgentCommand {
         #[arg(long, action = clap::ArgAction::Set)]
         every: bool,
     },
+    /// Retire a device kernel's previous release in an instance
+    /// (`light-node.md` §4.4): its guard stops admitting it at `--at-ms`, by
+    /// the agent's batch time, if that is earlier than its date; now by
+    /// default. Its answer is printed: the date kept, if one is, encoded.
+    Retire {
+        #[command(flatten)]
+        operator: OperatorArgs,
+        #[arg(long)]
+        agent: u32,
+        #[arg(long)]
+        instance: u32,
+        /// The device kernel, by its method's name.
+        #[arg(long)]
+        method: String,
+        /// When, in milliseconds since the Unix epoch.
+        #[arg(long, default_value_t = 0)]
+        at_ms: u64,
+    },
     /// Replace one of an agent's replicas by another node, at its leader:
     /// the replicas are printed once the change committed.
     Replace {

@@ -400,4 +400,16 @@ pub enum Admin {
     /// other agents its cut holds.
     #[codec(index = 2)]
     ReportEveryWindow(bool),
+    /// Retire device kernel `method`'s previous release in `instance` at
+    /// `at_ms` by the agent's batch time, if that is earlier than its date
+    /// (`light-node.md` §4.4): an operator who finds it unsound retires it
+    /// now. At or before the batch's time it is deleted, and its guard
+    /// admits the kernel's release alone. Done whether or not one was
+    /// kept; its outcome is the date kept, if one is, encoded.
+    #[codec(index = 3)]
+    Retire {
+        instance: InstanceId,
+        method: MethodId,
+        at_ms: u64,
+    },
 }

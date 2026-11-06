@@ -216,6 +216,15 @@ impl Api {
                 .filter(|(agent, _)| self.inner.admits(*agent, mark, None).is_ok())
                 .and_then(|(agent, instance)| self.schema(agent, instance))
                 .encode(),
+            // A device window computes the programs it names the first time:
+            // on an executor, once a release.
+            Kind::Devices => match <(AgentId, InstanceId)>::decode_exact(&body)
+                .filter(|(agent, _)| self.inner.admits(*agent, mark, None).is_ok())
+            {
+                Some((agent, instance)) => self.inner.device_window(agent, instance).await,
+                None => None,
+            }
+            .encode(),
             _ => self.respond(kind, mark, body, large).await.encode(),
         }
     }

@@ -197,6 +197,44 @@ impl Digest {
     }
 }
 
+/// The reference statement of the credential kernels (`light-node.md`
+/// §4.4): a fixed secret, known to all, its member at slot 0 of the empty
+/// tree, its nullifier in a fixed scope, a fixed binding. A public, valid
+/// statement of no member of any space, on which a credential kernel's
+/// reference run (`#[attestable(device, reference = path)]`) sizes its
+/// device program.
+pub mod reference {
+    use super::{DEPTH, Digest, Path, Secret};
+
+    /// The secret: word `i` is `0x7e1e_0000 + i`.
+    pub const SECRET: Secret = Digest(words(0x7e1e_0000));
+    /// The scope: word `i` is `0x5c0e_0000 + i`.
+    pub const SCOPE: Digest = Digest(words(0x5c0e_0000));
+    /// The binding: word `i` is `0x0b1d_0000 + i`.
+    pub const BINDING: Digest = Digest(words(0x0b1d_0000));
+    /// Slot 0 of the empty tree: each sibling the empty subtree's root at
+    /// its level.
+    pub const PATH: Path = {
+        let mut siblings = [Digest([0; 8]); DEPTH];
+        let mut level = 0;
+        while level < DEPTH {
+            siblings[level] = Digest(vos_wire::credentials::EMPTY[level]);
+            level += 1;
+        }
+        Path { siblings, slot: 0 }
+    };
+
+    const fn words(base: u32) -> [u32; 8] {
+        let mut words = [0; 8];
+        let mut i = 0;
+        while i < 8 {
+            words[i] = base + i as u32;
+            i += 1;
+        }
+        words
+    }
+}
+
 /// Equal by every word, never stopping early.
 impl PartialEq for Digest {
     #[inline(always)]

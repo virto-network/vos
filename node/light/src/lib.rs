@@ -24,9 +24,14 @@
 //!   against its call as ingress does.
 //! - **Device kernels** ([`DeviceProgram`], [`Prover::prove_kernel`]): a
 //!   kernel's run proved under the device profile, format 46, against the
-//!   program ingress computes from the same kernel; auth's statement by a
+//!   program ingress computes from the same kernel, which the app embeds
+//!   as a release artifact ([`release::Device`]); auth's statement by a
 //!   device kernel ([`Prover::prove_device_auth`], [`verify_device`]), which
 //!   a guard naming that kernel takes as it takes auth's credential proof.
+//!   The app proves with the newest program it ships that the space's
+//!   compatibility window admits ([`choose`], the window read by
+//!   [`wire::devices_request`]), and refuses before proving when it admits
+//!   none.
 //! - **The wire** ([`mod@wire`]): the node-API requests a client sends for
 //!   its time, its path, the root and a credentialed call, and the answers
 //!   it decodes.
@@ -54,7 +59,7 @@ pub mod wire;
 
 pub use call::{Call, NAME_BYTES, method_id, scope, transfer_arguments};
 pub use kernel::{
-    DEVICE_FORMAT, DEVICE_PEAK_BYTES, DeviceProgram, DeviceProof, auth_io, verify_device,
+    DEVICE_FORMAT, DEVICE_PEAK_BYTES, DeviceProgram, DeviceProof, auth_io, choose, verify_device,
 };
 pub use light::{Config, Error, LOCAL, Light};
 pub use path::PathKeeper;
@@ -141,6 +146,13 @@ pub enum DeviceError {
     Decode,
     /// A proof that does not verify against its call.
     Verify,
+    /// The space admits none of the programs this app ships for the
+    /// kernel (`light-node.md` §4.4): its compatibility window closed, or
+    /// the app is newer than the space; refused before proving.
+    Window,
+    /// The node could not compute one of the window's programs yet: ask
+    /// again, or another replica.
+    Unavailable,
 }
 
 impl core::fmt::Display for DeviceError {
@@ -152,6 +164,11 @@ impl core::fmt::Display for DeviceError {
             DeviceError::Prove => "the prover failed",
             DeviceError::Decode => "the answer does not decode",
             DeviceError::Verify => "the proof does not verify",
+            DeviceError::Unavailable => "the node holds the space's programs not yet: ask again",
+            DeviceError::Window => {
+                "the space admits none of this app's programs for the kernel: the app or the \
+                 space must update"
+            }
         })
     }
 }

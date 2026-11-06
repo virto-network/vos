@@ -1098,7 +1098,9 @@ outbox sequence numbers, which receivers deduplicate.
   workflow's attest of one does not compile. A credential guard names it
   (`device = "..."`), and ingress verifies its proofs (section 8.6). Its
   install record keeps a node segment shape, never proved; the node
-  computes its device program from the installed kernel instead.
+  computes its device program from the installed kernel and its
+  reference program instead (`light-node.md` §4.4), and its guard admits
+  the previous release's until its date.
 - **Verification** [proposed]:
   - On VOS, the receiving node verifies a proof at ingress, where trust
     changes, before the message enters the log. Refine sees only verified

@@ -11,10 +11,12 @@ impl Kernels {
     }
 
     /// An argument in place is read, never written.
-    #[attestable(device)]
+    #[attestable(device, reference = reference)]
     pub fn touch(digest: &mut Digest) {
         digest.0[0] = 0;
     }
 }
+
+fn reference() {}
 
 fn main() {}

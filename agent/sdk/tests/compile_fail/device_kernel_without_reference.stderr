@@ -1,0 +1,5 @@
+error: an #[attestable(device)] method names its reference run, `reference = path`: a function returning its message, a public, valid witness, whose run sizes its device program
+  --> tests/compile_fail/device_kernel_without_reference.rs:15:18
+   |
+15 |     #[attestable(device)]
+   |                  ^^^^^^

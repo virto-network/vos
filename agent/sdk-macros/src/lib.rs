@@ -114,7 +114,13 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   (`vos_sdk::p2::InPlace`: digests, paths, `#[derive(InPlace)]`
 ///   structs), come first and are read where its witness input left them,
 ///   never copied; its message type holds them by value, its encoding
-///   the same bytes.
+///   the same bytes. It names its reference run, `reference = path`: a
+///   function returning its message, a public, valid witness (no secret
+///   of anyone's), on whose run the device program each node and each
+///   release computes from the kernel is sized; the entry
+///   `__vos_reference_<name>` returns that message's encoding. A kernel
+///   whose runs may need more rows than its reference's declares
+///   `headroom = k`, each of the program's log sizes raised by `k`.
 /// - **Options:** `#[msg(role = "...", gas = N)]`, the role a caller needs
 ///   and the handler's gas limit; `#[workflow(role = "...", gas = N)]`
 ///   alike, the role checked when it starts and the gas each step's.

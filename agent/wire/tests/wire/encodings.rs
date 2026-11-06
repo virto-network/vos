@@ -11,7 +11,8 @@ use vos_wire::ingress::Grant;
 use vos_wire::jam::{AccumulateInput, RefineArgs, WorkError};
 use vos_wire::keys::{Due, Transform};
 use vos_wire::records::{
-    Derivation, Kernel, SegmentClass, Shape, Snapshot, Workflow, WorkflowState,
+    Derivation, DeviceRelease, Kernel, Previous, Reference, SegmentClass, Shape, Snapshot,
+    Workflow, WorkflowState,
 };
 use vos_wire::result::{CommittedWrite, InputRef, Outcome, Outgoing, Page, Run, Write};
 use vos_wire::{Decode, Encode};
@@ -134,6 +135,11 @@ fn installs_keep_their_bytes() {
         elf: [4; 32],
         transpiler: 5,
         heap: 6,
+        references: vec![Reference {
+            method: MethodId(0x0e0f_1011),
+            program: ProgramHash([9; 32]),
+            headroom: 2,
+        }],
     };
     let kernel = |method: u32, program: &[u8], root: &[u8], shape: &[u8]| {
         [&method.to_le_bytes()[..], program, root, shape].concat()
@@ -161,6 +167,10 @@ fn installs_keep_their_bytes() {
         &[4; 32],
         &5u32.to_le_bytes(),
         &6u32.to_le_bytes(),
+        &1u32.to_le_bytes(),
+        &0x0e0f_1011u32.to_le_bytes(),
+        &[9; 32],
+        &[2],
     ]
     .concat();
     assert_eq!(derivation.encode(), derived);
@@ -196,17 +206,65 @@ fn installs_keep_their_bytes() {
             admission: Default::default(),
         },
         target: Target::Jam,
+        previous: vec![Previous {
+            method: MethodId(0x0e0f_1011),
+            release: DeviceRelease {
+                kernel: ProgramHash([5; 32]),
+                reference: ProgramHash([6; 32]),
+                headroom: 0,
+            },
+            retires_ms: 0x0102_0304_0506_0708,
+        }],
     };
-    let record = [&derived[..], &roles, &0u32.to_le_bytes(), &[0, 0, 0], &[1]].concat();
+    let previous = [
+        &1u32.to_le_bytes()[..],
+        &0x0e0f_1011u32.to_le_bytes(),
+        &[5; 32],
+        &[6; 32],
+        &[0],
+        &[8, 7, 6, 5, 4, 3, 2, 1],
+    ]
+    .concat();
+    let record = [
+        &derived[..],
+        &roles,
+        &0u32.to_le_bytes(),
+        &[0, 0, 0],
+        &[1],
+        &previous,
+    ]
+    .concat();
     assert_eq!(installed.encode(), record);
     assert_eq!(
         installed.programs().collect::<Vec<_>>(),
         [
             ProgramHash([3; 32]),
             ProgramHash([1; 32]),
-            ProgramHash([2; 32])
+            ProgramHash([2; 32]),
+            ProgramHash([9; 32]),
+            ProgramHash([5; 32]),
+            ProgramHash([6; 32]),
         ],
         "every program the agent pins"
+    );
+    assert_eq!(
+        installed.window(MethodId(0x0e0f_1011), 0x0102_0304_0506_0707),
+        [
+            DeviceRelease {
+                kernel: ProgramHash([2; 32]),
+                reference: ProgramHash([9; 32]),
+                headroom: 2,
+            },
+            installed.previous[0].release,
+        ],
+        "the release and the previous one before its date"
+    );
+    assert_eq!(
+        installed
+            .window(MethodId(0x0e0f_1011), 0x0102_0304_0506_0708)
+            .len(),
+        1,
+        "the release alone from its date"
     );
     assert_eq!(
         installed.kernel(MethodId(0x0e0f_1011)),

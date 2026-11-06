@@ -43,5 +43,7 @@ vos-wire = { workspace = true }
 # Its outputs searched for the member's secret (`tests/outputs.rs`): dev
 # edges only.
 vos-checker = { path = "../../node/checker" }
+# The release build of a device kernel's artifact, which `kernel` reads.
+vos-light = { workspace = true, features = ["release"] }
 vos-testkit = { path = "../../agent/testkit" }
 tempfile = "3"

@@ -100,25 +100,34 @@ without the page-Merkle boundary, every chip at most 2^17 rows, the
 proof at most 1.5 MiB; `proving.md` §8) authorizes as
 an auth credential proof does, and only for a method whose auth guard
 names a device kernel. Its program (the kernel's chips, their log sizes
-and the preprocessed root) is the one this node computes from the
-installed kernel by a run on auth's public reference statement
-(`vos_pvm_recair::device::Program::auth`), never one a request names, and
-kept as its verifier alone (the program and its id). The leader computes
-it at the install, which fails for a guarded kernel that is no device
-kernel, or does not run that statement within the format's shape. A
-replica that did not install it, or has restarted since, computes it on
-an executor when a device proof naming the kernel has passed every check
-before the binding (format, size, expiry, guard, kind), once however many
-such requests wait on it (about 0.2 s), then keeps it, and a failure of
-the kernel's own (its shape, its run) too; a kernel the replica does not
-hold yet, or any other failure, answers `Unavailable` and is tried
-again. The binding names the program's id; the io-hash is `H_io` of the
+and the preprocessed root) is one this node computes from a release of
+the installed kernel (the kernel, its reference program and its
+headroom) by a run on the arguments the reference returns
+(`vos_pvm_recair::device::Program::of`), never one a request names, and
+kept as its verifier alone (the program and its id), by release. The
+leader computes every device kernel's at the install, which fails for a
+kernel whose reference, or whose run on it, does not end within the
+format's shape. A replica that did not install it, or has restarted
+since, computes it on an executor when a device proof naming the kernel
+has passed every check before the binding (format, size, expiry, guard,
+kind), or a `Devices` read names it, once however many such requests wait
+on it (about 0.2 s), then keeps it, and a failure of the release's own
+(its shape, its runs) too; a program the replica does not hold yet, or
+any other failure, answers `Unavailable` (a `Devices` read marks the
+kernel's window `unavailable`) and is tried again. A window release
+whose program cannot be computed admits no proof, the window's other
+release still does. The guard
+admits its kernel's release and, until its date, the previous release
+an install replaced (`light-node.md` §4.4); a device format past its
+retirement is refused `Format`. The binding names the program's id, one
+of the window's; the io-hash is `H_io` of the
 request's auth words, computed here (each word below `p`, as a credential
 proof's), so the proof's bytes carry no statement of their own. A run is
 traced with at most 2^18 gas (`device::GAS`, twice the most steps a
 program's CPU holds; about 109 Poseidon2 calls, fewer as its steps
 grow), so neither the install nor a device traces far past a program's
-shape.
+shape; a reference program, run once a release and never proved, with at
+most 2^22 (`device::REFERENCE_GAS`).
 
 **A device kernel is trusted as its actor's code is.** It is the
 installed actor's own attestable method, and what its proof states is

@@ -159,11 +159,15 @@ devices decrypt each other's messages".
   link; ingress's device programs (`credentialed.rs`'s use of
   `vos_pvm_recair::device`) stay in the node, as the light node never
   computes one from a kernel once they are release artifacts.
-- **Not yet release artifacts:** the stock kernels' device programs. The
-  device library still computes one from its kernel
-  (`DeviceProgram::auth`, a reference run) until the references are
-  generalized (plan 8.4); the local actors and the agent program already
-  are (`vos_light::release`).
+- **Release artifacts** (`vos_light::release`, built behind its `release`
+  feature on the host that builds the app): the local actors' packages,
+  the agent program, and the device kernels' programs
+  (`release::Device`: the kernel, its chips, its log sizes, its id, and
+  the hash of the ELF it came from). The device library commits a
+  program's preprocessed tree from its artifact
+  (`DeviceProgram::released`), checking the id; it never runs a reference
+  or the transpiler, and installs no package another transpiler derived
+  (`release::TRANSPILER`).
 
 **Not embedded:** Raft (`vos-raft`) and every group loop; ingress serving
 of any kind (the light node listens on no socket; sync and calls are
@@ -1209,9 +1213,8 @@ each a short Rust function in the actor whose state it concerns:
 - any actor's own, under the same rules.
 
 ```rust
-// vos-credentials, beside the tree it proves membership of. Both are built
-// and measured as the `sdk-device` test actor's (below); the credential
-// actor takes them with the reference attribute (plan 8.4, 8.5).
+// vos-credentials, beside the tree it proves membership of [built]: the
+// `sdk-device` test actor's (below), each sized on its reference run.
 #[attestable(device, reference = reference::auth)]
 pub fn auth(path: &Path, secret: &Secret, #[public] claim: &AuthClaim) {
     let member = Tag::Member.hash(secret);
@@ -1287,6 +1290,17 @@ writes (the `sdk-device` test actor's `auth` and `owner`):
   stay as the test actors' references; the fallback (the hand-lean
   kernels shipped as stock, the assembly kept inside `vos_sdk::p2`) is not
   taken.
+- **The device end inlined** [measured, step counts of the traced run on
+  the host, Intel Core Ultra 7 155H, 2026-11-03]: a crate with several
+  device kernels, or a kernel and its reference entry, called
+  one outlined `DeviceReturn` end and its part writers. With them
+  `#[inline(always)]`, on today's target, the SDK-form auth takes 1,546
+  steps (from 1,839) and owner 385 (from 708, `owner_lean` 383); the
+  hand-lean auth stays at 1,722. The programs shrink with them: the SDK
+  form's auth at the hand-lean one's sizes but one chip a size smaller
+  (2^12 rows where it had 2^13), owner two chips a size smaller; proofs
+  about 0.88 MB and 0.85 MB as before. The stock kernels in the credential
+  actor are these, one program each with the `sdk-device` actor's.
 - **The transpiler and `unaligned-scalar-mem`** [measured, 2026-11-02, on
   a side branch]: LLVM emits plain misaligned `ld`/`sd`/`lw`/`sw`
   where it emitted byte loops, and the transpiler takes them: the test actors,
@@ -1363,29 +1377,47 @@ picks the circuit; ingress knows each kind's checks
 alone: its chips (what its code reaches), each chip's log size from a
 reference run, and the preprocessed root over its code, data, regions,
 permissions and entry registers; its id the BLAKE2b-256 of a domain, the
-format, the chips, the sizes and the root. Today only auth's reference
-(`auth_reference`) exists, hard-wired in `vos_pvm_recair::device`.
-- **Generalized:** `#[attestable(device, reference = path)]` names a
-  function returning the kernel's reference arguments (a public, valid
-  witness; the credential actor's `auth_reference` and `owner_reference`,
-  later the pool's `spend_reference`). The derivation records it; the
-  leader computes the program at install by running it, as auth's today; a
-  replica that did not install computes it at the first proof naming the
-  kernel, as today.
+format, the chips, the sizes and the root.
+- **The reference** [built]: `#[attestable(device, reference = path,
+  headroom = k)]` names a function returning the kernel's message, its
+  reference arguments (a public, valid witness: the credential kernels'
+  is `vos_sdk::p2::reference`, a fixed public secret's member at slot 0
+  of the empty tree; later the pool's spend's). The macro refuses a device
+  kernel without one. It generates an entry, `__vos_reference_<name>`,
+  whose run returns the message's encoding, and the derivation links it
+  as a **reference program** beside the kernel
+  (`Derivation::references`: the method, the program's hash, the
+  headroom), refusing a device kernel without one. A device kernel's
+  **release** is the three (`DeviceRelease`: kernel, reference,
+  headroom). The install computes every device kernel's program from its
+  release (`vos_pvm_recair::device::Program::of`: the reference run, then
+  the kernel's run on its output), refusing the install when either fails;
+  a replica that did not install computes it from the stored blobs at the
+  first proof or window read naming it, once a release.
 - **Sizes and witnesses:** every chip is padded to the program's sizes, so
   a proof's shape is the program's whatever the witness. A witness whose
   run needs more rows than the reference's fails to prove (an error on the
   device, never a different proof shape); branch-free kernels avoid it,
   and a kernel that branches declares `headroom = k` (each size raised by
-  `k` powers of two). The testkit's `device_fits` property test runs
-  random witnesses against the reference's sizes.
-- **Computed at release, on the phone never** [proposed]: the stock
-  kernels' device programs, and the transpiled programs of the light
-  node's own local actors, are computed by the release build and embedded
-  with their ELF bytes. The phone runs no transpiler and no reference run;
-  it compares the program id a space installed with the one it embeds, and
-  "reproducible" reduces to the app and the space taking the same release
-  artifact by hash.
+  `k` powers of two, `k` at most 4). `device_fits`
+  (`Program::fits`, and the proof crate's
+  `random_witnesses_fit_the_reference_programs`) runs random witnesses of
+  the stock kernels and of the hand-lean `auth` against their references'
+  sizes [built].
+- **Computed at release, on the phone never** [built: the release build
+  and the device's side; s4's facility takes them when its VOS pin moves,
+  plan 8.24b]: the release build computes each device kernel's program
+  from the package's ELF as a node's install does
+  (`vos_light::release::devices`), the stock kernels' among them, and the
+  app embeds the artifacts (`release::Device`: the kernel, its chips and
+  log sizes, its id, the ELF's hash) beside the local actors' packages
+  (the phone bench's `kernel` command takes one, `tools/phone`). The phone
+  runs no transpiler and no reference run: it commits a program's
+  preprocessed tree from its artifact and checks the id
+  (`DeviceProgram::released`). "Reproducible" reduces to the app and the
+  space taking the same release artifact, the ELF, by its hash: the
+  space's window names the ids the app's artifacts name (the window
+  test checks it; the guest blobs are path-independent, `blobs.lock`).
 - **Which kernels see a secret** [proposed, the slice-8 rule]: the light
   node puts a member secret (and, in slice 9, a spending key) only into
   kernels it ships, whose programs it embeds: the stock `auth` and
@@ -1397,26 +1429,61 @@ format, the chips, the sizes and the root. Today only auth's reference
   secret itself (§8, G2). So in slice 8 a developer's own device kernel
   proves over public data and over data the user explicitly hands it,
   never over keys; a consent model per program id is later work (§9.3).
-- **Compatibility windows** [proposed]: so that an app release and a
-  space's upgrade need not land on the same day, each stock kernel's guard
-  admits a **window** of program ids, at most two: the current release's
-  and the previous one's; ingress admits the device formats likewise (at
-  most the current and the previous). A program id embeds its format
-  (§4.4), so a previous program is only ever verified under the previous
-  format.
-  - **How a window ends:** a release adds its ids and sets the previous
-    release's retirement, 60 days on by default; the space's operator may
-    set it to any earlier date, **now** included, when a version is found
-    unsound. At the date the entry is deleted, so nothing older than one
-    release is ever admitted and no version table grows. The light node
-    proves with the newest program it ships that the space admits, and
-    when the space admits none it says the app or the space must update.
+- **Compatibility windows** [built]: so that an app release and a
+  space's upgrade need not land on the same day, each guard naming a
+  device kernel (the stock kernels' among them) admits a **window** of
+  programs, at most two: its release's and the previous one's; ingress
+  admits the device formats likewise (at most the current and the
+  previous). A program id embeds its format (§4.4), so a previous program
+  is only ever verified under the format it was computed in.
+  - **Where a window lives:** the installed record
+    (`Installed::previous`, one a device kernel, pinned with the
+    instance's programs). An install that replaces a device kernel's
+    release keeps the replaced one as its previous release, retiring 60
+    days after that install's batch time (`RETIREMENT_MS`); one that keeps
+    the release keeps the previous one it had; nothing older is ever
+    kept, so no version table grows.
+  - **How a window ends:** at its date, by the node's clock, ingress
+    and the window read stop admitting the previous release, and the next
+    install or retirement deletes its entry. The operator may set any
+    earlier date, **now** included, when a version is found unsound
+    (`Kind::Retire`, `Admin::Retire`, through the agent's log, so every
+    replica agrees; `vos agent retire`); a date is never moved later.
+  - **The formats' window** is each node's: the device formats its binary
+    verifies, at most two, the previous one retiring at the date its
+    release set (60 days after the release that brought the next), or any
+    earlier date the operator sets at that node (`Config::retired_formats`,
+    or `Kind::Retire`'s `Format`, live until a restart). A proof of a
+    retired format is refused `Format` before anything is decoded.
+  - **The proof names its program:** ingress computes the binding under
+    each program the window admits, and the request's binding must be one
+    of them; a proof of a retired or unknown release is refused
+    `Binding`, at no verification's cost.
+  - **The light node reads the window first** (`Kind::Devices`: the
+    formats and each device kernel's programs, ids, formats and dates) and
+    proves with the newest program it ships that the window holds, in a
+    format it holds (`vos_light::choose`, `wire::devices_request` [built];
+    the app's sign-in calls them when s4's facility moves to release
+    artifacts, plan 8.24b). When the space admits none it refuses before
+    proving (`DeviceError::Window`: "the space admits none of this app's
+    programs for the kernel: the app or the space must update"); a window
+    a node could not compute whole yet (a blob it does not hold) is marked
+    `unavailable`, and the app asks again rather than saying either side
+    must update. An app ships the current release's artifacts and the
+    previous one's [proposed].
   - **One claim per window:** two versions in one window must compute
     identical claims (auth's nullifier, owner's digest) with identical
     meaning, so a `once` scope admits a member once whichever version
     proved, and pseudonyms do not change at a release. A kernel whose
     claim changes is a new guard name (a new scope), never a window
-    member.
+    member. The window test signs in through a `once` guard with release
+    one's proof and is refused `Once` with release two's: the same
+    nullifier (`an_app_one_release_behind_signs_in_until_its_window_closes`).
+  - **Until a second device format exists** [decided here, the simplest
+    rule consistent with D8 and G3]: every window entry's program is
+    computed under the node's current device format. Format 47 (plan
+    8.10) pairs each entry with its release's format, the previous
+    release's program verified under the previous format.
 - **Pins:** the binding names the program id, so a proof of one kernel
   authorizes nothing under another. No venue pins device ids (device
   proofs are not folded, `proving.md` §11, "Device proofs are not
@@ -1794,7 +1861,7 @@ gateway, 2026-11-02]:
 
 No third port carries raw node-API frames. **The light node speaks
 `vos-api` over SSH over the onion,** as s4 does today, and the subsystem's
-relay set (`NodeKey`, `Time`, `AgentInfo`, `Schema`, `Query`;
+relay set (`NodeKey`, `Time`, `AgentInfo`, `Schema`, `Devices`, `Query`;
 `node/api/src/lib.rs`, `Kind::relayed`) gains `Call` (the personal agent's
 pushes, commits and device-set operations, and member calls) and
 `Credentialed`, with the gateway's leader-aware routing behind them.
@@ -2192,7 +2259,7 @@ device's crates faster); Q9's size argument for it is small.
 - **The gateway** keeps HTTP, TLS and SSH, and adds the onion service
   (§6): the same HTTP routes and SSH behind an onion address, and nothing
   else [E23]. Its SSH `vos-api` subsystem's relay set is wider than
-  today's (`NodeKey`, `Time`, `AgentInfo`, `Schema`, `Query`;
+  today's (`NodeKey`, `Time`, `AgentInfo`, `Schema`, `Devices`, `Query`;
   `node/api/src/lib.rs`, `Kind::relayed`): it adds `Credentialed` and
   `Call`, which the light node sends through it.
 - **Limits that bind the personal agent** [built]: 64 KiB a call's
@@ -2229,9 +2296,10 @@ device's crates faster); Q9's size argument for it is small.
 
 - `#[attestable(device)]` methods may take references to fixed-size
   argument types (decoded in place, first among the arguments: built,
-  §4.2) and declare `reference` and
-  `headroom`; the derivation records the reference's symbol and refuses a
-  device kernel without one.
+  §4.2) and declare `reference = path` and `headroom = k` [built, §4.4];
+  the macro and the derivation refuse a device kernel without a
+  reference, and the derivation records each reference program by its
+  hash beside its kernel (`Derivation::references`).
 - `#[msg(proven = k)]` names a device kernel of the actor or of the agent's
   credential actor; the method's first argument is the kernel's claim
   type, checked equal at compile time (`pay(tx, memos)`: `tx` first).

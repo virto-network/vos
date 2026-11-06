@@ -60,6 +60,9 @@ pub enum Kind {
     AgentInfo = 0x0003,
     /// An installed instance's schema: `Option<Schema>`.
     Schema = 0x0004,
+    /// An installed instance's device window, the formats and the device
+    /// programs its guards admit: `Option<DeviceWindow>`.
+    Devices = 0x0005,
     Call = 0x0101,
     Query = 0x0102,
     Workflow = 0x0103,
@@ -74,14 +77,17 @@ pub enum Kind {
     Replace = 0x0206,
     Grant = 0x0207,
     Reports = 0x0208,
+    /// Retire a device kernel's previous release, or a device format.
+    Retire = 0x0209,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 16] = [
+    pub const ALL: [Kind; 18] = [
         Kind::NodeKey,
         Kind::Time,
         Kind::AgentInfo,
         Kind::Schema,
+        Kind::Devices,
         Kind::Call,
         Kind::Query,
         Kind::Workflow,
@@ -94,6 +100,7 @@ impl Kind {
         Kind::Replace,
         Kind::Grant,
         Kind::Reports,
+        Kind::Retire,
     ];
 
     /// The kind numbered `number`, if one is.
@@ -109,7 +116,7 @@ impl Kind {
         match self {
             Kind::NodeKey | Kind::Time => 0,
             Kind::AgentInfo => AGENT,
-            Kind::Schema => 2 * AGENT,
+            Kind::Schema | Kind::Devices => 2 * AGENT,
             Kind::Call | Kind::Query | Kind::Workflow => REQUEST + AGENT,
             Kind::Credentialed => (CREDENTIALED_HTTP + AGENT as usize) as u32,
             Kind::Stats | Kind::Status => OPERATOR_READ + OPERATED,
@@ -118,7 +125,8 @@ impl Kind {
             | Kind::CreateRepresentative
             | Kind::Replace
             | Kind::Grant
-            | Kind::Reports => REQUEST + AGENT + OPERATED,
+            | Kind::Reports
+            | Kind::Retire => REQUEST + AGENT + OPERATED,
         }
     }
 
@@ -127,7 +135,12 @@ impl Kind {
     pub fn relayed(self) -> bool {
         matches!(
             self,
-            Kind::NodeKey | Kind::Time | Kind::AgentInfo | Kind::Schema | Kind::Query
+            Kind::NodeKey
+                | Kind::Time
+                | Kind::AgentInfo
+                | Kind::Schema
+                | Kind::Devices
+                | Kind::Query
         )
     }
 
@@ -144,6 +157,7 @@ impl Kind {
                 | Kind::Replace
                 | Kind::Grant
                 | Kind::Reports
+                | Kind::Retire
         )
     }
 
@@ -230,6 +244,7 @@ mod tests {
         assert_eq!(limit(Kind::Time), 0);
         assert_eq!(limit(Kind::AgentInfo), 4);
         assert_eq!(limit(Kind::Schema), 8);
+        assert_eq!(limit(Kind::Devices), 8);
         for kind in [Kind::Call, Kind::Query, Kind::Workflow] {
             assert_eq!(limit(kind), 69_636);
         }
@@ -242,6 +257,7 @@ mod tests {
             Kind::Replace,
             Kind::Grant,
             Kind::Reports,
+            Kind::Retire,
         ] {
             assert_eq!(limit(kind), 69_792);
         }
@@ -260,7 +276,7 @@ mod tests {
             assert_eq!(Kind::from_u16(kind as u16), Some(kind));
         }
         assert_eq!(Kind::Credentialed as u16, 0x0104);
-        for number in [0, FRAME_ERROR, 0x0005, 0x0105, 0x0209] {
+        for number in [0, FRAME_ERROR, 0x0006, 0x0105, 0x020a] {
             assert_eq!(Kind::from_u16(number), None, "{number:#06x}");
         }
         let relayed: Vec<Kind> = Kind::ALL.into_iter().filter(|k| k.relayed()).collect();
@@ -271,13 +287,14 @@ mod tests {
                 Kind::Time,
                 Kind::AgentInfo,
                 Kind::Schema,
+                Kind::Devices,
                 Kind::Query
             ]
         );
         let nonces = Kind::ALL.into_iter().filter(|k| k.records_nonce()).count();
-        assert_eq!(nonces, 6);
+        assert_eq!(nonces, 7);
         let operators = Kind::ALL.into_iter().filter(|k| k.operator()).count();
-        assert_eq!(operators, 8);
+        assert_eq!(operators, 9);
         assert!(Kind::Stats.operator() && !Kind::Stats.records_nonce());
         assert!(!Kind::Call.operator());
     }
