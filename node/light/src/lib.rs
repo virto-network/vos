@@ -9,7 +9,13 @@
 //! - **Sync** ([`mod@sync`]): each local instance one scope, a merkle-crdt
 //!   DAG of nodes the store's author key signs; a call is a merge
 //!   handler's operation recorded as a node, and a peer's nodes run
-//!   through the same handlers; the merge fields read filtered.
+//!   through the same handlers; the merge fields read filtered. Each
+//!   scope's id derives from its name and the key archive's naming secret.
+//! - **The device group** ([`group`]): the user's devices as one MLS group
+//!   over `vos-mls`, its commits admin calls the personal agent orders,
+//!   each candidate processed on a copy and confirmed by the devices'
+//!   signed votes; data keys exported at the confirmed epoch, and the key
+//!   archive.
 //!
 //! **The device library** (`docs/design/proving.md` §8): what the phone
 //! runs to prove facts about its device secret to its space's ingress, and
@@ -46,6 +52,7 @@
 //! enables). `SECURITY.md` states what the secret is exposed to.
 
 mod call;
+pub mod group;
 mod kernel;
 mod light;
 mod path;

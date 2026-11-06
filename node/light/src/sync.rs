@@ -15,10 +15,10 @@ use std::collections::BTreeMap;
 
 use blake2::Blake2b;
 use blake2::digest::Digest;
-use blake2::digest::consts::{U16, U32};
+use blake2::digest::consts::U32;
 use fjall::{Keyspace, OwnedWriteBatch};
 use merkle_crdt::{
-    Author, Changes, Decode, Encode, Event, FjallError, FjallStore, Loaded, Rows, Scope, Store,
+    Author, Changes, Decode, Encode, Event, FjallError, FjallStore, Loaded, Rows, Store,
 };
 use vos_wire::ids::{InstanceId, MethodId};
 use vos_wire::keys;
@@ -119,15 +119,12 @@ impl Decode for Op {
     }
 }
 
-/// The scope of local instance `instance` among the devices that share
-/// `realm`: the first 16 bytes of BLAKE2b over its domain, the realm and
-/// the instance.
-pub fn scope(realm: &[u8; 32], instance: InstanceId) -> Scope {
-    let mut hasher = Blake2b::<U16>::new();
-    hasher.update(b"vos/light/scope\0");
-    hasher.update(realm);
-    hasher.update(instance.0.to_be_bytes());
-    Scope(hasher.finalize().into())
+/// The name of local instance `instance`'s scope, from which its id
+/// derives with the key archive's naming secret
+/// ([`crate::group::archive::scope_id`]): devices sharing the archive sync
+/// an instance's scope with each other.
+pub fn scope_name(instance: InstanceId) -> [u8; 4] {
+    instance.0.to_be_bytes()
 }
 
 /// A row the light node wrote that does not read as written.

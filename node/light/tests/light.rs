@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 
 use ed25519_dalek::SigningKey;
 use merkle_crdt::{Author, Node};
+use vos_light::group::{Archive, archive};
 use vos_light::release::{self, Package};
 use vos_light::sync::{self, Blake2b256, Call, Cid, Op, Ops};
 use vos_light::{Config, Error, Light};
@@ -19,6 +20,21 @@ use vos_wire::{Decode, Encode, keys};
 
 const NOTES: InstanceId = InstanceId(1);
 const DEVICE: Principal = Principal::Client([0xd1; 32]);
+
+/// The naming secret the tests' devices share, as pairing gives it.
+const NAMING: [u8; 32] = [0x11; 32];
+
+/// A light node at `dir`, its store's archive the devices' shared one.
+fn open(dir: &std::path::Path, agent: &[u8]) -> Light {
+    let light = Light::open(dir, agent, Config::default()).unwrap();
+    let shared = Archive {
+        naming: NAMING,
+        scopes: Vec::new(),
+        keys: Vec::new(),
+    };
+    light.store().adopt(&shared).unwrap();
+    light
+}
 
 /// The release artifacts, as the release build computes them: the agent
 /// program, and the notes actor's package.
@@ -43,7 +59,7 @@ struct Device {
 impl Device {
     fn new(agent: &[u8], notes: &Package) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let light = Light::open(dir.path(), agent, Config::default()).unwrap();
+        let light = open(dir.path(), agent);
         let installed = light.install(NOTES, notes, Vec::new()).unwrap();
         assert!(matches!(installed, Outcome::Done(_)), "{installed:?}");
         Self {
@@ -118,7 +134,7 @@ fn a_local_actor_installed_from_release_artifacts_is_called() {
     assert_eq!(embedded, notes);
     let dir = tempfile::tempdir().unwrap();
     let author = {
-        let light = Light::open(dir.path(), &agent, Config::default()).unwrap();
+        let light = open(dir.path(), &agent);
         let device = Device {
             light,
             notes: embedded.clone(),
@@ -151,7 +167,7 @@ fn a_local_actor_installed_from_release_artifacts_is_called() {
         assert_eq!(device.light.outbox(NOTES).unwrap().len(), 12);
         device.light.author()
     };
-    let light = Light::open(dir.path(), &agent, Config::default()).unwrap();
+    let light = open(dir.path(), &agent);
     assert_eq!(light.author(), author);
     let device = Device {
         light,
@@ -183,7 +199,7 @@ fn a_local_actor_installed_from_release_artifacts_is_called() {
 fn the_merge_entry_runs_merge_handlers_writing_merge_fields() {
     let (agent, notes) = artifacts();
     let dir = tempfile::tempdir().unwrap();
-    let light = Light::open(dir.path(), &agent, Config::default()).unwrap();
+    let light = open(dir.path(), &agent);
     let mut forged = notes.clone();
     forged.programs[0].push(0);
     assert!(matches!(
@@ -311,7 +327,7 @@ fn delivery_order_does_not_change_what_devices_read() {
 /// A node of `ops` at `seq` in `key`'s chain of the notes' scope, after
 /// `parents`.
 fn node(key: &SigningKey, seq: u64, ops: Ops, parents: BTreeSet<Cid>) -> Vec<u8> {
-    let scope = sync::scope(&Config::default().realm, NOTES);
+    let scope = merkle_crdt::Scope(archive::scope_id(&NAMING, &sync::scope_name(NOTES)));
     Node::<Blake2b256, Ops>::sign(key, &scope, seq, ops, parents).to_bytes()
 }
 

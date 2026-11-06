@@ -52,10 +52,6 @@ pub struct Config {
     pub refine_gas: u64,
     /// The store's block cache.
     pub cache_bytes: u64,
-    /// What the user's devices share, from which each local instance's
-    /// scope id derives ([`sync::scope`]): devices of one realm sync an
-    /// instance's scope with each other.
-    pub realm: [u8; 32],
 }
 
 impl Default for Config {
@@ -63,7 +59,6 @@ impl Default for Config {
         Self {
             refine_gas: defaults::REFINE_GAS,
             cache_bytes: CACHE_BYTES,
-            realm: [0; 32],
         }
     }
 }
@@ -434,6 +429,14 @@ impl Light {
         Ok(decode::<Outcome>(&output)?)
     }
 
+    /// The id of `instance`'s scope: from its name and the key archive's
+    /// naming secret, which is this store's for good from the first.
+    pub fn scope_id(&self, instance: InstanceId) -> Result<merkle_crdt::Scope, Error> {
+        Ok(merkle_crdt::Scope(
+            self.store.scope_id(&sync::scope_name(instance))?,
+        ))
+    }
+
     /// One write operation at a time: each is refined on the state the one
     /// before it left. The lock holds the scopes.
     fn writing(&self) -> MutexGuard<'_, BTreeMap<InstanceId, Scope>> {
@@ -460,7 +463,7 @@ impl Light {
                     &name,
                     self.store.rows_keyspace().clone(),
                 )?;
-                let id = sync::scope(&self.config.realm, instance);
+                let id = self.scope_id(instance)?;
                 let replica = Replica::open(ScopeStore::new(store), id).map_err(Error::Scope)?;
                 Ok(vacant.insert(replica))
             }

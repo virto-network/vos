@@ -52,6 +52,32 @@ and what a node does with one is `node/SECURITY.md`'s.
   write past its cutoff hides its own earlier write to that element,
   which reads then fall back from to the other authors'.
 
+## The device group
+
+- **Its secrets are in the store, in the clear:** the MLS group state
+  (the leaf's signing key, the epoch's secrets), a held own commit (the
+  next epoch's secrets), key packages' private keys, and the key archive
+  (the naming secret and every confirmed epoch's scope keys), all in the
+  store's `group` keyspace. The client wraps the directory under a key
+  usable after the first unlock and keeps it out of backups
+  (`light-node.md` §3.5, §8 A11); whoever reads the store reads every
+  scope's data, past and present (no forward secrecy for history, by
+  design).
+- **It holds no admin key and no sync key:** commits and votes are signed
+  by the client, the admin key behind the owner's prompt, the sync key
+  after first unlock; the library gives the messages to sign.
+- **It trusts no operation the log shows without its signature:** a
+  candidate is processed only once its evidence verifies against the
+  committer's admin key as this device knows it, each removal it carries
+  a matured operation whose evidence verifies; each vote is verified
+  against the voter's sync key and the candidate's place in this device's
+  log; a log that does not chain stops the reading. A candidate is
+  processed on a copy and swapped in only on confirmation, by this
+  device's own count of the votes, never the agent's verdict.
+- **Data keys come from the confirmed epoch alone**, and scope ids from
+  the archive's naming secret, which is the store's from its first scope
+  on: a store that named a scope does not join another group.
+
 ## The secret and its containment
 
 - **The source** is a keyed HMAC-SHA-256 whose key the device never
