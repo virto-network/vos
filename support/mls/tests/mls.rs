@@ -2,7 +2,8 @@
 //! commits held and confirmed on copies; a copy leaving the current state
 //! as it was; a held commit across a reopen, matched by its handshake and
 //! deleted on a void; the device group's policy refusing what it does not
-//! allow, from a member running other rules; and a removed member.
+//! allow, from a member running other rules; a removed member; and a
+//! restart into a new group.
 
 use std::collections::BTreeMap;
 
@@ -419,4 +420,56 @@ fn the_confirmation_hash_binds_its_parts() {
         h,
         confirmation(b"vos/personal/confirm", &[1; 32], 7, &[8; 32])
     );
+}
+
+/// A restart: A starts a new group with B, its commit held and the old
+/// group kept until the swap; B, still in the old group, joins the new one
+/// from the Welcome on a copy; each swap deletes the group it leaves, and
+/// C, left out, cannot follow. A void deletes a held restart's new group.
+#[test]
+fn a_restart_starts_a_new_group_and_leaves_the_old() {
+    let (mut a, mut b, c) = three();
+    let old = a.namespace.store().keyspace().iter().count();
+    let void = a.mls.restart(&[], T + 1, |_| BTreeMap::new()).unwrap();
+    assert!(a.mls.commit(&[], &[], T + 1, |_| BTreeMap::new()).is_err());
+    assert_eq!(a.mls.own(&void.handshake).unwrap().kind(), Kind::Started);
+    a.mls.void(BTreeMap::new()).unwrap();
+    assert_eq!(a.namespace.store().keyspace().iter().count(), old);
+    agree(&[&a, &b, &c], 1);
+
+    let package = b.mls.key_package(T + 2, BTreeMap::new()).unwrap();
+    let restart = a
+        .mls
+        .restart(&[package], T + 2, |_| BTreeMap::new())
+        .unwrap();
+    assert_eq!(restart.epoch, 1);
+    agree(&[&a, &b, &c], 1);
+    a.mls = reopen(&a, 1);
+    let own = a.mls.own(&restart.handshake).unwrap();
+    let welcome = restart.welcome.expect("a Welcome for the rest");
+    let joined = b.mls.join(&welcome, T + 2).unwrap();
+    assert!(matches!(
+        c.mls.join(&welcome, T + 2),
+        Err(Error::Refused(_))
+    ));
+    assert_eq!(
+        own.authenticator().unwrap(),
+        joined.authenticator().unwrap()
+    );
+    a.mls.swap(own, BTreeMap::new()).unwrap();
+    b.mls.swap(joined, BTreeMap::new()).unwrap();
+    agree(&[&a, &b], 1);
+    assert_eq!(a.mls.credentials().unwrap().len(), 2);
+    let states = |member: &Member| {
+        member
+            .namespace
+            .store()
+            .keyspace()
+            .iter()
+            .map(|row| row.into_inner().unwrap().0)
+            .filter(|key| key.starts_with(b"mls/state/"))
+            .count()
+    };
+    assert_eq!(states(&a), 1, "the old group's state is deleted");
+    assert_eq!(states(&b), 1);
 }

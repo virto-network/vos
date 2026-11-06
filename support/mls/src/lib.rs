@@ -76,10 +76,12 @@ pub type Config = IntoConfigOutput<
 >;
 
 /// A namespace's rows beside mls-rs's: the leaf's signing key and
-/// identity, the group's id, and the held commit.
+/// identity, the group's id, the held commit, and the id of the new group
+/// a held restart starts.
 const SIGNER: &[u8] = b"signer";
 const GROUP: &[u8] = b"group";
 const HELD: &[u8] = b"held";
+const NEXT: &[u8] = b"next";
 
 /// Why an operation failed. A failed operation writes nothing: the
 /// current state stays as the last batch left it.
@@ -157,8 +159,10 @@ pub enum Kind {
     Own,
     /// Another device's commit, processed.
     Received,
-    /// A Welcome: the device joins with it.
+    /// A Welcome: the device joins with it, leaving any group it is in.
     Joined,
+    /// Its own restart: a new group it made, with the members it added.
+    Started,
     /// A commit that removes this device.
     Removed,
 }
@@ -513,6 +517,9 @@ impl Mls {
         time: u64,
     ) -> Result<Commit, Error> {
         let group = self.group.as_mut().ok_or(Error::NoGroup)?;
+        if self.namespace.get(NEXT)?.is_some() {
+            return Err(Error::Held);
+        }
         let members = credentials(group);
         let mut builder = group.commit_builder().commit_time(MlsTime::from(time));
         for package in adds {
@@ -547,6 +554,69 @@ impl Mls {
         })
     }
 
+    /// Restart: a new group of this member at `time`, its commit adding
+    /// the devices of `adds` (their key packages) applied at once and
+    /// held, the current group kept until the restart is swapped in. The
+    /// new group's state, the held commit and the caller's `rows` of it in
+    /// one batch, written before this returns.
+    pub fn restart(
+        &mut self,
+        adds: &[Vec<u8>],
+        time: u64,
+        rows: impl FnOnce(&Commit) -> Writes,
+    ) -> Result<Commit, Error> {
+        if self.held_row()?.is_some() {
+            return Err(Error::Held);
+        }
+        match self.started(adds, time) {
+            Ok(commit) => {
+                self.flush(rows(&commit))?;
+                Ok(commit)
+            }
+            Err(error) => {
+                self.namespace.unstage();
+                self.reload()?;
+                Err(error)
+            }
+        }
+    }
+
+    fn started(&mut self, adds: &[Vec<u8>], time: u64) -> Result<Commit, Error> {
+        let mut group = self
+            .client
+            .create_group(
+                ExtensionList::new(),
+                ExtensionList::new(),
+                Some(MlsTime::from(time)),
+            )
+            .map_err(|error| self.failure(error))?;
+        let mut builder = group.commit_builder().commit_time(MlsTime::from(time));
+        for package in adds {
+            builder = builder.add_member(MlsMessage::from_bytes(package)?)?;
+        }
+        let output = builder.build()?;
+        group.apply_pending_commit()?;
+        let handshake = output.commit_message.to_bytes()?;
+        let welcome = match output.welcome_messages.first() {
+            Some(welcome) => Some(welcome.to_bytes()?),
+            None => None,
+        };
+        let epoch = group.current_epoch();
+        let held = Held {
+            hash: handshake_hash(&handshake),
+            epoch,
+            secrets: Vec::new(),
+        };
+        group.write_to_storage()?;
+        self.namespace.put(HELD, Some(held.encode()));
+        self.namespace.put(NEXT, Some(group.group_id().to_vec()));
+        Ok(Commit {
+            handshake,
+            welcome,
+            epoch,
+        })
+    }
+
     /// A copy of the current group under `rules`.
     fn copy(&self, rules: Rules) -> Result<(Group<Config>, Namespace), Error> {
         let id = self.group()?.group_id().to_vec();
@@ -565,6 +635,23 @@ impl Mls {
     /// is the held commit's and the current epoch is the one before it.
     pub fn own(&self, handshake: &[u8]) -> Result<Candidate, Error> {
         let held = self.held_row()?.ok_or(Error::NotHeld)?;
+        if let Some(next) = self.namespace.get(NEXT)? {
+            if held.hash != handshake_hash(handshake) {
+                return Err(Error::NotHeld);
+            }
+            let namespace = self.namespace.copy();
+            let group = client(&namespace, Rules::default(), None)
+                .load_group(&next)
+                .map_err(|error| match namespace.take_failure() {
+                    Some(error) => Error::Store(error),
+                    None => Error::Mls(error),
+                })?;
+            return Ok(Candidate {
+                group,
+                namespace,
+                kind: Kind::Started,
+            });
+        }
         if held.hash != handshake_hash(handshake) || held.epoch != self.epoch()? + 1 {
             return Err(Error::NotHeld);
         }
@@ -638,11 +725,9 @@ impl Mls {
     }
 
     /// Join with `welcome` on a copy at `time`, under the key package this
-    /// member made: a candidate for the epoch the Welcome names.
+    /// member made: a candidate for the epoch the Welcome names, which a
+    /// member of a group joins to leave it for a new one.
     pub fn join(&self, welcome: &[u8], time: u64) -> Result<Candidate, Error> {
-        if self.group.is_some() {
-            return Err(Error::Grouped);
-        }
         let Ok(message) = MlsMessage::from_bytes(welcome) else {
             return Err(Error::Refused(Refusal::Malformed));
         };
@@ -666,7 +751,8 @@ impl Mls {
 
     /// Make `candidate` current, in one batch with `rows`: its state into
     /// the current namespace, any held commit deleted (its epoch is
-    /// decided). A candidate that removes this member deletes the group.
+    /// decided). A candidate that removes this member deletes the group; a
+    /// new group's deletes the group it leaves.
     pub fn swap(&mut self, candidate: Candidate, rows: Writes) -> Result<(), Error> {
         let Candidate {
             mut group,
@@ -683,19 +769,32 @@ impl Mls {
             Kind::Own | Kind::Received if group.current_epoch() != self.epoch()? + 1 => {
                 return Err(Error::NotHeld);
             }
-            Kind::Joined | Kind::Own | Kind::Received => {
+            Kind::Joined | Kind::Own | Kind::Received | Kind::Started => {
+                if let Some(current) = &self.group
+                    && current.group_id() != group.group_id()
+                {
+                    let id = current.group_id().to_vec();
+                    self.namespace
+                        .put(&[b"state/".as_slice(), &id].concat(), None);
+                }
                 group.write_to_storage()?;
                 self.namespace.stage(namespace.take_copy());
                 self.namespace.put(GROUP, Some(group.group_id().to_vec()));
             }
         }
         self.namespace.put(HELD, None);
+        self.namespace.put(NEXT, None);
         self.flush(rows)
     }
 
     /// Delete the held commit, its candidate void, in one batch with
-    /// `rows`.
+    /// `rows`: a held restart's new group with it.
     pub fn void(&mut self, rows: Writes) -> Result<(), Error> {
+        if let Some(next) = self.namespace.get(NEXT)? {
+            self.namespace
+                .put(&[b"state/".as_slice(), &next].concat(), None);
+            self.namespace.put(NEXT, None);
+        }
         self.namespace.put(HELD, None);
         self.flush(rows)
     }
