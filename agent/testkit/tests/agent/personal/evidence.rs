@@ -22,6 +22,7 @@ fn evidence_is_stored_beside_its_call_its_arguments_byte_for_byte() {
     let effect = Effect {
         add: Some(device(2)),
         remove: Vec::new(),
+        rekey: None,
     };
     let arguments = (
         (2u64, effect),
@@ -99,7 +100,7 @@ fn evidence_is_stored_beside_its_call_its_arguments_byte_for_byte() {
             home.call::<Recorded>(
                 caller,
                 "evidence",
-                evidence(candidacy.index, message, welcome)
+                evidence(candidacy.index, message, Attached { welcome, r2: None })
             ),
             Err(refusal)
         );
@@ -108,14 +109,28 @@ fn evidence_is_stored_beside_its_call_its_arguments_byte_for_byte() {
         .call(
             sync(0),
             "evidence",
-            evidence(candidacy.index, good.clone(), Some(welcome.clone())),
+            evidence(
+                candidacy.index,
+                good.clone(),
+                Attached {
+                    welcome: Some(welcome.clone()),
+                    r2: None,
+                },
+            ),
         )
         .unwrap();
     assert_eq!(
         home.call::<Recorded>(
             sync(0),
             "evidence",
-            evidence(candidacy.index, good.clone(), Some(welcome.clone()))
+            evidence(
+                candidacy.index,
+                good.clone(),
+                Attached {
+                    welcome: Some(welcome.clone()),
+                    r2: None
+                }
+            )
         ),
         Err(PersonalError::Evidenced)
     );
@@ -148,18 +163,29 @@ fn evidence_is_stored_beside_its_call_its_arguments_byte_for_byte() {
         home.call::<Recorded>(
             sync(0),
             "evidence",
-            evidence(removal.index, signed.clone(), Some(vec![1]))
+            evidence(
+                removal.index,
+                signed.clone(),
+                Attached {
+                    welcome: Some(vec![1]),
+                    r2: None
+                }
+            )
         ),
         Err(PersonalError::Welcome)
     );
-    home.call::<Recorded>(sync(0), "evidence", evidence(removal.index, signed, None))
-        .unwrap();
+    home.call::<Recorded>(
+        sync(0),
+        "evidence",
+        evidence(removal.index, signed, Attached::default()),
+    )
+    .unwrap();
     // Evidence is no admin call.
     assert_eq!(
         home.call::<Recorded>(
             sync(0),
             "evidence",
-            evidence(stored.index, Vec::new(), None)
+            evidence(stored.index, Vec::new(), Attached::default())
         ),
         Err(PersonalError::NotAdminCall)
     );

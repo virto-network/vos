@@ -67,6 +67,7 @@ fn a_commit_from_a_sync_key_or_a_device_that_may_not_commit_is_refused() {
     let effect = Effect {
         add: Some(device(3)),
         remove: Vec::new(),
+        rekey: None,
     };
     assert_eq!(
         home.call::<Candidacy>(admin(2), "commit", commit(4, effect, vec![4; 600])),
@@ -186,6 +187,7 @@ fn a_nack_a_second_h_or_the_window_voids_a_candidate() {
     let effect = Effect {
         add: Some(device(2)),
         remove: Vec::new(),
+        rekey: None,
     };
     let candidacy: Candidacy = home
         .call(admin(0), "commit", commit(2, effect, vec![2; 900]))
@@ -245,7 +247,15 @@ fn one_commit_carries_every_matured_removal_and_removed_devices_have_no_voice() 
         Err(PersonalError::Pending)
     );
     let epoch = home.overview().confirmed + 1;
-    let removing = |remove: Vec<u32>| commit(epoch, Effect { add: None, remove }, vec![0x33; 650]);
+    let rekey = home.rekey(sync(0), 0x33).0;
+    let removing = |remove: Vec<u32>| {
+        let effect = Effect {
+            add: None,
+            remove,
+            rekey: Some(rekey.clone()),
+        };
+        commit(epoch, effect, vec![0x33; 650])
+    };
     assert_eq!(
         home.call::<Candidacy>(admin(0), "commit", removing(vec![3])),
         Err(PersonalError::NotMatured(3)),

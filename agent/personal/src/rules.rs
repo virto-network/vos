@@ -403,10 +403,18 @@ impl Personal {
                     .is_some_and(|(device, _)| device == candidate.by)
                 {
                     recovery.released = None;
+                    recovery.previous = Vec::new();
                     self.recovery.insert(&ONE, &recovery);
                 }
+                if let Some(rekey) = &candidate.rekey
+                    && let Some(r2) = self.deposits.get(&candidate.index)
+                {
+                    self.reseal(&rekey.entries, r2);
+                }
+                self.deposits.remove(&candidate.index);
             }
             Verdict::Void(_) => {
+                self.deposits.remove(&candidate.index);
                 if let Some(added) = candidate.added
                     && let Some(mut device) = self.devices.get(&added)
                 {

@@ -207,6 +207,7 @@ fn a_pairing_slot_admits_its_key_for_its_slot_alone() {
     let effect = Effect {
         add: Some(device(1)),
         remove: Vec::new(),
+        rekey: None,
     };
     let candidacy: Candidacy = home
         .call(admin(0), "commit", commit(1, effect, vec![1; 700]))

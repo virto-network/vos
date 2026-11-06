@@ -28,9 +28,9 @@ use vos_wire::defaults::SESSION_EXPIRY_MS;
 use vos_wire::ids::{InstanceId, MethodId, Principal, Session};
 use vos_wire::ingress::{Grant, call_message};
 use vos_wire::personal::{
-    AdminClass, Attestation, Candidacy, DeviceId, Effect, HOUR_MS, Header, Kit, KitEntry, KitKind,
-    NewDevice, NewKit, Operation, Overview, PersonalError, Policy, Pushed, Recorded, Scope, Voted,
-    Woken, r2_hash,
+    AdminClass, Attached, Attestation, Candidacy, DeviceId, Effect, HOUR_MS, Header, Kit, KitEntry,
+    KitKind, NewDevice, NewKit, Operation, Overview, PersonalError, Policy, Pushed, Recorded,
+    RecoveryView, Scope, Voted, Woken, r_hash, r2_hash,
 };
 use vos_wire::result::{Outcome, Run, Step};
 use vos_wire::{Decode, Encode, SpaceId, WindowClock};
@@ -148,6 +148,7 @@ pub fn new_kit(n: u8) -> (NewKit, [u8; 32]) {
         NewKit {
             entries,
             r2_hash: r2_hash(&r2),
+            r_hash: r_hash(&[n ^ 0x0f; 32]),
         },
         r2,
     )
@@ -165,8 +166,16 @@ pub fn message(key: [u8; 32], method: MethodId, arguments: &[u8]) -> Vec<u8> {
 }
 
 /// The evidence call's arguments.
-pub fn evidence(index: u64, message: Vec<u8>, attached: Option<Vec<u8>>) -> impl Encode {
+pub fn evidence(index: u64, message: Vec<u8>, attached: Attached) -> impl Encode {
     ((index, message), ([0x5a_u8; 64], attached))
+}
+
+/// What rides beside an evidence: an `R2`.
+pub fn with_r2(r2: [u8; 32]) -> Attached {
+    Attached {
+        welcome: None,
+        r2: Some(r2),
+    }
 }
 
 /// A scope's id.
@@ -414,7 +423,7 @@ impl Home {
         let epoch = self.overview().confirmed + 1;
         let effect = Effect {
             add: Some(keys),
-            remove: Vec::new(),
+            ..Effect::default()
         };
         let candidacy: Candidacy = self
             .call(
@@ -444,11 +453,15 @@ impl Home {
         assert_eq!(self.overview().confirmed, epoch);
     }
 
-    /// A commit by device `by` for the next epoch carrying `remove`,
-    /// confirmed by its set.
+    /// A commit by device `by` for the next epoch carrying `remove`, the
+    /// kit re-sealed, confirmed by its set.
     pub fn commit_removing(&mut self, by: u8, remove: Vec<DeviceId>) -> Candidacy {
         let epoch = self.overview().confirmed + 1;
-        let effect = Effect { add: None, remove };
+        let effect = Effect {
+            add: None,
+            remove,
+            rekey: Some(self.rekey(sync(by), 0x3e).0),
+        };
         let candidacy: Candidacy = self
             .call(
                 admin(by),
@@ -488,11 +501,28 @@ impl Home {
         r2: [u8; 32],
     ) -> Result<Recorded, PersonalError> {
         let signed = message(key, self.method(name), &arguments.encode());
-        self.call(
-            poster,
-            "evidence",
-            evidence(index, signed, Some(r2.to_vec())),
-        )
+        self.call(poster, "evidence", evidence(index, signed, with_r2(r2)))
+    }
+
+    /// The kit as `reader` reads it re-sealed under a new `R`, each `R1`
+    /// `fill`, and its `R2`: what a commit carrying a removal brings.
+    pub fn rekey(&self, reader: Principal, fill: u8) -> (NewKit, [u8; 32]) {
+        let view: RecoveryView = self.query(reader, "recovery", ()).unwrap();
+        let entries = view
+            .entries
+            .into_iter()
+            .map(|entry| KitEntry {
+                sealed_r1: vec![fill; 80],
+                ..entry
+            })
+            .collect();
+        let r2 = [fill ^ 0x77; 32];
+        let kit = NewKit {
+            entries,
+            r2_hash: r2_hash(&r2),
+            r_hash: r_hash(&[fill; 32]),
+        };
+        (kit, r2)
     }
 
     /// `envelope` pushed by device `n`.

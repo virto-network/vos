@@ -827,6 +827,7 @@ impl Personal {
                     &Recovery {
                         from: self.scopes.get(&RECOVERY).unwrap_or(0),
                         released: None,
+                        previous: Vec::new(),
                     },
                 );
             }
@@ -838,6 +839,7 @@ impl Personal {
             }
             Op::Restore { device, kit } => {
                 let previous = self.secrets.get(&ONE);
+                let entries: Vec<KitEntry> = self.kit.iter(None).map(|(_, entry)| entry).collect();
                 let live: Vec<DeviceId> = self.live.iter(None).map(|(id, ())| id).collect();
                 for id in live {
                     self.remove_device(id, index, at, now);
@@ -853,6 +855,7 @@ impl Personal {
                     &Recovery {
                         from: self.scopes.get(&RECOVERY).unwrap_or(0),
                         released: added.zip(previous),
+                        previous: entries,
                     },
                 );
             }
@@ -898,6 +901,35 @@ impl Personal {
             self.kit.insert(&(i as u8), entry);
         }
         self.secrets.insert(&ONE, &r2);
+    }
+
+    /// Whether `entries` are the kit's as they are, in order, each with any
+    /// `R1`: a commit's kit re-sealed under a new `R`.
+    pub(crate) fn kit_resealed(&self, entries: &[KitEntry]) -> bool {
+        let kit: Vec<KitEntry> = self.kit.iter(None).map(|(_, entry)| entry).collect();
+        kit.len() == entries.len()
+            && kit.iter().zip(entries).all(|(kept, resealed)| {
+                kept.kind == resealed.kind
+                    && kept.signing == resealed.signing
+                    && kept.sealing == resealed.sealing
+            })
+    }
+
+    /// The kit re-sealed by a confirmed commit, its `R2` deposited: its
+    /// entries' `R1`s and `R2` replaced, the recovery scope's envelopes for
+    /// the kit those after now. A kit replaced since the commit keeps its
+    /// own.
+    pub(crate) fn reseal(&mut self, entries: &[KitEntry], r2: [u8; 32]) {
+        if !self.kit_resealed(entries) {
+            return;
+        }
+        for (i, entry) in entries.iter().enumerate() {
+            self.kit.insert(&(i as u8), entry);
+        }
+        self.secrets.insert(&ONE, &r2);
+        let mut recovery = self.recovery.get(&ONE).unwrap_or_default();
+        recovery.from = self.scopes.get(&RECOVERY).unwrap_or(0);
+        self.recovery.insert(&ONE, &recovery);
     }
 
     /// A regroup or a restore starts a new group: the pending candidate,

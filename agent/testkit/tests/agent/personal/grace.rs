@@ -53,6 +53,7 @@ fn a_lapsed_agent_takes_removals_alive_and_votes_and_refuses_pushes() {
     let adding = Effect {
         add: Some(device(2)),
         remove: vec![1],
+        rekey: None,
     };
     assert_eq!(
         home.call::<Candidacy>(admin(0), "commit", commit(2, adding, vec![2; 700])),

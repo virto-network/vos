@@ -364,6 +364,35 @@ fn a_restore_is_cancelled_by_alive_and_releases_r2_once_matured() {
     let effect = Effect {
         add: None,
         remove: vec![0],
+        rekey: None,
+    };
+    assert_eq!(
+        home.call::<Candidacy>(
+            admin(5),
+            "commit",
+            commit(epoch, effect.clone(), vec![9; 600])
+        ),
+        Err(PersonalError::Rekey),
+        "a removal re-seals the kit"
+    );
+    let (mut stale, _) = home.rekey(sync(5), 9);
+    stale.entries[0].sealing = [0x99; 32];
+    let effect = Effect {
+        rekey: Some(stale),
+        ..effect
+    };
+    assert_eq!(
+        home.call::<Candidacy>(
+            admin(5),
+            "commit",
+            commit(epoch, effect.clone(), vec![9; 600])
+        ),
+        Err(PersonalError::Rekey),
+        "the kit's own entries, each with a new R1"
+    );
+    let effect = Effect {
+        rekey: Some(home.rekey(sync(5), 9).0),
+        ..effect
     };
     home.call::<Candidacy>(admin(5), "commit", commit(epoch, effect, vec![9; 600]))
         .unwrap();
@@ -510,6 +539,7 @@ fn a_delayed_admins_add_waits_then_a_commit_carries_it() {
     let add = |n| Effect {
         add: Some(device(n)),
         remove: Vec::new(),
+        rekey: None,
     };
     assert_eq!(
         home.call::<Candidacy>(admin(1), "commit", commit(2, add(2), vec![2; 600])),
@@ -611,15 +641,27 @@ fn operations_are_signed_end_to_end_and_their_evidence_stored() {
     let removal = home.operate(KIT, "remove", 1u32).unwrap();
     let signed = message(KIT_KEY, home.method("remove"), &1u32.encode());
     assert_eq!(
-        home.call::<Recorded>(sync(0), "evidence", evidence(removal, signed.clone(), None)),
+        home.call::<Recorded>(
+            sync(0),
+            "evidence",
+            evidence(removal, signed.clone(), Attached::default())
+        ),
         Err(PersonalError::NotYours)
     );
-    home.call::<Recorded>(KIT, "evidence", evidence(removal, signed, None))
-        .unwrap();
+    home.call::<Recorded>(
+        KIT,
+        "evidence",
+        evidence(removal, signed, Attached::default()),
+    )
+    .unwrap();
     let veto = home.operate(admin(1), "veto", removal).unwrap();
     let signed = message(device(1).admin, home.method("veto"), &removal.encode());
-    home.call::<Recorded>(sync(1), "evidence", evidence(veto, signed, None))
-        .unwrap();
+    home.call::<Recorded>(
+        sync(1),
+        "evidence",
+        evidence(veto, signed, Attached::default()),
+    )
+    .unwrap();
     let entries: Vec<(u64, Entry)> = home.query(sync(0), "log", removal).unwrap();
     assert!(matches!(
         entries[0].1.body,
@@ -786,6 +828,7 @@ fn an_open_operations_keys_cannot_be_squatted() {
     let effect = Effect {
         add: Some(squat),
         remove: Vec::new(),
+        rekey: None,
     };
     let epoch = home.overview().confirmed + 1;
     assert_eq!(
@@ -837,6 +880,7 @@ fn a_dropped_devices_operations_are_cancelled() {
     let effect = Effect {
         add: Some(device(2)),
         remove: Vec::new(),
+        rekey: None,
     };
     let candidacy: Candidacy = home
         .call(admin(0), "commit", commit(2, effect, vec![2; 600]))
@@ -871,16 +915,41 @@ fn the_released_r2_is_deleted_at_the_restored_devices_first_commit() {
         .unwrap();
     let released: RecoveryView = home.query(sync(5), "recovery", ()).unwrap();
     assert_eq!(released.released, Some(kit().r2));
+    assert_eq!(released.previous, kit().entries, "the entries it went with");
+    let (rekey, r2) = home.rekey(sync(5), 9);
     let effect = Effect {
         add: None,
         remove: vec![0],
+        rekey: Some(rekey.clone()),
     };
-    let candidacy: Candidacy = home
-        .call(admin(5), "commit", commit(1, effect, vec![9; 600]))
-        .unwrap();
+    let arguments = commit(1, effect, vec![9; 600]);
+    let candidacy: Candidacy = home.call(admin(5), "commit", arguments.clone()).unwrap();
+    let signed = message(device(5).admin, home.method("commit"), &arguments.encode());
+    assert_eq!(
+        home.call::<Recorded>(
+            sync(5),
+            "evidence",
+            evidence(candidacy.index, signed.clone(), Attached::default())
+        ),
+        Err(PersonalError::Welcome),
+        "a re-sealed kit's evidence carries its R2"
+    );
+    home.call::<Recorded>(
+        sync(5),
+        "evidence",
+        evidence(candidacy.index, signed, with_r2(r2)),
+    )
+    .unwrap();
+    let pushed = home.push(5, envelope(RECOVERY, 0, 3, 200)).unwrap();
     home.call::<Voted>(sync(5), "confirm", (1u64, [1u8; 32], [0u8; 64]))
         .unwrap();
     assert_eq!(candidacy.set, vec![1]);
     let released: RecoveryView = home.query(sync(5), "recovery", ()).unwrap();
     assert_eq!(released.released, None);
+    assert!(released.previous.is_empty());
+    assert_eq!(released.entries, rekey.entries, "the kit re-sealed");
+    assert_eq!(
+        released.from, pushed.position,
+        "the kit reads what follows the re-seal"
+    );
 }

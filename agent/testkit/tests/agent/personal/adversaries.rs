@@ -289,10 +289,12 @@ impl Game {
                     .is_some_and(|removal| removal.committed.is_none())
             })
             .map(|view| view.id)
-            .collect();
+            .collect::<Vec<_>>();
+        let rekey = (!owed.is_empty()).then(|| self.home.rekey(self.reader(), id).0);
         let effect = Effect {
             add: Some(device(id)),
             remove: owed,
+            rekey,
         };
         let made = self.home.call::<Candidacy>(
             Principal::Client(device_keys(by).admin),

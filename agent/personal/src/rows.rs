@@ -1,8 +1,10 @@
 //! The rows `Personal` keeps for itself, beside the wire's: each encoding
 //! fixed for good, as every row's (the layout is append-only).
 
+use alloc::vec::Vec;
+
 use vos_sdk::prelude::*;
-use vos_wire::personal::{DeviceId, Pending};
+use vos_wire::personal::{DeviceId, KitEntry, NewKit, Pending};
 
 /// The key of a table holding one row.
 pub const ONE: u8 = 0;
@@ -36,6 +38,9 @@ pub struct Candidate {
     pub carries: Option<u64>,
     pub removes: Vec<DeviceId>,
     pub set: Vec<DeviceId>,
+    /// The kit re-sealed under a new `R`, its `R2` deposited by the
+    /// commit's evidence: the kit's from the commit's confirmation.
+    pub rekey: Option<NewKit>,
 }
 
 impl Candidate {
@@ -98,11 +103,13 @@ pub struct Stored {
 
 /// The recovery kit's state beside its entries: the recovery scope's
 /// position its envelopes start after, and the previous `R2` a matured
-/// restore released, with the device it added.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
+/// restore released, with the device it added and the entries it
+/// replaced.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
 pub struct Recovery {
     pub from: u64,
     pub released: Option<(DeviceId, [u8; 32])>,
+    pub previous: Vec<KitEntry>,
 }
 
 /// An open pairing slot.

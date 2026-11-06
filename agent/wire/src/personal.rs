@@ -105,6 +105,13 @@ pub fn r2_hash(r2: &[u8; 32]) -> [u8; 32] {
     hash(b"vos/personal/r2", &[r2])
 }
 
+/// The hash a kit's `R` is named by in the admin call that drew it: a
+/// device takes an `R` another device's archive brings only when it is the
+/// one named.
+pub fn r_hash(r: &[u8; 32]) -> [u8; 32] {
+    hash(b"vos/personal/r", &[r])
+}
+
 /// The control log's chain after the entry at `index`: over the chain
 /// before it and the entry's time and body, encoded. The chain before the
 /// first entry is zeros.
@@ -299,23 +306,27 @@ pub struct Kit {
     pub r2: [u8; 32],
 }
 
-/// A kit an operation brings: its entries, and its `R2` by
-/// [`r2_hash`], `R2` itself in the operation's evidence.
+/// A kit an operation or a commit brings: its entries, its `R2` by
+/// [`r2_hash`], `R2` itself in the call's evidence, and its `R` by
+/// [`r_hash`], which the devices check.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct NewKit {
     pub entries: Vec<KitEntry>,
     pub r2_hash: [u8; 32],
+    pub r_hash: [u8; 32],
 }
 
 /// The recovery kit as the agent answers it: its entries, each with `R1`
 /// sealed to it; the recovery scope's position its envelopes start after,
-/// those sealed under an earlier `R` before it; and `R2`, for the device a
-/// matured restore added alone.
+/// those sealed under an earlier `R` before it; and, for the device a
+/// matured restore added alone, the previous `R2` and the entries the
+/// restore replaced, whose `R1` it opens with the kit it used.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct RecoveryView {
     pub entries: Vec<KitEntry>,
     pub from: u64,
     pub released: Option<[u8; 32]>,
+    pub previous: Vec<KitEntry>,
 }
 
 /// Who signed an operation: a device's admin key, or a recovery entry's
@@ -473,12 +484,25 @@ impl Policy {
 }
 
 /// A commit's declared effect: the device it adds, inline for a strong
-/// admin's add or a matured add operation's, and the devices whose matured
-/// removals it carries; an update with neither.
+/// admin's add or a matured add operation's, the devices whose matured
+/// removals it carries, and the kit re-sealed under a new `R`, which every
+/// commit carrying a removal brings: the kit's entries as they are, each
+/// with a new `R1` sealed to it, its `R2` in the evidence. An update with
+/// none of these.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
 pub struct Effect {
     pub add: Option<NewDevice>,
     pub remove: Vec<DeviceId>,
+    pub rekey: Option<NewKit>,
+}
+
+/// What an admin call's evidence carries beside it, bound by hash in the
+/// call: a commit's Welcome, and the `R2` of a kit rotation, a restore or
+/// a commit that re-seals the kit. `R2` is kept apart and logged nowhere.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
+pub struct Attached {
+    pub welcome: Option<Vec<u8>>,
+    pub r2: Option<[u8; 32]>,
 }
 
 /// An admin call as the agent recorded it: its origin, its method and its
@@ -820,8 +844,8 @@ pub enum PersonalError {
     /// The evidence's message is not the call recorded.
     #[codec(index = 25)]
     Mismatch,
-    /// What rides beside the evidence, a commit's Welcome or an
-    /// operation's `R2`, is missing, unexpected, or not the one named.
+    /// What rides beside the evidence, a commit's Welcome or an `R2`, is
+    /// missing, unexpected, or not the one named.
     #[codec(index = 26)]
     Welcome,
     /// An operation of the kind is open already, for the device or for
@@ -877,4 +901,8 @@ pub enum PersonalError {
     /// The set holds as many live devices as it may.
     #[codec(index = 43)]
     Devices,
+    /// A commit carrying a removal without the kit re-sealed, or a kit
+    /// re-sealed that is not the agent's kit.
+    #[codec(index = 44)]
+    Rekey,
 }

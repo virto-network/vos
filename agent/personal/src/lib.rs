@@ -47,11 +47,11 @@ use vos_sdk::context::Method;
 use vos_sdk::prelude::*;
 use vos_wire::ingress::CallMessage;
 use vos_wire::personal::{
-    Acknowledged, AdminCall, AdminClass, Author, Body, Candidacy, Device, DeviceId, DeviceView,
-    Effect, Entry, Envelope, Header, Holder, InboxItem, Item, Kit, KitEntry, MAX_ENVELOPE,
-    NewAdmin, NewDevice, NewKit, Op, Operation, Overview, PersonalError, Policy, Pushed, RECOVERY,
-    Recipient, Recorded, RecoveryView, Removal, Scope, Signer, Status, Vote, Voted, Woken,
-    commit_id, envelope_id, r2_hash, welcome_hash,
+    Acknowledged, AdminCall, AdminClass, Attached, Author, Body, Candidacy, Device, DeviceId,
+    DeviceView, Effect, Entry, Envelope, Header, Holder, InboxItem, Item, Kit, KitEntry,
+    MAX_ENVELOPE, NewAdmin, NewDevice, NewKit, Op, Operation, Overview, PersonalError, Policy,
+    Pushed, RECOVERY, Recipient, Recorded, RecoveryView, Removal, Scope, Signer, Status, Vote,
+    Voted, Woken, commit_id, envelope_id, r2_hash, welcome_hash,
 };
 
 use rows::{Candidate, Charge, Group, Head, Lease, ONE, Recovery, Share, Slot, Stored, Usage};
@@ -74,12 +74,6 @@ pub const OPEN_SLOTS: usize = 4;
 
 /// The inbox items a pairing slot's holder writes.
 pub const SLOT_ITEMS: u32 = 4;
-
-/// What an admin call's evidence carries beside it, bound by hash.
-enum Bound {
-    Welcome([u8; 32]),
-    R2([u8; 32]),
-}
 
 #[actor(known_keys, onion_only)]
 pub struct Personal {
@@ -485,9 +479,10 @@ impl Personal {
 
     /// Propose `epoch`'s commit: an admin call by an active device, taken as
     /// the candidate when `epoch` is the confirmed epoch plus one and none
-    /// is pending, its effect carrying every matured removal, and adding
-    /// inline for a strong admin or a matured add operation's device. A
-    /// commit already taken answers as it did, or `Decided` once decided.
+    /// is pending, its effect carrying every matured removal, and with any
+    /// removal the kit re-sealed under a new `R`, and adding inline for a
+    /// strong admin or a matured add operation's device. A commit already
+    /// taken answers as it did, or `Decided` once decided.
     #[msg(gas = 40_000_000)]
     pub async fn commit(
         &mut self,
@@ -524,6 +519,13 @@ impl Personal {
             });
         }
         self.check_removals(&effect.remove)?;
+        match &effect.rekey {
+            None if !effect.remove.is_empty() => return Err(PersonalError::Rekey),
+            Some(rekey) if !self.kit_resealed(&rekey.entries) => {
+                return Err(PersonalError::Rekey);
+            }
+            _ => {}
+        }
         let carries = match &effect.add {
             Some(_) if self.live_devices() >= devices::DEVICES => {
                 return Err(PersonalError::Devices);
@@ -594,6 +596,7 @@ impl Personal {
             carries,
             removes: effect.remove,
             set: set.clone(),
+            rekey: effect.rekey,
         });
         self.group.insert(&ONE, &group);
         Ok(Candidacy {
@@ -607,10 +610,10 @@ impl Personal {
 
     /// Post the evidence of the admin call at `index`: the exact call
     /// message its key signed and the signature, and what rides beside it
-    /// bound by hash, a commit's Welcome or an operation's `R2`. Stored as
-    /// data, `R2` apart and logged nowhere; its arguments must be the
-    /// call's recorded, byte for byte. Only the signer posts it: a device
-    /// under its sync key, the kit under its own.
+    /// bound by hash, a commit's Welcome and an `R2`. Stored as data, `R2`
+    /// apart and logged nowhere; its arguments must be the call's
+    /// recorded, byte for byte. Only the signer posts it: a device under
+    /// its sync key, the kit under its own.
     #[msg(gas = 40_000_000)]
     pub async fn evidence(
         &mut self,
@@ -618,7 +621,7 @@ impl Personal {
         index: u64,
         message: Vec<u8>,
         signature: [u8; 64],
-        attached: Option<Vec<u8>>,
+        attached: Attached,
     ) -> Result<Recorded, PersonalError> {
         let now = self.settle(ctx.now())?;
         self.assigned()?;
@@ -627,25 +630,24 @@ impl Personal {
             _ => Signer::Device(self.sync_caller(ctx.caller(), now)?),
         };
         let entry = self.log.get(&index).ok_or(PersonalError::NotAdminCall)?;
-        let (call, by, bound) = match entry.body {
+        let (call, by, welcome_named, r2_named) = match entry.body {
             Body::Operation { call, by, op, .. } => {
-                let bound = match op {
-                    Op::Rotate(kit) | Op::Restore { kit, .. } => Some(Bound::R2(kit.r2_hash)),
+                let r2 = match op {
+                    Op::Rotate(kit) | Op::Restore { kit, .. } => Some(kit.r2_hash),
                     _ => None,
                 };
-                (call, by, bound)
+                (call, by, None, r2)
             }
             Body::Candidate { call, by, .. } => {
                 let commit = personal::Commit::decode_exact(&call.arguments)
                     .ok_or(PersonalError::Malformed)?;
-                (
-                    call,
-                    Signer::Device(by),
-                    commit.welcome_hash.map(Bound::Welcome),
-                )
+                let r2 = commit.effect.rekey.map(|kit| kit.r2_hash);
+                (call, Signer::Device(by), commit.welcome_hash, r2)
             }
-            Body::Veto { call, by, .. } => (call, Signer::Device(by), None),
-            Body::Cosign { call, by, .. } | Body::Resolve { call, by, .. } => (call, by, None),
+            Body::Veto { call, by, .. } => (call, Signer::Device(by), None, None),
+            Body::Cosign { call, by, .. } | Body::Resolve { call, by, .. } => {
+                (call, by, None, None)
+            }
             _ => return Err(PersonalError::NotAdminCall),
         };
         let origin = match self.holder(ctx.caller()) {
@@ -669,23 +671,25 @@ impl Personal {
         {
             return Err(PersonalError::Mismatch);
         }
-        let welcome = match (bound, attached) {
+        let Attached { welcome, r2 } = attached;
+        let welcome = match (welcome_named, welcome) {
             (None, None) => None,
-            (Some(Bound::Welcome(named)), Some(welcome)) if welcome_hash(&welcome) == named => {
-                Some(welcome)
-            }
-            (Some(Bound::R2(named)), Some(r2)) => {
-                let r2: [u8; 32] = r2.try_into().map_err(|_| PersonalError::Welcome)?;
-                if r2_hash(&r2) != named {
-                    return Err(PersonalError::Welcome);
-                }
-                if self.open.contains(&index) {
-                    self.deposits.insert(&index, &r2);
-                }
-                None
-            }
+            (Some(named), Some(welcome)) if welcome_hash(&welcome) == named => Some(welcome),
             _ => return Err(PersonalError::Welcome),
         };
+        match (r2_named, r2) {
+            (None, None) => {}
+            (Some(named), Some(r2)) if r2_hash(&r2) == named => {
+                let candidate = self
+                    .group()
+                    .candidate
+                    .is_some_and(|candidate| candidate.index == index);
+                if self.open.contains(&index) || candidate {
+                    self.deposits.insert(&index, &r2);
+                }
+            }
+            _ => return Err(PersonalError::Welcome),
+        }
         if let Signer::Device(device) = caller {
             self.seen.insert(&device, &now);
         }
@@ -1051,20 +1055,27 @@ impl Personal {
     }
 
     /// The recovery kit: its entries with `R1` sealed to each, where the
-    /// recovery scope starts for it, and the previous `R2` for the device a
-    /// matured restore added, which alone reads it.
+    /// recovery scope starts for it, and the previous `R2` and the entries
+    /// it went with for the device a matured restore added, which alone
+    /// reads them.
     #[msg]
     pub async fn recovery(&self, ctx: &Query<Self>) -> Result<RecoveryView, PersonalError> {
         let reader = self.reader(ctx.caller(), ctx.now())?;
         reader.device_or_kit()?;
         let recovery = self.recovery.get(&ONE).unwrap_or_default();
+        let released = recovery
+            .released
+            .filter(|(device, _)| reader == rules::Reader::Device(*device))
+            .map(|(_, r2)| r2);
         Ok(RecoveryView {
             entries: self.kit.iter(None).map(|(_, entry)| entry).collect(),
             from: recovery.from,
-            released: recovery
-                .released
-                .filter(|(device, _)| reader == rules::Reader::Device(*device))
-                .map(|(_, r2)| r2),
+            previous: if released.is_some() {
+                recovery.previous
+            } else {
+                Vec::new()
+            },
+            released,
         })
     }
 
