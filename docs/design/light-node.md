@@ -848,7 +848,8 @@ commits), **active**, or **removed** (with its frontier). A device is
 
 *What is conceded, and only this:* a thief who passes the owner's strong
 biometric holds an active device and can always contest. The owner wins
-with one device and the kit, or with two other seasoned devices. With the
+with one device and the kit, or with two other seasoned devices whose
+admins are strong (two delayed admins resolve nothing). With the
 kit alone the owner still wins against a thief holding only a sync key (a
 phone after first unlock, malware): the kit's `remove` of that phone can
 be cancelled only by a veto, which needs the admin key the thief lacks,
@@ -928,14 +929,19 @@ where the rules above leave a choice, this is the one taken]:
   `kit_delay_ms` (7 days), and a replacement its `probation_ms` (72 h), the
   new key admitted only at maturity: the new key's probation is the
   replacement's wait, so the old key, while it signs, can veto a
-  replacement it did not ask for. `seasoning_ms` (7 days) is the policy's
-  too; a test home sets each in minutes.
+  replacement it did not ask for. `seasoning_ms` (7 days) and the kit's
+  daily allowance (`kit_operations_per_day`, 4) are the policy's too; a
+  test home sets each in minutes. No device removes itself.
 - **Vetoes** (`veto`, an active device's admin key, never the kit's):
   a device's operation becomes contested, the kit's is cancelled. A
   contest held only by vetoes lifts when the last vetoer's removal
   matures (rule 9), and the operation matures at its own time or then,
-  whichever is later. A device whose removal matures has its open
-  operations cancelled.
+  whichever is later. A device whose removal matures, or which is dropped
+  with its void candidate, is **silenced**: its open operations (a
+  matured add its commit never carried included) are cancelled and its
+  vetoes lifted.
+- **Contests:** a removal aimed at an open removal of its signer by one
+  of its targets, a regroup on either side, is one contest with it.
 - **The two-device rules** need two seasoned devices with **strong**
   admins other than the targets: a delayed admin's signature makes
   nothing immediate and resolves nothing (every operation it signs
@@ -946,33 +952,48 @@ where the rules above leave a choice, this is the one taken]:
   the reverse): the kit's acts at once, a device's when a second agrees.
 - **A frozen probation** keeps the time it had left when the first removal
   against it opened, and runs it from when the last one closes.
+- **Keys an operation brings are claimed** while it is open (a matured
+  add's until its commit): no pairing slot, add or other operation takes
+  them, so none can be squatted to cancel it.
 - **`R2` never enters a readable row:** a rotation or a restore names its
   `R2` by `r2_hash` and carries it in its evidence, kept apart and logged
   nowhere; an operation that matures without it is cancelled
-  (`Unevidenced`).
-- **A restore carries the next kit:** at maturity every open operation is
-  cancelled, every device removed, the restore's device added alone and
-  active, the kit replaced, and the previous `R2` released to that device
-  alone (`recovery`), so the rotation that follows every restore is part of
-  it. A rotation's maturity records the recovery scope's position: the new
-  kit reads only the envelopes after it, those re-sealed under its `R`.
+  (`Unevidenced`). The kit's evidence must come from the very key that
+  signed its operation.
+- **A restore carries the next kit:** at maturity every device is
+  removed, the restore's device added alone and active, the kit replaced,
+  and the previous `R2` released to that device alone (`recovery`) until
+  its first confirmed commit, then deleted; so the rotation that follows
+  every restore is part of it. A rotation's or a restore's maturity
+  cancels the replaced kit's open operations, and records the recovery
+  scope's position: the new kit reads only the envelopes after it, those
+  re-sealed under its `R`. A device's rotation is a veto of the kit's
+  pending rotation or restore, so a leaked kit cannot hold its place.
 - **A regroup or a restore voids the pending candidate** (`Regroup`); the
   agent's epochs run on, the new group's first commit being the confirmed
   epoch plus one and carrying the removals.
+- **Quotas:** operations, vetoes, second signatures and resolutions count
+  against no commit quota, so neither a thief device nor a leaked kit can
+  spend the owner's; the kit's operations count against its daily
+  allowance, and a device's against its open operations.
 - **Bounds:** one open operation of each kind a target (a removal, a
   replacement) or an agent (a rotation or a restore, a regroup); two open
   operations a signer besides its removals; eight live devices. A call
-  settles one operation, then does its own work, which may mature one
-  more; every handler that settles declares the largest gas a schema may
-  (`MAX_HANDLER_GAS`, 100M), and the worst maturity is within half of
-  it [measured, the agent suite on a debug build, x86-64 Core Ultra 7
-  155H, 2026-11-06; gas is deterministic]: a removal by a second signature
-  of a device that vetoed 19 operations and held 9, 20.3M; a restore over
-  eight devices with 24 operations open and contested, 35.8M in one
-  `wake`; an ordinary operation or veto 1.6–2.6M, `alive` 0.93M.
-  Operations other than removals count as commits against the quotas;
-  removals, vetoes, second signatures and resolutions are free, so no
-  quota stops a removal.
+  settles four **steps** before it runs: an operation's maturity, or one
+  row of a silencing or of a replaced kit's cancelling, each queued in
+  the due index at the time it takes effect, so everything settles in
+  time order and no step grows with what an adversary queued. Every
+  handler that settles declares 40M gas [measured, the agent suite on a
+  debug build, x86-64 Core Ultra 7 155H, 2026-11-06; gas is
+  deterministic]: the worst call in a full set (eight seasoned devices,
+  each holding two operations, each vetoed by every other device and
+  resolved by one), whether a regroup naming seven of them or a restore
+  matures, 13.9M; an ordinary operation, veto or resolution 1.6–3.9M,
+  `alive` 0.92M.
+- **Reads between calls** compute a device's standing from the removals
+  due by their time, which a call may yet cancel in time order (a
+  removal's signer removed first); the operations read as the last call
+  left them.
 - **Not built:** an admin call's arguments naming the control log's head
   it was made against (the devices' check, plan 8.19).
 
@@ -2339,7 +2360,8 @@ other device (A4). *Known limit* for what the phone shows. (8.13)
 **A4. A thief who passes the owner's strong biometric** (coercion, a weak
 sensor) holds an active device. *Mitigation:* the symmetric rules (§3.5):
 he removes nothing uncontested while the owner vetoes; the owner wins a
-contest with one device and the kit, or two other seasoned devices; a
+contest with one device and the kit, or two other seasoned devices with
+strong admins; a
 thief holding only a sync key loses even to the kit alone, in 14 days (its
 removal cannot be vetoed without the admin key, and a removed device's
 `alive` is ignored). *Known limit,* and only this: a thief who passes the
