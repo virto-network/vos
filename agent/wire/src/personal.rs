@@ -98,6 +98,13 @@ pub fn welcome_hash(welcome: &[u8]) -> [u8; 32] {
     hash(b"vos/personal/welcome", &[welcome])
 }
 
+/// The hash a kit rotation or a restore names its `R2` by: `R2` rides in
+/// the operation's evidence, kept by the agent and logged nowhere, so no
+/// read serves it.
+pub fn r2_hash(r2: &[u8; 32]) -> [u8; 32] {
+    hash(b"vos/personal/r2", &[r2])
+}
+
 /// The control log's chain after the entry at `index`: over the chain
 /// before it and the entry's time and body, encoded. The chain before the
 /// first entry is zeros.
@@ -171,9 +178,19 @@ pub struct Device {
     pub keys: NewDevice,
     /// The batch time of its add.
     pub added: u64,
-    /// When its probation ends: its add's time for the claiming device.
+    /// When its probation ends: its add's time for the claiming device, a
+    /// restore's maturity for the device it adds. A probation frozen under
+    /// a removal moves it on by the time frozen.
     pub active_from: u64,
     pub status: Status,
+}
+
+/// An admin key replacing a device's, and what its attestation showed.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct NewAdmin {
+    pub key: [u8; 32],
+    pub class: AdminClass,
+    pub attestation: Attestation,
 }
 
 /// A device's lasting status, as the agent wrote it.
@@ -190,10 +207,10 @@ pub enum Status {
 }
 
 /// A device's standing at a batch time: its status, and its probation
-/// and pending removal read against the time.
+/// and the removals pending against it read against the time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Standing {
-    /// It may sync and vote, not sign operations or commits.
+    /// It may sync and vote, not sign operations, veto or commit.
     #[codec(index = 0)]
     Probation,
     #[codec(index = 1)]
@@ -204,13 +221,14 @@ pub enum Standing {
     Dropped,
 }
 
-/// A removal of a device: pending until `matures`, then matured until a
-/// confirmed commit carries it.
+/// A device's matured removal, until a confirmed commit carries it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Removal {
-    /// The log index of the operation.
+    /// The log index of the operation that removed it: a removal, a
+    /// regroup or a restore.
     pub index: u64,
-    pub matures: u64,
+    /// When it matured.
+    pub at: u64,
     /// The epoch whose confirmed commit carried it out of the group.
     pub committed: Option<u64>,
 }
@@ -221,6 +239,9 @@ pub struct DeviceView {
     pub id: DeviceId,
     pub device: Device,
     pub standing: Standing,
+    /// Active for the policy's seasoning: one of two for the two-device
+    /// rules, when its admin is strong.
+    pub seasoned: bool,
     pub removal: Option<Removal>,
 }
 
@@ -268,14 +289,136 @@ pub struct Kit {
     pub r2: [u8; 32],
 }
 
+/// A kit an operation brings: its entries, and its `R2` by
+/// [`r2_hash`], `R2` itself in the operation's evidence.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct NewKit {
+    pub entries: Vec<KitEntry>,
+    pub r2_hash: [u8; 32],
+}
+
+/// The recovery kit as the agent answers it: its entries, each with `R1`
+/// sealed to it; the recovery scope's position its envelopes start after,
+/// those sealed under an earlier `R` before it; and `R2`, for the device a
+/// matured restore added alone.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct RecoveryView {
+    pub entries: Vec<KitEntry>,
+    pub from: u64,
+    pub released: Option<[u8; 32]>,
+}
+
+/// Who signed an operation: a device's admin key, or a recovery entry's
+/// signing key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
+pub enum Signer {
+    #[codec(index = 0)]
+    Device(DeviceId),
+    #[codec(index = 1)]
+    Kit(u8),
+}
+
+/// A device-set operation (`light-node.md` §3.5): each pending for its
+/// signer's delay, then matured unless vetoed or contested.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum Op {
+    /// An add as an operation, a delayed admin's: a commit carries it once
+    /// matured.
+    #[codec(index = 0)]
+    Add(NewDevice),
+    #[codec(index = 1)]
+    Remove(DeviceId),
+    /// A device's admin key replaced, its seasoning kept: the wait is the
+    /// new key's probation.
+    #[codec(index = 2)]
+    Replace { device: DeviceId, admin: NewAdmin },
+    /// The kit replaced: its entries, `R2`, and the recovery envelopes
+    /// re-sealed after it.
+    #[codec(index = 3)]
+    Rotate(NewKit),
+    /// The devices named removed and a new group started with the rest:
+    /// a device's restore, needing no `R2`.
+    #[codec(index = 4)]
+    Regroup(Vec<DeviceId>),
+    /// Every device removed, `device` added alone and active, `kit`
+    /// replacing the kit, and the previous `R2` released to `device`.
+    #[codec(index = 5)]
+    Restore { device: NewDevice, kit: NewKit },
+}
+
+/// Why an operation was cancelled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+#[repr(u8)]
+pub enum Cancel {
+    /// A device vetoed the kit's operation.
+    #[codec(index = 0)]
+    Veto = 0,
+    /// A device's `alive` while a restore was pending.
+    #[codec(index = 1)]
+    Alive = 1,
+    /// Its signer's removal matured: it has no voice.
+    #[codec(index = 2)]
+    Signer = 2,
+    /// The device it acts on left the set first.
+    #[codec(index = 3)]
+    Moot = 3,
+    /// A resolution dropped it.
+    #[codec(index = 4)]
+    Resolved = 4,
+    /// A restore replaced the device set.
+    #[codec(index = 5)]
+    Restored = 5,
+    /// It matured without the evidence carrying its `R2`.
+    #[codec(index = 6)]
+    Unevidenced = 6,
+    /// A key it brings was admitted by its maturity.
+    #[codec(index = 7)]
+    KeyTaken = 7,
+}
+
+/// Where an operation is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum OpState {
+    /// Waiting for its maturity.
+    #[codec(index = 0)]
+    Pending,
+    /// Vetoed by a device with a voice, or one of two removals aimed at
+    /// each other: it does not mature until resolved.
+    #[codec(index = 1)]
+    Contested,
+    #[codec(index = 2)]
+    Matured { at: u64 },
+    /// An add a confirmed commit carried.
+    #[codec(index = 3)]
+    Carried { epoch: u64 },
+    #[codec(index = 4)]
+    Cancelled { at: u64, why: Cancel },
+}
+
+/// A device-set operation as the agent holds it, by its log index.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Operation {
+    pub by: Signer,
+    pub op: Op,
+    /// Its batch time, and when it matures uncontested.
+    pub at: u64,
+    pub matures: u64,
+    pub state: OpState,
+}
+
 /// The space's policy for its personal agents: delays, windows and
 /// quotas, minutes on a test home.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Policy {
-    /// A removal's wait before it matures.
-    pub removal_delay_ms: u64,
-    /// A paired device's probation.
+    /// A device's operation's wait before it matures: a removal, a
+    /// delayed admin's add, a kit rotation, a regroup.
+    pub operation_delay_ms: u64,
+    /// The kit's operations' wait.
+    pub kit_delay_ms: u64,
+    /// A paired device's probation, and a replaced admin key's.
     pub probation_ms: u64,
+    /// How long a device is active before it is seasoned.
+    pub seasoning_ms: u64,
     /// The confirming set's window of calls, and a candidate's wait for
     /// its set.
     pub confirm_window_ms: u64,
@@ -298,8 +441,10 @@ pub struct Policy {
 impl Policy {
     /// A home's policy unless it sets another.
     pub const DEFAULT: Self = Self {
-        removal_delay_ms: 72 * HOUR_MS,
+        operation_delay_ms: 72 * HOUR_MS,
+        kit_delay_ms: 7 * DAY_MS,
         probation_ms: 72 * HOUR_MS,
+        seasoning_ms: 7 * DAY_MS,
         confirm_window_ms: 72 * HOUR_MS,
         lease_ms: 395 * DAY_MS,
         bytes_new: 8 << 20,
@@ -314,8 +459,8 @@ impl Policy {
 }
 
 /// A commit's declared effect: the device it adds, inline for a strong
-/// admin's add, and the devices whose matured removals it carries; an
-/// update with neither.
+/// admin's add or a matured add operation's, and the devices whose matured
+/// removals it carries; an update with neither.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
 pub struct Effect {
     pub add: Option<NewDevice>,
@@ -355,6 +500,9 @@ pub enum Void {
     /// Its window passed without its set complete.
     #[codec(index = 2)]
     Timeout = 2,
+    /// A regroup or a restore started a new group.
+    #[codec(index = 3)]
+    Regroup = 3,
 }
 
 /// The agent's advisory verdict on a candidate: each device checks the
@@ -381,12 +529,13 @@ pub enum Body {
     /// A re-proof: the lease runs to `until`.
     #[codec(index = 2)]
     Renewed { until: u64 },
-    /// An admin call removing `target`, maturing at `matures`.
+    /// An admin call making a device-set operation, maturing at
+    /// `matures` unless vetoed or contested.
     #[codec(index = 3)]
-    Removal {
+    Operation {
         call: AdminCall,
-        by: DeviceId,
-        target: DeviceId,
+        by: Signer,
+        op: Op,
         matures: u64,
     },
     /// A removal matured: the device has no voice.
@@ -426,6 +575,33 @@ pub enum Body {
     /// A device's liveness.
     #[codec(index = 9)]
     Alive { device: DeviceId },
+    /// An admin call vetoing the operation at `op`.
+    #[codec(index = 10)]
+    Veto {
+        call: AdminCall,
+        by: DeviceId,
+        op: u64,
+    },
+    /// An admin call adding the second signature that makes the operation
+    /// at `op` immediate.
+    #[codec(index = 11)]
+    Cosign {
+        call: AdminCall,
+        by: Signer,
+        op: u64,
+    },
+    /// An admin call resolving the contest of the operation at `op`:
+    /// `upheld`, it matures and its rival is dropped; else the reverse.
+    #[codec(index = 12)]
+    Resolve {
+        call: AdminCall,
+        by: Signer,
+        op: u64,
+        upheld: bool,
+    },
+    /// The operation at `op` reached `state`.
+    #[codec(index = 13)]
+    Settled { op: u64, state: OpState },
 }
 
 /// A control-log entry: its batch time, its body and the chain through it.
@@ -538,6 +714,13 @@ pub struct Recorded {
     pub index: u64,
 }
 
+/// A `wake`: its batch time, and whether it settled everything due.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Woken {
+    pub at: u64,
+    pub settled: bool,
+}
+
 /// A vote recorded, and the verdict it reached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Voted {
@@ -623,11 +806,12 @@ pub enum PersonalError {
     /// The evidence's message is not the call recorded.
     #[codec(index = 25)]
     Mismatch,
-    /// The evidence's Welcome is missing, unexpected, or not the one the
-    /// commit names.
+    /// What rides beside the evidence, a commit's Welcome or an
+    /// operation's `R2`, is missing, unexpected, or not the one named.
     #[codec(index = 26)]
     Welcome,
-    /// A removal of the device is pending already.
+    /// An operation of the kind is open already, for the device or for
+    /// the agent.
     #[codec(index = 27)]
     Pending,
     /// No envelope at that position.
@@ -647,4 +831,36 @@ pub enum PersonalError {
     /// Another item holds the inbox key.
     #[codec(index = 33)]
     ItemTaken,
+    /// No open operation at the index.
+    #[codec(index = 34)]
+    NoOperation,
+    /// The device vetoed the operation already.
+    #[codec(index = 35)]
+    Vetoed,
+    /// The kit vetoes nothing.
+    #[codec(index = 36)]
+    KitVeto,
+    /// Not a seasoned device whose admin is strong, as the two-device
+    /// rules and a replacement need.
+    #[codec(index = 37)]
+    Unseasoned,
+    /// A device the operation acts on signs no resolution or second
+    /// signature of it.
+    #[codec(index = 38)]
+    Targeted,
+    /// The signer holds as many open operations as it may.
+    #[codec(index = 39)]
+    Operations,
+    /// The operation is not contested.
+    #[codec(index = 40)]
+    Uncontested,
+    /// The operation is not one this signer makes, or signs a second time.
+    #[codec(index = 41)]
+    NotSigner,
+    /// Operations fell due that `wake` settles first.
+    #[codec(index = 42)]
+    Settling,
+    /// The set holds as many live devices as it may.
+    #[codec(index = 43)]
+    Devices,
 }

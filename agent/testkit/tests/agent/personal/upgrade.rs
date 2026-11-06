@@ -5,8 +5,8 @@
 
 use vos_testkit::programs::{derived, package};
 use vos_wire::personal::{
-    Acknowledged, Candidacy, DeviceView, Entry, Envelope, InboxItem, Overview, Recipient, Recorded,
-    Verdict, Voted,
+    Acknowledged, Candidacy, DeviceView, Entry, Envelope, InboxItem, Operation, Overview,
+    Recipient, Recorded, RecoveryView, Verdict, Voted,
 };
 
 use super::*;
@@ -22,6 +22,8 @@ struct Everything {
     inbox: Vec<InboxItem>,
     acks: Vec<Vec<Acknowledged>>,
     frontiers: Vec<Vec<(Scope, u64)>>,
+    operations: Vec<(u64, Operation)>,
+    recovery: RecoveryView,
 }
 
 fn everything(home: &Home) -> Everything {
@@ -64,11 +66,14 @@ fn everything(home: &Home) -> Everything {
         frontiers: (0..3u32)
             .map(|device| home.query(sync(0), "frontier", device).unwrap())
             .collect(),
+        operations: home.query(sync(0), "operations", None::<u64>).unwrap(),
+        recovery: home.query(sync(0), "recovery", ()).unwrap(),
     }
 }
 
 /// An agent with devices added and removed, commits confirmed and void,
-/// evidence, envelopes across scopes and the inbox; the next version
+/// evidence, envelopes across scopes, the inbox, and device-set operations
+/// open, contested and cancelled; the next version
 /// installed over it reads all of it back as the version before did, and
 /// takes the next push and commit.
 #[test]
@@ -103,8 +108,19 @@ fn the_next_version_installed_over_a_populated_agent_reads_everything_back() {
         ((Recipient::Devices, [5u8; 16]), (expires, vec![5u8; 300])),
     )
     .unwrap();
+    let contested = home.operate(admin(0), "remove", 1u32).unwrap();
+    home.operate(admin(1), "veto", contested).unwrap();
+    let cancelled = home.operate(KIT, "remove", 0u32).unwrap();
+    home.operate(admin(0), "veto", cancelled).unwrap();
+    home.operate(KIT, "remove", 1u32).unwrap_err();
+    home.operate(admin(1), "add", device(7)).unwrap();
     let before = everything(&home);
     assert!(before.log.len() > 10 && before.scopes.iter().all(|read| read.len() == 10));
+    assert_eq!(
+        before.operations.len(),
+        2,
+        "the contested removal and the add"
+    );
 
     // The next version, installed over the same instance.
     let elf = package("personal-next");

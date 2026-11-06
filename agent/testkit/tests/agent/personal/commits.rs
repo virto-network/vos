@@ -13,7 +13,8 @@ use super::*;
 /// The gate: a commit from a sync key, or from an admin key whose device
 /// may not commit (in probation, its removal matured, a delayed admin's
 /// add inline), is refused, as is one from the kit, a stranger or the
-/// home; an active device's admin key commits. A23: a sync key alone
+/// home, and a removal from any of them but the kit; an active device's
+/// admin key commits. A23: a sync key alone
 /// commits nothing.
 #[test]
 fn a_commit_from_a_sync_key_or_a_device_that_may_not_commit_is_refused() {
@@ -28,6 +29,10 @@ fn a_commit_from_a_sync_key_or_a_device_that_may_not_commit_is_refused() {
             }),
             "{caller:?}"
         );
+        if caller == KIT {
+            // The kit removes, as an operation of its own.
+            continue;
+        }
         assert_eq!(
             home.call::<Recorded>(caller, "remove", 0u32),
             Err(if caller == sync(0) {
@@ -247,6 +252,7 @@ fn one_commit_carries_every_matured_removal_and_removed_devices_have_no_voice() 
         "not yet matured"
     );
     home.pass(72 * HOUR_MS);
+    home.wake(sync(0)).unwrap();
     // The removals matured: the attackers' liveness is refused.
     for n in [3, 4] {
         assert_eq!(

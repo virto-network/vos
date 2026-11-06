@@ -32,6 +32,8 @@ pub struct Candidate {
     pub by: DeviceId,
     pub created: u64,
     pub added: Option<DeviceId>,
+    /// The matured add operation whose device it adds.
+    pub carries: Option<u64>,
     pub removes: Vec<DeviceId>,
     pub set: Vec<DeviceId>,
 }
@@ -90,6 +92,15 @@ pub struct Stored {
     pub id: [u8; 32],
     pub author: DeviceId,
     pub len: u32,
+}
+
+/// The recovery kit's state beside its entries: the recovery scope's
+/// position its envelopes start after, and the previous `R2` a matured
+/// restore released, with the device it added.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
+pub struct Recovery {
+    pub from: u64,
+    pub released: Option<(DeviceId, [u8; 32])>,
 }
 
 /// An open pairing slot.
