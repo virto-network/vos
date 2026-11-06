@@ -140,7 +140,7 @@ devices decrypt each other's messages".
 | **local store** | fjall, as the node's, with small caches (8–16 MiB block cache [est]) | `vos-node`'s `store` [built] |
 | **device prover** | the device profile (format 46, then 47 after the levers, §4.4), masked, `Threads::Auto` | `vos-pvm-proof` and `vos-pvm-recair`'s masked device segment, its recursion prover featured out (§7.1) |
 | **node-API client** | the multiplexed `vos-api` client over SSH's `vos-api` subsystem, over an arti onion stream (§6) [E23] | `vos-api` [built] |
-| **sync** | merkle-crdt DAGs of the local actors' Merge fields, one a local instance, its `Store` over fjall, sealed before they leave the device (§3.6) | `support/merkle-crdt` [built: incremental apply, author chains, `FjallStore`, batched fetching], `vos-light`'s `sync` [built: nodes recorded and applied through the merge entry; sealing and the cursor over `Personal` are not] |
+| **sync** | merkle-crdt DAGs of the local actors' Merge fields, one a local instance, its `Store` over fjall, sealed before they leave the device (§3.6) | `support/merkle-crdt` [built: incremental apply, author chains, `FjallStore`, batched fetching], `vos-light`'s `sync` and `personal` [built: nodes recorded and applied through the merge entry, sealed at push and read by the cursor over `Personal`, §3.6] |
 | **MLS** | the user's device group, through `vos-mls` over mls-rs, on the host side, native, never in a guest | `vos-mls` [new]; the storage providers and copy-and-swap adapted from the `messaging` branch (§3.4) |
 | **secrets** | per device, as today: the member secret from the keystore's HMAC; the admin key in the hardware keystore; the sync key and MLS state wrapped after first unlock; a security-key kit through the `hmac-secret` path (§3.5) | `vos-light`'s `secret` [built, extended] |
 | **Tor** | arti's client, one `TorClient` per process | arti (§6) |
@@ -167,8 +167,8 @@ devices decrypt each other's messages".
   Lamport clock, its author's cutoff where it equivocates and its held
   operations of unknown kinds written with them. Reads filter the
   equivocating authors and those the host cuts off (`Light::cut_off`,
-  the device set's frontiers, §3.5). Sealing, the cursor over
-  `Personal` and the device set are later steps (8.13, 8.20).
+  the device set's frontiers, §3.5). Sealing and the cursor over
+  `Personal` are §3.6's (`vos_light::personal`).
 - **The host-call layer** is `vos-exec`, which `vos-node` and `vos-light`
   link; ingress's device programs (`credentialed.rs`'s use of
   `vos_pvm_recair::device`) stay in the node, as the light node never
@@ -843,8 +843,8 @@ arm64-v8a build; the phones' timings below are S8-P1's]:
   its group), and every tracked scope's key of every confirmed epoch,
   recorded in the swap's batch; it seals under the epoch's archive key
   (`MLS-Exporter("vos/personal/archive", "", 32)`, XChaCha20-Poly1305).
-  Pushing it to the agent is 8.20's. A store that derived a scope id
-  joins no other group.
+  It is pushed to the agent at each confirmed epoch (§3.6, "Sealed sync
+  as built"). A store that derived a scope id joins no other group.
 - **Not built here:** a replaced admin key's leaf credential (the leaf
   keeps the key it was added with; the replaced key signs calls, and a
   replacement whose evidence comes after its maturity leaves the old key
@@ -1259,6 +1259,88 @@ bytes and calls. [built: the bytes held are envelopes' and inbox items';
 the calls counted are pushes, inbox items and commits carrying no removal;
 the share binds while the agent has a second live device, so a sole
 device holds the whole quota.]
+
+**Sealed sync as built** [built, `vos_light::sealed` and
+`vos_light::personal`, tested against `Personal` in
+`node/light/tests/sealed`; where the text above leaves a choice, this is
+the one taken]:
+- **The envelope:** the header as above; the body framed by its length
+  (four bytes) and zero-padded to the frame's Padmé length, the padding
+  checked on open; `len_class` the padded length's bit length less one,
+  checked against the bytes; the nonce the operating system's. A data
+  scope's body is the node's bytes (author, sequence, signature, parents,
+  operations), the writer's view `(next index, chain)` and its `seen`
+  positions, one a scope it syncs (its cursor), cut to the envelope's own
+  scope's when they would not fit. One node an envelope: the largest body
+  is 59,388 bytes, and a call takes at most 48 KiB of arguments
+  (`MAX_ARGUMENTS`), so every node fits with room for its parents; larger
+  objects are the actor's to chunk.
+- **Seal at push:** `SealedSync::push` seals each outbox node not yet
+  queued under the confirmed epoch, writes the queue (one synced batch)
+  and sends it 16 envelopes a round trip; each prefix the agent took is
+  marked pushed and leaves the queue in one batch with the scope's
+  commit. `StaleEpoch` naming the epoch this device confirmed reseals the
+  queue's envelopes of earlier epochs; naming a later one stops the push
+  for the log. `Settling` is answered with a `wake` and the rest pushed
+  again.
+- **The cursor:** `SealedSync::catch_up` reads `since` from the scope's
+  stored position, checks each envelope's id against its bytes and its
+  header against the scope, opens it under the confirmed epoch's key or
+  the archive's candidates for an earlier epoch, and applies the page's
+  nodes with its last position in one batch. It stops before an envelope
+  of a later epoch (`Waiting::Epoch`: follow the log) or of an epoch whose
+  key this device lacks (`Waiting::Key`: read the archive); one that does
+  not open under any candidate, or holds no body, is passed over and
+  reported with its position (B5). Each opened envelope's view and `seen`
+  positions are returned for 8.21's checks; nothing checks them yet.
+- **The archive** lives in a scope of its own, its id from the naming
+  secret (`"vos/personal/archive"`, apart from every instance's
+  four-byte name). `SealedSync::archive` reads it from its cursor, merges
+  every archive sealed at the confirmed epoch (its chunks reassembled and
+  checked against their digest), and, if it found none, pushes this
+  device's, chunked, under the epoch's archive key: the committer's push
+  and any device's that finds it missing are one rule. Archives of
+  earlier epochs are passed over; a later one holds their keys.
+- **`R` and the recovery envelopes:** `R` is held in the archive (the
+  later claim's or rotation's by log index, so it travels with pairing
+  and with the archive); `SealedSync::recovery` pushes, once a confirmed
+  epoch, the naming secret and the epoch's keys of every tracked scope
+  sealed under `BLAKE2b-256("vos/personal/recovery" ‖ R)` into the
+  recovery scope, unless one is there; `open_recovery` is the kit's read.
+- **Tor only:** a `Link` names its `Route`; `SealedSync` refuses a link
+  whose route is not the onion, and checks it again before every
+  request, so no request to the personal agent leaves over the clearnet
+  [E17]. The onion transport itself is 8.26's.
+- **Not built here:** the device-side authorization of authors (a node's
+  author is the store's author key, not yet the device's sync key, so no
+  reader maps it to the device set), frontiers on read, the `seen` and
+  view checks (8.21), pipelined reads, and garbage collection of covered
+  envelopes and of earlier epochs' archives (§9.3).
+
+**PG6's catch-up on the clearnet** [measured, x86-64 Core Ultra 7 155H,
+load average 5–11, release, 2026-11-06; `node/host/tests/ingress/sealed.rs`
+with `VOS_CATCH_UP_ROUNDS=5`: two light nodes in one device group at
+`Personal` on a node, every request through the node's socket with the
+onion's mark]: a mebibyte of titles in a fresh scope, read from its start,
+every envelope opened and its node applied through the merge entry:
+- in 1,000-byte operations: 1,049 envelopes, 1,477,977 bytes (the node's
+  framing and the padding 41% over the titles), about 26 `since` pages:
+  **0.62 s p50**, 0.66 s p95; its push, one call an envelope in turn,
+  4.2 s;
+- in the largest operations: 22 envelopes, 1,127,830 bytes: **0.16 s
+  p50**, 0.18 s p95; its push 0.15 s.
+
+PG6's limit is 20 s. The device's part alone (`vos-phone sync`, the agent
+a stand-in in the process, the same host): 0.32 s and 0.09 s; the phones'
+numbers wait for the phone session (`tools/phone/scripts/sync.sh`).
+**Over Tor** the reads, not the device, set the time: at §6.3's measured
+0.15 MB/s and 0.55 s a round trip, the 1.48 MB of small envelopes take
+about 10 s to arrive and their 26 sequential pages about 14 s of round
+trips, past the limit. The levers, before S8-P6: `since` pages asked
+ahead (positions are dense, so a device can pipeline the next pages'
+requests), and several operations a node, which cuts the framing and the
+envelope count (a push of 1,049 envelopes 16 a round trip is 66 round
+trips over Tor).
 
 **Background sync:** a WorkManager job pushes queued operations, posts
 `alive` if a restore is pending, reads the control log and each scope's

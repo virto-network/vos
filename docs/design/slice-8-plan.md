@@ -336,6 +336,12 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   traffic.
 - **Gate:** PG6's catch-up on the clearnet. **Dep:** 8.19. **Estimate:**
   2.5–3.5 weeks.
+- **Host result** (2026-11-06, `light-node.md` §3.6): a 1 MiB catch-up
+  through a node's socket takes 0.62 s p50 in 1,000-byte operations and
+  0.16 s in the largest, against 20 s; the phone's part is
+  `tools/phone/scripts/sync.sh` (S8-P5). Over Tor its 26 sequential pages
+  and 1.5 MB would miss the limit at §6.3's rates: reads asked ahead are
+  the lever.
 
 ### 8.21 Checkpoints and detection — A
 - Checkpoints at agent positions, the pairing device's trusted, two
