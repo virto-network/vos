@@ -10,6 +10,7 @@
 mod garble;
 mod home;
 mod phone;
+mod set;
 
 use ed25519_dalek::{Signer, SigningKey};
 use mls_rs::{ExtensionList, ProtocolVersion};
@@ -33,7 +34,9 @@ const NOTES: Scope = [0x6e; 16];
 fn policy() -> Policy {
     Policy {
         operation_delay_ms: 10 * MIN,
+        kit_delay_ms: 20 * MIN,
         probation_ms: 5 * MIN,
+        seasoning_ms: 10 * MIN,
         confirm_window_ms: 30 * MIN,
         ..Policy::DEFAULT
     }

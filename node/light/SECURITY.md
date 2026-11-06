@@ -74,6 +74,34 @@ and what a node does with one is `node/SECURITY.md`'s.
   log; a log that does not chain stops the reading. A candidate is
   processed on a copy and swapped in only on confirmation, by this
   device's own count of the votes, never the agent's verdict.
+- **A maturity is honoured only behind verified evidence:** each device-set
+  call (operation, veto, second signature, resolution) is checked against
+  its signer's key (a device's admin key, or the kit entry's), what that
+  signer may sign and the delay it must wait; the log's word that an
+  operation matured is honoured only once the evidence supports it: the
+  operation's own, and either its delay passed with no verified veto of a
+  device with a voice, no rival removal and, for a restore, no `alive`
+  since, or a verified second signature, or verified resolutions naming
+  it (the kit's, or two seasoned devices' with strong admins). Evidence
+  posted after the maturity is waited for until the confirm window has
+  passed; a maturity it never supports raises `Unsigned` and moves
+  nothing. A device whose candidate removes a device on a maturity this
+  device does not honour is refused.
+- **The agent's policy is the log's:** operators set the delays, the
+  seasoning, the probation and the confirm window through `Configured`,
+  which every device takes as it reads it. The window bounds how long a
+  candidate waits for its set and how long a device waits for evidence a
+  maturity needs; a home that shortens it shortens both, and one that
+  lengthens it holds a void candidate's keys in place longer. A device
+  checks operations against the delays the log configured, not against
+  its own.
+- **A restore's device trusts the agent for what came before:** it starts
+  its group from what it reads of the agent after its restore matured
+  (the log's head, the device set, the kit), with no earlier view to
+  check them against; from then it checks the log as any device does.
+- **A device that cannot follow** reads on for the device set's
+  operations, so its own regroup matures in its view, but takes no other
+  candidate: its regroup's new group names only the devices it knew.
 - **Data keys come from the confirmed epoch alone**, and scope ids from
   the archive's naming secret, which is the store's from its first scope
   on: a store that named a scope does not join another group.

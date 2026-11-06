@@ -6,23 +6,23 @@
 use ed25519_dalek::{Signature, VerifyingKey};
 use vos_mls::{Expected, Kind};
 use vos_wire::Decode;
-use vos_wire::ids::MethodId;
 use vos_wire::ingress::CallMessage;
 use vos_wire::personal::{
-    AdminClass, Body, DeviceId, Effect, Entry, Op, Signer, Verdict, Void, Vote, chain, vote_message,
+    Body, DeviceId, Effect, Entry, OpState, Signer, Verdict, Void, Vote, chain, vote_message,
     welcome_hash,
 };
 
 use super::{
-    Alarm, CONFIRM, Check, Course, DeviceGroup, Event, GroupError, Known, Pending, Processed,
-    Remedy, Removal, Why, credential, rows,
+    Act, Alarm, CONFIRM, Check, Course, DeviceGroup, Event, GroupError, Known, Pending, Processed,
+    Remedy, Why, credential, rows,
 };
+use crate::call::method_id;
 
 /// A commit call's arguments: its epoch, effect, handshake and Welcome's
 /// hash.
 type CommitArguments = ((u64, Effect), (Vec<u8>, Option<[u8; 32]>));
 
-fn verifies(key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
+pub(super) fn verifies(key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
     VerifyingKey::from_bytes(key).is_ok_and(|key| {
         key.verify_strict(message, &Signature::from_bytes(signature))
             .is_ok()
@@ -33,7 +33,9 @@ impl DeviceGroup {
     /// Read `entries` of the control log, from the cursor on, in order:
     /// what the device must post, and what it saw. An entry that does not
     /// chain stops the reading with [`Alarm::Log`]; entries before the
-    /// cursor are skipped, and the reading stops at a gap. The device's
+    /// cursor are skipped, and the reading stops at a gap. A device that
+    /// cannot follow reads on for the device set's operations, its own
+    /// regroup's among them, not for others' candidates. The device's
     /// state is written once a confirmed epoch is swapped in and at the
     /// end, each time in one batch with its MLS state.
     pub fn follow(
@@ -42,7 +44,7 @@ impl DeviceGroup {
     ) -> Result<Vec<Event>, GroupError> {
         let mut events = Vec::new();
         for (index, entry) in entries {
-            if self.state.course != Course::Following {
+            if self.state.course == Course::Out {
                 break;
             }
             if index < self.state.next {
@@ -59,6 +61,7 @@ impl DeviceGroup {
             self.state.chain = entry.chain;
             self.state.time = self.state.time.max(entry.at);
             self.deadline(entry.at, &mut events)?;
+            self.support(Some(entry.at), &mut events)?;
             self.entry(index, entry, &mut events)?;
             self.settle(&mut events)?;
         }
@@ -79,47 +82,32 @@ impl DeviceGroup {
         }
         match entry.body {
             Body::Configured(policy) => self.state.policy = policy,
+            Body::Assigned { kit, .. } => self.state.set.kit = kit,
             Body::Operation {
                 call,
-                by: Signer::Device(by),
-                op: Op::Remove(target),
+                by,
+                op,
                 matures,
-            } => {
-                // Only a device with a voice, past its probation, removes
-                // another.
-                let evidence = if call.method == self.state.agent.remove.0
-                    && by != target
-                    && self.state.may_sign(by, at)
-                {
-                    Check::Missing
-                } else {
-                    Check::Invalid
-                };
-                self.state.removals.push(Removal {
-                    index,
-                    by,
-                    target,
-                    matures,
-                    arguments: call.arguments,
-                    origin: call.origin,
-                    evidence,
-                });
+            } => self.call(index, at, call, by, Act::Op { op, matures }),
+            Body::Veto { call, by, op } => {
+                self.call(index, at, call, Signer::Device(by), Act::Veto(op))
             }
-            Body::Matured { device } => {
-                let signed = self.state.removals.iter().any(|removal| {
-                    removal.target == device
-                        && removal.evidence == Check::Valid
-                        && removal.matures <= at
-                });
-                if !signed {
-                    events.push(Event::Alarm(Alarm::Unsigned { index }));
-                    return Ok(());
-                }
+            Body::Cosign { call, by, op } => self.call(index, at, call, by, Act::Cosign(op)),
+            Body::Resolve {
+                call,
+                by,
+                op,
+                upheld,
+            } => self.call(index, at, call, by, Act::Resolve { op, upheld }),
+            Body::Settled { op, state } => match state {
+                OpState::Matured { at } => self.claim(index, op, at, events)?,
+                OpState::Cancelled { .. } => self.cancelled(op),
+                OpState::Pending | OpState::Contested | OpState::Carried { .. } => {}
+            },
+            Body::Matured { device } => self.matured(index, device, events)?,
+            Body::Alive { device } => {
                 if let Some(known) = self.state.known_mut(device) {
-                    known.matured = true;
-                }
-                if self.state.id == Some(device) {
-                    self.out(events)?;
+                    known.alive = at;
                 }
             }
             Body::Candidate { .. } => unreachable!("taken above"),
@@ -128,7 +116,7 @@ impl DeviceGroup {
                 message,
                 signature,
                 welcome,
-            } => self.evidence(of, &message, &signature, welcome),
+            } => self.evidence(of, &message, &signature, welcome, events)?,
             Body::Vote {
                 device,
                 epoch,
@@ -137,14 +125,7 @@ impl DeviceGroup {
                 signature,
             } => self.vote(device, epoch, candidate, vote, &signature, events),
             Body::Verdict { epoch, verdict } => self.verdict(epoch, verdict, events)?,
-            Body::Assigned { .. }
-            | Body::Renewed { .. }
-            | Body::Alive { .. }
-            | Body::Operation { .. }
-            | Body::Veto { .. }
-            | Body::Cosign { .. }
-            | Body::Resolve { .. }
-            | Body::Settled { .. } => {}
+            Body::Renewed { .. } => {}
         }
         Ok(())
     }
@@ -172,6 +153,13 @@ impl DeviceGroup {
         else {
             unreachable!("a candidate entry")
         };
+        let fresh = self.state.set.fresh;
+        let regroup = fresh.is_some() && fresh == self.state.id && fresh == Some(by);
+        if matches!(self.state.course, Course::Stuck { .. }) && !regroup {
+            // A device that cannot follow takes no candidate but its own
+            // regroup's.
+            return Ok(());
+        }
         if let Some(pending) = &self.state.pending {
             // The agent took the next candidate while this device's count
             // of the last one is undecided: the agent counted votes this
@@ -181,22 +169,30 @@ impl DeviceGroup {
             return self.stick(epoch, committer, events);
         }
         let decoded = CommitArguments::decode_exact(&call.arguments)
-            .filter(|((named, _), _)| *named == epoch && call.method == self.state.agent.commit.0);
+            .filter(|((named, _), _)| *named == epoch && call.method == method_id("commit"));
         let (mut evidence, effect, handshake, welcome_hash) = match decoded {
             Some(((_, effect), (handshake, hash))) => (Check::Missing, effect, handshake, hash),
             None => (Check::Invalid, Effect::default(), Vec::new(), None),
         };
-        // The committer has a voice past its probation, an add is a strong
-        // admin's and names a new device by a new number.
+        // The committer has a voice past its probation and its admin key
+        // signed the call, an add is a strong admin's or a matured add
+        // operation's and names a new device by a new number, and a matured
+        // regroup's new group comes first.
         let state = &self.state;
-        let strong = state
-            .known(by)
-            .is_some_and(|known| known.keys.class == AdminClass::Strong);
-        let fresh = added.is_none_or(|id| state.known(id).is_none());
+        let strong = state.known(by).is_some_and(|known| known.strong);
+        let matured = effect
+            .add
+            .as_ref()
+            .is_some_and(|add| state.set.adds.contains(add));
+        let new = added.is_none_or(|id| state.known(id).is_none());
         if !state.may_sign(by, at)
+            || state
+                .known(by)
+                .is_none_or(|known| known.admin != call.origin)
             || added.is_some() != effect.add.is_some()
-            || !fresh
-            || (effect.add.is_some() && !strong)
+            || !new
+            || (effect.add.is_some() && !strong && !matured)
+            || fresh.is_some_and(|fresh| fresh != by)
         {
             evidence = Check::Invalid;
         }
@@ -245,82 +241,46 @@ impl DeviceGroup {
         Ok(())
     }
 
-    /// Whether `message` and `signature` are the admin call `arguments` of
-    /// `method` by `origin`, the admin key of `by`, at this agent.
-    fn signed(
-        &self,
-        by: DeviceId,
-        origin: &[u8; 32],
-        method: MethodId,
-        arguments: &[u8],
-        message: &[u8],
-        signature: &[u8; 64],
-    ) -> bool {
-        let Some(known) = self.state.known(by) else {
-            return false;
-        };
-        let agent = &self.state.agent;
-        let Some(signed) = CallMessage::parse(message) else {
-            return false;
-        };
-        known.keys.admin == *origin
-            && signed.identity == agent.identity
-            && signed.session.key == *origin
-            && signed.instance == agent.instance
-            && signed.method == method
-            && signed.arguments == arguments
-            && verifies(origin, message, signature)
-    }
-
+    /// The evidence of the admin call at `of`: the pending candidate's,
+    /// valid when it is the commit call as logged, signed by the
+    /// committer's admin key for this agent, with the Welcome its hash
+    /// names; or a device-set call's.
     fn evidence(
         &mut self,
         of: u64,
         message: &[u8],
         signature: &[u8; 64],
         welcome: Option<Vec<u8>>,
-    ) {
-        if let Some(pending) = &self.state.pending
-            && pending.index == of
-        {
-            if pending.evidence != Check::Missing {
-                return;
-            }
-            let valid = self.signed(
-                pending.by,
-                &pending.origin,
-                self.state.agent.commit,
-                &pending.arguments,
-                message,
-                signature,
-            ) && welcome.as_deref().map(welcome_hash) == pending.welcome_hash;
-            let pending = self.state.pending.as_mut().expect("pending");
-            pending.evidence = if valid { Check::Valid } else { Check::Invalid };
-            pending.welcome = welcome;
-        } else if let Some(at) = self
-            .state
-            .removals
-            .iter()
-            .position(|removal| removal.index == of)
-        {
-            let removal = &self.state.removals[at];
-            if removal.evidence != Check::Missing {
-                return;
-            }
-            let valid = self.signed(
-                removal.by,
-                &removal.origin,
-                self.state.agent.remove,
-                &removal.arguments,
-                message,
-                signature,
-            ) && DeviceId::decode_exact(&removal.arguments) == Some(removal.target);
-            self.state.removals[at].evidence = if valid { Check::Valid } else { Check::Invalid };
-        }
+        events: &mut Vec<Event>,
+    ) -> Result<(), GroupError> {
         if let Some(own) = &mut self.state.own
             && own.index == Some(of)
         {
             own.evidenced = true;
         }
+        let agent = self.state.agent;
+        let Some(pending) = self
+            .state
+            .pending
+            .as_mut()
+            .filter(|pending| pending.index == of)
+        else {
+            return self.call_evidence(of, message, signature, welcome.is_some(), events);
+        };
+        if pending.evidence != Check::Missing {
+            return Ok(());
+        }
+        let valid = CallMessage::parse(message).is_some_and(|signed| {
+            signed.identity == agent.identity
+                && signed.session.key == pending.origin
+                && signed.instance == agent.instance
+                && signed.method.0 == method_id("commit")
+                && signed.arguments == pending.arguments
+        }) && verifies(&pending.origin, message, signature)
+            && welcome.as_deref().map(welcome_hash) == pending.welcome_hash;
+        pending.evidence = if valid { Check::Valid } else { Check::Invalid };
+        pending.welcome = welcome;
+        Ok(())
     }
 
     fn vote(
@@ -377,7 +337,8 @@ impl DeviceGroup {
                 Verdict::Void(void) => {
                     let why = match void {
                         Void::Timeout => Why::Timeout,
-                        Void::Nack | Void::Split | Void::Regroup => Why::Agent,
+                        Void::Regroup => Why::Regroup,
+                        Void::Nack | Void::Split => Why::Agent,
                     };
                     self.void(why, events)?;
                 }
@@ -472,7 +433,7 @@ impl DeviceGroup {
         let mut confirmed = None;
         let mut complete = true;
         let voice = |device: DeviceId| match cutoff {
-            Some(cutoff) => self.state.voiced_at(device, cutoff),
+            Some(cutoff) => self.voiced_at(device, cutoff),
             None => self.state.voiced(device),
         };
         for device in pending.set.iter().filter(|device| voice(**device)) {
@@ -517,7 +478,33 @@ impl DeviceGroup {
             .add
             .as_ref()
             .is_some_and(|add| add.sync == me.sync && add.admin == me.admin);
-        let candidate = if joining {
+        // A matured regroup's first commit starts a new group: the
+        // regrouper's restart, which the others join by its Welcome.
+        let restart = self.state.set.fresh == Some(pending.by);
+        let candidate = if restart && !joining {
+            let mut owed = pending.effect.remove.clone();
+            owed.sort_unstable();
+            if pending.epoch != self.state.confirmed + 1
+                || pending.effect.add.is_some()
+                || owed != self.state.owed()
+            {
+                return Ok(Processed::Refused);
+            }
+            let outcome = if self.state.id == Some(pending.by) {
+                self.mls.own(&pending.handshake)
+            } else {
+                let Some(welcome) = &pending.welcome else {
+                    return Ok(Processed::Refused);
+                };
+                self.mls.join(welcome, time)
+            };
+            match outcome {
+                Ok(candidate) => candidate,
+                Err(vos_mls::Error::Refused(_)) => return Ok(Processed::Refused),
+                Err(vos_mls::Error::NotHeld) => return Ok(Processed::Unable),
+                Err(error) => return Err(error.into()),
+            }
+        } else if joining {
             if !adds_me {
                 return Ok(Processed::Ignored);
             }
@@ -551,7 +538,12 @@ impl DeviceGroup {
         if candidate.kind() == Kind::Removed {
             return Ok(Processed::Copy { candidate, h: None });
         }
-        if candidate.epoch() != pending.epoch || !self.roster_holds(pending, &candidate) {
+        let epoch = if restart {
+            1
+        } else {
+            pending.epoch.saturating_sub(self.state.offset)
+        };
+        if candidate.epoch() != epoch || !self.roster_holds(pending, &candidate) {
             return Ok(Processed::Refused);
         }
         let authenticator = candidate.authenticator()?.ok_or(GroupError::Corrupt)?;
@@ -605,7 +597,8 @@ impl DeviceGroup {
                 .devices
                 .iter()
                 .any(|(_, known)| known.keys.sync == add.sync || known.keys.admin == add.admin);
-            if committer.keys.class != AdminClass::Strong || known || add.sync == add.admin {
+            let delayed = !committer.strong && !state.set.adds.contains(add);
+            if delayed || known || add.sync == add.admin {
                 return None;
             }
             adds.push(credential(add));
@@ -615,10 +608,21 @@ impl DeviceGroup {
         if named != state.owed() {
             return None;
         }
-        let mut removes = Vec::new();
-        for device in &named {
-            removes.push(credential(&state.known(*device)?.keys));
-        }
+        // The removals of devices in the group: a restore's new group has
+        // none of those before it.
+        let members: Vec<Vec<u8>> = self
+            .mls
+            .credentials()
+            .ok()?
+            .into_iter()
+            .map(|(_, credential)| credential)
+            .collect();
+        let removes = named
+            .iter()
+            .filter_map(|device| state.known(*device))
+            .map(|known| credential(&known.keys))
+            .filter(|credential| members.contains(credential))
+            .collect();
         Some(Expected {
             committer: credential(&committer.keys),
             adds,
@@ -643,10 +647,19 @@ impl DeviceGroup {
                 candidate,
                 h: Some(mine),
             }) if mine == h => {
-                if candidate.kind() == Kind::Joined {
+                if joining {
                     self.state.id = pending.added;
                     self.state.renewed = pending.at;
                 }
+                if self.state.set.fresh == Some(pending.by) {
+                    // The regroup's new group: its epochs count on from
+                    // the agent's, and a device that could not follow
+                    // follows it.
+                    self.state.set.fresh = None;
+                    self.state.renewed = pending.at;
+                    self.state.course = Course::Following;
+                }
+                self.state.offset = pending.epoch.saturating_sub(candidate.epoch());
                 if self.state.id == Some(pending.by) {
                     self.state.renewed = pending.at;
                 }
@@ -695,24 +708,24 @@ impl DeviceGroup {
     }
 
     /// A confirmed candidate's effect on the device set: the device it
-    /// added known, the devices it removed out, the epoch confirmed.
+    /// added known, a matured add it carried done, the devices it removed
+    /// out, the epoch confirmed.
     fn apply(&mut self, pending: &Pending) {
         if let (Some(id), Some(keys)) = (pending.added, &pending.effect.add) {
-            self.state.devices.push((
-                id,
-                Known {
-                    keys: keys.clone(),
-                    active_from: pending.at.saturating_add(self.state.policy.probation_ms),
-                    matured: false,
-                    out: false,
-                },
-            ));
+            let active_from = pending.at.saturating_add(self.state.policy.probation_ms);
+            self.state
+                .devices
+                .push((id, Known::new(keys.clone(), active_from)));
+            self.state.set.adds.retain(|add| add != keys);
         }
         for device in &pending.effect.remove {
             if let Some(known) = self.state.known_mut(*device) {
                 known.out = true;
             }
         }
+        let set = &mut self.state.set;
+        set.owed
+            .retain(|device| !pending.effect.remove.contains(device));
         self.state.confirmed = pending.epoch;
     }
 
@@ -743,10 +756,9 @@ impl DeviceGroup {
         events: &mut Vec<Event>,
     ) -> Result<(), GroupError> {
         let me = self.state.id;
-        let other =
-            self.state.devices.iter().any(|(id, known)| {
-                Some(*id) != me && *id != committer && !known.matured && !known.out
-            });
+        let other = self.state.devices.iter().any(|(id, known)| {
+            Some(*id) != me && *id != committer && known.matured.is_none() && !known.out
+        });
         let remedy = if other {
             Remedy::RePair
         } else {
@@ -766,7 +778,7 @@ impl DeviceGroup {
     }
 
     /// This device's removal matured: it has no voice.
-    fn out(&mut self, events: &mut Vec<Event>) -> Result<(), GroupError> {
+    pub(super) fn out(&mut self, events: &mut Vec<Event>) -> Result<(), GroupError> {
         self.state.course = Course::Out;
         self.state.pending = None;
         self.state.own = None;

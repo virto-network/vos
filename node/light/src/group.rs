@@ -15,6 +15,15 @@
 //!   candidate's place in this device's log; one `h` from every voice of
 //!   the set confirms the epoch and the copy is swapped in, a nack, a
 //!   second `h` or the window's end voids it.
+//! - **The device set's operations are honoured behind their evidence:**
+//!   each operation, veto, second signature and resolution is checked
+//!   against its signer, and a maturity the log asserts takes effect only
+//!   once the evidence supports it (its delay passed unvetoed, or a
+//!   verified second signature or resolution), else [`Alarm::Unsigned`].
+//!   A commit carries every removal this device honours; a matured
+//!   regroup's first commit is its regrouper's new group
+//!   ([`DeviceGroup::regroup`]), joined by Welcome; a restore's device
+//!   starts its own ([`DeviceGroup::restore`]).
 //! - **Sleepers are deferred:** a device outside the set processes the
 //!   confirmed candidate when it reads it; one it cannot process, or whose
 //!   `h` is not the confirmed one, raises [`Alarm::CannotFollow`] naming the
@@ -27,16 +36,21 @@
 //!
 //! Sans I/O: the caller makes the calls (the admin key signs commits behind
 //! the owner's prompt, the sync key votes and evidence), reads the log and
-//! hands its entries over.
+//! hands its entries over. A call `Personal` refuses with `Settling` (more
+//! fell due than one call settles) is made again after a `wake`.
 
 pub mod archive;
 mod follow;
+mod set;
 
 use std::collections::BTreeMap;
 
 use vos_mls::{Mls, Namespace};
-use vos_wire::ids::{InstanceId, MethodId};
-use vos_wire::personal::{DeviceId, Effect, NewDevice, Policy, Scope, Vote, welcome_hash};
+use vos_wire::ids::InstanceId;
+use vos_wire::personal::{
+    AdminClass, DeviceId, DeviceView, Effect, NewDevice, Op, Policy, Scope, Signer, Status, Vote,
+    welcome_hash,
+};
 use vos_wire::{Decode, Encode};
 
 use crate::store::{Store, StoreError};
@@ -59,14 +73,11 @@ const CALLS: usize = 32;
 const MLS: &[u8] = b"mls/";
 
 /// The personal agent a device group's commits go through: its identity,
-/// which calls are signed for, `Personal`'s instance, and the methods an
-/// admin call's evidence names.
+/// which calls are signed for, and `Personal`'s instance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Agent {
     pub identity: [u8; 32],
     pub instance: InstanceId,
-    pub commit: MethodId,
-    pub remove: MethodId,
 }
 
 /// Why the device group cannot do something.
@@ -95,6 +106,13 @@ pub enum GroupError {
     NoCommit,
     /// The device a commit would add is in the group already.
     Known,
+    /// A matured regroup's new group comes first: its regrouper's
+    /// [`DeviceGroup::regroup`], no other commit.
+    Regroup,
+    /// No matured regroup of this device's waits for its new group.
+    NoRegroup,
+    /// The agent's device set as read does not name this device.
+    Unnamed,
 }
 
 impl From<vos_mls::Error> for GroupError {
@@ -129,6 +147,9 @@ impl std::fmt::Display for GroupError {
             GroupError::Out => f.write_str("the device is out of the group"),
             GroupError::NoCommit => f.write_str("no commit is waiting for its call"),
             GroupError::Known => f.write_str("the device is in the group already"),
+            GroupError::Regroup => f.write_str("a regroup's new group comes first"),
+            GroupError::NoRegroup => f.write_str("no regroup of this device's has matured"),
+            GroupError::Unnamed => f.write_str("the device set does not name this device"),
         }
     }
 }
@@ -181,6 +202,8 @@ pub enum Why {
     Timeout,
     /// The agent voided it before this device's count decided it.
     Agent,
+    /// A regroup or a restore matured: a new group starts.
+    Regroup,
 }
 
 /// What a device raises to its user.
@@ -209,8 +232,10 @@ pub enum Alarm {
     },
     /// The agent's verdict on `epoch` is not this device's count.
     Verdict { epoch: u64 },
-    /// The log's entry at `index` asserts what no verified operation
-    /// supports (a maturity with no signed removal): it is ignored.
+    /// The log's entry at `index` asserts a maturity its evidence does not
+    /// support: no verified operation, or one whose delay had not passed
+    /// with no verified second signature or resolution, or vetoed. It is
+    /// ignored.
     Unsigned { index: u64 },
     /// The device's clock and the agent's batch time disagree by `skew_ms`,
     /// more than an hour: the device acts as the log says.
@@ -255,17 +280,36 @@ impl Prepared {
     }
 }
 
-/// A device the group knows: its keys, and whether it has a voice.
+/// A device the group knows: its leaf's keys, its admin key as replaced,
+/// and whether it has a voice.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub(crate) struct Known {
     pub(crate) keys: NewDevice,
+    pub(crate) admin: [u8; 32],
+    pub(crate) strong: bool,
     /// When its probation ends, by the log's time: it signs no operation
     /// or commit before.
     pub(crate) active_from: u64,
-    /// Its removal matured: it has no voice.
-    pub(crate) matured: bool,
+    /// When its removal matured: it has no voice from then.
+    pub(crate) matured: Option<u64>,
     /// A confirmed commit removed it from the group.
     pub(crate) out: bool,
+    /// The time of its last logged `alive`.
+    pub(crate) alive: u64,
+}
+
+impl Known {
+    pub(crate) fn new(keys: NewDevice, active_from: u64) -> Self {
+        Self {
+            admin: keys.admin,
+            strong: keys.class == AdminClass::Strong,
+            keys,
+            active_from,
+            matured: None,
+            out: false,
+            alive: 0,
+        }
+    }
 }
 
 /// What a check of an admin call's evidence found.
@@ -280,16 +324,63 @@ pub(crate) enum Check {
     Invalid = 2,
 }
 
-/// A removal operation the log holds.
+/// What a device-set admin call does.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub(crate) struct Removal {
+pub(crate) enum Act {
+    /// An operation, maturing at `matures` unless vetoed or contested.
+    #[codec(index = 0)]
+    Op { op: Op, matures: u64 },
+    /// A veto of the operation at the index.
+    #[codec(index = 1)]
+    Veto(u64),
+    /// The second signature making the operation at the index immediate.
+    #[codec(index = 2)]
+    Cosign(u64),
+    /// A resolution of the contest of the operation at `op`.
+    #[codec(index = 3)]
+    Resolve { op: u64, upheld: bool },
+}
+
+/// A device-set admin call the log holds at `index`, as this device
+/// checked it: its signer, origin, method and arguments, and its evidence.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub(crate) struct Call {
     pub(crate) index: u64,
-    pub(crate) by: DeviceId,
-    pub(crate) target: DeviceId,
-    pub(crate) matures: u64,
-    pub(crate) arguments: Vec<u8>,
+    pub(crate) at: u64,
+    pub(crate) by: Signer,
     pub(crate) origin: [u8; 32],
+    pub(crate) method: u32,
+    pub(crate) arguments: Vec<u8>,
+    pub(crate) act: Act,
     pub(crate) evidence: Check,
+}
+
+/// Whether the evidence supports a maturity the log asserts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+#[repr(u8)]
+pub(crate) enum Support {
+    /// Evidence it needs is not in the log yet.
+    #[codec(index = 0)]
+    Waiting = 0,
+    #[codec(index = 1)]
+    Held = 1,
+    #[codec(index = 2)]
+    Refused = 2,
+}
+
+/// A maturity the log asserts in its entry at `entry`: the operation at
+/// `op` matured at `at`, removing `removes` (or, a restore, `every`
+/// device), and the removals the log logged for it while its support
+/// waits.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub(crate) struct Claim {
+    pub(crate) entry: u64,
+    pub(crate) op: u64,
+    pub(crate) at: u64,
+    pub(crate) every: bool,
+    pub(crate) removes: Vec<DeviceId>,
+    pub(crate) removed: Vec<DeviceId>,
+    pub(crate) support: Support,
 }
 
 /// The pending candidate, as this device's log holds it.
@@ -346,9 +437,27 @@ pub enum Course {
     Out,
 }
 
+/// What a device keeps of the device set's operations.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
+pub(crate) struct Set {
+    /// The kit's signing keys, by entry.
+    pub(crate) kit: Vec<[u8; 32]>,
+    /// The admin calls of the operations open, and theirs.
+    pub(crate) operations: Vec<Call>,
+    pub(crate) claims: Vec<Claim>,
+    /// The operations closed, their calls dropped once no claim waits.
+    pub(crate) closed: Vec<u64>,
+    /// The matured removals no confirmed commit carried yet.
+    pub(crate) owed: Vec<DeviceId>,
+    /// The matured adds no confirmed commit carried yet.
+    pub(crate) adds: Vec<NewDevice>,
+    /// The regrouper whose new group a matured regroup waits for.
+    pub(crate) fresh: Option<DeviceId>,
+}
+
 /// What the device keeps of the log: the agent, itself, its place in the
-/// log, the devices and removals it verified, the pending candidate and
-/// its own commit.
+/// log, the devices and the open operations it verified, the pending
+/// candidate and its own commit.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub(crate) struct State {
     pub(crate) agent: Agent,
@@ -364,12 +473,15 @@ pub(crate) struct State {
     /// window, the latest last.
     pub(crate) calls: Vec<u64>,
     pub(crate) confirmed: u64,
+    /// The confirmed epoch less the MLS group's epoch: a new group's
+    /// epochs count on from the agent's.
+    pub(crate) offset: u64,
     /// When this device's leaf was last renewed: its add, or its last
     /// confirmed commit.
     pub(crate) renewed: u64,
     pub(crate) policy: Policy,
     pub(crate) devices: Vec<(DeviceId, Known)>,
-    pub(crate) removals: Vec<Removal>,
+    pub(crate) set: Set,
     pub(crate) pending: Option<Pending>,
     pub(crate) own: Option<Own>,
     /// This device's last decision: an epoch, and whether it confirmed it.
@@ -395,7 +507,21 @@ impl State {
     /// A device in the group with a voice.
     pub(crate) fn voiced(&self, device: DeviceId) -> bool {
         self.known(device)
-            .is_some_and(|known| !known.matured && !known.out)
+            .is_some_and(|known| known.matured.is_none() && !known.out)
+    }
+
+    /// A device with a voice active for the policy's seasoning at `at`.
+    pub(crate) fn seasoned(&self, device: DeviceId, at: u64) -> bool {
+        self.may_sign(device, at)
+            && self.known(device).is_some_and(|known| {
+                known.active_from.saturating_add(self.policy.seasoning_ms) <= at
+            })
+    }
+
+    /// The device-set admin call the log holds at `index`, while its
+    /// operation is open.
+    pub(crate) fn call_at(&self, index: u64) -> Option<&Call> {
+        self.set.operations.iter().find(|call| call.index == index)
     }
 
     /// A device with a voice past its probation at `at`: it may sign an
@@ -407,40 +533,19 @@ impl State {
                 .is_some_and(|known| at >= known.active_from)
     }
 
-    /// The device's voice at `cutoff`: no matured removal, and none whose
-    /// verified removal matures by then.
-    pub(crate) fn voiced_at(&self, device: DeviceId, cutoff: u64) -> bool {
-        self.voiced(device)
-            && !self.removals.iter().any(|removal| {
-                removal.target == device
-                    && removal.evidence == Check::Valid
-                    && removal.matures <= cutoff
-            })
-    }
-
-    /// The matured removals with verified evidence no confirmed commit
-    /// carried yet: what the next commit carries.
+    /// The matured removals no confirmed commit carried yet: what the next
+    /// commit carries.
     pub(crate) fn owed(&self) -> Vec<DeviceId> {
-        let mut owed: Vec<DeviceId> = self
-            .removals
-            .iter()
-            .filter(|removal| {
-                removal.evidence == Check::Valid
-                    && self
-                        .known(removal.target)
-                        .is_some_and(|known| known.matured && !known.out)
-            })
-            .map(|removal| removal.target)
-            .collect();
+        let mut owed = self.set.owed.clone();
         owed.sort_unstable();
-        owed.dedup();
         owed
     }
 }
 
 /// What a device that pairs another hands it over the pairing channel:
-/// the agent, the device group's devices and removals as the pairing
-/// device verified them, its place in the log, and the key archive.
+/// the agent, the device group's devices and the device set's operations
+/// as the pairing device verified them, its place in the log, and the key
+/// archive.
 #[derive(Clone, Debug, Encode, Decode)]
 pub struct Pairing {
     agent: Agent,
@@ -448,10 +553,26 @@ pub struct Pairing {
     chain: [u8; 32],
     time: u64,
     confirmed: u64,
+    offset: u64,
     policy: Policy,
     devices: Vec<(DeviceId, Known)>,
-    removals: Vec<Removal>,
+    set: Set,
     archive: Archive,
+}
+
+/// What a device a restore added reads from the agent once the restore
+/// matured, to start its new group: the log's head, the confirmed epoch,
+/// the policy, the kit it carried, and the device set. It has no earlier
+/// view to check them against.
+#[derive(Clone, Debug)]
+pub struct Restored {
+    pub next: u64,
+    pub chain: [u8; 32],
+    pub time: u64,
+    pub confirmed: u64,
+    pub policy: Policy,
+    pub kit: Vec<[u8; 32]>,
+    pub devices: Vec<DeviceView>,
 }
 
 impl Pairing {
@@ -524,18 +645,11 @@ impl DeviceGroup {
             time: now,
             calls: vec![now],
             confirmed: 0,
+            offset: 0,
             renewed: now,
             policy: Policy::DEFAULT,
-            devices: vec![(
-                0,
-                Known {
-                    keys: me.clone(),
-                    active_from: now,
-                    matured: false,
-                    out: false,
-                },
-            )],
-            removals: Vec::new(),
+            devices: vec![(0, Known::new(me.clone(), now))],
+            set: Set::default(),
             pending: None,
             own: None,
             decided: None,
@@ -579,9 +693,10 @@ impl DeviceGroup {
             chain,
             time,
             confirmed,
+            offset,
             policy,
             devices,
-            removals,
+            set,
             archive,
         } = pairing;
         let state = State {
@@ -593,10 +708,11 @@ impl DeviceGroup {
             time,
             calls: Vec::new(),
             confirmed,
+            offset,
             renewed: time,
             policy,
             devices,
-            removals,
+            set,
             pending: None,
             own: None,
             decided: None,
@@ -604,6 +720,80 @@ impl DeviceGroup {
         };
         let mut mls = Mls::open(namespace(store), &credential(&me), BTreeMap::new())?;
         mls.write(rows(&state, Some(&archive)))?;
+        Ok(Self {
+            store: store.clone(),
+            mls,
+            state,
+            archive,
+            processed: None,
+        })
+    }
+
+    /// The group of the device a matured restore added alone, from what it
+    /// read of the agent ([`Restored`]): a new group of this device alone at
+    /// the confirmed epoch, following the log from its head; its first
+    /// commit carries the removal of every device before it. The store's
+    /// archive is kept, its naming secret new.
+    pub fn restore(
+        store: &Store,
+        agent: Agent,
+        me: NewDevice,
+        read: Restored,
+    ) -> Result<Self, GroupError> {
+        if store.group_row(STATE)?.is_some() {
+            return Err(GroupError::Grouped);
+        }
+        let id = read
+            .devices
+            .iter()
+            .find(|view| view.device.keys.sync == me.sync && view.device.status == Status::Live)
+            .map(|view| view.id)
+            .ok_or(GroupError::Unnamed)?;
+        let mut devices = Vec::new();
+        let mut owed = Vec::new();
+        for view in &read.devices {
+            let mut known = Known::new(view.device.keys.clone(), view.device.active_from);
+            match view.device.status {
+                Status::Live => {}
+                Status::Removed { at } => {
+                    known.matured = Some(at);
+                    known.out = view
+                        .removal
+                        .is_some_and(|removal| removal.committed.is_some());
+                    if !known.out {
+                        owed.push(view.id);
+                    }
+                }
+                Status::Dropped { .. } => known.out = true,
+            }
+            devices.push((view.id, known));
+        }
+        let state = State {
+            agent,
+            me: me.clone(),
+            id: Some(id),
+            next: read.next,
+            chain: read.chain,
+            time: read.time,
+            calls: vec![read.time],
+            confirmed: read.confirmed,
+            offset: read.confirmed,
+            renewed: read.time,
+            policy: read.policy,
+            devices,
+            set: Set {
+                kit: read.kit,
+                owed,
+                ..Set::default()
+            },
+            pending: None,
+            own: None,
+            decided: None,
+            course: Course::Following,
+        };
+        let archive = store.archive()?;
+        let mut mls = Mls::open(namespace(store), &credential(&me), BTreeMap::new())?;
+        mls.create(read.time / 1000, rows(&state, None))?;
         Ok(Self {
             store: store.clone(),
             mls,
@@ -702,7 +892,7 @@ impl DeviceGroup {
         if !self.mls.grouped() {
             return Err(GroupError::NoGroup);
         }
-        if self.mls.epoch()? != self.state.confirmed {
+        if self.mls.epoch()? + self.state.offset != self.state.confirmed {
             return Err(GroupError::Stuck);
         }
         let key = self.mls.export(label, context, 32)?;
@@ -742,10 +932,72 @@ impl DeviceGroup {
             Course::Stuck { .. } => return Err(GroupError::Stuck),
             Course::Out => return Err(GroupError::Out),
         }
+        self.idle()
+    }
+
+    fn idle(&self) -> Result<DeviceId, GroupError> {
         if self.pending() || self.processed.is_some() {
             return Err(GroupError::Pending);
         }
         self.state.id.ok_or(GroupError::NoGroup)
+    }
+
+    /// This device's removals owed, as the next commit carries them: their
+    /// numbers, and the credentials of those in the MLS group.
+    fn removals(&self) -> Result<(Vec<DeviceId>, Vec<Vec<u8>>), GroupError> {
+        let remove = self.state.owed();
+        let members: Vec<Vec<u8>> = self
+            .mls
+            .credentials()?
+            .into_iter()
+            .map(|(_, credential)| credential)
+            .collect();
+        let removes = remove
+            .iter()
+            .filter_map(|device| self.state.known(*device))
+            .map(|known| credential(&known.keys))
+            .filter(|credential| members.contains(credential))
+            .collect();
+        Ok((remove, removes))
+    }
+
+    /// This device's own commit, held with the record of it: its call's
+    /// arguments, by which the log's candidate is known as it.
+    fn hold(
+        &mut self,
+        effect: Effect,
+        make: impl FnOnce(
+            &mut Mls,
+            &mut dyn FnMut(&vos_mls::Commit) -> vos_mls::Writes,
+        ) -> Result<vos_mls::Commit, vos_mls::Error>,
+    ) -> Result<Prepared, GroupError> {
+        let mut state = self.state.clone();
+        let epoch = state.confirmed + 1;
+        let mut rows_of = |commit: &vos_mls::Commit| {
+            state.own = Some(Own {
+                epoch,
+                welcome: commit.welcome.clone(),
+                arguments: Prepared {
+                    epoch,
+                    effect: effect.clone(),
+                    handshake: commit.handshake.clone(),
+                    welcome: commit.welcome.clone(),
+                }
+                .arguments(),
+                signed: None,
+                index: None,
+                evidenced: false,
+            });
+            rows(&state, None)
+        };
+        let commit = make(&mut self.mls, &mut rows_of)?;
+        self.state = state;
+        Ok(Prepared {
+            epoch,
+            effect,
+            handshake: commit.handshake,
+            welcome: commit.welcome,
+        })
     }
 
     /// Commit at `now` for the epoch after the confirmed one: adding `add`
@@ -761,12 +1013,10 @@ impl DeviceGroup {
         now: u64,
     ) -> Result<Prepared, GroupError> {
         self.ready()?;
-        let remove = self.state.owed();
-        let mut removes = Vec::new();
-        for device in &remove {
-            let known = self.state.known(*device).ok_or(GroupError::Corrupt)?;
-            removes.push(credential(&known.keys));
+        if self.state.set.fresh.is_some() {
+            return Err(GroupError::Regroup);
         }
+        let (remove, removes) = self.removals()?;
         let mut packages = Vec::new();
         if let Some((keys, package)) = &add {
             if self
@@ -783,36 +1033,35 @@ impl DeviceGroup {
             add: add.map(|(keys, _)| keys),
             remove,
         };
-        let mut state = self.state.clone();
-        let epoch = state.confirmed + 1;
-        state.own = Some(Own {
-            epoch,
-            welcome: None,
-            arguments: Vec::new(),
-            signed: None,
-            index: None,
-            evidenced: false,
-        });
-        let commit = self.mls.commit(&packages, &removes, now / 1000, |commit| {
-            if let Some(own) = &mut state.own {
-                own.welcome = commit.welcome.clone();
-                own.arguments = Prepared {
-                    epoch: commit.epoch,
-                    effect: effect.clone(),
-                    handshake: commit.handshake.clone(),
-                    welcome: commit.welcome.clone(),
-                }
-                .arguments();
-            }
-            rows(&state, None)
-        })?;
-        self.state = state;
-        Ok(Prepared {
-            epoch: commit.epoch,
-            effect,
-            handshake: commit.handshake,
-            welcome: commit.welcome,
+        self.hold(effect, |mls, rows| {
+            mls.commit(&packages, &removes, now / 1000, rows)
         })
+    }
+
+    /// A key package for the new group a regroup starts, at `now`: handed
+    /// to the regrouper as a pairing's is.
+    pub fn regroup_package(&mut self, now: u64) -> Result<Vec<u8>, GroupError> {
+        Ok(self.mls.key_package(now / 1000, rows(&self.state, None))?)
+    }
+
+    /// This device's regroup matured: start its new group at `now` with the
+    /// devices that keep their voice (their key packages, `packages`), the
+    /// first commit after the confirmed epoch, carrying every matured
+    /// removal. Held as [`DeviceGroup::commit`]'s, and called the same way;
+    /// a device that cannot follow regroups so.
+    pub fn regroup(&mut self, packages: Vec<Vec<u8>>, now: u64) -> Result<Prepared, GroupError> {
+        if self.state.course == Course::Out {
+            return Err(GroupError::Out);
+        }
+        let me = self.idle()?;
+        if self.state.set.fresh != Some(me) {
+            return Err(GroupError::NoRegroup);
+        }
+        let effect = Effect {
+            add: None,
+            remove: self.state.owed(),
+        };
+        self.hold(effect, |mls, rows| mls.restart(&packages, now / 1000, rows))
     }
 
     /// Pair `device` at `now`: the commit adding it, and what the new
@@ -830,9 +1079,10 @@ impl DeviceGroup {
             chain: self.state.chain,
             time: self.state.time,
             confirmed: self.state.confirmed,
+            offset: self.state.offset,
             policy: self.state.policy,
             devices: self.state.devices.clone(),
-            removals: self.state.removals.clone(),
+            set: self.state.set.clone(),
             archive: self.archive.clone(),
         };
         Ok((prepared, pairing))

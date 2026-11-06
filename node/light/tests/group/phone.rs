@@ -5,7 +5,9 @@
 use ed25519_dalek::{Signer, SigningKey};
 use vos_light::group::{DeviceGroup, Event, Pairing, Prepared};
 use vos_wire::Encode;
-use vos_wire::personal::{AdminClass, Attestation, Candidacy, NewDevice, PersonalError, Vote};
+use vos_wire::personal::{
+    AdminClass, Attestation, Candidacy, KitEntry, KitKind, NewDevice, PersonalError, Vote,
+};
 
 use vos_light::{Config, Light, Store};
 
@@ -61,10 +63,11 @@ impl Phone {
         self.keys.sync
     }
 
-    /// The claiming phone: its group made, the home assigned to it.
+    /// The claiming phone: its group made, the home assigned to it with
+    /// the kit of [`kit`]`(0)`.
     pub fn claim(&mut self, home: &mut Home, homes: &SigningKey) {
         let kit = vos_wire::personal::Kit {
-            entries: Vec::new(),
+            entries: vec![kit_entry(&kit(0))],
             r2: [0xc4; 32],
         };
         home.call(homes, "assign", (self.keys.clone(), kit).encode())
@@ -144,17 +147,23 @@ impl Phone {
     }
 
     /// Make `prepared`'s commit call under the admin key and post its
-    /// evidence; a refused call abandons the commit.
+    /// evidence; refused with `Settling`, wake the agent and call again; a
+    /// refused call abandons the commit.
     pub fn send(
         &mut self,
         home: &mut Home,
         prepared: &Prepared,
     ) -> Result<Candidacy, PersonalError> {
-        let signed = home.sign(&self.admin, "commit", prepared.arguments());
-        self.group()
-            .signed_commit(signed.message.clone(), signed.signature)
-            .unwrap();
-        let reply = home.send(signed);
+        let reply = loop {
+            let signed = home.sign(&self.admin, "commit", prepared.arguments());
+            self.group()
+                .signed_commit(signed.message.clone(), signed.signature)
+                .unwrap();
+            let reply = home.send(signed);
+            if !reply.settling() || !home.wake(&self.sync) {
+                break reply;
+            }
+        };
         self.group().called(reply.at);
         match reply.answer::<Candidacy>() {
             Ok(candidacy) => {
@@ -206,5 +215,20 @@ impl Phone {
         let pairing = Pairing::from_bytes(&pairing.to_bytes()).unwrap();
         new.group = Some(DeviceGroup::join(&new.store, new.keys.clone(), pairing).unwrap());
         self.send(home, &prepared).unwrap()
+    }
+}
+
+/// Kit `n`'s signing key.
+pub fn kit(n: u8) -> SigningKey {
+    SigningKey::from_bytes(&[0x4b + n; 32])
+}
+
+/// A recovery entry of `key`.
+pub fn kit_entry(key: &SigningKey) -> KitEntry {
+    KitEntry {
+        kind: KitKind::Phrase,
+        signing: key.verifying_key().to_bytes(),
+        sealing: [0x5e; 32],
+        sealed_r1: vec![0x51; 80],
     }
 }

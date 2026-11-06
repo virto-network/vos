@@ -36,8 +36,6 @@ fn agent() -> Agent {
     Agent {
         identity: IDENTITY,
         instance: INSTANCE,
-        commit: MethodId(vos_light::method_id("commit")),
-        remove: MethodId(vos_light::method_id("remove")),
     }
 }
 
@@ -151,7 +149,7 @@ fn round(
     let index = script.append(Body::Candidate {
         call: AdminCall {
             origin: committer_admin,
-            method: agent().commit.0,
+            method: vos_light::method_id("commit"),
             arguments: arguments.clone(),
         },
         by: committer as DeviceId,
@@ -169,7 +167,7 @@ fn round(
         &session,
         index,
         INSTANCE,
-        agent().commit,
+        MethodId(vos_light::method_id("commit")),
         &arguments,
     );
     let signature = devices[committer].admin.sign(&message).to_bytes();

@@ -127,6 +127,15 @@ impl Reply {
             other => panic!("{other:?}"),
         }
     }
+
+    /// Whether `Personal` refused the call with `Settling`: what fell due
+    /// is more than a call settles, which `wake` settles a few at a time.
+    pub fn settling(&self) -> bool {
+        matches!(&self.outcome, Outcome::Failed {
+            code: Failure::Handler,
+            detail,
+        } if PersonalError::decode_exact(detail) == Some(PersonalError::Settling))
+    }
 }
 
 pub struct Home {
@@ -206,8 +215,6 @@ impl Home {
         vos_light::group::Agent {
             identity: IDENTITY,
             instance: PERSONAL,
-            commit: self.method("commit"),
-            remove: self.method("remove"),
         }
     }
 
@@ -240,10 +247,25 @@ impl Home {
     }
 
     /// A call of `name` with `arguments` signed by `key`, verified as
-    /// ingress verifies it, then run alone in a batch.
+    /// ingress verifies it, then run alone in a batch; refused with
+    /// `Settling`, `key` wakes the agent and calls again.
     pub fn call(&mut self, key: &SigningKey, name: &str, arguments: Vec<u8>) -> Reply {
-        let signed = self.sign(key, name, arguments);
+        loop {
+            let signed = self.sign(key, name, arguments.clone());
+            let reply = self.send(signed);
+            if !reply.settling() || !self.wake(key) {
+                return reply;
+            }
+        }
+    }
+
+    /// `key` wakes the agent, which settles a few of the steps due:
+    /// whether it took the call.
+    pub fn wake(&mut self, key: &SigningKey) -> bool {
+        let signed = self.sign(key, "wake", ().encode());
         self.send(signed)
+            .answer::<vos_wire::personal::Woken>()
+            .is_ok()
     }
 
     /// A call of `name` with `arguments` signed by `key`, in its session
