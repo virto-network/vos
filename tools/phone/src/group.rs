@@ -305,6 +305,8 @@ pub fn group(args: &[String]) {
                 admin,
             });
         }
+        // Past the paired devices' probation, as the log's time runs.
+        script.now += vos_wire::personal::Policy::DEFAULT.probation_ms;
         let scope = [0x6e; 16];
         for device in &mut devices {
             device.group.key(scope).unwrap();
