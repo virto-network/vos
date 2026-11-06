@@ -13,6 +13,7 @@ extern crate alloc;
 extern crate self as vos_sdk;
 
 pub mod context;
+pub mod crdt;
 pub mod device;
 pub mod heap;
 pub mod host;
@@ -34,7 +35,10 @@ pub mod prelude {
     pub use alloc::vec::Vec;
     pub use core::time::Duration;
 
-    pub use crate::context::{CallError, Command, Level, Query, Ref, RequestError, Workflow};
+    pub use crate::context::{
+        CallError, Command, Level, MergeContext, Query, Ref, RequestError, Workflow,
+    };
+    pub use crate::crdt;
     pub use crate::table::{CommittedMap, Hashed, Ordered, Table};
     pub use crate::{Decode, Encode, actor, messages, scale};
     pub use vos_wire::abi::AttestError;

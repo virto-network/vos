@@ -75,18 +75,20 @@ pub struct Query {
     pub arguments: Vec<u8>,
 }
 
-/// A call on a device, with no log (`core-model.md` §9.2): its handler runs
-/// on the state as it stands, version `version`, at the device's time and
-/// seed, and its step is the work result the device applies in one batch.
-/// The step may only write rows: a handler that sends a message, attests,
-/// writes a committed map or starts a workflow fails `Trapped`, with
-/// nothing written.
+/// An operation on a device, with no log (`core-model.md` §9.2): a
+/// `#[msg(merge)]` handler run on the state as it stands, at the time and
+/// seed of the device that issued the operation, as `origin`, the
+/// operation's author its caller ([`Principal::Client`]). Its step is the
+/// work result, of version 0 (a device keeps no log), which the device
+/// applies in one batch; every device that applies the operation runs it
+/// so. Only a merge handler runs here, and its step writes its instance's
+/// merge fields alone: any other method is `Unknown`, and a handler that
+/// writes another row or reads any fails `Trapped`, with nothing written.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Merge {
-    pub version: u64,
     pub time: u64,
     pub seed: [u8; 32],
-    pub caller: Principal,
+    pub origin: crate::merge::Origin,
     pub instance: InstanceId,
     pub method: MethodId,
     pub arguments: Vec<u8>,

@@ -54,6 +54,14 @@ pub fn load<A: Encode + Decode + Tables + New>() -> A {
     state
 }
 
+/// A new instance's state, its tables and merge fields bound, read from
+/// nothing: what a merge handler runs on.
+pub fn fresh<A: Tables + New>() -> A {
+    let mut state = A::new();
+    state.bind_tables();
+    state
+}
+
 /// Write the state back if its encoding changed from `before`.
 pub fn save<A: Encode>(state: &A, before: &[u8]) {
     let after: Vec<u8> = state.encode();

@@ -5,6 +5,7 @@
 mod ended;
 mod kernel;
 mod memory;
+mod merge;
 mod scan;
 mod units;
 
@@ -16,9 +17,12 @@ use alloc::rc::Rc;
 use alloc::vec::Vec;
 
 use vos_wire::abi::cap::{self, Limits};
-use vos_wire::abi::{self, AttestError, Failure, Kind, Op, Rows, code, precompile, price};
+use vos_wire::abi::{
+    self, AttestError, Failure, Kind, MergeRows, Op, Rows, code, precompile, price,
+};
 use vos_wire::batch::{Await, Body};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, RequestId, WorkflowId};
+use vos_wire::merge::{Cutoff, Origin};
 use vos_wire::records::{Installed, PendingRead};
 use vos_wire::result::{Attest, Attested, InstanceGas, KernelReturn, Outcome, Outgoing};
 use vos_wire::served::{ClosedRow, Served};
@@ -84,6 +88,11 @@ pub(crate) struct Invocation<'a> {
     write_bytes: usize,
     rows_written: usize,
     draws: u64,
+    /// A merge step's operation, and the writes its run has made.
+    pub(crate) origin: Option<Origin>,
+    merge_writes: u32,
+    /// The authors' cutoffs a query's merge reads met, by instance.
+    cutoffs: BTreeMap<(InstanceId, [u8; 32]), Option<Cutoff>>,
     pub(crate) gas_used: u64,
 }
 
@@ -106,6 +115,9 @@ impl<'a> Invocation<'a> {
             write_bytes: 0,
             rows_written: 0,
             draws: 0,
+            origin: None,
+            merge_writes: 0,
+            cutoffs: BTreeMap::new(),
             gas_used: 0,
         }
     }
@@ -128,7 +140,14 @@ impl<'a> Invocation<'a> {
         let Some(schema) = installed.schema.method(method) else {
             return Outcome::failed(Failure::Unknown);
         };
-        if !schema.kind.is_handler() || (self.entry == Kind::Query && schema.kind != Kind::Query) {
+        // The merge entry runs merge handlers alone, and no other entry
+        // runs one.
+        let runs = match self.entry {
+            Kind::Merge => schema.kind.is_merge(),
+            Kind::Query => schema.kind == Kind::Query,
+            _ => schema.kind.is_handler(),
+        };
+        if !runs {
             return Outcome::failed(Failure::Unknown);
         }
         let gas = schema.gas_limit();
@@ -383,6 +402,8 @@ impl<'a> Invocation<'a> {
             ..
         } = call;
         let r = machine.registers();
+        // A merge field's rows, and every row of a merge step, apart.
+        let merge = |r: &[u64; 13]| self.entry == Kind::Merge || MergeRows::is(r[7]);
         match op {
             Op::Input => {
                 copy_out(machine, arguments, r[7], r[8], r[9])?;
@@ -414,6 +435,9 @@ impl<'a> Invocation<'a> {
                 self.draws += 1;
                 write(machine, r[7], &bytes)?;
                 machine.set_register(7, code::OK);
+            }
+            Op::Get | Op::Put | Op::Delete | Op::Scan if merge(&r) => {
+                return self.merge_operation(machine, instance, op);
             }
             Op::Get => {
                 let key = row(machine, instance, r[7], r[8], r[9])?;

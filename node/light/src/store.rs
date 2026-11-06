@@ -1,13 +1,20 @@
 //! The light node's store: one fjall database, mended at open as the
-//! node's is ([`vos_exec::store::recover`]), with three keyspaces:
+//! node's is ([`vos_exec::store::recover`]), with three keyspaces of its
+//! own:
 //!
-//! - `rows`: the local agent's rows, as `vos_wire::apply` stores them;
+//! - `rows`: the local agent's rows, as `vos_wire::apply` stores them, and
+//!   each scope's rows beside them: its merge fields' entries, its nodes'
+//!   Lamport clocks, its authors' cutoffs and its held operations;
 //! - `programs`: the programs installed, by their hash;
-//! - `meta`: the store's layout, and the last operation's time and seed.
+//! - `meta`: the store's layout, its author key, and the last local
+//!   operation's time and seed;
 //!
-//! An operation's every change, its rows, its programs and its time, is one
-//! batch, synced: a process killed at any point leaves the store before the
-//! operation or after it.
+//! and each scope's keyspaces, its DAG's (`merkle_crdt::FjallStore`),
+//! named after it.
+//!
+//! An operation's every change, its rows, its programs, its time, and a
+//! scope's nodes and their rows, is one batch, synced: a process killed at
+//! any point leaves the store before the operation or after it.
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -22,13 +29,14 @@ use vos_wire::ids::AgentId;
 /// The number of the store's layout: where its rows live. A store written
 /// in another is refused at open. Numbered apart from the node's store's
 /// layouts.
-pub const LAYOUT: u32 = 1;
+pub const LAYOUT: u32 = 2;
 
 /// The block cache the store keeps by default: a phone's.
 pub const CACHE_BYTES: u64 = 16 << 20;
 
 const LAYOUT_ROW: &[u8] = b"layout";
 const LAST_ROW: &[u8] = b"last";
+const AUTHOR_ROW: &[u8] = b"author";
 
 /// An installed program: its hash and its bytes.
 pub type Program = ([u8; 32], Vec<u8>);
@@ -44,6 +52,9 @@ pub enum StoreError {
     /// The store names another layout, `None` for one that holds rows and
     /// names none, or whose layout row does not read.
     Layout(Option<u32>),
+    /// The operating system had no randomness for a new store's author
+    /// key.
+    Randomness,
 }
 
 impl From<fjall::Error> for StoreError {
@@ -67,6 +78,7 @@ impl std::fmt::Display for StoreError {
                 "the store is laid out as layout {layout}, and this build reads layout {LAYOUT}"
             ),
             StoreError::Layout(None) => f.write_str("the store names no layout it can read"),
+            StoreError::Randomness => f.write_str("no randomness for the author key"),
         }
     }
 }
@@ -97,8 +109,9 @@ impl Store {
         Ok(store)
     }
 
-    /// The layout row checked, and written, synced, to a store holding
-    /// nothing yet.
+    /// The layout row checked, and written, synced, with a fresh author
+    /// key, to a store holding nothing yet: a store made anew, by an
+    /// install or a restore, signs as a new author.
     fn check_layout(&self) -> Result<(), StoreError> {
         let Keyspaces {
             db,
@@ -113,12 +126,59 @@ impl Store {
                 Err(_) => Err(StoreError::Layout(None)),
             },
             None if rows.is_empty()? && programs.is_empty()? && meta.is_empty()? => {
-                meta.insert(LAYOUT_ROW, LAYOUT.to_be_bytes())?;
-                db.persist(PersistMode::SyncAll)?;
+                let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+                getrandom::getrandom(&mut seed[..]).map_err(|_| StoreError::Randomness)?;
+                let mut batch = db.batch();
+                batch.insert(meta, AUTHOR_ROW, &seed[..]);
+                batch.insert(meta, LAYOUT_ROW, LAYOUT.to_be_bytes());
+                batch.durability(Some(PersistMode::SyncAll)).commit()?;
                 Ok(())
             }
             None => Err(StoreError::Layout(None)),
         }
+    }
+
+    /// The store's author key: the seed of the ed25519 key its scopes'
+    /// nodes are signed with, drawn when the store was made.
+    pub(crate) fn author(&self) -> Result<zeroize::Zeroizing<[u8; 32]>, StoreError> {
+        let bytes = self
+            .0
+            .meta
+            .get(AUTHOR_ROW)?
+            .ok_or(StoreError::Layout(None))?;
+        let seed = <[u8; 32]>::try_from(&bytes[..]).map_err(|_| StoreError::Layout(None))?;
+        Ok(zeroize::Zeroizing::new(seed))
+    }
+
+    /// The database, which each scope's keyspaces are in.
+    pub(crate) fn database(&self) -> &Database {
+        &self.0.db
+    }
+
+    /// The local agent's rows' keyspace, a scope's rows too.
+    pub(crate) fn rows_keyspace(&self) -> &Keyspace {
+        &self.0.rows
+    }
+
+    /// The meta keyspace, and the row of a local operation's time and
+    /// seed in it, as an operation stages it.
+    pub(crate) fn last_row(
+        &self,
+        time: u64,
+        seed: &[u8; 32],
+    ) -> (&Keyspace, &'static [u8], Vec<u8>) {
+        let mut last = time.to_le_bytes().to_vec();
+        last.extend_from_slice(seed);
+        (&self.0.meta, LAST_ROW, last)
+    }
+
+    /// Write `rows` of the local agent's, synced.
+    pub(crate) fn write_rows(&self, rows: Vec<(Vec<u8>, Vec<u8>)>) -> Result<(), StoreError> {
+        let mut batch = self.0.db.batch();
+        for (key, value) in rows {
+            batch.insert(&self.0.rows, key, value);
+        }
+        Ok(batch.durability(Some(PersistMode::SyncAll)).commit()?)
     }
 
     /// A view of the store as it stands, which later commits do not move.
@@ -158,9 +218,8 @@ impl Store {
         for (hash, program) in operation.programs {
             batch.insert(programs, hash, program);
         }
-        let mut last = operation.time.to_le_bytes().to_vec();
-        last.extend_from_slice(&operation.seed);
-        batch.insert(meta, LAST_ROW, last);
+        let (_, key, last) = self.last_row(operation.time, &operation.seed);
+        batch.insert(meta, key, last);
         Ok(batch.durability(Some(PersistMode::SyncAll)).commit()?)
     }
 
@@ -217,7 +276,7 @@ impl Snapshot {
             .map(|value| value.to_vec()))
     }
 
-    /// The last operation's time and seed; none before the first.
+    /// The last local operation's time and seed; none before the first.
     pub fn last(&self) -> Result<Option<(u64, [u8; 32])>, StoreError> {
         let Some(bytes) = self.snapshot.get(&self.store.0.meta, LAST_ROW)? else {
             return Ok(None);

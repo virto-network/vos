@@ -17,6 +17,7 @@ pub mod ids;
 pub mod ingress;
 pub mod jam;
 pub mod keys;
+pub mod merge;
 pub mod package;
 pub mod peer;
 pub mod personal;

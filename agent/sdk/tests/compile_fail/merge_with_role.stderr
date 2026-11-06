@@ -1,0 +1,5 @@
+error: `merge` marks a `&mut self` #[msg] handler alone, with no role: it runs on every device that applies its operation, by its author
+  --> tests/compile_fail/merge_with_role.rs:18:11
+   |
+18 |     #[msg(merge, role = "Member")]
+   |           ^^^^^

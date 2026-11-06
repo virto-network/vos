@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 use scale::{Decode, Encode};
 use vos_tree::Blake2b;
 
-use crate::abi::{Failure, Rows, cap};
+use crate::abi::{Failure, MergeRows, Rows, cap};
 use crate::ids::{
     AgentId, InstanceId, MapId, Principal, ProgramHash, Session, SessionId, WorkflowId,
 };
@@ -44,6 +44,7 @@ enum Owner {
 enum Part {
     Struct = 0x00,
     Table = 0x01,
+    Merge = 0x02,
 }
 
 /// How a table's keys become its row keys, as a Substrate map's hasher
@@ -160,6 +161,9 @@ enum Row {
     Binding = 0x27,
     Once = 0x28,
     Admission = 0x29,
+    Cutoff = 0x2a,
+    Lamport = 0x2b,
+    Held = 0x2c,
 }
 
 /// The root builder's rows, each tagged after [`Owner::Tree`]: the rows of
@@ -515,6 +519,75 @@ pub fn admitted(instance: InstanceId, key: &[u8; 32]) -> Vec<u8> {
         transform: Transform::Hashed,
     };
     row(instance, rows, key).expect("a hashed row's key")
+}
+
+/// The prefix of a merge field's rows in `instance`'s state, `0x01 ‖
+/// instance ‖ 0x02 ‖ tag ‖ transform`, as a table's after its own part.
+pub fn merge_rows(instance: InstanceId, field: MergeRows) -> Vec<u8> {
+    key(&[
+        &[Owner::Instance as u8],
+        &instance.0.to_be_bytes(),
+        &[Part::Merge as u8],
+        &field.tag.to_be_bytes(),
+        &[field.transform.tag()],
+    ])
+}
+
+/// The row of the raw key `key` in a merge field, the prefix of its
+/// entries, one an author ([`merge_entry`]): the key transformed after the
+/// field's prefix. An ordered key past [`cap::ORDERED_KEY`] exceeds a cap
+/// ([`Failure::Cap`]).
+pub fn merge_element(
+    instance: InstanceId,
+    field: MergeRows,
+    key: &[u8],
+) -> Result<Vec<u8>, Failure> {
+    if field.transform == Transform::Ordered && key.len() > cap::ORDERED_KEY {
+        return Err(Failure::Cap);
+    }
+    let mut row = merge_rows(instance, field);
+    field.transform.append(key, &mut row);
+    Ok(row)
+}
+
+/// The entry of `author` for one element or key of a merge field, after
+/// its row ([`merge_element`]): the author's 32 bytes last, so one key's
+/// entries lie together and the keys stay prefix-free.
+pub fn merge_entry(row: &[u8], author: &[u8; 32]) -> Vec<u8> {
+    key(&[row, author])
+}
+
+/// The length of the author's part of a merge field's entry.
+pub const AUTHOR: usize = 32;
+
+/// An author's cutoff in `instance`'s scope ([`crate::merge::Cutoff`]): its
+/// operations at this sequence number and later are filtered when a merge
+/// field is read. A device writes it, never an actor.
+pub fn cutoff(instance: InstanceId, author: &[u8; 32]) -> Vec<u8> {
+    key(&[&Row::Cutoff.prefix(), &instance.0.to_be_bytes(), author])
+}
+
+/// A device's DAG node's Lamport clock, by its CID: one more than its
+/// parents' greatest, the order a merge field's latest entry is chosen in.
+pub fn lamport(cid: &[u8; 32]) -> Vec<u8> {
+    key(&[&Row::Lamport.prefix(), cid])
+}
+
+/// An operation of a kind, or a method, the device does not know, kept
+/// until it does, with its origin: in `instance`'s scope, by its node's
+/// CID and its index there, so two equivocating nodes' never share a row.
+pub fn held(instance: InstanceId, cid: &[u8; 32], index: u32) -> Vec<u8> {
+    key(&[
+        &Row::Held.prefix(),
+        &instance.0.to_be_bytes(),
+        cid,
+        &index.to_be_bytes(),
+    ])
+}
+
+/// The prefix of the operations held in `instance`'s scope.
+pub fn held_prefix(instance: InstanceId) -> Vec<u8> {
+    key(&[&Row::Held.prefix(), &instance.0.to_be_bytes()])
 }
 
 /// A credentialed call's binding digest `b`, recorded at its apply with its

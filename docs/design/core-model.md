@@ -188,7 +188,7 @@ impl Ledger {
     #[attestable]
     fn settle(&mut self, window: Window) -> Settlement { /* ... */ }
 
-    /// Merge: any replica or device, no log (not built, section 9.4).
+    /// Merge: every device that applies its operation, no log (section 9.4).
     #[msg(merge)]
     async fn note(&mut self, ctx: &mut MergeContext<Self>, text: String) { /* ... */ }
 
@@ -230,8 +230,10 @@ impl Ledger {
 - **Attestable methods take no context.** The macro rejects any use of
   fields that are not committed maps, and any call outside the method
   (section 11.1).
-- Merge fields and `#[msg(merge)]` handlers (`MergeContext`) belong to the
-  Merge lane, which is not built (section 9.4).
+- Merge fields and `#[msg(merge)]` handlers (`MergeContext<A>`: `now`,
+  `random`, `me` and `log`, the operation's own) belong to the Merge lane,
+  built on devices (section 9.4). A merge handler takes no role, and no
+  handler calls or sends to one.
 
 ### 6.3 Execution order and `.await` [decided]
 
@@ -699,7 +701,7 @@ The Local (replica-only) lane is deferred until a use case needs it.
 |---|---|---|---|
 | `#[msg] fn f(&mut self)` (command) | leader, through the log | Linear; Merge operations applied after commit | Linear; Merge as of the heads recorded in the work result |
 | `#[msg] fn f(&self)` (query) | any replica (`linearizable`: after a read index) | nothing | applied Linear and Merge state |
-| `#[msg(merge)]` | any replica or device, no log | Merge | Merge |
+| `#[msg(merge)]` | every device that applies its operation, no log | Merge | nothing: its operation alone (section 9.4) |
 | `#[workflow]` | leader, through the log | nothing directly (calls and messages) | its own memory |
 | `#[attestable]` | inside a command or workflow step | nothing (writes, "the root after", are not built) | its arguments, and, as `&self`, committed fields through a served witness at an anchored window cut, its read set declared |
 
@@ -794,14 +796,14 @@ The Local (replica-only) lane is deferred until a use case needs it.
   both hosts fail on it. A space has a root per window, built by its
   representative (`proving.md` §7).
 
-### 9.4 Merge lane [proposed; not built]
+### 9.4 Merge lane [proposed; built on devices]
 
-The Merge lane is designed and not built: no actor field, handler or node
-path serves it yet. `support/merkle-crdt` holds the DAG and the sync
-format it builds on. Its open questions are in `open.md`: masking and
-read-time filtering in each CRDT type, property tests for the
-authorization rule, the storage-backed types' design, and whether devices
-run Merge handlers locally or as thin clients.
+The Merge lane is built on devices and not on nodes: the light node
+(`light-node.md` §2.1) runs local actors' merge fields and `#[msg(merge)]`
+handlers over `support/merkle-crdt`'s DAGs, one a local instance; no node
+path serves a merge field, and no command reads or emits one. Its open
+questions are in `open.md`: the epochs and cutoffs of the authorization
+rule on a log, masking, a list type, and thin clients.
 
 - **One DAG per sync scope** [proposed]. A scope is one instance's Merge
   fields, or a declared group of them. Each scope has its own merkle-crdt
@@ -834,6 +836,76 @@ run Merge handlers locally or as thin clients.
   profile at 1M on the in-memory store puts about 95% of the time in
   ed25519; caching decompressed author keys and batch verification are
   the levers left.
+- **A scope is plaintext or sealed** [decided, `light-node.md` §3.6]. A
+  plaintext scope's nodes are readable by the nodes that store and serve
+  them, as this section designs it; it is not built. A sealed scope's
+  nodes are ciphertext to every node: its devices validate and apply
+  them, and nodes store, order and serve envelopes and enforce what they
+  can see (who may push, the epoch, quotas). The authorization rule below
+  runs on the devices, against the control log (the personal agent's,
+  `light-node.md` §3.5): an author is valid if its key was in the device
+  set when its envelope was accepted, and within its frontier if later
+  removed. The local actors' scopes are sealed.
+- **An operation is a merge handler's call, run on every device**
+  [decided; built, `vos-light`'s `sync`]. A device's operation is the
+  handler, its arguments, and the device's time and seed; a node carries
+  a batch of them, its operation ids (author, sequence number, index). The
+  issuing device runs it on the agent program's merge entry and records
+  the node only when it is `Done`; every device that applies the node
+  runs it so, as the operation's author. A merge handler writes its
+  instance's merge fields alone and reads no row: it runs on a new
+  instance's state, its merge fields bound, and the agent traps a read or
+  a write of any other row. Its effects are its operation's alone,
+  whatever the device has applied, so every device writes the same. An
+  operation of a kind, or a method, the device's build does not know is
+  held in the scope's rows for a build that does, never refused.
+- **The storage-backed types** [decided; built, `vos_wire::merge`, the
+  SDK's `crdt`]. A merge field keeps **one entry an element or key and
+  author chain**, under the element's row and the author's key: the
+  stamp of the write that made it (the node's Lamport clock, one more than
+  its parents' greatest, then the sequence number, operation index and
+  write index) and its value or removal. An author's later write replaces
+  its entry (a grow-only set keeps the earliest), comparing the entries'
+  bytes, so any delivery order keeps the same row. A read takes, among an
+  element's entries whose authors' cutoffs admit them, the latest by
+  Lamport clock, then author.
+  - `crdt::GSet<T>`: an element is in it once an admitted author added it.
+  - `crdt::Set<T>`: an add/remove set, the latest admitted add or remove
+    deciding. A causally later operation always wins; concurrent ones
+    resolve by Lamport clock, then author, on every device alike, so an
+    add concurrent with a removal is not guaranteed to win. Add-wins
+    needs each operation's causal context (a version vector a node, an
+    entry an author); it is later work, should a local actor need it.
+  - `crdt::Map<K, V>`: last-writer-wins per key, a removal a write of no
+    value.
+  - Iteration walks a field's rows in its transform's order, an element's
+    entries together, and returns the elements whose latest admitted
+    entry holds a value.
+- **Filtering at read** [decided; built]. Each author has a cutoff in a
+  scope: its operations at that sequence number and later are filtered,
+  never unapplied. An equivocation's is its number, written in the batch
+  that applies the second node (merkle-crdt tells the apply); a removal's
+  is one past the removed author's frontier, which the device set gives
+  (`Light::cut_off`, `light-node.md` §3.5). The lower stands. *Known
+  limit:* a field keeps one entry an element and author, so an author's
+  write before its cutoff to an element it rewrote after it is lost to
+  reads, which fall back to the other authors' entries.
+- **Cost** [measured, Intel Core Ultra 7 155H under other builds' load,
+  2026-11-03, the light node on fjall, release, the agent program on the
+  interpreter; the step's measuring crate, outside the tree]:
+  - a local operation (the handler's run on the merge entry, the node
+    signed, its synced commit) takes 1.55–1.60 ms at p50 and 1.9–2.1 ms
+    at p95 for each type alike (`GSet` insert, `Set` insert and remove,
+    `Map` insert); a peer's node of one operation, in an ingest of 100,
+    0.5–1.2 ms, and an operation in nodes of 100, 0.42 ms. The handler's
+    run on the interpreter is most of it: merkle-crdt's own work and the
+    signature check are about 60 µs a node (above);
+  - a read, three authors' entries a key, one author cut off or none: a
+    point read is 0.58–0.68 ms (one query, its fixed cost most of it) at
+    1k keys and at 100k alike; a scan costs 100–120 µs a key at 1k and
+    123–127 µs at 100k, the cutoff adding up to a sixth. A read is the
+    agent program's work on the interpreter, row by row; the light node
+    reading natively is the lever if a local actor's reads need it.
 - CRDT types are storage-backed. A list type that rebuilds its whole order
   on every call and never drops tombstones does not meet the budget.
 - **Linear-emitted chain.** Linear handlers may emit Merge operations, for
@@ -852,7 +924,9 @@ run Merge handlers locally or as thin clients.
     same node.
   - A node takes a fresh author key on every start, and a device on every
     install or restore. A crash or a backup therefore never reuses a
-    sequence number under an old key.
+    sequence number under an old key. (Built on devices: the light node's
+    store draws its author key when it is made, and keeps it in the same
+    database as its nodes.)
   - The scope's membership maps principals to their author chains.
 - **Authorization rule** (starting design, to be property-tested):
   1. A membership change is a Linear step that emits an epoch node E_n.
@@ -872,10 +946,11 @@ run Merge handlers locally or as thin clients.
      cite them, but their operations are filtered when read, and the
      chain's key is removed.
   6. Operations invalidated by a later epoch are filtered when read, by
-     (author chain, position relative to the cutoff), not unapplied. Lists
-     and sets need nothing else. An LWW map keeps the latest write per
-     (key, author chain), and a read takes the latest among unfiltered
-     chains.
+     (author chain, position relative to the cutoff), not unapplied. A set
+     or an LWW map keeps one entry per (element or key, author chain), and
+     a read takes the latest among unfiltered chains (built: the types
+     above, with their known limit: a chain's entry is its latest write,
+     so a write past its cutoff hides the chain's earlier one).
 
   The decision depends only on the log and the DAG, so every replica
   agrees. It costs O(1) per operation with per-author epoch intervals.

@@ -2,7 +2,8 @@
 
 use super::*;
 
-/// A handler's options, from `#[msg(role = "...", gas = N, linearizable)]`,
+/// A handler's options, from `#[msg(role = "...", gas = N, linearizable)]`
+/// or `#[msg(merge, gas = N)]`,
 /// or an attestable method's, from `#[attestable(gas = N, venue_bound,
 /// device, reference = path, headroom = k)]`.
 #[derive(Default)]
@@ -28,6 +29,8 @@ pub(super) struct Options {
     pub(super) headroom: Option<(u8, Span)>,
     /// An auth guard that admits each nullifier once, `once`.
     pub(super) once: Option<Span>,
+    /// A merge handler, `merge`.
+    pub(super) merge: Option<Span>,
 }
 
 /// `Auth("name")` or `Owner`, a guard's value.
@@ -118,6 +121,8 @@ pub(super) fn msg_options(attribute: &Attribute) -> syn::Result<Options> {
                 options.headroom = Some((headroom, span));
             } else if meta.path.is_ident("once") {
                 options.once = Some(meta.path.span());
+            } else if meta.path.is_ident("merge") {
+                options.merge = Some(meta.path.span());
             } else if meta.path.is_ident("gas") {
                 let Expr::Lit(ExprLit {
                     lit: Lit::Int(value),
@@ -129,9 +134,9 @@ pub(super) fn msg_options(attribute: &Attribute) -> syn::Result<Options> {
                 options.gas = Some(value.base10_parse()?);
             } else {
                 return Err(meta.error(
-                    "expected `role = \"...\"`, `gas = N`, `linearizable`, `venue_bound`, \
-                     `device`, `reference = path`, `headroom = k`, `credential = ...`, \
-                     `device = \"...\"` or `once`",
+                    "expected `role = \"...\"`, `gas = N`, `linearizable`, `merge`, \
+                     `venue_bound`, `device`, `reference = path`, `headroom = k`, \
+                     `credential = ...`, `device = \"...\"` or `once`",
                 ));
             }
             Ok(())

@@ -134,27 +134,41 @@ devices decrypt each other's messages".
 | part | what | from |
 |---|---|---|
 | **PVM runtime** | the interpreter, its machine pool and inner machines; no JIT (the recompiler is x86-64 Linux only, `pvm/runtime/src/lib.rs`) | `vos-pvm` [built] |
-| **the agent program** | the default agent, `vos-agent`: local actors are installed into it as into a node's agent; it gains merge dispatch, CRDT fields' storage and scopes (none exists today in `agent/default` or `agent/sdk-macros`) | `agent/default` [built, extended] |
+| **the agent program** | the default agent, `vos-agent`: local actors are installed into it as into a node's agent; its merge entry runs `#[msg(merge)]` handlers writing merge fields, and its queries read them filtered (`core-model.md` §9.4) | `agent/default` [built, extended] |
 | **merge and query dispatch** | local actors are Merge-only (`#[msg(merge)]` handlers and `&self` queries; `core-model.md` §9.2: a merge handler runs on "any replica or device, no log"), so the light node runs the agent program's merge and query entries over its store, one fjall batch per operation; no refine, no accumulate, no work results, sessions or sweeps; no Raft, no leader, no peers | the executor's host-call layer, reused from `vos-node` without its pipeline (§7.1) |
 | **release artifacts** | the transpiled programs of the local actors and the stock kernels' device programs, computed at release and embedded with their ELF bytes; the phone runs no transpiler and no reference run (§4.4) | the release build [new] |
 | **local store** | fjall, as the node's, with small caches (8–16 MiB block cache [est]) | `vos-node`'s `store` [built] |
 | **device prover** | the device profile (format 46, then 47 after the levers, §4.4), masked, `Threads::Auto` | `vos-pvm-proof` and `vos-pvm-recair`'s masked device segment, its recursion prover featured out (§7.1) |
 | **node-API client** | the multiplexed `vos-api` client over SSH's `vos-api` subsystem, over an arti onion stream (§6) [E23] | `vos-api` [built] |
-| **sync** | merkle-crdt DAGs of the local actors' Merge fields, its `Store` over fjall, sealed before they leave the device (§3.6) | `support/merkle-crdt` [built: incremental apply, author chains, `FjallStore`, batched fetching; no dependent today] |
+| **sync** | merkle-crdt DAGs of the local actors' Merge fields, one a local instance, its `Store` over fjall, sealed before they leave the device (§3.6) | `support/merkle-crdt` [built: incremental apply, author chains, `FjallStore`, batched fetching], `vos-light`'s `sync` [built: nodes recorded and applied through the merge entry; sealing and the cursor over `Personal` are not] |
 | **MLS** | the user's device group, through `vos-mls` over mls-rs, on the host side, native, never in a guest | `vos-mls` [new]; the storage providers and copy-and-swap adapted from the `messaging` branch (§3.4) |
 | **secrets** | per device, as today: the member secret from the keystore's HMAC; the admin key in the hardware keystore; the sync key and MLS state wrapped after first unlock; a security-key kit through the `hmac-secret` path (§3.5) | `vos-light`'s `secret` [built, extended] |
 | **Tor** | arti's client, one `TorClient` per process | arti (§6) |
 
 **What the core is, as built** [built, `node/light`, `node/exec`]:
-- **The entries:** a call is the agent program's merge entry
-  (`Work::Merge`): refine runs the handler as a command's step and returns
-  that one step as a work result, which the light node applies natively
-  with the code a node's accumulate runs (`vos_wire::apply`), so no
-  accumulate runs in the PVM. An install is a batch of one install
-  through refine, applied alike. Until the CRDT fields and `#[msg(merge)]`
-  (plan 8.18a), the entry runs `&mut self` handlers and fails, `Trapped`
-  with nothing written, a run that sends, attests, writes a committed map
-  or starts a workflow: Merge-only in effect.
+- **The entries:** a call is a merge handler's operation, the agent
+  program's merge entry (`Work::Merge`): refine runs the `#[msg(merge)]`
+  handler as the operation's author, at the device's time and seed, and
+  returns its one step as a work result, whose rows (its merge fields'
+  entries) the light node writes itself, so no accumulate runs in the
+  PVM. Only a merge handler runs there, and it writes its merge fields
+  alone and reads no row (it runs on a new instance's state); anything
+  else fails with nothing written
+  (`core-model.md` §9.4). An install is a batch of one install through
+  refine, applied with the code a node's accumulate runs
+  (`vos_wire::apply`).
+- **Sync** [built, `vos-light`'s `sync`]: each local instance is one
+  scope, a merkle-crdt DAG whose nodes the store's author key signs (drawn
+  when the store is made, so an install or a restore is a new author). A
+  call is recorded as a node, its rows and the node in one synced batch
+  with the light node's own row of the call's time and seed
+  (`FjallStore::commit_with`); a peer's nodes are ingested in one batch,
+  each operation run through the same merge entry, and each node's
+  Lamport clock, its author's cutoff where it equivocates and its held
+  operations of unknown kinds written with them. Reads filter the
+  equivocating authors and those the host cuts off (`Light::cut_off`,
+  the device set's frontiers, §3.5). Sealing, the cursor over
+  `Personal` and the device set are later steps (8.13, 8.20).
 - **The host-call layer** is `vos-exec`, which `vos-node` and `vos-light`
   link; ingress's device programs (`credentialed.rs`'s use of
   `vos_pvm_recair::device`) stay in the node, as the light node never
@@ -303,13 +317,17 @@ operation and travel inside it.
 - **What syncs:** each scope's DAG nodes, each a batch of CRDT operations
   with stable ids, its parents and its author. Never the store's rows,
   never proofs, never a secret.
-- **The CRDT types, first:** `crdt::Set<T>` (add-wins observed-remove),
-  `crdt::Map<K, V>` (last-writer-wins a key by a Lamport counter and the
-  author's id) and `crdt::GSet<T>`. Storage-backed and **stored per
-  author:** a map keeps the latest write per (key, author) and a read
-  takes the latest among authors not filtered out (`core-model.md` §9.4,
-  rule 6), so a removed device's writes applied before the removal was
-  known are filtered at read, never unapplied (§3.5's frontier).
+- **The CRDT types, first** [built, `core-model.md` §9.4]:
+  `crdt::Set<T>` (an add/remove set, the latest admitted add or remove by
+  Lamport clock then author deciding: a causally later operation always
+  wins, concurrent ones resolve alike on every device; add-wins, which
+  needs each operation's causal context, is later work), `crdt::Map<K, V>`
+  (last-writer-wins a key by a Lamport clock and the author's id) and
+  `crdt::GSet<T>`. Storage-backed and **stored per author:** a field keeps
+  one entry per (element or key, author) and a read takes the latest among
+  authors not filtered out (`core-model.md` §9.4, rule 6), so a removed
+  device's writes applied before the removal was known are filtered at
+  read, never unapplied (§3.5's frontier).
 - **The conflict model** is the types' own; no operation needs another
   device's agreement. Where conflicts are real, a log decides: the device
   set and the device group by the personal agent's log, a payment by the
@@ -327,8 +345,15 @@ operation and travel inside it.
   63–68 µs at 1M operations, most of it the ed25519 check, and a node
   alone 0.5–0.8 ms, its synced commit [measured, Intel Core Ultra 7 155H, 2026-11-03, `core-model.md`
   §9.4]. Nodes arriving before their parents, as a cursor serves them,
-  are held until the parents arrive. Equivocations are found at apply and
-  listed; filtering them at read is the types' (8.18a).
+  are held until the parents arrive. Equivocations are found at apply,
+  listed, and filtered at read by the types, from the equivocation's
+  number on.
+- **What the types cost on the light node** [measured, Intel Core Ultra
+  7 155H under load, 2026-11-03, `core-model.md` §9.4]: a local operation
+  1.6 ms at p50 for each type, its synced commit included; a peer's node
+  0.5–1.2 ms in an ingest of 100; a point read 0.6–0.7 ms at 1k and 100k
+  keys alike, a scan 100–127 µs a key, three authors' entries a key, one
+  cut off.
 
 ### 3.3 The home and the personal agent
 

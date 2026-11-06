@@ -10,6 +10,7 @@ use vos_wire::ids::{
 use vos_wire::ingress::Grant;
 use vos_wire::jam::{AccumulateInput, RefineArgs, WorkError};
 use vos_wire::keys::{Due, Transform};
+use vos_wire::merge::Origin;
 use vos_wire::records::{
     Derivation, DeviceRelease, Kernel, Previous, Reference, SegmentClass, Shape, Snapshot,
     Workflow, WorkflowState,
@@ -1032,26 +1033,31 @@ fn packages_keep_their_bytes() {
     assert_eq!(exports.encode(), bytes);
 }
 
-/// A merge's work: variant 3, its fields in order; a merge's step names
+/// A merge's work: variant 3, its fields in order, its origin's inline; a merge's step names
 /// its input as variant 10, with no fields.
 #[test]
 fn a_merge_encodes_in_field_order() {
     let merge = Merge {
-        version: 1,
         time: 2,
         seed: [3; 32],
-        caller: Principal::Client([4; 32]),
+        origin: Origin {
+            author: [4; 32],
+            seq: 8,
+            lamport: 9,
+            index: 10,
+        },
         instance: InstanceId(5),
         method: MethodId(6),
         arguments: vec![7],
     };
     let bytes = [
         &[3][..],
-        &1u64.to_le_bytes(),
         &2u64.to_le_bytes(),
         &[3; 32],
-        &[0],
         &[4; 32],
+        &8u64.to_le_bytes(),
+        &9u64.to_le_bytes(),
+        &10u32.to_le_bytes(),
         &5u32.to_le_bytes(),
         &6u32.to_le_bytes(),
         &1u32.to_le_bytes(),

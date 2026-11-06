@@ -3,9 +3,10 @@
 # phone over adb (`light-node.md` §2.1).
 #
 # 1. A local actor installed from the release artifacts the binary embeds
-#    and called: `vos-phone light` on a new store, 500 calls timed, then
-#    its value read back; then again on the same store, which reopens with
-#    the counter installed and its calls applied.
+#    and called: `vos-phone light` on a new store, 500 merge operations
+#    timed, each a signed node of the actor's scope, then read back; then
+#    again on the same store, which reopens with the notes actor installed
+#    and its operations applied.
 # 2. A process killed mid-operation leaves the store consistent: for each
 #    round (10 by default), `vos-phone light` calling in a loop on one store
 #    is killed (SIGKILL) a random 50-800 ms after it starts, and `vos-phone

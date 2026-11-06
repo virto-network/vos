@@ -1,153 +1,446 @@
-//! A local actor installed on the light node from release artifacts,
-//! called and queried, its state kept across a reopen; and what the merge
-//! entry refuses.
+//! Local actors on the light node, installed from release artifacts: their
+//! merge handlers' operations recorded as signed nodes and their merge
+//! fields read by queries, kept across a reopen; what the merge entry
+//! refuses; and two devices exchanging their nodes and converging, an
+//! equivocating author and a removed one filtered at read.
 
+use std::collections::BTreeSet;
+
+use ed25519_dalek::SigningKey;
+use merkle_crdt::{Author, Node};
 use vos_light::release::{self, Package};
+use vos_light::sync::{self, Blake2b256, Call, Cid, Op, Ops};
 use vos_light::{Config, Error, Light};
 use vos_testkit::programs;
 use vos_wire::abi::Failure;
 use vos_wire::ids::{InstanceId, MethodId, Principal};
 use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode};
+use vos_wire::{Decode, Encode, keys};
 
-const COUNTER: InstanceId = InstanceId(1);
+const NOTES: InstanceId = InstanceId(1);
 const DEVICE: Principal = Principal::Client([0xd1; 32]);
 
 /// The release artifacts, as the release build computes them: the agent
-/// program, and the counter's package.
+/// program, and the notes actor's package.
 fn artifacts() -> (Vec<u8>, Package) {
     let read = |path: std::path::PathBuf| std::fs::read(path).unwrap();
     let agent = release::agent(&read(programs::agent_elf())).unwrap();
-    let counter = release::package(&read(programs::actor_elf("counter"))).unwrap();
-    (agent, counter)
+    let notes = release::package(&read(programs::actor_elf("notes"))).unwrap();
+    (agent, notes)
 }
 
 fn method(package: &Package, name: &str) -> MethodId {
     programs::method(&package.programs[0], name)
 }
 
-fn total(outcome: Outcome) -> u64 {
-    match outcome {
-        Outcome::Done(bytes) => u64::decode(&bytes).unwrap().0,
-        other => panic!("not done: {other:?}"),
+/// A device: its light node with the notes actor installed.
+struct Device {
+    light: Light,
+    notes: Package,
+    _dir: tempfile::TempDir,
+}
+
+impl Device {
+    fn new(agent: &[u8], notes: &Package) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let light = Light::open(dir.path(), agent, Config::default()).unwrap();
+        let installed = light.install(NOTES, notes, Vec::new()).unwrap();
+        assert!(matches!(installed, Outcome::Done(_)), "{installed:?}");
+        Self {
+            light,
+            notes: notes.clone(),
+            _dir: dir,
+        }
+    }
+
+    fn call(&self, name: &str, arguments: Vec<u8>) -> Outcome {
+        self.light
+            .call(NOTES, method(&self.notes, name), arguments)
+            .unwrap()
+    }
+
+    fn done(&self, name: &str, arguments: Vec<u8>) -> Vec<u8> {
+        match self.call(name, arguments) {
+            Outcome::Done(reply) => reply,
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+
+    fn query<T: Decode>(&self, name: &str, arguments: Vec<u8>) -> T {
+        let outcome = self
+            .light
+            .query(DEVICE, NOTES, method(&self.notes, name), arguments)
+            .unwrap();
+        match outcome {
+            Outcome::Done(reply) => T::decode_exact(&reply).unwrap(),
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+
+    /// What every read sees.
+    fn state(&self) -> State {
+        State {
+            tags: self.query("tags", Vec::new()),
+            items: self.query("items", Vec::new()),
+            titles: self.query("titles", Vec::new()),
+        }
+    }
+
+    /// The local nodes not yet pushed, marked pushed.
+    fn push(&self) -> Vec<Vec<u8>> {
+        let outbox = self.light.outbox(NOTES).unwrap();
+        let pushed: Vec<(Author, u64)> =
+            outbox.iter().map(|node| (node.author, node.seq)).collect();
+        self.light.pushed(NOTES, &pushed).unwrap();
+        outbox.into_iter().map(|node| node.bytes).collect()
     }
 }
 
-/// The artifacts round-trip as the app embeds them, and install: the
-/// counter, called on the merge entry, counts, its queries read what the
-/// calls wrote, and the light node opened again holds it all, its programs
-/// pooled from the store.
+#[derive(Debug, PartialEq, Eq)]
+struct State {
+    tags: Vec<String>,
+    items: Vec<u64>,
+    titles: Vec<(u64, String)>,
+}
+
+/// The artifacts round-trip as the app embeds them, and install: the notes
+/// actor's merge handlers write its fields, its queries read them, and the
+/// light node opened again holds it all, its programs pooled from the
+/// store, its author the same.
 #[test]
 fn a_local_actor_installed_from_release_artifacts_is_called() {
-    let (agent, counter) = artifacts();
+    let (agent, notes) = artifacts();
     // As `vos-phone`'s build script encodes a package: its derivation,
     // then its programs.
-    let bytes = (counter.derivation.clone(), counter.programs.clone()).encode();
-    assert_eq!(bytes, counter.encode());
+    let bytes = (notes.derivation.clone(), notes.programs.clone()).encode();
+    assert_eq!(bytes, notes.encode());
     let embedded = Package::decode_exact(&bytes).unwrap();
-    assert_eq!(embedded, counter);
+    assert_eq!(embedded, notes);
     let dir = tempfile::tempdir().unwrap();
-    let (increment, value) = (method(&counter, "increment"), method(&counter, "value"));
-    {
+    let author = {
         let light = Light::open(dir.path(), &agent, Config::default()).unwrap();
-        let installed = light.install(COUNTER, &embedded, Vec::new()).unwrap();
+        let device = Device {
+            light,
+            notes: embedded.clone(),
+            _dir: tempfile::tempdir().unwrap(),
+        };
+        let installed = device.light.install(NOTES, &embedded, Vec::new()).unwrap();
         assert!(matches!(installed, Outcome::Done(_)), "{installed:?}");
-        for (by, expected) in [(5u64, 5), (7, 12)] {
-            let outcome = light.call(DEVICE, COUNTER, increment, by.encode()).unwrap();
-            assert_eq!(total(outcome), expected);
+        device.done("tag", "home".to_string().encode());
+        device.done("tag", "work".to_string().encode());
+        device.done("tag", "home".to_string().encode());
+        for item in [3u64, 1, 2] {
+            device.done("add", item.encode());
         }
-        let read = light.query(DEVICE, COUNTER, value, Vec::new()).unwrap();
-        assert_eq!(total(read), 12);
-    }
+        device.done("remove", 1u64.encode());
+        device.done("title", (7u64, "seven".to_string()).encode());
+        device.done("title", (7u64, "SEVEN".to_string()).encode());
+        device.done("title", (8u64, "eight".to_string()).encode());
+        device.done("untitle", 8u64.encode());
+        device.done("churn", 9u64.encode());
+        assert!(device.query::<bool>("has_tag", "work".to_string().encode()));
+        assert!(!device.query::<bool>("has", 1u64.encode()));
+        assert_eq!(
+            device.query::<Option<String>>("title_of", 7u64.encode()),
+            Some("SEVEN".into())
+        );
+        assert_eq!(
+            device.query::<Option<String>>("title_of", 8u64.encode()),
+            None
+        );
+        assert_eq!(device.light.outbox(NOTES).unwrap().len(), 12);
+        device.light.author()
+    };
     let light = Light::open(dir.path(), &agent, Config::default()).unwrap();
+    assert_eq!(light.author(), author);
+    let device = Device {
+        light,
+        notes,
+        _dir: tempfile::tempdir().unwrap(),
+    };
+    let mut items: Vec<u64> = device.query("items", Vec::new());
+    items.sort();
+    assert_eq!(items, [2, 3, 9]);
+    let mut tags: Vec<String> = device.query("tags", Vec::new());
+    tags.sort();
+    assert_eq!(tags, ["home", "work"]);
     assert_eq!(
-        total(light.query(DEVICE, COUNTER, value, Vec::new()).unwrap()),
-        12
+        device.query::<Vec<(u64, String)>>("titles", Vec::new()),
+        [(7, "SEVEN".to_string())]
     );
-    assert_eq!(
-        total(
-            light
-                .call(DEVICE, COUNTER, increment, 1u64.encode())
-                .unwrap()
-        ),
-        13
-    );
+    device.done("add", 1u64.encode());
+    assert!(device.query::<bool>("has", 1u64.encode()));
+    assert_eq!(device.light.have(NOTES).unwrap()[&author], 12);
 }
 
-/// A handler's failure writes nothing of its own; a call doing more than
-/// writing rows (a message, a committed map) fails `Trapped` with nothing
-/// written; a query that writes traps; and a package whose programs are
-/// not its derivation's, or another transpiler's, installs nothing.
+/// Only merge handlers run on the merge entry, and they write merge fields
+/// alone: a command is `Unknown`; a merge handler that reads a merge field
+/// or writes a table traps; one that fails declines; none of them records
+/// a node or writes a row. A package whose programs are not its
+/// derivation's, or another transpiler's, installs nothing, and nodes of
+/// an instance not installed are refused.
 #[test]
-fn the_merge_entry_writes_rows_alone() {
-    let (agent, counter) = artifacts();
+fn the_merge_entry_runs_merge_handlers_writing_merge_fields() {
+    let (agent, notes) = artifacts();
     let dir = tempfile::tempdir().unwrap();
     let light = Light::open(dir.path(), &agent, Config::default()).unwrap();
-    let mut forged = counter.clone();
+    let mut forged = notes.clone();
     forged.programs[0].push(0);
     assert!(matches!(
-        light.install(COUNTER, &forged, Vec::new()),
+        light.install(NOTES, &forged, Vec::new()),
         Err(Error::Package)
     ));
-    let mut other = counter.clone();
+    let mut other = notes.clone();
     other.derivation.transpiler += 1;
     assert!(matches!(
-        light.install(COUNTER, &other, Vec::new()),
+        light.install(NOTES, &other, Vec::new()),
         Err(Error::Transpiler(version)) if version == release::TRANSPILER + 1
     ));
-    light.install(COUNTER, &counter, Vec::new()).unwrap();
-    let call = |name: &str, arguments: Vec<u8>| {
-        light
-            .call(DEVICE, COUNTER, method(&counter, name), arguments)
-            .unwrap()
-    };
-    assert_eq!(total(call("increment", u64::MAX.encode())), u64::MAX);
     assert!(matches!(
-        call("increment", 1u64.encode()),
-        Outcome::Failed {
-            code: Failure::Handler,
-            ..
-        }
+        light.ingest(NOTES, Vec::new(), None),
+        Err(Error::NotInstalled)
     ));
-    let rows = light.store().rows().unwrap();
-    let trapped = |outcome: Outcome| {
-        matches!(
-            outcome,
-            Outcome::Failed {
-                code: Failure::Trapped,
-                ..
-            }
-        )
+    light.install(NOTES, &notes, Vec::new()).unwrap();
+    let device = Device {
+        light,
+        notes,
+        _dir: tempfile::tempdir().unwrap(),
     };
-    assert!(trapped(call("forward", (2u32, 1u32, 3u64).encode())));
-    assert!(trapped(call(
-        "set_entries",
-        vec![(1u64, Some(2u64))].encode()
-    )));
-    let after: Vec<_> = light
-        .store()
-        .rows()
-        .unwrap()
-        .into_iter()
-        .filter(|(key, _)| !is_mark(key))
-        .collect();
-    let before: Vec<_> = rows.into_iter().filter(|(key, _)| !is_mark(key)).collect();
-    assert_eq!(after, before, "a refused call wrote a row");
-    let sneaky = light
-        .query(DEVICE, COUNTER, method(&counter, "sneaky"), Vec::new())
-        .unwrap();
-    assert!(trapped(sneaky));
+    device.done("add", 5u64.encode());
+    let rows = device.light.store().rows().unwrap();
+    let failed = |outcome: Outcome, expected: Failure| match outcome {
+        Outcome::Failed { code, .. } => assert_eq!(code, expected),
+        other => panic!("{other:?}"),
+    };
+    failed(device.call("bump", 1u64.encode()), Failure::Unknown);
+    failed(device.call("peek", 6u64.encode()), Failure::Trapped);
+    failed(device.call("scribble", 1u64.encode()), Failure::Trapped);
+    failed(device.call("refuse", 6u64.encode()), Failure::Handler);
     assert_eq!(
-        total(
-            light
-                .query(DEVICE, COUNTER, method(&counter, "value"), Vec::new())
-                .unwrap()
-        ),
-        u64::MAX
+        device.light.store().rows().unwrap(),
+        rows,
+        "a declined call wrote"
     );
+    assert_eq!(device.light.outbox(NOTES).unwrap().len(), 1);
+    assert_eq!(device.query::<Vec<u64>>("items", Vec::new()), [5]);
 }
 
-/// The rows every operation moves: the state version and the latest time.
-fn is_mark(key: &[u8]) -> bool {
-    key == vos_wire::keys::version() || key == vos_wire::keys::batch_time()
+/// Two devices issue operations, concurrent ones among them, and exchange
+/// their nodes, each in one ingest: both read the same, an operation's
+/// time and randomness the issuing device's; a node already applied is a
+/// duplicate.
+#[test]
+fn two_devices_exchange_nodes_and_converge() {
+    let (agent, notes) = artifacts();
+    let phone = Device::new(&agent, &notes);
+    let laptop = Device::new(&agent, &notes);
+    assert_ne!(phone.light.author(), laptop.light.author());
+    let stamp = String::decode_exact(&phone.done("stamp", 1u64.encode())).unwrap();
+    phone.done("tag", "phone".to_string().encode());
+    phone.done("add", 1u64.encode());
+    phone.done("title", (2u64, "from the phone".to_string()).encode());
+    laptop.done("tag", "laptop".to_string().encode());
+    laptop.done("add", 1u64.encode());
+    laptop.done("remove", 1u64.encode());
+    laptop.done("add", 4u64.encode());
+    laptop.done("title", (2u64, "from the laptop".to_string()).encode());
+
+    let to_laptop = phone.push();
+    let to_phone = laptop.push();
+    let ingested = laptop.light.ingest(NOTES, to_laptop.clone(), None).unwrap();
+    assert_eq!(ingested.applied.len(), to_laptop.len());
+    phone.light.ingest(NOTES, to_phone, None).unwrap();
+    assert_eq!(phone.state(), laptop.state());
+    assert_eq!(
+        laptop.query::<Option<String>>("title_of", 1u64.encode()),
+        Some(stamp)
+    );
+    let again = laptop.light.ingest(NOTES, to_laptop, None).unwrap();
+    assert_eq!(again.duplicates, 4);
+    assert!(again.applied.is_empty());
+
+    // Each now writes after the other's, and the later writes win.
+    phone.done("remove", 4u64.encode());
+    laptop.done("title", (2u64, "settled".to_string()).encode());
+    laptop.light.ingest(NOTES, phone.push(), None).unwrap();
+    phone.light.ingest(NOTES, laptop.push(), None).unwrap();
+    assert_eq!(phone.state(), laptop.state());
+    let state = phone.state();
+    assert!(!state.items.contains(&4));
+    assert!(state.titles.contains(&(2, "settled".into())));
+}
+
+/// Operations delivered to three devices in different orders, each a few
+/// nodes at a time and some before their parents: every device reads the
+/// same.
+#[test]
+fn delivery_order_does_not_change_what_devices_read() {
+    let (agent, notes) = artifacts();
+    let writers = [Device::new(&agent, &notes), Device::new(&agent, &notes)];
+    let mut nodes = Vec::new();
+    for round in 0..4u64 {
+        for (index, writer) in writers.iter().enumerate() {
+            let item = (round + index as u64) % 3;
+            writer.done("add", item.encode());
+            if round % 2 == index as u64 {
+                writer.done("remove", ((round + 1) % 3).encode());
+            }
+            writer.done("title", (round % 2, format!("{index}/{round}")).encode());
+            writer.done("set", (round, index as u64).encode());
+        }
+        // Each learns the other's nodes of this round.
+        let pushed: Vec<Vec<Vec<u8>>> = writers.iter().map(Device::push).collect();
+        writers[0]
+            .light
+            .ingest(NOTES, pushed[1].clone(), None)
+            .unwrap();
+        writers[1]
+            .light
+            .ingest(NOTES, pushed[0].clone(), None)
+            .unwrap();
+        nodes.extend(pushed.into_iter().flatten());
+    }
+    let expected = writers[0].state();
+    assert_eq!(writers[1].state(), expected);
+    for order in 0..3u64 {
+        let reader = Device::new(&agent, &notes);
+        let mut shuffled = nodes.clone();
+        shuffle(&mut shuffled, order);
+        for chunk in shuffled.chunks(3 + order as usize) {
+            reader.light.ingest(NOTES, chunk.to_vec(), None).unwrap();
+        }
+        assert_eq!(reader.light.wanted(NOTES).unwrap().0, 0);
+        assert_eq!(reader.state(), expected, "order {order}");
+    }
+}
+
+/// A node of `ops` at `seq` in `key`'s chain of the notes' scope, after
+/// `parents`.
+fn node(key: &SigningKey, seq: u64, ops: Ops, parents: BTreeSet<Cid>) -> Vec<u8> {
+    let scope = sync::scope(&Config::default().realm, NOTES);
+    Node::<Blake2b256, Ops>::sign(key, &scope, seq, ops, parents).to_bytes()
+}
+
+fn call(notes: &Package, name: &str, arguments: Vec<u8>, time: u64) -> Op {
+    Op::Call(Call {
+        method: method(notes, name),
+        arguments,
+        time,
+        seed: [time as u8; 32],
+    })
+}
+
+fn cid(bytes: &[u8]) -> Cid {
+    merkle_crdt::Cid(<Blake2b256 as merkle_crdt::Hasher>::hash(bytes))
+}
+
+/// An author that signs two nodes at one sequence number is cut off from
+/// it on every device that applies both, its earlier writes kept; an
+/// author the device set removed is cut off past its frontier, and reads
+/// fall back to the others' writes; an operation of a kind this build does
+/// not know is held, not refused.
+#[test]
+fn equivocating_and_removed_authors_are_filtered_at_read() {
+    let (agent, notes) = artifacts();
+    let phone = Device::new(&agent, &notes);
+    let laptop = Device::new(&agent, &notes);
+    phone.done("title", (1u64, "phone".to_string()).encode());
+    let base = phone.push();
+    laptop.light.ingest(NOTES, base.clone(), None).unwrap();
+    let after = BTreeSet::from([cid(&base[0])]);
+
+    // A third author: a first node, then two at its second number.
+    let thief = SigningKey::from_bytes(&[9; 32]);
+    let first = node(
+        &thief,
+        0,
+        vec![call(
+            &notes,
+            "title",
+            (2u64, "thief".to_string()).encode(),
+            10,
+        )],
+        after,
+    );
+    let second = BTreeSet::from([cid(&first)]);
+    let one = node(
+        &thief,
+        1,
+        vec![call(
+            &notes,
+            "title",
+            (1u64, "one".to_string()).encode(),
+            11,
+        )],
+        second.clone(),
+    );
+    let other = node(
+        &thief,
+        1,
+        vec![
+            call(&notes, "title", (1u64, "other".to_string()).encode(), 12),
+            Op::Unknown {
+                kind: 9,
+                body: vec![1, 2, 3],
+            },
+        ],
+        second,
+    );
+    let title =
+        |device: &Device, key: u64| device.query::<Option<String>>("title_of", key.encode());
+    phone
+        .light
+        .ingest(NOTES, [first.clone(), one.clone()], None)
+        .unwrap();
+    assert_eq!(title(&phone, 1).as_deref(), Some("one"));
+    let ingested = phone.light.ingest(NOTES, [other.clone()], None).unwrap();
+    assert_eq!(ingested.equivocations.len(), 1);
+    laptop
+        .light
+        .ingest(NOTES, [other, one, first], None)
+        .unwrap();
+    for device in [&phone, &laptop] {
+        assert_eq!(title(device, 1).as_deref(), Some("phone"));
+        assert_eq!(title(device, 2).as_deref(), Some("thief"));
+    }
+    assert_eq!(phone.state(), laptop.state());
+    let held = keys::held_prefix(NOTES);
+    assert!(
+        phone
+            .light
+            .store()
+            .rows()
+            .unwrap()
+            .iter()
+            .any(|(key, _)| key.starts_with(&held)),
+        "the unknown operation is held"
+    );
+
+    // The laptop writes after the phone; the device set then removes the
+    // laptop past its frontier, before its write.
+    laptop.done("title", (1u64, "laptop".to_string()).encode());
+    phone.light.ingest(NOTES, laptop.push(), None).unwrap();
+    assert_eq!(title(&phone, 1).as_deref(), Some("laptop"));
+    phone
+        .light
+        .cut_off(NOTES, laptop.light.author(), 0)
+        .unwrap();
+    assert_eq!(title(&phone, 1).as_deref(), Some("phone"));
+    // A later, higher cutoff does not lift it.
+    phone
+        .light
+        .cut_off(NOTES, laptop.light.author(), 5)
+        .unwrap();
+    assert_eq!(title(&phone, 1).as_deref(), Some("phone"));
+}
+
+/// A deterministic shuffle by `seed`.
+fn shuffle<T>(items: &mut [T], seed: u64) {
+    let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    for at in (1..items.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        items.swap(at, (state % (at as u64 + 1)) as usize);
+    }
 }

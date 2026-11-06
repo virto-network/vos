@@ -233,6 +233,13 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
         &self.store
     }
 
+    /// The store, to stage writes of its own that its next commit carries
+    /// (a wrapper's rows beside the replica's). What the replica has
+    /// applied is not to be changed through it.
+    pub fn store_mut(&mut self) -> &mut S {
+        &mut self.store
+    }
+
     /// The store, given back.
     pub fn into_store(self) -> S {
         self.store
@@ -273,6 +280,7 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
             seq,
             parents: &node.parents,
             ops: &node.payload.ops,
+            equivocation: false,
         };
         crdt.apply(event, &mut rows).map_err(Error::Apply)?;
         if let Some(error) = rows.error {
@@ -500,6 +508,7 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
                 }
             }
             let same = lookup(seq).map_err(Error::Store)?;
+            let equivocation = !same.is_empty();
             if let Some(first) = same.first()
                 && !self.equivocations.contains(&(author, seq))
                 && equivocations.insert((author, seq))
@@ -525,6 +534,7 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
                 seq,
                 parents: &node.parents,
                 ops: &node.payload.ops,
+                equivocation,
             };
             crdt.apply(event, &mut rows).map_err(Error::Apply)?;
             if let Some(error) = rows.error.take() {

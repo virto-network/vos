@@ -7,7 +7,7 @@ use crate::{Author, Cid, Decode, Hasher, Store};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::vec::Vec;
-use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
+use fjall::{Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch, PersistMode};
 
 const HEADS: &[u8] = b"h";
 const CURSOR: &[u8] = b"c";
@@ -62,7 +62,8 @@ impl std::error::Error for FjallError {
 /// - the rows: `<name>.rows`, or a keyspace the caller names, so that a
 ///   light node's agent reads the CRDT's rows with its own.
 ///
-/// Every [`commit`](Store::commit) is one batch, synced before it returns.
+/// Every [`commit`](Store::commit) is one batch, synced before it returns;
+/// [`commit_with`](FjallStore::commit_with) adds the caller's writes to it.
 pub struct FjallStore {
     db: Database,
     nodes: Keyspace,
@@ -217,7 +218,21 @@ impl<H: Hasher> Store<H> for FjallStore {
     }
 
     fn commit(&mut self, changes: Changes<H>) -> Result<(), Self::Error> {
+        self.commit_with(changes, |_| {})
+    }
+}
+
+impl FjallStore {
+    /// Write `changes` and the caller's own writes, which `extra` adds to
+    /// the batch, in one synced batch: a store that keeps rows of its own
+    /// beside the scope's commits them with the scope's, or not at all.
+    pub fn commit_with<H: Hasher>(
+        &mut self,
+        changes: Changes<H>,
+        extra: impl FnOnce(&mut OwnedWriteBatch),
+    ) -> Result<(), FjallError> {
         let mut batch = self.db.batch();
+        extra(&mut batch);
         for node in changes.applied {
             batch.insert(
                 &self.authored,

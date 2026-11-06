@@ -232,6 +232,7 @@ vos-pvm-recair-air = { path = "pvm/proof/recair-air" }
 vos-pvm-recair = { path = "pvm/proof/recair", default-features = false }
 vos-pvm-final-verifier = { path = "pvm/proof/final-verifier" }
 vos-light = { path = "node/light" }
+merkle-crdt = { path = "support/merkle-crdt" }
 vos-statement = { path = "pvm/proof/statement" }
 vos-anchor = { path = "pvm/proof/anchor" }
 vos-statement-service = { path = "pvm/proof/statement/service" }

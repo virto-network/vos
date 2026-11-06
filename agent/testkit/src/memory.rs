@@ -24,7 +24,9 @@ pub(crate) fn held(key: &[u8], value: &[u8]) -> Result<Vec<u8>, Failure> {
 }
 
 /// The agent-relative key of the row an operation names, by the register
-/// `rows` and the actor's key at `address`/`len`.
+/// `rows` and the actor's key at `address`/`len`. The testkit models no
+/// merge lane: a merge field's rows trap, before the key is read, as a
+/// command's or a workflow's do in the agent.
 pub(crate) fn row(
     machine: &mut Machine,
     instance: InstanceId,
@@ -32,6 +34,9 @@ pub(crate) fn row(
     address: u64,
     len: u64,
 ) -> Result<Vec<u8>, Failure> {
+    if vos_wire::abi::MergeRows::is(rows) {
+        return Err(Failure::Trapped);
+    }
     let key = read_key(machine, address, len)?;
     let rows = Rows::from_register(rows).ok_or(Failure::Trapped)?;
     keys::row(instance, rows, &key)

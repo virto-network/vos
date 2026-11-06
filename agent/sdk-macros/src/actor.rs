@@ -1,4 +1,5 @@
-//! `#[actor]`: the state struct's encoding, its tables' tags, and the view
+//! `#[actor]`: the state struct's encoding, its tables' and merge fields'
+//! tags, and the view
 //! an attestable `&self` method reads: `<Actor>View`, its committed maps
 //! alone, each a [`ServedMap`](vos_sdk::table::ServedMap) of the same keys,
 //! values and transform, answering from the rows served at a window's cut.
@@ -64,7 +65,11 @@ pub(crate) fn actor_impl(mut input: ItemStruct, marks: Marks) -> syn::Result<Tok
             }
         }
         field.attrs = kept;
-        if !(explicit || is_named(&field.ty, "Table") || is_named(&field.ty, "CommittedMap")) {
+        if !(explicit
+            || is_named(&field.ty, "Table")
+            || is_named(&field.ty, "CommittedMap")
+            || is_merge_field(&field.ty))
+        {
             continue;
         }
         let table_name = table_name.unwrap_or_else(|| ident.to_string());
@@ -138,6 +143,22 @@ pub(crate) fn actor_impl(mut input: ItemStruct, marks: Marks) -> syn::Result<Tok
             }
         }
     })
+}
+
+/// Whether `ty` is a merge field: `crdt::GSet`, `crdt::Set` or `crdt::Map`,
+/// named through the `crdt` module so a type of the actor's own named
+/// `Set` or `Map` stays a plain field.
+fn is_merge_field(ty: &Type) -> bool {
+    let Type::Path(path) = ty else {
+        return false;
+    };
+    let segments: Vec<_> = path.path.segments.iter().collect();
+    matches!(
+        segments.as_slice(),
+        [.., module, last]
+            if module.ident == "crdt"
+                && ["GSet", "Set", "Map"].iter().any(|name| last.ident == name)
+    )
 }
 
 /// Whether `ty` is `Table<[u8; 32], V>`, of the default (hashed)
