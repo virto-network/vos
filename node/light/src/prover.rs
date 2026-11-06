@@ -170,7 +170,8 @@ impl Prover {
 
     /// A stock kernel's proof: `program` run on `arguments`, then the
     /// secret, then `claim`, the arguments zeroized once proved, the run's
-    /// io-hash checked to be the claim's.
+    /// io-hash checked to be the claim's. Their room is reserved before the
+    /// secret is written, so no reallocation frees a block holding it.
     fn prove_stock(
         &self,
         program: &DeviceProgram,
@@ -178,6 +179,7 @@ impl Prover {
         claim: Vec<u8>,
         mut arguments: Vec<u8>,
     ) -> Result<Proven, DeviceError> {
+        arguments.reserve_exact(32 + claim.len());
         secret.append_to(&mut arguments);
         arguments.extend_from_slice(&claim);
         let proved = self.prove_kernel(program, &arguments);
