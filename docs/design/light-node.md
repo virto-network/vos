@@ -1357,13 +1357,16 @@ choice, this is the one taken]:
   unchecked.
 - **Calls the agent drops:** the caller gives each admin call the agent
   took, with its log index, to `DeviceGroup::made`; another entry at that
-  index raises `Dropped`, and a dropped veto holds back the maturity of
-  its operation on this device, which keeps its voice (B8): the alarm is
-  the owner's to act on.
+  index, or a head that never reaches it, raises `Dropped`, and a dropped
+  veto holds back the maturity of its operation on this device, which
+  keeps its voice (B8): the alarm is the owner's to act on.
 - **Each envelope read:** positions are dense, so one skipped raises
-  `Withheld`; an envelope under an epoch before one the scope already
+  `Withheld` and the reading stops before it (`Waiting::Withheld`), as
+  reading past it would leave this device's reading of the scope apart
+  from the others' for good; an envelope under an epoch before one the scope already
   showed is a push the agent should have refused (`Stale`, passed over;
-  A8, B8); a node whose author is no device's sync key, or a removed
+  A8, B8); a node whose signature is not its header's author's, whose
+  author is no device's sync key, or a removed
   device's past its frontier (the agent's `frontier`, asked once a
   reading), is refused (`Author`; A7, B6); a writer's `seen` position in
   the envelope's own scope at or past the envelope's position is a
@@ -1373,30 +1376,42 @@ choice, this is the one taken]:
   written before its page applies.
 - **The sample audit** (`SealedSync::audit`, B2): every envelope a device
   pushed is recorded by position (`s/own/`); a uniform sample is fetched
-  at its positions, and one gone or replaced raises `Deleted` and its
-  node is sealed and pushed again.
+  at its positions, the bytes' hash checked against the id the push was
+  answered with, and one gone or replaced raises `Deleted` and its node
+  is sealed and pushed again.
 - **Checkpoints** (`personal::checkpoint`): the hash is over the agent,
   the scope, `P` and each position up to `P` that held a node with its
-  CID, in order, so two devices cutting at one position hold one (C3);
-  one is cut only where no node waits for a parent. Its content (those
+  CID, in order (a node the scope refused left out, as every device
+  refuses it), so two devices at one position compute one (C3); one is
+  cut only where no node waits for a parent. Its content (those
   nodes by position) is pushed in parts into a checkpoints' scope of its
   own, with the maker's `made(P, hash)` signed by its sync key; a device
   that read the scope to `P` recomputes it and signs `acknowledged`, or
-  raises `Checkpoint` (C4). A scope read for the first time starts from
-  the checkpoint its pairing device named over the pairing channel
-  (`Pairing::trust`, with where its parts start), or, for a restore's
-  device, the latest that two devices other than its maker acknowledged,
-  each signature checked against the device set; the content is checked
+  raises `Checkpoint` (C4); a maker acknowledges none of its own. A
+  scope read for the first time starts from the checkpoint its pairing
+  device named over the pairing channel (`Pairing::trust`, with where its
+  parts start), or, for a restore's device, the latest that a device made
+  and two devices that made none of it acknowledged, each signature
+  checked against the device set; the content is checked
   against the hash before it applies, and otherwise the scope is read
-  from its start (C12). `Personal`'s `acknowledge` table is unused: the
-  acknowledgements are sealed and signed, so the operators cannot add one.
+  from its start (C12). The acknowledgements are sealed and signed, so the
+  operators cannot add one; `Personal`'s `acknowledge` table and method
+  are unused, and go with `Personal`'s next change.
 - **Known limits:** the frontier and the device set a restore reads are
-  the agent's word (B8); a restore's device scans the checkpoints' scope
+  the agent's word (B8), and a removed device's acknowledgement counts
+  for a restore (the restore removes every device), so a removed thief
+  is one of the two; a device that cannot follow takes the devices added
+  meanwhile by the agent's word (§3.4), and their nodes as authored; a restore's device scans the checkpoints' scope
   from its start; a device that passed over an envelope another opened
   (M2 above) computes another hash, and raises `Checkpoint` at an honest
   one; a consistent partition is caught only once an envelope crosses it
-  (a `seen` position, a view); the rows by position and the chain rows
-  grow until garbage collection (§9.3).
+  (a `seen` position, a view); the checkpoints' scope passes over an
+  envelope it cannot open without an alarm; a scope with no envelope
+  yet looks for its checkpoint at each reading; the rows by position and
+  the chain rows grow until garbage collection (§9.3). The callers of
+  `made`, `head`, `audit`, `checkpoint`, `acknowledge` and
+  `Pairing::trust` are the background job's (8.22) and pairing's
+  (8.23a); the model test drives them.
 
 **PG6's catch-up on the clearnet** [measured, x86-64 Core Ultra 7 155H,
 load average 5–11, release, 2026-11-06; `node/host/tests/ingress/sealed.rs`

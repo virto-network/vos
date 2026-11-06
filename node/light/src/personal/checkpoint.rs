@@ -17,7 +17,7 @@
 //!   [`Alarm::Checkpoint`] and acknowledges nothing (C4).
 //! - **Which a device starts from:** a paired device, the one its pairing
 //!   device named over the pairing channel; a restore's device, the latest
-//!   one two devices other than its maker acknowledged, each signature
+//!   one two devices other than its makers acknowledged, each signature
 //!   checked against the device set; otherwise none, and it reads the scope
 //!   from its start. The content is checked against its hash before a node
 //!   of it is applied (C12).
@@ -152,11 +152,11 @@ fn said_message(
     message
 }
 
-/// A checkpoint as the checkpoints' scope shows it: its maker, and the
-/// devices that acknowledged it.
+/// A checkpoint as the checkpoints' scope shows it: the devices that made
+/// it, and those that acknowledged it.
 #[derive(Default)]
 struct Shown {
-    maker: Option<[u8; 32]>,
+    makers: Vec<[u8; 32]>,
     acknowledged: Vec<[u8; 32]>,
 }
 
@@ -169,7 +169,12 @@ impl<L: Link> SealedSync<'_, L> {
 
     /// What this device read of `scope` up to `position`: each position
     /// whose envelope held a node, and the node's CID.
-    fn read_to(&self, scope: &Scope, position: u64) -> Result<Read, SyncError<L::Error>> {
+    fn read_to(
+        &self,
+        instance: InstanceId,
+        scope: &Scope,
+        position: u64,
+    ) -> Result<Read, SyncError<L::Error>> {
         let corrupt = || SyncError::Group(GroupError::Corrupt);
         let mut read = Vec::new();
         for (key, value) in self
@@ -181,7 +186,16 @@ impl<L: Link> SealedSync<'_, L> {
             if at > position {
                 break;
             }
-            read.push((at, <[u8; 32]>::try_from(&value[..]).map_err(|_| corrupt())?));
+            let cid = <[u8; 32]>::try_from(&value[..]).map_err(|_| corrupt())?;
+            // A node the scope refused (its chain broken, a parent refused)
+            // is every device's to refuse: it is in no checkpoint.
+            if self
+                .light
+                .node(instance, &merkle_crdt::Cid::<Blake2b256>(cid))?
+                .is_some()
+            {
+                read.push((at, cid));
+            }
         }
         Ok(read)
     }
@@ -244,7 +258,7 @@ impl<L: Link> SealedSync<'_, L> {
         if self.light.wanted(instance)?.0 > 0 {
             return Err(SyncError::Incomplete);
         }
-        let read = self.read_to(&scope, position)?;
+        let read = self.read_to(instance, &scope, position)?;
         let agent = self.group.agent().identity;
         let hash = checkpoint_hash(&agent, &scope, position, &read);
         let mut content = Vec::with_capacity(read.len());
@@ -370,8 +384,12 @@ impl<L: Link> SealedSync<'_, L> {
             }
             true
         })?;
+        let me = self.light.sync_key().verifying_key().to_bytes();
         for (position, hash, author, signature) in made {
-            if self.said_by(&author, &signature, Said::Made, &scope, position, &hash)
+            // A maker's word is its `made`: it acknowledges no checkpoint
+            // of its own.
+            if author != me
+                && self.said_by(&author, &signature, Said::Made, &scope, position, &hash)
                 && !marks.pending.contains(&(position, hash))
                 && !marks.acknowledged.contains(&(position, hash))
             {
@@ -391,7 +409,12 @@ impl<L: Link> SealedSync<'_, L> {
                 waiting.push((position, hash));
                 continue;
             }
-            let mine = checkpoint_hash(&agent, &scope, position, &self.read_to(&scope, position)?);
+            let mine = checkpoint_hash(
+                &agent,
+                &scope,
+                position,
+                &self.read_to(instance, &scope, position)?,
+            );
             if mine == hash {
                 acks.push(self.say(Said::Acknowledged, &scope, position, hash));
                 marks.acknowledged.push((position, hash));
@@ -523,9 +546,9 @@ impl<L: Link> SealedSync<'_, L> {
         Ok(None)
     }
 
-    /// The checkpoints of `instance`'s scope two devices other than its
-    /// maker acknowledged, each signature checked against the device set:
-    /// the latest first.
+    /// The checkpoints of `instance`'s scope that a device made and two
+    /// devices that made none of it acknowledged, each signature checked
+    /// against the device set: the latest first.
     fn acknowledged(
         &mut self,
         instance: InstanceId,
@@ -557,7 +580,8 @@ impl<L: Link> SealedSync<'_, L> {
             }
             let entry = shown.entry((position, hash)).or_default();
             match word {
-                Said::Made => entry.maker = entry.maker.or(Some(author)),
+                Said::Made if !entry.makers.contains(&author) => entry.makers.push(author),
+                Said::Made => {}
                 Said::Acknowledged if !entry.acknowledged.contains(&author) => {
                     entry.acknowledged.push(author)
                 }
@@ -570,10 +594,10 @@ impl<L: Link> SealedSync<'_, L> {
                 let others = shown
                     .acknowledged
                     .iter()
-                    .filter(|author| shown.maker.is_none_or(|maker| maker != **author))
+                    .filter(|author| !shown.makers.contains(author))
                     .count();
                 let first = firsts.get(&(position, hash))?;
-                (others >= 2).then_some(Checkpoint {
+                (!shown.makers.is_empty() && others >= 2).then_some(Checkpoint {
                     scope,
                     position,
                     hash,

@@ -246,6 +246,9 @@ pub enum Waiting {
     /// An envelope of a confirmed epoch whose key this device lacks: read
     /// the archive, then read again.
     Key(u64),
+    /// The agent's page skips this position ([`Alarm::Withheld`]): read
+    /// again.
+    Withheld(u64),
 }
 
 /// Why an envelope read was passed over.
@@ -787,8 +790,12 @@ impl<'a, L: Link> SealedSync<'a, L> {
                     return Err(SyncError::Disordered);
                 }
                 if envelope.position != to + 1 {
+                    // Read on past it and this device's reading of the
+                    // scope would differ from the others' for good.
                     let position = to + 1;
                     raise(&mut caught.alarms, Alarm::Withheld { scope, position });
+                    caught.waiting = Some(Waiting::Withheld(position));
+                    break;
                 }
                 let opened = self.open(scope, &agent, &envelope)?;
                 let position = envelope.position;
@@ -880,6 +887,19 @@ impl<'a, L: Link> SealedSync<'a, L> {
             return Ok(Err(Unusable::Stale));
         }
         watch.epoch = epoch;
+        // Its author's signature, checked here: a header naming a device
+        // over a node no device signed is refused before its author counts.
+        match merkle_crdt::validate::<Blake2b256, crate::sync::Ops>(
+            &merkle_crdt::Scope(scope),
+            &body.node,
+        ) {
+            Ok(_) => {}
+            Err((_, merkle_crdt::Refusal::BadSignature)) => {
+                raise(&mut caught.alarms, Alarm::Author { scope, position });
+                return Ok(Err(Unusable::Author));
+            }
+            Err(_) => return Ok(Err(Unusable::Body)),
+        }
         let Some(header) = merkle_crdt::Header::<Blake2b256>::read(&body.node) else {
             return Ok(Err(Unusable::Body));
         };
@@ -980,10 +1000,9 @@ impl<'a, L: Link> SealedSync<'a, L> {
                 .ok_or(SyncError::Group(GroupError::Corrupt))?;
             audited.checked.push(position);
             let page = self.since(scope, position - 1)?;
-            if page
-                .first()
-                .is_some_and(|envelope| envelope.position == position && envelope.id == id)
-            {
+            if page.first().is_some_and(|envelope| {
+                envelope.position == position && envelope_id(&envelope.bytes) == id
+            }) {
                 continue;
             }
             raise(&mut audited.alarms, Alarm::Deleted { scope, position });

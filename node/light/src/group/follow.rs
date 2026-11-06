@@ -36,11 +36,11 @@ impl DeviceGroup {
     /// the cursor whose chain is not the one this device read there (a fork
     /// behind it); the reading stops at a gap. Each entry is checked
     /// against the writers' views waiting for it ([`Alarm::View`]) and this
-    /// device's admin calls the agent took there ([`Alarm::Dropped`]). A device that
-    /// cannot follow reads on for the device set's operations, its own
-    /// regroup's among them, not for others' candidates. The device's
-    /// state is written once a confirmed epoch is swapped in and at the
-    /// end, each time in one batch with its MLS state.
+    /// device's admin calls the agent took there ([`Alarm::Dropped`]). A
+    /// device that cannot follow reads on for the device set's operations,
+    /// its own regroup's among them, not for others' candidates. The
+    /// device's state is written once a confirmed epoch is swapped in and
+    /// at the end, each time in one batch with its MLS state.
     pub fn follow(
         &mut self,
         entries: impl IntoIterator<Item = (u64, Entry)>,

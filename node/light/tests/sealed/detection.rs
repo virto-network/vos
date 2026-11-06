@@ -11,7 +11,7 @@
 
 use ed25519_dalek::SigningKey;
 use vos_light::group::{Alarm, DeviceGroup, Event, Pairing, Restored};
-use vos_light::personal::{Answer, Frontier, Link, Route, SealedSync, Unusable};
+use vos_light::personal::{Answer, Frontier, Link, Route, SealedSync, Unusable, Waiting};
 use vos_light::sealed::{self, Body as Sealed, View};
 use vos_wire::Encode;
 use vos_wire::ids::InstanceId;
@@ -230,15 +230,16 @@ fn write(
     assert_eq!(pushed.stale, None);
 }
 
-/// A node of `instance` by `phone`, sealed for the agent under `key` at
-/// `epoch` with the writer's view and `seen` positions it has: what a
-/// device holding that key could have pushed.
+/// A node of `instance` by `phone`, `edit` applied to its bytes, sealed for
+/// the agent under `key` at `epoch` with the writer's view and `seen`
+/// positions it has: what one holding that key could have pushed.
 fn sealed_by(
     phone: &Phone,
     instance: InstanceId,
     key: &[u8; 32],
     epoch: u64,
     value: u64,
+    edit: impl FnOnce(&mut Vec<u8>),
 ) -> Vec<u8> {
     set(&phone.light, instance, 99, value);
     let node = phone.light.outbox(instance).unwrap().pop().unwrap();
@@ -246,7 +247,8 @@ fn sealed_by(
         .light
         .pushed(instance, &[(node.author, node.seq)])
         .unwrap();
-    let node = node.bytes;
+    let mut node = node.bytes;
+    edit(&mut node);
     let scope = scope_of(phone, instance);
     let (index, chain) = phone.group.as_ref().unwrap().view();
     let body = Sealed {
@@ -698,7 +700,7 @@ fn a_forged_operation_moves_nothing() {
     );
     let epoch = a.group().confirmed();
     let key = a.group().key(scope).unwrap();
-    let envelope = sealed_by(&stranger, NOTES, &key, epoch, 7);
+    let envelope = sealed_by(&stranger, NOTES, &key, epoch, 7, |_| {});
     let caught = shown(&mut home, a, &[NOTES], placed(scope, envelope), |sync| {
         sync.catch_up(NOTES)
     })
@@ -707,6 +709,33 @@ fn a_forged_operation_moves_nothing() {
     assert_eq!(caught.passed[0].why, Unusable::Author);
     assert_eq!(caught.alarms, vec![Alarm::Author { scope, position: 1 }]);
     assert_eq!(count(&a.light, NOTES, 99), None);
+
+    // A device's node with an operation changed: its header names the
+    // device, and its signature is no longer the device's.
+    let (mut home, mut phones) = household(2);
+    let scope = scope_of(&phones[0], NOTES);
+    write(&mut home, &mut phones[0], &[NOTES], NOTES, 1);
+    let epoch = phones[1].group().confirmed();
+    let key = phones[1].group().key(scope).unwrap();
+    let envelope = sealed_by(&phones[1], NOTES, &key, epoch, 7, |node| {
+        let shown = (99u64, 7u64).encode();
+        let at = node
+            .windows(shown.len())
+            .position(|window| window == shown)
+            .expect("the operation's arguments");
+        node[at + shown.len() - 8] = 8;
+    });
+    let caught = shown(
+        &mut home,
+        &mut phones[0],
+        &[NOTES],
+        placed(scope, envelope),
+        |sync| sync.catch_up(NOTES),
+    )
+    .unwrap();
+    assert_eq!(caught.alarms, vec![Alarm::Author { scope, position: 2 }]);
+    assert_eq!(caught.passed[0].why, Unusable::Author);
+    assert_eq!(count(&phones[0].light, NOTES, 99), None);
 }
 
 /// A8 and B8 for epochs: a push under an epoch since replaced is refused
@@ -726,7 +755,7 @@ fn a_stale_epoch_push_is_refused_and_one_placed_anyway_is_passed_over() {
     let (a, b) = phones.split_at_mut(1);
     let (a, b) = (&mut a[0], &mut b[0]);
     write(&mut home, a, &[NOTES], NOTES, 1);
-    let envelope = sealed_by(a, NOTES, &old_key, old, 7);
+    let envelope = sealed_by(a, NOTES, &old_key, old, 7, |_| {});
     assert_eq!(
         home.call(&a.sync, "push", envelope.encode())
             .answer::<Pushed>(),
@@ -772,7 +801,7 @@ fn a_backdated_envelope_past_its_frontier_is_refused() {
             .is_some_and(|(_, removed)| removed)
     );
 
-    let envelope = sealed_by(b, NOTES, &key, epoch, 7);
+    let envelope = sealed_by(b, NOTES, &key, epoch, 7, |_| {});
     let caught = shown(&mut home, a, &[NOTES], placed(scope, envelope), |sync| {
         sync.catch_up(NOTES)
     })
@@ -818,6 +847,17 @@ fn the_audit_of_a_devices_own_pushes_pushes_a_deleted_one_again() {
     })
     .unwrap();
     assert_eq!(caught.alarms, vec![Alarm::Withheld { scope, position: 2 }]);
+    assert_eq!(caught.waiting, Some(Waiting::Withheld(2)));
+    assert_eq!(
+        phones[1].light.cursor(NOTES).unwrap(),
+        Some(1),
+        "it stops at the gap"
+    );
+    let caught = with(&mut home, &mut phones[1], &[NOTES], |sync| {
+        sync.catch_up(NOTES)
+    })
+    .unwrap();
+    assert!(caught.alarms.is_empty(), "{:?}", caught.alarms);
     assert_eq!(count(&phones[1].light, NOTES, 2), Some(20));
 }
 
@@ -839,57 +879,65 @@ fn checkpoints_are_acknowledged_and_trusted_as_the_rules_say() {
         with(&mut home, phone, &[NOTES], |sync| sync.catch_up(NOTES)).unwrap();
     }
     // The third reads the scope as the operators show it: without the
-    // second's envelope, on which no node of the first's depends.
+    // second's envelope, on which no node of the first's depends, and
+    // numbered densely without it.
     let caught = shown(
         &mut home,
         &mut phones[2],
         &[NOTES],
-        |_, mut held| {
-            held.retain(|envelope| envelope.position != 1);
-            held
+        |_, held| {
+            held.into_iter()
+                .filter(|envelope| envelope.position != 1)
+                .enumerate()
+                .map(|(n, mut envelope)| {
+                    envelope.position = n as u64 + 1;
+                    envelope
+                })
+                .collect()
         },
         |sync| sync.catch_up(NOTES),
     )
     .unwrap();
-    assert_eq!(caught.alarms, vec![Alarm::Withheld { scope, position: 1 }]);
+    assert!(caught.alarms.is_empty(), "{:?}", caught.alarms);
 
     let made = with(&mut home, &mut phones[0], &[NOTES], |sync| {
         sync.checkpoint(NOTES)
     })
     .unwrap();
     assert_eq!((made.scope, made.position), (scope, 4));
-    let same = with(&mut home, &mut phones[1], &[NOTES], |sync| {
-        sync.checkpoint(NOTES)
-    })
-    .unwrap();
-    assert_eq!(same.hash, made.hash, "one position, one state");
     let wrong = with(&mut home, &mut phones[2], &[NOTES], |sync| {
         sync.checkpoint(NOTES)
     })
     .unwrap();
-    assert_ne!(wrong.hash, made.hash);
+    assert_eq!(wrong.position, 3);
 
+    // The second recomputes the first's from its own reading, one state at
+    // one position, and refuses the third's.
     let acked = with(&mut home, &mut phones[1], &[NOTES], |sync| {
         sync.acknowledge(NOTES)
     })
     .unwrap();
     assert_eq!(acked.acknowledged, vec![4]);
-    assert_eq!(acked.alarms, vec![Alarm::Checkpoint { scope, position: 4 }]);
+    assert_eq!(acked.alarms, vec![Alarm::Checkpoint { scope, position: 3 }]);
     let acked = with(&mut home, &mut phones[2], &[NOTES], |sync| {
         sync.acknowledge(NOTES)
     })
     .unwrap();
-    assert_eq!(acked.acknowledged, vec![4], "its own reading's");
-    assert_eq!(acked.alarms, vec![Alarm::Checkpoint { scope, position: 4 }]);
+    assert!(
+        acked.acknowledged.is_empty(),
+        "past its reading, and its own"
+    );
+    assert!(acked.alarms.is_empty());
 
-    // A device paired from the second starts from its checkpoint.
+    // A device paired from the second starts from the checkpoint it
+    // acknowledged.
     let mut paired = Phone::new(4);
     let package = DeviceGroup::key_package(&paired.store, &paired.keys, home.now).unwrap();
     let (prepared, mut pairing) = phones[1]
         .group()
         .pair(paired.keys.clone(), package, home.now)
         .unwrap();
-    pairing.trust(same);
+    pairing.trust(made);
     let pairing = Pairing::from_bytes(&pairing.to_bytes()).unwrap();
     paired.group = Some(DeviceGroup::join(&paired.store, paired.keys.clone(), pairing).unwrap());
     phones[1].send(&mut home, &prepared).unwrap();
@@ -906,9 +954,35 @@ fn checkpoints_are_acknowledged_and_trusted_as_the_rules_say() {
     let acked = with(&mut home, paired, &[NOTES], |sync| sync.acknowledge(NOTES)).unwrap();
     assert_eq!(acked.acknowledged, vec![4]);
 
+    // One handed a hash its content does not give refuses it, with the
+    // alarm, and reads the scope from its start.
+    let mut misled = Phone::new(5);
+    let package = DeviceGroup::key_package(&misled.store, &misled.keys, home.now).unwrap();
+    let (prepared, mut pairing) = phones[1]
+        .group()
+        .pair(misled.keys.clone(), package, home.now)
+        .unwrap();
+    pairing.trust(vos_light::group::Checkpoint {
+        hash: [0x0b; 32],
+        ..made
+    });
+    misled.group = Some(DeviceGroup::join(&misled.store, misled.keys.clone(), pairing).unwrap());
+    phones[1].send(&mut home, &prepared).unwrap();
+    phones.push(misled);
+    settle(&mut home, &mut phones);
+    let misled = &mut phones[4];
+    install(&misled.light, NOTES);
+    let caught = with(&mut home, misled, &[NOTES], |sync| sync.catch_up(NOTES)).unwrap();
+    assert_eq!(caught.started, None);
+    assert_eq!(
+        caught.alarms,
+        vec![Alarm::Checkpoint { scope, position: 4 }]
+    );
+    assert_eq!(caught.envelopes, 4);
+    assert_eq!(count(&misled.light, NOTES, 4), Some(40));
+
     // Every device lost: the restore's device trusts the checkpoint the
-    // second and the fourth acknowledged, not the one only its maker's
-    // reading gives.
+    // second and the fourth acknowledged, not the third's, which none did.
     let mut restored = Phone::new(9);
     assert!(restored.store.adopt(phones[0].group().archive()).unwrap());
     let next = kit(1);

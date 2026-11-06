@@ -500,7 +500,11 @@ pub(crate) struct Made {
 impl Made {
     /// Whether it is a veto of the operation at `op`.
     pub(crate) fn vetoes(&self, op: u64) -> bool {
-        self.method == crate::call::method_id("veto") && self.arguments == op.encode()
+        self.vetoes_any() && self.arguments == op.encode()
+    }
+
+    fn vetoes_any(&self) -> bool {
+        self.method == crate::call::method_id("veto")
     }
 }
 
@@ -1076,6 +1080,7 @@ impl DeviceGroup {
     /// The agent took this device's admin call, signed as `message`, at
     /// log index `index`: the log must hold that call there, and a veto in
     /// it holds its operation back until it does ([`Alarm::Dropped`]).
+    /// Given before the device follows the log past `index`.
     pub fn made(&mut self, index: u64, message: &[u8]) -> Result<(), GroupError> {
         let Some(signed) = CallMessage::parse(message) else {
             return Ok(());
@@ -1092,8 +1097,12 @@ impl DeviceGroup {
             arguments: signed.arguments,
             dropped: false,
         });
-        if made.len() > MADE {
-            made.remove(0);
+        // A veto holding its operation back is kept past the bound: the
+        // open operations bound them.
+        if made.len() > MADE
+            && let Some(oldest) = made.iter().position(|made| !made.vetoes_any())
+        {
+            made.remove(oldest);
         }
         let writes = self.writes(false);
         self.mls.write(writes)?;
@@ -1142,12 +1151,26 @@ impl DeviceGroup {
         if next < self.state.next || (next == self.state.next && chain != self.state.chain) {
             alarms.push(Alarm::Rollback { next });
         }
-        if next <= self.state.next && !self.state.views.is_empty() {
-            for (index, _) in self.state.views.drain(..) {
-                alarms.push(Alarm::View { index });
+        if next <= self.state.next {
+            let views = std::mem::take(&mut self.state.views);
+            alarms.extend(views.iter().map(|(index, _)| Alarm::View { index: *index }));
+            // A call the agent said it took at an index its log does not
+            // reach.
+            let mut changed = !views.is_empty();
+            for made in &mut self.state.made {
+                if made.index >= next && !made.dropped {
+                    alarms.push(Alarm::Dropped { index: made.index });
+                    made.dropped = true;
+                    changed = true;
+                }
             }
-            let writes = self.writes(false);
-            self.mls.write(writes)?;
+            self.state
+                .made
+                .retain(|made| !made.dropped || made.vetoes_any());
+            if changed {
+                let writes = self.writes(false);
+                self.mls.write(writes)?;
+            }
         }
         Ok(alarms)
     }
