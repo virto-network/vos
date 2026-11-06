@@ -106,6 +106,13 @@ impl Nodes {
                     leader.set(replicas[(at + 1) % replicas.len()]);
                     smol::Timer::after(Duration::from_millis(100)).await;
                 }
+                // No answer: the next call tries the next replica, this
+                // one's fate unknown.
+                Err(_) => {
+                    let at = replicas.iter().position(|r| *r == node).unwrap_or(0);
+                    leader.set(replicas[(at + 1) % replicas.len()]);
+                    return answer;
+                }
                 _ => return answer,
             }
         }

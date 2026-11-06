@@ -69,20 +69,19 @@ pub fn summary(run: &Run) -> Option<String> {
         .max();
     let _ = writeln!(
         out,
-        "  each node's RSS: before the creation, after it, and at the load's end; per personal replica it holds"
+        "  each node's RSS: before the creation, after it, and at the load's end (or the fill's start); per personal replica it holds, the shard load's growth included: set it against the run without personal agents"
     );
     let hosts_dir = run.dir.join("hosts");
-    let inventory = crate::inventory::Inventory::read(&run.file("inventory.toml"), &[]).ok();
-    let nodes: Vec<String> = inventory
-        .as_ref()
-        .map(|inventory| {
-            inventory
-                .nodes()
-                .iter()
-                .map(|host| host.name.clone())
-                .collect()
-        })
-        .unwrap_or_default();
+    let nodes = &personals.nodes;
+    let fill = std::fs::read_to_string(run.file("fill.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Fill>(&text).ok());
+    // The load's end, or the fill's start when the run filled an agent:
+    // its 64 MiB are no personal replica's idle cost.
+    let load_end = match &fill {
+        Some(fill) => Some(load_end.map_or(fill.from_ms, |end| end.min(fill.from_ms))),
+        None => load_end,
+    };
     for (at, name) in nodes.iter().enumerate() {
         let number = at as u8 + 1;
         let replicas = personals
@@ -157,10 +156,24 @@ pub fn summary(run: &Run) -> Option<String> {
             }
         }
     }
-    if let Some(fill) = std::fs::read_to_string(run.file("fill.json"))
+    if let Some(sessions) = std::fs::read_to_string(run.file("personal-sessions.json"))
         .ok()
-        .and_then(|text| serde_json::from_str::<Fill>(&text).ok())
+        .and_then(|text| serde_json::from_str::<Vec<serde_json::Value>>(&text).ok())
+        .filter(|sampled| !sampled.is_empty())
     {
+        let held: Vec<u64> = sessions
+            .iter()
+            .filter_map(|one| one["sessions"].as_u64())
+            .collect();
+        let _ = writeln!(
+            out,
+            "  sessions held at the load's end by {} sampled agents' leaders: {} at most, {:.1} on average",
+            held.len(),
+            held.iter().max().unwrap_or(&0),
+            held.iter().sum::<u64>() as f64 / held.len().max(1) as f64
+        );
+    }
+    if let Some(fill) = fill {
         let _ = writeln!(
             out,
             "  the fill: agent {}, {} envelopes, {:.1} MiB in {:.1} s (push p50 {} us, p99 {} us), stopped by {:?}",
@@ -193,6 +206,13 @@ pub fn summary(run: &Run) -> Option<String> {
             fill.error
                 .as_ref()
                 .map_or(String::new(), |error| format!("; error: {error}"))
+        );
+        let _ = writeln!(
+            out,
+            "    the gate (filled to the quota, the spare's snapshot past the leader's commit {} before the fill, installed within {} ms): {}",
+            fill.commit_before,
+            super::fill::INSTALL_LIMIT_MS,
+            if fill.passed { "met" } else { "MISSED" }
         );
     }
     Some(out)

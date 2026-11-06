@@ -83,6 +83,9 @@ pub struct Personals {
     /// Agents whose device's sync key read the agent's overview through
     /// the onion once they were all created.
     pub admitted: u64,
+    /// The node hosts' names, in node order.
+    #[serde(default)]
+    pub nodes: Vec<String>,
 }
 
 impl Personals {
@@ -375,6 +378,11 @@ pub fn create(inventory: &Inventory, request: &Request) -> Result<Personals, Str
         created_from_ms,
         created_to_ms: 0,
         admitted: 0,
+        nodes: inventory
+            .nodes()
+            .iter()
+            .map(|host| host.name.clone())
+            .collect(),
     };
     personals.admitted = onion::admitted(
         &deployed.nodes,
@@ -392,4 +400,43 @@ pub fn create(inventory: &Inventory, request: &Request) -> Result<Personals, Str
     );
     personals.write(inventory)?;
     Ok(personals)
+}
+
+/// The personal agents a sessions' sample reads.
+const SAMPLED: usize = 64;
+
+/// The sessions a sample of the personal agents' leaders hold now, into
+/// the run's `personal-sessions.json`: opened by the wakes, swept an hour
+/// after each opened.
+pub fn sample_sessions(inventory: &Inventory, run: &crate::runs::Run) -> Result<(), String> {
+    let Some(personals) = Personals::read(inventory) else {
+        return Ok(());
+    };
+    let deployed = Deployed::read(inventory)?;
+    let operators = operators(inventory, &deployed)?;
+    let step = (personals.agents.len() / SAMPLED).max(1);
+    let sampled: Vec<serde_json::Value> = personals
+        .agents
+        .iter()
+        .step_by(step)
+        .take(SAMPLED)
+        .filter_map(|member| {
+            member.replicas.iter().find_map(|replica| {
+                match operators[usize::from(*replica) - 1].status(AgentId(member.agent)) {
+                    Ok(Response::Status(status)) if status.leads => Some(serde_json::json!({
+                        "agent": member.agent,
+                        "sessions": status.sessions,
+                        "log_start": status.log_start,
+                        "applied": status.applied,
+                    })),
+                    _ => None,
+                }
+            })
+        })
+        .collect();
+    std::fs::write(
+        run.file("personal-sessions.json"),
+        serde_json::to_string_pretty(&sampled).expect("json"),
+    )
+    .map_err(|error| error.to_string())
 }

@@ -505,6 +505,9 @@ fn drive_and_poll(
                 personal: wakes,
             },
         );
+        if let Err(error) = personal::sample_sessions(inventory, run) {
+            eprintln!("the personal agents' sessions: {error}");
+        }
         // One more interval of polls past the load's end.
         let _ = hosts::wait_for(
             "the last poll",

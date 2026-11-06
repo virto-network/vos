@@ -39,6 +39,9 @@ const INSTALLED: Duration = Duration::from_secs(300);
 pub struct Fill {
     pub agent: u32,
     pub from_ms: u64,
+    /// The leader's commit before the fill: a snapshot past it holds the
+    /// fill's envelopes.
+    pub commit_before: u64,
     pub pushes: u64,
     pub bytes: u64,
     pub fill_ms: u64,
@@ -63,6 +66,27 @@ pub struct Fill {
     pub served: Option<(u64, u64)>,
     pub error: Option<String>,
     pub to_ms: u64,
+    /// The gate: filled to the quota, the spare's replica installed from a
+    /// snapshot past the fill, within 30 s of the replacement's start.
+    pub passed: bool,
+}
+
+/// The longest a full agent's snapshot may take to install.
+pub const INSTALL_LIMIT_MS: u64 = 30_000;
+
+/// The replica of `agent` that leads in the latest term among `replicas`.
+fn leader_of(
+    operators: &[Operator],
+    agent: AgentId,
+    replicas: &[u8],
+) -> Option<(u8, ReplicaStatus)> {
+    replicas
+        .iter()
+        .filter_map(|replica| {
+            let status = status(&operators[usize::from(*replica) - 1], agent)?;
+            status.leads.then_some((*replica, status))
+        })
+        .max_by_key(|(_, status)| status.term)
 }
 
 fn status(operator: &Operator, agent: AgentId) -> Option<ReplicaStatus> {
@@ -91,7 +115,7 @@ fn push_full(
                     let mut mix = Mix(seed ^ (0xf111 + session as u64));
                     let mut name = [0; 16];
                     name[..8].copy_from_slice(&mix.next().to_le_bytes());
-                    let opened = device.session(name, nodes.now());
+                    let mut opened = device.session(name, nodes.now());
                     let mut sequence = 1;
                     let mut latency = Histogram::default();
                     let mut pushed = (0u64, 0u64);
@@ -104,8 +128,16 @@ fn push_full(
                             .call(device.agent, &device.replicas, &device.leader, &call)
                             .await;
                         latency.record(sent.elapsed().as_micros() as u64);
-                        if let Ok(Response::Ran { .. }) = answer {
-                            sequence += 1;
+                        match &answer {
+                            Ok(Response::Ran { .. }) => sequence += 1,
+                            // Its fate unknown, the push may have spent
+                            // the sequence: a new session goes on.
+                            Err(_) => {
+                                name[8..].copy_from_slice(&mix.next().to_le_bytes());
+                                opened = device.session(name, nodes.now());
+                                sequence = 1;
+                            }
+                            Ok(_) => {}
                         }
                         match Answer::<Pushed>::of(&answer) {
                             Answer::Reply(_) => {
@@ -161,15 +193,6 @@ fn fill_and_replace(
     let device = Rc::new(Device::sync(personals.seed, full));
     let agent = AgentId(full.agent);
     fill.agent = full.agent;
-    push_full(&nodes, &device, personals.seed, fill)?;
-    eprintln!(
-        "the fill: agent {} took {} envelopes, {:.1} MiB, in {:.1} s; stopped by {:?}",
-        full.agent,
-        fill.pushes,
-        fill.bytes as f64 / (1 << 20) as f64,
-        fill.fill_ms as f64 / 1e3,
-        fill.stopped_by
-    );
     let operators: Vec<Operator> = inventory
         .nodes()
         .iter()
@@ -180,17 +203,25 @@ fn fill_and_replace(
             crate::nodes::operator(inventory, node, Duration::from_secs(90))
         })
         .collect::<Result<_, String>>()?;
+    fill.commit_before =
+        leader_of(&operators, agent, &full.replicas).map_or(0, |(_, status)| status.commit);
+    push_full(&nodes, &device, personals.seed, fill)?;
+    eprintln!(
+        "the fill: agent {} took {} envelopes, {:.1} MiB, in {:.1} s; stopped by {:?}",
+        full.agent,
+        fill.pushes,
+        fill.bytes as f64 / (1 << 20) as f64,
+        fill.fill_ms as f64 / 1e3,
+        fill.stopped_by
+    );
     // The leader's log compacted past the fill: a new replica needs its
     // snapshot.
     let compacting = Instant::now();
     let mut leading = None;
     while compacting.elapsed() < COMPACTED && !crate::hosts::interrupted() {
-        leading = full.replicas.iter().find_map(|replica| {
-            let status = status(&operators[usize::from(*replica) - 1], agent)?;
-            status.leads.then_some((*replica, status))
-        });
+        leading = leader_of(&operators, agent, &full.replicas);
         if let Some((_, status)) = &leading
-            && status.log_start > 0
+            && status.log_start > fill.commit_before
         {
             fill.compacted_ms = Some(compacting.elapsed().as_millis() as u64);
             break;
@@ -201,6 +232,12 @@ fn fill_and_replace(
     fill.leader = Some(leader);
     fill.leader_commit = led.commit;
     fill.leader_log_start = led.log_start;
+    if fill.compacted_ms.is_none() {
+        eprintln!(
+            "the fill: the leader's log not compacted past the fill within {} s: the spare may replay it",
+            COMPACTED.as_secs()
+        );
+    }
     let spare = inventory
         .nodes()
         .iter()
@@ -287,6 +324,13 @@ pub fn fill_at(
         fill.error = Some(error);
     }
     fill.to_ms = crate::now_ms();
+    fill.passed = fill.error.is_none()
+        && fill.stopped_by.contains_key("Quota")
+        && fill.bytes + MAX_ENVELOPE as u64 > super::policy().bytes_new
+        && fill
+            .installed
+            .is_some_and(|(log_start, _)| log_start > fill.commit_before)
+        && fill.installed_ms.is_some_and(|ms| ms <= INSTALL_LIMIT_MS);
     std::fs::write(
         run.file("fill.json"),
         serde_json::to_string_pretty(&fill).expect("json"),
