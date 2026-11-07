@@ -2,12 +2,12 @@
 //! its gateway, for a phone that reaches the SSH port (through `adb reverse`)
 //! as `anonymous@ADDRESS`. The operator's commands come on standard input:
 //!
-//! - `invite MEMBER ROW OWNER`: invite the member digest into the
-//!   credential actor's tree and the row `ROW` for the owner digest, both as
-//!   the phone's Enroll screen shows them;
-//! - `mint ROW AMOUNT`; `balance ROW`; `quit`.
+//! - `invite MEMBER ACCOUNT OWNER`: invite the member digest into the
+//!   credential actor's tree and the account `ACCOUNT` for the owner
+//!   digest, both as the phone's Enroll screen shows them;
+//! - `mint ACCOUNT AMOUNT`; `balance ACCOUNT`; `quit`.
 //!
-//! The space starts with a row `shop` of another owner, to pay to. The
+//! The space starts with an account `shop` of another owner, to pay to. The
 //! node's and the gateway's logs go to standard error.
 
 use std::path::PathBuf;
@@ -25,21 +25,23 @@ fn digest(text: &str) -> Result<[u8; 32], String> {
 fn command(space: &LocalSpace, line: &str) -> Result<String, String> {
     let words: Vec<&str> = line.split_whitespace().collect();
     match words.as_slice() {
-        ["invite", member, row, owner] => {
-            space.invite(digest(member)?, row, digest(owner)?)?;
-            Ok(format!("invited the member and the row {row}"))
+        ["invite", member, account, owner] => {
+            space.invite(digest(member)?, account, digest(owner)?)?;
+            Ok(format!("invited the member and the account {account}"))
         }
-        ["mint", row, amount] => {
+        ["mint", account, amount] => {
             let amount = amount.parse().map_err(|_| "the amount is a number")?;
-            space.mint(row, amount)?;
-            Ok(format!("minted {amount} to {row}"))
+            space.mint(account, amount)?;
+            Ok(format!("minted {amount} to {account}"))
         }
-        ["balance", row] => Ok(match space.balance(row)? {
-            Some(balance) => format!("{row}: {balance}"),
-            None => format!("no row {row}"),
+        ["balance", account] => Ok(match space.balance(account)? {
+            Some(balance) => format!("{account}: {balance}"),
+            None => format!("no account {account}"),
         }),
         [] => Ok(String::new()),
-        _ => Err("invite MEMBER ROW OWNER | mint ROW AMOUNT | balance ROW | quit".into()),
+        _ => {
+            Err("invite MEMBER ACCOUNT OWNER | mint ACCOUNT AMOUNT | balance ACCOUNT | quit".into())
+        }
     }
 }
 
@@ -86,7 +88,7 @@ fn main() -> Result<(), String> {
     let data = data.ok_or("--data DIR, an empty directory")?;
     std::fs::create_dir_all(&data).map_err(|error| error.to_string())?;
     let space = LocalSpace::found(&data, random(), random())?;
-    space.open_row("shop", random::<32>().map(|byte| byte & 0x3f), 0)?;
+    space.open_account("shop", random::<32>().map(|byte| byte & 0x3f), 0)?;
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
     runtime.block_on(async {
         let listener = tokio::net::TcpListener::bind(&ssh)

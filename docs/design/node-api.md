@@ -553,7 +553,7 @@ could replay, and a relay keeps nothing it can reuse.
   connection when full.
 - **The s4 app's client key:** `app.key`, an ordinary VOS client key
   apart from `gateway.key`, with which the gateway's s4 app sends the
-  claims (`claim(member)`, `claim_row`) of members with no key of their
+  claims (`claim(member)`, `open`) of members with no key of their
   own; its authority is the registrar's invitations, which name the
   digests. Its calls run in one session per agent, so the app sends one
   claim at a time to an agent, in order.

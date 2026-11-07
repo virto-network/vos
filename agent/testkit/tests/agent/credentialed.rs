@@ -5,10 +5,12 @@
 //! and forgotten by the sweep; a `once` nullifier recorded only on `Ok`;
 //! the guards (an origin admitted by its guard alone, an auth scope the
 //! guard's, a kernel guard's handler taking the claim first); the
-//! credential actor's row and its install's refusals; and the demo's
-//! ledger of named rows, paid by its owners' proofs.
+//! credential actor's row and its install's refusals; and the ledger,
+//! `Payments`, paid from by its owners' proofs.
 
-use vos_testkit::programs::{actor, actor_elf, credentials, credentials_elf, method};
+use vos_testkit::programs::{
+    actor, actor_elf, credentials, credentials_elf, method, payments, payments_elf,
+};
 use vos_wire::abi::cap::Target;
 use vos_wire::abi::{Failure, Refusal};
 use vos_wire::batch::{Admin, CredentialedInput, Input, Request};
@@ -23,7 +25,7 @@ use vos_wire::{Decode, Encode, SpaceId, WindowClock};
 use crate::common::{AGENT, ALICE, BOB, Node, failed, ran, refused};
 
 const CREDENTIALS: InstanceId = InstanceId(9);
-const PURSES: InstanceId = InstanceId(2);
+const PAYMENTS: InstanceId = InstanceId(2);
 const POLL: InstanceId = InstanceId(3);
 /// One role byte for both names: a principal holds one role, and `ALICE`
 /// is the registrar and the operator.
@@ -37,12 +39,12 @@ fn owner(seed: u32) -> Digest {
     credentials::digest(&[seed, 1, 2, 3, 4, 5, 6, 7])
 }
 
-/// A node holding the credential actor (a member enrolled), the purses'
-/// ledger and the poll, in `SPACE`; `ALICE` the registrar and the operator.
+/// A node holding the credential actor (a member enrolled), the ledger
+/// and the poll, in `SPACE`; `ALICE` the registrar and the operator.
 struct Agent {
     node: Node,
     credentials: Vec<u8>,
-    purses: Vec<u8>,
+    payments: Vec<u8>,
     poll: Vec<u8>,
     sessions: u64,
     nonce: u8,
@@ -72,7 +74,7 @@ impl Agent {
 
     fn on(mut node: Node) -> Self {
         let poll_elf = std::fs::read(actor_elf("poll")).unwrap();
-        let purses_elf = std::fs::read(actor_elf("purses")).unwrap();
+        let payments_elf = std::fs::read(payments_elf()).unwrap();
         let credentials_elf = std::fs::read(credentials_elf()).unwrap();
         // An auth guard needs the agent's credential actor.
         let before = Self::install(&mut node, POLL, &poll_elf, &[]);
@@ -97,9 +99,9 @@ impl Agent {
         assert_eq!(failed(&second), Failure::Credentials);
         // Its instance replaced by a program that is not one.
         let operator = [("operator", OPERATOR)];
-        let replaced = Self::install(&mut node, CREDENTIALS, &purses_elf, &operator);
+        let replaced = Self::install(&mut node, CREDENTIALS, &payments_elf, &operator);
         assert_eq!(failed(&replaced), Failure::Credentials);
-        for (instance, elf) in [(POLL, &poll_elf), (PURSES, &purses_elf)] {
+        for (instance, elf) in [(POLL, &poll_elf), (PAYMENTS, &payments_elf)] {
             let step = Self::install(&mut node, instance, elf, &operator);
             assert!(matches!(ran(&step).outcome, Outcome::Done(_)));
         }
@@ -113,7 +115,7 @@ impl Agent {
         let mut agent = Self {
             node,
             credentials: credentials(),
-            purses: actor("purses"),
+            payments: payments(),
             poll: actor("poll"),
             sessions: 0,
             nonce: 0,
@@ -128,7 +130,7 @@ impl Agent {
     fn program(&self, instance: InstanceId) -> &[u8] {
         match instance {
             CREDENTIALS => &self.credentials,
-            PURSES => &self.purses,
+            PAYMENTS => &self.payments,
             _ => &self.poll,
         }
     }
@@ -160,6 +162,21 @@ impl Agent {
             method: method(self.program(instance), name),
             arguments: arguments.encode(),
         })
+    }
+
+    /// `caller`'s request of the ledger's `name` with encoded `arguments`.
+    fn request_raw(
+        &mut self,
+        caller: Principal,
+        name: &str,
+        arguments: Vec<u8>,
+        time: u64,
+    ) -> Input {
+        let mut request = self.request(caller, PAYMENTS, name, (), time);
+        if let Input::Request(request) = &mut request {
+            request.arguments = arguments;
+        }
+        request
     }
 
     /// A proven call of `name` by `origin`, a fresh binding digest, good
@@ -231,22 +248,19 @@ impl Agent {
     }
 
     fn balance(&self, name: &str) -> Option<u64> {
-        self.query(PURSES, "balance", name.as_bytes().to_vec())
+        self.query(PAYMENTS, "balance", name.as_bytes().to_vec())
     }
 
-    /// A row `name` invited for `owner` and claimed, holding `amount`.
-    fn row(&mut self, time: u64, name: &str, owner: Digest, amount: u64) {
+    /// An account `name` invited for `owner` and opened, minted `amount`.
+    fn account(&mut self, time: u64, name: &str, owner: Digest, amount: u64) {
         let name = name.as_bytes().to_vec();
-        let invite = self.request(
-            ALICE,
-            PURSES,
-            "invite_row",
-            (name.clone(), owner, time),
-            time,
-        );
-        let claim = self.request(BOB, PURSES, "claim_row", (name.clone(), owner), time);
-        let mint = self.request(ALICE, PURSES, "mint", (name.clone(), amount), time);
-        self.done(time, vec![invite, claim, mint]);
+        let invite = self.request(ALICE, PAYMENTS, "invite", (name.clone(), owner, time), time);
+        let open = self.request(BOB, PAYMENTS, "open", (name.clone(), owner), time);
+        let mut inputs = vec![invite, open];
+        if amount > 0 {
+            inputs.push(self.request(ALICE, PAYMENTS, "mint", (name.clone(), amount), time));
+        }
+        self.done(time, inputs);
     }
 
     fn scope(&self, name: &str) -> Digest {
@@ -261,12 +275,19 @@ impl Agent {
     }
 }
 
-/// The purses' errors and the poll's, by their codec index.
+/// The ledger's errors and the poll's, by their codec index.
 const NOT_INVITED: u8 = 3;
 const EXPIRED: u8 = 4;
 const NOT_OWNER: u8 = 5;
 const FROZEN: u8 = 6;
-const NO_ROW: u8 = 2;
+const EXISTS: u8 = 1;
+const NO_ACCOUNT: u8 = 2;
+const INSUFFICIENT: u8 = 7;
+const BAD_NAME: u8 = 0;
+const OVERFLOW: u8 = 8;
+const BAD_OWNER: u8 = 10;
+const SAME_PAYEE: u8 = 11;
+const NO_AMOUNT: u8 = 12;
 const NO_CHOICE: u8 = 0;
 
 /// The handler's failure detail: its error's one byte.
@@ -285,62 +306,70 @@ fn writes(step: &Step) -> usize {
     ran(step).writes.len()
 }
 
-/// Owner proofs pay from their rows: the live owner's alone, nothing from a
-/// frozen row, a rekeyed row from its new owner; a transfer to a row that
-/// does not exist refused, the payer's balance kept; a claim of a digest
-/// the invitation does not name refused.
+/// Owner proofs pay from the accounts their digests hold: nothing from a
+/// digest that holds none or from a frozen account, a rekeyed account from
+/// its new owner; a transfer to an account that does not exist refused,
+/// the payer's balance kept; an opening for a digest the invitation does
+/// not name, or past its expiry, refused.
 #[test]
-fn owner_proofs_pay_from_the_rows_they_own() {
+fn owner_proofs_pay_from_the_accounts_they_hold() {
     let mut agent = Agent::new();
     let time = START + 10;
     let (alice, bob) = (owner(1), owner(2));
-    agent.row(time, "alice", alice, 100);
-    agent.row(time, "bob", bob, 0);
+    agent.account(time, "alice", alice, 100);
+    agent.account(time, "bob", bob, 0);
 
-    let pay = |agent: &mut Agent, by: Digest, from: &str, to: &str, amount: u64| {
-        let from = from.as_bytes().to_vec();
+    let pay = |agent: &mut Agent, by: Digest, to: &str, amount: u64| {
         let to = to.as_bytes().to_vec();
         let call = agent.call(
             Principal::Owner(by),
-            PURSES,
+            PAYMENTS,
             "transfer",
-            (from, to, amount),
+            (to, amount),
             time + 60_000,
             None,
         );
         agent.step(time, &call)
     };
     assert!(matches!(
-        ran(&pay(&mut agent, alice, "alice", "bob", 30)).outcome,
+        ran(&pay(&mut agent, alice, "bob", 30)).outcome,
         Outcome::Done(_)
     ));
     assert_eq!(
         (agent.balance("alice"), agent.balance("bob")),
         (Some(70), Some(30))
     );
-    let stranger = pay(&mut agent, bob, "alice", "bob", 1);
+    let stranger = pay(&mut agent, owner(7), "bob", 1);
     assert_eq!(detail(&stranger), NOT_OWNER);
     // Its binding digest recorded all the same, and its due row.
     assert_eq!(writes(&stranger), 2);
+    let short = pay(&mut agent, bob, "alice", 31);
+    assert_eq!(detail(&short), INSUFFICIENT);
+    assert_eq!(
+        agent.balance("bob"),
+        Some(30),
+        "an account never below zero"
+    );
 
-    let nowhere = pay(&mut agent, alice, "alice", "nobody", 5);
-    assert_eq!(detail(&nowhere), NO_ROW);
+    let nowhere = pay(&mut agent, alice, "nobody", 5);
+    assert_eq!(detail(&nowhere), NO_ACCOUNT);
     assert_eq!(agent.balance("alice"), Some(70), "the payer's balance kept");
 
-    let freeze = agent.request(ALICE, PURSES, "freeze", b"alice".to_vec(), time);
+    let freeze = agent.request(ALICE, PAYMENTS, "freeze", b"alice".to_vec(), time);
     agent.done(time, vec![freeze]);
-    let frozen = pay(&mut agent, alice, "alice", "bob", 1);
+    let frozen = pay(&mut agent, alice, "bob", 1);
     assert_eq!(detail(&frozen), FROZEN);
 
-    // A rekey moves the row to a new owner, its balance kept, the freeze
-    // lifted: the old owner's proof fails, the new one's pays.
+    // A rekey moves the account to a new owner, its balance kept, the
+    // freeze lifted: the old owner's proof holds nothing, the new one's
+    // pays.
     let renewed = owner(5);
-    let rekey = agent.request(ALICE, PURSES, "rekey", (b"alice".to_vec(), renewed), time);
+    let rekey = agent.request(ALICE, PAYMENTS, "rekey", (b"alice".to_vec(), renewed), time);
     agent.done(time, vec![rekey]);
-    let old = pay(&mut agent, alice, "alice", "bob", 1);
+    let old = pay(&mut agent, alice, "bob", 1);
     assert_eq!(detail(&old), NOT_OWNER);
     assert!(matches!(
-        ran(&pay(&mut agent, renewed, "alice", "bob", 20)).outcome,
+        ran(&pay(&mut agent, renewed, "bob", 20)).outcome,
         Outcome::Done(_)
     ));
     assert_eq!(
@@ -349,26 +378,108 @@ fn owner_proofs_pay_from_the_rows_they_own() {
     );
 
     // The operator's methods are under its role.
-    let mint = agent.request(BOB, PURSES, "mint", (b"bob".to_vec(), 1u64), time);
+    let mint = agent.request(BOB, PAYMENTS, "mint", (b"bob".to_vec(), 1u64), time);
     let result = agent.node.batch(time, vec![mint]);
     assert_eq!(failed(&result.steps[0]), Failure::Forbidden);
 
-    // The invitation names the digest: another's claim is refused.
+    // The invitation names the digest: another's opening is refused.
     let name = b"carol".to_vec();
     let invite = agent.request(
         ALICE,
-        PURSES,
-        "invite_row",
+        PAYMENTS,
+        "invite",
         (name.clone(), owner(3), time + 5),
         time,
     );
     agent.done(time, vec![invite]);
-    let wrong = agent.request(BOB, PURSES, "claim_row", (name.clone(), owner(4)), time);
-    let late = agent.request(BOB, PURSES, "claim_row", (name.clone(), owner(3)), time + 6);
+    let wrong = agent.request(BOB, PAYMENTS, "open", (name.clone(), owner(4)), time);
+    let late = agent.request(BOB, PAYMENTS, "open", (name.clone(), owner(3)), time + 6);
     let result = agent.node.batch(time, vec![wrong]);
     assert_eq!(detail(&result.steps[0]), NOT_INVITED);
     let result = agent.node.batch(time + 6, vec![late]);
     assert_eq!(detail(&result.steps[0]), EXPIRED);
+}
+
+/// The ledger's own refusals: a name or an owner it does not take, a
+/// second account for one digest, a rekey onto a digest that holds one, a
+/// payment to oneself or of nothing, a mint past `u64::MAX`; a frozen
+/// account still credited; a digest's own account read by it; and every
+/// balance the issuance's mints, so the ledger conserves.
+#[test]
+fn the_ledger_refuses_what_its_rules_refuse_and_conserves() {
+    let mut agent = Agent::new();
+    let time = START + 10;
+    let (alice, bob) = (owner(1), owner(2));
+    agent.account(time, "alice", alice, 100);
+    agent.account(time, "bob", bob, 5);
+    let refusal = |agent: &mut Agent, caller, name: &str, arguments: Vec<u8>| {
+        let request = agent.request_raw(caller, name, arguments, time);
+        let result = agent.node.batch(time, vec![request]);
+        detail(&result.steps[0])
+    };
+    let invite = |name: &[u8], owner: Digest| (name.to_vec(), owner, time + 5).encode();
+    assert_eq!(
+        refusal(&mut agent, ALICE, "invite", invite(b"", owner(3))),
+        BAD_NAME
+    );
+    assert_eq!(
+        refusal(&mut agent, ALICE, "invite", invite(b"a b", owner(3))),
+        BAD_NAME
+    );
+    assert_eq!(
+        refusal(&mut agent, ALICE, "invite", invite(b"carol", [0xff; 32])),
+        BAD_OWNER
+    );
+    assert_eq!(
+        refusal(&mut agent, ALICE, "invite", invite(b"bob2", bob)),
+        EXISTS
+    );
+    let rekey = |name: &[u8], owner: Digest| (name.to_vec(), owner).encode();
+    assert_eq!(
+        refusal(&mut agent, ALICE, "rekey", rekey(b"alice", bob)),
+        EXISTS
+    );
+    assert_eq!(
+        refusal(&mut agent, ALICE, "rekey", rekey(b"alice", [0xff; 32])),
+        BAD_OWNER
+    );
+    let mint = (b"bob".to_vec(), u64::MAX).encode();
+    assert_eq!(refusal(&mut agent, ALICE, "mint", mint), OVERFLOW);
+    let mint = (b"bob".to_vec(), 0u64).encode();
+    assert_eq!(refusal(&mut agent, ALICE, "mint", mint), NO_AMOUNT);
+
+    let pay = |agent: &mut Agent, to: &str, amount: u64| {
+        let call = agent.call(
+            Principal::Owner(alice),
+            PAYMENTS,
+            "transfer",
+            (to.as_bytes().to_vec(), amount),
+            time + 60_000,
+            None,
+        );
+        agent.step(time, &call)
+    };
+    assert_eq!(detail(&pay(&mut agent, "alice", 1)), SAME_PAYEE);
+    assert_eq!(detail(&pay(&mut agent, "bob", 0)), NO_AMOUNT);
+
+    // A frozen account takes credits; its debits wait for a rekey.
+    let freeze = agent.request(ALICE, PAYMENTS, "freeze", b"bob".to_vec(), time);
+    agent.done(time, vec![freeze]);
+    assert!(matches!(
+        ran(&pay(&mut agent, "bob", 10)).outcome,
+        Outcome::Done(_)
+    ));
+    let held: Option<(Vec<u8>, (Digest, u64, bool))> = agent.query(PAYMENTS, "held", bob);
+    assert_eq!(held, Some((b"bob".to_vec(), (bob, 15, true))));
+    let account: Option<(Digest, u64, bool)> = agent.query(PAYMENTS, "account", b"alice".to_vec());
+    assert_eq!(account, Some((alice, 90, false)));
+    let none: Option<(Vec<u8>, (Digest, u64, bool))> = agent.query(PAYMENTS, "held", owner(9));
+    assert_eq!(none, None);
+    // What was minted, 105, is what the accounts hold.
+    assert_eq!(
+        agent.balance("alice").unwrap() + agent.balance("bob").unwrap(),
+        105
+    );
 }
 
 /// An origin is admitted by its guard alone: an owner proof's to a method
@@ -378,10 +489,10 @@ fn owner_proofs_pay_from_the_rows_they_own() {
 fn an_origin_is_admitted_by_its_guard_alone() {
     let mut agent = Agent::new();
     let time = START + 10;
-    agent.row(time, "alice", owner(1), 10);
+    agent.account(time, "alice", owner(1), 10);
     let unguarded = agent.call(
         Principal::Owner(owner(1)),
-        PURSES,
+        PAYMENTS,
         "mint",
         (b"alice".to_vec(), 1u64),
         time + 1_000,
@@ -393,20 +504,14 @@ fn an_origin_is_admitted_by_its_guard_alone() {
     let anonymous = agent.anonymous("login", 1);
     let other = agent.call(
         anonymous,
-        PURSES,
+        PAYMENTS,
         "transfer",
-        (b"alice".to_vec(), b"alice".to_vec(), 1u64),
+        (b"alice".to_vec(), 1u64),
         time + 1_000,
         None,
     );
     assert_eq!(failed(&agent.step(time, &other)), Failure::Forbidden);
-    let client = agent.request(
-        BOB,
-        PURSES,
-        "transfer",
-        (b"alice".to_vec(), b"alice".to_vec(), 1u64),
-        time,
-    );
+    let client = agent.request(BOB, PAYMENTS, "transfer", (b"alice".to_vec(), 1u64), time);
     let result = agent.node.batch(time, vec![client]);
     assert_eq!(failed(&result.steps[0]), Failure::Forbidden);
     let grant = Input::Admin(Admin::SetRole(Grant {
@@ -430,12 +535,12 @@ fn an_origin_is_admitted_by_its_guard_alone() {
 fn apply_refuses_by_the_batchs_time_and_records_each_binding() {
     let mut agent = Agent::new();
     let time = START + 10;
-    agent.row(time, "alice", owner(1), 10);
-    agent.row(time, "bob", owner(2), 0);
-    let transfer = (b"alice".to_vec(), b"bob".to_vec(), 1u64);
+    agent.account(time, "alice", owner(1), 10);
+    agent.account(time, "bob", owner(2), 0);
+    let transfer = (b"bob".to_vec(), 1u64);
     let expired = agent.call(
         Principal::Owner(owner(1)),
-        PURSES,
+        PAYMENTS,
         "transfer",
         transfer.clone(),
         time - 1,
@@ -451,7 +556,7 @@ fn apply_refuses_by_the_batchs_time_and_records_each_binding() {
     );
     let call = agent.call(
         Principal::Owner(owner(1)),
-        PURSES,
+        PAYMENTS,
         "transfer",
         transfer.clone(),
         time,
@@ -476,7 +581,7 @@ fn apply_refuses_by_the_batchs_time_and_records_each_binding() {
     // Two copies in one batch: the second refused.
     let twice = agent.call(
         Principal::Owner(owner(1)),
-        PURSES,
+        PAYMENTS,
         "transfer",
         transfer,
         time,
@@ -755,14 +860,14 @@ fn a_kernel_guards_handler_takes_the_claim_first() {
 fn a_batch_runs_at_most_its_credentialed_calls() {
     let mut agent = Agent::new();
     let time = START + 10;
-    agent.row(time, "alice", owner(1), 100);
-    agent.row(time, "bob", owner(2), 0);
+    agent.account(time, "alice", owner(1), 100);
+    agent.account(time, "bob", owner(2), 0);
     let calls: Vec<CredentialedInput> = (0..=defaults::BATCH_CREDENTIALED)
         .map(|_| {
-            let transfer = (b"alice".to_vec(), b"bob".to_vec(), 1u64);
+            let transfer = (b"bob".to_vec(), 1u64);
             agent.call(
                 Principal::Owner(owner(1)),
-                PURSES,
+                PAYMENTS,
                 "transfer",
                 transfer,
                 time,

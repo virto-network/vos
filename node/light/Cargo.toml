@@ -72,3 +72,7 @@ mls-rs-crypto-rustcrypto = { version = "=0.22.1", default-features = false }
 [[test]]
 name = "crash"
 harness = false
+
+[[example]]
+name = "devices"
+required-features = ["release"]

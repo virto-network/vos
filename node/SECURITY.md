@@ -303,7 +303,7 @@ facility (`identity-and-authority.md` §7):
   request as it is, after checking it names the demo's agent and the
   screen's instance and method; any other is refused before a node sees
   it. It holds no credential bytes, builds none, and its app key sends only
-  the claims (`claim(member)`, `claim_row`) the operator's invitations name.
+  the claims (`claim(member)`, `open`) the operator's invitations name.
   The binding names the space, so a proof made for another space fails the
   node's `Binding` check whoever relays it.
 - **The enrollment's digests** are shown in the client's chrome, never in

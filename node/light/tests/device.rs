@@ -289,21 +289,14 @@ fn a_method_id_and_a_transfer_s_arguments_are_the_node_s() {
         vos_light::method_id("transfer"),
         derive_id("vos/method/", "transfer")
     );
-    let arguments = vos_light::transfer_arguments("alice", "bob", 7);
+    let arguments = vos_light::transfer_arguments("bob", 7);
     assert_eq!(
         arguments,
-        [
-            &5u32.to_le_bytes()[..],
-            b"alice",
-            &3u32.to_le_bytes(),
-            b"bob",
-            &7u64.to_le_bytes(),
-        ]
-        .concat()
+        [&3u32.to_le_bytes()[..], b"bob", &7u64.to_le_bytes()].concat()
     );
     assert_eq!(
-        <(Vec<u8>, Vec<u8>, u64)>::decode(&arguments).unwrap(),
-        ((b"alice".to_vec(), b"bob".to_vec(), 7), arguments.len())
+        <(Vec<u8>, u64)>::decode(&arguments).unwrap(),
+        ((b"bob".to_vec(), 7), arguments.len())
     );
 }
 

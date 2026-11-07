@@ -6,7 +6,7 @@
 //! a root a replica has not applied, one replaced at its own batch time
 //! and one pushed out of the ring, each `RootUnknown` and admitted after a
 //! path refetch; a revoked member's root refused once `ROOT_MAX_AGE` has
-//! passed by batch time; owner proofs paying from their rows; no log entry
+//! passed by batch time; owner proofs paying from their accounts; no log entry
 //! holding a proof; a verified call holding no large body's place while it
 //! waits to apply; the device library's requests and proofs admitted as
 //! they leave it; an actor's own kernel's proof run by its handler on its
@@ -19,7 +19,9 @@ use std::time::Duration;
 use ed25519_dalek::SigningKey;
 use vos_checker::Nodes;
 use vos_checker::calls::installed;
-use vos_checker::programs::{actor, actor_elf, credentials, credentials_elf, method};
+use vos_checker::programs::{
+    actor, actor_elf, credentials, credentials_elf, method, payments, payments_elf,
+};
 use vos_light::release::Device;
 use vos_light::{AuthWitness, Call, DEVICE_FORMAT, DeviceProgram, Prover, ProverConfig, Threads};
 use vos_node::client::{self, Client};
@@ -40,7 +42,7 @@ use crate::harness::{Cluster, NODES};
 /// The hub's seed: odd, so clients reach the nodes over the API's sockets.
 const SEED: u64 = 11;
 const CREDENTIALS: InstanceId = InstanceId(9);
-const PURSES: InstanceId = InstanceId(2);
+const PAYMENTS: InstanceId = InstanceId(2);
 const POLL: InstanceId = InstanceId(3);
 /// The registrar's and the operator's role byte: one key holds both.
 const ROLE: u8 = 1;
@@ -85,7 +87,7 @@ fn witness(path: &Path) -> AuthWitness {
 }
 
 /// The founded space's agent: the credential actor, the poll and the
-/// purses' ledger installed, the operator's key their registrar and
+/// ledger installed, the operator's key their registrar and
 /// operator, the actor founded; the stock kernels' programs, from their
 /// release artifacts, and a prover.
 struct Founded {
@@ -95,7 +97,7 @@ struct Founded {
     operator: Mutex<Client>,
     credentials: Vec<u8>,
     poll: Vec<u8>,
-    purses: Vec<u8>,
+    payments: Vec<u8>,
     nonce: AtomicU64,
     auth: DeviceProgram,
     owner: DeviceProgram,
@@ -115,7 +117,7 @@ impl Founded {
         let installs = [
             (CREDENTIALS, credentials_elf.clone(), "registrar"),
             (POLL, elf(actor_elf("poll")), "operator"),
-            (PURSES, elf(actor_elf("purses")), "operator"),
+            (PAYMENTS, elf(payments_elf()), "operator"),
         ];
         for (instance, elf, role) in installs {
             install(&cluster, agent, instance, &elf, role);
@@ -141,7 +143,7 @@ impl Founded {
             operator: Mutex::new(operator),
             credentials: credentials(),
             poll: actor("poll"),
-            purses: actor("purses"),
+            payments: payments(),
             nonce: AtomicU64::new(0),
             auth: program("auth"),
             owner: program("owner"),
@@ -159,7 +161,7 @@ impl Founded {
         match instance {
             CREDENTIALS => &self.credentials,
             POLL => &self.poll,
-            _ => &self.purses,
+            _ => &self.payments,
         }
     }
 
@@ -284,17 +286,10 @@ impl Founded {
         request(&call, proof)
     }
 
-    /// An owner call of the purses' `transfer`, by `secret`.
-    fn pay(
-        &self,
-        at: NodeNumber,
-        secret: &Secret,
-        from: &str,
-        to: &str,
-        amount: u64,
-    ) -> Credentialed {
-        let arguments = (from.as_bytes().to_vec(), to.as_bytes().to_vec(), amount);
-        let call = self.call(at, PURSES, "transfer", arguments);
+    /// An owner call of the ledger's `transfer`, by `secret`.
+    fn pay(&self, at: NodeNumber, secret: &Secret, to: &str, amount: u64) -> Credentialed {
+        let arguments = (to.as_bytes().to_vec(), amount);
+        let call = self.call(at, PAYMENTS, "transfer", arguments);
         let proof = self
             .prover
             .prove_owner(&secret.0, &call, &self.owner)
@@ -346,7 +341,7 @@ impl Founded {
     /// Move every node's clock on by `ms`, and apply a batch after it.
     fn later(&self, ms: i64) {
         self.cluster.offset.fetch_add(ms, Ordering::SeqCst);
-        self.write(PURSES, "invite_row", (b"tick".to_vec(), [1u8; 32], 0u64));
+        self.write(PAYMENTS, "invite", (b"tick".to_vec(), [1u8; 32], 0u64));
     }
 
     fn follower(&self) -> NodeNumber {
@@ -782,9 +777,10 @@ fn an_unknown_root_is_retried_on_a_path_fetched_again() {
 /// A revoked member's proof on the root before its revocation is admitted
 /// within `ROOT_MAX_AGE` of the revoking batch, and refused `RootStale`
 /// once that has passed by the replica's latest batch time; owner proofs
-/// pay from the rows they own, and a rekeyed row from its new owner's.
+/// pay from the accounts they hold, and a rekeyed account from its new
+/// owner's.
 #[test]
-fn a_revoked_members_root_goes_stale_and_owners_pay_their_rows() {
+fn a_revoked_members_root_goes_stale_and_owners_pay_from_their_accounts() {
     let founded = Founded::new();
     let at = founded.follower();
     let member = Secret::new(6);
@@ -807,14 +803,14 @@ fn a_revoked_members_root_goes_stale_and_owners_pay_their_rows() {
     let expires = client::time(founded.cluster.target(1)).unwrap() + 60_000;
     for (name, owner) in [("alice", alice.owner()), ("bob", Secret::new(9).owner())] {
         let name = name.as_bytes().to_vec();
-        founded.write(PURSES, "invite_row", (name.clone(), owner, expires));
-        founded.write(PURSES, "claim_row", (name.clone(), owner));
-        founded.write(PURSES, "mint", (name, 50u64));
+        founded.write(PAYMENTS, "invite", (name.clone(), owner, expires));
+        founded.write(PAYMENTS, "open", (name.clone(), owner));
+        founded.write(PAYMENTS, "mint", (name, 50u64));
     }
-    let paid = founded.pay(at, &alice, "alice", "bob", 20);
+    let paid = founded.pay(at, &alice, "bob", 20);
     done(&founded.send(at, &paid));
-    founded.write(PURSES, "rekey", (b"alice".to_vec(), renewed.owner()));
-    let old = founded.pay(at, &alice, "alice", "bob", 1);
+    founded.write(PAYMENTS, "rekey", (b"alice".to_vec(), renewed.owner()));
+    let old = founded.pay(at, &alice, "bob", 1);
     match founded.send(at, &old) {
         Response::Ran {
             outcome: Outcome::Failed { .. },
@@ -822,8 +818,8 @@ fn a_revoked_members_root_goes_stale_and_owners_pay_their_rows() {
         } => {}
         other => panic!("the old owner's proof: {other:?}"),
     }
-    done(&founded.send(at, &founded.pay(at, &renewed, "alice", "bob", 5)));
-    let balance: Option<u64> = founded.read(PURSES, "balance", b"bob".to_vec());
+    done(&founded.send(at, &founded.pay(at, &renewed, "bob", 5)));
+    let balance: Option<u64> = founded.read(PAYMENTS, "balance", b"bob".to_vec());
     assert_eq!(balance, Some(75));
 }
 
@@ -854,7 +850,8 @@ fn device_send(founded: &Founded, at: NodeNumber, request: &[u8]) -> Vec<u8> {
 /// The device library's scope is ingress's, the vector on both sides; its
 /// path query, its auth and owner proofs and its requests are admitted by
 /// a follower's ingress as they leave it, the poll's `ctx.nullifier` the
-/// library's, and the purses paying from the row its owner digest claims;
+/// library's, and the ledger paying from the account its owner digest
+/// holds;
 /// a `RootUnknown` answer decodes as the library's.
 #[test]
 fn the_device_librarys_proofs_are_admitted() {
@@ -1023,21 +1020,21 @@ fn the_device_librarys_proofs_are_admitted() {
         })
     ));
 
-    // An owner proof pays from the row its digest claims.
+    // An owner proof pays from the account its digest holds.
     let owner = vos_light::owner(&secret).to_bytes();
     let expires = time() + 60_000;
-    for (row, digest) in [("device", owner), ("shop", Secret::new(9).owner())] {
-        let row = row.as_bytes().to_vec();
-        founded.write(PURSES, "invite_row", (row.clone(), digest, expires));
-        founded.write(PURSES, "claim_row", (row.clone(), digest));
-        founded.write(PURSES, "mint", (row, 50u64));
+    for (name, digest) in [("device", owner), ("shop", Secret::new(9).owner())] {
+        let name = name.as_bytes().to_vec();
+        founded.write(PAYMENTS, "invite", (name.clone(), digest, expires));
+        founded.write(PAYMENTS, "open", (name.clone(), digest));
+        founded.write(PAYMENTS, "mint", (name, 50u64));
     }
-    let arguments = (b"device".to_vec(), b"shop".to_vec(), 20u64).encode();
+    let arguments = vos_light::transfer_arguments("shop", 20);
     let pay = vos_light::Call::new(
         space,
         agent.0,
-        PURSES.0,
-        founded.method(PURSES, "transfer").0,
+        PAYMENTS.0,
+        founded.method(PAYMENTS, "transfer").0,
         arguments,
         time() + 60_000,
     )
@@ -1054,7 +1051,7 @@ fn the_device_librarys_proofs_are_admitted() {
         ),
         "the device's payment: {answer:?}"
     );
-    let balance: Option<u64> = founded.read(PURSES, "balance", b"shop".to_vec());
+    let balance: Option<u64> = founded.read(PAYMENTS, "balance", b"shop".to_vec());
     assert_eq!(balance, Some(70));
 }
 
