@@ -316,7 +316,12 @@ proves and the kernel's claim.
     nullifier is refused (`CredentialRefusal::Once` at ingress,
     `Refusal::Once` at apply). A new round takes a new name, so a new
     scope. `once` needs an `Auth` guard and is part of
-    `CredentialGuard::Auth`.
+    `CredentialGuard::Auth`. Each of a member's devices holds a secret of
+    its own (`light-node.md` E2), so a leaf and a nullifier of its own:
+    `once` admits a member **once a device** [decided], which the space's
+    chrome states; a member with three devices votes three times. One
+    admission a person, a ring of person leaves, is later work
+    (`light-node.md` §9.3).
 - **Ingress's checks, in order,** each cheap one before any dearer, every
   state read on this replica's applied state; each refusal is
   `Rejected(Credential(code))` (index 9 of `Rejection`), `code` a
@@ -527,6 +532,14 @@ across a space's agents wait for the identity agent above.
     a root and the batch time it became the tree's root;
   - `opening`: one row once the registrar opened the open claim, its
     terms, its salts' seed, and the current period with its count;
+  - `persons`: a person's id, a `u32` → its record: its limit and each
+    device's `member` and `owner` digests, the first the one the registrar
+    registered;
+  - `owners`: a confirmed device's `owner` digest → its person's id;
+    `pending`: an enrolled device's `owner` digest awaiting its own proof
+    → its person's id; `devices`: a device's `member` digest → its
+    person's id;
+  - `people`: one row, the persons ever registered, the next one's id;
   - its struct: `handle`, `next` (the lowest slot never used) and `count`
     (the members enrolled).
 - **The ring:** a write whose batch time equals the newest entry's
@@ -582,6 +595,44 @@ across a space's agents wait for the identity agent above.
     (the `opening` row);
   - `revoke(member)`, role `registrar`: the leaf back to the empty leaf,
     the slot freed; for a member only invited, the invitation withdrawn;
+    either way the member dropped from its person, and the person with it
+    once it holds no device;
+  - **persons** (`light-node.md` §3.8): each device of a member derives
+    its own secret, so its own `member` and `owner` digests, which nothing
+    links; the registrar, which knows both digests of a member it enrolls
+    or invites, links them:
+    - `register(member, owner, limit)`, role `registrar`: a member
+      enrolled or invited (an invitation past its expiry `Expired`), and
+      its owner digest, the first device of a person of at most `limit`
+      devices (1 to `MAX_DEVICES`, 16); refused for a member or an owner
+      digest a person holds (`Held`); an owner digest only awaiting its
+      confirmation gives way, the registrar's word the binding one;
+    - `limit(member, limit)`, role `registrar`: the limit of `member`'s
+      person; devices past it stay, and the person enrolls none until it
+      is below;
+    - `enroll_device(member, owner) → slot`, under
+      `#[msg(credential = Owner)]`: the caller's confirmed owner digest
+      names its person (`NoPerson` for none), which enrolls `member` as a
+      device within its limit (`Limit`); its leaf proves at once. The
+      digests are the caller's word, so a member enrolled (`Enrolled`) or
+      invited (`Invited`: the registrar named it for its own claim), and
+      a member or an owner digest a person holds or awaits (`Held`), are
+      refused; and `owner` acts for the person only once its own proof
+      confirms it, so a person cannot take another's owner digest, public
+      in the ledger's log, and with it that member's later enrollments;
+    - `confirm_device()`, under `#[msg(credential = Owner)]`: the added
+      device's own proof, its owner digest awaited (`NoPerson` for none),
+      confirmed; the pairing's one more prompt a space (`light-node.md`
+      §3.8);
+    - `revoke_device(member)`, under `#[msg(credential = Owner)]`: a
+      device of the caller's person (`NotYours` for any other), the
+      caller's own included, revoked as `revoke` revokes it;
+    - no query answers a person; the registrar and the space's operators,
+      who read the rows and the calls' digests, link a person's devices
+      (`light-node.md` §8.8 L7). A space whose members pay each
+      other's devices links their owner digests in the ledger's log
+      anyway (L4). A re-founding's `enroll_many` re-seeds members, not
+      persons: the registrar registers them again;
   - queries, any caller: `path(member) → Option<(root, slot, siblings)>`,
     the 32 siblings from the leaf's level up; `root() → (root, since)`;
     `handle() → [u8; 32]`; `count()`, the members enrolled. A query is

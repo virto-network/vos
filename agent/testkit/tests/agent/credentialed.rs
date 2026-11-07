@@ -5,8 +5,10 @@
 //! and forgotten by the sweep; a `once` nullifier recorded only on `Ok`;
 //! the guards (an origin admitted by its guard alone, an auth scope the
 //! guard's, a kernel guard's handler taking the claim first); the
-//! credential actor's row and its install's refusals; and the ledger,
-//! `Payments`, paid from by its owners' proofs.
+//! credential actor's row and its install's refusals; the ledger,
+//! `Payments`, paid from by its owners' proofs; and the credential actor's
+//! persons, whose devices enroll and revoke each other by their owner
+//! proofs.
 
 use vos_testkit::programs::{
     actor, actor_elf, credentials, credentials_elf, method, payments, payments_elf,
@@ -14,7 +16,9 @@ use vos_testkit::programs::{
 use vos_wire::abi::cap::Target;
 use vos_wire::abi::{Failure, Refusal};
 use vos_wire::batch::{Admin, CredentialedInput, Input, Request};
-use vos_wire::credentials::{self, AuthClaim, Digest, OwnerClaim, Ring, RootEntry};
+use vos_wire::credentials::{
+    self, AuthClaim, CredentialError, Digest, OwnerClaim, Ring, RootEntry,
+};
 use vos_wire::defaults::{self, BINDING_KEPT_MS, ROOT_MAX_AGE};
 use vos_wire::ids::{InstanceId, Principal, Session};
 use vos_wire::ingress::Grant;
@@ -889,5 +893,265 @@ fn a_batch_runs_at_most_its_credentialed_calls() {
     assert_eq!(
         agent.balance("bob"),
         Some(defaults::BATCH_CREDENTIALED as u64 + 1)
+    );
+}
+
+/// A device's member digest, apart from every [`owner`].
+fn member(seed: u32) -> Digest {
+    credentials::digest(&[seed, 11, 12, 13, 14, 15, 16, 17])
+}
+
+/// A person's devices enroll and revoke each other by their owner proofs
+/// (`light-node.md` §3.8): the registrar registers the first, which
+/// enrolls a second, whose owner digest acts for the person once its own
+/// proof confirms it; the person's limit, then a raised one; the second
+/// revokes the first, whose proof then holds no person, and the first is
+/// enrolled again; a registered invitation claimed and revoked; a
+/// registrar's revocation drops a device from its person, and the last
+/// device's the person. Refused: an owner digest no person holds or not
+/// yet confirmed, a member enrolled or invited, a member or owner digest a
+/// person holds or awaits, another person's device, an expired
+/// invitation's registration, the registrar's writes by anyone else, and
+/// the device methods by a client. An owner digest another person named
+/// first gives way to the registrar's.
+#[test]
+fn a_persons_devices_enroll_and_revoke_each_other_by_their_owner_proofs() {
+    let mut agent = Agent::new();
+    let time = START + 10;
+    let by = |agent: &mut Agent, by: u32, name: &str, arguments: Vec<u8>| {
+        let mut call = agent.call(
+            Principal::Owner(owner(by)),
+            CREDENTIALS,
+            name,
+            (),
+            time + 60_000,
+            None,
+        );
+        call.arguments = arguments;
+        agent.step(time, &call)
+    };
+    let enroll = |agent: &mut Agent, caller: u32, device: u32| {
+        by(
+            agent,
+            caller,
+            "enroll_device",
+            (member(device), owner(device)).encode(),
+        )
+    };
+    let confirm = |agent: &mut Agent, device: u32| by(agent, device, "confirm_device", Vec::new());
+    let revoke = |agent: &mut Agent, caller: u32, device: u32| {
+        by(agent, caller, "revoke_device", member(device).encode())
+    };
+    let register = |agent: &mut Agent, device: u32, owner_of: u32, limit: u8| {
+        let input = agent.request(
+            ALICE,
+            CREDENTIALS,
+            "register",
+            (member(device), owner(owner_of), limit),
+            time,
+        );
+        agent.node.batch(time, vec![input]).steps.remove(0)
+    };
+    let ok = |step: Step| assert!(matches!(ran(&step).outcome, Outcome::Done(_)), "{step:?}");
+    let error = |error: CredentialError| error as u8;
+    let enrolled = |agent: &Agent, device: u32| {
+        agent
+            .query::<_, Option<credentials::Path>>(CREDENTIALS, "path", member(device))
+            .is_some()
+    };
+
+    let first = agent.request(ALICE, CREDENTIALS, "enroll", member(1), time);
+    agent.done(time, vec![first]);
+    ok(register(&mut agent, 1, 1, 2));
+    let count: u64 = agent.query(CREDENTIALS, "count", ());
+
+    ok(enroll(&mut agent, 1, 2));
+    assert!(enrolled(&agent, 2), "its leaf at once");
+    assert_eq!(
+        detail(&enroll(&mut agent, 2, 3)),
+        error(CredentialError::NoPerson)
+    );
+    ok(confirm(&mut agent, 2));
+    assert_eq!(
+        detail(&confirm(&mut agent, 2)),
+        error(CredentialError::NoPerson)
+    );
+    assert_eq!(
+        detail(&enroll(&mut agent, 2, 3)),
+        error(CredentialError::Limit)
+    );
+    let raise = agent.request(ALICE, CREDENTIALS, "limit", (member(2), 3u8), time);
+    agent.done(time, vec![raise]);
+    ok(enroll(&mut agent, 2, 3));
+    let after: u64 = agent.query(CREDENTIALS, "count", ());
+    assert_eq!(after, count + 2);
+
+    // What the person may not enroll, and who may not.
+    assert_eq!(
+        detail(&enroll(&mut agent, 7, 4)),
+        error(CredentialError::NoPerson)
+    );
+    let raise = agent.request(ALICE, CREDENTIALS, "limit", (member(1), 8u8), time);
+    agent.done(time, vec![raise]);
+    // `Agent::on` enrolled `owner(99)` as its first member.
+    let registrars = owner(99);
+    let taken = by(
+        &mut agent,
+        1,
+        "enroll_device",
+        (registrars, owner(5)).encode(),
+    );
+    assert_eq!(detail(&taken), error(CredentialError::Enrolled));
+    let held = by(
+        &mut agent,
+        1,
+        "enroll_device",
+        (member(4), owner(2)).encode(),
+    );
+    assert_eq!(detail(&held), error(CredentialError::Held));
+    let awaited = by(
+        &mut agent,
+        1,
+        "enroll_device",
+        (member(4), owner(3)).encode(),
+    );
+    assert_eq!(detail(&awaited), error(CredentialError::Held));
+    let invite = agent.request(
+        ALICE,
+        CREDENTIALS,
+        "invite",
+        (member(5), time + 1_000),
+        time,
+    );
+    let lapsed = agent.request(ALICE, CREDENTIALS, "invite", (member(6), time - 1), time);
+    agent.done(time, vec![invite, lapsed]);
+    assert_eq!(
+        detail(&enroll(&mut agent, 1, 5)),
+        error(CredentialError::Invited)
+    );
+    assert_eq!(
+        detail(&register(&mut agent, 5, 2, 1)),
+        error(CredentialError::Held)
+    );
+    assert_eq!(
+        detail(&register(&mut agent, 5, 5, 0)),
+        error(CredentialError::Terms)
+    );
+    assert_eq!(
+        detail(&register(&mut agent, 6, 6, 1)),
+        error(CredentialError::Expired)
+    );
+    let stranger = agent.request(
+        BOB,
+        CREDENTIALS,
+        "register",
+        (member(5), owner(5), 1u8),
+        time,
+    );
+    let client = agent.request(
+        BOB,
+        CREDENTIALS,
+        "enroll_device",
+        (member(6), owner(6)),
+        time,
+    );
+    let steps = agent.node.batch(time, vec![stranger, client]).steps;
+    assert_eq!(failed(&steps[0]), Failure::Forbidden);
+    assert_eq!(failed(&steps[1]), Failure::Forbidden);
+
+    // A registered invitation, claimed, then revoked by its own proof.
+    ok(register(&mut agent, 5, 5, 1));
+    let claim = agent.request(BOB, CREDENTIALS, "claim", member(5), time);
+    agent.done(time, vec![claim]);
+    assert!(enrolled(&agent, 5));
+    ok(revoke(&mut agent, 5, 5));
+    assert!(!enrolled(&agent, 5));
+    assert_eq!(
+        detail(&revoke(&mut agent, 5, 5)),
+        error(CredentialError::NoPerson)
+    );
+
+    // Another person: its device is not this one's to revoke, nor this
+    // one's its; and an owner digest it names that the registrar then
+    // registers is the registrar's.
+    let other = agent.request(ALICE, CREDENTIALS, "enroll", member(8), time);
+    agent.done(time, vec![other]);
+    ok(register(&mut agent, 8, 8, 2));
+    assert_eq!(
+        detail(&revoke(&mut agent, 2, 8)),
+        error(CredentialError::NotYours)
+    );
+    assert_eq!(
+        detail(&revoke(&mut agent, 8, 2)),
+        error(CredentialError::NotYours)
+    );
+    assert!(enrolled(&agent, 8) && enrolled(&agent, 2));
+    let squat = by(
+        &mut agent,
+        8,
+        "enroll_device",
+        (member(20), owner(21)).encode(),
+    );
+    ok(squat);
+    let victim = agent.request(ALICE, CREDENTIALS, "enroll", member(21), time);
+    agent.done(time, vec![victim]);
+    ok(register(&mut agent, 21, 21, 1));
+    assert_eq!(
+        detail(&confirm(&mut agent, 21)),
+        error(CredentialError::NoPerson)
+    );
+    ok(revoke(&mut agent, 8, 20));
+    assert_eq!(
+        detail(&revoke(&mut agent, 21, 8)),
+        error(CredentialError::NotYours)
+    );
+    ok(revoke(&mut agent, 21, 21));
+
+    // The second retires the first, whose proof holds no person after;
+    // the first enrolled again, its slot reused.
+    let slot = agent
+        .query::<_, Option<credentials::Path>>(CREDENTIALS, "path", member(1))
+        .unwrap()
+        .slot;
+    ok(revoke(&mut agent, 2, 1));
+    assert!(!enrolled(&agent, 1));
+    assert_eq!(
+        detail(&enroll(&mut agent, 1, 4)),
+        error(CredentialError::NoPerson)
+    );
+    ok(enroll(&mut agent, 2, 1));
+    let again = agent.query::<_, Option<credentials::Path>>(CREDENTIALS, "path", member(1));
+    assert_eq!(again.map(|path| path.slot), Some(slot));
+    ok(confirm(&mut agent, 1));
+    ok(revoke(&mut agent, 1, 1));
+    // A limit below the devices held: they stay, and none is enrolled.
+    let lower = agent.request(ALICE, CREDENTIALS, "limit", (member(2), 1u8), time);
+    agent.done(time, vec![lower]);
+    assert_eq!(
+        detail(&enroll(&mut agent, 2, 4)),
+        error(CredentialError::Limit)
+    );
+    assert!(enrolled(&agent, 2) && enrolled(&agent, 3));
+    // The registrar's revocation drops the third, unconfirmed, from the
+    // person; the second revokes itself, the person's last device, and
+    // the person goes with it.
+    let third = agent.request(ALICE, CREDENTIALS, "revoke", member(3), time);
+    agent.done(time, vec![third]);
+    assert_eq!(
+        detail(&confirm(&mut agent, 3)),
+        error(CredentialError::NoPerson)
+    );
+    ok(revoke(&mut agent, 2, 2));
+    assert_eq!(
+        detail(&enroll(&mut agent, 2, 4)),
+        error(CredentialError::NoPerson)
+    );
+    let gone = agent.request(ALICE, CREDENTIALS, "limit", (member(2), 2u8), time);
+    let steps = agent.node.batch(time, vec![gone]).steps;
+    assert_eq!(detail(&steps[0]), error(CredentialError::NoPerson));
+    let after: u64 = agent.query(CREDENTIALS, "count", ());
+    assert_eq!(
+        after, count,
+        "the other person's device in the first's place"
     );
 }

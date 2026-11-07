@@ -479,7 +479,14 @@ operator makes ahead of time**:
 **The lease: one re-proof a year** [decided, E15]:
 - Every device's own "home" nullifier is recorded at its add (the device
   computes it without a proof; `Personal` passes it to `Homes`, which
-  refuses one already mapped to another agent).
+  refuses one already mapped to another agent). The person records (§3.8)
+  give it no proof: they hold `member` and `owner` digests, from which no
+  nullifier follows (it is unlinkable to both by design), and the
+  enrollment is the adding device's proof, not the added one's. The
+  proof path is the added device's own `Auth("home")` once it has a leaf
+  in the home (its open claim at a home-only space, its enrollment at a
+  home that is the user's own space), with which 8.23a's pairing records
+  it.
 - Once a year, any device proves `Auth("home")` to `homes.renew(agent)`
   under a recorded nullifier: one prompt a year, at an ordinary sign-in
   when the home is the user's own space, or at a yearly "keep my backup"
@@ -1724,7 +1731,9 @@ skip expired items, each write deletes a few; no timer).
   owner(s_B))` under `#[msg(credential = Owner)]`, one proof per space
   (the member secret's per-use prompt, since the keystore's HMAC is per
   handle and per use: a user in eight spaces answers eight prompts, and
-  the chrome lets them defer any space), batched over Tor. Those
+  the chrome lets them defer any space), batched over Tor; then B calls
+  `confirm_device()` under its own owner proof, so its owner digest acts
+  for the person (B's prompt a space, on its own device). Those
   registrars never see the personal agent, so there is nothing to blur;
 - **in a home-only space,** B makes its own open claim (§3.3), in the
   background after pairing: no enrollment by A, no link, and no wait on
@@ -1735,6 +1744,18 @@ skip expired items, each write deletes a few; no timer).
 - The registrar keeps a person record (each device's member and owner
   digests, their count and a per-member limit), which a credential actor
   alone cannot (member and owner digests are unlinkable by design).
+  [built] The registrar registers a person's first device with both its
+  digests (`register(member, owner, limit)`); from then on the person's
+  own devices enroll and revoke its devices by their owner proofs, the
+  digests they name refused when any person holds them or when the member
+  is enrolled or invited, and B's owner digest acts for the person once
+  B's own owner proof confirms it (`confirm_device`, one more prompt a
+  space on the pairing's path, batched with A's), so no person takes
+  another member's public owner digest (`identity-and-authority.md` §6). The credential
+  book's `DeviceHandle` holds each device's member and owner digests as
+  the record does, so the device that enrolls or revokes another names it
+  from the book. The gate: `node/host/tests/served/credentialed.rs`'s
+  `a_second_device_is_enrolled_and_revoked_by_its_first_devices_proof`.
 - **`once` scopes** admit one nullifier per device in slice 8 [decided,
   §9.1]: a member with three devices can vote three times where a space
   uses `once`, which the space's chrome states. A ring of person leaves is

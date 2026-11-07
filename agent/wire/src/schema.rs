@@ -98,7 +98,8 @@ pub enum CredentialGuard {
     /// `#[msg(credential = Auth("name"))]`: the stock `auth` kernel, an
     /// `Anonymous` origin of the scope `name` gives, 1 to
     /// [`MAX_GUARD_NAME`] bytes, in this space, agent and instance; `once`
-    /// admits each nullifier once in the scope.
+    /// admits each nullifier once in the scope: each device's secret gives
+    /// it its own, so a member once a device.
     #[codec(index = 0)]
     Auth { name: Vec<u8>, once: bool },
     /// `#[msg(credential = Owner)]` or `#[msg(proven = owner)]`: the stock

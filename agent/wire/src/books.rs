@@ -3,8 +3,8 @@
 //! app reads their queries without either actor's crate.
 //!
 //! - **The credential book:** each space the user is a member of
-//!   ([`Enrolled`]), each device's handle there ([`DeviceHandle`]) and each
-//!   method pinned ([`Pinned`]).
+//!   ([`Enrolled`]), each device's handle and digests there
+//!   ([`DeviceHandle`]) and each method pinned ([`Pinned`]).
 //! - **The device book:** each device's label and settings, by its id in
 //!   the device set; its bounds are [`LABEL_BYTES`], [`SETTING_BYTES`] and
 //!   [`VALUE_BYTES`].
@@ -57,18 +57,21 @@ pub struct Enrolled {
 }
 
 /// A device's handle in a space, which its secret source is asked for,
-/// and the member digest of its secret there, public.
+/// and the member and owner digests of its secret there: the device as the
+/// registrar's person record holds it, which another of the user's devices
+/// names to `enroll_device` and `revoke_device`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct DeviceHandle {
     pub handle: [u8; 32],
     pub member: [u8; 32],
+    pub owner: [u8; 32],
 }
 
 /// The guard a pinned method proves under.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Guard {
     /// Membership, its nullifier in the scope `scope`; `once` admits each
-    /// member once there.
+    /// device's nullifier once there, so a member once a device.
     #[codec(index = 0)]
     Auth { scope: String, once: bool },
     /// Ownership of a ledger account.

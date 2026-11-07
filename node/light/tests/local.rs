@@ -175,6 +175,7 @@ fn the_credential_book_and_the_device_book_read_back() {
     let handle = DeviceHandle {
         handle: [0x48; 32],
         member: [0x4d; 32],
+        owner: [0x4f; 32],
     };
     let sign_in = Pinned {
         at: Location {

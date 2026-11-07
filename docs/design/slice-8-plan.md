@@ -303,6 +303,21 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   nullifier per device, stated (N3 (c)).
 - **Gate:** a second device enrolled and revoked in a space by its first
   device's proof. **Dep:** 8.5. **Estimate:** 1–1.5 weeks.
+- **Built** (2026-11-07, `identity-and-authority.md` §6 and §5's `once`,
+  `light-node.md` §3.8): the credential actor's `persons`, `owners` and
+  `devices` rows; `register` and `limit` under the registrar, a person's
+  first device registered by both its digests, its limit 1 to 16;
+  `enroll_device`, `confirm_device` (the added device's own owner proof
+  binding its owner digest) and `revoke_device` under `credential =
+  Owner`; the
+  registrar's `revoke` dropping a device from its person; no query answers
+  a person. The credential book's `DeviceHandle` carries the owner digest
+  beside the member's. `once` stated as one admission a device. The gate:
+  `node/host/tests/served/credentialed.rs`'s
+  `a_second_device_is_enrolled_and_revoked_by_its_first_devices_proof`,
+  with real owner and auth proofs on three nodes; the refusals in
+  `agent/testkit/tests/agent/credentialed.rs`. The home nullifier stays
+  unproven by the person records (`light-node.md` §3.3).
 
 ### M3 acceptance
 - `ci-full`, 8.15's gate, 8.13's property tests, the carrier audit over

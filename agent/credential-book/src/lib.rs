@@ -5,8 +5,10 @@
 //!   and the agents of it the user's devices call, with the identity each
 //!   one's queries are signed over.
 //! - **Handles:** each device's handle in a space, which its secret source
-//!   is asked for, and the member digest its leaf is: public, so a device
-//!   keeps its path from a session's start without asking the source. A
+//!   is asked for, and the member digest its leaf is and its owner digest,
+//!   as the registrar's person record holds them: public, so a device keeps
+//!   its path from a session's start without asking the source, and
+//!   another device enrolls or revokes it by its owner proof. A
 //!   device's secret, its source's output and its member tree stay on the
 //!   device, outside any synced scope.
 //! - **Pins:** each method a device may prove for in a space, and the
