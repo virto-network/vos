@@ -219,12 +219,17 @@ fn an_agent_that_misses_the_close_ends_not_closed() {
     holds_hook.reports.lock().unwrap().clear();
 
     // Its statement at window 0, with the path the on-time agent holds.
-    let closed: ClosedRow = vos_checker::applied(
-        replica(&cluster, on_time).store(),
-        on_time,
-        &keys::closed(0),
-    )
-    .expect("the on-time agent's close");
+    // The replica read applies the close once it replicates there.
+    let mut closed: Option<ClosedRow> = None;
+    wait_until("the on-time agent's close", || {
+        closed = vos_checker::applied(
+            replica(&cluster, on_time).store(),
+            on_time,
+            &keys::closed(0),
+        );
+        closed.is_some()
+    });
+    let closed = closed.unwrap();
     assert_eq!(closed.rep_root, rep_root_0);
     let witness = Served {
         space: cluster.space.id(),
