@@ -292,12 +292,10 @@ impl Inner {
         if let Err(error) = self.settled(agent).await {
             return error.into();
         }
-        if run.agent.leading() {
-            self.credentialed_call(agent, input).await
-        } else {
-            self.forward(&run, agent, Forwardable::Credentialed(input))
-                .await
-        }
+        // Here if this replica leads, else at the leader, and on through
+        // leader changes until it is answered.
+        self.forward(&run, agent, Forwardable::Credentialed(input))
+            .await
     }
 
     /// The device program of `release`: computed on an executor from the

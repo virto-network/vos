@@ -180,6 +180,7 @@ async fn apply_one(inner: &Inner, shared: &Shared, index: u64) -> Result<(), Fau
                 writes.extend(answered);
                 if let Some(result) = &result {
                     writes.extend(crate::prover::attested(&snapshot, agent, result)?);
+                    inner.calls.runs.applied(result, index);
                 }
             }
             if let Some(result) = result {

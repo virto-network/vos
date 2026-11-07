@@ -397,7 +397,10 @@ proves and the kernel's claim.
   duplicate is answered `Refusal::Replayed` at apply (or
   `CredentialRefusal::Replayed` at an ingress that has applied the
   first), without the first call's outcome [decided]: a client that
-  lost its answer reads state (a balance, a record).
+  lost its answer reads state (a balance, a record). A replica's own
+  resend of a call it forwards is no duplicate: refused `Replayed`
+  because its earlier send ran, the client is answered that run, which
+  the replica saw apply.
 - **On JAM,** an agent whose builder is one of the space's nodes takes a
   proven input as it takes any: its builder's ingress verified the
   proof, under the trust-boundary rule above.

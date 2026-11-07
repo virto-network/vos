@@ -35,6 +35,7 @@ use vos_wire::{defaults, keys};
 use crate::asking::{PAUSE, REASK, Waits, pause};
 use crate::fault::{Fault, read};
 use crate::node::{Answered, CallError, Inner, Reply, Run};
+use crate::runs::Watch;
 use crate::signature::signed;
 use crate::store::Snapshot;
 use crate::{lock, timeout};
@@ -64,6 +65,9 @@ pub(crate) struct Calls {
     /// them, each by its token: a call forwarded again while it runs is
     /// answered once, when it ends.
     forwarded: Mutex<HashMap<NodeNumber, HashSet<u64>>>,
+    /// The runs of the credentialed calls this replica forwards, as it
+    /// applies them.
+    pub(crate) runs: crate::runs::Runs,
     /// Device proofs being verified now.
     pub(crate) verifying: Arc<std::sync::atomic::AtomicUsize>,
     /// The device programs of installed kernels, as ingress verifies
@@ -487,7 +491,8 @@ impl Inner {
     }
 
     /// Forward a checked call to the agent's leader until it is answered,
-    /// then answer once this replica has applied it.
+    /// then answer once this replica has applied it; run here whenever
+    /// this replica leads.
     pub(crate) async fn forward(
         self: &Arc<Self>,
         run: &Arc<Run>,
@@ -496,6 +501,12 @@ impl Inner {
     ) -> Response {
         let until = Instant::now() + FORWARDING;
         let wait = self.calls.forwards.register(agent);
+        // A credentialed call's runs, watched from before it first goes:
+        // sent again after a send that ran, it is answered that run.
+        let watch = match &call {
+            Forwardable::Credentialed(call) => Some(self.calls.runs.watch(call.binding)),
+            Forwardable::Call(_) => None,
+        };
         // How many times the call went: once it went before, nothing the
         // leader answers short of running it says it never ran.
         let mut sent = 0;
@@ -511,9 +522,27 @@ impl Inner {
             if state.stopped {
                 return Response::Stopped;
             }
-            // This replica leads now: the call runs here.
+            // This replica leads now: the call runs here. Should leadership
+            // end under it, it may have been proposed, and goes on to
+            // whoever leads next.
             if run.agent.leading() {
-                return self.lead(agent, call).await;
+                sent += 1;
+                match self.lead(agent, call.clone()).await {
+                    Response::NotLeader { .. } => {
+                        let term = state.term;
+                        pause(run, PAUSE, until, |state| {
+                            state.stopped || state.term > term
+                        })
+                        .await;
+                        continue;
+                    }
+                    Response::Refused(Refusal::Replayed) if sent > 1 => {
+                        return self
+                            .replayed(run, agent, &call, until, watch.as_ref())
+                            .await;
+                    }
+                    answer => return answer,
+                }
             }
             // The leader this replica follows, or one named at a later term
             // until this replica's own core reaches it.
@@ -597,30 +626,47 @@ impl Inner {
                     return Response::TimedOut;
                 }
                 Some((_, Response::TimedOut)) | None => {}
-                // A credentialed call that ran already, by an earlier send
-                // or another replica's copy: answered once this replica
-                // holds its binding, so a client reading state here reads
-                // the run's effects.
+                // A credentialed call that ran already: by an earlier send,
+                // when it went more than once, or by another copy.
                 Some((_, Response::Refused(Refusal::Replayed))) => {
-                    if let Forwardable::Credentialed(call) = &call {
-                        return self.recorded(run, agent, call, until).await;
-                    }
-                    return Response::Refused(Refusal::Replayed);
+                    let watch = watch.as_ref().filter(|_| sent > 1);
+                    return self.replayed(run, agent, &call, until, watch).await;
                 }
                 Some((_, answer)) => return answer,
             }
         }
     }
 
+    /// The answer to a forwarded call apply refused `Replayed`, by
+    /// `until`: for a credentialed call whose run `watch` saw apply here,
+    /// that run, once applied; else `Replayed`, once this replica has
+    /// applied the call's binding record, so a client reading state here
+    /// reads the run's effects.
+    async fn replayed(
+        &self,
+        run: &Arc<Run>,
+        agent: AgentId,
+        call: &Forwardable,
+        until: Instant,
+        watch: Option<&Watch<'_>>,
+    ) -> Response {
+        match call {
+            Forwardable::Credentialed(call) => self.recorded(run, agent, call, until, watch).await,
+            Forwardable::Call(_) => Response::Refused(Refusal::Replayed),
+        }
+    }
+
+    /// The run `watch` saw of `call` apply here, once applied; else
     /// `Replayed`, once this replica has applied `call`'s binding record,
-    /// or a batch past its expiry (by then the run is applied here, and
-    /// its record may be swept), by `until`.
+    /// or a batch past its expiry (by then the run is applied here, and its
+    /// record may be swept), by `until`.
     async fn recorded(
         &self,
         run: &Arc<Run>,
         agent: AgentId,
         call: &CredentialedInput,
         until: Instant,
+        watch: Option<&Watch<'_>>,
     ) -> Response {
         let key = keys::binding(&call.binding);
         loop {
@@ -634,10 +680,16 @@ impl Inner {
                     let time = read::<u64>(&snapshot, agent, &keys::batch_time())?;
                     Ok(held.is_some() || time.is_some_and(|time| time > call.expires_ms))
                 });
-            match held {
-                Ok(true) => return Response::Refused(Refusal::Replayed),
-                Ok(false) => {}
-                Err(_) => return Response::Unavailable,
+            let Ok(held) = held else {
+                return Response::Unavailable;
+            };
+            // Read after the record: a watched run is kept before its
+            // writes commit, so the run that recorded it is seen here.
+            match watch.and_then(Watch::ran) {
+                Some((outcome, at)) if applied >= at => return Response::Ran { outcome, at },
+                Some(_) => {}
+                None if held => return Response::Refused(Refusal::Replayed),
+                None => {}
             }
             let left = until.saturating_duration_since(Instant::now());
             if left.is_zero() {

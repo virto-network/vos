@@ -3,6 +3,7 @@
 //! made as a device makes them, by the stock kernels' release artifacts:
 //! each refusal in its check order; a proof replayed, and a `once`
 //! nullifier raced past ingress at another replica, each refused at apply;
+//! a forwarded call whose answer was lost answered its run, not `Replayed`;
 //! a root a replica has not applied, one replaced at its own batch time
 //! and one pushed out of the ring, each `RootUnknown` and admitted after a
 //! path refetch; a revoked member's root refused once `ROOT_MAX_AGE` has
@@ -12,8 +13,8 @@
 //! they leave it; an actor's own kernel's proof run by its handler on its
 //! claim; and compatibility windows across a credential actor's upgrade.
 
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -24,6 +25,7 @@ use vos_checker::programs::{
 };
 use vos_light::release::Device;
 use vos_light::{AuthWitness, Call, DEVICE_FORMAT, DeviceProgram, Prover, ProverConfig, Threads};
+use vos_net::Class;
 use vos_node::client::{self, Client};
 use vos_wire::abi::Refusal;
 use vos_wire::credentials::{self as tree, AuthClaim, Bound, Digest, Path, RootEntry};
@@ -32,7 +34,7 @@ use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
 use vos_wire::ingress::{
     CredentialRefusal, Credentialed, DeviceWindow, FormatWindow, Rejection, Response,
 };
-use vos_wire::peer::NodeNumber;
+use vos_wire::peer::{NodeNumber, PeerMessage};
 use vos_wire::records::RETIREMENT_MS;
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode, SpaceId, WindowClock};
@@ -647,6 +649,51 @@ fn a_replay_and_a_once_race_past_ingress_are_refused_at_apply() {
     assert_eq!(tally + other, 1, "one vote of the nullifier");
     let next = founded.auth(follower, &secret, &path, ("vote_again", "vote/2"), 4u8);
     done(&founded.send(follower, &next));
+}
+
+/// A follower forwards a call whose answer from the leader is lost: it
+/// forwards it again, which apply refuses `Replayed`, the first send having
+/// run, and the client is answered the run's outcome once the follower has
+/// applied it. The client's own repeat is refused `Replayed` at ingress.
+#[test]
+fn a_forwarded_call_whose_answer_is_lost_is_answered_its_run() {
+    let founded = Founded::new();
+    let secret = Secret::new(12);
+    founded.write(CREDENTIALS, "enroll", secret.member());
+    let leader = founded.cluster.leader(founded.agent).unwrap();
+    let follower = founded.follower();
+    let path = founded.path(&secret);
+    let call = founded.auth(follower, &secret, &path, ("login", "login"), ());
+    let hub = &founded.cluster.hub;
+    let lost = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&lost);
+    hub.tap(Arc::new(move |from, to, class, frame| {
+        if from == leader
+            && to == follower
+            && class == Class::Requests
+            && matches!(
+                PeerMessage::decode_exact(frame),
+                Some(PeerMessage::Forwarded { .. })
+            )
+        {
+            seen.store(true, Ordering::SeqCst);
+        }
+    }));
+    hub.cut_class(leader, follower, Class::Requests);
+    let founded = &founded;
+    let answer = std::thread::scope(|scope| {
+        let answer = scope.spawn(|| founded.send(follower, &call));
+        vos_checker::wait_until("the leader's answer lost", Duration::from_secs(30), || {
+            lost.load(Ordering::SeqCst)
+        });
+        hub.heal();
+        answer.join().unwrap()
+    });
+    done(&answer);
+    assert_eq!(
+        refused(founded.send(follower, &call)),
+        CredentialRefusal::Replayed
+    );
 }
 
 /// A credentialed call's body takes a place among the node's large bodies
