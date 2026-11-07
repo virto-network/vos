@@ -8,6 +8,7 @@ use std::time::Instant;
 use vos_wire::batch::{Admin, CredentialedInput, Input, Message, Request};
 use vos_wire::ids::AgentId;
 use vos_wire::keys::Due;
+use vos_wire::peer::NodeNumber;
 
 use super::{CallError, Inner, Reply};
 use crate::lock;
@@ -31,6 +32,9 @@ pub(crate) enum Pending {
     /// A credentialed call, its proof verified at a replica's ingress.
     Credentialed {
         call: CredentialedInput,
+        /// The replica that took it at its ingress, and its forward's
+        /// token ([`crate::store::Origin`]).
+        origin: (NodeNumber, u64),
         answer: Answer,
     },
     /// An admin command, with the blobs its entry names.

@@ -9,7 +9,7 @@ use super::*;
 use crate::NoHooks;
 use crate::blobs::Keep;
 use crate::storage::StorageThread;
-use crate::store::{BlobRef, Fjall};
+use crate::store::{BlobRef, Fjall, Origin};
 
 const AGENT: AgentId = AgentId(7);
 const NODES: [NodeNumber; 3] = [1, 2, 3];
@@ -23,10 +23,20 @@ fn entries_round_trip_through_the_store() {
             hash: [9; 32],
             len: 1 << 20,
         }],
+        origins: vec![Origin {
+            input: 3,
+            node: 2,
+            token: u64::MAX - 7,
+        }],
         body: b"result".to_vec(),
     };
     let raft = to_raft(5, &result);
     assert_eq!(to_store(&raft), result);
+    let plain = LogEntry {
+        origins: Vec::new(),
+        ..result.clone()
+    };
+    assert_eq!(to_store(&to_raft(5, &plain)), plain);
     let no_op = RaftEntry::data(6, 4, Vec::new());
     assert_eq!(to_store(&no_op).kind, EntryKind::NoOp);
     assert_eq!(to_raft(6, &to_store(&no_op)), no_op);
@@ -55,6 +65,11 @@ fn a_large_results_blob_weighs_in_its_payload() {
         term: 1,
         kind: EntryKind::LargeResult,
         blobs: vec![blob, program],
+        origins: vec![Origin {
+            input: 0,
+            node: 1,
+            token: 5,
+        }],
         body: Vec::new(),
     };
     let payload = large.payload();
@@ -275,6 +290,7 @@ fn recovery_compacts_past_an_applied_entry_missing_its_blob() {
         term: 1,
         kind: EntryKind::Configuration,
         blobs: Vec::new(),
+        origins: Vec::new(),
         body: store::encode_configuration(&[1, 2, 4], None),
     };
     let mut batch = store.batch();

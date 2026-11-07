@@ -142,10 +142,11 @@ pub(crate) async fn apply(inner: Arc<Inner>, shared: Arc<Shared>) {
 /// every replica alike.
 async fn apply_one(inner: &Inner, shared: &Shared, index: u64) -> Result<(), Fault> {
     let agent = shared.agent;
-    let entry = inner
+    let mut entry = inner
         .store
         .log_entry(agent, index)?
         .ok_or_else(|| Fault::Infrastructure(format!("the entry at {index} is missing")))?;
+    let origins = std::mem::take(&mut entry.origins);
     let snapshot = Arc::new(inner.store.snapshot());
     let epoch = snapshot.epoch(agent)?;
     let mut rest = Vec::new();
@@ -180,7 +181,10 @@ async fn apply_one(inner: &Inner, shared: &Shared, index: u64) -> Result<(), Fau
                 writes.extend(answered);
                 if let Some(result) = &result {
                     writes.extend(crate::prover::attested(&snapshot, agent, result)?);
-                    inner.calls.runs.applied(result, index);
+                    inner
+                        .calls
+                        .runs
+                        .applied(result, index, &origins, inner.number);
                 }
             }
             if let Some(result) = result {

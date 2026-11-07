@@ -455,6 +455,9 @@ impl Driver {
                 *last = (*last).min(index);
             }
         }
+        // The entries the snapshot covers are not applied here one by one:
+        // a forward's own run among them is not seen (`crate::runs`), and
+        // its resend is answered `Replayed`.
         self.shared.update(|state| {
             state.applied = state.applied.max(index);
             state.commit = state.commit.max(index);

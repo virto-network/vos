@@ -34,6 +34,7 @@ pub(crate) fn to_store(entry: &RaftEntry<NodeNumber>) -> LogEntry {
             term: entry.term,
             kind: EntryKind::NoOp,
             blobs: Vec::new(),
+            origins: Vec::new(),
             body: Vec::new(),
         },
         // A payload this node cannot read is kept as the body of a work
@@ -46,6 +47,7 @@ pub(crate) fn to_store(entry: &RaftEntry<NodeNumber>) -> LogEntry {
             term: entry.term,
             kind: EntryKind::Configuration,
             blobs: Vec::new(),
+            origins: Vec::new(),
             body: store::encode_configuration(members, joint_old.as_deref()),
         },
     }

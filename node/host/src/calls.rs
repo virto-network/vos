@@ -20,6 +20,7 @@
 //! lane: apply refuses its binding digest once recorded.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -267,26 +268,42 @@ impl Inner {
     }
 
     /// Run `call` as this replica's leader would: a client's call in its
-    /// lane, a credentialed call queued.
-    async fn lead(self: &Arc<Self>, agent: AgentId, call: Forwardable) -> Response {
+    /// lane, a credentialed call queued as `origin`'s. `pushed` is set once
+    /// the call may run: a credentialed call once queued, a client's call
+    /// at once, its lane deduping it.
+    async fn lead(
+        self: &Arc<Self>,
+        agent: AgentId,
+        call: Forwardable,
+        origin: (NodeNumber, u64),
+        pushed: Arc<AtomicBool>,
+    ) -> Response {
         match call {
-            Forwardable::Call(call) => self.lane_call(agent, call).await,
-            Forwardable::Credentialed(call) => self.credentialed_call(agent, call).await,
+            Forwardable::Call(call) => {
+                pushed.store(true, Ordering::SeqCst);
+                self.lane_call(agent, call).await
+            }
+            Forwardable::Credentialed(call) => {
+                self.credentialed_call(agent, call, origin, pushed).await
+            }
         }
     }
 
-    /// Run a credentialed call, its proof verified: this replica must lead
-    /// the agent, else the answer says where the leader is. Apply refuses a
-    /// binding digest recorded, so a call sent twice runs once.
-    pub(crate) async fn credentialed_call(
+    /// Run a credentialed call, its proof verified, as `origin`'s: this
+    /// replica must lead the agent, else the answer says where the leader
+    /// is. Apply refuses a binding digest recorded, so a call sent twice
+    /// runs once.
+    async fn credentialed_call(
         self: &Arc<Self>,
         agent: AgentId,
         call: CredentialedInput,
+        origin: (NodeNumber, u64),
+        pushed: Arc<AtomicBool>,
     ) -> Response {
         if let Err(error) = self.leading(agent).await {
             return error.into();
         }
-        let running = self.call_credentialed(agent, call);
+        let running = self.call_credentialed(agent, call, origin, pushed);
         timeout(self.settings.answered, running)
             .await
             .map_or(Response::TimedOut, answer_of)
@@ -504,7 +521,9 @@ impl Inner {
         // A credentialed call's runs, watched from before it first goes:
         // sent again after a send that ran, it is answered that run.
         let watch = match &call {
-            Forwardable::Credentialed(call) => Some(self.calls.runs.watch(call.binding)),
+            Forwardable::Credentialed(call) => {
+                Some(self.calls.runs.watch(call.binding, wait.token))
+            }
             Forwardable::Call(_) => None,
         };
         // How many times the call went: once it went before, nothing the
@@ -522,27 +541,37 @@ impl Inner {
             if state.stopped {
                 return Response::Stopped;
             }
-            // This replica leads now: the call runs here. Should leadership
-            // end under it, it may have been proposed, and goes on to
-            // whoever leads next.
+            // This replica leads now: the call runs here, as its own
+            // forward's send. Should leadership end under it, it may have
+            // been proposed, and goes on to whoever leads next.
             if run.agent.leading() {
-                sent += 1;
-                match self.lead(agent, call.clone()).await {
-                    Response::NotLeader { .. } => {
-                        let term = state.term;
-                        pause(run, PAUSE, until, |state| {
-                            state.stopped || state.term > term
-                        })
-                        .await;
-                        continue;
-                    }
-                    Response::Refused(Refusal::Replayed) if sent > 1 => {
+                let pushed = Arc::new(AtomicBool::new(false));
+                let origin = (self.number, wait.token);
+                let led = self.lead(agent, call.clone(), origin, Arc::clone(&pushed));
+                let answer = timeout(left, led).await;
+                if pushed.load(Ordering::SeqCst) {
+                    sent += 1;
+                }
+                let term = state.term;
+                let moved = |state: &crate::group::State| state.stopped || state.term > term;
+                match answer {
+                    None => return Response::TimedOut,
+                    Some(Response::NotLeader { .. }) => pause(run, PAUSE, until, moved).await,
+                    // Full, the call not queued: nothing ran, unless an
+                    // earlier send is running elsewhere.
+                    Some(Response::Busy) if sent == 0 => return Response::Busy,
+                    Some(Response::Busy) => pause(run, REASK, until, moved).await,
+                    Some(
+                        Response::Rejected(Rejection::StaleSession { .. }) | Response::NotConsumed,
+                    ) if sent > 1 => return Response::TimedOut,
+                    Some(Response::Refused(Refusal::Replayed)) => {
                         return self
                             .replayed(run, agent, &call, until, watch.as_ref())
                             .await;
                     }
-                    answer => return answer,
+                    Some(answer) => return answer,
                 }
+                continue;
             }
             // The leader this replica follows, or one named at a later term
             // until this replica's own core reaches it.
@@ -626,11 +655,12 @@ impl Inner {
                     return Response::TimedOut;
                 }
                 Some((_, Response::TimedOut)) | None => {}
-                // A credentialed call that ran already: by an earlier send,
-                // when it went more than once, or by another copy.
+                // A credentialed call that ran already: by an earlier send
+                // of this forward's, or by another copy.
                 Some((_, Response::Refused(Refusal::Replayed))) => {
-                    let watch = watch.as_ref().filter(|_| sent > 1);
-                    return self.replayed(run, agent, &call, until, watch).await;
+                    return self
+                        .replayed(run, agent, &call, until, watch.as_ref())
+                        .await;
                 }
                 Some((_, answer)) => return answer,
             }
@@ -638,10 +668,10 @@ impl Inner {
     }
 
     /// The answer to a forwarded call apply refused `Replayed`, by
-    /// `until`: for a credentialed call whose run `watch` saw apply here,
-    /// that run, once applied; else `Replayed`, once this replica has
-    /// applied the call's binding record, so a client reading state here
-    /// reads the run's effects.
+    /// `until`: for a credentialed call one of whose own sends `watch` saw
+    /// run here, that run, once applied; else `Replayed`, once this replica
+    /// has applied the call's binding record, so a client reading state
+    /// here reads the run's effects.
     async fn replayed(
         &self,
         run: &Arc<Run>,
@@ -762,7 +792,8 @@ impl Inner {
                 from,
                 token,
             };
-            let answer = inner.lead(agent, call).await;
+            let pushed = Arc::new(AtomicBool::new(false));
+            let answer = inner.lead(agent, call, (from, token), pushed).await;
             drop(running);
             let term = inner.run(agent).map_or(term, |run| run.shared.state().term);
             inner.answer_forward(from, agent, token, term, answer);

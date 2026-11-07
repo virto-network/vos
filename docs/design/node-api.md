@@ -192,7 +192,7 @@ budget, past which it is answered `Busy`.
   | `Query` | any; its key signs it | relayed | yes: a read |
   | `Workflow` | any; the workflow's owner signs it | no | yes: a read |
   | `Call` | any; its session's key signs it | no | yes: the session's sequence dedupes |
-  | `Credentialed` | any; its proof is its authority | no (the demo's device sends it over the gateway's s4 facility) | yes: a repeat is answered `Replayed`, not the first outcome (a replica's resend of one it forwards is answered the run) |
+  | `Credentialed` | any; its proof is its authority | no (the demo's device sends it over the gateway's s4 facility) | yes: a repeat is answered `Replayed`, not the first outcome (a replica's own resend of one it forwards is answered the run its entry's origin names it in, unless a snapshot brought that run; identity-and-authority §5) |
   | `Stats`, `Status` | an operator key, signed (§4) | no | yes: reads, signed with an expiry, no nonce recorded |
   | the other `0x02xx` | an operator key, signed (§4) | no | no: each nonce once |
 

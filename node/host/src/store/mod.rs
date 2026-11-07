@@ -44,7 +44,7 @@ use keys::{
 };
 
 pub use batch::Batch;
-pub use entry::{BlobRef, EntryKind, LARGE_RESULT, LogEntry};
+pub use entry::{BlobRef, EntryKind, LARGE_RESULT, LogEntry, Origin};
 pub use fjall::{Error, PersistMode};
 pub use keys::{LAYOUT, NODE_AGENT, decode_configuration, encode_configuration, next_epoch};
 pub use open::{Layout, LayoutMismatch};

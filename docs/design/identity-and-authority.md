@@ -398,9 +398,15 @@ proves and the kernel's claim.
   `CredentialRefusal::Replayed` at an ingress that has applied the
   first), without the first call's outcome [decided]: a client that
   lost its answer reads state (a balance, a record). A replica's own
-  resend of a call it forwards is no duplicate: refused `Replayed`
-  because its earlier send ran, the client is answered that run, which
-  the replica saw apply.
+  resend of a call it forwards (after a lost answer, or a leader
+  change) is no duplicate: each log entry carries, beside its work
+  result and under no proof, the origin of each proven input, the
+  replica that took it at its ingress and its forward's token. When a
+  later send is refused `Replayed` and the replica applied the run of
+  an entry naming it and that token, its client is answered that run.
+  Any other copy (another replica's, another client's) is answered
+  `Replayed`, and so is the replica's own resend when a snapshot, not
+  the entry, brought it the run.
 - **On JAM,** an agent whose builder is one of the space's nodes takes a
   proven input as it takes any: its builder's ingress verified the
   proof, under the trust-boundary rule above.

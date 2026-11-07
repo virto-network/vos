@@ -21,7 +21,7 @@ use crate::node::Inner;
 use crate::node::Pending;
 use crate::pvm::{self, AgentState};
 use crate::stats::Histogram;
-use crate::store::{BlobRef, EntryKind, LARGE_RESULT, LogEntry, Snapshot};
+use crate::store::{BlobRef, EntryKind, LARGE_RESULT, LogEntry, Origin, Snapshot};
 
 /// A batch proposed whose result has yet to apply here.
 pub(super) struct Flight {
@@ -67,7 +67,7 @@ impl Leader {
     ) -> Result<Ended, Fault> {
         let started = Instant::now();
         let launched = self
-            .launch(Arc::clone(&snapshot), batch, blobs, marker)
+            .launch(Arc::clone(&snapshot), batch, blobs, Vec::new(), marker)
             .await?;
         let Launched::Proposed {
             index,
@@ -94,12 +94,14 @@ impl Leader {
 
     /// Refine `batch`, or take `marker` as its result; dry-run accumulate
     /// on the same state, which the batches in flight's writes are over,
-    /// and propose the result.
+    /// and propose the result, its credentialed inputs' `origins` beside
+    /// it.
     pub(super) async fn launch(
         &mut self,
         snapshot: Arc<Snapshot>,
         batch: Batch,
         blobs: Vec<BlobRef>,
+        origins: Vec<Origin>,
         marker: Option<WorkResult>,
     ) -> Result<Launched, Fault> {
         let id = self.id;
@@ -138,6 +140,7 @@ impl Leader {
                 term: 0,
                 kind: EntryKind::LargeResult,
                 blobs: [vec![blob], blobs].concat(),
+                origins,
                 body: Vec::new(),
             };
             (entry.payload(), writes?, Some(held))
@@ -146,6 +149,7 @@ impl Leader {
                 term: 0,
                 kind: EntryKind::Result,
                 blobs,
+                origins,
                 body: output,
             };
             let payload = entry.payload();

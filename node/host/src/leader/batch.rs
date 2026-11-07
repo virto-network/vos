@@ -14,7 +14,7 @@ use super::execute::{Flight, Launched};
 use super::{Ended, Leader, is_due};
 use crate::fault::{Fault, read};
 use crate::node::{Answered, Pending, Reply};
-use crate::store::{BlobRef, Snapshot, Unapplied};
+use crate::store::{BlobRef, Origin, Snapshot, Unapplied};
 use crate::{Backoff, lock, raise, random};
 
 /// How far this node's clock may trail the agent's time before the leader
@@ -153,8 +153,9 @@ impl Leader {
                 _ => Vec::new(),
             })
             .collect();
+        let origins = origins(&pending);
         self.inner.stats.prepare.took(taken.elapsed());
-        match self.launch(snapshot, batch, blobs, None).await {
+        match self.launch(snapshot, batch, blobs, origins, None).await {
             Ok(Launched::Proposed {
                 index,
                 result,
@@ -510,4 +511,24 @@ impl Leader {
             at: self.applied,
         }));
     }
+}
+
+/// The origins of `pending`'s credentialed inputs, by their positions in
+/// the batch.
+fn origins(pending: &[Pending]) -> Vec<Origin> {
+    pending
+        .iter()
+        .enumerate()
+        .filter_map(|(input, item)| match item {
+            Pending::Credentialed {
+                origin: (node, token),
+                ..
+            } => Some(Origin {
+                input: u16::try_from(input).expect("a batch's inputs fit in u16"),
+                node: *node,
+                token: *token,
+            }),
+            _ => None,
+        })
+        .collect()
 }

@@ -3,7 +3,8 @@
 //! made as a device makes them, by the stock kernels' release artifacts:
 //! each refusal in its check order; a proof replayed, and a `once`
 //! nullifier raced past ingress at another replica, each refused at apply;
-//! a forwarded call whose answer was lost answered its run, not `Replayed`;
+//! a forwarded call whose answer was lost, and a call its leader proposed
+//! before it was deposed, each answered its run, not `Replayed`;
 //! a root a replica has not applied, one replaced at its own batch time
 //! and one pushed out of the ring, each `RootUnknown` and admitted after a
 //! path refetch; a revoked member's root refused once `ROOT_MAX_AGE` has
@@ -692,6 +693,65 @@ fn a_forwarded_call_whose_answer_is_lost_is_answered_its_run() {
     done(&answer);
     assert_eq!(
         refused(founded.send(follower, &call)),
+        CredentialRefusal::Replayed
+    );
+}
+
+/// The leader takes a call at its own ingress and proposes it, its
+/// followers' acknowledgements lost: it steps down before the entry
+/// commits there, and its successor commits it. Healed, the deposed leader
+/// sends the call on, apply refuses it `Replayed`, and the client is
+/// answered the run of its own proposal.
+#[test]
+fn a_leader_deposed_after_proposing_answers_the_run_its_successor_committed() {
+    let founded = Founded::new();
+    let agent = founded.agent;
+    let secret = Secret::new(13);
+    founded.write(CREDENTIALS, "enroll", secret.member());
+    let leader = founded.cluster.leader(agent).unwrap();
+    let others: Vec<NodeNumber> = (1..=NODES).filter(|number| *number != leader).collect();
+    let path = founded.path(&secret);
+    let call = founded.auth(leader, &secret, &path, ("login", "login"), ());
+    let replica = |number| {
+        let node = founded.cluster.node(number).unwrap();
+        node.replica(agent).unwrap()
+    };
+    let first = replica(leader);
+    let hub = &founded.cluster.hub;
+    let gate = &founded.cluster.slot(leader).trip.refines;
+    let reached = gate.reached();
+    let closed = gate.close();
+    let founded = &founded;
+    let answer = std::thread::scope(|scope| {
+        let answer = scope.spawn(|| founded.send(leader, &call));
+        vos_checker::wait_until("the call at refine", Duration::from_secs(30), || {
+            gate.reached() > reached
+        });
+        for other in &others {
+            hub.cut_class(*other, leader, Class::Consensus);
+        }
+        drop(closed);
+        let mut proposed = 0;
+        vos_checker::wait_until("the call proposed", Duration::from_secs(30), || {
+            proposed = replica(leader).last_index;
+            proposed > first.last_index
+        });
+        vos_checker::wait_until("a successor applied it", Duration::from_secs(60), || {
+            others.iter().any(|other| {
+                let status = replica(*other);
+                status.leads && status.term > first.term && status.applied >= proposed
+            })
+        });
+        assert!(
+            replica(leader).commit < proposed,
+            "not committed at the leader"
+        );
+        hub.heal();
+        answer.join().unwrap()
+    });
+    done(&answer);
+    assert_eq!(
+        refused(founded.send(leader, &call)),
         CredentialRefusal::Replayed
     );
 }

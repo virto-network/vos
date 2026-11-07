@@ -468,27 +468,38 @@ impl Inner {
         request: Request,
     ) -> impl Future<Output = Result<Answered, CallError>> + use<> {
         let (answer, reply) = smol::channel::bounded(1);
-        self.queue_answered(agent, Pending::Request { request, answer }, reply)
+        let pushed = Arc::new(AtomicBool::new(false));
+        self.queue_answered(agent, Pending::Request { request, answer }, reply, pushed)
     }
 
     /// A credentialed call, its proof verified, queued as [`Inner::call`]
-    /// queues a call.
+    /// queues a call, proposed as `origin`'s; `pushed` is set once it is
+    /// queued.
     pub(crate) fn call_credentialed(
         self: &Arc<Self>,
         agent: AgentId,
         call: vos_wire::batch::CredentialedInput,
+        origin: (NodeNumber, u64),
+        pushed: Arc<AtomicBool>,
     ) -> impl Future<Output = Result<Answered, CallError>> + use<> {
         let (answer, reply) = smol::channel::bounded(1);
-        self.queue_answered(agent, Pending::Credentialed { call, answer }, reply)
+        let pending = Pending::Credentialed {
+            call,
+            origin,
+            answer,
+        };
+        self.queue_answered(agent, pending, reply, pushed)
     }
 
     /// Queue `pending`, whose answer `reply` receives: at once when the
-    /// group knows where calls go, else once it does.
+    /// group knows where calls go, else once it does; `pushed` set once it
+    /// is.
     fn queue_answered(
         self: &Arc<Self>,
         agent: AgentId,
         pending: Pending,
         reply: smol::channel::Receiver<Result<Answered, CallError>>,
+        pushed: Arc<AtomicBool>,
     ) -> impl Future<Output = Result<Answered, CallError>> + use<> {
         let known = self.run(agent).is_some_and(|run| {
             let state = run.shared.state();
@@ -508,6 +519,7 @@ impl Inner {
                     inner.push(agent, pending)?;
                 }
             }
+            pushed.store(true, Ordering::SeqCst);
             reply.recv().await.map_err(|_| CallError::Stopped)?
         }
     }
