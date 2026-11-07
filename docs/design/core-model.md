@@ -861,9 +861,15 @@ rule on a log, masking, a list type, and thin clients.
   instance's merge fields alone and reads no row: it runs on a new
   instance's state, its merge fields bound, and the agent traps a read or
   a write of any other row. Its effects are its operation's alone,
-  whatever the device has applied, so every device writes the same. An
-  operation of a kind, or a method, the device's build does not know is
-  held in the scope's rows for a build that does, never refused.
+  whatever the device has applied, so every device writes the same. Each
+  operation carries the release of its actor its issuing device ran. One
+  of a kind the device's build does not know, of a later release than the
+  one installed, or whose run faults on the device, is held in the scope's
+  rows and replayed once the device can run it (an install replays its
+  instance's), never refused. One that is invalid (a frame no device
+  records, or a run that fails where the issuing device records an
+  operation only when its run is done) is quarantined, never applied, and
+  listed with its author.
 - **The storage-backed types** [decided; built, `vos_wire::merge`, the
   SDK's `crdt`]. A merge field keeps **one entry an element or key and
   author chain**, under the element's row and the author's key: the
@@ -891,10 +897,16 @@ rule on a log, masking, a list type, and thin clients.
   never unapplied. An equivocation's is its number, written in the batch
   that applies the second node (merkle-crdt tells the apply); a removal's
   is one past the removed author's frontier, which the device set gives
-  (`Light::cut_off`, `light-node.md` §3.5). The lower stands. *Known
+  (`Light::cut_off`, `light-node.md` §3.5), and the sealed read sets it
+  so. The lower stands. An author's operations that arrive once its
+  cutoff admits them no longer are quarantined, never applied. *Known
   limit:* a field keeps one entry an element and author, so an author's
-  write before its cutoff to an element it rewrote after it is lost to
-  reads, which fall back to the other authors' entries.
+  write past its cutoff that arrives before the cutoff is known replaces
+  its write before it to that element, which reads then lose and fall
+  back to the other authors' entries; agent-mediated sync refuses a
+  removed device's envelopes past its frontier, so only a delivery
+  concurrent with the removal does this. Each author's exact history of
+  an element is later work.
 - **Cost** [measured, Intel Core Ultra 7 155H under other builds' load,
   2026-11-03, the light node on fjall, release, the agent program on the
   interpreter; the step's measuring crate, outside the tree]:
@@ -955,7 +967,8 @@ rule on a log, masking, a list type, and thin clients.
      or an LWW map keeps one entry per (element or key, author chain), and
      a read takes the latest among unfiltered chains (built: the types
      above, with their known limit: a chain's entry is its latest write,
-     so a write past its cutoff hides the chain's earlier one).
+     so a write past its cutoff that arrives before the cutoff is known
+     hides the chain's earlier one; one that arrives after is quarantined).
 
   The decision depends only on the log and the DAG, so every replica
   agrees. It costs O(1) per operation with per-author epoch intervals.

@@ -327,6 +327,16 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
 - Versioned operations, unknown kinds held; validation and quarantine;
   the credential book and the device book; storage-full handling.
 - **Dep:** 8.18a. **Estimate:** 2–3 weeks.
+- **Built** (2026-11-07, `light-node.md` §2.1 and §3.2): operations carry
+  their actor's release (`release::Package`'s `release`), and a later
+  release's, an unknown kind's and a faulted run's are held and replayed
+  by an install; invalid ones, and a cut-off author's that arrive after
+  its cutoff, quarantined and listed with their authors; the sealed read
+  cuts a removed device off one past its node at its frontier, the one
+  source of that cutoff; `vos-credential-book` and `vos-device-book`
+  (`vos_wire::books`); a disk reserve refusing installs, calls, ingests
+  and replays (`Error::Full`); `DeviceError::Rejected` carrying ingress's
+  refusal. The gate: `node/light/tests/local.rs`.
 
 ### 8.19 `vos-mls` and the device group — C
 - `vos-mls` over mls-rs: storage providers over fjall, copy-and-swap, the
