@@ -13,8 +13,9 @@ use crate::{Decode, Encode};
 /// their hashes: the actor's program, which holds its handlers and its
 /// workflows, a kernel for each attestable method, by method in ascending
 /// order, and each device kernel's reference program, likewise; their
-/// provenance, the ELF's hash and the version of the transpiler that
-/// derived them; and the pages of the actor's heap its program leaves out.
+/// provenance, the ELF's hash, the names of its temporary symbols left
+/// out (`vos_pvm_compiler::Derived::elf`), and the version of the
+/// transpiler that derived them; and the pages of the actor's heap its program leaves out.
 /// The same ELF and version derive the same bytes on any machine.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Derivation {
@@ -167,7 +168,8 @@ const _: () = assert!(segment_chip::BITWISE_AND_BYTE + 1 == SEGMENT_CHIPS);
 pub const MAX_CLASSES: usize = 4;
 
 impl Derivation {
-    /// The derivation of package `elf`: its actor's program and each
+    /// The derivation of the package whose ELF's hash is `elf`
+    /// (`vos_pvm_compiler::Derived::elf`): its actor's program and each
     /// attestable method's kernel, by the method's id, with its shape, by
     /// the kernel's position, as version `transpiler` derived them, each
     /// named by its hash, and the `heap` pages its program leaves out. The
@@ -179,7 +181,7 @@ impl Derivation {
     /// If a kernel is not a standard program, or the shapes are not one a
     /// kernel, which a derivation never makes.
     pub fn new(
-        elf: &[u8],
+        elf: [u8; 32],
         actor: &[u8],
         kernels: &[(u32, Vec<u8>)],
         shapes: &[Shape],
@@ -202,7 +204,7 @@ impl Derivation {
                     shape: shape.clone(),
                 })
                 .collect(),
-            elf: crate::result::digest(elf),
+            elf,
             transpiler,
             heap,
             references: references

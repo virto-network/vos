@@ -26,7 +26,7 @@ fn main() {
             let derived = vos_pvm_compiler::derive(&notes).expect("the notes actor derives");
             (
                 vos_pvm_compiler::link_elf_spi(&agent).expect("the agent links"),
-                (derived.derivation(&notes), derived.programs()).encode(),
+                (derived.derivation(), derived.programs()).encode(),
             )
         }
         _ => (Vec::new(), Vec::new()),

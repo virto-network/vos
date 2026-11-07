@@ -77,7 +77,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use crate::TranspileError;
 use crate::linker::{
     Link, LinkedElf, STT_FUNC, Z_Z, direct_targets, in_ranges, merge_ranges, name_at, name_is,
-    parse_linked_elf, range_at, raw_code_pointers, spi_blob, transpile_with, zone_round,
+    parse_linked_elf, range_at, raw_code_pointers, spi_blob, transpile_with,
+    without_temporary_names, zone_round,
 };
 use crate::riscv::rv::{add, addi, auipc, b_type, jal, jalr, ld, lui, sub};
 use crate::riscv::{self, decode_b_imm, decode_j_imm, op};
@@ -166,6 +167,10 @@ pub struct Derived {
     /// which a workflow's machine maps there.
     pub heap: u32,
     pub transpiler_version: u32,
+    /// The hash of the ELF it is derived from, the names of its temporary
+    /// symbols left out: the same for an ELF whose code and data are the
+    /// same.
+    pub elf: [u8; 32],
 }
 
 impl Derived {
@@ -182,11 +187,10 @@ impl Derived {
         programs
     }
 
-    /// The derivation an install of the package `elf`, derived as this,
-    /// names.
-    pub fn derivation(&self, elf: &[u8]) -> vos_wire::records::Derivation {
+    /// The derivation an install of the package it is derived from names.
+    pub fn derivation(&self) -> vos_wire::records::Derivation {
         vos_wire::records::Derivation::new(
-            elf,
+            self.elf,
             &self.actor,
             &self.kernels,
             &self.shapes,
@@ -328,6 +332,7 @@ pub fn derive(elf: &[u8]) -> Result<Derived, DeriveError> {
         schema,
         heap,
         transpiler_version: TRANSPILER_VERSION,
+        elf: vos_wire::result::digest(&without_temporary_names(elf)?),
     })
 }
 

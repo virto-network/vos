@@ -136,7 +136,7 @@ impl Flows {
     /// the node, which stores its programs, and in the model: its program
     /// holds the heap a handler maps, and its workflows map the rest.
     fn install_derived(&mut self, package: &str) -> Input {
-        use vos_testkit::programs::{derivation, derived};
+        use vos_testkit::programs::derived;
         let derived = derived(package);
         self.kit
             .install_derived(Target::Vos, SHOP, &derived, &[])
@@ -147,7 +147,7 @@ impl Flows {
         }
         Input::Admin(Admin::Install {
             instance: SHOP,
-            derivation: derivation(&vos_testkit::programs::package(package), &derived),
+            derivation: derived.derivation(),
             roles: vec![],
             target: Target::Vos,
             space: vos_wire::SpaceId::NONE,

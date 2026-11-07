@@ -370,7 +370,9 @@ fn digest(shown: &str) -> [u8; 32] {
 
 /// The stock kernels' release artifacts of this tree's credential actor,
 /// which the space installs: the ones s4's facility embeds, so a pin of s4
-/// whose artifacts are another credential actor's fails here.
+/// whose artifacts are another credential actor's fails here. They follow
+/// the actor's code and data and the transpiler, never another crate's
+/// edit that leaves those as they are.
 fn stock() -> Stock {
     let elf = std::fs::read(vos_testkit::programs::credentials_elf()).unwrap();
     let artifact =
@@ -381,7 +383,8 @@ fn stock() -> Stock {
     };
     assert!(
         stock == Stock::embedded(),
-        "s4's embedded stock artifacts are not this tree's: re-pin s4 after `just vos-release`"
+        "s4's embedded stock artifacts are not this tree's: the credential actor's code or the \
+         transpiler moved; run s4's `just vos-release` at this tree and re-pin s4"
     );
     stock
 }

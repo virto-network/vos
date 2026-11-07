@@ -8,7 +8,10 @@
 //! `agent/test-actors/target/riscv64em-vos/release/roomy.elf`. A rebuild
 //! derives the same programs while the actor's source stands, but not the
 //! same file: its symbols' names carry crate hashes that follow where it
-//! was built and the SDK's dependencies.
+//! was built and the SDK's dependencies. Its ELF hash leaves the temporary
+//! symbols' names out, which carry the dependencies' hashes, so an edit to
+//! a dependency that leaves the code as it is moves neither the programs
+//! nor the hash.
 
 use vos_pvm_compiler::{TRANSPILER_VERSION, derive};
 
@@ -35,11 +38,16 @@ const PINNED: (u32, &str, u32, [(u32, &str); 3]) = (
     ],
 );
 
+/// The fixture's ELF hash, the names of its temporary symbols left out:
+/// what every derivation and release artifact of it names.
+const ELF: &str = "55ccaddc6f02637ff36bf7f621ad060d752a628cb11abdc126b9965facfea51f";
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn hash(bytes: &[u8]) -> String {
-    vos_pvm::precompile::blake2b_256(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    hex(&vos_pvm::precompile::blake2b_256(bytes))
 }
 
 #[test]
@@ -65,4 +73,40 @@ fn a_fixed_package_derives_its_pinned_programs() {
         (PINNED.0, PINNED.1.to_string(), PINNED.2, pinned),
         "the derivation's bytes changed: move TRANSPILER_VERSION, and pin what it derives"
     );
+}
+
+/// `elf` with the byte `at` bytes into each occurrence of `name` set to
+/// `to`, and how many it changed.
+fn renamed(elf: &[u8], name: &[u8], at: usize, to: u8) -> (Vec<u8>, usize) {
+    let mut renamed = elf.to_vec();
+    let mut changed = 0;
+    for start in 0..elf.len().saturating_sub(name.len()) {
+        if elf[start..].starts_with(name) {
+            renamed[start + at] = to;
+            changed += 1;
+        }
+    }
+    (renamed, changed)
+}
+
+/// A rebuild after an edit to a dependency, its code the same, differs in
+/// its anonymous data's names (`.Lanon.<hash>.<n>`), whose hash is the
+/// dependency's: its ELF hash, its programs and its derivation stay. Any
+/// other name moves the hash.
+#[test]
+fn an_elf_hash_leaves_out_temporary_symbols_names() {
+    let elf = include_bytes!("fixtures/roomy.elf");
+    let derived = derive(elf).expect("derives");
+    assert_eq!(hex(&derived.elf), ELF);
+
+    let (rebuilt, names) = renamed(elf, b".Lanon.", 7, b'0');
+    assert!(names > 0, "the fixture names its anonymous data");
+    assert_ne!(&rebuilt[..], &elf[..]);
+    let again = derive(&rebuilt).expect("derives");
+    assert_eq!(again.derivation(), derived.derivation());
+    assert_eq!(again.programs(), derived.programs());
+
+    let (renamed, names) = renamed(elf, b"_RNv", 4, b'Z');
+    assert!(names > 0, "the fixture names its functions");
+    assert_ne!(derive(&renamed).expect("derives").elf, derived.elf);
 }

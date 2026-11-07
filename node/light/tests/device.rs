@@ -752,7 +752,7 @@ fn the_stock_kernels_programs_come_from_their_release_artifacts() {
     expected.sort();
     assert_eq!(methods, expected);
     for device in &devices {
-        assert_eq!(device.elf, vos_wire::result::digest(&elf));
+        assert_eq!(device.elf, vos_pvm_compiler::derive(&elf).unwrap().elf);
         let program = DeviceProgram::released(device).unwrap();
         assert_eq!(program.id(), &device.id);
         assert_eq!(program.log_sizes(), &device.log_sizes[..]);

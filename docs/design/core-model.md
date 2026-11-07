@@ -261,7 +261,11 @@ impl Ledger {
   program, which holds its handlers and its workflows, and one kernel per
   attestable method (section 11.1). The install record holds the derived
   program and kernel hashes, the schema, the transpiler's version and the
-  ELF's hash. Derived hashes are per transpiler version, so two spaces
+  ELF's hash, the names of its temporary symbols (`.L…`) left out: a
+  compiler names anonymous data after its dependencies' hashes, so an edit
+  to another crate that leaves the actor's code and data as they are moves
+  neither its programs nor its install record, nor a release artifact of
+  it. Derived hashes are per transpiler version, so two spaces
   agree on a kernel's hash only when they derive with the same version.
   It also names its target, VOS or JAM, whose limits its statics were
   checked against and its steps run within (section 12): the agent's,

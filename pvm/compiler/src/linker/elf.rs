@@ -88,6 +88,41 @@ pub(crate) fn name_is(table: &[u8], offset: usize, name: &[u8]) -> bool {
         .is_some_and(|rest| rest.first() == Some(&0))
 }
 
+/// `data` with the names of its temporary symbols (`.L…`) zeroed in their
+/// string tables: what a package's ELF hash covers. A compiler names its
+/// anonymous data after its dependencies' hashes, which move with any edit
+/// to them, and the transpiler reads no such name; the rest of the bytes,
+/// the code, data, relocations and every other name, stay.
+pub(crate) fn without_temporary_names(data: &[u8]) -> Result<Vec<u8>, TranspileError> {
+    let headers = sections(data)?.headers;
+    let mut kept = data.to_vec();
+    for symtab in headers.iter().filter(|header| header.sh_type == SHT_SYMTAB) {
+        let (Some(table), Some(names)) = (
+            span(data, symtab.file_off, symtab.size),
+            headers.get(symtab.link),
+        ) else {
+            continue;
+        };
+        let (Some(start), Some(strtab)) = (
+            usize::try_from(names.file_off).ok(),
+            span(data, names.file_off, names.size),
+        ) else {
+            continue;
+        };
+        for entry in table.chunks_exact(SYMBOL_ENTRY) {
+            let at = u32::from_le_bytes(entry[0..4].try_into().expect("four bytes")) as usize;
+            let Some(name) = strtab.get(at..) else {
+                continue;
+            };
+            let len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+            if name[..len].starts_with(b".L") {
+                kept[start + at..start + at + len].fill(0);
+            }
+        }
+    }
+    Ok(kept)
+}
+
 /// A section header's fields the linker reads.
 pub(super) struct SectionInfo {
     name_off: usize,

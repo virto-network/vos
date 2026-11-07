@@ -77,7 +77,7 @@ impl Package {
 pub fn package(elf: &[u8]) -> Result<Package, String> {
     let derived = vos_pvm_compiler::derive(elf).map_err(|error| error.to_string())?;
     Ok(Package {
-        derivation: derived.derivation(elf),
+        derivation: derived.derivation(),
         programs: derived.programs(),
     })
 }
@@ -94,7 +94,7 @@ pub fn agent(elf: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(feature = "release")]
 pub fn devices(elf: &[u8]) -> Result<Vec<Device>, String> {
     let derived = vos_pvm_compiler::derive(elf).map_err(|error| error.to_string())?;
-    let derivation = derived.derivation(elf);
+    let derivation = derived.derivation();
     derived
         .references
         .iter()

@@ -145,7 +145,7 @@ fn an_install_binds_each_kernel_to_an_attestable_method() {
 /// kernel, within its method's gas limit for JAM.
 #[test]
 fn derived_kernels_run_in_the_agent() {
-    use vos_testkit::programs::{derivation, derived, package};
+    use vos_testkit::programs::derived;
     let derived = derived("kernels");
     let instance = InstanceId(9);
     let kernels: Vec<(MethodId, &[u8])> = derived
@@ -162,7 +162,7 @@ fn derived_kernels_run_in_the_agent() {
     {
         let install = Input::Admin(Admin::Install {
             instance,
-            derivation: derivation(&package("kernels"), &derived),
+            derivation: derived.derivation(),
             roles: vec![],
             target,
             space: vos_wire::SpaceId::NONE,
@@ -198,7 +198,7 @@ fn derived_kernels_run_in_the_agent() {
 /// installed first.
 #[test]
 fn a_device_kernels_method_is_never_attested() {
-    use vos_testkit::programs::{credentials_elf, derivation, derived, package};
+    use vos_testkit::programs::{credentials_elf, derived};
     let derived = derived("device");
     let instance = InstanceId(9);
     let kernels: Vec<(MethodId, &[u8])> = derived
@@ -230,8 +230,8 @@ fn a_device_kernels_method_is_never_attested() {
         })
     };
     let installs = vec![
-        install(InstanceId(8), credentials.derivation(&elf), &["registrar"]),
-        install(instance, derivation(&package("device"), &derived), &[]),
+        install(InstanceId(8), credentials.derivation(), &["registrar"]),
+        install(instance, derived.derivation(), &[]),
     ];
     for step in &node.batch(0, installs).steps {
         ran_done(step);

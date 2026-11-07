@@ -3,7 +3,7 @@
 //! statics pass them, or which names another target than its agent's, is
 //! refused.
 
-use vos_testkit::programs::{actor, derivation, derived, method, package};
+use vos_testkit::programs::{actor, derived, method, package};
 use vos_testkit::{InstallError, Testkit};
 use vos_wire::abi::cap::{JAM, Refused, Target, VOS};
 use vos_wire::abi::{Failure, INVOCATION_HEAP};
@@ -52,7 +52,7 @@ fn derived_install(
     for (_, kernel) in &derived.kernels {
         node.add(kernel);
     }
-    let input = install(instance, derivation(&package(name), &derived), target);
+    let input = install(instance, derived.derivation(), target);
     let model = kit.install_derived(target, instance, &derived, &[("minter", MINTER)]);
     (input, model)
 }
@@ -298,7 +298,7 @@ fn a_device_kernels_gas_is_not_held_to_jams_kernel_cap() {
         assert_eq!(model, Ok(()));
         let credentials = Input::Admin(Admin::Install {
             instance: InstanceId(1),
-            derivation: credentials.derivation(&elf),
+            derivation: credentials.derivation(),
             roles: vec![(b"registrar".to_vec(), MINTER)],
             target: Target::Jam,
             space: SpaceId::NONE,

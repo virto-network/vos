@@ -255,18 +255,15 @@ impl Home {
     /// Installed, the role `homes` granted to `homes`.
     pub fn installed_for(homes: Principal) -> Self {
         // Derived once a run: a pool's agents each install it.
-        static DERIVED: std::sync::OnceLock<(Vec<u8>, vos_pvm_compiler::Derived)> =
-            std::sync::OnceLock::new();
-        let (elf, derived) = DERIVED.get_or_init(|| {
-            let elf = std::fs::read(personal_elf()).unwrap();
-            let derived = vos_pvm_compiler::derive(&elf).expect("derives");
-            (elf, derived)
+        static DERIVED: std::sync::OnceLock<vos_pvm_compiler::Derived> = std::sync::OnceLock::new();
+        let derived = DERIVED.get_or_init(|| {
+            vos_pvm_compiler::derive(&std::fs::read(personal_elf()).unwrap()).expect("derives")
         });
         let mut node = Node::new();
         node.add(&derived.actor);
         let install = Input::Admin(Admin::Install {
             instance: PERSONAL,
-            derivation: derived.derivation(elf),
+            derivation: derived.derivation(),
             roles: vec![(b"homes".to_vec(), HOMES_ROLE)],
             target: Target::Vos,
             space: SpaceId::NONE,

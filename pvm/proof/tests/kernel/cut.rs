@@ -20,7 +20,7 @@ use vos_pvm_proof::{Proof, ProvingError, prove_shaped};
 use vos_statement::{ProgramId, Statement};
 use vos_testkit::Step;
 use vos_testkit::Testkit;
-use vos_testkit::programs::{derivation, derived, method, package, table_tag};
+use vos_testkit::programs::{derived, method, table_tag};
 use vos_tree::{BatchProof, Blake2b, Hash, MemStore};
 use vos_venue::{ModelVenue, VenueClient};
 use vos_wire::abi::cap::Target;
@@ -331,7 +331,7 @@ pub fn read_live(
 /// `actor`'s kernel that made `attest`, and its install's record of it.
 pub fn kernel_of(actor: &str, attest: &Attest) -> (Vec<u8>, vos_wire::records::Kernel) {
     let derived = derived(actor);
-    let install = derivation(&package(actor), &derived);
+    let install = derived.derivation();
     let blob = derived
         .kernels
         .iter()

@@ -46,7 +46,6 @@ fn representative() -> (Node, Testkit) {
         (SPACE, CLOCK),
         Target::Vos,
         REPRESENTATIVE,
-        &package,
         &derived,
     );
     assert!(

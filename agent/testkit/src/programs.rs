@@ -98,11 +98,6 @@ pub fn derived(name: &str) -> Derived {
         .clone()
 }
 
-/// The derivation an install of package `elf`, derived as `derived`, names.
-pub fn derivation(elf: &[u8], derived: &Derived) -> Derivation {
-    derived.derivation(elf)
-}
-
 /// The derivation of an actor program a test holds alone, linked or built:
 /// no kernels, and no ELF it names.
 pub fn bare(program: ProgramHash) -> Derivation {

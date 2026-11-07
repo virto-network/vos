@@ -37,7 +37,7 @@ pub fn program_id(elf: &[u8], method: &str) -> Result<[u32; 8], String> {
     let id = schema
         .method_id(method)
         .ok_or_else(|| format!("no method {method}"))?;
-    let install = derived.derivation(elf);
+    let install = derived.derivation();
     let record = install
         .kernels
         .iter()
