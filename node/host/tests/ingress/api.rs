@@ -109,13 +109,16 @@ fn unknown_kinds_and_truncated_frames_are_refused_and_closed() {
             "{kind:#06x}"
         );
     }
-    // A length short of the header: no id to answer.
+    // A length short of the header: no id to answer. One write, so the
+    // node's close on reading the length cannot meet a later write.
     let mut stream = connect(&served.socket);
-    stream.write_all(&9u32.to_le_bytes()).unwrap();
-    stream
-        .write_all(&(Kind::Time as u16).to_le_bytes())
-        .unwrap();
-    stream.write_all(&[0; 8]).unwrap();
+    let short = [
+        &9u32.to_le_bytes()[..],
+        &(Kind::Time as u16).to_le_bytes(),
+        &[0; 8],
+    ]
+    .concat();
+    stream.write_all(&short).unwrap();
     assert_eq!(refused(&mut stream, 0), FrameError::Truncated);
     // A body cut short, then the write side shut: answered under its id.
     let mut stream = connect(&served.socket);
