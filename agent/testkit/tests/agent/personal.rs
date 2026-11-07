@@ -23,16 +23,16 @@ use vos_testkit::programs::{method, personal, personal_elf};
 use vos_wire::abi::Failure;
 use vos_wire::abi::cap::Target;
 
-use vos_wire::batch::{Admin, Input, Query, Request, Work};
+use vos_wire::batch::{Admin, Body, Input, Message, Query, Request, Work};
 use vos_wire::defaults::SESSION_EXPIRY_MS;
-use vos_wire::ids::{InstanceId, MethodId, Principal, Session};
+use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
 use vos_wire::ingress::{Grant, call_message};
 use vos_wire::personal::{
     AdminClass, Attached, Attestation, Candidacy, DeviceId, Effect, HOUR_MS, Header, Kit, KitEntry,
     KitKind, NewDevice, NewKit, Operation, Overview, PersonalError, Policy, Pushed, Recorded,
     RecoveryView, Scope, Voted, Woken, r_hash, r2_hash,
 };
-use vos_wire::result::{Outcome, Run, Step};
+use vos_wire::result::{Outcome, Outgoing, Run, Step};
 use vos_wire::{Decode, Encode, SpaceId, WindowClock};
 
 use crate::common::{Node, ran};
@@ -242,25 +242,38 @@ pub struct Home {
     pub now: u64,
     /// The most gas each method's call used.
     pub gas: BTreeMap<String, u64>,
+    /// The messages its steps sent, for a test that relays them.
+    pub outbox: Vec<Outgoing>,
 }
 
 impl Home {
     /// Installed, not assigned.
     pub fn installed() -> Self {
+        Self::installed_for(HOMES)
+    }
+
+    /// Installed, the role `homes` granted to `homes`.
+    pub fn installed_for(homes: Principal) -> Self {
+        // Derived once a run: a pool's agents each install it.
+        static DERIVED: std::sync::OnceLock<(Vec<u8>, vos_pvm_compiler::Derived)> =
+            std::sync::OnceLock::new();
+        let (elf, derived) = DERIVED.get_or_init(|| {
+            let elf = std::fs::read(personal_elf()).unwrap();
+            let derived = vos_pvm_compiler::derive(&elf).expect("derives");
+            (elf, derived)
+        });
         let mut node = Node::new();
-        let elf = std::fs::read(personal_elf()).unwrap();
-        let derived = vos_pvm_compiler::derive(&elf).expect("derives");
         node.add(&derived.actor);
         let install = Input::Admin(Admin::Install {
             instance: PERSONAL,
-            derivation: derived.derivation(&elf),
+            derivation: derived.derivation(elf),
             roles: vec![(b"homes".to_vec(), HOMES_ROLE)],
             target: Target::Vos,
             space: SpaceId::NONE,
             clock: WindowClock::DEFAULT,
         });
         let grant = Input::Admin(Admin::SetRole(Grant {
-            principal: HOMES,
+            principal: homes,
             role: Some(HOMES_ROLE),
         }));
         let result = node.batch(T0 - 1, vec![install, grant]);
@@ -273,6 +286,7 @@ impl Home {
             sessions: BTreeMap::new(),
             now: T0,
             gas: BTreeMap::new(),
+            outbox: Vec::new(),
         }
     }
 
@@ -314,8 +328,30 @@ impl Home {
         let result = self.node.batch(self.now, vec![input]);
         self.now += 1;
         match result.steps.into_iter().next() {
-            Some(Step::Ran(run)) => run,
+            Some(Step::Ran(run)) => {
+                self.outbox.extend(run.messages.iter().cloned());
+                run
+            }
             other => panic!("{name}: {other:?}"),
+        }
+    }
+
+    /// A message from agent `from`, its `sequence`-th to this one, alone in
+    /// a batch: its run.
+    pub fn deliver(&mut self, from: AgentId, sequence: u64, body: Body) -> Run {
+        let input = Input::Message(Message {
+            from,
+            sequence,
+            body,
+        });
+        let result = self.node.batch(self.now, vec![input]);
+        self.now += 1;
+        match result.steps.into_iter().next() {
+            Some(Step::Ran(run)) => {
+                self.outbox.extend(run.messages.iter().cloned());
+                run
+            }
+            other => panic!("a message: {other:?}"),
         }
     }
 

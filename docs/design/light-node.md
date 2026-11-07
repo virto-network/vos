@@ -455,6 +455,111 @@ operator makes ahead of time**:
   pool, is later work (§9.3): nothing can lapse within slice 8's first
   year.
 
+**`Homes` as built** [built, `agent/homes`, its wire types
+`vos_wire::homes`; tested in the testkit's agent suite,
+`agent/testkit/tests/agent/homes.rs`, and on three nodes,
+`node/host/tests/served/homes.rs`; where the text above leaves a choice,
+this is the one taken]:
+- **Its tables,** its struct holding tables alone (the layout
+  append-only, as `Personal`'s): every agent stocked with its standing
+  (`Pooled`, `Claimed`, `Assigned`, `Retired`, with no times, which would
+  link an agent to the ring's enrollments), the claim's nullifier and its
+  kit's indexes; the pool, lowest id first; the nullifier and kit-key
+  indexes; the terms; the counts.
+- **The operator's** (role `operator`): `configure(Terms)`, `Personal`'s
+  instance in the pool's agents and the policy each is configured with
+  before its claim (the home's delays, lease and quotas, minutes on a test
+  home); `stock(agents)`, at most 256 a call, an agent stocked already left
+  as it is, so a keeper that lost the answer stocks the page again (34.1M
+  gas for 200 [measured, the testkit's agent suite, Core Ultra 7 155H,
+  2026-11-07; gas is deterministic], 50M declared); `release(agent)`, a
+  claim its agent never answered (its role not granted, a wrong instance)
+  dropped and the agent retired.
+- **The claim** (`claim(device, kit)` under `Auth("home")`, 0.69M gas):
+  the device's `nullifier` must be the proof's (`Nullifier`); a nullifier
+  holding an agent is `Claimed`, a kit entry's index holding one
+  `KitTaken`, more than four entries or one key twice among the device's
+  and the kit's `Malformed` (what `Personal` would refuse, so a refusal
+  cannot be repeated against a pooled agent), an empty pool `PoolEmpty`,
+  each writing nothing. A kit may be empty (no recovery). The lowest
+  pooled agent is taken and indexed, and sent `claim(device, kit, policy,
+  homes)`, `Personal`'s entry for its home: the policy and the claim
+  checked whole, answered by message, `assigned`, or `refused` with the
+  error and nothing written (`assign` and `configure` stay for a home's
+  stand-in, and answer only their caller). The reply is the agent's id.
+  The same claim again (its nullifier and kit) while its answer is awaited
+  is sent again, and `Personal` answers `assigned` again to a claim it
+  took from the same home, so an answer lost is recovered by the device's
+  retry. A refused claim's indexes are dropped and its agent pooled again,
+  unless `Personal` says it was assigned already (`Retired`, never pooled
+  again).
+- **Personal tells its home** (the agent and instance its `claim` named)
+  each device's nullifier as its add is confirmed, and the restore's
+  device's at its maturity (`record`, refused for a nullifier another agent
+  holds), each removed device's as its removal matures (`forget`, so a
+  stolen phone renews nothing and the index stays at the device set's
+  size), and the kit's signing keys whenever a rotation or a restore
+  replaces it (`rekey`, the agent re-indexed under the new keys alone, a
+  key indexing another agent left out, and that kit then finding no agent:
+  a squatted kit key is the next rotation's to replace). A device's
+  nullifier is its own word, as its keys are: the agent's devices could
+  record a nullifier not theirs, holding a member who has not claimed out
+  of the home, which a nullifier's 32 bytes keep from anyone who never
+  saw it. These messages name `Homes`'
+  handlers by their ids (`vos_sdk::method_id!`), since `Homes` depends on
+  `Personal`'s crate for its own messages; the relayed suites prove the
+  ids by the answers taken.
+- **The re-proof** (`renew(agent)` under `Auth("home")`): a nullifier
+  recorded for that agent, assigned (`NotRecorded`, `Unknown`); it sends
+  the agent `renew`, which runs the lease on and lifts the quota to its
+  larger size. **Not built:** B20's re-recording after a re-founding, when
+  every nullifier changes: a re-proof needs a nullifier recorded, and
+  `Personal` records one only at a device's add, so a re-founded home's
+  agents lapse into their grace unless a device re-records; the path (a
+  device's new nullifier vouched for by its admin key and relayed by
+  `Personal`) waits for the re-founding runbook.
+- **Reads:** the agent of a nullifier (`agent`), of a kit entry's index
+  (`find`, a restore's lookup), an agent's standing (`standing_of`), the
+  counts (`tally`), and the stocked agents a page at a time (`agents`,
+  which the keeper's upgrade walks).
+- **The scope reserved** [built, `vos_light::home`]: `Prover::prove_auth`
+  refuses the guard name "home" (`DeviceError::Reserved`), and
+  `Prover::prove_home` proves in it only a call of `claim` or `renew`; a
+  device computes its own nullifier there with no proof
+  (`home::nullifier`). s4's facility links the library, so it refuses
+  the same; its own operations are unchanged.
+- **The open claim's work** (`home::work`): a nonce found on the device's
+  threads for the registrar's terms (`identity-and-authority.md` §6),
+  which publish the cap. A query reads at the last batch's time, so on a
+  home no batch reached for a period the salt served is the one before;
+  past two periods its work is refused `Work` and the device asks again.
+- **The cap and `PoolEmpty`:** the cap is the registrar's, refusing an
+  open claim past it (`Cap`); `PoolEmpty` is `Homes'`, when the pool is
+  empty. With the cap below the keeper's refill, members joining at the
+  cap every period never drain the pool, and a keeper that stops shows as
+  `PoolEmpty` once the pool runs dry
+  (`the_cap_keeps_the_pool_and_an_empty_pool_is_pool_empty`).
+- **The keeper** [built, `tools/keeper`, `vos-keeper`]: under an operator
+  key every node lists, whose client key holds `operator` at the home's
+  agent; `top-up --to N` makes agents (created on the home's replicas,
+  `Personal` installed with its role `homes`, that role granted to the
+  home's agent, sixteen at once by default) and stocks them a page at a
+  time, a failure stopping it once the agents made before it are stocked;
+  `stock`; `upgrade --elf`, `Personal` installed over every agent `Homes`
+  lists when it starts, a batch at a time, stopping after the batch holding
+  a refusal; `tally`. It reads the install's answer back, not the agent's
+  `version`, which only the onion reaches. On three nodes in one process it
+  made and stocked 200 agents in 23.2–26.9 s, sixteen at once; 200 members'
+  claims, each proved by the device library (four provers of three threads
+  each), were taken in 78.5–84.2 s, about 1.6–1.7 s a proof on one prover,
+  and every claim was assigned [measured, the served suite on a debug build
+  with the prover's crates optimized, Core Ultra 7 155H, 2026-11-07, two
+  runs].
+- **The `home` test actor stays, for tests alone** (`agent/test-actors/
+  home`): it passes a client's `assign`, `configure` and `renew` on to a
+  personal agent with no proof, for the suites of `Personal` itself, the
+  light node's and the scale harness's; a home runs `Homes`.
+
 **Replicas:** three by default, the space's policy, fixed when the keeper
 makes the agent. One replica is allowed for small spaces and shown in the
 chrome (§8, B10). **Cost:** about 46 KiB and 1.6 µs/s a replica when idle
@@ -565,9 +670,9 @@ more are due, which `wake` settles one a call; then the slots that expired
 and the pending candidate's timeout. A refused call writes nothing, so its
 settling waits for the next call that runs, and a read computes a device's
 standing from the time it reads at. The home's
-calls (`configure`, `assign`, `renew`) take the role `homes`; `assign`
-answers its caller, and the `assigned`/`refused` message to `Homes` is
-plan 8.14's. Bounds the rules above leave open: `alive` is logged at
+calls (`configure`, `assign`, `claim`, `renew`) take the role `homes`;
+`assign` answers its caller, and `claim` answers `Homes` by message
+(below, "`Homes` as built"). Bounds the rules above leave open: `alive` is logged at
 most once an hour a device (the entry logged last answers between), a
 vote's signed message names its candidate's log index as well as its
 epoch (an epoch's number is free again after a void), an opener holds one
@@ -3133,7 +3238,9 @@ the alarm. (8.20, 8.21)
 The agents and `Homes`' indexes survive if the agents do; the "home"
 scope includes the space, so nullifiers change. *Mitigation:* each device
 re-records its new nullifier at its next re-proof; the kit carries the
-home's stable handle, not its `SpaceId`. (8.14)
+home's stable handle, not its `SpaceId`. *Known limit:* the re-recording
+is not built; it waits for the re-founding runbook (§3.3, "`Homes` as
+built"). (8.14)
 
 ### 8.3 Data, storage and quotas
 

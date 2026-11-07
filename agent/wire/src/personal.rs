@@ -112,6 +112,13 @@ pub fn r_hash(r: &[u8; 32]) -> [u8; 32] {
     hash(b"vos/personal/r", &[r])
 }
 
+/// The index `Homes` keeps a personal agent under for a recovery kit's
+/// entry whose signing key is `signing`: `BLAKE2b-256("vos/personal/kit/
+/// index" ‖ signing)`, so a kit finds its agent with no agent id.
+pub fn kit_index(signing: &[u8; 32]) -> [u8; 32] {
+    hash(b"vos/personal/kit/index", &[signing])
+}
+
 /// The control log's chain after the entry at `index`: over the chain
 /// before it and the entry's time and body, encoded. The chain before the
 /// first entry is zeros.

@@ -42,7 +42,6 @@ const SALT_DOMAIN: &[u8] = b"vos/personal/kit/v1";
 const SIGNING: &[u8] = b"vos/personal/kit/signing";
 const SEALING: &[u8] = b"vos/personal/kit/sealing";
 const SEAL: &[u8] = b"vos/personal/kit/r1";
-const INDEX: &[u8] = b"vos/personal/kit/index";
 
 /// The salt a security key's `hmac-secret` takes for its kit:
 /// `SHA-256("vos/personal/kit/v1")`, apart from every space's handle a
@@ -221,7 +220,7 @@ impl KitSecret {
 /// The index `Homes` keeps a personal agent under for a kit whose signing
 /// key is `signing`: `BLAKE2b-256("vos/personal/kit/index" ‖ signing)`.
 pub fn index(signing: &[u8; 32]) -> [u8; 32] {
-    *hash(INDEX, &[signing])
+    vos_wire::personal::kit_index(signing)
 }
 
 /// `R1` sealed to `key`'s sealing key at the agent whose identity is

@@ -1,6 +1,6 @@
 //! The guest programs this repository builds (`just build-agent
 //! build-representative build-credentials build-personal build-payments
-//! build-test-actors`), linked or
+//! build-homes build-test-actors`), linked or
 //! derived as an install derives them, and their methods by name: for the
 //! tests and benches of the testkit and of the node.
 
@@ -19,7 +19,7 @@ fn guest(path: &str) -> PathBuf {
     assert!(
         path.exists(),
         "{}: run `just build-agent build-representative build-credentials build-personal \
-         build-payments build-test-actors`",
+         build-payments build-homes build-test-actors`",
         path.display()
     );
     path
@@ -48,6 +48,11 @@ pub fn credentials_elf() -> PathBuf {
 /// The personal agent's actor's ELF.
 pub fn personal_elf() -> PathBuf {
     guest("programs/target/riscv64em-vos/release/vos-personal.elf")
+}
+
+/// The home's actor's ELF.
+pub fn homes_elf() -> PathBuf {
+    guest("programs/target/riscv64em-vos/release/vos-homes.elf")
 }
 
 /// The personal agent's actor's package, as its crate builds it.
@@ -146,6 +151,11 @@ pub fn personal() -> Vec<u8> {
 /// The ledger, `Payments`, linked.
 pub fn payments() -> Vec<u8> {
     link(&payments_elf())
+}
+
+/// The home's actor, linked.
+pub fn homes() -> Vec<u8> {
+    link(&homes_elf())
 }
 
 /// The default agent, linked, and the counter actor, linked and as its

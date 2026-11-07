@@ -119,8 +119,23 @@ impl Prover {
     /// the scope of the guard named `name`, for `call`, the binding naming
     /// the program. The witness is checked first: a path that does not
     /// place the member's leaf under its root is [`DeviceError::Witness`],
-    /// before any proving.
+    /// before any proving. The home's scope, "home", is reserved
+    /// ([`DeviceError::Reserved`]): [`Prover::prove_home`] proves in it.
     pub fn prove_auth(
+        &self,
+        secret: &DeviceSecret,
+        witness: &AuthWitness,
+        name: &[u8],
+        call: &Call,
+        program: &DeviceProgram,
+    ) -> Result<Proven, DeviceError> {
+        if name == crate::home::SCOPE {
+            return Err(DeviceError::Reserved);
+        }
+        self.prove_in_scope(secret, witness, name, call, program)
+    }
+
+    pub(crate) fn prove_in_scope(
         &self,
         secret: &DeviceSecret,
         witness: &AuthWitness,

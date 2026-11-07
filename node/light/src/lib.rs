@@ -22,6 +22,9 @@
 //!   every envelope opened and its node applied; the archive pushed at each
 //!   confirmed epoch, and the recovery envelopes under `R`; over the onion
 //!   alone.
+//! - **The home** ([`home`]): the open claim's work, the device's
+//!   nullifier in the home's scope, and that scope reserved for the claim
+//!   and its re-proofs.
 //! - **The recovery kit** ([`kit`]): a phrase or a security key's 32
 //!   bytes, the kit's signing and sealing keys, and `R = R1 ⊕ R2` split
 //!   across the kit and the agent.
@@ -65,6 +68,7 @@
 
 mod call;
 pub mod group;
+pub mod home;
 mod kernel;
 pub mod kit;
 mod light;
@@ -165,6 +169,9 @@ pub enum DeviceError {
     /// The node could not compute one of the window's programs yet: ask
     /// again, or another replica.
     Unavailable,
+    /// A proof in the home's reserved scope for a call that is not its
+    /// claim or re-proof (`light-node.md` §3.3).
+    Reserved,
 }
 
 impl core::fmt::Display for DeviceError {
@@ -177,6 +184,7 @@ impl core::fmt::Display for DeviceError {
             DeviceError::Decode => "the answer does not decode",
             DeviceError::Verify => "the proof does not verify",
             DeviceError::Unavailable => "the node holds the space's programs not yet: ask again",
+            DeviceError::Reserved => "the home's scope proves only its claim and re-proofs",
             DeviceError::Window => {
                 "the space admits none of this app's programs for the kernel: the app or the \
                  space must update"

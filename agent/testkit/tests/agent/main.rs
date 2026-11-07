@@ -5,6 +5,7 @@
 mod common;
 mod credentialed;
 mod credentials;
+mod homes;
 mod hosts;
 mod jam;
 mod limits;

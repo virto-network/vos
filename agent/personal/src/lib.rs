@@ -38,6 +38,7 @@
 extern crate alloc;
 
 mod devices;
+pub mod home;
 mod rows;
 mod rules;
 
@@ -154,6 +155,8 @@ pub struct Personal {
     slots: Table<Scope, Slot>,
     /// Open slots by their expiry.
     closing: Table<(u64, Scope), (), Ordered>,
+    /// The home's `Homes` that claimed the agent: its agent and instance.
+    home: Table<u8, (u32, u32)>,
 }
 
 #[messages]
@@ -202,6 +205,7 @@ impl Personal {
             inbox: Table::default(),
             slots: Table::default(),
             closing: Table::default(),
+            home: Table::default(),
         }
     }
 
@@ -229,38 +233,55 @@ impl Personal {
         device: NewDevice,
         kit: Kit,
     ) -> Result<Recorded, PersonalError> {
-        let now = ctx.now();
-        if self.lease.contains(&ONE) {
-            return Err(PersonalError::Assigned);
+        self.take(ctx.now(), device, kit)
+    }
+
+    /// [`Personal::configure`] then [`Personal::assign`] for the home's
+    /// `Homes` at `homes` in the calling agent, answered by message (a send
+    /// is one-way): `assigned`, or `refused` with the error, writing
+    /// nothing. The same claim again, from the same home, is answered
+    /// `assigned` again. From then on the agent tells `Homes` each device's
+    /// nullifier as its add is confirmed and as its removal matures, and
+    /// each new kit's keys.
+    #[msg(role = "homes")]
+    pub async fn claim(
+        &mut self,
+        ctx: &mut Command<Self>,
+        device: NewDevice,
+        kit: Kit,
+        policy: Policy,
+        homes: u32,
+    ) -> Result<(), PersonalError> {
+        let Principal::Agent(agent) = ctx.caller() else {
+            return Err(PersonalError::NotAdmitted);
+        };
+        let to = Ref::<home::Homes>::new(InstanceId(homes));
+        let again = self.home.get(&ONE) == Some((agent.0, homes))
+            && self
+                .devices
+                .get(&0)
+                .is_some_and(|first| first.keys == device);
+        if again {
+            ctx.send(agent, to, home::Assigned {});
+            return Ok(());
         }
-        if kit.entries.len() > KIT_ENTRIES {
-            return Err(PersonalError::Malformed);
-        }
-        let mut keys: Vec<[u8; 32]> = Vec::from([device.sync, device.admin]);
-        keys.extend(kit.entries.iter().map(|entry| entry.signing));
-        for (i, key) in keys.iter().enumerate() {
-            if keys[..i].contains(key) {
-                return Err(PersonalError::KeyTaken);
+        let previous = self.policy.get(&ONE);
+        self.policy.insert(&ONE, &policy);
+        match self.take(ctx.now(), device, kit) {
+            Ok(_) => {
+                self.append(ctx.now(), Body::Configured(policy));
+                self.home.insert(&ONE, &(agent.0, homes));
+                ctx.send(agent, to, home::Assigned {});
+            }
+            Err(error) => {
+                match previous {
+                    Some(previous) => self.policy.insert(&ONE, &previous),
+                    None => self.policy.remove(&ONE),
+                }
+                ctx.send(agent, to, home::Refused { error });
             }
         }
-        let first = self.add_device(now, now, device)?;
-        for (i, entry) in kit.entries.iter().enumerate() {
-            self.admitted.insert(&entry.signing, &Holder::Kit(i as u8));
-            self.kit.insert(&(i as u8), entry);
-        }
-        self.secrets.insert(&ONE, &kit.r2);
-        let lease_ms = self.policy().lease_ms;
-        self.lease.insert(
-            &ONE,
-            &Lease {
-                until: now.saturating_add(lease_ms),
-                reproved: false,
-            },
-        );
-        self.seen.insert(&first, &now);
-        let kit = kit.entries.iter().map(|entry| entry.signing).collect();
-        let index = self.append(now, Body::Assigned { device: first, kit });
-        Ok(Recorded { at: now, index })
+        Ok(())
     }
 
     /// A re-proof: the lease runs from now, and the larger quota holds.

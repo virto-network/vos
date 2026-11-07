@@ -2,13 +2,13 @@
 # each alone: the default agent (`just build-agent`), the space's
 # representative (`just build-representative`), the credential actor
 # (`just build-credentials`), the personal agent's actor (`just
-# build-personal`) and the ledger (`just build-payments`). One lockfile,
-# toolchain, target configuration and release profile for the five; no
-# `.cargo/config.toml` above it, whose `build-std` would reach the host
-# crates under `agent/`.
+# build-personal`), the ledger (`just build-payments`) and the home's
+# (`just build-homes`). One lockfile, toolchain, target configuration and
+# release profile for the six; no `.cargo/config.toml` above it, whose
+# `build-std` would reach the host crates under `agent/`.
 [workspace]
 resolver = "3"
-members = ["../default", "../representative", "../credentials", "../personal", "../payments"]
+members = ["../default", "../representative", "../credentials", "../personal", "../payments", "../homes"]
 
 [profile.release]
 opt-level = 3

@@ -1,0 +1,20 @@
+[package]
+name = "vos-keeper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The home's keeper (`light-node.md` §3.3): under an operator key, it makes the pool's personal agents (each created, `Personal` installed, the home's agent granted its role `homes`), stocks them at `Homes`, tops the pool up, and upgrades `Personal` across the pool in batches, stopping at the first refusal."
+publish = false
+
+[[bin]]
+name = "vos-keeper"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+ed25519-dalek = "2"
+hex = "0.4"
+# The operator's signed commands and the keeper's calls at `Homes`, each
+# node's API over its socket or a loopback gateway.
+vos-node = { path = "../../node/host" }
+vos-wire = { workspace = true }

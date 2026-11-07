@@ -846,9 +846,11 @@ impl Personal {
                 }
                 self.new_group(now);
                 self.replace_kit(&kit.entries, r2, at);
+                let nullifier = device.nullifier;
                 let added = self.add_device(at, at, device).ok();
                 if let Some(added) = added {
                     self.seen.insert(&added, &now);
+                    self.tell_home(crate::home::Record { nullifier });
                 }
                 self.recovery.insert(
                     &ONE,
@@ -901,6 +903,9 @@ impl Personal {
             self.kit.insert(&(i as u8), entry);
         }
         self.secrets.insert(&ONE, &r2);
+        self.tell_home(crate::home::Rekey {
+            keys: entries.iter().map(|entry| entry.signing).collect(),
+        });
     }
 
     /// Whether `entries` are the kit's as they are, in order, each with any
@@ -952,6 +957,9 @@ impl Personal {
             return;
         }
         device.status = Status::Removed { at };
+        self.tell_home(crate::home::Forget {
+            nullifier: device.keys.nullifier,
+        });
         self.admitted.remove(&device.keys.sync);
         self.admitted.remove(&device.keys.admin);
         self.devices.insert(&target, &device);

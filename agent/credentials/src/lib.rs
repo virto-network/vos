@@ -13,8 +13,16 @@
 //! and 32 levels, a revocation 32, and an enrollment of many shares the
 //! nodes they have in common.
 //!
-//! Every write but `claim` is under the role `registrar`, and none is
-//! taken before `found` sets the space's handle and the ring's first root.
+//! Every write but `claim` and `claim_open` is under the role `registrar`,
+//! and none is taken before `found` sets the space's handle and the ring's
+//! first root.
+//!
+//! **The open claim** (`light-node.md` §3.3): a space that admits anyone,
+//! a home-only space, has its registrar `open` it; then any caller enrolls
+//! a member by work, a nonce whose hash over the space's handle, the
+//! member and the period's salt starts with the difficulty's zero bits,
+//! at most the cap's members a period. The work only stops a trivial loop;
+//! the cap bounds what a home admits.
 //!
 //! **The stock kernels** (`light-node.md` §4.2): `auth` and `owner`, the
 //! device kernels every space gets with this actor, written with the SDK
@@ -34,9 +42,34 @@ use alloc::collections::BTreeMap;
 use vos_sdk::p2::{self, InPlace, Secret, Tag, TagHash};
 use vos_sdk::prelude::*;
 use vos_wire::credentials::{
-    self as tree, CredentialError, DEPTH, Digest, EMPTY, ENROLL_MANY, Path, Ring, RootEntry,
-    Siblings, Words, tables::RING_KEY,
+    self as tree, CredentialError, DEPTH, Digest, EMPTY, ENROLL_MANY, MAX_DIFFICULTY, Open, Path,
+    Ring, RootEntry, Siblings, Words, tables::RING_KEY,
 };
+
+/// The open claim's terms and the current period's count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Opening {
+    pub difficulty: u8,
+    pub cap: u32,
+    pub period_ms: u64,
+    /// The salts' seed, drawn at the first opening and kept: no query
+    /// answers it, though its replicas and its operators hold it.
+    pub seed: [u8; 32],
+    /// The period `count` is of, and the members it enrolled.
+    pub period: u64,
+    pub count: u32,
+}
+
+impl Opening {
+    /// The members the period at `now` takes yet.
+    fn left(&self, now: u64) -> u32 {
+        if now / self.period_ms == self.period {
+            self.cap.saturating_sub(self.count)
+        } else {
+            self.cap
+        }
+    }
+}
 
 /// Auth's claim, the stock `auth` kernel's public arguments: the member's
 /// leaf under `map_root`, and `nullifier` its pseudonym in `scope`.
@@ -103,6 +136,7 @@ pub struct Credentials {
     free: Table<u32, (), Ordered>,
     invites: Table<Digest, u64>,
     ring: Table<u8, Ring>,
+    opening: Table<u8, Opening>,
 }
 
 #[messages]
@@ -117,6 +151,7 @@ impl Credentials {
             free: Table::default(),
             invites: Table::default(),
             ring: Table::default(),
+            opening: Table::default(),
         }
     }
 
@@ -218,6 +253,94 @@ impl Credentials {
         Ok(slot)
     }
 
+    /// Open claims to any caller whose work meets `difficulty`, at most
+    /// `cap` members a period of `period_ms` of batch time; a cap of 0
+    /// closes them. The salts' seed is drawn at the first opening.
+    #[msg(role = "registrar")]
+    pub async fn open(
+        &mut self,
+        ctx: &mut Command<Self>,
+        difficulty: u8,
+        cap: u32,
+        period_ms: u64,
+    ) -> Result<(), CredentialError> {
+        self.founded()?;
+        if difficulty > MAX_DIFFICULTY || period_ms == 0 {
+            return Err(CredentialError::Terms);
+        }
+        let now = ctx.now();
+        let period = now / period_ms;
+        let opening = match self.opening.get(&RING_KEY) {
+            Some(opening) => Opening {
+                difficulty,
+                cap,
+                period_ms,
+                period,
+                count: if opening.period_ms == period_ms && opening.period == period {
+                    opening.count
+                } else {
+                    0
+                },
+                ..opening
+            },
+            None => Opening {
+                difficulty,
+                cap,
+                period_ms,
+                seed: ctx.random(),
+                period,
+                count: 0,
+            },
+        };
+        self.opening.insert(&RING_KEY, &opening);
+        Ok(())
+    }
+
+    /// Enroll `member` by its work at `nonce`, under the period's salt or
+    /// the one before: any caller, within the period's cap.
+    #[msg]
+    pub async fn claim_open(
+        &mut self,
+        ctx: &mut Command<Self>,
+        member: Digest,
+        nonce: u64,
+    ) -> Result<u32, CredentialError> {
+        self.founded()?;
+        let leaf = self.admit(&member)?;
+        let mut opening = self
+            .opening
+            .get(&RING_KEY)
+            .filter(|opening| opening.cap > 0)
+            .ok_or(CredentialError::Closed)?;
+        let now = ctx.now();
+        let period = now / opening.period_ms;
+        if opening.left(now) == 0 {
+            return Err(CredentialError::Cap);
+        }
+        let met = [Some(period), period.checked_sub(1)]
+            .into_iter()
+            .flatten()
+            .any(|period| {
+                let salt = tree::open_salt(&opening.seed, period);
+                tree::meets(
+                    &tree::open_work(&self.handle, &member, &salt, nonce),
+                    opening.difficulty,
+                )
+            });
+        if !met {
+            return Err(CredentialError::Work);
+        }
+        if opening.period != period {
+            opening.period = period;
+            opening.count = 0;
+        }
+        opening.count += 1;
+        self.opening.insert(&RING_KEY, &opening);
+        let slot = self.place(&member, true)?;
+        self.write(now, BTreeMap::from([(slot, leaf)]));
+        Ok(slot)
+    }
+
     /// Revoke `member`: its leaf back to the empty leaf, its slot freed for
     /// the next enrollment; or its invitation withdrawn.
     #[msg(role = "registrar")]
@@ -279,6 +402,28 @@ impl Credentials {
     #[msg]
     pub async fn count(&self) -> u64 {
         self.count
+    }
+
+    /// The open claim's terms now: its salt, its difficulty, its period,
+    /// its cap and the claims the period takes yet; `None` while the
+    /// registrar keeps it closed. A query reads at the last batch's time,
+    /// so on a home no batch reached this period it names the salt before,
+    /// and work under it is refused once two periods passed: the device
+    /// asks again.
+    #[msg]
+    pub async fn opening(&self, ctx: &Query<Self>) -> Option<Open> {
+        let opening = self
+            .opening
+            .get(&RING_KEY)
+            .filter(|opening| opening.cap > 0)?;
+        let now = ctx.now();
+        Some(Open {
+            salt: tree::open_salt(&opening.seed, now / opening.period_ms),
+            difficulty: opening.difficulty,
+            period_ms: opening.period_ms,
+            cap: opening.cap,
+            left: opening.left(now),
+        })
     }
 
     /// The secret's member's leaf lies under `map_root` by `path`, and
