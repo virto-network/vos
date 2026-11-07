@@ -239,7 +239,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "vos-credential-book"
+version = "0.1.0"
+dependencies = [
+ "vos-sdk",
+ "vos-wire",
+]
+
+[[package]]
 name = "vos-credentials"
+version = "0.1.0"
+dependencies = [
+ "vos-sdk",
+ "vos-wire",
+]
+
+[[package]]
+name = "vos-device-book"
 version = "0.1.0"
 dependencies = [
  "vos-sdk",
