@@ -6,9 +6,12 @@ ce591f098862cfc472b4bdc03d756c93fddc0d988f01c71b9726f2ea292a25c7  target/riscv64
 3e6bfe60378c19c21c2504e1cfe1dd0dc8c267a30bd914c5128611d71850276e  target/riscv64em-vos/release/statement-service.elf
 725f2116245b49fd2942726cfce18c55abb648a7629389b54c653c4cc9737f57  agent/programs/target/riscv64em-vos/release/vos-agent.elf
 7b88fe03e7dc51c7bea81bf26a16318199457e64e2b01210122655b53cca46a3  agent/programs/target/riscv64em-vos/release/vos-representative.elf
-0856bdc7fc6142843e394e241ca73dc62e49631b7000b66efb52c4076da39a93  agent/programs/target/riscv64em-vos/release/vos-credentials.elf
-80c812594330188e1d282e5e527a3417f31973af4b31b5ec9c5d309e269b3919  agent/programs/target/riscv64em-vos/release/vos-personal.elf
+95e4bd2b8d66f6724dfbb751784b8d4eb9ac4d95e68d09bfdac27b49cdf37676  agent/programs/target/riscv64em-vos/release/vos-credentials.elf
+318bb4160cb09050210cae1c4ea6f9f712ae1796d1dc41185e16802e8a9dbb70  agent/programs/target/riscv64em-vos/release/vos-personal.elf
 6f6192d31c62c9ba165124d8cedcea3d3642421e48d31b42c815264631753250  agent/programs/target/riscv64em-vos/release/vos-payments.elf
+b272d5e4569020e22d9c054f81385b522334a282a73d3cd26948d903ede773e9  agent/programs/target/riscv64em-vos/release/vos-homes.elf
+3285da77545f3943c57ed238fb98f04e24769257a12544f164bd97162fdf54b1  agent/programs/target/riscv64em-vos/release/vos-credential-book.elf
+bf9eb548c9040c11227e0389e86e951f59d2e4d1d01899ac3528e91118e5ef03  agent/programs/target/riscv64em-vos/release/vos-device-book.elf
 229265b3a8523eaecf9300f1132ac52b357736be369b51caa20305a9b5226eb9  pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm
 4ebe1d574dce9f9394ced821f3f20fbfba5fb3cbfd8d3a413bb96b5c9f5fa77e  pvm/proof/final-verifier/wasm/blob/target/test-formats/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm
 fd142a130d57dd196374d3f7317f76b48f868edeafc2b0e9dee273b9a12c49ec  agent/test-actors/target/riscv64em-vos/release/accounts.elf
@@ -20,8 +23,9 @@ c0a21a2e4b30a4ae5b9e921d2a481435e80b38a6c8a75fc15fc685f79a41cd33  agent/test-act
 d4638aaa0b2102cd85f4fb9566cddbb094b9ebd2e7228d4b42b1e559ecd5e447  agent/test-actors/target/riscv64em-vos/release/caller.elf
 9f99d8155be6b22e902eb20ec990d598c9e5e4948a36187b8851ee02e0a0e5a0  agent/test-actors/target/riscv64em-vos/release/compact.elf
 a7c578941f1a99dbde49f9354418df79ebe505f31b3b2fcc656924f3001dd60b  agent/test-actors/target/riscv64em-vos/release/counter.elf
-3d89df076e7f9cc0cc2cee5f5af3671cbd6245ef644caf06797e4c1b95f483b0  agent/test-actors/target/riscv64em-vos/release/credentials-next.elf
+b86831532803c9ec84fdaa207278c145f99e735478ca6e3013c1f125ddd83a37  agent/test-actors/target/riscv64em-vos/release/credentials-next.elf
 6b749aa923113133b63f6a41ca76ca674ff3f744334c9d2bc42e5067c10d16a8  agent/test-actors/target/riscv64em-vos/release/device.elf
+e3b8715b075bded7ea8211ec100e432c5bcc26e2f479a9f5d46aaffc4c81bca4  agent/test-actors/target/riscv64em-vos/release/device-book-next.elf
 e4cc4aeacd070d1bcec62d8c829ebe9d0ffc4f13e0e923eea0f74c73ecdcc633  agent/test-actors/target/riscv64em-vos/release/device-next.elf
 0af44ef30d7590cf788e4aed0d033bdba46a830053c82d89693ead4543ac52a6  agent/test-actors/target/riscv64em-vos/release/door.elf
 86a8402fbef371dcb74b975641ed6da30662754108ac65a815614f5a4ad1e161  agent/test-actors/target/riscv64em-vos/release/gated.elf
@@ -32,7 +36,7 @@ ddf85b7a834ec6f5a78f3023c626eedc35a40bcb6daf33b3f9d3efb38f6b7819  agent/test-act
 81971c2340227caf65599583a67a38b985f2073895237f2995198d83684b020f  agent/test-actors/target/riscv64em-vos/release/lean.elf
 5733edd3e1d8b1ae5060970c8c88974256653c6b373ee35c11f25bc93fac28f9  agent/test-actors/target/riscv64em-vos/release/ledger.elf
 c5187e4249e7196c0e2f32d363af53e8057066dda6f2b8b67dc30aef77a9c806  agent/test-actors/target/riscv64em-vos/release/notes.elf
-8b720829e92843a6eff64b780271c02f57c718638b4cef83e60b8cba238857d3  agent/test-actors/target/riscv64em-vos/release/personal-next.elf
+ca288394ee7df528e16484342b3dece941fb0b0ebcb4e8d3eb5739208f09c08a  agent/test-actors/target/riscv64em-vos/release/personal-next.elf
 13410e3dc1b02f7a40133a6890597a902fcc68b7caff21b51632c73f939fb8fc  agent/test-actors/target/riscv64em-vos/release/poll.elf
 3e48a9aae9ea5a455725beb6339f2f07bdc1a780caa89c01e75a98b95cf2c190  agent/test-actors/target/riscv64em-vos/release/reader.elf
 3d650786c3daec44a34a1509b59c61a4e29c557850e61c7b055b74d51d5279ab  agent/test-actors/target/riscv64em-vos/release/roomy.elf
