@@ -161,14 +161,14 @@ mod tests {
         assert_eq!(distinct.len(), ports.len());
     }
 
-    /// While held, a UDP port takes no other socket; let go of, it binds
-    /// again.
+    /// While held, a UDP port takes no other socket; let go of, it is held
+    /// again, through another process's moment's probe of it.
     #[test]
     fn a_held_udp_port_takes_no_other_socket() {
         let address = SocketAddr::from(([127, 0, 0, 1], free_udp_port()));
         let held = HeldPort::udp(address);
         assert!(UdpSocket::bind(address).is_err());
         drop(held);
-        UdpSocket::bind(address).unwrap();
+        drop(HeldPort::udp(address));
     }
 }

@@ -8,6 +8,7 @@ ce591f098862cfc472b4bdc03d756c93fddc0d988f01c71b9726f2ea292a25c7  target/riscv64
 7b88fe03e7dc51c7bea81bf26a16318199457e64e2b01210122655b53cca46a3  agent/programs/target/riscv64em-vos/release/vos-representative.elf
 0856bdc7fc6142843e394e241ca73dc62e49631b7000b66efb52c4076da39a93  agent/programs/target/riscv64em-vos/release/vos-credentials.elf
 80c812594330188e1d282e5e527a3417f31973af4b31b5ec9c5d309e269b3919  agent/programs/target/riscv64em-vos/release/vos-personal.elf
+6f6192d31c62c9ba165124d8cedcea3d3642421e48d31b42c815264631753250  agent/programs/target/riscv64em-vos/release/vos-payments.elf
 229265b3a8523eaecf9300f1132ac52b357736be369b51caa20305a9b5226eb9  pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm
 4ebe1d574dce9f9394ced821f3f20fbfba5fb3cbfd8d3a413bb96b5c9f5fa77e  pvm/proof/final-verifier/wasm/blob/target/test-formats/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm
 fd142a130d57dd196374d3f7317f76b48f868edeafc2b0e9dee273b9a12c49ec  agent/test-actors/target/riscv64em-vos/release/accounts.elf
@@ -33,7 +34,6 @@ ddf85b7a834ec6f5a78f3023c626eedc35a40bcb6daf33b3f9d3efb38f6b7819  agent/test-act
 c5187e4249e7196c0e2f32d363af53e8057066dda6f2b8b67dc30aef77a9c806  agent/test-actors/target/riscv64em-vos/release/notes.elf
 8b720829e92843a6eff64b780271c02f57c718638b4cef83e60b8cba238857d3  agent/test-actors/target/riscv64em-vos/release/personal-next.elf
 13410e3dc1b02f7a40133a6890597a902fcc68b7caff21b51632c73f939fb8fc  agent/test-actors/target/riscv64em-vos/release/poll.elf
-5adcafa4dbe79afc4c87e98b4a2ad668c459809e58003075d24a3c0d76043ecf  agent/test-actors/target/riscv64em-vos/release/purses.elf
 3e48a9aae9ea5a455725beb6339f2f07bdc1a780caa89c01e75a98b95cf2c190  agent/test-actors/target/riscv64em-vos/release/reader.elf
 3d650786c3daec44a34a1509b59c61a4e29c557850e61c7b055b74d51d5279ab  agent/test-actors/target/riscv64em-vos/release/roomy.elf
 06258d35bb6ac3ecaf8d76c8a1e3d7b2ac5b3fd546f2cf29c3fecc8d40bfc1ac  agent/test-actors/target/riscv64em-vos/release/rounds.elf
