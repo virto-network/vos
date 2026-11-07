@@ -41,6 +41,7 @@ members = [
     "tools/jam-dev",
     "tools/scale",
     "tools/phone",
+    "tools/keeper",
 ]
 # A plain `cargo build` builds what ships: the development crates (the
 # checker, the JAM tooling, the scale harness) enable test features of the
@@ -82,6 +83,7 @@ default-members = [
     "pvm/proof/derive",
     "pvm/proof/verifier",
     "pvm/bench",
+    "tools/keeper",
 ]
 exclude = [
     # Built with `cargo fuzz` (nightly flags, panic = abort).

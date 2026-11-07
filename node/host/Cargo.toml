@@ -65,6 +65,8 @@ webpki = { package = "rustls-webpki", version = "0.103", default-features = fals
 # Its integration tests only: never its unit tests, which build a second
 # vos-node the checker's types do not unify with.
 vos-checker = { path = "../checker" }
+# The home's keeper, making and upgrading a pool on the served cluster.
+vos-keeper = { path = "../../tools/keeper" }
 # The device library's requests and proofs, admitted by ingress end to end,
 # and the release build of its device programs.
 vos-light = { workspace = true, features = ["release"] }

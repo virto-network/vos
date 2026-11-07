@@ -4,10 +4,10 @@
 //! relayed as the nodes deliver them: a pool of 200 stocked and claimed; a
 //! double claim, a kit's key twice and a claim `Personal` refuses; a
 //! lapsed agent's reads, restore and removal and its refused pushes, ended
-//! by a re-proof under a nullifier its add recorded; the registrar's open
-//! claim refused without its work, closed or past its cap; and the cap
-//! below the keeper's refill rate, a pool the keeper stops filling ending
-//! `PoolEmpty`.
+//! by a re-proof under a nullifier its add recorded; the quota raised at
+//! the first re-proof; the registrar's open claim refused without its
+//! work, closed or past its cap; and the cap below the keeper's refill
+//! rate, a pool the keeper stops filling ending `PoolEmpty`.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -760,4 +760,30 @@ fn the_cap_keeps_the_pool_and_an_empty_pool_is_pool_empty() {
     assert_eq!(space.found(nullifier(seed)), None, "nothing written");
     space.make(1);
     space.claim(seed).unwrap();
+}
+
+/// The quota ramps: a claimed agent holds the policy's smaller quota until
+/// its first re-proof through `Homes`, and the larger one after.
+#[test]
+fn the_quota_ramps_at_the_first_re_proof() {
+    let policy = Policy {
+        bytes_new: 1_000,
+        bytes_full: 4_000,
+        ..minutes()
+    };
+    let mut space = Space::new(policy);
+    space.make(1);
+    let agent = space
+        .claim_with(device(0).nullifier, device(0), kit())
+        .unwrap();
+    let home = space.agent(agent);
+    home.push(0, envelope(scope(1), 0, 1, 900)).unwrap();
+    assert_eq!(
+        home.push(0, envelope(scope(1), 0, 2, 900)),
+        Err(PersonalError::Quota)
+    );
+    space.renew(device(0).nullifier, agent).unwrap();
+    let home = space.agent(agent);
+    home.push(0, envelope(scope(1), 0, 2, 900)).unwrap();
+    home.push(0, envelope(scope(1), 0, 3, 900)).unwrap();
 }

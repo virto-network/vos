@@ -23,6 +23,10 @@ use vos_wire::{Decode, WindowClock};
 
 pub const NODES: NodeNumber = 3;
 
+/// The seed of the operator key every node lists, beside its own: a
+/// keeper's or a test's that signs for each node.
+pub const OPERATOR_SEED: [u8; 32] = [0x6b; 32];
+
 /// Stops a leader loop once, after its commit and before its answers;
 /// and holds the node's refines, or its commits, while asked.
 #[derive(Default)]
@@ -178,6 +182,11 @@ impl Cluster {
         config.space = Some(self.space.clone());
         config.venue = Some(self.venue.clone());
         config.peers = Peers::Hub(self.hub.clone());
+        config.operators.push(
+            ed25519_dalek::SigningKey::from_bytes(&OPERATOR_SEED)
+                .verifying_key()
+                .to_bytes(),
+        );
         // Slow enough that a host starved for a moment moves no leader a
         // test holds still; the faults move them.
         config.election_timeout_ms = (1_000, 2_000);
