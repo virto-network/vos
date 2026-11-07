@@ -10,7 +10,7 @@ use ed25519_dalek::SigningKey;
 use merkle_crdt::{Author, Node};
 use vos_light::group::{Archive, archive};
 use vos_light::release::{self, Package};
-use vos_light::sync::{self, Blake2b256, Call, Cid, Op, Ops, Quarantine};
+use vos_light::sync::{self, Blake2b256, Call, Cid, Hold, Op, Ops};
 use vos_light::{Config, Error, Light};
 use vos_testkit::programs;
 use vos_wire::abi::Failure;
@@ -355,10 +355,10 @@ fn cid(bytes: &[u8]) -> Cid {
 }
 
 /// An author that signs two nodes at one sequence number is cut off from
-/// it on every device that applies both, its earlier writes kept, and a
-/// device that knew the cutoff when the second came quarantines its
-/// operations; an author the device set removed is cut off past its
-/// frontier, and reads fall back to the others' writes.
+/// it on every device that applies both, its earlier writes kept, both
+/// forks applied whichever came first; an author the device set removed is
+/// cut off past its frontier, and reads fall back to the others' writes;
+/// an operation of a kind this build does not know is held.
 #[test]
 fn equivocating_and_removed_authors_are_filtered_at_read() {
     let (agent, notes) = artifacts();
@@ -425,14 +425,14 @@ fn equivocating_and_removed_authors_are_filtered_at_read() {
         assert_eq!(title(device, 2).as_deref(), Some("thief"));
     }
     assert_eq!(phone.state(), laptop.state());
-    // The phone knew the cutoff when the second node came: its operations,
-    // the unknown kind's among them, are quarantined, never applied.
-    let quarantined = phone.light.quarantined(NOTES).unwrap();
-    assert_eq!(quarantined.len(), 2);
-    for kept in &quarantined {
-        assert_eq!(kept.why, Quarantine::CutOff);
-        assert_eq!(kept.origin.author, Author::from(&thief).0);
-        assert_eq!(kept.cid, cid(&other_cid));
+    // Both forks apply, filtered at read, whichever came first: the
+    // unknown kind is held, and nothing quarantined.
+    let held = phone.light.held(NOTES).unwrap();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].why, Hold::Kind);
+    assert_eq!(held[0].cid, cid(&other_cid));
+    for device in [&phone, &laptop] {
+        assert!(device.light.quarantined(NOTES).unwrap().is_empty());
     }
 
     // The laptop writes after the phone; the device set then removes the

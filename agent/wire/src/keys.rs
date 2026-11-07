@@ -167,6 +167,7 @@ enum Row {
     BindingDue = 0x2d,
     Release = 0x2e,
     QuarantinedOp = 0x2f,
+    Removed = 0x30,
 }
 
 /// The root builder's rows, each tagged after [`Owner::Tree`]: the rows of
@@ -610,6 +611,14 @@ pub fn quarantined_op(instance: InstanceId, cid: &[u8; 32], index: u32) -> Vec<u
 /// The prefix of the operations quarantined in `instance`'s scope.
 pub fn quarantined_op_prefix(instance: InstanceId) -> Vec<u8> {
     key(&[&Row::QuarantinedOp.prefix(), &instance.0.to_be_bytes()])
+}
+
+/// A removed author's cutoff in `instance`'s scope, apart from the
+/// [`cutoff`] the reads filter by, which an equivocation lowers too: its
+/// operations at this sequence number and later that arrive are
+/// quarantined. A device writes it, never an actor.
+pub fn removed(instance: InstanceId, author: &[u8; 32]) -> Vec<u8> {
+    key(&[&Row::Removed.prefix(), &instance.0.to_be_bytes(), author])
 }
 
 /// The release version of the local actor installed at `instance` on a

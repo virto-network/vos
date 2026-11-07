@@ -27,7 +27,7 @@ pub struct DeviceBook {
     /// Each device's label.
     labels: crdt::Map<u32, String>,
     /// Each device's settings, by the device and the setting's name: a
-    /// device's lie together.
+    /// device's settings lie together.
     settings: crdt::Map<(u32, String), Vec<u8>, Ordered>,
 }
 

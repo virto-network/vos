@@ -330,7 +330,7 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
 - **Built** (2026-11-07, `light-node.md` §2.1 and §3.2): operations carry
   their actor's release (`release::Package`'s `release`), and a later
   release's, an unknown kind's and a faulted run's are held and replayed
-  by an install; invalid ones, and a cut-off author's that arrive after
+  by an install; invalid ones, and a removed author's that arrive after
   its cutoff, quarantined and listed with their authors; the sealed read
   cuts a removed device off one past its node at its frontier, the one
   source of that cutoff; `vos-credential-book` and `vos-device-book`

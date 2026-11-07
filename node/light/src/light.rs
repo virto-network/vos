@@ -175,7 +175,8 @@ pub enum Error {
     Fault(Fault),
     /// The agent program refused the operation, before running it.
     Refused,
-    /// A package whose programs are not its derivation's.
+    /// A package whose programs are not its derivation's, or of release 0,
+    /// which no release is.
     Package,
     /// A package another transpiler's version derived: its programs are
     /// not the ones this light node's release names.
@@ -227,7 +228,9 @@ impl std::fmt::Display for Error {
             Error::Scope(error) => error.fmt(f),
             Error::Fault(fault) => f.write_str(fault.message()),
             Error::Refused => f.write_str("the agent refused the operation"),
-            Error::Package => f.write_str("the package's programs are not its derivation's"),
+            Error::Package => {
+                f.write_str("the package's programs are not its derivation's, or its release is 0")
+            }
             Error::Transpiler(version) => write!(
                 f,
                 "the package is transpiler {version}'s, not {}'s",
@@ -357,16 +360,21 @@ impl Light {
     /// Install `package` as `instance`, its roles `roles`: its programs
     /// checked against its derivation and pooled, the install run as a
     /// node's, and its programs, its rows and its release committed in one
-    /// batch; then the instance's held operations replayed ([`Light::replay`]).
-    /// A package of a release before the installed one, or of that release
-    /// and another program, is refused. The install's outcome; a failed
-    /// install stores nothing but the operation's mark.
+    /// batch; then the instance's held operations replayed ([`Light::replay`]),
+    /// whose failure (a full disk, the store's) leaves them held for the
+    /// next replay and the install standing. A package of a release before
+    /// the installed one, or of that release and another program, is
+    /// refused. The install's outcome; a failed install stores nothing but
+    /// the operation's mark.
     pub fn install(
         &self,
         instance: InstanceId,
         package: &Package,
         roles: Vec<(Vec<u8>, u8)>,
     ) -> Result<Outcome, Error> {
+        if package.release == 0 {
+            return Err(Error::Package);
+        }
         if package.derivation.transpiler != crate::release::TRANSPILER {
             return Err(Error::Transpiler(package.derivation.transpiler));
         }
@@ -439,7 +447,9 @@ impl Light {
         }
         self.store.commit(operation)?;
         if done {
-            self.replay_held(&mut writing, instance)?;
+            // The install stands whatever its replay does: what the replay
+            // could not run waits, held, for the next.
+            let _ = self.replay_held(&mut writing, instance);
         }
         Ok(outcome)
     }
@@ -491,7 +501,8 @@ impl Light {
     /// causal order, through the merge entry as the device that issued it
     /// ran it; `cursor`, the feed's position they were read to, stored
     /// with them. An operation this device cannot run yet is held, and an
-    /// invalid one, or one whose author is cut off at its number,
+    /// invalid one, or one whose author the device set removed at or before
+    /// its number,
     /// quarantined ([`crate::sync`]); both are kept in the scope's rows and
     /// reported. Refused with nothing written when the disk has no room
     /// ([`Error::Full`]).
@@ -608,7 +619,7 @@ impl Light {
     }
 
     /// Room on the disk past the reserve, or [`Error::Full`].
-    fn room(&self) -> Result<(), Error> {
+    pub(crate) fn room(&self) -> Result<(), Error> {
         let free = self.config.disk.free(&self.dir)?;
         if free < self.config.reserve_bytes {
             return Err(Error::Full { free });
@@ -715,20 +726,28 @@ impl Light {
     /// the scope's own. Exempt from the disk's reserve: it keeps data out.
     pub fn cut_off(&self, instance: InstanceId, author: Author, from: u64) -> Result<(), Error> {
         let _writing = self.writing();
-        let key = keys::cutoff(instance, &author.0);
-        let stored_cutoff = match self.store.snapshot().get(&key)? {
-            Some(bytes) => Some(
-                unstored(&bytes)
-                    .and_then(Cutoff::decode_exact)
-                    .ok_or(CorruptRow)?,
-            ),
-            None => None,
-        };
-        if stored_cutoff.is_some_and(|cutoff| cutoff.0 <= from) {
+        let snapshot = self.store.snapshot();
+        let mut rows = Vec::new();
+        for key in [
+            keys::cutoff(instance, &author.0),
+            keys::removed(instance, &author.0),
+        ] {
+            let stored_cutoff = match snapshot.get(&key)? {
+                Some(bytes) => Some(
+                    unstored(&bytes)
+                        .and_then(Cutoff::decode_exact)
+                        .ok_or(CorruptRow)?,
+                ),
+                None => None,
+            };
+            if stored_cutoff.is_none_or(|cutoff| from < cutoff.0) {
+                rows.push((key, stored(&Cutoff(from).encode())));
+            }
+        }
+        if rows.is_empty() {
             return Ok(());
         }
-        let row = stored(&Cutoff(from).encode());
-        Ok(self.store.write_rows(vec![(key, row)])?)
+        Ok(self.store.write_rows(rows)?)
     }
 
     /// Query `instance`'s `method` with `arguments`, as `caller`, on the
@@ -1005,7 +1024,7 @@ impl<'a> Merging<'a> {
 
     /// Run `op` as `origin`, of the node `cid`, its writes through `rows`.
     /// A local operation runs, or declines with nothing recorded. A
-    /// peer's is checked first: one whose author is cut off at its number,
+    /// peer's is checked first: one whose author was removed at its number,
     /// or whose frame no device records, is quarantined; one of a kind this
     /// build does not know, or of a later release than the one installed,
     /// is held. It then runs: done, its rows are written; its run faulting
@@ -1020,7 +1039,7 @@ impl<'a> Merging<'a> {
         rows: &mut dyn Rows,
     ) -> Result<(), Halt> {
         if !self.local {
-            let cutoff = sync::cutoff(rows, self.instance, &origin.author)?;
+            let cutoff = sync::removed(rows, self.instance, &origin.author)?;
             if cutoff.is_some_and(|cutoff| !cutoff.admits(origin.seq)) {
                 self.quarantine(keep(cid, origin, op, Quarantine::CutOff), rows);
                 return Ok(());

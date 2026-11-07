@@ -53,13 +53,15 @@ and what a node does with one is `node/SECURITY.md`'s.
 - **Reads filter, never unapply:** an author that equivocated, and one
   the device set removed (cut off one past its node at its frontier, as
   the sealed read finds it), are filtered when a merge field is read,
-  from their cutoff on; their rows stay, and their operations that arrive
-  after the cutoff is known are quarantined, so they never replace the
-  author's earlier entries. A field keeps one entry an element and
-  author, its latest: a cut-off author's write past its cutoff that
-  arrives before the cutoff is known, which agent-mediated sync refuses
-  past the removed device's frontier, still hides its own earlier write to
-  that element, which reads then fall back from to the other authors'.
+  from their cutoff on; their rows stay. A removed author's operations
+  that arrive after its removal is known are quarantined, so they never
+  replace its earlier entries; an equivocation's forks both apply, so
+  devices meeting them in either order read alike. A field keeps one
+  entry an element and author, its latest: an applied write past a
+  cutoff (a removed author's that arrives before the removal is known,
+  which agent-mediated sync refuses past the frontier, or a fork's) still
+  hides its author's earlier write to that element, which reads then fall
+  back from to the other authors'.
 - **A full disk refuses, never tears:** below a reserve of free room
   (64 MiB by default) an install, a call, an ingest and a replay are
   refused with nothing written, and succeed once room is freed; a cutoff,

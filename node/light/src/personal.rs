@@ -863,6 +863,8 @@ impl<'a, L: Link> SealedSync<'a, L> {
     /// to its end short of where a writer had read it raises the partition
     /// alarm.
     pub fn catch_up(&mut self, instance: InstanceId) -> Result<Caught, SyncError<L::Error>> {
+        // A full disk pauses the reading before it writes anything.
+        self.light.room()?;
         let scope = self.light.scope_id(instance)?.0;
         let agent = self.group.agent().identity;
         // Tracked from now: the archive records its key at every confirmed

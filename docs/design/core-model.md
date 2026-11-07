@@ -898,15 +898,29 @@ rule on a log, masking, a list type, and thin clients.
   that applies the second node (merkle-crdt tells the apply); a removal's
   is one past the removed author's frontier, which the device set gives
   (`Light::cut_off`, `light-node.md` §3.5), and the sealed read sets it
-  so. The lower stands. An author's operations that arrive once its
-  cutoff admits them no longer are quarantined, never applied. *Known
-  limit:* a field keeps one entry an element and author, so an author's
-  write past its cutoff that arrives before the cutoff is known replaces
-  its write before it to that element, which reads then lose and fall
-  back to the other authors' entries; agent-mediated sync refuses a
-  removed device's envelopes past its frontier, so only a delivery
-  concurrent with the removal does this. Each author's exact history of
-  an element is later work.
+  so. The lower stands. A removed author's operations that arrive once
+  its removal's cutoff (kept apart, `keys::removed`) no longer admits
+  them are quarantined, never applied. An equivocation's are applied and
+  filtered: devices meet the forks in different orders, and quarantining
+  whichever came second would leave each device a different fork's
+  entries. *Known limit:* a field keeps one entry an element and author,
+  so an author's write past its cutoff that is applied (a removed
+  author's that arrives before the removal is known, or any fork's)
+  replaces its write before it to that element, which reads then lose and
+  fall back to the other authors' entries, and devices that applied
+  different such writes can read that element differently; agent-mediated
+  sync refuses a removed device's envelopes past its frontier, and every
+  device reads the agent's one order, so only a delivery concurrent with
+  the removal, or outside the agent's order, does this. Each author's
+  exact history of an element is later work.
+- **A merge handler's outcome is its operation's alone** [decided]: a
+  device quarantines a peer's operation whose run fails under a release
+  it runs, as its issuing device recorded it only when done; so a handler
+  refuses only on its arguments, never on what the device holds, and a
+  later release keeps every earlier release's handlers, an operation of a
+  method its release lacks being invalid (`Quarantine::Failed(Unknown)`).
+  A device's own operations are recorded even when the device set has cut
+  it off: its peers quarantine them.
 - **Cost** [measured, Intel Core Ultra 7 155H under other builds' load,
   2026-11-03, the light node on fjall, release, the agent program on the
   interpreter; the step's measuring crate, outside the tree]:

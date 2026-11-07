@@ -3,8 +3,9 @@
 //! and synced; an operation of a later release, or of a kind this build
 //! does not know, held, and the release's replayed once it is installed;
 //! an invalid operation, and one of an author already cut off,
-//! quarantined, never applied, and reported; and a full disk refusing
-//! every new write with nothing written, until room is freed.
+//! quarantined, never applied, and reported, while an equivocation's forks
+//! apply in either order; and a full disk refusing every new write with
+//! nothing written, until room is freed.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -576,4 +577,102 @@ fn a_full_disk_refuses_new_writes_until_room_is_freed() {
             (3, "tablet".to_string())
         ]
     );
+}
+
+/// An author signs two forks at one number, and two devices meet them in
+/// opposite orders: both apply both, filtered at read from the fork's
+/// number, so both read the same, and neither quarantines.
+#[test]
+fn forks_met_in_either_order_read_the_same() {
+    let agent = agent();
+    let (first, _) = device_books();
+    let phone = Device::new(&agent, &first);
+    let laptop = Device::new(&agent, &first);
+    let label = phone.method("label");
+    let forker = SigningKey::from_bytes(&[5; 32]);
+    let base = node(
+        &forker,
+        0,
+        vec![
+            call(label, 1, (1u32, "one".to_string()).encode()),
+            call(label, 1, (2u32, "two".to_string()).encode()),
+        ],
+        BTreeSet::new(),
+    );
+    let after = BTreeSet::from([cid(&base)]);
+    let left = node(
+        &forker,
+        1,
+        vec![call(label, 1, (1u32, "left".to_string()).encode())],
+        after.clone(),
+    );
+    let right = node(
+        &forker,
+        1,
+        vec![call(label, 1, (2u32, "right".to_string()).encode())],
+        after,
+    );
+    for (device, forks) in [(&phone, [&left, &right]), (&laptop, [&right, &left])] {
+        device.light.ingest(BOOK, [base.clone()], None).unwrap();
+        for fork in forks {
+            let ingested = device.light.ingest(BOOK, [fork.clone()], None).unwrap();
+            assert!(ingested.quarantined.is_empty());
+        }
+    }
+    assert_eq!(phone.labels(), laptop.labels());
+}
+
+/// The install's replay meets a full disk: the install stands, and the
+/// release's operations stay held until a replay with room runs them.
+/// Release 0 is no release.
+#[test]
+fn an_install_stands_when_its_replay_finds_no_room() {
+    let agent = agent();
+    let (first, next) = device_books();
+    // The checks of room the disk answers yes to, then no.
+    let roomy = Arc::new(AtomicU64::new(u64::MAX));
+    let probe = Arc::clone(&roomy);
+    let config = Config {
+        disk: Disk::Probe(Arc::new(move || {
+            match probe.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            }) {
+                Ok(_) => u64::MAX,
+                Err(_) => 0,
+            }
+        })),
+        ..Config::default()
+    };
+    let older = Device::with(&agent, &first, config);
+    let newer = Device::new(&agent, &next);
+    newer.done("retire", 9u32.encode());
+    older.light.ingest(BOOK, newer.push(), None).unwrap();
+    assert_eq!(older.light.held(BOOK).unwrap().len(), 1);
+
+    let unnumbered = Package {
+        release: 0,
+        ..next.clone()
+    };
+    assert!(matches!(
+        older.light.install(BOOK, &unnumbered, Vec::new()),
+        Err(Error::Package)
+    ));
+    // Room for the install's check alone.
+    roomy.store(1, Ordering::SeqCst);
+    let installed = older.light.install(BOOK, &next, Vec::new()).unwrap();
+    assert!(matches!(installed, Outcome::Done(_)), "{installed:?}");
+    let older = Device {
+        package: next.clone(),
+        ..older
+    };
+    assert_eq!(older.light.held(BOOK).unwrap().len(), 1);
+    assert!(matches!(
+        older.light.replay(BOOK),
+        Err(Error::Full { free: 0 })
+    ));
+    roomy.store(u64::MAX, Ordering::SeqCst);
+    let replayed = older.light.replay(BOOK).unwrap();
+    assert_eq!(replayed.applied.len(), 1);
+    assert!(older.light.held(BOOK).unwrap().is_empty());
+    assert_eq!(older.query::<Vec<u32>>("retired", Vec::new()), [9]);
 }

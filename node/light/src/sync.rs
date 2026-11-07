@@ -18,8 +18,11 @@
 //!   devices on different releases converge once they update;
 //! - **quarantined** ([`Quarantine`]) when it is invalid, never applied
 //!   and reported with its author: a frame no device records, a run that
-//!   fails where the issuing device's was done, or an author already cut
-//!   off at or before its number.
+//!   fails where the issuing device's was done, or an author the device
+//!   set removed, already cut off at or before its number. An
+//!   equivocation's operations still apply, filtered at read: which fork
+//!   came first differs between devices, and applying both keeps their
+//!   reads alike.
 
 use std::collections::BTreeMap;
 
@@ -164,9 +167,8 @@ pub enum Quarantine {
     /// author wrote garbage, or ran another program under that release.
     #[codec(index = 1)]
     Failed(Failure),
-    /// Its author is cut off at or before its sequence number: where it
-    /// equivocated, or past the frontier the device set gives a removed
-    /// device.
+    /// Its author was removed, cut off at or before its sequence number,
+    /// past the frontier the device set gives a removed device.
     #[codec(index = 2)]
     CutOff,
 }
@@ -255,6 +257,16 @@ pub(crate) fn cutoff(
     author: &[u8; 32],
 ) -> Result<Option<Cutoff>, CorruptRow> {
     read::<Cutoff>(rows, &keys::cutoff(instance, author))
+}
+
+/// `author`'s cutoff in `instance`'s scope as the device set removed it,
+/// if it did ([`keys::removed`]).
+pub(crate) fn removed(
+    rows: &mut dyn Rows,
+    instance: InstanceId,
+    author: &[u8; 32],
+) -> Result<Option<Cutoff>, CorruptRow> {
+    read::<Cutoff>(rows, &keys::removed(instance, author))
 }
 
 /// Apply `event`, a node of `instance`'s scope, through `rows`: its Lamport

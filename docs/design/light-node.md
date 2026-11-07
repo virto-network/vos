@@ -178,7 +178,11 @@ devices decrypt each other's messages".
   `Quarantine::Invalid` (a frame no device records),
   `Quarantine::Failed` (a run that fails where the issuing device records
   an operation only when its run is done, so the author wrote garbage) and
-  `Quarantine::CutOff` (an author already cut off at its number). Each is
+  `Quarantine::CutOff` (an author the device set removed, already cut off
+  at its number; an equivocation's forks still apply, filtered at read,
+  so devices meeting them in either order agree). An operation of a
+  method its release lacks is `Quarantine::Failed(Unknown)`: a later
+  release keeps every earlier one's handlers (`core-model.md` §9.4). Each is
   reported by the ingest that met it and listed with its author
   (`Light::held`, `Light::quarantined`), and the sealed read gathers them
   (`Caught::held`, `Caught::quarantined`).
@@ -186,8 +190,8 @@ devices decrypt each other's messages".
   replay, the light node asks the store's filesystem for its free room
   (`statvfs`) and refuses below a reserve, 64 MiB by default
   (`Config::reserve_bytes`) [est], with `Error::Full` and nothing written;
-  sync pauses, as a refused ingest fails the read, and both resume once
-  room is freed. Cutoffs, the push queue and the device group's writes
+  sync pauses, as the sealed read checks first and writes nothing, and
+  both resume once room is freed. Cutoffs, the push queue and the device group's writes
   are exempt, being small and what removes a device or gets data off the
   phone. A disk that fills anyway (another app's writes) fails fjall's
   write, which then refuses every write until the store is opened again.
