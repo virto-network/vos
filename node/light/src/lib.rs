@@ -5,11 +5,15 @@
 //!   program, on the interpreter over the light node's own store
 //!   ([`Store`]), with no log; each operation one entry of the agent
 //!   program, committed in one batch. Its actors and the agent program are
-//!   release artifacts ([`release`]): the phone transpiles nothing.
+//!   release artifacts ([`release`]): the phone transpiles nothing. The
+//!   first are the credential book and the device book (`vos_wire::books`).
+//!   Below a reserve of disk room, it refuses what adds data
+//!   ([`Error::Full`]).
 //! - **Sync** ([`mod@sync`]): each local instance one scope, a merkle-crdt
 //!   DAG of nodes the store's author key signs; a call is a merge
 //!   handler's operation recorded as a node, and a peer's nodes run
-//!   through the same handlers; the merge fields read filtered. Each
+//!   through the same handlers, what the device cannot run yet held and
+//!   what is invalid quarantined; the merge fields read filtered. Each
 //!   scope's id derives from its name and the key archive's naming secret.
 //! - **The device group** ([`group`]): the user's devices as one MLS group
 //!   over `vos-mls`, its commits admin calls the personal agent orders,
@@ -85,7 +89,10 @@ pub mod wire;
 
 pub use call::{Call, NAME_BYTES, method_id, scope, transfer_arguments};
 pub use kernel::{DEVICE_FORMAT, DeviceProgram, DeviceProof, choose, claim_io};
-pub use light::{Config, Error, LOCAL, Light, MAX_ARGUMENTS, Queued, ScopeError};
+pub use light::{
+    Config, Disk, Error, Ingest, LOCAL, Light, MAX_ARGUMENTS, Queued, RESERVE_BYTES, Replayed,
+    ScopeError,
+};
 pub use path::PathKeeper;
 pub use prover::{PEAK_BYTES, Proven, Prover, ProverConfig, STACK_BYTES, Threads, verify};
 pub use secret::{DeviceSecret, derive_secret, member, owner, source_input};
@@ -93,6 +100,7 @@ pub use store::{Store, StoreError};
 pub use threads::thread_pool;
 
 use vos_wire::credentials::{self, P};
+use vos_wire::ingress::Rejection;
 
 /// A digest: eight M31 words, each below `p`. Its bytes are the words as
 /// little-endian `u32`s.
@@ -172,6 +180,10 @@ pub enum DeviceError {
     /// A proof in the home's reserved scope for a call that is not its
     /// claim or re-proof (`light-node.md` §3.3).
     Reserved,
+    /// The node's ingress refused the request, before its agent saw it:
+    /// why, as the node said (an admission the agent asks, a stale query, a
+    /// replica behind).
+    Rejected(Rejection),
 }
 
 impl core::fmt::Display for DeviceError {
@@ -185,6 +197,9 @@ impl core::fmt::Display for DeviceError {
             DeviceError::Verify => "the proof does not verify",
             DeviceError::Unavailable => "the node holds the space's programs not yet: ask again",
             DeviceError::Reserved => "the home's scope proves only its claim and re-proofs",
+            DeviceError::Rejected(rejection) => {
+                return write!(f, "the node's ingress refused the request: {rejection:?}");
+            }
             DeviceError::Window => {
                 "the space admits none of this app's programs for the kernel: the app or the \
                  space must update"

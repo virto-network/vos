@@ -13,6 +13,7 @@ use ed25519_dalek::SigningKey;
 use vos_light::group::{Alarm, DeviceGroup, Event, Pairing, Restored};
 use vos_light::personal::{Answer, Frontier, Link, Route, SealedSync, Unusable, Waiting};
 use vos_light::sealed::{self, Body as Sealed, View};
+use vos_light::sync::Quarantine;
 use vos_wire::Encode;
 use vos_wire::ids::InstanceId;
 use vos_wire::personal::{
@@ -803,6 +804,9 @@ fn a_backdated_envelope_past_its_frontier_is_refused() {
             .is_some_and(|(_, removed)| removed)
     );
 
+    // A node it wrote after its removal, which the agent never took.
+    set(&b.light, NOTES, 98, 980);
+    let late = b.light.outbox(NOTES).unwrap().pop().unwrap().bytes;
     let envelope = sealed_by(b, NOTES, &key, epoch, 7, |_| {});
     let caught = shown(&mut home, a, &[NOTES], placed(scope, envelope), |sync| {
         sync.catch_up(NOTES)
@@ -817,6 +821,17 @@ fn a_backdated_envelope_past_its_frontier_is_refused() {
     assert_eq!(caught.passed[0].why, Unusable::Author);
     assert_eq!(count(&a.light, NOTES, 1), Some(10));
     assert_eq!(count(&a.light, NOTES, 99), None);
+    // The frontier is the removed author's cutoff too: one past its node at
+    // its last position, whose number is 0.
+    let author = merkle_crdt::Author(b.sync_key());
+    assert_eq!(a.light.cutoff(NOTES, &author).unwrap(), Some(1));
+    // So a later node of its, met outside the agent's order, is
+    // quarantined, never applied.
+    let ingested = a.light.ingest(NOTES, [late], None).unwrap();
+    assert_eq!(ingested.nodes.applied.len(), 1);
+    assert_eq!(ingested.quarantined.len(), 1);
+    assert_eq!(ingested.quarantined[0].why, Quarantine::CutOff);
+    assert_eq!(count(&a.light, NOTES, 98), None);
 }
 
 /// B2: the operators delete a device's envelope. Its sample audit fetches

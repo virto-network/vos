@@ -119,13 +119,15 @@ pub fn root_query(
 }
 
 /// A query's reply bytes, from its answer: `Ran` with the handler's
-/// reply, or [`DeviceError::Decode`].
+/// reply; ingress's refusal, [`DeviceError::Rejected`] with it; any other,
+/// [`DeviceError::Decode`].
 fn reply(body: &[u8]) -> Result<Vec<u8>, DeviceError> {
     match Response::decode_exact(body) {
         Some(Response::Ran {
             outcome: Outcome::Done(reply),
             ..
         }) => Ok(reply),
+        Some(Response::Rejected(rejection)) => Err(DeviceError::Rejected(rejection)),
         _ => Err(DeviceError::Decode),
     }
 }

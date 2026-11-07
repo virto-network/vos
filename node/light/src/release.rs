@@ -44,13 +44,19 @@ pub struct Device {
     pub id: [u8; 32],
 }
 
-/// A local actor's release artifact: its derivation, and its programs,
-/// the actor's, then each kernel's, then each reference's, in the
-/// derivation's order.
+/// A local actor's release artifact: its derivation, its programs (the
+/// actor's, then each kernel's, then each reference's, in the
+/// derivation's order), and its release, numbered from 1 up across the
+/// actor's releases. Every operation a device issues carries the release
+/// it ran on, and a device holds one of a later release than it installed
+/// until it installs that one (`light-node.md` §3.2); a later release runs
+/// every earlier one's operations as they ran, and one that cannot starts
+/// a new scope (§8, D7).
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Package {
     pub derivation: Derivation,
     pub programs: Vec<Vec<u8>>,
+    pub release: u32,
 }
 
 impl Package {
@@ -71,14 +77,16 @@ impl Package {
     }
 }
 
-/// The release artifact of the local actor whose ELF is `elf`: its
-/// programs derived from it as a node's install derives them.
+/// The release artifact of release `release` of the local actor whose
+/// ELF is `elf`: its programs derived from it as a node's install derives
+/// them.
 #[cfg(feature = "release")]
-pub fn package(elf: &[u8]) -> Result<Package, String> {
+pub fn package(elf: &[u8], release: u32) -> Result<Package, String> {
     let derived = vos_pvm_compiler::derive(elf).map_err(|error| error.to_string())?;
     Ok(Package {
         derivation: derived.derivation(elf),
         programs: derived.programs(),
+        release,
     })
 }
 

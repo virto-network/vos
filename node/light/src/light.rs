@@ -10,12 +10,21 @@
 //! applies an entry's work result itself, an install's by the code a
 //! node's accumulate runs (`vos_wire::apply`), a merge's by writing its
 //! rows.
+//!
+//! A peer's operation the light node cannot run yet is held, and one that
+//! is invalid quarantined ([`crate::sync`]); an install replays its
+//! instance's held operations. Before an operation that adds data (an
+//! install, a call, an ingest, a replay) the light node asks the disk for
+//! room past its reserve ([`Config::reserve_bytes`]), and refuses it with
+//! nothing written when there is none ([`Error::Full`]): the store stops
+//! growing before the disk fills, sync pauses, and both resume once room
+//! is freed.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -32,13 +41,16 @@ use vos_wire::apply::{Host, apply};
 use vos_wire::batch::{Admin, Batch, Input, Merge, Query, Work};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
 use vos_wire::merge::{Cutoff, Origin};
-use vos_wire::records::{stored, unstored};
+use vos_wire::records::{Installed, stored, unstored};
 use vos_wire::result::{Outcome, Run, Step, split_output};
 use vos_wire::{Decode, Encode, SpaceId, WindowClock, defaults, keys};
 
 use crate::release::Package;
 use crate::store::{Applying, CACHE_BYTES, Operation, Snapshot, Store, StoreError};
-use crate::sync::{self, Blake2b256, Call, CorruptRow, Mirrored, Op, Ops, ScopeStore};
+use crate::sync::{
+    self, Blake2b256, Call, CorruptRow, Held, Hold, Kept, Mirrored, Op, Ops, Quarantine,
+    Quarantined, ScopeStore,
+};
 
 /// The local agent, the light node's one: its id as the agent program
 /// sees it.
@@ -58,6 +70,11 @@ pub struct Queued {
     pub envelope: Vec<u8>,
 }
 
+/// The disk room the light node keeps free by default: an operation that
+/// adds data is refused below it, leaving room for what removes data or
+/// keeps the device in its group.
+pub const RESERVE_BYTES: u64 = 64 << 20;
+
 /// How the light node runs.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -66,6 +83,11 @@ pub struct Config {
     pub refine_gas: u64,
     /// The store's block cache.
     pub cache_bytes: u64,
+    /// The room on the store's disk below which an operation that adds data
+    /// is refused ([`Error::Full`]).
+    pub reserve_bytes: u64,
+    /// Where the room is read.
+    pub disk: Disk,
 }
 
 impl Default for Config {
@@ -73,8 +95,62 @@ impl Default for Config {
         Self {
             refine_gas: defaults::REFINE_GAS,
             cache_bytes: CACHE_BYTES,
+            reserve_bytes: RESERVE_BYTES,
+            disk: Disk::System,
         }
     }
+}
+
+/// Where the light node reads the room left on its store's disk.
+#[derive(Clone)]
+pub enum Disk {
+    /// The filesystem the store is on, asked before each operation that
+    /// adds data.
+    System,
+    /// The bytes free a probe answers: a test's disk, filled and freed at
+    /// will.
+    Probe(Arc<dyn Fn() -> u64 + Send + Sync>),
+}
+
+impl std::fmt::Debug for Disk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Disk::System => "System",
+            Disk::Probe(_) => "Probe",
+        })
+    }
+}
+
+impl Disk {
+    /// The bytes free to an unprivileged writer under `dir`.
+    fn free(&self, dir: &Path) -> Result<u64, Error> {
+        match self {
+            Disk::System => available(dir).map_err(|error| Error::Store(error.into())),
+            Disk::Probe(probe) => Ok(probe()),
+        }
+    }
+}
+
+/// The bytes the filesystem under `dir` gives an unprivileged writer.
+#[cfg(unix)]
+fn available(dir: &Path) -> std::io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    // SAFETY: `path` is a NUL-terminated string, and `stat` a zeroed
+    // `statvfs` the call writes within.
+    if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the call succeeded, so it filled `stat`.
+    let stat = unsafe { stat.assume_init() };
+    #[allow(clippy::unnecessary_cast)]
+    Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+}
+
+#[cfg(not(unix))]
+fn available(_: &Path) -> std::io::Result<u64> {
+    Ok(u64::MAX)
 }
 
 /// Rows an operation writes (`Some`) or deletes (`None`).
@@ -112,6 +188,12 @@ pub enum Error {
     NotInstalled,
     /// A call's arguments past [`MAX_ARGUMENTS`]: nothing was recorded.
     TooLarge,
+    /// A package of a release before the one installed, or of the same
+    /// release and another program: nothing was installed.
+    Release { installed: u32 },
+    /// The disk has less room than the light node keeps free: nothing was
+    /// written. It succeeds again once room is freed.
+    Full { free: u64 },
 }
 
 impl From<StoreError> for Error {
@@ -154,6 +236,15 @@ impl std::fmt::Display for Error {
             Error::NotApplied => f.write_str("the operation's result does not apply"),
             Error::NotInstalled => f.write_str("the instance is not installed"),
             Error::TooLarge => write!(f, "a call's arguments past {MAX_ARGUMENTS} bytes"),
+            Error::Release { installed } => write!(
+                f,
+                "the package's release is before release {installed}, installed, or is \
+                 another program under it"
+            ),
+            Error::Full { free } => write!(
+                f,
+                "the disk has {free} bytes free, less than the light node keeps: free room"
+            ),
         }
     }
 }
@@ -199,6 +290,7 @@ impl From<CorruptRow> for Halt {
 /// at a time.
 pub struct Light {
     store: Store,
+    dir: PathBuf,
     machines: Machines,
     config: Config,
     key: SigningKey,
@@ -228,6 +320,7 @@ impl Light {
         let key = SigningKey::from_bytes(&*store.author()?);
         Ok(Self {
             store,
+            dir: dir.to_path_buf(),
             machines,
             config,
             key,
@@ -263,9 +356,11 @@ impl Light {
 
     /// Install `package` as `instance`, its roles `roles`: its programs
     /// checked against its derivation and pooled, the install run as a
-    /// node's, and its programs and rows committed in one batch. The
-    /// install's outcome; a failed install stores nothing but the
-    /// operation's mark.
+    /// node's, and its programs, its rows and its release committed in one
+    /// batch; then the instance's held operations replayed ([`Light::replay`]).
+    /// A package of a release before the installed one, or of that release
+    /// and another program, is refused. The install's outcome; a failed
+    /// install stores nothing but the operation's mark.
     pub fn install(
         &self,
         instance: InstanceId,
@@ -282,8 +377,20 @@ impl Light {
                 .install(program)
                 .map_err(|error| Error::Fault(Fault::Agent(format!("{error:?}"))))?;
         }
-        let _writing = self.writing();
+        let mut writing = self.writing();
+        self.room()?;
         let snapshot = self.store.snapshot();
+        if let Some(installed) = release(&snapshot, instance)? {
+            let over = snapshot
+                .get(&keys::installed(instance))?
+                .and_then(|bytes| unstored(&bytes).and_then(Installed::decode_exact))
+                .ok_or(CorruptRow)?;
+            if package.release < installed
+                || (package.release == installed && over.derivation != package.derivation)
+            {
+                return Err(Error::Release { installed });
+            }
+        }
         let version = version(&snapshot)?;
         let (time, seed) = self.next(&snapshot)?;
         let work = Work::Batch(Batch {
@@ -319,13 +426,21 @@ impl Light {
             time,
             seed,
         };
-        if let Outcome::Done(_) = outcome {
+        let done = matches!(outcome, Outcome::Done(_));
+        if done {
             operation.programs = programs
                 .into_iter()
                 .map(|(hash, program)| (hash, program.to_vec()))
                 .collect();
+            operation.rows.insert(
+                keys::release(instance),
+                Some(stored(&package.release.encode())),
+            );
         }
         self.store.commit(operation)?;
+        if done {
+            self.replay_held(&mut writing, instance)?;
+        }
         Ok(outcome)
     }
 
@@ -349,8 +464,10 @@ impl Light {
         if snapshot.get(&keys::installed(instance))?.is_none() {
             return Ok(Outcome::failed(Failure::Unknown));
         }
+        self.room()?;
         let (time, seed) = self.next(&snapshot)?;
         let ops = vec![Op::Call(Call {
+            release: release(&snapshot, instance)?.unwrap_or(0),
             method,
             arguments,
             time,
@@ -359,7 +476,7 @@ impl Light {
         let scope = self.scope(&mut writing, instance)?;
         let (meta, key, last) = self.store.last_row(time, &seed);
         scope.store_mut().stage(meta, key, Some(last));
-        let mut merging = Merging::new(self, instance, snapshot, true);
+        let mut merging = Merging::new(self, instance, snapshot, true)?;
         let recorded = scope.record(&self.key, ops, &mut merging);
         scope.store_mut().unstage();
         match recorded.map_err(scope_error) {
@@ -373,27 +490,130 @@ impl Light {
     /// batch: each validated, and each operation of each node run, in
     /// causal order, through the merge entry as the device that issued it
     /// ran it; `cursor`, the feed's position they were read to, stored
-    /// with them. A handler's failure on an operation is its effect, the
-    /// same on every device: nothing written; a method this build's
-    /// program does not run is held in the scope's rows.
+    /// with them. An operation this device cannot run yet is held, and an
+    /// invalid one, or one whose author is cut off at its number,
+    /// quarantined ([`crate::sync`]); both are kept in the scope's rows and
+    /// reported. Refused with nothing written when the disk has no room
+    /// ([`Error::Full`]).
     pub fn ingest(
         &self,
         instance: InstanceId,
         nodes: impl IntoIterator<Item = Vec<u8>>,
         cursor: Option<u64>,
-    ) -> Result<Ingested<Blake2b256>, Error> {
+    ) -> Result<Ingest, Error> {
         let mut writing = self.writing();
         let scope = self.scope(&mut writing, instance)?;
+        self.room()?;
         let snapshot = self.store.snapshot();
-        let mut merging = Merging::new(self, instance, snapshot, false);
+        let mut merging = Merging::new(self, instance, snapshot, false)?;
         match scope
             .ingest(nodes, cursor, &mut merging)
             .map_err(scope_error)
         {
-            Ok(ingested) => Ok(ingested),
+            Ok(nodes) => Ok(Ingest {
+                nodes,
+                held: merging.held,
+                quarantined: merging.quarantined,
+            }),
             Err(Halt::Declined(_)) => unreachable!("a peer's operation is never declined"),
             Err(Halt::Error(error)) => Err(error),
         }
+    }
+
+    /// Run `instance`'s held operations this device can run now, in one
+    /// batch: each that runs applied as it would have been at its ingest,
+    /// each found invalid, or whose author was cut off since, quarantined,
+    /// and the rest held still. An install replays its instance's; a
+    /// fault's operations wait for the next replay.
+    pub fn replay(&self, instance: InstanceId) -> Result<Replayed, Error> {
+        let mut writing = self.writing();
+        self.replay_held(&mut writing, instance)
+    }
+
+    /// `instance`'s operations held, in their rows' order.
+    pub fn held(&self, instance: InstanceId) -> Result<Vec<Held>, Error> {
+        self.kept(&keys::held_prefix(instance))
+    }
+
+    /// `instance`'s operations quarantined, in their rows' order: what the
+    /// chrome names, with each one's author.
+    pub fn quarantined(&self, instance: InstanceId) -> Result<Vec<Quarantined>, Error> {
+        self.kept(&keys::quarantined_op_prefix(instance))
+    }
+
+    /// `author`'s cutoff in `instance`'s scope: its operations at this
+    /// sequence number and later are filtered at read, and quarantined
+    /// when they arrive after it is known.
+    pub fn cutoff(&self, instance: InstanceId, author: &Author) -> Result<Option<u64>, Error> {
+        let key = keys::cutoff(instance, &author.0);
+        Ok(match self.store.snapshot().get(&key)? {
+            Some(bytes) => Some(
+                unstored(&bytes)
+                    .and_then(Cutoff::decode_exact)
+                    .ok_or(CorruptRow)?
+                    .0,
+            ),
+            None => None,
+        })
+    }
+
+    /// The operations kept under `prefix`.
+    fn kept<W: Copy + Encode + Decode>(&self, prefix: &[u8]) -> Result<Vec<Kept<W>>, Error> {
+        let snapshot = self.store.snapshot();
+        StateReader::rows(&snapshot, prefix, None)
+            .map(|(key, value)| Ok(Kept::read(prefix, &key, &value)?))
+            .collect()
+    }
+
+    /// [`Light::replay`], under the write lock `_writing`.
+    fn replay_held(
+        &self,
+        _writing: &mut MutexGuard<'_, BTreeMap<InstanceId, Scope>>,
+        instance: InstanceId,
+    ) -> Result<Replayed, Error> {
+        let held = self.held(instance)?;
+        let mut replayed = Replayed::default();
+        if held.is_empty() {
+            return Ok(replayed);
+        }
+        self.room()?;
+        let snapshot = self.store.snapshot();
+        let mut merging = Merging::new(self, instance, snapshot, false)?;
+        let snapshot = Arc::clone(&merging.snapshot);
+        let mut changes = Written::new();
+        for kept in held {
+            let mut rows = Staged {
+                snapshot: &snapshot,
+                written: &mut changes,
+            };
+            rows.write(&keys::held(instance, &kept.cid.0, kept.origin.index), None);
+            let (held, quarantined) = (merging.held.len(), merging.quarantined.len());
+            merging
+                .run(&kept.cid, &kept.origin, &kept.op, &mut rows)
+                .map_err(|halt| match halt {
+                    Halt::Error(error) => error,
+                    Halt::Declined(_) => unreachable!("a peer's operation is never declined"),
+                })?;
+            if merging.held.len() > held {
+                replayed.held += 1;
+            } else if merging.quarantined.len() == quarantined {
+                replayed.applied.push(kept);
+            }
+        }
+        // Held again, each rewrote its row: not news.
+        merging.held.clear();
+        replayed.quarantined = std::mem::take(&mut merging.quarantined);
+        self.store.write_changes(changes)?;
+        Ok(replayed)
+    }
+
+    /// Room on the disk past the reserve, or [`Error::Full`].
+    fn room(&self) -> Result<(), Error> {
+        let free = self.config.disk.free(&self.dir)?;
+        if free < self.config.reserve_bytes {
+            return Err(Error::Full { free });
+        }
+        Ok(())
     }
 
     /// The local nodes of `instance`'s scope not yet pushed, each author's
@@ -486,10 +706,13 @@ impl Light {
     }
 
     /// Cut `author` off in `instance`'s scope from sequence number `from`:
-    /// its operations there and later are filtered when the merge fields
-    /// are read, never unapplied. A cutoff already lower stands. The
-    /// device set's removals give it, past a removed device's frontier;
-    /// an equivocation's is the scope's own.
+    /// its operations there and later already applied are filtered when
+    /// the merge fields are read, never unapplied, and those that arrive
+    /// later are quarantined. A cutoff already lower stands. The device
+    /// set's removals give it, one past a removed device's node at its
+    /// frontier, as the sealed read sets it
+    /// ([`crate::personal::SealedSync::catch_up`]); an equivocation's is
+    /// the scope's own. Exempt from the disk's reserve: it keeps data out.
     pub fn cut_off(&self, instance: InstanceId, author: Author, from: u64) -> Result<(), Error> {
         let _writing = self.writing();
         let key = keys::cutoff(instance, &author.0);
@@ -657,6 +880,56 @@ fn unexpected() -> Error {
     Error::Fault(Fault::Agent("its output is not one step".into()))
 }
 
+/// The release of the actor installed at `instance`, if one is.
+fn release(snapshot: &Snapshot, instance: InstanceId) -> Result<Option<u32>, Error> {
+    match snapshot.get(&keys::release(instance))? {
+        Some(bytes) => Ok(Some(
+            unstored(&bytes)
+                .and_then(u32::decode_exact)
+                .ok_or(CorruptRow)?,
+        )),
+        None => Ok(None),
+    }
+}
+
+/// What ingesting nodes did: the nodes' report, and the operations they
+/// carried that were held or quarantined.
+#[derive(Debug, Default)]
+pub struct Ingest {
+    pub nodes: Ingested<Blake2b256>,
+    pub held: Vec<Held>,
+    pub quarantined: Vec<Quarantined>,
+}
+
+/// What a replay did: the held operations it applied, those it
+/// quarantined, and the number still held.
+#[derive(Debug, Default)]
+pub struct Replayed {
+    pub applied: Vec<Held>,
+    pub quarantined: Vec<Quarantined>,
+    pub held: usize,
+}
+
+/// The store as of a snapshot under a batch's writes, which its reads
+/// see: a replay's rows.
+struct Staged<'a> {
+    snapshot: &'a Snapshot,
+    written: &'a mut Written,
+}
+
+impl Rows for Staged<'_> {
+    fn read(&mut self, key: &[u8]) -> Option<Vec<u8>> {
+        match self.written.get(key) {
+            Some(value) => value.clone(),
+            None => self.snapshot.read(key),
+        }
+    }
+
+    fn write(&mut self, key: &[u8], value: Option<&[u8]>) {
+        self.written.insert(key.to_vec(), value.map(<[u8]>::to_vec));
+    }
+}
+
 /// The store's state version: the installs applied.
 fn version(snapshot: &Snapshot) -> Result<u64, Error> {
     match snapshot.get(&keys::version())? {
@@ -670,6 +943,16 @@ fn version(snapshot: &Snapshot) -> Result<u64, Error> {
     }
 }
 
+/// `op`, as `origin` of the node `cid`, kept for `why`.
+fn keep<W>(cid: &sync::Cid, origin: &Origin, op: &Op, why: W) -> Kept<W> {
+    Kept {
+        cid: cid.clone(),
+        origin: *origin,
+        op: op.clone(),
+        why,
+    }
+}
+
 /// A scope's nodes applied through the merge entry: each operation run
 /// over the store as the batch began and the batch's writes since, its
 /// rows written through the scope's.
@@ -679,37 +962,87 @@ struct Merging<'a> {
     snapshot: Arc<Snapshot>,
     /// The batch's writes so far, which later runs read above the store.
     written: Arc<Written>,
+    /// The release of the instance's actor installed here.
+    release: u32,
     /// A local operation: its handler's failure declines it.
     local: bool,
     /// A local operation's outcome.
     outcome: Option<Outcome>,
+    /// The peers' operations held, and quarantined.
+    held: Vec<Held>,
+    quarantined: Vec<Quarantined>,
 }
 
 impl<'a> Merging<'a> {
-    fn new(light: &'a Light, instance: InstanceId, snapshot: Snapshot, local: bool) -> Self {
-        Self {
+    fn new(
+        light: &'a Light,
+        instance: InstanceId,
+        snapshot: Snapshot,
+        local: bool,
+    ) -> Result<Self, Error> {
+        Ok(Self {
             light,
             instance,
+            release: release(&snapshot, instance)?.unwrap_or(0),
             snapshot: Arc::new(snapshot),
             written: Arc::new(BTreeMap::new()),
             local,
             outcome: None,
-        }
+            held: Vec::new(),
+            quarantined: Vec::new(),
+        })
     }
 
-    /// Run `call` as `origin`, of the node `cid`, its writes through
-    /// `rows`. A peer's operation that its run fails, by its handler's
-    /// failure or trap, writes nothing, as on every device; one this
-    /// build's program does not run (`Unknown`), or whose run faults, is
-    /// held for a build that runs it, so no peer's node stops the scope's
-    /// sync.
+    fn hold(&mut self, kept: Held, rows: &mut dyn Rows) {
+        sync::hold(self.instance, &kept, rows);
+        self.held.push(kept);
+    }
+
+    fn quarantine(&mut self, kept: Quarantined, rows: &mut dyn Rows) {
+        sync::quarantine(self.instance, &kept, rows);
+        self.quarantined.push(kept);
+    }
+
+    /// Run `op` as `origin`, of the node `cid`, its writes through `rows`.
+    /// A local operation runs, or declines with nothing recorded. A
+    /// peer's is checked first: one whose author is cut off at its number,
+    /// or whose frame no device records, is quarantined; one of a kind this
+    /// build does not know, or of a later release than the one installed,
+    /// is held. It then runs: done, its rows are written; its run faulting
+    /// here, it is held for a replay; failing otherwise, which no issuing
+    /// device records, it is quarantined. So no peer's node stops the
+    /// scope's sync, and none writes what its author's device did not.
     fn run(
         &mut self,
         cid: &sync::Cid,
         origin: &Origin,
-        call: &Call,
+        op: &Op,
         rows: &mut dyn Rows,
     ) -> Result<(), Halt> {
+        if !self.local {
+            let cutoff = sync::cutoff(rows, self.instance, &origin.author)?;
+            if cutoff.is_some_and(|cutoff| !cutoff.admits(origin.seq)) {
+                self.quarantine(keep(cid, origin, op, Quarantine::CutOff), rows);
+                return Ok(());
+            }
+        }
+        let call = match op {
+            Op::Call(call) => call,
+            Op::Unknown { .. } => {
+                self.hold(keep(cid, origin, op, Hold::Kind), rows);
+                return Ok(());
+            }
+        };
+        if !self.local {
+            if call.arguments.len() > MAX_ARGUMENTS {
+                self.quarantine(keep(cid, origin, op, Quarantine::Invalid), rows);
+                return Ok(());
+            }
+            if call.release > self.release {
+                self.hold(keep(cid, origin, op, Hold::Release), rows);
+                return Ok(());
+            }
+        }
         let state = Arc::new(Layered {
             snapshot: Arc::clone(&self.snapshot),
             written: Arc::clone(&self.written),
@@ -718,7 +1051,7 @@ impl<'a> Merging<'a> {
             Ok(run) => run,
             Err(error) if self.local => return Err(Halt::Error(error)),
             Err(_) => {
-                sync::hold(self.instance, cid, origin, &Op::Call(call.clone()), rows);
+                self.hold(keep(cid, origin, op, Hold::Fault), rows);
                 return Ok(());
             }
         };
@@ -734,11 +1067,17 @@ impl<'a> Merging<'a> {
                 }
             }
             outcome if self.local => return Err(Halt::Declined(outcome)),
+            // The device lacks a program its state names: its fault.
             Outcome::Failed {
-                code: Failure::Unknown,
+                code: Failure::Unloadable | Failure::InRefine,
                 ..
-            } => sync::hold(self.instance, cid, origin, &Op::Call(call.clone()), rows),
-            _ => {}
+            } => self.hold(keep(cid, origin, op, Hold::Fault), rows),
+            Outcome::Failed { code, .. } => {
+                self.quarantine(keep(cid, origin, op, Quarantine::Failed(code)), rows)
+            }
+            Outcome::Started(_) => {
+                self.quarantine(keep(cid, origin, op, Quarantine::Invalid), rows)
+            }
         }
         if self.local {
             self.outcome = Some(run.outcome);
@@ -755,8 +1094,8 @@ impl Apply<Blake2b256, Ops> for Merging<'_> {
         event: Event<'_, Blake2b256, Ops>,
         rows: &mut dyn Rows,
     ) -> Result<(), Halt> {
-        sync::apply_node(self.instance, &event, rows, |cid, origin, call, rows| {
-            self.run(cid, origin, call, rows)
+        sync::apply_node(self.instance, &event, rows, |cid, origin, op, rows| {
+            self.run(cid, origin, op, rows)
         })
     }
 }

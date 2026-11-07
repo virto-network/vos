@@ -56,9 +56,9 @@ use zeroize::Zeroizing;
 
 use crate::group::{Alarm, Archive, DeviceGroup, GroupError};
 use crate::kit::{self, KitSecret};
-use crate::light::{Error, Light, Queued};
+use crate::light::{Error, Ingest, Light, Queued};
 use crate::sealed::{self, Body, MAX_BODY, OpenError, View};
-use crate::sync::Blake2b256;
+use crate::sync::{Blake2b256, Held, Quarantined};
 use merkle_crdt::Hasher as _;
 
 mod checkpoint;
@@ -297,6 +297,10 @@ pub struct Heard {
 #[derive(Debug, Default)]
 pub struct Caught {
     pub ingested: Option<Ingested<Blake2b256>>,
+    /// The operations the nodes read carried that were held, and those
+    /// quarantined, each with its author ([`crate::sync`]).
+    pub held: Vec<Held>,
+    pub quarantined: Vec<Quarantined>,
     /// The envelopes read, and their bytes.
     pub envelopes: usize,
     pub bytes: usize,
@@ -310,7 +314,10 @@ pub struct Caught {
 }
 
 impl Caught {
-    fn absorb(&mut self, ingested: Ingested<Blake2b256>) {
+    fn absorb(&mut self, ingest: Ingest) {
+        self.held.extend(ingest.held);
+        self.quarantined.extend(ingest.quarantined);
+        let ingested = ingest.nodes;
         match &mut self.ingested {
             Some(report) => {
                 report.applied.extend(ingested.applied);
@@ -848,7 +855,9 @@ impl<'a, L: Link> SealedSync<'a, L> {
     /// A7): positions are dense, so one skipped is withheld; epochs never go
     /// back along a scope, so an envelope under an earlier one is a push the
     /// agent should have refused, passed over; a node's author is a device
-    /// of the set, a removed one's counted only up to its frontier; each
+    /// of the set, a removed one's counted only up to its frontier and cut
+    /// off past it in the light node, so its entries read filtered and its
+    /// later operations met anywhere are quarantined; each
     /// writer's view of the control log is checked against this device's;
     /// and each writer's `seen` positions are kept, so that a scope served
     /// to its end short of where a writer had read it raises the partition
@@ -896,7 +905,9 @@ impl<'a, L: Link> SealedSync<'a, L> {
                 let position = envelope.position;
                 match opened {
                     Opening::Node(epoch, body) => {
-                        match self.admit(scope, position, epoch, &body, &mut scan, &mut caught)? {
+                        let admitted =
+                            self.admit(instance, position, epoch, &body, &mut scan, &mut caught)?;
+                        match admitted {
                             Ok(cid) => {
                                 at.push((
                                     scope_key(AT, &scope, Some(position)),
@@ -964,18 +975,21 @@ impl<'a, L: Link> SealedSync<'a, L> {
         Ok(self.light.store().write_group_rows(rows)?)
     }
 
-    /// Whether the node an envelope at `scope`'s `position`, sealed under
-    /// `epoch`, holds is admitted: its CID, or why it is passed over, with
-    /// what its writer said checked into `caught`'s alarms.
+    /// Whether the node an envelope at `instance`'s scope's `position`,
+    /// sealed under `epoch`, holds is admitted: its CID, or why it is
+    /// passed over, with what its writer said checked into `caught`'s
+    /// alarms. A removed device's node is admitted up to its frontier, and
+    /// its author cut off past it ([`SealedSync::cut_off_removed`]).
     fn admit(
         &mut self,
-        scope: Scope,
+        instance: InstanceId,
         position: u64,
         epoch: u64,
         body: &Body,
         scan: &mut Scan,
         caught: &mut Caught,
     ) -> Result<Result<[u8; 32], Unusable>, SyncError<L::Error>> {
+        let scope = self.light.scope_id(instance)?.0;
         let watch = self.watch(scan, scope)?;
         if epoch < watch.epoch {
             raise(&mut caught.alarms, Alarm::Stale { scope, position });
@@ -1011,10 +1025,22 @@ impl<'a, L: Link> SealedSync<'a, L> {
                             .map_err(SyncError::Refused)?,
                     ),
                 };
-                frontier
+                let last = frontier
                     .iter()
                     .find(|(at, _)| *at == scope)
-                    .is_some_and(|(_, last)| position <= *last)
+                    .map(|(_, last)| *last);
+                if !scan.cut.contains(&device) {
+                    let removed = Removed {
+                        author: header.author,
+                        last,
+                        position,
+                        seq: header.seq,
+                    };
+                    if self.cut_off_removed(instance, scope, &removed)? {
+                        scan.cut.push(device);
+                    }
+                }
+                last.is_some_and(|last| position <= last)
             }
         };
         if !within {
@@ -1037,6 +1063,49 @@ impl<'a, L: Link> SealedSync<'a, L> {
             }
         }
         Ok(Ok(Blake2b256::hash(&body.node)))
+    }
+
+    /// Cut a removed device's author off in `instance`'s scope, one past its
+    /// node at its frontier, the position of its last envelope there that
+    /// the agent took: from 0 when it has none there; from the node's
+    /// number plus one when `removed` is that node, or when this device
+    /// read it before; from `removed`'s own number when it is past the
+    /// frontier and the node there was not read, an upper bound a lower
+    /// cutoff replaces. Whether it was cut off; not yet, while the
+    /// frontier's node is ahead. So the frontier the agent's log gives is
+    /// the one source of a removed author's cutoff, which filters its
+    /// entries at read and quarantines its later operations at ingest.
+    fn cut_off_removed(
+        &self,
+        instance: InstanceId,
+        scope: Scope,
+        removed: &Removed,
+    ) -> Result<bool, SyncError<L::Error>> {
+        let from = match removed.last {
+            None => Some(0),
+            Some(last) if removed.position == last => Some(removed.seq + 1),
+            Some(last) => match self
+                .light
+                .store()
+                .group_row(&scope_key(AT, &scope, Some(last)))?
+            {
+                Some(cid) => {
+                    let cid = <[u8; 32]>::try_from(&cid[..])
+                        .map_err(|_| SyncError::Group(GroupError::Corrupt))?;
+                    self.light
+                        .node(instance, &merkle_crdt::Cid(cid))?
+                        .and_then(|node| merkle_crdt::Header::<Blake2b256>::read(&node))
+                        .map(|header| header.seq + 1)
+                }
+                None if removed.position > last => Some(removed.seq),
+                None => None,
+            },
+        };
+        let Some(from) = from else {
+            return Ok(false);
+        };
+        self.light.cut_off(instance, removed.author, from)?;
+        Ok(true)
     }
 
     /// Record this device's envelopes the agent took in `scope`, each
@@ -1362,6 +1431,8 @@ struct Scan {
     tracked: Vec<Scope>,
     watches: BTreeMap<Scope, Watch>,
     frontiers: BTreeMap<DeviceId, Frontier>,
+    /// The removed devices whose authors it cut off.
+    cut: Vec<DeviceId>,
 }
 
 impl Scan {
@@ -1370,8 +1441,18 @@ impl Scan {
             tracked,
             watches: BTreeMap::new(),
             frontiers: BTreeMap::new(),
+            cut: Vec::new(),
         }
     }
+}
+
+/// A removed device's node read in a scope: its author, the device's
+/// frontier there, and the node's position and number.
+struct Removed {
+    author: merkle_crdt::Author,
+    last: Option<u64>,
+    position: u64,
+    seq: u64,
 }
 
 /// What opening an envelope of a data scope gave.

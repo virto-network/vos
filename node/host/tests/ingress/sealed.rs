@@ -192,7 +192,7 @@ fn read(personal: &mut Personal, phone: &mut Phone) {
 fn artifacts() -> (Vec<u8>, Package) {
     let read = |path: std::path::PathBuf| std::fs::read(path).unwrap();
     let agent = release::agent(&read(programs::agent_elf())).unwrap();
-    let notes = release::package(&read(programs::actor_elf("notes"))).unwrap();
+    let notes = release::package(&read(programs::actor_elf("notes")), 1).unwrap();
     (agent, notes)
 }
 

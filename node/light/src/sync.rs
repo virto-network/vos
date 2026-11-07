@@ -1,15 +1,25 @@
 //! Sync (`light-node.md` §3.2): each local actor instance is one scope, a
 //! merkle-crdt DAG whose nodes the light node's author key signs, each a
 //! batch of operations. An operation is a merge handler's call with the
-//! time and seed of the device that issued it, so every device that
-//! applies the node runs the handler again and writes the same entries
-//! (`vos_wire::merge`).
+//! time and seed of the device that issued it, and the release of its
+//! actor that device ran, so every device that applies the node runs the
+//! handler again and writes the same entries (`vos_wire::merge`).
 //!
 //! Applying a node ([`apply_node`]) writes beside its operations' runs:
-//! its Lamport clock, which orders the merge fields' entries; its author's
-//! cutoff where it equivocates, from which the merge fields' reads filter
-//! the author; and each operation of a kind this build does not know,
-//! kept in its scope's rows, never refused.
+//! its Lamport clock, which orders the merge fields' entries; and its
+//! author's cutoff where it equivocates, from which the merge fields'
+//! reads filter the author. Each operation then runs, or is kept in its
+//! scope's rows without running:
+//!
+//! - **held** ([`Hold`]) while this device cannot run it yet: a kind this
+//!   build does not know, a later release of its actor than the one
+//!   installed, or a run that faulted here. A held operation runs at the
+//!   next replay that can run it (an install replays its instance's), so
+//!   devices on different releases converge once they update;
+//! - **quarantined** ([`Quarantine`]) when it is invalid, never applied
+//!   and reported with its author: a frame no device records, a run that
+//!   fails where the issuing device's was done, or an author already cut
+//!   off at or before its number.
 
 use std::collections::BTreeMap;
 
@@ -20,6 +30,7 @@ use fjall::{Keyspace, OwnedWriteBatch};
 use merkle_crdt::{
     Author, Changes, Decode, Encode, Event, FjallError, FjallStore, Loaded, Rows, Store,
 };
+use vos_wire::abi::Failure;
 use vos_wire::ids::{InstanceId, MethodId};
 use vos_wire::keys;
 use vos_wire::merge::{Cutoff, Origin};
@@ -40,9 +51,11 @@ impl merkle_crdt::Hasher for Blake2b256 {
 pub type Cid = merkle_crdt::Cid<Blake2b256>;
 
 /// A merge handler's call: the operation a device issues, with its time
-/// and seed, which every device that applies it runs on.
+/// and seed, which every device that applies it runs on, and the release
+/// of its actor the issuing device ran it on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Call {
+    pub release: u32,
     pub method: MethodId,
     pub arguments: Vec<u8>,
     pub time: u64,
@@ -72,6 +85,7 @@ pub type Ops = Vec<Op>;
 
 impl Encode for Call {
     fn encode_to(&self, buf: &mut Vec<u8>) {
+        self.release.encode_to(buf);
         self.method.0.encode_to(buf);
         self.arguments.encode_to(buf);
         self.time.encode_to(buf);
@@ -82,6 +96,7 @@ impl Encode for Call {
 impl Decode for Call {
     fn decode_from(buf: &[u8], pos: &mut usize) -> Option<Self> {
         Some(Call {
+            release: u32::decode_from(buf, pos)?,
             method: MethodId(u32::decode_from(buf, pos)?),
             arguments: Vec::decode_from(buf, pos)?,
             time: u64::decode_from(buf, pos)?,
@@ -120,6 +135,84 @@ impl Decode for Op {
     }
 }
 
+/// Why an operation is held: it runs once this device can run it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, vos_wire::Encode, vos_wire::Decode)]
+#[repr(u8)]
+pub enum Hold {
+    /// A kind this build does not know: it runs after the app's update.
+    #[codec(index = 0)]
+    Kind = 0,
+    /// A release of its actor after the one installed here: it runs once
+    /// that release is installed.
+    #[codec(index = 1)]
+    Release = 1,
+    /// Its run faulted here, the device's failure and not the operation's:
+    /// it runs again at the next replay.
+    #[codec(index = 2)]
+    Fault = 2,
+}
+
+/// Why an operation is quarantined: it is never applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, vos_wire::Encode, vos_wire::Decode)]
+pub enum Quarantine {
+    /// Its frame is one no device records: arguments past
+    /// [`crate::MAX_ARGUMENTS`].
+    #[codec(index = 0)]
+    Invalid,
+    /// Its run failed so, under a release this device runs, where the
+    /// issuing device records an operation only when its run is done: the
+    /// author wrote garbage, or ran another program under that release.
+    #[codec(index = 1)]
+    Failed(Failure),
+    /// Its author is cut off at or before its sequence number: where it
+    /// equivocated, or past the frontier the device set gives a removed
+    /// device.
+    #[codec(index = 2)]
+    CutOff,
+}
+
+/// An operation kept in its scope's rows without being applied: its
+/// node's CID, its origin, the operation, and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Kept<W> {
+    pub cid: Cid,
+    pub origin: Origin,
+    pub op: Op,
+    pub why: W,
+}
+
+/// An operation held for a later run.
+pub type Held = Kept<Hold>;
+
+/// An operation quarantined.
+pub type Quarantined = Kept<Quarantine>;
+
+impl<W: Copy + vos_wire::Encode + vos_wire::Decode> Kept<W> {
+    /// The kept operation of the row `key`, `value`, under `prefix`
+    /// ([`keys::held_prefix`] or [`keys::quarantined_op_prefix`]).
+    pub(crate) fn read(prefix: &[u8], key: &[u8], value: &[u8]) -> Result<Self, CorruptRow> {
+        let rest = key.strip_prefix(prefix).ok_or(CorruptRow)?;
+        let (cid, _index) = rest.split_first_chunk::<32>().ok_or(CorruptRow)?;
+        let (origin, op, why) = unstored(value)
+            .and_then(<(Origin, Vec<u8>, W) as vos_wire::Decode>::decode_exact)
+            .ok_or(CorruptRow)?;
+        Ok(Self {
+            cid: merkle_crdt::Cid(*cid),
+            origin,
+            op: Op::decode(&op).ok_or(CorruptRow)?,
+            why,
+        })
+    }
+
+    fn row(&self) -> Vec<u8> {
+        stored(&vos_wire::Encode::encode(&(
+            self.origin,
+            self.op.encode(),
+            self.why,
+        )))
+    }
+}
+
 /// The name of local instance `instance`'s scope, from which its id
 /// derives with the key archive's naming secret
 /// ([`crate::group::archive::scope_id`]): devices sharing the archive sync
@@ -143,24 +236,37 @@ fn write(rows: &mut dyn Rows, key: &[u8], value: &impl vos_wire::Encode) {
     rows.write(key, Some(&stored(&value.encode())));
 }
 
-/// Hold `op`, the operation `origin` names in the node `cid` of
-/// `instance`'s scope, in the scope's rows: its origin and its bytes, for
-/// a build that runs it.
-pub fn hold(instance: InstanceId, cid: &Cid, origin: &Origin, op: &Op, rows: &mut dyn Rows) {
-    let key = keys::held(instance, &cid.0, origin.index);
-    write(rows, &key, &(*origin, op.encode()));
+/// Hold `kept` in `instance`'s scope's rows, for a later run.
+pub fn hold(instance: InstanceId, kept: &Held, rows: &mut dyn Rows) {
+    let key = keys::held(instance, &kept.cid.0, kept.origin.index);
+    rows.write(&key, Some(&kept.row()));
+}
+
+/// Quarantine `kept` in `instance`'s scope's rows: never applied.
+pub fn quarantine(instance: InstanceId, kept: &Quarantined, rows: &mut dyn Rows) {
+    let key = keys::quarantined_op(instance, &kept.cid.0, kept.origin.index);
+    rows.write(&key, Some(&kept.row()));
+}
+
+/// `author`'s cutoff in `instance`'s scope, if it has one.
+pub(crate) fn cutoff(
+    rows: &mut dyn Rows,
+    instance: InstanceId,
+    author: &[u8; 32],
+) -> Result<Option<Cutoff>, CorruptRow> {
+    read::<Cutoff>(rows, &keys::cutoff(instance, author))
 }
 
 /// Apply `event`, a node of `instance`'s scope, through `rows`: its Lamport
 /// clock, one more than its parents' greatest; its author's cutoff from its
-/// sequence number where it equivocates; then each operation in order, a
-/// call by `run` with its node's CID and its origin, and one of a kind not
-/// known held ([`hold`]).
+/// sequence number where it equivocates; then each operation in order, by
+/// `run` with its node's CID and its origin, which runs it, holds it or
+/// quarantines it.
 pub fn apply_node<E: From<CorruptRow>>(
     instance: InstanceId,
     event: &Event<'_, Blake2b256, Ops>,
     rows: &mut dyn Rows,
-    mut run: impl FnMut(&Cid, &Origin, &Call, &mut dyn Rows) -> Result<(), E>,
+    mut run: impl FnMut(&Cid, &Origin, &Op, &mut dyn Rows) -> Result<(), E>,
 ) -> Result<(), E> {
     let mut lamport = 0;
     for parent in event.parents {
@@ -171,10 +277,9 @@ pub fn apply_node<E: From<CorruptRow>>(
     write(rows, &keys::lamport(&event.cid.0), &lamport);
     let author = event.author.0;
     if event.equivocation {
-        let key = keys::cutoff(instance, &author);
-        let cutoff = read::<Cutoff>(rows, &key)?;
+        let cutoff = cutoff(rows, instance, &author)?;
         if cutoff.is_none_or(|cutoff| event.seq < cutoff.0) {
-            write(rows, &key, &Cutoff(event.seq));
+            write(rows, &keys::cutoff(instance, &author), &Cutoff(event.seq));
         }
     }
     for (index, op) in event.ops.iter().enumerate() {
@@ -184,10 +289,7 @@ pub fn apply_node<E: From<CorruptRow>>(
             lamport,
             index: u32::try_from(index).map_err(|_| CorruptRow)?,
         };
-        match op {
-            Op::Call(call) => run(event.cid, &origin, call, rows)?,
-            Op::Unknown { .. } => hold(instance, event.cid, &origin, op, rows),
-        }
+        run(event.cid, &origin, op, rows)?;
     }
     Ok(())
 }

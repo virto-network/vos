@@ -10,13 +10,13 @@ use ed25519_dalek::SigningKey;
 use merkle_crdt::{Author, Node};
 use vos_light::group::{Archive, archive};
 use vos_light::release::{self, Package};
-use vos_light::sync::{self, Blake2b256, Call, Cid, Op, Ops};
+use vos_light::sync::{self, Blake2b256, Call, Cid, Op, Ops, Quarantine};
 use vos_light::{Config, Error, Light};
 use vos_testkit::programs;
 use vos_wire::abi::Failure;
 use vos_wire::ids::{InstanceId, MethodId, Principal};
 use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode, keys};
+use vos_wire::{Decode, Encode};
 
 const NOTES: InstanceId = InstanceId(1);
 const DEVICE: Principal = Principal::Client([0xd1; 32]);
@@ -44,7 +44,7 @@ fn open(dir: &std::path::Path, agent: &[u8]) -> Light {
 fn artifacts() -> (Vec<u8>, Package) {
     let read = |path: std::path::PathBuf| std::fs::read(path).unwrap();
     let agent = release::agent(&read(programs::agent_elf())).unwrap();
-    let notes = release::package(&read(programs::actor_elf("notes"))).unwrap();
+    let notes = release::package(&read(programs::actor_elf("notes")), 1).unwrap();
     (agent, notes)
 }
 
@@ -129,9 +129,9 @@ struct State {
 #[test]
 fn a_local_actor_installed_from_release_artifacts_is_called() {
     let (agent, notes) = artifacts();
-    // As `vos-phone`'s build script encodes a package: its derivation,
-    // then its programs.
-    let bytes = (notes.derivation.clone(), notes.programs.clone()).encode();
+    // As `vos-phone`'s build script encodes a package: its derivation, its
+    // programs, then its release.
+    let bytes = (notes.derivation.clone(), notes.programs.clone(), 1u32).encode();
     assert_eq!(bytes, notes.encode());
     let embedded = Package::decode_exact(&bytes).unwrap();
     assert_eq!(embedded, notes);
@@ -267,7 +267,7 @@ fn two_devices_exchange_nodes_and_converge() {
     let to_laptop = phone.push();
     let to_phone = laptop.push();
     let ingested = laptop.light.ingest(NOTES, to_laptop.clone(), None).unwrap();
-    assert_eq!(ingested.applied.len(), to_laptop.len());
+    assert_eq!(ingested.nodes.applied.len(), to_laptop.len());
     phone.light.ingest(NOTES, to_phone, None).unwrap();
     assert_eq!(phone.state(), laptop.state());
     assert_eq!(
@@ -275,8 +275,8 @@ fn two_devices_exchange_nodes_and_converge() {
         Some(stamp)
     );
     let again = laptop.light.ingest(NOTES, to_laptop, None).unwrap();
-    assert_eq!(again.duplicates, 4);
-    assert!(again.applied.is_empty());
+    assert_eq!(again.nodes.duplicates, 4);
+    assert!(again.nodes.applied.is_empty());
 
     // Each now writes after the other's, and the later writes win.
     phone.done("remove", 4u64.encode());
@@ -342,6 +342,7 @@ fn node(key: &SigningKey, seq: u64, ops: Ops, parents: BTreeSet<Cid>) -> Vec<u8>
 
 fn call(notes: &Package, name: &str, arguments: Vec<u8>, time: u64) -> Op {
     Op::Call(Call {
+        release: 1,
         method: method(notes, name),
         arguments,
         time,
@@ -354,10 +355,10 @@ fn cid(bytes: &[u8]) -> Cid {
 }
 
 /// An author that signs two nodes at one sequence number is cut off from
-/// it on every device that applies both, its earlier writes kept; an
-/// author the device set removed is cut off past its frontier, and reads
-/// fall back to the others' writes; an operation of a kind this build does
-/// not know is held, not refused.
+/// it on every device that applies both, its earlier writes kept, and a
+/// device that knew the cutoff when the second came quarantines its
+/// operations; an author the device set removed is cut off past its
+/// frontier, and reads fall back to the others' writes.
 #[test]
 fn equivocating_and_removed_authors_are_filtered_at_read() {
     let (agent, notes) = artifacts();
@@ -412,8 +413,9 @@ fn equivocating_and_removed_authors_are_filtered_at_read() {
         .ingest(NOTES, [first.clone(), one.clone()], None)
         .unwrap();
     assert_eq!(title(&phone, 1).as_deref(), Some("one"));
+    let other_cid = other.clone();
     let ingested = phone.light.ingest(NOTES, [other.clone()], None).unwrap();
-    assert_eq!(ingested.equivocations.len(), 1);
+    assert_eq!(ingested.nodes.equivocations.len(), 1);
     laptop
         .light
         .ingest(NOTES, [other, one, first], None)
@@ -423,17 +425,15 @@ fn equivocating_and_removed_authors_are_filtered_at_read() {
         assert_eq!(title(device, 2).as_deref(), Some("thief"));
     }
     assert_eq!(phone.state(), laptop.state());
-    let held = keys::held_prefix(NOTES);
-    assert!(
-        phone
-            .light
-            .store()
-            .rows()
-            .unwrap()
-            .iter()
-            .any(|(key, _)| key.starts_with(&held)),
-        "the unknown operation is held"
-    );
+    // The phone knew the cutoff when the second node came: its operations,
+    // the unknown kind's among them, are quarantined, never applied.
+    let quarantined = phone.light.quarantined(NOTES).unwrap();
+    assert_eq!(quarantined.len(), 2);
+    for kept in &quarantined {
+        assert_eq!(kept.why, Quarantine::CutOff);
+        assert_eq!(kept.origin.author, Author::from(&thief).0);
+        assert_eq!(kept.cid, cid(&other_cid));
+    }
 
     // The laptop writes after the phone; the device set then removes the
     // laptop past its frontier, before its write.

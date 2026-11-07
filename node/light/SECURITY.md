@@ -40,17 +40,32 @@ and what a node does with one is `node/SECURITY.md`'s.
   reading no row, and records nothing for a handler that fails. A peer's
   node is applied only if its author signed it for the scope, and its
   operations run through the same entry, so a peer reaches only what a
-  merge handler writes; an operation whose run fails writes nothing, and
-  one this build cannot run (an unknown kind or method, a run that
-  faults) is held, so no node stops the scope's sync. Validation of what
-  a well-formed operation writes, and quarantine, are not built
-  (`light-node.md` §8, C1).
+  merge handler writes.
+- **What a device does not run, it keeps:** a peer's operation this
+  device cannot run yet (a kind its build does not know, a later release
+  of the actor than it installed, a run that faults here) is held and
+  replayed by an install; one that is invalid (a frame no device records,
+  a run that fails where its issuing device's was done) is quarantined,
+  never applied, and listed with its author for the chrome (§8, C1). So
+  no node stops the scope's sync, and garbage that opens correctly writes
+  nothing. Excising what a device wrote validly before it was found out is
+  later work: the remedy is removing the device.
 - **Reads filter, never unapply:** an author that equivocated, and one
-  the client cuts off (a removal past its frontier), are filtered when a
-  merge field is read, from their cutoff on; their rows stay. A field
-  keeps one entry an element and author, its latest: a cut-off author's
-  write past its cutoff hides its own earlier write to that element,
-  which reads then fall back from to the other authors'.
+  the device set removed (cut off one past its node at its frontier, as
+  the sealed read finds it), are filtered when a merge field is read,
+  from their cutoff on; their rows stay, and their operations that arrive
+  after the cutoff is known are quarantined, so they never replace the
+  author's earlier entries. A field keeps one entry an element and
+  author, its latest: a cut-off author's write past its cutoff that
+  arrives before the cutoff is known, which agent-mediated sync refuses
+  past the removed device's frontier, still hides its own earlier write to
+  that element, which reads then fall back from to the other authors'.
+- **A full disk refuses, never tears:** below a reserve of free room
+  (64 MiB by default) an install, a call, an ingest and a replay are
+  refused with nothing written, and succeed once room is freed; a cutoff,
+  a push's queue and the device group's writes are exempt. A disk that
+  fills anyway fails fjall's write, which then refuses every write until
+  the store is opened again.
 
 ## The device group
 

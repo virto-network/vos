@@ -155,7 +155,7 @@ pub fn artifacts() -> &'static (Vec<u8>, Package) {
     ARTIFACTS.get_or_init(|| {
         let read = |path: std::path::PathBuf| std::fs::read(path).unwrap();
         let agent = release::agent(&read(programs::agent_elf())).unwrap();
-        let personal = release::package(&read(programs::personal_elf())).unwrap();
+        let personal = release::package(&read(programs::personal_elf()), 1).unwrap();
         (agent, personal)
     })
 }
