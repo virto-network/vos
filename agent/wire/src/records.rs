@@ -15,8 +15,9 @@ use crate::{Decode, Encode};
 /// order, and each device kernel's reference program, likewise; their
 /// provenance, the ELF's hash, the names of its temporary symbols left
 /// out (`vos_pvm_compiler::Derived::elf`), and the version of the
-/// transpiler that derived them; and the pages of the actor's heap its program leaves out.
-/// The same ELF and version derive the same bytes on any machine.
+/// transpiler that derived them; and the pages of the actor's heap its
+/// program leaves out. The same ELF and version derive the same bytes on
+/// any machine.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Derivation {
     pub program: ProgramHash,

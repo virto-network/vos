@@ -9,9 +9,9 @@
 //! derives the same programs while the actor's source stands, but not the
 //! same file: its symbols' names carry crate hashes that follow where it
 //! was built and the SDK's dependencies. Its ELF hash leaves the temporary
-//! symbols' names out, which carry the dependencies' hashes, so an edit to
-//! a dependency that leaves the code as it is moves neither the programs
-//! nor the hash.
+//! symbols' names out, which follow the dependencies' source, so an edit to
+//! a dependency's source that leaves the code as it is moves neither the
+//! programs nor the hash.
 
 use vos_pvm_compiler::{TRANSPILER_VERSION, derive};
 
@@ -80,7 +80,7 @@ fn a_fixed_package_derives_its_pinned_programs() {
 fn renamed(elf: &[u8], name: &[u8], at: usize, to: u8) -> (Vec<u8>, usize) {
     let mut renamed = elf.to_vec();
     let mut changed = 0;
-    for start in 0..elf.len().saturating_sub(name.len()) {
+    for start in 0..=elf.len().saturating_sub(name.len()) {
         if elf[start..].starts_with(name) {
             renamed[start + at] = to;
             changed += 1;
@@ -97,7 +97,12 @@ fn renamed(elf: &[u8], name: &[u8], at: usize, to: u8) -> (Vec<u8>, usize) {
 fn an_elf_hash_leaves_out_temporary_symbols_names() {
     let elf = include_bytes!("fixtures/roomy.elf");
     let derived = derive(elf).expect("derives");
-    assert_eq!(hex(&derived.elf), ELF);
+    assert_eq!(
+        hex(&derived.elf),
+        ELF,
+        "what an ELF hash covers changed, which every derivation names: move TRANSPILER_VERSION, \
+         and pin the hash"
+    );
 
     let (rebuilt, names) = renamed(elf, b".Lanon.", 7, b'0');
     assert!(names > 0, "the fixture names its anonymous data");

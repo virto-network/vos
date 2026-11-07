@@ -25,10 +25,11 @@ const SECTION_HEADER: usize = 64;
 /// The ELF classes: 32- and 64-bit.
 const ELFCLASS32: u8 = 1;
 const ELFCLASS64: u8 = 2;
-/// Section types: an unused header, a symbol table, relocations with
-/// addends, and a section the file holds no bytes of.
+/// Section types: an unused header, a symbol table, a string table,
+/// relocations with addends, and a section the file holds no bytes of.
 const SHT_NULL: u32 = 0;
 const SHT_SYMTAB: u32 = 2;
+const SHT_STRTAB: u32 = 3;
 const SHT_RELA: u32 = 4;
 const SHT_NOBITS: u32 = 8;
 /// Section flags: written, loaded and executed.
@@ -88,36 +89,68 @@ pub(crate) fn name_is(table: &[u8], offset: usize, name: &[u8]) -> bool {
         .is_some_and(|rest| rest.first() == Some(&0))
 }
 
-/// `data` with the names of its temporary symbols (`.L…`) zeroed in their
-/// string tables: what a package's ELF hash covers. A compiler names its
-/// anonymous data after its dependencies' hashes, which move with any edit
-/// to them, and the transpiler reads no such name; the rest of the bytes,
-/// the code, data, relocations and every other name, stay.
+/// `data` with the names of its temporary symbols (`.L…`) zeroed in its
+/// symbol table's string table: what a package's ELF hash covers. LLVM
+/// names a module's private globals after the module's hash, which follows
+/// its dependencies' source, and the transpiler reads no such name; the
+/// rest of the bytes, the code, data, relocations and every other name,
+/// stay. Refused unless those names lie in a string table of their own,
+/// no other section's bytes and not the sections' names, and no other
+/// name shares their bytes: the zeroed bytes are then only theirs, and
+/// two packages the transpiler reads apart never hash alike.
 pub(crate) fn without_temporary_names(data: &[u8]) -> Result<Vec<u8>, TranspileError> {
-    let headers = sections(data)?.headers;
+    let parsed = sections(data)?;
     let mut kept = data.to_vec();
-    for symtab in headers.iter().filter(|header| header.sh_type == SHT_SYMTAB) {
-        let (Some(table), Some(names)) = (
-            span(data, symtab.file_off, symtab.size),
-            headers.get(symtab.link),
-        ) else {
-            continue;
-        };
-        let (Some(start), Some(strtab)) = (
-            usize::try_from(names.file_off).ok(),
-            span(data, names.file_off, names.size),
-        ) else {
-            continue;
-        };
-        for entry in table.chunks_exact(SYMBOL_ENTRY) {
-            let at = u32::from_le_bytes(entry[0..4].try_into().expect("four bytes")) as usize;
-            let Some(name) = strtab.get(at..) else {
-                continue;
-            };
-            let len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
-            if name[..len].starts_with(b".L") {
-                kept[start + at..start + at + len].fill(0);
-            }
+    let Some(symtab) = parsed.symtab.map(|index| &parsed.headers[index]) else {
+        return Ok(kept);
+    };
+    let refused = |why: &str| TranspileError::ElfParse(format!("its symbols' names {why}"));
+    let table = &parsed.headers[symtab.link];
+    if table.sh_type != SHT_STRTAB
+        || table.flags & SHF_ALLOC != 0
+        || symtab.link == parsed.section_names
+    {
+        return Err(refused("are not in a string table of their own"));
+    }
+    let (from, to) = (table.file_off, table.file_off + table.size);
+    let overlaps = parsed.headers.iter().enumerate().any(|(index, other)| {
+        index != symtab.link
+            && !matches!(other.sh_type, SHT_NULL | SHT_NOBITS)
+            && other.size > 0
+            && other.file_off < to
+            && from < other.file_off.saturating_add(other.size)
+    });
+    if overlaps {
+        return Err(refused("share bytes with another section"));
+    }
+    let names = &parsed.names;
+    let entries = span(data, symtab.file_off, symtab.size).unwrap_or(&[]);
+    let mut starts: Vec<usize> = entries
+        .chunks_exact(SYMBOL_ENTRY)
+        .map(|entry| u32::from_le_bytes(entry[0..4].try_into().expect("four bytes")) as usize)
+        .filter(|&at| at < names.len())
+        .collect();
+    starts.sort_unstable();
+    starts.dedup();
+    // One pass in offset order: each name ends at the next NUL, and one
+    // starting inside a name of the other kind shares its bytes.
+    let base = from as usize;
+    let (mut nul, mut temporary_end, mut named_end) = (0, 0, 0);
+    for at in starts {
+        nul = nul.max(at);
+        nul += names[nul..]
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(names.len() - nul);
+        let temporary = names[at..].starts_with(b".L");
+        if at < if temporary { named_end } else { temporary_end } {
+            return Err(refused("share bytes, a temporary one and another"));
+        }
+        if temporary {
+            temporary_end = nul;
+            kept[base + at..base + nul].fill(0);
+        } else {
+            named_end = nul;
         }
     }
     Ok(kept)
@@ -160,6 +193,9 @@ pub(super) struct Sections {
     pub(super) names: Vec<u8>,
     /// The exported `accumulate` symbol's address.
     pub(super) accumulate: Option<u64>,
+    /// The symbol table's index, and the section names' table's.
+    pub(super) symtab: Option<usize>,
+    pub(super) section_names: usize,
 }
 
 /// Read the ELF header, the section table, and the symbol table.
@@ -350,5 +386,62 @@ pub(super) fn sections(data: &[u8]) -> Result<Sections, TranspileError> {
         symbols,
         names,
         accumulate: accumulate_vaddr,
+        symtab: symtab_idx,
+        section_names: e_shstrndx,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ROOMY: &[u8] = include_bytes!("../../tests/fixtures/roomy.elf");
+
+    /// `elf` with symbol `index`'s name at `at` of its string table.
+    fn named(elf: &[u8], index: usize, at: usize) -> Vec<u8> {
+        let parsed = sections(elf).unwrap();
+        let symtab = &parsed.headers[parsed.symtab.unwrap()];
+        let entry = symtab.file_off as usize + index * SYMBOL_ENTRY;
+        let mut named = elf.to_vec();
+        named[entry..entry + 4].copy_from_slice(&(at as u32).to_le_bytes());
+        named
+    }
+
+    /// A name inside a temporary one, or a temporary one inside another
+    /// name, would be zeroed with it: refused.
+    #[test]
+    fn a_name_sharing_a_temporary_ones_bytes_is_refused() {
+        assert!(without_temporary_names(ROOMY).is_ok());
+        let names = sections(ROOMY).unwrap().names;
+        let temporary = names.windows(7).position(|w| w == b".Lanon.").unwrap();
+        let inside = named(ROOMY, 1, temporary + 2);
+        assert!(without_temporary_names(&inside).is_err());
+
+        let named_at = names
+            .windows(4)
+            .position(|w| w == b"_RNv")
+            .expect("a function's name");
+        let mut around = named(ROOMY, 1, named_at);
+        let table = sections(ROOMY).unwrap();
+        let strtab = &table.headers[table.headers[table.symtab.unwrap()].link];
+        let at = strtab.file_off as usize + named_at + 4;
+        around[at..at + 2].copy_from_slice(b".L");
+        let around = named(&around, 2, named_at + 4);
+        assert!(without_temporary_names(&around).is_err());
+    }
+
+    /// Symbol names in the sections' names' table are refused.
+    #[test]
+    fn names_in_the_section_names_table_are_refused() {
+        let parsed = sections(ROOMY).unwrap();
+        let symtab = parsed.symtab.unwrap();
+        // A section header's `sh_link`, 40 bytes in.
+        let link = 40;
+        let header = u64::from_le_bytes(ROOMY[40..48].try_into().unwrap()) as usize
+            + symtab * SECTION_HEADER;
+        let mut linked = ROOMY.to_vec();
+        linked[header + link..header + link + 4]
+            .copy_from_slice(&(parsed.section_names as u32).to_le_bytes());
+        assert!(without_temporary_names(&linked).is_err());
+    }
 }

@@ -28,8 +28,9 @@ use vos_wire::{Decode, Encode};
 pub const TRANSPILER: u32 = 1;
 
 /// A device kernel's release artifact: method `method`'s kernel of the
-/// package whose ELF hashes to `elf`, and its device program as every node
-/// computes it from that package (`vos_pvm_recair::device::Program::of`):
+/// package whose ELF hash (`vos_pvm_compiler::Derived::elf`) is `elf`,
+/// and its device program as every node computes it from that package
+/// (`vos_pvm_recair::device::Program::of`):
 /// its chips, its log sizes, its format and its id. The light node
 /// commits the program's preprocessed tree from these at its first proof
 /// ([`crate::DeviceProgram::released`]) and checks the id it gets.
