@@ -13,9 +13,9 @@
 //! and 32 levels, a revocation 32, and an enrollment of many shares the
 //! nodes they have in common.
 //!
-//! Every write but `claim` and `claim_open` is under the role `registrar`,
-//! and none is taken before `found` sets the space's handle and the ring's
-//! first root.
+//! Every write but `claim`, `claim_open` and a person's device methods is
+//! under the role `registrar`, and none is taken before
+//! `found` sets the space's handle and the ring's first root.
 //!
 //! **The open claim** (`light-node.md` §3.3): a space that admits anyone,
 //! a home-only space, has its registrar `open` it; then any caller enrolls
@@ -23,6 +23,25 @@
 //! member and the period's salt starts with the difficulty's zero bits,
 //! at most the cap's members a period. The work only stops a trivial loop;
 //! the cap bounds what a home admits.
+//!
+//! **Persons** (`light-node.md` §3.8): each device of a member holds a
+//! secret of its own, so a leaf and an owner digest of its own, which
+//! nothing links. The registrar, which knows both digests of the member it
+//! enrolls, records them as a person's first device with `register`, and
+//! the person's limit of devices. A device of the person then enrolls
+//! another, `enroll_device(member, owner)` under its owner proof, and
+//! revokes any of the person's, `revoke_device(member)`. The digests it
+//! names are its word, so a member or an owner digest any person holds, an
+//! enrolled member and an invited one are refused, and the new owner digest
+//! acts for the person only once its own proof confirms it
+//! (`confirm_device`): owner digests are public in a ledger's log, and no
+//! person takes another's. No query answers a person; the registrar and
+//! the space's operators, who read its rows and the calls, link its
+//! devices.
+//!
+//! **`once`** admits a nullifier once in its scope, and each device's
+//! secret gives it its own: a guard under `once` admits a member once a
+//! device, which the space's chrome states.
 //!
 //! **The stock kernels** (`light-node.md` §4.2): `auth` and `owner`, the
 //! device kernels every space gets with this actor, written with the SDK
@@ -42,8 +61,8 @@ use alloc::collections::BTreeMap;
 use vos_sdk::p2::{self, InPlace, Secret, Tag, TagHash};
 use vos_sdk::prelude::*;
 use vos_wire::credentials::{
-    self as tree, CredentialError, DEPTH, Digest, EMPTY, ENROLL_MANY, MAX_DIFFICULTY, Open, Path,
-    Ring, RootEntry, Siblings, Words, tables::RING_KEY,
+    self as tree, CredentialError, DEPTH, Digest, EMPTY, ENROLL_MANY, MAX_DEVICES, MAX_DIFFICULTY,
+    Open, Path, Ring, RootEntry, Siblings, Words, tables::RING_KEY,
 };
 
 /// The open claim's terms and the current period's count.
@@ -69,6 +88,21 @@ impl Opening {
             self.cap
         }
     }
+}
+
+/// A device of a person: its leaf's member digest and its owner digest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Device {
+    pub member: Digest,
+    pub owner: Digest,
+}
+
+/// A person's record: its devices, at most `limit`, the first the one the
+/// registrar registered.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Person {
+    pub limit: u8,
+    pub devices: Vec<Device>,
 }
 
 /// Auth's claim, the stock `auth` kernel's public arguments: the member's
@@ -137,6 +171,11 @@ pub struct Credentials {
     invites: Table<Digest, u64>,
     ring: Table<u8, Ring>,
     opening: Table<u8, Opening>,
+    persons: Table<u32, Person>,
+    owners: Table<Digest, u32>,
+    pending: Table<Digest, u32>,
+    devices: Table<Digest, u32>,
+    people: Table<u8, u32>,
 }
 
 #[messages]
@@ -152,6 +191,11 @@ impl Credentials {
             invites: Table::default(),
             ring: Table::default(),
             opening: Table::default(),
+            persons: Table::default(),
+            owners: Table::default(),
+            pending: Table::default(),
+            devices: Table::default(),
+            people: Table::default(),
         }
     }
 
@@ -342,7 +386,8 @@ impl Credentials {
     }
 
     /// Revoke `member`: its leaf back to the empty leaf, its slot freed for
-    /// the next enrollment; or its invitation withdrawn.
+    /// the next enrollment, or its invitation withdrawn; and dropped from
+    /// its person.
     #[msg(role = "registrar")]
     pub async fn revoke(
         &mut self,
@@ -351,18 +396,125 @@ impl Credentials {
     ) -> Result<(), CredentialError> {
         self.founded()?;
         tree::words(&member).ok_or(CredentialError::NotADigest)?;
-        if let Some(slot) = self.slots.get(&member) {
-            self.slots.remove(&member);
-            self.free.insert(&slot, &());
-            self.count -= 1;
-            self.write(ctx.now(), BTreeMap::from([(slot, EMPTY[0])]));
-            Ok(())
-        } else if self.invites.contains(&member) {
-            self.invites.remove(&member);
-            Ok(())
-        } else {
-            Err(CredentialError::NotEnrolled)
+        self.unseat(ctx.now(), &member)
+    }
+
+    /// Record `member`, enrolled or invited until now or later, with its
+    /// owner digest `owner` as the first device of a person of at most
+    /// `limit` devices. An enrollment awaiting `owner`'s confirmation gives
+    /// way: the registrar's word is the binding one.
+    #[msg(role = "registrar")]
+    pub async fn register(
+        &mut self,
+        ctx: &mut Command<Self>,
+        member: Digest,
+        owner: Digest,
+        limit: u8,
+    ) -> Result<(), CredentialError> {
+        self.founded()?;
+        tree::words(&member).ok_or(CredentialError::NotADigest)?;
+        tree::words(&owner).ok_or(CredentialError::NotADigest)?;
+        if limit == 0 || limit > MAX_DEVICES {
+            return Err(CredentialError::Terms);
         }
+        if !self.slots.contains(&member) {
+            let expires = self
+                .invites
+                .get(&member)
+                .ok_or(CredentialError::NotEnrolled)?;
+            if ctx.now() > expires {
+                return Err(CredentialError::Expired);
+            }
+        }
+        self.unheld(&member, &owner)?;
+        if self.pending.contains(&owner) {
+            self.pending.remove(&owner);
+        }
+        let id = self.people.get(&RING_KEY).unwrap_or(0);
+        let next = id.checked_add(1).ok_or(CredentialError::Full)?;
+        self.people.insert(&RING_KEY, &next);
+        let person = Person {
+            limit,
+            devices: Vec::new(),
+        };
+        self.seat(id, person, Device { member, owner });
+        self.owners.insert(&owner, &id);
+        Ok(())
+    }
+
+    /// Set the limit of `member`'s person to `limit`; devices past it stay
+    /// enrolled, and the person enrolls none until it is below.
+    #[msg(role = "registrar")]
+    pub async fn limit(&mut self, member: Digest, limit: u8) -> Result<(), CredentialError> {
+        self.founded()?;
+        if limit == 0 || limit > MAX_DEVICES {
+            return Err(CredentialError::Terms);
+        }
+        let id = self.devices.get(&member).ok_or(CredentialError::NoPerson)?;
+        let mut person = self.persons.get(&id).expect("a device's person");
+        person.limit = limit;
+        self.persons.insert(&id, &person);
+        Ok(())
+    }
+
+    /// Enroll `member` as a device of the person whose device proved the
+    /// caller's owner digest, within the person's limit: its slot. Its
+    /// leaf proves at once; `owner`, its owner digest, acts for the person
+    /// once its own proof confirms it (`confirm_device`).
+    #[msg(credential = Owner)]
+    pub async fn enroll_device(
+        &mut self,
+        ctx: &mut Command<Self>,
+        member: Digest,
+        owner: Digest,
+    ) -> Result<u32, CredentialError> {
+        self.founded()?;
+        let (id, person) = self.person_of(ctx.owner())?;
+        if person.devices.len() >= usize::from(person.limit) {
+            return Err(CredentialError::Limit);
+        }
+        let leaf = self.admit(&member)?;
+        tree::words(&owner).ok_or(CredentialError::NotADigest)?;
+        if self.invites.contains(&member) {
+            return Err(CredentialError::Invited);
+        }
+        self.unheld(&member, &owner)?;
+        if self.pending.contains(&owner) {
+            return Err(CredentialError::Held);
+        }
+        let slot = self.place(&member, true)?;
+        self.write(ctx.now(), BTreeMap::from([(slot, leaf)]));
+        self.seat(id, person, Device { member, owner });
+        self.pending.insert(&owner, &id);
+        Ok(slot)
+    }
+
+    /// Confirm the caller's owner digest as its device's, named by an
+    /// `enroll_device`: from now on it acts for the person.
+    #[msg(credential = Owner)]
+    pub async fn confirm_device(&mut self, ctx: &mut Command<Self>) -> Result<(), CredentialError> {
+        self.founded()?;
+        let owner = ctx.owner().ok_or(CredentialError::NoPerson)?;
+        let id = self.pending.get(&owner).ok_or(CredentialError::NoPerson)?;
+        self.pending.remove(&owner);
+        self.owners.insert(&owner, &id);
+        Ok(())
+    }
+
+    /// Revoke `member`, a device of the person whose device proved the
+    /// caller's owner digest, the caller's own included, as `revoke` does.
+    #[msg(credential = Owner)]
+    pub async fn revoke_device(
+        &mut self,
+        ctx: &mut Command<Self>,
+        member: Digest,
+    ) -> Result<(), CredentialError> {
+        self.founded()?;
+        let (id, _) = self.person_of(ctx.owner())?;
+        if self.devices.get(&member) != Some(id) {
+            return Err(CredentialError::NotYours);
+        }
+        self.unseat(ctx.now(), &member)
     }
 
     /// `member`'s path: the tree's root, its slot and the 32 siblings from
@@ -455,6 +607,70 @@ impl Credentials {
         } else {
             Ok(())
         }
+    }
+
+    /// The person whose device's owner digest is `owner`, and its id.
+    fn person_of(&self, owner: Option<Digest>) -> Result<(u32, Person), CredentialError> {
+        let id = owner
+            .and_then(|owner| self.owners.get(&owner))
+            .ok_or(CredentialError::NoPerson)?;
+        Ok((id, self.persons.get(&id).expect("an owner's person")))
+    }
+
+    /// Refuse a member or an owner digest a person holds.
+    fn unheld(&self, member: &Digest, owner: &Digest) -> Result<(), CredentialError> {
+        if self.devices.contains(member) || self.owners.contains(owner) {
+            Err(CredentialError::Held)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// `device` added to the person `id`, `person` as it was; its owner
+    /// digest indexed by the caller.
+    fn seat(&mut self, id: u32, mut person: Person, device: Device) {
+        self.devices.insert(&device.member, &id);
+        person.devices.push(device);
+        self.persons.insert(&id, &person);
+    }
+
+    /// `member`'s leaf emptied and its slot freed, or its invitation
+    /// withdrawn; and the member dropped from its person, the person with
+    /// it once it holds no device.
+    fn unseat(&mut self, time: u64, member: &Digest) -> Result<(), CredentialError> {
+        if let Some(slot) = self.slots.get(member) {
+            self.slots.remove(member);
+            self.free.insert(&slot, &());
+            self.count -= 1;
+            self.write(time, BTreeMap::from([(slot, EMPTY[0])]));
+        } else if self.invites.contains(member) {
+            self.invites.remove(member);
+        } else {
+            return Err(CredentialError::NotEnrolled);
+        }
+        if let Some(id) = self.devices.get(member) {
+            self.devices.remove(member);
+            let mut person = self.persons.get(&id).expect("a device's person");
+            let at = person
+                .devices
+                .iter()
+                .position(|device| device.member == *member)
+                .expect("a device in its person");
+            let owner = person.devices.remove(at).owner;
+            // A registration may have taken an unconfirmed owner digest.
+            if self.owners.get(&owner) == Some(id) {
+                self.owners.remove(&owner);
+            }
+            if self.pending.get(&owner) == Some(id) {
+                self.pending.remove(&owner);
+            }
+            if person.devices.is_empty() {
+                self.persons.remove(&id);
+            } else {
+                self.persons.insert(&id, &person);
+            }
+        }
+        Ok(())
     }
 
     /// `member`'s leaf, for a member neither enrolled nor malformed.

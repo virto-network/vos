@@ -12,7 +12,8 @@
 //! holding a proof; a verified call holding no large body's place while it
 //! waits to apply; the device library's requests and proofs admitted as
 //! they leave it; an actor's own kernel's proof run by its handler on its
-//! claim; and compatibility windows across a credential actor's upgrade.
+//! claim; compatibility windows across a credential actor's upgrade; and a
+//! second device enrolled and revoked by its first device's owner proofs.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,7 +30,9 @@ use vos_light::{AuthWitness, Call, DEVICE_FORMAT, DeviceProgram, Prover, ProverC
 use vos_net::Class;
 use vos_node::client::{self, Client};
 use vos_wire::abi::Refusal;
-use vos_wire::credentials::{self as tree, AuthClaim, Bound, Digest, Path, RootEntry};
+use vos_wire::credentials::{
+    self as tree, AuthClaim, Bound, CredentialError, Digest, Path, RootEntry,
+};
 use vos_wire::defaults::ROOT_MAX_AGE;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
 use vos_wire::ingress::{
@@ -292,7 +295,20 @@ impl Founded {
     /// An owner call of the ledger's `transfer`, by `secret`.
     fn pay(&self, at: NodeNumber, secret: &Secret, to: &str, amount: u64) -> Credentialed {
         let arguments = (to.as_bytes().to_vec(), amount);
-        let call = self.call(at, PAYMENTS, "transfer", arguments);
+        self.owned(at, secret, PAYMENTS, "transfer", arguments)
+    }
+
+    /// An owner call of `instance`'s `name` by `secret`, good for a minute
+    /// by node `at`'s clock: its proof made by the stock `owner` kernel.
+    fn owned<A: Encode>(
+        &self,
+        at: NodeNumber,
+        secret: &Secret,
+        instance: InstanceId,
+        name: &str,
+        arguments: A,
+    ) -> Credentialed {
+        let call = self.call(at, instance, name, arguments);
         let proof = self
             .prover
             .prove_owner(&secret.0, &call, &self.owner)
@@ -928,6 +944,56 @@ fn a_revoked_members_root_goes_stale_and_owners_pay_from_their_accounts() {
     done(&founded.send(at, &founded.pay(at, &renewed, "bob", 5)));
     let balance: Option<u64> = founded.read(PAYMENTS, "balance", b"bob".to_vec());
     assert_eq!(balance, Some(75));
+}
+
+/// A second device enrolled and revoked in the space by its first
+/// device's owner proofs (`light-node.md` §3.8): the registrar registers
+/// the first device's digests as a person, whose owner proof enrolls the
+/// second, and the second's confirms its owner digest; each device votes once in the poll's `once` scope, so the
+/// person is admitted once a device, the second's repeat refused; the
+/// first's owner proof revokes the second, whose path is gone and whose
+/// owner proof, which held the person, then holds none.
+#[test]
+fn a_second_device_is_enrolled_and_revoked_by_its_first_devices_proof() {
+    let founded = Founded::new();
+    let at = founded.follower();
+    let (first, second) = (Secret::new(41), Secret::new(42));
+    founded.write(CREDENTIALS, "enroll", first.member());
+    founded.write(
+        CREDENTIALS,
+        "register",
+        (first.member(), first.owner(), 2u8),
+    );
+    let arguments = (second.member(), second.owner());
+    let enroll = founded.owned(at, &first, CREDENTIALS, "enroll_device", arguments);
+    let slot = u32::decode_exact(done(&founded.send(at, &enroll))).unwrap();
+    let path = founded.path(&second);
+    assert_eq!(slot, path.slot);
+    let confirm = founded.owned(at, &second, CREDENTIALS, "confirm_device", ());
+    done(&founded.send(at, &confirm));
+
+    for secret in [&first, &second] {
+        let vote = founded.auth(at, secret, &founded.path(secret), ("vote", "vote"), 3u8);
+        done(&founded.send(at, &vote));
+    }
+    let tally: u32 = founded.read(POLL, "tally", 3u8);
+    assert_eq!(tally, 2, "one admission a device");
+    let again = founded.auth(at, &second, &path, ("vote", "vote"), 4u8);
+    assert_eq!(refused(founded.send(at, &again)), CredentialRefusal::Once);
+
+    let revoke = founded.owned(at, &first, CREDENTIALS, "revoke_device", second.member());
+    done(&founded.send(at, &revoke));
+    let gone: Option<Path> = founded.read(CREDENTIALS, "path", second.member());
+    assert_eq!(gone, None);
+    let back = founded.owned(at, &second, CREDENTIALS, "revoke_device", first.member());
+    match founded.send(at, &back) {
+        Response::Ran {
+            outcome: Outcome::Failed { detail, .. },
+            ..
+        } => assert_eq!(detail, [CredentialError::NoPerson as u8]),
+        other => panic!("a revoked device's revocation: {other:?}"),
+    }
+    founded.path(&first);
 }
 
 /// `vos-light`'s `SCOPE_VECTOR`: `scope([0x51; 32], 4, 2, "login")`, the

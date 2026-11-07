@@ -41,7 +41,11 @@ pub const RING: usize = 64;
 /// The most members one `enroll_many` takes.
 pub const ENROLL_MANY: usize = 256;
 
-/// The role every write but `claim` is under.
+/// The most devices a person's limit admits.
+pub const MAX_DEVICES: u8 = 16;
+
+/// The role every write but the claims and a person's device methods is
+/// under.
 pub const REGISTRAR: &str = "registrar";
 
 /// The actor's tables, by name: each tagged
@@ -64,6 +68,19 @@ pub mod tables {
     /// One row, under [`RING_KEY`]: the open claim's terms and its period's
     /// count, once the registrar opened it.
     pub const OPENING: &str = "opening";
+    /// A person's id, a `u32` → its record: its limit and each device's
+    /// `member` and `owner` digests.
+    pub const PERSONS: &str = "persons";
+    /// A confirmed device's `owner` digest → its person's id.
+    pub const OWNERS: &str = "owners";
+    /// An enrolled device's `owner` digest awaiting its own proof → its
+    /// person's id.
+    pub const PENDING: &str = "pending";
+    /// A device's `member` digest → its person's id.
+    pub const DEVICES: &str = "devices";
+    /// One row, under [`RING_KEY`]: the persons ever registered, the next
+    /// one's id.
+    pub const PEOPLE: &str = "people";
 }
 
 /// The tags' names (`proving.md` §8): `T(name)` is the block
@@ -787,9 +804,28 @@ pub enum CredentialError {
     /// The open claims of the period reached its cap.
     #[codec(index = 12)]
     Cap = 12,
-    /// A difficulty past [`MAX_DIFFICULTY`], or a period of zero.
+    /// A difficulty past [`MAX_DIFFICULTY`], a period of zero, or a
+    /// person's limit of zero or past [`MAX_DEVICES`].
     #[codec(index = 13)]
     Terms = 13,
+    /// The member or the owner digest is a device of a person already, or
+    /// the owner digest awaits its confirmation.
+    #[codec(index = 14)]
+    Held = 14,
+    /// The caller's owner digest is no person's confirmed device, or, to
+    /// `confirm_device`, awaits no confirmation.
+    #[codec(index = 15)]
+    NoPerson = 15,
+    /// The person holds as many devices as its limit.
+    #[codec(index = 16)]
+    Limit = 16,
+    /// The member is no device of the caller's person.
+    #[codec(index = 17)]
+    NotYours = 17,
+    /// The member holds an invitation: the registrar named it for its
+    /// own claim.
+    #[codec(index = 18)]
+    Invited = 18,
 }
 
 /// The most leading zero bits an open claim's difficulty asks.
