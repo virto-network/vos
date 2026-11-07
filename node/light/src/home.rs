@@ -10,7 +10,7 @@
 //!   pseudonym there. A device's own nullifier in it, which its add
 //!   records, is computed without a proof ([`nullifier`]).
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use vos_wire::credentials::{Digest as Bytes, meets, open_work};
 
@@ -27,8 +27,8 @@ pub fn nullifier(secret: &DeviceSecret, space: &[u8; 32], agent: u32, instance: 
 }
 
 /// A nonce whose work for `member` in the space whose handle is `handle`
-/// meets `difficulty` under `salt`, searched on `threads` threads: about
-/// `2^difficulty` hashes; `u64::MAX` if no nonce does.
+/// meets `difficulty` under `salt`, the least, searched on `threads`
+/// threads: about `2^difficulty` hashes; `u64::MAX` if no nonce does.
 pub fn work(
     handle: &[u8; 32],
     member: &Bytes,
@@ -37,17 +37,17 @@ pub fn work(
     threads: usize,
 ) -> u64 {
     let threads = threads.max(1) as u64;
-    let found = AtomicBool::new(false);
     let nonce = AtomicU64::new(u64::MAX);
     std::thread::scope(|scope| {
         for start in 0..threads {
-            let (found, nonce) = (&found, &nonce);
+            let nonce = &nonce;
             scope.spawn(move || {
+                // Each thread searches on below the least nonce found, so
+                // the search finds the least on any number of threads.
                 let mut at = start;
-                while !found.load(Ordering::Relaxed) {
+                while at < nonce.load(Ordering::Relaxed) {
                     if meets(&open_work(handle, member, salt, at), difficulty) {
                         nonce.fetch_min(at, Ordering::Relaxed);
-                        found.store(true, Ordering::Relaxed);
                         return;
                     }
                     match at.checked_add(threads) {
