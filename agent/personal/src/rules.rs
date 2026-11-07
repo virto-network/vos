@@ -5,14 +5,17 @@
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
+use vos_sdk::context::Method;
 use vos_sdk::prelude::*;
 use vos_wire::personal::{
-    ANSWER_BYTES, Author, Body, DAY_MS, Device, DeviceId, Entry, Holder, Item, NewDevice,
-    PersonalError, Policy, Recipient, Scope, Standing, Status, Verdict, Void, Vote, Voted, chain,
+    ANSWER_BYTES, Author, Body, DAY_MS, Device, DeviceId, Entry, Holder, Item, Kit, NewDevice,
+    PersonalError, Policy, Recipient, Recorded, Scope, Standing, Status, Verdict, Void, Vote,
+    Voted, chain,
 };
 
 use crate::Personal;
-use crate::rows::{Charge, Group, Head, ONE, Share, Slot, Usage};
+use crate::home::{self, Homes};
+use crate::rows::{Charge, Group, Head, Lease, ONE, Share, Slot, Usage};
 
 /// Rows while their encodings, `size` each, fit one answer: at least the
 /// first.
@@ -47,6 +50,55 @@ impl Reader {
 }
 
 impl Personal {
+    /// A claim's assignment at `now`: its device, the first, active at
+    /// once, and its kit; checked whole before anything is written.
+    pub(crate) fn take(
+        &mut self,
+        now: u64,
+        device: NewDevice,
+        kit: Kit,
+    ) -> Result<Recorded, PersonalError> {
+        if self.lease.contains(&ONE) {
+            return Err(PersonalError::Assigned);
+        }
+        if kit.entries.len() > crate::KIT_ENTRIES {
+            return Err(PersonalError::Malformed);
+        }
+        let mut keys: Vec<[u8; 32]> = Vec::from([device.sync, device.admin]);
+        keys.extend(kit.entries.iter().map(|entry| entry.signing));
+        for (i, key) in keys.iter().enumerate() {
+            if keys[..i].contains(key) {
+                return Err(PersonalError::KeyTaken);
+            }
+        }
+        let first = self.add_device(now, now, device)?;
+        for (i, entry) in kit.entries.iter().enumerate() {
+            self.admitted.insert(&entry.signing, &Holder::Kit(i as u8));
+            self.kit.insert(&(i as u8), entry);
+        }
+        self.secrets.insert(&ONE, &kit.r2);
+        let lease_ms = self.policy().lease_ms;
+        self.lease.insert(
+            &ONE,
+            &Lease {
+                until: now.saturating_add(lease_ms),
+                reproved: false,
+            },
+        );
+        self.seen.insert(&first, &now);
+        let kit = kit.entries.iter().map(|entry| entry.signing).collect();
+        let index = self.append(now, Body::Assigned { device: first, kit });
+        Ok(Recorded { at: now, index })
+    }
+
+    /// Tell the home's `Homes` `message`, if a claim through it assigned
+    /// the agent; delivered once the step commits.
+    pub(crate) fn tell_home<M: Method<Actor = Homes>>(&self, message: M) {
+        if let Some((agent, instance)) = self.home.get(&ONE) {
+            vos_sdk::host::send(agent, instance, M::ID, &message.encode());
+        }
+    }
+
     pub(crate) fn policy(&self) -> Policy {
         self.policy.get(&ONE).unwrap_or(Policy::DEFAULT)
     }
@@ -394,6 +446,11 @@ impl Personal {
                 }
                 if let Some(index) = candidate.carries {
                     self.carried(index, candidate.epoch);
+                }
+                if let Some(device) = candidate.added.and_then(|added| self.devices.get(&added)) {
+                    self.tell_home(home::Record {
+                        nullifier: device.keys.nullifier,
+                    });
                 }
                 // The previous R2 is released until the restore's device
                 // commits a group of its own.

@@ -8,6 +8,9 @@
 //!   kernel is derived from.
 //! - `#[derive(InPlace)]` on a `#[repr(C)]` struct of in-place fields: read
 //!   in place, its encoding its bytes (`vos_sdk::p2`).
+//! - `method_id!("name")`: the id a handler named `name` derives, as a
+//!   literal, for a message to an actor whose crate the sender cannot
+//!   depend on.
 
 mod actor;
 mod in_place;
@@ -180,4 +183,22 @@ pub fn in_place(item: TokenStream) -> TokenStream {
     in_place_impl(input)
         .unwrap_or_else(Error::into_compile_error)
         .into()
+}
+
+// ===== method_id! =====
+
+/// The id a handler named `name` derives (`derive_id` in `vos/method/`), as
+/// a `u32` literal: a crate that sends to an actor it cannot depend on
+/// implements `Method` for the message with it.
+#[proc_macro]
+pub fn method_id(input: TokenStream) -> TokenStream {
+    let name = parse_macro_input!(input as LitStr);
+    let id = vos_wire::ids::derive_id("vos/method/", &name.value());
+    if id == 0 {
+        return Error::new(name.span(), "the name derives the reserved id 0")
+            .into_compile_error()
+            .into();
+    }
+    let id = proc_macro2::Literal::u32_suffixed(id);
+    quote::quote!(#id).into()
 }

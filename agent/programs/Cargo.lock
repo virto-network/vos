@@ -169,6 +169,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "vos-homes"
+version = "0.1.0"
+dependencies = [
+ "vos-personal",
+ "vos-sdk",
+ "vos-wire",
+]
+
+[[package]]
 name = "vos-personal"
 version = "0.1.0"
 dependencies = [

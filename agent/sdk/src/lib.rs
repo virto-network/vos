@@ -24,7 +24,7 @@ pub mod state;
 pub mod table;
 
 pub use alloc::vec::Vec;
-pub use vos_sdk_macros::{actor, messages};
+pub use vos_sdk_macros::{actor, messages, method_id};
 pub use vos_wire::vos_anchor::VenueId;
 pub use vos_wire::{Decode, Encode, abi, credentials, keys, scale, schema, served};
 

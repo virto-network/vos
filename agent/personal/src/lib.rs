@@ -38,6 +38,7 @@
 extern crate alloc;
 
 mod devices;
+pub mod home;
 mod rows;
 mod rules;
 
@@ -154,6 +155,8 @@ pub struct Personal {
     slots: Table<Scope, Slot>,
     /// Open slots by their expiry.
     closing: Table<(u64, Scope), (), Ordered>,
+    /// The home's `Homes` that claimed the agent: its agent and instance.
+    home: Table<u8, (u32, u32)>,
 }
 
 #[messages]
@@ -202,6 +205,7 @@ impl Personal {
             inbox: Table::default(),
             slots: Table::default(),
             closing: Table::default(),
+            home: Table::default(),
         }
     }
 
@@ -229,38 +233,34 @@ impl Personal {
         device: NewDevice,
         kit: Kit,
     ) -> Result<Recorded, PersonalError> {
-        let now = ctx.now();
-        if self.lease.contains(&ONE) {
-            return Err(PersonalError::Assigned);
-        }
-        if kit.entries.len() > KIT_ENTRIES {
-            return Err(PersonalError::Malformed);
-        }
-        let mut keys: Vec<[u8; 32]> = Vec::from([device.sync, device.admin]);
-        keys.extend(kit.entries.iter().map(|entry| entry.signing));
-        for (i, key) in keys.iter().enumerate() {
-            if keys[..i].contains(key) {
-                return Err(PersonalError::KeyTaken);
+        self.take(ctx.now(), device, kit)
+    }
+
+    /// [`Personal::assign`] for the home's `Homes` at `homes` in the
+    /// calling agent, answered by message (a send is one-way): `assigned`,
+    /// or `refused` with the error, writing nothing. From then on the agent
+    /// tells `Homes` each device's nullifier as its add is confirmed, and
+    /// each new kit's keys.
+    #[msg(role = "homes")]
+    pub async fn claim(
+        &mut self,
+        ctx: &mut Command<Self>,
+        device: NewDevice,
+        kit: Kit,
+        homes: u32,
+    ) -> Result<(), PersonalError> {
+        let Principal::Agent(agent) = ctx.caller() else {
+            return Err(PersonalError::NotAdmitted);
+        };
+        let to = Ref::<home::Homes>::new(InstanceId(homes));
+        match self.take(ctx.now(), device, kit) {
+            Ok(_) => {
+                self.home.insert(&ONE, &(agent.0, homes));
+                ctx.send(agent, to, home::Assigned {});
             }
+            Err(error) => ctx.send(agent, to, home::Refused { error }),
         }
-        let first = self.add_device(now, now, device)?;
-        for (i, entry) in kit.entries.iter().enumerate() {
-            self.admitted.insert(&entry.signing, &Holder::Kit(i as u8));
-            self.kit.insert(&(i as u8), entry);
-        }
-        self.secrets.insert(&ONE, &kit.r2);
-        let lease_ms = self.policy().lease_ms;
-        self.lease.insert(
-            &ONE,
-            &Lease {
-                until: now.saturating_add(lease_ms),
-                reproved: false,
-            },
-        );
-        self.seen.insert(&first, &now);
-        let kit = kit.entries.iter().map(|entry| entry.signing).collect();
-        let index = self.append(now, Body::Assigned { device: first, kit });
-        Ok(Recorded { at: now, index })
+        Ok(())
     }
 
     /// A re-proof: the lease runs from now, and the larger quota holds.
