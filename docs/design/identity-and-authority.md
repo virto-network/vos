@@ -563,12 +563,14 @@ across a space's agents wait for the identity agent above.
     64), at most `cap` members a period of `period_ms` of batch time
     (`Cap` past it, a cap of 0 closing it, `Closed`). The salt is the
     period's, `BLAKE2b-256("vos/cred/open/salt" ‖ seed ‖ period)`, from a
-    seed the actor draws at its first opening and serves to no read; the
+    seed the actor draws at its first opening, which no query answers
+    (its replicas and operators hold it); the
     period's salt and the one before are accepted, so work made just
     before a period ends still counts, and none is made before its
-    period's salt is served. `opening()` answers the salt, the
-    difficulty, the period and the claims the period takes yet (the
-    `opening` row);
+    period's salt is served. A re-opening keeps the period's count only
+    for the same period and length. `opening()` answers the salt, the
+    difficulty, the period, the cap and the claims the period takes yet
+    (the `opening` row);
   - `revoke(member)`, role `registrar`: the leaf back to the empty leaf,
     the slot freed; for a member only invited, the invitation withdrawn;
   - queries, any caller: `path(member) → Option<(root, slot, siblings)>`,

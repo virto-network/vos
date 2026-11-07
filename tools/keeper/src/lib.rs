@@ -12,7 +12,7 @@
 //! - **Stock:** the agents handed to `Homes` with `stock`, a page at a time;
 //!   **top up** makes and stocks until the pool holds as many as asked.
 //! - **Upgrade:** `Personal` installed anew over every agent of the pool,
-//!   a batch at a time, stopping at the batch holding the first refusal:
+//!   a batch at a time, stopping after the batch holding a refusal:
 //!   its layout is append-only, so an install that refuses is the
 //!   upgrade's to fix, never the next batch's to repeat.
 
@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use vos_node::client::{Client, Operator};
 use vos_wire::abi::Failure;
-use vos_wire::homes::{AgentsPage, Counts, HomesError, PAGE, Standing};
+use vos_wire::homes::{AgentsPage, Counts, HomesError, PAGE};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, derive_id};
 use vos_wire::ingress::{Install, Response};
 use vos_wire::result::Outcome;
@@ -103,16 +103,17 @@ impl Keeper {
     }
 
     /// `count` agents made with `Personal` from `elf`, `at_once` at a time:
-    /// their ids, lowest first.
+    /// their ids, lowest first, and the first failure, which stops the
+    /// rest. The agents made before it are whole, to stock.
     pub fn make(
         &self,
         count: usize,
         elf: &[u8],
         at_once: usize,
-    ) -> Result<Vec<AgentId>, KeeperError> {
+    ) -> (Vec<AgentId>, Result<(), KeeperError>) {
         let next = AtomicUsize::new(0);
         let made = Mutex::new(Vec::with_capacity(count));
-        std::thread::scope(|scope| {
+        let failed = std::thread::scope(|scope| {
             let workers: Vec<_> = (0..at_once.clamp(1, count.max(1)))
                 .map(|_| {
                     scope.spawn(|| -> Result<(), KeeperError> {
@@ -128,11 +129,12 @@ impl Keeper {
                 .collect();
             workers
                 .into_iter()
-                .try_for_each(|worker| worker.join().expect("a maker"))
-        })?;
+                .map(|worker| worker.join().expect("a maker"))
+                .fold(Ok(()), Result::and)
+        });
         let mut made = made.into_inner().unwrap();
         made.sort();
-        Ok(made)
+        (made, failed)
     }
 
     fn make_one(&self, elf: &[u8]) -> Result<AgentId, KeeperError> {
@@ -202,20 +204,24 @@ impl Keeper {
     }
 
     /// Make and stock agents, `batch` at a time, until the pool holds `to`:
-    /// the pooled count after.
+    /// the pooled count after. A failure stops it once the agents made
+    /// before it are stocked; `stock` skips an agent stocked already, so a
+    /// run after a lost answer stocks again safely.
     pub fn top_up(&self, to: u32, elf: &[u8], batch: usize) -> Result<u32, KeeperError> {
         let mut pooled = self.tally()?.pooled;
         while pooled < to {
             let count = batch.max(1).min((to - pooled) as usize);
-            let made = self.make(count, elf, batch)?;
+            let (made, failed) = self.make(count, elf, batch);
             pooled = self.stock(&made)?;
+            failed?;
         }
         Ok(pooled)
     }
 
-    /// `Personal` from `elf` installed over every agent of the pool, `batch`
-    /// at once, each batch whole before the next: the agents upgraded. A
-    /// refusal stops it after its batch.
+    /// `Personal` from `elf` installed over every agent `Homes` holds, as it
+    /// lists them when the upgrade starts, `batch` at once, each batch whole
+    /// before the next: the agents upgraded. A refusal stops it after its
+    /// batch.
     pub fn upgrade(&self, elf: &[u8], batch: usize) -> Result<usize, KeeperError> {
         let install = Install {
             instance: self.home.personal,
@@ -250,19 +256,14 @@ impl Keeper {
         Ok(upgraded)
     }
 
-    /// Every agent `Homes` holds but the retired, by id.
+    /// Every agent `Homes` holds, by id.
     pub fn agents(&self) -> Result<Vec<AgentId>, KeeperError> {
         let mut agents = Vec::new();
         let mut after = None;
         loop {
             let page: AgentsPage = self.query("agents", after)?;
             after = page.agents.last().map(|(agent, _)| *agent);
-            agents.extend(
-                page.agents
-                    .into_iter()
-                    .filter(|(_, standing)| *standing != Standing::Retired)
-                    .map(|(agent, _)| AgentId(agent)),
-            );
+            agents.extend(page.agents.into_iter().map(|(agent, _)| AgentId(agent)));
             if !page.more {
                 return Ok(agents);
             }

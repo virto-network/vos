@@ -957,6 +957,9 @@ impl Personal {
             return;
         }
         device.status = Status::Removed { at };
+        self.tell_home(crate::home::Forget {
+            nullifier: device.keys.nullifier,
+        });
         self.admitted.remove(&device.keys.sync);
         self.admitted.remove(&device.keys.admin);
         self.devices.insert(&target, &device);

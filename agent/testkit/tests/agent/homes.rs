@@ -126,6 +126,8 @@ struct Space {
     agents: BTreeMap<u32, Home>,
     /// The next message's number, by sender and receiver.
     sequences: BTreeMap<(u32, u32), u64>,
+    /// The outcomes of messages to `Homes` that did not run to `Done`.
+    unanswered: Vec<Outcome>,
     now: u64,
     sessions: u64,
     nonce: u64,
@@ -170,6 +172,7 @@ impl Space {
             homes: homes(),
             agents: BTreeMap::new(),
             sequences: BTreeMap::new(),
+            unanswered: Vec::new(),
             now: personal::T0,
             sessions: 0,
             nonce: 0,
@@ -347,11 +350,9 @@ impl Space {
                     sequence,
                     body,
                 }));
-                assert!(
-                    matches!(run.outcome, Outcome::Done(_)),
-                    "Homes took agent {from}'s message: {:?}",
-                    run.outcome
-                );
+                if !matches!(run.outcome, Outcome::Done(_)) {
+                    self.unanswered.push(run.outcome.clone());
+                }
                 queue.extend(run.messages.into_iter().map(|message| (HOME.0, message)));
             } else {
                 let now = self.now;
@@ -430,10 +431,7 @@ fn a_pool_of_200_is_made_and_claimed() {
     for n in 0..200 {
         let agent = space.claim(n).unwrap();
         assert_eq!(agent, FIRST + n, "the lowest pooled agent");
-        assert!(matches!(
-            space.standing(agent),
-            Some(Standing::Assigned { .. })
-        ));
+        assert!(matches!(space.standing(agent), Some(Standing::Assigned)));
         assert_eq!(space.found(nullifier(n)), Some(agent));
         assert_eq!(space.kit_finds(&kit_of(n).entries[0].signing), Some(agent));
     }
@@ -464,9 +462,9 @@ fn a_pool_of_200_is_made_and_claimed() {
 }
 
 /// B12: one nullifier holds one agent and a kit's key indexes one; a
-/// device whose nullifier is not the proof's is refused; a claim
-/// `Personal` refuses is released, its agent pooled again; a stocked agent
-/// is not stocked again; and only a pool agent's answer is taken.
+/// device whose nullifier is not the proof's, or keys `Personal` would
+/// refuse, are refused; an agent stocked again is left as it is; and only
+/// a pool agent's answer is taken.
 #[test]
 fn a_double_claim_is_refused() {
     let mut space = Space::new(minutes());
@@ -483,21 +481,26 @@ fn a_double_claim_is_refused() {
         Err(HomesError::Nullifier),
         "a device naming another nullifier"
     );
-    // `Personal` refuses a device whose two keys are one: the agent goes
-    // back to the pool and the claim's indexes with it.
     let one_key = NewDevice {
         admin: claimant(4).sync,
         ..claimant(4)
     };
-    let refused = space.claim_with(nullifier(4), one_key, kit_of(4)).unwrap();
-    assert_eq!(refused, first + 1);
-    assert_eq!(space.standing(refused), Some(Standing::Pooled));
-    assert_eq!(space.found(nullifier(4)), None);
-    assert_eq!(space.kit_finds(&kit_of(4).entries[0].signing), None);
-    assert_eq!(space.claim(4), Ok(refused), "claimed again, properly");
     assert_eq!(
-        space.operate::<u32, HomesError>(HOMES, "stock", vec![first]),
-        Err(HomesError::Stocked)
+        space.claim_with(nullifier(4), one_key, kit_of(4)),
+        Err(HomesError::Malformed),
+        "one key twice"
+    );
+    let mut kit_key_twice = kit_of(4);
+    kit_key_twice.entries[0].signing = claimant(4).admin;
+    assert_eq!(
+        space.claim_with(nullifier(4), claimant(4), kit_key_twice),
+        Err(HomesError::Malformed)
+    );
+    assert_eq!(space.claim(4), Ok(first + 1));
+    assert_eq!(
+        space.operate::<u32, HomesError>(HOMES, "stock", vec![first, first + 2]),
+        Ok(1),
+        "stocked again, left as they are"
     );
     let many: Vec<u32> = (1000..1257).collect();
     assert_eq!(
@@ -527,6 +530,96 @@ fn a_double_claim_is_refused() {
             assigned: 2,
         }
     );
+}
+
+/// A claim `Personal` refuses as assigned already retires its agent, and
+/// the claim takes the next; a claim never answered (the agent's role not
+/// granted) is sent again when its nullifier claims again, and the
+/// operator releases it, its agent retired; and an agent not assigned has
+/// no nullifier recorded and no kit indexed.
+#[test]
+fn a_refused_or_unanswered_claim_is_released() {
+    let mut space = Space::new(minutes());
+    space.make(2);
+    // Agent `FIRST` was assigned behind `Homes`' back.
+    let personal = vos_testkit::programs::personal();
+    let claim = ((claimant(90), kit_of(90)), (minutes(), HOMES.0));
+    space.relay(vec![Outgoing {
+        to: AgentId(FIRST),
+        body: Body::Call {
+            instance: PERSONAL,
+            method: method(&personal, "claim"),
+            arguments: claim.encode(),
+            awaiting: None,
+        },
+    }]);
+    assert_eq!(space.unanswered.len(), 1, "its answer is not Homes'");
+    space.unanswered.clear();
+    assert_eq!(space.claim(1), Ok(FIRST));
+    assert_eq!(space.standing(FIRST), Some(Standing::Retired));
+    assert_eq!(space.found(nullifier(1)), None);
+    assert_eq!(space.claim(1), Ok(FIRST + 1), "the next agent");
+    assert_eq!(space.standing(FIRST + 1), Some(Standing::Assigned));
+
+    // An agent whose role `homes` was never granted answers nothing.
+    let stray = FIRST + 2;
+    let mut home = Home::installed_for(Principal::Client([0x99; 32]));
+    home.now = space.now;
+    space.agents.insert(stray, home);
+    space
+        .operate::<u32, HomesError>(HOMES, "stock", vec![stray])
+        .unwrap();
+    assert_eq!(space.claim(2), Ok(stray));
+    assert_eq!(space.standing(stray), Some(Standing::Claimed));
+    assert_eq!(space.claim(2), Ok(stray), "sent again");
+    assert_eq!(
+        space.claim_with(nullifier(2), claimant(2), kit_of(3)),
+        Err(HomesError::Claimed),
+        "not the same claim"
+    );
+    assert_eq!(space.renew(nullifier(2), stray), Err(HomesError::Unknown));
+    space
+        .operate::<(), HomesError>(HOMES, "release", stray)
+        .unwrap();
+    assert_eq!(space.standing(stray), Some(Standing::Retired));
+    assert_eq!(space.found(nullifier(2)), None);
+    assert_eq!(space.kit_finds(&kit_of(2).entries[0].signing), None);
+    assert_eq!(
+        space.operate::<(), HomesError>(HOMES, "release", FIRST + 1),
+        Err(HomesError::Unknown),
+        "an answered claim stays"
+    );
+    assert_eq!(space.claim(2), Err(HomesError::PoolEmpty));
+    assert_eq!(
+        space.tally(),
+        Counts {
+            pooled: 0,
+            claimed: 0,
+            assigned: 1,
+        }
+    );
+    // Messages from an agent not assigned are refused.
+    for (sequence, (name, arguments)) in (1..).zip([
+        ("record", nullifier(7).encode()),
+        ("rekey", vec![[1u8; 32]].encode()),
+        ("forget", nullifier(1).encode()),
+    ]) {
+        let run = space.step(Input::Message(Message {
+            from: AgentId(stray),
+            sequence,
+            body: Body::Call {
+                instance: HOMES,
+                method: method(&space.homes, name),
+                arguments,
+                awaiting: None,
+            },
+        }));
+        assert_eq!(
+            answer::<(), HomesError>(&run.outcome),
+            Err(HomesError::Unknown),
+            "{name}"
+        );
+    }
 }
 
 /// A claim before the operator set the terms is refused, and so is a
@@ -593,6 +686,13 @@ fn a_lapsed_agent_serves_reads_a_restore_and_a_removal_and_refuses_pushes() {
     home.pass(3 * MINUTE);
     let removal = home.commit_removing(0, vec![1]);
     assert_eq!(removal.set, vec![0]);
+    space.flush(agent);
+    assert_eq!(
+        space.found(device(1).nullifier),
+        None,
+        "a removed device re-proves no more"
+    );
+    let home = space.agent(agent);
     home.push(0, envelope(RECOVERY, 2, 3, 100)).unwrap();
     // Every device is lost: the kit restores onto a new one.
     let (next, r2) = new_kit(1);
@@ -616,6 +716,11 @@ fn a_lapsed_agent_serves_reads_a_restore_and_a_removal_and_refuses_pushes() {
     assert_eq!(space.kit_finds(&kit_signing(1, 0)), Some(agent));
     assert_eq!(space.kit_finds(&kit_signing(1, 1)), Some(agent));
     assert_eq!(space.kit_finds(&KIT_KEY), None, "the replaced kit's index");
+    assert_eq!(
+        space.found(device(0).nullifier),
+        None,
+        "the restore removed it"
+    );
     // The restored device re-proves: the grace ends.
     space.renew(device(5).nullifier, agent).unwrap();
     let home = space.agent(agent);
@@ -691,6 +796,11 @@ fn an_open_claim_without_its_work_is_refused() {
     let next = space.opening();
     assert_ne!(next.salt, open.salt);
     assert_eq!(next.left, 3);
+    // Opened again with the same terms, the period counts from none.
+    space
+        .operate::<(), CredentialError>(CREDENTIALS, "open", (8u8, 3u32, period))
+        .unwrap();
+    assert_eq!((space.opening().left, space.opening().cap), (3, 3));
     space
         .operate::<u32, CredentialError>(CREDENTIALS, "claim_open", (member(4), fourth))
         .unwrap();

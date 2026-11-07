@@ -1,6 +1,6 @@
 //! The home's `Homes` (`agent/homes`), as `Personal` messages it: its
-//! answer to a claim, each device's nullifier once its add is confirmed,
-//! and each new kit's keys. `Homes` depends on this crate for the
+//! answer to a claim, each device's nullifier once its add is confirmed
+//! and again once its removal matures, and each new kit's keys. `Homes` depends on this crate for the
 //! messages it sends here, so these are declared by hand, their ids the
 //! handlers' names derive.
 
@@ -30,6 +30,12 @@ pub struct Record {
     pub nullifier: [u8; 32],
 }
 
+/// A device's nullifier whose removal matured, re-proving no more.
+#[derive(Encode)]
+pub struct Forget {
+    pub nullifier: [u8; 32],
+}
+
 /// The kit's signing keys after its rotation or a restore.
 #[derive(Encode)]
 pub struct Rekey {
@@ -50,4 +56,5 @@ macro_rules! sent {
 sent!(Assigned, "assigned");
 sent!(Refused, "refused");
 sent!(Record, "record");
+sent!(Forget, "forget");
 sent!(Rekey, "rekey");

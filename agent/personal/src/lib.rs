@@ -236,10 +236,12 @@ impl Personal {
         self.take(ctx.now(), device, kit)
     }
 
-    /// [`Personal::assign`] for the home's `Homes` at `homes` in the
-    /// calling agent, answered by message (a send is one-way): `assigned`,
-    /// or `refused` with the error, writing nothing. From then on the agent
-    /// tells `Homes` each device's nullifier as its add is confirmed, and
+    /// [`Personal::configure`] then [`Personal::assign`] for the home's
+    /// `Homes` at `homes` in the calling agent, answered by message (a send
+    /// is one-way): `assigned`, or `refused` with the error, writing
+    /// nothing. The same claim again, from the same home, is answered
+    /// `assigned` again. From then on the agent tells `Homes` each device's
+    /// nullifier as its add is confirmed and as its removal matures, and
     /// each new kit's keys.
     #[msg(role = "homes")]
     pub async fn claim(
@@ -247,18 +249,37 @@ impl Personal {
         ctx: &mut Command<Self>,
         device: NewDevice,
         kit: Kit,
+        policy: Policy,
         homes: u32,
     ) -> Result<(), PersonalError> {
         let Principal::Agent(agent) = ctx.caller() else {
             return Err(PersonalError::NotAdmitted);
         };
         let to = Ref::<home::Homes>::new(InstanceId(homes));
+        let again = self.home.get(&ONE) == Some((agent.0, homes))
+            && self
+                .devices
+                .get(&0)
+                .is_some_and(|first| first.keys == device);
+        if again {
+            ctx.send(agent, to, home::Assigned {});
+            return Ok(());
+        }
+        let previous = self.policy.get(&ONE);
+        self.policy.insert(&ONE, &policy);
         match self.take(ctx.now(), device, kit) {
             Ok(_) => {
+                self.append(ctx.now(), Body::Configured(policy));
                 self.home.insert(&ONE, &(agent.0, homes));
                 ctx.send(agent, to, home::Assigned {});
             }
-            Err(error) => ctx.send(agent, to, home::Refused { error }),
+            Err(error) => {
+                match previous {
+                    Some(previous) => self.policy.insert(&ONE, &previous),
+                    None => self.policy.remove(&ONE),
+                }
+                ctx.send(agent, to, home::Refused { error });
+            }
         }
         Ok(())
     }

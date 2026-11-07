@@ -12,24 +12,28 @@
 //! - **The claim:** a nullifier holds one agent, and a kit's key indexes
 //!   one: `Homes` takes the lowest pooled agent, indexes it under the
 //!   nullifier and under each kit entry's [`kit_index`], and sends it the
-//!   home's policy and the claim. A send is one-way, so `Personal` answers
+//!   claim with the home's policy. A send is one-way, so `Personal` answers
 //!   `assigned` or `refused`; a refused claim's indexes are dropped and its
-//!   agent pooled again.
+//!   agent pooled again. A claim still waiting for its answer is sent again
+//!   when its nullifier claims again, and the operator may `release` one
+//!   that never will be answered.
 //! - **The lease:** `Personal` keeps it; any device whose nullifier is
 //!   recorded here (the claiming one's at the claim, the others' as their
-//!   adds are confirmed, `record`) renews it with `renew`, a re-proof.
+//!   adds are confirmed, `record`, until their removals mature, `forget`)
+//!   renews it with `renew`, a re-proof.
 //!
-//! Every table is the actor's state, its struct holding no field, so a
-//! later version adds tables beside these.
+//! The actor's struct holds tables alone, no plain field, so a later
+//! version adds tables beside these.
 
 #![no_std]
 
 extern crate alloc;
 
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
 use vos_personal::Personal;
-use vos_personal::personal::{Claim, Configure, Renew};
+use vos_personal::personal::{Claim, Renew};
 use vos_sdk::prelude::*;
 use vos_wire::homes::{AgentsPage, Counts, HomesError, PAGE, Standing, Terms};
 use vos_wire::personal::{Kit, NewDevice, PersonalError, kit_index};
@@ -86,40 +90,55 @@ impl Homes {
     }
 
     /// Pool `agents`, each made by the keeper with `Personal` installed and
-    /// this agent granted its role `homes`: the pooled count after. One
-    /// stocked already, and none is. A full page's rows take about 44M gas
-    /// [measured, the testkit's agent suite, x86-64, 2026-11-07: 34.1M for
-    /// 200; gas is deterministic].
+    /// this agent granted its role `homes`: the pooled count after. An
+    /// agent stocked already is left as it is, so a keeper that lost the
+    /// answer stocks the page again. 200 agents take 34.1M gas [measured,
+    /// the testkit's agent suite, Core Ultra 7 155H, 2026-11-07; gas is
+    /// deterministic], so a page fits the 50M declared.
     #[msg(role = "operator", gas = 50_000_000)]
     pub async fn stock(&mut self, agents: Vec<u32>) -> Result<u32, HomesError> {
         if agents.len() > PAGE {
             return Err(HomesError::TooMany);
         }
-        for (i, agent) in agents.iter().enumerate() {
-            if self.agents.contains(agent) || agents[..i].contains(agent) {
-                return Err(HomesError::Stocked);
-            }
-        }
+        let fresh: BTreeSet<u32> = agents
+            .into_iter()
+            .filter(|agent| !self.agents.contains(agent))
+            .collect();
         let held = Held {
             standing: Standing::Pooled,
             nullifier: None,
             kit: Vec::new(),
         };
-        for agent in &agents {
+        for agent in &fresh {
             self.agents.insert(agent, &held);
             self.pool.insert(agent, &());
         }
         let mut counts = self.tallied();
-        counts.pooled += agents.len() as u32;
+        counts.pooled += fresh.len() as u32;
         self.counts.insert(&ONE, &counts);
         Ok(counts.pooled)
+    }
+
+    /// Release `agent`, sent a claim its `Personal` never answered (its
+    /// role not granted, say): the claim's indexes dropped and the agent
+    /// retired, never pooled again.
+    #[msg(role = "operator")]
+    pub async fn release(&mut self, agent: u32) -> Result<(), HomesError> {
+        let held = self.agents.get(&agent).ok_or(HomesError::Unknown)?;
+        if held.standing != Standing::Claimed {
+            return Err(HomesError::Unknown);
+        }
+        self.drop_claim(agent, &held, Standing::Retired);
+        Ok(())
     }
 
     // ===== Devices' =====
 
     /// Claim a personal agent for `device`, the claiming device, with
     /// `kit`: its id. The device's nullifier must be the proof's; a
-    /// nullifier holding an agent, or a kit entry indexing one, is refused.
+    /// nullifier holding an agent, or a kit entry indexing one, is refused,
+    /// and so are keys `Personal` would refuse (one key twice). The same
+    /// claim again while its answer is awaited is sent again.
     #[msg(credential = Auth("home"))]
     pub async fn claim(
         &mut self,
@@ -132,10 +151,11 @@ impl Homes {
         if device.nullifier != nullifier {
             return Err(HomesError::Nullifier);
         }
-        if self.nullifiers.contains(&nullifier) {
-            return Err(HomesError::Claimed);
-        }
         if kit.entries.len() > KIT_ENTRIES {
+            return Err(HomesError::Malformed);
+        }
+        let mut keys = BTreeSet::from([device.sync, device.admin]);
+        if keys.len() != 2 || !kit.entries.iter().all(|entry| keys.insert(entry.signing)) {
             return Err(HomesError::Malformed);
         }
         let indexes: Vec<[u8; 32]> = kit
@@ -143,6 +163,23 @@ impl Homes {
             .iter()
             .map(|entry| kit_index(&entry.signing))
             .collect();
+        let (_, me) = ctx.me();
+        let personal = Ref::<Personal>::new(InstanceId(terms.instance));
+        let claim = Claim {
+            device,
+            kit,
+            policy: terms.policy,
+            homes: me.0,
+        };
+        if let Some(agent) = self.nullifiers.get(&nullifier) {
+            return match self.agents.get(&agent) {
+                Some(held) if held.standing == Standing::Claimed && held.kit == indexes => {
+                    ctx.send(AgentId(agent), personal, claim);
+                    Ok(agent)
+                }
+                _ => Err(HomesError::Claimed),
+            };
+        }
         if indexes.iter().any(|index| self.kits.contains(index)) {
             return Err(HomesError::KitTaken);
         }
@@ -155,7 +192,7 @@ impl Homes {
         self.agents.insert(
             &agent,
             &Held {
-                standing: Standing::Claimed { at: ctx.now() },
+                standing: Standing::Claimed,
                 nullifier: Some(nullifier),
                 kit: indexes,
             },
@@ -164,24 +201,7 @@ impl Homes {
         counts.pooled -= 1;
         counts.claimed += 1;
         self.counts.insert(&ONE, &counts);
-        let (_, me) = ctx.me();
-        let personal = Ref::<Personal>::new(InstanceId(terms.instance));
-        ctx.send(
-            AgentId(agent),
-            personal,
-            Configure {
-                policy: terms.policy,
-            },
-        );
-        ctx.send(
-            AgentId(agent),
-            personal,
-            Claim {
-                device,
-                kit,
-                homes: me.0,
-            },
-        );
+        ctx.send(AgentId(agent), personal, claim);
         Ok(agent)
     }
 
@@ -195,7 +215,7 @@ impl Homes {
             return Err(HomesError::NotRecorded);
         }
         match self.agents.get(&agent).map(|held| held.standing) {
-            Some(Standing::Assigned { .. }) => {}
+            Some(Standing::Assigned) => {}
             _ => return Err(HomesError::Unknown),
         }
         ctx.send(
@@ -212,7 +232,7 @@ impl Homes {
     #[msg]
     pub async fn assigned(&mut self, ctx: &mut Command<Self>) -> Result<(), HomesError> {
         let (agent, mut held) = self.claimed_by(ctx.caller())?;
-        held.standing = Standing::Assigned { at: ctx.now() };
+        held.standing = Standing::Assigned;
         self.agents.insert(&agent, &held);
         let mut counts = self.tallied();
         counts.claimed -= 1;
@@ -230,30 +250,12 @@ impl Homes {
         error: PersonalError,
     ) -> Result<(), HomesError> {
         let (agent, held) = self.claimed_by(ctx.caller())?;
-        if let Some(nullifier) = held.nullifier {
-            self.nullifiers.remove(&nullifier);
-        }
-        for index in &held.kit {
-            self.kits.remove(index);
-        }
-        let mut counts = self.tallied();
-        counts.claimed -= 1;
         let standing = if error == PersonalError::Assigned {
             Standing::Retired
         } else {
-            self.pool.insert(&agent, &());
-            counts.pooled += 1;
             Standing::Pooled
         };
-        self.counts.insert(&ONE, &counts);
-        self.agents.insert(
-            &agent,
-            &Held {
-                standing,
-                nullifier: None,
-                kit: Vec::new(),
-            },
-        );
+        self.drop_claim(agent, &held, standing);
         Ok(())
     }
 
@@ -275,6 +277,21 @@ impl Homes {
                 Ok(())
             }
         }
+    }
+
+    /// A device of the calling agent whose removal matured: its nullifier
+    /// re-proves the agent no more.
+    #[msg]
+    pub async fn forget(
+        &mut self,
+        ctx: &mut Command<Self>,
+        nullifier: [u8; 32],
+    ) -> Result<(), HomesError> {
+        let agent = self.assigned_caller(ctx.caller())?;
+        if self.nullifiers.get(&nullifier) == Some(agent) {
+            self.nullifiers.remove(&nullifier);
+        }
+        Ok(())
     }
 
     /// The calling agent's kit after a rotation or a restore: its signing
@@ -355,6 +372,32 @@ impl Homes {
         self.counts.get(&ONE).unwrap_or_default()
     }
 
+    /// `agent`'s claim dropped: its nullifier and kit indexes, the agent
+    /// left `standing`, pooled again when that is `Pooled`.
+    fn drop_claim(&mut self, agent: u32, held: &Held, standing: Standing) {
+        if let Some(nullifier) = held.nullifier {
+            self.nullifiers.remove(&nullifier);
+        }
+        for index in &held.kit {
+            self.kits.remove(index);
+        }
+        let mut counts = self.tallied();
+        counts.claimed -= 1;
+        if standing == Standing::Pooled {
+            self.pool.insert(&agent, &());
+            counts.pooled += 1;
+        }
+        self.counts.insert(&ONE, &counts);
+        self.agents.insert(
+            &agent,
+            &Held {
+                standing,
+                nullifier: None,
+                kit: Vec::new(),
+            },
+        );
+    }
+
     /// The calling agent's row, while a claim it was sent waits for its
     /// answer.
     fn claimed_by(&self, caller: Principal) -> Result<(u32, Held), HomesError> {
@@ -362,7 +405,7 @@ impl Homes {
             return Err(HomesError::Unknown);
         };
         match self.agents.get(&agent) {
-            Some(held) if matches!(held.standing, Standing::Claimed { .. }) => Ok((agent, held)),
+            Some(held) if held.standing == Standing::Claimed => Ok((agent, held)),
             _ => Err(HomesError::Unknown),
         }
     }
@@ -373,7 +416,7 @@ impl Homes {
             return Err(HomesError::Unknown);
         };
         match self.agents.get(&agent).map(|held| held.standing) {
-            Some(Standing::Assigned { .. }) => Ok(agent),
+            Some(Standing::Assigned) => Ok(agent),
             _ => Err(HomesError::Unknown),
         }
     }

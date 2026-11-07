@@ -3,7 +3,9 @@
 //! (`vos-keeper`) making 200 personal agents, each `Personal` installed
 //! and the home's agent granted its role `homes`, and stocking them; each
 //! claimed by a member's proof of `Auth("home")`, made as a device makes
-//! it, and assigned by `Personal`'s answer across agents; a double claim
+//! it, and assigned by `Personal`'s answer across agents; a member joining
+//! by the open claim, its work found by the device library, and claiming
+//! the agent the keeper tops the pool up with; a double claim
 //! refused at `Homes`; the scope "home" proving nothing but a claim and a
 //! re-proof; and the keeper's upgrade across the pool in batches, stopping
 //! at the batch an install refuses.
@@ -22,8 +24,8 @@ use vos_light::{
 };
 use vos_node::client::{self, Client, Operator};
 use vos_wire::abi::Failure;
-use vos_wire::credentials::{CredentialError, Digest, Path};
-use vos_wire::homes::{Counts, HomesError, Terms};
+use vos_wire::credentials::{CredentialError, Digest, Open, Path};
+use vos_wire::homes::{Counts, HomesError, Standing, Terms};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
 use vos_wire::ingress::{Credentialed, NodeId, Response};
 use vos_wire::personal::{AdminClass, Attestation, Kit, KitEntry, KitKind, NewDevice, Policy};
@@ -262,11 +264,21 @@ impl Founded {
             claim: proof.claim,
             proof: proof.proof,
         };
-        let at = (n % u32::from(NODES)) as u8 + 1;
-        outcome(
-            "claim",
-            client::credentialed(self.cluster.target(at), self.agent, &request).unwrap(),
-        )
+        // As a device sends it: to a node, then to the next while the
+        // agent's group has no leader there.
+        let until = Instant::now() + Duration::from_secs(30);
+        let mut at = (n % u32::from(NODES)) as u8 + 1;
+        loop {
+            match client::credentialed(self.cluster.target(at), self.agent, &request).unwrap() {
+                Response::NotLeader { .. } | Response::Busy | Response::Unavailable
+                    if Instant::now() < until =>
+                {
+                    at = at % NODES + 1;
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                answer => return outcome("claim", answer),
+            }
+        }
     }
 }
 
@@ -370,12 +382,34 @@ fn a_pool_of_200_is_made_by_the_keeper_and_claimed() {
             }
     });
 
-    // A member's second claim.
+    // A member joins by the open claim, its work found by the device
+    // library, and claims the agent the keeper tops the pool up with.
+    home.write::<(), CredentialError>(CREDENTIALS, "open", (8u8, 4u32, 86_400_000u64))
+        .unwrap();
+    let open: Open = home
+        .read::<Option<Open>>(CREDENTIALS, "opening", ())
+        .expect("opened");
+    let joining = member(POOL);
+    let nonce = vos_light::home::work(&HANDLE, &joining, &open.salt, open.difficulty, 4);
+    home.write::<u32, CredentialError>(CREDENTIALS, "claim_open", (joining, nonce))
+        .unwrap();
+    assert_eq!(keeper.top_up(1, &personal, 16).unwrap(), 1);
+    let joined: Path = home
+        .read::<Option<Path>>(CREDENTIALS, "path", joining)
+        .unwrap();
     let prover = Prover::new(ProverConfig {
         threads: Threads::Count(4),
         ..ProverConfig::default()
     })
     .unwrap();
+    let agent = home.claim(&prover, POOL, &joined, kit(POOL)).unwrap();
+    vos_checker::wait_until(
+        "the open member's claim assigned",
+        Duration::from_secs(60),
+        || home.read::<Option<Standing>>(HOMES, "standing_of", agent) == Some(Standing::Assigned),
+    );
+
+    // A member's second claim.
     assert_eq!(
         home.claim(&prover, 0, &paths[0], kit(1_000)),
         Err(HomesError::Claimed)
@@ -399,7 +433,10 @@ fn a_pool_of_200_is_made_by_the_keeper_and_claimed() {
     // The next `Personal` over the pool, 16 at a time; then a program that
     // declares no admission, which every agent's install refuses.
     let next_version = std::fs::read(actor_elf("personal-next")).unwrap();
-    assert_eq!(keeper.upgrade(&next_version, 16).unwrap(), POOL as usize);
+    assert_eq!(
+        keeper.upgrade(&next_version, 16).unwrap(),
+        POOL as usize + 1
+    );
     let counter = std::fs::read(actor_elf("counter")).unwrap();
     match keeper.upgrade(&counter, 16) {
         Err(KeeperError::Refused { agent, .. }) => {

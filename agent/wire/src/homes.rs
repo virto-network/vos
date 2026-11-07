@@ -32,14 +32,14 @@ pub enum Standing {
     /// Stocked, waiting for a claim.
     #[codec(index = 0)]
     Pooled,
-    /// Sent to a claim at `at`; `Personal`'s answer not yet in.
+    /// Sent to a claim; `Personal`'s answer not yet in.
     #[codec(index = 1)]
-    Claimed { at: u64 },
-    /// `Personal` took the claim at `at`, batch time of its answer.
+    Claimed,
+    /// `Personal` took the claim.
     #[codec(index = 2)]
-    Assigned { at: u64 },
-    /// `Personal` refused the claim as already assigned: never pooled
-    /// again.
+    Assigned,
+    /// `Personal` refused the claim as already assigned, or the operator
+    /// released a claim never answered: never pooled again.
     #[codec(index = 3)]
     Retired,
 }
@@ -66,20 +66,18 @@ pub enum HomesError {
     /// No agent of the pool by that id, or not one in the standing asked.
     #[codec(index = 5)]
     Unknown,
-    /// The agent is stocked already.
-    #[codec(index = 6)]
-    Stocked,
     /// More than [`PAGE`] agents in one call.
-    #[codec(index = 7)]
+    #[codec(index = 6)]
     TooMany,
-    /// A kit of more entries than `Personal` takes.
-    #[codec(index = 8)]
+    /// A kit of more entries than `Personal` takes, or one key twice among
+    /// the device's and the kit's.
+    #[codec(index = 7)]
     Malformed,
     /// No terms set yet: `configure` first.
-    #[codec(index = 9)]
+    #[codec(index = 8)]
     Unconfigured,
     /// Not the proof of a member's pseudonym.
-    #[codec(index = 10)]
+    #[codec(index = 9)]
     Anonymous,
 }
 

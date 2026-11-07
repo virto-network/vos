@@ -797,20 +797,21 @@ pub const MAX_DIFFICULTY: u8 = 64;
 
 /// The open claim's terms as the registrar answers them
 /// (`light-node.md` §3.3): the salt its work names now, its difficulty in
-/// leading zero bits, the period the cap counts by and the claims left in
-/// the current one.
+/// leading zero bits, the period the cap counts by, the cap, published, and
+/// the claims left in the current period.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Open {
     pub salt: [u8; 32],
     pub difficulty: u8,
     pub period_ms: u64,
+    pub cap: u32,
     pub left: u32,
 }
 
 /// The salt of the open claim's period `period`, from the registrar's
 /// `seed`: `BLAKE2b-256("vos/cred/open/salt" ‖ seed ‖ period)`, the period
-/// eight little-endian bytes. Only the registrar's actor holds the seed, so
-/// no work is made before its period's salt is served.
+/// eight little-endian bytes. No query answers the seed, so no client makes
+/// work before its period's salt is served.
 pub fn open_salt(seed: &[u8; 32], period: u64) -> [u8; 32] {
     vos_pvm_precompiles::blake2b_hash::<32>(b"vos/cred/open/salt", &[seed, &period.to_le_bytes()])
 }

@@ -28,7 +28,7 @@ pub fn nullifier(secret: &DeviceSecret, space: &[u8; 32], agent: u32, instance: 
 
 /// A nonce whose work for `member` in the space whose handle is `handle`
 /// meets `difficulty` under `salt`, searched on `threads` threads: about
-/// `2^difficulty` hashes.
+/// `2^difficulty` hashes; `u64::MAX` if no nonce does.
 pub fn work(
     handle: &[u8; 32],
     member: &Bytes,
@@ -50,7 +50,10 @@ pub fn work(
                         found.store(true, Ordering::Relaxed);
                         return;
                     }
-                    at += threads;
+                    match at.checked_add(threads) {
+                        Some(next) => at = next,
+                        None => return,
+                    }
                 }
             });
         }
@@ -78,5 +81,21 @@ impl Prover {
             return Err(DeviceError::Reserved);
         }
         self.prove_in_scope(secret, witness, SCOPE, call, program)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The work found meets the difficulty, on one thread or several.
+    #[test]
+    fn the_work_found_meets_its_difficulty() {
+        let (handle, member, salt) = ([1; 32], [2; 32], [3; 32]);
+        for threads in [1, 4] {
+            let nonce = work(&handle, &member, &salt, 10, threads);
+            assert!(meets(&open_work(&handle, &member, &salt, nonce), 10));
+        }
+        assert_eq!(work(&handle, &member, &salt, 0, 2), 0);
     }
 }

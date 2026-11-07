@@ -52,8 +52,8 @@ pub struct Opening {
     pub difficulty: u8,
     pub cap: u32,
     pub period_ms: u64,
-    /// The salts' seed, drawn at the first opening and kept, served to no
-    /// read.
+    /// The salts' seed, drawn at the first opening and kept: no query
+    /// answers it, though its replicas and its operators hold it.
     pub seed: [u8; 32],
     /// The period `count` is of, and the members it enrolled.
     pub period: u64,
@@ -269,13 +269,14 @@ impl Credentials {
             return Err(CredentialError::Terms);
         }
         let now = ctx.now();
+        let period = now / period_ms;
         let opening = match self.opening.get(&RING_KEY) {
             Some(opening) => Opening {
                 difficulty,
                 cap,
                 period_ms,
-                period: now / period_ms,
-                count: if opening.period_ms == period_ms {
+                period,
+                count: if opening.period_ms == period_ms && opening.period == period {
                     opening.count
                 } else {
                     0
@@ -287,7 +288,7 @@ impl Credentials {
                 cap,
                 period_ms,
                 seed: ctx.random(),
-                period: now / period_ms,
+                period,
                 count: 0,
             },
         };
@@ -403,9 +404,12 @@ impl Credentials {
         self.count
     }
 
-    /// The open claim's terms now: its salt, its difficulty, its period and
-    /// the claims the period takes yet; `None` while the registrar keeps it
-    /// closed.
+    /// The open claim's terms now: its salt, its difficulty, its period,
+    /// its cap and the claims the period takes yet; `None` while the
+    /// registrar keeps it closed. A query reads at the last batch's time,
+    /// so on a home no batch reached this period it names the salt before,
+    /// and work under it is refused once two periods passed: the device
+    /// asks again.
     #[msg]
     pub async fn opening(&self, ctx: &Query<Self>) -> Option<Open> {
         let opening = self
@@ -417,6 +421,7 @@ impl Credentials {
             salt: tree::open_salt(&opening.seed, now / opening.period_ms),
             difficulty: opening.difficulty,
             period_ms: opening.period_ms,
+            cap: opening.cap,
             left: opening.left(now),
         })
     }
