@@ -46,7 +46,10 @@ fn element_row(field: u8, element: u8) -> Vec<u8> {
 
 /// An operation's writes, as the agent makes a merge handler's: each the
 /// operation's entry, kept against the author's stored one.
-fn run(_: &Cid, origin: &Origin, call: &Call, rows: &mut dyn Rows) -> Result<(), sync::CorruptRow> {
+fn run(_: &Cid, origin: &Origin, op: &Op, rows: &mut dyn Rows) -> Result<(), sync::CorruptRow> {
+    let Op::Call(call) = op else {
+        unreachable!("the model's operations are calls")
+    };
     let writes = Vec::<Write>::decode_exact(&call.arguments).expect("a model operation");
     for (at, (field, element, value)) in writes.into_iter().enumerate() {
         let keep = FIELDS[field as usize].1;
@@ -184,6 +187,7 @@ fn generate(steps: &[Step]) -> History {
                     writes: Vec<Write>| {
         time += 1;
         let ops: Ops = vec![Op::Call(Call {
+            release: 1,
             method: MethodId(7),
             arguments: writes.encode(),
             time,

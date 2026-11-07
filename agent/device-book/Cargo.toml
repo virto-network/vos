@@ -1,0 +1,26 @@
+# The device book (`light-node.md` §3.1), a local actor: the labels and
+# settings of the user's devices, built for the PVM with the guest
+# toolchain: `just build-device-book`.
+[package]
+name = "vos-device-book"
+version = "0.1.0"
+edition = "2024"
+publish = false
+workspace = "../programs"
+
+[lib]
+name = "vos_device_book"
+path = "src/lib.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "vos-device-book"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+vos-sdk = { path = "../sdk" }
+# The books' types, which the app reads their queries by.
+vos-wire = { path = "../wire" }

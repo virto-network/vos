@@ -164,11 +164,40 @@ devices decrypt each other's messages".
   with the light node's own row of the call's time and seed
   (`FjallStore::commit_with`); a peer's nodes are ingested in one batch,
   each operation run through the same merge entry, and each node's
-  Lamport clock, its author's cutoff where it equivocates and its held
-  operations of unknown kinds written with them. Reads filter the
-  equivocating authors and those the host cuts off (`Light::cut_off`,
-  the device set's frontiers, §3.5). Sealing and the cursor over
+  Lamport clock and its author's cutoff where it equivocates written with
+  them. Reads filter the equivocating authors and those the device set
+  removed (`Light::cut_off`, one past a removed device's node at its
+  frontier, which the sealed read sets, §3.5). Sealing and the cursor over
   `Personal` are §3.6's (`vos_light::personal`).
+- **Held and quarantined operations** [built, `vos-light`'s `sync`]: a
+  peer's operation the device cannot run yet is held in its scope's rows,
+  `Hold::Kind` (a kind the build does not know), `Hold::Release` (a later
+  release of its actor than the one installed, §3.2) or `Hold::Fault` (a
+  run that faulted here); an install replays its instance's
+  (`Light::replay`). One that is invalid is quarantined, never applied:
+  `Quarantine::Invalid` (a frame no device records),
+  `Quarantine::Failed` (a run that fails where the issuing device records
+  an operation only when its run is done, so the author wrote garbage) and
+  `Quarantine::CutOff` (an author the device set removed, already cut off
+  at its number; an equivocation's forks still apply, filtered at read,
+  so devices meeting them in either order agree). An operation of a
+  method its release lacks is `Quarantine::Failed(Unknown)`: a later
+  release keeps every earlier one's handlers (`core-model.md` §9.4). Each is
+  reported by the ingest that met it and listed with its author
+  (`Light::held`, `Light::quarantined`), and the sealed read gathers them
+  (`Caught::held`, `Caught::quarantined`).
+- **Disk room** [built]: before an install, a call, an ingest or a
+  replay, the light node asks the store's filesystem for its free room
+  (`statvfs`) and refuses below a reserve, 64 MiB by default
+  (`Config::reserve_bytes`) [est], with `Error::Full` and nothing written;
+  sync pauses, as the sealed read checks first and writes nothing, and
+  both resume once room is freed. Cutoffs, the push queue and the device group's writes
+  are exempt, being small and what removes a device or gets data off the
+  phone. A disk that fills anyway (another app's writes) fails fjall's
+  write, which then refuses every write until the store is opened again.
+- **The first local actors** [built]: the credential book and the device
+  book (§3.1), stock programs (`agent/credential-book`,
+  `agent/device-book`) whose types are `vos_wire::books`'.
 - **The host-call layer** is `vos-exec`, which `vos-node` and `vos-light`
   link; ingress's device programs (`credentialed.rs`'s use of
   `vos_pvm_recair::device`) stay in the node, as the light node never
@@ -310,7 +339,8 @@ also where the recovery kit is made, §3.5) at first launch and again
 until the user accepts or declines for good, since a single device with
 no kit loses everything with the phone (§8, D2).
 
-**The first local actors:**
+**The first local actors** [built: `vos-credential-book`,
+`vos-device-book`, their types `vos_wire::books`]:
 - the credential book: the spaces the user is a member of, each device's
   handles there, the pinned agents and methods s4's facility pins today.
   The member trees a device keeps for its proofs (§6.7) stay on the
@@ -340,7 +370,13 @@ operation and travel inside it.
   one entry per (element or key, author) and a read takes the latest among
   authors not filtered out (`core-model.md` §9.4, rule 6), so a removed
   device's writes applied before the removal was known are filtered at
-  read, never unapplied (§3.5's frontier).
+  read, never unapplied (§3.5's frontier), and those that arrive once it
+  is known are quarantined, never applied [built]. *Known limit:* a
+  removed device's write past its frontier that reaches a device before
+  the removal does replaces, and hides, its own earlier write to that
+  element; agent-mediated sync refuses its envelopes past its frontier, so
+  only a delivery concurrent with the removal reaches it. Keeping each
+  author's history of an element exactly is later work.
 - **The conflict model** is the types' own; no operation needs another
   device's agreement. Where conflicts are real, a log decides: the device
   set and the device group by the personal agent's log, a payment by the
@@ -349,9 +385,17 @@ operation and travel inside it.
   sync key (§3.5); merkle-crdt's `DagNode` has no author field, so the
   author's key, sequence number and signature travel inside the payload,
   which is sealed (§3.6).
-- **Operations are versioned:** an operation of a kind a device does not
-  know is kept and applied once the device updates, never quarantined, so
-  devices on different app versions do not diverge.
+- **Operations are versioned** [built]: each operation carries the
+  release of its actor the issuing device ran (`release::Package`'s
+  `release`, numbered from 1), and an operation of a later release, or of
+  a kind the build does not know, is held and applied once the device
+  updates, never quarantined, so devices on different app versions do not
+  diverge. A device holds every operation of a later release, not only
+  those of handlers its release lacks, as a later release may change what
+  a handler writes; a later release runs every earlier one's operations
+  as they ran, and one that cannot starts a new scope (§8, D7). An install
+  of an earlier release than the one installed, or of another program
+  under the same release, is refused.
 - **Incremental apply** [decided, `core-model.md` §9.4; built in
   `support/merkle-crdt`]: only newly fetched nodes are applied, in causal
   order, one fjall batch an ingest; on fjall a node of a batch costs
@@ -1553,7 +1597,11 @@ choice, this is the one taken]:
   A8, B8); a node whose signature is not its header's author's, whose
   author is no device's sync key, or a removed
   device's past its frontier (the agent's `frontier`, asked once a
-  reading), is refused (`Author`; A7, B6); a writer's `seen` position in
+  reading), is refused (`Author`; A7, B6), and the removed device's author
+  is cut off in the light node one past its node at its frontier
+  (`Light::cut_off`), the one place a removed author's cutoff comes from:
+  its entries read filtered, and its later operations, met in any ingest,
+  are quarantined; a writer's `seen` position in
   the envelope's own scope at or past the envelope's position is a
   renumbering, and each `seen` position of a scope this sync reads is
   kept, so a scope read to its served end short of one raises `Partition`
@@ -3046,7 +3094,8 @@ gap of more than a few hundred commits prefers re-pairing. (8.19)
 **A7. A removed device backdates DAG writes.** *Mitigation:* seal at push
 takes only the confirmed epoch; the agent refuses its keys; devices accept
 its envelopes only up to its frontier, and the CRDT types filter its
-writes at read. (8.18a, 8.20)
+writes at read; the light node cuts it off there, so its later operations
+are quarantined wherever they arrive [built]. (8.18a, 8.18b, 8.20)
 
 **A8. A write made offline leaks to a device removed meanwhile.**
 *Mitigation:* seal at push under the confirmed epoch read just before;
@@ -3246,9 +3295,10 @@ built"). (8.14)
 ### 8.3 Data, storage and quotas
 
 **C1. A device writes garbage** that opens correctly. *Mitigation:* apply
-validates each operation; a node that fails is quarantined and the chrome
-names its author. *Known limit:* excising a device's range after the fact
-is later work; the remedy is removing the device. (8.18b)
+validates each operation; one that fails is quarantined and the chrome
+names its author [built: `Light::quarantined`]. *Known limit:* excising a
+device's range after the fact is later work; the remedy is removing the
+device. (8.18b)
 
 **C2. The DAG grows without bound, or a user stores media.** *Mitigation:*
 checkpoints let new devices start late; the quota bounds the agent; the
@@ -3289,7 +3339,10 @@ device-local. *Known limit:* a device too small for a full replica, and
 slice 9's wallet mirror of a large pool, are later concerns. (8.20)
 
 **C11. The phone's storage fills.** *Mitigation:* the local store refuses
-writes before the disk fills; sync pauses; the chrome says so. (8.18b)
+writes before the disk fills; sync pauses; the chrome says so [built:
+`Error::Full` below the reserve, §2.1]. *Known limit:* a disk another app
+fills past the reserve fails fjall's write, which refuses every write
+until the store is opened again. (8.18b)
 
 **C12. Years of history for a two-device user.** *Mitigation:* the new
 device takes its pairing device's checkpoint, so it never replays from the
@@ -3352,7 +3405,8 @@ same claims; the light node proves with the newest program the space
 admits. (8.4, 8.10)
 
 **D9. Devices run different app versions.** *Mitigation:* versioned
-operations; unknown kinds wait for the update. (8.18b)
+operations; unknown kinds and later releases wait for the update
+[built, §3.2]. (8.18b)
 
 **D10. The security key is lost** (the kit of that kind). *Mitigation:* a
 second kit (the phrase, or a second key) is offered at the claim; rotation

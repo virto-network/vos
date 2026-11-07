@@ -7,7 +7,8 @@
 //! Without the ELFs they are empty, and the commands say so.
 //!
 //! A package is encoded as `vos_light::release::Package` encodes it: its
-//! derivation, then its programs (`vos-light`'s test decodes one).
+//! derivation, its programs, then its release, the notes actor's first
+//! (`vos-light`'s test decodes one).
 
 use std::path::Path;
 
@@ -26,7 +27,7 @@ fn main() {
             let derived = vos_pvm_compiler::derive(&notes).expect("the notes actor derives");
             (
                 vos_pvm_compiler::link_elf_spi(&agent).expect("the agent links"),
-                (derived.derivation(), derived.programs()).encode(),
+                (derived.derivation(), derived.programs(), 1u32).encode(),
             )
         }
         _ => (Vec::new(), Vec::new()),

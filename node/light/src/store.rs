@@ -321,6 +321,21 @@ impl Store {
         (&self.0.meta, LAST_ROW, last)
     }
 
+    /// Write `changes` to the local agent's rows, synced: `None` deletes.
+    pub(crate) fn write_changes(
+        &self,
+        changes: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    ) -> Result<(), StoreError> {
+        let mut batch = self.0.db.batch();
+        for (key, value) in changes {
+            match value {
+                Some(value) => batch.insert(&self.0.rows, key, value),
+                None => batch.remove(&self.0.rows, key),
+            }
+        }
+        Ok(batch.durability(Some(PersistMode::SyncAll)).commit()?)
+    }
+
     /// Write `rows` of the local agent's, synced.
     pub(crate) fn write_rows(&self, rows: Vec<(Vec<u8>, Vec<u8>)>) -> Result<(), StoreError> {
         let mut batch = self.0.db.batch();

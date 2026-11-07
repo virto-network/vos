@@ -12,6 +12,7 @@ extern crate alloc;
 pub mod abi;
 pub mod apply;
 pub mod batch;
+pub mod books;
 pub mod credentials;
 pub mod homes;
 pub mod ids;

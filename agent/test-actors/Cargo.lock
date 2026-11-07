@@ -144,6 +144,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "device-book-next"
+version = "0.1.0"
+dependencies = [
+ "vos-sdk",
+ "vos-wire",
+]
+
+[[package]]
 name = "device-next"
 version = "0.1.0"
 dependencies = [

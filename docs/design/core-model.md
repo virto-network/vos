@@ -867,9 +867,15 @@ rule on a log, masking, a list type, and thin clients.
   instance's merge fields alone and reads no row: it runs on a new
   instance's state, its merge fields bound, and the agent traps a read or
   a write of any other row. Its effects are its operation's alone,
-  whatever the device has applied, so every device writes the same. An
-  operation of a kind, or a method, the device's build does not know is
-  held in the scope's rows for a build that does, never refused.
+  whatever the device has applied, so every device writes the same. Each
+  operation carries the release of its actor its issuing device ran. One
+  of a kind the device's build does not know, of a later release than the
+  one installed, or whose run faults on the device, is held in the scope's
+  rows and replayed once the device can run it (an install replays its
+  instance's), never refused. One that is invalid (a frame no device
+  records, or a run that fails where the issuing device records an
+  operation only when its run is done) is quarantined, never applied, and
+  listed with its author.
 - **The storage-backed types** [decided; built, `vos_wire::merge`, the
   SDK's `crdt`]. A merge field keeps **one entry an element or key and
   author chain**, under the element's row and the author's key: the
@@ -897,10 +903,30 @@ rule on a log, masking, a list type, and thin clients.
   never unapplied. An equivocation's is its number, written in the batch
   that applies the second node (merkle-crdt tells the apply); a removal's
   is one past the removed author's frontier, which the device set gives
-  (`Light::cut_off`, `light-node.md` §3.5). The lower stands. *Known
-  limit:* a field keeps one entry an element and author, so an author's
-  write before its cutoff to an element it rewrote after it is lost to
-  reads, which fall back to the other authors' entries.
+  (`Light::cut_off`, `light-node.md` §3.5), and the sealed read sets it
+  so. The lower stands. A removed author's operations that arrive once
+  its removal's cutoff (kept apart, `keys::removed`) no longer admits
+  them are quarantined, never applied. An equivocation's are applied and
+  filtered: devices meet the forks in different orders, and quarantining
+  whichever came second would leave each device a different fork's
+  entries. *Known limit:* a field keeps one entry an element and author,
+  so an author's write past its cutoff that is applied (a removed
+  author's that arrives before the removal is known, or any fork's)
+  replaces its write before it to that element, which reads then lose and
+  fall back to the other authors' entries, and devices that applied
+  different such writes can read that element differently; agent-mediated
+  sync refuses a removed device's envelopes past its frontier, and every
+  device reads the agent's one order, so only a delivery concurrent with
+  the removal, or outside the agent's order, does this. Each author's
+  exact history of an element is later work.
+- **A merge handler's outcome is its operation's alone** [decided]: a
+  device quarantines a peer's operation whose run fails under a release
+  it runs, as its issuing device recorded it only when done; so a handler
+  refuses only on its arguments, never on what the device holds, and a
+  later release keeps every earlier release's handlers, an operation of a
+  method its release lacks being invalid (`Quarantine::Failed(Unknown)`).
+  A device's own operations are recorded even when the device set has cut
+  it off: its peers quarantine them.
 - **Cost** [measured, Intel Core Ultra 7 155H under other builds' load,
   2026-11-03, the light node on fjall, release, the agent program on the
   interpreter; the step's measuring crate, outside the tree]:
@@ -961,7 +987,8 @@ rule on a log, masking, a list type, and thin clients.
      or an LWW map keeps one entry per (element or key, author chain), and
      a read takes the latest among unfiltered chains (built: the types
      above, with their known limit: a chain's entry is its latest write,
-     so a write past its cutoff hides the chain's earlier one).
+     so a write past its cutoff that arrives before the cutoff is known
+     hides the chain's earlier one; one that arrives after is quarantined).
 
   The decision depends only on the log and the DAG, so every replica
   agrees. It costs O(1) per operation with per-author epoch intervals.

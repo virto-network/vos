@@ -194,7 +194,7 @@ export MIMALLOC_ALLOW_THP := "0"
 # Formatting: the workspace's, and each crate's it excludes.
 fmt-check:
     cargo fmt --all -- --check
-    for manifest in ([agent/default agent/representative agent/credentials agent/personal agent/payments agent/homes agent/test-actors pvm/bench/guests pvm/proof/fuzz pvm/proof/final-verifier/wasm node/gateway/demo] | each {|dir| glob $'($dir)/**/Cargo.toml' --exclude ['**/target/**'] } | flatten | where {|manifest| open --raw $manifest | str contains '[package]' }) { cargo fmt --manifest-path $manifest -- --check }
+    for manifest in ([agent/default agent/representative agent/credentials agent/personal agent/payments agent/homes agent/credential-book agent/device-book agent/test-actors pvm/bench/guests pvm/proof/fuzz pvm/proof/final-verifier/wasm node/gateway/demo] | each {|dir| glob $'($dir)/**/Cargo.toml' --exclude ['**/target/**'] } | flatten | where {|manifest| open --raw $manifest | str contains '[package]' }) { cargo fmt --manifest-path $manifest -- --check }
 
 # The docs' links: none broken, and none from a public doc to a private
 # item.
@@ -250,6 +250,11 @@ build-payments: (_build-program "vos-payments")
 # The home's actor, `Homes`, built in the agent's guest workspace.
 build-homes: (_build-program "vos-homes")
 
+# The light node's local actors, the credential book and the device book,
+# built in the agent's guest workspace.
+build-credential-book: (_build-program "vos-credential-book")
+build-device-book: (_build-program "vos-device-book")
+
 # One of the agent's guest programs, alone, from the fixed path
 # (`_at-fixed-path`): its features never unified with another's.
 _build-program package:
@@ -274,10 +279,10 @@ build-final-verify: (_venue-guest "vos-statement" "final-verify" "pvm-guest") (_
 # Wasm blobs, whose code that hash orders, are built from a fixed path
 # (`_at-fixed-path`).
 _blob-hashes:
-    if ($env.CARGO_TARGET_DIR? | is-not-empty) { error make { msg: "the blobs are hashed where the recipes build them: unset CARGO_TARGET_DIR" } }; let fixed = ["target/riscv64em-vos/release/final-verify.elf" "target/riscv64em-vos/release/final-verify-test.elf" "target/riscv64em-vos/release/statement-service.elf" "agent/programs/target/riscv64em-vos/release/vos-agent.elf" "agent/programs/target/riscv64em-vos/release/vos-representative.elf" "agent/programs/target/riscv64em-vos/release/vos-credentials.elf" "agent/programs/target/riscv64em-vos/release/vos-personal.elf" "agent/programs/target/riscv64em-vos/release/vos-payments.elf" "agent/programs/target/riscv64em-vos/release/vos-homes.elf" "pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm" "pvm/proof/final-verifier/wasm/blob/target/test-formats/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm"]; let actors = (cargo metadata --manifest-path agent/test-actors/Cargo.toml --no-deps --format-version 1 | from json | get packages.targets | flatten | where {|target| "bin" in $target.kind } | get name | sort | each {|name| $"agent/test-actors/target/riscv64em-vos/release/($name).elf" }); let sysroot = (rustc --print sysroot | str trim); let objcopy = ($sysroot | path join lib rustlib (rustc -vV | lines | parse "host: {host}" | get host.0) bin rust-objcopy); let stripped = (mktemp -t); for path in ($fixed ++ $actors) { with-env { LD_LIBRARY_PATH: ($sysroot | path join lib) } { ^$objcopy --strip-all $path $stripped }; print $"(open --raw $stripped | hash sha256)  ($path)" }; rm $stripped
+    if ($env.CARGO_TARGET_DIR? | is-not-empty) { error make { msg: "the blobs are hashed where the recipes build them: unset CARGO_TARGET_DIR" } }; let fixed = ["target/riscv64em-vos/release/final-verify.elf" "target/riscv64em-vos/release/final-verify-test.elf" "target/riscv64em-vos/release/statement-service.elf" "agent/programs/target/riscv64em-vos/release/vos-agent.elf" "agent/programs/target/riscv64em-vos/release/vos-representative.elf" "agent/programs/target/riscv64em-vos/release/vos-credentials.elf" "agent/programs/target/riscv64em-vos/release/vos-personal.elf" "agent/programs/target/riscv64em-vos/release/vos-payments.elf" "agent/programs/target/riscv64em-vos/release/vos-homes.elf" "agent/programs/target/riscv64em-vos/release/vos-credential-book.elf" "agent/programs/target/riscv64em-vos/release/vos-device-book.elf" "pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm" "pvm/proof/final-verifier/wasm/blob/target/test-formats/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm"]; let actors = (cargo metadata --manifest-path agent/test-actors/Cargo.toml --no-deps --format-version 1 | from json | get packages.targets | flatten | where {|target| "bin" in $target.kind } | get name | sort | each {|name| $"agent/test-actors/target/riscv64em-vos/release/($name).elf" }); let sysroot = (rustc --print sysroot | str trim); let objcopy = ($sysroot | path join lib rustlib (rustc -vV | lines | parse "host: {host}" | get host.0) bin rust-objcopy); let stripped = (mktemp -t); for path in ($fixed ++ $actors) { with-env { LD_LIBRARY_PATH: ($sysroot | path join lib) } { ^$objcopy --strip-all $path $stripped }; print $"(open --raw $stripped | hash sha256)  ($path)" }; rm $stripped
 
 # Every guest blob `blobs.lock` pins, built as `check` builds it.
-build-blobs: build-final-verify build-statement-service build-agent build-representative build-credentials build-personal build-payments build-homes build-wasm-blobs build-test-actors
+build-blobs: build-final-verify build-statement-service build-agent build-representative build-credentials build-personal build-payments build-homes build-credential-book build-device-book build-wasm-blobs build-test-actors
 
 # `blobs.lock` written anew from the blobs as built: after a change that
 # moves one, which the lock's diff then shows.
@@ -297,7 +302,7 @@ check-blobs: build-blobs
 # The SDK, its macros' restrictions, the test actors on the testkit, the
 # default agent against it, the checker's own model, the node running the
 # agent, the network between nodes, and the `vos` command.
-test-agent: build-test-actors build-agent build-representative build-credentials build-personal build-payments build-homes
+test-agent: build-test-actors build-agent build-representative build-credentials build-personal build-payments build-homes build-credential-book build-device-book
     cargo test {{agent_crates}}
     cargo test -p vos-cli --features faults --test processes faults::
     cargo test -p vos-cli --features faults --test fault_suite
@@ -675,7 +680,7 @@ fuzz secs="60":
 # Left to `just ci`: the slow fault runs (the five-process fault suite, the
 # fault build's process tests), the PVM vectors, the bench and prover
 # library tests, and the lints of other feature sets.
-check: fmt-check doc-check check-venue-rules check-no-std check-no-leaks check-no-faults check-kit build-test-actors build-agent build-representative build-credentials build-personal build-payments build-homes fuzz-replay
+check: fmt-check doc-check check-venue-rules check-no-std check-no-leaks check-no-faults check-kit build-test-actors build-agent build-representative build-credentials build-personal build-payments build-homes build-credential-book build-device-book fuzz-replay
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     cargo clippy -p vos-venue --all-targets --quiet -- -D warnings
     cargo clippy -p vos-pvm-recair --no-default-features --lib --quiet -- -D warnings

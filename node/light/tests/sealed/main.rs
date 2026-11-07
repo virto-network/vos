@@ -56,7 +56,7 @@ fn policy() -> Policy {
 fn notes() -> &'static Package {
     static NOTES: std::sync::OnceLock<Package> = std::sync::OnceLock::new();
     NOTES.get_or_init(|| {
-        release::package(&std::fs::read(programs::actor_elf("notes")).unwrap()).unwrap()
+        release::package(&std::fs::read(programs::actor_elf("notes")).unwrap(), 1).unwrap()
     })
 }
 

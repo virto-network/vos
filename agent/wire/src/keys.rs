@@ -165,6 +165,9 @@ enum Row {
     Lamport = 0x2b,
     Held = 0x2c,
     BindingDue = 0x2d,
+    Release = 0x2e,
+    QuarantinedOp = 0x2f,
+    Removed = 0x30,
 }
 
 /// The root builder's rows, each tagged after [`Owner::Tree`]: the rows of
@@ -574,9 +577,10 @@ pub fn lamport(cid: &[u8; 32]) -> Vec<u8> {
     key(&[&Row::Lamport.prefix(), cid])
 }
 
-/// An operation of a kind, or a method, the device does not know, kept
-/// until it does, with its origin: in `instance`'s scope, by its node's
-/// CID and its index there, so two equivocating nodes' never share a row.
+/// An operation of a kind, or of a release of its actor, the device does
+/// not run yet, or whose run faulted there, kept until it runs, with its
+/// origin: in `instance`'s scope, by its node's CID and its index there, so
+/// two equivocating nodes' never share a row.
 pub fn held(instance: InstanceId, cid: &[u8; 32], index: u32) -> Vec<u8> {
     key(&[
         &Row::Held.prefix(),
@@ -589,6 +593,39 @@ pub fn held(instance: InstanceId, cid: &[u8; 32], index: u32) -> Vec<u8> {
 /// The prefix of the operations held in `instance`'s scope.
 pub fn held_prefix(instance: InstanceId) -> Vec<u8> {
     key(&[&Row::Held.prefix(), &instance.0.to_be_bytes()])
+}
+
+/// An operation of `instance`'s scope the device found invalid, or whose
+/// author was cut off at or before its number: never applied, kept with
+/// its origin and why, by its node's CID and its index there, as a held
+/// one is ([`held`]).
+pub fn quarantined_op(instance: InstanceId, cid: &[u8; 32], index: u32) -> Vec<u8> {
+    key(&[
+        &Row::QuarantinedOp.prefix(),
+        &instance.0.to_be_bytes(),
+        cid,
+        &index.to_be_bytes(),
+    ])
+}
+
+/// The prefix of the operations quarantined in `instance`'s scope.
+pub fn quarantined_op_prefix(instance: InstanceId) -> Vec<u8> {
+    key(&[&Row::QuarantinedOp.prefix(), &instance.0.to_be_bytes()])
+}
+
+/// A removed author's cutoff in `instance`'s scope, apart from the
+/// [`cutoff`] the reads filter by, which an equivocation lowers too: its
+/// operations at this sequence number and later that arrive are
+/// quarantined. A device writes it, never an actor.
+pub fn removed(instance: InstanceId, author: &[u8; 32]) -> Vec<u8> {
+    key(&[&Row::Removed.prefix(), &instance.0.to_be_bytes(), author])
+}
+
+/// The release version of the local actor installed at `instance` on a
+/// device, which its operations carry: a device holds an operation of a
+/// later one until it installs it. A device writes it, never an actor.
+pub fn release(instance: InstanceId) -> Vec<u8> {
+    key(&[&Row::Release.prefix(), &instance.0.to_be_bytes()])
 }
 
 /// A credentialed call's binding digest `b`, recorded at its apply with its

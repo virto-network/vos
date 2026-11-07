@@ -25,7 +25,8 @@ use vos_wire::credentials::{
 };
 use vos_wire::ids::{AgentId, InstanceId, MethodId, derive_id};
 use vos_wire::ingress::{
-    Consistency, CredentialRefusal, Credentialed, QueryCall, Rejection, Response, query_message,
+    AdmissionRefusal, Consistency, CredentialRefusal, Credentialed, QueryCall, Rejection, Response,
+    query_message,
 };
 use vos_wire::result::Outcome;
 
@@ -544,6 +545,16 @@ fn the_wire_requests_and_answers() {
     assert_eq!(
         wire::path_answer(&Response::Busy.encode()),
         Err(DeviceError::Decode)
+    );
+    // Ingress's refusal is the device's to show, as the node gave it.
+    let onion_only = Rejection::Admission(AdmissionRefusal::OnionOnly);
+    assert_eq!(
+        wire::path_answer(&Response::Rejected(onion_only).encode()),
+        Err(DeviceError::Rejected(onion_only))
+    );
+    assert_eq!(
+        wire::root_answer(&Response::Rejected(Rejection::Behind).encode()),
+        Err(DeviceError::Rejected(Rejection::Behind))
     );
     let mut above = Tree::default().path(0);
     above.siblings.0[3] = [0xff; 32];
