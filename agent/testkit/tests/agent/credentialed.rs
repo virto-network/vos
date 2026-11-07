@@ -56,7 +56,7 @@ impl Agent {
         node.add(&derived.actor);
         let install = Input::Admin(Admin::Install {
             instance,
-            derivation: derived.derivation(elf),
+            derivation: derived.derivation(),
             roles: roles
                 .iter()
                 .map(|(name, role)| (name.as_bytes().to_vec(), *role))

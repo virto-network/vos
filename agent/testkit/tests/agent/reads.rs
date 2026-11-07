@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 
 use vos_pvm_compiler::Derived;
-use vos_testkit::programs::{derived, kernel, method, package};
+use vos_testkit::programs::{derived, kernel, method};
 use vos_testkit::{Testkit, run_kernel};
 use vos_tree::{BatchProof, Blake2b, MemStore};
 use vos_wire::abi::cap::{self, Target};
@@ -73,14 +73,7 @@ impl Reads {
             Target::Vos => Node::new(),
             Target::Jam => Node::jam(true),
         };
-        let (kit, _) = install_in(
-            &mut node,
-            (space, CLOCK),
-            target,
-            READER,
-            &package("reader"),
-            &derived,
-        );
+        let (kit, _) = install_in(&mut node, (space, CLOCK), target, READER, &derived);
         Self {
             node,
             kit,

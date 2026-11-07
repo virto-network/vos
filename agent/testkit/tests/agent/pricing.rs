@@ -489,7 +489,7 @@ fn serving_a_precompile_costs_the_agent_its_bounce() {
 /// shapes at derive's classes and at the most classes a shape has.
 #[test]
 fn the_start_reserves_cover_decoding_a_batch() {
-    use vos_testkit::programs::{derivation, derived, package};
+    use vos_testkit::programs::derived;
     use vos_wire::abi::cap::Target;
     use vos_wire::batch::{Admin, Body, Input, Message};
     use vos_wire::ids::{AgentId, InstanceId};
@@ -516,7 +516,7 @@ fn the_start_reserves_cover_decoding_a_batch() {
             })
             .collect()
     };
-    let wide = derivation(&package("wide"), &derived("wide"));
+    let wide = derived("wide").derivation();
     let mut widest = wide.clone();
     for kernel in &mut widest.kernels {
         let class = kernel.shape.classes[0];

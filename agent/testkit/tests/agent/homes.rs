@@ -155,7 +155,7 @@ impl Space {
             node.add(&derived.actor);
             installs.push(Input::Admin(Admin::Install {
                 instance,
-                derivation: derived.derivation(&elf),
+                derivation: derived.derivation(),
                 roles: vec![(role.as_bytes().to_vec(), ROLE)],
                 target: Target::Vos,
                 space: SPACE,

@@ -3,7 +3,7 @@
 //! installed over a populated agent, reads every envelope and operation
 //! back and goes on.
 
-use vos_testkit::programs::{derived, package};
+use vos_testkit::programs::derived;
 use vos_wire::personal::{
     Acknowledged, Candidacy, DeviceView, Entry, Envelope, InboxItem, Operation, Overview,
     Recipient, Recorded, RecoveryView, Verdict, Voted,
@@ -123,12 +123,11 @@ fn the_next_version_installed_over_a_populated_agent_reads_everything_back() {
     );
 
     // The next version, installed over the same instance.
-    let elf = package("personal-next");
     let next = derived("personal-next");
     home.node.add(&next.actor);
     let install = Input::Admin(Admin::Install {
         instance: PERSONAL,
-        derivation: next.derivation(&elf),
+        derivation: next.derivation(),
         roles: vec![(b"homes".to_vec(), 1)],
         target: Target::Vos,
         space: SpaceId::NONE,

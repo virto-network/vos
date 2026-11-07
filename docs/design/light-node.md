@@ -177,7 +177,8 @@ devices decrypt each other's messages".
   feature on the host that builds the app): the local actors' packages,
   the agent program, and the device kernels' programs
   (`release::Device`: the kernel, its chips, its log sizes, its id, and
-  the hash of the ELF it came from). The device library commits a
+  the hash of the ELF it came from, as an install record names it, its
+  temporary symbols' names left out). The device library commits a
   program's preprocessed tree from its artifact
   (`DeviceProgram::released`), checking the id; it never runs a reference
   or the transpiler, and installs no package another transpiler derived

@@ -22,7 +22,7 @@ use vos_pvm_proof::kernel::{KernelTrace, KernelTraceError, trace_kernel};
 use vos_pvm_proof::segment::SegmentCursor;
 use vos_pvm_proof::{prove, verify, verify_chain};
 use vos_testkit::Testkit;
-use vos_testkit::programs::{derivation, derived, method, package};
+use vos_testkit::programs::{derived, method};
 use vos_wire::Encode;
 use vos_wire::abi::cap::Target;
 use vos_wire::ids::{AgentId, InstanceId, Principal, ProgramHash};
@@ -291,7 +291,7 @@ fn kernels() -> Testkit {
 /// The derivation an install of the `kernels` actor records.
 fn install() -> &'static vos_wire::records::Derivation {
     static DERIVATION: OnceLock<vos_wire::records::Derivation> = OnceLock::new();
-    DERIVATION.get_or_init(|| derivation(&package("kernels"), &derived("kernels")))
+    DERIVATION.get_or_init(|| derived("kernels").derivation())
 }
 
 /// The kernel blob a derivation names by hash.

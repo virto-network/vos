@@ -172,7 +172,7 @@ impl Actor {
         };
         let install = Input::Admin(Admin::Install {
             instance: CREDENTIALS,
-            derivation: derived.derivation(&elf),
+            derivation: derived.derivation(),
             roles: vec![(b"registrar".to_vec(), REGISTRAR)],
             target,
             space: vos_wire::SpaceId::NONE,

@@ -274,7 +274,7 @@ impl Inner {
                     stored.push((reference, Arc::new(blob)));
                     Ok(ProgramHash(hash.0))
                 };
-                let derivation = derived.derivation(&elf);
+                let derivation = derived.derivation();
                 let mut devices = Vec::new();
                 for (method, reference, headroom) in &derived.references {
                     let kernel = derived

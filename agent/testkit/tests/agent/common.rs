@@ -12,7 +12,7 @@ use vos_pvm::refine_host::{JamItem, JamRefine, Preimages, ProgramSource, RefineC
 use vos_pvm::{ExitReason, PvmBackend};
 use vos_pvm_compiler::Derived;
 use vos_testkit::node::serve;
-use vos_testkit::programs::{actor, agent, bare, derivation, derived, kernel, method, package};
+use vos_testkit::programs::{actor, agent, bare, derived, kernel, method};
 use vos_testkit::{Step as KitStep, Testkit, decode};
 use vos_wire::abi::cap::Target;
 use vos_wire::abi::{Failure, Refusal, cap};
@@ -442,7 +442,6 @@ pub fn install_in(
     (space, clock): (SpaceId, WindowClock),
     target: Target,
     instance: InstanceId,
-    package: &[u8],
     derived: &Derived,
 ) -> (Testkit, WorkResult) {
     node.add(&derived.actor);
@@ -451,7 +450,7 @@ pub fn install_in(
     }
     let install = Input::Admin(Admin::Install {
         instance,
-        derivation: derivation(package, derived),
+        derivation: derived.derivation(),
         roles: vec![],
         target,
         space,
@@ -496,7 +495,7 @@ impl Actors {
         node.add(&self.checksum);
         Input::Admin(Admin::Install {
             instance: LEDGER,
-            derivation: derivation(&package("ledger"), &derived("ledger")),
+            derivation: derived("ledger").derivation(),
             roles: vec![(b"minter".to_vec(), MINTER)],
             target,
             space: vos_wire::SpaceId::NONE,

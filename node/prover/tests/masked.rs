@@ -9,7 +9,7 @@ use vos_node_prover::program::program_id;
 use vos_node_prover::{ProveError, Prover};
 use vos_pvm_proof::constants;
 use vos_testkit::Testkit;
-use vos_testkit::programs::{actor_elf, derivation, derived, method, package};
+use vos_testkit::programs::{actor_elf, derived, method};
 use vos_wire::Encode;
 use vos_wire::abi::cap::Target;
 use vos_wire::ids::{AgentId, InstanceId, Principal, ProgramHash};
@@ -48,7 +48,7 @@ fn attests(values: &[u64]) -> Vec<(Vec<u8>, Attest)> {
 #[test]
 fn a_kernel_is_read_from_its_blob_alone() {
     let derived = derived("kernels");
-    let install = derivation(&package("kernels"), &derived);
+    let install = derived.derivation();
     let prover = MaskedProver::new();
     for (_, blob) in &derived.kernels {
         let mut record = kernel_record(blob).unwrap();

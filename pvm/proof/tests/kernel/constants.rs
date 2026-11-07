@@ -8,13 +8,13 @@ use vos_pvm_proof::constants;
 use vos_pvm_proof::format::SEGMENT;
 use vos_pvm_recair::fold::FoldCircuit;
 use vos_pvm_recair::wrap::WrapCircuit;
-use vos_testkit::programs::{derivation, derived, method, package};
+use vos_testkit::programs::{derived, method};
 
 /// The program id of test actor `actor`'s attestable `name`, from its ELF.
 pub fn program_id(actor: &str, name: &str) -> [u32; 8] {
     let derived = derived(actor);
     let id = method(&derived.actor, name);
-    let install = derivation(&package(actor), &derived);
+    let install = derived.derivation();
     let record = install
         .kernels
         .iter()

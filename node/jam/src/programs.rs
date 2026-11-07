@@ -51,7 +51,7 @@ pub fn derive(elf: &[u8]) -> Result<Installable, Error> {
         )));
     }
     Ok(Installable {
-        derivation: derived.derivation(elf),
+        derivation: derived.derivation(),
         programs: derived.programs(),
         schema,
     })
