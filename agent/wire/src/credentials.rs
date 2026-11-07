@@ -61,6 +61,9 @@ pub mod tables {
     pub const RING: &str = "ring";
     /// The ring's row's key, one byte.
     pub const RING_KEY: u8 = 0;
+    /// One row, under [`RING_KEY`]: the open claim's terms and its period's
+    /// count, once the registrar opened it.
+    pub const OPENING: &str = "opening";
 }
 
 /// The tags' names (`proving.md` §8): `T(name)` is the block
@@ -774,6 +777,66 @@ pub enum CredentialError {
     /// The handle given is all zeros, which reads as none.
     #[codec(index = 9)]
     ZeroHandle = 9,
+    /// The registrar takes no open claim.
+    #[codec(index = 10)]
+    Closed = 10,
+    /// The open claim's work does not meet its difficulty under the
+    /// current salt or the one before.
+    #[codec(index = 11)]
+    Work = 11,
+    /// The open claims of the period reached its cap.
+    #[codec(index = 12)]
+    Cap = 12,
+    /// A difficulty past [`MAX_DIFFICULTY`], or a period of zero.
+    #[codec(index = 13)]
+    Terms = 13,
+}
+
+/// The most leading zero bits an open claim's difficulty asks.
+pub const MAX_DIFFICULTY: u8 = 64;
+
+/// The open claim's terms as the registrar answers them
+/// (`light-node.md` §3.3): the salt its work names now, its difficulty in
+/// leading zero bits, the period the cap counts by and the claims left in
+/// the current one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Open {
+    pub salt: [u8; 32],
+    pub difficulty: u8,
+    pub period_ms: u64,
+    pub left: u32,
+}
+
+/// The salt of the open claim's period `period`, from the registrar's
+/// `seed`: `BLAKE2b-256("vos/cred/open/salt" ‖ seed ‖ period)`, the period
+/// eight little-endian bytes. Only the registrar's actor holds the seed, so
+/// no work is made before its period's salt is served.
+pub fn open_salt(seed: &[u8; 32], period: u64) -> [u8; 32] {
+    vos_pvm_precompiles::blake2b_hash::<32>(b"vos/cred/open/salt", &[seed, &period.to_le_bytes()])
+}
+
+/// The open claim's work for `member` in the space whose handle is
+/// `handle`, under `salt`, at `nonce`: `BLAKE2b-256("vos/cred/open/work" ‖
+/// handle ‖ member ‖ salt ‖ nonce)`, the nonce eight little-endian bytes.
+pub fn open_work(handle: &[u8; 32], member: &Digest, salt: &[u8; 32], nonce: u64) -> [u8; 32] {
+    vos_pvm_precompiles::blake2b_hash::<32>(
+        b"vos/cred/open/work",
+        &[handle, member, salt, &nonce.to_le_bytes()],
+    )
+}
+
+/// Whether `work` starts with `difficulty` zero bits.
+pub fn meets(work: &[u8; 32], difficulty: u8) -> bool {
+    let difficulty = u32::from(difficulty);
+    let mut zeros = 0;
+    for byte in work {
+        if *byte != 0 {
+            zeros += byte.leading_zeros();
+            break;
+        }
+        zeros += 8;
+    }
+    zeros >= difficulty
 }
 
 /// The key of the ring's row of the credential actor at `actor`: the row
