@@ -516,6 +516,8 @@ across a space's agents wait for the identity agent above.
     milliseconds of batch time;
   - `ring`: one row, the last 64 roots, newest last, each `(root, since)`:
     a root and the batch time it became the tree's root;
+  - `opening`: one row once the registrar opened the open claim, its
+    terms, its salts' seed, and the current period with its count;
   - its struct: `handle`, `next` (the lowest slot never used) and `count`
     (the members enrolled).
 - **The ring:** a write whose batch time equals the newest entry's
@@ -553,6 +555,20 @@ across a space's agents wait for the identity agent above.
     (the demo's gateway app, under its own client key): an ordinary
     client's authority, bounded by the invitation, which names the
     digest;
+  - `open(difficulty, cap, period_ms)`, role `registrar`, and
+    `claim_open(member, nonce)`, any caller: the open claim of a space
+    that admits anyone, a home-only space (`light-node.md` §3.3). A
+    member enrolls itself when `BLAKE2b-256("vos/cred/open/work" ‖ handle
+    ‖ member ‖ salt ‖ nonce)` starts with `difficulty` zero bits (at most
+    64), at most `cap` members a period of `period_ms` of batch time
+    (`Cap` past it, a cap of 0 closing it, `Closed`). The salt is the
+    period's, `BLAKE2b-256("vos/cred/open/salt" ‖ seed ‖ period)`, from a
+    seed the actor draws at its first opening and serves to no read; the
+    period's salt and the one before are accepted, so work made just
+    before a period ends still counts, and none is made before its
+    period's salt is served. `opening()` answers the salt, the
+    difficulty, the period and the claims the period takes yet (the
+    `opening` row);
   - `revoke(member)`, role `registrar`: the leaf back to the empty leaf,
     the slot freed; for a member only invited, the invitation withdrawn;
   - queries, any caller: `path(member) → Option<(root, slot, siblings)>`,
