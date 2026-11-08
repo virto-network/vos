@@ -173,6 +173,11 @@ pub struct Config {
     /// proof of one is refused from that time. The operator's `Retire`
     /// sets one live, until the node restarts.
     pub retired_formats: Vec<(u32, u64)>,
+    /// What every agent of the node's space asks of the gateway's mark
+    /// (`light-node.md` §6.5): its proven calls, or every request read of
+    /// an agent, only through the onion. An agent may ask more of its own
+    /// (`#[actor(onion_only)]`).
+    pub onion: crate::admission::OnionPolicy,
 }
 
 impl Config {
@@ -234,6 +239,7 @@ impl Config {
             operator_nonces: 1 << 16,
             verifications: None,
             retired_formats: Vec::new(),
+            onion: crate::admission::OnionPolicy::Any,
         }
     }
 }
@@ -275,6 +281,7 @@ pub(crate) struct Settings {
     pub(crate) api_frame_deadline: Duration,
     /// [`Config::verifications`], resolved.
     pub(crate) verifications: usize,
+    pub(crate) onion: crate::admission::OnionPolicy,
 }
 
 impl Settings {
@@ -314,6 +321,7 @@ impl Settings {
             api_in_flight: config.api_in_flight,
             api_frame_deadline: config.api_frame_deadline,
             verifications: config.verifications.unwrap_or(2 * config.executors.max(1)),
+            onion: config.onion,
         }
     }
 }

@@ -51,6 +51,19 @@ pub struct Settings {
     /// Whether the node lists the operator key in its data directory too:
     /// true by default.
     local_operator: Option<bool>,
+    /// What the space asks of the gateway's onion mark, alike on every node
+    /// of it: `"any"` by default, `"anonymous"` for its proven calls only
+    /// through the onion, `"all"` for an onion-only space.
+    onion: Option<Onion>,
+}
+
+/// [`vos_node::OnionPolicy`] as the file names it.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Onion {
+    Any,
+    Anonymous,
+    All,
 }
 
 /// The keys `listed` names in hex, each named `what` when it is not one.
@@ -140,6 +153,13 @@ impl Settings {
         }
         config.operators = keys("an operator's", self.operators)?;
         config.local_operator = self.local_operator.unwrap_or(config.local_operator);
+        if let Some(onion) = self.onion {
+            config.onion = match onion {
+                Onion::Any => vos_node::OnionPolicy::Any,
+                Onion::Anonymous => vos_node::OnionPolicy::Anonymous,
+                Onion::All => vos_node::OnionPolicy::All,
+            };
+        }
         let gateways = keys("a gateway's", self.gateways)?;
         Ok(Fronts {
             api_socket: self.api_socket,
@@ -208,6 +228,16 @@ mod tests {
         .unwrap();
         assert_eq!(config.operators, vec![[0xcd; 32]]);
         assert!(!config.local_operator);
+        assert_eq!(defaults.onion, vos_node::OnionPolicy::Any);
+        assert_eq!(
+            applied("onion = \"anonymous\"\n").unwrap().onion,
+            vos_node::OnionPolicy::Anonymous
+        );
+        assert_eq!(
+            applied("onion = \"all\"\n").unwrap().onion,
+            vos_node::OnionPolicy::All
+        );
+        assert!(applied("onion = \"clearnet\"\n").is_err());
     }
 
     #[test]
