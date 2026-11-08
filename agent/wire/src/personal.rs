@@ -267,6 +267,9 @@ pub struct DeviceView {
     /// rules, when its admin is strong.
     pub seasoned: bool,
     pub removal: Option<Removal>,
+    /// The batch time of the device's last call the agent took: 0 before
+    /// any. A device's last sync, as the chrome shows it.
+    pub seen: u64,
 }
 
 /// What a key admitted at ingress is to the agent: the rows of its

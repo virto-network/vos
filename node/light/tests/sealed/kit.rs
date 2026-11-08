@@ -22,7 +22,7 @@ use crate::phone::Touch;
 /// A home claimed by phone 1 with the kit of `keys`, `count - 1` more
 /// phones paired, every phone seasoned and seen, the notes actor
 /// installed on each and its scope tracked: the claim's split too.
-fn household_with(count: u8, keys: Vec<KitKey>) -> (Home, Vec<Phone>, Split) {
+pub(super) fn household_with(count: u8, keys: Vec<KitKey>) -> (Home, Vec<Phone>, Split) {
     let homes = SigningKey::from_bytes(&[0x50; 32]);
     let mut home = Home::new(&homes, policy());
     let mut phones: Vec<Phone> = (1..=count).map(Phone::new).collect();
@@ -45,7 +45,7 @@ fn household_with(count: u8, keys: Vec<KitKey>) -> (Home, Vec<Phone>, Split) {
 
 /// `signer`'s admin call of `name`, its evidence posted under `poster`
 /// with `r2` beside it: its log index.
-fn operate(
+pub(super) fn operate(
     home: &mut Home,
     signer: &SigningKey,
     poster: &SigningKey,
@@ -98,7 +98,12 @@ fn kit_reads(home: &Home, key: &KitSecret) -> Vec<Envelope> {
 /// Phone `n`, a fresh install, opens a restore signed by `kit`, carrying
 /// the next kit `next`, its `R` held in its store: the phone, the split
 /// and the restore's log index.
-fn open_restore(home: &mut Home, kit: &KitSecret, next: &KitSecret, n: u8) -> (Phone, Split, u64) {
+pub(super) fn open_restore(
+    home: &mut Home,
+    kit: &KitSecret,
+    next: &KitSecret,
+    n: u8,
+) -> (Phone, Split, u64) {
     let restoring = Phone::new(n);
     let split =
         vos_light::group::restoring(&restoring.store, &[next.key()], &home.agent()).unwrap();
