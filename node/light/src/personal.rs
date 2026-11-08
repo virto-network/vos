@@ -57,6 +57,8 @@ use zeroize::Zeroizing;
 use crate::group::{Alarm, Archive, DeviceGroup, GroupError};
 use crate::kit::{self, KitSecret};
 use crate::light::{Error, Ingest, Light, Queued};
+/// How the link reaches the agent: no request to it takes the clearnet.
+pub use crate::route::Route;
 use crate::sealed::{self, Body, MAX_BODY, OpenError, View};
 use crate::sync::{Blake2b256, Held, Quarantined};
 use merkle_crdt::Hasher as _;
@@ -125,16 +127,6 @@ pub type Answer<T, E> = Result<Result<T, PersonalError>, E>;
 
 /// A device's last position in each scope it pushed to.
 pub type Frontier = Vec<(Scope, u64)>;
-
-/// How the link reaches the agent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum Route {
-    /// Through the home's onion service.
-    Onion = 0,
-    /// Over the clearnet: no request to the personal agent takes it.
-    Clearnet = 1,
-}
 
 /// A connection to the personal agent: its calls signed by the device's
 /// sync key in a session the link keeps, its reads queries under the same

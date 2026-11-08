@@ -90,6 +90,7 @@ mod path;
 pub mod personal;
 mod prover;
 pub mod release;
+pub mod route;
 pub mod sealed;
 mod secret;
 pub mod store;
