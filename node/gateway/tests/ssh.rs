@@ -440,11 +440,13 @@ async fn verifying(node: [u8; 32], socket: PathBuf, hold: Duration) -> Verifying
 }
 
 /// A flood of well-formed junk proven calls, a device proof's size each,
-/// from four connections at once through a port capped as the onion's: at
-/// most the port's proven calls held at once behind it, the rest answered
-/// `Busy` by the gateway, its caps' places all given back once answered;
-/// meanwhile a member's queries and a session's call on another connection
-/// are answered, the call relayed as the relay set now holds it.
+/// from eight connections at once through a port capped as the onion's: at
+/// most the port's proven calls held behind it at once, the rest waiting
+/// for a place with their bodies unread; a connection past its own proven
+/// calls answered `Busy` and closed before its body is read; every place
+/// given back once answered. Meanwhile a member's queries, a session's
+/// call and the member's own proven call, on a connection of its own, are
+/// all answered: the proven call reaches the node in its turn.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_flood_of_junk_proofs_is_held_to_the_caps_and_members_are_served() {
     use vos_gateway::caps::{Caps, PerPort};
@@ -476,7 +478,7 @@ async fn a_flood_of_junk_proofs_is_held_to_the_caps_and_members_are_served() {
     })
     .await
     .unwrap();
-    let verifying = verifying(
+    let standing = verifying(
         served.node.id().0,
         served.socket.clone(),
         Duration::from_millis(500),
@@ -485,12 +487,14 @@ async fn a_flood_of_junk_proofs_is_held_to_the_caps_and_members_are_served() {
     let caps = Caps::new(PerPort {
         proven: 4,
         proven_per_connection: 2,
+        // Every test connection is from one address.
+        proven_per_circuit: 1_000,
         agent_rate: 1_000,
         agent_burst: 1_000,
     });
     let gateway = Arc::new(Gateway::new(vec![Upstream::new(
         served.node.id().0,
-        Address::Socket(verifying.socket.clone()),
+        Address::Socket(standing.socket.clone()),
         [41; 32],
     )]));
     let host_key = ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[3; 32]));
@@ -525,9 +529,10 @@ async fn a_flood_of_junk_proofs_is_held_to_the_caps_and_members_are_served() {
             &(agent, call).encode(),
         )
     };
-    const FLOOD: u64 = 12;
+    const CONNECTIONS: u64 = 8;
+    const FLOOD: u64 = 2;
     let mut floods = Vec::new();
-    for connection in 0..4u64 {
+    for connection in 0..CONNECTIONS {
         let mut channel = channel(address).await;
         let frames: Vec<Vec<u8>> = (1..=FLOOD).map(|at| junk(connection * 100 + at)).collect();
         floods.push(tokio::spawn(async move {
@@ -535,18 +540,58 @@ async fn a_flood_of_junk_proofs_is_held_to_the_caps_and_members_are_served() {
                 channel.data(&bytes[..]).await.unwrap();
             }
             let mut answers = Answers { buffer: Vec::new() };
-            let mut busy = 0;
             for _ in 0..FLOOD {
                 let (kind, _, body) = answers.next(&mut channel).await.unwrap();
                 assert_eq!(kind, Kind::Credentialed as u16);
-                match Response::decode_exact(&body).unwrap() {
-                    Response::Busy => busy += 1,
-                    Response::Rejected(Rejection::Malformed) => {}
-                    other => panic!("{other:?}"),
-                }
+                assert_eq!(
+                    Response::decode_exact(&body),
+                    Some(Response::Rejected(Rejection::Malformed)),
+                    "each reaches the node in its turn"
+                );
             }
-            busy
         }));
+    }
+    // A connection pipelining past its own proven calls, on a port whose
+    // own places are many and whose node holds each proof 3 s: its third
+    // is answered `Busy` from its header, and the channel closed.
+    let slow = verifying(
+        served.node.id().0,
+        served.socket.clone(),
+        Duration::from_secs(3),
+    )
+    .await;
+    let roomy = Caps::new(PerPort {
+        proven: 100,
+        proven_per_connection: 2,
+        proven_per_circuit: 1_000,
+        agent_rate: 1_000,
+        agent_burst: 1_000,
+    });
+    let roomy_address = {
+        let gateway = Arc::new(Gateway::new(vec![Upstream::new(
+            served.node.id().0,
+            Address::Socket(slow.socket.clone()),
+            [41; 32],
+        )]));
+        let host_key =
+            ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[4; 32]));
+        let port = vos_gateway::ssh::Port::tcp(
+            vos_api::Mark::Onion,
+            Limits::new(PerAddress::default()),
+            Arc::clone(&roomy),
+            vos_gateway::caps::bodies(),
+        );
+        let server = vos_gateway::ssh::server(host_key, gateway, port, None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = server.serve_on(listener).await;
+        });
+        address
+    };
+    let mut greedy = channel(roomy_address).await;
+    for at in 1..=3 {
+        greedy.data(&junk(900 + at)[..]).await.unwrap_or(());
     }
     // A member, on a connection of its own, while the flood is held.
     let mut member = channel(address).await;
@@ -614,25 +659,44 @@ async fn a_flood_of_junk_proofs_is_held_to_the_caps_and_members_are_served() {
         "{:?}",
         Response::decode_exact(&body)
     );
-    let member_took = started.elapsed();
-    let mut busy = 0;
-    for flood in floods {
-        busy += flood.await.unwrap();
-    }
-    let reached = verifying.proven.load(Ordering::SeqCst);
-    assert_eq!(busy + reached, 4 * FLOOD, "each answered once");
-    assert!(busy > 0, "past the caps, Busy");
-    assert!(
-        verifying.most.load(Ordering::SeqCst) <= 4,
-        "at most the port's proven calls held at once: {}",
-        verifying.most.load(Ordering::SeqCst)
+    // The member's own proven call, waiting its turn behind the flood.
+    member.data(&junk(7_000)[..]).await.unwrap();
+    let (kind, _, body) = answers.next(&mut member).await.unwrap();
+    assert_eq!(kind, Kind::Credentialed as u16);
+    assert_eq!(
+        Response::decode_exact(&body),
+        Some(Response::Rejected(Rejection::Malformed)),
+        "the member's proven call reached the node"
     );
-    let refused = caps.refused();
-    assert_eq!(refused.proven + refused.connection, busy);
+    let member_took = started.elapsed();
+    for flood in floods {
+        flood.await.unwrap();
+    }
+    let mut answers = Answers { buffer: Vec::new() };
+    let mut greedy_answers = Vec::new();
+    while let Some((_, id, body)) = answers.next(&mut greedy).await {
+        greedy_answers.push((id, Response::decode_exact(&body).unwrap()));
+    }
+    assert!(
+        greedy_answers.contains(&(903, Response::Busy)),
+        "{greedy_answers:?}"
+    );
+    assert!(greedy_answers.len() <= 3, "the channel closed");
+    assert!(
+        standing.most.load(Ordering::SeqCst) <= 4,
+        "at most the port's proven calls held at once: {}",
+        standing.most.load(Ordering::SeqCst)
+    );
+    assert_eq!(roomy.refused().connection, 1);
     assert_eq!(caps.proven(), 0, "every place given back");
     assert!(
         member_took < Duration::from_secs(20),
         "the member waited {member_took:?}"
     );
-    assert_eq!(verifying.held.load(Ordering::SeqCst), 0);
+    assert_eq!(standing.held.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        standing.proven.load(Ordering::SeqCst),
+        CONNECTIONS * FLOOD + 1,
+        "every proven call within its connection's reached the node"
+    );
 }

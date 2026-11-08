@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -84,13 +84,23 @@ pub struct Counts {
 /// The onion's circuits and the streams open on each.
 pub struct Circuits {
     per: PerCircuit,
-    open: Mutex<HashMap<u32, usize>>,
+    open: Mutex<HashMap<u32, Open>>,
     circuits: Mutex<usize>,
     /// The SSH streams carried to the onion's SSH port, by the carrier's
-    /// loopback port: the stream's address.
-    carried: Mutex<HashMap<u16, SocketAddr>>,
-    next: AtomicU16,
+    /// loopback address: the stream's address.
+    carried: Mutex<HashMap<SocketAddr, SocketAddr>>,
     counts: [AtomicU64; 4],
+}
+
+/// A circuit's open streams: the ports of its address they hold, the next
+/// port to try, and the circuit's place when its streams hold it.
+#[derive(Default)]
+struct Open {
+    ports: Vec<u16>,
+    next: u16,
+    /// Held while the circuit's streams are open, given back with the
+    /// entry.
+    _place: Option<CircuitPlace>,
 }
 
 /// A circuit's place among the onion's, given back when it closes.
@@ -112,13 +122,20 @@ pub struct StreamPlace {
 
 impl Drop for StreamPlace {
     fn drop(&mut self) {
-        let mut open = self.circuits.open.lock().expect("the open streams");
-        if let Some(count) = open.get_mut(&self.circuit) {
-            *count -= 1;
-            if *count == 0 {
-                open.remove(&self.circuit);
+        let closed = {
+            let mut open = self.circuits.open.lock().expect("the open streams");
+            let Some(streams) = open.get_mut(&self.circuit) else {
+                return;
+            };
+            streams.ports.retain(|port| *port != self.peer.port());
+            if streams.ports.is_empty() {
+                open.remove(&self.circuit)
+            } else {
+                None
             }
-        }
+        };
+        // The circuit's place, if its streams held it, goes outside the lock.
+        drop(closed);
     }
 }
 
@@ -129,7 +146,6 @@ impl Circuits {
             open: Mutex::new(HashMap::new()),
             circuits: Mutex::new(0),
             carried: Mutex::new(HashMap::new()),
-            next: AtomicU16::new(0),
             counts: Default::default(),
         })
     }
@@ -153,19 +169,45 @@ impl Circuits {
     }
 
     /// A place for a stream on `circuit`, while it holds fewer than its
-    /// limit.
+    /// limit: on a circuit whose own task holds its place (arti's).
     pub fn stream(self: &Arc<Self>, circuit: u32) -> Option<StreamPlace> {
+        self.open_stream(circuit, false)
+    }
+
+    /// A place for a stream on `circuit`, its first stream taking the
+    /// circuit's place among the onion's and its last giving it back: a
+    /// circuit that only its streams show (C tor's).
+    pub fn stream_placing(self: &Arc<Self>, circuit: u32) -> Option<StreamPlace> {
+        self.open_stream(circuit, true)
+    }
+
+    fn open_stream(self: &Arc<Self>, circuit: u32, placing: bool) -> Option<StreamPlace> {
         let mut open = self.open.lock().expect("the open streams");
-        let count = open.entry(circuit).or_insert(0);
-        if *count >= self.per.streams {
+        if placing && !open.contains_key(&circuit) {
+            let place = self.circuit()?;
+            open.insert(
+                circuit,
+                Open {
+                    _place: Some(place),
+                    ..Open::default()
+                },
+            );
+        }
+        let streams = open.entry(circuit).or_default();
+        if streams.ports.len() >= self.per.streams {
             drop(open);
             self.count(3);
             return None;
         }
-        *count += 1;
+        // A port no live stream of the circuit holds.
+        let mut port = streams.next;
+        while streams.ports.contains(&port) {
+            port = port.wrapping_add(1);
+        }
+        streams.next = port.wrapping_add(1);
+        streams.ports.push(port);
         drop(open);
         self.count(2);
-        let port = self.next.fetch_add(1, Ordering::Relaxed);
         Some(StreamPlace {
             circuits: Arc::clone(self),
             circuit,
@@ -179,8 +221,7 @@ impl Circuits {
             .lock()
             .expect("the open streams")
             .get(&circuit)
-            .copied()
-            .unwrap_or(0)
+            .map_or(0, |streams| streams.ports.len())
     }
 
     /// A stream refused as it arrived, for a port the onion does not serve.
@@ -200,15 +241,13 @@ impl Circuits {
     }
 
     /// The address of the stream the SSH connection from `peer` carries,
-    /// if one does: the onion's SSH port serves channels to no other.
+    /// if one does, by the carrier's exact loopback address: the onion's
+    /// SSH port serves channels to no other.
     pub fn carried(&self, peer: SocketAddr) -> Option<SocketAddr> {
-        if !peer.ip().is_loopback() {
-            return None;
-        }
         self.carried
             .lock()
             .expect("the carried streams")
-            .get(&peer.port())
+            .get(&peer)
             .copied()
     }
 }
@@ -295,13 +334,23 @@ impl Onion {
 
     /// Serve `stream`, a stream on `circuit` to virtual port `port`, until
     /// it ends: closed at once past its circuit's streams, or for a port
-    /// the onion does not serve.
+    /// the onion does not serve. The circuit's own task holds its place.
     pub async fn serve(&self, stream: impl Io, circuit: u32, port: u16) {
+        self.serve_placed(stream, circuit, port, false).await
+    }
+
+    /// [`Onion::serve`], the circuit's streams holding its place when
+    /// `placing`: closed at once past the onion's circuits too.
+    async fn serve_placed(&self, stream: impl Io, circuit: u32, port: u16, placing: bool) {
         if !self.serves(port) {
             self.circuits.refused();
             return;
         }
-        let Some(place) = self.circuits.stream(circuit) else {
+        let place = match placing {
+            true => self.circuits.stream_placing(circuit),
+            false => self.circuits.stream(circuit),
+        };
+        let Some(place) = place else {
             return;
         };
         let peer = place.peer;
@@ -331,13 +380,13 @@ impl Onion {
             .carried
             .lock()
             .expect("the carried streams")
-            .insert(local.port(), peer);
+            .insert(local, peer);
         let _ = tokio::io::copy_bidirectional(&mut stream, &mut carrier).await;
         self.circuits
             .carried
             .lock()
             .expect("the carried streams")
-            .remove(&local.port());
+            .remove(&local);
     }
 }
 
@@ -355,16 +404,21 @@ pub mod sidecar {
     /// How long a connection may take to write its PROXY line.
     const DEADLINE: Duration = Duration::from_secs(10);
 
+    /// The source range C tor writes a circuit's number into.
+    const EXPORTED: u128 = 0xfc00_dead_beef_4dad << 64;
+    /// PROXY lines read at once: past them, a connection waits its turn.
+    const READING: usize = 256;
+
     /// The circuit a PROXY line names: the last 32 bits of its source
-    /// address, a `TCP6` one.
+    /// address, a `TCP6` one in C tor's `fc00:dead:beef:4dad::/64`.
     pub fn circuit(line: &str) -> Option<u32> {
         let mut fields = line.strip_suffix("\r\n")?.split(' ');
         let ("PROXY", "TCP6", Some(source)) = (fields.next()?, fields.next()?, fields.next())
         else {
             return None;
         };
-        let source: Ipv6Addr = source.parse().ok()?;
-        Some(u128::from(source) as u32)
+        let source = u128::from(source.parse::<Ipv6Addr>().ok()?);
+        (source >> 64 == EXPORTED >> 64).then_some(source as u32)
     }
 
     /// The PROXY line at `stream`'s start, read a byte at a time so no
@@ -381,21 +435,36 @@ pub mod sidecar {
     }
 
     /// Serve the connections C tor forwards on `listener` for virtual port
-    /// `port`, each on the circuit its PROXY line names, until the listener
-    /// fails.
+    /// `port`, each on the circuit its PROXY line names, its first stream
+    /// taking the circuit's place among the onion's. The listener's trust
+    /// boundary is the host: a local process may name any circuit, as it
+    /// may reach the gateway's loopback ports.
     pub async fn serve(onion: Arc<Onion>, listener: tokio::net::TcpListener, port: u16) {
-        while let Ok((mut stream, peer)) = listener.accept().await {
+        let reading = Arc::new(tokio::sync::Semaphore::new(READING));
+        loop {
+            let (mut stream, peer) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    tracing::warn!(%error, "C tor's listener: an accept failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
             if !peer.ip().is_loopback() {
                 continue;
             }
+            let Ok(turn) = Arc::clone(&reading).acquire_owned().await else {
+                return;
+            };
             let onion = Arc::clone(&onion);
             tokio::spawn(async move {
                 let named = tokio::time::timeout(DEADLINE, line(&mut stream)).await;
+                drop(turn);
                 let Some(circuit) = named.ok().flatten().as_deref().and_then(circuit) else {
                     return;
                 };
                 let _ = stream.set_nodelay(true);
-                onion.serve(stream, circuit, port).await;
+                onion.serve_placed(stream, circuit, port, true).await;
             });
         }
     }
@@ -439,6 +508,66 @@ mod tests {
         );
     }
 
+    /// A circuit only its streams show takes its place with its first
+    /// stream and gives it back with its last; a live stream's port is
+    /// never another's on its circuit.
+    #[test]
+    fn a_placing_circuit_is_held_by_its_streams() {
+        let circuits = Circuits::new(PerCircuit {
+            streams: 2,
+            circuits: 1,
+        });
+        let first = circuits.stream_placing(9).unwrap();
+        let second = circuits.stream_placing(9).unwrap();
+        assert!(
+            circuits.stream_placing(10).is_none(),
+            "the onion's circuits"
+        );
+        assert_ne!(first.peer, second.peer);
+        drop(first);
+        assert!(
+            circuits.stream_placing(10).is_none(),
+            "held while one is open"
+        );
+        let third = circuits.stream_placing(9).unwrap();
+        assert_ne!(third.peer, second.peer);
+        drop((second, third));
+        assert!(
+            circuits.stream_placing(10).is_some(),
+            "given back with the last"
+        );
+    }
+
+    /// C tor's connection: its PROXY line read and its stream served on
+    /// the circuit the line names; one without a line closed.
+    #[tokio::test]
+    async fn c_tors_streams_are_served_on_their_circuits() {
+        use tokio::io::AsyncWriteExt;
+        let circuits = Circuits::new(PerCircuit::default());
+        let (onion, mut http) = Onion::new(Arc::clone(&circuits), None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(sidecar::serve(onion, listener, HTTP));
+        let mut bare = tokio::net::TcpStream::connect(address).await.unwrap();
+        bare.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+        let mut tor = tokio::net::TcpStream::connect(address).await.unwrap();
+        tor.write_all(b"PROXY TCP6 fc00:dead:beef:4dad::12 ::1 65535 80\r\nping")
+            .await
+            .unwrap();
+        let (mut stream, peer) = vos_http::Listener::accept(&mut http).await.unwrap();
+        assert_eq!(peer.ip(), address_of(0x12));
+        let mut read = [0u8; 4];
+        futures::AsyncReadExt::read_exact(&mut stream, &mut read)
+            .await
+            .unwrap();
+        assert_eq!(&read, b"ping", "nothing past the line taken");
+        assert_eq!(circuits.counts().circuits, 1, "its circuit placed");
+    }
+
+    fn address_of(circuit: u32) -> IpAddr {
+        address(circuit)
+    }
+
     #[test]
     fn a_proxy_line_names_tors_circuit() {
         assert_eq!(
@@ -454,6 +583,7 @@ mod tests {
             "PROXY TCP6 fc00:dead:beef:4dad::1 ::1 1 2\n",
             "SSH-2.0-OpenSSH\r\n",
             "PROXY TCP6 nowhere ::1 1 2\r\n",
+            "PROXY TCP6 fd00::1 ::1 1 2\r\n",
         ] {
             assert_eq!(sidecar::circuit(refused), None, "{refused}");
         }

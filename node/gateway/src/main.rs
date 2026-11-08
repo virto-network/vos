@@ -48,9 +48,12 @@ fn run(cli: Cli) -> Result<(), String> {
     let gateway = Arc::new(Gateway::new(upstreams));
     // The s4 app's client key, apart from the gateway's: its apps' claims
     // go as it.
-    let app_seed = config.app_key.as_ref().map(|path| seed(path)).transpose()?;
-    let app =
-        app_seed.map(|seed| Arc::new(AppClient::new(seed, Arc::clone(&gateway), Mark::Clearnet)));
+    let app = config
+        .app_key
+        .as_ref()
+        .map(|path| seed(path))
+        .transpose()?
+        .map(|seed| Arc::new(AppClient::new(seed, Arc::clone(&gateway), Mark::Clearnet)));
     let limits = Limits::new(config.per_address());
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
     runtime.block_on(async {
@@ -64,8 +67,6 @@ fn run(cli: Cli) -> Result<(), String> {
         if let Some(app) = &app {
             println!("app {}", hex::encode(app.key()));
         }
-        // The proven bodies' places the SSH ports share.
-        let bodies = vos_gateway::caps::bodies();
         // The HTTP and SSH ports are the clearnet's: their clients'
         // addresses bound them, and they cap no calls.
         #[cfg(feature = "ssh")]
@@ -76,16 +77,15 @@ fn run(cli: Cli) -> Result<(), String> {
                 Mark::Clearnet,
                 Arc::clone(&limits),
                 Caps::none(),
-                Arc::clone(&bodies),
+                vos_gateway::caps::bodies(),
             ),
             app.clone(),
         )
         .await?;
         let onion = match &config.onion {
-            Some(onion) => Some(
-                vos_gateway::served::onion(&config, onion, Arc::clone(&gateway), bodies, app_seed)
-                    .await?,
-            ),
+            Some(onion) => {
+                Some(vos_gateway::served::onion(&config, onion, Arc::clone(&gateway)).await?)
+            }
             None => None,
         };
         #[cfg(feature = "tor")]

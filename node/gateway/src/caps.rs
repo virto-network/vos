@@ -1,24 +1,30 @@
 //! Caps on the calls a port relays, beside the limits per address
 //! (`light-node.md` §6.6): an onion's clients have no address, and a
 //! proven call costs a node a verification, so each port bounds
-//! - its proven calls in flight, from every connection (past them,
-//!   `Busy`): the node's verification budget behind it, which a flood
-//!   through one port cannot take whole from the others;
-//! - a connection's proven calls in flight (past them, `Busy`);
+//! - its proven calls in flight, from every connection: the node's
+//!   verification budget behind it, which a flood through one port cannot
+//!   take whole from the others;
+//! - the proven calls in flight from one connection, and from one address
+//!   or circuit;
 //! - an agent's calls and proven calls from one address or circuit, a
-//!   second with a burst (past them, `Busy`), so one circuit cannot fill a
-//!   personal agent's log.
+//!   second with a burst, so one circuit cannot fill a personal agent's
+//!   log.
 //!
-//! The gateway answers `Busy` itself, never asking a node, and the client
-//! backs off as it does on a node's. The clearnet's ports cap nothing
-//! ([`Caps::none`]): their clients' addresses are the bound
+//! A proven call holds its places from its header on, before its body is
+//! read: the SSH relay waits for a place among the port's (its channel
+//! reading nothing meanwhile) and closes a channel past its connection's
+//! or circuit's; a request whose body is already read is answered `Busy`
+//! past any cap, by the gateway, with no node asked. The clearnet's ports
+//! cap nothing ([`Caps::none`]): their clients' addresses are the bound
 //! ([`crate::limits`]).
 
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use vos_api::Kind;
 use vos_api::client::Answer;
 use vos_wire::Encode;
@@ -26,13 +32,13 @@ use vos_wire::ingress::Response;
 
 use crate::limits::{Rate, counted};
 
-/// Proven calls' bodies past a call's limit the gateway's SSH ports hold
-/// at once, from every channel: as many as its HTTP holds.
+/// Proven calls' bodies past a call's limit one uncapped SSH port holds at
+/// once, from every channel: as many as the gateway's HTTP holds.
 pub const PROVEN_BODIES: usize = vos_http::CREDENTIALED_LARGE;
 
-/// The proven bodies' places a gateway's SSH ports share.
-pub fn bodies() -> Arc<tokio::sync::Semaphore> {
-    Arc::new(tokio::sync::Semaphore::new(PROVEN_BODIES))
+/// An uncapped port's own proven bodies' places.
+pub fn bodies() -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(PROVEN_BODIES))
 }
 
 /// What one port's calls may take.
@@ -42,6 +48,8 @@ pub struct PerPort {
     pub proven: usize,
     /// Proven calls in flight from one connection.
     pub proven_per_connection: usize,
+    /// Proven calls in flight from one address or circuit.
+    pub proven_per_circuit: usize,
     /// An agent's calls and proven calls a second from one address or
     /// circuit, on average.
     pub agent_rate: u32,
@@ -54,50 +62,80 @@ impl Default for PerPort {
         Self {
             proven: 16,
             proven_per_connection: 2,
+            proven_per_circuit: 4,
             agent_rate: 4,
             agent_burst: 16,
         }
     }
 }
 
-/// Requests a port's caps answered `Busy`, by the cap.
+/// Requests a port's caps refused, by the cap.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Refused {
     pub proven: u64,
     pub connection: u64,
+    pub circuit: u64,
     pub agent: u64,
+}
+
+/// Counts by key, each at most a limit.
+struct Counted<K>(Mutex<HashMap<K, usize>>);
+
+impl<K: Hash + Eq + Copy> Counted<K> {
+    fn take(&self, key: K, most: usize) -> bool {
+        let mut open = self.0.lock().expect("the counts");
+        let count = open.entry(key).or_insert(0);
+        if *count >= most {
+            if *count == 0 {
+                open.remove(&key);
+            }
+            return false;
+        }
+        *count += 1;
+        true
+    }
+
+    fn give(&self, key: K) {
+        let mut open = self.0.lock().expect("the counts");
+        if let Some(count) = open.get_mut(&key) {
+            *count -= 1;
+            if *count == 0 {
+                open.remove(&key);
+            }
+        }
+    }
 }
 
 /// One port's caps on calls.
 pub struct Caps {
     per: Option<PerPort>,
-    proven: Mutex<usize>,
-    connections: Mutex<HashMap<SocketAddr, usize>>,
+    proven: Arc<Semaphore>,
+    connections: Counted<SocketAddr>,
+    circuits: Counted<IpAddr>,
     agents: Rate<(IpAddr, u32)>,
-    refused: [AtomicU64; 3],
+    refused: [AtomicU64; 4],
 }
 
-/// A proven call's places among its port's and its connection's, given
-/// back when it is answered.
+/// A proven call's places among its port's, its connection's and its
+/// circuit's, given back when it is answered.
 pub struct Held {
     caps: Arc<Caps>,
-    connection: Option<SocketAddr>,
+    peer: Option<SocketAddr>,
+    _place: OwnedSemaphorePermit,
 }
 
 impl Drop for Held {
     fn drop(&mut self) {
-        *self.caps.proven.lock().expect("the proven calls") -= 1;
-        if let Some(connection) = self.connection {
-            let mut open = self.caps.connections.lock().expect("the connections");
-            if let Some(count) = open.get_mut(&connection) {
-                *count -= 1;
-                if *count == 0 {
-                    open.remove(&connection);
-                }
-            }
+        if let Some(peer) = self.peer {
+            self.caps.connections.give(peer);
+            self.caps.circuits.give(counted(peer.ip()));
         }
     }
 }
+
+/// A request past a cap: answered `Busy`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Capped;
 
 /// The answer a cap gives: the kind's `Busy`.
 pub fn busy(kind: Kind) -> Answer {
@@ -118,84 +156,132 @@ impl Caps {
         let rates = per.unwrap_or_default();
         Arc::new(Self {
             per,
-            proven: Mutex::new(0),
-            connections: Mutex::new(HashMap::new()),
+            proven: Arc::new(Semaphore::new(rates.proven)),
+            connections: Counted(Mutex::new(HashMap::new())),
+            circuits: Counted(Mutex::new(HashMap::new())),
             agents: Rate::new(rates.agent_rate, rates.agent_burst),
             refused: Default::default(),
         })
     }
 
-    /// Whether a request of `kind` holding `body` from the connection
-    /// `peer` (its address, or its circuit's) may go on: `Ok` with the
-    /// places it holds while in flight, if it is a proven call; `Err` when
-    /// a cap answers it `Busy`. Only calls and proven calls are capped.
+    /// Whether the port caps proven calls.
+    pub fn caps(&self) -> bool {
+        self.per.is_some()
+    }
+
+    fn refuse(&self, cap: usize) {
+        self.refused[cap].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The connection's and circuit's places for a proven call from
+    /// `peer`, beside the port's `place`; `None` past either.
+    fn own(
+        self: &Arc<Self>,
+        per: PerPort,
+        peer: Option<SocketAddr>,
+        place: OwnedSemaphorePermit,
+    ) -> Option<Held> {
+        if let Some(peer) = peer {
+            if !self.connections.take(peer, per.proven_per_connection) {
+                self.refuse(1);
+                return None;
+            }
+            if !self
+                .circuits
+                .take(counted(peer.ip()), per.proven_per_circuit)
+            {
+                self.connections.give(peer);
+                self.refuse(2);
+                return None;
+            }
+        }
+        Some(Held {
+            caps: Arc::clone(self),
+            peer,
+            _place: place,
+        })
+    }
+
+    /// A proven call's places from `peer` now, if the port, its connection
+    /// and its circuit have one: `Ok(None)` on a port that caps nothing.
+    pub fn proven_now(self: &Arc<Self>, peer: Option<SocketAddr>) -> Result<Option<Held>, Capped> {
+        let Some(per) = self.per else {
+            return Ok(None);
+        };
+        let Ok(place) = Arc::clone(&self.proven).try_acquire_owned() else {
+            self.refuse(0);
+            return Err(Capped);
+        };
+        self.own(per, peer, place).map(Some).ok_or(Capped)
+    }
+
+    /// A proven call's places from `peer`, once the port has one: `Err`
+    /// past its connection's or circuit's, at once.
+    pub async fn proven_wait(
+        self: &Arc<Self>,
+        peer: Option<SocketAddr>,
+    ) -> Result<Option<Held>, Capped> {
+        let Some(per) = self.per else {
+            return Ok(None);
+        };
+        let place = Arc::clone(&self.proven)
+            .acquire_owned()
+            .await
+            .expect("the port's places are never closed");
+        self.own(per, peer, place).map(Some).ok_or(Capped)
+    }
+
+    /// Whether a call or proven call holding `body` from `peer` passes its
+    /// agent's rate; other kinds always do.
+    pub fn agent(&self, kind: Kind, body: &[u8], peer: Option<SocketAddr>) -> bool {
+        if self.per.is_none() || !matches!(kind, Kind::Call | Kind::Credentialed) {
+            return true;
+        }
+        let (Some(peer), Some(agent)) = (peer, body.get(..4)) else {
+            return true;
+        };
+        let agent = u32::from_le_bytes(agent.try_into().expect("four bytes"));
+        let passes = self.agents.take((counted(peer.ip()), agent));
+        if !passes {
+            self.refuse(3);
+        }
+        passes
+    }
+
+    /// Whether a whole request of `kind` holding `body` from `peer` may go
+    /// on: the places it holds while in flight, if it is a proven call;
+    /// `Err` when a cap answers it `Busy`.
     pub fn admit(
         self: &Arc<Self>,
         kind: Kind,
         body: &[u8],
         peer: Option<SocketAddr>,
-    ) -> Result<Option<Held>, ()> {
-        let Some(per) = self
-            .per
-            .filter(|_| matches!(kind, Kind::Call | Kind::Credentialed))
-        else {
-            return Ok(None);
+    ) -> Result<Option<Held>, Capped> {
+        let held = match kind {
+            Kind::Credentialed => self.proven_now(peer)?,
+            _ => None,
         };
-        if let (Some(peer), Some(agent)) = (peer, body.get(..4)) {
-            let agent = u32::from_le_bytes(agent.try_into().expect("four bytes"));
-            if !self.agents.take((counted(peer.ip()), agent)) {
-                return self.refuse(2);
-            }
+        if !self.agent(kind, body, peer) {
+            return Err(Capped);
         }
-        if kind != Kind::Credentialed {
-            return Ok(None);
-        }
-        {
-            let mut proven = self.proven.lock().expect("the proven calls");
-            if *proven >= per.proven {
-                drop(proven);
-                return self.refuse(0);
-            }
-            *proven += 1;
-        }
-        let held = Held {
-            caps: Arc::clone(self),
-            connection: None,
-        };
-        let Some(peer) = peer else {
-            return Ok(Some(held));
-        };
-        let mut open = self.connections.lock().expect("the connections");
-        let count = open.entry(peer).or_insert(0);
-        if *count >= per.proven_per_connection {
-            drop(open);
-            drop(held);
-            return self.refuse(1);
-        }
-        *count += 1;
-        let mut held = held;
-        held.connection = Some(peer);
-        Ok(Some(held))
+        Ok(held)
     }
 
-    fn refuse(&self, cap: usize) -> Result<Option<Held>, ()> {
-        self.refused[cap].fetch_add(1, Ordering::Relaxed);
-        Err(())
-    }
-
-    /// The requests answered `Busy` so far, by the cap.
+    /// The requests refused so far, by the cap.
     pub fn refused(&self) -> Refused {
         let count = |cap: usize| self.refused[cap].load(Ordering::Relaxed);
         Refused {
             proven: count(0),
             connection: count(1),
-            agent: count(2),
+            circuit: count(2),
+            agent: count(3),
         }
     }
 
     /// The proven calls in flight now.
     pub fn proven(&self) -> usize {
-        *self.proven.lock().expect("the proven calls")
+        self.per
+            .map_or(0, |per| per.proven - self.proven.available_permits())
     }
 }
 
@@ -207,47 +293,53 @@ mod tests {
         agent.to_le_bytes().to_vec()
     }
 
-    #[test]
-    fn a_ports_proven_calls_are_capped_whole_by_connection_and_by_agent() {
+    #[tokio::test]
+    async fn a_ports_proven_calls_are_capped_whole_by_connection_circuit_and_agent() {
         let caps = Caps::new(PerPort {
-            proven: 3,
+            proven: 4,
             proven_per_connection: 2,
+            proven_per_circuit: 3,
             agent_rate: 1,
             agent_burst: 4,
         });
-        let one: SocketAddr = "10.0.0.1:1000".parse().unwrap();
-        let two: SocketAddr = "10.0.0.2:1000".parse().unwrap();
-        let three: SocketAddr = "10.0.0.3:1000".parse().unwrap();
+        let at = |text: &str| Some(text.parse::<SocketAddr>().unwrap());
         // Reads pass untouched.
         for _ in 0..100 {
             assert!(
-                caps.admit(Kind::Query, &body(1), Some(one))
+                caps.admit(Kind::Query, &body(1), at("10.0.0.1:1"))
                     .unwrap()
                     .is_none()
             );
         }
-        let first = caps.admit(Kind::Credentialed, &body(1), Some(one)).unwrap();
-        let second = caps.admit(Kind::Credentialed, &body(2), Some(one)).unwrap();
+        let first = caps
+            .admit(Kind::Credentialed, &body(1), at("10.0.0.1:1"))
+            .unwrap();
+        let second = caps
+            .admit(Kind::Credentialed, &body(2), at("10.0.0.1:1"))
+            .unwrap();
         assert!(first.is_some() && second.is_some());
         assert!(
-            caps.admit(Kind::Credentialed, &body(3), Some(one)).is_err(),
+            caps.admit(Kind::Credentialed, &body(3), at("10.0.0.1:1"))
+                .is_err(),
             "the connection's"
         );
-        let third = caps.admit(Kind::Credentialed, &body(1), Some(two)).unwrap();
-        assert!(
-            caps.admit(Kind::Credentialed, &body(1), Some(three))
-                .is_err(),
-            "the port's"
-        );
-        assert_eq!(caps.proven(), 3);
+        let third = caps.proven_wait(at("10.0.0.1:2")).await.unwrap();
+        assert!(caps.proven_now(at("10.0.0.1:3")).is_err(), "the circuit's");
+        let fourth = caps.proven_now(at("10.0.0.2:1")).unwrap();
+        assert!(caps.proven_now(at("10.0.0.3:1")).is_err(), "the port's");
+        assert_eq!(caps.proven(), 4);
+        // A wait for the port's place ends as one is given back.
+        let waiting = {
+            let caps = Arc::clone(&caps);
+            tokio::spawn(async move { caps.proven_wait(at("10.0.0.3:1")).await.is_ok() })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
         drop(first);
-        assert!(
-            caps.admit(Kind::Credentialed, &body(4), Some(three))
-                .is_ok()
-        );
-        drop((second, third));
+        assert!(waiting.await.unwrap());
+        drop((second, third, fourth));
         // An agent's calls from one address: its burst, then `Busy`.
-        let agent = |at: &str| caps.admit(Kind::Call, &body(9), Some(at.parse().unwrap()));
+        let agent = |text: &str| caps.admit(Kind::Call, &body(9), at(text));
         assert!((0..4).all(|_| agent("10.0.0.4:1").is_ok()));
         assert!(
             agent("10.0.0.4:2").is_err(),
@@ -259,6 +351,7 @@ mod tests {
             Refused {
                 proven: 1,
                 connection: 1,
+                circuit: 1,
                 agent: 1
             }
         );
@@ -268,9 +361,9 @@ mod tests {
             (Kind::Call as u16, Response::Busy.encode())
         );
         let none = Caps::none();
-        let one = Some(one);
+        assert!(!none.caps());
         assert!((0..100).all(|_| {
-            none.admit(Kind::Credentialed, &body(1), one)
+            none.admit(Kind::Credentialed, &body(1), at("10.0.0.1:1"))
                 .unwrap()
                 .is_none()
         }));

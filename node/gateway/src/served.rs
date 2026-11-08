@@ -42,22 +42,18 @@ impl Drop for Served {
 
 /// Serve the onion `onion` of the gateway the file `config` describes, in
 /// front of `gateway`, on the runtime: SSH if the file names an SSH port,
-/// its proven bodies among `bodies`, its screens' claims as the app's key
-/// `app`.
+/// its `vos-api` subsystem and no demo screens, whose host service would
+/// answer a connection no stream carries.
 pub async fn onion(
     config: &Config,
     onion: &config::Onion,
     gateway: Arc<Gateway>,
-    bodies: Arc<tokio::sync::Semaphore>,
-    app: Option<[u8; 32]>,
 ) -> Result<Served, String> {
     let circuits = Circuits::new(onion.per_circuit());
     let limits = Limits::new(onion.limits());
     let caps = Caps::new(onion.caps());
     let mut tasks = Vec::new();
-    let ssh = ssh(
-        config, &gateway, &circuits, &limits, &caps, bodies, app, &mut tasks,
-    )?;
+    let ssh = ssh(config, &gateway, &circuits, &limits, &caps, &mut tasks)?;
     let (front, listener) = Onion::new(Arc::clone(&circuits), ssh);
     let http = Http {
         tls: None,
@@ -122,15 +118,12 @@ pub async fn onion(
 
 /// The onion's own SSH port on a loopback listener, if the file names an
 /// SSH port: its address.
-#[allow(clippy::too_many_arguments)]
 fn ssh(
     config: &Config,
     gateway: &Arc<Gateway>,
     circuits: &Arc<Circuits>,
     limits: &Arc<Limits>,
     caps: &Arc<Caps>,
-    bodies: Arc<tokio::sync::Semaphore>,
-    app: Option<[u8; 32]>,
     tasks: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> Result<Option<SocketAddr>, String> {
     #[cfg(feature = "ssh")]
@@ -147,26 +140,23 @@ fn ssh(
             mark: Mark::Onion,
             limits: Arc::clone(limits),
             caps: Arc::clone(caps),
-            bodies,
+            bodies: crate::caps::bodies(),
             peers: Peers::Carried(Arc::clone(circuits)),
         };
-        // The screens' claims through the onion go marked onion.
-        let app = app.map(|seed| {
-            Arc::new(crate::app::AppClient::new(
-                seed,
-                Arc::clone(gateway),
-                Mark::Onion,
-            ))
-        });
-        tasks.push(crate::ssh::serve(
-            config,
-            Arc::clone(gateway),
-            port,
-            app,
-            listener,
-        )?);
+        let path = config
+            .ssh_host_key
+            .clone()
+            .ok_or("an SSH port needs ssh_host_key")?;
+        let host_key = s4_server::load_or_create_host_key(&path)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let server = crate::ssh::server(host_key, Arc::clone(gateway), port, None);
+        tasks.push(tokio::spawn(async move {
+            if let Err(error) = server.serve_on(listener).await {
+                tracing::warn!(%error, "the onion's SSH port ended");
+            }
+        }));
         return Ok(Some(address));
     }
-    let _ = (config, gateway, circuits, limits, caps, bodies, app, tasks);
+    let _ = (config, gateway, circuits, limits, caps, tasks);
     Ok(None)
 }

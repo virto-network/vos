@@ -10,11 +10,13 @@
 //! channel, each frame within [`DEADLINE`] of its first byte.
 //!
 //! A proven call's body, up to a device proof's 1.5 MiB, is read only once
-//! it holds one of the places the gateway's SSH ports share
-//! ([`crate::caps::PROVEN_BODIES`]): past them the channel reads no further until one
-//! is given back, the frame's deadline running from then. Each call and
-//! proven call then passes its port's caps ([`crate::caps`]), or is
-//! answered `Busy` with no node asked.
+//! it holds its places: on a capped port (the onion's) its port's,
+//! connection's and circuit's ([`crate::caps`]), the channel reading
+//! nothing while it waits for the port's and closed past the others; on
+//! an uncapped one a place among the port's own proven bodies
+//! ([`crate::caps::PROVEN_BODIES`]). The body must then arrive within
+//! [`LARGE_DEADLINE`]. Each call and proven call passes its port's caps,
+//! or is answered `Busy` with no node asked.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -38,6 +40,10 @@ pub const SUBSYSTEM: &str = "vos-api";
 pub const IN_FLIGHT: usize = 16;
 /// How long a frame may take to arrive from its first byte.
 pub const DEADLINE: Duration = Duration::from_secs(60);
+/// How long a proven call's large body may take to arrive once it holds
+/// its places: a device proof over an onion circuit at its slowest
+/// measured rate (`light-node.md` §6.3), with room.
+pub const LARGE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Whose channels a port serves, and how it counts them.
 #[derive(Clone)]
@@ -209,6 +215,13 @@ fn large(kind: u16, body: u32) -> bool {
     kind == Kind::Credentialed as u16 && body > Kind::Call.limit()
 }
 
+/// The places a proven call's large body holds from its header on.
+#[derive(Default)]
+struct Placed {
+    held: Option<crate::caps::Held>,
+    body: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
 /// Relay one channel's frames until it ends, or a frame error closes it,
 /// each marked with `port`'s transport, whatever the client marked it.
 /// From `connection`, each frame takes a token of its address's rate (past
@@ -227,14 +240,15 @@ pub async fn relay(
     let slots = Arc::new(Semaphore::new(IN_FLIGHT));
     let mut reader = Reader::requests(Framing::Stream, Requests::Relayed);
     let mut chunk = vec![0u8; 64 << 10];
-    let mut started: Option<Instant> = None;
-    // The frame part read's place among the proven bodies, if it is large.
-    let mut body = None;
+    // When the frame part read must have arrived by.
+    let mut due: Option<Instant> = None;
+    // The places the frame part read holds, if it is a large body.
+    let mut placed: Option<Placed> = None;
     let mut requests = tokio::task::JoinSet::new();
     loop {
-        let read = match started {
-            Some(started) => {
-                let left = (started + DEADLINE).saturating_duration_since(Instant::now());
+        let read = match due {
+            Some(due) => {
+                let left = due.saturating_duration_since(Instant::now());
                 match tokio::time::timeout(left, reading.read(&mut chunk)).await {
                     Ok(read) => read,
                     Err(_) => return,
@@ -263,16 +277,8 @@ pub async fn relay(
                 Event::Frame(request) => {
                     // A whole frame read: the next one's deadline runs from
                     // its own first byte.
-                    started = None;
-                    let body = match body.take() {
-                        None if large(request.kind, request.body.len() as u32) => {
-                            let Ok(place) = Arc::clone(&port.bodies).acquire_owned().await else {
-                                return;
-                            };
-                            Some(place)
-                        }
-                        held => held,
-                    };
+                    due = None;
+                    let placed = placed.take().unwrap_or_default();
                     let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
                         return;
                     };
@@ -290,15 +296,23 @@ pub async fn relay(
                         }
                     }
                     let kind = Kind::from_u16(request.kind).expect("the reader's kinds");
-                    let held = match port.caps.admit(kind, &request.body, connection) {
-                        Ok(held) => held,
-                        Err(()) => {
-                            let (answered, answer) = busy(kind);
-                            let bytes = frame(Framing::Stream, answered, request.id, &answer);
-                            let _ = writer.lock().await.write_all(&bytes).await;
-                            continue;
-                        }
+                    let admitted = match placed.held {
+                        // Its places taken at its header: its agent's rate
+                        // is left.
+                        Some(held) => port
+                            .caps
+                            .agent(kind, &request.body, connection)
+                            .then_some(Some(held))
+                            .ok_or(crate::caps::Capped),
+                        None => port.caps.admit(kind, &request.body, connection),
                     };
+                    let Ok(held) = admitted else {
+                        let (answered, answer) = busy(kind);
+                        let bytes = frame(Framing::Stream, answered, request.id, &answer);
+                        let _ = writer.lock().await.write_all(&bytes).await;
+                        continue;
+                    };
+                    let body = placed.body;
                     let (gateway, writer) = (Arc::clone(&gateway), Arc::clone(&writer));
                     requests.spawn(async move {
                         let (_place, _body, _held) = (place, body, held);
@@ -320,24 +334,46 @@ pub async fn relay(
             }
         }
         while requests.try_join_next().is_some() {}
-        started = match (reader.pending(), started) {
-            (false, _) => None,
-            (true, Some(started)) => Some(started),
-            (true, None) => Some(Instant::now()),
-        };
-        // A large body is read only once it holds a place; its deadline
+        if !reader.pending() {
+            due = None;
+        } else if due.is_none() {
+            due = Some(Instant::now() + DEADLINE);
+        }
+        // A large body is read only once it holds its places; its deadline
         // runs from then, as the wait is the gateway's.
-        if body.is_none()
+        if placed.is_none()
             && let Some(header) = reader.header()
             && header
                 .body(Framing::Stream)
                 .is_some_and(|length| large(header.kind, length))
         {
-            let Ok(place) = Arc::clone(&port.bodies).acquire_owned().await else {
+            let taken = if port.caps.caps() {
+                match tokio::time::timeout(DEADLINE, port.caps.proven_wait(connection)).await {
+                    Ok(Ok(held)) => Some(Placed { held, body: None }),
+                    _ => None,
+                }
+            } else {
+                Arc::clone(&port.bodies)
+                    .acquire_owned()
+                    .await
+                    .ok()
+                    .map(|body| Placed {
+                        held: None,
+                        body: Some(body),
+                    })
+            };
+            let Some(taken) = taken else {
+                // Past its connection's or circuit's proven calls: the
+                // body is not read, so the channel's framing ends here.
+                let (answered, answer) = busy(Kind::Credentialed);
+                let bytes = frame(Framing::Stream, answered, header.id, &answer);
+                let mut writer = writer.lock().await;
+                let _ = writer.write_all(&bytes).await;
+                let _ = writer.shutdown().await;
                 return;
             };
-            body = Some(place);
-            started = Some(Instant::now());
+            placed = Some(taken);
+            due = Some(Instant::now() + LARGE_DEADLINE);
         }
     }
 }

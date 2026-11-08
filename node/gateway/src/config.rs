@@ -112,9 +112,11 @@ pub struct Onion {
     pub circuit_connections: Option<usize>,
     pub circuit_rate: Option<u32>,
     pub circuit_burst: Option<u32>,
-    /// Proven calls in flight through the onion, and from one connection.
+    /// Proven calls in flight through the onion, from one connection, and
+    /// from one circuit.
     pub proven: Option<usize>,
     pub proven_per_connection: Option<usize>,
+    pub proven_per_circuit: Option<usize>,
     /// An agent's calls a second from one circuit, and their burst.
     pub agent_rate: Option<u32>,
     pub agent_burst: Option<u32>,
@@ -159,6 +161,9 @@ impl Onion {
             proven_per_connection: self
                 .proven_per_connection
                 .unwrap_or(defaults.proven_per_connection),
+            proven_per_circuit: self
+                .proven_per_circuit
+                .unwrap_or(defaults.proven_per_circuit),
             agent_rate: self.agent_rate.unwrap_or(defaults.agent_rate),
             agent_burst: self.agent_burst.unwrap_or(defaults.agent_burst),
         }
