@@ -6,12 +6,18 @@
 //! a write superseded it ([`vos_wire::credentials::Ring::accepts`]).
 //!
 //! A library actor, installed in the agent whose methods it guards. Its
-//! rows are plain: `slots`, `nodes`, `free`, `invites` and `ring`
-//! ([`vos_wire::credentials::tables`]). Each hash is one `0x402` call,
+//! rows are plain: `slots`, `nodes`, `free`, `invites`, `ring` and
+//! `changes` ([`vos_wire::credentials::tables`]). Each hash is one `0x402` call,
 //! served natively by a VOS node and in software on JAM, so the tree is a
 //! function of its writes on every host: an enrollment costs 33, the leaf
 //! and 32 levels, a revocation 32, and an enrollment of many shares the
 //! nodes they have in common.
+//!
+//! **The tree's feed** (`light-node.md` §6.7): every write of the tree is
+//! kept, in order, as a [`Change`]: the leaves it set and the root it left,
+//! with that root's place in the ring. `feed(from)` serves them a page at a
+//! time to any caller, so a device keeps the whole tree and computes its
+//! own path, never asking for it: no query names a member.
 //!
 //! Every write but `claim`, `claim_open` and a person's device methods is
 //! under the role `registrar`, and none but the onion set's is taken
@@ -67,8 +73,9 @@ use alloc::collections::BTreeMap;
 use vos_sdk::p2::{self, InPlace, Secret, Tag, TagHash};
 use vos_sdk::prelude::*;
 use vos_wire::credentials::{
-    self as tree, CredentialError, DEPTH, Digest, EMPTY, ENROLL_MANY, MAX_DEVICES, MAX_DIFFICULTY,
-    MAX_ONIONS, Onion, Open, Path, Ring, RootEntry, Siblings, Words, tables::RING_KEY,
+    self as tree, Change, CredentialError, DEPTH, Digest, EMPTY, ENROLL_MANY, FEED_BYTES, Feed,
+    MAX_DEVICES, MAX_DIFFICULTY, MAX_ONIONS, Onion, Open, Path, Ring, RootEntry, Siblings, Words,
+    tables::RING_KEY,
 };
 
 /// The open claim's terms and the current period's count.
@@ -183,6 +190,9 @@ pub struct Credentials {
     devices: Table<Digest, u32>,
     people: Table<u8, u32>,
     onions: Table<u8, Vec<Onion>>,
+    /// The tree's writes, the feed's length.
+    changed: u64,
+    changes: Table<u64, Change, Ordered>,
 }
 
 #[messages]
@@ -204,6 +214,8 @@ impl Credentials {
             devices: Table::default(),
             people: Table::default(),
             onions: Table::default(),
+            changed: 0,
+            changes: Table::default(),
         }
     }
 
@@ -552,6 +564,27 @@ impl Credentials {
             })
     }
 
+    /// The tree's feed from its `from`th change: as many changes as
+    /// [`FEED_BYTES`] holds, at least one when there is one, and the
+    /// feed's length.
+    #[msg(gas = 100_000_000)]
+    pub async fn feed(&self, from: u64) -> Feed {
+        let mut changes = Vec::new();
+        let mut bytes = 0;
+        for (_, change) in self.changes.iter(from.checked_sub(1).as_ref()) {
+            bytes += change.encoded_len();
+            if !changes.is_empty() && bytes > FEED_BYTES {
+                break;
+            }
+            changes.push(change);
+        }
+        Feed {
+            from,
+            changes,
+            length: self.changed,
+        }
+    }
+
     /// Set the space's onion set, its gateways' onions, at most
     /// [`MAX_ONIONS`], each once: a device pins it at enrollment and
     /// refreshes it through any onion of it.
@@ -744,8 +777,13 @@ impl Credentials {
     }
 
     /// Set the leaves at their slots, every node above them recomputed once,
-    /// and the new root recorded in the ring at `time`.
+    /// the new root recorded in the ring at `time`, and the write kept in
+    /// the feed.
     fn write(&mut self, time: u64, leaves: BTreeMap<u32, Words>) {
+        let set = leaves
+            .iter()
+            .map(|(&slot, leaf)| (slot, tree::digest(leaf)))
+            .collect();
         let mut changed = leaves;
         for level in 0..=DEPTH {
             for (&index, node) in &changed {
@@ -777,9 +815,15 @@ impl Credentials {
             }
             changed = parents;
         }
-        let root = changed[&0];
+        let root = RootEntry {
+            root: tree::digest(&changed[&0]),
+            since: time,
+        };
         let mut ring = self.ring.get(&RING_KEY).unwrap_or_default();
-        ring.record(tree::digest(&root), time);
+        ring.record(root.root, time);
         self.ring.insert(&RING_KEY, &ring);
+        self.changes
+            .insert(&self.changed, &Change { leaves: set, root });
+        self.changed += 1;
     }
 }

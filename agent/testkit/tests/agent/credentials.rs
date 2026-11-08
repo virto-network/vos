@@ -1,7 +1,7 @@
 //! The credential actor in the default agent, on a VOS host and on the
 //! JAM-only host: its tree against a reference built from scratch, its
-//! slots, its paths, its ring and its refusals; and the Poseidon2 call it
-//! makes, as an actor's precompile.
+//! slots, its paths, its ring, its feed and its refusals; and the
+//! Poseidon2 call it makes, as an actor's precompile.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -10,7 +10,10 @@ use vos_testkit::programs::{credentials, credentials_elf, method};
 use vos_wire::abi::Failure;
 use vos_wire::abi::cap::Target;
 use vos_wire::batch::{Admin, Input};
-use vos_wire::credentials::{CredentialError, DEPTH, Digest, MAX_ONIONS, Onion, Path, RootEntry};
+use vos_wire::credentials::{
+    Change, CredentialError, DEPTH, Digest, EMPTY, FEED_BYTES, Feed, MAX_ONIONS, Onion, Path,
+    RootEntry,
+};
 use vos_wire::ids::{InstanceId, Principal};
 use vos_wire::ingress::Grant;
 use vos_wire::result::{Outcome, Step, WorkResult};
@@ -114,6 +117,27 @@ impl Reference {
             levels.push(level.clone());
         }
         levels
+    }
+
+    /// The root of a tree holding `leaves`, by slot, from scratch.
+    fn root_of_leaves(leaves: &BTreeMap<u32, Digest>) -> Digest {
+        let empty = Self::empty();
+        let mut level: BTreeMap<u32, Words> = leaves
+            .iter()
+            .map(|(&slot, leaf)| (slot, words(leaf)))
+            .filter(|(_, leaf)| *leaf != empty[0])
+            .collect();
+        for below in &empty[..DEPTH] {
+            let parents: BTreeSet<u32> = level.keys().map(|index| index >> 1).collect();
+            level = parents
+                .into_iter()
+                .map(|parent| {
+                    let child = |index: u32| level.get(&index).copied().unwrap_or(*below);
+                    (parent, compress(&child(2 * parent), &child(2 * parent + 1)))
+                })
+                .collect();
+        }
+        digest(level.get(&0).unwrap_or(&empty[DEPTH]))
     }
 
     fn root(&self) -> Digest {
@@ -356,6 +380,114 @@ fn the_tree_equals_a_reference_built_from_scratch_on_vos_and_jam() {
         }
     }
     assert!(reference.slots.len() > 8 && reference.next as usize > reference.slots.len());
+}
+
+impl Actor {
+    /// The whole feed, page by page from `from`, and its length.
+    fn feed_from(&self, mut from: u64) -> (Vec<Change>, u64) {
+        let mut changes = Vec::new();
+        loop {
+            let page: Feed = self.query("feed", from);
+            assert_eq!(page.from, from);
+            let bytes: usize = page.changes.iter().map(Change::encoded_len).sum();
+            assert!(page.changes.len() == 1 || bytes <= FEED_BYTES);
+            from += page.changes.len() as u64;
+            changes.extend(page.changes);
+            if from >= page.length {
+                assert_eq!(from, page.length);
+                return (changes, page.length);
+            }
+            assert!(
+                from < page.length,
+                "a page short of the feed holds a change"
+            );
+        }
+    }
+}
+
+/// The feed replayed onto an empty tree: each change's root the
+/// reference's, rebuilt from scratch from the leaves set so far; the last
+/// the actor's root.
+fn replay(changes: &[Change]) -> BTreeMap<u32, Digest> {
+    let mut leaves = BTreeMap::new();
+    let mut since = 0;
+    for change in changes {
+        assert!(!change.leaves.is_empty());
+        assert!(change.leaves.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        for (slot, leaf) in &change.leaves {
+            leaves.insert(*slot, *leaf);
+        }
+        assert_eq!(change.root.root, Reference::root_of_leaves(&leaves));
+        assert!(change.root.since >= since);
+        since = change.root.since;
+    }
+    leaves
+}
+
+/// The feed, at every batch of random enrollments, many-member enrollments
+/// and revocations: read page by page from the start, it replays to the
+/// actor's root and to each change's own, and a revocation sets the empty
+/// leaf; a feed read from a later place gives the same changes; its length
+/// counts the tree's writes. The page bound: as many changes as
+/// `FEED_BYTES` holds, the feed past its length empty.
+#[test]
+fn the_feed_replays_to_the_tree() {
+    let members: Vec<Digest> = (1..=4).map(member).collect();
+    let mut actor = founded(&members);
+    let (changes, length) = actor.feed_from(0);
+    assert_eq!(length, 4);
+    let leaves = replay(&changes);
+    assert_eq!(leaves.len(), 4);
+    assert!(changes.iter().all(|change| change.root.since == 1));
+    let revoke = actor.input(ALICE, "revoke", members[2]);
+    let many = actor.input(
+        ALICE,
+        "enroll_many",
+        (10..266).map(member).collect::<Vec<_>>(),
+    );
+    let steps = actor.node.batch(2, vec![revoke, many]).steps;
+    assert_eq!(answer::<()>(&steps[0]), Ok(()));
+    let (changes, length) = actor.feed_from(0);
+    assert_eq!(length, 6);
+    assert_eq!(
+        changes[4].leaves,
+        vec![(2, vos_wire::credentials::digest(&EMPTY[0]))]
+    );
+    assert_eq!(changes[5].leaves.len(), 256);
+    replay(&changes);
+    assert_eq!(
+        changes.last().unwrap().root,
+        actor.query::<_, RootEntry>("root", ())
+    );
+    assert_eq!(actor.feed_from(4).0, changes[4..]);
+
+    // Single enrollments past a page: the page stops at the bound.
+    for time in 3..13u64 {
+        let inputs = (0..80)
+            .map(|i| actor.input(ALICE, "enroll", member(1_000 * time + i)))
+            .collect();
+        actor.node.batch(time, inputs);
+    }
+    let first: Feed = actor.query("feed", 6u64);
+    let bytes: usize = first.changes.iter().map(Change::encoded_len).sum();
+    assert_eq!(
+        first.changes[0].encoded_len(),
+        first.changes[0].encode().len()
+    );
+    assert!(bytes <= FEED_BYTES);
+    assert!(bytes + first.changes[0].encoded_len() > FEED_BYTES);
+    assert_eq!(first.length, 806);
+    let (changes, length) = actor.feed_from(0);
+    assert_eq!(length, 806);
+    replay(&changes);
+    assert_eq!(
+        changes.last().unwrap().root,
+        actor.query::<_, RootEntry>("root", ())
+    );
+    for from in [806u64, 900] {
+        let past: Feed = actor.query("feed", from);
+        assert_eq!((past.changes.len(), past.length), (0, 806));
+    }
 }
 
 /// A step's result: its reply, or the actor's error.

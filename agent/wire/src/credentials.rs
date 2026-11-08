@@ -47,6 +47,12 @@ pub const MAX_DEVICES: u8 = 16;
 /// The most onions the space's set holds: one a gateway.
 pub const MAX_ONIONS: usize = 16;
 
+/// The most bytes one page of the tree's feed holds, encoded: under a
+/// query's reply cap ([`crate::abi::cap::REPLY`]) with room for its framing.
+/// A page holds at least one change, and a change holds at most
+/// [`ENROLL_MANY`] leaves, about 9 KiB.
+pub const FEED_BYTES: usize = 48 << 10;
+
 /// The role every write but the claims and a person's device methods is
 /// under.
 pub const REGISTRAR: &str = "registrar";
@@ -87,6 +93,9 @@ pub mod tables {
     /// One row, under [`RING_KEY`]: the space's onion set, its gateways'
     /// [`Onion`](super::Onion)s.
     pub const ONIONS: &str = "onions";
+    /// The tree's feed: a write's place in it, eight big-endian bytes, in
+    /// key order → its [`Change`](super::Change).
+    pub const CHANGES: &str = "changes";
 }
 
 /// The tags' names (`proving.md` §8): `T(name)` is the block
@@ -594,6 +603,36 @@ impl Path {
 pub struct RootEntry {
     pub root: Digest,
     pub since: u64,
+}
+
+/// One write of the tree, as its feed carries it: the leaves it set, each
+/// at its slot (the empty leaf `E_0` for a revocation), in slot order, and
+/// the root it left with the batch time that root became the tree's, the
+/// entry it left in the ring. Two writes of one batch share that time: the
+/// ring holds the second's root alone.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Change {
+    pub leaves: Vec<(u32, Digest)>,
+    pub root: RootEntry,
+}
+
+impl Change {
+    /// Its encoding's length: the leaves' count, each leaf's slot and
+    /// digest, and the root's entry.
+    pub fn encoded_len(&self) -> usize {
+        4 + 36 * self.leaves.len() + 40
+    }
+}
+
+/// A page of the tree's feed (`feed(from)`): the changes from the `from`th
+/// on, as many as [`FEED_BYTES`] holds, and the feed's length, the changes
+/// the tree has had. Its changes from the first, applied in order to the
+/// empty tree, give each change's root.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Feed {
+    pub from: u64,
+    pub changes: Vec<Change>,
+    pub length: u64,
 }
 
 /// Why a root is not accepted: in no entry of the ring, or superseded more
