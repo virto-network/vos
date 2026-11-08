@@ -12,9 +12,10 @@ use ed25519_dalek::{Signer, SigningKey};
 use scale::{Decode, Encode};
 use vos_api::Kind;
 use vos_wire::credentials::{Path, RootEntry};
+use vos_wire::ids::Session;
 use vos_wire::ids::{AgentId, InstanceId, MethodId};
 use vos_wire::ingress::{
-    self, Consistency, CredentialRefusal, Credentialed, QueryCall, Rejection, Response,
+    self, AgentInfo, Consistency, CredentialRefusal, Credentialed, QueryCall, Rejection, Response,
     query_message,
 };
 use vos_wire::result::Outcome;
@@ -48,6 +49,87 @@ pub fn time_request() -> Vec<u8> {
 /// The node's time in milliseconds, from a `Time` answer.
 pub fn time_answer(body: &[u8]) -> Result<u64, DeviceError> {
     u64::decode_exact(body).ok_or(DeviceError::Decode)
+}
+
+/// `agent`'s record: an `AgentInfo` request, which a device asks of a
+/// pooled agent before it seals its kit to that agent's identity.
+pub fn agent_request(agent: u32) -> Vec<u8> {
+    request(Kind::AgentInfo as u16, AgentId(agent))
+}
+
+/// The agent's identity from an `AgentInfo` answer, the hash of its
+/// creation record, as every node computes it; `None` for an agent the
+/// node does not know.
+pub fn agent_answer(body: &[u8]) -> Result<Option<[u8; 32]>, DeviceError> {
+    let info = Option::<AgentInfo>::decode_exact(body).ok_or(DeviceError::Decode)?;
+    Ok(info.map(|info| vos_pvm::precompile::blake2b_256(&info.record.encode())))
+}
+
+/// A call of `method` with `arguments` at `instance` of `agent`, whose
+/// identity is `identity`: the first of a session of its own, at the
+/// node's time `now`, signed by a key drawn for it alone, so it links to
+/// no other call (an open claim's). [`DeviceError::Prove`] if the
+/// operating system has no randomness to give.
+pub fn call_request(
+    agent: u32,
+    identity: &[u8; 32],
+    instance: u32,
+    method: &str,
+    arguments: Vec<u8>,
+    now: u64,
+) -> Result<Vec<u8>, DeviceError> {
+    let mut seed = [0u8; 32];
+    let mut name = [0u8; 16];
+    getrandom::getrandom(&mut seed).map_err(|_| DeviceError::Prove)?;
+    getrandom::getrandom(&mut name).map_err(|_| DeviceError::Prove)?;
+    let key = SigningKey::from_bytes(&seed);
+    seed.zeroize();
+    let session = Session {
+        key: key.verifying_key().to_bytes(),
+        name,
+        t0: now,
+    };
+    let (instance, method) = (InstanceId(instance), MethodId(crate::method_id(method)));
+    let message = ingress::call_message(identity, &session, 1, instance, method, &arguments);
+    let call = ingress::Call {
+        session,
+        sequence: 1,
+        instance,
+        method,
+        arguments,
+        signature: key.sign(&message).to_bytes(),
+    };
+    Ok(request(Kind::Call as u16, (AgentId(agent), call)))
+}
+
+/// A call's or a query's outcome, from its answer: `Ran`'s; ingress's
+/// refusal, [`DeviceError::Rejected`] with it; any other,
+/// [`DeviceError::Decode`].
+pub fn outcome(body: &[u8]) -> Result<Outcome, DeviceError> {
+    match Response::decode_exact(body) {
+        Some(Response::Ran { outcome, .. }) => Ok(outcome),
+        Some(Response::Rejected(rejection)) => Err(DeviceError::Rejected(rejection)),
+        _ => Err(DeviceError::Decode),
+    }
+}
+
+/// A query of `method` with `arguments` at `instance` of `agent`, as
+/// [`query`]: the open claim's terms (`opening`), `Homes`' lowest pooled
+/// agent (`pooled`) and its terms (`configured`).
+pub fn query_request(
+    agent: u32,
+    identity: &[u8; 32],
+    instance: u32,
+    method: &str,
+    arguments: Vec<u8>,
+    not_after: u64,
+) -> Result<Vec<u8>, DeviceError> {
+    query(agent, identity, instance, method, arguments, not_after)
+}
+
+/// A query's reply, decoded as `T`, from its answer.
+pub fn query_answer<T: Decode>(body: &[u8]) -> Result<T, DeviceError> {
+    T::decode_exact(&reply(body)?).ok_or(DeviceError::Decode)
 }
 
 /// A query of `method` with `arguments` at `instance` of `agent`, whose

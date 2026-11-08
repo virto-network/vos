@@ -794,6 +794,11 @@ impl Pairing {
     }
 }
 
+/// Whether `store` has a device group.
+pub(crate) fn grouped(store: &Store) -> Result<bool, StoreError> {
+    Ok(store.group_row(STATE)?.is_some())
+}
+
 /// A device's leaf credential at its add: its sync key and its admin key.
 pub fn credential(device: &NewDevice) -> Vec<u8> {
     [&device.sync[..], &device.admin[..]].concat()
@@ -1134,6 +1139,12 @@ impl DeviceGroup {
 
     pub fn archive(&self) -> &Archive {
         &self.archive
+    }
+
+    /// The agent's policy, as the log configured it: its delays, windows
+    /// and quotas (a pairing's items are its inbox items' size).
+    pub fn policy(&self) -> Policy {
+        self.state.policy
     }
 
     /// The personal agent its commits go through.
