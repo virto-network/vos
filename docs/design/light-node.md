@@ -2604,6 +2604,27 @@ built (`open.md`, "The registry and the root space"; §8, D4). A gateway
 could serve a forged set, as it could forge any answer it relays
 (`open.md`, "Node-signed roots").
 
+**Built** [built, `node-api.md` §6, `docs/operations.md`]: the
+gateway's `tor` feature hosts the onion in process on arti-client 0.47.0
+(pinned exactly), full vanguards on, its key from the gateway's own file
+inserted once into arti's keystore and checked against it at each start,
+arti's service-side PoW behind the `tor-pow` feature and the file's
+`pow`, off by default. Port 80 is the gateway's own HTTP server, port 22
+its own SSH port, both marking onion; any other port is refused `DONE`.
+s4-server serves a listener, not a stream, so each SSH stream is carried
+to the onion's SSH port on a loopback listener and the carrier's
+loopback port names it: the port counts the stream's circuit, and serves
+no channel to a loopback connection no stream carries. The same ports
+serve a C tor beside the gateway, the documented fallback, whose
+`HiddenServiceExportCircuitID haproxy` names each stream's circuit. The
+`vos-api` relay set holds `Call` and `Credentialed`. A proven call's
+body is read only once it holds one of the 64 places the SSH ports share.
+The registrar serves the onion set (the credential actor's `set_onions`
+and `onions`, each onion's key and its SSH host key). A gateway given its
+space file starts only if every node of it is an upstream. A space's
+nodes may ask the onion's mark of its proven calls, or of every request
+(`onion = "anonymous" | "all"`, `node-api.md` §3).
+
 ### 6.2 The client embedding arti
 
 - **One `TorClient` a process,** created in the light node on the
@@ -2867,6 +2888,19 @@ place:
   (its size is bounded), and one key shared by every member is as good
   as public once one member leaks it. A space small enough for per-member
   keys may turn it on later.
+
+**The caps as built** [built, `node-api.md` §6]: each circuit counts as
+an address of its own (4 connections, 20 requests a second, a burst of
+40); 8 streams at once a circuit, 1,024 circuits at once, a circuit with
+no stream let go after 60 s; 16 proven calls in flight through the
+onion and 2 from one connection; an agent's calls and proven calls from
+one circuit 4 a second, a burst of 16. Past a cap the gateway answers
+`Busy` and asks no node. A flood of junk proven calls the size of a device
+proof, from four connections through a port capped this way, held at most
+the port's proven calls behind it and answered the rest `Busy`, while a
+member's queries and a session's call on another connection were answered
+(the gateway's test 22, in process, no network). The flood through the
+live Tor network is not measured yet: M5 measures it.
 
 ### 6.7 What Tor fixes, and what it does not
 

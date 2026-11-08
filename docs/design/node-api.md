@@ -59,16 +59,16 @@ run. Everything here is built.
 - **The transport mark** [decided, `light-node.md` §3.3, E17, E22]: the
   transport a gateway received a request on, which it writes on every
   frame it relays (`vos_api::Mark`): 1, clearnet, from its HTTP and SSH
-  ports; 2, onion, from its onion service's (`light-node.md` §6.1; the
-  gateway's `Http.mark` and the SSH relay's mark, every port it opens
-  today clearnet, the onion port with the onion service). A
+  ports; 2, onion, from its onion service's own HTTP server and SSH port
+  (`light-node.md` §6.1, §6 below). A
   relay never passes a client's mark on: the `vos-api` subsystem relays
   each frame anew under its port's mark. Every other sender (a local
   tool on the socket, a driver, a test, the node's own client) sends 0,
   none, and the node takes none as clearnet. The node trusts the mark as
   it trusts any API client (the socket's file mode, a QUIC key in its
   `gateways`): it is the gateway's word, read only for an agent that asks
-  to be onion-only (§3), defence in depth against a client's bug and
+  to be onion-only and for a space that asks it of its proven calls or of
+  every request (§3), defence in depth against a client's bug and
   against strangers on the clearnet. The enforcement of "anonymous calls
   never over the clearnet" is the client's routing, which has no
   clearnet route for them (`light-node.md` §6.5).
@@ -191,8 +191,8 @@ budget, past which it is answered `Busy`.
   | `Time` | any | relayed | yes |
   | `Query` | any; its key signs it | relayed | yes: a read |
   | `Workflow` | any; the workflow's owner signs it | no | yes: a read |
-  | `Call` | any; its session's key signs it | no | yes: the session's sequence dedupes |
-  | `Credentialed` | any; its proof is its authority | no (the demo's device sends it over the gateway's s4 facility) | yes: a repeat is answered `Replayed`, not the first outcome (a replica's own resend of one it forwards is answered the run its entry's origin names it in, unless a snapshot brought that run; identity-and-authority §5) |
+  | `Call` | any; its session's key signs it | relayed, under the port's caps (§6) | yes: the session's sequence dedupes |
+  | `Credentialed` | any; its proof is its authority | relayed, its body read only once it holds a place, under the port's caps (§6) | yes: a repeat is answered `Replayed`, not the first outcome (a replica's own resend of one it forwards is answered the run its entry's origin names it in, unless a snapshot brought that run; identity-and-authority §5) |
   | `Stats`, `Status` | an operator key, signed (§4) | no | yes: reads, signed with an expiry, no nonce recorded |
   | the other `0x02xx` | an operator key, signed (§4) | no | no: each nonce once |
 
@@ -277,6 +277,14 @@ budget, past which it is answered `Busy`.
 
   Apply does not check either: the rows are ingress's filter, so a call
   forwarded between replicas was checked at the replica that took it.
+- **A space's own** [decided, `light-node.md` §6.5, E22]: the node's
+  configuration `onion` (`vos_node::OnionPolicy`, alike on every node of
+  a space), read from the frame's kind and mark before its body is
+  decoded: `"any"` by default; `"anonymous"`, a `Credentialed` not marked
+  onion refused `Admission(OnionOnly)`, key-signed requests taken over the
+  clearnet; `"all"`, an onion-only space, every kind that reads an agent
+  refused off the onion as an onion-only agent's is (`Schema` and
+  `Devices` answered `None`), `AgentInfo` and the node's kinds open.
 - **`Rejection` variants** (`vos_wire::ingress`): index 9 is
   `Credential(CredentialRefusal)` (`identity-and-authority.md` §5);
   index 10 is `Operator(OperatorRefusal)`:
@@ -532,17 +540,31 @@ could replay, and a relay keeps nothing it can reuse.
 - **The SSH port** (the `ssh` feature, off by default) hosts s4's screens
   and the **`vos-api` subsystem** [decided]: under any key, a fresh
   ephemeral one expected, the gateway's authenticator taking any public
-  key; a byte-stream channel of frames (with ids). It gives a device
-  paths, roots and the node's time on a connection apart from the one
-  that carries its proofs, under a key that links to nothing. The gateway
-  reads each header, answers `NotRelayed` for any kind outside the relay
-  set (`NodeKey`, `Time`, `AgentInfo`, `Schema`, `Devices`, `Query`) without reading
-  its body or sending anything to a node, checks the limit, then relays
-  the frame to a node under a fresh upstream id and its port's mark (§2),
-  and maps the answer back.
-  The relay set is the public, unsigned or self-signed reads: an
-  anonymous relay lying about `AgentInfo` costs a `BadSignature` and
-  nothing more. At most 16 requests in flight a channel, past which it
+  key; a byte-stream channel of frames (with ids). The light node speaks
+  the node API through it, over the onion (`light-node.md` §6.1, E23),
+  one connection an isolation group under a key that links to nothing.
+  The gateway reads each header, answers `NotRelayed` for any kind
+  outside the relay set (`NodeKey`, `Time`, `AgentInfo`, `Schema`,
+  `Devices`, `Call`, `Query`, `Credentialed`) without reading its body or
+  sending anything to a node, checks the limit, then relays the frame to
+  a node under a fresh upstream id and its port's mark (§2), with the
+  leader-aware routing above, and maps the answer back.
+  The relay set is the public, unsigned or self-signed reads and the
+  requests whose authority they carry, a session's signature or a proof:
+  a relay lying about `AgentInfo` costs a `BadSignature`, one that alters
+  a call or a proof a `BadSignature` or a refused proof, and nothing more.
+  Workflow reads and the operator kinds stay off it.
+  A `Credentialed` body past a call's limit, up to a device proof's
+  1.5 MiB, is read only once it holds one of the 64 places the gateway's
+  SSH ports share (`caps::PROVEN_BODIES`, as many as its HTTP holds):
+  past them the channel reads no further until one is given back, the
+  frame's deadline running from then. Each `Call` and `Credentialed` then
+  passes its port's caps (`caps::Caps`) or is answered `Busy` by the
+  gateway with no node asked: the proven calls in flight through the port
+  (16 on the onion), and from one connection (2), and an agent's calls
+  and proven calls from one address or circuit (4 a second, a burst of
+  16). The clearnet's ports cap no calls: their clients' addresses bound
+  them. At most 16 requests in flight a channel, past which it
   stops reading; each frame within 60 s of its first byte. A channel
   holds a place among its address's connections, as an HTTP connection
   does; each frame takes a token of its address's rate (past it, the
@@ -562,6 +584,33 @@ could replay, and a relay keeps nothing it can reuse.
   feature; s4's crates ask a newer stable Rust than the workspace's
   nightly names, which builds them with `--ignore-rust-version`
   (`just test-gateway-ssh`).
+- **The onion service** [decided, `light-node.md` §6.1, §6.6, E23]:
+  `[onion]` in the gateway's file. Its streams arrive on rendezvous
+  circuits for virtual port 22 or 80, anything else refused `DONE`. Port
+  80 is the gateway's own HTTP server, plain inside the onion, marking
+  onion; port 22, with an SSH port, the onion's own SSH port on a
+  loopback listener marking onion (s4-server serves a listener, not a
+  stream: each stream is carried to it, the carrier's loopback port naming
+  the stream, and a loopback connection no stream carries is served no
+  channel). A circuit counts as an address of its own,
+  `fd76:6f73:<circuit>::/64`, each stream a port of it: 4 connections at
+  once, 20 requests a second with a burst of 40; 8 streams at once a
+  circuit (arti's `max_concurrent_streams_per_circuit` too), 1,024
+  circuits at once, a circuit holding no stream for 60 s let go. The
+  streams come from **arti in process** (the `tor` feature: arti-client
+  0.47.0 pinned exactly, one `TorClient` with full vanguards, the
+  onion's key from the gateway's `key` file inserted once into arti's
+  keystore and checked against it at each start, introduction rate limits
+  if the file names them, and arti's service-side PoW behind the
+  `tor-pow` feature and `pow = true`, off by default since no release has
+  declared it ready), or from **a C tor beside the gateway**
+  (`sidecar_ssh`, `sidecar_http`: loopback listeners its
+  `HiddenServicePort`s forward to, each connection naming its circuit in
+  the PROXY line `HiddenServiceExportCircuitID haproxy` writes;
+  `docs/operations.md`).
+- **Every node an upstream:** with `space`, the space file of its nodes,
+  the gateway starts only if every node of it is among its `nodes`, as a
+  home's gateways list every node (`light-node.md` §3.3).
 - **No authority** [decided]: the node verifies every signature and
   proof and runs every ingress check. A compromised gateway can drop,
   delay or reorder requests and read what it relays; it can forge
@@ -624,6 +673,9 @@ could replay, and a relay keeps nothing it can reuse.
 | 18 | an agent's admission: an unknown key's 10^4 session attempts, each a session of its own with no valid signature, all `UnknownKey`, the node's verifications and the agent's applied index unchanged; a key admitted by another agent's message refused until applied, then its session created; a key revoked keeping its session and creating no other; every kind that reads an onion-only agent refused unmarked and clearnet, over the socket and QUIC, before any verification; the installs that would leave no declaring actor failing `Admission` | node |
 | 19 | the mark on the relay path: an HTTP port marking clearnet and one marking onion in front of the onion-only agent, the clearnet's call `OnionOnly`, the onion's `UnknownKey` then run; the `vos-api` subsystem relaying an onion-marked query under its clearnet port's mark (`OnionOnly`) and under an onion port's (answered) | gateway |
 | 20 | the codec: the mark pinned, each read back, an unknown one `UnknownMark` from the header; the fuzz target's frames written again being the bytes read | `vos-api` |
+| 21 | a space's own ask of the mark: proven calls refused unmarked and clearnet before any proof is read while key-signed queries are answered; an onion-only space refusing every read of an agent off the onion, an agent's record open | node |
+| 22 | a flood of junk proven calls, a device proof's size each, from four connections through a port capped as the onion's: at most its proven calls held at once behind it, the rest `Busy` from the gateway, every place given back; a member's queries and a session's call on another connection answered meanwhile | gateway |
+| 23 | the onion's streams: a circuit one address and each stream a port of it, the circuits' and streams' caps; HTTP streams at the onion's listener, SSH streams carried and named by their carrier, other ports refused; C tor's PROXY lines read | gateway |
 
 ## 9. Design choices
 
@@ -643,10 +695,13 @@ could replay, and a relay keeps nothing it can reuse.
   configuration.
 - **The API's own QUIC endpoint:** its own port, allowlist and thread, so
   API load never shares the consensus network's.
-- **`vos-api` relays public reads only:** `NodeKey`, `Time`,
-  `AgentInfo`, `Schema`, `Devices` and `Query`, what a device needs beside its
-  proofs; anything that changes state goes through a signed or proven
-  request on another path.
+- **`vos-api` relays what a device sends:** `NodeKey`, `Time`,
+  `AgentInfo`, `Schema`, `Devices` and `Query`, and the requests whose
+  authority they carry, `Call` and `Credentialed`, so the light node
+  needs no other port on the onion (E23); the operator kinds and
+  workflow reads go another way. Behind the in-flight cap on large bodies
+  and the port's caps, a flood of proofs costs the node no more than its
+  verification budget lets it.
 - **`FrameError::Unavailable` keeps the channel:** an upstream failure is
   no framing error, so the other requests on a shared channel go on.
 - **The binding digest's `arguments`** are hashed as the codec writes
