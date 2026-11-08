@@ -45,7 +45,7 @@ pub(super) fn household_with(count: u8, keys: Vec<KitKey>) -> (Home, Vec<Phone>,
 
 /// `signer`'s admin call of `name`, its evidence posted under `poster`
 /// with `r2` beside it: its log index.
-fn operate(
+pub(super) fn operate(
     home: &mut Home,
     signer: &SigningKey,
     poster: &SigningKey,
@@ -385,7 +385,8 @@ fn a_restore_elsewhere_reads_the_personal_space_back() {
     );
 
     let authors: Vec<[u8; 32]> = devices.iter().map(|view| view.device.keys.sync).collect();
-    restored.group().record_authors(&authors).unwrap();
+    let carried = vos_light::moving::carried(&restored.light, &authors).unwrap();
+    restored.group().record_authors(&carried).unwrap();
     let carried = with(&mut elsewhere, &mut restored, &[NOTES], |sync| {
         sync.catch_up(NOTES)?;
         sync.carry(NOTES)

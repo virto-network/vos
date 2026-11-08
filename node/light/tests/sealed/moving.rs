@@ -17,7 +17,7 @@ use vos_light::kit::{KitKey, KitSecret};
 use vos_light::moving::{self, Move, MoveError};
 use vos_wire::personal::{Kit, NewDevice, Recorded};
 
-use super::kit::{household_with, kit_reads, r_of, written};
+use super::kit::{household_with, kit_reads, operate, r_of, written};
 use super::*;
 use crate::home::PERSONAL;
 
@@ -65,9 +65,9 @@ fn assign(to: &mut Home, homes: &SigningKey, held: &Move) {
 /// the log of `to`.
 fn claimed(phone: &mut Phone, to: &Home, held: Move) {
     let entries = to.log(phone.sync_key(), 0).unwrap();
-    drop(phone.group.take());
+    let group = phone.group.take();
     phone.group = Some(
-        held.claimed(&phone.light, PERSONAL, &entries, to.now)
+        held.claimed(&phone.light, group, PERSONAL, &entries, to.now)
             .unwrap(),
     );
 }
@@ -83,8 +83,9 @@ fn pair_again(home: &mut Home, opener: &mut Phone, joiner: &mut Phone, checkpoin
         .unwrap();
     pairing.trust(checkpoint);
     let pairing = Pairing::from_bytes(&pairing.to_bytes()).unwrap();
-    drop(joiner.group.take());
-    joiner.group = Some(moving::rejoin(&joiner.light, joiner.keys.clone(), pairing).unwrap());
+    let group = joiner.group.take();
+    let keys = joiner.keys.clone();
+    joiner.group = Some(moving::rejoin(&joiner.light, group, keys, pairing).unwrap());
     opener.send(home, &prepared).unwrap();
 }
 
@@ -101,15 +102,19 @@ fn finish(home: &mut Home, phone: &mut Phone) -> moving::Finished {
 
 /// Three phones at a home, each holding every note. The first moves: its
 /// claim elsewhere waits beside the group it leaves, a second move refused
-/// meanwhile, and it leaves the notice at the old home. Once the new
-/// agent is assigned its group starts there, its scopes read afresh, and
-/// the kit opens nothing there until the move pushed everything: every
-/// node, then the recovery envelopes under the new `R`. The others read
-/// the notice at the old home and the third writes there. The second pairs
-/// again from the mover's checkpoint and carries the third's note, which
-/// the mover reads though the third is not yet in the set; the third pairs
-/// again and carries nothing. A new phone paired there with no checkpoint
-/// reads the whole history from the new home's start.
+/// meanwhile; once the claim is answered it leaves the notice at the old
+/// home, and once the new agent is assigned its group starts there, its
+/// scopes read afresh, the kit opening nothing there until the move pushed
+/// everything: every node, then the recovery envelopes under the new `R`.
+/// At the old home the others read the notice; the third writes there,
+/// and a fourth phone is paired there by the second and writes too, past
+/// the moved first's voice. The second pairs again from the mover's
+/// checkpoint and carries both notes, which the mover reads, the fourth's
+/// author reaching it with the second's archive; the third pairs again and
+/// carries nothing. The third removed at the new home before it pushed
+/// anything there, a new phone paired there with no checkpoint reads the
+/// whole history from the new home's start, the third's carried nodes
+/// among it.
 #[test]
 fn a_move_carries_the_personal_space_and_the_others_pair_again() {
     let kit = KitSecret::phrase().unwrap();
@@ -125,11 +130,12 @@ fn a_move_carries_the_personal_space_and_the_others_pair_again() {
 
     let held = prepare(&phones[0], &elsewhere, vec![next.key()]);
     let group = phones[0].group.as_ref().unwrap();
+    let keys = phones[0].keys.clone();
     assert!(matches!(
         Move::prepare(
             &phones[0].store,
             group,
-            phones[0].keys.clone(),
+            keys,
             vec![next.key()],
             4,
             ELSEWHERE
@@ -140,13 +146,12 @@ fn a_move_carries_the_personal_space_and_the_others_pair_again() {
         Claim::pending(&phones[0].store).unwrap().is_none(),
         "a move's claim is the move's"
     );
+    assign(&mut elsewhere, &homes, &held);
     let notice = held.notice(&space_of(&elsewhere));
     with(&mut home, &mut phones[0], &[NOTES], |sync| {
         sync.announce(&notice)
     })
     .unwrap();
-
-    assign(&mut elsewhere, &homes, &held);
     claimed(&mut phones[0], &elsewhere, held);
     assert_eq!(phones[0].group().agent().identity, ELSEWHERE);
     assert!(moving::carrying(&phones[0].store).unwrap());
@@ -157,6 +162,11 @@ fn a_move_carries_the_personal_space_and_the_others_pair_again() {
         "the scopes keep their ids"
     );
     phones[0].read(&mut elsewhere);
+    let early = with(&mut elsewhere, &mut phones[0], &[], |sync| sync.recovery()).unwrap();
+    assert_eq!(
+        early.pushed, 0,
+        "no recovery envelope while the move carries"
+    );
     assert!(
         kit_reads(&elsewhere, &next).is_empty(),
         "the kit opens nothing at the new home yet"
@@ -177,17 +187,33 @@ fn a_move_carries_the_personal_space_and_the_others_pair_again() {
         assert!(phone.group.as_ref().unwrap().archive().authors.is_empty());
     }
 
-    // The phones that missed the move: the notice, and a note written at
-    // the old home.
+    // The phones that missed the move: the notice, a note written at the
+    // old home, and a fourth phone paired there once the first's voice
+    // lapsed, writing too.
     let announced = with(&mut home, &mut phones[1], &[NOTES], |sync| sync.announced()).unwrap();
     assert_eq!(announced, Some(notice.clone()));
     set(&phones[2].light, NOTES, 30, 31);
     with(&mut home, &mut phones[2], &[NOTES], |sync| sync.push(NOTES)).unwrap();
+    home.pass(policy().confirm_window_ms + 1);
+    let mut late = Phone::new(5);
+    phones[1].alive(&mut home);
+    phones[2].alive(&mut home);
+    phones[1].pair(&mut home, &mut late);
+    let mut there = [phones.remove(1), phones.remove(1), late];
+    settle(&mut home, &mut there);
+    let [second, third, mut late] = there;
+    assert!(late.group().id().is_some(), "added at the old home");
+    install(&late.light, NOTES);
+    set(&late.light, NOTES, 50, 51);
+    with(&mut home, &mut late, &[NOTES], |sync| sync.push(NOTES)).unwrap();
+    phones.push(second);
+    phones.push(third);
     with(&mut home, &mut phones[1], &[NOTES], |sync| {
         sync.catch_up(NOTES)
     })
     .unwrap();
     assert_eq!(count(&phones[1].light, NOTES, 30), Some(31));
+    assert_eq!(count(&phones[1].light, NOTES, 50), Some(51));
 
     let checkpoint_at = checkpoint(&mut elsewhere, &mut phones[0]);
     let (mover, rest) = phones.split_at_mut(1);
@@ -199,16 +225,18 @@ fn a_move_carries_the_personal_space_and_the_others_pair_again() {
     assert!(finished.done);
     let (_, caught, carried) = &finished.scopes[0];
     assert_eq!(caught.started, Some(checkpoint_at.position));
-    assert_eq!(carried.pushed.len(), 1, "the note the move did not carry");
+    assert_eq!(carried.pushed.len(), 2, "the notes the move did not carry");
     assert_eq!(carried.held, 3);
 
     let caught = with(&mut elsewhere, &mut phones[0], &[NOTES], |sync| {
+        sync.archive()?;
         sync.catch_up(NOTES)
     })
     .unwrap();
     assert!(caught.passed.is_empty(), "{:?}", caught.passed);
     assert!(caught.alarms.is_empty(), "{:?}", caught.alarms);
     assert_eq!(count(&phones[0].light, NOTES, 30), Some(31));
+    assert_eq!(count(&phones[0].light, NOTES, 50), Some(51));
 
     let checkpoint_at = checkpoint(&mut elsewhere, &mut phones[0]);
     let (mover, rest) = phones.split_at_mut(1);
@@ -220,22 +248,57 @@ fn a_move_carries_the_personal_space_and_the_others_pair_again() {
         finished.scopes[0].2.pushed.is_empty(),
         "nothing left to carry"
     );
-    assert_eq!(stored(&elsewhere, &phones[0], scope).len(), 4);
+    assert_eq!(stored(&elsewhere, &phones[0], scope).len(), 5);
+
+    // The third removed at once by the two others, seasoned there.
+    elsewhere.pass(policy().probation_ms + policy().seasoning_ms);
+    for phone in phones.iter_mut() {
+        phone.alive(&mut elsewhere);
+    }
+    let removed = phones[2].group().id().unwrap();
+    let (admin, sync) = (phones[0].admin.clone(), phones[0].sync.clone());
+    let removal = operate(
+        &mut elsewhere,
+        &admin,
+        &sync,
+        "remove",
+        removed.encode(),
+        None,
+    );
+    let (admin, sync) = (phones[1].admin.clone(), phones[1].sync.clone());
+    operate(
+        &mut elsewhere,
+        &admin,
+        &sync,
+        "cosign",
+        removal.encode(),
+        None,
+    );
+    settle(&mut elsewhere, &mut phones[..2]);
+    phones[0].update(&mut elsewhere).unwrap();
+    settle(&mut elsewhere, &mut phones[..2]);
+    let third = phones.pop().unwrap();
+    assert!(matches!(
+        phones[0].group().author(&third.sync_key()),
+        Some((_, true))
+    ));
 
     let mut fresh = Phone::new(4);
     phones[0].pair(&mut elsewhere, &mut fresh);
     phones.push(fresh);
     settle(&mut elsewhere, &mut phones);
-    install(&phones[3].light, NOTES);
-    let caught = with(&mut elsewhere, &mut phones[3], &[NOTES], |sync| {
+    install(&phones[2].light, NOTES);
+    let caught = with(&mut elsewhere, &mut phones[2], &[NOTES], |sync| {
+        sync.archive()?;
         sync.catch_up(NOTES)
     })
     .unwrap();
     assert!(caught.passed.is_empty(), "{:?}", caught.passed);
     for n in 0..3 {
-        assert_eq!(count(&phones[3].light, NOTES, n), Some(10 + n));
+        assert_eq!(count(&phones[2].light, NOTES, n), Some(10 + n));
     }
-    assert_eq!(count(&phones[3].light, NOTES, 30), Some(31));
+    assert_eq!(count(&phones[2].light, NOTES, 30), Some(31));
+    assert_eq!(count(&phones[2].light, NOTES, 50), Some(51));
 }
 
 /// A move refused at the other home is abandoned, the old group standing;
@@ -291,6 +354,9 @@ fn an_interrupted_move_resumes_where_it_stopped() {
     assert_eq!(mover.group().agent().identity, ELSEWHERE);
     mover.read(&mut elsewhere);
 
+    // The archive pushed first, so the first push the link fails is the
+    // carry's round.
+    with(&mut elsewhere, &mut mover, &[], |sync| sync.archive()).unwrap();
     let mut link = HomeLink::new(&mut elsewhere, &mover);
     link.fail = Some(Fail::Lost);
     #[allow(clippy::redundant_closure)]
@@ -329,11 +395,13 @@ fn a_pairing_of_another_personal_space_is_refused() {
         .group()
         .pair(phones[0].keys.clone(), package, elsewhere.now)
         .unwrap();
+    let group = phones[0].group.take();
+    let keys = phones[0].keys.clone();
     assert!(matches!(
-        moving::rejoin(&phones[0].light, phones[0].keys.clone(), pairing),
+        moving::rejoin(&phones[0].light, group, keys, pairing),
         Err(MoveError::Elsewhere)
     ));
-    let standing = DeviceGroup::open(&phones[0].store).unwrap().unwrap();
-    assert_eq!(standing.agent().identity, home.identity);
+    phones[0].group = DeviceGroup::open(&phones[0].store).unwrap();
+    assert_eq!(phones[0].group().agent().identity, home.identity);
     phones[0].read(&mut home);
 }

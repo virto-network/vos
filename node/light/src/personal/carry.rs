@@ -11,20 +11,23 @@
 //!   with this device's view and `seen` positions, [`PIPELINE`] a round;
 //!   each round's sealed bytes held in the store before they are sent, so
 //!   a retry after a lost answer or a crash sends them as they are and the
-//!   agent answers them by id. Each node taken is recorded as read at its
-//!   position, and this device's own leave its outbox.
-//! - **The cursor** moves past the carried envelopes only when the agent
-//!   numbered them right after it: the reading then skips nothing.
+//!   agent answers them by id. Each node taken is recorded as pushed at
+//!   its position, and this device's own leave its outbox, round by round.
+//!   The cursor stays: the next reading reads the carried envelopes back,
+//!   so whatever another device pushed between them is read too.
+//! - **The notice** of a move is signed by its maker's sync key, and read
+//!   only from a device of the set that is not removed.
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use ed25519_dalek::Signer as _;
 use vos_wire::ids::InstanceId;
 use vos_wire::personal::PersonalError;
 use vos_wire::{Decode, Encode};
 use zeroize::Zeroizing;
 
 use super::{AT, Link, OWN, PIPELINE, SealedSync, SyncError, scope_key};
-use crate::group::GroupError;
+use crate::group::{GroupError, verifies};
 use crate::moving::Notice;
 use crate::sealed;
 use crate::sync::Blake2b256;
@@ -36,6 +39,24 @@ const CARRY: &[u8] = b"s/carry/";
 /// The name the notice of a move derives its scope from, apart from every
 /// instance's (four bytes).
 const NOTICE_NAME: &[u8] = b"vos/personal/moved";
+
+/// A notice as it is sealed: its maker's sync key and signature over
+/// [`notice_message`].
+#[derive(Encode, Decode)]
+struct SignedNotice {
+    notice: Notice,
+    author: [u8; 32],
+    signature: [u8; 64],
+}
+
+/// What a notice's maker signs: the notice at the agent whose identity is
+/// `agent`.
+fn notice_message(agent: &[u8; 32], notice: &Notice) -> Vec<u8> {
+    let mut message = NOTICE_NAME.to_vec();
+    message.extend_from_slice(agent);
+    notice.encode_to(&mut message);
+    message
+}
 
 /// A node sealed for a carry: its CID, its author and number, and its
 /// envelope.
@@ -165,9 +186,6 @@ impl<L: Link> SealedSync<'_, L> {
             left.push((cid, header, bytes));
         }
         let author = self.light.author().0;
-        let mut next = self.light.cursor(instance)?.unwrap_or(0) + 1;
-        let mut dense = true;
-        let mut own = Vec::new();
         let mut left = causal(left).into_iter();
         loop {
             if round.sealed.is_empty() {
@@ -192,18 +210,12 @@ impl<L: Link> SealedSync<'_, L> {
                 .map(|sealed| sealed.envelope.clone())
                 .collect();
             let answers = self.send(&envelopes)?;
-            let mut read = Vec::new();
             let mut taken = Vec::new();
+            let mut own = Vec::new();
             let mut stop = None;
             for (sealed, answer) in round.sealed.iter().zip(answers) {
                 match answer {
                     Ok(pushed) => {
-                        dense &= pushed.position == next;
-                        next = pushed.position + 1;
-                        read.push((
-                            scope_key(AT, &scope, Some(pushed.position)),
-                            Some(sealed.cid.to_vec()),
-                        ));
                         taken.push((pushed.position, pushed.id, sealed.cid));
                         if sealed.author == author {
                             own.push(sealed.seq);
@@ -216,8 +228,8 @@ impl<L: Link> SealedSync<'_, L> {
                     }
                 }
             }
-            self.light.store().write_group_rows(read)?;
             self.record_own(scope, &taken, None)?;
+            self.light.sent(instance, &own)?;
             round.sealed.drain(..taken.len());
             self.store_row(&row, &round)?;
             match stop {
@@ -229,15 +241,13 @@ impl<L: Link> SealedSync<'_, L> {
                 Some(error) => return Err(SyncError::Refused(error)),
             }
         }
-        self.light.sent(instance, &own)?;
-        if dense && report.stale.is_none() && !report.pushed.is_empty() {
-            self.light.ingest(instance, Vec::new(), Some(next - 1))?;
-        }
         Ok(report)
     }
 
-    /// Leave `notice` at this agent, sealed under the confirmed epoch in a
-    /// scope of its own: the devices still here read where the space moved
+    /// Leave `notice` at this agent, signed by this device's sync key and
+    /// sealed under the confirmed epoch in a scope of its own, then push
+    /// the archive, which carries that scope's key to the devices here at
+    /// later epochs: they read where the space moved
     /// ([`SealedSync::announced`]), and the operators read nothing. Its
     /// position.
     pub fn announce(&mut self, notice: &Notice) -> Result<u64, SyncError<L::Error>> {
@@ -245,19 +255,26 @@ impl<L: Link> SealedSync<'_, L> {
         let epoch = self.group.confirmed();
         let key = Zeroizing::new(self.group.key(scope)?);
         let agent = self.group.agent().identity;
-        let body = Zeroizing::new(notice.encode());
-        let envelope = sealed::seal(&key, &agent, scope, epoch, &body)
-            .map_err(|_| SyncError::TooLarge { seq: 0 })?;
-        match self.send(&[envelope])?.pop() {
-            Some(answer) => answer
-                .map(|pushed| pushed.position)
-                .map_err(SyncError::Refused),
-            None => Err(SyncError::Unanswered),
+        let sync = self.light.sync_key();
+        let signed = SignedNotice {
+            notice: notice.clone(),
+            author: sync.verifying_key().to_bytes(),
+            signature: sync.sign(&notice_message(&agent, notice)).to_bytes(),
+        };
+        let envelope = sealed::seal(&key, &agent, scope, epoch, &signed.encode())
+            .expect("a notice fits an envelope");
+        let position = match self.send(&[envelope])?.pop() {
+            Some(answer) => answer.map(|pushed| pushed.position),
+            None => return Err(SyncError::Unanswered),
         }
+        .map_err(SyncError::Refused)?;
+        self.archive()?;
+        Ok(position)
     }
 
-    /// The latest notice of a move a device left at this agent that this
-    /// device opens: none while no device moved.
+    /// The latest notice of a move at this agent that this device opens,
+    /// signed by a device of the set that is not removed: none while no
+    /// device moved.
     pub fn announced(&mut self) -> Result<Option<Notice>, SyncError<L::Error>> {
         let scope = self.group.archive().scope(NOTICE_NAME);
         let agent = self.group.agent().identity;
@@ -282,9 +299,15 @@ impl<L: Link> SealedSync<'_, L> {
                 }
                 let keys = Zeroizing::new(self.keys(scope, header.epoch)?);
                 if let Ok((_, body)) = sealed::open(&keys, &agent, &envelope.bytes)
-                    && let Some(notice) = Notice::decode_exact(&body)
+                    && let Some(signed) = SignedNotice::decode_exact(&body)
+                    && matches!(self.group.author(&signed.author), Some((_, false)))
+                    && verifies(
+                        &signed.author,
+                        &notice_message(&agent, &signed.notice),
+                        &signed.signature,
+                    )
                 {
-                    found = Some(notice);
+                    found = Some(signed.notice);
                 }
             }
         }

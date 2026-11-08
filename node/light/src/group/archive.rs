@@ -3,8 +3,9 @@
 //! restore recovered, from which their scopes' ids still derive; every
 //! scope key of every confirmed epoch, a union indexed by epoch; and the
 //! recovery wrap key `R` (§3.5), with the ones this device drew that the
-//! control log has not named yet; and the sync keys of the devices of the
-//! groups a move left (§3.9), whose nodes the moved history holds. A device keeps it in its store; a new
+//! control log has not named yet; and the authors a move carried (§3.9):
+//! the devices of the groups it left, each up to the node it carried in
+//! each scope. A device keeps it in its store; a new
 //! device receives it over the pairing channel; sealed under an epoch's
 //! archive key it travels to the agent, `R` with it and the drawn ones
 //! never. Archives that disagree keep every candidate key, and the AEAD
@@ -55,7 +56,7 @@ pub struct Recovery {
 /// scopes whose keys it records at each confirmed epoch, the keys, each
 /// `(epoch, scope)` with every candidate key archives disagreeing on, `R`
 /// once the claim drew it, the `R`s this device drew that the log has not
-/// named yet, and the authors a move carried, in order.
+/// named yet, and the authors a move carried, by author and scope.
 #[derive(Clone, PartialEq, Eq, Encode, Decode)]
 pub struct Archive {
     pub naming: [u8; 32],
@@ -64,7 +65,17 @@ pub struct Archive {
     pub keys: Vec<Keys>,
     pub recovery: Option<Recovery>,
     pub drawn: Vec<[u8; 32]>,
-    pub authors: Vec<[u8; 32]>,
+    pub authors: Vec<CarriedAuthor>,
+}
+
+/// An author a move carried in a scope: a device of a group it left, its
+/// nodes there read as the set's up to number `through`, the highest a
+/// leaving device held short of the author's cutoff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct CarriedAuthor {
+    pub author: [u8; 32],
+    pub scope: Scope,
+    pub through: u64,
 }
 
 impl std::fmt::Debug for Archive {
@@ -139,17 +150,29 @@ impl Archive {
         }
     }
 
-    /// Admit `author`, a sync key of a group a move left: its nodes, which
-    /// the devices carried, are read as the device set's.
-    pub fn carried(&mut self, author: [u8; 32]) {
-        if let Err(at) = self.authors.binary_search(&author) {
-            self.authors.insert(at, author);
+    /// Admit `carried`'s author in its scope up to its number: of two, the
+    /// higher stands.
+    pub fn carried(&mut self, carried: CarriedAuthor) {
+        let key = |at: &CarriedAuthor| (at.author, at.scope);
+        match self
+            .authors
+            .binary_search_by(|at| key(at).cmp(&key(&carried)))
+        {
+            Ok(found) => {
+                let held = &mut self.authors[found].through;
+                *held = (*held).max(carried.through);
+            }
+            Err(at) => self.authors.insert(at, carried),
         }
     }
 
-    /// Whether `author` is a sync key of a group a move left.
-    pub fn moved(&self, author: &[u8; 32]) -> bool {
-        self.authors.binary_search(author).is_ok()
+    /// The number up to which `author`'s nodes in `scope` were carried by
+    /// a move: none for an author no move carried there.
+    pub fn through(&self, author: &[u8; 32], scope: &Scope) -> Option<u64> {
+        self.authors
+            .binary_search_by(|at| (at.author, at.scope).cmp(&(*author, *scope)))
+            .ok()
+            .map(|found| self.authors[found].through)
     }
 
     /// Track `scope`: its key is recorded at every confirmed epoch from now.
@@ -181,8 +204,8 @@ impl Archive {
         for naming in &other.previous {
             self.remember(*naming);
         }
-        for author in &other.authors {
-            self.carried(*author);
+        for carried in &other.authors {
+            self.carried(*carried);
         }
         for scope in &other.scopes {
             self.track(*scope);
@@ -305,7 +328,11 @@ impl Archive {
             authors: self
                 .authors
                 .iter()
-                .filter(|author| !other.moved(author))
+                .filter(|at| {
+                    other
+                        .through(&at.author, &at.scope)
+                        .is_none_or(|theirs| theirs < at.through)
+                })
                 .copied()
                 .collect(),
         }

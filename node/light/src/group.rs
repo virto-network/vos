@@ -69,7 +69,7 @@ use zeroize::Zeroize;
 use crate::kit::{KitKey, Split};
 use crate::store::{Store, StoreError};
 
-pub use archive::Archive;
+pub use archive::{Archive, CarriedAuthor};
 pub(crate) use follow::verifies;
 
 /// The confirmation hash's domain.
@@ -972,10 +972,18 @@ impl DeviceGroup {
 
     /// A device about to be paired: its leaf's signing key drawn and a key
     /// package made, for the pairing device's add, at `now`.
-    /// A device of a group a move left makes it beside its group, under
-    /// the next generation, which its rejoin takes ([`DeviceGroup::rejoin`]).
+    ///
+    /// A device of a group a move left makes it beside its group, under the
+    /// next generation, which its rejoin takes ([`DeviceGroup::rejoin`]),
+    /// an earlier pairing's key package there dropped.
     pub fn key_package(store: &Store, me: &NewDevice, now: u64) -> Result<Vec<u8>, GroupError> {
         let ahead = u32::from(store.group_row(STATE)?.is_some());
+        if ahead > 0 {
+            // A pairing again cut short left its key package there.
+            let prefix = mls_prefix(generation(store)? + 1);
+            let rows = store.group_rows(&prefix, None)?;
+            store.write_group_rows(rows.into_iter().map(|(key, _)| (key, None)).collect())?;
+        }
         let mut mls = Mls::open(namespace(store, ahead)?, &credential(me), BTreeMap::new())?;
         Ok(mls.key_package(now / 1000, BTreeMap::new())?)
     }
@@ -1268,16 +1276,20 @@ impl DeviceGroup {
     /// Leave this group for good, its scopes' data kept: its state, its MLS
     /// state, the log's chains it kept and every row of its sealed sync
     /// deleted in one batch, with the archive kept without `R` and the `R`s
-    /// drawn (another agent's split is another `R`), every device of the
-    /// set recorded in it as a carried author, and the MLS state's
-    /// generation the next. A move's (`crate::moving`).
-    pub(crate) fn leave(self) -> Result<(), GroupError> {
+    /// drawn (another agent's split is another `R`), `carried` recorded in
+    /// it, and the MLS state's generation the next, `rejoining` keeping
+    /// the key package made there. A move's (`crate::moving`).
+    pub(crate) fn leave(
+        self,
+        carried: &[CarriedAuthor],
+        rejoining: bool,
+    ) -> Result<(), GroupError> {
         let mut archive = self.archive.shareable();
         if let Some(mut recovery) = archive.recovery.take() {
             recovery.r.zeroize();
         }
-        for (_, sync) in self.sync_keys() {
-            archive.carried(sync);
+        for carried in carried {
+            archive.carried(*carried);
         }
         let generation = generation(&self.store)?;
         let mut rows = vec![
@@ -1286,7 +1298,11 @@ impl DeviceGroup {
             (GENERATION.to_vec(), Some((generation + 1).encode())),
         ];
         let mls = mls_prefix(generation);
-        for prefix in [CHAINS, &mls[..], crate::personal::SYNC_ROWS] {
+        // A rejoin's key package waits in the next generation; a mover's
+        // starts it empty, so no pairing cut short leaves its leaf secret.
+        let next = (!rejoining).then(|| mls_prefix(generation + 1));
+        let prefixes = [CHAINS, &mls[..], crate::personal::SYNC_ROWS];
+        for prefix in prefixes.into_iter().chain(next.as_deref()) {
             for (key, _) in self.store.group_rows(prefix, None)? {
                 rows.push((key, None));
             }
@@ -1304,13 +1320,13 @@ impl DeviceGroup {
         Ok(())
     }
 
-    /// Record `authors`, the sync keys of a group this device left, as
-    /// carried authors in the archive: a restore elsewhere's, the old
-    /// agent's device set as it read it there, before it carries the old
-    /// scopes to its new home ([`crate::personal::SealedSync::carry`]).
-    pub fn record_authors(&mut self, authors: &[[u8; 32]]) -> Result<(), GroupError> {
-        for author in authors {
-            self.archive.carried(*author);
+    /// Record `carried` in the archive: a restore elsewhere's, of the old
+    /// agent's device set as it read it there ([`crate::moving::carried`]),
+    /// before it carries the old scopes to its new home
+    /// ([`crate::personal::SealedSync::carry`]).
+    pub fn record_authors(&mut self, carried: &[CarriedAuthor]) -> Result<(), GroupError> {
+        for carried in carried {
+            self.archive.carried(*carried);
         }
         let writes = self.writes(true);
         self.mls.write(writes)?;

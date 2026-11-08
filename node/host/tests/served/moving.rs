@@ -1,17 +1,18 @@
 //! Moving home (`light-node.md` §3.9) end to end on three nodes holding
-//! two home-only spaces, every request as the device library makes it and
-//! through a node's socket with the onion's mark: two phones at the first
-//! home sync a local actor's notes through their personal agent; the first
-//! joins the second home by its open claim and moves there, its claim of
-//! the pooled agent proved in the new home's scope with a new phrase kit,
-//! leaving its notice at the old home; its new group starts from the new
-//! agent's log and it pushes everything, the kit opening nothing there
-//! until the recovery envelopes, the last push. The second phone reads the
-//! notice at the old home and writes a note there, then pairs again from
-//! the first through a slot at the new home, its "home" nullifier there
-//! recorded at the new `Homes`, starts from the first's checkpoint and
-//! carries its note, which the first reads; the old home still serves what
-//! it held.
+//! two home-only homes, each its own agent with its credential actor (its
+//! own handle) and `Homes`, in the nodes' one space; every request as the
+//! device library makes it and through a node's socket with the onion's
+//! mark. Two phones at the first home sync a local actor's notes through
+//! their personal agent; the first joins the second home by its open claim
+//! and moves there, its claim of the pooled agent proved in the new home's
+//! scope with a new phrase kit; once it is answered the first leaves its
+//! notice at the old home; its new group starts from the new agent's log
+//! and it pushes everything, the kit opening nothing there until the
+//! recovery envelopes, the last push. The second phone reads the notice at
+//! the old home and writes a note there, then pairs again from the first
+//! through a slot at the new home, its "home" nullifier there recorded at
+//! the new `Homes`, starts from the first's checkpoint and carries its
+//! note, which the first reads; the old home still serves what it held.
 
 use std::convert::Infallible;
 
@@ -313,10 +314,13 @@ fn pair(
     };
     let store = joiner_phone.light.store();
     joiner_phone.group = Some(match joiner_phone.group.take() {
-        Some(old) => {
-            drop(old);
-            moving::rejoin(&joiner_phone.light, heard.device.clone(), *pairing).unwrap()
-        }
+        Some(old) => moving::rejoin(
+            &joiner_phone.light,
+            Some(old),
+            heard.device.clone(),
+            *pairing,
+        )
+        .unwrap(),
         None => DeviceGroup::join(store, heard.device.clone(), *pairing).unwrap(),
     });
     leave(sockets, personal, &mut slot, &ack);
@@ -428,19 +432,19 @@ fn a_personal_space_moves_home_and_its_other_phone_pairs_again() {
         new.identity,
     )
     .unwrap();
-    let notice = held.notice(&elsewhere);
-    sealed(&mut sockets, old, &mut first, |sync| sync.announce(&notice)).unwrap();
     let call = held.call(&elsewhere, expires(&mut sockets)).unwrap();
     assert_eq!(
         claim_call(&mut sockets, &prover, &other, &elsewhere, &first, &call),
         new.agent
     );
+    let notice = held.notice(&elsewhere);
+    sealed(&mut sockets, old, &mut first, |sync| sync.announce(&notice)).unwrap();
     first.sync = Signer::new(first.light.sync_key().clone());
     first.admin = Signer::new(first.admin.key.clone());
     let entries = assigned(&mut sockets, new, &first.sync.key);
-    drop(first.group.take());
+    let group = first.group.take();
     first.group = Some(
-        held.claimed(&first.light, PERSONAL, &entries, sockets.time())
+        held.claimed(&first.light, group, PERSONAL, &entries, sockets.time())
             .unwrap(),
     );
     assert!(moving::carrying(first.light.store()).unwrap());

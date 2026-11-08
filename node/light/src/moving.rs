@@ -10,31 +10,36 @@
 //!   it leaves, so a retry after a lost answer sends the same claim, and a
 //!   refused one ([`Move::abandon`]) leaves the old group as it was.
 //! - **Leaving, and a new group** ([`Move::claimed`]): once the new agent's
-//!   log assigns it, the old group's state, its MLS state and every row of
-//!   its sealed sync are deleted, the scopes' data kept and each scope's
-//!   cursor and push queue forgotten; the archive keeps its naming secrets
-//!   and keys, drops the old `R`, and records every device of the old set
-//!   as a carried author, whose nodes readers at the new home take as the
-//!   set's. Then this device's group alone at the new agent, its `R` the
-//!   new split's.
-//! - **Push everything** ([`finish`]): each scope's nodes the new agent
-//!   lacks carried in causal order ([`SealedSync::carry`]), then the
-//!   archive, then the recovery envelopes under the new `R`, last: until
-//!   then the kit opens nothing at the new home.
+//!   log assigns it, the old group, given up by the caller, is left: its
+//!   state, its MLS state and every row of its sealed sync deleted, the
+//!   scopes' data kept and each scope's cursor and push queue forgotten;
+//!   the archive keeps its naming secrets and keys, drops the old `R`, and
+//!   records each device of the old set as a carried author in each scope
+//!   up to the node this device holds of it ([`carried`]), which readers
+//!   at the new home take as the set's. Then this device's group alone at
+//!   the new agent, its `R` the new split's.
+//! - **Push everything** ([`finish`]): the archive, then each scope's nodes
+//!   the new agent lacks carried in causal order
+//!   ([`SealedSync::carry`]) and read back, the archive again, then the
+//!   recovery envelopes under the new `R`, last: until then the kit opens
+//!   nothing at the new home.
 //! - **Re-pair** ([`rejoin`]): each other device pairs again by QR from a
 //!   device at the new home, the move done there. It reads the old home to
-//!   its end first, then, on the handover, leaves its old group and joins
-//!   the new one (a pairing of the same personal space's alone), starts
-//!   its scopes from the checkpoints handed over, and carries what the new
-//!   home lacks: what it and the devices still at the old home wrote
-//!   there after the move ([`finish`] again).
-//! - **The notice** ([`Notice`]): before leaving, the mover leaves at the
-//!   old home where the space went ([`SealedSync::announce`]), sealed under
-//!   the old group's epoch; a device that missed the move reads it there
-//!   ([`SealedSync::announced`]), and the app asks for the re-pairing. Until
-//!   then that device follows the old home with the devices still there,
-//!   and what they write reaches the new home with the first of them to
-//!   pair again.
+//!   its end first; its key package waits beside its old group, so a
+//!   pairing cut short before the handover leaves that group standing; on
+//!   the handover it leaves its old group and joins the new one (a pairing
+//!   of the same personal space's alone), starts its scopes from the
+//!   checkpoints handed over, and carries what the new home lacks: what it
+//!   and the devices still at the old home wrote there after the move
+//!   ([`finish`] again). Cut short after the handover, it pairs again from
+//!   a new slot with no group to give up.
+//! - **The notice** ([`Notice`]): once its claim is answered, the mover
+//!   leaves at the old home where the space went, signed and sealed under
+//!   the old group's epoch ([`SealedSync::announce`]); a device that missed
+//!   the move reads it there ([`SealedSync::announced`]), and the app asks
+//!   for the re-pairing. Until then that device follows the old home with
+//!   the devices still there, and what they write reaches the new home
+//!   with the first of them to pair again.
 //!
 //! **What the old home keeps:** what it held, for as long as its operators
 //! keep it: the control log, every scope's ciphertext to the move, the
@@ -59,7 +64,7 @@ use vos_wire::ids::InstanceId;
 use vos_wire::personal::{Entry, NewDevice};
 use vos_wire::{Decode, Encode};
 
-use crate::group::{DeviceGroup, GroupError, Pairing, same_space};
+use crate::group::{CarriedAuthor, Course, DeviceGroup, GroupError, Pairing, same_space};
 use crate::home::{Claim, ClaimError, Home};
 use crate::kit::KitKey;
 use crate::personal::{Carried, Caught, Kept, Link, SealedSync, SyncError};
@@ -88,6 +93,8 @@ pub enum MoveError {
     Elsewhere,
     /// A move or a claim waits already.
     Held,
+    /// The group is one this device cannot follow, or is out of.
+    Course,
     Group(GroupError),
     Light(Error),
     Store(StoreError),
@@ -124,6 +131,7 @@ impl std::fmt::Display for MoveError {
             MoveError::Here => f.write_str("the personal space is at that agent already"),
             MoveError::Elsewhere => f.write_str("the pairing is of another personal space"),
             MoveError::Held => f.write_str("a move or a claim waits already"),
+            MoveError::Course => f.write_str("the device does not follow its group"),
             MoveError::Group(error) => error.fmt(f),
             MoveError::Light(error) => error.fmt(f),
             MoveError::Store(error) => error.fmt(f),
@@ -154,8 +162,8 @@ impl Move {
     /// another home, whose identity is `identity`, for `device` (its
     /// nullifier the new home's) with the kit of `keys`: `R` split anew,
     /// `R1` sealed to each key at that agent, held in the store before this
-    /// returns. Refused while a move or a claim waits, and for the agent
-    /// the group has.
+    /// returns. Refused while a move or a claim waits, for the agent the
+    /// group has, and for a group this device cannot follow or is out of.
     pub fn prepare(
         store: &Store,
         group: &DeviceGroup,
@@ -169,6 +177,9 @@ impl Move {
         }
         if identity == group.agent().identity {
             return Err(MoveError::Here);
+        }
+        if group.course() != Course::Following {
+            return Err(MoveError::Course);
         }
         let claim = Claim::draw(device, keys, agent, identity)?;
         store.write_group_rows(vec![claim.row(), (MOVE_ROW.to_vec(), Some(Vec::new()))])?;
@@ -212,52 +223,106 @@ impl Move {
     }
 
     /// The new agent assigned (its log `entries` from its start, `Personal`
-    /// at `instance`): the old group left ([`DeviceGroup`]'s rows, and each
-    /// of `light`'s scopes' cursor and push queue), then this device's
-    /// group at the new agent, its `R` the new split's; the claim's row
-    /// deleted, the move's kept until [`finish`]. Again after a crash, what
-    /// is left of it is done.
+    /// at `instance`): `group`, the store's group, given up and left
+    /// ([`DeviceGroup`]'s rows, and each of `light`'s scopes' cursor and
+    /// push queue), then this device's group at the new agent, its `R` the
+    /// new split's; the claim's row deleted, the move's kept until
+    /// [`finish`]. Again after a crash, what is left of it is done: `group`
+    /// is then none, or the new one.
     pub fn claimed(
         self,
         light: &Light,
+        group: Option<DeviceGroup>,
         instance: InstanceId,
         entries: &[(u64, Entry)],
         now: u64,
     ) -> Result<DeviceGroup, MoveError> {
         let store = light.store();
         self.0.assigned(entries)?;
-        if let Some(old) = DeviceGroup::open(store)?
+        let group = given(store, group)?;
+        if let Some(old) = group
             && old.agent().identity != self.agent().1
         {
-            leave(light, old)?;
+            leave(light, old, false)?;
         }
         Ok(self.0.claimed(store, instance, entries, now)?)
     }
 }
 
+/// `group`, given up by its caller, as the store's: the caller holds no
+/// handle on a group a leave deletes, which would write it again.
+fn given(store: &Store, group: Option<DeviceGroup>) -> Result<Option<DeviceGroup>, MoveError> {
+    if crate::group::grouped(store)? != group.is_some() {
+        return Err(MoveError::Group(GroupError::Grouped));
+    }
+    Ok(group)
+}
+
 /// Leave `group` for good: each of `light`'s scopes' cursor and push queue
-/// forgotten first, then the group's rows in one batch, so that a leave cut
-/// short is made again whole.
-fn leave(light: &Light, group: DeviceGroup) -> Result<(), MoveError> {
+/// forgotten first, then the group's rows in one batch, its devices'
+/// authorship recorded ([`carried`]), so that a leave cut short is made
+/// again whole.
+fn leave(light: &Light, group: DeviceGroup, rejoining: bool) -> Result<(), MoveError> {
+    let authors: Vec<[u8; 32]> = group
+        .sync_keys()
+        .into_iter()
+        .map(|(_, sync)| sync)
+        .collect();
+    let carried = carried(light, &authors)?;
     for instance in light.instances()? {
         light.forget_feed(instance)?;
     }
-    group.leave()?;
+    group.leave(&carried, rejoining)?;
     Ok(())
+}
+
+/// What a move carries of `authors` (a group's sync keys) in `light`'s
+/// scopes: each that a scope holds nodes of, up to the highest it holds
+/// there short of its cutoff ([`crate::group::Archive::authors`]). A
+/// restore elsewhere records the old agent's device set's so
+/// ([`DeviceGroup::record_authors`]).
+pub fn carried(light: &Light, authors: &[[u8; 32]]) -> Result<Vec<CarriedAuthor>, MoveError> {
+    let mut carried = Vec::new();
+    for instance in light.instances()? {
+        let scope = light.scope_id(instance)?.0;
+        for (author, seq) in light.have(instance)? {
+            if !authors.contains(&author.0) {
+                continue;
+            }
+            let through = match light.cutoff(instance, &author)? {
+                Some(0) => continue,
+                Some(from) => seq.min(from - 1),
+                None => seq,
+            };
+            carried.push(CarriedAuthor {
+                author: author.0,
+                scope,
+                through,
+            });
+        }
+    }
+    Ok(carried)
 }
 
 /// A device of a group a move left, joining the moved group from the
 /// `pairing` a device at the new home handed over (`me` its keys there):
-/// its old group left, then its group from the pairing, its archive's keys
-/// and carried authors kept. Refused before anything is left for a pairing
-/// of another personal space, or of the agent its group has. The move is
-/// held until [`finish`] carried what the new home lacks.
-pub fn rejoin(light: &Light, me: NewDevice, pairing: Pairing) -> Result<DeviceGroup, MoveError> {
+/// `group`, the store's old group, given up and left, then its group from
+/// the pairing, its archive's keys and carried authors kept. Refused
+/// before anything is left for a pairing of another personal space, or of
+/// the agent its group has. The move is held until [`finish`] carried
+/// what the new home lacks. Once the old group is left, a pairing cut
+/// short is started again from a new slot, `group` none.
+pub fn rejoin(
+    light: &Light,
+    group: Option<DeviceGroup>,
+    me: NewDevice,
+    pairing: Pairing,
+) -> Result<DeviceGroup, MoveError> {
     let store = light.store();
     if !same_space(pairing.archive(), &store.archive()?) {
         return Err(MoveError::Elsewhere);
     }
-    let old = DeviceGroup::open(store)?;
+    let old = given(store, group)?;
     if old
         .as_ref()
         .is_some_and(|old| old.agent() == pairing.agent())
@@ -266,7 +331,7 @@ pub fn rejoin(light: &Light, me: NewDevice, pairing: Pairing) -> Result<DeviceGr
     }
     store.write_group_rows(vec![(MOVE_ROW.to_vec(), Some(Vec::new()))])?;
     if let Some(old) = old {
-        leave(light, old)?;
+        leave(light, old, true)?;
     }
     Ok(DeviceGroup::rejoin(store, me, pairing)?)
 }
@@ -274,7 +339,8 @@ pub fn rejoin(light: &Light, me: NewDevice, pairing: Pairing) -> Result<DeviceGr
 /// What pushing everything did.
 #[derive(Debug, Default)]
 pub struct Finished {
-    /// Each scope's reading at the new agent, then its carry.
+    /// Each scope's reading at the new agent before its carry, and the
+    /// carry.
     pub scopes: Vec<(InstanceId, Caught, Carried)>,
     pub archive: Kept,
     pub recovery: Kept,
@@ -284,33 +350,46 @@ pub struct Finished {
     pub done: bool,
 }
 
-/// Push everything to the agent of `sync`'s group: each installed scope
-/// read to its end and its nodes the agent lacks carried, then the archive
-/// and the recovery envelopes pushed; once all of it went, the move held is
-/// done. What a move does at its new home, and what a device paired again
-/// there does: again after an interruption, it pushes what is left.
+/// Push everything to the agent of `sync`'s group: the archive read and
+/// pushed (the carried authors reach the readers before their nodes), each
+/// installed scope read to its end, its nodes the agent lacks carried and
+/// read back; then the archive again, and once all of it went the move
+/// held is done and the recovery envelopes pushed, the last push. What a
+/// move does at its new home, and what a device paired again there does:
+/// again after an interruption, it pushes what is left. A failed recovery
+/// push after the move is done is the next sync round's, as any is.
 pub fn finish<L: Link>(sync: &mut SealedSync<'_, L>) -> Result<Finished, SyncError<L::Error>> {
-    let mut finished = Finished::default();
+    let mut finished = Finished {
+        archive: sync.archive()?,
+        ..Finished::default()
+    };
+    if finished.archive.stale.is_some() {
+        return Ok(finished);
+    }
     for instance in sync.light().instances()? {
         let caught = sync.catch_up(instance)?;
-        if caught.waiting.is_some() {
-            finished.scopes.push((instance, caught, Carried::default()));
-            return Ok(finished);
+        let mut stop = caught.waiting.is_some();
+        let mut carried = Carried::default();
+        if !stop {
+            carried = sync.carry(instance)?;
+            stop = carried.stale.is_some();
+            if !stop && !carried.pushed.is_empty() {
+                stop = sync.catch_up(instance)?.waiting.is_some();
+            }
         }
-        let carried = sync.carry(instance)?;
-        let stale = carried.stale.is_some();
         finished.scopes.push((instance, caught, carried));
-        if stale {
+        if stop {
             return Ok(finished);
         }
     }
     finished.archive = sync.archive()?;
-    finished.recovery = sync.recovery()?;
-    if finished.archive.stale.is_none() && finished.recovery.stale.is_none() {
-        sync.light()
-            .store()
-            .write_group_rows(vec![(MOVE_ROW.to_vec(), None)])?;
-        finished.done = true;
+    if finished.archive.stale.is_some() {
+        return Ok(finished);
     }
+    sync.light()
+        .store()
+        .write_group_rows(vec![(MOVE_ROW.to_vec(), None)])?;
+    finished.done = true;
+    finished.recovery = sync.recovery()?;
     Ok(finished)
 }
