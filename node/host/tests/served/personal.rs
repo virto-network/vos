@@ -49,7 +49,7 @@ const CLUB: InstanceId = InstanceId(9);
 const CLUB_HANDLE: [u8; 32] = [0xc1; 32];
 
 /// A test home's policy: seconds, not days.
-fn policy() -> Policy {
+pub(crate) fn policy() -> Policy {
     Policy {
         operation_delay_ms: 3_000,
         kit_delay_ms: 6_000,
@@ -64,15 +64,15 @@ fn policy() -> Policy {
 
 /// The nodes' sockets, asked in turn: a request goes to the next node
 /// while one cannot take it.
-struct Sockets {
-    paths: Vec<std::path::PathBuf>,
-    at: usize,
+pub(crate) struct Sockets {
+    pub(crate) paths: Vec<std::path::PathBuf>,
+    pub(crate) at: usize,
 }
 
 impl Sockets {
     /// `request`, as the device library makes it (its kind's two bytes,
     /// then its body), marked as the gateway marks what its onion took.
-    fn ask(&mut self, request: &[u8]) -> Vec<u8> {
+    pub(crate) fn ask(&mut self, request: &[u8]) -> Vec<u8> {
         let kind = u16::from_le_bytes([request[0], request[1]]);
         for _ in 0..60 {
             let mut stream = UnixStream::connect(&self.paths[self.at]).unwrap();
@@ -110,18 +110,18 @@ impl Sockets {
         panic!("no node took the request")
     }
 
-    fn time(&mut self) -> u64 {
+    pub(crate) fn time(&mut self) -> u64 {
         wire::time_answer(&self.ask(&wire::time_request())).unwrap()
     }
 
     /// The identity of `agent`, from its record.
-    fn identity(&mut self, agent: u32) -> [u8; 32] {
+    pub(crate) fn identity(&mut self, agent: u32) -> [u8; 32] {
         wire::agent_answer(&self.ask(&wire::agent_request(agent)))
             .unwrap()
             .expect("the agent's record")
     }
 
-    fn query<T: Decode>(
+    pub(crate) fn query<T: Decode>(
         &mut self,
         agent: u32,
         identity: &[u8; 32],
@@ -143,7 +143,7 @@ impl Sockets {
     }
 
     /// `call` proved by `prove` and sent: its outcome.
-    fn credentialed(&mut self, call: &Call, proof: &vos_light::Proven) -> Outcome {
+    pub(crate) fn credentialed(&mut self, call: &Call, proof: &vos_light::Proven) -> Outcome {
         match wire::credentialed_answer(&self.ask(&wire::credentialed(call, proof))).unwrap() {
             Answer::Ran { outcome, .. } => outcome,
             other => panic!("{other:?}"),
@@ -152,7 +152,7 @@ impl Sockets {
 }
 
 /// A handler's answer from its outcome.
-fn answer<T: Decode, E: Decode + std::fmt::Debug>(outcome: &Outcome) -> Result<T, E> {
+pub(crate) fn answer<T: Decode, E: Decode + std::fmt::Debug>(outcome: &Outcome) -> Result<T, E> {
     match outcome {
         Outcome::Done(bytes) => Ok(T::decode_exact(bytes).expect("the reply decodes")),
         Outcome::Failed {
@@ -164,14 +164,14 @@ fn answer<T: Decode, E: Decode + std::fmt::Debug>(outcome: &Outcome) -> Result<T
 }
 
 /// A client key's session at the personal agent.
-struct Signer {
-    key: SigningKey,
-    session: Option<Session>,
-    next: u64,
+pub(crate) struct Signer {
+    pub(crate) key: SigningKey,
+    pub(crate) session: Option<Session>,
+    pub(crate) next: u64,
 }
 
 impl Signer {
-    fn new(key: SigningKey) -> Self {
+    pub(crate) fn new(key: SigningKey) -> Self {
         Self {
             key,
             session: None,
@@ -179,23 +179,23 @@ impl Signer {
         }
     }
 
-    fn public(&self) -> [u8; 32] {
+    pub(crate) fn public(&self) -> [u8; 32] {
         self.key.verifying_key().to_bytes()
     }
 }
 
 /// A personal agent as a device reaches it.
 #[derive(Clone, Copy)]
-struct Personal {
-    agent: u32,
-    identity: [u8; 32],
+pub(crate) struct Personal {
+    pub(crate) agent: u32,
+    pub(crate) identity: [u8; 32],
 }
 
 impl Personal {
     /// `signer`'s call of `name`: its answer, and the message and
     /// signature an admin call's evidence carries. Refused with
     /// `Settling`, the call goes again after a `wake`.
-    fn call<T: Decode>(
+    pub(crate) fn call<T: Decode>(
         &self,
         sockets: &mut Sockets,
         signer: &mut Signer,
@@ -215,7 +215,7 @@ impl Personal {
 
     /// `signer`'s call of `name`, signed in its session at its next
     /// sequence, and the message signed.
-    fn sign(
+    pub(crate) fn sign(
         &self,
         sockets: &mut Sockets,
         signer: &mut Signer,
@@ -247,7 +247,12 @@ impl Personal {
     }
 
     /// `call` sent: its outcome.
-    fn submit(&self, sockets: &mut Sockets, signer: &mut Signer, call: &Signed) -> Outcome {
+    pub(crate) fn submit(
+        &self,
+        sockets: &mut Sockets,
+        signer: &mut Signer,
+        call: &Signed,
+    ) -> Outcome {
         let mut request = (Kind::Call as u16).to_le_bytes().to_vec();
         (AgentId(self.agent), call.clone()).encode_to(&mut request);
         match Response::decode_exact(&sockets.ask(&request)) {
@@ -259,7 +264,7 @@ impl Personal {
         }
     }
 
-    fn send(
+    pub(crate) fn send(
         &self,
         sockets: &mut Sockets,
         signer: &mut Signer,
@@ -270,7 +275,7 @@ impl Personal {
         (self.submit(sockets, signer, &call), message, call.signature)
     }
 
-    fn query<T: Decode>(
+    pub(crate) fn query<T: Decode>(
         &self,
         sockets: &mut Sockets,
         key: &SigningKey,
@@ -295,7 +300,12 @@ impl Personal {
         }
     }
 
-    fn log(&self, sockets: &mut Sockets, key: &SigningKey, from: u64) -> Vec<(u64, Entry)> {
+    pub(crate) fn log(
+        &self,
+        sockets: &mut Sockets,
+        key: &SigningKey,
+        from: u64,
+    ) -> Vec<(u64, Entry)> {
         let mut entries = Vec::new();
         let mut next = from;
         loop {
@@ -311,18 +321,18 @@ impl Personal {
 
 /// A phone: its light node, its device group, its keys, and its secret
 /// source's output for each space.
-struct Phone {
-    n: u8,
-    light: Light,
-    group: Option<DeviceGroup>,
-    sync: Signer,
-    admin: Signer,
-    keys: NewDevice,
-    _dir: tempfile::TempDir,
+pub(crate) struct Phone {
+    pub(crate) n: u8,
+    pub(crate) light: Light,
+    pub(crate) group: Option<DeviceGroup>,
+    pub(crate) sync: Signer,
+    pub(crate) admin: Signer,
+    pub(crate) keys: NewDevice,
+    pub(crate) _dir: tempfile::TempDir,
 }
 
 impl Phone {
-    fn new(n: u8, home: &HomeSpace) -> Self {
+    pub(crate) fn new(n: u8, home: &HomeSpace) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let agent =
             vos_light::release::agent(&std::fs::read(vos_testkit::programs::agent_elf()).unwrap())
@@ -353,11 +363,11 @@ impl Phone {
     }
 
     /// Its secret in the space whose handle is `handle`.
-    fn secret(&self, handle: &[u8; 32]) -> vos_light::DeviceSecret {
+    pub(crate) fn secret(&self, handle: &[u8; 32]) -> vos_light::DeviceSecret {
         vos_light::derive_secret(&[self.n; 32], handle)
     }
 
-    fn handle(&self, handle: &[u8; 32]) -> DeviceHandle {
+    pub(crate) fn handle(&self, handle: &[u8; 32]) -> DeviceHandle {
         let secret = self.secret(handle);
         DeviceHandle {
             handle: *handle,
@@ -366,13 +376,13 @@ impl Phone {
         }
     }
 
-    fn group(&mut self) -> &mut DeviceGroup {
+    pub(crate) fn group(&mut self) -> &mut DeviceGroup {
         self.group.as_mut().expect("a device group")
     }
 
     /// Read the log and act on it, posting each vote, evidence and
     /// `alive` it asks for: every other event.
-    fn read(&mut self, sockets: &mut Sockets, personal: Personal) -> Vec<Event> {
+    pub(crate) fn read(&mut self, sockets: &mut Sockets, personal: Personal) -> Vec<Event> {
         let mut seen = Vec::new();
         for _ in 0..8 {
             let cursor = self.group().cursor();
@@ -433,7 +443,7 @@ impl Phone {
         panic!("the phone keeps posting")
     }
 
-    fn evidence(
+    pub(crate) fn evidence(
         &mut self,
         sockets: &mut Sockets,
         personal: Personal,
@@ -451,7 +461,7 @@ impl Phone {
 
     /// Make `prepared`'s commit call under the admin key, its message
     /// signed and written before the call, and post its evidence.
-    fn commit(
+    pub(crate) fn commit(
         &mut self,
         sockets: &mut Sockets,
         personal: Personal,
@@ -482,7 +492,7 @@ impl Phone {
     }
 
     /// Its path in the credential actor of `agent` at `instance`.
-    fn path(
+    pub(crate) fn path(
         &self,
         sockets: &mut Sockets,
         agent: u32,
@@ -502,7 +512,7 @@ impl Phone {
 
 /// The home's terms for an open claim, as a device reads them, and the
 /// device's open claim made by its work: its slot.
-fn open_claim(sockets: &mut Sockets, home: &HomeSpace, phone: &Phone) -> u32 {
+pub(crate) fn open_claim(sockets: &mut Sockets, home: &HomeSpace, phone: &Phone) -> u32 {
     let terms: Option<Open> =
         sockets.query(home.agent, &home.identity, home.credentials, "opening", ());
     let terms = terms.expect("the home is open");
@@ -514,18 +524,18 @@ fn open_claim(sockets: &mut Sockets, home: &HomeSpace, phone: &Phone) -> u32 {
     answer::<u32, CredentialError>(&outcome).unwrap()
 }
 
-fn auth(path: &Path) -> AuthWitness {
+pub(crate) fn auth(path: &Path) -> AuthWitness {
     witness(path)
 }
 
 /// The pairing slot's items as `key` reads them.
-fn inbox(sockets: &mut Sockets, personal: Personal, key: &SigningKey) -> Vec<InboxItem> {
+pub(crate) fn inbox(sockets: &mut Sockets, personal: Personal, key: &SigningKey) -> Vec<InboxItem> {
     personal
         .query(sockets, key, "inbox", Option::<(u64, [u8; 16])>::None)
         .unwrap()
 }
 
-fn leave(sockets: &mut Sockets, personal: Personal, signer: &mut Signer, put: &Put) {
+pub(crate) fn leave(sockets: &mut Sockets, personal: Personal, signer: &mut Signer, put: &Put) {
     personal
         .call::<u64>(sockets, signer, "put", put.arguments())
         .0
@@ -533,7 +543,7 @@ fn leave(sockets: &mut Sockets, personal: Personal, signer: &mut Signer, put: &P
 }
 
 /// Wait until `done`, a second at most between tries, for a minute.
-fn wait(what: &str, mut done: impl FnMut() -> bool) {
+pub(crate) fn wait(what: &str, mut done: impl FnMut() -> bool) {
     vos_checker::wait_until(what, Duration::from_secs(60), || {
         let ok = done();
         if !ok {

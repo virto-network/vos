@@ -12,4 +12,5 @@ mod faults;
 mod forwarding;
 mod harness;
 mod homes;
+mod moving;
 mod personal;

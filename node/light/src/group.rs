@@ -1304,6 +1304,19 @@ impl DeviceGroup {
         Ok(())
     }
 
+    /// Record `authors`, the sync keys of a group this device left, as
+    /// carried authors in the archive: a restore elsewhere's, the old
+    /// agent's device set as it read it there, before it carries the old
+    /// scopes to its new home ([`crate::personal::SealedSync::carry`]).
+    pub fn record_authors(&mut self, authors: &[[u8; 32]]) -> Result<(), GroupError> {
+        for author in authors {
+            self.archive.carried(*author);
+        }
+        let writes = self.writes(true);
+        self.mls.write(writes)?;
+        Ok(())
+    }
+
     /// An archive read from the agent merged: its keys, and its `R` only
     /// when it is the one the log made the kit's, by its hash.
     pub fn merge_read(&mut self, read: &Archive) -> Result<(), GroupError> {

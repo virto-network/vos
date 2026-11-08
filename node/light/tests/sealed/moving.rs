@@ -92,6 +92,9 @@ fn checkpoint(home: &mut Home, phone: &mut Phone) -> Checkpoint {
     with(home, phone, &[NOTES], |sync| sync.checkpoint(NOTES)).unwrap()
 }
 
+/// The closure's lifetimes are the link's, which `moving::finish` named
+/// alone does not take.
+#[allow(clippy::redundant_closure)]
 fn finish(home: &mut Home, phone: &mut Phone) -> moving::Finished {
     with(home, phone, &[NOTES], |sync| moving::finish(sync)).unwrap()
 }
@@ -188,12 +191,7 @@ fn a_move_carries_the_personal_space_and_the_others_pair_again() {
 
     let checkpoint_at = checkpoint(&mut elsewhere, &mut phones[0]);
     let (mover, rest) = phones.split_at_mut(1);
-    pair_again(
-        &mut elsewhere,
-        &mut mover[0],
-        &mut rest[0],
-        checkpoint_at.clone(),
-    );
+    pair_again(&mut elsewhere, &mut mover[0], &mut rest[0], checkpoint_at);
     settle(&mut elsewhere, &mut phones[..2]);
     assert_eq!(phones[1].group().id(), Some(1));
     assert_eq!(phones[1].group().agent().identity, ELSEWHERE);
@@ -295,6 +293,7 @@ fn an_interrupted_move_resumes_where_it_stopped() {
 
     let mut link = HomeLink::new(&mut elsewhere, &mover);
     link.fail = Some(Fail::Lost);
+    #[allow(clippy::redundant_closure)]
     let lost = over(&mut link, &mut mover, &[NOTES], |sync| moving::finish(sync));
     assert!(matches!(lost, Err(SyncError::Link(Broken))));
     restart(&mut mover);
