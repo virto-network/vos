@@ -12,7 +12,7 @@
 //! counts the circuit, and a loopback connection that no stream carries is
 //! served no channel.
 //!
-//! The streams come from arti in process ([`crate::onion`]) or from a C tor
+//! The streams come from arti in process (the `onion` module, the `tor` feature) or from a C tor
 //! beside the gateway ([`sidecar`]), whose `HiddenServiceExportCircuitID
 //! haproxy` names each stream's circuit.
 
