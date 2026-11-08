@@ -44,6 +44,9 @@ pub const ENROLL_MANY: usize = 256;
 /// The most devices a person's limit admits.
 pub const MAX_DEVICES: u8 = 16;
 
+/// The most onions the space's set holds: one a gateway.
+pub const MAX_ONIONS: usize = 16;
+
 /// The role every write but the claims and a person's device methods is
 /// under.
 pub const REGISTRAR: &str = "registrar";
@@ -81,6 +84,9 @@ pub mod tables {
     /// One row, under [`RING_KEY`]: the persons ever registered, the next
     /// one's id.
     pub const PEOPLE: &str = "people";
+    /// One row, under [`RING_KEY`]: the space's onion set, its gateways'
+    /// [`Onion`](super::Onion)s.
+    pub const ONIONS: &str = "onions";
 }
 
 /// The tags' names (`proving.md` §8): `T(name)` is the block
@@ -842,6 +848,16 @@ pub struct Open {
     pub period_ms: u64,
     pub cap: u32,
     pub left: u32,
+}
+
+/// A gateway's onion service, as the space's registrar serves it
+/// (`light-node.md` §6.1): the ed25519 key its `.onion` address encodes,
+/// self-authenticating, and the SSH host key its onion's SSH port presents,
+/// which a client pins as it pins the address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Onion {
+    pub key: [u8; 32],
+    pub ssh_host_key: [u8; 32],
 }
 
 /// The salt of the open claim's period `period`, from the registrar's
