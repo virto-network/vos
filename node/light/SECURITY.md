@@ -249,7 +249,37 @@ and what a node does with one is `node/SECURITY.md`'s.
   call, and the proof is checked to state its io-hash before it is
   returned.
 
+## The tree, and what reading it shows
+
+- **The tree is kept whole from the credential actor's feed**
+  (`TreeKeeper`): every write of the tree, read in order a page at a
+  time, the member's path computed on the device. A feed query names the
+  keeper's place in the feed, nothing of the member's, and is signed by a
+  key drawn for it alone; the client sends it on the space's feed
+  connection, which carries reads alone. So no node or gateway learns
+  which leaf is the member's, and every proof is against the newest root
+  the device has read.
+- **Each page is checked against the root its last change names,** the
+  one root a proof uses, which binds every leaf: a page that leaves
+  another root, holds a leaf that is no digest, a change out of order or
+  older than the last, or does not start at the keeper's place, is
+  refused whole and the tree kept as it was. The feed is still the gateway's word: one that withholds changes
+  makes the device prove against an old root, which ingress answers
+  `RootStale` or `RootUnknown`.
+- **The feed is read on a jittered timer of its own** (30 s, between
+  15 s and 45 s), never because a proof is about to be made: the feed's
+  connection is one circuit for as long as it is open, and a read just
+  before each proof would join the proofs through it. A `RootUnknown` or
+  `RootStale` answer makes the feed due at once: that one read precedes
+  the retried proof, as a refetched path did.
+- **Kept on the device:** the tree's leaves, which every member reads
+  alike, and the feed's place; nothing in them is the member's but which
+  leaf the keeper computes paths for, which is not kept.
+
 ## Paths, and what fetching them shows
+
+The path keeper remains for a client not yet on the feed; it names the
+member to the node.
 
 - **Paths are fetched apart from proofs** (`PathKeeper`): on a jittered
   timer, and within a spread of up to 10 s after a moved `root()` is
@@ -277,8 +307,8 @@ not (`light-node.md` §6.2–§6.7).
   every space is reached through its pinned onions unless the user opted
   its key-signed calls out of Tor, after `OPT_OUT_WARNING`, where the
   space offers a clearnet port and is not onion-only. Anonymous requests
-  (proven calls, path fetches and root polls, the feed, the onion set's
-  refresh) and the personal agent's and `Homes`' traffic have no clearnet
+  (proven calls, the tree's feed, path fetches and root polls, the onion
+  set's refresh) and the personal agent's and `Homes`' traffic have no clearnet
   route at all: with no onion pinned they are refused, nothing dialed. A
   proven call goes only under its own purpose, which carries nothing
   else, so it never rides a connection that may be on the clearnet.

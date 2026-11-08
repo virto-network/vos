@@ -34,6 +34,9 @@
 //! - **The pinned onion set** ([`Client::refresh_onions`]): the registrar's
 //!   current set, read through any onion of the pinned one, replaces it.
 //!   The answer is the gateway's word, as any answer it relays (§8, H5).
+//! - **The credential tree's feed** ([`Client::read_tree`]): each page on
+//!   the space's one feed connection, which carries reads alone and names
+//!   nothing of the member's; the tree kept by a [`crate::TreeKeeper`].
 
 mod arti;
 mod client;

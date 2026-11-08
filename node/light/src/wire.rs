@@ -4,14 +4,14 @@
 //! body; the transport adds the frame's length, its mark and any request
 //! id. So neither a client nor a gateway encodes a credential's bytes.
 //!
-//! A query of `path` or `root()` is a `QueryCall` signed by an ed25519 key
-//! drawn for that query alone, so a fetch links to no client key; it reads
-//! the replica's applied state.
+//! A query of `feed`, `path` or `root()` is a `QueryCall` signed by an
+//! ed25519 key drawn for that query alone, so a fetch links to no client
+//! key; it reads the replica's applied state.
 
 use ed25519_dalek::{Signer, SigningKey};
 use scale::{Decode, Encode};
 use vos_api::Kind;
-use vos_wire::credentials::{Path, RootEntry};
+use vos_wire::credentials::{Feed, Path, RootEntry};
 use vos_wire::ids::Session;
 use vos_wire::ids::{AgentId, InstanceId, MethodId};
 use vos_wire::ingress::{
@@ -177,6 +177,23 @@ pub fn path_query(
         member.to_bytes().encode(),
         not_after,
     )
+}
+
+/// A query of the credential actor's `feed(from)`, the tree's changes from
+/// the `from`th on, as [`path_query`]: it names no member.
+pub fn feed_query(
+    agent: u32,
+    identity: &[u8; 32],
+    instance: u32,
+    from: u64,
+    not_after: u64,
+) -> Result<Vec<u8>, DeviceError> {
+    query_request(agent, identity, instance, "feed", from.encode(), not_after)
+}
+
+/// The page from a `feed` query's answer.
+pub fn feed_answer(body: &[u8]) -> Result<Feed, DeviceError> {
+    query_answer(body)
 }
 
 /// A query of the credential actor's `root()`, as [`path_query`].

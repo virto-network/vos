@@ -22,12 +22,16 @@ use super::connection::{Connection, OpenError};
 use super::dial::{Circuit, Dial, Target};
 use super::{Config, SSH_PORT, onion_address};
 use crate::route::{Purpose, Refused, Route, Routes};
-use crate::{DeviceError, wire};
+use crate::{DeviceError, TreeKeeper, wire};
+
+/// How long a feed query is good for, by the node's clock.
+const FEED_TIME: Duration = Duration::from_secs(60);
 
 /// A space, by its handle.
 pub type SpaceId = [u8; 32];
 
-/// The space's credential actor, whose registrar serves its onion set.
+/// The space's credential actor, whose registrar serves its onion set and
+/// whose feed serves its tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Registrar {
     pub agent: u32,
@@ -481,6 +485,52 @@ impl Client {
         let fresh = onions.clone();
         self.replace_routes(space, move |routes| routes.onions = fresh);
         Ok(onions)
+    }
+
+    /// Read `space`'s credential tree into `keeper` from the feed of its
+    /// credential actor (`credentials`), on the space's feed connection:
+    /// the node's time, then each page from the keeper's place until the
+    /// feed holds no more, the time read again for a page past half a
+    /// query's life. The changes applied; a page refused leaves the tree as
+    /// the pages before it left it. The caller reads it when
+    /// [`TreeKeeper::due`] says, never because a proof is about to be made.
+    pub async fn read_tree(
+        &self,
+        space: SpaceId,
+        credentials: &Registrar,
+        keeper: &mut TreeKeeper,
+    ) -> Result<u64, Error> {
+        let mut applied = 0;
+        let mut time: Option<(u64, Instant)> = None;
+        loop {
+            let now = match time {
+                Some((now, at)) if at.elapsed() < FEED_TIME / 2 => {
+                    now + at.elapsed().as_millis() as u64
+                }
+                _ => {
+                    let (_, answer) = self
+                        .request(space, Purpose::Feed, &wire::time_request())
+                        .await?;
+                    let now = wire::time_answer(&answer).map_err(Error::Answer)?;
+                    time = Some((now, Instant::now()));
+                    now
+                }
+            };
+            let query = keeper
+                .request(
+                    credentials.agent,
+                    &credentials.identity,
+                    credentials.instance,
+                    now + FEED_TIME.as_millis() as u64,
+                )
+                .map_err(Error::Answer)?;
+            let (_, answer) = self.request(space, Purpose::Feed, &query).await?;
+            let read = keeper.ingest(&answer, now).map_err(Error::Answer)?;
+            applied += read.applied;
+            if !read.more {
+                return Ok(applied);
+            }
+        }
     }
 
     /// `space`'s routes, the route `purpose` takes there, and the version

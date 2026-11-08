@@ -75,11 +75,17 @@
 //!   [`wire::devices_request`]), and refuses before proving when it admits
 //!   none.
 //! - **The wire** ([`mod@wire`]): the node-API requests a client sends for
-//!   its time, its path, the root and a credentialed call, and the answers
-//!   it decodes.
+//!   its time, the tree's feed, its path, the root and a credentialed
+//!   call, and the answers it decodes.
+//! - **The tree** ([`TreeKeeper`]): the credential actor's whole tree,
+//!   kept from its feed on a jittered timer, each page checked against
+//!   the root its last change names; the member's path computed on the device, so no
+//!   query names the member, and its proofs made against the newest root
+//!   it read.
 //! - **The path** ([`PathKeeper`]) is fetched apart from proofs: when the
 //!   root moves and on a jittered timer, never because a proof is about to
-//!   be made; an answer that the root is unknown drops it.
+//!   be made; an answer that the root is unknown drops it. It names the
+//!   member to the node; the tree does not.
 //!
 //! The format is the registry's device format
 //! ([`vos_pvm_recair::device::FORMAT`]). No witness is logged, and
@@ -107,6 +113,7 @@ pub mod sync;
 mod threads;
 #[cfg(feature = "tor")]
 pub mod tor;
+mod tree;
 pub mod wire;
 
 pub use call::{Call, NAME_BYTES, method_id, scope, transfer_arguments};
@@ -116,6 +123,7 @@ pub use light::{
     ScopeError,
 };
 pub use path::PathKeeper;
+pub use tree::{Synced, TreeKeeper};
 pub use prover::{PEAK_BYTES, Proven, Prover, ProverConfig, STACK_BYTES, Threads, verify};
 pub use secret::{DeviceSecret, derive_secret, member, owner, source_input};
 pub use store::{Store, StoreError};

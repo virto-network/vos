@@ -23,11 +23,12 @@ use vos_light::tor::{
     Circuit, Client, Config, Dial, Dialing, Error, Registrar, SSH_PORT, Stream, Target,
     onion_address,
 };
-use vos_light::wire;
-use vos_wire::Encode;
-use vos_wire::credentials::Onion;
-use vos_wire::ingress::Response;
+use vos_light::{DeviceError, TreeKeeper, wire};
+use vos_wire::credentials::{self, Change, DEPTH, EMPTY, Feed, Onion, RootEntry, Words};
+use vos_wire::ids::AgentId;
+use vos_wire::ingress::{QueryCall, Response};
 use vos_wire::result::Outcome;
+use vos_wire::{Decode, Encode};
 
 /// What the gateway's capture holds of one connection.
 #[derive(Clone, Debug)]
@@ -61,6 +62,9 @@ struct Gateway {
     onions: Mutex<Vec<Onion>>,
     /// What the client told the dialer of its dormancy, in order.
     dormant: Mutex<Vec<bool>>,
+    /// The credential actor's feed, which `feed` answers three changes a
+    /// page.
+    feed: Mutex<Vec<Change>>,
 }
 
 /// An ed25519 SSH key's public half.
@@ -79,6 +83,7 @@ impl Gateway {
             silent: AtomicBool::new(false),
             onions: Mutex::new(Vec::new()),
             dormant: Mutex::new(Vec::new()),
+            feed: Mutex::new(Vec::new()),
         })
     }
 
@@ -100,6 +105,26 @@ impl Gateway {
 
     fn dials(&self) -> usize {
         self.seen.lock().unwrap().len()
+    }
+
+    /// A query's reply: a page of the feed for `feed(from)`, else the
+    /// onion set.
+    fn answer(&self, body: &[u8]) -> Vec<u8> {
+        let query = <(AgentId, QueryCall)>::decode_exact(body).map(|(_, query)| query);
+        let Some(query) = query.filter(|query| query.method.0 == vos_light::method_id("feed"))
+        else {
+            return self.onions.lock().unwrap().encode();
+        };
+        let from = u64::decode_exact(&query.arguments).expect("a place");
+        let feed = self.feed.lock().unwrap();
+        let start = (from as usize).min(feed.len());
+        let end = (start + 3).min(feed.len());
+        Feed {
+            from,
+            changes: feed[start..end].to_vec(),
+            length: feed.len() as u64,
+        }
+        .encode()
     }
 
     fn fault(&self, faults: &[Fault]) {
@@ -211,8 +236,9 @@ impl russh::server::Handler for Handler {
     }
 }
 
-/// The `vos-api` subsystem: `Time` answers 42, a query the registrar's
-/// onion set, anything else its own body back.
+/// The `vos-api` subsystem: `Time` answers 42, a query of `feed` its page,
+/// any other query the registrar's onion set, anything else its own body
+/// back.
 async fn serve(
     mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     gateway: Arc<Gateway>,
@@ -234,7 +260,7 @@ async fn serve(
             let body = match Kind::from_u16(request.kind) {
                 Some(Kind::Time) => 42u64.encode(),
                 Some(Kind::Query) => Response::Ran {
-                    outcome: Outcome::Done(gateway.onions.lock().unwrap().encode()),
+                    outcome: Outcome::Done(gateway.answer(&request.body)),
                     at: 1,
                 }
                 .encode(),
@@ -766,4 +792,105 @@ async fn a_new_screen_session_ends_the_last() {
     assert_eq!(seen.len(), 2);
     assert!(!seen[1].ended && client.screens_open());
     assert_isolated(&seen);
+}
+
+/// The root of a tree holding `leaves`, rebuilt from them.
+fn root_of(leaves: &[Words], level: usize, index: usize) -> Words {
+    let first = index << level;
+    if first >= leaves.len() {
+        return EMPTY[level];
+    }
+    if level == 0 {
+        return leaves[index];
+    }
+    credentials::compress(
+        &root_of(leaves, level - 1, 2 * index),
+        &root_of(leaves, level - 1, 2 * index + 1),
+    )
+}
+
+/// `count` enrollments at slots `0..count`, one change each.
+fn enrollments(count: u32) -> Vec<Change> {
+    let mut leaves = Vec::new();
+    (0..count)
+        .map(|slot| {
+            let leaf = credentials::leaf(&[slot + 1; 8]);
+            leaves.push(leaf);
+            Change {
+                leaves: vec![(slot, credentials::digest(&leaf))],
+                root: RootEntry {
+                    root: credentials::digest(&root_of(&leaves, DEPTH, 0)),
+                    since: u64::from(slot),
+                },
+            }
+        })
+        .collect()
+}
+
+/// The tree is read on the space's one feed connection: the time and every
+/// page on it, one circuit and one SSH key however many pages and reads,
+/// carrying reads alone and no query naming the member; the tree the
+/// feed's; a page that does not check refused, the tree as the pages
+/// before it left it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_tree_is_read_on_one_feed_connection() {
+    let gateway = Gateway::new();
+    let client = client(&gateway, config());
+    let a = space(1);
+    let credentials = Registrar {
+        agent: 1,
+        instance: 9,
+        identity: [5; 32],
+    };
+    client.set_space(a, Routes::onions(vec![gateway.onion(1)]));
+    let changes = enrollments(10);
+    *gateway.feed.lock().unwrap() = changes[..7].to_vec();
+    let mine = vos_light::Digest([3; 8]);
+    let mut keeper = TreeKeeper::new(mine);
+    assert_eq!(
+        client
+            .read_tree(a, &credentials, &mut keeper)
+            .await
+            .unwrap(),
+        7
+    );
+    assert_eq!(keeper.root(), changes[6].root);
+    *gateway.feed.lock().unwrap() = changes.clone();
+    assert_eq!(
+        client
+            .read_tree(a, &credentials, &mut keeper)
+            .await
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        client
+            .read_tree(a, &credentials, &mut keeper)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(keeper.root(), changes[9].root);
+    let witness = keeper.witness().expect("the member's leaf, slot 2");
+    assert_eq!(witness.slot, 2);
+    assert!(witness.proves(&mine));
+
+    let seen = gateway.seen();
+    assert_eq!(seen.len(), 1, "one connection for every read");
+    let (time, query) = (Kind::Time as u16, Kind::Query as u16);
+    assert_eq!(
+        seen[0].kinds,
+        [time, query, query, query, time, query, time, query]
+    );
+
+    let mut forged = enrollments(12);
+    forged[11].root.root = [1; 32];
+    *gateway.feed.lock().unwrap() = forged;
+    assert!(matches!(
+        client.read_tree(a, &credentials, &mut keeper).await,
+        Err(Error::Answer(DeviceError::Witness))
+    ));
+    assert_eq!(keeper.cursor(), 10);
+    assert_eq!(keeper.root(), changes[9].root);
+    assert_eq!(gateway.seen().len(), 1);
 }

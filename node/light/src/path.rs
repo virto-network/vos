@@ -122,7 +122,7 @@ impl PathKeeper {
 
 /// A uniform draw below `period` from the operating system; 0 if it has
 /// no randomness to give.
-fn jitter(period: u64) -> u64 {
+pub(crate) fn jitter(period: u64) -> u64 {
     let mut bytes = [0; 8];
     if period == 0 || getrandom::getrandom(&mut bytes).is_err() {
         return 0;
