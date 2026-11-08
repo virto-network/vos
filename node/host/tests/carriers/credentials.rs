@@ -370,15 +370,39 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
     let mut device_values: Vec<String> = Vec::new();
     let now = wire::time_answer(&fetch.send(&wire::time_request())).unwrap();
     let identity = founded.operator.lock().unwrap().identity(agent).unwrap();
-    let root = wire::root_answer(
-        &fetch.send(&wire::root_query(agent.0, &identity, CREDENTIALS.0, now + 60_000).unwrap()),
+    // The follower answers from what it has applied: its root and the
+    // member's path read again until both are the leader's root.
+    let leader_root = wire::root_answer(
+        &Socket::connect(&founded.cluster.dir(leader).join("api.sock"))
+            .send(&wire::root_query(agent.0, &identity, CREDENTIALS.0, now + 60_000).unwrap()),
     )
-    .unwrap();
-    let query = wire::path_query(agent.0, &identity, CREDENTIALS.0, &member, now + 60_000).unwrap();
-    let witness: AuthWitness = wire::path_answer(&fetch.send(&query))
-        .unwrap()
-        .expect("an enrolled member's path");
-    assert_eq!(witness.root, root.0);
+    .unwrap()
+    .0;
+    let mut read = || {
+        let root = wire::root_answer(
+            &fetch
+                .send(&wire::root_query(agent.0, &identity, CREDENTIALS.0, now + 60_000).unwrap()),
+        )
+        .unwrap();
+        let query =
+            wire::path_query(agent.0, &identity, CREDENTIALS.0, &member, now + 60_000).unwrap();
+        let witness: AuthWitness = wire::path_answer(&fetch.send(&query))
+            .unwrap()
+            .expect("an enrolled member's path");
+        (root, witness)
+    };
+    let (mut root, mut witness) = read();
+    vos_checker::wait_until(
+        "the follower's root and path are the leader's root",
+        Duration::from_secs(60),
+        || {
+            if root.0 == leader_root && witness.root == leader_root {
+                return true;
+            }
+            (root, witness) = read();
+            false
+        },
+    );
     device_values.push(format!("{witness:?} {root:?}"));
     let path = Path {
         root: witness.root.to_bytes(),
