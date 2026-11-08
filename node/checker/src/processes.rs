@@ -160,9 +160,14 @@ pub fn first_run(vos: &Path, data: &Path, log: &Path) -> String {
         .key
 }
 
-/// What a node logged to `log`, if anything.
+/// What a node logged to `log`, if anything, and its threads' states
+/// should it have never said it listens.
 pub fn read_log(log: &Path) -> String {
-    std::fs::read_to_string(log).unwrap_or_default()
+    let logged = std::fs::read_to_string(log).unwrap_or_default();
+    match std::fs::read_to_string(log.with_extension("stuck")) {
+        Ok(threads) => format!("{logged}\nits threads, never having said it listens:\n{threads}"),
+        Err(_) => logged,
+    }
 }
 
 /// A space file's text: a line for each of `nodes`, numbered from 1, of
