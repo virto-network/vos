@@ -463,7 +463,7 @@ mod tests {
     #[test]
     fn a_relay_refuses_what_it_does_not_relay_before_its_body() {
         let mut reader = Reader::requests(Framing::Stream, Requests::Relayed);
-        let header = Header::of(Framing::Stream, Kind::Call as u16, 5, 100);
+        let header = Header::of(Framing::Stream, Kind::Workflow as u16, 5, 100);
         reader.push(&header.encode(Framing::Stream));
         assert_eq!(
             reader.event(),

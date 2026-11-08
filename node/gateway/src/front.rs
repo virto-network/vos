@@ -16,6 +16,7 @@ use vos_wire::Encode;
 use vos_wire::abi::cap;
 use vos_wire::ingress::{OperatorRefusal, Rejection, Response};
 
+use crate::caps::Caps;
 use crate::limits::Limits;
 use crate::routing::Gateway;
 
@@ -57,6 +58,8 @@ pub struct Http {
     /// marked with: [`Mark::Clearnet`] for a TCP port, [`Mark::Onion`] for
     /// the onion service's.
     pub mark: Mark,
+    /// Its caps on calls and proven calls.
+    pub caps: Arc<Caps>,
 }
 
 /// Serve HTTP on `listener` in front of `gateway` until `stop` resolves.
@@ -70,12 +73,24 @@ pub async fn serve(
     http: Http,
     stop: impl Future<Output = ()>,
 ) {
-    let mark = http.mark;
+    serve_on(gateway, limits, TokioListener(listener), http, stop).await;
+}
+
+/// [`serve`] on any listener: the onion's streams among them, each from
+/// its circuit's address.
+pub async fn serve_on(
+    gateway: Arc<Gateway>,
+    limits: Arc<Limits>,
+    listener: impl vos_http::Listener + 'static,
+    http: Http,
+    stop: impl Future<Output = ()>,
+) {
+    let (mark, caps) = (http.mark, http.caps);
     let handler: Handler = {
         let gateway = Arc::clone(&gateway);
         Arc::new(move |request| {
-            let gateway = Arc::clone(&gateway);
-            Box::pin(async move { handle(&gateway, mark, request).await })
+            let (gateway, caps) = (Arc::clone(&gateway), Arc::clone(&caps));
+            Box::pin(async move { handle(&gateway, mark, &caps, request).await })
         })
     };
     let head: Head = {
@@ -102,7 +117,7 @@ pub async fn serve(
         })),
         head: Some(head),
     };
-    vos_http::serve(TokioListener(listener), serve, stop).await;
+    vos_http::serve(listener, serve, stop).await;
 }
 
 /// A request's answer from its head, before its body is read: past its
@@ -147,10 +162,12 @@ fn unauthorized() -> vos_http::Response {
 }
 
 /// A request's answer: its route's, through a node where it needs one,
-/// marked `mark`, the transport it came in on.
+/// marked `mark`, the transport it came in on, a call or a proven call past
+/// `caps` answered `Busy`.
 pub async fn handle(
     gateway: &Gateway,
     mark: Mark,
+    caps: &Arc<Caps>,
     request: vos_http::Request,
 ) -> vos_http::Response {
     let (kind, body) = match routes::route(&request) {
@@ -168,6 +185,9 @@ pub async fn handle(
             Err(answer) => return answer,
         },
         Routed::Operator { .. } => return unauthorized(),
+    };
+    let Ok(_held) = caps.admit(kind, &body, request.peer) else {
+        return routes::respond(&Response::Busy);
     };
     let (answered, bytes) = gateway.relay(kind, mark, &body).await;
     routes::answer(answered, &bytes)

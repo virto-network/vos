@@ -10,7 +10,7 @@ use vos_testkit::programs::{credentials, credentials_elf, method};
 use vos_wire::abi::Failure;
 use vos_wire::abi::cap::Target;
 use vos_wire::batch::{Admin, Input};
-use vos_wire::credentials::{CredentialError, DEPTH, Digest, Path, RootEntry};
+use vos_wire::credentials::{CredentialError, DEPTH, Digest, MAX_ONIONS, Onion, Path, RootEntry};
 use vos_wire::ids::{InstanceId, Principal};
 use vos_wire::ingress::Grant;
 use vos_wire::result::{Outcome, Step, WorkResult};
@@ -481,6 +481,39 @@ fn the_actor_refuses_what_its_rules_refuse() {
     let root: RootEntry = actor.query("root", ());
     assert_ne!(root.root, empty_root.root);
     assert_eq!(root.since, 2);
+}
+
+/// The onion set: the registrar's to set and any caller's to read, empty
+/// until set; a set past [`MAX_ONIONS`], or naming one onion twice, refused
+/// and the set kept.
+#[test]
+fn the_registrar_serves_the_onion_set() {
+    let mut actor = founded(&[]);
+    let onion = |byte: u8| Onion {
+        key: [byte; 32],
+        ssh_host_key: [!byte; 32],
+    };
+    assert_eq!(actor.query::<_, Vec<Onion>>("onions", ()), Vec::new());
+    let set = vec![onion(1), onion(2)];
+    let past: Vec<Onion> = (0..=MAX_ONIONS as u8).map(onion).collect();
+    let inputs = vec![
+        actor.input(BOB, "set_onions", set.clone()),
+        actor.input(ALICE, "set_onions", set.clone()),
+        actor.input(ALICE, "set_onions", vec![onion(3), onion(3)]),
+        actor.input(ALICE, "set_onions", past),
+    ];
+    let steps = actor.node.batch(2, inputs).steps;
+    assert!(matches!(
+        ran(&steps[0]).outcome,
+        Outcome::Failed {
+            code: Failure::Forbidden,
+            ..
+        }
+    ));
+    assert_eq!(answer::<()>(&steps[1]), Ok(()));
+    assert_eq!(answer::<()>(&steps[2]), Err(CredentialError::TooMany));
+    assert_eq!(answer::<()>(&steps[3]), Err(CredentialError::TooMany));
+    assert_eq!(actor.query::<_, Vec<Onion>>("onions", ()), set);
 }
 
 /// An invitation names its member's digest, which any caller may claim

@@ -38,6 +38,7 @@ pub mod store;
 pub mod tls;
 mod workflows;
 
+pub use admission::OnionPolicy;
 pub use api::{CREDENTIALED_BODIES, OPERATOR_KEY, OPERATOR_PUB};
 pub use leader::AnchorAlert;
 pub use node::{

@@ -12,6 +12,26 @@ path = "src/main.rs"
 [features]
 # The SSH port: s4's screens and the `vos-api` subsystem, on s4-server.
 ssh = ["dep:s4-server", "dep:russh"]
+# The onion service in process, on arti: the SSH port's and HTTP's own
+# onion. One arti version a release, pinned exactly (its crates break
+# monthly); built with `--ignore-rust-version`, as s4's crates are.
+tor = [
+    "ssh",
+    "dep:arti-client",
+    "dep:futures",
+    "dep:safelog",
+    "dep:tor-cell",
+    "dep:tor-config",
+    "dep:tor-guardmgr",
+    "dep:tor-hscrypto",
+    "dep:tor-hsservice",
+    "dep:tor-llcrypto",
+    "dep:tor-proto",
+    "dep:tor-rtcompat",
+]
+# arti's service-side proof of work, which no release has declared ready
+# (its `experimental` bundle, with LGPL dependencies): the file's `pow`.
+tor-pow = ["tor", "arti-client/hs-pow-full", "tor-hsservice/hs-pow-full"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -34,8 +54,20 @@ vos-wire = { workspace = true }
 vos-pvm-precompiles = { workspace = true }
 s4-server = { git = "https://codeberg.org/Virto/s4", rev = "a11a57f806b944f62e16e63adc2f62eb81a28474", optional = true }
 russh = { version = "0.61", default-features = false, features = ["ring", "flate2"], optional = true }
+arti-client = { version = "=0.47.0", default-features = false, features = ["tokio", "rustls", "compression", "onion-service-client", "onion-service-service", "experimental-api", "static-sqlite", "vanguards"], optional = true }
+futures = { version = "0.3", optional = true }
+safelog = { version = "0.10", optional = true }
+tor-cell = { version = "=0.47.0", optional = true }
+tor-config = { version = "=0.47.0", optional = true }
+tor-guardmgr = { version = "=0.47.0", features = ["vanguards"], optional = true }
+tor-hscrypto = { version = "=0.47.0", optional = true }
+tor-hsservice = { version = "=0.47.0", optional = true }
+tor-llcrypto = { version = "=0.47.0", optional = true }
+tor-proto = { version = "=0.47.0", features = ["tokio"], optional = true }
+tor-rtcompat = { version = "=0.47.0", features = ["tokio", "rustls"], optional = true }
 
 [dev-dependencies]
+futures = "0.3"
 # The tests run real nodes behind the gateway: dev edges only.
 vos-node = { path = "../host" }
 vos-checker = { path = "../checker" }

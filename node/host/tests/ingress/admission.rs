@@ -391,6 +391,95 @@ fn an_onion_only_agent_refuses_clearnet_and_unmarked_requests() {
     assert!(Option::<Schema>::decode_exact(&body).unwrap().is_some());
 }
 
+/// A space's own ask of the mark, on an agent that asks nothing: proven
+/// calls only through the onion, refused unmarked and clearnet before any
+/// proof is read, its key-signed queries still answered off the onion; an
+/// onion-only space refusing every read of an agent off it, a schema
+/// answered none, while an agent's record and the node's time stay open.
+#[test]
+fn a_space_asks_the_onion_of_its_proven_calls_or_of_every_request() {
+    for policy in [vos_node::OnionPolicy::Anonymous, vos_node::OnionPolicy::All] {
+        let served =
+            Served::start_with(Arc::new(vos_node::NoHooks), |config| config.onion = policy);
+        let mut stream = connect(&served.socket);
+        let identity = served.client(1).identity(served.agent).unwrap();
+        let query = (
+            served.agent,
+            signed_query(
+                &identity,
+                &SigningKey::from_bytes(&[71; 32]),
+                served.now() + 10_000,
+                Consistency::Applied { at: 0 },
+                COUNTER,
+                served.value,
+                Vec::new(),
+            ),
+        )
+            .encode();
+        let credentialed = (
+            served.agent,
+            Credentialed {
+                instance: COUNTER,
+                method: served.increment,
+                arguments: Vec::new(),
+                nonce: [1; 16],
+                expires_ms: served.now() + 10_000,
+                format: 0,
+                claim: vec![2; 64],
+                proof: vec![0; 64],
+            },
+        )
+            .encode();
+        let proofs = |node: &Node| -> u64 {
+            let stats = node.stats();
+            let stage = stats.stages.iter().find(|stage| stage.name == "credential");
+            stage.expect("a stage").counts.iter().sum()
+        };
+        let verified = proofs(&served.node);
+        for mark in [Mark::Unmarked, Mark::Clearnet] {
+            assert_eq!(
+                ask(&mut stream, Kind::Credentialed, mark, &credentialed),
+                refused(AdmissionRefusal::OnionOnly),
+                "{policy:?} {mark:?}"
+            );
+            let answer = ask(&mut stream, Kind::Query, mark, &query);
+            match policy {
+                vos_node::OnionPolicy::All => {
+                    assert_eq!(answer, refused(AdmissionRefusal::OnionOnly));
+                    send(
+                        &mut stream,
+                        Kind::Schema,
+                        mark,
+                        1,
+                        &(served.agent, COUNTER).encode(),
+                    );
+                    assert_eq!(
+                        receive(&mut stream).unwrap().2,
+                        [0],
+                        "no schema off the onion"
+                    );
+                }
+                _ => assert_eq!(done(answer), 0, "a key-signed query off the onion"),
+            }
+            send(
+                &mut stream,
+                Kind::AgentInfo,
+                mark,
+                1,
+                &served.agent.encode(),
+            );
+            assert_ne!(receive(&mut stream).unwrap().2, [0], "an agent's record");
+        }
+        assert_eq!(proofs(&served.node), verified, "no proof read");
+        assert_eq!(done(ask(&mut stream, Kind::Query, Mark::Onion, &query)), 0);
+        // Through the onion, the proven call reaches its own checks.
+        assert_ne!(
+            ask(&mut stream, Kind::Credentialed, Mark::Onion, &credentialed),
+            refused(AdmissionRefusal::OnionOnly)
+        );
+    }
+}
+
 /// Over QUIC, as a remote gateway relays: unmarked refused, the onion's
 /// mark taken.
 #[test]

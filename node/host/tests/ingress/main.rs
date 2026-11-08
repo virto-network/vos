@@ -63,6 +63,29 @@ struct Served {
     _dir: tempfile::TempDir,
 }
 
+/// `instance`'s schema in `agent`, read over the socket at `socket` as
+/// the onion's gateway relays it.
+fn schema_marked(
+    socket: &std::path::Path,
+    agent: AgentId,
+    instance: InstanceId,
+) -> Option<vos_wire::schema::Schema> {
+    use std::io::Write;
+    let mut stream = api::connect(socket);
+    let body = (agent, instance).encode();
+    stream
+        .write_all(&vos_api::marked(
+            vos_api::Framing::Stream,
+            vos_api::Kind::Schema as u16,
+            vos_api::Mark::Onion,
+            1,
+            &body,
+        ))
+        .unwrap();
+    let (_, _, body) = api::receive(&mut stream).expect("an answer");
+    Option::decode_exact(&body).expect("an optional schema")
+}
+
 impl Served {
     /// A node with no hooks.
     fn plain() -> Self {
@@ -100,9 +123,9 @@ impl Served {
             &programs.counter_elf,
             Vec::new(),
         )));
-        let schema = vos_node::client::schema(&target, agent, COUNTER)
-            .unwrap()
-            .expect("an installed schema");
+        // Read through the onion: a node of an onion-only space answers no
+        // schema off it.
+        let schema = schema_marked(&socket, agent, COUNTER).expect("an installed schema");
         Self {
             node,
             target,

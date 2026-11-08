@@ -14,8 +14,14 @@
 //! nodes they have in common.
 //!
 //! Every write but `claim`, `claim_open` and a person's device methods is
-//! under the role `registrar`, and none is taken before
-//! `found` sets the space's handle and the ring's first root.
+//! under the role `registrar`, and none but the onion set's is taken
+//! before `found` sets the space's handle and the ring's first root.
+//!
+//! **The onion set** (`light-node.md` §6.1): the space's gateways' onions,
+//! each its key and its SSH host key, which the registrar sets and any
+//! caller reads; a device pins it at enrollment and refreshes it through
+//! any onion of it. Its answer is the gateway's to forge, as any answer
+//! it relays is.
 //!
 //! **The open claim** (`light-node.md` §3.3): a space that admits anyone,
 //! a home-only space, has its registrar `open` it; then any caller enrolls
@@ -62,7 +68,7 @@ use vos_sdk::p2::{self, InPlace, Secret, Tag, TagHash};
 use vos_sdk::prelude::*;
 use vos_wire::credentials::{
     self as tree, CredentialError, DEPTH, Digest, EMPTY, ENROLL_MANY, MAX_DEVICES, MAX_DIFFICULTY,
-    Open, Path, Ring, RootEntry, Siblings, Words, tables::RING_KEY,
+    MAX_ONIONS, Onion, Open, Path, Ring, RootEntry, Siblings, Words, tables::RING_KEY,
 };
 
 /// The open claim's terms and the current period's count.
@@ -176,6 +182,7 @@ pub struct Credentials {
     pending: Table<Digest, u32>,
     devices: Table<Digest, u32>,
     people: Table<u8, u32>,
+    onions: Table<u8, Vec<Onion>>,
 }
 
 #[messages]
@@ -196,6 +203,7 @@ impl Credentials {
             pending: Table::default(),
             devices: Table::default(),
             people: Table::default(),
+            onions: Table::default(),
         }
     }
 
@@ -542,6 +550,28 @@ impl Credentials {
                 root: tree::digest(&EMPTY[DEPTH]),
                 since: 0,
             })
+    }
+
+    /// Set the space's onion set, its gateways' onions, at most
+    /// [`MAX_ONIONS`], each once: a device pins it at enrollment and
+    /// refreshes it through any onion of it.
+    #[msg(role = "registrar")]
+    pub async fn set_onions(&mut self, onions: Vec<Onion>) -> Result<(), CredentialError> {
+        let repeated = onions
+            .iter()
+            .enumerate()
+            .any(|(at, onion)| onions[..at].iter().any(|seen| seen.key == onion.key));
+        if onions.len() > MAX_ONIONS || repeated {
+            return Err(CredentialError::TooMany);
+        }
+        self.onions.insert(&RING_KEY, &onions);
+        Ok(())
+    }
+
+    /// The space's onion set; empty until the registrar sets one.
+    #[msg]
+    pub async fn onions(&self) -> Vec<Onion> {
+        self.onions.get(&RING_KEY).unwrap_or_default()
     }
 
     /// The space's handle; zeros before `found`.

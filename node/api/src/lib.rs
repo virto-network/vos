@@ -131,7 +131,8 @@ impl Kind {
     }
 
     /// Whether the gateway's `vos-api` subsystem relays it: the public
-    /// reads, the node's time and queries.
+    /// reads, the node's time, queries, a session's calls and proven
+    /// calls. Workflow reads and the operator kinds go another way.
     pub fn relayed(self) -> bool {
         matches!(
             self,
@@ -140,7 +141,9 @@ impl Kind {
                 | Kind::AgentInfo
                 | Kind::Schema
                 | Kind::Devices
+                | Kind::Call
                 | Kind::Query
+                | Kind::Credentialed
         )
     }
 
@@ -288,7 +291,9 @@ mod tests {
                 Kind::AgentInfo,
                 Kind::Schema,
                 Kind::Devices,
-                Kind::Query
+                Kind::Call,
+                Kind::Query,
+                Kind::Credentialed
             ]
         );
         let nonces = Kind::ALL.into_iter().filter(|k| k.records_nonce()).count();

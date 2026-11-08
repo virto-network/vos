@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 use vos_api::{Kind, Mark};
 use vos_wire::ids::{AgentId, InstanceId, Principal};
 use vos_wire::ingress::{
-    AgentInfo, QueryCall, Rejection, Response, WorkflowRead, workflow_read_horizon,
+    AdmissionRefusal, AgentInfo, QueryCall, Rejection, Response, WorkflowRead,
+    workflow_read_horizon,
 };
 use vos_wire::records::{Installed, unstored};
 use vos_wire::schema::Schema;
@@ -205,6 +206,13 @@ impl Api {
         large: Option<LargePlace>,
     ) -> Vec<u8> {
         self.frames.fetch_add(1, Ordering::Relaxed);
+        // The space's own, from the header: no body decoded.
+        if !self.inner.settings.onion.admits(kind, mark) {
+            return match kind {
+                Kind::Schema | Kind::Devices => Option::<Schema>::None.encode(),
+                _ => Response::Rejected(Rejection::Admission(AdmissionRefusal::OnionOnly)).encode(),
+            };
+        }
         match kind {
             Kind::NodeKey => self.inner.node_id.encode(),
             Kind::Time => (self.inner.clock)().encode(),

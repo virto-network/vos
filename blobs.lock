@@ -1,12 +1,12 @@
 # Every pinned guest blob's SHA-256, its symbols and relocations stripped,
 # as `just build-blobs` builds it: `just blobs-lock` writes it, `just
 # check-blobs` checks it (the justfile's `_blob-hashes` says which blobs).
-4d09813a1b1e3d50dce0160f3030b14b1ba956aeb834729ee3c001b292e24be6  target/riscv64em-vos/release/final-verify.elf
-ce591f098862cfc472b4bdc03d756c93fddc0d988f01c71b9726f2ea292a25c7  target/riscv64em-vos/release/final-verify-test.elf
-3e6bfe60378c19c21c2504e1cfe1dd0dc8c267a30bd914c5128611d71850276e  target/riscv64em-vos/release/statement-service.elf
+8eaef15ecd9f4a7c594bdf4a38c51c390f8f865461b36c99f80cde71f4aaf99a  target/riscv64em-vos/release/final-verify.elf
+c3a8803233b1cf1b4d1b0b6a00bbe76579da098722a6cec27e666d38ecb20555  target/riscv64em-vos/release/final-verify-test.elf
+4aadd58eb9b615e555c17d47337905ec4956c2961c9a3a3ee06ed0258fde8e58  target/riscv64em-vos/release/statement-service.elf
 725f2116245b49fd2942726cfce18c55abb648a7629389b54c653c4cc9737f57  agent/programs/target/riscv64em-vos/release/vos-agent.elf
 7b88fe03e7dc51c7bea81bf26a16318199457e64e2b01210122655b53cca46a3  agent/programs/target/riscv64em-vos/release/vos-representative.elf
-168f4455d7cd9d939db5588302f64ab318a9103028c2299edd6130fbd8a3e12e  agent/programs/target/riscv64em-vos/release/vos-credentials.elf
+9521f1316779511733359cdf87814270680f35009a3f904d52106869aa49078f  agent/programs/target/riscv64em-vos/release/vos-credentials.elf
 318bb4160cb09050210cae1c4ea6f9f712ae1796d1dc41185e16802e8a9dbb70  agent/programs/target/riscv64em-vos/release/vos-personal.elf
 6f6192d31c62c9ba165124d8cedcea3d3642421e48d31b42c815264631753250  agent/programs/target/riscv64em-vos/release/vos-payments.elf
 ba73e499be0b59d6c21fdedbfae4fc3c806481baf767a94ca0fc05a163947ebf  agent/programs/target/riscv64em-vos/release/vos-homes.elf
@@ -23,7 +23,7 @@ c0a21a2e4b30a4ae5b9e921d2a481435e80b38a6c8a75fc15fc685f79a41cd33  agent/test-act
 d4638aaa0b2102cd85f4fb9566cddbb094b9ebd2e7228d4b42b1e559ecd5e447  agent/test-actors/target/riscv64em-vos/release/caller.elf
 9f99d8155be6b22e902eb20ec990d598c9e5e4948a36187b8851ee02e0a0e5a0  agent/test-actors/target/riscv64em-vos/release/compact.elf
 a7c578941f1a99dbde49f9354418df79ebe505f31b3b2fcc656924f3001dd60b  agent/test-actors/target/riscv64em-vos/release/counter.elf
-20e82398181a3f030358763cb8dad1b202596f1e0ee2f9da666e95880d4ac1bf  agent/test-actors/target/riscv64em-vos/release/credentials-next.elf
+ad9cf473d031e26b97baa905e3f0ce73cbaa3fd2f28db66cf1b6c93e8dc8011c  agent/test-actors/target/riscv64em-vos/release/credentials-next.elf
 6b749aa923113133b63f6a41ca76ca674ff3f744334c9d2bc42e5067c10d16a8  agent/test-actors/target/riscv64em-vos/release/device.elf
 e3b8715b075bded7ea8211ec100e432c5bcc26e2f479a9f5d46aaffc4c81bca4  agent/test-actors/target/riscv64em-vos/release/device-book-next.elf
 e4cc4aeacd070d1bcec62d8c829ebe9d0ffc4f13e0e923eea0f74c73ecdcc633  agent/test-actors/target/riscv64em-vos/release/device-next.elf

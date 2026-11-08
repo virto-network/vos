@@ -142,6 +142,74 @@ and the batch goes on as if it were absent; every replica's apply logs it
 at error level. The rows are kept for the operator to read; the next
 report or close writes the row afresh.
 
+## The onion service
+
+A space's gateways serve the same HTTP and SSH on an onion, and nothing
+else (`design/light-node.md` §6.1, `design/node-api.md` §6). Requests
+that came through it carry the onion's mark, which a node reads for an
+onion-only agent and for the space's own `onion` setting (`"any"`,
+`"anonymous"` for its proven calls only through the onion, `"all"` for an
+onion-only space; set it alike on every node of the space).
+
+- **arti in process** (a gateway built with the `tor` feature):
+
+  ```toml
+  [onion]
+  state = "/var/lib/vos-gateway/arti/state"
+  cache = "/var/lib/vos-gateway/arti/cache"
+  key = "/var/lib/vos-gateway/onion.key"   # made if missing
+  ```
+
+  The gateway prints `onion <address>` and `onion key <hex>` at start.
+  Full vanguards are always on. `pow = true` needs a gateway built with
+  `tor-pow`; no arti release has declared its service-side PoW ready, so
+  it is off by default.
+- **A C tor beside the gateway**, the fallback should arti's onion be
+  flooded (`design/light-node.md` §6.7): name its loopback listeners in
+  place of arti's directories,
+
+  ```toml
+  [onion]
+  sidecar_ssh = "127.0.0.1:2222"
+  sidecar_http = "127.0.0.1:8081"
+  ```
+
+  and give tor:
+
+  ```text
+  HiddenServiceDir /var/lib/tor/vos-gateway
+  HiddenServicePort 22 127.0.0.1:2222
+  HiddenServicePort 80 127.0.0.1:8081
+  HiddenServiceExportCircuitID haproxy
+  HiddenServiceMaxStreams 8
+  HiddenServiceMaxStreamsCloseCircuit 1
+  HiddenServiceEnableIntroDoSDefense 1
+  HiddenServicePoWDefensesEnabled 1
+  ```
+
+  `HiddenServiceExportCircuitID haproxy` is required: the gateway reads
+  each connection's circuit from the PROXY line tor writes first, and
+  closes a connection without one. C tor's PoW is stable, so turn it on.
+- **Caps:** each circuit counts as an address (4 connections, 20 requests
+  a second, a burst of 40, 8 streams at once); 1,024 circuits at once;
+  16 proven calls in flight through the onion, 2 a connection, 4 a
+  circuit; an agent's
+  calls from one circuit 4 a second, a burst of 16. Each is a key of
+  `[onion]` (`circuit_connections`, `circuit_rate`, `circuit_burst`,
+  `circuit_streams`, `circuits`, `proven`, `proven_per_connection`,
+  `proven_per_circuit`, `agent_rate`, `agent_burst`).
+- **The trust boundary of the loopback ports** is the host: the onion's
+  own SSH port and a C tor's listeners are on loopback, and a local
+  process could name a circuit to a C tor's listener. Run the gateway on a
+  host no untrusted user shares.
+- **The onion set:** the registrar sets the space's onions in the
+  credential actor (`set_onions`, each onion's key and its SSH host key),
+  which devices read (`onions`). Set it again when a gateway's onion
+  changes.
+- **Every node an upstream:** with `space = "<the space file>"`, a
+  gateway starts only if each node of the space is among its `nodes`. A
+  home's gateways must list every node.
+
 ## An ended space
 
 An equivocation's evidence ends a space at its venue for good: its roots

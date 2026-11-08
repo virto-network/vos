@@ -1,7 +1,10 @@
 //! Limits per source address, before any authentication or decoding:
-//! connections at once, and requests a second with a burst.
+//! connections at once, and requests a second with a burst. An onion
+//! service's clients have no address: each rendezvous circuit counts as
+//! one ([`crate::circuits`]).
 
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -50,16 +53,70 @@ pub fn counted(address: IpAddr) -> IpAddr {
     }
 }
 
+/// A token bucket for each key: `rate` a second on average, `burst` at
+/// once.
+pub struct Rate<K> {
+    rate: f64,
+    burst: f64,
+    buckets: Mutex<Buckets<K>>,
+}
+
+struct Buckets<K> {
+    by: HashMap<K, Bucket>,
+    swept: Instant,
+}
+
+impl<K: Hash + Eq> Rate<K> {
+    pub fn new(rate: u32, burst: u32) -> Self {
+        Self {
+            rate: f64::from(rate),
+            burst: f64::from(burst.max(1)),
+            buckets: Mutex::new(Buckets {
+                by: HashMap::new(),
+                swept: Instant::now(),
+            }),
+        }
+    }
+
+    /// Whether `key` may act now: a token taken from its bucket.
+    pub fn take(&self, key: K) -> bool {
+        let now = Instant::now();
+        let (rate, burst) = (self.rate, self.burst);
+        let mut buckets = self.buckets.lock().expect("the buckets");
+        if buckets.by.len() >= BUCKETS && now.duration_since(buckets.swept) >= SWEEP {
+            buckets.swept = now;
+            buckets.by.retain(|_, bucket| {
+                bucket.tokens + now.duration_since(bucket.at).as_secs_f64() * rate < burst
+            });
+            if buckets.by.len() >= BUCKETS {
+                // Still full: the longest idle half goes.
+                let mut idle: Vec<Instant> = buckets.by.values().map(|bucket| bucket.at).collect();
+                idle.sort_unstable();
+                let cut = idle[idle.len() / 2];
+                buckets.by.retain(|_, bucket| bucket.at > cut);
+            }
+        }
+        let bucket = buckets.by.entry(key).or_insert(Bucket {
+            tokens: burst,
+            at: now,
+        });
+        bucket.tokens =
+            (bucket.tokens + now.duration_since(bucket.at).as_secs_f64() * rate).min(burst);
+        bucket.at = now;
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Each address's connections and requests.
 pub struct Limits {
     per: PerAddress,
     open: Mutex<HashMap<IpAddr, usize>>,
-    buckets: Mutex<Buckets>,
-}
-
-struct Buckets {
-    by: HashMap<IpAddr, Bucket>,
-    swept: Instant,
+    requests: Rate<IpAddr>,
 }
 
 /// A connection's place among its address's, given back when it ends.
@@ -85,10 +142,7 @@ impl Limits {
         Arc::new(Self {
             per,
             open: Mutex::new(HashMap::new()),
-            buckets: Mutex::new(Buckets {
-                by: HashMap::new(),
-                swept: Instant::now(),
-            }),
+            requests: Rate::new(per.rate, per.burst),
         })
     }
 
@@ -111,36 +165,7 @@ impl Limits {
     /// Whether `address` may make a request now: a token taken from its
     /// bucket.
     pub fn request(&self, address: IpAddr) -> bool {
-        let address = counted(address);
-        let now = Instant::now();
-        let (rate, burst) = (f64::from(self.per.rate), f64::from(self.per.burst.max(1)));
-        let mut buckets = self.buckets.lock().expect("the buckets");
-        if buckets.by.len() >= BUCKETS && now.duration_since(buckets.swept) >= SWEEP {
-            buckets.swept = now;
-            buckets.by.retain(|_, bucket| {
-                bucket.tokens + now.duration_since(bucket.at).as_secs_f64() * rate < burst
-            });
-            if buckets.by.len() >= BUCKETS {
-                // Still full: the longest idle half goes.
-                let mut idle: Vec<Instant> = buckets.by.values().map(|bucket| bucket.at).collect();
-                idle.sort_unstable();
-                let cut = idle[idle.len() / 2];
-                buckets.by.retain(|_, bucket| bucket.at > cut);
-            }
-        }
-        let bucket = buckets.by.entry(address).or_insert(Bucket {
-            tokens: burst,
-            at: now,
-        });
-        bucket.tokens =
-            (bucket.tokens + now.duration_since(bucket.at).as_secs_f64() * rate).min(burst);
-        bucket.at = now;
-        if bucket.tokens >= 1.0 {
-            bucket.tokens -= 1.0;
-            true
-        } else {
-            false
-        }
+        self.requests.take(counted(address))
     }
 }
 
