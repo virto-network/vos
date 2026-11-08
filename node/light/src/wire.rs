@@ -114,20 +114,6 @@ pub fn outcome(body: &[u8]) -> Result<Outcome, DeviceError> {
     }
 }
 
-/// A query of `method` with `arguments` at `instance` of `agent`, as
-/// [`query`]: the open claim's terms (`opening`), `Homes`' lowest pooled
-/// agent (`pooled`) and its terms (`configured`).
-pub fn query_request(
-    agent: u32,
-    identity: &[u8; 32],
-    instance: u32,
-    method: &str,
-    arguments: Vec<u8>,
-    not_after: u64,
-) -> Result<Vec<u8>, DeviceError> {
-    query(agent, identity, instance, method, arguments, not_after)
-}
-
 /// A query's reply, decoded as `T`, from its answer.
 pub fn query_answer<T: Decode>(body: &[u8]) -> Result<T, DeviceError> {
     T::decode_exact(&reply(body)?).ok_or(DeviceError::Decode)
@@ -135,9 +121,11 @@ pub fn query_answer<T: Decode>(body: &[u8]) -> Result<T, DeviceError> {
 
 /// A query of `method` with `arguments` at `instance` of `agent`, whose
 /// identity is `identity`, good until `not_after` by the node's clock,
-/// signed by a key drawn for it alone; [`DeviceError::Prove`] if the
-/// operating system has no randomness to give.
-fn query(
+/// signed by a key drawn for it alone: the open claim's terms
+/// (`opening`), `Homes`' lowest pooled agent (`pooled`) and its terms
+/// (`configured`) among them. [`DeviceError::Prove`] if the operating
+/// system has no randomness to give.
+pub fn query_request(
     agent: u32,
     identity: &[u8; 32],
     instance: u32,
@@ -181,7 +169,7 @@ pub fn path_query(
     member: &Digest,
     not_after: u64,
 ) -> Result<Vec<u8>, DeviceError> {
-    query(
+    query_request(
         agent,
         identity,
         instance,
@@ -198,7 +186,7 @@ pub fn root_query(
     instance: u32,
     not_after: u64,
 ) -> Result<Vec<u8>, DeviceError> {
-    query(agent, identity, instance, "root", Vec::new(), not_after)
+    query_request(agent, identity, instance, "root", Vec::new(), not_after)
 }
 
 /// A query's reply bytes, from its answer: `Ran` with the handler's
