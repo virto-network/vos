@@ -2612,13 +2612,17 @@ arti's service-side PoW behind the `tor-pow` feature and the file's
 `pow`, off by default. Port 80 is the gateway's own HTTP server, port 22
 its own SSH port, both marking onion; any other port is refused `DONE`.
 s4-server serves a listener, not a stream, so each SSH stream is carried
-to the onion's SSH port on a loopback listener and the carrier's
-loopback port names it: the port counts the stream's circuit, and serves
-no channel to a loopback connection no stream carries. The same ports
+to the onion's SSH port on a loopback listener and the carrier's exact
+loopback address names it: the port counts the stream's circuit, and
+serves no channel to a connection no stream carries. The onion's SSH port
+serves the `vos-api` subsystem and no demo screens, whose host service
+would answer a connection no stream carries: s4's screens over the onion
+want s4-server serving a stream. The same ports
 serve a C tor beside the gateway, the documented fallback, whose
 `HiddenServiceExportCircuitID haproxy` names each stream's circuit. The
 `vos-api` relay set holds `Call` and `Credentialed`. A proven call's
-body is read only once it holds one of the 64 places the SSH ports share.
+body is read only once it holds its places, the port's, its connection's
+and its circuit's, and must then arrive within 30 s.
 The registrar serves the onion set (the credential actor's `set_onions`
 and `onions`, each onion's key and its SSH host key). A gateway given its
 space file starts only if every node of it is an upstream. A space's
@@ -2893,13 +2897,16 @@ place:
 an address of its own (4 connections, 20 requests a second, a burst of
 40); 8 streams at once a circuit, 1,024 circuits at once, a circuit with
 no stream let go after 60 s; 16 proven calls in flight through the
-onion and 2 from one connection; an agent's calls and proven calls from
-one circuit 4 a second, a burst of 16. Past a cap the gateway answers
-`Busy` and asks no node. A flood of junk proven calls the size of a device
-proof, from four connections through a port capped this way, held at most
-the port's proven calls behind it and answered the rest `Busy`, while a
-member's queries and a session's call on another connection were answered
-(the gateway's test 22, in process, no network). The flood through the
+onion, 2 from one connection and 4 from one circuit, taken from a proven
+call's header before its body is read (a call waits for the onion's, and
+past its connection's or circuit's the channel is closed); an agent's
+calls and proven calls from one circuit 4 a second, a burst of 16. Past a
+cap on a request already read the gateway answers `Busy` and asks no
+node. A flood of junk proven calls the size of a device proof, from eight
+connections through a port capped this way, held at most the port's
+proven calls behind it, while a member's queries, a session's call and
+the member's own proven call on another connection were answered (the
+gateway's test 22, in process, no network). The flood through the
 live Tor network is not measured yet: M5 measures it.
 
 ### 6.7 What Tor fixes, and what it does not

@@ -555,15 +555,17 @@ could replay, and a relay keeps nothing it can reuse.
   a call or a proof a `BadSignature` or a refused proof, and nothing more.
   Workflow reads and the operator kinds stay off it.
   A `Credentialed` body past a call's limit, up to a device proof's
-  1.5 MiB, is read only once it holds one of the 64 places the gateway's
-  SSH ports share (`caps::PROVEN_BODIES`, as many as its HTTP holds):
-  past them the channel reads no further until one is given back, the
-  frame's deadline running from then. Each `Call` and `Credentialed` then
-  passes its port's caps (`caps::Caps`) or is answered `Busy` by the
-  gateway with no node asked: the proven calls in flight through the port
-  (16 on the onion), and from one connection (2), and an agent's calls
-  and proven calls from one address or circuit (4 a second, a burst of
-  16). The clearnet's ports cap no calls: their clients' addresses bound
+  1.5 MiB, is read only once it holds its places: on a capped port (the
+  onion's, `caps::Caps`) among the port's proven calls in flight (16),
+  waited for with the channel reading nothing, and among its connection's
+  (2) and its circuit's (4), past which it is answered `Busy` from its
+  header and the channel closed, its body unread; on an uncapped port
+  among the port's own 64 proven bodies (`caps::PROVEN_BODIES`, as many
+  as its HTTP holds). The body must then arrive within 30 s. A `Call` or
+  a `Credentialed` read whole passes the same caps and an agent's rate
+  from one address or circuit (4 a second, a burst of 16), or is answered
+  `Busy` by the gateway with no node asked. The clearnet's ports cap no
+  calls: their clients' addresses bound
   them. At most 16 requests in flight a channel, past which it
   stops reading; each frame within 60 s of its first byte. A channel
   holds a place among its address's connections, as an HTTP connection
@@ -589,14 +591,15 @@ could replay, and a relay keeps nothing it can reuse.
   circuits for virtual port 22 or 80, anything else refused `DONE`. Port
   80 is the gateway's own HTTP server, plain inside the onion, marking
   onion; port 22, with an SSH port, the onion's own SSH port on a
-  loopback listener marking onion (s4-server serves a listener, not a
-  stream: each stream is carried to it, the carrier's loopback port naming
-  the stream, and a loopback connection no stream carries is served no
-  channel). A circuit counts as an address of its own,
+  loopback listener marking onion, its `vos-api` subsystem and no demo
+  screens (s4-server serves a listener, not a stream: each stream is
+  carried to it, the carrier's exact loopback address naming the stream,
+  and a connection no stream carries is served no channel). A circuit counts as an address of its own,
   `fd76:6f73:<circuit>::/64`, each stream a port of it: 4 connections at
   once, 20 requests a second with a burst of 40; 8 streams at once a
   circuit (arti's `max_concurrent_streams_per_circuit` too), 1,024
-  circuits at once, a circuit holding no stream for 60 s let go. The
+  circuits at once (a C tor's circuit holding its place while its streams
+  are open), a circuit of arti's holding no stream for 60 s let go. The
   streams come from **arti in process** (the `tor` feature: arti-client
   0.47.0 pinned exactly, one `TorClient` with full vanguards, the
   onion's key from the gateway's `key` file inserted once into arti's
@@ -606,8 +609,10 @@ could replay, and a relay keeps nothing it can reuse.
   declared it ready), or from **a C tor beside the gateway**
   (`sidecar_ssh`, `sidecar_http`: loopback listeners its
   `HiddenServicePort`s forward to, each connection naming its circuit in
-  the PROXY line `HiddenServiceExportCircuitID haproxy` writes;
-  `docs/operations.md`).
+  the PROXY line `HiddenServiceExportCircuitID haproxy` writes, a source
+  in `fc00:dead:beef:4dad::/64`, at most 256 lines read at once;
+  `docs/operations.md`). The loopback listeners' trust boundary is the
+  host: a local process may name any circuit.
 - **Every node an upstream:** with `space`, the space file of its nodes,
   the gateway starts only if every node of it is among its `nodes`, as a
   home's gateways list every node (`light-node.md` §3.3).
@@ -674,8 +679,8 @@ could replay, and a relay keeps nothing it can reuse.
 | 19 | the mark on the relay path: an HTTP port marking clearnet and one marking onion in front of the onion-only agent, the clearnet's call `OnionOnly`, the onion's `UnknownKey` then run; the `vos-api` subsystem relaying an onion-marked query under its clearnet port's mark (`OnionOnly`) and under an onion port's (answered) | gateway |
 | 20 | the codec: the mark pinned, each read back, an unknown one `UnknownMark` from the header; the fuzz target's frames written again being the bytes read | `vos-api` |
 | 21 | a space's own ask of the mark: proven calls refused unmarked and clearnet before any proof is read while key-signed queries are answered; an onion-only space refusing every read of an agent off the onion, an agent's record open | node |
-| 22 | a flood of junk proven calls, a device proof's size each, from four connections through a port capped as the onion's: at most its proven calls held at once behind it, the rest `Busy` from the gateway, every place given back; a member's queries and a session's call on another connection answered meanwhile | gateway |
-| 23 | the onion's streams: a circuit one address and each stream a port of it, the circuits' and streams' caps; HTTP streams at the onion's listener, SSH streams carried and named by their carrier, other ports refused; C tor's PROXY lines read | gateway |
+| 22 | a flood of junk proven calls, a device proof's size each, from eight connections through a port capped as the onion's: at most its proven calls held at once behind it, the rest waiting with their bodies unread, every place given back; a connection past its own answered `Busy` from the header and closed; a member's queries, a session's call and the member's own proven call on another connection answered meanwhile | gateway |
+| 23 | the onion's streams: a circuit one address and each stream a port of it, the circuits' and streams' caps, a C tor's circuit held by its streams; HTTP streams at the onion's listener, SSH streams carried and named by their carrier's exact address, other ports refused; C tor's PROXY lines read, its streams served on their circuits | gateway |
 
 ## 9. Design choices
 

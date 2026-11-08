@@ -192,11 +192,16 @@ onion-only space; set it alike on every node of the space).
   closes a connection without one. C tor's PoW is stable, so turn it on.
 - **Caps:** each circuit counts as an address (4 connections, 20 requests
   a second, a burst of 40, 8 streams at once); 1,024 circuits at once;
-  16 proven calls in flight through the onion, 2 a connection; an agent's
+  16 proven calls in flight through the onion, 2 a connection, 4 a
+  circuit; an agent's
   calls from one circuit 4 a second, a burst of 16. Each is a key of
   `[onion]` (`circuit_connections`, `circuit_rate`, `circuit_burst`,
   `circuit_streams`, `circuits`, `proven`, `proven_per_connection`,
-  `agent_rate`, `agent_burst`).
+  `proven_per_circuit`, `agent_rate`, `agent_burst`).
+- **The trust boundary of the loopback ports** is the host: the onion's
+  own SSH port and a C tor's listeners are on loopback, and a local
+  process could name a circuit to a C tor's listener. Run the gateway on a
+  host no untrusted user shares.
 - **The onion set:** the registrar sets the space's onions in the
   credential actor (`set_onions`, each onion's key and its SSH host key),
   which devices read (`onions`). Set it again when a gateway's onion
