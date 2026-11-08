@@ -57,8 +57,7 @@ use zeroize::Zeroizing;
 use crate::group::{Alarm, Archive, DeviceGroup, GroupError};
 use crate::kit::{self, KitSecret};
 use crate::light::{Error, Ingest, Light, Queued};
-/// How the link reaches the agent: no request to it takes the clearnet.
-pub use crate::route::Route;
+use crate::route::Route;
 use crate::sealed::{self, Body, MAX_BODY, OpenError, View};
 use crate::sync::{Blake2b256, Held, Quarantined};
 use merkle_crdt::Hasher as _;

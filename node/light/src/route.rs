@@ -89,13 +89,25 @@ impl Purpose {
     }
 
     /// Whether a request of `kind` may go under this purpose: a proven
-    /// call only as [`Purpose::Proven`], which carries nothing else; a
-    /// kind the gateway's subsystem does not relay never; s4's screens no
-    /// node-API request at all.
+    /// call only as [`Purpose::Proven`], which carries nothing else; the
+    /// other anonymous purposes reads alone; a kind the gateway's
+    /// subsystem does not relay never; s4's screens no node-API request at
+    /// all.
     pub fn admits(self, kind: Kind) -> bool {
         match self {
             Purpose::Screens => false,
             Purpose::Proven => kind == Kind::Credentialed,
+            // An anonymous purpose carries reads alone, so no key-signed
+            // call joins its circuit.
+            Purpose::Fetch | Purpose::Feed => matches!(
+                kind,
+                Kind::NodeKey
+                    | Kind::Time
+                    | Kind::AgentInfo
+                    | Kind::Schema
+                    | Kind::Devices
+                    | Kind::Query
+            ),
             _ => kind.relayed() && kind != Kind::Credentialed,
         }
     }
@@ -347,6 +359,10 @@ mod tests {
         for purpose in [Purpose::Fetch, Purpose::Member, Purpose::Personal] {
             assert!(purpose.admits(Kind::Query) && purpose.admits(Kind::Time));
         }
+        for purpose in [Purpose::Fetch, Purpose::Feed] {
+            assert!(!purpose.admits(Kind::Call), "{purpose:?}");
+        }
+        assert!(Purpose::Member.admits(Kind::Call) && Purpose::Personal.admits(Kind::Call));
         assert!(!Purpose::Member.admits(Kind::Install));
     }
 }

@@ -20,8 +20,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Instant;
 
-use vos_light::personal::{Answer, Frontier, Link, Route, SealedSync};
+use vos_light::personal::{Answer, Frontier, Link, SealedSync};
 use vos_light::release::Package;
+use vos_light::route::Route;
 use vos_wire::ids::{InstanceId, MethodId};
 use vos_wire::personal::{
     ANSWER_BYTES, Envelope, Header, MAX_ENVELOPE, PersonalError, Pushed, Scope, Woken, envelope_id,

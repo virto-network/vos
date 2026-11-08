@@ -1,10 +1,17 @@
 //! The client: spaces, their routes, a connection a purpose, the spare,
 //! dormancy, s4's screens and the onion set's refresh.
+//!
+//! Every connection is made under a [`Version`]: the space's routes as
+//! they were and the awake period it opened in. A connection is used only
+//! under the version it was made in, and a change of the space's routes or
+//! a dormancy closes every connection of the old one, requests in flight
+//! included, so none outlives the route it was chosen for.
 
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use tokio::task::JoinHandle;
 use vos_api::Kind;
@@ -38,11 +45,13 @@ pub enum Error {
     Dormant,
     /// No connection opened within its attempts: the last one's failure.
     Unreachable(String),
-    /// The connection was lost, or missed the request's deadline, before
-    /// the answer: it is closed.
+    /// The connection was lost, missed the request's deadline, or was
+    /// closed by a change of the space's routes, before the answer.
     Lost,
     /// The request is not a node-API request: no kind leads it.
     Malformed,
+    /// A descriptor handed over could not be used.
+    Local(String),
     /// The registrar's answer to the onion set's refresh.
     Answer(DeviceError),
     /// The registrar served an empty set, or one past [`MAX_ONIONS`] or
@@ -64,7 +73,8 @@ impl std::fmt::Display for Error {
             Error::Unreachable(why) => write!(f, "the space's gateways do not answer: {why}"),
             Error::Lost => f.write_str("the connection was lost"),
             Error::Malformed => f.write_str("not a node-API request"),
-            Error::Answer(error) => write!(f, "the onion set: {error:?}"),
+            Error::Local(why) => write!(f, "the descriptor: {why}"),
+            Error::Answer(error) => write!(f, "the onion set: {error}"),
             Error::Onions => f.write_str("the registrar served no usable onion set"),
         }
     }
@@ -72,32 +82,85 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// The routes and the awake period a connection was made under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Version {
+    awake: u64,
+    routes: u64,
+}
+
+/// A connection, and the version it was made under.
+struct Held {
+    version: Version,
+    connection: Arc<Connection>,
+}
+
+/// A kept-open group's connection, and when its last open failed.
+#[derive(Default)]
+struct Kept {
+    held: Option<Held>,
+    failed: Option<Instant>,
+}
+
 /// A kept-open purpose's connection in a space.
 type Group = (Purpose, SpaceId);
 
 /// A slot for a group's connection, held while it opens, so a group opens
 /// one at a time.
-type Slot = Arc<tokio::sync::Mutex<Option<Arc<Connection>>>>;
+type Slot = Arc<tokio::sync::Mutex<Kept>>;
 
 /// What the client holds.
 #[derive(Default)]
 struct State {
-    spaces: HashMap<SpaceId, Routes>,
+    /// Each space's routes and their version.
+    spaces: HashMap<SpaceId, (Routes, u64)>,
+    /// The last routes' version given.
+    versions: u64,
     groups: HashMap<Group, Slot>,
+    /// Every open connection, by its space, closed when its routes change
+    /// or the client goes dormant.
+    live: Vec<(SpaceId, Weak<Connection>)>,
     /// The space the spare is kept for, and the spare once built.
     spare_for: Option<SpaceId>,
-    spare: Option<Arc<Connection>>,
+    spare: Option<Held>,
     /// The task building the spare.
     building: Option<JoinHandle<()>>,
     /// The task closing idle connections.
     reaper: Option<JoinHandle<()>>,
-    /// s4's screen session's carrying task.
-    screens: Option<JoinHandle<()>>,
+    /// s4's screen session's space and carrying task.
+    screens: Option<(SpaceId, JoinHandle<()>)>,
     dormant: bool,
+    /// Moved at each dormancy and each waking.
+    awake: u64,
+}
+
+impl State {
+    /// Close every connection of `space`, or of every space, its spare and
+    /// its screens.
+    fn close(&mut self, space: Option<SpaceId>) {
+        let of = |other: &SpaceId| space.is_none_or(|space| space == *other);
+        self.live.retain(|(other, connection)| {
+            if !of(other) {
+                return connection.strong_count() > 0;
+            }
+            if let Some(connection) = connection.upgrade() {
+                connection.close();
+            }
+            false
+        });
+        self.groups.retain(|(_, other), _| !of(other));
+        if self.spare_for.is_some_and(|spare| of(&spare)) {
+            self.spare = None;
+        }
+        if self.screens.as_ref().is_some_and(|(other, _)| of(other)) {
+            let (_, task) = self.screens.take().expect("the screens");
+            task.abort();
+        }
+    }
 }
 
 /// The light node's client of its spaces' gateways. Cloned, it shares
-/// them. Its tasks run on the current tokio runtime.
+/// them. Made and used on a tokio runtime, whose tasks it spawns.
 #[derive(Clone)]
 pub struct Client {
     inner: Arc<Inner>,
@@ -107,8 +170,6 @@ struct Inner {
     dial: Arc<dyn Dial>,
     config: Config,
     state: Mutex<State>,
-    /// Moved at each dormancy: a connection opened across one is dropped.
-    epoch: AtomicU64,
     /// Where the next connection's onion is taken from in a pinned set.
     next: AtomicU64,
 }
@@ -116,13 +177,10 @@ struct Inner {
 impl Drop for Inner {
     fn drop(&mut self) {
         let state = self.state.get_mut().expect("the client's state");
-        for task in [
-            state.building.take(),
-            state.reaper.take(),
-            state.screens.take(),
-        ]
-        .into_iter()
-        .flatten()
+        state.close(None);
+        for task in [state.building.take(), state.reaper.take()]
+            .into_iter()
+            .flatten()
         {
             task.abort();
         }
@@ -146,7 +204,6 @@ impl Client {
                 dial,
                 config,
                 state: Mutex::new(State::default()),
-                epoch: AtomicU64::new(0),
                 next: AtomicU64::new(rand_u64()),
             }),
         };
@@ -158,24 +215,40 @@ impl Client {
         self.inner.state.lock().expect("the client's state")
     }
 
-    /// Set `space`'s routes; its connections close if its routes changed.
+    /// Set `space`'s routes; if they changed, its connections, spare and
+    /// screens close, requests in flight on them included.
     pub fn set_space(&self, space: SpaceId, routes: Routes) {
+        self.replace_routes(space, |current| *current = routes);
+    }
+
+    /// Change `space`'s routes by `change` (a new space starts from
+    /// none), closing what the old ones opened if they changed.
+    fn replace_routes(&self, space: SpaceId, change: impl FnOnce(&mut Routes)) {
         let mut state = self.state();
-        if state.spaces.get(&space) == Some(&routes) {
+        let mut routes = state
+            .spaces
+            .get(&space)
+            .map(|(routes, _)| routes.clone())
+            .unwrap_or_default();
+        let before = state.spaces.contains_key(&space).then(|| routes.clone());
+        change(&mut routes);
+        if before.as_ref() == Some(&routes) {
             return;
         }
-        state.spaces.insert(space, routes);
-        state.groups.retain(|(_, of), _| *of != space);
-        if state.spare_for == Some(space) {
-            state.spare = None;
-        }
+        state.versions += 1;
+        let version = state.versions;
+        state.spaces.insert(space, (routes, version));
+        state.close(Some(space));
         drop(state);
         self.refill();
     }
 
     /// `space`'s routes.
     pub fn routes(&self, space: &SpaceId) -> Option<Routes> {
-        self.state().spaces.get(space).cloned()
+        self.state()
+            .spaces
+            .get(space)
+            .map(|(routes, _)| routes.clone())
     }
 
     /// Keep a spare connection built ahead to `space` for its next proven
@@ -195,29 +268,24 @@ impl Client {
         self.state()
             .spare
             .as_ref()
-            .is_some_and(|spare| !spare.is_closed())
+            .is_some_and(|spare| !spare.connection.is_closed())
     }
 
-    /// Dormant, or awake: dormant closes every connection, drops the spare
-    /// and the screens, stops every timer and tells arti; awake starts them
-    /// again and builds the spare.
+    /// Dormant, or awake: dormant closes every connection (requests in
+    /// flight end), the spare and the screens, stops every timer and tells
+    /// arti; awake starts them again and builds the spare.
     pub fn set_dormant(&self, dormant: bool) {
         let mut state = self.state();
         if state.dormant == dormant {
             return;
         }
         state.dormant = dormant;
-        self.inner.epoch.fetch_add(1, Ordering::SeqCst);
+        state.awake += 1;
         if dormant {
-            state.groups.clear();
-            state.spare = None;
-            for task in [
-                state.building.take(),
-                state.reaper.take(),
-                state.screens.take(),
-            ]
-            .into_iter()
-            .flatten()
+            state.close(None);
+            for task in [state.building.take(), state.reaper.take()]
+                .into_iter()
+                .flatten()
             {
                 task.abort();
             }
@@ -251,50 +319,79 @@ impl Client {
         if !purpose.admits(kind) {
             return Err(Refused::Kind.into());
         }
-        let routes = self.space(&space)?;
-        let route = routes.route(purpose)?;
         let deadline = if kind == Kind::Credentialed {
             self.inner.config.proven
         } else {
             self.inner.config.request
         };
-        if purpose.one_shot() {
-            let connection = match self.take_spare(space, purpose, route) {
-                Some(spare) => spare,
-                None => Arc::new(self.open(&routes, route).await?),
-            };
-            let answered =
-                tokio::time::timeout(deadline, connection.request(kind as u16, body)).await;
-            drop(connection);
+        let connection = if purpose.one_shot() {
+            let (routes, route, version) = self.current(space, purpose)?;
+            let spare = self.take_spare(space, purpose, version);
             if purpose == Purpose::Proven {
+                // The next spare is built while this call goes.
                 self.refill();
             }
-            return answered.map_err(|_| Error::Lost)?.map_err(|_| Error::Lost);
-        }
-        let slot = self.slot((purpose, space))?;
-        let connection = {
-            let mut held = slot.lock().await;
-            match held.as_ref() {
-                Some(connection) if !connection.is_closed() => Arc::clone(connection),
-                _ => {
-                    let connection = Arc::new(self.open(&routes, route).await?);
-                    *held = Some(Arc::clone(&connection));
-                    connection
-                }
+            match spare {
+                Some(spare) => spare,
+                None => self.open(space, &routes, route, version).await?,
             }
+        } else {
+            self.kept((purpose, space)).await?
         };
-        match tokio::time::timeout(deadline, connection.request(kind as u16, body)).await {
-            Ok(Ok(answer)) => Ok(answer),
-            _ => {
-                // Lost, or past its deadline: the connection goes.
-                let mut held = slot.lock().await;
-                if held
-                    .as_ref()
-                    .is_some_and(|held| Arc::ptr_eq(held, &connection))
-                {
-                    *held = None;
+        let answered = tokio::time::timeout(deadline, connection.request(kind as u16, body)).await;
+        match answered {
+            Ok(Ok(answer)) => {
+                if purpose.one_shot() {
+                    connection.close();
                 }
+                Ok(answer)
+            }
+            _ => {
+                connection.close();
                 Err(Error::Lost)
+            }
+        }
+    }
+
+    /// A kept-open group's connection, open under the space's current
+    /// routes: the one held, or a new one. A request that waited while
+    /// another's open failed fails with it, rather than trying again.
+    async fn kept(&self, group: Group) -> Result<Arc<Connection>, Error> {
+        let (purpose, space) = group;
+        let slot = {
+            let mut state = self.state();
+            if state.dormant {
+                return Err(Error::Dormant);
+            }
+            Arc::clone(state.groups.entry(group).or_default())
+        };
+        let waited = Instant::now();
+        let mut kept = slot.lock().await;
+        // The routes as they are now, after the wait.
+        let (routes, route, version) = self.current(space, purpose)?;
+        if let Some(held) = &kept.held
+            && held.version == version
+            && !held.connection.is_closed()
+        {
+            return Ok(Arc::clone(&held.connection));
+        }
+        if kept.failed.is_some_and(|failed| failed > waited) {
+            return Err(Error::Unreachable(
+                "the connection another request opened failed".into(),
+            ));
+        }
+        match self.open(space, &routes, route, version).await {
+            Ok(connection) => {
+                kept.held = Some(Held {
+                    version,
+                    connection: Arc::clone(&connection),
+                });
+                kept.failed = None;
+                Ok(connection)
+            }
+            Err(error) => {
+                kept.failed = Some(Instant::now());
+                Err(error)
             }
         }
     }
@@ -306,19 +403,15 @@ impl Client {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        let routes = self.space(&space)?;
-        let route = routes.route(Purpose::Screens)?;
+        let (routes, route, version) = self.current(space, Purpose::Screens)?;
         let (mut gateway, ssh_host_key) = self.connect(&routes, route).await?;
+        let mut state = self.state();
+        Self::still(&state, space, version)?;
         let task = tokio::spawn(async move {
             let mut stream = stream;
             let _ = tokio::io::copy_bidirectional(&mut stream, &mut gateway).await;
         });
-        let mut state = self.state();
-        if state.dormant {
-            task.abort();
-            return Err(Error::Dormant);
-        }
-        if let Some(last) = state.screens.replace(task) {
+        if let Some((_, last)) = state.screens.replace((space, task)) {
             last.abort();
         }
         Ok(Screens {
@@ -338,9 +431,9 @@ impl Client {
         let stream = std::os::unix::net::UnixStream::from(descriptor);
         stream
             .set_nonblocking(true)
-            .map_err(|error| Error::Unreachable(error.to_string()))?;
+            .map_err(|error| Error::Local(error.to_string()))?;
         let stream = tokio::net::UnixStream::from_std(stream)
-            .map_err(|error| Error::Unreachable(error.to_string()))?;
+            .map_err(|error| Error::Local(error.to_string()))?;
         self.screens(space, stream).await
     }
 
@@ -349,7 +442,7 @@ impl Client {
         self.state()
             .screens
             .as_ref()
-            .is_some_and(|task| !task.is_finished())
+            .is_some_and(|(_, task)| !task.is_finished())
     }
 
     /// Read `space`'s onion set from its registrar, through the pinned set,
@@ -382,61 +475,71 @@ impl Client {
         if onions.is_empty() || onions.len() > MAX_ONIONS || repeated {
             return Err(Error::Onions);
         }
-        let mut state = self.state();
-        let routes = state.spaces.get_mut(&space).ok_or(Refused::UnknownSpace)?;
-        if routes.onions != onions {
-            routes.onions = onions.clone();
-            state.groups.retain(|(_, of), _| *of != space);
-            if state.spare_for == Some(space) {
-                state.spare = None;
-            }
-            drop(state);
-            self.refill();
+        if !self.state().spaces.contains_key(&space) {
+            return Err(Refused::UnknownSpace.into());
         }
+        let fresh = onions.clone();
+        self.replace_routes(space, move |routes| routes.onions = fresh);
         Ok(onions)
     }
 
-    fn space(&self, space: &SpaceId) -> Result<Routes, Error> {
+    /// `space`'s routes, the route `purpose` takes there, and the version
+    /// a connection for it is made under.
+    fn current(&self, space: SpaceId, purpose: Purpose) -> Result<(Routes, Route, Version), Error> {
         let state = self.state();
         if state.dormant {
             return Err(Error::Dormant);
         }
-        Ok(state
-            .spaces
-            .get(space)
-            .cloned()
-            .ok_or(Refused::UnknownSpace)?)
+        let (routes, version) = state.spaces.get(&space).ok_or(Refused::UnknownSpace)?;
+        let route = routes.route(purpose)?;
+        Ok((
+            routes.clone(),
+            route,
+            Version {
+                awake: state.awake,
+                routes: *version,
+            },
+        ))
     }
 
-    fn slot(&self, group: Group) -> Result<Slot, Error> {
-        let mut state = self.state();
+    /// Whether `version` is still `space`'s: refused when the client went
+    /// dormant, or the routes changed, since.
+    fn still(state: &State, space: SpaceId, version: Version) -> Result<(), Error> {
         if state.dormant {
             return Err(Error::Dormant);
         }
-        Ok(Arc::clone(state.groups.entry(group).or_default()))
+        let routes = state.spaces.get(&space).map(|(_, version)| *version);
+        if state.awake != version.awake || routes != Some(version.routes) {
+            return Err(Error::Lost);
+        }
+        Ok(())
     }
 
-    /// The spare, for a proven call to `space` on the onion, if it is built
-    /// and still open.
+    /// The spare, for a proven call to `space` under `version`, if it is
+    /// built and still open.
     fn take_spare(
         &self,
         space: SpaceId,
         purpose: Purpose,
-        route: Route,
+        version: Version,
     ) -> Option<Arc<Connection>> {
-        if purpose != Purpose::Proven || route != Route::Onion {
+        if purpose != Purpose::Proven {
             return None;
         }
         let mut state = self.state();
         if state.spare_for != Some(space) {
             return None;
         }
-        state.spare.take().filter(|spare| !spare.is_closed())
+        state
+            .spare
+            .take()
+            .filter(|spare| spare.version == version && !spare.connection.is_closed())
+            .map(|spare| spare.connection)
     }
 
     /// Build the spare if one is wanted and none is built or building.
     fn refill(&self) {
-        let mut state = self.state();
+        let state = self.state();
         let Some(space) = state.spare_for else {
             return;
         };
@@ -444,34 +547,37 @@ impl Client {
             .building
             .as_ref()
             .is_some_and(|task| !task.is_finished());
-        let built = state.spare.as_ref().is_some_and(|spare| !spare.is_closed());
-        if state.dormant || building || built {
+        let built = state
+            .spare
+            .as_ref()
+            .is_some_and(|spare| !spare.connection.is_closed());
+        if building || built {
             return;
         }
-        let Some(routes) = state.spaces.get(&space).cloned() else {
+        drop(state);
+        let Ok((routes, Route::Onion, version)) = self.current(space, Purpose::Proven) else {
             return;
         };
-        if routes.route(Purpose::Proven) != Ok(Route::Onion) {
-            return;
-        }
         let client = Arc::downgrade(&self.inner);
-        state.building = Some(tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let Some(inner) = client.upgrade() else {
                 return;
             };
             let client = Client { inner };
-            let epoch = client.inner.epoch.load(Ordering::SeqCst);
-            let Ok(spare) = client.open(&routes, Route::Onion).await else {
+            let Ok(spare) = client.open(space, &routes, Route::Onion, version).await else {
                 return;
             };
             let mut state = client.state();
-            if client.inner.epoch.load(Ordering::SeqCst) == epoch
-                && state.spare_for == Some(space)
-                && state.spaces.get(&space) == Some(&routes)
-            {
-                state.spare = Some(Arc::new(spare));
+            if state.spare_for == Some(space) && state.spare.is_none() {
+                state.spare = Some(Held {
+                    version,
+                    connection: spare,
+                });
+            } else {
+                spare.close();
             }
-        }));
+        });
+        self.state().building = Some(task);
     }
 
     /// Close kept-open connections idle past their time, each half of it.
@@ -480,7 +586,7 @@ impl Client {
         let idle = self.inner.config.idle;
         let task = tokio::spawn(async move {
             loop {
-                tokio::time::sleep(idle / 2).await;
+                tokio::time::sleep((idle / 2).max(Duration::from_millis(100))).await;
                 let Some(inner) = client.upgrade() else {
                     return;
                 };
@@ -489,14 +595,15 @@ impl Client {
                     state.groups.values().cloned().collect()
                 };
                 for slot in slots {
-                    let Ok(mut held) = slot.try_lock() else {
+                    // A slot held is in use, or opening.
+                    let Ok(mut kept) = slot.try_lock() else {
                         continue;
                     };
-                    let stale = held
-                        .as_ref()
-                        .is_some_and(|held| held.is_closed() || held.last().elapsed() >= idle);
-                    if stale {
-                        *held = None;
+                    let stale = kept.held.as_ref().is_some_and(|held| {
+                        held.connection.is_closed() || held.connection.last().elapsed() >= idle
+                    });
+                    if stale && let Some(held) = kept.held.take() {
+                        held.connection.close();
                     }
                 }
             }
@@ -506,12 +613,18 @@ impl Client {
         }
     }
 
-    /// A new connection to the space on `route`, its `vos-api` channel
-    /// open; each failed attempt retried on a new circuit, through the
-    /// next pinned onion.
-    async fn open(&self, routes: &Routes, route: Route) -> Result<Connection, Error> {
+    /// A new connection to `space` on `route` under `version`, its
+    /// `vos-api` channel open; each failed attempt retried on a new
+    /// circuit, through the next pinned onion. Refused, and closed, if the
+    /// version is no longer the space's once it opened.
+    async fn open(
+        &self,
+        space: SpaceId,
+        routes: &Routes,
+        route: Route,
+        version: Version,
+    ) -> Result<Arc<Connection>, Error> {
         let config = self.inner.config;
-        let epoch = self.inner.epoch.load(Ordering::SeqCst);
         let mut last = String::from("no attempt");
         let turn = self
             .inner
@@ -535,17 +648,17 @@ impl Client {
                         OpenError::Randomness => "no randomness".into(),
                     })
             };
-            match opened.await {
+            let opened = opened.await;
+            let mut state = self.state();
+            Self::still(&state, space, version)?;
+            match opened {
                 Ok(connection) => {
-                    if self.inner.epoch.load(Ordering::SeqCst) != epoch {
-                        return Err(Error::Dormant);
-                    }
+                    let connection = Arc::new(connection);
+                    state.live.retain(|(_, live)| live.strong_count() > 0);
+                    state.live.push((space, Arc::downgrade(&connection)));
                     return Ok(connection);
                 }
                 Err(why) => last = why,
-            }
-            if self.inner.epoch.load(Ordering::SeqCst) != epoch {
-                return Err(Error::Dormant);
             }
         }
         Err(Error::Unreachable(last))
@@ -566,6 +679,9 @@ impl Client {
             .next
             .fetch_add(config.attempts as u64, Ordering::Relaxed);
         for attempt in 0..config.attempts.max(1) as u64 {
+            if self.is_dormant() {
+                return Err(Error::Dormant);
+            }
             let (target, host_key) = Self::target(routes, route, turn + attempt)?;
             match tokio::time::timeout(
                 config.connect,
@@ -588,7 +704,7 @@ impl Client {
             Route::Onion => {
                 let count = routes.onions.len() as u64;
                 if count == 0 {
-                    return Err(Refused::OnionOnly.into());
+                    return Err(Refused::NoOnion.into());
                 }
                 let onion = routes.onions[(turn % count) as usize];
                 Ok((

@@ -11,8 +11,9 @@ use std::time::{Duration, Instant};
 
 use ed25519_dalek::Signer as _;
 use vos_light::group::{Agent, DeviceGroup, Event};
-use vos_light::personal::{Answer, Frontier, Link, Route, SealedSync};
+use vos_light::personal::{Answer, Frontier, Link, SealedSync};
 use vos_light::release::{self, Package};
+use vos_light::route::Route;
 use vos_light::{Config, Light};
 use vos_testkit::programs;
 use vos_wire::personal::{

@@ -11,7 +11,8 @@
 
 use ed25519_dalek::SigningKey;
 use vos_light::group::{Alarm, DeviceGroup, Event, Pairing, Restored};
-use vos_light::personal::{Answer, Frontier, Link, Route, SealedSync, Unusable, Waiting};
+use vos_light::personal::{Answer, Frontier, Link, SealedSync, Unusable, Waiting};
+use vos_light::route::Route;
 use vos_light::sealed::{self, Body as Sealed, View};
 use vos_light::sync::Quarantine;
 use vos_wire::Encode;

@@ -38,6 +38,7 @@ pub fn onion_address(key: &[u8; 32]) -> String {
 /// The ed25519 key an `.onion` address encodes, its version and checksum
 /// checked: `None` for anything else.
 pub fn onion_key(address: &str) -> Option<[u8; 32]> {
+    let address = address.to_ascii_lowercase();
     let encoded = address.strip_suffix(".onion")?;
     let bytes = data_encoding::BASE32_NOPAD
         .decode(encoded.to_ascii_uppercase().as_bytes())
@@ -49,8 +50,8 @@ pub fn onion_key(address: &str) -> Option<[u8; 32]> {
 /// Why a pasted bridge line was not taken.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BridgeError {
-    /// It names a pluggable transport (obfs4, Snowflake, WebTunnel): only
-    /// plain bridges, for now.
+    /// It names a pluggable transport (obfs4, Snowflake, WebTunnel), which
+    /// this client does not run: plain bridges only.
     Transport(String),
     /// It is not a bridge line.
     Line(String),
@@ -75,13 +76,15 @@ impl std::error::Error for BridgeError {}
 /// refused.
 pub fn bridge(line: &str) -> Result<BridgeConfigBuilder, BridgeError> {
     let line = line.trim();
-    let line = line.strip_prefix("Bridge ").unwrap_or(line).trim();
+    let line = match line.split_once(char::is_whitespace) {
+        Some((first, rest)) if first.eq_ignore_ascii_case("bridge") => rest.trim(),
+        _ => line,
+    };
     // A line naming a transport leads with its name, its address second.
     let mut words = line.split_whitespace();
     if let (Some(first), Some(second)) = (words.next(), words.next())
         && first.parse::<std::net::SocketAddr>().is_err()
         && second.parse::<std::net::SocketAddr>().is_ok()
-        && first != "bridge"
     {
         return Err(BridgeError::Transport(first.to_string()));
     }
@@ -101,7 +104,8 @@ pub fn bridge(line: &str) -> Result<BridgeConfigBuilder, BridgeError> {
 pub struct TorConfig {
     /// A directory in the app's private storage: arti's state (`state`)
     /// and its directory cache (`cache`) under it, so a later start skips
-    /// the cold bootstrap. Kept out of the operating system's backup.
+    /// the cold bootstrap. The app keeps it out of the operating system's
+    /// backup.
     pub directory: PathBuf,
     /// Plain bridge lines the user pasted: none, the public relays.
     pub bridges: Vec<String>,
@@ -134,6 +138,8 @@ pub enum BootstrapError {
     BridgeLine(BridgeError),
     /// The network blocks Tor, or the device is offline: arti's word.
     Blocked(String),
+    /// Tor's directory could not be fetched, and no blockage was named.
+    Directory(String),
     /// arti's state directory is not private to the app, or cannot be
     /// made: arti checks its permissions, whatever the environment says.
     State(String),
@@ -151,6 +157,7 @@ impl std::fmt::Display for BootstrapError {
             BootstrapError::Bridge => f.write_str("this bridge does not answer"),
             BootstrapError::BridgeLine(error) => error.fmt(f),
             BootstrapError::Blocked(why) => write!(f, "this network blocks Tor: {why}"),
+            BootstrapError::Directory(why) => write!(f, "Tor's directory: {why}"),
             BootstrapError::State(why) => write!(f, "Tor's state directory: {why}"),
             BootstrapError::Tor(why) => write!(f, "Tor: {why}"),
         }
@@ -159,24 +166,42 @@ impl std::fmt::Display for BootstrapError {
 
 impl std::error::Error for BootstrapError {}
 
-/// Name a bootstrap's failure from what arti reported: its error's kind,
-/// if it ended with one rather than running out of time, and the blockage
-/// its status showed last.
-fn named(
+/// The earliest time a right clock can show: the pinned arti's release,
+/// 2026-10-01, in seconds since the epoch.
+const RELEASED: u64 = 1_790_812_800;
+
+/// What a failed bootstrap left to name it by.
+#[derive(Clone, Debug, Default)]
+struct Signals {
+    /// arti's error's kind and text, if it ended with one rather than
+    /// running out of time.
     error: Option<(ErrorKind, String)>,
+    /// The blockage arti's status showed last.
     blockage: Option<(BlockageKind, String)>,
+    /// arti's skew estimate was noteworthy (its status's text names the
+    /// clock), or the device's clock is before the pinned arti's release.
+    skewed: bool,
+    /// The bootstrap went through bridges.
     bridges: bool,
-) -> BootstrapError {
-    let clock = matches!(error, Some((ErrorKind::ClockSkew, _)))
-        || matches!(blockage, Some((BlockageKind::ClockSkewed, _)));
+}
+
+/// Name a bootstrap's failure: the clock whenever any signal blames it;
+/// a bootstrap through bridges that ran out of time, the bridge's; then
+/// the blockage arti named, a directory that could not be fetched, or
+/// arti's error.
+fn named(signals: Signals) -> BootstrapError {
+    let clock = signals.skewed
+        || matches!(signals.error, Some((ErrorKind::ClockSkew, _)))
+        || matches!(signals.blockage, Some((BlockageKind::ClockSkewed, _)));
     if clock {
         return BootstrapError::Clock;
     }
-    if let Some((ErrorKind::FsPermissions, why)) = error {
+    if let Some((ErrorKind::FsPermissions, why)) = signals.error {
         return BootstrapError::State(why);
     }
-    match (error, blockage) {
-        (None, _) if bridges => BootstrapError::Bridge,
+    match (signals.error, signals.blockage) {
+        (None, _) if signals.bridges => BootstrapError::Bridge,
+        (_, Some((BlockageKind::CantBootstrap, why))) => BootstrapError::Directory(why),
         (_, Some((_, why))) => BootstrapError::Blocked(why),
         (Some((_, why)), None) => BootstrapError::Tor(why),
         (None, None) => BootstrapError::Blocked("no answer from the Tor network".into()),
@@ -241,12 +266,18 @@ impl Tor {
             Ok(Err(error)) => Some((error.kind(), error.to_string())),
             Err(_) => None,
         };
-        let blockage = self
-            .client
-            .bootstrap_status()
-            .blocked()
-            .map(|blockage| (blockage.kind(), blockage.to_string()));
-        Err(named(ended, blockage, self.bridges))
+        let status = self.client.bootstrap_status();
+        let before_release = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(true, |now| now.as_secs() < RELEASED);
+        Err(named(Signals {
+            error: ended,
+            blockage: status
+                .blocked()
+                .map(|blockage| (blockage.kind(), blockage.to_string())),
+            skewed: status.to_string().contains("Clock is ") || before_release,
+            bridges: self.bridges,
+        }))
     }
 
     /// arti's client itself.
@@ -305,6 +336,7 @@ mod tests {
         flipped[3] = if flipped[3] == b'a' { b'b' } else { b'a' };
         assert_eq!(onion_key(std::str::from_utf8(&flipped).unwrap()), None);
         assert_eq!(onion_key(address.trim_end_matches(".onion")), None);
+        assert_eq!(onion_key(&address.to_uppercase()), Some(key));
         let mut other = key;
         other[0] ^= 1;
         assert_ne!(onion_address(&other)[52..56], address[52..56]);
@@ -318,6 +350,7 @@ mod tests {
         for line in [
             format!("192.0.2.1:443 {fingerprint}"),
             format!("Bridge 192.0.2.1:443 {fingerprint}"),
+            format!("bridge 192.0.2.1:443 {fingerprint}"),
             format!("  [2001:db8::1]:9001 {fingerprint}\n"),
         ] {
             bridge(&line).unwrap();
@@ -325,6 +358,10 @@ mod tests {
         let obfs4 = format!("obfs4 192.0.2.1:443 {fingerprint} cert=AAAA iat-mode=0");
         assert_eq!(
             bridge(&obfs4).err(),
+            Some(BridgeError::Transport("obfs4".into()))
+        );
+        assert_eq!(
+            bridge(&format!("Bridge {obfs4}")).err(),
             Some(BridgeError::Transport("obfs4".into()))
         );
         assert_eq!(
@@ -341,37 +378,48 @@ mod tests {
     #[test]
     fn a_bootstrap_failure_is_named() {
         let why = || "why".to_string();
-        assert_eq!(
-            named(Some((ErrorKind::ClockSkew, why())), None, false),
-            BootstrapError::Clock
-        );
-        assert_eq!(
-            named(None, Some((BlockageKind::ClockSkewed, why())), true),
-            BootstrapError::Clock
-        );
+        let named = |error: Option<ErrorKind>, blockage: Option<BlockageKind>, skewed, bridges| {
+            named(Signals {
+                error: error.map(|kind| (kind, why())),
+                blockage: blockage.map(|kind| (kind, why())),
+                skewed,
+                bridges,
+            })
+        };
+        use BlockageKind as B;
+        use ErrorKind as K;
+        let clock = BootstrapError::Clock;
+        assert_eq!(named(Some(K::ClockSkew), None, false, false), clock);
+        assert_eq!(named(None, Some(B::ClockSkewed), false, true), clock);
         assert_eq!(
             named(
-                Some((ErrorKind::TorNetworkTimeout, why())),
-                Some((BlockageKind::ClockSkewed, why())),
+                Some(K::TorNetworkTimeout),
+                Some(B::CantBootstrap),
+                true,
                 false
             ),
-            BootstrapError::Clock
+            clock
         );
-        assert_eq!(named(None, None, true), BootstrapError::Bridge);
+        assert_eq!(named(None, Some(B::CantBootstrap), true, true), clock);
+        assert_eq!(named(None, None, false, true), BootstrapError::Bridge);
         assert_eq!(
-            named(None, Some((BlockageKind::Offline, why())), true),
+            named(None, Some(B::Offline), false, true),
             BootstrapError::Bridge
         );
         assert_eq!(
-            named(None, Some((BlockageKind::Filtering, why())), false),
+            named(None, Some(B::Filtering), false, false),
             BootstrapError::Blocked(why())
         );
         assert_eq!(
-            named(Some((ErrorKind::FsPermissions, why())), None, false),
+            named(None, Some(B::CantBootstrap), false, false),
+            BootstrapError::Directory(why())
+        );
+        assert_eq!(
+            named(Some(K::FsPermissions), None, false, false),
             BootstrapError::State(why())
         );
         assert_eq!(
-            named(Some((ErrorKind::Internal, why())), None, false),
+            named(Some(K::Internal), None, false, false),
             BootstrapError::Tor(why())
         );
         assert!(BootstrapError::Clock.to_string().contains("clock"));

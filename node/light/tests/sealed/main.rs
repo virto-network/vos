@@ -21,10 +21,10 @@ use std::rc::Rc;
 
 use ed25519_dalek::SigningKey;
 use vos_light::personal::{
-    Answer, Frontier, Link, Route, SealedSync, SyncError, Unusable, Waiting, open_recovery,
-    recovery_key,
+    Answer, Frontier, Link, SealedSync, SyncError, Unusable, Waiting, open_recovery, recovery_key,
 };
 use vos_light::release::{self, Package};
+use vos_light::route::Route;
 use vos_light::sealed::{self, OpenError};
 use vos_light::{Error, Light, MAX_ARGUMENTS};
 use vos_testkit::programs;

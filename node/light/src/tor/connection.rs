@@ -49,10 +49,12 @@ pub(crate) enum OpenError {
 pub(crate) struct Connection {
     api: Multiplexed,
     _handle: client::Handle<Pinned>,
-    /// When its last request was made.
+    /// When its last request was made or answered.
     last: Mutex<Instant>,
     /// The `vos-api` channel's reading and writing.
     task: JoinHandle<()>,
+    /// Set once the client closes it: requests in flight end at once.
+    closed: tokio::sync::watch::Sender<bool>,
 }
 
 impl Drop for Connection {
@@ -108,21 +110,40 @@ impl Connection {
             _handle: handle,
             last: Mutex::new(Instant::now()),
             task: tokio::spawn(task),
+            closed: tokio::sync::watch::Sender::new(false),
         })
     }
 
-    /// Send a request of `kind` holding `body`: its answer.
+    /// Send a request of `kind` holding `body`: its answer, or `Closed`
+    /// once the stream ends or the client closes the connection.
     pub async fn request(&self, kind: u16, body: &[u8]) -> Result<Answer, vos_api::client::Closed> {
+        self.touch();
+        let mut closed = self.closed.subscribe();
+        let answer = tokio::select! {
+            answer = self.api.request(kind, vos_api::Mark::Unmarked, body) => answer,
+            _ = closed.wait_for(|closed| *closed) => Err(vos_api::client::Closed::Ended),
+        };
+        self.touch();
+        answer
+    }
+
+    fn touch(&self) {
         *self.last.lock().expect("the last request's time") = Instant::now();
-        self.api.request(kind, vos_api::Mark::Unmarked, body).await
     }
 
-    /// Whether it can carry no request: its stream ended.
+    /// Close it: nothing more is written or read, and every request in
+    /// flight ends.
+    pub fn close(&self) {
+        self.closed.send_replace(true);
+        self.task.abort();
+    }
+
+    /// Whether it can carry no request: its stream ended, or it was closed.
     pub fn is_closed(&self) -> bool {
-        self.api.is_closed() || self.task.is_finished()
+        *self.closed.borrow() || self.api.is_closed() || self.task.is_finished()
     }
 
-    /// When its last request was made.
+    /// When its last request was made or answered.
     pub fn last(&self) -> Instant {
         *self.last.lock().expect("the last request's time")
     }

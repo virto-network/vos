@@ -285,16 +285,23 @@ not (`light-node.md` §6.2–§6.7).
 - **One connection a purpose, each its own circuit and SSH key:** each
   connection's stream takes an arti isolation token drawn for it alone,
   which arti's circuit manager shares with no other stream, and its SSH
-  session authenticates with an ed25519 key drawn for it alone (its
-  seed zeroized once the key is made), so the gateway cannot join two purposes, two
-  spaces, or two proven calls by circuit or by key. A proven call and a
-  fetch each take a connection of their own, closed once answered; the
-  member's calls in a space, the feed, the personal agent and its
-  background schedule each keep one while used. **Not hidden:** what a
-  purpose's requests themselves carry (a member's signed calls name its
-  key; a personal agent's calls its sync key), the timing of requests,
-  and that one Tor client made them all to the same onion at once, which
-  the gateway may correlate by time alone.
+  session authenticates with an ed25519 key drawn for it alone (its seed
+  zeroized once the key is made), so the gateway cannot join two
+  purposes, two spaces, or two proven calls by circuit or by key. A
+  proven call and a fetch each take a connection of their own, closed
+  once answered; the member's calls in a space, the feed, the personal
+  agent and its background schedule each keep one while used. The
+  anonymous purposes carry reads alone, so no key-signed call joins
+  their circuits. A change of a space's routes closes every connection
+  made under the old ones, requests in flight included. **Not hidden:**
+  what a purpose's requests themselves carry (a member's signed calls
+  name its key; a personal agent's calls its sync key), the timing of
+  requests, and that one Tor client made them all to the same onion at
+  once, which the gateway may correlate by time alone. **Its cost:**
+  arti keys an onion's descriptor and introduction state by isolation,
+  so each connection fetches the descriptor anew and a retry does not
+  learn which introduction point failed; arti keeps each such record 48
+  hours.
 - **The gateway is pinned twice:** its onion address authenticates the
   service, and its SSH host key, pinned beside it, is checked at each
   handshake; a gateway presenting another key is not spoken to.
@@ -309,8 +316,9 @@ not (`light-node.md` §6.2–§6.7).
   `ARTI_FS_DISABLE_PERMISSION_CHECKS` is ignored. The state holds guard
   choices and the directory, no key of the member's; it is kept out of
   the operating system's backup with the store.
-- **Dormant sends nothing:** dormant, the client holds no connection, no
-  spare and no timer, and refuses every request until woken.
+- **Dormant sends nothing:** going dormant closes every connection (a
+  request in flight ends unanswered), the spare and the screens, stops
+  the idle timer, and refuses every request until woken.
 - **Plain bridges only:** a pasted line naming a pluggable transport is
   refused, so a network that blocks Tor by inspection blocks the
   anonymous calls and the personal space, which wait (§8, H2).

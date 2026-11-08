@@ -56,6 +56,7 @@ fn args() -> Args {
             "--onion" => args.onion = value(),
             "--host-key" => {
                 let hex = value();
+                assert_eq!(hex.len(), 64, "--host-key: 32 bytes in hex");
                 for (at, byte) in args.host_key.iter_mut().enumerate() {
                     *byte = u8::from_str_radix(&hex[2 * at..2 * at + 2], 16).expect("hex");
                 }

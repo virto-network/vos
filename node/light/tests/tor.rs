@@ -2,7 +2,10 @@
 //! to an SSH server of its own serving `vos-api`, the gateway's capture
 //! recording each connection's target, its circuit (the isolation token
 //! the dial was given, as arti's circuit manager reads it), the SSH key it
-//! authenticated with and the kinds it carried. No network.
+//! authenticated with and the kinds it carried. No network. That
+//! `vos_light::tor::Tor` hands each connection's token to arti
+//! (`StreamPrefs::set_isolation`) is the one line the capture does not
+//! reach; the onion example exercises it over the live network.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,7 +38,7 @@ struct Seen {
     key: Option<[u8; 32]>,
     /// The kinds of the requests it carried.
     kinds: Vec<u16>,
-    /// Its stream ended.
+    /// Its stream ended: its SSH session, or its `vos-api` channel.
     ended: bool,
 }
 
@@ -141,10 +144,12 @@ impl Dial for Dialer {
                 index,
                 channels: HashMap::new(),
             };
+            let ended = Arc::clone(&gateway);
             tokio::spawn(async move {
                 if let Ok(session) = russh::server::run_stream(config, theirs, handler).await {
                     let _ = session.await;
                 }
+                ended.seen.lock().unwrap()[index].ended = true;
             });
             Ok(Box::new(ours) as Stream)
         })
@@ -673,4 +678,92 @@ async fn the_pinned_onion_set_is_refreshed_from_the_registrar() {
         assert_eq!(client.routes(&a).unwrap().onions, fresh);
     }
     assert_isolated(&gateway.seen());
+}
+
+/// Requests of one group at once share the connection one of them opens:
+/// one dial, every request on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_groups_concurrent_requests_open_one_connection() {
+    let gateway = Gateway::new();
+    let client = client(&gateway, config());
+    let a = space(1);
+    client.set_space(a, Routes::onions(vec![gateway.onion(1)]));
+    let mut requests = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let client = client.clone();
+        requests.spawn(async move { client.request(a, Purpose::Member, &query()).await });
+    }
+    while let Some(answered) = requests.join_next().await {
+        answered.unwrap().unwrap();
+    }
+    let seen = gateway.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].kinds.len(), 8);
+}
+
+/// Opting back into Tor closes the clearnet connection, a request in
+/// flight on it included, and the next key-signed call takes the onion; a
+/// dormancy ends a request in flight at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_route_change_or_a_dormancy_ends_what_the_old_route_carried() {
+    let gateway = Gateway::new();
+    let client = client(&gateway, config());
+    let a = space(1);
+    let clearnet = Clearnet {
+        host: "gateway.example".into(),
+        port: 2222,
+        ssh_host_key: gateway.host_key(),
+    };
+    let mut routes = Routes::new(vec![gateway.onion(1)], Some(clearnet), false);
+    routes.opt_out().unwrap();
+    client.set_space(a, routes.clone());
+    client.request(a, Purpose::Member, &query()).await.unwrap();
+    assert!(matches!(gateway.seen()[0].target, Target::Clearnet { .. }));
+    gateway.silent.store(true, Ordering::SeqCst);
+    let waiting = {
+        let client = client.clone();
+        tokio::spawn(async move { client.request(a, Purpose::Member, &query()).await })
+    };
+    until(|| gateway.seen()[0].kinds.len() == 2).await;
+    routes.opt_in();
+    client.set_space(a, routes);
+    let started = std::time::Instant::now();
+    assert!(matches!(waiting.await.unwrap(), Err(Error::Lost)));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    until(|| gateway.seen()[0].ended).await;
+    gateway.silent.store(false, Ordering::SeqCst);
+    client.request(a, Purpose::Member, &query()).await.unwrap();
+    let seen = gateway.seen();
+    assert_eq!(seen.len(), 2);
+    assert!(matches!(seen[1].target, Target::Onion { .. }));
+    // A request in flight when the client goes dormant ends at once.
+    gateway.silent.store(true, Ordering::SeqCst);
+    let waiting = {
+        let client = client.clone();
+        tokio::spawn(async move { client.request(a, Purpose::Member, &query()).await })
+    };
+    until(|| gateway.seen()[1].kinds.len() == 2).await;
+    client.set_dormant(true);
+    let started = std::time::Instant::now();
+    assert!(matches!(waiting.await.unwrap(), Err(Error::Lost)));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    until(|| gateway.seen()[1].ended).await;
+}
+
+/// A new screen session ends the last, each on a circuit of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_screen_session_ends_the_last() {
+    let gateway = Gateway::new();
+    let client = client(&gateway, config());
+    let a = space(1);
+    client.set_space(a, Routes::onions(vec![gateway.onion(1)]));
+    let (first, _first) = tokio::io::duplex(1 << 16);
+    client.screens(a, first).await.unwrap();
+    let (second, _second) = tokio::io::duplex(1 << 16);
+    client.screens(a, second).await.unwrap();
+    until(|| gateway.seen()[0].ended).await;
+    let seen = gateway.seen();
+    assert_eq!(seen.len(), 2);
+    assert!(!seen[1].ended && client.screens_open());
+    assert_isolated(&seen);
 }
