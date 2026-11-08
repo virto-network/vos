@@ -633,8 +633,13 @@ across a space's agents wait for the identity agent above.
       other's devices links their owner digests in the ledger's log
       anyway (L4). A re-founding's `enroll_many` re-seeds members, not
       persons: the registrar registers them again;
-  - queries, any caller: `path(member) → Option<(root, slot, siblings)>`,
-    the 32 siblings from the leaf's level up; `root() → (root, since)`;
+  - queries, any caller: `feed(from) → Feed`, the tree's writes from the
+    `from`th on, each the leaves it set and the root it left with its
+    batch time, a page at most 48 KiB, and the feed's length, from which a
+    device keeps the whole tree and computes its own path
+    (`light-node.md` §6.7); `path(member) → Option<(root, slot,
+    siblings)>`, the 32 siblings from the leaf's level up; `root() →
+    (root, since)`;
     `handle() → [u8; 32]`; `count()`, the members enrolled. A query is
     signed by a client key like any other; the device library signs each
     with a key drawn for it alone.
@@ -754,7 +759,11 @@ the device never exports, evaluated once a use after the user's consent
   computes the scope and the binding (`vos_wire`'s functions, the ones
   ingress calls), proves auth, owner and device-kernel statements, and
   builds every node-API request and decodes every answer, so neither the
-  client nor a gateway encodes a credential's bytes. Its `PathKeeper`
+  client nor a gateway encodes a credential's bytes. Its `TreeKeeper`
+  keeps the whole tree from the actor's feed, each page checked against
+  the root its last change names, on a jittered timer of its own, and computes the
+  member's path, so no query names the member (`light-node.md` §6.7). Its
+  `PathKeeper`, for a client not yet on the feed,
   holds the member's path and refreshes it apart from proofs [decided]: on a 30 s timer jittered by half a period either way, a moved
   `root()` bringing the fetch forward to a time drawn below 10 s, a
   `RootUnknown` dropping the path and halving the period (to 1 s), a fetch
@@ -852,38 +861,43 @@ the device never exports, evaluated once a use after the user's consent
   replica's ingress accepted. Within the window a revoked member can still
   authenticate.
 - **What operators learn:**
-  - from `path(member)`: which member digest is online, and from which
-    address. The query's key is drawn for it alone and links nothing, and
-    the library refreshes its path apart from its proofs (when `root()`
-    moves and on a timer, never just before a proof, on a connection of
-    its own) [decided], so a fetch's time says nothing of a proof's.
-    The leak is reduced, not closed: a proof from the same address still
-    links its nullifier to the digest, and the digest to whoever the
-    registrar enrolled. So `Anonymous` hides the member from the log's
-    readers, other agents and other members, not from the operators of
-    the nodes and gateways that serve its requests; that is full
-    privacy's (§3, §8);
+  - from the tree's feed: nothing of the member's. The device library
+    keeps the whole tree from `feed(from)`, whose query names only its
+    place in the feed, read on a timer of its own (never just before a
+    proof), and computes the member's path itself (`light-node.md` §6.7);
+  - from `path(member)`, for a client not yet on the feed: which member
+    digest is online, and from which address. The query's key is drawn
+    for it alone and links nothing, and the library refreshes its path
+    apart from its proofs (when `root()` moves and on a timer, never just
+    before a proof, on a connection of its own) [decided], so a fetch's
+    time says nothing of a proof's. The leak is reduced, not closed: a
+    proof from the same address still links its nullifier to the digest,
+    and the digest to whoever the registrar enrolled. So `Anonymous`
+    hides the member from the log's readers, other agents and other
+    members, not from the operators of the nodes and gateways that serve
+    its requests; that is full privacy's (§3, §8);
   - from the log: each auth call's scope and nullifier (a pseudonym's
     activity in one scope), each payment's owner digest (a public payer),
     each credentialed call's arguments in clear (a payment's payee
     and amount beside its payer), and the metadata every cell leaks (§3);
-  - from the root each auth call names (`CredentialedInput.root`, logged
-    for the apply's freshness check): a member proves against the root of
-    its last fetched path until its next refresh, so while the tree moves
-    often, few members hold one root at once, and the roots logged on
-    calls in different scopes link those calls' pseudonyms to one holder,
-    a fingerprint across scopes the nullifiers alone do not give. The
-    fix, not built (`open.md`): the library fetches its path at every moved
-    root, so every online member proves against the newest one, or the
-    log keeps the root's class (its position in the ring: the newest,
-    or how many roots it trails) in place of the root;
-  - from a tree change: every online member's library refreshes its path
-    when `root()` moves, so each enrollment or revocation shows which
-    member digests are online then (the timer's jitter spreads the
-    fetches, it does not hide them); syncing the tree is the later fix;
+  - from the root each auth call names (in its claim, logged for the
+    apply's freshness check): a device on the feed proves against the
+    newest root it has read, the one every member who read the feed since
+    a tree change holds, so the roots logged link nothing beyond the time,
+    except for the members who prove within a timer period of a change
+    before reading it. The log keeps the root, not its place in the ring:
+    a place relative to the newest moves between ingress and apply, and
+    one counted from the first root names the root as its digest does. A
+    client on its path proves against its last fetch's root until the
+    next, which the moved `root()` brings within 10 s;
+  - from a tree change: a client on its path refreshes it when `root()`
+    moves, so each enrollment or revocation shows which member digests
+    are online then; a device on the feed reads the change as every
+    member does, naming no digest;
   - from the tree: how many members there are and when each was enrolled
-    or revoked; a leaf hides its digest, so whether a digest is enrolled
-    is learned only by asking `path` for it;
+    or revoked (the feed serves every write and its batch time); a leaf
+    hides its digest, so whether a digest is enrolled is learned only by
+    asking `path` for it;
   - from a copied handle: two spaces sharing a handle can link their
     common members' `member` and `owner` digests (their nullifiers stay
     apart).

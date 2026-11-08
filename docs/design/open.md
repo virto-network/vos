@@ -102,11 +102,15 @@ The scale results are in `core-model.md` §14, "The scale test".
 - **The non-repudiation side store:** a space that wants evidence keeps the
   proofs an ingress verified. Not built; ingress logs the proven origin
   only.
-- **Tree syncing:** members fetch their credential tree's paths from a node,
-  which learns which leaf a member asks for (the path leak), and the logged
-  `map_root` is a fingerprint that links a member's requests across scopes.
-  Both are stated in `node/SECURITY.md`; the fix is a synced tree a member
-  holds.
+- **Tree syncing, its last clients:** the device library keeps each
+  credential tree whole from its feed (`light-node.md` §6.7), so no query
+  names the member and its proofs are against the newest root it read.
+  s4's `vos.credential` facility still fetches its member's path
+  (`PathKeeper`), and so leaks which leaf is online, until it moves to
+  the feed; then `path(member)`, `PathKeeper` and `path_query` go. The
+  feed is kept whole on the actor and on every device, about 77 bytes a
+  write: a compaction (a snapshot of the leaves, then the changes since)
+  is later work, should a space's history outgrow it.
 - **Full privacy** (`identity-and-authority.md` §8): personal spaces, the
   shared pool, the relay layer and the holder-side prover, postponed; where
   the shared pool first runs (a JAM agent or a proving space run by the

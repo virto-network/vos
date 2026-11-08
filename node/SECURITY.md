@@ -180,9 +180,18 @@ naming one is `Malformed`).
 from other members, not from the operators of the nodes and gateways that
 serve its requests:
 
-- **The path leak, reduced, not closed.** Asking the credential actor for
-  `path(member)` tells the operators which member digest is online, and
-  from which address. What they do not learn is when it proves:
+- **No path leak from the tree's feed.** The device library keeps the
+  credential actor's whole tree from its feed (`TreeKeeper`): every
+  write of the tree, read a page at a time on the space's feed
+  connection, each query naming its place in the feed and nothing of
+  the member's, signed by a key drawn for it alone. The member's path is
+  computed on the device, so no node or gateway learns which leaf is
+  online. The feed is read on a jittered timer (30 s, between 15 s and
+  45 s), never because a proof is about to be made.
+- **The path leak, where a client still fetches its path.** Asking the
+  credential actor for `path(member)` tells the operators which member
+  digest is online, and from which address. What they do not learn is
+  when it proves:
   - the device library (`PathKeeper`) fetches its path apart from its
     proofs: on a timer of 30 s jittered uniformly between 15 s and 45 s,
     and at a time drawn below 10 s after a moved `root()` answer is first
@@ -193,33 +202,36 @@ serve its requests:
   - so a fetch's time says nothing of a proof's, but a proof from the same
     address still links its nullifier to the digest, and the digest to
     whoever the registrar enrolled.
-- **A refetch after `RootUnknown`** precedes the proof that retries the
-  call, so that fetch's time links to that proof's. It happens only when
-  the replica's ring does not hold the proof's root: a lagging replica, a
-  root replaced at its own batch time, or 64 tree-changing batches within
-  one timer period (about 1.4 a second, for 45 s), past which the library
-  halves its period for the space's pace.
+- **A re-read after `RootUnknown`** precedes the proof that retries the
+  call, so that read's time links to that proof's (for a path fetch, the
+  member's digest to it). It happens only when the replica's ring does
+  not hold the proof's root: a lagging replica, a root replaced at its
+  own batch time, or 64 tree-changing batches within one timer period
+  (about 1.4 a second, for 45 s), past which the library halves its
+  period for the space's pace.
 - **From the log:** each auth call's scope and nullifier (a pseudonym's
   activity in one scope), each payment's owner digest (a public payer),
   each proven call's claim and arguments in clear, and the metadata every
   call leaks.
 - **From the root an auth call names.** The log keeps each auth call's
   `map_root` (in its claim, `CredentialedInput.claim`), which the apply
-  checks for freshness. A member proves against the root of its last fetched path
-  until its next refresh: while the tree changes often, few members hold
-  one root at once, so the roots logged on calls in different scopes link
-  those calls' pseudonyms to one holder, a fingerprint across scopes that
-  the nullifiers keep apart. The fix, not built (`docs/design/open.md`):
-  the library fetches
-  its path at every moved root, so every online member proves against
-  the newest, or the log keeps the root's position in the ring (the
-  newest, or how many roots it trails) in place of the root
-  (`identity-and-authority.md` §7).
-- **From a tree change:** every online member's library fetches its path
-  within 10 s of seeing `root()` move, so each enrollment or revocation
-  shows which member digests are online then; the spread, and the
-  clients' own jitter in polling `root()`, spread the fetches, they do
-  not hide them. Syncing the tree is the later fix.
+  checks for freshness. A device on the feed proves against the newest
+  root it has read, the one every member who read the feed since a tree
+  change holds, so the roots logged on calls link nothing beyond the
+  time: within one timer period of a change (at most 45 s), the members
+  who have not read it yet prove against the root before, which sets
+  them apart from those who have. A client still on its path proves
+  against the root of its last fetch until its next, which the moved
+  `root()` brings within 10 s. The log keeps the root itself, not its
+  place in the ring: a place relative to the newest moves between
+  ingress and apply, and a place counted from the first root names the
+  root as its digest does, so it would hide nothing the newest root does
+  not.
+- **From a tree change:** a client still on its path fetches it within
+  10 s of seeing `root()` move, so each enrollment or revocation shows
+  which member digests are online then. A device on the feed reads the
+  change as every member does, naming no digest; the gateway sees only
+  that some feed connection read it.
 - **From the tree:** how many members there are, and when each was
   enrolled or revoked.
 - **From a copied handle:** two spaces whose credential actors share a

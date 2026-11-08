@@ -2757,11 +2757,12 @@ nodes may ask the onion's mark of its proven calls, or of every request
   (`isolated_client()` or a `StreamPrefs` isolation group) and its own
   SSH connection under its own SSH key, so the gateway cannot join them by
   circuit or by connection:
-  - the credential tree's feed (§6.7, plan 8.27): one long-lived circuit,
-    since every member reads the same feed; until the feed lands, root
-    polls and path fetches each take their own, a rendezvous each (about
-    120 an hour in the foreground at today's 30 s polls, a cost PG5
-    counts);
+  - the credential tree's feed (§6.7): one long-lived circuit, since
+    every member reads the same feed, its reads on the connection kept
+    open while used, so a poll costs a round trip, not a rendezvous;
+    root polls and path fetches, for a client not yet on the feed, each
+    take their own, a rendezvous each (about 120 an hour in the
+    foreground at 30 s polls, a cost PG5 counts);
   - proven calls (each its own, from a spare: the client keeps one
     circuit to the onion built ahead, its SSH handshake done, for the next
     proven call, and builds the next spare once it is used, since each
@@ -3086,13 +3087,14 @@ live Tor network is not measured yet: M5 measures it.
   address behind them.
 
 **Does not fix:**
-- **timing:** a gateway sees when a fetch and a proof arrive; jitter
-  (`PathKeeper`'s) spreads them, and keeping each tree from its feed on
-  the device (plan 8.27; the wallet's `tree` likewise) removes path
-  fetches altogether, which is the real fix the carried list names;
-- **the `map_root` fingerprint** (carried, plan 8.27): fixed by proving against
-  the newest root, which a synced tree gives the device, or by logging the
-  root's place in the ring in place of the root;
+- **timing:** a gateway sees when a read and a proof arrive; keeping
+  each tree from its feed on the device (below; the wallet's `tree`
+  likewise) removes path fetches altogether, and the feed's timer keeps
+  its reads apart from proofs;
+- **the `map_root` fingerprint:** what a synced tree fixes (below), every
+  proof against the newest root the device has read; within a timer
+  period of a tree change, the members who have not read it yet still
+  stand apart;
 - **small anonymity sets:** a pool or a member tree of fifty is a set of
   fifty however the bytes travel;
 - **a global observer** correlating both ends of Tor, and application
@@ -3104,6 +3106,73 @@ live Tor network is not measured yet: M5 measures it.
   ready, its documentation is inconsistent about production use, and the
   Tor Project has not recommended it for high-risk onion services; its library crates take breaking minor releases about monthly
   (arti-client 0.45, 0.46 and 0.47 in August, September and October 2026).
+
+**The credential tree's feed** [built: the credential actor's
+`feed(from)`, `vos_light::TreeKeeper`, `Client::read_tree`]:
+- **The actor keeps every write of its tree** as a `Change`
+  (`vos_wire::credentials`): the leaves it set, each at its slot, and the
+  root it left with the batch time it became the root, the entry it left
+  in the ring. `feed(from)` serves them in order from the `from`th, as
+  many as 48 KiB holds (`FEED_BYTES`, at least one), with the feed's
+  length; any caller reads it, as every member reads the same feed.
+- **The device keeps the whole tree** (`TreeKeeper`): each page applied
+  at once, each slot's last leaf and every node above them computed once,
+  and refused whole unless the tree it leaves has the root its last change
+  names (the one root a proof uses, which binds every leaf), its changes
+  in order and from the keeper's place. The member's path is computed on
+  the device, so no query names the member: the path leak ends, and each
+  proof is against the newest root the device read. The tree is kept
+  outside any synced scope (`encode`, `restore`, the root checked on
+  restore), so a restart reads only the changes since.
+- **On one long-lived circuit** (`Client::read_tree`, `Purpose::Feed`):
+  the node's time and each page on the space's feed connection, which
+  carries reads alone, one rendezvous for as long as it stays open (five
+  minutes idle). Read on a jittered timer (30 s, between 15 s and 45 s),
+  never because a proof is about to be made, since that connection is one
+  circuit of the device's and a read before each proof would join the
+  proofs through it; a page that says more is due at once; `RootUnknown`
+  or `RootStale` makes the feed due at once and halves the period.
+- **The root in the log:** the claim keeps the root, which the apply
+  checks; its place in the ring is the feed's (each change's root and
+  batch time). A place in place of the root would hide nothing: relative
+  to the newest it moves between ingress and apply, and counted from the
+  first it names the root as the digest does. What fixes the fingerprint
+  is that every member on the feed proves against the same newest root;
+  within one timer period of a tree change, those who have not read it
+  yet still stand apart.
+- **Not yet:** s4's facility still keeps a path (`PathKeeper`) until it
+  moves to the feed (`open.md`); the feed is kept whole, about 77 bytes a
+  single write, on the actor and on every device.
+
+**What it costs** [measured, x86: Intel Core Ultra 7 155H; the actor on
+the testkit's refine, the keeper in a release build; 2026-11-08; a
+throwaway spike]. A feed query is 139 bytes; an answer with nothing new
+34 bytes, one with one new enrollment 114.
+
+| tree | pages | bytes to catch up | node, a page | device, all pages | kept on the device, restored in |
+|---|---|---|---|---|---|
+| 1,001 members, one write each | 2 | 78 KiB | 20 ms | 2 ms | 35 KiB, 2 ms |
+| 10,001 members, one write each (the worst case) | 17 | 782 KiB | 25 ms | 17 ms | 352 KiB, 15 ms |
+| 100,097 members, 391 writes of 256 | 79 | 3.5 MiB | 33 ms | 109 ms | 3.4 MiB, 96 ms |
+| a new enrollment, or nothing new | 1 | 114 B, or 34 B | 6 ms | under 1 ms | — |
+
+- **Over Tor** [est, from §6.3's desktop figures: a round trip 0.55 s,
+  the circuit about 0.15 MB/s]: pages go one after another, each naming
+  the place the last left, so a catch-up is a round trip a page plus its
+  bytes: about 15 s for 10,000 single-write members (17 × 0.55 s and
+  782 KiB), about 67 s for 100,000 by `enroll_many`, about 2.4 minutes
+  for 100,000 single writes. Once caught up, a poll is one round trip and
+  one Tor cell each way, on a connection kept open: at the 30 s timer
+  about 120 polls an hour in the foreground, none a rendezvous (H8).
+- **On the node:** a poll with nothing new costs about 6 ms of the
+  testkit's refine, every member asking every 30 s: 10,000 online members
+  are about 330 queries a second, two cores' worth. Every member reads the
+  same pages, so a gateway's cache of the feed's answers (by place, until
+  the length moves) is the lever, not built.
+- **The phone at M5** measures: a 10,000-member catch-up over Tor (time,
+  bytes), the keeper's page and restore time and its memory at 10,000 and
+  100,000, and the feed connection's rendezvous and polls an hour in the
+  foreground (PG5).
 
 **Verdict on arti** [proposed]: ready for the client side (stable since
 1.0, shipped by Zashi and Fedimint); usable, not yet hardened, for

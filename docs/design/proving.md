@@ -1273,6 +1273,10 @@ impl DeviceProgram {
 // identity, which a query's key signs over.
 pub fn time_request() -> Vec<u8>;                                    // Time
 pub fn time_answer(body: &[u8]) -> Result<u64, DeviceError>;
+/// A `QueryCall` of `feed(from)`, signed by a fresh key: it names no member.
+pub fn feed_query(agent: u32, identity: &[u8; 32], instance: u32,
+                  from: u64, not_after: u64) -> Result<Vec<u8>, DeviceError>;
+pub fn feed_answer(body: &[u8]) -> Result<Feed, DeviceError>;
 /// A `QueryCall` of `path`, signed by a fresh key.
 pub fn path_query(agent: u32, identity: &[u8; 32], instance: u32,
                   member: &Digest, not_after: u64) -> Vec<u8>;
@@ -1285,7 +1289,23 @@ pub fn root_answer(body: &[u8]) -> Result<(Digest, u64), DeviceError>;
 /// The request, addressed to `call.agent`.
 pub fn credentialed(call: &Call, proof: &Proven) -> Vec<u8>;
 
-/// The path held, refreshed apart from proofs, so no fetch precedes a proof.
+/// The whole tree, kept from the feed on a jittered timer, each page
+/// checked against the root its last change names; the member's path computed here.
+pub struct TreeKeeper { /* the tree's nodes, the feed's place, the root, the timer */ }
+impl TreeKeeper {
+    pub fn new(member: Digest) -> Self;
+    pub fn request(&self, agent: u32, identity: &[u8; 32], instance: u32,
+                   not_after: u64) -> Result<Vec<u8>, DeviceError>;
+    pub fn due(&self, now_ms: u64) -> bool;
+    pub fn ingest(&mut self, answer: &[u8], now_ms: u64) -> Result<Synced, DeviceError>;
+    pub fn witness(&self) -> Option<AuthWitness>;
+    pub fn unknown(&mut self);
+    pub fn encode(&self) -> Vec<u8>;
+    pub fn restore(member: Digest, kept: &[u8]) -> Result<Self, DeviceError>;
+}
+
+/// The path held, refreshed apart from proofs, so no fetch precedes a
+/// proof: for a client not yet on the feed.
 pub struct PathKeeper { /* the member, the path held, the next fetch's time */ }
 impl PathKeeper {
     pub fn new(member: Digest) -> Self;

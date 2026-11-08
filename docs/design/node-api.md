@@ -242,7 +242,7 @@ budget, past which it is answered `Busy`.
   it, until it restarts (`Config::retired_formats` keeps one across
   restarts), its outcome the date kept, `Malformed` for a format the node
   does not verify. Neither ever moves a date later.
-- **The credential actor's `path(member)` and `root()`** are `Query`s
+- **The credential actor's `feed(from)`, `path(member)` and `root()`** are `Query`s
   like any other, signed by a key the device library draws for each
   (`identity-and-authority.md` §6); no kind of their own.
 - **An agent's admission** [decided, `light-node.md` §3.3]: an actor
