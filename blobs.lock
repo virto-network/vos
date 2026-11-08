@@ -9,7 +9,7 @@ ce591f098862cfc472b4bdc03d756c93fddc0d988f01c71b9726f2ea292a25c7  target/riscv64
 168f4455d7cd9d939db5588302f64ab318a9103028c2299edd6130fbd8a3e12e  agent/programs/target/riscv64em-vos/release/vos-credentials.elf
 318bb4160cb09050210cae1c4ea6f9f712ae1796d1dc41185e16802e8a9dbb70  agent/programs/target/riscv64em-vos/release/vos-personal.elf
 6f6192d31c62c9ba165124d8cedcea3d3642421e48d31b42c815264631753250  agent/programs/target/riscv64em-vos/release/vos-payments.elf
-b272d5e4569020e22d9c054f81385b522334a282a73d3cd26948d903ede773e9  agent/programs/target/riscv64em-vos/release/vos-homes.elf
+ba73e499be0b59d6c21fdedbfae4fc3c806481baf767a94ca0fc05a163947ebf  agent/programs/target/riscv64em-vos/release/vos-homes.elf
 15bd949fcfae1aaa4887797c9bd4c13472edc55117cfff29a4487721cbbb0817  agent/programs/target/riscv64em-vos/release/vos-credential-book.elf
 bf9eb548c9040c11227e0389e86e951f59d2e4d1d01899ac3528e91118e5ef03  agent/programs/target/riscv64em-vos/release/vos-device-book.elf
 229265b3a8523eaecf9300f1132ac52b357736be369b51caa20305a9b5226eb9  pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm
