@@ -1673,3 +1673,124 @@ fn an_app_one_release_behind_signs_in_until_its_window_closes() {
         Answer::Refused(CredentialRefusal::Format)
     );
 }
+
+/// The tree kept from its feed: a follower's feed read page by page into
+/// the device's keeper, no query naming the member; the path it computes
+/// the actor's `path`; its proof, against the newest root, admitted by a
+/// follower's ingress and run. Enrollments since are read alone, from the
+/// keeper's place, and a proof at the new root is admitted too.
+#[test]
+fn a_proof_from_the_tree_kept_from_its_feed_is_admitted() {
+    use vos_light::wire::{self, Answer};
+
+    let founded = Founded::new();
+    let at = founded.follower();
+    let agent = founded.agent;
+    let secret = vos_light::derive_secret(&[0x5f; 32], &[0x42; 32]);
+    let mine = vos_light::member(&secret);
+    for batch in 0..6u32 {
+        let members: Vec<Digest> = (0..tree::ENROLL_MANY as u32)
+            .map(|seed| Secret::new(1_000 * batch + seed).member())
+            .collect();
+        founded.write(CREDENTIALS, "enroll_many", members);
+    }
+    founded.write(CREDENTIALS, "enroll", mine.to_bytes());
+    let time = || client::time(founded.cluster.target(at)).unwrap();
+    let identity = founded.operator.lock().unwrap().identity(agent).unwrap();
+    let mut keeper = vos_light::TreeKeeper::new(mine);
+    // Every page from the follower, whose applied state the last
+    // enrollment reaches once it replicates.
+    let read = |keeper: &mut vos_light::TreeKeeper| {
+        let mut pages = 0;
+        loop {
+            let query = keeper
+                .request(agent.0, &identity, CREDENTIALS.0, time() + 60_000)
+                .unwrap();
+            pages += 1;
+            if !keeper
+                .ingest(&device_send(&founded, at, &query), time())
+                .unwrap()
+                .more
+            {
+                return pages;
+            }
+        }
+    };
+    vos_checker::wait_until(
+        "the follower's feed holds the member",
+        Duration::from_secs(30),
+        || {
+            read(&mut keeper);
+            keeper.slot().is_some()
+        },
+    );
+    assert_eq!(keeper.cursor(), 7);
+    let path: Option<Path> = founded.read(CREDENTIALS, "path", mine.to_bytes());
+    let witness = keeper.witness().unwrap();
+    assert_eq!(Some(witness.clone()), path.as_ref().map(self::witness));
+    let root: RootEntry = founded.read(CREDENTIALS, "root", ());
+    assert_eq!(keeper.root(), root);
+
+    let prover = vos_light::Prover::new(vos_light::ProverConfig {
+        threads: vos_light::Threads::Count(4),
+        ..vos_light::ProverConfig::default()
+    })
+    .unwrap();
+    let login = || {
+        vos_light::Call::new(
+            founded.space.0,
+            agent.0,
+            POLL.0,
+            founded.method(POLL, "login").0,
+            ().encode(),
+            time() + 60_000,
+        )
+        .unwrap()
+    };
+    let prove = |keeper: &vos_light::TreeKeeper| {
+        let call = login();
+        let proof = prover
+            .prove_auth(
+                &secret,
+                &keeper.witness().unwrap(),
+                b"login",
+                &call,
+                &founded.auth,
+            )
+            .unwrap();
+        let claim = AuthClaim::decode_exact(&proof.claim).unwrap();
+        assert_eq!(claim.map_root, keeper.root().root, "the newest root");
+        wire::credentialed_answer(&device_send(
+            &founded,
+            at,
+            &wire::credentialed(&call, &proof),
+        ))
+    };
+    assert!(matches!(
+        prove(&keeper),
+        Ok(Answer::Ran {
+            outcome: Outcome::Done(_),
+            ..
+        })
+    ));
+
+    founded.write(CREDENTIALS, "enroll", Secret::new(9_999).member());
+    founded.write(CREDENTIALS, "revoke", Secret::new(3).member());
+    vos_checker::wait_until(
+        "the follower's feed holds the revocation",
+        Duration::from_secs(30),
+        || {
+            assert_eq!(read(&mut keeper), 1, "one page holds what changed since");
+            keeper.cursor() == 9
+        },
+    );
+    let root: RootEntry = founded.read(CREDENTIALS, "root", ());
+    assert_eq!(keeper.root(), root);
+    assert!(matches!(
+        prove(&keeper),
+        Ok(Answer::Ran {
+            outcome: Outcome::Done(_),
+            ..
+        })
+    ));
+}
