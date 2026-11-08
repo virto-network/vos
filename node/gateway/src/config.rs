@@ -1,11 +1,14 @@
 //! The gateway's TOML file: its key, its HTTP listener and public TLS, the
-//! limits per address, the nodes behind it, and its SSH port.
+//! limits per address, the nodes behind it, its SSH port, and its onion
+//! service.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::caps::PerPort;
+use crate::circuits::PerCircuit;
 use crate::limits::PerAddress;
 use crate::upstream::Address;
 
@@ -51,6 +54,10 @@ pub struct Config {
     pub per_address_burst: Option<u32>,
     /// The nodes behind the gateway.
     pub nodes: Vec<Node>,
+    /// The space file of the nodes' space: each of its nodes must be among
+    /// `nodes`, as a home's gateways list every node (`light-node.md`
+    /// §3.3), or the gateway does not start.
+    pub space: Option<PathBuf>,
     /// Where the SSH port listens, for s4's screens and the `vos-api`
     /// subsystem: none by default.
     pub ssh: Option<SocketAddr>,
@@ -62,6 +69,100 @@ pub struct Config {
     /// The demo's agent and its actors, whose screens the SSH port serves.
     #[cfg(feature = "ssh")]
     pub demo: Option<crate::demo::Demo>,
+    /// The onion service: the same HTTP and, with an SSH port, SSH, and
+    /// nothing else.
+    pub onion: Option<Onion>,
+}
+
+/// The onion service (`light-node.md` §6.1, §6.6): arti in process (the
+/// `tor` feature), or a C tor beside the gateway forwarding to loopback
+/// listeners; and what its circuits and calls may take.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Onion {
+    /// arti's state directory, whose keystore holds the onion's key once
+    /// the gateway inserted it.
+    pub state: Option<PathBuf>,
+    /// arti's directory cache.
+    pub cache: Option<PathBuf>,
+    /// The onion's key's seed file, in hex, made if missing: its address
+    /// is the key's.
+    pub key: Option<PathBuf>,
+    /// arti's service-side proof of work, which a release has not yet
+    /// declared ready: the `tor-pow` feature, off by default.
+    #[serde(default)]
+    pub pow: bool,
+    /// Introduction points, 3 by default.
+    pub intro_points: Option<u8>,
+    /// The introductions a second the introduction points pass on, and
+    /// their burst, for them to enforce; the consensus's by default.
+    pub intro_rate: Option<u32>,
+    pub intro_burst: Option<u32>,
+    /// A C tor beside the gateway in place of arti: the loopback listeners
+    /// its `HiddenServicePort 22` and `80` forward to, with
+    /// `HiddenServiceExportCircuitID haproxy`.
+    pub sidecar_ssh: Option<SocketAddr>,
+    pub sidecar_http: Option<SocketAddr>,
+    /// Streams open at once on one circuit.
+    pub circuit_streams: Option<usize>,
+    /// Circuits held at once.
+    pub circuits: Option<usize>,
+    /// HTTP connections and SSH channels at once from one circuit, and its
+    /// requests a second with a burst.
+    pub circuit_connections: Option<usize>,
+    pub circuit_rate: Option<u32>,
+    pub circuit_burst: Option<u32>,
+    /// Proven calls in flight through the onion, and from one connection.
+    pub proven: Option<usize>,
+    pub proven_per_connection: Option<usize>,
+    /// An agent's calls a second from one circuit, and their burst.
+    pub agent_rate: Option<u32>,
+    pub agent_burst: Option<u32>,
+}
+
+/// What one circuit may take by default, as an address would: fewer
+/// connections and requests than an address, since a client opens
+/// circuits at will.
+pub const PER_CIRCUIT: PerAddress = PerAddress {
+    connections: 4,
+    rate: 20,
+    burst: 40,
+};
+
+impl Onion {
+    /// Whether a C tor serves it, not arti.
+    pub fn sidecar(&self) -> bool {
+        self.sidecar_ssh.is_some() || self.sidecar_http.is_some()
+    }
+
+    pub fn per_circuit(&self) -> PerCircuit {
+        let defaults = PerCircuit::default();
+        PerCircuit {
+            streams: self.circuit_streams.unwrap_or(defaults.streams),
+            circuits: self.circuits.unwrap_or(defaults.circuits),
+        }
+    }
+
+    /// The limits each circuit counts as an address.
+    pub fn limits(&self) -> PerAddress {
+        PerAddress {
+            connections: self.circuit_connections.unwrap_or(PER_CIRCUIT.connections),
+            rate: self.circuit_rate.unwrap_or(PER_CIRCUIT.rate),
+            burst: self.circuit_burst.unwrap_or(PER_CIRCUIT.burst),
+        }
+    }
+
+    pub fn caps(&self) -> PerPort {
+        let defaults = PerPort::default();
+        PerPort {
+            proven: self.proven.unwrap_or(defaults.proven),
+            proven_per_connection: self
+                .proven_per_connection
+                .unwrap_or(defaults.proven_per_connection),
+            agent_rate: self.agent_rate.unwrap_or(defaults.agent_rate),
+            agent_burst: self.agent_burst.unwrap_or(defaults.agent_burst),
+        }
+    }
 }
 
 impl Config {
@@ -86,6 +187,32 @@ impl Config {
             .iter()
             .map(|node| Ok((hex32(&node.key)?, Address::parse(&node.address)?)))
             .collect()
+    }
+
+    /// Refused: a space file naming a node the gateway does not list, and
+    /// an onion both arti's and a C tor's.
+    pub fn check(&self) -> Result<(), String> {
+        if let Some(space) = &self.space {
+            let listed: Vec<[u8; 32]> = self.upstreams()?.into_iter().map(|(key, _)| key).collect();
+            let text = std::fs::read_to_string(space)
+                .map_err(|error| format!("{}: {error}", space.display()))?;
+            for key in space_keys(&text).map_err(|error| format!("{}: {error}", space.display()))? {
+                if !listed.contains(&key) {
+                    return Err(format!(
+                        "{}: node {} is not among the gateway's nodes: list every node of the space",
+                        space.display(),
+                        hex::encode(key)
+                    ));
+                }
+            }
+        }
+        if let Some(onion) = &self.onion
+            && onion.sidecar()
+            && (onion.state.is_some() || onion.cache.is_some() || onion.key.is_some() || onion.pow)
+        {
+            return Err("an onion is arti's (state, cache, key, pow) or a C tor's (sidecar_ssh, sidecar_http), not both".into());
+        }
+        Ok(())
     }
 
     /// HTTP's TLS, for the gateway whose seed is `secret`.
@@ -118,6 +245,28 @@ impl Config {
         };
         server_config(&tls, secret).map(Some)
     }
+}
+
+/// The node keys a space file names: one node a line, its key the second
+/// of four fields; a `#` starts a comment.
+pub fn space_keys(text: &str) -> Result<Vec<[u8; 32]>, String> {
+    text.lines()
+        .enumerate()
+        .filter_map(|(line, content)| {
+            let content = content.split('#').next().unwrap_or_default().trim();
+            (!content.is_empty()).then_some((line, content))
+        })
+        .map(|(line, content)| {
+            let fields: Vec<&str> = content.split_whitespace().collect();
+            let [_, key, _, _] = fields[..] else {
+                return Err(format!(
+                    "line {}: four fields: number, key, peer address, contact",
+                    line + 1
+                ));
+            };
+            hex32(key).map_err(|error| format!("line {}: {error}", line + 1))
+        })
+        .collect()
 }
 
 /// 32 bytes from 64 hex digits.
@@ -179,6 +328,55 @@ mod tests {
             toml::from_str::<Config>("key = \"k\"\nhttp = \"0.0.0.0:80\"\nnodes = []\nother = 1\n")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn every_node_of_the_space_is_listed_or_the_gateway_does_not_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let space = dir.path().join("space");
+        std::fs::write(
+            &space,
+            format!(
+                "# number key peer contact\n1 {} 10.0.0.1:7800 https://g\n2 {} 10.0.0.2:7800 https://g # two\n",
+                "ab".repeat(32),
+                "cd".repeat(32)
+            ),
+        )
+        .unwrap();
+        let node = |key: u8| {
+            format!(
+                "[[nodes]]\nkey = \"{}\"\naddress = \"unix:/n{key}\"\n",
+                hex::encode([key; 32])
+            )
+        };
+        let config = |nodes: &str| -> Config {
+            toml::from_str(&format!(
+                "key = \"k\"\nhttp = \"127.0.0.1:80\"\nspace = \"{}\"\n{nodes}",
+                space.display()
+            ))
+            .unwrap()
+        };
+        assert!(config(&node(0xab)).check().is_err(), "node 2 unlisted");
+        assert!(config(&(node(0xab) + &node(0xcd))).check().is_ok());
+        assert!(space_keys("1 ab 10.0.0.1:1 c\n").is_err());
+        let onion = |text: &str| -> Config {
+            toml::from_str(&format!(
+                "key = \"k\"\nhttp = \"127.0.0.1:80\"\nnodes = []\n[onion]\n{text}"
+            ))
+            .unwrap()
+        };
+        assert!(
+            onion("sidecar_ssh = \"127.0.0.1:2222\"\nkey = \"o\"\n")
+                .check()
+                .is_err()
+        );
+        let sidecar = onion("sidecar_http = \"127.0.0.1:8081\"\ncircuit_rate = 5\n");
+        assert!(sidecar.check().is_ok());
+        let served = sidecar.onion.unwrap();
+        assert!(served.sidecar());
+        assert_eq!(served.limits().rate, 5);
+        assert_eq!(served.limits().connections, PER_CIRCUIT.connections);
+        assert_eq!(served.caps(), PerPort::default());
     }
 
     #[test]

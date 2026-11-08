@@ -315,6 +315,14 @@ test-agent: build-test-actors build-agent build-representative build-credentials
 # space (`node/gateway/demo`, outside the workspace): a headless s4 client
 # enrolling, signing in and paying through the SSH port, proving with the
 # device library through s4's `vos.credential` facility.
+# The onion's ports and the SSH relay's caps on the `tor` feature (arti,
+# pinned exactly; `--ignore-rust-version` as s4's): clippy, and the
+# gateway's tests, the flood of junk proven calls held to the caps among
+# them. No network: the onion's streams are made in process.
+test-gateway-onion: build-test-actors build-agent
+    cargo clippy -p vos-gateway --features tor --ignore-rust-version --all-targets --quiet -- -D warnings
+    cargo test -p vos-gateway --features tor --ignore-rust-version
+
 test-gateway-ssh: build-test-actors build-agent build-credentials build-payments
     cargo clippy -p vos-gateway --features ssh --ignore-rust-version --all-targets --quiet -- -D warnings
     cargo test -p vos-gateway --features ssh --ignore-rust-version
@@ -689,6 +697,7 @@ check: fmt-check doc-check check-venue-rules check-no-std check-no-leaks check-n
     cargo test {{core_crates}}
     just test-recair
     cargo test {{agent_crates}}
+    just test-gateway-onion
     just test-reads
 
 # The live runs of reads at a cut on the agent's model, with no proving:

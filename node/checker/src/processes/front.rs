@@ -61,6 +61,7 @@ impl Front {
                 tls: None,
                 connections: 1024,
                 mark: vos_api::Mark::Clearnet,
+                caps: vos_gateway::caps::Caps::none(),
             },
             async {
                 let _ = stopped.await;

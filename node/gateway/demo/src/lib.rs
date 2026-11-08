@@ -260,13 +260,13 @@ impl LocalSpace {
         )]));
         let mark = vos_api::Mark::Clearnet;
         let app = Arc::new(AppClient::new(app, Arc::clone(&gateway), mark));
-        let server = vos_gateway::ssh::server(
-            host_key,
-            gateway,
-            Limits::new(PerAddress::default()),
+        let port = vos_gateway::ssh::Port::tcp(
             mark,
-            Some((self.demo(), app)),
+            Limits::new(PerAddress::default()),
+            vos_gateway::caps::Caps::none(),
+            vos_gateway::caps::bodies(),
         );
+        let server = vos_gateway::ssh::server(host_key, gateway, port, Some((self.demo(), app)));
         tokio::spawn(async move {
             if let Err(error) = server.serve_on(listener).await {
                 eprintln!("the SSH port ended: {error}");

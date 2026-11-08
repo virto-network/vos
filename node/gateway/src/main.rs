@@ -7,6 +7,7 @@ use clap::Parser;
 use vos_api::Mark;
 use vos_gateway::Gateway;
 use vos_gateway::app::AppClient;
+use vos_gateway::caps::Caps;
 use vos_gateway::config::{Config, seed};
 use vos_gateway::front::{self, Http};
 use vos_gateway::limits::Limits;
@@ -36,6 +37,7 @@ fn run(cli: Cli) -> Result<(), String> {
         .with_writer(std::io::stderr)
         .init();
     let config = Config::read(&cli.config)?;
+    config.check()?;
     let secret = seed(&config.key)?;
     let tls = config.http_tls(&secret)?;
     let upstreams = config
@@ -46,14 +48,9 @@ fn run(cli: Cli) -> Result<(), String> {
     let gateway = Arc::new(Gateway::new(upstreams));
     // The s4 app's client key, apart from the gateway's: its apps' claims
     // go as it.
-    let app = config
-        .app_key
-        .as_ref()
-        .map(|path| {
-            seed(path)
-                .map(|seed| Arc::new(AppClient::new(seed, Arc::clone(&gateway), Mark::Clearnet)))
-        })
-        .transpose()?;
+    let app_seed = config.app_key.as_ref().map(|path| seed(path)).transpose()?;
+    let app =
+        app_seed.map(|seed| Arc::new(AppClient::new(seed, Arc::clone(&gateway), Mark::Clearnet)));
     let limits = Limits::new(config.per_address());
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
     runtime.block_on(async {
@@ -67,19 +64,40 @@ fn run(cli: Cli) -> Result<(), String> {
         if let Some(app) = &app {
             println!("app {}", hex::encode(app.key()));
         }
+        // The proven bodies' places the SSH ports share.
+        let bodies = vos_gateway::caps::bodies();
+        // The HTTP and SSH ports are the clearnet's: their clients'
+        // addresses bound them, and they cap no calls.
         #[cfg(feature = "ssh")]
         let ssh = vos_gateway::ssh::start(
             &config,
             Arc::clone(&gateway),
-            Arc::clone(&limits),
+            vos_gateway::ssh::Port::tcp(
+                Mark::Clearnet,
+                Arc::clone(&limits),
+                Caps::none(),
+                Arc::clone(&bodies),
+            ),
             app.clone(),
         )
         .await?;
-        // The HTTP and SSH ports are the clearnet's.
+        let onion = match &config.onion {
+            Some(onion) => Some(
+                vos_gateway::served::onion(&config, onion, Arc::clone(&gateway), bodies, app_seed)
+                    .await?,
+            ),
+            None => None,
+        };
+        #[cfg(feature = "tor")]
+        if let Some(hosted) = onion.as_ref().and_then(|served| served.hosted.as_ref()) {
+            println!("onion {}", hosted.address);
+            println!("onion key {}", hex::encode(hosted.key));
+        }
         let http = Http {
             tls,
             connections: config.connections.unwrap_or(1024),
             mark: Mark::Clearnet,
+            caps: Caps::none(),
         };
         front::serve(gateway, limits, listener, http, async {
             let _ = tokio::signal::ctrl_c().await;
@@ -89,6 +107,7 @@ fn run(cli: Cli) -> Result<(), String> {
         if let Some(ssh) = ssh {
             ssh.abort();
         }
+        drop(onion);
         Ok(())
     })
 }

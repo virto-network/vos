@@ -128,6 +128,7 @@ impl Front {
                 tls,
                 connections: 64,
                 mark,
+                caps: vos_gateway::caps::Caps::none(),
             },
             async {
                 let _ = stopped.await;
