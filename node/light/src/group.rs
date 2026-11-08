@@ -593,9 +593,10 @@ pub enum Trust {
 }
 
 /// Where the device is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
 pub enum Course {
     #[codec(index = 0)]
+    #[default]
     Following,
     /// It cannot follow `epoch`, committed by `committer`.
     #[codec(index = 1)]

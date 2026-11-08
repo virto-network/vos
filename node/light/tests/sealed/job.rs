@@ -179,7 +179,7 @@ fn pass_with(
     phone: &mut Phone,
     instances: &[InstanceId],
     death: Option<Death>,
-) -> Result<Run, vos_light::personal::SyncError<Killed>> {
+) -> Result<Run, job::Stopped<Killed>> {
     let now = home.now;
     let mut link = JobLink::new(home, phone);
     link.death = death;
@@ -225,8 +225,8 @@ fn a_pass_with_nothing_new_reads_little() {
         "quiet pass: {} requests, {} bytes of answers",
         quiet.requests, quiet.down
     );
-    assert!(quiet.down < 64 << 10, "{} bytes", quiet.down);
-    assert!(quiet.requests <= 12, "{} requests", quiet.requests);
+    assert_eq!(quiet.requests, 7);
+    assert!(quiet.down < 1 << 10, "{} bytes", quiet.down);
 }
 
 /// A pass pushes the scope's queued operations and reads what the other
@@ -265,7 +265,9 @@ fn a_pass_pushes_and_reads_the_scopes() {
 }
 
 /// A restore signed by a leaked kit is pending: the pass posts `alive`,
-/// which cancels it, and raises the restore and the kit's operation.
+/// which cancels it, and raises the restore and the kit's operation; the
+/// other phone's pass raises the kit's operation too, and a pass after
+/// posts nothing.
 #[test]
 fn a_pending_restore_is_answered_with_alive() {
     let leaked = KitSecret::phrase().unwrap();
@@ -280,6 +282,17 @@ fn a_pending_restore_is_answered_with_alive() {
         notices.contains(&Notice::Alarm(Alarm::Kit { index })),
         "{notices:?}"
     );
+    let other = pass(&mut home, &mut phones[1]);
+    assert!(!other.pass.alive, "the restore was cancelled already");
+    assert!(
+        other
+            .pass
+            .notices()
+            .contains(&Notice::Alarm(Alarm::Kit { index })),
+        "the kit's restore is raised on every phone"
+    );
+    let again = pass(&mut home, &mut phones[0]);
+    assert!(!again.pass.alive && again.pass.posts == 0);
     let state = home
         .query::<Operation>(phones[0].sync_key(), "operation", index.encode())
         .unwrap()
@@ -387,7 +400,13 @@ fn a_killed_pass_leaves_the_store_consistent() {
             let (mut home, mut phones) = killable();
             let killed = pass_with(&mut home, &mut phones[0], &[NOTES], Some(death));
             assert!(
-                matches!(killed, Err(vos_light::personal::SyncError::Link(Killed))),
+                matches!(
+                    &killed,
+                    Err(job::Stopped {
+                        error: vos_light::personal::SyncError::Link(Killed),
+                        ..
+                    })
+                ),
                 "{death:?}: {:?}",
                 killed.map(|run| run.requests)
             );
@@ -396,4 +415,93 @@ fn a_killed_pass_leaves_the_store_consistent() {
             converged(&mut home, &mut phones);
         }
     }
+}
+
+/// A candidate waits for this phone's vote: the pass votes, the other
+/// phone's pass sees it confirmed. Killed before and after each request,
+/// the next pass still votes once, refused as done where the agent took
+/// the vote already, and the epoch confirms.
+#[test]
+fn a_pass_killed_around_its_vote_votes_once() {
+    let requests = {
+        let (mut home, mut phones) = household(2);
+        let epoch = phones[0].group().confirmed();
+        phones[1].update(&mut home).unwrap();
+        let whole = pass(&mut home, &mut phones[0]);
+        assert!(whole.pass.posts >= 1, "it voted");
+        pass(&mut home, &mut phones[1]);
+        assert_eq!(phones[1].group().confirmed(), epoch + 1);
+        whole.requests
+    };
+    for n in 0..requests {
+        for death in [Death::Before(n), Death::After(n)] {
+            let (mut home, mut phones) = household(2);
+            let epoch = phones[0].group().confirmed();
+            phones[1].update(&mut home).unwrap();
+            assert!(pass_with(&mut home, &mut phones[0], &[NOTES], Some(death)).is_err());
+            restart(&mut phones[0]);
+            let next = pass(&mut home, &mut phones[0]);
+            assert!(
+                next.pass.alarms.is_empty(),
+                "{death:?}: {:?}",
+                next.pass.alarms
+            );
+            pass(&mut home, &mut phones[1]);
+            pass(&mut home, &mut phones[0]);
+            for phone in phones.iter_mut() {
+                assert_eq!(phone.group().confirmed(), epoch + 1, "{death:?}");
+            }
+        }
+    }
+}
+
+/// A link that is not the onion's: the pass sends nothing.
+#[test]
+fn a_pass_over_the_clearnet_sends_nothing() {
+    struct Clear<'a>(JobLink<'a>);
+    impl Link for Clear<'_> {
+        type Error = Killed;
+        fn route(&self) -> Route {
+            Route::Clearnet
+        }
+        fn push(
+            &mut self,
+            envelopes: &[Vec<u8>],
+        ) -> Result<Vec<Result<Pushed, PersonalError>>, Killed> {
+            self.0.push(envelopes)
+        }
+        fn since(&mut self, scope: Scope, position: u64) -> Answer<Vec<Envelope>, Killed> {
+            self.0.since(scope, position)
+        }
+        fn wake(&mut self) -> Answer<Woken, Killed> {
+            self.0.wake()
+        }
+        fn frontier(&mut self, device: u32) -> Answer<Frontier, Killed> {
+            self.0.frontier(device)
+        }
+    }
+    impl Control for Clear<'_> {
+        fn log(&mut self, from: u64) -> Answer<Vec<(u64, Entry)>, Killed> {
+            self.0.log(from)
+        }
+        fn overview(&mut self) -> Answer<Overview, Killed> {
+            self.0.overview()
+        }
+        fn devices(&mut self) -> Answer<Vec<DeviceView>, Killed> {
+            self.0.devices()
+        }
+        fn post(&mut self, post: &Post) -> Answer<u64, Killed> {
+            self.0.post(post)
+        }
+    }
+    let (mut home, mut phones) = household(2);
+    let now = home.now;
+    let mut link = Clear(JobLink::new(&mut home, &phones[0]));
+    let Phone { light, group, .. } = &mut phones[0];
+    let stopped = job::run(light, group.as_mut().unwrap(), &mut link, &[NOTES], now).unwrap_err();
+    assert!(matches!(
+        stopped.error,
+        vos_light::personal::SyncError::Clearnet
+    ));
+    assert_eq!(link.0.requests, 0);
 }

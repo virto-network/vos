@@ -15,15 +15,24 @@
 //!
 //! **A pass killed at any point leaves the store consistent:** every
 //! change it makes is one of the device group's or sealed sync's batches,
-//! each synced, and every request it sends is one the agent answers alike
-//! when sent again (a push by its envelope's id, a vote or evidence by its
-//! index, `alive` at most once an hour), so the next pass starts from what
-//! the store holds and finishes the work.
+//! each synced, and every request it sends is safe to send again: a push
+//! the agent answers by its envelope's id, `alive` it logs at most once an
+//! hour, and a vote or evidence it already holds (or whose candidate it
+//! decided meanwhile) is refused with an answer the pass takes as done,
+//! reading the log on. The next pass starts from what the store holds and
+//! finishes the work.
+//!
+//! **A device that cannot follow** (stuck, or out of the group) reads the
+//! log, the overview and the device set, and leaves its scopes alone: it
+//! re-pairs or regroups first. A pass that stops on an error hands back
+//! what it had found ([`Stopped`]), its alarms with it.
 //!
 //! **What the chrome raises** ([`Pass::notices`]): the device set's open
 //! operations, each a local notification while it can be vetoed; a
-//! pending restore; this device's removal; the yearly re-proof; and every
-//! alarm. No push-notification token is given to any space (§8, L3).
+//! pending restore; this device's removal, and that it cannot follow, for
+//! as long as either holds; the yearly re-proof; and every alarm, on the
+//! pass that raised it (the chrome keeps an alarm until its user saw it).
+//! No push-notification token is given to any space (§8, L3).
 
 use ed25519_dalek::Signer as _;
 use vos_wire::ids::InstanceId;
@@ -156,6 +165,9 @@ pub enum Notice {
     Restore,
     /// This device is out of the group.
     Removed,
+    /// This device cannot follow the confirmed epoch: it re-pairs, or
+    /// regroups.
+    Stuck,
     /// The yearly re-proof and the leaf's update are due.
     Renew,
     Alarm(Alarm),
@@ -163,14 +175,13 @@ pub enum Notice {
 
 /// A device-set operation's kind, as a notification names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
 pub enum Kind {
-    Add = 0,
-    Remove = 1,
-    Replace = 2,
-    Rotate = 3,
-    Regroup = 4,
-    Restore = 5,
+    Add,
+    Remove,
+    Replace,
+    Rotate,
+    Regroup,
+    Restore,
 }
 
 impl Kind {
@@ -218,6 +229,8 @@ pub struct Pass {
     /// The agent's batch time, and whether the yearly re-proof is due.
     pub at: u64,
     pub renew: bool,
+    /// Where the device is after the pass.
+    pub course: group::Course,
 }
 
 impl Pass {
@@ -243,8 +256,10 @@ impl Pass {
         if self.alive {
             notices.push(Notice::Restore);
         }
-        if self.events.contains(&Event::Removed) {
-            notices.push(Notice::Removed);
+        match self.course {
+            group::Course::Out => notices.push(Notice::Removed),
+            group::Course::Stuck { .. } => notices.push(Notice::Stuck),
+            group::Course::Following => {}
         }
         if self.renew {
             notices.push(Notice::Renew);
@@ -260,6 +275,13 @@ impl Pass {
     }
 }
 
+/// A pass that stopped on `error`, and what it had found by then.
+#[derive(Debug)]
+pub struct Stopped<E> {
+    pub pass: Box<Pass>,
+    pub error: SyncError<E>,
+}
+
 /// One pass of the background job for `instances` of `light`, through
 /// `group`'s agent over `link`, at the device's time `now` (milliseconds):
 /// refused before anything is sent unless the link reaches the agent
@@ -270,12 +292,32 @@ pub fn run<L: Control>(
     link: &mut L,
     instances: &[InstanceId],
     now: u64,
-) -> Result<Pass, SyncError<L::Error>> {
+) -> Result<Pass, Stopped<L::Error>> {
     let mut pass = Pass::default();
+    let done = passing(light, group, link, instances, now, &mut pass);
+    pass.course = group.course();
+    pass.operations = group.operations();
+    match done {
+        Ok(()) => Ok(pass),
+        Err(error) => Err(Stopped {
+            pass: Box::new(pass),
+            error,
+        }),
+    }
+}
+
+fn passing<L: Control>(
+    light: &Light,
+    group: &mut DeviceGroup,
+    link: &mut L,
+    instances: &[InstanceId],
+    now: u64,
+    pass: &mut Pass,
+) -> Result<(), SyncError<L::Error>> {
     onion(link)?;
-    follow(light, group, link, &mut pass)?;
+    follow(light, group, link, pass)?;
     if group.course() == group::Course::Out {
-        return Ok(pass);
+        return Ok(());
     }
     let overview = answer(link.overview())?;
     pass.at = overview.at;
@@ -292,10 +334,29 @@ pub fn run<L: Control>(
             group.policy().lease_ms,
             overview.at,
         );
-    for instance in instances {
-        scope(light, group, link, instances, *instance, &mut pass)?;
+    if group.course() == group::Course::Following {
+        sealed(light, group, link, instances, pass)?;
     }
-    keep(light, group, link, instances, &mut pass)?;
+    pass.seen = answer(link.devices())?
+        .into_iter()
+        .map(|view| (view.id, view.seen))
+        .collect();
+    Ok(())
+}
+
+/// The scopes pushed and read, the archive and the recovery envelopes
+/// kept, the checkpoints acknowledged and one own push audited.
+fn sealed<L: Control>(
+    light: &Light,
+    group: &mut DeviceGroup,
+    link: &mut L,
+    instances: &[InstanceId],
+    pass: &mut Pass,
+) -> Result<(), SyncError<L::Error>> {
+    for instance in instances {
+        scope(light, group, link, instances, *instance, pass)?;
+    }
+    keep(light, group, link, instances, pass)?;
     for instance in instances {
         let mut sync = SealedSync::new(light, group, link, instances.to_vec())?;
         let acknowledging = sync.acknowledge(*instance)?;
@@ -304,12 +365,7 @@ pub fn run<L: Control>(
             pass.raise(alarm);
         }
     }
-    pass.seen = answer(link.devices())?
-        .into_iter()
-        .map(|view| (view.id, view.seen))
-        .collect();
-    pass.operations = group.operations();
-    Ok(pass)
+    Ok(())
 }
 
 fn onion<L: Link>(link: &L) -> Result<(), SyncError<L::Error>> {
@@ -384,9 +440,12 @@ fn follow<L: Control>(
                     continue;
                 }
             };
-            let at = post_settled(link, &post)?;
-            group.called(at);
-            pass.posts += 1;
+            // Taken before (a kill between the post and its answer), or its
+            // candidate decided meanwhile: the log says which, read on.
+            if let Some(at) = post_settled(link, &post)? {
+                group.called(at);
+                pass.posts += 1;
+            }
             posted = true;
         }
         if !posted || group.course() == group::Course::Out {
@@ -415,12 +474,19 @@ fn log<L: Control>(link: &mut L, from: u64) -> Result<Vec<(u64, Entry)>, SyncErr
 }
 
 /// `post`, the agent woken and the post made again while it answers
-/// `Settling`.
-fn post_settled<L: Control>(link: &mut L, post: &Post) -> Result<u64, SyncError<L::Error>> {
+/// `Settling`: the batch time it was taken at, or `None` when the agent
+/// holds it already or decided its candidate meanwhile.
+fn post_settled<L: Control>(link: &mut L, post: &Post) -> Result<Option<u64>, SyncError<L::Error>> {
     for _ in 0..=WAKES {
         onion(link)?;
         match link.post(post).map_err(SyncError::Link)? {
-            Ok(at) => return Ok(at),
+            Ok(at) => return Ok(Some(at)),
+            Err(
+                PersonalError::Voted
+                | PersonalError::Evidenced
+                | PersonalError::NoCandidate
+                | PersonalError::NotConfirming,
+            ) => return Ok(None),
             Err(PersonalError::Settling) => {
                 onion(link)?;
                 answer(link.wake())?;
@@ -449,6 +515,7 @@ fn scope<L: Control>(
         pass.pushed += again.pushed.len();
     }
     let mut waiting = None;
+    let mut withheld = false;
     for _ in 0..READINGS {
         let caught = SealedSync::new(light, group, link, instances.to_vec())?.catch_up(instance)?;
         pass.envelopes += caught.envelopes;
@@ -465,7 +532,9 @@ fn scope<L: Control>(
             Some(Waiting::Key(_)) => {
                 SealedSync::new(light, group, link, instances.to_vec())?.archive()?;
             }
-            Some(Waiting::Withheld(_)) => {}
+            // Read again once: a page withheld twice waits for the next pass.
+            Some(Waiting::Withheld(_)) if withheld => break,
+            Some(Waiting::Withheld(_)) => withheld = true,
         }
     }
     if let Some(waiting) = waiting {
