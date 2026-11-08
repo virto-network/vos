@@ -409,6 +409,14 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   the battery-exemption prompt; a killed job leaves everything consistent.
 - **Gate:** PG6's job limits on a locked phone, and its recorded cases.
   **Dep:** 8.6, 8.20. **Estimate:** 1–1.5 weeks.
+- **Host result** (2026-11-08, `light-node.md` §3.6, "The background job
+  as built"): `vos_light::job`, the pass over a `Control` link, its notices
+  and `DeviceView::seen`; a pass with nothing new 7 requests and 376 bytes
+  of answers; a pass killed before or after each request converging at
+  the next. s4: WorkManager in `:vos`, the runs kept, the notices as local
+  notifications, the exemption's prompt; a quiet run 5.2 KB down at a
+  stand-in gateway. The locked-phone run waits for the phone session; the
+  personal agent's part on a phone waits for s4's Tor wiring.
 
 ### 8.23a Pairing, claim, memberships, retiring a phone — C
 - The claim at a home-only space (the open claim's work, a phrase or

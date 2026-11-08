@@ -37,6 +37,7 @@ use home::Home;
 use phone::Phone;
 
 mod detection;
+mod job;
 mod pairing;
 
 const MIN: u64 = 60_000;

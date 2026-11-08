@@ -1,0 +1,565 @@
+//! The background job's pass (`light-node.md` §3.6, "Background sync"):
+//! what a device does each time the operating system runs its job, over
+//! one connection to its personal agent ([`Control`]), and what it leaves
+//! for the chrome ([`Pass`]).
+//!
+//! In order: the control log read from the device group's cursor and
+//! followed, every vote, evidence and `alive` it asks for posted until it
+//! asks for none (`alive` while a restore is pending, §3.5); the agent's
+//! head and batch time checked; each scope's queued operations pushed and
+//! its envelopes read by its cursor, the log followed again where a push or
+//! a page waits for an epoch, the archive read where a page waits for a
+//! key; the archive and the recovery envelopes kept; each scope's
+//! checkpoints acknowledged and a sample of its own pushes audited; the
+//! device set read for each device's last call.
+//!
+//! **A pass killed at any point leaves the store consistent:** every
+//! change it makes is one of the device group's or sealed sync's batches,
+//! each synced, and every request it sends is safe to send again: a push
+//! the agent answers by its envelope's id, `alive` it logs at most once an
+//! hour, and a vote or evidence it already holds (or whose candidate it
+//! decided meanwhile) is refused with an answer the pass takes as done,
+//! reading the log on. The next pass starts from what the store holds and
+//! finishes the work.
+//!
+//! **A device that cannot follow** (stuck, or out of the group) reads the
+//! log, the overview and the device set, and leaves its scopes alone: it
+//! re-pairs or regroups first. A pass that stops on an error hands back
+//! what it had found ([`Stopped`]), its alarms with it.
+//!
+//! **What the chrome raises** ([`Pass::notices`]): the device set's open
+//! operations, each a local notification while it can be vetoed; a
+//! pending restore; this device's removal, and that it cannot follow, for
+//! as long as either holds; the yearly re-proof; and every alarm, on the
+//! pass that raised it (the chrome keeps an alarm until its user saw it).
+//! No push-notification token is given to any space (§8, L3).
+
+use ed25519_dalek::Signer as _;
+use vos_wire::ids::InstanceId;
+use vos_wire::personal::{
+    Attached, Body, DeviceId, DeviceView, Entry, Op, Overview, PersonalError, Recorded, Signer,
+    Vote, Voted,
+};
+use vos_wire::{Decode, Encode};
+
+use crate::group::{self, Alarm, DeviceGroup, Event, Open};
+use crate::home;
+use crate::light::Light;
+use crate::personal::{Answer, Link, SealedSync, SyncError, Waiting};
+use crate::route::Route;
+
+/// The rounds of posting a pass makes while the log keeps asking for
+/// more: a vote, then the next candidate's, and so on.
+const ROUNDS: usize = 8;
+
+/// The `wake`s a post makes before it gives up on `Settling`.
+const WAKES: usize = 8;
+
+/// The readings of one scope a pass makes while a page waits for an epoch
+/// or a key.
+const READINGS: usize = 4;
+
+/// The own envelopes a pass audits in each scope.
+pub const AUDIT_SAMPLE: usize = 1;
+
+/// What a device posts to its agent under its sync key while following
+/// the log, each a named call of `Personal`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Post {
+    /// `confirm(epoch, h, signature)`.
+    Confirm {
+        epoch: u64,
+        h: [u8; 32],
+        signature: [u8; 64],
+    },
+    /// `nack(epoch, signature)`.
+    Nack { epoch: u64, signature: [u8; 64] },
+    /// `evidence((index, message), (signature, attached))`.
+    Evidence {
+        index: u64,
+        message: Vec<u8>,
+        signature: [u8; 64],
+        attached: Attached,
+    },
+    /// `alive()`.
+    Alive,
+}
+
+impl Post {
+    /// The method's name.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Post::Confirm { .. } => "confirm",
+            Post::Nack { .. } => "nack",
+            Post::Evidence { .. } => "evidence",
+            Post::Alive => "alive",
+        }
+    }
+
+    /// Its arguments, encoded.
+    pub fn arguments(&self) -> Vec<u8> {
+        match self {
+            Post::Confirm {
+                epoch,
+                h,
+                signature,
+            } => (*epoch, *h, *signature).encode(),
+            Post::Nack { epoch, signature } => (*epoch, *signature).encode(),
+            Post::Evidence {
+                index,
+                message,
+                signature,
+                attached,
+            } => ((*index, message.clone()), (*signature, attached.clone())).encode(),
+            Post::Alive => ().encode(),
+        }
+    }
+
+    /// The batch time its reply names, from the reply's bytes.
+    pub fn at(&self, reply: &[u8]) -> Option<u64> {
+        match self {
+            Post::Confirm { .. } | Post::Nack { .. } => {
+                Voted::decode_exact(reply).map(|voted| voted.at)
+            }
+            Post::Evidence { .. } | Post::Alive => {
+                Recorded::decode_exact(reply).map(|recorded| recorded.at)
+            }
+        }
+    }
+}
+
+/// A connection to the personal agent with what a pass reads and posts
+/// beyond sealed sync's: the control log, the overview, the device set,
+/// and the posts. Each method one round trip.
+pub trait Control: Link {
+    /// `log(from)`: the log's entries from `from`, as much as one answer
+    /// holds.
+    fn log(&mut self, from: u64) -> Answer<Vec<(u64, Entry)>, Self::Error>;
+
+    /// `overview()`: the epochs, the log's head, the lease.
+    fn overview(&mut self) -> Answer<Overview, Self::Error>;
+
+    /// `devices()`: the device set, each device's standing and last call.
+    fn devices(&mut self) -> Answer<Vec<DeviceView>, Self::Error>;
+
+    /// `post` under the sync key in the link's session: the batch time it
+    /// was taken at.
+    fn post(&mut self, post: &Post) -> Answer<u64, Self::Error>;
+}
+
+/// What the chrome raises as a local notification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Notice {
+    /// A device-set operation open at `index`, maturing at `matures`
+    /// unless vetoed: `at` is when the log took it, if this pass read it.
+    Operation {
+        index: u64,
+        by: Signer,
+        kind: Kind,
+        matures: u64,
+        contested: bool,
+        at: Option<u64>,
+    },
+    /// A restore is pending, which asserts every device lost: this device
+    /// posted `alive`, and its user rotates the kit.
+    Restore,
+    /// This device is out of the group.
+    Removed,
+    /// This device cannot follow the confirmed epoch: it re-pairs, or
+    /// regroups.
+    Stuck,
+    /// The yearly re-proof and the leaf's update are due.
+    Renew,
+    Alarm(Alarm),
+}
+
+/// A device-set operation's kind, as a notification names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Add,
+    Remove,
+    Replace,
+    Rotate,
+    Regroup,
+    Restore,
+}
+
+impl Kind {
+    pub fn of(op: &Op) -> Self {
+        match op {
+            Op::Add(_) => Kind::Add,
+            Op::Remove(_) => Kind::Remove,
+            Op::Replace { .. } => Kind::Replace,
+            Op::Rotate(_) => Kind::Rotate,
+            Op::Regroup(_) => Kind::Regroup,
+            Op::Restore { .. } => Kind::Restore,
+        }
+    }
+}
+
+/// What one pass did and found.
+#[derive(Debug, Default)]
+pub struct Pass {
+    /// The log entries read, and the posts made.
+    pub entries: usize,
+    pub posts: usize,
+    /// Whether it posted `alive`: a restore is pending.
+    pub alive: bool,
+    /// The epochs confirmed or voided, and this device's removal, as read.
+    pub events: Vec<Event>,
+    /// Every alarm raised, once each.
+    pub alarms: Vec<Alarm>,
+    /// The device set's operations open after the pass.
+    pub operations: Vec<Open>,
+    /// When the log took each operation this pass read, by index.
+    pub taken: Vec<(u64, u64)>,
+    /// The nodes this device's pushes delivered, and the envelopes read
+    /// with their bytes.
+    pub pushed: usize,
+    pub envelopes: usize,
+    pub bytes: usize,
+    /// The operations read that are held or quarantined.
+    pub held: usize,
+    pub quarantined: usize,
+    /// A scope's reading still waiting when the pass ended.
+    pub waiting: Vec<(InstanceId, Waiting)>,
+    /// Each device's last call the agent took, by its batch time (0 before
+    /// any).
+    pub seen: Vec<(DeviceId, u64)>,
+    /// The agent's batch time, and whether the yearly re-proof is due.
+    pub at: u64,
+    pub renew: bool,
+    /// Where the device is after the pass.
+    pub course: group::Course,
+}
+
+impl Pass {
+    /// What the chrome raises for it.
+    pub fn notices(&self) -> Vec<Notice> {
+        let mut notices: Vec<Notice> = self
+            .operations
+            .iter()
+            .filter(|open| open.verified)
+            .map(|open| Notice::Operation {
+                index: open.index,
+                by: open.by,
+                kind: Kind::of(&open.op),
+                matures: open.matures,
+                contested: open.contested,
+                at: self
+                    .taken
+                    .iter()
+                    .find(|(index, _)| *index == open.index)
+                    .map(|(_, at)| *at),
+            })
+            .collect();
+        if self.alive {
+            notices.push(Notice::Restore);
+        }
+        match self.course {
+            group::Course::Out => notices.push(Notice::Removed),
+            group::Course::Stuck { .. } => notices.push(Notice::Stuck),
+            group::Course::Following => {}
+        }
+        if self.renew {
+            notices.push(Notice::Renew);
+        }
+        notices.extend(self.alarms.iter().copied().map(Notice::Alarm));
+        notices
+    }
+
+    fn raise(&mut self, alarm: Alarm) {
+        if !self.alarms.contains(&alarm) {
+            self.alarms.push(alarm);
+        }
+    }
+}
+
+/// A pass that stopped on `error`, and what it had found by then.
+#[derive(Debug)]
+pub struct Stopped<E> {
+    pub pass: Box<Pass>,
+    pub error: SyncError<E>,
+}
+
+/// One pass of the background job for `instances` of `light`, through
+/// `group`'s agent over `link`, at the device's time `now` (milliseconds):
+/// refused before anything is sent unless the link reaches the agent
+/// through the onion.
+pub fn run<L: Control>(
+    light: &Light,
+    group: &mut DeviceGroup,
+    link: &mut L,
+    instances: &[InstanceId],
+    now: u64,
+) -> Result<Pass, Stopped<L::Error>> {
+    let mut pass = Pass::default();
+    let done = passing(light, group, link, instances, now, &mut pass);
+    pass.course = group.course();
+    pass.operations = group.operations();
+    match done {
+        Ok(()) => Ok(pass),
+        Err(error) => Err(Stopped {
+            pass: Box::new(pass),
+            error,
+        }),
+    }
+}
+
+fn passing<L: Control>(
+    light: &Light,
+    group: &mut DeviceGroup,
+    link: &mut L,
+    instances: &[InstanceId],
+    now: u64,
+    pass: &mut Pass,
+) -> Result<(), SyncError<L::Error>> {
+    onion(link)?;
+    follow(light, group, link, pass)?;
+    if group.course() == group::Course::Out {
+        return Ok(());
+    }
+    let overview = answer(link.overview())?;
+    pass.at = overview.at;
+    for alarm in group.head(overview.next, overview.chain)? {
+        pass.raise(alarm);
+    }
+    if let Some(alarm) = group::clock(now, overview.at) {
+        pass.raise(alarm);
+    }
+    pass.renew = overview.lapsed
+        || home::renewal_due(
+            group,
+            overview.lease_until,
+            group.policy().lease_ms,
+            overview.at,
+        );
+    if group.course() == group::Course::Following {
+        sealed(light, group, link, instances, pass)?;
+    }
+    pass.seen = answer(link.devices())?
+        .into_iter()
+        .map(|view| (view.id, view.seen))
+        .collect();
+    Ok(())
+}
+
+/// The scopes pushed and read, the archive and the recovery envelopes
+/// kept, the checkpoints acknowledged and one own push audited.
+fn sealed<L: Control>(
+    light: &Light,
+    group: &mut DeviceGroup,
+    link: &mut L,
+    instances: &[InstanceId],
+    pass: &mut Pass,
+) -> Result<(), SyncError<L::Error>> {
+    for instance in instances {
+        scope(light, group, link, instances, *instance, pass)?;
+    }
+    keep(light, group, link, instances, pass)?;
+    for instance in instances {
+        let mut sync = SealedSync::new(light, group, link, instances.to_vec())?;
+        let acknowledging = sync.acknowledge(*instance)?;
+        let audited = sync.audit(*instance, AUDIT_SAMPLE)?;
+        for alarm in acknowledging.alarms.into_iter().chain(audited.alarms) {
+            pass.raise(alarm);
+        }
+    }
+    Ok(())
+}
+
+fn onion<L: Link>(link: &L) -> Result<(), SyncError<L::Error>> {
+    if link.route() != Route::Onion {
+        return Err(SyncError::Clearnet);
+    }
+    Ok(())
+}
+
+fn answer<T, E>(answer: Answer<T, E>) -> Result<T, SyncError<E>> {
+    answer.map_err(SyncError::Link)?.map_err(SyncError::Refused)
+}
+
+/// Read the log from the cursor to its head and act on it, posting what it
+/// asks for until it asks for nothing.
+fn follow<L: Control>(
+    light: &Light,
+    group: &mut DeviceGroup,
+    link: &mut L,
+    pass: &mut Pass,
+) -> Result<(), SyncError<L::Error>> {
+    for _ in 0..ROUNDS {
+        let entries = log(link, group.cursor())?;
+        pass.entries += entries.len();
+        for (index, entry) in &entries {
+            if matches!(entry.body, Body::Operation { .. }) {
+                pass.taken.retain(|(taken, _)| taken != index);
+                pass.taken.push((*index, entry.at));
+            }
+        }
+        let mut posted = false;
+        for event in group.follow(entries)? {
+            let post = match event {
+                Event::Vote {
+                    epoch,
+                    vote,
+                    message,
+                } => {
+                    let signature = light.sync_key().sign(&message).to_bytes();
+                    match vote {
+                        Vote::Confirm(h) => Post::Confirm {
+                            epoch,
+                            h,
+                            signature,
+                        },
+                        Vote::Nack => Post::Nack { epoch, signature },
+                    }
+                }
+                Event::Evidence {
+                    index,
+                    message,
+                    signature,
+                    attached,
+                } => Post::Evidence {
+                    index,
+                    message,
+                    signature,
+                    attached,
+                },
+                Event::Alive => {
+                    pass.alive = true;
+                    Post::Alive
+                }
+                Event::Alarm(alarm) => {
+                    pass.raise(alarm);
+                    continue;
+                }
+                other => {
+                    if !pass.events.contains(&other) {
+                        pass.events.push(other);
+                    }
+                    continue;
+                }
+            };
+            // Taken before (a kill between the post and its answer), or its
+            // candidate decided meanwhile: the log says which, read on.
+            if let Some(at) = post_settled(link, &post)? {
+                group.called(at);
+                pass.posts += 1;
+            }
+            posted = true;
+        }
+        if !posted || group.course() == group::Course::Out {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// The log from `from` to its head, page by page.
+fn log<L: Control>(link: &mut L, from: u64) -> Result<Vec<(u64, Entry)>, SyncError<L::Error>> {
+    let mut entries = Vec::new();
+    let mut next = from;
+    loop {
+        onion(link)?;
+        let page = answer(link.log(next))?;
+        let Some((last, _)) = page.last() else {
+            return Ok(entries);
+        };
+        if *last < next {
+            return Err(SyncError::Disordered);
+        }
+        next = last + 1;
+        entries.extend(page);
+    }
+}
+
+/// `post`, the agent woken and the post made again while it answers
+/// `Settling`: the batch time it was taken at, or `None` when the agent
+/// holds it already or decided its candidate meanwhile.
+fn post_settled<L: Control>(link: &mut L, post: &Post) -> Result<Option<u64>, SyncError<L::Error>> {
+    for _ in 0..=WAKES {
+        onion(link)?;
+        match link.post(post).map_err(SyncError::Link)? {
+            Ok(at) => return Ok(Some(at)),
+            Err(
+                PersonalError::Voted
+                | PersonalError::Evidenced
+                | PersonalError::NoCandidate
+                | PersonalError::NotConfirming,
+            ) => return Ok(None),
+            Err(PersonalError::Settling) => {
+                onion(link)?;
+                answer(link.wake())?;
+            }
+            Err(error) => return Err(SyncError::Refused(error)),
+        }
+    }
+    Err(SyncError::Settling)
+}
+
+/// Push `instance`'s scope and read it by its cursor, following the log or
+/// reading the archive where either waits for it.
+fn scope<L: Control>(
+    light: &Light,
+    group: &mut DeviceGroup,
+    link: &mut L,
+    instances: &[InstanceId],
+    instance: InstanceId,
+    pass: &mut Pass,
+) -> Result<(), SyncError<L::Error>> {
+    let pushing = SealedSync::new(light, group, link, instances.to_vec())?.push(instance)?;
+    pass.pushed += pushing.pushed.len();
+    if pushing.stale.is_some() {
+        follow(light, group, link, pass)?;
+        let again = SealedSync::new(light, group, link, instances.to_vec())?.push(instance)?;
+        pass.pushed += again.pushed.len();
+    }
+    let mut waiting = None;
+    let mut withheld = false;
+    for _ in 0..READINGS {
+        let caught = SealedSync::new(light, group, link, instances.to_vec())?.catch_up(instance)?;
+        pass.envelopes += caught.envelopes;
+        pass.bytes += caught.bytes;
+        pass.held += caught.held.len();
+        pass.quarantined += caught.quarantined.len();
+        for alarm in caught.alarms {
+            pass.raise(alarm);
+        }
+        waiting = caught.waiting;
+        match waiting {
+            None => break,
+            Some(Waiting::Epoch(_)) => follow(light, group, link, pass)?,
+            Some(Waiting::Key(_)) => {
+                SealedSync::new(light, group, link, instances.to_vec())?.archive()?;
+            }
+            // Read again once: a page withheld twice waits for the next pass.
+            Some(Waiting::Withheld(_)) if withheld => break,
+            Some(Waiting::Withheld(_)) => withheld = true,
+        }
+    }
+    if let Some(waiting) = waiting {
+        pass.waiting.push((instance, waiting));
+    }
+    Ok(())
+}
+
+/// Keep the archive and the recovery envelopes, following the log where a
+/// push of either is stale.
+fn keep<L: Control>(
+    light: &Light,
+    group: &mut DeviceGroup,
+    link: &mut L,
+    instances: &[InstanceId],
+    pass: &mut Pass,
+) -> Result<(), SyncError<L::Error>> {
+    for _ in 0..2 {
+        let mut sync = SealedSync::new(light, group, link, instances.to_vec())?;
+        let archive = sync.archive()?;
+        let recovery = sync.recovery()?;
+        if archive.stale.is_none() && recovery.stale.is_none() {
+            return Ok(());
+        }
+        follow(light, group, link, pass)?;
+    }
+    Ok(())
+}

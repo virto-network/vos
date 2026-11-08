@@ -1041,6 +1041,7 @@ impl Personal {
                 standing: self.standing(id, &device, now),
                 seasoned: self.seasoned(id, now),
                 removal: self.removals.get(&id),
+                seen: self.seen.get(&id).unwrap_or(0),
                 device,
             })
             .collect())
