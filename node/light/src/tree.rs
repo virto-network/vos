@@ -294,10 +294,10 @@ impl TreeKeeper {
             }
         }
         let mut changed: Vec<(u32, Words)> = leaves.to_vec();
-        for level in 0..=DEPTH {
+        for (level, empty) in EMPTY.iter().enumerate() {
             for &(index, node) in &changed {
                 let key = (level as u8, index);
-                let previous = if node == EMPTY[level] {
+                let previous = if node == *empty {
                     self.nodes.remove(&key)
                 } else {
                     self.nodes.insert(key, node)

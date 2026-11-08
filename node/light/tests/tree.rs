@@ -188,17 +188,17 @@ fn a_page_that_does_not_check_is_refused_whole() {
     let held = keeper.witness().unwrap();
     let rest = writes.page(half, writes.changes.len());
 
-    let forged: Vec<Box<dyn Fn(&mut Feed)>> = vec![
-        Box::new(|page| page.changes[1].root.root = [1; 32]),
-        Box::new(|page| page.changes[0].leaves[0].1 = [0xff; 32]),
-        Box::new(|page| page.changes[0].leaves.clear()),
-        Box::new(|page| page.changes[0].root.since = 0),
-        Box::new(|page| {
+    let forged: [fn(&mut Feed); 5] = [
+        |page| page.changes[1].root.root = [1; 32],
+        |page| page.changes[0].leaves[0].1 = [0xff; 32],
+        |page| page.changes[0].leaves.clear(),
+        |page| page.changes[0].root.since = 0,
+        |page| {
             let leaves = &mut page.changes[0].leaves;
             leaves.push(leaves[0]);
-        }),
+        },
     ];
-    for forge in &forged {
+    for forge in forged {
         let mut page = rest.clone();
         forge(&mut page);
         assert_eq!(keeper.apply(&page), Err(DeviceError::Witness));
