@@ -25,7 +25,7 @@ use vos_light::{
 use vos_node::client::{self, Client, Operator};
 use vos_wire::abi::Failure;
 use vos_wire::credentials::{CredentialError, Digest, Open, Path};
-use vos_wire::homes::{Counts, HomesError, Standing, Terms};
+use vos_wire::homes::{AgentsPage, Counts, HomesError, Standing, Terms};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
 use vos_wire::ingress::{Credentialed, NodeId, Response};
 use vos_wire::personal::{AdminClass, Attestation, Kit, KitEntry, KitKind, NewDevice, Policy};
@@ -35,13 +35,13 @@ use vos_wire::{Decode, Encode, SpaceId, WindowClock};
 use crate::harness::{Cluster, NODES, OPERATOR_SEED};
 
 const SEED: u64 = 23;
-const CREDENTIALS: InstanceId = InstanceId(9);
-const HOMES: InstanceId = InstanceId(3);
-const PERSONAL: InstanceId = InstanceId(5);
+pub(crate) const CREDENTIALS: InstanceId = InstanceId(9);
+pub(crate) const HOMES: InstanceId = InstanceId(3);
+pub(crate) const PERSONAL: InstanceId = InstanceId(5);
 /// The registrar's and the operator's role byte at the home's agent: the
 /// keeper's key holds both.
 const ROLE: u8 = 1;
-const HANDLE: [u8; 32] = [0x48; 32];
+pub(crate) const HANDLE: [u8; 32] = [0x48; 32];
 const POOL: u32 = 200;
 /// The proofs made at once, each on a prover of its own.
 const PROVERS: usize = 4;
@@ -57,7 +57,7 @@ fn member(n: u32) -> Digest {
     vos_light::member(&secret(n)).to_bytes()
 }
 
-fn witness(path: &Path) -> AuthWitness {
+pub(crate) fn witness(path: &Path) -> AuthWitness {
     let digest = |bytes: &Digest| vos_light::Digest::from_bytes(bytes).expect("a digest");
     AuthWitness {
         root: digest(&path.root),
@@ -68,16 +68,21 @@ fn witness(path: &Path) -> AuthWitness {
 
 /// The home: its agent, the keeper's client there, the space and the
 /// stock `auth` kernel's program.
-struct Founded {
-    cluster: Cluster,
-    agent: AgentId,
-    space: SpaceId,
+pub(crate) struct Founded {
+    pub(crate) cluster: Cluster,
+    pub(crate) agent: AgentId,
+    pub(crate) space: SpaceId,
     caller: Mutex<Client>,
-    auth: DeviceProgram,
+    pub(crate) auth: DeviceProgram,
 }
 
 impl Founded {
     fn new() -> Self {
+        Self::with(Policy::DEFAULT)
+    }
+
+    /// The home, its agents configured with `policy` before their claims.
+    pub(crate) fn with(policy: Policy) -> Self {
         let cluster = Cluster::founded(SEED, Some(WindowClock::DEFAULT));
         let agent = cluster
             .node(1)
@@ -133,7 +138,7 @@ impl Founded {
                 "configure",
                 Terms {
                     instance: PERSONAL.0,
-                    policy: Policy::DEFAULT,
+                    policy,
                 },
             )
             .unwrap();
@@ -142,7 +147,7 @@ impl Founded {
 
     /// The keeper's call of `name`: its reply, or the handler's error.
     #[track_caller]
-    fn write<T: Decode, E: Decode + std::fmt::Debug>(
+    pub(crate) fn write<T: Decode, E: Decode + std::fmt::Debug>(
         &self,
         instance: InstanceId,
         name: &str,
@@ -162,7 +167,12 @@ impl Founded {
         outcome(name, answer)
     }
 
-    fn read<T: Decode>(&self, instance: InstanceId, name: &str, arguments: impl Encode) -> T {
+    pub(crate) fn read<T: Decode>(
+        &self,
+        instance: InstanceId,
+        name: &str,
+        arguments: impl Encode,
+    ) -> T {
         let not_after = client::time(self.cluster.target(1)).unwrap() + 60_000;
         let answer = self
             .caller
@@ -186,7 +196,7 @@ impl Founded {
     }
 
     /// The keeper, on every node's operator and the keeper's client.
-    fn keeper(&self) -> Keeper {
+    pub(crate) fn keeper(&self) -> Keeper {
         let key = SigningKey::from_bytes(&OPERATOR_SEED);
         let operators = self
             .cluster
@@ -247,10 +257,17 @@ impl Founded {
         }
     }
 
-    /// Member `n`'s claim, proved on `prover` and sent to a node: `Homes`'
-    /// answer.
-    fn claim(&self, prover: &Prover, n: u32, path: &Path, kit: Kit) -> Result<u32, HomesError> {
-        let call = self.call("claim", (self.device(n), kit), n);
+    /// Member `n`'s claim of the pooled `agent`, proved on `prover` and
+    /// sent to a node: `Homes`' answer.
+    fn claim(
+        &self,
+        prover: &Prover,
+        n: u32,
+        path: &Path,
+        kit: Kit,
+        agent: u32,
+    ) -> Result<u32, HomesError> {
+        let call = self.call("claim", (self.device(n), kit, agent), n);
         let proof = prover
             .prove_home(&secret(n), &witness(path), &call, &self.auth)
             .unwrap();
@@ -336,6 +353,11 @@ fn a_pool_of_200_is_made_by_the_keeper_and_claimed() {
     );
     assert_eq!(keeper.tally().unwrap().pooled, POOL);
 
+    // Each member claims an agent of its own, as devices that each read
+    // another pooled agent would.
+    let page: AgentsPage = home.read(HOMES, "agents", Option::<u32>::None);
+    let pooled: Vec<u32> = page.agents.iter().map(|(agent, _)| *agent).collect();
+    assert_eq!(pooled.len(), POOL as usize);
     let paths: Vec<Path> = members
         .iter()
         .map(|member| {
@@ -359,7 +381,9 @@ fn a_pool_of_200_is_made_by_the_keeper_and_claimed() {
                     if n >= POOL {
                         return;
                     }
-                    let agent = home.claim(&prover, n, &paths[n as usize], kit(n)).unwrap();
+                    let agent = home
+                        .claim(&prover, n, &paths[n as usize], kit(n), pooled[n as usize])
+                        .unwrap();
                     claimed.lock().unwrap().push(agent);
                 }
             });
@@ -402,7 +426,10 @@ fn a_pool_of_200_is_made_by_the_keeper_and_claimed() {
         ..ProverConfig::default()
     })
     .unwrap();
-    let agent = home.claim(&prover, POOL, &joined, kit(POOL)).unwrap();
+    let next: Option<u32> = home.read(HOMES, "pooled", ());
+    let agent = home
+        .claim(&prover, POOL, &joined, kit(POOL), next.expect("topped up"))
+        .unwrap();
     vos_checker::wait_until(
         "the open member's claim assigned",
         Duration::from_secs(60),
@@ -411,7 +438,7 @@ fn a_pool_of_200_is_made_by_the_keeper_and_claimed() {
 
     // A member's second claim.
     assert_eq!(
-        home.claim(&prover, 0, &paths[0], kit(1_000)),
+        home.claim(&prover, 0, &paths[0], kit(1_000), agent),
         Err(HomesError::Claimed)
     );
     // The scope "home" proves a claim and a re-proof alone.

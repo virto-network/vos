@@ -10,9 +10,11 @@
 //!   grants this agent `Personal`'s role `homes` in each, and hands their
 //!   ids over with `stock`, an operator's call.
 //! - **The claim:** a nullifier holds one agent, and a kit's key indexes
-//!   one: `Homes` takes the lowest pooled agent, indexes it under the
-//!   nullifier and under each kit entry's [`kit_index`], and sends it the
-//!   claim with the home's policy. A send is one-way, so `Personal` answers
+//!   one. The claiming device names the pooled agent it sealed its kit's
+//!   `R1` to (a kit's seal binds the agent's identity, which the device
+//!   learns of the agent [`Homes::pooled`] answers); `Homes` takes it,
+//!   indexes it under the nullifier and under each kit entry's
+//!   [`kit_index`], and sends it the claim with the home's policy. A send is one-way, so `Personal` answers
 //!   `assigned` or `refused`; a refused claim's indexes are dropped and its
 //!   agent pooled again. A claim still waiting for its answer is sent again
 //!   when its nullifier claims again, and the operator may `release` one
@@ -134,10 +136,12 @@ impl Homes {
 
     // ===== Devices' =====
 
-    /// Claim a personal agent for `device`, the claiming device, with
-    /// `kit`: its id. The device's nullifier must be the proof's; a
-    /// nullifier holding an agent, or a kit entry indexing one, is refused,
-    /// and so are keys `Personal` would refuse (one key twice). The same
+    /// Claim `agent`, a pooled agent, for `device`, the claiming device,
+    /// with `kit`, whose `R1` is sealed to `agent`'s identity: its id. The
+    /// device's nullifier must be the proof's; a nullifier holding an
+    /// agent, or a kit entry indexing one, is refused, and so are keys
+    /// `Personal` would refuse (one key twice); an agent another claim
+    /// took is `Taken`, and the device seals its kit to the next. The same
     /// claim again while its answer is awaited is sent again.
     #[msg(credential = Auth("home"))]
     pub async fn claim(
@@ -145,6 +149,7 @@ impl Homes {
         ctx: &mut Command<Self>,
         device: NewDevice,
         kit: Kit,
+        agent: u32,
     ) -> Result<u32, HomesError> {
         let nullifier = ctx.nullifier().ok_or(HomesError::Anonymous)?;
         let terms = self.terms.get(&ONE).ok_or(HomesError::Unconfigured)?;
@@ -171,9 +176,13 @@ impl Homes {
             policy: terms.policy,
             homes: me.0,
         };
-        if let Some(agent) = self.nullifiers.get(&nullifier) {
-            return match self.agents.get(&agent) {
-                Some(held) if held.standing == Standing::Claimed && held.kit == indexes => {
+        if let Some(held_by) = self.nullifiers.get(&nullifier) {
+            return match self.agents.get(&held_by) {
+                Some(held)
+                    if held_by == agent
+                        && held.standing == Standing::Claimed
+                        && held.kit == indexes =>
+                {
                     ctx.send(AgentId(agent), personal, claim);
                     Ok(agent)
                 }
@@ -183,7 +192,13 @@ impl Homes {
         if indexes.iter().any(|index| self.kits.contains(index)) {
             return Err(HomesError::KitTaken);
         }
-        let (agent, ()) = self.pool.first().ok_or(HomesError::PoolEmpty)?;
+        if !self.pool.contains(&agent) {
+            return Err(if self.pool.first().is_some() {
+                HomesError::Taken
+            } else {
+                HomesError::PoolEmpty
+            });
+        }
         self.pool.remove(&agent);
         self.nullifiers.insert(&nullifier, &agent);
         for index in &indexes {
@@ -321,6 +336,14 @@ impl Homes {
     }
 
     // ===== Reads =====
+
+    /// The lowest pooled agent: the one a claiming device seals its kit
+    /// to, learning its identity from the node; `None` once the pool is
+    /// empty.
+    #[msg]
+    pub async fn pooled(&self) -> Option<u32> {
+        self.pool.first().map(|(agent, ())| agent)
+    }
 
     /// The agent `nullifier` is recorded for.
     #[msg]
