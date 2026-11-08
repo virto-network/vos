@@ -498,6 +498,21 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   path; a bootstrap through a pasted bridge on the phone; two isolation
   groups never sharing a circuit or an SSH key in a capture.
 - **Dep:** 8.6, 8.25. **Estimate:** 3–4 weeks.
+- **Built** (2026-11-08, `light-node.md` §6.2 "Built"): `vos_light::route`
+  (the policy, unconditional) and `vos_light::tor` behind `vos-light`'s
+  `tor` feature (arti-client 0.47.0 with `bridge-client` and
+  `static-sqlite`, russh on ring), `just test-light-tor` in `check`. The
+  gate's refusal and capture: `node/light/tests/tor.rs`
+  (`an_anonymous_call_is_refused_on_a_clearnet_only_path`,
+  `isolation_groups_never_share_a_circuit_or_an_ssh_key`, against an
+  in-process gateway recording each connection's isolation token and SSH
+  key), `tests/tor_state.rs` for arti's state. Over the live network the
+  `onion` example reached a local gateway's onion (§6.2's figures). The
+  phone's bridge bootstrap: the same example for arm64, its script and
+  expected output, for S8-P6. s4's screens over Tor need s4 to hand the
+  socketpair's end to `Client::screens_fd` once the `:vos` process
+  (8.24b) carries it, and the gateway's onion to serve s4's screens,
+  which wants s4-server serving a stream (§6.1).
 
 ### 8.27 The credential tree's feed
 - **Carried in:** tree syncing and the `map_root` fingerprint: each tree

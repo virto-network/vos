@@ -2783,25 +2783,33 @@ nodes may ask the onion's mark of its proven calls, or of every request
   check on and `ARTI_FS_DISABLE_PERMISSION_CHECKS` ignored (arti's
   `ignore_environment`); pasted lines taken as plain bridges, one naming
   a transport refused; the bootstrap bounded (two minutes by default)
-  and its failure named: the clock when arti's error or its last
-  blockage blames it, the bridge when a bootstrap through bridges ran
-  out of time, otherwise the network's blockage or arti's error.
+  and its failure named: the clock when arti's error, its last blockage
+  (`ClockSkewed`, which arti raises only for expired certificates, a
+  gross skew) or its skew estimate (its status naming the clock) blames
+  it, or the device's clock is before the pinned arti's release; the
+  bridge when a bootstrap through bridges ran out of time; otherwise a
+  directory that could not be fetched, the network's blockage, or
+  arti's error. A moderate skew that arti's estimate misses reads as the
+  directory's failure; the phone session checks which it is.
 - **The client** (`Client`) sends a request (the device library's
   `wire` bytes) to a space under a `Purpose`: `Proven`, `Fetch` (a path,
   a root, the onion set: each a connection of its own, closed once
   answered), `Feed`, `Member` (one a space), `Personal`, `Background`
-  and `Screens`. Each connection is a stream on an isolation token drawn
+  and `Screens`; `Fetch` and `Feed` carry reads alone. Each connection is a stream on an isolation token drawn
   for it, SSH under the pinned host key and an ed25519 key drawn for it,
   and the `vos-api` subsystem multiplexed; a kept-open one is closed
   after five minutes without a request. A fresh connection gets three
   attempts, each on a new circuit through the next onion of the pinned
   set; deadlines: the onion stream 45 s, the SSH handshake 30 s, a
   request 30 s, a proven call 90 s, a missed one closing its
-  connection. The spare (`keep_spare`) is built once its space is set,
-  taken by the next proven call, and built again once taken. Dormant
-  (`set_dormant`) drops every connection, the spare and the screens,
-  stops the idle timer, sets arti's `DormantMode::Soft`, and refuses
-  every request until woken. s4's screen session is carried as bytes
+  connection. Each connection is made under its space's routes and the
+  awake period: a change of either closes it, requests in flight
+  included, so none outlives the route it was chosen for (an opt-in
+  ends the clearnet connection at once). The spare (`keep_spare`) is
+  built once its space is set, taken by the next proven call, and the
+  next built as it is taken. Dormant (`set_dormant`) closes every
+  connection, the spare and the screens, stops the idle timer, sets
+  arti's `DormantMode::Soft`, and refuses every request until woken. s4's screen session is carried as bytes
   between a stream or a descriptor s4 hands over (`screens_fd`, a
   socketpair's end) and the onion's port 22, on a circuit of its own; s4
   speaks SSH over it under its own key and pins the host key returned.
@@ -2821,9 +2829,27 @@ nodes may ask the onion's mark of its proven calls, or of every request
   and every kind went under its purpose; an anonymous call on a
   clearnet-only path dials nothing; the spare, the retry on a new
   circuit, dormancy, the deadlines, the screens over a socketpair and
-  the refresh each have their test; arti's state opens in a private
-  directory and is refused in a world-writable one with the override
-  set.
+  the refresh, concurrent requests sharing one open, a route change and
+  a dormancy ending requests in flight each have their test; arti's
+  state opens in a private directory and is refused in a world-writable
+  one with the override set. arti keys an onion's descriptor and
+  introduction state by isolation, so each connection fetches the
+  descriptor anew, a retry learns nothing of the failed introduction
+  point, and arti keeps each record 48 h: the price of a circuit a
+  connection, to be watched in the phone's memory.
+- **Over the live network** [measured, x86: Intel Core Ultra 7 155H, a
+  home connection in Europe, 2026-11-08; the `onion` example, release,
+  against a debug `vos-gateway --features tor` hosting its onion in
+  process in front of one node, on the same host; 1 cold and 2 warm
+  runs]: bootstrap cold 4.2 s, warm 0.64 and 0.33 s; each group's
+  first `Time` (an onion connection, SSH, the subsystem) 7.4–17.5 s, one
+  45.1 s (a retry past a 45 s deadline); a `Time` on an open connection
+  0.45–1.23 s p50; a fetch 8.3 and 16.5 s, one 95.6 s (two attempts
+  failed, the third on a new circuit answered); the spare took the
+  proven calls in every run (`spare=true`), each answered in 0.57–1.16 s
+  (the node's refusal of a stand-in body); resident memory 24 MiB
+  after a warm bootstrap (31 MiB cold), 31–33 MiB with the groups'
+  connections open.
 
 ### 6.3 The latency model
 
