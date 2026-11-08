@@ -1693,6 +1693,74 @@ OEMs' battery managers; the chrome shows each device's last sync and
 recommends the battery-optimization exemption, and PG6 measures these
 cases before the device-change windows are pinned (§8, D5).
 
+**The background job as built** [built, `vos_light::job` and s4's
+`credential/src/job.rs` with its WorkManager worker in `:vos`; tested in
+`node/light/tests/sealed/job.rs` against `Personal` and in s4's
+`credential/tests/job.rs` and `killed.rs`]:
+- **One pass** (`job::run`) over a `Control` link (sealed sync's `Link`
+  with `log`, `overview`, `devices` and the four posts `confirm`, `nack`,
+  `evidence` and `alive`, named, nothing generic), refused before anything
+  leaves unless it is the onion's: the log followed from the cursor and
+  every vote, evidence and `alive` it asks for posted, `Settling` woken
+  through, until it asks for nothing; the head checked (`head`) and the
+  clock against the agent's batch time; each scope pushed (the log
+  followed again on `StaleEpoch`) and read by its cursor (the log followed
+  where a page waits for an epoch, the archive read where it waits for a
+  key, four readings at most); the archive and the recovery envelopes
+  kept; each scope's checkpoints acknowledged (`acknowledge`) and one of
+  its own pushes audited (`audit`); the device set read. `made` stays the
+  caller of an admin call's (the chrome's, 8.24).
+- **What it leaves** (`Pass`, `Pass::notices`): each verified open
+  operation of the device set with the batch time the log took it when
+  this pass read it (what a notification's latency is measured from); a
+  pending restore (this device posted `alive`); its removal; the yearly
+  re-proof (`home::renewal_due`); every alarm, once. `Personal`'s
+  `devices` gives each device's last call (`DeviceView::seen`, the `seen`
+  table the confirming set is drawn from): each device's last sync as the
+  chrome shows it, for a device whose sync made a call (a push, a vote,
+  `alive`); a pass with nothing new makes none.
+- **A pass killed anywhere** leaves the store consistent: every change is
+  one synced batch of the group's or sealed sync's, and every request is
+  one the agent answers alike when sent again. The test kills a pass
+  before and after each of its requests (a push that had something to
+  do, a scope to read), restarts the phone from its store and runs the
+  next pass: the phones converge and the agent holds each node once.
+- **s4's job**: WorkManager's periodic job (15 minutes, a network up) in
+  `:vos` alone (`setDefaultProcessName`, every WorkManager component
+  declared in `:vos`, its start-up initializer dropped from the UI
+  process), scheduled when the facility opens. A run polls each
+  enrollment's root and fetches its path if due, then the personal space's
+  pass once the device holds one (`job::Personal`; the claim's and
+  pairing's facility operations attach it, 8.24); every connection is a
+  stream of the facility's one dialer, counted (TCP today, arti's stream
+  with s4's Tor wiring: the same seam). Each run is kept (the latest 64),
+  written as started before anything is sent and as finished after, each
+  write whole or not at all, so a run its process's death cut short shows
+  as never finished; the device's last sync is the latest finished run.
+  Notices are posted as local notifications, alerting once while they
+  stand, withdrawn when no pass raises them, carried through a pass that
+  could not read the space. The chrome recommends the exemption (Android's
+  own prompt) when the facility keeps something and the app is in the
+  "rare" or "restricted" bucket or no run finished for a day, at most once
+  a week.
+- **After first unlock:** the store is in the app's credential-encrypted
+  storage, open from the first unlock after boot whether the screen is
+  locked or not; the job uses no key behind a prompt (the member secret's
+  and the admin key's prompts are the UI's), and the app is not direct-boot
+  aware, so no job runs before that unlock.
+- **First numbers** [measured, x86-64 Core Ultra 7 155H, debug,
+  2026-11-08]: a pass with nothing new on a paired phone, 7 requests and
+  376 bytes of the agent's answers (the log's head, the overview, the
+  scope's, the archive's and the checkpoints' empty pages, the device set),
+  no call and so no session; s4's run with nothing new, one enrollment at a
+  stand-in gateway, 2 SSH connections (the time, the root), 5.2 KB down
+  and 5.6 KB up, 25 ms. The phones' numbers (PG6's 30 s and 1 MB, the
+  recorded cases) wait for the phone session.
+- **Not built:** the personal agent's link over arti (s4's Tor wiring),
+  which `job::Personal` takes as it is; until then a phone's pass reads
+  only its enrollments, since the agent takes nothing off the clearnet
+  (E17).
+
 ### 3.7 The inbox
 
 A table in `Personal`, keyed by `(expiry, id)`; **expiry is lazy** (reads
