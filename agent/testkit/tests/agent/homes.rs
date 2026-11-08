@@ -317,6 +317,8 @@ impl Space {
     ) -> Result<u32, HomesError> {
         let agent = match self.found(nullifier) {
             Some(agent) => agent,
+            // Agent 0 is never stocked here, so naming it meets an empty
+            // pool.
             None => self.query::<Option<u32>>(HOMES, "pooled", ()).unwrap_or(0),
         };
         self.claim_of(nullifier, device, kit, agent)

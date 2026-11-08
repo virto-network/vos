@@ -27,8 +27,20 @@
 //! Sans I/O: each side's caller puts the items it is given
 //! ([`Put::arguments`], `Personal::put` to the slot, the opener under its
 //! sync key, the joiner under the slot key) and hands each side the slot's
-//! items it reads (`Personal::inbox`). A side lives in memory: a pairing cut
-//! short starts again with a new slot, the old one expiring.
+//! items it reads (`Personal::inbox`, every page of it: a handover of more
+//! than a few items spans pages). A side lives in memory. A pairing cut
+//! short (an error, the slot's expiry, the user's no, the opener's
+//! restart) is started again from a new slot: the opener closes the old
+//! one (`close_slot` of [`Opener::slot`]), and once it paired the joiner,
+//! abandons the commit adding it ([`crate::group::DeviceGroup::abandon`]),
+//! never sending it.
+//!
+//! *Known limits:* the pre-shared key enters at the third message, so a
+//! joiner holding another code fails at the offer and the opener hears
+//! nothing until the slot expires; a delayed admin's pairing (its add an
+//! operation, its commit after the delay, past the slot's life) is not
+//! built here: [`crate::group::DeviceGroup::pair`] makes a strong admin's
+//! inline add.
 
 use blake2::Blake2b;
 use blake2::digest::Digest as _;
@@ -58,6 +70,9 @@ const TAG: usize = 16;
 /// The handshake's first message: the opener's ephemeral key and the
 /// tag of its empty payload, which the pre-shared key's mode encrypts.
 const FIRST: usize = 32 + TAG;
+/// The most bytes a handover takes: a full device set's log and an archive
+/// of years of epochs fit many times over.
+const MAX_HANDOVER: usize = 8 << 20;
 
 /// What the QR code carries. Its `Debug` shows neither the slot key nor
 /// the code.
@@ -103,7 +118,11 @@ impl Drop for Code {
 impl Code {
     /// The bytes the QR code shows.
     pub fn to_bytes(&self) -> Zeroizing<Vec<u8>> {
-        let mut bytes = vec![VERSION];
+        // Sized for the code and its onions, so no growth leaves a copy of
+        // the slot key behind.
+        let onions: usize = self.onions.iter().map(|onion| onion.len() + 5).sum();
+        let mut bytes = Vec::with_capacity(256 + onions);
+        bytes.push(VERSION);
         self.encode_to(&mut bytes);
         Zeroizing::new(bytes)
     }
@@ -146,11 +165,21 @@ pub struct Offer {
 
 /// The joiner's word over the channel: its keys (its "home" nullifier
 /// among them), its key package, and its handle in each offered space.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+/// Its `Debug` shows none of them: the nullifier links the device to its
+/// agent.
+#[derive(Clone, PartialEq, Eq, Encode, Decode)]
 pub struct Hello {
     pub device: NewDevice,
     pub key_package: Vec<u8>,
     pub handles: Vec<(Space, DeviceHandle)>,
+}
+
+impl core::fmt::Debug for Hello {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Hello")
+            .field("handles", &self.handles.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// An inbox item to leave in the slot: its id, its expiry (the slot's) and
@@ -182,8 +211,8 @@ pub enum PairError {
     /// A message did not authenticate: another code, or an item forged or
     /// replaced.
     Handshake,
-    /// A message's plaintext does not decode, or exceeds the slot's
-    /// items.
+    /// A message's plaintext does not decode, the handover is longer than
+    /// its framed length, or a message exceeds a Noise message.
     Decode,
     /// The call is not this side's at this point of the pairing.
     Order,
@@ -269,11 +298,12 @@ fn handshake(
 ) -> Result<snow::HandshakeState, PairError> {
     let params: snow::params::NoiseParams = PATTERN.parse().expect("the pattern parses");
     let builder = snow::Builder::new(params);
-    let keypair = builder.generate_keypair()?;
+    let mut keypair = builder.generate_keypair()?;
+    let private = Zeroizing::new(core::mem::take(&mut keypair.private));
     let psk = psk(code, slot, identity);
     let prologue = prologue(slot, identity);
     let builder = builder
-        .local_private_key(&keypair.private)
+        .local_private_key(&private)
         .psk(3, &psk[..])
         .prologue(&prologue);
     Ok(if initiator {
@@ -417,9 +447,11 @@ impl Opener {
         Ok((opener, drawn))
     }
 
-    /// The QR code, once the agent opened the slot until `expires`; the
+    /// The QR code, once the agent opened the slot until `expires` (the
+    /// batch time `open_slot` answered and the policy's `slot_ttl_ms`,
+    /// [`crate::group::DeviceGroup::policy`]), every item's expiry; the
     /// home's `handle` and `onions`, and the agent `agent` with `Personal`
-    /// at `instance`.
+    /// at `instance`. Items are put only after it.
     pub fn code(
         &mut self,
         drawn: &Drawn,
@@ -474,6 +506,9 @@ impl Opener {
                 let mut payload = vec![0; item.item.bytes.len()];
                 handshake.read_message(&item.item.bytes, &mut payload)?;
                 let offer = self.offer.encode();
+                if offer.len() + 64 + 3 * TAG > NOISE_MAX.min(self.item_bytes) {
+                    return Err(PairError::Decode);
+                }
                 let mut third = vec![0; offer.len() + 64 + 3 * TAG];
                 let len = handshake.write_message(&offer, &mut third)?;
                 third.truncate(len);
@@ -631,8 +666,14 @@ impl Joiner {
                 bytes.extend_from_slice(&plain);
                 if length.is_none() && bytes.len() >= 4 {
                     let framed = u32::from_le_bytes(bytes[..4].try_into().expect("four bytes"));
-                    length = Some(framed as usize);
-                    bytes.drain(..4);
+                    let framed = framed as usize;
+                    if framed > MAX_HANDOVER {
+                        return Err(PairError::Decode);
+                    }
+                    length = Some(framed);
+                    let mut whole = Zeroizing::new(Vec::with_capacity(framed));
+                    whole.extend_from_slice(&bytes[4..]);
+                    bytes = whole;
                 }
                 match length {
                     Some(length) if bytes.len() > length => return Err(PairError::Decode),
@@ -656,7 +697,11 @@ impl Joiner {
         else {
             return Err(PairError::Order);
         };
-        let sealed = channel.seal(&hello.encode())?;
+        let bytes = hello.encode();
+        if bytes.len() + TAG > NOISE_MAX {
+            return Err(PairError::Decode);
+        }
+        let sealed = channel.seal(&bytes)?;
         let put = self.put(channel.written, sealed);
         channel.written += 1;
         self.state = Joining::Greeted(channel, None, Zeroizing::new(Vec::new()));

@@ -11,8 +11,8 @@
 //!   ids over with `stock`, an operator's call.
 //! - **The claim:** a nullifier holds one agent, and a kit's key indexes
 //!   one. The claiming device names the pooled agent it sealed its kit's
-//!   `R1` to (a kit's seal binds the agent's identity, which the device
-//!   learns of the agent [`Homes::pooled`] answers); `Homes` takes it,
+//!   `R1` to: a kit's seal binds the agent's identity, which the device
+//!   learns of the agent [`Homes::pooled`] answers. `Homes` takes it,
 //!   indexes it under the nullifier and under each kit entry's
 //!   [`kit_index`], and sends it the claim with the home's policy. A send is one-way, so `Personal` answers
 //!   `assigned` or `refused`; a refused claim's indexes are dropped and its

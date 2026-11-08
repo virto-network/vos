@@ -7,16 +7,19 @@
 //!   offers its memberships over the pairing channel, the joiner answers
 //!   its handle in each (its member and owner digests there), and the
 //!   opener calls each registrar's `enroll_device(member, owner)` under its
-//!   own owner proof, one prompt a space. Each enrollment is held in the
-//!   store until it is made or dropped, so the chrome may defer any space
-//!   to a later prompt.
-//! - **Confirmed by the joiner** ([`expect`], [`Confirmation`]): once its
+//!   own owner proof, one prompt a space. The enrollments are held in the
+//!   store ([`hold`]) once the agent took the commit adding the joiner,
+//!   never for a pairing cut short, each until it is made or dropped, so
+//!   the chrome may defer any space to a later prompt.
+//! - **Confirmed by the joiner** ([`expect`]): once its
 //!   leaf is in a space's tree, the joiner calls `confirm_device()` under
 //!   its own owner proof there, so its owner digest acts for the person.
 //! - **The credential book:** each device's handle in each space, as the
 //!   registrar's person record holds it ([`handles_of`] reads what the
 //!   opener offers and what a retired device's revocations name,
-//!   [`record`] writes the new device's).
+//!   [`record`] writes the new device's once its add is confirmed; a
+//!   device that finds a device of the set with no handle in a space it
+//!   enrolled records it again).
 //! - **Revoked at retirement** ([`revoke_call`]): `revoke_device(member)`
 //!   under another device's owner proof, each space at once.
 //!
@@ -37,8 +40,10 @@ use crate::{Call, DeviceError, Error, Light, call};
 const ENROLL: &[u8] = b"m/enroll/";
 const CONFIRM: &[u8] = b"m/confirm/";
 
-fn key(prefix: &[u8], space: &Space) -> Vec<u8> {
-    [prefix, &space[..]].concat()
+/// A membership's row: by its space and its handle, since one space may
+/// hold several credential actors.
+fn key(prefix: &[u8], space: &Space, handle: &[u8; 32]) -> Vec<u8> {
+    [prefix, &space[..], &handle[..]].concat()
 }
 
 impl Membership {
@@ -72,14 +77,10 @@ impl Enrollment {
 }
 
 /// The enrollments of the joiner whose hello is `hello`, in each of the
-/// `offered` memberships it answered a handle for: held in `store`, each
-/// until [`done`] drops it.
-pub fn plan(
-    store: &Store,
-    offered: &[Membership],
-    hello: &Hello,
-) -> Result<Vec<Enrollment>, StoreError> {
-    let enrollments: Vec<Enrollment> = offered
+/// `offered` memberships it answered a handle for; held only once the
+/// agent took the commit adding it ([`hold`]).
+pub fn plan(offered: &[Membership], hello: &Hello) -> Vec<Enrollment> {
+    offered
         .iter()
         .filter_map(|membership| {
             let (_, device) = hello.handles.iter().find(|(space, handle)| {
@@ -90,19 +91,22 @@ pub fn plan(
                 device: *device,
             })
         })
-        .collect();
+        .collect()
+}
+
+/// Hold `enrollments` in `store` once the agent took the commit adding
+/// their device, each until [`done`] drops it.
+pub fn hold(store: &Store, enrollments: &[Enrollment]) -> Result<(), StoreError> {
     store.write_group_rows(
         enrollments
             .iter()
             .map(|enrollment| {
-                (
-                    key(ENROLL, &enrollment.membership.space),
-                    Some(enrollment.encode()),
-                )
+                let membership = &enrollment.membership;
+                let key = key(ENROLL, &membership.space, &membership.handle);
+                (key, Some(enrollment.encode()))
             })
             .collect(),
-    )?;
-    Ok(enrollments)
+    )
 }
 
 /// The enrollments held: made later on their prompts, or dropped.
@@ -110,14 +114,12 @@ pub fn enrollments(store: &Store) -> Result<Vec<Enrollment>, StoreError> {
     rows(store, ENROLL)
 }
 
-/// The enrollment in `space` made (its slot answered, or the registrar
-/// refused it for good): no longer held.
-pub fn done(store: &Store, space: &Space) -> Result<(), StoreError> {
-    store.write_group_rows(vec![(key(ENROLL, space), None)])
+/// The enrollment in `membership` made (its slot answered, or the
+/// registrar refused it for good): no longer held.
+pub fn done(store: &Store, membership: &Membership) -> Result<(), StoreError> {
+    let key = key(ENROLL, &membership.space, &membership.handle);
+    store.write_group_rows(vec![(key, None)])
 }
-
-/// A confirmation the joiner owes in a space, once its leaf is there.
-pub type Confirmation = Membership;
 
 /// The confirmations of the joiner offered `memberships`, held in `store`
 /// until [`confirmed`].
@@ -125,26 +127,30 @@ pub fn expect(store: &Store, memberships: &[Membership]) -> Result<(), StoreErro
     store.write_group_rows(
         memberships
             .iter()
-            .map(|membership| (key(CONFIRM, &membership.space), Some(membership.encode())))
+            .map(|membership| {
+                let key = key(CONFIRM, &membership.space, &membership.handle);
+                (key, Some(membership.encode()))
+            })
             .collect(),
     )
 }
 
 /// The confirmations owed.
-pub fn confirmations(store: &Store) -> Result<Vec<Confirmation>, StoreError> {
+pub fn confirmations(store: &Store) -> Result<Vec<Membership>, StoreError> {
     rows(store, CONFIRM)
 }
 
 /// The registrar's `confirm_device()` in `membership`'s space, to prove
 /// under this device's owner secret there once its leaf is in the tree
 /// (its `path` answered).
-pub fn confirm_call(membership: &Confirmation, expires_ms: u64) -> Result<Call, DeviceError> {
+pub fn confirm_call(membership: &Membership, expires_ms: u64) -> Result<Call, DeviceError> {
     membership.call("confirm_device", ().encode(), expires_ms)
 }
 
-/// The confirmation in `space` made: no longer owed.
-pub fn confirmed(store: &Store, space: &Space) -> Result<(), StoreError> {
-    store.write_group_rows(vec![(key(CONFIRM, space), None)])
+/// The confirmation in `membership` made: no longer owed.
+pub fn confirmed(store: &Store, membership: &Membership) -> Result<(), StoreError> {
+    let key = key(CONFIRM, &membership.space, &membership.handle);
+    store.write_group_rows(vec![(key, None)])
 }
 
 /// The registrar's `revoke_device(member)` in `membership`'s space, a

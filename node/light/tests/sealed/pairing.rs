@@ -73,8 +73,15 @@ fn handle_of(n: u8, membership: &Membership) -> DeviceHandle {
 
 /// The slot's items as `key` reads them.
 fn inbox(home: &Home, key: [u8; 32]) -> Vec<InboxItem> {
-    home.query(key, "inbox", Option::<(u64, [u8; 16])>::None.encode())
-        .unwrap()
+    let mut items: Vec<InboxItem> = Vec::new();
+    loop {
+        let after = items.last().map(|item| (item.expires, item.id));
+        let page: Vec<InboxItem> = home.query(key, "inbox", after.encode()).unwrap();
+        if page.is_empty() {
+            return items;
+        }
+        items.extend(page);
+    }
 }
 
 /// Leave `put` in the slot under `key`.
@@ -86,7 +93,17 @@ fn leave(home: &mut Home, key: &SigningKey, put: &Put) {
 
 /// An opener's slot opened at the home, and the QR code's bytes.
 fn open(home: &mut Home, opener: &mut Phone, offer: Offer) -> (Opener, Vec<u8>) {
-    let (mut side, drawn) = Opener::open(home.identity, offer, policy().inbox_item_bytes).unwrap();
+    open_in(home, opener, offer, policy().inbox_item_bytes)
+}
+
+/// [`open`], the handover in items of `item_bytes`.
+fn open_in(
+    home: &mut Home,
+    opener: &mut Phone,
+    offer: Offer,
+    item_bytes: u32,
+) -> (Opener, Vec<u8>) {
+    let (mut side, drawn) = Opener::open(home.identity, offer, item_bytes).unwrap();
     let at = home
         .call(&opener.sync, "open_slot", drawn.slot.arguments())
         .answer::<u64>()
@@ -138,7 +155,28 @@ fn pair(
     offer: Offer,
     checkpoints: Vec<vos_light::group::Checkpoint>,
 ) -> (Code, Vec<Enrollment>) {
-    let (mut side, qr) = open(home, opener, offer.clone());
+    pair_in(
+        home,
+        opener,
+        joiner,
+        n,
+        offer,
+        checkpoints,
+        policy().inbox_item_bytes,
+    )
+}
+
+/// [`pair`], the handover in items of `item_bytes`.
+fn pair_in(
+    home: &mut Home,
+    opener: &mut Phone,
+    joiner: &mut Phone,
+    n: u8,
+    offer: Offer,
+    checkpoints: Vec<vos_light::group::Checkpoint>,
+    item_bytes: u32,
+) -> (Code, Vec<Enrollment>) {
+    let (mut side, qr) = open_in(home, opener, offer.clone(), item_bytes);
     let code = Code::from_bytes(&qr).expect("the QR code reads");
     let (mut joining, second) = Joiner::scan(&code).unwrap();
     leave(home, &code.slot_key(), &second);
@@ -159,7 +197,7 @@ fn pair(
         panic!("the hello")
     };
     assert_eq!(heard, greeting);
-    let enrollments = memberships::plan(&opener.store, &offer.memberships, &heard).unwrap();
+    let enrollments = memberships::plan(&offer.memberships, &heard);
     let (prepared, mut pairing) = opener
         .group()
         .pair(heard.device.clone(), heard.key_package.clone(), home.now)
@@ -167,7 +205,13 @@ fn pair(
     for checkpoint in checkpoints {
         pairing.trust(checkpoint);
     }
-    for put in side.hand_over(&pairing).unwrap() {
+    let puts = side.hand_over(&pairing).unwrap();
+    assert_eq!(
+        puts.len() > 1,
+        item_bytes < 1024,
+        "items of {item_bytes} bytes"
+    );
+    for put in puts {
         leave(home, &opener.sync, &put);
     }
     assert!(matches!(
@@ -186,6 +230,7 @@ fn pair(
         Opened::Received
     ));
     opener.send(home, &prepared).unwrap();
+    memberships::hold(&opener.store, &enrollments).unwrap();
     (code, enrollments)
 }
 
@@ -291,7 +336,7 @@ fn a_phone_is_paired_through_the_slot_and_reads_at_once() {
         (handle_of(2, &club()).member, handle_of(2, &club()).owner).encode()
     );
     assert_eq!(call.method, vos_light::method_id("enroll_device"));
-    memberships::done(&phones[0].store, &CLUB).unwrap();
+    memberships::done(&phones[0].store, &club()).unwrap();
     assert!(
         memberships::enrollments(&phones[0].store)
             .unwrap()
@@ -301,7 +346,7 @@ fn a_phone_is_paired_through_the_slot_and_reads_at_once() {
         memberships::confirmations(&phones[1].store).unwrap(),
         vec![club()]
     );
-    memberships::confirmed(&phones[1].store, &CLUB).unwrap();
+    memberships::confirmed(&phones[1].store, &club()).unwrap();
     assert!(
         memberships::confirmations(&phones[1].store)
             .unwrap()
@@ -431,6 +476,73 @@ fn book(light: &vos_light::Light, devices: &[(u32, u8)]) {
     }
 }
 
+/// A pairing cut short after the opener paired the joiner (the joiner
+/// gone before its acknowledgement): the opener abandons the commit adding
+/// it and closes the slot, holding no enrollment; the next pairing, from a
+/// new slot, adds another device.
+#[test]
+fn a_pairing_cut_short_is_abandoned_and_paired_again() {
+    let (mut home, mut phones) = household(1);
+    let offer = Offer {
+        home: home_space(&home),
+        memberships: vec![club()],
+    };
+    let (mut side, qr) = open(&mut home, &mut phones[0], offer.clone());
+    let code = Code::from_bytes(&qr).unwrap();
+    let (mut joining, second) = Joiner::scan(&code).unwrap();
+    leave(&mut home, &code.slot_key(), &second);
+    let Opened::Put(third) = opener_reads(&home, &phones[0], &mut side) else {
+        panic!("the last message")
+    };
+    leave(&mut home, &phones[0].sync, &third);
+    let Joined::Offer(offered) = joiner_reads(&home, &code, &mut joining) else {
+        panic!("the offer")
+    };
+    let mut gone = Phone::new(2);
+    let greeting = hello(&home, &mut gone, 2, &offered);
+    leave(
+        &mut home,
+        &code.slot_key(),
+        &joining.hello(&greeting).unwrap(),
+    );
+    let Opened::Hello(heard) = opener_reads(&home, &phones[0], &mut side) else {
+        panic!("the hello")
+    };
+    let enrollments = memberships::plan(&offer.memberships, &heard);
+    assert_eq!(enrollments.len(), 1);
+    let (_, pairing) = phones[0]
+        .group()
+        .pair(heard.device, heard.key_package, home.now)
+        .unwrap();
+    for put in side.hand_over(&pairing).unwrap() {
+        leave(&mut home, &phones[0].sync, &put);
+    }
+    // No acknowledgement comes.
+    assert!(matches!(
+        opener_reads(&home, &phones[0], &mut side),
+        Opened::Waiting
+    ));
+    phones[0].group().abandon().unwrap();
+    home.call(&phones[0].sync, "close_slot", side.slot().encode())
+        .answer::<u64>()
+        .unwrap();
+    assert!(
+        memberships::enrollments(&phones[0].store)
+            .unwrap()
+            .is_empty()
+    );
+
+    let mut joiner = Phone::new(3);
+    pair(&mut home, &mut phones[0], &mut joiner, 3, offer, Vec::new());
+    phones.push(joiner);
+    settle(&mut home, &mut phones);
+    assert_eq!(phones[1].group().id(), Some(1));
+    assert_eq!(
+        memberships::enrollments(&phones[0].store).unwrap()[0].device,
+        handle_of(3, &club())
+    );
+}
+
 /// A phone retired: the new phone paired from the old one, offered the
 /// memberships the old one's handles name; then the old one removed by a
 /// seasoned device (the new one in its probation, so the removal waits its
@@ -455,14 +567,16 @@ fn a_phone_is_retired_once_its_successor_is_paired() {
             .map(|(membership, _)| membership)
             .collect(),
     };
+    // The handover in items of 600 bytes: many, read across pages.
     let mut successor = Phone::new(3);
-    pair(
+    pair_in(
         &mut home,
         &mut phones[0],
         &mut successor,
         3,
         offer,
         Vec::new(),
+        600,
     );
     phones.push(successor);
     settle(&mut home, &mut phones);

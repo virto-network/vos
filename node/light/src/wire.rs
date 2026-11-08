@@ -59,7 +59,8 @@ pub fn agent_request(agent: u32) -> Vec<u8> {
 
 /// The agent's identity from an `AgentInfo` answer, the hash of its
 /// creation record, as every node computes it; `None` for an agent the
-/// node does not know.
+/// node does not know. It is the answering node's word: a device that
+/// seals to it (a claim's kit) asks a second node too.
 pub fn agent_answer(body: &[u8]) -> Result<Option<[u8; 32]>, DeviceError> {
     let info = Option::<AgentInfo>::decode_exact(body).ok_or(DeviceError::Decode)?;
     Ok(info.map(|info| vos_pvm::precompile::blake2b_256(&info.record.encode())))

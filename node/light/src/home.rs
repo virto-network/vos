@@ -225,9 +225,7 @@ impl Claim {
             agent,
             identity,
         });
-        let mut row = claim.0.encode();
-        store.write_group_rows(vec![(CLAIM_ROW.to_vec(), Some(row.clone()))])?;
-        row.zeroize();
+        store.write_group_rows(vec![(CLAIM_ROW.to_vec(), Some(claim.0.encode()))])?;
         Ok(claim)
     }
 
@@ -248,7 +246,10 @@ impl Claim {
 
     /// `Homes`' `claim(device, kit, agent)` at `home`, to prove in the
     /// scope "home" ([`Prover::prove_home`]) with this device's secret
-    /// there.
+    /// there. Its answer is the agent's id: then [`Claim::claimed`] once
+    /// the agent's log shows it. `Claimed` for this held claim means an
+    /// answer was lost and the agent may be assigned already: read its
+    /// log and call [`Claim::claimed`], never [`Claim::abandon`].
     pub fn call(&self, home: &Home, expires_ms: u64) -> Result<Call, DeviceError> {
         let mut arguments = self.0.device.encode();
         self.0.kit.encode_to(&mut arguments);
@@ -259,7 +260,9 @@ impl Claim {
     }
 
     /// Drop the claim `Homes` refused (`Taken`, `PoolEmpty`, `KitTaken`):
-    /// the device prepares another, at the agent `pooled` answers then.
+    /// the device prepares another, at the agent `pooled` answers then;
+    /// after `KitTaken`, with another kit, since the same key indexes the
+    /// same agent again.
     pub fn abandon(self, store: &Store) -> Result<(), ClaimError> {
         store.write_group_rows(vec![(CLAIM_ROW.to_vec(), None)])?;
         Ok(())

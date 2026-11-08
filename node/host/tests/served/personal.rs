@@ -639,6 +639,8 @@ fn a_personal_space_is_claimed_paired_and_its_first_phone_retired() {
     club.write("enroll", first.handle(&CLUB_HANDLE).member);
     let me = first.handle(&CLUB_HANDLE);
     club.write("register", (me.member, me.owner, 4u8));
+    // The club's agent is in the nodes' one space beside the home's, its
+    // credential actor apart by its handle.
     let membership = Membership {
         space: home.space.0,
         handle: CLUB_HANDLE,
@@ -706,7 +708,7 @@ fn a_personal_space_is_claimed_paired_and_its_first_phone_retired() {
     else {
         panic!("the hello")
     };
-    let enrollments = memberships::plan(first.light.store(), &offer.memberships, &heard).unwrap();
+    let enrollments = memberships::plan(&offer.memberships, &heard);
     let now = sockets.time();
     let (prepared, pairing) = first
         .group()
@@ -732,6 +734,7 @@ fn a_personal_space_is_claimed_paired_and_its_first_phone_retired() {
         Opened::Received
     ));
     first.commit(&mut sockets, personal, &prepared);
+    memberships::hold(first.light.store(), &enrollments).unwrap();
     for _ in 0..3 {
         first.read(&mut sockets, personal);
         second.read(&mut sockets, personal);
@@ -778,7 +781,7 @@ fn a_personal_space_is_claimed_paired_and_its_first_phone_retired() {
         .prove_owner(&first.secret(&CLUB_HANDLE), &call, &owner_kernel)
         .unwrap();
     answer::<u32, CredentialError>(&sockets.credentialed(&call, &proof)).unwrap();
-    memberships::done(first.light.store(), &membership.space).unwrap();
+    memberships::done(first.light.store(), &membership).unwrap();
     let club_identity = membership.identity;
     assert!(
         second
@@ -798,7 +801,7 @@ fn a_personal_space_is_claimed_paired_and_its_first_phone_retired() {
         .prove_owner(&second.secret(&CLUB_HANDLE), &call, &owner_kernel)
         .unwrap();
     answer::<(), CredentialError>(&sockets.credentialed(&call, &proof)).unwrap();
-    memberships::confirmed(second.light.store(), &membership.space).unwrap();
+    memberships::confirmed(second.light.store(), &membership).unwrap();
 
     // The first phone retired: once past its probation the second removes
     // it, the removal matures after its delay, and the second's commit

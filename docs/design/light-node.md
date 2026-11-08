@@ -1825,14 +1825,20 @@ one taken]:
   policy's item size takes, and the joiner's acknowledgement by the
   handover's hash: three items of the slot's four. **The commit waits for
   the acknowledgement**, since the add closes the slot and deletes its
-  items. *Known limit:* the pre-shared key enters at the third message,
-  so a joiner holding another code fails at the offer and the opener
-  hears nothing; it shows the slot open until it expires or the user
-  closes it. Each side lives in memory: a pairing cut short starts again
-  with a new slot.
-- **Memberships** (`memberships`): the opener holds an `Enrollment` a
-  space, from the hello's handles, until it is made (`enroll_device` under
-  its owner proof) or dropped, so the chrome defers any space; the joiner
+  items. Each side lives in memory: a pairing cut short is started again
+  from a new slot, the opener closing the old one and abandoning the
+  commit `pair` held (`DeviceGroup::abandon`). *Known limits:* the
+  pre-shared key enters at the third message, so a joiner holding another
+  code fails at the offer and the opener hears nothing until the slot
+  expires; a delayed admin's pairing (its add an operation, its commit
+  after the delay, past the slot's life) is not built, `pair` making a
+  strong admin's inline add; the identity a claim's kit is sealed to is
+  the answering node's word, so the device asks a second node.
+- **Memberships** (`memberships`): once the agent took the commit adding
+  the joiner, never for a pairing cut short, the opener holds an
+  `Enrollment` a membership (by its space and handle), from the hello's
+  handles, until it is made (`enroll_device` under its owner proof) or
+  dropped, so the chrome defers any space; the joiner
   holds a confirmation a space (`confirm_device` under its own owner
   proof, once its leaf is there). The memberships offered, and a retired
   device's revocations (`revoke_device`), come from the credential book's
@@ -1844,7 +1850,11 @@ one taken]:
 - **The joiner's open claim** at a home-only space runs after the pairing
   (`home::open_claim`, its own work), so its re-proof proves under the
   nullifier its add recorded; at a home that is the user's own space it
-  is the opener's enrollment there, as in any space.
+  is the opener's enrollment there, as in any space. It is held in no
+  row: a device whose path at the home is none makes it. When it runs is
+  the chrome's (the background job's), at a delay from the add, so the
+  home's operators do not link the new member to the agent by its time
+  (L5).
 - **Retiring a phone:** the successor paired from the old phone (offered
   the old phone's memberships), then the old phone's removal by the other
   devices as §3.5's rules time it, carried by the next commit; the old
