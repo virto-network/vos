@@ -414,6 +414,12 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   space; retire a phone; the yearly re-proof with the leaf renewal on its
   prompt; refusing a second claim.
 - **Dep:** 8.13, 8.14, 8.16, 8.20. **Estimate:** 2–2.5 weeks.
+- **Built** (2026-11-08, `light-node.md` §3.8 "Pairing, the claim and
+  memberships as built"): `vos_light::pairing`, `vos_light::home::Claim`,
+  `vos_light::memberships`; `Homes`' claim names the pooled agent the kit
+  is sealed to (`pooled`, `Taken`), a kit's seal binding the agent's
+  identity; the flows driven in `node/light/tests/sealed/pairing.rs` and
+  end to end on three nodes in `node/host/tests/served/personal.rs`.
 
 ### 8.23b Kits, restore and contests — D
 - Kit creation and rotation (phrase, security key); restore here and

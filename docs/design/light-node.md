@@ -527,14 +527,20 @@ this is the one taken]:
   2026-11-07; gas is deterministic], 50M declared); `release(agent)`, a
   claim its agent never answered (its role not granted, a wrong instance)
   dropped and the agent retired.
-- **The claim** (`claim(device, kit)` under `Auth("home")`, 0.69M gas):
-  the device's `nullifier` must be the proof's (`Nullifier`); a nullifier
-  holding an agent is `Claimed`, a kit entry's index holding one
+- **The claim** (`claim(device, kit, agent)` under `Auth("home")`, 0.69M
+  gas): the device's `nullifier` must be the proof's (`Nullifier`); a
+  nullifier holding an agent is `Claimed`, a kit entry's index holding one
   `KitTaken`, more than four entries or one key twice among the device's
   and the kit's `Malformed` (what `Personal` would refuse, so a refusal
   cannot be repeated against a pooled agent), an empty pool `PoolEmpty`,
-  each writing nothing. A kit may be empty (no recovery). The lowest
-  pooled agent is taken and indexed, and sent `claim(device, kit, policy,
+  an `agent` not pooled `Taken`, each writing nothing. A kit may be empty
+  (no recovery). **The device names the agent** [built, 8.23a]: a kit's
+  `R1` is sealed with the agent's identity bound (§3.5), which the device
+  must know before its claim, so it reads `pooled` (the lowest pooled
+  agent), learns that agent's identity from its record (`AgentInfo`),
+  seals to it and claims it; a claim that loses the race is `Taken`, and
+  the device seals to the next. The named agent is taken and indexed,
+  and sent `claim(device, kit, policy,
   homes)`, `Personal`'s entry for its home: the policy and the claim
   checked whole, answered by message, `assigned`, or `refused` with the
   error and nothing written (`assign` and `configure` stay for a home's
@@ -1776,6 +1782,77 @@ answer to a stolen phone):
 For a stolen phone the user runs steps 2 and 3's revocations from any
 remaining device; a user with no other device uses the kit (§3.5) and each
 registrar's ordinary process, and the chrome states that cost.
+
+**Pairing, the claim and memberships as built** [built, `vos_light::
+pairing`, `vos_light::home`, `vos_light::memberships`; tested against
+`Personal` in `node/light/tests/sealed/pairing.rs`, and end to end on three
+nodes through their sockets with the onion's mark in
+`node/host/tests/served/personal.rs`, at a test home of seconds and an open
+claim's difficulty of 4; where the text above leaves a choice, this is the
+one taken]:
+- **The claim at a home-only space** (`home::Claim`): the device's open
+  claim first (`home::open_claim`, `claim_open(member, nonce)` in a session
+  of its own, its key drawn for that call alone), then the claim of the
+  agent `Homes` answers `pooled` for, sealed to that agent's identity
+  (§3.3, "The device names the agent"), with a phrase's or a security
+  key's kit or both. The claim (the device, the kit with `R2`, `R`, the
+  agent) is held in the store from before its call until the device's
+  group starts from the agent's log (`Claim::claimed`, the `R` the kit's
+  from the `Assigned` entry), so a retry after a lost answer sends the
+  same claim, which `Homes` sends again; a refused one is abandoned and
+  the device seals to the next agent. **A second claim is refused** at the
+  device (`ClaimError::Held`) when its store holds a personal space's
+  archive (a group, a restore's drawn `R`, an earlier group's keys) or a
+  claim waits, and at `Homes` for a nullifier recorded (`Claimed`).
+- **The QR code** (`pairing::Code`, a version byte then its encoding):
+  the home's handle and onions, the agent, its identity and `Personal`'s
+  instance (the joiner reaches the slot through them), the slot, the slot
+  key's seed, its expiry, the handshake's first message and the 128-bit
+  code. The opener is the Noise initiator, so its first message (its
+  ephemeral key and its empty payload's tag, 48 bytes) is in the QR. The
+  pre-shared key is `BLAKE2b-256("vos/personal/pairing/psk" ‖ code ‖ slot
+  ‖ agent)`, the prologue the agent and the slot; each side's Noise
+  static key is drawn for the pairing, the pre-shared key authenticating
+  both.
+- **The messages** go as inbox items to the slot, each id
+  `BLAKE2b-128("vos/personal/pairing/item" ‖ slot ‖ side ‖ n)`: the
+  joiner's second message, the opener's third carrying the `Offer` (the
+  home as `home::Home`, and the memberships to enrol it in), the joiner's
+  `Hello` (its `NewDevice` with its "home" nullifier from its own secret
+  there, its key package, its handle in each offered space), the
+  opener's handover (the `Pairing`, its archive with the naming secret and
+  `R`, and its checkpoints, `Pairing::trust`) in as many items as the
+  policy's item size takes, and the joiner's acknowledgement by the
+  handover's hash: three items of the slot's four. **The commit waits for
+  the acknowledgement**, since the add closes the slot and deletes its
+  items. *Known limit:* the pre-shared key enters at the third message,
+  so a joiner holding another code fails at the offer and the opener
+  hears nothing; it shows the slot open until it expires or the user
+  closes it. Each side lives in memory: a pairing cut short starts again
+  with a new slot.
+- **Memberships** (`memberships`): the opener holds an `Enrollment` a
+  space, from the hello's handles, until it is made (`enroll_device` under
+  its owner proof) or dropped, so the chrome defers any space; the joiner
+  holds a confirmation a space (`confirm_device` under its own owner
+  proof, once its leaf is there). The memberships offered, and a retired
+  device's revocations (`revoke_device`), come from the credential book's
+  handles (`memberships::handles_of`); the opener records the new
+  device's handle there once its add is confirmed (`memberships::record`).
+  The registrar registers a person's first device (`register`) as it
+  enrols the member, its own call; the light node calls none of the
+  registrar's role methods.
+- **The joiner's open claim** at a home-only space runs after the pairing
+  (`home::open_claim`, its own work), so its re-proof proves under the
+  nullifier its add recorded; at a home that is the user's own space it
+  is the opener's enrollment there, as in any space.
+- **Retiring a phone:** the successor paired from the old phone (offered
+  the old phone's memberships), then the old phone's removal by the other
+  devices as §3.5's rules time it, carried by the next commit; the old
+  phone, relayed the log, sees `Event::Removed`, which is where the app
+  offers to wipe it; its leaves revoked in each space its handles name.
+- **The yearly prompt** (`home::renewal_due`): due in the lease's last
+  sixth or once the device's leaf is due its update; on it the device
+  proves `renew` (`home::renew_call`) and commits its update.
 
 ### 3.9 Home spaces: several, and moving home
 
