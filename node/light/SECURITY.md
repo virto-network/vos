@@ -267,3 +267,50 @@ and what a node does with one is `node/SECURITY.md`'s.
   links to the proof's; it happens only when the ring no longer holds the
   root (a replica's lag, a root replaced at its own batch time, or 64
   tree-changing batches within the keeper's period).
+
+## The client over Tor
+
+What `vos_light::tor` (the `tor` feature) keeps apart, and what it does
+not (`light-node.md` §6.2–§6.7).
+
+- **The route is decided before a byte leaves** (`vos_light::route`):
+  every space is reached through its pinned onions unless the user opted
+  its key-signed calls out of Tor, after `OPT_OUT_WARNING`, where the
+  space offers a clearnet port and is not onion-only. Anonymous requests
+  (proven calls, path fetches and root polls, the feed, the onion set's
+  refresh) and the personal agent's and `Homes`' traffic have no clearnet
+  route at all: with no onion pinned they are refused, nothing dialed. A
+  proven call goes only under its own purpose, which carries nothing
+  else, so it never rides a connection that may be on the clearnet.
+- **One connection a purpose, each its own circuit and SSH key:** each
+  connection's stream takes an arti isolation token drawn for it alone,
+  which arti's circuit manager shares with no other stream, and its SSH
+  session authenticates with an ed25519 key drawn for it alone (its
+  seed zeroized once the key is made), so the gateway cannot join two purposes, two
+  spaces, or two proven calls by circuit or by key. A proven call and a
+  fetch each take a connection of their own, closed once answered; the
+  member's calls in a space, the feed, the personal agent and its
+  background schedule each keep one while used. **Not hidden:** what a
+  purpose's requests themselves carry (a member's signed calls name its
+  key; a personal agent's calls its sync key), the timing of requests,
+  and that one Tor client made them all to the same onion at once, which
+  the gateway may correlate by time alone.
+- **The gateway is pinned twice:** its onion address authenticates the
+  service, and its SSH host key, pinned beside it, is checked at each
+  handshake; a gateway presenting another key is not spoken to.
+- **The onion set's refresh is the gateway's word:** a usable set (one to
+  sixteen onions, each once) read from the registrar through the pinned
+  set replaces it, as unsigned as any answer the gateway relays
+  (`light-node.md` §8, H5). A gateway could steer a device to onions it
+  controls; the SSH host keys come with the same answer.
+- **arti's state is the app's:** arti's state and directory cache in the
+  app's private directory, made private if missing; arti checks its
+  permissions and refuses a directory others may write, and
+  `ARTI_FS_DISABLE_PERMISSION_CHECKS` is ignored. The state holds guard
+  choices and the directory, no key of the member's; it is kept out of
+  the operating system's backup with the store.
+- **Dormant sends nothing:** dormant, the client holds no connection, no
+  spare and no timer, and refuses every request until woken.
+- **Plain bridges only:** a pasted line naming a pluggable transport is
+  refused, so a network that blocks Tor by inspection blocks the
+  anonymous calls and the personal space, which wait (§8, H2).

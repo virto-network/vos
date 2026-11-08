@@ -14,6 +14,21 @@ release = ["dep:vos-pvm-compiler"]
 # machine's: the phone bench's seeded build alone. A test seam: no
 # production build enables it (`just check-no-seeded-masks`).
 seeded-masks = ["vos-pvm-recair/seeded-masks"]
+# The client over arti (`tor`): one `TorClient`, `vos-api` over SSH over a
+# space's onion, a connection a purpose. One arti version a release,
+# pinned exactly as the gateway's; built with `--ignore-rust-version`, as
+# arti declares a newer Rust than the workspace's nightly.
+tor = [
+    "vos-api/client",
+    "dep:arti-client",
+    "dep:tor-rtcompat",
+    "dep:rustls",
+    "dep:russh",
+    "dep:tokio",
+    "dep:tokio-util",
+    "dep:sha3",
+    "dep:data-encoding",
+]
 
 [dependencies]
 # The local agent's store.
@@ -55,6 +70,18 @@ bip39 = { version = "2.2", default-features = false, features = ["zeroize"] }
 getrandom = "0.2"
 # A pool's threads pinned to the cores `Threads::Cores` names.
 libc = "0.2"
+# The client over arti: arti's client with the bridge client and its
+# directory cache's SQLite built in (the NDK offers apps none), rustls on
+# ring as russh's and the gateway's, SSH under a key drawn a connection,
+# and the onion's address from its key (SHA3-256, base32).
+arti-client = { version = "=0.47.0", default-features = false, features = ["tokio", "rustls", "compression", "onion-service-client", "bridge-client", "static-sqlite"], optional = true }
+tor-rtcompat = { version = "=0.47.0", default-features = false, features = ["tokio", "rustls"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+russh = { version = "0.61", default-features = false, features = ["ring", "flate2"], optional = true }
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync", "macros"], optional = true }
+tokio-util = { version = "0.7", features = ["compat"], optional = true }
+sha3 = { version = "0.10", optional = true }
+data-encoding = { version = "2", optional = true }
 
 [dev-dependencies]
 # The release build, as the tests compute the artifacts.
@@ -64,6 +91,8 @@ vos-testkit = { path = "../../agent/testkit" }
 # The crash rounds.
 vos-checker = { path = "../checker" }
 tempfile = "3"
+# The client over arti's tests: a runtime, as the facility's.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
 # The merge fields' convergence, on their native model.
 proptest = "1"
 # The device group's adversaries: a committer running other code over a
@@ -76,6 +105,18 @@ mls-rs-crypto-rustcrypto = { version = "=0.22.1", default-features = false }
 name = "crash"
 harness = false
 
+[[test]]
+name = "tor"
+required-features = ["tor"]
+
+[[test]]
+name = "tor_state"
+required-features = ["tor"]
+
 [[example]]
 name = "devices"
 required-features = ["release"]
+
+[[example]]
+name = "onion"
+required-features = ["tor"]

@@ -323,6 +323,15 @@ test-gateway-onion: build-test-actors build-agent
     cargo clippy -p vos-gateway --features tor --ignore-rust-version --all-targets --quiet -- -D warnings
     cargo test -p vos-gateway --features tor --ignore-rust-version
 
+# The light node's client over arti (`vos-light`'s `tor` feature, arti
+# pinned exactly; `--ignore-rust-version` as the gateway's): clippy, the
+# Tor policy, and the client against an in-process gateway, its capture
+# checking each connection's circuit and SSH key. No network.
+test-light-tor:
+    cargo clippy -p vos-light --features tor --ignore-rust-version --all-targets --quiet -- -D warnings
+    cargo test -p vos-light --features tor --ignore-rust-version --test tor --test tor_state
+    cargo test -p vos-light --features tor --ignore-rust-version --lib -- tor:: route::
+
 test-gateway-ssh: build-test-actors build-agent build-credentials build-payments
     cargo clippy -p vos-gateway --features ssh --ignore-rust-version --all-targets --quiet -- -D warnings
     cargo test -p vos-gateway --features ssh --ignore-rust-version
@@ -698,6 +707,7 @@ check: fmt-check doc-check check-venue-rules check-no-std check-no-leaks check-n
     just test-recair
     cargo test {{agent_crates}}
     just test-gateway-onion
+    just test-light-tor
     just test-reads
 
 # The live runs of reads at a cut on the agent's model, with no proving:

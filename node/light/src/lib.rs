@@ -41,6 +41,15 @@
 //!   bytes, the kit's signing and sealing keys, and `R = R1 ⊕ R2` split
 //!   across the kit and the agent.
 //!
+//! - **The Tor policy** ([`route`]): the route each request takes to a
+//!   space, by its purpose, decided before it leaves: Tor by default, a
+//!   per-space opt-out for key-signed calls, no clearnet route for
+//!   anonymous requests nor the personal agent's.
+//! - **The client over arti** (`tor`, the `tor` feature): one `TorClient`
+//!   a process, `vos-api` over SSH over a space's onion, a connection a
+//!   purpose, each its own circuit and SSH key; the spare for proven calls,
+//!   dormancy, s4's screens carried, the pinned onion set refreshed.
+//!
 //! **The device library** (`docs/design/proving.md` §8): what the phone
 //! runs to prove facts about its device secret to its space's ingress, and
 //! nothing a client or a gateway has to encode itself.
@@ -96,6 +105,8 @@ mod secret;
 pub mod store;
 pub mod sync;
 mod threads;
+#[cfg(feature = "tor")]
+pub mod tor;
 pub mod wire;
 
 pub use call::{Call, NAME_BYTES, method_id, scope, transfer_arguments};
