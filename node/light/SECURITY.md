@@ -270,8 +270,20 @@ and what a node does with one is `node/SECURITY.md`'s.
   15 s and 45 s), never because a proof is about to be made: the feed's
   connection is one circuit for as long as it is open, and a read just
   before each proof would join the proofs through it. A `RootUnknown` or
-  `RootStale` answer makes the feed due at once: that one read precedes
-  the retried proof, as a refetched path did.
+  `RootStale` answer makes the feed due within 10 s, at a time drawn for
+  it: that read still precedes the retried proof, and since the feed's
+  connection is one circuit while it stays open, two refused proofs each
+  followed by a read on it link the two proofs' scopes to one device. It
+  happens only when the ring no longer holds the device's root.
+- **What a gateway can make the device hold is bounded:** a page at most
+  48 KiB (or one change of at most 256 leaves), no slot past the lowest
+  never used, as the actor places members, so about two nodes a leaf;
+  and one read at most 256 pages. No path is given until a read reaches
+  the feed's end.
+- **A feed query names the keeper's place:** a restored keeper's first
+  read names the place it last read from, which can link the new circuit
+  to the last when few devices read the feed; a new device reads from the
+  start soon after its claim.
 - **Kept on the device:** the tree's leaves, which every member reads
   alike, and the feed's place; nothing in them is the member's but which
   leaf the keeper computes paths for, which is not kept.

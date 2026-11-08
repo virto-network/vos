@@ -123,11 +123,11 @@ pub use light::{
     ScopeError,
 };
 pub use path::PathKeeper;
-pub use tree::{Synced, TreeKeeper};
 pub use prover::{PEAK_BYTES, Proven, Prover, ProverConfig, STACK_BYTES, Threads, verify};
 pub use secret::{DeviceSecret, derive_secret, member, owner, source_input};
 pub use store::{Store, StoreError};
 pub use threads::thread_pool;
+pub use tree::{Synced, TreeKeeper};
 
 use vos_wire::credentials::{self, P};
 use vos_wire::ingress::Rejection;

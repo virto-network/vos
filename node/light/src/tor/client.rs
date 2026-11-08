@@ -27,6 +27,11 @@ use crate::{DeviceError, TreeKeeper, wire};
 /// How long a feed query is good for, by the node's clock.
 const FEED_TIME: Duration = Duration::from_secs(60);
 
+/// The most pages one [`Client::read_tree`] reads, about 12 MiB: the
+/// feed's length is the gateway's word, so a read ends however long it
+/// says the feed is.
+pub const FEED_PAGES: usize = 256;
+
 /// A space, by its handle.
 pub type SpaceId = [u8; 32];
 
@@ -489,31 +494,32 @@ impl Client {
 
     /// Read `space`'s credential tree into `keeper` from the feed of its
     /// credential actor (`credentials`), on the space's feed connection:
-    /// the node's time, then each page from the keeper's place until the
-    /// feed holds no more, the time read again for a page past half a
-    /// query's life. The changes applied; a page refused leaves the tree as
-    /// the pages before it left it. The caller reads it when
+    /// the node's time, for the queries' life, then each page from the
+    /// keeper's place until the feed holds no more, or [`FEED_PAGES`] pages
+    /// (the keeper then due at once), the time read again for a page past
+    /// half a query's life. The keeper's timer runs on this device's clock
+    /// (`now_ms`, milliseconds). The changes applied; a page refused leaves
+    /// the tree as the pages before it left it. The caller reads it when
     /// [`TreeKeeper::due`] says, never because a proof is about to be made.
     pub async fn read_tree(
         &self,
         space: SpaceId,
         credentials: &Registrar,
         keeper: &mut TreeKeeper,
+        now_ms: impl Fn() -> u64,
     ) -> Result<u64, Error> {
         let mut applied = 0;
         let mut time: Option<(u64, Instant)> = None;
-        loop {
-            let now = match time {
-                Some((now, at)) if at.elapsed() < FEED_TIME / 2 => {
-                    now + at.elapsed().as_millis() as u64
-                }
+        for _ in 0..FEED_PAGES {
+            let node = match time {
+                Some((node, at)) if at.elapsed() < FEED_TIME / 2 => node,
                 _ => {
                     let (_, answer) = self
                         .request(space, Purpose::Feed, &wire::time_request())
                         .await?;
-                    let now = wire::time_answer(&answer).map_err(Error::Answer)?;
-                    time = Some((now, Instant::now()));
-                    now
+                    let node = wire::time_answer(&answer).map_err(Error::Answer)?;
+                    time = Some((node, Instant::now()));
+                    node
                 }
             };
             let query = keeper
@@ -521,16 +527,17 @@ impl Client {
                     credentials.agent,
                     &credentials.identity,
                     credentials.instance,
-                    now + FEED_TIME.as_millis() as u64,
+                    node + FEED_TIME.as_millis() as u64,
                 )
                 .map_err(Error::Answer)?;
             let (_, answer) = self.request(space, Purpose::Feed, &query).await?;
-            let read = keeper.ingest(&answer, now).map_err(Error::Answer)?;
+            let read = keeper.ingest(&answer, now_ms()).map_err(Error::Answer)?;
             applied += read.applied;
             if !read.more {
-                return Ok(applied);
+                break;
             }
         }
+        Ok(applied)
     }
 
     /// `space`'s routes, the route `purpose` takes there, and the version

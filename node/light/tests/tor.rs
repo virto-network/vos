@@ -849,7 +849,7 @@ async fn the_tree_is_read_on_one_feed_connection() {
     let mut keeper = TreeKeeper::new(mine);
     assert_eq!(
         client
-            .read_tree(a, &credentials, &mut keeper)
+            .read_tree(a, &credentials, &mut keeper, || 0)
             .await
             .unwrap(),
         7
@@ -858,14 +858,14 @@ async fn the_tree_is_read_on_one_feed_connection() {
     *gateway.feed.lock().unwrap() = changes.clone();
     assert_eq!(
         client
-            .read_tree(a, &credentials, &mut keeper)
+            .read_tree(a, &credentials, &mut keeper, || 0)
             .await
             .unwrap(),
         3
     );
     assert_eq!(
         client
-            .read_tree(a, &credentials, &mut keeper)
+            .read_tree(a, &credentials, &mut keeper, || 0)
             .await
             .unwrap(),
         0
@@ -887,7 +887,7 @@ async fn the_tree_is_read_on_one_feed_connection() {
     forged[11].root.root = [1; 32];
     *gateway.feed.lock().unwrap() = forged;
     assert!(matches!(
-        client.read_tree(a, &credentials, &mut keeper).await,
+        client.read_tree(a, &credentials, &mut keeper, || 0).await,
         Err(Error::Answer(DeviceError::Witness))
     ));
     assert_eq!(keeper.cursor(), 10);

@@ -13,9 +13,15 @@
 //! keeps. A page that leaves another root, holds a leaf that is no digest,
 //! a change of no leaves or out of slot order or older than the last, or
 //! does not start at the keeper's place or overruns the feed's length, is
-//! refused whole and the tree kept as it was. The answer is still the
-//! gateway's word, as any answer it relays: a withheld change shows as
-//! `RootStale` at the next proof, which [`TreeKeeper::unknown`] answers.
+//! refused whole and the tree kept as it was. What a gateway can make the
+//! device hold is bounded: a page at most [`FEED_BYTES`] (or one change of
+//! at most [`ENROLL_MANY`] leaves), and no slot past the lowest never used,
+//! as the actor places members, so about two nodes a leaf. The answer is
+//! still the gateway's word, as any answer it relays: a withheld change
+//! shows as `RootStale` at the next proof, which [`TreeKeeper::unknown`]
+//! answers. Until a read reaches the feed's end no path is given, since a
+//! page may end between two writes of one batch, whose first root the
+//! ring never holds.
 //!
 //! **When.** The feed is read on a jittered timer of its own,
 //! [`TreeKeeper::PERIOD_MS`] (30 s, between 15 s and 45 s), never because a
@@ -26,21 +32,23 @@
 //! a root held at most one period behind the tree survives unless the
 //! space makes 64 tree-changing batches within one period; a space faster
 //! than that meets `RootUnknown`, and [`TreeKeeper::unknown`] makes the
-//! feed due at once and halves the period (to at least
+//! feed due within 10 s, at a time drawn for it, and halves the period (to at least
 //! [`TreeKeeper::MIN_PERIOD_MS`]), which doubles back toward the default
 //! at each read that finds the tree unchanged.
 //!
 //! **Kept on the device** ([`TreeKeeper::encode`], [`TreeKeeper::restore`]):
 //! the leaves, the feed's place and the root, outside any synced scope
-//! (`light-node.md` §3.1), so a restart reads only the changes since.
+//! (`light-node.md` §3.1), so a restart reads only the changes since. That
+//! first read names the place kept, which the device read last from: when
+//! few devices read the feed, it can link the new circuit to the last.
 
 use std::collections::{BTreeMap, HashMap};
 
 use scale::{Decode, Encode};
-use vos_wire::credentials::{self, DEPTH, EMPTY, Feed, RootEntry, Words};
+use vos_wire::credentials::{self, DEPTH, EMPTY, ENROLL_MANY, FEED_BYTES, Feed, RootEntry, Words};
 
 use crate::path::jitter;
-use crate::{AuthWitness, DeviceError, Digest, wire};
+use crate::{AuthWitness, DeviceError, Digest, PathKeeper, wire};
 
 /// The tree as the feed built it, the member's slot in it, and when to
 /// read the feed again.
@@ -56,8 +64,16 @@ pub struct TreeKeeper {
     /// The root the last change left, and the batch time it became the
     /// root; the empty tree's from 0 before any.
     root: RootEntry,
+    /// The lowest slot no change has set: the actor places a member at a
+    /// freed slot or at the lowest never used, so no change sets a slot
+    /// past it, which bounds the tree to about two nodes a leaf.
+    fresh: u64,
     /// The member's slot, while its leaf is in the tree.
     slot: Option<u32>,
+    /// Whether the last page read ended the feed: until it does, the root
+    /// held may be one the ring never held (a page may end between two
+    /// writes of one batch), and no path is given.
+    caught_up: bool,
     /// When the timer is next due, by the client's clock in milliseconds.
     next: u64,
     /// The timer's period before its jitter.
@@ -78,6 +94,7 @@ pub struct Synced {
 struct Kept {
     cursor: u64,
     root: RootEntry,
+    fresh: u64,
     leaves: Vec<(u32, [u8; 32])>,
 }
 
@@ -99,7 +116,9 @@ impl TreeKeeper {
                 root: credentials::digest(&EMPTY[DEPTH]),
                 since: 0,
             },
+            fresh: 0,
             slot: None,
+            caught_up: false,
             next: 0,
             period: Self::PERIOD_MS,
         }
@@ -107,12 +126,17 @@ impl TreeKeeper {
 
     /// A keeper for `member` from what [`TreeKeeper::encode`] kept: the
     /// tree rebuilt from its leaves, refused ([`DeviceError::Decode`])
-    /// unless it decodes and its root is the one kept. Due at once.
+    /// unless it decodes, its leaves lie below the lowest slot never used
+    /// and its root is the one kept. Due at once, and no path given until
+    /// a read finds the feed's end.
     pub fn restore(member: Digest, bytes: &[u8]) -> Result<Self, DeviceError> {
         let kept = Kept::decode_exact(bytes).ok_or(DeviceError::Decode)?;
         let mut keeper = Self::new(member);
         let mut leaves = Vec::with_capacity(kept.leaves.len());
         for (slot, leaf) in &kept.leaves {
+            if u64::from(*slot) >= kept.fresh {
+                return Err(DeviceError::Decode);
+            }
             leaves.push((*slot, credentials::words(leaf).ok_or(DeviceError::Decode)?));
         }
         let mut undo = Vec::new();
@@ -122,6 +146,7 @@ impl TreeKeeper {
         }
         keeper.cursor = kept.cursor;
         keeper.root = kept.root;
+        keeper.fresh = kept.fresh;
         Ok(keeper)
     }
 
@@ -138,6 +163,7 @@ impl TreeKeeper {
         Kept {
             cursor: self.cursor,
             root: self.root,
+            fresh: self.fresh,
             leaves,
         }
         .encode()
@@ -179,9 +205,14 @@ impl TreeKeeper {
     }
 
     /// `page` applied, the tree it leaves checked against the root its last
-    /// change names; a page that fails is refused whole
-    /// ([`DeviceError::Witness`]), the tree as it was. A page from a replica behind the keeper,
-    /// whose feed is shorter than the keeper's place, holds nothing new.
+    /// change names. A page not from the keeper's place, or past the
+    /// feed's length, is refused ([`DeviceError::Decode`]); one past
+    /// [`FEED_BYTES`] (but for a single change), with a change of no leaves
+    /// or more than [`ENROLL_MANY`], out of slot order, older than the
+    /// last, setting a slot past the lowest never used, or leaving another
+    /// root, is refused whole ([`DeviceError::Witness`]): the tree as it
+    /// was. A page from a replica behind the keeper, whose feed is shorter
+    /// than the keeper's place, holds nothing new.
     pub fn apply(&mut self, page: &Feed) -> Result<Synced, DeviceError> {
         let end = page
             .from
@@ -196,15 +227,25 @@ impl TreeKeeper {
         if page.from != self.cursor || end > page.length {
             return Err(DeviceError::Decode);
         }
-        let mut since = self.root.since;
+        let bytes: usize = page.changes.iter().map(|change| change.encoded_len()).sum();
+        if page.changes.len() > 1 && bytes > FEED_BYTES {
+            return Err(DeviceError::Witness);
+        }
+        let (mut since, mut fresh) = (self.root.since, self.fresh);
         let mut leaves = BTreeMap::new();
         for change in &page.changes {
             let ordered = change.leaves.windows(2).all(|pair| pair[0].0 < pair[1].0);
-            if change.root.since < since || !ordered || change.leaves.is_empty() {
+            let sized = !change.leaves.is_empty() && change.leaves.len() <= ENROLL_MANY;
+            if change.root.since < since || !ordered || !sized {
                 return Err(DeviceError::Witness);
             }
             since = change.root.since;
             for (slot, leaf) in &change.leaves {
+                let slot64 = u64::from(*slot);
+                if slot64 > fresh || (slot64 == fresh && *leaf == credentials::digest(&EMPTY[0])) {
+                    return Err(DeviceError::Witness);
+                }
+                fresh = fresh.max(slot64 + 1);
                 leaves.insert(*slot, credentials::words(leaf).ok_or(DeviceError::Witness)?);
             }
         }
@@ -220,15 +261,21 @@ impl TreeKeeper {
             self.root = last.root;
         }
         self.cursor = end;
+        self.fresh = fresh;
+        self.caught_up = end >= page.length;
         Ok(Synced {
             applied: page.changes.len() as u64,
-            more: end < page.length,
+            more: !self.caught_up,
         })
     }
 
     /// The member's path at the newest root the keeper holds, computed
-    /// here; `None` while its leaf is not in the tree.
+    /// here; `None` while its leaf is not in the tree, or until a read
+    /// found the feed's end.
     pub fn witness(&self) -> Option<AuthWitness> {
+        if !self.caught_up {
+            return None;
+        }
         let slot = self.slot?;
         Some(AuthWitness {
             root: Digest::from_bytes(&self.root.root)?,
@@ -237,11 +284,15 @@ impl TreeKeeper {
         })
     }
 
-    /// A `RootUnknown` or `RootStale` answer to a proof against the held
-    /// root: the feed is due at once, and the period halved, to at least
-    /// [`TreeKeeper::MIN_PERIOD_MS`].
-    pub fn unknown(&mut self) {
-        self.next = 0;
+    /// A `RootUnknown` or `RootStale` answer at `now_ms` to a proof
+    /// against the held root: the feed due at a time drawn below
+    /// [`PathKeeper::MOVED_SPREAD_MS`], not at once, so the read on the
+    /// feed's circuit does not follow the refused proof by a fixed delay;
+    /// and the period halved, to at least [`TreeKeeper::MIN_PERIOD_MS`].
+    pub fn unknown(&mut self, now_ms: u64) {
+        self.next = self
+            .next
+            .min(now_ms.saturating_add(jitter(PathKeeper::MOVED_SPREAD_MS)));
         self.period = (self.period / 2).max(Self::MIN_PERIOD_MS);
     }
 

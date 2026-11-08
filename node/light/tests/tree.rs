@@ -185,7 +185,9 @@ fn a_page_that_does_not_check_is_refused_whole() {
     let half = 8;
     let mut keeper = TreeKeeper::new(mine);
     keeper.apply(&writes.page(0, half)).unwrap();
-    let held = keeper.witness().unwrap();
+    // No path until the feed's end is read: the page may end inside a batch.
+    assert_eq!(keeper.witness(), None);
+    let held = keeper.slot();
     let rest = writes.page(half, writes.changes.len());
 
     let forged: [fn(&mut Feed); 5] = [
@@ -204,7 +206,7 @@ fn a_page_that_does_not_check_is_refused_whole() {
         assert_eq!(keeper.apply(&page), Err(DeviceError::Witness));
         assert_eq!(keeper.cursor(), half as u64);
         assert_eq!(keeper.root(), writes.changes[half - 1].root);
-        assert_eq!(keeper.witness().as_ref(), Some(&held));
+        assert_eq!(keeper.slot(), held);
     }
     let mut early = writes.page(half - 1, writes.changes.len());
     assert_eq!(keeper.apply(&early), Err(DeviceError::Decode));
@@ -225,7 +227,7 @@ fn a_page_that_does_not_check_is_refused_whole() {
             more: false
         })
     );
-    assert_eq!(keeper.witness().as_ref(), Some(&held));
+    assert_eq!(keeper.slot(), held);
 
     keeper.apply(&rest).unwrap();
     assert_eq!(keeper.root().root, writes.tree.root());
@@ -245,11 +247,16 @@ fn the_kept_tree_restores() {
     let mut keeper = TreeKeeper::new(mine);
     keeper.apply(&writes.page(0, writes.changes.len())).unwrap();
     let kept = keeper.encode();
-    let restored = TreeKeeper::restore(mine, &kept).unwrap();
+    let mut restored = TreeKeeper::restore(mine, &kept).unwrap();
     assert_eq!(restored.cursor(), keeper.cursor());
     assert_eq!(restored.root(), keeper.root());
-    assert_eq!(restored.witness(), keeper.witness());
     assert!(restored.due(0));
+    // A path once a read finds the feed's end, nothing new.
+    assert_eq!(restored.witness(), None);
+    let end = writes.changes.len();
+    restored.apply(&writes.page(end, end)).unwrap();
+    assert_eq!(restored.witness(), keeper.witness());
+    assert!(keeper.witness().is_some());
 
     let mut forged = kept.clone();
     // The root's first byte, after the place's eight.
@@ -275,15 +282,65 @@ fn the_feed_is_read_on_its_own_timer() {
     assert!(!keeper.due(1_000 + period / 2 - 1));
     assert!(keeper.due(1_000 + period * 3 / 2));
 
-    keeper.unknown();
-    assert!(keeper.due(1_001));
+    keeper.unknown(1_000);
+    assert!(keeper.due(1_000 + vos_light::PathKeeper::MOVED_SPREAD_MS));
     assert_eq!(keeper.period(), period / 2);
     for _ in 0..10 {
-        keeper.unknown();
+        keeper.unknown(1_000);
     }
     assert_eq!(keeper.period(), TreeKeeper::MIN_PERIOD_MS);
     let quiet = writes.page(end, end);
     keeper.ingest(&answer(&quiet), 2_000).unwrap();
     assert_eq!(keeper.period(), 2 * TreeKeeper::MIN_PERIOD_MS);
     assert!(!keeper.due(2_000 + TreeKeeper::MIN_PERIOD_MS - 1));
+}
+
+/// What a gateway can make the device hold is bounded: a slot past the
+/// lowest never used, a change past `ENROLL_MANY` leaves, or a page past
+/// `FEED_BYTES`, is refused, the tree as it was.
+#[test]
+fn a_page_past_the_feeds_bounds_is_refused() {
+    let mine = secret_member();
+    let mut keeper = TreeKeeper::new(mine);
+    let mut sparse = Writes::new();
+    sparse.write(1, &[(0, leaf(&other(1)))]);
+    sparse.write(1, &[(1 << 30, leaf(&other(2)))]);
+    assert_eq!(keeper.apply(&sparse.page(0, 2)), Err(DeviceError::Witness));
+    let mut revoked = Writes::new();
+    revoked.write(1, &[(0, EMPTY[0])]);
+    assert_eq!(keeper.apply(&revoked.page(0, 1)), Err(DeviceError::Witness));
+    let mut many = Writes::new();
+    let leaves: Vec<_> = (0..257).map(|slot| (slot, leaf(&other(slot)))).collect();
+    many.write(1, &leaves);
+    assert_eq!(keeper.apply(&many.page(0, 1)), Err(DeviceError::Witness));
+    let mut long = Writes::new();
+    for slot in 0..700 {
+        long.write(1, &[(slot, leaf(&other(slot)))]);
+    }
+    assert_eq!(keeper.apply(&long.page(0, 700)), Err(DeviceError::Witness));
+    assert_eq!((keeper.cursor(), keeper.slot()), (0, None));
+    keeper.apply(&long.page(0, 600)).unwrap();
+    assert_eq!(keeper.root(), long.changes[599].root);
+}
+
+/// The member revoked at one slot and enrolled again at another within one
+/// page: its path at the new slot.
+#[test]
+fn a_member_moved_within_one_page_keeps_its_path() {
+    let mine = secret_member();
+    let mut writes = writes(&mine);
+    let at = writes.changes.len();
+    writes.write(7, &[(17, EMPTY[0])]);
+    writes.write(7, &[(41, leaf(&mine.0))]);
+    writes.write(7, &[(17, leaf(&other(77)))]);
+    let mut keeper = TreeKeeper::new(mine);
+    keeper.apply(&writes.page(0, at)).unwrap();
+    assert_eq!(keeper.slot(), Some(17));
+    keeper
+        .apply(&writes.page(at, writes.changes.len()))
+        .unwrap();
+    let witness = keeper.witness().unwrap();
+    assert_eq!(witness.slot, 41);
+    assert_eq!(witness.siblings, writes.tree.siblings(41));
+    assert!(witness.proves(&mine));
 }

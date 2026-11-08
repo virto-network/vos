@@ -895,9 +895,10 @@ the device never exports, evaluated once a use after the user's consent
     are online then; a device on the feed reads the change as every
     member does, naming no digest;
   - from the tree: how many members there are and when each was enrolled
-    or revoked (the feed serves every write and its batch time); a leaf
-    hides its digest, so whether a digest is enrolled is learned only by
-    asking `path` for it;
+    or revoked (the feed serves every write and its batch time, to any
+    caller); a leaf hides its digest from one who does not know it, but
+    whoever knows a digest computes its leaf and learns from the feed
+    whether and since when it is enrolled;
   - from a copied handle: two spaces sharing a handle can link their
     common members' `member` and `owner` digests (their nullifiers stay
     apart).

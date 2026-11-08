@@ -232,8 +232,11 @@ serve its requests:
   which member digests are online then. A device on the feed reads the
   change as every member does, naming no digest; the gateway sees only
   that some feed connection read it.
-- **From the tree:** how many members there are, and when each was
-  enrolled or revoked.
+- **From the tree, to any caller:** how many members there are, and when
+  each was enrolled or revoked; the feed serves every write to anyone,
+  and a leaf is `C(T(leaf), member)`, so whoever knows a member digest
+  learns from the feed whether and since when it is enrolled, with no
+  query naming it.
 - **From a copied handle:** two spaces whose credential actors share a
   handle can link their common members' `member` and `owner` digests; their
   nullifiers stay apart, since the scope names the space. The app shows and

@@ -44,7 +44,7 @@ mod connection;
 mod dial;
 
 pub use arti::{BootstrapError, BridgeError, Tor, TorConfig, bridge, onion_address, onion_key};
-pub use client::{Client, Error, Registrar, Screens, SpaceId};
+pub use client::{Client, Error, FEED_PAGES, Registrar, Screens, SpaceId};
 pub use dial::{Circuit, Dial, Dialing, Io, Stream, Target};
 
 use std::time::Duration;

@@ -3140,6 +3140,17 @@ live Tor network is not measured yet: M5 measures it.
   is that every member on the feed proves against the same newest root;
   within one timer period of a tree change, those who have not read it
   yet still stand apart.
+- **Bounded against its gateway:** a page at most `FEED_BYTES` (or one
+  change of at most 256 leaves), no slot past the lowest never used, as
+  the actor places members (so about two nodes a leaf), at most 256 pages
+  a read; no path given until a read reaches the feed's end, as a page may
+  end between two writes of one batch, whose first root the ring never
+  holds.
+- **A later lever, a settled root:** proving against the newest root
+  older than one timer period (45 s and a margin) in place of the newest
+  would give every member who read within the period the same root,
+  closing the split above, at up to 45 s more of revocation lag; it needs
+  the path at that root, the leaves' values before the changes since.
 - **Not yet:** s4's facility still keeps a path (`PathKeeper`) until it
   moves to the feed (`open.md`); the feed is kept whole, about 77 bytes a
   single write, on the actor and on every device.
