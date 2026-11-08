@@ -2775,6 +2775,56 @@ nodes may ask the onion's mark of its proven calls, or of every request
   job runs; dormant otherwise (no circuit kept, no timer firing), so
   battery costs come only from the work §2.3 budgets.
 
+**Built** [built, `node/light`'s `tor` feature, `vos_light::tor` and
+`vos_light::route`]:
+- **One `Tor` a process** on arti-client 0.47.0 (pinned exactly, as the
+  gateway's) with the features above: its state and cache under one
+  directory the app names, made `0700` if missing, arti's permission
+  check on and `ARTI_FS_DISABLE_PERMISSION_CHECKS` ignored (arti's
+  `ignore_environment`); pasted lines taken as plain bridges, one naming
+  a transport refused; the bootstrap bounded (two minutes by default)
+  and its failure named: the clock when arti's error or its last
+  blockage blames it, the bridge when a bootstrap through bridges ran
+  out of time, otherwise the network's blockage or arti's error.
+- **The client** (`Client`) sends a request (the device library's
+  `wire` bytes) to a space under a `Purpose`: `Proven`, `Fetch` (a path,
+  a root, the onion set: each a connection of its own, closed once
+  answered), `Feed`, `Member` (one a space), `Personal`, `Background`
+  and `Screens`. Each connection is a stream on an isolation token drawn
+  for it, SSH under the pinned host key and an ed25519 key drawn for it,
+  and the `vos-api` subsystem multiplexed; a kept-open one is closed
+  after five minutes without a request. A fresh connection gets three
+  attempts, each on a new circuit through the next onion of the pinned
+  set; deadlines: the onion stream 45 s, the SSH handshake 30 s, a
+  request 30 s, a proven call 90 s, a missed one closing its
+  connection. The spare (`keep_spare`) is built once its space is set,
+  taken by the next proven call, and built again once taken. Dormant
+  (`set_dormant`) drops every connection, the spare and the screens,
+  stops the idle timer, sets arti's `DormantMode::Soft`, and refuses
+  every request until woken. s4's screen session is carried as bytes
+  between a stream or a descriptor s4 hands over (`screens_fd`, a
+  socketpair's end) and the onion's port 22, on a circuit of its own; s4
+  speaks SSH over it under its own key and pins the host key returned.
+  The onion set's refresh (`refresh_onions`) is a `Time` and an `onions`
+  query, each a fetch; a set of one to sixteen distinct onions replaces
+  the pinned one, closing the space's connections.
+- **The policy** (`Routes`, §6.5): the onion unless the request is
+  key-signed (`Member`, `Screens`), the user opted the space out
+  (`opt_out`, refused for an onion-only space or one offering no
+  clearnet port) and the space offers a clearnet SSH port; otherwise
+  refused when no onion is pinned. A kind must match its purpose
+  (`Credentialed` only as `Proven`, which carries nothing else).
+- **Tested without the network** (`just test-light-tor`): an
+  in-process gateway, a russh server per dial, records each
+  connection's isolation token, SSH key and kinds: no two connections
+  share a token (none compatible by arti's own `Isolation`) or a key,
+  and every kind went under its purpose; an anonymous call on a
+  clearnet-only path dials nothing; the spare, the retry on a new
+  circuit, dormancy, the deadlines, the screens over a socketpair and
+  the refresh each have their test; arti's state opens in a private
+  directory and is refused in a world-writable one with the override
+  set.
+
 ### 6.3 The latency model
 
 | phase | time | when it is paid |
