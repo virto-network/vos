@@ -37,6 +37,7 @@ use home::Home;
 use phone::Phone;
 
 mod detection;
+mod pairing;
 
 const MIN: u64 = 60_000;
 const NOTES: InstanceId = InstanceId(1);

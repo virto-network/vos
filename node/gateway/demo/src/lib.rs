@@ -209,10 +209,17 @@ impl LocalSpace {
     }
 
     /// Invite a member's two digests: `member` into the credential actor's
-    /// tree, and the account `account` for `owner`.
+    /// tree, recorded with `owner` as its person's first device, so the
+    /// member's devices enroll one another (a member registered already is
+    /// refused there, `Held`); and the account `account` for `owner`.
     pub fn invite(&self, member: [u8; 32], account: &str, owner: [u8; 32]) -> Result<(), String> {
         let expires = self.now()? + INVITATION_MS;
         self.write(CREDENTIALS, "invite", (member, expires))?;
+        self.write(
+            CREDENTIALS,
+            "register",
+            (member, owner, vos_wire::credentials::MAX_DEVICES),
+        )?;
         self.write(
             PAYMENTS,
             "invite",

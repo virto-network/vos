@@ -27,8 +27,16 @@
 //!   confirmed epoch, and the recovery envelopes under `R`; over the onion
 //!   alone.
 //! - **The home** ([`home`]): the open claim's work, the device's
-//!   nullifier in the home's scope, and that scope reserved for the claim
-//!   and its re-proofs.
+//!   nullifier in the home's scope, that scope reserved for the claim and
+//!   its re-proofs, the claim of a personal agent (refused on a device
+//!   that holds one's archive) and the yearly re-proof.
+//! - **Pairing** ([`pairing`]): a new device joined through a pairing
+//!   slot's inbox over Noise `XXpsk3`, the QR code carrying the slot and
+//!   the pre-shared code; the archive, `R` and the checkpoints handed over
+//!   on the channel.
+//! - **Memberships** ([`memberships`]): a new device enrolled in every
+//!   other space by another of the person's devices, each deferrable,
+//!   confirmed by its own proof; a retired one revoked.
 //! - **The recovery kit** ([`kit`]): a phrase or a security key's 32
 //!   bytes, the kit's signing and sealing keys, and `R = R1 ⊕ R2` split
 //!   across the kit and the agent.
@@ -76,6 +84,8 @@ pub mod home;
 mod kernel;
 pub mod kit;
 mod light;
+pub mod memberships;
+pub mod pairing;
 mod path;
 pub mod personal;
 mod prover;

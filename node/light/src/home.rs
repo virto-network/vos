@@ -1,9 +1,23 @@
 //! The home (`light-node.md` §3.3): its open claim's work, a device's
-//! nullifier in its scope, and the scope reserved.
+//! nullifier in its scope, the scope reserved, the claim of a personal
+//! agent and its yearly re-proof.
 //!
 //! - **The open claim:** a home-only space admits anyone whose work meets
 //!   its registrar's difficulty under the period's salt ([`work`], over
-//!   the registrar's answer [`vos_wire::credentials::Open`]).
+//!   the registrar's answer [`vos_wire::credentials::Open`]): a call of
+//!   `claim_open(member, nonce)` in a session of its own
+//!   ([`open_claim`]). A device paired at a home-only space makes its own
+//!   in the background, unlinked to the others at the registrar.
+//! - **The claim** ([`Claim`]): of the agent `Homes` answers `pooled` for,
+//!   the kit's `R1` sealed to that agent's identity, proved in the scope
+//!   "home". It is held in the store from before its call until the
+//!   device's group starts from the agent's log ([`Claim::claimed`]), so
+//!   a retry after a lost answer sends the same claim. A device that
+//!   already holds a personal space's archive (its group, or a restore's)
+//!   claims nothing ([`ClaimError::Held`]): a second device pairs.
+//! - **The yearly re-proof** ([`renewal_due`], [`renew_call`]): `Homes`'
+//!   `renew` under the device's recorded nullifier, on the same prompt as
+//!   the leaf's update (the device group's update commit).
 //! - **The scope "home"** ([`SCOPE`]) is reserved: [`Prover::prove_auth`]
 //!   refuses it, and [`Prover::prove_home`] proves in it only a claim or a
 //!   re-proof of `Homes`, so no other call can be linked to the device's
@@ -13,11 +27,283 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use vos_wire::credentials::{Digest as Bytes, meets, open_work};
+use vos_wire::ids::InstanceId;
+use vos_wire::personal::{Body, Entry, Kit, NewDevice};
+use vos_wire::{Decode, Encode};
+use zeroize::Zeroize;
 
 pub use vos_wire::homes::SCOPE;
 
+use crate::group::{Agent, DeviceGroup, GroupError};
+use crate::kit::{KitKey, Split};
+use crate::store::{Store, StoreError};
 use crate::{AuthWitness, Call, DeviceError, DeviceProgram, DeviceSecret, Proven, Prover};
 use crate::{call, secret};
+
+/// The claim's row in the group keyspace, from its preparation until the
+/// device's group starts.
+const CLAIM_ROW: &[u8] = b"c/claim";
+
+/// A home as a device reaches it: its space, its stable handle, the agent
+/// holding its credential actor and `Homes` with the identity calls to it
+/// are signed for, and their instances. `Homes`' agent and instance are
+/// the scope of every "home" nullifier.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Home {
+    pub space: [u8; 32],
+    pub handle: [u8; 32],
+    pub agent: u32,
+    pub identity: [u8; 32],
+    pub homes: InstanceId,
+    pub credentials: InstanceId,
+}
+
+impl Home {
+    /// The nullifier of the device whose secret in this home is `secret`.
+    pub fn nullifier(&self, secret: &DeviceSecret) -> [u8; 32] {
+        nullifier(secret, &self.space, self.agent, self.homes.0)
+    }
+
+    fn call(&self, method: &str, arguments: Vec<u8>, expires_ms: u64) -> Result<Call, DeviceError> {
+        Call::new(
+            self.space,
+            self.agent,
+            self.homes.0,
+            call::method_id(method),
+            arguments,
+            expires_ms,
+        )
+    }
+}
+
+/// The open claim of `member` at `home` by the work `nonce` ([`work`]), a
+/// call in a session of its own at the node's time `now`: the request to
+/// send, whose answer is the member's slot or the registrar's refusal
+/// (`Work` past two periods: ask the terms again; `Cap`: try another day).
+pub fn open_claim(
+    home: &Home,
+    member: &Bytes,
+    nonce: u64,
+    now: u64,
+) -> Result<Vec<u8>, DeviceError> {
+    crate::wire::call_request(
+        home.agent,
+        &home.identity,
+        home.credentials.0,
+        "claim_open",
+        (*member, nonce).encode(),
+        now,
+    )
+}
+
+/// The yearly re-proof of `agent` at `home`, to prove in the scope "home"
+/// ([`Prover::prove_home`]) on the prompt that also signs the leaf's
+/// update.
+pub fn renew_call(home: &Home, agent: u32, expires_ms: u64) -> Result<Call, DeviceError> {
+    home.call("renew", agent.encode(), expires_ms)
+}
+
+/// Whether the yearly prompt is due at `now`, the lease running to
+/// `lease_until` (`Personal`'s overview) under a lease of `lease_ms`: in
+/// the lease's last sixth (two months of thirteen), or once the device's
+/// leaf is due its update. The prompt makes both.
+pub fn renewal_due(group: &DeviceGroup, lease_until: u64, lease_ms: u64, now: u64) -> bool {
+    group.update_due(now) || now >= lease_until.saturating_sub(lease_ms / 6)
+}
+
+/// Why a claim cannot go on.
+#[derive(Debug)]
+pub enum ClaimError {
+    /// The store holds a personal space's archive already, or a claim
+    /// waits: a device of a personal space pairs, it claims no second.
+    Held,
+    /// No kit key, or one no agreement is contributory with, or no
+    /// randomness.
+    Kit,
+    /// The agent's log holds no assignment of this claim's device and
+    /// kit: not yet assigned, or another claim's.
+    Unassigned,
+    Store(StoreError),
+    Group(GroupError),
+    Corrupt,
+}
+
+impl From<StoreError> for ClaimError {
+    fn from(error: StoreError) -> Self {
+        ClaimError::Store(error)
+    }
+}
+
+impl From<GroupError> for ClaimError {
+    fn from(error: GroupError) -> Self {
+        ClaimError::Group(error)
+    }
+}
+
+impl std::fmt::Display for ClaimError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClaimError::Held => f.write_str("the device holds a personal space already"),
+            ClaimError::Kit => f.write_str("the kit's keys do not seal"),
+            ClaimError::Unassigned => {
+                f.write_str("the agent's log holds no assignment of this claim")
+            }
+            ClaimError::Store(error) => error.fmt(f),
+            ClaimError::Group(error) => error.fmt(f),
+            ClaimError::Corrupt => f.write_str("the claim's row does not read"),
+        }
+    }
+}
+
+impl std::error::Error for ClaimError {}
+
+/// Whether `store` holds a personal space's archive: a device group, a
+/// restore's drawn `R`, or keys of an earlier group. Such a device claims
+/// no agent ([`ClaimError::Held`]).
+pub fn holds_archive(store: &Store) -> Result<bool, StoreError> {
+    if crate::group::grouped(store)? {
+        return Ok(true);
+    }
+    let archive = store.archive()?;
+    Ok(archive.recovery.is_some()
+        || !archive.drawn.is_empty()
+        || !archive.keys.is_empty()
+        || !archive.previous.is_empty())
+}
+
+#[derive(Encode, Decode)]
+struct Held {
+    device: NewDevice,
+    keys: Vec<KitKey>,
+    kit: Kit,
+    r: [u8; 32],
+    agent: u32,
+    identity: [u8; 32],
+}
+
+/// A claim of a personal agent, held in the store from before its call
+/// until the device's group starts. Its `Debug` shows no `R` or `R2`.
+pub struct Claim(Held);
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.0.r.zeroize();
+        self.0.kit.r2.zeroize();
+    }
+}
+
+impl std::fmt::Debug for Claim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Claim")
+            .field("agent", &self.0.agent)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Claim {
+    /// The claim of the pooled `agent`, whose identity is `identity`, for
+    /// `device` with the kit of `keys` (a phrase's, a security key's, or
+    /// both): `R` split, `R1` sealed to each key at that agent, held in the
+    /// store before this returns. Refused for a store that holds a personal
+    /// space's archive or a claim already.
+    pub fn prepare(
+        store: &Store,
+        device: NewDevice,
+        keys: Vec<KitKey>,
+        agent: u32,
+        identity: [u8; 32],
+    ) -> Result<Self, ClaimError> {
+        if holds_archive(store)? || store.group_row(CLAIM_ROW)?.is_some() {
+            return Err(ClaimError::Held);
+        }
+        let split = Split::draw(&keys, &identity).ok_or(ClaimError::Kit)?;
+        let claim = Claim(Held {
+            device,
+            kit: split.claim(),
+            keys,
+            r: *split.r(),
+            agent,
+            identity,
+        });
+        store.write_group_rows(vec![(CLAIM_ROW.to_vec(), Some(claim.0.encode()))])?;
+        Ok(claim)
+    }
+
+    /// The claim held in `store`, if one waits: made again as it was.
+    pub fn pending(store: &Store) -> Result<Option<Self>, ClaimError> {
+        let Some(mut row) = store.group_row(CLAIM_ROW)? else {
+            return Ok(None);
+        };
+        let held = Held::decode_exact(&row).ok_or(ClaimError::Corrupt);
+        row.zeroize();
+        Ok(Some(Claim(held?)))
+    }
+
+    /// The agent claimed, and its identity.
+    pub fn agent(&self) -> (u32, [u8; 32]) {
+        (self.0.agent, self.0.identity)
+    }
+
+    /// `Homes`' `claim(device, kit, agent)` at `home`, to prove in the
+    /// scope "home" ([`Prover::prove_home`]) with this device's secret
+    /// there. Its answer is the agent's id: then [`Claim::claimed`] once
+    /// the agent's log shows it. `Claimed` for this held claim means an
+    /// answer was lost and the agent may be assigned already: read its
+    /// log and call [`Claim::claimed`], never [`Claim::abandon`].
+    pub fn call(&self, home: &Home, expires_ms: u64) -> Result<Call, DeviceError> {
+        let mut arguments = self.0.device.encode();
+        self.0.kit.encode_to(&mut arguments);
+        self.0.agent.encode_to(&mut arguments);
+        let call = home.call("claim", arguments.clone(), expires_ms);
+        arguments.zeroize();
+        call
+    }
+
+    /// Drop the claim `Homes` refused (`Taken`, `PoolEmpty`, `KitTaken`):
+    /// the device prepares another, at the agent `pooled` answers then;
+    /// after `KitTaken`, with another kit, since the same key indexes the
+    /// same agent again.
+    pub fn abandon(self, store: &Store) -> Result<(), ClaimError> {
+        store.write_group_rows(vec![(CLAIM_ROW.to_vec(), None)])?;
+        Ok(())
+    }
+
+    /// The agent assigned: the device's group, from the agent's log
+    /// `entries` from its start (`Personal` at `instance`), its `R` the
+    /// kit's from the assignment's entry; the claim's row deleted. Again
+    /// after a crash, the group already made is taken.
+    pub fn claimed(
+        self,
+        store: &Store,
+        instance: InstanceId,
+        entries: &[(u64, Entry)],
+        now: u64,
+    ) -> Result<DeviceGroup, ClaimError> {
+        let signing: Vec<[u8; 32]> = self.0.keys.iter().map(|key| key.signing).collect();
+        let since = entries
+            .iter()
+            .find(|(_, entry)| matches!(&entry.body, Body::Assigned { device: 0, kit } if *kit == signing))
+            .map(|(index, _)| *index)
+            .ok_or(ClaimError::Unassigned)?;
+        let agent = Agent {
+            identity: self.0.identity,
+            instance,
+        };
+        let mut group = match DeviceGroup::open(store)? {
+            Some(group) => group,
+            None => DeviceGroup::create(
+                store,
+                agent,
+                self.0.device.clone(),
+                self.0.keys.clone(),
+                now,
+            )?,
+        };
+        group.set_recovery(since, self.0.r)?;
+        store.write_group_rows(vec![(CLAIM_ROW.to_vec(), None)])?;
+        Ok(group)
+    }
+}
 
 /// The device's nullifier in `Homes`' scope: the home's `space`, `Homes`'
 /// `agent` and `instance`.

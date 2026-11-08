@@ -306,13 +306,36 @@ impl Space {
         self.claim_with(nullifier(n), claimant(n), kit_of(n))
     }
 
+    /// A device's claim: of the agent its nullifier holds, as a device
+    /// retrying its claim names the agent it sealed its kit to, else of
+    /// the lowest pooled.
     fn claim_with(
         &mut self,
         nullifier: [u8; 32],
         device: NewDevice,
         kit: Kit,
     ) -> Result<u32, HomesError> {
-        answer(&self.proven(nullifier, "claim", (device, kit)).outcome)
+        let agent = match self.found(nullifier) {
+            Some(agent) => agent,
+            // Agent 0 is never stocked here, so naming it meets an empty
+            // pool.
+            None => self.query::<Option<u32>>(HOMES, "pooled", ()).unwrap_or(0),
+        };
+        self.claim_of(nullifier, device, kit, agent)
+    }
+
+    fn claim_of(
+        &mut self,
+        nullifier: [u8; 32],
+        device: NewDevice,
+        kit: Kit,
+        agent: u32,
+    ) -> Result<u32, HomesError> {
+        answer(
+            &self
+                .proven(nullifier, "claim", (device, kit, agent))
+                .outcome,
+        )
     }
 
     fn renew(&mut self, nullifier: [u8; 32], agent: u32) -> Result<(), HomesError> {
@@ -496,10 +519,25 @@ fn a_double_claim_is_refused() {
         space.claim_with(nullifier(4), claimant(4), kit_key_twice),
         Err(HomesError::Malformed)
     );
+    assert_eq!(
+        space.claim_of(nullifier(4), claimant(4), kit_of(4), first),
+        Err(HomesError::Taken),
+        "an agent another claim took"
+    );
+    assert_eq!(
+        space.claim_of(nullifier(4), claimant(4), kit_of(4), 9_999),
+        Err(HomesError::Taken),
+        "an agent never stocked"
+    );
     assert_eq!(space.claim(4), Ok(first + 1));
     assert_eq!(
+        space.claim_of(nullifier(5), claimant(5), kit_of(5), first + 2),
+        Ok(first + 2),
+        "any pooled agent, not only the lowest"
+    );
+    assert_eq!(
         space.operate::<u32, HomesError>(HOMES, "stock", vec![first, first + 2]),
-        Ok(1),
+        Ok(0),
         "stocked again, left as they are"
     );
     let many: Vec<u32> = (1000..1257).collect();
@@ -525,9 +563,9 @@ fn a_double_claim_is_refused() {
     assert_eq!(
         space.tally(),
         Counts {
-            pooled: 1,
+            pooled: 0,
             claimed: 0,
-            assigned: 2,
+            assigned: 3,
         }
     );
 }

@@ -79,6 +79,10 @@ pub enum HomesError {
     /// Not the proof of a member's pseudonym.
     #[codec(index = 9)]
     Anonymous,
+    /// The agent named is not pooled: another claim took it, or it never
+    /// was. The device seals its kit to the agent `pooled` answers now.
+    #[codec(index = 10)]
+    Taken,
 }
 
 /// A page of the pool's agents by id, from after the last one asked:
