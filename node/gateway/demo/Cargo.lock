@@ -2131,7 +2131,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.58.0",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -3972,13 +3972,14 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s4-credential"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=24ba52b341fc166ae5f780c3db9c631eb9373173#24ba52b341fc166ae5f780c3db9c631eb9373173"
+source = "git+https://codeberg.org/Virto/s4?rev=5101eaad8a39756a738c8e2a7d95756f26b52382#5101eaad8a39756a738c8e2a7d95756f26b52382"
 dependencies = [
  "getrandom 0.2.17",
  "hex",
  "libc",
  "russh",
- "s4-protocol 0.1.0 (git+https://codeberg.org/Virto/s4?rev=24ba52b341fc166ae5f780c3db9c631eb9373173)",
+ "s4-credential-contract",
+ "s4-protocol 0.1.0 (git+https://codeberg.org/Virto/s4?rev=5101eaad8a39756a738c8e2a7d95756f26b52382)",
  "serde",
  "sha2 0.10.9",
  "tokio",
@@ -3990,9 +3991,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "s4-credential-contract"
+version = "0.1.0"
+source = "git+https://codeberg.org/Virto/s4?rev=5101eaad8a39756a738c8e2a7d95756f26b52382#5101eaad8a39756a738c8e2a7d95756f26b52382"
+dependencies = [
+ "hex",
+ "s4-protocol 0.1.0 (git+https://codeberg.org/Virto/s4?rev=5101eaad8a39756a738c8e2a7d95756f26b52382)",
+ "serde",
+ "zeroize",
+]
+
+[[package]]
 name = "s4-protocol"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=24ba52b341fc166ae5f780c3db9c631eb9373173#24ba52b341fc166ae5f780c3db9c631eb9373173"
+source = "git+https://codeberg.org/Virto/s4?rev=5101eaad8a39756a738c8e2a7d95756f26b52382#5101eaad8a39756a738c8e2a7d95756f26b52382"
 dependencies = [
  "base64",
  "ciborium",
@@ -4734,7 +4746,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0136791f7c95b1f6dd99f9cc786b91bb81c3800b639b3478e561ddb7be95e5f1"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.3",
  "windows-sys 0.61.2",
@@ -5244,7 +5256,7 @@ dependencies = [
  "hmac 0.12.1",
  "russh",
  "s4-credential",
- "s4-protocol 0.1.0 (git+https://codeberg.org/Virto/s4?rev=24ba52b341fc166ae5f780c3db9c631eb9373173)",
+ "s4-protocol 0.1.0 (git+https://codeberg.org/Virto/s4?rev=5101eaad8a39756a738c8e2a7d95756f26b52382)",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
