@@ -1642,6 +1642,19 @@ pseudonym, answering in 54–71 ms, one pseudonym every round [measured,
 Fairphone 6, 2026-11-01]. Within the 1.0 s, 1 GiB and 1.5 MiB budgets
 (the memory's target, 768 MiB, too).
 
+**The stock kernels at release, PG1′ and PG2′:** `vos-phone run` on the
+`auth` and `owner` kernels' release artifacts, format 46, automatic
+threads (4), three rounds of five: `auth` 615.6 ms (the rounds' medians
+613.7–629.8 ms, the 95th percentile 664–681 ms), peak resident ≤ 505 MiB,
+proofs 875,530–881,437 bytes; `owner` 351.8 ms (351.4–362.4 ms, the 95th
+percentile 382–415 ms), ≤ 337 MiB, 851,494–856,567 bytes. Every proof
+verified on the phone and again on x86; the seeded build's proofs equal
+the x86 run's byte for byte. Three sign-ins proved on the phone
+(646–665 ms, ~400 MiB) were run by the node's ingress as the member's
+pseudonym, answering in 61–68 ms [measured, Fairphone 6, 2026-11-08].
+PG1′ (≤ 0.5 s, ≤ 512 MiB) and PG2′ at format 46 (≤ 1.0 s, ≤ 1 GiB,
+≤ 1.5 MiB) pass.
+
 **What brought it there,** each lever measured on the phone (the auth
 statement over the credential actor's Poseidon2 tree, masked, blowup 4,
 47 queries, PoW 16, automatic threads, the median) [measured, Fairphone

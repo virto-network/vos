@@ -181,6 +181,11 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
 ### M1 acceptance
 - `ci-full`, the checker loop, PG1′ and PG2′ on format 46, PG3′'s P1 flows
   on the clearnet (S8-P2). Fable.
+- **Result so far** (2026-11-08): `ci-full` and the checker loop (seeds
+  7901–7912, the cuts in full) pass at vos-core `113eb9499`. PG1′ and PG2′
+  pass on the Fairphone 6: `owner` 351.8 ms and ≤ 337 MiB, `auth`
+  615.6 ms, ≤ 505 MiB and ≤ 0.88 MB, each phone-made sign-in run at the
+  node's ingress (`proving.md` §8). PG3′'s P1 flows are still to run.
 
 ## M2 — The levers in the device format (5.5–8 weeks with two implementers; parallel)
 
