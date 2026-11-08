@@ -22,7 +22,7 @@ use crate::phone::Touch;
 /// A home claimed by phone 1 with the kit of `keys`, `count - 1` more
 /// phones paired, every phone seasoned and seen, the notes actor
 /// installed on each and its scope tracked: the claim's split too.
-fn household_with(count: u8, keys: Vec<KitKey>) -> (Home, Vec<Phone>, Split) {
+pub(super) fn household_with(count: u8, keys: Vec<KitKey>) -> (Home, Vec<Phone>, Split) {
     let homes = SigningKey::from_bytes(&[0x50; 32]);
     let mut home = Home::new(&homes, policy());
     let mut phones: Vec<Phone> = (1..=count).map(Phone::new).collect();
@@ -73,13 +73,13 @@ fn state(home: &Home, reader: [u8; 32], index: u64) -> OpState {
 }
 
 /// The `R` `phone` holds.
-fn r_of(phone: &mut Phone) -> [u8; 32] {
+pub(super) fn r_of(phone: &mut Phone) -> [u8; 32] {
     phone.group().archive().recovery.as_ref().unwrap().r
 }
 
 /// Each phone's archive read and pushed, then its recovery envelopes, in
 /// turn, twice: what a sync round does.
-fn sync_keys(home: &mut Home, phones: &mut [Phone]) {
+pub(super) fn sync_keys(home: &mut Home, phones: &mut [Phone]) {
     for _ in 0..2 {
         for phone in phones.iter_mut() {
             with(home, phone, &[], |sync| sync.archive()).unwrap();
@@ -90,7 +90,7 @@ fn sync_keys(home: &mut Home, phones: &mut [Phone]) {
 
 /// The recovery scope's envelopes the kit `key` reads: those after its
 /// kit's last re-seal.
-fn kit_reads(home: &Home, key: &KitSecret) -> Vec<Envelope> {
+pub(super) fn kit_reads(home: &Home, key: &KitSecret) -> Vec<Envelope> {
     home.query(key.key().signing, "since", (RECOVERY, 0u64).encode())
         .unwrap()
 }
@@ -162,7 +162,7 @@ fn restart(home: &Home, restored: &mut Phone, split: &Split, next: &KitSecret) {
 
 /// Notes set on each phone, pushed, and the keys pushed to the recovery
 /// scope: what a restore reads back.
-fn written(home: &mut Home, phones: &mut [Phone]) {
+pub(super) fn written(home: &mut Home, phones: &mut [Phone]) {
     for (n, phone) in phones.iter_mut().enumerate() {
         set(&phone.light, NOTES, n as u64, 10 + n as u64);
         with(home, phone, &[NOTES], |sync| sync.push(NOTES)).unwrap();

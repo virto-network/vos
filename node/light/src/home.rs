@@ -216,21 +216,46 @@ impl Claim {
         if holds_archive(store)? || store.group_row(CLAIM_ROW)?.is_some() {
             return Err(ClaimError::Held);
         }
+        let claim = Self::draw(device, keys, agent, identity)?;
+        store.write_group_rows(vec![claim.row()])?;
+        Ok(claim)
+    }
+
+    /// A claim of `agent` for `device` with the kit of `keys`, `R` split
+    /// there, not yet held.
+    pub(crate) fn draw(
+        device: NewDevice,
+        keys: Vec<KitKey>,
+        agent: u32,
+        identity: [u8; 32],
+    ) -> Result<Self, ClaimError> {
         let split = Split::draw(&keys, &identity).ok_or(ClaimError::Kit)?;
-        let claim = Claim(Held {
+        Ok(Claim(Held {
             device,
             kit: split.claim(),
             keys,
             r: *split.r(),
             agent,
             identity,
-        });
-        store.write_group_rows(vec![(CLAIM_ROW.to_vec(), Some(claim.0.encode()))])?;
-        Ok(claim)
+        }))
     }
 
-    /// The claim held in `store`, if one waits: made again as it was.
+    /// The claim's row, to hold it.
+    pub(crate) fn row(&self) -> (Vec<u8>, Option<Vec<u8>>) {
+        (CLAIM_ROW.to_vec(), Some(self.0.encode()))
+    }
+
+    /// The claim held in `store`, if one waits: made again as it was. A
+    /// move's claim is the move's ([`crate::moving::Move::pending`]).
     pub fn pending(store: &Store) -> Result<Option<Self>, ClaimError> {
+        if crate::moving::moving(store)? {
+            return Ok(None);
+        }
+        Self::held(store)
+    }
+
+    /// The claim held in `store`, a move's too.
+    pub(crate) fn held(store: &Store) -> Result<Option<Self>, ClaimError> {
         let Some(mut row) = store.group_row(CLAIM_ROW)? else {
             return Ok(None);
         };
@@ -268,10 +293,22 @@ impl Claim {
         Ok(())
     }
 
+    /// The log index of the entry assigning the agent to this claim, in
+    /// its log `entries` from its start.
+    pub(crate) fn assigned(&self, entries: &[(u64, Entry)]) -> Result<u64, ClaimError> {
+        let signing: Vec<[u8; 32]> = self.0.keys.iter().map(|key| key.signing).collect();
+        entries
+            .iter()
+            .find(|(_, entry)| matches!(&entry.body, Body::Assigned { device: 0, kit } if *kit == signing))
+            .map(|(index, _)| *index)
+            .ok_or(ClaimError::Unassigned)
+    }
+
     /// The agent assigned: the device's group, from the agent's log
     /// `entries` from its start (`Personal` at `instance`), its `R` the
     /// kit's from the assignment's entry; the claim's row deleted. Again
-    /// after a crash, the group already made is taken.
+    /// after a crash, the group already made is taken; a group of another
+    /// agent is [`ClaimError::Held`].
     pub fn claimed(
         self,
         store: &Store,
@@ -279,18 +316,14 @@ impl Claim {
         entries: &[(u64, Entry)],
         now: u64,
     ) -> Result<DeviceGroup, ClaimError> {
-        let signing: Vec<[u8; 32]> = self.0.keys.iter().map(|key| key.signing).collect();
-        let since = entries
-            .iter()
-            .find(|(_, entry)| matches!(&entry.body, Body::Assigned { device: 0, kit } if *kit == signing))
-            .map(|(index, _)| *index)
-            .ok_or(ClaimError::Unassigned)?;
+        let since = self.assigned(entries)?;
         let agent = Agent {
             identity: self.0.identity,
             instance,
         };
         let mut group = match DeviceGroup::open(store)? {
-            Some(group) => group,
+            Some(group) if group.agent().identity == self.0.identity => group,
+            Some(_) => return Err(ClaimError::Held),
             None => DeviceGroup::create(
                 store,
                 agent,

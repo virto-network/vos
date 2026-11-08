@@ -37,6 +37,9 @@
 //! - **Memberships** ([`memberships`]): a new device enrolled in every
 //!   other space by another of the person's devices, each deferrable,
 //!   confirmed by its own proof; a retired one revoked.
+//! - **Moving home** ([`moving`]): an agent claimed at another home, a
+//!   new group there, the kit split anew, every node carried; the other
+//!   devices paired again, each carrying what the new home lacks.
 //! - **The recovery kit** ([`kit`]): a phrase or a security key's 32
 //!   bytes, the kit's signing and sealing keys, and `R = R1 ⊕ R2` split
 //!   across the kit and the agent.
@@ -100,6 +103,7 @@ mod kernel;
 pub mod kit;
 mod light;
 pub mod memberships;
+pub mod moving;
 pub mod pairing;
 mod path;
 pub mod personal;

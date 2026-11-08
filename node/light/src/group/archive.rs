@@ -3,7 +3,8 @@
 //! restore recovered, from which their scopes' ids still derive; every
 //! scope key of every confirmed epoch, a union indexed by epoch; and the
 //! recovery wrap key `R` (§3.5), with the ones this device drew that the
-//! control log has not named yet. A device keeps it in its store; a new
+//! control log has not named yet; and the sync keys of the devices of the
+//! groups a move left (§3.9), whose nodes the moved history holds. A device keeps it in its store; a new
 //! device receives it over the pairing channel; sealed under an epoch's
 //! archive key it travels to the agent, `R` with it and the drawn ones
 //! never. Archives that disagree keep every candidate key, and the AEAD
@@ -53,8 +54,8 @@ pub struct Recovery {
 /// The archive: the naming secret, the earlier groups' naming secrets, the
 /// scopes whose keys it records at each confirmed epoch, the keys, each
 /// `(epoch, scope)` with every candidate key archives disagreeing on, `R`
-/// once the claim drew it, and the `R`s this device drew that the log has
-/// not named yet.
+/// once the claim drew it, the `R`s this device drew that the log has not
+/// named yet, and the authors a move carried, in order.
 #[derive(Clone, PartialEq, Eq, Encode, Decode)]
 pub struct Archive {
     pub naming: [u8; 32],
@@ -63,6 +64,7 @@ pub struct Archive {
     pub keys: Vec<Keys>,
     pub recovery: Option<Recovery>,
     pub drawn: Vec<[u8; 32]>,
+    pub authors: Vec<[u8; 32]>,
 }
 
 impl std::fmt::Debug for Archive {
@@ -76,6 +78,7 @@ impl std::fmt::Debug for Archive {
                 &self.recovery.as_ref().map(|recovery| recovery.since),
             )
             .field("drawn", &self.drawn.len())
+            .field("authors", &self.authors.len())
             .finish_non_exhaustive()
     }
 }
@@ -93,6 +96,7 @@ impl Archive {
             keys: Vec::new(),
             recovery: None,
             drawn: Vec::new(),
+            authors: Vec::new(),
         })
     }
 
@@ -135,6 +139,19 @@ impl Archive {
         }
     }
 
+    /// Admit `author`, a sync key of a group a move left: its nodes, which
+    /// the devices carried, are read as the device set's.
+    pub fn carried(&mut self, author: [u8; 32]) {
+        if let Err(at) = self.authors.binary_search(&author) {
+            self.authors.insert(at, author);
+        }
+    }
+
+    /// Whether `author` is a sync key of a group a move left.
+    pub fn moved(&self, author: &[u8; 32]) -> bool {
+        self.authors.binary_search(author).is_ok()
+    }
+
     /// Track `scope`: its key is recorded at every confirmed epoch from now.
     pub fn track(&mut self, scope: Scope) {
         if let Err(at) = self.scopes.binary_search(&scope) {
@@ -158,11 +175,14 @@ impl Archive {
         self.merge_keys(other);
     }
 
-    /// `other`'s scopes, earlier naming secrets and keys merged in, its `R`
-    /// left out.
+    /// `other`'s scopes, earlier naming secrets, keys and carried authors
+    /// merged in, its `R` left out.
     pub fn merge_keys(&mut self, other: &Archive) {
         for naming in &other.previous {
             self.remember(*naming);
+        }
+        for author in &other.authors {
+            self.carried(*author);
         }
         for scope in &other.scopes {
             self.track(*scope);
@@ -250,8 +270,8 @@ impl Archive {
         }
     }
 
-    /// The scopes and keys of this archive that `other` lacks, with this
-    /// archive's naming secret and no `R`.
+    /// The scopes, keys and carried authors of this archive that `other`
+    /// lacks, with this archive's naming secret and no `R`.
     pub fn beyond(&self, other: &Archive) -> Archive {
         Archive {
             naming: self.naming,
@@ -282,12 +302,22 @@ impl Archive {
                 .collect(),
             recovery: None,
             drawn: Vec::new(),
+            authors: self
+                .authors
+                .iter()
+                .filter(|author| !other.moved(author))
+                .copied()
+                .collect(),
         }
     }
 
-    /// Whether it holds no earlier naming secret, no scope and no key.
+    /// Whether it holds no earlier naming secret, no scope, no key and no
+    /// carried author.
     pub fn is_empty(&self) -> bool {
-        self.previous.is_empty() && self.scopes.is_empty() && self.keys.is_empty()
+        self.previous.is_empty()
+            && self.scopes.is_empty()
+            && self.keys.is_empty()
+            && self.authors.is_empty()
     }
 
     /// The archive sealed under `key` with `nonce`: XChaCha20-Poly1305 over

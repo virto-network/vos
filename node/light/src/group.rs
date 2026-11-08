@@ -64,6 +64,7 @@ use vos_wire::personal::{
     Signer, Status, Vote, welcome_hash,
 };
 use vos_wire::{Decode, Encode};
+use zeroize::Zeroize;
 
 use crate::kit::{KitKey, Split};
 use crate::store::{Store, StoreError};
@@ -88,7 +89,11 @@ const CALLS: usize = 32;
 /// writers' views past its cursor it keeps to check.
 const MADE: usize = 16;
 const VIEWS: usize = 16;
+/// The MLS state's rows, under its generation: the number of groups the
+/// store left, so a device paired again from a group it is leaving keeps
+/// the old group's state beside its key package until it joins.
 const MLS: &[u8] = b"mls/";
+const GENERATION: &[u8] = b"g/generation";
 /// The log's chain through each entry read, by the next index: the views
 /// writers name are checked against it.
 const CHAINS: &[u8] = b"g/chain/";
@@ -792,11 +797,29 @@ impl Pairing {
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         Self::decode_exact(bytes)
     }
+
+    /// The personal agent it is of.
+    pub fn agent(&self) -> Agent {
+        self.agent
+    }
+
+    /// The key archive it hands over.
+    pub fn archive(&self) -> &Archive {
+        &self.archive
+    }
 }
 
 /// Whether `store` has a device group.
 pub(crate) fn grouped(store: &Store) -> Result<bool, StoreError> {
     Ok(store.group_row(STATE)?.is_some())
+}
+
+/// Whether two archives are one personal space's: the naming secret of
+/// either is the other's or one of its earlier groups'.
+pub(crate) fn same_space(one: &Archive, other: &Archive) -> bool {
+    one.naming == other.naming
+        || one.previous.contains(&other.naming)
+        || other.previous.contains(&one.naming)
 }
 
 /// A device's leaf credential at its add: its sync key and its admin key.
@@ -867,8 +890,28 @@ pub struct DeviceGroup {
     chains: Vec<(u64, [u8; 32])>,
 }
 
-fn namespace(store: &Store) -> Namespace {
-    Namespace::current(store.group_store(), MLS.to_vec())
+/// The generation of `store`'s MLS state.
+fn generation(store: &Store) -> Result<u32, GroupError> {
+    match store.group_row(GENERATION)? {
+        Some(bytes) => u32::decode_exact(&bytes).ok_or(GroupError::Corrupt),
+        None => Ok(0),
+    }
+}
+
+/// The MLS rows' prefix of `generation`.
+fn mls_prefix(generation: u32) -> Vec<u8> {
+    [MLS, &generation.to_be_bytes()[..]].concat()
+}
+
+/// The namespace of `store`'s MLS state, `ahead` generations on.
+fn namespace(store: &Store, ahead: u32) -> Result<Namespace, GroupError> {
+    let prefix = mls_prefix(generation(store)? + ahead);
+    Ok(Namespace::current(store.group_store(), prefix))
+}
+
+/// The namespace `store`'s MLS state is in.
+pub fn mls_namespace(store: &Store) -> Result<Namespace, GroupError> {
+    namespace(store, 0)
 }
 
 impl DeviceGroup {
@@ -915,7 +958,7 @@ impl DeviceGroup {
             views: Vec::new(),
             trust: Trust::Paired(Vec::new()),
         };
-        let mut mls = Mls::open(namespace(store), &credential(&me), BTreeMap::new())?;
+        let mut mls = Mls::open(namespace(store, 0)?, &credential(&me), BTreeMap::new())?;
         mls.create(now / 1000, rows(&state, None))?;
         Ok(Self {
             store: store.clone(),
@@ -929,11 +972,11 @@ impl DeviceGroup {
 
     /// A device about to be paired: its leaf's signing key drawn and a key
     /// package made, for the pairing device's add, at `now`.
+    /// A device of a group a move left makes it beside its group, under
+    /// the next generation, which its rejoin takes ([`DeviceGroup::rejoin`]).
     pub fn key_package(store: &Store, me: &NewDevice, now: u64) -> Result<Vec<u8>, GroupError> {
-        if store.group_row(STATE)?.is_some() {
-            return Err(GroupError::Grouped);
-        }
-        let mut mls = Mls::open(namespace(store), &credential(me), BTreeMap::new())?;
+        let ahead = u32::from(store.group_row(STATE)?.is_some());
+        let mut mls = Mls::open(namespace(store, ahead)?, &credential(me), BTreeMap::new())?;
         Ok(mls.key_package(now / 1000, BTreeMap::new())?)
     }
 
@@ -948,6 +991,27 @@ impl DeviceGroup {
         if store.scoped()? {
             return Err(GroupError::Scoped);
         }
+        Self::joined(store, me, pairing)
+    }
+
+    /// A device of a group a move left joining the moved group from
+    /// `pairing`, once it left its own ([`crate::moving::rejoin`]): as
+    /// [`DeviceGroup::join`], for a store whose scopes the pairing's naming
+    /// secrets name (the same personal space), its archive's keys and
+    /// carried authors kept beside the pairing's.
+    pub fn rejoin(store: &Store, me: NewDevice, mut pairing: Pairing) -> Result<Self, GroupError> {
+        if store.group_row(STATE)?.is_some() {
+            return Err(GroupError::Grouped);
+        }
+        let mine = store.archive()?;
+        if !same_space(&pairing.archive, &mine) {
+            return Err(GroupError::Scoped);
+        }
+        pairing.archive.merge_keys(&mine);
+        Self::joined(store, me, pairing)
+    }
+
+    fn joined(store: &Store, me: NewDevice, pairing: Pairing) -> Result<Self, GroupError> {
         let Pairing {
             agent,
             next,
@@ -987,7 +1051,7 @@ impl DeviceGroup {
             views: Vec::new(),
             trust: Trust::Paired(checkpoints),
         };
-        let mut mls = Mls::open(namespace(store), &credential(&me), BTreeMap::new())?;
+        let mut mls = Mls::open(namespace(store, 0)?, &credential(&me), BTreeMap::new())?;
         mls.write(rows(&state, Some(&archive)))?;
         Ok(Self {
             store: store.clone(),
@@ -1078,7 +1142,7 @@ impl DeviceGroup {
             views: Vec::new(),
             trust: Trust::Acknowledged,
         };
-        let mut mls = Mls::open(namespace(store), &credential(&me), BTreeMap::new())?;
+        let mut mls = Mls::open(namespace(store, 0)?, &credential(&me), BTreeMap::new())?;
         mls.create(read.time / 1000, rows(&state, Some(&archive)))?;
         Ok(Self {
             store: store.clone(),
@@ -1096,7 +1160,11 @@ impl DeviceGroup {
             return Ok(None);
         };
         let state = State::decode_exact(&bytes).ok_or(GroupError::Corrupt)?;
-        let mls = Mls::open(namespace(store), &credential(&state.me), BTreeMap::new())?;
+        let mls = Mls::open(
+            namespace(store, 0)?,
+            &credential(&state.me),
+            BTreeMap::new(),
+        )?;
         Ok(Some(Self {
             store: store.clone(),
             mls,
@@ -1195,6 +1263,36 @@ impl DeviceGroup {
         let writes = self.writes(true);
         self.mls.write(writes)?;
         Ok(split)
+    }
+
+    /// Leave this group for good, its scopes' data kept: its state, its MLS
+    /// state, the log's chains it kept and every row of its sealed sync
+    /// deleted in one batch, with the archive kept without `R` and the `R`s
+    /// drawn (another agent's split is another `R`), every device of the
+    /// set recorded in it as a carried author, and the MLS state's
+    /// generation the next. A move's (`crate::moving`).
+    pub(crate) fn leave(self) -> Result<(), GroupError> {
+        let mut archive = self.archive.shareable();
+        if let Some(mut recovery) = archive.recovery.take() {
+            recovery.r.zeroize();
+        }
+        for (_, sync) in self.sync_keys() {
+            archive.carried(sync);
+        }
+        let generation = generation(&self.store)?;
+        let mut rows = vec![
+            (STATE.to_vec(), None),
+            (crate::store::ARCHIVE_ROW.to_vec(), Some(archive.encode())),
+            (GENERATION.to_vec(), Some((generation + 1).encode())),
+        ];
+        let mls = mls_prefix(generation);
+        for prefix in [CHAINS, &mls[..], crate::personal::SYNC_ROWS] {
+            for (key, _) in self.store.group_rows(prefix, None)? {
+                rows.push((key, None));
+            }
+        }
+        self.store.write_group_rows(rows)?;
+        Ok(())
     }
 
     /// A recovered group's archive taken in: its naming secret one of the

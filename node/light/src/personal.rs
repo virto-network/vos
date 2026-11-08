@@ -33,6 +33,10 @@
 //! - **Reading back** ([`read_back`]): a restored device reading a scope
 //!   of the agent it restored at with the archive it recovered, before any
 //!   group of its own.
+//! - **Carrying** ([`SealedSync::carry`]): every node of a scope the agent
+//!   lacks, pushed in causal order: a move's to its new home, and a device
+//!   paired again there carrying what the move did not; and the notice a
+//!   move leaves at the home it left ([`SealedSync::announce`]).
 //! - **Tor only** (E17): a link names its [`Route`], and every request is
 //!   refused before it leaves unless the route is the onion, so the light
 //!   node has no clearnet route for any kind addressed to the personal
@@ -62,8 +66,10 @@ use crate::sealed::{self, Body, MAX_BODY, OpenError, View};
 use crate::sync::{Blake2b256, Held, Quarantined};
 use merkle_crdt::Hasher as _;
 
+mod carry;
 mod checkpoint;
 
+pub use carry::Carried;
 pub use checkpoint::{Acknowledging, checkpoint_hash};
 
 /// The envelopes a push sends in one round trip, in flight at once.
@@ -75,6 +81,10 @@ const WAKES: usize = 8;
 /// The name the archive's scope derives from, apart from every instance's
 /// (four bytes).
 pub const ARCHIVE_NAME: &[u8] = b"vos/personal/archive";
+
+/// The prefix of every row of sealed sync with one agent, in the group
+/// keyspace: a move deletes them all.
+pub(crate) const SYNC_ROWS: &[u8] = b"s/";
 
 /// The rows of the archive's and the recovery scope's reading, in the
 /// group keyspace: each one's cursor and the epoch read or pushed there.
@@ -632,6 +642,10 @@ impl<'a, L: Link> SealedSync<'a, L> {
         self.group
     }
 
+    pub(crate) fn light(&self) -> &Light {
+        self.light
+    }
+
     /// The link, for a request: refused unless it still reaches the agent
     /// through the onion.
     fn link(&mut self) -> Result<&mut L, SyncError<L::Error>> {
@@ -1006,7 +1020,10 @@ impl<'a, L: Link> SealedSync<'a, L> {
             return Ok(Err(Unusable::Body));
         };
         let within = match self.group.author(&header.author.0) {
-            None => false,
+            // A device of a group a move left: its nodes reach the agent
+            // carried by the devices of the set, which carry none past
+            // the cutoffs they hold.
+            None => self.group.archive().moved(&header.author.0),
             Some((_, false)) => true,
             Some((device, true)) => {
                 let frontier = match scan.frontiers.entry(device) {
