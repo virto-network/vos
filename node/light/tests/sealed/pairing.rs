@@ -547,3 +547,104 @@ fn the_yearly_prompt_renews_the_leaf() {
         assert_eq!(phone.group().confirmed(), before + 1);
     }
 }
+
+/// The claim with a phrase and a security key: held in the store across a
+/// restart until the agent's log shows its assignment, then the device's
+/// group starts with both kit keys and `R` the kit's; the recovery
+/// envelopes it pushes open under that `R` with either kit's `R1`.
+#[test]
+fn a_claim_with_a_phrase_and_a_security_key_starts_the_group() {
+    let homes = SigningKey::from_bytes(&[0x50; 32]);
+    let mut home = Home::new(&homes, policy());
+    let phone = Phone::new(1);
+    let phrase = vos_light::kit::KitSecret::phrase().unwrap();
+    let keys = vec![phrase.key(), kit_key(0)];
+    let claim = Claim::prepare(
+        &phone.store,
+        phone.keys.clone(),
+        keys.clone(),
+        7,
+        home.identity,
+    )
+    .unwrap();
+    assert!(matches!(
+        Claim::prepare(
+            &phone.store,
+            phone.keys.clone(),
+            keys.clone(),
+            7,
+            home.identity
+        ),
+        Err(ClaimError::Held)
+    ));
+    assert!(matches!(
+        Claim::prepare(
+            &Phone::new(2).store,
+            phone.keys.clone(),
+            Vec::new(),
+            7,
+            home.identity
+        ),
+        Err(ClaimError::Kit)
+    ));
+    let call = claim.call(&home_space(&home), home.now + 60_000).unwrap();
+    assert_eq!(call.method, vos_light::method_id("claim"));
+    drop(claim);
+
+    // Again after a restart, the same claim.
+    let claim = Claim::pending(&phone.store).unwrap().expect("held");
+    assert_eq!(claim.agent(), (7, home.identity));
+    let call_again = claim.call(&home_space(&home), call.expires_ms).unwrap();
+    assert_eq!(call_again.arguments, call.arguments, "the same claim again");
+    let (device, kit, agent): (vos_wire::personal::NewDevice, vos_wire::personal::Kit, u32) =
+        vos_wire::Decode::decode_exact(&call.arguments).unwrap();
+    assert_eq!((device, agent), (phone.keys.clone(), 7));
+    let early = home.log(phone.sync_key(), 0).unwrap_or_default();
+    assert!(matches!(
+        Claim::pending(&phone.store).unwrap().unwrap().claimed(
+            &phone.store,
+            PERSONAL,
+            &early,
+            home.now
+        ),
+        Err(ClaimError::Unassigned)
+    ));
+    // The home assigns the agent, as `Homes`' claim does through
+    // `Personal`.
+    home.call(&homes, "assign", (phone.keys.clone(), kit.clone()).encode())
+        .answer::<Recorded>()
+        .unwrap();
+    let entries = home.log(phone.sync_key(), 0).unwrap();
+    let mut phone = phone;
+    let group = claim
+        .claimed(&phone.store, PERSONAL, &entries, home.now)
+        .unwrap();
+    assert!(Claim::pending(&phone.store).unwrap().is_none());
+    assert!(group.holds_recovery());
+    assert_eq!(group.kit(), &keys[..]);
+    for (secret, entry) in [
+        phrase,
+        vos_light::kit::KitSecret::security_key(&mut crate::phone::Touch(0x4b)).unwrap(),
+    ]
+    .iter()
+    .zip(&kit.entries)
+    {
+        let r1 = secret.open_r1(entry, &home.identity).expect("its R1 opens");
+        let r = vos_light::kit::join(&r1, &kit.r2);
+        assert_eq!(
+            vos_wire::personal::r_hash(&r),
+            vos_wire::personal::r_hash(
+                group
+                    .archive()
+                    .recovery
+                    .as_ref()
+                    .map(|recovery| &recovery.r)
+                    .unwrap()
+            )
+        );
+    }
+    phone.group = Some(group);
+    phone.read(&mut home);
+    assert_eq!(phone.group().id(), Some(0));
+    assert!(home::holds_archive(&phone.store).unwrap());
+}
