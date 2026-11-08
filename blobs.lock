@@ -7,7 +7,7 @@ c3a8803233b1cf1b4d1b0b6a00bbe76579da098722a6cec27e666d38ecb20555  target/riscv64
 725f2116245b49fd2942726cfce18c55abb648a7629389b54c653c4cc9737f57  agent/programs/target/riscv64em-vos/release/vos-agent.elf
 7b88fe03e7dc51c7bea81bf26a16318199457e64e2b01210122655b53cca46a3  agent/programs/target/riscv64em-vos/release/vos-representative.elf
 9521f1316779511733359cdf87814270680f35009a3f904d52106869aa49078f  agent/programs/target/riscv64em-vos/release/vos-credentials.elf
-318bb4160cb09050210cae1c4ea6f9f712ae1796d1dc41185e16802e8a9dbb70  agent/programs/target/riscv64em-vos/release/vos-personal.elf
+9fdcc1b2d83e296606f79f1df4d67f191b8adfe6a7e458bdc84f10c14712e741  agent/programs/target/riscv64em-vos/release/vos-personal.elf
 6f6192d31c62c9ba165124d8cedcea3d3642421e48d31b42c815264631753250  agent/programs/target/riscv64em-vos/release/vos-payments.elf
 ba73e499be0b59d6c21fdedbfae4fc3c806481baf767a94ca0fc05a163947ebf  agent/programs/target/riscv64em-vos/release/vos-homes.elf
 15bd949fcfae1aaa4887797c9bd4c13472edc55117cfff29a4487721cbbb0817  agent/programs/target/riscv64em-vos/release/vos-credential-book.elf
@@ -36,7 +36,7 @@ ddf85b7a834ec6f5a78f3023c626eedc35a40bcb6daf33b3f9d3efb38f6b7819  agent/test-act
 81971c2340227caf65599583a67a38b985f2073895237f2995198d83684b020f  agent/test-actors/target/riscv64em-vos/release/lean.elf
 5733edd3e1d8b1ae5060970c8c88974256653c6b373ee35c11f25bc93fac28f9  agent/test-actors/target/riscv64em-vos/release/ledger.elf
 c5187e4249e7196c0e2f32d363af53e8057066dda6f2b8b67dc30aef77a9c806  agent/test-actors/target/riscv64em-vos/release/notes.elf
-ca288394ee7df528e16484342b3dece941fb0b0ebcb4e8d3eb5739208f09c08a  agent/test-actors/target/riscv64em-vos/release/personal-next.elf
+493f149d63b0151df059049f0d38c35624a62862ce5b16c4cd7b5c274a6c4a2e  agent/test-actors/target/riscv64em-vos/release/personal-next.elf
 13410e3dc1b02f7a40133a6890597a902fcc68b7caff21b51632c73f939fb8fc  agent/test-actors/target/riscv64em-vos/release/poll.elf
 3e48a9aae9ea5a455725beb6339f2f07bdc1a780caa89c01e75a98b95cf2c190  agent/test-actors/target/riscv64em-vos/release/reader.elf
 3d650786c3daec44a34a1509b59c61a4e29c557850e61c7b055b74d51d5279ab  agent/test-actors/target/riscv64em-vos/release/roomy.elf
