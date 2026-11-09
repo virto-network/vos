@@ -1734,7 +1734,12 @@ pays (`open.md`):
   proving at four threads 231 → 211 ms (auth) and 135 → 128 ms (owner),
   peak −5%, proofs −6.5% [measured, x86 dev machine (Intel Core Ultra 7
   155H, loaded by other work, automatic threads too noisy to read),
-  2026-11-09]. Format 47 takes it beside word-level memory;
+  2026-11-09]. On the Pixel 1 at automatic threads, one round of five,
+  each cell's proofs verified there and on x86: auth 1,463 → 1,406 ms
+  (−3.9%), 439 → 418 MiB, 879,737 → 820,480 bytes; owner 844 → 825 ms
+  (−2.3%), 286 → 292 MiB, 858,350 → 798,408 bytes [measured, Pixel 1,
+  2026-11-09]: on that phone the time falls less than the cells. Format
+  47 takes it beside word-level memory;
 - **word-level memory:** −17% of the auth kernel's cells, its memory
   ledger byte-level at 2^14 rows for 1,722 steps; −26% beside the
   per-program CPU.
