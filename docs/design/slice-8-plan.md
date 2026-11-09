@@ -4,7 +4,7 @@
 is `light-node.md`; this file orders it into milestones, steps, gates and
 estimates, and places what slice 7 carried.
 
-- **Status:** the steps take the owner's decisions E1–E27
+- **Status:** the steps take the owner's decisions E1–E29
   (`light-node.md` §1.1) and the answers of its §9.1; no question is
   open.
 - **Precondition:** slice 7's cleanup before master: the code and the

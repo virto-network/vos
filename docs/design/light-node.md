@@ -8,7 +8,7 @@ for every device statement, payments rebuilt on cipher-clerk as the
 showcase of attestable Rust, and clients reaching a space over Tor.
 - **Status:** everything here is [proposed], to be built as stated,
   unless tagged [decided] (an owner decision, listed in §1.1 by its
-  number, E1–E27, or cited from another document) or [built] (what
+  number, E1–E29, or cited from another document) or [built] (what
   `vos-core` holds at `543c05e07`).
 - **Numbers** carry their tag: [measured] (a run, cited), [model] (the
   cell model, `proving.md` §8), [est] (arithmetic on those, unmeasured).
@@ -78,6 +78,8 @@ devices decrypt each other's messages".
 | E25 | 8.25's flood measurement over live Tor runs on a private Tor test network (chutney) at M5's acceptance, a lighter run accepted. |
 | E26 | A scheduling decision (phone sessions), not recorded here. |
 | E27 | M3's and M4's acceptances run together: one `ci-full`, one carrier audit, one Fable review; M5's phone runs may fold into S8-P7. |
+| E28 | A joining device's open claim at a home-only space is made by the background job after a random drawn delay from its add, never at the pairing, so the home's operators cannot link the new member to the agent by its time. |
+| E29 | A device's admin key is replaced (`admin(d, new key)`) on the kit's signature or another seasoned active device's; the new key's 72 h probation stands either way. |
 
 ### 1.2 Goals
 
