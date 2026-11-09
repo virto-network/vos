@@ -22,7 +22,7 @@ use s4_credential::api::Gateway;
 use s4_credential::chrome::{Answer, Chrome, Form};
 use s4_credential::enrollment::Store;
 use s4_credential::source::{BoxFuture, Kind, Output, Reference, Source, SourceError};
-use s4_credential::{Facility, Session, Stock};
+use s4_credential::{Facility, Operation, Session, Stock};
 use s4_protocol::{Message, Value};
 use vos_gateway_demo::{LocalSpace, host_key, local, random};
 
@@ -265,9 +265,14 @@ impl Headless {
                         ])),
                         None => {
                             let session = self.session.as_ref().expect("granted");
-                            session
-                                .call(call.operation.as_str(), &call.args, &*self.user)
-                                .await
+                            match Operation::read(call.operation.as_str(), &call.args) {
+                                Ok(operation) => session
+                                    .call(operation, &*self.user)
+                                    .await
+                                    .map(|outcome| outcome.to_value())
+                                    .map_err(Into::into),
+                                Err(refusal) => Err(refusal.into()),
+                            }
                         }
                     };
                     self.send(Message::FacilityResult(s4_protocol::FacilityResult {
