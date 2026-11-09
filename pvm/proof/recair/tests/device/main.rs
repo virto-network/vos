@@ -10,5 +10,6 @@ mod cpu;
 mod format;
 mod gates;
 mod leakage;
+mod memory;
 mod program;
 mod support;
