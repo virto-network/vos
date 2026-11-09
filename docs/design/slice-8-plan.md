@@ -4,7 +4,7 @@
 is `light-node.md`; this file orders it into milestones, steps, gates and
 estimates, and places what slice 7 carried.
 
-- **Status:** the steps take the owner's decisions E1–E23
+- **Status:** the steps take the owner's decisions E1–E27
   (`light-node.md` §1.1) and the answers of its §9.1; no question is
   open.
 - **Precondition:** slice 7's cleanup before master: the code and the
@@ -326,7 +326,8 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
 
 ### M3 acceptance
 - `ci-full`, 8.15's gate, 8.13's property tests, the carrier audit over
-  `Personal`'s logs. Fable.
+  `Personal`'s logs. Fable. Run together with M4's (E27): one `ci-full`,
+  one carrier audit over both milestones' logs, one Fable review.
 
 ## M4 — The personal space on devices
 
@@ -492,7 +493,8 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
 ### M4 acceptance
 - `ci-full`, PG3′'s personal-space flows and PG6 on the clearnet (S8-P5),
   8.21's model test, the carrier audit over the light node's and the
-  agent's logs. Fable.
+  agent's logs. Fable. Combined with M3's (E27); M5's phone runs may
+  fold into S8-P7.
 
 ## M5 — Tor (stream E)
 

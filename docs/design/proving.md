@@ -1674,6 +1674,12 @@ the x86 run's byte for byte. Three sign-ins proved on the phone
 pseudonym, answering in 61–68 ms [measured, Fairphone 6, 2026-11-08].
 PG1′ (≤ 0.5 s, ≤ 512 MiB) and PG2′ at format 46 (≤ 1.0 s, ≤ 1 GiB,
 ≤ 1.5 MiB) pass.
+A second device, the Pixel 1 (LineageOS, Android 15, four threads), one
+round of five on the same artifacts: `auth` 1,532 ms (the 95th percentile
+1,589 ms), ≤ 441 MiB, 880,128 bytes; `owner` 817 ms (837 ms), ≤ 311 MiB;
+verified on the phone and on x86, the seeded build's proofs equal to
+x86's [measured, Pixel 1, 2026-11-09]. The gates are the Fairphone 6's;
+this is the floor of an older phone.
 
 **What brought it there,** each lever measured on the phone (the auth
 statement over the credential actor's Poseidon2 tree, masked, blowup 4,

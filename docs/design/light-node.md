@@ -8,7 +8,7 @@ for every device statement, payments rebuilt on cipher-clerk as the
 showcase of attestable Rust, and clients reaching a space over Tor.
 - **Status:** everything here is [proposed], to be built as stated,
   unless tagged [decided] (an owner decision, listed in §1.1 by its
-  number, E1–E23, or cited from another document) or [built] (what
+  number, E1–E27, or cited from another document) or [built] (what
   `vos-core` holds at `543c05e07`).
 - **Numbers** carry their tag: [measured] (a run, cited), [model] (the
   cell model, `proving.md` §8), [est] (arithmetic on those, unmeasured).
@@ -74,6 +74,10 @@ devices decrypt each other's messages".
 | E21 | The light node runs in its own `:vos` Android process behind Binder in slice 8, for crash isolation and background sync without the UI process. |
 | E22 | Tor is the light node's default transport for every space, with a per-space opt-out and a plain warning; anonymous (credentialed or proven) calls never leave the client over the clearnet in any space, enforced by the client and optionally by a space's ingress through the gateway's transport mark; a space may declare itself onion-only (the home is, E17); key-signed calls may use the clearnet where the space allows. Plain bridges in slice 8; obfs4 and Snowflake later. |
 | E23 | The gateway's onion serves only HTTP (plain inside the onion) and SSH, the clearnet's protocols; no raw node-API port. The light node speaks `vos-api` over SSH over the onion, whose relay set gains `Call` and `Credentialed`; the SSH handshake is paid once per kept-open connection. SSH over QUIC or a roaming transport later, when UDP over Tor exists. |
+| E24 | The device set records each admin key's attestation (a TEE key behind a strong biometric) and the verified-boot state; the chrome shows an unattested key or an unverified boot, without changing the device's admin class. |
+| E25 | 8.25's flood measurement over live Tor runs on a private Tor test network (chutney) at M5's acceptance, a lighter run accepted. |
+| E26 | A scheduling decision (phone sessions), not recorded here. |
+| E27 | M3's and M4's acceptances run together: one `ci-full`, one carrier audit, one Fable review; M5's phone runs may fold into S8-P7. |
 
 ### 1.2 Goals
 
