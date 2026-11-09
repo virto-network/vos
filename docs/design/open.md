@@ -54,9 +54,10 @@ The scale results are in `core-model.md` §14, "The scale test".
 
 ## Proving
 
-- **The device prover's next levers:** a per-program CPU (the CPU's
-  columns cut to the opcodes a kernel uses) and word-level memory. The
-  4-way CPU split by opcode family is not built.
+- **The device prover's next levers:** word-level memory, then format 47
+  taking it with the per-program CPU (built as a candidate, `Cpu::PerProgram`,
+  `proving.md` §8), measured on the phone. The per-program CPU for node
+  segments is later. The 4-way CPU split by opcode family is not built.
 - **Segment proving levers** (`proving.md` §9): the 36 cubic gates
   rewritten, narrow BLAKE2b chips, a lighter page boundary or one memory
   argument across segments, and folding device proofs (the recursion
