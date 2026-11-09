@@ -2866,8 +2866,9 @@ pushes, commits and device-set operations, and member calls) and
   below a node's verification budget, and malformed short ones fail their
   decode in microseconds. The pre-check refuses well-formed junk whose
   interaction PoW fails in about 0.02 ms; junk ground for its 8 bits
-  costs the node the decode and the composition (§4.3) [measured], and a
-  flood through Tor is measured in M5 (§6.6).
+  costs the node the decode and the composition (§4.3) [measured]; a flood
+  through Tor is bounded by Tor itself below the node's budget, measured on
+  a private Tor test network (§6.6).
 - **One SSH connection per isolation group** (§6.2), each authenticated by
   an SSH key drawn for that connection alone, so the gateway cannot join
   two groups by their SSH identity; the `vos-api` frames inside carry
@@ -3272,8 +3273,39 @@ node. A flood of junk proven calls the size of a device proof, from eight
 connections through a port capped this way, held at most the port's
 proven calls behind it, while a member's queries, a session's call and
 the member's own proven call on another connection were answered (the
-gateway's test 22, in process, no network). The flood through the
-live Tor network is not measured yet: M5 measures it.
+gateway's test 22, in process, no network).
+
+**The flood through Tor** [measured, x86 dev machine, chutney, 2026-11-09;
+`8.25f/spike/flood`, E25's private Tor test network]: a chutney network of
+four authorities and eight relays on loopback, the gateway's arti onion in
+process over it (full vanguards, descriptor published in about 0.3 s), and
+arti clients over the same network. Eight circuits flooded well-formed
+junk proofs (a device proof's valid claim for an enrolled member who never
+signs in, so each reaches a verification slot, with about 1 MB of corrupt
+proof bytes) while four to six members signed in on circuits of their own,
+against a no-flood baseline:
+- **The members were served throughout:** every sign-in ran (4/4 and 6/6
+  across runs), its pseudonym the node's. A sign-in took about 0.8 s with
+  no flood (p99 1.2 s) and 1.9–3.6 s under it (p50; p99 2.2–3.7 s), well
+  inside the 30 s a proven call is given.
+- **Tor bounded the flood below the node's budget on its own:** a 1 MB
+  proof through a three-hop circuit and one verification slot throttled the
+  junk to about 15 a second in aggregate through the onion, far below the
+  node's verification budget, so the gateway's per-connection, per-circuit
+  and global proven caps never had to shed a call (the in-process test 22
+  exercises those caps directly). Each junk was refused — the pre-check in
+  microseconds, a corrupt body at its decode — and the node's credential
+  stage averaged 9–11 ms a call under the load, as §4.3 reports. No member
+  sign-in was refused `Busy`, and the whole measurement process (node,
+  gateway, arti and the clients together) held under 1.2 GiB.
+- **What a private network does not show:** chutney's rendezvous is local,
+  so a sign-in's 0.8 s understates live Tor's about 5 s (§6.1) and its
+  descriptor publishes in seconds, not the tens live Tor can take; and
+  loopback bandwidth lets the junk flow faster than the live network
+  would, so the private run is a harder test of the node per junk proof
+  and a lighter one of Tor's latency and rendezvous. The caps and the C
+  tor sidecar remain the backstop should a live flood outrun the
+  bandwidth bound (§6.7, §9.1).
 
 ### 6.7 What Tor fixes, and what it does not
 

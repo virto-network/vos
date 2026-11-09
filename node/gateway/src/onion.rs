@@ -12,9 +12,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use arti_client::TorClient;
-use arti_client::config::TorClientConfigBuilder;
 use arti_client::config::onion_service::OnionServiceConfigBuilder;
+use arti_client::config::{CfgPath, TorClientConfigBuilder};
+use arti_client::{TorClient, TorClientConfig};
 use futures::StreamExt;
 use safelog::DisplayRedacted;
 use tor_cell::relaycell::msg::{Connected, End, EndReason};
@@ -43,26 +43,58 @@ pub struct Hosted {
 }
 
 /// arti's client, bootstrapped with full vanguards, its state and cache
-/// where the file names.
+/// where the file names, over the arti configuration it names.
 async fn client(
     onion: &config::Onion,
 ) -> Result<Arc<TorClient<tor_rtcompat::PreferredRuntime>>, String> {
-    use tor_config::ExplicitOrAuto;
-    use tor_guardmgr::VanguardMode;
     // rustls's provider, ring's as the gateway's TLS uses, before arti's
     // first TLS: an error is one installed already.
     let _ = rustls::crypto::ring::default_provider().install_default();
+    TorClient::create_bootstrapped(client_config(onion)?)
+        .await
+        .map_err(|error| format!("arti's bootstrap: {error}"))
+}
+
+/// arti's configuration: the file's arti configuration, if it names one,
+/// its state and cache, and full vanguards.
+fn client_config(onion: &config::Onion) -> Result<TorClientConfig, String> {
+    use tor_config::ExplicitOrAuto;
+    use tor_guardmgr::VanguardMode;
     let (Some(state), Some(cache)) = (&onion.state, &onion.cache) else {
         return Err("an onion in process needs its state and cache directories".into());
     };
-    let mut builder = TorClientConfigBuilder::from_directories(state, cache);
+    let mut builder = match &onion.arti {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            // A key arti does not recognize is refused, not ignored: a
+            // mis-spelled authority or network section would otherwise
+            // leave the compiled-in live-Tor directory in place.
+            let mut unknown = Vec::new();
+            let de = toml::Deserializer::parse(&text)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            let builder: TorClientConfigBuilder =
+                serde_ignored::deserialize(de, |key| unknown.push(key.to_string()))
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
+            if !unknown.is_empty() {
+                return Err(format!(
+                    "{}: keys arti does not know: {}",
+                    path.display(),
+                    unknown.join(", ")
+                ));
+            }
+            builder
+        }
+        None => TorClientConfigBuilder::default(),
+    };
+    builder
+        .storage()
+        .state_dir(CfgPath::new_literal(state))
+        .cache_dir(CfgPath::new_literal(cache));
     builder
         .vanguards()
         .mode(ExplicitOrAuto::Explicit(VanguardMode::Full));
-    let config = builder.build().map_err(|error| error.to_string())?;
-    TorClient::create_bootstrapped(config)
-        .await
-        .map_err(|error| format!("arti's bootstrap: {error}"))
+    builder.build().map_err(|error| error.to_string())
 }
 
 /// Launch the onion the file names, its streams served by `front`, on the
@@ -177,5 +209,72 @@ async fn circuit_streams(
         };
         let front = Arc::clone(&front);
         tokio::spawn(async move { front.serve(stream, circuit, port).await });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A private network's authorities and fallback, as a test network's
+    /// tooling writes them: they reach the built config, the file's own
+    /// directories and weakened vanguards do not, and a key arti does not
+    /// know is refused.
+    #[test]
+    fn an_arti_configuration_names_the_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("arti.toml");
+        let network = r#"
+[storage]
+state_dir = "/elsewhere/state"
+
+[vanguards]
+mode = "lite"
+
+[path_rules]
+ipv4_subnet_family_prefix = 33
+
+[address_filter]
+allow_local_addrs = true
+
+[[tor_network.fallback_caches]]
+rsa_identity = "A13FF5397B8F66EB7A7BA85A753DB4E8C812D2F0"
+ed_identity = "c3BCgjTnffMvOA2d1Ui1EtZgbDlOXAEoVoOU9m1bfFU"
+orports = ["127.0.0.1:5100"]
+
+[tor_network.authorities]
+v3idents = ["705B85A1A414461D2BA13FBA815BEB322FE45594"]
+uploads = [["127.0.0.1:7100"]]
+downloads = [["127.0.0.1:7100"]]
+votes = [["127.0.0.1:7100"]]
+"#;
+        std::fs::write(&path, network).unwrap();
+        let mut onion = config::Onion {
+            state: Some(dir.path().join("state")),
+            cache: Some(dir.path().join("cache")),
+            ..config::Onion::default()
+        };
+        let public = format!("{:?}", client_config(&onion).unwrap());
+        onion.arti = Some(path.clone());
+        let private = format!("{:?}", client_config(&onion).unwrap());
+        assert!(private.contains("705b85a1a414461d2ba13fba815beb322fe45594"));
+        assert!(private.contains("127.0.0.1:5100"));
+        assert!(!public.contains("705b85a1a414461d2ba13fba815beb322fe45594"));
+        let state = format!("{:?}", dir.path().join("state").display().to_string());
+        assert!(private.contains(&state));
+        assert!(
+            !private.contains("/elsewhere"),
+            "the file's directories apply"
+        );
+        assert!(
+            private.contains("Full"),
+            "full vanguards survive a file that asks for less"
+        );
+        // A key arti does not know is refused, not ignored.
+        std::fs::write(&path, format!("[tor-network]\n{network}")).unwrap();
+        assert!(client_config(&onion).unwrap_err().contains("does not know"));
+        // A file that cannot be read is refused.
+        onion.arti = Some(dir.path().join("none.toml"));
+        assert!(client_config(&onion).is_err());
     }
 }
