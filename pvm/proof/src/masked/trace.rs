@@ -173,7 +173,7 @@ pub fn masked_device_trace(
     )));
     let components: Vec<_> = chips
         .iter()
-        .map(|&chip| crate::device_component(chip))
+        .map(|&chip| crate::device_component(shape.memory, chip))
         .collect();
     let cpu = shape.program_cpu();
     side_note.cpu_rows_local = cpu.is_some();
@@ -218,16 +218,16 @@ pub fn masked_device_trace(
 }
 
 /// The preprocessed columns of a device program laid out as `layout`,
-/// `code` its kernel's side note (no run needed), at the shape `active`,
+/// `code` its kernel's side note (no run needed), at the shape `shape`,
 /// `log_sizes`: what its program id's preprocessed root commits.
 pub fn device_preprocessed(
     code: &SideNote,
     layout: &crate::device::DeviceLayout,
-    active: u32,
+    shape: crate::device::DeviceShape,
     log_sizes: &[u32],
 ) -> Result<Evaluations, ProvingError> {
     use super::ChipSet;
-    let chips = super::Device::chips(active.into()).ok_or(ProvingError::MalformedShape)?;
+    let chips = super::Device::chips(shape).ok_or(ProvingError::MalformedShape)?;
     if chips.len() != log_sizes.len() {
         return Err(ProvingError::MalformedShape);
     }
@@ -240,7 +240,8 @@ pub fn device_preprocessed(
         .iter()
         .zip(log_sizes)
         .flat_map(|(&chip, &log_size)| {
-            crate::device_component(chip).generate_preprocessed_trace(log_size, &side_note)
+            crate::device_component(shape.memory, chip)
+                .generate_preprocessed_trace(log_size, &side_note)
         })
         .collect())
 }

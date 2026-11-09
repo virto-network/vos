@@ -149,8 +149,8 @@ pub trait ChipSet: 'static {
     #[allow(private_bounds, private_interfaces)]
     fn visit<V: ChipVisitor>(active: Self::Active, index: usize, visitor: V) -> V::Output;
 
-    /// The chip at `index`, as the verifier's component.
-    fn machine(index: usize) -> &'static dyn MachineComponent;
+    /// The chip at `index` among `active`'s, as the verifier's component.
+    fn machine(active: Self::Active, index: usize) -> &'static dyn MachineComponent;
 
     /// The positions, among `active`'s chips, of the claimed sums the
     /// public values fix: the prover leaves them unblinded.
@@ -174,7 +174,7 @@ impl ChipSet for Node {
         visit_chip(index, visitor)
     }
 
-    fn machine(index: usize) -> &'static dyn MachineComponent {
+    fn machine(_: u32, index: usize) -> &'static dyn MachineComponent {
         BASE_COMPONENTS[index]
     }
 
@@ -192,9 +192,9 @@ impl ChipSet for Node {
 
 /// The device profile's segment (`crate::device`): the shared chip set
 /// without the page boundary, in
-/// [`DEVICE_ORDER`](crate::device::DEVICE_ORDER), its CPU the program's
-/// ([`DeviceShape`]), the io-hash's claimed sum (DeviceIoChip's) its one
-/// public sum.
+/// [`DEVICE_ORDER`](crate::device::DEVICE_ORDER), its CPU the program's and
+/// its memory ledger the format's ([`DeviceShape`]), the io-hash's claimed
+/// sum (DeviceIoChip's) its one public sum.
 pub enum Device {}
 
 impl ChipSet for Device {
@@ -209,12 +209,12 @@ impl ChipSet for Device {
     fn visit<V: ChipVisitor>(active: DeviceShape, index: usize, visitor: V) -> V::Output {
         match active.program_cpu() {
             Some(cpu) if index == chip_idx::CPU => visitor.visit(&cpu),
-            _ => crate::visit_device_chip(index, visitor),
+            _ => crate::visit_device_chip(active.memory, index, visitor),
         }
     }
 
-    fn machine(index: usize) -> &'static dyn MachineComponent {
-        crate::device_machine_component(index)
+    fn machine(active: DeviceShape, index: usize) -> &'static dyn MachineComponent {
+        crate::device_machine_component(active.memory, index)
     }
 
     fn public_sums(active: DeviceShape) -> Vec<usize> {
@@ -409,7 +409,7 @@ impl<S: ChipSet> MaskedComponents for Components<S> {
             .into_iter()
             .zip(&self.log_sizes)
             .flat_map(|(chip, &log_size)| {
-                MachineComponent::preprocessed_trace_sizes(S::machine(chip), log_size)
+                MachineComponent::preprocessed_trace_sizes(S::machine(self.active, chip), log_size)
             })
             .collect()
     }
@@ -507,24 +507,18 @@ pub fn drive_masked_chip<E: EvalAtRow>(
     drive::<Node, E>(chip_idx::ALL, chip, log_size, relations, blind, eval)
 }
 
-/// A chip of the device's masked segment driven at `log_size` through
-/// `eval` ([`drive_masked_chip`]'s), `chip` its shared index
-/// (`device::device_chip`).
+/// A chip of the device's masked segment of shape `shape` driven at
+/// `log_size` through `eval` ([`drive_masked_chip`]'s), `chip` its shared
+/// index (`device::device_chip`).
 pub fn drive_masked_device_chip<E: EvalAtRow>(
+    shape: DeviceShape,
     chip: usize,
     log_size: u32,
     relations: &AllLookupElements,
     blind: &BlindRelation,
     eval: E,
 ) -> E {
-    drive::<Device, E>(
-        DeviceShape::from(crate::device::DEVICE_ALL),
-        chip,
-        log_size,
-        relations,
-        blind,
-        eval,
-    )
+    drive::<Device, E>(shape, chip, log_size, relations, blind, eval)
 }
 
 fn drive<S: ChipSet, E: EvalAtRow>(

@@ -330,8 +330,9 @@ fn trace(
 /// format's number, its parameters (log blowup, queries, PoW, fold step,
 /// log last layer, interaction PoW, `log h`), the chips, the count of log
 /// sizes and each, when the CPU is cut its column words (eight
-/// little-endian bytes each), and the preprocessed root, every other
-/// integer four little-endian bytes.
+/// little-endian bytes each), under the word ledger its tag (eight
+/// little-endian bytes, `DEVICE_WORD_MEMORY_TAG`), and the preprocessed
+/// root, every other integer four little-endian bytes.
 pub fn program_id(format: &Format, program: &DeviceProgram<Hasher>) -> [u8; 32] {
     let params = &format.params;
     let log_mask_rows = format.masking.map_or(0, |masking| masking.log_mask_rows);
@@ -358,6 +359,9 @@ pub fn program_id(format: &Format, program: &DeviceProgram<Hasher>) -> [u8; 32] 
         for word in program.cpu.words() {
             hash.update(word.to_le_bytes());
         }
+    }
+    if program.memory == vos_pvm_proof::format::Memory::Word {
+        hash.update(super::masked::device::DEVICE_WORD_MEMORY_TAG.to_le_bytes());
     }
     let Blake2sHash(root) = program.circuit;
     hash.update(root);

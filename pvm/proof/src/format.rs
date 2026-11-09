@@ -225,6 +225,18 @@ pub enum Cpu {
     PerProgram,
 }
 
+/// The memory ledger of a format's device programs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Memory {
+    /// A row a byte an access touches, a row a byte the run touches at its
+    /// boundary.
+    Byte,
+    /// A row a word an access touches, its bytes lanes, and a row a word the
+    /// run touches at its boundary ([`crate::chips::WordMemoryChip`]); the
+    /// accesses' byte tuples as the byte ledger takes them.
+    Word,
+}
+
 /// The least counts a verifier accepts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SecurityFloor {
@@ -246,6 +258,9 @@ pub struct Format {
     pub masking: Option<Masking>,
     /// The CPU of its device programs; [`Cpu::Full`] for every other kind.
     pub cpu: Cpu,
+    /// The memory ledger of its device programs; [`Memory::Byte`] for every
+    /// other kind.
+    pub memory: Memory,
     pub floor: SecurityFloor,
     pub status: Status,
     /// The shape [`Format::bits`] is counted at.
@@ -332,6 +347,7 @@ pub const SEGMENT: Format = Format {
     masked: false,
     masking: None,
     cpu: Cpu::Full,
+    memory: Memory::Byte,
     floor: INNER_FLOOR,
     status: Status::Admitted,
     reference: SEGMENT_REFERENCE,
@@ -356,6 +372,7 @@ pub const LEAF_FOLD: Format = Format {
     masked: false,
     masking: None,
     cpu: Cpu::Full,
+    memory: Memory::Byte,
     floor: INNER_FLOOR,
     status: Status::Reserved,
     reference: LEAF_FOLD_REFERENCE,
@@ -382,6 +399,7 @@ pub const WRAP: Format = Format {
     masked: false,
     masking: None,
     cpu: Cpu::Full,
+    memory: Memory::Byte,
     floor: SecurityFloor {
         conjectured: 100,
         proven: 80,
@@ -419,6 +437,7 @@ pub const MASKED_WRAP: Format = Format {
     masked: true,
     masking: Some(MASKED_WRAP_MASKING),
     cpu: Cpu::Full,
+    memory: Memory::Byte,
     floor: WRAP.floor,
     status: Status::Admitted,
     reference: MASKED_WRAP_REFERENCE,
@@ -449,6 +468,7 @@ pub const DEVICE_PROOF: Format = Format {
     masked: true,
     masking: Some(DEVICE_MASKING),
     cpu: Cpu::Full,
+    memory: Memory::Byte,
     floor: INNER_FLOOR,
     status: Status::Admitted,
     reference: DEVICE_REFERENCE,

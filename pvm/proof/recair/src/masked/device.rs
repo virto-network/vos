@@ -30,7 +30,7 @@ use vos_pvm_final_verifier::Error;
 use vos_pvm_final_verifier::masked::{Claim, MaskedFormat, verify_masked};
 use vos_pvm_proof::chips::CpuColumns;
 use vos_pvm_proof::device::{DEVICE_MAX_LOG_SIZE, DeviceLayout, DeviceShape, device_chips_of_code};
-use vos_pvm_proof::format::{Cpu, Format};
+use vos_pvm_proof::format::{Cpu, Format, Memory};
 use vos_pvm_proof::framework_access::AllLookupElements;
 use vos_pvm_proof::masked::{
     ChipSet, Components, DeviceComponents, DeviceSizes, MaskedDeviceTrace, device_bound_sums,
@@ -55,9 +55,13 @@ impl<S: ChipSet> MaskedProvers for Components<S> {
 /// The word the transcript mixes before a device program's chips.
 pub const DEVICE_PROGRAM_TAG: u64 = u64::from_le_bytes(*b"VOS/DEV1");
 
+/// The word the transcript mixes after a device program's chips and CPU
+/// under the word ledger ([`Memory::Word`]).
+pub const DEVICE_WORD_MEMORY_TAG: u64 = u64::from_le_bytes(*b"VOS/WMEM");
+
 /// A device program, as its verifier pins it: its chips, their log sizes,
-/// its CPU's columns, its layout and the preprocessed root they commit under
-/// its format.
+/// its CPU's columns, its memory ledger, its layout and the preprocessed
+/// root they commit under its format.
 #[derive(Clone, Debug)]
 pub struct DeviceProgram<H: MerkleHasherLifted> {
     /// The chips, a device mask (`vos_pvm_proof::device::device_chip`).
@@ -65,6 +69,8 @@ pub struct DeviceProgram<H: MerkleHasherLifted> {
     /// The CPU's columns: every one under a format of the full CPU, the
     /// code's under a per-program one (`CpuColumns::of_code`).
     pub cpu: CpuColumns,
+    /// The memory ledger, its format's.
+    pub memory: Memory,
     /// Each chip's log size, in `DEVICE_ORDER`.
     pub log_sizes: Vec<u32>,
     pub layout: DeviceLayout,
@@ -74,22 +80,27 @@ pub struct DeviceProgram<H: MerkleHasherLifted> {
 
 impl<H: MerkleHasherLifted> DeviceProgram<H> {
     /// The words the transcript mixes right after the header: the tag, the
-    /// chips and, for a per-program CPU that cuts any, the CPU's columns'
-    /// words. The header holds the format and the log sizes; the first
-    /// commitment, the preprocessed root.
+    /// chips, for a per-program CPU that cuts any the CPU's columns' words,
+    /// and under the word ledger [`DEVICE_WORD_MEMORY_TAG`]. The header holds
+    /// the format and the log sizes; the first commitment, the preprocessed
+    /// root.
     pub fn header(&self) -> Vec<u64> {
         let mut words = vec![DEVICE_PROGRAM_TAG, u64::from(self.active)];
         if self.cpu != CpuColumns::ALL {
             words.extend(self.cpu.words());
         }
+        if self.memory == Memory::Word {
+            words.push(DEVICE_WORD_MEMORY_TAG);
+        }
         words
     }
 
-    /// Its components: the chips and the CPU's columns.
+    /// Its components: the chips, the CPU's columns and the memory ledger.
     pub fn shape(&self) -> DeviceShape {
         DeviceShape {
             chips: self.active,
             cpu: self.cpu,
+            memory: self.memory,
         }
     }
 }
@@ -161,6 +172,7 @@ pub fn device_shape(
     let shape = DeviceShape {
         chips: active,
         cpu: device_cpu(format, reference),
+        memory: format.memory,
     };
     let floors = device_floors(format, shape).ok_or(ProveError::TraceShape(
         "the format's masking does not fit the chips, or an h under the rows a chip reveals",
@@ -224,6 +236,7 @@ where
         let shape = DeviceShape {
             chips: active,
             cpu: device_cpu(format, &code),
+            memory: format.memory,
         };
         let floors = device_floors(format, shape).ok_or(ProveError::TraceShape(
             "the format's masking does not fit the chips, or an h under the rows a chip reveals",
@@ -236,7 +249,7 @@ where
                 "a log size above the device format's reference",
             ));
         }
-        let preprocessed = device_preprocessed(&code, &layout, active, log_sizes)
+        let preprocessed = device_preprocessed(&code, &layout, shape, log_sizes)
             .map_err(|error| ProveError::Segment(error.to_string()))?;
         let committed = Committed::<MC>::new(format, log_sizes, preprocessed)
             .ok_or(ProveError::TraceShape("a component's log size overflows"))?;
@@ -245,6 +258,7 @@ where
             program: DeviceProgram {
                 active,
                 cpu: shape.cpu,
+                memory: shape.memory,
                 log_sizes: log_sizes.to_vec(),
                 layout,
                 circuit: committed.root(),
@@ -411,7 +425,8 @@ pub fn device_format<'a, H: MerkleHasherLifted>(
     program: &'a DeviceProgram<H>,
     header: &'a [u64],
 ) -> Option<(MaskedFormat<'a>, DeviceComponents)> {
-    if format.cpu == Cpu::Full && program.cpu != CpuColumns::ALL {
+    if format.cpu == Cpu::Full && program.cpu != CpuColumns::ALL || program.memory != format.memory
+    {
         return None;
     }
     let floors = device_floors(format, program.shape())?;

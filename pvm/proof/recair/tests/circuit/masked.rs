@@ -200,54 +200,63 @@ fn the_masked_segment_chips_pass_the_degree_audit() {
 
 /// R5 on the device's masked segment: every chip a device shape may hold
 /// (the shared chip set's CPU and Poseidon2 chip, the device's boundary
-/// chips, the tables and the arithmetic) keeps every constraint at degree 3
-/// or under, masked; the CPU is the node segment's, its fractions the same;
-/// and the set built at its layout declares them, each bounded at
-/// `log_size + 2`.
+/// chips, the tables and the arithmetic), under either memory ledger, keeps
+/// every constraint at degree 3 or under, masked; the CPU is the node
+/// segment's, its fractions the same; and the set built at its layout
+/// declares them, each bounded at `log_size + 2`.
 #[test]
 fn the_masked_device_chips_pass_the_degree_audit() {
-    use vos_pvm_proof::device::{DEVICE_ALL, device_chip, device_chips_of_mask};
+    use vos_pvm_proof::device::{DEVICE_ALL, DeviceShape, device_chip, device_chips_of_mask};
+    use vos_pvm_proof::format::Memory;
     use vos_pvm_proof::masked::{DeviceComponents, drive_masked_device_chip};
-    let channel = &mut Blake2sM31Channel::default();
-    let lookups = DeviceComponents::draw_relations(DEVICE_ALL.into(), channel);
-    let blind = BlindRelation::draw(channel);
-    let mut total = 0;
-    for chip in device_chips_of_mask(DEVICE_ALL) {
-        let info = drive_masked_device_chip(chip, 10, &lookups, &blind, InfoEvaluator::empty());
-        let preprocessed = preprocessed_of(&info);
-        let preprocessed: Vec<&str> = preprocessed.iter().map(String::as_str).collect();
-        let recorded = drive_masked_device_chip(chip, 10, &lookups, &blind, ExprEvaluator::new());
-        let name = format!("device chip {chip}");
-        let counted = audit(&name, &recorded, &preprocessed);
-        assert_eq!(counted.len(), info.n_constraints, "{name}");
-        eprintln!(
-            "{name}: {} constraints {:?}",
-            counted.len(),
-            histogram(&counted)
-        );
-        total += counted.len();
-        if chip == device_chip::CPU {
-            let plain = drive_masked_chip(chip, 10, &lookups, &blind, InfoEvaluator::empty());
-            let fractions = |info: &InfoEvaluator| info.logup.fracs.len();
-            assert_eq!(fractions(&info), fractions(&plain));
+    for memory in [Memory::Byte, Memory::Word] {
+        let shape = DeviceShape {
+            memory,
+            ..DEVICE_ALL.into()
+        };
+        let channel = &mut Blake2sM31Channel::default();
+        let lookups = DeviceComponents::draw_relations(shape, channel);
+        let blind = BlindRelation::draw(channel);
+        let mut total = 0;
+        for chip in device_chips_of_mask(DEVICE_ALL) {
+            let info =
+                drive_masked_device_chip(shape, chip, 10, &lookups, &blind, InfoEvaluator::empty());
+            let preprocessed = preprocessed_of(&info);
+            let preprocessed: Vec<&str> = preprocessed.iter().map(String::as_str).collect();
+            let recorded =
+                drive_masked_device_chip(shape, chip, 10, &lookups, &blind, ExprEvaluator::new());
+            let name = format!("{memory:?} memory, device chip {chip}");
+            let counted = audit(&name, &recorded, &preprocessed);
+            assert_eq!(counted.len(), info.n_constraints, "{name}");
+            eprintln!(
+                "{name}: {} constraints {:?}",
+                counted.len(),
+                histogram(&counted)
+            );
+            total += counted.len();
+            if chip == device_chip::CPU {
+                let plain = drive_masked_chip(chip, 10, &lookups, &blind, InfoEvaluator::empty());
+                let fractions = |info: &InfoEvaluator| info.logup.fracs.len();
+                assert_eq!(fractions(&info), fractions(&plain));
+            }
         }
+        let count = device_chips_of_mask(DEVICE_ALL).count();
+        let built = DeviceComponents::layout(shape, &vec![10; count]).unwrap();
+        assert_eq!(
+            built
+                .components()
+                .iter()
+                .map(|component| component.n_constraints())
+                .sum::<usize>(),
+            total
+        );
+        assert!(
+            built
+                .components()
+                .iter()
+                .all(|component| component.max_constraint_log_degree_bound() == 12)
+        );
     }
-    let count = device_chips_of_mask(DEVICE_ALL).count();
-    let built = DeviceComponents::layout(DEVICE_ALL.into(), &vec![10; count]).unwrap();
-    assert_eq!(
-        built
-            .components()
-            .iter()
-            .map(|component| component.n_constraints())
-            .sum::<usize>(),
-        total
-    );
-    assert!(
-        built
-            .components()
-            .iter()
-            .all(|component| component.max_constraint_log_degree_bound() == 12)
-    );
 }
 
 /// The cubic census (the review's option 4), a measurement: which of the

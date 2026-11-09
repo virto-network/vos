@@ -8,8 +8,8 @@ use stwo::core::circle::CirclePoint;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::quotients::deep_values_of_column;
 use stwo_constraint_framework::InfoEvaluator;
-use vos_pvm_proof::device::{DEVICE_ALL, DEVICE_MAX_LOG_SIZE, device_chips_of_mask};
-use vos_pvm_proof::format::{DEVICE_PROOF, DEVICE_REFERENCE, FormatParams, lookup};
+use vos_pvm_proof::device::{DEVICE_ALL, DEVICE_MAX_LOG_SIZE, DeviceShape, device_chips_of_mask};
+use vos_pvm_proof::format::{DEVICE_PROOF, DEVICE_REFERENCE, FormatParams, Memory, lookup};
 use vos_pvm_proof::framework_access::MAX_RELATION_WIDTH;
 use vos_pvm_proof::masked::{DeviceComponents, drive_masked_device_chip};
 use vos_pvm_proof::security::{SecurityShape, proven_count, security_bits};
@@ -25,9 +25,15 @@ use vos_pvm_recair_air::masked::{
 /// points' DEEP values, its constraints, every fraction a masked row
 /// evaluates (the blinding's among them) and the widest relation.
 fn device_shape(log_size: u32) -> SecurityShape {
+    shape_of(DEVICE_ALL.into(), log_size)
+}
+
+/// [`device_shape`] of the device set `set_shape`: every chip it may hold,
+/// its CPU and its memory ledger.
+fn shape_of(set_shape: DeviceShape, log_size: u32) -> SecurityShape {
     let pins = mask_pins(&DEVICE_PROOF.masking.unwrap());
     let chips: Vec<usize> = device_chips_of_mask(DEVICE_ALL).collect();
-    let set = DeviceComponents::layout(DEVICE_ALL.into(), &vec![log_size; chips.len()]).unwrap();
+    let set = DeviceComponents::layout(set_shape, &vec![log_size; chips.len()]).unwrap();
     let trees = committed_log_sizes(&set, &pins).unwrap();
     let points = sample_points(&set, CirclePoint::<SecureField>::get_point(1), &pins).unwrap();
     let columns = points.iter().flatten();
@@ -45,12 +51,13 @@ fn device_shape(log_size: u32) -> SecurityShape {
         .max()
         .unwrap();
     let channel = &mut Blake2sM31Channel::default();
-    let relations = DeviceComponents::draw_relations(DEVICE_ALL.into(), channel);
+    let relations = DeviceComponents::draw_relations(set_shape, channel);
     let blind = BlindRelation::draw(channel);
     let fractions: u64 = chips
         .iter()
         .map(|&chip| {
             let info = drive_masked_device_chip(
+                set_shape,
                 chip,
                 log_size,
                 &relations,
@@ -157,4 +164,33 @@ fn the_reference_bounds_smaller_programs() {
             "2^{log_size}: {count} against {reference}"
         );
     }
+}
+
+/// The word ledger's set (`Memory::Word`), every chip at the most rows a
+/// device program takes, counts format 46's pinned bits at its parameters,
+/// its every chip revealing at most `h` rows at the floor of 2^10: the
+/// candidate fits the device format's count and masking as they stand.
+#[test]
+fn the_word_ledgers_set_counts_the_device_formats_bits() {
+    let word = DeviceShape {
+        memory: Memory::Word,
+        ..DEVICE_ALL.into()
+    };
+    let built = shape_of(word, DEVICE_MAX_LOG_SIZE);
+    assert_eq!(
+        security_bits(&DEVICE_PROOF.params, &built).unwrap(),
+        DEVICE_PROOF.bits
+    );
+    assert!(proven_count(&DEVICE_PROOF.params, &built).unwrap() >= 62.0);
+    let chips = device_chips_of_mask(DEVICE_ALL).count();
+    for log_size in [10, DEVICE_MAX_LOG_SIZE] {
+        let reveals = device_reveals(&DEVICE_PROOF, word, &vec![log_size; chips]).unwrap();
+        assert!(
+            reveals
+                .iter()
+                .all(|(reveal, _)| (reveal.offsets, reveal.rows) == (2, 149))
+        );
+    }
+    let floors = device_floors(&DEVICE_PROOF, word).unwrap();
+    assert!(floors.iter().all(|&floor| floor == 10), "{floors:?}");
 }

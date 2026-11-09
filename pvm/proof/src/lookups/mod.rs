@@ -16,7 +16,8 @@ mod relations;
 #[cfg(feature = "prover")]
 pub use self::logup_trace_builder::LogupTraceBuilder;
 pub use self::relations::{
-    MAX_RELATION_WIDTH, PROG_MEMORY_N_FLAG_BYTES, PROG_MEMORY_N_FLAGS, boundary_relation_challenges,
+    MAX_RELATION_WIDTH, MEMORY_WORD_SIZE, PROG_MEMORY_N_FLAG_BYTES, PROG_MEMORY_N_FLAGS,
+    boundary_relation_challenges,
 };
 pub use self::{
     range_check::Range256LookupElements,
@@ -24,11 +25,11 @@ pub use self::{
         BitcountLookupElements, BitwiseAndByteLookupElements, BitwiseAndLookupElements,
         BitwiseLookupElements, Blake2bCallLookupElements, Blake2bCompressionLookupElements,
         ByteToBitsLookupElements, CompareLookupElements, DataTableLookupElements,
-        DivRemLookupElements, IoHashLookupElements, JumpTableLookupElements,
-        MemoryAccessLookupElements, MerkleNodeLookupElements, MultiplicationLookupElements,
-        PopcountLookupElements, Poseidon2CallLookupElements, PowerOfTwoLookupElements,
-        ProgramExecutionLookupElements, ProgramMemoryLookupElements, RegisterMemoryLookupElements,
-        WitnessCallLookupElements,
+        DataWordLookupElements, DivRemLookupElements, IoHashLookupElements,
+        JumpTableLookupElements, MemoryAccessLookupElements, MemoryWordLookupElements,
+        MerkleNodeLookupElements, MultiplicationLookupElements, PopcountLookupElements,
+        Poseidon2CallLookupElements, PowerOfTwoLookupElements, ProgramExecutionLookupElements,
+        ProgramMemoryLookupElements, RegisterMemoryLookupElements, WitnessCallLookupElements,
     },
 };
 
@@ -57,6 +58,8 @@ macros::register_relation! {
         Poseidon2CallLookupElements,
         DataTableLookupElements,
         IoHashLookupElements,
+        MemoryWordLookupElements,
+        DataWordLookupElements,
     };
     pub(crate) trait RegisteredLookupBound {}
 }
