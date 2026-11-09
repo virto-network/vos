@@ -265,7 +265,10 @@ fn pair(
         at + policy().slot_ttl_ms,
         personal.agent,
         PERSONAL,
-        vec!["home.onion".into()],
+        vec![vos_wire::credentials::Onion {
+            key: [0x0e; 32],
+            ssh_host_key: [0x0f; 32],
+        }],
     );
     let mut slot = Signer::new(code.slot_key());
     let (mut joiner, put) = Joiner::scan(&code).unwrap();

@@ -328,10 +328,10 @@ impl Split {
 }
 
 /// What a phrase kit is shown with, beside its words: the home's handle
-/// (its stable 32 bytes, so a re-founded home still matches) and its onion
-/// addresses at the claim; never a QR.
+/// (its stable 32 bytes, so a re-founded home still matches) and its
+/// onions at the claim, each with its SSH host key; never a QR.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Card {
     pub handle: [u8; 32],
-    pub onions: Vec<String>,
+    pub onions: Vec<vos_wire::credentials::Onion>,
 }

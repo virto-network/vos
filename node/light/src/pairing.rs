@@ -47,6 +47,7 @@ use blake2::digest::Digest as _;
 use blake2::digest::consts::{U16, U32};
 use ed25519_dalek::SigningKey;
 use vos_wire::books::{DeviceHandle, Space};
+use vos_wire::credentials::Onion;
 use vos_wire::ids::InstanceId;
 use vos_wire::personal::{Author, InboxItem, NewDevice, Recipient, Scope};
 use vos_wire::{Decode, Encode};
@@ -78,9 +79,10 @@ const MAX_HANDOVER: usize = 8 << 20;
 /// the code.
 #[derive(Clone, PartialEq, Eq, Encode, Decode)]
 pub struct Code {
-    /// The home's stable handle and its onion addresses.
+    /// The home's stable handle and its onions, each with the SSH host key
+    /// the joiner pins.
     pub handle: [u8; 32],
-    pub onions: Vec<String>,
+    pub onions: Vec<Onion>,
     /// The personal agent, the identity its calls are signed for, and
     /// `Personal`'s instance in it.
     pub agent: u32,
@@ -120,7 +122,7 @@ impl Code {
     pub fn to_bytes(&self) -> Zeroizing<Vec<u8>> {
         // Sized for the code and its onions, so no growth leaves a copy of
         // the slot key behind.
-        let onions: usize = self.onions.iter().map(|onion| onion.len() + 5).sum();
+        let onions: usize = self.onions.len() * 64 + 5;
         let mut bytes = Vec::with_capacity(256 + onions);
         bytes.push(VERSION);
         self.encode_to(&mut bytes);
@@ -458,7 +460,7 @@ impl Opener {
         expires: u64,
         agent: u32,
         instance: InstanceId,
-        onions: Vec<String>,
+        onions: Vec<Onion>,
     ) -> Code {
         self.expires = expires;
         Code {
