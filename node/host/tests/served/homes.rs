@@ -10,8 +10,8 @@
 //! re-proof; and the keeper's upgrade across the pool in batches, stopping
 //! at the batch an install refuses.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
@@ -66,10 +66,12 @@ pub(crate) fn witness(path: &Path) -> AuthWitness {
     }
 }
 
-/// The home: its agent, the keeper's client there, the space and the
-/// stock `auth` kernel's program.
+/// The home: its agent, the keeper's client there, the space, its handle
+/// and the stock `auth` kernel's program. Another home on the same nodes
+/// shares their cluster ([`Founded::beside`]).
 pub(crate) struct Founded {
-    pub(crate) cluster: Cluster,
+    pub(crate) cluster: Arc<Cluster>,
+    pub(crate) handle: [u8; 32],
     pub(crate) agent: AgentId,
     pub(crate) space: SpaceId,
     caller: Mutex<Client>,
@@ -84,6 +86,17 @@ impl Founded {
     /// The home, its agents configured with `policy` before their claims.
     pub(crate) fn with(policy: Policy) -> Self {
         let cluster = Cluster::founded(SEED, Some(WindowClock::DEFAULT));
+        Self::on(Arc::new(cluster), HANDLE, policy)
+    }
+
+    /// Another home on this home's nodes, in their one space: its own
+    /// agent holding a credential actor whose handle is `handle`, and
+    /// `Homes` configured with `policy`.
+    pub(crate) fn beside(&self, handle: [u8; 32], policy: Policy) -> Self {
+        Self::on(Arc::clone(&self.cluster), handle, policy)
+    }
+
+    fn on(cluster: Arc<Cluster>, handle: [u8; 32], policy: Policy) -> Self {
         let agent = cluster
             .node(1)
             .unwrap()
@@ -124,13 +137,14 @@ impl Founded {
         let device = vos_light::release::device(&credentials, "auth").expect("the stock kernel");
         let founded = Self {
             cluster,
+            handle,
             agent,
             space,
             caller: Mutex::new(caller),
             auth: DeviceProgram::released(&device).unwrap(),
         };
         founded
-            .write::<(), CredentialError>(CREDENTIALS, "found", HANDLE)
+            .write::<(), CredentialError>(CREDENTIALS, "found", handle)
             .unwrap();
         founded
             .write::<(), HomesError>(

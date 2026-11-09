@@ -1390,8 +1390,10 @@ where the text above leaves a choice, this is the one taken]:
   are named afresh. **Elsewhere:** the restore at the old agent releases
   `R2`; the device claims an agent at another home with the next kit
   split anew there, and reads its old scopes from the old agent with the
-  recovered archive (`personal::read_back`); pushing them to the new home
-  is moving home's (8.23c).
+  recovered archive (`personal::read_back`), then carries them to the new
+  home (`SealedSync::carry`), the old agent's device set recorded as its
+  carried authors up to the nodes it read back (`moving::carried`,
+  `DeviceGroup::record_authors`, §3.9 "Moving home as built").
 - **Liveness:** every device with a voice that reads an open restore
   posts `alive` (`Event::Alive`) until the log cancels it, and shows a
   kit-signed operation for as long as it is open (`Alarm::Kit`); the
@@ -1961,6 +1963,116 @@ re-splits the kit (a new `R2` at the new agent) and pushes everything,
 including recovery envelopes; the other devices pair again by QR. Until
 the move completes, the kit opens nothing at the new home. The old
 operators keep what they held; deletion there cannot be verified.
+
+**Moving home as built** [built, `vos_light::moving`,
+`personal::SealedSync::carry`; tested against `Personal` at two homes in
+`node/light/tests/sealed/moving.rs`, and end to end on three nodes holding
+two home-only homes (each its own agent, credential actor and handle, and
+`Homes`, in the nodes' one space), through their sockets with the onion's
+mark, in `node/host/tests/served/moving.rs`; where the text above leaves a
+choice, this is the one taken]:
+- **The claim elsewhere** (`Move::prepare`): a device of the group that
+  follows it joins the other home as any member does (its open claim
+  there) and claims the agent that home's `Homes` answers `pooled` for, as
+  a first claim does (§3.8): the kit's keys given split anew at that
+  agent, `R1` sealed to its identity, the new `R2` in the claim, the
+  device's "home" nullifier the new home's. The claim is held in the store
+  beside the group it leaves; a second move or claim is refused, and so
+  are a move to the agent the group has and one from a device that cannot
+  follow its group or is out of it. A claim `Homes` refuses is abandoned
+  (`Move::abandon`) and the old group stands. The kit may be the old one
+  or a new one: the same kit's index at both `Homes` links the two agents,
+  and the old one still restores at the old home (below), so the app takes
+  a new kit for a hostile home.
+- **The notice** (`moving::Notice`): once the claim is answered and before
+  it leaves, the mover leaves at the old home the new home and agent,
+  signed by its sync key and sealed under the old group's confirmed epoch
+  in a scope of its own, then pushes its archive there, which carries that
+  scope's key to the devices at later epochs (`SealedSync::announce`). A
+  device reads it only from a device of the set that is not removed
+  (`SealedSync::announced`); the operators read an envelope.
+- **Leaving, and the new group** (`Move::claimed`, once the new agent's
+  log holds the assignment, the caller giving up its handle on the old
+  group): every local scope's cursor and push queue forgotten
+  (`Light::forget_feed`, `merkle_crdt::Replica::forget_cursor`), then in
+  one batch the old group's state, the log's chains it kept, its MLS state
+  and every row of its sealed sync deleted, the MLS state's generation
+  moved on; the archive kept without the old `R`, and each device of the
+  old set recorded there as a carried author in each scope, up to the
+  highest of its nodes the device holds there short of its cutoff
+  (`Archive::authors`, `moving::carried`). Then the device's group alone
+  at the new agent (`DeviceGroup::create`), its `R` the new split's. The
+  naming secret stays: the scopes keep their ids, at both homes.
+- **Push everything** (`moving::finish`): the archive first, so that the
+  carried authors reach the readers before their nodes; each installed
+  scope read at the new agent, then every node it holds that this device
+  neither read nor pushed there carried (`SealedSync::carry`), in causal
+  order, a node past its author's cutoff left behind, and read back, so
+  that whatever another device pushed between the carried envelopes is
+  read too; the archive again; then, the move done, the recovery
+  envelopes under the new `R`, which `SealedSync::recovery` pushes no
+  earlier while a move is held. Each carry round's sealed bytes are held
+  in the store before they are sent and sent again as they are, its own
+  nodes leaving the outbox round by round.
+- **Readers at the new home** take a carried author's node as the set's up
+  to its number there, whoever pushed it (`SealedSync::catch_up`). A
+  device of the old set removed at the new home is cut off at its
+  frontier there, never below one past what was carried of it, and a
+  frontier envelope holding another author's carried node gives no
+  cutoff of its own. A restore elsewhere records the old agent's device
+  set the same way, from the nodes it read back, before it carries its old
+  scopes (`DeviceGroup::record_authors`).
+- **Re-pair** (`moving::rejoin`): each other device pairs again by QR from
+  a device at the new home whose move is done, its handles in the other
+  spaces kept (the offer names none). It reads the old home to its end
+  first (the app's step). Its key package is made beside its old group, in
+  the next MLS generation of its store (`DeviceGroup::key_package`, an
+  earlier attempt's dropped), so a pairing cut short before the handover
+  leaves the old group standing. On the handover it gives up its old group
+  and leaves it as the mover did, then joins (`DeviceGroup::rejoin`),
+  refused before anything is left for a pairing of another personal space
+  (its naming secrets none of the store's); its archive's keys and carried
+  authors are kept beside the pairing's. It starts its scopes from the
+  checkpoints handed over and carries what the new home lacks
+  (`moving::finish` again): what it, and the devices still at the old
+  home, wrote there after the move. A re-pair cut short after the handover
+  leaves the device with no group, its move held: it pairs again from a
+  new slot, with no old group to give up.
+- **A device that missed the move** follows the old home with the devices
+  still there; the moved devices stop being voices there once their
+  confirmation window lapses, as any sleeper does. At its next reading it
+  finds the notice, and the app asks for the re-pairing. What it, or a
+  device paired there meanwhile, writes reaches the new home with the
+  first device to pair again after reading it, and that device's archive
+  brings the authors.
+- **What the old home keeps:** what it held, for as long as its operators
+  keep it: the control log, each scope's ciphertext to the move, the
+  recovery envelopes under the old `R`, and the old `R2` with the old
+  kit's entries. The moved devices are never removed there (their old
+  MLS state deleted, they read nothing pushed there after). It is let go
+  as the last device leaves it: none re-proves its lease, which lapses 13
+  months after the last re-proof, then refuses pushes and serves reads, a
+  restore and a move for the 180 days' grace (B14); reaping is later
+  work. An old kit kept across the move still restores there, unanswered
+  once no device follows it, and reads the history to the move.
+- **An interrupted move** resumes where it stopped: before the claim's
+  answer, the claim is held and sent again (`Move::pending`); once the
+  new agent assigned it, `Move::claimed` again leaves the old group
+  (again whole, if a crash cut the leave short: the cursors first, then
+  the batch) and starts the new one, or takes the one already made; then
+  `moving::carrying` holds until `moving::finish` pushed everything. A
+  round answered and lost is answered again by id, one envelope each; a
+  round sealed under an epoch since replaced is sealed again, a duplicate
+  node at worst, which readers skip.
+- *Known limits:* each device's sync and admin keys, each scope's id, and
+  a reused kit's index at `Homes` are the same at both homes, so the two
+  homes' operators together link the two agents, as the time and size of
+  the carry do; a carried author's bound grows with each device that
+  leaves the old home, so what an old device never removed there writes
+  before the last leaves is carried; an opener whose own move is not done
+  is not refused by the library; the old home's `Homes` keeps the moved
+  devices' nullifiers until its lease lapses; a crash inside the leave is
+  argued, not tested.
 
 ### 3.10 What the operators see
 
@@ -3655,8 +3767,10 @@ leaves 180 days for a restore. (8.14, 8.23b)
 
 **B16. The home vanishes or turns hostile.** *Mitigation:* move home by
 re-pairing (§3.9); nothing is lost while one device holds the data.
-*Known limit:* the kit opens nothing until the move re-splits it; a
-successor group and a live handover are later work. (8.23c)
+*Known limit:* the kit opens nothing at the new home until the move's
+last push; the devices' keys and a reused kit link the two agents for
+the two homes' operators together; a successor group and a live handover
+are later work. (8.23c)
 
 **B17. Personal agents fill the space's disks.** *Mitigation:* a 64 MiB
 default quota; the scale gate measures a full agent's snapshot and a

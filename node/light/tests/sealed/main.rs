@@ -38,6 +38,7 @@ use phone::Phone;
 
 mod detection;
 mod job;
+mod moving;
 mod pairing;
 
 const MIN: u64 = 60_000;

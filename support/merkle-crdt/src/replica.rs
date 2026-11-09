@@ -213,6 +213,17 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
         self.cursor
     }
 
+    /// Forget the cursor, in one commit with what the store has staged:
+    /// the scope's next feed is another's, read from its start.
+    pub fn forget_cursor(&mut self) -> Result<(), S::Error> {
+        self.store.commit(Changes {
+            forget_cursor: true,
+            ..Changes::default()
+        })?;
+        self.cursor = None;
+        Ok(())
+    }
+
     /// The number of nodes held for missing parents.
     pub fn held(&self) -> usize {
         self.missing.len()

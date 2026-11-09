@@ -15,7 +15,7 @@ use mls_rs_core::crypto::{
 };
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 use vos_light::Store;
-use vos_mls::{Identity, Namespace};
+use vos_mls::Identity;
 use zeroize::Zeroizing;
 
 type Suite = <RustCryptoProvider as CryptoProvider>::CipherSuiteProvider;
@@ -277,7 +277,7 @@ pub fn hostile(
     spare: Option<Vec<HpkePublicKey>>,
     rules: Anything,
 ) -> Group<impl MlsConfig + use<>> {
-    let namespace = Namespace::current(store.group_store(), b"mls/".to_vec()).copy();
+    let namespace = vos_light::group::mls_namespace(store).unwrap().copy();
     let id = namespace
         .get(b"group")
         .unwrap()

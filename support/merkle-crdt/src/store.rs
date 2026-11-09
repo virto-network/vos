@@ -98,6 +98,9 @@ pub struct Changes<H: Hasher> {
     pub equivocations: Vec<(Author, u64)>,
     /// The cursor after the batch, when it moved.
     pub cursor: Option<u64>,
+    /// The cursor forgotten: the scope is read again from the start of
+    /// another feed.
+    pub forget_cursor: bool,
     /// Local nodes to push.
     pub outbox: Vec<(Author, u64, Cid<H>)>,
     /// Local nodes pushed, by author and sequence number.
@@ -116,6 +119,7 @@ impl<H: Hasher> Default for Changes<H> {
             latest: Vec::new(),
             equivocations: Vec::new(),
             cursor: None,
+            forget_cursor: false,
             outbox: Vec::new(),
             pushed: Vec::new(),
             rows: BTreeMap::new(),
@@ -131,6 +135,7 @@ impl<H: Hasher> Changes<H> {
             && self.released.is_empty()
             && self.heads.is_none()
             && self.cursor.is_none()
+            && !self.forget_cursor
             && self.outbox.is_empty()
             && self.pushed.is_empty()
             && self.rows.is_empty()
@@ -246,6 +251,9 @@ impl<H: Hasher> Store<H> for MemStore<H> {
             loaded.latest.insert(author, (seq, cid));
         }
         loaded.equivocations.extend(changes.equivocations);
+        if changes.forget_cursor {
+            loaded.cursor = None;
+        }
         if changes.cursor.is_some() {
             loaded.cursor = changes.cursor;
         }

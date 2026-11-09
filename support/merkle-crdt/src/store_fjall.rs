@@ -259,6 +259,9 @@ impl FjallStore {
             let key = tagged(EQUIVOCATION, &[&author.0, &at.to_be_bytes()]);
             batch.insert(&self.meta, key, []);
         }
+        if changes.forget_cursor {
+            batch.remove(&self.meta, CURSOR);
+        }
         if let Some(cursor) = changes.cursor {
             batch.insert(&self.meta, CURSOR, cursor.to_be_bytes());
         }

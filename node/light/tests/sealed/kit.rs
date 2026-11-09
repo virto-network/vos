@@ -73,13 +73,13 @@ fn state(home: &Home, reader: [u8; 32], index: u64) -> OpState {
 }
 
 /// The `R` `phone` holds.
-fn r_of(phone: &mut Phone) -> [u8; 32] {
+pub(super) fn r_of(phone: &mut Phone) -> [u8; 32] {
     phone.group().archive().recovery.as_ref().unwrap().r
 }
 
 /// Each phone's archive read and pushed, then its recovery envelopes, in
 /// turn, twice: what a sync round does.
-fn sync_keys(home: &mut Home, phones: &mut [Phone]) {
+pub(super) fn sync_keys(home: &mut Home, phones: &mut [Phone]) {
     for _ in 0..2 {
         for phone in phones.iter_mut() {
             with(home, phone, &[], |sync| sync.archive()).unwrap();
@@ -90,7 +90,7 @@ fn sync_keys(home: &mut Home, phones: &mut [Phone]) {
 
 /// The recovery scope's envelopes the kit `key` reads: those after its
 /// kit's last re-seal.
-fn kit_reads(home: &Home, key: &KitSecret) -> Vec<Envelope> {
+pub(super) fn kit_reads(home: &Home, key: &KitSecret) -> Vec<Envelope> {
     home.query(key.key().signing, "since", (RECOVERY, 0u64).encode())
         .unwrap()
 }
@@ -167,7 +167,7 @@ fn restart(home: &Home, restored: &mut Phone, split: &Split, next: &KitSecret) {
 
 /// Notes set on each phone, pushed, and the keys pushed to the recovery
 /// scope: what a restore reads back.
-fn written(home: &mut Home, phones: &mut [Phone]) {
+pub(super) fn written(home: &mut Home, phones: &mut [Phone]) {
     for (n, phone) in phones.iter_mut().enumerate() {
         set(&phone.light, NOTES, n as u64, 10 + n as u64);
         with(home, phone, &[NOTES], |sync| sync.push(NOTES)).unwrap();
@@ -328,7 +328,9 @@ fn a_restore_here_reads_the_personal_space_back() {
 /// restore at the old home releases `R2`, and the fresh install claims a
 /// new agent at another home, its group there, its kit split anew; it
 /// reads the personal space back from the old home with the archive it
-/// recovered, the old scopes keeping their ids, new ones named afresh.
+/// recovered, the old scopes keeping their ids, new ones named afresh; and
+/// carries them to the new home, the old device set its carried authors,
+/// where a phone paired there reads them.
 #[test]
 fn a_restore_elsewhere_reads_the_personal_space_back() {
     let key = KitSecret::security_key(&mut Touch(9)).unwrap();
@@ -362,6 +364,9 @@ fn a_restore_elsewhere_reads_the_personal_space_back() {
         "a new scope is named afresh"
     );
     let identity = home.identity;
+    let devices: Vec<DeviceView> = home
+        .query(restored.sync_key(), "devices", ().encode())
+        .unwrap();
     let mut link = HomeLink::new(&mut home, &restored);
     let caught = read_back(
         &restored.light,
@@ -383,6 +388,29 @@ fn a_restore_elsewhere_reads_the_personal_space_back() {
         events.contains(&Event::Confirmed { epoch: 1 }),
         "{events:?}"
     );
+
+    let authors: Vec<[u8; 32]> = devices.iter().map(|view| view.device.keys.sync).collect();
+    let carried = vos_light::moving::carried(&restored.light, &authors).unwrap();
+    restored.group().record_authors(&carried).unwrap();
+    let carried = with(&mut elsewhere, &mut restored, &[NOTES], |sync| {
+        sync.catch_up(NOTES)?;
+        sync.carry(NOTES)
+    })
+    .unwrap();
+    assert_eq!(carried.pushed.len(), 2);
+    let mut phones = vec![restored, Phone::new(10)];
+    let (first, rest) = phones.split_at_mut(1);
+    first[0].pair(&mut elsewhere, &mut rest[0]);
+    settle(&mut elsewhere, &mut phones);
+    install(&phones[1].light, NOTES);
+    let caught = with(&mut elsewhere, &mut phones[1], &[NOTES], |sync| {
+        sync.catch_up(NOTES)
+    })
+    .unwrap();
+    assert!(caught.passed.is_empty(), "{:?}", caught.passed);
+    for n in 0..2 {
+        assert_eq!(count(&phones[1].light, NOTES, n), Some(10 + n));
+    }
 }
 
 /// A leaked kit's restore: every device shows the kit's operation and

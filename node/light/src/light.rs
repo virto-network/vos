@@ -357,6 +357,53 @@ impl Light {
         Ok(merkle_crdt::Store::node(scope.store(), cid)?)
     }
 
+    /// The instances installed, in order.
+    pub fn instances(&self) -> Result<Vec<InstanceId>, Error> {
+        let snapshot = self.store.snapshot();
+        let prefix = keys::installed_prefix();
+        StateReader::rows(&snapshot, &prefix, None)
+            .map(|(key, _)| {
+                let id = key
+                    .get(prefix.len()..)
+                    .and_then(|id| <[u8; 4]>::try_from(id).ok())
+                    .ok_or(CorruptRow)?;
+                Ok(InstanceId(u32::from_be_bytes(id)))
+            })
+            .collect()
+    }
+
+    /// Every node `instance`'s scope holds applied, by its CID, with its
+    /// bytes: what a move carries to another agent.
+    pub fn nodes(&self, instance: InstanceId) -> Result<Vec<(sync::Cid, Vec<u8>)>, Error> {
+        let mut writing = self.writing();
+        let scope = self.scope(&mut writing, instance)?;
+        let store = scope.store();
+        merkle_crdt::Store::nodes(store)?
+            .into_iter()
+            .map(|cid| {
+                let bytes = merkle_crdt::Store::node(store, &cid)?.ok_or(CorruptRow)?;
+                Ok((cid, bytes))
+            })
+            .collect()
+    }
+
+    /// Forget where `instance`'s scope was read to at its personal agent,
+    /// and its push queue, sealed for that agent, in one batch: its nodes
+    /// and its outbox stay, and its next feed, another agent's, is read
+    /// from its start.
+    pub fn forget_feed(&self, instance: InstanceId) -> Result<(), Error> {
+        let mut writing = self.writing();
+        let queued = self.store.queued(instance)?;
+        let scope = self.scope(&mut writing, instance)?;
+        for (seq, _) in queued {
+            let (meta, key) = self.store.queue_key(instance, seq);
+            scope.store_mut().stage(meta, &key, None);
+        }
+        let forgot = scope.forget_cursor();
+        scope.store_mut().unstage();
+        Ok(forgot?)
+    }
+
     /// Install `package` as `instance`, its roles `roles`: its programs
     /// checked against its derivation and pooled, the install run as a
     /// node's, and its programs, its rows and its release committed in one

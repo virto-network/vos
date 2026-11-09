@@ -33,6 +33,10 @@
 //! - **Reading back** ([`read_back`]): a restored device reading a scope
 //!   of the agent it restored at with the archive it recovered, before any
 //!   group of its own.
+//! - **Carrying** ([`SealedSync::carry`]): every node of a scope the agent
+//!   lacks, pushed in causal order: a move's to its new home, and a device
+//!   paired again there carrying what the move did not; and the notice a
+//!   move leaves at the home it left ([`SealedSync::announce`]).
 //! - **Tor only** (E17): a link names its [`Route`], and every request is
 //!   refused before it leaves unless the route is the onion, so the light
 //!   node has no clearnet route for any kind addressed to the personal
@@ -62,8 +66,10 @@ use crate::sealed::{self, Body, MAX_BODY, OpenError, View};
 use crate::sync::{Blake2b256, Held, Quarantined};
 use merkle_crdt::Hasher as _;
 
+mod carry;
 mod checkpoint;
 
+pub use carry::Carried;
 pub use checkpoint::{Acknowledging, checkpoint_hash};
 
 /// The envelopes a push sends in one round trip, in flight at once.
@@ -75,6 +81,10 @@ const WAKES: usize = 8;
 /// The name the archive's scope derives from, apart from every instance's
 /// (four bytes).
 pub const ARCHIVE_NAME: &[u8] = b"vos/personal/archive";
+
+/// The prefix of every row of sealed sync with one agent, in the group
+/// keyspace: a move deletes them all.
+pub(crate) const SYNC_ROWS: &[u8] = b"s/";
 
 /// The rows of the archive's and the recovery scope's reading, in the
 /// group keyspace: each one's cursor and the epoch read or pushed there.
@@ -632,6 +642,10 @@ impl<'a, L: Link> SealedSync<'a, L> {
         self.group
     }
 
+    pub(crate) fn light(&self) -> &Light {
+        self.light
+    }
+
     /// The link, for a request: refused unless it still reaches the agent
     /// through the onion.
     fn link(&mut self) -> Result<&mut L, SyncError<L::Error>> {
@@ -1005,8 +1019,15 @@ impl<'a, L: Link> SealedSync<'a, L> {
         let Some(header) = merkle_crdt::Header::<Blake2b256>::read(&body.node) else {
             return Ok(Err(Unusable::Body));
         };
+        // A device of a group a move left is read as the set's up to the
+        // node a leaving device carried of it here, whoever pushed it.
+        let carried = self
+            .group
+            .archive()
+            .through(&header.author.0, &scope)
+            .filter(|through| header.seq <= *through);
         let within = match self.group.author(&header.author.0) {
-            None => false,
+            None => carried.is_some(),
             Some((_, false)) => true,
             Some((device, true)) => {
                 let frontier = match scan.frontiers.entry(device) {
@@ -1033,7 +1054,7 @@ impl<'a, L: Link> SealedSync<'a, L> {
                         scan.cut.push(device);
                     }
                 }
-                last.is_some_and(|last| position <= last)
+                carried.is_some() || last.is_some_and(|last| position <= last)
             }
         };
         if !within {
@@ -1064,10 +1085,12 @@ impl<'a, L: Link> SealedSync<'a, L> {
     /// number plus one when `removed` is that node, or when this device
     /// read it before; from `removed`'s own number when it is past the
     /// frontier and the node there was not read, an upper bound a lower
-    /// cutoff replaces. Whether it was cut off; not yet, while the
-    /// frontier's node is ahead. So the frontier the agent's log gives is
-    /// the one source of a removed author's cutoff, which filters its
-    /// entries at read and quarantines its later operations at ingest.
+    /// cutoff replaces, as when the node there is another author's (one it
+    /// carried). Never below one past what a move carried of it. Whether it
+    /// was cut off; not yet, while the frontier's node is ahead. So the
+    /// frontier the agent's log gives is the one source of a removed
+    /// author's cutoff, which filters its entries at read and quarantines
+    /// its later operations at ingest.
     fn cut_off_removed(
         &self,
         instance: InstanceId,
@@ -1085,18 +1108,26 @@ impl<'a, L: Link> SealedSync<'a, L> {
                 Some(cid) => {
                     let cid = <[u8; 32]>::try_from(&cid[..])
                         .map_err(|_| SyncError::Group(GroupError::Corrupt))?;
-                    self.light
+                    match self
+                        .light
                         .node(instance, &merkle_crdt::Cid(cid))?
                         .and_then(|node| merkle_crdt::Header::<Blake2b256>::read(&node))
-                        .map(|header| header.seq + 1)
+                    {
+                        Some(header) if header.author == removed.author => Some(header.seq + 1),
+                        _ if removed.position > last => Some(removed.seq),
+                        _ => None,
+                    }
                 }
                 None if removed.position > last => Some(removed.seq),
                 None => None,
             },
         };
-        let Some(from) = from else {
+        let Some(mut from) = from else {
             return Ok(false);
         };
+        if let Some(through) = self.group.archive().through(&removed.author.0, &scope) {
+            from = from.max(through + 1);
+        }
         self.light.cut_off(instance, removed.author, from)?;
         Ok(true)
     }
@@ -1362,8 +1393,11 @@ impl<'a, L: Link> SealedSync<'a, L> {
     /// and nothing while the log names an `R` this device does not hold
     /// yet: a removed device may hold the one before; a new `R` reads the
     /// scope again from its start and pushes the whole archive under it.
+    /// Nothing while a move is held here.
     pub fn recovery(&mut self) -> Result<Kept, SyncError<L::Error>> {
-        if !self.group.holds_recovery() {
+        // A move pushes its recovery envelopes last, once it carried
+        // everything ([`crate::moving::finish`]).
+        if !self.group.holds_recovery() || crate::moving::moving(self.light.store())? {
             return Ok(Kept::default());
         }
         let Some((since, key)) = self
