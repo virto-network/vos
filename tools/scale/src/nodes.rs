@@ -15,7 +15,7 @@ use crate::runs::Run;
 
 /// The units the harness may run on `host`.
 pub fn units_of(host: &Host) -> Vec<String> {
-    ["node", "sample", "drive"]
+    ["node", "sample", "drive", "personal"]
         .iter()
         .map(|part| host.unit(part))
         .collect()

@@ -148,6 +148,10 @@ pub fn gather(inventory: &Inventory, run: &Run) -> Result<(), String> {
                     &format!("{}/logs/{}.drive.log", host.dir, run.id),
                     &to,
                 )?;
+                for file in ["drive/{}.personal.jsonl", "logs/{}.personal.log"] {
+                    let file = file.replace("{}", &run.id);
+                    hosts::pull(host, &format!("{}/{file}", host.dir), &to)?;
+                }
             }
         }
     }
