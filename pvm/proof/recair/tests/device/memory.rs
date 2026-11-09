@@ -518,8 +518,8 @@ fn a_misaligned_group_is_refused() {
     let tamper = |trace: &mut MaskedDeviceTrace| {
         let mut ledger = Chip::of(trace, &program, device_chip::MEMORY);
         let addresses = ledger_addresses(&ledger);
-        for row in 0..ledger.rows() {
-            if addresses[row] == Some(AREA) {
+        for (row, address) in addresses.into_iter().enumerate() {
+            if address == Some(AREA) {
                 let low = ledger.get(Column::Address.offset(), row);
                 ledger.set(Column::Address.offset(), row, low + 1);
             }
@@ -683,4 +683,4 @@ fn a_laneless_inner_row_is_refused() {
     );
 }
 
-const _: () = assert!(WORD_BYTES == 8 && AREA % 8 == 0);
+const _: () = assert!(WORD_BYTES == 8 && AREA.is_multiple_of(8));
