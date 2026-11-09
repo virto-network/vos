@@ -488,7 +488,16 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   feed (8.27's), every personal-space operation on the Binder interface
   (8.22, 8.23a–c), the admin key's prompt, the binding's lifecycle
   (8.24b). Host-tested against homes in process behind an in-process
-  gateway (`credential/tests/personal.rs`). The screens are part 2.
+  gateway (`credential/tests/personal.rs`).
+- **Part 2 built** (2026-11-09, `light-node.md` §7.3): the screens, plain
+  Android views in Java (the app has no Kotlin) under
+  `team.virto.s4.personal`, a launcher entry of their own; QR codes by
+  ZXing's core (a home's code and a pairing's, prefix and hex); the
+  facility's forms in the app's own dialog. The gateway demo takes the
+  node's answer and pins the gateway's onion. The joiner's open claim is
+  the background job's after a drawn delay (E28), and an admin key is
+  replaced by the kit or another seasoned device (E29). Host-tested logic
+  only: the gate is the phone session.
 
 ### M4 acceptance
 - `ci-full`, PG3′'s personal-space flows and PG6 on the clearnet (S8-P5),
