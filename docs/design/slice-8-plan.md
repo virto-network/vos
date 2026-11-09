@@ -481,6 +481,13 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
 - **Gate:** each screen drives its flow on the phone. **Dep:** 8.24b,
   8.23a–c's facility operations (developed against stubs first).
   **Estimate:** 3–4 weeks, its last 1–2 weeks after 8.23a.
+- **Part 1 built** (2026-11-09, `light-node.md` §7.3 "The facility's
+  wiring as built"): the facility's plumbing the screens call, in s4's
+  `credential/`: Tor in `:vos` (8.26's client side), the tree from its
+  feed (8.27's), every personal-space operation on the Binder interface
+  (8.22, 8.23a–c), the admin key's prompt, the binding's lifecycle
+  (8.24b). Host-tested against homes in process behind an in-process
+  gateway (`credential/tests/personal.rs`). The screens are part 2.
 
 ### M4 acceptance
 - `ci-full`, PG3′'s personal-space flows and PG6 on the clearnet (S8-P5),

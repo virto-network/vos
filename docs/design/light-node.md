@@ -3510,6 +3510,32 @@ device's crates faster); Q9's size argument for it is small.
   "Repository"); it moves with the cleanup's last step, before slice 8's
   first phone session.
 
+**The facility's wiring as built** [built, s4 `credential/`, plan 8.24
+part 1]: the screens are the step's second part.
+- **Tor**: one arti runtime in `:vos`, its state in `files/tor`, rebuilt
+  through pasted bridges (a `BootstrapError` named by its Display); one
+  `Client` whose every space is set from the onions pinned at enrollment
+  (the enrollment carries the onion set, each onion with its SSH host key),
+  its clearnet only the per-space opt-out of key-signed calls, kept with
+  each `refresh_onions` answer in `routes.state`. A spare circuit is kept
+  while a session is open; the client is dormant in the background and
+  woken around each job. Every request is `client.request` under its
+  purpose: a sign-in's and a payment's proof sent by the facility itself
+  (`Proven`; the s4 server gets the node's answer, never the request), the
+  node's time (`Fetch`), the tree (`Feed`, a `TreeKeeper` kept beside the
+  enrollment), open claims (`Member`), the personal agent (`Personal` for
+  what the user does, `Background` for its job). A stream to a gateway's
+  `.onion` goes over Tor too.
+- **The personal space**: every flow of §3.8 and §3.9 and the device set's
+  operations, named on the Binder interface; the light node under
+  `light/`; the admin key in the UI's Keystore (Ed25519, strong biometric
+  only, `IVosPrompts.signKey`). A device replaces its own admin key by the
+  kit's signature (the agent's rule: no device signs its own key's
+  replacement), maturing after the kit's delay. The personal space's job
+  is a periodic job of its own.
+- **Pairing's code and the kit's card** carry each onion with its SSH host
+  key, which the joiner pins to reach the home.
+
 ### 7.4 The SDK macros and the derivation
 
 - `#[attestable(device)]` methods may take references to fixed-size
