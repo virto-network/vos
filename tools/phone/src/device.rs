@@ -3,16 +3,20 @@
 //! one channel, timed, verified, its peak memory read and its bytes
 //! counted.
 //!
-//! A cell is `statement/log_blowup:queries:pow[:log_h]/channel`, the statement a
-//! kernel `<statement>.kernel` and its witness input `<statement>.input` in
-//! the kernels' directory, the channel `b2sm31` (Blake2s-M31) or `b2b`
-//! (Blake2b-256). Its format is [`DEVICE_PROOF`] at the cell's parameters,
-//! `h` `2^log_h` where the cell names it, else twice the rows a column
-//! reading two rows reveals, `4·2 + 3q`, rounded up to a power of two. The
-//! program is installed once from a
-//! reference run of the same witness (the shape its run needs, each chip at
-//! least its floor), its preprocessed tree committed then; each rep traces
-//! the kernel and proves it against the program.
+//! A cell is `statement/log_blowup:queries:pow[:log_h]/channel[/cpu]`, the
+//! statement a kernel `<statement>.kernel` and its witness input
+//! `<statement>.input` in the kernels' directory, or `auth` or `owner`, the
+//! stock kernel from its embedded release artifact on its reference
+//! program's arguments; the channel `b2sm31` (Blake2s-M31) or `b2b`
+//! (Blake2b-256); the CPU `full` (the default) or `program`, the
+//! per-program CPU ([`Cpu`]). Its format is [`DEVICE_PROOF`] at the cell's
+//! parameters, `h` `2^log_h` where the cell names it, else twice the rows a
+//! column reading two rows reveals, `4·2 + 3q`, rounded up to a power of
+//! two. The program is installed once, its preprocessed tree committed
+//! then: a stock kernel's at its release's chips and log sizes, any other's
+//! from a reference run of the same witness (the shape its run needs, each
+//! chip at least its floor); each rep traces the kernel and proves it
+//! against the program.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -23,7 +27,7 @@ use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 use stwo::core::vcs_lifted::blake2b_merkle::Blake2bMerkleChannel;
 use stwo::prover::backend::BackendForChannel;
 use stwo::prover::backend::simd::SimdBackend;
-use vos_pvm_proof::format::{ChannelKind, DEVICE_PROOF, Format, FormatParams, Masking};
+use vos_pvm_proof::format::{ChannelKind, Cpu, DEVICE_PROOF, Format, FormatParams, Masking};
 use vos_pvm_proof::masked::DeviceComponents;
 use vos_pvm_recair::masked::MaskRng;
 use vos_pvm_recair::masked::device::{DeviceProver, device_shape, verify_device};
@@ -55,15 +59,15 @@ pub struct Cell {
     /// format's rule (`proving.md` §5).
     pub log_mask_rows: Option<u32>,
     pub channel: ChannelKind,
+    pub cpu: Cpu,
 }
 
 impl Cell {
     pub fn parse(text: &str) -> Self {
         let parts: Vec<&str> = text.split('/').collect();
-        assert_eq!(
-            parts.len(),
-            3,
-            "a cell is statement/blowup:queries:pow/channel: {text}"
+        assert!(
+            matches!(parts.len(), 3 | 4),
+            "a cell is statement/blowup:queries:pow/channel[/cpu]: {text}"
         );
         let config: Vec<u32> = parts[1]
             .split(':')
@@ -78,6 +82,11 @@ impl Cell {
             "b2b" => ChannelKind::Blake2b256,
             other => panic!("unknown channel {other}"),
         };
+        let cpu = match parts.get(3).copied() {
+            None | Some("full") => Cpu::Full,
+            Some("program") => Cpu::PerProgram,
+            Some(other) => panic!("unknown CPU {other}"),
+        };
         Self {
             statement: parts[0].to_string(),
             log_blowup: config[0],
@@ -85,6 +94,7 @@ impl Cell {
             pow: config[2],
             log_mask_rows: config.get(3).copied(),
             channel,
+            cpu,
         }
     }
 
@@ -103,6 +113,7 @@ impl Cell {
                 log_mask_rows: self.log_mask_rows.unwrap_or(h.ilog2()),
                 ..DEVICE_PROOF.masking.expect("the device format's masking")
             }),
+            cpu: self.cpu,
             ..DEVICE_PROOF
         }
     }
@@ -117,13 +128,45 @@ fn masks() -> MaskRng {
     MaskRng::default()
 }
 
-/// The kernel and the witness input of `statement` in `dir`.
-fn statement(dir: &Path, statement: &str) -> (Vec<u8>, Vec<u8>) {
+/// The stock kernels' reference arguments, as the build computed them from
+/// the credential actor's ELF; empty without it.
+static AUTH_INPUT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/auth.input"));
+static OWNER_INPUT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/owner.input"));
+
+/// A cell's statement: its kernel, its witness input and, for a stock
+/// kernel, its release's chips and log sizes.
+struct Statement {
+    kernel: Vec<u8>,
+    input: Vec<u8>,
+    released: Option<(u32, Vec<u32>)>,
+}
+
+/// The statement `statement`: a stock kernel's from its embedded release
+/// artifact, any other's `<statement>.kernel` and `<statement>.input` in
+/// `dir`.
+fn statement(dir: &Path, statement: &str) -> Statement {
+    let stock = match statement {
+        "auth" => Some(AUTH_INPUT),
+        "owner" => Some(OWNER_INPUT),
+        _ => None,
+    };
+    if let Some(input) = stock {
+        let device = crate::device_artifact(statement);
+        return Statement {
+            kernel: device.kernel,
+            input: input.to_vec(),
+            released: Some((device.chips, device.log_sizes)),
+        };
+    }
     let read = |extension: &str| {
         let path = dir.join(format!("{statement}.{extension}"));
         std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
     };
-    (read("kernel"), read("input"))
+    Statement {
+        kernel: read("kernel"),
+        input: read("input"),
+        released: None,
+    }
 }
 
 /// Runs `name` in this process: install, `warmups` proofs, then `reps`
@@ -153,7 +196,11 @@ fn measure<MC: MerkleChannel>(
     MC::H: serde::Serialize,
 {
     let format = cell.format();
-    let (kernel, input) = statement(dir, &cell.statement);
+    let Statement {
+        kernel,
+        input,
+        released,
+    } = statement(dir, &cell.statement);
     let trace = || {
         vos_pvm_proof::kernel::trace_kernel(&kernel, &input, GAS)
             .expect("the kernel runs to its halt")
@@ -162,7 +209,11 @@ fn measure<MC: MerkleChannel>(
     let started = Instant::now();
     let mut reference = trace();
     let steps = reference.steps.len();
-    let (active, log_sizes) = device_shape(&format, &kernel, &mut reference).expect("a shape");
+    let (active, log_sizes) = match released {
+        Some(shape) => shape,
+        None => device_shape(&format, &kernel, &mut reference).expect("a shape"),
+    };
+    drop(reference);
     let prover = DeviceProver::<MC>::install(&format, &kernel, active, &log_sizes)
         .unwrap_or_else(|error| panic!("{name} at {log_sizes:?}: {error:?}"));
     let program = prover.program();
@@ -210,7 +261,7 @@ fn measure<MC: MerkleChannel>(
         std::fs::create_dir_all(out).expect("the output directory");
         std::fs::write(out.join(name.replace(['/', ':'], "-")), &bytes).expect("written");
     }
-    let layout = DeviceComponents::layout(active, &log_sizes).expect("laid out");
+    let layout = DeviceComponents::layout(program.shape(), &log_sizes).expect("laid out");
     let (mut columns, mut cells) = (0usize, 0u64);
     let mut by_chip = Vec::new();
     for component in layout.components() {
@@ -245,13 +296,15 @@ fn measure<MC: MerkleChannel>(
             .join(",")
     };
     println!(
-        "{{\"kind\":\"device_cell\",\"cell\":\"{name}\",\"format\":{},\"threads\":{},\"steps\":{steps},\
+        "{{\"kind\":\"device_cell\",\"cell\":\"{name}\",\"format\":{},\"cpu\":\"{:?}\",\"cpu_columns\":{},\"threads\":{},\"steps\":{steps},\
          \"chips\":{chips:?},\"log_sizes\":{log_sizes:?},\"log_mask_rows\":{},\"columns\":{columns},\"cells\":{cells},\"by_chip\":[{}],\
          \"reps\":{reps},\"install_ms\":{install_ms:.1},\"trace_ms_p50\":{:.1},\
          \"prove_ms_p50\":{:.1},\"prove_ms_p95\":{:.1},\"prove_ms_min\":{:.1},\"prove_ms_max\":{:.1},\"prove_ms_runs\":[{}],\
          \"verify_ms_p50\":{:.2},\"r1_attempts\":{},\"r1_ms\":{:.1},\"proof_bytes\":{},\"distinct_proofs\":{distinct},\
          \"proof_sha256\":\"{}\",\"verified\":true,\"peak_rss_mib\":{:.1}}}",
         format.number,
+        format.cpu,
+        program.cpu.width(),
         rayon::current_num_threads(),
         format.masking.expect("masked").log_mask_rows,
         by_chip.join(","),

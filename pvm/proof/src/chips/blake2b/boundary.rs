@@ -57,6 +57,7 @@ use super::compression::{
     fill_schedule_preprocessed,
 };
 
+#[derive(Clone, Copy)]
 pub struct Blake2bBoundaryChip;
 
 /// Structurally identical to `blake2b::PreprocessedColumn` but under the

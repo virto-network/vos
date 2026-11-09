@@ -42,6 +42,7 @@ pub(crate) use witness::entry;
 #[cfg(feature = "prover")]
 pub use witness::{range_checked_bytes, witness};
 
+#[derive(Clone, Copy)]
 pub struct DivRemChip;
 
 #[derive(Debug, Copy, Clone, AirColumn)]

@@ -56,6 +56,7 @@ use crate::{
     },
 };
 
+#[derive(Clone, Copy)]
 pub struct WitnessInputChip;
 
 #[derive(Debug, Copy, Clone, AirColumn)]

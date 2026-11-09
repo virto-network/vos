@@ -28,8 +28,9 @@ use stwo::prover::backend::BackendForChannel;
 use stwo::prover::backend::simd::SimdBackend;
 use vos_pvm_final_verifier::Error;
 use vos_pvm_final_verifier::masked::{Claim, MaskedFormat, verify_masked};
-use vos_pvm_proof::device::{DEVICE_MAX_LOG_SIZE, DeviceLayout, device_chips_of_code};
-use vos_pvm_proof::format::Format;
+use vos_pvm_proof::chips::CpuColumns;
+use vos_pvm_proof::device::{DEVICE_MAX_LOG_SIZE, DeviceLayout, DeviceShape, device_chips_of_code};
+use vos_pvm_proof::format::{Cpu, Format};
 use vos_pvm_proof::framework_access::AllLookupElements;
 use vos_pvm_proof::masked::{
     ChipSet, Components, DeviceComponents, DeviceSizes, MaskedDeviceTrace, device_bound_sums,
@@ -55,11 +56,15 @@ impl<S: ChipSet> MaskedProvers for Components<S> {
 pub const DEVICE_PROGRAM_TAG: u64 = u64::from_le_bytes(*b"VOS/DEV1");
 
 /// A device program, as its verifier pins it: its chips, their log sizes,
-/// its layout and the preprocessed root they commit under its format.
+/// its CPU's columns, its layout and the preprocessed root they commit under
+/// its format.
 #[derive(Clone, Debug)]
 pub struct DeviceProgram<H: MerkleHasherLifted> {
     /// The chips, a device mask (`vos_pvm_proof::device::device_chip`).
     pub active: u32,
+    /// The CPU's columns: every one under a format of the full CPU, the
+    /// code's under a per-program one (`CpuColumns::of_code`).
+    pub cpu: CpuColumns,
     /// Each chip's log size, in `DEVICE_ORDER`.
     pub log_sizes: Vec<u32>,
     pub layout: DeviceLayout,
@@ -68,11 +73,33 @@ pub struct DeviceProgram<H: MerkleHasherLifted> {
 }
 
 impl<H: MerkleHasherLifted> DeviceProgram<H> {
-    /// The words the transcript mixes right after the header: the tag and
-    /// the chips. The header holds the format and the log sizes; the first
+    /// The words the transcript mixes right after the header: the tag, the
+    /// chips and, for a per-program CPU that cuts any, the CPU's columns'
+    /// words. The header holds the format and the log sizes; the first
     /// commitment, the preprocessed root.
-    pub fn header(&self) -> [u64; 2] {
-        [DEVICE_PROGRAM_TAG, u64::from(self.active)]
+    pub fn header(&self) -> Vec<u64> {
+        let mut words = vec![DEVICE_PROGRAM_TAG, u64::from(self.active)];
+        if self.cpu != CpuColumns::ALL {
+            words.extend(self.cpu.words());
+        }
+        words
+    }
+
+    /// Its components: the chips and the CPU's columns.
+    pub fn shape(&self) -> DeviceShape {
+        DeviceShape {
+            chips: self.active,
+            cpu: self.cpu,
+        }
+    }
+}
+
+/// The CPU's columns kernel code `code` takes under `format`: every column
+/// for the full CPU, the code's for the per-program CPU.
+pub fn device_cpu(format: &Format, code: &SideNote) -> CpuColumns {
+    match format.cpu {
+        Cpu::Full => CpuColumns::ALL,
+        Cpu::PerProgram => CpuColumns::of_code(&code.code, &code.bitmask),
     }
 }
 
@@ -91,10 +118,10 @@ pub struct DeviceProof<H: MerkleHasherLifted> {
 /// of it reveals ([`Reveal`], `proving.md` §5), which R1 would refuse on
 /// every transcript: such a format is refused at the install, before any
 /// proof.
-pub fn device_floors(format: &Format, active: u32) -> Option<Vec<u32>> {
+pub fn device_floors(format: &Format, shape: DeviceShape) -> Option<Vec<u32>> {
     let any = format.masking?.log_mask_rows + 2;
-    let chips = vos_pvm_proof::masked::Device::chips(active)?;
-    let layout = DeviceComponents::layout(active, &vec![any; chips.len()])?;
+    let chips = vos_pvm_proof::masked::Device::chips(shape)?;
+    let layout = DeviceComponents::layout(shape, &vec![any; chips.len()])?;
     let rows = mask_rows(format, &layout)?;
     let covered = reveals(format, &layout)?
         .iter()
@@ -109,10 +136,10 @@ pub fn device_floors(format: &Format, active: u32) -> Option<Vec<u32>> {
 /// shape the device set refuses.
 pub fn device_reveals(
     format: &Format,
-    active: u32,
+    shape: DeviceShape,
     log_sizes: &[u32],
 ) -> Option<Vec<(Reveal, u32)>> {
-    let layout = DeviceComponents::layout(active, log_sizes)?;
+    let layout = DeviceComponents::layout(shape, log_sizes)?;
     let reveals = reveals(format, &layout)?;
     let rows = mask_rows(format, &layout)?;
     Some(reveals.into_iter().zip(rows).collect())
@@ -131,10 +158,14 @@ pub fn device_shape(
     let layout =
         DeviceLayout::of_program(blob).ok_or(ProveError::TraceShape("not a standard program"))?;
     let active = device_chips_of_code(&reference.code, &reference.bitmask);
-    let floors = device_floors(format, active).ok_or(ProveError::TraceShape(
+    let shape = DeviceShape {
+        chips: active,
+        cpu: device_cpu(format, reference),
+    };
+    let floors = device_floors(format, shape).ok_or(ProveError::TraceShape(
         "the format's masking does not fit the chips, or an h under the rows a chip reveals",
     ))?;
-    let trace = masked_device_trace(reference, &layout, active, DeviceSizes::AtLeast(&floors))
+    let trace = masked_device_trace(reference, &layout, shape, DeviceSizes::AtLeast(&floors))
         .map_err(|error| ProveError::Segment(error.to_string()))?;
     Ok((active, trace.log_sizes.clone()))
 }
@@ -190,7 +221,11 @@ where
         if active != device_chips_of_code(&code.code, &code.bitmask) {
             return Err(ProveError::TraceShape("the chips are not the code's"));
         }
-        let floors = device_floors(format, active).ok_or(ProveError::TraceShape(
+        let shape = DeviceShape {
+            chips: active,
+            cpu: device_cpu(format, &code),
+        };
+        let floors = device_floors(format, shape).ok_or(ProveError::TraceShape(
             "the format's masking does not fit the chips, or an h under the rows a chip reveals",
         ))?;
         if floors.len() != log_sizes.len() || log_sizes.iter().zip(&floors).any(|(s, f)| s < f) {
@@ -209,6 +244,7 @@ where
             format: *format,
             program: DeviceProgram {
                 active,
+                cpu: shape.cpu,
                 log_sizes: log_sizes.to_vec(),
                 layout,
                 circuit: committed.root(),
@@ -301,7 +337,7 @@ pub fn device_trace<H: MerkleHasherLifted>(
     masked_device_trace(
         side_note,
         &program.layout,
-        program.active,
+        program.shape(),
         DeviceSizes::Pinned(&program.log_sizes),
     )
     .map_err(|error| ProveError::Segment(error.to_string()))
@@ -338,7 +374,7 @@ where
         trace.interaction(side_note, relations, &fractions)
     };
     let masked = MaskedTrace {
-        active: program.active,
+        active: program.shape(),
         log_sizes: &trace.log_sizes,
         preprocessed: match committed {
             Some(_) => Vec::new(),
@@ -375,7 +411,10 @@ pub fn device_format<'a, H: MerkleHasherLifted>(
     program: &'a DeviceProgram<H>,
     header: &'a [u64],
 ) -> Option<(MaskedFormat<'a>, DeviceComponents)> {
-    let floors = device_floors(format, program.active)?;
+    if format.cpu == Cpu::Full && program.cpu != CpuColumns::ALL {
+        return None;
+    }
+    let floors = device_floors(format, program.shape())?;
     let fits = floors.len() == program.log_sizes.len()
         && program
             .log_sizes
@@ -385,7 +424,7 @@ pub fn device_format<'a, H: MerkleHasherLifted>(
     if !fits {
         return None;
     }
-    let layout = DeviceComponents::layout(program.active, &program.log_sizes)?;
+    let layout = DeviceComponents::layout(program.shape(), &program.log_sizes)?;
     let masked = super::verifier_format(format, &program.log_sizes, &layout)?;
     Some((
         MaskedFormat {
@@ -419,7 +458,7 @@ pub fn verify_device_in<MC: MerkleChannel>(
     proof: DeviceProof<MC::H>,
 ) -> Result<(), Error> {
     let layout =
-        DeviceComponents::layout(program.active, &program.log_sizes).ok_or(Error::Format)?;
+        DeviceComponents::layout(program.shape(), &program.log_sizes).ok_or(Error::Format)?;
     let public = device_public_values(&proof.io);
     let zero = |_: &AllLookupElements| SecureField::zero();
     let bound = |relations: &AllLookupElements, sums: &[SecureField]| {

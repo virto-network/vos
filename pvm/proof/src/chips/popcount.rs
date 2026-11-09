@@ -40,6 +40,7 @@ use crate::{
     lookups::PopcountLookupElements,
 };
 
+#[derive(Clone, Copy)]
 pub struct PopcountChip;
 
 const POPCOUNT_LOG_SIZE: u32 = 8; // 2^8 = 256 rows

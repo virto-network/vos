@@ -65,6 +65,7 @@ use crate::{
 /// The FS-transcript mix of the field (see `prove.rs`) makes a finished proof
 /// tamper-evident and feeds the boundary states into the lookup-element draw
 /// the binding check relies on.
+#[derive(Clone, Copy)]
 pub struct RegisterMemoryClosingChip;
 
 #[derive(Debug, Copy, Clone, AirColumn)]

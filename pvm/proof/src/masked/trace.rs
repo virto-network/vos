@@ -36,6 +36,9 @@ pub type Evaluations = ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitRev
 pub struct ChipTraces {
     components: Vec<&'static dyn MachineProverComponent>,
     traces: Vec<ComponentTrace>,
+    /// The per-program CPU the first chip is, its cut columns zeroed in its
+    /// trace; `None` for the full CPU.
+    cpu: Option<crate::chips::ProgramCpuChip>,
 }
 
 /// A run's chips, traced as the node's segment: what the masked prover
@@ -92,7 +95,11 @@ pub fn masked_segment_trace(
         log_sizes: traces.iter().map(ComponentTrace::log_size).collect(),
         initial_state,
         final_state,
-        chips: ChipTraces { components, traces },
+        chips: ChipTraces {
+            components,
+            traces,
+            cpu: None,
+        },
     })
 }
 
@@ -140,19 +147,21 @@ pub enum DeviceSizes<'a> {
 }
 
 /// `side_note`'s run traced as the device's segment of a program laid out
-/// as `layout`, over the chips `active` names (a device mask), each at its
-/// log size in `sizes`: the program's shape, never the run's. The run is
-/// taken whole: its first touches are the layout's, its registers at entry
-/// the layout's.
+/// as `layout`, over the chips `shape` names (a device mask) and its CPU,
+/// each at its log size in `sizes`: the program's shape, never the run's.
+/// The run is taken whole: its first touches are the layout's, its
+/// registers at entry the layout's. A per-program CPU's cut columns are
+/// zeroed in its trace.
 pub fn masked_device_trace(
     side_note: &mut SideNote,
     layout: &crate::device::DeviceLayout,
-    active: u32,
+    shape: crate::device::DeviceShape,
     sizes: DeviceSizes<'_>,
 ) -> Result<MaskedDeviceTrace, ProvingError> {
     let (DeviceSizes::Pinned(log_sizes) | DeviceSizes::AtLeast(log_sizes)) = sizes;
     use super::ChipSet;
-    let chips = super::Device::chips(active).ok_or(ProvingError::MalformedShape)?;
+    let active = shape.chips;
+    let chips = super::Device::chips(shape).ok_or(ProvingError::MalformedShape)?;
     if chips.len() != log_sizes.len() {
         return Err(ProvingError::MalformedShape);
     }
@@ -166,7 +175,17 @@ pub fn masked_device_trace(
         .iter()
         .map(|&chip| crate::device_component(chip))
         .collect();
-    let traces = generate_component_traces(side_note, &components, log_sizes);
+    let cpu = shape.program_cpu();
+    side_note.cpu_rows_local = cpu.is_some();
+    let mut traces = generate_component_traces(side_note, &components, log_sizes);
+    if let Some(cpu) = &cpu {
+        assert_eq!(
+            chips.first(),
+            Some(&chip_idx::CPU),
+            "the CPU is the first chip"
+        );
+        cpu.cut(&mut traces[0]);
+    }
     if let DeviceSizes::Pinned(log_sizes) = sizes
         && let Some((&chip, (trace, &pinned))) = chips
             .iter()
@@ -190,7 +209,11 @@ pub fn masked_device_trace(
         active,
         log_sizes: traces.iter().map(ComponentTrace::log_size).collect(),
         io,
-        chips: ChipTraces { components, traces },
+        chips: ChipTraces {
+            components,
+            traces,
+            cpu,
+        },
     })
 }
 
@@ -204,7 +227,7 @@ pub fn device_preprocessed(
     log_sizes: &[u32],
 ) -> Result<Evaluations, ProvingError> {
     use super::ChipSet;
-    let chips = super::Device::chips(active).ok_or(ProvingError::MalformedShape)?;
+    let chips = super::Device::chips(active.into()).ok_or(ProvingError::MalformedShape)?;
     if chips.len() != log_sizes.len() {
         return Err(ProvingError::MalformedShape);
     }
@@ -243,13 +266,17 @@ impl ChipTraces {
     /// in bit-reversed order, borrowed: the masked prover interpolates them
     /// a column at a time, with no copy of the trace.
     pub fn main(&self, chip: usize) -> Vec<&BaseColumn> {
-        self.traces
-            .get(chip)
-            .map_or_else(Vec::new, |trace| trace.original_trace.iter().collect())
+        match (self.traces.get(chip), &self.cpu) {
+            (None, _) => Vec::new(),
+            (Some(trace), Some(cpu)) if chip == 0 => cpu.committed(trace).collect(),
+            (Some(trace), _) => trace.original_trace.iter().collect(),
+        }
     }
 
     /// Each chip's main columns, in bit-reversed order, to change: what a
-    /// forged trace starts from. The soundness gates' seam alone.
+    /// forged trace starts from. The soundness gates' seam alone. A cut
+    /// CPU's columns are its full trace's: a change to a cut column reaches
+    /// its interaction trace but not its commitment.
     #[cfg(feature = "seeded-masks")]
     pub fn main_columns_mut(&mut self) -> impl Iterator<Item = &mut Vec<BaseColumn>> {
         self.traces
@@ -282,8 +309,10 @@ impl ChipTraces {
             .zip(&self.traces)
             .enumerate()
             .map(|(index, (component, trace))| {
-                let (columns, claimed_sum) =
-                    component.generate_interaction_trace(trace, side_note, relations);
+                let (columns, claimed_sum) = match &self.cpu {
+                    Some(cpu) if index == 0 => cpu.interaction_trace(trace, relations),
+                    _ => component.generate_interaction_trace(trace, side_note, relations),
+                };
                 let blind = blinding
                     .get(index)
                     .map_or(SecureField::zero(), |&(numerator, denominator)| {

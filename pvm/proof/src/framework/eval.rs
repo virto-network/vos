@@ -1,7 +1,5 @@
 use stwo_constraint_framework::{EvalAtRow, FrameworkEval};
 
-use crate::trace::eval::TraceEval;
-
 use crate::framework::traits::builtin::BuiltInComponent;
 
 pub struct BuiltInComponentEval<'a, C: BuiltInComponent> {
@@ -26,7 +24,7 @@ impl<C: BuiltInComponent> FrameworkEval for BuiltInComponentEval<'_, C> {
     }
 
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
-        let trace_eval = TraceEval::new(&mut eval);
+        let trace_eval = self.component.trace_eval(&mut eval);
         C::add_constraints(self.component, &mut eval, trace_eval, &self.lookup_elements);
         C::LOGUP.finalize(&mut eval);
         eval

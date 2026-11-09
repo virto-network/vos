@@ -59,6 +59,7 @@ use crate::{
     lookups::JumpTableLookupElements,
 };
 
+#[derive(Clone, Copy)]
 pub struct JumpTableChip;
 
 #[derive(Debug, Copy, Clone, AirColumn)]

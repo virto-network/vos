@@ -41,6 +41,7 @@ use crate::{
     lookups::{CompareLookupElements, Range256LookupElements},
 };
 
+#[derive(Clone, Copy)]
 pub struct CompareChip;
 
 #[derive(Debug, Copy, Clone, AirColumn)]

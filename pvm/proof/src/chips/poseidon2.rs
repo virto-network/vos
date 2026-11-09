@@ -76,6 +76,7 @@ use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
 
+#[derive(Clone, Copy)]
 pub struct Poseidon2Chip;
 
 /// The input's bytes: sixteen words of four.

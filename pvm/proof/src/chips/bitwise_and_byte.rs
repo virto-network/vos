@@ -36,6 +36,7 @@ use crate::{
 ///
 /// Row `a·256 + b` holds `(a, b, a & b)` — the same index
 /// `side_note.bitwise_and_byte_counts` is keyed by.
+#[derive(Clone, Copy)]
 pub struct BitwiseAndByteChip;
 
 const BITWISE_BYTE_LOG_SIZE: u32 = 16; // 2^16 = 256×256 rows

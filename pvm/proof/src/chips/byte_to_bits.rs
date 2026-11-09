@@ -53,6 +53,7 @@ use crate::{
     lookups::ByteToBitsLookupElements,
 };
 
+#[derive(Clone, Copy)]
 pub struct ByteToBitsChip;
 
 const BYTE_TO_BITS_LOG_SIZE: u32 = 8; // 2^8 = 256 rows

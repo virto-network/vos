@@ -94,6 +94,16 @@ pub trait BuiltInComponent {
     #[allow(private_bounds)]
     type LookupElements: ComponentLookupElements;
 
+    /// The chip's columns at a row, read from `eval`: every main column by
+    /// default; a chip whose instance commits fewer reads the others as zero
+    /// ([`TraceEval::with_columns`]).
+    fn trace_eval<E: EvalAtRow>(
+        &self,
+        eval: &mut E,
+    ) -> TraceEval<Self::PreprocessedColumn, Self::MainColumn, E> {
+        TraceEval::new(eval)
+    }
+
     /// The chip's constraints and fractions, the fractions left unfinalized
     /// ([`LOGUP`](Self::LOGUP)).
     fn add_constraints<E: EvalAtRow>(

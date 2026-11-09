@@ -39,6 +39,7 @@ mimalloc = { version = "0.1.52", optional = true }
 # (`build.rs`): the transpiler and the release build, on the host alone.
 [build-dependencies]
 vos-pvm-compiler = { workspace = true }
+vos-pvm-recair = { workspace = true }
 vos-light = { workspace = true, features = ["release"] }
 vos-wire = { workspace = true }
 

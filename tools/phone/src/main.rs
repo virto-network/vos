@@ -14,9 +14,10 @@
 //!   against the same calls: a phone's proofs verified on x86.
 //! - `vos-phone device [--kernels DIR] [--cells LIST] [--reps N] [--warmups N] [--threads auto|N] [--out DIR]`:
 //!   device kernels proved masked under the device profile at candidate
-//!   parameters (`device.rs`), one `device_cell` line a cell, each in
-//!   a child process of its own; the kernels and their witness inputs read
-//!   from DIR (default `kernels` beside the binary).
+//!   parameters and CPU (`device.rs`), one `device_cell` line a cell, each
+//!   in a child process of its own; the stock kernels from their embedded
+//!   release artifacts, any other kernel and its witness input read from
+//!   DIR (default `kernels` beside the binary).
 //!
 //! - `vos-phone kernel --device PATH --input PATH --out PATH [--claim N] [--threads auto|N]`:
 //!   a device kernel proved as the device library proves it for a space's
@@ -84,8 +85,8 @@ const CELLS: [&str; 2] = ["auth", "owner"];
 static AUTH: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/auth.device"));
 static OWNER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/owner.device"));
 
-/// The stock kernel `cell`'s program, from its embedded release artifact.
-fn program(cell: &str) -> DeviceProgram {
+/// The stock kernel `cell`'s embedded release artifact.
+fn device_artifact(cell: &str) -> Device {
     let bytes = match cell {
         "auth" => AUTH,
         "owner" => OWNER,
@@ -95,8 +96,12 @@ fn program(cell: &str) -> DeviceProgram {
         !bytes.is_empty(),
         "built without the credential actor's ELF: `just build-credentials` first"
     );
-    let device = Device::decode_exact(bytes).expect("a release artifact");
-    DeviceProgram::released(&device).expect("the stock kernel's program")
+    Device::decode_exact(bytes).expect("a release artifact")
+}
+
+/// The stock kernel `cell`'s program, from its embedded release artifact.
+fn program(cell: &str) -> DeviceProgram {
+    DeviceProgram::released(&device_artifact(cell)).expect("the stock kernel's program")
 }
 /// The guard name of every cell.
 const NAME: &[u8] = b"login";

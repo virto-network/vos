@@ -51,7 +51,20 @@ pub(super) fn generate_interaction_trace(
     ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
     SecureField,
 ) {
-    let mut logup = LogupTraceBuilder::new(component_trace.log_size());
+    interaction_trace(component_trace, lookup_elements, u128::MAX)
+}
+
+/// The interaction trace with only the fractions `kept` names, bit `i` the
+/// `i`-th in the AIR's order: a per-program CPU's.
+pub(super) fn interaction_trace(
+    component_trace: &ComponentTrace,
+    lookup_elements: &AllLookupElements,
+    kept: u128,
+) -> (
+    ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
+    SecureField,
+) {
+    let mut logup = LogupTraceBuilder::new(component_trace.log_size()).keeping(kept);
     let row = &RowTrace::new(component_trace);
     // The fractions in the AIR's order.
     result_bytes(&mut logup, row, lookup_elements);

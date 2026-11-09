@@ -33,6 +33,11 @@ pub struct LogupTraceBuilder {
     /// How many of the next fractions take a column each, never paired:
     /// the first `singles` for `Logup::SingleThenPairs`, none otherwise.
     singles: usize,
+    /// The fractions written, by their index among the chip's: bit `i` of
+    /// the `i`-th, every one by default ([`Self::keeping`]).
+    kept: u128,
+    /// The index of the next fraction.
+    next: usize,
 }
 
 impl LogupTraceBuilder {
@@ -48,6 +53,29 @@ impl LogupTraceBuilder {
             pending_logup: Vec::with_capacity(1 << (log_size - LOG_N_LANES)),
             skip_dead_rows,
             singles: 0,
+            kept: u128::MAX,
+            next: 0,
+        }
+    }
+
+    /// A builder that writes only the fractions `kept` names, bit `i` the
+    /// `i`-th the chip adds: the others' numerators are zero on every row
+    /// of an instance that omits them.
+    pub fn keeping(self, kept: u128) -> Self {
+        Self { kept, ..self }
+    }
+
+    /// Whether the next fraction is written, counting it: every one past
+    /// the 128 a mask names is, and a builder keeping fewer takes none.
+    fn take(&mut self) -> bool {
+        let index = self.next;
+        self.next += 1;
+        match index {
+            0..128 => self.kept >> index & 1 == 1,
+            _ => {
+                assert_eq!(self.kept, u128::MAX, "a fraction past a builder's mask");
+                true
+            }
         }
     }
 
@@ -103,6 +131,9 @@ impl LogupTraceBuilder {
         R: RegisteredLookupBound,
         F: Fn([PackedBaseField; N]) -> PackedSecureField,
     {
+        if !self.take() {
+            return;
+        }
         let frac_iter = Self::iter_logup_fractions(
             self.log_size,
             self.skip_dead_rows,
@@ -129,6 +160,9 @@ impl LogupTraceBuilder {
         F: Fn([PackedBaseField; N]) -> PackedSecureField,
         G: Fn(usize) -> Vec<PackedBaseField>,
     {
+        if !self.take() {
+            return;
+        }
         let num_vecs = 1 << (self.log_size - LOG_N_LANES);
         let skip_dead_rows = self.skip_dead_rows;
         let frac_iter = (0..num_vecs).map(|vec_idx| {

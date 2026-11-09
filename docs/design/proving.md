@@ -1713,6 +1713,22 @@ pays (`open.md`):
   traced kernel uses 48–55 of the 139 opcodes): 785 → 535–549 columns at
   every length, −8.8% of the auth kernel's cells, −14–17% of heavier
   kernels', and a narrower node leaf, in both formats;
+  **as built (2026-11-09), a candidate format field** (`Cpu::PerProgram`,
+  the device profile only; format 46 keeps the full CPU): the full CPU
+  AIR with the columns the program's code cannot set fixed to zero and
+  the constraints and fractions that vanish under that cut dropped, so
+  every cut trace is a trace of the full AIR. The column set is a
+  function of the code alone (opcode flags and `ecalli` ids), hashed
+  into the program id and the transcript header. Its fill sets each
+  column on its instructions' rows alone, so an honest run's cut columns
+  are already zero; the full CPU's fill, and so every shipped proof, is
+  unchanged. On the stock kernels
+  the CPU is 781 → 539 columns (auth) and 538 (owner), the kernel's
+  cells −9.5% (auth, 10.43M → 9.44M) and −7.8% (owner, 6.39M → 5.89M);
+  proving at four threads 231 → 211 ms (auth) and 135 → 128 ms (owner),
+  peak −5%, proofs −6.5% [measured, x86 dev machine (Intel Core Ultra 7
+  155H, loaded by other work, automatic threads too noisy to read),
+  2026-11-09]. Format 47 takes it beside word-level memory;
 - **word-level memory:** −17% of the auth kernel's cells, its memory
   ledger byte-level at 2^14 rows for 1,722 steps; −26% beside the
   per-program CPU.
@@ -1746,7 +1762,7 @@ compared with x86's byte for byte.
 | a shape per kernel | −38% verify, −14% bytes, −10% RSS [measured] | about 1 week | built |
 | the reference Poseidon2 and a SIMD hasher | segments on Poseidon2 at 1.75–1.85× Blake2s, against 6.4–6.9× before; a leaf's commitment 0.63 s [measured] | 2–3 weeks | built |
 | the seven zero columns dropped; logical right shifts through MUL | the window kernel −5.75% of its cells; its statement 33.3 s end to end [measured] | | built (formats 41 and 46) |
-| a per-program CPU (its columns the program's opcodes') | 785 → 535–549 CPU columns; −8.8% to −17% of a kernel's cells; a narrower leaf [model] | 3–5 weeks | next (`open.md`) |
+| a per-program CPU (its columns the program's opcodes') | 785 → 535–549 CPU columns; −8.8% to −17% of a kernel's cells; a narrower leaf [model]; the stock kernels 781 → 538–539 columns, −7.8% / −9.5% of their cells [measured] | 3–5 weeks | built for the device profile as a candidate, not in a shipped format (format 47 is to take it); node segments later |
 | word-level memory | MEMORY 4–8× fewer rows; −17% of the auth kernel's cells [model] | 4–6 weeks | next (`open.md`) |
 | the CPU split by opcode family | 4-way: −5.4% of the auth kernel's cells, 1–8% of a segment's, under 1% at a class's fixed shape, wider by 499 columns, past a leaf with the Poseidon2 chip [model] | 6–10 weeks | not built; a 2-way split on the per-program CPU only where padding pays |
 | narrow BLAKE2b chips | −2,200 columns; −30–45% of BLAKE2b's cells [model] | 3–5 weeks | later (device kernels hold no BLAKE2b, §8; folds gain) |
