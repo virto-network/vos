@@ -108,8 +108,9 @@ pub(super) fn compare(out: &mut Sinks, s: Step, ops: &Operands) -> Compare {
     trace.fill_columns(row, sign_src_d, Column::SignSrcD);
 
     // Signed lt: if signs differ, negative is smaller. If same, use unsigned compare.
-    // On a compare's or a branch's row alone, as the unsigned flag is.
-    let cmp_lt_s_flag: u8 = if !(flags.is_compare || flags.is_branch) {
+    // On a compare's or a branch's row alone, as the unsigned flag is,
+    // under the per-program CPU's fill.
+    let cmp_lt_s_flag: u8 = if side_note.cpu_rows_local && !(flags.is_compare || flags.is_branch) {
         0
     } else if sign_bit_b != sign_bit_d {
         sign_bit_b // b is negative (sign=1) → b < d

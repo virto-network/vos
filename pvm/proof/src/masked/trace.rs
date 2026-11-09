@@ -175,8 +175,9 @@ pub fn masked_device_trace(
         .iter()
         .map(|&chip| crate::device_component(chip))
         .collect();
-    let mut traces = generate_component_traces(side_note, &components, log_sizes);
     let cpu = shape.program_cpu();
+    side_note.cpu_rows_local = cpu.is_some();
+    let mut traces = generate_component_traces(side_note, &components, log_sizes);
     if let Some(cpu) = &cpu {
         assert_eq!(
             chips.first(),

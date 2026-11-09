@@ -1719,7 +1719,10 @@ pays (`open.md`):
   the constraints and fractions that vanish under that cut dropped, so
   every cut trace is a trace of the full AIR. The column set is a
   function of the code alone (opcode flags and `ecalli` ids), hashed
-  into the program id and the transcript header. On the stock kernels
+  into the program id and the transcript header. Its fill sets each
+  column on its instructions' rows alone, so an honest run's cut columns
+  are already zero; the full CPU's fill, and so every shipped proof, is
+  unchanged. On the stock kernels
   the CPU is 781 → 539 columns (auth) and 538 (owner), the kernel's
   cells −9.5% (auth, 10.43M → 9.44M) and −7.8% (owner, 6.39M → 5.89M);
   proving at four threads 231 → 211 ms (auth) and 135 → 128 ms (owner),

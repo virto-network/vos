@@ -18,9 +18,10 @@
 //!   the program memory's lookup, so a step of an operation the code does
 //!   not hold is refused by the full AIR as by the cut one; a cut that drops
 //!   a column the program's run sets is a run the prover cannot prove (its
-//!   constraints fail at the prover's own check), never a proof. The fill
-//!   sets a column on its instructions' rows alone, so an honest run's
-//!   cut columns are already zero and its cut trace is its full one.
+//!   constraints fail at the prover's own check), never a proof. The
+//!   per-program CPU's fill (`SideNote::cpu_rows_local`) sets a column on
+//!   its instructions' rows alone, so an honest run's cut columns are
+//!   already zero and its cut trace is a full-CPU trace of the run.
 
 use num_traits::{One, Zero};
 use stwo::core::Fraction;
@@ -1130,10 +1131,10 @@ mod tests {
     }
 
     /// The per-program CPU of `side_note`'s code over its run, when the full
-    /// CPU proves the run: the full trace's cut columns already zero (the
-    /// fill row-local, so a program of many instructions is cut as each of
-    /// them alone), its trace satisfies its constraints and states the full
-    /// CPU's claimed sum. `Ok(false)` for a
+    /// CPU proves the run: its row-local fill a trace of the full CPU, its
+    /// cut columns already zero (so a program of many instructions is cut
+    /// as each of them alone), the cut trace satisfies the cut constraints
+    /// and states the full CPU's claimed sum. `Ok(false)` for a
     /// run the full CPU refuses (a fault the tracer records).
     fn check(side_note: &mut SideNote) -> Result<bool, String> {
         let columns = CpuColumns::of_code(&side_note.code, &side_note.bitmask);
@@ -1152,6 +1153,17 @@ mod tests {
         let mut relations = AllLookupElements::default();
         CpuChip.draw_lookup_elements(&mut relations, (&mut Blake2sM31Channel::default()).into());
         let (_, full_sum) = CpuChip.generate_interaction_trace(&full, side_note, &relations);
+        side_note.cpu_rows_local = true;
+        let full = CpuChip.generate_component_trace(side_note);
+        side_note.cpu_rows_local = false;
+        if let Some(violation) = violation(
+            &CpuChip,
+            full.log_size,
+            full.original_trace.iter().collect(),
+            &names(&CpuColumns::ALL),
+        ) {
+            return Err(format!("the row-local fill: {violation}"));
+        }
         let mut cut = full.clone();
         chip.cut(&mut cut);
         let all = names(&CpuColumns::ALL);

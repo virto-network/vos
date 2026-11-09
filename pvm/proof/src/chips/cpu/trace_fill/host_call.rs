@@ -72,25 +72,26 @@ pub(super) fn host_call(out: &mut Sinks, s: Step, ops: &Operands) -> HostCall {
                 cmp_carry,
             });
     }
-    // The pointer slots on a precompile call's row alone, which reads
-    // them, the counter slot on a BLAKE2b call's: zero on any other, as a
-    // program of no such call holds no column for them.
+    // Under the per-program CPU's fill, the pointer slots on a precompile
+    // call's row alone, which reads them, and the counter and flag slots
+    // on a BLAKE2b call's.
+    let local = side_note.cpu_rows_local;
     let pointers = is_blake_ecall || is_p2_ecall || is_witness;
-    let slot = |on: bool, register: usize| if on { step.regs_before[register] } else { 0 };
+    let slot = |on: bool, register: usize| {
+        if on || !local {
+            step.regs_before[register]
+        } else {
+            0
+        }
+    };
     // HPtr slot ← h_ptr (a0 = x10 = PVM φ[7]).
     trace.fill_columns(row, slot(pointers, 7), Column::HPtr);
     // MPtr slot ← m_ptr (a1 = x11 = PVM φ[8]).
     trace.fill_columns(row, slot(pointers, 8), Column::MPtr);
     // TLow slot ← t_low (a2 = x12 = PVM φ[9]).
     trace.fill_columns(row, slot(is_blake_ecall, 9), Column::TLow);
-    // Flag slot ← f_flag (a3 = x13 = PVM φ[10]), on a BLAKE2b call's row
-    // alone, which reads it: zero on any other, as a program of no BLAKE2b
-    // call holds no column for it.
-    let flag_u64 = if is_blake_ecall {
-        step.regs_before[10]
-    } else {
-        0
-    };
+    // Flag slot ← f_flag (a3 = x13 = PVM φ[10]).
+    let flag_u64 = slot(is_blake_ecall, 10);
     trace.fill_columns(row, flag_u64, Column::Flag);
     // Flag is non-zero exactly when its bytes' sum is: at most 2040,
     // it is its own field value, so its inverse witnesses it.
