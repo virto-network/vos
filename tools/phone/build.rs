@@ -3,7 +3,9 @@
 //! actor's package, derived, from their ELFs (`just build-agent
 //! build-test-actors`), written to `OUT_DIR` for `vos-phone light` to
 //! embed; and the stock kernels' release artifacts, `auth` and `owner`
-//! from the credential actor's ELF (`just build-credentials`), for `run`.
+//! from the credential actor's ELF (`just build-credentials`), for `run`,
+//! with the arguments their reference programs return, the public
+//! statements the device cells prove them on.
 //! Without the ELFs they are empty, and the commands say so.
 //!
 //! A package is encoded as `vos_light::release::Package` encodes it: its
@@ -37,14 +39,33 @@ fn main() {
     let credentials_elf =
         root.join("agent/programs/target/riscv64em-vos/release/vos-credentials.elf");
     println!("cargo::rerun-if-changed={}", credentials_elf.display());
+    let credentials = std::fs::read(&credentials_elf).ok();
+    let derived = credentials
+        .as_ref()
+        .map(|elf| vos_pvm_compiler::derive(elf).expect("the credential actor derives"));
     for kernel in ["auth", "owner"] {
-        let device = std::fs::read(&credentials_elf)
+        let device = credentials
+            .as_ref()
             .map(|elf| {
-                vos_light::release::device(&elf, kernel)
+                vos_light::release::device(elf, kernel)
                     .expect("the stock kernel's release artifact")
                     .encode()
             })
             .unwrap_or_default();
         std::fs::write(out.join(format!("{kernel}.device")), device).unwrap();
+        let input = derived
+            .as_ref()
+            .map(|derived| {
+                let method = vos_light::method_id(kernel);
+                let (_, reference, _) = derived
+                    .references
+                    .iter()
+                    .find(|(bound, _, _)| *bound == method)
+                    .expect("the stock kernel's reference");
+                vos_pvm_recair::device::reference_arguments(reference)
+                    .expect("the stock kernel's reference arguments")
+            })
+            .unwrap_or_default();
+        std::fs::write(out.join(format!("{kernel}.input")), input).unwrap();
     }
 }
