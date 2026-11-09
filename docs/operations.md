@@ -163,7 +163,11 @@ onion-only space; set it alike on every node of the space).
   The gateway prints `onion <address>` and `onion key <hex>` at start.
   Full vanguards are always on. `pow = true` needs a gateway built with
   `tor-pow`; no arti release has declared its service-side PoW ready, so
-  it is off by default.
+  it is off by default. An optional `arti = "…/arti.toml"` names an arti
+  client configuration to start from (a private Tor test network's
+  authorities and fallbacks, say; a key arti does not know is refused, not
+  ignored); the section's state, cache and full vanguards still apply over
+  it.
 - **A C tor beside the gateway**, the fallback should arti's onion be
   flooded (`design/light-node.md` §6.7): name its loopback listeners in
   place of arti's directories,
