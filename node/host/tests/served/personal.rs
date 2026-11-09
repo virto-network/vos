@@ -680,7 +680,10 @@ fn a_personal_space_is_claimed_paired_and_its_first_phone_retired() {
             at + policy().slot_ttl_ms,
             agent,
             PERSONAL,
-            vec!["home.onion".into()],
+            vec![vos_wire::credentials::Onion {
+                key: [0x0e; 32],
+                ssh_host_key: [0x0f; 32],
+            }],
         )
         .to_bytes();
     let code = Code::from_bytes(&qr).unwrap();

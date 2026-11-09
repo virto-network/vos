@@ -113,7 +113,10 @@ fn open_in(
         at + policy().slot_ttl_ms,
         7,
         PERSONAL,
-        vec!["home.onion".into()],
+        vec![vos_wire::credentials::Onion {
+            key: [0x0e; 32],
+            ssh_host_key: [0x0f; 32],
+        }],
     );
     (side, code.to_bytes().to_vec())
 }
