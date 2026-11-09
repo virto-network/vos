@@ -209,7 +209,7 @@ fn the_masked_device_chips_pass_the_degree_audit() {
     use vos_pvm_proof::device::{DEVICE_ALL, device_chip, device_chips_of_mask};
     use vos_pvm_proof::masked::{DeviceComponents, drive_masked_device_chip};
     let channel = &mut Blake2sM31Channel::default();
-    let lookups = DeviceComponents::draw_relations(DEVICE_ALL, channel);
+    let lookups = DeviceComponents::draw_relations(DEVICE_ALL.into(), channel);
     let blind = BlindRelation::draw(channel);
     let mut total = 0;
     for chip in device_chips_of_mask(DEVICE_ALL) {
@@ -233,7 +233,7 @@ fn the_masked_device_chips_pass_the_degree_audit() {
         }
     }
     let count = device_chips_of_mask(DEVICE_ALL).count();
-    let built = DeviceComponents::layout(DEVICE_ALL, &vec![10; count]).unwrap();
+    let built = DeviceComponents::layout(DEVICE_ALL.into(), &vec![10; count]).unwrap();
     assert_eq!(
         built
             .components()

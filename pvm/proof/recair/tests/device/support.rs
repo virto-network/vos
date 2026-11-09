@@ -10,7 +10,7 @@ use stwo::prover::backend::simd::SimdBackend;
 use vos_pvm_compiler::assembler::{Assembler, Reg};
 use vos_pvm_final_verifier::Error;
 use vos_pvm_proof::core::ecall::{ECALL_POSEIDON2, ECALL_WITNESS_INPUT};
-use vos_pvm_proof::format::{ChannelKind, Format, FormatParams, Masking, SEGMENT};
+use vos_pvm_proof::format::{ChannelKind, Cpu, Format, FormatParams, Masking, SEGMENT};
 use vos_pvm_proof::poseidon2::P2MerkleChannel;
 use vos_pvm_proof::side_note::SideNote;
 use vos_pvm_recair::ProveError;
@@ -132,9 +132,22 @@ pub fn small_format(channel: ChannelKind, log_mask_rows: u32, n_queries: usize) 
     }
 }
 
-/// The small format R1 passes: `h = 64`, every chip at 2^8 rows at least.
+/// The small format R1 passes: `h = 64`, every chip at 2^8 rows at least,
+/// its CPU [`cpu`]'s.
 pub fn format() -> Format {
-    small_format(ChannelKind::Poseidon2M31, 6, 4)
+    Format {
+        cpu: cpu(),
+        ..small_format(ChannelKind::Poseidon2M31, 6, 4)
+    }
+}
+
+/// The CPU the device gates prove under: the full CPU, or the per-program
+/// CPU where `DEVICE_CPU=program`, a run of the gates on the candidate.
+pub fn cpu() -> Cpu {
+    match std::env::var("DEVICE_CPU").as_deref() {
+        Ok("program") => Cpu::PerProgram,
+        _ => Cpu::Full,
+    }
 }
 
 /// The kernel's program under `format` on `MC`, its shape from a reference

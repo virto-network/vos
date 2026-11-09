@@ -218,7 +218,7 @@ fn a_program_outside_the_formats_count_is_refused() {
     let mut tall = honest.clone();
     tall.log_sizes[0] = DEVICE_MAX_LOG_SIZE + 1;
     let mut short = honest.clone();
-    short.log_sizes[0] = vos_pvm_recair::masked::device::device_floors(&format, honest.active)
+    short.log_sizes[0] = vos_pvm_recair::masked::device::device_floors(&format, honest.shape())
         .expect("floors")[0]
         - 1;
     assert!(install::<P2>(&format, &blob(), tall.active, &tall.log_sizes).is_err());
@@ -688,7 +688,9 @@ fn the_program_is_mixed_into_the_transcript() {
         .unwrap_or(Err(Error::Format))
     };
     verify_under(&program.header()).expect("the honest header");
-    let [tag, active] = program.header();
+    let [tag, active] = program.header()[..] else {
+        panic!("the full CPU's header is its tag and chips")
+    };
     assert!(verify_under(&[tag, active ^ 1 << device_chip::MUL]).is_err());
     assert!(verify_under(&[tag]).is_err());
     let mut other = program.clone();
@@ -748,7 +750,7 @@ fn a_tampered_proof_is_refused() {
 #[test]
 fn the_io_hash_is_the_one_public_sum() {
     let program = the_program();
-    let layout = DeviceComponents::layout(program.active, &program.log_sizes).expect("laid out");
+    let layout = DeviceComponents::layout(program.shape(), &program.log_sizes).expect("laid out");
     let position = vos_pvm_proof::device::device_chips_of_mask(program.active)
         .position(|chip| chip == device_chip::DEVICE_IO);
     assert_eq!(

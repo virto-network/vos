@@ -27,7 +27,7 @@ use vos_pvm_recair_air::masked::{
 fn device_shape(log_size: u32) -> SecurityShape {
     let pins = mask_pins(&DEVICE_PROOF.masking.unwrap());
     let chips: Vec<usize> = device_chips_of_mask(DEVICE_ALL).collect();
-    let set = DeviceComponents::layout(DEVICE_ALL, &vec![log_size; chips.len()]).unwrap();
+    let set = DeviceComponents::layout(DEVICE_ALL.into(), &vec![log_size; chips.len()]).unwrap();
     let trees = committed_log_sizes(&set, &pins).unwrap();
     let points = sample_points(&set, CirclePoint::<SecureField>::get_point(1), &pins).unwrap();
     let columns = points.iter().flatten();
@@ -45,7 +45,7 @@ fn device_shape(log_size: u32) -> SecurityShape {
         .max()
         .unwrap();
     let channel = &mut Blake2sM31Channel::default();
-    let relations = DeviceComponents::draw_relations(DEVICE_ALL, channel);
+    let relations = DeviceComponents::draw_relations(DEVICE_ALL.into(), channel);
     let blind = BlindRelation::draw(channel);
     let fractions: u64 = chips
         .iter()
@@ -110,7 +110,8 @@ fn every_device_chip_reveals_at_most_its_h() {
     assert_eq!(h, 256);
     let chips = device_chips_of_mask(DEVICE_ALL).count();
     for log_size in [10, DEVICE_MAX_LOG_SIZE] {
-        let reveals = device_reveals(&DEVICE_PROOF, DEVICE_ALL, &vec![log_size; chips]).unwrap();
+        let reveals =
+            device_reveals(&DEVICE_PROOF, DEVICE_ALL.into(), &vec![log_size; chips]).unwrap();
         assert_eq!(reveals.len(), chips);
         for (reveal, log_mask_rows) in reveals {
             assert_eq!((reveal.offsets, reveal.rows), (2, 149), "2^{log_size}");
@@ -118,7 +119,7 @@ fn every_device_chip_reveals_at_most_its_h() {
             assert!(reveal.rows <= h && 2 * reveal.rows > h);
         }
     }
-    let floors = device_floors(&DEVICE_PROOF, DEVICE_ALL).unwrap();
+    let floors = device_floors(&DEVICE_PROOF, DEVICE_ALL.into()).unwrap();
     assert!(floors.iter().all(|&floor| floor == 10), "{floors:?}");
 }
 
@@ -139,9 +140,9 @@ fn an_h_under_the_rows_revealed_is_refused_before_any_proof() {
         }),
         ..DEVICE_PROOF
     };
-    assert!(device_floors(&with(7, 47), DEVICE_ALL).is_none());
-    assert!(device_floors(&with(8, 83), DEVICE_ALL).is_none());
-    assert!(device_floors(&with(8, 82), DEVICE_ALL).is_some());
+    assert!(device_floors(&with(7, 47), DEVICE_ALL.into()).is_none());
+    assert!(device_floors(&with(8, 83), DEVICE_ALL.into()).is_none());
+    assert!(device_floors(&with(8, 82), DEVICE_ALL.into()).is_some());
 }
 
 /// A smaller device program counts more bits than the reference: the

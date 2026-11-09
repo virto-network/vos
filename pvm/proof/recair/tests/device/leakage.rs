@@ -131,9 +131,12 @@ fn the_published_values_do_not_depend_on_the_witness() {
 #[test]
 fn heavy_the_device_formats_proofs_do_not_depend_on_the_witness() {
     use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
-    use vos_pvm_recair::device::FORMAT;
+    let format = vos_pvm_proof::format::Format {
+        cpu: crate::support::cpu(),
+        ..vos_pvm_recair::device::FORMAT
+    };
     let n = n();
-    let program = program::<Blake2sM31MerkleChannel>(&FORMAT, &blob());
+    let program = program::<Blake2sM31MerkleChannel>(&format, &blob());
     assert_eq!(program.log_sizes.iter().min(), Some(&10));
     let mut attempts = 0;
     let mut most = 0;
@@ -141,7 +144,7 @@ fn heavy_the_device_formats_proofs_do_not_depend_on_the_witness() {
         let mut fields = Fields::default();
         for mask in 0..n as u64 {
             let (proof, stats) = prove::<Blake2sM31MerkleChannel>(
-                &FORMAT,
+                &format,
                 &program,
                 &blob(),
                 &witness(seed),
@@ -149,7 +152,7 @@ fn heavy_the_device_formats_proofs_do_not_depend_on_the_witness() {
             )
             .expect("proves");
             if mask == 0 {
-                verify::<Blake2sM31MerkleChannel>(&FORMAT, &program, &proof).expect("verifies");
+                verify::<Blake2sM31MerkleChannel>(&format, &program, &proof).expect("verifies");
             }
             assert_eq!(proof.io, io_bytes(), "one public value for both witnesses");
             assert!(stats.revealed_rows <= 149, "{stats:?}");
@@ -164,7 +167,7 @@ fn heavy_the_device_formats_proofs_do_not_depend_on_the_witness() {
     });
     eprintln!(
         "format {}: {} proofs, {attempts} attempts, at most {most} rows revealed of h = 256",
-        FORMAT.number,
+        format.number,
         2 * n
     );
     let mut verdicts = Verdicts::new("the device format's witness indistinguishability");
@@ -291,7 +294,7 @@ fn drawn_relations(
     P2MerkleChannel::mix_root(&mut channel, proof.proof.stark_proof.commitments[1]);
     channel.mix_felts(&device_public_values(&proof.io));
     channel.mix_u64(proof.proof.interaction_pow);
-    DeviceComponents::draw_relations(program.active, &mut channel)
+    DeviceComponents::draw_relations(program.shape(), &mut channel)
 }
 
 /// The claimed sums' control: the sums a right guess of the run computes
@@ -310,7 +313,7 @@ fn a_right_guess_reproduces_the_public_sum_only() {
     let trace = masked_device_trace(
         &mut side_note,
         &program.layout,
-        program.active,
+        program.shape(),
         DeviceSizes::Pinned(&program.log_sizes),
     )
     .expect("traces");
@@ -319,7 +322,7 @@ fn a_right_guess_reproduces_the_public_sum_only() {
         .into_iter()
         .map(|(_, sum)| sum)
         .collect();
-    let public = DeviceComponents::layout(program.active, &program.log_sizes)
+    let public = DeviceComponents::layout(program.shape(), &program.log_sizes)
         .expect("laid out")
         .public_sums();
     assert_eq!(public.len(), 1);
