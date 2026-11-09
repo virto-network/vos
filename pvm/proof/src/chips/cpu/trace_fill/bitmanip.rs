@@ -52,9 +52,12 @@ pub(super) fn bit_counts(out: &mut Sinks, s: Step, ops: &Operands) -> BitCounts 
     // BytePopcount witnesses, and charge popcount_counts for each
     // active emission so PopcountChip's multiplicity column balances.
     trace.fill_columns(row, flags.is_count_set_bits, Column::IsCountSetBits);
+    // On a count's row alone, zero on any other.
     let mut byte_popcount = [0u8; WORD_SIZE];
-    for i in 0..WORD_SIZE {
-        byte_popcount[i] = val_d_bytes[i].count_ones() as u8;
+    if flags.is_count_set_bits {
+        for i in 0..WORD_SIZE {
+            byte_popcount[i] = val_d_bytes[i].count_ones() as u8;
+        }
     }
     trace.fill_columns_bytes(row, &byte_popcount, Column::BytePopcount);
     if flags.is_count_set_bits {
