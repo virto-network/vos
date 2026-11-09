@@ -10,10 +10,11 @@ struct Space {
     handle: [u8; 32],
 }
 
-/// The screens' server side: reads, the claims under the app's key, and the
-/// relay of what the device proved.
+/// The screens' server side: reads, and the claims under the app's key.
 pub struct Service {
     demo: Demo,
+    /// The SSH host key the gateway's onions present on port 22.
+    ssh_host_key: Option<[u8; 32]>,
     gateway: Arc<Gateway>,
     /// The transport of the port the screens are served on.
     mark: Mark,
@@ -60,9 +61,9 @@ fn answered((kind, body): vos_api::client::Answer) -> Result<Vec<u8>, HostServic
 }
 
 /// How a method's own error reads on the screen.
-type Errors = fn(&[u8]) -> String;
+pub(super) type Errors = fn(&[u8]) -> String;
 
-fn method_error(_detail: &[u8]) -> String {
+pub(super) fn method_error(_detail: &[u8]) -> String {
     "the method refused".into()
 }
 
@@ -96,7 +97,7 @@ fn outcome(outcome: &Outcome, errors: Errors) -> Result<Vec<u8>, String> {
     }
 }
 
-fn payment_error(detail: &[u8]) -> String {
+pub(super) fn payment_error(detail: &[u8]) -> String {
     detail
         .first()
         .and_then(|index| PAYMENT_ERRORS.get(usize::from(*index)))
@@ -111,7 +112,7 @@ fn credential_error(detail: &[u8]) -> String {
 }
 
 /// A node's answer, as the screen says it.
-fn response(answer: &Response, errors: Errors) -> Result<Vec<u8>, String> {
+pub(super) fn response(answer: &Response, errors: Errors) -> Result<Vec<u8>, String> {
     match answer {
         Response::Ran { outcome: ran, .. } => outcome(ran, errors),
         Response::Rejected(Rejection::Credential(refusal)) => {
@@ -123,9 +124,16 @@ fn response(answer: &Response, errors: Errors) -> Result<Vec<u8>, String> {
 }
 
 impl Service {
-    pub fn new(demo: Demo, gateway: Arc<Gateway>, mark: Mark, app: Arc<AppClient>) -> Self {
+    pub fn new(
+        demo: Demo,
+        ssh_host_key: Option<[u8; 32]>,
+        gateway: Arc<Gateway>,
+        mark: Mark,
+        app: Arc<AppClient>,
+    ) -> Self {
         Self {
             demo,
+            ssh_host_key,
             gateway,
             mark,
             app,
@@ -256,7 +264,8 @@ impl Service {
     }
 
     /// The facility's `enroll` arguments: the space, the agent and what
-    /// the device may prove for.
+    /// the device may prove for, and the gateway's onions, which the device
+    /// pins and sends its proofs to.
     async fn enrollment(&self) -> Result<Value, HostServiceError> {
         let space = self.space().await?;
         let demo = &self.demo;
@@ -296,6 +305,23 @@ impl Service {
                     ("instance", Value::from(demo.credentials)),
                 ]),
             ),
+            (
+                "onions",
+                Value::Array(
+                    self.ssh_host_key
+                        .iter()
+                        .flat_map(|host| {
+                            demo.onions.iter().map(|key| {
+                                object([
+                                    ("key", Value::Bytes(key.to_vec())),
+                                    ("ssh_host_key", Value::Bytes(host.to_vec())),
+                                ])
+                            })
+                        })
+                        .collect(),
+                ),
+            ),
+            ("onion_only", Value::Bool(false)),
         ]))
     }
 
@@ -327,60 +353,6 @@ impl Service {
         )
         .await?;
         Ok(Value::from(slot))
-    }
-
-    /// Relay a credentialed request the facility made, if it names this
-    /// agent and the screen's method; refuse any other before it reaches a
-    /// node.
-    async fn relay(&self, args: &Value) -> Result<Value, HostServiceError> {
-        let request = bytes(args, "request")?;
-        let allowed: Vec<(u32, &str)> = match text(args, "screen")? {
-            "sign_in" => vec![(self.demo.poll, LOGIN), (self.demo.poll, VOTE)],
-            "pay" => vec![(self.demo.payments, TRANSFER)],
-            _ => return Err(failed("no such screen")),
-        };
-        let (kind, body) = request
-            .split_first_chunk::<2>()
-            .ok_or_else(|| failed("a request names its kind"))?;
-        if u16::from_le_bytes(*kind) != Kind::Credentialed as u16 {
-            return Err(failed("not a credentialed request"));
-        }
-        let (agent, call) = <(AgentId, Credentialed)>::decode_exact(body)
-            .ok_or_else(|| failed("the request does not decode"))?;
-        let named = allowed.iter().any(|(instance, name)| {
-            call.instance == InstanceId(*instance) && call.method == method(name)
-        });
-        if agent != self.agent() || !named {
-            return Err(failed(
-                "the request names another agent or method than this screen's",
-            ));
-        }
-        let answer = answered(
-            self.gateway
-                .relay(Kind::Credentialed, self.mark, body)
-                .await,
-        )?;
-        let answer = Response::decode_exact(&answer)
-            .ok_or_else(|| failed("an answer that does not decode"))?;
-        let root_unknown = matches!(
-            answer,
-            Response::Rejected(Rejection::Credential(
-                CredentialRefusal::RootUnknown | CredentialRefusal::RootStale
-            ))
-        );
-        let errors: Errors = if call.instance == InstanceId(self.demo.payments) {
-            payment_error
-        } else {
-            method_error
-        };
-        Ok(match response(&answer, errors) {
-            Ok(reply) => object([("ran", Value::Bool(true)), ("reply", Value::Bytes(reply))]),
-            Err(why) => object([
-                ("ran", Value::Bool(false)),
-                ("why", Value::from(why)),
-                ("root_unknown", Value::Bool(root_unknown)),
-            ]),
-        })
     }
 
     /// The name and balance of the account the owner digest `owner`
@@ -439,7 +411,6 @@ impl Service {
         match request.operation.as_str() {
             "enrollment" => self.enrollment().await,
             "claim" => self.claim(args).await,
-            "relay" => self.relay(args).await,
             "balance" => self.balance(args).await,
             "root" => self.root().await,
             other => Err(failed(format!("no operation `{other}`"))),

@@ -4,11 +4,14 @@
 //! offers the poll's `login`, proven by the stock `auth` kernel; *Pay* the
 //! ledger's `transfer`, proven by the stock `owner` kernel, from the
 //! account of the device's owner digest. The proofs are the member's
-//! device's: the client's `vos.credential` facility, which the app asks and
-//! whose answer, a node-API `Credentialed` request, the gateway relays as it
-//! is after checking it names this agent and the screen's method. The
-//! gateway builds no credential bytes and holds no authority; its app key
-//! sends only the claims an operator's invitations allow.
+//! device's: the client's `vos.credential` facility, which the app asks,
+//! sends each proof itself over Tor to the onions its enrollment pinned,
+//! and hands the screen the node's answer, which it shows; the screens
+//! relay nothing the device hands back. What the screen shows of that
+//! answer is the client's word: it grants nothing here, as the proven call
+//! itself is the action, at the node. The gateway builds no credential
+//! bytes and holds no authority; its app key sends only the claims an
+//! operator's invitations allow.
 
 use std::sync::Arc;
 
@@ -19,7 +22,7 @@ use vos_api::{FRAME_ERROR, Kind, Mark};
 use vos_wire::abi::Failure;
 use vos_wire::credentials::{CredentialError, RootEntry};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Session, derive_id};
-use vos_wire::ingress::{AgentInfo, CredentialRefusal, Credentialed, Rejection, Response};
+use vos_wire::ingress::{AgentInfo, CredentialRefusal, Rejection, Response};
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode, SpaceId};
 
@@ -48,6 +51,10 @@ pub struct Demo {
     pub credentials: u32,
     pub payments: u32,
     pub poll: u32,
+    /// The onion keys the enrollment pins: the gateway's own onion, from
+    /// its key file, never the file's `[demo]` section.
+    #[serde(skip)]
+    pub onions: Vec<[u8; 32]>,
 }
 
 /// The guarded methods the device is asked to pin, and the ledger's.

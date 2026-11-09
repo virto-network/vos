@@ -1,6 +1,8 @@
-//! `vos-gateway-demo --data DIR --ssh ADDRESS`: the demo's local space and
-//! its gateway, for a phone that reaches the SSH port (through `adb reverse`)
-//! as `anonymous@ADDRESS`. The operator's commands come on standard input:
+//! `vos-gateway-demo --data DIR --ssh ADDRESS --onion KEY`: the demo's local
+//! space and its gateway, for a phone that reaches the SSH port (through
+//! `adb reverse`) as `anonymous@ADDRESS`, and sends its proofs to the onion
+//! service whose key is `KEY` (hex), in front of the same port. The
+//! operator's commands come on standard input:
 //!
 //! - `invite MEMBER ACCOUNT OWNER`: invite the member digest into the
 //!   credential actor's tree and the account `ACCOUNT` for the owner
@@ -77,12 +79,15 @@ fn main() -> Result<(), String> {
         .with_writer(std::io::stderr)
         .init();
     let mut arguments = std::env::args().skip(1);
-    let (mut data, mut ssh) = (None, "127.0.0.1:2222".to_owned());
+    let (mut data, mut ssh, mut onions) = (None, "127.0.0.1:2222".to_owned(), Vec::new());
     while let Some(flag) = arguments.next() {
         match (flag.as_str(), arguments.next()) {
             ("--data", Some(value)) => data = Some(PathBuf::from(value)),
             ("--ssh", Some(value)) => ssh = value,
-            _ => return Err("vos-gateway-demo --data DIR [--ssh ADDRESS]".into()),
+            ("--onion", Some(value)) => onions.push(digest(&value)?),
+            _ => {
+                return Err("vos-gateway-demo --data DIR [--ssh ADDRESS] [--onion KEY]".into());
+            }
         }
     }
     let data = data.ok_or("--data DIR, an empty directory")?;
@@ -98,7 +103,7 @@ fn main() -> Result<(), String> {
         let fingerprint = host_key
             .public_key()
             .fingerprint(russh::keys::ssh_key::HashAlg::Sha256);
-        let _gateway = space.gateway(listener, host_key, random());
+        let _gateway = space.gateway(listener, host_key, random(), onions);
         println!("ssh anonymous@{ssh}  (host key {fingerprint})");
         println!("agent {}", space.agent().0);
         let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();

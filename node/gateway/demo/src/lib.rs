@@ -155,6 +155,7 @@ impl LocalSpace {
             credentials: CREDENTIALS.0,
             payments: PAYMENTS.0,
             poll: POLL.0,
+            onions: Vec::new(),
         }
     }
 
@@ -253,12 +254,14 @@ impl LocalSpace {
 
     /// The gateway on this node's socket, its SSH port on `listener`
     /// serving the demo, its host key `host_key` and the app's key
-    /// `app`.
+    /// `app`; the enrollment pins `onions`, the onion keys a device sends
+    /// its proofs to (an onion in front of this port).
     pub fn gateway(
         &self,
         listener: tokio::net::TcpListener,
         host_key: russh::keys::PrivateKey,
         app: [u8; 32],
+        onions: Vec<[u8; 32]>,
     ) -> tokio::task::JoinHandle<()> {
         let gateway = Arc::new(Gateway::new(vec![Upstream::new(
             self.node.id().0,
@@ -273,7 +276,11 @@ impl LocalSpace {
             vos_gateway::caps::Caps::none(),
             vos_gateway::caps::bodies(),
         );
-        let server = vos_gateway::ssh::server(host_key, gateway, port, Some((self.demo(), app)));
+        let demo = Demo {
+            onions,
+            ..self.demo()
+        };
+        let server = vos_gateway::ssh::server(host_key, gateway, port, Some((demo, app)));
         tokio::spawn(async move {
             if let Err(error) = server.serve_on(listener).await {
                 eprintln!("the SSH port ended: {error}");

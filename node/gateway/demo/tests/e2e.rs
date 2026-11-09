@@ -8,8 +8,10 @@
 //! digests it shows, it claims them, signs in on the path it fetched apart
 //! by the stock auth kernel, and pays from its account by the stock owner
 //! kernel: what the chrome confirmed is paid, whatever the document's fields
-//! held, and a request naming another method is refused by the gateway
-//! before any node.
+//! held. The facility sends each proof itself, to the onion its enrollment
+//! pinned (here a dial to the gateway's port in process), and hands the
+//! screen the node's answer; a client that hands back a request instead is
+//! refused by the gateway before any node.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -18,13 +20,14 @@ use std::time::Duration;
 use hmac::{Hmac, Mac as _};
 use russh::keys::ssh_key;
 use russh::{ChannelMsg, client};
-use s4_credential::api::Gateway;
 use s4_credential::chrome::{Answer, Chrome, Form};
 use s4_credential::enrollment::Store;
+use s4_credential::net::Net;
 use s4_credential::source::{BoxFuture, Kind, Output, Reference, Source, SourceError};
-use s4_credential::{Facility, Operation, Session, Stock};
+use s4_credential::{Facility, Gateway, Operation, Session, Stock};
 use s4_protocol::{Message, Value};
 use vos_gateway_demo::{LocalSpace, host_key, local, random};
+use vos_light::tor::{Circuit, Dial, Dialing, Stream, Target};
 
 /// An HMAC-SHA-256 key in memory, standing in for the phone's Keystore.
 struct Software([u8; 32]);
@@ -85,14 +88,35 @@ fn confirm(values: &[&str]) -> Answer {
     }
 }
 
+/// Every stream the facility dials, to the onion it pinned, goes to the
+/// gateway's SSH port in process: Tor's part played by a socket.
+struct Local(std::net::SocketAddr);
+
+impl Dial for Local {
+    fn dial(&self, target: &Target, _circuit: Circuit) -> Dialing {
+        let (address, onion) = (self.0, matches!(target, Target::Onion { .. }));
+        Box::pin(async move {
+            assert!(onion, "the facility's requests go to the onion alone");
+            let stream = tokio::net::TcpStream::connect(address).await?;
+            Ok(Box::new(stream) as Stream)
+        })
+    }
+}
+
+/// A host key seen: its fingerprint and its Ed25519 key.
+type Seen = Arc<Mutex<Option<(String, Option<[u8; 32]>)>>>;
+
 /// Pins the host key it first sees.
-struct Pinning(Arc<Mutex<Option<String>>>);
+struct Pinning(Seen);
 
 impl client::Handler for Pinning {
     type Error = russh::Error;
 
     async fn check_server_key(&mut self, key: &ssh_key::PublicKey) -> Result<bool, Self::Error> {
-        *self.0.lock().unwrap() = Some(key.fingerprint(ssh_key::HashAlg::Sha256).to_string());
+        *self.0.lock().unwrap() = Some((
+            key.fingerprint(ssh_key::HashAlg::Sha256).to_string(),
+            key.key_data().ed25519().map(|key| key.0),
+        ));
         Ok(true)
     }
 }
@@ -112,9 +136,9 @@ struct Headless {
     gateway: Gateway,
     session: Option<Session>,
     user: Arc<User>,
-    /// A request to answer every facility call with, as a hostile client
+    /// A result to answer every facility call with, as a hostile client
     /// would.
-    hostile: Option<Vec<u8>>,
+    hostile: Option<Value>,
     _handle: client::Handle<Pinning>,
 }
 
@@ -202,7 +226,7 @@ impl Headless {
             .data_bytes(s4_protocol::encode_direct(&hello, limits).unwrap())
             .await
             .unwrap();
-        let fingerprint = pinned.lock().unwrap().clone().expect("a host key");
+        let (fingerprint, host_key) = pinned.lock().unwrap().clone().expect("a host key");
         let mut headless = Self {
             channel,
             state,
@@ -213,6 +237,8 @@ impl Headless {
                 host: address.ip().to_string(),
                 port: address.port(),
                 fingerprint,
+                application: String::new(),
+                host_key,
             },
             session: None,
             user,
@@ -250,19 +276,17 @@ impl Headless {
                             .facilities
                             .contains(&ty(s4_credential::FACILITY))
                     );
-                    let session = self
-                        .facility
-                        .session(self.gateway.clone(), hello.application.as_str().to_owned());
+                    let session = self.facility.session(Gateway {
+                        application: hello.application.as_str().to_owned(),
+                        ..self.gateway.clone()
+                    });
                     // The user grants the facility for this session.
                     session.granted();
                     self.session = Some(session);
                 }
                 Message::FacilityCall(call) => {
                     let result = match &self.hostile {
-                        Some(request) => Ok(Value::object([
-                            ("request".to_owned(), Value::Bytes(request.clone())),
-                            ("proving_ms".to_owned(), Value::from(0u64)),
-                        ])),
+                        Some(result) => Ok(result.clone()),
                         None => {
                             let session = self.session.as_ref().expect("granted");
                             match Operation::read(call.operation.as_str(), &call.args) {
@@ -402,14 +426,12 @@ async fn demo(user: Arc<User>) -> (Arc<LocalSpace>, Headless, [tempfile::TempDir
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = local(&listener);
-    let _gateway = space.gateway(listener, host_key(), random());
+    let _gateway = space.gateway(listener, host_key(), random(), vec![random()]);
     let store = tempfile::tempdir().unwrap();
-    let facility = Facility::with_stock(
-        Store::new(store.path()),
-        Arc::new(Software(random())),
-        stock(),
-        Duration::from_millis(200),
-    );
+    let net = Arc::new(Net::new(Arc::new(Local(address)), store.path()));
+    let facility = Facility::new(Store::new(store.path()), Arc::new(Software(random())), net)
+        .with_stock(stock())
+        .with_tick(Duration::from_millis(200));
     let phone = Headless::connect(address, facility, user).await;
     (space, phone, [data, store])
 }
@@ -514,9 +536,10 @@ async fn enroll_sign_in_and_pay_through_the_gateways_ssh_port() {
     assert_eq!(balances, (Some(30), Some(70), Some(0)));
 }
 
-/// A client that answers the sign-in with a request for another method
-/// (a once guard's next round, `vote_again`) is refused by the gateway, and
-/// no frame reaches the node.
+/// A client that answers the sign-in with a request of its own, for another
+/// method (a once guard's next round, `vote_again`), where the node's answer
+/// belongs, is refused by the gateway, and no frame reaches the node: the
+/// screens relay nothing a client hands back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_request_naming_another_method_never_reaches_the_node() {
     let user = Arc::new(User::default());
@@ -543,16 +566,25 @@ async fn a_request_naming_another_method_never_reaches_the_node() {
         (vos_gateway_demo::PAYMENTS.0, "transfer"),
         (vos_gateway_demo::CREDENTIALS.0, "claim"),
     ] {
-        phone.hostile = Some(request(instance, name));
-        let frames = space.node().api_frames();
-        let at = phone.click("Sign in with my device").await;
-        let shown = phone
-            .settle(at, &["names another", "refused", "Signed in", "Not done"])
-            .await;
-        assert!(
-            shown.contains("names another agent or method"),
-            "{name}: {shown}"
-        );
-        assert_eq!(space.node().api_frames(), frames, "{name} reached the node");
+        for field in ["request", "answer"] {
+            phone.hostile = Some(Value::object([
+                (field.to_owned(), Value::Bytes(request(instance, name))),
+                ("proving_ms".to_owned(), Value::from(0u64)),
+            ]));
+            let frames = space.node().api_frames();
+            let at = phone.click("Sign in with my device").await;
+            let shown = phone
+                .settle(at, &["node's answer", "refused", "Signed in", "Not done"])
+                .await;
+            assert!(
+                shown.contains("holds no node's answer"),
+                "{name} as {field}: {shown}"
+            );
+            assert_eq!(
+                space.node().api_frames(),
+                frames,
+                "{name} as {field} reached the node"
+            );
+        }
     }
 }

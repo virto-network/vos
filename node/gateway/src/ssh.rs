@@ -121,8 +121,12 @@ pub fn server(
     let mark = port.mark;
     let server = match demo {
         Some((demo, app)) => {
+            // An onion's port 22 presents this key; with no Ed25519 host
+            // key the enrollment pins no onion.
+            let ssh_host_key = host_key.public_key().key_data().ed25519().map(|key| key.0);
             let service = Arc::new(crate::demo::Service::new(
                 demo.clone(),
+                ssh_host_key,
                 Arc::clone(&gateway),
                 mark,
                 app,
@@ -197,7 +201,18 @@ pub fn serve(
     let host_key = s4_server::load_or_create_host_key(&path)
         .map_err(|error| format!("{}: {error}", path.display()))?;
     let demo = match (config.demo.clone(), app) {
-        (Some(demo), Some(app)) => Some((demo, app)),
+        (Some(mut demo), Some(app)) => {
+            // The enrollment pins the onion the gateway serves in process.
+            if let Some(path) = config.onion.as_ref().and_then(|onion| onion.key.as_ref()) {
+                let seed = crate::config::seed(path)?;
+                demo.onions = vec![
+                    ed25519_dalek::SigningKey::from_bytes(&seed)
+                        .verifying_key()
+                        .to_bytes(),
+                ];
+            }
+            Some((demo, app))
+        }
         (Some(_), None) => return Err("the demo's screens need app_key".into()),
         (None, _) => None,
     };

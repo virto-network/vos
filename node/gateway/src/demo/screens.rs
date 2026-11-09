@@ -1,5 +1,6 @@
 //! The demo's screens.
 
+use super::service::{Errors, method_error, payment_error, response as response_of};
 use super::*;
 
 /// Which screen is shown.
@@ -23,7 +24,6 @@ pub enum Message {
     Claimed(EffectOutput),
     SignIn,
     Proved(Screen, EffectOutput),
-    Relayed(Screen, EffectOutput),
     Pay,
     Balance(EffectOutput),
     Refreshed(EffectOutput),
@@ -130,61 +130,56 @@ impl Screens {
         };
     }
 
+    /// The device's result: what it proved, sent by the facility itself,
+    /// and the node's answer, which the screen shows. Nothing the device
+    /// hands back is relayed: anything but a node's answer is refused here.
     fn proved(&mut self, screen: Screen, output: EffectOutput, cx: &mut Cx<Message>) {
         let EffectOutput::Facility(Ok(answer)) = output else {
             return self.failed(output);
         };
-        let Some(request) = map_bytes(&answer, "request") else {
-            self.status = "the device's answer holds no request".into();
+        let Some(answer) = map_bytes(&answer, "answer")
+            .and_then(|bytes| Response::decode_exact(&bytes))
+            .map(|response| (answer, response))
+        else {
+            self.status = "the device's result holds no node's answer".into();
             return;
         };
-        self.proving = map_unsigned(&answer, "proving_ms");
+        let (result, response) = answer;
+        self.proving = map_unsigned(&result, "proving_ms");
         if screen == Screen::Pay
             && let (Some(payee), Some(amount)) =
-                (map_text(&answer, "payee"), map_unsigned(&answer, "amount"))
+                (map_text(&result, "payee"), map_unsigned(&result, "amount"))
         {
             // What the device confirmed, whatever this document held.
             self.payee = payee;
             self.amount = amount.to_string();
         }
-        self.status = "Sending the proof…".into();
-        let screen_name = match screen {
-            Screen::Pay => "pay",
-            _ => "sign_in",
-        };
-        cx.effect(Effect::host_service(
-            "relay",
-            identifier(SERVICE),
-            identifier("relay"),
-            object([
-                ("request", Value::Bytes(request)),
-                ("screen", Value::from(screen_name)),
-            ]),
-            move |output| Message::Relayed(screen, output),
-        ));
-    }
-
-    fn relayed(&mut self, screen: Screen, output: EffectOutput, cx: &mut Cx<Message>) {
-        let EffectOutput::HostService(Ok(answer)) = output else {
-            return self.failed(output);
-        };
         let proving = self
             .proving
             .map_or_else(String::new, |ms| format!(" (proved in {ms} ms)"));
-        let ran = matches!(&answer, Value::Map(map) if map.get("ran") == Some(&Value::Bool(true)));
-        if !ran {
-            let why = map_text(&answer, "why").unwrap_or_default();
-            let unknown = matches!(&answer, Value::Map(map) if map.get("root_unknown") == Some(&Value::Bool(true)));
-            if unknown {
-                cx.effect(facility("refresh", Value::Null, Message::Refreshed));
-                self.status =
-                    format!("{why}: the device fetches its path again; try again shortly");
-            } else {
-                self.status = format!("Not done: {why}{proving}");
+        let errors: Errors = match screen {
+            Screen::Pay => payment_error,
+            _ => method_error,
+        };
+        let reply = match response_of(&response, errors) {
+            Ok(reply) => reply,
+            Err(why) => {
+                let unknown = matches!(
+                    response,
+                    Response::Rejected(Rejection::Credential(
+                        CredentialRefusal::RootUnknown | CredentialRefusal::RootStale
+                    ))
+                );
+                if unknown {
+                    cx.effect(facility("refresh", Value::Null, Message::Refreshed));
+                    self.status =
+                        format!("{why}: the device fetches its path again; try again shortly");
+                } else {
+                    self.status = format!("Not done: {why}{proving}");
+                }
+                return;
             }
-            return;
-        }
-        let reply = map_bytes(&answer, "reply").unwrap_or_default();
+        };
         match screen {
             Screen::Pay => {
                 self.status = format!("Paid {} to {}{proving}", self.amount, self.payee);
@@ -215,7 +210,7 @@ impl App for Screens {
         let mut page = view::column()
             .gap(1.0)
             .padding(2.0)
-            .text("VOS: a member's device proves; this server only relays")
+            .text("VOS: a member's device proves; this server only shows")
             .row(|row| {
                 row.gap(1.0)
                     .button("Enroll", Message::Show(Screen::Enroll))
@@ -354,7 +349,6 @@ impl App for Screens {
                 ));
             }
             Message::Proved(screen, output) => self.proved(screen, output, cx),
-            Message::Relayed(screen, output) => self.relayed(screen, output, cx),
             Message::Balance(output) => match output {
                 EffectOutput::HostService(Ok(held)) => {
                     self.balance = Some(
