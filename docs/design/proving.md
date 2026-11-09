@@ -1759,7 +1759,7 @@ compared with x86's byte for byte.
 | a shape per kernel | −38% verify, −14% bytes, −10% RSS [measured] | about 1 week | built |
 | the reference Poseidon2 and a SIMD hasher | segments on Poseidon2 at 1.75–1.85× Blake2s, against 6.4–6.9× before; a leaf's commitment 0.63 s [measured] | 2–3 weeks | built |
 | the seven zero columns dropped; logical right shifts through MUL | the window kernel −5.75% of its cells; its statement 33.3 s end to end [measured] | | built (formats 41 and 46) |
-| a per-program CPU (its columns the program's opcodes') | 785 → 535–549 CPU columns; −8.8% to −17% of a kernel's cells; a narrower leaf [model]; the stock kernels 781 → 538–539 columns, −7.8% / −9.5% of their cells [measured] | 3–5 weeks | built for the device profile as a candidate (format 47); node segments later |
+| a per-program CPU (its columns the program's opcodes') | 785 → 535–549 CPU columns; −8.8% to −17% of a kernel's cells; a narrower leaf [model]; the stock kernels 781 → 538–539 columns, −7.8% / −9.5% of their cells [measured] | 3–5 weeks | built for the device profile as a candidate, not in a shipped format (format 47 is to take it); node segments later |
 | word-level memory | MEMORY 4–8× fewer rows; −17% of the auth kernel's cells [model] | 4–6 weeks | next (`open.md`) |
 | the CPU split by opcode family | 4-way: −5.4% of the auth kernel's cells, 1–8% of a segment's, under 1% at a class's fixed shape, wider by 499 columns, past a leaf with the Poseidon2 chip [model] | 6–10 weeks | not built; a 2-way split on the per-program CPU only where padding pays |
 | narrow BLAKE2b chips | −2,200 columns; −30–45% of BLAKE2b's cells [model] | 3–5 weeks | later (device kernels hold no BLAKE2b, §8; folds gain) |
