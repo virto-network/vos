@@ -17,7 +17,11 @@
 //!   parameters and CPU (`device.rs`), one `device_cell` line a cell, each
 //!   in a child process of its own; the stock kernels from their embedded
 //!   release artifacts, any other kernel and its witness input read from
-//!   DIR (default `kernels` beside the binary).
+//!   DIR (default `kernels` beside the binary); with `--out`, each cell's
+//!   last proof written there.
+//! - `vos-phone device-verify DIR`: verifies the proofs `device --out DIR`
+//!   wrote, each against its cell's program: a phone's device proofs
+//!   verified on x86.
 //!
 //! - `vos-phone kernel --device PATH --input PATH --out PATH [--claim N] [--threads auto|N]`:
 //!   a device kernel proved as the device library proves it for a space's
@@ -545,6 +549,7 @@ fn main() {
         Some("cell") => cell(&args[1], &options(&args[2..])),
         Some("verify") => verify_dir(&args[1]),
         Some("device") => device_run(&args[1..]),
+        Some("device-verify") => device::verify_dir(std::path::Path::new(&args[1])),
         Some("device-cell") => device_cell(&args[1], &args[2..]),
         Some("kernel") => kernel(&args[1..]),
         Some("light") => light::light(&args[1..]),
@@ -554,7 +559,7 @@ fn main() {
             eprintln!(
                 "vos-phone run [--reps N] [--threads auto|N] [--cells LIST] [--grind N] [--out DIR] | verify DIR \
                  | device [--kernels DIR] [--cells LIST] [--reps N] [--warmups N] [--threads auto|N] [--out DIR] \
-                 | kernel --device PATH --input PATH --out PATH [--claim N] [--threads auto|N] \
+                 | device-verify DIR | kernel --device PATH --input PATH --out PATH [--claim N] [--threads auto|N] \
                  | light --store DIR [--calls N] [--check] \
                  | group --dir DIR [--devices 3,8] [--rounds N] \
                  | sync --dir DIR [--rounds N] [--shapes small,large]"
