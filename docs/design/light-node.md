@@ -1936,11 +1936,12 @@ one taken]:
 - **The joiner's open claim** at a home-only space runs after the pairing
   (`home::open_claim`, its own work), so its re-proof proves under the
   nullifier its add recorded; at a home that is the user's own space it
-  is the opener's enrollment there, as in any space. It is held in no
-  row: a device whose path at the home is none makes it. When it runs is
-  the chrome's (the background job's), at a delay from the add, so the
-  home's operators do not link the new member to the agent by its time
-  (L5).
+  is the opener's enrollment there, as in any space. The background job
+  makes it at a delay drawn uniformly over 1 to 6 hours from the pairing,
+  so the home's operators do not link the new member to the agent by its
+  time (L5); the due time is kept in the device's state, so a killed
+  process neither loses nor redraws it [built, s4 `credential/`]. Until
+  then the joiner works through the archive, and its re-proof waits.
 - **Retiring a phone:** the successor paired from the old phone (offered
   the old phone's memberships), then the old phone's removal by the other
   devices as §3.5's rules time it, carried by the next commit; the old
@@ -3529,12 +3530,30 @@ part 1]: the screens are the step's second part.
 - **The personal space**: every flow of §3.8 and §3.9 and the device set's
   operations, named on the Binder interface; the light node under
   `light/`; the admin key in the UI's Keystore (Ed25519, strong biometric
-  only, `IVosPrompts.signKey`). A device replaces its own admin key by the
-  kit's signature (the agent's rule: no device signs its own key's
-  replacement), maturing after the kit's delay. The personal space's job
+  only, `IVosPrompts.signKey`). A device's new admin key is signed in by
+  the kit (maturing after the kit's delay) or by another seasoned device
+  (the new key's 72 h probation): the device offers the key as a code
+  (`VOSADMN1:`: the device, the key, its attestation's flags), which the
+  other scans and signs once the user compares the key check both show; no
+  device signs its own key's replacement. The personal space's job
   is a periodic job of its own.
 - **Pairing's code and the kit's card** carry each onion with its SSH host
-  key, which the joiner pins to reach the home.
+  key, which the joiner pins to reach the home. The card is shown in the
+  kit's own form: beside the phrase's words, or after a security key's
+  credential is made.
+- **The screens** [built, plan 8.24 part 2]: one activity of plain views
+  over the Binder interface, each operation off the main thread with its
+  prompts lent and released when it returns or the screen gives it up.
+  A home is entered as its code (`VOSHOME1:` and hex: the home as a device
+  reaches it, which its operator publishes); a restore takes the home's
+  code too, its handle checked against the card. A pairing's code is a QR
+  code (`VOSPAIR1:` and hex) while the opener waits, which the user
+  cancels (`pairCancel`: the slot closed, a commit made for the joiner
+  abandoned). A security-key kit is a discoverable credential with a
+  random user handle, so a restore finds it with no id; a key holding
+  several kits answers with the newest. "Backup paused" is Tor's bootstrap
+  refusal, on the screen and as a notification after a personal pass that
+  did not finish.
 
 ### 7.4 The SDK macros and the derivation
 
