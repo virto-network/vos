@@ -36,6 +36,7 @@ use crate::{
 /// (address, 2·timestamp + is_write): at one timestamp an address's reads
 /// precede its writes. For consecutive accesses to the same address, reads
 /// must return the value from the last write.
+#[derive(Clone, Copy)]
 pub struct MemoryChip;
 
 /// Byte-level memory model: each row is a single byte access.

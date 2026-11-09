@@ -97,7 +97,8 @@ vectors:
 # rows, and the final verifier's decode, verify and Wasm gates as the
 # maximum over 12 seeds of the masked wrap (on the JAM-only host's
 # `final-verify.elf`, built by `check-no-std`, and `judge-wasm`'s blob),
-# one test at a time. Last, the wrap files the suites wrote checked to be
+# one test at a time; the device suite, its leakage gate among it, again
+# on the per-program CPU (`DEVICE_CPU=program`). Last, the wrap files the suites wrote checked to be
 # final wraps alone, and the carrier audit (`test-carriers`).
 test-proof: build-test-actors judge-wasm
     cargo test -p vos-pvm-proof --features debug-internals --lib --bins --test gates --test isa -- --test-threads=2
@@ -105,6 +106,7 @@ test-proof: build-test-actors judge-wasm
     cargo test -p vos-pvm-proof --features debug-internals --test kernel reads:: -- --test-threads=1
     cargo test -p vos-pvm-proof --test kernel constants:: -- --test-threads=1
     cargo test -p vos-pvm-recair --features heavy-gates --test circuit --test recursion --test segment --test device -- leakage heavy --test-threads=1
+    with-env { DEVICE_CPU: "program" } { cargo test -p vos-pvm-recair --features heavy-gates --test device -- --test-threads=1 }
     cargo test -p vos-pvm-proof --features debug-internals --test kernel wrap_files:: -- --test-threads=1
     just test-carriers
 

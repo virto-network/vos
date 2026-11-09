@@ -36,6 +36,7 @@ use crate::{
 /// the PVM register file: (reg_addr\[1\], reg_val\[8\], reg_ts\[8\]=0) with
 /// positive multiplicity.  The matching consumers live in RegisterMemoryChip
 /// (the ledger).
+#[derive(Clone, Copy)]
 pub struct RegisterMemoryBoundaryChip;
 
 #[derive(Debug, Copy, Clone, AirColumn)]

@@ -64,6 +64,7 @@ use crate::{
     lookups::ProgramMemoryLookupElements,
 };
 
+#[derive(Clone, Copy)]
 pub struct ProgramMemoryChip;
 
 #[derive(Debug, Copy, Clone, AirColumn)]

@@ -96,6 +96,12 @@ pub struct SideNote {
     /// include the closing chip in an explicit slice should set this
     /// to `true` themselves.
     pub closing_chip_active: bool,
+    /// Whether the CPU's fill sets each column on the rows of the
+    /// instructions that read it alone, zero on every other: the
+    /// per-program CPU's fill, under which a column a program's code never
+    /// sets is zero on every row. The full CPU's fill sets some columns of
+    /// one instruction family on every row, as its proofs always have.
+    pub cpu_rows_local: bool,
     /// Per-PC count of CpuChip steps that fetched the instruction
     /// at that PC.  Populated once CpuChip emits the ProgramMemory
     /// consumer; until then the chip has zero multiplicity everywhere
@@ -319,6 +325,7 @@ impl SideNote {
             initial_regs: [0u64; NUM_REGS],
             final_regs: [0u64; NUM_REGS],
             closing_chip_active: false,
+            cpu_rows_local: false,
             program_memory_counts: HashMap::new(),
             jump_table: Arc::from([]),
             jump_table_counts: Vec::new(),

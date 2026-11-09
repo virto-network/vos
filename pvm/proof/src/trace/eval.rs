@@ -19,6 +19,13 @@ pub struct TraceEval<P, C, E: EvalAtRow> {
 
 impl<P: PreprocessedAirColumn, C: AirColumn, E: EvalAtRow> TraceEval<P, C, E> {
     pub fn new(eval: &mut E) -> Self {
+        Self::with_columns(eval, |_| true)
+    }
+
+    /// The evaluations of the main columns `present` admits, read from `eval`
+    /// in order; every other column reads as zero, at the row and the next,
+    /// and takes no mask: an instance that does not commit it.
+    pub fn with_columns(eval: &mut E, present: impl Fn(C) -> bool) -> Self {
         let preprocessed_evals = <P as PreprocessedAirColumn>::PREPROCESSED_IDS
             .iter()
             .map(|&id| eval.get_preprocessed_column(PreProcessedColumnId { id: id.to_owned() }))
@@ -26,8 +33,10 @@ impl<P: PreprocessedAirColumn, C: AirColumn, E: EvalAtRow> TraceEval<P, C, E> {
         let evals = <C as AirColumn>::ALL_VARIANTS
             .iter()
             .flat_map(|col| core::iter::repeat_n(col, col.size()))
-            .map(|col| {
-                if col.mask_next_row() {
+            .map(|&col| {
+                if !present(col) {
+                    [<E::F as Zero>::zero(), <E::F as Zero>::zero()]
+                } else if col.mask_next_row() {
                     eval.next_interaction_mask(ORIGINAL_TRACE_IDX, [0, 1])
                 } else {
                     [

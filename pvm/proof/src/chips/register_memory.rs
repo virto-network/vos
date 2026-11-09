@@ -41,6 +41,7 @@ use crate::{
 /// read value = previous value).  A step that reads and writes one register
 /// reads it first: within a timestamp, reads sort before writes, so a read
 /// returns the value before its step.
+#[derive(Clone, Copy)]
 pub struct RegisterMemoryChip;
 
 #[derive(Debug, Copy, Clone, AirColumn)]

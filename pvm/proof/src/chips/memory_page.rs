@@ -64,6 +64,7 @@ use crate::memory_layout::Permission;
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
 
+#[derive(Clone, Copy)]
 pub struct MemoryPageChip;
 
 /// 128 bytes / block, 32 blocks / page.

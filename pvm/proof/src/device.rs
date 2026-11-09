@@ -133,6 +133,33 @@ pub const fn is_device_mask(active: u32) -> bool {
     active & DEVICE_ALWAYS == DEVICE_ALWAYS && active & !DEVICE_ALL == 0
 }
 
+/// A device program's components: its chips, a device mask, and its CPU's
+/// columns, all of them for the full CPU, the program's for a per-program
+/// one ([`crate::format::Cpu`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceShape {
+    pub chips: u32,
+    pub cpu: crate::chips::CpuColumns,
+}
+
+impl DeviceShape {
+    /// The per-program CPU the shape holds, `None` for the full CPU.
+    pub fn program_cpu(&self) -> Option<crate::chips::ProgramCpuChip> {
+        (self.cpu != crate::chips::CpuColumns::ALL)
+            .then(|| crate::chips::ProgramCpuChip::new(self.cpu))
+    }
+}
+
+impl From<u32> for DeviceShape {
+    /// The chips `chips`, the CPU full.
+    fn from(chips: u32) -> Self {
+        Self {
+            chips,
+            cpu: crate::chips::CpuColumns::ALL,
+        }
+    }
+}
+
 /// The pc a halted run ends at: φ0's at entry, the standard layout's halt
 /// address, the low four bytes of `vos_pvm_program::HALT_ADDRESS`.
 pub const HALT_PC: u32 = vos_pvm_program::HALT_ADDRESS as u32;

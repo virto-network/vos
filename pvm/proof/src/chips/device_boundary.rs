@@ -54,6 +54,7 @@ use crate::side_note::SideNote;
 /// The io-hash's registers: φ9..12.
 pub const IO_REGISTERS: core::ops::Range<usize> = 9..13;
 
+#[derive(Clone, Copy)]
 pub struct DeviceBoundaryChip;
 
 #[derive(Debug, Copy, Clone, AirColumn)]
@@ -270,6 +271,7 @@ impl BuiltInProverComponent for DeviceBoundaryChip {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct DeviceIoChip;
 
 #[derive(Debug, Copy, Clone, AirColumn)]

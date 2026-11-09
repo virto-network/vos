@@ -281,9 +281,9 @@ macro_rules! chips {
 /// What [`visit_chip`] does with a chip, generic over its type.
 pub(crate) trait ChipVisitor {
     type Output;
-    fn visit<C>(self, chip: &'static C) -> Self::Output
+    fn visit<C>(self, chip: &C) -> Self::Output
     where
-        C: framework::BuiltInComponent + Sync + 'static,
+        C: framework::BuiltInComponent + Copy + Sync + 'static,
         C::LookupElements: Sync + 'static;
 }
 

@@ -43,6 +43,7 @@ use crate::{
     lookups::MerkleNodeLookupElements,
 };
 
+#[derive(Clone, Copy)]
 pub struct MemoryRootBoundaryChip;
 
 #[derive(Debug, Copy, Clone, AirColumn)]

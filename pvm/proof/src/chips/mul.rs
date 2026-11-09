@@ -51,6 +51,7 @@ use crate::{
     lookups::{MultiplicationLookupElements, Range256LookupElements},
 };
 
+#[derive(Clone, Copy)]
 pub struct MulChip;
 
 #[derive(Debug, Copy, Clone, AirColumn)]

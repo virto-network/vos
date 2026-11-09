@@ -43,6 +43,7 @@ use crate::{
     lookups::{BitwiseAndLookupElements, BitwiseLookupElements},
 };
 
+#[derive(Clone, Copy)]
 pub struct BitwiseChip;
 
 #[derive(Debug, Copy, Clone, AirColumn)]

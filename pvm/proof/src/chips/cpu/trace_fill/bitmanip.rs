@@ -52,9 +52,13 @@ pub(super) fn bit_counts(out: &mut Sinks, s: Step, ops: &Operands) -> BitCounts 
     // BytePopcount witnesses, and charge popcount_counts for each
     // active emission so PopcountChip's multiplicity column balances.
     trace.fill_columns(row, flags.is_count_set_bits, Column::IsCountSetBits);
+    // On a count's row alone under the per-program CPU's fill.
+    let local = side_note.cpu_rows_local;
     let mut byte_popcount = [0u8; WORD_SIZE];
-    for i in 0..WORD_SIZE {
-        byte_popcount[i] = val_d_bytes[i].count_ones() as u8;
+    if flags.is_count_set_bits || !local {
+        for i in 0..WORD_SIZE {
+            byte_popcount[i] = val_d_bytes[i].count_ones() as u8;
+        }
     }
     trace.fill_columns_bytes(row, &byte_popcount, Column::BytePopcount);
     if flags.is_count_set_bits {
@@ -69,12 +73,16 @@ pub(super) fn bit_counts(out: &mut Sinks, s: Step, ops: &Operands) -> BitCounts 
     // low 4 bytes only — for LZ32).
     trace.fill_columns(row, flags.is_lzb, Column::IsLzb);
     trace.fill_columns(row, flags.is_tzb, Column::IsTzb);
+    // Their counts on an LZ/TZ row alone, which looks them up, under the
+    // per-program CPU's fill.
     let mut bit_op_lz = [0u8; WORD_SIZE];
     let mut bit_op_tz = [0u8; WORD_SIZE];
-    for i in 0..WORD_SIZE {
-        let b = val_d_bytes[i];
-        bit_op_lz[i] = if b == 0 { 8 } else { b.leading_zeros() as u8 };
-        bit_op_tz[i] = if b == 0 { 8 } else { b.trailing_zeros() as u8 };
+    if flags.is_lzb || flags.is_tzb || !local {
+        for i in 0..WORD_SIZE {
+            let b = val_d_bytes[i];
+            bit_op_lz[i] = if b == 0 { 8 } else { b.leading_zeros() as u8 };
+            bit_op_tz[i] = if b == 0 { 8 } else { b.trailing_zeros() as u8 };
+        }
     }
     trace.fill_columns_bytes(row, &bit_op_lz, Column::BitOpLzByte);
     trace.fill_columns_bytes(row, &bit_op_tz, Column::BitOpTzByte);

@@ -33,6 +33,7 @@ use crate::{framework::BuiltInComponent, lookups::ProgramExecutionLookupElements
 ///
 /// This ensures that the CpuChip's step chain forms a valid sequence:
 /// boundary→step0→step1→...→stepN-1→boundary.
+#[derive(Clone, Copy)]
 pub struct ProgramBoundaryChip;
 
 #[derive(Debug, Copy, Clone, AirColumn)]

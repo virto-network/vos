@@ -214,6 +214,17 @@ pub struct Masking {
     pub log_mask_rows: u32,
 }
 
+/// The CPU a format's device programs hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cpu {
+    /// The shared chip set's CPU, every column.
+    Full,
+    /// The per-program CPU: the columns its program's code sets
+    /// ([`crate::chips::CpuColumns::of_code`]), the others cut, the set in
+    /// the program's id and transcript.
+    PerProgram,
+}
+
 /// The least counts a verifier accepts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SecurityFloor {
@@ -233,6 +244,8 @@ pub struct Format {
     pub masked: bool,
     /// The masking's pins for a masked format, `None` for an unmasked one.
     pub masking: Option<Masking>,
+    /// The CPU of its device programs; [`Cpu::Full`] for every other kind.
+    pub cpu: Cpu,
     pub floor: SecurityFloor,
     pub status: Status,
     /// The shape [`Format::bits`] is counted at.
@@ -318,6 +331,7 @@ pub const SEGMENT: Format = Format {
     bytes: ProofBytes::Postcard,
     masked: false,
     masking: None,
+    cpu: Cpu::Full,
     floor: INNER_FLOOR,
     status: Status::Admitted,
     reference: SEGMENT_REFERENCE,
@@ -341,6 +355,7 @@ pub const LEAF_FOLD: Format = Format {
     bytes: ProofBytes::Postcard,
     masked: false,
     masking: None,
+    cpu: Cpu::Full,
     floor: INNER_FLOOR,
     status: Status::Reserved,
     reference: LEAF_FOLD_REFERENCE,
@@ -366,6 +381,7 @@ pub const WRAP: Format = Format {
     bytes: ProofBytes::Postcard,
     masked: false,
     masking: None,
+    cpu: Cpu::Full,
     floor: SecurityFloor {
         conjectured: 100,
         proven: 80,
@@ -402,6 +418,7 @@ pub const MASKED_WRAP: Format = Format {
     bytes: ProofBytes::FixedLayout,
     masked: true,
     masking: Some(MASKED_WRAP_MASKING),
+    cpu: Cpu::Full,
     floor: WRAP.floor,
     status: Status::Admitted,
     reference: MASKED_WRAP_REFERENCE,
@@ -431,6 +448,7 @@ pub const DEVICE_PROOF: Format = Format {
     bytes: ProofBytes::Postcard,
     masked: true,
     masking: Some(DEVICE_MASKING),
+    cpu: Cpu::Full,
     floor: INNER_FLOOR,
     status: Status::Admitted,
     reference: DEVICE_REFERENCE,

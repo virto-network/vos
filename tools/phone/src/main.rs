@@ -14,9 +14,14 @@
 //!   against the same calls: a phone's proofs verified on x86.
 //! - `vos-phone device [--kernels DIR] [--cells LIST] [--reps N] [--warmups N] [--threads auto|N] [--out DIR]`:
 //!   device kernels proved masked under the device profile at candidate
-//!   parameters (`device.rs`), one `device_cell` line a cell, each in
-//!   a child process of its own; the kernels and their witness inputs read
-//!   from DIR (default `kernels` beside the binary).
+//!   parameters and CPU (`device.rs`), one `device_cell` line a cell, each
+//!   in a child process of its own; the stock kernels from their embedded
+//!   release artifacts, any other kernel and its witness input read from
+//!   DIR (default `kernels` beside the binary); with `--out`, each cell's
+//!   last proof written there.
+//! - `vos-phone device-verify DIR`: verifies the proofs `device --out DIR`
+//!   wrote, each against its cell's program: a phone's device proofs
+//!   verified on x86.
 //!
 //! - `vos-phone kernel --device PATH --input PATH --out PATH [--claim N] [--threads auto|N]`:
 //!   a device kernel proved as the device library proves it for a space's
@@ -84,8 +89,8 @@ const CELLS: [&str; 2] = ["auth", "owner"];
 static AUTH: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/auth.device"));
 static OWNER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/owner.device"));
 
-/// The stock kernel `cell`'s program, from its embedded release artifact.
-fn program(cell: &str) -> DeviceProgram {
+/// The stock kernel `cell`'s embedded release artifact.
+fn device_artifact(cell: &str) -> Device {
     let bytes = match cell {
         "auth" => AUTH,
         "owner" => OWNER,
@@ -95,8 +100,12 @@ fn program(cell: &str) -> DeviceProgram {
         !bytes.is_empty(),
         "built without the credential actor's ELF: `just build-credentials` first"
     );
-    let device = Device::decode_exact(bytes).expect("a release artifact");
-    DeviceProgram::released(&device).expect("the stock kernel's program")
+    Device::decode_exact(bytes).expect("a release artifact")
+}
+
+/// The stock kernel `cell`'s program, from its embedded release artifact.
+fn program(cell: &str) -> DeviceProgram {
+    DeviceProgram::released(&device_artifact(cell)).expect("the stock kernel's program")
 }
 /// The guard name of every cell.
 const NAME: &[u8] = b"login";
@@ -540,6 +549,7 @@ fn main() {
         Some("cell") => cell(&args[1], &options(&args[2..])),
         Some("verify") => verify_dir(&args[1]),
         Some("device") => device_run(&args[1..]),
+        Some("device-verify") => device::verify_dir(std::path::Path::new(&args[1])),
         Some("device-cell") => device_cell(&args[1], &args[2..]),
         Some("kernel") => kernel(&args[1..]),
         Some("light") => light::light(&args[1..]),
@@ -549,7 +559,7 @@ fn main() {
             eprintln!(
                 "vos-phone run [--reps N] [--threads auto|N] [--cells LIST] [--grind N] [--out DIR] | verify DIR \
                  | device [--kernels DIR] [--cells LIST] [--reps N] [--warmups N] [--threads auto|N] [--out DIR] \
-                 | kernel --device PATH --input PATH --out PATH [--claim N] [--threads auto|N] \
+                 | device-verify DIR | kernel --device PATH --input PATH --out PATH [--claim N] [--threads auto|N] \
                  | light --store DIR [--calls N] [--check] \
                  | group --dir DIR [--devices 3,8] [--rounds N] \
                  | sync --dir DIR [--rounds N] [--shapes small,large]"
