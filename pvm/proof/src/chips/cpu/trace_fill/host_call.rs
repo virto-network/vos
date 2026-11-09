@@ -78,8 +78,14 @@ pub(super) fn host_call(out: &mut Sinks, s: Step, ops: &Operands) -> HostCall {
     trace.fill_columns(row, step.regs_before[8], Column::MPtr);
     // TLow slot ← t_low (a2 = x12 = PVM φ[9]).
     trace.fill_columns(row, step.regs_before[9], Column::TLow);
-    // Flag slot ← f_flag (a3 = x13 = PVM φ[10]).
-    let flag_u64 = step.regs_before[10];
+    // Flag slot ← f_flag (a3 = x13 = PVM φ[10]), on a BLAKE2b call's row
+    // alone, which reads it: zero on any other, as a program of no BLAKE2b
+    // call holds no column for it.
+    let flag_u64 = if is_blake_ecall {
+        step.regs_before[10]
+    } else {
+        0
+    };
     trace.fill_columns(row, flag_u64, Column::Flag);
     // Flag is non-zero exactly when its bytes' sum is: at most 2040,
     // it is its own field value, so its inverse witnesses it.

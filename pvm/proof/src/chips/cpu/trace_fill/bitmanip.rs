@@ -69,12 +69,16 @@ pub(super) fn bit_counts(out: &mut Sinks, s: Step, ops: &Operands) -> BitCounts 
     // low 4 bytes only — for LZ32).
     trace.fill_columns(row, flags.is_lzb, Column::IsLzb);
     trace.fill_columns(row, flags.is_tzb, Column::IsTzb);
+    // Their counts on an LZ/TZ row alone, which looks them up: zero on any
+    // other, as a program of neither holds no column for them.
     let mut bit_op_lz = [0u8; WORD_SIZE];
     let mut bit_op_tz = [0u8; WORD_SIZE];
-    for i in 0..WORD_SIZE {
-        let b = val_d_bytes[i];
-        bit_op_lz[i] = if b == 0 { 8 } else { b.leading_zeros() as u8 };
-        bit_op_tz[i] = if b == 0 { 8 } else { b.trailing_zeros() as u8 };
+    if flags.is_lzb || flags.is_tzb {
+        for i in 0..WORD_SIZE {
+            let b = val_d_bytes[i];
+            bit_op_lz[i] = if b == 0 { 8 } else { b.leading_zeros() as u8 };
+            bit_op_tz[i] = if b == 0 { 8 } else { b.trailing_zeros() as u8 };
+        }
     }
     trace.fill_columns_bytes(row, &bit_op_lz, Column::BitOpLzByte);
     trace.fill_columns_bytes(row, &bit_op_tz, Column::BitOpTzByte);
