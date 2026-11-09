@@ -2472,6 +2472,13 @@ format, the chips, the sizes and the root.
 | ownership (owner) | 161–179 ms [measured] | 0.30–0.40 s [est]: every chip at its 2^10 floor, the CPU half auth's | 0.27–0.36 s [est] | 0.25–0.33 s [est] |
 | spend, 1 in 2 out | none | 0.9–1.3 s [est] (§5.7) | 0.8–1.1 s [est] | 0.7–0.95 s [est] |
 
+The levers' cells on the stock kernels, both built as candidates
+(`proving.md` §8): the per-program CPU −9.5% (auth) and −7.8% (owner),
+word-level memory −19.3% and −7.3%, the two together −28.8% and −15.1%,
+against the model's −8.8%, −17% and −26% for auth; peak −45% and −35%
+together [measured, x86 dev machine, 2026-11-09]. The phone's times are
+the next run's.
+
 - **The price of one path:** sign-in costs about 3.5× today's credential
   proof in time and 4.5× in bytes, payment authorization about 2× in time.
   Within the owner's requirement (`proving.md` §1: under a second on a
