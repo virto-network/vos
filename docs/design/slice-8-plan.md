@@ -510,6 +510,20 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
 - **Gate:** a flood of well-formed junk proofs through Tor measured
   against the node's budget, members' sign-ins still served. **Dep:** 8.1,
   8.5, 8.11. **Estimate:** 2–2.5 weeks.
+- **Measured** [x86 dev machine, chutney, 2026-11-09, E25's private Tor
+  test network; `light-node.md` §6.6, `8.25f/spike/flood`]: the gate
+  passes. Over a chutney network (four authorities, eight relays on
+  loopback), eight circuits flooded ~1 MB junk proofs at the onion while
+  members signed in on their own circuits. Every member sign-in ran (4/4,
+  6/6), ~0.8 s with no flood and 1.9–3.6 s under it (p50), inside the 30 s
+  bound; none was refused `Busy`. Tor itself held the junk to ~15 proofs a
+  second through the onion, far below the node's budget, so the gateway's
+  caps never had to shed a call (the in-process gateway test exercises the
+  caps directly). A private network's rendezvous is local, so it
+  understates live Tor's latency (~5 s a sign-in) and lets the junk flow
+  faster than the live network would; the gateway code gained an `[onion]`
+  `arti` key naming a test network's arti configuration (unknown keys
+  refused, so a typo cannot fall back to live Tor).
 
 ### 8.26 The client over arti
 - One `TorClient`; `vos-api` over SSH over the onion [E23], one SSH
