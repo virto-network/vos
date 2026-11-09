@@ -411,6 +411,9 @@ pub fn device_format<'a, H: MerkleHasherLifted>(
     program: &'a DeviceProgram<H>,
     header: &'a [u64],
 ) -> Option<(MaskedFormat<'a>, DeviceComponents)> {
+    if format.cpu == Cpu::Full && program.cpu != CpuColumns::ALL {
+        return None;
+    }
     let floors = device_floors(format, program.shape())?;
     let fits = floors.len() == program.log_sizes.len()
         && program

@@ -207,7 +207,7 @@ impl ChipSet for Device {
 
     #[allow(private_bounds, private_interfaces)]
     fn visit<V: ChipVisitor>(active: DeviceShape, index: usize, visitor: V) -> V::Output {
-        match active.cpu() {
+        match active.program_cpu() {
             Some(cpu) if index == chip_idx::CPU => visitor.visit(&cpu),
             _ => crate::visit_device_chip(index, visitor),
         }

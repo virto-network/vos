@@ -329,8 +329,8 @@ fn trace(
 /// The id of `program` under `format`: BLAKE2b-256 of the domain, the
 /// format's number, its parameters (log blowup, queries, PoW, fold step,
 /// log last layer, interaction PoW, `log h`), the chips, the count of log
-/// sizes and each, for a per-program CPU that cuts any its columns' words
-/// (eight little-endian bytes each), and the preprocessed root, every other
+/// sizes and each, when the CPU is cut its column words (eight
+/// little-endian bytes each), and the preprocessed root, every other
 /// integer four little-endian bytes.
 pub fn program_id(format: &Format, program: &DeviceProgram<Hasher>) -> [u8; 32] {
     let params = &format.params;

@@ -144,7 +144,7 @@ pub struct DeviceShape {
 
 impl DeviceShape {
     /// The per-program CPU the shape holds, `None` for the full CPU.
-    pub fn cpu(&self) -> Option<crate::chips::ProgramCpuChip> {
+    pub fn program_cpu(&self) -> Option<crate::chips::ProgramCpuChip> {
         (self.cpu != crate::chips::CpuColumns::ALL)
             .then(|| crate::chips::ProgramCpuChip::new(self.cpu))
     }

@@ -18,7 +18,9 @@
 //!   the program memory's lookup, so a step of an operation the code does
 //!   not hold is refused by the full AIR as by the cut one; a cut that drops
 //!   a column the program's run sets is a run the prover cannot prove (its
-//!   trace is checked before it is committed), never a proof.
+//!   constraints fail at the prover's own check), never a proof. The fill
+//!   sets a column on its instructions' rows alone, so an honest run's
+//!   cut columns are already zero and its cut trace is its full one.
 
 use num_traits::{One, Zero};
 use stwo::core::Fraction;
@@ -57,16 +59,6 @@ impl CpuColumns {
 
     /// No column.
     pub const NONE: Self = Self([0; CPU_COLUMN_WORDS]);
-
-    /// The set whose words are `words`; `None` when a bit names no column.
-    pub fn from_words(words: [u64; CPU_COLUMN_WORDS]) -> Option<Self> {
-        let set = Self(words);
-        (set.0
-            .iter()
-            .zip(Self::ALL.0)
-            .all(|(word, all)| word & !all == 0))
-        .then_some(set)
-    }
 
     /// Its words.
     pub fn words(&self) -> [u64; CPU_COLUMN_WORDS] {
@@ -206,6 +198,7 @@ impl<E> Kept<'_, E> {
     fn take_fraction(&mut self) -> bool {
         let index = self.fraction;
         self.fraction += 1;
+        assert!(index < 128, "a kept fraction past the mask");
         self.fractions >> index & 1 == 1
     }
 }
@@ -1137,8 +1130,10 @@ mod tests {
     }
 
     /// The per-program CPU of `side_note`'s code over its run, when the full
-    /// CPU proves the run: its trace, the cut columns zeroed, satisfies its
-    /// constraints and states the full CPU's claimed sum. `Ok(false)` for a
+    /// CPU proves the run: the full trace's cut columns already zero (the
+    /// fill row-local, so a program of many instructions is cut as each of
+    /// them alone), its trace satisfies its constraints and states the full
+    /// CPU's claimed sum. `Ok(false)` for a
     /// run the full CPU refuses (a fault the tracer records).
     fn check(side_note: &mut SideNote) -> Result<bool, String> {
         let columns = CpuColumns::of_code(&side_note.code, &side_note.bitmask);
@@ -1159,6 +1154,16 @@ mod tests {
         let (_, full_sum) = CpuChip.generate_interaction_trace(&full, side_note, &relations);
         let mut cut = full.clone();
         chip.cut(&mut cut);
+        let all = names(&CpuColumns::ALL);
+        let set: Vec<&str> = (0..full.original_trace.len())
+            .filter(|&at| full.original_trace[at].as_slice() != cut.original_trace[at].as_slice())
+            .map(|at| all[at].split('[').next().unwrap_or_default())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if !set.is_empty() {
+            return Err(format!("the fill sets cut columns {}", set.join(", ")));
+        }
         if let Some(violation) = violation(
             &chip,
             cut.log_size,
@@ -1256,12 +1261,5 @@ mod tests {
         let info = |chip: &dyn MachineComponent| chip.trace_sizes(10).0;
         assert_eq!(info(&full), info(&CpuChip));
         assert_eq!(CpuColumns::ALL.width(), Column::COLUMNS_NUM);
-        assert_eq!(
-            CpuColumns::from_words(CpuColumns::ALL.words()),
-            Some(CpuColumns::ALL)
-        );
-        let mut beyond = CpuColumns::ALL.words();
-        beyond[CPU_COLUMN_WORDS - 1] |= 1 << 63;
-        assert_eq!(CpuColumns::from_words(beyond), None);
     }
 }

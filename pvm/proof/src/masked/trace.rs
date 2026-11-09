@@ -176,9 +176,13 @@ pub fn masked_device_trace(
         .map(|&chip| crate::device_component(chip))
         .collect();
     let mut traces = generate_component_traces(side_note, &components, log_sizes);
-    let cpu = shape.cpu();
+    let cpu = shape.program_cpu();
     if let Some(cpu) = &cpu {
-        debug_assert_eq!(chips.first(), Some(&chip_idx::CPU));
+        assert_eq!(
+            chips.first(),
+            Some(&chip_idx::CPU),
+            "the CPU is the first chip"
+        );
         cpu.cut(&mut traces[0]);
     }
     if let DeviceSizes::Pinned(log_sizes) = sizes
@@ -269,7 +273,9 @@ impl ChipTraces {
     }
 
     /// Each chip's main columns, in bit-reversed order, to change: what a
-    /// forged trace starts from. The soundness gates' seam alone.
+    /// forged trace starts from. The soundness gates' seam alone. A cut
+    /// CPU's columns are its full trace's: a change to a cut column reaches
+    /// its interaction trace but not its commitment.
     #[cfg(feature = "seeded-masks")]
     pub fn main_columns_mut(&mut self) -> impl Iterator<Item = &mut Vec<BaseColumn>> {
         self.traces
