@@ -89,7 +89,7 @@ impl BuiltInComponent for DataWordTableChip {
 /// is none.
 #[cfg(feature = "prover")]
 fn entries(side_note: &SideNote) -> Vec<(u32, [u8; WORD_BYTES])> {
-    let layout = &super::super::device_memory::device_run(side_note).layout;
+    let layout = &crate::chips::device_memory::device_run(side_note).layout;
     let entries: Vec<(u32, [u8; WORD_BYTES])> = layout
         .data
         .iter()
@@ -134,9 +134,9 @@ impl BuiltInProverComponent for DataWordTableChip {
     ) -> FinalizedTrace {
         let entries = entries(side_note);
         let natural = crate::trace::utils::ceil_log2_at_least_lanes(entries.len());
-        let log_size = super::super::table_log_size(natural, min_log_size);
+        let log_size = crate::chips::table_log_size(natural, min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
-        let run = super::super::device_memory::device_run(side_note);
+        let run = crate::chips::device_memory::device_run(side_note);
         let row_of: alloc::collections::BTreeMap<u32, usize> = entries
             .iter()
             .enumerate()

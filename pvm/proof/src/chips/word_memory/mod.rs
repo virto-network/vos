@@ -25,7 +25,12 @@
 //!   the last byte written to it, or the first touch's, whatever the
 //!   accesses' widths;
 //! - **no lane** is taken on a group's ends or on padding, so every byte
-//!   tuple is consumed inside a group.
+//!   tuple is consumed inside a group, and **every inner row takes one**, so
+//!   its timestamp is a producer's and the sort keys between two accesses
+//!   cannot wrap the field through rows no access binds;
+//! - **padding** comes after every real row (the preprocessed `IsLast`), so
+//!   the real rows are one sorted run and a word one group, however many
+//!   boundary rows name it.
 //!
 //! [`DeviceWordMemoryChip`]: crate::chips::DeviceWordMemoryChip
 
@@ -114,7 +119,6 @@ pub enum Column {
     OrderBits,
     /// 1 on a group's closing read.
     #[size = 1]
-    #[mask_next_row]
     IsClosing,
     /// Bound helper: `is_real_next · (1 − IsSameAddrNext)`.
     #[size = 1]
@@ -135,11 +139,18 @@ pub enum Column {
     /// a group's start, 0 on every other row.
     #[size = 1]
     PermissionH,
+    /// The inverse of the lanes an inner row takes: proof that it takes one.
+    #[size = 1]
+    LaneInv,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
 #[preprocessed_prefix = "wmem"]
-pub enum PreprocessedColumn {}
+pub enum PreprocessedColumn {
+    /// 1 on the last row, 0 elsewhere.
+    #[size = 1]
+    IsLast,
+}
 
 const _: () = assert!(WORD_BYTES == 8);
 
@@ -177,10 +188,15 @@ impl BuiltInComponent for WordMemoryChip {
         eval.add_constraint(is_closing[0].clone() * is_write[0].clone());
         eval.add_constraint(is_closing[0].clone() * is_pad[0].clone());
 
-        // The lanes: taken on a group's inner rows alone; a read keeps every
-        // byte, a byte no lane writes is kept, the group's first row's free
-        // (its word tuple binds them).
+        // The lanes: taken on a group's inner rows alone, at least one on
+        // each; a read keeps every byte, a byte no lane writes is kept, the
+        // group's first row's free (its word tuple binds them).
         let ends = is_start[0].clone() + is_closing[0].clone() + is_pad[0].clone();
+        let lane_inv = crate::trace::trace_eval!(trace_eval, Column::LaneInv);
+        let taken = active
+            .iter()
+            .fold(E::F::zero(), |sum, lane| sum + lane.clone());
+        eval.add_constraint((one() - ends.clone()) * (one() - lane_inv[0].clone() * taken));
         for lane in 0..WORD_BYTES {
             let kept = value[lane].clone() - prev[lane].clone();
             eval.add_constraint(ends.clone() * active[lane].clone());
@@ -189,8 +205,14 @@ impl BuiltInComponent for WordMemoryChip {
         }
 
         // The sortedness gadget, `MemoryChip`'s: rows sorted by (address,
-        // 2·ts + is_write), a word's rows one group.
+        // 2·ts + is_write), a word's rows one group; padding past the real
+        // rows alone, a padding row followed by a real one only at the wrap.
         let is_pad_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsPadding);
+        let is_last =
+            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsLast);
+        eval.add_constraint(
+            is_pad[0].clone() * (one() - is_pad_next[0].clone()) * (one() - is_last[0].clone()),
+        );
         let address_next = crate::trace::trace_eval_next_row!(trace_eval, Column::Address);
         let timestamp_next = crate::trace::trace_eval_next_row!(trace_eval, Column::Timestamp);
         let prev_next = crate::trace::trace_eval_next_row!(trace_eval, Column::PrevValue);
@@ -372,6 +394,13 @@ fn rows(side_note: &SideNote) -> Vec<Row> {
 impl BuiltInProverComponent for WordMemoryChip {
     const IS_PRODUCER: bool = false;
 
+    fn generate_preprocessed_trace(&self, log_size: u32, _: &SideNote) -> FinalizedTrace {
+        let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
+        let last = trace.num_rows() - 1;
+        trace.fill_columns(last, true, PreprocessedColumn::IsLast);
+        trace.finalize_bit_reversed()
+    }
+
     fn generate_main_trace_immut_min(
         &self,
         side_note: &SideNote,
@@ -421,6 +450,10 @@ impl BuiltInProverComponent for WordMemoryChip {
                 if is_start { permission } else { 0 },
                 Column::PermissionH,
             );
+            let taken = row.active.iter().filter(|&&lane| lane).count() as u32;
+            if taken > 0 {
+                trace.fill_columns(index, BaseField::from(taken).inverse(), Column::LaneInv);
+            }
         }
         for index in n..num_rows {
             trace.fill_columns(index, true, Column::IsPadding);

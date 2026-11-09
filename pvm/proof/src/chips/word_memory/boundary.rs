@@ -16,7 +16,8 @@
 //! other region's eight zeros. **The permission** is the region's.
 //!
 //! Two rows for one word put two `ts = 0` writes for one group, which takes
-//! one: their proof does not balance.
+//! one: their proof does not balance (the ledger's real rows are one sorted
+//! run, so a word has one group).
 
 use crate::prelude::*;
 use num_traits::{One, Zero};
@@ -237,7 +238,7 @@ impl BuiltInProverComponent for DeviceWordMemoryChip {
 
     fn generate_preprocessed_trace(&self, log_size: u32, side_note: &SideNote) -> FinalizedTrace {
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
-        let regions = super::super::device_memory::device_run(side_note)
+        let regions = crate::chips::device_memory::device_run(side_note)
             .layout
             .regions;
         let firsts = regions.map(|range| BaseField::from(range.first));
@@ -254,7 +255,7 @@ impl BuiltInProverComponent for DeviceWordMemoryChip {
         side_note: &SideNote,
         min_log_size: u32,
     ) -> FinalizedTrace {
-        let run = super::super::device_memory::device_run(side_note);
+        let run = crate::chips::device_memory::device_run(side_note);
         let log_size =
             crate::trace::utils::ceil_log2_at_least_lanes(run.words.len()).max(min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);

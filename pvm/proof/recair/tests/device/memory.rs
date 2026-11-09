@@ -150,8 +150,9 @@ fn mixed_program(format: &Format) -> Program {
     program_on::<P2>(format)
 }
 
-/// The run with load `k` of [`LOADS`] (an unsigned one) reading its low
-/// byte's bit 0 flipped: the byte tuple it puts, its register and every
+/// The run with load `k` of [`LOADS`] reading its low byte's bit 0
+/// flipped (bit 0 of the register too, whatever the load's extension): the
+/// byte tuple it puts, its register and every
 /// step that reads the register until the halt clears it, so the CPU's
 /// rows hold and only the memory ledger's read is wrong.
 fn forged_load(k: usize) -> SideNote {
@@ -169,7 +170,7 @@ fn forged_load(k: usize) -> SideNote {
     let register = side_note.steps[at].reg_write.expect("its register");
     let read = side_note.steps[at].mem_read.as_mut().expect("its read");
     read.value ^= 1;
-    let forged = read.value;
+    let forged = side_note.steps[at].regs_after[register] ^ 1;
     side_note.steps[at].regs_after[register] = forged;
     for step in &mut side_note.steps[at + 1..] {
         step.regs_before[register] = forged;
@@ -268,6 +269,26 @@ impl Chip<'_> {
     fn set(&mut self, column: usize, row: usize, value: u32) {
         let at = self.at(row);
         self.columns[column].as_mut_slice()[at] = BaseField::from(value);
+    }
+
+    /// Every row's columns, in natural order.
+    fn natural(&self) -> Vec<Vec<u32>> {
+        (0..self.rows())
+            .map(|row| {
+                (0..self.columns.len())
+                    .map(|column| self.get(column, row))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Writes `rows`, in natural order.
+    fn write(&mut self, rows: &[Vec<u32>]) {
+        for (row, values) in rows.iter().enumerate() {
+            for (column, &value) in values.iter().enumerate() {
+                self.set(column, row, value);
+            }
+        }
     }
 }
 
@@ -401,10 +422,7 @@ fn every_width_and_alignment_proves_under_the_word_ledger() {
 fn a_forged_load_is_refused() {
     let format = word();
     let program = mixed_program(&format);
-    for (k, &(opcode, _)) in LOADS.iter().enumerate() {
-        if opcode == Opcode::LoadIndI16 {
-            continue;
-        }
+    for k in 0..LOADS.len() {
         refused_as_a_broken_constraint(&format, &program, || forged_load(k));
     }
 }
@@ -573,6 +591,96 @@ fn an_untouched_byte_of_a_touched_word_is_bound() {
     let (proof, _) = prove_device::<P2>(&byte, &program, &mut forged(), MaskRng::Seeded(5))
         .expect("the byte ledger proves it");
     verify_device::<P2>(&byte, &program, &proof).expect("verifies");
+}
+
+/// Padding between real rows is refused: the ledger's rows turned so its
+/// padding lies inside, every cyclic neighbour kept, so each relation
+/// balances and every other constraint holds. Padding anywhere would let a
+/// word's accesses split into two groups, its writes in one and its reads
+/// in the other, two boundary rows for the word giving each its ends.
+#[test]
+fn padding_between_real_rows_is_refused() {
+    use word_memory::Column;
+    let format = word();
+    let program = mixed_program(&format);
+    let tamper = |trace: &mut MaskedDeviceTrace| {
+        let mut ledger = Chip::of(trace, &program, device_chip::MEMORY);
+        let rows = ledger.natural();
+        let real = rows
+            .iter()
+            .filter(|row| row[Column::IsPadding.offset()] == 0)
+            .count();
+        let mut turned = rows.clone();
+        turned.rotate_left(real / 2);
+        ledger.write(&turned);
+    };
+    let proof = forced(&format, &program, &mut mixed_run(), tamper);
+    let outcome = verify_device::<P2>(&format, &program, &proof);
+    assert!(
+        matches!(
+            outcome,
+            Err(Error::Stark(VerificationError::OodsNotMatching))
+        ),
+        "{outcome:?}"
+    );
+}
+
+/// An inner row that takes no lane is refused: a read's row repeated after
+/// it with no lane, its timestamp the read's, every relation balanced and
+/// every other constraint held. Such rows, their timestamps bound by no
+/// access, could carry the sort key around the field and order a read
+/// before the write it should see.
+#[test]
+fn a_laneless_inner_row_is_refused() {
+    use word_memory::Column;
+    let format = word();
+    let program = mixed_program(&format);
+    let tamper = |trace: &mut MaskedDeviceTrace| {
+        let mut ledger = Chip::of(trace, &program, device_chip::MEMORY);
+        let mut rows = ledger.natural();
+        let flag = |row: &Vec<u32>, column: Column| row[column.offset()] == 1;
+        let read = rows
+            .iter()
+            .position(|row| {
+                !flag(row, Column::IsPadding)
+                    && !flag(row, Column::IsStart)
+                    && !flag(row, Column::IsClosing)
+                    && !flag(row, Column::IsWrite)
+            })
+            .expect("an inner read");
+        let n = rows.len();
+        assert!(flag(&rows[n - 2], Column::IsPadding), "two padding rows");
+        let mut repeated = rows[read].clone();
+        let span = |column: Column| column.offset()..column.offset() + column.size();
+        for at in span(Column::Active).chain(span(Column::LaneInv)) {
+            repeated[at] = 0;
+        }
+        let value = rows[read][span(Column::Value)].to_vec();
+        repeated[span(Column::PrevValue)].copy_from_slice(&value);
+        let original = &mut rows[read];
+        original[Column::IsSameAddrNext.offset()] = 1;
+        for at in span(Column::AdvLoH)
+            .chain(span(Column::AdvHiH))
+            .chain(span(Column::OrderBits))
+            .chain(span(Column::IsGroupStart))
+            .chain(span(Column::IsGroupEnd))
+        {
+            original[at] = 0;
+        }
+        rows.insert(read + 1, repeated);
+        rows.pop();
+        rows[n - 1][Column::IsGroupStart.offset()] = 1;
+        ledger.write(&rows);
+    };
+    let proof = forced(&format, &program, &mut mixed_run(), tamper);
+    let outcome = verify_device::<P2>(&format, &program, &proof);
+    assert!(
+        matches!(
+            outcome,
+            Err(Error::Stark(VerificationError::OodsNotMatching))
+        ),
+        "{outcome:?}"
+    );
 }
 
 const _: () = assert!(WORD_BYTES == 8 && AREA % 8 == 0);
