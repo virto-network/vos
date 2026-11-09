@@ -688,11 +688,20 @@ fn the_program_is_mixed_into_the_transcript() {
         .unwrap_or(Err(Error::Format))
     };
     verify_under(&program.header()).expect("the honest header");
-    let [tag, active] = program.header()[..] else {
-        panic!("the full CPU's header is its tag and chips")
+    let header = program.header();
+    let [tag, active, ref cpu @ ..] = header[..] else {
+        panic!("a header is its tag, its chips and its CPU's columns")
     };
-    assert!(verify_under(&[tag, active ^ 1 << device_chip::MUL]).is_err());
+    let mut other_chips = header.clone();
+    other_chips[1] = active ^ 1 << device_chip::MUL;
+    assert!(verify_under(&other_chips).is_err());
     assert!(verify_under(&[tag]).is_err());
+    if !cpu.is_empty() {
+        let mut other_cpu = header.clone();
+        other_cpu[2] ^= 1;
+        assert!(verify_under(&other_cpu).is_err());
+        assert!(verify_under(&[tag, active]).is_err());
+    }
     let mut other = program.clone();
     other.circuit = install::<P2>(
         &format,
