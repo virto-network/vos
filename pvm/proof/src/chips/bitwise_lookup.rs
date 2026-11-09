@@ -33,6 +33,7 @@ use crate::{
 /// Each row provides (a, b, a&b) for 4-bit values with multiplicity = number
 /// of times this combination was used. The CpuChip splits bytes into nibbles
 /// and produces 16 lookups per bitwise op (2 nibbles × 8 bytes).
+#[derive(Clone, Copy)]
 pub struct BitwiseLookupChip;
 
 const BITWISE_LOG_SIZE: u32 = 8; // 2^8 = 256 rows = 16×16

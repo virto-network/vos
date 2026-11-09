@@ -46,6 +46,7 @@ use crate::{
     lookups::BitcountLookupElements,
 };
 
+#[derive(Clone, Copy)]
 pub struct BitcountChip;
 
 const BITCOUNT_LOG_SIZE: u32 = 8; // 2^8 = 256 rows

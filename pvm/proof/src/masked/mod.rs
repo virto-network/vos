@@ -49,10 +49,10 @@ use crate::boundary_binding::{
     BOUNDARY_STATE_BYTES, boundary_positions_in_mask, boundary_state_bytes,
     check_boundary_claimed_sums,
 };
+use crate::device::DeviceShape;
 use crate::framework::{BuiltInComponent, MachineComponent};
 use crate::lookups::{AllLookupElements, ComponentLookupElements};
 use crate::proof::SegmentState;
-use crate::trace::eval::TraceEval;
 use crate::{BASE_COMPONENTS, ChipVisitor, chip_idx, chips_of_mask, visit_chip};
 
 #[cfg(feature = "prover")]
@@ -67,7 +67,7 @@ pub use trace::{
 /// constraints and fractions, its blinding columns and their fraction joined
 /// to its last batch, at the bound `log_size + 2`.
 pub struct MaskedChipEval<C: BuiltInComponent + 'static> {
-    chip: &'static C,
+    chip: C,
     log_size: u32,
     lookup_elements: C::LookupElements,
     blind: BlindRelation,
@@ -76,15 +76,15 @@ pub struct MaskedChipEval<C: BuiltInComponent + 'static> {
     batching: Vec<usize>,
 }
 
-impl<C: BuiltInComponent + 'static> MaskedChipEval<C> {
+impl<C: BuiltInComponent + Copy + 'static> MaskedChipEval<C> {
     fn new(
-        chip: &'static C,
+        chip: &C,
         log_size: u32,
         lookup_elements: C::LookupElements,
         blind: &BlindRelation,
     ) -> Self {
         Self {
-            chip,
+            chip: *chip,
             log_size,
             lookup_elements,
             blind: blind.clone(),
@@ -98,7 +98,7 @@ impl<C: BuiltInComponent + 'static> MaskedChipEval<C> {
 /// both take the last batch to exist).
 fn fractions<C: BuiltInComponent>(chip: &C) -> usize {
     let mut info = InfoEvaluator::empty();
-    let trace_eval = TraceEval::new(&mut info);
+    let trace_eval = chip.trace_eval(&mut info);
     chip.add_constraints(&mut info, trace_eval, &C::LookupElements::dummy());
     let n = info.logup.fracs.len();
     C::LOGUP.finalize(&mut info);
@@ -115,7 +115,7 @@ impl<C: BuiltInComponent + 'static> FrameworkEval for MaskedChipEval<C> {
     }
 
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
-        let trace_eval = TraceEval::new(&mut eval);
+        let trace_eval = self.chip.trace_eval(&mut eval);
         self.chip
             .add_constraints(&mut eval, trace_eval, &self.lookup_elements);
         let b: [E::F; BLIND_COLUMNS] = from_fn(|_| eval.next_trace_mask());
@@ -138,20 +138,23 @@ type Boxed = Box<dyn Component>;
 /// names and in what order, the chip at an index, and the claimed sums the
 /// public values fix.
 pub trait ChipSet: 'static {
+    /// Which chips a proof holds, and in what form.
+    type Active: Copy;
+
     /// The chips `active` names, in commitment order; `None` when it is not
     /// a mask of the set's.
-    fn chips(active: u32) -> Option<Vec<usize>>;
+    fn chips(active: Self::Active) -> Option<Vec<usize>>;
 
-    /// Calls `visitor` with the chip at `index`.
+    /// Calls `visitor` with the chip at `index`, as `active` holds it.
     #[allow(private_bounds, private_interfaces)]
-    fn visit<V: ChipVisitor>(index: usize, visitor: V) -> V::Output;
+    fn visit<V: ChipVisitor>(active: Self::Active, index: usize, visitor: V) -> V::Output;
 
     /// The chip at `index`, as the verifier's component.
     fn machine(index: usize) -> &'static dyn MachineComponent;
 
     /// The positions, among `active`'s chips, of the claimed sums the
     /// public values fix: the prover leaves them unblinded.
-    fn public_sums(active: u32) -> Vec<usize>;
+    fn public_sums(active: Self::Active) -> Vec<usize>;
 }
 
 /// The node's segment: format 41's chips in chip order, its boundary chips'
@@ -160,12 +163,14 @@ pub trait ChipSet: 'static {
 pub enum Node {}
 
 impl ChipSet for Node {
+    type Active = u32;
+
     fn chips(active: u32) -> Option<Vec<usize>> {
         (active & !chip_idx::ALL == 0).then(|| chips_of_mask(active).collect())
     }
 
     #[allow(private_bounds, private_interfaces)]
-    fn visit<V: ChipVisitor>(index: usize, visitor: V) -> V::Output {
+    fn visit<V: ChipVisitor>(_: u32, index: usize, visitor: V) -> V::Output {
         visit_chip(index, visitor)
     }
 
@@ -187,27 +192,33 @@ impl ChipSet for Node {
 
 /// The device profile's segment (`crate::device`): the shared chip set
 /// without the page boundary, in
-/// [`DEVICE_ORDER`](crate::device::DEVICE_ORDER), the io-hash's claimed sum
-/// (DeviceIoChip's) its one public sum.
+/// [`DEVICE_ORDER`](crate::device::DEVICE_ORDER), its CPU the program's
+/// ([`DeviceShape`]), the io-hash's claimed sum (DeviceIoChip's) its one
+/// public sum.
 pub enum Device {}
 
 impl ChipSet for Device {
-    fn chips(active: u32) -> Option<Vec<usize>> {
-        crate::device::is_device_mask(active)
-            .then(|| crate::device::device_chips_of_mask(active).collect())
+    type Active = DeviceShape;
+
+    fn chips(active: DeviceShape) -> Option<Vec<usize>> {
+        crate::device::is_device_mask(active.chips)
+            .then(|| crate::device::device_chips_of_mask(active.chips).collect())
     }
 
     #[allow(private_bounds, private_interfaces)]
-    fn visit<V: ChipVisitor>(index: usize, visitor: V) -> V::Output {
-        crate::visit_device_chip(index, visitor)
+    fn visit<V: ChipVisitor>(active: DeviceShape, index: usize, visitor: V) -> V::Output {
+        match active.cpu() {
+            Some(cpu) if index == chip_idx::CPU => visitor.visit(&cpu),
+            _ => crate::visit_device_chip(index, visitor),
+        }
     }
 
     fn machine(index: usize) -> &'static dyn MachineComponent {
         crate::device_machine_component(index)
     }
 
-    fn public_sums(active: u32) -> Vec<usize> {
-        device_io_position(active).into_iter().collect()
+    fn public_sums(active: DeviceShape) -> Vec<usize> {
+        device_io_position(active.chips).into_iter().collect()
     }
 }
 
@@ -224,7 +235,7 @@ pub fn device_io_position(active: u32) -> Option<usize> {
 /// A chip set's chips an active-chip mask names, masked, at their log sizes,
 /// in the set's order.
 pub struct Components<S: ChipSet> {
-    active: u32,
+    active: S::Active,
     log_sizes: Vec<u32>,
     components: Vec<Boxed>,
     set: core::marker::PhantomData<S>,
@@ -248,9 +259,9 @@ struct Build<'a> {
 impl ChipVisitor for Build<'_> {
     type Output = Boxed;
 
-    fn visit<C>(self, chip: &'static C) -> Boxed
+    fn visit<C>(self, chip: &C) -> Boxed
     where
-        C: BuiltInComponent + Sync + 'static,
+        C: BuiltInComponent + Copy + Sync + 'static,
         C::LookupElements: Sync + 'static,
     {
         Box::new(FrameworkComponent::new(
@@ -275,9 +286,9 @@ struct Draw<'a, Ch> {
 impl<Ch: Channel> ChipVisitor for Draw<'_, Ch> {
     type Output = ();
 
-    fn visit<C>(self, _: &'static C)
+    fn visit<C>(self, _: &C)
     where
-        C: BuiltInComponent + Sync + 'static,
+        C: BuiltInComponent + Copy + Sync + 'static,
         C::LookupElements: Sync + 'static,
     {
         C::LookupElements::draw(self.relations, self.channel);
@@ -289,7 +300,7 @@ impl<S: ChipSet> Components<S> {
     /// `log_sizes` with `claimed_sums`; `None` unless each count is the
     /// mask's.
     pub fn build(
-        active: u32,
+        active: S::Active,
         relations: &AllLookupElements,
         blind: &BlindRelation,
         log_sizes: &[u32],
@@ -306,6 +317,7 @@ impl<S: ChipSet> Components<S> {
             .zip(claimed_sums)
             .map(|((chip, &log_size), &claimed_sum)| {
                 S::visit(
+                    active,
                     chip,
                     Build {
                         allocator,
@@ -339,12 +351,13 @@ impl<S: ChipSet> Components<S> {
 
 impl<S: ChipSet> MaskedComponents for Components<S> {
     type Relations = AllLookupElements;
-    type Active = u32;
+    type Active = S::Active;
 
-    fn draw_relations(active: u32, channel: &mut impl Channel) -> AllLookupElements {
+    fn draw_relations(active: S::Active, channel: &mut impl Channel) -> AllLookupElements {
         let mut relations = AllLookupElements::default();
         for chip in S::chips(active).unwrap_or_default() {
             S::visit(
+                active,
                 chip,
                 Draw {
                     relations: &mut relations,
@@ -356,7 +369,7 @@ impl<S: ChipSet> MaskedComponents for Components<S> {
     }
 
     fn new(
-        active: u32,
+        active: S::Active,
         relations: &AllLookupElements,
         blind: &BlindRelation,
         log_sizes: &[u32],
@@ -365,7 +378,7 @@ impl<S: ChipSet> MaskedComponents for Components<S> {
         Self::build(active, relations, blind, log_sizes, claimed_sums)
     }
 
-    fn layout(active: u32, log_sizes: &[u32]) -> Option<Self> {
+    fn layout(active: S::Active, log_sizes: &[u32]) -> Option<Self> {
         let channel = &mut Blake2sM31Channel::default();
         let relations = Self::draw_relations(active, channel);
         let blind = BlindRelation::draw(channel);
@@ -378,7 +391,7 @@ impl<S: ChipSet> MaskedComponents for Components<S> {
         )
     }
 
-    fn active(&self) -> u32 {
+    fn active(&self) -> S::Active {
         self.active
     }
 
@@ -491,7 +504,7 @@ pub fn drive_masked_chip<E: EvalAtRow>(
     blind: &BlindRelation,
     eval: E,
 ) -> E {
-    drive::<Node, E>(chip, log_size, relations, blind, eval)
+    drive::<Node, E>(chip_idx::ALL, chip, log_size, relations, blind, eval)
 }
 
 /// A chip of the device's masked segment driven at `log_size` through
@@ -504,10 +517,18 @@ pub fn drive_masked_device_chip<E: EvalAtRow>(
     blind: &BlindRelation,
     eval: E,
 ) -> E {
-    drive::<Device, E>(chip, log_size, relations, blind, eval)
+    drive::<Device, E>(
+        DeviceShape::from(crate::device::DEVICE_ALL),
+        chip,
+        log_size,
+        relations,
+        blind,
+        eval,
+    )
 }
 
 fn drive<S: ChipSet, E: EvalAtRow>(
+    active: S::Active,
     chip: usize,
     log_size: u32,
     relations: &AllLookupElements,
@@ -524,9 +545,9 @@ fn drive<S: ChipSet, E: EvalAtRow>(
     impl<E: EvalAtRow> ChipVisitor for Drive<'_, E> {
         type Output = E;
 
-        fn visit<C>(self, chip: &'static C) -> E
+        fn visit<C>(self, chip: &C) -> E
         where
-            C: BuiltInComponent + Sync + 'static,
+            C: BuiltInComponent + Copy + Sync + 'static,
             C::LookupElements: Sync + 'static,
         {
             MaskedChipEval::new(
@@ -540,6 +561,7 @@ fn drive<S: ChipSet, E: EvalAtRow>(
     }
 
     S::visit(
+        active,
         chip,
         Drive {
             log_size,

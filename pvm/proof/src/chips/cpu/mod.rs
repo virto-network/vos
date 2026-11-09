@@ -30,6 +30,7 @@ use crate::side_note::SideNote;
 pub(crate) mod classify;
 mod columns;
 mod constraints;
+mod cut;
 #[cfg(feature = "prover")]
 mod reg_access;
 // trace fill + interaction-trace generation live in their own files;
@@ -44,6 +45,7 @@ mod tuples;
 pub(crate) use classify::classify_opcode_for_program_memory;
 pub use columns::Column;
 use columns::PreprocessedColumn;
+pub use cut::{CPU_COLUMN_WORDS, CpuColumns, ProgramCpuChip};
 #[cfg(feature = "prover")]
 pub(crate) use reg_access::{static_destination, step_reg_accesses};
 
@@ -51,6 +53,7 @@ pub(crate) use reg_access::{static_destination, step_reg_accesses};
 /// witness input and the Poseidon2 call, whose
 /// row hands `(ts, φ7, φ8)` to `Poseidon2Chip` (the `Poseidon2Call`
 /// relation). The node's segments and the device shape share it.
+#[derive(Clone, Copy)]
 pub struct CpuChip;
 
 // ── Trace generation ───────────────────────────────────────────────────────
@@ -73,65 +76,7 @@ impl BuiltInComponent for CpuChip {
         trace_eval: TraceEval<PreprocessedColumn, Column, E>,
         lookups: &constraints::Lookups,
     ) {
-        // The constraints and relation entries in the AIR's order.
-        let row = &columns::Row::new(&trace_eval);
-        constraints::row::padding(eval, row);
-        constraints::row::timestamp_chain(eval, row);
-        constraints::memory::address_validity(eval, row);
-        constraints::alu::selector_helpers(eval, row);
-        constraints::compare::compare_and_divrem_helpers(eval, row);
-        constraints::divrem::zero_divisor_helpers(eval, row);
-        constraints::bitmanip::msb_helpers(eval, row);
-        constraints::alu::add(eval, row);
-        constraints::alu::sub(eval, row);
-        constraints::alu::mul(eval, row);
-        constraints::alu::imm_alt_operands(eval, row);
-        constraints::compare::compare(eval, row);
-        constraints::divrem::divrem(eval, row);
-        constraints::divrem::zero_divisor(eval, row);
-        constraints::divrem::remainder_sign(eval, row);
-        constraints::alu::move_reg(eval, row);
-        constraints::bitmanip::byte_ops(eval, row);
-        constraints::bitmanip::count_set_bits(eval, row);
-        constraints::bitmanip::leading_trailing_zeros_helpers(eval, row);
-        constraints::control::branch_helpers(eval, row);
-        constraints::control::control_flow_helpers(eval, row);
-        constraints::registers::register_helpers(eval, row);
-        constraints::row::shared_helpers(eval, row);
-        constraints::bitmanip::leading_trailing_zeros(eval, row);
-        constraints::control::next_pc(eval, row);
-        constraints::control::branch_conditions(eval, row);
-        constraints::host_call::host_call_continuation(eval, row);
-        constraints::memory::result_bytes(eval, row, lookups);
-        constraints::memory::memory_access(eval, row, lookups);
-        constraints::memory::active_bytes(eval, row);
-        constraints::control::program_execution(eval, row, lookups);
-        constraints::lookups::table_lookups(eval, row, lookups);
-        constraints::registers::register_accesses(eval, row, lookups);
-        constraints::host_call::blake2b_call(eval, row, lookups);
-        constraints::host_call::witness_input_reads(eval, row, lookups);
-        constraints::bitmanip::sign_extend_nibbles(eval, row, lookups);
-        constraints::program::program_memory(eval, row, lookups);
-        constraints::program::flag_bits(eval, row, lookups);
-        constraints::control::trap_terminal(eval, row);
-        constraints::control::jump_ind(eval, row, lookups);
-        constraints::control::load_imm_jump_ind(eval, row, lookups);
-        constraints::memory::load_result(eval, row);
-        constraints::memory::direct_store_value(eval, row);
-        constraints::memory::indirect_store_value(eval, row);
-        constraints::memory::direct_address(eval, row);
-        constraints::memory::immediate_store_value(eval, row);
-        constraints::memory::indirect_address(eval, row);
-        constraints::memory::signed_load_extension(eval, row);
-        constraints::signs::sign_sources(eval, row);
-        constraints::signs::sign_nibbles(eval, row, lookups);
-        constraints::lookups::mul_lookup(eval, row, lookups);
-        constraints::lookups::divrem_lookup(eval, row, lookups);
-        constraints::lookups::compare_lookup(eval, row, lookups);
-        constraints::lookups::bitwise_lookup(eval, row, lookups);
-        constraints::host_call::witness_input(eval, row, lookups);
-        constraints::row::next_timestamp_bytes(eval, row, lookups);
-        constraints::host_call::poseidon2_call(eval, row, lookups);
+        constraints::all(eval, &columns::Row::new(&trace_eval), lookups);
     }
 }
 

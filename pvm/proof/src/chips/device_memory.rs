@@ -57,6 +57,7 @@ use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
 
+#[derive(Clone, Copy)]
 pub struct DeviceMemoryChip;
 
 /// The bits of a page index, and of a page's distance to its region's ends.

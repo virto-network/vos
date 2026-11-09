@@ -71,6 +71,7 @@ use compression::{
 #[cfg(feature = "prover")]
 use trace::GRow;
 
+#[derive(Clone, Copy)]
 pub struct Blake2bChip;
 
 impl BuiltInComponent for Blake2bChip {

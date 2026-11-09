@@ -198,9 +198,9 @@ pub fn drive_chip_oods<E: stwo_constraint_framework::EvalAtRow>(
     impl<E: stwo_constraint_framework::EvalAtRow> crate::ChipVisitor for Drive<'_, E> {
         type Output = E;
 
-        fn visit<C>(self, chip: &'static C) -> E
+        fn visit<C>(self, chip: &C) -> E
         where
-            C: BuiltInComponent + Sync + 'static,
+            C: BuiltInComponent + Copy + Sync + 'static,
             C::LookupElements: Sync + 'static,
         {
             let ce = BuiltInComponentEval::<C> {

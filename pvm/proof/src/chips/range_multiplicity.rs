@@ -30,6 +30,7 @@ use crate::{
 
 /// Range multiplicity chip: proves that all byte values (0-255) are valid.
 /// This is the "receiver" side of the range check lookup.
+#[derive(Clone, Copy)]
 pub struct RangeMultiplicity256;
 
 const RANGE_LOG_SIZE: u32 = 8; // 256 rows, one per byte value

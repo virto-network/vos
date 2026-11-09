@@ -34,6 +34,7 @@ use crate::{
 /// Each row i provides (shift_amount=i, power_val=2^i as 8 LE bytes).
 /// The CpuChip produces positive entries when is_shift=1 and shift_op ∈ {0,1}.
 /// This chip consumes them with negative multiplicity.
+#[derive(Clone, Copy)]
 pub struct PowerOfTwoChip;
 
 const POW2_LOG_SIZE: u32 = 6; // 2^6 = 64 rows
