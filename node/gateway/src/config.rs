@@ -85,6 +85,10 @@ pub struct Onion {
     pub state: Option<PathBuf>,
     /// arti's directory cache.
     pub cache: Option<PathBuf>,
+    /// An arti configuration file, in arti's TOML, the client starts from:
+    /// a private Tor network's authorities, fallbacks and path rules, say.
+    /// The directories above and full vanguards apply over it.
+    pub arti: Option<PathBuf>,
     /// The onion's key's seed file, in hex, made if missing: its address
     /// is the key's.
     pub key: Option<PathBuf>,
@@ -213,9 +217,13 @@ impl Config {
         }
         if let Some(onion) = &self.onion
             && onion.sidecar()
-            && (onion.state.is_some() || onion.cache.is_some() || onion.key.is_some() || onion.pow)
+            && (onion.state.is_some()
+                || onion.cache.is_some()
+                || onion.arti.is_some()
+                || onion.key.is_some()
+                || onion.pow)
         {
-            return Err("an onion is arti's (state, cache, key, pow) or a C tor's (sidecar_ssh, sidecar_http), not both".into());
+            return Err("an onion is arti's (state, cache, arti, key, pow) or a C tor's (sidecar_ssh, sidecar_http), not both".into());
         }
         Ok(())
     }
@@ -370,11 +378,13 @@ mod tests {
             ))
             .unwrap()
         };
-        assert!(
-            onion("sidecar_ssh = \"127.0.0.1:2222\"\nkey = \"o\"\n")
-                .check()
-                .is_err()
-        );
+        for arti in ["key = \"o\"", "arti = \"arti.toml\""] {
+            assert!(
+                onion(&format!("sidecar_ssh = \"127.0.0.1:2222\"\n{arti}\n"))
+                    .check()
+                    .is_err()
+            );
+        }
         let sidecar = onion("sidecar_http = \"127.0.0.1:8081\"\ncircuit_rate = 5\n");
         assert!(sidecar.check().is_ok());
         let served = sidecar.onion.unwrap();
