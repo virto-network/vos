@@ -149,7 +149,7 @@ fn device(seed: u64, index: u64) -> NewDevice {
 /// first push, so the fill needs no re-proof.
 pub fn policy() -> Policy {
     Policy {
-        removal_delay_ms: 2 * 60_000,
+        operation_delay_ms: 2 * 60_000,
         probation_ms: 60_000,
         confirm_window_ms: 5 * 60_000,
         bytes_new: 64 << 20,
@@ -370,7 +370,7 @@ pub fn create(inventory: &Inventory, request: &Request) -> Result<Personals, Str
         full,
         seed: request.seed,
         policy_ms: (
-            policy.removal_delay_ms,
+            policy.operation_delay_ms,
             policy.probation_ms,
             policy.confirm_window_ms,
             policy.slot_ttl_ms,
