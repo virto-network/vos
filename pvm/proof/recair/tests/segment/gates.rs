@@ -246,7 +246,9 @@ fn pad_inside(trace: &mut MaskedSegmentTrace, position: usize, is_padding: usize
         .filter(|&&flag| flag == BaseField::zero())
         .count();
     let turn = |row: usize| (row + real / 2) % rows;
-    assert!(real >= 2 && natural[is_padding][turn(rows - 1)] == BaseField::zero());
+    let is_real = |row: usize| natural[is_padding][turn(row)] == BaseField::zero();
+    assert!(real >= 2 && is_real(0) && is_real(rows - 1));
+    assert!(natural[is_padding].contains(&BaseField::one()));
     for (column, values) in columns.iter_mut().zip(&natural) {
         for row in 0..rows {
             column.as_mut_slice()[stored(row, log_size)] = values[turn(row)];
@@ -256,14 +258,16 @@ fn pad_inside(trace: &mut MaskedSegmentTrace, position: usize, is_padding: usize
 
 /// Padding between the segment's ledgers' real rows is accepted, and is
 /// sound: the memory ledger (`MemoryChip`) and the register ledger, each
-/// turned so that its padding lies between real rows, verify. A run of
-/// real rows after padding starts with a `ts = 0` write and every group
-/// ends with a closing read; in the segment a byte's are its listed page's
-/// alone (`MemoryPageChip`, a page once: its leaf the trie's one at its
-/// index) and a register's the boundary chip's alone, so each byte and
-/// each register is one group wherever padding lies. The device's byte
-/// ledger, whose boundary rows a byte may hold twice, is not
-/// (`device::memory::byte_ledger_padding_between_real_rows_is_accepted_today`).
+/// turned so that its padding lies between real rows, verify (the segment
+/// AIR, proved and verified masked). In the memory ledger a run of real
+/// rows after padding starts with a `ts = 0` write and every group ends
+/// with a closing read, a byte's the listed page's alone (`MemoryPageChip`,
+/// a page once: its leaf the trie's one at its index); in the register
+/// ledger each real row after padding starts a chain, which must be its
+/// register's `ts = 0` write, the boundary chip's one a register. So each
+/// byte is one group and each register one chain wherever padding lies.
+/// The device's byte ledger, which lets a byte have two boundary rows, is
+/// not (`device::memory::byte_ledger_padding_between_real_rows_is_accepted_today`).
 #[test]
 fn padding_between_the_ledgers_real_rows_is_harmless() {
     use vos_pvm_proof::chips::memory;

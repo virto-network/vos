@@ -1817,7 +1817,7 @@ that narrows the inner proof makes folds cheaper too.
 | format 41's wider AIR overflows a kernel leaf | the leaves counted as built, within 2^16 / 2^17 / 2^16; the Poseidon2 chip's 17-page class (§3.2) |
 | a device proof's shape leaks its witness | the trace padded to the program's log sizes, which a public reference run sets (§8); branch-free kernels; a test of two path shapes under one program |
 | the signature chips' cost or soundness | a gate ladder per chip; a phone run (`open.md`) |
-| a ledger's padding splits an address into two groups | segments: **held**, a byte's and a register's boundary produced once, padding inside each ledger verifying harmless; device 46: **not held**, `DeviceMemoryChip` gives a byte two boundary rows, so 46 retires behind 47, whose word ledger keeps padding past the real rows (`open.md`) [reviewed, 2026-11-10] |
+| a ledger's padding splits an address into two groups | segments: **held**, a byte's and a register's boundary produced once, padding inside each ledger verifying harmless; device 46 (admitted): **not held**, `DeviceMemoryChip` lets a byte have two boundary rows, so 46 retires behind 47, whose word ledger keeps padding past the real rows (`open.md`) [reviewed, 2026-11-10] |
 
 ## 11. Design choices
 

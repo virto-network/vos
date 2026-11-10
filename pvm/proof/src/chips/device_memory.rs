@@ -28,8 +28,8 @@
 //! across a padding row, so its real rows may be several sorted runs, each
 //! holding a group of the byte that one of its rows starts and closes: a
 //! read in one group then misses the writes in another. Under this chip
-//! the byte ledger does not keep one group a byte (`docs/design/open.md`);
-//! the word ledger, its padding past the real rows, does.
+//! the byte ledger does not keep one group a byte; the word ledger, its
+//! padding past the real rows, does.
 
 use crate::prelude::*;
 use num_traits::{One, Zero};

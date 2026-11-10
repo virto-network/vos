@@ -642,11 +642,13 @@ fn pad_inside(trace: &mut MaskedDeviceTrace, program: &Program, chip: usize, is_
 /// [`padding_between_real_rows_is_refused`], the proof verifies. The byte
 /// ledger has no last-row column and its sortedness gadget does not fire
 /// across a padding row, so its real rows may be several sorted runs; and
-/// `DeviceMemoryChip` gives a byte as many boundary rows as the prover
+/// `DeviceMemoryChip` lets a byte have as many boundary rows as the prover
 /// puts, so each run may hold a group of one byte, its writes in one and
-/// its reads in another. The known gap of format 46 (`docs/design/open.md`),
-/// closed by the word ledger's `IsLast` (format 47): when the byte ledger
-/// takes it, or format 46 is refused, this test asserts the refusal.
+/// its reads in another: the byte ledger's known gap, which the word
+/// ledger's `IsLast` closes (`docs/design/proving.md` §10). The test runs
+/// the shape's byte ledger, not registry entry 46: it asserts the refusal
+/// once the byte ledger takes a last-row column, and goes with the byte
+/// ledger if the device drops it.
 #[test]
 fn byte_ledger_padding_between_real_rows_is_accepted_today() {
     use vos_pvm_proof::chips::memory::Column;

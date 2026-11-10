@@ -25,7 +25,9 @@
 //!   states as the boundary chips' bytes and grinds its interaction PoW
 //!   before the relation challenges. 46 is admitted: a space's ingress
 //!   verifies device proofs against the program it computes from the
-//!   installed kernel (`vos-pvm-recair`'s `device`). 32
+//!   installed kernel (`vos-pvm-recair`'s `device`); its byte ledger does
+//!   not keep a byte one group (`chips::DeviceMemoryChip`), so its memory
+//!   argument is unsound and the word ledger's format retires it. 32
 //!   is registered and refused
 //!   although its AIR and channel exist: `vos-pvm-recair` proves and verifies
 //!   its proofs natively, pinning each circuit by its hash, and no verifier
