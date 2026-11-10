@@ -73,7 +73,7 @@ fn run(cli: Cli) -> Result<(), String> {
         let ssh = vos_gateway::ssh::start(
             &config,
             Arc::clone(&gateway),
-            vos_gateway::ssh::Port::tcp(
+            vos_gateway::ssh::Port::new(
                 Mark::Clearnet,
                 Arc::clone(&limits),
                 Caps::none(),

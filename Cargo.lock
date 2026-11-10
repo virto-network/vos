@@ -2204,7 +2204,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2976,7 +2976,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.58.0",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -4925,7 +4925,7 @@ dependencies = [
  "derive-deftly",
  "libc",
  "paste",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -5023,7 +5023,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5647,7 +5647,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5660,7 +5660,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.11.0",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5726,7 +5726,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s4-protocol"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=a11a57f806b944f62e16e63adc2f62eb81a28474#a11a57f806b944f62e16e63adc2f62eb81a28474"
+source = "git+https://codeberg.org/Virto/s4?rev=b91c21e35bb0c0f2fa093dbe4352d2c1dffcf2c9#b91c21e35bb0c0f2fa093dbe4352d2c1dffcf2c9"
 dependencies = [
  "base64",
  "ciborium",
@@ -5738,7 +5738,7 @@ dependencies = [
 [[package]]
 name = "s4-rui"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=a11a57f806b944f62e16e63adc2f62eb81a28474#a11a57f806b944f62e16e63adc2f62eb81a28474"
+source = "git+https://codeberg.org/Virto/s4?rev=b91c21e35bb0c0f2fa093dbe4352d2c1dffcf2c9#b91c21e35bb0c0f2fa093dbe4352d2c1dffcf2c9"
 dependencies = [
  "base64",
  "libc",
@@ -5756,7 +5756,7 @@ dependencies = [
 [[package]]
 name = "s4-server"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=a11a57f806b944f62e16e63adc2f62eb81a28474#a11a57f806b944f62e16e63adc2f62eb81a28474"
+source = "git+https://codeberg.org/Virto/s4?rev=b91c21e35bb0c0f2fa093dbe4352d2c1dffcf2c9#b91c21e35bb0c0f2fa093dbe4352d2c1dffcf2c9"
 dependencies = [
  "rand 0.10.3",
  "russh",
@@ -5769,7 +5769,7 @@ dependencies = [
 [[package]]
 name = "s4-widgets"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=a11a57f806b944f62e16e63adc2f62eb81a28474#a11a57f806b944f62e16e63adc2f62eb81a28474"
+source = "git+https://codeberg.org/Virto/s4?rev=b91c21e35bb0c0f2fa093dbe4352d2c1dffcf2c9#b91c21e35bb0c0f2fa093dbe4352d2c1dffcf2c9"
 dependencies = [
  "s4-protocol",
  "serde",
@@ -6747,10 +6747,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0136791f7c95b1f6dd99f9cc786b91bb81c3800b639b3478e561ddb7be95e5f1"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.3",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -9439,7 +9439,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

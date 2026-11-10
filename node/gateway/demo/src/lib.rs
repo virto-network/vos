@@ -270,7 +270,7 @@ impl LocalSpace {
         )]));
         let mark = vos_api::Mark::Clearnet;
         let app = Arc::new(AppClient::new(app, Arc::clone(&gateway), mark));
-        let port = vos_gateway::ssh::Port::tcp(
+        let port = vos_gateway::ssh::Port::new(
             mark,
             Limits::new(PerAddress::default()),
             vos_gateway::caps::Caps::none(),

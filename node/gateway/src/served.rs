@@ -1,10 +1,11 @@
 //! The onion's ports (`light-node.md` §6.1): its own HTTP server and, with
-//! an SSH port, its own SSH port on a loopback listener, both marking
-//! onion, counting each circuit as an address and capping its calls; their
-//! streams from arti in process (the `tor` feature) or from a C tor beside
-//! the gateway ([`crate::circuits::sidecar`]).
+//! an SSH port, its own SSH server (s4's screens, when the file names the
+//! demo, and the `vos-api` subsystem), both served the onion's streams
+//! with their circuits' addresses, marking onion, counting each circuit as
+//! an address and capping its calls; their streams from arti in process
+//! (the `tor` feature) or from a C tor beside the gateway
+//! ([`crate::circuits::sidecar`]).
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use vos_api::Mark;
@@ -20,8 +21,6 @@ use crate::limits::Limits;
 pub struct Served {
     pub circuits: Arc<Circuits>,
     pub caps: Arc<Caps>,
-    /// The onion's SSH port's loopback address, if it serves SSH.
-    pub ssh: Option<SocketAddr>,
     /// The onion arti hosts, if it does.
     #[cfg(feature = "tor")]
     pub hosted: Option<crate::onion::Hosted>,
@@ -42,8 +41,8 @@ impl Drop for Served {
 
 /// Serve the onion `onion` of the gateway the file `config` describes, in
 /// front of `gateway`, on the runtime: SSH if the file names an SSH port,
-/// its `vos-api` subsystem and no demo screens, whose host service would
-/// answer a connection no stream carries.
+/// as the gateway's SSH port serves it, its demo's claims going as the
+/// app's key marked onion.
 pub async fn onion(
     config: &Config,
     onion: &config::Onion,
@@ -53,8 +52,14 @@ pub async fn onion(
     let limits = Limits::new(onion.limits());
     let caps = Caps::new(onion.caps());
     let mut tasks = Vec::new();
-    let ssh = ssh(config, &gateway, &circuits, &limits, &caps, &mut tasks)?;
-    let (front, listener) = Onion::new(Arc::clone(&circuits), ssh);
+    let ssh = cfg!(feature = "ssh") && config.ssh.is_some();
+    let (front, listener, ssh_listener) = Onion::new(Arc::clone(&circuits), ssh);
+    #[cfg(feature = "ssh")]
+    if let Some(listener) = ssh_listener {
+        tasks.push(ssh_server(config, &gateway, &limits, &caps, listener)?);
+    }
+    #[cfg(not(feature = "ssh"))]
+    let _ = ssh_listener;
     let http = Http {
         tls: None,
         connections: config.connections.unwrap_or(1024),
@@ -77,7 +82,7 @@ pub async fn onion(
             if !address.ip().is_loopback() {
                 return Err(format!("{address}: a C tor's listener is a loopback one"));
             }
-            if port == circuits::SSH && ssh.is_none() {
+            if port == circuits::SSH && !ssh {
                 return Err("sidecar_ssh needs the gateway's SSH port".into());
             }
             let listener = tokio::net::TcpListener::bind(address)
@@ -92,7 +97,6 @@ pub async fn onion(
         return Ok(Served {
             circuits,
             caps,
-            ssh,
             #[cfg(feature = "tor")]
             hosted: None,
             tasks,
@@ -104,7 +108,6 @@ pub async fn onion(
         Ok(Served {
             circuits,
             caps,
-            ssh,
             hosted: Some(hosted),
             tasks,
         })
@@ -116,47 +119,32 @@ pub async fn onion(
     }
 }
 
-/// The onion's own SSH port on a loopback listener, if the file names an
-/// SSH port: its address.
-fn ssh(
+/// The onion's own SSH server, taking the streams `listener` hands it.
+#[cfg(feature = "ssh")]
+fn ssh_server(
     config: &Config,
     gateway: &Arc<Gateway>,
-    circuits: &Arc<Circuits>,
     limits: &Arc<Limits>,
     caps: &Arc<Caps>,
-    tasks: &mut Vec<tokio::task::JoinHandle<()>>,
-) -> Result<Option<SocketAddr>, String> {
-    #[cfg(feature = "ssh")]
-    if config.ssh.is_some() {
-        use crate::ssh::{Peers, Port};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")
-            .and_then(|listener| {
-                listener.set_nonblocking(true)?;
-                tokio::net::TcpListener::from_std(listener)
-            })
-            .map_err(|error| format!("the onion's SSH port: {error}"))?;
-        let address = listener.local_addr().map_err(|error| error.to_string())?;
-        let port = Port {
-            mark: Mark::Onion,
-            limits: Arc::clone(limits),
-            caps: Arc::clone(caps),
-            bodies: crate::caps::bodies(),
-            peers: Peers::Carried(Arc::clone(circuits)),
-        };
-        let path = config
-            .ssh_host_key
-            .clone()
-            .ok_or("an SSH port needs ssh_host_key")?;
-        let host_key = s4_server::load_or_create_host_key(&path)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
-        let server = crate::ssh::server(host_key, Arc::clone(gateway), port, None);
-        tasks.push(tokio::spawn(async move {
-            if let Err(error) = server.serve_on(listener).await {
-                tracing::warn!(%error, "the onion's SSH port ended");
-            }
-        }));
-        return Ok(Some(address));
-    }
-    let _ = (config, gateway, circuits, limits, caps, tasks);
-    Ok(None)
+    listener: circuits::OnionListener,
+) -> Result<tokio::task::JoinHandle<()>, String> {
+    let port = crate::ssh::Port::new(
+        Mark::Onion,
+        Arc::clone(limits),
+        Arc::clone(caps),
+        crate::caps::bodies(),
+    );
+    let app = config
+        .app_key
+        .as_ref()
+        .map(|path| config::seed(path))
+        .transpose()?
+        .map(|seed| {
+            Arc::new(crate::app::AppClient::new(
+                seed,
+                Arc::clone(gateway),
+                Mark::Onion,
+            ))
+        });
+    crate::ssh::serve(config, Arc::clone(gateway), port, app, listener)
 }

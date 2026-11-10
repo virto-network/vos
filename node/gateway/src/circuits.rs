@@ -5,12 +5,9 @@
 //! the unique local IPv6 addresses no client holds, and each stream on it
 //! a port of that address, so a connection's caps count it alone.
 //!
-//! HTTP streams go to the onion's own HTTP server, its requests marked
-//! onion. An SSH stream is carried to the onion's own SSH port on a
-//! loopback listener (s4-server serves a listener, not a stream): the
-//! carrier's loopback address names the stream, so the port's subsystem
-//! counts the circuit, and a loopback connection that no stream carries is
-//! served no channel.
+//! HTTP streams go to the onion's own HTTP server, SSH streams to the
+//! onion's own SSH server, each stream handed over with its address, so
+//! both count the circuit and mark onion what they serve.
 //!
 //! The streams come from arti in process (the `onion` module, the `tor` feature) or from a C tor
 //! beside the gateway ([`sidecar`]), whose `HiddenServiceExportCircuitID
@@ -86,9 +83,6 @@ pub struct Circuits {
     per: PerCircuit,
     open: Mutex<HashMap<u32, Open>>,
     circuits: Mutex<usize>,
-    /// The SSH streams carried to the onion's SSH port, by the carrier's
-    /// loopback address: the stream's address.
-    carried: Mutex<HashMap<SocketAddr, SocketAddr>>,
     counts: [AtomicU64; 4],
 }
 
@@ -145,7 +139,6 @@ impl Circuits {
             per,
             open: Mutex::new(HashMap::new()),
             circuits: Mutex::new(0),
-            carried: Mutex::new(HashMap::new()),
             counts: Default::default(),
         })
     }
@@ -239,17 +232,6 @@ impl Circuits {
             streams_refused: count(3),
         }
     }
-
-    /// The address of the stream the SSH connection from `peer` carries,
-    /// if one does, by the carrier's exact loopback address: the onion's
-    /// SSH port serves channels to no other.
-    pub fn carried(&self, peer: SocketAddr) -> Option<SocketAddr> {
-        self.carried
-            .lock()
-            .expect("the carried streams")
-            .get(&peer)
-            .copied()
-    }
 }
 
 /// A stream holding its place on its circuit until it ends.
@@ -286,36 +268,57 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Placed<S> {
     }
 }
 
-/// An HTTP stream from the onion, with its address.
+/// A stream from the onion, with its address.
 type Accepted = (Box<dyn Io>, SocketAddr);
 
-/// The onion's HTTP streams as a listener of the gateway's HTTP server.
+/// The onion's streams to one of its ports, as that port's server takes
+/// them: the HTTP server's listener, or the SSH server's.
 pub struct OnionListener(tokio::sync::mpsc::Receiver<Accepted>);
+
+impl OnionListener {
+    /// The next stream and its address; `None` once the onion is gone.
+    pub async fn next(&mut self) -> Option<Accepted> {
+        self.0.recv().await
+    }
+}
 
 impl vos_http::Listener for OnionListener {
     type Stream = Compat<Box<dyn Io>>;
 
     async fn accept(&mut self) -> std::io::Result<(Self::Stream, SocketAddr)> {
-        match self.0.recv().await {
+        match self.next().await {
             Some((stream, peer)) => Ok((stream.compat(), peer)),
             None => Err(std::io::ErrorKind::BrokenPipe.into()),
         }
     }
 }
 
-/// Where the onion's streams go: its HTTP server's listener, and its SSH
-/// port's loopback address.
+/// Streams the onion's servers wait to take, a port's at most.
+const WAITING: usize = 64;
+
+/// Where the onion's streams go: its HTTP server and, if it serves SSH,
+/// its SSH server.
 pub struct Onion {
     pub circuits: Arc<Circuits>,
     http: tokio::sync::mpsc::Sender<Accepted>,
-    ssh: Option<SocketAddr>,
+    ssh: Option<tokio::sync::mpsc::Sender<Accepted>>,
 }
 
 impl Onion {
-    /// The onion over `circuits`, its SSH streams carried to `ssh`, if it
-    /// serves SSH; and the listener its HTTP streams arrive on.
-    pub fn new(circuits: Arc<Circuits>, ssh: Option<SocketAddr>) -> (Arc<Self>, OnionListener) {
-        let (http, accepted) = tokio::sync::mpsc::channel(64);
+    /// The onion over `circuits`; and the listeners its HTTP streams and,
+    /// if it serves `ssh`, its SSH streams arrive on.
+    pub fn new(
+        circuits: Arc<Circuits>,
+        ssh: bool,
+    ) -> (Arc<Self>, OnionListener, Option<OnionListener>) {
+        let (http, accepted) = tokio::sync::mpsc::channel(WAITING);
+        let (ssh, ssh_accepted) = match ssh {
+            true => {
+                let (ssh, accepted) = tokio::sync::mpsc::channel(WAITING);
+                (Some(ssh), Some(OnionListener(accepted)))
+            }
+            false => (None, None),
+        };
         (
             Arc::new(Self {
                 circuits,
@@ -323,6 +326,7 @@ impl Onion {
                 ssh,
             }),
             OnionListener(accepted),
+            ssh_accepted,
         )
     }
 
@@ -358,35 +362,11 @@ impl Onion {
             stream,
             _place: place,
         };
-        match (port, self.ssh) {
-            (SSH, Some(ssh)) => self.carry(stream, peer, ssh).await,
-            _ => {
-                let _ = self.http.send((Box::new(stream), peer)).await;
-            }
-        }
-    }
-
-    /// Carry an SSH stream to the onion's SSH port, the carrier's loopback
-    /// port naming it while it is open.
-    async fn carry(&self, mut stream: impl Io, peer: SocketAddr, ssh: SocketAddr) {
-        let Ok(mut carrier) = tokio::net::TcpStream::connect(ssh).await else {
-            return;
+        let server = match (port, &self.ssh) {
+            (SSH, Some(ssh)) => ssh,
+            _ => &self.http,
         };
-        let Ok(local) = carrier.local_addr() else {
-            return;
-        };
-        let _ = carrier.set_nodelay(true);
-        self.circuits
-            .carried
-            .lock()
-            .expect("the carried streams")
-            .insert(local, peer);
-        let _ = tokio::io::copy_bidirectional(&mut stream, &mut carrier).await;
-        self.circuits
-            .carried
-            .lock()
-            .expect("the carried streams")
-            .remove(&local);
+        let _ = server.send((Box::new(stream), peer)).await;
     }
 }
 
@@ -544,7 +524,7 @@ mod tests {
     async fn c_tors_streams_are_served_on_their_circuits() {
         use tokio::io::AsyncWriteExt;
         let circuits = Circuits::new(PerCircuit::default());
-        let (onion, mut http) = Onion::new(Arc::clone(&circuits), None);
+        let (onion, mut http, _) = Onion::new(Arc::clone(&circuits), false);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(sidecar::serve(onion, listener, HTTP));
@@ -589,20 +569,18 @@ mod tests {
         }
     }
 
-    /// An HTTP stream reaches the listener with its circuit's address, and
-    /// an SSH stream is carried to the SSH port, its carrier naming it while
-    /// it is open; a stream to another port is closed.
+    /// An HTTP stream reaches the HTTP listener and an SSH stream the SSH
+    /// one, each with its circuit's address and a port of its own, holding
+    /// its place on the circuit until it ends; a stream to another port is
+    /// closed.
     #[tokio::test]
     async fn streams_go_by_their_port() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let ssh = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let circuits = Circuits::new(PerCircuit::default());
-        let (onion, mut http) = Onion::new(Arc::clone(&circuits), Some(ssh.local_addr().unwrap()));
+        let (onion, mut http, ssh) = Onion::new(Arc::clone(&circuits), true);
+        let mut ssh = ssh.expect("the onion serves SSH");
         let (mut client, served) = tokio::io::duplex(64);
-        let serving = {
-            let onion = Arc::clone(&onion);
-            tokio::spawn(async move { onion.serve(served, 5, HTTP).await })
-        };
+        onion.serve(served, 5, HTTP).await;
         let (mut stream, peer) = vos_http::Listener::accept(&mut http).await.unwrap();
         assert_eq!(peer.ip(), address(5));
         client.write_all(b"ping").await.unwrap();
@@ -611,36 +589,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&read, b"ping");
-        serving.await.unwrap();
-        // SSH: carried, the carrier's port naming the stream.
+        // SSH: to the SSH server, on its circuit.
         let (mut client, served) = tokio::io::duplex(64);
-        let carrying = {
-            let onion = Arc::clone(&onion);
-            tokio::spawn(async move { onion.serve(served, 6, SSH).await })
-        };
-        let (mut carried, from) = ssh.accept().await.unwrap();
-        let mut named = None;
-        for _ in 0..100 {
-            named = circuits.carried(from);
-            if named.is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let named = named.expect("the carrier names it");
-        assert_eq!(named.ip(), address(6));
-        assert_eq!(circuits.carried("10.0.0.1:1".parse().unwrap()), None);
+        onion.serve(served, 6, SSH).await;
+        let (mut stream, peer) = ssh.next().await.unwrap();
+        assert_eq!(peer.ip(), address(6));
+        assert_eq!(circuits.streams(6), 1, "its place held");
         client.write_all(b"ssh").await.unwrap();
         let mut read = [0u8; 3];
-        carried.read_exact(&mut read).await.unwrap();
+        stream.read_exact(&mut read).await.unwrap();
         assert_eq!(&read, b"ssh");
-        drop(client);
-        drop(carried);
-        carrying.await.unwrap();
-        assert_eq!(circuits.carried(from), None, "forgotten once it ends");
+        drop(stream);
+        assert_eq!(circuits.streams(6), 0, "given back once it ends");
         // Another port: closed, counted.
         let (_client, served) = tokio::io::duplex(64);
         onion.serve(served, 7, 443).await;
         assert_eq!(circuits.counts().streams_refused, 1);
+        // Without SSH, port 22 is another port.
+        let (onion, _http, none) = Onion::new(Arc::clone(&circuits), false);
+        assert!(none.is_none() && !onion.serves(SSH));
     }
 }

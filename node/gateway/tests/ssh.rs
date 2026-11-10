@@ -85,7 +85,7 @@ async fn port_marked(key: [u8; 32], socket: PathBuf, mark: vos_api::Mark) -> std
         [41; 32],
     )]));
     let host_key = ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[3; 32]));
-    let port = vos_gateway::ssh::Port::tcp(
+    let port = vos_gateway::ssh::Port::new(
         mark,
         Limits::new(PerAddress::default()),
         vos_gateway::caps::Caps::none(),
@@ -498,7 +498,7 @@ async fn a_flood_of_junk_proofs_is_held_to_the_caps_and_members_are_served() {
         [41; 32],
     )]));
     let host_key = ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[3; 32]));
-    let port = vos_gateway::ssh::Port::tcp(
+    let port = vos_gateway::ssh::Port::new(
         vos_api::Mark::Onion,
         Limits::new(PerAddress::default()),
         Arc::clone(&caps),
@@ -575,7 +575,7 @@ async fn a_flood_of_junk_proofs_is_held_to_the_caps_and_members_are_served() {
         )]));
         let host_key =
             ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[4; 32]));
-        let port = vos_gateway::ssh::Port::tcp(
+        let port = vos_gateway::ssh::Port::new(
             vos_api::Mark::Onion,
             Limits::new(PerAddress::default()),
             Arc::clone(&roomy),
@@ -699,4 +699,270 @@ async fn a_flood_of_junk_proofs_is_held_to_the_caps_and_members_are_served() {
         CONNECTIONS * FLOOD + 1,
         "every proven call within its connection's reached the node"
     );
+}
+
+/// The onion's SSH, as the gateway serves it behind a C tor (each stream
+/// on the circuit its PROXY line names), each circuit's channels limited
+/// to `connections` and its streams to `streams`: the sidecar's listener,
+/// and what serves it.
+async fn onion(
+    node: [u8; 32],
+    socket: &std::path::Path,
+    connections: usize,
+    streams: usize,
+) -> (
+    std::net::SocketAddr,
+    vos_gateway::served::Served,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let text = format!(
+        r#"
+key = "{dir}/gateway.key"
+http = "127.0.0.1:0"
+nodes = [{{ key = "{node}", address = "unix:{socket}" }}]
+ssh = "127.0.0.1:0"
+ssh_host_key = "{dir}/ssh_host_key"
+
+[onion]
+sidecar_ssh = "{sidecar}"
+circuit_connections = {connections}
+circuit_streams = {streams}
+"#,
+        dir = dir.path().display(),
+        node = hex::encode(node),
+        socket = socket.display(),
+    );
+    let config: vos_gateway::config::Config = toml::from_str(&text).unwrap();
+    let gateway = Arc::new(Gateway::new(
+        config
+            .upstreams()
+            .unwrap()
+            .into_iter()
+            .map(|(key, address)| Upstream::new(key, address, [41; 32]))
+            .collect(),
+    ));
+    let served = vos_gateway::served::onion(&config, config.onion.as_ref().unwrap(), gateway)
+        .await
+        .unwrap();
+    (sidecar, served, dir)
+}
+
+/// An SSH connection under an ephemeral key over a stream C tor forwards
+/// from circuit `circuit`.
+async fn over_circuit(
+    sidecar: std::net::SocketAddr,
+    circuit: u32,
+) -> Result<client::Handle<AcceptAll>, russh::Error> {
+    use tokio::io::AsyncWriteExt;
+    let mut stream = tokio::net::TcpStream::connect(sidecar).await?;
+    stream
+        .write_all(
+            format!("PROXY TCP6 fc00:dead:beef:4dad::{circuit:x} ::1 65535 22\r\n").as_bytes(),
+        )
+        .await?;
+    let mut handle =
+        client::connect_stream(Arc::new(client::Config::default()), stream, AcceptAll).await?;
+    let key = ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&seed_of(
+        circuit,
+    )));
+    let key = russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), None);
+    assert!(
+        handle
+            .authenticate_publickey("anyone", key)
+            .await?
+            .success()
+    );
+    Ok(handle)
+}
+
+/// An SSH key of the connection's own.
+fn seed_of(circuit: u32) -> [u8; 32] {
+    let mut seed = [7u8; 32];
+    seed[..4].copy_from_slice(&circuit.to_le_bytes());
+    seed
+}
+
+/// A `vos-api` subsystem channel asked for on `handle`: one the gateway
+/// serves no channel closes at once.
+async fn subsystem(handle: &client::Handle<AcceptAll>) -> russh::Channel<client::Msg> {
+    let channel = handle.channel_open_session().await.unwrap();
+    channel
+        .request_subsystem(true, vos_gateway::ssh::SUBSYSTEM)
+        .await
+        .unwrap();
+    channel
+}
+
+/// A terminal's text, its escape sequences dropped.
+fn text(bytes: &[u8]) -> String {
+    let mut text = String::new();
+    let mut chars = String::from_utf8_lossy(bytes).into_owned();
+    chars.push(' ');
+    let mut chars = chars.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            text.push(c);
+            continue;
+        }
+        match chars.next() {
+            // CSI: up to its final byte.
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            // OSC, APC, DCS: up to BEL or ST.
+            Some(']' | '_' | 'P') => {
+                while let Some(c) = chars.next() {
+                    if c == '\x07' || (c == '\x1b' && chars.next_if_eq(&'\\').is_some()) {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    text
+}
+
+/// s4's screens over the onion: a stream on a circuit, handed to the
+/// gateway's SSH server with its circuit's address, serves the screen on
+/// a terminal and, on the same connection, the `vos-api` subsystem marking
+/// onion, which the onion-only gated agent answers. Each circuit holds its
+/// own channels and their requests (two places here: past them a request
+/// is answered `Unavailable`, a further connection's channel on the same
+/// circuit is closed at once, and another circuit's is served) and its own
+/// streams (two: a third on the circuit is closed as it arrives); every
+/// place is given back once its connection ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_onions_ssh_serves_the_screens_marked_onion_and_limited_per_circuit() {
+    const GATED: InstanceId = InstanceId(1);
+    let served = served();
+    let target = Target::socket(served.socket.clone());
+    let operator = Operator::signing(&target, SigningKey::from_bytes(&OPERATOR), served.node.id());
+    let (gated, identity) = tokio::task::spawn_blocking(move || {
+        let Ok(Response::Created(agent)) = operator.create_agent(Vec::new()) else {
+            panic!("an agent")
+        };
+        let elf = vos_checker::programs::package("gated");
+        vos_checker::calls::installed(
+            operator
+                .install(agent, &vos_checker::calls::install_of(GATED, &elf))
+                .unwrap(),
+        );
+        let identity = Client::new(&target, SigningKey::from_bytes(&[1; 32]))
+            .identity(agent)
+            .unwrap();
+        (agent, identity)
+    })
+    .await
+    .unwrap();
+    let query = |key: u8| {
+        let query = signed_query(
+            &identity,
+            &SigningKey::from_bytes(&[key; 32]),
+            served.clock.load(Ordering::SeqCst) + 10_000,
+            Consistency::Applied { at: 0 },
+            GATED,
+            vos_wire::ids::MethodId(vos_wire::ids::derive_id("vos/method/", "count")),
+            Vec::new(),
+        );
+        frame(
+            Framing::Stream,
+            Kind::Query as u16,
+            1,
+            &(gated, query).encode(),
+        )
+    };
+    let (sidecar, onion, _dir) = onion(served.node.id().0, &served.socket, 2, 2).await;
+    let handle = over_circuit(sidecar, 7).await.unwrap();
+    // The screen, on a terminal.
+    let mut shell = handle.channel_open_session().await.unwrap();
+    shell
+        .request_pty(true, "xterm-256color", 100, 30, 800, 480, &[])
+        .await
+        .unwrap();
+    shell.request_shell(true).await.unwrap();
+    let mut screen = Vec::new();
+    let shown = tokio::time::timeout(Duration::from_secs(30), async {
+        while !text(&screen).contains("vos-gateway") {
+            match shell.wait().await {
+                Some(ChannelMsg::Data { data }) => screen.extend_from_slice(&data),
+                Some(ChannelMsg::Eof | ChannelMsg::Close) | None => return false,
+                Some(_) => {}
+            }
+        }
+        true
+    })
+    .await;
+    assert_eq!(shown, Ok(true), "{:?}", text(&screen));
+    // The subsystem beside it, marking onion.
+    let mut channel = subsystem(&handle).await;
+    let mut answers = Answers { buffer: Vec::new() };
+    channel.data(&query(72)[..]).await.unwrap();
+    let (kind, _, answer) = answers.next(&mut channel).await.unwrap();
+    assert_eq!(kind, Kind::Query as u16);
+    let answer = Response::decode_exact(&answer).unwrap();
+    assert!(
+        matches!(answer, Response::Ran { .. }),
+        "the onion's mark reached the node: {answer:?}"
+    );
+    // A second channel takes the circuit's other place: its request finds
+    // none left.
+    let mut full = subsystem(&handle).await;
+    full.data(&query(73)[..]).await.unwrap();
+    let (kind, _, body) = Answers { buffer: Vec::new() }
+        .next(&mut full)
+        .await
+        .unwrap();
+    assert_eq!(kind, FRAME_ERROR);
+    assert_eq!(
+        FrameError::decode_exact(&body),
+        Some(FrameError::Unavailable)
+    );
+    // A further connection on the circuit is served no channel; another
+    // circuit's is.
+    let second = over_circuit(sidecar, 7).await.unwrap();
+    let mut refused = subsystem(&second).await;
+    refused.data(&query(74)[..]).await.unwrap_or(());
+    assert_eq!(
+        Answers { buffer: Vec::new() }.next(&mut refused).await,
+        None,
+        "past the circuit's channels"
+    );
+    let other = over_circuit(sidecar, 8).await.unwrap();
+    let mut served_other = subsystem(&other).await;
+    served_other.data(&query(75)[..]).await.unwrap();
+    let (kind, _, answer) = Answers { buffer: Vec::new() }
+        .next(&mut served_other)
+        .await
+        .unwrap();
+    assert_eq!(kind, Kind::Query as u16, "another circuit's own channel");
+    assert!(matches!(
+        Response::decode_exact(&answer),
+        Some(Response::Ran { .. })
+    ));
+    // Circuit 7 holds its two streams: a third is closed as it arrives.
+    assert_eq!(onion.circuits.streams(7), 2);
+    assert!(
+        over_circuit(sidecar, 7).await.is_err(),
+        "past the circuit's streams"
+    );
+    // Every place given back once the connections end.
+    drop((shell, channel, full, refused, served_other));
+    drop((handle, second, other));
+    for _ in 0..100 {
+        if onion.circuits.streams(7) + onion.circuits.streams(8) == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(onion.circuits.streams(7) + onion.circuits.streams(8), 0);
 }
