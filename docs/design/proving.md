@@ -1753,8 +1753,9 @@ pays (`open.md`):
   62 columns at 2^14 → 101 at 2^11 (auth); beside the per-program CPU
   7.43M (−28.8%) and 5.43M (−15.1%); peak 403 → 241 → 221 MiB (auth) and
   237 → 166 → 155 MiB (owner); proofs 0.876 → 0.847 → 0.783 MB (auth),
-  0.856 → 0.828 → 0.763 MB (owner) [measured, x86 dev machine (Intel Core
-  Ultra 7 155H), four threads, 2026-11-09].
+  0.856 → 0.828 → 0.763 MB (owner); the times, at load average 16–25
+  from other work, too noisy to read [measured, x86 dev machine (Intel
+  Core Ultra 7 155H), four threads, 2026-11-09].
 The two cheap cuts the model found are in formats 41 and 46 (§3.2).
 
 **3. Signature chips** come last, for flows that must prove a standard
