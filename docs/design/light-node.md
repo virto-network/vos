@@ -1745,8 +1745,8 @@ cases before the device-change windows are pinned (§8, D5).
 - **s4's job**: WorkManager's periodic job (15 minutes, a network up) in
   `:vos` alone (`setDefaultProcessName`, every WorkManager component
   declared in `:vos`, its start-up initializer dropped from the UI
-  process), scheduled when the facility opens. A run polls each
-  enrollment's root and fetches its path if due, then the personal space's
+  process), scheduled when the facility opens. A run reads each
+  enrollment's tree from its feed if due, then the personal space's
   pass once the device holds one (`job::Personal`; the claim's and
   pairing's facility operations attach it, 8.24); every connection is a
   stream of the facility's one dialer, counted (TCP today, arti's stream
@@ -2962,9 +2962,6 @@ nodes may ask the onion's mark of its proven calls, or of every request
   - the credential tree's feed (§6.7): one long-lived circuit, since
     every member reads the same feed, its reads on the connection kept
     open while used, so a poll costs a round trip, not a rendezvous;
-    root polls and path fetches, for a client not yet on the feed, each
-    take their own, a rendezvous each (about 120 an hour in the
-    foreground at 30 s polls, a cost PG5 counts);
   - proven calls (each its own, from a spare: the client keeps one
     circuit to the onion built ahead, its SSH handshake done, for the next
     proven call, and builds the next spare once it is used, since each
@@ -2995,8 +2992,8 @@ nodes may ask the onion's mark of its proven calls, or of every request
   arti's error. A moderate skew that arti's estimate misses reads as the
   directory's failure; the phone session checks which it is.
 - **The client** (`Client`) sends a request (the device library's
-  `wire` bytes) to a space under a `Purpose`: `Proven`, `Fetch` (a path,
-  a root, the onion set: each a connection of its own, closed once
+  `wire` bytes) to a space under a `Purpose`: `Proven`, `Fetch` (the
+  node's time, the onion set: each a connection of its own, closed once
   answered), `Feed`, `Member` (one a space), `Personal`, `Background`
   and `Screens`; `Fetch` and `Feed` carry reads alone. Each connection is a stream on an isolation token drawn
   for it, SSH under the pinned host key and an ed25519 key drawn for it,
@@ -3279,19 +3276,18 @@ live Tor network is not measured yet: M5 measures it.
 
 **Fixes:**
 - the network address: no node or gateway learns a member's address, so
-  "a proof from the same address still links its nullifier to the digest"
-  (`node/SECURITY.md`) ends, since a path fetch and a proof arrive on
-  different circuits;
+  a proof's nullifier links to no address, and a feed read and a proof
+  arrive on different circuits;
 - the root-marking attack's last step (a gateway marking an address's
-  root polls) loses its address; it keeps the circuit, which isolation
-  per purpose (§6.2) scopes to one poll;
+  feed) loses its address; it keeps the circuit, which isolation per
+  purpose (§6.2) scopes to the feed's connection;
 - the personal agent's view: a device's pushes and fetches with no
   address behind them.
 
 **Does not fix:**
 - **timing:** a gateway sees when a read and a proof arrive; keeping
   each tree from its feed on the device (below; the wallet's `tree`
-  likewise) removes path fetches altogether, and the feed's timer keeps
+  likewise) leaves no query naming the member, and the feed's timer keeps
   its reads apart from proofs;
 - **the `map_root` fingerprint:** what a synced tree fixes (below), every
   proof against the newest root the device has read; within a timer
@@ -3353,9 +3349,8 @@ live Tor network is not measured yet: M5 measures it.
   would give every member who read within the period the same root,
   closing the split above, at up to 45 s more of revocation lag; it needs
   the path at that root, the leaves' values before the changes since.
-- **Not yet:** s4's facility still keeps a path (`PathKeeper`) until it
-  moves to the feed (`open.md`); the feed is kept whole, about 77 bytes a
-  single write, on the actor and on every device.
+- **Not yet:** the feed is kept whole, about 77 bytes a single write, on
+  the actor and on every device (`open.md`).
 
 **What it costs** [measured, x86: Intel Core Ultra 7 155H; the actor on
 the testkit's refine, the keeper in a release build; 2026-11-08; a
