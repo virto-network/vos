@@ -165,7 +165,7 @@ pub fn status(answer: &Answer) -> u16 {
             Rejection::Behind => 503,
             Rejection::Credential(refusal) => match refusal {
                 CredentialRefusal::Replayed | CredentialRefusal::Once => 409,
-                // Retryable: fetch the path again, or ask another replica.
+                // Retryable: read the tree's feed again, or ask another replica.
                 CredentialRefusal::RootUnknown => 503,
                 CredentialRefusal::NoSpace
                 | CredentialRefusal::Format

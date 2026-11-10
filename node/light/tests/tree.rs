@@ -283,7 +283,7 @@ fn the_feed_is_read_on_its_own_timer() {
     assert!(keeper.due(1_000 + period * 3 / 2));
 
     keeper.unknown(1_000);
-    assert!(keeper.due(1_000 + vos_light::PathKeeper::MOVED_SPREAD_MS));
+    assert!(keeper.due(1_000 + TreeKeeper::UNKNOWN_SPREAD_MS));
     assert_eq!(keeper.period(), period / 2);
     for _ in 0..10 {
         keeper.unknown(1_000);

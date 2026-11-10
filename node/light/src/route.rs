@@ -41,8 +41,8 @@ pub enum Purpose {
     /// spare built ahead.
     Proven = 0,
     /// A read that names nothing of the member's but must not link to it:
-    /// a path fetch, a root poll, the onion set's refresh. Anonymous, each
-    /// on a connection of its own.
+    /// the node's time, the onion set's refresh. Anonymous, each on a
+    /// connection of its own.
     Fetch = 1,
     /// The credential tree's feed: anonymous, one long-lived connection,
     /// as every member reads the same feed.

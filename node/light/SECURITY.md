@@ -288,27 +288,11 @@ and what a node does with one is `node/SECURITY.md`'s.
   alike, and the feed's place; nothing in them is the member's but which
   leaf the keeper computes paths for, which is not kept.
 
-## Paths, and what fetching them shows
+## Proofs and the node's checks
 
-The path keeper remains for a client not yet on the feed; it names the
-member to the node.
-
-- **Paths are fetched apart from proofs** (`PathKeeper`): on a jittered
-  timer, and within a spread of up to 10 s after a moved `root()` is
-  first seen, never because a proof is about to be made; each `path` or
-  `root()` query is signed by a key drawn for it alone. The keeper only
-  says when: **the client** polls `root()` on a jittered timer of its own
-  and sends the queries on a connection of their own, apart from the one
-  that carries its proofs. `node/SECURITY.md` states what the fetches
-  still show the operators.
 - **`verify`** runs ingress's checks that need neither a clock nor
   state; the expiry window, the root's freshness and replay are the
   node's.
-- **A `RootUnknown` (or `RootStale`) answer** drops the held path: the client fetches it
-  again and proves anew. That one fetch precedes a proof, so its time
-  links to the proof's; it happens only when the ring no longer holds the
-  root (a replica's lag, a root replaced at its own batch time, or 64
-  tree-changing batches within the keeper's period).
 
 ## The client over Tor
 
@@ -319,8 +303,8 @@ not (`light-node.md` §6.2–§6.7).
   every space is reached through its pinned onions unless the user opted
   its key-signed calls out of Tor, after `OPT_OUT_WARNING`, where the
   space offers a clearnet port and is not onion-only. Anonymous requests
-  (proven calls, the tree's feed, path fetches and root polls, the onion
-  set's refresh) and the personal agent's and `Homes`' traffic have no clearnet
+  (proven calls, the tree's feed, the node's time, the onion set's
+  refresh) and the personal agent's and `Homes`' traffic have no clearnet
   route at all: with no onion pinned they are refused, nothing dialed. A
   proven call goes only under its own purpose, which carries nothing
   else, so it never rides a connection that may be on the clearnet.

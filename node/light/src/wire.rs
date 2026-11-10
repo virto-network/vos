@@ -4,14 +4,14 @@
 //! body; the transport adds the frame's length, its mark and any request
 //! id. So neither a client nor a gateway encodes a credential's bytes.
 //!
-//! A query of `feed`, `path` or `root()` is a `QueryCall` signed by an
-//! ed25519 key drawn for that query alone, so a fetch links to no client
-//! key; it reads the replica's applied state.
+//! A query of `feed` is a `QueryCall` signed by an ed25519 key drawn for
+//! that query alone, so a read links to no client key; it reads the
+//! replica's applied state.
 
 use ed25519_dalek::{Signer, SigningKey};
 use scale::{Decode, Encode};
 use vos_api::Kind;
-use vos_wire::credentials::{Feed, Path, RootEntry};
+use vos_wire::credentials::Feed;
 use vos_wire::ids::Session;
 use vos_wire::ids::{AgentId, InstanceId, MethodId};
 use vos_wire::ingress::{
@@ -21,7 +21,7 @@ use vos_wire::ingress::{
 use vos_wire::result::Outcome;
 use zeroize::Zeroize;
 
-use crate::{AuthWitness, Call, DeviceError, Digest, Proven};
+use crate::{Call, DeviceError, Proven};
 
 /// `kind`'s request holding `body`.
 fn request(kind: u16, body: impl Encode) -> Vec<u8> {
@@ -160,27 +160,9 @@ pub fn query_request(
     Ok(request(Kind::Query as u16, (AgentId(agent), query)))
 }
 
-/// A query of the credential actor's `path(member)` at `instance` of
-/// `agent`, signed by a fresh key over the agent's `identity`.
-pub fn path_query(
-    agent: u32,
-    identity: &[u8; 32],
-    instance: u32,
-    member: &Digest,
-    not_after: u64,
-) -> Result<Vec<u8>, DeviceError> {
-    query_request(
-        agent,
-        identity,
-        instance,
-        "path",
-        member.to_bytes().encode(),
-        not_after,
-    )
-}
-
 /// A query of the credential actor's `feed(from)`, the tree's changes from
-/// the `from`th on, as [`path_query`]: it names no member.
+/// the `from`th on, at `instance` of `agent`, signed by a fresh key over
+/// the agent's `identity`: it names no member.
 pub fn feed_query(
     agent: u32,
     identity: &[u8; 32],
@@ -196,16 +178,6 @@ pub fn feed_answer(body: &[u8]) -> Result<Feed, DeviceError> {
     query_answer(body)
 }
 
-/// A query of the credential actor's `root()`, as [`path_query`].
-pub fn root_query(
-    agent: u32,
-    identity: &[u8; 32],
-    instance: u32,
-    not_after: u64,
-) -> Result<Vec<u8>, DeviceError> {
-    query_request(agent, identity, instance, "root", Vec::new(), not_after)
-}
-
 /// A query's reply bytes, from its answer: `Ran` with the handler's
 /// reply; ingress's refusal, [`DeviceError::Rejected`] with it; any other,
 /// [`DeviceError::Decode`].
@@ -218,34 +190,6 @@ fn reply(body: &[u8]) -> Result<Vec<u8>, DeviceError> {
         Some(Response::Rejected(rejection)) => Err(DeviceError::Rejected(rejection)),
         _ => Err(DeviceError::Decode),
     }
-}
-
-/// The path from a `path` query's answer; `None` for a member not
-/// enrolled.
-pub fn path_answer(body: &[u8]) -> Result<Option<AuthWitness>, DeviceError> {
-    let Some(path) = Option::<Path>::decode_exact(&reply(body)?).ok_or(DeviceError::Decode)? else {
-        return Ok(None);
-    };
-    let digest = |bytes: &[u8; 32]| Digest::from_bytes(bytes).ok_or(DeviceError::Decode);
-    let mut siblings = [Digest([0; 8]); vos_wire::credentials::DEPTH];
-    for (sibling, bytes) in siblings.iter_mut().zip(&path.siblings.0) {
-        *sibling = digest(bytes)?;
-    }
-    Ok(Some(AuthWitness {
-        root: digest(&path.root)?,
-        slot: path.slot,
-        siblings,
-    }))
-}
-
-/// The root and the batch time it became the root, from a `root()` query's
-/// answer.
-pub fn root_answer(body: &[u8]) -> Result<(Digest, u64), DeviceError> {
-    let entry = RootEntry::decode_exact(&reply(body)?).ok_or(DeviceError::Decode)?;
-    Ok((
-        Digest::from_bytes(&entry.root).ok_or(DeviceError::Decode)?,
-        entry.since,
-    ))
 }
 
 /// The credentialed request of `call` under `proof`, addressed to
@@ -270,11 +214,11 @@ pub enum Answer {
     /// The call ran: its outcome, at the applied index of the state it
     /// reflects.
     Ran { outcome: Outcome, at: u64 },
-    /// The replica's ring does not hold the proof's root: drop the path
-    /// ([`crate::PathKeeper::unknown`]), fetch it again, prove anew.
+    /// The replica's ring does not hold the proof's root: read the feed
+    /// again ([`crate::TreeKeeper::unknown`]), prove anew at its root.
     RootUnknown,
-    /// The proof's root was superseded more than `ROOT_MAX_AGE` ago: drop
-    /// the path as for [`Answer::RootUnknown`]; a new path proves anew.
+    /// The proof's root was superseded more than `ROOT_MAX_AGE` ago: read
+    /// the feed again as for [`Answer::RootUnknown`] and prove anew.
     RootStale,
     /// The expiry is outside the node's window: `now` is the node's clock,
     /// from which a new proof picks its expiry.

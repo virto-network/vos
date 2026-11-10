@@ -89,7 +89,7 @@ frame checks and the agent's placement come first, as for any call):
 15. for auth, the root is in the credential actor's ring (`RootUnknown`,
     retryable: an honest member meets it on a lagging replica, after a
     later write replaced its root at the same batch time, or once 64 later
-    roots pushed it out; it fetches its path again or asks another
+    roots pushed it out; it reads the tree's feed again or asks another
     replica);
 16. for auth, the root is the ring's newest or was superseded at most
     `ROOT_MAX_AGE` (10 minutes) before this replica's latest batch time
@@ -188,24 +188,10 @@ serve its requests:
   computed on the device, so no node or gateway learns which leaf is
   online. The feed is read on a jittered timer (30 s, between 15 s and
   45 s), never because a proof is about to be made.
-- **The path leak, where a client still fetches its path.** Asking the
-  credential actor for `path(member)` tells the operators which member
-  digest is online, and from which address. What they do not learn is
-  when it proves:
-  - the device library (`PathKeeper`) fetches its path apart from its
-    proofs: on a timer of 30 s jittered uniformly between 15 s and 45 s,
-    and at a time drawn below 10 s after a moved `root()` answer is first
-    seen, never because a proof is about to be made; the client sends
-    the queries on a connection of their own;
-  - each `path` and `root()` query is signed by a key drawn for it alone,
-    so a fetch links to no client key; `root()` names no member;
-  - so a fetch's time says nothing of a proof's, but a proof from the same
-    address still links its nullifier to the digest, and the digest to
-    whoever the registrar enrolled.
 - **A re-read after `RootUnknown`** precedes the proof that retries the
-  call, so that read's time links to that proof's (for a path fetch, the
-  member's digest to it). It happens only when the replica's ring does
-  not hold the proof's root: a lagging replica, a root replaced at its
+  call, at a time drawn below 10 s after the refusal, so that read's time
+  links to that proof's. It happens only when the replica's ring does not
+  hold the proof's root: a lagging replica, a root replaced at its
   own batch time, or 64 tree-changing batches within one timer period
   (about 1.4 a second, for 45 s), past which the library halves its
   period for the space's pace.
@@ -220,18 +206,14 @@ serve its requests:
   change holds, so the roots logged on calls link nothing beyond the
   time: within one timer period of a change (at most 45 s), the members
   who have not read it yet prove against the root before, which sets
-  them apart from those who have. A client still on its path proves
-  against the root of its last fetch until its next, which the moved
-  `root()` brings within 10 s. The log keeps the root itself, not its
+  them apart from those who have. The log keeps the root itself, not its
   place in the ring: a place relative to the newest moves between
   ingress and apply, and a place counted from the first root names the
   root as its digest does, so it would hide nothing the newest root does
   not.
-- **From a tree change:** a client still on its path fetches it within
-  10 s of seeing `root()` move, so each enrollment or revocation shows
-  which member digests are online then. A device on the feed reads the
-  change as every member does, naming no digest; the gateway sees only
-  that some feed connection read it.
+- **From a tree change:** a device reads the change as every member
+  does, naming no digest; the gateway sees only that some feed
+  connection read it.
 - **From the tree, to any caller:** how many members there are, and when
   each was enrolled or revoked; the feed serves every write to anyone,
   and a leaf is `C(T(leaf), member)`, so whoever knows a member digest
@@ -261,8 +243,9 @@ frames between the gateway and the nodes are not taken apart from the
 TLS: their bodies are the HTTP bodies above, framed by the same codec as
 the socket's. And no carrier of a credentialed call holds where its
 member sits (its digest, its leaf, its occupied siblings): the call's
-bytes each way, its answers, its log entries, the logs. Only the path's
-fetch does, as above. The member's slot is searched for as a number
+bytes each way, its answers, its log entries, the logs. Only the feed's
+connection does, which carries the whole tree to every member, though
+not the member's digest. The member's slot is searched for as a number
 only from 2^20 up (`carriers::SMALL_FLOOR`): a smaller one's digits are in
 any log by chance, so a slot under 2^20 is searched for through its
 digest, leaf and siblings alone.
@@ -278,20 +261,16 @@ facility (`identity-and-authority.md` §7):
   for its connection alone (s4's anonymous policy): no session is parked
   or resumed, and no remembered grant is selected. The client draws a key
   for each connection, and another for each `vos-api` connection that
-  fetches its path, the root or the node's time, so no two of them share a
+  reads the tree's feed or the node's time, so no two of them share a
   key. Keys are all that stops linking them: the gateway still sees their
-  address and timing, and a proof from the address that fetched a digest's
-  path links its nullifier to that digest, as above. The client fetches
-  its path on a schedule of its own (a drawn first delay, a spread on each
-  refresh, at most one refresh in thirty seconds), not on the way to a
-  proof, which loosens the timing link without removing it.
-- **The root a proof names.** A path is used only if its root is one of the
-  last roots the client's own root polls saw, so a gateway cannot hand one
-  member a path to a root of its own making and know the member by it
-  unless it also answers that member's root polls with that root. The polls
-  name no member, but they come from the member's address: a gateway that
-  marks an address's polls with a root of its own still learns which
-  member proves on it. Roots the node signs, under a key pinned at
+  address and timing. The feed names no member, and the client reads it
+  on its own timer (`TreeKeeper`), not on the way to a proof.
+- **The root a proof names.** A proof names the root of the tree the
+  client built from the feed, each page checked against the root its last
+  change names, so a gateway cannot hand one member a path to a root of
+  its own making but by serving that member's address a feed of its own:
+  a gateway that marks an address's feed with a root of its own learns
+  which member proves on it. Roots the node signs, under a key pinned at
   enrollment, would close this; until then, the gateway is trusted not to
   mark roots.
 - **What the server can steer.** The screens are the gateway's document;

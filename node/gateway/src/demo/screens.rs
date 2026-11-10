@@ -177,8 +177,7 @@ impl Screens {
             let unknown = matches!(&answer, Value::Map(map) if map.get("root_unknown") == Some(&Value::Bool(true)));
             if unknown {
                 cx.effect(facility("refresh", Value::Null, Message::Refreshed));
-                self.status =
-                    format!("{why}: the device fetches its path again; try again shortly");
+                self.status = format!("{why}: the device reads the tree again; try again shortly");
             } else {
                 self.status = format!("Not done: {why}{proving}");
             }

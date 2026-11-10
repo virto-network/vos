@@ -2,10 +2,10 @@
 //! `node/light/SECURITY.md`): three nodes of a founded space with the
 //! credential actor, the poll, the ledger and the device actor; a
 //! member's device secret derived from a known source output, its path
-//! fetched, and its calls proved by the device library as a phone proves
-//! them, by the stock kernels' release artifacts, and sent to the nodes
-//! over each transport: the API's socket, and a gateway relaying HTTP onto
-//! the API over QUIC. Then every carrier the run produced is searched for
+//! computed from the tree's feed, and its calls proved by the device
+//! library as a phone proves them, by the stock kernels' release
+//! artifacts, and sent to the nodes over each transport: the API's socket,
+//! and a gateway relaying HTTP onto the API over QUIC. Then every carrier the run produced is searched for
 //! the member's secret, which only the device holds, and for where the
 //! member sits, which a proven call never carries
 //! ([`vos_checker::carriers`]).
@@ -18,7 +18,7 @@
 //! actor's hand-lean `auth`, its claim checked by the handler), its replay
 //! and its proof sent to a stock guard (`Kind`), a frame of no kind and
 //! one past its kind's limit (`FrameError`), each on a connection the
-//! device keeps for its calls; its time, path and root fetched on one of
+//! device keeps for its calls; its time and the tree's feed read on one of
 //! their own.
 //!
 //! Carriers that leave the device: every byte of each API connection each
@@ -28,8 +28,8 @@
 //! values as its `Debug` and `Display` show them, every log line of the
 //! process at every level (the nodes', the gateway's), and standard
 //! error. Searched there: the secret (`s`'s single words among it), the
-//! proofs' masks and the member's place, but in the path's own fetch,
-//! which holds the place by design.
+//! proofs' masks and the member's place, but in the feed's connection,
+//! which holds the whole tree by design.
 //! Carriers within the replicas (their stores, logs, work results, disks
 //! and frames), which hold the members' digests and the tree, are searched
 //! for the secret and the masks.
@@ -50,7 +50,7 @@ use vos_checker::programs::{
 use vos_light::wire::{self, Answer};
 use vos_light::{
     AuthWitness, Call, DEVICE_FORMAT, DeviceError, DeviceProgram, Proven, Prover, ProverConfig,
-    Threads,
+    Threads, TreeKeeper,
 };
 use vos_node::client::{self, Client, Target};
 use vos_node::store::EntryKind;
@@ -365,44 +365,38 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
         founded.write(CREDENTIALS, "enroll", digest);
     }
 
-    // Its time, root and path, on a connection of their own.
+    // Its time and the tree's feed, on a connection of their own.
     let mut fetch = Socket::connect(&founded.cluster.dir(at).join("api.sock"));
     let mut device_values: Vec<String> = Vec::new();
     let now = wire::time_answer(&fetch.send(&wire::time_request())).unwrap();
     let identity = founded.operator.lock().unwrap().identity(agent).unwrap();
-    // The follower answers from what it has applied: its root and the
-    // member's path read again until both are the leader's root.
-    let leader_root = wire::root_answer(
-        &Socket::connect(&founded.cluster.dir(leader).join("api.sock"))
-            .send(&wire::root_query(agent.0, &identity, CREDENTIALS.0, now + 60_000).unwrap()),
-    )
-    .unwrap()
-    .0;
-    let mut read = || {
-        let root = wire::root_answer(
-            &fetch
-                .send(&wire::root_query(agent.0, &identity, CREDENTIALS.0, now + 60_000).unwrap()),
-        )
-        .unwrap();
-        let query =
-            wire::path_query(agent.0, &identity, CREDENTIALS.0, &member, now + 60_000).unwrap();
-        let witness: AuthWitness = wire::path_answer(&fetch.send(&query))
-            .unwrap()
-            .expect("an enrolled member's path");
-        (root, witness)
+    let read = |socket: &mut Socket, keeper: &mut TreeKeeper| loop {
+        let query = keeper
+            .request(agent.0, &identity, CREDENTIALS.0, now + 60_000)
+            .unwrap();
+        if !keeper.ingest(&socket.send(&query), 0).unwrap().more {
+            break;
+        }
     };
-    let (mut root, mut witness) = read();
+    let mut leader_tree = TreeKeeper::new(member);
+    read(
+        &mut Socket::connect(&founded.cluster.dir(leader).join("api.sock")),
+        &mut leader_tree,
+    );
+    let leader_root = leader_tree.root();
+    // The follower answers from what it has applied: its feed read again
+    // until its tree is at the leader's root.
+    let mut keeper = TreeKeeper::new(member);
     vos_checker::wait_until(
-        "the follower's root and path are the leader's root",
+        "the follower's tree is at the leader's root",
         Duration::from_secs(60),
         || {
-            if root.0 == leader_root && witness.root == leader_root {
-                return true;
-            }
-            (root, witness) = read();
-            false
+            read(&mut fetch, &mut keeper);
+            keeper.root() == leader_root
         },
     );
+    let witness: AuthWitness = keeper.witness().expect("an enrolled member's path");
+    let root = keeper.root();
     device_values.push(format!("{witness:?} {root:?}"));
     let path = Path {
         root: witness.root.to_bytes(),
@@ -732,7 +726,7 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
                 &auth_program,
             )
             .unwrap_err(),
-        wire::path_answer(&[0xff]).unwrap_err(),
+        wire::feed_answer(&[0xff]).unwrap_err(),
         vos_light::verify(&proof, &fresh, &auth_program, Some(b"login")).unwrap_err(),
     ];
     for error in refusals {
@@ -771,14 +765,17 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
         );
     }
 
-    // The fetch holds the member's place by design: searched for the
-    // secret and the masks alone.
+    // The feed holds the whole tree, the member's leaf and its siblings
+    // among it, by design: searched for the secret, the masks and the
+    // member's digest, which no query names.
     let mut fetched = Audit::default();
     fetched.needles.0 = audit
         .needles
         .0
         .iter()
-        .filter(|needle| needle.kind != Kind::MemberPlace)
+        .filter(|needle| {
+            needle.kind != Kind::MemberPlace || needle.name.ends_with("the member digest")
+        })
         .cloned()
         .collect();
     fetch.carriers(&mut fetched, "the fetch's connection");

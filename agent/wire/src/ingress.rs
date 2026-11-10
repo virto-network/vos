@@ -343,7 +343,7 @@ pub enum CredentialRefusal {
     #[codec(index = 9)]
     Once,
     /// An auth root the credential actor's ring does not hold, on this
-    /// replica: retryable, by fetching the path again or asking another
+    /// replica: retryable, by reading the tree's feed again or asking another
     /// replica. An honest member meets it when this replica lags, when a
     /// later write at the same batch time replaced its root, or when 64
     /// later roots pushed it out.
