@@ -1743,7 +1743,12 @@ pays (`open.md`):
   237 → 166 → 155 MiB (owner); proofs 0.876 → 0.847 → 0.783 MB (auth),
   0.856 → 0.828 → 0.763 MB (owner); the times, at load average 16–25
   from other work, too noisy to read [measured, x86 dev machine (Intel
-  Core Ultra 7 155H), four threads, 2026-11-09].
+  Core Ultra 7 155H), four threads, 2026-11-09]. On the Pixel 1 at
+  automatic threads, one round of five, every proof verified there and
+  on x86: auth 1,438 → 959 → 922 ms (−33%, −36%), 417 → 315 → 273 MiB;
+  owner 828 → 634 → 599 ms (−23%, −28%), 292 → 214 → 195 MiB [measured,
+  Pixel 1, 2026-11-10]: the time falls further than the cells, the
+  ledger's trace eight times shorter.
 The two cheap cuts the model found are in formats 41 and 46 (§3.2).
 
 **3. Signature chips** come last, for flows that must prove a standard
