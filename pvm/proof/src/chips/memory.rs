@@ -36,6 +36,14 @@ use crate::{
 /// (address, 2·timestamp + is_write): at one timestamp an address's reads
 /// precede its writes. For consecutive accesses to the same address, reads
 /// must return the value from the last write.
+///
+/// The AIR fixes no place for the padding, and the sortedness gadget does
+/// not fire across a padding row, so the real rows may be several sorted
+/// runs. Each run starts with a `ts = 0` write and every group ends with a
+/// closing read, so an address is one group whenever its boundary produces
+/// its `ts = 0` write, or its closing read, once: the page boundary does
+/// (`MemoryPageChip`, a page once in the trie); `DeviceMemoryChip`, which
+/// may give a byte several rows, does not.
 #[derive(Clone, Copy)]
 pub struct MemoryChip;
 

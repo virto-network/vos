@@ -604,15 +604,12 @@ fn padding_between_real_rows_is_refused() {
     let format = word();
     let program = mixed_program(&format);
     let tamper = |trace: &mut MaskedDeviceTrace| {
-        let mut ledger = Chip::of(trace, &program, device_chip::MEMORY);
-        let rows = ledger.natural();
-        let real = rows
-            .iter()
-            .filter(|row| row[Column::IsPadding.offset()] == 0)
-            .count();
-        let mut turned = rows.clone();
-        turned.rotate_left(real / 2);
-        ledger.write(&turned);
+        pad_inside(
+            trace,
+            &program,
+            device_chip::MEMORY,
+            Column::IsPadding.offset(),
+        );
     };
     let proof = forced(&format, &program, &mut mixed_run(), tamper);
     let outcome = verify_device::<P2>(&format, &program, &proof);
@@ -623,6 +620,73 @@ fn padding_between_real_rows_is_refused() {
         ),
         "{outcome:?}"
     );
+}
+
+/// `chip`'s rows turned so that its padding lies between real rows, every
+/// cyclic neighbour kept: each relation balances as before and every
+/// constraint relating a row to the next holds where it held. Asserts the
+/// turn leaves real rows on both sides of the padding.
+fn pad_inside(trace: &mut MaskedDeviceTrace, program: &Program, chip: usize, is_padding: usize) {
+    let mut ledger = Chip::of(trace, program, chip);
+    let mut rows = ledger.natural();
+    let real = rows.iter().filter(|row| row[is_padding] == 0).count();
+    rows.rotate_left(real / 2);
+    let n = rows.len();
+    assert!(real >= 2 && rows[0][is_padding] == 0 && rows[n - 1][is_padding] == 0);
+    assert!(rows.iter().any(|row| row[is_padding] == 1));
+    ledger.write(&rows);
+}
+
+/// Padding between the byte ledger's real rows is accepted: the ledger
+/// (`MemoryChip`, the byte ledger format 46 takes) turned as in
+/// [`padding_between_real_rows_is_refused`], the proof verifies. The byte
+/// ledger has no last-row column and its sortedness gadget does not fire
+/// across a padding row, so its real rows may be several sorted runs; and
+/// `DeviceMemoryChip` gives a byte as many boundary rows as the prover
+/// puts, so each run may hold a group of one byte, its writes in one and
+/// its reads in another. The known gap of format 46 (`docs/design/open.md`),
+/// closed by the word ledger's `IsLast` (format 47): when the byte ledger
+/// takes it, or format 46 is refused, this test asserts the refusal.
+#[test]
+fn byte_ledger_padding_between_real_rows_is_accepted_today() {
+    use vos_pvm_proof::chips::memory::Column;
+    let format = byte();
+    let program = mixed_program(&format);
+    let tamper = |trace: &mut MaskedDeviceTrace| {
+        pad_inside(
+            trace,
+            &program,
+            device_chip::MEMORY,
+            Column::IsPadding.offset(),
+        );
+    };
+    let proof = forced(&format, &program, &mut mixed_run(), tamper);
+    verify_device::<P2>(&format, &program, &proof).expect("the byte ledger takes padding anywhere");
+}
+
+/// Padding between the register ledger's real rows is accepted, and is
+/// sound: every real row after a padding row starts a register's chain,
+/// which must be that register's `ts = 0` write (`ChainStartH`), and
+/// `DeviceBoundaryChip` produces one a register on preprocessed rows; so a
+/// register's rows are one chain wherever padding lies. A chain split by
+/// padding, its second half with no write to start it, is refused
+/// (`register_ledger_gate`'s `a_read_follows_its_register_s_writes`).
+#[test]
+fn register_ledger_padding_between_real_rows_is_harmless() {
+    use vos_pvm_proof::chips::register_memory::Column;
+    for format in [word(), byte()] {
+        let program = mixed_program(&format);
+        let tamper = |trace: &mut MaskedDeviceTrace| {
+            pad_inside(
+                trace,
+                &program,
+                device_chip::REGISTER_MEMORY,
+                Column::IsPadding.offset(),
+            );
+        };
+        let proof = forced(&format, &program, &mut mixed_run(), tamper);
+        verify_device::<P2>(&format, &program, &proof).expect("one chain a register");
+    }
 }
 
 /// An inner row that takes no lane is refused: a read's row repeated after
