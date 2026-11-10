@@ -285,6 +285,8 @@ fn a_regroup_starts_a_new_group_with_the_rest() {
         kept[1].group().regroup(Vec::new(), home.now),
         Err(GroupError::NoRegroup)
     ));
+    assert_eq!(kept[0].group().regrouper(), Some(0));
+    assert_eq!(kept[1].group().regrouper(), Some(0));
 
     let package = kept[1].group().regroup_package(home.now).unwrap();
     let prepared = kept[0].group().regroup(vec![package], home.now).unwrap();
@@ -301,6 +303,7 @@ fn a_regroup_starts_a_new_group_with_the_rest() {
     }
     let after = agree(&mut all(kept), 3);
     assert_ne!(after, before);
+    assert_eq!(kept[1].group().regrouper(), None, "the new group confirmed");
     let events = relayed(&home, &kept[0], &mut named[0]);
     assert!(events.contains(&Event::Removed), "{events:?}");
 
