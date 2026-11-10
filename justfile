@@ -98,8 +98,9 @@ vectors:
 # maximum over 12 seeds of the masked wrap (on the JAM-only host's
 # `final-verify.elf`, built by `check-no-std`, and `judge-wasm`'s blob),
 # one test at a time; the device suite, its leakage gate among it, again
-# on the per-program CPU (`DEVICE_CPU=program`). Last, the wrap files the suites wrote checked to be
-# final wraps alone, and the carrier audit (`test-carriers`).
+# on the per-program CPU (`DEVICE_CPU=program`), on the word ledger
+# (`DEVICE_MEMORY=word`) and on both. Last, the wrap files the suites wrote
+# checked to be final wraps alone, and the carrier audit (`test-carriers`).
 test-proof: build-test-actors judge-wasm
     cargo test -p vos-pvm-proof --features debug-internals --lib --bins --test gates --test isa -- --test-threads=2
     for test in (cargo test -p vos-pvm-proof --features debug-internals --test kernel -- --list --format terse --skip reads:: --skip wrap_files:: | lines | where {|line| $line ends-with ': test' } | each {|line| $line | str replace ': test' '' }) { cargo test -p vos-pvm-proof --features debug-internals --test kernel $test -- --exact --test-threads=1 }
@@ -107,6 +108,8 @@ test-proof: build-test-actors judge-wasm
     cargo test -p vos-pvm-proof --test kernel constants:: -- --test-threads=1
     cargo test -p vos-pvm-recair --features heavy-gates --test circuit --test recursion --test segment --test device -- leakage heavy --test-threads=1
     with-env { DEVICE_CPU: "program" } { cargo test -p vos-pvm-recair --features heavy-gates --test device -- --test-threads=1 }
+    with-env { DEVICE_MEMORY: "word" } { cargo test -p vos-pvm-recair --features heavy-gates --test device -- --test-threads=1 }
+    with-env { DEVICE_CPU: "program", DEVICE_MEMORY: "word" } { cargo test -p vos-pvm-recair --features heavy-gates --test device -- --test-threads=1 }
     cargo test -p vos-pvm-proof --features debug-internals --test kernel wrap_files:: -- --test-threads=1
     just test-carriers
 

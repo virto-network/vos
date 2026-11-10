@@ -256,6 +256,25 @@ stwo_constraint_framework::relation!(Poseidon2CallLookupElements, REL_POSEIDON2_
 const REL_DATA_TABLE_LOOKUP_SIZE: usize = PC_SIZE + 1;
 stwo_constraint_framework::relation!(DataTableLookupElements, REL_DATA_TABLE_LOOKUP_SIZE);
 
+/// The bytes a word of the device's word ledger holds
+/// (`crate::chips::WordMemoryChip`), at an address a multiple of it.
+pub const MEMORY_WORD_SIZE: usize = 8;
+
+// (addr[4], value[8], timestamp[8], is_write[1], is_closing + 2·permission[1])
+// — a word's boundary access in the device's word ledger, `addr` its first
+// byte's (a multiple of 8): DeviceWordMemoryChip produces a word's `ts = 0`
+// write and its closing read; WordMemoryChip consumes them at the word's
+// group's ends, its other rows consuming `MemoryAccess`'s byte tuples.
+const REL_MEMORY_WORD_LOOKUP_SIZE: usize = PC_SIZE + MEMORY_WORD_SIZE + TS_SIZE + 1 + 1;
+stwo_constraint_framework::relation!(MemoryWordLookupElements, REL_MEMORY_WORD_LOOKUP_SIZE);
+
+// (addr[4], value[8]) — a word of a device program's data, `addr` a
+// multiple of 8: DataWordTableChip's preprocessed table holds every word of
+// its read-only and read-write data pages; DeviceWordMemoryChip consumes
+// one tuple per word it first touches in them.
+const REL_DATA_WORD_LOOKUP_SIZE: usize = PC_SIZE + MEMORY_WORD_SIZE;
+stwo_constraint_framework::relation!(DataWordLookupElements, REL_DATA_WORD_LOOKUP_SIZE);
+
 // (reg[1], value[8]) — an io-hash register at a device run's halt.
 // DeviceIoChip produces the four the public io-hash names, its claimed sum
 // the verifier's to recompute; DeviceBoundaryChip consumes φ9..12's final
@@ -288,6 +307,8 @@ pub const MAX_RELATION_WIDTH: usize = {
         REL_MERKLE_NODE_LOOKUP_SIZE,
         REL_POSEIDON2_CALL_LOOKUP_SIZE,
         REL_DATA_TABLE_LOOKUP_SIZE,
+        REL_MEMORY_WORD_LOOKUP_SIZE,
+        REL_DATA_WORD_LOOKUP_SIZE,
         REL_IO_HASH_LOOKUP_SIZE,
         super::range_check::RANGE_CHECK_LOOKUP_SIZE,
     ];

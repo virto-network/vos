@@ -10,7 +10,7 @@ use stwo::prover::backend::simd::SimdBackend;
 use vos_pvm_compiler::assembler::{Assembler, Reg};
 use vos_pvm_final_verifier::Error;
 use vos_pvm_proof::core::ecall::{ECALL_POSEIDON2, ECALL_WITNESS_INPUT};
-use vos_pvm_proof::format::{ChannelKind, Cpu, Format, FormatParams, Masking, SEGMENT};
+use vos_pvm_proof::format::{ChannelKind, Cpu, Format, FormatParams, Masking, Memory, SEGMENT};
 use vos_pvm_proof::poseidon2::P2MerkleChannel;
 use vos_pvm_proof::side_note::SideNote;
 use vos_pvm_recair::ProveError;
@@ -108,7 +108,7 @@ pub fn run(blob: &[u8], input: &[u8]) -> SideNote {
 
 /// A masked device format of no registered number on `channel`: blowup 4,
 /// `n_queries` queries, `h = 2^log_mask_rows`, 8 salts a tree and an `R` of
-/// 8.
+/// 8, its memory ledger [`memory`]'s.
 pub fn small_format(channel: ChannelKind, log_mask_rows: u32, n_queries: usize) -> Format {
     Format {
         number: 0x7e43,
@@ -128,6 +128,7 @@ pub fn small_format(channel: ChannelKind, log_mask_rows: u32, n_queries: usize) 
             fri_mask_columns: 8,
             log_mask_rows,
         }),
+        memory: memory(),
         ..SEGMENT
     }
 }
@@ -147,6 +148,15 @@ pub fn cpu() -> Cpu {
     match std::env::var("DEVICE_CPU").as_deref() {
         Ok("program") => Cpu::PerProgram,
         _ => Cpu::Full,
+    }
+}
+
+/// The memory ledger the device gates prove under: a row a byte, or a row a
+/// word where `DEVICE_MEMORY=word`, a run of the gates on the candidate.
+pub fn memory() -> Memory {
+    match std::env::var("DEVICE_MEMORY").as_deref() {
+        Ok("word") => Memory::Word,
+        _ => Memory::Byte,
     }
 }
 

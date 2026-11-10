@@ -1719,7 +1719,31 @@ pays (`open.md`):
   47 takes it beside word-level memory;
 - **word-level memory:** −17% of the auth kernel's cells, its memory
   ledger byte-level at 2^14 rows for 1,722 steps; −26% beside the
-  per-program CPU.
+  per-program CPU [model]; **as built (2026-11-09), a candidate format
+  field** (`Memory::Word`, the device profile only; format 46 keeps the
+  byte ledger): WordMemoryChip, a row an 8-byte word at one
+  `(timestamp, is_write)`, its eight lanes consuming the producers'
+  byte tuples unchanged (the CPU, the precompiles and the witness input
+  at any width and alignment; an access across a word's end is two
+  rows); a word's group starts and ends with a word tuple only
+  DeviceWordMemoryChip produces, from 29 address bits, so a group is
+  one aligned word and its lanes its bytes; every inner row takes a lane
+  (its timestamp a producer's) and padding lies past the real rows
+  alone; the data table a word a row; the ledger's tag in the program id
+  and the transcript header. Eight bytes, not four, from the stock
+  kernels' access mix: of auth's 1,546 steps' 9,262 byte accesses, the
+  CPU's 3,942 are 75% aligned 8-byte loads and stores (riscv64's
+  spills), the Poseidon2 calls' 4,128 on 8-aligned buffers; the ledger
+  takes 12,754 rows a byte, 3,245 a 4-byte word, 1,713 an 8-byte one
+  (2^14, 2^12, 2^11). The first touch of a touched word's every byte is
+  the layout's, touched or not. On the stock kernels the cells are
+  10.43M → 8.42M (auth, −19.3%) and 6.39M → 5.92M (owner, −7.3%), MEMORY
+  62 columns at 2^14 → 101 at 2^11 (auth); beside the per-program CPU
+  7.43M (−28.8%) and 5.43M (−15.1%); peak 403 → 241 → 221 MiB (auth) and
+  237 → 166 → 155 MiB (owner); proofs 0.876 → 0.847 → 0.783 MB (auth),
+  0.856 → 0.828 → 0.763 MB (owner); the times, at load average 16–25
+  from other work, too noisy to read [measured, x86 dev machine (Intel
+  Core Ultra 7 155H), four threads, 2026-11-09].
 The two cheap cuts the model found are in formats 41 and 46 (§3.2).
 
 **3. Signature chips** come last, for flows that must prove a standard
@@ -1751,7 +1775,7 @@ compared with x86's byte for byte.
 | the reference Poseidon2 and a SIMD hasher | segments on Poseidon2 at 1.75–1.85× Blake2s, against 6.4–6.9× before; a leaf's commitment 0.63 s [measured] | 2–3 weeks | built |
 | the seven zero columns dropped; logical right shifts through MUL | the window kernel −5.75% of its cells; its statement 33.3 s end to end [measured] | | built (formats 41 and 46) |
 | a per-program CPU (its columns the program's opcodes') | 785 → 535–549 CPU columns; −8.8% to −17% of a kernel's cells; a narrower leaf [model]; the stock kernels 781 → 538–539 columns, −7.8% / −9.5% of their cells [measured] | 3–5 weeks | built for the device profile as a candidate, not in a shipped format (format 47 is to take it); node segments later |
-| word-level memory | MEMORY 4–8× fewer rows; −17% of the auth kernel's cells [model] | 4–6 weeks | next (`open.md`) |
+| word-level memory | MEMORY 4–8× fewer rows; −17% of the auth kernel's cells [model]; 8-byte words: auth's ledger 2^14 → 2^11 rows, the stock kernels −19.3% / −7.3% of their cells, −28.8% / −15.1% beside the per-program CPU [measured] | 4–6 weeks | built for the device profile as a candidate, not in a shipped format (format 47 is to take it) |
 | the CPU split by opcode family | 4-way: −5.4% of the auth kernel's cells, 1–8% of a segment's, under 1% at a class's fixed shape, wider by 499 columns, past a leaf with the Poseidon2 chip [model] | 6–10 weeks | not built; a 2-way split on the per-program CPU only where padding pays |
 | narrow BLAKE2b chips | −2,200 columns; −30–45% of BLAKE2b's cells [model] | 3–5 weeks | later (device kernels hold no BLAKE2b, §8; folds gain) |
 | a lighter page boundary (Poseidon2 page hashing), or one memory argument across segments | about −1,100 / −2,800 columns; up to −49% of prover cells | 3–5 / 6–10 weeks | later |

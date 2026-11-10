@@ -133,13 +133,15 @@ pub const fn is_device_mask(active: u32) -> bool {
     active & DEVICE_ALWAYS == DEVICE_ALWAYS && active & !DEVICE_ALL == 0
 }
 
-/// A device program's components: its chips, a device mask, and its CPU's
+/// A device program's components: its chips, a device mask; its CPU's
 /// columns, all of them for the full CPU, the program's for a per-program
-/// one ([`crate::format::Cpu`]).
+/// one ([`crate::format::Cpu`]); and its memory ledger
+/// ([`crate::format::Memory`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceShape {
     pub chips: u32,
     pub cpu: crate::chips::CpuColumns,
+    pub memory: crate::format::Memory,
 }
 
 impl DeviceShape {
@@ -151,11 +153,12 @@ impl DeviceShape {
 }
 
 impl From<u32> for DeviceShape {
-    /// The chips `chips`, the CPU full.
+    /// The chips `chips`, the CPU full, the memory ledger a byte a row.
     fn from(chips: u32) -> Self {
         Self {
             chips,
             cpu: crate::chips::CpuColumns::ALL,
+            memory: crate::format::Memory::Byte,
         }
     }
 }
@@ -282,17 +285,34 @@ pub struct Touched {
     pub last: u8,
 }
 
-/// A device run's boundary: its layout and the bytes it touches, in
-/// address order; what `MemoryChip`, [`DeviceMemoryChip`] and
-/// [`DataTableChip`] take in place of the page boundary.
+/// A word a device run touches a byte of, under the word ledger
+/// ([`crate::format::Memory::Word`]): its address, a multiple of
+/// [`WORD_BYTES`], the bytes its first touch reads and those it holds at the
+/// halt, every byte of the word's, touched or not.
+#[cfg(feature = "prover")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TouchedWord {
+    pub address: u32,
+    pub initial: [u8; WORD_BYTES],
+    pub last: [u8; WORD_BYTES],
+}
+
+/// The bytes of a word of the word ledger.
+pub const WORD_BYTES: usize = crate::lookups::MEMORY_WORD_SIZE;
+
+/// A device run's boundary: its layout, the bytes it touches and the words
+/// they lie in, each in address order; what the memory ledger, its boundary
+/// chip ([`DeviceMemoryChip`] or [`DeviceWordMemoryChip`]) and the data
+/// table take in place of the page boundary.
 ///
 /// [`DeviceMemoryChip`]: crate::chips::DeviceMemoryChip
-/// [`DataTableChip`]: crate::chips::DataTableChip
+/// [`DeviceWordMemoryChip`]: crate::chips::DeviceWordMemoryChip
 #[cfg(feature = "prover")]
 #[derive(Clone, Debug)]
 pub struct DeviceRun {
     pub layout: DeviceLayout,
     pub touched: alloc::vec::Vec<Touched>,
+    pub words: alloc::vec::Vec<TouchedWord>,
 }
 
 #[cfg(feature = "prover")]
@@ -330,7 +350,26 @@ impl DeviceRun {
                 }
             }
         }
-        Self { layout, touched }
+        let mut words: alloc::vec::Vec<TouchedWord> = alloc::vec::Vec::new();
+        for byte in &touched {
+            let address = byte.address & !(WORD_BYTES as u32 - 1);
+            if words.last().is_none_or(|word| word.address != address) {
+                let initial =
+                    core::array::from_fn(|lane| entering(address.wrapping_add(lane as u32)));
+                words.push(TouchedWord {
+                    address,
+                    initial,
+                    last: initial,
+                });
+            }
+            let word = words.last_mut().expect("the byte's word");
+            word.last[(byte.address - address) as usize] = byte.last;
+        }
+        Self {
+            layout,
+            touched,
+            words,
+        }
     }
 
     /// No run: the layout alone, what a program's preprocessed columns are
@@ -339,6 +378,7 @@ impl DeviceRun {
         Self {
             layout,
             touched: alloc::vec::Vec::new(),
+            words: alloc::vec::Vec::new(),
         }
     }
 }

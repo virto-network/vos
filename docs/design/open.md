@@ -54,10 +54,22 @@ The scale results are in `core-model.md` §14, "The scale test".
 
 ## Proving
 
-- **The device prover's next levers:** word-level memory, then format 47
-  taking it with the per-program CPU (built as a candidate, `Cpu::PerProgram`,
-  `proving.md` §8), measured on the phone. The per-program CPU for node
-  segments is later. The 4-way CPU split by opcode family is not built.
+- **The device prover's next levers:** format 47 taking word-level memory
+  and the per-program CPU (both built as candidates, `Memory::Word` and
+  `Cpu::PerProgram`, `proving.md` §8), measured on the phone. The
+  per-program CPU for node segments is later. The 4-way CPU split by
+  opcode family is not built.
+- **Format 46's byte ledger leaves its padding's place free:** no
+  constraint keeps MemoryChip's padding past its real rows, and no
+  sortedness gadget fires across a padding row, so a trace with padding
+  between two runs of real rows verifies (the word ledger's gate
+  `padding_between_real_rows_is_refused`, its honest trace turned so,
+  pointed at the byte ledger: the proof verifies [checked, 2026-11-09]). With DeviceMemoryChip's rows unsorted and a byte's
+  row allowed twice, a byte's accesses could then split into two groups,
+  its writes in one and its reads in the other, the reads seeing the
+  first touch. The word ledger closes it (padding past the real rows by a
+  preprocessed last-row column); format 46's fix is an AIR change, so a
+  format of its own or format 47 retiring 46.
 - **Segment proving levers** (`proving.md` §9): the 36 cubic gates
   rewritten, narrow BLAKE2b chips, a lighter page boundary or one memory
   argument across segments, and folding device proofs (the recursion

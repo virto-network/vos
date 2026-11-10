@@ -32,6 +32,7 @@ pub mod register_memory;
 pub mod register_memory_boundary;
 pub mod register_memory_closing;
 pub mod witness_input;
+pub mod word_memory;
 
 pub use bitcount::BitcountChip;
 pub use bitwise::BitwiseChip;
@@ -61,6 +62,7 @@ pub use register_memory::RegisterMemoryChip;
 pub use register_memory_boundary::RegisterMemoryBoundaryChip;
 pub use register_memory_closing::RegisterMemoryClosingChip;
 pub use witness_input::WitnessInputChip;
+pub use word_memory::{DataWordTableChip, DeviceWordMemoryChip, WordMemoryChip};
 
 /// A fixed table's log size: its entries' `natural`, or `floor` when that
 /// is larger, its rows past the entries repeating them with no
