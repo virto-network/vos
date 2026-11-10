@@ -1000,7 +1000,8 @@ arm64-v8a build; the phones' timings below are S8-P1's]:
   `Settling` is made again after a `wake`.
 - **Regroup and restore:** a matured regroup voids the pending candidate,
   and the next commit is the regrouper's new group (`DeviceGroup::regroup`,
-  with the key packages the rest hand over as a pairing's), its epoch the
+  with the key packages the rest hand over as a pairing's, through the
+  inbox under their sync keys, §7.3), its epoch the
   confirmed one plus one, carrying every removal; the rest join it by its
   Welcome, and its epochs count on from the agent's. A device that cannot
   follow reads on for the device set's operations and takes no candidate
@@ -3587,6 +3588,42 @@ part 1]: the screens are the step's second part.
   several kits answers with the newest. "Backup paused" is Tor's bootstrap
   refusal, on the screen and as a notification after a personal pass that
   did not finish.
+- **A regroup's handover** [built, s4 `credential/src/personal/ops/
+  regroup.rs`; host-tested in `credential/tests/personal.rs`]: once a
+  regroup matured (`DeviceGroup::regrouper` names its device), every
+  device it keeps hands the regrouper its key package
+  (`DeviceGroup::regroup_package`) as an inbox item for the devices, put
+  from its pass under the sync key with no prompt: the device, the
+  regrouper, the confirmed epoch the new group follows and the package,
+  signed by the device's sync key over `"vos/personal/regroup/handover" ‖
+  agent identity ‖ regrouper ‖ epoch ‖ device ‖ package` (the agent's word
+  on an item's author is the operators', and the epoch keeps an earlier
+  regroup's handover from being put again for a later one). The
+  item is not sealed, where §3.7 seals the devices' items: a key package
+  is public, and the regrouper may not follow the epoch the others seal
+  under. The package is drawn once and put again by each pass until the
+  new group is confirmed, its expiry moved on in the inbox's last quarter.
+  The regrouper's commit ("Commit now") reads the inbox for a verified
+  handover of every device the set still holds (none removed, its own
+  aside) to this regroup, waiting 10 s (the inbox's pages read in key
+  order, no more than the policy's items); with all of them it starts
+  the new group (`DeviceGroup::regroup`) and the kept devices join it by
+  its Welcome at their next pass, the named devices out; otherwise it
+  holds nothing and names the devices missing. A kept device that never
+  hands over is removed first (§3.5's removal; the regroup then leaves it
+  out, as its new group carries every matured removal). A kept device's
+  own commit hands its package over and commits nothing. *Known limit:*
+  a kept device that cannot follow takes no candidate but its own
+  regroup's, so it hands nothing over and the regrouper names it missing:
+  it is named in the regroup (or removed) and re-pairs after.
+- **Pairing after the set changed** [built, s4 `credential/`]: the
+  opener reads the log and settles what fell due before its pairing's
+  commit, and a replaced admin key is taken before any admin call, so a
+  device pairs after a kit rotation, admin replacements or a regroup
+  (host-tested with a fourth device after each). The commit is confirmed
+  only once every recently active device of the set votes within the
+  confirm window (72 h by default): a pairing completes while the other
+  devices sync.
 
 ### 7.4 The SDK macros and the derivation
 
