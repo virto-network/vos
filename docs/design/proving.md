@@ -1277,15 +1277,6 @@ pub fn time_answer(body: &[u8]) -> Result<u64, DeviceError>;
 pub fn feed_query(agent: u32, identity: &[u8; 32], instance: u32,
                   from: u64, not_after: u64) -> Result<Vec<u8>, DeviceError>;
 pub fn feed_answer(body: &[u8]) -> Result<Feed, DeviceError>;
-/// A `QueryCall` of `path`, signed by a fresh key.
-pub fn path_query(agent: u32, identity: &[u8; 32], instance: u32,
-                  member: &Digest, not_after: u64) -> Vec<u8>;
-pub fn path_answer(body: &[u8]) -> Result<Option<AuthWitness>, DeviceError>;
-/// A `QueryCall` of `root()`, signed by a fresh key.
-pub fn root_query(agent: u32, identity: &[u8; 32], instance: u32,
-                  not_after: u64) -> Vec<u8>;
-/// The root and its `since`.
-pub fn root_answer(body: &[u8]) -> Result<(Digest, u64), DeviceError>;
 /// The request, addressed to `call.agent`.
 pub fn credentialed(call: &Call, proof: &Proven) -> Vec<u8>;
 
@@ -1299,20 +1290,9 @@ impl TreeKeeper {
     pub fn due(&self, now_ms: u64) -> bool;
     pub fn ingest(&mut self, answer: &[u8], now_ms: u64) -> Result<Synced, DeviceError>;
     pub fn witness(&self) -> Option<AuthWitness>;
-    pub fn unknown(&mut self);
+    pub fn unknown(&mut self, now_ms: u64);
     pub fn encode(&self) -> Vec<u8>;
     pub fn restore(member: Digest, kept: &[u8]) -> Result<Self, DeviceError>;
-}
-
-/// The path held, refreshed apart from proofs, so no fetch precedes a
-/// proof: for a client not yet on the feed.
-pub struct PathKeeper { /* the member, the path held, the next fetch's time */ }
-impl PathKeeper {
-    pub fn new(member: Digest) -> Self;
-    /// Whether to fetch now: the root moved, or the jittered timer is due.
-    pub fn due(&self, now_ms: u64, root: Option<&Digest>) -> bool;
-    pub fn update(&mut self, witness: AuthWitness, now_ms: u64);
-    pub fn witness(&self) -> Option<&AuthWitness>;
 }
 ```
 - **`prove_auth` checks its witness first:** the leaf of `member(s)` under
@@ -1329,10 +1309,9 @@ impl PathKeeper {
   four big cores, pinned: the same four unpinned are ×1.20 slower, the
   split over all eight ×1.3 [measured, Fairphone 6, 2026-10-31]. The pool's stacks are 16 MiB
   (`STACK_BYTES`): a nested join overflowed rayon's default 2 MiB.
-- **`path_query` and `root_query` sign with a key drawn for that query
-  alone,** so fetches link to no client key; a proof uses the path
-  `PathKeeper` holds, and no fetch precedes it. `path_answer` is `None`
-  for a digest not enrolled.
+- **`feed_query` signs with a key drawn for that query alone,** so a
+  read links to no client key; a proof uses the path `TreeKeeper`
+  computes, and no read precedes it.
 - **No logging of witnesses,** and no `seeded-masks` feature in a
   production build (`just check-no-seeded-masks`). The client's bridge zero-fills its `byte[]` of `o` once
   the library has copied it; the library zeroizes its copies of `o` and
@@ -1340,11 +1319,9 @@ impl PathKeeper {
 - **Built** (`node/light`, its `SECURITY.md`): as sketched; the masks
   always the operating system's, a `seeded-masks` test seam
   (`Prover::seeded`) for the phone bench's byte comparison alone;
-  `Call::new`, `path_query` and `root_query` answering `Result` (the
-  operating system's randomness may fail); `PathKeeper::due` taking
-  `&mut self` (a moved root brings the fetch forward to a time drawn
-  below 10 s after it is first seen), `update` refusing a path not its
-  member's, and `unknown` for a `RootUnknown` or `RootStale` answer, with
+  `Call::new` and `feed_query` answering `Result` (the operating
+  system's randomness may fail); `TreeKeeper::unknown` for a
+  `RootUnknown` or `RootStale` answer, with
   `wire::credentialed_answer` (the node's `Response` decoded exactly, a
   refusal as `vos_wire`'s `CredentialRefusal`, `Expiry`'s `now` kept);
   the request is `vos_wire`'s `Credentialed` under `Kind::Credentialed`,
@@ -1352,8 +1329,8 @@ impl PathKeeper {
   (`credentials::scope`, `AuthClaim`, `OwnerClaim`, `Bound::digest`), so
   the library and ingress share one computation. The keeper's timer is
   30 s with a uniform jitter of half a period either way, halved on each
-  `RootUnknown` (to 1 s) and doubled back on a fetch that finds the root
-  unmoved. `Prover::new` refuses an allowance below `PEAK_BYTES`, 1 GiB,
+  `RootUnknown` (to 1 s) and doubled back on a read that finds the tree
+  unchanged. `Prover::new` refuses an allowance below `PEAK_BYTES`, 1 GiB,
   the device budget, above the stock auth kernel's peak of 0.70 GiB on
   the phone.
 
@@ -2032,7 +2009,7 @@ its hex, its `Debug` list and, for a number, its digits and byte orders:
   each word, the nullifier's key, their hashes, a device kernel's
   arguments), a proof's masks as drawn, and its place in the
   tree (its digest, its leaf, its slot, its occupied siblings), the place
-  searched in every carrier that leaves but the path's own fetch; and the
+  searched in every carrier that leaves but the feed's connection; and the
   phone bench's lines and proofs. A run over small values (rows from
   2^20) searches a number below 2^24 by its digits and hex alone. s4's
   facility is audited in s4, through its C ABI and every freed heap block;

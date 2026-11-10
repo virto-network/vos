@@ -28,13 +28,16 @@
 //! proof is about to be made: the feed's connection is one circuit of the
 //! device's for as long as it is open, and a read just before each proof
 //! would join the proofs through it. A page that says more follows is due
-//! at once. The ring's limits are the path keeper's (`crate::PathKeeper`):
-//! a root held at most one period behind the tree survives unless the
-//! space makes 64 tree-changing batches within one period; a space faster
-//! than that meets `RootUnknown`, and [`TreeKeeper::unknown`] makes the
-//! feed due within 10 s, at a time drawn for it, and halves the period (to at least
-//! [`TreeKeeper::MIN_PERIOD_MS`]), which doubles back toward the default
-//! at each read that finds the tree unchanged.
+//! at once. The credential actor's ring holds the last 64 roots, one a
+//! tree-changing batch, and accepts a superseded root for `ROOT_MAX_AGE`
+//! (10 minutes) while the ring still holds it: a root held at most one
+//! period behind the tree survives unless the space makes 64
+//! tree-changing batches within one period; a space faster than that
+//! meets `RootUnknown`, and [`TreeKeeper::unknown`] makes the feed due
+//! within [`TreeKeeper::UNKNOWN_SPREAD_MS`] (10 s), at a time drawn for
+//! it, and halves the period (to at least [`TreeKeeper::MIN_PERIOD_MS`]),
+//! which doubles back toward the default at each read that finds the tree
+//! unchanged.
 //!
 //! **Kept on the device** ([`TreeKeeper::encode`], [`TreeKeeper::restore`]):
 //! the leaves, the feed's place and the root, outside any synced scope
@@ -47,8 +50,7 @@ use std::collections::{BTreeMap, HashMap};
 use scale::{Decode, Encode};
 use vos_wire::credentials::{self, DEPTH, EMPTY, ENROLL_MANY, FEED_BYTES, Feed, RootEntry, Words};
 
-use crate::path::jitter;
-use crate::{AuthWitness, DeviceError, Digest, PathKeeper, wire};
+use crate::{AuthWitness, DeviceError, Digest, wire};
 
 /// The tree as the feed built it, the member's slot in it, and when to
 /// read the feed again.
@@ -100,10 +102,14 @@ struct Kept {
 
 impl TreeKeeper {
     /// The timer's period, before its jitter of half a period either way:
-    /// one twentieth of `ROOT_MAX_AGE`, the path keeper's.
+    /// one twentieth of `ROOT_MAX_AGE`.
     pub const PERIOD_MS: u64 = vos_wire::defaults::ROOT_MAX_AGE / 20;
     /// The least period a run of `RootUnknown` answers halves it to.
     pub const MIN_PERIOD_MS: u64 = 1_000;
+    /// The spread of the read a refused root brings forward: drawn
+    /// uniformly below it, so the members a tree change leaves behind do
+    /// not all read at once.
+    pub const UNKNOWN_SPREAD_MS: u64 = 10_000;
 
     /// A keeper for `member` holding the empty tree: due at once.
     pub fn new(member: Digest) -> Self {
@@ -286,13 +292,13 @@ impl TreeKeeper {
 
     /// A `RootUnknown` or `RootStale` answer at `now_ms` to a proof
     /// against the held root: the feed due at a time drawn below
-    /// [`PathKeeper::MOVED_SPREAD_MS`], not at once, so the read on the
+    /// [`TreeKeeper::UNKNOWN_SPREAD_MS`], not at once, so the read on the
     /// feed's circuit does not follow the refused proof by a fixed delay;
     /// and the period halved, to at least [`TreeKeeper::MIN_PERIOD_MS`].
     pub fn unknown(&mut self, now_ms: u64) {
         self.next = self
             .next
-            .min(now_ms.saturating_add(jitter(PathKeeper::MOVED_SPREAD_MS)));
+            .min(now_ms.saturating_add(jitter(Self::UNKNOWN_SPREAD_MS)));
         self.period = (self.period / 2).max(Self::MIN_PERIOD_MS);
     }
 
@@ -385,4 +391,14 @@ impl TreeKeeper {
         self.slot = slot;
         self.root = root;
     }
+}
+
+/// A uniform draw below `period` from the operating system; 0 if it has
+/// no randomness to give.
+fn jitter(period: u64) -> u64 {
+    let mut bytes = [0; 8];
+    if period == 0 || getrandom::getrandom(&mut bytes).is_err() {
+        return 0;
+    }
+    u64::from_le_bytes(bytes) % period
 }

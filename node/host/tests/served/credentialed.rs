@@ -1056,32 +1056,29 @@ fn the_device_librarys_proofs_are_admitted() {
     let time = || client::time(founded.cluster.target(at)).unwrap();
     let identity = founded.operator.lock().unwrap().identity(agent).unwrap();
 
-    let mut keeper = vos_light::PathKeeper::new(vos_light::member(&secret));
-    let now = time();
-    assert!(keeper.due(now, None));
-    let query = wire::path_query(
-        agent.0,
-        &identity,
-        CREDENTIALS.0,
-        &vos_light::member(&secret),
-        now + 60_000,
-    )
-    .unwrap();
+    let mut keeper = vos_light::TreeKeeper::new(vos_light::member(&secret));
+    let read = |keeper: &mut vos_light::TreeKeeper, node: NodeNumber| loop {
+        let query = keeper
+            .request(agent.0, &identity, CREDENTIALS.0, time() + 60_000)
+            .unwrap();
+        if !keeper
+            .ingest(&device_send(&founded, node, &query), time())
+            .unwrap()
+            .more
+        {
+            break;
+        }
+    };
     // The follower answers from its applied state, which the enrollment
     // reaches once it replicates.
     vos_checker::wait_until(
-        "the follower has the member's path",
+        "the follower's feed holds the member",
         Duration::from_secs(30),
         || {
-            wire::path_answer(&device_send(&founded, at, &query))
-                .unwrap()
-                .is_some()
+            read(&mut keeper, at);
+            keeper.witness().is_some()
         },
     );
-    let witness = wire::path_answer(&device_send(&founded, at, &query))
-        .unwrap()
-        .expect("an enrolled member's path");
-    keeper.update(witness, now).unwrap();
 
     let name = b"login";
     let login = |expires_ms| {
@@ -1099,7 +1096,7 @@ fn the_device_librarys_proofs_are_admitted() {
     let proof = prover
         .prove_auth(
             &secret,
-            keeper.witness().unwrap(),
+            &keeper.witness().unwrap(),
             name,
             &call,
             &founded.auth,
@@ -1132,8 +1129,8 @@ fn the_device_librarys_proofs_are_admitted() {
         Ok(Answer::Refused(CredentialRefusal::Replayed))
     );
 
-    // Pushed out of the ring: the library's answer, a path fetched again,
-    // and a new proof admitted.
+    // Pushed out of the ring: the library's answer, the feed read again,
+    // and a new proof at its root admitted.
     for seed in 200..200 + tree::RING as u32 + 4 {
         founded.write(CREDENTIALS, "enroll", Secret::new(seed).member());
         std::thread::sleep(Duration::from_millis(2));
@@ -1142,7 +1139,7 @@ fn the_device_librarys_proofs_are_admitted() {
     let proof = prover
         .prove_auth(
             &secret,
-            keeper.witness().unwrap(),
+            &keeper.witness().unwrap(),
             name,
             &call,
             &founded.auth,
@@ -1157,25 +1154,12 @@ fn the_device_librarys_proofs_are_admitted() {
         )),
         Ok(Answer::RootUnknown)
     );
-    keeper.unknown();
-    let now = time();
-    assert!(keeper.due(now, None));
-    let query = wire::path_query(
-        agent.0,
-        &identity,
-        CREDENTIALS.0,
-        &vos_light::member(&secret),
-        now + 60_000,
-    )
-    .unwrap();
-    let fetched = wire::path_answer(&device_send(&founded, leader, &query))
-        .unwrap()
-        .unwrap();
-    keeper.update(fetched, now).unwrap();
+    keeper.unknown(time());
+    read(&mut keeper, leader);
     let proof = prover
         .prove_auth(
             &secret,
-            keeper.witness().unwrap(),
+            &keeper.witness().unwrap(),
             name,
             &call,
             &founded.auth,

@@ -346,7 +346,7 @@ proves and the kernel's claim.
   | 12 | the claim's `binding` is `C(T(binding), W(b))` of this request, `b` under one of the window's programs | `Binding`, 7 | 403 |
   | 13 | `b` is not recorded | `Replayed`, 8 | 409 |
   | 14 | auth with `once`: `(scope, nullifier)` not recorded | `Once`, 9 | 409 |
-  | 15 | auth: `map_root` is in the credential actor's ring | `RootUnknown`, 10 (`RootRefusal::Unknown`): retryable, fetch the path again, or ask another replica; an honest member meets it on a replica's lag, a root replaced at its own batch time, or one past the ring's 64 entries (§6) | 503 |
+  | 15 | auth: `map_root` is in the credential actor's ring | `RootUnknown`, 10 (`RootRefusal::Unknown`): retryable, read the tree's feed again, or ask another replica; an honest member meets it on a replica's lag, a root replaced at its own batch time, or one past the ring's 64 entries (§6) | 503 |
   | 16 | auth: `map_root` is the ring's newest, or was superseded at most `ROOT_MAX_AGE` before the replica's latest applied batch time | `RootStale`, 11 | 403 |
   | 17 | a verification slot is free: fewer verifications in flight than the node's budget (by default twice its executor threads) | `Busy` (not a credential code) | 503 |
   | 18 | on an executor, the proof's interaction PoW holds over its leading fields before it is decoded; then it decodes and verifies under the program the binding names against `H_io` of the claim | `Proof`, 12 | 403 |
@@ -555,7 +555,7 @@ across a space's agents wait for the identity agent above.
   storage, and in a busy space freshness too: a root that has fallen out
   is `RootUnknown`, so 64 tree-changing batches within `ROOT_MAX_AGE` make
   an honest root unknown before it is stale. `RootUnknown` is retryable by
-  a path refetch, and the device library refreshes its path well within
+  reading the feed again, and the device library reads it well within
   64 batches' time: its timer's period is well under the time the space
   takes to make 64 tree-changing batches, not merely under
   `ROOT_MAX_AGE` (§7).
@@ -664,7 +664,7 @@ across a space's agents wait for the identity agent above.
   re-founding runbook installs the new space's credential actor with the
   ended space's handle and re-seeds it with `enroll_many` from the ended
   space's `member` digests, with no member action. Slots may move, and a
-  member fetches its path again.
+  member's device reads the new space's feed.
 
 ## 7. Credentials: facts proven about oneself
 
@@ -761,14 +761,13 @@ the device never exports, evaluated once a use after the user's consent
   builds every node-API request and decodes every answer, so neither the
   client nor a gateway encodes a credential's bytes. Its `TreeKeeper`
   keeps the whole tree from the actor's feed, each page checked against
-  the root its last change names, on a jittered timer of its own, and computes the
-  member's path, so no query names the member (`light-node.md` §6.7). Its
-  `PathKeeper`, for a client not yet on the feed,
-  holds the member's path and refreshes it apart from proofs [decided]: on a 30 s timer jittered by half a period either way, a moved
-  `root()` bringing the fetch forward to a time drawn below 10 s, a
-  `RootUnknown` dropping the path and halving the period (to 1 s), a fetch
-  that finds the root unmoved doubling it back. Its queries are signed by
-  a key drawn for each. Its `SECURITY.md` states the secret's containment.
+  the root its last change names, on a jittered timer of its own, and
+  computes the member's path, so no query names the member (`light-node.md` §6.7):
+  on a 30 s timer jittered by half a period either way, a `RootUnknown`
+  bringing the read forward to a time drawn below 10 s and halving the
+  period (to 1 s), a read that finds the tree unchanged doubling it back.
+  Its queries are signed by a key drawn for each. Its `SECURITY.md`
+  states the secret's containment.
 - **s4's `vos.credential` facility** [decided]: a client
   facility of s4's Android client, called by a server's document and
   gated by the client's grant, implemented in Rust over `vos-light` (a
@@ -865,17 +864,12 @@ the device never exports, evaluated once a use after the user's consent
     keeps the whole tree from `feed(from)`, whose query names only its
     place in the feed, read on a timer of its own (never just before a
     proof), and computes the member's path itself (`light-node.md` §6.7);
-  - from `path(member)`, for a client not yet on the feed: which member
-    digest is online, and from which address. The query's key is drawn
-    for it alone and links nothing, and the library refreshes its path
-    apart from its proofs (when `root()` moves and on a timer, never just
-    before a proof, on a connection of its own) [decided], so a fetch's
-    time says nothing of a proof's. The leak is reduced, not closed: a
-    proof from the same address still links its nullifier to the digest,
-    and the digest to whoever the registrar enrolled. So `Anonymous`
-    hides the member from the log's readers, other agents and other
-    members, not from the operators of the nodes and gateways that serve
-    its requests; that is full privacy's (§3, §8);
+  - from each request's address and timing: a proof's connection shows
+    the node or gateway that serves it where it came from and when, which
+    links its nullifier to that address. So `Anonymous` hides the member
+    from the log's readers, other agents and other members, not from the
+    operators of the nodes and gateways that serve its requests; that is
+    full privacy's (§3, §8);
   - from the log: each auth call's scope and nullifier (a pseudonym's
     activity in one scope), each payment's owner digest (a public payer),
     each credentialed call's arguments in clear (a payment's payee
@@ -887,13 +881,9 @@ the device never exports, evaluated once a use after the user's consent
     except for the members who prove within a timer period of a change
     before reading it. The log keeps the root, not its place in the ring:
     a place relative to the newest moves between ingress and apply, and
-    one counted from the first root names the root as its digest does. A
-    client on its path proves against its last fetch's root until the
-    next, which the moved `root()` brings within 10 s;
-  - from a tree change: a client on its path refreshes it when `root()`
-    moves, so each enrollment or revocation shows which member digests
-    are online then; a device on the feed reads the change as every
-    member does, naming no digest;
+    one counted from the first root names the root as its digest does;
+  - from a tree change: a device reads the change as every member does,
+    naming no digest;
   - from the tree: how many members there are and when each was enrolled
     or revoked (the feed serves every write and its batch time, to any
     caller); a leaf hides its digest from one who does not know it, but

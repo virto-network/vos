@@ -1,9 +1,9 @@
 //! The device library: the derivation from a source's output, the scope
 //! and the binding, the stock kernels' proofs verified against their calls
 //! and refused against others, the witness checked before proving, the
-//! prover's configuration, the wire's requests and answers, the path kept
-//! apart from proofs, a `RootUnknown` answer fetching it again and proving
-//! anew, and the stock kernels' programs from their release artifacts.
+//! prover's configuration, the wire's requests and answers, a
+//! `RootUnknown` answer proving anew at the new root, and the stock
+//! kernels' programs from their release artifacts.
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -15,13 +15,12 @@ use sha2::Sha256;
 use vos_api::Kind;
 use vos_light::wire::{self, Answer};
 use vos_light::{
-    AuthWitness, Call, DEVICE_FORMAT, DeviceError, DeviceProgram, Digest, PEAK_BYTES, PathKeeper,
-    Proven, Prover, ProverConfig, Threads, derive_secret, member, owner, scope, source_input,
-    verify,
+    AuthWitness, Call, DEVICE_FORMAT, DeviceError, DeviceProgram, Digest, PEAK_BYTES, Proven,
+    Prover, ProverConfig, Threads, derive_secret, member, owner, scope, source_input, verify,
 };
 use vos_wire::credentials::{
-    self, AuthClaim, DEPTH, EMPTY, OwnerClaim, P, Path, RING, Ring, RootEntry, RootRefusal,
-    Siblings, Tag, Words, compress, leaf,
+    self, AuthClaim, DEPTH, EMPTY, Feed, OwnerClaim, P, RING, Ring, RootRefusal, Tag, Words,
+    compress, leaf,
 };
 use vos_wire::ids::{AgentId, InstanceId, MethodId, derive_id};
 use vos_wire::ingress::{
@@ -74,25 +73,15 @@ impl Tree {
         Digest(self.node(DEPTH, 0))
     }
 
-    /// The path the actor's `path` answers, as the node's API carries it.
-    fn path(&self, slot: u32) -> Path {
-        Path {
-            root: self.root().to_bytes(),
-            slot,
-            siblings: Siblings(core::array::from_fn(|level| {
-                credentials::digest(&self.node(level, u64::from(slot >> level ^ 1)))
-            })),
-        }
-    }
-
+    /// The path of the member at `slot`, at the tree's root.
     fn witness(&self, slot: u32) -> AuthWitness {
-        let answer = Response::Ran {
-            outcome: Outcome::Done(Some(self.path(slot)).encode()),
-            at: 1,
-        };
-        wire::path_answer(&answer.encode())
-            .unwrap()
-            .expect("an enrolled member's path")
+        AuthWitness {
+            root: self.root(),
+            slot,
+            siblings: core::array::from_fn(|level| {
+                Digest(self.node(level, u64::from(slot >> level ^ 1)))
+            }),
+        }
     }
 }
 
@@ -486,10 +475,10 @@ fn the_configuration_is_checked() {
     verify(&proof, &call(b""), owner_program(), None).unwrap();
 }
 
-/// The requests: `Time` its kind alone; `path` and `root()` queries signed
-/// over the agent's identity by a key drawn for each; the credentialed
-/// request the call and the proof. The answers: the time, a path, none,
-/// the root, and a credentialed call's, `RootUnknown` among them.
+/// The requests: `Time` its kind alone; `feed` queries signed over the
+/// agent's identity by a key drawn for each; the credentialed request the
+/// call and the proof. The answers: the time, a page of the feed, and a
+/// credentialed call's, `RootUnknown` among them.
 #[test]
 fn the_wire_requests_and_answers() {
     assert_eq!(wire::time_request(), 0x0002u16.to_le_bytes());
@@ -497,18 +486,17 @@ fn the_wire_requests_and_answers() {
     assert_eq!(wire::time_answer(&[1, 2]), Err(DeviceError::Decode));
 
     let identity = [0x1d; 32];
-    let member = member(&secret(1));
     let decode = |request: &[u8]| {
         assert_eq!(request[..2], 0x0102u16.to_le_bytes());
         <(AgentId, QueryCall)>::decode_exact(&request[2..]).expect("a query's body")
     };
-    let (agent, path) = decode(&wire::path_query(4, &identity, 2, &member, 900).unwrap());
+    let (agent, feed) = decode(&wire::feed_query(4, &identity, 2, 7, 900).unwrap());
     assert_eq!(agent, AgentId(4));
-    assert_eq!(path.instance, InstanceId(2));
-    assert_eq!(path.method, MethodId(derive_id("vos/method/", "path")));
-    assert_eq!(path.arguments, member.to_bytes().to_vec());
-    assert_eq!(path.not_after, 900);
-    assert_eq!(path.consistency, Consistency::Applied { at: 0 });
+    assert_eq!(feed.instance, InstanceId(2));
+    assert_eq!(feed.method, MethodId(derive_id("vos/method/", "feed")));
+    assert_eq!(feed.arguments, 7u64.encode());
+    assert_eq!(feed.not_after, 900);
+    assert_eq!(feed.consistency, Consistency::Applied { at: 0 });
     let signed = |query: &QueryCall| {
         VerifyingKey::from_bytes(&query.key)
             .unwrap()
@@ -526,14 +514,15 @@ fn the_wire_requests_and_answers() {
             )
             .is_ok()
     };
-    assert!(signed(&path));
-    let (_, again) = decode(&wire::path_query(4, &identity, 2, &member, 900).unwrap());
-    assert_ne!(again.key, path.key, "a key a query");
-    let (_, root) = decode(&wire::root_query(4, &identity, 2, 900).unwrap());
-    assert_eq!(root.method, MethodId(derive_id("vos/method/", "root")));
-    assert!(root.arguments.is_empty());
-    assert!(signed(&root));
+    assert!(signed(&feed));
+    let (_, again) = decode(&wire::feed_query(4, &identity, 2, 7, 900).unwrap());
+    assert_ne!(again.key, feed.key, "a key a query");
 
+    let page = Feed {
+        from: 7,
+        changes: Vec::new(),
+        length: 7,
+    };
     let ran = |reply: Vec<u8>| {
         Response::Ran {
             outcome: Outcome::Done(reply),
@@ -541,34 +530,20 @@ fn the_wire_requests_and_answers() {
         }
         .encode()
     };
-    assert_eq!(wire::path_answer(&ran(None::<Path>.encode())), Ok(None));
+    assert_eq!(wire::feed_answer(&ran(page.encode())), Ok(page));
     assert_eq!(
-        wire::path_answer(&Response::Busy.encode()),
+        wire::feed_answer(&Response::Busy.encode()),
         Err(DeviceError::Decode)
     );
     // Ingress's refusal is the device's to show, as the node gave it.
     let onion_only = Rejection::Admission(AdmissionRefusal::OnionOnly);
     assert_eq!(
-        wire::path_answer(&Response::Rejected(onion_only).encode()),
+        wire::feed_answer(&Response::Rejected(onion_only).encode()),
         Err(DeviceError::Rejected(onion_only))
     );
     assert_eq!(
-        wire::root_answer(&Response::Rejected(Rejection::Behind).encode()),
+        wire::feed_answer(&Response::Rejected(Rejection::Behind).encode()),
         Err(DeviceError::Rejected(Rejection::Behind))
-    );
-    let mut above = Tree::default().path(0);
-    above.siblings.0[3] = [0xff; 32];
-    assert_eq!(
-        wire::path_answer(&ran(Some(above).encode())),
-        Err(DeviceError::Decode)
-    );
-    let entry = RootEntry {
-        root: Tree::default().root().to_bytes(),
-        since: 44,
-    };
-    assert_eq!(
-        wire::root_answer(&ran(entry.encode())),
-        Ok((Tree::default().root(), 44))
     );
 
     let prover = prover();
@@ -643,56 +618,12 @@ fn the_wire_requests_and_answers() {
     assert_eq!(wire::credentialed_answer(&[]), Err(DeviceError::Decode));
 }
 
-/// The keeper: due with no path; a path not its member's refused; due when
-/// the root moved; its timer between half and one and a half periods;
-/// `unknown` drops the path and halves the period, a quiet fetch doubles
-/// it back.
-#[test]
-fn the_path_is_kept_apart_from_proofs() {
-    let secret = secret(1);
-    let tree = tree_with(&secret, 5);
-    let mut keeper = PathKeeper::new(member(&secret));
-    assert!(keeper.due(0, None));
-    assert!(keeper.witness().is_none());
-    assert_eq!(keeper.update(tree.witness(0), 0), Err(DeviceError::Witness));
-    assert!(keeper.witness().is_none());
-
-    let period = PathKeeper::PERIOD_MS;
-    keeper.update(tree.witness(5), 1_000).unwrap();
-    assert_eq!(keeper.witness(), Some(&tree.witness(5)));
-    assert!(!keeper.due(1_000 + period / 2 - 1, None));
-    assert!(!keeper.due(1_000 + period / 2 - 1, Some(&tree.root())));
-    assert!(keeper.due(1_000 + period * 3 / 2, None));
-    // A moved root brings the fetch forward, spread below
-    // `MOVED_SPREAD_MS` from when it is first seen: before the timer's
-    // earliest, half a period on.
-    keeper.update(tree.witness(5), 1_000).unwrap();
-    let seen = 2_000;
-    assert!(seen + PathKeeper::MOVED_SPREAD_MS < 1_000 + period / 2);
-    keeper.due(seen, Some(&Tree::default().root()));
-    assert!(keeper.due(seen + PathKeeper::MOVED_SPREAD_MS, None));
-
-    keeper.unknown();
-    assert!(keeper.witness().is_none());
-    assert!(keeper.due(1_001, Some(&tree.root())));
-    assert_eq!(keeper.period(), period / 2);
-    for _ in 0..10 {
-        keeper.unknown();
-    }
-    assert_eq!(keeper.period(), PathKeeper::MIN_PERIOD_MS);
-    keeper.update(tree.witness(5), 2_000).unwrap();
-    assert!(!keeper.due(2_000 + PathKeeper::MIN_PERIOD_MS / 2 - 1, None));
-    keeper.update(tree.witness(5), 3_000).unwrap();
-    assert_eq!(keeper.period(), 2 * PathKeeper::MIN_PERIOD_MS);
-}
-
 /// The path's freshness in a busy space: 64 tree-changing batches after
-/// the member's fetch push its root out of the ring, so ingress answers
-/// `RootUnknown` before the root is ever stale; the answer drops the path,
-/// the keeper says to fetch again, and the call proved anew on the new
-/// path is admitted by the ring and verifies.
+/// the member's read push its root out of the ring, so ingress answers
+/// `RootUnknown` before the root is ever stale; the call proved anew on
+/// the path at the new root is admitted by the ring and verifies.
 #[test]
-fn a_root_unknown_answer_fetches_the_path_again_and_proves_anew() {
+fn a_root_unknown_answer_proves_anew_at_the_new_root() {
     let prover = prover();
     let secret = secret(1);
     let slot = 40;
@@ -700,10 +631,8 @@ fn a_root_unknown_answer_fetches_the_path_again_and_proves_anew() {
     let mut ring = Ring::installed(0);
     ring.record(tree.root().to_bytes(), 10);
 
-    let mut keeper = PathKeeper::new(member(&secret));
-    keeper.update(tree.witness(slot), 10).unwrap();
     let call = call(b"yes");
-    let held = keeper.witness().unwrap().clone();
+    let held = tree.witness(slot);
     let first = prover
         .prove_auth(&secret, &held, NAME, &call, auth_program())
         .unwrap();
@@ -732,13 +661,10 @@ fn a_root_unknown_answer_fetches_the_path_again_and_proves_anew() {
     let answer = [2, 9, 10];
     assert_eq!(wire::credentialed_answer(&answer), Ok(Answer::RootUnknown));
     verify(&first, &call, auth_program(), Some(NAME)).unwrap();
-    keeper.unknown();
-    assert!(keeper.due(now, None));
-    keeper.update(tree.witness(slot), now).unwrap();
-    let fresh = keeper.witness().unwrap();
+    let fresh = tree.witness(slot);
     assert_ne!(fresh.root, held.root);
     let again = prover
-        .prove_auth(&secret, fresh, NAME, &call, auth_program())
+        .prove_auth(&secret, &fresh, NAME, &call, auth_program())
         .unwrap();
     let claim = AuthClaim::decode_exact(&again.claim).unwrap();
     assert_eq!(ring.accepts(&claim.map_root, now), Ok(()));
