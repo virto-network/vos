@@ -676,10 +676,10 @@ test home-only space for M4 and M5 (Virto's home's shape, E20, with test
 delays, lease and claim difficulty).
 
 **Built** (2026-11-11): `vos-gateway-demo --homes 2` (`node/gateway/demo`,
-`vos_gateway_demo::home`): two test homes on the demo's node, each its
-agent with the credential actor and `Homes`, a pool the keeper makes and
+`vos_gateway_demo::home`): two test homes on the demo's node, in its
+space, each its agent with the credential actor and `Homes`, a pool the keeper makes and
 stocks, open claims at 8 bits of work; behind an onion of their own (its
-own SSH host key, no clearnet port); delays in minutes and a 4 h lease
+own SSH host key, no clearnet port); delays in minutes and a day's lease
 (`home::SESSION`); each printed as the code the app reads. Driven end to
 end by `node/gateway/demo/tests/home.rs`: a claim and a pairing by s4's
 facility over the onion in process.

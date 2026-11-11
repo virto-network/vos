@@ -6,10 +6,10 @@
 //! (through `adb reverse`) as `anonymous@ADDRESS` to enroll; the enrollment
 //! pins the onion, which then carries its proofs and its screens.
 //!
-//! With `--homes N` (1 or 2), as many test homes on the same node behind an
-//! onion of their own, its own SSH host key and no clearnet port
-//! ([`vos_gateway_demo::home`], Virto's home's shape, E20): each a
-//! home-only space with
+//! With `--homes N` (1 or 2), as many test homes on the same node, in the
+//! demo's space, behind an onion of their own, its own SSH host key and no
+//! clearnet port ([`vos_gateway_demo::home`], in Virto's home's shape,
+//! E20): each a home agent with
 //! a pool of `--pool` personal agents (6 by default), the delays and the
 //! lease of [`vos_gateway_demo::home::SESSION`], its open claim at a low
 //! difficulty; each printed as the code the app scans or pastes

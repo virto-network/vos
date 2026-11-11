@@ -334,6 +334,20 @@ pub enum Served {
 }
 
 impl Served {
+    /// Its circuits' request rate: the gateway's own for the space's; for
+    /// the homes', 100 a second and a burst of 200, as a personal pass's
+    /// requests follow one another on one connection as fast as Tor
+    /// answers them, a circuit's channel closed past its rate.
+    fn rate(self) -> Option<Rate> {
+        match self {
+            Served::Demo => None,
+            Served::Homes => Some(Rate {
+                rate: 100,
+                burst: 200,
+            }),
+        }
+    }
+
     /// The name of its file `name` under the data directory.
     fn file(self, name: &str) -> String {
         match self {
@@ -460,7 +474,7 @@ key = "{onion}"
             .mode(0o700)
             .create(data.join(served.file("onion")))
             .map_err(|error| error.to_string())?;
-        let config = self.gateway_file(served, data, unbound(), &self.socket, None)?;
+        let config = self.gateway_file(served, data, unbound(), &self.socket, served.rate())?;
         let gateway = Self::front_gateway(&config)?;
         let onion = config.onion.as_ref().expect("the file's onion");
         let hosted = vos_gateway::served::onion(&config, onion, gateway).await?;

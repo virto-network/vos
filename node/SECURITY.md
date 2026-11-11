@@ -366,8 +366,12 @@ other port refused. What that changes for the node and its operators:
   the space's onion set unsigned (`set_onions`, `onions`), as any answer a
   gateway relays (`light-node.md` §8, H5). A client pins the set and each
   onion's SSH host key at enrollment and refuses a host key it did not
-  pin; s4 refuses its own clearnet connection to a gateway presenting a
-  key a space pinned to its onion, however its name is written.
+  pin. s4 (on Android, with the facility) refuses to go on with its own
+  clearnet connection to a gateway presenting a key a space pinned to its
+  onion, however its name or port is written: a guard against a
+  misspelled gateway, not a hostile one. The check comes at the key
+  exchange, so the gateway has seen the device's address by then, and a
+  gateway presenting another key on its clearnet port is not caught.
 - **Audited** (`just test-carriers`, `node/gateway/demo/tests/carriers.rs`):
   a member's sign-ins by the stock auth kernel (one of them proved with
   its masks' randomness watched), a cut proof and an owner's payment, each

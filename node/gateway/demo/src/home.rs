@@ -1,6 +1,8 @@
-//! A test home on the demo's node (`light-node.md` §3.3, E20): Virto's
-//! home-only space in shape, its delays, its lease and its open claim's
-//! difficulty cut to a phone session's. Its agent holds the credential
+//! A test home on the demo's node (`light-node.md` §3.3, E20): a home in
+//! the shape of Virto's (its own agent, credential actor and handle, behind
+//! an onion and an SSH host key of its own), in the demo's space on its
+//! one node rather than a space of its own, its delays, its lease and its
+//! open claim's difficulty cut to a phone session's. Its agent holds the credential
 //! actor and `Homes`, in front of a pool of personal agents the keeper
 //! (`vos-keeper`) makes and stocks; the registrar admits open claims at a
 //! low difficulty and serves the gateway's onion as the home's onion set.
@@ -30,20 +32,21 @@ const ROLE: u8 = 1;
 
 const MINUTE: u64 = 60_000;
 
-/// A phone session's home policy: a device's operations (a removal, a
-/// delayed admin's add, a regroup) mature in two minutes and the kit's (a
-/// rotation, a restore, an admin key's replacement by the kit) in five; a
-/// paired device is on probation two minutes and seasoned five after, so
-/// an admin key's replacement by another device (E29) runs within the
-/// session; the lease four hours, so a session never outlives it, its
-/// re-proof due in its last 40 minutes and made at any time before.
+/// A phone session's home policy: a device's own operations (a removal, a
+/// kit rotation, a regroup) mature in two minutes and the kit's (a
+/// restore, an admin key's replacement by the kit) in five; a paired
+/// device is on probation two minutes and seasoned five after, and an
+/// admin key another device replaces takes over after the probation (E29),
+/// all within the session; the lease a day, past the hours a joiner's
+/// open claim waits (E28) and an unattended day of background runs, its
+/// re-proof due in its last four hours and made at any time before.
 pub const SESSION: Policy = Policy {
     operation_delay_ms: 2 * MINUTE,
     kit_delay_ms: 5 * MINUTE,
     probation_ms: 2 * MINUTE,
     seasoning_ms: 5 * MINUTE,
     confirm_window_ms: 15 * MINUTE,
-    lease_ms: 240 * MINUTE,
+    lease_ms: 24 * 60 * MINUTE,
     slot_ttl_ms: 10 * MINUTE,
     ..Policy::DEFAULT
 };

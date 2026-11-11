@@ -307,7 +307,11 @@ pub async fn relay(
                     let mut place = None;
                     if let Some(connection) = connection {
                         if !port.limits.request(connection.ip()) {
-                            tracing::info!(?connection, ?mark, "a channel past its address's rate, closed");
+                            tracing::debug!(
+                                ?connection,
+                                ?mark,
+                                "a channel past its address's rate, closed"
+                            );
                             return;
                         }
                         place = port.limits.connect(connection.ip());

@@ -13,6 +13,8 @@
 use std::collections::VecDeque;
 use std::fmt;
 
+use vos_wire::{Decode, Encode};
+
 use crate::route::Purpose;
 
 /// The hours kept, the newest last: two days.
@@ -36,9 +38,45 @@ impl Opened {
         self.rendezvous.iter().sum()
     }
 
+    fn add(&mut self, other: &Opened) {
+        for (count, more) in self.rendezvous.iter_mut().zip(other.rendezvous) {
+            *count += more;
+        }
+        self.failed += other.failed;
+        self.clearnet += other.clearnet;
+    }
+
     /// The rendezvous made for `purpose`.
     pub fn of(&self, purpose: Purpose) -> u32 {
         self.rendezvous[purpose as usize]
+    }
+}
+
+/// Encoded as its counts by purpose (as many as it names, a later
+/// purpose's read as none), then the failed and the clearnet counts.
+impl Encode for Opened {
+    fn encode_to(&self, buf: &mut Vec<u8>) {
+        self.rendezvous.to_vec().encode_to(buf);
+        (self.failed, self.clearnet).encode_to(buf);
+    }
+}
+
+impl Decode for Opened {
+    fn decode(data: &[u8]) -> Result<(Self, usize), vos_wire::DecodeError> {
+        let (counts, used) = Vec::<u32>::decode(data)?;
+        let ((failed, clearnet), more) = <(u32, u32)>::decode(&data[used..])?;
+        let mut rendezvous = [0; Purpose::ALL.len()];
+        for (count, decoded) in rendezvous.iter_mut().zip(counts) {
+            *count = decoded;
+        }
+        Ok((
+            Self {
+                rendezvous,
+                failed,
+                clearnet,
+            },
+            used + more,
+        ))
     }
 }
 
@@ -74,8 +112,9 @@ fn name(purpose: Purpose) -> &'static str {
     }
 }
 
-/// One hour's connections.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// One hour's connections. Encoded, a process keeps its tally across
+/// restarts ([`super::Client::restore_opened`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
 pub struct Hour {
     /// The hour, counted from the Unix epoch by the device's clock.
     pub hour: u64,
@@ -144,6 +183,24 @@ impl Tally {
         }
     }
 
+    /// `hours` a process before this one kept, counted in with this
+    /// one's, the newest [`HOURS`] kept.
+    pub(crate) fn restore(&mut self, hours: &[Hour]) {
+        let mut merged: Vec<Hour> = self.hours.iter().copied().collect();
+        for hour in hours {
+            match merged.iter_mut().find(|kept| kept.hour == hour.hour) {
+                Some(kept) => {
+                    kept.foreground.add(&hour.foreground);
+                    kept.background.add(&hour.background);
+                }
+                None => merged.push(*hour),
+            }
+        }
+        merged.sort_by_key(|hour| hour.hour);
+        let skip = merged.len().saturating_sub(HOURS);
+        self.hours = merged.into_iter().skip(skip).collect();
+    }
+
     pub(crate) fn hours(&self) -> Vec<Hour> {
         self.hours.iter().copied().collect()
     }
@@ -204,5 +261,13 @@ mod tests {
         let hours = tally.hours();
         assert_eq!(hours.len(), HOURS);
         assert_eq!(hours[0].hour, 12);
+        // A restart's tally takes the last one's in, its own counts beside.
+        let mut restarted = Tally::default();
+        restarted.record(12 + HOURS as u64 - 1, Dialed::Clearnet);
+        let kept = Vec::<Hour>::decode_exact(&hours.encode()).unwrap();
+        restarted.restore(&kept);
+        let hours = restarted.hours();
+        assert_eq!(hours.len(), HOURS);
+        assert_eq!(hours.last().unwrap().background.clearnet, 2);
     }
 }

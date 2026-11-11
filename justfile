@@ -341,11 +341,11 @@ test-light-tor:
     cargo test -p vos-light --features tor --ignore-rust-version --test tor --test tor_state
     cargo test -p vos-light --features tor --ignore-rust-version --lib -- tor:: route::
 
-test-gateway-ssh: build-test-actors build-agent build-credentials build-payments
+test-gateway-ssh: build-test-actors build-agent build-credentials build-payments build-homes build-personal
     cargo clippy -p vos-gateway --features ssh --ignore-rust-version --all-targets --quiet -- -D warnings
     cargo test -p vos-gateway --features ssh --ignore-rust-version
     cargo clippy --manifest-path node/gateway/demo/Cargo.toml --ignore-rust-version --all-targets --quiet -- -D warnings
-    cargo test --manifest-path node/gateway/demo/Cargo.toml --ignore-rust-version
+    cargo test --manifest-path node/gateway/demo/Cargo.toml --ignore-rust-version --lib --bins --test e2e --test home
 
 # The default agent as a service on a local PolkaJam testnet, which it
 # starts and stops: a workflow suspended in one work package and resumed in

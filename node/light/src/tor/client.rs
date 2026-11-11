@@ -328,6 +328,12 @@ impl Client {
         self.tally().hours()
     }
 
+    /// Count in the hours a process before this one kept (its
+    /// [`Client::opened`], encoded and kept by the app).
+    pub fn restore_opened(&self, hours: &[Hour]) {
+        self.tally().restore(hours);
+    }
+
     fn tally(&self) -> std::sync::MutexGuard<'_, Tally> {
         self.inner.tally.lock().unwrap_or_else(|e| e.into_inner())
     }

@@ -900,7 +900,7 @@ async fn the_tree_is_read_on_one_feed_connection() {
 /// between 15 and 45; the kept-open connections' idle limit a second, past
 /// any stall of a loaded host): the feed
 /// read on its timer, the member's calls and the personal agent's every
-/// minute, and twelve sign-ins, each a fetch of the node's time and a
+/// minute, and twelve sign-ins (one every four minutes), each a fetch of the node's time and a
 /// proven call. The hour's rendezvous are one a kept-open group (its
 /// connection outlives the gaps between its requests), one the spare built
 /// ahead, and two a sign-in: 3 + 1 + 2 × 12 = 28, within PG5's 30, so a
@@ -942,8 +942,8 @@ async fn a_foreground_hour_opens_a_rendezvous_a_kept_group_and_two_a_sign_in() {
                 .unwrap();
             minute = now + Duration::from_millis(60);
         }
-        // A sign-in every five minutes, the spare rebuilt between them.
-        let due = Duration::from_millis(300 * u64::from(signed) + 150);
+        // A sign-in every four minutes, the spare rebuilt between them.
+        let due = Duration::from_millis(240 * u64::from(signed) + 100);
         if signed < SIGN_INS && hour - Duration::from_millis(3_600) + due <= now {
             until(|| client.spare_ready()).await;
             client
