@@ -8,7 +8,7 @@ for every device statement, payments rebuilt on cipher-clerk as the
 showcase of attestable Rust, and clients reaching a space over Tor.
 - **Status:** everything here is [proposed], to be built as stated,
   unless tagged [decided] (an owner decision, listed in §1.1 by its
-  number, E1–E29, or cited from another document) or [built] (what
+  number, E1–E30, or cited from another document) or [built] (what
   `vos-core` holds at `543c05e07`).
 - **Numbers** carry their tag: [measured] (a run, cited), [model] (the
   cell model, `proving.md` §8), [est] (arithmetic on those, unmeasured).
@@ -80,6 +80,7 @@ devices decrypt each other's messages".
 | E27 | M3's and M4's acceptances run together: one `ci-full`, one carrier audit, one Fable review; M5's phone runs may fold into S8-P7. |
 | E28 | A joining device's open claim at a home-only space is made by the background job after a random drawn delay from its add, never at the pairing, so the home's operators cannot link the new member to the agent by its time. |
 | E29 | A device's admin key is replaced (`admin(d, new key)`) on the kit's signature or another seasoned active device's; the new key's 72 h probation stands either way. |
+| E30 | No C tor in the product, its tooling or its demo: the gateway hosts its onion with arti in process, the one path; the C tor sidecar, run once to measure it, is removed. A private test network's relays (chutney) may use C tor outside the tree. |
 
 ### 1.2 Goals
 
@@ -2840,14 +2841,14 @@ gateway, 2026-11-02]:
   `tor_proto::stream::IncomingStreamRequest`; a `Begin` to port 22 is
   accepted with `Connected::new_empty()`, anything else refused with
   `End::new_misc()`.
-- **s4-server serves only a `TcpListener`** (`serve_on`). The spike handed
-  each accepted onion stream to the gateway's SSH port on a loopback
-  listener. Through loopback every onion client arrives from 127.0.0.1,
+- **s4-server served only a `TcpListener`** (`serve_on`) in the spike,
+  which handed each accepted onion stream to the gateway's SSH port on a
+  loopback listener. Through loopback every onion client arrives from 127.0.0.1,
   so it shares one address's limits (64 connections, 200 requests a
   second), and the gateway cannot mark the request as onion-borne. The
-  product needs s4-server to serve a given stream (russh's `run_stream`
-  takes any `AsyncRead + AsyncWrite`), so the gateway can mark the stream
-  and apply §6.6's limits to it.
+  product's s4-server serves any `Listener` (russh's `run_stream` takes
+  any `AsyncRead + AsyncWrite`), so the gateway hands it each stream,
+  marked and under §6.6's limits (§6.1, "Built").
 - Seen from a client, an arti-hosted onion showed no difference from a
   C tor-hosted one [measured, x86, 2026-11-02, n = 20 each]. Isolated
   connections from one warm client to the spike's onion took a median of
@@ -2902,16 +2903,18 @@ gateway's `tor` feature hosts the onion in process on arti-client 0.47.0
 inserted once into arti's keystore and checked against it at each start,
 arti's service-side PoW behind the `tor-pow` feature and the file's
 `pow`, off by default. Port 80 is the gateway's own HTTP server, port 22
-its own SSH port, both marking onion; any other port is refused `DONE`.
-s4-server serves a listener, not a stream, so each SSH stream is carried
-to the onion's SSH port on a loopback listener and the carrier's exact
-loopback address names it: the port counts the stream's circuit, and
-serves no channel to a connection no stream carries. The onion's SSH port
-serves the `vos-api` subsystem and no demo screens, whose host service
-would answer a connection no stream carries: s4's screens over the onion
-want s4-server serving a stream. The same ports
-serve a C tor beside the gateway, the documented fallback, whose
-`HiddenServiceExportCircuitID haproxy` names each stream's circuit. The
+its own SSH server, both marking onion; any other port is refused `DONE`.
+s4-server serves any source of connections (its `Listener`: a TCP
+listener, or streams handed over), so each SSH stream is handed to the
+onion's SSH server with its circuit's address, a port of it its own: the
+circuit's streams are counted, and its `vos-api` channels, requests and
+proven calls as an address's; the server serves s4's screens (the demo's,
+its claims marked onion) beside the `vos-api` subsystem; no loopback port
+carries them. The screens' own calls (the demo's host service) pass no
+per-circuit limit: s4's host-service requests name no peer, so only the
+server's bound per session holds them; and the onion's SSH server has
+s4-server's connection cap (128) and no idle timeout of its own, both
+open (§6.6). arti in process is the onion's one host (E30). The
 `vos-api` relay set holds `Call` and `Credentialed`. A proven call's
 body is read only once it holds its places, the port's, its connection's
 and its circuit's, and must then arrive within 30 s.
@@ -3016,6 +3019,13 @@ nodes may ask the onion's mark of its proven calls, or of every request
   between a stream or a descriptor s4 hands over (`screens_fd`, a
   socketpair's end) and the onion's port 22, on a circuit of its own; s4
   speaks SSH over it under its own key and pins the host key returned.
+  On the phone, s4's UI hands its end over the `:vos` interface
+  (`IVosNode.screens`) when it connects to a gateway a space was enrolled
+  through (a space whose routes take neither its onion nor an opt-out
+  refused), and accepts that host key alone, under an
+  SSH key drawn for the session, never resumed, forwarding no agent; the
+  opt-out takes the space's clearnet port, its enrolled host key pinned;
+  a gateway no space was enrolled through s4 reaches itself.
   The onion set's refresh (`refresh_onions`) is a `Time` and an `onions`
   query, each a fetch; a set of one to sixteen distinct onions replaces
   the pinned one, closing the space's connections.
@@ -3237,8 +3247,7 @@ place:
   experimentation only" and lists no DoS protection (last touched
   2025-08, and stale on restricted discovery, so weak evidence either
   way). Turn PoW on when a release declares it; until then the gateway's
-  other limits hold alone, and the fallback is C tor beside the gateway
-  (§9.1).
+  other limits hold alone (§9.1).
 - **Limits per circuit and per service:** streams per rendezvous circuit,
   requests a second per stream, calls per agent per circuit (so one
   circuit cannot fill a personal agent's log), and a global cap of proven
@@ -3302,9 +3311,8 @@ against a no-flood baseline:
   descriptor publishes in seconds, not the tens live Tor can take; and
   loopback bandwidth lets the junk flow faster than the live network
   would, so the private run is a harder test of the node per junk proof
-  and a lighter one of Tor's latency and rendezvous. The caps and the C
-  tor sidecar remain the backstop should a live flood outrun the
-  bandwidth bound (§6.7, §9.1).
+  and a lighter one of Tor's latency and rendezvous. The caps remain the
+  backstop should a live flood outrun the bandwidth bound (§6.7, §9.1).
 
 ### 6.7 What Tor fixes, and what it does not
 
@@ -3420,8 +3428,7 @@ throwaway spike]. A feed query is 139 bytes; an answer with nothing new
 1.0, shipped by Zashi and Fedimint); usable, not yet hardened, for
 hosting, whose DoS defence is the gap. Ship the client path in slice 8;
 host the gateway's onion behind a `tor` feature, full vanguards on, PoW
-when a release declares it; keep a C tor sidecar as the documented
-fallback should the onion be flooded before then (§9.1); pin one arti
+when a release declares it, arti the onion's one host (E30); pin one arti
 version a release and budget an upgrade step each slice.
 
 ### 6.8 Sources (read 2026-11-02 unless marked)
@@ -4085,7 +4092,7 @@ target 0.55 s; format 47 ships at what it measures under the gate, and the
 **H1. The onion is flooded** before arti's service PoW is declared ready.
 *Mitigation:* introduction-point, SSH-connection, circuit, per-agent and per-onion caps;
 the in-flight cap on large requests; Tor's own throughput bounding junk
-proofs; a flood measured in M5; the C tor sidecar as the fallback (Q11).
+proofs; a flood measured in M5 (Q11).
 (8.25)
 
 **H2. Tor is blocked on the user's network.** *Mitigation:* plain bridges
@@ -4249,8 +4256,8 @@ agent. (8.14)
   (Q7; the gate met, the SDK-form kernels the stock ones, §4.2); glue in
   the light node's Rust for device effects (Q8); a
   `recursion` feature on `vos-pvm-recair` (Q9); arti in the gateway behind
-  a `tor` feature, PoW when a release declares it, a C tor sidecar the
-  documented fallback (Q11); the pool's integrity and note delivery with
+  a `tor` feature, PoW when a release declares it, arti the onion's one
+  host (Q11, E30); the pool's integrity and note delivery with
   P2 (Q10, Q12).
 
 ### 9.2 Risks
