@@ -226,6 +226,67 @@ fn a_broken_constraint_on_the_first_last_or_wrap_row_is_refused() {
     }
 }
 
+/// The trace's chip at `position` turned so that its padding lies between
+/// real rows, every cyclic neighbour kept: each relation balances as before
+/// and every constraint relating a row to the next holds where it held.
+fn pad_inside(trace: &mut MaskedSegmentTrace, position: usize, is_padding: usize) {
+    let log_size = trace.log_sizes[position];
+    let columns = trace.main_columns_mut().nth(position).expect("the chip");
+    let rows = 1usize << log_size;
+    let natural: Vec<Vec<BaseField>> = columns
+        .iter()
+        .map(|column| {
+            (0..rows)
+                .map(|row| column.as_slice()[stored(row, log_size)])
+                .collect()
+        })
+        .collect();
+    let real = natural[is_padding]
+        .iter()
+        .filter(|&&flag| flag == BaseField::zero())
+        .count();
+    let turn = |row: usize| (row + real / 2) % rows;
+    let is_real = |row: usize| natural[is_padding][turn(row)] == BaseField::zero();
+    assert!(real >= 2 && is_real(0) && is_real(rows - 1));
+    assert!(natural[is_padding].contains(&BaseField::one()));
+    for (column, values) in columns.iter_mut().zip(&natural) {
+        for row in 0..rows {
+            column.as_mut_slice()[stored(row, log_size)] = values[turn(row)];
+        }
+    }
+}
+
+/// Padding between the segment's ledgers' real rows is accepted, and is
+/// sound: the memory ledger (`MemoryChip`) and the register ledger, each
+/// turned so that its padding lies between real rows, verify (the segment
+/// AIR, proved and verified masked). In the memory ledger a run of real
+/// rows after padding starts with a `ts = 0` write and every group ends
+/// with a closing read, a byte's the listed page's alone (`MemoryPageChip`,
+/// a page once: its leaf the trie's one at its index); in the register
+/// ledger each real row after padding starts a chain, which must be its
+/// register's `ts = 0` write, the boundary chip's one a register. So each
+/// byte is one group and each register one chain wherever padding lies.
+/// The device's byte ledger, which lets a byte have two boundary rows, is
+/// not (`device::memory::byte_ledger_padding_between_real_rows_is_accepted_today`).
+#[test]
+fn padding_between_the_ledgers_real_rows_is_harmless() {
+    use vos_pvm_proof::chips::memory;
+    let format = format();
+    for (chip, is_padding) in [
+        (chip_idx::MEMORY, memory::Column::IsPadding.offset()),
+        (
+            chip_idx::REGISTER_MEMORY,
+            register_memory::Column::IsPadding.offset(),
+        ),
+    ] {
+        let at = position(chip);
+        let tamper = |trace: &mut MaskedSegmentTrace| pad_inside(trace, at, is_padding);
+        let proof = forced::<P2MerkleChannel>(&format, 6, tamper, |_, _| {}, true)
+            .expect("the ledger takes padding anywhere");
+        verify::<P2MerkleChannel>(&format, &proof).expect("verifies");
+    }
+}
+
 /// The blinding's soundness: a relation unbalanced (a byte's multiplicity
 /// in the range table one more) is refused by its logup total; with the
 /// CPU's blinding fraction moved to cancel it once the relations are drawn,

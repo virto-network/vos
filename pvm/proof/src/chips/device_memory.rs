@@ -21,10 +21,15 @@
 //! it and requires it to close its address's group, so no choice of it lets
 //! an access go unread.
 //!
-//! Two rows for one byte are harmless: the ledger keeps one group per
-//! address, both rows' `ts = 0` writes carry the same first touch (the
-//! table's or zero) and both closing reads chain in that group, so a
-//! duplicated first touch stages no stale read.
+//! Nothing keeps a byte to one row. In one sorted run of the ledger a
+//! second row does not balance: its `ts = 0` write is no group's start,
+//! and only a start consumes the permission it carries. But `MemoryChip`
+//! fixes no place for its padding and its sortedness gadget does not fire
+//! across a padding row, so its real rows may be several sorted runs, each
+//! holding a group of the byte that one of its rows starts and closes: a
+//! read in one group then misses the writes in another. Under this chip
+//! the byte ledger does not keep one group a byte; the word ledger, its
+//! padding past the real rows, does.
 
 use crate::prelude::*;
 use num_traits::{One, Zero};

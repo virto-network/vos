@@ -133,9 +133,10 @@ then force:
   `before_byte`.
 
 New MemoryChip structural constraints (forward-only, next-row masks; the
-guaranteed ≥1 padding row makes the cyclic wrap a padding transition, which
-is **load-bearing**: it is what lets the group-start rule cover natural row 0
-via the wraparound):
+trace generator's ≥1 padding row makes the cyclic wrap a padding transition,
+which lets the group-start rule cover natural row 0 via the wraparound; the
+AIR fixes no place for padding, so the real rows may be several sorted runs,
+and a byte is one group because its page's boundary is produced once):
 - **group start** — gate `g := is_real_next · (1 − is_same_addr)` (on
   padding→real wrap, `is_same_addr` is constraint-forced 0, so `g = 1` and
   row 0 is covered): `g · ts_next[i] = 0` for all 8 limbs, and

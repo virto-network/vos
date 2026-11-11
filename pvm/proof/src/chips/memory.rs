@@ -36,6 +36,14 @@ use crate::{
 /// (address, 2·timestamp + is_write): at one timestamp an address's reads
 /// precede its writes. For consecutive accesses to the same address, reads
 /// must return the value from the last write.
+///
+/// The AIR fixes no place for the padding, and the sortedness gadget does
+/// not fire across a padding row, so the real rows may be several sorted
+/// runs. Each run starts with a `ts = 0` write and every group ends with a
+/// closing read, so an address is one group, its first touch the one
+/// written, when its boundary produces its `ts = 0` write once: the page
+/// boundary does (`MemoryPageChip`, a page once in the trie);
+/// `DeviceMemoryChip`, which lets a byte have several rows, does not.
 #[derive(Clone, Copy)]
 pub struct MemoryChip;
 
@@ -334,8 +342,10 @@ impl BuiltInComponent for MemoryChip {
         );
 
         // Group start: the next row (first of a new address group) is a ts=0
-        // write.  The guaranteed ≥1 padding row makes the cyclic last→row-0
-        // wrap a group start, so natural row 0 is covered.
+        // write.  The trace generator's ≥1 padding row makes the cyclic
+        // last→row-0 wrap a group start, so natural row 0 is covered; the AIR
+        // does not require that row, and a trace with none is one cycle of
+        // one address at one sort key, which no run's producers can fill.
         for limb in &timestamp_next {
             eval.add_constraint(is_group_start[0].clone() * limb.clone());
         }
@@ -347,8 +357,9 @@ impl BuiltInComponent for MemoryChip {
         // ── Page permissions ──────────────────────────────────────────────
         // Every address group starts with its page's ts=0 write, which
         // MemoryPageChip produces carrying the page's proven permission
-        // (`2·permission` in the tuple's last field; no other producer
-        // emits ts = 0). The group holds it, and every row after the start
+        // (`2·permission` in the tuple's last field; on a device run
+        // DeviceMemoryChip does, and no other producer emits ts = 0). The
+        // group holds it, and every row after the start
         // obeys it: a write needs a writable page; an unreadable page's
         // start is followed by its closing read, so no step, BLAKE2b or
         // witness-input access lands in it.

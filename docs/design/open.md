@@ -59,17 +59,77 @@ The scale results are in `core-model.md` §14, "The scale test".
   `Cpu::PerProgram`, `proving.md` §8), measured on the phone. The
   per-program CPU for node segments is later. The 4-way CPU split by
   opcode family is not built.
-- **Format 46's byte ledger leaves its padding's place free:** no
-  constraint keeps MemoryChip's padding past its real rows, and no
-  sortedness gadget fires across a padding row, so a trace with padding
-  between two runs of real rows verifies (the word ledger's gate
-  `padding_between_real_rows_is_refused`, its honest trace turned so,
-  pointed at the byte ledger: the proof verifies [checked, 2026-11-09]). With DeviceMemoryChip's rows unsorted and a byte's
-  row allowed twice, a byte's accesses could then split into two groups,
-  its writes in one and its reads in the other, the reads seeing the
-  first touch. The word ledger closes it (padding past the real rows by a
-  preprocessed last-row column); format 46's fix is an AIR change, so a
-  format of its own or format 47 retiring 46.
+- **Format 46 does not keep its memory consistent: retire it behind 47**
+  [reviewed, 2026-11-10]. `MemoryChip` fixes no place for its padding and
+  its sortedness gadget does not fire across a padding row (`both_real`
+  zeroes the ordering delta), so its real rows may be several sorted
+  runs; every run starts with a `ts = 0` write (`IsGroupStart`, also on a
+  padding→real step) and every group ends with a closing read
+  (`IsGroupEnd`, also on a real→padding step). A byte is one group, and
+  its reads the last write's or its first touch, when its boundary
+  produces its `ts = 0` write once. Per ledger:
+  - **Segments (41, the AIR 32's leaves verify):** consistent. A byte's
+    boundary tuples are its listed page's alone (the CPU's, the
+    precompiles' and the witness input's carry 0 in the last field and a
+    timestamp ≥ 1, the verifier's `initial_state.timestamp ≥ 1` and the
+    chain's entry at 1), and a page is listed once: its 32 aligned rows
+    are real together, its leaf `(20, index)` is produced once, and the
+    `MerkleNode` balance down from the root's one consumption takes each
+    index once. The register ledger: a chain starts only with a register's
+    `ts = 0` write (`ChainStartH`), the boundary chip's thirteen, bound to
+    the public registers. The program memory is a preprocessed read-only
+    table. Padding inside both ledgers verifies, harmless (gate
+    `segment::gates::padding_between_the_ledgers_real_rows_is_harmless`,
+    on the segment AIR proved masked; the masked segment verifier has no
+    `initial_state.timestamp ≥ 1` check yet, which it needs before any
+    masked segment format is admitted). 28, 32 and 39 prove the recursion
+    AIR, which has no memory argument.
+  - **Device 46: not consistent, and admitted.** `DeviceMemoryChip` lets
+    a byte have as many rows as the prover puts (its address bits free, no
+    ordering, `Last` and `ClosingTs` free), so a byte can have two groups,
+    each in a sorted run of its own and started and closed by its own
+    boundary row: a read in the second sees the byte's first touch, or any
+    write placed with it, instead of the last write before it. It needs one
+    spare `DeviceMemoryChip` row and about four spare ledger rows at the
+    program's log sizes (auth's ledger: 12,754 of 2^14 rows). In one sorted run a
+    second boundary row does not balance (its `ts = 0` write is no start,
+    and only a start consumes the permission), so the gap needs both. On
+    paper a riscv64 kernel's stack spill reloads its first touch (zero) or
+    an older spill, so a value the kernel's control flow reads back, a
+    check's result among them, could be another. Its register ledger
+    (`DeviceBoundaryChip`'s preprocessed registers, entry at timestamp 1)
+    and program memory are consistent. Gate
+    `device::memory::byte_ledger_padding_between_real_rows_is_accepted_today`
+    holds the byte ledger's acceptance of padding inside it (the shape's
+    byte ledger, not entry 46) and flips when the ledger takes a last-row
+    column.
+  - **Device 47 (the word ledger):** consistent. `IsLast` keeps padding
+    past the real rows, one sorted run, a word one group; a second
+    boundary row's `ts = 0` write has no start to consume it (gates
+    `padding_between_real_rows_is_refused`,
+    `a_word_touched_twice_at_the_boundary_is_refused`). Its register
+    ledger and program memory are 46's. A cheap hardening before it ships:
+    `IsLast · (1 − IsPadding) = 0`, the last row padding, which removes the
+    all-real cyclic trace (every row one word at one sort key, no group
+    start); today it is excluded only because such a ledger consumes
+    nothing else: at least 16 rows each take a byte tuple at one word,
+    timestamp and direction, which one BLAKE2b call's overlapping reads can
+    put, but the call's writes and every other tuple of the run would go
+    unconsumed.
+
+  The fix for 46 is retiring it behind 47: ingress refusing 46 is part of
+  shipping 47, and until then a device proof under 46 can lie about a
+  read. Device proofs are in no leaf, fold, wrap, venue or `MANIFEST` pin,
+  so the cost is the device programs' re-pin 47 makes anyway.
+  Keeping a byte-ledger device format instead takes a format number of
+  its own: the word ledger's `IsLast` on `MemoryChip` under the device
+  shape alone (one preprocessed column and one degree-3 constraint, about
+  0.2% of the auth kernel's cells), new device program ids; on the segment
+  AIR it would be a new segment format with its leaf, folds, wrap and
+  pins for no soundness gain, so it waits for the next segment format as
+  hardening. Sorting `DeviceMemoryChip`'s rows strictly by address closes
+  it too, but needs a last-row column there as well and about 30 more
+  columns a boundary row.
 - **Segment proving levers** (`proving.md` §9): the 36 cubic gates
   rewritten, narrow BLAKE2b chips, a lighter page boundary or one memory
   argument across segments, and folding device proofs (the recursion
