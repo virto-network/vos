@@ -33,8 +33,8 @@ toml = "1"
 [dev-dependencies]
 # The headless client: s4's protocol, and the `vos.credential` facility
 # proving with this tree's device library.
-s4-protocol = { git = "https://codeberg.org/Virto/s4", rev = "ed26db9639408f9da236048bc9ea0d8742f71a01" }
-s4-credential = { git = "https://codeberg.org/Virto/s4", rev = "ed26db9639408f9da236048bc9ea0d8742f71a01" }
+s4-protocol = { git = "https://codeberg.org/Virto/s4", rev = "17b07de44a94e63fa5a912f53b1894adbc6e13b4" }
+s4-credential = { git = "https://codeberg.org/Virto/s4", rev = "17b07de44a94e63fa5a912f53b1894adbc6e13b4" }
 # The stock kernels' release artifacts, from this tree's credential actor.
 vos-light = { path = "../../light", features = ["release"] }
 hmac = "0.12"
