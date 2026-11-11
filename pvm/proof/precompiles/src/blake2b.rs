@@ -52,9 +52,8 @@ pub fn blake2b_compress(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: bool) {
 }
 
 /// [`blake2b_compress`] on words: the state's eight and the block's
-/// sixteen, each little-endian as BLAKE2b reads it. A caller that builds
-/// its block from words moves no byte: the guest target has no misaligned
-/// access, so a byte array moves byte by byte.
+/// sixteen, each little-endian as BLAKE2b reads it: a caller that builds
+/// its block from words moves no byte.
 pub fn blake2b_compress_words(h: &mut [u64; 8], m: &[u64; 16], t: u128, f: bool) {
     // The guest is little-endian: the words' bytes are the block's.
     #[cfg(target_arch = "riscv64")]

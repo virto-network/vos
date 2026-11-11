@@ -89,31 +89,16 @@ impl<const N: usize> Encode for InPlace<N> {
 }
 
 /// The eight bytes at `at`, any alignment, little-endian: on the guest in
-/// one load, which the PVM serves at any address (the target's own
-/// unaligned reads go byte by byte).
+/// one load, which the PVM serves at any address and the guest target
+/// (`unaligned-scalar-mem`) emits whole.
 ///
 /// # Safety
 ///
 /// `at` must point at eight readable bytes.
 #[inline(always)]
 unsafe fn load_u64(at: *const u8) -> u64 {
-    #[cfg(target_arch = "riscv64")]
-    // SAFETY: the caller's contract; the load touches nothing else.
-    unsafe {
-        let word: u64;
-        core::arch::asm!(
-            "ld {word}, 0({at})",
-            word = out(reg) word,
-            at = in(reg) at,
-            options(nostack, readonly, preserves_flags),
-        );
-        word
-    }
-    #[cfg(not(target_arch = "riscv64"))]
     // SAFETY: the caller's contract.
-    unsafe {
-        u64::from_le(core::ptr::read_unaligned(at.cast()))
-    }
+    u64::from_le(unsafe { core::ptr::read_unaligned(at.cast()) })
 }
 
 /// Stores `word` at `at`, any alignment, little-endian: on the guest in one
@@ -124,21 +109,8 @@ unsafe fn load_u64(at: *const u8) -> u64 {
 /// `at` must point at eight writable bytes.
 #[inline(always)]
 unsafe fn store_u64(at: *mut u8, word: u64) {
-    #[cfg(target_arch = "riscv64")]
-    // SAFETY: the caller's contract; the store touches nothing else.
-    unsafe {
-        core::arch::asm!(
-            "sd {word}, 0({at})",
-            word = in(reg) word,
-            at = in(reg) at,
-            options(nostack, preserves_flags),
-        );
-    }
-    #[cfg(not(target_arch = "riscv64"))]
     // SAFETY: the caller's contract.
-    unsafe {
-        core::ptr::write_unaligned(at.cast::<[u8; 8]>(), word.to_le_bytes())
-    };
+    unsafe { core::ptr::write_unaligned(at.cast::<[u8; 8]>(), word.to_le_bytes()) };
 }
 
 /// The `0x402` call on the sixteen words at `input`, its eight out at
