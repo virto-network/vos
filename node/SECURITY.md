@@ -315,6 +315,120 @@ facility (`identity-and-authority.md` §7):
   after a withheld one cannot pay twice; a `once` guard's nullifier admits
   it at most once whenever it lands.
 
+## The onion
+
+A space's gateways host its onion service in process (arti, `vos-gateway`'s
+`tor` feature; `light-node.md` §6.1, §6.6, §6.7): its port 80 is the
+gateway's HTTP, its port 22 the gateway's SSH (s4's screens and the
+`vos-api` subsystem, whose relay set holds `Call` and `Credentialed`), any
+other port refused. What that changes for the node and its operators:
+
+- **What Tor fixes:** no node or gateway learns a Tor client's network
+  address, so a proof's nullifier, a feed read and a personal agent's
+  traffic arrive with no address behind them, each on a circuit of its
+  own (one a purpose, `node/light/SECURITY.md`); a gateway that marks a
+  feed with a root of its own (above) loses the address it would have
+  linked the proof to, and keeps only the circuit.
+- **What Tor does not fix:** the timing of a feed read and a proof, which
+  a gateway sees on two circuits it may correlate by time; the `map_root`
+  a proof names, which within a timer period of a tree change sets apart
+  the members who have not read the change (above); small anonymity sets
+  (a tree of fifty is fifty however the bytes travel); a global observer
+  correlating both ends of Tor; what a request carries itself (a member's
+  signed call names its key, a personal agent's call its sync key); and
+  Tor's own maturity: arti's onion-service hosting is not declared
+  production-ready, and its service-side proof of work is behind the
+  `tor-pow` feature, off by default.
+- **The transport mark.** The gateway marks every frame with the
+  transport it took (`Mark::Onion` for the onion's ports, `Clearnet`
+  otherwise), whatever the client marked; the node's ingress may refuse
+  anonymous calls without the onion's mark, or every request
+  (`onion = "anonymous" | "all"`, `node-api.md` §3). The mark is the
+  gateway's word: a space trusts its gateways to mark truly, as it trusts
+  them to relay. A personal agent takes nothing without it (E17).
+- **No address to limit.** A Tor client has no address, so the
+  gateway's limits per address count each circuit as an address of its
+  own, and cap streams a circuit, circuits at once, proven calls in
+  flight through the onion, from one connection and from one circuit,
+  and an agent's calls from one circuit (`node-api.md` §6). A client may
+  open as many circuits as Tor lets it: the per-circuit caps bound one
+  circuit, the onion's global caps and the node's verification budget
+  bound them all, and a flood of well-formed junk proofs through a
+  private Tor network was held by Tor itself to about fifteen a second,
+  members' sign-ins served throughout (`light-node.md` §6.6, measured on
+  chutney, not on the live network).
+- **Not capped per circuit:** the demo's screens' own calls (s4's
+  host-service calls carry no peer), which only the server's bound per
+  session holds; and the onion's SSH server takes s4-server's connection
+  cap (128) with no idle timeout of its own (`docs/design/open.md`).
+- **The onion's key is the gateway's identity,** self-authenticating:
+  a gateway that holds it is the space's onion, and the registrar serves
+  the space's onion set unsigned (`set_onions`, `onions`), as any answer a
+  gateway relays (`light-node.md` §8, H5). A client pins the set and each
+  onion's SSH host key at enrollment and refuses a host key it did not
+  pin; s4 refuses its own clearnet connection to a gateway presenting a
+  key a space pinned to its onion, however its name is written.
+- **Audited** (`just test-carriers`, `node/gateway/demo/tests/carriers.rs`):
+  a member's sign-ins by the stock auth kernel (one of them proved with
+  its masks' randomness watched), a cut proof and an owner's payment, each
+  made by the light node's Tor client and carried by the gateway's onion
+  in process (each stream handed to the onion's SSH port on a circuit of
+  its own, as arti hands them), the tree read from its feed on one
+  connection and the node's time on others. No carrier holds the member's
+  device secret or a proof's masks: each circuit's bytes each way, what
+  the client sent and read on each purpose's connections, every frame
+  the gateway relayed to the node and its answers, the light node's
+  values, every log line of the process at every level, standard error,
+  and the node's store, log and disk. No carrier of a proven call holds
+  where its member sits; the feed's connection and the gateway's frames to
+  the node hold the whole tree by design, not the member's digest. Tor's
+  own cells (arti's onion encryption) are not in the test: the streams are
+  handed over in process.
+
+## The home and its personal agents
+
+A home is a space whose agent holds the credential actor and `Homes` in
+front of a pool of personal agents (`light-node.md` §3.3); each agent runs
+`Personal`, holds a user's ciphertext and a small log of rare operations,
+and takes requests only through the onion, only from the keys its log
+admitted. What its operators are trusted with, and the limits that stay
+(`light-node.md` §8.2, §8.8):
+
+- **Trusted for availability, order and time, not for contents:** the
+  operators can withhold or delay sync (devices work offline as full
+  replicas, and after 7 days without the agent the app offers to move
+  home, B1), delete envelopes (each device samples what it pushed and
+  pushes again what is missing, B2), roll an agent back or equivocate
+  (raising an alarm on the control log's chain and the views sealed in
+  envelopes, though nodes sign nothing a device could show a third party,
+  B3, B4), and advance the agent's clock to mature a hostile removal or
+  restore early (B7): every delay trusts the operators' clock, a known
+  limit. They cannot forge an envelope (B5) or a device-set operation,
+  each signed by a device's admin key or the kit and checked by every
+  device (B6).
+- **Collusion with a thief or a removed device** can drop vetoes, order
+  the thief's operations first and serve a removed device data for up to
+  six days; acting alone they can hold back a genuine commit until a
+  device is quiet and name it absent, locking it out until it re-pairs or
+  regroups (B8). The owner's remedies are two seasoned devices' immediate
+  removal and moving home.
+- **What the operators see:** the agent's id, its sync keys and admin
+  keys, each scope's opaque id, the sizes, counts and times of its
+  envelopes and commits (padded, not hidden, C8), its quota and lease; not
+  a byte of the user's data. At a home-only space the claim and each
+  device's open claim name no member the operators know elsewhere; a home
+  that is the user's own space links the agent to the member (L1, L5),
+  which the app states.
+- **The lease and the pool.** An agent lapses when its yearly re-proof
+  stops (an expelled member's included), 13 months after the last, into
+  180 days of grace in which it serves reads, a restore, a removal and a
+  move and refuses pushes (B14); reaping after the grace is later work. Open claims are bounded by a daily cap
+  and work, a bound on griefing and not a price (L11); the pool's
+  `PoolEmpty` and the cap's refusal stop claims, never another user's
+  agent (B11).
+- **A home with one replica** loses the agent with its node; devices stay
+  full replicas, and the chrome shows the replica count (B10).
+
 ## Replay and custody
 
 - **A replay answered by a replica that forwarded it** (`Replayed`, the

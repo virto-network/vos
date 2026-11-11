@@ -200,6 +200,21 @@ The scale results are in `core-model.md` §14, "The scale test".
   (`node/SECURITY.md`).
 - **The credential facility's gaps** (`identity-and-authority.md` §7):
   forgetting an enrollment, the claim order.
+- **The onion's screens, their last limits** (`light-node.md` §6.1,
+  `node/SECURITY.md`, "The onion"): a session of the onion's screens has at
+  most four host-service calls in flight, which bounds one circuit's by its
+  connections and sessions, but s4's host-service requests name no peer,
+  so no rate a circuit holds them to; and the onion's SSH server takes
+  s4-server's connection cap (128) with no idle timeout of its own
+  (russh's inactivity timeout is reset by the keepalives a live client
+  answers, so an idle close needs s4-server to count a connection's
+  channel traffic). Both need s4-server's work.
+- **The kit's own device-set calls on a phone:** s4's facility signs a
+  resolution and a removal with a device's admin key only; a contest
+  resolved by the kit, and the kit alone removing a phone that holds only
+  a sync key (PG3′), are driven in `node/light/tests/sealed/kit.rs` and
+  need the facility's kit-signed `resolve` and `remove` (and their
+  screens) before a phone runs them.
 - **The registry and the root space** (`identity-and-authority.md` §12): the registry agent on JAM, the
   root space under a charter, the handover triggers' numbers, and the rules
   for exit and disputes.

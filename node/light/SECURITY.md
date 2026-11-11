@@ -348,3 +348,82 @@ not (`light-node.md` §6.2–§6.7).
 - **Plain bridges only:** a pasted line naming a pluggable transport is
   refused, so a network that blocks Tor by inspection blocks the
   anonymous calls and the personal space, which wait (§8, H2).
+- **Rendezvous are counted** (`Client::opened`): each hour's onion
+  connections by purpose, the foreground's apart from the background's,
+  so a phone shows what its schedule costs (PG5: at most 30 an hour in
+  the foreground). A kept-open purpose costs one rendezvous while it is
+  used within its idle limit; a proven call and a fetch one each; the
+  spare one ahead. Each rendezvous is a descriptor fetch, an
+  introduction and a rendezvous circuit of its own.
+
+## What Tor fixes, and what it does not
+
+What going over the onion changes for a device (`light-node.md` §6.7):
+
+- **Fixes:** no node or gateway learns the device's network address, so
+  a proof's nullifier links to no address, a feed read and a proof arrive
+  on different circuits, and the personal agent sees pushes and fetches
+  with no address behind them; a gateway that marks a feed with a root of
+  its own keeps only the feed connection's circuit, not an address.
+- **Does not fix:** the timing of what a device sends (a gateway may join
+  two circuits by time: the feed's timer keeps its reads apart from
+  proofs, no more); the `map_root` a proof names, which within a timer
+  period of a tree change sets apart the members who have not read it;
+  small anonymity sets; a global observer correlating both ends of Tor;
+  what a request carries itself (a member's signed call names its key,
+  the personal agent's calls the device's sync key, an `alive` or a veto
+  its time); and Tor's own maturity (arti pinned at one version a
+  release, its hosting not declared production-ready).
+- **Blocked networks:** plain bridges defeat a blocked relay list; deep
+  packet inspection, with no pluggable transport, stops the anonymous
+  calls and the personal space, which wait and say so, while the veto and
+  `alive` windows run without the device (H2). Key-signed calls may take
+  the clearnet only where the space allows it and the user opted out.
+- **The device's foreground opens the personal space's circuits** when
+  the user opens the app, so the time a member's group and the personal
+  agent's start together is seen by a gateway serving both (L2).
+
+## The personal space's known limits
+
+What the personal agent and the device's keys still leave open
+(`light-node.md` §8; the home's side is `node/SECURITY.md`'s):
+
+- **After first unlock** the sync key and the MLS state work while the
+  screen is locked, so a thief who keeps a stolen phone powered and runs
+  code on it reads the personal space; the admin key stays in the
+  hardware keystore behind the strong biometric (A2). Malware in the
+  app's process reads what the phone reads and holds its sync key: it can
+  push garbage, nack commits, post `alive` and use the device's quota,
+  never commit or sign a device-set operation (A3).
+- **A thief who passes the biometric** can always contest: against him
+  the kit alone does not win; the owner wins with one device and the kit,
+  or two other seasoned devices with strong admins. A thief holding only a
+  sync key loses to the kit alone (A4).
+- **The kit:** alone it opens `R1`, not `R2`; with the operators it reads
+  everything, and a thief holding the kit, a phone and the biometric wins
+  (D3). A home whose onions all changed is found again only through the
+  registry of spaces, not built (D4). The kit holds keys, not data: with
+  every device lost and the home gone or withholding, the restore has
+  nothing to read (D1); with every device and the kit lost, the personal
+  space is gone (D2).
+- **Delays trust the home's clock and its configuration:** an operator
+  who advances the agent's clock, or configures a delay of zero, matures
+  a hostile removal or a restore early on every device (B7, and
+  `Configured` above).
+- **A job that never runs** (a restricted bucket, a force-stop, an OEM
+  battery manager) neither vetoes nor answers `alive` until the user
+  opens the app (D5); the app shows each device's last sync and asks for
+  the battery exemption.
+- **History has no forward secrecy:** the archive holds every confirmed
+  epoch's scope keys, so whoever reads a store reads every scope's past
+  (the device group, above); the exporter itself is not forward-secure
+  either (F3).
+- **Linkability:** at a home that is the user's own space, the claim, the
+  devices' changes and their counts link the agent to the member (L1,
+  L5); P1 transfers between the user's own devices link their owner
+  digests (L4); a `once` scope admits a member once per device (L6); the
+  registrar learns which device leaves are one member's (L7).
+- **Envelopes' sizes, counts and times** are padded, not hidden (C8), and
+  counts are the operators' to see.
+- **A local actor's new state shape** is not migrated: it starts a new
+  scope and the device imports again (D7).
