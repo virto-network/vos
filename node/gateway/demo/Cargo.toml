@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 publish = false
-description = "The s4 demo on a local space: one node of a founded space with the credential actor, the poll and the ledger, and the gateway's SSH port serving the screens; and its end-to-end test, a headless s4 client proving with the device library."
+description = "The s4 demo on a local space: one node of a founded space with the credential actor, the poll and the ledger, and the gateway's SSH port and its onion, hosted by arti, serving the screens; and its end-to-end test, a headless s4 client proving with the device library."
 
 # Outside VOS's workspace: s4's crates ask a newer Rust than the workspace's
 # nightly, which builds them with `--ignore-rust-version`
@@ -16,7 +16,7 @@ name = "vos-gateway-demo"
 path = "src/main.rs"
 
 [dependencies]
-vos-gateway = { path = "..", features = ["ssh"] }
+vos-gateway = { path = "..", features = ["tor"] }
 vos-node = { path = "../../host" }
 vos-testkit = { path = "../../../agent/testkit" }
 vos-wire = { path = "../../../agent/wire" }
@@ -28,12 +28,13 @@ tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "io-std", "io-util", "signal"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 russh = { version = "0.61", default-features = false, features = ["ring", "flate2"] }
+toml = "1"
 
 [dev-dependencies]
 # The headless client: s4's protocol, and the `vos.credential` facility
 # proving with this tree's device library.
-s4-protocol = { git = "https://codeberg.org/Virto/s4", rev = "ed26db9639408f9da236048bc9ea0d8742f71a01" }
-s4-credential = { git = "https://codeberg.org/Virto/s4", rev = "ed26db9639408f9da236048bc9ea0d8742f71a01" }
+s4-protocol = { git = "https://codeberg.org/Virto/s4", rev = "17b07de44a94e63fa5a912f53b1894adbc6e13b4" }
+s4-credential = { git = "https://codeberg.org/Virto/s4", rev = "17b07de44a94e63fa5a912f53b1894adbc6e13b4" }
 # The stock kernels' release artifacts, from this tree's credential actor.
 vos-light = { path = "../../light", features = ["release"] }
 hmac = "0.12"

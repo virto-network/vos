@@ -30,7 +30,6 @@ use vos_api::{Event, FrameError, Framing, Kind, Mark, Reader, Requests, error_fr
 
 use crate::Gateway;
 use crate::caps::{Caps, busy};
-use crate::circuits::Circuits;
 use crate::limits::Limits;
 
 /// The subsystem's name.
@@ -45,48 +44,40 @@ pub const DEADLINE: Duration = Duration::from_secs(60);
 /// measured rate (`light-node.md` §6.3), with room.
 pub const LARGE_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Whose channels a port serves, and how it counts them.
-#[derive(Clone)]
-pub enum Peers {
-    /// A TCP port's: each by its peer's address.
-    Addresses,
-    /// The onion's: each by the stream its loopback carrier names, a port
-    /// of its circuit's address; a connection no stream carries is served
-    /// no channel.
-    Carried(Arc<Circuits>),
-}
-
 /// What a port's relay counts and caps: the transport it marks, its limits
-/// per address (or circuit), its caps on calls, and the proven calls'
-/// bodies it shares with the gateway's other ports.
+/// per address (an onion's: per circuit, each stream a port of its
+/// circuit's address, [`crate::circuits`]), its caps on calls, and the
+/// proven calls' bodies it shares with the gateway's other ports.
 #[derive(Clone)]
 pub struct Port {
     pub mark: Mark,
     pub limits: Arc<Limits>,
     pub caps: Arc<Caps>,
     pub bodies: Arc<Semaphore>,
-    pub peers: Peers,
 }
 
 impl Port {
-    /// A TCP port marking `mark`, its limits and caps as given, and the
-    /// bodies it shares.
-    pub fn tcp(mark: Mark, limits: Arc<Limits>, caps: Arc<Caps>, bodies: Arc<Semaphore>) -> Self {
+    /// A port marking `mark`, its limits and caps as given, and the bodies
+    /// it shares.
+    pub fn new(mark: Mark, limits: Arc<Limits>, caps: Arc<Caps>, bodies: Arc<Semaphore>) -> Self {
         Self {
             mark,
             limits,
             caps,
             bodies,
-            peers: Peers::Addresses,
         }
     }
+}
 
-    /// The address a channel from `peer` counts as, or `None` when the
-    /// port serves it no channel.
-    fn connection(&self, peer: Option<SocketAddr>) -> Option<Option<SocketAddr>> {
-        match &self.peers {
-            Peers::Addresses => Some(peer),
-            Peers::Carried(circuits) => peer.and_then(|peer| circuits.carried(peer)).map(Some),
+/// The onion's SSH streams as the SSH server's connections, each from its
+/// stream's address.
+impl s4_server::Listener for crate::circuits::OnionListener {
+    type Stream = Box<dyn crate::circuits::Io>;
+
+    async fn accept(&mut self) -> std::io::Result<(Self::Stream, Option<SocketAddr>)> {
+        match self.next().await {
+            Some((stream, peer)) => Ok((stream, Some(peer))),
+            None => Err(std::io::ErrorKind::BrokenPipe.into()),
         }
     }
 }
@@ -149,9 +140,7 @@ pub fn server(
         .subsystem_fn(SUBSYSTEM, move |channel| {
             let (gateway, port) = (Arc::clone(&gateway), port.clone());
             async move {
-                let Some(connection) = port.connection(channel.peer()) else {
-                    return;
-                };
+                let connection = channel.peer();
                 // A channel holds a place among its address's, as an HTTP
                 // connection does.
                 let place = match connection {
@@ -192,7 +181,7 @@ pub fn serve(
     gateway: Arc<Gateway>,
     port: Port,
     app: Option<Arc<crate::app::AppClient>>,
-    listener: tokio::net::TcpListener,
+    listener: impl s4_server::Listener + 'static,
 ) -> Result<tokio::task::JoinHandle<()>, String> {
     let path = config
         .ssh_host_key
@@ -216,10 +205,11 @@ pub fn serve(
         (Some(_), None) => return Err("the demo's screens need app_key".into()),
         (None, _) => None,
     };
+    let mark = port.mark;
     let server = server(host_key, gateway, port, demo);
     Ok(tokio::spawn(async move {
         if let Err(error) = server.serve_on(listener).await {
-            tracing::warn!(%error, "an SSH port ended");
+            tracing::warn!(%error, ?mark, "an SSH port ended");
         }
     }))
 }

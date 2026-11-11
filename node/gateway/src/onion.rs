@@ -4,7 +4,7 @@
 //! service-side proof of work behind the `tor-pow` feature and the file's
 //! `pow`. Each rendezvous takes a place among the onion's circuits (past
 //! them it is not answered) and a number; its streams to port 22 and 80
-//! go to the onion's SSH port and HTTP server ([`crate::circuits`]), any
+//! go to the onion's SSH and HTTP servers ([`crate::circuits`]), any
 //! other refused as an unserved port is, with `DONE`. A circuit holding no
 //! stream for [`IDLE`] is let go.
 

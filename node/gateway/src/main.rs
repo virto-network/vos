@@ -73,7 +73,7 @@ fn run(cli: Cli) -> Result<(), String> {
         let ssh = vos_gateway::ssh::start(
             &config,
             Arc::clone(&gateway),
-            vos_gateway::ssh::Port::tcp(
+            vos_gateway::ssh::Port::new(
                 Mark::Clearnet,
                 Arc::clone(&limits),
                 Caps::none(),
@@ -82,16 +82,20 @@ fn run(cli: Cli) -> Result<(), String> {
             app.clone(),
         )
         .await?;
+        #[cfg(feature = "tor")]
         let onion = match &config.onion {
             Some(onion) => {
-                Some(vos_gateway::served::onion(&config, onion, Arc::clone(&gateway)).await?)
+                let served =
+                    vos_gateway::served::onion(&config, onion, Arc::clone(&gateway)).await?;
+                println!("onion {}", served.hosted.address);
+                println!("onion key {}", hex::encode(served.hosted.key));
+                Some(served)
             }
             None => None,
         };
-        #[cfg(feature = "tor")]
-        if let Some(hosted) = onion.as_ref().and_then(|served| served.hosted.as_ref()) {
-            println!("onion {}", hosted.address);
-            println!("onion key {}", hex::encode(hosted.key));
+        #[cfg(not(feature = "tor"))]
+        if config.onion.is_some() {
+            return Err("an onion needs a gateway built with the tor feature".into());
         }
         let http = Http {
             tls,
@@ -107,6 +111,7 @@ fn run(cli: Cli) -> Result<(), String> {
         if let Some(ssh) = ssh {
             ssh.abort();
         }
+        #[cfg(feature = "tor")]
         drop(onion);
         Ok(())
     })

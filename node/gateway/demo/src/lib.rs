@@ -270,7 +270,7 @@ impl LocalSpace {
         )]));
         let mark = vos_api::Mark::Clearnet;
         let app = Arc::new(AppClient::new(app, Arc::clone(&gateway), mark));
-        let port = vos_gateway::ssh::Port::tcp(
+        let port = vos_gateway::ssh::Port::new(
             mark,
             Limits::new(PerAddress::default()),
             vos_gateway::caps::Caps::none(),
@@ -285,6 +285,122 @@ impl LocalSpace {
             if let Err(error) = server.serve_on(listener).await {
                 eprintln!("the SSH port ended: {error}");
             }
+        })
+    }
+}
+
+/// The demo's gateway as `vos-gateway` serves it: its SSH port and the
+/// onion arti hosts for it, each serving the demo's screens.
+pub struct Hosted {
+    /// The onion's address, `….onion`.
+    pub onion: String,
+    /// The SSH host key both ports present, its fingerprint.
+    pub fingerprint: String,
+    ssh: tokio::task::JoinHandle<()>,
+    _served: vos_gateway::served::Served,
+}
+
+impl Drop for Hosted {
+    fn drop(&mut self) {
+        self.ssh.abort();
+    }
+}
+
+impl LocalSpace {
+    /// The gateway's file for this space, its keys and arti's state under
+    /// `data`, its SSH port on `ssh`.
+    fn gateway_file(
+        &self,
+        data: &Path,
+        ssh: SocketAddr,
+    ) -> Result<vos_gateway::config::Config, String> {
+        let demo = self.demo();
+        let at = |name: &str| data.join(name).display().to_string();
+        let text = format!(
+            r#"
+key = "{key}"
+http = "127.0.0.1:0"
+nodes = [{{ key = "{node}", address = "unix:{socket}" }}]
+ssh = "{ssh}"
+ssh_host_key = "{host_key}"
+app_key = "{app_key}"
+
+[demo]
+agent = {agent}
+credentials = {credentials}
+payments = {payments}
+poll = {poll}
+
+[onion]
+state = "{state}"
+cache = "{cache}"
+key = "{onion}"
+"#,
+            key = at("gateway.key"),
+            node = hex::encode(self.node.id().0),
+            socket = self.socket.display(),
+            host_key = at("ssh_host_key"),
+            app_key = at("app.key"),
+            agent = demo.agent,
+            credentials = demo.credentials,
+            payments = demo.payments,
+            poll = demo.poll,
+            state = at("onion/state"),
+            cache = at("onion/cache"),
+            onion = at("onion.key"),
+        );
+        let config: vos_gateway::config::Config =
+            toml::from_str(&text).map_err(|error| error.to_string())?;
+        config.check()?;
+        Ok(config)
+    }
+
+    /// The gateway `vos-gateway` would serve for this space, its keys and
+    /// arti's state kept under `data`: its SSH port on `ssh` and its onion,
+    /// hosted by arti over the live Tor network, the enrollment pinning
+    /// that onion and the SSH host key both present.
+    pub async fn host(&self, data: &Path, ssh: SocketAddr) -> Result<Hosted, String> {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(data.join("onion"))
+            .map_err(|error| error.to_string())?;
+        let config = self.gateway_file(data, ssh)?;
+        let gateway = Arc::new(Gateway::new(
+            config
+                .upstreams()?
+                .into_iter()
+                .map(|(key, address)| Upstream::new(key, address, random()))
+                .collect(),
+        ));
+        let mark = vos_api::Mark::Clearnet;
+        let app = vos_gateway::config::seed(config.app_key.as_ref().expect("the file's app key"))?;
+        let app = Arc::new(AppClient::new(app, Arc::clone(&gateway), mark));
+        let port = vos_gateway::ssh::Port::new(
+            mark,
+            Limits::new(PerAddress::default()),
+            vos_gateway::caps::Caps::none(),
+            vos_gateway::caps::bodies(),
+        );
+        let listener = tokio::net::TcpListener::bind(ssh)
+            .await
+            .map_err(|error| format!("{ssh}: {error}"))?;
+        let ssh =
+            vos_gateway::ssh::serve(&config, Arc::clone(&gateway), port, Some(app), listener)?;
+        let onion = config.onion.as_ref().expect("the file's onion");
+        let served = vos_gateway::served::onion(&config, onion, gateway).await?;
+        let host_key = config.ssh_host_key.as_ref().expect("the file's host key");
+        let fingerprint = russh::keys::load_secret_key(host_key, None)
+            .map_err(|error| format!("{}: {error}", host_key.display()))?
+            .public_key()
+            .fingerprint(russh::keys::ssh_key::HashAlg::Sha256)
+            .to_string();
+        Ok(Hosted {
+            onion: served.hosted.address.clone(),
+            fingerprint,
+            ssh,
+            _served: served,
         })
     }
 }

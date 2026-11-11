@@ -3,9 +3,8 @@
 //! limits per address and leader-aware routing; with the `ssh` feature,
 //! s4's SSH port and its `vos-api` subsystem; with the `tor` feature, an
 //! onion service in process serving the same SSH and HTTP and nothing
-//! else (`light-node.md` §6.1), or the same served behind a C tor beside
-//! it without the feature ([`circuits::sidecar`]). It holds no authority:
-//! every signature, proof and check is a node's.
+//! else (`light-node.md` §6.1). It holds no authority: every signature,
+//! proof and check is a node's.
 
 pub mod app;
 pub mod caps;
@@ -18,6 +17,7 @@ pub mod limits;
 #[cfg(feature = "tor")]
 pub mod onion;
 pub mod routing;
+#[cfg(feature = "tor")]
 pub mod served;
 #[cfg(feature = "ssh")]
 pub mod ssh;

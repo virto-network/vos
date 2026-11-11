@@ -1,8 +1,11 @@
-//! `vos-gateway-demo --data DIR --ssh ADDRESS --onion KEY`: the demo's local
-//! space and its gateway, for a phone that reaches the SSH port (through
-//! `adb reverse`) as `anonymous@ADDRESS`, and sends its proofs to the onion
-//! service whose key is `KEY` (hex), in front of the same port. The
-//! operator's commands come on standard input:
+//! `vos-gateway-demo --data DIR [--ssh ADDRESS]`: the demo's local space
+//! and its gateway as `vos-gateway` serves it: the SSH port on `ADDRESS`
+//! (`127.0.0.1:2222` by default) and the onion arti hosts for it over the
+//! live Tor network, its key and state kept under `DIR`, both serving the
+//! demo's screens. A phone reaches the SSH port (through `adb reverse`) as
+//! `anonymous@ADDRESS` to enroll; the enrollment pins the onion, which then
+//! carries its proofs and its screens. The operator's commands come on
+//! standard input:
 //!
 //! - `invite MEMBER ACCOUNT OWNER`: invite the member digest into the
 //!   credential actor's tree and the account `ACCOUNT` for the owner
@@ -47,64 +50,31 @@ fn command(space: &LocalSpace, line: &str) -> Result<String, String> {
     }
 }
 
-/// The host key whose seed is kept at `path`, made there on the first run so
-/// that a phone which trusted it keeps recognising the gateway.
-fn kept_host_key(path: &std::path::Path) -> Result<russh::keys::PrivateKey, String> {
-    let seed: [u8; 32] = match std::fs::read(path) {
-        Ok(bytes) => bytes
-            .try_into()
-            .map_err(|_| format!("{}: not a 32-byte seed", path.display()))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let seed = random();
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)
-                .and_then(|mut file| file.write_all(&seed))
-                .map_err(|error| format!("{}: {error}", path.display()))?;
-            seed
-        }
-        Err(error) => return Err(error.to_string()),
-    };
-    Ok(russh::keys::PrivateKey::from(
-        russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&seed),
-    ))
-}
-
 fn main() -> Result<(), String> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .init();
     let mut arguments = std::env::args().skip(1);
-    let (mut data, mut ssh, mut onions) = (None, "127.0.0.1:2222".to_owned(), Vec::new());
+    let (mut data, mut ssh) = (None, "127.0.0.1:2222".to_owned());
     while let Some(flag) = arguments.next() {
         match (flag.as_str(), arguments.next()) {
             ("--data", Some(value)) => data = Some(PathBuf::from(value)),
             ("--ssh", Some(value)) => ssh = value,
-            ("--onion", Some(value)) => onions.push(digest(&value)?),
-            _ => {
-                return Err("vos-gateway-demo --data DIR [--ssh ADDRESS] [--onion KEY]".into());
-            }
+            _ => return Err("vos-gateway-demo --data DIR [--ssh ADDRESS]".into()),
         }
     }
     let data = data.ok_or("--data DIR, an empty directory")?;
+    let ssh = ssh
+        .parse()
+        .map_err(|_| format!("{ssh}: not an address and port"))?;
     std::fs::create_dir_all(&data).map_err(|error| error.to_string())?;
-    let space = LocalSpace::found(&data, random(), random())?;
+    let space = LocalSpace::found(&data.join("space"), random(), random())?;
     space.open_account("shop", random::<32>().map(|byte| byte & 0x3f), 0)?;
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
     runtime.block_on(async {
-        let listener = tokio::net::TcpListener::bind(&ssh)
-            .await
-            .map_err(|error| format!("{ssh}: {error}"))?;
-        let host_key = kept_host_key(&data.join("host_key"))?;
-        let fingerprint = host_key
-            .public_key()
-            .fingerprint(russh::keys::ssh_key::HashAlg::Sha256);
-        let _gateway = space.gateway(listener, host_key, random(), onions);
-        println!("ssh anonymous@{ssh}  (host key {fingerprint})");
+        let hosted = space.host(&data, ssh).await?;
+        println!("ssh anonymous@{ssh}  (host key {})", hosted.fingerprint);
+        println!("onion {}", hosted.onion);
         println!("agent {}", space.agent().0);
         let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -117,6 +87,7 @@ fn main() -> Result<(), String> {
                 Err(error) => println!("error: {error}"),
             }
         }
+        drop(hosted);
         Ok::<(), String>(())
     })?;
     space.shutdown();

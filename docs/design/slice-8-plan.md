@@ -521,7 +521,8 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   caps); the transport mark, and a space's option to refuse anonymous
   calls without it, or to be onion-only [E22]; full vanguards; PoW behind a flag; the onion set
   served by the registrar; every node listed as an upstream; the C tor
-  sidecar documented and run once.
+  sidecar documented and run once (8.25), then removed (E30): arti in
+  process is the onion's one host.
 - **Gate:** a flood of well-formed junk proofs through Tor measured
   against the node's budget, members' sign-ins still served. **Dep:** 8.1,
   8.5, 8.11. **Estimate:** 2–2.5 weeks.
@@ -569,10 +570,28 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   key), `tests/tor_state.rs` for arti's state. Over the live network the
   `onion` example reached a local gateway's onion (§6.2's figures). The
   phone's bridge bootstrap: the same example for arm64, its script and
-  expected output, for S8-P6. s4's screens over Tor need s4 to hand the
-  socketpair's end to `Client::screens_fd` once the `:vos` process
-  (8.24b) carries it, and the gateway's onion to serve s4's screens,
-  which wants s4-server serving a stream (§6.1).
+  expected output, for S8-P6.
+- **s4's screens over Tor** (2026-11-10, §6.1 and §6.2 "Built"):
+  s4-server serves any `Listener` (a TCP listener, or streams handed
+  over); the gateway hands each onion SSH stream to its onion's SSH
+  server with its circuit's address, the loopback carrier gone, so the
+  onion serves the demo's screens beside `vos-api`, its streams and
+  `vos-api` channels counted and capped per circuit (`tests/ssh.rs`,
+  `the_onions_ssh_serves_the_screens_marked_onion_and_limited_per_circuit`,
+  the gateway's own screen, streams handed as arti's circuits hand them,
+  every place given back; the demo's screens by its e2e on its SSH
+  port). The C tor sidecar is removed (E30). The demo (`vos-gateway-demo --data DIR`) hosts its own
+  onion through the gateway's arti path. s4's UI hands a socketpair's
+  end to `IVosNode.screens`, which `:vos` carries with
+  `Client::screens_fd` and answers the host key the space pinned, the one
+  s4 accepts; the opt-out
+  takes the clearnet port; a space whose routes take neither is refused,
+  never dialled; a gateway no space was enrolled through s4 reaches
+  itself. A carried session goes under a key drawn for it, never
+  resumed, forwarding no agent. Open: the screens' host-service calls
+  pass no per-circuit limit (s4's host-service requests name no peer),
+  and the onion's SSH server takes s4-server's connection cap (128) with
+  no idle timeout. The phone run of PG3′ and PG6 over Tor is M5's.
 
 ### 8.27 The credential tree's feed
 - **Carried in:** tree syncing and the `map_root` fingerprint: each tree

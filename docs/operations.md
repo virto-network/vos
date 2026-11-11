@@ -151,7 +151,8 @@ onion-only agent and for the space's own `onion` setting (`"any"`,
 `"anonymous"` for its proven calls only through the onion, `"all"` for an
 onion-only space; set it alike on every node of the space).
 
-- **arti in process** (a gateway built with the `tor` feature):
+- **arti in process**, the onion's one host (a gateway built with the
+  `tor` feature):
 
   ```toml
   [onion]
@@ -168,32 +169,6 @@ onion-only space; set it alike on every node of the space).
   authorities and fallbacks, say; a key arti does not know is refused, not
   ignored); the section's state, cache and full vanguards still apply over
   it.
-- **A C tor beside the gateway**, the fallback should arti's onion be
-  flooded (`design/light-node.md` §6.7): name its loopback listeners in
-  place of arti's directories,
-
-  ```toml
-  [onion]
-  sidecar_ssh = "127.0.0.1:2222"
-  sidecar_http = "127.0.0.1:8081"
-  ```
-
-  and give tor:
-
-  ```text
-  HiddenServiceDir /var/lib/tor/vos-gateway
-  HiddenServicePort 22 127.0.0.1:2222
-  HiddenServicePort 80 127.0.0.1:8081
-  HiddenServiceExportCircuitID haproxy
-  HiddenServiceMaxStreams 8
-  HiddenServiceMaxStreamsCloseCircuit 1
-  HiddenServiceEnableIntroDoSDefense 1
-  HiddenServicePoWDefensesEnabled 1
-  ```
-
-  `HiddenServiceExportCircuitID haproxy` is required: the gateway reads
-  each connection's circuit from the PROXY line tor writes first, and
-  closes a connection without one. C tor's PoW is stable, so turn it on.
 - **Caps:** each circuit counts as an address (4 connections, 20 requests
   a second, a burst of 40, 8 streams at once); 1,024 circuits at once;
   16 proven calls in flight through the onion, 2 a connection, 4 a
@@ -201,11 +176,16 @@ onion-only space; set it alike on every node of the space).
   calls from one circuit 4 a second, a burst of 16. Each is a key of
   `[onion]` (`circuit_connections`, `circuit_rate`, `circuit_burst`,
   `circuit_streams`, `circuits`, `proven`, `proven_per_connection`,
-  `proven_per_circuit`, `agent_rate`, `agent_burst`).
-- **The trust boundary of the loopback ports** is the host: the onion's
-  own SSH port and a C tor's listeners are on loopback, and a local
-  process could name a circuit to a C tor's listener. Run the gateway on a
-  host no untrusted user shares.
+  `proven_per_circuit`, `agent_rate`, `agent_burst`); `circuit_streams`
+  from 1 to 65,535 and `circuits` at least 1, or the gateway does not
+  start.
+- **The onion's SSH:** with an SSH port, the onion's port 22 serves the
+  same screens (the demo's when the file has `[demo]`) and `vos-api`
+  subsystem, under the same `ssh_host_key`: the key the onion set lists
+  for that onion. Its screens' own host-service calls pass no per-circuit
+  limit, only the server's bound per session; the onion's SSH server
+  holds at most 128 connections in all and has no idle timeout of its
+  own.
 - **The onion set:** the registrar sets the space's onions in the
   credential actor (`set_onions`, each onion's key and its SSH host key),
   which devices read (`onions`). Set it again when a gateway's onion
