@@ -605,3 +605,22 @@ fn a_blinded_public_sum_is_refused() {
         Err(Error::Logup)
     ));
 }
+
+/// A segment whose first timestamp is 0 is refused before its transcript:
+/// the CPU's, the precompiles' and the witness input's byte tuples carry a
+/// timestamp of at least 1, so the memory boundary's `ts = 0` tuples are
+/// its listed pages' alone (`docs/design/open.md`, the ledgers' padding).
+/// The honest proof at 1 verifies.
+#[test]
+fn a_first_timestamp_of_zero_is_refused() {
+    let format = format();
+    let (proof, _) = prove::<P2MerkleChannel>(&format, IO, MaskRng::Seeded(11)).unwrap();
+    assert_eq!(proof.initial_state.timestamp, 1);
+    verify::<P2MerkleChannel>(&format, &proof).expect("verifies");
+    let mut zero = proof;
+    zero.initial_state.timestamp = 0;
+    assert!(matches!(
+        verify::<P2MerkleChannel>(&format, &zero),
+        Err(Error::PublicWords)
+    ));
+}
