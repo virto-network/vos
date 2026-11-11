@@ -1,6 +1,8 @@
-//! The device program `device_verify_bytes` verifies under, and the seeds
-//! prove: a small kernel's, which reads 16 witness bytes, states a fixed
-//! io-hash and halts, installed on a reference of 16 bytes.
+//! The device programs `device_verify_bytes` (the device format, 47) and
+//! `device_verify_bytes_46` (format 46, while its code lives) verify
+//! under, and the seeds prove: a small kernel's, which reads 16 witness
+//! bytes, states a fixed io-hash and halts, installed on a reference of 16
+//! bytes.
 
 use vos_pvm_compiler::assembler::{Assembler, Reg};
 use vos_pvm_proof::core::ecall::ECALL_WITNESS_INPUT;
@@ -30,7 +32,15 @@ fn kernel() -> Vec<u8> {
     asm.build()
 }
 
-/// The program.
+/// The program under the device format.
+#[allow(dead_code, reason = "each target takes one")]
 pub fn program() -> Program {
     Program::install(&kernel(), &WITNESS, 0).expect("the kernel installs")
+}
+
+/// The program under format 46.
+#[allow(dead_code, reason = "each target takes one")]
+pub fn byte_program() -> Program {
+    let format = vos_pvm_recair::device::format(46).expect("format 46");
+    Program::install_in(format, &kernel(), &WITNESS, 0).expect("the kernel installs")
 }

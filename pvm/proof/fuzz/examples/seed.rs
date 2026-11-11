@@ -4,10 +4,10 @@
 //! `statement_decode` with every fixture's judgement (its input, then its
 //! proof) and its statement alone, `anchor_decode` with `vos-anchor`'s
 //! golden vectors, their geneses, an anchor and a migration of each, and
-//! `device_verify_bytes` with an honest proof of its program, its io-hash
-//! first.
+//! `device_verify_bytes` and `device_verify_bytes_46` each with an honest
+//! proof of its program, its io-hash first.
 //!
-//! Those four corpora are cleared first: a masked fixture regenerated is
+//! Those corpora are cleared first: a masked fixture regenerated is
 //! another honest proof of the same words, so a proof of an earlier
 //! fixture left in a corpus verifies, and the targets' oracle (every
 //! accepted proof the golden one) refuses it.
@@ -39,6 +39,7 @@ fn main() {
         "statement_decode",
         "anchor_decode",
         "device_verify_bytes",
+        "device_verify_bytes_46",
     ] {
         match std::fs::remove_dir_all(corpus.join(target)) {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
@@ -103,15 +104,15 @@ fn main() {
         };
         write("anchor_decode", &format!("anchor-{at}"), &anchor.encode());
     }
-    let program = device_program::program();
-    let (proof, _) = program
-        .prove(&device_program::WITNESS, MaskRng::Os)
-        .expect("the kernel proves");
-    let bytes = vos_pvm_recair::device::encode(&proof.proof).expect("encodes");
-    write(
-        "device_verify_bytes",
-        "honest",
-        &[&proof.io[..], &bytes].concat(),
-    );
+    for (target, program) in [
+        ("device_verify_bytes", device_program::program()),
+        ("device_verify_bytes_46", device_program::byte_program()),
+    ] {
+        let (proof, _) = program
+            .prove(&device_program::WITNESS, MaskRng::Os)
+            .expect("the kernel proves");
+        let bytes = program.encode(&proof.proof).expect("encodes");
+        write(target, "honest", &[&proof.io[..], &bytes].concat());
+    }
     println!("{} fixtures seeded under {}", all.len(), corpus.display());
 }

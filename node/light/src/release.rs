@@ -99,9 +99,20 @@ pub fn agent(elf: &[u8]) -> Result<Vec<u8>, String> {
 
 /// The device kernels' release artifacts of the package whose ELF is
 /// `elf`, by method in ascending order: each kernel's program computed as
-/// a node's install computes it, from its reference run.
+/// a node's install computes it, from its reference run, in the device
+/// format.
 #[cfg(feature = "release")]
 pub fn devices(elf: &[u8]) -> Result<Vec<Device>, String> {
+    devices_in(vos_pvm_recair::device::FORMAT.number, elf)
+}
+
+/// [`devices`] in the device format numbered `format`, one this build
+/// proves (`vos_pvm_recair::device::FORMATS`): an app's artifacts for a
+/// space that admits only that format.
+#[cfg(feature = "release")]
+pub fn devices_in(format: u32, elf: &[u8]) -> Result<Vec<Device>, String> {
+    let format = vos_pvm_recair::device::format(format)
+        .ok_or_else(|| format!("no device format {format} in this build"))?;
     let derived = vos_pvm_compiler::derive(elf).map_err(|error| error.to_string())?;
     let derivation = derived.derivation();
     derived
@@ -114,12 +125,13 @@ pub fn devices(elf: &[u8]) -> Result<Vec<Device>, String> {
                 .find(|(bound, _)| bound == method)
                 .map(|(_, kernel)| kernel.clone())
                 .ok_or_else(|| format!("device kernel {method:#010x} has no kernel"))?;
-            let program = vos_pvm_recair::device::Program::of(&kernel, reference, *headroom)
-                .map_err(|error| format!("device kernel {method:#010x}: {error}"))?;
+            let program =
+                vos_pvm_recair::device::Program::of_in(format, &kernel, reference, *headroom)
+                    .map_err(|error| format!("device kernel {method:#010x}: {error}"))?;
             Ok(Device {
                 elf: derivation.elf,
                 method: MethodId(*method),
-                format: vos_pvm_recair::device::FORMAT.number,
+                format: format.number,
                 chips: program.chips(),
                 log_sizes: program.log_sizes().to_vec(),
                 id: *program.id(),

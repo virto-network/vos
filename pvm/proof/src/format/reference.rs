@@ -22,7 +22,7 @@ pub const SEGMENT_REFERENCE: SecurityShape = SecurityShape {
     composition_point_doublings: 0,
 };
 
-/// The device format's reference, format 46's: the device set
+/// Format 46's reference: the device set
 /// (`vos_pvm_proof::device`) with every chip a device program may hold at
 /// `2^17` rows (`device::DEVICE_MAX_LOG_SIZE`, which install enforces),
 /// masked under variant (c): its columns at degree bound 2^18, the
@@ -30,7 +30,7 @@ pub const SEGMENT_REFERENCE: SecurityShape = SecurityShape {
 /// batch, 4,262 constraints, every fraction a masked row evaluates (the
 /// blinding's among them), the widest relation's 265 limbs. A test in
 /// `vos-pvm-recair` derives it from the built set.
-pub const DEVICE_REFERENCE: SecurityShape = SecurityShape {
+pub const BYTE_DEVICE_REFERENCE: SecurityShape = SecurityShape {
     log_degree_bound: 19,
     log_trace_length: 18,
     log_composition_degree_bound: 19,
@@ -38,6 +38,24 @@ pub const DEVICE_REFERENCE: SecurityShape = SecurityShape {
     max_samples_per_column: 3,
     constraints: 4_262,
     logup_fractions: 155_058_176,
+    relation_width: SEGMENT_RELATION_WIDTH,
+    composition_point_doublings: 1,
+};
+
+/// The device format's reference, format 47's: the device set with the
+/// word ledger in place of the byte ledger and the full CPU, every chip a
+/// device program may hold at `2^17` rows, masked as
+/// [`BYTE_DEVICE_REFERENCE`]: 7,470 values in the DEEP batch, 4,309
+/// constraints. A per-program CPU's cut has fewer of both. A test in
+/// `vos-pvm-recair` derives it from the built set.
+pub const DEVICE_REFERENCE: SecurityShape = SecurityShape {
+    log_degree_bound: 19,
+    log_trace_length: 18,
+    log_composition_degree_bound: 19,
+    sampled_values: 7_470,
+    max_samples_per_column: 3,
+    constraints: 4_309,
+    logup_fractions: 156_106_752,
     relation_width: SEGMENT_RELATION_WIDTH,
     composition_point_doublings: 1,
 };

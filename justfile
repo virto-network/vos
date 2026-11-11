@@ -97,9 +97,8 @@ vectors:
 # rows, and the final verifier's decode, verify and Wasm gates as the
 # maximum over 12 seeds of the masked wrap (on the JAM-only host's
 # `final-verify.elf`, built by `check-no-std`, and `judge-wasm`'s blob),
-# one test at a time; the device suite, its leakage gate among it, again
-# on the per-program CPU (`DEVICE_CPU=program`), on the word ledger
-# (`DEVICE_MEMORY=word`) and on both. Last, the wrap files the suites wrote
+# one test at a time, the device formats' leakage gates (47's and 46's)
+# among them. Last, the wrap files the suites wrote
 # checked to be final wraps alone, and the carrier audit (`test-carriers`).
 test-proof: build-test-actors judge-wasm
     cargo test -p vos-pvm-proof --features debug-internals --lib --bins --test gates --test isa -- --test-threads=2
@@ -107,9 +106,6 @@ test-proof: build-test-actors judge-wasm
     cargo test -p vos-pvm-proof --features debug-internals --test kernel reads:: -- --test-threads=1
     cargo test -p vos-pvm-proof --test kernel constants:: -- --test-threads=1
     cargo test -p vos-pvm-recair --features heavy-gates --test circuit --test recursion --test segment --test device -- leakage heavy --test-threads=1
-    with-env { DEVICE_CPU: "program" } { cargo test -p vos-pvm-recair --features heavy-gates --test device -- --test-threads=1 }
-    with-env { DEVICE_MEMORY: "word" } { cargo test -p vos-pvm-recair --features heavy-gates --test device -- --test-threads=1 }
-    with-env { DEVICE_CPU: "program", DEVICE_MEMORY: "word" } { cargo test -p vos-pvm-recair --features heavy-gates --test device -- --test-threads=1 }
     cargo test -p vos-pvm-proof --features debug-internals --test kernel wrap_files:: -- --test-threads=1
     just test-carriers
 
@@ -670,10 +666,10 @@ _kit-workspace:
 # 39's layout past its header and on its queried parts reshaped within the
 # layout's bounds; the statement's and the space's decoders and the venue's
 # check; prove-then-verify on random programs; and a credentialed call's
-# decode and the device verifier's bytes, ingress's. A target's property
+# decode and the device verifier's bytes, ingress's, under 47 and 46. A target's property
 # is no panic and nothing accepted but a golden (a device proof: its one
 # encoding).
-fuzz_targets := "final_verifier_bytes final_verifier_mutate statement_decode prove_verify_roundtrip masked_bytes masked_shape anchor_decode api_reader operated_decode credentialed_decode device_verify_bytes"
+fuzz_targets := "final_verifier_bytes final_verifier_mutate statement_decode prove_verify_roundtrip masked_bytes masked_shape anchor_decode api_reader operated_decode credentialed_decode device_verify_bytes device_verify_bytes_46"
 
 # Each target's checked-in corpus (`pvm/proof/fuzz/replay`) run once, every
 # input, optimized and without a sanitizer: no crash. `cargo run --example

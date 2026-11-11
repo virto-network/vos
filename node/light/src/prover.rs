@@ -9,7 +9,7 @@ use vos_wire::abi::cap;
 use vos_wire::credentials::{AuthClaim, OwnerClaim, claim_binding};
 use zeroize::Zeroize;
 
-use crate::kernel::{DEVICE_FORMAT, DeviceProgram, claim_io};
+use crate::kernel::{DeviceProgram, claim_io};
 use crate::secret::{self, DeviceSecret};
 use crate::threads::thread_pool;
 use crate::{AuthWitness, Call, DeviceError, scope};
@@ -204,7 +204,7 @@ impl Prover {
             return Err(DeviceError::Prove);
         }
         Ok(Proven {
-            format: DEVICE_FORMAT,
+            format: program.format(),
             claim,
             proof: proof.proof,
         })
@@ -212,7 +212,7 @@ impl Prover {
 }
 
 /// Verifies `proof` against `call` under the kernel `program` as ingress
-/// does: its format the device format, its claim within its cap, `call`'s
+/// does: its format the program's, its claim within its cap, `call`'s
 /// arguments within their
 /// cap, the claim's binding `call`'s under the program's id, for a stock
 /// auth claim (`name` given) its scope the one the guard named `name`
@@ -223,7 +223,7 @@ pub fn verify(
     program: &DeviceProgram,
     name: Option<&[u8]>,
 ) -> Result<(), DeviceError> {
-    if proof.format != DEVICE_FORMAT || proof.claim.len() > cap::CLAIM || call.check().is_err() {
+    if proof.format != program.format() || proof.claim.len() > cap::CLAIM || call.check().is_err() {
         return Err(DeviceError::Verify);
     }
     let binding = claim_binding(&proof.claim).ok_or(DeviceError::Verify)?;

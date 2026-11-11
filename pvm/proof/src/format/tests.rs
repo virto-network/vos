@@ -95,13 +95,14 @@ fn the_parameters_are_the_least_that_clear_their_margins() {
     assert!((62.81..62.82).contains(&segment), "{segment}");
     let at_44 = count(&LEAF_FOLD.params, &SEGMENT_REFERENCE);
     assert!((62.74..62.75).contains(&at_44), "{at_44}");
-    let device = &DEVICE_PROOF;
-    let fewer = FormatParams {
-        n_queries: device.params.n_queries - 1,
-        ..device.params
-    };
-    assert!(count(&device.params, &device.reference) >= 62.0);
-    assert!(count(&fewer, &device.reference) < 62.0);
+    for device in [&BYTE_DEVICE_PROOF, &DEVICE_PROOF] {
+        let fewer = FormatParams {
+            n_queries: device.params.n_queries - 1,
+            ..device.params
+        };
+        assert!(count(&device.params, &device.reference) >= 62.0);
+        assert!(count(&fewer, &device.reference) < 62.0);
+    }
 }
 
 /// The wrap counts 82.6 proven bits under affine batching, and needs 19
@@ -170,7 +171,7 @@ fn the_verifier_takes_the_batching_from_the_format() {
     }
 }
 
-/// Every number names one entry; only 28, 39, 41 and 46 are
+/// Every number names one entry; only 28, 39, 41, 46 and 47 are
 /// admitted, and a segment verifier takes 41 alone; every other number,
 /// one an earlier format took among them, is refused as unregistered.
 #[test]
@@ -183,6 +184,7 @@ fn the_registry_numbers_round_trip() {
                 WRAP.number,
                 SEGMENT.number,
                 MASKED_WRAP.number,
+                BYTE_DEVICE_PROOF.number,
                 DEVICE_PROOF.number,
             ]
             .contains(&format.number)
