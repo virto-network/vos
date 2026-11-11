@@ -34,6 +34,8 @@
 //! - **The pinned onion set** ([`Client::refresh_onions`]): the registrar's
 //!   current set, read through any onion of the pinned one, replaces it.
 //!   The answer is the gateway's word, as any answer it relays (§8, H5).
+//! - **What it opened** ([`Client::opened`]): each hour's rendezvous by
+//!   purpose, in the foreground and in the background, for PG5's bound.
 //! - **The credential tree's feed** ([`Client::read_tree`]): each page on
 //!   the space's one feed connection, which carries reads alone and names
 //!   nothing of the member's; the tree kept by a [`crate::TreeKeeper`].
@@ -42,10 +44,12 @@ mod arti;
 mod client;
 mod connection;
 mod dial;
+mod tally;
 
 pub use arti::{BootstrapError, BridgeError, Tor, TorConfig, bridge, onion_address, onion_key};
 pub use client::{Client, Error, FEED_PAGES, Registrar, Screens, SpaceId};
 pub use dial::{Circuit, Dial, Dialing, Io, Stream, Target};
+pub use tally::{HOURS, Hour, Opened};
 
 use std::time::Duration;
 

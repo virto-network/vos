@@ -894,3 +894,93 @@ async fn the_tree_is_read_on_one_feed_connection() {
     assert_eq!(keeper.root(), changes[9].root);
     assert_eq!(gateway.seen().len(), 1);
 }
+
+/// PG5's foreground schedule, on a clock a thousand times faster (a
+/// second a millisecond: the hour 3.6 s, the feed's timer 30 ms, drawn
+/// between 15 and 45; the kept-open connections' idle limit a second, past
+/// any stall of a loaded host): the feed
+/// read on its timer, the member's calls and the personal agent's every
+/// minute, and twelve sign-ins, each a fetch of the node's time and a
+/// proven call. The hour's rendezvous are one a kept-open group (its
+/// connection outlives the gaps between its requests), one the spare built
+/// ahead, and two a sign-in: 3 + 1 + 2 × 12 = 28, within PG5's 30, so a
+/// foreground hour holds at most 13 sign-ins before the bound. Counted
+/// as the foreground's; a background run after it as the background's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_foreground_hour_opens_a_rendezvous_a_kept_group_and_two_a_sign_in() {
+    const SIGN_INS: u32 = 12;
+    let gateway = Gateway::new();
+    let client = client(
+        &gateway,
+        Config {
+            idle: Duration::from_secs(1),
+            ..config()
+        },
+    );
+    let (a, home) = (space(1), space(3));
+    client.set_space(a, Routes::onions(vec![gateway.onion(1)]));
+    client.set_space(home, Routes::new(vec![gateway.onion(3)], None, true));
+    client.set_foreground(true);
+    client.keep_spare(Some(a));
+    until(|| client.spare_ready()).await;
+    let hour = std::time::Instant::now() + Duration::from_millis(3_600);
+    let (mut feed, mut minute, mut signed) =
+        (std::time::Instant::now(), std::time::Instant::now(), 0u32);
+    let mut draw = 7u64;
+    while std::time::Instant::now() < hour {
+        let now = std::time::Instant::now();
+        if now >= feed {
+            client.request(a, Purpose::Feed, &query()).await.unwrap();
+            draw = draw.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            feed = now + Duration::from_millis(15 + (draw >> 33) % 31);
+        }
+        if now >= minute {
+            client.request(a, Purpose::Member, &query()).await.unwrap();
+            client
+                .request(home, Purpose::Personal, &query())
+                .await
+                .unwrap();
+            minute = now + Duration::from_millis(60);
+        }
+        // A sign-in every five minutes, the spare rebuilt between them.
+        let due = Duration::from_millis(300 * u64::from(signed) + 150);
+        if signed < SIGN_INS && hour - Duration::from_millis(3_600) + due <= now {
+            until(|| client.spare_ready()).await;
+            client
+                .request(a, Purpose::Fetch, &wire::time_request())
+                .await
+                .unwrap();
+            client.request(a, Purpose::Proven, &proven()).await.unwrap();
+            signed += 1;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(signed, SIGN_INS);
+    until(|| client.spare_ready()).await;
+    let hours = client.opened();
+    let foreground: u32 = hours.iter().map(|hour| hour.foreground.rendezvous()).sum();
+    let of = |purpose| -> u32 { hours.iter().map(|hour| hour.foreground.of(purpose)).sum() };
+    // Every sign-in's proven call took a spare; the last spare is built.
+    assert_eq!(of(Purpose::Proven), SIGN_INS + 1);
+    assert_eq!(of(Purpose::Fetch), SIGN_INS);
+    for purpose in [Purpose::Feed, Purpose::Member, Purpose::Personal] {
+        assert_eq!(of(purpose), 1, "{purpose:?} kept open across the hour");
+    }
+    assert_eq!(foreground, 3 + 1 + 2 * SIGN_INS);
+    assert!(foreground <= 30, "PG5: {foreground} rendezvous in the hour");
+    assert_eq!(foreground as usize, gateway.dials());
+    assert!(hours.iter().all(|hour| hour.foreground.failed == 0));
+
+    // In the background, a job's run on its own group.
+    client.set_foreground(false);
+    client
+        .request(home, Purpose::Background, &query())
+        .await
+        .unwrap();
+    let hours = client.opened();
+    let background: u32 = hours.iter().map(|hour| hour.background.rendezvous()).sum();
+    assert_eq!(background, 1);
+    let line = hours.last().unwrap().to_string();
+    assert!(line.starts_with("rendezvous hour "), "{line}");
+    assert!(line.contains("; background 1 rendezvous"), "{line}");
+}

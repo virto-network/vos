@@ -20,6 +20,7 @@ use vos_wire::credentials::{MAX_ONIONS, Onion};
 
 use super::connection::{Connection, OpenError};
 use super::dial::{Circuit, Dial, Target};
+use super::tally::{self, Dialed, Hour, Tally};
 use super::{Config, SSH_PORT, onion_address};
 use crate::route::{Purpose, Refused, Route, Routes};
 use crate::{DeviceError, TreeKeeper, wire};
@@ -181,6 +182,8 @@ struct Inner {
     state: Mutex<State>,
     /// Where the next connection's onion is taken from in a pinned set.
     next: AtomicU64,
+    /// What it opened, each hour.
+    tally: Mutex<Tally>,
 }
 
 impl Drop for Inner {
@@ -214,6 +217,7 @@ impl Client {
                 config,
                 state: Mutex::new(State::default()),
                 next: AtomicU64::new(rand_u64()),
+                tally: Mutex::new(Tally::default()),
             }),
         };
         client.start_reaper();
@@ -312,6 +316,31 @@ impl Client {
         self.state().dormant
     }
 
+    /// The app came to the foreground, or left it: what the client opens
+    /// from now on is counted as the foreground's, or the background's.
+    pub fn set_foreground(&self, foreground: bool) {
+        self.tally().set_foreground(foreground);
+    }
+
+    /// What the client opened, each of the last [`super::HOURS`] hours in
+    /// which it opened anything, the newest last.
+    pub fn opened(&self) -> Vec<Hour> {
+        self.tally().hours()
+    }
+
+    fn tally(&self) -> std::sync::MutexGuard<'_, Tally> {
+        self.inner.tally.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Count a connection to `target` for `purpose`, opened or failed.
+    fn dialed(&self, target: &Target, purpose: Purpose, failed: bool) {
+        let dialed = match target {
+            Target::Onion { .. } => Dialed::Onion { purpose, failed },
+            Target::Clearnet { .. } => Dialed::Clearnet,
+        };
+        self.tally().record(tally::now(), dialed);
+    }
+
     /// Send `request` (its kind's two little-endian bytes, then its body,
     /// as [`crate::wire`] makes them) to `space` under `purpose`: its
     /// answer's kind and body. The policy decides first; a proven call
@@ -342,7 +371,7 @@ impl Client {
             }
             match spare {
                 Some(spare) => spare,
-                None => self.open(space, &routes, route, version).await?,
+                None => self.open(space, purpose, &routes, route, version).await?,
             }
         } else {
             self.kept((purpose, space)).await?
@@ -389,7 +418,7 @@ impl Client {
                 "the connection another request opened failed".into(),
             ));
         }
-        match self.open(space, &routes, route, version).await {
+        match self.open(space, purpose, &routes, route, version).await {
             Ok(connection) => {
                 kept.held = Some(Held {
                     version,
@@ -621,7 +650,10 @@ impl Client {
                 return;
             };
             let client = Client { inner };
-            let Ok(spare) = client.open(space, &routes, Route::Onion, version).await else {
+            let Ok(spare) = client
+                .open(space, Purpose::Proven, &routes, Route::Onion, version)
+                .await
+            else {
                 return;
             };
             let mut state = client.state();
@@ -677,6 +709,7 @@ impl Client {
     async fn open(
         &self,
         space: SpaceId,
+        purpose: Purpose,
         routes: &Routes,
         route: Route,
         version: Version,
@@ -706,6 +739,7 @@ impl Client {
                     })
             };
             let opened = opened.await;
+            self.dialed(&target, purpose, opened.is_err());
             let mut state = self.state();
             Self::still(&state, space, version)?;
             match opened {
@@ -740,12 +774,13 @@ impl Client {
                 return Err(Error::Dormant);
             }
             let (target, host_key) = Self::target(routes, route, turn + attempt)?;
-            match tokio::time::timeout(
+            let dialed = tokio::time::timeout(
                 config.connect,
                 self.inner.dial.dial(&target, Circuit::new()),
             )
-            .await
-            {
+            .await;
+            self.dialed(&target, Purpose::Screens, !matches!(dialed, Ok(Ok(_))));
+            match dialed {
                 Ok(Ok(stream)) => return Ok((stream, host_key)),
                 Ok(Err(error)) => last = error,
                 Err(_) => last = io::Error::other("the connection's deadline passed"),
