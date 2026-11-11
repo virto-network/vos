@@ -1721,6 +1721,13 @@ impl DeviceGroup {
         })
     }
 
+    /// The device whose matured regroup's new group the set waits for: the
+    /// next commit is its, with the key packages the others hand it
+    /// ([`DeviceGroup::regroup_package`]).
+    pub fn regrouper(&self) -> Option<DeviceId> {
+        self.state.set.fresh
+    }
+
     /// A key package for the new group a regroup starts, at `now`: handed
     /// to the regrouper as a pairing's is.
     pub fn regroup_package(&mut self, now: u64) -> Result<Vec<u8>, GroupError> {

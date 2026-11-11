@@ -498,6 +498,12 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   the background job's after a drawn delay (E28), and an admin key is
   replaced by the kit or another seasoned device (E29). Host-tested logic
   only: the gate is the phone session.
+- **Fixes before the phone session** (2026-11-10, `light-node.md` §7.3):
+  a fourth device pairs after a kit rotation, admin replacements or a
+  regroup (the opener reads the log before its commit; a replaced admin
+  key settled before an admin call); a regroup keeping other devices
+  takes their key packages, handed over through the inbox under their
+  sync keys, and refuses after a bounded wait naming any device missing.
 
 ### M4 acceptance
 - `ci-full`, PG3′'s personal-space flows and PG6 on the clearnet (S8-P5),
