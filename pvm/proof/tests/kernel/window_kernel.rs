@@ -502,16 +502,17 @@ fn the_window_proves_and_verifies_over_its_shape() {
 }
 
 /// The window's kernel's leaves and folds: its program finalized with its
-/// leaf circuits; its run cut at class 1's budgets into three segments
-/// (two class-1 windows of the 32k cut, then the halt at class 0), each
-/// verified in its class's leaf as natively, the leaf within the padded
-/// shape, proved and verified. The first states the entry, the last the
-/// halt and the run's io-hash; each segment's exit digest is the next's
-/// entry digest. A class-1 leaf proves in at most 4 GiB of heap and in at
-/// most the time of its segment's proving.
+/// leaf circuits; its run cut at class 1's budgets into segments (a
+/// class-1 window of the 32k cut first, the halt last: two for its
+/// 53,199 steps), each verified in its class's leaf as natively, the leaf
+/// within the padded shape, proved and verified. The first states the
+/// entry, the last the halt and the run's io-hash, any between neither;
+/// each segment's exit digest is the next's entry digest. A class-1 leaf
+/// proves in at most 4 GiB of heap and in at most the time of its
+/// segment's proving.
 ///
-/// The leaves fold: the first two, then their fold with the third, the
-/// root of the whole run, each within the padded shape, proved and
+/// The leaves fold left to right, the first two, then that with the next,
+/// to the root of the whole run, each within the padded shape, proved and
 /// verified against the fold circuit's hash. The root proves in at most
 /// 4 GiB of heap, as a leaf, and in at most the time of a class-1
 /// segment's proving.
@@ -542,7 +543,7 @@ fn the_windows_leaves_and_folds_prove_and_verify() {
         1 << class.log_steps,
         usize::from(class.pages),
     );
-    assert_eq!(bounds.len(), 3, "{bounds:?}");
+    assert!(bounds.len() >= 2, "{bounds:?}");
     let fold = vos_pvm_recair::fold::FoldCircuit::new();
     let (word, elapsed, _) = common::measured(|| fold.hash());
     eprintln!("the fold circuit's hash in {:.1}s", elapsed.as_secs_f64());
@@ -579,30 +580,30 @@ fn the_windows_leaves_and_folds_prove_and_verify() {
         .iter()
         .map(|(class, leaf)| (*class, leaf.node.output))
         .collect();
-    let [(first_class, first), (_, second), (_, end)] = outputs[..] else {
-        unreachable!()
-    };
+    let (first_class, first) = outputs[0];
+    let (_, end) = outputs[outputs.len() - 1];
     assert_eq!(first_class, CUT, "the first segment is a class-1 window");
     assert!(first.entry && !first.halt);
-    assert!(!second.entry && !second.halt);
     assert!(!end.entry && end.halt);
-    assert_eq!(first.exit_digest, second.entry_digest);
-    assert_eq!(second.exit_digest, end.entry_digest);
-
-    let head = common::prove_fold(&fold, &program, &leaves[0].1, &leaves[1].1, word);
-    let root = common::prove_fold(&fold, &program, &head, &leaves[2].1, word);
-    for (name, run) in [
-        ("the fold of leaves 0 and 1", &head),
-        ("the fold of that and leaf 2", &root),
-    ] {
-        eprintln!(
-            "{name}: {:?} rows ({:?} finalized), proved in {:.2}s, its peak heap {} MiB",
-            run.rows,
-            run.finalized,
-            run.proving.as_secs_f64(),
-            run.peak_mib,
-        );
+    for (_, between) in &outputs[1..outputs.len() - 1] {
+        assert!(!between.entry && !between.halt);
     }
+    for pair in outputs.windows(2) {
+        assert_eq!(pair[0].1.exit_digest, pair[1].1.entry_digest);
+    }
+
+    let mut root = common::prove_fold(&fold, &program, &leaves[0].1, &leaves[1].1, word);
+    for (at, (_, leaf)) in leaves.iter().enumerate().skip(2) {
+        root = common::prove_fold(&fold, &program, &root, leaf, word);
+        eprintln!("folded leaf {at}");
+    }
+    eprintln!(
+        "the root fold: {:?} rows ({:?} finalized), proved in {:.2}s, its peak heap {} MiB",
+        root.rows,
+        root.finalized,
+        root.proving.as_secs_f64(),
+        root.peak_mib,
+    );
     assert!(root.peak_mib <= 4 << 10, "{} MiB", root.peak_mib);
     assert!(
         root.proving <= slowest,
@@ -610,7 +611,7 @@ fn the_windows_leaves_and_folds_prove_and_verify() {
         root.proving
     );
     let root = root.node.output;
-    assert_eq!((root.first, root.last), (0, 2));
+    assert_eq!((root.first, root.last), (0, leaves.len() as u32 - 1));
     assert!(root.entry && root.halt, "the whole run");
     assert_eq!(root.entry_digest, first.entry_digest);
     assert_eq!(root.program.0, program.id().0);

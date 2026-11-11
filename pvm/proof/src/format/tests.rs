@@ -70,6 +70,7 @@ fn the_bit_counts_are_pinned_per_format() {
             (39, 146, 82),
             (41, 104, 62),
             (46, 110, 62),
+            (47, 110, 62),
         ]
     );
     assert!(REGISTRY.iter().all(Format::meets_floors));
