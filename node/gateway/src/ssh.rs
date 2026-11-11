@@ -44,6 +44,12 @@ pub const DEADLINE: Duration = Duration::from_secs(60);
 /// measured rate (`light-node.md` §6.3), with room.
 pub const LARGE_DEADLINE: Duration = Duration::from_secs(30);
 
+/// Host-service calls in flight from one of the onion's screen sessions:
+/// with a circuit's connections and an anonymous connection's sessions
+/// (s4-server's four), what bounds the screens' own calls from one circuit,
+/// whose requests name no peer to count them by.
+pub const ONION_HOST_CALLS: usize = 4;
+
 /// What a port's relay counts and caps: the transport it marks, its limits
 /// per address (an onion's: per circuit, each stream a port of its
 /// circuit's address, [`crate::circuits`]), its caps on calls, and the
@@ -132,8 +138,19 @@ pub fn server(
         }
         None => Server::new(crate::demo::APPLICATION, || Screen),
     };
+    let limits = match mark {
+        Mark::Onion => s4_server::ServerLimits {
+            host_services: s4_server::HostServiceLimits {
+                max_active_per_session: ONION_HOST_CALLS,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        _ => s4_server::ServerLimits::default(),
+    };
     server
         .host_key(host_key)
+        .limits(limits)
         // Any key, as no one in particular: authority is what a request
         // proves, and the node checks every signature and proof.
         .anonymous()
@@ -290,6 +307,7 @@ pub async fn relay(
                     let mut place = None;
                     if let Some(connection) = connection {
                         if !port.limits.request(connection.ip()) {
+                            tracing::info!(?connection, ?mark, "a channel past its address's rate, closed");
                             return;
                         }
                         place = port.limits.connect(connection.ip());
