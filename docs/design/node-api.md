@@ -590,29 +590,21 @@ could replay, and a relay keeps nothing it can reuse.
   `[onion]` in the gateway's file. Its streams arrive on rendezvous
   circuits for virtual port 22 or 80, anything else refused `DONE`. Port
   80 is the gateway's own HTTP server, plain inside the onion, marking
-  onion; port 22, with an SSH port, the onion's own SSH port on a
-  loopback listener marking onion, its `vos-api` subsystem and no demo
-  screens (s4-server serves a listener, not a stream: each stream is
-  carried to it, the carrier's exact loopback address naming the stream,
-  and a connection no stream carries is served no channel). A circuit counts as an address of its own,
+  onion; port 22, with an SSH port, the onion's own SSH server marking
+  onion, the same screens (the demo's, when the file names it, its claims
+  marked onion) and `vos-api` subsystem as the SSH port, each stream
+  handed to s4-server with its circuit's address. A circuit counts as an address of its own,
   `fd76:6f73:<circuit>::/64`, each stream a port of it: 4 connections at
   once, 20 requests a second with a burst of 40; 8 streams at once a
   circuit (arti's `max_concurrent_streams_per_circuit` too), 1,024
-  circuits at once (a C tor's circuit holding its place while its streams
-  are open), a circuit of arti's holding no stream for 60 s let go. The
-  streams come from **arti in process** (the `tor` feature: arti-client
+  circuits at once, a circuit holding no stream for 60 s let go. The
+  streams come from **arti in process**, the onion's one host (the `tor` feature: arti-client
   0.47.0 pinned exactly, one `TorClient` with full vanguards, the
   onion's key from the gateway's `key` file inserted once into arti's
   keystore and checked against it at each start, introduction rate limits
   if the file names them, and arti's service-side PoW behind the
   `tor-pow` feature and `pow = true`, off by default since no release has
-  declared it ready), or from **a C tor beside the gateway**
-  (`sidecar_ssh`, `sidecar_http`: loopback listeners its
-  `HiddenServicePort`s forward to, each connection naming its circuit in
-  the PROXY line `HiddenServiceExportCircuitID haproxy` writes, a source
-  in `fc00:dead:beef:4dad::/64`, at most 256 lines read at once;
-  `docs/operations.md`). The loopback listeners' trust boundary is the
-  host: a local process may name any circuit.
+  declared it ready; `docs/operations.md`).
 - **Every node an upstream:** with `space`, the space file of its nodes,
   the gateway starts only if every node of it is among its `nodes`, as a
   home's gateways list every node (`light-node.md` §3.3).
@@ -680,7 +672,7 @@ could replay, and a relay keeps nothing it can reuse.
 | 20 | the codec: the mark pinned, each read back, an unknown one `UnknownMark` from the header; the fuzz target's frames written again being the bytes read | `vos-api` |
 | 21 | a space's own ask of the mark: proven calls refused unmarked and clearnet before any proof is read while key-signed queries are answered; an onion-only space refusing every read of an agent off the onion, an agent's record open | node |
 | 22 | a flood of junk proven calls, a device proof's size each, from eight connections through a port capped as the onion's: at most its proven calls held at once behind it, the rest waiting with their bodies unread, every place given back; a connection past its own answered `Busy` from the header and closed; a member's queries, a session's call and the member's own proven call on another connection answered meanwhile | gateway |
-| 23 | the onion's streams: a circuit one address and each stream a port of it, the circuits' and streams' caps, a C tor's circuit held by its streams; HTTP streams at the onion's listener, SSH streams carried and named by their carrier's exact address, other ports refused; C tor's PROXY lines read, its streams served on their circuits | gateway |
+| 23 | the onion's streams: a circuit one address and each stream a port of it, the circuits' and streams' caps; HTTP and SSH streams each at its server's listener with its circuit's address, other ports refused; SSH streams on circuits serving the screens and the `vos-api` subsystem marked onion, a circuit's channels and streams capped | gateway |
 
 ## 9. Design choices
 

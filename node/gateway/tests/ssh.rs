@@ -701,25 +701,17 @@ async fn a_flood_of_junk_proofs_is_held_to_the_caps_and_members_are_served() {
     );
 }
 
-/// The onion's SSH, as the gateway serves it behind a C tor (each stream
-/// on the circuit its PROXY line names), each circuit's channels limited
-/// to `connections` and its streams to `streams`: the sidecar's listener,
-/// and what serves it.
-async fn onion(
+/// The onion's servers, each circuit's channels limited to `connections`
+/// and its streams to `streams`, taking the streams handed to them as
+/// arti's circuits hand them.
+#[cfg(feature = "tor")]
+fn onion(
     node: [u8; 32],
     socket: &std::path::Path,
     connections: usize,
     streams: usize,
-) -> (
-    std::net::SocketAddr,
-    vos_gateway::served::Served,
-    tempfile::TempDir,
-) {
+) -> (vos_gateway::served::Front, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let sidecar = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap();
     let text = format!(
         r#"
 key = "{dir}/gateway.key"
@@ -729,7 +721,6 @@ ssh = "127.0.0.1:0"
 ssh_host_key = "{dir}/ssh_host_key"
 
 [onion]
-sidecar_ssh = "{sidecar}"
 circuit_connections = {connections}
 circuit_streams = {streams}
 "#,
@@ -746,27 +737,25 @@ circuit_streams = {streams}
             .map(|(key, address)| Upstream::new(key, address, [41; 32]))
             .collect(),
     ));
-    let served = vos_gateway::served::onion(&config, config.onion.as_ref().unwrap(), gateway)
-        .await
-        .unwrap();
-    (sidecar, served, dir)
+    let front =
+        vos_gateway::served::front(&config, config.onion.as_ref().unwrap(), gateway).unwrap();
+    (front, dir)
 }
 
-/// An SSH connection under an ephemeral key over a stream C tor forwards
-/// from circuit `circuit`.
+/// An SSH connection under an ephemeral key over a stream to the onion's
+/// port 22 on circuit `circuit`.
+#[cfg(feature = "tor")]
 async fn over_circuit(
-    sidecar: std::net::SocketAddr,
+    front: &vos_gateway::served::Front,
     circuit: u32,
 ) -> Result<client::Handle<AcceptAll>, russh::Error> {
-    use tokio::io::AsyncWriteExt;
-    let mut stream = tokio::net::TcpStream::connect(sidecar).await?;
-    stream
-        .write_all(
-            format!("PROXY TCP6 fc00:dead:beef:4dad::{circuit:x} ::1 65535 22\r\n").as_bytes(),
-        )
-        .await?;
+    let (ours, theirs) = tokio::io::duplex(1 << 20);
+    front
+        .onion
+        .serve(theirs, circuit, vos_gateway::circuits::SSH)
+        .await;
     let mut handle =
-        client::connect_stream(Arc::new(client::Config::default()), stream, AcceptAll).await?;
+        client::connect_stream(Arc::new(client::Config::default()), ours, AcceptAll).await?;
     let key = ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&seed_of(
         circuit,
     )));
@@ -781,6 +770,7 @@ async fn over_circuit(
 }
 
 /// An SSH key of the connection's own.
+#[cfg(feature = "tor")]
 fn seed_of(circuit: u32) -> [u8; 32] {
     let mut seed = [7u8; 32];
     seed[..4].copy_from_slice(&circuit.to_le_bytes());
@@ -789,6 +779,7 @@ fn seed_of(circuit: u32) -> [u8; 32] {
 
 /// A `vos-api` subsystem channel asked for on `handle`: one the gateway
 /// serves no channel closes at once.
+#[cfg(feature = "tor")]
 async fn subsystem(handle: &client::Handle<AcceptAll>) -> russh::Channel<client::Msg> {
     let channel = handle.channel_open_session().await.unwrap();
     channel
@@ -799,6 +790,7 @@ async fn subsystem(handle: &client::Handle<AcceptAll>) -> russh::Channel<client:
 }
 
 /// A terminal's text, its escape sequences dropped.
+#[cfg(feature = "tor")]
 fn text(bytes: &[u8]) -> String {
     let mut text = String::new();
     let mut chars = String::from_utf8_lossy(bytes).into_owned();
@@ -833,14 +825,16 @@ fn text(bytes: &[u8]) -> String {
 }
 
 /// s4's screens over the onion: a stream on a circuit, handed to the
-/// gateway's SSH server with its circuit's address, serves the screen on
-/// a terminal and, on the same connection, the `vos-api` subsystem marking
+/// onion's SSH server with its circuit's address, serves the gateway's own
+/// screen (its file names no demo) on a terminal and, on the same connection, the `vos-api` subsystem marking
 /// onion, which the onion-only gated agent answers. Each circuit holds its
 /// own channels and their requests (two places here: past them a request
 /// is answered `Unavailable`, a further connection's channel on the same
 /// circuit is closed at once, and another circuit's is served) and its own
 /// streams (two: a third on the circuit is closed as it arrives); every
-/// place is given back once its connection ends.
+/// place, the streams' and the channels', is given back once its
+/// connection ends.
+#[cfg(feature = "tor")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_onions_ssh_serves_the_screens_marked_onion_and_limited_per_circuit() {
     const GATED: InstanceId = InstanceId(1);
@@ -881,8 +875,8 @@ async fn the_onions_ssh_serves_the_screens_marked_onion_and_limited_per_circuit(
             &(gated, query).encode(),
         )
     };
-    let (sidecar, onion, _dir) = onion(served.node.id().0, &served.socket, 2, 2).await;
-    let handle = over_circuit(sidecar, 7).await.unwrap();
+    let (onion, _dir) = onion(served.node.id().0, &served.socket, 2, 2);
+    let handle = over_circuit(&onion, 7).await.unwrap();
     // The screen, on a terminal.
     let mut shell = handle.channel_open_session().await.unwrap();
     shell
@@ -929,7 +923,7 @@ async fn the_onions_ssh_serves_the_screens_marked_onion_and_limited_per_circuit(
     );
     // A further connection on the circuit is served no channel; another
     // circuit's is.
-    let second = over_circuit(sidecar, 7).await.unwrap();
+    let second = over_circuit(&onion, 7).await.unwrap();
     let mut refused = subsystem(&second).await;
     refused.data(&query(74)[..]).await.unwrap_or(());
     assert_eq!(
@@ -937,7 +931,7 @@ async fn the_onions_ssh_serves_the_screens_marked_onion_and_limited_per_circuit(
         None,
         "past the circuit's channels"
     );
-    let other = over_circuit(sidecar, 8).await.unwrap();
+    let other = over_circuit(&onion, 8).await.unwrap();
     let mut served_other = subsystem(&other).await;
     served_other.data(&query(75)[..]).await.unwrap();
     let (kind, _, answer) = Answers { buffer: Vec::new() }
@@ -952,7 +946,7 @@ async fn the_onions_ssh_serves_the_screens_marked_onion_and_limited_per_circuit(
     // Circuit 7 holds its two streams: a third is closed as it arrives.
     assert_eq!(onion.circuits.streams(7), 2);
     assert!(
-        over_circuit(sidecar, 7).await.is_err(),
+        over_circuit(&onion, 7).await.is_err(),
         "past the circuit's streams"
     );
     // Every place given back once the connections end.
@@ -965,4 +959,20 @@ async fn the_onions_ssh_serves_the_screens_marked_onion_and_limited_per_circuit(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(onion.circuits.streams(7) + onion.circuits.streams(8), 0);
+    // And the circuit's channel places, once their tasks end: a new
+    // connection's channel and its request take both again.
+    let mut given_back = false;
+    for _ in 0..100 {
+        let again = over_circuit(&onion, 7).await.unwrap();
+        let mut channel = subsystem(&again).await;
+        channel.data(&query(76)[..]).await.unwrap();
+        let answer = Answers { buffer: Vec::new() }.next(&mut channel).await;
+        if answer.map(|(kind, _, _)| kind) == Some(Kind::Query as u16) {
+            given_back = true;
+            break;
+        }
+        drop((channel, again));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(given_back, "the circuit's places given back");
 }

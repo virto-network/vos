@@ -74,9 +74,8 @@ pub struct Config {
     pub onion: Option<Onion>,
 }
 
-/// The onion service (`light-node.md` §6.1, §6.6): arti in process (the
-/// `tor` feature), or a C tor beside the gateway forwarding to loopback
-/// listeners; and what its circuits and calls may take.
+/// The onion service (`light-node.md` §6.1, §6.6), arti in process (the
+/// `tor` feature), and what its circuits and calls may take.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Onion {
@@ -102,11 +101,6 @@ pub struct Onion {
     /// their burst, for them to enforce; the consensus's by default.
     pub intro_rate: Option<u32>,
     pub intro_burst: Option<u32>,
-    /// A C tor beside the gateway in place of arti: the loopback listeners
-    /// its `HiddenServicePort 22` and `80` forward to, with
-    /// `HiddenServiceExportCircuitID haproxy`.
-    pub sidecar_ssh: Option<SocketAddr>,
-    pub sidecar_http: Option<SocketAddr>,
     /// Streams open at once on one circuit.
     pub circuit_streams: Option<usize>,
     /// Circuits held at once.
@@ -136,11 +130,6 @@ pub const PER_CIRCUIT: PerAddress = PerAddress {
 };
 
 impl Onion {
-    /// Whether a C tor serves it, not arti.
-    pub fn sidecar(&self) -> bool {
-        self.sidecar_ssh.is_some() || self.sidecar_http.is_some()
-    }
-
     pub fn per_circuit(&self) -> PerCircuit {
         let defaults = PerCircuit::default();
         PerCircuit {
@@ -199,8 +188,22 @@ impl Config {
     }
 
     /// Refused: a space file naming a node the gateway does not list, and
-    /// an onion both arti's and a C tor's.
+    /// an onion whose circuits hold no stream, more streams than a
+    /// circuit's address has ports, or no circuit.
     pub fn check(&self) -> Result<(), String> {
+        if let Some(onion) = &self.onion {
+            let per = onion.per_circuit();
+            if !(1..=usize::from(u16::MAX)).contains(&per.streams) {
+                return Err(format!(
+                    "[onion] circuit_streams = {}: from 1 to {}",
+                    per.streams,
+                    u16::MAX
+                ));
+            }
+            if per.circuits == 0 {
+                return Err("[onion] circuits = 0: at least 1".into());
+            }
+        }
         if let Some(space) = &self.space {
             let listed: Vec<[u8; 32]> = self.upstreams()?.into_iter().map(|(key, _)| key).collect();
             let text = std::fs::read_to_string(space)
@@ -214,16 +217,6 @@ impl Config {
                     ));
                 }
             }
-        }
-        if let Some(onion) = &self.onion
-            && onion.sidecar()
-            && (onion.state.is_some()
-                || onion.cache.is_some()
-                || onion.arti.is_some()
-                || onion.key.is_some()
-                || onion.pow)
-        {
-            return Err("an onion is arti's (state, cache, arti, key, pow) or a C tor's (sidecar_ssh, sidecar_http), not both".into());
         }
         Ok(())
     }
@@ -378,17 +371,15 @@ mod tests {
             ))
             .unwrap()
         };
-        for arti in ["key = \"o\"", "arti = \"arti.toml\""] {
-            assert!(
-                onion(&format!("sidecar_ssh = \"127.0.0.1:2222\"\n{arti}\n"))
-                    .check()
-                    .is_err()
-            );
+        for refused in [
+            "circuit_streams = 0",
+            "circuit_streams = 65536",
+            "circuits = 0",
+        ] {
+            assert!(onion(&format!("{refused}\n")).check().is_err(), "{refused}");
         }
-        let sidecar = onion("sidecar_http = \"127.0.0.1:8081\"\ncircuit_rate = 5\n");
-        assert!(sidecar.check().is_ok());
-        let served = sidecar.onion.unwrap();
-        assert!(served.sidecar());
+        assert!(onion("circuit_streams = 65535\n").check().is_ok());
+        let served = onion("circuit_rate = 5\n").onion.unwrap();
         assert_eq!(served.limits().rate, 5);
         assert_eq!(served.limits().connections, PER_CIRCUIT.connections);
         assert_eq!(served.caps(), PerPort::default());
