@@ -10,7 +10,9 @@
 //! ```
 //!
 //! Each measurement is printed as `M <name> <value>` (milliseconds unless
-//! named otherwise), each note as `N <text>`; a failed bootstrap ends with
+//! named otherwise), each note as `N <text>`, the rendezvous the client
+//! opened last (`N rendezvous hour …`, counted as the foreground's); a
+//! failed bootstrap ends with
 //! `E bootstrap <its name>` and exit code 2, an unreachable gateway with
 //! `E <purpose> <why>` and exit code 3.
 
@@ -127,6 +129,7 @@ async fn main() {
     println!("M rss_bootstrapped_kib {}", rss_kib());
 
     let client = Client::new(Arc::new(tor), Config::default());
+    client.set_foreground(true);
     let space = [1; 32];
     client.set_space(
         space,
@@ -209,6 +212,9 @@ async fn main() {
         client.set_dormant(true);
         tokio::time::sleep(Duration::from_secs(args.idle)).await;
         println!("M rss_dormant_kib {}", rss_kib());
+    }
+    for hour in client.opened() {
+        println!("N {hour}");
     }
     println!("M wall_ms {}", ms(start));
 }
