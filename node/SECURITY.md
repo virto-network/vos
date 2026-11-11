@@ -47,7 +47,8 @@ holds is `node/light/SECURITY.md`'s, and what a verified proof proves is
 
 A proven call carries its kernel's claim (the kernel's public arguments,
 SCALE-encoded, the call's binding its last 32 bytes, at most 1 KiB) and
-one device proof (format 46) of the kernel's run stating it. Each check
+one device proof (format 47, or another device format the node admits:
+the release admits 47 alone) of the kernel's run stating it. Each check
 is cheaper than the next; every one but the last reads the request and
 this replica's applied state alone. A refusal is
 `Rejected(Credential(code))`, the codes in this order (the node API's
@@ -60,7 +61,8 @@ frame checks and the agent's placement come first, as for any call):
 3. this node serves the agent;
 4. the agent's space has a genesis (`NoSpace`): a binding names its
    `SpaceId`, and no proof may bind `NONE`;
-5. the format is the device format, 46, while admitted (`Format`);
+5. the format is a device format this node admits now, 47 by default,
+   each until its retirement (`Format`);
 6. the proof within the format's cap (1.5 MiB), the claim within
    `cap::CLAIM` (1 KiB), the arguments within `cap::REQUEST` less it
    (`Size`);
@@ -106,7 +108,7 @@ owner claim's owner, or the program's id for an actor's kernel, whose
 handler takes the claim as its first argument and checks it at apply (a
 stock kernel's checks are the node's, above).
 
-**A device proof** (format 46: the device profile, one masked segment
+**A device proof** (format 47: the device profile, one masked segment
 without the page-Merkle boundary, every chip at most 2^17 rows, the
 proof at most 1.5 MiB; `proving.md` §8) is of a device kernel's run: one
 of the credential actor's stock kernels (`auth`, `owner`), or an actor's
@@ -114,9 +116,9 @@ own. Its program (the kernel's chips, their log sizes
 and the preprocessed root) is one this node computes from a release of
 the installed kernel (the kernel, its reference program and its
 headroom) by a run on the arguments the reference returns
-(`vos_pvm_recair::device::Program::of`), never one a request names, and
-kept as its verifier alone (the program, its masked format and its id),
-by release. The
+(`vos_pvm_recair::device::Program::of`), in the proof's format, never
+one a request names, and kept as its verifier alone (the program, its
+masked format and its id), by release and format. The
 leader computes every device kernel's at the install, which fails for a
 kernel whose reference, or whose run on it, does not end within the
 format's shape. A replica that did not install it, or has restarted

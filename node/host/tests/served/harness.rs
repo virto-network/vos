@@ -67,8 +67,15 @@ pub struct Slot {
     pub installed: AtomicU64,
     pub trip: Arc<Trip>,
     pub offset: Arc<AtomicI64>,
+    /// The device formats its next start admits, where a test sets them
+    /// (`Config::device_formats`); the release's otherwise.
+    pub device_formats: Mutex<Option<DeviceFormats>>,
     dir: tempfile::TempDir,
 }
+
+/// Device formats a node admits, each with its retirement
+/// (`Config::device_formats`).
+pub type DeviceFormats = Vec<(u32, Option<u64>)>;
 
 /// [`NODES`] nodes on a hub whose losses follow its seed.
 pub struct Cluster {
@@ -122,6 +129,7 @@ impl Cluster {
                 installed: AtomicU64::new(0),
                 trip: Arc::new(Trip::default()),
                 offset: Arc::new(AtomicI64::new(0)),
+                device_formats: Mutex::new(None),
                 dir,
             })
             .collect();
@@ -205,6 +213,9 @@ impl Cluster {
                 everyone.load(Ordering::SeqCst) + offset.load(Ordering::SeqCst),
             )
         });
+        if let Some(formats) = slot.device_formats.lock().unwrap().clone() {
+            config.device_formats = formats;
+        }
         let node = Node::open(slot.dir.path(), config).unwrap();
         node.serve_socket(&slot.dir.path().join("api.sock"), 0o600)
             .unwrap();

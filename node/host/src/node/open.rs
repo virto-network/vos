@@ -41,6 +41,8 @@ impl Node {
         if config.refine_gas < defaults::min_refine_gas(config.max_inputs.max(1)) {
             return Err(Error::Gas);
         }
+        let devices = crate::credentialed::DevicePrograms::admitting(&config.device_formats)
+            .ok_or(Error::Formats)?;
         let data = data.as_ref().to_path_buf();
         private_dir(&data).map_err(Error::Data)?;
         let store =
@@ -105,7 +107,7 @@ impl Node {
             .max()
             .unwrap_or(1);
         let settings = Settings::of(&config);
-        let calls = crate::calls::Calls::default();
+        let calls = crate::calls::Calls::admitting(devices);
         for &(format, at_ms) in &config.retired_formats {
             calls.devices.retire_format(format, at_ms);
         }

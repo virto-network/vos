@@ -26,10 +26,11 @@
 //! kernel's release and, until its date, the previous release an install
 //! replaced (`Installed::window`), and the binding names which; ingress
 //! admits the device formats this node verifies, the current and the
-//! previous, each until its retirement ([`DEVICE_FORMATS`], with the
-//! operator's earlier date if it set one). A proof of a retired release
-//! names a program no guard admits (`Binding`); one of a retired format is
-//! refused at once (`Format`).
+//! previous, each until its retirement ([`DEVICE_FORMATS`] or the node's
+//! configured ones, with the operator's earlier date if it set one), and
+//! verifies a proof against each release's program in the proof's format.
+//! A proof of a retired release names a program no guard admits
+//! (`Binding`); one of a retired format is refused at once (`Format`).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -56,48 +57,81 @@ use crate::lock;
 use crate::node::Inner;
 use crate::store::Snapshot;
 
-/// The device formats this node verifies, newest first, each with the
+/// The device formats a node admits by default, newest first, each with the
 /// retirement its release set, if any: at most the current and the
 /// previous (`light-node.md` §4.4). A release that brings a new format
 /// sets the previous one's to 60 days on; the operator may set any earlier
-/// date ([`DevicePrograms::retire_format`]).
-pub(crate) const DEVICE_FORMATS: [(u32, Option<u64>); 1] = [(device::FORMAT.number, None)];
+/// date (`Node::retire_format`). Format 47's release retires
+/// 46 at once: its byte ledger lets a read see a stale byte (`open.md`).
+pub const DEVICE_FORMATS: [(u32, Option<u64>); 2] = [
+    (device::FORMAT.number, None),
+    (device::FORMATS[1].number, Some(0)),
+];
+const _: () = assert!(device::FORMATS[1].number == 46);
 
-/// A device program's place, by its release: computed once however many
+/// A device program's place, by its release and format: computed once however many
 /// requests wait on it; `None` for a release whose program cannot be
 /// computed (its reference does not run, its kernel does not run on it, or
 /// its run is past the device format's shape), so a request naming it
 /// costs no second attempt.
 type Place = Arc<smol::lock::OnceCell<Option<Arc<Verifier>>>>;
 
-/// The device programs this node holds, their verifiers alone, by release;
-/// and the device formats' retirements its operator set.
-#[derive(Default)]
+/// The device programs this node holds, their verifiers alone, by release
+/// and format; the device formats it admits, each with its release's
+/// retirement; and the retirements its operator set.
 pub(crate) struct DevicePrograms {
-    programs: Mutex<HashMap<DeviceRelease, Place>>,
+    programs: Mutex<HashMap<(DeviceRelease, u32), Place>>,
+    formats: Vec<(u32, Option<u64>)>,
     retired: Mutex<HashMap<u32, u64>>,
 }
 
+impl Default for DevicePrograms {
+    fn default() -> Self {
+        Self::admitting(&DEVICE_FORMATS).expect("the release's formats")
+    }
+}
+
 impl DevicePrograms {
-    /// Keeps `programs`, each by its release: an install's, computed before
-    /// its entry is queued.
+    /// None held yet, admitting `formats`, newest first: `None` unless they
+    /// are one or two, distinct, each one this binary verifies.
+    pub(crate) fn admitting(formats: &[(u32, Option<u64>)]) -> Option<Self> {
+        let known = formats
+            .iter()
+            .all(|(format, _)| device::format(*format).is_some());
+        let distinct = formats
+            .iter()
+            .enumerate()
+            .all(|(at, (format, _))| formats[..at].iter().all(|(other, _)| other != format));
+        (known && distinct && (1..=2).contains(&formats.len())).then(|| Self {
+            programs: Mutex::default(),
+            formats: formats.to_vec(),
+            retired: Mutex::default(),
+        })
+    }
+
+    /// Keeps `programs`, each by its release, in the device format: an
+    /// install's, computed before its entry is queued.
     pub(crate) fn pin(&self, programs: Vec<(DeviceRelease, Verifier)>) {
         let mut held = lock(&self.programs);
         for (release, program) in programs {
-            held.insert(release, Arc::new(Some(Arc::new(program)).into()));
+            let format = program.format().number;
+            held.insert((release, format), Arc::new(Some(Arc::new(program)).into()));
         }
     }
 
-    /// The place of `release`'s program, made empty if it has none.
-    fn place(&self, release: DeviceRelease) -> Place {
-        Arc::clone(lock(&self.programs).entry(release).or_default())
+    /// The place of `release`'s program in `format`, made empty if it has
+    /// none.
+    fn place(&self, release: DeviceRelease, format: u32) -> Place {
+        Arc::clone(lock(&self.programs).entry((release, format)).or_default())
     }
 
     /// Retires device format `format` at `at_ms`, if that is earlier than
-    /// its retirement: its date kept, if this node verifies the format.
+    /// its retirement: its date kept, if this node admits the format.
     pub(crate) fn retire_format(&self, format: u32, at_ms: u64) -> Option<u64> {
-        let (_, released) = DEVICE_FORMATS
-            .into_iter()
+        let (_, released) = self
+            .formats
+            .iter()
+            .copied()
             .find(|(number, _)| *number == format)?;
         let mut retired = lock(&self.retired);
         let date = retired
@@ -116,8 +150,9 @@ impl DevicePrograms {
     /// retirement, if one is set.
     pub(crate) fn formats(&self, now: u64) -> Vec<FormatWindow> {
         let retired = lock(&self.retired);
-        DEVICE_FORMATS
-            .into_iter()
+        self.formats
+            .iter()
+            .copied()
             .map(|(format, released)| FormatWindow {
                 format,
                 retires_ms: retired
@@ -241,7 +276,7 @@ impl Inner {
         };
         let mut programs = Vec::with_capacity(front.window.len());
         for release in &front.window {
-            match self.device_program(*release).await {
+            match self.device_program(*release, call.format).await {
                 Ok(program) => programs.push((*release, program)),
                 Err(refused) => return refused.into(),
             }
@@ -298,17 +333,21 @@ impl Inner {
             .await
     }
 
-    /// The device program of `release`: computed on an executor from the
-    /// stored kernel and reference the first time, one computation however
-    /// many requests wait on it, then kept; `None`, kept too, for a release
-    /// whose program cannot be computed from its bytes (its shape, its
-    /// runs). A program this replica does not hold yet, any other failure,
-    /// or an executor gone, is `Unavailable`, retryable, and not kept.
+    /// The device program of `release` in device format `format`: computed
+    /// on an executor from the stored kernel and reference the first time,
+    /// one computation however many requests wait on it, then kept; `None`,
+    /// kept too, for a release whose program cannot be computed from its
+    /// bytes in that format (its shape, its runs). A program this replica
+    /// does not hold yet, any other failure, or an executor gone, is
+    /// `Unavailable`, retryable, and not kept. `format` is one the node
+    /// admits, which ingress checks first.
     async fn device_program(
         &self,
         release: DeviceRelease,
+        format: u32,
     ) -> Result<Option<Arc<Verifier>>, Refused> {
-        let place = self.calls.devices.place(release);
+        let in_format = *device::format(format).ok_or(Refused::Code(CredentialRefusal::Format))?;
+        let place = self.calls.devices.place(release, format);
         let blobs = self.blobs.clone();
         place
             .get_or_try_init(|| async move {
@@ -317,7 +356,8 @@ impl Inner {
                         blobs.get(&hash).ok().flatten().ok_or(Refused::Unavailable)
                     };
                     let (kernel, reference) = (blob(release.kernel.0)?, blob(release.reference.0)?);
-                    match device::Program::of(&kernel, &reference, release.headroom) {
+                    match device::Program::of_in(&in_format, &kernel, &reference, release.headroom)
+                    {
                         Ok(program) => Ok(Some(Arc::new(program.verifier()))),
                         Err(error) if of_the_kernel(&error) => Ok(None),
                         Err(_) => Err(Refused::Unavailable),
@@ -333,7 +373,8 @@ impl Inner {
     /// The device window of `instance` of `agent` as this replica's applied
     /// state and this node hold it: the device formats it admits now, and
     /// for each device kernel the programs its guard admits, newest first,
-    /// each with its retirement (`Kind::Devices`). `None` for an instance
+    /// each release's in every format admitted, newest first, each with its
+    /// retirement (`Kind::Devices`). `None` for an instance
     /// not installed; a release whose program cannot be computed is left
     /// out, and one this node cannot compute yet (a blob it does not hold)
     /// marks its kernel's window `unavailable`.
@@ -359,16 +400,16 @@ impl Inner {
             };
             let (mut programs, mut unavailable) = (Vec::new(), false);
             for release in installed.window(method.id, now) {
-                match self.device_program(release).await {
-                    // Every program is computed under the current device
-                    // format until a second one is verified.
-                    Ok(Some(program)) => programs.push(ProgramWindow {
-                        id: *program.id(),
-                        format: device::FORMAT.number,
-                        retires_ms: retires(&release),
-                    }),
-                    Ok(None) => {}
-                    Err(_) => unavailable = true,
+                for format in &formats {
+                    match self.device_program(release, format.format).await {
+                        Ok(Some(program)) => programs.push(ProgramWindow {
+                            id: *program.id(),
+                            format: format.format,
+                            retires_ms: retires(&release),
+                        }),
+                        Ok(None) => {}
+                        Err(_) => unavailable = true,
+                    }
                 }
             }
             kernels.push(KernelWindow {
@@ -632,6 +673,27 @@ fn ring(snapshot: &Snapshot, agent: AgentId) -> Result<Option<Ring>, Fault> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The device formats a node admits are one or two, distinct, each one
+    /// this binary verifies; the release's are.
+    #[test]
+    fn the_admitted_formats_are_checked() {
+        assert!(DevicePrograms::admitting(&DEVICE_FORMATS).is_some());
+        assert!(DevicePrograms::admitting(&[(46, None)]).is_some());
+        assert!(DevicePrograms::admitting(&[]).is_none(), "none");
+        assert!(
+            DevicePrograms::admitting(&[(45, None)]).is_none(),
+            "unknown"
+        );
+        assert!(
+            DevicePrograms::admitting(&[(47, None), (47, None)]).is_none(),
+            "twice"
+        );
+        assert!(
+            DevicePrograms::admitting(&[(47, None), (46, None), (46, Some(1))]).is_none(),
+            "three"
+        );
+    }
 
     /// A verification takes a place while fewer than the budget hold one,
     /// and gives it back when it ends.

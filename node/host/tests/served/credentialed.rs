@@ -1658,6 +1658,160 @@ fn an_app_one_release_behind_signs_in_until_its_window_closes() {
     );
 }
 
+/// The device formats' window (`light-node.md` §4.4) at one node: by
+/// default it admits 47 alone and refuses a 46 proof `Format`. Restarted
+/// admitting both (a test's configuration), its window names the stock
+/// `auth` kernel's program in each, an app shipping both chooses 47 and
+/// one shipping 46 alone chooses 46, and a 46 proof and a 47 proof are
+/// both run as their members' pseudonyms. The operator retires 46 now: its
+/// proof made before is refused `Format` and the app chooses 47. Restarted
+/// admitting 46 alone, the app shipping both chooses 46, and its proof is
+/// run.
+#[test]
+fn the_previous_device_format_is_admitted_until_it_is_retired() {
+    use vos_light::wire::{self, Answer};
+    use vos_light::{DeviceError, Proven};
+
+    let previous = vos_pvm_recair::device::FORMATS[1].number;
+    assert_eq!((DEVICE_FORMAT, previous), (47, 46));
+    let founded = Founded::new();
+    let auth = founded.method(CREDENTIALS, "auth");
+    let elf = std::fs::read(credentials_elf()).unwrap();
+    let current = stock(&elf, "auth");
+    let byte = vos_light::release::devices_in(previous, &elf)
+        .unwrap()
+        .into_iter()
+        .find(|device| device.method == auth)
+        .unwrap();
+    assert_eq!((current.format, byte.format), (DEVICE_FORMAT, previous));
+    assert_ne!(current.id, byte.id);
+    let (both, only_byte) = (vec![current.clone(), byte.clone()], vec![byte.clone()]);
+
+    let at = founded.follower();
+    let secrets = [0x51, 0x52, 0x53, 0x54].map(Secret::new);
+    for secret in &secrets {
+        founded.write(CREDENTIALS, "enroll", secret.member());
+    }
+    let witnesses = secrets
+        .each_ref()
+        .map(|secret| witness(&founded.path(secret)));
+    let formats = |window: &DeviceWindow| -> Vec<u32> {
+        window.formats.iter().map(|format| format.format).collect()
+    };
+    let programs = |window: &DeviceWindow| -> Vec<([u8; 32], u32)> {
+        window
+            .kernels
+            .iter()
+            .find(|kernel| kernel.method == auth)
+            .unwrap()
+            .programs
+            .iter()
+            .map(|program| (program.id, program.format))
+            .collect()
+    };
+    // The member's sign-in with the program its app chooses at `at`.
+    let sign_in = |member: usize, app: &[Device]| {
+        let chosen = vos_light::choose(app, &window(&founded, at, CREDENTIALS), auth)?;
+        let program = DeviceProgram::released(chosen).unwrap();
+        let call = founded.call(at, POLL, "login", ());
+        let proof = founded
+            .prover
+            .prove_auth(
+                &secrets[member].0,
+                &witnesses[member],
+                b"login",
+                &call,
+                &program,
+            )
+            .unwrap();
+        assert_eq!(proof.format, chosen.format);
+        Ok::<_, DeviceError>((chosen.format, call, proof))
+    };
+    let send = |call: &Call, proof: &Proven| {
+        wire::credentialed_answer(&device_send(&founded, at, &wire::credentialed(call, proof)))
+            .unwrap()
+    };
+    // The node restarted admitting `admitted`, then caught up with the
+    // leader's applied index, so its forwarded calls reach a leader.
+    let restart = |admitted: Vec<(u32, Option<u64>)>| {
+        let leading = founded
+            .cluster
+            .leading(founded.agent)
+            .applied(founded.agent);
+        founded.cluster.stop(at);
+        *founded.cluster.slot(at).device_formats.lock().unwrap() = Some(admitted);
+        founded.cluster.start(at);
+        vos_checker::spaces::wait_in_process("the node caught up", || {
+            founded
+                .cluster
+                .node(at)
+                .is_some_and(|node| node.applied(founded.agent) >= leading)
+                && client::devices(founded.cluster.target(at), founded.agent, CREDENTIALS)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|window| !programs(&window).is_empty())
+        });
+    };
+
+    // The release's default: 47 alone, a 46 proof refused at once.
+    let window_47 = window(&founded, at, CREDENTIALS);
+    assert_eq!(formats(&window_47), [DEVICE_FORMAT]);
+    assert_eq!(programs(&window_47), [(current.id, DEVICE_FORMAT)]);
+    assert!(matches!(sign_in(0, &only_byte), Err(DeviceError::Window)));
+    let byte_program = DeviceProgram::released(&byte).unwrap();
+    let call = founded.call(at, POLL, "login", ());
+    let refused = founded
+        .prover
+        .prove_auth(&secrets[0].0, &witnesses[0], b"login", &call, &byte_program)
+        .unwrap();
+    assert_eq!(refused.format, previous);
+    assert_eq!(
+        send(&call, &refused),
+        Answer::Refused(CredentialRefusal::Format)
+    );
+
+    // Both admitted: one node runs a 47 proof and a 46 proof in one run.
+    restart(vec![(DEVICE_FORMAT, None), (previous, None)]);
+    let window_both = window(&founded, at, CREDENTIALS);
+    assert_eq!(formats(&window_both), [DEVICE_FORMAT, previous]);
+    assert_eq!(
+        programs(&window_both),
+        [(current.id, DEVICE_FORMAT), (byte.id, previous)]
+    );
+    let (format, call, proof) = sign_in(0, &both).unwrap();
+    assert_eq!(format, DEVICE_FORMAT, "the newest format admitted");
+    assert!(matches!(send(&call, &proof), Answer::Ran { .. }));
+    let (format, call, proof) = sign_in(1, &only_byte).unwrap();
+    assert_eq!(format, previous);
+    assert!(matches!(send(&call, &proof), Answer::Ran { .. }));
+    let made_before = sign_in(2, &only_byte).unwrap();
+
+    // 46 retired now: its proof refused, the app back on 47.
+    let node = founded.cluster.node(at).unwrap();
+    let now = client::time(founded.cluster.target(at)).unwrap();
+    assert_eq!(node.retire_format(previous, now), Some(now));
+    drop(node);
+    assert_eq!(formats(&window(&founded, at, CREDENTIALS)), [DEVICE_FORMAT]);
+    let (_, call, proof) = made_before;
+    assert_eq!(
+        send(&call, &proof),
+        Answer::Refused(CredentialRefusal::Format)
+    );
+    assert!(matches!(sign_in(2, &only_byte), Err(DeviceError::Window)));
+    let (format, call, proof) = sign_in(2, &both).unwrap();
+    assert_eq!(format, DEVICE_FORMAT);
+    assert!(matches!(send(&call, &proof), Answer::Ran { .. }));
+
+    // 46 alone: the app shipping both chooses it.
+    restart(vec![(previous, None)]);
+    let window_46 = window(&founded, at, CREDENTIALS);
+    assert_eq!(formats(&window_46), [previous]);
+    assert_eq!(programs(&window_46), [(byte.id, previous)]);
+    let (format, call, proof) = sign_in(3, &both).unwrap();
+    assert_eq!(format, previous);
+    assert!(matches!(send(&call, &proof), Answer::Ran { .. }));
+}
+
 /// The tree kept from its feed: a follower's feed read page by page into
 /// the device's keeper, no query naming the member; the path it computes
 /// the actor's `path`; its proof, against the newest root, admitted by a
