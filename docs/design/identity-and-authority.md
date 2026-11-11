@@ -227,7 +227,7 @@ wants one says "from agent G, with claim `decision(d)`".
   ever crosses a space boundary, so none leaks who was revoked.
 
 **Proven calls** [decided]: a call whose authority is a device kernel's
-proof (format 46, `proving.md` §8; `light-node.md` §4), with no session
+proof (format 47, `proving.md` §8; `light-node.md` §4), with no session
 and no signature. Ingress verifies the proof and logs the origin it
 proves and the kernel's claim.
 - **The request:** `Credentialed`, a request kind of the node's binary
