@@ -4,7 +4,10 @@
 //! invites members and mints, and the
 //! gateway's SSH port serving the demo's screens over the node's socket.
 //! A phone runs it through `adb reverse`; the end-to-end test
-//! drives it with a headless client.
+//! drives it with a headless client. Beside it, on the same node, test
+//! homes ([`home`]): home-only spaces of personal agents.
+
+pub mod home;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -37,6 +40,8 @@ pub const INVITATION_MS: u64 = 600_000;
 pub struct LocalSpace {
     node: Node,
     socket: PathBuf,
+    space: vos_wire::SpaceId,
+    key: SigningKey,
     agent: AgentId,
     operator: Mutex<Client>,
     programs: [(InstanceId, Vec<u8>); 3],
@@ -75,6 +80,7 @@ impl LocalSpace {
             let genesis = space.found(WindowClock::DEFAULT, vos_node::wall_clock(), random())?;
             space.with_genesis(genesis)?
         };
+        let space_id = space.id();
         let key = SigningKey::from_bytes(&operator);
         let mut config = Config::new(program);
         config.executors = 2;
@@ -124,6 +130,8 @@ impl LocalSpace {
         let space = Self {
             node,
             socket,
+            space: space_id,
+            key: key.clone(),
             agent,
             operator: Mutex::new(Client::new(&target, key)),
             programs: [
@@ -138,6 +146,16 @@ impl LocalSpace {
 
     pub fn agent(&self) -> AgentId {
         self.agent
+    }
+
+    /// The founded space's id.
+    pub fn space_id(&self) -> [u8; 32] {
+        self.space.0
+    }
+
+    /// The node's API socket.
+    pub fn socket(&self) -> PathBuf {
+        self.socket.clone()
     }
 
     pub fn node(&self) -> &Node {
@@ -242,6 +260,22 @@ impl LocalSpace {
         }
     }
 
+    /// `count` members of random digests enrolled in the credential
+    /// actor's tree, 256 a call: a tree whose feed a new device reads
+    /// whole, about 77 bytes a member.
+    pub fn members(&self, count: u32) -> Result<(), String> {
+        let mut left = count as usize;
+        while left > 0 {
+            let at_once = left.min(vos_wire::credentials::ENROLL_MANY);
+            let digests: Vec<[u8; 32]> = (0..at_once)
+                .map(|_| random::<32>().map(|byte| byte & 0x3f))
+                .collect();
+            self.write(CREDENTIALS, "enroll_many", digests)?;
+            left -= at_once;
+        }
+        Ok(())
+    }
+
     pub fn mint(&self, account: &str, amount: u64) -> Result<(), String> {
         self.write(PAYMENTS, "mint", (account.as_bytes().to_vec(), amount))
             .map(|_| ())
@@ -289,15 +323,53 @@ impl LocalSpace {
     }
 }
 
-/// The demo's gateway as `vos-gateway` serves it: its SSH port and the
-/// onion arti hosts for it, each serving the demo's screens.
-pub struct Hosted {
-    /// The onion's address, `….onion`.
-    pub onion: String,
-    /// The SSH host key both ports present, its fingerprint.
-    pub fingerprint: String,
-    ssh: tokio::task::JoinHandle<()>,
+/// Which gateway a file describes: the demo's space's (its SSH port and its
+/// onion, serving its screens), or the test homes' (an onion of its own,
+/// its own SSH host key, no clearnet port and no screens but the
+/// gateway's), so no host key joins a home to a space its members use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Served {
+    Demo,
+    Homes,
+}
+
+impl Served {
+    /// The name of its file `name` under the data directory.
+    fn file(self, name: &str) -> String {
+        match self {
+            Served::Demo => name.to_owned(),
+            Served::Homes => format!("homes-{name}"),
+        }
+    }
+}
+
+/// A circuit's requests a second, and their burst.
+#[derive(Clone, Copy, Debug)]
+pub struct Rate {
+    pub rate: u32,
+    pub burst: u32,
+}
+
+/// An onion hosted by arti, and how a device pins it.
+pub struct Onion {
+    /// Its address, `….onion`.
+    pub address: String,
+    /// Its key and the SSH host key its port 22 presents, as the
+    /// registrar's onion set and a home's code name them.
+    pub pinned: vos_wire::credentials::Onion,
     _served: vos_gateway::served::Served,
+}
+
+/// The demo's gateways as `vos-gateway` serves them: the space's SSH port
+/// and onion, each serving the demo's screens, and the homes' onion.
+pub struct Hosted {
+    /// The space's onion.
+    pub onion: Onion,
+    /// The SSH host key the space's ports present, its fingerprint.
+    pub fingerprint: String,
+    /// The homes' onion, if asked for.
+    pub homes: Option<Onion>,
+    ssh: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for Hosted {
@@ -307,15 +379,37 @@ impl Drop for Hosted {
 }
 
 impl LocalSpace {
-    /// The gateway's file for this space, its keys and arti's state under
-    /// `data`, its SSH port on `ssh`.
+    /// `served`'s gateway file for this space, its keys and arti's state
+    /// under `data`, its one upstream the node's API at `socket`; the
+    /// demo's names its SSH port on `ssh`.
     fn gateway_file(
         &self,
+        served: Served,
         data: &Path,
         ssh: SocketAddr,
+        socket: &Path,
+        rate: Option<Rate>,
     ) -> Result<vos_gateway::config::Config, String> {
         let demo = self.demo();
-        let at = |name: &str| data.join(name).display().to_string();
+        let at = |name: &str| data.join(served.file(name)).display().to_string();
+        let screens = match served {
+            Served::Demo => format!(
+                r#"app_key = "{app_key}"
+
+[demo]
+agent = {agent}
+credentials = {credentials}
+payments = {payments}
+poll = {poll}
+"#,
+                app_key = at("app.key"),
+                agent = demo.agent,
+                credentials = demo.credentials,
+                payments = demo.payments,
+                poll = demo.poll,
+            ),
+            Served::Homes => String::new(),
+        };
         let text = format!(
             r#"
 key = "{key}"
@@ -323,31 +417,22 @@ http = "127.0.0.1:0"
 nodes = [{{ key = "{node}", address = "unix:{socket}" }}]
 ssh = "{ssh}"
 ssh_host_key = "{host_key}"
-app_key = "{app_key}"
-
-[demo]
-agent = {agent}
-credentials = {credentials}
-payments = {payments}
-poll = {poll}
-
+{screens}
 [onion]
 state = "{state}"
 cache = "{cache}"
 key = "{onion}"
-"#,
+{rate}"#,
             key = at("gateway.key"),
             node = hex::encode(self.node.id().0),
-            socket = self.socket.display(),
+            socket = socket.display(),
             host_key = at("ssh_host_key"),
-            app_key = at("app.key"),
-            agent = demo.agent,
-            credentials = demo.credentials,
-            payments = demo.payments,
-            poll = demo.poll,
             state = at("onion/state"),
             cache = at("onion/cache"),
             onion = at("onion.key"),
+            rate = rate.map_or(String::new(), |Rate { rate, burst }| format!(
+                "circuit_rate = {rate}\ncircuit_burst = {burst}\n"
+            )),
         );
         let config: vos_gateway::config::Config =
             toml::from_str(&text).map_err(|error| error.to_string())?;
@@ -355,25 +440,44 @@ key = "{onion}"
         Ok(config)
     }
 
-    /// The gateway `vos-gateway` would serve for this space, its keys and
-    /// arti's state kept under `data`: its SSH port on `ssh` and its onion,
-    /// hosted by arti over the live Tor network, the enrollment pinning
-    /// that onion and the SSH host key both present.
-    pub async fn host(&self, data: &Path, ssh: SocketAddr) -> Result<Hosted, String> {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(data.join("onion"))
-            .map_err(|error| error.to_string())?;
-        let config = self.gateway_file(data, ssh)?;
-        let gateway = Arc::new(Gateway::new(
+    /// A gateway in front of this node as the file `config` names it.
+    fn front_gateway(config: &vos_gateway::config::Config) -> Result<Arc<Gateway>, String> {
+        Ok(Arc::new(Gateway::new(
             config
                 .upstreams()?
                 .into_iter()
                 .map(|(key, address)| Upstream::new(key, address, random()))
                 .collect(),
-        ));
+        )))
+    }
+
+    /// `served`'s onion, hosted by arti over the live Tor network, its keys
+    /// and arti's state under `data`.
+    async fn launch(&self, served: Served, data: &Path) -> Result<Onion, String> {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(data.join(served.file("onion")))
+            .map_err(|error| error.to_string())?;
+        let config = self.gateway_file(served, data, unbound(), &self.socket, None)?;
+        let gateway = Self::front_gateway(&config)?;
+        let onion = config.onion.as_ref().expect("the file's onion");
+        let hosted = vos_gateway::served::onion(&config, onion, gateway).await?;
+        Ok(Onion {
+            address: hosted.hosted.address.clone(),
+            pinned: pinned(&config)?.1,
+            _served: hosted,
+        })
+    }
+
+    /// The gateways `vos-gateway` would serve for this space, their keys
+    /// and arti's state kept under `data`: the space's SSH port on `ssh`
+    /// and its onion, the enrollment pinning that onion and the SSH host
+    /// key both present; with `homes`, the homes' onion beside it.
+    pub async fn host(&self, data: &Path, ssh: SocketAddr, homes: bool) -> Result<Hosted, String> {
+        let config = self.gateway_file(Served::Demo, data, ssh, &self.socket, None)?;
+        let gateway = Self::front_gateway(&config)?;
         let mark = vos_api::Mark::Clearnet;
         let app = vos_gateway::config::seed(config.app_key.as_ref().expect("the file's app key"))?;
         let app = Arc::new(AppClient::new(app, Arc::clone(&gateway), mark));
@@ -386,23 +490,78 @@ key = "{onion}"
         let listener = tokio::net::TcpListener::bind(ssh)
             .await
             .map_err(|error| format!("{ssh}: {error}"))?;
-        let ssh =
-            vos_gateway::ssh::serve(&config, Arc::clone(&gateway), port, Some(app), listener)?;
-        let onion = config.onion.as_ref().expect("the file's onion");
-        let served = vos_gateway::served::onion(&config, onion, gateway).await?;
-        let host_key = config.ssh_host_key.as_ref().expect("the file's host key");
-        let fingerprint = russh::keys::load_secret_key(host_key, None)
-            .map_err(|error| format!("{}: {error}", host_key.display()))?
-            .public_key()
-            .fingerprint(russh::keys::ssh_key::HashAlg::Sha256)
-            .to_string();
+        let ssh = vos_gateway::ssh::serve(&config, gateway, port, Some(app), listener)?;
+        let (fingerprint, _) = pinned(&config)?;
+        let onion = self.launch(Served::Demo, data).await?;
+        let homes = match homes {
+            true => Some(self.launch(Served::Homes, data).await?),
+            false => None,
+        };
         Ok(Hosted {
-            onion: served.hosted.address.clone(),
+            onion,
             fingerprint,
+            homes,
             ssh,
-            _served: served,
         })
     }
+
+    /// `served`'s onion for this space, its keys under `data`, served in
+    /// process: the servers its streams are handed to, as arti hands them
+    /// ([`vos_gateway::circuits::Onion::serve`]), relaying to the node's
+    /// API at `socket`, each circuit's requests held to `rate` if given,
+    /// else to the gateway's own; and the onion as the registrar's set
+    /// names it. On a runtime; no Tor.
+    pub async fn onion_front(
+        &self,
+        served: Served,
+        data: &Path,
+        socket: &Path,
+        rate: Option<Rate>,
+    ) -> Result<(vos_gateway::served::Front, vos_wire::credentials::Onion), String> {
+        let config = self.gateway_file(served, data, unbound(), socket, rate)?;
+        let gateway = Self::front_gateway(&config)?;
+        let onion = config.onion.as_ref().expect("the file's onion");
+        let front = vos_gateway::served::front(&config, onion, gateway)?;
+        Ok((front, pinned(&config)?.1))
+    }
+}
+
+/// An SSH address no listener is bound to: the onion's SSH server takes
+/// only the streams the onion hands it.
+fn unbound() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 0))
+}
+
+/// The file's SSH host key's fingerprint, once its SSH server made it, and
+/// its onion as a device pins it: the onion's key and the SSH host key its
+/// port 22 presents.
+fn pinned(
+    config: &vos_gateway::config::Config,
+) -> Result<(String, vos_wire::credentials::Onion), String> {
+    let path = config.ssh_host_key.as_ref().expect("the file's host key");
+    let host_key = russh::keys::load_secret_key(path, None)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let public = host_key.public_key();
+    let fingerprint = public
+        .fingerprint(russh::keys::ssh_key::HashAlg::Sha256)
+        .to_string();
+    let ssh_host_key = public
+        .key_data()
+        .ed25519()
+        .map(|key| key.0)
+        .ok_or("the SSH host key is not Ed25519")?;
+    let key = config
+        .onion
+        .as_ref()
+        .and_then(|onion| onion.key.as_ref())
+        .expect("the file's onion key");
+    let key = SigningKey::from_bytes(&vos_gateway::config::seed(key)?)
+        .verifying_key()
+        .to_bytes();
+    Ok((
+        fingerprint,
+        vos_wire::credentials::Onion { key, ssh_host_key },
+    ))
 }
 
 /// `N` bytes from the operating system.

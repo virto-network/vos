@@ -850,6 +850,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "64fa3c856b712db6612c019f14756e64e4bcea13337a6b33b696333a9eaa2d06"
 
 [[package]]
+name = "byte-slice-cast"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7575182f7272186991736b70173b0ea045398f984bf5ebbb3804736ce1330c9d"
+
+[[package]]
 name = "bytemuck"
 version = "1.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1173,6 +1179,27 @@ name = "const-oid"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
+
+[[package]]
+name = "const_format"
+version = "0.2.37"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3decb4d6965448659923544a634a0571ba44cede4e11ef15a5a317126840454"
+dependencies = [
+ "const_format_proc_macros",
+ "konst",
+]
+
+[[package]]
+name = "const_format_proc_macros"
+version = "0.2.37"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "941b570269a642506f08cb5b688c04bfa6cfd41a26f8bcdc49db8fd00c0ab659"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-xid",
+]
 
 [[package]]
 name = "constant_time_eq"
@@ -3327,6 +3354,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "konst"
+version = "0.2.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "128133ed7824fcd73d6e7b17957c5eb7bacb885649bd8c69708b2331a10bcefb"
+dependencies = [
+ "konst_macro_rules",
+]
+
+[[package]]
+name = "konst_macro_rules"
+version = "0.2.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
+
+[[package]]
 name = "kqueue"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4192,6 +4234,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e6eb142958d64335fb0e345c5b9ead2ecd6fc438c307e9d7d3c4fd428dbaf12"
 dependencies = [
  "libm",
+]
+
+[[package]]
+name = "parity-scale-codec"
+version = "3.7.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "799781ae679d79a948e13d4824a40970bfa500058d245760dd857301059810fa"
+dependencies = [
+ "arrayvec",
+ "bitvec",
+ "byte-slice-cast",
+ "const_format",
+ "impl-trait-for-tuples",
+ "parity-scale-codec-derive",
+ "rustversion",
+ "serde",
+]
+
+[[package]]
+name = "parity-scale-codec-derive"
+version = "3.7.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34b4653168b563151153c9e4c08ebed57fb8262bebfa79711552fa983c623e7a"
+dependencies = [
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
 ]
 
 [[package]]
@@ -8291,6 +8361,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "vos-checker"
+version = "0.1.0"
+dependencies = [
+ "aho-corasick",
+ "blake2 0.10.6",
+ "blake3",
+ "ed25519-dalek 2.2.0",
+ "hex",
+ "libc",
+ "smol",
+ "socket2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "vos-api",
+ "vos-gateway",
+ "vos-net",
+ "vos-node",
+ "vos-node-prover",
+ "vos-statement-service",
+ "vos-testkit",
+ "vos-venue",
+ "vos-wire",
+]
+
+[[package]]
 name = "vos-exec"
 version = "0.1.0"
 dependencies = [
@@ -8348,16 +8445,21 @@ dependencies = [
  "hmac 0.12.1",
  "russh",
  "s4-credential",
+ "s4-credential-contract",
  "s4-protocol",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
  "toml 1.1.5+spec-1.1.0",
+ "tracing",
  "tracing-subscriber",
  "vos-api",
+ "vos-checker",
  "vos-gateway",
+ "vos-keeper",
  "vos-light",
  "vos-node",
+ "vos-pvm-recair",
  "vos-testkit",
  "vos-wire",
  "zeroize",
@@ -8378,6 +8480,17 @@ dependencies = [
  "tracing",
  "vos-api",
  "vos-net",
+ "vos-wire",
+]
+
+[[package]]
+name = "vos-keeper"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "ed25519-dalek 2.2.0",
+ "hex",
+ "vos-node",
  "vos-wire",
 ]
 
@@ -8626,6 +8739,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vos-statement-service"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek 2.2.0",
+ "vos-pvm-program",
+ "vos-statement",
+ "vos-wire",
+]
+
+[[package]]
 name = "vos-testkit"
 version = "0.1.0"
 dependencies = [
@@ -8648,8 +8771,11 @@ dependencies = [
 name = "vos-venue"
 version = "0.1.0"
 dependencies = [
+ "blake2 0.10.6",
  "ed25519-dalek 2.2.0",
+ "parity-scale-codec",
  "tracing",
+ "twox-hash",
  "vos-anchor",
  "vos-statement",
 ]
