@@ -123,10 +123,14 @@ test-proof: build-test-actors judge-wasm
 # its proofs' masks and its place in the tree. Its tests one at a time in
 # one process, which they capture whole (its logs at every level, its
 # standard error). Then the phone bench's lines and proofs searched for
-# its member's secret. About eight minutes and 6 GiB.
+# its member's secret. Then the same member's calls made by the light node's
+# Tor client and carried by the gateway's onion in process (the demo's
+# `tests/carriers.rs`, outside the workspace), every carrier searched
+# again. About ten minutes and 6 GiB.
 test-carriers: build-test-actors build-agent build-representative build-credentials build-payments
     cargo test -p vos-node --features disclosing --test carriers -- audit:: credentials:: --nocapture --test-threads=1
     cargo test -p vos-phone --test outputs -- --nocapture
+    cargo test --manifest-path node/gateway/demo/Cargo.toml --ignore-rust-version --test carriers -- --nocapture
 
 # The golden fixtures (`pvm/proof/fixtures`) judged in Wasm, by the final
 # verifier's blobs built as a runtime builds them, under the PVF's semantics
