@@ -53,6 +53,12 @@ enum Command {
     },
     /// Stock agents made otherwise.
     Stock { agents: Vec<u32> },
+    /// Finish agents a top-up left unfinished, then stock them.
+    Finish {
+        #[arg(long)]
+        elf: PathBuf,
+        agents: Vec<u32>,
+    },
     /// Install `Personal` anew over every agent of the pool, a batch at a
     /// time, stopping at the first refusal.
     Upgrade {
@@ -108,6 +114,13 @@ fn run(args: Args) -> Result<(), String> {
         Command::Stock { agents } => {
             let agents: Vec<AgentId> = agents.iter().copied().map(AgentId).collect();
             let pooled = keeper.stock(&agents).map_err(|error| error.to_string())?;
+            println!("pooled {pooled}");
+        }
+        Command::Finish { elf, agents } => {
+            let agents: Vec<AgentId> = agents.iter().copied().map(AgentId).collect();
+            let pooled = keeper
+                .finish(&agents, &read(elf)?)
+                .map_err(|error| error.to_string())?;
             println!("pooled {pooled}");
         }
         Command::Upgrade { elf, batch } => {

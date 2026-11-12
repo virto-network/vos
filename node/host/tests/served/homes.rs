@@ -350,7 +350,9 @@ fn kit(n: u32) -> Kit {
 /// by a proof of `Auth("home")`, and every claim is assigned once its
 /// agent answers; a member's second claim is refused; the scope "home"
 /// proves no other call; and the keeper's upgrade installs the next
-/// `Personal` across the pool in batches, then stops at a refused batch.
+/// `Personal` across the pool in batches, then stops at a refused batch;
+/// a top-up whose install fails names the agent it left unfinished, and
+/// the keeper finishes and stocks it.
 #[test]
 fn a_pool_of_200_is_made_by_the_keeper_and_claimed() {
     let home = Founded::new();
@@ -485,4 +487,24 @@ fn a_pool_of_200_is_made_by_the_keeper_and_claimed() {
         }
         other => panic!("the refused upgrade: {other:?}"),
     }
+
+    // A top-up whose install fails (a program with an auth guard, in an
+    // agent with no credential actor) leaves its agent unfinished: named
+    // in the error, stocked by none; finished, it is pooled.
+    let guarded = std::fs::read(actor_elf("poll")).unwrap();
+    let pooled = keeper.tally().unwrap().pooled;
+    let unfinished = match keeper.top_up(pooled + 1, &guarded, 1) {
+        Err(KeeperError::Unfinished { agents, .. }) => agents,
+        other => panic!("the failed top-up: {other:?}"),
+    };
+    assert_eq!(unfinished.len(), 1);
+    assert_eq!(keeper.tally().unwrap().pooled, pooled);
+    assert_eq!(
+        keeper.finish(&unfinished, &next_version).unwrap(),
+        pooled + 1
+    );
+    assert_eq!(
+        home.read::<Option<Standing>>(HOMES, "standing_of", unfinished[0].0),
+        Some(Standing::Pooled)
+    );
 }
