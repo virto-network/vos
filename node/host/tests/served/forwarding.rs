@@ -147,7 +147,7 @@ fn a_client_follows_elsewhere_to_a_replica() {
 }
 
 /// A leader whose clock trails the agent's time, as one does after a
-/// leader with a clock ahead, times its batches just past the agent's time
+/// leader with a clock ahead, times each batch just past the agent's time
 /// and goes on leading: the agent's time never goes back.
 #[test]
 fn a_leader_whose_clock_trails_times_its_batches_at_the_agents() {

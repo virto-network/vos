@@ -354,7 +354,7 @@ proves and the kernel's claim.
   | 12 | the claim's `binding` is `C(T(binding), W(b))` of this request, `b` under one of the window's programs | `Binding`, 7 | 403 |
   | 13 | `b` is not recorded | `Replayed`, 8 | 409 |
   | 14 | auth with `once`: `(scope, nullifier)` not recorded | `Once`, 9 | 409 |
-  | 15 | auth: `map_root` is in the credential actor's ring | `RootUnknown`, 10 (`RootRefusal::Unknown`): retryable, read the tree's feed again, or ask another replica; an honest member meets it on a replica's lag, a root a later write of its own batch replaced (each batch's time is past the one before), or one past the ring's 64 entries (§6) | 503 |
+  | 15 | auth: `map_root` is in the credential actor's ring | `RootUnknown`, 10 (`RootRefusal::Unknown`): retryable, read the tree's feed again, or ask another replica; an honest member meets it on a replica's lag, a root a later write at its own batch time replaced (a trailing leader times each batch past the one before), or one past the ring's 64 entries (§6) | 503 |
   | 16 | auth: `map_root` is the ring's newest, or was superseded at most `ROOT_MAX_AGE` before the replica's latest applied batch time | `RootStale`, 11 | 403 |
   | 17 | a verification slot is free: fewer verifications in flight than the node's budget (by default twice its executor threads) | `Busy` (not a credential code) | 503 |
   | 18 | on an executor, the proof's interaction PoW holds over its leading fields before it is decoded; then it decodes and verifies under the program the binding names against `H_io` of the claim | `Proof`, 12 | 403 |

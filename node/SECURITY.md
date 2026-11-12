@@ -90,9 +90,11 @@ frame checks and the agent's placement come first, as for any call):
     verification on every such probe;
 15. for auth, the root is in the credential actor's ring (`RootUnknown`,
     retryable: an honest member meets it on a lagging replica, after a
-    later write of the same batch replaced its root (each batch takes a
-    time of its own, past the one before), or once 64 later roots pushed
-    it out; it reads the tree's feed again or asks another replica);
+    later write at the same batch time replaced its root (a leader whose
+    clock trails times each batch a millisecond past the one before, so
+    that is one batch's, or one millisecond's), or once 64 later roots
+    pushed it out; it reads the tree's feed again or asks another
+    replica);
 16. for auth, the root is the ring's newest or was superseded at most
     `ROOT_MAX_AGE` (10 minutes) before this replica's latest batch time
     (`RootStale`, final);
