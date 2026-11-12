@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use russh::client;
-use russh::keys::ssh_key;
+use russh::keys::{PublicKeyOrCertificate, ssh_key};
 use tokio::task::JoinHandle;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use vos_api::client::{Answer, Multiplexed};
@@ -27,11 +27,13 @@ pub(crate) struct Pinned {
 impl client::Handler for Pinned {
     type Error = russh::Error;
 
-    async fn check_server_key(&mut self, key: &ssh_key::PublicKey) -> Result<bool, Self::Error> {
-        Ok(key
-            .key_data()
-            .ed25519()
-            .is_some_and(|key| key.0 == self.host_key))
+    /// A bare key only: a certificate is not the key pinned.
+    async fn check_server_key(
+        &mut self,
+        key: &PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
+        Ok(matches!(key, PublicKeyOrCertificate::PublicKey { key, .. }
+            if key.key_data().ed25519().is_some_and(|key| key.0 == self.host_key)))
     }
 }
 

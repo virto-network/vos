@@ -77,7 +77,7 @@ libc = "0.2"
 arti-client = { version = "=0.47.0", default-features = false, features = ["tokio", "rustls", "compression", "onion-service-client", "bridge-client", "static-sqlite"], optional = true }
 tor-rtcompat = { version = "=0.47.0", default-features = false, features = ["tokio", "rustls"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
-russh = { version = "0.61", default-features = false, features = ["ring", "flate2"], optional = true }
+russh = { version = "0.65", default-features = false, features = ["ring", "flate2"], optional = true }
 tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync", "macros"], optional = true }
 tokio-util = { version = "0.7", features = ["compat"], optional = true }
 sha3 = { version = "0.10", optional = true }

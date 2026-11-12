@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arti_client::isolation::Isolation;
-use russh::keys::ssh_key;
-use russh::server::{Auth, Msg, Session};
+use russh::keys::{PublicKeyOrCertificate, ssh_key};
+use russh::server::{Auth, ChannelOpenHandle, Msg, Session, VerifiedPublicKey};
 use russh::{Channel, ChannelId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use vos_api::{Event, Framing, Kind, Reader, Requests, frame};
@@ -198,19 +198,21 @@ impl russh::server::Handler for Handler {
     async fn auth_publickey(
         &mut self,
         _user: &str,
-        key: &ssh_key::PublicKey,
+        verified: VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
-        self.gateway.seen.lock().unwrap()[self.index].key = Some(public(key));
+        self.gateway.seen.lock().unwrap()[self.index].key = Some(public(verified.public_key));
         Ok(Auth::Accept)
     }
 
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         self.channels.insert(channel.id(), channel);
-        Ok(true)
+        reply.accept().await;
+        Ok(())
     }
 
     async fn subsystem_request(
@@ -617,7 +619,10 @@ async fn s4s_screens_are_carried_over_a_circuit_of_their_own() {
     struct Trusting;
     impl russh::client::Handler for Trusting {
         type Error = russh::Error;
-        async fn check_server_key(&mut self, _: &ssh_key::PublicKey) -> Result<bool, Self::Error> {
+        async fn check_server_key(
+            &mut self,
+            _: &PublicKeyOrCertificate,
+        ) -> Result<bool, Self::Error> {
             Ok(true)
         }
     }

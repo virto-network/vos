@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hmac::{Hmac, Mac as _};
-use russh::keys::ssh_key;
+use russh::keys::{PublicKeyOrCertificate, ssh_key};
 use russh::{ChannelMsg, client};
 use s4_credential::chrome::{Answer, Chrome, Form};
 use s4_credential::enrollment::Store;
@@ -112,7 +112,13 @@ struct Pinning(Seen);
 impl client::Handler for Pinning {
     type Error = russh::Error;
 
-    async fn check_server_key(&mut self, key: &ssh_key::PublicKey) -> Result<bool, Self::Error> {
+    async fn check_server_key(
+        &mut self,
+        key: &PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
+        let PublicKeyOrCertificate::PublicKey { key, .. } = key else {
+            return Ok(false);
+        };
         *self.0.lock().unwrap() = Some((
             key.fingerprint(ssh_key::HashAlg::Sha256).to_string(),
             key.key_data().ed25519().map(|key| key.0),
