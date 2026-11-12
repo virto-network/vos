@@ -263,11 +263,18 @@ fn given(store: &Store, group: Option<DeviceGroup>) -> Result<Option<DeviceGroup
 /// authorship recorded ([`carried`]), so that a leave cut short is made
 /// again whole.
 fn leave(light: &Light, group: DeviceGroup, rejoining: bool) -> Result<(), MoveError> {
-    let authors: Vec<[u8; 32]> = group
+    // The group's devices, and every author it read as carried: the next
+    // home's set may hold none of the devices that vouched for them.
+    let archive = group.archive();
+    let mut authors: Vec<[u8; 32]> = group
         .sync_keys()
         .into_iter()
         .map(|(_, sync)| sync)
+        .chain(archive.vouched.iter().map(|vouched| vouched.carried.author))
+        .chain(archive.authors.iter().map(|carried| carried.author))
         .collect();
+    authors.sort_unstable();
+    authors.dedup();
     let carried = carried(light, &authors)?;
     for instance in light.instances()? {
         light.forget_feed(instance)?;

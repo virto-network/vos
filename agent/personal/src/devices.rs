@@ -584,9 +584,17 @@ impl Personal {
             },
         );
         if decided {
-            match winner {
-                Some(winner) => self.mature(winner, now, now),
-                None => self.cancel(index, Cancel::Resolved, now),
+            // A replacement upheld still waits out its new key's
+            // probation: due at its own time.
+            let probation = winner
+                .and_then(|winner| self.operations.get(&winner))
+                .filter(|operation| matches!(operation.op, Op::Replace { .. }))
+                .map(|operation| operation.matures)
+                .filter(|matures| *matures > now);
+            match (winner, probation) {
+                (Some(winner), Some(matures)) => self.due.insert(&(matures, winner), &()),
+                (Some(winner), None) => self.mature(winner, now, now),
+                (None, _) => self.cancel(index, Cancel::Resolved, now),
             }
         }
         Ok(Recorded { at: now, index: at })

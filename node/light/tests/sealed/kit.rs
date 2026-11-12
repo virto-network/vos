@@ -643,6 +643,94 @@ fn r_rotates_at_a_removal_and_the_removed_device_opens_nothing_after() {
     );
 }
 
+/// The operators log `Void` for the epoch every device confirmed by its
+/// own count, the commit carrying a removal: the new `R` is named nowhere
+/// and the old one, which the removed device holds, is held by no device
+/// that may push under it. Nothing of the new epoch reaches the recovery
+/// scope under the old `R`, and the next commit re-seals the kit.
+#[test]
+fn a_void_verdict_after_a_confirmed_removal_rotates_r_all_the_same() {
+    let key = KitSecret::security_key(&mut Touch(7)).unwrap();
+    let (mut home, mut phones, split) = household_with(3, vec![key.key()]);
+    written(&mut home, &mut phones);
+    let old = *split.r();
+    let (admin, sync) = (phones[0].admin.clone(), phones[0].sync.clone());
+    let removal = operate(&mut home, &admin, &sync, "remove", 2u32.encode(), None);
+    let (admin, sync) = (phones[1].admin.clone(), phones[1].sync.clone());
+    operate(&mut home, &admin, &sync, "cosign", removal.encode(), None);
+    settle(&mut home, &mut phones[..2]);
+    let epoch = phones[0].group().confirmed() + 1;
+    let prepared = phones[0].group().commit(None, home.now).unwrap();
+    assert_eq!(prepared.effect.remove, vec![2]);
+    phones[0].send(&mut home, &prepared).unwrap();
+    let mut voided = [false; 2];
+    for _ in 0..4 {
+        for (phone, voided) in phones[..2].iter_mut().zip(&mut voided) {
+            if !*voided {
+                *voided = read_voided(&mut home, phone, epoch);
+            }
+        }
+    }
+    assert_eq!(voided, [true; 2]);
+    for phone in &mut phones[..2] {
+        assert_eq!(phone.group().confirmed(), epoch);
+        assert!(!phone.group().holds_recovery());
+        assert_eq!(
+            with(&mut home, phone, &[], |sync| sync.recovery()).unwrap(),
+            Default::default(),
+            "nothing pushed under an R the removed device holds"
+        );
+    }
+    let served = stored(&home, &phones[0], RECOVERY);
+    let opened = open_recovery(&old, &home.identity, &served).unwrap();
+    assert!(opened.keys(epoch, &scope_of(&phones[0], NOTES)).is_empty());
+    let next = phones[0].group().commit(None, home.now).unwrap();
+    assert!(
+        next.effect.rekey.is_some(),
+        "the next commit re-seals the kit"
+    );
+}
+
+/// `phone` reading the log, posting what it asks for, with the verdict on
+/// `epoch` shown it as `Void`, its reading stopped there: whether it read
+/// that verdict.
+fn read_voided(home: &mut Home, phone: &mut Phone, epoch: u64) -> bool {
+    let (cursor, before) = phone.group().view();
+    let mut entries = home.log(phone.sync_key(), cursor).unwrap();
+    let verdict = entries.iter().position(|(_, entry)| {
+        matches!(entry.body, vos_wire::personal::Body::Verdict { epoch: of, .. } if of == epoch)
+    });
+    if let Some(at) = verdict {
+        entries.truncate(at + 1);
+        let last = at
+            .checked_sub(1)
+            .map_or(before, |previous| entries[previous].1.chain);
+        let (index, entry) = &mut entries[at];
+        entry.body = vos_wire::personal::Body::Verdict {
+            epoch,
+            verdict: vos_wire::personal::Verdict::Void(vos_wire::personal::Void::Nack),
+        };
+        entry.chain = vos_wire::personal::chain(&last, *index, entry.at, &entry.body);
+    }
+    for event in phone.group().follow(entries).unwrap() {
+        match event {
+            Event::Vote {
+                epoch,
+                vote,
+                message,
+            } => phone.vote(home, epoch, vote, &message),
+            Event::Evidence {
+                index,
+                message,
+                signature,
+                attached,
+            } => phone.evidence(home, index, message, signature, attached),
+            _ => {}
+        }
+    }
+    verdict.is_some()
+}
+
 /// A chunk of an archive, as sealed sync frames it.
 #[derive(vos_wire::Decode)]
 struct Chunk {

@@ -8,8 +8,8 @@ use vos_mls::{Expected, Kind};
 use vos_wire::Decode;
 use vos_wire::ingress::CallMessage;
 use vos_wire::personal::{
-    Attached, Body, DeviceId, Effect, Entry, Op, OpState, Signer, Verdict, Void, Vote, chain,
-    vote_message, welcome_hash,
+    Attached, Body, DeviceId, Effect, Entry, Op, OpState, Policy, Signer, Verdict, Void, Vote,
+    chain, vote_message, welcome_hash,
 };
 
 use super::{
@@ -81,7 +81,8 @@ impl DeviceGroup {
             self.settle(&mut events)?;
         }
         self.reposts(&mut events);
-        let writes = self.writes(true);
+        self.note(&events);
+        let writes = self.writes(true)?;
         self.mls.write(writes)?;
         Ok(events)
     }
@@ -135,9 +136,18 @@ impl DeviceGroup {
             return self.candidate(index, entry, events);
         }
         match entry.body {
-            Body::Configured(policy) => self.state.policy = policy,
+            Body::Configured(policy) => self.configure(index, policy, events),
             // The claim's kit is the claiming device's own, its sealing
-            // keys with it.
+            // keys with it. The claim's assignment is the first of device
+            // 0 under the kit this device holds.
+            Body::Assigned { device: 0, kit }
+                if self.state.assigned.is_none()
+                    && kit
+                        .iter()
+                        .eq(self.state.set.kit.iter().map(|key| &key.signing)) =>
+            {
+                self.state.assigned = Some(index);
+            }
             Body::Assigned { .. } => {}
             Body::Operation {
                 call,
@@ -184,6 +194,27 @@ impl DeviceGroup {
             Body::Renewed { .. } => {}
         }
         Ok(())
+    }
+
+    /// A configuration of the agent's policy at `index`: the claim's (one
+    /// before its assignment, or the one beside it) taken whole; a later
+    /// one takes the quotas, the lease and the inbox, and lowers no delay
+    /// or window of the device set's rules ([`Policy::over`]), which it
+    /// raises [`Alarm::Policy`] for.
+    fn configure(&mut self, index: u64, policy: Policy, events: &mut Vec<Event>) {
+        if self
+            .state
+            .assigned
+            .is_none_or(|assigned| index == assigned + 1)
+        {
+            self.state.policy = policy;
+            return;
+        }
+        let kept = policy.over(&self.state.policy);
+        if kept != policy {
+            events.push(Event::Alarm(Alarm::Policy { index }));
+        }
+        self.state.policy = kept;
     }
 
     /// A candidate entry: its call decoded and checked against what the
@@ -454,14 +485,18 @@ impl DeviceGroup {
                     events.push(Event::Alarm(Alarm::Verdict { epoch }));
                 }
                 // The agent re-seals the kit at its verdict: from this entry
-                // the commit's `R` is the kit's.
+                // the commit's `R` is the kit's. Any other verdict on an
+                // epoch this device confirmed leaves its `R` unheld: the
+                // agent installed no `R2` for it, and the `R` before is a
+                // removed device's, so nothing is pushed under either and
+                // the next commit re-seals the kit.
                 if let Some((rekeyed, hash)) = self.state.rekeyed
                     && rekeyed == epoch
+                    && confirmed
+                    && self.state.decided == Some((epoch, true))
                 {
                     self.state.rekeyed = None;
-                    if confirmed && self.state.decided == Some((epoch, true)) {
-                        self.name_recovery(index, hash, false);
-                    }
+                    self.name_recovery(index, hash, false);
                 }
             }
         }
@@ -813,7 +848,8 @@ impl DeviceGroup {
                         .ok_or(GroupError::Corrupt)?;
                     self.archive.record(pending.epoch, scope, key);
                 }
-                let writes = self.writes(true);
+                self.note(events);
+                let writes = self.writes(true)?;
                 self.mls.swap(*candidate, writes)?;
                 events.push(Event::Confirmed {
                     epoch: pending.epoch,
@@ -823,7 +859,8 @@ impl DeviceGroup {
             Some(Processed::Copy { candidate, h: None }) => {
                 self.apply(&pending);
                 self.state.course = Course::Out;
-                let writes = self.writes(false);
+                self.note(events);
+                let writes = self.writes(false)?;
                 self.mls.swap(*candidate, writes)?;
                 events.push(Event::Removed);
                 Ok(())
@@ -885,7 +922,8 @@ impl DeviceGroup {
             if let Some(rekey) = &pending.effect.rekey {
                 self.archive.forget(&rekey.r_hash);
             }
-            let writes = self.writes(true);
+            self.note(events);
+            let writes = self.writes(true)?;
             self.mls.void(writes)?;
         }
         events.push(Event::Voided {
@@ -917,13 +955,14 @@ impl DeviceGroup {
         self.state.pending = None;
         self.state.own = None;
         self.processed = None;
-        let writes = self.writes(false);
-        self.mls.void(writes)?;
         events.push(Event::Alarm(Alarm::CannotFollow {
             epoch,
             committer,
             remedy,
         }));
+        self.note(events);
+        let writes = self.writes(false)?;
+        self.mls.void(writes)?;
         Ok(())
     }
 
@@ -933,7 +972,8 @@ impl DeviceGroup {
         self.state.pending = None;
         self.state.own = None;
         self.processed = None;
-        let writes = self.writes(false);
+        self.note(events);
+        let writes = self.writes(false)?;
         self.mls.void(writes)?;
         events.push(Event::Removed);
         Ok(())

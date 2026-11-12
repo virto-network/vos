@@ -491,6 +491,22 @@ impl Policy {
         inbox_ttl_ms: 7 * DAY_MS,
         slot_ttl_ms: 10 * 60 * 1000,
     };
+
+    /// This policy configured over `held`, the one the claim set: its
+    /// quotas, lease and inbox, and each delay and window of the device
+    /// set's rules no lower than `held`'s. Only the claim sets those: a
+    /// later configuration is the operators' word, and a lowered delay
+    /// would let an operation mature before its window to veto it.
+    pub fn over(self, held: &Policy) -> Policy {
+        Policy {
+            operation_delay_ms: self.operation_delay_ms.max(held.operation_delay_ms),
+            kit_delay_ms: self.kit_delay_ms.max(held.kit_delay_ms),
+            probation_ms: self.probation_ms.max(held.probation_ms),
+            seasoning_ms: self.seasoning_ms.max(held.seasoning_ms),
+            confirm_window_ms: self.confirm_window_ms.max(held.confirm_window_ms),
+            ..self
+        }
+    }
 }
 
 /// A commit's declared effect: the device it adds, inline for a strong

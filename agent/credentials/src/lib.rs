@@ -6,8 +6,8 @@
 //! a write superseded it ([`vos_wire::credentials::Ring::accepts`]).
 //!
 //! A library actor, installed in the agent whose methods it guards. Its
-//! rows are plain: `slots`, `nodes`, `free`, `invites`, `ring` and
-//! `changes` ([`vos_wire::credentials::tables`]). Each hash is one `0x402` call,
+//! rows are plain: `slots`, `nodes`, `free`, `invites`, `ring`, `changes` and
+//! `roots` ([`vos_wire::credentials::tables`]). Each hash is one `0x402` call,
 //! served natively by a VOS node and in software on JAM, so the tree is a
 //! function of its writes on every host: an enrollment costs 33, the leaf
 //! and 32 levels, a revocation 32, and an enrollment of many shares the
@@ -16,8 +16,10 @@
 //! **The tree's feed** (`light-node.md` §6.7): every write of the tree is
 //! kept, in order, as a [`Change`]: the leaves it set and the root it left,
 //! with that root's place in the ring. `feed(from)` serves them a page at a
-//! time to any caller, so a device keeps the whole tree and computes its
-//! own path, never asking for it: no query names a member.
+//! time to any caller, and `feed_after(root)` from the last write that left
+//! a root, so a device keeps the whole tree and computes its own path,
+//! never asking for it: no query names a member, and a device reading on
+//! names only the root it holds.
 //!
 //! Every write but `claim`, `claim_open` and a person's device methods is
 //! under the role `registrar`, and none but the onion set's is taken
@@ -193,6 +195,8 @@ pub struct Credentials {
     /// The tree's writes, the feed's length.
     changed: u64,
     changes: Table<u64, Change, Ordered>,
+    /// Each root a write left → the last write that left it.
+    roots: Table<Digest, u64>,
 }
 
 #[messages]
@@ -216,6 +220,7 @@ impl Credentials {
             onions: Table::default(),
             changed: 0,
             changes: Table::default(),
+            roots: Table::default(),
         }
     }
 
@@ -569,6 +574,22 @@ impl Credentials {
     /// feed's length.
     #[msg(gas = 100_000_000)]
     pub async fn feed(&self, from: u64) -> Feed {
+        self.page(from)
+    }
+
+    /// The tree's feed after the last change that left `root`, a page as
+    /// [`Credentials::feed`] gives it; `None` for a root no change left. A
+    /// device reads on from the root it holds, which every member that
+    /// read the feed as far holds, so its query names no place of its own
+    /// that an answer could have written.
+    #[msg(gas = 100_000_000)]
+    pub async fn feed_after(&self, root: Digest) -> Option<Feed> {
+        let last = self.roots.get(&root)?;
+        Some(self.page(last + 1))
+    }
+
+    /// The feed's page from its `from`th change.
+    fn page(&self, from: u64) -> Feed {
         let mut changes = Vec::new();
         let mut bytes = 0;
         for (_, change) in self.changes.iter(from.checked_sub(1).as_ref()) {
@@ -824,6 +845,7 @@ impl Credentials {
         self.ring.insert(&RING_KEY, &ring);
         self.changes
             .insert(&self.changed, &Change { leaves: set, root });
+        self.roots.insert(&root.root, &self.changed);
         self.changed += 1;
     }
 }

@@ -454,6 +454,11 @@ impl DeviceGroup {
             Check::Valid if call.awaits.is_some() => return Support::Waiting,
             Check::Valid => {}
         }
+        // A replacement's wait is its new key's probation, which no
+        // resolution shortens (E29).
+        if matches!(op, Op::Replace { .. }) && matures > claim.at {
+            return Support::Refused;
+        }
         let mut waiting = false;
         let before = state
             .set

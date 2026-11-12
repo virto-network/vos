@@ -12,8 +12,8 @@
 //! change before it that named another root left no leaf the device
 //! keeps. A page that leaves another root, holds a leaf that is no digest,
 //! a change of no leaves or out of slot order or older than the last, or
-//! does not start at the keeper's place or overruns the feed's length, is
-//! refused whole and the tree kept as it was. What a gateway can make the
+//! overruns the feed's length, is refused whole and the tree kept as it
+//! was. What a gateway can make the
 //! device hold is bounded: a page at most [`FEED_BYTES`] (or one change of
 //! at most [`ENROLL_MANY`] leaves), and no slot past the lowest never used,
 //! as the actor places members, so about two nodes a leaf. The answer is
@@ -22,6 +22,18 @@
 //! answers. Until a read reaches the feed's end no path is given, since a
 //! page may end between two writes of one batch, whose first root the
 //! ring never holds.
+//!
+//! **What a query names.** The first read is `feed(0)`, every keeper's
+//! first; each read after is `feed_after(root)`, the root the keeper
+//! holds, which the actor answers from the last change that left it. So a
+//! query names no place of the keeper's own: a gateway that padded its
+//! answers with changes undoing each other left the device at the root
+//! every member holds, where a place it wrote would mark the device in
+//! every query after; and a root it forged fails the device's next proof.
+//! A keeper off the real feed (its pages refused, or its root one no
+//! change left: a fork a gateway served, a re-founded space) two reads in
+//! a row drops its tree and reads from the start again; one such read, as
+//! from a replica behind, holds nothing new.
 //!
 //! **When.** The feed is read on a jittered timer of its own,
 //! [`TreeKeeper::PERIOD_MS`] (30 s, between 15 s and 45 s), never because a
@@ -42,8 +54,9 @@
 //! **Kept on the device** ([`TreeKeeper::encode`], [`TreeKeeper::restore`]):
 //! the leaves, the feed's place and the root, outside any synced scope
 //! (`light-node.md` §3.1), so a restart reads only the changes since. That
-//! first read names the place kept, which the device read last from: when
-//! few devices read the feed, it can link the new circuit to the last.
+//! first read names the root kept, which every member that read as far
+//! holds: when few devices read the feed, its age can still link the new
+//! circuit to the last.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -80,7 +93,21 @@ pub struct TreeKeeper {
     next: u64,
     /// The timer's period before its jitter.
     period: u64,
+    /// Whether the next read starts at the feed's start: a keeper that has
+    /// read nothing, or one that left the real feed and starts over.
+    start: bool,
+    /// The reads in a row that found the keeper off the feed: a page
+    /// refused, or the root it holds one no change left.
+    off: u8,
+    /// The proofs refused against the root held since the last read that
+    /// moved it: a root the ring never held (one a gateway forged, or a
+    /// historical one it left the keeper at) is not kept for good.
+    unknowns: u8,
 }
+
+/// The reads in a row off the feed after which a keeper starts over: one
+/// may be a replica behind the keeper's, or a page cut short.
+const OFF_FEED: u8 = 2;
 
 /// What a page did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +116,22 @@ pub struct Synced {
     pub applied: u64,
     /// Whether the feed holds more: the next page is due at once.
     pub more: bool,
+    /// Whether the keeper left the real feed (its pages refused, or its
+    /// root one no change left, `OFF_FEED` (two) reads in a row) and starts
+    /// over from the feed's start, the tree it held dropped.
+    pub reset: bool,
+}
+
+impl Synced {
+    /// A keeper that starts over: nothing applied, its next read due at
+    /// once from the feed's start.
+    fn starting_over() -> Self {
+        Self {
+            applied: 0,
+            more: true,
+            reset: true,
+        }
+    }
 }
 
 /// What [`TreeKeeper::encode`] keeps.
@@ -127,6 +170,9 @@ impl TreeKeeper {
             caught_up: false,
             next: 0,
             period: Self::PERIOD_MS,
+            start: true,
+            off: 0,
+            unknowns: 0,
         }
     }
 
@@ -153,6 +199,7 @@ impl TreeKeeper {
         keeper.cursor = kept.cursor;
         keeper.root = kept.root;
         keeper.fresh = kept.fresh;
+        keeper.start = kept.cursor == 0;
         Ok(keeper)
     }
 
@@ -177,7 +224,12 @@ impl TreeKeeper {
 
     /// The query of the feed's next page at `instance` of `agent`, the
     /// credential actor, signed by a fresh key over the agent's
-    /// `identity`: it names the keeper's place, nothing of the member's.
+    /// `identity`: `feed(0)` from the feed's start, else `feed_after` the
+    /// root the keeper holds. It names nothing of the member's, and no
+    /// place of the keeper's own: a root is every member's that read the
+    /// feed as far, and one a gateway forged fails the next proof, where
+    /// the place a gateway's answers left (its padding, say) would be this
+    /// device's alone in every query after.
     pub fn request(
         &self,
         agent: u32,
@@ -185,7 +237,11 @@ impl TreeKeeper {
         instance: u32,
         not_after: u64,
     ) -> Result<Vec<u8>, DeviceError> {
-        wire::feed_query(agent, identity, instance, self.cursor, not_after)
+        if self.start {
+            wire::feed_query(agent, identity, instance, 0, not_after)
+        } else {
+            wire::feed_after_query(agent, identity, instance, &self.root.root, not_after)
+        }
     }
 
     /// Whether to read the feed now: the jittered timer is due, or a page
@@ -196,9 +252,35 @@ impl TreeKeeper {
 
     /// The answer to [`TreeKeeper::request`], read at `now_ms`: its page
     /// applied, and the timer set (due at once while the feed holds more).
+    /// A keeper off the real feed `OFF_FEED` (two) reads in a row (its pages
+    /// refused, or its root one the actor knows no change leaving: a fork
+    /// a gateway served, or a re-founded space) drops its tree and starts
+    /// over from the feed's start ([`Synced::reset`]); a single such read,
+    /// as from a replica behind, holds nothing new.
     pub fn ingest(&mut self, answer: &[u8], now_ms: u64) -> Result<Synced, DeviceError> {
-        let page = wire::feed_answer(answer)?;
-        let read = self.apply(&page)?;
+        let page = if self.start {
+            Some(wire::feed_answer(answer)?)
+        } else {
+            wire::feed_after_answer(answer)?
+        };
+        let read = match page {
+            Some(page) => match self.read(&page, self.start) {
+                Ok(read) => read,
+                Err(DeviceError::Witness) => {
+                    if !self.left() {
+                        return Err(DeviceError::Witness);
+                    }
+                    Synced::starting_over()
+                }
+                Err(error) => return Err(error),
+            },
+            None if !self.left() => Synced {
+                applied: 0,
+                more: false,
+                reset: false,
+            },
+            None => Synced::starting_over(),
+        };
         if read.more {
             self.next = now_ms;
         } else {
@@ -208,6 +290,19 @@ impl TreeKeeper {
             self.next = now_ms.saturating_add(self.period / 2 + jitter(self.period));
         }
         Ok(read)
+    }
+
+    /// A read off the real feed: whether it is the `OFF_FEED`th in a
+    /// row, the tree then dropped and the next read from the feed's start.
+    fn left(&mut self) -> bool {
+        self.off = self.off.saturating_add(1);
+        if self.off < OFF_FEED {
+            return false;
+        }
+        let (next, period) = (self.next, self.period);
+        *self = Self::new(self.member);
+        (self.next, self.period) = (next, period);
+        true
     }
 
     /// `page` applied, the tree it leaves checked against the root its last
@@ -220,17 +315,25 @@ impl TreeKeeper {
     /// was. A page from a replica behind the keeper, whose feed is shorter
     /// than the keeper's place, holds nothing new.
     pub fn apply(&mut self, page: &Feed) -> Result<Synced, DeviceError> {
+        self.read(page, true)
+    }
+
+    /// `page` applied as [`TreeKeeper::apply`] does; from the keeper's
+    /// place when `placed`, else from where the actor answered a
+    /// `feed_after` (the last change that left the keeper's root).
+    fn read(&mut self, page: &Feed, placed: bool) -> Result<Synced, DeviceError> {
         let end = page
             .from
             .checked_add(page.changes.len() as u64)
             .ok_or(DeviceError::Decode)?;
-        if page.length < self.cursor && page.changes.is_empty() {
+        if placed && page.length < self.cursor && page.changes.is_empty() {
             return Ok(Synced {
                 applied: 0,
                 more: false,
+                reset: false,
             });
         }
-        if page.from != self.cursor || end > page.length {
+        if (placed && page.from != self.cursor) || end > page.length {
             return Err(DeviceError::Decode);
         }
         let bytes: usize = page.changes.iter().map(|change| change.encoded_len()).sum();
@@ -269,9 +372,15 @@ impl TreeKeeper {
         self.cursor = end;
         self.fresh = fresh;
         self.caught_up = end >= page.length;
+        self.start = false;
+        self.off = 0;
+        if !page.changes.is_empty() {
+            self.unknowns = 0;
+        }
         Ok(Synced {
             applied: page.changes.len() as u64,
             more: !self.caught_up,
+            reset: false,
         })
     }
 
@@ -295,7 +404,17 @@ impl TreeKeeper {
     /// [`TreeKeeper::UNKNOWN_SPREAD_MS`], not at once, so the read on the
     /// feed's circuit does not follow the refused proof by a fixed delay;
     /// and the period halved, to at least [`TreeKeeper::MIN_PERIOD_MS`].
+    ///
+    /// The `OFF_FEED`th (second) such answer in a row with no change read between
+    /// drops the tree and reads the feed from its start: the root held is
+    /// none the ring holds, though the gateway answers it with pages.
     pub fn unknown(&mut self, now_ms: u64) {
+        self.unknowns = self.unknowns.saturating_add(1);
+        if self.unknowns >= OFF_FEED {
+            let period = self.period;
+            *self = Self::new(self.member);
+            self.period = period;
+        }
         self.next = self
             .next
             .min(now_ms.saturating_add(jitter(Self::UNKNOWN_SPREAD_MS)));

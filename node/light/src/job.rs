@@ -30,8 +30,10 @@
 //! **What the chrome raises** ([`Pass::notices`]): the device set's open
 //! operations, each a local notification while it can be vetoed; a
 //! pending restore; this device's removal, and that it cannot follow, for
-//! as long as either holds; the yearly re-proof; and every alarm, on the
-//! pass that raised it (the chrome keeps an alarm until its user saw it).
+//! as long as either holds; the yearly re-proof; and every alarm kept,
+//! from the batch that consumed its evidence until the chrome, its user
+//! having seen it, acknowledges it ([`DeviceGroup::acknowledge`]): a pass
+//! killed or stopped after an alarm loses none.
 //! No push-notification token is given to any space (§8, L3).
 
 use ed25519_dalek::Signer as _;
@@ -207,7 +209,8 @@ pub struct Pass {
     pub alive: bool,
     /// The epochs confirmed or voided, and this device's removal, as read.
     pub events: Vec<Event>,
-    /// Every alarm raised, once each.
+    /// Every alarm kept and not yet acknowledged
+    /// ([`DeviceGroup::acknowledge`]), the oldest first.
     pub alarms: Vec<Alarm>,
     /// The device set's operations open after the pass.
     pub operations: Vec<Open>,
@@ -297,6 +300,23 @@ pub fn run<L: Control>(
     let done = passing(light, group, link, instances, now, &mut pass);
     pass.course = group.course();
     pass.operations = group.operations();
+    // Every alarm raised was kept in the batch that consumed its evidence;
+    // the rest (the clock's) are kept now, and the pass reports every one
+    // kept until the chrome acknowledges it.
+    let kept = group.keep(&pass.alarms).and_then(|()| group.alarms());
+    let done = match (done, kept) {
+        (Ok(()), Ok(kept)) => {
+            pass.alarms = kept;
+            Ok(())
+        }
+        (Ok(()), Err(error)) => Err(SyncError::Group(error)),
+        (Err(error), kept) => {
+            if let Ok(kept) = kept {
+                pass.alarms = kept;
+            }
+            Err(error)
+        }
+    };
     match done {
         Ok(()) => Ok(pass),
         Err(error) => Err(Stopped {
@@ -319,11 +339,23 @@ fn passing<L: Control>(
     if group.course() == group::Course::Out {
         return Ok(());
     }
-    let overview = answer(link.overview())?;
-    pass.at = overview.at;
+    let mut overview = answer(link.overview())?;
     for alarm in group.head(overview.next, overview.chain)? {
         pass.raise(alarm);
     }
+    if group.cursor() < overview.next && group.course() != group::Course::Out {
+        // A head past what was read: read on, and the head again must be
+        // reached ([`Alarm::Unserved`]).
+        follow(light, group, link, pass)?;
+        if group.course() == group::Course::Out {
+            return Ok(());
+        }
+        overview = answer(link.overview())?;
+        for alarm in group.head(overview.next, overview.chain)? {
+            pass.raise(alarm);
+        }
+    }
+    pass.at = overview.at;
     if let Some(alarm) = group::clock(now, overview.at) {
         pass.raise(alarm);
     }
