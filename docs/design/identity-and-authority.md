@@ -6,7 +6,7 @@ attestations, credentials, proofs, personal spaces) and each space
 composes its privacy model from them. The in-space credential (§5–§7)
 is built: the credential actor and its tree, credentialed calls at the
 node API's ingress, the `once` guard, device proofs, signed operator
-requests, and the device library with s4's `vos.credential` facility.
+requests, and the device library with the `vos.credential` facility.
 Full privacy (§8) is postponed; known gaps and next work are in
 `open.md`.
 
@@ -825,8 +825,8 @@ the device never exports, evaluated once a use after the user's consent
   period (to 1 s), a read that finds the tree unchanged doubling it back.
   Its queries are signed by a key drawn for each. Its `SECURITY.md`
   states the secret's containment.
-- **s4's `vos.credential` facility** [decided]: a client
-  facility of s4's Android client, called by a server's document and
+- **The `vos.credential` facility** [decided]: a client
+  facility of s4's Android client (VOS's `node/light/android`), called by a server's document and
   gated by the client's grant, implemented in Rust over `vos-light` (a
   library the client loads), unsupported below Android 11. Its
   operations:

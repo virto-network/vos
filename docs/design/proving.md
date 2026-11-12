@@ -591,8 +591,8 @@ pub struct Statement {
     `vos-pvm-proof`'s `device` (the shape) and `masked` (the masked
     segment chips);
   - `device` (`vos-light`, `node/light`): the device library (§8), `std`,
-    which s4's `vos.credential` facility (a `cdylib` the Android client
-    loads) links;
+    which the `vos.credential` facility (`node/light/android`, a `cdylib`
+    s4's Android client loads) links;
   - the golden fixtures, under `fixtures` (A.6).
 
   Every venue uses `final-verifier`, `anchor` and `statement`. The source

@@ -87,7 +87,7 @@ pub const PERSONAL: InstanceId = InstanceId(5);
 pub const CREDENTIAL_BOOK: InstanceId = InstanceId(1);
 pub const DEVICE_BOOK: InstanceId = InstanceId(2);
 
-/// The light node's artifacts this crate embeds (`just vos-release`): the
+/// The light node's artifacts this crate embeds (`just facility-release`): the
 /// default agent's program, and the local actors' packages.
 pub struct Artifacts {
     pub agent: Vec<u8>,

@@ -267,11 +267,12 @@ actors, and calls a space through its gateway.
 - **s4's SSH over the same Tor:** the facility is its own
   `libvos_facility.so`, built on VOS's pinned nightly because s4's client
   cannot build on it. s4's client asks each facility it hosts whether it
-  carries a host's connection and pins its host key (`External::carry`),
+  carries a host's connection and pins its host key (`Carrier::carry`),
   and refuses on its own connection a key a facility keeps to the ones it
-  carries (`External::admit`); a `.onion` host typed in the client can be
-  dialed through the same hook. `:vos` opens the onion stream and hands the UI one end of a Unix socketpair as a
-  `ParcelFileDescriptor` over Binder, pumping bytes between it and the
+  carries (`Carrier::admit`); a `.onion` host typed in the client can be
+  dialed through the same hook. `:vos` opens the onion stream and hands
+  the UI one end of a Unix socketpair as a `ParcelFileDescriptor` over
+  Binder, pumping bytes between it and the
   `DataStream`; the client runs its SSH over the descriptor as over a TCP
   socket. Not a loopback SOCKS port: any app on the phone can reach
   127.0.0.1.
@@ -912,8 +913,7 @@ arm64-v8a build; the phones' timings below are S8-P1's]:
   `tree_index`; the RustCrypto provider 0.22 (0.23 then could not share
   a build with russh 0.61's `curve25519-dalek` `=5.0.0-rc.0`; russh 0.65
   takes 5.0.0, so 0.23 now builds beside it, unmeasured).
-- **The facility's `.so`** (`libvos_facility.so`, then s4's
-  `libs4_credential.so`, release, arm64,
+- **The facility's `.so`** (`libvos_facility.so`, release, arm64,
   stripped as packaged): +0.86 MB with the device-group scenario linked
   (+0.38 MB gzip -9), +0.96 MB with `std`: within PG5's 2 MB. The growth
   includes a second RustCrypto generation beside the facility's own.
@@ -2704,7 +2704,7 @@ circuit" (cipher-clerk's Phase 3 entry criterion 11) holds by construction.
    payment to oneself or of nothing is refused; a device reads its own
    account by its digest (`held`), and an account's digest and balance are
    readable by the agent's callers, as the log's readers see them. The
-   s4 facility proves with the stock kernels' release artifacts it
+   facility proves with the stock kernels' release artifacts it
    embeds, never a kernel a server sends (G2), so the s4 demo signs in by
    the stock `auth` kernel alone.
 2. **P2, private** [slice 9, E13]: the shielded pool and the

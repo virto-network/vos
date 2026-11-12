@@ -543,7 +543,7 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   s4 (`s4-protocol`, `s4-credential-contract`, `s4-server`, by git
   revision) and s4 on nothing of VOS: s4 keeps the credential contract,
   its AIDL and its UI side, and its client's facilities may carry a
-  host's stream and pin its host key (`External::carry`, `admit`). The
+  host's stream and pin its host key (`Carrier::carry`, `admit`). The
   embedded artifacts are held to this tree's guests by a test
   (`tests/release.rs`), so a guest that moves fails `just check` until
   `just facility-release`. One build: `just android-facility` here, then

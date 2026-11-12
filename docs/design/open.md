@@ -177,7 +177,7 @@ The scale results are in `core-model.md` §14, "The scale test".
 - **Tree syncing, its last clients:** the device library keeps each
   credential tree whole from its feed (`light-node.md` §6.7), so no query
   names the member and its proofs are against the newest root it read;
-  s4's `vos.credential` facility reads it too. The actor's `path(member)`
+  the `vos.credential` facility reads it too. The actor's `path(member)`
   has no client; it goes at the credential actor's next re-pin, as
   removing it moves the actor's ELF. The feed is kept whole on the actor
   and on every device, about 77 bytes a write: a compaction (a snapshot of the leaves, then the changes since)

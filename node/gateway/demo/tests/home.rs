@@ -16,11 +16,11 @@ use std::sync::{Arc, Mutex};
 
 use ed25519_dalek::{Signer as _, SigningKey};
 use hmac::{Hmac, Mac as _};
+use s4_credential_contract::KeyAnswer;
+use s4_credential_contract::personal::{Claim, Home as Code, KitKind};
 use vos_facility::chrome::{Answer, Form};
 use vos_facility::node::{Device, Node, Prompts};
 use vos_facility::source::Kind;
-use s4_credential_contract::KeyAnswer;
-use s4_credential_contract::personal::{Claim, Home as Code, KitKind};
 use vos_gateway_demo::home::{HOME_CREDENTIALS, HOMES, Home};
 use vos_gateway_demo::{LocalSpace, Rate, Served, random};
 use vos_light::tor::{Circuit, Dial, Dialing, Stream, Target};

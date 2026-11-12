@@ -18,6 +18,9 @@ def repositoryRoot = file("../../../..")
 layout.buildDirectory = new File(repositoryRoot, "target/android/gradle/facility")
 
 def jniLibs = providers.gradleProperty("jniLibs")
+if (!jniLibs.isPresent()) {
+    throw new GradleException("-PjniLibs=<dir> is required: the library is nothing without libvos_facility.so")
+}
 def repository = providers.gradleProperty("repository")
 
 android {
@@ -36,9 +39,7 @@ android {
     }
 
     sourceSets {
-        if (jniLibs.isPresent()) {
-            main.jniLibs.srcDir(jniLibs.get())
-        }
+        main.jniLibs.srcDir(jniLibs.get())
     }
 
     testOptions {

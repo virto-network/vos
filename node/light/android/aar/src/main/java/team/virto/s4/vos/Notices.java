@@ -14,8 +14,8 @@ import android.service.notification.StatusBarNotification;
 import android.util.Log;
 import java.util.HashSet;
 import java.util.Set;
-import team.virto.vos.R;
 import team.virto.s4.personal.PersonalActivity;
+import team.virto.vos.R;
 
 /**
  * The background job's local notifications, posted in {@code :vos}: one for each notice a pass

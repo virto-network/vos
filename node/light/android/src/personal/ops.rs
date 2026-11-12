@@ -559,6 +559,7 @@ impl Space {
             },
         ))?;
         let answer = self.ask(home.handle, Purpose::Proven, &request)?;
+        crate::session::update_refused(&answer)?;
         match wire::credentialed_answer(&answer).map_err(failed)? {
             wire::Answer::Ran { outcome, .. } => match outcome {
                 Outcome::Done(bytes) => T::decode_exact(&bytes)
@@ -1566,6 +1567,7 @@ impl Space {
             },
         ))?;
         let answer = self.ask(enrollment.handle, Purpose::Proven, &request)?;
+        crate::session::update_refused(&answer)?;
         match wire::credentialed_answer(&answer).map_err(failed)? {
             wire::Answer::Ran { outcome, .. } => Ok(outcome),
             other => Err(refused(

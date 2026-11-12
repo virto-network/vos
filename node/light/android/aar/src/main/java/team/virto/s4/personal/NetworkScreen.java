@@ -7,9 +7,9 @@ import android.widget.EditText;
 import android.widget.LinearLayout;
 import java.util.ArrayList;
 import java.util.List;
-import team.virto.vos.R;
 import team.virto.s4.vos.EnrolledSpace;
 import team.virto.s4.vos.Refusal;
+import team.virto.vos.R;
 
 /**
  * Tor and the network: whether Tor connects (backup paused when it does not, with why: a wrong

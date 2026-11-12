@@ -568,8 +568,9 @@ fn the_onion_is_preferred_and_a_gateway_spelled_otherwise_is_refused() {
 }
 
 /// A sign-in whose root the node no longer judges current is proved again
-/// once the keeper's next read is made, with no second prompt; a second
-/// such answer is the server's to see. A proof the node no longer admits
+/// on the root the keeper's next read brought, with no second prompt; a
+/// root the read did not move, or a second refusal, is the server's to
+/// see. A proof the node no longer admits
 /// for its device format, at ingress or at apply, asks for an update and
 /// answers the server nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -609,15 +610,26 @@ async fn a_refused_root_is_proved_again_and_a_retired_format_asks_for_an_update(
     };
     let proofs = || world.state.lock().unwrap().credentialed.len();
 
-    // Refused once: proved again after the keeper read the feed, the user
-    // asked once and the source used once.
+    // Refused as stale while the tree moved on: proved again on the root
+    // the keeper read, the user asked once and the source used once.
     let (forms, uses, sent, reads) = (
         chrome.shown.lock().unwrap().len(),
         *source.uses.lock().unwrap(),
         proofs(),
         world.feed_reads(),
     );
-    world.state.lock().unwrap().refusing.push_back(stale());
+    let claim_root = |index: usize| {
+        let state = world.state.lock().unwrap();
+        vos_wire::credentials::AuthClaim::decode_exact(&state.credentialed[index].1.claim)
+            .unwrap()
+            .map_root
+    };
+    world
+        .state
+        .lock()
+        .unwrap()
+        .refusing
+        .push_back((stale(), Some([0x77; 32])));
     let signed = signed_in(&session, &login, &chrome).await.unwrap();
     assert!(matches!(
         Response::decode_exact(&bytes(field(&signed, "answer"))),
@@ -627,16 +639,34 @@ async fn a_refused_root_is_proved_again_and_a_retired_format_asks_for_an_update(
         })
     ));
     assert_eq!(proofs(), sent + 2, "proved twice");
+    assert_ne!(claim_root(sent), claim_root(sent + 1), "on the new root");
     assert!(world.feed_reads() > reads, "the feed read between");
     assert_eq!(chrome.shown.lock().unwrap().len(), forms + 1, "one prompt");
     assert_eq!(*source.uses.lock().unwrap(), uses + 1, "one source use");
 
-    // Refused twice: the second refusal is the answer.
+    // Refused as stale with the tree where it was: no proof on the same
+    // root, the refusal is the answer.
+    let sent = proofs();
+    world
+        .state
+        .lock()
+        .unwrap()
+        .refusing
+        .push_back((stale(), None));
+    let signed = signed_in(&session, &login, &chrome).await.unwrap();
+    assert_eq!(
+        Response::decode_exact(&bytes(field(&signed, "answer"))),
+        Some(stale())
+    );
+    assert_eq!(proofs(), sent + 1, "no second proof on a stale root");
+
+    // Refused twice, the tree moved between: one retry, its refusal the
+    // answer.
     let sent = proofs();
     {
         let mut state = world.state.lock().unwrap();
-        state.refusing.push_back(stale());
-        state.refusing.push_back(stale());
+        state.refusing.push_back((stale(), Some([0x78; 32])));
+        state.refusing.push_back((stale(), None));
     }
     let signed = signed_in(&session, &login, &chrome).await.unwrap();
     assert_eq!(
@@ -652,7 +682,12 @@ async fn a_refused_root_is_proved_again_and_a_retired_format_asks_for_an_update(
             ingress::CredentialRefusal::Format,
         )),
     ] {
-        world.state.lock().unwrap().refusing.push_back(retired);
+        world
+            .state
+            .lock()
+            .unwrap()
+            .refusing
+            .push_back((retired, None));
         let refused = signed_in(&session, &login, &chrome).await.unwrap_err();
         assert_eq!(refused.code, Code::Refused);
         assert!(refused.message.contains("update the app"), "{refused:?}");

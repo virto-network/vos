@@ -704,12 +704,13 @@ fn the_stock_kernels_programs_come_from_their_release_artifacts() {
 
 /// What a stock kernel's program is under format 47: its chips, its log
 /// sizes and its id, as a release computes them from the credential
-/// actor's ELF and s4 ships them (`credential/release`). Every app proves
+/// actor's ELF and the facility embeds them (`node/light/android/release`). Every app proves
 /// under this id, so a prover change that moves it (a CPU column, a chip's
 /// index, a trace's rows on the reference run, a preprocessed column) is a
 /// new device format, never the same number: this gate fails first. A
 /// change of the credential actor's kernels moves it too, re-pinned with
-/// `blobs.lock` in the same commit, and s4's artifacts with it.
+/// `blobs.lock` in the same commit, and the facility's artifacts with it
+/// (`just facility-release`).
 #[test]
 fn the_stock_kernels_programs_are_pinned() {
     const AUTH: (u32, [u32; 18], [u8; 32]) = (

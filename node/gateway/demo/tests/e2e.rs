@@ -20,12 +20,12 @@ use std::time::Duration;
 use hmac::{Hmac, Mac as _};
 use russh::keys::{PublicKeyOrCertificate, ssh_key};
 use russh::{ChannelMsg, client};
+use s4_protocol::{Message, Value};
 use vos_facility::chrome::{Answer, Chrome, Form};
 use vos_facility::enrollment::Store;
 use vos_facility::net::Net;
 use vos_facility::source::{BoxFuture, Kind, Output, Reference, Source, SourceError};
 use vos_facility::{Facility, Gateway, Operation, Session, Stock};
-use s4_protocol::{Message, Value};
 use vos_gateway_demo::{LocalSpace, host_key, local, random};
 use vos_light::tor::{Circuit, Dial, Dialing, Stream, Target};
 

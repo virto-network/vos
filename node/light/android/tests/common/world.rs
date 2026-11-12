@@ -295,8 +295,9 @@ pub struct State {
     /// Answer the node's time with bytes that are no time.
     pub bad_time: bool,
     /// The answers the next proven calls get in place of running, as a
-    /// node's ingress or agent refuses them.
-    pub refusing: std::collections::VecDeque<Response>,
+    /// node's ingress or agent refuses them, each with the member the
+    /// space's tree enrolls as it answers, if any: a root superseded.
+    pub refusing: std::collections::VecDeque<(Response, Option<[u8; 32]>)>,
     pub feed_reads: usize,
     /// Admit no open claim, and count the terms asked.
     pub closed: bool,
@@ -633,7 +634,15 @@ impl World {
             Some(Kind::Credentialed) => {
                 let (agent, request) =
                     <(AgentId, Credentialed)>::decode_exact(body).expect("a credentialed call");
-                if let Some(refused) = state.refusing.pop_front() {
+                if let Some((refused, member)) = state.refusing.pop_front() {
+                    if let Some(member) = member {
+                        state
+                            .spaces
+                            .get_mut(&agent.0)
+                            .unwrap()
+                            .tree
+                            .enroll(&member, now);
+                    }
                     state.credentialed.push((agent, request));
                     return refused.encode();
                 }
