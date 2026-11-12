@@ -1764,7 +1764,7 @@ dependencies = [
  "proc-macro-crate",
  "proc-macro2",
  "quote",
- "sha3 0.12.0",
+ "sha3 0.10.9",
  "strum",
  "syn 3.0.6",
  "unicode-ident",
@@ -2773,7 +2773,10 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash 0.1.5",
+ "serde",
 ]
 
 [[package]]
@@ -2794,8 +2797,6 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash 0.2.0",
- "serde",
- "serde_core",
 ]
 
 [[package]]
@@ -5727,7 +5728,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s4-protocol"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=4828c9123b0efc2c33345293b9a9b8b8e277b149#4828c9123b0efc2c33345293b9a9b8b8e277b149"
+source = "git+https://codeberg.org/Virto/s4?rev=2857f5877410da9ced2ae5a72fcc5b760c171df6#2857f5877410da9ced2ae5a72fcc5b760c171df6"
 dependencies = [
  "base64",
  "ciborium",
@@ -5739,7 +5740,7 @@ dependencies = [
 [[package]]
 name = "s4-rui"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=4828c9123b0efc2c33345293b9a9b8b8e277b149#4828c9123b0efc2c33345293b9a9b8b8e277b149"
+source = "git+https://codeberg.org/Virto/s4?rev=2857f5877410da9ced2ae5a72fcc5b760c171df6#2857f5877410da9ced2ae5a72fcc5b760c171df6"
 dependencies = [
  "base64",
  "libc",
@@ -5757,7 +5758,7 @@ dependencies = [
 [[package]]
 name = "s4-server"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=4828c9123b0efc2c33345293b9a9b8b8e277b149#4828c9123b0efc2c33345293b9a9b8b8e277b149"
+source = "git+https://codeberg.org/Virto/s4?rev=2857f5877410da9ced2ae5a72fcc5b760c171df6#2857f5877410da9ced2ae5a72fcc5b760c171df6"
 dependencies = [
  "rand 0.10.3",
  "russh",
@@ -5770,7 +5771,7 @@ dependencies = [
 [[package]]
 name = "s4-widgets"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=4828c9123b0efc2c33345293b9a9b8b8e277b149#4828c9123b0efc2c33345293b9a9b8b8e277b149"
+source = "git+https://codeberg.org/Virto/s4?rev=2857f5877410da9ced2ae5a72fcc5b760c171df6#2857f5877410da9ced2ae5a72fcc5b760c171df6"
 dependencies = [
  "s4-protocol",
  "serde",
@@ -6597,7 +6598,7 @@ dependencies = [
  "dashmap",
  "educe 0.5.11",
  "fnv",
- "hashbrown 0.17.1",
+ "hashbrown 0.15.5",
  "hex",
  "indexmap 2.14.0",
  "itertools 0.12.1",
@@ -6618,7 +6619,7 @@ name = "stwo-constraint-framework"
 version = "2.2.0"
 source = "git+https://github.com/olanod/stwo?rev=e14925a81606b4d68c6a5d3047d382a20bd953d3#e14925a81606b4d68c6a5d3047d382a20bd953d3"
 dependencies = [
- "hashbrown 0.17.1",
+ "hashbrown 0.15.5",
  "itertools 0.12.1",
  "num-traits",
  "rand 0.8.6",

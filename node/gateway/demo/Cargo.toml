@@ -35,9 +35,9 @@ toml = "1"
 [dev-dependencies]
 # The headless client: s4's protocol, and the `vos.credential` facility
 # proving with this tree's device library.
-s4-protocol = { git = "https://codeberg.org/Virto/s4", rev = "3a63688dd66f053e24ab41ab0a438c74fbf80705" }
-s4-credential = { git = "https://codeberg.org/Virto/s4", rev = "3a63688dd66f053e24ab41ab0a438c74fbf80705" }
-s4-credential-contract = { git = "https://codeberg.org/Virto/s4", rev = "3a63688dd66f053e24ab41ab0a438c74fbf80705" }
+s4-protocol = { git = "https://codeberg.org/Virto/s4", rev = "2857f5877410da9ced2ae5a72fcc5b760c171df6" }
+s4-credential = { git = "https://codeberg.org/Virto/s4", rev = "2857f5877410da9ced2ae5a72fcc5b760c171df6" }
+s4-credential-contract = { git = "https://codeberg.org/Virto/s4", rev = "2857f5877410da9ced2ae5a72fcc5b760c171df6" }
 # The carrier audit's search over what the onion carried, and the tests'
 # waits.
 vos-checker = { path = "../../checker" }
