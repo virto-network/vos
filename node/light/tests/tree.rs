@@ -507,3 +507,59 @@ fn a_keeper_off_the_feed_starts_over() {
         );
     }
 }
+
+/// T1: a gateway that ends its answers early, at a root the ring still
+/// holds, marks the device's proofs for the root's grace alone. Past
+/// `ROOT_GRACE_MS` after the change it held back, the root is `Stale`;
+/// the refusal makes the feed due within the spread, and that one read on
+/// the real feed gives the path at the newest root, which the ring accepts,
+/// so the proof is made again with no other step. The grace is two of the
+/// timer's longest gaps, so an honest keeper's root never goes stale
+/// between its reads.
+#[test]
+fn a_feed_held_back_meets_the_grace_and_one_read_proves_again() {
+    use vos_wire::credentials::{Ring, RootRefusal};
+    use vos_wire::defaults::ROOT_GRACE_MS;
+    assert!(ROOT_GRACE_MS >= 2 * (TreeKeeper::PERIOD_MS * 3 / 2));
+
+    let mine = secret_member();
+    let mut writes = writes(&mine);
+    let held = writes.changes.len();
+    let superseded = 1_000_000;
+    writes.write(superseded, &[(41, leaf(&other(41)))]);
+    let mut ring = Ring::installed(0);
+    for change in &writes.changes {
+        ring.record(change.root.root, change.root.since);
+    }
+
+    // The gateway's answers end before the last change, the feed's
+    // length its word.
+    let mut cut = writes.page(0, held);
+    cut.length = held as u64;
+    let mut keeper = TreeKeeper::new(mine);
+    keeper.ingest(&answer(&cut), superseded).unwrap();
+    let old = keeper.witness().expect("a path at the root it was left at");
+    assert_ne!(old.root.to_bytes(), writes.tree.root());
+    assert_eq!(
+        ring.accepts(&old.root.to_bytes(), superseded + ROOT_GRACE_MS),
+        Ok(())
+    );
+    let now = superseded + ROOT_GRACE_MS + 1;
+    assert_eq!(
+        ring.accepts(&old.root.to_bytes(), now),
+        Err(RootRefusal::Stale)
+    );
+
+    // The proof's `RootStale`: the feed due within the spread, then read.
+    keeper.unknown(now);
+    assert!(keeper.due(now + TreeKeeper::UNKNOWN_SPREAD_MS));
+    let request = keeper.request(4, &[0x1d; 32], 2, 900).unwrap();
+    let read = keeper
+        .ingest(&writes.serve(&request), now + TreeKeeper::UNKNOWN_SPREAD_MS)
+        .unwrap();
+    assert_eq!(read.applied, 1);
+    let fresh = keeper.witness().expect("the newest root's path");
+    assert_eq!(fresh.root.to_bytes(), writes.tree.root());
+    assert!(fresh.proves(&mine));
+    assert_eq!(ring.accepts(&fresh.root.to_bytes(), u64::MAX), Ok(()));
+}

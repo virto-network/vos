@@ -185,6 +185,9 @@ struct Front {
     /// The kernel the guard names, a method of its actor.
     kernel: MethodId,
     window: Vec<DeviceRelease>,
+    /// The node's clock the expiry was checked at, which the root's
+    /// freshness is judged at too.
+    now: u64,
 }
 
 /// A verification's place among those in flight, given back when the
@@ -499,6 +502,7 @@ impl Inner {
             guard,
             kernel,
             window,
+            now,
         })
     }
 
@@ -520,6 +524,7 @@ impl Inner {
             guard,
             kernel,
             window,
+            now,
         } = front;
         // An install or a retirement between the programs' lookup and this
         // snapshot: a release no longer in the window is not admitted, and
@@ -582,7 +587,7 @@ impl Inner {
                 {
                     return Err(CredentialRefusal::Once.into());
                 }
-                fresh(snapshot, agent, &claim.map_root)?;
+                fresh(snapshot, agent, &claim.map_root, now)?;
                 Principal::Anonymous {
                     scope: claim.scope,
                     nullifier: claim.nullifier,
@@ -669,16 +674,18 @@ fn installed(
         .and_then(|bytes| Installed::decode_exact(unstored(&bytes)?)))
 }
 
-/// That `root` is in the credential actor's ring and fresh by this
-/// replica's latest applied batch time: `RootUnknown` (retryable) when the
-/// ring does not hold it, the agent has no credential actor, or this
-/// replica has applied no batch time yet; `RootStale` when it was
-/// superseded more than [`defaults::ROOT_MAX_AGE`] before.
-fn fresh(snapshot: &Snapshot, agent: AgentId, root: &[u8; 32]) -> Result<(), Refused> {
+/// That `root` is in the credential actor's ring and fresh at `now`, the
+/// node's clock the call's expiry was checked at: `RootUnknown`
+/// (retryable) when the ring does not hold it or the agent has no
+/// credential actor; `RootStale` when it was superseded more than
+/// [`defaults::ROOT_GRACE_MS`] before. Judged by the clock, not this
+/// replica's latest batch time, which an idle space leaves behind: an
+/// expiry at most the horizon past it puts apply's time
+/// ([`credentials::judged_at`]) no later, so apply accepts what this
+/// admits.
+fn fresh(snapshot: &Snapshot, agent: AgentId, root: &[u8; 32], now: u64) -> Result<(), Refused> {
     let ring = ring(snapshot, agent)?.ok_or(CredentialRefusal::RootUnknown)?;
-    let time =
-        read::<u64>(snapshot, agent, &keys::batch_time())?.ok_or(CredentialRefusal::RootUnknown)?;
-    ring.accepts(root, time).map_err(|refusal| match refusal {
+    ring.accepts(root, now).map_err(|refusal| match refusal {
         credentials::RootRefusal::Unknown => CredentialRefusal::RootUnknown.into(),
         credentials::RootRefusal::Stale => CredentialRefusal::RootStale.into(),
     })

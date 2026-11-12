@@ -751,7 +751,7 @@ fn an_invitation_enrolls_its_member_until_its_expiry() {
 /// The ring: the install's entry is the empty tree's from the founding's
 /// time; a batch's writes leave one entry, from its time; a root fallen out
 /// of the last 64 is unknown, and a superseded one stale past
-/// `ROOT_MAX_AGE`, by `Ring::accepts` on the stored row, which ingress and
+/// `ROOT_GRACE_MS`, by `Ring::accepts` on the stored row, which ingress and
 /// apply read.
 #[test]
 fn the_ring_keeps_a_root_a_batch_from_its_time() {
@@ -784,7 +784,7 @@ fn the_ring_keeps_a_root_a_batch_from_its_time() {
     let newest = ring.newest().unwrap().since;
     assert_eq!(ring.accepts(&roots[0], newest), Err(RootRefusal::Unknown));
     assert_eq!(ring.accepts(&roots[RING], u64::MAX), Ok(()));
-    let superseded = ring.0[1].since + vos_wire::defaults::ROOT_MAX_AGE;
+    let superseded = ring.0[1].since + vos_wire::defaults::ROOT_GRACE_MS;
     assert_eq!(ring.accepts(&roots[1], superseded), Ok(()));
     assert_eq!(
         ring.accepts(&roots[1], superseded + 1),

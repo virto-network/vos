@@ -2,8 +2,10 @@
 //! the batch's time): refused, writing nothing, when it expired, when its
 //! binding digest is recorded, when its proof's device format is retired,
 //! by the release or the agent's log, whatever the node that verified it
-//! admits, when a stock auth claim's root is not
-//! fresh, or when a `once` guard admitted its nullifier; else its binding
+//! admits, when a stock auth claim's root is not fresh at
+//! [`credentials::judged_at`] (the earlier of the batch's time and the
+//! expiry less the horizon, no later than any admitting ingress's
+//! clock, so apply refuses no root ingress admitted), or when a `once` guard admitted its nullifier; else its binding
 //! digest is recorded, whatever the method then does, and the method runs
 //! as the call's origin, a `once` guard's nullifier recorded only when the
 //! method returned `Ok`. A kernel guard's handler takes the claim before
@@ -61,8 +63,9 @@ pub(crate) fn credentialed(base: &Base, index: u32, call: CredentialedInput) -> 
         let Some(claim) = AuthClaim::decode_exact(&call.claim) else {
             return Stepped::ran(consumed(input, Outcome::failed(Failure::Forbidden)));
         };
+        let at = credentials::judged_at(base.time, call.expires_ms);
         match ring(base) {
-            Ok(Some(ring)) if ring.accepts(&claim.map_root, base.time).is_ok() => {}
+            Ok(Some(ring)) if ring.accepts(&claim.map_root, at).is_ok() => {}
             Ok(_) => return refused(Refusal::StaleRoot),
             // A ring the meter cannot pay, or that does not read: the call
             // fails, nothing recorded.

@@ -8,8 +8,8 @@
 //! answered its run, not `Replayed` or `CredentialExpired`; a root a
 //! replica has not applied and one pushed out of the ring, each
 //! `RootUnknown` and admitted after a path refetch, and a root written
-//! while the leader's clock trails kept past the next batch; a revoked member's root refused once `ROOT_MAX_AGE` has
-//! passed by batch time; owner proofs paying from their accounts; no log entry
+//! while the leader's clock trails kept past the next batch; a revoked member's root refused once `ROOT_GRACE_MS` has
+//! passed by the node's clock; owner proofs paying from their accounts; no log entry
 //! holding a proof; a verified call holding no large body's place while it
 //! waits to apply; the device library's requests and proofs admitted as
 //! they leave it; an actor's own kernel's proof run by its handler on its
@@ -34,7 +34,7 @@ use vos_wire::abi::{Failure, Refusal};
 use vos_wire::credentials::{
     self as tree, AuthClaim, Bound, CredentialError, Digest, Path, RootEntry,
 };
-use vos_wire::defaults::ROOT_MAX_AGE;
+use vos_wire::defaults::ROOT_GRACE_MS;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
 use vos_wire::ingress::{
     CredentialRefusal, Credentialed, DeviceWindow, FormatWindow, Rejection, Response,
@@ -941,8 +941,8 @@ fn an_unknown_root_is_retried_on_a_path_fetched_again() {
 }
 
 /// A revoked member's proof on the root before its revocation is admitted
-/// within `ROOT_MAX_AGE` of the revoking batch, and refused `RootStale`
-/// once that has passed by the replica's latest batch time; owner proofs
+/// within `ROOT_GRACE_MS` of the revoking batch, and refused `RootStale`
+/// once that has passed by the node's clock; owner proofs
 /// pay from the accounts they hold, and a rekeyed account from its new
 /// owner's.
 #[test]
@@ -958,7 +958,14 @@ fn a_revoked_members_root_goes_stale_and_owners_pay_from_their_accounts() {
         done(&founded.send(at, &call)).len() > 1,
         "within the window"
     );
-    founded.later(ROOT_MAX_AGE as i64 + 60_000);
+    founded.later(ROOT_GRACE_MS as i64 - 30_000);
+    let call = founded.auth(at, &member, &before, ("login", "login"), ());
+    assert!(
+        done(&founded.send(at, &call)).len() > 1,
+        "later, within the grace"
+    );
+    // Past the grace, long before the ring's 64 roots push it out.
+    founded.later(40_000);
     let call = founded.auth(at, &member, &before, ("login", "login"), ());
     assert_eq!(
         refused(founded.send(at, &call)),

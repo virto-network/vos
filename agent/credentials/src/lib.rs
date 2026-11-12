@@ -2,7 +2,7 @@
 //! a slot of a positional sparse Merkle tree of Poseidon2-M31 compressions,
 //! depth 32 (`identity-and-authority.md` §6, `proving.md` §8). A member
 //! proves its leaf under a root of the ring in zero knowledge; ingress and
-//! apply accept a root while it is the newest, and for `ROOT_MAX_AGE` after
+//! apply accept a root while it is the newest, and for `ROOT_GRACE_MS` after
 //! a write superseded it ([`vos_wire::credentials::Ring::accepts`]).
 //!
 //! A library actor, installed in the agent whose methods it guards. Its

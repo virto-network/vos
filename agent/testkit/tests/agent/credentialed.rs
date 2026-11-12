@@ -19,7 +19,7 @@ use vos_wire::batch::{Admin, CredentialedInput, Input, Request};
 use vos_wire::credentials::{
     self, AuthClaim, CredentialError, Digest, OwnerClaim, Ring, RootEntry,
 };
-use vos_wire::defaults::{self, BINDING_KEPT_MS, ROOT_MAX_AGE};
+use vos_wire::defaults::{self, BINDING_KEPT_MS, CREDENTIAL_HORIZON_MS, ROOT_GRACE_MS};
 use vos_wire::ids::{InstanceId, Principal, Session};
 use vos_wire::ingress::Grant;
 use vos_wire::keys::{self, Due};
@@ -630,12 +630,17 @@ fn apply_refuses_by_the_batchs_time_and_records_each_binding() {
 }
 
 /// An auth call is admitted on the ring's newest root, and on a superseded
-/// one for `ROOT_MAX_AGE` after it was superseded, by the batch's time: a
-/// revoked member's proof on the root before its revocation is refused
-/// once that has passed. An origin whose scope is not its guard's is
-/// `Forbidden`.
+/// one for `ROOT_GRACE_MS` after it was superseded, judged at the latest
+/// time an ingress could have admitted it, its expiry less
+/// `CREDENTIAL_HORIZON_MS`, or the batch's time if earlier: a revoked
+/// member's proof on the root before its revocation is refused once that
+/// has passed, well inside the ring's 64 roots. A call of the shortest
+/// expiry, which an ingress could have admitted `CREDENTIAL_HORIZON_MS`
+/// before its batch, runs at the window's end by that time, so a replica
+/// never refuses at apply what ingress admitted. An origin whose scope is
+/// not its guard's is `Forbidden`.
 #[test]
-fn an_auth_root_is_fresh_by_the_batchs_time_and_a_scope_is_its_guards() {
+fn an_auth_root_is_fresh_for_the_grace_by_the_calls_time_and_a_scope_is_its_guards() {
     let mut agent = Agent::new();
     let before = agent.root();
     let revoked = START + 100;
@@ -644,20 +649,44 @@ fn an_auth_root_is_fresh_by_the_batchs_time_and_a_scope_is_its_guards() {
     let after = agent.root();
     assert_ne!(after.root, before.root);
     assert_eq!(after.since, revoked);
-    let horizon = revoked + ROOT_MAX_AGE + 10_000;
-    let login = |agent: &mut Agent, nullifier: u8, root: Digest, time: u64| {
+    let horizon = revoked + 6 * 60_000;
+    let login = |agent: &mut Agent, nullifier: u8, root: Digest, (time, expires): (u64, u64)| {
         let origin = agent.anonymous("login", nullifier);
-        let call = agent.call(origin, POLL, "login", (), time + 1_000, Some(root));
+        let call = agent.call(origin, POLL, "login", (), expires, Some(root));
         agent.step(time, &call)
     };
-    let within = login(&mut agent, 1, before.root, revoked + ROOT_MAX_AGE);
+    // Expiring a horizon after the batch: judged at the batch's time.
+    let judged_at = |time| (time, time + CREDENTIAL_HORIZON_MS);
+    let within = login(
+        &mut agent,
+        1,
+        before.root,
+        judged_at(revoked + ROOT_GRACE_MS),
+    );
     assert!(
         matches!(ran(&within).outcome, Outcome::Done(_)),
         "{within:?}"
     );
-    let past = login(&mut agent, 1, before.root, revoked + ROOT_MAX_AGE + 1);
+    let past = login(
+        &mut agent,
+        1,
+        before.root,
+        judged_at(revoked + ROOT_GRACE_MS + 1),
+    );
     assert_eq!(refused(&past), Refusal::StaleRoot);
-    let newest = login(&mut agent, 2, after.root, horizon);
+    // Expiring at the batch's time: an ingress a horizon before admitted it.
+    let edge = revoked + ROOT_GRACE_MS + CREDENTIAL_HORIZON_MS;
+    let late = login(&mut agent, 3, before.root, (edge, edge));
+    assert!(matches!(ran(&late).outcome, Outcome::Done(_)), "{late:?}");
+    let beyond = login(&mut agent, 4, before.root, (edge + 1, edge + 1));
+    assert_eq!(refused(&beyond), Refusal::StaleRoot);
+    let later = login(&mut agent, 1, before.root, judged_at(revoked + 5 * 60_000));
+    assert_eq!(
+        refused(&later),
+        Refusal::StaleRoot,
+        "inside the ring, past the grace"
+    );
+    let newest = login(&mut agent, 2, after.root, judged_at(horizon));
     match &ran(&newest).outcome {
         Outcome::Done(bytes) => {
             assert_eq!(Option::<Digest>::decode_exact(bytes), Some(Some([2; 32])));
@@ -679,7 +708,7 @@ fn an_auth_root_is_fresh_by_the_batchs_time_and_a_scope_is_its_guards() {
     );
     let step = agent.step(horizon, &call);
     assert_eq!(failed(&step), Failure::Forbidden);
-    assert_eq!(agent.query::<_, u64>(POLL, "logins", ()), 2);
+    assert_eq!(agent.query::<_, u64>(POLL, "logins", ()), 3);
 }
 
 /// A `once` guard admits a nullifier once in its scope, its row written

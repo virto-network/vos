@@ -41,10 +41,13 @@
 //! device's for as long as it is open, and a read just before each proof
 //! would join the proofs through it. A page that says more follows is due
 //! at once. The credential actor's ring holds the last 64 roots, one a
-//! tree-changing batch, and accepts a superseded root for `ROOT_MAX_AGE`
-//! (10 minutes) while the ring still holds it: a root held at most one
-//! period behind the tree survives unless the space makes 64
-//! tree-changing batches within one period; a space faster than that
+//! tree-changing batch, and accepts a superseded root for `ROOT_GRACE_MS`
+//! (90 s, two of the timer's longest gaps) while the ring still holds it:
+//! a root held at most one period behind the tree survives, with time left
+//! to prove and send, unless the space makes 64 tree-changing batches
+//! within one period; a gateway that holds a change back marks the root
+//! the device proves against for the grace at most, then the device meets
+//! `RootStale` and reads again; a space faster than that
 //! meets `RootUnknown`, and [`TreeKeeper::unknown`] makes the feed due
 //! within [`TreeKeeper::UNKNOWN_SPREAD_MS`] (10 s), at a time drawn for
 //! it, and halves the period (to at least [`TreeKeeper::MIN_PERIOD_MS`]),
@@ -145,8 +148,8 @@ struct Kept {
 
 impl TreeKeeper {
     /// The timer's period, before its jitter of half a period either way:
-    /// one twentieth of `ROOT_MAX_AGE`.
-    pub const PERIOD_MS: u64 = vos_wire::defaults::ROOT_MAX_AGE / 20;
+    /// `FEED_PERIOD_MS`, which the root's grace is two longest gaps of.
+    pub const PERIOD_MS: u64 = vos_wire::defaults::FEED_PERIOD_MS;
     /// The least period a run of `RootUnknown` answers halves it to.
     pub const MIN_PERIOD_MS: u64 = 1_000;
     /// The spread of the read a refused root brings forward: drawn

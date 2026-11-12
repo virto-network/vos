@@ -244,7 +244,7 @@ pub enum Answer {
     /// The replica's ring does not hold the proof's root: read the feed
     /// again ([`crate::TreeKeeper::unknown`]), prove anew at its root.
     RootUnknown,
-    /// The proof's root was superseded more than `ROOT_MAX_AGE` ago: read
+    /// The proof's root was superseded more than `ROOT_GRACE_MS` ago: read
     /// the feed again as for [`Answer::RootUnknown`] and prove anew.
     RootStale,
     /// The expiry is outside the node's window: `now` is the node's clock,

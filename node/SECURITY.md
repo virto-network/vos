@@ -96,8 +96,12 @@ frame checks and the agent's placement come first, as for any call):
     pushed it out; it reads the tree's feed again or asks another
     replica);
 16. for auth, the root is the ring's newest or was superseded at most
-    `ROOT_MAX_AGE` (10 minutes) before this replica's latest batch time
-    (`RootStale`, final);
+    `ROOT_GRACE_MS` (90 s) before the node's clock, the one the expiry
+    check reads (`RootStale`, final for that proof: the device reads the
+    feed and proves again at the newest root). Two of the device feed
+    timer's longest gaps (`light-node.md` §6.7): a gateway that ends a
+    device's feed answers early, at a root the ring still holds, marks its
+    proofs for that long at most;
 17. a verification slot is free (`Busy`): fewer verifications in flight
     than the node's budget, by default twice its executor threads;
 18. on an executor, the proof verifies under the program the binding
@@ -173,8 +177,12 @@ proven calls (`defaults::BATCH_CREDENTIALED`). So:
 
 - **a proof replayed at another replica runs once:** both may pass their
   ingresses, the second is refused at apply;
-- **a revocation binds every replica** within `ROOT_MAX_AGE` of the
-  revoking batch, whatever a lagging replica's ingress admitted;
+- **a revocation binds every replica** within `ROOT_GRACE_MS` and the
+  120 s horizon of the revoking batch, whatever a lagging replica's
+  ingress admitted: apply judges a root at the earlier of the batch's time
+  and the call's expiry less the horizon (`credentials::judged_at`), the
+  latest time an ingress could have admitted the call, so no replica
+  refuses at apply what an ingress admitted on the grace;
 - **a format's retirement binds every replica,** whatever one node's
   ingress admits (`Admin::RetireFormat`, through the agent's log);
 - **a resend past the expiry is answered the run:** a replica whose

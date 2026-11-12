@@ -654,7 +654,7 @@ pub struct Feed {
 }
 
 /// Why a root is not accepted: in no entry of the ring, or superseded more
-/// than [`crate::defaults::ROOT_MAX_AGE`] before the time it is judged at.
+/// than [`crate::defaults::ROOT_GRACE_MS`] before the time it is judged at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 #[repr(u8)]
 pub enum RootRefusal {
@@ -699,7 +699,7 @@ impl Ring {
     }
 
     /// Whether `root` is accepted at `time`: the newest, or superseded at
-    /// most [`crate::defaults::ROOT_MAX_AGE`] before `time`, by the time
+    /// most [`crate::defaults::ROOT_GRACE_MS`] before `time`, by the time
     /// the next entry became the root. A root the ring holds twice is
     /// judged by its later entry.
     pub fn accepts(&self, root: &Digest, time: u64) -> Result<(), RootRefusal> {
@@ -710,7 +710,7 @@ impl Ring {
             .ok_or(RootRefusal::Unknown)?;
         match self.0.get(at + 1) {
             None => Ok(()),
-            Some(next) if time.saturating_sub(next.since) <= crate::defaults::ROOT_MAX_AGE => {
+            Some(next) if time.saturating_sub(next.since) <= crate::defaults::ROOT_GRACE_MS => {
                 Ok(())
             }
             Some(_) => Err(RootRefusal::Stale),
@@ -968,6 +968,19 @@ pub fn ring_key(actor: InstanceId) -> Vec<u8> {
     crate::keys::row(actor, rows, &[tables::RING_KEY]).expect("a hashed row's key")
 }
 
+/// The time apply judges a proven call's root at ([`Ring::accepts`]): the
+/// earlier of the batch's time and the call's expiry less
+/// [`crate::defaults::CREDENTIAL_HORIZON_MS`]. Ingress judges at its clock
+/// and refuses an expiry more than the horizon past it, so this is no
+/// later than the time of any ingress that admitted the call; and apply
+/// refuses an expiry before the batch's time, so it is no earlier than
+/// the batch's time less the horizon. So no replica refuses at apply a
+/// root an ingress admitted, and a superseded root binds every replica
+/// within [`crate::defaults::ROOT_GRACE_MS`] and the horizon.
+pub fn judged_at(batch_time: u64, expires_ms: u64) -> u64 {
+    batch_time.min(expires_ms.saturating_sub(crate::defaults::CREDENTIAL_HORIZON_MS))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1027,11 +1040,11 @@ mod tests {
 
     /// The ring: a write at the newest entry's time replaces its root,
     /// another appends, the oldest dropped past 64; a root is accepted while
-    /// newest and for `ROOT_MAX_AGE` after it was superseded, judged by its
+    /// newest and for `ROOT_GRACE_MS` after it was superseded, judged by its
     /// later entry when held twice.
     #[test]
     fn the_ring_records_and_judges_freshness() {
-        const AGE: u64 = crate::defaults::ROOT_MAX_AGE;
+        const AGE: u64 = crate::defaults::ROOT_GRACE_MS;
         let root = |n: u8| [n; 32];
         let mut ring = Ring::installed(5);
         assert_eq!(ring.newest().unwrap().root, digest(&EMPTY[DEPTH]));
@@ -1068,6 +1081,30 @@ mod tests {
         assert_eq!(ring.0[0].since, 20 + 1, "the oldest dropped");
         assert_eq!(ring.accepts(&root(3), 30), Err(RootRefusal::Unknown));
         assert_eq!(Ring::decode_exact(&ring.encode()), Some(ring));
+    }
+
+    /// Apply judges a root at the batch's time, or at the call's expiry
+    /// less the horizon when that is earlier: never later than the clock
+    /// of an ingress that admitted the call, never earlier than the
+    /// batch's time less the horizon.
+    #[test]
+    fn apply_judges_a_root_no_later_than_its_ingress() {
+        const HORIZON: u64 = crate::defaults::CREDENTIAL_HORIZON_MS;
+        let batch = 1_000_000;
+        assert_eq!(judged_at(batch, batch + HORIZON), batch);
+        assert_eq!(judged_at(batch, batch + 2 * HORIZON), batch);
+        assert_eq!(judged_at(batch, batch), batch - HORIZON);
+        assert_eq!(judged_at(batch, batch + 60_000), batch + 60_000 - HORIZON);
+        assert_eq!(judged_at(5, 10), 0);
+        // Any ingress at `now` admitting an expiry of at most
+        // `now + HORIZON`, applied at a batch no earlier than `now`.
+        for now in [batch - 1, batch - HORIZON, batch - 30_000] {
+            for expires in [now, now + 1, now + HORIZON / 2, now + HORIZON] {
+                if expires >= batch {
+                    assert!(judged_at(batch, expires) <= now);
+                }
+            }
+        }
     }
 
     /// A path's codec is its root, its slot and 1,024 bytes of siblings.

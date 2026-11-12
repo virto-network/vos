@@ -353,8 +353,8 @@ pub enum CredentialRefusal {
     #[codec(index = 10)]
     RootUnknown,
     /// An auth root superseded more than
-    /// [`crate::defaults::ROOT_MAX_AGE`] before this replica's latest
-    /// applied batch time: final.
+    /// [`crate::defaults::ROOT_GRACE_MS`] before the node's clock: final
+    /// for this proof; read the tree's feed again and prove anew.
     #[codec(index = 11)]
     RootStale,
     /// The proof does not verify: one code for every failure, so a refusal

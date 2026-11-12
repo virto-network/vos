@@ -639,7 +639,7 @@ fn a_root_unknown_answer_proves_anew_at_the_new_root() {
     assert_eq!(ring.accepts(&held.root.to_bytes(), 10), Ok(()));
 
     // 64 batches, each enrolling one member: one second apart, well within
-    // `ROOT_MAX_AGE`, so the held root drops out unknown, not stale.
+    // `ROOT_GRACE_MS`, so the held root drops out unknown, not stale.
     for batch in 0..RING as u32 {
         tree.enroll(
             1_000 + batch,
@@ -651,7 +651,7 @@ fn a_root_unknown_answer_proves_anew_at_the_new_root() {
         ring.record(tree.root().to_bytes(), 11_000 + 1_000 * u64::from(batch));
     }
     let now = 11_000 + 1_000 * RING as u64;
-    assert!(now - 10 < vos_wire::defaults::ROOT_MAX_AGE);
+    assert!(now - 10 < vos_wire::defaults::ROOT_GRACE_MS);
     assert_eq!(
         ring.accepts(&held.root.to_bytes(), now),
         Err(RootRefusal::Unknown)

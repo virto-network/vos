@@ -237,7 +237,8 @@ and what a node does with one is `node/SECURITY.md`'s.
 - **What `s` gives a thief:** auth as its member in every scope of the
   space (and of any space sharing its handle), payment from every row
   `owner(s)` owns, and every nullifier the member has used or will use.
-  Revoking the leaf stops auth within `ROOT_MAX_AGE`; it does not stop
+  Revoking the leaf stops auth within `ROOT_GRACE_MS` (90 s) and the
+  120 s horizon; it does not stop
   payment: the ledger's `rekey` and `freeze` do.
 
 ## What the library shows
@@ -286,7 +287,9 @@ and what a node does with one is `node/SECURITY.md`'s.
   older than the last, or does not start at the keeper's place, is
   refused whole and the tree kept as it was. The feed is still the gateway's word: one that withholds changes
   makes the device prove against an old root, which ingress answers
-  `RootStale` or `RootUnknown`.
+  `RootStale` or `RootUnknown`: a root the ring still holds passes for
+  `ROOT_GRACE_MS` (90 s) after the change that superseded it, so such a
+  mark lasts that long at most, and then the device reads again.
 - **The feed is read on a jittered timer of its own** (30 s, between
   15 s and 45 s), never because a proof is about to be made: the feed's
   connection is one circuit for as long as it is open, and a read just
@@ -295,7 +298,10 @@ and what a node does with one is `node/SECURITY.md`'s.
   it: that read still precedes the retried proof, and since the feed's
   connection is one circuit while it stays open, two refused proofs each
   followed by a read on it link the two proofs' scopes to one device. It
-  happens only when the ring no longer holds the device's root.
+  happens only when the ring no longer holds the device's root, or a
+  proof reached the node more than the grace after a change its keeper
+  had not read (a gateway's holding back, or a call slower than the 45 s
+  the grace leaves it).
 - **What a gateway can make the device hold is bounded:** a page at most
   48 KiB (or one change of at most 256 leaves), no slot past the lowest
   never used, as the actor places members, so about two nodes a leaf;
@@ -390,8 +396,9 @@ What going over the onion changes for a device (`light-node.md` §6.7):
   feed, so answers padded to leave a place of the device's own mark
   nothing a later circuit carries; answers ended early can leave the
   device at a root of the gateway's choosing, one of the ring's recent
-  roots others hold too (a few bits at most), or one no proof passes
-  under, which the keeper leaves after two refusals.
+  roots others hold too (a few bits at most, and for the root's 90 s
+  grace at most), or one no proof passes under, which the keeper leaves
+  after two refusals.
 - **Does not fix:** the timing of what a device sends (a gateway may join
   two circuits by time: the feed's timer keeps its reads apart from
   proofs, no more); the `map_root` a proof names, which within a timer

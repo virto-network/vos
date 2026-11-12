@@ -141,8 +141,8 @@ codes! {
         /// not repeated.
         Replayed = 8,
         /// An auth call whose root is neither the credential actor's newest
-        /// nor superseded at most [`crate::defaults::ROOT_MAX_AGE`] before
-        /// the batch's time.
+        /// nor superseded at most [`crate::defaults::ROOT_GRACE_MS`] before
+        /// [`crate::credentials::judged_at`] the batch's time and its expiry.
         StaleRoot = 9,
         /// An auth call of a `once` guard whose nullifier its scope has
         /// admitted.

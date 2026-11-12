@@ -211,13 +211,24 @@ pub const SERVED_BYTE: u64 = 64;
 /// the rest.
 pub const ACK_LIMIT: u64 = 1024;
 
+/// The period of a device's timer for reading the credential tree's feed,
+/// in milliseconds (`vos_light::TreeKeeper`): each read is drawn between
+/// half and one and a half periods after the last, so an honest keeper's
+/// reads are at most 45 s apart.
+pub const FEED_PERIOD_MS: u64 = 30_000;
+
 /// How long a credential actor's root stays accepted after a write
-/// superseded it, in milliseconds of batch time
-/// ([`crate::credentials::Ring::accepts`]): so a revocation binds every
-/// replica within it, and an honest member's path stays good as long after
-/// any change to the tree, unless the ring's 64 later roots push its root
-/// out first. Not the venues' `MaxRootAge`.
-pub const ROOT_MAX_AGE: u64 = 10 * 60 * 1000;
+/// superseded it, in milliseconds ([`crate::credentials::Ring::accepts`],
+/// at ingress by the node's clock, at apply at
+/// [`crate::credentials::judged_at`]): two of the feed timer's longest
+/// gaps (`light-node.md` §6.7), one for a keeper that has not yet read the
+/// change, one for the proof it made just before, proved and carried to
+/// the node. So a revocation binds every replica within it and
+/// [`CREDENTIAL_HORIZON_MS`], and a gateway that ends a device's feed
+/// answers early at a root the ring holds marks the device's proofs for
+/// no longer; unless the ring's 64 later roots push the root out first.
+/// Not the venues' `MaxRootAge`.
+pub const ROOT_GRACE_MS: u64 = 2 * (FEED_PERIOD_MS + FEED_PERIOD_MS / 2);
 
 /// How far ahead of the node's clock a credentialed call's `expires_ms` may
 /// be, in milliseconds: a proof is good at ingress for this long at most.
