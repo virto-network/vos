@@ -135,10 +135,15 @@ The scale results are in `core-model.md` §14, "The scale test".
   pre-check and costs a decode and the composition (11–27 ms on one x86
   thread) before its 16-bit PoW refuses it; 16 or more bits would refuse
   such junk in about 0.02 ms, at the prover's grind's cost on the phone.
-- **A quiet re-measure of the device exit `0x402`'s cost** on an idle
-  machine (`POSEIDON2_GAS`' 1,800 TSC cycles a native compression is an
-  estimate from loaded runs); owed since plan 8.10, whose machine stayed
-  loaded.
+- **`0x402`'s price against its quiet cost:** one native Poseidon2-M31
+  compression (`vos_pvm::precompile::poseidon2_compress`) takes 1,925 TSC
+  cycles at the median, one BLAKE2b compression 405–414, ×4.65–4.75, on
+  one pinned core of an idle machine (load average 0.5), three runs of 31
+  rounds of 20,000 [measured, x86 dev machine (Intel Core Ultra 7 155H),
+  2026-11-12; a spike outside the tree]. `POSEIDON2_GAS` (2,400) is four
+  BLAKE2b prices (600) from the loaded estimate of 1,800 cycles; at
+  BLAKE2b's gas a cycle it would be about 2,800. Whether to raise it, which
+  moves every gas pin that counts a `0x402` call, is the owner's.
 - **Segment AIR parts not yet under a forgery gate:** the program memory's
   decode binding, the jump table, the lookup tables, the memory page and
   Merkle chips, the witness-input chip, the boundary-binding argument, and

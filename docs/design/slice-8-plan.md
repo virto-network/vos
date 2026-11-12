@@ -231,10 +231,11 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   proof and a 46 proof run, the light node choosing 47 where both are
   admitted; 46 retired now, its proof made before refused `Format`;
   admitting 46 alone, the light node choosing 46 and its proof run.
+- **The quiet re-measure of `0x402`:** 1,925 TSC cycles a native
+  compression, ×4.7 a BLAKE2b compression, against the price's four
+  [measured, 2026-11-12; `open.md`]; the price is unchanged, the owner's.
 - **Still to run:** PG1′ and PG2′ on 47, twice a day apart (S8-P3,
-  S8-P4); `proving.md` §8 holds them at 46 until then. The quiet
-  re-measure of `0x402` is still owed: the machine was under other work
-  (load average 22–39) throughout the step (`open.md`).
+  S8-P4); `proving.md` §8 holds them at 46 until then.
 
 ## M3 — The personal agent in the space (stream D, 11–15 weeks from M0)
 
