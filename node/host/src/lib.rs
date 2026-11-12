@@ -40,6 +40,7 @@ mod workflows;
 
 pub use admission::OnionPolicy;
 pub use api::{CREDENTIALED_BODIES, OPERATOR_KEY, OPERATOR_PUB};
+pub use credentialed::DEVICE_FORMATS;
 pub use leader::AnchorAlert;
 pub use node::{
     CallError, Config, Error, NODE_KEY, Node, Peers, ReplaceError, Reply, STORE, wall_clock,

@@ -29,7 +29,8 @@ reference shape, from the security tool (`src/security.rs`):
 | 32 | leaves and folds | Poseidon2-M31 | 108 / 63 | 100 / 60 | reserved: proved and verified inside the recursion, refused by every outside verifier |
 | 28 | the final wrap, unmasked | Blake2b-256 | 146 / 82.6 | 100 / 80 | admitted: the tests' and the fixtures', linked by the final verifier under `test-formats` alone |
 | 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 146 / 82.70 | 100 / 80 | admitted: what production venues accept |
-| 46 | device proofs, masked (variant (c)), `h = 256` | Blake2s-M31 | 110 / 62.82 | 100 / 60 | admitted: proven calls at a space's ingress, a device kernel's run each |
+| 46 | device proofs, masked (variant (c)), `h = 256`, the full CPU and the byte ledger | Blake2s-M31 | 110 / 62.82 | 100 / 60 | registered and verifiable; retired at 47's release (its byte ledger lets a byte have two groups, `docs/design/open.md`), admitted by a node only where configured |
+| 47 | device proofs, masked (variant (c)), `h = 256`, the per-program CPU and the word ledger | Blake2s-M31 | 110 / 62.82 | 100 / 60 | admitted: proven calls at a space's ingress, a device kernel's run each |
 
 - **Conjectured** bits are PoW plus queries times log blowup (the ethSTARK
   conjecture, refuted as stated in 2025; the parameters carry a margin for
@@ -42,7 +43,9 @@ reference shape, from the security tool (`src/security.rs`):
   (`deep_values_of_column`); `c`, the most of one column, is counted the
   same way, 3. The segment shape batches 11,091 values; 41's query term
   binds, 62.81. The masked device reference (every device chip at 2^17
-  rows) batches 7,403; 46 counts 62.82 by affine batching, 62.01 by powers.
+  rows) batches 7,403 under the byte ledger, 46's, and 7,470 under the
+  word ledger, 47's; 46 counts 62.82 by affine batching, 62.01 by powers;
+  47 counts 62.82 by affine batching.
 - A verifier rejects a number the registry does not admit
   (`format::lookup`), and a proof on another channel than its format's. The proof's configuration must equal
   the format's, and its counts at its own shape must reach the floors.

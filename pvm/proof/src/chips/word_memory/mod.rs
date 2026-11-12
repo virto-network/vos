@@ -28,9 +28,9 @@
 //!   tuple is consumed inside a group, and **every inner row takes one**, so
 //!   its timestamp is a producer's and the sort keys between two accesses
 //!   cannot wrap the field through rows no access binds;
-//! - **padding** comes after every real row (the preprocessed `IsLast`), so
-//!   the real rows are one sorted run and a word one group, however many
-//!   boundary rows name it.
+//! - **padding** comes after every real row and the last row is padding
+//!   (the preprocessed `IsLast`), so the real rows are one sorted run and a
+//!   word one group, however many boundary rows name it.
 //!
 //! [`DeviceWordMemoryChip`]: crate::chips::DeviceWordMemoryChip
 
@@ -213,6 +213,9 @@ impl BuiltInComponent for WordMemoryChip {
         eval.add_constraint(
             is_pad[0].clone() * (one() - is_pad_next[0].clone()) * (one() - is_last[0].clone()),
         );
+        // The last row is padding, which removes the all-real cyclic
+        // ledger: every row one word at one sort key, with no group start.
+        eval.add_constraint(is_last[0].clone() * is_real.clone());
         let address_next = crate::trace::trace_eval_next_row!(trace_eval, Column::Address);
         let timestamp_next = crate::trace::trace_eval_next_row!(trace_eval, Column::Timestamp);
         let prev_next = crate::trace::trace_eval_next_row!(trace_eval, Column::PrevValue);

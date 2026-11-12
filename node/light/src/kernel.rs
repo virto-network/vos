@@ -10,10 +10,12 @@ use vos_wire::ingress::DeviceWindow;
 use crate::release::Device;
 use crate::{DeviceError, Prover};
 
-/// The device format's number, the registry's: format 46.
+/// The device format's number, the registry's: format 47, the one this
+/// light node's release artifacts are computed in.
 pub const DEVICE_FORMAT: u32 = profile::FORMAT.number;
 
-/// A device kernel's program under the device format: the chips its code
+/// A device kernel's program under a device format (the device format, or
+/// another this build proves, [`profile::FORMATS`]): the chips its code
 /// reaches, a log size each and the preprocessed root they commit, all
 /// computed from the kernel, never taken from a proof. A branch-free kernel
 /// proves every witness under its one program.
@@ -32,14 +34,13 @@ impl DeviceProgram {
     }
 
     /// The program a release artifact names: its preprocessed tree
-    /// committed from the kernel at the artifact's chips and log sizes, no
-    /// reference run and no transpiler; [`DeviceError::Prove`] when that is
-    /// no program of the device format, or its id is not the artifact's.
+    /// committed from the kernel at the artifact's chips and log sizes in
+    /// its format, no reference run and no transpiler;
+    /// [`DeviceError::Prove`] when this build proves no such format, that is
+    /// no program of it, or its id is not the artifact's.
     pub fn released(device: &Device) -> Result<Self, DeviceError> {
-        if device.format != DEVICE_FORMAT {
-            return Err(DeviceError::Prove);
-        }
-        let program = Program::released(&device.kernel, device.chips, &device.log_sizes)
+        let format = profile::format(device.format).ok_or(DeviceError::Prove)?;
+        let program = Program::released_in(format, &device.kernel, device.chips, &device.log_sizes)
             .map_err(|_| DeviceError::Prove)?;
         if *program.id() != device.id {
             return Err(DeviceError::Prove);
@@ -50,6 +51,11 @@ impl DeviceProgram {
     /// Its id, which a binding names.
     pub fn id(&self) -> &[u8; 32] {
         self.0.id()
+    }
+
+    /// The device format it proves under.
+    pub fn format(&self) -> u32 {
+        self.0.format().number
     }
 
     /// Each chip's log size, in the device order.
@@ -65,7 +71,7 @@ impl DeviceProgram {
     /// Verifies `proof`'s bytes under this program against its io-hash,
     /// which a caller holding the claim computes itself ([`claim_io`]).
     pub fn verify(&self, proof: &DeviceProof) -> Result<(), DeviceError> {
-        if proof.format != DEVICE_FORMAT {
+        if proof.format != self.format() {
             return Err(DeviceError::Verify);
         }
         self.verify_io(&proof.io, &proof.proof)
@@ -84,7 +90,8 @@ impl DeviceProgram {
 /// space must update, and nothing is proved; [`DeviceError::Unavailable`]
 /// when it admits none of them yet but the node could not compute one of
 /// the window's programs: ask again, or another replica. `shipped` is
-/// newest first.
+/// newest first, a release's artifact in the device format before its
+/// artifact in the previous one.
 pub fn choose<'a>(
     shipped: &'a [Device],
     window: &DeviceWindow,
@@ -133,7 +140,7 @@ pub struct DeviceProof {
 
 impl Prover {
     /// `program`'s kernel run on `arguments`, through its witness input,
-    /// proved under the device format in this prover's pool. A run that
+    /// proved under the program's format in this prover's pool. A run that
     /// does not halt, or needs more rows than the program's shape, is
     /// [`DeviceError::Prove`].
     pub fn prove_kernel(
@@ -147,9 +154,9 @@ impl Prover {
                 .prove(arguments, self.masks)
                 .map_err(|_| DeviceError::Prove)?;
             Ok(DeviceProof {
-                format: DEVICE_FORMAT,
+                format: program.format(),
                 io: proof.io,
-                proof: profile::encode(&proof.proof).ok_or(DeviceError::Prove)?,
+                proof: program.0.encode(&proof.proof).ok_or(DeviceError::Prove)?,
             })
         })
     }
@@ -239,6 +246,31 @@ mod tests {
             choose(&app, &window(&[(2, format)], &[format]), MethodId(8)).map(|_| ()),
             Err(DeviceError::Window),
             "no window for the kernel"
+        );
+    }
+
+    /// An app shipping a kernel's program in the device format and in the
+    /// previous one proves with the device format's where the space admits
+    /// both, and with the previous one's where it admits that format alone.
+    #[test]
+    fn the_newest_admitted_format_is_chosen() {
+        let previous = profile::FORMATS[1].number;
+        let app = [shipped(2, DEVICE_FORMAT), shipped(1, previous)];
+        let chosen = |window: &DeviceWindow| {
+            choose(&app, window, AUTH).map(|device| (device.id[0], device.format))
+        };
+        let both = window(
+            &[(2, DEVICE_FORMAT), (1, previous)],
+            &[DEVICE_FORMAT, previous],
+        );
+        assert_eq!(chosen(&both), Ok((2, DEVICE_FORMAT)));
+        assert_eq!(
+            chosen(&window(&[(1, previous)], &[previous])),
+            Ok((1, previous))
+        );
+        assert_eq!(
+            chosen(&window(&[(2, DEVICE_FORMAT)], &[DEVICE_FORMAT])),
+            Ok((2, DEVICE_FORMAT))
         );
     }
 }

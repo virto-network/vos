@@ -207,6 +207,35 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   release); the mechanism is what the gate proves, and the previous
   format's fuzz and leakage targets stay until its code is deleted.
   Fable. **Dep:** 8.8, 8.9. **Estimate:** 1.5–2 weeks.
+- **Built:** format 47 (`format::DEVICE_PROOF`: the per-program CPU and
+  the word ledger, 46's parameters and masking, 110 / 62 bits on its own
+  reference, the word set at 2^17 rows), `vos_pvm_recair::device::FORMAT`;
+  46 (`BYTE_DEVICE_PROOF`) kept, proved and verified while its code lives
+  (`device::FORMATS`), with its fuzz target (`device_verify_bytes_46`) and
+  leakage gate beside 47's. The candidate knobs are gone: the device
+  gates run on 47, `vos-phone`'s cell names a format (`47` by default, or
+  `46`). The guest target takes `unaligned-scalar-mem`, and the SDK's and
+  the device io-hash's unaligned word accesses are plain
+  `read_unaligned`/`write_unaligned`: every guest blob and program id
+  moved (`blobs.lock`, the pinned constants). Hardening before 47 shipped:
+  the word ledger's last row is padding (`IsLast · (1 − IsPadding) = 0`,
+  gate `word_ledger_gate::an_all_real_ledger_is_refused`), and the masked
+  segment verifier refuses a first timestamp below 1
+  (`a_first_timestamp_of_zero_is_refused`). **The ingress window:** 47's
+  release retires 46 at once (`DEVICE_FORMATS`, 46's byte ledger is not
+  consistent, `open.md`), so the shipped node admits 47 alone; a node
+  computes each release's program in every format it admits, and
+  `Config::device_formats` admits another (a test's). The gate
+  (`the_previous_device_format_is_admitted_until_it_is_retired`): a 46
+  proof refused `Format` by default; at one node admitting both, a 47
+  proof and a 46 proof run, the light node choosing 47 where both are
+  admitted; 46 retired now, its proof made before refused `Format`;
+  admitting 46 alone, the light node choosing 46 and its proof run.
+- **The quiet re-measure of `0x402`:** 1,925 TSC cycles a native
+  compression, ×4.7 a BLAKE2b compression, against the price's four
+  [measured, 2026-11-12; `open.md`]; the price is unchanged, the owner's.
+- **Still to run:** PG1′ and PG2′ on 47, twice a day apart (S8-P3,
+  S8-P4); `proving.md` §8 holds them at 46 until then.
 
 ## M3 — The personal agent in the space (stream D, 11–15 weeks from M0)
 

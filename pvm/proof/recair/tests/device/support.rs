@@ -142,22 +142,16 @@ pub fn format() -> Format {
     }
 }
 
-/// The CPU the device gates prove under: the full CPU, or the per-program
-/// CPU where `DEVICE_CPU=program`, a run of the gates on the candidate.
+/// The CPU the device gates prove under: the device format's, the
+/// per-program CPU.
 pub fn cpu() -> Cpu {
-    match std::env::var("DEVICE_CPU").as_deref() {
-        Ok("program") => Cpu::PerProgram,
-        _ => Cpu::Full,
-    }
+    vos_pvm_recair::device::FORMAT.cpu
 }
 
-/// The memory ledger the device gates prove under: a row a byte, or a row a
-/// word where `DEVICE_MEMORY=word`, a run of the gates on the candidate.
+/// The memory ledger the device gates prove under: the device format's, a
+/// row a word.
 pub fn memory() -> Memory {
-    match std::env::var("DEVICE_MEMORY").as_deref() {
-        Ok("word") => Memory::Word,
-        _ => Memory::Byte,
-    }
+    vos_pvm_recair::device::FORMAT.memory
 }
 
 /// The kernel's program under `format` on `MC`, its shape from a reference

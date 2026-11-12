@@ -1,7 +1,8 @@
 //! Device programs as a space's ingress and a member's device both take
-//! them (`proving.md` §8): a device kernel's
-//! program under format 46, its id, a proof's bytes, and the auth
-//! statement's arguments and io-hash.
+//! them (`proving.md` §8): a device kernel's program under a device format
+//! (47, [`FORMAT`]; or 46, the previous one, while its code lives:
+//! [`FORMATS`]), its id, a proof's bytes, and the auth statement's
+//! arguments and io-hash.
 //!
 //! - **The program** ([`Program`]) is computed from the kernel's release
 //!   alone (`vos_wire::records::DeviceRelease`): the chips its code reaches
@@ -37,7 +38,7 @@ use blake2::{Blake2b, Digest as _};
 use stwo::core::vcs::blake2_hash::Blake2sHash;
 use stwo::core::vcs_lifted::blake2_merkle::{Blake2sM31MerkleChannel, Blake2sM31MerkleHasher};
 use vos_pvm_final_verifier::Error;
-use vos_pvm_proof::format::{DEVICE_PROOF, Format};
+use vos_pvm_proof::format::{BYTE_DEVICE_PROOF, DEVICE_PROOF, Format};
 use vos_wire::credentials::{self, DEPTH, EMPTY, Tag, Words};
 
 use crate::masked::device::{
@@ -47,8 +48,20 @@ use crate::masked::{MaskRng, MaskStats, MaskedProof};
 use crate::prove::ProveError;
 use vos_pvm_final_verifier::masked::MaskedFormat;
 
-/// The device format: format 46.
+/// The device format: format 47, the per-program CPU and the word ledger.
 pub const FORMAT: Format = DEVICE_PROOF;
+
+/// The device formats this build proves and verifies, newest first: the
+/// device format and the previous one, 46, the full CPU and the byte
+/// ledger, whose memory argument is unsound (`open.md`): a node admits it
+/// only where its operator configures it.
+pub const FORMATS: [Format; 2] = [DEVICE_PROOF, BYTE_DEVICE_PROOF];
+
+/// The device format numbered `number`, if this build proves and verifies
+/// it ([`FORMATS`]).
+pub fn format(number: u32) -> Option<&'static Format> {
+    FORMATS.iter().find(|format| format.number == number)
+}
 
 /// The longest device proof a decode reads, in bytes: ingress's cap.
 pub const MAX_PROOF_BYTES: usize = 1536 << 10;
@@ -80,9 +93,10 @@ const PROGRAM_DOMAIN: &[u8] = b"vos/device/program/v1";
 
 type Hasher = Blake2sM31MerkleHasher;
 
-/// A device kernel's program under format 46, as its prover and its
+/// A device kernel's program under a device format, as its prover and its
 /// verifier pin it, and the kernel it proves.
 pub struct Program {
+    format: Format,
     prover: DeviceProver<Blake2sM31MerkleChannel>,
     kernel: Vec<u8>,
     id: [u8; 32],
@@ -93,11 +107,11 @@ pub struct Program {
 /// once, at its install ([`masked`]).
 type Masked = MaskedFormat<'static>;
 
-/// `program`'s masked format under format 46, its log sizes and words left
+/// `program`'s masked format under `format`, its log sizes and words left
 /// for each verification to fill in from the program.
-fn masked(program: &DeviceProgram<Hasher>) -> Option<Masked> {
+fn masked(format: &Format, program: &DeviceProgram<Hasher>) -> Option<Masked> {
     let header = program.header();
-    let (masked, _) = device_format(&FORMAT, program, &header)?;
+    let (masked, _) = device_format(format, program, &header)?;
     Some(MaskedFormat {
         log_sizes: &[],
         program: &[],
@@ -106,41 +120,72 @@ fn masked(program: &DeviceProgram<Hasher>) -> Option<Masked> {
 }
 
 impl Program {
-    /// Kernel `kernel`'s program, its log sizes the ones its run on
-    /// `reference` needs (each at least its floor), each raised by
-    /// `headroom`. Refused when the kernel does not run to its halt on
-    /// `reference`, or a raised size is past `DEVICE_MAX_LOG_SIZE`.
+    /// Kernel `kernel`'s program under the device format, its log sizes the
+    /// ones its run on `reference` needs (each at least its floor), each
+    /// raised by `headroom`. Refused when the kernel does not run to its
+    /// halt on `reference`, or a raised size is past `DEVICE_MAX_LOG_SIZE`.
     pub fn install(kernel: &[u8], reference: &[u8], headroom: u8) -> Result<Self, ProveError> {
+        Self::install_in(&FORMAT, kernel, reference, headroom)
+    }
+
+    /// [`Program::install`] under the device format `format`.
+    pub fn install_in(
+        format: &Format,
+        kernel: &[u8],
+        reference: &[u8],
+        headroom: u8,
+    ) -> Result<Self, ProveError> {
         let mut run = trace(kernel, reference)?;
-        let (active, log_sizes) = device_shape(&FORMAT, kernel, &mut run)?;
+        let (active, log_sizes) = device_shape(format, kernel, &mut run)?;
         drop(run);
         let log_sizes: Vec<u32> = log_sizes
             .iter()
             .map(|size| size + u32::from(headroom))
             .collect();
-        Self::released(kernel, active, &log_sizes)
+        Self::released_in(format, kernel, active, &log_sizes)
     }
 
-    /// The program of a device kernel's release: `kernel` sized on what its
-    /// reference program `reference` returns ([`reference_arguments`]),
-    /// raised by `headroom`.
+    /// The program of a device kernel's release under the device format:
+    /// `kernel` sized on what its reference program `reference` returns
+    /// ([`reference_arguments`]), raised by `headroom`.
     pub fn of(kernel: &[u8], reference: &[u8], headroom: u8) -> Result<Self, ProveError> {
-        Self::install(kernel, &reference_arguments(reference)?, headroom)
+        Self::of_in(&FORMAT, kernel, reference, headroom)
     }
 
-    /// The program of `kernel` at the chips `active` and the log sizes
-    /// `log_sizes`, as a release embeds it: its preprocessed tree committed
-    /// from the kernel, no run of anything. Refused when `active` is not the
-    /// chips the kernel's code reaches, or a size is under its floor or past
-    /// `DEVICE_MAX_LOG_SIZE`.
+    /// [`Program::of`] under the device format `format`.
+    pub fn of_in(
+        format: &Format,
+        kernel: &[u8],
+        reference: &[u8],
+        headroom: u8,
+    ) -> Result<Self, ProveError> {
+        Self::install_in(format, kernel, &reference_arguments(reference)?, headroom)
+    }
+
+    /// The program of `kernel` under the device format at the chips
+    /// `active` and the log sizes `log_sizes`, as a release embeds it: its
+    /// preprocessed tree committed from the kernel, no run of anything.
+    /// Refused when `active` is not the chips the kernel's code reaches, or
+    /// a size is under its floor or past `DEVICE_MAX_LOG_SIZE`.
     pub fn released(kernel: &[u8], active: u32, log_sizes: &[u32]) -> Result<Self, ProveError> {
+        Self::released_in(&FORMAT, kernel, active, log_sizes)
+    }
+
+    /// [`Program::released`] under the device format `format`.
+    pub fn released_in(
+        format: &Format,
+        kernel: &[u8],
+        active: u32,
+        log_sizes: &[u32],
+    ) -> Result<Self, ProveError> {
         let prover =
-            DeviceProver::<Blake2sM31MerkleChannel>::install(&FORMAT, kernel, active, log_sizes)?;
-        let id = program_id(&FORMAT, prover.program());
-        let masked = masked(prover.program()).ok_or(ProveError::TraceShape(
+            DeviceProver::<Blake2sM31MerkleChannel>::install(format, kernel, active, log_sizes)?;
+        let id = program_id(format, prover.program());
+        let masked = masked(format, prover.program()).ok_or(ProveError::TraceShape(
             "a program outside the format's shape",
         ))?;
         Ok(Self {
+            format: *format,
             prover,
             kernel: kernel.to_vec(),
             id,
@@ -154,7 +199,7 @@ impl Program {
     /// §4.4).
     pub fn fits(&self, arguments: &[u8]) -> Result<(), ProveError> {
         let mut run = trace(&self.kernel, arguments)?;
-        let (active, needed) = device_shape(&FORMAT, &self.kernel, &mut run)?;
+        let (active, needed) = device_shape(&self.format, &self.kernel, &mut run)?;
         let program = self.program();
         if active != program.active
             || needed
@@ -170,6 +215,17 @@ impl Program {
     /// The chips, a device mask.
     pub fn chips(&self) -> u32 {
         self.program().active
+    }
+
+    /// The device format it proves and verifies under.
+    pub fn format(&self) -> &Format {
+        &self.format
+    }
+
+    /// `proof`'s bytes under its format, the one encoding
+    /// [`Program::verify`] reads; `None` when it cannot be encoded.
+    pub fn encode(&self, proof: &MaskedProof<Hasher>) -> Option<Vec<u8>> {
+        encode_in(&self.format, proof)
     }
 
     /// Its id, which a binding names.
@@ -210,13 +266,14 @@ impl Program {
     /// Verifies the proof in `bytes` ([`decode`]) of this program's kernel
     /// stating the io-hash `io`.
     pub fn verify(&self, io: &[u8; 32], bytes: &[u8]) -> Result<(), Error> {
-        verify(self.program(), &self.masked, io, bytes)
+        verify(&self.format, self.program(), &self.masked, io, bytes)
     }
 
     /// What a verifier keeps of it: the program, its masked format and its
     /// id, without the prover's committed tree.
     pub fn verifier(&self) -> Verifier {
         Verifier {
+            format: self.format,
             program: self.program().clone(),
             id: self.id,
             masked: self.masked,
@@ -228,6 +285,7 @@ impl Program {
 /// reads, and the id.
 #[derive(Clone, Debug)]
 pub struct Verifier {
+    format: Format,
     program: DeviceProgram<Hasher>,
     id: [u8; 32],
     masked: Masked,
@@ -239,13 +297,19 @@ impl Verifier {
         &self.id
     }
 
+    /// The device format it verifies under.
+    pub fn format(&self) -> &Format {
+        &self.format
+    }
+
     /// [`Program::verify`].
     pub fn verify(&self, io: &[u8; 32], bytes: &[u8]) -> Result<(), Error> {
-        verify(&self.program, &self.masked, io, bytes)
+        verify(&self.format, &self.program, &self.masked, io, bytes)
     }
 }
 
 fn verify(
+    format: &Format,
     program: &DeviceProgram<Hasher>,
     masked: &Masked,
     io: &[u8; 32],
@@ -257,10 +321,10 @@ fn verify(
         program: &header,
         ..*masked
     };
-    precheck(&masked, io, bytes)?;
+    precheck(format, &masked, io, bytes)?;
     let proof = DeviceProof {
         io: *io,
-        proof: decode(bytes)?,
+        proof: decode_in(format, bytes)?,
     };
     verify_device_in::<Blake2sM31MerkleChannel>(&masked, program, proof)
 }
@@ -280,16 +344,21 @@ struct Head {
 
 /// The device verifier's pre-check, before the proof is decoded whole: its
 /// length within [`MAX_PROOF_BYTES`], its leading fields read, its format
-/// this one's, and its interaction PoW holding over the program `masked`
+/// `format`, and its interaction PoW holding over the program `masked`
 /// names, its roots and `io` as the verifier's transcript mixes them. A proof it refuses,
 /// the verifier refuses; well-formed junk that has not ground the
 /// interaction PoW is refused here, at a small fraction of a decode.
-fn precheck(masked: &MaskedFormat<'_>, io: &[u8; 32], bytes: &[u8]) -> Result<(), Error> {
+fn precheck(
+    format: &Format,
+    masked: &MaskedFormat<'_>,
+    io: &[u8; 32],
+    bytes: &[u8],
+) -> Result<(), Error> {
     if bytes.len() > MAX_PROOF_BYTES {
         return Err(Error::Length);
     }
     let (head, _): (Head, &[u8]) = postcard::take_from_bytes(bytes).map_err(|_| Error::Decode)?;
-    if head.format_version != FORMAT.number {
+    if head.format_version != format.number {
         return Err(Error::Format);
     }
     let public = vos_pvm_proof::masked::device_public_values(io);
@@ -377,11 +446,17 @@ struct Wire {
     stark_proof: stwo::core::proof::StarkProof<Hasher>,
 }
 
-/// `proof`'s bytes, the one encoding [`decode`] reads; `None` when it
-/// cannot be encoded.
+/// `proof`'s bytes under the device format, the one encoding [`decode`]
+/// reads; `None` when it cannot be encoded.
 pub fn encode(proof: &MaskedProof<Hasher>) -> Option<Vec<u8>> {
+    encode_in(&FORMAT, proof)
+}
+
+/// `proof`'s bytes under the device format `format`, the one encoding
+/// [`decode_in`] reads; `None` when it cannot be encoded.
+pub fn encode_in(format: &Format, proof: &MaskedProof<Hasher>) -> Option<Vec<u8>> {
     postcard::to_allocvec(&Wire {
-        format_version: FORMAT.number,
+        format_version: format.number,
         interaction_pow: proof.interaction_pow,
         claimed_sums: proof.claimed_sums.clone(),
         stark_proof: proof.stark_proof.clone(),
@@ -389,15 +464,21 @@ pub fn encode(proof: &MaskedProof<Hasher>) -> Option<Vec<u8>> {
     .ok()
 }
 
-/// The proof in `bytes`: at most [`MAX_PROOF_BYTES`], read whole and
-/// canonical (re-encoded, the same bytes), its format 46.
+/// The proof in `bytes` under the device format: at most
+/// [`MAX_PROOF_BYTES`], read whole and canonical (re-encoded, the same
+/// bytes).
 pub fn decode(bytes: &[u8]) -> Result<MaskedProof<Hasher>, Error> {
+    decode_in(&FORMAT, bytes)
+}
+
+/// [`decode`] under the device format `format`.
+pub fn decode_in(format: &Format, bytes: &[u8]) -> Result<MaskedProof<Hasher>, Error> {
     if bytes.len() > MAX_PROOF_BYTES {
         return Err(Error::Length);
     }
     let (wire, rest): (Wire, &[u8]) =
         postcard::take_from_bytes(bytes).map_err(|_| Error::Decode)?;
-    if wire.format_version != FORMAT.number {
+    if wire.format_version != format.number {
         return Err(Error::Format);
     }
     let proof = MaskedProof {
@@ -405,7 +486,7 @@ pub fn decode(bytes: &[u8]) -> Result<MaskedProof<Hasher>, Error> {
         claimed_sums: wire.claimed_sums,
         stark_proof: wire.stark_proof,
     };
-    if !rest.is_empty() || encode(&proof).as_deref() != Some(bytes) {
+    if !rest.is_empty() || encode_in(format, &proof).as_deref() != Some(bytes) {
         return Err(Error::Decode);
     }
     Ok(proof)

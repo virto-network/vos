@@ -27,7 +27,7 @@
 //!   a device kernel proved as the device library proves it for a space's
 //!   ingress, from its release artifact (`release::Device`, the program
 //!   ingress computes from the installed kernel, computed at release:
-//!   `DeviceProgram::released`; `Prover::prove_kernel`, format 46), on its
+//!   `DeviceProgram::released`; `Prover::prove_kernel`, the device format, 47), on its
 //!   witness input, verified here against the io-hash of the input's last
 //!   `N` bytes, its claim (128 by default, the stock auth kernel's); the
 //!   proof's bytes written to `--out`, one `kernel` line.

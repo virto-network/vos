@@ -219,34 +219,17 @@ fn pack(lane: &mut [u32; 16], block: &[u8; BLOCK]) {
     }
 }
 
-/// The four bytes at `at`, any alignment, little-endian: on the guest in
-/// one load, which the PVM serves at any address (the target's own
-/// unaligned reads go byte by byte).
+/// The four bytes at `at`, any alignment, little-endian: on the guest one
+/// load, which the PVM serves at any address and the guest target
+/// (`unaligned-scalar-mem`) emits whole.
 ///
 /// # Safety
 ///
 /// `at` must point at four readable bytes.
 #[inline(always)]
 unsafe fn load_u32(at: *const u8) -> u32 {
-    #[cfg(target_arch = "riscv64")]
-    {
-        let word: u64;
-        // SAFETY: the caller's contract; the load touches nothing else.
-        unsafe {
-            core::arch::asm!(
-                "lwu {word}, 0({at})",
-                word = out(reg) word,
-                at = in(reg) at,
-                options(nostack, readonly, preserves_flags),
-            );
-        }
-        word as u32
-    }
-    #[cfg(not(target_arch = "riscv64"))]
     // SAFETY: the caller's contract.
-    unsafe {
-        u32::from_le_bytes(core::ptr::read_unaligned(at.cast()))
-    }
+    u32::from_le_bytes(unsafe { core::ptr::read_unaligned(at.cast()) })
 }
 
 /// A device kernel's io-hash over its statement's parts, as

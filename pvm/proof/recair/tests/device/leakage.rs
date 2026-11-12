@@ -122,19 +122,31 @@ fn the_published_values_do_not_depend_on_the_witness() {
 }
 
 /// The masking's condition without its factor two (`proving.md` §5, how
-/// large `h` must be), at the device format itself: `h = 256` against the
-/// 149 rows a column reveals at 47 queries, its chips at their floor of
-/// 2^10 rows, `N/4 = h`, or above. The two witnesses' N proofs each are not told
-/// apart, field by field nor pooled, each field of the first's is
+/// large `h` must be), at the device format itself, 47: `h = 256` against
+/// the 149 rows a column reveals at 47 queries, its chips at their floor
+/// of 2^10 rows, `N/4 = h`, or above. The two witnesses' N proofs each are
+/// not told apart, field by field nor pooled, each field of the first's is
 /// uniform, and R1 passes every transcript within `h`.
 #[cfg(feature = "heavy-gates")]
 #[test]
 fn heavy_the_device_formats_proofs_do_not_depend_on_the_witness() {
+    witness_independent(&vos_pvm_recair::device::FORMAT);
+}
+
+/// The same at format 46, the full CPU and the byte ledger, while its
+/// code lives.
+#[cfg(feature = "heavy-gates")]
+#[test]
+fn heavy_the_byte_device_formats_proofs_do_not_depend_on_the_witness() {
+    witness_independent(&vos_pvm_proof::format::BYTE_DEVICE_PROOF);
+}
+
+/// [`heavy_the_device_formats_proofs_do_not_depend_on_the_witness`] at
+/// device format `format`.
+#[cfg(feature = "heavy-gates")]
+fn witness_independent(format: &vos_pvm_proof::format::Format) {
     use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
-    let format = vos_pvm_proof::format::Format {
-        cpu: crate::support::cpu(),
-        ..vos_pvm_recair::device::FORMAT
-    };
+    let format = *format;
     let n = n();
     let program = program::<Blake2sM31MerkleChannel>(&format, &blob());
     assert_eq!(program.log_sizes.iter().min(), Some(&10));

@@ -208,7 +208,7 @@ attribution). Its full design is `recursion-air.md`.
   dropped rather than constrained, with the other columns and next-row
   masks no constraint reads: each cost every leaf its samples.
 - **One chip set, two shapes** [decided]: the node's segments (format
-  41) and the device profile (format 46, §8) share one chip set and one
+  41) and the device profile (format 47, §8) share one chip set and one
   CPU, so a lever on the chips serves both; the node's shape takes a chip
   only while every kernel leaf still fits the fold's fixed padded shape
   (§3.4). The node's shape keeps the page-Merkle boundary, the device's
@@ -623,13 +623,13 @@ last for decades.**
 |---|---|---|---|
 | segment proofs (format 41) | ≥ 100 / ≥ 60 | blowup 4 (log 2), 40 queries, PoW 24, plus interaction PoW 8; FRI fold step 1, log last-layer degree bound 0 | 104 / 62 (62.81) |
 | leaf and fold proofs (32) | ≥ 100 / ≥ 60 | blowup 4, 44 queries, PoW 20, plus interaction PoW 8; fold step 1, last layer 2^0 | 108 / 63 |
-| device proofs (46; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | blowup 4, 47 queries, PoW 16, interaction PoW 8; variant (c), `h = 256` (§8, "The device parameters") | 110 / 62 (62.82) |
+| device proofs (47, and 46 while its code lives; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | blowup 4, 47 queries, PoW 16, interaction PoW 8; variant (c), `h = 256` (§8, "The device parameters") | 110 / 62 (62.82, each) |
 | the final wrap, unmasked (28; tests only) | ≥ 100 / ≥ 80 | blowup 64 (log 6), 20 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching (§3.5) | 146 / 82 (82.60) |
 | the final wrap, masked (39) | ≥ 100 / ≥ 80 | blowup 32 (log 5), 24 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching; variant (c) | 146 / 82 (82.70) |
 
 - **The counts** are the security tool's (`pvm/proof/src/security.rs`) at
   each format's reference shape [model], pinned by the format tests.
-- **The numbers:** 41 and 46 name the segment AIR's current form, the
+- **The numbers:** 41, 46 and 47 name the segment AIR's current form, the
   chip set the node's segments and the device shape share (§3.2); the
   default prover produces 41. A number names one AIR and one set of
   parameters; the registry refuses every other (A.4).
@@ -707,9 +707,9 @@ last for decades.**
 
   `pvm/proof/SECURITY.md` keeps the open items' detail (011–013).
 
-## 5. Masking [built: formats 39 and 46]
+## 5. Masking [built: formats 39, 46 and 47]
 
-- **Where:** the final wrap (39) and device proofs (46): the masking is generic over the component set and the
+- **Where:** the final wrap (39) and device proofs (47, 46): the masking is generic over the component set and the
   channel. The segment chips mask (`vos_pvm_proof::masked`): each chip's
   blinding fraction joins its last batch of fractions, so masking adds no
   column and no degree to any chip; the boundary chips' claimed sums,
@@ -1079,7 +1079,7 @@ removes a state, at the cost named where it is stated (§11).
 
 Device-held secrets with hash credentials come first; standard
 signatures need chips and come after (part 3). Every device statement is
-a device kernel proved under the device profile (format 46): the stock
+a device kernel proved under the device profile (format 47): the stock
 `auth` and `owner` kernels, and any actor's own (`light-node.md` §4). The
 phone's budgets for a statement under the device profile: at most 1.0 s,
 1 GiB of peak resident memory and a 1.5 MiB proof, verified on the phone
@@ -1484,10 +1484,10 @@ same statement under BLAKE2b's io-hash [measured, Fairphone 6,
 - **What the verifier and ingress check** [built]: the verifier
   is the device segment's (the io-hash's 32 bytes are the public values,
   DeviceIoChip's sum recomputed from them); ingress picks the io-hash by
-  the proof's format, 46's being `H_io` (not by the guard), computes it
+  the proof's format, 47's (and 46's) being `H_io` (not by the guard), computes it
   from the request's claim (`a` the claim's bytes, `o` empty, no roots:
   for the stock auth claim `ℓ = 132`, six blocks and the length's) and
-  verifies the proof under 46 against it. A
+  verifies the proof under its format against it. A
   proof whose kernel ended with BLAKE2b states another io-hash and fails.
 - **Where it lives:** the device kernel's end (`DeviceReturn`); a device
   return's check (`KernelReturn::device_io_hash`, the testkit's
@@ -1525,7 +1525,30 @@ byte by byte). A kernel of the same statement that copies its arguments
 and converts them byte by byte takes 18,733 steps [measured,
 2026-10-30].
 
-**Format 46, device proofs** [built; measured]: masked (c), the
+**Format 47, device proofs** [built]: format 46's parameters, masking
+and floors (below) over the per-program CPU (`Cpu::PerProgram`, the
+columns the program's code sets) and the word ledger (`Memory::Word`, a
+row an 8-byte word), counted on its own masked reference (the word set
+with the full CPU at 2^17 rows: 7,470 DEEP values, 4,309 constraints):
+110 conjectured and 62.82 proven bits; a per-program CPU's cut drops
+columns and constraints, which only raises the count (a gate counts the
+cut set too). The word ledger's last row is padding
+(`IsLast · (1 − IsPadding) = 0`, degree 2, `open.md`). Its kernels are
+built for a guest target with `unaligned-scalar-mem`, every unaligned
+word access one load or store. The device format: ingress admits it for
+every proven call, and 47's release retires 46 at once
+(`DEVICE_FORMATS`), a node admitting 46 only where its configuration
+says so (`Config::device_formats`). On the stock kernels
+at release, against 46: auth 1,312 steps (1,546 before the target
+feature), 10.24M → 7.23M cells (−29.4%), MEMORY at 2^14 → 2^11 rows, the
+CPU 577 → 393 main columns (`vos-phone`'s `cpu_columns`), proofs 880,297 → 784,094 bytes, peak 390 → 209
+MiB; owner 259 steps (385), 6.29M → 5.32M cells (−15.4%), 859,617 →
+748,356 bytes, peak 225 → 141 MiB; every proof verified; the times, at
+load average 20–23 from other work, too noisy to read [measured, x86 dev
+machine (Intel Core Ultra 7 155H), four threads, 2026-11-11]. PG1′ and
+PG2′ on 47 are the phone sessions' (plan 8.10).
+
+**Format 46, device proofs** [built; measured; retired at 47's release]: masked (c), the
 Blake2s-M31 channel, blowup 4, 47 queries, PoW 16, interaction PoW 8,
 affine DEEP batching, `h = 256`,
 every chip's floor 2^10 rows, over the shared chip set's current form
@@ -1623,7 +1646,7 @@ binding names, under the guard the method carries. A device kernel is an
 `#[attestable(device)]` method whose `public_args` are its claim, SCALE
 words, the binding last, and whose output is empty. Ingress takes the
 claim from the request, recomputes the io-hash, verifies the proof under
-format 46 against the device program the node computes from the
+its format against the device program the node computes from the
 installed kernel the guard names (above), runs a stock kernel's checks
 (`identity-and-authority.md` §5), and logs the claim, which an actor
 kernel's handler judges at apply. The trace is witness-independent: the
@@ -1697,7 +1720,7 @@ pays (`open.md`):
   every length, −8.8% of the auth kernel's cells, −14–17% of heavier
   kernels', and a narrower node leaf, in both formats;
   **as built (2026-11-09), a candidate format field** (`Cpu::PerProgram`,
-  the device profile only; format 46 keeps the full CPU): the full CPU
+  the device profile; format 47 takes it, 46 keeps the full CPU): the full CPU
   AIR with the columns the program's code cannot set fixed to zero and
   the constraints and fractions that vanish under that cut dropped, so
   every cut trace is a trace of the full AIR. The column set is a
@@ -1716,11 +1739,11 @@ pays (`open.md`):
   (−3.9%), 439 → 418 MiB, 879,737 → 820,480 bytes; owner 844 → 825 ms
   (−2.3%), 286 → 292 MiB, 858,350 → 798,408 bytes [measured, Pixel 1,
   2026-11-09]: on that phone the time falls less than the cells. Format
-  47 takes it beside word-level memory;
+  47 takes it beside word-level memory [built];
 - **word-level memory:** −17% of the auth kernel's cells, its memory
   ledger byte-level at 2^14 rows for 1,722 steps; −26% beside the
   per-program CPU [model]; **as built (2026-11-09), a candidate format
-  field** (`Memory::Word`, the device profile only; format 46 keeps the
+  field** (`Memory::Word`, the device profile; format 47 takes it, 46 keeps the
   byte ledger): WordMemoryChip, a row an 8-byte word at one
   `(timestamp, is_write)`, its eight lanes consuming the producers'
   byte tuples unchanged (the CPU, the precompiles and the witness input
@@ -1779,8 +1802,8 @@ compared with x86's byte for byte.
 | a shape per kernel | −38% verify, −14% bytes, −10% RSS [measured] | about 1 week | built |
 | the reference Poseidon2 and a SIMD hasher | segments on Poseidon2 at 1.75–1.85× Blake2s, against 6.4–6.9× before; a leaf's commitment 0.63 s [measured] | 2–3 weeks | built |
 | the seven zero columns dropped; logical right shifts through MUL | the window kernel −5.75% of its cells; its statement 33.3 s end to end [measured] | | built (formats 41 and 46) |
-| a per-program CPU (its columns the program's opcodes') | 785 → 535–549 CPU columns; −8.8% to −17% of a kernel's cells; a narrower leaf [model]; the stock kernels 781 → 538–539 columns, −7.8% / −9.5% of their cells [measured] | 3–5 weeks | built for the device profile as a candidate, not in a shipped format (format 47 is to take it); node segments later |
-| word-level memory | MEMORY 4–8× fewer rows; −17% of the auth kernel's cells [model]; 8-byte words: auth's ledger 2^14 → 2^11 rows, the stock kernels −19.3% / −7.3% of their cells, −28.8% / −15.1% beside the per-program CPU [measured] | 4–6 weeks | built for the device profile as a candidate, not in a shipped format (format 47 is to take it) |
+| a per-program CPU (its columns the program's opcodes') | 785 → 535–549 CPU columns; −8.8% to −17% of a kernel's cells; a narrower leaf [model]; the stock kernels 781 → 538–539 columns, −7.8% / −9.5% of their cells [measured] | 3–5 weeks | built for the device profile: format 47; node segments later |
+| word-level memory | MEMORY 4–8× fewer rows; −17% of the auth kernel's cells [model]; 8-byte words: auth's ledger 2^14 → 2^11 rows, the stock kernels −19.3% / −7.3% of their cells, −28.8% / −15.1% beside the per-program CPU [measured] | 4–6 weeks | built for the device profile: format 47 |
 | the CPU split by opcode family | 4-way: −5.4% of the auth kernel's cells, 1–8% of a segment's, under 1% at a class's fixed shape, wider by 499 columns, past a leaf with the Poseidon2 chip [model] | 6–10 weeks | not built; a 2-way split on the per-program CPU only where padding pays |
 | narrow BLAKE2b chips | −2,200 columns; −30–45% of BLAKE2b's cells [model] | 3–5 weeks | later (device kernels hold no BLAKE2b, §8; folds gain) |
 | a lighter page boundary (Poseidon2 page hashing), or one memory argument across segments | about −1,100 / −2,800 columns; up to −49% of prover cells | 3–5 / 6–10 weeks | later |
@@ -1817,7 +1840,7 @@ that narrows the inner proof makes folds cheaper too.
 | format 41's wider AIR overflows a kernel leaf | the leaves counted as built, within 2^16 / 2^17 / 2^16; the Poseidon2 chip's 17-page class (§3.2) |
 | a device proof's shape leaks its witness | the trace padded to the program's log sizes, which a public reference run sets (§8); branch-free kernels; a test of two path shapes under one program |
 | the signature chips' cost or soundness | a gate ladder per chip; a phone run (`open.md`) |
-| a ledger's padding splits an address into two groups | segments: **held**, a byte's and a register's boundary produced once, padding inside each ledger verifying harmless; device 46 (admitted): **not held**, `DeviceMemoryChip` lets a byte have two boundary rows, so 46 retires behind 47, whose word ledger keeps padding past the real rows (`open.md`) [reviewed, 2026-11-10] |
+| a ledger's padding splits an address into two groups | segments: **held**, a byte's and a register's boundary produced once, padding inside each ledger verifying harmless, the masked segment verifier refusing a first timestamp below 1; device 47: **held**, its word ledger keeping padding past the real rows and its last row padding; device 46: **not held**, `DeviceMemoryChip` lets a byte have two boundary rows, so 47's release retires it at once and a node admits it only where configured (`open.md`) [reviewed, 2026-11-10; built] |
 
 ## 11. Design choices
 
@@ -1960,7 +1983,8 @@ counts as conjectured / proven at the reference shape [model]:
 | 32 | leaf and fold (one padded shape) | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 63 | reserved |
 | 28 | the final wrap, unmasked (tests only) | Blake2b-256 | 6, 20, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 | admitted |
 | 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 5, 24, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 | admitted; the one production venues accept |
-| 46 | device proofs, masked (variant (c)), `h = 256` | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 (62.82), on its masked shape | admitted |
+| 46 | device proofs, masked (variant (c)), `h = 256`, the full CPU and the byte ledger | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 (62.82), on its masked shape | registered and verifiable; a node admits it only where configured (its byte ledger unsound, `open.md`) |
+| 47 | device proofs, masked (variant (c)), `h = 256`, the per-program CPU and the word ledger | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 (62.82), on its masked shape | admitted: the device format |
 
 - **A number names one AIR and one set of parameters,** and is never
   reused: every number not in the table is refused. 38 is held by no
@@ -1974,7 +1998,7 @@ counts as conjectured / proven at the reference shape [model]:
   queries, and a fold verifies under half the recursion AIR's shape. On the
   segment shape 41's count is its query term's, 62.81; 32's parameters give
   62.74, their batching term binding.
-- **41 and 46 name the segment AIR,** hardened, without the columns and
+- **41, 46 and 47 name the segment AIR,** hardened, without the columns and
   next-row masks no constraint reads (§3.2), its chip set shared by the
   node's segments and the device shape; 28, 32 and 39 prove the
   recursion AIR, 32's leaves verifying the segment AIR. A reserved entry is refused until its AIR and channel

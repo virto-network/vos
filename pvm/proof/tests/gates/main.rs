@@ -34,3 +34,4 @@ mod page_permission_gate;
 mod register_ledger_gate;
 mod register_ledger_negative;
 mod witness_input_gate;
+mod word_ledger_gate;

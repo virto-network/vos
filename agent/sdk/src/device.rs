@@ -133,30 +133,17 @@ impl DeviceReturn {
 /// The io-hash's block: 24 bytes.
 const BLOCK: usize = 24;
 
-/// Stores `word` at `at`, any alignment, little-endian: on the guest in one
-/// store, which the PVM serves at any address (the target's own unaligned
-/// writes go byte by byte).
+/// Stores `word` at `at`, any alignment, little-endian: on the guest one
+/// store, which the PVM serves at any address and the guest target
+/// (`unaligned-scalar-mem`) emits whole.
 ///
 /// # Safety
 ///
 /// `at` must point at four writable bytes.
 #[inline(always)]
 unsafe fn store_u32(at: *mut u8, word: u32) {
-    #[cfg(target_arch = "riscv64")]
-    // SAFETY: the caller's contract; the store touches nothing else.
-    unsafe {
-        core::arch::asm!(
-            "sw {word}, 0({at})",
-            word = in(reg) word,
-            at = in(reg) at,
-            options(nostack, preserves_flags),
-        );
-    }
-    #[cfg(not(target_arch = "riscv64"))]
     // SAFETY: the caller's contract.
-    unsafe {
-        core::ptr::write_unaligned(at.cast::<[u8; 4]>(), word.to_le_bytes())
-    };
+    unsafe { core::ptr::write_unaligned(at.cast::<[u8; 4]>(), word.to_le_bytes()) };
 }
 
 /// A trap, on the guest; a panic elsewhere.

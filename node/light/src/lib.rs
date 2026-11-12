@@ -63,7 +63,7 @@
 //!   stores. A [`DeviceSecret`] is zeroized on drop and has no `Clone` and
 //!   no `Debug`.
 //! - **Proven calls** ([`Prover`]): a device kernel's run proved under the
-//!   device format, 46, against the program ingress computes from the same
+//!   program's device format (47, the device format), against the program ingress computes from the same
 //!   kernel, which the app embeds as a release artifact
 //!   ([`release::Device`], [`DeviceProgram`]). The stock kernels of the
 //!   credential actor take the secret: auth, a member's leaf under the
@@ -86,8 +86,10 @@
 //!   query names the member, and its proofs made against the newest root
 //!   it read.
 //!
-//! The format is the registry's device format
-//! ([`vos_pvm_recair::device::FORMAT`]). No witness is logged, and
+//! The release artifacts are computed in the registry's device format
+//! ([`vos_pvm_recair::device::FORMAT`]); a program proves in its
+//! artifact's format, one this build proves
+//! ([`vos_pvm_recair::device::FORMATS`]). No witness is logged, and
 //! its proofs' masks are the operating system's (a seeded stream exists
 //! only under the `seeded-masks` test seam, which no production build
 //! enables). `SECURITY.md` states what the secret is exposed to.

@@ -11,10 +11,11 @@
 //! | 32 | leaves and folds | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 63 |
 //! | 39 | the final wrap, masked | Blake2b-256 | 5, 24, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 |
 //! | 41 | segments | Poseidon2-M31 | 2, 40, 24, 1, 0, 8 | 100 / 60 | 104 / 62 |
-//! | 46 | device proofs, masked | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 |
+//! | 46 | device proofs, masked, the byte ledger | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 |
+//! | 47 | device proofs, masked, the per-program CPU and the word ledger | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 |
 //!
 //! - **The segment AIR** is the one every segment, leaf and device format
-//!   names: 41 and 46 name its current form, one chip set the node's
+//!   names: 41, 46 and 47 name its current form, one chip set the node's
 //!   segments and the device shape share (the CPU acknowledging the
 //!   Poseidon2 call, the Poseidon2 chip, the logical right shifts through
 //!   the multiplication, no column a constraint pins to zero), and 32's
@@ -23,11 +24,15 @@
 //!   unregistered; 44 is never reused.
 //! - **Every format** takes exactly its parameters, mixes the boundary
 //!   states as the boundary chips' bytes and grinds its interaction PoW
-//!   before the relation challenges. 46 is admitted: a space's ingress
-//!   verifies device proofs against the program it computes from the
-//!   installed kernel (`vos-pvm-recair`'s `device`); its byte ledger does
-//!   not keep a byte one group (`chips::DeviceMemoryChip`), so its memory
-//!   argument is unsound and the word ledger's format retires it. 32
+//!   before the relation challenges. 47 is the device format: a space's
+//!   ingress verifies device proofs against the program it computes from
+//!   the installed kernel (`vos-pvm-recair`'s `device`), its CPU the
+//!   program's columns ([`Cpu::PerProgram`]) and its memory ledger a row a
+//!   word ([`Memory::Word`]). 46, the full CPU and the byte ledger, stays
+//!   registered and verifiable while its code lives, and a node admits it
+//!   only where its operator configures it: its byte ledger does not keep a
+//!   byte one group (`chips::DeviceMemoryChip`), so its memory argument is
+//!   unsound, and 47 retires it. 32
 //!   is registered and refused
 //!   although its AIR and channel exist: `vos-pvm-recair` proves and verifies
 //!   its proofs natively, pinning each circuit by its hash, and no verifier
@@ -47,10 +52,13 @@
 //!   the leaf's `p2` under 2^16 with room. Leaves and folds (32) take 44
 //!   queries and 20 bits: a fold verifies under half the recursion AIR's
 //!   shape.
-//! - **The device format** (46) is counted on the device shape's masked
-//!   reference ([`DEVICE_REFERENCE`]: every chip a device program may hold
-//!   at `2^17` rows, the most install, the prover and the verifier admit).
-//!   It takes blowup 4, 47 queries, PoW 16 and affine batching (62.82
+//! - **The device formats** (46, 47) are counted on the device shape's
+//!   masked reference, each its own ledger's ([`BYTE_DEVICE_REFERENCE`],
+//!   [`DEVICE_REFERENCE`]: every chip a device program may hold, the full
+//!   CPU among them, at `2^17` rows, the most install, the prover and the
+//!   verifier admit); a per-program CPU's cut drops columns and
+//!   constraints, which only raises the count. Both take blowup 4, 47
+//!   queries, PoW 16 and affine batching (62.82
 //!   proven bits): at a small program's shape every blowup costs the same
 //!   cells, and PoW 16's grind keeps a short tail on a phone; with `h = 256`
 //!   (`proving.md` §5, how large `h` must be): every device chip reveals at
@@ -92,7 +100,7 @@
 //! - **The bit counts** are [`crate::security`]'s, at each entry's reference
 //!   shape. The segment's and the recursion's verifiers count again at the
 //!   proof's own shape and refuse a proof below either floor; the masked
-//!   formats' (39, 46) do not: their shapes are pinned at or under the
+//!   formats' (39, 46, 47) do not: their shapes are pinned at or under the
 //!   reference shape (a fixed layout, a device program's log sizes at most
 //!   `DEVICE_MAX_LOG_SIZE`), and every term of
 //!   the count is monotone in the shape, so the reference's count bounds
@@ -106,7 +114,8 @@ use crate::security::{SecurityBits, SecurityShape};
 mod reference;
 
 pub use reference::{
-    DEVICE_REFERENCE, LEAF_FOLD_REFERENCE, MASKED_WRAP_REFERENCE, SEGMENT_REFERENCE, WRAP_REFERENCE,
+    BYTE_DEVICE_REFERENCE, DEVICE_REFERENCE, LEAF_FOLD_REFERENCE, MASKED_WRAP_REFERENCE,
+    SEGMENT_REFERENCE, WRAP_REFERENCE,
 };
 
 /// What a format proves.
@@ -449,7 +458,7 @@ pub const MASKED_WRAP: Format = Format {
     },
 };
 
-/// Format 46's masking: 8 salt columns a tree; an `R` of 8 columns (R3
+/// The device formats' masking: 8 salt columns a tree; an `R` of 8 columns (R3
 /// under affine batching); and `h = 256`, at least the
 /// `4|O| + q(|O| + 1) = 149` rows a column reveals for `q = 47` queries and
 /// `|O| = 2` offsets, every device chip's widest (`proving.md` §5), so each
@@ -460,8 +469,31 @@ pub const DEVICE_MASKING: Masking = Masking {
     log_mask_rows: 8,
 };
 
-/// Device proofs, masked: see the module's notes.
+/// Device proofs under the per-program CPU and the word ledger, masked:
+/// the device format; see the module's notes.
 pub const DEVICE_PROOF: Format = Format {
+    number: 47,
+    kind: ProofKind::Device,
+    channel: ChannelKind::Blake2sM31,
+    params: DEVICE,
+    bytes: ProofBytes::Postcard,
+    masked: true,
+    masking: Some(DEVICE_MASKING),
+    cpu: Cpu::PerProgram,
+    memory: Memory::Word,
+    floor: INNER_FLOOR,
+    status: Status::Admitted,
+    reference: DEVICE_REFERENCE,
+    bits: SecurityBits {
+        conjectured: 110,
+        proven: 62,
+    },
+};
+
+/// Device proofs under the full CPU and the byte ledger, masked: the
+/// previous device format, whose byte ledger does not keep a byte one
+/// group; see the module's notes.
+pub const BYTE_DEVICE_PROOF: Format = Format {
     number: 46,
     kind: ProofKind::Device,
     channel: ChannelKind::Blake2sM31,
@@ -473,7 +505,7 @@ pub const DEVICE_PROOF: Format = Format {
     memory: Memory::Byte,
     floor: INNER_FLOOR,
     status: Status::Admitted,
-    reference: DEVICE_REFERENCE,
+    reference: BYTE_DEVICE_REFERENCE,
     bits: SecurityBits {
         conjectured: 110,
         proven: 62,
@@ -481,7 +513,14 @@ pub const DEVICE_PROOF: Format = Format {
 };
 
 /// Every registered format, by number.
-pub const REGISTRY: [Format; 5] = [WRAP, LEAF_FOLD, MASKED_WRAP, SEGMENT, DEVICE_PROOF];
+pub const REGISTRY: [Format; 6] = [
+    WRAP,
+    LEAF_FOLD,
+    MASKED_WRAP,
+    SEGMENT,
+    BYTE_DEVICE_PROOF,
+    DEVICE_PROOF,
+];
 
 /// The entry for `number`, admitted or not.
 pub fn lookup(number: u32) -> Option<&'static Format> {

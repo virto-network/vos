@@ -1,4 +1,4 @@
-//! What a device proof (format 46) costs ingress: the stock auth kernel's
+//! What a device proof (format 47) costs ingress: the stock auth kernel's
 //! proof of a member at slot 0 verified by its program's verifier on one
 //! thread, and the time to refuse well-formed junk: a wrong PoW, a wrong
 //! interaction PoW, a commitment root changed, the honest proof against

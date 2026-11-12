@@ -77,6 +77,14 @@ pub(crate) struct Calls {
 }
 
 impl Calls {
+    /// No calls yet, ingress admitting the device formats `devices` admits.
+    pub(crate) fn admitting(devices: crate::credentialed::DevicePrograms) -> Self {
+        Self {
+            devices,
+            ..Self::default()
+        }
+    }
+
     /// The calls queued in their lanes and not yet answered, with the
     /// duplicates waiting on them.
     pub(crate) fn in_flight(&self) -> usize {

@@ -59,6 +59,10 @@ pub enum Error {
     /// inputs (`defaults::min_refine_gas`): some input or step could never
     /// be dispatched.
     Gas,
+    /// The device formats configured are none, not ones this binary
+    /// verifies, more than two, or name one twice
+    /// (`Config::device_formats`).
+    Formats,
     /// The data directory, the space, the network or the ingress's
     /// listener failed.
     Data(String),

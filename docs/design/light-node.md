@@ -145,7 +145,7 @@ devices decrypt each other's messages".
 | **merge and query dispatch** | local actors are Merge-only (`#[msg(merge)]` handlers and `&self` queries; `core-model.md` §9.2: a merge handler runs on "any replica or device, no log"), so the light node runs the agent program's merge and query entries over its store, one fjall batch per operation; no refine, no accumulate, no work results, sessions or sweeps; no Raft, no leader, no peers | the executor's host-call layer, reused from `vos-node` without its pipeline (§7.1) |
 | **release artifacts** | the transpiled programs of the local actors and the stock kernels' device programs, computed at release and embedded with their ELF bytes; the phone runs no transpiler and no reference run (§4.4) | the release build [new] |
 | **local store** | fjall, as the node's, with small caches (8–16 MiB block cache [est]) | `vos-node`'s `store` [built] |
-| **device prover** | the device profile (format 46, then 47 after the levers, §4.4), masked, `Threads::Auto` | `vos-pvm-proof` and `vos-pvm-recair`'s masked device segment, its recursion prover featured out (§7.1) |
+| **device prover** | the device profile (format 47, the per-program CPU and the word ledger, §4.4), masked, `Threads::Auto` | `vos-pvm-proof` and `vos-pvm-recair`'s masked device segment, its recursion prover featured out (§7.1) |
 | **node-API client** | the multiplexed `vos-api` client over SSH's `vos-api` subsystem, over an arti onion stream (§6) [E23] | `vos-api` [built] |
 | **sync** | merkle-crdt DAGs of the local actors' Merge fields, one a local instance, its `Store` over fjall, sealed before they leave the device (§3.6) | `support/merkle-crdt` [built: incremental apply, author chains, `FjallStore`, batched fetching], `vos-light`'s `sync` and `personal` [built: nodes recorded and applied through the merge entry, sealed at push and read by the cursor over `Personal`, §3.6] |
 | **MLS** | the user's device group, through `vos-mls` over mls-rs, on the host side, native, never in a guest | `vos-mls` [new]; the storage providers and copy-and-swap adapted from the `messaging` branch (§3.4) |
@@ -2285,7 +2285,8 @@ picked the circuit; a proven call carries the kernel's claim:
 - **The request** keeps kind `0x0104` and its envelope (instance, method,
   arguments, nonce, expiry, format, proof) and replaces `public:
   CredentialPublic` with `claim: Vec<u8>`, the kernel's public arguments
-  in their SCALE encoding. The format is 46 (or its successor) alone.
+  in their SCALE encoding. The format is a device format the node admits:
+  47 alone by release (46 where configured, §4.4).
 - **The guard names the kernel:** `#[msg(proven = spend)]`, naming a
   device kernel of this actor, or `#[msg(proven = owner)]`, the
   credential actor's. `#[msg(credential = Auth("login"))]` and
@@ -2463,11 +2464,20 @@ format, the chips, the sizes and the root.
     member. The window test signs in through a `once` guard with release
     one's proof and is refused `Once` with release two's: the same
     nullifier (`an_app_one_release_behind_signs_in_until_its_window_closes`).
-  - **Until a second device format exists** [decided here, the simplest
-    rule consistent with D8 and G3]: every window entry's program is
-    computed under the node's current device format. Format 47 (plan
-    8.10) pairs each entry with its release's format, the previous
-    release's program verified under the previous format.
+  - **A release's program in each format admitted** [built]: a node
+    computes each window entry's program in every device format it
+    admits now, so the window read names each release's program once a
+    format (a program id embeds its format) and a proof is verified
+    against the release's program in the proof's own format. An app one
+    format behind proves the same release in its format until that
+    format retires. Format 47's release admits 47 alone: 46 is retired at
+    once (its byte ledger is not consistent, `open.md`), and a node
+    admits it only where its configuration says so
+    (`Config::device_formats`, a test's: the gate
+    `the_previous_device_format_is_admitted_until_it_is_retired` runs a
+    46 proof and a 47 proof at one node, refuses the 46 proof `Format`
+    once 46 is retired now, and has the light node choose 47 where both
+    are admitted and 46 where 46 alone is).
 - **Pins:** the binding names the program id, so a proof of one kernel
   authorizes nothing under another. No venue pins device ids (device
   proofs are not folded, `proving.md` §11, "Device proofs are not

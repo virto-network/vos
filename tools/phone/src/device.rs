@@ -3,21 +3,21 @@
 //! one channel, timed, verified, its peak memory read and its bytes
 //! counted.
 //!
-//! A cell is `statement/log_blowup:queries:pow[:log_h]/channel[/cpu[/memory]]`, the
+//! A cell is `statement/log_blowup:queries:pow[:log_h]/channel[/format]`, the
 //! statement a kernel `<statement>.kernel` and its witness input
 //! `<statement>.input` in the kernels' directory, or `auth` or `owner`, the
 //! stock kernel from its embedded release artifact on its reference
 //! program's arguments; the channel `b2sm31` (Blake2s-M31) or `b2b`
-//! (Blake2b-256); the CPU `full` (the default) or `program`, the
-//! per-program CPU ([`Cpu`]); the memory ledger `byte` (the default) or
-//! `word`, a row a word ([`Memory`]). Its format is [`DEVICE_PROOF`] at the cell's
-//! parameters, `h` `2^log_h` where the cell names it, else twice the rows a
+//! (Blake2b-256); the format `47` (the default, the device format: the
+//! per-program CPU and the word ledger) or `46` (the full CPU and the
+//! byte ledger), whose CPU ([`Cpu`]) and memory ledger ([`Memory`]) it
+//! takes. Its format is that one at the cell's parameters, `h` `2^log_h` where the cell names it, else twice the rows a
 //! column reading two rows reveals, `4·2 + 3q`, rounded up to a power of
 //! two. The program is installed once, its preprocessed tree committed
 //! then: a stock kernel's at its release's chips and log sizes, any other's
 //! from a reference run of the same witness (the shape its run needs, each
-//! chip at least its floor), as is a stock kernel's under the word ledger,
-//! whose release's log sizes are the byte ledger's; each rep traces the
+//! chip at least its floor), as is a stock kernel's under format 46 (its
+//! release's log sizes are 47's); each rep traces the
 //! kernel and proves it against the program.
 
 use std::path::{Path, PathBuf};
@@ -30,7 +30,7 @@ use stwo::core::vcs_lifted::blake2b_merkle::Blake2bMerkleChannel;
 use stwo::prover::backend::BackendForChannel;
 use stwo::prover::backend::simd::SimdBackend;
 use vos_pvm_proof::format::{
-    ChannelKind, Cpu, DEVICE_PROOF, Format, FormatParams, Masking, Memory,
+    BYTE_DEVICE_PROOF, ChannelKind, Cpu, DEVICE_PROOF, Format, FormatParams, Masking, Memory,
 };
 use vos_pvm_proof::masked::DeviceComponents;
 use vos_pvm_recair::masked::device::{
@@ -73,8 +73,8 @@ impl Cell {
     pub fn parse(text: &str) -> Self {
         let parts: Vec<&str> = text.split('/').collect();
         assert!(
-            matches!(parts.len(), 3..=5),
-            "a cell is statement/blowup:queries:pow/channel[/cpu[/memory]]: {text}"
+            matches!(parts.len(), 3 | 4),
+            "a cell is statement/blowup:queries:pow/channel[/format]: {text}"
         );
         let config: Vec<u32> = parts[1]
             .split(':')
@@ -89,15 +89,10 @@ impl Cell {
             "b2b" => ChannelKind::Blake2b256,
             other => panic!("unknown channel {other}"),
         };
-        let cpu = match parts.get(3).copied() {
-            None | Some("full") => Cpu::Full,
-            Some("program") => Cpu::PerProgram,
-            Some(other) => panic!("unknown CPU {other}"),
-        };
-        let memory = match parts.get(4).copied() {
-            None | Some("byte") => Memory::Byte,
-            Some("word") => Memory::Word,
-            Some(other) => panic!("unknown memory ledger {other}"),
+        let (cpu, memory) = match parts.get(3).copied() {
+            None | Some("47") => (DEVICE_PROOF.cpu, DEVICE_PROOF.memory),
+            Some("46") => (BYTE_DEVICE_PROOF.cpu, BYTE_DEVICE_PROOF.memory),
+            Some(other) => panic!("unknown device format {other}"),
         };
         Self {
             statement: parts[0].to_string(),
@@ -128,6 +123,10 @@ impl Cell {
             }),
             cpu: self.cpu,
             memory: self.memory,
+            number: match self.memory {
+                Memory::Word => DEVICE_PROOF.number,
+                Memory::Byte => BYTE_DEVICE_PROOF.number,
+            },
             ..DEVICE_PROOF
         }
     }
@@ -184,8 +183,8 @@ fn statement(dir: &Path, statement: &str) -> Statement {
 }
 
 /// The steps of the kernel's run `trace` gives, and the program's chips and
-/// log sizes: the release's where it has one and the format its memory
-/// ledger, else the shape that run needs.
+/// log sizes: the release's where it has one and the format is the
+/// release's, else the shape that run needs.
 fn shape(
     format: &Format,
     kernel: &[u8],
@@ -195,7 +194,7 @@ fn shape(
     let mut reference = trace();
     let steps = reference.steps.len();
     let (active, log_sizes) = match released {
-        Some(shape) if format.memory == Memory::Byte => shape,
+        Some(shape) if format.memory == DEVICE_PROOF.memory => shape,
         _ => device_shape(format, kernel, &mut reference).expect("a shape"),
     };
     (steps, active, log_sizes)

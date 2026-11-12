@@ -1,7 +1,7 @@
 //! Device programs as ingress and a device take them
 //! (`vos_pvm_recair::device`): a program's id, a proof's bytes, and
-//! a run past the program's log sizes refused by the prover, under format
-//! 46 itself.
+//! a run past the program's log sizes refused by the prover, under the
+//! device format itself.
 
 use vos_pvm_compiler::assembler::{Assembler, Reg};
 use vos_pvm_final_verifier::Error;
@@ -12,14 +12,14 @@ use vos_pvm_recair::masked::MaskRng;
 
 use crate::support::{blob, io_and_halt, io_bytes, witness};
 
-/// A kernel reading up to 1,024 witness bytes onto its stack: its rows
+/// A kernel reading up to 4,096 witness bytes onto its stack: its rows
 /// follow its input's length.
 fn reader() -> Vec<u8> {
     let mut asm = Assembler::new();
-    asm.set_stack_pages(1)
-        .add_imm_64(Reg::S0, Reg::SP, -1024)
+    asm.set_stack_pages(2)
+        .add_imm_64(Reg::S0, Reg::SP, -4096)
         .move_reg(Reg::A0, Reg::S0)
-        .load_imm(Reg::A1, 1024)
+        .load_imm(Reg::A1, 4096)
         .ecalli(ECALL_WITNESS_INPUT);
     io_and_halt(&mut asm);
     asm.build()
@@ -27,7 +27,8 @@ fn reader() -> Vec<u8> {
 
 /// A run that needs more rows than its program's log sizes is refused by
 /// the prover, never proved at a larger shape: the reader's program sized
-/// by a 16-byte reference run, then a run of 1,000 bytes; under format 46.
+/// by a 16-byte reference run, then a run of 4,000 bytes (500 words); under
+/// the device format.
 #[test]
 fn a_run_past_the_programs_log_sizes_is_refused_by_the_prover() {
     let kernel = reader();
@@ -36,13 +37,13 @@ fn a_run_past_the_programs_log_sizes_is_refused_by_the_prover() {
     let bytes = encode(&proof.proof).expect("encodes");
     program.verify(&proof.io, &bytes).expect("verifies");
     let error = program
-        .prove(&[9; 1000], MaskRng::default())
+        .prove(&[9; 4000], MaskRng::default())
         .expect_err("past the shape");
     assert!(
         matches!(&error, ProveError::Segment(message) if message.contains("its shape")),
         "{error:?}"
     );
-    let larger = Program::install(&kernel, &[7; 1000], 0).expect("installs");
+    let larger = Program::install(&kernel, &[7; 4000], 0).expect("installs");
     assert_ne!(larger.log_sizes(), program.log_sizes());
     assert_ne!(larger.id(), program.id());
 }
@@ -186,5 +187,29 @@ fn a_proof_whose_interaction_pow_fails_is_refused_before_its_decode() {
         if full(&proof.io, &flipped) {
             assert!(program.verify(&proof.io, &flipped).is_ok(), "byte {at}");
         }
+    }
+}
+
+/// A kernel's programs under 47 and 46 are two programs, their ids apart;
+/// each verifies its own format's proofs and refuses the other's as
+/// `Format` before any decode.
+#[test]
+fn a_proof_of_one_device_format_is_refused_under_the_other() {
+    let byte = vos_pvm_recair::device::format(46).expect("46 is proved");
+    assert_eq!(vos_pvm_recair::device::FORMATS[0], FORMAT);
+    let word = Program::install(&blob(), &witness(1), 0).expect("installs");
+    let old = Program::install_in(byte, &blob(), &witness(1), 0).expect("installs");
+    assert_eq!((word.format().number, old.format().number), (47, 46));
+    assert_ne!(word.id(), old.id());
+    for (program, other) in [(&word, &old), (&old, &word)] {
+        let (proof, _) = program
+            .prove(&witness(2), MaskRng::default())
+            .expect("proves");
+        let bytes = program.encode(&proof.proof).expect("encodes");
+        program.verify(&proof.io, &bytes).expect("verifies");
+        assert!(matches!(
+            other.verify(&proof.io, &bytes),
+            Err(Error::Format)
+        ));
     }
 }

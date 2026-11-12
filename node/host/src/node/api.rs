@@ -316,7 +316,9 @@ impl Node {
 
     /// Retire device format `format` at this node at `at_ms`, if that is
     /// earlier than its date (now included): the date kept, or `None` for
-    /// a format this node does not verify.
+    /// a format this node does not admit
+    /// (`Config::device_formats`). The date is this run's: a restart takes
+    /// the configuration's again.
     pub fn retire_format(&self, format: u32, at_ms: u64) -> Option<u64> {
         self.inner.calls.devices.retire_format(format, at_ms)
     }

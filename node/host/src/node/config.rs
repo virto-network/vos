@@ -168,6 +168,14 @@ pub struct Config {
     /// The most device proofs the node verifies at once: past them, a
     /// credentialed call is answered busy. `None` for twice its executors.
     pub verifications: Option<usize>,
+    /// The device formats this node admits, newest first, each with the
+    /// retirement its release set, if any (`light-node.md` §4.4): by
+    /// default the release's, [`crate::DEVICE_FORMATS`], which admits 47
+    /// alone (46's byte ledger is not consistent, `open.md`). At most two,
+    /// each one this binary verifies (`vos_pvm_recair::device::FORMATS`),
+    /// else the node does not open. Admitting the previous format past its
+    /// release's date is a test's: the window's mechanism.
+    pub device_formats: Vec<(u32, Option<u64>)>,
     /// The device formats the operator retired, each at its time in ms,
     /// where that is earlier than its release's (`light-node.md` §4.4): a
     /// proof of one is refused from that time. The operator's `Retire`
@@ -238,6 +246,7 @@ impl Config {
             local_operator: true,
             operator_nonces: 1 << 16,
             verifications: None,
+            device_formats: crate::DEVICE_FORMATS.to_vec(),
             retired_formats: Vec::new(),
             onion: crate::admission::OnionPolicy::Any,
         }

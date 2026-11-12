@@ -54,13 +54,11 @@ The scale results are in `core-model.md` §14, "The scale test".
 
 ## Proving
 
-- **The device prover's next levers:** format 47 taking word-level memory
-  and the per-program CPU (both built as candidates, `Memory::Word` and
-  `Cpu::PerProgram`, `proving.md` §8), measured on the phone. The
-  per-program CPU for node segments is later. The 4-way CPU split by
-  opcode family is not built.
-- **Format 46 does not keep its memory consistent: retire it behind 47**
-  [reviewed, 2026-11-10]. `MemoryChip` fixes no place for its padding and
+- **The device prover's next levers:** format 47 takes word-level memory
+  and the per-program CPU (`proving.md` §8). The per-program CPU for node
+  segments is later. The 4-way CPU split by opcode family is not built.
+- **The ledgers' padding** [reviewed, 2026-11-10; resolved for device
+  proofs by format 47]. `MemoryChip` fixes no place for its padding and
   its sortedness gadget does not fire across a padding row (`both_real`
   zeroes the ordering delta), so its real rows may be several sorted
   runs; every run starts with a `ts = 0` write (`IsGroupStart`, also on a
@@ -80,56 +78,49 @@ The scale results are in `core-model.md` §14, "The scale test".
     the public registers. The program memory is a preprocessed read-only
     table. Padding inside both ledgers verifies, harmless (gate
     `segment::gates::padding_between_the_ledgers_real_rows_is_harmless`,
-    on the segment AIR proved masked; the masked segment verifier has no
-    `initial_state.timestamp ≥ 1` check yet, which it needs before any
-    masked segment format is admitted). 28, 32 and 39 prove the recursion
-    AIR, which has no memory argument.
-  - **Device 46: not consistent, and admitted.** `DeviceMemoryChip` lets
-    a byte have as many rows as the prover puts (its address bits free, no
-    ordering, `Last` and `ClosingTs` free), so a byte can have two groups,
-    each in a sorted run of its own and started and closed by its own
-    boundary row: a read in the second sees the byte's first touch, or any
-    write placed with it, instead of the last write before it. It needs one
-    spare `DeviceMemoryChip` row and about four spare ledger rows at the
-    program's log sizes (auth's ledger: 12,754 of 2^14 rows). In one sorted run a
-    second boundary row does not balance (its `ts = 0` write is no start,
-    and only a start consumes the permission), so the gap needs both. On
-    paper a riscv64 kernel's stack spill reloads its first touch (zero) or
-    an older spill, so a value the kernel's control flow reads back, a
-    check's result among them, could be another. Its register ledger
-    (`DeviceBoundaryChip`'s preprocessed registers, entry at timestamp 1)
-    and program memory are consistent. Gate
-    `device::memory::byte_ledger_padding_between_real_rows_is_accepted_today`
+    on the segment AIR proved masked). The masked segment verifier
+    refuses a first timestamp below 1 as the unmasked one does (gate
+    `segment::gates::a_first_timestamp_of_zero_is_refused`). 28, 32 and 39
+    prove the recursion AIR, which has no memory argument.
+  - **Device 46: not consistent; retired behind 47.** `DeviceMemoryChip`
+    lets a byte have as many rows as the prover puts (its address bits
+    free, no ordering, `Last` and `ClosingTs` free), so a byte can have
+    two groups, each in a sorted run of its own and started and closed by
+    its own boundary row: a read in the second sees the byte's first
+    touch, or any write placed with it, instead of the last write before
+    it. It needs one spare `DeviceMemoryChip` row and about four spare
+    ledger rows at the program's log sizes (auth's ledger: 12,754 of 2^14
+    rows). In one sorted run a second boundary row does not balance (its
+    `ts = 0` write is no start, and only a start consumes the permission),
+    so the gap needs both. On paper a riscv64 kernel's stack spill reloads
+    its first touch (zero) or an older spill, so a value the kernel's
+    control flow reads back, a check's result among them, could be
+    another. Its register ledger (`DeviceBoundaryChip`'s preprocessed
+    registers, entry at timestamp 1) and program memory are consistent.
+    Gate `device::memory::byte_ledger_padding_between_real_rows_is_accepted_today`
     holds the byte ledger's acceptance of padding inside it (the shape's
-    byte ledger, not entry 46) and flips when the ledger takes a last-row
-    column.
+    byte ledger) and flips if the ledger takes a last-row column. Format
+    47's release retires 46 at once (`DEVICE_FORMATS`: 46's date 0), so a
+    node refuses a 46 proof `Format` unless its configuration admits 46
+    (`Config::device_formats`, which the window's gate uses); 46's code,
+    fuzz target and leakage gate stay until it is deleted. Device proofs
+    are in no leaf, fold, wrap, venue or `MANIFEST` pin.
   - **Device 47 (the word ledger):** consistent. `IsLast` keeps padding
     past the real rows, one sorted run, a word one group; a second
     boundary row's `ts = 0` write has no start to consume it (gates
     `padding_between_real_rows_is_refused`,
-    `a_word_touched_twice_at_the_boundary_is_refused`). Its register
-    ledger and program memory are 46's. A cheap hardening before it ships:
-    `IsLast · (1 − IsPadding) = 0`, the last row padding, which removes the
-    all-real cyclic trace (every row one word at one sort key, no group
-    start); today it is excluded only because such a ledger consumes
-    nothing else: at least 16 rows each take a byte tuple at one word,
-    timestamp and direction, which one BLAKE2b call's overlapping reads can
-    put, but the call's writes and every other tuple of the run would go
-    unconsumed.
+    `a_word_touched_twice_at_the_boundary_is_refused`); and the last row
+    is padding (`IsLast · (1 − IsPadding) = 0`, degree 2), which removes
+    the all-real cyclic trace, every row one word at one sort key with no
+    group start (gate `word_ledger_gate::an_all_real_ledger_is_refused`,
+    its control that every other constraint holds on it). Its register
+    ledger and program memory are 46's.
 
-  The fix for 46 is retiring it behind 47: ingress refusing 46 is part of
-  shipping 47, and until then a device proof under 46 can lie about a
-  read. Device proofs are in no leaf, fold, wrap, venue or `MANIFEST` pin,
-  so the cost is the device programs' re-pin 47 makes anyway.
-  Keeping a byte-ledger device format instead takes a format number of
-  its own: the word ledger's `IsLast` on `MemoryChip` under the device
-  shape alone (one preprocessed column and one degree-3 constraint, about
-  0.2% of the auth kernel's cells), new device program ids; on the segment
-  AIR it would be a new segment format with its leaf, folds, wrap and
-  pins for no soundness gain, so it waits for the next segment format as
-  hardening. Sorting `DeviceMemoryChip`'s rows strictly by address closes
-  it too, but needs a last-row column there as well and about 30 more
-  columns a boundary row.
+  Keeping a byte-ledger format for segments: the word ledger's `IsLast`
+  on `MemoryChip` (one preprocessed column and one degree-3 constraint)
+  would be a new segment format with its leaf, folds, wrap and pins for
+  no soundness gain, so it waits for the next segment format as
+  hardening.
 - **Segment proving levers** (`proving.md` §9): the 36 cubic gates
   rewritten, narrow BLAKE2b chips, a lighter page boundary or one memory
   argument across segments, and folding device proofs (the recursion
@@ -144,8 +135,15 @@ The scale results are in `core-model.md` §14, "The scale test".
   pre-check and costs a decode and the composition (11–27 ms on one x86
   thread) before its 16-bit PoW refuses it; 16 or more bits would refuse
   such junk in about 0.02 ms, at the prover's grind's cost on the phone.
-- **A quiet re-measure of the device exit `0x402`'s cost** on an idle
-  machine.
+- **`0x402`'s price against its quiet cost:** one native Poseidon2-M31
+  compression (`vos_pvm::precompile::poseidon2_compress`) takes 1,925 TSC
+  cycles at the median, one BLAKE2b compression 405–414, ×4.65–4.75, on
+  one pinned core of an idle machine (load average 0.5), three runs of 31
+  rounds of 20,000 [measured, x86 dev machine (Intel Core Ultra 7 155H),
+  2026-11-12; a spike outside the tree]. `POSEIDON2_GAS` (2,400) is four
+  BLAKE2b prices (600) from the loaded estimate of 1,800 cycles; at
+  BLAKE2b's gas a cycle it would be about 2,800. Whether to raise it, which
+  moves every gas pin that counts a `0x402` call, is the owner's.
 - **Segment AIR parts not yet under a forgery gate:** the program memory's
   decode binding, the jump table, the lookup tables, the memory page and
   Merkle chips, the witness-input chip, the boundary-binding argument, and

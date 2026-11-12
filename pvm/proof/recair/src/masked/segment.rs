@@ -201,12 +201,18 @@ where
 /// its program and shape commit ([`circuit_root`]), its chips laid out from
 /// its active-chip mask and log sizes: the masked transcript, the claimed
 /// sums' total zero and the boundary chips' sums the boundary states'.
-/// The root is the only pin of the tables' and the code's content.
+/// The root is the only pin of the tables' and the code's content. A
+/// segment's first timestamp is at least 1 (`Error::PublicWords` else),
+/// as the unmasked verifier holds it: the memory boundary's `ts = 0`
+/// tuples are its listed pages' alone.
 pub fn verify_segment<MC: MerkleChannel>(
     format: &Format,
     proof: &SegmentProof<MC::H>,
     circuit: <MC::H as MerkleHasherLifted>::Hash,
 ) -> Result<(), Error> {
+    if proof.initial_state.timestamp < 1 {
+        return Err(Error::PublicWords);
+    }
     let (masked, layout) =
         segment_format(format, proof.active, &proof.log_sizes).ok_or(Error::Format)?;
     let public = public_values(&proof.initial_state, &proof.final_state);
