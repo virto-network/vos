@@ -14,8 +14,8 @@ authors.workspace = true
 # index. The one pinned mls-rs for VOS.
 mls-rs = { version = "=0.57.0", default-features = false, features = ["private_message"] }
 mls-rs-core = { version = "=0.27.0", default-features = false }
-# 0.23's curve25519-dalek 5.0.0 cannot share a build with russh's
-# `=5.0.0-rc.0` (s4's facility links both).
+# 0.22, the provider the facility's size was measured with
+# (light-node.md); 0.23 builds beside russh, both on curve25519-dalek 5.
 mls-rs-crypto-rustcrypto = { version = "=0.22.1", default-features = false }
 fjall = { workspace = true }
 # The confirmation hash and a held commit's handshake hash.

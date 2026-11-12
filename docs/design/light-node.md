@@ -895,9 +895,9 @@ arm64-v8a build; the phones' timings below are S8-P1's]:
 - **Features:** `default-features = false` with `private_message` only
   (encrypted handshakes); no `std`, `rayon`, `x509`, `psk`,
   `by_ref_proposal`, `out_of_order`, `prior_epoch`, `custom_proposal` or
-  `tree_index`; the RustCrypto provider 0.22 (0.23's
-  `curve25519-dalek` 5.0.0 cannot share a build with russh 0.61's
-  `=5.0.0-rc.0`; a russh taking 5.0.0 lifts this).
+  `tree_index`; the RustCrypto provider 0.22 (0.23 then could not share
+  a build with russh 0.61's `curve25519-dalek` `=5.0.0-rc.0`; russh 0.65
+  takes 5.0.0, so 0.23 now builds beside it, unmeasured).
 - **The facility's `.so`** (s4's `libs4_credential.so`, release, arm64,
   stripped as packaged): +0.86 MB with the device-group scenario linked
   (+0.38 MB gzip -9), +0.96 MB with `std`: within PG5's 2 MB. The growth
