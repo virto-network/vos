@@ -172,8 +172,8 @@ fn the_verifier_takes_the_batching_from_the_format() {
     }
 }
 
-/// Every number names one entry; only 28, 39, 41, 46 and 47 are
-/// admitted, and a segment verifier takes 41 alone; every other number,
+/// Every number names one entry; only 28, 39, 41 and 47 are admitted, 46
+/// is retired, and a segment verifier takes 41 alone; every other number,
 /// one an earlier format took among them, is refused as unregistered.
 #[test]
 fn the_registry_numbers_round_trip() {
@@ -185,7 +185,6 @@ fn the_registry_numbers_round_trip() {
                 WRAP.number,
                 SEGMENT.number,
                 MASKED_WRAP.number,
-                BYTE_DEVICE_PROOF.number,
                 DEVICE_PROOF.number,
             ]
             .contains(&format.number)
@@ -195,6 +194,8 @@ fn the_registry_numbers_round_trip() {
             format.number == SEGMENT.number
         );
     }
+    let retired = admitted(BYTE_DEVICE_PROOF.number).unwrap_err();
+    assert!(retired.contains("retired"), "{retired}");
     assert!(REGISTRY.windows(2).all(|w| w[0].number < w[1].number));
     for number in (0..64).chain([u32::MAX]) {
         if REGISTRY.iter().any(|format| format.number == number) {

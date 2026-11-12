@@ -125,6 +125,7 @@ fn a_proof_under_one_format_is_refused_under_another() {
             let expected = match (other.status, other.kind) {
                 (format::Status::Admitted, format::ProofKind::Segment) => "Stark proof is on",
                 (format::Status::Admitted, _) => "does not name segment proofs",
+                (format::Status::Retired, _) => "is retired",
                 _ => "not admitted",
             };
             refused_both(relabelled, side_note, expected);

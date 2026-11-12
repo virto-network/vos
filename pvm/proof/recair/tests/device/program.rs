@@ -213,3 +213,37 @@ fn a_proof_of_one_device_format_is_refused_under_the_other() {
         ));
     }
 }
+
+/// The device kernel's program under the device format: its chips, its log
+/// sizes, its CPU's column words and its id, pinned. A program id names
+/// what a device proves under, so whatever moves it for one kernel (a CPU
+/// `Column` reordered or added, a chip index, a trace's rows on the
+/// reference run, a preprocessed column's layout, the word ledger's tag)
+/// needs a new format number: this gate fails at any such change.
+#[test]
+fn the_device_programs_id_is_pinned() {
+    const CHIPS: u32 = 1_016_328_469;
+    const LOG_SIZES: [u32; 16] = [10; 16];
+    const CPU: [u64; 5] = [
+        252_612_797_300_735,
+        14_105_555_774_723_964_920,
+        146_366_456_924_999_232,
+        18_428_906_283_836_883_394,
+        3,
+    ];
+    const ID: [u8; 32] = [
+        65, 178, 245, 91, 215, 220, 180, 111, 175, 221, 41, 102, 30, 132, 209, 241, 155, 149, 147,
+        234, 200, 68, 72, 136, 17, 31, 215, 145, 87, 138, 187, 240,
+    ];
+    let program = Program::install(&blob(), &witness(1), 0).expect("installs");
+    assert_eq!(FORMAT.number, 47);
+    assert_eq!(
+        (
+            program.chips(),
+            program.log_sizes(),
+            &program.program().cpu.words()[..],
+            *program.id()
+        ),
+        (CHIPS, &LOG_SIZES[..], &CPU[..], ID)
+    );
+}
