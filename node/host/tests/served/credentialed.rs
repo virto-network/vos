@@ -3,11 +3,12 @@
 //! made as a device makes them, by the stock kernels' release artifacts:
 //! each refusal in its check order; a proof replayed, and a `once`
 //! nullifier raced past ingress at another replica, each refused at apply;
-//! a forwarded call whose answer was lost, and a call its leader proposed
-//! before it was deposed, each answered its run, not `Replayed`;
-//! a root a replica has not applied, one replaced at its own batch time
-//! and one pushed out of the ring, each `RootUnknown` and admitted after a
-//! path refetch; a revoked member's root refused once `ROOT_MAX_AGE` has
+//! a forwarded call whose answer was lost, sent again before its expiry or
+//! after it, and a call its leader proposed before it was deposed, each
+//! answered its run, not `Replayed` or `CredentialExpired`; a root a
+//! replica has not applied and one pushed out of the ring, each
+//! `RootUnknown` and admitted after a path refetch, and a root written
+//! while the leader's clock trails kept past the next batch; a revoked member's root refused once `ROOT_MAX_AGE` has
 //! passed by batch time; owner proofs paying from their accounts; no log entry
 //! holding a proof; a verified call holding no large body's place while it
 //! waits to apply; the device library's requests and proofs admitted as
@@ -29,7 +30,7 @@ use vos_light::release::Device;
 use vos_light::{AuthWitness, Call, DEVICE_FORMAT, DeviceProgram, Prover, ProverConfig, Threads};
 use vos_net::Class;
 use vos_node::client::{self, Client};
-use vos_wire::abi::Refusal;
+use vos_wire::abi::{Failure, Refusal};
 use vos_wire::credentials::{
     self as tree, AuthClaim, Bound, CredentialError, Digest, Path, RootEntry,
 };
@@ -713,6 +714,51 @@ fn a_forwarded_call_whose_answer_is_lost_is_answered_its_run() {
     );
 }
 
+/// A follower forwards a call whose answer from the leader is lost, and
+/// sends it again once the agent's time is past the call's expiry: apply
+/// refuses that send `CredentialExpired`, and the client is answered the
+/// first send's run, not the expiry.
+#[test]
+fn a_forwarded_call_run_before_its_expiry_is_answered_its_run_after_it() {
+    let founded = Founded::new();
+    let secret = Secret::new(14);
+    founded.write(CREDENTIALS, "enroll", secret.member());
+    let leader = founded.cluster.leader(founded.agent).unwrap();
+    let follower = founded.follower();
+    let path = founded.path(&secret);
+    let call = founded.auth(follower, &secret, &path, ("login", "login"), ());
+    let logins: u64 = founded.read(POLL, "logins", ());
+    let hub = &founded.cluster.hub;
+    let lost = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&lost);
+    hub.tap(Arc::new(move |from, to, class, frame| {
+        if from == leader
+            && to == follower
+            && class == Class::Requests
+            && matches!(
+                PeerMessage::decode_exact(frame),
+                Some(PeerMessage::Forwarded { .. })
+            )
+        {
+            seen.store(true, Ordering::SeqCst);
+        }
+    }));
+    hub.cut_class(leader, follower, Class::Requests);
+    let founded = &founded;
+    let answer = std::thread::scope(|scope| {
+        let answer = scope.spawn(|| founded.send(follower, &call));
+        vos_checker::wait_until("the leader's answer lost", Duration::from_secs(30), || {
+            lost.load(Ordering::SeqCst)
+        });
+        founded.later(61_000);
+        hub.heal();
+        answer.join().unwrap()
+    });
+    done(&answer);
+    let after: u64 = founded.read(POLL, "logins", ());
+    assert_eq!(after, logins + 1, "it ran once");
+}
+
 /// The leader takes a call at its own ingress and proposes it, its
 /// followers' acknowledgements lost: it steps down before the entry
 /// commits there, and its successor commits it. Healed, the deposed leader
@@ -828,9 +874,11 @@ fn a_verified_call_holds_no_large_place_while_it_waits_to_apply() {
 }
 
 /// A root this replica has not applied is `RootUnknown` there, and
-/// admitted at a replica that has; a root a later write replaced at its
-/// own batch time, and one pushed out of the ring by 64 later roots, each
-/// `RootUnknown`, and admitted on the path fetched again.
+/// admitted at a replica that has; a root written while the leader's clock
+/// trails the agent's time stays admitted after the next batch's write,
+/// each batch timed past the one before; a root pushed out of the ring by
+/// 64 later roots is `RootUnknown`, and admitted on the path fetched
+/// again.
 #[test]
 fn an_unknown_root_is_retried_on_a_path_fetched_again() {
     let founded = Founded::new();
@@ -849,8 +897,8 @@ fn an_unknown_root_is_retried_on_a_path_fetched_again() {
         assert!(done(&founded.send(leader, &call)).len() > 1);
     }
 
-    // Replaced at its own batch time: the clock held back, a later write
-    // is timed at the agent's time.
+    // The clock held back: a later write is timed past the agent's time,
+    // so its root supersedes the one before, which stays admitted.
     let replaced = Secret::new(4);
     founded.write(CREDENTIALS, "enroll", replaced.member());
     let stale = founded.path(&replaced);
@@ -860,20 +908,15 @@ fn an_unknown_root_is_retried_on_a_path_fetched_again() {
         .offset
         .fetch_sub(3_600_000, Ordering::SeqCst);
     founded.write(CREDENTIALS, "enroll", Secret::new(5).member());
+    founded.write(CREDENTIALS, "enroll", Secret::new(6).member());
     founded
         .cluster
         .offset
         .fetch_add(3_600_000, Ordering::SeqCst);
     let newest = founded.root();
-    assert_eq!(newest.since, since, "replaced at its own batch time");
+    assert!(newest.since > since, "a batch time of its own");
     assert_ne!(newest.root, stale.root);
     let call = founded.auth(leader, &replaced, &stale, ("login", "login"), ());
-    assert_eq!(
-        refused(founded.send(leader, &call)),
-        CredentialRefusal::RootUnknown
-    );
-    let fetched = founded.path(&replaced);
-    let call = founded.auth(leader, &replaced, &fetched, ("login", "login"), ());
     assert!(done(&founded.send(leader, &call)).len() > 1);
 
     // Pushed out by 64 later roots, each a batch of its own.
@@ -969,7 +1012,7 @@ fn a_second_device_is_enrolled_and_revoked_by_its_first_devices_proof() {
     let slot = u32::decode_exact(done(&founded.send(at, &enroll))).unwrap();
     let path = founded.path(&second);
     assert_eq!(slot, path.slot);
-    let confirm = founded.owned(at, &second, CREDENTIALS, "confirm_device", ());
+    let confirm = founded.owned(at, &second, CREDENTIALS, "confirm_device", second.member());
     done(&founded.send(at, &confirm));
 
     for secret in [&first, &second] {
@@ -1640,17 +1683,36 @@ fn an_app_one_release_behind_signs_in_until_its_window_closes() {
     let (call, proof) = login(0);
     assert!(matches!(send(&call, &proof), Answer::Ran { .. }));
 
-    // A device format retired now: no device proof is admitted.
+    // A device format retired now in the agent's log: no device proof is
+    // admitted, at any replica.
     let now = time();
-    let node = founded.cluster.node(at).unwrap();
-    assert_eq!(node.retire_format(DEVICE_FORMAT, now), Some(now));
-    assert_eq!(
-        node.retire_format(44, now),
-        None,
-        "a format it never verified"
+    let retire = |format| {
+        smol::block_on(
+            founded
+                .cluster
+                .leading(agent)
+                .retire_format(agent, format, now),
+        )
+        .unwrap()
+    };
+    assert!(matches!(
+        retire(DEVICE_FORMAT),
+        vos_node::Reply::Ran(Outcome::Done(ref kept)) if Option::<u64>::decode_exact(kept) == Some(Some(now))
+    ));
+    assert!(
+        matches!(
+            retire(44),
+            vos_node::Reply::Ran(Outcome::Failed {
+                code: Failure::Unknown,
+                ..
+            })
+        ),
+        "a format the release never admitted"
     );
     let (call, proof) = login(1);
-    assert!(window(&founded, at, CREDENTIALS).formats.is_empty());
+    vos_checker::spaces::wait_in_process("the retirement applied", || {
+        window(&founded, at, CREDENTIALS).formats.is_empty()
+    });
     assert!(matches!(sign_in(&old_app), Err(DeviceError::Window)));
     assert_eq!(
         send(&call, &proof),
@@ -1662,11 +1724,11 @@ fn an_app_one_release_behind_signs_in_until_its_window_closes() {
 /// default it admits 47 alone and refuses a 46 proof `Format`. Restarted
 /// admitting both (a test's configuration), its window names the stock
 /// `auth` kernel's program in each, an app shipping both chooses 47 and
-/// one shipping 46 alone chooses 46, and a 46 proof and a 47 proof are
-/// both run as their members' pseudonyms. The operator retires 46 now: its
-/// proof made before is refused `Format` and the app chooses 47. Restarted
-/// admitting 46 alone, the app shipping both chooses 46, and its proof is
-/// run.
+/// one shipping 46 alone chooses 46, and a 47 proof is run as its member's
+/// pseudonym. The operator retires 46 now in the agent's log: a 46 proof
+/// made before is refused `Format` at the node's ingress and the app
+/// chooses 47. Restarted admitting 46 alone, the node's window is empty:
+/// the log's retirement outlives the restart.
 #[test]
 fn the_previous_device_format_is_admitted_until_it_is_retired() {
     use vos_light::wire::{self, Answer};
@@ -1749,7 +1811,9 @@ fn the_previous_device_format_is_admitted_until_it_is_retired() {
                 && client::devices(founded.cluster.target(at), founded.agent, CREDENTIALS)
                     .ok()
                     .flatten()
-                    .is_some_and(|window| !programs(&window).is_empty())
+                    .is_some_and(|window| {
+                        window.formats.is_empty() || !programs(&window).is_empty()
+                    })
         });
     };
 
@@ -1781,17 +1845,26 @@ fn the_previous_device_format_is_admitted_until_it_is_retired() {
     let (format, call, proof) = sign_in(0, &both).unwrap();
     assert_eq!(format, DEVICE_FORMAT, "the newest format admitted");
     assert!(matches!(send(&call, &proof), Answer::Ran { .. }));
-    let (format, call, proof) = sign_in(1, &only_byte).unwrap();
-    assert_eq!(format, previous);
-    assert!(matches!(send(&call, &proof), Answer::Ran { .. }));
     let made_before = sign_in(2, &only_byte).unwrap();
+    assert_eq!(made_before.0, previous);
 
-    // 46 retired now: its proof refused, the app back on 47.
-    let node = founded.cluster.node(at).unwrap();
+    // 46 retired now in the agent's log: its proof refused, the app back
+    // on 47.
     let now = client::time(founded.cluster.target(at)).unwrap();
-    assert_eq!(node.retire_format(previous, now), Some(now));
-    drop(node);
-    assert_eq!(formats(&window(&founded, at, CREDENTIALS)), [DEVICE_FORMAT]);
+    let retired = smol::block_on(founded.cluster.leading(founded.agent).retire_format(
+        founded.agent,
+        previous,
+        now,
+    ))
+    .unwrap();
+    // The date kept is the release's, earlier.
+    assert!(matches!(
+        retired,
+        vos_node::Reply::Ran(Outcome::Done(ref kept)) if Option::<u64>::decode_exact(kept) == Some(Some(0))
+    ));
+    vos_checker::spaces::wait_in_process("the retirement applied", || {
+        formats(&window(&founded, at, CREDENTIALS)) == [DEVICE_FORMAT]
+    });
     let (_, call, proof) = made_before;
     assert_eq!(
         send(&call, &proof),
@@ -1802,14 +1875,66 @@ fn the_previous_device_format_is_admitted_until_it_is_retired() {
     assert_eq!(format, DEVICE_FORMAT);
     assert!(matches!(send(&call, &proof), Answer::Ran { .. }));
 
-    // 46 alone: the app shipping both chooses it.
+    // 46 alone: the log still retires it.
     restart(vec![(previous, None)]);
-    let window_46 = window(&founded, at, CREDENTIALS);
-    assert_eq!(formats(&window_46), [previous]);
-    assert_eq!(programs(&window_46), [(byte.id, previous)]);
-    let (format, call, proof) = sign_in(3, &both).unwrap();
-    assert_eq!(format, previous);
-    assert!(matches!(send(&call, &proof), Answer::Ran { .. }));
+    assert!(window(&founded, at, CREDENTIALS).formats.is_empty());
+    assert!(matches!(sign_in(3, &both), Err(DeviceError::Window)));
+}
+
+/// A device format the release retired binds every replica, whatever one
+/// node admits: a follower restarted admitting 46 (a test's
+/// configuration) passes an honest 46 proof at its ingress and forwards
+/// it to the leader, which admits 47 alone, and apply refuses it `Format`
+/// on every replica, so it runs nowhere.
+#[test]
+fn a_retired_format_one_replica_admits_is_refused_at_apply() {
+    let previous = vos_pvm_recair::device::FORMATS[1].number;
+    let founded = Founded::new();
+    let auth = founded.method(CREDENTIALS, "auth");
+    let elf = std::fs::read(credentials_elf()).unwrap();
+    let byte = vos_light::release::devices_in(previous, &elf)
+        .unwrap()
+        .into_iter()
+        .find(|device| device.method == auth)
+        .unwrap();
+    let at = founded.follower();
+    let secret = Secret::new(0x61);
+    founded.write(CREDENTIALS, "enroll", secret.member());
+    let leading = founded
+        .cluster
+        .leading(founded.agent)
+        .applied(founded.agent);
+    founded.cluster.stop(at);
+    *founded.cluster.slot(at).device_formats.lock().unwrap() =
+        Some(vec![(DEVICE_FORMAT, None), (previous, None)]);
+    founded.cluster.start(at);
+    vos_checker::spaces::wait_in_process("the node caught up", || {
+        founded
+            .cluster
+            .node(at)
+            .is_some_and(|node| node.applied(founded.agent) >= leading)
+    });
+    assert_ne!(founded.cluster.leader(founded.agent), Some(at));
+    let logins: u64 = founded.read(POLL, "logins", ());
+    let path = founded.path(&secret);
+    let call = founded.call(at, POLL, "login", ());
+    let proof = founded
+        .prover
+        .prove_auth(
+            &secret.0,
+            &witness(&path),
+            b"login",
+            &call,
+            &DeviceProgram::released(&byte).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(proof.format, previous);
+    assert_eq!(
+        founded.send(at, &request(&call, proof)),
+        Response::Refused(Refusal::Format)
+    );
+    let after: u64 = founded.read(POLL, "logins", ());
+    assert_eq!(after, logins, "run nowhere");
 }
 
 /// The tree kept from its feed: a follower's feed read page by page into

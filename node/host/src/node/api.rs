@@ -314,13 +314,23 @@ impl Node {
         })
     }
 
-    /// Retire device format `format` at this node at `at_ms`, if that is
-    /// earlier than its date (now included): the date kept, or `None` for
-    /// a format this node does not admit
-    /// (`Config::device_formats`). The date is this run's: a restart takes
-    /// the configuration's again.
-    pub fn retire_format(&self, format: u32, at_ms: u64) -> Option<u64> {
-        self.inner.calls.devices.retire_format(format, at_ms)
+    /// Retire device format `format` in `agent` at `at_ms`, if that is
+    /// earlier than its date (now included), through the agent's log, so
+    /// every replica refuses its proofs: answered with the date kept,
+    /// encoded; a format the release does not admit fails `Unknown`.
+    pub fn retire_format(
+        &self,
+        agent: AgentId,
+        format: u32,
+        at_ms: u64,
+    ) -> impl Future<Output = Result<Reply, CallError>> + use<> {
+        let inner = Arc::clone(&self.inner);
+        self.inner.runtime.spawn(async move {
+            inner
+                .admin(agent, Admin::RetireFormat { format, at_ms })
+                .await
+                .map(|answered| answered.reply)
+        })
     }
 
     /// A client request to `agent`, answered once its step is applied here.

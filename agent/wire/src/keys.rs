@@ -168,6 +168,7 @@ enum Row {
     Release = 0x2e,
     QuarantinedOp = 0x2f,
     Removed = 0x30,
+    FormatRetired = 0x31,
 }
 
 /// The root builder's rows, each tagged after [`Owner::Tree`]: the rows of
@@ -633,6 +634,13 @@ pub fn release(instance: InstanceId) -> Vec<u8> {
 /// the sweep forgets it ([`Due::Binding`]).
 pub fn binding(binding: &[u8; 32]) -> Vec<u8> {
     key(&[&Row::Binding.prefix(), binding])
+}
+
+/// Device format `format`'s retirement in this agent, its batch time:
+/// from then apply refuses a proof of it on every replica, and ingress at
+/// each ([`crate::batch::Admin::RetireFormat`]). Kept for good.
+pub fn format_retired(format: u32) -> Vec<u8> {
+    key(&[&Row::FormatRetired.prefix(), &format.to_be_bytes()])
 }
 
 /// A `once` guard's admission of `nullifier` in `scope`, with the batch

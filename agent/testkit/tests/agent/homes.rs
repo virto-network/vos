@@ -5,7 +5,7 @@
 //! double claim, a kit's key twice and a claim `Personal` refuses; a
 //! lapsed agent's reads, restore and removal and its refused pushes, ended
 //! by a re-proof under a nullifier its add recorded; the quota raised at
-//! the first re-proof; the registrar's open claim refused without its
+//! the first yearly re-proof; the registrar's open claim refused without its
 //! work, closed or past its cap; and the cap below the keeper's refill
 //! rate, a pool the keeper stops filling ending `PoolEmpty`.
 
@@ -296,6 +296,7 @@ impl Space {
             expires_ms: self.now + 60_000,
             claim: claim.encode(),
             kernel: method(&self.credentials, "auth"),
+            format: vos_wire::defaults::DEVICE_FORMATS[0].0,
         };
         let run = self.step(Input::Credentialed(Box::new(call)));
         self.relay(run.messages.clone());
@@ -911,12 +912,15 @@ fn the_cap_keeps_the_pool_and_an_empty_pool_is_pool_empty() {
 }
 
 /// The quota ramps: a claimed agent holds the policy's smaller quota until
-/// its first re-proof through `Homes`, and the larger one after.
+/// a re-proof through `Homes` five sixths of a lease after its claim, when
+/// the device's yearly prompt first falls, and the larger one after; a
+/// re-proof made at once renews the lease and lifts nothing.
 #[test]
-fn the_quota_ramps_at_the_first_re_proof() {
+fn the_quota_ramps_at_the_first_yearly_re_proof() {
     let policy = Policy {
         bytes_new: 1_000,
         bytes_full: 4_000,
+        lease_ms: 60 * MINUTE,
         ..minutes()
     };
     let mut space = Space::new(policy);
@@ -931,7 +935,79 @@ fn the_quota_ramps_at_the_first_re_proof() {
         Err(PersonalError::Quota)
     );
     space.renew(device(0).nullifier, agent).unwrap();
+    assert_eq!(
+        space.agent(agent).push(0, envelope(scope(1), 0, 2, 900)),
+        Err(PersonalError::Quota),
+        "a re-proof at once"
+    );
+    space.pass(50 * MINUTE);
+    space.renew(device(0).nullifier, agent).unwrap();
     let home = space.agent(agent);
     home.push(0, envelope(scope(1), 0, 2, 900)).unwrap();
     home.push(0, envelope(scope(1), 0, 3, 900)).unwrap();
+}
+
+/// An owner digest for `seed`, apart from every [`member`].
+fn owner(seed: u32) -> Digest {
+    tree::digest(&[seed, 1, 2, 3, 4, 5, 6, 7])
+}
+
+/// A person's limit.
+const LIMIT: u8 = 2;
+const REPLACEMENTS: u8 = tree::REPLACEMENTS;
+
+/// B13 at a home that is the user's own space: a person of limit 2 whose
+/// device enrolls a new device, which claims a pooled agent under its own
+/// nullifier, and revokes it, again and again, takes at most its
+/// enrollments of the period's agents, its limit and its replacements;
+/// the rest of the pool stays.
+#[test]
+fn device_churn_takes_no_more_agents_than_the_persons_enrollments() {
+    let mut space = Space::new(minutes());
+    space.make(20);
+    let owned = |space: &mut Space, name: &str, arguments: Vec<u8>| -> Run {
+        space.nonce += 1;
+        let mut binding = [0x3c; 32];
+        binding[..8].copy_from_slice(&space.nonce.to_le_bytes());
+        let call = CredentialedInput {
+            origin: Principal::Owner(owner(1)),
+            instance: CREDENTIALS,
+            method: method(&space.credentials, name),
+            arguments,
+            binding,
+            expires_ms: space.now + 60_000,
+            claim: tree::OwnerClaim {
+                owner: owner(1),
+                binding,
+            }
+            .encode(),
+            kernel: method(&space.credentials, "owner"),
+            format: vos_wire::defaults::DEVICE_FORMATS[0].0,
+        };
+        space.step(Input::Credentialed(Box::new(call)))
+    };
+    space
+        .operate::<u32, CredentialError>(CREDENTIALS, "enroll", member(1))
+        .unwrap();
+    space
+        .operate::<(), CredentialError>(CREDENTIALS, "register", (member(1), owner(1), LIMIT))
+        .unwrap();
+    space.claim(1).unwrap();
+    let mut claimed = 1u32;
+    for device in 2..20 {
+        let enrolled = owned(
+            &mut space,
+            "enroll_device",
+            (member(device), owner(device)).encode(),
+        );
+        if answer::<u32, CredentialError>(&enrolled.outcome).is_err() {
+            break;
+        }
+        space.claim(device).unwrap();
+        claimed += 1;
+        let revoked = owned(&mut space, "revoke_device", member(device).encode());
+        answer::<(), CredentialError>(&revoked.outcome).unwrap();
+    }
+    assert_eq!(claimed, u32::from(LIMIT + REPLACEMENTS));
+    assert_eq!(space.tally().pooled, 20 - claimed);
 }

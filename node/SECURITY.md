@@ -90,9 +90,9 @@ frame checks and the agent's placement come first, as for any call):
     verification on every such probe;
 15. for auth, the root is in the credential actor's ring (`RootUnknown`,
     retryable: an honest member meets it on a lagging replica, after a
-    later write replaced its root at the same batch time, or once 64 later
-    roots pushed it out; it reads the tree's feed again or asks another
-    replica);
+    later write of the same batch replaced its root (each batch takes a
+    time of its own, past the one before), or once 64 later roots pushed
+    it out; it reads the tree's feed again or asks another replica);
 16. for auth, the root is the ring's newest or was superseded at most
     `ROOT_MAX_AGE` (10 minutes) before this replica's latest batch time
     (`RootStale`, final);
@@ -155,7 +155,11 @@ whatever the kernel does: the binding, the replay and the claim's cap.
 ## At apply
 
 Every replica applies a credentialed input by the batch's time: refused,
-writing nothing, if it has expired, if its binding digest is recorded
+writing nothing, if it has expired, if its proof's device format is one
+the release does not admit or the release or the agent's log retired
+(`Format`: the input carries its format, so a replica whose configuration
+admits more verifies such a proof for nothing), if its binding digest is
+recorded
 (`Replayed`, without the first call's outcome), for auth if its root is not
 fresh by the batch's time (`StaleRoot`), or for a `once` guard if the
 nullifier is admitted (`Once`). Otherwise the binding digest is recorded
@@ -169,6 +173,11 @@ proven calls (`defaults::BATCH_CREDENTIALED`). So:
   ingresses, the second is refused at apply;
 - **a revocation binds every replica** within `ROOT_MAX_AGE` of the
   revoking batch, whatever a lagging replica's ingress admitted;
+- **a format's retirement binds every replica,** whatever one node's
+  ingress admits (`Admin::RetireFormat`, through the agent's log);
+- **a resend past the expiry is answered the run:** a replica whose
+  forward's earlier send ran is answered that run when a later send is
+  refused `CredentialExpired`, not the refusal;
 - **a refused vote is not a cast vote:** a handler that fails leaves its
   member free to try again with a new proof (its binding stays recorded).
 
@@ -193,8 +202,8 @@ serve its requests:
 - **A re-read after `RootUnknown`** precedes the proof that retries the
   call, at a time drawn below 10 s after the refusal, so that read's time
   links to that proof's. It happens only when the replica's ring does not
-  hold the proof's root: a lagging replica, a root replaced at its
-  own batch time, or 64 tree-changing batches within one timer period
+  hold the proof's root: a lagging replica, or 64 tree-changing batches
+  within one timer period
   (about 1.4 a second, for 45 s), past which the library halves its
   period for the space's pace.
 - **From the log:** each auth call's scope and nullifier (a pseudonym's

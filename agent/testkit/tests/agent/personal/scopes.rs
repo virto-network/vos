@@ -140,7 +140,7 @@ fn checkpoint_acknowledgements_are_stored_and_read() {
 /// half the agent's while it has another device, bound pushes; a full
 /// quota still takes a removal, the commit carrying it, the votes and
 /// `alive`, so no device blocks its own removal by filling it; a re-proof
-/// raises the bytes held.
+/// five sixths of a lease after the claim raises the bytes held.
 #[test]
 fn quotas_bound_pushes_and_exempt_what_removes_a_device() {
     let policy = Policy {
@@ -150,6 +150,7 @@ fn quotas_bound_pushes_and_exempt_what_removes_a_device() {
         commits_per_day: 3,
         probation_ms: HOUR_MS,
         operation_delay_ms: HOUR_MS,
+        lease_ms: 2 * HOUR_MS,
         ..Policy::DEFAULT
     };
     let mut home = Home::with(policy);
@@ -193,6 +194,7 @@ fn quotas_bound_pushes_and_exempt_what_removes_a_device() {
         "the bytes held still"
     );
     // A re-proof raises the bytes held; the envelopes a day still bound.
+    home.pass(45 * 60_000);
     home.call::<Recorded>(HOMES, "renew", ()).unwrap();
     for n in 30..34 {
         home.push(0, envelope(scope(1), 4, n, 100)).unwrap();
@@ -203,6 +205,7 @@ fn quotas_bound_pushes_and_exempt_what_removes_a_device() {
         "twelve envelopes a day"
     );
     home.pass(DAY);
+    home.call::<Recorded>(HOMES, "renew", ()).unwrap();
     home.push(0, envelope(scope(1), 4, 35, 100)).unwrap();
 }
 

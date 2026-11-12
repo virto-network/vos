@@ -319,9 +319,17 @@ proves and the kernel's claim.
     `CredentialGuard::Auth`. Each of a member's devices holds a secret of
     its own (`light-node.md` E2), so a leaf and a nullifier of its own:
     `once` admits a member **once a device** [decided], which the space's
-    chrome states; a member with three devices votes three times. One
-    admission a person, a ring of person leaves, is later work
-    (`light-node.md` §9.3).
+    chrome states; a member with three devices votes three times. A
+    device revoked and another enrolled is a fresh leaf and a fresh
+    nullifier, so what bounds a person's admissions is the count of its
+    enrollments (§6), not the devices it holds: its devices of a year,
+    those it held as the year began and those it enrolled in it, at most
+    its limit and `REPLACEMENTS` (2) [decided]. Periods are fixed blocks
+    of batch time, so a person of limit 3 is admitted at most five times
+    in a scope within one period, and at most nine (twice its limit and
+    three) in one that spans a period's end: it may hold one device as the
+    period ends and enroll its limit and one more in the next. One admission a person, a ring of
+    person leaves, is later work (`light-node.md` §9.3).
 - **Ingress's checks, in order,** each cheap one before any dearer, every
   state read on this replica's applied state; each refusal is
   `Rejected(Credential(code))` (index 9 of `Rejection`), `code` a
@@ -346,7 +354,7 @@ proves and the kernel's claim.
   | 12 | the claim's `binding` is `C(T(binding), W(b))` of this request, `b` under one of the window's programs | `Binding`, 7 | 403 |
   | 13 | `b` is not recorded | `Replayed`, 8 | 409 |
   | 14 | auth with `once`: `(scope, nullifier)` not recorded | `Once`, 9 | 409 |
-  | 15 | auth: `map_root` is in the credential actor's ring | `RootUnknown`, 10 (`RootRefusal::Unknown`): retryable, read the tree's feed again, or ask another replica; an honest member meets it on a replica's lag, a root replaced at its own batch time, or one past the ring's 64 entries (§6) | 503 |
+  | 15 | auth: `map_root` is in the credential actor's ring | `RootUnknown`, 10 (`RootRefusal::Unknown`): retryable, read the tree's feed again, or ask another replica; an honest member meets it on a replica's lag, a root a later write of its own batch replaced (each batch's time is past the one before), or one past the ring's 64 entries (§6) | 503 |
   | 16 | auth: `map_root` is the ring's newest, or was superseded at most `ROOT_MAX_AGE` before the replica's latest applied batch time | `RootStale`, 11 | 403 |
   | 17 | a verification slot is free: fewer verifications in flight than the node's budget (by default twice its executor threads) | `Busy` (not a credential code) | 503 |
   | 18 | on an executor, the proof's interaction PoW holds over its leading fields before it is decoded; then it decodes and verifies under the program the binding names against `H_io` of the claim | `Proof`, 12 | 403 |
@@ -360,8 +368,10 @@ proves and the kernel's claim.
   connections and its verification budget.
 - **The log carries** `Input::Credentialed` (index 10 of the batch's
   `Input`: the session-less kind, which anonymous inputs of a shared
-  pool (§8) will also take), never the proof, the nonce or the format;
-  a log entry grows by at most the claim's cap:
+  pool (§8) will also take), never the proof or the nonce, and the
+  device format the proof was verified under, so that every replica, not
+  only the one that verified it, judges whether the format is retired; a
+  log entry grows by at most the claim's cap:
 
   ```rust
   pub struct CredentialedInput {
@@ -372,10 +382,22 @@ proves and the kernel's claim.
       pub binding: [u8; 32],           // b
       pub expires_ms: u64,
       pub claim: Vec<u8>,              // the kernel's public arguments
+      pub kernel: MethodId,            // the kernel the proof is of
+      pub format: u32,                 // the device format verified under
   }
   ```
 - **At apply** (refine, in the batch's order, at the batch's time `t`):
   1. `expires_ms < t`: refused, `Refusal::CredentialExpired` (7);
+     after the binding's check (2), the device format one the release
+     does not admit
+     (`defaults::DEVICE_FORMATS`, 47 alone, 46 retired at once), or
+     past its release's date or the date the agent's log retired it at
+     (`Admin::RetireFormat`, the operator's `Retire::Format` for an
+     agent, one call for each agent that takes proven calls): refused,
+     `Refusal::Format` (11). A node's configuration
+     narrows what its own ingress admits and never what the space
+     runs: a replica admitting a retired format verifies its proofs for
+     nothing [decided];
   2. `b` recorded: refused, `Refusal::Replayed` (8);
   3. auth: the claim's `map_root` neither the ring's newest nor
      superseded at most `ROOT_MAX_AGE` before `t`: refused,
@@ -407,8 +429,9 @@ proves and the kernel's claim.
   change) is no duplicate: each log entry carries, beside its work
   result and under no proof, the origin of each proven input, the
   replica that took it at its ingress and its forward's token. When a
-  later send is refused `Replayed` and the replica applied the run of
-  an entry naming it and that token, its client is answered that run.
+  later send is refused `Replayed`, or `CredentialExpired` after the
+  call's expiry passed under a resend, and the replica applied the run
+  of an entry naming it and that token, its client is answered that run.
   Any other copy (another replica's, another client's) is answered
   `Replayed`, and so is the replica's own resend when a snapshot, not
   the entry, brought it the run.
@@ -610,6 +633,27 @@ across a space's agents wait for the identity agent above.
     - `limit(member, limit)`, role `registrar`: the limit of `member`'s
       person; devices past it stay, and the person enrolls none until it
       is below;
+    - **the enrollment count** [decided]: a person's devices of the
+      enrollment period (`ENROLLMENT_PERIOD_MS`, a year of batch time,
+      the span between a home's re-proofs), those it held as the period
+      began and those it enrolled in it, are at most its limit and
+      `REPLACEMENTS` (2), past which `enroll_device` is refused
+      (`Enrollments`); `reset(member)`, role `registrar`, starts the count
+      again from the devices the person holds. The year and the two follow
+      the design's own numbers: a phone is retired every few years
+      (`light-node.md` §3.8), so two replacements a year cover a retired
+      phone and a lost one with room to spare, and a third goes through the
+      registrar's ordinary process, as a lost last phone does. Without it,
+      revoking a device and enrolling another gives a person a fresh
+      nullifier at each round, so a `once` guard admits it without bound
+      and a home that is the user's own space hands it a pooled agent at
+      each round;
+    - `revoke_person(member)`, role `registrar`: every device of
+      `member`'s person revoked, as `revoke` revokes one, in one tree
+      write, and the person with them (`NoPerson` for a member of none):
+      the expulsion, which no device of the person outruns, as it would
+      a revocation of one device at a time by enrolling another while the
+      person is under its limit;
     - `enroll_device(member, owner) → slot`, under
       `#[msg(credential = Owner)]`: the caller's confirmed owner digest
       names its person (`NoPerson` for none), which enrolls `member` as a
@@ -619,10 +663,17 @@ across a space's agents wait for the identity agent above.
       a member or an owner digest a person holds or awaits (`Held`), are
       refused; and `owner` acts for the person only once its own proof
       confirms it, so a person cannot take another's owner digest, public
-      in the ledger's log, and with it that member's later enrollments;
-    - `confirm_device()`, under `#[msg(credential = Owner)]`: the added
-      device's own proof, its owner digest awaited (`NoPerson` for none),
-      confirmed; the pairing's one more prompt a space (`light-node.md`
+      in the ledger's log, and with it that member's later enrollments. An
+      owner digest awaits its confirmation for `CONFIRM_MS` (a day): past
+      it, another enrollment naming the digest takes it, so a person that
+      names another member's digest for a device of its own holds it from
+      that member's own person a day at most, each such hold spending one
+      of its enrollments;
+    - `confirm_device(member)`, under `#[msg(credential = Owner)]`: the
+      added device's own proof, its owner digest awaited beside `member`,
+      its own member digest, in the awaiting person (`NoPerson` for none),
+      confirmed, so an enrollment that took a late digest for another
+      member joins the device to no person; the pairing's one more prompt a space (`light-node.md`
       §3.8);
     - `revoke_device(member)`, under `#[msg(credential = Owner)]`: a
       device of the caller's person (`NotYours` for any other), the
@@ -645,7 +696,7 @@ across a space's agents wait for the identity agent above.
     with a key drawn for it alone.
 - **Its cost:** 33 calls of `0x402` an enrollment (32 a revocation, whose
   leaf is the empty one; an `enroll_many` shares the nodes its members
-  have in common), each 2,400 gas to the actor. The VOS host serves it
+  have in common), each 3,000 gas to the actor. The VOS host serves it
   natively and a JAM-deployed agent through the shim's software
   permutation (about 37,600 gas), so the tree is a function of its writes
   on both. The rows dominate: an enrollment costs the actor about 4.1M

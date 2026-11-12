@@ -45,15 +45,28 @@
 //! revokes any of the person's, `revoke_device(member)`. The digests it
 //! names are its word, so a member or an owner digest any person holds, an
 //! enrolled member and an invited one are refused, and the new owner digest
-//! acts for the person only once its own proof confirms it
-//! (`confirm_device`): owner digests are public in a ledger's log, and no
-//! person takes another's. No query answers a person; the registrar and
-//! the space's operators, who read its rows and the calls, link its
-//! devices.
+//! acts for the person only once its own proof confirms it beside its own
+//! member digest (`confirm_device(member)`): owner digests are public in a ledger's log, and no
+//! person takes another's. A digest awaiting its confirmation is held for
+//! [`CONFIRM_MS`]; past that another enrollment may name it, so no person
+//! keeps another's digest from its own person. No query answers a person;
+//! the registrar and the space's operators, who read its rows and the
+//! calls, link its devices.
+//!
+//! **A person's enrollments are counted:** its devices of a year
+//! ([`ENROLLMENT_PERIOD_MS`]), those it held as the year began and those
+//! it enrolled in it, are at most its limit and [`REPLACEMENTS`], past
+//! which `enroll_device` is refused until the next year or the registrar's
+//! `reset`. A device revoked and another enrolled gives a fresh leaf and a
+//! fresh nullifier, so the count, not the devices held, is what bounds a
+//! person's pseudonyms in a scope. The registrar expels a person whole
+//! with `revoke_person`, every device in one write.
 //!
 //! **`once`** admits a nullifier once in its scope, and each device's
 //! secret gives it its own: a guard under `once` admits a member once a
-//! device, which the space's chrome states.
+//! device, which the space's chrome states: a person at most its limit
+//! and its replacements times in a scope within one period, and twice its
+//! limit and three in one spanning a period's end.
 //!
 //! **The stock kernels** (`light-node.md` §4.2): `auth` and `owner`, the
 //! device kernels every space gets with this actor, written with the SDK
@@ -73,9 +86,9 @@ use alloc::collections::BTreeMap;
 use vos_sdk::p2::{self, InPlace, Secret, Tag, TagHash};
 use vos_sdk::prelude::*;
 use vos_wire::credentials::{
-    self as tree, Change, CredentialError, DEPTH, Digest, EMPTY, ENROLL_MANY, FEED_BYTES, Feed,
-    MAX_DEVICES, MAX_DIFFICULTY, MAX_ONIONS, Onion, Open, Path, Ring, RootEntry, Siblings, Words,
-    tables::RING_KEY,
+    self as tree, CONFIRM_MS, Change, CredentialError, DEPTH, Digest, EMPTY, ENROLL_MANY,
+    ENROLLMENT_PERIOD_MS, FEED_BYTES, Feed, MAX_DEVICES, MAX_DIFFICULTY, MAX_ONIONS, Onion, Open,
+    Path, REPLACEMENTS, Ring, RootEntry, Siblings, Words, tables::RING_KEY,
 };
 
 /// The open claim's terms and the current period's count.
@@ -111,11 +124,27 @@ pub struct Device {
 }
 
 /// A person's record: its devices, at most `limit`, the first the one the
-/// registrar registered.
+/// registrar registered; and its devices of the enrollment period
+/// `period` ([`ENROLLMENT_PERIOD_MS`]), those it held as the period began
+/// and those it enrolled in it, at most `limit` and [`REPLACEMENTS`].
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Person {
     pub limit: u8,
     pub devices: Vec<Device>,
+    pub period: u64,
+    pub enrolled: u8,
+}
+
+impl Person {
+    /// The count moved to the period of `now`, if that is a later one:
+    /// the devices held, carried into it.
+    fn roll(&mut self, now: u64) {
+        let period = now / ENROLLMENT_PERIOD_MS;
+        if period != self.period {
+            self.period = period;
+            self.enrolled = self.devices.len() as u8;
+        }
+    }
 }
 
 /// Auth's claim, the stock `auth` kernel's public arguments: the member's
@@ -186,7 +215,9 @@ pub struct Credentials {
     opening: Table<u8, Opening>,
     persons: Table<u32, Person>,
     owners: Table<Digest, u32>,
-    pending: Table<Digest, u32>,
+    /// Each owner digest an enrollment named, its person's, until its
+    /// confirmation or, past the time kept with it, another enrollment.
+    pending: Table<Digest, (u32, u64)>,
     devices: Table<Digest, u32>,
     people: Table<u8, u32>,
     onions: Table<u8, Vec<Onion>>,
@@ -456,6 +487,8 @@ impl Credentials {
         let person = Person {
             limit,
             devices: Vec::new(),
+            period: ctx.now() / ENROLLMENT_PERIOD_MS,
+            enrolled: 1,
         };
         self.seat(id, person, Device { member, owner });
         self.owners.insert(&owner, &id);
@@ -477,6 +510,50 @@ impl Credentials {
         Ok(())
     }
 
+    /// Start the count of `member`'s person's devices of the period again
+    /// from those it holds now: the registrar's word, for a person whose
+    /// replacements ran out.
+    #[msg(role = "registrar")]
+    pub async fn reset(
+        &mut self,
+        ctx: &mut Command<Self>,
+        member: Digest,
+    ) -> Result<(), CredentialError> {
+        self.founded()?;
+        let id = self.devices.get(&member).ok_or(CredentialError::NoPerson)?;
+        let mut person = self.persons.get(&id).expect("a device's person");
+        person.period = ctx.now() / ENROLLMENT_PERIOD_MS;
+        person.enrolled = person.devices.len() as u8;
+        self.persons.insert(&id, &person);
+        Ok(())
+    }
+
+    /// Revoke every device of `member`'s person, as `revoke` revokes one,
+    /// in one write, and the person with them: an expulsion no device of
+    /// the person outruns by enrolling another.
+    #[msg(role = "registrar")]
+    pub async fn revoke_person(
+        &mut self,
+        ctx: &mut Command<Self>,
+        member: Digest,
+    ) -> Result<(), CredentialError> {
+        self.founded()?;
+        let id = self.devices.get(&member).ok_or(CredentialError::NoPerson)?;
+        let person = self.persons.get(&id).expect("a device's person");
+        let mut leaves = BTreeMap::new();
+        for device in &person.devices {
+            if let Ok(Some(slot)) = self.vacate(&device.member) {
+                leaves.insert(slot, EMPTY[0]);
+            }
+            self.forget(id, device);
+        }
+        self.persons.remove(&id);
+        if !leaves.is_empty() {
+            self.write(ctx.now(), leaves);
+        }
+        Ok(())
+    }
+
     /// Enroll `member` as a device of the person whose device proved the
     /// caller's owner digest, within the person's limit: its slot. Its
     /// leaf proves at once; `owner`, its owner digest, acts for the person
@@ -489,9 +566,14 @@ impl Credentials {
         owner: Digest,
     ) -> Result<u32, CredentialError> {
         self.founded()?;
-        let (id, person) = self.person_of(ctx.owner())?;
+        let now = ctx.now();
+        let (id, mut person) = self.person_of(ctx.owner())?;
+        person.roll(now);
         if person.devices.len() >= usize::from(person.limit) {
             return Err(CredentialError::Limit);
+        }
+        if person.enrolled >= person.limit.saturating_add(REPLACEMENTS) {
+            return Err(CredentialError::Enrollments);
         }
         let leaf = self.admit(&member)?;
         tree::words(&owner).ok_or(CredentialError::NotADigest)?;
@@ -499,23 +581,39 @@ impl Credentials {
             return Err(CredentialError::Invited);
         }
         self.unheld(&member, &owner)?;
-        if self.pending.contains(&owner) {
+        if self
+            .pending
+            .get(&owner)
+            .is_some_and(|(_, until)| now <= until)
+        {
             return Err(CredentialError::Held);
         }
         let slot = self.place(&member, true)?;
-        self.write(ctx.now(), BTreeMap::from([(slot, leaf)]));
+        self.write(now, BTreeMap::from([(slot, leaf)]));
+        person.enrolled += 1;
         self.seat(id, person, Device { member, owner });
-        self.pending.insert(&owner, &id);
+        self.pending
+            .insert(&owner, &(id, now.saturating_add(CONFIRM_MS)));
         Ok(slot)
     }
 
-    /// Confirm the caller's owner digest as its device's, named by an
-    /// `enroll_device`: from now on it acts for the person.
+    /// Confirm the caller's owner digest as its device's, `member` its own
+    /// member digest, named together by an `enroll_device`: from now on it
+    /// acts for the person. An enrollment that named the digest beside
+    /// another member, another person's, is no confirmation's.
     #[msg(credential = Owner)]
-    pub async fn confirm_device(&mut self, ctx: &mut Command<Self>) -> Result<(), CredentialError> {
+    pub async fn confirm_device(
+        &mut self,
+        ctx: &mut Command<Self>,
+        member: Digest,
+    ) -> Result<(), CredentialError> {
         self.founded()?;
         let owner = ctx.owner().ok_or(CredentialError::NoPerson)?;
-        let id = self.pending.get(&owner).ok_or(CredentialError::NoPerson)?;
+        let (id, _) = self.pending.get(&owner).ok_or(CredentialError::NoPerson)?;
+        let person = self.persons.get(&id).expect("a pending digest's person");
+        if !person.devices.contains(&Device { member, owner }) {
+            return Err(CredentialError::NoPerson);
+        }
         self.pending.remove(&owner);
         self.owners.insert(&owner, &id);
         Ok(())
@@ -701,32 +799,19 @@ impl Credentials {
     /// withdrawn; and the member dropped from its person, the person with
     /// it once it holds no device.
     fn unseat(&mut self, time: u64, member: &Digest) -> Result<(), CredentialError> {
-        if let Some(slot) = self.slots.get(member) {
-            self.slots.remove(member);
-            self.free.insert(&slot, &());
-            self.count -= 1;
+        if let Some(slot) = self.vacate(member)? {
             self.write(time, BTreeMap::from([(slot, EMPTY[0])]));
-        } else if self.invites.contains(member) {
-            self.invites.remove(member);
-        } else {
-            return Err(CredentialError::NotEnrolled);
         }
         if let Some(id) = self.devices.get(member) {
-            self.devices.remove(member);
             let mut person = self.persons.get(&id).expect("a device's person");
+            person.roll(time);
             let at = person
                 .devices
                 .iter()
                 .position(|device| device.member == *member)
                 .expect("a device in its person");
-            let owner = person.devices.remove(at).owner;
-            // A registration may have taken an unconfirmed owner digest.
-            if self.owners.get(&owner) == Some(id) {
-                self.owners.remove(&owner);
-            }
-            if self.pending.get(&owner) == Some(id) {
-                self.pending.remove(&owner);
-            }
+            let device = person.devices.remove(at);
+            self.forget(id, &device);
             if person.devices.is_empty() {
                 self.persons.remove(&id);
             } else {
@@ -734,6 +819,35 @@ impl Credentials {
             }
         }
         Ok(())
+    }
+
+    /// `member`'s slot freed, its leaf left to the caller's write, if it is
+    /// enrolled; else its invitation withdrawn.
+    fn vacate(&mut self, member: &Digest) -> Result<Option<u32>, CredentialError> {
+        if let Some(slot) = self.slots.get(member) {
+            self.slots.remove(member);
+            self.free.insert(&slot, &());
+            self.count -= 1;
+            Ok(Some(slot))
+        } else if self.invites.contains(member) {
+            self.invites.remove(member);
+            Ok(None)
+        } else {
+            Err(CredentialError::NotEnrolled)
+        }
+    }
+
+    /// `device` of the person `id` no longer indexed: its member, and its
+    /// owner digest where the person holds or awaits it (a registration,
+    /// or a later enrollment past its wait, may have taken it).
+    fn forget(&mut self, id: u32, device: &Device) {
+        self.devices.remove(&device.member);
+        if self.owners.get(&device.owner) == Some(id) {
+            self.owners.remove(&device.owner);
+        }
+        if self.pending.get(&device.owner).map(|(person, _)| person) == Some(id) {
+            self.pending.remove(&device.owner);
+        }
     }
 
     /// `member`'s leaf, for a member neither enrolled nor malformed.

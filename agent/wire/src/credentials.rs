@@ -44,6 +44,21 @@ pub const ENROLL_MANY: usize = 256;
 /// The most devices a person's limit admits.
 pub const MAX_DEVICES: u8 = 16;
 
+/// The period a person's enrollments are counted in: a year of batch
+/// time, the home's lease's span between re-proofs (`light-node.md` §3.3).
+pub const ENROLLMENT_PERIOD_MS: u64 = 365 * 24 * 3_600_000;
+
+/// The devices a person enrolls in a period past its limit: replacements
+/// of a lost or retired phone. Its devices of a period, those it held as
+/// the period began and those it enrolled in it, are at most its limit and
+/// these; the registrar's `reset` starts the count again.
+pub const REPLACEMENTS: u8 = 2;
+
+/// How long an owner digest an enrollment names awaits its device's
+/// confirmation before another enrollment may name it: a day of batch
+/// time, so no person holds another's digest from its own person.
+pub const CONFIRM_MS: u64 = 24 * 3_600_000;
+
 /// The most onions the space's set holds: one a gateway.
 pub const MAX_ONIONS: usize = 16;
 
@@ -871,6 +886,11 @@ pub enum CredentialError {
     /// own claim.
     #[codec(index = 18)]
     Invited = 18,
+    /// The person's devices of the period, its limit and its
+    /// [`REPLACEMENTS`], are spent: the next period, or the registrar's
+    /// `reset`, enrolls again.
+    #[codec(index = 19)]
+    Enrollments = 19,
 }
 
 /// The most leading zero bits an open claim's difficulty asks.

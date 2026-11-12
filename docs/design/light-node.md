@@ -445,7 +445,11 @@ user's other spaces.
   drained pool shows as `PoolEmpty` (§8, B11) rather than a full disk;
   and the **quota ramps:** a new agent holds 8 MiB, rising to 64 MiB after
   its first yearly re-proof, so a Sybil's first year costs the home an
-  eighth as much. Nothing an open member does reaches another user's
+  eighth as much. A re-proof lifts it only once five sixths of a lease
+  have passed since the claim, where the device's yearly prompt first
+  falls (the lease's last sixth): an earlier one renews the lease and lifts
+  nothing, so a Sybil cannot re-prove at once for the larger quota
+  [built, `Personal::renew`]. Nothing an open member does reaches another user's
   agent (known keys, gated queries, one agent a claim). The default home
   is run by Virto, listed in the app, its cap published [decided, E20];
   anyone may run another, and users may pick it.
@@ -1499,7 +1503,7 @@ at 18.
 - Garbage collection of covered envelopes is later work (§9.3).
 
 **Quotas** (per agent, the space's policy, enforced by `Personal`): bytes
-held (8 MiB for a new agent, 64 MiB after its first re-proof, §3.3),
+held (8 MiB for a new agent, 64 MiB after its first yearly re-proof, §3.3),
 envelopes and commits a day, inbox items.
 Admin-signed operations, the commits carrying matured ones, confirmations
 and `alive` are exempt, so no device can block its own removal by filling a
@@ -1832,8 +1836,9 @@ skip expired items, each write deletes a few; no timer).
   (the member secret's per-use prompt, since the keystore's HMAC is per
   handle and per use: a user in eight spaces answers eight prompts, and
   the chrome lets them defer any space), batched over Tor; then B calls
-  `confirm_device()` under its own owner proof, so its owner digest acts
-  for the person (B's prompt a space, on its own device). Those
+  `confirm_device(member)` under its own owner proof, naming its own
+  member digest, so its owner digest acts for the person (B's prompt a
+  space, on its own device). Those
   registrars never see the personal agent, so there is nothing to blur;
 - **in a home-only space,** B makes its own open claim (§3.3), in the
   background after pairing: no enrollment by A, no link, and no wait on
@@ -1860,6 +1865,27 @@ skip expired items, each write deletes a few; no timer).
   §9.1]: a member with three devices can vote three times where a space
   uses `once`, which the space's chrome states. A ring of person leaves is
   later work (§9.3).
+- **A person's enrollments are counted** [decided, built]: a device
+  revoked and another enrolled is a fresh leaf, so a fresh nullifier in
+  every scope, and the limit alone bounds the devices held, not the
+  pseudonyms a person makes by churning them. The credential actor counts
+  a person's devices of a year of batch time (`ENROLLMENT_PERIOD_MS`), those
+  it held as the year began and those it enrolled in it, and refuses
+  `enroll_device` past its limit and `REPLACEMENTS` (2), `Enrollments`,
+  until the next year or the registrar's `reset`. A year is the home's
+  span between re-proofs (§3.3), and two replacements a year are a retired
+  phone and a lost one, where the usual replacement is every few years
+  (below); a user past them asks the registrar, as a user with no device
+  left does. So a `once` scope within one period admits a person at most
+  its limit and two times, one spanning a period's end at most twice its
+  limit and three, and a home that is the user's own space hands it at
+  most its limit and two agents a period (§8.2 B13). The registrar expels a person whole
+  with `revoke_person`, every device in one write
+  (`identity-and-authority.md` §6). The gates:
+  `agent/testkit/tests/agent/credentialed.rs`'s
+  `a_persons_device_churn_is_held_to_its_enrollments_of_the_period` and
+  `agent/testkit/tests/agent/homes.rs`'s
+  `device_churn_takes_no_more_agents_than_the_persons_enrollments`.
 
 **Removing a device** is §3.5's removal and, in every space other than the
 home, `revoke_device` at once from another device, on its prompt.
@@ -2434,12 +2460,19 @@ format, the chips, the sizes and the root.
     earlier date, **now** included, when a version is found unsound
     (`Kind::Retire`, `Admin::Retire`, through the agent's log, so every
     replica agrees; `vos agent retire`); a date is never moved later.
-  - **The formats' window** is each node's: the device formats its binary
-    verifies, at most two, the previous one retiring at the date its
-    release set (60 days after the release that brought the next), or any
-    earlier date the operator sets at that node (`Config::retired_formats`,
-    or `Kind::Retire`'s `Format`, live until a restart). A proof of a
-    retired format is refused `Format` before anything is decoded.
+  - **The formats' window** is the release's, held at apply: the device
+    formats its binary verifies, at most two, the previous one retiring at
+    the date its release set (60 days after the release that brought the
+    next), or any earlier date the operator sets in an agent's log
+    (`Kind::Retire`'s `Format` for that agent, `Admin::RetireFormat`, so
+    every replica agrees and a restart keeps it; one call for each agent
+    that takes proven calls). A proof of a retired
+    format is refused `Format` at ingress before anything is decoded, and
+    the proven input carries its format, so apply refuses it on every
+    replica too (`Refusal::Format`): a node whose configuration admits
+    more (`Config::device_formats`, a test's) or retires earlier
+    (`Config::retired_formats`) only changes what its own ingress takes,
+    never what the space runs [decided].
   - **The proof names its program:** ingress computes the binding under
     each program the window admits, and the request's binding must be one
     of them; a proof of a retired or unknown release is refused
@@ -3891,7 +3924,13 @@ replies. (8.14)
 
 **B13. A user's second device claims a second agent** (its nullifier
 differs under E2, so `Homes` cannot tell). *Mitigation:* the chrome
-refuses a claim on a device that already holds an archive. (8.23a)
+refuses a claim on a device that already holds an archive (8.23a). A
+person that churns devices instead, revoking one and enrolling another
+for a fresh nullifier at each round, is held to its enrollments of the
+year at a home that is the user's own space: its limit and two
+replacements (§3.8), so at most that many agents a period, each lapsing
+13 months after its last re-proof, which a revoked leaf cannot make. At a
+home-only space each device's open claim is under the period's cap.
 
 **B14. A member is expelled, or stops re-proving.** *Mitigation:* the
 lease lapses 13 months after the last re-proof; the agent then refuses

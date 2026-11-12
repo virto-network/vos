@@ -1,6 +1,8 @@
 //! A proven call's step (`identity-and-authority.md` §5's apply rule, at
 //! the batch's time): refused, writing nothing, when it expired, when its
-//! binding digest is recorded, when a stock auth claim's root is not
+//! binding digest is recorded, when its proof's device format is retired,
+//! by the release or the agent's log, whatever the node that verified it
+//! admits, when a stock auth claim's root is not
 //! fresh, or when a `once` guard admitted its nullifier; else its binding
 //! digest is recorded, whatever the method then does, and the method runs
 //! as the call's origin, a `once` guard's nullifier recorded only when the
@@ -42,8 +44,15 @@ pub(crate) fn credentialed(base: &Base, index: u32, call: CredentialedInput) -> 
     if call.expires_ms < base.time {
         return refused(Refusal::CredentialExpired);
     }
+    // After the binding: a resend of a call that ran before its format
+    // was retired is `Replayed`, and its forwarder answers the run.
     if base.holds(&keys::binding(&call.binding)) {
         return refused(Refusal::Replayed);
+    }
+    match admitted(base, call.format) {
+        Ok(true) => {}
+        Ok(false) => return refused(Refusal::Format),
+        Err(Corrupt) => return Stepped::ran(consumed(input, Outcome::failed(Failure::Trapped))),
     }
     let (guard, kernel) = guard(base, call.instance, call.method);
     // A stock auth claim's root, its first digest: ingress checked the
@@ -150,6 +159,22 @@ fn guard(
         _ => None,
     };
     (guard, kernel)
+}
+
+/// Whether device format `format` is admitted at the batch's time: one the
+/// release admits, before its release's date and its log's.
+fn admitted(base: &Base, format: u32) -> Result<bool, Corrupt> {
+    let Some((_, released)) = defaults::DEVICE_FORMATS
+        .iter()
+        .find(|(number, _)| *number == format)
+    else {
+        return Ok(false);
+    };
+    let logged = base.decoded::<u64>(&keys::format_retired(format))?;
+    Ok([*released, logged]
+        .into_iter()
+        .flatten()
+        .all(|date| date > base.time))
 }
 
 /// The agent's space, when it has one.

@@ -12,8 +12,9 @@
 //!   never for a pairing cut short, each until it is made or dropped, so
 //!   the chrome may defer any space to a later prompt.
 //! - **Confirmed by the joiner** ([`expect`]): once its
-//!   leaf is in a space's tree, the joiner calls `confirm_device()` under
-//!   its own owner proof there, so its owner digest acts for the person.
+//!   leaf is in a space's tree, the joiner calls `confirm_device(member)`
+//!   under its own owner proof there, naming its own member digest, so its
+//!   owner digest acts for the person.
 //! - **The credential book:** each device's handle in each space, as the
 //!   registrar's person record holds it ([`handles_of`] reads what the
 //!   opener offers and what a retired device's revocations name,
@@ -140,11 +141,15 @@ pub fn confirmations(store: &Store) -> Result<Vec<Membership>, StoreError> {
     rows(store, CONFIRM)
 }
 
-/// The registrar's `confirm_device()` in `membership`'s space, to prove
-/// under this device's owner secret there once its leaf is in the tree
-/// (its `path` answered).
-pub fn confirm_call(membership: &Membership, expires_ms: u64) -> Result<Call, DeviceError> {
-    membership.call("confirm_device", ().encode(), expires_ms)
+/// The registrar's `confirm_device(member)` in `membership`'s space,
+/// `member` this device's member digest there, to prove under its owner
+/// secret there once its leaf is in the tree (its `path` answered).
+pub fn confirm_call(
+    membership: &Membership,
+    member: &[u8; 32],
+    expires_ms: u64,
+) -> Result<Call, DeviceError> {
+    membership.call("confirm_device", member.encode(), expires_ms)
 }
 
 /// The confirmation in `membership` made: no longer owed.

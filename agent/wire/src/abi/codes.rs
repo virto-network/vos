@@ -147,6 +147,11 @@ codes! {
         /// An auth call of a `once` guard whose nullifier its scope has
         /// admitted.
         Once = 10,
+        /// A credentialed call whose proof's device format the release, or
+        /// the agent's log, retired by the batch's time
+        /// ([`crate::defaults::DEVICE_FORMATS`],
+        /// [`crate::keys::format_retired`]).
+        Format = 11,
     }
 }
 

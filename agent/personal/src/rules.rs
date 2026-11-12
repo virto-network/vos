@@ -83,6 +83,7 @@ impl Personal {
             &Lease {
                 until: now.saturating_add(lease_ms),
                 reproved: false,
+                claimed: now,
             },
         );
         self.seen.insert(&first, &now);

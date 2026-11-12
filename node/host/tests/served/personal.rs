@@ -809,7 +809,8 @@ fn a_personal_space_is_claimed_paired_and_its_first_phone_retired() {
     );
     let owed = memberships::confirmations(second.light.store()).unwrap();
     assert_eq!(owed, vec![membership.clone()]);
-    let call = memberships::confirm_call(&owed[0], expires(&mut sockets)).unwrap();
+    let mine = vos_light::member(&second.secret(&CLUB_HANDLE)).to_bytes();
+    let call = memberships::confirm_call(&owed[0], &mine, expires(&mut sockets)).unwrap();
     let proof = prover
         .prove_owner(&second.secret(&CLUB_HANDLE), &call, &owner_kernel)
         .unwrap();

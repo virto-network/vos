@@ -577,6 +577,9 @@ impl Inner {
                             .replayed(run, agent, &call, until, watch.as_ref())
                             .await;
                     }
+                    Some(Response::Refused(Refusal::CredentialExpired)) if sent > 1 => {
+                        return self.expired(run, agent, &call, until, watch.as_ref()).await;
+                    }
                     Some(answer) => return answer,
                 }
                 continue;
@@ -670,6 +673,11 @@ impl Inner {
                         .replayed(run, agent, &call, until, watch.as_ref())
                         .await;
                 }
+                // A credentialed call past its expiry, about one send of
+                // several: an earlier one may have run before it.
+                Some((_, Response::Refused(Refusal::CredentialExpired))) if sent > 1 => {
+                    return self.expired(run, agent, &call, until, watch.as_ref()).await;
+                }
                 Some((_, answer)) => return answer,
             }
         }
@@ -689,15 +697,41 @@ impl Inner {
         watch: Option<&Watch<'_>>,
     ) -> Response {
         match call {
-            Forwardable::Credentialed(call) => self.recorded(run, agent, call, until, watch).await,
+            Forwardable::Credentialed(call) => {
+                self.recorded(run, agent, call, until, watch, Refusal::Replayed)
+                    .await
+            }
             Forwardable::Call(_) => Response::Refused(Refusal::Replayed),
         }
     }
 
+    /// The answer to a forwarded credentialed call apply refused
+    /// `CredentialExpired` after an earlier send, by `until`: the run of
+    /// one of its own sends `watch` saw, once applied; `Replayed` if
+    /// another copy ran; else `CredentialExpired`, nothing of it having
+    /// run.
+    async fn expired(
+        &self,
+        run: &Arc<Run>,
+        agent: AgentId,
+        call: &Forwardable,
+        until: Instant,
+        watch: Option<&Watch<'_>>,
+    ) -> Response {
+        match call {
+            Forwardable::Credentialed(call) => {
+                self.recorded(run, agent, call, until, watch, Refusal::CredentialExpired)
+                    .await
+            }
+            Forwardable::Call(_) => Response::Refused(Refusal::CredentialExpired),
+        }
+    }
+
     /// The run `watch` saw of `call` apply here, once applied; else
-    /// `Replayed`, once this replica has applied `call`'s binding record,
-    /// or a batch past its expiry (by then the run is applied here, and its
-    /// record may be swept), by `until`.
+    /// `Replayed`, once this replica has applied `call`'s binding record;
+    /// else `unrecorded`, once it has applied a batch past its expiry with
+    /// no record (by then a run is applied here, and its record may be
+    /// swept), by `until`.
     async fn recorded(
         &self,
         run: &Arc<Run>,
@@ -705,6 +739,7 @@ impl Inner {
         call: &CredentialedInput,
         until: Instant,
         watch: Option<&Watch<'_>>,
+        unrecorded: Refusal,
     ) -> Response {
         let key = keys::binding(&call.binding);
         loop {
@@ -716,7 +751,12 @@ impl Inner {
                 .map_err(Fault::from)
                 .and_then(|held| {
                     let time = read::<u64>(&snapshot, agent, &keys::batch_time())?;
-                    Ok(held.is_some() || time.is_some_and(|time| time > call.expires_ms))
+                    let past = time.is_some_and(|time| time > call.expires_ms);
+                    Ok(match held {
+                        Some(_) => Some(Refusal::Replayed),
+                        None if past => Some(unrecorded),
+                        None => None,
+                    })
                 });
             let Ok(held) = held else {
                 return Response::Unavailable;
@@ -726,8 +766,11 @@ impl Inner {
             match watch.and_then(Watch::ran) {
                 Some((outcome, at)) if applied >= at => return Response::Ran { outcome, at },
                 Some(_) => {}
-                None if held => return Response::Refused(Refusal::Replayed),
-                None => {}
+                None => {
+                    if let Some(refusal) = held {
+                        return Response::Refused(refusal);
+                    }
+                }
             }
             let left = until.saturating_duration_since(Instant::now());
             if left.is_zero() {
