@@ -527,6 +527,35 @@ fn an_admin_key_replacement_keeps_the_seasoning() {
     );
 }
 
+/// E29: a replacement contested and resolved upheld still waits out the
+/// new key's probation: the new key signs nothing before it, and the
+/// replacement matures at its own time.
+#[test]
+fn a_resolved_replacement_keeps_its_probation() {
+    let mut home = seasoned(2);
+    let replacement = home
+        .operate(admin(0), "replace", (1u32, new_admin(1)))
+        .unwrap();
+    home.operate(admin(1), "veto", replacement).unwrap();
+    assert_eq!(state(&home, sync(0), replacement), OpState::Contested);
+    home.operate(KIT, "resolve", (replacement, true)).unwrap();
+    assert!(
+        !matured(state(&home, sync(0), replacement)),
+        "upheld, in its probation"
+    );
+    let replaced = Principal::Client(new_admin(1).key);
+    home.pass(MINUTE);
+    assert_eq!(
+        home.operate(replaced, "remove", 0u32),
+        Err(PersonalError::NotAdmitted),
+        "the new key signs nothing in its probation"
+    );
+    home.pass(2 * MINUTE);
+    home.wake(sync(0)).unwrap();
+    assert!(matured(state(&home, sync(0), replacement)));
+    assert_eq!(view(&home, sync(0), 1).device.keys.admin, new_admin(1).key);
+}
+
 /// Rule 1, A18: a delayed admin's add is an operation that waits and can
 /// be contested, then a commit carries it; it never adds inline.
 #[test]

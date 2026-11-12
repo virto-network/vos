@@ -212,6 +212,9 @@ impl Personal {
     // ===== The home's =====
 
     /// Set the space's policy for this agent: delays, windows and quotas.
+    /// Once a claim assigned the agent, a configuration lowers no delay or
+    /// window of the device set's rules ([`Policy::over`]): those are the
+    /// claim's.
     #[msg(role = "homes")]
     pub async fn configure(
         &mut self,
@@ -219,6 +222,11 @@ impl Personal {
         policy: Policy,
     ) -> Result<Recorded, PersonalError> {
         let now = ctx.now();
+        let policy = if self.assigned().is_ok() {
+            policy.over(&self.policy())
+        } else {
+            policy
+        };
         self.policy.insert(&ONE, &policy);
         let index = self.append(now, Body::Configured(policy));
         Ok(Recorded { at: now, index })
