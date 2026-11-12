@@ -1,0 +1,82 @@
+// SPDX-FileCopyrightText: 2026 Virto
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+// The facility's Android library, `team.virto.vos:facility`: its `:vos`
+// process (`team.virto.s4.vos`: the service, the background job, its
+// notices), the personal space's screens (`team.virto.s4.personal`) and
+// the facility's native library for ARM64 phones, `libvos_facility.so`
+// (`-PjniLibs=<dir>`, which `cargo ndk` filled). Published to the local
+// Maven repository `-Prepository=<dir>`, from which s4's `-Ps4Vos` build
+// takes it. It compiles against s4's credential contract (`:s4-host`) and
+// carries none of it: the app does.
+plugins {
+    id "com.android.library" version "9.3.1"
+    id "maven-publish"
+}
+
+def repositoryRoot = file("../../../..")
+layout.buildDirectory = new File(repositoryRoot, "target/android/gradle/facility")
+
+def jniLibs = providers.gradleProperty("jniLibs")
+def repository = providers.gradleProperty("repository")
+
+android {
+    namespace = "team.virto.vos"
+    compileSdk {
+        version = release(37) {
+            minorApiLevel = 1
+        }
+    }
+    buildToolsVersion = "36.1.0"
+
+    defaultConfig {
+        // The facility runs on Android 11 (API 30) or later; the app that
+        // links it, on earlier ones too, binds no `:vos` there.
+        minSdk = 23
+    }
+
+    sourceSets {
+        if (jniLibs.isPresent()) {
+            main.jniLibs.srcDir(jniLibs.get())
+        }
+    }
+
+    testOptions {
+        // The screens' logic is tested on the host: the parcelables it
+        // fills are plain fields.
+        unitTests.returnDefaultValues = true
+    }
+
+    publishing {
+        singleVariant("release")
+    }
+}
+
+dependencies {
+    compileOnly project(":s4-host")
+    testImplementation project(":s4-host")
+    // The background job, scheduled and run in the `:vos` process.
+    implementation "androidx.work:work-runtime:2.10.0"
+    // QR codes: a pairing's drawn and scanned, a home's scanned. Pure
+    // Java, no Play services.
+    implementation "com.google.zxing:core:3.5.3"
+    testImplementation "junit:junit:4.13.2"
+}
+
+afterEvaluate {
+    publishing {
+        publications {
+            release(MavenPublication) {
+                from components.release
+                groupId = "team.virto.vos"
+                artifactId = "facility"
+                version = "0.1.0"
+            }
+        }
+        repositories {
+            if (repository.isPresent()) {
+                maven { url = file(repository.get()) }
+            }
+        }
+    }
+}

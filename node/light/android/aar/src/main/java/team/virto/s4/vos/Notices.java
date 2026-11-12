@@ -14,7 +14,7 @@ import android.service.notification.StatusBarNotification;
 import android.util.Log;
 import java.util.HashSet;
 import java.util.Set;
-import team.virto.s4.R;
+import team.virto.vos.R;
 import team.virto.s4.personal.PersonalActivity;
 
 /**
@@ -38,9 +38,9 @@ final class Notices {
       NotificationChannel channel =
           new NotificationChannel(
               CHANNEL,
-              context.getString(R.string.pending_channel),
+              context.getString(R.string.vos_pending_channel),
               NotificationManager.IMPORTANCE_DEFAULT);
-      channel.setDescription(context.getString(R.string.pending_channel_description));
+      channel.setDescription(context.getString(R.string.vos_pending_channel_description));
       manager.createNotificationChannel(channel);
     }
     return manager;
@@ -55,7 +55,7 @@ final class Notices {
     if (manager == null) {
       return;
     }
-    String text = context.getString(R.string.paused_text, why);
+    String text = context.getString(R.string.vos_paused_text, why);
     Intent open =
         new Intent(context, PersonalActivity.class)
             .putExtra(PersonalActivity.OPEN, PersonalActivity.NETWORK);
@@ -63,7 +63,7 @@ final class Notices {
         PAUSED,
         0,
         builder(context, 1, open)
-            .setContentTitle(context.getString(R.string.paused_title))
+            .setContentTitle(context.getString(R.string.vos_paused_title))
             .setContentText(text)
             .setStyle(new Notification.BigTextStyle().bigText(text))
             .build());
@@ -138,7 +138,7 @@ final class Notices {
             ? new Notification.Builder(context, CHANNEL)
             : new Notification.Builder(context);
     return builder
-        .setSmallIcon(R.drawable.ic_terminal)
+        .setSmallIcon(R.drawable.vos_notice)
         .setContentIntent(content)
         .setAutoCancel(true)
         .setOnlyAlertOnce(true);
@@ -151,7 +151,7 @@ final class Notices {
       text = text + " (" + notice.detail + ")";
     }
     return builder(context, 0, new Intent(context, PersonalActivity.class))
-        .setContentTitle(context.getString(R.string.pending_title))
+        .setContentTitle(context.getString(R.string.vos_pending_title))
         .setContentText(text)
         .setStyle(new Notification.BigTextStyle().bigText(text))
         .build();
@@ -160,27 +160,27 @@ final class Notices {
   private static int text(byte pending) {
     switch (pending) {
       case Pending.ADD:
-        return R.string.pending_add;
+        return R.string.vos_pending_add;
       case Pending.REMOVE:
-        return R.string.pending_remove;
+        return R.string.vos_pending_remove;
       case Pending.REPLACE:
-        return R.string.pending_replace;
+        return R.string.vos_pending_replace;
       case Pending.ROTATE:
-        return R.string.pending_rotate;
+        return R.string.vos_pending_rotate;
       case Pending.REGROUP:
-        return R.string.pending_regroup;
+        return R.string.vos_pending_regroup;
       case Pending.RESTORE:
-        return R.string.pending_restore;
+        return R.string.vos_pending_restore;
       case Pending.RESTORING:
-        return R.string.pending_restoring;
+        return R.string.vos_pending_restoring;
       case Pending.REMOVED:
-        return R.string.pending_removed;
+        return R.string.vos_pending_removed;
       case Pending.RENEW:
-        return R.string.pending_renew;
+        return R.string.vos_pending_renew;
       case Pending.STUCK:
-        return R.string.pending_stuck;
+        return R.string.vos_pending_stuck;
       default:
-        return R.string.pending_alarm;
+        return R.string.vos_pending_alarm;
     }
   }
 }

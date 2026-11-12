@@ -7,7 +7,7 @@ import android.widget.EditText;
 import android.widget.LinearLayout;
 import java.util.ArrayList;
 import java.util.List;
-import team.virto.s4.R;
+import team.virto.vos.R;
 import team.virto.s4.vos.EnrolledSpace;
 import team.virto.s4.vos.Refusal;
 
@@ -91,7 +91,7 @@ final class NetworkScreen extends Screen {
       into.addView(text("No space this phone is enrolled in."));
       return;
     }
-    into.addView(text(app.getString(R.string.opt_out_warning)));
+    into.addView(text(app.getString(R.string.vos_opt_out_warning)));
     for (EnrolledSpace space : spaces) {
       into.addView(
           text(
@@ -110,7 +110,7 @@ final class NetworkScreen extends Screen {
                   v ->
                       app.ask(
                           "Take this space off Tor?",
-                          app.getString(R.string.opt_out_warning),
+                          app.getString(R.string.vos_opt_out_warning),
                           "Take it off Tor",
                           () -> optOut(space, true))));
     }

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-FileCopyrightText: 2026 Virto -->
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<resources>
+    <string name="vos_pending_channel">Personal space</string>
+    <string name="vos_pending_channel_description">Changes to your devices waiting for you, found by the background sync.</string>
+    <string name="vos_pending_title">Your personal space</string>
+    <string name="vos_pending_add">A device is being added. Veto it if it is not yours.</string>
+    <string name="vos_pending_remove">A device is being removed. Veto it if you did not ask for it.</string>
+    <string name="vos_pending_replace">A device\'s admin key is being replaced. Veto it if you did not ask for it.</string>
+    <string name="vos_pending_rotate">Your recovery kit is being replaced. Veto it if you did not ask for it.</string>
+    <string name="vos_pending_regroup">Your devices are being regrouped. Veto it if you did not ask for it.</string>
+    <string name="vos_pending_restore">Your recovery kit signed a restore that removes every device. Veto it if you did not ask for it.</string>
+    <string name="vos_pending_restoring">A restore of your personal space is pending: this device answered that it is alive. Rotate your recovery kit.</string>
+    <string name="vos_pending_removed">This device was removed from your personal space.</string>
+    <string name="vos_pending_stuck">This device cannot follow your other devices. Pair it again from one of them.</string>
+    <string name="vos_pending_renew">Your yearly re-proof is due.</string>
+    <string name="vos_pending_alarm">The background sync found something wrong.</string>
+    <string name="vos_personal_name">Personal space</string>
+    <!-- VOS's own words for the opt-out (`vos_light::route::OPT_OUT_WARNING`). -->
+    <string name="vos_opt_out_warning">Without Tor, this space\'s operators see this device\'s network address with every call it signs. Sign-ins and other anonymous calls, and your personal space, stay on Tor.</string>
+    <string name="vos_paused_title">Backup paused</string>
+    <string name="vos_paused_text">Your devices cannot sync: %1$s. On a network that blocks Tor, add bridges.</string>
+</resources>

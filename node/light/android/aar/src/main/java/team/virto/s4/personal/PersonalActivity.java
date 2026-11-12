@@ -24,7 +24,6 @@ import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import team.virto.s4.BuildConfig;
 import team.virto.s4.KeySources;
 import team.virto.s4.VosClient;
 import team.virto.s4.VosPrompts;
@@ -94,13 +93,6 @@ public final class PersonalActivity extends Activity {
     root.addView(scroll);
     root.addView(busyOverlay());
     setContentView(root);
-    if (!BuildConfig.VOS_FACILITY) {
-      title.setText("Personal space");
-      TextView none = new TextView(this);
-      none.setText("This build of the app carries no VOS facility.");
-      content.addView(none);
-      return;
-    }
     open(new OverviewScreen(this));
     if (NETWORK.equals(getIntent().getStringExtra(OPEN))) {
       open(new NetworkScreen(this));
@@ -110,7 +102,7 @@ public final class PersonalActivity extends Activity {
   @Override
   protected void onNewIntent(Intent intent) {
     super.onNewIntent(intent);
-    if (BuildConfig.VOS_FACILITY && NETWORK.equals(intent.getStringExtra(OPEN))) {
+    if (NETWORK.equals(intent.getStringExtra(OPEN))) {
       open(new NetworkScreen(this));
     }
   }
@@ -140,16 +132,12 @@ public final class PersonalActivity extends Activity {
   @Override
   protected void onStart() {
     super.onStart();
-    if (BuildConfig.VOS_FACILITY) {
-      VosClient.get(this).started();
-    }
+    VosClient.get(this).started();
   }
 
   @Override
   protected void onStop() {
-    if (BuildConfig.VOS_FACILITY) {
-      VosClient.get(this).stopped();
-    }
+    VosClient.get(this).stopped();
     super.onStop();
   }
 

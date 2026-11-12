@@ -21,7 +21,7 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * The VOS facility in the app's own {@code :vos} process: {@code libs4_credential.so}, opened once
+ * The VOS facility in the app's own {@code :vos} process: {@code libvos_facility.so}, opened once
  * for the process, and the {@link IVosNode} it serves. The prover's memory, the secrets a proof
  * takes and the gateway connections stay in this process, so the UI's death touches no proof or
  * sync, and this process's death leaves the UI running.
@@ -41,7 +41,7 @@ import java.util.Set;
  */
 public final class VosNode {
   /** The facility's library. */
-  static final String LIBRARY = "s4_credential";
+  static final String LIBRARY = "vos_facility";
 
   private static final String TAG = "vos.node";
   private static final int KEYSTORE = 1;

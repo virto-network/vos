@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+SPDX-FileCopyrightText: 2026 Virto
+SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<!-- The facility in the app that links this library: its own process, its
+     background job there, and the personal space's screens. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+    <!-- A pairing's QR code, scanned on the device that joins. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+
+    <application>
+        <!-- The personal space's screens over the facility, an entry of
+             their own in the launcher. -->
+        <activity
+            android:name="team.virto.s4.personal.PersonalActivity"
+            android:enabled="@bool/vos_personal_screens"
+            android:configChanges="colorMode|density|fontScale|fontWeightAdjustment|keyboard|keyboardHidden|layoutDirection|locale|mcc|mnc|navigation|orientation|screenLayout|screenSize|smallestScreenSize|touchscreen|uiMode"
+            android:exported="true"
+            android:icon="@drawable/vos_personal"
+            android:label="@string/vos_personal_name"
+            android:launchMode="singleTask"
+            android:taskAffinity="team.virto.s4.personal"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- The VOS facility in its own process: the prover, the secrets a proof
+             takes and the gateway connections stay out of the UI's, and each
+             process survives the other's death. Bound by this app alone. -->
+        <service
+            android:name="team.virto.s4.vos.VosNodeService"
+            android:exported="false"
+            android:process=":vos" />
+
+        <!-- WorkManager in the `:vos` process alone: the background job is
+             scheduled, started and run there (the app names it WorkManager's
+             process), with no UI process at all. Its
+             components are moved there and its start-up initializer is
+             dropped, so the UI process never opens it. -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:node="merge">
+            <meta-data
+                android:name="androidx.work.WorkManagerInitializer"
+                tools:node="remove" />
+        </provider>
+        <service
+            android:name="androidx.work.impl.background.systemjob.SystemJobService"
+            android:process=":vos"
+            tools:node="merge" />
+        <service
+            android:name="androidx.work.impl.background.systemalarm.SystemAlarmService"
+            android:process=":vos"
+            tools:node="merge" />
+        <service
+            android:name="androidx.work.impl.foreground.SystemForegroundService"
+            android:process=":vos"
+            tools:node="merge" />
+        <receiver
+            android:name="androidx.work.impl.utils.ForceStopRunnable$BroadcastReceiver"
+            android:process=":vos"
+            tools:node="merge" />
+        <receiver
+            android:name="androidx.work.impl.background.systemalarm.ConstraintProxy$BatteryChargingProxy"
+            android:process=":vos"
+            tools:node="merge" />
+        <receiver
+            android:name="androidx.work.impl.background.systemalarm.ConstraintProxy$BatteryNotLowProxy"
+            android:process=":vos"
+            tools:node="merge" />
+        <receiver
+            android:name="androidx.work.impl.background.systemalarm.ConstraintProxy$StorageNotLowProxy"
+            android:process=":vos"
+            tools:node="merge" />
+        <receiver
+            android:name="androidx.work.impl.background.systemalarm.ConstraintProxy$NetworkStateProxy"
+            android:process=":vos"
+            tools:node="merge" />
+        <receiver
+            android:name="androidx.work.impl.background.systemalarm.RescheduleReceiver"
+            android:process=":vos"
+            tools:node="merge" />
+        <receiver
+            android:name="androidx.work.impl.background.systemalarm.ConstraintProxyUpdateReceiver"
+            android:process=":vos"
+            tools:node="merge" />
+        <receiver
+            android:name="androidx.work.impl.diagnostics.DiagnosticsReceiver"
+            android:process=":vos"
+            tools:node="merge" />
+    </application>
+</manifest>

@@ -1,0 +1,32 @@
+// SPDX-FileCopyrightText: 2026 Virto
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+// The facility's Android library (`just android-facility`). `-Ps4=<dir>`:
+// the s4 checkout at the revision the facility's crate names, whose
+// credential contract's UI side (`client/android/host`: the Binder
+// interface, `VosClient`, `VosPrompts`, `KeySources`) this library compiles
+// against and the app that links it carries.
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = "vos-facility"
+
+def s4 = providers.gradleProperty("s4")
+if (!s4.isPresent()) {
+    throw new GradleException("-Ps4=<the s4 checkout the facility's crate names> is required")
+}
+include(":s4-host")
+project(":s4-host").projectDir = new File(s4.get(), "client/android/host")
