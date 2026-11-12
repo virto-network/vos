@@ -108,16 +108,17 @@ and what a node does with one is `node/SECURITY.md`'s.
   passed; a maturity it never supports raises `Unsigned` and moves
   nothing. A device whose candidate removes a device on a maturity this
   device does not honour is refused.
-- **The agent's policy is the log's:** operators set the delays, the
-  seasoning, the probation and the confirm window through `Configured`,
-  which every device takes as it reads it. The window bounds how long a
-  candidate waits for its set and how long a device waits for evidence a
-  maturity needs; a home that shortens it shortens both, and one that
-  lengthens it holds a void candidate's keys in place longer. A device
-  checks operations against the delays the log configured, not against
-  its own: `Configured` is the operators' word, unsigned, so a home that
-  sets a delay to zero makes every removal (and a leaked kit's restore)
-  immediate on every device, and no device alarms on it.
+- **The agent's delays are the claim's:** the claim's `Configured` sets
+  the delays, the seasoning, the probation and the confirm window, which
+  every device takes (a paired device from its pairing device). A later
+  `Configured` is the operators' word, unsigned: a device takes its
+  quotas, lease and inbox, keeps each delay and window at the higher of
+  the two, and raises `Alarm::Policy` for one it would lower, so a home
+  that sets a delay to zero makes no removal (and no leaked kit's restore)
+  immediate on any device; an operation asserted matured inside the kept
+  delay is `Unsigned`. A home that lengthens the window holds a void
+  candidate's keys in place longer. `Personal` lowers no delay once
+  assigned either.
 - **A restore's device trusts the agent for what came before:** it starts
   its group from what it reads of the agent after its restore matured
   (the log's head, the device set, the kit), with no earlier view to
@@ -160,8 +161,11 @@ and what a node does with one is `node/SECURITY.md`'s.
   the kit's reading of the recovery scope after it; the committer then
   seals the whole archive under the new `R`. A removed device holds only
   the `R` before, so with the operators it reads nothing pushed to the
-  recovery scope after its removal. A kit rotation and a restore draw a
-  new `R` too.
+  recovery scope after its removal. A verdict other than the devices' own
+  count (a `Void` the operators log over an epoch every device confirmed)
+  leaves each device holding no `R` it may push under, the next commit
+  re-sealing the kit, so the old `R` stays in force nowhere. A kit
+  rotation and a restore draw a new `R` too.
 - **A drawn `R` is held aside** until the log makes it the kit's (the
   commit's verdict, the rotation's or restore's verified maturity), and
   never travels before. The other devices take it only from an archive
@@ -364,7 +368,13 @@ What going over the onion changes for a device (`light-node.md` §6.7):
   a proof's nullifier links to no address, a feed read and a proof arrive
   on different circuits, and the personal agent sees pushes and fetches
   with no address behind them; a gateway that marks a feed with a root of
-  its own keeps only the feed connection's circuit, not an address.
+  its own keeps only the feed connection's circuit, not an address. A
+  feed query names the root the device holds, never its place in the
+  feed, so answers padded to leave a place of the device's own mark
+  nothing a later circuit carries; answers ended early can leave the
+  device at a root of the gateway's choosing, one of the ring's recent
+  roots others hold too (a few bits at most), or one no proof passes
+  under, which the keeper leaves after two refusals.
 - **Does not fix:** the timing of what a device sends (a gateway may join
   two circuits by time: the feed's timer keeps its reads apart from
   proofs, no more); the `map_root` a proof names, which within a timer

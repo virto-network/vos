@@ -5,10 +5,12 @@
 //! recovery wrap key `R` (§3.5), with the ones this device drew that the
 //! control log has not named yet; and the authors a move carried (§3.9):
 //! the devices of the groups it left, each up to the node it carried in
-//! each scope. A device keeps it in its store; a new
-//! device receives it over the pairing channel; sealed under an epoch's
-//! archive key it travels to the agent, `R` with it and the drawn ones
-//! never. Archives that disagree keep every candidate key, and the AEAD
+//! each scope, this device's own (its move, its restore, a pairing's) and
+//! those another device of the set vouched for, signed by its sync key. A
+//! device keeps it in its store; a new device receives it over the pairing
+//! channel; sealed under an epoch's archive key it travels to the agent,
+//! `R` with it and the drawn ones never, its own carried authors vouched
+//! for. Archives that disagree keep every candidate key, and the AEAD
 //! decides.
 
 use blake2::Blake2b;
@@ -66,6 +68,7 @@ pub struct Archive {
     pub recovery: Option<Recovery>,
     pub drawn: Vec<[u8; 32]>,
     pub authors: Vec<CarriedAuthor>,
+    pub vouched: Vec<Vouched>,
 }
 
 /// An author a move carried in a scope: a device of a group it left, its
@@ -76,6 +79,32 @@ pub struct CarriedAuthor {
     pub author: [u8; 32],
     pub scope: Scope,
     pub through: u64,
+}
+
+/// A carried author a device of the set vouched for, signed by its sync
+/// key `by`: read as the set's while `by` has a voice, and once its
+/// removal matured only at positions up to its frontier, so a device's
+/// vouching leaves no author writing after its removal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Vouched {
+    pub carried: CarriedAuthor,
+    pub by: [u8; 32],
+    pub signature: [u8; 64],
+}
+
+impl CarriedAuthor {
+    /// What a device signs to vouch for it at the agent whose identity is
+    /// `agent`.
+    pub fn message(&self, agent: &[u8; 32]) -> Vec<u8> {
+        [
+            &b"vos/personal/carried"[..],
+            agent,
+            &self.author,
+            &self.scope,
+            &self.through.to_be_bytes(),
+        ]
+        .concat()
+    }
 }
 
 impl std::fmt::Debug for Archive {
@@ -90,6 +119,7 @@ impl std::fmt::Debug for Archive {
             )
             .field("drawn", &self.drawn.len())
             .field("authors", &self.authors.len())
+            .field("vouched", &self.vouched.len())
             .finish_non_exhaustive()
     }
 }
@@ -108,6 +138,7 @@ impl Archive {
             recovery: None,
             drawn: Vec::new(),
             authors: Vec::new(),
+            vouched: Vec::new(),
         })
     }
 
@@ -167,12 +198,39 @@ impl Archive {
     }
 
     /// The number up to which `author`'s nodes in `scope` were carried by
-    /// a move: none for an author no move carried there.
+    /// a move of this device's: none for an author no move of its carried
+    /// there.
     pub fn through(&self, author: &[u8; 32], scope: &Scope) -> Option<u64> {
         self.authors
             .binary_search_by(|at| (at.author, at.scope).cmp(&(*author, *scope)))
             .ok()
             .map(|found| self.authors[found].through)
+    }
+
+    /// Admit `vouched`, its signature checked by the caller: of two by one
+    /// voucher, the higher stands.
+    pub fn vouch(&mut self, vouched: Vouched) {
+        let key = |at: &Vouched| (at.carried.author, at.carried.scope, at.by);
+        match self
+            .vouched
+            .binary_search_by(|at| key(at).cmp(&key(&vouched)))
+        {
+            Ok(found) if self.vouched[found].carried.through < vouched.carried.through => {
+                self.vouched[found] = vouched;
+            }
+            Ok(_) => {}
+            Err(at) => self.vouched.insert(at, vouched),
+        }
+    }
+
+    /// The vouchers for `author`'s nodes in `scope`, each with the number
+    /// it vouched up to.
+    pub fn vouchers(&self, author: &[u8; 32], scope: &Scope) -> Vec<([u8; 32], u64)> {
+        self.vouched
+            .iter()
+            .filter(|at| at.carried.author == *author && at.carried.scope == *scope)
+            .map(|at| (at.by, at.carried.through))
+            .collect()
     }
 
     /// Track `scope`: its key is recorded at every confirmed epoch from now.
@@ -198,14 +256,17 @@ impl Archive {
         self.merge_keys(other);
     }
 
-    /// `other`'s scopes, earlier naming secrets, keys and carried authors
-    /// merged in, its `R` left out.
+    /// `other`'s scopes, earlier naming secrets, keys and carried authors,
+    /// its own and those vouched for, merged in, its `R` left out.
     pub fn merge_keys(&mut self, other: &Archive) {
         for naming in &other.previous {
             self.remember(*naming);
         }
         for carried in &other.authors {
             self.carried(*carried);
+        }
+        for vouched in &other.vouched {
+            self.vouch(*vouched);
         }
         for scope in &other.scopes {
             self.track(*scope);
@@ -335,6 +396,12 @@ impl Archive {
                 })
                 .copied()
                 .collect(),
+            vouched: self
+                .vouched
+                .iter()
+                .filter(|at| !other.vouched.contains(at))
+                .copied()
+                .collect(),
         }
     }
 
@@ -345,6 +412,7 @@ impl Archive {
             && self.scopes.is_empty()
             && self.keys.is_empty()
             && self.authors.is_empty()
+            && self.vouched.is_empty()
     }
 
     /// The archive sealed under `key` with `nonce`: XChaCha20-Poly1305 over

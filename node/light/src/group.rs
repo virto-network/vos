@@ -69,7 +69,7 @@ use zeroize::Zeroize;
 use crate::kit::{KitKey, Split};
 use crate::store::{Store, StoreError};
 
-pub use archive::{Archive, CarriedAuthor};
+pub use archive::{Archive, CarriedAuthor, Vouched};
 pub(crate) use follow::verifies;
 
 /// The confirmation hash's domain.
@@ -97,6 +97,9 @@ const GENERATION: &[u8] = b"g/generation";
 /// The log's chain through each entry read, by the next index: the views
 /// writers name are checked against it.
 const CHAINS: &[u8] = b"g/chain/";
+/// The alarms raised and not yet acknowledged, and how many are kept.
+const ALARMS: &[u8] = b"g/alarms";
+const KEPT_ALARMS: usize = 64;
 
 fn chain_key(next: u64) -> Vec<u8> {
     [CHAINS, &next.to_be_bytes()[..]].concat()
@@ -244,80 +247,114 @@ pub enum Why {
     Regroup,
 }
 
-/// What a device raises to its user.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What a device raises to its user. Kept in the store from the batch
+/// that consumes its evidence until the chrome acknowledges it
+/// ([`DeviceGroup::alarms`], [`DeviceGroup::acknowledge`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Alarm {
     /// The log does not chain from what this device saw at `index`: a
     /// rollback or a fork. The device reads no further.
+    #[codec(index = 0)]
     Log { index: u64 },
     /// A vote by `device`, of `epoch`'s logged set, does not verify against
     /// the candidate as this device's log holds it: the devices were shown
     /// two logs (a different confirming set), or the vote is forged.
+    #[codec(index = 1)]
     SplitLog { epoch: u64, device: DeviceId },
     /// The log names this device absent from `epoch`'s confirming set
     /// though it made a call within the window.
+    #[codec(index = 2)]
     NamedAbsent { epoch: u64, last_call: u64 },
     /// This device refused `epoch`'s candidate by `committer`: its evidence
     /// does not verify, its effect is not the matured operations', or its
     /// handshake does not process. It nacked, if it votes.
+    #[codec(index = 3)]
     Refused { epoch: u64, committer: DeviceId },
     /// `epoch` was confirmed and this device cannot follow it: it could not
     /// process `committer`'s commit, or its `h` is not the confirmed one.
+    #[codec(index = 4)]
     CannotFollow {
         epoch: u64,
         committer: DeviceId,
         remedy: Remedy,
     },
     /// The agent's verdict on `epoch` is not this device's count.
+    #[codec(index = 5)]
     Verdict { epoch: u64 },
     /// The log's entry at `index` asserts a maturity its evidence does not
     /// support: no verified operation, or one whose delay had not passed
     /// with no verified second signature or resolution, or vetoed. It is
     /// ignored.
+    #[codec(index = 6)]
     Unsigned { index: u64 },
     /// The device's clock and the agent's batch time disagree by `skew_ms`,
     /// more than an hour: the device acts as the log says.
+    #[codec(index = 7)]
     Clock { skew_ms: u64 },
     /// The kit signed the operation at `index`: every device shows it for
     /// as long as it is open, and its user vetoes it or rotates the kit.
+    #[codec(index = 8)]
     Kit { index: u64 },
     /// The agent's log head, `next`, is behind what this device read of
     /// it, or diverges from it there: a rollback.
+    #[codec(index = 9)]
     Rollback { next: u64 },
     /// A writer's view of the log names `index` with a chain this device's
     /// log does not have there, or an index past what the agent serves this
     /// device: a split log.
+    #[codec(index = 10)]
     View { index: u64 },
     /// An admin call of this device's that the agent took at `index` is not
     /// there: dropped, or replaced.
+    #[codec(index = 11)]
     Dropped { index: u64 },
     /// A writer had read `scope` to `position`, and the agent serves this
     /// device less of it: a partition.
+    #[codec(index = 12)]
     Partition { scope: Scope, position: u64 },
     /// The agent's page of `scope` skips `position`, which it numbered: an
     /// envelope withheld.
+    #[codec(index = 13)]
     Withheld { scope: Scope, position: u64 },
     /// The envelope at `scope`'s `position` is sealed under an epoch before
     /// one the agent took earlier there: a push it should have refused.
+    #[codec(index = 14)]
     Stale { scope: Scope, position: u64 },
     /// The node at `scope`'s `position` is not by a device of the set, or by
     /// a removed device past its frontier: refused.
+    #[codec(index = 15)]
     Author { scope: Scope, position: u64 },
     /// This device's own envelope at `scope`'s `position` is gone: pushed
     /// again.
+    #[codec(index = 16)]
     Deleted { scope: Scope, position: u64 },
     /// A checkpoint of `scope` at `position` whose hash is not this
     /// device's reading of the scope there: refused, and not acknowledged.
+    #[codec(index = 17)]
     Checkpoint { scope: Scope, position: u64 },
+    /// The agent named its log's head at `next` and, read again, served
+    /// this device less of the log: entries withheld. The writers' views
+    /// and this device's admin calls past what it was served count as
+    /// unreached.
+    #[codec(index = 18)]
+    Unserved { next: u64 },
+    /// The log's entry at `index` lowers a delay or a window of the device
+    /// set's policy: refused, the policy's delays and windows kept. Only
+    /// the claim's configuration sets them (`light-node.md` §3.5).
+    #[codec(index = 19)]
+    Policy { index: u64 },
 }
 
 /// What a device that cannot follow does.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+#[repr(u8)]
 pub enum Remedy {
     /// Pair again from another live device.
-    RePair,
+    #[codec(index = 0)]
+    RePair = 0,
     /// No other live device to pair from: a regroup (§3.5).
-    Regroup,
+    #[codec(index = 1)]
+    Regroup = 1,
 }
 
 /// The clock alarm: the device's clock `local` against the agent's batch
@@ -683,6 +720,15 @@ pub(crate) struct State {
     /// Writers' views past the cursor, checked as the device reads on.
     pub(crate) views: Vec<(u64, [u8; 32])>,
     pub(crate) trust: Trust,
+    /// A head the agent named past the cursor, which the next reading of
+    /// the log must reach ([`Alarm::Unserved`]).
+    pub(crate) ahead: Option<u64>,
+    /// The log index of the claim's assignment, once read: a configuration
+    /// before it, or the one beside it, is the claim's and sets the
+    /// policy's delays and windows; a later one lowers none of them
+    /// ([`Alarm::Policy`]). A paired device's is its pairing device's; a
+    /// restored device starts past it.
+    pub(crate) assigned: Option<u64>,
 }
 
 impl State {
@@ -762,6 +808,7 @@ pub struct Pairing {
     devices: Vec<(DeviceId, Known)>,
     set: Set,
     recovery: Option<Named>,
+    assigned: Option<u64>,
     archive: Archive,
     checkpoints: Vec<Checkpoint>,
 }
@@ -889,6 +936,8 @@ pub struct DeviceGroup {
     processed: Option<(u64, Processed)>,
     /// The log's chains read and not yet written, by the next index.
     chains: Vec<(u64, [u8; 32])>,
+    /// The alarms raised and not yet written.
+    raised: Vec<Alarm>,
 }
 
 /// The generation of `store`'s MLS state.
@@ -958,6 +1007,8 @@ impl DeviceGroup {
             made: Vec::new(),
             views: Vec::new(),
             trust: Trust::Paired(Vec::new()),
+            ahead: None,
+            assigned: None,
         };
         let mut mls = Mls::open(namespace(store, 0)?, &credential(&me), BTreeMap::new())?;
         mls.create(now / 1000, rows(&state, None))?;
@@ -968,6 +1019,7 @@ impl DeviceGroup {
             archive,
             processed: None,
             chains: Vec::new(),
+            raised: Vec::new(),
         })
     }
 
@@ -1032,6 +1084,7 @@ impl DeviceGroup {
             devices,
             set,
             recovery,
+            assigned,
             archive,
             checkpoints,
         } = pairing;
@@ -1059,6 +1112,8 @@ impl DeviceGroup {
             made: Vec::new(),
             views: Vec::new(),
             trust: Trust::Paired(checkpoints),
+            ahead: None,
+            assigned,
         };
         let mut mls = Mls::open(namespace(store, 0)?, &credential(&me), BTreeMap::new())?;
         mls.write(rows(&state, Some(&archive)))?;
@@ -1069,6 +1124,7 @@ impl DeviceGroup {
             archive,
             processed: None,
             chains: Vec::new(),
+            raised: Vec::new(),
         })
     }
 
@@ -1150,6 +1206,8 @@ impl DeviceGroup {
             made: Vec::new(),
             views: Vec::new(),
             trust: Trust::Acknowledged,
+            ahead: None,
+            assigned: Some(0),
         };
         let mut mls = Mls::open(namespace(store, 0)?, &credential(&me), BTreeMap::new())?;
         mls.create(read.time / 1000, rows(&state, Some(&archive)))?;
@@ -1160,6 +1218,7 @@ impl DeviceGroup {
             archive,
             processed: None,
             chains: Vec::new(),
+            raised: Vec::new(),
         })
     }
 
@@ -1181,6 +1240,7 @@ impl DeviceGroup {
             state,
             processed: None,
             chains: Vec::new(),
+            raised: Vec::new(),
         }))
     }
 
@@ -1241,8 +1301,9 @@ impl DeviceGroup {
     /// Whether this device holds the `R` the log made the kit's last, and
     /// may let it travel: not while a removal it honours is owed (the
     /// removed device is still in the epoch), not while a confirmed
-    /// commit's re-sealed kit waits on the agent's verdict, and not while
-    /// it cannot follow.
+    /// commit's re-sealed kit waits on the agent's verdict confirming it
+    /// (a verdict that does not leaves it unheld until the next commit
+    /// re-seals the kit), and not while it cannot follow.
     pub fn holds_recovery(&self) -> bool {
         if self.state.rekeyed.is_some()
             || !self.state.set.owed.is_empty()
@@ -1269,7 +1330,7 @@ impl DeviceGroup {
     pub fn rotate(&mut self, keys: &[KitKey]) -> Result<Split, GroupError> {
         let split = Split::draw(keys, &self.state.agent.identity).ok_or(GroupError::Kit)?;
         self.archive.draw(*split.r());
-        let writes = self.writes(true);
+        let writes = self.writes(true)?;
         self.mls.write(writes)?;
         Ok(split)
     }
@@ -1314,9 +1375,17 @@ impl DeviceGroup {
 
     /// A recovered group's archive taken in: its naming secret one of the
     /// earlier groups' (their scopes keep their ids), its keys merged.
+    ///
+    /// Its carried authors are taken as [`DeviceGroup::merge_read`] takes
+    /// them: vouchings of devices this device knows, each signature
+    /// checked, and no bare author, since devices push their own carried
+    /// authors vouched for and a bare one in the recovery scope is planted.
     pub fn inherit(&mut self, recovered: &Archive) -> Result<(), GroupError> {
-        self.archive.inherit(recovered);
-        let writes = self.writes(true);
+        let mut recovered = recovered.shareable();
+        recovered.authors.clear();
+        self.keep_vouched(&mut recovered);
+        self.archive.inherit(&recovered);
+        let writes = self.writes(true)?;
         self.mls.write(writes)?;
         Ok(())
     }
@@ -1329,15 +1398,25 @@ impl DeviceGroup {
         for carried in carried {
             self.archive.carried(*carried);
         }
-        let writes = self.writes(true);
+        let writes = self.writes(true)?;
         self.mls.write(writes)?;
         Ok(())
     }
 
-    /// An archive read from the agent merged: its keys, and its `R` only
-    /// when it is the one the log made the kit's, by its hash.
+    /// An archive read from the agent merged, bounded by what any device
+    /// of the epoch may bring: the keys of the epochs before the confirmed
+    /// one (this device exports the confirmed epoch's itself, and no device
+    /// holds a later one), and its `R` only when it is the one the log made
+    /// the kit's, by its hash; and the carried authors a device this device
+    /// knows vouched for, each signature checked, read as the set's only
+    /// while the voucher has a voice and then up to its frontier. Bare carried
+    /// authors, earlier groups' naming secrets and scopes are not taken:
+    /// they come from this device's own move or restore and from a pairing
+    /// alone. So no device, removed later, leaves an author or a key
+    /// behind that outlives its removal.
     pub fn merge_read(&mut self, read: &Archive) -> Result<(), GroupError> {
         let named = self.state.recovery;
+        let confirmed = self.state.confirmed;
         let mut taken = read.shareable();
         let theirs = taken.recovery.take();
         if let (Some(named), Some(theirs)) = (named, theirs)
@@ -1346,7 +1425,37 @@ impl DeviceGroup {
         {
             taken.recovery = Some(theirs);
         }
+        taken.authors.clear();
+        taken.previous.zeroize();
+        taken.previous.clear();
+        taken.scopes.clear();
+        self.keep_vouched(&mut taken);
+        taken.keys.retain_mut(|((epoch, _), keys)| {
+            let before = *epoch < confirmed;
+            if !before {
+                keys.zeroize();
+            }
+            before
+        });
         self.merge_archive(&taken)
+    }
+
+    /// Keep in `archive` only the vouchings of devices this device knows,
+    /// removed ones included (their vouchings read up to their frontier),
+    /// each signature checked over this agent's identity.
+    fn keep_vouched(&self, archive: &mut Archive) {
+        let devices = &self.state.devices;
+        let agent = self.state.agent.identity;
+        archive.vouched.retain(|vouched| {
+            devices
+                .iter()
+                .any(|(_, known)| known.keys.sync == vouched.by)
+                && verifies(
+                    &vouched.by,
+                    &vouched.carried.message(&agent),
+                    &vouched.signature,
+                )
+        });
     }
 
     /// The device set's open operations, as this device verified them.
@@ -1413,7 +1522,7 @@ impl DeviceGroup {
         {
             self.archive.track(scope);
             self.archive.record(self.state.confirmed, scope, key);
-            let writes = self.writes(true);
+            let writes = self.writes(true)?;
             self.mls.write(writes)?;
         }
         Ok(key)
@@ -1439,7 +1548,7 @@ impl DeviceGroup {
     /// opened from the agent.
     pub fn merge_archive(&mut self, other: &Archive) -> Result<(), GroupError> {
         self.archive.merge(other);
-        let writes = self.writes(true);
+        let writes = self.writes(true)?;
         self.mls.write(writes)?;
         Ok(())
     }
@@ -1485,7 +1594,7 @@ impl DeviceGroup {
         {
             made.remove(oldest);
         }
-        let writes = self.writes(false);
+        let writes = self.writes(false)?;
         self.mls.write(writes)?;
         Ok(())
     }
@@ -1518,40 +1627,55 @@ impl DeviceGroup {
         if views.len() > VIEWS {
             views.remove(0);
         }
-        let writes = self.writes(false);
+        let writes = self.writes(false)?;
         self.mls.write(writes)?;
         Ok(None)
     }
 
     /// The agent's log head, `(next, chain)`, as it answers after this
     /// device read the log to its end: a head behind what this device read,
-    /// or diverging at it, is a rollback; a writer's view past it is a log
-    /// this device is not served.
+    /// or diverging at it, is a rollback. A head past it is kept, and the
+    /// caller reads the log again and gives the head again: a kept head the
+    /// log still does not reach is entries withheld ([`Alarm::Unserved`]).
+    /// Wherever the log reaches no further than this device read, the
+    /// writers' views past it ([`Alarm::View`]) and the admin calls the
+    /// agent took past it ([`Alarm::Dropped`]) are unreached.
     pub fn head(&mut self, next: u64, chain: [u8; 32]) -> Result<Vec<Alarm>, GroupError> {
         let mut alarms = Vec::new();
-        if next < self.state.next || (next == self.state.next && chain != self.state.chain) {
+        let cursor = self.state.next;
+        if next < cursor || (next == cursor && chain != self.state.chain) {
             alarms.push(Alarm::Rollback { next });
         }
-        if next <= self.state.next {
-            let views = std::mem::take(&mut self.state.views);
-            alarms.extend(views.iter().map(|(index, _)| Alarm::View { index: *index }));
-            // A call the agent said it took at an index its log does not
-            // reach.
-            let mut changed = !views.is_empty();
-            for made in &mut self.state.made {
-                if made.index >= next && !made.dropped {
-                    alarms.push(Alarm::Dropped { index: made.index });
-                    made.dropped = true;
-                    changed = true;
-                }
-            }
-            self.state
-                .made
-                .retain(|made| !made.dropped || made.vetoes_any());
-            if changed {
-                let writes = self.writes(false);
+        let kept = self.state.ahead.take();
+        match kept.filter(|claimed| *claimed > cursor) {
+            Some(claimed) => alarms.push(Alarm::Unserved { next: claimed }),
+            None if next > cursor => {
+                self.state.ahead = Some(next);
+                self.raised.extend(alarms.iter().copied());
+                let writes = self.writes(false)?;
                 self.mls.write(writes)?;
+                return Ok(alarms);
             }
+            None => {}
+        }
+        let views = std::mem::take(&mut self.state.views);
+        alarms.extend(views.iter().map(|(index, _)| Alarm::View { index: *index }));
+        // A call the agent said it took at an index its log does not reach.
+        let mut changed = kept.is_some() || !views.is_empty() || !alarms.is_empty();
+        for made in &mut self.state.made {
+            if made.index >= cursor && !made.dropped {
+                alarms.push(Alarm::Dropped { index: made.index });
+                made.dropped = true;
+                changed = true;
+            }
+        }
+        self.state
+            .made
+            .retain(|made| !made.dropped || made.vetoes_any());
+        if changed {
+            self.raised.extend(alarms.iter().copied());
+            let writes = self.writes(false)?;
+            self.mls.write(writes)?;
         }
         Ok(alarms)
     }
@@ -1621,13 +1745,15 @@ impl DeviceGroup {
         Ok((remove, removes))
     }
 
-    /// The kit re-sealed for a commit carrying `remove`, or while the log
+    /// The kit re-sealed for a commit carrying `remove`, while the log
     /// names an `R` this device does not hold (a kit rotation the kit
-    /// signed, or one whose drawer never passed its `R` on): a split of the
-    /// kit's keys, its `R` held aside until the commit's verdict, and its
-    /// `R2`.
+    /// signed, or one whose drawer never passed its `R` on), or while a
+    /// confirmed re-sealing commit's `R` waits on a verdict that did not
+    /// make it the kit's: a split of the kit's keys, its `R` held aside
+    /// until the commit's verdict, and its `R2`.
     fn rekey(&mut self, remove: &[DeviceId]) -> Result<Option<(Split, [u8; 32])>, GroupError> {
-        let unheld = self.state.recovery.is_some() && !self.holds_recovery();
+        let unheld = (self.state.recovery.is_some() && !self.holds_recovery())
+            || self.state.rekeyed.is_some();
         if remove.is_empty() && !unheld {
             return Ok(None);
         }
@@ -1780,6 +1906,7 @@ impl DeviceGroup {
             devices: self.state.devices.clone(),
             set: self.state.set.clone(),
             recovery: self.state.recovery,
+            assigned: self.state.assigned,
             archive: self.archive.shareable(),
             checkpoints: Vec::new(),
         };
@@ -1841,14 +1968,99 @@ impl DeviceGroup {
 
 impl DeviceGroup {
     /// The group's rows, as [`rows`] gives them, with the log's chains read
-    /// since the last write.
-    pub(crate) fn writes(&mut self, archive: bool) -> vos_mls::Writes {
+    /// since the last write and the alarms raised since, kept until they
+    /// are acknowledged.
+    pub(crate) fn writes(&mut self, archive: bool) -> Result<vos_mls::Writes, GroupError> {
         let mut writes = rows(&self.state, archive.then_some(&self.archive));
         for (next, chain) in self.chains.drain(..) {
             writes.insert(chain_key(next), Some(chain.to_vec()));
         }
-        writes
+        let raised = std::mem::take(&mut self.raised);
+        if let Some((key, value)) = raised_row(&self.store, &raised)? {
+            writes.insert(key, value);
+        }
+        Ok(writes)
     }
+
+    /// Note the alarms among `events`: the next write keeps them.
+    pub(crate) fn note(&mut self, events: &[Event]) {
+        for event in events {
+            if let Event::Alarm(alarm) = event
+                && !self.raised.contains(alarm)
+            {
+                self.raised.push(*alarm);
+            }
+        }
+    }
+
+    /// The alarms raised and not yet acknowledged, the oldest first: every
+    /// one the device group and sealed sync raised, each kept from the batch
+    /// that consumed its evidence, so a pass killed or stopped after it
+    /// loses none.
+    pub fn alarms(&self) -> Result<Vec<Alarm>, GroupError> {
+        Ok(stored_alarms(&self.store)?)
+    }
+
+    /// Keep `alarms`, raised outside the device group's own batches.
+    pub fn keep(&mut self, alarms: &[Alarm]) -> Result<(), GroupError> {
+        if let Some(row) = raised_row(&self.store, alarms)? {
+            self.store.write_group_rows(vec![row])?;
+        }
+        Ok(())
+    }
+
+    /// The chrome showed `alarms` to the user: they are kept no more. One
+    /// raised again after is kept again.
+    pub fn acknowledge(&mut self, alarms: &[Alarm]) -> Result<(), GroupError> {
+        let mut kept = stored_alarms(&self.store)?;
+        let before = kept.len();
+        kept.retain(|alarm| !alarms.contains(alarm));
+        if kept.len() != before {
+            self.store
+                .write_group_rows(vec![(ALARMS.to_vec(), Some(kept.encode()))])?;
+        }
+        Ok(())
+    }
+}
+
+/// A row written, or deleted when its value is none.
+type Write = (Vec<u8>, Option<Vec<u8>>);
+
+/// The alarms kept, the oldest first.
+fn stored_alarms(store: &Store) -> Result<Vec<Alarm>, StoreError> {
+    Ok(store
+        .group_row(ALARMS)?
+        .and_then(|bytes| Vec::<Alarm>::decode_exact(&bytes))
+        .unwrap_or_default())
+}
+
+/// The row of the alarms kept with `raised` added, each once; none when
+/// `raised` adds nothing. Past [`KEPT_ALARMS`], the oldest of a kind of
+/// which a later one is kept goes first, so a flood of one kind evicts no
+/// other.
+pub(crate) fn raised_row(store: &Store, raised: &[Alarm]) -> Result<Option<Write>, StoreError> {
+    let mut kept = stored_alarms(store)?;
+    let before = kept.clone();
+    for alarm in raised {
+        if !kept.contains(alarm) {
+            kept.push(*alarm);
+        }
+    }
+    if kept == before {
+        return Ok(None);
+    }
+    while kept.len() > KEPT_ALARMS {
+        let kind = |alarm: &Alarm| core::mem::discriminant(alarm);
+        let oldest = (0..kept.len())
+            .find(|at| {
+                kept[at + 1..]
+                    .iter()
+                    .any(|later| kind(later) == kind(&kept[*at]))
+            })
+            .unwrap_or(0);
+        kept.remove(oldest);
+    }
+    Ok(Some((ALARMS.to_vec(), Some(kept.encode()))))
 }
 
 /// The group's rows: its state and, when it changed, the archive.

@@ -757,3 +757,97 @@ fn a_replaced_admin_key_signs_and_renews_its_leaf() {
     }
     agree(&mut all(&mut phones), epoch);
 }
+
+/// E29: a replacement contested and resolved upheld, by the kit, still
+/// waits out the new key's probation. The agent matures it at its own
+/// time; a maturity the operators assert before is unsupported, the
+/// replacement open on every device until then.
+#[test]
+fn a_resolved_replacement_waits_out_its_probation() {
+    let (mut home, mut phones) = seasoned(2);
+    let fresh = SigningKey::from_bytes(&[0x73; 32]);
+    let admin = vos_wire::personal::NewAdmin {
+        key: fresh.verifying_key().to_bytes(),
+        class: vos_wire::personal::AdminClass::Strong,
+        attestation: vos_wire::personal::Attestation {
+            hardware: true,
+            verified_boot: true,
+        },
+    };
+    let replacement = operate(
+        &mut home,
+        &phones[0].admin,
+        &phones[0].sync,
+        "replace",
+        (1u32, admin).encode(),
+        None,
+    );
+    operate(
+        &mut home,
+        &phones[1].admin,
+        &phones[1].sync,
+        "veto",
+        replacement.encode(),
+        None,
+    );
+
+    operate(
+        &mut home,
+        &kit(0),
+        &kit(0),
+        "resolve",
+        (replacement, true).encode(),
+        None,
+    );
+    assert_eq!(state(&home, &phones[0], replacement), OpState::Contested);
+
+    let (cursor, before) = phones[0].group().view();
+    let mut entries = home.log(phones[0].sync_key(), cursor).unwrap();
+    let early = append(
+        &mut entries,
+        before,
+        home.now,
+        Body::Settled {
+            op: replacement,
+            state: OpState::Matured { at: home.now },
+        },
+    );
+    let events = phones[0].group().follow(entries).unwrap();
+    assert!(
+        events.contains(&Event::Alarm(Alarm::Unsigned { index: early })),
+        "{events:?}"
+    );
+    assert!(
+        phones[1]
+            .read(&mut home)
+            .iter()
+            .all(|event| !matches!(event, Event::Alarm(_))),
+    );
+    assert!(
+        phones[1]
+            .group()
+            .operations()
+            .iter()
+            .any(|open| open.index == replacement),
+        "open through its probation"
+    );
+
+    home.pass(policy().probation_ms);
+    phones[1].alive(&mut home);
+    let events = phones[1].read(&mut home);
+    assert!(
+        events.iter().all(|event| !matches!(event, Event::Alarm(_))),
+        "{events:?}"
+    );
+    assert!(matches!(
+        state(&home, &phones[1], replacement),
+        OpState::Matured { .. }
+    ));
+    assert!(
+        phones[1]
+            .group()
+            .operations()
+            .iter()
+            .all(|open| open.index != replacement)
+    );
+}

@@ -429,6 +429,7 @@ impl<L: Link> SealedSync<'_, L> {
                 .acknowledged
                 .drain(..marks.acknowledged.len() - PENDING);
         }
+        self.keep_alarms(&report.alarms)?;
         if !acks.is_empty() {
             self.push_marks(instance, &acks)?;
         }
@@ -534,6 +535,9 @@ impl<L: Link> SealedSync<'_, L> {
             ..
         } in trusted
         {
+            // A refusal is kept before an older checkpoint's install moves
+            // the cursor, after which the scope starts no more.
+            self.keep_alarms(alarms)?;
             let installed = match self.content(instance, from, position, hash)? {
                 Some(content) => self.install(instance, scope, position, hash, &content)?,
                 None => false,
