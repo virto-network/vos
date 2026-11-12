@@ -942,7 +942,7 @@ fn an_unknown_root_is_retried_on_a_path_fetched_again() {
 
 /// A revoked member's proof on the root before its revocation is admitted
 /// within `ROOT_GRACE_MS` of the revoking batch, and refused `RootStale`
-/// once that has passed by the node's clock; owner proofs
+/// once that has passed by the node's clock, no batch run since; owner proofs
 /// pay from the accounts they hold, and a rekeyed account from its new
 /// owner's.
 #[test]
@@ -958,14 +958,18 @@ fn a_revoked_members_root_goes_stale_and_owners_pay_from_their_accounts() {
         done(&founded.send(at, &call)).len() > 1,
         "within the window"
     );
-    founded.later(ROOT_GRACE_MS as i64 - 30_000);
+    // The clocks moved on with no batch after: an idle space, whose
+    // latest batch time stays at the revocation's.
+    let idle = |ms: i64| founded.cluster.offset.fetch_add(ms, Ordering::SeqCst);
+    idle(ROOT_GRACE_MS as i64 - 30_000);
     let call = founded.auth(at, &member, &before, ("login", "login"), ());
     assert!(
         done(&founded.send(at, &call)).len() > 1,
         "later, within the grace"
     );
-    // Past the grace, long before the ring's 64 roots push it out.
-    founded.later(40_000);
+    // Past the grace by the node's clock, long before the ring's 64 roots
+    // push it out.
+    idle(40_000);
     let call = founded.auth(at, &member, &before, ("login", "login"), ());
     assert_eq!(
         refused(founded.send(at, &call)),

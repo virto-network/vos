@@ -649,19 +649,19 @@ fn an_auth_root_is_fresh_for_the_grace_by_the_calls_time_and_a_scope_is_its_guar
     let after = agent.root();
     assert_ne!(after.root, before.root);
     assert_eq!(after.since, revoked);
-    let horizon = revoked + 6 * 60_000;
+    let long_after = revoked + 6 * 60_000;
     let login = |agent: &mut Agent, nullifier: u8, root: Digest, (time, expires): (u64, u64)| {
         let origin = agent.anonymous("login", nullifier);
         let call = agent.call(origin, POLL, "login", (), expires, Some(root));
         agent.step(time, &call)
     };
     // Expiring a horizon after the batch: judged at the batch's time.
-    let judged_at = |time| (time, time + CREDENTIAL_HORIZON_MS);
+    let a_horizon_ahead = |time| (time, time + CREDENTIAL_HORIZON_MS);
     let within = login(
         &mut agent,
         1,
         before.root,
-        judged_at(revoked + ROOT_GRACE_MS),
+        a_horizon_ahead(revoked + ROOT_GRACE_MS),
     );
     assert!(
         matches!(ran(&within).outcome, Outcome::Done(_)),
@@ -671,7 +671,7 @@ fn an_auth_root_is_fresh_for_the_grace_by_the_calls_time_and_a_scope_is_its_guar
         &mut agent,
         1,
         before.root,
-        judged_at(revoked + ROOT_GRACE_MS + 1),
+        a_horizon_ahead(revoked + ROOT_GRACE_MS + 1),
     );
     assert_eq!(refused(&past), Refusal::StaleRoot);
     // Expiring at the batch's time: an ingress a horizon before admitted it.
@@ -680,13 +680,18 @@ fn an_auth_root_is_fresh_for_the_grace_by_the_calls_time_and_a_scope_is_its_guar
     assert!(matches!(ran(&late).outcome, Outcome::Done(_)), "{late:?}");
     let beyond = login(&mut agent, 4, before.root, (edge + 1, edge + 1));
     assert_eq!(refused(&beyond), Refusal::StaleRoot);
-    let later = login(&mut agent, 1, before.root, judged_at(revoked + 5 * 60_000));
+    let later = login(
+        &mut agent,
+        1,
+        before.root,
+        a_horizon_ahead(revoked + 5 * 60_000),
+    );
     assert_eq!(
         refused(&later),
         Refusal::StaleRoot,
         "inside the ring, past the grace"
     );
-    let newest = login(&mut agent, 2, after.root, judged_at(horizon));
+    let newest = login(&mut agent, 2, after.root, a_horizon_ahead(long_after));
     match &ran(&newest).outcome {
         Outcome::Done(bytes) => {
             assert_eq!(Option::<Digest>::decode_exact(bytes), Some(Some([2; 32])));
@@ -703,10 +708,10 @@ fn an_auth_root_is_fresh_for_the_grace_by_the_calls_time_and_a_scope_is_its_guar
         POLL,
         "login",
         (),
-        horizon + 1_000,
+        long_after + 1_000,
         Some(after.root),
     );
-    let step = agent.step(horizon, &call);
+    let step = agent.step(long_after, &call);
     assert_eq!(failed(&step), Failure::Forbidden);
     assert_eq!(agent.query::<_, u64>(POLL, "logins", ()), 3);
 }

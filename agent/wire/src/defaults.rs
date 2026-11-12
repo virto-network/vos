@@ -223,7 +223,7 @@ pub const FEED_PERIOD_MS: u64 = 30_000;
 /// [`crate::credentials::judged_at`]): two of the feed timer's longest
 /// gaps (`light-node.md` §6.7), one for a keeper that has not yet read the
 /// change, one for the proof it made just before, proved and carried to
-/// the node. So a revocation binds every replica within it and
+/// the node, with the read's own trip, a replica's lag and clock skew. So a revocation binds every replica within it and
 /// [`CREDENTIAL_HORIZON_MS`], and a gateway that ends a device's feed
 /// answers early at a root the ring holds marks the device's proofs for
 /// no longer; unless the ring's 64 later roots push the root out first.

@@ -100,8 +100,12 @@ frame checks and the agent's placement come first, as for any call):
     check reads (`RootStale`, final for that proof: the device reads the
     feed and proves again at the newest root). Two of the device feed
     timer's longest gaps (`light-node.md` §6.7): a gateway that ends a
-    device's feed answers early, at a root the ring still holds, marks its
-    proofs for that long at most;
+    device's feed answers early, at a root the ring still holds, marks the
+    proofs that run for that long at most. The ring's `since` is the
+    leader's batch time and this check reads the node's clock, so it
+    assumes the nodes' clocks within a few seconds of the leader's; a
+    leader behind by D shortens the grace here by D, and apply's bound
+    holds either way;
 17. a verification slot is free (`Busy`): fewer verifications in flight
     than the node's budget, by default twice its executor threads;
 18. on an executor, the proof verifies under the program the binding

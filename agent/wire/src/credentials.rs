@@ -1101,7 +1101,8 @@ mod tests {
         for now in [batch - 1, batch - HORIZON, batch - 30_000] {
             for expires in [now, now + 1, now + HORIZON / 2, now + HORIZON] {
                 if expires >= batch {
-                    assert!(judged_at(batch, expires) <= now);
+                    let at = judged_at(batch, expires);
+                    assert!(at <= now && at >= batch - HORIZON);
                 }
             }
         }

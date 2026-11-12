@@ -513,14 +513,29 @@ fn a_keeper_off_the_feed_starts_over() {
 /// `ROOT_GRACE_MS` after the change it held back, the root is `Stale`;
 /// the refusal makes the feed due within the spread, and that one read on
 /// the real feed gives the path at the newest root, which the ring accepts,
-/// so the proof is made again with no other step. The grace is two of the
-/// timer's longest gaps, so an honest keeper's root never goes stale
-/// between its reads.
+/// so the proof is made again with no other step. An honest keeper's
+/// reads are less than one and a half periods apart, half the grace, so
+/// its root stays good between its reads with as long again to prove.
 #[test]
 fn a_feed_held_back_meets_the_grace_and_one_read_proves_again() {
     use vos_wire::credentials::{Ring, RootRefusal};
     use vos_wire::defaults::ROOT_GRACE_MS;
-    assert!(ROOT_GRACE_MS >= 2 * (TreeKeeper::PERIOD_MS * 3 / 2));
+    let longest = TreeKeeper::PERIOD_MS * 3 / 2;
+    assert_eq!(ROOT_GRACE_MS, 2 * longest);
+    let mine = secret_member();
+    let quiet = writes(&mine);
+    let end = quiet.changes.len();
+    let mut honest = TreeKeeper::new(mine);
+    honest.ingest(&answer(&quiet.page(0, end)), 0).unwrap();
+    for read in 1..200u64 {
+        let now = read * longest;
+        assert!(honest.due(now), "read {read} later than the longest gap");
+        let request = honest.request(4, &[0x1d; 32], 2, 900).unwrap();
+        assert_eq!(
+            honest.ingest(&quiet.serve(&request), now).unwrap().applied,
+            0
+        );
+    }
 
     let mine = secret_member();
     let mut writes = writes(&mine);

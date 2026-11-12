@@ -711,8 +711,8 @@ across a space's agents wait for the identity agent above.
 - **Built:** `vos-credentials` (`agent/credentials`), `#[actor(credentials)]`;
   the tree's values, the ring and its freshness rule in
   `vos_wire::credentials` (`Ring::accepts`, `RootRefusal::{Unknown,
-  Stale}`, `credentials::judged_at`, `defaults::ROOT_GRACE_MS`), which ingress, apply and the device
-  library share; a reference built from `proving.md` §8 alone equals the
+  Stale}`, `credentials::judged_at`, `defaults::ROOT_GRACE_MS`), which
+  ingress, apply and the device library share; a reference built from `proving.md` §8 alone equals the
   actor's tree over random enrollments and revocations, on a VOS host and
   on the JAM-only host [measured].
 - **Re-founding:** a space that changes venue, or whose anchors
@@ -889,8 +889,8 @@ the device never exports, evaluated once a use after the user's consent
     (and of every space sharing its handle), payment from the account
     `owner(s)` holds, and every nullifier the member has used or will use,
     so the member's past pseudonyms link to it. Revoking the leaf stops
-    auth within `ROOT_GRACE_MS` and the 120 s horizon; it does not stop payment, which reads no
-    tree: the ledger's `rekey(account, owner)` and `freeze(account)`,
+    auth within `ROOT_GRACE_MS` and the 120 s horizon; it does not stop
+    payment, which reads no tree: the ledger's `rekey(account, owner)` and `freeze(account)`,
     under an operator role, do [decided].
   - **The in-space ledger is custodial by design:** an operator who can
     `rekey` can move any account to a key of its choosing. It is the tier

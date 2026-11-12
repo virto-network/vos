@@ -237,9 +237,8 @@ and what a node does with one is `node/SECURITY.md`'s.
 - **What `s` gives a thief:** auth as its member in every scope of the
   space (and of any space sharing its handle), payment from every row
   `owner(s)` owns, and every nullifier the member has used or will use.
-  Revoking the leaf stops auth within `ROOT_GRACE_MS` (90 s) and the
-  120 s horizon; it does not stop
-  payment: the ledger's `rekey` and `freeze` do.
+  Revoking the leaf stops auth within `ROOT_GRACE_MS` (90 s) and the 120 s
+  horizon; it does not stop payment: the ledger's `rekey` and `freeze` do.
 
 ## What the library shows
 
@@ -289,7 +288,9 @@ and what a node does with one is `node/SECURITY.md`'s.
   makes the device prove against an old root, which ingress answers
   `RootStale` or `RootUnknown`: a root the ring still holds passes for
   `ROOT_GRACE_MS` (90 s) after the change that superseded it, so such a
-  mark lasts that long at most, and then the device reads again.
+  mark on what runs and is logged lasts that long at most, and then the
+  device reads again (the withholding gateway still sees the refused
+  proofs it relays).
 - **The feed is read on a jittered timer of its own** (30 s, between
   15 s and 45 s), never because a proof is about to be made: the feed's
   connection is one circuit for as long as it is open, and a read just

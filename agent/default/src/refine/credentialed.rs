@@ -4,9 +4,10 @@
 //! by the release or the agent's log, whatever the node that verified it
 //! admits, when a stock auth claim's root is not fresh at
 //! [`credentials::judged_at`] (the earlier of the batch's time and the
-//! expiry less the horizon, no later than any admitting ingress's
-//! clock, so apply refuses no root ingress admitted), or when a `once` guard admitted its nullifier; else its binding
-//! digest is recorded, whatever the method then does, and the method runs
+//! expiry less the horizon, no later than any admitting ingress's clock,
+//! so apply refuses no root ingress admitted), or when a `once` guard
+//! admitted its nullifier; else its binding digest is recorded, whatever
+//! the method then does, and the method runs
 //! as the call's origin, a `once` guard's nullifier recorded only when the
 //! method returned `Ok`. A kernel guard's handler takes the claim before
 //! the call's arguments, and its checks are its own. A ring the meter

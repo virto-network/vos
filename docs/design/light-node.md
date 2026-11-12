@@ -2871,7 +2871,9 @@ the actor; it is a later extension of the local host (§9.1).
 - at ingress: the generic checks and the proof against the `spend`
   program (§4.3); no pool-specific pre-check;
 - at apply (`pay`): the anchor accepted (newest, or superseded within
-  `ROOT_GRACE_MS`, the credential ring's rule); each nullifier inserted
+  `ROOT_GRACE_MS`, the credential ring's rule, 90 s: a spend proof's
+  larger upload, about 1.2 MB, still fits its 45 s margin at the median
+  circuit, and P2 sets its own window if its measured trip does not); each nullifier inserted
   once (a second is refused, the whole call with it); the memos' hash;
   the commitments appended; the transparent leg applied by cipher-clerk's
   kernel (a withdrawal credits the account `leg` names from the pool's
@@ -3501,7 +3503,10 @@ against a no-flood baseline:
   recent roots, shared by every member that read as far, so the mark is a
   few bits at most, and it lasts only the root's grace (below): ninety
   seconds after the change the device was not shown, its proofs meet
-  `RootStale` and its keeper reads again. Within the grace the mark is the
+  `RootStale` and its keeper reads again. That bounds what is logged
+  and what any other party sees; the gateway itself still sees the
+  refused proofs it relays, each naming the root it chose, for as long as
+  it keeps withholding. Within the grace the mark is the
   split an honest keeper one period behind already shows, which only a
   settled root (below) closes. Of the ways to close it further: a head
   bound to the ring's entry inside the actor alone would show the keeper
@@ -3529,27 +3534,37 @@ against a no-flood baseline:
     apply refuses an expiry before the batch's time, so it is no earlier
     than the batch's time less the horizon. So no replica refuses at
     apply what an ingress admitted on the ring's grace, however long the
-    call waits for its batch (but for a ring that has since dropped the
-    root, refused `StaleRoot` at apply as before), and a revoked or held-back root binds
-    every replica within the grace and the horizon, 3.5 minutes, of its
-    successor's batch, and within the grace at an honest ingress. A call
-    expiring sooner than the horizon is judged at apply as far before its
-    ingress (s4's 60 s expiry: 60 s).
+    call waits for its batch (but for a ring that has since dropped or
+    replaced the root, refused `StaleRoot` at apply), and a revoked or
+    held-back root binds every replica within the grace and the horizon,
+    3.5 minutes, of its successor's batch, and within the grace at an
+    honest ingress. A call expiring sooner than the horizon is judged at
+    apply as far before its ingress (s4's 60 s expiry: 60 s). Ingress
+    compares the leader's batch time (a ring entry's `since`) with its own
+    clock, so it assumes the nodes' clocks within a few seconds of the
+    leader's: a leader behind by D shortens the grace at ingress by D,
+    out of the margin below, one ahead lengthens it by D; apply's bound
+    holds either way.
   - **The margin, an honest phone's:** the grace leaves 45 s for the
-    proof and its trip. The slowest proving measured is the Pixel 1's
+    proof and its trip, and for what the first gap leaves out: the feed
+    read's own round trip, the feed replica's lag behind the leader, a
+    failed read retried (10–20% of fresh onion connections fail, §6.4),
+    and clock skew. The slowest proving measured is the Pixel 1's
     `auth`, 1.5 s at format 46 and 0.92 s at 47 (the Fairphone 6's about
-    0.6 s) [measured, `proving.md` §8]; the slowest trip, a fresh onion
-    connection at the Pixel 1's 95th percentile (11.7 s) and an SSH
-    handshake (3.5 s) when no spare is built, then a 0.8–0.9 MB proof at
-    the slowest circuit measured, 0.07 MB/s (about 13 s) [measured, §6.3,
-    §6.4]: about 30 s in all, a sign-in at the median about 3–6 s. So
-    the grace holds the slowest measured phone with 15 s to spare; a call
-    slower than that (the client gives a proven call 90 s, §6.2) meets
-    `RootStale`, which makes the feed due within 10 s, and the proof made
-    again at the newest root, which no grace refuses, runs. That retry is
-    the app's, once, with no new prompt: the user confirmed the call, not
-    the root (s4 makes the feed due on the answer but shows the refusal
-    today; its re-release takes the retry).
+    0.6 s) [measured, `proving.md` §8]. The trip without a bridge on the
+    Pixel 1, when no spare is built: a fresh onion connection at its 95th
+    percentile (11.7 s), an SSH handshake (3.5 s), then a 0.8–0.9 MB
+    proof at the slowest onion circuit measured, 0.07 MB/s (about 13 s)
+    [measured, §6.3, §6.4]: about 30 s in all, 15 s to spare; a sign-in
+    at the median is about 3–6 s. Through the plain bridge (about
+    0.04 MB/s warm, §6.3: about 23 s for the proof), or on a connection in
+    the desktop's tail (a p95 of 58 s), the call can outlast the grace.
+    A call slower than the margin (the client gives a proven call 90 s,
+    §6.2) meets `RootStale`, which makes the feed due within 10 s, and
+    the proof made again at the newest root, which no grace refuses,
+    runs. That retry is the app's, once, with no new prompt: the user
+    confirmed the call, not the root (s4 makes the feed due on the answer
+    and shows the refusal; its re-release takes the retry).
   - **Not a read before proving:** the keeper still reads on its timer
     alone, since a read just before each proof would join the proofs
     through the feed's circuit (below); the grace is sized to the timer
@@ -4396,9 +4411,8 @@ which leaf proves. *Known limit,* stated. (8.16)
 
 **L8. Path fetches and the logged `map_root`** link a member's proofs.
 *Mitigation:* the credential tree's feed (8.27); a gateway that ends its
-answers early marks the root a device proves against for the root's grace
-alone, 90 s after the change it held back, not the ten minutes a
-superseded root was accepted before (§6.7). *Known limit:* within the
+answers early marks the root a logged proof names for the root's grace
+alone, 90 s after the change it held back (§6.7). *Known limit:* within the
 grace, the split an honest keeper one period behind shows; node-signed
 feed heads are later work (`open.md`). (8.27)
 
