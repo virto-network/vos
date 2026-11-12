@@ -337,6 +337,9 @@ impl Personal {
                 if self.lapsed(now) {
                     return Err(PersonalError::Lapsed);
                 }
+                if !keys.bounded() {
+                    return Err(PersonalError::Malformed);
+                }
                 self.fresh(&[keys.sync, keys.admin])
             }
             Op::Remove(target) => {
@@ -379,6 +382,9 @@ impl Personal {
             Op::Restore { device, kit } => {
                 if matches!(by, Signer::Device(_)) {
                     return Err(PersonalError::NotSigner);
+                }
+                if !device.bounded() {
+                    return Err(PersonalError::Malformed);
                 }
                 self.check_kit(&kit.entries, &[device.sync, device.admin])
             }
@@ -584,9 +590,17 @@ impl Personal {
             },
         );
         if decided {
-            match winner {
-                Some(winner) => self.mature(winner, now, now),
-                None => self.cancel(index, Cancel::Resolved, now),
+            // A replacement upheld still waits out its new key's
+            // probation: due at its own time.
+            let probation = winner
+                .and_then(|winner| self.operations.get(&winner))
+                .filter(|operation| matches!(operation.op, Op::Replace { .. }))
+                .map(|operation| operation.matures)
+                .filter(|matures| *matures > now);
+            match (winner, probation) {
+                (Some(winner), Some(matures)) => self.due.insert(&(matures, winner), &()),
+                (Some(winner), None) => self.mature(winner, now, now),
+                (None, _) => self.cancel(index, Cancel::Resolved, now),
             }
         }
         Ok(Recorded { at: now, index: at })

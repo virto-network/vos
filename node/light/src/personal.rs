@@ -97,6 +97,8 @@ const RECOVERY_ROW: &[u8] = b"s/recovery";
 const AT: &[u8] = b"s/at/";
 const OWN: &[u8] = b"s/own/";
 const WATCH: &[u8] = b"s/watch/";
+/// A removed device's frontier, by its id, as the agent first answered it.
+const FRONTIER: &[u8] = b"s/frontier/";
 
 /// `prefix`'s row of `scope`, at `position` if given.
 fn scope_key(prefix: &[u8], scope: &Scope, position: Option<u64>) -> Vec<u8> {
@@ -257,6 +259,10 @@ pub enum Waiting {
     /// The agent's page skips this position ([`Alarm::Withheld`]): read
     /// again.
     Withheld(u64),
+    /// A move's claim waits beside this group ([`crate::moving::Move`]): its
+    /// keys named what it carries, so nothing more is read here; the scope
+    /// is read at the new home once the move starts its group there.
+    Moving,
 }
 
 /// Why an envelope read was passed over.
@@ -876,8 +882,13 @@ impl<'a, L: Link> SealedSync<'a, L> {
         // epoch.
         drop(Zeroizing::new(self.group.key(scope)?));
         let mut caught = Caught::default();
+        if crate::moving::claiming(self.light.store())? {
+            caught.waiting = Some(Waiting::Moving);
+            return Ok(caught);
+        }
         if self.light.cursor(instance)?.is_none() {
             caught.started = self.start(instance, scope, &mut caught.alarms)?;
+            self.keep_alarms(&caught.alarms)?;
         }
         let mut scan = Scan::new(self.tracked()?);
         loop {
@@ -890,7 +901,7 @@ impl<'a, L: Link> SealedSync<'a, L> {
                     let position = watch.claimed;
                     raise(&mut caught.alarms, Alarm::Partition { scope, position });
                 }
-                self.store_watches(&scan)?;
+                self.store_watches(&scan, &caught.alarms)?;
                 return Ok(caught);
             }
             let mut nodes = Vec::with_capacity(page.len());
@@ -941,12 +952,17 @@ impl<'a, L: Link> SealedSync<'a, L> {
                 to = position;
             }
             if to > from {
-                // What was read at each position, written before the page is
-                // applied: a reading again after a crash writes it the same.
+                // What was read at each position, and the alarms the page
+                // raised, written before the page is applied: a reading
+                // again after a crash writes it the same.
+                at.extend(crate::group::raised_row(
+                    self.light.store(),
+                    &caught.alarms,
+                )?);
                 self.light.store().write_group_rows(at)?;
                 caught.absorb(self.light.ingest(instance, nodes, Some(to))?);
             }
-            self.store_watches(&scan)?;
+            self.store_watches(&scan, &caught.alarms)?;
             if caught.waiting.is_some() {
                 return Ok(caught);
             }
@@ -973,13 +989,25 @@ impl<'a, L: Link> SealedSync<'a, L> {
         })
     }
 
-    fn store_watches(&self, scan: &Scan) -> Result<(), SyncError<L::Error>> {
-        let rows = scan
+    /// `scan`'s watches written, with `alarms` kept in the same batch.
+    fn store_watches(&self, scan: &Scan, alarms: &[Alarm]) -> Result<(), SyncError<L::Error>> {
+        let mut rows: Vec<_> = scan
             .watches
             .iter()
             .map(|(scope, watch)| (scope_key(WATCH, scope, None), Some(watch.encode())))
             .collect();
+        rows.extend(crate::group::raised_row(self.light.store(), alarms)?);
         Ok(self.light.store().write_group_rows(rows)?)
+    }
+
+    /// Keep `alarms` until the chrome acknowledges them
+    /// ([`DeviceGroup::alarms`]): written before what consumed their
+    /// evidence is, so a reading stopped or killed after loses none.
+    pub(crate) fn keep_alarms(&self, alarms: &[Alarm]) -> Result<(), SyncError<L::Error>> {
+        if let Some(row) = crate::group::raised_row(self.light.store(), alarms)? {
+            self.light.store().write_group_rows(vec![row])?;
+        }
+        Ok(())
     }
 
     /// Whether the node an envelope at `instance`'s scope's `position`,
@@ -1020,29 +1048,14 @@ impl<'a, L: Link> SealedSync<'a, L> {
             return Ok(Err(Unusable::Body));
         };
         // A device of a group a move left is read as the set's up to the
-        // node a leaving device carried of it here, whoever pushed it.
-        let carried = self
-            .group
-            .archive()
-            .through(&header.author.0, &scope)
-            .filter(|through| header.seq <= *through);
+        // node the keys of a device of the set name it carried to,
+        // whoever pushed it.
+        let carried = self.carried(scan, scope, &header.author.0, header.seq, position)?;
         let within = match self.group.author(&header.author.0) {
-            None => carried.is_some(),
+            None => carried,
             Some((_, false)) => true,
             Some((device, true)) => {
-                let frontier = match scan.frontiers.entry(device) {
-                    Entry::Occupied(held) => held.into_mut(),
-                    Entry::Vacant(vacant) => vacant.insert(
-                        self.link()?
-                            .frontier(device)
-                            .map_err(SyncError::Link)?
-                            .map_err(SyncError::Refused)?,
-                    ),
-                };
-                let last = frontier
-                    .iter()
-                    .find(|(at, _)| *at == scope)
-                    .map(|(_, last)| *last);
+                let last = self.last(scan, device, scope)?;
                 if !scan.cut.contains(&device) {
                     let removed = Removed {
                         author: header.author,
@@ -1054,7 +1067,7 @@ impl<'a, L: Link> SealedSync<'a, L> {
                         scan.cut.push(device);
                     }
                 }
-                carried.is_some() || last.is_some_and(|last| position <= last)
+                carried || last.is_some_and(|last| position <= last)
             }
         };
         if !within {
@@ -1077,6 +1090,87 @@ impl<'a, L: Link> SealedSync<'a, L> {
             }
         }
         Ok(Ok(Blake2b256::hash(&body.node)))
+    }
+
+    /// The position of `device`'s last envelope in `scope` the agent took
+    /// before its removal matured, its frontier: asked once, and kept, so
+    /// an answer that later names a higher one moves nothing (the removal
+    /// fixed it).
+    fn last(
+        &mut self,
+        scan: &mut Scan,
+        device: DeviceId,
+        scope: Scope,
+    ) -> Result<Option<u64>, SyncError<L::Error>> {
+        let row = [FRONTIER, &device.to_be_bytes()[..]].concat();
+        let frontier = match scan.frontiers.entry(device) {
+            Entry::Occupied(held) => held.into_mut(),
+            Entry::Vacant(vacant) => {
+                let kept = match self.light.store().group_row(&row)? {
+                    Some(bytes) => Frontier::decode_exact(&bytes)
+                        .ok_or(SyncError::Group(GroupError::Corrupt))?,
+                    None => {
+                        let asked = self
+                            .link()?
+                            .frontier(device)
+                            .map_err(SyncError::Link)?
+                            .map_err(SyncError::Refused)?;
+                        self.light
+                            .store()
+                            .write_group_rows(vec![(row, Some(asked.encode()))])?;
+                        asked
+                    }
+                };
+                vacant.insert(kept)
+            }
+        };
+        Ok(frontier
+            .iter()
+            .find(|(at, _)| *at == scope)
+            .map(|(_, last)| *last))
+    }
+
+    /// Whether the node numbered `seq` by `author` at `scope`'s `position`
+    /// was carried by a move: one the keys of a device of the set name up
+    /// to a number past it (`NewDevice::carried`, as the log holds them),
+    /// while that device has a voice, and after its removal only at
+    /// positions up to its frontier.
+    fn carried(
+        &mut self,
+        scan: &mut Scan,
+        scope: Scope,
+        author: &[u8; 32],
+        seq: u64,
+        position: u64,
+    ) -> Result<bool, SyncError<L::Error>> {
+        for (through, removed) in self.group.carriers(author, &scope) {
+            if seq > through {
+                continue;
+            }
+            match removed {
+                None => return Ok(true),
+                Some(carrier) => {
+                    if self
+                        .last(scan, carrier, scope)?
+                        .is_some_and(|last| position <= last)
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// The number up to which `author`'s nodes in `scope` were carried, as
+    /// the keys of a device of the set with a voice name it.
+    fn carried_through(&self, author: &[u8; 32], scope: &Scope) -> Option<u64> {
+        self.group
+            .carriers(author, scope)
+            .into_iter()
+            .filter(|(_, removed)| removed.is_none())
+            .map(|(through, _)| through)
+            .max()
     }
 
     /// Cut a removed device's author off in `instance`'s scope, one past its
@@ -1125,8 +1219,8 @@ impl<'a, L: Link> SealedSync<'a, L> {
         let Some(mut from) = from else {
             return Ok(false);
         };
-        if let Some(through) = self.group.archive().through(&removed.author.0, &scope) {
-            from = from.max(through + 1);
+        if let Some(through) = self.carried_through(&removed.author.0, &scope) {
+            from = from.max(through.saturating_add(1));
         }
         self.light.cut_off(instance, removed.author, from)?;
         Ok(true)
@@ -1194,6 +1288,7 @@ impl<'a, L: Link> SealedSync<'a, L> {
                 continue;
             }
             raise(&mut audited.alarms, Alarm::Deleted { scope, position });
+            self.keep_alarms(&audited.alarms)?;
             let Some(node) = self
                 .light
                 .node(instance, &merkle_crdt::Cid::<Blake2b256>(cid))?

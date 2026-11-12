@@ -1028,8 +1028,25 @@ arm64-v8a build; the phones' timings below are S8-P1's]:
   alone; a call the new key signs while the maturity's evidence is still
   to come waits for it (the commit is neither processed nor refused) and
   falls if it never verifies, so a late evidence makes no false refusal.
+- **The policy's delays** [built]: the claim's configuration (one
+  logged before its assignment, or the one beside it) sets the delays
+  and windows the device set's rules run on (`operation_delay_ms`,
+  `kit_delay_ms`, `probation_ms`, `seasoning_ms`, `confirm_window_ms`); a
+  paired device takes its pairing device's. A `Configured` logged later
+  is the operators' word, and a lowered delay would mature an operation
+  inside the window §3.5's rules give the devices to veto it, which B8
+  denies the operators: a device takes from it the quotas, the lease and
+  the inbox, keeps each delay and window at the higher of the two
+  (`Policy::over`), and raises `Alarm::Policy` for one it lowers; an
+  operation then asserted matured inside the kept delay is `Unsigned`.
+  `Personal::configure` applies the same rule once a claim assigned the
+  agent, so an honest home logs no lowered delay. Lowering a delay would
+  need an operation of the device set's own, signed as §3.5's are; none
+  is built. A raised delay is taken: the operators can lengthen any
+  delay without bound, which stops removals and restores maturing, a
+  withholding B8 concedes them already.
 - **Not built here:** a restore's device's view of operations opened
-  before its read; an alarm on a `Configured` that lowers a delay. A
+  before its read. A
   device that cannot follow takes the device a confirmed candidate adds
   into its set by the agent's word, so that device's nodes have a known
   author.
@@ -1301,6 +1318,9 @@ where the rules above leave a choice, this is the one taken]:
   not; the kit cosigns only a regroup. `resolve(op, upheld)` names the
   operation that matures, its rival in a pair dropped (or, not upheld,
   the reverse): the kit's acts at once, a device's when a second agrees.
+  A replacement upheld still waits out its new key's probation [E29]: it
+  matures at its own time, and a device takes no maturity of one
+  asserted before it.
 - **A frozen probation** keeps the time it had left when the first removal
   against it opened, and runs it from when the last one closes.
 - **Keys an operation brings are claimed** while it is open (a matured
@@ -1372,7 +1392,13 @@ where the text above leaves a choice, this is the one taken]:
   once; a rotation's and a restore's at their verified maturity; a
   commit's at the agent's verdict confirming it, which is where the agent
   installs the commit's `R2` and moves the kit's reading of the recovery
-  scope on. Each admin call names its `R` by `r_hash` (`NewKit::r_hash`),
+  scope on. A verdict that does not confirm an epoch this device
+  confirmed by its own count with a re-sealing commit (a `Void` the
+  operators log) names no `R`, and leaves the device holding none it may
+  push under: the agent installed no `R2` for the new one, and the one
+  before is the removed device's. So nothing reaches the recovery scope
+  under either, and the device's next commit re-seals the kit; the
+  `Verdict` alarm tells its user to make one. Each admin call names its `R` by `r_hash` (`NewKit::r_hash`),
   and a device takes an `R` another's archive brings only when it is the
   one the log named last, so `R` travels in archives sealed under an
   epoch's archive key, never under an epoch a removed device was in.
@@ -1400,12 +1426,13 @@ where the text above leaves a choice, this is the one taken]:
   recovered archive in (`DeviceGroup::inherit`): the old group's naming
   secret kept beside its own, so old scopes keep their ids and new ones
   are named afresh. **Elsewhere:** the restore at the old agent releases
-  `R2`; the device claims an agent at another home with the next kit
-  split anew there, and reads its old scopes from the old agent with the
-  recovered archive (`personal::read_back`), then carries them to the new
-  home (`SealedSync::carry`), the old agent's device set recorded as its
-  carried authors up to the nodes it read back (`moving::carried`,
-  `DeviceGroup::record_authors`, §3.9 "Moving home as built").
+  `R2`; the device takes the recovered archive in (`group::recovered`)
+  and reads its old scopes from the old agent with it
+  (`personal::read_back`), then claims an agent at another home with the
+  next kit split anew there, its keys naming the old agent's device set
+  as its carried authors up to the nodes it read back
+  (`moving::carried`, §3.9 "Moving home as built"), and carries them to
+  the new home (`SealedSync::carry`).
 - **Liveness:** every device with a voice that reads an open restore
   posts `alive` (`Event::Alive`) until the log cancels it, and shows a
   kit-signed operation for as long as it is open (`Alarm::Kit`); the
@@ -1550,8 +1577,16 @@ the one taken]:
   secret (`"vos/personal/archive"`, apart from every instance's
   four-byte name). `SealedSync::archive` reads it from its cursor and
   merges every archive sealed at the confirmed epoch (its chunks
-  reassembled and checked against their digest), its `R` only when it is
-  the one the log named last (by `r_hash`); unless one
+  reassembled and checked against their digest), bounded by what any
+  device of the epoch may bring (`DeviceGroup::merge_read`): the keys of
+  the epochs before the confirmed one (a device exports the confirmed
+  epoch's itself, and no device holds a later one); its `R` only when it
+  is the one the log named last (by `r_hash`); and no earlier group's
+  naming secret or scope, which come from a device's own restore and
+  from a pairing alone. An archive names no carried author at all: the
+  authors a move carried are named by the device set's keys in the
+  control log (`NewDevice::carried`, §3.9). So a device, removed later,
+  leaves behind no author or key that outlives its removal (A7); unless one
   there encodes as this device's whole archive (candidates are kept in
   order, so equal archives encode alike), it pushes its own, chunked,
   under the epoch's archive key. The committer's push and the push of any
@@ -1607,7 +1642,12 @@ choice, this is the one taken]:
   on, and raises `View` if the agent's head stops short of it. The caller
   hands the agent's head to `DeviceGroup::head` after reading the log to
   its end: one behind the device's view, or diverging at it, is a
-  `Rollback` (B3). An entry served again behind the cursor that does not
+  `Rollback` (B3); one past it is kept, the log read again and the head
+  given again (the job does both), and a kept head the log still does
+  not reach is entries withheld (`Unserved`), the views and the calls
+  past the cursor then counted unreached (`View`, `Dropped`). So the
+  operators cannot silence them by naming a head one past what they
+  serve. An entry served again behind the cursor that does not
   chain as the device read it stops the reading with `Log` (a fork behind
   the cursor). A view before a paired device's first index passes
   unchecked.
@@ -1735,8 +1775,15 @@ cases before the device-change windows are pinned (§8, D5).
   pending restore (this device posted `alive`; every other device reads
   the kit's operation, `Alarm::Kit`); its removal and that it cannot
   follow, from its course, at every pass while they hold; the yearly
-  re-proof (`home::renewal_due`); every alarm, on the pass that raised
-  it. `Personal`'s
+  re-proof (`home::renewal_due`); every alarm kept and not yet
+  acknowledged. **Alarms are rows:** each is written in the batch that
+  consumes its evidence (the device group's state, a page's positions,
+  a scope's watches), or before the write that does (a checkpoint's
+  marks, an audit's push again), and kept (`DeviceGroup::alarms`, at most
+  64, a flood of one kind evicting only its own) until the chrome, its
+  user having seen it, acknowledges it (`DeviceGroup::acknowledge`). A
+  pass killed or stopped after the request that raised one, or a request
+  the operators fail after it, loses none (B3, B4, B19). `Personal`'s
   `devices` gives each device's last call (`DeviceView::seen`, the `seen`
   table the confirming set is drawn from): each device's last sync as the
   chrome shows it, for a device whose sync made a call (a push, a vote,
@@ -2000,7 +2047,7 @@ the move completes, the kit opens nothing at the new home. The old
 operators keep what they held; deletion there cannot be verified.
 
 **Moving home as built** [built, `vos_light::moving`,
-`personal::SealedSync::carry`; tested against `Personal` at two homes in
+`personal::SealedSync::carry`; tested against `Personal` at three homes, and a restore at the third, in
 `node/light/tests/sealed/moving.rs`, and end to end on three nodes holding
 two home-only homes (each its own agent, credential actor and handle, and
 `Homes`, in the nodes' one space), through their sockets with the onion's
@@ -2011,7 +2058,14 @@ choice, this is the one taken]:
   there) and claims the agent that home's `Homes` answers `pooled` for, as
   a first claim does (§3.8): the kit's keys given split anew at that
   agent, `R1` sealed to its identity, the new `R2` in the claim, the
-  device's "home" nullifier the new home's. The claim is held in the store
+  device's "home" nullifier the new home's. Its keys in the claim name
+  what it carries (`NewDevice::carried`, `moving::naming`): each device
+  of the old set, removed ones' too, and each author the old set's keys
+  named as carried, in each scope up to the highest of its nodes the
+  device holds there short of its cutoff (`moving::carried`); so a
+  second move carries what the first did. While the claim waits, the old
+  group's scopes are read no more (`Waiting::Moving`), so the move holds
+  nothing past what its keys named. The claim is held in the store
   beside the group it leaves; a second move or claim is refused, and so
   are a move to the agent the group has and one from a device that cannot
   follow its group or is out of it. A claim `Homes` refuses is abandoned
@@ -2032,17 +2086,15 @@ choice, this is the one taken]:
   (`Light::forget_feed`, `merkle_crdt::Replica::forget_cursor`), then in
   one batch the old group's state, the log's chains it kept, its MLS state
   and every row of its sealed sync deleted, the MLS state's generation
-  moved on; the archive kept without the old `R`, and each device of the
-  old set recorded there as a carried author in each scope, up to the
-  highest of its nodes the device holds there short of its cutoff
-  (`Archive::authors`, `moving::carried`). Then the device's group alone
+  moved on; the archive kept without the old `R`. Then the device's group alone
   at the new agent (`DeviceGroup::create`), its `R` the new split's. The
   naming secret stays: the scopes keep their ids, at both homes.
-- **Push everything** (`moving::finish`): the archive first, so that the
-  carried authors reach the readers before their nodes; each installed
+- **Push everything** (`moving::finish`): the archive first; each installed
   scope read at the new agent, then every node it holds that this device
   neither read nor pushed there carried (`SealedSync::carry`), in causal
-  order, a node past its author's cutoff left behind, and read back, so
+  order, a node past its author's cutoff left behind (and so is one of
+  an author no device of the set is, past what the set's keys name of
+  it), and read back, so
   that whatever another device pushed between the carried envelopes is
   read too; the archive again; then, the move done, the recovery
   envelopes under the new `R`, which `SealedSync::recovery` pushes no
@@ -2050,24 +2102,45 @@ choice, this is the one taken]:
   in the store before they are sent and sent again as they are, its own
   nodes leaving the outbox round by round.
 - **Readers at the new home** take a carried author's node as the set's up
-  to its number there, whoever pushed it (`SealedSync::catch_up`). A
-  device of the old set removed at the new home is cut off at its
-  frontier there, never below one past what was carried of it, and a
-  frontier envelope holding another author's carried node gives no
-  cutoff of its own. A restore elsewhere records the old agent's device
-  set the same way, from the nodes it read back, before it carries its old
-  scopes (`DeviceGroup::record_authors`).
+  to the number a device's keys name it to there, whoever pushed it
+  (`SealedSync::catch_up`, `DeviceGroup::carriers`). The keys are the
+  log's: the mover's as its claim put them, a re-paired device's as the
+  commit adding it put them, which its opener's admin key signed and
+  every device verifies; a paired device takes the others' from its
+  pairing device's word, as it takes the device set, and a restore from
+  the agent's, as it takes the device set (§8, D1). No archive names an
+  author, so no device of the set, later removed, plants one through
+  its archive, and the operators plant none. A reader
+  takes a named author's nodes as the set's while the device naming it
+  has a voice, then, once its removal matured, only at positions up to
+  that device's frontier, the first one the agent answered and kept
+  (`s/frontier/`), so a device that named an author of its own making
+  writes through it no later than it could itself (A7). A device
+  of the old set removed at the new home is cut off at its frontier
+  there, never below one past what a device with a voice names of it,
+  and a frontier envelope holding another author's carried node gives no
+  cutoff of its own. A restore elsewhere names the old agent's device set
+  the same way in the keys it claims with, from the nodes it read back
+  before the claim (`group::recovered`, `personal::read_back`): the set
+  as the old agent's operators show it, and the nodes as read back, with
+  no author, frontier or epoch checked (`read_back`, an open finding of
+  its own), so what it names is the old home's word
+  as much as a restore at home takes it.
 - **Re-pair** (`moving::rejoin`): each other device pairs again by QR from
   a device at the new home whose move is done, its handles in the other
   spaces kept (the offer names none). It reads the old home to its end
-  first (the app's step). Its key package is made beside its old group, in
+  first (the app's step), then names what it carries in the keys its
+  hello gives (`moving::naming`, as the mover's claim does), which the
+  commit adding it puts in the new home's log; what it reads at the old
+  home after its hello is past what it named, and stays behind. Its key
+  package is made beside its old group, in
   the next MLS generation of its store (`DeviceGroup::key_package`, an
   earlier attempt's dropped), so a pairing cut short before the handover
   leaves the old group standing. On the handover it gives up its old group
   and leaves it as the mover did, then joins (`DeviceGroup::rejoin`),
   refused before anything is left for a pairing of another personal space
-  (its naming secrets none of the store's); its archive's keys and carried
-  authors are kept beside the pairing's. It starts its scopes from the
+  (its naming secrets none of the store's); its archive's keys are kept
+  beside the pairing's. It starts its scopes from the
   checkpoints handed over and carries what the new home lacks
   (`moving::finish` again): what it, and the devices still at the old
   home, wrote there after the move. A re-pair cut short after the handover
@@ -2078,8 +2151,8 @@ choice, this is the one taken]:
   confirmation window lapses, as any sleeper does. At its next reading it
   finds the notice, and the app asks for the re-pairing. What it, or a
   device paired there meanwhile, writes reaches the new home with the
-  first device to pair again after reading it, and that device's archive
-  brings the authors.
+  first device to pair again after reading it, and the commit adding
+  that device names the authors.
 - **What the old home keeps:** what it held, for as long as its operators
   keep it: the control log, each scope's ciphertext to the move, the
   recovery envelopes under the old `R`, and the old `R2` with the old
@@ -2104,7 +2177,12 @@ choice, this is the one taken]:
   homes' operators together link the two agents, as the time and size of
   the carry do; a carried author's bound grows with each device that
   leaves the old home, so what an old device never removed there writes
-  before the last leaves is carried; an opener whose own move is not done
+  before the last leaves is carried; the device set's keys at the new
+  home show the operators the old set's sync keys and how far each wrote
+  in each scope (each scope's id and node count, already theirs at the
+  old home); a device's keys name at most 64 carried authors
+  (`vos_wire::personal::CARRIED`, one an author and a scope), so a space whose old
+  set wrote in more scopes than that allows does not move (`Carried`); an opener whose own move is not done
   is not refused by the library; the old home's `Homes` keeps the moved
   devices' nullifiers until its lease lapses; a crash inside the leave is
   argued, not tested.
@@ -3398,18 +3476,54 @@ against a no-flood baseline:
   (arti-client 0.45, 0.46 and 0.47 in August, September and October 2026).
 
 **The credential tree's feed** [built: the credential actor's
-`feed(from)`, `vos_light::TreeKeeper`, `Client::read_tree`]:
+`feed(from)` and `feed_after(root)`, `vos_light::TreeKeeper`,
+`Client::read_tree`]:
 - **The actor keeps every write of its tree** as a `Change`
   (`vos_wire::credentials`): the leaves it set, each at its slot, and the
   root it left with the batch time it became the root, the entry it left
   in the ring. `feed(from)` serves them in order from the `from`th, as
   many as 48 KiB holds (`FEED_BYTES`, at least one), with the feed's
   length; any caller reads it, as every member reads the same feed.
+  `feed_after(root)` serves the page after the last change that left
+  `root` (the actor indexes each root by its last write, `roots`), none
+  for a root no change left.
+- **The query names no place of the device's** [built]: a keeper's first
+  read is `feed(0)`, every keeper's first, and every read after is
+  `feed_after` the root it holds. The place in the feed is the answers'
+  word: a gateway padding them with changes that undo each other would
+  leave the device's place its own, a mark in every query after on every
+  circuit; the root it is left at is every member's that read as far,
+  and a root a gateway forged fails the next proof (`RootUnknown`), not
+  silently. *Known limit:* a gateway can still end its answers early, at
+  a root of its choosing. One the ring does not hold (a historical root,
+  a batch's first) fails every proof, and two such refusals with no
+  change read between drop the tree; one the ring holds is one of its 64
+  recent roots, shared by every member that read as far, so the mark is a
+  few bits at most and lasts only while those proofs still pass. A head
+  bound to the ring's entry inside the actor alone would show the keeper
+  nothing, since every answer, the binding with it, is the gateway's to
+  forge, and the ring accepts any of its roots for `ROOT_MAX_AGE`; closing
+  it takes a change beyond the actor (open, for the owner): ingress and
+  the refine accepting a superseded root for about one feed period only
+  (the node and the agent's blob; it shortens the mark to the split an
+  honest keeper one period behind shows), the head bound into the proven
+  statement with that rule, or answers the keeper can authenticate past
+  the gateway (the node's own signature over the feed's head).
+- **Back onto the real feed** [built]: a keeper whose pages are refused,
+  or whose root the actor knows no change leaving (a fork a gateway
+  served, a re-founded space whose feed starts again), two reads in a
+  row drops its tree and reads from `feed(0)` again (`Synced::reset`);
+  one such read, as from a replica behind the keeper's, holds nothing
+  new. So does one whose proofs meet `RootUnknown` or `RootStale` twice
+  with no change read between (`TreeKeeper::unknown`): a root the
+  gateway keeps answering with empty pages is left too. A gateway can
+  force such a start over each minute or so, a re-read of the whole feed:
+  a cost, not a mark, as `feed(0)` is every keeper's.
 - **The device keeps the whole tree** (`TreeKeeper`): each page applied
   at once, each slot's last leaf and every node above them computed once,
   and refused whole unless the tree it leaves has the root its last change
-  names (the one root a proof uses, which binds every leaf), its changes
-  in order and from the keeper's place. The member's path is computed on
+  names (the one root a proof uses, which binds every leaf) and its
+  changes are in order. The member's path is computed on
   the device, so no query names the member: the path leak ends, and each
   proof is against the newest root the device read. The tree is kept
   outside any synced scope (`encode`, `restore`, the root checked on
@@ -3768,7 +3882,13 @@ gap of more than a few hundred commits prefers re-pairing. (8.19)
 takes only the confirmed epoch; the agent refuses its keys; devices accept
 its envelopes only up to its frontier, and the CRDT types filter its
 writes at read; the light node cuts it off there, so its later operations
-are quarantined wherever they arrive [built]. (8.18a, 8.18b, 8.20)
+are quarantined wherever they arrive [built]. Nor does it leave a
+writer behind: an archive names no carried author, and an archive read
+takes no key of an epoch past the confirmed one; a carried author is one
+the device set's keys name in the control log (`NewDevice::carried`, the
+claim's, or an add's that an admin signed), read only while the device
+naming it has a voice and, once its removal matured, up to its frontier
+[built]. (8.18a, 8.18b, 8.20)
 
 **A8. A write made offline leaks to a device removed meanwhile.**
 *Mitigation:* seal at push under the confirmed epoch read just before;
@@ -3900,7 +4020,11 @@ serving a removed device data sealed before its removal's epoch is
 confirmed, for up to 72 h after the 72 h removal delay, six days in all.
 **Acting alone,** they can hold back a genuine admin-signed commit until a
 device is quiet and name it absent in the logged confirming set, locking
-it out until it re-pairs or regroups; they cannot make a commit.
+it out until it re-pairs or regroups; they cannot make a commit. Nor can
+they shorten a delay (a later `Configured` lowers none on any device,
+§3.4), nor keep the old `R` in force past a removal by logging `Void`
+over the devices' own count (§3.5), nor silence a view or a dropped call
+by naming a head they do not serve (§3.6) [built].
 *Known limit:* the home is trusted for availability, order and time
 (`core-model.md` §5); the owner's remedies are two seasoned devices'
 immediate removal and moving home. (8.28)

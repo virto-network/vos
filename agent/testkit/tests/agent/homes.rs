@@ -69,6 +69,7 @@ fn claimant(n: u32) -> NewDevice {
         },
         nullifier: nullifier(n),
         label: vec![7; 24],
+        carried: Vec::new(),
     }
 }
 

@@ -34,7 +34,6 @@ fn open(dir: &std::path::Path, agent: &[u8]) -> Light {
         keys: Vec::new(),
         recovery: None,
         drawn: Vec::new(),
-        authors: Vec::new(),
     };
     light.store().adopt(&shared).unwrap();
     light

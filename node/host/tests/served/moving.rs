@@ -283,6 +283,11 @@ fn pair(
     let Joined::Offer(_) = joiner.read(&inbox(sockets, personal, &slot.key)).unwrap() else {
         panic!("the offer")
     };
+    // A device of the group the move left names what it carries.
+    let device = match joiner_phone.group.as_ref() {
+        Some(old) => moving::naming(&joiner_phone.light, old, device).unwrap(),
+        None => device,
+    };
     let now = sockets.time();
     let hello = Hello {
         key_package: DeviceGroup::key_package(joiner_phone.light.store(), &device, now).unwrap(),
@@ -427,7 +432,7 @@ fn a_personal_space_moves_home_and_its_other_phone_pairs_again() {
     moved.nullifier = elsewhere.nullifier(&first.secret(&ELSEWHERE));
     let keys: Vec<KitKey> = vec![next.key()];
     let held = Move::prepare(
-        first.light.store(),
+        &first.light,
         first.group.as_ref().unwrap(),
         moved,
         keys,

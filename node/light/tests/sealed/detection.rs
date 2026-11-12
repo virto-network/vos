@@ -236,7 +236,7 @@ fn write(
 /// A node of `instance` by `phone`, `edit` applied to its bytes, sealed for
 /// the agent under `key` at `epoch` with the writer's view and `seen`
 /// positions it has: what one holding that key could have pushed.
-fn sealed_by(
+pub(super) fn sealed_by(
     phone: &Phone,
     instance: InstanceId,
     key: &[u8; 32],
@@ -623,6 +623,243 @@ fn a_dropped_veto_raises_the_alarm_and_holds_its_removal_back() {
             .author(&b.sync_key())
             .is_some_and(|(_, removed)| removed)
     );
+}
+
+/// B8 and the views (§3.6): the operators claim a head one past what they
+/// serve, so a head at or behind the cursor never comes. The device reads
+/// the log again; a head it still does not reach is entries withheld, and
+/// the veto the agent took and the writer's view it holds past the cursor
+/// count as unreached. A head the log reaches when read again, as when an
+/// entry lands between the reading and the head, raises nothing.
+#[test]
+fn a_head_claimed_past_what_is_served_silences_nothing() {
+    let (mut home, mut phones) = household(2);
+    let (a, b) = phones.split_at_mut(1);
+    let (a, b) = (&mut a[0], &mut b[0]);
+    let op = operate(
+        &mut home,
+        &a.admin.clone(),
+        &a.sync.clone(),
+        "remove",
+        1u32.encode(),
+        None,
+    );
+    read(&mut home, b);
+    let cursor = b.group().cursor();
+    let veto = home.sign(&b.admin, "veto", op.encode());
+    b.group().made(cursor, &veto.message).unwrap();
+    assert_eq!(b.group().check_view(cursor + 1, [7; 32]).unwrap(), None);
+    let mut alarms = Vec::new();
+    for _ in 0..2 {
+        assert!(b.group().follow(Vec::new()).unwrap().is_empty());
+        alarms.extend(b.group().head(cursor + 1, [9; 32]).unwrap());
+    }
+    for alarm in [
+        Alarm::Unserved { next: cursor + 1 },
+        Alarm::Dropped { index: cursor },
+        Alarm::View { index: cursor + 1 },
+    ] {
+        assert!(alarms.contains(&alarm), "{alarm:?}: {alarms:?}");
+    }
+
+    let cursor = a.group().cursor();
+    home.pass(61 * MIN);
+    a.alive(&mut home);
+    let overview: Overview = home.query(a.sync_key(), "overview", ().encode()).unwrap();
+    assert!(overview.next > cursor);
+    assert!(
+        a.group()
+            .head(overview.next, overview.chain)
+            .unwrap()
+            .is_empty()
+    );
+    let events = read(&mut home, a);
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Alarm(_))),
+        "{events:?}"
+    );
+}
+
+/// L6: a configuration logged after the claim's lowers no delay. The
+/// operators log one with every delay zero, then an operation a stolen
+/// admin key signed, asserted matured at once: the device raises the
+/// alarm on the configuration, keeps its delays, and honours nothing.
+#[test]
+fn a_later_configuration_lowers_no_delay() {
+    let (mut home, mut phones) = household(2);
+    let (a, b) = phones.split_at_mut(1);
+    let (a, b) = (&mut a[0], &mut b[0]);
+    let at = home.now;
+    let arguments = 1u32.encode();
+    let call = AdminCall {
+        origin: a.admin.verifying_key().to_bytes(),
+        method: home.method("remove").0,
+        arguments: arguments.clone(),
+    };
+    let stolen = home.sign(&a.admin, "remove", arguments);
+    let zero = vos_wire::personal::Policy {
+        operation_delay_ms: 0,
+        kit_delay_ms: 0,
+        probation_ms: 0,
+        seasoning_ms: 0,
+        confirm_window_ms: 0,
+        ..policy()
+    };
+    let mut configured = 0;
+    let log = shown_log(&home, b, |entries| {
+        let (_, last) = entries.last().cloned().unwrap();
+        configured = entries.len() as u64;
+        let index = configured + 1;
+        let mut entry = |body: Body| {
+            let mut entry = last.clone();
+            entry.at = at;
+            entry.body = body;
+            entries.push((0, entry));
+        };
+        entry(Body::Configured(zero));
+        entry(Body::Operation {
+            call,
+            by: Signer::Device(0),
+            op: Op::Remove(1),
+            matures: at,
+        });
+        entry(Body::Evidence {
+            index,
+            message: stolen.message,
+            signature: stolen.signature,
+            welcome: None,
+        });
+        entry(Body::Settled {
+            op: index,
+            state: OpState::Matured { at },
+        });
+        entry(Body::Matured { device: 1 });
+    });
+    let events = follow_shown(&mut home, b, log);
+    assert!(!events.contains(&Event::Removed), "{events:?}");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::Alarm(Alarm::Unsigned { .. }))),
+        "{events:?}"
+    );
+    assert!(
+        alarmed(&events, Alarm::Policy { index: configured }),
+        "{events:?}"
+    );
+    assert_eq!(
+        b.group().policy().operation_delay_ms,
+        policy().operation_delay_ms
+    );
+    assert!(
+        b.group
+            .as_ref()
+            .unwrap()
+            .author(&b.keys.sync)
+            .is_some_and(|(_, removed)| !removed)
+    );
+}
+
+/// A7 for archives (§3.4, §3.6): a phone of the group plants candidate
+/// keys of later epochs in the archive it pushes, and seals a node of an
+/// author no device's keys name under the epoch's key. The other phones
+/// take from an archive read only the keys of the epochs before their
+/// confirmed one, and no archive names an author: the node is passed over
+/// while the phone has a voice, and so is one the planted author wrote
+/// under the key of an epoch the phone was in, placed by the operators
+/// after its removal. A restore taking in an archive names no author
+/// either: only the device set's keys carry one.
+#[test]
+fn an_archive_plants_no_author_and_no_later_key() {
+    let (mut home, mut phones, _) = super::kit::household_with(3, vec![kit_key(0)]);
+    let scope = scope_of(&phones[0], NOTES);
+    let epoch = phones[0].group().confirmed();
+    let stranger = Phone::new(9);
+    assert!(stranger.store.adopt(phones[0].group().archive()).unwrap());
+    install(&stranger.light, NOTES);
+    assert_eq!(scope_of(&stranger, NOTES), scope);
+    let planted_key = [0x77; 32];
+    let mut planted = phones[2].group().archive().shareable();
+    for later in epoch + 1..epoch + 3 {
+        planted.record(later, scope, planted_key);
+    }
+    phones[2].group().merge_archive(&planted).unwrap();
+    with(&mut home, &mut phones[2], &[], |sync| sync.archive()).unwrap();
+    for phone in &mut phones[..2] {
+        let kept = with(&mut home, phone, &[], |sync| sync.archive()).unwrap();
+        assert!(kept.found > 0);
+        let archive = phone.group().archive();
+        assert!(!archive.keys(epoch + 1, &scope).contains(&planted_key));
+    }
+
+    // The stranger's node sealed under the epoch's key while the phone
+    // that planted the archive has a voice, read by another.
+    let known_key = phones[0].group().key(scope).unwrap();
+    let sealed_node = |phones: &mut [Phone], key: u64| {
+        set(&stranger.light, NOTES, key, key * 10);
+        let node = stranger.light.outbox(NOTES).unwrap().pop().unwrap().bytes;
+        let (index, chain) = phones[0].group().view();
+        let body = Sealed {
+            node,
+            view: View { index, chain },
+            seen: vec![(scope, 0)],
+        }
+        .sealable(&scope)
+        .unwrap();
+        sealed::seal(&known_key, &home::IDENTITY, scope, epoch, &body).unwrap()
+    };
+    let envelope = sealed_node(&mut phones, 98);
+    let caught = shown(
+        &mut home,
+        &mut phones[0],
+        &[NOTES],
+        placed(scope, envelope),
+        |sync| sync.catch_up(NOTES),
+    )
+    .unwrap();
+    assert_eq!(caught.passed.len(), 1);
+    assert_eq!(caught.passed[0].why, Unusable::Author);
+    assert_eq!(count(&phones[0].light, NOTES, 98), None);
+
+    let removal = operate(
+        &mut home,
+        &phones[0].admin.clone(),
+        &phones[0].sync.clone(),
+        "remove",
+        2u32.encode(),
+        None,
+    );
+    operate(
+        &mut home,
+        &phones[1].admin.clone(),
+        &phones[1].sync.clone(),
+        "cosign",
+        removal.encode(),
+        None,
+    );
+    settle(&mut home, &mut phones[..2]);
+    phones[0].update(&mut home).unwrap();
+    settle(&mut home, &mut phones[..2]);
+    assert_eq!(phones[1].group().confirmed(), epoch + 1);
+
+    let envelope = sealed_node(&mut phones, 99);
+    let caught = shown(
+        &mut home,
+        &mut phones[1],
+        &[NOTES],
+        placed(scope, envelope),
+        |sync| sync.catch_up(NOTES),
+    )
+    .unwrap();
+    assert_eq!(caught.passed.len(), 1);
+    assert_eq!(caught.passed[0].why, Unusable::Author);
+    assert_eq!(count(&phones[1].light, NOTES, 99), None);
+
+    let recovered = phones[2].group().archive().shareable();
+    phones[0].group().inherit(&recovered).unwrap();
+    let group = phones[0].group.as_ref().unwrap();
+    assert!(group.carriers(&stranger.sync_key(), &scope).is_empty());
+    assert!(!group.moved_authors().contains(&stranger.sync_key()));
 }
 
 /// B6: the operators forge a device-set operation, a removal with evidence

@@ -35,7 +35,7 @@ use crate::group::Archive;
 /// The number of the store's layout: where its rows live. A store written
 /// in another is refused at open. Numbered apart from the node's store's
 /// layouts.
-pub const LAYOUT: u32 = 3;
+pub const LAYOUT: u32 = 5;
 
 /// The block cache the store keeps by default: a phone's.
 pub const CACHE_BYTES: u64 = 16 << 20;

@@ -194,6 +194,32 @@ pub struct NewDevice {
     pub nullifier: [u8; 32],
     /// Its label, sealed to the device group.
     pub label: Vec<u8>,
+    /// The authors it carries from the groups it left (`light-node.md`
+    /// §3.9), by author and scope, at most [`CARRIED`]: none for a device
+    /// that left no group.
+    pub carried: Vec<CarriedAuthor>,
+}
+
+/// The most carried authors a device's keys name: eight devices' in eight
+/// scopes, so the device set's views stay well within a reply.
+pub const CARRIED: usize = 64;
+
+impl NewDevice {
+    /// Whether it names at most [`CARRIED`] carried authors.
+    pub fn bounded(&self) -> bool {
+        self.carried.len() <= CARRIED
+    }
+}
+
+/// An author a device carries from a group it left: a device of that
+/// group, its nodes in `scope` read as the set's up to number `through`,
+/// while the carrying device has a voice and, once its removal matured,
+/// at positions up to its frontier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct CarriedAuthor {
+    pub author: [u8; 32],
+    pub scope: Scope,
+    pub through: u64,
 }
 
 /// A device in the set.
@@ -491,6 +517,22 @@ impl Policy {
         inbox_ttl_ms: 7 * DAY_MS,
         slot_ttl_ms: 10 * 60 * 1000,
     };
+
+    /// This policy configured over `held`, the one the claim set: its
+    /// quotas, lease and inbox, and each delay and window of the device
+    /// set's rules no lower than `held`'s. Only the claim sets those: a
+    /// later configuration is the operators' word, and a lowered delay
+    /// would let an operation mature before its window to veto it.
+    pub fn over(self, held: &Policy) -> Policy {
+        Policy {
+            operation_delay_ms: self.operation_delay_ms.max(held.operation_delay_ms),
+            kit_delay_ms: self.kit_delay_ms.max(held.kit_delay_ms),
+            probation_ms: self.probation_ms.max(held.probation_ms),
+            seasoning_ms: self.seasoning_ms.max(held.seasoning_ms),
+            confirm_window_ms: self.confirm_window_ms.max(held.confirm_window_ms),
+            ..self
+        }
+    }
 }
 
 /// A commit's declared effect: the device it adds, inline for a strong

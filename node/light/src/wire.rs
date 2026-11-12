@@ -173,8 +173,35 @@ pub fn feed_query(
     query_request(agent, identity, instance, "feed", from.encode(), not_after)
 }
 
+/// A query of the credential actor's `feed_after(root)`, the tree's
+/// changes after the last that left `root`, at `instance` of `agent`,
+/// signed by a fresh key over the agent's `identity`: it names the root,
+/// which every member that read the feed as far holds, and no place.
+pub fn feed_after_query(
+    agent: u32,
+    identity: &[u8; 32],
+    instance: u32,
+    root: &[u8; 32],
+    not_after: u64,
+) -> Result<Vec<u8>, DeviceError> {
+    query_request(
+        agent,
+        identity,
+        instance,
+        "feed_after",
+        root.encode(),
+        not_after,
+    )
+}
+
 /// The page from a `feed` query's answer.
 pub fn feed_answer(body: &[u8]) -> Result<Feed, DeviceError> {
+    query_answer(body)
+}
+
+/// The page from a `feed_after` query's answer: none for a root the actor
+/// knows of no change leaving.
+pub fn feed_after_answer(body: &[u8]) -> Result<Option<Feed>, DeviceError> {
     query_answer(body)
 }
 

@@ -57,6 +57,9 @@ struct JobLink<'a> {
     down: usize,
     death: Option<Death>,
     dead: bool,
+    /// An envelope the operators place in a scope at its position, then
+    /// fail the next request.
+    placed: Option<(Scope, Envelope)>,
 }
 
 impl<'a> JobLink<'a> {
@@ -68,6 +71,7 @@ impl<'a> JobLink<'a> {
             down: 0,
             death: None,
             dead: false,
+            placed: None,
         }
     }
 
@@ -124,7 +128,18 @@ impl Link for JobLink<'_> {
 
     fn since(&mut self, scope: Scope, position: u64) -> Answer<Vec<Envelope>, Killed> {
         let key = self.key();
-        self.request(|home, _| home.query(key, "since", (scope, position).encode()))
+        let mut answer = self.request(|home, _| {
+            home.query::<Vec<Envelope>>(key, "since", (scope, position).encode())
+        })?;
+        if let (Ok(page), Some((at, envelope))) = (&mut answer, &self.placed)
+            && *at == scope
+            && position < envelope.position
+        {
+            page.retain(|held| held.position < envelope.position);
+            page.push(envelope.clone());
+            self.death = Some(Death::Before(self.requests));
+        }
+        Ok(answer)
     }
 
     fn wake(&mut self) -> Answer<Woken, Killed> {
@@ -504,4 +519,85 @@ fn a_pass_over_the_clearnet_sends_nothing() {
         vos_light::personal::SyncError::Clearnet
     ));
     assert_eq!(link.0.requests, 0);
+}
+
+/// The kit's removal of phone 1, open, which phone 0 has yet to read: the
+/// household and the operation's index.
+fn kit_removal() -> (Home, Vec<Phone>, u64) {
+    let (mut home, phones) = household(2);
+    let kit = super::phone::kit(0);
+    let index = operate(&mut home, &kit, &kit, "remove", 1u32.encode(), None);
+    (home, phones, index)
+}
+
+/// J1 (§8 B3, B4, B19): an alarm is kept from the batch that consumed its
+/// evidence. A pass killed before or after any of its requests, its
+/// process dead with what it found, leaves the kit's operation's alarm to
+/// the next pass, which reports it until the chrome acknowledges it.
+#[test]
+fn an_alarm_survives_a_killed_pass() {
+    let requests = {
+        let (mut home, mut phones, _) = kit_removal();
+        pass(&mut home, &mut phones[0]).requests
+    };
+    for n in 0..requests {
+        for death in [Death::Before(n), Death::After(n)] {
+            let (mut home, mut phones, index) = kit_removal();
+            let _dead = pass_with(&mut home, &mut phones[0], &[NOTES], Some(death));
+            restart(&mut phones[0]);
+            let next = pass(&mut home, &mut phones[0]);
+            assert!(
+                next.pass.alarms.contains(&Alarm::Kit { index }),
+                "{death:?}: {:?}",
+                next.pass.alarms
+            );
+        }
+    }
+    let (mut home, mut phones, index) = kit_removal();
+    let first = pass(&mut home, &mut phones[0]);
+    assert!(first.pass.alarms.contains(&Alarm::Kit { index }));
+    let again = pass(&mut home, &mut phones[0]);
+    assert!(again.pass.alarms.contains(&Alarm::Kit { index }), "kept");
+    phones[0].group().acknowledge(&again.pass.alarms).unwrap();
+    let after = pass(&mut home, &mut phones[0]);
+    assert!(after.pass.alarms.is_empty(), "{:?}", after.pass.alarms);
+}
+
+/// C3: the operators serve a stale envelope, then fail the next request.
+/// The stopped pass reports the alarm the page raised, and so does the
+/// next pass, though its reading starts past the envelope.
+#[test]
+fn an_alarm_outlives_the_request_failed_after_it() {
+    let (mut home, mut phones) = household(2);
+    let scope = scope_of(&phones[0], NOTES);
+    let old = phones[0].group().confirmed();
+    let old_key = phones[0].group().key(scope).unwrap();
+    phones[1].update(&mut home).unwrap();
+    settle(&mut home, &mut phones);
+    set(&phones[0].light, NOTES, 1, 10);
+    with(&mut home, &mut phones[0], &[NOTES], |sync| sync.push(NOTES)).unwrap();
+    let bytes = super::detection::sealed_by(&phones[0], NOTES, &old_key, old, 7, |_| {});
+    let position = stored(&home, &phones[1], scope).len() as u64 + 1;
+    let stale = Alarm::Stale { scope, position };
+    let now = home.now;
+    let mut link = JobLink::new(&mut home, &phones[1]);
+    link.placed = Some((
+        scope,
+        Envelope {
+            position,
+            id: vos_wire::personal::envelope_id(&bytes),
+            bytes,
+        },
+    ));
+    let Phone { light, group, .. } = &mut phones[1];
+    let stopped = job::run(light, group.as_mut().unwrap(), &mut link, &[NOTES], now)
+        .expect_err("the request after the page fails");
+    assert!(
+        stopped.pass.alarms.contains(&stale),
+        "{:?}",
+        stopped.pass.alarms
+    );
+    restart(&mut phones[1]);
+    let next = pass(&mut home, &mut phones[1]);
+    assert!(next.pass.alarms.contains(&stale), "{:?}", next.pass.alarms);
 }

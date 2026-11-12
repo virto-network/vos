@@ -483,8 +483,9 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
 - **Built** (2026-11-09, `light-node.md` §3.9 "Moving home as built"):
   `vos_light::moving` (`Move`, `finish`, `rejoin`, the `Notice` left at
   the old home, signed) and `SealedSync::carry`; the old set's devices
-  carried authors in the archive, each bounded per scope by what was
-  carried; a re-pair's key package in the next MLS generation beside the
+  carried authors named by the carrying device's keys in the control log
+  (`NewDevice::carried`, the claim's or the add's), each bounded per scope
+  by what was carried, never by an archive; a re-pair's key package in the next MLS generation beside the
   old group; a restore elsewhere's old scopes carried to its new home.
   Driven in `node/light/tests/sealed/moving.rs` and end to end on two
   homes on three nodes (each its own agent, credential actor and handle,

@@ -5,8 +5,8 @@
 //! admin-key replacement, a delayed admin's add and a regroup.
 
 use vos_wire::personal::{
-    AdminClass, Attestation, Body, Cancel, DeviceView, Entry, NewAdmin, OpState, RECOVERY,
-    RecoveryView, Standing, Verdict, Void,
+    AdminClass, Attestation, Body, CARRIED, Cancel, CarriedAuthor, DeviceView, Entry, NewAdmin,
+    OpState, RECOVERY, RecoveryView, Standing, Verdict, Void,
 };
 
 use super::*;
@@ -527,6 +527,35 @@ fn an_admin_key_replacement_keeps_the_seasoning() {
     );
 }
 
+/// E29: a replacement contested and resolved upheld still waits out the
+/// new key's probation: the new key signs nothing before it, and the
+/// replacement matures at its own time.
+#[test]
+fn a_resolved_replacement_keeps_its_probation() {
+    let mut home = seasoned(2);
+    let replacement = home
+        .operate(admin(0), "replace", (1u32, new_admin(1)))
+        .unwrap();
+    home.operate(admin(1), "veto", replacement).unwrap();
+    assert_eq!(state(&home, sync(0), replacement), OpState::Contested);
+    home.operate(KIT, "resolve", (replacement, true)).unwrap();
+    assert!(
+        !matured(state(&home, sync(0), replacement)),
+        "upheld, in its probation"
+    );
+    let replaced = Principal::Client(new_admin(1).key);
+    home.pass(MINUTE);
+    assert_eq!(
+        home.operate(replaced, "remove", 0u32),
+        Err(PersonalError::NotAdmitted),
+        "the new key signs nothing in its probation"
+    );
+    home.pass(2 * MINUTE);
+    home.wake(sync(0)).unwrap();
+    assert!(matured(state(&home, sync(0), replacement)));
+    assert_eq!(view(&home, sync(0), 1).device.keys.admin, new_admin(1).key);
+}
+
 /// Rule 1, A18: a delayed admin's add is an operation that waits and can
 /// be contested, then a commit carries it; it never adds inline.
 #[test]
@@ -951,5 +980,36 @@ fn the_released_r2_is_deleted_at_the_restored_devices_first_commit() {
     assert_eq!(
         released.from, pushed.position,
         "the kit reads what follows the re-seal"
+    );
+}
+
+/// A device's keys name at most `CARRIED` carried authors: an add, by
+/// commit or by operation, naming more is malformed.
+#[test]
+fn a_device_naming_too_many_carried_authors_is_refused() {
+    let mut home = seasoned(2);
+    let crowded = NewDevice {
+        carried: (0..=CARRIED as u64)
+            .map(|through| CarriedAuthor {
+                author: [9; 32],
+                scope: scope(1),
+                through,
+            })
+            .collect(),
+        ..device(4)
+    };
+    let effect = Effect {
+        add: Some(crowded.clone()),
+        remove: Vec::new(),
+        rekey: None,
+    };
+    let epoch = home.overview().confirmed + 1;
+    assert_eq!(
+        home.call::<Candidacy>(admin(0), "commit", commit(epoch, effect, vec![4; 600])),
+        Err(PersonalError::Malformed)
+    );
+    assert_eq!(
+        home.operate(admin(0), "add", crowded),
+        Err(PersonalError::Malformed)
     );
 }

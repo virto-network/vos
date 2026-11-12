@@ -3,13 +3,12 @@
 //! restore recovered, from which their scopes' ids still derive; every
 //! scope key of every confirmed epoch, a union indexed by epoch; and the
 //! recovery wrap key `R` (§3.5), with the ones this device drew that the
-//! control log has not named yet; and the authors a move carried (§3.9):
-//! the devices of the groups it left, each up to the node it carried in
-//! each scope. A device keeps it in its store; a new
+//! control log has not named yet. A device keeps it in its store; a new
 //! device receives it over the pairing channel; sealed under an epoch's
 //! archive key it travels to the agent, `R` with it and the drawn ones
 //! never. Archives that disagree keep every candidate key, and the AEAD
-//! decides.
+//! decides. The authors a move carried are no archive's: each device's
+//! keys name them in the control log (`NewDevice::carried`, §3.9).
 
 use blake2::Blake2b;
 use blake2::digest::Digest;
@@ -55,8 +54,8 @@ pub struct Recovery {
 /// The archive: the naming secret, the earlier groups' naming secrets, the
 /// scopes whose keys it records at each confirmed epoch, the keys, each
 /// `(epoch, scope)` with every candidate key archives disagreeing on, `R`
-/// once the claim drew it, the `R`s this device drew that the log has not
-/// named yet, and the authors a move carried, by author and scope.
+/// once the claim drew it, and the `R`s this device drew that the log has
+/// not named yet.
 #[derive(Clone, PartialEq, Eq, Encode, Decode)]
 pub struct Archive {
     pub naming: [u8; 32],
@@ -65,17 +64,6 @@ pub struct Archive {
     pub keys: Vec<Keys>,
     pub recovery: Option<Recovery>,
     pub drawn: Vec<[u8; 32]>,
-    pub authors: Vec<CarriedAuthor>,
-}
-
-/// An author a move carried in a scope: a device of a group it left, its
-/// nodes there read as the set's up to number `through`, the highest a
-/// leaving device held short of the author's cutoff.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct CarriedAuthor {
-    pub author: [u8; 32],
-    pub scope: Scope,
-    pub through: u64,
 }
 
 impl std::fmt::Debug for Archive {
@@ -89,7 +77,6 @@ impl std::fmt::Debug for Archive {
                 &self.recovery.as_ref().map(|recovery| recovery.since),
             )
             .field("drawn", &self.drawn.len())
-            .field("authors", &self.authors.len())
             .finish_non_exhaustive()
     }
 }
@@ -107,7 +94,6 @@ impl Archive {
             keys: Vec::new(),
             recovery: None,
             drawn: Vec::new(),
-            authors: Vec::new(),
         })
     }
 
@@ -150,31 +136,6 @@ impl Archive {
         }
     }
 
-    /// Admit `carried`'s author in its scope up to its number: of two, the
-    /// higher stands.
-    pub fn carried(&mut self, carried: CarriedAuthor) {
-        let key = |at: &CarriedAuthor| (at.author, at.scope);
-        match self
-            .authors
-            .binary_search_by(|at| key(at).cmp(&key(&carried)))
-        {
-            Ok(found) => {
-                let held = &mut self.authors[found].through;
-                *held = (*held).max(carried.through);
-            }
-            Err(at) => self.authors.insert(at, carried),
-        }
-    }
-
-    /// The number up to which `author`'s nodes in `scope` were carried by
-    /// a move: none for an author no move carried there.
-    pub fn through(&self, author: &[u8; 32], scope: &Scope) -> Option<u64> {
-        self.authors
-            .binary_search_by(|at| (at.author, at.scope).cmp(&(*author, *scope)))
-            .ok()
-            .map(|found| self.authors[found].through)
-    }
-
     /// Track `scope`: its key is recorded at every confirmed epoch from now.
     pub fn track(&mut self, scope: Scope) {
         if let Err(at) = self.scopes.binary_search(&scope) {
@@ -198,14 +159,11 @@ impl Archive {
         self.merge_keys(other);
     }
 
-    /// `other`'s scopes, earlier naming secrets, keys and carried authors
-    /// merged in, its `R` left out.
+    /// `other`'s scopes, earlier naming secrets and keys merged in, its `R`
+    /// left out.
     pub fn merge_keys(&mut self, other: &Archive) {
         for naming in &other.previous {
             self.remember(*naming);
-        }
-        for carried in &other.authors {
-            self.carried(*carried);
         }
         for scope in &other.scopes {
             self.track(*scope);
@@ -293,8 +251,7 @@ impl Archive {
         }
     }
 
-    /// The scopes, keys and carried authors of this archive that `other`
-    /// lacks, with this archive's naming secret and no `R`.
+    /// The scopes and keys of this archive that `other` lacks, with this archive's naming secret and no `R`.
     pub fn beyond(&self, other: &Archive) -> Archive {
         Archive {
             naming: self.naming,
@@ -325,26 +282,12 @@ impl Archive {
                 .collect(),
             recovery: None,
             drawn: Vec::new(),
-            authors: self
-                .authors
-                .iter()
-                .filter(|at| {
-                    other
-                        .through(&at.author, &at.scope)
-                        .is_none_or(|theirs| theirs < at.through)
-                })
-                .copied()
-                .collect(),
         }
     }
 
-    /// Whether it holds no earlier naming secret, no scope, no key and no
-    /// carried author.
+    /// Whether it holds no earlier naming secret, no scope and no key.
     pub fn is_empty(&self) -> bool {
-        self.previous.is_empty()
-            && self.scopes.is_empty()
-            && self.keys.is_empty()
-            && self.authors.is_empty()
+        self.previous.is_empty() && self.scopes.is_empty() && self.keys.is_empty()
     }
 
     /// The archive sealed under `key` with `nonce`: XChaCha20-Poly1305 over

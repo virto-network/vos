@@ -121,7 +121,7 @@ pub(super) fn open_restore(
 
 /// The restore matured: `kit` wakes the agent, and the restored phone
 /// recovers the archive from the recovery scope.
-fn matured(home: &mut Home, kit: &KitSecret, restored: &Phone) -> Archive {
+pub(super) fn matured(home: &mut Home, kit: &KitSecret, restored: &Phone) -> Archive {
     home.pass(policy().kit_delay_ms);
     home.call(&kit.signing(), "wake", ().encode())
         .answer::<Woken>()
@@ -143,7 +143,7 @@ fn matured(home: &mut Home, kit: &KitSecret, restored: &Phone) -> Archive {
 }
 
 /// The restored phone's new group at its home, from what it reads there.
-fn restart(home: &Home, restored: &mut Phone, split: &Split, next: &KitSecret) {
+pub(super) fn restart(home: &Home, restored: &mut Phone, split: &Split, next: &KitSecret) {
     let overview: Overview = home
         .query(restored.sync_key(), "overview", ().encode())
         .unwrap();
@@ -325,12 +325,13 @@ fn a_restore_here_reads_the_personal_space_back() {
 }
 
 /// A restore elsewhere: the kit finds its agent by its index alone, the
-/// restore at the old home releases `R2`, and the fresh install claims a
-/// new agent at another home, its group there, its kit split anew; it
-/// reads the personal space back from the old home with the archive it
-/// recovered, the old scopes keeping their ids, new ones named afresh; and
-/// carries them to the new home, the old device set its carried authors,
-/// where a phone paired there reads them.
+/// restore at the old home releases `R2`, and the fresh install takes the
+/// archive it recovered in and reads the personal space back from the old
+/// home, the old scopes keeping their ids, new ones named afresh; then it
+/// claims a new agent at another home, its keys there naming the old
+/// device set as its carried authors, its group there, its kit split
+/// anew; and carries the old scopes to the new home, where a phone paired
+/// there reads them.
 #[test]
 fn a_restore_elsewhere_reads_the_personal_space_back() {
     let key = KitSecret::security_key(&mut Touch(9)).unwrap();
@@ -348,10 +349,7 @@ fn a_restore_elsewhere_reads_the_personal_space_back() {
     let archive = matured(&mut home, &kit, &restored);
     assert_eq!(archive.naming, naming);
 
-    let homes = SigningKey::from_bytes(&[0x51; 32]);
-    let mut elsewhere = Home::at(&homes, policy(), [0x2e; 32]);
-    let split = restored.claim_with(&mut elsewhere, &homes, vec![next.key()]);
-    restored.group().inherit(&archive).unwrap();
+    vos_light::group::recovered(&restored.store, &archive).unwrap();
     install(&restored.light, NOTES);
     assert_eq!(
         scope_of(&restored, NOTES),
@@ -368,19 +366,18 @@ fn a_restore_elsewhere_reads_the_personal_space_back() {
         .query(restored.sync_key(), "devices", ().encode())
         .unwrap();
     let mut link = HomeLink::new(&mut home, &restored);
-    let caught = read_back(
-        &restored.light,
-        restored.group.as_ref().unwrap().archive(),
-        &identity,
-        &mut link,
-        NOTES,
-    )
-    .unwrap();
+    let caught = read_back(&restored.light, &archive, &identity, &mut link, NOTES).unwrap();
     assert!(caught.passed.is_empty(), "{:?}", caught.passed);
     for n in 0..2 {
         assert_eq!(count(&restored.light, NOTES, n), Some(10 + n));
     }
+    let authors: Vec<[u8; 32]> = devices.iter().map(|view| view.device.keys.sync).collect();
+    restored.keys.carried = vos_light::moving::carried(&restored.light, &authors).unwrap();
+    assert!(!restored.keys.carried.is_empty());
 
+    let homes = SigningKey::from_bytes(&[0x51; 32]);
+    let mut elsewhere = Home::at(&homes, policy(), [0x2e; 32]);
+    let split = restored.claim_with(&mut elsewhere, &homes, vec![next.key()]);
     assert_eq!(r_of(&mut restored), *split.r());
     restored.update(&mut elsewhere).unwrap();
     let events = restored.read(&mut elsewhere);
@@ -389,9 +386,6 @@ fn a_restore_elsewhere_reads_the_personal_space_back() {
         "{events:?}"
     );
 
-    let authors: Vec<[u8; 32]> = devices.iter().map(|view| view.device.keys.sync).collect();
-    let carried = vos_light::moving::carried(&restored.light, &authors).unwrap();
-    restored.group().record_authors(&carried).unwrap();
     let carried = with(&mut elsewhere, &mut restored, &[NOTES], |sync| {
         sync.catch_up(NOTES)?;
         sync.carry(NOTES)
@@ -641,6 +635,94 @@ fn r_rotates_at_a_removal_and_the_removed_device_opens_nothing_after() {
             .keys(epoch + 1, &scope_of(&phones[0], NOTES))
             .is_empty()
     );
+}
+
+/// The operators log `Void` for the epoch every device confirmed by its
+/// own count, the commit carrying a removal: the new `R` is named nowhere
+/// and the old one, which the removed device holds, is held by no device
+/// that may push under it. Nothing of the new epoch reaches the recovery
+/// scope under the old `R`, and the next commit re-seals the kit.
+#[test]
+fn a_void_verdict_after_a_confirmed_removal_rotates_r_all_the_same() {
+    let key = KitSecret::security_key(&mut Touch(7)).unwrap();
+    let (mut home, mut phones, split) = household_with(3, vec![key.key()]);
+    written(&mut home, &mut phones);
+    let old = *split.r();
+    let (admin, sync) = (phones[0].admin.clone(), phones[0].sync.clone());
+    let removal = operate(&mut home, &admin, &sync, "remove", 2u32.encode(), None);
+    let (admin, sync) = (phones[1].admin.clone(), phones[1].sync.clone());
+    operate(&mut home, &admin, &sync, "cosign", removal.encode(), None);
+    settle(&mut home, &mut phones[..2]);
+    let epoch = phones[0].group().confirmed() + 1;
+    let prepared = phones[0].group().commit(None, home.now).unwrap();
+    assert_eq!(prepared.effect.remove, vec![2]);
+    phones[0].send(&mut home, &prepared).unwrap();
+    let mut voided = [false; 2];
+    for _ in 0..4 {
+        for (phone, voided) in phones[..2].iter_mut().zip(&mut voided) {
+            if !*voided {
+                *voided = read_voided(&mut home, phone, epoch);
+            }
+        }
+    }
+    assert_eq!(voided, [true; 2]);
+    for phone in &mut phones[..2] {
+        assert_eq!(phone.group().confirmed(), epoch);
+        assert!(!phone.group().holds_recovery());
+        assert_eq!(
+            with(&mut home, phone, &[], |sync| sync.recovery()).unwrap(),
+            Default::default(),
+            "nothing pushed under an R the removed device holds"
+        );
+    }
+    let served = stored(&home, &phones[0], RECOVERY);
+    let opened = open_recovery(&old, &home.identity, &served).unwrap();
+    assert!(opened.keys(epoch, &scope_of(&phones[0], NOTES)).is_empty());
+    let next = phones[0].group().commit(None, home.now).unwrap();
+    assert!(
+        next.effect.rekey.is_some(),
+        "the next commit re-seals the kit"
+    );
+}
+
+/// `phone` reading the log, posting what it asks for, with the verdict on
+/// `epoch` shown it as `Void`, its reading stopped there: whether it read
+/// that verdict.
+fn read_voided(home: &mut Home, phone: &mut Phone, epoch: u64) -> bool {
+    let (cursor, before) = phone.group().view();
+    let mut entries = home.log(phone.sync_key(), cursor).unwrap();
+    let verdict = entries.iter().position(|(_, entry)| {
+        matches!(entry.body, vos_wire::personal::Body::Verdict { epoch: of, .. } if of == epoch)
+    });
+    if let Some(at) = verdict {
+        entries.truncate(at + 1);
+        let last = at
+            .checked_sub(1)
+            .map_or(before, |previous| entries[previous].1.chain);
+        let (index, entry) = &mut entries[at];
+        entry.body = vos_wire::personal::Body::Verdict {
+            epoch,
+            verdict: vos_wire::personal::Verdict::Void(vos_wire::personal::Void::Nack),
+        };
+        entry.chain = vos_wire::personal::chain(&last, *index, entry.at, &entry.body);
+    }
+    for event in phone.group().follow(entries).unwrap() {
+        match event {
+            Event::Vote {
+                epoch,
+                vote,
+                message,
+            } => phone.vote(home, epoch, vote, &message),
+            Event::Evidence {
+                index,
+                message,
+                signature,
+                attached,
+            } => phone.evidence(home, index, message, signature, attached),
+            _ => {}
+        }
+    }
+    verdict.is_some()
 }
 
 /// A chunk of an archive, as sealed sync frames it.

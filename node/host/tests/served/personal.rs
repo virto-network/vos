@@ -352,6 +352,7 @@ impl Phone {
                 },
                 nullifier: [0; 32],
                 label: vec![n; 8],
+                carried: Vec::new(),
             },
             admin: Signer::new(admin),
             light,

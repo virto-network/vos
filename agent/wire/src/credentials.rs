@@ -111,6 +111,9 @@ pub mod tables {
     /// The tree's feed: a write's place in it, eight big-endian bytes, in
     /// key order → its [`Change`](super::Change).
     pub const CHANGES: &str = "changes";
+    /// A root a write of the tree left → the place of the last write that
+    /// left it, a `u64`: where `feed_after(root)` reads on from.
+    pub const ROOTS: &str = "roots";
 }
 
 /// The tags' names (`proving.md` §8): `T(name)` is the block

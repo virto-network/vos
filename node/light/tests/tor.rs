@@ -107,24 +107,34 @@ impl Gateway {
         self.seen.lock().unwrap().len()
     }
 
-    /// A query's reply: a page of the feed for `feed(from)`, else the
+    /// A query's reply: a page of the feed for `feed(from)`, and after the
+    /// last change that left the root for `feed_after(root)`; else the
     /// onion set.
     fn answer(&self, body: &[u8]) -> Vec<u8> {
-        let query = <(AgentId, QueryCall)>::decode_exact(body).map(|(_, query)| query);
-        let Some(query) = query.filter(|query| query.method.0 == vos_light::method_id("feed"))
-        else {
+        let Some((_, query)) = <(AgentId, QueryCall)>::decode_exact(body) else {
             return self.onions.lock().unwrap().encode();
         };
-        let from = u64::decode_exact(&query.arguments).expect("a place");
         let feed = self.feed.lock().unwrap();
-        let start = (from as usize).min(feed.len());
-        let end = (start + 3).min(feed.len());
-        Feed {
-            from,
-            changes: feed[start..end].to_vec(),
-            length: feed.len() as u64,
+        let page = |from: u64| {
+            let start = (from as usize).min(feed.len());
+            let end = (start + 3).min(feed.len());
+            Feed {
+                from,
+                changes: feed[start..end].to_vec(),
+                length: feed.len() as u64,
+            }
+        };
+        if query.method.0 == vos_light::method_id("feed") {
+            page(u64::decode_exact(&query.arguments).expect("a place")).encode()
+        } else if query.method.0 == vos_light::method_id("feed_after") {
+            let root = <[u8; 32]>::decode_exact(&query.arguments).expect("a root");
+            feed.iter()
+                .rposition(|change| change.root.root == root)
+                .map(|last| page(last as u64 + 1))
+                .encode()
+        } else {
+            self.onions.lock().unwrap().encode()
         }
-        .encode()
     }
 
     fn fault(&self, faults: &[Fault]) {
