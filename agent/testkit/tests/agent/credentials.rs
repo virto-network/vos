@@ -490,6 +490,38 @@ fn the_feed_replays_to_the_tree() {
     }
 }
 
+/// `feed_after(root)` reads on from the last change that left `root`, as
+/// `feed` from the place after it: a root the tree returned to reads on
+/// from its last write; the root after every write, the feed's end; a root
+/// no write left, none.
+#[test]
+fn the_feed_reads_on_after_a_root() {
+    let members: Vec<Digest> = (1..=4).map(member).collect();
+    let mut actor = founded(&members);
+    let revoke = actor.input(ALICE, "revoke", members[3]);
+    actor.node.batch(2, vec![revoke]);
+    let enroll = actor.input(ALICE, "enroll", members[3]);
+    actor.node.batch(3, vec![enroll]);
+    let (changes, length) = actor.feed_from(0);
+    assert_eq!(length, 6);
+    assert_eq!(
+        changes[5].root.root, changes[3].root.root,
+        "the tree returned"
+    );
+    for (at, change) in changes.iter().enumerate() {
+        let after: Option<Feed> = actor.query("feed_after", change.root.root);
+        let last = changes
+            .iter()
+            .rposition(|other| other.root.root == change.root.root)
+            .unwrap();
+        assert!(last >= at);
+        let place: Feed = actor.query("feed", last as u64 + 1);
+        assert_eq!(after, Some(place));
+    }
+    let unknown: Option<Feed> = actor.query("feed_after", [7u8; 32]);
+    assert_eq!(unknown, None);
+}
+
 /// A step's result: its reply, or the actor's error.
 fn answer<T: Decode>(step: &Step) -> Result<T, CredentialError> {
     match &ran(step).outcome {

@@ -1,17 +1,21 @@
 //! The credential tree kept from its feed: the member's path computed on
 //! the device equals the path a tree rebuilt from its leaves gives, and
 //! proves its member; each page checked against the root its last change
-//! names and its changes' order, a page that fails refused whole and the tree kept as it was; a replica
-//! behind the keeper giving nothing new; the tree kept and restored; and
-//! the feed's timer.
+//! names and its changes' order, a page that fails refused whole and the
+//! tree kept as it was; a replica behind the keeper giving nothing new;
+//! the tree kept and restored; the feed's timer; a query naming the root
+//! held, never a place an answer wrote; and a keeper off the real feed
+//! starting over.
 
 use std::collections::BTreeMap;
 
-use scale::Encode;
+use scale::{Decode, Encode};
 use vos_light::{DeviceError, Digest, Synced, TreeKeeper, derive_secret, member, wire};
 use vos_wire::credentials::{
     self, Change, DEPTH, EMPTY, Feed, P, RootEntry, Words, compress, leaf,
 };
+use vos_wire::ids::{AgentId, MethodId};
+use vos_wire::ingress::QueryCall;
 use vos_wire::ingress::Response;
 use vos_wire::result::Outcome;
 
@@ -96,6 +100,45 @@ impl Writes {
     }
 }
 
+impl Writes {
+    /// The credential actor's answer over these writes to `request`, a
+    /// query of `feed(from)` or of `feed_after(root)`: a page of at most
+    /// four changes.
+    fn serve(&self, request: &[u8]) -> Vec<u8> {
+        let (_, query) = <(AgentId, QueryCall)>::decode_exact(&request[2..]).unwrap();
+        let length = self.changes.len();
+        let page = |from: usize| Feed {
+            from: from as u64,
+            changes: self.changes[from.min(length)..(from + 4).min(length)].to_vec(),
+            length: length as u64,
+        };
+        let body = if query.method == MethodId(vos_light::method_id("feed")) {
+            page(u64::decode_exact(&query.arguments).unwrap() as usize).encode()
+        } else {
+            assert_eq!(query.method, MethodId(vos_light::method_id("feed_after")));
+            let root = <[u8; 32]>::decode_exact(&query.arguments).unwrap();
+            self.changes
+                .iter()
+                .rposition(|change| change.root.root == root)
+                .map(|last| page(last + 1))
+                .encode()
+        };
+        Response::Ran {
+            outcome: Outcome::Done(body),
+            at: 1,
+        }
+        .encode()
+    }
+}
+
+/// `keeper`'s next query, as the gateway reads it: its method and
+/// arguments (the key that signs it is drawn for it alone).
+fn query_of(keeper: &TreeKeeper) -> (MethodId, Vec<u8>) {
+    let request = keeper.request(4, &[0x1d; 32], 2, 900).unwrap();
+    let (_, query) = <(AgentId, QueryCall)>::decode_exact(&request[2..]).unwrap();
+    (query.method, query.arguments)
+}
+
 /// A member digest by a seed.
 fn other(seed: u32) -> Words {
     core::array::from_fn(|i| (seed.wrapping_mul(0x9e37_79b9) >> i) % P)
@@ -105,6 +148,15 @@ fn other(seed: u32) -> Words {
 fn answer(page: &Feed) -> Vec<u8> {
     Response::Ran {
         outcome: Outcome::Done(page.encode()),
+        at: 1,
+    }
+    .encode()
+}
+
+/// The answer to a `feed_after` query that found its root.
+fn answer_after(page: &Feed) -> Vec<u8> {
+    Response::Ran {
+        outcome: Outcome::Done(Some(page.clone()).encode()),
         at: 1,
     }
     .encode()
@@ -143,12 +195,19 @@ fn the_tree_kept_from_the_feed_gives_the_members_path() {
     assert!(keeper.due(0));
     let mut at = 0;
     for to in [3, 5, 6, 8, writes.changes.len()] {
-        let read = keeper.ingest(&answer(&writes.page(at, to)), 100).unwrap();
+        let page = writes.page(at, to);
+        let answered = if at == 0 {
+            answer(&page)
+        } else {
+            answer_after(&page)
+        };
+        let read = keeper.ingest(&answered, 100).unwrap();
         assert_eq!(
             read,
             Synced {
                 applied: (to - at) as u64,
                 more: to < writes.changes.len(),
+                reset: false,
             }
         );
         at = to;
@@ -224,7 +283,8 @@ fn a_page_that_does_not_check_is_refused_whole() {
         keeper.apply(&behind),
         Ok(Synced {
             applied: 0,
-            more: false
+            more: false,
+            reset: false,
         })
     );
     assert_eq!(keeper.slot(), held);
@@ -278,7 +338,9 @@ fn the_feed_is_read_on_its_own_timer() {
     keeper.ingest(&answer(&writes.page(0, 2)), 1_000).unwrap();
     assert!(keeper.due(1_000));
     let end = writes.changes.len();
-    keeper.ingest(&answer(&writes.page(2, end)), 1_000).unwrap();
+    keeper
+        .ingest(&answer_after(&writes.page(2, end)), 1_000)
+        .unwrap();
     assert!(!keeper.due(1_000 + period / 2 - 1));
     assert!(keeper.due(1_000 + period * 3 / 2));
 
@@ -289,8 +351,14 @@ fn the_feed_is_read_on_its_own_timer() {
         keeper.unknown(1_000);
     }
     assert_eq!(keeper.period(), TreeKeeper::MIN_PERIOD_MS);
+    assert_eq!(
+        query_of(&keeper),
+        (MethodId(vos_light::method_id("feed")), 0u64.encode()),
+        "refused proof after proof with no change read between: read from the start"
+    );
+    keeper.ingest(&answer(&writes.page(0, end)), 2_000).unwrap();
     let quiet = writes.page(end, end);
-    keeper.ingest(&answer(&quiet), 2_000).unwrap();
+    keeper.ingest(&answer_after(&quiet), 2_000).unwrap();
     assert_eq!(keeper.period(), 2 * TreeKeeper::MIN_PERIOD_MS);
     assert!(!keeper.due(2_000 + TreeKeeper::MIN_PERIOD_MS - 1));
 }
@@ -343,4 +411,99 @@ fn a_member_moved_within_one_page_keeps_its_path() {
     assert_eq!(witness.slot, 41);
     assert_eq!(witness.siblings, writes.tree.siblings(41));
     assert!(witness.proves(&mine));
+}
+
+/// T1: a gateway pads its answers with changes that undo each other, so
+/// the place the device reads on from would be its own, in every query on
+/// every circuit after. The keeper holds the root every member holds, and
+/// its next query is the one every keeper that read as far makes: it
+/// names the root, not the place.
+#[test]
+fn a_padded_feed_leaves_no_mark_in_the_next_query() {
+    let mine = secret_member();
+    let writes = writes(&mine);
+    let end = writes.changes.len();
+    let mut honest = TreeKeeper::new(mine);
+    honest.apply(&writes.page(0, end)).unwrap();
+
+    let mut padded = writes.page(0, end - 1);
+    let mut tree = Writes::new();
+    tree.changes = padded.changes.clone();
+    for change in &padded.changes {
+        for (slot, leaf) in &change.leaves {
+            let leaf = credentials::words(leaf).unwrap();
+            if leaf == EMPTY[0] {
+                tree.tree.leaves.remove(slot);
+            } else {
+                tree.tree.leaves.insert(*slot, leaf);
+            }
+        }
+    }
+    let held = tree.tree.leaves[&0];
+    for _ in 0..3 {
+        tree.write(5, &[(0, leaf(&other(77)))]);
+        tree.write(5, &[(0, held)]);
+    }
+    tree.changes.push(writes.changes[end - 1].clone());
+    padded.changes = tree.changes[end - 1..].to_vec();
+    padded.from = end as u64 - 1;
+    padded.length = tree.changes.len() as u64;
+    let mut marked = TreeKeeper::new(mine);
+    marked.apply(&writes.page(0, end - 1)).unwrap();
+    marked.apply(&padded).unwrap();
+    assert_eq!(
+        marked.cursor(),
+        end as u64 + 6,
+        "the place its answers wrote"
+    );
+    assert_eq!(marked.root(), honest.root());
+    assert_eq!(query_of(&marked), query_of(&honest));
+
+    let read = marked.ingest(
+        &writes.serve(&marked.request(4, &[0x1d; 32], 2, 900).unwrap()),
+        0,
+    );
+    assert_eq!(read.unwrap().applied, 0);
+    assert_eq!(marked.witness(), honest.witness());
+}
+
+/// T2: a keeper off the real feed finds its way back. One whose root the
+/// actor knows no change leaving (a fork it was served, or a re-founded
+/// space whose feed starts again, shorter or longer than its place) drops
+/// its tree after two such reads and reads the feed from its start: its
+/// member's path is the real tree's.
+#[test]
+fn a_keeper_off_the_feed_starts_over() {
+    let mine = secret_member();
+    let ours = writes(&mine);
+    let mut shorter = Writes::new();
+    shorter.write(1, &[(0, leaf(&other(50)))]);
+    shorter.write(1, &[(1, leaf(&mine.0))]);
+    shorter.write(2, &[(2, leaf(&other(51)))]);
+    let mut longer = Writes::new();
+    for slot in 0..19 {
+        longer.write(1 + u64::from(slot), &[(slot, leaf(&other(60 + slot)))]);
+    }
+    longer.write(30, &[(19, leaf(&mine.0))]);
+    assert_eq!((shorter.changes.len(), longer.changes.len()), (3, 20));
+    for real in [shorter, longer] {
+        let mut keeper = TreeKeeper::new(mine);
+        keeper.apply(&ours.page(0, ours.changes.len())).unwrap();
+        assert_eq!(keeper.cursor(), 10);
+        let mut reset = false;
+        for _ in 0..12 {
+            let request = keeper.request(4, &[0x1d; 32], 2, 900).unwrap();
+            if let Ok(read) = keeper.ingest(&real.serve(&request), 0) {
+                reset |= read.reset;
+            }
+        }
+        assert!(reset);
+        assert_eq!(keeper.root().root, real.tree.root());
+        assert!(
+            keeper
+                .witness()
+                .expect("the real tree's path")
+                .proves(&mine)
+        );
+    }
 }
