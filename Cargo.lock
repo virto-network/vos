@@ -5728,7 +5728,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s4-protocol"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=44089556b23d6bbfa601209a595e6d82a3893c5e#44089556b23d6bbfa601209a595e6d82a3893c5e"
+source = "git+https://codeberg.org/Virto/s4?rev=bbfaa73cc015a82292b82e7d503e1ff6c5baad9b#bbfaa73cc015a82292b82e7d503e1ff6c5baad9b"
 dependencies = [
  "base64",
  "ciborium",
@@ -5740,7 +5740,7 @@ dependencies = [
 [[package]]
 name = "s4-rui"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=44089556b23d6bbfa601209a595e6d82a3893c5e#44089556b23d6bbfa601209a595e6d82a3893c5e"
+source = "git+https://codeberg.org/Virto/s4?rev=bbfaa73cc015a82292b82e7d503e1ff6c5baad9b#bbfaa73cc015a82292b82e7d503e1ff6c5baad9b"
 dependencies = [
  "base64",
  "libc",
@@ -5758,7 +5758,7 @@ dependencies = [
 [[package]]
 name = "s4-server"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=44089556b23d6bbfa601209a595e6d82a3893c5e#44089556b23d6bbfa601209a595e6d82a3893c5e"
+source = "git+https://codeberg.org/Virto/s4?rev=bbfaa73cc015a82292b82e7d503e1ff6c5baad9b#bbfaa73cc015a82292b82e7d503e1ff6c5baad9b"
 dependencies = [
  "rand 0.10.3",
  "russh",
@@ -5771,7 +5771,7 @@ dependencies = [
 [[package]]
 name = "s4-widgets"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=44089556b23d6bbfa601209a595e6d82a3893c5e#44089556b23d6bbfa601209a595e6d82a3893c5e"
+source = "git+https://codeberg.org/Virto/s4?rev=bbfaa73cc015a82292b82e7d503e1ff6c5baad9b#bbfaa73cc015a82292b82e7d503e1ff6c5baad9b"
 dependencies = [
  "s4-protocol",
  "serde",
