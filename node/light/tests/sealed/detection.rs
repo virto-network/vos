@@ -859,7 +859,7 @@ fn an_archive_plants_no_author_and_no_later_key() {
     phones[0].group().inherit(&recovered).unwrap();
     let group = phones[0].group.as_ref().unwrap();
     assert!(group.carriers(&stranger.sync_key(), &scope).is_empty());
-    assert!(group.carried_authors().is_empty());
+    assert!(!group.moved_authors().contains(&stranger.sync_key()));
 }
 
 /// B6: the operators forge a device-set operation, a removal with evidence

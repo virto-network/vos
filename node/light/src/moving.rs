@@ -155,6 +155,14 @@ pub fn moving(store: &Store) -> Result<bool, StoreError> {
     Ok(store.group_row(MOVE_ROW)?.is_some())
 }
 
+/// Whether the move held in `store` waits for its claim's answer, beside
+/// the group it leaves: that group's scopes are read no more
+/// (`personal::Waiting::Moving`), since the claim's keys named what the
+/// move carries.
+pub fn claiming(store: &Store) -> Result<bool, StoreError> {
+    Ok(moving(store)? && crate::home::claim_held(store)?)
+}
+
 /// Whether the move held in `store` started its new group and waits to
 /// push everything ([`finish`]).
 pub fn carrying(store: &Store) -> Result<bool, MoveError> {
@@ -293,15 +301,7 @@ pub fn naming(
     group: &DeviceGroup,
     mut device: NewDevice,
 ) -> Result<NewDevice, MoveError> {
-    let mut authors: Vec<[u8; 32]> = group
-        .sync_keys()
-        .into_iter()
-        .map(|(_, sync)| sync)
-        .chain(group.carried_authors())
-        .collect();
-    authors.sort_unstable();
-    authors.dedup();
-    device.carried = carried(light, &authors)?;
+    device.carried = carried(light, &group.moved_authors())?;
     if !device.bounded() {
         return Err(MoveError::Carried);
     }

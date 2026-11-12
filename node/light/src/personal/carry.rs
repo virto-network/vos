@@ -8,8 +8,9 @@
 //!   its own pushes' CIDs by position. A node past its author's cutoff
 //!   stays behind, so a removed device's late nodes reach no new home; so
 //!   does one of an author no device of the set is, past the number the
-//!   set's keys name it carried to (`NewDevice::carried`), which no reader
-//!   there would take.
+//!   keys of a device of the set with a voice name it carried to
+//!   (`NewDevice::carried`), which no reader there would take; and so does
+//!   every node over one left behind, whose parent no reader would hold.
 //! - **In causal order,** parents first, sealed under the confirmed epoch
 //!   with this device's view and `seen` positions, [`PIPELINE`] a round;
 //!   each round's sealed bytes held in the store before they are sent, so
@@ -85,8 +86,9 @@ pub struct Carried {
     pub pushed: Vec<u64>,
     /// The nodes this device read or pushed there already.
     pub held: usize,
-    /// The nodes left behind, past their author's cutoff or past what the
-    /// set's keys name of a carried author.
+    /// The nodes left behind: past their author's cutoff, past what the
+    /// keys of a device with a voice name of a carried author, or over one
+    /// left behind.
     pub cut: usize,
     /// The carry stopped at `StaleEpoch` for this epoch: follow the log,
     /// then carry again.
@@ -169,6 +171,7 @@ impl<L: Link> SealedSync<'_, L> {
         }
         let mut report = Carried::default();
         let mut left = Vec::new();
+        let mut behind = BTreeSet::new();
         for (cid, bytes) in self.light.nodes(instance)? {
             let cid = cid.0;
             if known.contains(&cid) {
@@ -185,6 +188,7 @@ impl<L: Link> SealedSync<'_, L> {
                 .is_some_and(|from| header.seq >= from)
             {
                 report.cut += 1;
+                behind.insert(cid);
                 continue;
             }
             if self.group.author(&header.author.0).is_none()
@@ -192,15 +196,31 @@ impl<L: Link> SealedSync<'_, L> {
                     .group
                     .carriers(&header.author.0, &scope)
                     .iter()
-                    .all(|(through, _)| header.seq > *through)
+                    .all(|(through, removed)| removed.is_some() || header.seq > *through)
             {
                 report.cut += 1;
+                behind.insert(cid);
                 continue;
             }
             left.push((cid, header, bytes));
         }
+        // A node over one left behind stays behind too: no reader there
+        // would ever hold its parent.
+        let mut kept = Vec::with_capacity(left.len());
+        for (cid, header, bytes) in causal(left) {
+            if header
+                .parents
+                .iter()
+                .any(|parent| behind.contains(&parent.0))
+            {
+                behind.insert(cid);
+                report.cut += 1;
+            } else {
+                kept.push((cid, header, bytes));
+            }
+        }
         let author = self.light.author().0;
-        let mut left = causal(left).into_iter();
+        let mut left = kept.into_iter();
         loop {
             if round.sealed.is_empty() {
                 for (cid, header, bytes) in left.by_ref().take(PIPELINE) {

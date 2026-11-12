@@ -189,11 +189,15 @@ and what a node does with one is `node/SECURITY.md`'s.
   one, the `R` the log named, and nothing else; an archive names no
   carried author. The authors a move carried are named by the device
   set's keys in the control log (`NewDevice::carried`: the mover's claim,
-  the commit adding a re-paired device, which an admin key signed), read
-  as the set's while the device naming them has a voice and, once its
-  removal matured, only at positions up to its frontier. So neither the
-  operators nor a device of the set, removed later, leaves an author or a
-  key behind that writes past the removal.
+  the commit adding a re-paired device, which an admin key signed; a
+  paired device takes them from its pairing device as it takes the set,
+  a restore from the agent), read as the set's while the device naming
+  them has a voice and, once its removal matured, only at positions up to
+  its frontier, the first the agent answered, kept. So no device of the
+  set, removed later, leaves an author or a key behind through an archive
+  that writes past the removal. A restore elsewhere names what it read
+  back from the old home, which checks no author or frontier there: the
+  old home's word, as a restore at home takes the agent's.
 
 ## The secret and its containment
 

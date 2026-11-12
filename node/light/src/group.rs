@@ -1462,16 +1462,21 @@ impl DeviceGroup {
         carriers
     }
 
-    /// Every author the device set's keys name as carried, removed
-    /// devices' too, once each.
-    pub fn carried_authors(&self) -> Vec<[u8; 32]> {
+    /// Every author a move from this group carries, once each: each
+    /// device of the set, removed ones too, and each author their keys and
+    /// this device's name as carried; none of a device a void commit
+    /// dropped.
+    pub fn moved_authors(&self) -> Vec<[u8; 32]> {
         let mut authors: Vec<[u8; 32]> = self
             .state
             .devices
             .iter()
+            .filter(|(_, known)| known.matured.is_some() || !known.out)
             .map(|(_, known)| &known.keys)
             .chain([&self.state.me])
-            .flat_map(|keys| keys.carried.iter().map(|carried| carried.author))
+            .flat_map(|keys| {
+                std::iter::once(keys.sync).chain(keys.carried.iter().map(|carried| carried.author))
+            })
             .collect();
         authors.sort_unstable();
         authors.dedup();

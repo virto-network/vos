@@ -15,6 +15,7 @@ use vos_light::group::{Checkpoint, DeviceGroup, Pairing};
 use vos_light::home::{Claim, Home as HomeSpace};
 use vos_light::kit::{KitKey, KitSecret};
 use vos_light::moving::{self, Move, MoveError};
+use vos_light::personal::Waiting;
 use vos_wire::personal::{Kit, NewDevice, Recorded};
 
 use super::kit::{
@@ -118,7 +119,8 @@ fn finish(home: &mut Home, phone: &mut Phone) -> moving::Finished {
 /// and a fourth phone is paired there by the second and writes too, past
 /// the moved first's voice. The second pairs again from the mover's
 /// checkpoint and carries both notes, which the mover reads, the fourth's
-/// author reaching it with the second's archive; the third pairs again and
+/// author reaching it from the log, in the keys the second's add named;
+/// the third pairs again and
 /// carries nothing. The third removed at the new home before it pushed
 /// anything there, a new phone paired there with no checkpoint reads the
 /// whole history from the new home's start, the third's carried nodes
@@ -155,6 +157,15 @@ fn a_move_carries_the_personal_space_and_the_others_pair_again() {
     assert!(
         Claim::pending(&phones[0].store).unwrap().is_none(),
         "a move's claim is the move's"
+    );
+    let caught = with(&mut home, &mut phones[0], &[NOTES], |sync| {
+        sync.catch_up(NOTES)
+    })
+    .unwrap();
+    assert_eq!(
+        caught.waiting,
+        Some(Waiting::Moving),
+        "the old home is read no more once the claim named what it carries"
     );
     assign(&mut elsewhere, &homes, &held);
     let notice = held.notice(&space_of(&elsewhere));

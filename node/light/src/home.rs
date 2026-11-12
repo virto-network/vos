@@ -181,6 +181,12 @@ struct Held {
     identity: [u8; 32],
 }
 
+/// Whether a claim waits in `store`: prepared, and its agent's group not
+/// yet started.
+pub(crate) fn claim_held(store: &Store) -> Result<bool, StoreError> {
+    Ok(store.group_row(CLAIM_ROW)?.is_some())
+}
+
 /// A claim of a personal agent, held in the store from before its call
 /// until the device's group starts. Its `Debug` shows no `R` or `R2`.
 pub struct Claim(Held);

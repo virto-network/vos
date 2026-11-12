@@ -97,6 +97,8 @@ const RECOVERY_ROW: &[u8] = b"s/recovery";
 const AT: &[u8] = b"s/at/";
 const OWN: &[u8] = b"s/own/";
 const WATCH: &[u8] = b"s/watch/";
+/// A removed device's frontier, by its id, as the agent first answered it.
+const FRONTIER: &[u8] = b"s/frontier/";
 
 /// `prefix`'s row of `scope`, at `position` if given.
 fn scope_key(prefix: &[u8], scope: &Scope, position: Option<u64>) -> Vec<u8> {
@@ -257,6 +259,10 @@ pub enum Waiting {
     /// The agent's page skips this position ([`Alarm::Withheld`]): read
     /// again.
     Withheld(u64),
+    /// A move's claim waits beside this group ([`crate::moving::Move`]): its
+    /// keys named what it carries, so nothing more is read here; the scope
+    /// is read at the new home once the move starts its group there.
+    Moving,
 }
 
 /// Why an envelope read was passed over.
@@ -876,6 +882,10 @@ impl<'a, L: Link> SealedSync<'a, L> {
         // epoch.
         drop(Zeroizing::new(self.group.key(scope)?));
         let mut caught = Caught::default();
+        if crate::moving::claiming(self.light.store())? {
+            caught.waiting = Some(Waiting::Moving);
+            return Ok(caught);
+        }
         if self.light.cursor(instance)?.is_none() {
             caught.started = self.start(instance, scope, &mut caught.alarms)?;
             self.keep_alarms(&caught.alarms)?;
@@ -1083,21 +1093,36 @@ impl<'a, L: Link> SealedSync<'a, L> {
     }
 
     /// The position of `device`'s last envelope in `scope` the agent took
-    /// before its removal matured, its frontier: asked once a reading.
+    /// before its removal matured, its frontier: asked once, and kept, so
+    /// an answer that later names a higher one moves nothing (the removal
+    /// fixed it).
     fn last(
         &mut self,
         scan: &mut Scan,
         device: DeviceId,
         scope: Scope,
     ) -> Result<Option<u64>, SyncError<L::Error>> {
+        let row = [FRONTIER, &device.to_be_bytes()[..]].concat();
         let frontier = match scan.frontiers.entry(device) {
             Entry::Occupied(held) => held.into_mut(),
-            Entry::Vacant(vacant) => vacant.insert(
-                self.link()?
-                    .frontier(device)
-                    .map_err(SyncError::Link)?
-                    .map_err(SyncError::Refused)?,
-            ),
+            Entry::Vacant(vacant) => {
+                let kept = match self.light.store().group_row(&row)? {
+                    Some(bytes) => Frontier::decode_exact(&bytes)
+                        .ok_or(SyncError::Group(GroupError::Corrupt))?,
+                    None => {
+                        let asked = self
+                            .link()?
+                            .frontier(device)
+                            .map_err(SyncError::Link)?
+                            .map_err(SyncError::Refused)?;
+                        self.light
+                            .store()
+                            .write_group_rows(vec![(row, Some(asked.encode()))])?;
+                        asked
+                    }
+                };
+                vacant.insert(kept)
+            }
         };
         Ok(frontier
             .iter()

@@ -567,6 +567,7 @@ fn scope<L: Control>(
             // Read again once: a page withheld twice waits for the next pass.
             Some(Waiting::Withheld(_)) if withheld => break,
             Some(Waiting::Withheld(_)) => withheld = true,
+            Some(Waiting::Moving) => break,
         }
     }
     if let Some(waiting) = waiting {
