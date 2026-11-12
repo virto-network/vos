@@ -25,7 +25,10 @@
 //!   while it stands and again if it comes back. An operation stands while
 //!   a pass reads it open; a pending restore and an alarm, which a pass
 //!   raises once, stand for [`STANDS_MS`] after it, whatever later passes
-//!   read; a pass that reached nothing keeps every notice.
+//!   read; a pass that reached nothing keeps every notice. The device
+//!   group's alarms a pass found are acknowledged to it
+//!   ([`Personal::acknowledge`]) once the run that raised them is kept:
+//!   the group raises them no more, and the run's notices hold them.
 //! - **After first unlock:** the job reads only what the facility's store
 //!   holds in the app's credential-encrypted storage, readable from the
 //!   first unlock after boot whether the screen is locked or not, and
@@ -37,6 +40,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use vos_light::group::Alarm;
 
 use crate::enrollment::{create_private, write_private};
 use crate::{Code, Facility, JobRun, Notice, Pending, Refusal, Seen, Synced, refused};
@@ -60,6 +64,10 @@ pub trait Personal: Send + Sync {
     /// driven on `runtime` (the facility's, which the pass is called
     /// beside, never on): what it found, or why it reached nothing.
     fn pass(&self, now: u64, runtime: &tokio::runtime::Handle) -> Result<Passed, String>;
+
+    /// The device group's `alarms`, raised by a pass, are kept as the
+    /// run's notices: the group keeps them no more.
+    fn acknowledge(&self, alarms: &[Alarm]) -> Result<(), String>;
 }
 
 /// What a run syncs.
@@ -72,10 +80,12 @@ pub enum Part {
 }
 
 /// What the personal space's pass found: its notices (none `fresh` yet),
-/// each device's last call, and the error it stopped on, if it did.
+/// the device group's alarms among them, each device's last call, and the
+/// error it stopped on, if it did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Passed {
     pub notices: Vec<Notice>,
+    pub alarms: Vec<Alarm>,
     pub seen: Vec<Seen>,
     pub stopped: Option<String>,
 }
@@ -218,6 +228,8 @@ impl Job {
         let (down, up) = count.bytes();
         let mut synced = Synced::default();
         let mut found = None;
+        let mut alarms = Vec::new();
+        let mut acknowledging = None;
         let now = now_ms();
         match part {
             // The enrollments unread are one failure: the run still
@@ -250,6 +262,8 @@ impl Job {
                             }
                             synced.seen = passed.seen;
                             found = Some(passed.notices);
+                            alarms = passed.alarms;
+                            acknowledging = Some(personal);
                         }
                         Err(_) => synced.failed = 1,
                     }
@@ -283,6 +297,13 @@ impl Job {
             };
         }
         self.runs.write(&state).map_err(job_error)?;
+        // Kept: the group may let them go. One not acknowledged is raised
+        // again, and stands as one already raised.
+        if let Some(personal) = acknowledging
+            && !alarms.is_empty()
+        {
+            let _ = personal.acknowledge(&alarms);
+        }
         Ok(synced)
     }
 }
@@ -391,8 +412,80 @@ pub(crate) fn notice(raised: vos_light::job::Notice) -> Notice {
         Found::Stuck => plain(Pending::Stuck),
         Found::Renew => plain(Pending::Renew),
         Found::Alarm(alarm) => Notice {
-            detail: format!("{alarm:?}"),
+            detail: described(&alarm),
             ..plain(Pending::Alarm)
         },
+    }
+}
+
+/// What the chrome says of `alarm`: each kind in its own words, so a kind
+/// this build does not name fails to build rather than show as code.
+pub(crate) fn described(alarm: &Alarm) -> String {
+    match alarm {
+        Alarm::Log { index } => format!("the log does not chain at entry {index}"),
+        Alarm::SplitLog { epoch, device } => {
+            format!("device {device}'s vote on epoch {epoch} is of another log")
+        }
+        Alarm::NamedAbsent { epoch, .. } => {
+            format!("epoch {epoch} names this device absent though it called")
+        }
+        Alarm::Refused { epoch, committer } => {
+            format!("this device refused device {committer}'s epoch {epoch}")
+        }
+        Alarm::CannotFollow {
+            epoch, committer, ..
+        } => format!("this device cannot follow device {committer}'s epoch {epoch}"),
+        Alarm::Verdict { epoch } => {
+            format!("the agent's verdict on epoch {epoch} is not this device's")
+        }
+        Alarm::Unsigned { index } => format!("log entry {index} matures with no evidence"),
+        Alarm::Clock { skew_ms } => format!(
+            "this device's clock is {} s off the agent's",
+            skew_ms / 1_000
+        ),
+        Alarm::Kit { index } => format!("the kit signed operation {index}"),
+        Alarm::Rollback { next } => format!("the agent's log went back to {next}"),
+        Alarm::View { index } => format!("a device saw log entry {index} otherwise"),
+        Alarm::Dropped { index } => format!("this device's call at {index} is not in the log"),
+        Alarm::Partition { scope, position } => {
+            format!("the agent serves less of {scope:?} than {position}, which a device read")
+        }
+        Alarm::Withheld { scope, position } => {
+            format!("the agent withheld {scope:?} at {position}")
+        }
+        Alarm::Stale { scope, position } => {
+            format!("{scope:?} at {position} is sealed under a past epoch")
+        }
+        Alarm::Author { scope, position } => {
+            format!("{scope:?} at {position} is by no device of the set")
+        }
+        Alarm::Deleted { scope, position } => {
+            format!("this device's {scope:?} at {position} is gone: pushed again")
+        }
+        Alarm::Checkpoint { scope, position } => {
+            format!("a checkpoint of {scope:?} at {position} is not this device's reading")
+        }
+        Alarm::Unserved { next } => {
+            format!("the agent named its log's head at {next} and served less of it")
+        }
+        Alarm::Policy { index } => {
+            format!("log entry {index} lowers the device set's delays: refused")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The alarms a pass raises name themselves: the head served short and
+    /// a lowered policy among them.
+    #[test]
+    fn an_alarm_names_itself() {
+        assert!(described(&Alarm::Unserved { next: 9 }).contains("head at 9"));
+        assert!(described(&Alarm::Policy { index: 4 }).contains("entry 4 lowers"));
+        let raised = notice(vos_light::job::Notice::Alarm(Alarm::Policy { index: 4 }));
+        assert_eq!(raised.pending, Pending::Alarm);
+        assert_eq!(raised.detail, described(&Alarm::Policy { index: 4 }));
     }
 }

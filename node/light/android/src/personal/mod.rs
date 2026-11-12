@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use ed25519_dalek::SigningKey;
-use vos_light::group::DeviceGroup;
+use vos_light::group::{Alarm, DeviceGroup};
 use vos_light::home::Home as HomeSpace;
 use vos_light::kit::KitKey;
 use vos_light::memberships;
@@ -77,9 +77,8 @@ pub const FILE: &str = "personal.state";
 const MAGIC: &[u8; 8] = b"vos/pst\0";
 /// The version of what the file keeps, which this build writes. A file of
 /// another version, or of none (an earlier build's), is refused and its
-/// bytes kept ([`read_state`]); a later version that reads an earlier one
-/// converts it there.
-pub const STATE_VERSION: u16 = 1;
+/// bytes kept ([`read_state`]).
+pub const STATE_VERSION: u16 = 2;
 /// The light node's store, under the facility's directory.
 pub const LIGHT: &str = "light";
 /// `Personal`'s instance in every personal agent.
@@ -702,6 +701,7 @@ impl Personal for Space {
         }
         Ok(Passed {
             notices: pass.notices().into_iter().map(crate::job::notice).collect(),
+            alarms: pass.alarms.clone(),
             seen: pass
                 .seen
                 .iter()
@@ -712,6 +712,12 @@ impl Personal for Space {
                 .collect(),
             stopped: (!failures.is_empty()).then(|| failures.join("; ")),
         })
+    }
+
+    fn acknowledge(&self, alarms: &[Alarm]) -> Result<(), String> {
+        let mut held = self.held();
+        let group = held.group.as_mut().ok_or("no personal space")?;
+        group.acknowledge(alarms).map_err(|error| error.to_string())
     }
 }
 
@@ -784,6 +790,7 @@ mod tests {
             },
             nullifier: [11; 32],
             label: b"phone".to_vec(),
+            carried: Vec::new(),
         };
         let kit = NewKit {
             entries: vec![vos_wire::personal::KitEntry {
@@ -835,9 +842,9 @@ mod tests {
 
     /// The bytes of [`every_field`] in [`STATE_VERSION`]: a change to what
     /// the file keeps, or to how a type it holds encodes, fails here, and
-    /// is a new version with its conversion in [`read_state`].
+    /// is a new version.
     const PINNED: &str = concat!(
-        "766f732f70737400010001010101010101010101010101010101010101010101010101010101010101010102",
+        "766f732f70737400020001010101010101010101010101010101010101010101010101010101010101010102",
         "0202020202020202020202020202020202020202020202020202020202020203000000040404040404040404",
         "0404040404040404040404040404040404040404040404050000000600000001000000070707070707070707",
         "0707070707070707070707070707070707070707070707080808080808080808080808080808080808080808",
@@ -851,22 +858,22 @@ mod tests {
         "1717171717171717171717171717170100000018181818181818181818181818181818181818181818181818",
         "18181818181818000101000e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0f",
         "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0d0d0d0d0d0d0d0d0d0d0d0d0d",
-        "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0df7000000090909090909090909090909090909090909090909",
+        "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0dfb000000090909090909090909090909090909090909090909",
         "09090909090909090909090a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a00",
-        "01000b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0500000070686f6e6501",
-        "000000011e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1f1f1f1f1f1f1f1f",
-        "1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f0200000020200c0c0c0c0c0c0c0c0c0c0c0c0c0c",
-        "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d",
-        "0d0d0d0d0d0d0110101010101010101010101010101010101010101010101010101010101010100103000000",
-        "1111111212121212121212121212121212121212121212121212121212121212121212121212121212121212",
-        "1212121212121212121212121212121212121212121212010101010101010101010101010101010101010101",
-        "0101010101010101010101010202020202020202020202020202020202020202020202020202020202020202",
-        "0300000004040404040404040404040404040404040404040404040404040404040404040500000006000000",
-        "19191919191919191919191919191919191919191919191919191919191919191a000000000000001b000000",
-        "00011c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c00000000210000002222",
-        "2222222222222222222222222222222222222222222222222222222222222323232323232323232323232323",
-        "2323232323232323232323232323232323232400000000000000040000001d1d1d1d02000000010000000200",
-        "00000200000003000000",
+        "01000b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0500000070686f6e6500",
+        "00000001000000011e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1f1f1f1f",
+        "1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f0200000020200c0c0c0c0c0c0c0c0c0c",
+        "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d",
+        "0d0d0d0d0d0d0d0d0d0d01101010101010101010101010101010101010101010101010101010101010101001",
+        "0300000011111112121212121212121212121212121212121212121212121212121212121212121212121212",
+        "1212121212121212121212121212121212121212121212121212120101010101010101010101010101010101",
+        "0101010101010101010101010101010102020202020202020202020202020202020202020202020202020202",
+        "0202020203000000040404040404040404040404040404040404040404040404040404040404040405000000",
+        "0600000019191919191919191919191919191919191919191919191919191919191919191a00000000000000",
+        "1b00000000011c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c000000002100",
+        "0000222222222222222222222222222222222222222222222222222222222222222223232323232323232323",
+        "232323232323232323232323232323232323232323232400000000000000040000001d1d1d1d020000000100",
+        "0000020000000200000003000000",
     );
 
     #[test]
@@ -882,7 +889,7 @@ mod tests {
         let bytes = state_bytes(&every_field());
         let mut later = bytes.clone();
         later[MAGIC.len()..MAGIC.len() + 2].copy_from_slice(&(STATE_VERSION + 1).to_le_bytes());
-        assert!(read_state(&later).err().unwrap().contains("version 2"));
+        assert!(read_state(&later).err().unwrap().contains("version 3"));
         let unversioned = every_field().encode();
         assert!(
             read_state(&unversioned)

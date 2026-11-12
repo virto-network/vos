@@ -52,6 +52,8 @@ pub type Hold<'a> = &'a mut dyn FnMut(&[u8], &[u8; 64]) -> Result<(), String>;
 pub struct Signer {
     pub key: [u8; 32],
     session: Option<Session>,
+    /// The agent the session is at: another agent's calls start one anew.
+    agent: u32,
     next: u64,
 }
 
@@ -60,6 +62,7 @@ impl Signer {
         Self {
             key,
             session: None,
+            agent: 0,
             next: 1,
         }
     }
@@ -180,9 +183,10 @@ impl<'a> AgentLink<'a> {
         hold: Hold<'_>,
     ) -> Result<Called, String> {
         let now = self.now()?;
-        let stale = signer
-            .session
-            .is_none_or(|session| session.t0 + SESSION_EXPIRY_MS / 2 < now);
+        let stale = signer.agent != self.agent.agent
+            || signer
+                .session
+                .is_none_or(|session| session.t0 + SESSION_EXPIRY_MS / 2 < now);
         if stale {
             let mut session_name = [0; 16];
             getrandom::getrandom(&mut session_name).map_err(|error| error.to_string())?;
@@ -191,6 +195,7 @@ impl<'a> AgentLink<'a> {
                 name: session_name,
                 t0: now,
             });
+            signer.agent = self.agent.agent;
             signer.next = 1;
         }
         let session = signer.session.expect("a session");

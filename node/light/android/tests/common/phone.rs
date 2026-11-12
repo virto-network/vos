@@ -8,11 +8,11 @@
 use std::collections::{HashMap, HashSet};
 
 use ed25519_dalek::{Signer as _, SigningKey};
-use s4_credential::Enroll;
-use s4_credential::chrome::Field;
-use s4_credential::node::{Device, Node, Prompts};
 use s4_credential_contract::KeyAnswer;
 use s4_credential_contract::personal::{Claim, KitKind};
+use vos_facility::Enroll;
+use vos_facility::chrome::Field;
+use vos_facility::node::{Device, Node, Prompts};
 
 use super::*;
 

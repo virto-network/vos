@@ -22,9 +22,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use common::*;
-use s4_credential::node::{Device, Node, Prompts};
-use s4_credential::{Enroll, SignIn};
 use s4_credential_contract::KeyAnswer;
+use vos_facility::node::{Device, Node, Prompts};
+use vos_facility::{Enroll, SignIn};
 
 const KEY: [u8; 32] = [9; 32];
 const ROLE: &str = "S4_CREDENTIAL_KILLED_ROLE";

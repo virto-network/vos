@@ -39,6 +39,14 @@ const _: () = assert!(EXPIRY_MS < vos_wire::defaults::CREDENTIAL_HORIZON_MS);
 const TICK: Duration = Duration::from_secs(1);
 /// The wait after a failed read before the next.
 const RETRY: Duration = Duration::from_secs(5);
+/// How long a sign-in whose root the node refused waits for the keeper's
+/// next read before it answers that refusal: the read falls due within
+/// `TreeKeeper::UNKNOWN_SPREAD_MS`, and takes a page or two over Tor.
+const ROOT_RETRY: Duration = Duration::from_secs(30);
+/// How often that wait looks at the keeper.
+const ROOT_POLL: Duration = Duration::from_millis(250);
+/// A space that no longer admits the device format this app proves in.
+pub(crate) const UPDATE: &str = "the space no longer admits this app's proofs: update the app";
 /// The furthest the node's time may be from the device's: past it, a relay
 /// that lies about the time could keep a confirmed proof for later.
 const CLOCK_SKEW_MS: u64 = 300_000;
@@ -120,6 +128,9 @@ struct Tree {
     refresher: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The sessions holding it: its refresher stops with the last.
     sessions: AtomicUsize,
+    /// The feed's reads made: a sign-in whose root was refused waits for
+    /// the next.
+    reads: AtomicUsize,
 }
 
 #[derive(Clone)]
@@ -523,6 +534,7 @@ impl Inner {
                 payment: Mutex::new(None),
                 refresher: Mutex::new(None),
                 sessions: AtomicUsize::new(0),
+                reads: AtomicUsize::new(0),
             })
         })))
     }
@@ -694,7 +706,7 @@ impl Session {
     /// space's handle, after the user's consent at the source; the output
     /// zeroized once copied. On the heap, so the prover's task takes it as a
     /// pointer and no freed task keeps its words.
-    async fn secret(&self, enrollment: &Enrollment) -> Result<Box<DeviceSecret>, Refusal> {
+    async fn secret(&self, enrollment: &Enrollment) -> Result<Arc<DeviceSecret>, Refusal> {
         secret_of(&*self.inner.source, enrollment).await
     }
 
@@ -949,13 +961,47 @@ impl Session {
         if !matches!(chrome.confirm(form).await, Answer::Confirmed { .. }) {
             return Err(declined());
         }
-        let call = self
-            .call_for(&enrollment, method, request.arguments)
-            .await?;
+        // The secret is held until the node took a proof or refused it
+        // for good: a root it no longer judges current is proved against
+        // again, once, with no second prompt.
+        let arguments = request.arguments;
         let secret = self.secret(&enrollment).await?;
-        let name = scope.clone();
         let started = Instant::now();
-        let request = Inner::prove(
+        let request = self
+            .prove_sign_in(&enrollment, method, scope, &arguments, &secret, witness)
+            .await?;
+        let mut proving_ms = started.elapsed().as_millis() as u64;
+        let mut answer = self.send(&enrollment, &request).await?;
+        if root_refused(&answer)
+            && let Some(again) = self.next_witness(&enrollment).await
+        {
+            let started = Instant::now();
+            let request = self
+                .prove_sign_in(&enrollment, method, scope, &arguments, &secret, again)
+                .await?;
+            proving_ms += started.elapsed().as_millis() as u64;
+            answer = self.send(&enrollment, &request).await?;
+        }
+        drop(secret);
+        Ok(SignedIn { answer, proving_ms })
+    }
+
+    /// `method`'s call with `arguments` at the node's time, proved under
+    /// `secret` on `witness`'s path in `scope`: the credentialed request.
+    async fn prove_sign_in(
+        &self,
+        enrollment: &Enrollment,
+        method: &Method,
+        scope: &str,
+        arguments: &[u8],
+        secret: &Arc<DeviceSecret>,
+        witness: AuthWitness,
+    ) -> Result<Vec<u8>, Refusal> {
+        let call = self
+            .call_for(enrollment, method, arguments.to_vec())
+            .await?;
+        let (secret, name) = (Arc::clone(secret), scope.to_owned());
+        Inner::prove(
             &self.inner,
             |stock| &stock.auth,
             move |prover, program| {
@@ -967,17 +1013,31 @@ impl Session {
                 proof.map(|proof| wire::credentialed(&call, &proof))
             },
         )
-        .await?;
-        let proving_ms = started.elapsed().as_millis() as u64;
-        Ok(SignedIn {
-            answer: self.send(&enrollment, &request).await?,
-            proving_ms,
-        })
+        .await
+    }
+
+    /// After a proof was answered `RootUnknown` or `RootStale`: the
+    /// member's path once the keeper's next read is made, on its own timer
+    /// (the read that answer made due, at a drawn delay, never at once);
+    /// `None` when no read is made in [`ROOT_RETRY`] or the keeper holds no
+    /// path after it.
+    async fn next_witness(&self, enrollment: &Enrollment) -> Option<AuthWitness> {
+        let tree = self.inner.tree_of(enrollment)?;
+        let read = tree.reads.load(Ordering::Acquire);
+        let deadline = Instant::now() + ROOT_RETRY;
+        while Instant::now() < deadline {
+            if tree.reads.load(Ordering::Acquire) > read {
+                return tree.keeper.lock().await.witness();
+            }
+            tokio::time::sleep(ROOT_POLL).await;
+        }
+        None
     }
 
     /// A proved request sent over Tor as a proven call, the spare's if one
     /// is built: the node's answer. One that names the root unknown or
-    /// stale makes the feed due.
+    /// stale makes the feed due; one that no longer admits this app's
+    /// device format is refused: the app needs updating.
     async fn send(&self, enrollment: &Enrollment, request: &[u8]) -> Result<Vec<u8>, Refusal> {
         let answer = self
             .inner
@@ -985,11 +1045,13 @@ impl Session {
             .request(enrollment.handle, Purpose::Proven, request)
             .await
             .map_err(|error| refused(Code::Api, error))?;
-        if let Ok(wire::Answer::RootUnknown | wire::Answer::RootStale) =
-            wire::credentialed_answer(&answer)
+        if root_refused(&answer)
             && let Some(tree) = self.inner.tree_of(enrollment)
         {
             tree.keeper.lock().await.unknown(now_ms());
+        }
+        if format_refused(&answer) {
+            return Err(refused(Code::Refused, UPDATE));
         }
         Ok(answer)
     }
@@ -1179,8 +1241,9 @@ impl Session {
 }
 
 /// The feed read into `tree` if its keeper says so, on the space's feed
-/// connection, and the keeper kept if the read changed it; a `refresh`
-/// asked for and due makes it so first.
+/// connection, and the keeper kept if the read changed it (a change
+/// applied, or the tree dropped to start over from the feed's start); a
+/// `refresh` asked for and due makes it so first.
 async fn read_once(net: &Net, tree: &Tree, enrollment: &Enrollment) -> Result<(), String> {
     let registrar = registrar(enrollment)?;
     let mut keeper = tree.keeper.lock().await;
@@ -1195,14 +1258,16 @@ async fn read_once(net: &Net, tree: &Tree, enrollment: &Enrollment) -> Result<()
     if !keeper.due(now_ms()) {
         return Ok(());
     }
-    let applied = net
-        .client()
+    let before = keeper.encode();
+    net.client()
         .read_tree(tree.space, &registrar, &mut keeper, now_ms)
         .await
         .map_err(|error| error.to_string())?;
-    if applied > 0 {
-        write_private(&tree.file, &keeper.encode())?;
+    let after = keeper.encode();
+    if after != before {
+        write_private(&tree.file, &after)?;
     }
+    tree.reads.fetch_add(1, Ordering::Release);
     Ok(())
 }
 
@@ -1211,7 +1276,7 @@ async fn read_once(net: &Net, tree: &Tree, enrollment: &Enrollment) -> Result<()
 pub(crate) async fn secret_of(
     source: &dyn Source,
     enrollment: &Enrollment,
-) -> Result<Box<DeviceSecret>, Refusal> {
+) -> Result<Arc<DeviceSecret>, Refusal> {
     let output = source
         .evaluate(
             &enrollment.source,
@@ -1219,7 +1284,7 @@ pub(crate) async fn secret_of(
         )
         .await
         .map_err(source_error)?;
-    Ok(Box::new(vos_light::derive_secret(
+    Ok(Arc::new(vos_light::derive_secret(
         &output,
         &enrollment.handle,
     )))
@@ -1272,6 +1337,31 @@ fn describe(method: &Method) -> (String, String) {
             "Pay".into(),
             format!("{} (from this device's account)", method.name),
         ),
+    }
+}
+
+/// Whether the node answered a proof `RootUnknown` or `RootStale`: its
+/// root is not one the node judges current.
+fn root_refused(answer: &[u8]) -> bool {
+    matches!(
+        wire::credentialed_answer(answer),
+        Ok(wire::Answer::RootUnknown | wire::Answer::RootStale)
+    )
+}
+
+/// Whether the node refused a proof for its device format: one its
+/// ingress does not admit, or one the release or the agent's log retired
+/// by the batch's time.
+fn format_refused(answer: &[u8]) -> bool {
+    use vos_wire::abi::Refusal as Refused;
+    use vos_wire::ingress::{CredentialRefusal, Response};
+    match wire::credentialed_answer(answer) {
+        Ok(wire::Answer::Refused(CredentialRefusal::Format)) => true,
+        Ok(wire::Answer::Other(body)) => matches!(
+            <Response as vos_wire::Decode>::decode_exact(&body),
+            Some(Response::Refused(Refused::Format))
+        ),
+        _ => false,
     }
 }
 

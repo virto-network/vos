@@ -237,7 +237,7 @@ fn the_device_sets_operations_are_signed_by_the_admin_key() {
         std::thread::sleep(Duration::from_millis(300));
         first.node.pair_cancel().unwrap();
         let cancelled = opener.join().unwrap().unwrap_err();
-        assert_eq!(cancelled.code, s4_credential::Code::Declined);
+        assert_eq!(cancelled.code, vos_facility::Code::Declined);
     });
     first.pair(&second, "second");
     first.pair(&third, "third");
@@ -754,7 +754,7 @@ fn a_space_enrolled_after_the_claim_is_offered_and_revoked() {
 
 /// A sign-in in the club, once the path is held.
 fn signs_in(phone: &Held) {
-    let login = s4_credential::SignIn::read(&object(&[
+    let login = vos_facility::SignIn::read(&object(&[
         ("agent", Value::from(AGENT)),
         ("instance", Value::from(POLL)),
         ("method", Value::from("login")),
@@ -766,7 +766,7 @@ fn signs_in(phone: &Held) {
         match phone.node.sign_in(
             session,
             login.clone(),
-            Arc::clone(&phone.hand) as Arc<dyn s4_credential::node::Prompts>,
+            Arc::clone(&phone.hand) as Arc<dyn vos_facility::node::Prompts>,
         ) {
             Err(refusal) if refusal.code == Code::NoPath => {
                 phone.node.sync().unwrap();
@@ -783,7 +783,7 @@ fn signs_in(phone: &Held) {
 
 /// The light store's layout row under `directory`.
 fn layout_of(directory: &std::path::Path) -> Option<Vec<u8>> {
-    let db = fjall::Database::builder(directory.join(s4_credential::personal::LIGHT))
+    let db = fjall::Database::builder(directory.join(vos_facility::personal::LIGHT))
         .open()
         .unwrap();
     let meta = db
@@ -801,16 +801,16 @@ type Alter = dyn Fn(&std::path::Path);
 #[test]
 fn a_personal_space_this_build_does_not_read_is_kept_and_sign_in_runs() {
     let later = |directory: &std::path::Path| {
-        let file = directory.join(s4_credential::personal::FILE);
+        let file = directory.join(vos_facility::personal::FILE);
         let mut bytes = std::fs::read(&file).unwrap();
-        bytes[8..10].copy_from_slice(&(s4_credential::personal::STATE_VERSION + 1).to_le_bytes());
+        bytes[8..10].copy_from_slice(&(vos_facility::personal::STATE_VERSION + 1).to_le_bytes());
         std::fs::write(&file, bytes).unwrap();
     };
     let unversioned = |directory: &std::path::Path| {
-        std::fs::write(directory.join(s4_credential::personal::FILE), [1, 0, 2]).unwrap();
+        std::fs::write(directory.join(vos_facility::personal::FILE), [1, 0, 2]).unwrap();
     };
     let layout = |directory: &std::path::Path| {
-        let db = fjall::Database::builder(directory.join(s4_credential::personal::LIGHT))
+        let db = fjall::Database::builder(directory.join(vos_facility::personal::LIGHT))
             .open()
             .unwrap();
         let meta = db
@@ -837,8 +837,13 @@ fn a_personal_space_this_build_does_not_read_is_kept_and_sign_in_runs() {
             _directory,
         } = phone;
         drop(node);
+        assert_eq!(
+            layout_of(_directory.path()),
+            Some(vos_light::store::LAYOUT.to_be_bytes().to_vec()),
+            "the light node's layout written"
+        );
         alter(_directory.path());
-        let file = _directory.path().join(s4_credential::personal::FILE);
+        let file = _directory.path().join(vos_facility::personal::FILE);
         let state = std::fs::read(&file).unwrap();
         let phone = Held {
             node: node_as(&world, _directory.path(), tag),
@@ -973,4 +978,47 @@ fn a_restore_cancelled_by_alive_is_opened_anew() {
     after(policy().kit_delay_ms);
     let restored = fresh.node.restored(KitKind::Phrase, &*fresh.hand).unwrap();
     assert_eq!(restored.agent, claimed.agent);
+}
+
+/// A device a move left behind pairs again at the new home, its old group
+/// still held: its hello names what it carries from the group it leaves,
+/// its key package and its rejoin are for those same keys, and it joins
+/// the moved set beside the device that moved.
+#[test]
+fn a_device_a_move_left_rejoins_at_the_new_home() {
+    let world = world();
+    let home = world.home(HOME, 2, 1);
+    let elsewhere = world.home(ELSEWHERE, 3, 1);
+    let first = phone(&world, 0x51);
+    let second = phone(&world, 0x52);
+    first.claim(&world, home, KitKind::Phrase, "first phone");
+    first.pair(&second, "second phone");
+    for phone in [&first, &second] {
+        phone.node.sync_personal().unwrap();
+    }
+    let moved = first
+        .node
+        .move_home(
+            Claim {
+                home: world.home_of(elsewhere),
+                kit: KitKind::Phrase,
+                label: "first phone".into(),
+            },
+            &*first.hand,
+        )
+        .unwrap();
+    let alone = first.node.devices().unwrap();
+    assert_eq!(alone.iter().filter(|device| !device.removed).count(), 1);
+
+    let (opened, joined) = first.pair(&second, "second phone");
+    assert_eq!(opened.device, joined.device);
+    let devices = second.node.devices().unwrap();
+    assert_eq!(
+        devices.iter().filter(|device| !device.removed).count(),
+        2,
+        "{devices:?}"
+    );
+    assert!(devices.iter().any(|device| device.me && !device.removed));
+    second.node.sync_personal().unwrap();
+    assert!(!world.carrying(moved.agent).is_empty());
 }

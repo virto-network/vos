@@ -14,13 +14,13 @@ pub use std::time::Duration;
 
 pub use hmac::{Hmac, Mac as _};
 pub use russh::keys::ssh_key;
-pub use s4_credential::chrome::{Answer, Chrome, Form};
-pub use s4_credential::enrollment::Store;
-pub use s4_credential::source::{BoxFuture, Kind, Output, Reference, Source, SourceError};
-pub use s4_credential::{Code, Facility, Operation, Refusal, Session, Stock};
 pub use s4_protocol::{Integer, Value};
 pub use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 pub use vos_api::Kind as ApiKind;
+pub use vos_facility::chrome::{Answer, Chrome, Form};
+pub use vos_facility::enrollment::Store;
+pub use vos_facility::source::{BoxFuture, Kind, Output, Reference, Source, SourceError};
+pub use vos_facility::{Code, Facility, Operation, Refusal, Session, Stock};
 pub use vos_wire::credentials::{self as tree, RootEntry};
 pub use vos_wire::ids::AgentId;
 pub use vos_wire::ingress::{self, Credentialed, QueryCall, Response};
@@ -128,8 +128,8 @@ pub fn world() -> Arc<World> {
 
 /// The client every request of a facility under `directory` goes through,
 /// over `world`'s gateway. On the test's runtime.
-pub fn net(world: &Arc<World>, directory: &std::path::Path) -> Arc<s4_credential::net::Net> {
-    Arc::new(s4_credential::net::Net::new(world.dial(), directory))
+pub fn net(world: &Arc<World>, directory: &std::path::Path) -> Arc<vos_facility::net::Net> {
+    Arc::new(vos_facility::net::Net::new(world.dial(), directory))
 }
 
 /// A facility under `directory`, its source `source`, over `world`, its
@@ -148,8 +148,8 @@ pub fn facility(
 pub fn node(
     world: &Arc<World>,
     directory: &std::path::Path,
-    device: Arc<dyn s4_credential::node::Device>,
-) -> s4_credential::node::Node {
+    device: Arc<dyn vos_facility::node::Device>,
+) -> vos_facility::node::Node {
     node_over(world.dial(), directory, device)
 }
 
@@ -157,8 +157,8 @@ pub fn node(
 pub fn node_over(
     dial: Arc<dyn vos_light::tor::Dial>,
     directory: &std::path::Path,
-    device: Arc<dyn s4_credential::node::Device>,
-) -> s4_credential::node::Node {
+    device: Arc<dyn vos_facility::node::Device>,
+) -> vos_facility::node::Node {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -166,21 +166,21 @@ pub fn node_over(
         .unwrap();
     let net = {
         let _entered = runtime.enter();
-        Arc::new(s4_credential::net::Net::new(dial, directory))
+        Arc::new(vos_facility::net::Net::new(dial, directory))
     };
-    s4_credential::node::Node::over(
+    vos_facility::node::Node::over(
         runtime,
         directory.to_owned(),
         device,
         net,
-        s4_credential::personal::Artifacts::embedded(),
+        vos_facility::personal::Artifacts::embedded(),
     )
     .unwrap()
 }
 
 /// The s4 session's gateway, as the client verified it.
-pub fn gateway() -> s4_credential::Gateway {
-    s4_credential::Gateway {
+pub fn gateway() -> vos_facility::Gateway {
+    vos_facility::Gateway {
         host: "gateway.test".into(),
         port: 2222,
         fingerprint: "SHA256:test".into(),

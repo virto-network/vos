@@ -22,9 +22,9 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 use blake2::{Blake2b512, Digest as _};
 use common::*;
-use s4_credential::node::{Device, Prompts};
-use s4_credential::{Enroll, Outcome, Pay, SignIn};
 use s4_credential_contract::KeyAnswer;
+use vos_facility::node::{Device, Prompts};
+use vos_facility::{Enroll, Outcome, Pay, SignIn};
 
 /// Freed blocks up to this size are searched: the facility's own buffers,
 /// futures and tasks, not the prover's traces, which hold `s`'s words by

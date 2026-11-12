@@ -11,10 +11,11 @@
 mod common;
 
 use common::*;
-use s4_credential::job::{Passed, Personal, RUNS};
-use s4_credential::node::{Device, Node, Prompts};
-use s4_credential::{Enroll, Notice, Pending, Seen};
 use s4_credential_contract::KeyAnswer;
+use vos_facility::job::{Passed, Personal, RUNS};
+use vos_facility::node::{Device, Node, Prompts};
+use vos_facility::{Enroll, Notice, Pending, Seen};
+use vos_light::group::Alarm;
 
 struct Phone;
 
@@ -28,8 +29,8 @@ impl Device for Phone {
 struct Client;
 
 impl Prompts for Client {
-    fn confirm(&self, _: s4_credential::Form) -> s4_credential::Answer {
-        s4_credential::Answer::Confirmed {
+    fn confirm(&self, _: vos_facility::Form) -> vos_facility::Answer {
+        vos_facility::Answer::Confirmed {
             choice: 0,
             values: Vec::new(),
         }
@@ -106,9 +107,20 @@ fn a_run_with_nothing_new_reads_nothing() {
 }
 
 /// A personal space scripted pass by pass: unreachable once the script
-/// ends.
+/// ends. It records the alarms acknowledged.
+#[derive(Default)]
 struct Scripted {
     passes: Mutex<VecDeque<Result<Passed, String>>>,
+    acknowledged: Mutex<Vec<Vec<Alarm>>>,
+}
+
+impl Scripted {
+    fn new(passes: impl IntoIterator<Item = Result<Passed, String>>) -> Self {
+        Self {
+            passes: Mutex::new(passes.into_iter().collect()),
+            ..Self::default()
+        }
+    }
 }
 
 impl Personal for Scripted {
@@ -118,6 +130,11 @@ impl Personal for Scripted {
             .unwrap()
             .pop_front()
             .unwrap_or_else(|| Err("the agent did not answer".into()))
+    }
+
+    fn acknowledge(&self, alarms: &[Alarm]) -> Result<(), String> {
+        self.acknowledged.lock().unwrap().push(alarms.to_vec());
+        Ok(())
     }
 }
 
@@ -143,19 +160,17 @@ fn notices_are_fresh_once_and_stand_while_a_pass_fails() {
     let raised = Passed {
         notices: vec![removal()],
         seen: vec![Seen { device: 1, at: 900 }],
-        stopped: None,
+        ..Passed::default()
     };
-    let personal = Arc::new(Scripted {
-        passes: Mutex::new(VecDeque::from([
-            Ok(raised.clone()),
-            Ok(raised.clone()),
-            Err("the agent did not answer".into()),
-            Ok(Passed::default()),
-            Ok(raised.clone()),
-        ])),
-    });
+    let personal = Arc::new(Scripted::new([
+        Ok(raised.clone()),
+        Ok(raised.clone()),
+        Err("the agent did not answer".into()),
+        Ok(Passed::default()),
+        Ok(raised.clone()),
+    ]));
     node.attach(personal);
-    let fresh = |synced: &s4_credential::Synced| {
+    let fresh = |synced: &vos_facility::Synced| {
         synced
             .notices
             .iter()
@@ -195,7 +210,9 @@ fn notices_are_fresh_once_and_stand_while_a_pass_fails() {
 
 /// An alarm, which a pass raises once, stands after passes that find it
 /// no more, not fresh, and through a pass that stopped, which raises what
-/// it found.
+/// it found. The device group's alarms are acknowledged to it once the
+/// run that raised them is kept, and a pass that found none acknowledges
+/// none.
 #[test]
 fn an_alarm_stands_after_the_pass_that_raised_it() {
     let directory = tempfile::tempdir().unwrap();
@@ -208,23 +225,30 @@ fn an_alarm_stands_after_the_pass_that_raised_it() {
         fresh: false,
         detail: "Rollback { next: 4 }".into(),
     };
+    let rollback = Alarm::Rollback { next: 4 };
     let found = |notices: Vec<Notice>, stopped: Option<&str>| {
+        let alarms = match notices
+            .iter()
+            .any(|notice| notice.pending == Pending::Alarm)
+        {
+            true => vec![rollback],
+            false => Vec::new(),
+        };
         Ok(Passed {
             notices,
+            alarms,
             seen: Vec::new(),
             stopped: stopped.map(Into::into),
         })
     };
-    let personal = Arc::new(Scripted {
-        passes: Mutex::new(VecDeque::from([
-            found(vec![alarm.clone()], None),
-            found(vec![removal()], None),
-            found(vec![removal()], Some("the agent refused")),
-            found(Vec::new(), None),
-        ])),
-    });
-    node.attach(personal);
-    let shown = |synced: s4_credential::Synced| {
+    let personal = Arc::new(Scripted::new([
+        found(vec![alarm.clone()], None),
+        found(vec![removal()], None),
+        found(vec![removal()], Some("the agent refused")),
+        found(Vec::new(), None),
+    ]));
+    node.attach(personal.clone());
+    let shown = |synced: vos_facility::Synced| {
         synced
             .notices
             .into_iter()
@@ -234,6 +258,13 @@ fn an_alarm_stands_after_the_pass_that_raised_it() {
     assert_eq!(
         shown(node.sync_personal().unwrap()),
         [(Pending::Alarm, true)]
+    );
+    assert_eq!(*personal.acknowledged.lock().unwrap(), [vec![rollback]]);
+    let kept = node.runs().unwrap();
+    assert_eq!(
+        kept.last().unwrap().notices,
+        1,
+        "the run that raised it, kept"
     );
     assert_eq!(
         shown(node.sync_personal().unwrap()),
@@ -250,6 +281,7 @@ fn an_alarm_stands_after_the_pass_that_raised_it() {
         shown(node.sync_personal().unwrap()),
         [(Pending::Alarm, false)]
     );
+    assert_eq!(personal.acknowledged.lock().unwrap().len(), 1);
 }
 
 /// The runs kept are the latest [`RUNS`].
@@ -257,9 +289,7 @@ fn an_alarm_stands_after_the_pass_that_raised_it() {
 fn the_latest_runs_are_kept() {
     let directory = tempfile::tempdir().unwrap();
     let (node, _world) = enrolled(directory.path());
-    let personal = Arc::new(Scripted {
-        passes: Mutex::new(VecDeque::new()),
-    });
+    let personal = Arc::new(Scripted::default());
     node.attach(personal);
     for _ in 0..RUNS + 3 {
         let synced = node.sync_personal().unwrap();

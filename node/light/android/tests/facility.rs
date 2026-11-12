@@ -231,7 +231,7 @@ async fn enroll_sign_in_and_pay_as_the_chrome_confirmed() {
     assert!(world.feed_reads() > feeds);
 
     // Another server asking to enroll the same space is refused.
-    let elsewhere = facility.session(s4_credential::Gateway {
+    let elsewhere = facility.session(vos_facility::Gateway {
         fingerprint: "SHA256:elsewhere".into(),
         ..gateway()
     });
@@ -315,7 +315,7 @@ async fn nothing_is_proved_before_enrollment_or_for_an_unknown_operation() {
 
 struct Phone;
 
-impl s4_credential::node::Device for Phone {
+impl vos_facility::node::Device for Phone {
     fn kinds(&self) -> Vec<Kind> {
         vec![Kind::Keystore]
     }
@@ -331,7 +331,7 @@ fn a_stream_to_an_onion_goes_over_tor() {
     let directory = tempfile::tempdir().unwrap();
     let node = node(&world, directory.path(), Arc::new(Phone));
     let mut stream = node
-        .open_stream(s4_credential::StreamTarget {
+        .open_stream(vos_facility::StreamTarget {
             host: world::address(&world, 1).to_ascii_uppercase(),
             port: 22,
         })
@@ -346,7 +346,7 @@ fn a_stream_to_an_onion_goes_over_tor() {
         Some(world::address(&world, 1))
     );
     let refused = node
-        .open_stream(s4_credential::StreamTarget {
+        .open_stream(vos_facility::StreamTarget {
             host: "nowhere.onion".into(),
             port: 22,
         })
@@ -357,8 +357,8 @@ fn a_stream_to_an_onion_goes_over_tor() {
 /// A client whose user confirms everything, its key in memory.
 struct Confirming;
 
-impl s4_credential::node::Prompts for Confirming {
-    fn confirm(&self, _: s4_credential::Form) -> Answer {
+impl vos_facility::node::Prompts for Confirming {
+    fn confirm(&self, _: vos_facility::Form) -> Answer {
         Answer::Confirmed {
             choice: 0,
             values: Vec::new(),
@@ -402,19 +402,19 @@ fn the_screens_go_over_the_spaces_onion_or_its_opt_out() {
     let node = node(&world, directory.path(), Arc::new(Phone));
     // The app in the foreground: a dormant client closes the screens.
     node.foreground(true);
-    let session = node.open_session(s4_credential::Gateway {
+    let session = node.open_session(vos_facility::Gateway {
         host_key: Some(ssh_host_key()),
         ..gateway()
     });
     node.enroll(
         session,
-        s4_credential::Enroll::read(&enrollment()).unwrap(),
+        vos_facility::Enroll::read(&enrollment()).unwrap(),
         Arc::new(Confirming),
     )
     .unwrap();
     let screens = |host: &str| {
         let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
-        let target = s4_credential::StreamTarget {
+        let target = vos_facility::StreamTarget {
             host: host.into(),
             port: gateway().port,
         };
@@ -461,7 +461,7 @@ fn the_screens_go_over_the_spaces_onion_or_its_opt_out() {
     // Dormant, the client closes the screens.
     let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
     node.screens(
-        s4_credential::StreamTarget {
+        vos_facility::StreamTarget {
             host: "gateway.test".into(),
             port: gateway().port,
         },
@@ -504,14 +504,14 @@ fn the_onion_is_preferred_and_a_gateway_spelled_otherwise_is_refused() {
             enrollment_at(OTHER_HANDLE, [0x52; 32], OTHER, [0x1e; 32], 2),
         ),
     ] {
-        let session = node.open_session(s4_credential::Gateway {
+        let session = node.open_session(vos_facility::Gateway {
             host_key: Some(ssh_host_key()),
             application: application.into(),
             ..gateway()
         });
         node.enroll(
             session,
-            s4_credential::Enroll::read(&enrollment).unwrap(),
+            vos_facility::Enroll::read(&enrollment).unwrap(),
             Arc::new(Confirming),
         )
         .unwrap();
@@ -519,7 +519,7 @@ fn the_onion_is_preferred_and_a_gateway_spelled_otherwise_is_refused() {
     }
     let screens = || {
         let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
-        let target = s4_credential::StreamTarget {
+        let target = vos_facility::StreamTarget {
             host: "gateway.test".into(),
             port: gateway().port,
         };
@@ -565,4 +565,115 @@ fn the_onion_is_preferred_and_a_gateway_spelled_otherwise_is_refused() {
     node.clearnet(ssh_host_key()).unwrap();
     node.opt_out(HANDLE, false).unwrap();
     assert!(node.clearnet(ssh_host_key()).is_err(), "back on Tor");
+}
+
+/// A sign-in whose root the node no longer judges current is proved again
+/// once the keeper's next read is made, with no second prompt; a second
+/// such answer is the server's to see. A proof the node no longer admits
+/// for its device format, at ingress or at apply, asks for an update and
+/// answers the server nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_root_is_proved_again_and_a_retired_format_asks_for_an_update() {
+    let world = world();
+    let directory = tempfile::tempdir().unwrap();
+    let source = Arc::new(Software {
+        key: [9; 32],
+        uses: Mutex::new(0),
+    });
+    let facility = facility(
+        &world,
+        directory.path(),
+        Arc::clone(&source) as Arc<dyn Source>,
+    );
+    let session = facility.session(gateway());
+    let chrome = Scripted::default();
+    chrome.will(confirm(&[]));
+    chrome.will(confirm(&[]));
+    let enrolled = session.ask("enroll", &enrollment(), &chrome).await.unwrap();
+    world.enroll(
+        AGENT,
+        &bytes(field(&enrolled, "member")).try_into().unwrap(),
+    );
+    session.granted();
+    let login = object(&[
+        ("agent", Value::from(AGENT)),
+        ("instance", Value::from(POLL)),
+        ("method", Value::from("login")),
+        ("arguments", Value::Bytes(Vec::new())),
+    ]);
+    signed_in(&session, &login, &chrome).await.unwrap();
+    let stale = || {
+        Response::Rejected(ingress::Rejection::Credential(
+            ingress::CredentialRefusal::RootStale,
+        ))
+    };
+    let proofs = || world.state.lock().unwrap().credentialed.len();
+
+    // Refused once: proved again after the keeper read the feed, the user
+    // asked once and the source used once.
+    let (forms, uses, sent, reads) = (
+        chrome.shown.lock().unwrap().len(),
+        *source.uses.lock().unwrap(),
+        proofs(),
+        world.feed_reads(),
+    );
+    world.state.lock().unwrap().refusing.push_back(stale());
+    let signed = signed_in(&session, &login, &chrome).await.unwrap();
+    assert!(matches!(
+        Response::decode_exact(&bytes(field(&signed, "answer"))),
+        Some(Response::Ran {
+            outcome: Outcome::Done(_),
+            ..
+        })
+    ));
+    assert_eq!(proofs(), sent + 2, "proved twice");
+    assert!(world.feed_reads() > reads, "the feed read between");
+    assert_eq!(chrome.shown.lock().unwrap().len(), forms + 1, "one prompt");
+    assert_eq!(*source.uses.lock().unwrap(), uses + 1, "one source use");
+
+    // Refused twice: the second refusal is the answer.
+    let sent = proofs();
+    {
+        let mut state = world.state.lock().unwrap();
+        state.refusing.push_back(stale());
+        state.refusing.push_back(stale());
+    }
+    let signed = signed_in(&session, &login, &chrome).await.unwrap();
+    assert_eq!(
+        Response::decode_exact(&bytes(field(&signed, "answer"))),
+        Some(stale())
+    );
+    assert_eq!(proofs(), sent + 2, "one retry");
+
+    // A device format the space no longer admits.
+    for retired in [
+        Response::Refused(vos_wire::abi::Refusal::Format),
+        Response::Rejected(ingress::Rejection::Credential(
+            ingress::CredentialRefusal::Format,
+        )),
+    ] {
+        world.state.lock().unwrap().refusing.push_back(retired);
+        let refused = signed_in(&session, &login, &chrome).await.unwrap_err();
+        assert_eq!(refused.code, Code::Refused);
+        assert!(refused.message.contains("update the app"), "{refused:?}");
+    }
+}
+
+/// `request` signed in, confirmed in `chrome`, once the device holds its
+/// path: a refusal for a path not read yet is asked again.
+async fn signed_in(
+    session: &Session,
+    request: &Value,
+    chrome: &Scripted,
+) -> Result<Value, Refusal> {
+    loop {
+        chrome.will(confirm(&[]));
+        match session.ask("sign_in", request, chrome).await {
+            Err(error) if error.code == Code::NoPath => {
+                chrome.answers.lock().unwrap().clear();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            answered => return answered,
+        }
+    }
 }

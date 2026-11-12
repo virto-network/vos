@@ -8,7 +8,7 @@
 //! SSH key and every request it carried.
 //!
 //! - **A space** ([`World::space`]): its agent, its credential actor (the
-//!   tree served from its feed, an open claim's work and `enroll_device`
+//!   tree served from its feed (`feed`, `feed_after`), an open claim's work and `enroll_device`
 //!   placing a leaf, `revoke_device` clearing one), its onions; a home's
 //!   `Homes` too ([`World::home`]): a pool of personal agents, each one a
 //!   [`Host`] running `Personal`, claimed by a proof in the scope "home",
@@ -240,6 +240,16 @@ impl Tree {
         });
     }
 
+    /// The feed after the last change that left `root`, as
+    /// `feed_after(root)` serves it: none for a root no change left.
+    fn after(&self, root: &[u8; 32]) -> Option<Feed> {
+        let last = self
+            .changes
+            .iter()
+            .rposition(|change| change.root.root == *root)?;
+        Some(self.page(last as u64 + 1))
+    }
+
     fn page(&self, from: u64) -> Feed {
         let start = (from as usize).min(self.changes.len());
         let end = (start + 8).min(self.changes.len());
@@ -284,6 +294,9 @@ pub struct State {
     pub credentialed: Vec<(AgentId, Credentialed)>,
     /// Answer the node's time with bytes that are no time.
     pub bad_time: bool,
+    /// The answers the next proven calls get in place of running, as a
+    /// node's ingress or agent refuses them.
+    pub refusing: std::collections::VecDeque<Response>,
     pub feed_reads: usize,
     /// Admit no open claim, and count the terms asked.
     pub closed: bool,
@@ -303,7 +316,7 @@ pub struct World {
     pub state: Mutex<State>,
     /// Added to the device's clock: the world's time.
     pub offset: AtomicI64,
-    pub stock: s4_credential::Stock,
+    pub stock: vos_facility::Stock,
 }
 
 impl World {
@@ -317,7 +330,7 @@ impl World {
                 ..State::default()
             }),
             offset: AtomicI64::new(0),
-            stock: s4_credential::Stock::embedded(),
+            stock: vos_facility::Stock::embedded(),
         })
     }
 
@@ -620,6 +633,10 @@ impl World {
             Some(Kind::Credentialed) => {
                 let (agent, request) =
                     <(AgentId, Credentialed)>::decode_exact(body).expect("a credentialed call");
+                if let Some(refused) = state.refusing.pop_front() {
+                    state.credentialed.push((agent, request));
+                    return refused.encode();
+                }
                 let outcome = state.credentialed(&self.stock, agent.0, &request, now);
                 state.credentialed.push((agent, request));
                 Response::Ran { outcome, at: 1 }.encode()
@@ -662,6 +679,15 @@ impl State {
                     space
                         .tree
                         .page(u64::decode_exact(&query.arguments).unwrap()),
+                );
+            }
+            if named("feed_after") {
+                self.feed_reads += 1;
+                let space = self.spaces.get_mut(&agent).unwrap();
+                return done(
+                    space
+                        .tree
+                        .after(&<[u8; 32]>::decode_exact(&query.arguments).unwrap()),
                 );
             }
             if named("opening") {
@@ -714,7 +740,7 @@ impl State {
 
     fn credentialed(
         &mut self,
-        stock: &s4_credential::Stock,
+        stock: &vos_facility::Stock,
         agent: u32,
         request: &Credentialed,
         now: u64,

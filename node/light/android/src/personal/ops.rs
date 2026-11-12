@@ -669,6 +669,7 @@ impl Space {
             },
             nullifier: home.nullifier(secret),
             label: label.as_bytes().to_vec(),
+            carried: Vec::new(),
         })
     }
 
@@ -1390,7 +1391,13 @@ impl Space {
                 Joined::Offer(offer) => {
                     let reference = self.source(prompts, &mut held)?;
                     let secret = secret(prompts, &reference, &offer.home.handle)?;
-                    let device = self.device(&mut held, prompts, &offer.home, &secret, label)?;
+                    let mut device =
+                        self.device(&mut held, prompts, &offer.home, &secret, label)?;
+                    // A device of a group a move left says what it carries
+                    // in its hello: the keys it rejoins with name it.
+                    if let Some(old) = held.group.as_ref() {
+                        device = moving::naming(&held.light, old, device).map_err(moved)?;
+                    }
                     let member = vos_light::member(&secret).to_bytes();
                     let mut handles = Vec::new();
                     for membership in &offer.memberships {
@@ -1447,7 +1454,7 @@ impl Space {
             None if !vos_light::home::holds_archive(held.light.store()).map_err(failed)? => {
                 DeviceGroup::join(held.light.store(), device, *pairing).map_err(failed)
             }
-            old => moving::rejoin(&held.light, old, device, *pairing).map_err(failed),
+            old => moving::rejoin(&held.light, old, device, *pairing).map_err(moved),
         };
         let group = match joined {
             Ok(group) => group,
@@ -1597,7 +1604,7 @@ impl Space {
             .ok_or_else(|| refused(Refused::Arguments, "no confirmation is owed there"))?;
         let mine = self.enrolled_at(&membership.handle)?;
         let outcome = self.prove_owner(prompts, &mine, |expires| {
-            memberships::confirm_call(&confirmation, expires)
+            memberships::confirm_call(&confirmation, &mine.member, expires)
         })?;
         registrar_done(&outcome)?;
         memberships::confirmed(held.light.store(), &confirmation).map_err(failed)
@@ -2428,7 +2435,7 @@ impl Space {
                 let kit = new_kit(prompts, request.kit, &kept)?;
                 let group = held.group.as_ref().ok_or_else(no_space)?;
                 Move::prepare(
-                    held.light.store(),
+                    &held.light,
                     group,
                     device,
                     vec![kit.key()],
@@ -2575,10 +2582,12 @@ fn registrar_done(outcome: &Outcome) -> Result<(), Refusal> {
         Outcome::Done(_) => Ok(()),
         Outcome::Failed { detail, .. } => Err(refused(
             Refused::Refused,
-            format!(
-                "the registrar refused: {:?}",
-                CredentialError::decode_exact(detail)
-            ),
+            match CredentialError::decode_exact(detail) {
+                Some(CredentialError::Enrollments) => {
+                    "replacements spent; next year, or ask the registrar".into()
+                }
+                error => format!("the registrar refused: {error:?}"),
+            },
         )),
         other => Err(failed(format!("the registrar answered {other:?}"))),
     }
@@ -2598,5 +2607,14 @@ impl State {
         if self.next_admin.len() > KEPT {
             self.next_admin.remove(0);
         }
+    }
+}
+
+/// A move's or a rejoin's refusal: a device that carries more authors than
+/// its keys can name is refused, as nothing this device can retry fixes.
+fn moved(error: moving::MoveError) -> Refusal {
+    match error {
+        moving::MoveError::Carried => refused(Refused::Refused, error.to_string()),
+        error => failed(error),
     }
 }
