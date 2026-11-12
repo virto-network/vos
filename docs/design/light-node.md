@@ -2037,7 +2037,9 @@ choice, this is the one taken]:
   of the old set, removed ones' too, and each author the old set's keys
   named as carried, in each scope up to the highest of its nodes the
   device holds there short of its cutoff (`moving::carried`); so a
-  second move carries what the first did. The claim is held in the store
+  second move carries what the first did. While the claim waits, the old
+  group's scopes are read no more (`Waiting::Moving`), so the move holds
+  nothing past what its keys named. The claim is held in the store
   beside the group it leaves; a second move or claim is refused, and so
   are a move to the agent the group has and one from a device that cannot
   follow its group or is out of it. A claim `Homes` refuses is abandoned
@@ -2076,21 +2078,28 @@ choice, this is the one taken]:
 - **Readers at the new home** take a carried author's node as the set's up
   to the number a device's keys name it to there, whoever pushed it
   (`SealedSync::catch_up`, `DeviceGroup::carriers`). The keys are the
-  log's: the mover's as its claim put them (a pairing hands them over, a
-  restore reads them from the device set), a re-paired device's as the
+  log's: the mover's as its claim put them, a re-paired device's as the
   commit adding it put them, which its opener's admin key signed and
-  every device verifies. No archive names an author, so neither the
-  operators nor a device of the set, later removed, plants one. A reader
+  every device verifies; a paired device takes the others' from its
+  pairing device's word, as it takes the device set, and a restore from
+  the agent's, as it takes the device set (§8, D1). No archive names an
+  author, so no device of the set, later removed, plants one through
+  its archive, and the operators plant none. A reader
   takes a named author's nodes as the set's while the device naming it
   has a voice, then, once its removal matured, only at positions up to
-  that device's frontier, so a device that named an author of its own
-  making writes through it no later than it could itself (A7). A device
+  that device's frontier, the first one the agent answered and kept
+  (`s/frontier/`), so a device that named an author of its own making
+  writes through it no later than it could itself (A7). A device
   of the old set removed at the new home is cut off at its frontier
   there, never below one past what a device with a voice names of it,
   and a frontier envelope holding another author's carried node gives no
   cutoff of its own. A restore elsewhere names the old agent's device set
   the same way in the keys it claims with, from the nodes it read back
-  before the claim (`group::recovered`, `personal::read_back`).
+  before the claim (`group::recovered`, `personal::read_back`): the set
+  as the old agent's operators show it, and the nodes as read back, with
+  no author, frontier or epoch checked (`read_back`, an open finding of
+  its own), so what it names is the old home's word
+  as much as a restore at home takes it.
 - **Re-pair** (`moving::rejoin`): each other device pairs again by QR from
   a device at the new home whose move is done, its handles in the other
   spaces kept (the offer names none). It reads the old home to its end
@@ -2146,7 +2155,7 @@ choice, this is the one taken]:
   home show the operators the old set's sync keys and how far each wrote
   in each scope (each scope's id and node count, already theirs at the
   old home); a device's keys name at most 64 carried authors
-  (`personal::CARRIED`, one an author and a scope), so a space whose old
+  (`vos_wire::personal::CARRIED`, one an author and a scope), so a space whose old
   set wrote in more scopes than that allows does not move (`Carried`); an opener whose own move is not done
   is not refused by the library; the old home's `Homes` keeps the moved
   devices' nullifiers until its lease lapses; a crash inside the leave is
@@ -3457,9 +3466,16 @@ against a no-flood baseline:
   a batch's first) fails every proof, and two such refusals with no
   change read between drop the tree; one the ring holds is one of its 64
   recent roots, shared by every member that read as far, so the mark is a
-  few bits at most and lasts only while those proofs still pass. Binding
-  the feed's head to the ring's entry, so a page ending early shows, is
-  later work.
+  few bits at most and lasts only while those proofs still pass. A head
+  bound to the ring's entry inside the actor alone would show the keeper
+  nothing, since every answer, the binding with it, is the gateway's to
+  forge, and the ring accepts any of its roots for `ROOT_MAX_AGE`; closing
+  it takes a change beyond the actor (open, for the owner): ingress and
+  the refine accepting a superseded root for about one feed period only
+  (the node and the agent's blob; it shortens the mark to the split an
+  honest keeper one period behind shows), the head bound into the proven
+  statement with that rule, or answers the keeper can authenticate past
+  the gateway (the node's own signature over the feed's head).
 - **Back onto the real feed** [built]: a keeper whose pages are refused,
   or whose root the actor knows no change leaving (a fork a gateway
   served, a re-founded space whose feed starts again), two reads in a
