@@ -194,6 +194,32 @@ pub struct NewDevice {
     pub nullifier: [u8; 32],
     /// Its label, sealed to the device group.
     pub label: Vec<u8>,
+    /// The authors it carries from the groups it left (`light-node.md`
+    /// §3.9), by author and scope, at most [`CARRIED`]: none for a device
+    /// that left no group.
+    pub carried: Vec<CarriedAuthor>,
+}
+
+/// The most carried authors a device's keys name: eight devices' in eight
+/// scopes, so the device set's views stay well within a reply.
+pub const CARRIED: usize = 64;
+
+impl NewDevice {
+    /// Whether it names at most [`CARRIED`] carried authors.
+    pub fn bounded(&self) -> bool {
+        self.carried.len() <= CARRIED
+    }
+}
+
+/// An author a device carries from a group it left: a device of that
+/// group, its nodes in `scope` read as the set's up to number `through`,
+/// while the carrying device has a voice and, once its removal matured,
+/// at positions up to its frontier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct CarriedAuthor {
+    pub author: [u8; 32],
+    pub scope: Scope,
+    pub through: u64,
 }
 
 /// A device in the set.

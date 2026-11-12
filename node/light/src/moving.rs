@@ -6,18 +6,21 @@
 //! - **The claim elsewhere** ([`Move`]): a device of the group claims the
 //!   agent another home's `Homes` answers `pooled` for, as a first claim
 //!   does, the kit split anew there (`R1` sealed to that agent, a new
-//!   `R2` in the claim). The claim is held in the store beside the group
-//!   it leaves, so a retry after a lost answer sends the same claim, and a
-//!   refused one ([`Move::abandon`]) leaves the old group as it was.
+//!   `R2` in the claim). Its keys there name each device of the old set,
+//!   and each author the old set's keys named, as a carried author in
+//!   each scope up to the node this device holds of it ([`carried`]):
+//!   readers at the new home take those nodes as the set's, on the word of
+//!   the log that holds the keys, never of an archive. The claim is held
+//!   in the store beside the group it leaves, so a retry after a lost
+//!   answer sends the same claim, and a refused one ([`Move::abandon`])
+//!   leaves the old group as it was.
 //! - **Leaving, and a new group** ([`Move::claimed`]): once the new agent's
 //!   log assigns it, the old group, given up by the caller, is left: its
 //!   state, its MLS state and every row of its sealed sync deleted, the
 //!   scopes' data kept and each scope's cursor and push queue forgotten;
-//!   the archive keeps its naming secrets and keys, drops the old `R`, and
-//!   records each device of the old set as a carried author in each scope
-//!   up to the node this device holds of it ([`carried`]), which readers
-//!   at the new home take as the set's. Then this device's group alone at
-//!   the new agent, its `R` the new split's.
+//!   the archive keeps its naming secrets and keys and drops the old `R`.
+//!   Then this device's group alone at the new agent, its `R` the new
+//!   split's.
 //! - **Push everything** ([`finish`]): the archive, then each scope's nodes
 //!   the new agent lacks carried in causal order
 //!   ([`SealedSync::carry`]) and read back, the archive again, then the
@@ -25,7 +28,9 @@
 //!   nothing at the new home.
 //! - **Re-pair** ([`rejoin`]): each other device pairs again by QR from a
 //!   device at the new home, the move done there. It reads the old home to
-//!   its end first; its key package waits beside its old group, so a
+//!   its end first, then its keys name what it carries as the mover's do
+//!   ([`naming`]), which the commit adding it puts in the new home's log
+//!   for every device there; its key package waits beside its old group, so a
 //!   pairing cut short before the handover leaves that group standing; on
 //!   the handover it leaves its old group and joins the new one (a pairing
 //!   of the same personal space's alone), starts its scopes from the
@@ -95,6 +100,9 @@ pub enum MoveError {
     Held,
     /// The group is one this device cannot follow, or is out of.
     Course,
+    /// The device carries more authors than its keys can name
+    /// (`vos_wire::personal::CARRIED`).
+    Carried,
     Group(GroupError),
     Light(Error),
     Store(StoreError),
@@ -132,6 +140,7 @@ impl std::fmt::Display for MoveError {
             MoveError::Elsewhere => f.write_str("the pairing is of another personal space"),
             MoveError::Held => f.write_str("a move or a claim waits already"),
             MoveError::Course => f.write_str("the device does not follow its group"),
+            MoveError::Carried => f.write_str("the device carries more authors than its keys name"),
             MoveError::Group(error) => error.fmt(f),
             MoveError::Light(error) => error.fmt(f),
             MoveError::Store(error) => error.fmt(f),
@@ -158,20 +167,22 @@ pub fn carrying(store: &Store) -> Result<bool, MoveError> {
 pub struct Move(Claim);
 
 impl Move {
-    /// The move of `group`'s personal space to the pooled `agent` of
-    /// another home, whose identity is `identity`, for `device` (its
-    /// nullifier the new home's) with the kit of `keys`: `R` split anew,
-    /// `R1` sealed to each key at that agent, held in the store before this
-    /// returns. Refused while a move or a claim waits, for the agent the
-    /// group has, and for a group this device cannot follow or is out of.
+    /// The move of `group`'s personal space, kept in `light`, to the pooled
+    /// `agent` of another home, whose identity is `identity`, for `device`
+    /// (its nullifier the new home's), its keys naming what it carries
+    /// ([`naming`]), with the kit of `keys`: `R` split anew, `R1` sealed to
+    /// each key at that agent, held in the store before this returns.
+    /// Refused while a move or a claim waits, for the agent the group has,
+    /// and for a group this device cannot follow or is out of.
     pub fn prepare(
-        store: &Store,
+        light: &Light,
         group: &DeviceGroup,
         device: NewDevice,
         keys: Vec<KitKey>,
         agent: u32,
         identity: [u8; 32],
     ) -> Result<Self, MoveError> {
+        let store = light.store();
         if moving(store)? || Claim::held(store)?.is_some() {
             return Err(MoveError::Held);
         }
@@ -181,6 +192,7 @@ impl Move {
         if group.course() != Course::Following {
             return Err(MoveError::Course);
         }
+        let device = naming(light, group, device)?;
         let claim = Claim::draw(device, keys, agent, identity)?;
         store.write_group_rows(vec![claim.row(), (MOVE_ROW.to_vec(), Some(Vec::new()))])?;
         Ok(Self(claim))
@@ -259,35 +271,47 @@ fn given(store: &Store, group: Option<DeviceGroup>) -> Result<Option<DeviceGroup
 }
 
 /// Leave `group` for good: each of `light`'s scopes' cursor and push queue
-/// forgotten first, then the group's rows in one batch, its devices'
-/// authorship recorded ([`carried`]), so that a leave cut short is made
-/// again whole.
+/// forgotten first, then the group's rows in one batch, so that a leave
+/// cut short is made again whole.
 fn leave(light: &Light, group: DeviceGroup, rejoining: bool) -> Result<(), MoveError> {
-    // The group's devices, and every author it read as carried: the next
-    // home's set may hold none of the devices that vouched for them.
-    let archive = group.archive();
+    for instance in light.instances()? {
+        light.forget_feed(instance)?;
+    }
+    group.leave(rejoining)?;
+    Ok(())
+}
+
+/// `device`, the keys a device of `group` takes to the home its personal
+/// space moves to, naming what it carries there ([`carried`]): each device
+/// of `group`'s set, removed ones' too, and each author their keys named
+/// as carried, so a second move carries what the first did. What a mover
+/// claims with ([`Move::prepare`]) and what a device pairing again there
+/// says in its hello, its old group still held ([`rejoin`]). Refused past
+/// `vos_wire::personal::CARRIED` of them.
+pub fn naming(
+    light: &Light,
+    group: &DeviceGroup,
+    mut device: NewDevice,
+) -> Result<NewDevice, MoveError> {
     let mut authors: Vec<[u8; 32]> = group
         .sync_keys()
         .into_iter()
         .map(|(_, sync)| sync)
-        .chain(archive.vouched.iter().map(|vouched| vouched.carried.author))
-        .chain(archive.authors.iter().map(|carried| carried.author))
+        .chain(group.carried_authors())
         .collect();
     authors.sort_unstable();
     authors.dedup();
-    let carried = carried(light, &authors)?;
-    for instance in light.instances()? {
-        light.forget_feed(instance)?;
+    device.carried = carried(light, &authors)?;
+    if !device.bounded() {
+        return Err(MoveError::Carried);
     }
-    group.leave(&carried, rejoining)?;
-    Ok(())
+    Ok(device)
 }
 
 /// What a move carries of `authors` (a group's sync keys) in `light`'s
 /// scopes: each that a scope holds nodes of, up to the highest it holds
-/// there short of its cutoff ([`crate::group::Archive::authors`]). A
-/// restore elsewhere records the old agent's device set's so
-/// ([`DeviceGroup::record_authors`]).
+/// there short of its cutoff (`NewDevice::carried`). A restore elsewhere
+/// names the old agent's device set's so in the keys it claims with.
 pub fn carried(light: &Light, authors: &[[u8; 32]]) -> Result<Vec<CarriedAuthor>, MoveError> {
     let mut carried = Vec::new();
     for instance in light.instances()? {
@@ -312,9 +336,10 @@ pub fn carried(light: &Light, authors: &[[u8; 32]]) -> Result<Vec<CarriedAuthor>
 }
 
 /// A device of a group a move left, joining the moved group from the
-/// `pairing` a device at the new home handed over (`me` its keys there):
-/// `group`, the store's old group, given up and left, then its group from
-/// the pairing, its archive's keys and carried authors kept. Refused
+/// `pairing` a device at the new home handed over (`me` its keys there, as
+/// [`naming`] made them before its hello): `group`, the store's old group,
+/// given up and left, then its group from the pairing, its archive's keys
+/// kept. Refused
 /// before anything is left for a pairing of another personal space, or of
 /// the agent its group has. The move is held until [`finish`] carried
 /// what the new home lacks. Once the old group is left, a pairing cut
@@ -358,8 +383,7 @@ pub struct Finished {
 }
 
 /// Push everything to the agent of `sync`'s group: the archive read and
-/// pushed (the carried authors reach the readers before their nodes), each
-/// installed scope read to its end, its nodes the agent lacks carried and
+/// pushed, each installed scope read to its end, its nodes the agent lacks carried and
 /// read back; then the archive again, and once all of it went the move
 /// held is done and the recovery envelopes pushed, the last push. What a
 /// move does at its new home, and what a device paired again there does:

@@ -253,6 +253,7 @@ impl Founded {
             },
             nullifier: vos_light::home::nullifier(&secret(n), &self.space.0, self.agent.0, HOMES.0),
             label: vec![1; 24],
+            carried: Vec::new(),
         }
     }
 

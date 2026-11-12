@@ -6,7 +6,10 @@
 //! - **What the agent lacks** is every node the scope holds applied that
 //!   this device neither read there nor pushed there: its reading's and
 //!   its own pushes' CIDs by position. A node past its author's cutoff
-//!   stays behind, so a removed device's late nodes reach no new home.
+//!   stays behind, so a removed device's late nodes reach no new home; so
+//!   does one of an author no device of the set is, past the number the
+//!   set's keys name it carried to (`NewDevice::carried`), which no reader
+//!   there would take.
 //! - **In causal order,** parents first, sealed under the confirmed epoch
 //!   with this device's view and `seen` positions, [`PIPELINE`] a round;
 //!   each round's sealed bytes held in the store before they are sent, so
@@ -82,7 +85,8 @@ pub struct Carried {
     pub pushed: Vec<u64>,
     /// The nodes this device read or pushed there already.
     pub held: usize,
-    /// The nodes left behind, past their author's cutoff.
+    /// The nodes left behind, past their author's cutoff or past what the
+    /// set's keys name of a carried author.
     pub cut: usize,
     /// The carry stopped at `StaleEpoch` for this epoch: follow the log,
     /// then carry again.
@@ -179,6 +183,16 @@ impl<L: Link> SealedSync<'_, L> {
                 .light
                 .cutoff(instance, &header.author)?
                 .is_some_and(|from| header.seq >= from)
+            {
+                report.cut += 1;
+                continue;
+            }
+            if self.group.author(&header.author.0).is_none()
+                && self
+                    .group
+                    .carriers(&header.author.0, &scope)
+                    .iter()
+                    .all(|(through, _)| header.seq > *through)
             {
                 report.cut += 1;
                 continue;

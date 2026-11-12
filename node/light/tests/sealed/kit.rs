@@ -121,7 +121,7 @@ pub(super) fn open_restore(
 
 /// The restore matured: `kit` wakes the agent, and the restored phone
 /// recovers the archive from the recovery scope.
-fn matured(home: &mut Home, kit: &KitSecret, restored: &Phone) -> Archive {
+pub(super) fn matured(home: &mut Home, kit: &KitSecret, restored: &Phone) -> Archive {
     home.pass(policy().kit_delay_ms);
     home.call(&kit.signing(), "wake", ().encode())
         .answer::<Woken>()
@@ -143,7 +143,7 @@ fn matured(home: &mut Home, kit: &KitSecret, restored: &Phone) -> Archive {
 }
 
 /// The restored phone's new group at its home, from what it reads there.
-fn restart(home: &Home, restored: &mut Phone, split: &Split, next: &KitSecret) {
+pub(super) fn restart(home: &Home, restored: &mut Phone, split: &Split, next: &KitSecret) {
     let overview: Overview = home
         .query(restored.sync_key(), "overview", ().encode())
         .unwrap();
@@ -325,12 +325,13 @@ fn a_restore_here_reads_the_personal_space_back() {
 }
 
 /// A restore elsewhere: the kit finds its agent by its index alone, the
-/// restore at the old home releases `R2`, and the fresh install claims a
-/// new agent at another home, its group there, its kit split anew; it
-/// reads the personal space back from the old home with the archive it
-/// recovered, the old scopes keeping their ids, new ones named afresh; and
-/// carries them to the new home, the old device set its carried authors,
-/// where a phone paired there reads them.
+/// restore at the old home releases `R2`, and the fresh install takes the
+/// archive it recovered in and reads the personal space back from the old
+/// home, the old scopes keeping their ids, new ones named afresh; then it
+/// claims a new agent at another home, its keys there naming the old
+/// device set as its carried authors, its group there, its kit split
+/// anew; and carries the old scopes to the new home, where a phone paired
+/// there reads them.
 #[test]
 fn a_restore_elsewhere_reads_the_personal_space_back() {
     let key = KitSecret::security_key(&mut Touch(9)).unwrap();
@@ -348,10 +349,7 @@ fn a_restore_elsewhere_reads_the_personal_space_back() {
     let archive = matured(&mut home, &kit, &restored);
     assert_eq!(archive.naming, naming);
 
-    let homes = SigningKey::from_bytes(&[0x51; 32]);
-    let mut elsewhere = Home::at(&homes, policy(), [0x2e; 32]);
-    let split = restored.claim_with(&mut elsewhere, &homes, vec![next.key()]);
-    restored.group().inherit(&archive).unwrap();
+    vos_light::group::recovered(&restored.store, &archive).unwrap();
     install(&restored.light, NOTES);
     assert_eq!(
         scope_of(&restored, NOTES),
@@ -368,19 +366,18 @@ fn a_restore_elsewhere_reads_the_personal_space_back() {
         .query(restored.sync_key(), "devices", ().encode())
         .unwrap();
     let mut link = HomeLink::new(&mut home, &restored);
-    let caught = read_back(
-        &restored.light,
-        restored.group.as_ref().unwrap().archive(),
-        &identity,
-        &mut link,
-        NOTES,
-    )
-    .unwrap();
+    let caught = read_back(&restored.light, &archive, &identity, &mut link, NOTES).unwrap();
     assert!(caught.passed.is_empty(), "{:?}", caught.passed);
     for n in 0..2 {
         assert_eq!(count(&restored.light, NOTES, n), Some(10 + n));
     }
+    let authors: Vec<[u8; 32]> = devices.iter().map(|view| view.device.keys.sync).collect();
+    restored.keys.carried = vos_light::moving::carried(&restored.light, &authors).unwrap();
+    assert!(!restored.keys.carried.is_empty());
 
+    let homes = SigningKey::from_bytes(&[0x51; 32]);
+    let mut elsewhere = Home::at(&homes, policy(), [0x2e; 32]);
+    let split = restored.claim_with(&mut elsewhere, &homes, vec![next.key()]);
     assert_eq!(r_of(&mut restored), *split.r());
     restored.update(&mut elsewhere).unwrap();
     let events = restored.read(&mut elsewhere);
@@ -389,9 +386,6 @@ fn a_restore_elsewhere_reads_the_personal_space_back() {
         "{events:?}"
     );
 
-    let authors: Vec<[u8; 32]> = devices.iter().map(|view| view.device.keys.sync).collect();
-    let carried = vos_light::moving::carried(&restored.light, &authors).unwrap();
-    restored.group().record_authors(&carried).unwrap();
     let carried = with(&mut elsewhere, &mut restored, &[NOTES], |sync| {
         sync.catch_up(NOTES)?;
         sync.carry(NOTES)

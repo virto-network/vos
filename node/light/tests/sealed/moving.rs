@@ -17,12 +17,18 @@ use vos_light::kit::{KitKey, KitSecret};
 use vos_light::moving::{self, Move, MoveError};
 use vos_wire::personal::{Kit, NewDevice, Recorded};
 
-use super::kit::{household_with, kit_reads, operate, r_of, written};
+use super::kit::{
+    household_with, kit_reads, matured, open_restore, operate, r_of, restart as restored_group,
+    written,
+};
 use super::*;
 use crate::home::PERSONAL;
 
 /// The other home's agent identity.
 const ELSEWHERE: [u8; 32] = [0x2e; 32];
+
+/// A third home's agent identity.
+const FARTHER: [u8; 32] = [0x3e; 32];
 
 /// A home as a device reaches it.
 fn space_of(home: &Home) -> HomeSpace {
@@ -41,7 +47,7 @@ fn space_of(home: &Home) -> HomeSpace {
 fn prepare(phone: &Phone, to: &Home, keys: Vec<KitKey>) -> Move {
     let group = phone.group.as_ref().unwrap();
     Move::prepare(
-        &phone.store,
+        &phone.light,
         group,
         phone.keys.clone(),
         keys,
@@ -76,6 +82,8 @@ fn claimed(phone: &mut Phone, to: &Home, held: Move) {
 /// from `opener`, handed `checkpoint`: its old group left on the handover,
 /// and its add committed.
 fn pair_again(home: &mut Home, opener: &mut Phone, joiner: &mut Phone, checkpoint: Checkpoint) {
+    let group = joiner.group.as_ref().unwrap();
+    joiner.keys = moving::naming(&joiner.light, group, joiner.keys.clone()).unwrap();
     let package = DeviceGroup::key_package(&joiner.store, &joiner.keys, home.now).unwrap();
     let (prepared, mut pairing) = opener
         .group()
@@ -114,7 +122,9 @@ fn finish(home: &mut Home, phone: &mut Phone) -> moving::Finished {
 /// carries nothing. The third removed at the new home before it pushed
 /// anything there, a new phone paired there with no checkpoint reads the
 /// whole history from the new home's start, the third's carried nodes
-/// among it.
+/// among it. The mover moves again, to a third home, and a phone paired
+/// there reads the whole history too, as a restore there does once every
+/// device is lost.
 #[test]
 fn a_move_carries_the_personal_space_and_the_others_pair_again() {
     let kit = KitSecret::phrase().unwrap();
@@ -133,7 +143,7 @@ fn a_move_carries_the_personal_space_and_the_others_pair_again() {
     let keys = phones[0].keys.clone();
     assert!(matches!(
         Move::prepare(
-            &phones[0].store,
+            &phones[0].light,
             group,
             keys,
             vec![next.key()],
@@ -183,8 +193,12 @@ fn a_move_carries_the_personal_space_and_the_others_pair_again() {
     let r = r_of(&mut phones[0]);
     let recovered = open_recovery(&r, &ELSEWHERE, &kit_reads(&elsewhere, &next)).unwrap();
     assert_eq!(recovered.naming, naming, "the kit's copy at the new home");
+    let mover = phones[0].group.as_ref().unwrap();
     for phone in &phones[1..] {
-        assert!(phone.group.as_ref().unwrap().archive().authors.is_empty());
+        assert!(
+            matches!(mover.carriers(&phone.sync_key(), &scope)[..], [(_, None)]),
+            "the mover's keys name each old device"
+        );
     }
 
     // The phones that missed the move: the notice, a note written at the
@@ -228,8 +242,9 @@ fn a_move_carries_the_personal_space_and_the_others_pair_again() {
     assert_eq!(carried.pushed.len(), 2, "the notes the move did not carry");
     assert_eq!(carried.held, 3);
 
+    // The second's carried authors reach the mover from the log, with no
+    // archive read.
     let caught = with(&mut elsewhere, &mut phones[0], &[NOTES], |sync| {
-        sync.archive()?;
         sync.catch_up(NOTES)
     })
     .unwrap();
@@ -299,6 +314,59 @@ fn a_move_carries_the_personal_space_and_the_others_pair_again() {
     }
     assert_eq!(count(&phones[2].light, NOTES, 30), Some(31));
     assert_eq!(count(&phones[2].light, NOTES, 50), Some(51));
+
+    // A second move, to a third home: the mover's keys there name what the
+    // first move and the second's pairing carried, the fourth's author
+    // among it, which no device of the third home's set is.
+    let mut farther = Home::at(&homes, policy(), FARTHER);
+    let last = KitSecret::phrase().unwrap();
+    let held = prepare(&phones[0], &farther, vec![last.key()]);
+    assert_eq!(held.agent().1, FARTHER);
+    assign(&mut farther, &homes, &held);
+    claimed(&mut phones[0], &farther, held);
+    let finished = finish(&mut farther, &mut phones[0]);
+    assert!(finished.done);
+    let mover = phones[0].group.as_ref().unwrap();
+    assert!(
+        matches!(mover.carriers(&late.sync_key(), &scope)[..], [(_, None)]),
+        "the second move names the fourth's author"
+    );
+    let mut newest = Phone::new(6);
+    phones[0].pair(&mut farther, &mut newest);
+    let mut there = vec![phones.remove(0), newest];
+    settle(&mut farther, &mut there);
+    install(&there[1].light, NOTES);
+    let caught = with(&mut farther, &mut there[1], &[NOTES], |sync| {
+        sync.catch_up(NOTES)
+    })
+    .unwrap();
+    assert!(caught.passed.is_empty(), "{:?}", caught.passed);
+    for n in 0..3 {
+        assert_eq!(count(&there[1].light, NOTES, n), Some(10 + n));
+    }
+    assert_eq!(count(&there[1].light, NOTES, 30), Some(31));
+    assert_eq!(count(&there[1].light, NOTES, 50), Some(51));
+
+    // Every device lost: a restore at the third home reads the carried
+    // history back, the authors from the device set's keys as the agent
+    // shows them, no archive naming one.
+    drop(there);
+    let after = KitSecret::phrase().unwrap();
+    let (mut restored, split, _) = open_restore(&mut farther, &last, &after, 7);
+    let archive = matured(&mut farther, &last, &restored);
+    restored_group(&farther, &mut restored, &split, &after);
+    restored.group().inherit(&archive).unwrap();
+    install(&restored.light, NOTES);
+    let caught = with(&mut farther, &mut restored, &[NOTES], |sync| {
+        sync.catch_up(NOTES)
+    })
+    .unwrap();
+    assert!(caught.passed.is_empty(), "{:?}", caught.passed);
+    for n in 0..3 {
+        assert_eq!(count(&restored.light, NOTES, n), Some(10 + n));
+    }
+    assert_eq!(count(&restored.light, NOTES, 30), Some(31));
+    assert_eq!(count(&restored.light, NOTES, 50), Some(51));
 }
 
 /// A move refused at the other home is abandoned, the old group standing;
@@ -328,7 +396,7 @@ fn an_interrupted_move_resumes_where_it_stopped() {
     let group = mover.group.as_ref().unwrap();
     assert!(matches!(
         Move::prepare(
-            &mover.store,
+            &mover.light,
             group,
             mover.keys.clone(),
             vec![kit.key()],

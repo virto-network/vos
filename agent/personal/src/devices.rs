@@ -337,6 +337,9 @@ impl Personal {
                 if self.lapsed(now) {
                     return Err(PersonalError::Lapsed);
                 }
+                if !keys.bounded() {
+                    return Err(PersonalError::Malformed);
+                }
                 self.fresh(&[keys.sync, keys.admin])
             }
             Op::Remove(target) => {
@@ -379,6 +382,9 @@ impl Personal {
             Op::Restore { device, kit } => {
                 if matches!(by, Signer::Device(_)) {
                     return Err(PersonalError::NotSigner);
+                }
+                if !device.bounded() {
+                    return Err(PersonalError::Malformed);
                 }
                 self.check_kit(&kit.entries, &[device.sync, device.admin])
             }

@@ -69,8 +69,9 @@ use zeroize::Zeroize;
 use crate::kit::{KitKey, Split};
 use crate::store::{Store, StoreError};
 
-pub use archive::{Archive, CarriedAuthor, Vouched};
+pub use archive::Archive;
 pub(crate) use follow::verifies;
+pub use vos_wire::personal::CarriedAuthor;
 
 /// The confirmation hash's domain.
 pub const CONFIRM: &[u8] = b"vos/personal/confirm";
@@ -893,6 +894,25 @@ pub fn restoring(store: &Store, keys: &[KitKey], agent: &Agent) -> Result<Split,
     Ok(split)
 }
 
+/// A restore elsewhere's recovered archive taken into `store` before the
+/// device has a group: its naming secret one of the earlier groups', its
+/// keys merged, its `R` left out. So the device reads its old scopes back
+/// from the old agent (`crate::personal::read_back`) and names the old
+/// device set in the keys it claims the new agent with
+/// ([`crate::moving::carried`]). Only for a store with no device group.
+pub fn recovered(store: &Store, recovered: &Archive) -> Result<(), GroupError> {
+    if store.group_row(STATE)?.is_some() {
+        return Err(GroupError::Grouped);
+    }
+    let mut archive = store.archive()?;
+    archive.inherit(&recovered.without_recovery());
+    store.write_group_rows(vec![(
+        crate::store::ARCHIVE_ROW.to_vec(),
+        Some(archive.encode()),
+    )])?;
+    Ok(())
+}
+
 /// An open operation of the device set as this device verified it, for
 /// the chrome: its index, signer and operation, when it matures, whether
 /// it is contested, the devices whose vetoes verified, and whether its
@@ -1058,8 +1078,9 @@ impl DeviceGroup {
     /// A device of a group a move left joining the moved group from
     /// `pairing`, once it left its own ([`crate::moving::rejoin`]): as
     /// [`DeviceGroup::join`], for a store whose scopes the pairing's naming
-    /// secrets name (the same personal space), its archive's keys and
-    /// carried authors kept beside the pairing's.
+    /// secrets name (the same personal space), its archive's keys kept
+    /// beside the pairing's; `me` names the authors it carries
+    /// ([`crate::moving::naming`]).
     pub fn rejoin(store: &Store, me: NewDevice, mut pairing: Pairing) -> Result<Self, GroupError> {
         if store.group_row(STATE)?.is_some() {
             return Err(GroupError::Grouped);
@@ -1338,21 +1359,11 @@ impl DeviceGroup {
     /// Leave this group for good, its scopes' data kept: its state, its MLS
     /// state, the log's chains it kept and every row of its sealed sync
     /// deleted in one batch, with the archive kept without `R` and the `R`s
-    /// drawn (another agent's split is another `R`), `carried` recorded in
-    /// it, and the MLS state's generation the next, `rejoining` keeping
-    /// the key package made there. A move's (`crate::moving`).
-    pub(crate) fn leave(
-        self,
-        carried: &[CarriedAuthor],
-        rejoining: bool,
-    ) -> Result<(), GroupError> {
-        let mut archive = self.archive.shareable();
-        if let Some(mut recovery) = archive.recovery.take() {
-            recovery.r.zeroize();
-        }
-        for carried in carried {
-            archive.carried(*carried);
-        }
+    /// drawn (another agent's split is another `R`), and the MLS state's
+    /// generation the next, `rejoining` keeping the key package made there.
+    /// A move's (`crate::moving`).
+    pub(crate) fn leave(self, rejoining: bool) -> Result<(), GroupError> {
+        let archive = self.archive.without_recovery();
         let generation = generation(&self.store)?;
         let mut rows = vec![
             (STATE.to_vec(), None),
@@ -1374,30 +1385,11 @@ impl DeviceGroup {
     }
 
     /// A recovered group's archive taken in: its naming secret one of the
-    /// earlier groups' (their scopes keep their ids), its keys merged.
-    ///
-    /// Its carried authors are taken as [`DeviceGroup::merge_read`] takes
-    /// them: vouchings of devices this device knows, each signature
-    /// checked, and no bare author, since devices push their own carried
-    /// authors vouched for and a bare one in the recovery scope is planted.
+    /// earlier groups' (their scopes keep their ids), its keys merged. The
+    /// authors a move carried come from the device set's keys
+    /// (`NewDevice::carried`), never from an archive.
     pub fn inherit(&mut self, recovered: &Archive) -> Result<(), GroupError> {
-        let mut recovered = recovered.shareable();
-        recovered.authors.clear();
-        self.keep_vouched(&mut recovered);
-        self.archive.inherit(&recovered);
-        let writes = self.writes(true)?;
-        self.mls.write(writes)?;
-        Ok(())
-    }
-
-    /// Record `carried` in the archive: a restore elsewhere's, of the old
-    /// agent's device set as it read it there ([`crate::moving::carried`]),
-    /// before it carries the old scopes to its new home
-    /// ([`crate::personal::SealedSync::carry`]).
-    pub fn record_authors(&mut self, carried: &[CarriedAuthor]) -> Result<(), GroupError> {
-        for carried in carried {
-            self.archive.carried(*carried);
-        }
+        self.archive.inherit(&recovered.without_recovery());
         let writes = self.writes(true)?;
         self.mls.write(writes)?;
         Ok(())
@@ -1407,13 +1399,10 @@ impl DeviceGroup {
     /// of the epoch may bring: the keys of the epochs before the confirmed
     /// one (this device exports the confirmed epoch's itself, and no device
     /// holds a later one), and its `R` only when it is the one the log made
-    /// the kit's, by its hash; and the carried authors a device this device
-    /// knows vouched for, each signature checked, read as the set's only
-    /// while the voucher has a voice and then up to its frontier. Bare carried
-    /// authors, earlier groups' naming secrets and scopes are not taken:
-    /// they come from this device's own move or restore and from a pairing
-    /// alone. So no device, removed later, leaves an author or a key
-    /// behind that outlives its removal.
+    /// the kit's, by its hash. Earlier groups' naming secrets and scopes
+    /// are not taken: they come from this device's own restore and from a
+    /// pairing alone. So no device, removed later, leaves a key behind that
+    /// outlives its removal.
     pub fn merge_read(&mut self, read: &Archive) -> Result<(), GroupError> {
         let named = self.state.recovery;
         let confirmed = self.state.confirmed;
@@ -1425,11 +1414,9 @@ impl DeviceGroup {
         {
             taken.recovery = Some(theirs);
         }
-        taken.authors.clear();
         taken.previous.zeroize();
         taken.previous.clear();
         taken.scopes.clear();
-        self.keep_vouched(&mut taken);
         taken.keys.retain_mut(|((epoch, _), keys)| {
             let before = *epoch < confirmed;
             if !before {
@@ -1440,22 +1427,55 @@ impl DeviceGroup {
         self.merge_archive(&taken)
     }
 
-    /// Keep in `archive` only the vouchings of devices this device knows,
-    /// removed ones included (their vouchings read up to their frontier),
-    /// each signature checked over this agent's identity.
-    fn keep_vouched(&self, archive: &mut Archive) {
-        let devices = &self.state.devices;
-        let agent = self.state.agent.identity;
-        archive.vouched.retain(|vouched| {
-            devices
+    /// The devices whose keys name `author` as carried in `scope`, each
+    /// with the number named, and for one removed or out of the group its
+    /// id, whose frontier bounds what is read of it: those the log added
+    /// or the pairing handed over, and this device's own keys before the
+    /// log adds it. A device a void commit dropped names none.
+    pub fn carriers(&self, author: &[u8; 32], scope: &Scope) -> Vec<(u64, Option<DeviceId>)> {
+        let named = |keys: &NewDevice| {
+            keys.carried
                 .iter()
-                .any(|(_, known)| known.keys.sync == vouched.by)
-                && verifies(
-                    &vouched.by,
-                    &vouched.carried.message(&agent),
-                    &vouched.signature,
-                )
-        });
+                .find(|carried| carried.author == *author && carried.scope == *scope)
+                .map(|carried| carried.through)
+        };
+        let me = &self.state.me;
+        let mut carriers: Vec<(u64, Option<DeviceId>)> = self
+            .state
+            .devices
+            .iter()
+            .filter(|(_, known)| known.matured.is_some() || !known.out)
+            .filter_map(|(id, known)| {
+                let removed = known.matured.is_some() || known.out;
+                named(&known.keys).map(|through| (through, removed.then_some(*id)))
+            })
+            .collect();
+        if !self
+            .state
+            .devices
+            .iter()
+            .any(|(_, known)| known.keys.sync == me.sync)
+            && let Some(through) = named(me)
+        {
+            carriers.push((through, None));
+        }
+        carriers
+    }
+
+    /// Every author the device set's keys name as carried, removed
+    /// devices' too, once each.
+    pub fn carried_authors(&self) -> Vec<[u8; 32]> {
+        let mut authors: Vec<[u8; 32]> = self
+            .state
+            .devices
+            .iter()
+            .map(|(_, known)| &known.keys)
+            .chain([&self.state.me])
+            .flat_map(|keys| keys.carried.iter().map(|carried| carried.author))
+            .collect();
+        authors.sort_unstable();
+        authors.dedup();
+        authors
     }
 
     /// The device set's open operations, as this device verified them.

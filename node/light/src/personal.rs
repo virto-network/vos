@@ -50,7 +50,6 @@ use std::collections::btree_map::Entry;
 use blake2::Blake2b;
 use blake2::digest::Digest as _;
 use blake2::digest::consts::U32;
-use ed25519_dalek::Signer as _;
 use merkle_crdt::Ingested;
 use vos_wire::ids::InstanceId;
 use vos_wire::personal::{
@@ -59,7 +58,7 @@ use vos_wire::personal::{
 use vos_wire::{Decode, Encode};
 use zeroize::Zeroizing;
 
-use crate::group::{Alarm, Archive, DeviceGroup, GroupError, Vouched};
+use crate::group::{Alarm, Archive, DeviceGroup, GroupError};
 use crate::kit::{self, KitSecret};
 use crate::light::{Error, Ingest, Light, Queued};
 use crate::route::Route;
@@ -1039,7 +1038,8 @@ impl<'a, L: Link> SealedSync<'a, L> {
             return Ok(Err(Unusable::Body));
         };
         // A device of a group a move left is read as the set's up to the
-        // node a leaving device carried of it here, whoever pushed it.
+        // node the keys of a device of the set name it carried to,
+        // whoever pushed it.
         let carried = self.carried(scan, scope, &header.author.0, header.seq, position)?;
         let within = match self.group.author(&header.author.0) {
             None => carried,
@@ -1106,9 +1106,10 @@ impl<'a, L: Link> SealedSync<'a, L> {
     }
 
     /// Whether the node numbered `seq` by `author` at `scope`'s `position`
-    /// was carried by a move: this device's own carry's, or one a device of
-    /// the set vouched for while it has a voice, and after its removal only
-    /// up to its frontier.
+    /// was carried by a move: one the keys of a device of the set name up
+    /// to a number past it (`NewDevice::carried`, as the log holds them),
+    /// while that device has a voice, and after its removal only at
+    /// positions up to its frontier.
     fn carried(
         &mut self,
         scan: &mut Scan,
@@ -1117,65 +1118,34 @@ impl<'a, L: Link> SealedSync<'a, L> {
         seq: u64,
         position: u64,
     ) -> Result<bool, SyncError<L::Error>> {
-        let archive = self.group.archive();
-        if archive
-            .through(author, &scope)
-            .is_some_and(|through| seq <= through)
-        {
-            return Ok(true);
-        }
-        for (by, through) in archive.vouchers(author, &scope) {
+        for (through, removed) in self.group.carriers(author, &scope) {
             if seq > through {
                 continue;
             }
-            match self.group.author(&by) {
-                Some((_, false)) => return Ok(true),
-                Some((voucher, true)) => {
+            match removed {
+                None => return Ok(true),
+                Some(carrier) => {
                     if self
-                        .last(scan, voucher, scope)?
+                        .last(scan, carrier, scope)?
                         .is_some_and(|last| position <= last)
                     {
                         return Ok(true);
                     }
                 }
-                None => {}
             }
         }
         Ok(false)
     }
 
-    /// The number up to which `author`'s nodes in `scope` were carried, by
-    /// this device's own carry or as a voucher with a voice vouched.
+    /// The number up to which `author`'s nodes in `scope` were carried, as
+    /// the keys of a device of the set with a voice name it.
     fn carried_through(&self, author: &[u8; 32], scope: &Scope) -> Option<u64> {
-        let archive = self.group.archive();
-        let vouched = archive
-            .vouchers(author, scope)
+        self.group
+            .carriers(author, scope)
             .into_iter()
-            .filter(|(by, _)| matches!(self.group.author(by), Some((_, false))))
-            .map(|(_, through)| through);
-        archive
-            .through(author, scope)
-            .into_iter()
-            .chain(vouched)
+            .filter(|(_, removed)| removed.is_none())
+            .map(|(through, _)| through)
             .max()
-    }
-
-    /// `archive` as it travels to the agent: this device's own carried
-    /// authors vouched for under its sync key, none bare, so a reader takes
-    /// each on the word of a device it can bound.
-    fn vouched(&self, mut archive: Archive) -> Archive {
-        let key = self.light.sync_key();
-        let by = key.verifying_key().to_bytes();
-        let agent = self.group.agent().identity;
-        for carried in std::mem::take(&mut archive.authors) {
-            let signature = key.sign(&carried.message(&agent)).to_bytes();
-            archive.vouch(Vouched {
-                carried,
-                by,
-                signature,
-            });
-        }
-        archive
     }
 
     /// Cut a removed device's author off in `instance`'s scope, one past its
@@ -1465,11 +1435,11 @@ impl<'a, L: Link> SealedSync<'a, L> {
         }
         // `R` travels only while this device may let it: never under an
         // epoch a device whose removal is owed is still in.
-        let mine = self.vouched(if self.group.holds_recovery() {
+        let mine = if self.group.holds_recovery() {
             self.group.archive().shareable()
         } else {
             self.group.archive().without_recovery()
-        });
+        };
         let digest = archive_digest(&mine.encode());
         if held.contains(&digest) {
             reading.held = digest;
@@ -1529,7 +1499,7 @@ impl<'a, L: Link> SealedSync<'a, L> {
                 None => reading.held = Some(archive),
             }
         }
-        let mine = self.vouched(self.group.archive().without_recovery());
+        let mine = self.group.archive().without_recovery();
         let lacking = match &reading.held {
             Some(held) if held.naming == mine.naming => mine.beyond(held),
             _ => mine,

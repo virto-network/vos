@@ -10,7 +10,7 @@
 //! pushes (B2).
 
 use ed25519_dalek::SigningKey;
-use vos_light::group::{Alarm, CarriedAuthor, DeviceGroup, Event, Pairing, Restored};
+use vos_light::group::{Alarm, DeviceGroup, Event, Pairing, Restored};
 use vos_light::personal::{Answer, Frontier, Link, SealedSync, Unusable, Waiting};
 use vos_light::route::Route;
 use vos_light::sealed::{self, Body as Sealed, View};
@@ -760,13 +760,15 @@ fn a_later_configuration_lowers_no_delay() {
     );
 }
 
-/// A7 for archives (§3.4, §3.6): a phone of the group plants, in the
-/// archive it pushes, a carried author and candidate keys of later epochs.
-/// The other phones take from an archive read only the keys of the epochs
-/// before their confirmed one, and the author only as the phone's vouching,
-/// bounded by its frontier once its removal matured: after it, an
-/// envelope the planted author wrote under the key of an epoch the phone
-/// was in, placed by the operators past its frontier, is refused.
+/// A7 for archives (§3.4, §3.6): a phone of the group plants candidate
+/// keys of later epochs in the archive it pushes, and seals a node of an
+/// author no device's keys name under the epoch's key. The other phones
+/// take from an archive read only the keys of the epochs before their
+/// confirmed one, and no archive names an author: the node is passed over
+/// while the phone has a voice, and so is one the planted author wrote
+/// under the key of an epoch the phone was in, placed by the operators
+/// after its removal. A restore taking in an archive names no author
+/// either: only the device set's keys carry one.
 #[test]
 fn an_archive_plants_no_author_and_no_later_key() {
     let (mut home, mut phones, _) = super::kit::household_with(3, vec![kit_key(0)]);
@@ -778,11 +780,6 @@ fn an_archive_plants_no_author_and_no_later_key() {
     assert_eq!(scope_of(&stranger, NOTES), scope);
     let planted_key = [0x77; 32];
     let mut planted = phones[2].group().archive().shareable();
-    planted.carried(CarriedAuthor {
-        author: stranger.sync_key(),
-        scope,
-        through: u64::MAX,
-    });
     for later in epoch + 1..epoch + 3 {
         planted.record(later, scope, planted_key);
     }
@@ -792,11 +789,38 @@ fn an_archive_plants_no_author_and_no_later_key() {
         let kept = with(&mut home, phone, &[], |sync| sync.archive()).unwrap();
         assert!(kept.found > 0);
         let archive = phone.group().archive();
-        assert_eq!(archive.through(&stranger.sync_key(), &scope), None);
         assert!(!archive.keys(epoch + 1, &scope).contains(&planted_key));
     }
 
+    // The stranger's node sealed under the epoch's key while the phone
+    // that planted the archive has a voice, read by another.
     let known_key = phones[0].group().key(scope).unwrap();
+    let sealed_node = |phones: &mut [Phone], key: u64| {
+        set(&stranger.light, NOTES, key, key * 10);
+        let node = stranger.light.outbox(NOTES).unwrap().pop().unwrap().bytes;
+        let (index, chain) = phones[0].group().view();
+        let body = Sealed {
+            node,
+            view: View { index, chain },
+            seen: vec![(scope, 0)],
+        }
+        .sealable(&scope)
+        .unwrap();
+        sealed::seal(&known_key, &home::IDENTITY, scope, epoch, &body).unwrap()
+    };
+    let envelope = sealed_node(&mut phones, 98);
+    let caught = shown(
+        &mut home,
+        &mut phones[0],
+        &[NOTES],
+        placed(scope, envelope),
+        |sync| sync.catch_up(NOTES),
+    )
+    .unwrap();
+    assert_eq!(caught.passed.len(), 1);
+    assert_eq!(caught.passed[0].why, Unusable::Author);
+    assert_eq!(count(&phones[0].light, NOTES, 98), None);
+
     let removal = operate(
         &mut home,
         &phones[0].admin.clone(),
@@ -818,17 +842,7 @@ fn an_archive_plants_no_author_and_no_later_key() {
     settle(&mut home, &mut phones[..2]);
     assert_eq!(phones[1].group().confirmed(), epoch + 1);
 
-    set(&stranger.light, NOTES, 99, 990);
-    let node = stranger.light.outbox(NOTES).unwrap().pop().unwrap().bytes;
-    let (index, chain) = phones[0].group().view();
-    let body = Sealed {
-        node,
-        view: View { index, chain },
-        seen: vec![(scope, 0)],
-    }
-    .sealable(&scope)
-    .unwrap();
-    let envelope = sealed::seal(&known_key, &home::IDENTITY, scope, epoch, &body).unwrap();
+    let envelope = sealed_node(&mut phones, 99);
     let caught = shown(
         &mut home,
         &mut phones[1],
@@ -841,32 +855,11 @@ fn an_archive_plants_no_author_and_no_later_key() {
     assert_eq!(caught.passed[0].why, Unusable::Author);
     assert_eq!(count(&phones[1].light, NOTES, 99), None);
 
-    // A restore takes the recovery scope's archive by the same rule: no
-    // bare author (a device pushes its own vouched for), and no vouching
-    // whose signature is not its voucher's.
-    let mut recovered = phones[0].group().archive().shareable();
-    let carried = CarriedAuthor {
-        author: stranger.sync_key(),
-        scope,
-        through: u64::MAX,
-    };
-    recovered.carried(carried);
-    recovered.vouch(vos_light::group::Vouched {
-        carried,
-        by: phones[1].sync_key(),
-        signature: [7; 64],
-    });
+    let recovered = phones[2].group().archive().shareable();
     phones[0].group().inherit(&recovered).unwrap();
-    let forger = phones[1].sync_key();
-    let archive = phones[0].group().archive();
-    assert_eq!(archive.through(&stranger.sync_key(), &scope), None);
-    assert!(
-        archive
-            .vouchers(&stranger.sync_key(), &scope)
-            .iter()
-            .all(|(by, _)| *by != forger),
-        "the forged vouching is not taken"
-    );
+    let group = phones[0].group.as_ref().unwrap();
+    assert!(group.carriers(&stranger.sync_key(), &scope).is_empty());
+    assert!(group.carried_authors().is_empty());
 }
 
 /// B6: the operators forge a device-set operation, a removal with evidence

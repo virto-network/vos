@@ -65,6 +65,7 @@ pub fn device(n: u8) -> NewDevice {
         },
         nullifier: key(3),
         label: vec![n; 24],
+        carried: Vec::new(),
     }
 }
 

@@ -142,6 +142,7 @@ fn device(seed: u64, index: u64) -> NewDevice {
         },
         nullifier,
         label: vec![1; 16],
+        carried: Vec::new(),
     }
 }
 

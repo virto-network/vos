@@ -5,8 +5,8 @@
 //! admin-key replacement, a delayed admin's add and a regroup.
 
 use vos_wire::personal::{
-    AdminClass, Attestation, Body, Cancel, DeviceView, Entry, NewAdmin, OpState, RECOVERY,
-    RecoveryView, Standing, Verdict, Void,
+    AdminClass, Attestation, Body, CARRIED, Cancel, CarriedAuthor, DeviceView, Entry, NewAdmin,
+    OpState, RECOVERY, RecoveryView, Standing, Verdict, Void,
 };
 
 use super::*;
@@ -980,5 +980,36 @@ fn the_released_r2_is_deleted_at_the_restored_devices_first_commit() {
     assert_eq!(
         released.from, pushed.position,
         "the kit reads what follows the re-seal"
+    );
+}
+
+/// A device's keys name at most `CARRIED` carried authors: an add, by
+/// commit or by operation, naming more is malformed.
+#[test]
+fn a_device_naming_too_many_carried_authors_is_refused() {
+    let mut home = seasoned(2);
+    let crowded = NewDevice {
+        carried: (0..=CARRIED as u64)
+            .map(|through| CarriedAuthor {
+                author: [9; 32],
+                scope: scope(1),
+                through,
+            })
+            .collect(),
+        ..device(4)
+    };
+    let effect = Effect {
+        add: Some(crowded.clone()),
+        remove: Vec::new(),
+        rekey: None,
+    };
+    let epoch = home.overview().confirmed + 1;
+    assert_eq!(
+        home.call::<Candidacy>(admin(0), "commit", commit(epoch, effect, vec![4; 600])),
+        Err(PersonalError::Malformed)
+    );
+    assert_eq!(
+        home.operate(admin(0), "add", crowded),
+        Err(PersonalError::Malformed)
     );
 }

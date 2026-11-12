@@ -58,6 +58,7 @@ impl Keys {
             },
             nullifier: [self.sync.to_bytes()[0]; 32],
             label: vec![1; 16],
+            carried: Vec::new(),
         }
     }
 }

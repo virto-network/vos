@@ -559,6 +559,7 @@ impl Personal {
             Some(_) if self.live_devices() >= devices::DEVICES => {
                 return Err(PersonalError::Devices);
             }
+            Some(added) if !added.bounded() => return Err(PersonalError::Malformed),
             Some(added) => {
                 let carries = self.ready_add(added);
                 let committer = self.devices.get(&by).ok_or(PersonalError::UnknownDevice)?;
