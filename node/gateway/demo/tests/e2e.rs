@@ -20,11 +20,11 @@ use std::time::Duration;
 use hmac::{Hmac, Mac as _};
 use russh::keys::{PublicKeyOrCertificate, ssh_key};
 use russh::{ChannelMsg, client};
-use s4_credential::chrome::{Answer, Chrome, Form};
-use s4_credential::enrollment::Store;
-use s4_credential::net::Net;
-use s4_credential::source::{BoxFuture, Kind, Output, Reference, Source, SourceError};
-use s4_credential::{Facility, Gateway, Operation, Session, Stock};
+use vos_facility::chrome::{Answer, Chrome, Form};
+use vos_facility::enrollment::Store;
+use vos_facility::net::Net;
+use vos_facility::source::{BoxFuture, Kind, Output, Reference, Source, SourceError};
+use vos_facility::{Facility, Gateway, Operation, Session, Stock};
 use s4_protocol::{Message, Value};
 use vos_gateway_demo::{LocalSpace, host_key, local, random};
 use vos_light::tor::{Circuit, Dial, Dialing, Stream, Target};
@@ -208,12 +208,12 @@ impl Headless {
             route: s4_protocol::Route::root(),
             limits,
             capabilities: s4_protocol::Capabilities {
-                facilities: vec![ty(s4_credential::FACILITY)],
+                facilities: vec![ty(vos_facility::FACILITY)],
                 ..Default::default()
             },
             grants: s4_protocol::Grants {
                 facilities: vec![s4_protocol::Permission {
-                    ty: ty(s4_credential::FACILITY),
+                    ty: ty(vos_facility::FACILITY),
                     grant: s4_protocol::Grant::Prompt,
                 }],
                 ..Default::default()
@@ -280,7 +280,7 @@ impl Headless {
                         hello
                             .capabilities
                             .facilities
-                            .contains(&ty(s4_credential::FACILITY))
+                            .contains(&ty(vos_facility::FACILITY))
                     );
                     let session = self.facility.session(Gateway {
                         application: hello.application.as_str().to_owned(),

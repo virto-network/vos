@@ -33,11 +33,11 @@ russh = { version = "0.65", default-features = false, features = ["ring", "flate
 toml = "1"
 
 [dev-dependencies]
-# The headless client: s4's protocol, and the `vos.credential` facility
-# proving with this tree's device library.
-s4-protocol = { git = "https://codeberg.org/Virto/s4", rev = "08436340f4b2eac47af6a9e5ecb7687331288a7d" }
-s4-credential = { git = "https://codeberg.org/Virto/s4", rev = "08436340f4b2eac47af6a9e5ecb7687331288a7d" }
-s4-credential-contract = { git = "https://codeberg.org/Virto/s4", rev = "08436340f4b2eac47af6a9e5ecb7687331288a7d" }
+# The headless client: s4's protocol, and this tree's `vos.credential`
+# facility.
+s4-protocol = { git = "https://codeberg.org/Virto/s4", rev = "44089556b23d6bbfa601209a595e6d82a3893c5e" }
+vos-facility = { path = "../../light/android" }
+s4-credential-contract = { git = "https://codeberg.org/Virto/s4", rev = "44089556b23d6bbfa601209a595e6d82a3893c5e" }
 # The carrier audit's search over what the onion carried, and the tests'
 # waits.
 vos-checker = { path = "../../checker" }
@@ -50,16 +50,10 @@ hmac = "0.12"
 sha2 = "0.10"
 zeroize = "1"
 
-# The facility's light node is this tree's.
-[patch."https://codeberg.org/Virto/VOS"]
-vos-light = { path = "../../light" }
-vos-api = { path = "../../api" }
-vos-wire = { path = "../../../agent/wire" }
-vos-pvm-codec = { path = "../../../pvm/codec" }
-
-# As VOS's workspace: fjall's lsm-tree fork.
+# As VOS's workspace: fjall's lsm-tree fork, and fjall's.
 [patch.crates-io]
 lsm-tree = { git = "https://github.com/olanod/lsm-tree", rev = "d0791931a96ff2be9b23af4e0d1ef17a330ed9f2" }
+fjall = { git = "https://github.com/olanod/fjall", rev = "cffa5f7620be864277f7d5706a9f60e58beed219" }
 
 # As VOS's workspace: the prover's crates optimized, since tests prove.
 [profile.dev.package."*"]

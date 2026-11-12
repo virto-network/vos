@@ -2310,8 +2310,7 @@ checksum = "0ce7134b9999ecaf8bcd65542e436736ef32ddca1b3e06094cb6ec5755203b80"
 [[package]]
 name = "fjall"
 version = "3.1.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e98f7212d748b723dcfbd43d5f166958945ad2c05ad4537fb99bcda42ad8a96"
+source = "git+https://github.com/olanod/fjall?rev=cffa5f7620be864277f7d5706a9f60e58beed219#cffa5f7620be864277f7d5706a9f60e58beed219"
 dependencies = [
  "byteorder-lite",
  "byteview",
@@ -2320,6 +2319,7 @@ dependencies = [
  "log",
  "lsm-tree",
  "lz4_flex",
+ "rustix 1.1.6",
  "tempfile",
  "xxhash-rust",
 ]
@@ -5550,31 +5550,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
-name = "s4-credential"
-version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=08436340f4b2eac47af6a9e5ecb7687331288a7d#08436340f4b2eac47af6a9e5ecb7687331288a7d"
-dependencies = [
- "ed25519-dalek 2.2.0",
- "getrandom 0.2.17",
- "hex",
- "libc",
- "s4-credential-contract",
- "s4-protocol",
- "serde",
- "sha2 0.10.9",
- "tokio",
- "toml 0.9.12+spec-1.1.0",
- "vos-api",
- "vos-light",
- "vos-pvm-codec",
- "vos-wire",
- "zeroize",
-]
-
-[[package]]
 name = "s4-credential-contract"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=08436340f4b2eac47af6a9e5ecb7687331288a7d#08436340f4b2eac47af6a9e5ecb7687331288a7d"
+source = "git+https://codeberg.org/Virto/s4?rev=44089556b23d6bbfa601209a595e6d82a3893c5e#44089556b23d6bbfa601209a595e6d82a3893c5e"
 dependencies = [
  "hex",
  "s4-protocol",
@@ -5585,7 +5563,7 @@ dependencies = [
 [[package]]
 name = "s4-protocol"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=08436340f4b2eac47af6a9e5ecb7687331288a7d#08436340f4b2eac47af6a9e5ecb7687331288a7d"
+source = "git+https://codeberg.org/Virto/s4?rev=44089556b23d6bbfa601209a595e6d82a3893c5e#44089556b23d6bbfa601209a595e6d82a3893c5e"
 dependencies = [
  "base64 0.22.1",
  "ciborium",
@@ -5597,7 +5575,7 @@ dependencies = [
 [[package]]
 name = "s4-rui"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=08436340f4b2eac47af6a9e5ecb7687331288a7d#08436340f4b2eac47af6a9e5ecb7687331288a7d"
+source = "git+https://codeberg.org/Virto/s4?rev=44089556b23d6bbfa601209a595e6d82a3893c5e#44089556b23d6bbfa601209a595e6d82a3893c5e"
 dependencies = [
  "base64 0.22.1",
  "libc",
@@ -5615,7 +5593,7 @@ dependencies = [
 [[package]]
 name = "s4-server"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=08436340f4b2eac47af6a9e5ecb7687331288a7d#08436340f4b2eac47af6a9e5ecb7687331288a7d"
+source = "git+https://codeberg.org/Virto/s4?rev=44089556b23d6bbfa601209a595e6d82a3893c5e#44089556b23d6bbfa601209a595e6d82a3893c5e"
 dependencies = [
  "rand 0.10.3",
  "russh",
@@ -5628,7 +5606,7 @@ dependencies = [
 [[package]]
 name = "s4-widgets"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=08436340f4b2eac47af6a9e5ecb7687331288a7d#08436340f4b2eac47af6a9e5ecb7687331288a7d"
+source = "git+https://codeberg.org/Virto/s4?rev=44089556b23d6bbfa601209a595e6d82a3893c5e#44089556b23d6bbfa601209a595e6d82a3893c5e"
 dependencies = [
  "s4-protocol",
  "serde",
@@ -8399,6 +8377,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "vos-facility"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek 2.2.0",
+ "getrandom 0.2.17",
+ "hex",
+ "libc",
+ "s4-credential-contract",
+ "s4-protocol",
+ "serde",
+ "sha2 0.10.9",
+ "tokio",
+ "toml 0.9.12+spec-1.1.0",
+ "vos-api",
+ "vos-light",
+ "vos-pvm-codec",
+ "vos-wire",
+ "zeroize",
+]
+
+[[package]]
 name = "vos-gateway"
 version = "0.1.0"
 dependencies = [
@@ -8444,7 +8443,6 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "russh",
- "s4-credential",
  "s4-credential-contract",
  "s4-protocol",
  "sha2 0.10.9",
@@ -8455,6 +8453,7 @@ dependencies = [
  "tracing-subscriber",
  "vos-api",
  "vos-checker",
+ "vos-facility",
  "vos-gateway",
  "vos-keeper",
  "vos-light",

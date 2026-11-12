@@ -16,9 +16,9 @@ use std::sync::{Arc, Mutex};
 
 use ed25519_dalek::{Signer as _, SigningKey};
 use hmac::{Hmac, Mac as _};
-use s4_credential::chrome::{Answer, Form};
-use s4_credential::node::{Device, Node, Prompts};
-use s4_credential::source::Kind;
+use vos_facility::chrome::{Answer, Form};
+use vos_facility::node::{Device, Node, Prompts};
+use vos_facility::source::Kind;
 use s4_credential_contract::KeyAnswer;
 use s4_credential_contract::personal::{Claim, Home as Code, KitKind};
 use vos_gateway_demo::home::{HOME_CREDENTIALS, HOMES, Home};
@@ -155,7 +155,7 @@ fn phone(dial: &Arc<Onions>) -> (Node, tempfile::TempDir) {
         .unwrap();
     let net = {
         let _entered = runtime.enter();
-        Arc::new(s4_credential::net::Net::new(
+        Arc::new(vos_facility::net::Net::new(
             Arc::clone(dial) as Arc<dyn Dial>,
             directory.path(),
         ))
@@ -165,7 +165,7 @@ fn phone(dial: &Arc<Onions>) -> (Node, tempfile::TempDir) {
         directory.path().to_owned(),
         Arc::new(Phone),
         net,
-        s4_credential::personal::Artifacts::embedded(),
+        vos_facility::personal::Artifacts::embedded(),
     )
     .unwrap();
     // The joiner's open claim at its next background pass, not hours on.
