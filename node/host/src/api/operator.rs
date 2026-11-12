@@ -8,13 +8,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use vos_api::{Kind, Operated};
-use vos_wire::Encode;
 use vos_wire::batch::Admin;
 use vos_wire::ids::AgentId;
 use vos_wire::ingress::{
     Create, Grant, Install, OperatorRefusal, Rejection, Replace, Response, Retire,
 };
-use vos_wire::result::Outcome;
 
 use super::{Api, decode};
 use crate::calls::answer_of;
@@ -145,17 +143,15 @@ pub(super) async fn run(inner: &Arc<Inner>, command: Command) -> Response {
                 )
                 .await,
         ),
-        // The node's own window: its outcome the date kept, applied at no
-        // index of any agent's.
-        Command::Retire(Retire::Format { format, at_ms }) => {
-            match inner.calls.devices.retire_format(format, at_ms) {
-                Some(date) => Response::Ran {
-                    outcome: Outcome::Done(Some(date).encode()),
-                    at: 0,
-                },
-                None => Response::Rejected(Rejection::Malformed),
-            }
-        }
+        Command::Retire(Retire::Format {
+            agent,
+            format,
+            at_ms,
+        }) => answer_of(
+            inner
+                .admin(agent, Admin::RetireFormat { format, at_ms })
+                .await,
+        ),
     }
 }
 

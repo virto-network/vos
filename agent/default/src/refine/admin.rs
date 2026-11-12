@@ -1,5 +1,5 @@
 //! Operator commands: installs, roles, reporting every window, and
-//! retiring a device kernel's previous release.
+//! retiring a device kernel's previous release or a device format.
 
 use alloc::vec::Vec;
 
@@ -10,7 +10,7 @@ use vos_wire::ids::InstanceId;
 use vos_wire::records::{Admitting, Derivation, Installed, MAX_HEADROOM, Previous, RETIREMENT_MS};
 use vos_wire::result::{InputRef, Outcome, Step, Write};
 use vos_wire::schema::Schema;
-use vos_wire::{Decode, Encode, SpaceId, WindowClock, keys};
+use vos_wire::{Decode, Encode, SpaceId, WindowClock, defaults, keys};
 
 use super::base::{Base, Corrupt, Source};
 use super::inputs::consumed;
@@ -132,6 +132,28 @@ pub(crate) fn admin(base: &Base, admin: Admin) -> Step {
                 value: Some(installed.encode()),
             };
             (alloc::vec![write], kept.encode())
+        }
+        Admin::RetireFormat { format, at_ms } => {
+            let Some((_, released)) = defaults::DEVICE_FORMATS
+                .iter()
+                .find(|(number, _)| *number == format)
+            else {
+                return failed(Outcome::failed(Failure::Unknown));
+            };
+            let logged = match base.decoded::<u64>(&keys::format_retired(format)) {
+                Ok(logged) => logged,
+                Err(_) => return failed(Outcome::failed(Failure::Trapped)),
+            };
+            let date = [Some(at_ms), logged, *released]
+                .into_iter()
+                .flatten()
+                .min()
+                .expect("a date");
+            let write = Write {
+                key: keys::format_retired(format),
+                value: Some(date.encode()),
+            };
+            (alloc::vec![write], Some(date).encode())
         }
     };
     let written: usize = writes

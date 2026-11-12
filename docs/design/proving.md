@@ -1346,8 +1346,11 @@ reporting every window (§7).
   checks, about 1,060 columns a row once its single-denominator fractions
   are paired. At its floor of 2^10 rows a device kernel's 43 calls cost
   the chip's floor, not its calls.
-- **The host serves Poseidon2 natively** [built], at 2,400 gas a
-  call. A JAM-deployed agent pays it in software, about 37,600 gas a
+- **The host serves Poseidon2 natively** [built], at 3,000 gas a
+  call: one compression takes 1,925 cycles natively against BLAKE2b's
+  about 410 (×4.7) [measured, x86 dev machine (Intel Core Ultra 7 155H),
+  2026-11-12], about 2,800 at BLAKE2b's gas a cycle, and 3,000 is the
+  round price above it with headroom [decided]. A JAM-deployed agent pays it in software, about 37,600 gas a
   permutation [measured, 2026-10-26], as it does BLAKE2b.
 
 **2. The device profile** [built: `vos_pvm_proof::device`,
@@ -1672,8 +1675,9 @@ verified on the phone and again on x86; the seeded build's proofs equal
 the x86 run's byte for byte. Three sign-ins proved on the phone
 (646–665 ms, ~400 MiB) were run by the node's ingress as the member's
 pseudonym, answering in 61–68 ms [measured, Fairphone 6, 2026-11-08].
-PG1′ (≤ 0.5 s, ≤ 512 MiB) and PG2′ at format 46 (≤ 1.0 s, ≤ 1 GiB,
-≤ 1.5 MiB) pass.
+PG1′ (≤ 0.5 s, ≤ 512 MiB) and PG2′ (≤ 1.0 s, ≤ 1 GiB, ≤ 1.5 MiB) passed
+there at format 46, which the release retires; the gates stand at 47,
+the device format, whose phone runs are the phone sessions' (above).
 A second device, the Pixel 1 (LineageOS, Android 15, four threads), one
 round of five on the same artifacts: `auth` 1,532 ms (the 95th percentile
 1,589 ms), ≤ 441 MiB, 880,128 bytes; `owner` 817 ms (837 ms), ≤ 311 MiB;

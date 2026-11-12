@@ -53,11 +53,14 @@ impl Candidate {
     }
 }
 
-/// The lease: until when it runs, and whether a re-proof renewed it once.
+/// The lease: until when it runs, when the claim took the agent, and
+/// whether a re-proof lifted the quota: one five sixths of a lease after
+/// the claim at least, when the device's yearly prompt first falls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Lease {
     pub until: u64,
     pub reproved: bool,
+    pub claimed: u64,
 }
 
 /// What the agent holds and took today, against its quotas.

@@ -221,6 +221,7 @@ impl Agent {
             expires_ms,
             claim,
             kernel: method(&self.credentials, kernel),
+            format: defaults::DEVICE_FORMATS[0].0,
         }
     }
 
@@ -809,6 +810,7 @@ fn a_kernel_guards_handler_takes_the_claim_first() {
         expires_ms: START + 1_000,
         claim,
         kernel: auth,
+        format: defaults::DEVICE_FORMATS[0].0,
     };
     let program = [0x70; 32];
     let kernel = Principal::Kernel { program };
@@ -938,7 +940,9 @@ fn a_persons_devices_enroll_and_revoke_each_other_by_their_owner_proofs() {
             (member(device), owner(device)).encode(),
         )
     };
-    let confirm = |agent: &mut Agent, device: u32| by(agent, device, "confirm_device", Vec::new());
+    let confirm = |agent: &mut Agent, device: u32| {
+        by(agent, device, "confirm_device", member(device).encode())
+    };
     let revoke = |agent: &mut Agent, caller: u32, device: u32| {
         by(agent, caller, "revoke_device", member(device).encode())
     };
@@ -1154,4 +1158,332 @@ fn a_persons_devices_enroll_and_revoke_each_other_by_their_owner_proofs() {
         after, count,
         "the other person's device in the first's place"
     );
+}
+
+/// A person's limit.
+const LIMIT: u8 = 2;
+const REPLACEMENTS: u8 = credentials::REPLACEMENTS;
+const ENROLLMENTS: u8 = CredentialError::Enrollments as u8;
+
+/// Device churn is held to the person's enrollments of the period
+/// (`identity-and-authority.md` §5): a person of limit 2 enrolls a device,
+/// which votes under a `once` guard with a nullifier of its own, and
+/// revokes it, again and again; its devices of the period, the first among
+/// them, are at most its limit and its replacements, so the guard admits
+/// it at most that many times, and the next enrollment is refused
+/// `Enrollments`. The registrar's reset gives the person a fresh count from
+/// the devices it holds; so does the next period.
+#[test]
+fn a_persons_device_churn_is_held_to_its_enrollments_of_the_period() {
+    let mut agent = Agent::new();
+    let start = START + 10;
+    let owned = |agent: &mut Agent, time: u64, by: u32, name: &str, arguments: Vec<u8>| {
+        let mut call = agent.call(
+            Principal::Owner(owner(by)),
+            CREDENTIALS,
+            name,
+            (),
+            time + 60_000,
+            None,
+        );
+        call.arguments = arguments;
+        agent.step(time, &call)
+    };
+    let enroll = |agent: &mut Agent, time: u64, device: u32| {
+        let arguments = (member(device), owner(device)).encode();
+        owned(agent, time, 1, "enroll_device", arguments)
+    };
+    let revoke = |agent: &mut Agent, time: u64, device: u32| {
+        let step = owned(agent, time, 1, "revoke_device", member(device).encode());
+        assert!(matches!(ran(&step).outcome, Outcome::Done(_)), "{step:?}");
+    };
+    // The device's vote, its nullifier its own.
+    let vote = |agent: &mut Agent, time: u64, device: u32| {
+        let root = agent.root().root;
+        let origin = Principal::Anonymous {
+            scope: agent.scope("vote"),
+            nullifier: [device as u8; 32],
+        };
+        let call = agent.call(origin, POLL, "vote", 4u8, time + 60_000, Some(root));
+        matches!(ran(&agent.step(time, &call)).outcome, Outcome::Done(_))
+    };
+    let first = agent.request(ALICE, CREDENTIALS, "enroll", member(1), start);
+    let register = agent.request(
+        ALICE,
+        CREDENTIALS,
+        "register",
+        (member(1), owner(1), LIMIT),
+        start,
+    );
+    agent.done(start, vec![first, register]);
+    assert!(vote(&mut agent, start, 1));
+
+    // Churn: enroll, vote, revoke, until the person's enrollments run out.
+    let mut admitted = 1;
+    let mut device = 1;
+    let refusal = loop {
+        device += 1;
+        let step = enroll(&mut agent, start, device);
+        if !matches!(ran(&step).outcome, Outcome::Done(_)) {
+            break detail(&step);
+        }
+        assert!(vote(&mut agent, start, device), "a new nullifier");
+        admitted += 1;
+        revoke(&mut agent, start, device);
+        assert!(device < 40, "churn without end: {admitted} admissions");
+    };
+    assert_eq!(refusal, ENROLLMENTS);
+    assert_eq!(admitted, LIMIT + REPLACEMENTS);
+    assert_eq!(
+        agent.query::<_, u32>(POLL, "tally", 4u8),
+        u32::from(admitted)
+    );
+
+    // The registrar's reset: the devices held, the first alone, counted.
+    let reset = agent.request(ALICE, CREDENTIALS, "reset", member(1), start);
+    agent.done(start, vec![reset]);
+    for _ in 1..LIMIT + REPLACEMENTS {
+        device += 1;
+        let step = enroll(&mut agent, start, device);
+        assert!(matches!(ran(&step).outcome, Outcome::Done(_)), "{step:?}");
+        revoke(&mut agent, start, device);
+    }
+    let step = enroll(&mut agent, start, device + 1);
+    assert_eq!(detail(&step), ENROLLMENTS);
+
+    // The next period counts from the devices held then.
+    let next = start + credentials::ENROLLMENT_PERIOD_MS;
+    for _ in 1..LIMIT + REPLACEMENTS {
+        device += 1;
+        let step = enroll(&mut agent, next, device);
+        assert!(matches!(ran(&step).outcome, Outcome::Done(_)), "{step:?}");
+        revoke(&mut agent, next, device);
+    }
+    let step = enroll(&mut agent, next, device + 1);
+    assert_eq!(detail(&step), ENROLLMENTS);
+    // The reset is the registrar's alone.
+    let stranger = agent.request(BOB, CREDENTIALS, "reset", member(1), next);
+    let steps = agent.node.batch(next, vec![stranger]).steps;
+    assert_eq!(failed(&steps[0]), Failure::Forbidden);
+}
+
+/// A person's owner call of `name` at `time`, by device `by`'s owner
+/// digest.
+fn owned(agent: &mut Agent, time: u64, by: u32, name: &str, arguments: Vec<u8>) -> Step {
+    let mut call = agent.call(
+        Principal::Owner(owner(by)),
+        CREDENTIALS,
+        name,
+        (),
+        time + 60_000,
+        None,
+    );
+    call.arguments = arguments;
+    agent.step(time, &call)
+}
+
+/// Whether `step` ran to `Done`.
+fn done(step: &Step) -> bool {
+    matches!(ran(step).outcome, Outcome::Done(_))
+}
+
+/// The registrar expels a person whole (`identity-and-authority.md` §6):
+/// a device revoked alone leaves the person under its limit, so another
+/// of its devices enrolls a replacement at once; `revoke_person` revokes
+/// every device of the person in one write, and after it no owner digest
+/// of the person enrolls and no leaf of it is in the tree. It is the
+/// registrar's alone.
+#[test]
+fn the_registrar_expels_a_person_whole() {
+    let mut agent = Agent::new();
+    let time = START + 10;
+    let enrolled = |agent: &Agent, device: u32| {
+        agent
+            .query::<_, Option<credentials::Path>>(CREDENTIALS, "path", member(device))
+            .is_some()
+    };
+    let first = agent.request(ALICE, CREDENTIALS, "enroll", member(1), time);
+    let register = agent.request(
+        ALICE,
+        CREDENTIALS,
+        "register",
+        (member(1), owner(1), 3u8),
+        time,
+    );
+    agent.done(time, vec![first, register]);
+    for device in [2, 3] {
+        let arguments = (member(device), owner(device)).encode();
+        assert!(done(&owned(
+            &mut agent,
+            time,
+            1,
+            "enroll_device",
+            arguments
+        )));
+        assert!(done(&owned(
+            &mut agent,
+            time,
+            device,
+            "confirm_device",
+            member(device).encode()
+        )));
+    }
+    let count: u64 = agent.query(CREDENTIALS, "count", ());
+
+    // One device revoked: another replaces it at once.
+    let one = agent.request(ALICE, CREDENTIALS, "revoke", member(1), time);
+    agent.done(time, vec![one]);
+    let arguments = (member(4), owner(4)).encode();
+    assert!(done(&owned(
+        &mut agent,
+        time,
+        2,
+        "enroll_device",
+        arguments
+    )));
+    assert!(enrolled(&agent, 4));
+
+    // The person expelled whole, by any device's member digest.
+    let stranger = agent.request(BOB, CREDENTIALS, "revoke_person", member(3), time);
+    let steps = agent.node.batch(time, vec![stranger]).steps;
+    assert_eq!(failed(&steps[0]), Failure::Forbidden);
+    let changed: u64 = agent
+        .query::<_, credentials::Feed>(CREDENTIALS, "feed", 0u64)
+        .length;
+    let expel = agent.request(ALICE, CREDENTIALS, "revoke_person", member(3), time);
+    agent.done(time, vec![expel]);
+    let feed: credentials::Feed = agent.query(CREDENTIALS, "feed", 0u64);
+    assert_eq!(feed.length, changed + 1, "one write");
+    for device in 1..=4 {
+        assert!(!enrolled(&agent, device), "device {device}'s leaf");
+        let arguments = (member(10 + device), owner(10 + device)).encode();
+        let step = owned(&mut agent, time, device, "enroll_device", arguments);
+        assert_eq!(detail(&step), CredentialError::NoPerson as u8);
+    }
+    let after: u64 = agent.query(CREDENTIALS, "count", ());
+    assert_eq!(after, count - 3);
+    let again = agent.request(ALICE, CREDENTIALS, "revoke_person", member(3), time);
+    let steps = agent.node.batch(time, vec![again]).steps;
+    assert_eq!(detail(&steps[0]), CredentialError::NoPerson as u8);
+}
+
+/// An owner digest another person named awaits its confirmation for a
+/// day at most (`identity-and-authority.md` §6): within it, the digest's
+/// own person's enrollment is refused `Held`; past it, that enrollment
+/// takes the digest, its confirmation joins it to its own person, and the
+/// naming person's revocation of its device leaves it there. A device
+/// confirms beside its own member digest, so an enrollment that took its
+/// late digest for another member joins it to no person.
+#[test]
+fn an_owner_digest_another_person_named_is_held_a_day_at_most() {
+    let mut agent = Agent::new();
+    let time = START + 10;
+    for (device, limit) in [(1, 2u8), (40, 2u8)] {
+        let enroll = agent.request(ALICE, CREDENTIALS, "enroll", member(device), time);
+        let register = agent.request(
+            ALICE,
+            CREDENTIALS,
+            "register",
+            (member(device), owner(device), limit),
+            time,
+        );
+        agent.done(time, vec![enroll, register]);
+    }
+    // Person 1 names person 40's new device's owner digest, read from a
+    // ledger's log, for a device of its own.
+    let squat = (member(30), owner(31)).encode();
+    assert!(done(&owned(&mut agent, time, 1, "enroll_device", squat)));
+    let own = (member(31), owner(31)).encode();
+    let within = owned(&mut agent, time + 1_000, 40, "enroll_device", own.clone());
+    assert_eq!(detail(&within), CredentialError::Held as u8);
+    let later = time + credentials::CONFIRM_MS + 1;
+    assert!(done(&owned(&mut agent, later, 40, "enroll_device", own)));
+    assert!(done(&owned(
+        &mut agent,
+        later,
+        31,
+        "confirm_device",
+        member(31).encode()
+    )));
+    assert!(done(&owned(
+        &mut agent,
+        later,
+        1,
+        "revoke_device",
+        member(30).encode()
+    )));
+    // The digest acts for person 40: it revokes person 40's first device.
+    assert!(done(&owned(
+        &mut agent,
+        later,
+        31,
+        "revoke_device",
+        member(40).encode()
+    )));
+    let refused = owned(&mut agent, later, 31, "revoke_device", member(1).encode());
+    assert_eq!(detail(&refused), CredentialError::NotYours as u8);
+
+    // The reverse: person 31's enrollment of a device not yet confirmed
+    // past its day, its digest then named by person 1 for a device of its
+    // own; the device's late confirmation names its own member digest,
+    // which person 1 does not hold, so it joins no person.
+    let mine = (member(50), owner(51)).encode();
+    assert!(done(&owned(&mut agent, later, 31, "enroll_device", mine)));
+    let after = later + credentials::CONFIRM_MS + 1;
+    let theirs = (member(52), owner(51)).encode();
+    assert!(done(&owned(&mut agent, after, 1, "enroll_device", theirs)));
+    let confirm = owned(&mut agent, after, 51, "confirm_device", member(50).encode());
+    assert_eq!(detail(&confirm), CredentialError::NoPerson as u8);
+    let acting = owned(&mut agent, after, 51, "revoke_device", member(52).encode());
+    assert_eq!(detail(&acting), CredentialError::NoPerson as u8);
+}
+
+/// Apply holds every proven call to the release's device formats and the
+/// agent's log, whatever the node that verified it admits: a 46 proof, or
+/// one of a format the release never had, is refused `Format`, writing
+/// nothing; the operator retires 47 through the log, its outcome the date
+/// kept, and from that batch time a 47 proof is refused too. Retiring a
+/// format the release does not admit fails `Unknown`.
+#[test]
+fn apply_refuses_a_device_format_the_release_or_the_log_retired() {
+    let mut agent = Agent::new();
+    let time = START + 10;
+    let root = agent.root().root;
+    let login = |agent: &mut Agent, format: u32, nullifier: u8| {
+        let origin = agent.anonymous("login", nullifier);
+        let mut call = agent.call(origin, POLL, "login", (), time + 60_000, Some(root));
+        call.format = format;
+        call
+    };
+    for format in [46, 44] {
+        let call = login(&mut agent, format, 1);
+        let step = agent.step(time, &call);
+        assert_eq!(refused(&step), Refusal::Format, "format {format}");
+        assert!(!agent.node.state.contains_key(&keys::binding(&call.binding)));
+    }
+    let call = login(&mut agent, 47, 2);
+    assert!(done(&agent.step(time, &call)));
+
+    let retire = |agent: &mut Agent, format: u32, at_ms: u64| {
+        let input = Input::Admin(Admin::RetireFormat { format, at_ms });
+        agent.node.batch(time, vec![input]).steps.remove(0)
+    };
+    assert_eq!(failed(&retire(&mut agent, 44, time)), Failure::Unknown);
+    let kept = retire(&mut agent, 47, time + 5);
+    assert!(matches!(
+        &ran(&kept).outcome,
+        Outcome::Done(bytes) if Option::<u64>::decode_exact(bytes) == Some(Some(time + 5))
+    ));
+    let later = retire(&mut agent, 47, time + 50);
+    assert!(
+        matches!(
+            &ran(&later).outcome,
+            Outcome::Done(bytes) if Option::<u64>::decode_exact(bytes) == Some(Some(time + 5))
+        ),
+        "a date never moves later"
+    );
+    let call = login(&mut agent, 47, 3);
+    assert!(done(&agent.step(time + 4, &call)));
+    let call = login(&mut agent, 47, 4);
+    assert_eq!(refused(&agent.step(time + 5, &call)), Refusal::Format);
 }

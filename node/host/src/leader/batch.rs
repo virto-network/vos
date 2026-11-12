@@ -418,9 +418,13 @@ impl Leader {
             .map(|mark| mark.unwrap_or(0))
     }
 
-    /// A batch's time: the node's clock, held at the agent's time, `floor`,
-    /// while the clock trails it. Leadership stays: every replica would
-    /// trail an agent a fast clock once led.
+    /// A batch's time: the node's clock, or while it trails the agent's
+    /// time, `floor`, a millisecond past it. Leadership stays: every
+    /// replica would trail an agent a fast clock once led. A trailing
+    /// leader's batches each take a time of their own, so the credential
+    /// actor's ring, which replaces a root written at its own time
+    /// (`Ring::record`), keeps the roots devices read at earlier batches
+    /// until the clock catches up.
     pub(super) fn time(&mut self, floor: u64) -> u64 {
         let clock = (self.inner.clock)();
         let trailing = floor > clock.saturating_add(CLOCK_BOUND);
@@ -437,7 +441,11 @@ impl Leader {
             );
         }
         self.trailing = trailing;
-        clock.max(floor)
+        if clock < floor {
+            floor.saturating_add(1)
+        } else {
+            clock
+        }
     }
 
     /// A batch the node failed: put it back whole and wait before the next

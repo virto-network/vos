@@ -130,10 +130,9 @@ fn the_request_and_its_refusals_encode_as_pinned() {
     );
 }
 
-/// The log's input at `Input`'s index 10, its claim and its kernel beside
-/// the origin,
-/// without the proof, the nonce or the format; its step's reference at
-/// `InputRef`'s index 9.
+/// The log's input at `Input`'s index 10, its claim, its kernel and its
+/// device format beside the origin, without the proof or the nonce; its
+/// step's reference at `InputRef`'s index 9.
 #[test]
 fn the_logged_input_carries_the_origin_and_the_claim() {
     let input = CredentialedInput {
@@ -145,6 +144,7 @@ fn the_logged_input_carries_the_origin_and_the_claim() {
         expires_ms: 6,
         claim: vec![7; 3],
         kernel: MethodId(8),
+        format: 47,
     };
     let fields = [
         &Principal::Owner([1; 32]).encode()[..],
@@ -157,6 +157,7 @@ fn the_logged_input_carries_the_origin_and_the_claim() {
         &3u32.to_le_bytes(),
         &[7; 3],
         &8u32.to_le_bytes(),
+        &47u32.to_le_bytes(),
     ]
     .concat();
     assert_eq!(

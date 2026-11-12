@@ -91,9 +91,9 @@ pub struct ProgramWindow {
 }
 
 /// An operator's retirement (`light-node.md` §4.4, `Kind::Retire`): a
-/// device kernel's previous release in an instance, which the agent's log
-/// records, or a device format at the node that takes it, at `at_ms` if
-/// that is earlier than its date, now included.
+/// device kernel's previous release in an instance, or a device format,
+/// each in an agent, whose log records it, at `at_ms` if that is earlier
+/// than its date, now included.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Retire {
     #[codec(index = 0)]
@@ -104,7 +104,11 @@ pub enum Retire {
         at_ms: u64,
     },
     #[codec(index = 1)]
-    Format { format: u32, at_ms: u64 },
+    Format {
+        agent: AgentId,
+        format: u32,
+        at_ms: u64,
+    },
 }
 
 /// `POST /agents/{agent}/calls`: a command, in its session's sequence for
@@ -344,9 +348,8 @@ pub enum CredentialRefusal {
     Once,
     /// An auth root the credential actor's ring does not hold, on this
     /// replica: retryable, by reading the tree's feed again or asking another
-    /// replica. An honest member meets it when this replica lags, when a
-    /// later write at the same batch time replaced its root, or when 64
-    /// later roots pushed it out.
+    /// replica. An honest member meets it when this replica lags, or when
+    /// 64 later roots pushed it out.
     #[codec(index = 10)]
     RootUnknown,
     /// An auth root superseded more than

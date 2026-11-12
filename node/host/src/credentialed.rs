@@ -27,10 +27,14 @@
 //! replaced (`Installed::window`), and the binding names which; ingress
 //! admits the device formats this node verifies, the current and the
 //! previous, each until its retirement ([`DEVICE_FORMATS`] or the node's
-//! configured ones, with the operator's earlier date if it set one), and
-//! verifies a proof against each release's program in the proof's format.
-//! A proof of a retired release names a program no guard admits
-//! (`Binding`); one of a retired format is refused at once (`Format`).
+//! configured ones, with an earlier date if the configuration or the
+//! agent's log sets one), and verifies a proof against each release's
+//! program in the proof's format. A proof of a retired release names a
+//! program no guard admits (`Binding`); one of a retired format is refused
+//! at once (`Format`). The call carries its format to apply, which refuses
+//! one the release or the agent's log retired on every replica: a node's
+//! configuration narrows what its ingress admits, never what the space
+//! runs.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -59,15 +63,15 @@ use crate::store::Snapshot;
 
 /// The device formats a node admits by default, newest first, each with the
 /// retirement its release set, if any: at most the current and the
-/// previous (`light-node.md` §4.4). A release that brings a new format
-/// sets the previous one's to 60 days on; the operator may set any earlier
-/// date (`Node::retire_format`). Format 47's release retires
-/// 46 at once: its byte ledger lets a read see a stale byte (`open.md`).
-pub const DEVICE_FORMATS: [(u32, Option<u64>); 2] = [
-    (device::FORMAT.number, None),
-    (device::FORMATS[1].number, Some(0)),
-];
-const _: () = assert!(device::FORMATS[1].number == 46);
+/// previous (`light-node.md` §4.4), the release's, which apply holds every
+/// replica to ([`defaults::DEVICE_FORMATS`]). A release that brings a new
+/// format sets the previous one's to 60 days on; the operator may set any
+/// earlier date in an agent's log (`Node::retire_format`). Format 47's
+/// release retires 46 at once: its byte ledger lets a read see a stale
+/// byte (`open.md`).
+pub const DEVICE_FORMATS: [(u32, Option<u64>); 2] = defaults::DEVICE_FORMATS;
+const _: () = assert!(DEVICE_FORMATS[0].0 == device::FORMAT.number);
+const _: () = assert!(DEVICE_FORMATS[1].0 == device::FORMATS[1].number);
 
 /// A device program's place, by its release and format: computed once however many
 /// requests wait on it; `None` for a release whose program cannot be
@@ -78,7 +82,7 @@ type Place = Arc<smol::lock::OnceCell<Option<Arc<Verifier>>>>;
 
 /// The device programs this node holds, their verifiers alone, by release
 /// and format; the device formats it admits, each with its release's
-/// retirement; and the retirements its operator set.
+/// retirement; and the retirements its configuration set.
 pub(crate) struct DevicePrograms {
     programs: Mutex<HashMap<(DeviceRelease, u32), Place>>,
     formats: Vec<(u32, Option<u64>)>,
@@ -146,9 +150,14 @@ impl DevicePrograms {
         Some(date)
     }
 
-    /// The device formats admitted at `now`, newest first, each with its
+    /// The device formats admitted at `now` in an agent whose log retires
+    /// each at `logged`'s date, if any, newest first, each with its
     /// retirement, if one is set.
-    pub(crate) fn formats(&self, now: u64) -> Vec<FormatWindow> {
+    pub(crate) fn formats(
+        &self,
+        now: u64,
+        logged: impl Fn(u32) -> Option<u64>,
+    ) -> Vec<FormatWindow> {
         let retired = lock(&self.retired);
         self.formats
             .iter()
@@ -160,6 +169,7 @@ impl DevicePrograms {
                     .copied()
                     .into_iter()
                     .chain(released)
+                    .chain(logged(format))
                     .min(),
             })
             .filter(|window| window.retires_ms.is_none_or(|date| date > now))
@@ -384,8 +394,12 @@ impl Inner {
         instance: InstanceId,
     ) -> Option<DeviceWindow> {
         let now = (self.clock)();
-        let installed = installed(&self.store.snapshot(), agent, instance).ok()??;
-        let formats = self.calls.devices.formats(now);
+        let snapshot = self.store.snapshot();
+        let installed = installed(&snapshot, agent, instance).ok()??;
+        let formats = self
+            .calls
+            .devices
+            .formats(now, |format| logged(&snapshot, agent, format));
         let mut kernels = Vec::new();
         for method in &installed.schema.methods {
             if method.kind != Kind::Device {
@@ -435,10 +449,11 @@ impl Inner {
             .filter(|space| *space != SpaceId::NONE)
             .ok_or(CredentialRefusal::NoSpace)?;
         let now = (self.clock)();
+        let logged = read::<u64>(snapshot, agent, &keys::format_retired(call.format))?;
         if !self
             .calls
             .devices
-            .formats(now)
+            .formats(now, |format| logged.filter(|_| format == call.format))
             .iter()
             .any(|window| window.format == call.format)
         {
@@ -597,9 +612,18 @@ impl Inner {
                 expires_ms: call.expires_ms,
                 claim: call.claim,
                 kernel,
+                format: call.format,
             },
         })
     }
+}
+
+/// Device format `format`'s retirement in `agent`'s log, as `snapshot`
+/// holds it; none for a row that does not read, which apply refuses.
+fn logged(snapshot: &Snapshot, agent: AgentId, format: u32) -> Option<u64> {
+    read::<u64>(snapshot, agent, &keys::format_retired(format))
+        .ok()
+        .flatten()
 }
 
 /// Whether a device program's computation failed for its kernel's bytes,

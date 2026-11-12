@@ -28,11 +28,12 @@
 //!   ingress verifies device proofs against the program it computes from
 //!   the installed kernel (`vos-pvm-recair`'s `device`), its CPU the
 //!   program's columns ([`Cpu::PerProgram`]) and its memory ledger a row a
-//!   word ([`Memory::Word`]). 46, the full CPU and the byte ledger, stays
-//!   registered and verifiable while its code lives, and a node admits it
-//!   only where its operator configures it: its byte ledger does not keep a
-//!   byte one group (`chips::DeviceMemoryChip`), so its memory argument is
-//!   unsound, and 47 retires it. 32
+//!   word ([`Memory::Word`]). 46, the full CPU and the byte ledger, is
+//!   retired ([`Status::Retired`], refused by [`admitted`]): its byte
+//!   ledger does not keep a byte one group (`chips::DeviceMemoryChip`), so
+//!   its memory argument is unsound. Its code stays while its gates live,
+//!   and a node's window takes it only where a test configures it, which
+//!   apply refuses all the same (`vos_wire::defaults::DEVICE_FORMATS`). 32
 //!   is registered and refused
 //!   although its AIR and channel exist: `vos-pvm-recair` proves and verifies
 //!   its proofs natively, pinning each circuit by its hash, and no verifier
@@ -160,6 +161,9 @@ pub enum ProofBytes {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     Admitted,
+    /// Registered and once admitted, refused now: a device format found
+    /// unsound, which a node's window and apply refuse too.
+    Retired,
     /// Registered, with its parameters and counts, and refused until its AIR
     /// and channel exist.
     Reserved,
@@ -491,8 +495,8 @@ pub const DEVICE_PROOF: Format = Format {
 };
 
 /// Device proofs under the full CPU and the byte ledger, masked: the
-/// previous device format, whose byte ledger does not keep a byte one
-/// group; see the module's notes.
+/// previous device format, retired, whose byte ledger does not keep a byte
+/// one group; see the module's notes.
 pub const BYTE_DEVICE_PROOF: Format = Format {
     number: 46,
     kind: ProofKind::Device,
@@ -504,7 +508,7 @@ pub const BYTE_DEVICE_PROOF: Format = Format {
     cpu: Cpu::Full,
     memory: Memory::Byte,
     floor: INNER_FLOOR,
-    status: Status::Admitted,
+    status: Status::Retired,
     reference: BYTE_DEVICE_REFERENCE,
     bits: SecurityBits {
         conjectured: 110,
@@ -531,6 +535,10 @@ pub fn lookup(number: u32) -> Option<&'static Format> {
 pub fn admitted(number: u32) -> Result<&'static Format, alloc::string::String> {
     match lookup(number) {
         Some(format) if format.status == Status::Admitted => Ok(format),
+        Some(format) if format.status == Status::Retired => Err(alloc::format!(
+            "proof format {number} ({:?}) is retired",
+            format.kind
+        )),
         Some(format) => Err(alloc::format!(
             "proof format {number} ({:?}) is registered but not admitted",
             format.kind

@@ -701,3 +701,41 @@ fn the_stock_kernels_programs_come_from_their_release_artifacts() {
         assert!(DeviceProgram::released(&renamed).is_err(), "another id");
     }
 }
+
+/// What a stock kernel's program is under format 47: its chips, its log
+/// sizes and its id, as a release computes them from the credential
+/// actor's ELF and s4 ships them (`credential/release`). Every app proves
+/// under this id, so a prover change that moves it (a CPU column, a chip's
+/// index, a trace's rows on the reference run, a preprocessed column) is a
+/// new device format, never the same number: this gate fails first. A
+/// change of the credential actor's kernels moves it too, re-pinned with
+/// `blobs.lock` in the same commit, and s4's artifacts with it.
+#[test]
+fn the_stock_kernels_programs_are_pinned() {
+    const AUTH: (u32, [u32; 18], [u8; 32]) = (
+        1_022_619_925,
+        [
+            11, 10, 11, 10, 10, 12, 10, 10, 11, 10, 11, 10, 10, 10, 10, 10, 10, 10,
+        ],
+        [
+            9, 248, 65, 144, 64, 137, 80, 189, 172, 188, 63, 117, 252, 191, 42, 143, 95, 137, 28,
+            38, 139, 191, 225, 100, 163, 66, 121, 170, 24, 203, 58, 243,
+        ],
+    );
+    const OWNER: (u32, [u32; 18], [u8; 32]) = (
+        1_022_619_925,
+        [10; 18],
+        [
+            90, 162, 111, 236, 194, 116, 207, 245, 83, 68, 151, 156, 251, 205, 55, 109, 175, 213,
+            118, 24, 78, 207, 153, 118, 207, 183, 169, 253, 12, 240, 255, 154,
+        ],
+    );
+    let elf = std::fs::read(vos_testkit::programs::credentials_elf()).unwrap();
+    let pinned = [AUTH, OWNER].map(|(chips, log_sizes, id)| (chips, log_sizes.to_vec(), id));
+    let computed = ["auth", "owner"].map(|kernel| {
+        let device = vos_light::release::device(&elf, kernel).unwrap();
+        assert_eq!(device.format, DEVICE_FORMAT);
+        (device.chips, device.log_sizes, device.id)
+    });
+    assert_eq!(computed, pinned);
+}

@@ -174,12 +174,14 @@ pub struct Config {
     /// alone (46's byte ledger is not consistent, `open.md`). At most two,
     /// each one this binary verifies (`vos_pvm_recair::device::FORMATS`),
     /// else the node does not open. Admitting the previous format past its
-    /// release's date is a test's: the window's mechanism.
+    /// release's date is a test's: the window's mechanism. It narrows what
+    /// this node's ingress admits; apply refuses a format the release
+    /// retired whatever any node admits.
     pub device_formats: Vec<(u32, Option<u64>)>,
-    /// The device formats the operator retired, each at its time in ms,
-    /// where that is earlier than its release's (`light-node.md` §4.4): a
-    /// proof of one is refused from that time. The operator's `Retire`
-    /// sets one live, until the node restarts.
+    /// The device formats this node's ingress refuses, each from its time
+    /// in ms, where that is earlier than its release's (`light-node.md`
+    /// §4.4). The operator's `Retire` of a format retires it in an agent's
+    /// log instead, for every replica.
     pub retired_formats: Vec<(u32, u64)>,
     /// What every agent of the node's space asks of the gateway's mark
     /// (`light-node.md` §6.5): its proven calls, or every request read of

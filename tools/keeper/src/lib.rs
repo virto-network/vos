@@ -11,6 +11,9 @@
 //!   election.
 //! - **Stock:** the agents handed to `Homes` with `stock`, a page at a time;
 //!   **top up** makes and stocks until the pool holds as many as asked.
+//!   An agent created whose install or grant then failed is unfinished:
+//!   never stocked, named in the error (`KeeperError::Unfinished`), and
+//!   **finish** installs and grants it again, then stocks it.
 //! - **Upgrade:** `Personal` installed anew over every agent of the pool,
 //!   a batch at a time, stopping after the batch holding a refusal:
 //!   its layout is append-only, so an install that refuses is the
@@ -55,6 +58,12 @@ pub enum KeeperError {
     Homes(HomesError),
     /// An upgrade a pool agent refused: the upgrade stopped at its batch.
     Refused { agent: AgentId, answer: String },
+    /// Agents created whose install or grant failed, by `cause` (the
+    /// first): live on their replicas, stocked by none, until `finish`.
+    Unfinished {
+        agents: Vec<AgentId>,
+        cause: Box<KeeperError>,
+    },
 }
 
 impl std::fmt::Display for KeeperError {
@@ -64,6 +73,10 @@ impl std::fmt::Display for KeeperError {
             KeeperError::Homes(error) => write!(f, "Homes refused: {error:?}"),
             KeeperError::Refused { agent, answer } => {
                 write!(f, "agent {} refused the upgrade: {answer}", agent.0)
+            }
+            KeeperError::Unfinished { agents, cause } => {
+                let ids: Vec<String> = agents.iter().map(|agent| agent.0.to_string()).collect();
+                write!(f, "agents {} unfinished: {cause}", ids.join(","))
             }
         }
     }
@@ -104,7 +117,9 @@ impl Keeper {
 
     /// `count` agents made with `Personal` from `elf`, `at_once` at a time:
     /// their ids, lowest first, and the first failure, which stops the
-    /// rest. The agents made before it are whole, to stock.
+    /// rest. The agents made before it are whole, to stock; those it
+    /// created but did not finish are the failure's
+    /// (`KeeperError::Unfinished`).
     pub fn make(
         &self,
         count: usize,
@@ -113,13 +128,16 @@ impl Keeper {
     ) -> (Vec<AgentId>, Result<(), KeeperError>) {
         let next = AtomicUsize::new(0);
         let made = Mutex::new(Vec::with_capacity(count));
+        let unfinished = Mutex::new(Vec::new());
         let failed = std::thread::scope(|scope| {
             let workers: Vec<_> = (0..at_once.clamp(1, count.max(1)))
                 .map(|_| {
                     scope.spawn(|| -> Result<(), KeeperError> {
                         while next.fetch_add(1, Ordering::Relaxed) < count {
-                            let agent = self.make_one(elf).inspect_err(|_| {
+                            let agent = self.make_one(elf).map_err(|(created, error)| {
                                 next.store(count, Ordering::Relaxed);
+                                unfinished.lock().unwrap().extend(created);
+                                error
                             })?;
                             made.lock().unwrap().push(agent);
                         }
@@ -134,15 +152,47 @@ impl Keeper {
         });
         let mut made = made.into_inner().unwrap();
         made.sort();
+        let mut unfinished = unfinished.into_inner().unwrap();
+        unfinished.sort();
+        let failed = failed.map_err(|cause| {
+            if unfinished.is_empty() {
+                cause
+            } else {
+                KeeperError::Unfinished {
+                    agents: unfinished,
+                    cause: Box::new(cause),
+                }
+            }
+        });
         (made, failed)
     }
 
-    fn make_one(&self, elf: &[u8]) -> Result<AgentId, KeeperError> {
+    /// An agent created, then finished: on a failure, the agent if it was
+    /// created.
+    fn make_one(&self, elf: &[u8]) -> Result<AgentId, (Option<AgentId>, KeeperError)> {
         let creator = self.operator(self.replicas[0]);
         let agent = match creator.create_agent(self.replicas.clone()) {
             Ok(Response::Created(agent) | Response::Unconfirmed(agent)) => agent,
-            other => return Err(answer("create", other)),
+            other => return Err((None, answer("create", other))),
         };
+        self.finish_one(agent, elf)
+            .map_err(|error| (Some(agent), error))?;
+        Ok(agent)
+    }
+
+    /// `agents`, unfinished, given `Personal` from `elf` and the home's
+    /// grant again, then stocked: the pooled count after. Both steps are
+    /// idempotent, so an agent finished already is only stocked.
+    pub fn finish(&self, agents: &[AgentId], elf: &[u8]) -> Result<u32, KeeperError> {
+        for agent in agents {
+            self.finish_one(*agent, elf)?;
+        }
+        self.stock(agents)
+    }
+
+    /// `Personal` installed in `agent`, and its role `homes` granted to the
+    /// home's agent.
+    fn finish_one(&self, agent: AgentId, elf: &[u8]) -> Result<(), KeeperError> {
         let install = Install {
             instance: self.home.personal,
             elf: elf.to_vec(),
@@ -154,8 +204,7 @@ impl Keeper {
         let home = Principal::Agent(self.home.agent);
         self.at_leader(agent, "grant", |operator| {
             operator.grant(agent, home, Some(HOMES_ROLE))
-        })?;
-        Ok(agent)
+        })
     }
 
     /// `command` sent to `agent`'s replicas in turn until its leader runs
@@ -212,8 +261,9 @@ impl Keeper {
         while pooled < to {
             let count = batch.max(1).min((to - pooled) as usize);
             let (made, failed) = self.make(count, elf, batch);
-            pooled = self.stock(&made)?;
+            let stocked = self.stock(&made);
             failed?;
+            pooled = stocked?;
         }
         Ok(pooled)
     }

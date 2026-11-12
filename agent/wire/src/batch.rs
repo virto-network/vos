@@ -242,6 +242,9 @@ pub struct CredentialedInput {
     /// stock guard, of `instance` for a kernel guard, whose apply runs the
     /// handler only while its guard still names it.
     pub kernel: MethodId,
+    /// The device format the proof is in, which ingress verified it under:
+    /// apply refuses one the release or the agent's log retired.
+    pub format: u32,
 }
 
 /// A client request, in its session's sequence for this agent.
@@ -421,4 +424,11 @@ pub enum Admin {
         method: MethodId,
         at_ms: u64,
     },
+    /// Retire device format `format` in the agent at `at_ms` by its batch
+    /// time, if that is earlier than its date (`light-node.md` §4.4): from
+    /// then apply refuses a proof of it on every replica, and each
+    /// replica's ingress refuses it at once. A format the release does not
+    /// admit fails `Unknown`; its outcome is the date kept, encoded.
+    #[codec(index = 4)]
+    RetireFormat { format: u32, at_ms: u64 },
 }

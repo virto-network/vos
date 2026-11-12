@@ -424,3 +424,27 @@ fn only_a_halting_segment_ends_at_the_halt_address() {
     let side_notes: Vec<&SideNote> = segments.iter().collect();
     verify_chain(&proofs, &side_notes).expect("the chain verifies");
 }
+
+/// A kernel whose halt names an output past any memory (φ8 = 2^50) is
+/// refused `Output` before anything is allocated for it: a bad kernel at an
+/// install fails its program, never the node.
+#[test]
+fn an_output_past_memory_is_refused_before_it_is_allocated() {
+    let mut huge = vec![20, 8];
+    huge.extend_from_slice(&(1u64 << 50).to_le_bytes());
+    let load_imm = |register: u8, value: u32| [&[51, register][..], &value.to_le_bytes()].concat();
+    for (address, length) in [(RW as u32, huge), (u32::MAX - 4, load_imm(8, 16))] {
+        let blob = build_standard_program(&StandardProgram {
+            ro_data: vec![1; PAGE as usize],
+            rw_data: vec![],
+            heap_pages: 5,
+            stack_size: PAGE as u32,
+            code: crate::common::code_of(&[load_imm(7, address), length, vec![50, 0]]),
+        })
+        .unwrap();
+        assert!(matches!(
+            trace_kernel(&blob, &[], GAS),
+            Err(KernelTraceError::Output)
+        ));
+    }
+}

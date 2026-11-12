@@ -223,9 +223,14 @@ fn trace(
         });
     }
     let registers = tracer.pvm.registers;
-    let mut output =
-        alloc::vec![0u8; usize::try_from(registers[8]).map_err(|_| KernelTraceError::Output)?];
+    let length = usize::try_from(registers[8]).map_err(|_| KernelTraceError::Output)?;
     let address = u32::try_from(registers[7]).map_err(|_| KernelTraceError::Output)?;
+    // Checked before anything is allocated for it: a halt may name any
+    // length.
+    if !tracer.pvm.memory().is_readable(address, length) {
+        return Err(KernelTraceError::Output);
+    }
+    let mut output = alloc::vec![0u8; length];
     if !tracer.pvm.memory().read_bytes_checked(address, &mut output) {
         return Err(KernelTraceError::Output);
     }

@@ -284,17 +284,23 @@ impl Personal {
         Ok(())
     }
 
-    /// A re-proof: the lease runs from now, and the larger quota holds.
+    /// A re-proof: the lease runs from now, and once five sixths of a lease
+    /// passed since the claim, where the yearly prompt first falls, the
+    /// larger quota holds; an earlier one lifts nothing.
     #[msg(role = "homes")]
     pub async fn renew(&mut self, ctx: &mut Command<Self>) -> Result<Recorded, PersonalError> {
         let now = ctx.now();
         self.assigned()?;
-        let until = now.saturating_add(self.policy().lease_ms);
+        let lease_ms = self.policy().lease_ms;
+        let lease = self.lease.get(&ONE).expect("an assigned agent's lease");
+        let until = now.saturating_add(lease_ms);
+        let ramp = lease_ms - lease_ms / 6;
         self.lease.insert(
             &ONE,
             &Lease {
                 until,
-                reproved: true,
+                reproved: lease.reproved || now >= lease.claimed.saturating_add(ramp),
+                ..lease
             },
         );
         let index = self.append(now, Body::Renewed { until });
