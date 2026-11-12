@@ -1,0 +1,1429 @@
+//! The facility, one connection's use of it, and each enrollment's
+//! credential tree, kept for the process apart from every connection that
+//! proves.
+
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
+
+use vos_light::release::Device;
+use vos_light::route::{Clearnet, Purpose};
+use vos_light::tor::Registrar;
+use vos_light::wire;
+use vos_light::{
+    AuthWitness, Call, DeviceError, DeviceProgram, DeviceSecret, Digest, PEAK_BYTES, Prover,
+    ProverConfig, TreeKeeper,
+};
+
+use crate::chrome::{Answer, Chrome, Field, Form, short};
+use crate::enrollment::{Enrollment, Guard, Method, Origin, Store, write_private};
+use crate::job::now_ms;
+use crate::net::{Net, Pinned};
+use crate::source::{Kind, Reference, Source, SourceError};
+use crate::warm::{self, Programs, Warming};
+use crate::{
+    Code, Enroll, Enrolled, EnrolledSpace, Gateway, Operation, Outcome, Paid, Pay, Refusal, SignIn,
+    SignedIn, StreamTarget, Synced, refused,
+};
+use s4_credential_contract::{TRANSFER, account};
+
+/// How far past the node's time a proof's expiry is set: within VOS's
+/// `CREDENTIAL_HORIZON_MS`, which ingress allows, room for the proof and
+/// the trip.
+const EXPIRY_MS: u64 = 60_000;
+const _: () = assert!(EXPIRY_MS < vos_wire::defaults::CREDENTIAL_HORIZON_MS);
+/// How often a refresher asks its keeper whether the feed is due: the
+/// keeper's own jittered timer decides.
+const TICK: Duration = Duration::from_secs(1);
+/// The wait after a failed read before the next.
+const RETRY: Duration = Duration::from_secs(5);
+/// The furthest the node's time may be from the device's: past it, a relay
+/// that lies about the time could keep a confirmed proof for later.
+const CLOCK_SKEW_MS: u64 = 300_000;
+/// The least time between two `refresh` requests the facility honours, and
+/// the spread of the read one schedules.
+const REFRESH_EVERY: Duration = Duration::from_secs(30);
+const REFRESH_SPREAD: Duration = Duration::from_secs(5);
+
+/// The release artifacts of VOS's stock kernels, each an encoded
+/// `vos_light::release::Device`: the programs the device proves sign-ins
+/// and payments with, never one a server sends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stock {
+    pub auth: Vec<u8>,
+    pub owner: Vec<u8>,
+}
+
+impl Stock {
+    /// The artifacts this crate embeds, built from the credential actor of
+    /// the VOS revision it names (`just vos-release`).
+    pub fn embedded() -> Self {
+        Self {
+            auth: include_bytes!("../release/auth.device").to_vec(),
+            owner: include_bytes!("../release/owner.device").to_vec(),
+        }
+    }
+}
+
+/// The `vos.credential` facility of one device: its enrollments, its secret
+/// source, its prover, and each enrollment's tree.
+#[derive(Clone)]
+pub struct Facility {
+    inner: Arc<Inner>,
+}
+
+pub(crate) struct Inner {
+    pub(crate) store: Store,
+    pub(crate) source: Arc<dyn Source>,
+    pub(crate) stock: Stock,
+    prover: Mutex<Option<Arc<Prover>>>,
+    /// The enrolled kernels' programs, by release artifact.
+    programs: Programs,
+    /// Held for a proof: two at once would hold a proof's memory twice.
+    device_proof: Mutex<()>,
+    tick: Duration,
+    /// The one client every request to a space goes through.
+    pub(crate) net: Arc<Net>,
+    /// Each enrollment's tree and its refresher, by origin, for the
+    /// process's life: no connection that proves starts or steers it.
+    trees: Mutex<HashMap<(String, String), Arc<Tree>>>,
+    /// The device's personal space, while it runs.
+    paired: Mutex<Option<std::sync::Weak<dyn Paired>>>,
+}
+
+/// What an enrollment asks of the device's personal space.
+pub(crate) trait Paired: Send + Sync {
+    /// The source this device's handle in the space `handle` was derived
+    /// from at a pairing, while its confirmation there is owed: the device
+    /// that paired it enrolled that handle, so this one enrolls with it.
+    fn owed_source(&self, handle: &[u8; 32]) -> Result<Option<Reference>, String>;
+    /// An enrollment made: the credential book records it.
+    fn enrolled(&self);
+}
+
+/// One enrollment's credential tree, its refresher while a session holds
+/// it, and its last payment.
+struct Tree {
+    /// The space's handle, which the client knows the space by.
+    space: [u8; 32],
+    keeper: tokio::sync::Mutex<TreeKeeper>,
+    /// Where the keeper is kept, beside the enrollment.
+    file: PathBuf,
+    /// When a `refresh` request makes the feed due, at a drawn delay.
+    unknown_at: Mutex<Option<Instant>>,
+    last_refresh: Mutex<Option<Instant>>,
+    /// The last payment made: its confirmed values and its request, sent
+    /// again as it is for the same values while it may still run.
+    payment: Mutex<Option<Payment>>,
+    refresher: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The sessions holding it: its refresher stops with the last.
+    sessions: AtomicUsize,
+}
+
+#[derive(Clone)]
+struct Payment {
+    values: (String, u64),
+    expires_ms: u64,
+    request: Vec<u8>,
+}
+
+impl Tree {
+    fn stop(&self) {
+        if let Some(refresher) = self.refresher.lock().expect("refresher poisoned").take() {
+            refresher.abort();
+        }
+    }
+}
+
+impl Drop for Tree {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// A gateway's host as two spellings of one name compare: lowercase, no
+/// trailing dot.
+fn host(name: &str) -> String {
+    name.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// What `enrollment` pins of its space's routes.
+pub(crate) fn pinned(enrollment: &Enrollment) -> Pinned {
+    Pinned {
+        onions: crate::net::onions(&enrollment.onions),
+        // A session over an onion names no clearnet: its host would go to
+        // the system's resolver.
+        clearnet: enrollment
+            .host_key
+            .filter(|_| !enrollment.host.to_ascii_lowercase().ends_with(".onion"))
+            .map(|key| Clearnet {
+                host: enrollment.host.clone(),
+                port: enrollment.port,
+                ssh_host_key: key,
+            }),
+        onion_only: enrollment.onion_only,
+    }
+}
+
+/// `enrollment`'s credential actor, whose feed serves its tree.
+fn registrar(enrollment: &Enrollment) -> Result<Registrar, String> {
+    let location = enrollment.credentials;
+    let identity = enrollment
+        .agent(location.agent)
+        .ok_or("the credential actor's agent was not pinned")?
+        .identity;
+    Ok(Registrar {
+        agent: location.agent,
+        instance: location.instance,
+        identity,
+    })
+}
+
+impl Facility {
+    /// The facility over `store`, its secret sources `source`, every
+    /// request to a space through `net`.
+    pub fn new(store: Store, source: Arc<dyn Source>, net: Arc<Net>) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                store,
+                source,
+                stock: Stock::embedded(),
+                prover: Mutex::new(None),
+                programs: Programs::default(),
+                device_proof: Mutex::new(()),
+                tick: TICK,
+                net,
+                trees: Mutex::new(HashMap::new()),
+                paired: Mutex::new(None),
+            }),
+        }
+    }
+
+    /// The device's personal space, which enrollments ask.
+    pub(crate) fn lend_personal(&self, paired: std::sync::Weak<dyn Paired>) {
+        *self.inner.paired.lock().unwrap_or_else(|e| e.into_inner()) = Some(paired);
+    }
+
+    fn inner_mut(&mut self) -> &mut Inner {
+        Arc::get_mut(&mut self.inner).expect("a facility not yet shared")
+    }
+
+    /// The same, proving with the stock kernels' artifacts `stock`: a
+    /// client of a VOS tree whose credential actor is built apart (tests).
+    pub fn with_stock(mut self, stock: Stock) -> Self {
+        self.inner_mut().stock = stock;
+        self
+    }
+
+    /// The same, its refreshers asking their keepers every `tick` (tests).
+    pub fn with_tick(mut self, tick: Duration) -> Self {
+        self.inner_mut().tick = tick;
+        self
+    }
+
+    pub(crate) fn inner(&self) -> &Arc<Inner> {
+        &self.inner
+    }
+
+    /// The client every request goes through.
+    pub fn net(&self) -> &Arc<Net> {
+        &self.inner.net
+    }
+
+    /// Whether the device has a secret source, or a key one already made
+    /// for an enrollment: without either the client does not offer the
+    /// facility.
+    pub fn supported(&self) -> bool {
+        !self.inner.source.kinds().is_empty() || self.inner.store.any()
+    }
+
+    /// Compute the enrolled kernels' programs in the background at a low
+    /// priority: `None` when nothing is enrolled.
+    pub fn warm(&self) -> Option<Warming> {
+        let kernels = self.inner.enrolled_kernels();
+        Inner::warm(&self.inner, kernels)
+    }
+
+    /// Every enrollment's space told to the client, its routes as pinned.
+    pub fn pin_all(&self) {
+        for enrollment in self.inner.store.all().unwrap_or_default() {
+            self.inner.net.pin(enrollment.handle, pinned(&enrollment));
+        }
+    }
+
+    /// One pass of the facility's sync, apart from every proof: each
+    /// enrollment's tree read from its feed if due, over Tor. What it
+    /// keeps is the process's: a pass cut short leaves the store as it was.
+    pub async fn sync(&self) -> Result<Synced, Refusal> {
+        let all = self.inner.store.all().map_err(store_error)?;
+        let mut synced = Synced {
+            enrollments: all.len() as u32,
+            ..Synced::default()
+        };
+        for enrollment in all {
+            self.inner.net.pin(enrollment.handle, pinned(&enrollment));
+            let Some(tree) = self.inner.tree_of(&enrollment) else {
+                synced.failed += 1;
+                continue;
+            };
+            match read_once(&self.inner.net, &tree, &enrollment).await {
+                Ok(()) => synced.synced += 1,
+                Err(_) => synced.failed += 1,
+            }
+            // The registrar's onion set, once a day: a space whose onions
+            // rotate stays reachable. A failure keeps the set pinned.
+            if let Ok(registrar) = registrar(&enrollment) {
+                let _ = self
+                    .inner
+                    .net
+                    .refresh_onions_due(enrollment.handle, &registrar, now_ms())
+                    .await;
+            }
+        }
+        Ok(synced)
+    }
+
+    /// The enrollments kept, as the app's own screens list them.
+    pub fn enrollments(&self) -> Result<Vec<EnrolledSpace>, Refusal> {
+        Ok(self
+            .inner
+            .store
+            .all()
+            .map_err(store_error)?
+            .into_iter()
+            .map(|enrollment| EnrolledSpace {
+                space: enrollment.space,
+                handle: enrollment.handle,
+                member: enrollment.member,
+                opted_out: self.inner.net.opted_out(&enrollment.handle),
+                host: enrollment.host,
+                port: enrollment.port,
+            })
+            .collect())
+    }
+
+    /// The space whose screens the gateway `gateway` names serves: one
+    /// enrolled through that gateway whose routes take its onion, before
+    /// one the user opted out to its clearnet port, before one whose
+    /// routes take neither (which its routes then refuse). `NotEnrolled`
+    /// only when no space was enrolled through it.
+    pub fn screens_space(&self, gateway: &StreamTarget) -> Result<crate::net::SpaceId, Refusal> {
+        let net = &self.inner.net;
+        let (mut opted_out, mut unrouted) = (None, None);
+        for enrollment in self.inner.store.all().map_err(store_error)? {
+            if enrollment.port != gateway.port || host(&enrollment.host) != host(&gateway.host) {
+                continue;
+            }
+            if net.client().routes(&enrollment.handle).is_none() {
+                net.pin(enrollment.handle, pinned(&enrollment));
+            }
+            let routes = net.client().routes(&enrollment.handle);
+            match routes {
+                Some(routes) if routes.opted_out() => {
+                    opted_out.get_or_insert(enrollment.handle);
+                }
+                Some(routes) if !routes.onions.is_empty() => return Ok(enrollment.handle),
+                _ => {
+                    unrouted.get_or_insert(enrollment.handle);
+                }
+            }
+        }
+        opted_out.or(unrouted).ok_or_else(|| {
+            refused(
+                Code::NotEnrolled,
+                "no space was enrolled through this gateway",
+            )
+        })
+    }
+
+    /// Refused when `host_key`, the key a gateway presented to s4's own
+    /// connection, is one a space pinned to its onion (at the onion's port
+    /// 22, or at the clearnet port it was enrolled through) while its
+    /// routes take the onion: that gateway is the space's, however its
+    /// name or its port is spelled, and s4 does not reach it over the
+    /// clearnet itself. A space the user opted out of Tor refuses nothing.
+    pub fn clearnet_refused(&self, host_key: &[u8; 32]) -> Result<(), Refusal> {
+        let net = &self.inner.net;
+        for enrollment in self.inner.store.all().map_err(store_error)? {
+            if net.client().routes(&enrollment.handle).is_none() {
+                net.pin(enrollment.handle, pinned(&enrollment));
+            }
+        }
+        match net.onion_pinned(host_key) {
+            None => Ok(()),
+            Some(space) => {
+                let through = self
+                    .inner
+                    .store
+                    .all()
+                    .map_err(store_error)?
+                    .into_iter()
+                    .find(|enrollment| enrollment.handle == space)
+                    .map(|enrollment| {
+                        format!(
+                            ", as the gateway it was enrolled through ({}:{})",
+                            enrollment.host, enrollment.port
+                        )
+                    })
+                    .unwrap_or_default();
+                Err(refused(
+                    Code::Refused,
+                    format!(
+                        "this gateway serves a space this device reaches over Tor alone: s4 \
+                         reaches it over its onion{through}"
+                    ),
+                ))
+            }
+        }
+    }
+
+    /// The facility for one connection to `gateway`, whose `ServerHello`
+    /// named its application.
+    pub fn session(&self, gateway: Gateway) -> Session {
+        Session {
+            inner: Arc::clone(&self.inner),
+            origin: Origin {
+                host: gateway.fingerprint.clone(),
+                application: gateway.application.clone(),
+            },
+            gateway,
+            held: Mutex::new(None),
+        }
+    }
+}
+
+impl Inner {
+    fn personal(&self) -> Option<Arc<dyn Paired>> {
+        self.paired
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(Weak::upgrade)
+    }
+
+    /// The source a pairing derived this device's handle `handle` from,
+    /// while its confirmation is owed. Unread, the enrollment is refused:
+    /// a new key there would never prove.
+    async fn paired(&self, handle: [u8; 32]) -> Result<Option<Reference>, Refusal> {
+        let Some(personal) = self.personal() else {
+            return Ok(None);
+        };
+        tokio::task::spawn_blocking(move || personal.owed_source(&handle))
+            .await
+            .map_err(|_| refused(Code::Failed, "the personal space stopped"))?
+            .map_err(|error| refused(Code::Store, format!("the personal space's store: {error}")))
+    }
+
+    /// An enrollment made, told to the personal space off the runtime,
+    /// unawaited: a flow holding it delays the record, not the enrollment.
+    fn enrolled(&self) {
+        if let Some(personal) = self.personal() {
+            drop(tokio::task::spawn_blocking(move || personal.enrolled()));
+        }
+    }
+
+    /// The stock kernels `enrollment`'s guards prove with.
+    fn kernels<'a>(&'a self, enrollment: &'a Enrollment) -> impl Iterator<Item = &'a [u8]> {
+        enrollment.methods.iter().map(|method| match &method.guard {
+            Guard::Auth { .. } => self.stock.auth.as_slice(),
+            Guard::Owner => self.stock.owner.as_slice(),
+        })
+    }
+
+    /// Every enrolled kernel, the programs of others dropped.
+    fn enrolled_kernels(&self) -> Vec<Vec<u8>> {
+        let Ok(all) = self.store.all() else {
+            return Vec::new();
+        };
+        let mut kernels = HashMap::new();
+        for enrollment in &all {
+            for kernel in self.kernels(enrollment) {
+                kernels.insert(warm::key(kernel), kernel.to_vec());
+            }
+        }
+        self.programs
+            .retain(&kernels.keys().copied().collect::<HashSet<_>>());
+        kernels.into_values().collect()
+    }
+
+    /// The program of the release artifact `kernel`, computed once while an
+    /// enrolled guard proves with it.
+    pub(crate) fn program(&self, kernel: &[u8]) -> Result<Arc<DeviceProgram>, DeviceError> {
+        self.programs.get(warm::key(kernel), || {
+            <Device as vos_wire::Decode>::decode_exact(kernel)
+                .ok_or(DeviceError::Prove)
+                .and_then(|device| DeviceProgram::released(&device))
+        })
+    }
+
+    /// The prover, allowed a proof's memory.
+    pub(crate) fn prover(&self) -> Result<Arc<Prover>, DeviceError> {
+        let mut prover = self.prover.lock().expect("prover poisoned");
+        if let Some(prover) = &*prover {
+            return Ok(Arc::clone(prover));
+        }
+        let made = Arc::new(Prover::new(ProverConfig {
+            max_memory: PEAK_BYTES,
+            ..ProverConfig::default()
+        })?);
+        *prover = Some(Arc::clone(&made));
+        Ok(made)
+    }
+
+    /// One proof at a time, its heap handed back after: `prove` on a
+    /// blocking thread, given the program of `kernel`.
+    pub(crate) async fn prove<T: Send + 'static>(
+        this: &Arc<Self>,
+        kernel: fn(&Stock) -> &[u8],
+        prove: impl FnOnce(&Prover, &DeviceProgram) -> Result<T, DeviceError> + Send + 'static,
+    ) -> Result<T, Refusal> {
+        let prover = this
+            .prover()
+            .map_err(|error| refused(Code::Prove, error.to_string()))?;
+        let inner = Arc::clone(this);
+        tokio::task::spawn_blocking(move || {
+            let proof = inner.program(kernel(&inner.stock)).and_then(|program| {
+                let _one = warm::lock(&inner.device_proof);
+                prove(&prover, &program)
+            });
+            // A proof's half a gigabyte handed back, whether it was made or
+            // failed.
+            warm::release_heap();
+            proof
+        })
+        .await
+        .map_err(|_| refused(Code::Prove, "the prover stopped"))?
+        .map_err(|error| refused(Code::Prove, error.to_string()))
+    }
+
+    /// The tree kept for `enrollment`, restored from its file if one is
+    /// kept; `None` for a member digest that is none.
+    fn tree_of(&self, enrollment: &Enrollment) -> Option<Arc<Tree>> {
+        let member = Digest::from_bytes(&enrollment.member)?;
+        let origin = Origin {
+            host: enrollment.fingerprint.clone(),
+            application: enrollment.application.clone(),
+        };
+        let mut all = self.trees.lock().expect("trees poisoned");
+        let key = (origin.host.clone(), origin.application.clone());
+        Some(Arc::clone(all.entry(key).or_insert_with(|| {
+            let file = self.store.tree_path(&origin);
+            let keeper = std::fs::read(&file)
+                .ok()
+                .and_then(|bytes| TreeKeeper::restore(member, &bytes).ok())
+                .unwrap_or_else(|| TreeKeeper::new(member));
+            Arc::new(Tree {
+                space: enrollment.handle,
+                keeper: tokio::sync::Mutex::new(keeper),
+                file,
+                unknown_at: Mutex::new(None),
+                last_refresh: Mutex::new(None),
+                payment: Mutex::new(None),
+                refresher: Mutex::new(None),
+                sessions: AtomicUsize::new(0),
+            })
+        })))
+    }
+
+    /// `kernels`' programs computed on a thread of their own.
+    fn warm(this: &Arc<Self>, kernels: Vec<Vec<u8>>) -> Option<Warming> {
+        if kernels.is_empty() {
+            return None;
+        }
+        let inner = Arc::downgrade(this);
+        Warming::spawn(move |cancelled| {
+            for kernel in &kernels {
+                let Some(inner) = live(&inner, cancelled) else {
+                    return;
+                };
+                drop(inner.program(kernel));
+            }
+        })
+    }
+}
+
+/// The facility, unless it is gone or the warm-up `cancelled`.
+fn live(inner: &Weak<Inner>, cancelled: &AtomicBool) -> Option<Arc<Inner>> {
+    if cancelled.load(Ordering::SeqCst) {
+        return None;
+    }
+    inner.upgrade()
+}
+
+/// The node's time, read as a fetch of its own, refused when it is further
+/// from the device's clock than [`CLOCK_SKEW_MS`].
+pub(crate) async fn node_time(net: &Net, space: [u8; 32]) -> Result<u64, String> {
+    let answer = net
+        .request(space, Purpose::Fetch, &wire::time_request())
+        .await?;
+    let now = wire::time_answer(&answer).map_err(|error| error.to_string())?;
+    if now.abs_diff(now_ms()) > CLOCK_SKEW_MS {
+        return Err("the node's time is minutes off this device's".into());
+    }
+    Ok(now)
+}
+
+/// The facility on one connection.
+pub struct Session {
+    inner: Arc<Inner>,
+    origin: Origin,
+    gateway: Gateway,
+    /// The tree this session holds since its grant.
+    held: Mutex<Option<Arc<Tree>>>,
+}
+
+impl Drop for Session {
+    /// The last session holding a tree stops its refresher, and the spare
+    /// kept for its space.
+    fn drop(&mut self) {
+        let Some(tree) = self.held.lock().expect("held poisoned").take() else {
+            return;
+        };
+        if tree.sessions.fetch_sub(1, Ordering::SeqCst) == 1 {
+            tree.stop();
+            self.inner.net.drop_spare(tree.space);
+        }
+    }
+}
+
+fn declined() -> Refusal {
+    refused(Code::Declined, "the user declined")
+}
+
+/// The store's failure as the server is told it: its own message names the
+/// enrollments' files and quotes what it could not read, another origin's
+/// enrollment among them, so it stays on the device.
+pub(crate) fn store_error(_: String) -> Refusal {
+    refused(
+        Code::Store,
+        "this device's enrollments could not be read or kept",
+    )
+}
+
+pub(crate) fn source_error(error: SourceError) -> Refusal {
+    match error {
+        SourceError::Declined => declined(),
+        SourceError::Failed(message) => refused(Code::Source, message),
+    }
+}
+
+impl Session {
+    /// The user granted the facility for this session. The enrolled
+    /// member's tree is kept from then on, while a session holds it: its
+    /// refresher starts at a drawn delay, on the space's feed connection,
+    /// and later sessions do not restart it; a spare connection is kept
+    /// for the space's next proof. Nothing is read before a grant.
+    pub fn granted(&self) {
+        if let Ok(Some(enrollment)) = self.inner.store.get(&self.origin) {
+            self.keep(enrollment);
+        }
+    }
+
+    /// Compute this origin's kernels' programs: the earliest moment its
+    /// sign-in is known to be near is the user's grant.
+    pub fn warm(&self) -> Option<Warming> {
+        self.inner.enrolled_kernels();
+        let kernels = match self.inner.store.get(&self.origin) {
+            Ok(Some(enrollment)) => self
+                .inner
+                .kernels(&enrollment)
+                .map(<[u8]>::to_vec)
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect(),
+            _ => Vec::new(),
+        };
+        Inner::warm(&self.inner, kernels)
+    }
+
+    /// One call of `operation`, confirmed in `chrome`.
+    pub async fn call(
+        &self,
+        operation: Operation,
+        chrome: &dyn Chrome,
+    ) -> Result<Outcome, Refusal> {
+        Ok(match operation {
+            Operation::Enroll(request) => Outcome::Enrolled(self.enroll(request, chrome).await?),
+            Operation::SignIn(request) => Outcome::SignedIn(self.sign_in(request, chrome).await?),
+            Operation::Pay(request) => Outcome::Paid(self.pay(request, chrome).await?),
+            Operation::Refresh => {
+                self.refreshed();
+                Outcome::Refreshed
+            }
+        })
+    }
+
+    /// The server says the node did not hold the proof's root: at a drawn
+    /// delay the feed is due again, so a server cannot time this member's
+    /// reads by asking; honoured at most once in [`REFRESH_EVERY`],
+    /// whoever asks.
+    pub fn refreshed(&self) {
+        let Some(tree) = self.tree() else {
+            return;
+        };
+        let recent = tree
+            .last_refresh
+            .lock()
+            .expect("refresh poisoned")
+            .is_some_and(|last| last.elapsed() < REFRESH_EVERY);
+        if recent {
+            return;
+        }
+        tree.unknown_at
+            .lock()
+            .expect("refresh poisoned")
+            .get_or_insert_with(|| Instant::now() + below(REFRESH_SPREAD));
+    }
+
+    fn tree(&self) -> Option<Arc<Tree>> {
+        let enrollment = self.inner.store.get(&self.origin).ok()??;
+        self.inner.tree_of(&enrollment)
+    }
+
+    fn enrolled(&self) -> Result<Enrollment, Refusal> {
+        self.inner
+            .store
+            .get(&self.origin)
+            .map_err(store_error)?
+            .ok_or_else(|| refused(Code::NotEnrolled, "this device is not enrolled here"))
+    }
+
+    /// The member's secret, derived again from the source's output for the
+    /// space's handle, after the user's consent at the source; the output
+    /// zeroized once copied. On the heap, so the prover's task takes it as a
+    /// pointer and no freed task keeps its words.
+    async fn secret(&self, enrollment: &Enrollment) -> Result<Box<DeviceSecret>, Refusal> {
+        secret_of(&*self.inner.source, enrollment).await
+    }
+
+    fn origin_line(&self) -> String {
+        format!(
+            "{} at {}:{} asks",
+            self.origin.application, self.gateway.host, self.gateway.port
+        )
+    }
+    /// `enroll`: this device enrolled in the request's space, the digests
+    /// shown in the chrome and answered.
+    pub async fn enroll(&self, request: Enroll, chrome: &dyn Chrome) -> Result<Enrolled, Refusal> {
+        let store = &self.inner.store;
+        let existing = store.get(&self.origin).map_err(store_error)?;
+        if existing
+            .as_ref()
+            .is_some_and(|existing| !existing.pins(&request))
+        {
+            return Err(refused(
+                Code::NotPinned,
+                "this device is enrolled here for another space, agents or methods",
+            ));
+        }
+        // Another server asking for a space this device is enrolled in
+        // elsewhere could relay its proofs: refused.
+        let elsewhere = store.others(&self.origin).map_err(store_error)?;
+        if elsewhere
+            .iter()
+            .any(|other| other.handle == request.handle || other.space == request.space)
+        {
+            return Err(refused(
+                Code::NotPinned,
+                "this space is enrolled on this device through another server",
+            ));
+        }
+        let kinds = self.inner.source.kinds();
+        // A handle a pairing gave this device here is enrolled already, by
+        // the device that paired it: this device enrolls with the source
+        // it derived that handle from, not a new key.
+        let paired = match &existing {
+            Some(_) => None,
+            None => self.inner.paired(request.handle).await?,
+        };
+        let mut rows = vec![
+            ("Space handle".to_owned(), short(&request.handle)),
+            ("Space".to_owned(), short(&request.space)),
+        ];
+        rows.extend(
+            request
+                .agents
+                .iter()
+                .map(|agent| (format!("Agent {}", agent.agent), short(&agent.identity))),
+        );
+        rows.extend(request.methods.iter().map(describe));
+        rows.push((
+            "Onions".to_owned(),
+            format!(
+                "{}{}",
+                request.onions.len(),
+                if request.onion_only {
+                    ", onion-only"
+                } else {
+                    ""
+                }
+            ),
+        ));
+        let form = Form {
+            title: if existing.is_some() {
+                "Show this device's digests".into()
+            } else {
+                "Enroll this device".into()
+            },
+            detail: format!(
+                "{} to enroll this device in a space, for these methods only. \
+                 Check the space with its operator before you confirm.",
+                self.origin_line()
+            ),
+            rows,
+            fields: Vec::new(),
+            notice: None,
+            choices: match (&existing, &paired) {
+                (Some(_), _) => vec!["Show".into()],
+                (None, Some(paired)) => vec![choice(paired.kind()).into()],
+                (None, None) => kinds.iter().map(|kind| choice(*kind).into()).collect(),
+            },
+        };
+        let Answer::Confirmed { choice, .. } = chrome.confirm(form).await else {
+            return Err(declined());
+        };
+        let reference = match (&existing, paired) {
+            (Some(existing), _) => existing.source.clone(),
+            (None, Some(paired)) => paired,
+            (None, None) => {
+                let kind = *kinds.get(choice).ok_or_else(declined)?;
+                self.inner.source.create(kind).await.map_err(source_error)?
+            }
+        };
+        let output = self
+            .inner
+            .source
+            .evaluate(&reference, vos_light::source_input(&request.handle))
+            .await
+            .map_err(source_error)?;
+        let (member, owner) = digests(&output, &request.handle);
+        drop(output);
+        let enrollment = Enrollment {
+            handle: request.handle,
+            space: request.space,
+            agents: request.agents,
+            methods: request.methods,
+            credentials: request.credentials,
+            source: reference,
+            member: member.to_bytes(),
+            owner: owner.to_bytes(),
+            host: self.gateway.host.clone(),
+            port: self.gateway.port,
+            fingerprint: self.origin.host.clone(),
+            application: self.origin.application.clone(),
+            host_key: self.gateway.host_key,
+            onions: request.onions,
+            onion_only: request.onion_only,
+        };
+        if existing
+            .as_ref()
+            .is_some_and(|existing| existing.member != enrollment.member)
+        {
+            return Err(refused(
+                Code::Source,
+                "the source no longer gives this device's secret: revoke and enroll again",
+            ));
+        }
+        store.put(&self.origin, &enrollment).map_err(store_error)?;
+        self.keep(enrollment);
+        self.inner.enrolled();
+        // Its sign-in is near: its kernels' programs made meanwhile.
+        drop(self.warm());
+        // The digests the operator invites, shown here: a server's document
+        // could show its own in their place.
+        chrome
+            .confirm(Form {
+                title: "This device's digests".into(),
+                detail: "Read these to the space's operator from this screen, never from \
+                         the server's, so no one else's are invited in their place."
+                    .into(),
+                rows: vec![
+                    ("Member".into(), hex::encode(member.to_bytes())),
+                    ("Owner".into(), hex::encode(owner.to_bytes())),
+                ],
+                fields: Vec::new(),
+                notice: None,
+                choices: vec!["Done".into()],
+            })
+            .await;
+        Ok(Enrolled {
+            member: member.to_bytes(),
+            owner: owner.to_bytes(),
+        })
+    }
+
+    /// The pinned method `name`, which `wanted` accepts.
+    fn pinned<'a>(
+        enrollment: &'a Enrollment,
+        agent: u32,
+        instance: u32,
+        name: &str,
+        wanted: impl Fn(&Method) -> bool,
+    ) -> Result<&'a Method, Refusal> {
+        enrollment
+            .method(agent, instance, name)
+            .filter(|method| wanted(method))
+            .ok_or_else(|| {
+                refused(
+                    Code::NotPinned,
+                    format!("`{name}` at agent {agent}, instance {instance} was not pinned here"),
+                )
+            })
+    }
+
+    /// The member's path at the newest root its tree holds.
+    async fn witness(&self) -> Option<AuthWitness> {
+        self.tree()?.keeper.lock().await.witness()
+    }
+
+    /// `sign_in`: a pinned auth-guarded call, proved.
+    pub async fn sign_in(&self, request: SignIn, chrome: &dyn Chrome) -> Result<SignedIn, Refusal> {
+        let enrollment = self.enrolled()?;
+        let method = Self::pinned(
+            &enrollment,
+            request.agent,
+            request.instance,
+            &request.method,
+            |method| matches!(method.guard, Guard::Auth { .. }),
+        )?;
+        let Guard::Auth { scope, once } = &method.guard else {
+            unreachable!("an auth guard, filtered above")
+        };
+        // What a `once` call spends its admission on must be what the user
+        // sees: until the chrome reads a method's arguments from its schema,
+        // a `once` call takes none.
+        if *once && !request.arguments.is_empty() {
+            return Err(refused(
+                Code::Arguments,
+                "a once-guarded call is proved with no arguments the chrome cannot show",
+            ));
+        }
+        let Some(witness) = self.witness().await else {
+            return Err(refused(
+                Code::NoPath,
+                "the device is still reading its space's tree: try again in a few seconds",
+            ));
+        };
+        let form = Form {
+            title: if *once {
+                format!("Spend your one {}?", method.name)
+            } else {
+                format!("Prove membership: {}", method.name)
+            },
+            detail: format!(
+                "{} this device to prove it is a member, without saying which.",
+                self.origin_line()
+            ),
+            rows: vec![
+                ("Space handle".into(), short(&enrollment.handle)),
+                ("Method".into(), describe(method).1),
+                ("Agent".into(), method.agent.to_string()),
+                (
+                    "Arguments".into(),
+                    if request.arguments.is_empty() {
+                        "none".into()
+                    } else {
+                        format!(
+                            "{} bytes: {}",
+                            request.arguments.len(),
+                            hex::encode(&request.arguments[..request.arguments.len().min(32)])
+                        )
+                    },
+                ),
+            ],
+            fields: Vec::new(),
+            notice: once.then(|| {
+                format!(
+                    "This call spends your one admission in the scope “{scope}”: \
+                     the space admits each member there once, for good."
+                )
+            }),
+            choices: vec![if *once {
+                "Spend it".into()
+            } else {
+                "Prove".into()
+            }],
+        };
+        if !matches!(chrome.confirm(form).await, Answer::Confirmed { .. }) {
+            return Err(declined());
+        }
+        let call = self
+            .call_for(&enrollment, method, request.arguments)
+            .await?;
+        let secret = self.secret(&enrollment).await?;
+        let name = scope.clone();
+        let started = Instant::now();
+        let request = Inner::prove(
+            &self.inner,
+            |stock| &stock.auth,
+            move |prover, program| {
+                // The stock kernel's program, as the space's ingress
+                // computes it from the installed kernel: the warm-up's if
+                // it made it, waited for if it is making it.
+                let proof = prover.prove_auth(&secret, &witness, name.as_bytes(), &call, program);
+                drop(secret);
+                proof.map(|proof| wire::credentialed(&call, &proof))
+            },
+        )
+        .await?;
+        let proving_ms = started.elapsed().as_millis() as u64;
+        Ok(SignedIn {
+            answer: self.send(&enrollment, &request).await?,
+            proving_ms,
+        })
+    }
+
+    /// A proved request sent over Tor as a proven call, the spare's if one
+    /// is built: the node's answer. One that names the root unknown or
+    /// stale makes the feed due.
+    async fn send(&self, enrollment: &Enrollment, request: &[u8]) -> Result<Vec<u8>, Refusal> {
+        let answer = self
+            .inner
+            .net
+            .request(enrollment.handle, Purpose::Proven, request)
+            .await
+            .map_err(|error| refused(Code::Api, error))?;
+        if let Ok(wire::Answer::RootUnknown | wire::Answer::RootStale) =
+            wire::credentialed_answer(&answer)
+            && let Some(tree) = self.inner.tree_of(enrollment)
+        {
+            tree.keeper.lock().await.unknown(now_ms());
+        }
+        Ok(answer)
+    }
+
+    /// `pay`: a transfer from this device's account, as the user confirmed
+    /// it, proved.
+    pub async fn pay(&self, request: Pay, chrome: &dyn Chrome) -> Result<Paid, Refusal> {
+        let enrollment = self.enrolled()?;
+        let method = Self::pinned(
+            &enrollment,
+            request.agent,
+            request.instance,
+            &request.method,
+            |method| method.guard == Guard::Owner && method.name == TRANSFER,
+        )?;
+        let (mut payee, mut amount) = (request.payee.clone(), request.amount.to_string());
+        let mut notice = None;
+        let (payee, amount) = loop {
+            let form = Form {
+                title: "Confirm the payment".into(),
+                detail: format!(
+                    "{} this device to pay from its account. What you confirm here is \
+                     what is paid.",
+                    self.origin_line()
+                ),
+                rows: vec![
+                    ("Space handle".into(), short(&enrollment.handle)),
+                    ("Method".into(), describe(method).1),
+                    ("From".into(), "this device's account".into()),
+                ],
+                fields: vec![
+                    Field {
+                        label: "To account".into(),
+                        value: payee.clone(),
+                    },
+                    Field {
+                        label: "Amount".into(),
+                        value: amount.clone(),
+                    },
+                ],
+                notice: notice.take(),
+                choices: vec!["Pay".into()],
+            };
+            let Answer::Confirmed { values, .. } = chrome.confirm(form).await else {
+                return Err(declined());
+            };
+            let [to, how_much] = values.as_slice() else {
+                return Err(refused(Code::Arguments, "the form answered other fields"));
+            };
+            (payee, amount) = (to.trim().to_owned(), how_much.trim().to_owned());
+            match (account(&payee), amount.parse::<u64>()) {
+                (Ok(to), Ok(how_much)) if how_much > 0 => break (to, how_much),
+                (Err(_), _) => {
+                    notice = Some(
+                        "An account's name is 1 to 32 ASCII letters, digits, `.`, `_` or `-`."
+                            .into(),
+                    )
+                }
+                _ => notice = Some("The amount is a whole number above zero.".into()),
+            }
+        };
+        let values = (payee.clone(), amount);
+        let answer = |answer: Vec<u8>, proving_ms: u64| Paid {
+            answer,
+            proving_ms,
+            payee: values.0.clone(),
+            amount: values.1,
+        };
+        // The same payment asked again while its last proof may still run
+        // (a relay that withheld it, then asked anew) is that proof again:
+        // its binding runs once.
+        let now = node_time(&self.inner.net, enrollment.handle)
+            .await
+            .map_err(|error| refused(Code::Api, error))?;
+        let tree = self.tree();
+        let again = tree.as_ref().and_then(|tree| {
+            tree.payment
+                .lock()
+                .expect("payment poisoned")
+                .clone()
+                .filter(|last| last.values == values && now + 5_000 < last.expires_ms)
+        });
+        if let Some(again) = again {
+            return Ok(answer(self.send(&enrollment, &again.request).await?, 0));
+        }
+        let arguments = vos_light::transfer_arguments(&values.0, amount);
+        let call = self.call_at(&enrollment, method, arguments, now)?;
+        let secret = self.secret(&enrollment).await?;
+        let started = Instant::now();
+        let expires_ms = call.expires_ms;
+        let bytes = Inner::prove(
+            &self.inner,
+            |stock| &stock.owner,
+            move |prover, program| {
+                let proof = prover.prove_owner(&secret, &call, program);
+                drop(secret);
+                proof.map(|proof| wire::credentialed(&call, &proof))
+            },
+        )
+        .await?;
+        let proving_ms = started.elapsed().as_millis() as u64;
+        if let Some(tree) = tree {
+            *tree.payment.lock().expect("payment poisoned") = Some(Payment {
+                values: values.clone(),
+                expires_ms,
+                request: bytes.clone(),
+            });
+        }
+        Ok(answer(self.send(&enrollment, &bytes).await?, proving_ms))
+    }
+
+    /// A call of `method` with `arguments`, its expiry from the node's time
+    /// read now on a connection of its own.
+    async fn call_for(
+        &self,
+        enrollment: &Enrollment,
+        method: &Method,
+        arguments: Vec<u8>,
+    ) -> Result<Call, Refusal> {
+        let now = node_time(&self.inner.net, enrollment.handle)
+            .await
+            .map_err(|error| refused(Code::Api, error))?;
+        self.call_at(enrollment, method, arguments, now)
+    }
+
+    fn call_at(
+        &self,
+        enrollment: &Enrollment,
+        method: &Method,
+        arguments: Vec<u8>,
+        now: u64,
+    ) -> Result<Call, Refusal> {
+        Call::new(
+            enrollment.space,
+            method.agent,
+            method.instance,
+            vos_light::method_id(&method.name),
+            arguments,
+            now + EXPIRY_MS,
+        )
+        .map_err(|error| refused(Code::Prove, error.to_string()))
+    }
+
+    /// Hold `enrollment`'s tree for this session, its refresher started
+    /// if none runs, and a spare kept for its space's proofs.
+    fn keep(&self, enrollment: Enrollment) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let Some(tree) = self.inner.tree_of(&enrollment) else {
+            return;
+        };
+        self.inner.net.pin(enrollment.handle, pinned(&enrollment));
+        {
+            let mut held = self.held.lock().expect("held poisoned");
+            if held.is_none() {
+                tree.sessions.fetch_add(1, Ordering::SeqCst);
+                *held = Some(Arc::clone(&tree));
+            }
+        }
+        self.inner.net.keep_spare(enrollment.handle);
+        let mut refresher = tree.refresher.lock().expect("refresher poisoned");
+        if refresher.as_ref().is_some_and(|task| !task.is_finished()) {
+            return;
+        }
+        let (weak, tick, net) = (
+            Arc::downgrade(&tree),
+            self.inner.tick,
+            Arc::clone(&self.inner.net),
+        );
+        *refresher = Some(runtime.spawn(async move {
+            // The first read at a drawn delay, not at the grant.
+            tokio::time::sleep(below(tick)).await;
+            loop {
+                let Some(tree) = weak.upgrade() else {
+                    return;
+                };
+                let wait = match read_once(&net, &tree, &enrollment).await {
+                    Ok(()) => jittered(tick),
+                    Err(_) => RETRY,
+                };
+                drop(tree);
+                tokio::time::sleep(wait).await;
+            }
+        }));
+    }
+}
+
+/// The feed read into `tree` if its keeper says so, on the space's feed
+/// connection, and the keeper kept if the read changed it; a `refresh`
+/// asked for and due makes it so first.
+async fn read_once(net: &Net, tree: &Tree, enrollment: &Enrollment) -> Result<(), String> {
+    let registrar = registrar(enrollment)?;
+    let mut keeper = tree.keeper.lock().await;
+    {
+        let mut unknown = tree.unknown_at.lock().expect("refresh poisoned");
+        if unknown.is_some_and(|at| Instant::now() >= at) {
+            *unknown = None;
+            keeper.unknown(now_ms());
+            *tree.last_refresh.lock().expect("refresh poisoned") = Some(Instant::now());
+        }
+    }
+    if !keeper.due(now_ms()) {
+        return Ok(());
+    }
+    let applied = net
+        .client()
+        .read_tree(tree.space, &registrar, &mut keeper, now_ms)
+        .await
+        .map_err(|error| error.to_string())?;
+    if applied > 0 {
+        write_private(&tree.file, &keeper.encode())?;
+    }
+    Ok(())
+}
+
+/// The member's secret of `enrollment`, from its source's output after the
+/// user's consent there.
+pub(crate) async fn secret_of(
+    source: &dyn Source,
+    enrollment: &Enrollment,
+) -> Result<Box<DeviceSecret>, Refusal> {
+    let output = source
+        .evaluate(
+            &enrollment.source,
+            vos_light::source_input(&enrollment.handle),
+        )
+        .await
+        .map_err(source_error)?;
+    Ok(Box::new(vos_light::derive_secret(
+        &output,
+        &enrollment.handle,
+    )))
+}
+
+/// The member and owner digests of the secret `output` gives for `handle`.
+/// The secret is derived and dropped here, on this call's stack: held in an
+/// async function, it would sit in its future's state, which `drop` copies
+/// out of and zeroizes only the copy of.
+fn digests(output: &[u8; 32], handle: &[u8; 32]) -> (Digest, Digest) {
+    let secret = vos_light::derive_secret(output, handle);
+    (vos_light::member(&secret), vos_light::owner(&secret))
+}
+
+/// A uniform draw below `period`.
+fn below(period: Duration) -> Duration {
+    let mut bytes = [0; 8];
+    let draw = match getrandom::getrandom(&mut bytes) {
+        Ok(()) => u64::from_le_bytes(bytes),
+        Err(_) => 0,
+    };
+    Duration::from_millis(draw % (period.as_millis() as u64).max(1))
+}
+
+/// `period`, moved uniformly by up to half of it either way.
+fn jittered(period: Duration) -> Duration {
+    period / 2 + below(period)
+}
+
+/// The button that enrolls with `kind`.
+fn choice(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Keystore | Kind::Admin => "Use this phone's lock",
+        Kind::SecurityKey | Kind::Kit => "Use a security key",
+    }
+}
+
+/// A pinned method as the chrome lists it: its use, and its place.
+fn describe(method: &Method) -> (String, String) {
+    match &method.guard {
+        Guard::Auth { scope, once: false } => (
+            "Sign in".into(),
+            format!("{} (scope “{scope}”)", method.name),
+        ),
+        Guard::Auth { scope, once: true } => (
+            "Once".into(),
+            format!("{} (once in scope “{scope}”)", method.name),
+        ),
+        Guard::Owner => (
+            "Pay".into(),
+            format!("{} (from this device's account)", method.name),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::enrollment::{Agent, Location, Onion};
+    use crate::source::{BoxFuture, Output, Reference};
+
+    struct NoSource;
+
+    impl Source for NoSource {
+        fn kinds(&self) -> Vec<Kind> {
+            Vec::new()
+        }
+
+        fn create(&self, _: Kind) -> BoxFuture<'_, Result<Reference, SourceError>> {
+            Box::pin(async { Err(SourceError::Declined) })
+        }
+
+        fn evaluate<'a>(
+            &'a self,
+            _: &'a Reference,
+            _: [u8; 32],
+        ) -> BoxFuture<'a, Result<Output, SourceError>> {
+            Box::pin(async { Err(SourceError::Declined) })
+        }
+    }
+
+    fn enrollment(guard: Guard) -> Enrollment {
+        Enrollment {
+            handle: [1; 32],
+            space: [2; 32],
+            agents: vec![Agent {
+                agent: 7,
+                identity: [3; 32],
+            }],
+            methods: vec![Method {
+                agent: 7,
+                instance: 4,
+                name: "login".into(),
+                guard,
+            }],
+            credentials: Location {
+                agent: 7,
+                instance: 9,
+            },
+            source: Reference::Keystore {
+                alias: "vos.device.1".into(),
+            },
+            member: [4; 32],
+            owner: [8; 32],
+            host: "gateway.example".into(),
+            port: 2222,
+            fingerprint: origin().host,
+            application: origin().application,
+            host_key: None,
+            onions: vec![Onion {
+                key: [5; 32],
+                ssh_host_key: [6; 32],
+            }],
+            onion_only: false,
+        }
+    }
+
+    /// A dial that reaches nothing.
+    struct Nowhere;
+
+    impl vos_light::tor::Dial for Nowhere {
+        fn dial(
+            &self,
+            _: &vos_light::tor::Target,
+            _: vos_light::tor::Circuit,
+        ) -> vos_light::tor::Dialing {
+            Box::pin(async { Err(std::io::Error::other("no network")) })
+        }
+    }
+
+    /// A facility under `directory` that reaches no gateway, on `runtime`.
+    fn unreachable(
+        runtime: &tokio::runtime::Runtime,
+        store: Store,
+        directory: &std::path::Path,
+    ) -> Facility {
+        let _entered = runtime.enter();
+        Facility::new(
+            store,
+            Arc::new(NoSource),
+            Arc::new(Net::new(Arc::new(Nowhere), directory)),
+        )
+    }
+
+    fn origin() -> Origin {
+        Origin {
+            host: "SHA256:abc".into(),
+            application: "vos.test".into(),
+        }
+    }
+
+    /// A guard's stock kernel's program is computed by the warm-up once,
+    /// the sign-in's ask a hit, and dropped once no enrollment proves with
+    /// it.
+    #[test]
+    fn a_stock_kernels_program_is_kept_while_a_guard_proves_with_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::new(directory.path());
+        let login = Guard::Auth {
+            scope: "login".into(),
+            once: false,
+        };
+        store.put(&origin(), &enrollment(login)).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let facility = unreachable(&runtime, store.clone(), directory.path());
+        let inner = &facility.inner;
+        let (auth, owner) = (warm::key(&inner.stock.auth), warm::key(&inner.stock.owner));
+        assert!(!inner.programs.holds(&auth));
+
+        facility.warm().unwrap().join();
+        assert!(inner.programs.holds(&auth));
+        assert!(!inner.programs.holds(&owner));
+        let program = inner.program(&inner.stock.auth).unwrap();
+        facility.warm().unwrap().join();
+        assert!(Arc::ptr_eq(
+            &program,
+            &inner.program(&inner.stock.auth).unwrap()
+        ));
+        // Nothing proved: the prover was not even made.
+        assert!(inner.prover.lock().unwrap().is_none());
+
+        store.put(&origin(), &enrollment(Guard::Owner)).unwrap();
+        facility.warm().unwrap().join();
+        assert!(!inner.programs.holds(&auth));
+        assert!(inner.programs.holds(&owner));
+    }
+
+    /// The embedded stock artifacts are programs of the device format, and
+    /// an artifact whose id is not its program's proves nothing.
+    #[test]
+    fn the_stock_artifacts_are_programs() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let facility = unreachable(&runtime, Store::new(directory.path()), directory.path());
+        let stock = Stock::embedded();
+        for artifact in [&stock.auth, &stock.owner] {
+            facility.inner.program(artifact).unwrap();
+        }
+        let mut renamed = <Device as vos_wire::Decode>::decode_exact(&stock.owner).unwrap();
+        renamed.id[0] ^= 1;
+        let renamed = vos_wire::Encode::encode(&renamed);
+        assert_eq!(
+            facility.inner.program(&renamed).map(drop),
+            Err(DeviceError::Prove)
+        );
+    }
+}

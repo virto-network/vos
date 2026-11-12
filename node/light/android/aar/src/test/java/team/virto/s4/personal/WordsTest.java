@@ -1,0 +1,62 @@
+// SPDX-FileCopyrightText: 2026 Virto
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+package team.virto.s4.personal;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
+
+import org.junit.Test;
+import team.virto.s4.vos.ErrorCode;
+
+public final class WordsTest {
+  private static final long NOW = 1_800_000_000_000L;
+
+  @Test
+  public void timesReadPlainly() {
+    assertEquals("never", Words.ago(0, NOW));
+    assertEquals("just now", Words.ago(NOW - 5_000, NOW));
+    assertEquals("5 min ago", Words.ago(NOW - 5 * 60_000, NOW));
+    assertEquals("3 h ago", Words.ago(NOW - 3 * 3_600_000, NOW));
+    assertEquals("2 d ago", Words.ago(NOW - 2 * 86_400_000L, NOW));
+    assertEquals("in 2 min", Words.until(NOW + 2 * 60_000, NOW));
+    assertEquals("now", Words.until(NOW - 1, NOW));
+  }
+
+  @Test
+  public void aLabelIsOneTheFacilityTakes() {
+    assertEquals("Pixel 9 Pro", Words.label("Pixel 9 Pro"));
+    assertEquals("FP6 a b", Words.label("FP6 (a/b)"));
+    assertEquals("phone", Words.label("…"));
+    assertEquals("phone", Words.label(null));
+    StringBuilder longer = new StringBuilder();
+    for (int i = 0; i < 100; i++) {
+      longer.append('x');
+    }
+    assertEquals(Words.MAX_LABEL, Words.label(longer.toString()).length());
+  }
+
+  @Test
+  public void aContestIsReadFromTheDetail() {
+    assertTrue(Words.contested("by device 2, contested"));
+    assertFalse(Words.contested("by device 2"));
+    assertFalse(Words.contested("by the kit"));
+    assertFalse(Words.contested(null));
+  }
+
+  @Test
+  public void aRefusalSaysWhy() {
+    assertEquals("the slot expired", Words.refusal(ErrorCode.REFUSED, "the slot expired"));
+    assertEquals("declined", Words.refusal(ErrorCode.DECLINED, ""));
+    assertEquals("refused (13)", Words.refusal(ErrorCode.REFUSED, null));
+  }
+
+  @Test
+  public void aHandleIsShortened() {
+    byte[] handle = new byte[32];
+    handle[0] = (byte) 0xab;
+    handle[31] = (byte) 0xcd;
+    assertEquals("ab000000…000000cd", Words.shortHex(handle));
+  }
+}

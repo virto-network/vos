@@ -1,0 +1,568 @@
+// SPDX-FileCopyrightText: 2026 Virto
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+//! The facility against the world's space over its Tor client: enrollment
+//! pins what the chrome showed, the space's onions among it; a sign-in
+//! proves on the path the tree's feed gave, and the facility sends the
+//! proof over Tor itself, the server answered the node's answer; a payment
+//! pays what the chrome confirmed, whatever the server pre-filled; requests
+//! naming what was not pinned are refused; and every proof and read is a
+//! connection's own, none of them on the clearnet.
+
+mod common;
+
+use common::*;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn enroll_sign_in_and_pay_as_the_chrome_confirmed() {
+    let world = world();
+    let directory = tempfile::tempdir().unwrap();
+    let source = Arc::new(Software {
+        key: [9; 32],
+        uses: Mutex::new(0),
+    });
+    let facility = facility(
+        &world,
+        directory.path(),
+        Arc::clone(&source) as Arc<dyn Source>,
+    );
+    let session = facility.session(gateway());
+    let chrome = Scripted::default();
+
+    // Enrollment: what the chrome showed is pinned, and the digests are the
+    // secret's.
+    chrome.will(confirm(&[]));
+    chrome.will(confirm(&[]));
+    let enrolled = session.ask("enroll", &enrollment(), &chrome).await.unwrap();
+    let digests = chrome.last();
+    let shown = chrome.shown.lock().unwrap()[0].clone();
+    assert_eq!(shown.choices, vec!["Use this phone's lock"]);
+    assert!(
+        shown
+            .rows
+            .iter()
+            .any(|(_, value)| value.contains("vote (once in scope “vote”)"))
+    );
+    let output = {
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&[9; 32]).unwrap();
+        mac.update(&vos_light::source_input(&HANDLE));
+        let output: [u8; 32] = mac.finalize().into_bytes().into();
+        output
+    };
+    let secret = vos_light::derive_secret(&output, &HANDLE);
+    let member = vos_light::member(&secret).to_bytes();
+    assert_eq!(bytes(field(&enrolled, "member")), member.to_vec());
+    assert_eq!(
+        bytes(field(&enrolled, "owner")),
+        vos_light::owner(&secret).to_bytes().to_vec()
+    );
+    assert_eq!(digests.rows[0], ("Member".to_owned(), hex::encode(member)));
+    world.enroll(AGENT, &member);
+    session.granted();
+
+    // A different enrollment for the same server is refused.
+    let mut other = enrollment();
+    if let Value::Map(map) = &mut other {
+        *map.get_mut("space").unwrap() = Value::Bytes(vec![0x52; 32]);
+    }
+    let refused = session.ask("enroll", &other, &chrome).await.unwrap_err();
+    assert_eq!(refused.code, Code::NotPinned);
+
+    // The tree arrives apart, from its feed; a sign-in proves on it.
+    let login = object(&[
+        ("agent", Value::from(AGENT)),
+        ("instance", Value::from(POLL)),
+        ("method", Value::from("login")),
+        ("arguments", Value::Bytes(Vec::new())),
+    ]);
+    let signed = loop {
+        chrome.will(confirm(&[]));
+        match session.ask("sign_in", &login, &chrome).await {
+            Ok(signed) => break signed,
+            Err(error) if error.code == Code::NoPath => {
+                chrome.answers.lock().unwrap().clear();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => panic!("{error:?}"),
+        }
+    };
+    assert!(chrome.last().notice.is_none(), "login spends nothing");
+    assert!(matches!(
+        Response::decode_exact(&bytes(field(&signed, "answer"))),
+        Some(Response::Ran {
+            outcome: Outcome::Done(_),
+            ..
+        })
+    ));
+    let (agent, request) = world.last_credentialed();
+    assert_eq!(agent, AgentId(AGENT));
+    assert_eq!(request.method.0, vos_light::method_id("login"));
+    verified(&request, agent, &Stock::embedded().auth, Some(b"login"));
+    assert!(matches!(
+        field(&signed, "proving_ms"),
+        Value::Integer(Integer::Unsigned(_))
+    ));
+
+    // A `once` guard is named for what it spends; declining proves nothing.
+    let vote = object(&[
+        ("agent", Value::from(AGENT)),
+        ("instance", Value::from(POLL)),
+        ("method", Value::from("vote")),
+        ("arguments", Value::Bytes(Vec::new())),
+    ]);
+    let uses = *source.uses.lock().unwrap();
+    chrome.will(Answer::Declined);
+    let declined = session.ask("sign_in", &vote, &chrome).await.unwrap_err();
+    assert_eq!(declined.code, Code::Declined);
+    let shown = chrome.last();
+    assert!(shown.title.contains("one vote"));
+    assert!(
+        shown
+            .notice
+            .unwrap()
+            .contains("one admission in the scope “vote”")
+    );
+    assert_eq!(
+        *source.uses.lock().unwrap(),
+        uses,
+        "no source use when declined"
+    );
+
+    // What was not pinned is refused before any chrome.
+    let forms = chrome.shown.lock().unwrap().len();
+    for (agent, instance, name) in [
+        (AGENT, POLL, "vote_again"),
+        (AGENT + 1, POLL, "login"),
+        (AGENT, PAYMENTS, "login"),
+        (AGENT, POLL, "transfer"),
+    ] {
+        let request = object(&[
+            ("agent", Value::from(agent)),
+            ("instance", Value::from(instance)),
+            ("method", Value::from(name)),
+            ("arguments", Value::Bytes(Vec::new())),
+        ]);
+        let refused = session.ask("sign_in", &request, &chrome).await.unwrap_err();
+        assert_eq!(refused.code, Code::NotPinned, "{name}");
+    }
+    let transfer_as_sign_in = object(&[
+        ("agent", Value::from(AGENT)),
+        ("instance", Value::from(POLL)),
+        ("method", Value::from("login")),
+        ("payee", Value::from("shop")),
+        ("amount", Value::from(1u64)),
+    ]);
+    let refused = session
+        .ask("pay", &transfer_as_sign_in, &chrome)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, Code::NotPinned);
+    assert_eq!(chrome.shown.lock().unwrap().len(), forms);
+
+    // A hostile pre-fill: the server asks for 500 to "mallory"; the user
+    // confirms 20 to "shop", after a first answer the form refuses.
+    let pay = object(&[
+        ("agent", Value::from(AGENT)),
+        ("instance", Value::from(PAYMENTS)),
+        ("method", Value::from("transfer")),
+        ("payee", Value::from("mallory")),
+        ("amount", Value::from(500u64)),
+    ]);
+    chrome.will(confirm(&["shop", "twenty"]));
+    chrome.will(confirm(&[" shop ", "20"]));
+    let paid = session.ask("pay", &pay, &chrome).await.unwrap();
+    let forms = chrome.shown.lock().unwrap().clone();
+    let (first, second) = (&forms[forms.len() - 2], &forms[forms.len() - 1]);
+    assert_eq!(
+        first
+            .fields
+            .iter()
+            .map(|field| field.value.as_str())
+            .collect::<Vec<_>>(),
+        vec!["mallory", "500"],
+        "the pre-fill, shown to be changed"
+    );
+    assert!(second.notice.as_ref().unwrap().contains("whole number"));
+    assert!(
+        first
+            .rows
+            .iter()
+            .any(|(label, value)| label == "From" && value == "this device's account")
+    );
+    let (agent, request) = world.last_credentialed();
+    assert_eq!(
+        request.arguments,
+        (b"shop".to_vec(), 20u64).encode(),
+        "what the chrome confirmed, not what the server asked"
+    );
+    assert_eq!(request.method.0, vos_light::method_id("transfer"));
+    verified(&request, agent, &Stock::embedded().owner, None);
+    assert_eq!(field(&paid, "payee"), &Value::from("shop"));
+    assert_eq!(field(&paid, "amount"), &Value::from(20u64));
+
+    // The same payment asked again while its proof may still run is that
+    // proof again, so it runs once; another amount is a new proof.
+    chrome.will(confirm(&["shop", "20"]));
+    session.ask("pay", &pay, &chrome).await.unwrap();
+    assert_eq!(world.last_credentialed().1, request, "sent again as it was");
+    chrome.will(confirm(&["shop", "21"]));
+    session.ask("pay", &pay, &chrome).await.unwrap();
+    assert_ne!(world.last_credentialed().1, request);
+
+    // A once-guarded call with arguments the chrome cannot read is refused.
+    let ballot = object(&[
+        ("agent", Value::from(AGENT)),
+        ("instance", Value::from(POLL)),
+        ("method", Value::from("vote")),
+        ("arguments", Value::Bytes(vec![2])),
+    ]);
+    let refused = session.ask("sign_in", &ballot, &chrome).await.unwrap_err();
+    assert_eq!(refused.code, Code::Arguments);
+
+    // A `refresh` makes the feed due again at a drawn delay (at most the
+    // refresh's 5 s and the keeper's 10 s), honoured once in a while
+    // whoever asks: a read follows, on the feed's connection.
+    let feeds = world.feed_reads();
+    session.ask("refresh", &Value::Null, &chrome).await.unwrap();
+    let until = std::time::Instant::now() + Duration::from_secs(20);
+    while world.feed_reads() == feeds && std::time::Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(world.feed_reads() > feeds);
+
+    // Another server asking to enroll the same space is refused.
+    let elsewhere = facility.session(s4_credential::Gateway {
+        fingerprint: "SHA256:elsewhere".into(),
+        ..gateway()
+    });
+    let refused = elsewhere
+        .ask("enroll", &enrollment(), &chrome)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, Code::NotPinned);
+
+    // Every connection is its own circuit under its own SSH key, all to
+    // the space's onion; each proof went on a connection that carried
+    // nothing else.
+    let seen = world.state.lock().unwrap().seen.clone();
+    assert!(
+        seen.iter()
+            .all(|seen| matches!(seen.target, vos_light::tor::Target::Onion { .. }))
+    );
+    for (at, one) in seen.iter().enumerate() {
+        for other in &seen[..at] {
+            assert_ne!(one.circuit, other.circuit);
+            assert_ne!(one.key, other.key);
+        }
+    }
+    for proof in seen.iter().filter(|seen| {
+        seen.requests
+            .iter()
+            .any(|(kind, _)| *kind == ApiKind::Credentialed as u16)
+    }) {
+        assert!(
+            proof
+                .requests
+                .iter()
+                .all(|(kind, _)| *kind == ApiKind::Credentialed as u16),
+            "{proof:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nothing_is_proved_before_enrollment_or_for_an_unknown_operation() {
+    let world = world();
+    let directory = tempfile::tempdir().unwrap();
+    let facility = facility(
+        &world,
+        directory.path(),
+        Arc::new(Software {
+            key: [9; 32],
+            uses: Mutex::new(0),
+        }),
+    );
+    let session = facility.session(gateway());
+    let chrome = Scripted::default();
+    let login = object(&[
+        ("agent", Value::from(AGENT)),
+        ("instance", Value::from(POLL)),
+        ("method", Value::from("login")),
+        ("arguments", Value::Bytes(Vec::new())),
+    ]);
+    let error = session.ask("sign_in", &login, &chrome).await.unwrap_err();
+    assert_eq!(error.code, Code::NotEnrolled);
+    let error = session
+        .ask("export", &Value::Null, &chrome)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::Operation);
+    chrome.will(Answer::Declined);
+    let error = session
+        .ask("enroll", &enrollment(), &chrome)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::Declined);
+    assert!(
+        std::fs::read_dir(directory.path()).map_or(true, |entries| entries.flatten().all(
+            |entry| entry
+                .path()
+                .extension()
+                .is_none_or(|extension| extension != "toml")
+        ))
+    );
+}
+
+struct Phone;
+
+impl s4_credential::node::Device for Phone {
+    fn kinds(&self) -> Vec<Kind> {
+        vec![Kind::Keystore]
+    }
+}
+
+/// The s4 session's stream to a gateway's onion goes over Tor, on a
+/// circuit of its own: the world's gateway answers it with its SSH banner.
+#[test]
+fn a_stream_to_an_onion_goes_over_tor() {
+    use std::io::Read as _;
+
+    let world = world();
+    let directory = tempfile::tempdir().unwrap();
+    let node = node(&world, directory.path(), Arc::new(Phone));
+    let mut stream = node
+        .open_stream(s4_credential::StreamTarget {
+            host: world::address(&world, 1).to_ascii_uppercase(),
+            port: 22,
+        })
+        .unwrap();
+    let mut banner = [0; 8];
+    stream.read_exact(&mut banner).unwrap();
+    assert_eq!(&banner, b"SSH-2.0-");
+    let seen = world.state.lock().unwrap().seen.clone();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        world::onion_of(&seen[0].target),
+        Some(world::address(&world, 1))
+    );
+    let refused = node
+        .open_stream(s4_credential::StreamTarget {
+            host: "nowhere.onion".into(),
+            port: 22,
+        })
+        .unwrap_err();
+    assert_eq!(refused.code, Code::Api);
+}
+
+/// A client whose user confirms everything, its key in memory.
+struct Confirming;
+
+impl s4_credential::node::Prompts for Confirming {
+    fn confirm(&self, _: s4_credential::Form) -> Answer {
+        Answer::Confirmed {
+            choice: 0,
+            values: Vec::new(),
+        }
+    }
+
+    fn create_key(&self, _: Kind) -> s4_credential_contract::KeyAnswer {
+        s4_credential_contract::KeyAnswer::Done(b"vos.device.screens".to_vec().into())
+    }
+
+    fn evaluate_key(
+        &self,
+        _: Kind,
+        _: &[u8],
+        input: &[u8; 32],
+    ) -> s4_credential_contract::KeyAnswer {
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&[9; 32]).unwrap();
+        mac.update(input);
+        s4_credential_contract::KeyAnswer::Done(mac.finalize().into_bytes().to_vec().into())
+    }
+
+    fn sign_key(&self, _: Kind, _: &[u8], _: &[u8]) -> s4_credential_contract::KeyAnswer {
+        s4_credential_contract::KeyAnswer::Declined
+    }
+}
+
+/// s4's screens with an enrolled space's gateway go over its onion, on a
+/// circuit of their own, between the UI's end of a socket pair and the
+/// onion's port 22, whose host key is answered for the UI to pin; once
+/// the user opted the space out, over its clearnet port. The gateway's
+/// name matches in any case and with its root's dot; a gateway no space
+/// was enrolled through is the UI's own to reach. The app going to
+/// the background ends the session.
+#[test]
+fn the_screens_go_over_the_spaces_onion_or_its_opt_out() {
+    use std::io::Read as _;
+    use std::os::fd::OwnedFd;
+
+    let world = world();
+    let directory = tempfile::tempdir().unwrap();
+    let node = node(&world, directory.path(), Arc::new(Phone));
+    // The app in the foreground: a dormant client closes the screens.
+    node.foreground(true);
+    let session = node.open_session(s4_credential::Gateway {
+        host_key: Some(ssh_host_key()),
+        ..gateway()
+    });
+    node.enroll(
+        session,
+        s4_credential::Enroll::read(&enrollment()).unwrap(),
+        Arc::new(Confirming),
+    )
+    .unwrap();
+    let screens = |host: &str| {
+        let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let target = s4_credential::StreamTarget {
+            host: host.into(),
+            port: gateway().port,
+        };
+        node.screens(target, OwnedFd::from(theirs)).inspect(|_| {
+            let mut banner = [0; 8];
+            ours.read_exact(&mut banner).unwrap();
+            assert_eq!(&banner, b"SSH-2.0-");
+        })
+    };
+    let before = world.state.lock().unwrap().seen.len();
+    assert_eq!(
+        screens("GATEWAY.test").unwrap(),
+        world.onion(1).ssh_host_key
+    );
+    // The screens' stream among any the background job dialled meanwhile:
+    // to the onion, on a circuit no earlier stream took.
+    let seen = world.state.lock().unwrap().seen.clone();
+    assert!(
+        seen[before..].iter().any(|stream| {
+            world::onion_of(&stream.target) == Some(world::address(&world, 1))
+                && seen[..before]
+                    .iter()
+                    .all(|other| other.circuit != stream.circuit)
+        }),
+        "the onion's port, on a circuit of its own"
+    );
+    assert_eq!(
+        screens("elsewhere.test").unwrap_err().code,
+        Code::NotEnrolled
+    );
+    assert_eq!(
+        screens("gateway.test.").unwrap(),
+        world.onion(1).ssh_host_key,
+        "the gateway's name with its root's dot"
+    );
+    node.opt_out(HANDLE, true).unwrap();
+    assert_eq!(screens("gateway.test").unwrap(), ssh_host_key());
+    let seen = world.state.lock().unwrap().seen.clone();
+    assert_eq!(
+        world::onion_of(&seen.last().unwrap().target),
+        None,
+        "the clearnet"
+    );
+    // Dormant, the client closes the screens.
+    let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    node.screens(
+        s4_credential::StreamTarget {
+            host: "gateway.test".into(),
+            port: gateway().port,
+        },
+        OwnedFd::from(theirs),
+    )
+    .unwrap();
+    node.foreground(false);
+    // Past the timeout the read fails: a session carried on is no end.
+    ours.set_read_timeout(Some(std::time::Duration::from_secs(60)))
+        .unwrap();
+    let mut rest = Vec::new();
+    ours.read_to_end(&mut rest).unwrap();
+    assert!(rest.len() < 256, "ended, not carried on");
+}
+
+/// Two spaces enrolled through one gateway, one of them opted out of Tor:
+/// s4's screens with that gateway go over the other's onion, never the
+/// opted-out one's clearnet port; with both opted out, its clearnet port.
+/// A gateway presenting the host key a space pinned to its onion is that
+/// space's however its name or port is written: s4's own connection to it
+/// is refused while any space's routes take the onion, and allowed once
+/// none do.
+#[test]
+fn the_onion_is_preferred_and_a_gateway_spelled_otherwise_is_refused() {
+    use std::io::Read as _;
+    use std::os::fd::OwnedFd;
+
+    const OTHER: u32 = 6;
+    const OTHER_HANDLE: [u8; 32] = [0x43; 32];
+    let world = world();
+    world.space_at(OTHER, [0x1e; 32], OTHER_HANDLE, [0x52; 32], 2);
+    let directory = tempfile::tempdir().unwrap();
+    let node = node(&world, directory.path(), Arc::new(Phone));
+    node.foreground(true);
+    // Two applications at one gateway, a space each.
+    for (application, enrollment) in [
+        ("vos.test", enrollment()),
+        (
+            "vos.other",
+            enrollment_at(OTHER_HANDLE, [0x52; 32], OTHER, [0x1e; 32], 2),
+        ),
+    ] {
+        let session = node.open_session(s4_credential::Gateway {
+            host_key: Some(ssh_host_key()),
+            application: application.into(),
+            ..gateway()
+        });
+        node.enroll(
+            session,
+            s4_credential::Enroll::read(&enrollment).unwrap(),
+            Arc::new(Confirming),
+        )
+        .unwrap();
+        node.close(session);
+    }
+    let screens = || {
+        let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let target = s4_credential::StreamTarget {
+            host: "gateway.test".into(),
+            port: gateway().port,
+        };
+        let key = node.screens(target, OwnedFd::from(theirs)).unwrap();
+        let mut banner = [0; 8];
+        ours.read_exact(&mut banner).unwrap();
+        assert_eq!(&banner, b"SSH-2.0-");
+        let last = world
+            .state
+            .lock()
+            .unwrap()
+            .seen
+            .last()
+            .unwrap()
+            .target
+            .clone();
+        (key, world::onion_of(&last))
+    };
+    let (key, onion) = screens();
+    assert_eq!(key, world.onion(1).ssh_host_key);
+    assert!(onion.is_some(), "an onion");
+    // The first opted out: the second's onion, not the first's clearnet.
+    node.opt_out(HANDLE, true).unwrap();
+    for _ in 0..3 {
+        let (_, onion) = screens();
+        assert_eq!(onion, Some(world::address(&world, 2)), "the other's onion");
+    }
+    // The key the spaces pinned, presented to s4's own connection under any
+    // name: refused while the second keeps the onion.
+    let refused = node.clearnet(ssh_host_key()).unwrap_err();
+    assert_eq!(refused.code, Code::Refused);
+    assert!(
+        refused.message.contains("gateway.test:2222"),
+        "{}",
+        refused.message
+    );
+    assert!(node.clearnet(world.onion(2).ssh_host_key).is_err());
+    assert!(node.clearnet([0x99; 32]).is_ok(), "another gateway's key");
+    // Both opted out: the clearnet port, and s4's own connection allowed.
+    node.opt_out(OTHER_HANDLE, true).unwrap();
+    let (key, onion) = screens();
+    assert_eq!((key, onion), (ssh_host_key(), None));
+    node.clearnet(ssh_host_key()).unwrap();
+    node.opt_out(HANDLE, false).unwrap();
+    assert!(node.clearnet(ssh_host_key()).is_err(), "back on Tor");
+}
