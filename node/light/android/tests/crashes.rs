@@ -136,6 +136,7 @@ fn world_with_slots(slot_ttl_ms: u64) -> Arc<World> {
 #[test]
 fn a_pairing_with_its_joiner_killed_at_any_step_ends_paired() {
     const SLOT_MS: u64 = 12_000;
+    const WAIT_MS: u64 = 8_000;
     let trace = {
         let world = world_with_slots(SLOT_MS);
         let home = world.home(HOME, 2, 1);
@@ -153,8 +154,10 @@ fn a_pairing_with_its_joiner_killed_at_any_step_ends_paired() {
         let first = phone(&world, 1);
         let second = phone(&world, 2);
         first.claim(&world, home, KitKind::Phrase, "first");
+        // Each wait well inside the slot, and long enough that a loaded
+        // host's commit is confirmed within it.
         for phone in [&first, &second] {
-            phone.node.set_wait(4_000).unwrap();
+            phone.node.set_wait(WAIT_MS).unwrap();
         }
         world.kill(2, step, nth, death);
         let code = first.node.pair_offer(&*first.hand).unwrap();
@@ -163,7 +166,7 @@ fn a_pairing_with_its_joiner_killed_at_any_step_ends_paired() {
             let cut = second.node.pair_join(&code.code, "second", &*second.hand);
             assert!(world.died(2), "{at}: not reached: {cut:?}");
             let second = second.restart(&world);
-            second.node.set_wait(4_000).unwrap();
+            second.node.set_wait(WAIT_MS).unwrap();
             // Its pass puts an acknowledgement its last process kept.
             let _ = second.node.sync_personal();
             // A pairing cut short before its hello is cancelled by the user;
