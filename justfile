@@ -414,7 +414,7 @@ android-facility out="target/android/maven":
         error make { msg: $"($failures | length) JNI binding failures" }
     }
     print $"($checked) native methods bound to libvos_facility.so"
-    ^$"($s4)/client/android/gradlew" -p node/light/android/aar $"-Ps4=($s4)" $"-PjniLibs=($jni)" $"-Prepository=($out)" testReleaseUnitTest publish
+    ^$"($s4)/client/android/gradlew" -p node/light/android/aar $"-Ps4=($s4)" $"-PjniLibs=($jni)" $"-Prepository=($out)" testDebugUnitTest publish
     print $"team.virto.vos:facility in ($out); in s4: just android-build-vos ($out)"
 
 # The default agent as a service on a local PolkaJam testnet, which it
