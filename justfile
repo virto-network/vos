@@ -199,7 +199,7 @@ export MIMALLOC_ALLOW_THP := "0"
 # Formatting: the workspace's, and each crate's it excludes.
 fmt-check:
     cargo fmt --all -- --check
-    for manifest in ([agent/default agent/representative agent/credentials agent/personal agent/payments agent/homes agent/credential-book agent/device-book agent/test-actors pvm/bench/guests pvm/proof/fuzz pvm/proof/final-verifier/wasm node/gateway/demo] | each {|dir| glob $'($dir)/**/Cargo.toml' --exclude ['**/target/**'] } | flatten | where {|manifest| open --raw $manifest | str contains '[package]' }) { cargo fmt --manifest-path $manifest -- --check }
+    for manifest in ([agent/default agent/representative agent/credentials agent/personal agent/payments agent/homes agent/credential-book agent/device-book agent/test-actors pvm/bench/guests pvm/proof/fuzz pvm/proof/final-verifier/wasm node/gateway/demo node/light/android] | each {|dir| glob $'($dir)/**/Cargo.toml' --exclude ['**/target/**'] } | flatten | where {|manifest| open --raw $manifest | str contains '[package]' }) { cargo fmt --manifest-path $manifest -- --check }
 
 # The docs' links: none broken, and none from a public doc to a private
 # item.
@@ -342,6 +342,80 @@ test-gateway-ssh: build-test-actors build-agent build-credentials build-payments
     cargo test -p vos-gateway --features ssh --ignore-rust-version
     cargo clippy --manifest-path node/gateway/demo/Cargo.toml --ignore-rust-version --all-targets --quiet -- -D warnings
     cargo test --manifest-path node/gateway/demo/Cargo.toml --ignore-rust-version --lib --bins --test e2e --test home
+
+# The `vos.credential` facility (`node/light/android`, outside the
+# workspace: s4's crates ask a newer Rust than the workspace's nightly,
+# which builds them with `--ignore-rust-version`): its lints and its
+# suites with the `android` feature, as the app's `:vos` process builds
+# it; among them `tests/release.rs`, which holds the release artifacts it
+# embeds to this tree's guests.
+test-facility: build-agent build-credentials build-personal build-credential-book build-device-book
+    cargo clippy --manifest-path node/light/android/Cargo.toml --features android --ignore-rust-version --all-targets --quiet -- -D warnings
+    cargo test --manifest-path node/light/android/Cargo.toml --features android --ignore-rust-version
+
+# The facility's release artifacts (`node/light/android/release`) written
+# anew from this tree's guests: the stock kernels' (`auth.device`,
+# `owner.device`, from the credential actor), the default agent's program,
+# linked, and the light node's local actors' packages. After a change that
+# moves a guest, which `test-facility` then fails on.
+facility-release: build-agent build-credentials build-credential-book build-device-book
+    cargo run --manifest-path node/light/android/Cargo.toml --ignore-rust-version --example release
+
+# The facility's Android library, for s4's `-Ps4Vos` build: the facility's
+# native library for ARM64 (the NDK s4 builds with, Android 11 and later),
+# its `:vos` process and the personal space's screens, compiled against
+# the credential contract's UI side of the s4 checkout the facility's crate
+# names, and published to the local Maven repository `out`
+# (`team.virto.vos:facility`). Each `native` method of its classes is
+# checked against the library's exports, as s4's `android-jni` checks its
+# own. Then, in s4: `just android-build-vos <out>`.
+android-facility out="target/android/maven":
+    #!/usr/bin/env nu
+    let sdk = ($env.ANDROID_HOME? | default ($env.ANDROID_SDK_ROOT? | default "/opt/android-sdk"))
+    $env.ANDROID_HOME = $sdk
+    $env.ANDROID_NDK_HOME = $"($sdk)/ndk/28.2.13676358"
+    $env.JAVA_HOME = ($env.S4_ANDROID_JAVA_HOME? | default ($env.JAVA_HOME? | default "/usr/lib/jvm/java-17-openjdk"))
+    let manifest = "node/light/android/Cargo.toml"
+    let contract = (cargo metadata --manifest-path $manifest --format-version 1 | from json | get packages | where name == "s4-credential-contract" | get manifest_path.0)
+    let s4 = ($contract | path dirname | path dirname)
+    let jni = ("target/android/jni" | path expand)
+    let out = ("{{out}}" | path expand)
+    cargo ndk -t arm64-v8a -P 30 -o $jni build --manifest-path $manifest --lib --release --features android --ignore-rust-version
+    let nm = $"($env.ANDROID_NDK_HOME)/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+    let exported = (^$nm -D --defined-only $"($jni)/arm64-v8a/libvos_facility.so" | lines | each {|line| $line | split row " " | last })
+    let mangle = {|name| $name | str replace --all "_" "_1" }
+    mut failures = []
+    mut checked = 0
+    for file in (glob node/light/android/aar/src/main/java/**/*.java) {
+        let source = (open --raw $file)
+        let natives = ($source | parse --regex '\bnative\s+[\w<>\[\]]+\s+(?<method>\w+)\s*\(' | get method)
+        if ($natives | is-empty) { continue }
+        let package = ($source | parse --regex 'package\s+(?<name>[\w.]+)\s*;' | get name.0)
+        let class = ($file | path parse | get stem)
+        let constants = ($source | parse --regex 'static final String (?<id>\w+) = "(?<value>[^"]+)"')
+        let loads = ($source | parse --regex 'System\.loadLibrary\((?<arg>[^)]*)\)' | get arg | each {|arg|
+            if ($arg | str starts-with '"') { $arg | str trim --char '"' } else { $constants | where id == $arg | get -o value.0 }
+        } | compact | uniq)
+        if $loads != ["vos_facility"] {
+            $failures = ($failures | append $"($class) declares native methods but loads ($loads | str join ', '), not vos_facility")
+            continue
+        }
+        let prefix = $"Java_($package | split row '.' | each {|part| do $mangle $part } | str join '_')_(do $mangle $class)_"
+        for method in $natives {
+            $checked = $checked + 1
+            if $"($prefix)(do $mangle $method)" not-in $exported {
+                $failures = ($failures | append $"($class).($method) is not exported by libvos_facility.so")
+            }
+        }
+    }
+    if $checked == 0 { error make { msg: "no native methods found: the check reads nothing" } }
+    if not ($failures | is-empty) {
+        $failures | each {|failure| print -e $failure }
+        error make { msg: $"($failures | length) JNI binding failures" }
+    }
+    print $"($checked) native methods bound to libvos_facility.so"
+    ^$"($s4)/client/android/gradlew" -p node/light/android/aar $"-Ps4=($s4)" $"-PjniLibs=($jni)" $"-Prepository=($out)" testReleaseUnitTest publish
+    print $"team.virto.vos:facility in ($out); in s4: just android-build-vos ($out)"
 
 # The default agent as a service on a local PolkaJam testnet, which it
 # starts and stops: a workflow suspended in one work package and resumed in
@@ -713,6 +787,7 @@ check: fmt-check doc-check check-venue-rules check-no-std check-no-leaks check-n
     cargo test {{agent_crates}}
     just test-gateway-onion
     just test-light-tor
+    just test-facility
     just test-reads
 
 # The live runs of reads at a cut on the agent's model, with no proving:

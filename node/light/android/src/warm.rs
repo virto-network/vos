@@ -126,7 +126,7 @@ impl Warming {
         let cancelled = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&cancelled);
         let thread = std::thread::Builder::new()
-            .name("s4-credential-warm".into())
+            .name("vos-facility-warm".into())
             .spawn(move || {
                 lower_priority();
                 work(&flag);

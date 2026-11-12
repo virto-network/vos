@@ -1,7 +1,7 @@
-# s4-credential
+# vos-facility
 
-The `vos.credential` client facility: a member of a [VOS](https://codeberg.org/Virto/VOS)
-space proves on its own device that it is a member (to sign in) or that it
+The `vos.credential` client facility for [s4](https://codeberg.org/Virto/s4):
+a member of a VOS space proves on its own device that it is a member (to sign in) or that it
 holds a ledger account (to pay), and the s4 server that asked only relays what
 the device made. The proofs are VOS's light node's device library's (`vos-light`); this
 crate is the facility around it: the operations a server calls, the
@@ -9,10 +9,13 @@ trusted-chrome forms the user answers, the enrollment the device keeps, the
 Tor client every request to a space goes through, and the device's personal
 space.
 
-It is an external facility (`vos.`, not `s4.`): a client build registers it and
-the server registers it beside its built-in ones (`Server::facility`). The
-client offers it only where the device has a secret source; on Android that
-is Android 11 (API 30) or later.
+It is an external facility (`vos.`, not `s4.`): s4's client hosts it behind
+s4's credential contract (`s4-credential-contract`, its Binder interface
+and its UI side, which s4 keeps), and the server registers it beside its
+built-in ones (`Server::facility`). The client offers it only where the
+device has a secret source; on Android that is Android 11 (API 30) or
+later. This crate depends on s4's crates by git revision; s4 depends on
+nothing of VOS.
 
 ## Operations
 
@@ -27,10 +30,11 @@ Every proof is a run of one of VOS's stock kernels, `auth` for a sign-in and
 `owner` for a payment, proved under VOS's device format
 (`vos_light::DEVICE_FORMAT`) against the program the kernel's release artifact
 names, which the binding names too. The artifacts (`release/*.device`) are
-built from the credential actor of the VOS revision this crate pins and
-embedded in it (`Stock`); a server never sends a kernel, so the secret enters
-only the stock kernels. `just vos-release VOS` writes them anew from a VOS
-checkout at that revision. A proof takes up to about 0.7 GiB on a phone.
+built from this tree's credential actor and embedded in the crate (`Stock`);
+a server never sends a kernel, so the secret enters only the stock kernels.
+`just facility-release` writes them anew, and `tests/release.rs` fails while
+they are not this tree's guests'. A proof is allowed the device budget,
+`vos_light::PEAK_BYTES` (1 GiB).
 
 A stock kernel's program is computed once and kept while an enrollment's
 guard proves with it: in the background, at a low priority, when the
@@ -47,9 +51,9 @@ two prompts; the grant never stands in for a confirmation.
 ## Its own process
 
 On Android the facility runs in the app's `:vos` process
-(`android:process=":vos"`), which loads `libs4_credential.so`; the UI process
+(`android:process=":vos"`), which loads `libvos_facility.so`; the UI process
 never does. The UI reaches it through one Binder interface, `IVosNode`
-(`client/android/app/src/main/aidl/team/virto/s4/vos`), whose Rust form is
+(s4's `credential-contract/aidl/team/virto/s4/vos`), whose Rust form is
 `s4-credential-contract`: the operations above by name, each with its typed
 request and result, a refusal the operation's `out Refusal` (its code the
 contract's `Code`), and nothing generic. A proved request never crosses:
@@ -91,8 +95,8 @@ key, regroup, a commit now); the yearly re-proof; a restore from the kit; a
 move home. Each admin call is signed by the admin key, an Ed25519 key in the
 UI's Keystore behind a strong biometric (`IVosPrompts.signKey`). The light
 node's artifacts (`release/agent.program`, `release/*-book.package`) are
-embedded, and `tests/programs/personal.package` is the personal agent the
-tests run in process; `just vos-release VOS` writes them all. A local actor
+embedded, `just facility-release` writes them with the stock kernels', and
+the tests run this tree's personal agent in process. A local actor
 installed at an earlier release than the app carries is upgraded in place.
 
 What the device keeps beside the light node is `personal.state`, versioned:
@@ -143,10 +147,20 @@ drawn delay. The node's time is read before an expiry is picked.
 
 ## Building
 
-VOS's prover needs its own nightly, pinned in this directory's
-`rust-toolchain.toml`; the crate is outside s4's workspace so the stable gate
-never builds it. `just vos` (from the repository root) lints and tests it, and
-`just android-build-vos` builds the APK with it beside the client's library,
-for the `:vos` process to load.
+The crate is outside VOS's workspace: s4's crates ask a newer Rust than the
+workspace's nightly, which builds them with `--ignore-rust-version`. From
+the repository's root:
+
+- `just test-facility`: its lints and its suites with the `android`
+  feature, the release artifacts held to this tree's guests among them
+  (part of `just check`);
+- `just facility-release`: the release artifacts written anew;
+- `just android-facility [out]`: the Android library (`aar/`,
+  `team.virto.vos:facility`) published to the local Maven repository
+  `out` (`target/android/maven`): the `:vos` process (`team.virto.s4.vos`),
+  the personal space's screens (`team.virto.s4.personal`) and
+  `libvos_facility.so` for ARM64, compiled against the credential
+  contract's UI side of the s4 checkout this crate names. s4's
+  `just android-build-vos <out>` then builds the APK with it.
 
 License: AGPL-3.0-or-later.

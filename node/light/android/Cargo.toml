@@ -1,45 +1,47 @@
 [package]
-name = "s4-credential"
+name = "vos-facility"
 version = "0.1.0"
-description = "The vos.credential client facility: a VOS member's device credential, enrolled, kept and proved on the device for an s4 server that asks."
+description = "The vos.credential client facility: a VOS member's device credential, enrolled, kept and proved on the device for an s4 server that asks, and the device's personal space."
 edition = "2024"
 license = "AGPL-3.0-or-later"
-repository = "https://codeberg.org/Virto/s4"
-homepage = "https://codeberg.org/Virto/s4"
+repository = "https://codeberg.org/Virto/VOS"
 readme = "README.md"
 publish = false
 
-# Outside the workspace: VOS's prover builds on its own nightly, pinned in
-# this directory's `rust-toolchain.toml`, never on s4's stable toolchain.
+# Outside VOS's workspace: s4's crates ask a newer Rust than the
+# workspace's nightly, which builds them with `--ignore-rust-version`
+# (`just test-facility`), so `cargo clippy --workspace` never resolves them.
 [workspace]
 
 # The prover's dependencies optimized even in tests, which prove.
 [profile.dev.package."*"]
 opt-level = 3
 
-# The C ABI build (`ffi`) is the shared library the client loads.
+# The C ABI build is the shared library the app's `:vos` process loads,
+# `libvos_facility.so`.
 [lib]
 crate-type = ["rlib", "cdylib"]
 
 [features]
-# `libs4_credential.so` as the app's `:vos` process loads it: the facility
+# `libvos_facility.so` as the app's `:vos` process loads it: the facility
 # on a runtime of its own behind the Binder interface's JNI, its chrome and
 # its secret sources the UI process's, reached through the interface.
 android = ["dep:jni", "s4-credential-contract/jni", "tokio/rt-multi-thread"]
 
 [dependencies]
-s4-protocol = { path = "../protocol", version = "=0.1.0" }
-s4-credential-contract = { path = "../credential-contract", version = "=0.1.0" }
+# The facility's protocol and its Binder contract: s4's, by git revision,
+# as the gateway names s4-server.
+s4-protocol = { git = "https://codeberg.org/Virto/s4", rev = "44089556b23d6bbfa601209a595e6d82a3893c5e" }
+s4-credential-contract = { git = "https://codeberg.org/Virto/s4", rev = "44089556b23d6bbfa601209a595e6d82a3893c5e" }
 # The light node, with its device library: the secret's derivation, the
-# proofs, the node-API requests and the path kept apart from proofs. One
-# VOS revision for all three, so their types agree.
-vos-light = { git = "https://codeberg.org/Virto/VOS", rev = "d0d24ed7b8e48d9f926b622834cf06a6b74945a0", features = ["tor"] }
-vos-api = { git = "https://codeberg.org/Virto/VOS", rev = "d0d24ed7b8e48d9f926b622834cf06a6b74945a0" }
-vos-wire = { git = "https://codeberg.org/Virto/VOS", rev = "d0d24ed7b8e48d9f926b622834cf06a6b74945a0" }
+# proofs, the node-API requests and the path kept apart from proofs.
+vos-light = { path = "..", features = ["tor"] }
+vos-api = { path = "../../api" }
+vos-wire = { path = "../../../agent/wire" }
 # The personal agent's calls, signed by the light node's sync key; the
 # personal space's state in the light node's encoding.
 ed25519-dalek = "2"
-scale = { package = "vos-pvm-codec", git = "https://codeberg.org/Virto/VOS", rev = "d0d24ed7b8e48d9f926b622834cf06a6b74945a0", default-features = false }
+scale = { package = "vos-pvm-codec", path = "../../../pvm/codec", default-features = false }
 tokio = { version = "1", features = ["rt", "macros", "io-util", "net", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
@@ -52,11 +54,15 @@ zeroize = "1"
 jni = { version = "0.22", optional = true }
 
 [dev-dependencies]
+# The release artifacts computed from this tree's guests, which the
+# embedded ones must be; the personal agent's package the tests run.
+vos-light = { path = "..", features = ["release", "tor"] }
+vos-testkit = { path = "../../../agent/testkit" }
 # The personal agent run in process, as a node runs it: the default agent's
 # program over the interpreter, its work applied as accumulate applies it.
-vos-exec = { git = "https://codeberg.org/Virto/VOS", rev = "d0d24ed7b8e48d9f926b622834cf06a6b74945a0" }
-vos-pvm = { git = "https://codeberg.org/Virto/VOS", rev = "d0d24ed7b8e48d9f926b622834cf06a6b74945a0" }
-s4-server = { path = "../server", version = "=0.1.0" }
+vos-exec = { path = "../../exec" }
+vos-pvm = { path = "../../../pvm/runtime" }
+s4-server = { git = "https://codeberg.org/Virto/s4", rev = "44089556b23d6bbfa601209a595e6d82a3893c5e" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "sync", "time"] }
 tempfile = "3"
 hmac = "0.12"
@@ -68,7 +74,8 @@ ciborium = "0.2"
 # A light store written by another build, as a test makes one.
 fjall = "=3.1.13"
 
-# As VOS's workspace: fjall's lsm-tree fork, which the light node's store
-# runs on.
+# As VOS's workspace: fjall's lsm-tree fork, and fjall's, which the light
+# node's store runs on.
 [patch.crates-io]
 lsm-tree = { git = "https://github.com/olanod/lsm-tree", rev = "d0791931a96ff2be9b23af4e0d1ef17a330ed9f2" }
+fjall = { git = "https://github.com/olanod/fjall", rev = "cffa5f7620be864277f7d5706a9f60e58beed219" }
