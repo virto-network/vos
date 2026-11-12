@@ -513,12 +513,12 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   8.23a–c's facility operations (developed against stubs first).
   **Estimate:** 3–4 weeks, its last 1–2 weeks after 8.23a.
 - **Part 1 built** (2026-11-09, `light-node.md` §7.3 "The facility's
-  wiring as built"): the facility's plumbing the screens call, in s4's
-  `credential/`: Tor in `:vos` (8.26's client side), the tree from its
-  feed (8.27's), every personal-space operation on the Binder interface
-  (8.22, 8.23a–c), the admin key's prompt, the binding's lifecycle
-  (8.24b). Host-tested against homes in process behind an in-process
-  gateway (`credential/tests/personal.rs`).
+  wiring as built"): the facility's plumbing the screens call, then in
+  s4's `credential/`: Tor in `:vos` (8.26's client side), the tree from
+  its feed (8.27's), every personal-space operation on the Binder
+  interface (8.22, 8.23a–c), the admin key's prompt, the binding's
+  lifecycle (8.24b). Host-tested against homes in process behind an
+  in-process gateway (`tests/personal.rs`).
 - **Part 2 built** (2026-11-09, `light-node.md` §7.3): the screens, plain
   Android views in Java (the app has no Kotlin) under
   `team.virto.s4.personal`, a launcher entry of their own; QR codes by
@@ -534,6 +534,20 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   key settled before an admin call); a regroup keeping other devices
   takes their key packages, handed over through the inbox under their
   sync keys, and refuses after a bounded wait naming any device missing.
+- **The facility moved into VOS** (2026-11-12, owner's call; `light-node.md`
+  §2.2): the facility's crate, its tests and test world, its release
+  artifacts and their recipe are `node/light/android` (`vos-facility`,
+  `libvos_facility.so`), copied from s4 `a677826`; the `:vos` process and
+  the screens are its Android library (`just android-facility`), which
+  s4's `-Ps4Vos` build takes from a local Maven repository. VOS depends on
+  s4 (`s4-protocol`, `s4-credential-contract`, `s4-server`, by git
+  revision) and s4 on nothing of VOS: s4 keeps the credential contract,
+  its AIDL and its UI side, and its client's facilities may carry a
+  host's stream and pin its host key (`External::carry`, `admit`). The
+  embedded artifacts are held to this tree's guests by a test
+  (`tests/release.rs`), so a guest that moves fails `just check` until
+  `just facility-release`. One build: `just android-facility` here, then
+  `just android-build-vos <repository>` in s4.
 
 ### M4 acceptance
 - `ci-full`, PG3′'s personal-space flows and PG6 on the clearnet (S8-P5),

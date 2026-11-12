@@ -9,6 +9,13 @@ derivation, the statements, the library) and
 threat model); what a verified proof proves is `pvm/proof/SECURITY.md`'s,
 and what a node does with one is `node/SECURITY.md`'s.
 
+The client that links it here is the `vos.credential` facility
+(`android/`, `libvos_facility.so` in s4's app's `:vos` process, behind s4's
+credential contract): the bridges below that evaluate a source and sign
+with the admin key are s4's UI process's, which the contract lends each
+operation, and the facility's C ABI and every freed heap block are
+searched for the secret by its `tests/leaks.rs`.
+
 ## The local agent
 
 - **Its programs are the app's:** the agent program and each local

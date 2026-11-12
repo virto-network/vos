@@ -2069,8 +2069,9 @@ its hex, its `Debug` list and, for a number, its digits and byte orders:
   tree (its digest, its leaf, its slot, its occupied siblings), the place
   searched in every carrier that leaves but the feed's connection; and the
   phone bench's lines and proofs. A run over small values (rows from
-  2^20) searches a number below 2^24 by its digits and hex alone. s4's
-  facility is audited in s4, through its C ABI and every freed heap block;
+  2^20) searches a number below 2^24 by its digits and hex alone. The
+  facility (`node/light/android`) is audited through its C ABI and every
+  freed heap block (its `tests/leaks.rs`);
   its known gaps are `identity-and-authority.md` §7's;
 - **the guards:** each capture path shown to capture by a canary; each
   needle found when planted in each of its forms; the audit's seams and

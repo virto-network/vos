@@ -235,12 +235,19 @@ actors, and calls a space through its gateway.
 ### 2.2 Process model on Android
 
 **Its own Android process, behind Binder** [decided, E21].
-- The light node is one Rust crate, `vos-light` (§7.1), linked by s4's
-  facility cdylib (today `s4-credential`, `~/src/virto/s4-vos/credential`,
-  which links `vos-light`, `vos-api` and `vos-wire` by one VOS revision).
-  The facility is renamed `vos.node`, grows the operations of §7.3, and
-  runs in a separate process of s4's app (`android:process=":vos"`), which
-  s4's UI reaches through one Binder interface.
+- The light node is one Rust crate, `vos-light` (§7.1), linked by the
+  facility's cdylib, `vos-facility` (`node/light/android`, outside the
+  workspace, linking `vos-light`, `vos-api` and `vos-wire` by path). The
+  facility is renamed `vos.node`, grows the operations of §7.3, and runs
+  in a separate process of s4's app (`android:process=":vos"`), which s4's
+  UI reaches through one Binder interface. VOS depends on s4 (the
+  facility on `s4-protocol` and `s4-credential-contract`, its tests and
+  the gateway on `s4-server`, each by git revision); s4 depends on nothing
+  of VOS: its client hosts any facility behind its credential contract
+  (the AIDL, the binding, the prompts and the secret sources, which s4
+  keeps), and VOS's Android library (`just android-facility`: the `:vos`
+  service, the personal space's screens and `libvos_facility.so`) is what
+  s4's `-Ps4Vos` build links.
 - **Why its own process:** the prover's 1 GiB peak, the unwrapped sync key
   and archive, and arti's circuits stay out of the UI process; the OS can
   kill one without the other, so a proof or a sync is never lost to the UI
@@ -258,9 +265,12 @@ actors, and calls a space through its gateway.
 - **One runtime, one arti:** `:vos` owns a multi-threaded tokio runtime;
   the light node runs on it, and arti's `TorClient` is created once on it.
 - **s4's SSH over the same Tor:** the facility is its own
-  `libs4_credential.so`, built on VOS's pinned nightly because s4's client
-  cannot build on it (`s4-credential/rust-toolchain.toml`). `:vos` opens the
-  onion stream and hands the UI one end of a Unix socketpair as a
+  `libvos_facility.so`, built on VOS's pinned nightly because s4's client
+  cannot build on it. s4's client asks each facility it hosts whether it
+  carries a host's connection and pins its host key (`External::carry`),
+  and refuses on its own connection a key a facility keeps to the ones it
+  carries (`External::admit`); a `.onion` host typed in the client can be
+  dialed through the same hook. `:vos` opens the onion stream and hands the UI one end of a Unix socketpair as a
   `ParcelFileDescriptor` over Binder, pumping bytes between it and the
   `DataStream`; the client runs its SSH over the descriptor as over a TCP
   socket. Not a loopback SOCKS port: any app on the phone can reach
@@ -349,7 +359,7 @@ no kit loses everything with the phone (§8, D2).
 **The first local actors** [built: `vos-credential-book`,
 `vos-device-book`, their types `vos_wire::books`]:
 - the credential book: the spaces the user is a member of, each device's
-  handles there, the pinned agents and methods s4's facility pins today.
+  handles there, the pinned agents and methods the facility pins today.
   The member trees a device keeps for its proofs (§6.7) stay on the
   device, outside any synced scope;
 - the device book: labels and settings of the user's devices (the device
@@ -595,7 +605,7 @@ this is the one taken]:
   refuses the guard name "home" (`DeviceError::Reserved`), and
   `Prover::prove_home` proves in it only a call of `claim` or `renew`; a
   device computes its own nullifier there with no proof
-  (`home::nullifier`). s4's facility links the library, so it refuses
+  (`home::nullifier`). The facility links the library, so it refuses
   the same; its own operations are unchanged.
 - **The open claim's work** (`home::work`): a nonce found on the device's
   threads for the registrar's terms (`identity-and-authority.md` §6),
@@ -902,7 +912,8 @@ arm64-v8a build; the phones' timings below are S8-P1's]:
   `tree_index`; the RustCrypto provider 0.22 (0.23 then could not share
   a build with russh 0.61's `curve25519-dalek` `=5.0.0-rc.0`; russh 0.65
   takes 5.0.0, so 0.23 now builds beside it, unmeasured).
-- **The facility's `.so`** (s4's `libs4_credential.so`, release, arm64,
+- **The facility's `.so`** (`libvos_facility.so`, then s4's
+  `libs4_credential.so`, release, arm64,
   stripped as packaged): +0.86 MB with the device-group scenario linked
   (+0.38 MB gzip -9), +0.96 MB with `std`: within PG5's 2 MB. The growth
   includes a second RustCrypto generation beside the facility's own.
@@ -1747,10 +1758,10 @@ OEMs' battery managers; the chrome shows each device's last sync and
 recommends the battery-optimization exemption, and PG6 measures these
 cases before the device-change windows are pinned (§8, D5).
 
-**The background job as built** [built, `vos_light::job` and s4's
-`credential/src/job.rs` with its WorkManager worker in `:vos`; tested in
-`node/light/tests/sealed/job.rs` against `Personal` and in s4's
-`credential/tests/job.rs` and `killed.rs`]:
+**The background job as built** [built, `vos_light::job` and the
+facility's `node/light/android/src/job.rs` with its WorkManager worker in
+`:vos`; tested in `node/light/tests/sealed/job.rs` against `Personal` and
+in the facility's `tests/job.rs` and `killed.rs`]:
 - **One pass** (`job::run`) over a `Control` link (sealed sync's `Link`
   with `log`, `overview`, `devices` and the four posts `confirm`, `nack`,
   `evidence` and `alive`, named, nothing generic), refused before anything
@@ -2021,7 +2032,7 @@ one taken]:
   makes it at a delay drawn uniformly over 1 to 6 hours from the pairing,
   so the home's operators do not link the new member to the agent by its
   time (L5); the due time is kept in the device's state, so a killed
-  process neither loses nor redraws it [built, s4 `credential/`]. Until
+  process neither loses nor redraws it [built, `node/light/android`]. Until
   then the joiner works through the archive, and its re-proof waits.
 - **Retiring a phone:** the successor paired from the old phone (offered
   the old phone's memberships), then the old phone's removal by the other
@@ -2494,8 +2505,9 @@ format, the chips, the sizes and the root.
   the stock kernels and of the hand-lean `auth` against their references'
   sizes [built].
 - **Computed at release, on the phone never** [built: the release build
-  and the device's side; s4's facility takes them when its VOS pin moves,
-  plan 8.24b]: the release build computes each device kernel's program
+  and the device's side; the facility embeds them from this tree's
+  guests (`just facility-release`, held by its `tests/release.rs`), plan
+  8.24b]: the release build computes each device kernel's program
   from the package's ELF as a node's install does
   (`vos_light::release::devices`), the stock kernels' among them, and the
   app embeds the artifacts (`release::Device`: the kernel, its chips and
@@ -2559,7 +2571,7 @@ format, the chips, the sizes and the root.
     formats and each device kernel's programs, ids, formats and dates) and
     proves with the newest program it ships that the window holds, in a
     format it holds (`vos_light::choose`, `wire::devices_request` [built];
-    the app's sign-in calls them when s4's facility moves to release
+    the app's sign-in calls them when the facility moves to release
     artifacts, plan 8.24b). When the space admits none it refuses before
     proving (`DeviceError::Window`: "the space admits none of this app's
     programs for the kernel: the app or the space must update"); a window
@@ -3764,20 +3776,18 @@ device's crates faster); Q9's size argument for it is small.
   replacement; each behind the admin key's prompt), `restore` (from a
   kit), `move_home` (§3.9), the yearly re-proof (with the leaf renewal on
   the same prompt), and local notifications for pending device
-  operations. These are new Kotlin screens in s4's client, their own plan
-  step (8.24), over the `:vos` process's Binder interface (§2.2, plan
-  8.24b).
+  operations. These are the facility's own screens (its Android
+  library, `team.virto.s4.personal`), their own plan step (8.24), over
+  the `:vos` process's Binder interface (§2.2, plan 8.24b).
 - **Tor in s4's client:** its SSH connection to the gateway goes to the
   onion address pinned at enrollment, through the facility's `TorClient`;
   the host key is pinned as today.
-- **The facility's toolchain:** it builds on VOS's pinned nightly
-  (`s4-credential/rust-toolchain.toml`) because of the prover; unchanged.
-- **s4's VOS pin** still names a retired device format today (`open.md`,
-  "Repository"); it moves with the cleanup's last step, before slice 8's
-  first phone session.
+- **The facility's toolchain:** it builds on VOS's pinned nightly because
+  of the prover, in VOS (`node/light/android`), s4's crates built with
+  `--ignore-rust-version`; s4 builds nothing of VOS.
 
-**The facility's wiring as built** [built, s4 `credential/`, plan 8.24
-part 1]: the screens are the step's second part.
+**The facility's wiring as built** [built, `node/light/android`, plan
+8.24 part 1]: the screens are the step's second part.
 - **Tor**: one arti runtime in `:vos`, its state in `files/tor`, rebuilt
   through pasted bridges (a `BootstrapError` named by its Display); one
   `Client` whose every space is set from the onions pinned at enrollment
@@ -3819,8 +3829,8 @@ part 1]: the screens are the step's second part.
   several kits answers with the newest. "Backup paused" is Tor's bootstrap
   refusal, on the screen and as a notification after a personal pass that
   did not finish.
-- **A regroup's handover** [built, s4 `credential/src/personal/ops/
-  regroup.rs`; host-tested in `credential/tests/personal.rs`]: once a
+- **A regroup's handover** [built, the facility's `src/personal/ops/
+  regroup.rs`; host-tested in its `tests/personal.rs`]: once a
   regroup matured (`DeviceGroup::regrouper` names its device), every
   device it keeps hands the regrouper its key package
   (`DeviceGroup::regroup_package`) as an inbox item for the devices, put
@@ -3847,7 +3857,7 @@ part 1]: the screens are the step's second part.
   a kept device that cannot follow takes no candidate but its own
   regroup's, so it hands nothing over and the regrouper names it missing:
   it is named in the regroup (or removed) and re-pairs after.
-- **Pairing after the set changed** [built, s4 `credential/`]: the
+- **Pairing after the set changed** [built, `node/light/android`]: the
   opener reads the log and settles what fell due before its pairing's
   commit, and a replaced admin key is taken before any admin call, so a
   device pairs after a kit rotation, admin replacements or a regroup

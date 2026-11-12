@@ -215,7 +215,7 @@ The scale results are in `core-model.md` §14, "The scale test".
   (russh's inactivity timeout is reset by the keepalives a live client
   answers, so an idle close needs s4-server to count a connection's
   channel traffic). Both need s4-server's work.
-- **The kit's own device-set calls on a phone:** s4's facility signs a
+- **The kit's own device-set calls on a phone:** the facility signs a
   resolution and a removal with a device's admin key only; a contest
   resolved by the kit, and the kit alone removing a phone that holds only
   a sync key (PG3′), are driven in `node/light/tests/sealed/kit.rs` and
@@ -264,9 +264,6 @@ The scale results are in `core-model.md` §14, "The scale test".
 - **The precompile block** `0x400..=0x4ff` reserved through a JIP (§11.2).
 
 ## Repository
-
-- **s4's VOS pin:** s4's app pins a VOS revision whose device format is
-  retired, so its device sign-in is refused until the pin moves.
 
 - **Kreivo's retired indices:** the spaces pallet's calls, events, errors
   and statuses keep their holes (`spaces-pallet.md`) until the pallet's
