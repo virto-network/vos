@@ -121,8 +121,11 @@ and what a node does with one is `node/SECURITY.md`'s.
   assigned either.
 - **A restore's device trusts the agent for what came before:** it starts
   its group from what it reads of the agent after its restore matured
-  (the log's head, the device set, the kit), with no earlier view to
-  check them against; from then it checks the log as any device does.
+  (the log's head, the device set with the authors its keys name as
+  carried, the kit), with no earlier view to check them against; from
+  then it checks the log as any device does. An author the agent names
+  so is read only up to its device's frontier once the restore's first
+  commit removes it, as any old device's own nodes are.
 - **A device that cannot follow** reads on for the device set's
   operations, so its own regroup matures in its view, but takes no other
   candidate: it follows the others' epochs and the removals they carried
@@ -181,6 +184,16 @@ and what a node does with one is `node/SECURITY.md`'s.
   claiming device's, a rotation's or a restore's those its verified admin
   call carried; a commit re-seals `R1` only to those, never to keys the
   agent serves.
+- **An archive read brings keys, never a writer:** from an archive the
+  agent serves a device takes the keys of the epochs before its confirmed
+  one, the `R` the log named, and nothing else; an archive names no
+  carried author. The authors a move carried are named by the device
+  set's keys in the control log (`NewDevice::carried`: the mover's claim,
+  the commit adding a re-paired device, which an admin key signed), read
+  as the set's while the device naming them has a voice and, once its
+  removal matured, only at positions up to its frontier. So neither the
+  operators nor a device of the set, removed later, leaves an author or a
+  key behind that writes past the removal.
 
 ## The secret and its containment
 
