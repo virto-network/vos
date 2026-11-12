@@ -1258,8 +1258,9 @@ outbox sequence numbers, which receivers deduplicate.
     on VOS.
   - VOS prices each precompile, and the prover binds that price wherever a
     proof binds final gas. A BLAKE2b compression costs 600 gas, from its
-    native serving cost; a Poseidon2 compression 2,400, about four
-    BLAKE2b compressions natively, and about 37,600 gas in software on
+    native serving cost; a Poseidon2 compression 3,000, its
+    measured native cost of about 4.7 BLAKE2b compressions (1,925 cycles
+    against about 410, 2026-11-12) rounded up with headroom, and about 37,600 gas in software on
     JAM [measured, 2026-10-26, `pvm/bench precompile`]. The agent charges the batch for serving an inner
     machine's call by precompile (`POSEIDON2_SERVING` 60,000), since JAM
     pays the software permutation.

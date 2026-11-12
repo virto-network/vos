@@ -101,9 +101,11 @@ The scale results are in `core-model.md` §14, "The scale test".
     holds the byte ledger's acceptance of padding inside it (the shape's
     byte ledger) and flips if the ledger takes a last-row column. Format
     47's release retires 46 at once (`DEVICE_FORMATS`: 46's date 0), so a
-    node refuses a 46 proof `Format` unless its configuration admits 46
-    (`Config::device_formats`, which the window's gate uses); 46's code,
-    fuzz target and leakage gate stay until it is deleted. Device proofs
+    node refuses a 46 proof `Format`, and apply refuses one on every
+    replica whatever a node's configuration admits (the proven input
+    carries its format; `Config::device_formats` admitting 46 is the
+    window's gate's alone); the format registry marks it retired. 46's
+    code, fuzz target and leakage gate stay until it is deleted. Device proofs
     are in no leaf, fold, wrap, venue or `MANIFEST` pin.
   - **Device 47 (the word ledger):** consistent. `IsLast` keeps padding
     past the real rows, one sorted run, a word one group; a second
@@ -140,10 +142,9 @@ The scale results are in `core-model.md` §14, "The scale test".
   cycles at the median, one BLAKE2b compression 405–414, ×4.65–4.75, on
   one pinned core of an idle machine (load average 0.5), three runs of 31
   rounds of 20,000 [measured, x86 dev machine (Intel Core Ultra 7 155H),
-  2026-11-12; a spike outside the tree]. `POSEIDON2_GAS` (2,400) is four
-  BLAKE2b prices (600) from the loaded estimate of 1,800 cycles; at
-  BLAKE2b's gas a cycle it would be about 2,800. Whether to raise it, which
-  moves every gas pin that counts a `0x402` call, is the owner's.
+  2026-11-12; a spike outside the tree]. At BLAKE2b's gas a cycle it would
+  be about 2,800; `POSEIDON2_GAS` is 3,000, the round price above it with
+  headroom [decided].
 - **Segment AIR parts not yet under a forgery gate:** the program memory's
   decode binding, the jump table, the lookup tables, the memory page and
   Merkle chips, the witness-input chip, the boundary-binding argument, and

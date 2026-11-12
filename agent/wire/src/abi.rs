@@ -626,7 +626,7 @@ pub mod precompile {
     pub const fn price(id: u64) -> Option<u64> {
         match id {
             BLAKE2B_COMPRESS => Some(600),
-            POSEIDON2 => Some(2_400),
+            POSEIDON2 => Some(3_000),
             _ => None,
         }
     }
