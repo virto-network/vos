@@ -355,7 +355,7 @@ proves and the kernel's claim.
   | 13 | `b` is not recorded | `Replayed`, 8 | 409 |
   | 14 | auth with `once`: `(scope, nullifier)` not recorded | `Once`, 9 | 409 |
   | 15 | auth: `map_root` is in the credential actor's ring | `RootUnknown`, 10 (`RootRefusal::Unknown`): retryable, read the tree's feed again, or ask another replica; an honest member meets it on a replica's lag, a root a later write at its own batch time replaced (a trailing leader times each batch past the one before), or one past the ring's 64 entries (§6) | 503 |
-  | 16 | auth: `map_root` is the ring's newest, or was superseded at most `ROOT_MAX_AGE` before the replica's latest applied batch time | `RootStale`, 11 | 403 |
+  | 16 | auth: `map_root` is the ring's newest, or was superseded at most `ROOT_GRACE_MS` before the node's clock | `RootStale`, 11 | 403 |
   | 17 | a verification slot is free: fewer verifications in flight than the node's budget (by default twice its executor threads) | `Busy` (not a credential code) | 503 |
   | 18 | on an executor, the proof's interaction PoW holds over its leading fields before it is decoded; then it decodes and verifies under the program the binding names against `H_io` of the claim | `Proof`, 12 | 403 |
 
@@ -400,7 +400,9 @@ proves and the kernel's claim.
      nothing [decided];
   2. `b` recorded: refused, `Refusal::Replayed` (8);
   3. auth: the claim's `map_root` neither the ring's newest nor
-     superseded at most `ROOT_MAX_AGE` before `t`: refused,
+     superseded at most `ROOT_GRACE_MS` before the earlier of `t` and
+     `expires_ms` less the 120 s horizon, the latest time an ingress could
+     have admitted it (`credentials::judged_at`): refused,
      `Refusal::StaleRoot` (9);
   4. a `once` guard: `once(scope ‖ nullifier)` recorded: refused,
      `Refusal::Once` (10);
@@ -568,20 +570,24 @@ across a space's agents wait for the identity agent above.
 - **The ring:** a write whose batch time equals the newest entry's
   `since` replaces that entry's root; any other appends an entry, dropping
   the oldest past 64; the install writes the empty tree's root. A root is
-  **accepted** while it is the newest, and for `ROOT_MAX_AGE`
-  (10 minutes, `vos_wire::defaults`; not the venues' `MaxRootAge`) after
-  the next entry's `since`, the
-  moment it was superseded. Ingress measures that by the replica's latest
-  applied batch time, apply by the batch's (§5). So a revocation binds
-  within `ROOT_MAX_AGE` of its batch, and an honest member's path stays
-  good for as long after any change to the tree. The 64 entries bound
-  storage, and in a busy space freshness too: a root that has fallen out
-  is `RootUnknown`, so 64 tree-changing batches within `ROOT_MAX_AGE` make
-  an honest root unknown before it is stale. `RootUnknown` is retryable by
-  reading the feed again, and the device library reads it well within
-  64 batches' time: its timer's period is well under the time the space
-  takes to make 64 tree-changing batches, not merely under
-  `ROOT_MAX_AGE` (§7).
+  **accepted** while it is the newest, and for `ROOT_GRACE_MS`
+  (90 s, two of the device feed timer's longest gaps, `light-node.md`
+  §6.7; `vos_wire::defaults`; not the venues' `MaxRootAge`) after the
+  next entry's `since`, the moment it was superseded. Ingress measures
+  that by the node's clock, apply by the earlier of the batch's time and
+  the call's expiry less the 120 s horizon, so apply never refuses what
+  an ingress admitted (§5). So a revocation binds every replica within
+  the grace and the horizon of its batch, and an honest ingress within the
+  grace; and an honest member's path stays good for as long after any
+  change to the tree, which its feed's timer shows it well within. A
+  gateway that holds the feed back marks a device's root for the grace
+  alone. The 64 entries bound storage, and in a busy space freshness too:
+  a root that has fallen out is `RootUnknown`, so 64 tree-changing batches
+  within the grace make an honest root unknown before it is stale.
+  `RootUnknown` is retryable by reading the feed again, and the device
+  library reads it well within 64 batches' time: its timer's period is
+  well under the time the space takes to make 64 tree-changing batches,
+  not merely under the grace (§7).
 - **Its methods:**
   - `enroll(member) → slot`, role `registrar`: the lowest free slot, else
     `next`; refused for a member enrolled;
@@ -705,7 +711,7 @@ across a space's agents wait for the identity agent above.
 - **Built:** `vos-credentials` (`agent/credentials`), `#[actor(credentials)]`;
   the tree's values, the ring and its freshness rule in
   `vos_wire::credentials` (`Ring::accepts`, `RootRefusal::{Unknown,
-  Stale}`, `defaults::ROOT_MAX_AGE`), which ingress, apply and the device
+  Stale}`, `credentials::judged_at`, `defaults::ROOT_GRACE_MS`), which ingress, apply and the device
   library share; a reference built from `proving.md` §8 alone equals the
   actor's tree over random enrollments and revocations, on a VOS host and
   on the JAM-only host [measured].
@@ -767,7 +773,7 @@ space three of them take a simpler form:
   the leaf, and the device could neither keep an epoch nor the actor check
   one.
 - **Freshness is time, not windows:** a root is accepted for
-  `ROOT_MAX_AGE` after it was superseded (§6).
+  `ROOT_GRACE_MS` after it was superseded (§6).
 - **The scope carries the space:**
   `scope = C(T(scope), W(BLAKE2b-256("vos/cred/scope/v1" ‖ space ‖ agent ‖ instance ‖ name)))`,
   the agent and the instance four little-endian bytes each, `name` in
@@ -883,7 +889,7 @@ the device never exports, evaluated once a use after the user's consent
     (and of every space sharing its handle), payment from the account
     `owner(s)` holds, and every nullifier the member has used or will use,
     so the member's past pseudonyms link to it. Revoking the leaf stops
-    auth within `ROOT_MAX_AGE`; it does not stop payment, which reads no
+    auth within `ROOT_GRACE_MS` and the 120 s horizon; it does not stop payment, which reads no
     tree: the ledger's `rekey(account, owner)` and `freeze(account)`,
     under an operator role, do [decided].
   - **The in-space ledger is custodial by design:** an operator who can
@@ -905,8 +911,9 @@ the device never exports, evaluated once a use after the user's consent
   The node's `Time` is unsigned; a relay that lies about it costs a
   client a new proof, and cannot extend a proof's life past the 120 s
   ingress allows by its own clock.
-- **Revocation** binds every replica within `ROOT_MAX_AGE` of the
-  revoking batch, by batch time (§5's apply rule): a revoked member's
+- **Revocation** binds every replica within `ROOT_GRACE_MS` and the
+  120 s horizon (3.5 minutes) of the revoking batch, by batch time (§5's
+  apply rule), and an honest ingress within the grace: a revoked member's
   proof against an older root is refused then, whatever a lagging
   replica's ingress accepted. Within the window a revoked member can still
   authenticate.

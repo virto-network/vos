@@ -2871,7 +2871,7 @@ the actor; it is a later extension of the local host (§9.1).
 - at ingress: the generic checks and the proof against the `spend`
   program (§4.3); no pool-specific pre-check;
 - at apply (`pay`): the anchor accepted (newest, or superseded within
-  `ROOT_MAX_AGE`, the credential ring's rule); each nullifier inserted
+  `ROOT_GRACE_MS`, the credential ring's rule); each nullifier inserted
   once (a second is refused, the whole call with it); the memos' hash;
   the commitments appended; the transparent leg applied by cipher-clerk's
   kernel (a withdrawal credits the account `leg` names from the pool's
@@ -3499,16 +3499,61 @@ against a no-flood baseline:
   a batch's first) fails every proof, and two such refusals with no
   change read between drop the tree; one the ring holds is one of its 64
   recent roots, shared by every member that read as far, so the mark is a
-  few bits at most and lasts only while those proofs still pass. A head
+  few bits at most, and it lasts only the root's grace (below): ninety
+  seconds after the change the device was not shown, its proofs meet
+  `RootStale` and its keeper reads again. Within the grace the mark is the
+  split an honest keeper one period behind already shows, which only a
+  settled root (below) closes. Of the ways to close it further: a head
   bound to the ring's entry inside the actor alone would show the keeper
   nothing, since every answer, the binding with it, is the gateway's to
-  forge, and the ring accepts any of its roots for `ROOT_MAX_AGE`; closing
-  it takes a change beyond the actor (open, for the owner): ingress and
-  the refine accepting a superseded root for about one feed period only
-  (the node and the agent's blob; it shortens the mark to the split an
-  honest keeper one period behind shows), the head bound into the proven
-  statement with that rule, or answers the keeper can authenticate past
-  the gateway (the node's own signature over the feed's head).
+  forge; the head bound into the proven statement adds nothing over the
+  grace, since the proof already names its root and the ring judges that
+  root's age; answers the keeper can authenticate past the gateway (the
+  node's signature over a timestamped feed head) are later work
+  (`open.md`, "Node-signed feed heads").
+- **The root's grace** [built: `defaults::ROOT_GRACE_MS`,
+  `credentials::judged_at`]: ingress and the default agent's refine
+  accept a superseded root for 90 s after the batch that superseded it,
+  while the ring still holds it. The number is two of the feed timer's
+  longest gaps: the timer's period is `FEED_PERIOD_MS` (30 s), each read
+  drawn between half and one and a half periods after the last, so an
+  honest keeper's reads are at most 45 s apart. The first gap is the
+  keeper not yet having read a change; the second is the proof it made
+  just before that read, proved and carried to the node.
+  - **What each judges against:** ingress the node's clock, the one its
+    expiry check reads (not the replica's latest batch time, which an
+    idle space leaves behind); apply the earlier of the batch's time and
+    the call's expiry less `CREDENTIAL_HORIZON_MS` (120 s). Ingress
+    refuses an expiry more than the horizon past its clock, so that time
+    is no later than the clock of any ingress that admitted the call; and
+    apply refuses an expiry before the batch's time, so it is no earlier
+    than the batch's time less the horizon. So no replica refuses at
+    apply what an ingress admitted on the ring's grace, however long the
+    call waits for its batch (but for a ring that has since dropped the
+    root, refused `StaleRoot` at apply as before), and a revoked or held-back root binds
+    every replica within the grace and the horizon, 3.5 minutes, of its
+    successor's batch, and within the grace at an honest ingress. A call
+    expiring sooner than the horizon is judged at apply as far before its
+    ingress (s4's 60 s expiry: 60 s).
+  - **The margin, an honest phone's:** the grace leaves 45 s for the
+    proof and its trip. The slowest proving measured is the Pixel 1's
+    `auth`, 1.5 s at format 46 and 0.92 s at 47 (the Fairphone 6's about
+    0.6 s) [measured, `proving.md` §8]; the slowest trip, a fresh onion
+    connection at the Pixel 1's 95th percentile (11.7 s) and an SSH
+    handshake (3.5 s) when no spare is built, then a 0.8–0.9 MB proof at
+    the slowest circuit measured, 0.07 MB/s (about 13 s) [measured, §6.3,
+    §6.4]: about 30 s in all, a sign-in at the median about 3–6 s. So
+    the grace holds the slowest measured phone with 15 s to spare; a call
+    slower than that (the client gives a proven call 90 s, §6.2) meets
+    `RootStale`, which makes the feed due within 10 s, and the proof made
+    again at the newest root, which no grace refuses, runs. That retry is
+    the app's, once, with no new prompt: the user confirmed the call, not
+    the root (s4 makes the feed due on the answer but shows the refusal
+    today; its re-release takes the retry).
+  - **Not a read before proving:** the keeper still reads on its timer
+    alone, since a read just before each proof would join the proofs
+    through the feed's circuit (below); the grace is sized to the timer
+    instead.
 - **Back onto the real feed** [built]: a keeper whose pages are refused,
   or whose root the actor knows no change leaving (a fork a gateway
   served, a re-founded space whose feed starts again), two reads in a
@@ -4350,7 +4395,12 @@ person leaves are later work. (8.16)
 which leaf proves. *Known limit,* stated. (8.16)
 
 **L8. Path fetches and the logged `map_root`** link a member's proofs.
-*Mitigation:* the credential tree's feed (8.27). (8.27)
+*Mitigation:* the credential tree's feed (8.27); a gateway that ends its
+answers early marks the root a device proves against for the root's grace
+alone, 90 s after the change it held back, not the ten minutes a
+superseded root was accepted before (§6.7). *Known limit:* within the
+grace, the split an honest keeper one period behind shows; node-signed
+feed heads are later work (`open.md`). (8.27)
 
 **L9. A space's page asks the device to prove in the "home" scope.**
 *Mitigation:* the scope is reserved by the facility. (8.14, 8.23a)

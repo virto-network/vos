@@ -629,6 +629,15 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   proof against the newest root, the log keeping the root's place in the
   ring.
 - **Dep:** 8.5, 8.18a. **Estimate:** 1.5–2 weeks.
+- **Built** (2026-11-12, `light-node.md` §6.7 "The root's grace"): a
+  superseded root accepted for `ROOT_GRACE_MS` (90 s, two of the feed
+  timer's longest gaps), not ten minutes, at ingress by the node's clock
+  and in the default agent's refine at `credentials::judged_at` (the
+  earlier of the batch's time and the expiry less the horizon), so apply
+  never refuses what ingress admitted; a gateway's early-ended feed marks
+  a root for the grace alone. `vos-agent.elf` and the node moved; the
+  device formats and programs did not. Node-signed feed heads: slice 9
+  (`open.md`).
 
 ### M5 acceptance
 - PG3′ and PG6 over Tor (S8-P6); PG5's rendezvous limit; 8.25's flood

@@ -195,8 +195,15 @@ The scale results are in `core-model.md` §14, "The scale test".
   space or to JAM, then reputation, and opt-in linking (`identity-and-authority.md` §7).
 - **Secret sources:** sources that span devices, iOS, and recovery across
   devices.
-- **Node-signed roots,** so a gateway cannot mark the root a proof names
-  (`node/SECURITY.md`).
+- **Node-signed feed heads** (slice 9): a node's signature over the
+  credential tree feed's head (its newest root, the feed's length and the
+  node's time), relayed by the gateway and checked by the keeper, so a
+  gateway can no longer end a device's feed answers early at a root of its
+  choosing. Until then the root's grace (`ROOT_GRACE_MS`, 90 s,
+  `light-node.md` §6.7) bounds such a mark to that long; binding the head
+  into the proven statement was weighed and left out, as the proof
+  already names its root. The same signatures would let an alarm be
+  shown to a third party (`node/SECURITY.md`).
 - **The credential facility's gaps** (`identity-and-authority.md` §7):
   forgetting an enrollment, the claim order.
 - **The onion's screens, their last limits** (`light-node.md` §6.1,
