@@ -4,6 +4,21 @@ use crate::page_merkle;
 use crate::side_note::SideNote;
 use vos_pvm::instruction::Opcode;
 
+/// Split `[0, total)` into consecutive `[a, b)` ranges of at most
+/// `max_steps` steps each (the last may be shorter). Panics if
+/// `max_steps == 0`. Returns an empty vec when `total == 0`.
+fn segment_bounds(total: usize, max_steps: usize) -> Vec<(usize, usize)> {
+    assert!(max_steps > 0, "max_steps must be non-zero");
+    let mut bounds = Vec::new();
+    let mut a = 0;
+    while a < total {
+        let b = (a + max_steps).min(total);
+        bounds.push((a, b));
+        a = b;
+    }
+    bounds
+}
+
 /// A synthetic step at `ts`, optionally writing `size` bytes at `addr`.
 /// The budgeted walker and `touched_pages` read only
 /// timestamp/mem_read/mem_write (+ the precompile streams), so the rest

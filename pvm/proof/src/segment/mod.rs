@@ -18,21 +18,6 @@
 //!   - `memory_root` is the page-Merkle root the boundary multiproof binds
 //!     in-circuit (`Memory{Page,Merkle,RootBoundary}Chip`).
 
-/// Split `[0, total)` into consecutive `[a, b)` ranges of at most
-/// `max_steps` steps each (the last may be shorter). Panics if
-/// `max_steps == 0`. Returns an empty vec when `total == 0`.
-pub fn segment_bounds(total: usize, max_steps: usize) -> alloc::vec::Vec<(usize, usize)> {
-    assert!(max_steps > 0, "max_steps must be non-zero");
-    let mut bounds = alloc::vec::Vec::new();
-    let mut a = 0;
-    while a < total {
-        let b = (a + max_steps).min(total);
-        bounds.push((a, b));
-        a = b;
-    }
-    bounds
-}
-
 #[cfg(feature = "prover")]
 mod bounds;
 #[cfg(feature = "prover")]
