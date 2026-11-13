@@ -30,7 +30,7 @@ use vos_pvm_final_verifier::Error;
 use vos_pvm_final_verifier::masked::{Claim, MaskedFormat, verify_masked};
 use vos_pvm_proof::chips::CpuColumns;
 use vos_pvm_proof::device::{DEVICE_MAX_LOG_SIZE, DeviceLayout, DeviceShape, device_chips_of_code};
-use vos_pvm_proof::format::{Cpu, Format, Memory};
+use vos_pvm_proof::format::Format;
 use vos_pvm_proof::framework_access::AllLookupElements;
 use vos_pvm_proof::masked::{
     ChipSet, Components, DeviceComponents, DeviceSizes, MaskedDeviceTrace, device_bound_sums,
@@ -55,22 +55,19 @@ impl<S: ChipSet> MaskedProvers for Components<S> {
 /// The word the transcript mixes before a device program's chips.
 pub const DEVICE_PROGRAM_TAG: u64 = u64::from_le_bytes(*b"VOS/DEV1");
 
-/// The word the transcript mixes after a device program's chips and CPU
-/// under the word ledger ([`Memory::Word`]).
+/// The word the transcript mixes after a device program's chips and CPU:
+/// its memory ledger, a row a word.
 pub const DEVICE_WORD_MEMORY_TAG: u64 = u64::from_le_bytes(*b"VOS/WMEM");
 
 /// A device program, as its verifier pins it: its chips, their log sizes,
-/// its CPU's columns, its memory ledger, its layout and the preprocessed
-/// root they commit under its format.
+/// its CPU's columns, its layout and the preprocessed root they commit
+/// under its format.
 #[derive(Clone, Debug)]
 pub struct DeviceProgram<H: MerkleHasherLifted> {
     /// The chips, a device mask (`vos_pvm_proof::device::device_chip`).
     pub active: u32,
-    /// The CPU's columns: every one under a format of the full CPU, the
-    /// code's under a per-program one (`CpuColumns::of_code`).
+    /// The CPU's columns, the code's (`CpuColumns::of_code`).
     pub cpu: CpuColumns,
-    /// The memory ledger, its format's.
-    pub memory: Memory,
     /// Each chip's log size, in `DEVICE_ORDER`.
     pub log_sizes: Vec<u32>,
     pub layout: DeviceLayout,
@@ -80,8 +77,8 @@ pub struct DeviceProgram<H: MerkleHasherLifted> {
 
 impl<H: MerkleHasherLifted> DeviceProgram<H> {
     /// The words the transcript mixes right after the header: the tag, the
-    /// chips, for a per-program CPU that cuts any the CPU's columns' words,
-    /// and under the word ledger [`DEVICE_WORD_MEMORY_TAG`]. The header holds
+    /// chips, for a CPU that cuts any its columns' words, and
+    /// [`DEVICE_WORD_MEMORY_TAG`]. The header holds
     /// the format and the log sizes; the first commitment, the preprocessed
     /// root.
     pub fn header(&self) -> Vec<u64> {
@@ -89,28 +86,16 @@ impl<H: MerkleHasherLifted> DeviceProgram<H> {
         if self.cpu != CpuColumns::ALL {
             words.extend(self.cpu.words());
         }
-        if self.memory == Memory::Word {
-            words.push(DEVICE_WORD_MEMORY_TAG);
-        }
+        words.push(DEVICE_WORD_MEMORY_TAG);
         words
     }
 
-    /// Its components: the chips, the CPU's columns and the memory ledger.
+    /// Its components: the chips and the CPU's columns.
     pub fn shape(&self) -> DeviceShape {
         DeviceShape {
             chips: self.active,
             cpu: self.cpu,
-            memory: self.memory,
         }
-    }
-}
-
-/// The CPU's columns kernel code `code` takes under `format`: every column
-/// for the full CPU, the code's for the per-program CPU.
-pub fn device_cpu(format: &Format, code: &SideNote) -> CpuColumns {
-    match format.cpu {
-        Cpu::Full => CpuColumns::ALL,
-        Cpu::PerProgram => CpuColumns::of_code(&code.code, &code.bitmask),
     }
 }
 
@@ -171,8 +156,7 @@ pub fn device_shape(
     let active = device_chips_of_code(&reference.code, &reference.bitmask);
     let shape = DeviceShape {
         chips: active,
-        cpu: device_cpu(format, reference),
-        memory: format.memory,
+        cpu: CpuColumns::of_code(&reference.code, &reference.bitmask),
     };
     let floors = device_floors(format, shape).ok_or(ProveError::TraceShape(
         "the format's masking does not fit the chips, or an h under the rows a chip reveals",
@@ -235,8 +219,7 @@ where
         }
         let shape = DeviceShape {
             chips: active,
-            cpu: device_cpu(format, &code),
-            memory: format.memory,
+            cpu: CpuColumns::of_code(&code.code, &code.bitmask),
         };
         let floors = device_floors(format, shape).ok_or(ProveError::TraceShape(
             "the format's masking does not fit the chips, or an h under the rows a chip reveals",
@@ -258,7 +241,6 @@ where
             program: DeviceProgram {
                 active,
                 cpu: shape.cpu,
-                memory: shape.memory,
                 log_sizes: log_sizes.to_vec(),
                 layout,
                 circuit: committed.root(),
@@ -425,10 +407,6 @@ pub fn device_format<'a, H: MerkleHasherLifted>(
     program: &'a DeviceProgram<H>,
     header: &'a [u64],
 ) -> Option<(MaskedFormat<'a>, DeviceComponents)> {
-    if format.cpu == Cpu::Full && program.cpu != CpuColumns::ALL || program.memory != format.memory
-    {
-        return None;
-    }
     let floors = device_floors(format, program.shape())?;
     let fits = floors.len() == program.log_sizes.len()
         && program

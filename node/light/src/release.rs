@@ -126,7 +126,7 @@ pub fn devices_in(format: u32, elf: &[u8]) -> Result<Vec<Device>, String> {
                 .map(|(_, kernel)| kernel.clone())
                 .ok_or_else(|| format!("device kernel {method:#010x} has no kernel"))?;
             let program =
-                vos_pvm_recair::device::Program::of_in(format, &kernel, reference, *headroom)
+                vos_pvm_recair::device::Program::of(format, &kernel, reference, *headroom)
                     .map_err(|error| format!("device kernel {method:#010x}: {error}"))?;
             Ok(Device {
                 elf: derivation.elf,

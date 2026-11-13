@@ -266,8 +266,6 @@ fn pad_inside(trace: &mut MaskedSegmentTrace, position: usize, is_padding: usize
 /// ledger each real row after padding starts a chain, which must be its
 /// register's `ts = 0` write, the boundary chip's one a register. So each
 /// byte is one group and each register one chain wherever padding lies.
-/// The device's byte ledger, which lets a byte have two boundary rows, is
-/// not (`device::memory::byte_ledger_padding_between_real_rows_is_accepted_today`).
 #[test]
 fn padding_between_the_ledgers_real_rows_is_harmless() {
     use vos_pvm_proof::chips::memory;

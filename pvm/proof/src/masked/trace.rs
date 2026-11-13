@@ -173,7 +173,7 @@ pub fn masked_device_trace(
     )));
     let components: Vec<_> = chips
         .iter()
-        .map(|&chip| crate::device_component(shape.memory, chip))
+        .map(|&chip| crate::device_component(chip))
         .collect();
     let cpu = shape.program_cpu();
     side_note.cpu_rows_local = cpu.is_some();
@@ -240,8 +240,7 @@ pub fn device_preprocessed(
         .iter()
         .zip(log_sizes)
         .flat_map(|(&chip, &log_size)| {
-            crate::device_component(shape.memory, chip)
-                .generate_preprocessed_trace(log_size, &side_note)
+            crate::device_component(chip).generate_preprocessed_trace(log_size, &side_note)
         })
         .collect())
 }

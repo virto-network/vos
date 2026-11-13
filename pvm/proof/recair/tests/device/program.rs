@@ -32,9 +32,9 @@ fn reader() -> Vec<u8> {
 #[test]
 fn a_run_past_the_programs_log_sizes_is_refused_by_the_prover() {
     let kernel = reader();
-    let program = Program::install(&kernel, &[7; 16], 0).expect("installs");
+    let program = Program::install(&FORMAT, &kernel, &[7; 16], 0).expect("installs");
     let (proof, _) = program.prove(&[9; 16], MaskRng::default()).expect("proves");
-    let bytes = encode(&proof.proof).expect("encodes");
+    let bytes = encode(&FORMAT, &proof.proof).expect("encodes");
     program.verify(&proof.io, &bytes).expect("verifies");
     let error = program
         .prove(&[9; 4000], MaskRng::default())
@@ -43,7 +43,7 @@ fn a_run_past_the_programs_log_sizes_is_refused_by_the_prover() {
         matches!(&error, ProveError::Segment(message) if message.contains("its shape")),
         "{error:?}"
     );
-    let larger = Program::install(&kernel, &[7; 4000], 0).expect("installs");
+    let larger = Program::install(&FORMAT, &kernel, &[7; 4000], 0).expect("installs");
     assert_ne!(larger.log_sizes(), program.log_sizes());
     assert_ne!(larger.id(), program.id());
 }
@@ -53,8 +53,8 @@ fn a_run_past_the_programs_log_sizes_is_refused_by_the_prover() {
 /// sizes or another format another id.
 #[test]
 fn a_programs_id_names_its_kernel_its_shape_and_its_format() {
-    let program = Program::install(&blob(), &witness(1), 0).expect("installs");
-    let again = Program::install(&blob(), &witness(2), 0).expect("installs");
+    let program = Program::install(&FORMAT, &blob(), &witness(1), 0).expect("installs");
+    let again = Program::install(&FORMAT, &blob(), &witness(2), 0).expect("installs");
     assert_eq!(program.id(), again.id());
     assert_eq!(*program.id(), program_id(&FORMAT, program.program()));
     let mut taller = program.program().clone();
@@ -65,7 +65,7 @@ fn a_programs_id_names_its_kernel_its_shape_and_its_format() {
         ..FORMAT
     };
     assert_ne!(program_id(&other, program.program()), *program.id());
-    let reader = Program::install(&reader(), &[7; 64], 0).expect("installs");
+    let reader = Program::install(&FORMAT, &reader(), &[7; 64], 0).expect("installs");
     assert_ne!(reader.id(), program.id());
 }
 
@@ -74,25 +74,25 @@ fn a_programs_id_names_its_kernel_its_shape_and_its_format() {
 /// and they hold no io-hash, which the verifier takes from its caller.
 #[test]
 fn a_device_proofs_bytes_are_canonical() {
-    let program = Program::install(&blob(), &witness(1), 0).expect("installs");
+    let program = Program::install(&FORMAT, &blob(), &witness(1), 0).expect("installs");
     let (proof, _) = program
         .prove(&witness(3), MaskRng::default())
         .expect("proves");
     assert_eq!(proof.io, io_bytes());
-    let bytes = encode(&proof.proof).expect("encodes");
+    let bytes = encode(&FORMAT, &proof.proof).expect("encodes");
     assert_eq!(
-        encode(&decode(&bytes).expect("decodes")),
+        encode(&FORMAT, &decode(&FORMAT, &bytes).expect("decodes")),
         Some(bytes.clone())
     );
     let mut longer = bytes.clone();
     longer.push(0);
-    assert!(matches!(decode(&longer), Err(Error::Decode)));
-    assert!(decode(&bytes[..bytes.len() - 1]).is_err());
+    assert!(matches!(decode(&FORMAT, &longer), Err(Error::Decode)));
+    assert!(decode(&FORMAT, &bytes[..bytes.len() - 1]).is_err());
     let mut other = bytes.clone();
     other[0] = 44;
-    assert!(matches!(decode(&other), Err(Error::Format)));
+    assert!(matches!(decode(&FORMAT, &other), Err(Error::Format)));
     assert!(matches!(
-        decode(&vec![0; MAX_PROOF_BYTES + 1]),
+        decode(&FORMAT, &vec![0; MAX_PROOF_BYTES + 1]),
         Err(Error::Length)
     ));
     let mut io = proof.io;
@@ -107,16 +107,16 @@ fn a_device_proofs_bytes_are_canonical() {
 #[test]
 fn a_queried_value_plus_p_is_refused() {
     use stwo::core::fields::m31::{BaseField, P};
-    let program = Program::install(&blob(), &witness(1), 0).expect("installs");
+    let program = Program::install(&FORMAT, &blob(), &witness(1), 0).expect("installs");
     let (proof, _) = program
         .prove(&witness(3), MaskRng::default())
         .expect("proves");
     let mut wide = proof.proof.clone();
     let value = &mut wide.stark_proof.0.queried_values[0][0][0];
     *value = BaseField::from_u32_unchecked(value.0 + P);
-    let bytes = encode(&wide).expect("encodes");
+    let bytes = encode(&FORMAT, &wide).expect("encodes");
     assert_eq!(
-        encode(&decode(&bytes).expect("decodes")),
+        encode(&FORMAT, &decode(&FORMAT, &bytes).expect("decodes")),
         Some(bytes.clone())
     );
     assert!(matches!(
@@ -132,11 +132,11 @@ fn a_queried_value_plus_p_is_refused() {
 /// by the checks after it.
 #[test]
 fn a_proof_whose_interaction_pow_fails_is_refused_before_its_decode() {
-    let program = Program::install(&blob(), &witness(1), 0).expect("installs");
+    let program = Program::install(&FORMAT, &blob(), &witness(1), 0).expect("installs");
     let (proof, _) = program
         .prove(&witness(3), MaskRng::default())
         .expect("proves");
-    let bytes = encode(&proof.proof).expect("encodes");
+    let bytes = encode(&FORMAT, &proof.proof).expect("encodes");
     assert!(program.verify(&proof.io, &bytes).is_ok());
     // A nonce one of 2^8 nonces passes: of 16 others, the ones that fail
     // fail at the pre-check.
@@ -144,7 +144,7 @@ fn a_proof_whose_interaction_pow_fails_is_refused_before_its_decode() {
         .filter(|&delta| {
             let mut other = proof.proof.clone();
             other.interaction_pow = other.interaction_pow.wrapping_add(delta);
-            let bytes = encode(&other).expect("encodes");
+            let bytes = encode(&FORMAT, &other).expect("encodes");
             matches!(
                 program.verify(&proof.io, &bytes),
                 Err(Error::InteractionPow)
@@ -160,7 +160,7 @@ fn a_proof_whose_interaction_pow_fails_is_refused_before_its_decode() {
     root.stark_proof.0.commitments[1].0[0] ^= 1;
     assert!(
         program
-            .verify(&proof.io, &encode(&root).expect("encodes"))
+            .verify(&proof.io, &encode(&FORMAT, &root).expect("encodes"))
             .is_err()
     );
     let mut io = proof.io;
@@ -169,7 +169,7 @@ fn a_proof_whose_interaction_pow_fails_is_refused_before_its_decode() {
     // The pre-check refuses nothing the verifier without it accepts: a
     // byte of the leading fields flipped, each verified both ways.
     let full = |io: &[u8; 32], bytes: &[u8]| {
-        decode(bytes).is_ok_and(|decoded| {
+        decode(&FORMAT, bytes).is_ok_and(|decoded| {
             let proof = vos_pvm_recair::masked::device::DeviceProof {
                 io: *io,
                 proof: decoded,
@@ -190,16 +190,16 @@ fn a_proof_whose_interaction_pow_fails_is_refused_before_its_decode() {
     }
 }
 
-/// A kernel's programs under 47 and 46 are two programs, their ids apart;
-/// each verifies its own format's proofs and refuses the other's as
-/// `Format` before any decode.
+/// A kernel's programs under two device formats, 47 and the tests' 48, are
+/// two programs, their ids apart; each verifies its own format's proofs and
+/// refuses the other's as `Format` before any decode.
 #[test]
 fn a_proof_of_one_device_format_is_refused_under_the_other() {
-    let byte = vos_pvm_recair::device::format(46).expect("46 is proved");
+    let previous = vos_pvm_recair::device::format(48).expect("48 is proved");
     assert_eq!(vos_pvm_recair::device::FORMATS[0], FORMAT);
-    let word = Program::install(&blob(), &witness(1), 0).expect("installs");
-    let old = Program::install_in(byte, &blob(), &witness(1), 0).expect("installs");
-    assert_eq!((word.format().number, old.format().number), (47, 46));
+    let word = Program::install(&FORMAT, &blob(), &witness(1), 0).expect("installs");
+    let old = Program::install(previous, &blob(), &witness(1), 0).expect("installs");
+    assert_eq!((word.format().number, old.format().number), (47, 48));
     assert_ne!(word.id(), old.id());
     for (program, other) in [(&word, &old), (&old, &word)] {
         let (proof, _) = program
@@ -235,7 +235,7 @@ fn the_device_programs_id_is_pinned() {
         65, 178, 245, 91, 215, 220, 180, 111, 175, 221, 41, 102, 30, 132, 209, 241, 155, 149, 147,
         234, 200, 68, 72, 136, 17, 31, 215, 145, 87, 138, 187, 240,
     ];
-    let program = Program::install(&blob(), &witness(1), 0).expect("installs");
+    let program = Program::install(&FORMAT, &blob(), &witness(1), 0).expect("installs");
     assert_eq!(FORMAT.number, 47);
     assert_eq!(
         (

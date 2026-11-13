@@ -2,8 +2,7 @@
 //! a word of its read-only and read-write data pages, `(address, bytes)`
 //! preprocessed, so part of the program's identity; its main column how
 //! many first touches read the word (`DataWord` relation), which
-//! DeviceWordMemoryChip's rows in a data region consume. `DataTableChip`'s
-//! row a byte, a word at a time.
+//! DeviceWordMemoryChip's rows in a data region consume.
 //!
 //! Past its entries the table repeats them with no multiplicity; with none,
 //! its rows name address 0, which lies in no region.
@@ -89,7 +88,7 @@ impl BuiltInComponent for DataWordTableChip {
 /// is none.
 #[cfg(feature = "prover")]
 fn entries(side_note: &SideNote) -> Vec<(u32, [u8; WORD_BYTES])> {
-    let layout = &crate::chips::device_memory::device_run(side_note).layout;
+    let layout = &crate::chips::device_run(side_note).layout;
     let entries: Vec<(u32, [u8; WORD_BYTES])> = layout
         .data
         .iter()
@@ -136,7 +135,7 @@ impl BuiltInProverComponent for DataWordTableChip {
         let natural = crate::trace::utils::ceil_log2_at_least_lanes(entries.len());
         let log_size = crate::chips::table_log_size(natural, min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
-        let run = crate::chips::device_memory::device_run(side_note);
+        let run = crate::chips::device_run(side_note);
         let row_of: alloc::collections::BTreeMap<u32, usize> = entries
             .iter()
             .enumerate()

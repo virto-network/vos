@@ -11,9 +11,7 @@ pub mod blake2b;
 pub mod byte_to_bits;
 pub mod compare;
 pub mod cpu;
-pub mod data_table;
 pub mod device_boundary;
-pub mod device_memory;
 pub mod divrem;
 pub mod jump_table;
 pub mod memory;
@@ -42,9 +40,7 @@ pub use blake2b::{Blake2bBoundaryChip, Blake2bCall, Blake2bChip, blake2b_compres
 pub use byte_to_bits::ByteToBitsChip;
 pub use compare::CompareChip;
 pub use cpu::{CPU_COLUMN_WORDS, CpuChip, CpuColumns, ProgramCpuChip};
-pub use data_table::DataTableChip;
 pub use device_boundary::{DeviceBoundaryChip, DeviceIoChip};
-pub use device_memory::DeviceMemoryChip;
 pub use divrem::DivRemChip;
 pub use jump_table::JumpTableChip;
 pub use memory::MemoryChip;
@@ -63,6 +59,18 @@ pub use register_memory_boundary::RegisterMemoryBoundaryChip;
 pub use register_memory_closing::RegisterMemoryClosingChip;
 pub use witness_input::WitnessInputChip;
 pub use word_memory::{DataWordTableChip, DeviceWordMemoryChip, WordMemoryChip};
+
+/// The device run a device chip's trace is generated from.
+///
+/// # Panics
+/// On a side note of no device run: the device chips are in no node shape.
+#[cfg(feature = "prover")]
+pub(crate) fn device_run(side_note: &crate::side_note::SideNote) -> &crate::device::DeviceRun {
+    side_note
+        .device
+        .as_deref()
+        .expect("a device chip's trace needs the device run")
+}
 
 /// A fixed table's log size: its entries' `natural`, or `floor` when that
 /// is larger, its rows past the entries repeating them with no

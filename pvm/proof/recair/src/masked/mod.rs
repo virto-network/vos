@@ -482,9 +482,8 @@ pub(crate) fn prove_masked_program<MC: MerkleChannel, C: MaskedProvers>(
 where
     SimdBackend: BackendForChannel<MC>,
 {
-    let masking = match format.masking {
-        Some(masking) if format.masked => masking,
-        _ => return Err(ProveError::UnmaskedFormat),
+    let Some(masking) = format.masking else {
+        return Err(ProveError::UnmaskedFormat);
     };
     if trace.log_sizes.is_empty() {
         return Err(ProveError::TraceShape("no component"));

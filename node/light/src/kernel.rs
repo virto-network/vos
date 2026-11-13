@@ -28,7 +28,7 @@ impl DeviceProgram {
     /// the format's shape. A test's, or a bench's: the light node takes its
     /// programs as release artifacts ([`DeviceProgram::released`]).
     pub fn install(kernel: &[u8], reference: &[u8], headroom: u8) -> Result<Self, DeviceError> {
-        Program::install(kernel, reference, headroom)
+        Program::install(&profile::FORMAT, kernel, reference, headroom)
             .map(Self)
             .map_err(|_| DeviceError::Prove)
     }
@@ -40,7 +40,7 @@ impl DeviceProgram {
     /// no program of it, or its id is not the artifact's.
     pub fn released(device: &Device) -> Result<Self, DeviceError> {
         let format = profile::format(device.format).ok_or(DeviceError::Prove)?;
-        let program = Program::released_in(format, &device.kernel, device.chips, &device.log_sizes)
+        let program = Program::released(format, &device.kernel, device.chips, &device.log_sizes)
             .map_err(|_| DeviceError::Prove)?;
         if *program.id() != device.id {
             return Err(DeviceError::Prove);
@@ -249,12 +249,12 @@ mod tests {
         );
     }
 
-    /// An app shipping a kernel's program in the device format and in the
+    /// An app shipping a kernel's program in the device format and in a
     /// previous one proves with the device format's where the space admits
     /// both, and with the previous one's where it admits that format alone.
     #[test]
     fn the_newest_admitted_format_is_chosen() {
-        let previous = profile::FORMATS[1].number;
+        let previous = 48;
         let app = [shipped(2, DEVICE_FORMAT), shipped(1, previous)];
         let chosen = |window: &DeviceWindow| {
             choose(&app, window, AUTH).map(|device| (device.id[0], device.format))

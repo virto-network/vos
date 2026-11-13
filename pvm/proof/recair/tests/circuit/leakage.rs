@@ -143,7 +143,6 @@ fn masked(witness: &Witness, n: usize) -> Fields {
 fn unmasked(witness: &Witness, n: usize) -> Fields {
     let finalized = private_circuit(witness);
     let format = Format {
-        masked: false,
         masking: None,
         ..format()
     };

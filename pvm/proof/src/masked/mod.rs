@@ -192,8 +192,8 @@ impl ChipSet for Node {
 
 /// The device profile's segment (`crate::device`): the shared chip set
 /// without the page boundary, in
-/// [`DEVICE_ORDER`](crate::device::DEVICE_ORDER), its CPU the program's and
-/// its memory ledger the format's ([`DeviceShape`]), the io-hash's claimed
+/// [`DEVICE_ORDER`](crate::device::DEVICE_ORDER), its CPU the program's
+/// ([`DeviceShape`]), its memory ledger a row a word, the io-hash's claimed
 /// sum (DeviceIoChip's) its one public sum.
 pub enum Device {}
 
@@ -209,12 +209,12 @@ impl ChipSet for Device {
     fn visit<V: ChipVisitor>(active: DeviceShape, index: usize, visitor: V) -> V::Output {
         match active.program_cpu() {
             Some(cpu) if index == chip_idx::CPU => visitor.visit(&cpu),
-            _ => crate::visit_device_chip(active.memory, index, visitor),
+            _ => crate::visit_device_chip(index, visitor),
         }
     }
 
-    fn machine(active: DeviceShape, index: usize) -> &'static dyn MachineComponent {
-        crate::device_machine_component(active.memory, index)
+    fn machine(_: DeviceShape, index: usize) -> &'static dyn MachineComponent {
+        crate::device_machine_component(index)
     }
 
     fn public_sums(active: DeviceShape) -> Vec<usize> {

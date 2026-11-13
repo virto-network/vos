@@ -89,7 +89,6 @@ pub fn small_format(channel: ChannelKind, log_mask_rows: u32, n_queries: usize) 
             interaction_pow_bits: 4,
             batching: DeepBatching::Affine,
         },
-        masked: true,
         masking: Some(Masking {
             salt_columns: 8,
             fri_mask_columns: 8,

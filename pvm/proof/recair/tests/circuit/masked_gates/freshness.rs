@@ -54,7 +54,6 @@ fn a_right_guess_reproduces_an_unblinded_sum_only() {
             .map(|(_, sum)| sum)
     };
     let unmasked = Format {
-        masked: false,
         masking: None,
         ..format()
     };

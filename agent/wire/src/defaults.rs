@@ -238,9 +238,8 @@ pub const CREDENTIAL_HORIZON_MS: u64 = 120_000;
 /// batch time its release retires it at, if any (`light-node.md` §4.4): at
 /// most the current and the previous. Apply refuses a proof of any other,
 /// or of one past its date, on every replica, so no node's configuration
-/// admits it for the space: 47's release retires 46 at once, its byte
-/// ledger letting a read see a stale byte (`open.md`).
-pub const DEVICE_FORMATS: [(u32, Option<u64>); 2] = [(47, None), (46, Some(0))];
+/// admits it for the space.
+pub const DEVICE_FORMATS: &[(u32, Option<u64>)] = &[(47, None)];
 
 /// How long past its `expires_ms` a credentialed call's binding digest stays
 /// recorded, in milliseconds of batch time: past it, the sweep forgets it,

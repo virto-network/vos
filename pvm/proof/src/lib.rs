@@ -341,68 +341,49 @@ chips! {
 }
 
 /// Calls `visitor` with the shared chip set's chip at `index` as a device
-/// shape of memory ledger `memory` holds it (`device::device_chip`): the
-/// device's chips past [`chip_idx::COUNT`], the word ledger's at MEMORY and
-/// in their place under [`format::Memory::Word`], the segment AIR's
+/// shape holds it (`device::device_chip`): the device's chips past
+/// [`chip_idx::COUNT`], the word ledger's at MEMORY, the segment AIR's
 /// otherwise.
 ///
 /// # Panics
 /// When `index` is no chip's.
-pub(crate) fn visit_device_chip<V: ChipVisitor>(
-    memory: format::Memory,
-    index: usize,
-    visitor: V,
-) -> V::Output {
+pub(crate) fn visit_device_chip<V: ChipVisitor>(index: usize, visitor: V) -> V::Output {
     use device::device_chip;
-    match (memory, index) {
-        (format::Memory::Word, device_chip::MEMORY) => visitor.visit(&chips::WordMemoryChip),
-        (format::Memory::Word, device_chip::DEVICE_MEMORY) => {
-            visitor.visit(&chips::DeviceWordMemoryChip)
-        }
-        (format::Memory::Word, device_chip::DATA_TABLE) => visitor.visit(&chips::DataWordTableChip),
-        (_, device_chip::DEVICE_MEMORY) => visitor.visit(&chips::DeviceMemoryChip),
-        (_, device_chip::DATA_TABLE) => visitor.visit(&chips::DataTableChip),
-        (_, device_chip::DEVICE_BOUNDARY) => visitor.visit(&chips::DeviceBoundaryChip),
-        (_, device_chip::DEVICE_IO) => visitor.visit(&chips::DeviceIoChip),
+    match index {
+        device_chip::MEMORY => visitor.visit(&chips::WordMemoryChip),
+        device_chip::DEVICE_MEMORY => visitor.visit(&chips::DeviceWordMemoryChip),
+        device_chip::DATA_TABLE => visitor.visit(&chips::DataWordTableChip),
+        device_chip::DEVICE_BOUNDARY => visitor.visit(&chips::DeviceBoundaryChip),
+        device_chip::DEVICE_IO => visitor.visit(&chips::DeviceIoChip),
         _ => visit_chip(index, visitor),
     }
 }
 
-/// The shared chip set's chip at `index` as a device shape of memory ledger
-/// `memory` holds it, as a prover component ([`visit_device_chip`]'s).
+/// The shared chip set's chip at `index` as a device shape holds it, as a
+/// prover component ([`visit_device_chip`]'s).
 #[cfg(feature = "prover")]
-pub(crate) fn device_component(
-    memory: format::Memory,
-    index: usize,
-) -> &'static dyn framework::MachineProverComponent {
+pub(crate) fn device_component(index: usize) -> &'static dyn framework::MachineProverComponent {
     use device::device_chip;
-    match (memory, index) {
-        (format::Memory::Word, device_chip::MEMORY) => &chips::WordMemoryChip,
-        (format::Memory::Word, device_chip::DEVICE_MEMORY) => &chips::DeviceWordMemoryChip,
-        (format::Memory::Word, device_chip::DATA_TABLE) => &chips::DataWordTableChip,
-        (_, device_chip::DEVICE_MEMORY) => &chips::DeviceMemoryChip,
-        (_, device_chip::DATA_TABLE) => &chips::DataTableChip,
-        (_, device_chip::DEVICE_BOUNDARY) => &chips::DeviceBoundaryChip,
-        (_, device_chip::DEVICE_IO) => &chips::DeviceIoChip,
+    match index {
+        device_chip::MEMORY => &chips::WordMemoryChip,
+        device_chip::DEVICE_MEMORY => &chips::DeviceWordMemoryChip,
+        device_chip::DATA_TABLE => &chips::DataWordTableChip,
+        device_chip::DEVICE_BOUNDARY => &chips::DeviceBoundaryChip,
+        device_chip::DEVICE_IO => &chips::DeviceIoChip,
         _ => BASE_COMPONENTS[index],
     }
 }
 
-/// The shared chip set's chip at `index` as a device shape of memory ledger
-/// `memory` holds it, as a verifier component ([`visit_device_chip`]'s).
-pub(crate) fn device_machine_component(
-    memory: format::Memory,
-    index: usize,
-) -> &'static dyn framework::MachineComponent {
+/// The shared chip set's chip at `index` as a device shape holds it, as a
+/// verifier component ([`visit_device_chip`]'s).
+pub(crate) fn device_machine_component(index: usize) -> &'static dyn framework::MachineComponent {
     use device::device_chip;
-    match (memory, index) {
-        (format::Memory::Word, device_chip::MEMORY) => &chips::WordMemoryChip,
-        (format::Memory::Word, device_chip::DEVICE_MEMORY) => &chips::DeviceWordMemoryChip,
-        (format::Memory::Word, device_chip::DATA_TABLE) => &chips::DataWordTableChip,
-        (_, device_chip::DEVICE_MEMORY) => &chips::DeviceMemoryChip,
-        (_, device_chip::DATA_TABLE) => &chips::DataTableChip,
-        (_, device_chip::DEVICE_BOUNDARY) => &chips::DeviceBoundaryChip,
-        (_, device_chip::DEVICE_IO) => &chips::DeviceIoChip,
+    match index {
+        device_chip::MEMORY => &chips::WordMemoryChip,
+        device_chip::DEVICE_MEMORY => &chips::DeviceWordMemoryChip,
+        device_chip::DATA_TABLE => &chips::DataWordTableChip,
+        device_chip::DEVICE_BOUNDARY => &chips::DeviceBoundaryChip,
+        device_chip::DEVICE_IO => &chips::DeviceIoChip,
         _ => BASE_COMPONENTS[index],
     }
 }

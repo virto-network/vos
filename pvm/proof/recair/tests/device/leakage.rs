@@ -133,14 +133,6 @@ fn heavy_the_device_formats_proofs_do_not_depend_on_the_witness() {
     witness_independent(&vos_pvm_recair::device::FORMAT);
 }
 
-/// The same at format 46, the full CPU and the byte ledger, while its
-/// code lives.
-#[cfg(feature = "heavy-gates")]
-#[test]
-fn heavy_the_byte_device_formats_proofs_do_not_depend_on_the_witness() {
-    witness_independent(&vos_pvm_proof::format::BYTE_DEVICE_PROOF);
-}
-
 /// [`heavy_the_device_formats_proofs_do_not_depend_on_the_witness`] at
 /// device format `format`.
 #[cfg(feature = "heavy-gates")]

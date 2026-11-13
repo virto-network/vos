@@ -150,8 +150,8 @@ pub struct SideNote {
     /// through [`Self::memory_layout`]; attached by
     /// [`Self::with_memory_layout`].
     memory_layout: Option<crate::memory_layout::MemoryLayout>,
-    /// A device proof's run (`crate::device`): its layout and the bytes it
-    /// touches, whose first touches and closing reads `DeviceMemoryChip`
+    /// A device proof's run (`crate::device`): its layout and the words it
+    /// touches, whose first touches and closing reads `DeviceWordMemoryChip`
     /// produces in place of the page boundary. `None` on a node's proof.
     #[cfg(feature = "prover")]
     pub device: Option<alloc::sync::Arc<crate::device::DeviceRun>>,

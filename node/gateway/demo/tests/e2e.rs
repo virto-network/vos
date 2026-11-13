@@ -557,7 +557,7 @@ async fn a_request_naming_another_method_never_reaches_the_node() {
             arguments: Vec::new(),
             nonce: [7; 16],
             expires_ms: 0,
-            format: 46,
+            format: 47,
             claim: vec![0; 64],
             proof: vec![0; 64],
         };

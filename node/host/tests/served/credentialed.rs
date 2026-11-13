@@ -582,9 +582,11 @@ fn every_ingress_refusal_comes_in_its_check_order() {
     assert_eq!(refused(founded.send(at, &again)), CredentialRefusal::Once);
     // A proof with a wrong PoW: refused as any proof that fails.
     let mut wrong = founded.auth(at, &secret, &founded.path(&secret), ("login", "login"), ());
-    let mut decoded = vos_pvm_recair::device::decode(&wrong.proof).unwrap();
+    let mut decoded =
+        vos_pvm_recair::device::decode(&vos_pvm_recair::device::FORMAT, &wrong.proof).unwrap();
     decoded.stark_proof.0.proof_of_work ^= 1;
-    wrong.proof = vos_pvm_recair::device::encode(&decoded).unwrap();
+    wrong.proof =
+        vos_pvm_recair::device::encode(&vos_pvm_recair::device::FORMAT, &decoded).unwrap();
     assert_eq!(refused(founded.send(at, &wrong)), CredentialRefusal::Proof);
     // No log entry holds a proof's bytes.
     let node = founded.cluster.node(at).unwrap();
@@ -1733,33 +1735,33 @@ fn an_app_one_release_behind_signs_in_until_its_window_closes() {
 }
 
 /// The device formats' window (`light-node.md` §4.4) at one node: by
-/// default it admits 47 alone and refuses a 46 proof `Format`. Restarted
-/// admitting both (a test's configuration), its window names the stock
-/// `auth` kernel's program in each, an app shipping both chooses 47 and
-/// one shipping 46 alone chooses 46, and a 47 proof is run as its member's
-/// pseudonym. The operator retires 46 now in the agent's log: a 46 proof
-/// made before is refused `Format` at the node's ingress and the app
-/// chooses 47. Restarted admitting 46 alone, the node's window is empty:
-/// the log's retirement outlives the restart.
+/// default it admits 47 alone and refuses a proof of the tests' second
+/// format, 48 (`device::TEST_FORMAT`), `Format`. Restarted admitting both,
+/// its window names the stock `auth` kernel's program in each, an app
+/// shipping both chooses 47 and one shipping 48 alone chooses 48, and a 47
+/// proof is run as its member's pseudonym. Restarted with 48 retired now: a
+/// 48 proof made before is refused `Format` at the node's ingress and the
+/// app chooses 47. Restarted admitting 48 alone, retired, the node's window
+/// is empty.
 #[test]
 fn the_previous_device_format_is_admitted_until_it_is_retired() {
     use vos_light::wire::{self, Answer};
     use vos_light::{DeviceError, Proven};
 
-    let previous = vos_pvm_recair::device::FORMATS[1].number;
-    assert_eq!((DEVICE_FORMAT, previous), (47, 46));
+    let previous = vos_pvm_recair::device::TEST_FORMAT.number;
+    assert_eq!((DEVICE_FORMAT, previous), (47, 48));
     let founded = Founded::new();
     let auth = founded.method(CREDENTIALS, "auth");
     let elf = std::fs::read(program_elf("vos-credentials")).unwrap();
     let current = stock(&elf, "auth");
-    let byte = vos_light::release::devices_in(previous, &elf)
+    let other = vos_light::release::devices_in(previous, &elf)
         .unwrap()
         .into_iter()
         .find(|device| device.method == auth)
         .unwrap();
-    assert_eq!((current.format, byte.format), (DEVICE_FORMAT, previous));
-    assert_ne!(current.id, byte.id);
-    let (both, only_byte) = (vec![current.clone(), byte.clone()], vec![byte.clone()]);
+    assert_eq!((current.format, other.format), (DEVICE_FORMAT, previous));
+    assert_ne!(current.id, other.id);
+    let (both, only_other) = (vec![current.clone(), other.clone()], vec![other.clone()]);
 
     let at = founded.follower();
     let secrets = [0x51, 0x52, 0x53, 0x54].map(Secret::new);
@@ -1829,16 +1831,22 @@ fn the_previous_device_format_is_admitted_until_it_is_retired() {
         });
     };
 
-    // The release's default: 47 alone, a 46 proof refused at once.
+    // The release's default: 47 alone, a 48 proof refused at once.
     let window_47 = window(&founded, at, CREDENTIALS);
     assert_eq!(formats(&window_47), [DEVICE_FORMAT]);
     assert_eq!(programs(&window_47), [(current.id, DEVICE_FORMAT)]);
-    assert!(matches!(sign_in(0, &only_byte), Err(DeviceError::Window)));
-    let byte_program = DeviceProgram::released(&byte).unwrap();
+    assert!(matches!(sign_in(0, &only_other), Err(DeviceError::Window)));
+    let other_program = DeviceProgram::released(&other).unwrap();
     let call = founded.call(at, POLL, "login", ());
     let refused = founded
         .prover
-        .prove_auth(&secrets[0].0, &witnesses[0], b"login", &call, &byte_program)
+        .prove_auth(
+            &secrets[0].0,
+            &witnesses[0],
+            b"login",
+            &call,
+            &other_program,
+        )
         .unwrap();
     assert_eq!(refused.format, previous);
     assert_eq!(
@@ -1846,65 +1854,52 @@ fn the_previous_device_format_is_admitted_until_it_is_retired() {
         Answer::Refused(CredentialRefusal::Format)
     );
 
-    // Both admitted: one node runs a 47 proof and a 46 proof in one run.
+    // Both admitted.
     restart(vec![(DEVICE_FORMAT, None), (previous, None)]);
     let window_both = window(&founded, at, CREDENTIALS);
     assert_eq!(formats(&window_both), [DEVICE_FORMAT, previous]);
     assert_eq!(
         programs(&window_both),
-        [(current.id, DEVICE_FORMAT), (byte.id, previous)]
+        [(current.id, DEVICE_FORMAT), (other.id, previous)]
     );
     let (format, call, proof) = sign_in(0, &both).unwrap();
     assert_eq!(format, DEVICE_FORMAT, "the newest format admitted");
     assert!(matches!(send(&call, &proof), Answer::Ran { .. }));
-    let made_before = sign_in(2, &only_byte).unwrap();
+    let made_before = sign_in(2, &only_other).unwrap();
     assert_eq!(made_before.0, previous);
 
-    // 46 retired now in the agent's log: its proof refused, the app back
-    // on 47.
+    // 48 retired now: its proof refused, the app back on 47.
     let now = client::time(founded.cluster.target(at)).unwrap();
-    let retired = smol::block_on(founded.cluster.leading(founded.agent).retire_format(
-        founded.agent,
-        previous,
-        now,
-    ))
-    .unwrap();
-    // The date kept is the release's, earlier.
-    assert!(matches!(
-        retired,
-        vos_node::Reply::Ran(Outcome::Done(ref kept)) if Option::<u64>::decode_exact(kept) == Some(Some(0))
-    ));
-    vos_checker::spaces::wait_in_process("the retirement applied", || {
-        formats(&window(&founded, at, CREDENTIALS)) == [DEVICE_FORMAT]
-    });
+    restart(vec![(DEVICE_FORMAT, None), (previous, Some(now))]);
+    assert_eq!(formats(&window(&founded, at, CREDENTIALS)), [DEVICE_FORMAT]);
     let (_, call, proof) = made_before;
     assert_eq!(
         send(&call, &proof),
         Answer::Refused(CredentialRefusal::Format)
     );
-    assert!(matches!(sign_in(2, &only_byte), Err(DeviceError::Window)));
+    assert!(matches!(sign_in(2, &only_other), Err(DeviceError::Window)));
     let (format, call, proof) = sign_in(2, &both).unwrap();
     assert_eq!(format, DEVICE_FORMAT);
     assert!(matches!(send(&call, &proof), Answer::Ran { .. }));
 
-    // 46 alone: the log still retires it.
-    restart(vec![(previous, None)]);
+    // 48 alone, retired: no format.
+    restart(vec![(previous, Some(now))]);
     assert!(window(&founded, at, CREDENTIALS).formats.is_empty());
     assert!(matches!(sign_in(3, &both), Err(DeviceError::Window)));
 }
 
-/// A device format the release retired binds every replica, whatever one
-/// node admits: a follower restarted admitting 46 (a test's
-/// configuration) passes an honest 46 proof at its ingress and forwards
-/// it to the leader, which admits 47 alone, and apply refuses it `Format`
-/// on every replica, so it runs nowhere.
+/// A device format the release does not admit binds every replica, whatever
+/// one node admits: a follower restarted admitting the tests' 48 passes an
+/// honest 48 proof at its ingress and forwards it to the leader, which
+/// admits 47 alone, and apply refuses it `Format` on every replica, so it
+/// runs nowhere.
 #[test]
-fn a_retired_format_one_replica_admits_is_refused_at_apply() {
-    let previous = vos_pvm_recair::device::FORMATS[1].number;
+fn a_format_the_release_does_not_admit_is_refused_at_apply() {
+    let previous = vos_pvm_recair::device::TEST_FORMAT.number;
     let founded = Founded::new();
     let auth = founded.method(CREDENTIALS, "auth");
     let elf = std::fs::read(program_elf("vos-credentials")).unwrap();
-    let byte = vos_light::release::devices_in(previous, &elf)
+    let other = vos_light::release::devices_in(previous, &elf)
         .unwrap()
         .into_iter()
         .find(|device| device.method == auth)
@@ -1937,7 +1932,7 @@ fn a_retired_format_one_replica_admits_is_refused_at_apply() {
             &witness(&path),
             b"login",
             &call,
-            &DeviceProgram::released(&byte).unwrap(),
+            &DeviceProgram::released(&other).unwrap(),
         )
         .unwrap();
     assert_eq!(proof.format, previous);

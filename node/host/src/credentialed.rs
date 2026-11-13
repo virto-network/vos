@@ -66,12 +66,9 @@ use crate::store::Snapshot;
 /// previous (`light-node.md` §4.4), the release's, which apply holds every
 /// replica to ([`defaults::DEVICE_FORMATS`]). A release that brings a new
 /// format sets the previous one's to 60 days on; the operator may set any
-/// earlier date in an agent's log (`Node::retire_format`). Format 47's
-/// release retires 46 at once: its byte ledger lets a read see a stale
-/// byte (`open.md`).
-pub const DEVICE_FORMATS: [(u32, Option<u64>); 2] = defaults::DEVICE_FORMATS;
+/// earlier date in an agent's log (`Node::retire_format`).
+pub const DEVICE_FORMATS: &[(u32, Option<u64>)] = defaults::DEVICE_FORMATS;
 const _: () = assert!(DEVICE_FORMATS[0].0 == device::FORMAT.number);
-const _: () = assert!(DEVICE_FORMATS[1].0 == device::FORMATS[1].number);
 
 /// A device program's place, by its release and format: computed once however many
 /// requests wait on it; `None` for a release whose program cannot be
@@ -91,7 +88,7 @@ pub(crate) struct DevicePrograms {
 
 impl Default for DevicePrograms {
     fn default() -> Self {
-        Self::admitting(&DEVICE_FORMATS).expect("the release's formats")
+        Self::admitting(DEVICE_FORMATS).expect("the release's formats")
     }
 }
 
@@ -369,8 +366,7 @@ impl Inner {
                         blobs.get(&hash).ok().flatten().ok_or(Refused::Unavailable)
                     };
                     let (kernel, reference) = (blob(release.kernel.0)?, blob(release.reference.0)?);
-                    match device::Program::of_in(&in_format, &kernel, &reference, release.headroom)
-                    {
+                    match device::Program::of(&in_format, &kernel, &reference, release.headroom) {
                         Ok(program) => Ok(Some(Arc::new(program.verifier()))),
                         Err(error) if of_the_kernel(&error) => Ok(None),
                         Err(_) => Err(Refused::Unavailable),
@@ -709,8 +705,9 @@ mod tests {
     /// this binary verifies; the release's are.
     #[test]
     fn the_admitted_formats_are_checked() {
-        assert!(DevicePrograms::admitting(&DEVICE_FORMATS).is_some());
-        assert!(DevicePrograms::admitting(&[(46, None)]).is_some());
+        assert!(DevicePrograms::admitting(DEVICE_FORMATS).is_some());
+        let previous = device::FORMATS[1].number;
+        assert!(DevicePrograms::admitting(&[(previous, None)]).is_some());
         assert!(DevicePrograms::admitting(&[]).is_none(), "none");
         assert!(
             DevicePrograms::admitting(&[(45, None)]).is_none(),
@@ -721,7 +718,8 @@ mod tests {
             "twice"
         );
         assert!(
-            DevicePrograms::admitting(&[(47, None), (46, None), (46, Some(1))]).is_none(),
+            DevicePrograms::admitting(&[(47, None), (previous, None), (previous, Some(1))])
+                .is_none(),
             "three"
         );
     }

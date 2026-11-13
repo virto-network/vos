@@ -183,7 +183,7 @@ impl BuiltInProverComponent for DeviceBoundaryChip {
     const IS_PRODUCER: bool = false;
 
     fn generate_preprocessed_trace(&self, log_size: u32, side_note: &SideNote) -> FinalizedTrace {
-        let entry = super::device_memory::device_run(side_note).layout.registers;
+        let entry = crate::chips::device_run(side_note).layout.registers;
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
         for (row, &value) in entry.iter().enumerate() {
             trace.fill_columns(row, true, PreprocessedColumn::IsRegister);

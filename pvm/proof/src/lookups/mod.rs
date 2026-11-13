@@ -24,12 +24,12 @@ pub use self::{
     relations::{
         BitcountLookupElements, BitwiseAndByteLookupElements, BitwiseAndLookupElements,
         BitwiseLookupElements, Blake2bCallLookupElements, Blake2bCompressionLookupElements,
-        ByteToBitsLookupElements, CompareLookupElements, DataTableLookupElements,
-        DataWordLookupElements, DivRemLookupElements, IoHashLookupElements,
-        JumpTableLookupElements, MemoryAccessLookupElements, MemoryWordLookupElements,
-        MerkleNodeLookupElements, MultiplicationLookupElements, PopcountLookupElements,
-        Poseidon2CallLookupElements, PowerOfTwoLookupElements, ProgramExecutionLookupElements,
-        ProgramMemoryLookupElements, RegisterMemoryLookupElements, WitnessCallLookupElements,
+        ByteToBitsLookupElements, CompareLookupElements, DataWordLookupElements,
+        DivRemLookupElements, IoHashLookupElements, JumpTableLookupElements,
+        MemoryAccessLookupElements, MemoryWordLookupElements, MerkleNodeLookupElements,
+        MultiplicationLookupElements, PopcountLookupElements, Poseidon2CallLookupElements,
+        PowerOfTwoLookupElements, ProgramExecutionLookupElements, ProgramMemoryLookupElements,
+        RegisterMemoryLookupElements, WitnessCallLookupElements,
     },
 };
 
@@ -56,7 +56,6 @@ macros::register_relation! {
         ByteToBitsLookupElements,
         WitnessCallLookupElements,
         Poseidon2CallLookupElements,
-        DataTableLookupElements,
         IoHashLookupElements,
         MemoryWordLookupElements,
         DataWordLookupElements,

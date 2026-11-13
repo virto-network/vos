@@ -3,22 +3,19 @@
 //! one channel, timed, verified, its peak memory read and its bytes
 //! counted.
 //!
-//! A cell is `statement/log_blowup:queries:pow[:log_h]/channel[/format]`, the
+//! A cell is `statement/log_blowup:queries:pow[:log_h]/channel`, the
 //! statement a kernel `<statement>.kernel` and its witness input
 //! `<statement>.input` in the kernels' directory, or `auth` or `owner`, the
 //! stock kernel from its embedded release artifact on its reference
 //! program's arguments; the channel `b2sm31` (Blake2s-M31) or `b2b`
-//! (Blake2b-256); the format `47` (the default, the device format: the
-//! per-program CPU and the word ledger) or `46` (the full CPU and the
-//! byte ledger), whose CPU ([`Cpu`]) and memory ledger ([`Memory`]) it
-//! takes. Its format is that one at the cell's parameters, `h` `2^log_h` where the cell names it, else twice the rows a
+//! (Blake2b-256). Its format is the device format, 47, at the cell's
+//! parameters, `h` `2^log_h` where the cell names it, else twice the rows a
 //! column reading two rows reveals, `4·2 + 3q`, rounded up to a power of
 //! two. The program is installed once, its preprocessed tree committed
 //! then: a stock kernel's at its release's chips and log sizes, any other's
 //! from a reference run of the same witness (the shape its run needs, each
-//! chip at least its floor), as is a stock kernel's under format 46 (its
-//! release's log sizes are 47's); each rep traces the
-//! kernel and proves it against the program.
+//! chip at least its floor); each rep traces the kernel and proves it
+//! against the program.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -29,9 +26,7 @@ use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 use stwo::core::vcs_lifted::blake2b_merkle::Blake2bMerkleChannel;
 use stwo::prover::backend::BackendForChannel;
 use stwo::prover::backend::simd::SimdBackend;
-use vos_pvm_proof::format::{
-    BYTE_DEVICE_PROOF, ChannelKind, Cpu, DEVICE_PROOF, Format, FormatParams, Masking, Memory,
-};
+use vos_pvm_proof::format::{ChannelKind, DEVICE_PROOF, Format, FormatParams, Masking};
 use vos_pvm_proof::masked::DeviceComponents;
 use vos_pvm_recair::masked::device::{
     DeviceProof, DeviceProver, device_shape, install, verify_device,
@@ -65,16 +60,15 @@ pub struct Cell {
     /// format's rule (`proving.md` §5).
     pub log_mask_rows: Option<u32>,
     pub channel: ChannelKind,
-    pub cpu: Cpu,
-    pub memory: Memory,
 }
 
 impl Cell {
     pub fn parse(text: &str) -> Self {
         let parts: Vec<&str> = text.split('/').collect();
-        assert!(
-            matches!(parts.len(), 3 | 4),
-            "a cell is statement/blowup:queries:pow/channel[/format]: {text}"
+        assert_eq!(
+            parts.len(),
+            3,
+            "a cell is statement/blowup:queries:pow/channel: {text}"
         );
         let config: Vec<u32> = parts[1]
             .split(':')
@@ -89,11 +83,6 @@ impl Cell {
             "b2b" => ChannelKind::Blake2b256,
             other => panic!("unknown channel {other}"),
         };
-        let (cpu, memory) = match parts.get(3).copied() {
-            None | Some("47") => (DEVICE_PROOF.cpu, DEVICE_PROOF.memory),
-            Some("46") => (BYTE_DEVICE_PROOF.cpu, BYTE_DEVICE_PROOF.memory),
-            Some(other) => panic!("unknown device format {other}"),
-        };
         Self {
             statement: parts[0].to_string(),
             log_blowup: config[0],
@@ -101,8 +90,6 @@ impl Cell {
             pow: config[2],
             log_mask_rows: config.get(3).copied(),
             channel,
-            cpu,
-            memory,
         }
     }
 
@@ -121,12 +108,6 @@ impl Cell {
                 log_mask_rows: self.log_mask_rows.unwrap_or(h.ilog2()),
                 ..DEVICE_PROOF.masking.expect("the device format's masking")
             }),
-            cpu: self.cpu,
-            memory: self.memory,
-            number: match self.memory {
-                Memory::Word => DEVICE_PROOF.number,
-                Memory::Byte => BYTE_DEVICE_PROOF.number,
-            },
             ..DEVICE_PROOF
         }
     }
@@ -183,8 +164,8 @@ fn statement(dir: &Path, statement: &str) -> Statement {
 }
 
 /// The steps of the kernel's run `trace` gives, and the program's chips and
-/// log sizes: the release's where it has one and the format is the
-/// release's, else the shape that run needs.
+/// log sizes: the release's where it has one, else the shape that run
+/// needs.
 fn shape(
     format: &Format,
     kernel: &[u8],
@@ -194,8 +175,8 @@ fn shape(
     let mut reference = trace();
     let steps = reference.steps.len();
     let (active, log_sizes) = match released {
-        Some(shape) if format.memory == DEVICE_PROOF.memory => shape,
-        _ => device_shape(format, kernel, &mut reference).expect("a shape"),
+        Some(shape) => shape,
+        None => device_shape(format, kernel, &mut reference).expect("a shape"),
     };
     (steps, active, log_sizes)
 }
@@ -400,15 +381,13 @@ fn measure<MC: MerkleChannel>(
             .join(",")
     };
     println!(
-        "{{\"kind\":\"device_cell\",\"cell\":\"{name}\",\"format\":{},\"cpu\":\"{:?}\",\"memory\":\"{:?}\",\"cpu_columns\":{},\"threads\":{},\"steps\":{steps},\
+        "{{\"kind\":\"device_cell\",\"cell\":\"{name}\",\"format\":{},\"cpu_columns\":{},\"threads\":{},\"steps\":{steps},\
          \"chips\":{chips:?},\"log_sizes\":{log_sizes:?},\"log_mask_rows\":{},\"columns\":{columns},\"cells\":{cells},\"by_chip\":[{}],\
          \"reps\":{reps},\"install_ms\":{install_ms:.1},\"trace_ms_p50\":{:.1},\
          \"prove_ms_p50\":{:.1},\"prove_ms_p95\":{:.1},\"prove_ms_min\":{:.1},\"prove_ms_max\":{:.1},\"prove_ms_runs\":[{}],\
          \"verify_ms_p50\":{:.2},\"r1_attempts\":{},\"r1_ms\":{:.1},\"proof_bytes\":{},\"distinct_proofs\":{distinct},\
          \"proof_sha256\":\"{}\",\"verified\":true,\"peak_rss_mib\":{:.1}}}",
         format.number,
-        format.cpu,
-        format.memory,
         program.cpu.width(),
         rayon::current_num_threads(),
         format.masking.expect("masked").log_mask_rows,

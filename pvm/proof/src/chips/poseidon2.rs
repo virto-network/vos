@@ -1,5 +1,5 @@
 //! Poseidon2Chip — the Poseidon2 call (`0x402`),
-//! one permutation a row, in the shared chip set (formats 41, 46 and 47).
+//! one permutation a row, in the shared chip set (formats 41 and 47).
 //!
 //! A row is a served call at its step's timestamp:
 //!

@@ -70,6 +70,9 @@ vos-keeper = { path = "../../tools/keeper" }
 # The device library's requests and proofs, admitted by ingress end to end,
 # and the release build of its device programs.
 vos-light = { workspace = true, features = ["release"] }
+# A second device format beside the release's, the format window's tests'
+# (`device::TEST_FORMAT`): a dev edge, no production build has it.
+vos-pvm-recair = { workspace = true, features = ["test-formats"] }
 # A kernel run alone, as an attest runs it.
 vos-testkit = { path = "../../agent/testkit" }
 proptest = "1"

@@ -1,8 +1,7 @@
 //! The per-program CPU (`docs/design/proving.md` §8): a device program's
-//! CPU cut to the columns its code sets, under a format that takes it
-//! (`Cpu::PerProgram`); its columns the program's, bound by its id and its
-//! transcript, and an instruction its code does not hold unprovable under
-//! it.
+//! CPU cut to the columns its code sets; its columns the program's, bound
+//! by its id and its transcript, and an instruction its code does not hold
+//! unprovable under it.
 
 use stwo::core::channel::MerkleChannel;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
@@ -10,8 +9,7 @@ use vos_pvm::instruction::Opcode;
 use vos_pvm_compiler::assembler::{Assembler, Reg};
 use vos_pvm_proof::chips::CpuColumns;
 use vos_pvm_proof::core::ecall::{ECALL_POSEIDON2, ECALL_WITNESS_INPUT};
-use vos_pvm_proof::format::ChannelKind;
-use vos_pvm_proof::format::{Cpu, Format};
+use vos_pvm_proof::format::{ChannelKind, Format};
 use vos_pvm_recair::device::program_id;
 use vos_pvm_recair::masked::device::{DeviceProgram, prove_device_forced, verify_device};
 use vos_pvm_recair::masked::{Checks, MaskRng};
@@ -23,21 +21,9 @@ use crate::support::{
 type B2 = Blake2sM31MerkleChannel;
 type Program = DeviceProgram<<B2 as MerkleChannel>::H>;
 
-/// The device tests' small format on Blake2s-M31 with the per-program
-/// CPU.
+/// The device tests' small format on Blake2s-M31.
 fn per_program() -> Format {
-    Format {
-        cpu: Cpu::PerProgram,
-        ..full()
-    }
-}
-
-/// The device tests' small format on Blake2s-M31 with the full CPU.
-fn full() -> Format {
-    Format {
-        cpu: Cpu::Full,
-        ..small_format(ChannelKind::Blake2sM31, 6, 4)
-    }
+    small_format(ChannelKind::Blake2sM31, 6, 4)
 }
 
 /// [`blob`] with a division before its halt: a kernel whose code holds an
@@ -68,7 +54,7 @@ fn dividing() -> Vec<u8> {
 
 /// A kernel's run proves and verifies under its per-program CPU, every
 /// witness under one program, the CPU narrower than the full one and the
-/// code's own; the full CPU's program of the same kernel is another
+/// code's own; the same kernel's program with every column is another
 /// program, by its id and its transcript, and neither verifies the other's
 /// proofs.
 #[test]
@@ -88,11 +74,12 @@ fn a_per_program_cpu_proves_its_kernel() {
         .expect("proves");
         verify::<B2>(&per_program(), &narrow, &proof).expect("verifies");
     }
-    let whole_cpu = program::<B2>(&full(), &blob());
-    assert_eq!(whole_cpu.cpu, CpuColumns::ALL);
-    assert_eq!(whole_cpu.circuit, narrow.circuit);
+    let whole_cpu = Program {
+        cpu: CpuColumns::ALL,
+        ..narrow.clone()
+    };
     assert_ne!(
-        program_id(&full(), &whole_cpu),
+        program_id(&per_program(), &whole_cpu),
         program_id(&per_program(), &narrow)
     );
     assert_ne!(whole_cpu.header(), narrow.header());
@@ -105,14 +92,14 @@ fn a_per_program_cpu_proves_its_kernel() {
     )
     .expect("proves");
     let (whole, _) = prove::<B2>(
-        &full(),
+        &per_program(),
         &whole_cpu,
         &blob(),
         &witness(1),
         MaskRng::Seeded(3),
     )
     .expect("proves");
-    assert!(verify::<B2>(&full(), &whole_cpu, &cut).is_err());
+    assert!(verify::<B2>(&per_program(), &whole_cpu, &cut).is_err());
     assert!(verify::<B2>(&per_program(), &narrow, &whole).is_err());
 }
 

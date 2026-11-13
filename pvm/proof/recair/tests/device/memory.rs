@@ -1,28 +1,24 @@
 //! The word ledger (`docs/design/proving.md` §8): a device program's memory
-//! a row a word, under a format that takes it (`Memory::Word`); its
-//! accesses' byte tuples, at any width and alignment, bound to the bytes
-//! the word holds, its first touch and its closing read a word's, and the
-//! ledger bound by the program's id and its transcript.
+//! a row a word; its accesses' byte tuples, at any width and alignment,
+//! bound to the bytes the word holds, its first touch and its closing read
+//! a word's.
 
 use stwo::core::channel::MerkleChannel;
 use stwo::core::fields::m31::BaseField;
 use stwo::core::utils::{bit_reverse_index, coset_index_to_circle_domain_index};
 use stwo::core::verifier::VerificationError;
 use stwo::prover::ProvingError;
-use stwo::prover::backend::BackendForChannel;
-use stwo::prover::backend::simd::SimdBackend;
 use vos_pvm::instruction::Opcode;
 use vos_pvm_compiler::assembler::{Assembler, Reg};
 use vos_pvm_final_verifier::Error;
 use vos_pvm_proof::AirColumn;
 use vos_pvm_proof::chips::word_memory::{self, boundary};
 use vos_pvm_proof::device::{WORD_BYTES, device_chip, device_chips_of_mask};
-use vos_pvm_proof::format::{Format, Memory};
+use vos_pvm_proof::format::Format;
 use vos_pvm_proof::masked::MaskedDeviceTrace;
 use vos_pvm_proof::poseidon2::P2MerkleChannel;
 use vos_pvm_proof::side_note::SideNote;
 use vos_pvm_recair::ProveError;
-use vos_pvm_recair::device::program_id;
 use vos_pvm_recair::masked::device::{
     DeviceProgram, device_shape, install, prove_device, prove_device_forced, verify_device,
 };
@@ -31,23 +27,11 @@ use vos_pvm_recair::masked::{Checks, MaskRng};
 use crate::support::{HEAP, RO_BASE, RO_DATA, RW_BASE, RW_DATA, io_and_halt};
 
 type P2 = P2MerkleChannel;
-type B2 = stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 type Program = DeviceProgram<<P2 as MerkleChannel>::H>;
 
-/// The device gates' format under the word ledger, its CPU the gates'.
+/// The device gates' format.
 fn word() -> Format {
-    Format {
-        memory: Memory::Word,
-        ..crate::support::format()
-    }
-}
-
-/// The same under the byte ledger.
-fn byte() -> Format {
-    Format {
-        memory: Memory::Byte,
-        ..crate::support::format()
-    }
+    crate::support::format()
 }
 
 /// The heap area the mixed kernel works in, past a word the read-write
@@ -136,18 +120,10 @@ fn mixed_run() -> SideNote {
         .side_note
 }
 
-/// The program of [`mixed`] under `format` on `MC`.
-fn program_on<MC: MerkleChannel>(format: &Format) -> DeviceProgram<MC::H>
-where
-    SimdBackend: BackendForChannel<MC>,
-{
-    let (active, log_sizes) = device_shape(format, &mixed(), &mut mixed_run()).expect("a shape");
-    install::<MC>(format, &mixed(), active, &log_sizes).expect("installs")
-}
-
 /// The program of [`mixed`] under `format`.
 fn mixed_program(format: &Format) -> Program {
-    program_on::<P2>(format)
+    let (active, log_sizes) = device_shape(format, &mixed(), &mut mixed_run()).expect("a shape");
+    install::<P2>(format, &mixed(), active, &log_sizes).expect("installs")
 }
 
 /// The run with load `k` of [`LOADS`] reading its low byte's bit 0
@@ -306,10 +282,8 @@ fn ledger_addresses(ledger: &Chip<'_>) -> Vec<Option<u32>> {
         .collect()
 }
 
-/// The kernel of every width proves under the word ledger, as under the
-/// byte ledger, its loads the bytes the stores left; the two programs are
-/// two, by their ids and their transcripts, each refusing the other's
-/// proofs and the other's format; the word ledger takes fewer rows.
+/// The kernel of every width proves under the word ledger, its loads the
+/// bytes the stores left.
 #[test]
 fn every_width_and_alignment_proves_under_the_word_ledger() {
     let run = mixed_run();
@@ -360,58 +334,14 @@ fn every_width_and_alignment_proves_under_the_word_ledger() {
             ro(6, 4),
         ]
     );
-    let (word, byte) = (word(), byte());
-    let [word_program, byte_program] = [&word, &byte].map(mixed_program);
-    for (format, program) in [(&word, &word_program), (&byte, &byte_program)] {
-        for seed in [1, 2] {
-            let (proof, _) =
-                prove_device::<P2>(format, program, &mut mixed_run(), MaskRng::Seeded(seed))
-                    .expect("proves");
-            verify_device::<P2>(format, program, &proof).expect("verifies");
-        }
+    let word = word();
+    let program = mixed_program(&word);
+    for seed in [1, 2] {
+        let (proof, _) =
+            prove_device::<P2>(&word, &program, &mut mixed_run(), MaskRng::Seeded(seed))
+                .expect("proves");
+        verify_device::<P2>(&word, &program, &proof).expect("verifies");
     }
-    assert_eq!(word_program.memory, Memory::Word);
-    assert_eq!(byte_program.memory, Memory::Byte);
-    let on_b2 = program_on::<B2>(&word);
-    assert_ne!(
-        program_id(&word, &on_b2),
-        program_id(
-            &word,
-            &DeviceProgram {
-                memory: Memory::Byte,
-                ..on_b2.clone()
-            }
-        )
-    );
-    assert_ne!(word_program.header(), byte_program.header());
-    let (word_proof, _) =
-        prove_device::<P2>(&word, &word_program, &mut mixed_run(), MaskRng::Seeded(3))
-            .expect("proves");
-    let (byte_proof, _) =
-        prove_device::<P2>(&byte, &byte_program, &mut mixed_run(), MaskRng::Seeded(3))
-            .expect("proves");
-    // A program under another ledger's format is refused whole; a proof
-    // against the other ledger's program, under its own format, too.
-    assert!(matches!(
-        verify_device::<P2>(&byte, &word_program, &word_proof),
-        Err(Error::Format)
-    ));
-    assert!(matches!(
-        verify_device::<P2>(&word, &byte_program, &byte_proof),
-        Err(Error::Format)
-    ));
-    let relabelled = DeviceProgram {
-        memory: Memory::Byte,
-        ..word_program.clone()
-    };
-    assert!(verify_device::<P2>(&byte, &relabelled, &word_proof).is_err());
-    let at = |program: &Program, chip| {
-        let position = device_chips_of_mask(program.active)
-            .position(|active| active == chip)
-            .expect("the chip");
-        program.log_sizes[position]
-    };
-    assert!(at(&word_program, device_chip::MEMORY) <= at(&byte_program, device_chip::MEMORY));
 }
 
 /// A load reading other than the bytes its word holds is refused, whatever
@@ -563,8 +493,7 @@ fn a_lane_taken_on_padding_is_refused() {
 
 /// A first touch of a word's byte no access reaches is the layout's too:
 /// a heap byte of a word the kernel writes in part, nonzero in its machine
-/// before the run, is refused under the word ledger, where the byte
-/// ledger, holding touched bytes alone, proves the run.
+/// before the run, is refused.
 #[test]
 fn an_untouched_byte_of_a_touched_word_is_bound() {
     let forged = || {
@@ -586,11 +515,6 @@ fn an_untouched_byte_of_a_touched_word_is_bound() {
     );
     let format = word();
     refused_as_a_broken_constraint(&format, &mixed_program(&format), forged);
-    let byte = byte();
-    let program = mixed_program(&byte);
-    let (proof, _) = prove_device::<P2>(&byte, &program, &mut forged(), MaskRng::Seeded(5))
-        .expect("the byte ledger proves it");
-    verify_device::<P2>(&byte, &program, &proof).expect("verifies");
 }
 
 /// Padding between real rows is refused: the ledger's rows turned so its
@@ -637,35 +561,6 @@ fn pad_inside(trace: &mut MaskedDeviceTrace, program: &Program, chip: usize, is_
     ledger.write(&rows);
 }
 
-/// Padding between the byte ledger's real rows is accepted: the ledger
-/// (`MemoryChip`, the byte ledger format 46 takes) turned as in
-/// [`padding_between_real_rows_is_refused`], the proof verifies. The byte
-/// ledger has no last-row column and its sortedness gadget does not fire
-/// across a padding row, so its real rows may be several sorted runs; and
-/// `DeviceMemoryChip` lets a byte have as many boundary rows as the prover
-/// puts, so each run may hold a group of one byte, its writes in one and
-/// its reads in another: the byte ledger's known gap, which the word
-/// ledger's `IsLast` closes (`docs/design/proving.md` §10). The test runs
-/// the shape's byte ledger, not registry entry 46: it asserts the refusal
-/// once the byte ledger takes a last-row column, and goes with the byte
-/// ledger if the device drops it.
-#[test]
-fn byte_ledger_padding_between_real_rows_is_accepted_today() {
-    use vos_pvm_proof::chips::memory::Column;
-    let format = byte();
-    let program = mixed_program(&format);
-    let tamper = |trace: &mut MaskedDeviceTrace| {
-        pad_inside(
-            trace,
-            &program,
-            device_chip::MEMORY,
-            Column::IsPadding.offset(),
-        );
-    };
-    let proof = forced(&format, &program, &mut mixed_run(), tamper);
-    verify_device::<P2>(&format, &program, &proof).expect("the byte ledger takes padding anywhere");
-}
-
 /// Padding between the register ledger's real rows is accepted, and is
 /// sound: every real row after a padding row starts a register's chain,
 /// which must be that register's `ts = 0` write (`ChainStartH`), and
@@ -676,19 +571,18 @@ fn byte_ledger_padding_between_real_rows_is_accepted_today() {
 #[test]
 fn register_ledger_padding_between_real_rows_is_harmless() {
     use vos_pvm_proof::chips::register_memory::Column;
-    for format in [word(), byte()] {
-        let program = mixed_program(&format);
-        let tamper = |trace: &mut MaskedDeviceTrace| {
-            pad_inside(
-                trace,
-                &program,
-                device_chip::REGISTER_MEMORY,
-                Column::IsPadding.offset(),
-            );
-        };
-        let proof = forced(&format, &program, &mut mixed_run(), tamper);
-        verify_device::<P2>(&format, &program, &proof).expect("one chain a register");
-    }
+    let format = word();
+    let program = mixed_program(&format);
+    let tamper = |trace: &mut MaskedDeviceTrace| {
+        pad_inside(
+            trace,
+            &program,
+            device_chip::REGISTER_MEMORY,
+            Column::IsPadding.offset(),
+        );
+    };
+    let proof = forced(&format, &program, &mut mixed_run(), tamper);
+    verify_device::<P2>(&format, &program, &proof).expect("one chain a register");
 }
 
 /// An inner row that takes no lane is refused: a read's row repeated after

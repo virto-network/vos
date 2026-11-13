@@ -4,7 +4,7 @@
 8eaef15ecd9f4a7c594bdf4a38c51c390f8f865461b36c99f80cde71f4aaf99a  target/riscv64em-vos/release/final-verify.elf
 c3a8803233b1cf1b4d1b0b6a00bbe76579da098722a6cec27e666d38ecb20555  target/riscv64em-vos/release/final-verify-test.elf
 4aadd58eb9b615e555c17d47337905ec4956c2961c9a3a3ee06ed0258fde8e58  target/riscv64em-vos/release/statement-service.elf
-a9c3edfb1dbbf91be2f49fa528581c18a67b9a1f4d52ba9d4d41e42b92b60f4e  agent/programs/target/riscv64em-vos/release/vos-agent.elf
+f7d9be05bbf51f4a7122f59edec85e18e1258276bfebc6c4c99689615bcb5233  agent/programs/target/riscv64em-vos/release/vos-agent.elf
 7b88fe03e7dc51c7bea81bf26a16318199457e64e2b01210122655b53cca46a3  agent/programs/target/riscv64em-vos/release/vos-representative.elf
 4480ead1edcc7856e48a772c7dc6b0cd1166776186746cef28a0b43481209c06  agent/programs/target/riscv64em-vos/release/vos-credentials.elf
 b68acc375f4566417ce68e5466dccc993276ee776e2592127e67cf817a7dd967  agent/programs/target/riscv64em-vos/release/vos-personal.elf

@@ -560,9 +560,13 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
     audit
         .needles
         .kernel_arguments("the member", &arguments, claim.len());
-    let kernel =
-        vos_pvm_recair::device::Program::released(&auth.kernel, auth.chips, &auth.log_sizes)
-            .unwrap();
+    let kernel = vos_pvm_recair::device::Program::released(
+        &vos_pvm_recair::device::FORMAT,
+        &auth.kernel,
+        auth.chips,
+        &auth.log_sizes,
+    )
+    .unwrap();
     let ((proved, _), drawn) = drawn_in(|| kernel.prove(&arguments, MaskRng::default()).unwrap());
     let drawn: Vec<(&str, Vec<u8>)> = drawn.into_iter().map(|d| (d.what, d.bytes)).collect();
     for what in [
@@ -579,7 +583,8 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
     let watched_proof = Proven {
         format: DEVICE_FORMAT,
         claim,
-        proof: vos_pvm_recair::device::encode(&proved.proof).unwrap(),
+        proof: vos_pvm_recair::device::encode(&vos_pvm_recair::device::FORMAT, &proved.proof)
+            .unwrap(),
     };
     answers.push(ran(send(&watched, &watched_proof)));
 

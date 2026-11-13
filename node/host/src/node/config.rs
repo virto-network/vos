@@ -170,13 +170,11 @@ pub struct Config {
     pub verifications: Option<usize>,
     /// The device formats this node admits, newest first, each with the
     /// retirement its release set, if any (`light-node.md` §4.4): by
-    /// default the release's, [`crate::DEVICE_FORMATS`], which admits 47
-    /// alone (46's byte ledger is not consistent, `open.md`). At most two,
-    /// each one this binary verifies (`vos_pvm_recair::device::FORMATS`),
-    /// else the node does not open. Admitting the previous format past its
-    /// release's date is a test's: the window's mechanism. It narrows what
-    /// this node's ingress admits; apply refuses a format the release
-    /// retired whatever any node admits.
+    /// default the release's, [`crate::DEVICE_FORMATS`]. At most two, each
+    /// one this binary verifies (`vos_pvm_recair::device::FORMATS`), else
+    /// the node does not open. It narrows what this node's ingress admits;
+    /// apply refuses a format the release does not admit, or retired,
+    /// whatever any node admits.
     pub device_formats: Vec<(u32, Option<u64>)>,
     /// The device formats this node's ingress refuses, each from its time
     /// in ms, where that is earlier than its release's (`light-node.md`

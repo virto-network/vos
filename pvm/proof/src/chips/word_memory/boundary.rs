@@ -1,6 +1,6 @@
 //! DeviceWordMemoryChip — a device run's memory boundary under the word
-//! ledger, a row a word the run touches a byte of: `DeviceMemoryChip`'s
-//! row a byte, a word at a time.
+//! ledger, a row a word the run touches a byte of, in place of the
+//! page-Merkle boundary.
 //!
 //! A row PRODUCES the word's `ts = 0` write into the `MemoryWord` relation,
 //! its bytes the word's first touch and its last field `2·permission`, and
@@ -10,8 +10,12 @@
 //! **The address** is 29 boolean columns, its bits 3..32, so it is a
 //! multiple of [`WORD_BYTES`] and its four limbs are bytes, the low one at
 //! most 248, and its page index (bits 12..32) below 2^20. **Its region** is
-//! proved as `DeviceMemoryChip` proves a byte's (regions are whole pages,
-//! so a word lies in one). **The first touch** of a data region's word is
+//! selected among the layout's (`device::region`), preprocessed constants
+//! of the program's identity, and proved by two 20-bit distances,
+//! `page − first` and `end − 1 − page`, as MemoryPageChip proves a page's;
+//! a real row selects exactly one, so an address outside every region has
+//! no row and no first touch (regions are whole pages, so a word lies in
+//! one). **The first touch** of a data region's word is
 //! the data table's word (`DataWord` relation, `DataWordTableChip`), of any
 //! other region's eight zeros. **The permission** is the region's.
 //!
@@ -238,9 +242,7 @@ impl BuiltInProverComponent for DeviceWordMemoryChip {
 
     fn generate_preprocessed_trace(&self, log_size: u32, side_note: &SideNote) -> FinalizedTrace {
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
-        let regions = crate::chips::device_memory::device_run(side_note)
-            .layout
-            .regions;
+        let regions = crate::chips::device_run(side_note).layout.regions;
         let firsts = regions.map(|range| BaseField::from(range.first));
         let ends = regions.map(|range| BaseField::from(range.end));
         for row in 0..trace.num_rows() {
@@ -255,7 +257,7 @@ impl BuiltInProverComponent for DeviceWordMemoryChip {
         side_note: &SideNote,
         min_log_size: u32,
     ) -> FinalizedTrace {
-        let run = crate::chips::device_memory::device_run(side_note);
+        let run = crate::chips::device_run(side_note);
         let log_size =
             crate::trace::utils::ceil_log2_at_least_lanes(run.words.len()).max(min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);

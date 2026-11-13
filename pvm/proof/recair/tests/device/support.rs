@@ -10,7 +10,7 @@ use stwo::prover::backend::simd::SimdBackend;
 use vos_pvm_compiler::assembler::{Assembler, Reg};
 use vos_pvm_final_verifier::Error;
 use vos_pvm_proof::core::ecall::{ECALL_POSEIDON2, ECALL_WITNESS_INPUT};
-use vos_pvm_proof::format::{ChannelKind, Cpu, Format, FormatParams, Masking, Memory, SEGMENT};
+use vos_pvm_proof::format::{ChannelKind, Format, FormatParams, Masking, SEGMENT};
 use vos_pvm_proof::poseidon2::P2MerkleChannel;
 use vos_pvm_proof::side_note::SideNote;
 use vos_pvm_recair::ProveError;
@@ -108,7 +108,7 @@ pub fn run(blob: &[u8], input: &[u8]) -> SideNote {
 
 /// A masked device format of no registered number on `channel`: blowup 4,
 /// `n_queries` queries, `h = 2^log_mask_rows`, 8 salts a tree and an `R` of
-/// 8, its memory ledger [`memory`]'s.
+/// 8.
 pub fn small_format(channel: ChannelKind, log_mask_rows: u32, n_queries: usize) -> Format {
     Format {
         number: 0x7e43,
@@ -122,36 +122,18 @@ pub fn small_format(channel: ChannelKind, log_mask_rows: u32, n_queries: usize) 
             interaction_pow_bits: 4,
             batching: DeepBatching::Affine,
         },
-        masked: true,
         masking: Some(Masking {
             salt_columns: 8,
             fri_mask_columns: 8,
             log_mask_rows,
         }),
-        memory: memory(),
         ..SEGMENT
     }
 }
 
-/// The small format R1 passes: `h = 64`, every chip at 2^8 rows at least,
-/// its CPU [`cpu`]'s.
+/// The small format R1 passes: `h = 64`, every chip at 2^8 rows at least.
 pub fn format() -> Format {
-    Format {
-        cpu: cpu(),
-        ..small_format(ChannelKind::Poseidon2M31, 6, 4)
-    }
-}
-
-/// The CPU the device gates prove under: the device format's, the
-/// per-program CPU.
-pub fn cpu() -> Cpu {
-    vos_pvm_recair::device::FORMAT.cpu
-}
-
-/// The memory ledger the device gates prove under: the device format's, a
-/// row a word.
-pub fn memory() -> Memory {
-    vos_pvm_recair::device::FORMAT.memory
+    small_format(ChannelKind::Poseidon2M31, 6, 4)
 }
 
 /// The kernel's program under `format` on `MC`, its shape from a reference

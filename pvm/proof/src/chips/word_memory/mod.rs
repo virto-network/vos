@@ -1,5 +1,5 @@
-//! WordMemoryChip — the device's memory ledger a word a row
-//! ([`crate::format::Memory::Word`]), in place of `MemoryChip`'s row a byte.
+//! WordMemoryChip — the device's memory ledger a word a row, in place of
+//! `MemoryChip`'s row a byte.
 //!
 //! A row is one word, its address a multiple of [`WORD_BYTES`], at one
 //! `(timestamp, is_write)`: the word's bytes after it ([`Column::Value`])
@@ -352,7 +352,7 @@ struct Row {
 /// its closing read.
 #[cfg(feature = "prover")]
 fn rows(side_note: &SideNote) -> Vec<Row> {
-    let run = super::device_memory::device_run(side_note);
+    let run = crate::chips::device_run(side_note);
     let closing_ts = crate::chips::register_memory_closing::closing_ts_for(side_note);
     let word_of = |address: u32| address & !(WORD_BYTES as u32 - 1);
     let mut entries = crate::chips::memory::access_entries(side_note);
@@ -418,7 +418,7 @@ impl BuiltInProverComponent for WordMemoryChip {
             .max(min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
         let num_rows = trace.num_rows();
-        let run = super::device_memory::device_run(side_note);
+        let run = crate::chips::device_run(side_note);
         // The region's permission, 1 readable only, 2 writable, as
         // DeviceWordMemoryChip proves it; 0 off every region, which the AIR
         // refuses.

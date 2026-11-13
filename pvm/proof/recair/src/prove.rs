@@ -240,7 +240,7 @@ pub fn prove_on<MC: MerkleChannel>(
 where
     SimdBackend: BackendForChannel<MC>,
 {
-    if format.masked {
+    if format.masking.is_some() {
         return Err(ProveError::MaskedFormat);
     }
     circuit.check_wiring().map_err(ProveError::Wiring)?;

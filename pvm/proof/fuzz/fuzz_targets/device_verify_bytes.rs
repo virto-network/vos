@@ -13,7 +13,7 @@
 use std::sync::OnceLock;
 
 use libfuzzer_sys::fuzz_target;
-use vos_pvm_recair::device::{decode, encode, Verifier};
+use vos_pvm_recair::device::{decode, encode, Verifier, FORMAT};
 
 #[path = "device_program.rs"]
 mod device_program;
@@ -28,7 +28,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     if verifier().verify(io, proof).is_ok() {
-        let decoded = decode(proof).expect("an accepted proof decodes");
-        assert_eq!(encode(&decoded).as_deref(), Some(proof));
+        let decoded = decode(&FORMAT, proof).expect("an accepted proof decodes");
+        assert_eq!(encode(&FORMAT, &decoded).as_deref(), Some(proof));
     }
 });

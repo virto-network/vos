@@ -250,12 +250,6 @@ stwo_constraint_framework::relation!(MerkleNodeLookupElements, REL_MERKLE_NODE_L
 const REL_POSEIDON2_CALL_LOOKUP_SIZE: usize = TS_SIZE + 4 + 4;
 stwo_constraint_framework::relation!(Poseidon2CallLookupElements, REL_POSEIDON2_CALL_LOOKUP_SIZE);
 
-// (addr[4], value[1]) — a byte of a device program's data: DataTableChip's
-// preprocessed table holds every byte of its read-only and read-write data
-// pages; DeviceMemoryChip consumes one tuple per first touch in them.
-const REL_DATA_TABLE_LOOKUP_SIZE: usize = PC_SIZE + 1;
-stwo_constraint_framework::relation!(DataTableLookupElements, REL_DATA_TABLE_LOOKUP_SIZE);
-
 /// The bytes a word of the device's word ledger holds
 /// (`crate::chips::WordMemoryChip`), at an address a multiple of it.
 pub const MEMORY_WORD_SIZE: usize = 8;
@@ -306,7 +300,6 @@ pub const MAX_RELATION_WIDTH: usize = {
         REL_BLAKE2B_COMPRESSION_LOOKUP_SIZE,
         REL_MERKLE_NODE_LOOKUP_SIZE,
         REL_POSEIDON2_CALL_LOOKUP_SIZE,
-        REL_DATA_TABLE_LOOKUP_SIZE,
         REL_MEMORY_WORD_LOOKUP_SIZE,
         REL_DATA_WORD_LOOKUP_SIZE,
         REL_IO_HASH_LOOKUP_SIZE,

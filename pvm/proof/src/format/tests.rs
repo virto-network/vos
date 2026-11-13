@@ -69,7 +69,6 @@ fn the_bit_counts_are_pinned_per_format() {
             (32, 108, 63),
             (39, 146, 82),
             (41, 104, 62),
-            (46, 110, 62),
             (47, 110, 62),
         ]
     );
@@ -96,14 +95,12 @@ fn the_parameters_are_the_least_that_clear_their_margins() {
     assert!((62.81..62.82).contains(&segment), "{segment}");
     let at_44 = count(&LEAF_FOLD.params, &SEGMENT_REFERENCE);
     assert!((62.74..62.75).contains(&at_44), "{at_44}");
-    for device in [&BYTE_DEVICE_PROOF, &DEVICE_PROOF] {
-        let fewer = FormatParams {
-            n_queries: device.params.n_queries - 1,
-            ..device.params
-        };
-        assert!(count(&device.params, &device.reference) >= 62.0);
-        assert!(count(&fewer, &device.reference) < 62.0);
-    }
+    let fewer = FormatParams {
+        n_queries: DEVICE_PROOF.params.n_queries - 1,
+        ..DEVICE_PROOF.params
+    };
+    assert!(count(&DEVICE_PROOF.params, &DEVICE_PROOF.reference) >= 62.0);
+    assert!(count(&fewer, &DEVICE_PROOF.reference) < 62.0);
 }
 
 /// The wrap counts 82.6 proven bits under affine batching, and needs 19
@@ -172,9 +169,9 @@ fn the_verifier_takes_the_batching_from_the_format() {
     }
 }
 
-/// Every number names one entry; only 28, 39, 41 and 47 are admitted, 46
-/// is retired, and a segment verifier takes 41 alone; every other number,
-/// one an earlier format took among them, is refused as unregistered.
+/// Every number names one entry; only 28, 39, 41 and 47 are admitted, and a
+/// segment verifier takes 41 alone; every other number, one an earlier
+/// format took among them, is refused as unregistered.
 #[test]
 fn the_registry_numbers_round_trip() {
     for format in REGISTRY {
@@ -194,8 +191,6 @@ fn the_registry_numbers_round_trip() {
             format.number == SEGMENT.number
         );
     }
-    let retired = admitted(BYTE_DEVICE_PROOF.number).unwrap_err();
-    assert!(retired.contains("retired"), "{retired}");
     assert!(REGISTRY.windows(2).all(|w| w[0].number < w[1].number));
     for number in (0..64).chain([u32::MAX]) {
         if REGISTRY.iter().any(|format| format.number == number) {

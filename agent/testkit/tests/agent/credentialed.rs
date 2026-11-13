@@ -1471,8 +1471,8 @@ fn an_owner_digest_another_person_named_is_held_a_day_at_most() {
 }
 
 /// Apply holds every proven call to the release's device formats and the
-/// agent's log, whatever the node that verified it admits: a 46 proof, or
-/// one of a format the release never had, is refused `Format`, writing
+/// agent's log, whatever the node that verified it admits: a proof of a
+/// format the release does not admit is refused `Format`, writing
 /// nothing; the operator retires 47 through the log, its outcome the date
 /// kept, and from that batch time a 47 proof is refused too. Retiring a
 /// format the release does not admit fails `Unknown`.
@@ -1487,7 +1487,7 @@ fn apply_refuses_a_device_format_the_release_or_the_log_retired() {
         call.format = format;
         call
     };
-    for format in [46, 44] {
+    for format in [48, 46, 44] {
         let call = login(&mut agent, format, 1);
         let step = agent.step(time, &call);
         assert_eq!(refused(&step), Refusal::Format, "format {format}");

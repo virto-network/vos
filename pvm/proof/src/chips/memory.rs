@@ -42,8 +42,7 @@ use crate::{
 /// runs. Each run starts with a `ts = 0` write and every group ends with a
 /// closing read, so an address is one group, its first touch the one
 /// written, when its boundary produces its `ts = 0` write once: the page
-/// boundary does (`MemoryPageChip`, a page once in the trie);
-/// `DeviceMemoryChip`, which lets a byte have several rows, does not.
+/// boundary does (`MemoryPageChip`, a page once in the trie).
 #[derive(Clone, Copy)]
 pub struct MemoryChip;
 
@@ -357,8 +356,8 @@ impl BuiltInComponent for MemoryChip {
         // ── Page permissions ──────────────────────────────────────────────
         // Every address group starts with its page's ts=0 write, which
         // MemoryPageChip produces carrying the page's proven permission
-        // (`2·permission` in the tuple's last field; on a device run
-        // DeviceMemoryChip does, and no other producer emits ts = 0). The
+        // (`2·permission` in the tuple's last field; no other producer
+        // emits ts = 0). The
         // group holds it, and every row after the start
         // obeys it: a write needs a writable page; an unreadable page's
         // start is followed by its closing read, so no step, BLAKE2b or
@@ -519,25 +518,7 @@ impl BuiltInProverComponent for MemoryChip {
         // listed page.  Subsumes the old read-before-write ts=0 injection
         // (MemoryBoundaryChip is deleted); the producers are MemoryPageChip.
         let closing_ts = crate::chips::register_memory_closing::closing_ts_for(side_note);
-        // A device run (`crate::device`) has no page boundary: each byte it
-        // touches enters with the byte its layout gives and closes at its
-        // last value, both produced by DeviceMemoryChip.
-        if let Some(run) = &side_note.device {
-            for touched in &run.touched {
-                entries.push(MemEntry {
-                    address: touched.address,
-                    value: touched.initial,
-                    timestamp: 0,
-                    is_write: true,
-                });
-                entries.push(MemEntry {
-                    address: touched.address,
-                    value: touched.last,
-                    timestamp: closing_ts,
-                    is_write: false,
-                });
-            }
-        } else if let Some(payload) = &side_note.memory_pages {
+        if let Some(payload) = &side_note.memory_pages {
             for page in &payload.pages {
                 let base = page.page_idx as u64 * crate::page_merkle::PAGE_SIZE as u64;
                 for i in 0..crate::page_merkle::PAGE_SIZE {
@@ -588,19 +569,8 @@ impl BuiltInProverComponent for MemoryChip {
         let mut keys = vec![0u64; num_rows];
         let mut same_addr = vec![false; num_rows];
         let layout = side_note.layout();
-        let permission_of = |address: u32| {
-            use crate::memory_layout::Permission;
-            match &side_note.device {
-                Some(run) => match run.layout.region_of(address) {
-                    None => Permission::Unmapped,
-                    Some(region) if crate::device::region::READABLE_ONLY[region] => {
-                        Permission::Readable
-                    }
-                    Some(_) => Permission::Writable,
-                },
-                None => layout.permission(address / crate::page_merkle::PAGE_SIZE as u32),
-            }
-        };
+        let permission_of =
+            |address: u32| layout.permission(address / crate::page_merkle::PAGE_SIZE as u32);
         for (row, entry) in entries.iter().enumerate() {
             trace.fill_columns_bytes(row, &entry.address.to_le_bytes(), Column::Address);
             trace.fill_columns(row, entry.value, Column::Value);
@@ -626,8 +596,7 @@ impl BuiltInProverComponent for MemoryChip {
             let is_closing = closing_ts != 0 && entry.timestamp == closing_ts;
             trace.fill_columns(row, is_closing, Column::IsClosing);
 
-            // The page's permission, as MemoryPageChip (or, on a device
-            // run, DeviceMemoryChip) proves it, held
+            // The page's permission, as MemoryPageChip proves it, held
             // along the address's group; on its start, also the tuple's.
             use crate::memory_layout::Permission;
             let permission = permission_of(entry.address);
