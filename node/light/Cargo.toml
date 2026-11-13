@@ -2,7 +2,7 @@
 name = "vos-light"
 edition.workspace = true
 version.workspace = true
-license = "Apache-2.0"
+license.workspace = true
 description = "The light node: a device's local agent run on the interpreter over its own store with no log, installed from release artifacts; and the device library: a member's secret from a secret source, its proven calls, their verification, the node-API requests a client sends for them, and the path it keeps apart from its proofs."
 
 [features]
