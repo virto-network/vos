@@ -109,7 +109,11 @@ fn main() {
             .prove(&device_program::WITNESS, MaskRng::Os)
             .expect("the kernel proves");
         let bytes = program.encode(&proof.proof).expect("encodes");
-        write("device_verify_bytes", "honest", &[&proof.io[..], &bytes].concat());
+        write(
+            "device_verify_bytes",
+            "honest",
+            &[&proof.io[..], &bytes].concat(),
+        );
     }
     println!("{} fixtures seeded under {}", all.len(), corpus.display());
 }
