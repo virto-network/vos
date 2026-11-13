@@ -32,7 +32,7 @@ use vos_pvm::interpreter::Interpreter;
 use vos_pvm::PVM_REGISTER_COUNT;
 
 use vos_pvm_proof::core::tracing::TracingPvm;
-use vos_pvm_proof::{program_commitment_of_proof, prove, SideNote};
+use vos_pvm_proof::{prove, SideNote};
 use vos_pvm_proof_verifier::verify_standalone;
 
 /// Bounds for fuzz input — keep proving fast (single-digit seconds
@@ -113,7 +113,7 @@ fuzz_target!(|input: FuzzInput| {
         Err(_) => return,
     };
 
-    let prog_hash = program_commitment_of_proof(&proof);
+    let prog_hash = proof.preprocessed_commitment().unwrap();
 
     // Property: every successful prove + correct hash must verify.
     verify_standalone(proof, prog_hash).expect("verify_standalone failed for honest prove output");

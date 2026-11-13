@@ -24,8 +24,7 @@ use vos_pvm_proof::program_id::{KernelEntry, KernelProgram, LeafCircuits};
 use vos_pvm_proof::segment::SegmentCursor;
 use vos_pvm_proof::shape::{KernelShape, SegmentShape};
 use vos_pvm_proof::{
-    Proof, ProvingError, program_commitment_for_shape, program_commitment_of_proof,
-    prove_canonical_format, prove_kernel, prove_shaped,
+    Proof, ProvingError, program_commitment_for_shape, prove_kernel, prove_shaped,
 };
 use vos_pvm_proof_verifier::{
     ENTRY_TIMESTAMP, HALT_PC, verify_kernel_chain, verify_kernel_segment, verify_standalone,
@@ -193,7 +192,7 @@ fn kernels_prove_and_verify_over_their_shapes() {
         assert!(!segments.is_empty());
         for segment in &segments {
             assert_eq!(
-                program_commitment_of_proof(&segment.proof),
+                segment.proof.preprocessed_commitment().unwrap(),
                 program.preprocessed_roots[segment.class],
                 "{name}"
             );
@@ -231,9 +230,9 @@ fn areas() -> (Kernel, KernelProgram, SegmentShape) {
 #[test]
 fn a_full_set_proof_is_refused() {
     let (kernel, program, _) = areas();
-    let full = prove_canonical_format(&mut kernel.whole(), &[], &SEGMENT).unwrap();
+    let full = common::every_chip::prove_every_chip(|| kernel.whole(), &SEGMENT);
     assert_eq!(full.component_mask, chip_idx::ALL);
-    verify_standalone(full.clone(), program_commitment_of_proof(&full)).unwrap();
+    verify_standalone(full.clone(), full.preprocessed_commitment().unwrap()).unwrap();
     let error = verify_kernel_segment(full, &program).unwrap_err();
     assert!(error.to_string().contains("more"), "{error}");
 }
@@ -284,7 +283,7 @@ fn a_proof_missing_a_chip_is_refused() {
     fewer.components &= !(1 << chip_idx::POPCOUNT);
     fewer.log_sizes.remove(position);
     let proof = prove_shaped(&mut kernel.whole(), &fewer, &SEGMENT).unwrap();
-    verify_standalone(proof.clone(), program_commitment_of_proof(&proof)).unwrap();
+    verify_standalone(proof.clone(), proof.preprocessed_commitment().unwrap()).unwrap();
     let error = verify_kernel_segment(proof, &program).unwrap_err();
     assert!(error.to_string().contains("fewer"), "{error}");
     // Over its shape, the run proves and verifies as the kernel's.
@@ -300,7 +299,7 @@ fn a_proof_at_another_log_size_is_refused() {
     let mut larger = shape.clone();
     larger.log_sizes[chip_idx::CPU] += 1;
     let proof = prove_shaped(&mut kernel.whole(), &larger, &SEGMENT).unwrap();
-    verify_standalone(proof.clone(), program_commitment_of_proof(&proof)).unwrap();
+    verify_standalone(proof.clone(), proof.preprocessed_commitment().unwrap()).unwrap();
     let error = verify_kernel_segment(proof, &program).unwrap_err();
     assert!(error.to_string().contains("no class"), "{error}");
 }
@@ -321,8 +320,8 @@ fn a_run_needing_a_dropped_chip_does_not_verify() {
     fewer.log_sizes.remove(position);
     match prove_shaped(&mut kernel.whole(), &fewer, &SEGMENT) {
         Ok(proof) => {
-            let error =
-                verify_standalone(proof.clone(), program_commitment_of_proof(&proof)).unwrap_err();
+            let error = verify_standalone(proof.clone(), proof.preprocessed_commitment().unwrap())
+                .unwrap_err();
             assert!(error.to_string().contains("logup sum"), "{error}");
         }
         Err(error) => panic!("the forgery proves, and is refused at verify: {error}"),
@@ -376,10 +375,11 @@ fn a_chain_not_from_the_entry_is_refused() {
 
     let proof = prove_shaped(&mut kernel.whole(), &shape, &SEGMENT).unwrap();
     type Change = (fn(&mut Proof), &'static str);
-    let changes: [Change; 3] = [
+    let changes: [Change; 4] = [
         (|p| p.initial_state.timestamp += 1, "first timestamp"),
         (|p| p.initial_state.pc += 1, "entry"),
         (|p| p.initial_state.registers[1] -= 8, "registers"),
+        (|p| p.initial_state.memory_root[0] ^= 1, "image root"),
     ];
     for (change, reason) in changes {
         let mut changed = proof.clone();

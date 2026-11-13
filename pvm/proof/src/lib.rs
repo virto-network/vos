@@ -10,28 +10,28 @@
 //! `docs/status.md` for soundness coverage, and `SECURITY.md` for the
 //! trust boundary.
 //!
-//! ## Quick start
+//! ## What it proves
 //!
-//! Trace a standard program's run, prove it, verify the proof:
+//! A node proves a kernel's run segment by segment over its kernel's shape
+//! ([`shape`], [`prove_kernel`], [`prove_shaped`]) under the segment format,
+//! 41; `vos-pvm-recair` verifies each segment in a leaf (32), folds the
+//! leaves (32) and wraps the root (39), which `vos-pvm-final-verifier`
+//! verifies at a venue. A device proves a device kernel's whole run as one
+//! masked proof (47) over the device chips ([`device`], [`masked`]), which
+//! `vos-pvm-recair`'s `device` proves and a space's ingress verifies. The
+//! segment's native verifier, the one a leaf is held to, is
+//! `vos-pvm-proof-verifier`'s `verify_standalone`.
 //!
 //! ```no_run
-//! use vos_pvm_proof::kernel::trace_program;
-//! use vos_pvm_proof::{prove, verify};
+//! use vos_pvm_proof::{format::SEGMENT, kernel::trace_kernel, prove_kernel};
+//! use vos_pvm_proof::shape::KernelShape;
 //!
-//! # fn example(program: &[u8], arguments: &[u8]) {
+//! # fn example(blob: &[u8], arguments: &[u8], shape: &KernelShape) {
 //! // `gas` bounds the run.
-//! let gas = 1_000_000_000;
-//! let mut side_note = trace_program(program, arguments, gas).expect("trace").side_note;
-//! let proof = prove(&mut side_note).expect("prove");
-//! verify(proof, &side_note).expect("verify");
+//! let trace = trace_kernel(blob, arguments, 1_000_000_000).expect("a halting run");
+//! let segments = prove_kernel(&trace.side_note, shape, 0, &SEGMENT).expect("proofs");
 //! # }
 //! ```
-//!
-//! A *deployed* verifier sees only the proof + the program commitment
-//! (not the trace) and uses the side-note-free `verify_standalone` from
-//! the separate `no_std` `vos-pvm-proof-verifier` crate. Executions too large
-//! for one proof are proved as a chain — see [`verify_chain`] and the
-//! [`segment`] cut helpers.
 //!
 //! ## Crate layout
 //!
@@ -52,8 +52,8 @@
 //!   Blake2bCompression, MerkleNode, …).
 //! - [`trace`] — column-fill helpers + interaction-trace builder.
 //! - [`proof`] — public proof type (serializable).
-//! - `prove` / `verify` / `program_id` — top-level prover / verifier
-//!   API plus the public program-commitment hash.
+//! - `prove` / `verify` — the top-level prover and verifier; [`program_id`]
+//!   — a kernel's program id, its shape and each class's preprocessed root.
 //!
 //! ## Features
 //!
@@ -70,22 +70,17 @@
 //!
 //! The prover-side happy path lives at the crate root:
 //!
-//! - **Trace** — [`TracingPvm::into_side_note`][into_side_note] (a
-//!   run's whole trace) or [`SideNote::new`] from a hand-built step
-//!   trace.
-//! - **Prove** — [`prove`], under the segment `format::SEGMENT`;
-//!   [`prove_format`] under any admitted format of the
-//!   [`format`](mod@format) registry, at its parameters.
-//! - **Verify** — [`verify`] (prover-side, with the SideNote);
-//!   [`verify_chain`] for a segment chain. The
-//!   side-note-free deployer verifier is `verify_standalone` in the
+//! - **Trace** — [`kernel::trace_kernel`] (a kernel's run, from the
+//!   loader's layout), [`TracingPvm::into_side_note`][into_side_note] (a
+//!   run's whole trace) or [`SideNote::new`] from a hand-built step trace.
+//! - **Prove** — [`prove_kernel`] (a kernel's run over its shape, cut into
+//!   segments), [`prove_shaped`] (a segment over one class), and
+//!   [`program_commitment_for_shape`] (the class's preprocessed root a
+//!   kernel's program id pins). [`prove`] / [`prove_format`] prove a segment
+//!   over the chips its steps select, the tests' and the gates'.
+//! - **Verify** — [`verify`] (prover-side, with the SideNote); the
+//!   side-note-free verifier is `verify_standalone` in the
 //!   `vos-pvm-proof-verifier` crate.
-//! - **Identity** — [`program_commitment_of_proof`] /
-//!   [`program_commitment_hex`] extract the program commitment a
-//!   verifier pins.
-//! - **Large executions** — the [`segment`] cut helpers,
-//!   [`canonical_profile_for_bounds`], and [`prove_canonical`] produce a
-//!   chain of equal-shape segments.
 //!
 //! Core types: [`Proof`], [`SegmentState`], [`SideNote`], [`PcsConfig`],
 //! [`FriConfig`].
@@ -171,10 +166,6 @@ pub mod page_merkle;
 #[cfg(feature = "prover")]
 pub mod side_note;
 
-#[cfg(feature = "prover")]
-pub mod bench_helpers;
-#[cfg(feature = "prover")]
-mod commitment;
 #[cfg(feature = "prover")]
 pub mod kernel;
 #[cfg(feature = "prover")]
@@ -590,14 +581,13 @@ pub use proof::{Proof, SegmentState};
 pub use prove::prove_with_boundary_override;
 pub use sparse_memory::{SPARSE_MEMORY_PAGE_SIZE, SparseMemoryImage, SparseMemoryPage};
 // ── Prove: the stable surface ────────────────────────────────────────
-// Single proof: `prove` / `prove_format`.
-// Segment chain: `canonical_profile_for_bounds` derives the forcing
-// profile, `prove_canonical` proves each window to one shape.
+// A kernel's run over its shape: `prove_kernel`, a segment `prove_shaped`,
+// its class's preprocessed root `program_commitment_for_shape`. A segment
+// over the chips its steps select: `prove` / `prove_format`.
 #[cfg(feature = "prover")]
 pub use prove::{
-    KernelSegment, ProvingError, canonical_profile_for_bounds, program_commitment_for_profile,
-    program_commitment_for_profile_format, program_commitment_for_shape, prove, prove_canonical,
-    prove_canonical_format, prove_chain, prove_format, prove_kernel, prove_shaped,
+    KernelSegment, ProvingError, program_commitment_for_shape, prove, prove_format, prove_kernel,
+    prove_shaped,
 };
 // Advanced / internal prove surface: the profiling variants, the thread-pool
 // installer, and the explicit-component harness entry. Public for tests;
@@ -620,7 +610,7 @@ pub use stwo::core::pcs::PcsConfig;
 // The side-note-FREE deployer verifier lives in the `vos-pvm-proof-verifier` crate
 // (`verify_standalone`) — no_std, no prover deps.
 #[cfg(feature = "prover")]
-pub use verify::{DEFAULT_MAX_LOG_SIZE, verify, verify_chain};
+pub use verify::{DEFAULT_MAX_LOG_SIZE, verify};
 // Advanced verify surface (explicit components)
 // and the recursion seams the in-AIR verifier is checked against.
 #[doc(hidden)]
@@ -650,5 +640,3 @@ pub mod harness {
         crate::BASE_COMPONENTS
     }
 }
-#[cfg(feature = "prover")]
-pub use commitment::{ProgramCommitment, program_commitment_hex, program_commitment_of_proof};

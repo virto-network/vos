@@ -31,7 +31,7 @@ use common::*;
 use vos_pvm::PVM_REGISTER_COUNT;
 use vos_pvm::instruction::Opcode;
 use vos_pvm_proof::core::step::PvmStep;
-use vos_pvm_proof::{SegmentState, SideNote, program_commitment_of_proof, prove};
+use vos_pvm_proof::{SegmentState, SideNote, prove};
 use vos_pvm_proof_verifier::verify_standalone;
 
 /// Trace a tiny Add64 program whose destination is φ[9] — the first
@@ -53,7 +53,7 @@ fn from_scratch_boundary_forgery_is_rejected() {
     // boundary metadata + program commitment.
     let mut side_note = SideNote::new(steps.clone(), code.clone(), bitmask.clone());
     let honest = prove(&mut side_note).expect("honest prove failed");
-    let commitment = program_commitment_of_proof(&honest);
+    let commitment = honest.preprocessed_commitment().unwrap();
     vos_pvm_proof::verify(honest.clone(), &side_note).expect("honest proof must verify");
     verify_standalone(honest.clone(), commitment).expect("honest proof must verify standalone");
     let honest_initial = honest.initial_state.clone();
@@ -118,6 +118,6 @@ fn boundary_override_with_honest_values_verifies() {
     )
     .expect("override prove failed");
     vos_pvm_proof::verify(overridden.clone(), &sn).expect("honest-values override must verify");
-    verify_standalone(overridden, program_commitment_of_proof(&honest))
+    verify_standalone(overridden, honest.preprocessed_commitment().unwrap())
         .expect("honest-values override must verify standalone");
 }

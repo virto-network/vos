@@ -20,7 +20,7 @@ use vos_pvm_proof::SideNote;
 use vos_pvm_proof::core::step::WitnessWrite;
 use vos_pvm_proof::kernel::{KernelTrace, KernelTraceError, trace_kernel};
 use vos_pvm_proof::segment::SegmentCursor;
-use vos_pvm_proof::{prove, verify, verify_chain};
+use vos_pvm_proof::{prove, verify};
 use vos_testkit::model::Model;
 use vos_testkit::programs::{derived, method};
 use vos_wire::Encode;
@@ -421,8 +421,10 @@ fn only_a_halting_segment_ends_at_the_halt_address() {
     );
     assert_ne!(proofs[1].final_state.pc, PVM_HALT_ADDR as u32);
     assert_eq!(proofs[2].final_state.pc, PVM_HALT_ADDR as u32);
-    let side_notes: Vec<&SideNote> = segments.iter().collect();
-    verify_chain(&proofs, &side_notes).expect("the chain verifies");
+    vos_pvm_proof::proof::check_continuity(&proofs).expect("the segments chain");
+    for (proof, side_note) in proofs.into_iter().zip(&segments) {
+        verify(proof, side_note).expect("the segment verifies");
+    }
 }
 
 /// A kernel whose halt names an output past any memory (φ8 = 2^50) is

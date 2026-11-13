@@ -122,7 +122,7 @@ fn build_segment_with_memory(full: &SideNote, a: usize, b: usize, mem: SegmentMe
 /// and `poseidon2_ops`.
 /// Used both for a segment's threaded initial memory (`segment_side_note`)
 /// and its exit image (the boundary's memory root, `page_merkle`); the two
-/// MUST agree or `verify_chain`'s boundary-continuity check rejects.
+/// MUST agree or the run's segments do not chain.
 pub(crate) fn replay_writes(side_note: &SideNote, ts_upper: Option<u64>) -> Vec<u8> {
     let writes = collect_writes(side_note, ts_upper);
     let mut mem = side_note.initial_memory.clone();

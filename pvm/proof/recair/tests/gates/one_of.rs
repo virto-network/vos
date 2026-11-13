@@ -26,7 +26,6 @@ use vos_pvm_proof::format::SEGMENT;
 use vos_pvm_proof::kernel::trace_kernel;
 use vos_pvm_proof::poseidon2::P2Hash;
 use vos_pvm_proof::program_id::{IdPreimage, LeafCircuits};
-use vos_pvm_proof::prove_canonical_format;
 use vos_pvm_proof::segment::SegmentCursor;
 use vos_pvm_recair::fold::{CIRCUITS, FoldCircuit};
 use vos_pvm_recair::gadgets::assert_one_of;
@@ -37,6 +36,7 @@ use vos_pvm_recair::wrap::{LAYOUT, WrapCircuit};
 use vos_pvm_recair::{Context, Finalized};
 
 use crate::common::Rng;
+use crate::common::every_chip::prove_every_chip;
 use crate::common::kernel::{blob, entry, whole_run};
 use crate::forge::{DEEP_ALI, Forgery, LOGUP, assert_accepted, assert_refused, hash_of};
 
@@ -168,10 +168,12 @@ fn a_fold_child_of_a_circuit_outside_the_program_is_refused() {
     let blob = blob();
     let trace = trace_kernel(&blob, &[], 1_000).expect("halts");
     let entry = entry(&blob);
-    let mut cursor = SegmentCursor::new(&trace.side_note);
     let segments: Vec<_> = [(0, 3), (3, 6)]
         .map(|(a, b)| {
-            prove_canonical_format(&mut cursor.side_note(a, b), &[], &SEGMENT).expect("proves")
+            prove_every_chip(
+                || SegmentCursor::new(&trace.side_note).side_note(a, b),
+                &SEGMENT,
+            )
         })
         .into();
     let leaves: Vec<LeafCircuit> = segments

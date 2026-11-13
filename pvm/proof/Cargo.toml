@@ -108,28 +108,6 @@ vos-statement = { workspace = true, features = ["fixtures"] }
 vos-venue = { workspace = true, features = ["model"] }
 ed25519-dalek = "2"
 
-# Both examples demonstrate the prover end-to-end; mark them
-# prover-only so a verifier-only build (`--no-default-features`) skips
-# them instead of failing on the unresolved prover surface. (Examples
-# can't use a `#![cfg]` gate like the integration tests — a cfg'd-out
-# example has no `main`.)
-# On-device proving benchmark (mobile-proving plan, ARM bring-up): the
-# binary to cross-compile for aarch64 and run on a phone.  A [[bin]]
-# rather than an example so a cross-build pulls only the prover's own
-# dependency tree — examples/tests build against dev-deps (git + local
-# path crates) that have no business in a device image.
-[[bin]]
-name = "mobile_bench"
-required-features = ["prover"]
-
-[[example]]
-name = "multi_segment"
-required-features = ["prover"]
-
-[[example]]
-name = "prove_and_verify"
-required-features = ["prover"]
-
 # Proving benchmarks (measurement, not correctness — see benches/prove.rs).
 # `harness = false` + a custom `main` keeps them out of `cargo test` and runs
 # them serially (one prove at a time, so large traces never contend for RAM).

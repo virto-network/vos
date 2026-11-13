@@ -6,6 +6,9 @@
 
 use std::sync::OnceLock;
 
+#[path = "../../tests/common/every_chip.rs"]
+mod every_chip;
+
 use stwo::core::fields::m31::BaseField;
 use stwo::core::proof::StarkProof;
 use vos_pvm::PVM_REGISTER_COUNT;
@@ -16,7 +19,7 @@ use vos_pvm_proof::format::{self, Format};
 use vos_pvm_proof::pcs::PcsStack;
 use vos_pvm_proof::poseidon2::{P2MerkleChannel, P2MerkleHasher, Poseidon2M31Channel};
 use vos_pvm_proof::security::SecurityBits;
-use vos_pvm_proof::{Proof, SideNote, program_commitment_of_proof};
+use vos_pvm_proof::{Proof, SideNote};
 use vos_pvm_proof_verifier::{proof_security_bits, verify_standalone};
 
 /// Six chained Add64s and a trap: seven steps over 4 MiB of memory.
@@ -94,7 +97,7 @@ fn every_admitted_format_round_trips() {
         assert_eq!(proof.format_version, format.number);
         assert_eq!(proof.stark_proof.channel(), format.channel);
         assert_eq!(proof.pcs_config, format.pcs_config());
-        let commitment = program_commitment_of_proof(proof);
+        let commitment = proof.preprocessed_commitment().unwrap();
         assert_eq!(commitment.channel(), format.channel);
 
         let bincoded: Proof = bincode::deserialize(&bincode::serialize(proof).unwrap()).unwrap();
@@ -227,16 +230,14 @@ fn the_bit_counts_are_counted_at_the_proofs_shape() {
     assert!(segment.proven >= format::SEGMENT.floor.proven);
 }
 
-/// A full canonical segment proves under `format::SEGMENT` and verifies; a main
-/// root with one limb changed is refused, and a non-canonical limb is
+/// A segment over every chip proves under `format::SEGMENT` and verifies; a
+/// main root with one limb changed is refused, and a non-canonical limb is
 /// refused without a panic.
 #[test]
-fn a_canonical_segment_proves_under_the_poseidon2_format() {
-    let mut side_note = side_note();
-    let proof = vos_pvm_proof::prove_canonical_format(&mut side_note, &[], &format::SEGMENT)
-        .expect("proves");
+fn a_segment_over_every_chip_proves_under_the_poseidon2_format() {
+    let proof = every_chip::prove_every_chip(side_note, &format::SEGMENT);
     assert_eq!(proof.num_components, vos_pvm_proof::chip_idx::COUNT);
-    let commitment = program_commitment_of_proof(&proof);
+    let commitment = proof.preprocessed_commitment().unwrap();
     verify_standalone(proof.clone(), commitment).expect("verifies");
 
     let mut tampered = proof.clone();

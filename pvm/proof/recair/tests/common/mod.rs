@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+#[path = "../../../tests/common/every_chip.rs"]
+pub mod every_chip;
 pub mod kernel;
 pub mod leakage;
 
@@ -364,15 +366,15 @@ pub fn full_shape_proof() -> &'static vos_pvm_proof::Proof {
         );
         let mut tracing = TracingPvm::new(pvm);
         tracing.run();
-        let mut side_note =
-            vos_pvm_proof::SideNote::new(tracing.into_trace(), code, bitmask).with_memory(memory);
+        let steps = tracing.into_trace();
         let started = std::time::Instant::now();
-        let proof = vos_pvm_proof::prove_canonical_format(
-            &mut side_note,
-            &[],
+        let proof = every_chip::prove_every_chip(
+            || {
+                vos_pvm_proof::SideNote::new(steps.clone(), code.clone(), bitmask.clone())
+                    .with_memory(memory.clone())
+            },
             &vos_pvm_proof::format::SEGMENT,
-        )
-        .expect("proves");
+        );
         eprintln!(
             "proved over every chip in {:.1}s",
             started.elapsed().as_secs_f64()

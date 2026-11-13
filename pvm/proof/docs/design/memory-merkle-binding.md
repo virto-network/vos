@@ -291,13 +291,11 @@ All four are **unconditionally active** (the page set is never empty, §0).
 - **Chain/segment anchoring** (without it the chain's memory claim would
   be only relative):
   - `verify_standalone` rejects `initial_state.timestamp < 1` (§2);
-  - `verify_chain_standalone(proofs, preprocessed_commitment,
-    expected_initial_root)` — the expected starting-image root is a
-    **required parameter** checked against `proofs[0].initial_state
-    .initial_root` (the memory analogue of the program commitment), and the
-    function returns the chain's `final_root` so consumers pin the
-    post-state. Callers compute the expected root host-side via
-    `page_merkle` (the prover extension knows the program + input image).
+  - `verify_kernel_chain(proofs, program, entry)` checks the first
+    segment's `initial_state.memory_root` against the kernel's image root
+    (`program.image_root`, the memory analogue of the program commitment),
+    computed host-side via `page_merkle` from the kernel's blob; a leaf
+    binds the same in-circuit.
 - Cost [est, for a segment touching 23 pages]: Blake2bBoundary ≈ **1504
   cells/row** (2544 minus the 1040 pointer/address cells) × 2 passes ×
   (23×32 leaf + ~460 node) = **2392 compressions max** → ~230K rows (2^18),
@@ -307,8 +305,7 @@ All four are **unconditionally active** (the page set is never empty, §0).
 
 ## 5. What the verifier ends up guaranteeing
 
-For a chain accepted by `verify_chain_standalone(proofs, commitment,
-expected_initial_root)`:
+For a chain accepted by `verify_kernel_chain(proofs, program, entry)`:
 - every segment executed the committed program (preprocessed commitment),
   with register/pc/ts continuity and `initial_ts ≥ 1`;
 - within each segment, every RAM read/write is ledger-consistent, every
@@ -317,10 +314,10 @@ expected_initial_root)`:
   `final_root` (§1–§3), and untouched subtrees are carried unchanged (§1
   witness reuse);
 - across segments, `final_root_i == initial_root_{i+1}` (struct-eq over
-  bound fields), and `initial_root_0 == expected_initial_root`;
-- hence the returned final root commits the true RAM image produced by
-  running the committed program from the supplied starting image. The
-  remaining trust scope: the caller must know `expected_initial_root`
+  bound fields), and `initial_root_0` is the kernel's image root;
+- hence the last segment's final root commits the true RAM image produced
+  by running the committed program from the kernel's image. The
+  remaining trust scope: the caller must know the kernel's image root
   (program + input image), exactly as it must know the program commitment.
 
 ## 6. Gate tests (negative; mirror `ledger_readconsistency_gate`)
@@ -334,7 +331,7 @@ expected_initial_root)`:
   review + a tamper test on the merge row's witness columns;
 - Blake2bBoundary IsReal=1 only at row 95 (forged compression) → REJECTED;
 - single proof with `initial_ts = 0` → REJECTED by `verify_standalone`;
-- chain with wrong `expected_initial_root` → REJECTED;
+- chain not starting at the kernel's image root → REJECTED;
 - mask missing any of the four new chips → REJECTED;
 - boundary-override harness (`prove_with_boundary_override`) extended to
   ship forged roots over honest columns → REJECTED.

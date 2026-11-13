@@ -33,7 +33,7 @@ use cipher_clerk::types::{Account, Layer};
 use vos_pvm_proof::format::SEGMENT;
 use vos_pvm_proof::program_id::KernelEntry;
 use vos_pvm_proof::segment::{SegmentCursor, segment_bounds_budgeted};
-use vos_pvm_proof::{Proof, program_commitment_of_proof, prove_kernel};
+use vos_pvm_proof::{Proof, prove_kernel};
 use vos_pvm_proof_verifier::{verify_kernel_chain, verify_kernel_segment};
 use vos_statement::vos_pvm_final_verifier::Error as FinalError;
 use vos_statement::{ProgramId, Refusal, Statement};
@@ -462,7 +462,7 @@ fn the_window_proves_and_verifies_over_its_shape() {
     );
     for (index, segment) in segments.iter().enumerate() {
         assert_eq!(
-            program_commitment_of_proof(&segment.proof),
+            segment.proof.preprocessed_commitment().unwrap(),
             program.preprocessed_roots[segment.class]
         );
         eprintln!(

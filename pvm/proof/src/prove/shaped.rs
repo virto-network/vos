@@ -63,16 +63,18 @@ pub fn program_commitment_for_shape(
     shape: &SegmentShape,
     format: &'static Format,
 ) -> Option<Commitment> {
+    use crate::pcs::ProofHash;
     check(shape).ok()?;
+    if shape.log_sizes.contains(&0) {
+        return None;
+    }
     install_thread_pool();
-    let target = Target::of(format).ok()?;
+    let config = Target::of(format).ok()?.format.pcs_config();
     let components = selected(shape.components);
     crate::with_stack!(format.channel, Stack => {
-        super::canonical::program_commitment_on::<Stack>(
-            side_note,
-            &components,
-            &shape.log_sizes,
-            target,
+        Some(
+            super::preprocessed_root::<Stack>(side_note, &components, &shape.log_sizes, config)
+                .into_commitment(),
         )
     }, unbuilt => None)
 }

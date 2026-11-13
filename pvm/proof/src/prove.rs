@@ -26,18 +26,14 @@ use crate::{lookups::AllLookupElements, side_note::SideNote};
 
 pub use crate::proof::{Proof, SegmentState};
 
-mod canonical;
-pub(crate) use canonical::preprocessed_root;
 #[cfg(feature = "debug-internals")]
 mod debug;
+mod preprocessed;
+pub(crate) use preprocessed::preprocessed_root;
 mod profile;
 mod request;
 mod shaped;
 
-pub use canonical::{
-    canonical_profile_for_bounds, program_commitment_for_profile,
-    program_commitment_for_profile_format, prove_canonical, prove_canonical_format, prove_chain,
-};
 #[cfg(feature = "debug-internals")]
 pub use debug::{debug_assert_constraints_explicit, debug_claimed_sums};
 pub use profile::ProveProfile;
@@ -510,7 +506,7 @@ where
     let log_sizes = traced_sizes(&traces, sizes, component_mask)?;
     let trace_gen = t.elapsed();
 
-    let twiddles = canonical::twiddles_for(components, &log_sizes, &config);
+    let twiddles = preprocessed::twiddles_for(components, &log_sizes, &config);
 
     let prover_channel = &mut MC::C::default();
     crate::proof::mix_statement_header(prover_channel, format.number, &config, &log_sizes);
@@ -640,7 +636,7 @@ where
     // Printed only in a build with `debug-internals`, on the explicit
     // `profile` flag or whenever `VOS_PROOF_PROFILE` is set in the
     // environment (so the phase breakdown is reachable through paths that
-    // hard-code `profile = false`, e.g. `prove_canonical`): a segment's
+    // hard-code `profile = false`, e.g. `prove_shaped`): a segment's
     // sizes are its step counts. A production build returns the profile to
     // its caller and prints nothing.
     #[cfg(feature = "debug-internals")]

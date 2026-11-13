@@ -38,7 +38,6 @@ use vos_pvm_proof::format::{SEGMENT, WRAP};
 use vos_pvm_proof::kernel::trace_kernel;
 use vos_pvm_proof::poseidon2::P2Hash;
 use vos_pvm_proof::program_id::{IdPreimage, LeafCircuits};
-use vos_pvm_proof::prove_canonical_format;
 use vos_pvm_proof::segment::SegmentCursor;
 use vos_pvm_recair::fold::FoldCircuit;
 use vos_pvm_recair::leaf::{LeafCircuit, io_hash_of};
@@ -47,6 +46,7 @@ use vos_pvm_recair::verifier::SegmentShape;
 use vos_pvm_recair::wrap::{self, WrapCircuit, WrapValues};
 use vos_pvm_recair::{Context, NoValue};
 
+use common::every_chip::prove_every_chip;
 use common::kernel::{blob, entry};
 
 /// The four segments' cuts, as the fold's test cuts them.
@@ -84,11 +84,13 @@ impl Run {
         let blob = blob();
         let trace = trace_kernel(&blob, &[], 1_000).expect("halts");
         let entry = entry(&blob);
-        let mut cursor = SegmentCursor::new(&trace.side_note);
         let segments: Vec<Proof> = cuts
             .iter()
             .map(|&(a, b)| {
-                prove_canonical_format(&mut cursor.side_note(a, b), &[], &SEGMENT).expect("proves")
+                prove_every_chip(
+                    || SegmentCursor::new(&trace.side_note).side_note(a, b),
+                    &SEGMENT,
+                )
             })
             .collect();
         let leaves: Vec<LeafCircuit> = segments

@@ -36,7 +36,6 @@ use vos_pvm_proof::format::SEGMENT;
 use vos_pvm_proof::kernel::trace_kernel;
 use vos_pvm_proof::poseidon2::P2Hash;
 use vos_pvm_proof::program_id::{IdPreimage, LeafCircuits};
-use vos_pvm_proof::prove_canonical_format;
 use vos_pvm_proof::segment::SegmentCursor;
 use vos_pvm_recair::fold::child::{self, verify_child};
 use vos_pvm_recair::fold::{FoldCircuit, FoldValues};
@@ -47,6 +46,7 @@ use vos_pvm_recair::verifier::witness::digest_wires;
 use vos_pvm_recair::{Context, NoValue};
 
 use crate::common::{assert_transcript_is, print_rows};
+use common::every_chip::prove_every_chip;
 use common::kernel::{blob, entry};
 
 /// The run's segments, their leaves, the program and the fold circuit.
@@ -82,11 +82,13 @@ impl Run {
         let trace = trace_kernel(&blob, &[], 1_000).expect("halts");
         assert_eq!(trace.side_note.steps.len(), 6);
         let entry = entry(&blob);
-        let mut cursor = SegmentCursor::new(&trace.side_note);
         let segments: Vec<Proof> = CUTS
             .iter()
             .map(|&(a, b)| {
-                prove_canonical_format(&mut cursor.side_note(a, b), &[], &SEGMENT).expect("proves")
+                prove_every_chip(
+                    || SegmentCursor::new(&trace.side_note).side_note(a, b),
+                    &SEGMENT,
+                )
             })
             .collect();
         let leaves: Vec<LeafCircuit> = segments

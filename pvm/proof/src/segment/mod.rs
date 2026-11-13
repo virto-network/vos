@@ -1,18 +1,14 @@
 //! Trace segmentation: slice a fully-traced `SideNote` into bounded
-//! step-range segments that prove independently in bounded memory and chain
-//! via [`crate::verify_chain`].
+//! step-range segments that prove independently in bounded memory.
 //!
 //! A single proof's peak memory scales with the trace's largest chip
-//! `log_size`. A multi-million-step actor trace (e.g. a kernel
-//! state-transition re-execution) exceeds a 64 GB host even for a *single*
-//! chip. Segmentation caps each segment's step count — and hence its
-//! `log_size` — so the prover fits on modest hardware, while `verify_chain`
-//! re-checks per-segment validity plus boundary continuity.
+//! `log_size`; a kernel's run is cut into segments of its shape's classes
+//! ([`crate::prove_kernel`]), each proved on its own, and a run's segments
+//! chain: each one's `final_state` is the next's `initial_state`
+//! ([`crate::proof::check_continuity`]; a leaf binds it in-circuit).
 //!
-//! SOUNDNESS SCOPE. `verify_chain`'s continuity check compares each
-//! segment's `final_state` to the next's `initial_state` (registers, pc,
-//! timestamp, memory root). Each segment's verification binds those fields
-//! to the committed boundary columns (`boundary_binding`):
+//! Each segment's verification binds those fields to the committed boundary
+//! columns (`boundary_binding`):
 //!   - pc/timestamp columns are pinned to the trace by CpuChip's
 //!     program-execution chaining;
 //!   - register columns are pinned to the trace by the register ledger's
@@ -21,12 +17,6 @@
 //!     `tests/gates/ledger_readconsistency_gate.rs`);
 //!   - `memory_root` is the page-Merkle root the boundary multiproof binds
 //!     in-circuit (`Memory{Page,Merkle,RootBoundary}Chip`).
-//! `verify_chain` itself is a host-side capability: it consumes
-//! prover-derived `SideNote`s. The side-note-free trust boundary is the
-//! verifier crate's `verify_chain_standalone`.
-//!
-//! This is program-agnostic: any actor whose trace is too large for one
-//! proof becomes provable as a chain.
 
 /// Split `[0, total)` into consecutive `[a, b)` ranges of at most
 /// `max_steps` steps each (the last may be shorter). Panics if

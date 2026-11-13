@@ -29,7 +29,7 @@ use vos_pvm_proof::kernel::{KernelTrace, trace_kernel};
 use vos_pvm_proof::poseidon2::P2Hash;
 use vos_pvm_proof::program_id::HALT_PC;
 use vos_pvm_proof::segment::SegmentCursor;
-use vos_pvm_proof::{Proof, RecursionData, extract_recursion_data, prove_canonical_format};
+use vos_pvm_proof::{Proof, RecursionData, extract_recursion_data};
 use vos_pvm_recair::leaf::{LeafCircuit, LeafValues, NodeOutput, PADDED_ROWS, State};
 use vos_pvm_recair::verifier::SegmentShape;
 use vos_pvm_recair::{Context, NoValue};
@@ -37,6 +37,7 @@ use vos_pvm_recair::{Context, NoValue};
 use crate::common;
 
 use crate::common::{assert_transcript_is, print_rows};
+use common::every_chip::prove_every_chip;
 use common::kernel::{IO, blob, entry};
 
 /// A segment's proof, its leaf circuit and the native verifier's record.
@@ -86,10 +87,11 @@ fn run() -> &'static Run {
         let steps = trace.side_note.steps.len();
         assert_eq!(steps, 6);
         let entry = entry(&blob);
-        let mut cursor = SegmentCursor::new(&trace.side_note);
         let [whole, head, tail] = [(0, steps), (0, 3), (3, steps)].map(|(a, b)| {
-            let proof =
-                prove_canonical_format(&mut cursor.side_note(a, b), &[], &SEGMENT).expect("proves");
+            let proof = prove_every_chip(
+                || SegmentCursor::new(&trace.side_note).side_note(a, b),
+                &SEGMENT,
+            );
             Segment::new(proof, entry)
         });
         Run {

@@ -24,31 +24,6 @@ pub use recursion::{
     replay_stark, sample_layout, sample_layout_of,
 };
 
-/// Verify a chain of segment proofs. Each segment's final state must match
-/// the next segment's initial state. Each segment is verified independently.
-///
-/// The continued `SegmentState` fields are bound to the committed boundary
-/// columns (boundary-binding check — see `boundary_binding`), so the
-/// continuity equality forces real state continuity: pc/timestamp via CpuChip
-/// trace pinning, registers via the register-ledger read-consistency binding,
-/// and `memory_root` via the in-AIR page-Merkle trie. This is a host-side
-/// capability (it
-/// consumes prover-derived side notes); `vos_pvm_proof_verifier::verify_chain_standalone`
-/// is the side-note-free, trust-boundary variant.
-pub fn verify_chain(proofs: &[Proof], side_notes: &[&SideNote]) -> Result<(), VerificationError> {
-    if proofs.len() != side_notes.len() {
-        return Err(VerificationError::InvalidStructure(
-            "proofs and side_notes length mismatch".to_string(),
-        ));
-    }
-    crate::proof::check_continuity(proofs)?;
-    // Verify each segment independently
-    for (proof, side_note) in proofs.iter().zip(side_notes) {
-        verify(proof.clone(), side_note)?;
-    }
-    Ok(())
-}
-
 /// The per-component log size cap `verify` applies, the protocol's.
 pub use crate::proof::MAX_PROOF_LOG_SIZE as DEFAULT_MAX_LOG_SIZE;
 

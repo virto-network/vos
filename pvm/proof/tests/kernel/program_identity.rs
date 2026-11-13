@@ -2,12 +2,8 @@
 
 //! Program-identity public API.
 //!
-//! In vos-pvm-proof, a proof's preprocessed-trace Merkle root IS the program
-//! commitment.  These tests demonstrate the publish-once / verify-many
-//! workflow: run the prover once on representative input, extract the
-//! commitment via `program_commitment_of_proof`, then check that
-//! verify_standalone with that hash accepts only proofs of the same
-//! program.
+//! A proof's preprocessed root is its program's commitment: verify_standalone
+//! against one program's root accepts its proofs alone.
 
 use crate::common;
 use common::*;
@@ -17,7 +13,7 @@ use vos_pvm::instruction::Opcode;
 use vos_pvm::interpreter::Interpreter;
 
 use vos_pvm_proof::core::tracing::TracingPvm;
-use vos_pvm_proof::{ProgramCommitment, SideNote, program_commitment_of_proof, prove};
+use vos_pvm_proof::{Commitment, SideNote, prove};
 use vos_pvm_proof_verifier::verify_standalone;
 
 fn trace_reverse_bytes_program() -> (Vec<u8>, Vec<u8>, Vec<vos_pvm_proof::core::step::PvmStep>) {
@@ -71,7 +67,7 @@ fn program_commitment_round_trip() {
     let proof = prove_program(&code, &bitmask, steps);
 
     // Extract the program commitment from the proof.
-    let id_hash = program_commitment_of_proof(&proof);
+    let id_hash = proof.preprocessed_commitment().unwrap();
 
     // verify_standalone with the matching hash must accept.
     verify_standalone(proof, id_hash).expect("verification with matching hash failed");
@@ -82,7 +78,7 @@ fn verify_standalone_rejects_wrong_program_hash() {
     let (code, bitmask, steps) = trace_reverse_bytes_program();
     let proof = prove_program(&code, &bitmask, steps);
 
-    let wrong = ProgramCommitment::from_bytes(
+    let wrong = Commitment::from_bytes(
         vos_pvm_proof::format::ChannelKind::Poseidon2M31,
         &[0x01u8; 32],
     )
@@ -98,7 +94,7 @@ fn different_programs_have_different_commitments() {
     // against another's published hash.
     let (code_a, bitmask_a, steps_a) = trace_reverse_bytes_program();
     let proof_a = prove_program(&code_a, &bitmask_a, steps_a);
-    let h_a = program_commitment_of_proof(&proof_a);
+    let h_a = proof_a.preprocessed_commitment().unwrap();
 
     let mut regs_b = [0u64; PVM_REGISTER_COUNT];
     regs_b[3] = 0x12_34;
@@ -114,7 +110,7 @@ fn different_programs_have_different_commitments() {
     let mut tr_b = TracingPvm::new(pvm_b);
     let _ = tr_b.run();
     let proof_b = prove_program(&code_b, &bitmask_b, tr_b.into_trace());
-    let h_b = program_commitment_of_proof(&proof_b);
+    let h_b = proof_b.preprocessed_commitment().unwrap();
 
     assert_ne!(
         h_a, h_b,
@@ -143,7 +139,7 @@ fn verify_standalone_rejects_proof_for_different_program() {
     let mut tr_b = TracingPvm::new(pvm_b);
     let _ = tr_b.run();
     let proof_b = prove_program(&code_b, &bitmask_b, tr_b.into_trace());
-    let hash_b = program_commitment_of_proof(&proof_b);
+    let hash_b = proof_b.preprocessed_commitment().unwrap();
 
     let res = verify_standalone(proof_a, hash_b);
     assert!(
@@ -176,21 +172,9 @@ fn invalid_opcode_bytes_do_not_alias_canonical_trap_commitments() {
     let (_, trap_steps) = trace_raw_program(vec![Opcode::Trap as u8], bitmask.clone(), regs);
     let invalid_proof = prove_program(&[77], &bitmask, invalid_steps);
     let trap_proof = prove_program(&[Opcode::Trap as u8], &bitmask, trap_steps);
-    let invalid_commitment = program_commitment_of_proof(&invalid_proof);
-    let trap_commitment = program_commitment_of_proof(&trap_proof);
+    let invalid_commitment = invalid_proof.preprocessed_commitment().unwrap();
+    let trap_commitment = trap_proof.preprocessed_commitment().unwrap();
     assert_ne!(invalid_commitment, trap_commitment);
     verify_standalone(invalid_proof, trap_commitment)
         .expect_err("an invalid raw opcode must not alias canonical Trap");
-}
-
-#[test]
-fn profile_only_measurement_matches_canonical_proof_commitment() {
-    let (code, bitmask, steps) = trace_reverse_bytes_program();
-    let mut proven = SideNote::new(steps.clone(), code.clone(), bitmask.clone());
-    let proof = vos_pvm_proof::prove_canonical(&mut proven, &[]).expect("canonical proof");
-    let measured_side_note = SideNote::new(steps, code, bitmask);
-    let measured =
-        vos_pvm_proof::program_commitment_for_profile(&measured_side_note, &proof.log_sizes)
-            .expect("profile-only program commitment");
-    assert_eq!(measured, program_commitment_of_proof(&proof));
 }

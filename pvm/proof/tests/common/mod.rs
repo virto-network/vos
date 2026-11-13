@@ -7,6 +7,8 @@
 #[path = "../../statement/tests/support/jam.rs"]
 pub mod jam;
 
+pub mod every_chip;
+
 use vos_pvm::PVM_REGISTER_COUNT;
 use vos_pvm::instruction::Opcode;
 use vos_pvm::interpreter::Interpreter;

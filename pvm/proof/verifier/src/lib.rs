@@ -1,16 +1,16 @@
-// vos-pvm-proof-verifier: standalone verification for PVM zkVM proofs.
-//
-// This crate provides a verify function that does NOT require the full
-// execution trace (SideNote). It only needs the proof and the expected
-// preprocessed trace commitment (which is deterministic per program).
-//
-// no_std-ready: the verifier path of vos-pvm-proof pulls only verifier-side stwo,
-// alloc::*, and core::*.  Builds for wasm32-unknown-unknown (`just
-// wasm-verifier`): `vos_pvm` is prover-only in vos-pvm-proof (it doesn't build on
-// 32-bit targets — CODE_WINDOW_SIZE = 1 << 32 overflows usize), and the
-// workspace stwo pin is feature-less, with `std,prover,parallel` added
-// back only by vos-pvm-proof's `prover` feature — so this crate's normal-dep graph
-// carries no vos_pvm / rayon.
+//! The native verifier of a segment proof (format 41), from the proof and
+//! its program's preprocessed root alone, no trace.
+//!
+//! [`verify_standalone`] is the reference a leaf circuit is held to: the
+//! recursion's in-AIR verifier (`vos-pvm-recair`'s leaf) replays the checks
+//! it makes (`docs/design/proving.md` A.1), and the recursion's tests hold
+//! the leaf to it. No production path calls it: a node verifies a kernel's
+//! segments inside its leaves, and a venue the wrap alone.
+//! [`verify_kernel_segment`] and [`verify_kernel_chain`] add a kernel's
+//! shape and entry, its program id's preimage.
+//!
+//! `no_std`: `vos-pvm-proof` without its `prover` feature pulls no `vos_pvm`
+//! and no rayon, and builds for `wasm32-unknown-unknown`.
 
 #![no_std]
 
@@ -63,38 +63,10 @@ pub use vos_pvm_proof::proof::MAX_PROOF_LOG_SIZE as DEFAULT_MAX_LOG_SIZE;
 /// # Returns
 /// `Ok(())` if the proof is valid, `Err(VerificationError)` otherwise.
 pub fn verify_standalone(
-    proof: Proof,
-    preprocessed_commitment: CommitmentHash,
-) -> Result<(), VerificationError> {
-    verify_standalone_shaped(proof, preprocessed_commitment, DEFAULT_MAX_LOG_SIZE)
-}
-
-/// Same as `verify_standalone` but with a caller-supplied per-component
-/// `log_size` cap.  Use this when you need to accept proofs over larger
-/// traces than `DEFAULT_MAX_LOG_SIZE` admits, or — more usefully —
-/// tighten the cap for a specific deployment that knows its proof
-/// shapes are smaller.
-///
-/// Reject path: any `log_size > max_log_size` returns
-/// `InvalidStructure` before the verifier touches commitments,
-/// preventing a malicious prover from forcing the verifier into a
-/// giant Merkle commitment phase.
-pub fn verify_standalone_with_max_log_size(
-    proof: Proof,
-    preprocessed_commitment: CommitmentHash,
-    max_log_size: u32,
-) -> Result<(), VerificationError> {
-    verify_standalone_shaped(proof, preprocessed_commitment, max_log_size)
-}
-
-/// Shared verify funnel: the public `verify_standalone*` entry points
-/// funnel here.
-fn verify_standalone_shaped(
     mut proof: Proof,
     preprocessed_commitment: CommitmentHash,
-    max_log_size: u32,
 ) -> Result<(), VerificationError> {
-    let format = preflight_standalone(&mut proof, max_log_size)?;
+    let format = preflight_standalone(&mut proof, DEFAULT_MAX_LOG_SIZE)?;
     vos_pvm_proof::with_stack!(format.channel, Stack => {
         verify_standalone_on::<Stack>(proof, format, preprocessed_commitment)
     }, unbuilt => Err(VerificationError::InvalidStructure(format!(
@@ -370,69 +342,6 @@ fn verify_standalone_on<MC: PcsStack>(
         commitment_scheme,
         stark_proof,
     )
-}
-
-/// Verify a CHAIN of segment proofs WITHOUT any side note — the trustless
-/// counterpart to `vos_pvm_proof::verify_chain` (which needs prover-supplied
-/// `SideNote`s and never pins program identity).
-///
-/// Each segment is verified via [`verify_standalone`] against the SAME
-/// `preprocessed_commitment`, so the chain (a) needs no prover-supplied
-/// trace data and (b) pins every segment to ONE program identity (a
-/// from-scratch prover cannot splice in a segment of a different program).
-/// Consecutive segments must chain: `proofs[i].final_state ==
-/// proofs[i+1].initial_state`.
-///
-/// SOUNDNESS SCOPE — the boundary-continuity equality is BOUND in-circuit
-/// for every continued field, so an accepted chain proves genuine state
-/// continuity (not mere tamper-evidence): registers via the register-ledger
-/// read-consistency binding, pc/timestamp via CpuChip program-execution
-/// chaining, and `SegmentState.memory_root` via the in-AIR page-Merkle trie
-/// (`Memory{Page,Merkle,RootBoundary}Chip` force `memory_root` to be the
-/// genuine blake2b Merkle root of the listed RAM pages, and
-/// `check_boundary_claimed_sums` pins it to the public boundary state). The
-/// entering image is anchored by `expected_initial_root`; the returned final
-/// root pins the post-state. So a chain accepted here proves: one
-/// program, per-segment validity, and full register / pc / timestamp /
-/// memory continuity from `expected_initial_root` to the returned final
-/// root.
-///
-/// PRECONDITION — every segment must share `preprocessed_commitment`, i.e.
-/// have the SAME per-component `log_sizes` (the program commitment is the
-/// preprocessed-trace Merkle root, which is size-dependent). Deployments
-/// that segment a long trace should pad all segments to one uniform size
-/// so a single published commitment pins them all; a chain whose last
-/// segment is smaller would currently need its own commitment (a
-/// per-segment-commitment variant is future work).
-pub fn verify_chain_standalone(
-    proofs: &[Proof],
-    preprocessed_commitment: CommitmentHash,
-    expected_initial_root: [u8; 32],
-) -> Result<[u8; 32], VerificationError> {
-    if proofs.is_empty() {
-        return Err(VerificationError::InvalidStructure(
-            "verify_chain_standalone: empty proof chain".to_string(),
-        ));
-    }
-    // Anchor the chain's entering image — proofs[0] must start from the
-    // verifier-supplied expected root (the memory analogue of program identity).
-    if proofs[0].initial_state.memory_root != expected_initial_root {
-        return Err(VerificationError::InvalidStructure(
-            "verify_chain_standalone: proofs[0].initial_state.memory_root \
-             does not match expected_initial_root"
-                .to_string(),
-        ));
-    }
-    // Boundary continuity: each segment's final state must equal the next
-    // segment's initial state.  Bound for registers/pc/timestamp (and the
-    // memory root) by each segment's in-circuit boundary binding.
-    vos_pvm_proof::proof::check_continuity(proofs)?;
-    // Each segment verifies standalone against the SAME program commitment:
-    // no side note, and program identity is pinned across the whole chain.
-    for proof in proofs {
-        verify_standalone_shaped(proof.clone(), preprocessed_commitment, DEFAULT_MAX_LOG_SIZE)?;
-    }
-    Ok(proofs[proofs.len() - 1].final_state.memory_root)
 }
 
 /// The class of a segment of a kernel's run, from its structure alone: its

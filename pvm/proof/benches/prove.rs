@@ -24,8 +24,41 @@ fn main() {
 
 #[cfg(feature = "prover")]
 mod imp {
-    use vos_pvm_proof::bench_helpers::add_side_note;
-    use vos_pvm_proof::{prove, prove_profiled, verify};
+    use vos_pvm::PVM_REGISTER_COUNT;
+    use vos_pvm::instruction::Opcode;
+    use vos_pvm::interpreter::Interpreter;
+    use vos_pvm_proof::core::tracing::TracingPvm;
+    use vos_pvm_proof::{SideNote, prove, prove_profiled, verify};
+
+    /// The side note of a run of `2^log_size` Add64s, each on the next
+    /// registers, and a Trap; and its step count.
+    fn add_side_note(log_size: u32) -> (SideNote, usize) {
+        let n_steps = 1usize << log_size;
+        let mut code = Vec::with_capacity(n_steps * 3 + 1);
+        let mut bitmask = Vec::with_capacity(n_steps * 3 + 1);
+        for step in 0..n_steps {
+            let [a, b, d] = [0, 1, 2].map(|offset| ((step + offset) % 13) as u8);
+            code.extend_from_slice(&[Opcode::Add64 as u8, a | b << 4, d]);
+            bitmask.extend_from_slice(&[1, 0, 0]);
+        }
+        code.push(Opcode::Trap as u8);
+        bitmask.push(1);
+        let registers: [u64; PVM_REGISTER_COUNT] = core::array::from_fn(|i| i as u64 + 1);
+        let gas = (n_steps as u64 + 100) * 100;
+        let pvm = Interpreter::new(
+            code.clone(),
+            bitmask.clone(),
+            vec![],
+            registers,
+            vec![0u8; 64 * 1024],
+            gas,
+        );
+        let mut tracing = TracingPvm::new(pvm);
+        tracing.run();
+        let steps = tracing.into_trace();
+        assert!(steps.len() >= n_steps, "{} steps", steps.len());
+        (SideNote::new(steps, code, bitmask), n_steps)
+    }
 
     type Bench = (&'static str, fn());
 

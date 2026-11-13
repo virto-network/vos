@@ -430,9 +430,8 @@ fn standalone_verify_rejects_weak_pcs_config() {
     );
 }
 
-// log_size cap test.  We don't need to forge a giant proof
-// — just call the variant with an unrealistically tight cap and check
-// the early rejection fires.
+// A log size past the protocol's cap is refused before any commitment is
+// read: a proof claiming one need not be large.
 #[test]
 fn standalone_verify_rejects_oversized_log_size() {
     let code = vec![Opcode::Trap as u8];
@@ -452,18 +451,20 @@ fn standalone_verify_rejects_oversized_log_size() {
     let steps = tracing.into_trace();
 
     let mut side_note = SideNote::new(steps, code, bitmask);
-    let proof = prove(&mut side_note).expect("proving failed");
+    let mut proof = prove(&mut side_note).expect("proving failed");
     let preprocessed_commitment = proof.preprocessed_commitment().unwrap();
+    proof.log_sizes[0] = vos_pvm_proof_verifier::DEFAULT_MAX_LOG_SIZE + 1;
 
-    // Cap = 0: even the smallest legitimate proof has log_sizes >= LOG_N_LANES.
-    let err = vos_pvm_proof_verifier::verify_standalone_with_max_log_size(
-        proof,
-        preprocessed_commitment,
-        0,
-    )
-    .expect_err("should reject — cap is zero");
+    let err = verify_standalone(proof, preprocessed_commitment)
+        .expect_err("a log size past the cap is refused");
     let msg = format!("{err:?}");
-    assert!(msg.contains("outside 4..=0"), "got: {msg}");
+    assert!(
+        msg.contains(&format!(
+            "outside 4..={}",
+            vos_pvm_proof_verifier::DEFAULT_MAX_LOG_SIZE
+        )),
+        "got: {msg}"
+    );
 }
 
 #[test]
