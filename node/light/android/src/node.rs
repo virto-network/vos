@@ -25,8 +25,9 @@
 //! - **One client over Tor** ([`crate::net`]): every request to a space,
 //!   arti's state in the app's private files; dormant while the app is in
 //!   the background and no job runs ([`Node::foreground`]).
-//! - **The personal space** ([`crate::personal`]): its flows, each one
-//!   operation here, lent the client's prompts as the others are.
+//! - **The personal space** ([`crate::personal`]): its flows, called on
+//!   it through [`Node::personal`], lent the client's prompts as the
+//!   others are.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -42,13 +43,10 @@ use crate::personal::{Artifacts, Space};
 use crate::source::{BoxFuture, Kind, Output, Reference, Source, SourceError};
 use crate::stream::{Dialer, Tcp};
 use crate::{
-    Answer, Code, Enroll, Enrolled, EnrolledSpace, Facility, Form, Gateway, JobRun, Notice, Paid,
-    Pay, Refusal, Session, SignIn, SignedIn, StreamTarget, Synced, Warming, refused,
+    Answer, Code, Enroll, Enrolled, EnrolledSpace, Facility, Form, Gateway, JobRun, Paid, Pay,
+    Refusal, Session, SignIn, SignedIn, StreamTarget, Synced, Warming, refused,
 };
 use s4_credential_contract::KeyAnswer;
-use s4_credential_contract::personal::{
-    Claim, Claimed, Device as SetDevice, KitKind, Membership, Moved, PairCode, Paired, Posted,
-};
 
 /// The client's prompts, lent to one operation. Each call blocks until the
 /// user answers, or the client is gone.
@@ -456,19 +454,21 @@ impl Node {
     /// `run` with the client awake, dormant again after once nothing else
     /// runs and the app is in the background.
     fn awake<T>(&self, run: impl FnOnce() -> T) -> T {
-        let _entered = self.runtime.enter();
-        {
-            let mut waking = self.waking.lock().unwrap_or_else(|e| e.into_inner());
-            waking.1 += 1;
-            self.facility.net().set_dormant(false);
-        }
-        let done = run();
+        let _awake = self.wake();
+        run()
+    }
+
+    /// The client awake, within the runtime, until the guard drops.
+    fn wake(&self) -> Awake<'_> {
+        let entered = self.runtime.enter();
         let mut waking = self.waking.lock().unwrap_or_else(|e| e.into_inner());
-        waking.1 -= 1;
-        if *waking == (false, 0) {
-            self.facility.net().set_dormant(true);
+        waking.1 += 1;
+        self.facility.net().set_dormant(false);
+        drop(waking);
+        Awake {
+            node: self,
+            _entered: entered,
         }
-        done
     }
 
     /// The app came to the foreground, or left it (its binding's grace
@@ -583,7 +583,9 @@ impl Node {
 
     // ----- the personal space -----
 
-    fn space(&self) -> Result<&Arc<Space>, Refusal> {
+    /// The personal space, or why it does not open: its reads, and the
+    /// test seams that need no client awake.
+    pub fn space(&self) -> Result<&Arc<Space>, Refusal> {
         match &self.personal {
             Some(Ok(space)) => Ok(space),
             Some(Err(refusal)) => Err(refusal.clone()),
@@ -591,211 +593,56 @@ impl Node {
         }
     }
 
-    /// `flow` of the personal space, `prompts` lent to it, its client
-    /// awake; the job attached once the device holds a group.
-    fn personal<T>(
-        &self,
-        prompts: &dyn Prompts,
-        flow: impl FnOnce(&Space, &dyn Prompts) -> Result<T, Refusal>,
-    ) -> Result<T, Refusal> {
+    /// The personal space for one flow, called on it directly
+    /// (`node.personal()?.claim(..)`): its client awake while the flow
+    /// runs, the job attached once the device holds a group.
+    pub fn personal(&self) -> Result<Personal<'_>, Refusal> {
         let space = self.space()?;
-        let done = self.awake(|| flow(space, prompts));
-        if space.grouped() {
+        Ok(Personal {
+            space,
+            job: &self.job,
+            _awake: self.wake(),
+        })
+    }
+}
+
+/// The personal space lent to one flow ([`Node::personal`]).
+pub struct Personal<'a> {
+    space: &'a Arc<Space>,
+    job: &'a Job,
+    _awake: Awake<'a>,
+}
+
+impl std::ops::Deref for Personal<'_> {
+    type Target = Space;
+
+    fn deref(&self) -> &Space {
+        self.space
+    }
+}
+
+impl Drop for Personal<'_> {
+    fn drop(&mut self) {
+        if self.space.grouped() {
             self.job
-                .attach(Arc::clone(space) as Arc<dyn crate::job::Personal>);
+                .attach(Arc::clone(self.space) as Arc<dyn crate::job::Personal>);
         }
-        done
     }
+}
 
-    pub fn claim(&self, request: Claim, prompts: &dyn Prompts) -> Result<Claimed, Refusal> {
-        self.personal(prompts, |space, prompts| space.claim(prompts, request))
-    }
+/// The client awake while this lives ([`Node::wake`]).
+struct Awake<'a> {
+    node: &'a Node,
+    _entered: tokio::runtime::EnterGuard<'a>,
+}
 
-    pub fn pair_offer(&self, prompts: &dyn Prompts) -> Result<PairCode, Refusal> {
-        self.personal(prompts, |space, prompts| space.pair_offer(prompts))
-    }
-
-    pub fn pair_await(&self, prompts: &dyn Prompts) -> Result<Paired, Refusal> {
-        self.personal(prompts, |space, prompts| space.pair_await(prompts))
-    }
-
-    /// The joiner's open claim's delay range (ms): drawn uniformly over it
-    /// after a pairing ([`crate::personal::CLAIM_DELAY`] unless set; tests
-    /// alone shorten it).
-    #[doc(hidden)]
-    pub fn set_claim_delay(&self, delay: std::ops::Range<u64>) -> Result<(), Refusal> {
-        self.space()?.set_claim_delay(delay);
-        Ok(())
-    }
-
-    /// How long a personal flow waits for the agent (ms): tests alone
-    /// shorten it.
-    #[doc(hidden)]
-    pub fn set_wait(&self, ms: u64) -> Result<(), Refusal> {
-        self.space()?.set_wait(ms);
-        Ok(())
-    }
-
-    /// The first wait after the home refuses the joiner's open claim
-    /// (ms), doubled at each refusal ([`crate::personal::CLAIM_RETRY`]
-    /// unless set; tests alone shorten it).
-    #[doc(hidden)]
-    pub fn set_claim_retry(&self, base: u64) -> Result<(), Refusal> {
-        self.space()?.set_claim_retry(base);
-        Ok(())
-    }
-
-    /// The data key this device holds at its confirmed epoch for the scope
-    /// `name` names: two devices that read the same envelopes hold the
-    /// same one (tests alone compare them).
-    #[doc(hidden)]
-    pub fn scope_key(&self, name: &[u8]) -> Result<[u8; 32], Refusal> {
-        self.space()?.scope_key(name)
-    }
-
-    /// When the joiner's open claim is due (ms), while it is owed.
-    pub fn claim_due(&self) -> Result<Option<u64>, Refusal> {
-        Ok(self.space()?.claim_due())
-    }
-
-    /// Cancel the pairing under way, at its next read of the slot.
-    pub fn pair_cancel(&self) -> Result<(), Refusal> {
-        self.space()?.pair_cancel();
-        Ok(())
-    }
-
-    pub fn pair_join(
-        &self,
-        code: &[u8],
-        label: &str,
-        prompts: &dyn Prompts,
-    ) -> Result<Paired, Refusal> {
-        self.personal(prompts, |space, prompts| {
-            space.pair_join(prompts, code, label)
-        })
-    }
-
-    pub fn memberships(&self) -> Result<Vec<Membership>, Refusal> {
-        self.space()?.memberships()
-    }
-
-    pub fn enroll_device(
-        &self,
-        membership: Membership,
-        prompts: &dyn Prompts,
-    ) -> Result<(), Refusal> {
-        self.personal(prompts, |space, prompts| {
-            space.enroll_device(prompts, membership)
-        })
-    }
-
-    pub fn confirm_device(
-        &self,
-        membership: Membership,
-        prompts: &dyn Prompts,
-    ) -> Result<(), Refusal> {
-        self.personal(prompts, |space, prompts| {
-            space.confirm_device(prompts, membership)
-        })
-    }
-
-    pub fn drop_enrollment(&self, membership: Membership) -> Result<(), Refusal> {
-        self.space()?.drop_enrollment(membership)
-    }
-
-    pub fn revoke(&self, device: u32, prompts: &dyn Prompts) -> Result<u32, Refusal> {
-        self.personal(prompts, |space, prompts| space.revoke(prompts, device))
-    }
-
-    pub fn devices(&self) -> Result<Vec<SetDevice>, Refusal> {
-        let space = self.space()?;
-        self.awake(|| space.devices())
-    }
-
-    pub fn operations(&self) -> Result<Vec<Notice>, Refusal> {
-        self.space()?.operations()
-    }
-
-    pub fn remove(&self, device: u32, prompts: &dyn Prompts) -> Result<Posted, Refusal> {
-        self.personal(prompts, |space, prompts| space.remove(prompts, device))
-    }
-
-    pub fn veto(&self, index: u64, prompts: &dyn Prompts) -> Result<Posted, Refusal> {
-        self.personal(prompts, |space, prompts| space.veto(prompts, index))
-    }
-
-    pub fn cosign(&self, index: u64, prompts: &dyn Prompts) -> Result<Posted, Refusal> {
-        self.personal(prompts, |space, prompts| space.cosign(prompts, index))
-    }
-
-    pub fn resolve(
-        &self,
-        index: u64,
-        upheld: bool,
-        prompts: &dyn Prompts,
-    ) -> Result<Posted, Refusal> {
-        self.personal(prompts, |space, prompts| {
-            space.resolve(prompts, index, upheld)
-        })
-    }
-
-    pub fn rotate_kit(&self, kit: KitKind, prompts: &dyn Prompts) -> Result<Posted, Refusal> {
-        self.personal(prompts, |space, prompts| space.rotate_kit(prompts, kit))
-    }
-
-    pub fn replace_admin(&self, kit: KitKind, prompts: &dyn Prompts) -> Result<Posted, Refusal> {
-        self.personal(prompts, |space, prompts| space.replace_admin(prompts, kit))
-    }
-
-    /// A new admin key for this device, offered to another of its devices
-    /// to sign its replacement: the code that device takes.
-    pub fn admin_offer(&self, prompts: &dyn Prompts) -> Result<Vec<u8>, Refusal> {
-        self.personal(prompts, |space, prompts| space.admin_offer(prompts))
-    }
-
-    /// Another device's admin key replaced by the one its `code` offers,
-    /// signed by this device's admin key.
-    pub fn replace_admin_of(&self, code: &[u8], prompts: &dyn Prompts) -> Result<Posted, Refusal> {
-        self.personal(prompts, |space, prompts| {
-            space.replace_admin_of(prompts, code)
-        })
-    }
-
-    pub fn regroup(&self, remove: Vec<u32>, prompts: &dyn Prompts) -> Result<Posted, Refusal> {
-        if remove.len() > s4_credential_contract::personal::MAX_REGROUP {
-            return Err(refused(
-                Code::Arguments,
-                "a regroup names at most 16 devices",
-            ));
+impl Drop for Awake<'_> {
+    fn drop(&mut self) {
+        let mut waking = self.node.waking.lock().unwrap_or_else(|e| e.into_inner());
+        waking.1 -= 1;
+        if *waking == (false, 0) {
+            self.node.facility.net().set_dormant(true);
         }
-        self.personal(prompts, |space, prompts| space.regroup(prompts, remove))
-    }
-
-    pub fn update(&self, prompts: &dyn Prompts) -> Result<(), Refusal> {
-        self.personal(prompts, |space, prompts| space.update(prompts))
-    }
-
-    pub fn renew(&self, prompts: &dyn Prompts) -> Result<(), Refusal> {
-        self.personal(prompts, |space, prompts| space.renew(prompts))
-    }
-
-    pub fn restore(
-        &self,
-        request: Claim,
-        old: KitKind,
-        prompts: &dyn Prompts,
-    ) -> Result<Posted, Refusal> {
-        self.personal(prompts, |space, prompts| {
-            space.restore(prompts, request, old)
-        })
-    }
-
-    pub fn restored(&self, kit: KitKind, prompts: &dyn Prompts) -> Result<Claimed, Refusal> {
-        self.personal(prompts, |space, prompts| space.restored(prompts, kit))
-    }
-
-    pub fn move_home(&self, request: Claim, prompts: &dyn Prompts) -> Result<Moved, Refusal> {
-        self.personal(prompts, |space, prompts| space.move_home(prompts, request))
     }
 }
 

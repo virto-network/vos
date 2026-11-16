@@ -16,17 +16,23 @@ SPDX-License-Identifier: AGPL-3.0-or-later
     <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <application>
+        <!-- The facility's own ops of s4's debug probe (`VosProbe`):
+             `Probe`, over the facility's own interface. -->
+        <meta-data
+            android:name="team.virto.s4.FacilityProbe"
+            android:value="team.virto.vos.personal.Probe" />
+
         <!-- The personal space's screens over the facility, an entry of
              their own in the launcher. -->
         <activity
-            android:name="team.virto.s4.personal.PersonalActivity"
+            android:name="team.virto.vos.personal.PersonalActivity"
             android:enabled="@bool/vos_personal_screens"
             android:configChanges="colorMode|density|fontScale|fontWeightAdjustment|keyboard|keyboardHidden|layoutDirection|locale|mcc|mnc|navigation|orientation|screenLayout|screenSize|smallestScreenSize|touchscreen|uiMode"
             android:exported="true"
             android:icon="@drawable/vos_personal"
             android:label="@string/vos_personal_name"
             android:launchMode="singleTask"
-            android:taskAffinity="team.virto.s4.personal"
+            android:taskAffinity="team.virto.vos.personal"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

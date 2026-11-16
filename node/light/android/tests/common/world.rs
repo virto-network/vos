@@ -450,10 +450,10 @@ impl World {
     }
 
     /// The home at `agent` as the chrome names it.
-    pub fn home_of(&self, agent: u32) -> s4_credential_contract::personal::Home {
+    pub fn home_of(&self, agent: u32) -> vos_facility::personal::Home {
         let state = self.state.lock().unwrap();
         let space = &state.spaces[&agent];
-        s4_credential_contract::personal::Home {
+        vos_facility::personal::Home {
             space: space.space,
             handle: space.handle,
             agent,

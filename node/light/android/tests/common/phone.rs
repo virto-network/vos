@@ -9,10 +9,10 @@ use std::collections::{HashMap, HashSet};
 
 use ed25519_dalek::{Signer as _, SigningKey};
 use s4_credential_contract::KeyAnswer;
-use s4_credential_contract::personal::{Claim, KitKind};
 use vos_facility::Enroll;
 use vos_facility::chrome::Field;
 use vos_facility::node::{Device, Node, Prompts};
+use vos_facility::personal::{Claim, KitKind};
 
 use super::*;
 
@@ -188,7 +188,9 @@ pub struct Held {
 pub fn node_as(world: &Arc<World>, directory: &std::path::Path, tag: u8) -> Node {
     let node = node_over(world.dial_as(tag), directory, Arc::new(Phone));
     // A personal space in need of repair has no delay to set.
-    let _ = node.set_claim_delay(0..0);
+    if let Ok(space) = node.space() {
+        space.set_claim_delay(0..0);
+    }
     node
 }
 
@@ -246,15 +248,17 @@ impl Held {
         home: u32,
         kit: KitKind,
         label: &str,
-    ) -> s4_credential_contract::personal::Claimed {
+    ) -> vos_facility::personal::Claimed {
         self.node
+            .personal()
+            .unwrap()
             .claim(
+                &*self.hand,
                 Claim {
                     home: world.home_of(home),
                     kit,
                     label: label.into(),
                 },
-                &*self.hand,
             )
             .unwrap()
     }
@@ -265,14 +269,24 @@ impl Held {
         joiner: &Held,
         label: &str,
     ) -> (
-        s4_credential_contract::personal::Paired,
-        s4_credential_contract::personal::Paired,
+        vos_facility::personal::Paired,
+        vos_facility::personal::Paired,
     ) {
-        let code = self.node.pair_offer(&*self.hand).unwrap();
+        let code = self
+            .node
+            .personal()
+            .unwrap()
+            .pair_offer(&*self.hand)
+            .unwrap();
         assert!(code.expires_ms > wall());
         std::thread::scope(|scope| {
-            let opener = scope.spawn(|| self.node.pair_await(&*self.hand));
-            let joined = joiner.node.pair_join(&code.code, label, &*joiner.hand);
+            let opener = scope.spawn(|| self.node.personal().unwrap().pair_await(&*self.hand));
+            let joined =
+                joiner
+                    .node
+                    .personal()
+                    .unwrap()
+                    .pair_join(&*joiner.hand, &code.code, label);
             // The opener's refusal first: the joiner's is its wait running out.
             let opened = opener.join().unwrap().unwrap();
             (opened, joined.unwrap())

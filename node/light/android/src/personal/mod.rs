@@ -32,6 +32,7 @@
 //!   `Background` isolation group, a flow's on `Personal`; the personal
 //!   agent's traffic never shares a circuit with a proof.
 
+pub mod contract;
 pub mod link;
 mod ops;
 
@@ -57,9 +58,13 @@ use crate::job::{Passed, Personal};
 use crate::net::{Net, Pinned};
 use crate::node::Prompts;
 use crate::source::Reference;
-use crate::{Code, Facility, Refusal, Seen, refused};
+use crate::{Code, Facility, Refusal, refused};
 use link::{Agent, AgentLink, Signer};
 
+pub use contract::{
+    Claim, Claimed, Device, Home, KitKind, MAX_LABEL, MAX_REGROUP, Membership, Moved, Notice, Owed,
+    PairCode, Paired, Pending, Posted, Seen, Synced, label,
+};
 pub use ops::{AdminOffer, Removal};
 
 impl Held {

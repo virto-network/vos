@@ -97,7 +97,7 @@ fn a_run_with_nothing_new_reads_nothing() {
     assert_eq!(runs.len(), 2);
     for (run, synced) in runs.iter().zip([&first, &quiet]) {
         assert!(run.finished_ms >= run.started_ms && run.started_ms > 0);
-        assert!(!run.personal);
+        assert!(!run.apart);
         assert_eq!(
             (run.bytes_down, run.bytes_up, run.synced, run.failed),
             (synced.bytes_down, synced.bytes_up, 1, 0)
@@ -199,7 +199,7 @@ fn notices_are_fresh_once_and_stand_while_a_pass_fails() {
         .runs()
         .unwrap()
         .into_iter()
-        .filter(|run| run.personal)
+        .filter(|run| run.apart)
         .collect();
     assert_eq!(
         runs.iter().map(|run| run.notices).collect::<Vec<_>>(),

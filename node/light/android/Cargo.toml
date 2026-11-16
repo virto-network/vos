@@ -31,16 +31,22 @@ debug = "line-tables-only"
 crate-type = ["rlib", "cdylib"]
 
 [features]
+# The interfaces' types as their parcelables, read and made through JNI:
+# s4's contract's and the facility's own (`personal::contract`).
+jni = ["dep:jni", "s4-credential-contract/jni"]
 # `libvos_facility.so` as the app's `:vos` process loads it: the facility
-# on a runtime of its own behind the Binder interface's JNI, its chrome and
+# on a runtime of its own behind the Binder interfaces' JNI, its chrome and
 # its secret sources the UI process's, reached through the interface.
-android = ["dep:jni", "s4-credential-contract/jni", "tokio/rt-multi-thread"]
+android = ["jni", "tokio/rt-multi-thread"]
+# The facility's own interface's round trip on a JVM (`just
+# facility-contract`), on s4's contract's harness.
+jvm = ["jni", "s4-credential-contract/jvm"]
 
 [dependencies]
 # The facility's protocol and its Binder contract: s4's, by git revision,
 # as the gateway names s4-server.
-s4-protocol = { git = "https://codeberg.org/Virto/s4", rev = "bbfaa73cc015a82292b82e7d503e1ff6c5baad9b" }
-s4-credential-contract = { git = "https://codeberg.org/Virto/s4", rev = "bbfaa73cc015a82292b82e7d503e1ff6c5baad9b" }
+s4-protocol = { git = "https://codeberg.org/Virto/s4", rev = "084f598218c9468cbdd30dcad139d94e7cd754bc" }
+s4-credential-contract = { git = "https://codeberg.org/Virto/s4", rev = "084f598218c9468cbdd30dcad139d94e7cd754bc" }
 # The light node, with its device library: the secret's derivation, the
 # proofs, the node-API requests and the path kept apart from proofs.
 vos-light = { path = "..", features = ["tor"] }
@@ -70,7 +76,7 @@ vos-testkit = { path = "../../../agent/testkit" }
 # program over the interpreter, its work applied as accumulate applies it.
 vos-exec = { path = "../../exec" }
 vos-pvm = { path = "../../../pvm/runtime" }
-s4-server = { git = "https://codeberg.org/Virto/s4", rev = "bbfaa73cc015a82292b82e7d503e1ff6c5baad9b" }
+s4-server = { git = "https://codeberg.org/Virto/s4", rev = "084f598218c9468cbdd30dcad139d94e7cd754bc" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "sync", "time"] }
 tempfile = "3"
 hmac = "0.12"

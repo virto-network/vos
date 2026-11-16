@@ -18,8 +18,10 @@
 //!   the space's operator invites.
 //! - **`sign_in`** asks for a call of a pinned method under its auth guard.
 //!   The chrome names the method and, for a `once` guard, that the call
-//!   spends the member's one admission in its scope; the answer is the
-//!   node-API `Credentialed` request, proved on the path the device holds.
+//!   spends the member's one admission in its scope; the facility proves
+//!   the node-API `Credentialed` request on the path the device holds,
+//!   sends it over Tor itself, and answers the server with the node's
+//!   answer.
 //! - **`pay`** pre-fills a transfer from the account of this device's owner
 //!   digest. The chrome's own form lets the user edit the payee and the
 //!   amount; the transfer is encoded from what the user confirmed, whatever
@@ -40,10 +42,12 @@
 //! personal space's ([`personal`]) has its own job.
 //!
 //! On Android the facility runs in the app's own `:vos` process ([`node`],
-//! and its JNI under the `android` feature), behind the one Binder interface
-//! of `s4-credential-contract`: its operations' requests, results and
-//! refusals typed, the chrome and the secret sources' prompts the UI
-//! process's, reached back through the interface.
+//! and its JNI under the `android` feature), behind two Binder interfaces:
+//! `s4-credential-contract`'s `IVosNode`, which s4's client calls, and the
+//! facility's own `IVosPersonal` ([`personal::contract`]), which its
+//! screens call; their operations' requests, results and refusals typed,
+//! the chrome and the secret sources' prompts the UI process's, reached
+//! back through the interface.
 
 #[cfg(feature = "android")]
 mod android;
@@ -58,10 +62,10 @@ pub mod source;
 pub mod stream;
 mod warm;
 
+pub use personal::{Notice, Pending, Seen, Synced};
 pub use s4_credential_contract::{
     Answer, Code, Enroll, Enrolled, EnrolledSpace, FACILITY, Field, Form, Gateway, JobRun, MAJOR,
-    Notice, Onion, Operation, Outcome, Paid, Pay, Pending, Refusal, Seen, SignIn, SignedIn,
-    StreamTarget, Synced,
+    Onion, Operation, Outcome, Paid, Pay, Refusal, SignIn, SignedIn, StreamTarget,
 };
 pub use session::{Facility, Session, Stock};
 pub use warm::Warming;

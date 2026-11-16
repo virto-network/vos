@@ -1,0 +1,145 @@
+// SPDX-FileCopyrightText: 2026 Virto
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+package team.virto.vos.personal;
+
+import team.virto.s4.vos.IVosPrompts;
+import team.virto.s4.vos.Refusal;
+import team.virto.vos.personal.ClaimRequest;
+import team.virto.vos.personal.Claimed;
+import team.virto.vos.personal.Device;
+import team.virto.vos.personal.KitKind;
+import team.virto.vos.personal.Membership;
+import team.virto.vos.personal.Moved;
+import team.virto.vos.personal.Notice;
+import team.virto.vos.personal.PairCode;
+import team.virto.vos.personal.Paired;
+import team.virto.vos.personal.Posted;
+import team.virto.vos.personal.Synced;
+
+/**
+ * The facility's own operations, as its screens and its debug probe call them in the app's
+ * processes: the background jobs' passes, Tor's bridges, bootstrap and opt-outs, and the personal
+ * space's flows. Served by `VosNodeService` in `:vos` beside s4's `IVosNode`, bound by the intent
+ * action `team.virto.vos.personal.IVosPersonal`. An operation that refuses answers null, false or
+ * 0 and fills its `out Refusal`; a `RemoteException` means the facility's process stopped. The
+ * prompts an operation is lent are s4's `IVosPrompts`.
+ */
+interface IVosPersonal {
+    /** One run of the spaces' sync, apart from every proof: the spaces' background job's. */
+    Synced sync(out Refusal refused);
+
+    /** One run of the personal space's sync: its own background job's, on its own circuits. */
+    Synced syncPersonal(out Refusal refused);
+
+    /**
+     * Bootstrap Tor through the plain bridges pasted in the chrome (none: the public relays), kept
+     * for later starts; refused with why (a wrong clock, a bridge that does not answer, a network
+     * that blocks Tor).
+     */
+    boolean bridges(in String[] lines, out Refusal refused);
+
+    /** Bootstrap Tor now (it bootstraps at start too): refused with why, as `bridges` is. */
+    boolean bootstrap(out Refusal refused);
+
+    /**
+     * Opt the space whose handle this is out of Tor for its key-signed calls, after the chrome
+     * showed the warning; or back. Refused for an onion-only space or one with no clearnet port.
+     */
+    boolean optOut(in byte[] handle, boolean optedOut, out Refusal refused);
+
+    /** Claim a personal agent at a home-only space, with a kit of the kind asked. */
+    Claimed claim(in ClaimRequest request, IVosPrompts prompts, out Refusal refused);
+
+    /** Open a pairing slot: the QR code to show. */
+    PairCode pairOffer(IVosPrompts prompts, out Refusal refused);
+
+    /** Drive the pairing the code shown opened to its end: the new device added. */
+    Paired pairAwait(IVosPrompts prompts, out Refusal refused);
+
+    /**
+     * Cancel the pairing under way (`pairAwait`'s or `pairJoin`'s): it answers its refusal at its
+     * next read of the slot.
+     */
+    void pairCancel();
+
+    /** Join through a scanned code (or pair again after a move), this device named `label`. */
+    Paired pairJoin(in byte[] code, String label, IVosPrompts prompts, out Refusal refused);
+
+    /** The memberships owed on this device: enrollments of a device it paired, its confirmations. */
+    Membership[] memberships(out Refusal refused);
+
+    /** Enroll the device a pairing added in the membership's space, by this device's owner proof. */
+    boolean enrollDevice(in Membership membership, IVosPrompts prompts, out Refusal refused);
+
+    /** This device's own confirmation in the membership's space. */
+    boolean confirmDevice(in Membership membership, IVosPrompts prompts, out Refusal refused);
+
+    /** Give up an enrollment owed. */
+    boolean dropEnrollment(in Membership membership, out Refusal refused);
+
+    /** Revoke a removed device's leaf in every space its handles name: how many. */
+    int revoke(long device, IVosPrompts prompts, out Refusal refused);
+
+    /** The device set, as the personal agent holds it. */
+    Device[] devices(out Refusal refused);
+
+    /** The device set's operations open. */
+    Notice[] operations(out Refusal refused);
+
+    /** Remove a device (retire a phone), by the admin key. */
+    Posted remove(long device, IVosPrompts prompts, out Refusal refused);
+
+    /** Veto an operation open, by the admin key. */
+    Posted veto(long index, IVosPrompts prompts, out Refusal refused);
+
+    /** Cosign an operation open, which makes it immediate, by the admin key. */
+    Posted cosign(long index, IVosPrompts prompts, out Refusal refused);
+
+    /** Resolve a contested operation: upheld, or dropped. */
+    Posted resolve(long index, boolean upheld, IVosPrompts prompts, out Refusal refused);
+
+    /** Rotate the recovery kit to a new one of the kind. */
+    Posted rotateKit(KitKind kit, IVosPrompts prompts, out Refusal refused);
+
+    /**
+     * Replace this device's admin key with a new one (its old key lost, or
+     * invalidated by a new biometric), the kit of the kind signing the
+     * replacement: it matures after the kit's delay.
+     */
+    Posted replaceAdmin(KitKind kit, IVosPrompts prompts, out Refusal refused);
+
+    /**
+     * A new admin key for this device, offered to another seasoned device of the set to sign its
+     * replacement (`replaceAdminOf`): the offer's bytes, device (u32 BE) ‖ key ‖ flags ‖ the
+     * device's sync-key signature over them, which `replaceAdminOf` checks before it asks.
+     */
+    byte[] adminOffer(IVosPrompts prompts, out Refusal refused);
+
+    /**
+     * Another device's admin key replaced by the one its offer names, signed by this device's
+     * admin key: a seasoned device other than the one replaced; the new key on its probation.
+     */
+    Posted replaceAdminOf(in byte[] code, IVosPrompts prompts, out Refusal refused);
+
+    /** Remove the devices named and start a new group. */
+    Posted regroup(in long[] remove, IVosPrompts prompts, out Refusal refused);
+
+    /** Commit now: every matured removal carried, this device's leaf updated. */
+    boolean update(IVosPrompts prompts, out Refusal refused);
+
+    /** The yearly re-proof at the home, with the leaf's update on the same prompt. */
+    boolean renew(IVosPrompts prompts, out Refusal refused);
+
+    /**
+     * Open a restore from the kit of kind `old` at the request's home, a new kit of the request's
+     * kind split for it; it matures after the kit's delay unless a device answers.
+     */
+    Posted restore(in ClaimRequest request, KitKind old, IVosPrompts prompts, out Refusal refused);
+
+    /** The restore matured: the kit entered again, the personal space read back. */
+    Claimed restored(KitKind kit, IVosPrompts prompts, out Refusal refused);
+
+    /** Move the personal space to another home, with a new kit of the kind asked. */
+    Moved moveHome(in ClaimRequest request, IVosPrompts prompts, out Refusal refused);
+}

@@ -15,6 +15,7 @@ import android.util.Log;
 import androidx.annotation.NonNull;
 import androidx.work.Worker;
 import androidx.work.WorkerParameters;
+import team.virto.vos.personal.Synced;
 
 /**
  * The background jobs, run by WorkManager in {@code :vos} with no UI process: one pass of the

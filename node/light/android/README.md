@@ -52,15 +52,20 @@ two prompts; the grant never stands in for a confirmation.
 
 On Android the facility runs in the app's `:vos` process
 (`android:process=":vos"`), which loads `libvos_facility.so`; the UI process
-never does. The UI reaches it through one Binder interface, `IVosNode`
-(s4's `credential-contract/aidl/team/virto/s4/vos`), whose Rust form is
-`s4-credential-contract`: the operations above by name, each with its typed
-request and result, a refusal the operation's `out Refusal` (its code the
-contract's `Code`), and nothing generic. A proved request never crosses:
+never does. It serves two Binder interfaces. s4's client reaches it through
+`IVosNode` (s4's `credential-contract/aidl/team/virto/s4/vos`), whose Rust
+form is `s4-credential-contract`: the operations above by name, each with its
+typed request and result, a refusal the operation's `out Refusal` (its code
+the contract's `Code`), and nothing generic. A proved request never crosses:
 the facility sends it over Tor itself, and only the node's answer goes back
-to the server. A server's arguments are read
-into an operation's request in the UI; the facility checks each request
-again as it takes it off the interface (`src/node.rs`).
+to the server. A server's arguments are read into an operation's request in
+the UI; the facility checks each request again as it takes it off the
+interface (`src/node.rs`). The facility's own screens reach it through
+`IVosPersonal` (`aar/src/main/aidl/team/virto/vos/personal`, bound by the
+intent action of that name), whose Rust form is `src/personal/contract.rs`;
+both interfaces' parcelables are declared once with s4's `parcel!`, held to
+their AIDL in `cargo test` and round-tripped on a JVM
+(`just facility-contract`, s4's `just android-contract`).
 
 The prompts stay in the UI process: each operation is lent an `IVosPrompts`,
 which shows the facility's forms in the client's trusted chrome and runs each
@@ -68,15 +73,21 @@ use of a secret source's key with the prompt that authorizes it
 (BiometricPrompt and the Keystore's HMAC, or a security key's PIN and touch),
 handing `:vos` only the result.
 
-Besides the operations, the interface carries two background passes, each
-its own periodic job in `:vos` with no UI (`src/job.rs`): `sync`, every
-enrollment's tree read from its feed if due, and `syncPersonal`, the personal
-space's pass at its agent. It carries the jobs' runs kept (`runs`), the
-enrollments kept, Tor's bridges and the per-space opt-out, the personal
-space's operations (`src/personal/`), and a byte stream (`openStream`) served
-into one end of a Unix socket pair whose other end the UI holds as a
-`ParcelFileDescriptor` (`src/stream.rs`: to a `.onion` over Tor, else a TCP
-connection to the host the user named).
+`IVosNode` also carries the jobs' runs kept (`runs`), the enrollments kept,
+and a byte stream (`openStream`) served into one end of a Unix socket pair
+whose other end the UI holds as a `ParcelFileDescriptor` (`src/stream.rs`: to
+a `.onion` over Tor, else a TCP connection to the host the user named).
+`IVosPersonal` carries the two background passes, each its own periodic job
+in `:vos` with no UI (`src/job.rs`): `sync`, every enrollment's tree read from
+its feed if due, and `syncPersonal`, the personal space's pass at its agent;
+Tor's bridges and the per-space opt-out; and the personal space's operations
+(`src/personal/`, called as `node.personal()?.claim(..)`). Every native
+method is one entry of `src/android.rs`'s `natives!` table, which
+`cargo test` holds the Java `native` declarations to. A debug build's probe
+runs from a shell through s4's `VosProbe` (`am instrument -w -r -e op sync -e
+count N team.virto.s4/.VosProbe`, or `-e op personal`): the ops it does not
+know it hands to this library's `Probe` (s4's `FacilityProbe` hook, named in
+the AAR's manifest), which runs them over `IVosPersonal`.
 
 The UI binds while the app is started and for a minute after; it hands `:vos`
 a token of its process, which `:vos` watches: when the UI dies or releases
@@ -152,13 +163,17 @@ workspace's nightly, which builds them with `--ignore-rust-version`. From
 the repository's root:
 
 - `just test-facility`: its lints and its suites with the `android`
-  feature, the release artifacts held to this tree's guests among them
-  (part of `just gate`);
+  feature, the release artifacts held to this tree's guests among them,
+  every s4 revision VOS names held to one (`tests/pin.rs`), and the
+  JVM round trip when the SDK and a JDK are here (part of `just gate`);
+- `just pin-s4 <rev>`: s4 pinned at another revision in every manifest
+  and lockfile that names it;
 - `just facility-release`: the release artifacts written anew;
 - `just android-facility [out]`: the Android library (`aar/`,
   `team.virto.vos:facility`) published to the local Maven repository
-  `out` (`target/android/maven`): the `:vos` process (`team.virto.s4.vos`),
-  the personal space's screens (`team.virto.s4.personal`) and
+  `out` (`target/android/maven`): the `:vos` process (`team.virto.s4.vos`,
+  the package of s4's interface it serves), the personal space's screens and
+  their interface (`team.virto.vos.personal`) and
   `libvos_facility.so` for ARM64, compiled against the credential
   contract's UI side of the s4 checkout this crate names. s4's
   `just android-build-vos <out>` then builds the APK with it.
