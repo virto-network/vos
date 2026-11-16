@@ -10,7 +10,7 @@
 //! pages are the interpreter's dirty pages, and a page's base is read from
 //! the parsed program. It keeps no meter: of the budget, it knows only a
 //! step that could never run in a batch of it, and a batch a test marks as
-//! unable to cover a first effect ([`Testkit::uncovered`]); a step ended
+//! unable to cover a first effect ([`Model::uncovered`]); a step ended
 //! at a page the meter cannot pay it does not model.
 
 use std::collections::BTreeMap;
@@ -27,9 +27,9 @@ use vos_wire::records::{Snapshot, Workflow, WorkflowState};
 use vos_wire::result::{Attested, InstanceGas, Outcome, Outgoing, PAGE, Page, Write, digest};
 use vos_wire::{Decode, Encode, defaults};
 
-use crate::invocation::{Call, Ended, Invocation};
-use crate::memory::precompile;
-use crate::{Step, Testkit, split_writes};
+use super::invocation::{Call, Ended, Invocation};
+use super::memory::precompile;
+use super::{Model, Step, split_writes};
 
 type Rows = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
 
@@ -54,7 +54,7 @@ struct Captured {
     snapshot: Snapshot,
 }
 
-impl Testkit {
+impl Model {
     /// A workflow's record, as the agent keeps it.
     pub fn workflow(&self, id: WorkflowId) -> Option<Workflow> {
         let bytes = self.state.get(&keys::workflow(id))?;

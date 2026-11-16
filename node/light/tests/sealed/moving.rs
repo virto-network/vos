@@ -61,7 +61,7 @@ fn prepare(phone: &Phone, to: &Home, keys: Vec<KitKey>) -> Move {
 /// `Homes`' assignment of the agent of `to` to the move's claim, as
 /// `homes`.
 fn assign(to: &mut Home, homes: &SigningKey, held: &Move) {
-    let call = held.call(&space_of(to), to.now + MIN).unwrap();
+    let call = held.call(&space_of(to), to.now() + MIN).unwrap();
     let (device, kit, _) = <(NewDevice, Kit, u32)>::decode_exact(&call.arguments).unwrap();
     to.call(homes, "assign", (device, kit).encode())
         .answer::<Recorded>()
@@ -74,7 +74,7 @@ fn claimed(phone: &mut Phone, to: &Home, held: Move) {
     let entries = to.log(phone.sync_key(), 0).unwrap();
     let group = phone.group.take();
     phone.group = Some(
-        held.claimed(&phone.light, group, PERSONAL, &entries, to.now)
+        held.claimed(&phone.light, group, PERSONAL, &entries, to.now())
             .unwrap(),
     );
 }
@@ -85,10 +85,10 @@ fn claimed(phone: &mut Phone, to: &Home, held: Move) {
 fn pair_again(home: &mut Home, opener: &mut Phone, joiner: &mut Phone, checkpoint: Checkpoint) {
     let group = joiner.group.as_ref().unwrap();
     joiner.keys = moving::naming(&joiner.light, group, joiner.keys.clone()).unwrap();
-    let package = DeviceGroup::key_package(&joiner.store, &joiner.keys, home.now).unwrap();
+    let package = DeviceGroup::key_package(&joiner.store, &joiner.keys, home.now()).unwrap();
     let (prepared, mut pairing) = opener
         .group()
-        .pair(joiner.keys.clone(), package, home.now)
+        .pair(joiner.keys.clone(), package, home.now())
         .unwrap();
     pairing.trust(checkpoint);
     let pairing = Pairing::from_bytes(&pairing.to_bytes()).unwrap();
@@ -418,12 +418,12 @@ fn an_interrupted_move_resumes_where_it_stopped() {
     ));
 
     let held = prepare(&mover, &elsewhere, vec![kit.key()]);
-    let sent = held.call(&space_of(&elsewhere), elsewhere.now).unwrap();
+    let sent = held.call(&space_of(&elsewhere), elsewhere.now()).unwrap();
     restart(&mut mover);
     let held = Move::pending(&mover.store)
         .unwrap()
         .expect("held until assigned");
-    let again = held.call(&space_of(&elsewhere), elsewhere.now).unwrap();
+    let again = held.call(&space_of(&elsewhere), elsewhere.now()).unwrap();
     assert_eq!(again.arguments, sent.arguments, "the same claim");
     assign(&mut elsewhere, &homes, &held);
     claimed(&mut mover, &elsewhere, held);
@@ -469,10 +469,10 @@ fn a_pairing_of_another_personal_space_is_refused() {
     let mut stranger = Phone::new(7);
     stranger.claim(&mut elsewhere, &homes);
     let package =
-        DeviceGroup::key_package(&phones[0].store, &phones[0].keys, elsewhere.now).unwrap();
+        DeviceGroup::key_package(&phones[0].store, &phones[0].keys, elsewhere.now()).unwrap();
     let (_, pairing) = stranger
         .group()
-        .pair(phones[0].keys.clone(), package, elsewhere.now)
+        .pair(phones[0].keys.clone(), package, elsewhere.now())
         .unwrap();
     let group = phones[0].group.take();
     let keys = phones[0].keys.clone();

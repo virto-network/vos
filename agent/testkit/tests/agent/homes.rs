@@ -1,4 +1,4 @@
-//! `Homes`, the home's actor (`agent/homes`, built by `just build-homes`),
+//! `Homes`, the home's actor (`agent/homes`, built by `just build-programs`),
 //! in the default agent beside the credential actor, and its pool's agents,
 //! each `Personal` in an agent of its own, the messages between them
 //! relayed as the nodes deliver them: a pool of 200 stocked and claimed; a
@@ -9,29 +9,25 @@
 //! work, closed or past its cap; and the cap below the keeper's refill
 //! rate, a pool the keeper stops filling ending `PoolEmpty`.
 
-use std::collections::{BTreeMap, VecDeque};
-
-use vos_testkit::programs::{credentials, credentials_elf, homes, homes_elf, method};
-use vos_wire::abi::Failure;
-use vos_wire::abi::cap::Target;
-use vos_wire::batch::{Admin, Body, CredentialedInput, Input, Message, Query, Request, Work};
+use vos_testkit::programs::program_elf;
+use vos_testkit::{World, answer};
+use vos_wire::batch::{Body, Input, Message};
 use vos_wire::credentials::{
     self as tree, CredentialError, Digest, Open, RootEntry, meets, open_work,
 };
 use vos_wire::homes::{AgentsPage, Counts, HomesError, Standing, Terms};
-use vos_wire::ids::{AgentId, InstanceId, Principal, Session};
-use vos_wire::ingress::Grant;
+use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
 use vos_wire::personal::{
     AdminClass, Attestation, Envelope, Kit, KitEntry, KitKind, NewDevice, Overview, PersonalError,
     Policy, RECOVERY, Recorded, kit_index,
 };
-use vos_wire::result::{Outcome, Outgoing, Run, Step};
-use vos_wire::{Decode, Encode, SpaceId, WindowClock};
+use vos_wire::result::{Outcome, Outgoing, Run};
+use vos_wire::{Decode, Encode, SpaceId};
 
-use crate::common::{AGENT, ALICE, BOB, Node};
+use crate::common::ALICE;
 use crate::personal::{
-    self, Home, KIT, KIT_KEY, MINUTE, PERSONAL, admin, device, envelope, kit, kit_key, kit_signing,
-    minutes, new_kit, scope, sync,
+    self, Home, KIT, KIT_KEY, MINUTE, PERSONAL, Raw, admin, device, envelope, kit, kit_key,
+    kit_signing, minutes, new_kit, scope, sync,
 };
 
 /// The home's agent as its pool's agents name it.
@@ -105,33 +101,15 @@ fn work(member: &Digest, open: &Open) -> u64 {
         .unwrap()
 }
 
-/// A step's answer: its reply, or the handler's error.
-fn answer<T: Decode, E: Decode>(outcome: &Outcome) -> Result<T, E> {
-    match outcome {
-        Outcome::Done(bytes) => Ok(T::decode_exact(bytes).expect("the reply decodes")),
-        Outcome::Failed {
-            code: Failure::Handler,
-            detail,
-        } => Err(E::decode_exact(detail).expect("the error decodes")),
-        other => panic!("{other:?}"),
-    }
-}
-
 /// The home's agent, the credential actor and `Homes` installed, `ALICE`
-/// its registrar and operator; and the pool's agents, each a [`Home`]
-/// whose role `homes` the home's agent holds.
+/// its registrar and operator; and the pool's agents, each `Personal` in
+/// an agent of the same world, whose role `homes` the home's agent holds.
 struct Space {
-    node: Node,
-    credentials: Vec<u8>,
-    homes: Vec<u8>,
-    agents: BTreeMap<u32, Home>,
-    /// The next message's number, by sender and receiver.
-    sequences: BTreeMap<(u32, u32), u64>,
+    world: World,
+    /// The pool's agents made.
+    made: u32,
     /// The outcomes of messages to `Homes` that did not run to `Done`.
     unanswered: Vec<Outcome>,
-    now: u64,
-    sessions: u64,
-    nonce: u64,
 }
 
 impl Space {
@@ -145,42 +123,24 @@ impl Space {
 
     /// Founded, `Homes` not configured.
     fn installed() -> Self {
-        let mut node = Node::new();
-        let mut installs = Vec::new();
-        for (instance, elf, role) in [
-            (CREDENTIALS, credentials_elf(), "registrar"),
-            (HOMES, homes_elf(), "operator"),
+        let mut world = World::at(personal::T0 - 3);
+        for (instance, name, role) in [
+            (CREDENTIALS, "vos-credentials", "registrar"),
+            (HOMES, "vos-homes", "operator"),
         ] {
-            let elf = std::fs::read(elf).unwrap();
+            let elf = std::fs::read(program_elf(name)).unwrap();
             let derived = vos_pvm_compiler::derive(&elf).expect("derives");
-            node.add(&derived.actor);
-            installs.push(Input::Admin(Admin::Install {
-                instance,
-                derivation: derived.derivation(),
-                roles: vec![(role.as_bytes().to_vec(), ROLE)],
-                target: Target::Vos,
-                space: SPACE,
-                clock: WindowClock::DEFAULT,
-            }));
+            world
+                .agent(HOME)
+                .install_in(SPACE, instance, &derived, &[(role, ROLE)]);
         }
-        installs.push(Input::Admin(Admin::SetRole(Grant {
-            principal: ALICE,
-            role: Some(ROLE),
-        })));
+        world.agent(HOME).grant(ALICE, ROLE);
+        world.now = personal::T0;
         let mut space = Self {
-            node,
-            credentials: credentials(),
-            homes: homes(),
-            agents: BTreeMap::new(),
-            sequences: BTreeMap::new(),
+            world,
+            made: 0,
             unanswered: Vec::new(),
-            now: personal::T0,
-            sessions: 0,
-            nonce: 0,
         };
-        for step in space.node.batch(personal::T0 - 2, installs).steps {
-            assert!(matches!(ran(&step).outcome, Outcome::Done(_)), "{step:?}");
-        }
         space
             .operate::<(), CredentialError>(CREDENTIALS, "found", HANDLE)
             .unwrap();
@@ -196,55 +156,18 @@ impl Space {
             .unwrap();
     }
 
-    fn program(&self, instance: InstanceId) -> &[u8] {
-        if instance == CREDENTIALS {
-            &self.credentials
-        } else {
-            &self.homes
-        }
+    /// The id of the home's `instance`'s method `name`.
+    fn method(&self, instance: InstanceId, name: &str) -> MethodId {
+        self.world.method(HOME, instance, name)
     }
 
     fn pass(&mut self, ms: u64) {
-        self.now += ms;
+        self.world.pass(ms);
     }
 
-    /// One input alone in a batch at now: its run.
+    /// One input alone in a batch of the home's agent at now: its run.
     fn step(&mut self, input: Input) -> Run {
-        let result = self.node.batch(self.now, vec![input]);
-        self.now += 1;
-        match result.steps.into_iter().next() {
-            Some(Step::Ran(run)) => run,
-            other => panic!("{other:?}"),
-        }
-    }
-
-    /// `caller`'s request of `name` in a session of its own.
-    fn request<A: Encode>(
-        &mut self,
-        caller: Principal,
-        instance: InstanceId,
-        name: &str,
-        arguments: A,
-    ) -> Run {
-        self.sessions += 1;
-        let Principal::Client(key) = caller else {
-            panic!("a client's request")
-        };
-        let mut session = [0u8; 16];
-        session[..8].copy_from_slice(&self.sessions.to_le_bytes());
-        let method = method(self.program(instance), name);
-        self.step(Input::Request(Request {
-            session: Session {
-                key,
-                name: session,
-                t0: self.now,
-            },
-            sequence: 1,
-            caller,
-            instance,
-            method,
-            arguments: arguments.encode(),
-        }))
+        self.world.agent(HOME).step(input)
     }
 
     /// The operator's (and registrar's) call of `name`.
@@ -254,53 +177,32 @@ impl Space {
         name: &str,
         arguments: impl Encode,
     ) -> Result<T, E> {
-        answer(&self.request(ALICE, instance, name, arguments).outcome)
+        answer(
+            &self
+                .world
+                .agent(HOME)
+                .call(ALICE, instance, name, arguments)
+                .outcome,
+        )
     }
 
     /// A query of `name` at now.
     fn query<T: Decode>(&self, instance: InstanceId, name: &str, arguments: impl Encode) -> T {
-        let work = Work::Query(Query {
-            time: self.now,
-            seed: [0; 32],
-            caller: BOB,
-            instance,
-            method: method(self.program(instance), name),
-            arguments: arguments.encode(),
-        });
-        match Outcome::decode(&self.node.refine(&work)).unwrap().0 {
-            Outcome::Done(bytes) => T::decode_exact(&bytes).expect("decodes"),
-            other => panic!("{name}: {other:?}"),
-        }
+        self.world.read(HOME, instance, name, arguments)
     }
 
     /// A proven call of `Homes`' `name` by the member whose nullifier in
     /// the scope "home" is `nullifier`: its run, and every message it set
     /// off relayed.
     fn proven<A: Encode>(&mut self, nullifier: [u8; 32], name: &str, arguments: A) -> Run {
-        self.nonce += 1;
-        let mut binding = [0x3b; 32];
-        binding[..8].copy_from_slice(&self.nonce.to_le_bytes());
-        let root: RootEntry = self.query(CREDENTIALS, "root", ());
-        let scope = tree::scope(&SPACE, AGENT, HOMES, b"home");
-        let claim = tree::AuthClaim {
-            map_root: root.root,
-            scope,
-            nullifier,
-            binding,
-        };
-        let call = CredentialedInput {
-            origin: Principal::Anonymous { scope, nullifier },
-            instance: HOMES,
-            method: method(&self.homes, name),
-            arguments: arguments.encode(),
-            binding,
-            expires_ms: self.now + 60_000,
-            claim: claim.encode(),
-            kernel: method(&self.credentials, "auth"),
-            format: vos_wire::defaults::DEVICE_FORMATS[0].0,
-        };
-        let run = self.step(Input::Credentialed(Box::new(call)));
-        self.relay(run.messages.clone());
+        let run = self.world.agent(HOME).proven(
+            CREDENTIALS,
+            (b"home", nullifier),
+            HOMES,
+            name,
+            arguments,
+        );
+        self.relay(Vec::new());
         run
     }
 
@@ -347,75 +249,71 @@ impl Space {
     /// The keeper's batch: `count` agents with `Personal` installed, the
     /// home's agent granted their role `homes`, stocked: the pooled count.
     fn make(&mut self, count: u32) -> u32 {
-        let first = FIRST + self.agents.len() as u32;
+        let first = FIRST + self.made;
         let ids: Vec<u32> = (first..first + count).collect();
         for id in &ids {
-            let mut home = Home::installed_for(Principal::Agent(HOME));
-            home.now = self.now;
-            self.agents.insert(*id, home);
+            self.add(*id, Principal::Agent(HOME));
         }
         self.operate::<u32, HomesError>(HOMES, "stock", ids)
             .unwrap()
     }
 
-    /// Deliver `messages` from the home's agent, and every message their
-    /// steps send, in order, until none is left.
-    fn relay(&mut self, messages: Vec<Outgoing>) {
-        let mut queue: VecDeque<(u32, Outgoing)> = messages
-            .into_iter()
-            .map(|message| (HOME.0, message))
-            .collect();
-        while let Some((from, Outgoing { to, body })) = queue.pop_front() {
-            let sequence = self.sequences.entry((from, to.0)).or_insert(0);
-            *sequence += 1;
-            let sequence = *sequence;
-            if to == HOME {
-                let run = self.step(Input::Message(Message {
-                    from: AgentId(from),
-                    sequence,
-                    body,
-                }));
-                if !matches!(run.outcome, Outcome::Done(_)) {
-                    self.unanswered.push(run.outcome.clone());
-                }
-                queue.extend(run.messages.into_iter().map(|message| (HOME.0, message)));
-            } else {
-                let now = self.now;
-                let home = self.agents.get_mut(&to.0).expect("a pool agent");
-                home.now = home.now.max(now);
-                home.deliver(HOME, sequence, body);
-                let sent: Vec<Outgoing> = home.outbox.drain(..).collect();
-                queue.extend(sent.into_iter().map(|message| (to.0, message)));
-            }
-        }
+    /// Agent `id` with `Personal` installed, its role `homes` granted to
+    /// `homes`: one of the pool's, not yet stocked.
+    fn add(&mut self, id: u32, homes: Principal) {
+        personal::install(&mut self.world, AgentId(id), homes);
+        self.made += 1;
     }
 
-    /// Pool agent `agent`, its batch time now.
-    fn agent(&mut self, agent: u32) -> &mut Home {
-        let now = self.now;
-        let home = self.agents.get_mut(&agent).expect("a pool agent");
-        home.now = home.now.max(now);
-        home
+    /// Deliver `messages` as the home's agent's, with those it sent, and
+    /// every message their steps send, in order, until none is left.
+    fn relay(&mut self, messages: Vec<Outgoing>) {
+        for message in messages {
+            self.world.send(HOME, message);
+        }
+        self.delivered(HOME);
+    }
+
+    /// Deliver what `from` sent and all it sets off; an answer to the
+    /// home's agent that did not run to `Done` is kept.
+    fn delivered(&mut self, from: AgentId) -> Vec<(AgentId, Run)> {
+        let delivered = self.world.deliver_from(from);
+        self.unanswered.extend(
+            delivered
+                .iter()
+                .filter(|(to, run)| *to == HOME && !matches!(run.outcome, Outcome::Done(_)))
+                .map(|(_, run)| run.outcome.clone()),
+        );
+        delivered
+    }
+
+    /// Pool agent `agent`.
+    fn agent(&mut self, agent: u32) -> Home<&mut World> {
+        Home::on(&mut self.world, AgentId(agent))
     }
 
     /// Relay what agent `agent`'s calls sent.
     fn flush(&mut self, agent: u32) {
-        let sent: Vec<Outgoing> = self.agent(agent).outbox.drain(..).collect();
-        let mut queue = Vec::new();
-        for Outgoing { to, body } in sent {
-            assert_eq!(to, HOME, "a pool agent sends only to its home");
-            let sequence = self.sequences.entry((agent, HOME.0)).or_insert(0);
-            *sequence += 1;
-            let sequence = *sequence;
-            let run = self.step(Input::Message(Message {
-                from: AgentId(agent),
-                sequence,
-                body,
-            }));
-            assert!(matches!(run.outcome, Outcome::Done(_)), "{:?}", run.outcome);
-            queue.extend(run.messages);
-        }
-        self.relay(queue);
+        let sent = self
+            .world
+            .sent()
+            .filter(|(from, _)| *from == AgentId(agent))
+            .count();
+        assert!(
+            self.world
+                .sent()
+                .all(|(from, message)| *from != AgentId(agent) || message.to == HOME),
+            "a pool agent sends only to its home"
+        );
+        let before = self.unanswered.len();
+        let delivered = self.delivered(AgentId(agent));
+        assert!(delivered.len() >= sent);
+        assert_eq!(
+            self.unanswered.len(),
+            before,
+            "{:?}",
+            self.unanswered.last()
+        );
     }
 
     fn opening(&self) -> Open {
@@ -438,10 +336,6 @@ impl Space {
     fn kit_finds(&self, signing: &[u8; 32]) -> Option<u32> {
         self.query(HOMES, "find", kit_index(signing))
     }
-}
-
-fn ran(step: &Step) -> &Run {
-    crate::common::ran(step)
 }
 
 /// A pool of 200 made by the keeper in one batch and claimed, each claim
@@ -553,7 +447,7 @@ fn a_double_claim_is_refused() {
         sequence: 1,
         body: Body::Call {
             instance: HOMES,
-            method: method(&space.homes, "assigned"),
+            method: space.method(HOMES, "assigned"),
             arguments: Vec::new(),
             awaiting: None,
         },
@@ -582,13 +476,12 @@ fn a_refused_or_unanswered_claim_is_released() {
     let mut space = Space::new(minutes());
     space.make(2);
     // Agent `FIRST` was assigned behind `Homes`' back.
-    let personal = vos_testkit::programs::personal();
     let claim = ((claimant(90), kit_of(90)), (minutes(), HOMES.0));
     space.relay(vec![Outgoing {
         to: AgentId(FIRST),
         body: Body::Call {
             instance: PERSONAL,
-            method: method(&personal, "claim"),
+            method: space.world.method(AgentId(FIRST), PERSONAL, "claim"),
             arguments: claim.encode(),
             awaiting: None,
         },
@@ -603,9 +496,7 @@ fn a_refused_or_unanswered_claim_is_released() {
 
     // An agent whose role `homes` was never granted answers nothing.
     let stray = FIRST + 2;
-    let mut home = Home::installed_for(Principal::Client([0x99; 32]));
-    home.now = space.now;
-    space.agents.insert(stray, home);
+    space.add(stray, Principal::Client([0x99; 32]));
     space
         .operate::<u32, HomesError>(HOMES, "stock", vec![stray])
         .unwrap();
@@ -649,7 +540,7 @@ fn a_refused_or_unanswered_claim_is_released() {
             sequence,
             body: Body::Call {
                 instance: HOMES,
-                method: method(&space.homes, name),
+                method: space.method(HOMES, name),
                 arguments,
                 awaiting: None,
             },
@@ -712,8 +603,8 @@ fn a_lapsed_agent_serves_reads_a_restore_and_a_removal_and_refuses_pushes() {
         .push(0, envelope(scope(1), 1, 1, 100))
         .unwrap();
     space.pass(30 * MINUTE);
-    let home = space.agent(agent);
-    home.now += 1;
+    let mut home = space.agent(agent);
+    home.pass(1);
     assert!(home.overview().lapsed);
     assert_eq!(
         home.push(0, envelope(scope(1), 1, 2, 100)),
@@ -732,7 +623,7 @@ fn a_lapsed_agent_serves_reads_a_restore_and_a_removal_and_refuses_pushes() {
         None,
         "a removed device re-proves no more"
     );
-    let home = space.agent(agent);
+    let mut home = space.agent(agent);
     home.push(0, envelope(RECOVERY, 2, 3, 100)).unwrap();
     // Every device is lost: the kit restores onto a new one.
     let (next, r2) = new_kit(1);
@@ -763,7 +654,7 @@ fn a_lapsed_agent_serves_reads_a_restore_and_a_removal_and_refuses_pushes() {
     );
     // The restored device re-proves: the grace ends.
     space.renew(device(5).nullifier, agent).unwrap();
-    let home = space.agent(agent);
+    let mut home = space.agent(agent);
     let overview: Overview = home.query(sync(5), "overview", ()).unwrap();
     assert!(!overview.lapsed);
     home.push(5, envelope(scope(2), overview.confirmed, 4, 100))
@@ -929,7 +820,7 @@ fn the_quota_ramps_at_the_first_yearly_re_proof() {
     let agent = space
         .claim_with(device(0).nullifier, device(0), kit())
         .unwrap();
-    let home = space.agent(agent);
+    let mut home = space.agent(agent);
     home.push(0, envelope(scope(1), 0, 1, 900)).unwrap();
     assert_eq!(
         home.push(0, envelope(scope(1), 0, 2, 900)),
@@ -943,7 +834,7 @@ fn the_quota_ramps_at_the_first_yearly_re_proof() {
     );
     space.pass(50 * MINUTE);
     space.renew(device(0).nullifier, agent).unwrap();
-    let home = space.agent(agent);
+    let mut home = space.agent(agent);
     home.push(0, envelope(scope(1), 0, 2, 900)).unwrap();
     home.push(0, envelope(scope(1), 0, 3, 900)).unwrap();
 }
@@ -967,24 +858,13 @@ fn device_churn_takes_no_more_agents_than_the_persons_enrollments() {
     let mut space = Space::new(minutes());
     space.make(20);
     let owned = |space: &mut Space, name: &str, arguments: Vec<u8>| -> Run {
-        space.nonce += 1;
-        let mut binding = [0x3c; 32];
-        binding[..8].copy_from_slice(&space.nonce.to_le_bytes());
-        let call = CredentialedInput {
-            origin: Principal::Owner(owner(1)),
-            instance: CREDENTIALS,
-            method: method(&space.credentials, name),
-            arguments,
-            binding,
-            expires_ms: space.now + 60_000,
-            claim: tree::OwnerClaim {
-                owner: owner(1),
-                binding,
-            }
-            .encode(),
-            kernel: method(&space.credentials, "owner"),
-            format: vos_wire::defaults::DEVICE_FORMATS[0].0,
-        };
+        let call = space.world.agent(HOME).owned(
+            CREDENTIALS,
+            owner(1),
+            CREDENTIALS,
+            name,
+            Raw(&arguments),
+        );
         space.step(Input::Credentialed(Box::new(call)))
     };
     space

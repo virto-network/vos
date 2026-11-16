@@ -21,7 +21,7 @@ fn put(to: Recipient, id: u8, expires: u64, bytes: Vec<u8>) -> impl Encode {
 fn the_inbox_takes_the_devices_items_and_expires_them_lazily() {
     let mut home = Home::new();
     home.pair(0, 1);
-    let soon = home.now + HOUR_MS;
+    let soon = home.now() + HOUR_MS;
     for caller in [STRANGER, KIT, admin(0)] {
         assert_eq!(
             home.call::<u64>(caller, "put", put(Recipient::Devices, 1, soon, vec![1; 10])),
@@ -33,7 +33,7 @@ fn the_inbox_takes_the_devices_items_and_expires_them_lazily() {
         home.call::<u64>(
             sync(0),
             "put",
-            put(Recipient::Devices, 1, home.now + 7 * DAY + 10, vec![1])
+            put(Recipient::Devices, 1, home.now() + 7 * DAY + 10, vec![1])
         ),
         Err(PersonalError::Expiry)
     );
@@ -41,7 +41,7 @@ fn the_inbox_takes_the_devices_items_and_expires_them_lazily() {
         home.call::<u64>(
             sync(0),
             "put",
-            put(Recipient::Devices, 1, home.now, vec![1])
+            put(Recipient::Devices, 1, home.now(), vec![1])
         ),
         Err(PersonalError::Expiry)
     );
@@ -65,7 +65,7 @@ fn the_inbox_takes_the_devices_items_and_expires_them_lazily() {
         put(Recipient::Devices, 1, soon, vec![1; 10]),
     )
     .unwrap();
-    let later = home.now + 2 * HOUR_MS;
+    let later = home.now() + 2 * HOUR_MS;
     home.call::<u64>(
         sync(1),
         "put",
@@ -116,7 +116,7 @@ fn the_inbox_takes_the_devices_items_and_expires_them_lazily() {
         .unwrap();
     assert_eq!(items.len(), 1);
     // Full at 64: an expiry frees it, the next write deleting the expired.
-    let expires = home.now + 3 * HOUR_MS;
+    let expires = home.now() + 3 * HOUR_MS;
     for id in 10..73 {
         home.call::<u64>(
             sync(0),
@@ -164,7 +164,7 @@ fn a_pairing_slot_admits_its_key_for_its_slot_alone() {
         home.call::<u64>(sync(0), "open_slot", (slot, [0x53u8; 32])),
         Err(PersonalError::SlotTaken)
     );
-    let ten = home.now + 10 * 60 * 1000 - 5;
+    let ten = home.now() + 10 * 60 * 1000 - 5;
     assert_eq!(
         home.call::<u64>(holder, "put", put(Recipient::Devices, 1, ten, vec![1])),
         Err(PersonalError::NotAdmitted)
@@ -218,7 +218,7 @@ fn a_pairing_slot_admits_its_key_for_its_slot_alone() {
         Err(PersonalError::NotAdmitted)
     );
     assert!(
-        home.node
+        home.node()
             .get(&vos_wire::keys::admitted(PERSONAL, &[0x52; 32]))
             .is_none()
     );
@@ -236,7 +236,7 @@ fn a_pairing_slot_admits_its_key_for_its_slot_alone() {
     );
     home.call::<Recorded>(sync(0), "alive", ()).unwrap();
     assert!(
-        home.node
+        home.node()
             .get(&vos_wire::keys::admitted(PERSONAL, &[0x62; 32]))
             .is_none(),
         "its key admitted no more once a call settled it"
@@ -254,7 +254,7 @@ fn a_pairing_slot_admits_its_key_for_its_slot_alone() {
 fn slots_and_their_items_are_bounded() {
     let mut home = Home::new();
     home.pair(0, 1);
-    let soon = home.now + 5 * 60 * 1000;
+    let soon = home.now() + 5 * 60 * 1000;
     let slot: Scope = [0x71; 16];
     home.call::<u64>(sync(0), "open_slot", (slot, [0x72u8; 32]))
         .unwrap();

@@ -15,8 +15,8 @@ use vos_wire::records::WorkflowState;
 use vos_wire::result::{Attest, InstanceGas, KernelReturn, Outcome, Outgoing};
 use vos_wire::{Encode, keys};
 
-use crate::Testkit;
-use crate::memory::{
+use super::Model;
+use super::memory::{
     copy_out, held, kernel, parts, precompile, random, read, read_key, row, write,
 };
 
@@ -60,7 +60,7 @@ pub(crate) enum Ended {
 /// within the limits of its agent's target, which its entry instance's
 /// install names.
 pub(crate) struct Invocation<'a> {
-    pub(crate) kit: &'a Testkit,
+    pub(crate) kit: &'a Model,
     step: u32,
     /// The entry's kind: queries never write.
     entry: Kind,
@@ -88,7 +88,7 @@ pub(crate) struct Invocation<'a> {
 }
 
 impl<'a> Invocation<'a> {
-    pub(crate) fn new(kit: &'a Testkit, step: u32, entry: Kind) -> Self {
+    pub(crate) fn new(kit: &'a Model, step: u32, entry: Kind) -> Self {
         Self {
             kit,
             step,

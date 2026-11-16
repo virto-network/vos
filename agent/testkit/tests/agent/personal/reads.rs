@@ -26,14 +26,14 @@ fn reads() -> Vec<(&'static str, Vec<u8>)> {
 /// What `caller`'s read `name` answers: `Ok` or the refusal.
 fn read(home: &Home, caller: Principal, name: &str, arguments: &[u8]) -> Result<(), PersonalError> {
     let work = Work::Query(Query {
-        time: home.now,
+        time: home.now(),
         seed: [0; 32],
         caller,
         instance: PERSONAL,
         method: home.method(name),
         arguments: arguments.to_vec(),
     });
-    match Outcome::decode(&home.node.refine(&work)).unwrap().0 {
+    match Outcome::decode(&home.node().refine(&work)).unwrap().0 {
         Outcome::Done(_) => Ok(()),
         Outcome::Failed {
             code: Failure::Handler,

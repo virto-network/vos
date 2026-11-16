@@ -3,8 +3,8 @@
 //! statics pass them, or which names another target than its agent's, is
 //! refused.
 
+use vos_testkit::model::{InstallError, Model};
 use vos_testkit::programs::{actor, derived, method, package};
-use vos_testkit::{InstallError, Testkit};
 use vos_wire::abi::cap::{JAM, Refused, Target, VOS};
 use vos_wire::abi::{Failure, INVOCATION_HEAP};
 use vos_wire::batch::{Admin, Input};
@@ -42,7 +42,7 @@ fn bare(instance: InstanceId, program: ProgramHash, target: Target) -> Input {
 /// `instance` for `target`: the install, and the model's.
 fn derived_install(
     node: &mut Node,
-    kit: &mut Testkit,
+    kit: &mut Model,
     name: &str,
     instance: InstanceId,
     target: Target,
@@ -103,7 +103,7 @@ fn an_agent_on_jam_runs_within_its_limits() {
     ];
     for target in [Target::Vos, Target::Jam] {
         for mut node in hosts() {
-            let mut kit = Testkit::new(AGENT);
+            let mut kit = Model::new(AGENT);
             let program = node.add(&counter);
             let (bounds, model) = derived_install(&mut node, &mut kit, "bounds", BOUNDS, target);
             model.unwrap();
@@ -157,7 +157,7 @@ fn a_kernel_runs_within_its_declared_gas_on_jam() {
     let rounds = [100u32, 20_000];
     for target in [Target::Vos, Target::Jam] {
         for mut node in hosts() {
-            let mut kit = Testkit::new(AGENT);
+            let mut kit = Model::new(AGENT);
             let (bounds, model) = derived_install(&mut node, &mut kit, "bounds", BOUNDS, target);
             model.unwrap();
             ran(&node.batch(0, vec![bounds]).steps[0]);
@@ -198,7 +198,7 @@ fn a_kernel_runs_within_its_declared_gas_on_jam() {
 fn an_install_past_the_jam_limits_is_refused() {
     let shop = actor("shop");
     // The pages the shop's program may write, as the model counts them.
-    let pages = match Testkit::new(AGENT).install_for(Target::Jam, InstanceId(1), &shop, &[], &[]) {
+    let pages = match Model::new(AGENT).install_for(Target::Jam, InstanceId(1), &shop, &[], &[]) {
         Err(InstallError::Refused(Refused::Pages { pages, .. })) => pages,
         other => panic!("{other:?}"),
     };
@@ -236,7 +236,7 @@ fn an_install_past_the_jam_limits_is_refused() {
     assert!(why.contains("`hash`") && why.contains("3000000"), "{why}");
     for target in [Target::Vos, Target::Jam] {
         for mut node in hosts() {
-            let mut kit = Testkit::new(AGENT);
+            let mut kit = Model::new(AGENT);
             let shop_hash = node.add(&shop);
             let lean_hash = node.add(&actor("lean"));
             let mut inputs = vec![bare(InstanceId(1), shop_hash, target)];
@@ -288,11 +288,11 @@ fn a_device_kernels_gas_is_not_held_to_jams_kernel_cap() {
     let declared = schema.method(auth).and_then(|method| method.gas);
     assert!(declared > JAM.kernel_gas(), "{declared:?}");
     vos_jam::programs::derive(&package("device")).expect("a JAM builder derives it");
-    let elf = std::fs::read(vos_testkit::programs::credentials_elf()).unwrap();
+    let elf = std::fs::read(vos_testkit::programs::program_elf("vos-credentials")).unwrap();
     let credentials = vos_pvm_compiler::derive(&elf).expect("derives");
     for mut node in hosts() {
         node.add(&credentials.actor);
-        let mut kit = Testkit::new(AGENT);
+        let mut kit = Model::new(AGENT);
         let (input, model) =
             derived_install(&mut node, &mut kit, "device", InstanceId(2), Target::Jam);
         assert_eq!(model, Ok(()));
@@ -321,7 +321,7 @@ fn an_install_for_another_target_than_its_agents_is_refused() {
     let (counter, shop) = (actor("counter"), actor("shop"));
     for (first, other) in [(Target::Vos, Target::Jam), (Target::Jam, Target::Vos)] {
         for mut node in hosts() {
-            let mut kit = Testkit::new(AGENT);
+            let mut kit = Model::new(AGENT);
             let (counter_hash, shop_hash) = (node.add(&counter), node.add(&shop));
             // The shop's heap is past JAM's pages: refused there, it names
             // no target.
@@ -380,7 +380,7 @@ fn an_install_into_another_space_than_its_agents_is_refused() {
         ..clock
     };
     for (mut node, target) in [(Node::new(), Target::Vos), (Node::jam(true), Target::Jam)] {
-        let mut kit = Testkit::new(AGENT);
+        let mut kit = Model::new(AGENT);
         let (counter_hash, shop_hash) = (node.add(&counter), node.add(&shop));
         let in_space = |instance, program, target, space, clock| {
             Input::Admin(Admin::Install {
@@ -468,7 +468,7 @@ fn a_handler_allocates_within_the_invocation_heap() {
     let within = (INVOCATION_HEAP / 2) as u32;
     let past = INVOCATION_HEAP as u32 * 2;
     for mut node in hosts() {
-        let mut kit = Testkit::new(AGENT);
+        let mut kit = Model::new(AGENT);
         let (install, model) = derived_install(&mut node, &mut kit, "ample", BOUNDS, Target::Vos);
         model.unwrap();
         ran(&node.batch(0, vec![install]).steps[0]);

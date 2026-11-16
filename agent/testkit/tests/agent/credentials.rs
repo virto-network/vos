@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use vos_pvm_poseidon2::{M31, P};
-use vos_testkit::programs::{credentials, credentials_elf, method};
+use vos_testkit::programs::{method, program, program_elf};
 use vos_wire::abi::Failure;
 use vos_wire::abi::cap::Target;
 use vos_wire::batch::{Admin, Input};
@@ -19,7 +19,7 @@ use vos_wire::ingress::Grant;
 use vos_wire::result::{Outcome, Step, WorkResult};
 use vos_wire::{Decode, Encode};
 
-use crate::common::{ALICE, BOB, COUNTER, Node, OUTER_GAS, Sessions, counter_only, ran};
+use crate::common::{ALICE, BOB, COUNTER, GAS, Node, Sessions, counter_only, ran};
 
 const CREDENTIALS: InstanceId = InstanceId(9);
 const REGISTRAR: u8 = 1;
@@ -186,12 +186,12 @@ struct Actor {
 
 impl Actor {
     fn on(mut node: Node, target: Target) -> Self {
-        let elf = std::fs::read(credentials_elf()).unwrap();
+        let elf = std::fs::read(program_elf("vos-credentials")).unwrap();
         let derived = vos_pvm_compiler::derive(&elf).expect("derives");
         node.add(&derived.actor);
         let mut actor = Self {
             node,
-            program: credentials(),
+            program: program("vos-credentials"),
             sessions: Sessions::new(),
         };
         let install = Input::Admin(Admin::Install {
@@ -776,6 +776,18 @@ fn the_ring_keeps_a_root_a_batch_from_its_time() {
     };
     let key = vos_wire::keys::row(CREDENTIALS, rows, &[tables::RING_KEY]).unwrap();
     let ring: Ring = actor.node.value(&key).expect("the ring's row");
+    // A cell's row is its table's row under the one-byte key 0.
+    let cell = |name: &str| -> u64 {
+        let rows = vos_wire::abi::Rows::Table {
+            tag: vos_testkit::programs::table_tag(name),
+            transform: vos_wire::keys::Transform::Hashed,
+        };
+        let key = vos_wire::keys::row(CREDENTIALS, rows, &[0]).unwrap();
+        actor.node.value(&key).expect("the cell's row")
+    };
+    assert_eq!(cell(tables::COUNT), actor.query::<(), u64>("count", ()));
+    assert_eq!(cell(tables::NEXT), cell(tables::COUNT), "no slot freed");
+    assert_eq!(cell(tables::CHANGED), actor.feed_from(0).1);
     assert_eq!(ring.0.len(), RING);
     assert_eq!(
         ring.0.iter().map(|entry| entry.root).collect::<Vec<_>>(),
@@ -846,9 +858,7 @@ fn an_actors_poseidon2_call_is_served_and_a_word_at_or_above_p_traps() {
             inputs.push(sessions.request(ALICE, COUNTER, compress, refused));
         }
         let work = node.work(1, inputs);
-        let result = WorkResult::decode(&node.refine_with(&work, OUTER_GAS))
-            .unwrap()
-            .0;
+        let result = WorkResult::decode(&node.refine_with(&work, GAS)).unwrap().0;
         let served = ran(&result.steps[0]);
         assert_eq!(served.outcome, Outcome::Done(expected.encode()));
         gas.push(served.gas_used);

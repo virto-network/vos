@@ -3,11 +3,16 @@
 //! installed over a populated agent, reads every envelope and operation
 //! back and goes on.
 
+use vos_testkit::node::ran;
 use vos_testkit::programs::derived;
+use vos_wire::abi::cap::Target;
+use vos_wire::batch::{Admin, Input};
 use vos_wire::personal::{
     Acknowledged, Candidacy, DeviceView, Entry, Envelope, InboxItem, Operation, Overview,
     Recipient, Recorded, RecoveryView, Verdict, Voted,
 };
+
+use vos_wire::{SpaceId, WindowClock};
 
 use super::*;
 
@@ -101,7 +106,7 @@ fn the_next_version_installed_over_a_populated_agent_reads_everything_back() {
         home.call::<u64>(sync(1), "acknowledge", (scope(n), 5u64, [n; 32]))
             .unwrap();
     }
-    let expires = home.now + DAY;
+    let expires = home.now() + DAY;
     home.call::<u64>(
         sync(1),
         "put",
@@ -124,7 +129,10 @@ fn the_next_version_installed_over_a_populated_agent_reads_everything_back() {
 
     // The next version, installed over the same instance.
     let next = derived("personal-next");
-    home.node.add(&next.actor);
+    // On the node itself, at the batch time the reads above were made at.
+    let now = home.now();
+    let node = home.world().node_mut(crate::common::AGENT);
+    node.add(&next.actor);
     let install = Input::Admin(Admin::Install {
         instance: PERSONAL,
         derivation: next.derivation(),
@@ -133,7 +141,7 @@ fn the_next_version_installed_over_a_populated_agent_reads_everything_back() {
         space: SpaceId::NONE,
         clock: WindowClock::DEFAULT,
     });
-    let installed = home.node.batch(home.now, vec![install]);
+    let installed = node.batch(now, vec![install]);
     assert!(matches!(ran(&installed.steps[0]).outcome, Outcome::Done(_)));
     let version: u32 = home.query(STRANGER, "version", ()).unwrap();
     assert_eq!(version, 2);

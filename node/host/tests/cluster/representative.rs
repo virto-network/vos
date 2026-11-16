@@ -253,7 +253,7 @@ fn an_agent_that_misses_the_close_ends_not_closed() {
         .unwrap();
     let input = [keys.encode(), witness.encode()].concat();
     assert_eq!(
-        vos_testkit::run_kernel(&kernel, &input, 1 << 32).err(),
+        vos_testkit::model::run_kernel(&kernel, &input, 1 << 32).err(),
         Some(vos_wire::abi::Failure::Trapped),
         "the prologue refuses it at window 0"
     );

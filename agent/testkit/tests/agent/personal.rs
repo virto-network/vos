@@ -1,5 +1,5 @@
 //! `Personal`, the personal agent's actor (`agent/personal`, built by `just
-//! build-personal`), in the default agent on a VOS host, call by call at
+//! build-programs`), in the default agent on a VOS host, call by call at
 //! batch times a test sets: the commit log, the device set's origins, the
 //! votes and verdicts, evidence, sealed scopes, quotas, the inbox, the
 //! lapsed agent's grace, the reads only admitted keys get, the layout read
@@ -18,24 +18,24 @@ mod reads;
 mod scopes;
 mod upgrade;
 
+use std::borrow::{Borrow, BorrowMut};
 use std::collections::BTreeMap;
-use vos_testkit::programs::{method, personal, personal_elf};
-use vos_wire::abi::Failure;
-use vos_wire::abi::cap::Target;
 
-use vos_wire::batch::{Admin, Body, Input, Message, Query, Request, Work};
-use vos_wire::defaults::SESSION_EXPIRY_MS;
+use vos_testkit::World;
+use vos_testkit::programs::program_elf;
+use vos_wire::abi::Failure;
+use vos_wire::batch::{Query, Work};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
-use vos_wire::ingress::{Grant, call_message};
+use vos_wire::ingress::call_message;
 use vos_wire::personal::{
     AdminClass, Attached, Attestation, Candidacy, DeviceId, Effect, HOUR_MS, Header, Kit, KitEntry,
     KitKind, NewDevice, NewKit, Operation, Overview, PersonalError, Policy, Pushed, Recorded,
     RecoveryView, Scope, Voted, Woken, r_hash, r2_hash,
 };
-use vos_wire::result::{Outcome, Outgoing, Run, Step};
-use vos_wire::{Decode, Encode, SpaceId, WindowClock};
+use vos_wire::result::{Outcome, Run};
+use vos_wire::{Decode, Encode};
 
-use crate::common::{Node, ran};
+use crate::common::{AGENT, Node};
 
 pub const PERSONAL: InstanceId = InstanceId(5);
 /// The principal holding the role `homes`, as the home's `Homes` does.
@@ -211,7 +211,7 @@ pub fn update(epoch: u64, n: u8) -> Commit {
 }
 
 /// Arguments already encoded.
-struct Raw<'a>(&'a [u8]);
+pub struct Raw<'a>(pub &'a [u8]);
 
 impl Encode for Raw<'_> {
     fn encode_to(&self, buf: &mut Vec<u8>) {
@@ -231,20 +231,24 @@ pub fn answer<T: Decode>(name: &str, outcome: &Outcome) -> Result<T, PersonalErr
     }
 }
 
-/// A personal agent in the default agent: `Personal` installed, the role
-/// `homes` granted to [`HOMES`], calls in one session per caller, each a
-/// batch at the test's batch time.
-pub struct Home {
-    pub node: Node,
-    program: Vec<u8>,
-    /// Each caller's session, its last sequence and its last call's time.
-    sessions: BTreeMap<Principal, (Session, u64, u64)>,
-    /// The next batch's time; each batch moves it a millisecond on.
-    pub now: u64,
+/// A personal agent in a [`World`]: `Personal` installed in its agent, the
+/// role `homes` granted, calls in one session per caller, each a batch at
+/// the world's clock. Over a world of its own, or a view of an agent of a
+/// world several share.
+pub struct Home<W: Borrow<World> = World> {
+    world: W,
+    agent: AgentId,
     /// The most gas each method's call used.
     pub gas: BTreeMap<String, u64>,
-    /// The messages its steps sent, for a test that relays them.
-    pub outbox: Vec<Outgoing>,
+}
+
+/// `Personal`, derived once a run: a pool's agents each install it.
+fn personal_derived() -> &'static vos_pvm_compiler::Derived {
+    static DERIVED: std::sync::OnceLock<vos_pvm_compiler::Derived> = std::sync::OnceLock::new();
+    DERIVED.get_or_init(|| {
+        vos_pvm_compiler::derive(&std::fs::read(program_elf("vos-personal")).unwrap())
+            .expect("derives")
+    })
 }
 
 impl Home {
@@ -255,37 +259,10 @@ impl Home {
 
     /// Installed, the role `homes` granted to `homes`.
     pub fn installed_for(homes: Principal) -> Self {
-        // Derived once a run: a pool's agents each install it.
-        static DERIVED: std::sync::OnceLock<vos_pvm_compiler::Derived> = std::sync::OnceLock::new();
-        let derived = DERIVED.get_or_init(|| {
-            vos_pvm_compiler::derive(&std::fs::read(personal_elf()).unwrap()).expect("derives")
-        });
-        let mut node = Node::new();
-        node.add(&derived.actor);
-        let install = Input::Admin(Admin::Install {
-            instance: PERSONAL,
-            derivation: derived.derivation(),
-            roles: vec![(b"homes".to_vec(), HOMES_ROLE)],
-            target: Target::Vos,
-            space: SpaceId::NONE,
-            clock: WindowClock::DEFAULT,
-        });
-        let grant = Input::Admin(Admin::SetRole(Grant {
-            principal: homes,
-            role: Some(HOMES_ROLE),
-        }));
-        let result = node.batch(T0 - 1, vec![install, grant]);
-        for step in &result.steps {
-            assert!(matches!(ran(step).outcome, Outcome::Done(_)), "{step:?}");
-        }
-        Self {
-            node,
-            program: personal(),
-            sessions: BTreeMap::new(),
-            now: T0,
-            gas: BTreeMap::new(),
-            outbox: Vec::new(),
-        }
+        let mut world = World::at(T0 - 2);
+        install(&mut world, AGENT, homes);
+        world.now = T0;
+        Home::on(world, AGENT)
     }
 
     /// Assigned to device 0 with [`kit`], under `policy`.
@@ -301,78 +278,73 @@ impl Home {
     pub fn new() -> Self {
         Self::with(Policy::DEFAULT)
     }
+}
+
+/// `Personal` installed in `world`'s agent `agent`, the role `homes`
+/// granted to `homes`.
+pub fn install(world: &mut World, agent: AgentId, homes: Principal) {
+    world
+        .agent(agent)
+        .install(PERSONAL, personal_derived(), &[("homes", HOMES_ROLE)])
+        .grant(homes, HOMES_ROLE);
+}
+
+impl<W: Borrow<World>> Home<W> {
+    /// `world`'s agent `agent`, where [`install`] installed `Personal`.
+    pub fn on(world: W, agent: AgentId) -> Self {
+        Self {
+            world,
+            agent,
+            gas: BTreeMap::new(),
+        }
+    }
+
+    /// The next batch's time.
+    pub fn now(&self) -> u64 {
+        self.world.borrow().now
+    }
+
+    /// The agent's node.
+    pub fn node(&self) -> &Node {
+        self.world.borrow().node(self.agent)
+    }
 
     pub fn method(&self, name: &str) -> MethodId {
-        method(&self.program, name)
+        self.world.borrow().method(self.agent, PERSONAL, name)
+    }
+
+    /// `caller`'s query of `name` at the current batch time.
+    pub fn query<T: Decode>(
+        &self,
+        caller: Principal,
+        name: &str,
+        arguments: impl Encode,
+    ) -> Result<T, PersonalError> {
+        let outcome = self
+            .world
+            .borrow()
+            .query(self.agent, caller, PERSONAL, name, arguments);
+        answer(name, &outcome)
+    }
+}
+
+impl<W: BorrowMut<World>> Home<W> {
+    /// The world the agent is in.
+    pub fn world(&mut self) -> &mut World {
+        self.world.borrow_mut()
     }
 
     /// Move the batch time on by `ms`.
     pub fn pass(&mut self, ms: u64) {
-        self.now += ms;
+        self.world().pass(ms);
     }
 
     /// `caller`'s call of `name`, alone in a batch: its run.
     pub fn run(&mut self, caller: Principal, name: &str, arguments: impl Encode) -> Run {
-        let method = self.method(name);
-        let session = self.session(caller);
-        let input = Input::Request(Request {
-            session,
-            sequence: self.sessions[&caller].1,
-            caller,
-            instance: PERSONAL,
-            method,
-            arguments: arguments.encode(),
-        });
-        let result = self.node.batch(self.now, vec![input]);
-        self.now += 1;
-        match result.steps.into_iter().next() {
-            Some(Step::Ran(run)) => {
-                self.outbox.extend(run.messages.iter().cloned());
-                run
-            }
-            other => panic!("{name}: {other:?}"),
-        }
-    }
-
-    /// A message from agent `from`, its `sequence`-th to this one, alone in
-    /// a batch: its run.
-    pub fn deliver(&mut self, from: AgentId, sequence: u64, body: Body) -> Run {
-        let input = Input::Message(Message {
-            from,
-            sequence,
-            body,
-        });
-        let result = self.node.batch(self.now, vec![input]);
-        self.now += 1;
-        match result.steps.into_iter().next() {
-            Some(Step::Ran(run)) => {
-                self.outbox.extend(run.messages.iter().cloned());
-                run
-            }
-            other => panic!("a message: {other:?}"),
-        }
-    }
-
-    /// `caller`'s session for a call now, its sequence moved on: a new one
-    /// when its last call is older than the session's expiry allows.
-    fn session(&mut self, caller: Principal) -> Session {
-        let now = self.now;
-        let fresh = || {
-            let key = match caller {
-                Principal::Client(key) => key,
-                _ => [0; 32],
-            };
-            let mut name = [0; 16];
-            name[..8].copy_from_slice(&now.to_le_bytes());
-            (Session { key, name, t0: now }, 0, now)
-        };
-        let entry = self.sessions.entry(caller).or_insert_with(fresh);
-        if entry.2 + SESSION_EXPIRY_MS / 2 < now {
-            *entry = fresh();
-        }
-        entry.1 += 1;
-        entry.2 = now;
-        entry.0
+        let agent = self.agent;
+        self.world()
+            .agent(agent)
+            .call(caller, PERSONAL, name, arguments)
     }
 
     /// `caller`'s call of `name`: its reply, or the actor's error. Refused
@@ -423,25 +395,9 @@ impl Home {
             other => panic!("ran: {other:?}"),
         }
     }
+}
 
-    /// `caller`'s query of `name` at the current batch time.
-    pub fn query<T: Decode>(
-        &self,
-        caller: Principal,
-        name: &str,
-        arguments: impl Encode,
-    ) -> Result<T, PersonalError> {
-        let work = Work::Query(Query {
-            time: self.now,
-            seed: [0; 32],
-            caller,
-            instance: PERSONAL,
-            method: self.method(name),
-            arguments: arguments.encode(),
-        });
-        answer(name, &Outcome::decode(&self.node.refine(&work)).unwrap().0)
-    }
-
+impl<W: BorrowMut<World>> Home<W> {
     pub fn overview(&self) -> Overview {
         self.query(sync(0), "overview", ()).unwrap()
     }

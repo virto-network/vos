@@ -6,8 +6,8 @@
 
 use std::collections::BTreeMap;
 
+use vos_testkit::model::{Model, decode};
 use vos_testkit::programs::{actor, method};
-use vos_testkit::{Testkit, decode};
 use vos_wire::abi::cap::Target;
 use vos_wire::abi::{Failure, Op, cap, price};
 use vos_wire::batch::{Admin, Answer, Await, Body, Input, Message};
@@ -56,7 +56,7 @@ pub struct Flows {
     actors: Actors,
     programs: BTreeMap<&'static str, Vec<u8>>,
     node: Node,
-    kit: Testkit,
+    kit: Model,
     sessions: Sessions,
     pairs: BTreeMap<AgentId, u64>,
     time: u64,
@@ -93,11 +93,11 @@ impl Flows {
             actors: Actors::load(),
             programs: programs(),
             node,
-            kit: Testkit::new(crate::common::AGENT),
+            kit: Model::new(crate::common::AGENT),
             sessions: Sessions::new(),
             pairs: BTreeMap::new(),
             time: 0,
-            budget: crate::common::OUTER_GAS,
+            budget: crate::common::GAS,
         };
         flows
             .actors

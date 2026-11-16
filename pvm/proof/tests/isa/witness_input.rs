@@ -21,7 +21,7 @@ use vos_pvm_proof::core::step::WitnessWrite;
 use vos_pvm_proof::kernel::{KernelTrace, KernelTraceError, trace_kernel};
 use vos_pvm_proof::segment::SegmentCursor;
 use vos_pvm_proof::{prove, verify, verify_chain};
-use vos_testkit::Testkit;
+use vos_testkit::model::Model;
 use vos_testkit::programs::{derived, method};
 use vos_wire::Encode;
 use vos_wire::abi::cap::Target;
@@ -281,8 +281,8 @@ mod refused {
 }
 
 /// The `kernels` actor installed on the agent's reference model.
-fn kernels() -> Testkit {
-    let mut kit = Testkit::new(AgentId(7));
+fn kernels() -> Model {
+    let mut kit = Model::new(AgentId(7));
     kit.install_derived(Target::Vos, InstanceId(9), &derived("kernels"), &[])
         .expect("installs");
     kit

@@ -13,8 +13,8 @@ use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest};
 use proptest::prelude::*;
 use vos_pvm_compiler::{DeriveError, INVOCATION_HEAP, derive, link_elf_spi};
+use vos_testkit::model::{Model, decode};
 use vos_testkit::programs::{actor_elf, derived, method, package};
-use vos_testkit::{Testkit, decode};
 use vos_wire::Encode;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
 use vos_wire::result::Outcome;
@@ -146,7 +146,7 @@ fn kernels_run_their_methods() {
     );
     let derived = derived("kernels");
     let program = &derived.actor;
-    let mut kit = Testkit::new(AgentId(7));
+    let mut kit = Model::new(AgentId(7));
     let kernels: Vec<(MethodId, &[u8])> = derived
         .kernels
         .iter()
@@ -272,7 +272,7 @@ fn a_kernel_making_a_host_call_is_refused() {
 /// stripped of its relocations cannot be pruned soundly.
 #[test]
 fn what_is_no_package_is_refused() {
-    let agent = std::fs::read(vos_testkit::programs::agent_elf()).unwrap();
+    let agent = std::fs::read(vos_testkit::programs::program_elf("vos-agent")).unwrap();
     assert!(matches!(derive(&agent), Err(DeriveError::NoSchema)));
     let mut stripped = package("ledger");
     strip_relocations(&mut stripped);
@@ -530,7 +530,7 @@ fn every_package_is_built() {
 /// alike, and a member it does not hold traps it.
 #[test]
 fn a_device_kernel_states_its_parts_under_the_poseidon2_io_hash() {
-    use vos_testkit::{device_auth_input, device_parts, run_device_kernel, run_kernel};
+    use vos_testkit::model::{device_auth_input, device_parts, run_device_kernel, run_kernel};
     use vos_wire::abi::{Failure, Kind};
     use vos_wire::result::KernelReturn;
     const GAS: u64 = 50_000_000;

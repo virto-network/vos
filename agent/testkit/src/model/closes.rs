@@ -15,7 +15,7 @@ use vos_wire::served::{
 use vos_wire::vos_anchor::RootKind;
 use vos_wire::{Decode, Encode, SpaceId, defaults, keys};
 
-use crate::{Step, Testkit};
+use super::{Model, Step};
 
 /// A step's writes over the rows it quarantines, as the agent makes them.
 #[derive(Default)]
@@ -24,7 +24,7 @@ struct Writes(BTreeMap<Vec<u8>, Option<Vec<u8>>>);
 impl Writes {
     /// A row of `kit`'s state, decoded; one that does not decode
     /// quarantined, its bytes moved aside, and read as absent.
-    fn read<T: Decode>(&mut self, kit: &Testkit, key: &[u8]) -> Option<T> {
+    fn read<T: Decode>(&mut self, kit: &Model, key: &[u8]) -> Option<T> {
         let held = kit.state.get(key)?;
         if let Some(value) = T::decode_exact(held) {
             return Some(value);
@@ -39,7 +39,7 @@ impl Writes {
     }
 }
 
-impl Testkit {
+impl Model {
     /// A step that runs nothing and writes `writes`, applied.
     fn written(&mut self, writes: Vec<Write>, messages: Vec<Outgoing>) -> Step {
         self.applied(Step {
@@ -91,7 +91,7 @@ impl Testkit {
             });
             writes.put(keys::reported(), (window, to).encode());
         }
-        let (writes, _) = crate::split_writes(writes.0);
+        let (writes, _) = super::split_writes(writes.0);
         self.written(writes, messages)
     }
 
@@ -138,7 +138,7 @@ impl Testkit {
                 writes.put(keys::close_mark(), (window, last).encode());
             }
         }
-        let (writes, _) = crate::split_writes(writes.0);
+        let (writes, _) = super::split_writes(writes.0);
         self.written(writes, messages)
     }
 
@@ -155,7 +155,7 @@ impl Testkit {
         {
             writes.put(keys::closed(window), row.encode());
         }
-        let (writes, _) = crate::split_writes(writes.0);
+        let (writes, _) = super::split_writes(writes.0);
         self.written(writes, Vec::new())
     }
 
@@ -212,7 +212,7 @@ impl Testkit {
                 writes.put(keys::reading(), window.encode());
             }
         }
-        let (writes, committed) = crate::split_writes(writes.0);
+        let (writes, committed) = super::split_writes(writes.0);
         self.applied(Step {
             writes,
             committed,

@@ -2,8 +2,8 @@
 //! build-test-actors`) running on the testkit. The tests fail, not skip,
 //! when the programs are missing.
 
+use vos_testkit::model::{InstallError, Model, decode};
 use vos_testkit::programs::{actor, kernel, method, schema};
-use vos_testkit::{InstallError, Testkit, decode};
 use vos_wire::abi::{Failure, Kind};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash};
 use vos_wire::result::Outcome;
@@ -29,8 +29,8 @@ fn kernels<'a>(ledger: &[u8]) -> Vec<(MethodId, &'a [u8])> {
     vec![(method(ledger, "checksum"), checksum)]
 }
 
-fn kit() -> Testkit {
-    let mut kit = Testkit::new(AgentId(7));
+fn kit() -> Model {
+    let mut kit = Model::new(AgentId(7));
     kit.install(COUNTER, &actor("counter"), &[], &[]).unwrap();
     let ledger = actor("ledger");
     kit.install(LEDGER, &ledger, &kernels(&ledger), &[("minter", 1)])
@@ -40,16 +40,16 @@ fn kit() -> Testkit {
 }
 
 fn call<A: Encode>(
-    kit: &mut Testkit,
+    kit: &mut Model,
     instance: InstanceId,
     name: &str,
     arguments: A,
-) -> vos_testkit::Step {
+) -> vos_testkit::model::Step {
     let method = kit.method(instance, name).expect("a method");
     kit.command(ALICE, instance, method, &arguments.encode())
 }
 
-fn query<A: Encode, R: Decode>(kit: &Testkit, instance: InstanceId, name: &str, arguments: A) -> R {
+fn query<A: Encode, R: Decode>(kit: &Model, instance: InstanceId, name: &str, arguments: A) -> R {
     let method = kit.method(instance, name).expect("a method");
     reply(kit.query(ALICE, instance, method, &arguments.encode()))
 }
@@ -211,7 +211,7 @@ fn an_attestable_method_runs_as_its_own_kernel() {
 
 #[test]
 fn installing_needs_every_attestable_kernel_and_role() {
-    let mut kit = Testkit::new(AgentId(7));
+    let mut kit = Model::new(AgentId(7));
     let ledger = actor("ledger");
     let all = kernels(&ledger);
     assert_eq!(
@@ -318,7 +318,7 @@ fn a_kernel_may_not_make_host_calls() {
     })
     .unwrap();
     let ledger = actor("ledger");
-    let mut kit = Testkit::new(AgentId(7));
+    let mut kit = Model::new(AgentId(7));
     let mut programs = kernels(&ledger);
     programs[0].1 = &bad;
     kit.install(LEDGER, &ledger, &programs, &[("minter", 1)])
@@ -337,14 +337,14 @@ fn a_kernel_may_not_make_host_calls() {
 fn a_shard_moves_balances_here_or_by_a_credit_to_another_shard() {
     const SHARD: InstanceId = InstanceId(1);
     const OPENING: u64 = 1 << 40;
-    let mut kit = Testkit::new(AgentId(7));
+    let mut kit = Model::new(AgentId(7));
     let shard = actor("shard");
     let holds = kernel("shard", "holds");
     kit.install(SHARD, &shard, &[(method(&shard, "holds"), &holds)], &[])
         .unwrap();
     let (a, b) = ([1u8; 16], [2u8; 16]);
     // Four arguments: encoded one after another, as a call's are.
-    let transfer = |kit: &mut Testkit, from: [u8; 16], to: [u8; 16], agent: u32, amount: u64| {
+    let transfer = |kit: &mut Model, from: [u8; 16], to: [u8; 16], agent: u32, amount: u64| {
         let method = kit.method(SHARD, "transfer").expect("a method");
         let arguments = [from.encode(), to.encode(), agent.encode(), amount.encode()].concat();
         kit.command(ALICE, SHARD, method, &arguments)

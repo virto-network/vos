@@ -7,7 +7,7 @@ use super::*;
 /// which holds what they run and are charged: the agent's own work, less
 /// what the charges cover of it. The node's state is left as it was.
 fn unpaid(node: &Node, time: u64, inputs: Vec<Input>) -> i64 {
-    let invocation = node.run_refine(&node.work(time, inputs), crate::common::OUTER_GAS);
+    let invocation = node.run_refine(&node.work(time, inputs), crate::common::GAS);
     let output = invocation.output_bounded(cap::OUTPUT).unwrap();
     let (result, _) = vos_wire::result::split_output(&output).unwrap();
     let steps: u64 = result.steps.iter().map(|step| ran(step).gas_used).sum();

@@ -230,14 +230,14 @@ fn a_push_and_its_read_cost() {
             .map(|write| write.key.len() + write.value.as_ref().map_or(0, Vec::len))
             .sum();
         let query = Work::Query(Query {
-            time: home.now,
+            time: home.now(),
             seed: [0; 32],
             caller: sync(0),
             instance: PERSONAL,
             method: home.method("since"),
             arguments: (scope(1), pushed.position - 1).encode(),
         });
-        let since = home.node.run_refine(&query, crate::common::OUTER_GAS);
+        let since = home.node().run_refine(&query, crate::common::GAS);
         eprintln!(
             "an envelope of {len} B: push {} gas, {} rows, {written} B written \
              ({} B beyond the envelope); since {} gas",

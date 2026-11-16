@@ -153,7 +153,7 @@ pub(super) fn restart(home: &Home, restored: &mut Phone, split: &Split, next: &K
     let read = Restored {
         next: overview.next,
         chain: overview.chain,
-        time: home.now,
+        time: home.now(),
         confirmed: overview.confirmed,
         policy: policy(),
         kit: vec![next.key()],
@@ -304,7 +304,7 @@ fn a_restore_here_reads_the_personal_space_back() {
     let before = r_of(&mut restored);
     assert_eq!(before, *split.r(), "the restore's R");
     let epoch = restored.group().confirmed() + 1;
-    let prepared = restored.group().commit(None, home.now).unwrap();
+    let prepared = restored.group().commit(None, home.now()).unwrap();
     assert_eq!(prepared.effect.remove, vec![0, 1]);
     restored.send(&mut home, &prepared).unwrap();
     restored.read(&mut home);
@@ -531,7 +531,7 @@ fn the_kit_alone_removes_a_phone_that_holds_only_a_sync_key() {
     let phrase = KitSecret::phrase().unwrap();
     let (mut home, mut phones, _) = household_with(1, vec![phrase.key()]);
     written(&mut home, &mut phones);
-    let started = home.now;
+    let started = home.now();
     let signing = phrase.signing();
     let removal = operate(&mut home, &signing, &signing, "remove", 0u32.encode(), None);
     phones[0].read(&mut home);
@@ -556,7 +556,7 @@ fn the_kit_alone_removes_a_phone_that_holds_only_a_sync_key() {
     let next = KitSecret::phrase().unwrap();
     let (mut restored, split, _) = open_restore(&mut home, &phrase, &next, 9);
     let archive = matured(&mut home, &phrase, &restored);
-    assert!(home.now - started >= 2 * policy().kit_delay_ms);
+    assert!(home.now() - started >= 2 * policy().kit_delay_ms);
     restart(&home, &mut restored, &split, &next);
     restored.group().inherit(&archive).unwrap();
     install(&restored.light, NOTES);
@@ -587,7 +587,7 @@ fn r_rotates_at_a_removal_and_the_removed_device_opens_nothing_after() {
     operate(&mut home, &admin, &sync, "cosign", removal.encode(), None);
     settle(&mut home, &mut phones[..2]);
     let epoch = phones[0].group().confirmed() + 1;
-    let prepared = phones[0].group().commit(None, home.now).unwrap();
+    let prepared = phones[0].group().commit(None, home.now()).unwrap();
     assert_eq!(prepared.effect.remove, vec![2]);
     let rekey = prepared.effect.rekey.clone().expect("the kit re-sealed");
     phones[0].send(&mut home, &prepared).unwrap();
@@ -654,7 +654,7 @@ fn a_void_verdict_after_a_confirmed_removal_rotates_r_all_the_same() {
     operate(&mut home, &admin, &sync, "cosign", removal.encode(), None);
     settle(&mut home, &mut phones[..2]);
     let epoch = phones[0].group().confirmed() + 1;
-    let prepared = phones[0].group().commit(None, home.now).unwrap();
+    let prepared = phones[0].group().commit(None, home.now()).unwrap();
     assert_eq!(prepared.effect.remove, vec![2]);
     phones[0].send(&mut home, &prepared).unwrap();
     let mut voided = [false; 2];
@@ -678,7 +678,7 @@ fn a_void_verdict_after_a_confirmed_removal_rotates_r_all_the_same() {
     let served = stored(&home, &phones[0], RECOVERY);
     let opened = open_recovery(&old, &home.identity, &served).unwrap();
     assert!(opened.keys(epoch, &scope_of(&phones[0], NOTES)).is_empty());
-    let next = phones[0].group().commit(None, home.now).unwrap();
+    let next = phones[0].group().commit(None, home.now()).unwrap();
     assert!(
         next.effect.rekey.is_some(),
         "the next commit re-seals the kit"
@@ -781,7 +781,7 @@ fn a_rotation_maturing_before_a_removals_commit_reaches_no_removed_device() {
     operate(&mut home, &admin, &sync, "cosign", removal.encode(), None);
     settle(&mut home, &mut phones[..2]);
     let removed_key = phones[2].group().archive_key().unwrap();
-    let prepared = phones[0].group().commit(None, home.now).unwrap();
+    let prepared = phones[0].group().commit(None, home.now()).unwrap();
     let signed = home.sign(&phones[0].admin, "commit", prepared.arguments());
     phones[0]
         .group()
@@ -876,7 +876,7 @@ fn a_rotation_the_kit_signs_is_re_sealed_by_the_next_commit() {
             Default::default()
         );
     }
-    let prepared = phones[0].group().commit(None, home.now).unwrap();
+    let prepared = phones[0].group().commit(None, home.now()).unwrap();
     assert!(prepared.effect.remove.is_empty());
     let rekey = prepared.effect.rekey.clone().expect("the kit re-sealed");
     phones[0].send(&mut home, &prepared).unwrap();

@@ -29,7 +29,7 @@ fn a_lapsed_agent_takes_removals_alive_and_votes_and_refuses_pushes() {
         Err(PersonalError::Lapsed)
     );
     home.push(0, envelope(RECOVERY, 1, 3, 100)).unwrap();
-    let soon = home.now + HOUR_MS;
+    let soon = home.now() + HOUR_MS;
     assert_eq!(
         home.call::<u64>(
             sync(0),
@@ -86,12 +86,12 @@ fn the_lease_counts_re_proofs_not_uptime() {
     assert_eq!(retried.position, first.position);
     let until = home.overview().lease_until;
     assert_eq!(until, T0 + 395 * DAY + 1, "from the assignment's batch");
-    home.pass(until - home.now);
+    home.pass(until - home.now());
     assert!(!home.overview().lapsed);
     home.push(0, envelope(scope(1), 0, 2, 500)).unwrap();
     home.pass(1);
     assert!(home.overview().lapsed);
     home.call::<Recorded>(HOMES, "renew", ()).unwrap();
     let renewed = home.overview().lease_until;
-    assert_eq!(renewed, home.now - 1 + 395 * DAY);
+    assert_eq!(renewed, home.now() - 1 + 395 * DAY);
 }

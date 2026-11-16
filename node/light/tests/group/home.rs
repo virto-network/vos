@@ -1,102 +1,26 @@
-//! A home: `Personal` installed in the default agent on a host that runs a
-//! node's refine and applies its work results as a node's accumulate does,
-//! one batch a call; and ingress's part, each call's signature checked
-//! against its key before the call runs. The batch time is the test's.
-
-use std::collections::{BTreeMap, HashMap};
-use std::ops::Bound;
-use std::sync::{Arc, Mutex, PoisonError};
+//! A home: `Personal` installed in the default agent of a test's world
+//! ([`vos_testkit::World`]), one batch a call; and ingress's part, each
+//! call's signature checked against its key before the call runs. The
+//! batch time is the test's.
 
 use ed25519_dalek::{Signer, SigningKey, Verifier};
-use vos_exec::{Machines, ProgramStore, StateReader};
 use vos_light::release::{self, Package};
-use vos_pvm::PvmBackend;
-use vos_pvm::pool::{MachinePool, OuterMachines};
+use vos_testkit::World;
 use vos_testkit::programs;
 use vos_wire::abi::Failure;
-use vos_wire::abi::cap::Target;
-use vos_wire::apply::{Host, State, apply};
-use vos_wire::batch::{Admin, Batch, Input, Query, Request, Work};
-use vos_wire::defaults::SESSION_EXPIRY_MS;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
-use vos_wire::ingress::{Grant, call_message};
+use vos_wire::batch::{Input, Request};
+use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
+use vos_wire::ingress::call_message;
 use vos_wire::personal::{Entry, PersonalError, Policy};
-use vos_wire::records::unstored;
-use vos_wire::result::{Outcome, Step, split_output};
-use vos_wire::{Decode, Encode, SpaceId, WindowClock, keys};
+use vos_wire::result::Outcome;
+use vos_wire::{Decode, Encode, SpaceId};
 
 pub const PERSONAL: InstanceId = InstanceId(5);
 /// The agent's identity, which calls are signed for.
 pub const IDENTITY: [u8; 32] = [0x1d; 32];
 const AGENT: AgentId = AgentId(7);
-const GAS: u64 = 4_000_000_000;
 /// The batch time a test's home starts at.
 pub const T0: u64 = 1_800_000_000_000;
-
-/// The home's rows.
-#[derive(Clone, Default)]
-struct Rows(Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>);
-
-impl StateReader for Rows {
-    fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.0.lock().unwrap().get(key).cloned()
-    }
-
-    fn rows<'a>(
-        &'a self,
-        prefix: &'a [u8],
-        after: Option<&'a [u8]>,
-    ) -> Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + 'a> {
-        let start = match after {
-            Some(after) if after >= prefix => Bound::Excluded(after.to_vec()),
-            _ => Bound::Included(prefix.to_vec()),
-        };
-        let rows: Vec<(Vec<u8>, Vec<u8>)> = self
-            .0
-            .lock()
-            .unwrap()
-            .range((start, Bound::Unbounded))
-            .take_while(|(key, _)| key.starts_with(prefix))
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
-        Box::new(rows.into_iter())
-    }
-}
-
-impl State for Rows {
-    fn read(&mut self, key: &[u8]) -> Option<Vec<u8>> {
-        StateReader::read(self, key)
-    }
-
-    fn write(&mut self, key: &[u8], value: Option<&[u8]>) {
-        let mut rows = self.0.lock().unwrap();
-        match value {
-            Some(value) => rows.insert(key.to_vec(), value.to_vec()),
-            None => rows.remove(key),
-        };
-    }
-}
-
-/// The programs installed, each pinned.
-#[derive(Default)]
-struct Programs(Mutex<HashMap<[u8; 32], Vec<u8>>>);
-
-impl ProgramStore for Programs {
-    fn get(&self, hash: &[u8; 32]) -> Option<Vec<u8>> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(hash)
-            .cloned()
-    }
-
-    fn pinned_by(&self, hash: &[u8; 32], _: AgentId) -> bool {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .contains_key(hash)
-    }
-}
 
 /// A call signed, not yet sent: its request, and the message and
 /// signature its evidence carries.
@@ -139,11 +63,7 @@ impl Reply {
 }
 
 pub struct Home {
-    machines: Machines,
-    rows: Rows,
-    personal: Vec<u8>,
-    sessions: BTreeMap<[u8; 32], (Session, u64, u64)>,
-    pub now: u64,
+    world: World,
     /// The agent's identity, which calls are signed for.
     pub identity: [u8; 32],
 }
@@ -154,8 +74,8 @@ pub fn artifacts() -> &'static (Vec<u8>, Package) {
     static ARTIFACTS: std::sync::OnceLock<(Vec<u8>, Package)> = std::sync::OnceLock::new();
     ARTIFACTS.get_or_init(|| {
         let read = |path: std::path::PathBuf| std::fs::read(path).unwrap();
-        let agent = release::agent(&read(programs::agent_elf())).unwrap();
-        let personal = release::package(&read(programs::personal_elf()), 1).unwrap();
+        let agent = release::agent(&read(programs::program_elf("vos-agent"))).unwrap();
+        let personal = release::package(&read(programs::program_elf("vos-personal")), 1).unwrap();
         (agent, personal)
     })
 }
@@ -169,54 +89,34 @@ impl Home {
     /// [`Home::new`] for an agent whose identity is `identity`: another
     /// home's.
     pub fn at(homes: &SigningKey, policy: Policy, identity: [u8; 32]) -> Self {
-        let (agent, package) = artifacts();
-        let backend = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-            PvmBackend::ForceRecompiler
-        } else {
-            PvmBackend::ForceInterpreter
-        };
-        let program = OuterMachines::with_idle_limit(agent, backend, 1).unwrap();
-        let pool = Arc::new(MachinePool::with_idle_limits(8, 2));
-        let store = Arc::new(Programs::default());
-        for (hash, program) in package.checked().unwrap() {
-            pool.install(program).unwrap();
-            store.0.lock().unwrap().insert(hash, program.to_vec());
-        }
-        let mut home = Self {
-            machines: Machines {
-                program: Arc::new(program),
-                pool,
-                programs: store,
-            },
-            rows: Rows::default(),
-            personal: package.programs[0].clone(),
-            sessions: BTreeMap::new(),
-            now: T0,
-            identity,
-        };
-        let homes_key = homes.verifying_key().to_bytes();
-        home.batch(vec![
-            Input::Admin(Admin::Install {
-                instance: PERSONAL,
-                derivation: package.derivation.clone(),
-                roles: vec![(b"homes".to_vec(), 1)],
-                target: Target::Vos,
-                space: SpaceId::NONE,
-                clock: WindowClock::DEFAULT,
-            }),
-            Input::Admin(Admin::SetRole(Grant {
-                principal: Principal::Client(homes_key),
-                role: Some(1),
-            })),
-        ]);
+        let (_, package) = artifacts();
+        let checked = package.checked().unwrap();
+        let installed: Vec<&[u8]> = checked.iter().map(|(_, program)| *program).collect();
+        let mut world = World::at(T0 - 1);
+        world
+            .agent(AGENT)
+            .install_derivation(
+                SpaceId::NONE,
+                PERSONAL,
+                package.derivation.clone(),
+                &installed,
+                &[("homes", 1)],
+            )
+            .grant(Principal::Client(homes.verifying_key().to_bytes()), 1);
+        let mut home = Self { world, identity };
         home.call(homes, "configure", policy.encode())
             .answer::<vos_wire::personal::Recorded>()
             .unwrap();
         home
     }
 
+    /// The next batch's time.
+    pub fn now(&self) -> u64 {
+        self.world.now
+    }
+
     pub fn method(&self, name: &str) -> MethodId {
-        programs::method(&self.personal, name)
+        self.world.method(AGENT, PERSONAL, name)
     }
 
     /// The agent as a device group names it.
@@ -225,34 +125,6 @@ impl Home {
             identity: self.identity,
             instance: PERSONAL,
         }
-    }
-
-    fn version(&self) -> u64 {
-        match StateReader::read(&self.rows, &keys::version()) {
-            Some(bytes) => unstored(&bytes)
-                .and_then(|bytes| u64::decode(bytes).ok())
-                .map(|(version, _)| version)
-                .unwrap(),
-            None => 0,
-        }
-    }
-
-    /// `inputs` refined and applied at the batch time, which moves a
-    /// millisecond on: each step.
-    fn batch(&mut self, inputs: Vec<Input>) -> Vec<Step> {
-        let work = Work::Batch(Batch {
-            version: self.version(),
-            time: self.now,
-            seed: [0; 32],
-            budget: GAS,
-            inputs,
-        });
-        let state = Arc::new(self.rows.clone());
-        let (output, _) = self.machines.refine(state, AGENT, &work, GAS).unwrap();
-        let (result, pages) = split_output(&output).unwrap();
-        assert!(apply(&mut self.rows, &result, Host::Vos { pages: &pages }));
-        self.now += 1;
-        result.steps
     }
 
     /// A call of `name` with `arguments` signed by `key`, verified as
@@ -280,27 +152,22 @@ impl Home {
     /// A call of `name` with `arguments` signed by `key`, in its session
     /// for a call now, not yet sent.
     pub fn sign(&mut self, key: &SigningKey, name: &str, arguments: Vec<u8>) -> Signed {
-        let public = key.verifying_key().to_bytes();
-        let (session, sequence) = self.session(public);
-        let method = self.method(name);
+        let caller = Principal::Client(key.verifying_key().to_bytes());
+        let request = self
+            .world
+            .agent(AGENT)
+            .request(caller, PERSONAL, name, Raw(&arguments));
         let message = call_message(
             &self.identity,
-            &session,
-            sequence,
+            &request.session,
+            request.sequence,
             PERSONAL,
-            method,
+            self.method(name),
             &arguments,
         );
         let signature = key.sign(&message).to_bytes();
         Signed {
-            request: Request {
-                session,
-                sequence,
-                caller: Principal::Client(public),
-                instance: PERSONAL,
-                method,
-                arguments,
-            },
+            request,
             message,
             signature,
         }
@@ -315,35 +182,14 @@ impl Home {
             &ed25519_dalek::Signature::from_bytes(&signed.signature),
         )
         .expect("ingress verifies the call");
-        let at = self.now;
-        let steps = self.batch(vec![Input::Request(signed.request)]);
-        let outcome = match steps.into_iter().next() {
-            Some(Step::Ran(run)) => run.outcome,
-            other => panic!("{other:?}"),
-        };
+        let at = self.world.now;
+        let run = self.world.agent(AGENT).step(Input::Request(signed.request));
         Reply {
             at,
-            outcome,
+            outcome: run.outcome,
             message: signed.message,
             signature: signed.signature,
         }
-    }
-
-    /// `key`'s session for a call now, and the call's sequence.
-    fn session(&mut self, key: [u8; 32]) -> (Session, u64) {
-        let now = self.now;
-        let fresh = || {
-            let mut name = [0; 16];
-            name[..8].copy_from_slice(&now.to_le_bytes());
-            (Session { key, name, t0: now }, 0, now)
-        };
-        let entry = self.sessions.entry(key).or_insert_with(fresh);
-        if entry.2 + SESSION_EXPIRY_MS / 2 < now {
-            *entry = fresh();
-        }
-        entry.1 += 1;
-        entry.2 = now;
-        (entry.0, entry.1)
     }
 
     /// `key`'s query of `name` at the batch time.
@@ -353,21 +199,15 @@ impl Home {
         name: &str,
         arguments: Vec<u8>,
     ) -> Result<T, PersonalError> {
-        let work = Work::Query(Query {
-            time: self.now,
-            seed: [0; 32],
-            caller: Principal::Client(key),
-            instance: PERSONAL,
-            method: self.method(name),
-            arguments,
-        });
-        let (output, _) = self
-            .machines
-            .refine(Arc::new(self.rows.clone()), AGENT, &work, GAS)
-            .unwrap();
-        let outcome = vos_exec::decode::<Outcome>(&output).unwrap();
+        let outcome = self.world.query(
+            AGENT,
+            Principal::Client(key),
+            PERSONAL,
+            name,
+            Raw(&arguments),
+        );
         Reply {
-            at: self.now,
+            at: self.world.now,
             outcome,
             message: Vec::new(),
             signature: [0; 64],
@@ -390,6 +230,15 @@ impl Home {
     }
 
     pub fn pass(&mut self, ms: u64) {
-        self.now += ms;
+        self.world.pass(ms);
+    }
+}
+
+/// Arguments already encoded.
+struct Raw<'a>(&'a [u8]);
+
+impl Encode for Raw<'_> {
+    fn encode_to(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(self.0);
     }
 }

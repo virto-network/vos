@@ -18,8 +18,8 @@ use vos_pvm_proof::program_id::KernelProgram;
 use vos_pvm_proof::segment::{SegmentCursor, segment_bounds_budgeted};
 use vos_pvm_proof::{Proof, ProvingError, prove_shaped};
 use vos_statement::{ProgramId, Statement};
-use vos_testkit::Step;
-use vos_testkit::Testkit;
+use vos_testkit::model::Model;
+use vos_testkit::model::Step;
 use vos_testkit::programs::{derived, method, table_tag};
 use vos_tree::{BatchProof, Blake2b, Hash, MemStore};
 use vos_venue::{ModelVenue, VenueClient};
@@ -276,7 +276,7 @@ pub fn read_live(
     serve: impl FnOnce(&mut Served),
 ) -> Live {
     let derived = derived(actor);
-    let mut kit = Testkit::new(AGENT);
+    let mut kit = Model::new(AGENT);
     kit.install_derived_in((cut.space, CLOCK), Target::Vos, INSTANCE, &derived, &[])
         .expect("installs");
     let time = CLOCK.boundary(WINDOW - 1).unwrap() + 5;

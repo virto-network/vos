@@ -282,7 +282,7 @@ fn workflows_across_packages(backend: PvmBackend) {
     let WorkflowState::Ended(Outcome::Done(restocked)) = paired.record(5).state else {
         panic!("restocked");
     };
-    let restocked: Vec<u64> = vos_testkit::decode(&restocked).unwrap();
+    let restocked: Vec<u64> = vos_testkit::model::decode(&restocked).unwrap();
     assert_eq!(restocked.len(), 3);
     assert!(restocked.windows(2).all(|pair| pair[0] < pair[1]));
     assert!(

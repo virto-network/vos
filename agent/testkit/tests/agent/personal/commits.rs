@@ -212,7 +212,7 @@ fn a_nack_a_second_h_or_the_window_voids_a_candidate() {
         Err(PersonalError::NotAdmitted)
     );
     assert!(
-        home.node
+        home.node()
             .get(&vos_wire::keys::admitted(PERSONAL, &device(2).sync))
             .is_none()
     );

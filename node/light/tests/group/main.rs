@@ -115,10 +115,10 @@ fn paired_phones_confirm_one_group() {
     }
     let stranger = Phone::new(40);
     assert_ne!(stranger.light.scope_id(instance).unwrap(), scope);
-    let package = DeviceGroup::key_package(&stranger.store, &stranger.keys, home.now).unwrap();
+    let package = DeviceGroup::key_package(&stranger.store, &stranger.keys, home.now()).unwrap();
     let (_, pairing) = phones[0]
         .group()
-        .pair(stranger.keys.clone(), package, home.now)
+        .pair(stranger.keys.clone(), package, home.now())
         .unwrap();
     assert!(matches!(
         DeviceGroup::join(&stranger.store, stranger.keys.clone(), pairing),
@@ -126,11 +126,11 @@ fn paired_phones_confirm_one_group() {
     ));
     phones[0].group().abandon().unwrap();
 
-    assert!(!phones[1].group().update_due(home.now));
+    assert!(!phones[1].group().update_due(home.now()));
     assert!(
         phones[1]
             .group()
-            .update_due(home.now + vos_light::group::RENEW_AFTER_MS)
+            .update_due(home.now() + vos_light::group::RENEW_AFTER_MS)
     );
     phones[1].update(&mut home).unwrap();
     phones[2].read(&mut home);
@@ -154,7 +154,7 @@ fn paired_phones_confirm_one_group() {
         assert_eq!(opened, archive);
         assert!(vos_light::group::Archive::open(&key, &[3; 24], b"other", &sealed).is_none());
     }
-    assert!(!phones[1].group().update_due(home.now));
+    assert!(!phones[1].group().update_due(home.now()));
     assert_eq!(overview(&home, &phones[0]).confirmed, 3);
 }
 
@@ -369,7 +369,7 @@ fn garbage_to_a_sleeping_device_alarms_on_its_return_and_it_re_pairs() {
             committer: 0
         }
     );
-    assert!(phones[2].group().commit(None, home.now).is_err());
+    assert!(phones[2].group().commit(None, home.now()).is_err());
 
     // The committer goes quiet; the sleeper re-pairs from the other phone
     // as a new device.
@@ -431,7 +431,7 @@ fn garbage_to_a_sleeping_device_alarms_on_its_return_and_it_re_pairs() {
 #[test]
 fn a_commit_that_is_not_an_admin_call_is_refused() {
     let (mut home, mut phones) = household(2);
-    let prepared = phones[1].group().commit(None, home.now).unwrap();
+    let prepared = phones[1].group().commit(None, home.now()).unwrap();
     let reply = home.call(&phones[1].sync, "commit", prepared.arguments());
     assert_eq!(
         reply.answer::<vos_wire::personal::Candidacy>(),
@@ -476,7 +476,7 @@ fn a_commit_that_is_not_an_admin_call_is_refused() {
 #[test]
 fn without_valid_evidence_no_device_moves() {
     let (mut home, mut phones) = household(3);
-    let prepared = phones[0].group().commit(None, home.now).unwrap();
+    let prepared = phones[0].group().commit(None, home.now()).unwrap();
     let reply = home.call(&phones[0].admin, "commit", prepared.arguments());
     reply.answer::<vos_wire::personal::Candidacy>().unwrap();
     let (_, others) = phones.split_at_mut(1);
@@ -511,7 +511,7 @@ fn without_valid_evidence_no_device_moves() {
     }
 
     // Evidence that does not verify: its signature forged.
-    let prepared = phones[0].group().commit(None, home.now).unwrap();
+    let prepared = phones[0].group().commit(None, home.now()).unwrap();
     let reply = home.call(&phones[0].admin, "commit", prepared.arguments());
     let index = reply
         .answer::<vos_wire::personal::Candidacy>()
@@ -743,9 +743,9 @@ fn two_attacker_devices_are_removed_by_one_commit() {
 fn every_disallowed_proposal_is_nacked() {
     let (mut home, mut phones) = household(3);
     let mut stranger = Phone::new(30);
-    let package = DeviceGroup::key_package(&stranger.store, &stranger.keys, home.now).unwrap();
+    let package = DeviceGroup::key_package(&stranger.store, &stranger.keys, home.now()).unwrap();
     let other = Phone::new(31);
-    let other_package = DeviceGroup::key_package(&other.store, &other.keys, home.now).unwrap();
+    let other_package = DeviceGroup::key_package(&other.store, &other.keys, home.now()).unwrap();
     let suite = vos_mls::SUITE;
     let encrypted = Anything {
         path: true,
@@ -1042,8 +1042,8 @@ fn a_maturity_no_signed_removal_supports_is_ignored() {
     entries.push((
         index,
         Entry {
-            at: home.now,
-            chain: chain(&last, index, home.now, &body),
+            at: home.now(),
+            chain: chain(&last, index, home.now(), &body),
             body,
         },
     ));

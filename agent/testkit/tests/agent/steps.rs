@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 use vos_pvm::ExitReason;
+use vos_testkit::model::{Model, decode};
 use vos_testkit::programs::{method, table_tag};
-use vos_testkit::{Testkit, decode};
 use vos_wire::abi::{Failure, Refusal, Rows, cap, code};
 use vos_wire::batch::{Admin, Input};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, WorkflowId};
@@ -20,8 +20,8 @@ mod kernels;
 mod scans;
 
 use crate::common::{
-    AGENT, ALICE, Actors, BOB, CALLER, COUNTER, LEDGER, MINTER, Node, OUTER_GAS, Sessions, done,
-    failed, install, ran, ran_done, refused, request, setup,
+    AGENT, ALICE, Actors, BOB, CALLER, COUNTER, GAS, LEDGER, MINTER, Node, Sessions, done, failed,
+    install, ran, ran_done, refused, request, setup,
 };
 
 #[test]
@@ -224,7 +224,7 @@ fn roles_nested_calls_cycles_and_attests() {
 fn a_call_that_cannot_get_a_machine_fails_the_step() {
     let actors = Actors::load();
     let mut node = Node::new();
-    let mut kit = Testkit::new(AGENT);
+    let mut kit = Model::new(AGENT);
     let caller = node.add(&actors.caller);
     let installs: Vec<Input> = (100..170)
         .map(|instance| install(InstanceId(instance), caller))
@@ -358,7 +358,7 @@ fn a_step_whose_precompiles_overrun_the_budget_waits_or_fails() {
     };
 
     let incrementing = request(ALICE, 1, COUNTER, increment, 1u64.encode());
-    let alone = refine(std::slice::from_ref(&incrementing), OUTER_GAS);
+    let alone = refine(std::slice::from_ref(&incrementing), GAS);
     let incremented = defaults::STEP_RESERVE + ran_done(&alone.steps[0]).gas_used;
     let behind = [incrementing, hashing(2)];
     let waited = refine(&behind, budget(incremented, 10));

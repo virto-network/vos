@@ -405,7 +405,7 @@ fn two_commits_for_one_epoch_raise_the_split_log_alarm() {
 
     // B's own commit for the epoch, never sent: the operators log it in
     // A's place in what they show B.
-    let prepared = b.group().commit(None, home.now).unwrap();
+    let prepared = b.group().commit(None, home.now()).unwrap();
     let signed = home.sign(&b.admin, "commit", prepared.arguments());
     b.group()
         .signed_commit(signed.message.clone(), signed.signature)
@@ -689,7 +689,7 @@ fn a_later_configuration_lowers_no_delay() {
     let (mut home, mut phones) = household(2);
     let (a, b) = phones.split_at_mut(1);
     let (a, b) = (&mut a[0], &mut b[0]);
-    let at = home.now;
+    let at = home.now();
     let arguments = 1u32.encode();
     let call = AdminCall {
         origin: a.admin.verifying_key().to_bytes(),
@@ -871,7 +871,7 @@ fn a_forged_operation_moves_nothing() {
     let (mut home, mut phones) = household(2);
     let (a, b) = phones.split_at_mut(1);
     let (a, b) = (&mut a[0], &mut b[0]);
-    let at = home.now;
+    let at = home.now();
     let arguments = 1u32.encode();
     let call = AdminCall {
         origin: a.admin.verifying_key().to_bytes(),
@@ -935,7 +935,7 @@ fn a_forged_operation_moves_nothing() {
             home.agent(),
             stranger.keys.clone(),
             vec![kit_key(0)],
-            home.now,
+            home.now(),
         )
         .unwrap(),
     );
@@ -1187,10 +1187,10 @@ fn checkpoints_are_acknowledged_and_trusted_as_the_rules_say() {
     // A device paired from the second starts from the checkpoint it
     // acknowledged.
     let mut paired = Phone::new(4);
-    let package = DeviceGroup::key_package(&paired.store, &paired.keys, home.now).unwrap();
+    let package = DeviceGroup::key_package(&paired.store, &paired.keys, home.now()).unwrap();
     let (prepared, mut pairing) = phones[1]
         .group()
-        .pair(paired.keys.clone(), package, home.now)
+        .pair(paired.keys.clone(), package, home.now())
         .unwrap();
     pairing.trust(made);
     let pairing = Pairing::from_bytes(&pairing.to_bytes()).unwrap();
@@ -1212,10 +1212,10 @@ fn checkpoints_are_acknowledged_and_trusted_as_the_rules_say() {
     // One handed a hash its content does not give refuses it, with the
     // alarm, and reads the scope from its start.
     let mut misled = Phone::new(5);
-    let package = DeviceGroup::key_package(&misled.store, &misled.keys, home.now).unwrap();
+    let package = DeviceGroup::key_package(&misled.store, &misled.keys, home.now()).unwrap();
     let (prepared, mut pairing) = phones[1]
         .group()
-        .pair(misled.keys.clone(), package, home.now)
+        .pair(misled.keys.clone(), package, home.now())
         .unwrap();
     pairing.trust(vos_light::group::Checkpoint {
         hash: [0x0b; 32],
@@ -1264,7 +1264,7 @@ fn checkpoints_are_acknowledged_and_trusted_as_the_rules_say() {
     let read = Restored {
         next: overview.next,
         chain: overview.chain,
-        time: home.now,
+        time: home.now(),
         confirmed: overview.confirmed,
         policy: policy(),
         kit: vec![next],

@@ -20,7 +20,7 @@ fn scenario(node: Node) -> Vec<Ran> {
         let work = flows
             .node
             .budgeted_work(flows.time, [0; 32], budget, inputs);
-        let invocation = flows.node.run_refine(&work, crate::common::OUTER_GAS);
+        let invocation = flows.node.run_refine(&work, crate::common::GAS);
         assert_eq!(invocation.exit, vos_pvm::ExitReason::Halt, "refine halts");
         let output = invocation.output_bounded(cap::OUTPUT).unwrap();
         flows.node.accumulate(&output);

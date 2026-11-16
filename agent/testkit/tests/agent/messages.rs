@@ -2,7 +2,7 @@
 //! its outcome, a reply consumed in its pair's order, and a message the
 //! leader asserts failed in refine, each against the testkit.
 
-use vos_testkit::{Step as KitStep, Testkit, decode};
+use vos_testkit::model::{Model, Step as KitStep, decode};
 use vos_wire::Encode;
 use vos_wire::abi::{Failure, Refusal};
 use vos_wire::batch::{Answer, Await, Body, Input, Message};
@@ -72,7 +72,7 @@ fn reply(counter: u64, answer: Answer) -> Outgoing {
 }
 
 /// The node's steps agree with the testkit's, each made by `expected`.
-fn agrees(kit: &mut Testkit, steps: &[Step], expected: impl Fn(&mut Testkit, usize) -> KitStep) {
+fn agrees(kit: &mut Model, steps: &[Step], expected: impl Fn(&mut Model, usize) -> KitStep) {
     kit.batch(1, [0; 32]);
     for (index, step) in steps.iter().enumerate() {
         let expected = expected(kit, index);

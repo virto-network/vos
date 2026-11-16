@@ -86,9 +86,14 @@ impl Phone {
             .call(homes, "assign", (self.keys.clone(), split.claim()).encode())
             .answer()
             .unwrap();
-        let mut group =
-            DeviceGroup::create(&self.store, home.agent(), self.keys.clone(), keys, home.now)
-                .unwrap();
+        let mut group = DeviceGroup::create(
+            &self.store,
+            home.agent(),
+            self.keys.clone(),
+            keys,
+            home.now(),
+        )
+        .unwrap();
         group.set_recovery(assigned.index, *split.r()).unwrap();
         self.group = Some(group);
         split
@@ -210,7 +215,7 @@ impl Phone {
     /// Commit an update now: the yearly prompt's, carrying every matured
     /// removal.
     pub fn update(&mut self, home: &mut Home) -> Result<Candidacy, PersonalError> {
-        let prepared = self.group().commit(None, home.now).unwrap();
+        let prepared = self.group().commit(None, home.now()).unwrap();
         self.send(home, &prepared)
     }
 
@@ -227,10 +232,10 @@ impl Phone {
     /// adding it and its evidence posted, and `new`'s group from the
     /// pairing. The commit is the candidate; nothing is confirmed yet.
     pub fn pair(&mut self, home: &mut Home, new: &mut Phone) -> Candidacy {
-        let package = DeviceGroup::key_package(&new.store, &new.keys, home.now).unwrap();
+        let package = DeviceGroup::key_package(&new.store, &new.keys, home.now()).unwrap();
         let (prepared, pairing) = self
             .group()
-            .pair(new.keys.clone(), package, home.now)
+            .pair(new.keys.clone(), package, home.now())
             .unwrap();
         let pairing = Pairing::from_bytes(&pairing.to_bytes()).unwrap();
         new.group = Some(DeviceGroup::join(&new.store, new.keys.clone(), pairing).unwrap());

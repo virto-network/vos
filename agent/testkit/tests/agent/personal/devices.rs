@@ -244,7 +244,7 @@ fn a_removal_freezes_its_targets_probation() {
     let mut home = seasoned(2);
     home.pair(1, 2);
     home.pass(MINUTE);
-    let left = view(&home, sync(0), 2).device.active_from - home.now;
+    let left = view(&home, sync(0), 2).device.active_from - home.now();
     let removal = home.operate(admin(0), "remove", 2u32).unwrap();
     home.operate(admin(1), "veto", removal).unwrap();
     home.pass(20 * MINUTE);
@@ -259,7 +259,7 @@ fn a_removal_freezes_its_targets_probation() {
     assert_eq!(thawed.standing, Standing::Probation);
     assert_eq!(
         thawed.device.active_from,
-        home.now - 1 + left,
+        home.now() - 1 + left,
         "the probation left when the removal opened"
     );
     home.pass(left);
@@ -465,7 +465,7 @@ fn a_kit_rotation_replaces_the_kit_and_its_recovery_scope_starts_over() {
     let rotation = home.operate(kit_key(2, 1), "rotate", third).unwrap();
     assert_eq!(
         home.operation(sync(0), rotation).matures,
-        home.now - 1 + 7 * MINUTE
+        home.now() - 1 + 7 * MINUTE
     );
     home.operate(admin(1), "veto", rotation).unwrap();
     assert_eq!(
@@ -523,7 +523,7 @@ fn an_admin_key_replacement_keeps_the_seasoning() {
     let replacement = home.operate(KIT, "replace", (0u32, new_admin(2))).unwrap();
     assert_eq!(
         home.operation(sync(0), replacement).matures,
-        home.now - 1 + 7 * MINUTE
+        home.now() - 1 + 7 * MINUTE
     );
 }
 

@@ -8,7 +8,7 @@ use vos_node_prover::masked::{MaskedProver, kernel_record};
 use vos_node_prover::program::program_id;
 use vos_node_prover::{ProveError, Prover};
 use vos_pvm_proof::constants;
-use vos_testkit::Testkit;
+use vos_testkit::model::Model;
 use vos_testkit::programs::{actor_elf, derived, method};
 use vos_wire::Encode;
 use vos_wire::abi::cap::Target;
@@ -19,7 +19,7 @@ use vos_wire::result::Attest;
 /// and the attest it recorded.
 fn attests(values: &[u64]) -> Vec<(Vec<u8>, Attest)> {
     let derived = derived("kernels");
-    let mut kit = Testkit::new(AgentId(7));
+    let mut kit = Model::new(AgentId(7));
     kit.install_derived(Target::Vos, InstanceId(9), &derived, &[])
         .expect("installs");
     let step = kit.command(

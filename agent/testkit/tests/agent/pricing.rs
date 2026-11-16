@@ -2,7 +2,7 @@
 //! every operation's price, and the reserve a step keeps for the agent's
 //! own work.
 
-use vos_testkit::Testkit;
+use vos_testkit::model::Model;
 use vos_wire::abi::cap;
 use vos_wire::defaults;
 use vos_wire::ids::{InstanceId, MethodId};
@@ -11,7 +11,7 @@ use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode};
 
 use crate::common::{
-    AGENT, ALICE, CALLER, COUNTER, LEDGER, Node, OUTER_GAS, counter_only, install, ran, ran_done,
+    AGENT, ALICE, CALLER, COUNTER, GAS, LEDGER, Node, counter_only, install, ran, ran_done,
     request, setup,
 };
 
@@ -198,7 +198,7 @@ fn every_operation_pays_for_its_serving() {
     // A get and a scan through 61 call frames: a get probes every frame,
     // a scan merges them.
     let mut deep = Node::new();
-    let mut kit = Testkit::new(AGENT);
+    let mut kit = Model::new(AGENT);
     actors.install(&mut deep, &mut kit);
     let caller = deep.add(&actors.caller);
     let installs = (100..170)
@@ -347,7 +347,7 @@ fn the_reserves_cover_the_agents_own_work() {
         // the empty one's, every step's gas being 0.
         let plain = |inputs: Vec<Input>| {
             let work = node.work(1, inputs);
-            node.run_refine(&work, OUTER_GAS).gas_used as i64
+            node.run_refine(&work, GAS).gas_used as i64
         };
         let none = plain(vec![]);
         let acks = |count: u32| {
@@ -389,16 +389,14 @@ fn the_reserves_cover_the_agents_own_work() {
             .collect();
         node.batch(10 * bucket, created);
         let later = 10 * bucket + defaults::SESSION_EXPIRY_MS + 2 * bucket;
-        let sweeping = node.run_refine(&node.work(later, vec![node.sweep(later)]), OUTER_GAS);
+        let sweeping = node.run_refine(&node.work(later, vec![node.sweep(later)]), GAS);
         let swept = WorkResult::decode(&sweeping.output_bounded(cap::OUTPUT).unwrap())
             .unwrap()
             .0;
         assert!(
             matches!(&swept.steps[0], vos_wire::result::Step::Swept { due, .. } if due.len() == defaults::SWEEP_LIMIT)
         );
-        let idle = node
-            .run_refine(&node.work(later, vec![]), OUTER_GAS)
-            .gas_used;
+        let idle = node.run_refine(&node.work(later, vec![]), GAS).gas_used;
         check(
             "a full sweep",
             (sweeping.gas_used - idle) as i64,
@@ -415,7 +413,7 @@ fn the_reserves_cover_the_agents_own_work() {
             node.state
                 .insert(kept, vos_wire::records::stored(&later.encode()));
         }
-        let sweeping = node.run_refine(&node.work(later, vec![node.sweep(later)]), OUTER_GAS);
+        let sweeping = node.run_refine(&node.work(later, vec![node.sweep(later)]), GAS);
         let swept = WorkResult::decode(&sweeping.output_bounded(cap::OUTPUT).unwrap())
             .unwrap()
             .0;
@@ -454,7 +452,7 @@ fn serving_a_precompile_costs_the_agent_its_bounce() {
             let run = |count: u32| {
                 let arguments = (vec![(kind, 0u32, count)], (0u32, 0u32)).encode();
                 let work = node.work(1, vec![request(ALICE, 1, COUNTER, ops, arguments)]);
-                let invocation = node.run_refine(&work, OUTER_GAS);
+                let invocation = node.run_refine(&work, GAS);
                 let bytes = invocation.output_bounded(cap::OUTPUT).unwrap();
                 let (result, _) = WorkResult::decode(&bytes).unwrap();
                 let used = ran_done(&result.steps[0]).gas_used;
@@ -555,7 +553,7 @@ fn the_start_reserves_cover_decoding_a_batch() {
     ] {
         let work = node.budgeted_work(1, [0; 32], 0, inputs);
         let arguments = node.arguments(&work).len() as u64;
-        let invocation = node.run_refine(&work, OUTER_GAS);
+        let invocation = node.run_refine(&work, GAS);
         let (result, _) =
             WorkResult::decode(&invocation.output_bounded(cap::OUTPUT).unwrap()).unwrap();
         assert!(result.steps.is_empty(), "{name}: nothing dispatched");

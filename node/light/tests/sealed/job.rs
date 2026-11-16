@@ -195,7 +195,7 @@ fn pass_with(
     instances: &[InstanceId],
     death: Option<Death>,
 ) -> Result<Run, job::Stopped<Killed>> {
-    let now = home.now;
+    let now = home.now();
     let mut link = JobLink::new(home, phone);
     link.death = death;
     let Phone { light, group, .. } = phone;
@@ -253,7 +253,7 @@ fn a_pass_pushes_and_reads_the_scopes() {
     for key in 0..3 {
         set(&phones[0].light, NOTES, key, key + 100);
     }
-    let pushed_at = home.now;
+    let pushed_at = home.now();
     let first = pass(&mut home, &mut phones[0]);
     assert_eq!(first.pass.pushed, 3);
     assert!(phones[0].light.queued(NOTES).unwrap().is_empty());
@@ -331,7 +331,7 @@ fn a_pending_restore_is_answered_with_alive() {
 fn an_open_operation_is_a_notice() {
     let (mut home, mut phones, _) = household_with(2, vec![KitSecret::phrase().unwrap().key()]);
     let (admin, sync) = (phones[1].admin.clone(), phones[1].sync.clone());
-    let taken = home.now;
+    let taken = home.now();
     let index = operate(&mut home, &admin, &sync, "remove", 0u32.encode(), None);
     home.pass(MIN);
     let run = pass(&mut home, &mut phones[0]);
@@ -349,9 +349,9 @@ fn an_open_operation_is_a_notice() {
     };
     assert_eq!(kind, Kind::Remove);
     let at = at.expect("this pass read it");
-    assert!(at >= taken && at < home.now, "{at}");
+    assert!(at >= taken && at < home.now(), "{at}");
     assert_eq!(matures, at + policy().operation_delay_ms);
-    let latency = home.now - at;
+    let latency = home.now() - at;
     eprintln!("operation to notice: {latency} ms of the home's clock");
 }
 
@@ -510,7 +510,7 @@ fn a_pass_over_the_clearnet_sends_nothing() {
         }
     }
     let (mut home, mut phones) = household(2);
-    let now = home.now;
+    let now = home.now();
     let mut link = Clear(JobLink::new(&mut home, &phones[0]));
     let Phone { light, group, .. } = &mut phones[0];
     let stopped = job::run(light, group.as_mut().unwrap(), &mut link, &[NOTES], now).unwrap_err();
@@ -579,7 +579,7 @@ fn an_alarm_outlives_the_request_failed_after_it() {
     let bytes = super::detection::sealed_by(&phones[0], NOTES, &old_key, old, 7, |_| {});
     let position = stored(&home, &phones[1], scope).len() as u64 + 1;
     let stale = Alarm::Stale { scope, position };
-    let now = home.now;
+    let now = home.now();
     let mut link = JobLink::new(&mut home, &phones[1]);
     link.placed = Some((
         scope,

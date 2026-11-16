@@ -7,8 +7,8 @@
 //! the window as one a read waits on; the rows of old windows gone; and no
 //! program's call writes any of it.
 
-use vos_testkit::Testkit;
-use vos_testkit::programs::{representative_package, table_tag};
+use vos_testkit::model::Model;
+use vos_testkit::programs::{program_package, table_tag};
 use vos_wire::abi::cap::Target;
 use vos_wire::batch::{Body, Input, Message};
 use vos_wire::ids::{AgentId, MapId, MethodId, Principal, derive_id};
@@ -37,8 +37,8 @@ const SPACE: SpaceId = SpaceId([0x5a; 32]);
 
 /// The representative installed as `AGENT`'s instance 0, in a node and the
 /// model.
-fn representative() -> (Node, Testkit) {
-    let package = representative_package();
+fn representative() -> (Node, Model) {
+    let package = program_package("vos-representative");
     let derived = vos_pvm_compiler::derive(&package).unwrap();
     let mut node = Node::new();
     let (kit, installed) = install_in(
@@ -127,7 +127,7 @@ fn value(node: &Node, key: &[u8]) -> Option<Vec<u8>> {
 /// waits on, which the representative's apply cuts. A report of a window
 /// at or before the sender's last, or two past the representative's open
 /// window, stores nothing. The model agrees on each step.
-fn reports_are_stored(node: &mut Node, kit: &mut Testkit, a: AgentId, b: AgentId) {
+fn reports_are_stored(node: &mut Node, kit: &mut Model, a: AgentId, b: AgentId) {
     let inputs = vec![
         report(a, 1, 5, [5; 32]),
         report(b, 1, 5, [6; 32]),

@@ -26,7 +26,7 @@ fn a_kernels_argument_window_is_unmapped() {
     .unwrap();
     let actors = Actors::load();
     let mut node = Node::new();
-    let mut kit = Testkit::new(AGENT);
+    let mut kit = Model::new(AGENT);
     let program = node.add(&scribble);
     let Input::Admin(Admin::Install {
         instance,
@@ -173,7 +173,7 @@ fn derived_kernels_run_in_the_agent() {
             node.add(kernel);
         }
         ran_done(&node.batch(0, vec![install]).steps[0]);
-        let mut kit = Testkit::new(AGENT);
+        let mut kit = Model::new(AGENT);
         kit.install_for(target, instance, &derived.actor, &kernels, &[])
             .unwrap();
         let mut sessions = Sessions::new();
@@ -198,7 +198,7 @@ fn derived_kernels_run_in_the_agent() {
 /// installed first.
 #[test]
 fn a_device_kernels_method_is_never_attested() {
-    use vos_testkit::programs::{credentials_elf, derived};
+    use vos_testkit::programs::{derived, program_elf};
     let derived = derived("device");
     let instance = InstanceId(9);
     let kernels: Vec<(MethodId, &[u8])> = derived
@@ -213,7 +213,7 @@ fn a_device_kernels_method_is_never_attested() {
     for (_, kernel) in &kernels {
         node.add(kernel);
     }
-    let elf = std::fs::read(credentials_elf()).unwrap();
+    let elf = std::fs::read(program_elf("vos-credentials")).unwrap();
     let credentials = vos_pvm_compiler::derive(&elf).expect("derives");
     node.add(&credentials.actor);
     let install = |instance, derivation, roles: &[&str]| {
@@ -236,10 +236,10 @@ fn a_device_kernels_method_is_never_attested() {
     for step in &node.batch(0, installs).steps {
         ran_done(step);
     }
-    let mut kit = Testkit::new(AGENT);
+    let mut kit = Model::new(AGENT);
     kit.install_for(Target::Vos, instance, &derived.actor, &kernels, &[])
         .unwrap();
-    let (input, _) = vos_testkit::device_auth_input();
+    let (input, _) = vos_testkit::model::device_auth_input();
     let arguments = (auth.0, input);
     let mut sessions = Sessions::new();
     let result = node.batch(

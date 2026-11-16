@@ -14,8 +14,8 @@
 use std::collections::BTreeMap;
 
 use vos_pvm_compiler::Derived;
+use vos_testkit::model::{Model, run_kernel};
 use vos_testkit::programs::{derived, kernel, method};
-use vos_testkit::{Testkit, run_kernel};
 use vos_tree::{BatchProof, Blake2b, MemStore};
 use vos_wire::abi::cap::{self, Target};
 use vos_wire::abi::{AttestError, Failure, Kind, price};
@@ -55,7 +55,7 @@ const REPRESENTATIVE: AgentId = AgentId(0x0900_0000);
 /// and what drives them.
 struct Reads {
     node: Node,
-    kit: Testkit,
+    kit: Model,
     /// Alice's requests so far, in her session opened at `T0`.
     sequence: u64,
     /// The representative's messages to the agent so far.

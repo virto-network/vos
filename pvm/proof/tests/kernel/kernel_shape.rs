@@ -30,7 +30,7 @@ use vos_pvm_proof::{
 use vos_pvm_proof_verifier::{
     ENTRY_TIMESTAMP, HALT_PC, verify_kernel_chain, verify_kernel_segment, verify_standalone,
 };
-use vos_testkit::Testkit;
+use vos_testkit::model::Model;
 use vos_testkit::programs::{derived, method};
 use vos_wire::Encode;
 use vos_wire::abi::cap::Target;
@@ -89,7 +89,7 @@ impl Kernel {
 fn kernels(values: &[u64]) -> Vec<(&'static str, Kernel)> {
     let derived = derived("kernels");
     let install = derived.derivation();
-    let mut kit = Testkit::new(AgentId(7));
+    let mut kit = Model::new(AgentId(7));
     kit.install_derived(Target::Vos, InstanceId(9), &derived, &[])
         .expect("installs");
     let step = kit.command(

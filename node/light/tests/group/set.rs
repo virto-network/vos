@@ -98,7 +98,7 @@ fn signed(events: &[Vec<Event>]) {
 
 /// The removals `phone`'s next commit would carry.
 fn owed(home: &Home, phone: &mut Phone) -> Vec<u32> {
-    let prepared = phone.group().commit(None, home.now).unwrap();
+    let prepared = phone.group().commit(None, home.now()).unwrap();
     phone.group().abandon().unwrap();
     prepared.effect.remove
 }
@@ -278,18 +278,18 @@ fn a_regroup_starts_a_new_group_with_the_rest() {
         );
     }
     assert!(matches!(
-        kept[1].group().commit(None, home.now),
+        kept[1].group().commit(None, home.now()),
         Err(GroupError::Regroup)
     ));
     assert!(matches!(
-        kept[1].group().regroup(Vec::new(), home.now),
+        kept[1].group().regroup(Vec::new(), home.now()),
         Err(GroupError::NoRegroup)
     ));
     assert_eq!(kept[0].group().regrouper(), Some(0));
     assert_eq!(kept[1].group().regrouper(), Some(0));
 
-    let package = kept[1].group().regroup_package(home.now).unwrap();
-    let prepared = kept[0].group().regroup(vec![package], home.now).unwrap();
+    let package = kept[1].group().regroup_package(home.now()).unwrap();
+    let prepared = kept[0].group().regroup(vec![package], home.now()).unwrap();
     assert_eq!(prepared.effect.remove, vec![2]);
     let candidacy = kept[0].send(&mut home, &prepared).unwrap();
     assert_eq!(candidacy.set, vec![0, 1]);
@@ -388,7 +388,7 @@ fn a_restore_starts_a_new_group_under_its_new_kit() {
     let read = Restored {
         next: overview.next,
         chain: overview.chain,
-        time: home.now,
+        time: home.now(),
         confirmed: overview.confirmed,
         policy: policy(),
         kit: vec![next],
@@ -407,7 +407,7 @@ fn a_restore_starts_a_new_group_under_its_new_kit() {
         *split.r()
     );
     let epoch = overview.confirmed + 1;
-    let prepared = restored.group().commit(None, home.now).unwrap();
+    let prepared = restored.group().commit(None, home.now()).unwrap();
     assert_eq!(prepared.effect.remove, vec![0, 1]);
     assert!(
         prepared.effect.rekey.is_some(),
@@ -488,19 +488,24 @@ fn a_maturity_before_its_delay_is_unsigned() {
         2u32.encode(),
         None,
     );
-    let matures = home.now + policy().operation_delay_ms;
+    let matures = home.now() + policy().operation_delay_ms;
     let (cursor, before) = phones[1].group().view();
     let mut entries = home.log(phones[1].sync_key(), cursor).unwrap();
     let early = append(
         &mut entries,
         before,
-        home.now,
+        home.now(),
         Body::Settled {
             op: removal,
-            state: OpState::Matured { at: home.now },
+            state: OpState::Matured { at: home.now() },
         },
     );
-    append(&mut entries, before, home.now, Body::Matured { device: 2 });
+    append(
+        &mut entries,
+        before,
+        home.now(),
+        Body::Matured { device: 2 },
+    );
     let events = phones[1].group().follow(entries).unwrap();
     assert!(
         events.contains(&Event::Alarm(Alarm::Unsigned { index: early })),
@@ -512,17 +517,22 @@ fn a_maturity_before_its_delay_is_unsigned() {
     let ahead = append(
         &mut entries,
         before,
-        home.now,
+        home.now(),
         Body::Settled {
             op: removal,
             state: OpState::Matured { at: matures },
         },
     );
-    append(&mut entries, before, home.now, Body::Matured { device: 2 });
+    append(
+        &mut entries,
+        before,
+        home.now(),
+        Body::Matured { device: 2 },
+    );
     let back = append(
         &mut entries,
         before,
-        home.now - 1,
+        home.now() - 1,
         Body::Renewed { until: 0 },
     );
     let events = phones[0].group().follow(entries).unwrap();
@@ -589,7 +599,7 @@ fn a_device_that_cannot_follow_regroups() {
     home.pass(policy().operation_delay_ms);
     phones[1].alive(&mut home);
     signed(&[phones[1].read(&mut home)]);
-    let prepared = phones[1].group().regroup(Vec::new(), home.now).unwrap();
+    let prepared = phones[1].group().regroup(Vec::new(), home.now()).unwrap();
     assert_eq!(prepared.epoch, 3);
     assert_eq!(prepared.effect.remove, vec![0]);
     let candidacy = phones[1].send(&mut home, &prepared).unwrap();
@@ -622,10 +632,10 @@ fn a_delayed_admins_add_waits_its_delay() {
 
     let mut new = Phone::new(3);
     let attempt = |home: &mut Home, delayed: &mut Phone, new: &Phone| {
-        let package = DeviceGroup::key_package(&new.store, &new.keys, home.now).unwrap();
+        let package = DeviceGroup::key_package(&new.store, &new.keys, home.now()).unwrap();
         let (prepared, _) = delayed
             .group()
-            .pair(new.keys.clone(), package, home.now)
+            .pair(new.keys.clone(), package, home.now())
             .unwrap();
         delayed.send(home, &prepared)
     };
@@ -806,10 +816,10 @@ fn a_resolved_replacement_waits_out_its_probation() {
     let early = append(
         &mut entries,
         before,
-        home.now,
+        home.now(),
         Body::Settled {
             op: replacement,
-            state: OpState::Matured { at: home.now },
+            state: OpState::Matured { at: home.now() },
         },
     );
     let events = phones[0].group().follow(entries).unwrap();

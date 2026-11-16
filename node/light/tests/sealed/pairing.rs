@@ -138,7 +138,7 @@ fn hello(home: &Home, joiner: &mut Phone, n: u8, offer: &Offer) -> Hello {
     joiner.keys.nullifier = offer.home.nullifier(&secret(n, &offer.home.handle));
     Hello {
         device: joiner.keys.clone(),
-        key_package: DeviceGroup::key_package(&joiner.store, &joiner.keys, home.now).unwrap(),
+        key_package: DeviceGroup::key_package(&joiner.store, &joiner.keys, home.now()).unwrap(),
         handles: offer
             .memberships
             .iter()
@@ -203,7 +203,7 @@ fn pair_in(
     let enrollments = memberships::plan(&offer.memberships, &heard);
     let (prepared, mut pairing) = opener
         .group()
-        .pair(heard.device.clone(), heard.key_package.clone(), home.now)
+        .pair(heard.device.clone(), heard.key_package.clone(), home.now())
         .unwrap();
     for checkpoint in checkpoints {
         pairing.trust(checkpoint);
@@ -333,7 +333,7 @@ fn a_phone_is_paired_through_the_slot_and_reads_at_once() {
         memberships::enrollments(&phones[0].store).unwrap(),
         enrollments
     );
-    let call = enrollments[0].call(home.now + 60_000).unwrap();
+    let call = enrollments[0].call(home.now() + 60_000).unwrap();
     assert_eq!(
         call.arguments,
         (handle_of(2, &club()).member, handle_of(2, &club()).owner).encode()
@@ -454,8 +454,11 @@ fn another_code_or_a_replaced_item_fails_the_handshake() {
 /// The credential book installed on `light`, the club joined, and each
 /// of `devices`' handle there as the registrar's person record holds it.
 fn book(light: &vos_light::Light, devices: &[(u32, u8)]) {
-    let book =
-        release::package(&std::fs::read(programs::credential_book_elf()).unwrap(), 1).unwrap();
+    let book = release::package(
+        &std::fs::read(programs::program_elf("vos-credential-book")).unwrap(),
+        1,
+    )
+    .unwrap();
     let outcome = light.install(BOOK, &book, Vec::new()).unwrap();
     assert!(matches!(outcome, Outcome::Done(_)), "{outcome:?}");
     let enrolled = Enrolled {
@@ -515,7 +518,7 @@ fn a_pairing_cut_short_is_abandoned_and_paired_again() {
     assert_eq!(enrollments.len(), 1);
     let (_, pairing) = phones[0]
         .group()
-        .pair(heard.device, heard.key_package, home.now)
+        .pair(heard.device, heard.key_package, home.now())
         .unwrap();
     for put in side.hand_over(&pairing).unwrap() {
         leave(&mut home, &phones[0].sync, &put);
@@ -605,7 +608,7 @@ fn a_phone_is_retired_once_its_successor_is_paired() {
         !events.iter().any(|event| matches!(event, Event::Alarm(_))),
         "{events:?}"
     );
-    let prepared = phones[1].group().commit(None, home.now).unwrap();
+    let prepared = phones[1].group().commit(None, home.now()).unwrap();
     assert_eq!(prepared.effect.remove, vec![0]);
     phones[1].send(&mut home, &prepared).unwrap();
     let (old, rest) = phones.split_first_mut().unwrap();
@@ -620,7 +623,7 @@ fn a_phone_is_retired_once_its_successor_is_paired() {
     let revoked = memberships::handles_of(&rest[0].light, BOOK, 0).unwrap();
     assert_eq!(revoked, vec![(club(), handle_of(1, &club()))]);
     let (membership, handle) = &revoked[0];
-    let call = memberships::revoke_call(membership, &handle.member, home.now + 60_000).unwrap();
+    let call = memberships::revoke_call(membership, &handle.member, home.now() + 60_000).unwrap();
     assert_eq!(call.method, vos_light::method_id("revoke_device"));
     assert_eq!(call.arguments, handle_of(1, &club()).member.encode());
     assert_eq!(
@@ -638,7 +641,7 @@ fn the_yearly_prompt_renews_the_leaf() {
     let overview: vos_wire::personal::Overview = home
         .query(phones[0].sync_key(), "overview", ().encode())
         .unwrap();
-    let now = home.now;
+    let now = home.now();
     assert!(!home::renewal_due(
         phones[0].group(),
         overview.lease_until,
@@ -704,7 +707,7 @@ fn a_claim_with_a_phrase_and_a_security_key_starts_the_group() {
         ),
         Err(ClaimError::Kit)
     ));
-    let call = claim.call(&home_space(&home), home.now + 60_000).unwrap();
+    let call = claim.call(&home_space(&home), home.now() + 60_000).unwrap();
     assert_eq!(call.method, vos_light::method_id("claim"));
     drop(claim);
 
@@ -722,7 +725,7 @@ fn a_claim_with_a_phrase_and_a_security_key_starts_the_group() {
             &phone.store,
             PERSONAL,
             &early,
-            home.now
+            home.now()
         ),
         Err(ClaimError::Unassigned)
     ));
@@ -734,7 +737,7 @@ fn a_claim_with_a_phrase_and_a_security_key_starts_the_group() {
     let entries = home.log(phone.sync_key(), 0).unwrap();
     let mut phone = phone;
     let group = claim
-        .claimed(&phone.store, PERSONAL, &entries, home.now)
+        .claimed(&phone.store, PERSONAL, &entries, home.now())
         .unwrap();
     assert!(Claim::pending(&phone.store).unwrap().is_none());
     assert!(group.holds_recovery());

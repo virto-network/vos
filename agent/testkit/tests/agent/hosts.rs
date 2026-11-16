@@ -13,7 +13,7 @@ use vos_wire::result::WorkResult;
 use vos_wire::{Decode, Encode};
 
 use crate::common::{
-    ALICE, Actors, BOB, CALLER, COUNTER, LEDGER, MINTER, Node, OUTER_GAS, Sessions, done, install,
+    ALICE, Actors, BOB, CALLER, COUNTER, GAS, LEDGER, MINTER, Node, Sessions, done, install,
     ran_done,
 };
 
@@ -247,11 +247,7 @@ fn vos_and_jam_hosts_agree_on_batches_that_run_actors() {
     let hashes: Vec<Input> = (0..10).map(|_| hash(&mut sessions, 3)).collect();
     // Room for a few of the hashes after the first, each 50M of limit.
     let short = 52_000_000;
-    let batches = [
-        (installs, OUTER_GAS),
-        (actor_steps, OUTER_GAS),
-        (hashes, short),
-    ];
+    let batches = [(installs, GAS), (actor_steps, GAS), (hashes, short)];
     for (time, (inputs, budget)) in batches.into_iter().enumerate() {
         let time = time as u64 + 1;
         let work = vos.budgeted_work(time, [time as u8; 32], budget, inputs);
@@ -332,7 +328,7 @@ fn a_refine_that_cannot_read_state_produces_no_result() {
     for (time, inputs) in inputs.into_iter().enumerate() {
         let work = node.work(time as u64 + 2, inputs);
         assert_eq!(
-            node.run_refine(&work, OUTER_GAS).exit,
+            node.run_refine(&work, GAS).exit,
             ExitReason::Panic,
             "no result computed on empty state"
         );

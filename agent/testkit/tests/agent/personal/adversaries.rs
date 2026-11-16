@@ -325,7 +325,7 @@ impl Game {
             }
         }
         for thief in thiefs {
-            self.noticed.entry(thief).or_insert(self.home.now);
+            self.noticed.entry(thief).or_insert(self.home.now());
             let open = open_removal(&self.home, self.reader(), thief);
             let Some((index, operation)) = open else {
                 self.home
@@ -501,14 +501,14 @@ proptest! {
     ) {
         let policy = minutes();
         let mut home = Home::with(policy);
-        let start = home.now;
+        let start = home.now();
         let removal = home.operate(KIT, "remove", 0u32).unwrap();
         let removed = start + policy.kit_delay_ms;
         let (next, r2) = new_kit(1);
         let restoring = (device(5), next.clone());
         let mut restore: Option<(u64, u64)> = None;
         let mut thefts = thefts.into_iter();
-        while restore.is_none_or(|(_, at)| home.now <= at + policy.kit_delay_ms) {
+        while restore.is_none_or(|(_, at)| home.now() <= at + policy.kit_delay_ms) {
             match thefts.next().unwrap_or(Sync::Pass(60)) {
                 Sync::Alive => {
                     let _ = home.call::<Recorded>(sync(0), "alive", ());
@@ -529,11 +529,11 @@ proptest! {
                 }
                 Sync::Pass(seconds) => home.pass(u64::from(seconds) * 1000),
             }
-            if restore.is_none() && home.now > removed {
+            if restore.is_none() && home.now() > removed {
                 home.wake(KIT).unwrap();
                 let index = home.operate(KIT, "restore", restoring.clone()).unwrap();
                 home.deposit(KIT, KIT_KEY, index, "restore", restoring.clone(), r2).unwrap();
-                restore = Some((index, home.now - 2));
+                restore = Some((index, home.now() - 2));
             }
         }
         let (index, posted) = restore.unwrap();

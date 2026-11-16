@@ -26,7 +26,7 @@ fn a_device_kernels_shape_holds_no_blake2b() {
     );
     assert_ne!(chips & 1 << device_chip::POSEIDON2, 0);
     assert_ne!(chips & 1 << chip_idx::WITNESS_INPUT, 0);
-    let (input, public) = vos_testkit::device_auth_input();
+    let (input, public) = vos_testkit::model::device_auth_input();
     let trace = trace_kernel(&blob, &input, 50_000_000).expect("halts");
     assert_eq!(
         vos_pvm_precompiles::device_return_parts(&trace.output),
@@ -56,8 +56,8 @@ fn every_path_shape_proves_under_one_device_program() {
     let program = Program::install(&blob, &auth_reference(), 0).expect("the kernel's program");
     let full: Vec<usize> = (0..32).collect();
     let shapes = [
-        vos_testkit::device_auth_arguments(0x0101_0101, 0, &[]),
-        vos_testkit::device_auth_arguments(0x0202_0202, u32::MAX, &full),
+        vos_testkit::model::device_auth_arguments(0x0101_0101, 0, &[]),
+        vos_testkit::model::device_auth_arguments(0x0202_0202, u32::MAX, &full),
     ];
     let mut proofs = Vec::new();
     for (input, public) in &shapes {
@@ -117,13 +117,13 @@ fn device_steps(blob: &[u8], input: &[u8], public: &[u8]) -> usize {
 #[test]
 fn sdk_form_kernels_run_within_the_lean_kernels_steps() {
     let lean = kernel("device", "auth");
-    let (input, public) = vos_testkit::device_auth_input();
+    let (input, public) = vos_testkit::model::device_auth_input();
     let lean_auth = device_steps(&lean, &input, &public);
     let sdk = kernel("sdk-device", "auth");
     let (input, public) =
-        vos_testkit::device_sdk_auth_arguments(0x0123_4567, 0x1234_5678, &[0, 5, 17]);
+        vos_testkit::model::device_sdk_auth_arguments(0x0123_4567, 0x1234_5678, &[0, 5, 17]);
     let sdk_auth = device_steps(&sdk, &input, &public);
-    let (owner_input, owner_public) = vos_testkit::device_owner_arguments(0x0123_4567);
+    let (owner_input, owner_public) = vos_testkit::model::device_owner_arguments(0x0123_4567);
     let lean_owner = device_steps(
         &kernel("sdk-device", "owner_lean"),
         &owner_input,
@@ -164,13 +164,13 @@ fn sdk_form_kernels_prove_under_their_programs() {
     let cases = [
         (
             "auth",
-            vos_testkit::device_sdk_auth_arguments(0x0101_0101, 0, &[]),
-            vos_testkit::device_sdk_auth_arguments(0x0202_0202, u32::MAX, &full),
+            vos_testkit::model::device_sdk_auth_arguments(0x0101_0101, 0, &[]),
+            vos_testkit::model::device_sdk_auth_arguments(0x0202_0202, u32::MAX, &full),
         ),
         (
             "owner",
-            vos_testkit::device_owner_arguments(0x0101_0101),
-            vos_testkit::device_owner_arguments(0x0202_0202),
+            vos_testkit::model::device_owner_arguments(0x0101_0101),
+            vos_testkit::model::device_owner_arguments(0x0202_0202),
         ),
     ];
     for (method, (reference, _), (input, public)) in cases {
@@ -214,7 +214,8 @@ fn release(elf: &[u8], method: &str) -> (Vec<u8>, Vec<u8>, u8) {
 
 /// The credential actor's ELF.
 fn credentials() -> Vec<u8> {
-    std::fs::read(vos_testkit::programs::credentials_elf()).expect("the credential actor")
+    std::fs::read(vos_testkit::programs::program_elf("vos-credentials"))
+        .expect("the credential actor")
 }
 
 /// A device kernel's reference program returns its reference arguments:
@@ -274,7 +275,7 @@ fn a_headroom_raises_every_log_size() {
     assert_ne!(program.id(), raised.id());
     let expected: Vec<u32> = program.log_sizes().iter().map(|size| size + 1).collect();
     assert_eq!(raised.log_sizes(), &expected[..]);
-    let (input, public) = vos_testkit::device_owner_arguments(0x0303_0303);
+    let (input, public) = vos_testkit::model::device_owner_arguments(0x0303_0303);
     let (proof, _) = raised.prove(&input, MaskRng::default()).expect("proves");
     assert_eq!(
         Some(proof.io),
@@ -320,9 +321,9 @@ fn random_witnesses_fit_the_reference_programs() {
         let filled: Vec<usize> = (0..32).filter(|_| next() & 1 == 1).collect();
         for (name, program) in &programs {
             let input = match *name {
-                "auth" => vos_testkit::device_sdk_auth_arguments(seed, slot, &filled).0,
-                "owner" => vos_testkit::device_owner_arguments(seed).0,
-                _ => vos_testkit::device_auth_arguments(seed, slot, &filled).0,
+                "auth" => vos_testkit::model::device_sdk_auth_arguments(seed, slot, &filled).0,
+                "owner" => vos_testkit::model::device_owner_arguments(seed).0,
+                _ => vos_testkit::model::device_auth_arguments(seed, slot, &filled).0,
             };
             program
                 .fits(&input)
@@ -345,7 +346,7 @@ fn two_releases_compute_one_claim() {
         (0x0101_0101, 0, &[][..]),
         (0x0202_0202, u32::MAX, &full[..]),
     ] {
-        let (input, public) = vos_testkit::device_auth_arguments(seed, slot, filled);
+        let (input, public) = vos_testkit::model::device_auth_arguments(seed, slot, filled);
         let lean_run = trace_kernel(&lean, &input, 50_000_000).expect("halts");
         let next_run = trace_kernel(&next, &input, 50_000_000).expect("halts");
         assert_eq!(lean_run.io_hash, next_run.io_hash);

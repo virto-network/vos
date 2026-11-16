@@ -10,7 +10,7 @@ use vos_wire::served::Served;
 use vos_wire::{Decode, Encode, SpaceId, defaults, keys};
 
 use super::Invocation;
-use crate::memory::{kernel, parts, read};
+use crate::model::memory::{kernel, parts, read};
 
 impl Invocation<'_> {
     /// A workflow's read at the cut of the batch time's window of its
