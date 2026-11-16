@@ -830,7 +830,8 @@ check: fmt-check check-tiers build-test-actors build-programs build-final-verify
     cargo test {{agent_crates}} ...(python3 -I tools/gates/tiers.py fast {{agent_crates}} | split row ' ')
 
 # The step gate, after each step of work and before its commit: `check`,
-# then the docs' links, the venue rules' tripwire, the builds without std
+# then the docs' links, the dependencies' licences and advisories (`deny`),
+# the venue rules' tripwire, the builds without std
 # with every guest built and its blob checked, the production builds'
 # leaks, the verifier kit, the fuzz corpus replayed, the lints of the
 # feature sets a step touches, the heavy test targets and the doc tests of
@@ -839,7 +840,7 @@ check: fmt-check check-tiers build-test-actors build-programs build-final-verify
 # `vos.credential` facility; last the reads at a cut.
 # Left to `just ci`: the slow fault runs, the PVM vectors, the bench and
 # prover library tests, and the lints of other feature sets.
-gate: check doc-check check-venue-rules check-no-std check-no-leaks check-no-faults check-kit fuzz-replay
+gate: check doc-check deny check-venue-rules check-no-std check-no-leaks check-no-faults check-kit fuzz-replay
     cargo clippy -p vos-venue --all-targets --quiet -- -D warnings
     cargo clippy -p vos-pvm-recair --no-default-features --lib --quiet -- -D warnings
     cargo clippy -p vos-light --lib --quiet -- -D warnings
@@ -861,6 +862,14 @@ gate: check doc-check check-venue-rules check-no-std check-no-leaks check-no-fau
 # ones too. The prover's own suites stay `ci`'s and above.
 test-changed base="vos-core" *flags="": build-test-actors build-programs
     python3 -I tools/gates/tiers.py changed {{base}} {{flags}}
+
+# The workspace's dependencies (`deny.toml`, cargo-deny): every licence on
+# the AGPL-compatible allowlist, no advisory of the RustSec database but
+# those the file names with its reason, and no source but crates.io and
+# the forks it lists. Duplicate versions and yanked crates are warnings.
+# The advisory database is fetched; without a network it is the cached one.
+deny:
+    cargo deny check --hide-inclusion-graph
 
 # The gates' tripwire (`tools/gates/tiers.py`): the tiers nest, every test
 # target of the workspace is run by `check` or listed heavy and run by

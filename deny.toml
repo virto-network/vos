@@ -1,0 +1,63 @@
+# `just deny`: the workspace's dependency graph, every feature on, held to
+# an allowlist of licences compatible with the AGPL-3.0-or-later the
+# workspace ships under, to the RustSec advisory database, and to the
+# sources named here.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "warn"
+# Each advisory left open, with what holds it: none has an upgrade the
+# crate that pulls it accepts. Reviewed 2026-11-13.
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "rsa 0.9 (Marvin timing): arti's tor-llcrypto and ssh-key verify RSA identity keys of relays, public data; VOS signs nothing with RSA. No fixed 0.9." },
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 (timing): through elliptic-curve 0.13 (mls-rs's P-256/P-384 suites, arti) and through starknet-ff under Stwo, the prover; the device group's suite is CURVE25519_AES128 (`vos-mls`). Fixed in 0.7 only, which neither takes." },
+    { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.38 (SQLite CVE): arti's directory cache through rusqlite 0.40, which pins it; the database holds Tor's public directory, written by arti alone." },
+    { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill unmaintained: heapless 0.7 under postcard 1; no code path on a target without atomics." },
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1 unmaintained: a dev-dependency of the proving crates' tests (vos-pvm-proof, its verifier, vos-pvm-recair); nothing a node ships decodes with it." },
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained: a build-time macro under arti's dependencies and under ark-ff (starknet-ff, Stwo)." },
+]
+
+[licenses]
+version = 2
+# The permissive licences, and the copyleft ones the AGPL may be combined
+# with (LGPL-3.0, MPL-2.0: hashx, equix, dynasm, option-ext and
+# priority-queue, all under arti).
+allow = [
+    "AGPL-3.0-or-later",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "0BSD",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Unlicense",
+    "Unicode-3.0",
+    "LGPL-3.0-only",
+    "LGPL-3.0-or-later",
+    "MPL-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# The forks the workspace patches in or pins (fjall and its lsm-tree, the
+# Stwo prover), cipher-clerk and s4.
+allow-git = [
+    "https://github.com/olanod/lsm-tree",
+    "https://github.com/olanod/fjall",
+    "https://github.com/olanod/stwo",
+    "https://codeberg.org/Virto/CipherClerk.git",
+    "https://codeberg.org/Virto/s4",
+]
