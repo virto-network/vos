@@ -238,23 +238,37 @@ actors, and calls a space through its gateway.
 - The light node is one Rust crate, `vos-light` (§7.1), linked by the
   facility's cdylib, `vos-facility` (`node/light/android`, outside the
   workspace, linking `vos-light`, `vos-api` and `vos-wire` by path). The
-  facility is renamed `vos.node`, grows the operations of §7.3, and runs
-  in a separate process of s4's app (`android:process=":vos"`), which s4's
-  UI reaches through one Binder interface. VOS depends on s4 (the
-  facility on `s4-protocol` and `s4-credential-contract`, its tests and
-  the gateway on `s4-server`, each by git revision); s4 depends on nothing
-  of VOS: its client hosts any facility behind its credential contract
-  (the AIDL, the binding, the prompts and the secret sources, which s4
-  keeps), and VOS's Android library (`just android-facility`: the `:vos`
-  service, the personal space's screens and `libvos_facility.so`) is what
-  s4's `-Ps4Vos` build links.
+  facility keeps its name, `vos.credential`, grows the operations of §7.3,
+  and runs in a separate process of s4's app (`android:process=":vos"`),
+  which serves two Binder interfaces: s4's `IVosNode`, which s4's client
+  calls, and the facility's own `IVosPersonal`, which its screens call.
+  VOS depends on s4 one way (the facility on `s4-protocol` and
+  `s4-credential-contract`, its tests and the gateway on `s4-server`, each
+  at one git revision, `just pin-s4`); s4 depends on nothing of VOS.
+- **What s4 knows of VOS** is its credential contract alone: `IVosNode`
+  (a server's session's `enroll`, `sign_in`, `pay` and `refresh`, the
+  carriage of s4's screens and `clearnet`, `foreground`, and the
+  enrollments and background runs its own chrome reads), `IVosPrompts`
+  (the forms, and the secret sources' and an admin key's prompts: its
+  `KeyKind` names an admin key and a kit's security key beside the
+  device's sources, for the personal space's prompts), the parcelables of
+  both, the service's class name, the host bridges that answer the prompts
+  (`KeySources`, `AdminKeyBridge`), a generic hook its debug probe hands
+  unknown ops to (`FacilityProbe`, the library's `Probe`) and `parcel!`, the declaration both
+  repositories write their parcelables with. The personal space's
+  interface (`IVosPersonal`: the jobs' passes, Tor's bridges and opt-outs,
+  the claim, pairing, the device set, restore, move) and its types
+  (`vos_facility::personal::contract`, package `team.virto.vos.personal`)
+  are VOS's own, built into VOS's Android library (`just
+  android-facility`: the `:vos` service, the personal space's screens and
+  `libvos_facility.so`), which s4's `-Ps4Vos` build links.
 - **Why its own process:** the prover's 1 GiB peak, the unwrapped sync key
   and archive, and arti's circuits stay out of the UI process; the OS can
   kill one without the other, so a proof or a sync is never lost to the UI
   being swiped away, and a crash in either leaves the other running; the
   background job runs in `:vos` with no UI process at all.
-- **The Binder interface** carries the facility's named operations and
-  nothing generic (§3.3); its results and errors are typed. The trusted
+- **The Binder interfaces** carry the facility's named operations and
+  nothing generic (§3.3); their results and errors are typed. The trusted
   chrome (the prompts, the pinned methods) stays in the UI process: a
   per-use keystore key is used with the prompt that authorizes it, so the
   UI process runs the prompt and the keystore operation it binds (the
@@ -3766,19 +3780,20 @@ device's crates faster); Q9's size argument for it is small.
 
 ### 7.3 s4
 
-- **The facility** `vos.credential` becomes `vos.node`: `enroll`,
-  `sign_in` and `pay` as today (the trusted chrome, the pins, the two
-  prompts [decided, `identity-and-authority.md` §7]), plus `claim` (the
-  personal agent at a home-only space by default, with a phrase or
-  security-key kit), `pair` (§3.8, a QR shown and scanned, with the
-  enrollments in every other space), `retire` (a phone), `devices` (list,
+- **The facility** `vos.credential`: `enroll`, `sign_in` and `pay` as
+  today (the trusted chrome, the pins, the two prompts [decided,
+  `identity-and-authority.md` §7]), plus `claim` (the personal agent at a
+  home-only space by default, with a phrase or security-key kit), `pair`
+  (§3.8, a QR shown and scanned, with the enrollments in every other
+  space), retiring a phone (`remove` it from the set, then `revoke` its
+  leaves in every other space), `devices` (list,
   last sync, remove, veto, resolve, contests, kit rotation, admin-key
   replacement; each behind the admin key's prompt), `restore` (from a
   kit), `move_home` (§3.9), the yearly re-proof (with the leaf renewal on
   the same prompt), and local notifications for pending device
   operations. These are the facility's own screens (its Android
-  library, `team.virto.s4.personal`), their own plan step (8.24), over
-  the `:vos` process's Binder interface (§2.2, plan 8.24b).
+  library, `team.virto.vos.personal`), their own plan step (8.24), over
+  the facility's own Binder interface, `IVosPersonal` (§2.2, plan 8.24b).
 - **Tor in s4's client:** its SSH connection to the gateway goes to the
   onion address pinned at enrollment, through the facility's `TorClient`;
   the host key is pinned as today.
@@ -3803,7 +3818,7 @@ device's crates faster); Q9's size argument for it is small.
   what the user does, `Background` for its job). A stream to a gateway's
   `.onion` goes over Tor too.
 - **The personal space**: every flow of §3.8 and §3.9 and the device set's
-  operations, named on the Binder interface; the light node under
+  operations, named on `IVosPersonal`; the light node under
   `light/`; the admin key in the UI's Keystore (Ed25519, strong biometric
   only, `IVosPrompts.signKey`). A device's new admin key is signed in by
   the kit (maturing after the kit's delay) or by another seasoned device
@@ -3817,7 +3832,7 @@ device's crates faster); Q9's size argument for it is small.
   kit's own form: beside the phrase's words, or after a security key's
   credential is made.
 - **The screens** [built, plan 8.24 part 2]: one activity of plain views
-  over the Binder interface, each operation off the main thread with its
+  over `IVosPersonal`, each operation off the main thread with its
   prompts lent and released when it returns or the screen gives it up.
   A home is entered as its code (`VOSHOME1:` and hex: the home as a device
   reaches it, which its operator publishes); a restore takes the home's

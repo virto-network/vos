@@ -492,8 +492,9 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   in one space) in `node/host/tests/served/moving.rs`.
 
 ### 8.24b The `:vos` process and its Binder interface — F
-- The facility in `android:process=":vos"` [E21]; one Binder interface
-  carrying its named operations, typed results and errors, nothing
+- The facility in `android:process=":vos"` [E21]; Binder interfaces
+  (s4's `IVosNode`, the facility's own `IVosPersonal`) carrying its named
+  operations, typed results and errors, nothing
   generic; prompts and their keystore operations in the UI process,
   results handed to `:vos`; the SSH socketpair as a `ParcelFileDescriptor`;
   the background job in `:vos`.
