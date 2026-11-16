@@ -474,9 +474,9 @@ impl FieldExpOps for Live {
 }
 
 #[cfg(feature = "prover")]
-mod families;
-#[cfg(feature = "prover")]
 mod fill;
+#[cfg(feature = "prover")]
+mod pin;
 
 #[cfg(all(test, feature = "prover"))]
 mod tests {

@@ -64,3 +64,5 @@ impl BuiltInComponent for DataWordTableChip {
 
 #[cfg(feature = "prover")]
 mod fill;
+#[cfg(feature = "prover")]
+mod pin;

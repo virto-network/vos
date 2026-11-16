@@ -25,10 +25,10 @@ visibility outside the parent depends on where an item sits:
 
 | parent | its prover half |
 |---|---|
-| a chip, `src/chips/<chip>.rs` or `<chip>/mod.rs`: columns, `BuiltInComponent::add_constraints` | `src/chips/<chip>/fill.rs`: `impl BuiltInProverComponent`, the helpers and constants only it reads |
+| a chip, `src/chips/<chip>.rs` or `<chip>/mod.rs`: columns, `BuiltInComponent::add_constraints` | `src/chips/<chip>/fill.rs`: `impl BuiltInProverComponent`, the helpers and constants only it reads; for a chip whose preprocessed columns read the program, `<chip>/pin.rs`: those columns |
 | `src/chips/blake2b/address.rs` | `address/trace.rs` |
-| `src/chips/cpu/cut.rs`: `CpuColumns`, `ProgramCpuChip`'s AIR | `cut/families.rs` (the columns a code keeps), `cut/fill.rs` (the cut trace) |
-| `src/device.rs`: the device chip set, its order | `device/code.rs` (`device_chips_of_code`), `device/run.rs` (`DeviceLayout`, `DeviceRun`) |
+| `src/chips/cpu/cut.rs`: `CpuColumns`, `ProgramCpuChip`'s AIR | `cut/pin.rs` (the columns a code keeps), `cut/fill.rs` (the cut trace) |
+| `src/device.rs`: the device chip set, its order | `device/pin.rs` (`device_chips_of_code`), `device/run.rs` (`DeviceLayout`, `DeviceRun`) |
 | `src/page_merkle.rs`: the page-hash constants and chaining | `page_merkle/host.rs`: the host's tree, roots and multiproofs |
 | `src/core/step.rs`, `src/memory_layout.rs`, `src/sparse_memory.rs` | `step/trace.rs`, `memory_layout/host.rs`, `sparse_memory/host.rs` |
 | `src/framework/traits/{builtin,erased}.rs`: the verifier's chip traits | `builtin/prover.rs`, `erased/prover.rs`: `BuiltInProverComponent`, `MachineProverComponent` |
@@ -68,10 +68,10 @@ pin (`KernelEntry::of` derives a kernel's entry state from its blob,
 `KernelProgram::id` its id, both run by `verify_kernel_chain` and the
 leaf). Read it as trusted:
 
-- `src/chips/cpu/cut/families.rs`: `FAMILIES`, `CpuColumns::always`,
+- `src/chips/cpu/cut/pin.rs`: `FAMILIES`, `CpuColumns::always`,
   `CpuColumns::of_code`: which CPU columns a device program keeps, hence
   which of the CPU's constraints its verifier drops.
-- `src/device/code.rs`: `device_chips_of_code`, a device program's chip set,
+- `src/device/pin.rs`: `device_chips_of_code`, a device program's chip set,
   with `src/prove/active.rs`: `opcode_component_mask`, the chips an opcode
   activates.
 - `src/prove/preprocessed.rs`: `preprocessed_root`, the root of a chip
@@ -79,13 +79,15 @@ leaf). Read it as trusted:
   `MachineProverComponent::generate_preprocessed_trace`
   (`src/framework/traits/erased/prover.rs`).
 - `BuiltInProverComponent::generate_preprocessed_trace`, a method of the
-  fill trait, in each chip's `fill.rs`; every one feeds the preprocessed
-  root a verifier holds. Six read the program:
-  `src/chips/program_memory/fill.rs` (the code table every step is bound
-  to), `jump_table/fill.rs`, `memory_page/fill.rs` (the regions and their
-  permissions), `device_boundary/fill.rs` (`DeviceBoundaryChip`'s entry),
-  `word_memory/data/fill.rs` (the program's data) and
-  `word_memory/boundary/fill.rs`. The others are fixed tables:
+  fill trait; every one feeds the preprocessed root a verifier holds. Six
+  read the program, each in its chip's `pin.rs` (`preprocessed_trace`,
+  which the fill trait's method calls), beside the helpers they share
+  with the fill: `src/chips/program_memory/pin.rs` (the code table every
+  step is bound to), `jump_table/pin.rs`, `memory_page/pin.rs` (the
+  regions and their permissions), `device_boundary/pin.rs`
+  (`DeviceBoundaryChip`'s entry), `word_memory/data/pin.rs` (the program's
+  data) and `word_memory/boundary/pin.rs`. The others are fixed tables,
+  their columns in their `fill.rs`:
   `bitwise_lookup`, `bitwise_and_byte`, `byte_to_bits`, `popcount`,
   `bitcount`, `power_of_two`, `range_multiplicity`, `blake2b`,
   `blake2b/boundary`, `word_memory` and `device_boundary` (`DeviceIoChip`).

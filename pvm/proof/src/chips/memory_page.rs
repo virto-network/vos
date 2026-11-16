@@ -420,3 +420,5 @@ impl BuiltInComponent for MemoryPageChip {
 
 #[cfg(feature = "prover")]
 mod fill;
+#[cfg(feature = "prover")]
+mod pin;

@@ -103,3 +103,5 @@ impl BuiltInComponent for JumpTableChip {
 
 #[cfg(feature = "prover")]
 mod fill;
+#[cfg(feature = "prover")]
+mod pin;

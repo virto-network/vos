@@ -1,4 +1,5 @@
-//! The chip set a device program's code selects, the prover's half.
+//! The chip set a device program's code selects: pin code, computed from
+//! the code alone.
 
 use super::*;
 

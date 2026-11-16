@@ -190,10 +190,10 @@ pub mod region {
 pub const WORD_BYTES: usize = crate::lookups::MEMORY_WORD_SIZE;
 
 #[cfg(feature = "prover")]
-mod code;
+mod pin;
 #[cfg(feature = "prover")]
 mod run;
 #[cfg(feature = "prover")]
-pub use code::device_chips_of_code;
+pub use pin::device_chips_of_code;
 #[cfg(feature = "prover")]
 pub use run::{DeviceLayout, DeviceRun, TouchedWord};

@@ -21,21 +21,7 @@ impl BuiltInProverComponent for DeviceBoundaryChip {
     const IS_PRODUCER: bool = false;
 
     fn generate_preprocessed_trace(&self, log_size: u32, side_note: &SideNote) -> FinalizedTrace {
-        let entry = crate::chips::device_run(side_note).layout.registers;
-        let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
-        for (row, &value) in entry.iter().enumerate() {
-            trace.fill_columns(row, true, PreprocessedColumn::IsRegister);
-            trace.fill_columns(
-                row,
-                BaseField::from(row as u32),
-                PreprocessedColumn::Register,
-            );
-            trace.fill_columns(row, value, PreprocessedColumn::InitialValue);
-            trace.fill_columns(row, IO_REGISTERS.contains(&row), PreprocessedColumn::IsIo);
-            trace.fill_columns(row, row == 0, PreprocessedColumn::IsFirst);
-            trace.fill_columns(row, row + 1 < NUM_REGS, PreprocessedColumn::IsChained);
-        }
-        trace.finalize_bit_reversed()
+        self.preprocessed_trace(log_size, side_note)
     }
 
     fn generate_main_trace_immut_min(

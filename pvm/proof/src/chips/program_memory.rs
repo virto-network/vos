@@ -221,4 +221,6 @@ impl BuiltInComponent for ProgramMemoryChip {
 #[cfg(feature = "prover")]
 mod fill;
 #[cfg(feature = "prover")]
-pub(crate) use fill::pack_flags;
+mod pin;
+#[cfg(feature = "prover")]
+pub(crate) use pin::pack_flags;
