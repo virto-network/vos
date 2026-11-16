@@ -1334,7 +1334,9 @@ where the rules above leave a choice, this is the one taken]:
   whichever is later. A device whose removal matures, or which is dropped
   with its void candidate, is **silenced**: its open operations (a
   matured add its commit never carried included) are cancelled and its
-  vetoes lifted.
+  vetoes lifted, as of its removal, by the calls that settle it: an
+  `operations` read shows what the agent stores, so a device wakes the
+  agent before it acts on one (a lifted contest has nothing to resolve).
 - **Contests:** a removal aimed at an open removal of its signer by one
   of its targets, a regroup on either side, is one contest with it.
 - **The two-device rules** need two seasoned devices with **strong**
