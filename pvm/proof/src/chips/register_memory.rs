@@ -107,15 +107,6 @@ pub enum Column {
 #[preprocessed_prefix = "regmem"]
 pub enum PreprocessedColumn {}
 
-/// A single register-level ledger entry.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RegEntry {
-    pub reg_addr: u8,
-    pub value: u64,
-    pub timestamp: u64,
-    pub is_write: bool,
-}
-
 impl BuiltInComponent for RegisterMemoryChip {
     const LOGUP: Logup = Logup::Single;
     type PreprocessedColumn = PreprocessedColumn;
@@ -273,4 +264,4 @@ const _: [(); (NUM_REGS <= u8::MAX as usize) as usize - 1] = [];
 #[cfg(feature = "prover")]
 mod fill;
 #[cfg(feature = "prover")]
-pub use fill::build_entries_from_side_note;
+pub use fill::{RegEntry, build_entries_from_side_note};

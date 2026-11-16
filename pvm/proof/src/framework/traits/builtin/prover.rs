@@ -1,3 +1,5 @@
+//! The chips' prover trait, `BuiltInProverComponent`: a chip's traces.
+
 use super::*;
 use crate::trace::{builder::FinalizedTrace, component::ComponentTrace};
 use crate::{lookups::AllLookupElements, side_note::SideNote};

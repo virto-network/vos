@@ -304,9 +304,10 @@ impl MerkleChannel for P2MerkleChannel {
 
 // ── The prover's backends: `BackendForChannel<P2MerkleChannel>` ─────────
 //
-// `CpuBackend` takes the channel by a marker. Production proves on `SimdBackend` (vectorized FRI / quotients / twiddles),
-// and so does the Poseidon2-M31 stack: `simd_backend` hashes leaves and nodes
-// and grinds sixteen permutations at once ([`packed`]). Its roots and nonces
-// equal `CpuBackend`'s.
+// `CpuBackend` takes the channel by a marker. Production proves on
+// `SimdBackend` (vectorized FRI / quotients / twiddles), and so does the
+// Poseidon2-M31 stack: `simd_backend` hashes leaves and nodes and grinds
+// sixteen permutations at once ([`packed`]). Its roots and nonces equal
+// `CpuBackend`'s.
 #[cfg(feature = "prover")]
 mod simd_backend;

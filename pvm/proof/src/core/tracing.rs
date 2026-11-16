@@ -636,7 +636,6 @@ pub(crate) fn decode_mem_access(
     }
 }
 
-/// Decode register indices from decoded instruction arguments.
 /// The register write a step records: the register its opcode writes when
 /// it executed, even if it wrote the value the register held (the proof
 /// fixes each instruction's write), and otherwise what it changed, if
@@ -667,6 +666,7 @@ pub(crate) fn recorded_write(
     Ok(destination)
 }
 
+/// Decode register indices from decoded instruction arguments.
 pub(crate) fn decode_reg_indices(
     _opcode: Opcode,
     decoded_args: &args::Args,

@@ -13,7 +13,7 @@ pub fn all_components() -> &'static [&'static dyn framework::MachineProverCompon
 }
 
 /// The shared chip set's chip at `index` as a device shape holds it, as a
-/// prover component ([`visit_device_chip`]'s).
+/// prover component ([`visit_device_chip`](crate::visit_device_chip)'s).
 pub(crate) fn device_component(index: usize) -> &'static dyn framework::MachineProverComponent {
     use device::device_chip;
     match index {

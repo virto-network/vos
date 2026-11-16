@@ -1,3 +1,6 @@
+//! The dyn-safe prover trait, `MachineProverComponent`, and its blanket impl
+//! over every `BuiltInProverComponent`.
+
 use super::super::builtin::BuiltInProverComponent;
 use super::*;
 use crate::side_note::SideNote;

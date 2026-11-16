@@ -3,6 +3,29 @@
 use super::*;
 use vos_pvm::instruction::Opcode;
 
+/// A memory access record.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemAccess {
+    pub address: u32,
+    pub value: u64,
+    pub size: u8,
+}
+
+/// The one register write a step performed: file index + written value.
+/// A PVM instruction writes at most one register (every interpreter opcode
+/// arm is a single `registers[x] = …` assignment), so this pair is the
+/// entire register-file delta of a step — `None` when the step wrote no
+/// register. An executed instruction that writes one records the write even
+/// when it wrote the value already held (the proof fixes each instruction's
+/// write); a conditional move that does not move records none.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RegWrite {
+    pub index: u8,
+    pub value: u64,
+}
+
+// Prover builds carry the vos_pvm reference interpreter; assert at compile time
+// that our local protocol constant agrees with it so the two can never drift.
 const _: () = assert!(PVM_REGISTER_COUNT == vos_pvm::PVM_REGISTER_COUNT);
 
 /// A single PVM execution step witness, capturing the full state transition.

@@ -211,7 +211,7 @@ impl BuiltInComponent for Blake2bChip {
 #[cfg(feature = "prover")]
 mod fill;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "prover"))]
 mod tests {
     use super::consts::IV;
     use super::sw::g_func;

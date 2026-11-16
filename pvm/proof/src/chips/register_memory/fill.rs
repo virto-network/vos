@@ -16,6 +16,15 @@ use stwo::{
     },
 };
 
+/// A single register-level ledger entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegEntry {
+    pub reg_addr: u8,
+    pub value: u64,
+    pub timestamp: u64,
+    pub is_write: bool,
+}
+
 impl BuiltInProverComponent for RegisterMemoryChip {
     const IS_PRODUCER: bool = false;
 

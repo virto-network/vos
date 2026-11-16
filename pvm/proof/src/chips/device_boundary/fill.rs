@@ -1,4 +1,4 @@
-//! The chip's trace generation, the prover's half.
+//! The two chips' trace generation, the prover's half.
 
 use super::*;
 use crate::core::step::NUM_REGS;

@@ -1,4 +1,4 @@
-//! The chip's trace generation, the prover's half.
+//! A tuple's width in limbs, which the trace fill reads.
 
 use super::*;
 
