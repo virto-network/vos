@@ -254,8 +254,13 @@ jar-check:
 # from the fixed path: some depend on crates outside their workspace. The
 # stamp it leaves (`.built`, as `build-programs`') is what the testkit
 # holds the sources to: a test refuses guests older than their sources.
+# The testkit reads the workspace's sources with `cargo metadata
+# --offline`, which needs every platform's dependencies in the cache, not
+# only the guest target's that the build downloads: both recipes fetch
+# them before they stamp.
 build-test-actors:
     just _at-fixed-path agent/test-actors --release --target ../../pvm/guest/riscv64em-vos.json
+    cd agent/test-actors; cargo fetch --locked
     touch agent/test-actors/target/riscv64em-vos/release/.built
 
 # The agent's guest programs (`programs.toml`), each built alone in the
@@ -263,6 +268,7 @@ build-test-actors:
 # `pvm/guest`.
 build-programs:
     for program in (open programs.toml | get program) { just build-program $program.name }
+    cd agent/programs; cargo fetch --locked
     touch agent/programs/target/riscv64em-vos/release/.built
 
 # One of the agent's guest programs, alone, from the fixed path
