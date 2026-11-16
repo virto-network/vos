@@ -79,7 +79,7 @@ pub const PREIMAGE_TIMEOUT: Duration = Duration::from_secs(180);
 const METADATA: ServiceMetadata<'static> = ServiceMetadata {
     name: "vos-statements",
     version: env!("CARGO_PKG_VERSION"),
-    license: "Apache-2.0",
+    license: "AGPL-3.0-or-later",
     authors: &["VOS"],
 };
 
