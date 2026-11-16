@@ -3,8 +3,6 @@
 //! decomposition into [`ORDER_DELTA_BITS`] bits.
 
 use num_traits::{One, Zero};
-#[cfg(feature = "prover")]
-use stwo::core::fields::m31::BaseField;
 use stwo_constraint_framework::EvalAtRow;
 
 /// Ordering deltas must fit below this bit width. Twenty-eight bits cover
@@ -27,15 +25,7 @@ pub(crate) fn recompose<E: EvalAtRow>(eval: &mut E, bits: &[E::F], two: E::F) ->
     recomposed
 }
 
-/// The bits of `ledger`'s ordering delta `delta`.
-///
-/// # Panics
-/// When `delta` does not fit [`ORDER_DELTA_BITS`]: no proof binds it.
 #[cfg(feature = "prover")]
-pub(crate) fn bits(ledger: &str, delta: u64) -> [BaseField; ORDER_DELTA_BITS] {
-    assert!(
-        delta < 1 << ORDER_DELTA_BITS,
-        "{ledger} ordering delta {delta} exceeds the {ORDER_DELTA_BITS}-bit proof bound"
-    );
-    core::array::from_fn(|bit| BaseField::from(((delta >> bit) & 1) as u32))
-}
+mod fill;
+#[cfg(feature = "prover")]
+pub(crate) use fill::bits;

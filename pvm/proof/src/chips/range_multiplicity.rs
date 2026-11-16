@@ -1,28 +1,9 @@
 use stwo::core::fields::m31::BaseField;
-#[cfg(feature = "prover")]
-use stwo::{
-    core::{ColumnVec, fields::qm31::SecureField},
-    prover::{
-        backend::simd::SimdBackend,
-        poly::{BitReversedOrder, circle::CircleEvaluation},
-    },
-};
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
 use crate::trace::eval::TraceEval;
-#[cfg(feature = "prover")]
-use crate::trace::{
-    builder::{FinalizedTrace, TraceBuilder},
-    component::ComponentTrace,
-};
 
-#[cfg(feature = "prover")]
-use crate::framework::BuiltInProverComponent;
-#[cfg(feature = "prover")]
-use crate::lookups::{AllLookupElements, LogupTraceBuilder};
-#[cfg(feature = "prover")]
-use crate::side_note::SideNote;
 use crate::{
     framework::{BuiltInComponent, Logup},
     lookups::Range256LookupElements,
@@ -77,71 +58,4 @@ impl BuiltInComponent for RangeMultiplicity256 {
 }
 
 #[cfg(feature = "prover")]
-impl BuiltInProverComponent for RangeMultiplicity256 {
-    const IS_PRODUCER: bool = false;
-
-    fn generate_preprocessed_trace(&self, log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
-        let log_size = super::table_log_size(RANGE_LOG_SIZE, log_size);
-        let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
-        let num_rows = trace.num_rows();
-
-        for row in 0..num_rows {
-            trace.fill_columns(row, (row % 256) as u8, PreprocessedColumn::Value);
-        }
-
-        trace.finalize_bit_reversed()
-    }
-
-    fn generate_main_trace_immut_min(
-        &self,
-        side_note: &SideNote,
-        min_log_size: u32,
-    ) -> FinalizedTrace {
-        let log_size = super::table_log_size(RANGE_LOG_SIZE, min_log_size);
-        let mut trace = TraceBuilder::<Column>::new(log_size);
-        let num_rows = trace.num_rows();
-
-        for row in 0..num_rows {
-            let mult = if row < 256 {
-                side_note.range256_counts[row]
-            } else {
-                0
-            };
-            trace.fill_columns(row, BaseField::from(mult), Column::Multiplicity);
-        }
-
-        trace.finalize_bit_reversed()
-    }
-
-    fn generate_interaction_trace(
-        &self,
-        component_trace: &ComponentTrace,
-        _side_note: &SideNote,
-        lookup_elements: &AllLookupElements,
-    ) -> (
-        ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
-        SecureField,
-    ) {
-        let log_size = component_trace.log_size();
-        let mut logup = LogupTraceBuilder::new(log_size);
-
-        let range256: &Range256LookupElements = lookup_elements.as_ref();
-        let value =
-            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::Value);
-        let mult = crate::trace::original_base_column!(component_trace, Column::Multiplicity);
-
-        // Negative contribution: this is the "receiver" side
-        logup.add_to_relation_with(
-            range256,
-            [mult[0].clone()],
-            |[m]| {
-                // Negate: the multiplicity chip provides the values, so it subtracts
-                let neg: stwo::prover::backend::simd::qm31::PackedSecureField = (-m).into();
-                neg
-            },
-            &[value[0].clone()],
-        );
-
-        logup.finalize()
-    }
-}
+mod fill;
