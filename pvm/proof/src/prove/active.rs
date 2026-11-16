@@ -1,7 +1,7 @@
 //! The chips a trace activates: which of the segment AIR's chips a run's
 //! steps, or an opcode, select, and the chip set as prover components.
 
-use crate::{BASE_COMPONENTS, chip_idx, chips, chips_of_mask, device, framework, side_note};
+use crate::{BASE_COMPONENTS, chip_idx, chips_of_mask, framework, side_note};
 
 /// Diagnostics: the full BASE_COMPONENTS slice (no activity filter).
 /// Returns ALL chips, in declaration order. Test harnesses use this
@@ -10,20 +10,6 @@ use crate::{BASE_COMPONENTS, chip_idx, chips, chips_of_mask, device, framework, 
 #[doc(hidden)]
 pub fn all_components() -> &'static [&'static dyn framework::MachineProverComponent] {
     BASE_COMPONENTS
-}
-
-/// The shared chip set's chip at `index` as a device shape holds it, as a
-/// prover component ([`visit_device_chip`](crate::visit_device_chip)'s).
-pub(crate) fn device_component(index: usize) -> &'static dyn framework::MachineProverComponent {
-    use device::device_chip;
-    match index {
-        device_chip::MEMORY => &chips::WordMemoryChip,
-        device_chip::DEVICE_MEMORY => &chips::DeviceWordMemoryChip,
-        device_chip::DATA_TABLE => &chips::DataWordTableChip,
-        device_chip::DEVICE_BOUNDARY => &chips::DeviceBoundaryChip,
-        device_chip::DEVICE_IO => &chips::DeviceIoChip,
-        _ => BASE_COMPONENTS[index],
-    }
 }
 
 /// Deterministic, side-note-driven filter on `BASE_COMPONENTS`.

@@ -119,10 +119,7 @@ impl<C: BuiltInComponent + 'static> FrameworkEval for MaskedChipEval<C> {
     }
 }
 
-#[cfg(feature = "prover")]
-type Boxed = Box<dyn stwo::prover::ComponentProver<stwo::prover::backend::simd::SimdBackend>>;
-#[cfg(not(feature = "prover"))]
-type Boxed = Box<dyn Component>;
+type Boxed = Box<crate::DynComponent>;
 
 /// DeviceIoChip's position among `active`'s chips, a device mask's.
 pub fn device_io_position(active: u32) -> Option<usize> {
@@ -312,10 +309,7 @@ impl MaskedComponents for DeviceComponents {
             .into_iter()
             .zip(&self.log_sizes)
             .flat_map(|(chip, &log_size)| {
-                MachineComponent::preprocessed_trace_sizes(
-                    crate::device_machine_component(chip),
-                    log_size,
-                )
+                MachineComponent::preprocessed_trace_sizes(crate::device_component(chip), log_size)
             })
             .collect()
     }

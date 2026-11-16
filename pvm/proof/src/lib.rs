@@ -229,11 +229,7 @@ macro_rules! chips {
                 $(&& chip_idx::$index == vos_wire::records::segment_chip::$index)*
         );
 
-        #[cfg(feature = "prover")]
-        const BASE_COMPONENTS: &[&dyn framework::MachineProverComponent] = &[$(&$chip),*];
-
-        #[cfg(not(feature = "prover"))]
-        const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[$(&$chip),*];
+        const BASE_COMPONENTS: &[&DynChip] = &[$(&$chip),*];
 
         /// Calls `visitor` with the chip at `index`.
         ///
@@ -253,6 +249,21 @@ macro_rules! chips {
     };
     (@index $n:expr;) => {};
 }
+
+/// A chip as the chip tables hold it: the verifier's trait object, or under
+/// `prover` the prover's, which verification upcasts.
+#[cfg(feature = "prover")]
+pub(crate) type DynChip = dyn framework::MachineProverComponent;
+#[cfg(not(feature = "prover"))]
+pub(crate) type DynChip = dyn framework::MachineComponent;
+
+/// A chip as Stwo's components the masked set holds: the verifier's
+/// `Component`, or under `prover` the prover's, which verification upcasts.
+#[cfg(feature = "prover")]
+pub(crate) type DynComponent =
+    dyn stwo::prover::ComponentProver<stwo::prover::backend::simd::SimdBackend>;
+#[cfg(not(feature = "prover"))]
+pub(crate) type DynComponent = dyn stwo::core::air::Component;
 
 /// What [`visit_chip`] does with a chip, generic over its type.
 pub(crate) trait ChipVisitor {
@@ -325,37 +336,42 @@ chips! {
     BITWISE_AND_BYTE = chips::BitwiseAndByteChip,
 }
 
-/// Calls `visitor` with the shared chip set's chip at `index` as a device
-/// shape holds it (`device::device_chip`): the device's chips past
-/// [`chip_idx::COUNT`], the word ledger's at MEMORY, the segment AIR's
-/// otherwise.
-///
-/// # Panics
-/// When `index` is no chip's.
-pub(crate) fn visit_device_chip<V: ChipVisitor>(index: usize, visitor: V) -> V::Output {
-    use device::device_chip;
-    match index {
-        device_chip::MEMORY => visitor.visit(&chips::WordMemoryChip),
-        device_chip::DEVICE_MEMORY => visitor.visit(&chips::DeviceWordMemoryChip),
-        device_chip::DATA_TABLE => visitor.visit(&chips::DataWordTableChip),
-        device_chip::DEVICE_BOUNDARY => visitor.visit(&chips::DeviceBoundaryChip),
-        device_chip::DEVICE_IO => visitor.visit(&chips::DeviceIoChip),
-        _ => visit_chip(index, visitor),
-    }
+/// The device's own chips over the shared chip set's indices
+/// (`device::device_chip`), once: the dispatch from an index to a chip's
+/// type (`visit_device_chip`) and the component the prover and the
+/// verifier walk (`device_component`), the segment AIR's chip at every
+/// other index.
+macro_rules! device_chips {
+    ($($index:ident = $chip:path,)*) => {
+        /// Calls `visitor` with the shared chip set's chip at `index` as a
+        /// device shape holds it.
+        ///
+        /// # Panics
+        /// When `index` is no chip's.
+        pub(crate) fn visit_device_chip<V: ChipVisitor>(index: usize, visitor: V) -> V::Output {
+            match index {
+                $(device::device_chip::$index => visitor.visit(&$chip),)*
+                _ => visit_chip(index, visitor),
+            }
+        }
+
+        /// The shared chip set's chip at `index` as a device shape holds it.
+        pub(crate) fn device_component(index: usize) -> &'static DynChip {
+            match index {
+                $(device::device_chip::$index => &$chip,)*
+                _ => BASE_COMPONENTS[index],
+            }
+        }
+    };
 }
 
-/// The shared chip set's chip at `index` as a device shape holds it, as a
-/// verifier component ([`visit_device_chip`]'s).
-pub(crate) fn device_machine_component(index: usize) -> &'static dyn framework::MachineComponent {
-    use device::device_chip;
-    match index {
-        device_chip::MEMORY => &chips::WordMemoryChip,
-        device_chip::DEVICE_MEMORY => &chips::DeviceWordMemoryChip,
-        device_chip::DATA_TABLE => &chips::DataWordTableChip,
-        device_chip::DEVICE_BOUNDARY => &chips::DeviceBoundaryChip,
-        device_chip::DEVICE_IO => &chips::DeviceIoChip,
-        _ => BASE_COMPONENTS[index],
-    }
+device_chips! {
+    // The word ledger, in the byte ledger's place.
+    MEMORY = chips::WordMemoryChip,
+    DEVICE_MEMORY = chips::DeviceWordMemoryChip,
+    DATA_TABLE = chips::DataWordTableChip,
+    DEVICE_BOUNDARY = chips::DeviceBoundaryChip,
+    DEVICE_IO = chips::DeviceIoChip,
 }
 
 /// The chips `mask` selects, by index, in chip order: bit i is chip i.
@@ -367,13 +383,13 @@ pub use format::Format;
 pub use pcs::{Commitment, StarkProofAny};
 pub use proof::{Proof, SegmentState};
 // The chips a trace activates (`prove/active.rs`).
+#[cfg(feature = "prover")]
+pub(crate) use prove::active::active_components_verifier;
 #[doc(hidden)]
 #[cfg(feature = "prover")]
 pub use prove::active::{
     active_component_mask, active_components, all_components, opcode_component_mask,
 };
-#[cfg(feature = "prover")]
-pub(crate) use prove::active::{active_components_verifier, device_component};
 #[doc(hidden)]
 #[cfg(feature = "prover")]
 pub use prove::prove_with_boundary_override;

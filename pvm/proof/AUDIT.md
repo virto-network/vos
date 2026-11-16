@@ -40,11 +40,12 @@ Whole modules behind `prover`: `side_note`, `kernel`, `prove`, `verify`
 (which takes a `SideNote`; the side-note-free verifier is
 `vos-pvm-proof-verifier`), `segment`'s bounds, cursor and windows, the tracer
 (`core/tracing.rs`), the trace builders and the CPU's `classify`,
-`reg_access`, `trace_fill/` and `interaction/`. Two items have a twin per
-configuration, the same chips in the same order: `BASE_COMPONENTS`
-(`src/lib.rs`, in `chips!`) and `Boxed` (`src/masked/mod.rs`), each the
-verifier's trait object without `prover` and the prover's with it, which
-verification upcasts.
+`reg_access`, `trace_fill/` and `interaction/`. Two type aliases have a
+twin per configuration, side by side in `src/lib.rs`: `DynChip`, the chip
+tables' trait object, and `DynComponent`, Stwo's component the masked set
+holds; each is the verifier's trait without `prover` and the prover's
+subtrait with it, which verification upcasts. The tables themselves are
+written once.
 
 **The `prover` feature is not the trust boundary.** No production binary
 builds the verifier-only configuration: `vos-node` and `vos-light` link
@@ -115,8 +116,9 @@ and `src/masked/trace.rs`.
 ### The chip sets
 
 Each chip's check code is its parent file (or directory, its prover
-modules aside); `src/lib.rs` (`chips!`) is the node's table, `src/device.rs`
-(`DEVICE_ORDER`, `device_chip`) the device's.
+modules aside); `src/lib.rs` holds both tables, the node's (`chips!`) and
+the device's own chips over it (`device_chips!`), and `src/device.rs`
+(`DEVICE_ORDER`, `device_chip`) the device set's order and indices.
 
 | chips | node segment (41) | device (47) |
 |---|---|---|
