@@ -102,28 +102,6 @@
 // lints crate-wide when prover is off; on the default build the lints
 // remain active and catch genuine dead code.
 #![cfg_attr(not(feature = "prover"), allow(dead_code, unused_imports))]
-// Stylistic lints carried over from the Nexus port — fixing them
-// touches a wide swath of generated chip code and would obscure the
-// upstream diff. Allowed crate-wide so the workspace's `-D warnings`
-// gate doesn't reject the verbatim port. Correctness-relevant lints
-// (e.g. `unsound_*`, `correctness::*`) remain active.
-#![allow(
-    clippy::needless_range_loop,
-    clippy::needless_lifetimes,
-    clippy::uninlined_format_args,
-    clippy::manual_div_ceil,
-    clippy::nonminimal_bool,
-    clippy::no_effect,
-    clippy::manual_range_patterns,
-    clippy::derivable_impls,
-    clippy::field_reassign_with_default,
-    clippy::new_without_default,
-    clippy::unnecessary_cast,
-    clippy::duplicated_attributes,
-    clippy::doc_overindented_list_items,
-    clippy::identity_op
-)]
-
 extern crate alloc;
 
 /// The `alloc` items the chips use, in scope with `std` or without.

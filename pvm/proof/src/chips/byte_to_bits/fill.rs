@@ -22,6 +22,7 @@ const BYTE_TO_BITS_LOG_SIZE: u32 = 8; // 2^8 = 256 rows
 impl BuiltInProverComponent for ByteToBitsChip {
     const IS_PRODUCER: bool = false;
 
+    #[allow(clippy::identity_op, reason = "bit 0 written as the others are")]
     fn generate_preprocessed_trace(&self, log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
         let log_size = super::super::table_log_size(BYTE_TO_BITS_LOG_SIZE, log_size);
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);

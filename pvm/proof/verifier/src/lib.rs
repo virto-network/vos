@@ -9,6 +9,12 @@
 //! [`verify_kernel_segment`] and [`verify_kernel_chain`] add a kernel's
 //! shape and entry, its program id's preimage.
 //!
+//! **No production build links this crate.** It is the reference the
+//! leaf is tested against and the compile check of `vos-pvm-proof`'s
+//! verifier-only configuration (`just check-no-std`); nodes and venues
+//! verify through the leaf, the wrap and the device verifier instead
+//! (`../AUDIT.md`).
+//!
 //! `no_std`: `vos-pvm-proof` without its `prover` feature pulls no `vos_pvm`
 //! and no rayon, and builds for `wasm32-unknown-unknown`.
 

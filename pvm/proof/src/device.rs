@@ -162,13 +162,10 @@ impl DeviceShape {
     }
 }
 
-/// The pc a halted run ends at: φ0's at entry, the standard layout's halt
-/// address, the low four bytes of `vos_pvm_program::HALT_ADDRESS`.
-pub const HALT_PC: u32 = vos_pvm_program::HALT_ADDRESS as u32;
-
-/// The pc and the timestamp a run's first step takes.
+/// The pc a run's first step takes; its timestamp is a kernel's
+/// ([`ENTRY_TIMESTAMP`]), its halt pc too ([`HALT_PC`]).
 pub const ENTRY_PC: u32 = 0;
-pub const ENTRY_TIMESTAMP: u64 = 1;
+pub use crate::program_id::{ENTRY_TIMESTAMP, HALT_PC};
 
 /// A device layout's regions, by index: the read-only data, the argument
 /// window, the read-write data, the heap and the stack.

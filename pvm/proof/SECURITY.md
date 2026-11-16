@@ -46,6 +46,17 @@ reference shape, from the security tool (`src/security.rs`):
 - A verifier rejects a number the registry does not admit
   (`format::lookup`), and a proof on another channel than its format's. The proof's configuration must equal
   the format's, and its counts at its own shape must reach the floors.
+- **The proven count is the same on every target.** It is taken in `f64`
+  (`src/security.rs`) by IEEE 754's basic operations alone: addition,
+  subtraction, multiplication and division, each correctly rounded, so
+  bit-identical wherever Rust compiles them; comparisons; and conversions
+  from integers. `pow2` builds its power from the exponent's bits and
+  `log2` by squaring and halving, with no `libm` call, no square root
+  (`√ρ` is a power of two or one times `FRAC_1_SQRT_2`), no fused
+  multiply-add (Rust never contracts one) and no NaN on an admitted shape.
+  The targets the verifiers build for (x86-64, aarch64, `wasm32`, and
+  `thumbv7em` and the PVM guest, whose `f64` is software) all round so;
+  only an x87 FPU (an `i586` target) would not, and nothing builds for one.
 
 **End to end, the proven bound is the weakest inner format's: 62.81 bits,
 not the wrap's 82.6.** Forging a leaf's segment forges the statement. The

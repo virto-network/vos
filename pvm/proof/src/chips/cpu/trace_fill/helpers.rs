@@ -280,7 +280,7 @@ pub(super) fn helpers(
         || flags.is_br_gt_s;
     trace.fill_columns(
         row,
-        is_compare_b && eq_b || is_branch_b && eq_b,
+        (is_compare_b || is_branch_b) && eq_b,
         Column::IsCmpOrBranchEqH,
     );
     trace.fill_columns(row, is_branch_b && bt, Column::IsBranchTakenH);

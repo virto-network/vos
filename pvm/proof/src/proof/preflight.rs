@@ -181,8 +181,7 @@ where
     let coefficients_len = fri_proof.last_layer_poly.iter().count();
     if coefficients_len != expected_last_len {
         return Err(format!(
-            "FRI last-layer polynomial has {} coefficients, expected {expected_last_len}",
-            coefficients_len
+            "FRI last-layer polynomial has {coefficients_len} coefficients, expected {expected_last_len}"
         ));
     }
     if !proof_fields_are_canonical(proof, stark) {

@@ -78,7 +78,7 @@ pub(super) fn push_leaf_calls(page: &[u8; PAGE_SIZE], calls: &mut Vec<crate::chi
     let mut h = h_after_leaf_tag();
     for block in 0..32usize {
         let m = block_words(&page[block * BLOCK..block * BLOCK + BLOCK]);
-        let t = (128 * (block as u128 + 2)) as u128;
+        let t = 128 * (block as u128 + 2);
         let f = block == 31;
         calls.push(crate::chips::Blake2bCall { h, m, t, f });
         h = blake2b_compress(&h, &m, t, f);
@@ -94,7 +94,7 @@ pub fn leaf_block_outputs(page: &[u8; PAGE_SIZE]) -> Vec<[u8; 64]> {
     let mut outs = Vec::with_capacity(32);
     for block in 0..32usize {
         let m = block_words(&page[block * BLOCK..block * BLOCK + BLOCK]);
-        let t = (128 * (block as u128 + 2)) as u128;
+        let t = 128 * (block as u128 + 2);
         let f = block == 31;
         h = blake2b_compress(&h, &m, t, f);
         outs.push(state_to_bytes(&h));
