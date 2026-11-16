@@ -8,6 +8,7 @@ use crate::trace::{
     builder::{FinalizedTrace, TraceBuilder},
     component::ComponentTrace,
 };
+use stwo::core::fields::m31::BaseField;
 use stwo::{
     core::{ColumnVec, fields::qm31::SecureField},
     prover::{
@@ -15,6 +16,8 @@ use stwo::{
         poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
+
+const BITWISE_BYTE_LOG_SIZE: u32 = 16; // 2^16 = 256×256 rows
 
 impl BuiltInProverComponent for BitwiseAndByteChip {
     const IS_PRODUCER: bool = false;

@@ -16,7 +16,6 @@
 //! CpuChip's per-row charges).
 
 use crate::prelude::*;
-use stwo::core::fields::m31::BaseField;
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
@@ -29,8 +28,6 @@ use crate::{
 
 #[derive(Clone, Copy)]
 pub struct BitcountChip;
-
-const BITCOUNT_LOG_SIZE: u32 = 8; // 2^8 = 256 rows
 
 #[derive(Debug, Copy, Clone, AirColumn)]
 pub enum Column {

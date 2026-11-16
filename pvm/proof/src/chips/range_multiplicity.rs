@@ -1,4 +1,3 @@
-use stwo::core::fields::m31::BaseField;
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
@@ -13,8 +12,6 @@ use crate::{
 /// This is the "receiver" side of the range check lookup.
 #[derive(Clone, Copy)]
 pub struct RangeMultiplicity256;
-
-const RANGE_LOG_SIZE: u32 = 8; // 256 rows, one per byte value
 
 /// The table's entries are its preprocessed column, which the verifier
 /// commits; the main trace holds only their multiplicities.

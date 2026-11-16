@@ -8,11 +8,9 @@
 //! its rows name address 0, which lies in no region.
 
 use crate::prelude::*;
-use stwo::core::fields::m31::BaseField;
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
-use crate::device::WORD_BYTES;
 use crate::framework::{BuiltInComponent, Logup};
 use crate::lookups::DataWordLookupElements;
 use crate::trace::eval::TraceEval;

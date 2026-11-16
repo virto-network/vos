@@ -1,4 +1,5 @@
 use super::*;
+use alloc::collections::{BTreeMap, BTreeSet};
 
 fn hex_to_32(s: &str) -> [u8; 32] {
     let mut out = [0u8; 32];
@@ -405,7 +406,6 @@ fn boundary_calls_reproduce_all_multiproof_hashes() {
 /// deliberately unconstrained in the chip (the RangeMultiplicity256
 /// pattern); this cross-side sum is exactly what pins it in a proof.
 #[test]
-#[cfg(feature = "prover")]
 fn dedup_multiplicities_balance_in_fraction_space() {
     use crate::chips::Blake2bBoundaryChip;
     use crate::harness::MachineComponent;

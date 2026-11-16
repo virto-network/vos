@@ -1,4 +1,3 @@
-use stwo::core::fields::m31::BaseField;
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
@@ -16,8 +15,6 @@ use crate::{
 /// and produces 16 lookups per bitwise op (2 nibbles × 8 bytes).
 #[derive(Clone, Copy)]
 pub struct BitwiseLookupChip;
-
-const BITWISE_LOG_SIZE: u32 = 8; // 2^8 = 256 rows = 16×16
 
 /// The table's entries are its preprocessed columns, which the verifier
 /// commits; the main trace holds only their multiplicities.

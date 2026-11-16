@@ -1,4 +1,3 @@
-use stwo::core::fields::m31::BaseField;
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
@@ -19,8 +18,6 @@ use crate::{
 /// `side_note.bitwise_and_byte_counts` is keyed by.
 #[derive(Clone, Copy)]
 pub struct BitwiseAndByteChip;
-
-const BITWISE_BYTE_LOG_SIZE: u32 = 16; // 2^16 = 256×256 rows
 
 #[derive(Debug, Copy, Clone, AirColumn)]
 pub enum Column {

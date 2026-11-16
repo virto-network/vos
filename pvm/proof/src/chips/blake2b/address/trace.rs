@@ -1,6 +1,7 @@
 //! The address limbs' trace generation, the prover's half.
 
 use super::*;
+use crate::prelude::*;
 use crate::{
     lookups::LogupTraceBuilder,
     side_note::SideNote,

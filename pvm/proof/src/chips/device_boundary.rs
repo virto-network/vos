@@ -23,7 +23,7 @@ use stwo::core::fields::m31::BaseField;
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
-use crate::core::step::{NUM_REGS, WORD_SIZE};
+use crate::core::step::WORD_SIZE;
 use crate::device::{ENTRY_PC, ENTRY_TIMESTAMP, HALT_PC};
 use crate::framework::{BuiltInComponent, Logup};
 use crate::lookups::{

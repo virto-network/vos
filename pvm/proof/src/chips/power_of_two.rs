@@ -1,5 +1,4 @@
 use crate::prelude::*;
-use stwo::core::fields::m31::BaseField;
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
@@ -17,8 +16,6 @@ use crate::{
 /// This chip consumes them with negative multiplicity.
 #[derive(Clone, Copy)]
 pub struct PowerOfTwoChip;
-
-const POW2_LOG_SIZE: u32 = 6; // 2^6 = 64 rows
 
 /// The table's entries are its preprocessed columns, which the verifier
 /// commits; the main trace holds only their multiplicities.

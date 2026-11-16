@@ -5,6 +5,7 @@ use crate::framework::BuiltInProverComponent;
 use crate::lookups::AllLookupElements;
 use crate::side_note::SideNote;
 use crate::trace::{builder::FinalizedTrace, component::ComponentTrace};
+use stwo::core::fields::m31::BaseField;
 use stwo::{
     core::{ColumnVec, fields::qm31::SecureField},
     prover::{

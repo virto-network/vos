@@ -12,6 +12,7 @@ use compression::{
     add_compression_interaction_core, build_compression_rows, fill_compression_trace,
     fill_schedule_preprocessed,
 };
+use stwo::core::fields::m31::BaseField;
 use stwo::{
     core::{ColumnVec, fields::qm31::SecureField},
     prover::{

@@ -1,6 +1,7 @@
 //! The chip's trace generation, the prover's half.
 
 use super::*;
+use crate::device::WORD_BYTES;
 use crate::framework::BuiltInProverComponent;
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 use crate::side_note::SideNote;
@@ -8,6 +9,7 @@ use crate::trace::{
     builder::{FinalizedTrace, TraceBuilder},
     component::ComponentTrace,
 };
+use stwo::core::fields::m31::BaseField;
 use stwo::{
     core::{ColumnVec, fields::qm31::SecureField},
     prover::{

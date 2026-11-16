@@ -1,6 +1,7 @@
 //! The page tree built on the host: roots, multiproofs and the pages a segment touches, the prover's half.
 
 use super::*;
+use alloc::collections::{BTreeMap, BTreeSet};
 
 /// `default_hashes()[ℓ]` = root of an all-zero (absent) subtree at level `ℓ`;
 /// `[DEPTH]` is the empty leaf, `[0]` is the empty-tree root.

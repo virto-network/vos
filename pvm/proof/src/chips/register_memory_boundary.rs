@@ -4,7 +4,6 @@ use stwo::core::fields::m31::BaseField;
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
-use crate::core::step::NUM_REGS;
 use crate::trace::eval::TraceEval;
 
 use crate::{

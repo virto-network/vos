@@ -11,7 +11,6 @@
 
 use crate::prelude::*;
 use num_traits::{One, Zero};
-use stwo::core::fields::m31::BaseField;
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use crate::trace::eval::TraceEval;
@@ -31,6 +30,7 @@ mod columns;
 mod compression;
 mod consts;
 mod sw;
+#[cfg(feature = "prover")]
 mod trace;
 
 pub use boundary::{Blake2bBoundaryChip, BoundaryColumn};

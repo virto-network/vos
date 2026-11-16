@@ -13,7 +13,6 @@
 
 use crate::prelude::*;
 use num_traits::{One, Zero};
-use stwo::core::fields::m31::BaseField;
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};

@@ -14,7 +14,6 @@
 //! range that wraps as well). The limb relations hold on every row, so the
 //! writing row's addresses are pinned on that row, not only on the first.
 
-use crate::prelude::*;
 use stwo::core::fields::m31::BaseField;
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 

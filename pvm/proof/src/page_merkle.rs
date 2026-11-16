@@ -24,7 +24,6 @@
 //! all-zero leaf, which cannot collide with `leaf(page)` except with
 //! negligible probability.
 
-use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use vos_pvm_program::image::{LEAF_TAG, NODE_TAG};

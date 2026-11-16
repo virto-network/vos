@@ -8,6 +8,7 @@ use crate::trace::{
     builder::{FinalizedTrace, TraceBuilder},
     component::ComponentTrace,
 };
+use stwo::core::fields::m31::BaseField;
 use stwo::{
     core::{ColumnVec, fields::qm31::SecureField},
     prover::{
@@ -15,6 +16,8 @@ use stwo::{
         poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
+
+const RANGE_LOG_SIZE: u32 = 8; // 256 rows, one per byte value
 
 impl BuiltInProverComponent for RangeMultiplicity256 {
     const IS_PRODUCER: bool = false;

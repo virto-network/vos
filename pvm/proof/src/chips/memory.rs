@@ -134,38 +134,6 @@ pub enum Column {
 #[preprocessed_prefix = "mem"]
 pub enum PreprocessedColumn {}
 
-/// A single byte-level memory access entry.
-#[derive(Clone, Debug)]
-pub(crate) struct MemEntry {
-    pub(crate) address: u32,
-    pub(crate) value: u8,
-    pub(crate) timestamp: u64,
-    pub(crate) is_write: bool,
-}
-
-/// Decompose a multi-byte access into individual byte entries.
-fn decompose_access(
-    address: u32,
-    value: u64,
-    timestamp: u64,
-    is_write: bool,
-    size: u8,
-) -> Vec<MemEntry> {
-    let bytes = value.to_le_bytes();
-    (0..size as usize)
-        .map(|i| MemEntry {
-            // PVM memory is cyclic over 32-bit addresses. A successful wide
-            // access is decomposed with the same modulo-2^32 arithmetic as
-            // execution rather than relying on profile-dependent overflow
-            // checks or debug/release integer behavior.
-            address: address.wrapping_add(i as u32),
-            value: bytes[i],
-            timestamp,
-            is_write,
-        })
-        .collect()
-}
-
 impl BuiltInComponent for MemoryChip {
     const LOGUP: Logup = Logup::Single;
     type PreprocessedColumn = PreprocessedColumn;
@@ -379,22 +347,3 @@ impl BuiltInComponent for MemoryChip {
 mod fill;
 #[cfg(feature = "prover")]
 pub(crate) use fill::access_entries;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn wide_access_decomposition_wraps_in_u32_domain() {
-        let entries = decompose_access(u32::MAX - 2, 0x0807_0605_0403_0201, 7, false, 8);
-        let addresses: Vec<_> = entries.iter().map(|entry| entry.address).collect();
-        assert_eq!(
-            addresses,
-            [u32::MAX - 2, u32::MAX - 1, u32::MAX, 0, 1, 2, 3, 4]
-        );
-        assert_eq!(
-            entries.iter().map(|entry| entry.value).collect::<Vec<_>>(),
-            [1, 2, 3, 4, 5, 6, 7, 8]
-        );
-    }
-}

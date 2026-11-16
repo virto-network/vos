@@ -1,4 +1,3 @@
-use stwo::core::fields::m31::BaseField;
 use stwo_constraint_framework::EvalAtRow;
 
 use crate::trace::eval::TraceEval;

@@ -8,6 +8,7 @@ use crate::trace::{
     builder::{FinalizedTrace, TraceBuilder},
     component::ComponentTrace,
 };
+use stwo::core::fields::m31::BaseField;
 use stwo::{
     core::{ColumnVec, fields::qm31::SecureField},
     prover::{
@@ -15,6 +16,8 @@ use stwo::{
         poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
+
+const POPCOUNT_LOG_SIZE: u32 = 8; // 2^8 = 256 rows
 
 impl BuiltInProverComponent for PopcountChip {
     const IS_PRODUCER: bool = false;
