@@ -21,6 +21,15 @@ use vos_wire::personal::{
 
 use super::*;
 
+/// The cases each property runs: `PROPTEST_CASES`, as a longer run sets
+/// it, else 24.
+fn cases() -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|cases| cases.parse().ok())
+        .unwrap_or(24)
+}
+
 /// The open operations, read by `reader`.
 fn open(home: &Home, reader: Principal) -> Vec<(u64, Operation)> {
     home.query(reader, "operations", None::<u64>).unwrap()
@@ -437,7 +446,7 @@ fn play(owner: Owner, thefts: Vec<Theft>, notice: usize) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(24))]
+    #![proptest_config(ProptestConfig::with_cases(cases()))]
 
     /// A4, A14: a thief with the owner's device and its biometric, pairing
     /// devices and making any operation, against the owner's device and
@@ -489,7 +498,7 @@ fn sync_theft() -> impl Strategy<Value = Sync> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(24))]
+    #![proptest_config(ProptestConfig::with_cases(cases()))]
 
     /// A3, A4: the thief holds the owner's only device's sync key and
     /// calls as it likes; the kit alone removes the device after its delay
@@ -584,7 +593,7 @@ fn leak() -> impl Strategy<Value = Leak> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(24))]
+    #![proptest_config(ProptestConfig::with_cases(cases()))]
 
     /// D3: a leaked kit makes any of its operations, in any order, while
     /// the owner's two devices post `alive` and veto each, in either
