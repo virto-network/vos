@@ -8628,7 +8628,6 @@ dependencies = [
  "vos-http",
  "vos-net",
  "vos-node",
- "vos-pvm-precompiles",
  "vos-wire",
 ]
 

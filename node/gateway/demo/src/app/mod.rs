@@ -1,4 +1,5 @@
-//! The demo's three screens on the SSH port:
+//! The demo's s4 app on the gateway's SSH port
+//! ([`vos_gateway::ssh::App`]), its three screens
 //! *Enroll*, *Sign in* and *Pay*, server-owned s4 documents over the
 //! credential actor and the ledger, `Payments`, of one agent. *Sign in*
 //! offers the poll's `login`, proven by the stock `auth` kernel; *Pay* the
@@ -9,16 +10,18 @@
 //! and hands the screen the node's answer, which it shows; the screens
 //! relay nothing the device hands back. What the screen shows of that
 //! answer is the client's word: it grants nothing here, as the proven call
-//! itself is the action, at the node. The gateway builds no credential
-//! bytes and holds no authority; its app key sends only the claims an
-//! operator's invitations allow.
+//! itself is the action, at the node. The app builds no credential bytes;
+//! its key ([`AppClient`]) sends only the claims an operator's invitations
+//! allow.
 
 use std::sync::Arc;
 
 use s4_server::rui::{App, Cx, Effect, EffectOutput, EffectRequest, View, ViewContext, view};
-use s4_server::{HostServiceError, HostServiceRequest, Identifier, Value};
+use s4_server::{HostServiceError, HostServiceRequest, Identifier, Server, Value};
 use tokio::sync::{Mutex, OnceCell};
 use vos_api::{FRAME_ERROR, Kind, Mark};
+use vos_gateway::Gateway;
+use vos_gateway::ssh::APPLICATION;
 use vos_wire::abi::Failure;
 use vos_wire::credentials::{CredentialError, RootEntry};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Session, derive_id};
@@ -26,12 +29,11 @@ use vos_wire::ingress::{AgentInfo, CredentialRefusal, Rejection, Response};
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode, SpaceId};
 
-use crate::Gateway;
-use crate::app::AppClient;
-
+mod client;
 mod screens;
 mod service;
 
+pub use client::AppClient;
 pub use screens::{Message, Screen, Screens};
 pub use service::Service;
 
@@ -39,22 +41,40 @@ pub use service::Service;
 pub const SERVICE: &str = "vos.gateway";
 /// The client facility that proves.
 pub const FACILITY: &str = "vos.credential";
-/// The application identity the screens are served as.
-pub const APPLICATION: &str = "vos.gateway";
 
-/// The agent the demo serves and its actors' instances, from the gateway's
-/// file.
-#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+/// The agent the demo serves and its actors' instances.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Demo {
     pub agent: u32,
     pub credentials: u32,
     pub payments: u32,
     pub poll: u32,
-    /// The onion keys the enrollment pins: the gateway's own onion, from
-    /// its key file, never the file's `[demo]` section.
-    #[serde(skip)]
+    /// The onion keys the enrollment pins: the gateway's own onion.
     pub onions: Vec<[u8; 32]>,
+}
+
+/// The demo's screens as an SSH port serves them: on each port, its claims
+/// going as the app key's seed `key`, marked with the port's transport.
+pub struct DemoApp {
+    pub demo: Demo,
+    pub key: [u8; 32],
+}
+
+impl vos_gateway::ssh::App for DemoApp {
+    fn server(&self, gateway: &Arc<Gateway>, mark: Mark, host_key: Option<[u8; 32]>) -> Server {
+        let app = Arc::new(AppClient::new(self.key, Arc::clone(gateway), mark));
+        let service = Arc::new(Service::new(
+            self.demo.clone(),
+            host_key,
+            Arc::clone(gateway),
+            mark,
+            app,
+        ));
+        let demo = self.demo.clone();
+        Server::new(APPLICATION, move || Screens::new(demo.clone()))
+            .facility(FACILITY, 1)
+            .host_service_fn(SERVICE, move |request| Arc::clone(&service).serve(request))
+    }
 }
 
 /// The guarded methods the device is asked to pin, and the ledger's.

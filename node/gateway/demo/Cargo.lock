@@ -8357,6 +8357,7 @@ dependencies = [
  "tracing-subscriber",
  "vos-api",
  "vos-gateway",
+ "vos-kreivo",
  "vos-net",
  "vos-node",
  "vos-node-prover",
@@ -8431,7 +8432,6 @@ dependencies = [
  "vos-api",
  "vos-http",
  "vos-net",
- "vos-pvm-precompiles",
  "vos-wire",
 ]
 
@@ -8446,6 +8446,7 @@ dependencies = [
  "russh",
  "s4-credential-contract",
  "s4-protocol",
+ "s4-server",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
@@ -8459,6 +8460,7 @@ dependencies = [
  "vos-keeper",
  "vos-light",
  "vos-node",
+ "vos-pvm-precompiles",
  "vos-pvm-recair",
  "vos-testkit",
  "vos-wire",
@@ -8492,6 +8494,20 @@ dependencies = [
  "hex",
  "vos-node",
  "vos-wire",
+]
+
+[[package]]
+name = "vos-kreivo"
+version = "0.1.0"
+dependencies = [
+ "blake2 0.10.6",
+ "ed25519-dalek 2.2.0",
+ "parity-scale-codec",
+ "tracing",
+ "twox-hash",
+ "vos-anchor",
+ "vos-statement",
+ "vos-venue",
 ]
 
 [[package]]
@@ -8771,11 +8787,8 @@ dependencies = [
 name = "vos-venue"
 version = "0.1.0"
 dependencies = [
- "blake2 0.10.6",
  "ed25519-dalek 2.2.0",
- "parity-scale-codec",
  "tracing",
- "twox-hash",
  "vos-anchor",
  "vos-statement",
 ]

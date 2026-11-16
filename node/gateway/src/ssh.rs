@@ -1,8 +1,9 @@
 //! The SSH port: s4's screens and the `vos-api` subsystem, under any key as
 //! no one in particular (s4's anonymous policy: an identity for the
 //! connection alone, no resumable session, no remembered grant), a fresh
-//! ephemeral key expected. The screens are the demo's ([`crate::demo`]) when
-//! the file names its agent. The subsystem is a byte stream of the
+//! ephemeral key expected. The screens are an [`App`]'s: an application
+//! built on this library brings its own, and `vos-gateway` serves a
+//! placeholder ([`Placeholder`]). The subsystem is a byte stream of the
 //! node API's frames, with ids: the gateway reads each header, refuses a
 //! kind outside the relay set (`NotRelayed`) before reading its body or
 //! asking any node, checks its limit, then relays it to a node and writes
@@ -22,7 +23,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use s4_server::rui::{App, Cx, Id, View, ViewContext, view};
+use s4_server::rui::{Cx, Id, View, ViewContext, view};
 use s4_server::{Server, SubsystemChannel};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
@@ -34,6 +35,8 @@ use crate::limits::Limits;
 
 /// The subsystem's name.
 pub const SUBSYSTEM: &str = "vos-api";
+/// The application identity the screens are served as.
+pub const APPLICATION: &str = "vos.gateway";
 /// Requests in flight on one channel: past them, the gateway reads no
 /// further until one ends.
 pub const IN_FLIGHT: usize = 16;
@@ -88,10 +91,29 @@ impl s4_server::Listener for crate::circuits::OnionListener {
     }
 }
 
-/// The SSH port's screen when the file names no demo.
+/// What an SSH port serves as its screens: for the port marked `mark`,
+/// relaying through `gateway`, whose host key's Ed25519 half is
+/// `host_key` (what an onion's port 22 presents), the s4 server of an
+/// application's screens and host services. The port adds its host key,
+/// its limits, the anonymous policy and the `vos-api` subsystem. Asked
+/// once a port.
+pub trait App: Send + Sync {
+    fn server(&self, gateway: &Arc<Gateway>, mark: Mark, host_key: Option<[u8; 32]>) -> Server;
+}
+
+/// `vos-gateway`'s screens: one line saying what the port relays.
+pub struct Placeholder;
+
+impl App for Placeholder {
+    fn server(&self, _: &Arc<Gateway>, _: Mark, _: Option<[u8; 32]>) -> Server {
+        Server::new(APPLICATION, || Screen)
+    }
+}
+
+/// [`Placeholder`]'s screen.
 struct Screen;
 
-impl App for Screen {
+impl s4_server::rui::App for Screen {
     type Message = ();
 
     fn view(&self, _context: &ViewContext) -> View<()> {
@@ -107,37 +129,16 @@ impl App for Screen {
 }
 
 /// The SSH server, relaying through `gateway` as `port` counts and caps
-/// its channels, marked with its transport; with `demo`, its screens,
-/// whose claims go as the app's key.
+/// its channels, marked with its transport, serving `app`'s screens.
 pub fn server(
     host_key: russh::keys::PrivateKey,
     gateway: Arc<Gateway>,
     port: Port,
-    demo: Option<(crate::demo::Demo, Arc<crate::app::AppClient>)>,
+    app: &dyn App,
 ) -> Server {
     let mark = port.mark;
-    let server = match demo {
-        Some((demo, app)) => {
-            // An onion's port 22 presents this key; with no Ed25519 host
-            // key the enrollment pins no onion.
-            let ssh_host_key = host_key.public_key().key_data().ed25519().map(|key| key.0);
-            let service = Arc::new(crate::demo::Service::new(
-                demo.clone(),
-                ssh_host_key,
-                Arc::clone(&gateway),
-                mark,
-                app,
-            ));
-            Server::new(crate::demo::APPLICATION, move || {
-                crate::demo::Screens::new(demo.clone())
-            })
-            .facility(crate::demo::FACILITY, 1)
-            .host_service_fn(crate::demo::SERVICE, move |request| {
-                Arc::clone(&service).serve(request)
-            })
-        }
-        None => Server::new(crate::demo::APPLICATION, || Screen),
-    };
+    let ed25519 = host_key.public_key().key_data().ed25519().map(|key| key.0);
+    let server = app.server(&gateway, mark, ed25519);
     let limits = match mark {
         Mark::Onion => s4_server::ServerLimits {
             host_services: s4_server::HostServiceLimits {
@@ -173,13 +174,14 @@ pub fn server(
         })
 }
 
-/// The SSH port the file names, served on the runtime until it ends: its
-/// host key made if missing, counted and capped as `port`.
+/// The SSH port the file names, serving `app`'s screens on the runtime
+/// until it ends: its host key made if missing, counted and capped as
+/// `port`.
 pub async fn start(
     config: &crate::config::Config,
     gateway: Arc<Gateway>,
     port: Port,
-    app: Option<Arc<crate::app::AppClient>>,
+    app: &dyn App,
 ) -> Result<Option<tokio::task::JoinHandle<()>>, String> {
     let Some(address) = config.ssh else {
         return Ok(None);
@@ -190,14 +192,14 @@ pub async fn start(
     serve(config, gateway, port, app, listener).map(Some)
 }
 
-/// The SSH server the file names on `listener`, its host key made if
-/// missing, counted and capped as `port`, served on the runtime until it
-/// ends.
+/// The SSH server the file names on `listener`, serving `app`'s screens,
+/// its host key made if missing, counted and capped as `port`, served on
+/// the runtime until it ends.
 pub fn serve(
     config: &crate::config::Config,
     gateway: Arc<Gateway>,
     port: Port,
-    app: Option<Arc<crate::app::AppClient>>,
+    app: &dyn App,
     listener: impl s4_server::Listener + 'static,
 ) -> Result<tokio::task::JoinHandle<()>, String> {
     let path = config
@@ -206,24 +208,8 @@ pub fn serve(
         .ok_or("an SSH port needs ssh_host_key")?;
     let host_key = s4_server::load_or_create_host_key(&path)
         .map_err(|error| format!("{}: {error}", path.display()))?;
-    let demo = match (config.demo.clone(), app) {
-        (Some(mut demo), Some(app)) => {
-            // The enrollment pins the onion the gateway serves in process.
-            if let Some(path) = config.onion.as_ref().and_then(|onion| onion.key.as_ref()) {
-                let seed = crate::config::seed(path)?;
-                demo.onions = vec![
-                    ed25519_dalek::SigningKey::from_bytes(&seed)
-                        .verifying_key()
-                        .to_bytes(),
-                ];
-            }
-            Some((demo, app))
-        }
-        (Some(_), None) => return Err("the demo's screens need app_key".into()),
-        (None, _) => None,
-    };
     let mark = port.mark;
-    let server = server(host_key, gateway, port, demo);
+    let server = server(host_key, gateway, port, app);
     Ok(tokio::spawn(async move {
         if let Err(error) = server.serve_on(listener).await {
             tracing::warn!(%error, ?mark, "an SSH port ended");

@@ -94,7 +94,7 @@ async fn port_marked(key: [u8; 32], socket: PathBuf, mark: vos_api::Mark) -> std
         vos_gateway::caps::Caps::none(),
         vos_gateway::caps::bodies(),
     );
-    let server = vos_gateway::ssh::server(host_key, gateway, port, None);
+    let server = vos_gateway::ssh::server(host_key, gateway, port, &vos_gateway::ssh::Placeholder);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -507,7 +507,7 @@ async fn a_flood_of_junk_proofs_is_held_to_the_caps_and_members_are_served() {
         Arc::clone(&caps),
         vos_gateway::caps::bodies(),
     );
-    let server = vos_gateway::ssh::server(host_key, gateway, port, None);
+    let server = vos_gateway::ssh::server(host_key, gateway, port, &vos_gateway::ssh::Placeholder);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -584,7 +584,8 @@ async fn a_flood_of_junk_proofs_is_held_to_the_caps_and_members_are_served() {
             Arc::clone(&roomy),
             vos_gateway::caps::bodies(),
         );
-        let server = vos_gateway::ssh::server(host_key, gateway, port, None);
+        let server =
+            vos_gateway::ssh::server(host_key, gateway, port, &vos_gateway::ssh::Placeholder);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -740,8 +741,13 @@ circuit_streams = {streams}
             .map(|(key, address)| Upstream::new(key, address, [41; 32]))
             .collect(),
     ));
-    let front =
-        vos_gateway::served::front(&config, config.onion.as_ref().unwrap(), gateway).unwrap();
+    let front = vos_gateway::served::front(
+        &config,
+        config.onion.as_ref().unwrap(),
+        gateway,
+        &vos_gateway::ssh::Placeholder,
+    )
+    .unwrap();
     (front, dir)
 }
 

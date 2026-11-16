@@ -2,11 +2,13 @@
 //! founded space whose agent holds the credential actor, the poll and the
 //! ledger (`Payments`), an operator who
 //! invites members and mints, and the
-//! gateway's SSH port serving the demo's screens over the node's socket.
+//! gateway's SSH port serving the demo's screens ([`app`], an s4 app on the
+//! gateway's library) over the node's socket.
 //! A phone runs it through `adb reverse`; the end-to-end test
 //! drives it with a headless client. Beside it, on the same node, test
 //! homes ([`home`]): home-only spaces of personal agents.
 
+pub mod app;
 pub mod home;
 
 use std::net::SocketAddr;
@@ -15,9 +17,8 @@ use std::sync::{Arc, Mutex};
 
 use ed25519_dalek::SigningKey;
 use vos_gateway::Gateway;
-use vos_gateway::app::AppClient;
-use vos_gateway::demo::Demo;
 use vos_gateway::limits::{Limits, PerAddress};
+use vos_gateway::ssh::{App, Placeholder};
 use vos_gateway::upstream::{Address, Upstream};
 use vos_node::client::{self, Client, Operator, Target};
 use vos_node::{Config, Node};
@@ -26,6 +27,8 @@ use vos_wire::ids::{AgentId, InstanceId, Principal};
 use vos_wire::ingress::{Install, Response};
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode, WindowClock};
+
+use crate::app::{Demo, DemoApp};
 
 /// The instances the agent holds.
 pub const CREDENTIALS: InstanceId = InstanceId(9);
@@ -169,7 +172,7 @@ impl LocalSpace {
         self.node.shutdown();
     }
 
-    /// The demo the gateway's file names for this space.
+    /// The demo this space serves.
     pub fn demo(&self) -> Demo {
         Demo {
             agent: self.agent.0,
@@ -305,10 +308,8 @@ impl LocalSpace {
             Address::Socket(self.socket.clone()),
             random(),
         )]));
-        let mark = vos_api::Mark::Clearnet;
-        let app = Arc::new(AppClient::new(app, Arc::clone(&gateway), mark));
         let port = vos_gateway::ssh::Port::new(
-            mark,
+            vos_api::Mark::Clearnet,
             Limits::new(PerAddress::default()),
             vos_gateway::caps::Caps::none(),
             vos_gateway::caps::bodies(),
@@ -317,7 +318,8 @@ impl LocalSpace {
             onions,
             ..self.demo()
         };
-        let server = vos_gateway::ssh::server(host_key, gateway, port, Some((demo, app)));
+        let app = DemoApp { demo, key: app };
+        let server = vos_gateway::ssh::server(host_key, gateway, port, &app);
         tokio::spawn(async move {
             if let Err(error) = server.serve_on(listener).await {
                 eprintln!("the SSH port ended: {error}");
@@ -407,26 +409,7 @@ impl LocalSpace {
         socket: &Path,
         rate: Option<Rate>,
     ) -> Result<vos_gateway::config::Config, String> {
-        let demo = self.demo();
         let at = |name: &str| data.join(served.file(name)).display().to_string();
-        let screens = match served {
-            Served::Demo => format!(
-                r#"app_key = "{app_key}"
-
-[demo]
-agent = {agent}
-credentials = {credentials}
-payments = {payments}
-poll = {poll}
-"#,
-                app_key = at("app.key"),
-                agent = demo.agent,
-                credentials = demo.credentials,
-                payments = demo.payments,
-                poll = demo.poll,
-            ),
-            Served::Homes => String::new(),
-        };
         let text = format!(
             r#"
 key = "{key}"
@@ -434,7 +417,7 @@ http = "127.0.0.1:0"
 nodes = [{{ key = "{node}", address = "unix:{socket}" }}]
 ssh = "{ssh}"
 ssh_host_key = "{host_key}"
-{screens}
+
 [onion]
 state = "{state}"
 cache = "{cache}"
@@ -455,6 +438,32 @@ key = "{onion}"
             toml::from_str(&text).map_err(|error| error.to_string())?;
         config.check()?;
         Ok(config)
+    }
+
+    /// `served`'s screens: for the space's gateway the demo's, its claims
+    /// going as the app key kept under `data`, the enrollment pinning the
+    /// file `config`'s onion; for the homes', the gateway's placeholder.
+    fn app(
+        &self,
+        served: Served,
+        data: &Path,
+        config: &vos_gateway::config::Config,
+    ) -> Result<Box<dyn App>, String> {
+        if served == Served::Homes {
+            return Ok(Box::new(Placeholder));
+        }
+        let key = vos_gateway::config::seed(&data.join(served.file("app.key")))?;
+        let onion = config
+            .onion
+            .as_ref()
+            .and_then(|onion| onion.key.as_ref())
+            .expect("the file's onion key");
+        let onion = SigningKey::from_bytes(&vos_gateway::config::seed(onion)?).verifying_key();
+        let demo = Demo {
+            onions: vec![onion.to_bytes()],
+            ..self.demo()
+        };
+        Ok(Box::new(DemoApp { demo, key }))
     }
 
     /// A gateway in front of this node as the file `config` names it.
@@ -480,7 +489,8 @@ key = "{onion}"
         let config = self.gateway_file(served, data, unbound(), &self.socket, served.rate())?;
         let gateway = Self::front_gateway(&config)?;
         let onion = config.onion.as_ref().expect("the file's onion");
-        let hosted = vos_gateway::served::onion(&config, onion, gateway).await?;
+        let app = self.app(served, data, &config)?;
+        let hosted = vos_gateway::served::onion(&config, onion, gateway, &*app).await?;
         Ok(Onion {
             address: hosted.hosted.address.clone(),
             pinned: pinned(&config)?.1,
@@ -495,11 +505,9 @@ key = "{onion}"
     pub async fn host(&self, data: &Path, ssh: SocketAddr, homes: bool) -> Result<Hosted, String> {
         let config = self.gateway_file(Served::Demo, data, ssh, &self.socket, None)?;
         let gateway = Self::front_gateway(&config)?;
-        let mark = vos_api::Mark::Clearnet;
-        let app = vos_gateway::config::seed(config.app_key.as_ref().expect("the file's app key"))?;
-        let app = Arc::new(AppClient::new(app, Arc::clone(&gateway), mark));
+        let app = self.app(Served::Demo, data, &config)?;
         let port = vos_gateway::ssh::Port::new(
-            mark,
+            vos_api::Mark::Clearnet,
             Limits::new(PerAddress::default()),
             vos_gateway::caps::Caps::none(),
             vos_gateway::caps::bodies(),
@@ -507,7 +515,7 @@ key = "{onion}"
         let listener = tokio::net::TcpListener::bind(ssh)
             .await
             .map_err(|error| format!("{ssh}: {error}"))?;
-        let ssh = vos_gateway::ssh::serve(&config, gateway, port, Some(app), listener)?;
+        let ssh = vos_gateway::ssh::serve(&config, gateway, port, &*app, listener)?;
         let (fingerprint, _) = pinned(&config)?;
         let onion = self.launch(Served::Demo, data).await?;
         let homes = match homes {
@@ -538,7 +546,8 @@ key = "{onion}"
         let config = self.gateway_file(served, data, unbound(), socket, rate)?;
         let gateway = Self::front_gateway(&config)?;
         let onion = config.onion.as_ref().expect("the file's onion");
-        let front = vos_gateway::served::front(&config, onion, gateway)?;
+        let app = self.app(served, data, &config)?;
+        let front = vos_gateway::served::front(&config, onion, gateway, &*app)?;
         Ok((front, pinned(&config)?.1))
     }
 }

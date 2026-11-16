@@ -6,7 +6,6 @@ use std::sync::Arc;
 use clap::Parser;
 use vos_api::Mark;
 use vos_gateway::Gateway;
-use vos_gateway::app::AppClient;
 use vos_gateway::caps::Caps;
 use vos_gateway::config::{Config, seed};
 use vos_gateway::front::{self, Http};
@@ -46,14 +45,6 @@ fn run(cli: Cli) -> Result<(), String> {
         .map(|(key, address)| Upstream::new(key, address, secret))
         .collect();
     let gateway = Arc::new(Gateway::new(upstreams));
-    // The s4 app's client key, apart from the gateway's: its apps' claims
-    // go as it.
-    let app = config
-        .app_key
-        .as_ref()
-        .map(|path| seed(path))
-        .transpose()?
-        .map(|seed| Arc::new(AppClient::new(seed, Arc::clone(&gateway), Mark::Clearnet)));
     let limits = Limits::new(config.per_address());
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
     runtime.block_on(async {
@@ -64,9 +55,6 @@ fn run(cli: Cli) -> Result<(), String> {
         let public = ed25519_dalek::SigningKey::from_bytes(&secret).verifying_key();
         println!("listening on {address}");
         println!("gateway {}", hex::encode(public.to_bytes()));
-        if let Some(app) = &app {
-            println!("app {}", hex::encode(app.key()));
-        }
         // The HTTP and SSH ports are the clearnet's: their clients'
         // addresses bound them, and they cap no calls.
         #[cfg(feature = "ssh")]
@@ -79,24 +67,25 @@ fn run(cli: Cli) -> Result<(), String> {
                 Caps::none(),
                 vos_gateway::caps::bodies(),
             ),
-            app.clone(),
+            &vos_gateway::ssh::Placeholder,
         )
         .await?;
         #[cfg(feature = "tor")]
         let onion = match &config.onion {
             Some(onion) => {
-                let served =
-                    vos_gateway::served::onion(&config, onion, Arc::clone(&gateway)).await?;
+                let served = vos_gateway::served::onion(
+                    &config,
+                    onion,
+                    Arc::clone(&gateway),
+                    &vos_gateway::ssh::Placeholder,
+                )
+                .await?;
                 println!("onion {}", served.hosted.address);
                 println!("onion key {}", hex::encode(served.hosted.key));
                 Some(served)
             }
             None => None,
         };
-        #[cfg(not(feature = "tor"))]
-        if config.onion.is_some() {
-            return Err("an onion needs a gateway built with the tor feature".into());
-        }
         let http = Http {
             tls,
             connections: config.connections.unwrap_or(1024),

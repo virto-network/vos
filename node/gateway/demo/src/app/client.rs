@@ -1,6 +1,6 @@
-//! The s4 app's client key: an ordinary VOS client key, apart from the
-//! gateway's own, with which the gateway's s4 app sends the claims of
-//! members who have no key of their own. Its authority is the registrar's
+//! The demo app's client key: an ordinary VOS client key, apart from the
+//! gateway's own, with which the app sends the claims of members who have
+//! no key of their own. Its authority is the registrar's
 //! invitations, which name the digests; it holds no credential bytes. Its
 //! calls run in one session per agent, so the app sends one claim at a
 //! time to an agent, in order.
@@ -14,7 +14,7 @@ use vos_wire::Encode;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Session};
 use vos_wire::ingress::{Call, Consistency, QueryCall};
 
-use crate::Gateway;
+use vos_gateway::Gateway;
 
 /// The app's key, the gateway its requests go through, and the mark they
 /// go with: the transport of the port its screens are served on.

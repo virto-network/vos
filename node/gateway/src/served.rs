@@ -1,7 +1,6 @@
 //! The onion's ports (`light-node.md` §6.1), hosted by arti in process
 //! ([`crate::onion`]): its own HTTP server and, with an SSH port, its own
-//! SSH server (s4's screens, the demo's when the file names it, and the
-//! `vos-api` subsystem), both served the onion's streams with their
+//! SSH server (an [`App`]'s screens and the `vos-api` subsystem), both served the onion's streams with their
 //! circuits' addresses, marking onion, counting each circuit as an address
 //! and capping its calls.
 
@@ -15,6 +14,7 @@ use crate::circuits::{Circuits, Onion, OnionListener};
 use crate::config::{self, Config};
 use crate::front::{self, Http};
 use crate::limits::Limits;
+use crate::ssh::App;
 
 /// The onion's servers, taking the streams handed to [`Front::onion`].
 pub struct Front {
@@ -46,12 +46,13 @@ impl Drop for Served {
 
 /// The servers of the onion `onion` of the gateway the file `config`
 /// describes, in front of `gateway`, on the runtime: SSH if the file names
-/// an SSH port, as the gateway's SSH port serves it, its demo's claims
-/// going as the app's key marked onion.
+/// an SSH port, serving `app`'s screens as the gateway's SSH port does,
+/// marked onion.
 pub fn front(
     config: &Config,
     onion: &config::Onion,
     gateway: Arc<Gateway>,
+    app: &dyn App,
 ) -> Result<Front, String> {
     let circuits = Circuits::new(onion.per_circuit());
     let limits = Limits::new(onion.limits());
@@ -59,7 +60,7 @@ pub fn front(
     let (front, listener, ssh) = Onion::new(Arc::clone(&circuits), config.ssh.is_some());
     let mut tasks = Vec::new();
     if let Some(ssh) = ssh {
-        tasks.push(ssh_server(config, &gateway, &limits, &caps, ssh)?);
+        tasks.push(ssh_server(config, &gateway, &limits, &caps, app, ssh)?);
     }
     let http = Http {
         tls: None,
@@ -83,13 +84,15 @@ pub fn front(
 }
 
 /// The onion `onion` of the gateway the file `config` describes, hosted by
-/// arti in front of `gateway`, on the runtime.
+/// arti in front of `gateway`, on the runtime, its SSH port serving
+/// `app`'s screens.
 pub async fn onion(
     config: &Config,
     onion: &config::Onion,
     gateway: Arc<Gateway>,
+    app: &dyn App,
 ) -> Result<Served, String> {
-    let front = front(config, onion, gateway)?;
+    let front = front(config, onion, gateway, app)?;
     let hosted = crate::onion::launch(onion, Arc::clone(&front.onion)).await?;
     Ok(Served { front, hosted })
 }
@@ -100,6 +103,7 @@ fn ssh_server(
     gateway: &Arc<Gateway>,
     limits: &Arc<Limits>,
     caps: &Arc<Caps>,
+    app: &dyn App,
     listener: OnionListener,
 ) -> Result<tokio::task::JoinHandle<()>, String> {
     let port = crate::ssh::Port::new(
@@ -108,17 +112,5 @@ fn ssh_server(
         Arc::clone(caps),
         crate::caps::bodies(),
     );
-    let app = config
-        .app_key
-        .as_ref()
-        .map(|path| config::seed(path))
-        .transpose()?
-        .map(|seed| {
-            Arc::new(crate::app::AppClient::new(
-                seed,
-                Arc::clone(gateway),
-                Mark::Onion,
-            ))
-        });
     crate::ssh::serve(config, Arc::clone(gateway), port, app, listener)
 }
