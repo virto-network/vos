@@ -23,12 +23,12 @@ pub const WINDOW_PROGRAM: [u32; 8] = [
 
 /// The balance kernel's: the `balance` test actor's `at_least`.
 pub const BALANCE_PROGRAM: [u32; 8] = [
-    2053324620, 225332962, 1015111478, 2073190819, 917478058, 1110671864, 1014468599, 1610633666,
+    54088335, 1223015997, 1289224373, 1714354632, 1311890151, 1140654484, 551315295, 419728885,
 ];
 
 /// The solvency predicate's: the `kernels` test actor's `areas`.
 pub const PREDICATE_PROGRAM: [u32; 8] = [
-    1091417853, 111249495, 1583092950, 1036016041, 952592129, 28293080, 1563587938, 1108046296,
+    901840774, 504072782, 1334161016, 1917377011, 2072527272, 1352940115, 1217929938, 2139199218,
 ];
 
 /// `H_fold`: the fold circuit's hash over the padded shape, the fold word

@@ -22,7 +22,7 @@ const DEADLINE: Duration = Duration::from_secs(1800);
 #[actor]
 pub struct Rounds {
     /// The amounts tallied, added up.
-    total: u64,
+    total: Cell<u64>,
     /// How often each amount was tallied.
     tallies: Table<u64, u64>,
 }
@@ -50,25 +50,18 @@ impl<E> From<RequestError<E>> for RoundsError {
 
 #[messages]
 impl Rounds {
-    pub fn new() -> Self {
-        Self {
-            total: 0,
-            tallies: Table::default(),
-        }
-    }
-
     /// Tally `amount` once more: the total of the amounts tallied.
     #[msg]
     pub async fn tally(&mut self, amount: u64) -> u64 {
         let count = self.tallies.get(&amount).unwrap_or(0);
         self.tallies.insert(&amount, &(count + 1));
-        self.total += amount;
-        self.total
+        self.total.set(&(self.total.get_or_default() + amount));
+        self.total.get_or_default()
     }
 
     #[msg]
     pub async fn total(&self) -> u64 {
-        self.total
+        self.total.get_or_default()
     }
 
     /// Each amount tallied, and how often, in the table's order.

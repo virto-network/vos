@@ -124,8 +124,8 @@ pub struct Payments {
     owners: Table<Owner, Held>,
     invites: Table<Name, Invitation>,
     /// The accounts and transfers made, each id the count before it.
-    opened: u64,
-    paid: u64,
+    opened: Cell<u64>,
+    paid: Cell<u64>,
 }
 
 fn named(name: &[u8]) -> Result<(), PaymentError> {
@@ -236,7 +236,8 @@ impl Payments {
         if amount == 0 {
             return Err(PaymentError::NoAmount);
         }
-        let transfer = TransferBuilder::new(TransferId(id(self.paid)), JOURNAL)
+        let paid = self.paid.get_or_default();
+        let transfer = TransferBuilder::new(TransferId(id(paid)), JOURNAL)
             .debit(from, Layer::Settled, Value(amount))
             .credit(to, Layer::Settled, Value(amount))
             .build();
@@ -244,7 +245,7 @@ impl Payments {
         let result = cipher_clerk::apply_batch(self, &[event], now);
         match result[0].status {
             EventStatus::Created => {
-                self.paid += 1;
+                self.paid.set(&(paid + 1));
                 Ok(())
             }
             status => Err(refused(status)),
@@ -288,18 +289,6 @@ fn balance(account: &Account<Value>) -> u64 {
 
 #[messages]
 impl Payments {
-    pub fn new() -> Self {
-        Self {
-            accounts: Table::default(),
-            transfers: Table::default(),
-            names: Table::default(),
-            owners: Table::default(),
-            invites: Table::default(),
-            opened: 0,
-            paid: 0,
-        }
-    }
-
     /// Invite an account `name` for `owner`, which may open it until
     /// `expires_ms` included; a later invitation of the name replaces it.
     #[msg(role = "operator")]
@@ -341,7 +330,8 @@ impl Payments {
         if self.names.get(&name).is_some() || self.owners.get(&owner).is_some() {
             return Err(PaymentError::Exists);
         }
-        let account = AccountId(id(self.opened));
+        let opened = self.opened.get_or_default();
+        let account = AccountId(id(opened));
         let mut label = [0; 32];
         label[..name.len()].copy_from_slice(&name);
         let row = Account::open(
@@ -356,7 +346,7 @@ impl Payments {
         .with_flags(AccountFlags::BALANCE_MUST_NOT_BE_NEGATIVE)
         .with_user_data(label);
         self.create(ctx.now(), row)?;
-        self.opened += 1;
+        self.opened.set(&(opened + 1));
         self.invites.remove(&name);
         self.names.insert(&name, &account.0);
         self.owners.insert(

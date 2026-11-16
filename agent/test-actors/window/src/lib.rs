@@ -124,12 +124,6 @@ pub struct Window {
 
 #[messages]
 impl Window {
-    pub fn new() -> Self {
-        Self {
-            accounts: CommittedMap::default(),
-        }
-    }
-
     /// Put each account, cipher-clerk's encoding, under its id.
     #[msg(gas = 100_000_000)]
     pub async fn put(&mut self, accounts: Vec<Vec<u8>>) -> u32 {

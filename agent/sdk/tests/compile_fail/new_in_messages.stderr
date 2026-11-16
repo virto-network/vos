@@ -1,0 +1,5 @@
+error: an actor has no `new()`: a new instance's struct is its handles, unbound, and its first values are rows a handler writes (a `Cell` for one value)
+  --> tests/compile_fail/new_in_messages.rs:11:12
+   |
+11 |     pub fn new() -> Self {
+   |            ^^^

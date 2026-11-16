@@ -46,14 +46,6 @@ pub struct CredentialBook {
 
 #[messages]
 impl CredentialBook {
-    pub fn new() -> Self {
-        Self {
-            spaces: Default::default(),
-            handles: Default::default(),
-            pins: Default::default(),
-        }
-    }
-
     /// Record the membership of `space`, or replace it.
     #[msg(merge)]
     pub async fn join(&mut self, space: Space, enrolled: Enrolled) -> Result<(), BookError> {

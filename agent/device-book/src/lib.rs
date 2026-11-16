@@ -33,13 +33,6 @@ pub struct DeviceBook {
 
 #[messages]
 impl DeviceBook {
-    pub fn new() -> Self {
-        Self {
-            labels: Default::default(),
-            settings: Default::default(),
-        }
-    }
-
     /// Label `device`.
     #[msg(merge)]
     pub async fn label(&mut self, device: u32, label: String) -> Result<(), BookError> {

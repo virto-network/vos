@@ -13,10 +13,6 @@ pub struct Kernels {}
 
 #[messages]
 impl Kernels {
-    pub fn new() -> Self {
-        Self {}
-    }
-
     /// Arguments by reference first, read in place, then one by value.
     #[attestable(device, reference = reference)]
     pub fn member(path: &Path, secret: &Secret, #[public] claim: &Claim, tag: u32) {

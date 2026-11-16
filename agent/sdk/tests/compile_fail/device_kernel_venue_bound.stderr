@@ -1,5 +1,5 @@
 error: an #[attestable(device)] method is not `venue_bound`: no venue judges a device's statement
-  --> tests/compile_fail/device_kernel_venue_bound.rs:15:18
+  --> tests/compile_fail/device_kernel_venue_bound.rs:11:18
    |
-15 |     #[attestable(device, venue_bound)]
+11 |     #[attestable(device, venue_bound)]
    |                  ^^^^^^

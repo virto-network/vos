@@ -55,7 +55,7 @@ use vos_wire::personal::{
     Voted, Woken, commit_id, envelope_id, r2_hash, welcome_hash,
 };
 
-use rows::{Candidate, Charge, Group, Head, Lease, ONE, Recovery, Share, Slot, Stored, Usage};
+use rows::{Candidate, Charge, Group, Head, Lease, Recovery, Share, Slot, Stored, Usage};
 
 /// The layout's version, which `version` answers: the keeper upgrades
 /// agents a batch at a time and reads it back.
@@ -117,7 +117,7 @@ pub struct Personal {
     /// A kit rotation's or a restore's `R2`, from its evidence, until it
     /// matures: served to no read.
     deposits: Table<u64, [u8; 32]>,
-    recovery: Table<u8, Recovery>,
+    recovery: Cell<Recovery>,
     /// Each device's latest call, in batch time.
     seen: Table<DeviceId, u64>,
     /// Each device's last logged `alive`: its time and its log index.
@@ -129,15 +129,15 @@ pub struct Personal {
     /// Each admin call's evidence: its log index by the call's.
     evidenced: Table<u64, u64>,
     log: Table<u64, Entry, Ordered>,
-    head: Table<u8, Head>,
-    group: Table<u8, Group>,
-    lease: Table<u8, Lease>,
-    policy: Table<u8, Policy>,
-    usage: Table<u8, Usage>,
+    head: Cell<Head>,
+    group: Cell<Group>,
+    lease: Cell<Lease>,
+    policy: Cell<Policy>,
+    usage: Cell<Usage>,
     shares: Table<DeviceId, Share>,
     kit: Table<u8, KitEntry>,
     /// `R2`, served to no read.
-    secrets: Table<u8, [u8; 32]>,
+    secrets: Cell<[u8; 32]>,
     /// Each scope's last position.
     scopes: Table<Scope, u64>,
     envelopes: Table<(Scope, u64), Stored, Ordered>,
@@ -156,59 +156,11 @@ pub struct Personal {
     /// Open slots by their expiry.
     closing: Table<(u64, Scope), (), Ordered>,
     /// The home's `Homes` that claimed the agent: its agent and instance.
-    home: Table<u8, (u32, u32)>,
+    home: Cell<(u32, u32)>,
 }
 
 #[messages]
 impl Personal {
-    pub fn new() -> Self {
-        Self {
-            admitted: Table::default(),
-            devices: Table::default(),
-            live: Table::default(),
-            removals: Table::default(),
-            operations: Table::default(),
-            open: Table::default(),
-            due: Table::default(),
-            against: Table::default(),
-            kinds: Table::default(),
-            signed: Table::default(),
-            vetoes: Table::default(),
-            vetoed: Table::default(),
-            rivals: Table::default(),
-            resolutions: Table::default(),
-            frozen: Table::default(),
-            ready: Table::default(),
-            claimed: Table::default(),
-            deposits: Table::default(),
-            recovery: Table::default(),
-            seen: Table::default(),
-            alive: Table::default(),
-            votes: Table::default(),
-            commits: Table::default(),
-            evidenced: Table::default(),
-            log: Table::default(),
-            head: Table::default(),
-            group: Table::default(),
-            lease: Table::default(),
-            policy: Table::default(),
-            usage: Table::default(),
-            shares: Table::default(),
-            kit: Table::default(),
-            secrets: Table::default(),
-            scopes: Table::default(),
-            envelopes: Table::default(),
-            bodies: Table::default(),
-            ids: Table::default(),
-            pushed: Table::default(),
-            acks: Table::default(),
-            inbox: Table::default(),
-            slots: Table::default(),
-            closing: Table::default(),
-            home: Table::default(),
-        }
-    }
-
     // ===== The home's =====
 
     /// Set the space's policy for this agent: delays, windows and quotas.
@@ -227,7 +179,7 @@ impl Personal {
         } else {
             policy
         };
-        self.policy.insert(&ONE, &policy);
+        self.policy.set(&policy);
         let index = self.append(now, Body::Configured(policy));
         Ok(Recorded { at: now, index })
     }
@@ -264,7 +216,7 @@ impl Personal {
             return Err(PersonalError::NotAdmitted);
         };
         let to = Ref::<home::Homes>::new(InstanceId(homes));
-        let again = self.home.get(&ONE) == Some((agent.0, homes))
+        let again = self.home.get() == Some((agent.0, homes))
             && self
                 .devices
                 .get(&0)
@@ -273,18 +225,18 @@ impl Personal {
             ctx.send(agent, to, home::Assigned {});
             return Ok(());
         }
-        let previous = self.policy.get(&ONE);
-        self.policy.insert(&ONE, &policy);
+        let previous = self.policy.get();
+        self.policy.set(&policy);
         match self.take(ctx.now(), device, kit) {
             Ok(_) => {
                 self.append(ctx.now(), Body::Configured(policy));
-                self.home.insert(&ONE, &(agent.0, homes));
+                self.home.set(&(agent.0, homes));
                 ctx.send(agent, to, home::Assigned {});
             }
             Err(error) => {
                 match previous {
-                    Some(previous) => self.policy.insert(&ONE, &previous),
-                    None => self.policy.remove(&ONE),
+                    Some(previous) => self.policy.set(&previous),
+                    None => self.policy.clear(),
                 }
                 ctx.send(agent, to, home::Refused { error });
             }
@@ -300,17 +252,14 @@ impl Personal {
         let now = ctx.now();
         self.assigned()?;
         let lease_ms = self.policy().lease_ms;
-        let lease = self.lease.get(&ONE).expect("an assigned agent's lease");
+        let lease = self.lease.get().expect("an assigned agent's lease");
         let until = now.saturating_add(lease_ms);
         let ramp = lease_ms - lease_ms / 6;
-        self.lease.insert(
-            &ONE,
-            &Lease {
-                until,
-                reproved: lease.reproved || now >= lease.claimed.saturating_add(ramp),
-                ..lease
-            },
-        );
+        self.lease.set(&Lease {
+            until,
+            reproved: lease.reproved || now >= lease.claimed.saturating_add(ramp),
+            ..lease
+        });
         let index = self.append(now, Body::Renewed { until });
         Ok(Recorded { at: now, index })
     }
@@ -634,7 +583,7 @@ impl Personal {
             set: set.clone(),
             rekey: effect.rekey,
         });
-        self.group.insert(&ONE, &group);
+        self.group.set(&group);
         Ok(Candidacy {
             at: now,
             index,
@@ -1031,14 +980,14 @@ impl Personal {
         let now = ctx.now();
         self.reader(ctx.caller(), now)?.device_or_kit()?;
         let group = self.group();
-        let head = self.head.get(&ONE).unwrap_or_default();
+        let head = self.head.get().unwrap_or_default();
         Ok(Overview {
             at: now,
             confirmed: group.confirmed,
             candidate: group.candidate.map(|candidate| candidate.pending()),
             next: head.next,
             chain: head.chain,
-            lease_until: self.lease.get(&ONE).map_or(0, |lease| lease.until),
+            lease_until: self.lease.get().map_or(0, |lease| lease.until),
             lapsed: self.lapsed(now),
         })
     }
@@ -1099,7 +1048,7 @@ impl Personal {
     pub async fn recovery(&self, ctx: &Query<Self>) -> Result<RecoveryView, PersonalError> {
         let reader = self.reader(ctx.caller(), ctx.now())?;
         reader.device_or_kit()?;
-        let recovery = self.recovery.get(&ONE).unwrap_or_default();
+        let recovery = self.recovery.get().unwrap_or_default();
         let released = recovery
             .released
             .filter(|(device, _)| reader == rules::Reader::Device(*device))
@@ -1124,7 +1073,7 @@ impl Personal {
         from: u64,
     ) -> Result<Vec<(u64, Entry)>, PersonalError> {
         self.reader(ctx.caller(), ctx.now())?.device_or_kit()?;
-        let next = self.head.get(&ONE).unwrap_or_default().next;
+        let next = self.head.get().unwrap_or_default().next;
         let rows = (from..next).filter_map(|index| Some((index, self.log.get(&index)?)));
         Ok(rules::bounded(rows, |row| row.encode().len()))
     }
@@ -1142,7 +1091,7 @@ impl Personal {
         let position = match self.reader(ctx.caller(), ctx.now())? {
             rules::Reader::Device(_) => position,
             rules::Reader::Kit if scope == RECOVERY => {
-                position.max(self.recovery.get(&ONE).unwrap_or_default().from)
+                position.max(self.recovery.get().unwrap_or_default().from)
             }
             _ => return Err(PersonalError::NotAdmitted),
         };

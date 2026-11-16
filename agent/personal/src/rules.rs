@@ -15,7 +15,7 @@ use vos_wire::personal::{
 
 use crate::Personal;
 use crate::home::{self, Homes};
-use crate::rows::{Charge, Group, Head, Lease, ONE, Share, Slot, Usage};
+use crate::rows::{Charge, Group, Head, Lease, Share, Slot, Usage};
 
 /// Rows while their encodings, `size` each, fit one answer: at least the
 /// first.
@@ -58,7 +58,7 @@ impl Personal {
         device: NewDevice,
         kit: Kit,
     ) -> Result<Recorded, PersonalError> {
-        if self.lease.contains(&ONE) {
+        if self.lease.is_set() {
             return Err(PersonalError::Assigned);
         }
         if kit.entries.len() > crate::KIT_ENTRIES || !device.bounded() {
@@ -76,16 +76,13 @@ impl Personal {
             self.admitted.insert(&entry.signing, &Holder::Kit(i as u8));
             self.kit.insert(&(i as u8), entry);
         }
-        self.secrets.insert(&ONE, &kit.r2);
+        self.secrets.set(&kit.r2);
         let lease_ms = self.policy().lease_ms;
-        self.lease.insert(
-            &ONE,
-            &Lease {
-                until: now.saturating_add(lease_ms),
-                reproved: false,
-                claimed: now,
-            },
-        );
+        self.lease.set(&Lease {
+            until: now.saturating_add(lease_ms),
+            reproved: false,
+            claimed: now,
+        });
         self.seen.insert(&first, &now);
         let kit = kit.entries.iter().map(|entry| entry.signing).collect();
         let index = self.append(now, Body::Assigned { device: first, kit });
@@ -95,26 +92,26 @@ impl Personal {
     /// Tell the home's `Homes` `message`, if a claim through it assigned
     /// the agent; delivered once the step commits.
     pub(crate) fn tell_home<M: Method<Actor = Homes>>(&self, message: M) {
-        if let Some((agent, instance)) = self.home.get(&ONE) {
+        if let Some((agent, instance)) = self.home.get() {
             vos_sdk::host::send(agent, instance, M::ID, &message.encode());
         }
     }
 
     pub(crate) fn policy(&self) -> Policy {
-        self.policy.get(&ONE).unwrap_or(Policy::DEFAULT)
+        self.policy.get().unwrap_or(Policy::DEFAULT)
     }
 
     pub(crate) fn group(&self) -> Group {
-        self.group.get(&ONE).unwrap_or_default()
+        self.group.get().unwrap_or_default()
     }
 
     pub(crate) fn usage(&self) -> Usage {
-        self.usage.get(&ONE).unwrap_or_default()
+        self.usage.get().unwrap_or_default()
     }
 
     /// Refuse every call until a claim assigned the agent.
     pub(crate) fn assigned(&self) -> Result<(), PersonalError> {
-        if self.lease.contains(&ONE) {
+        if self.lease.is_set() {
             Ok(())
         } else {
             Err(PersonalError::Unassigned)
@@ -123,12 +120,12 @@ impl Personal {
 
     /// Whether the lease lapsed: the agent is in its grace.
     pub(crate) fn lapsed(&self, now: u64) -> bool {
-        self.lease.get(&ONE).is_some_and(|lease| lease.until < now)
+        self.lease.get().is_some_and(|lease| lease.until < now)
     }
 
     /// Append `body` to the control log at `at`: its index.
     pub(crate) fn append(&mut self, at: u64, body: Body) -> u64 {
-        let mut head: Head = self.head.get(&ONE).unwrap_or_default();
+        let mut head: Head = self.head.get().unwrap_or_default();
         let index = head.next;
         let linked = chain(&head.chain, index, at, &body);
         self.log.insert(
@@ -141,7 +138,7 @@ impl Personal {
         );
         head.next += 1;
         head.chain = linked;
-        self.head.insert(&ONE, &head);
+        self.head.set(&head);
         index
     }
 
@@ -156,7 +153,7 @@ impl Personal {
         let mut group = self.group();
         let id = group.devices;
         group.devices = id.checked_add(1).ok_or(PersonalError::Malformed)?;
-        self.group.insert(&ONE, &group);
+        self.group.set(&group);
         self.live.insert(&id, &());
         self.admitted.insert(&keys.sync, &Holder::Sync(id));
         self.admitted.insert(&keys.admin, &Holder::Admin(id));
@@ -455,14 +452,14 @@ impl Personal {
                 }
                 // The previous R2 is released until the restore's device
                 // commits a group of its own.
-                let mut recovery = self.recovery.get(&ONE).unwrap_or_default();
+                let mut recovery = self.recovery.get().unwrap_or_default();
                 if recovery
                     .released
                     .is_some_and(|(device, _)| device == candidate.by)
                 {
                     recovery.released = None;
                     recovery.previous = Vec::new();
-                    self.recovery.insert(&ONE, &recovery);
+                    self.recovery.set(&recovery);
                 }
                 if let Some(rekey) = &candidate.rekey
                     && let Some(r2) = self.deposits.get(&candidate.index)
@@ -485,7 +482,7 @@ impl Personal {
                 }
             }
         }
-        self.group.insert(&ONE, &group);
+        self.group.set(&group);
         self.append(
             now,
             Body::Verdict {
@@ -517,7 +514,7 @@ impl Personal {
                 ..usage
             };
         }
-        let reproved = self.lease.get(&ONE).is_some_and(|lease| lease.reproved);
+        let reproved = self.lease.get().is_some_and(|lease| lease.reproved);
         let quota = if reproved {
             policy.bytes_full
         } else {
@@ -557,7 +554,7 @@ impl Personal {
             share.calls += 1;
             self.shares.insert(&device, &share);
         }
-        self.usage.insert(&ONE, &usage);
+        self.usage.set(&usage);
         Ok(())
     }
 
@@ -580,7 +577,7 @@ impl Personal {
             return Err(PersonalError::Quota);
         }
         usage.kit_operations += 1;
-        self.usage.insert(&ONE, &usage);
+        self.usage.set(&usage);
         Ok(())
     }
 
@@ -608,7 +605,7 @@ impl Personal {
         let mut usage = self.usage();
         usage.bytes = usage.bytes.saturating_sub(bytes);
         usage.items = usage.items.saturating_sub(1);
-        self.usage.insert(&ONE, &usage);
+        self.usage.set(&usage);
         if let Author::Device(device) = item.from
             && let Some(mut share) = self.shares.get(&device)
         {

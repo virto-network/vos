@@ -24,8 +24,8 @@
 //!   adds are confirmed, `record`, until their removals mature, `forget`)
 //!   renews it with `renew`, a re-proof.
 //!
-//! The actor's struct holds tables alone, no plain field, so a later
-//! version adds tables beside these.
+//! The actor's state is its tables and cells, so a later version adds
+//! tables beside these.
 
 #![no_std]
 
@@ -39,9 +39,6 @@ use vos_personal::personal::{Claim, Renew};
 use vos_sdk::prelude::*;
 use vos_wire::homes::{AgentsPage, Counts, HomesError, PAGE, Standing, Terms};
 use vos_wire::personal::{Kit, NewDevice, PersonalError, kit_index};
-
-/// The key of a table holding one row.
-const ONE: u8 = 0;
 
 /// The most recovery entries a claim's kit brings, as `Personal` takes.
 const KIT_ENTRIES: usize = vos_personal::KIT_ENTRIES;
@@ -65,30 +62,19 @@ pub struct Homes {
     nullifiers: Table<[u8; 32], u32>,
     /// Each kit entry's index's agent.
     kits: Table<[u8; 32], u32>,
-    terms: Table<u8, Terms>,
-    counts: Table<u8, Counts>,
+    terms: Cell<Terms>,
+    counts: Cell<Counts>,
 }
 
 #[messages]
 impl Homes {
-    pub fn new() -> Self {
-        Self {
-            agents: Table::default(),
-            pool: Table::default(),
-            nullifiers: Table::default(),
-            kits: Table::default(),
-            terms: Table::default(),
-            counts: Table::default(),
-        }
-    }
-
     // ===== The operator's =====
 
     /// Set where `Personal` is in the pool's agents, and the policy each
     /// is configured with before its claim.
     #[msg(role = "operator")]
     pub async fn configure(&mut self, terms: Terms) {
-        self.terms.insert(&ONE, &terms);
+        self.terms.set(&terms);
     }
 
     /// Pool `agents`, each made by the keeper with `Personal` installed and
@@ -117,7 +103,7 @@ impl Homes {
         }
         let mut counts = self.tallied();
         counts.pooled += fresh.len() as u32;
-        self.counts.insert(&ONE, &counts);
+        self.counts.set(&counts);
         Ok(counts.pooled)
     }
 
@@ -152,7 +138,7 @@ impl Homes {
         agent: u32,
     ) -> Result<u32, HomesError> {
         let nullifier = ctx.nullifier().ok_or(HomesError::Anonymous)?;
-        let terms = self.terms.get(&ONE).ok_or(HomesError::Unconfigured)?;
+        let terms = self.terms.get().ok_or(HomesError::Unconfigured)?;
         if device.nullifier != nullifier {
             return Err(HomesError::Nullifier);
         }
@@ -215,7 +201,7 @@ impl Homes {
         let mut counts = self.tallied();
         counts.pooled -= 1;
         counts.claimed += 1;
-        self.counts.insert(&ONE, &counts);
+        self.counts.set(&counts);
         ctx.send(AgentId(agent), personal, claim);
         Ok(agent)
     }
@@ -225,7 +211,7 @@ impl Homes {
     #[msg(credential = Auth("home"))]
     pub async fn renew(&mut self, ctx: &mut Command<Self>, agent: u32) -> Result<(), HomesError> {
         let nullifier = ctx.nullifier().ok_or(HomesError::Anonymous)?;
-        let terms = self.terms.get(&ONE).ok_or(HomesError::Unconfigured)?;
+        let terms = self.terms.get().ok_or(HomesError::Unconfigured)?;
         if self.nullifiers.get(&nullifier) != Some(agent) {
             return Err(HomesError::NotRecorded);
         }
@@ -252,7 +238,7 @@ impl Homes {
         let mut counts = self.tallied();
         counts.claimed -= 1;
         counts.assigned += 1;
-        self.counts.insert(&ONE, &counts);
+        self.counts.set(&counts);
         Ok(())
     }
 
@@ -366,7 +352,7 @@ impl Homes {
     /// The pool's agents pooled, sent and assigned.
     #[msg]
     pub async fn tally(&self) -> Counts {
-        self.counts.get(&ONE).unwrap_or_default()
+        self.counts.get().unwrap_or_default()
     }
 
     /// The stocked agents by id, from after `after`, [`PAGE`] at most: the
@@ -386,13 +372,13 @@ impl Homes {
     /// The terms `configure` set.
     #[msg]
     pub async fn configured(&self) -> Option<Terms> {
-        self.terms.get(&ONE)
+        self.terms.get()
     }
 }
 
 impl Homes {
     fn tallied(&self) -> Counts {
-        self.counts.get(&ONE).unwrap_or_default()
+        self.counts.get().unwrap_or_default()
     }
 
     /// `agent`'s claim dropped: its nullifier and kit indexes, the agent
@@ -410,7 +396,7 @@ impl Homes {
             self.pool.insert(&agent, &());
             counts.pooled += 1;
         }
-        self.counts.insert(&ONE, &counts);
+        self.counts.set(&counts);
         self.agents.insert(
             &agent,
             &Held {

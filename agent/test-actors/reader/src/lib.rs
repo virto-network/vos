@@ -18,7 +18,7 @@ fn entries(reader: &Reader, keys: &[u64]) -> Vec<Read> {
 
 #[actor]
 pub struct Reader {
-    statements: u64,
+    statements: Cell<u64>,
     notes: Table<u32, u32>,
     /// Each noted read's end, by its tag: 0 served, else its error's code.
     outcomes: Table<u64, u32>,
@@ -28,16 +28,6 @@ pub struct Reader {
 
 #[messages]
 impl Reader {
-    pub fn new() -> Self {
-        Self {
-            statements: 0,
-            notes: Table::default(),
-            outcomes: Table::default(),
-            entries: CommittedMap::default(),
-            names: CommittedMap::default(),
-        }
-    }
-
     /// Put or, with no value, delete each entry.
     #[msg(gas = 100_000_000)]
     pub async fn set_entries(&mut self, writes: Vec<(u64, Option<u64>)>) -> u64 {
@@ -229,7 +219,7 @@ impl Reader {
             .attest(reader::Ordered { a, b, c })
             .await
             .unwrap_or_default();
-        self.statements += 1;
+        self.statements.set(&(self.statements.get_or_default() + 1));
         (stamped, ordered)
     }
 

@@ -14,7 +14,7 @@ use vos_sdk::prelude::*;
 
 #[actor]
 pub struct Kernels {
-    checks: u64,
+    checks: Cell<u64>,
 }
 
 /// A shape, called through its vtable.
@@ -84,10 +84,6 @@ fn shape(side: u64) -> Box<dyn Shape> {
 
 #[messages]
 impl Kernels {
-    pub fn new() -> Self {
-        Self { checks: 0 }
-    }
-
     /// Attest each kernel on `values`: their outputs.
     #[msg]
     pub async fn check(
@@ -111,7 +107,7 @@ impl Kernels {
             .attest(kernels::Areas { sides: values })
             .await
             .unwrap_or(0);
-        self.checks += 1;
+        self.checks.set(&(self.checks.get_or_default() + 1));
         (digest, named, areas)
     }
 

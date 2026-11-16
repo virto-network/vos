@@ -28,12 +28,6 @@ fn balance(account: Option<Vec<u8>>) -> i128 {
 
 #[messages]
 impl Accounts {
-    pub fn new() -> Self {
-        Self {
-            accounts: CommittedMap::default(),
-        }
-    }
-
     /// Whether account `id`'s settled balance was at least `threshold` at
     /// the cut of the window it asks in.
     #[workflow(gas = 100_000_000)]

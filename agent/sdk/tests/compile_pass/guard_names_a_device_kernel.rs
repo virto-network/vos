@@ -2,21 +2,17 @@ use vos_sdk::prelude::*;
 
 #[actor]
 pub struct Poll {
-    votes: u64,
+    votes: Cell<u64>,
 }
 
 #[messages]
 impl Poll {
-    pub fn new() -> Self {
-        Self { votes: 0 }
-    }
-
     /// The guard takes device proofs of `proof`, a device kernel: the
     /// handler takes its claim first.
     #[msg(proven = proof)]
     pub fn vote(&mut self, claim: [u8; 32], weight: u64) {
         let _ = claim;
-        self.votes += weight;
+        self.votes.set(&(self.votes.get_or_default() + weight));
     }
 
     /// The stock `owner` kernel's guard, by its name.

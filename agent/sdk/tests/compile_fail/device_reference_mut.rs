@@ -6,10 +6,6 @@ pub struct Kernels {}
 
 #[messages]
 impl Kernels {
-    pub fn new() -> Self {
-        Self {}
-    }
-
     /// An argument in place is read, never written.
     #[attestable(device, reference = reference)]
     pub fn touch(digest: &mut Digest) {

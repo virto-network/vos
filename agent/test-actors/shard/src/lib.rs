@@ -55,13 +55,6 @@ pub fn identity_row(index: u64) -> [u8; 32] {
 
 #[messages]
 impl Shard {
-    pub fn new() -> Self {
-        Self {
-            accounts: CommittedMap::default(),
-            identities: Table::default(),
-        }
-    }
-
     /// Move `amount` from `from` to `to`: here when `to_agent` is this
     /// shard, else by a credit sent to `to_agent`'s shard, delivered once
     /// this step commits. `from`'s balance after.

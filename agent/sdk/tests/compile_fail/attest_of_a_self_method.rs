@@ -7,12 +7,6 @@ pub struct Counter {
 
 #[messages]
 impl Counter {
-    pub fn new() -> Self {
-        Self {
-            entries: CommittedMap::default(),
-        }
-    }
-
     /// A `&self` method reads at a window's cut alone, from a workflow.
     #[msg]
     pub async fn check(&mut self, ctx: &mut Command<Self>, key: u32) -> u64 {

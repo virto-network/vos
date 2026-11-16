@@ -7,12 +7,6 @@ pub struct Notes {
 
 #[messages]
 impl Notes {
-    pub fn new() -> Self {
-        Self {
-            tags: Default::default(),
-        }
-    }
-
     /// A merge handler runs on every device that applies its operation, by
     /// its author: no role admits it.
     #[msg(merge, role = "Member")]

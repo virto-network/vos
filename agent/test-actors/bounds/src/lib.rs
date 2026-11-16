@@ -15,10 +15,6 @@ pub struct Bounds {}
 
 #[messages]
 impl Bounds {
-    pub fn new() -> Self {
-        Self {}
-    }
-
     /// Attest `echo` `count` times, each with `padding` bytes beside the
     /// output's length, asking for `output` bytes back: the bytes echoed.
     #[msg]

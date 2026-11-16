@@ -7,12 +7,6 @@ pub struct Counter {
 
 #[messages]
 impl Counter {
-    pub fn new() -> Self {
-        Self {
-            entries: CommittedMap::default(),
-        }
-    }
-
     /// A device reads no root: a device kernel takes no `self`.
     #[attestable(device, reference = reference)]
     pub fn entry(&self, key: u32) -> u64 {

@@ -1,5 +1,5 @@
 error: an #[attestable] method takes `gas = N`, `venue_bound` and `device` alone: it has no caller
-  --> tests/compile_fail/attestable_with_role.rs:14:5
+  --> tests/compile_fail/attestable_with_role.rs:10:5
    |
-14 |     #[attestable(role = "minter")]
+10 |     #[attestable(role = "minter")]
    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

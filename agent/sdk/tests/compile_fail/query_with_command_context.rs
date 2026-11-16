@@ -2,18 +2,14 @@ use vos_sdk::prelude::*;
 
 #[actor]
 pub struct Counter {
-    value: u64,
+    value: Cell<u64>,
 }
 
 #[messages]
 impl Counter {
-    pub fn new() -> Self {
-        Self { value: 0 }
-    }
-
     #[msg]
     pub async fn peek(&self, ctx: &mut Command<Self>) -> u64 {
-        self.value
+        self.value.get_or_default()
     }
 }
 

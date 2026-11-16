@@ -10,10 +10,6 @@ pub struct Wide {}
 
 #[messages]
 impl Wide {
-    pub fn new() -> Self {
-        Self {}
-    }
-
     #[attestable]
     pub fn k00(x: u64) -> u64 {
         x ^ 0

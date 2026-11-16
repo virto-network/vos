@@ -1,13 +1,13 @@
 error: a `proven = proof` handler takes the kernel's claim as its first argument: its public arguments, as their encoding reads
-  --> tests/compile_fail/proven_without_a_claim.rs:15:11
+  --> tests/compile_fail/proven_without_a_claim.rs:11:11
    |
-15 |     #[msg(proven = proof)]
+11 |     #[msg(proven = proof)]
    |           ^^^^^^
 
 error[E0433]: failed to resolve: use of unresolved module or unlinked crate `poll`
-  --> tests/compile_fail/proven_without_a_claim.rs:26:19
+  --> tests/compile_fail/proven_without_a_claim.rs:22:19
    |
-26 | fn reference() -> poll::Proof {
+22 | fn reference() -> poll::Proof {
    |                   ^^^^
    |                   |
    |                   use of unresolved module or unlinked crate `poll`
@@ -16,9 +16,9 @@ error[E0433]: failed to resolve: use of unresolved module or unlinked crate `pol
    = help: if you wanted to use a crate named `poll`, use `cargo add poll` to add it to your `Cargo.toml`
 
 error[E0433]: failed to resolve: use of unresolved module or unlinked crate `poll`
-  --> tests/compile_fail/proven_without_a_claim.rs:27:5
+  --> tests/compile_fail/proven_without_a_claim.rs:23:5
    |
-27 |     poll::Proof { root: [0; 32] }
+23 |     poll::Proof { root: [0; 32] }
    |     ^^^^
    |     |
    |     use of unresolved module or unlinked crate `poll`

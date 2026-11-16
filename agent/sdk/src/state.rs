@@ -1,12 +1,7 @@
-//! An instance's struct state, stored encoded in its struct row.
+//! An actor's state as its handlers hold it: the struct of its handles,
+//! each bound to its rows. The state itself is the rows.
 
-use alloc::vec::Vec;
-
-use vos_wire::abi::Rows;
-
-use crate::{Decode, Encode, host};
-
-/// Binds an actor's `Table` and `CommittedMap` fields to their tags.
+/// Binds an actor's fields, each a handle on rows, to their tags.
 /// `#[actor]` implements it.
 pub trait Tables {
     fn bind_tables(&mut self);
@@ -25,8 +20,8 @@ pub trait Marked {
     const ADMISSION: vos_wire::schema::Admission;
 }
 
-/// The state of a new instance. `#[messages]` implements it with the
-/// actor's `fn new() -> Self`.
+/// The actor's struct, its handles unbound. `#[actor]` implements it, each
+/// field its `Default`.
 pub trait New {
     fn new() -> Self;
 }
@@ -40,32 +35,10 @@ pub trait View {
     fn served(served: &'static vos_wire::served::Served) -> Self;
 }
 
-/// The instance's state, or a new instance's when none is stored. State
-/// that does not decode traps.
-pub fn load<A: Encode + Decode + Tables + New>() -> A {
-    let mut state = match host::get(Rows::Struct, &[]) {
-        Some(bytes) => match A::decode(&bytes) {
-            Ok((state, _)) => state,
-            Err(_) => panic!("undecodable state"),
-        },
-        None => A::new(),
-    };
-    state.bind_tables();
-    state
-}
-
-/// A new instance's state, its tables and merge fields bound, read from
-/// nothing: what a merge handler runs on.
-pub fn fresh<A: Tables + New>() -> A {
+/// The instance's state: the actor's struct, each handle bound to its
+/// rows. It reads nothing: a handler pays for the rows it touches.
+pub fn load<A: Tables + New>() -> A {
     let mut state = A::new();
     state.bind_tables();
     state
-}
-
-/// Write the state back if its encoding changed from `before`.
-pub fn save<A: Encode>(state: &A, before: &[u8]) {
-    let after: Vec<u8> = state.encode();
-    if after != before {
-        host::put(Rows::Struct, &[], &after);
-    }
 }

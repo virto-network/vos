@@ -15,9 +15,3 @@ error[E0412]: cannot find type `Gated` in module `super`
   |
 9 | impl Gated {
   |      ^^^^^ not found in `super`
-
-error[E0433]: failed to resolve: use of undeclared type `Gated`
- --> tests/compile_fail/known_keys_admitted_ordered.rs:9:6
-  |
-9 | impl Gated {
-  |      ^^^^^ use of undeclared type `Gated`

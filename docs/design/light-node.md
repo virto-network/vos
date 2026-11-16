@@ -722,10 +722,12 @@ commits a second across a space [est].
 `Admin::Install` replaces the program and touches no table
 (`agent/default/src/refine/admin.rs`), and state migration is unbuilt, so
 `Personal`'s storage layout is **append-only across versions:** new
-tables, never a changed key or encoding. A field added to the actor's
-struct, or to a row's type, would not decode what the previous version
-wrote (the codec has no optional tail), so `Personal` holds no struct
-field: its state is its tables, and its version answers `version` [built,
+tables, never a changed key or encoding. A field added to a row's type
+would not decode what the previous version wrote (the codec has no
+optional tail), and an actor's struct stores nothing (`core-model.md`
+§9.1: state is rows, a single value a `Cell`, and a changed value type a
+new table), so `Personal`'s state is its tables and cells, and its
+version answers `version` [built,
 `agent/personal`]. Each release installs over a populated agent of the
 previous release in a test that reads every envelope and operation back
 (plan 8.14; the mechanism's test, the next version built from the same

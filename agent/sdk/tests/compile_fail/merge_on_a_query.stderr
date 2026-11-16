@@ -1,5 +1,5 @@
 error: a #[msg(merge)] handler takes `&mut self`: it writes merge fields
-  --> tests/compile_fail/merge_on_a_query.rs:17:11
+  --> tests/compile_fail/merge_on_a_query.rs:11:11
    |
-17 |     #[msg(merge)]
+11 |     #[msg(merge)]
    |           ^^^^^

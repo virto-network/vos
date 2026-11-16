@@ -137,7 +137,8 @@ impl Kind {
 /// The rows a row operation reaches, in its φ7.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Rows {
-    /// The instance's struct state: one row, under the empty key.
+    /// The instance's struct row: one row, under the empty key. No actor
+    /// of the SDK keeps one: its state is its tables' rows.
     Struct,
     /// A table's rows, by its tag.
     Table { tag: u32, transform: Transform },

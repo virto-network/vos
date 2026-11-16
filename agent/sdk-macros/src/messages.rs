@@ -382,7 +382,6 @@ pub(crate) fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn:
     let view = format_ident!("{}View", actor);
     let mut ids = Ids::new("method");
     let mut handlers = Vec::new();
-    let mut has_new = false;
     let mut items = Vec::new();
     // The attestable `&self` methods, which read through the actor's view.
     let mut viewed = Vec::new();
@@ -391,8 +390,12 @@ pub(crate) fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn:
             items.push(item);
             continue;
         };
-        if method.sig.ident == "new" && method.sig.inputs.is_empty() {
-            has_new = true;
+        if method.sig.ident == "new" && method.sig.receiver().is_none() {
+            return Err(Error::new(
+                method.sig.ident.span(),
+                "an actor has no `new()`: a new instance's struct is its handles, unbound, \
+                 and its first values are rows a handler writes (a `Cell` for one value)",
+            ));
         }
         let marker = method
             .attrs
@@ -414,12 +417,6 @@ pub(crate) fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn:
         }
     }
     input.items = items;
-    if !has_new {
-        return Err(Error::new(
-            input.self_ty.span(),
-            "#[messages] needs `fn new() -> Self`, the state of a new instance",
-        ));
-    }
     // A `proven = k` guard names this actor's device kernel `k`, or a stock
     // kernel; its handler takes the kernel's claim first.
     let devices: Vec<String> = handlers
@@ -515,12 +512,6 @@ pub(crate) fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn:
 
         impl #actor {
             #(#entries)*
-        }
-
-        impl ::vos_sdk::state::New for #actor {
-            fn new() -> Self {
-                #actor::new()
-            }
         }
 
         /// Messages to this actor, one per handler.

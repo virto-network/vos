@@ -1,0 +1,5 @@
+error[E0609]: no field `value` on type `&CounterView`
+  --> tests/compile_fail/attestable_reads_a_cell.rs:14:14
+   |
+14 |         self.value.get_or_default() + by
+   |              ^^^^^ unknown field

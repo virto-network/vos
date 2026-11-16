@@ -72,12 +72,6 @@ pub struct DeviceNext {
 
 #[messages]
 impl DeviceNext {
-    pub fn new() -> Self {
-        Self {
-            seen: Table::default(),
-        }
-    }
-
     /// A member signed in by a device proof of `auth`, either release's,
     /// once a nullifier: the nullifier, its claim's, and the program the
     /// proof was of.

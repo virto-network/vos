@@ -8,7 +8,7 @@ use vos_sdk::prelude::*;
 
 #[actor]
 pub struct Caller {
-    calls: u64,
+    calls: Cell<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
@@ -21,10 +21,6 @@ pub enum PayError {
 
 #[messages]
 impl Caller {
-    pub fn new() -> Self {
-        Self { calls: 0 }
-    }
-
     /// Transfer through the ledger, then return the receiver's balance.
     #[msg]
     pub async fn pay(
@@ -36,7 +32,7 @@ impl Caller {
         amount: u64,
     ) -> Result<u64, PayError> {
         let ledger = Ref::<Ledger>::new(InstanceId(ledger));
-        self.calls += 1;
+        self.calls.set(&(self.calls.get_or_default() + 1));
         match ctx
             .call(ledger, ledger::ledger::Transfer { from, to, amount })
             .await
@@ -66,7 +62,7 @@ impl Caller {
     /// Call a ledger method that sends and then fails; succeed anyway.
     #[msg]
     pub async fn relay(&mut self, ctx: &mut Command<Self>, ledger: u32) -> bool {
-        self.calls += 1;
+        self.calls.set(&(self.calls.get_or_default() + 1));
         ctx.call(
             Ref::<Ledger>::new(InstanceId(ledger)),
             ledger::ledger::NotifyThenFail { agent: 9 },
@@ -137,8 +133,8 @@ impl Caller {
     #[msg]
     pub async fn recurse(&mut self, ctx: &mut Command<Self>) -> u64 {
         let (_, me) = ctx.me();
-        self.calls += 1;
+        self.calls.set(&(self.calls.get_or_default() + 1));
         let _ = ctx.call(Ref::<Caller>::new(me), caller::Recurse {}).await;
-        self.calls
+        self.calls.get_or_default()
     }
 }

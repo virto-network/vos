@@ -7,12 +7,6 @@ pub struct Counter {
 
 #[messages]
 impl Counter {
-    pub fn new() -> Self {
-        Self {
-            entries: CommittedMap::default(),
-        }
-    }
-
     /// A rootless method reads no rows at a cut.
     #[workflow]
     pub async fn read(ctx: &mut Workflow<Self>, by: u64) -> Result<u64, AttestError> {

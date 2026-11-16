@@ -1,7 +1,7 @@
 error[E0277]: the trait bound `Double: AtCutMethod` is not satisfied
-  --> tests/compile_fail/at_cut_of_a_rootless_method.rs:19:27
+  --> tests/compile_fail/at_cut_of_a_rootless_method.rs:13:27
    |
-19 |         ctx.attest_at_cut(counter::Double { by }).await
+13 |         ctx.attest_at_cut(counter::Double { by }).await
    |             ------------- ^^^^^^^^^^^^^^^^^^^^^^ the trait `AtCutMethod` is not implemented for `Double`
    |             |
    |             required by a bound introduced by this call
@@ -13,9 +13,9 @@ note: required by a bound in `vos_sdk::context::Workflow::<A>::attest_at_cut`
    |                             ^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `Workflow::<A>::attest_at_cut`
 
 error[E0277]: `AtCut<Counter, Double>` is not a future
-  --> tests/compile_fail/at_cut_of_a_rootless_method.rs:19:51
+  --> tests/compile_fail/at_cut_of_a_rootless_method.rs:13:51
    |
-19 |         ctx.attest_at_cut(counter::Double { by }).await
+13 |         ctx.attest_at_cut(counter::Double { by }).await
    |                                                   ^^^^^ `AtCut<Counter, Double>` is not a future
    |
    = help: the trait `IntoFuture` is not implemented for `AtCut<Counter, Double>`
@@ -23,6 +23,6 @@ error[E0277]: `AtCut<Counter, Double>` is not a future
    = help: the trait `IntoFuture` is implemented for `AtCut<A, M>`
 help: remove the `.await`
    |
-19 -         ctx.attest_at_cut(counter::Double { by }).await
-19 +         ctx.attest_at_cut(counter::Double { by })
+13 -         ctx.attest_at_cut(counter::Double { by }).await
+13 +         ctx.attest_at_cut(counter::Double { by })
    |

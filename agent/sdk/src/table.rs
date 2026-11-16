@@ -1,5 +1,16 @@
-//! Tables and committed maps: an instance's rows under a tag derived from
-//! the field's name, each keyed under the table's transform.
+//! Tables, cells and committed maps: an instance's rows under a tag
+//! derived from the field's name, each keyed under the table's transform.
+//! An actor's state is these rows and nothing else: its struct holds the
+//! handles, never a value.
+//!
+//! **A stored row's layout is its field's name, its key's encoding and its
+//! value's encoding, for good.** An install replaces the program and
+//! touches no row, and the codec has no optional tail: a value type with a
+//! field added, removed or reordered does not decode the rows an earlier
+//! version wrote ([`Table::get`] reads such a row as absent; an iteration
+//! traps). A new version adds tables and cells, each under a new name; a
+//! value whose shape must change goes to a new field of a new type, the
+//! old rows read through the old field for as long as they matter.
 //!
 //! A table chooses its key transform by its third type parameter,
 //! [`DefaultTransform`] when it names none: [`Hashed`] iterates in hash
@@ -130,8 +141,8 @@ impl<A: FixedKey, B: TableKey> TableKey for (A, B) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tag(pub u32);
 
-/// A handle's binding to its tag: `#[actor]` binds each table and
-/// committed map field when it loads the state.
+/// A handle's binding to its tag: `#[actor]` binds each field of the
+/// actor's struct when it loads the state.
 pub trait Bind {
     fn bound(tag: Tag) -> Self;
 }
@@ -244,6 +255,71 @@ rows_handle!(
     CommittedMap,
     Committed
 );
+
+/// The one key a [`Cell`]'s row is stored under: `0u8`, its table's only
+/// key.
+const CELL_KEY: u8 = 0;
+
+/// A single value of an actor's state: one row of a table, under the
+/// field's tag and the default transform, at the key `0u8`. Its row is
+/// the row a `Table<u8, T>` keeps under key `0`, so a cell reads the rows
+/// such a table wrote.
+pub struct Cell<T> {
+    table: Table<u8, T>,
+}
+
+/// An unbound handle, until the actor's state binds it to its tag.
+impl<T> Default for Cell<T> {
+    fn default() -> Self {
+        Self {
+            table: Table::default(),
+        }
+    }
+}
+
+impl<T> Bind for Cell<T> {
+    fn bound(tag: Tag) -> Self {
+        Self {
+            table: Table::new(tag),
+        }
+    }
+}
+
+impl<T> Cell<T> {
+    /// The rows the agent reaches for this cell: its table's.
+    pub const fn rows(&self) -> Rows {
+        self.table.rows()
+    }
+}
+
+impl<T: Encode + Decode> Cell<T> {
+    /// Its value; `None` when none was set, or when its row does not
+    /// decode.
+    pub fn get(&self) -> Option<T> {
+        self.table.get(&CELL_KEY)
+    }
+
+    /// Whether a value is set.
+    pub fn is_set(&self) -> bool {
+        self.table.contains(&CELL_KEY)
+    }
+
+    pub fn set(&mut self, value: &T) {
+        self.table.insert(&CELL_KEY, value);
+    }
+
+    /// Its value cleared: [`Cell::get`] is `None` again.
+    pub fn clear(&mut self) {
+        self.table.remove(&CELL_KEY);
+    }
+}
+
+impl<T: Encode + Decode + Default> Cell<T> {
+    /// Its value, or `T`'s default when none is set.
+    pub fn get_or_default(&self) -> T {
+        self.get().unwrap_or_default()
+    }
+}
 
 impl<K: TableKey, V, T: KeyTransform> CommittedMap<K, V, T> {
     /// Its row under `key`, as a read at a window's cut names it

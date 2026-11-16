@@ -1,7 +1,7 @@
 error[E0277]: the trait bound `notes::Tag: Method` is not satisfied
-  --> tests/compile_fail/command_calls_merge.rs:25:53
+  --> tests/compile_fail/command_calls_merge.rs:19:53
    |
-25 |             .call(Ref::<Notes>::new(InstanceId(1)), notes::Tag { tag })
+19 |             .call(Ref::<Notes>::new(InstanceId(1)), notes::Tag { tag })
    |              ----                                   ^^^^^^^^^^^^^^^^^^ the trait `Method` is not implemented for `notes::Tag`
    |              |
    |              required by a bound introduced by this call
@@ -14,11 +14,11 @@ note: required by a bound in `vos_sdk::context::Command::<A>::call`
    |                          ^^^^^^ required by this bound in `Command::<A>::call`
 
 error[E0277]: the trait bound `notes::Tag: Method` is not satisfied
-  --> tests/compile_fail/command_calls_merge.rs:24:17
+  --> tests/compile_fail/command_calls_merge.rs:18:17
    |
-24 |           let _ = ctx
+18 |           let _ = ctx
    |  _________________^
-25 | |             .call(Ref::<Notes>::new(InstanceId(1)), notes::Tag { tag })
+19 | |             .call(Ref::<Notes>::new(InstanceId(1)), notes::Tag { tag })
    | |_______________________________________________________________________^ the trait `Method` is not implemented for `notes::Tag`
    |
    = help: the trait `Method` is implemented for `Relay`
@@ -29,9 +29,9 @@ note: required by a bound in `vos_sdk::context::Command::<A>::call`
    |                          ^^^^^^ required by this bound in `Command::<A>::call`
 
 error[E0277]: the trait bound `notes::Tag: Method` is not satisfied
-  --> tests/compile_fail/command_calls_merge.rs:26:14
+  --> tests/compile_fail/command_calls_merge.rs:20:14
    |
-26 |             .await;
+20 |             .await;
    |              ^^^^^ the trait `Method` is not implemented for `notes::Tag`
    |
    = help: the trait `Method` is implemented for `Relay`

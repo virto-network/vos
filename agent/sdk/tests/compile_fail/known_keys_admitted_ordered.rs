@@ -7,11 +7,6 @@ pub struct Gated {
 
 #[messages]
 impl Gated {
-    pub fn new() -> Self {
-        Self {
-            admitted: Table::default(),
-        }
-    }
 }
 
 fn main() {}

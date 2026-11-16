@@ -2,19 +2,15 @@ use vos_sdk::prelude::*;
 
 #[actor]
 pub struct Shop {
-    orders: u64,
+    orders: Cell<u64>,
 }
 
 #[messages]
 impl Shop {
-    pub fn new() -> Self {
-        Self { orders: 0 }
-    }
-
     #[msg]
     pub async fn count(&mut self) -> u64 {
-        self.orders += 1;
-        self.orders
+        self.orders.set(&(self.orders.get_or_default() + 1));
+        self.orders.get_or_default()
     }
 
     /// Only a workflow awaits another agent.

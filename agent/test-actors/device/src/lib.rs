@@ -312,12 +312,6 @@ pub struct Device {
 
 #[messages]
 impl Device {
-    pub fn new() -> Self {
-        Self {
-            seen: Table::default(),
-        }
-    }
-
     /// A member signed in by a device proof of `auth`, once a nullifier:
     /// the nullifier, its claim's, and the program the proof was of.
     #[msg(proven = auth)]

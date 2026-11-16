@@ -10,10 +10,6 @@ pub struct Greedy {}
 
 #[messages]
 impl Greedy {
-    pub fn new() -> Self {
-        Self {}
-    }
-
     #[attestable(gas = 3_000_000)]
     pub fn hash(x: u64) -> u64 {
         x.rotate_left(7)

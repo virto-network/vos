@@ -11,20 +11,13 @@ use vos_sdk::prelude::*;
 
 #[actor(known_keys, onion_only)]
 pub struct Gated {
-    count: u64,
+    count: Cell<u64>,
     /// The keys ingress admits to create a session.
     admitted: Table<[u8; 32], ()>,
 }
 
 #[messages]
 impl Gated {
-    pub fn new() -> Self {
-        Self {
-            count: 0,
-            admitted: Table::default(),
-        }
-    }
-
     /// Admit `key` to create a session.
     #[msg]
     pub async fn admit(&mut self, key: [u8; 32]) {
@@ -39,13 +32,13 @@ impl Gated {
 
     #[msg]
     pub async fn bump(&mut self) -> u64 {
-        self.count += 1;
-        self.count
+        self.count.set(&(self.count.get_or_default() + 1));
+        self.count.get_or_default()
     }
 
     #[msg]
     pub async fn count(&self) -> u64 {
-        self.count
+        self.count.get_or_default()
     }
 }
 
@@ -54,10 +47,6 @@ pub struct Door {}
 
 #[messages]
 impl Door {
-    pub fn new() -> Self {
-        Self {}
-    }
-
     /// Admit `key` to the gated actor at `instance` of agent `agent`, by
     /// message.
     #[msg]

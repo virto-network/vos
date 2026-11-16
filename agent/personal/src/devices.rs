@@ -23,7 +23,7 @@ use vos_wire::personal::{
     Verdict, Void,
 };
 
-use crate::rows::{ONE, Recovery};
+use crate::rows::Recovery;
 use crate::{KIT_ENTRIES, Personal};
 
 /// The steps a call settles before it runs: with the one maturity its own
@@ -836,14 +836,11 @@ impl Personal {
             }
             Op::Rotate(kit) => {
                 self.replace_kit(&kit.entries, r2, at);
-                self.recovery.insert(
-                    &ONE,
-                    &Recovery {
-                        from: self.scopes.get(&RECOVERY).unwrap_or(0),
-                        released: None,
-                        previous: Vec::new(),
-                    },
-                );
+                self.recovery.set(&Recovery {
+                    from: self.scopes.get(&RECOVERY).unwrap_or(0),
+                    released: None,
+                    previous: Vec::new(),
+                });
             }
             Op::Regroup(named) => {
                 for device in named {
@@ -852,7 +849,7 @@ impl Personal {
                 self.new_group(now);
             }
             Op::Restore { device, kit } => {
-                let previous = self.secrets.get(&ONE);
+                let previous = self.secrets.get();
                 let entries: Vec<KitEntry> = self.kit.iter(None).map(|(_, entry)| entry).collect();
                 let live: Vec<DeviceId> = self.live.iter(None).map(|(id, ())| id).collect();
                 for id in live {
@@ -866,14 +863,11 @@ impl Personal {
                     self.seen.insert(&added, &now);
                     self.tell_home(crate::home::Record { nullifier });
                 }
-                self.recovery.insert(
-                    &ONE,
-                    &Recovery {
-                        from: self.scopes.get(&RECOVERY).unwrap_or(0),
-                        released: added.zip(previous),
-                        previous: entries,
-                    },
-                );
+                self.recovery.set(&Recovery {
+                    from: self.scopes.get(&RECOVERY).unwrap_or(0),
+                    released: added.zip(previous),
+                    previous: entries,
+                });
             }
         }
     }
@@ -916,7 +910,7 @@ impl Personal {
             self.admitted.insert(&entry.signing, &Holder::Kit(i as u8));
             self.kit.insert(&(i as u8), entry);
         }
-        self.secrets.insert(&ONE, &r2);
+        self.secrets.set(&r2);
         self.tell_home(crate::home::Rekey {
             keys: entries.iter().map(|entry| entry.signing).collect(),
         });
@@ -945,10 +939,10 @@ impl Personal {
         for (i, entry) in entries.iter().enumerate() {
             self.kit.insert(&(i as u8), entry);
         }
-        self.secrets.insert(&ONE, &r2);
-        let mut recovery = self.recovery.get(&ONE).unwrap_or_default();
+        self.secrets.set(&r2);
+        let mut recovery = self.recovery.get().unwrap_or_default();
         recovery.from = self.scopes.get(&RECOVERY).unwrap_or(0);
-        self.recovery.insert(&ONE, &recovery);
+        self.recovery.set(&recovery);
     }
 
     /// A regroup or a restore starts a new group: the pending candidate,

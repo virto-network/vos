@@ -42,14 +42,18 @@ pub(crate) fn string_arg(meta: &syn::meta::ParseNestedMeta) -> syn::Result<Strin
 
 // ===== #[actor] =====
 
-/// The actor's state: a struct whose encoding is stored under the instance,
-/// and whose `Table`, `CommittedMap` and merge fields (`crdt::GSet`,
-/// `crdt::Set`, `crdt::Map`, named through `crdt`) are handles to rows
-/// stored beside it.
+/// The actor's state: a struct of handles on the instance's rows, every
+/// field a `Table`, a `Cell` (one value: a one-row table), a
+/// `CommittedMap` or a merge field (`crdt::GSet`, `crdt::Set`, `crdt::Map`,
+/// named through `crdt`). The struct stores nothing itself, so a field of
+/// any other type is refused; a new instance's struct is each handle's
+/// `Default`.
 ///
-/// A table's or merge field's tag derives from its field's name, or from
-/// `#[table(name = "...")]`, which keeps rows reachable when the field is
-/// renamed. Its key transform is its type's.
+/// A field's tag derives from its name, or from `#[table(name = "...")]`,
+/// which keeps rows reachable when the field is renamed. Its key transform
+/// is its type's. The rows a version wrote are read by the next under the
+/// same names, keys and value encodings: a version adds fields, and gives
+/// a value whose shape changes a new field (`vos_sdk::table`).
 ///
 /// `#[actor(credentials)]` marks its agent's credential actor
 /// (`identity-and-authority.md` §6): its program's schema says so, and its
@@ -151,8 +155,6 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   Owner)]`, or `proven = owner`, the callers proving an owner digest's
 ///   secret, which `ctx.owner()` gives. Only a `&mut self` handler takes
 ///   a guard, with no role and not `linearizable`.
-/// - **A new instance's state:** the impl block must define
-///   `fn new() -> Self`.
 #[proc_macro_attribute]
 pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut module = None;

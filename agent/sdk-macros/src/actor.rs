@@ -1,10 +1,15 @@
-//! `#[actor]`: the state struct's encoding, its tables' and merge fields'
-//! tags, and the view
-//! an attestable `&self` method reads: `<Actor>View`, its committed maps
-//! alone, each a [`ServedMap`](vos_sdk::table::ServedMap) of the same keys,
-//! values and transform, answering from the rows served at a window's cut.
-//! Its plain fields and tables are not in it, so a method that reads one
-//! does not compile.
+//! `#[actor]`: the state struct's fields, each a handle on rows (a table,
+//! a cell, a committed map or a merge field) bound to the tag its name
+//! derives, the struct of unbound handles a new state starts from, and the
+//! view an attestable `&self` method reads: `<Actor>View`, its committed
+//! maps alone, each a [`ServedMap`](vos_sdk::table::ServedMap) of the same
+//! keys, values and transform, answering from the rows served at a
+//! window's cut. Its tables and cells are not in it, so a method that
+//! reads one does not compile.
+//!
+//! A field that is no handle is refused: a value kept in the struct would
+//! be one stored row of every field, which no later version could add a
+//! field to.
 
 use proc_macro2::TokenStream as Tokens;
 use quote::{format_ident, quote};
@@ -42,6 +47,7 @@ pub(crate) fn actor_impl(mut input: ItemStruct, marks: Marks) -> syn::Result<Tok
     let mut views = Vec::new();
     let mut viewed = Vec::new();
     let mut admitted = false;
+    let mut idents = Vec::new();
     for field in &mut fields.named {
         let ident = field.ident.clone().expect("named field");
         let mut table_name = None;
@@ -67,11 +73,17 @@ pub(crate) fn actor_impl(mut input: ItemStruct, marks: Marks) -> syn::Result<Tok
         field.attrs = kept;
         if !(explicit
             || is_named(&field.ty, "Table")
+            || is_named(&field.ty, "Cell")
             || is_named(&field.ty, "CommittedMap")
             || is_merge_field(&field.ty))
         {
-            continue;
+            return Err(Error::new(
+                field.ty.span(),
+                "an actor's state is its rows: a single value is a `Cell<T>`, and every field \
+                 a `Table`, a `Cell`, a `CommittedMap` or a merge field (`crdt::...`)",
+            ));
         }
+        idents.push(ident.clone());
         let table_name = table_name.unwrap_or_else(|| ident.to_string());
         if known_keys && table_name == ADMITTED {
             if !admitted_table(&field.ty) {
@@ -84,7 +96,6 @@ pub(crate) fn actor_impl(mut input: ItemStruct, marks: Marks) -> syn::Result<Tok
             admitted = true;
         }
         let tag = tags.take("vos/table/", &table_name, field.span())?;
-        field.attrs.push(syn::parse_quote!(#[codec(skip)]));
         binds.push(quote! {
             self.#ident = ::vos_sdk::table::Bind::bound(::vos_sdk::table::Tag(#tag));
         });
@@ -111,8 +122,15 @@ pub(crate) fn actor_impl(mut input: ItemStruct, marks: Marks) -> syn::Result<Tok
          as served at a window's cut."
     );
     Ok(quote! {
-        #[derive(::vos_sdk::Encode, ::vos_sdk::Decode)]
         #input
+
+        impl ::vos_sdk::state::New for #name {
+            fn new() -> Self {
+                Self {
+                    #(#idents: ::core::default::Default::default(),)*
+                }
+            }
+        }
 
         impl ::vos_sdk::state::Marked for #name {
             const CREDENTIALS: bool = #credentials;
@@ -146,8 +164,8 @@ pub(crate) fn actor_impl(mut input: ItemStruct, marks: Marks) -> syn::Result<Tok
 }
 
 /// Whether `ty` is a merge field: `crdt::GSet`, `crdt::Set` or `crdt::Map`,
-/// named through the `crdt` module so a type of the actor's own named
-/// `Set` or `Map` stays a plain field.
+/// named through the `crdt` module, apart from a type of the actor's own
+/// named `Set` or `Map`.
 fn is_merge_field(ty: &Type) -> bool {
     let Type::Path(path) = ty else {
         return false;

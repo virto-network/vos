@@ -8,13 +8,6 @@ pub struct Counter {
 
 #[messages]
 impl Counter {
-    pub fn new() -> Self {
-        Self {
-            notes: Table::default(),
-            entries: CommittedMap::default(),
-        }
-    }
-
     /// A table is no committed map: no root proves its rows.
     #[attestable]
     pub fn reads_a_table(&self, key: u32) -> Option<u64> {

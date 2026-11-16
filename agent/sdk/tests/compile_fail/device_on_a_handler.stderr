@@ -1,5 +1,5 @@
 error: only an #[attestable] method is a device kernel: `proven = k` names one on a handler
-  --> tests/compile_fail/device_on_a_handler.rs:15:11
+  --> tests/compile_fail/device_on_a_handler.rs:11:11
    |
-15 |     #[msg(device)]
+11 |     #[msg(device)]
    |           ^^^^^^

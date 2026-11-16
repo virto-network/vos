@@ -19,18 +19,11 @@ pub enum PollError {
 #[actor]
 pub struct Poll {
     votes: Table<u8, u32>,
-    logins: u64,
+    logins: Cell<u64>,
 }
 
 #[messages]
 impl Poll {
-    pub fn new() -> Self {
-        Self {
-            votes: Table::default(),
-            logins: 0,
-        }
-    }
-
     /// One vote for `choice`, once a member: the count after it.
     #[msg(credential = Auth("vote"), once)]
     pub async fn vote(&mut self, choice: u8) -> Result<u32, PollError> {
@@ -46,7 +39,7 @@ impl Poll {
     /// A member signed in: its pseudonym in the scope `"login"`.
     #[msg(credential = Auth("login"))]
     pub async fn login(&mut self, ctx: &mut Command<Self>) -> Option<[u8; 32]> {
-        self.logins += 1;
+        self.logins.set(&(self.logins.get_or_default() + 1));
         ctx.nullifier()
     }
 
@@ -59,7 +52,7 @@ impl Poll {
     /// The sign-ins so far.
     #[msg]
     pub async fn logins(&self) -> u64 {
-        self.logins
+        self.logins.get_or_default()
     }
 }
 

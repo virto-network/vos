@@ -7,12 +7,6 @@ pub struct Notes {
 
 #[messages]
 impl Notes {
-    pub fn new() -> Self {
-        Self {
-            tags: Default::default(),
-        }
-    }
-
     #[msg(merge)]
     pub async fn tag(&mut self, tag: u64) {
         self.tags.insert(&tag);

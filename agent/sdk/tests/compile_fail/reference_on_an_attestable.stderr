@@ -1,7 +1,7 @@
 error: only an #[attestable(device)] method takes an argument by reference, read in place
-  --> tests/compile_fail/reference_on_an_attestable.rs:15:25
+  --> tests/compile_fail/reference_on_an_attestable.rs:11:25
    |
-15 |     pub fn echo(digest: &Digest) -> u32 {
+11 |     pub fn echo(digest: &Digest) -> u32 {
    |                         ^^^^^^^
 
 warning: unused import: `vos_sdk::p2::Digest`

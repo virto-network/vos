@@ -497,10 +497,10 @@ impl<A: Tables + New> Workflow<A> {
     }
 }
 
-impl<A: Encode + Decode + Tables + New> Workflow<A> {
-    /// Read the state of the workflow's instance, its tables included, in
-    /// a section: `f`'s result. A new instance's state when none is stored.
-    /// It borrows the context whole, so `f` reaches nothing of it.
+impl<A: Tables + New> Workflow<A> {
+    /// Read the state of the workflow's instance, its rows, in a section:
+    /// `f`'s result. It borrows the context whole, so `f` reaches nothing
+    /// of it.
     pub fn read<R>(&mut self, f: impl FnOnce(&A) -> R) -> R {
         let (_, instance) = self.me();
         host::open(instance.0);
@@ -510,16 +510,13 @@ impl<A: Encode + Decode + Tables + New> Workflow<A> {
         result
     }
 
-    /// Read and change the state of the workflow's instance, its tables
-    /// included, atomically in a section: `f`'s result. The state is
-    /// written back if it changed; its tables' writes are `f`'s own.
+    /// Read and change the state of the workflow's instance atomically in
+    /// a section: `f`'s result, its rows' writes `f`'s own.
     pub fn update<R>(&mut self, f: impl FnOnce(&mut A) -> R) -> R {
         let (_, instance) = self.me();
         host::open(instance.0);
         let mut state = state::load::<A>();
-        let before = state.encode();
         let result = f(&mut state);
-        state::save(&state, &before);
         host::close();
         result
     }

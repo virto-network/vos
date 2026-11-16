@@ -1,7 +1,7 @@
 error[E0609]: no field `notes` on type `&CounterView`
-  --> tests/compile_fail/attestable_reads_a_table.rs:21:14
+  --> tests/compile_fail/attestable_reads_a_table.rs:14:14
    |
-21 |         self.notes.get(&key)
+14 |         self.notes.get(&key)
    |              ^^^^^ unknown field
    |
    = note: available field is: `entries`

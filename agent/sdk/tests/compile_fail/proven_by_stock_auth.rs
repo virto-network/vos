@@ -2,19 +2,15 @@ use vos_sdk::prelude::*;
 
 #[actor]
 pub struct Poll {
-    votes: u64,
+    votes: Cell<u64>,
 }
 
 #[messages]
 impl Poll {
-    pub fn new() -> Self {
-        Self { votes: 0 }
-    }
-
     /// The stock auth kernel proves a pseudonym in a scope it names.
     #[msg(proven = auth)]
     pub fn vote(&mut self) {
-        self.votes += 1;
+        self.votes.set(&(self.votes.get_or_default() + 1));
     }
 
     #[attestable(device, reference = reference)]

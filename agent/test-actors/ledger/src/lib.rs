@@ -7,7 +7,7 @@ use vos_sdk::prelude::*;
 
 #[actor]
 pub struct Ledger {
-    total: u64,
+    total: Cell<u64>,
     #[table(name = "balances")]
     accounts: Table<u64, u64, Ordered>,
 }
@@ -20,31 +20,26 @@ pub enum LedgerError {
 
 #[messages]
 impl Ledger {
-    pub fn new() -> Self {
-        Self {
-            total: 0,
-            accounts: Table::default(),
-        }
-    }
-
     /// Credit `to`; only a "minter" may.
     #[msg(role = "minter")]
     pub async fn mint(&mut self, to: u64, amount: u64) -> u64 {
         let balance = self.accounts.get(&to).unwrap_or(0) + amount;
         self.accounts.insert(&to, &balance);
-        self.total += amount;
+        self.total.set(&(self.total.get_or_default() + amount));
         balance
     }
 
     /// Credit each of `accounts`; only a "minter" may.
     #[msg(role = "minter", gas = 100_000_000)]
     pub async fn mint_all(&mut self, accounts: Vec<(u64, u64)>) -> u64 {
+        let mut total = self.total.get_or_default();
         for (to, amount) in &accounts {
             let balance = self.accounts.get(to).unwrap_or(0) + amount;
             self.accounts.insert(to, &balance);
-            self.total += amount;
+            total += amount;
         }
-        self.total
+        self.total.set(&total);
+        total
     }
 
     #[msg(gas = 2_000_000)]
@@ -66,7 +61,7 @@ impl Ledger {
 
     #[msg]
     pub async fn total(&self) -> u64 {
-        self.total
+        self.total.get_or_default()
     }
 
     /// Every non-empty account, in id order.

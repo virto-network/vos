@@ -157,21 +157,19 @@ accumulate (IC 5).
 
 ### 6.2 The actor framework [decided shape; API proposed]
 
-An actor is a struct holding its private state and an impl block of
-methods. Each method takes `self` and a context:
+An actor is a struct of handles on its private state's rows (section
+9.1) and an impl block of methods. Each method takes `self` and a context:
 
 ```rust
 #[actor(role = LedgerRole)]
 pub struct Ledger {
-    owner: PrincipalId,                           // Linear
+    owner: Cell<PrincipalId>,                     // Linear, one row
     accounts: CommittedMap<AccountId, Account>,   // Linear, committed: attestable reads
     notes: crdt::List<Note>,                      // Merge
 }
 
 #[messages]
 impl Ledger {
-    fn new() -> Self { /* ... */ }
-
     /// Query: any replica, applied state, outside the log.
     #[msg]
     async fn balance(&self, ctx: &Query<Self>, id: AccountId) -> u64 { /* ... */ }
@@ -698,11 +696,32 @@ Why handlers run to completion:
 ```rust
 #[actor]
 struct Channel {
-    topic: String,                     // Linear
-    members: Table<PrincipalId, Role>, // Linear, storage-backed
+    topic: Cell<String>,               // Linear, one row
+    members: Table<PrincipalId, Role>, // Linear, its rows
     posts: crdt::List<Post>,           // Merge
 }
 ```
+
+**State is rows; the struct holds handles only** [decided; built,
+`vos_sdk::table`]. Every field is a `Table`, a `Cell<T>` (one value: a
+one-row table, its row at key `0u8` under the field's tag), a
+`CommittedMap` or a merge field, and `#[actor]` refuses any other: a value
+kept in the struct would be one stored row of all its fields, which no
+later version could add a field to. A handler reads and writes the rows
+it touches and nothing else; a new instance has no rows, and its struct
+is each handle's `Default` (no `new()`).
+
+**The row-value rule** [decided]. A stored row's layout is its field's
+name (its tag), its key's encoding and its value's encoding, and an
+install replaces the program without touching a row. The codec has no
+optional tail, so **a changed value type needs a new table**: a version
+adds tables and cells under new names, and gives a value whose shape
+changes a new field of a new type, reading the old rows through the old
+field for as long as they matter. A field renamed keeps its rows with
+`#[table(name = "...")]`. An optional tail on the codec
+(`#[codec(tail)]`) was the alternative, not taken: it would make every
+row type's decode depend on which versions wrote it. A change no new
+table expresses waits for state migration (`open.md`, "Upgrades").
 
 The Local (replica-only) lane is deferred until a use case needs it.
 
@@ -1178,7 +1197,7 @@ outbox sequence numbers, which receivers deduplicate.
   served witness: the rows it reads and one multiproof against the agent
   root at the window's cut, the representative's root and salt, and the
   path to the space root. The witness travels inline in the `Resume`
-  input, under `Limits::served`. Plain fields and tables have no root, so
+  input, under `Limits::served`. Tables and cells have no root, so
   the macro rejects any use of them.
 - **Outputs:** public: the statement, its program id, space, `#[public]`
   arguments, output and the roots it read (`proving.md` §3.6); writes are

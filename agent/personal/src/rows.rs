@@ -6,9 +6,6 @@ use alloc::vec::Vec;
 use vos_sdk::prelude::*;
 use vos_wire::personal::{DeviceId, KitEntry, NewKit, Pending};
 
-/// The key of a table holding one row.
-pub const ONE: u8 = 0;
-
 /// The control log's next index and its chain so far.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
 pub struct Head {

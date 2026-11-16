@@ -1,5 +1,5 @@
 error: `proven = proof` names no #[attestable(device)] method of this actor, and no stock kernel
-  --> tests/compile_fail/guard_names_no_device_kernel.rs:15:11
+  --> tests/compile_fail/guard_names_no_device_kernel.rs:11:11
    |
-15 |     #[msg(proven = proof)]
+11 |     #[msg(proven = proof)]
    |           ^^^^^^

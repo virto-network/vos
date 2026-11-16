@@ -90,7 +90,7 @@ use vos_sdk::prelude::*;
 use vos_wire::credentials::{
     self as tree, CONFIRM_MS, Change, CredentialError, DEPTH, Digest, EMPTY, ENROLL_MANY,
     ENROLLMENT_PERIOD_MS, FEED_BYTES, Feed, MAX_DEVICES, MAX_DIFFICULTY, MAX_ONIONS, Onion, Open,
-    Path, REPLACEMENTS, Ring, RootEntry, Siblings, Words, tables::RING_KEY,
+    Path, REPLACEMENTS, Ring, RootEntry, Siblings, Words,
 };
 
 /// The open claim's terms and the current period's count.
@@ -203,28 +203,28 @@ mod reference {
 
 #[actor(credentials)]
 pub struct Credentials {
-    /// The space's handle, 32 bytes its founder drew; zeros until `found`.
-    handle: Digest,
+    /// The space's handle, 32 bytes its founder drew; unset until `found`.
+    handle: Cell<Digest>,
     /// The lowest slot never used.
-    next: u64,
+    next: Cell<u64>,
     /// The members enrolled.
-    count: u64,
+    count: Cell<u64>,
     slots: Table<Digest, u32>,
     nodes: Table<(u8, u32), Digest>,
     free: Table<u32, (), Ordered>,
     invites: Table<Digest, u64>,
-    ring: Table<u8, Ring>,
-    opening: Table<u8, Opening>,
+    ring: Cell<Ring>,
+    opening: Cell<Opening>,
     persons: Table<u32, Person>,
     owners: Table<Digest, u32>,
     /// Each owner digest an enrollment named, its person's, until its
     /// confirmation or, past the time kept with it, another enrollment.
     pending: Table<Digest, (u32, u64)>,
     devices: Table<Digest, u32>,
-    people: Table<u8, u32>,
-    onions: Table<u8, Vec<Onion>>,
+    people: Cell<u32>,
+    onions: Cell<Vec<Onion>>,
     /// The tree's writes, the feed's length.
-    changed: u64,
+    changed: Cell<u64>,
     changes: Table<u64, Change, Ordered>,
     /// Each root a write left → the last write that left it.
     roots: Table<Digest, u64>,
@@ -232,29 +232,6 @@ pub struct Credentials {
 
 #[messages]
 impl Credentials {
-    pub fn new() -> Self {
-        Self {
-            handle: [0; 32],
-            next: 0,
-            count: 0,
-            slots: Table::default(),
-            nodes: Table::default(),
-            free: Table::default(),
-            invites: Table::default(),
-            ring: Table::default(),
-            opening: Table::default(),
-            persons: Table::default(),
-            owners: Table::default(),
-            pending: Table::default(),
-            devices: Table::default(),
-            people: Table::default(),
-            onions: Table::default(),
-            changed: 0,
-            changes: Table::default(),
-            roots: Table::default(),
-        }
-    }
-
     /// Set the space's handle, once, and the ring's first root, the empty
     /// tree's: the install's step. A re-founded space's actor takes the
     /// ended space's handle.
@@ -264,14 +241,14 @@ impl Credentials {
         ctx: &mut Command<Self>,
         handle: Digest,
     ) -> Result<(), CredentialError> {
-        if self.handle != [0; 32] {
+        if self.handle.is_set() {
             return Err(CredentialError::Founded);
         }
         if handle == [0; 32] {
             return Err(CredentialError::ZeroHandle);
         }
-        self.handle = handle;
-        self.ring.insert(&RING_KEY, &Ring::installed(ctx.now()));
+        self.handle.set(&handle);
+        self.ring.set(&Ring::installed(ctx.now()));
         Ok(())
     }
 
@@ -306,12 +283,14 @@ impl Credentials {
         }
         let mut leaves = BTreeMap::new();
         let mut slots = Vec::with_capacity(members.len());
+        let mut counts = self.counts();
         for member in &members {
             let leaf = self.admit(member)?;
-            let slot = self.place(member, false)?;
+            let slot = self.place_in(&mut counts, member, false)?;
             leaves.insert(slot, leaf);
             slots.push(slot);
         }
+        self.keep(counts);
         if !leaves.is_empty() {
             self.write(ctx.now(), leaves);
         }
@@ -370,7 +349,7 @@ impl Credentials {
         }
         let now = ctx.now();
         let period = now / period_ms;
-        let opening = match self.opening.get(&RING_KEY) {
+        let opening = match self.opening.get() {
             Some(opening) => Opening {
                 difficulty,
                 cap,
@@ -392,7 +371,7 @@ impl Credentials {
                 count: 0,
             },
         };
-        self.opening.insert(&RING_KEY, &opening);
+        self.opening.set(&opening);
         Ok(())
     }
 
@@ -409,7 +388,7 @@ impl Credentials {
         let leaf = self.admit(&member)?;
         let mut opening = self
             .opening
-            .get(&RING_KEY)
+            .get()
             .filter(|opening| opening.cap > 0)
             .ok_or(CredentialError::Closed)?;
         let now = ctx.now();
@@ -423,7 +402,7 @@ impl Credentials {
             .any(|period| {
                 let salt = tree::open_salt(&opening.seed, period);
                 tree::meets(
-                    &tree::open_work(&self.handle, &member, &salt, nonce),
+                    &tree::open_work(&self.handle.get_or_default(), &member, &salt, nonce),
                     opening.difficulty,
                 )
             });
@@ -435,7 +414,7 @@ impl Credentials {
             opening.count = 0;
         }
         opening.count += 1;
-        self.opening.insert(&RING_KEY, &opening);
+        self.opening.set(&opening);
         let slot = self.place(&member, true)?;
         self.write(now, BTreeMap::from([(slot, leaf)]));
         Ok(slot)
@@ -486,9 +465,9 @@ impl Credentials {
         if self.pending.contains(&owner) {
             self.pending.remove(&owner);
         }
-        let id = self.people.get(&RING_KEY).unwrap_or(0);
+        let id = self.people.get().unwrap_or(0);
         let next = id.checked_add(1).ok_or(CredentialError::Full)?;
-        self.people.insert(&RING_KEY, &next);
+        self.people.set(&next);
         let person = Person {
             limit,
             devices: Vec::new(),
@@ -659,7 +638,7 @@ impl Credentials {
     #[msg]
     pub async fn root(&self) -> RootEntry {
         self.ring
-            .get(&RING_KEY)
+            .get()
             .and_then(|ring| ring.newest().copied())
             .unwrap_or(RootEntry {
                 root: tree::digest(&EMPTY[DEPTH]),
@@ -700,7 +679,7 @@ impl Credentials {
         Feed {
             from,
             changes,
-            length: self.changed,
+            length: self.changed.get_or_default(),
         }
     }
 
@@ -716,26 +695,26 @@ impl Credentials {
         if onions.len() > MAX_ONIONS || repeated {
             return Err(CredentialError::TooMany);
         }
-        self.onions.insert(&RING_KEY, &onions);
+        self.onions.set(&onions);
         Ok(())
     }
 
     /// The space's onion set; empty until the registrar sets one.
     #[msg]
     pub async fn onions(&self) -> Vec<Onion> {
-        self.onions.get(&RING_KEY).unwrap_or_default()
+        self.onions.get().unwrap_or_default()
     }
 
     /// The space's handle; zeros before `found`.
     #[msg]
     pub async fn handle(&self) -> Digest {
-        self.handle
+        self.handle.get_or_default()
     }
 
     /// The members enrolled.
     #[msg]
     pub async fn count(&self) -> u64 {
-        self.count
+        self.count.get_or_default()
     }
 
     /// The open claim's terms now: its salt, its difficulty, its period,
@@ -746,10 +725,7 @@ impl Credentials {
     /// asks again.
     #[msg]
     pub async fn opening(&self, ctx: &Query<Self>) -> Option<Open> {
-        let opening = self
-            .opening
-            .get(&RING_KEY)
-            .filter(|opening| opening.cap > 0)?;
+        let opening = self.opening.get().filter(|opening| opening.cap > 0)?;
         let now = ctx.now();
         Some(Open {
             salt: tree::open_salt(&opening.seed, now / opening.period_ms),
@@ -784,7 +760,7 @@ impl Credentials {
 
 impl Credentials {
     fn founded(&self) -> Result<(), CredentialError> {
-        if self.handle == [0; 32] {
+        if !self.handle.is_set() {
             Err(CredentialError::Unfounded)
         } else {
             Ok(())
@@ -848,7 +824,7 @@ impl Credentials {
         if let Some(slot) = self.slots.get(member) {
             self.slots.remove(member);
             self.free.insert(&slot, &());
-            self.count -= 1;
+            self.count.set(&(self.count.get_or_default() - 1));
             Ok(Some(slot))
         } else if self.invites.contains(member) {
             self.invites.remove(member);
@@ -880,9 +856,36 @@ impl Credentials {
         Ok(tree::leaf(&words))
     }
 
-    /// Give `member` the lowest freed slot when `reuse`, else (or when none
-    /// is freed) the lowest never used, and drop its invitation.
+    /// [`Credentials::place_in`] for one member, the counts read and kept
+    /// around it.
     fn place(&mut self, member: &Digest, reuse: bool) -> Result<u32, CredentialError> {
+        let mut counts = self.counts();
+        let slot = self.place_in(&mut counts, member, reuse)?;
+        self.keep(counts);
+        Ok(slot)
+    }
+
+    /// The lowest slot never used and the members enrolled, read once for
+    /// a handler's placements.
+    fn counts(&self) -> (u64, u64) {
+        (self.next.get_or_default(), self.count.get_or_default())
+    }
+
+    /// Keep `counts` after a handler's placements.
+    fn keep(&mut self, (next, count): (u64, u64)) {
+        self.next.set(&next);
+        self.count.set(&count);
+    }
+
+    /// Give `member` the lowest freed slot when `reuse`, else (or when none
+    /// is freed) the lowest never used, counted in `counts`, and drop its
+    /// invitation.
+    fn place_in(
+        &mut self,
+        (next, count): &mut (u64, u64),
+        member: &Digest,
+        reuse: bool,
+    ) -> Result<u32, CredentialError> {
         let lowest = if reuse { self.free.first() } else { None };
         let slot = match lowest {
             Some((slot, ())) => {
@@ -890,13 +893,13 @@ impl Credentials {
                 slot
             }
             None => {
-                let slot = u32::try_from(self.next).map_err(|_| CredentialError::Full)?;
-                self.next += 1;
+                let slot = u32::try_from(*next).map_err(|_| CredentialError::Full)?;
+                *next += 1;
                 slot
             }
         };
         self.slots.insert(member, &slot);
-        self.count += 1;
+        *count += 1;
         if self.invites.contains(member) {
             self.invites.remove(member);
         }
@@ -954,12 +957,12 @@ impl Credentials {
             root: tree::digest(&changed[&0]),
             since: time,
         };
-        let mut ring = self.ring.get(&RING_KEY).unwrap_or_default();
+        let mut ring = self.ring.get().unwrap_or_default();
         ring.record(root.root, time);
-        self.ring.insert(&RING_KEY, &ring);
-        self.changes
-            .insert(&self.changed, &Change { leaves: set, root });
-        self.roots.insert(&root.root, &self.changed);
-        self.changed += 1;
+        self.ring.set(&ring);
+        let length = self.changed.get_or_default();
+        self.changes.insert(&length, &Change { leaves: set, root });
+        self.roots.insert(&root.root, &length);
+        self.changed.set(&(length + 1));
     }
 }

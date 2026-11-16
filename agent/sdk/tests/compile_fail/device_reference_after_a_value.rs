@@ -6,10 +6,6 @@ pub struct Kernels {}
 
 #[messages]
 impl Kernels {
-    pub fn new() -> Self {
-        Self {}
-    }
-
     /// An argument by reference after one by value would lie unaligned.
     #[attestable(device, reference = reference)]
     pub fn owner(slot: u32, secret: &Secret, #[public] owner: &Digest) {

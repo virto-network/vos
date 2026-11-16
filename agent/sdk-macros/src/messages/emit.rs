@@ -278,7 +278,6 @@ pub(super) fn workflow_arm(handler: &Handler, actor: &Ident, message: &Ident) ->
     let outcome = outcome(
         handler,
         quote!(super::#actor::#method(#argument #(#names),*)),
-        quote!(),
     );
     quote! {
         #id => {
@@ -291,8 +290,7 @@ pub(super) fn workflow_arm(handler: &Handler, actor: &Ident, message: &Ident) ->
 }
 
 /// A handler's arm of the dispatcher: its message decoded, its instance's
-/// state loaded, its outcome passed to the agent, and a command's state
-/// saved when it replies.
+/// handles bound, its outcome passed to the agent.
 pub(super) fn handler_arm(handler: &Handler, actor: &Ident, message: &Ident) -> Tokens {
     let method = &handler.method.sig.ident;
     let id = handler.id;
@@ -303,29 +301,11 @@ pub(super) fn handler_arm(handler: &Handler, actor: &Ident, message: &Ident) -> 
         (Kind::Merge, true) => quote!(&mut ::vos_sdk::context::MergeContext::new(),),
         _ => quote!(),
     };
-    // A merge handler reads no state: its instance's struct is a new
-    // instance's, its merge fields bound, so its effects are its
-    // operation's alone; one that changes a plain field writes the
-    // struct, which the merge entry refuses.
-    let (state, save) = match handler.kind {
-        Kind::Command => (
-            quote! {
-                let mut state = ::vos_sdk::state::load::<super::#actor>();
-                let before = ::vos_sdk::Encode::encode(&state);
-            },
-            quote!(::vos_sdk::state::save(&state, &before);),
-        ),
-        Kind::Merge => (
-            quote! {
-                let mut state = ::vos_sdk::state::fresh::<super::#actor>();
-                let before = ::vos_sdk::Encode::encode(&state);
-            },
-            quote!(::vos_sdk::state::save(&state, &before);),
-        ),
-        _ => (
-            quote!(let state = ::vos_sdk::state::load::<super::#actor>();),
-            quote!(),
-        ),
+    let state = match handler.kind {
+        Kind::Command | Kind::Merge => {
+            quote!(let mut state = ::vos_sdk::state::load::<super::#actor>();)
+        }
+        _ => quote!(let state = ::vos_sdk::state::load::<super::#actor>();),
     };
     // A kernel guard's claim, unwrapped from its own part.
     let arguments = names
@@ -335,11 +315,7 @@ pub(super) fn handler_arm(handler: &Handler, actor: &Ident, message: &Ident) -> 
             true => quote!(message.#name.0),
             false => quote!(message.#name),
         });
-    let outcome = outcome(
-        handler,
-        quote!(state.#method(#context #(#arguments),*)),
-        save,
-    );
+    let outcome = outcome(handler, quote!(state.#method(#context #(#arguments),*)));
     quote! {
         #id => {
             let message = ::vos_sdk::runtime::arguments::<#message>();
@@ -349,10 +325,10 @@ pub(super) fn handler_arm(handler: &Handler, actor: &Ident, message: &Ident) -> 
     }
 }
 
-/// The method's `call`, run to completion when it is `async`: its reply,
-/// after `save`, or its error, passed to the agent. A method that cannot
-/// fail always replies.
-pub(super) fn outcome(handler: &Handler, call: Tokens, save: Tokens) -> Tokens {
+/// The method's `call`, run to completion when it is `async`: its reply
+/// or its error, passed to the agent. A method that cannot fail always
+/// replies.
+pub(super) fn outcome(handler: &Handler, call: Tokens) -> Tokens {
     let call = if handler.method.sig.asyncness.is_some() {
         quote!(::vos_sdk::runtime::block_on(#call))
     } else {
@@ -366,7 +342,6 @@ pub(super) fn outcome(handler: &Handler, call: Tokens, save: Tokens) -> Tokens {
     quote! {
         match #result {
             ::core::result::Result::Ok(reply) => {
-                #save
                 ::vos_sdk::host::reply(&::vos_sdk::Encode::encode(&reply));
             }
             ::core::result::Result::Err(error) => {

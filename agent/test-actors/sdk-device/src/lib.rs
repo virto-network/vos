@@ -116,10 +116,6 @@ pub struct SdkDevice {}
 
 #[messages]
 impl SdkDevice {
-    pub fn new() -> Self {
-        Self {}
-    }
-
     /// The secret's member's leaf lies under `map_root` by `path`, and
     /// `nullifier` is its nullifier in `scope`.
     #[attestable(device, reference = reference::auth)]

@@ -29,16 +29,6 @@ pub enum NotesError {
 
 #[messages]
 impl Notes {
-    pub fn new() -> Self {
-        Self {
-            tags: Default::default(),
-            items: Default::default(),
-            titles: Default::default(),
-            counts: Default::default(),
-            scratch: Table::default(),
-        }
-    }
-
     #[msg(merge)]
     pub async fn tag(&mut self, tag: String) {
         self.tags.insert(&tag);

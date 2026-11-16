@@ -17,10 +17,6 @@ pub struct Home {}
 
 #[messages]
 impl Home {
-    pub fn new() -> Self {
-        Self {}
-    }
-
     /// Assign the personal agent `agent`'s actor at `instance` to
     /// `device`, with `kit`.
     #[msg]

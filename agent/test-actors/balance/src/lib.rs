@@ -39,12 +39,6 @@ pub struct Balances {
 
 #[messages(module = "balance")]
 impl Balances {
-    pub fn new() -> Self {
-        Self {
-            balances: CommittedMap::default(),
-        }
-    }
-
     /// Set each account's balance.
     #[msg(gas = 100_000_000)]
     pub async fn set(&mut self, balances: Vec<(Account, Balance)>) -> u32 {

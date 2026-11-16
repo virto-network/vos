@@ -1,4 +1,4 @@
-//! A counter: struct state, queries, one linearizable, and a command that
+//! A counter: a cell, queries, one linearizable, and a command that
 //! can fail; a committed map; and probes of the agent's enforcement.
 
 #![no_std]
@@ -41,7 +41,7 @@ fn unserved_call() -> u64 {
 
 #[actor]
 pub struct Counter {
-    value: u64,
+    value: Cell<u64>,
     blobs: Table<u32, Vec<u8>>,
     entries: CommittedMap<u64, u64>,
 }
@@ -54,30 +54,28 @@ pub enum CounterError {
 
 #[messages]
 impl Counter {
-    pub fn new() -> Self {
-        Self {
-            value: 0,
-            blobs: Table::default(),
-            entries: CommittedMap::default(),
-        }
-    }
-
     #[msg]
     pub async fn increment(&mut self, by: u64) -> Result<u64, CounterError> {
-        self.value = self.value.checked_add(by).ok_or(CounterError::Overflow)?;
-        Ok(self.value)
+        self.value.set(
+            &(self
+                .value
+                .get_or_default()
+                .checked_add(by)
+                .ok_or(CounterError::Overflow)?),
+        );
+        Ok(self.value.get_or_default())
     }
 
     #[msg]
     pub async fn value(&self) -> u64 {
-        self.value
+        self.value.get_or_default()
     }
 
     /// The value, read after a read index whatever consistency the client
     /// asks.
     #[msg(linearizable)]
     pub async fn latest(&self) -> u64 {
-        self.value
+        self.value.get_or_default()
     }
 
     /// Add `by` to the counter at `instance` of agent `agent`, by message.
@@ -190,7 +188,7 @@ impl Counter {
     #[msg]
     pub async fn sneaky(&self) -> u64 {
         vos_sdk::host::put(RAW, &[9], &[1]);
-        self.value
+        self.value.get_or_default()
     }
 
     /// The result of an operation id the agent does not serve.
@@ -332,7 +330,7 @@ impl Counter {
     /// Set the counter to the batch time, and return a random draw.
     #[msg]
     pub async fn stamp(&mut self, ctx: &mut Command<Self>) -> [u8; 32] {
-        self.value = ctx.now();
+        self.value.set(&ctx.now());
         ctx.random()
     }
 }

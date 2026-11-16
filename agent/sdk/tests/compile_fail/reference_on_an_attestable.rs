@@ -6,10 +6,6 @@ pub struct Kernels {}
 
 #[messages]
 impl Kernels {
-    pub fn new() -> Self {
-        Self {}
-    }
-
     /// Only a device kernel reads its arguments in place.
     #[attestable]
     pub fn echo(digest: &Digest) -> u32 {

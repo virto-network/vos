@@ -19,7 +19,7 @@ const RISK: Ref<Counter> = Ref::new(InstanceId(1));
 
 #[actor]
 pub struct Shop {
-    sales: u64,
+    sales: Cell<u64>,
     /// Orders by id, their amounts: what workflows record in sections.
     orders: Table<u64, u64>,
 }
@@ -112,23 +112,16 @@ unsafe fn count_to(count: *mut u64, until: u64) {
 
 #[messages]
 impl Shop {
-    pub fn new() -> Self {
-        Self {
-            sales: 0,
-            orders: Table::default(),
-        }
-    }
-
     /// Count a sale: what a workflow's calls change.
     #[msg]
     pub async fn sell(&mut self, amount: u64) -> u64 {
-        self.sales += amount;
-        self.sales
+        self.sales.set(&(self.sales.get_or_default() + amount));
+        self.sales.get_or_default()
     }
 
     #[msg]
     pub async fn sales(&self) -> u64 {
-        self.sales
+        self.sales.get_or_default()
     }
 
     /// Ask the risk agent about a transfer, awaiting one answer, then move
@@ -488,9 +481,9 @@ impl Shop {
     pub async fn record(ctx: &mut Workflow<Self>, id: u64, amount: u64) -> (u64, Option<u64>) {
         ctx.update(|shop: &mut Shop| {
             shop.orders.insert(&id, &amount);
-            shop.sales += amount;
+            shop.sales.set(&(shop.sales.get_or_default() + amount));
         });
-        ctx.read(|shop: &Shop| (shop.sales, shop.orders.get(&id)))
+        ctx.read(|shop: &Shop| (shop.sales.get_or_default(), shop.orders.get(&id)))
     }
 
     /// Read the sales, spend `rounds` reads of the time, then write what it
@@ -499,13 +492,13 @@ impl Shop {
     /// still holds what it read. The sales it wrote.
     #[workflow(gas = 5_000_000)]
     pub async fn bump(ctx: &mut Workflow<Self>, by: u64, rounds: u32) -> u64 {
-        let sales = ctx.read(|shop: &Shop| shop.sales);
+        let sales = ctx.read(|shop: &Shop| shop.sales.get_or_default());
         for _ in 0..rounds {
             core::hint::black_box(ctx.now());
         }
         ctx.update(|shop: &mut Shop| {
-            shop.sales = sales + by;
-            shop.sales
+            shop.sales.set(&(sales + by));
+            shop.sales.get_or_default()
         })
     }
 
@@ -516,8 +509,8 @@ impl Shop {
         let mut seen = Vec::new();
         for amount in orders {
             let sales = ctx.update(|shop: &mut Shop| {
-                shop.sales += amount;
-                shop.sales
+                shop.sales.set(&(shop.sales.get_or_default() + amount));
+                shop.sales.get_or_default()
             });
             seen.push(sales);
             ctx.sleep_until(ctx.now()).await;

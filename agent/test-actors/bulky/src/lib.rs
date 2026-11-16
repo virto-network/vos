@@ -24,10 +24,6 @@ pub struct Bulky {}
 
 #[messages]
 impl Bulky {
-    pub fn new() -> Self {
-        Self {}
-    }
-
     /// The table's word at `index`, wrapped.
     #[msg]
     pub fn word(&self, index: u32) -> u64 {

@@ -7,12 +7,6 @@ pub struct Notes {
 
 #[messages]
 impl Notes {
-    pub fn new() -> Self {
-        Self {
-            tags: Default::default(),
-        }
-    }
-
     /// A merge handler's context reaches nothing past its operation.
     #[msg(merge)]
     pub async fn tag(&mut self, ctx: &mut Command<Self>, tag: u64) {

@@ -7,12 +7,6 @@ pub struct Counter {
 
 #[messages]
 impl Counter {
-    pub fn new() -> Self {
-        Self {
-            entries: CommittedMap::default(),
-        }
-    }
-
     #[attestable]
     pub fn writes(&mut self, key: u32) -> u64 {
         self.entries.insert(&key, &1);

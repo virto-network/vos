@@ -73,8 +73,18 @@ pub const FEED_BYTES: usize = 48 << 10;
 pub const REGISTRAR: &str = "registrar";
 
 /// The actor's tables, by name: each tagged
-/// `derive_id("vos/table/", name)`, plain rows.
+/// `derive_id("vos/table/", name)`, plain rows. A table of one row is a
+/// cell of the actor's (`vos_sdk::table::Cell`), its row under
+/// [`RING_KEY`](tables::RING_KEY), the key of every cell.
 pub mod tables {
+    /// One row, a cell: the space's handle, 32 bytes, once founded.
+    pub const HANDLE: &str = "handle";
+    /// One row, a cell: the lowest slot never used, a `u64`.
+    pub const NEXT: &str = "next";
+    /// One row, a cell: the members enrolled, a `u64`.
+    pub const COUNT: &str = "count";
+    /// One row, a cell: the tree's writes, the feed's length, a `u64`.
+    pub const CHANGED: &str = "changed";
     /// A `member` digest → its slot, a `u32`.
     pub const SLOTS: &str = "slots";
     /// `(level, index)`, one byte then four big-endian bytes → a digest,
@@ -87,7 +97,7 @@ pub mod tables {
     pub const INVITES: &str = "invites";
     /// One row, under [`RING_KEY`]: the [`Ring`](super::Ring).
     pub const RING: &str = "ring";
-    /// The ring's row's key, one byte.
+    /// The ring's row's key, one byte: a cell's.
     pub const RING_KEY: u8 = 0;
     /// One row, under [`RING_KEY`]: the open claim's terms and its period's
     /// count, once the registrar opened it.

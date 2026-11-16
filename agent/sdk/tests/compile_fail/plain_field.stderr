@@ -1,0 +1,17 @@
+error: an actor's state is its rows: a single value is a `Cell<T>`, and every field a `Table`, a `Cell`, a `CommittedMap` or a merge field (`crdt::...`)
+ --> tests/compile_fail/plain_field.rs:7:12
+  |
+7 |     value: u64,
+  |            ^^^
+
+error[E0412]: cannot find type `Counter` in this scope
+  --> tests/compile_fail/plain_field.rs:11:6
+   |
+11 | impl Counter {
+   |      ^^^^^^^ not found in this scope
+
+error[E0412]: cannot find type `Counter` in module `super`
+  --> tests/compile_fail/plain_field.rs:11:6
+   |
+11 | impl Counter {
+   |      ^^^^^^^ not found in `super`

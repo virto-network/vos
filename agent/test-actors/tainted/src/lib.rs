@@ -19,10 +19,6 @@ fn stamped(value: u64) -> u64 {
 
 #[messages]
 impl Tainted {
-    pub fn new() -> Self {
-        Self {}
-    }
-
     #[attestable]
     pub fn stamp(value: u64) -> u64 {
         stamped(value)

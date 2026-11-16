@@ -7,12 +7,6 @@ pub struct Shop {
 
 #[messages]
 impl Shop {
-    pub fn new() -> Self {
-        Self {
-            orders: Table::default(),
-        }
-    }
-
     /// A workflow holds no state of its own: it reaches its instance's
     /// state only in sections, and has no `self` to read tables through.
     #[workflow]

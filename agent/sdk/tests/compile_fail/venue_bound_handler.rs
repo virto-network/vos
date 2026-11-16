@@ -2,19 +2,15 @@ use vos_sdk::prelude::*;
 
 #[actor]
 pub struct Counter {
-    value: u64,
+    value: Cell<u64>,
 }
 
 #[messages]
 impl Counter {
-    pub fn new() -> Self {
-        Self { value: 0 }
-    }
-
     #[msg(venue_bound)]
     pub async fn add(&mut self, by: u64) -> u64 {
-        self.value += by;
-        self.value
+        self.value.set(&(self.value.get_or_default() + by));
+        self.value.get_or_default()
     }
 }
 

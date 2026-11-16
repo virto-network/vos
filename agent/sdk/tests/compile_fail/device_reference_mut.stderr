@@ -1,7 +1,7 @@
 error: a device kernel's argument by reference is `&T`, read in place for its run
-  --> tests/compile_fail/device_reference_mut.rs:15:26
+  --> tests/compile_fail/device_reference_mut.rs:11:26
    |
-15 |     pub fn touch(digest: &mut Digest) {
+11 |     pub fn touch(digest: &mut Digest) {
    |                          ^^^^^^^^^^^
 
 warning: unused import: `vos_sdk::p2::Digest`

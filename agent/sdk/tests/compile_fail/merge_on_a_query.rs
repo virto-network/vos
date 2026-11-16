@@ -7,12 +7,6 @@ pub struct Notes {
 
 #[messages]
 impl Notes {
-    pub fn new() -> Self {
-        Self {
-            tags: Default::default(),
-        }
-    }
-
     /// A merge handler writes merge fields: it takes `&mut self`.
     #[msg(merge)]
     pub async fn tag(&self, tag: u64) -> bool {

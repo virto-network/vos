@@ -33,11 +33,4 @@ pub struct Representative {
 }
 
 #[messages]
-impl Representative {
-    pub fn new() -> Self {
-        Self {
-            roots: CommittedMap::default(),
-            asked: CommittedMap::default(),
-        }
-    }
-}
+impl Representative {}
