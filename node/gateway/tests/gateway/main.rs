@@ -91,18 +91,6 @@ impl Front {
         per: PerAddress,
         tls: Option<Arc<rustls::ServerConfig>>,
     ) -> Self {
-        Self::start_marked(listener, upstreams, per, tls, Mark::Clearnet)
-    }
-
-    /// A gateway on `listener` marking what it relays `mark`: the onion
-    /// service's port, where `mark` is [`Mark::Onion`].
-    fn start_marked(
-        listener: std::net::TcpListener,
-        upstreams: Vec<([u8; 32], Address)>,
-        per: PerAddress,
-        tls: Option<Arc<rustls::ServerConfig>>,
-        mark: Mark,
-    ) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -127,8 +115,6 @@ impl Front {
             Http {
                 tls,
                 connections: 64,
-                mark,
-                caps: vos_gateway::caps::Caps::none(),
             },
             async {
                 let _ = stopped.await;

@@ -1,8 +1,8 @@
-//! The transport mark on the gateway's relay path: two HTTP ports in front
-//! of one node, a clearnet one and one marking as the onion service's
-//! would, and the onion-only gated test actor behind them. A call over the
-//! clearnet port is refused `OnionOnly`, whatever the client sent; over the
-//! onion's an unknown key is refused `UnknownKey`, and a key its door
+//! The transport mark on the gateway's relay path: an HTTP port in front of
+//! one node, the gateway's relay marking as the onion service's port does,
+//! and the onion-only gated test actor behind them. A call over the
+//! clearnet port is refused `OnionOnly`, whatever the client sent; relayed
+//! marked onion an unknown key is refused `UnknownKey`, and a key its door
 //! admitted runs.
 
 use vos_checker::programs::package;
@@ -32,14 +32,6 @@ fn the_gateway_marks_what_it_relays_and_an_onion_only_agent_reads_it() {
     };
     let gated = agent(&package("gated"), GATED);
     let door = agent(&package("door"), DOOR);
-    let upstream = || vec![(served.node.id().0, Address::Socket(served.socket.clone()))];
-    let onion = Front::start_marked(
-        std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
-        upstream(),
-        PerAddress::default(),
-        None,
-        Mark::Onion,
-    );
     let identity = Client::new(&target, SigningKey::from_bytes(&[1; 32]))
         .identity(gated)
         .unwrap();
@@ -66,6 +58,15 @@ fn the_gateway_marks_what_it_relays_and_an_onion_only_agent_reads_it() {
         let (status, body, _) = exchange(front.address, &request("POST", &path, &[], body));
         (status, Response::decode_exact(&body).expect("a response"))
     };
+    // The onion's: the call relayed as the onion's SSH port relays it.
+    let onion = |body: &[u8]| {
+        let body = [gated.0.encode(), body.to_vec()].concat();
+        let relayed = served.front.gateway.relay(Kind::Call, Mark::Onion, &body);
+        let (kind, bytes) = served.front.runtime.block_on(relayed);
+        let answer = vos_http::routes::answer(kind, &bytes);
+        let response = Response::decode_exact(&answer.body).expect("a response");
+        (answer.status, response)
+    };
     let refused = |refusal| (403, Response::Rejected(Rejection::Admission(refusal)));
     // The clearnet port: refused before the key is looked up.
     assert_eq!(
@@ -73,10 +74,7 @@ fn the_gateway_marks_what_it_relays_and_an_onion_only_agent_reads_it() {
         refused(AdmissionRefusal::OnionOnly)
     );
     // The onion's: the key is unknown until the door admits it.
-    assert_eq!(
-        post(&onion, &call(1)),
-        refused(AdmissionRefusal::UnknownKey)
-    );
+    assert_eq!(onion(&call(1)), refused(AdmissionRefusal::UnknownKey));
     let admitted = Client::new(&target, SigningKey::from_bytes(&[2; 32]))
         .call(
             door,
@@ -88,7 +86,7 @@ fn the_gateway_marks_what_it_relays_and_an_onion_only_agent_reads_it() {
     assert!(matches!(admitted, Response::Ran { .. }), "{admitted:?}");
     let mut answer = refused(AdmissionRefusal::UnknownKey);
     wait_until("the admission applied", || {
-        answer = post(&onion, &call(1));
+        answer = onion(&call(1));
         answer != refused(AdmissionRefusal::UnknownKey)
     });
     assert!(matches!(answer, (200, Response::Ran { .. })), "{answer:?}");
@@ -97,8 +95,5 @@ fn the_gateway_marks_what_it_relays_and_an_onion_only_agent_reads_it() {
         post(&served.front, &call(2)),
         refused(AdmissionRefusal::OnionOnly)
     );
-    assert!(matches!(
-        post(&onion, &call(2)),
-        (200, Response::Ran { .. })
-    ));
+    assert!(matches!(onion(&call(2)), (200, Response::Ran { .. })));
 }

@@ -4,9 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use vos_api::Mark;
 use vos_gateway::Gateway;
-use vos_gateway::caps::Caps;
 use vos_gateway::config::{Config, seed};
 use vos_gateway::front::{self, Http};
 use vos_gateway::limits::Limits;
@@ -62,9 +60,9 @@ fn run(cli: Cli) -> Result<(), String> {
             &config,
             Arc::clone(&gateway),
             vos_gateway::ssh::Port::new(
-                Mark::Clearnet,
+                vos_api::Mark::Clearnet,
                 Arc::clone(&limits),
-                Caps::none(),
+                vos_gateway::caps::Caps::none(),
                 vos_gateway::caps::bodies(),
             ),
             &vos_gateway::ssh::Placeholder,
@@ -89,8 +87,6 @@ fn run(cli: Cli) -> Result<(), String> {
         let http = Http {
             tls,
             connections: config.connections.unwrap_or(1024),
-            mark: Mark::Clearnet,
-            caps: Caps::none(),
         };
         front::serve(gateway, limits, listener, http, async {
             let _ = tokio::signal::ctrl_c().await;
