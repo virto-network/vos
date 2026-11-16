@@ -7,10 +7,11 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
+use vos_api::Kind;
 use vos_checker::calls::{Total, install_at_leader, signed_query};
 use vos_checker::programs::{actor, method, package};
 use vos_checker::{ANSWERED, COUNTER, Nodes, wait_until};
-use vos_node::client::{Client, post_within, signed_call};
+use vos_node::client::{Client, naming, send_within, signed_call};
 use vos_wire::ids::{AgentId, MethodId, Session};
 use vos_wire::ingress::{Call, Consistency, Rejection, Response};
 use vos_wire::peer::NodeNumber;
@@ -110,8 +111,8 @@ fn a_follower_forwards_no_call_it_cannot_verify() {
         .unwrap();
     let mut call = Call::decode(&body).unwrap().0;
     call.arguments = 6u64.encode();
-    let path = format!("/agents/{}/calls", agent.0);
-    let answer = post_within(cluster.target(follower), &path, &call.encode(), ANSWERED);
+    let call = naming(agent, &call.encode());
+    let answer = send_within(cluster.target(follower), Kind::Call, &call, ANSWERED);
     assert!(
         matches!(answer, Ok(Response::Rejected(Rejection::BadSignature))),
         "{answer:?}"
@@ -198,21 +199,23 @@ fn a_resend_of_a_queued_first_call_joins_it_past_the_skew() {
         name: [11; 16],
         t0: vos_node::wall_clock() - (vos_wire::defaults::SESSION_SKEW_MS - 1_500),
     };
-    let body = signed_increment(&identity, &key, session, 1, increment, 5);
-    let path = format!("/agents/{}/calls", agent.0);
+    let body = naming(
+        agent,
+        &signed_increment(&identity, &key, session, 1, increment, 5),
+    );
     let target = cluster.target(leader);
     let refines = &cluster.slot(leader).trip.refines;
     let reached = refines.reached();
     std::thread::scope(|scope| {
         // Inside the scope: a failure opens it before the scope waits.
         let closed = refines.close();
-        let first = scope.spawn(|| post_within(target, &path, &body, ANSWERED));
+        let first = scope.spawn(|| send_within(target, Kind::Call, &body, ANSWERED));
         wait_until("the first is refined", ANSWERED, || {
             refines.reached() > reached
         });
         // Past the skew now.
         std::thread::sleep(Duration::from_millis(2_000));
-        let second = scope.spawn(|| post_within(target, &path, &body, ANSWERED));
+        let second = scope.spawn(|| send_within(target, Kind::Call, &body, ANSWERED));
         let node = cluster.node(leader).unwrap();
         // Joined, or answered at once: then its answer fails the test.
         wait_until("the resend joins the first", ANSWERED, || {
@@ -274,7 +277,6 @@ fn a_follower_reads_a_write_once_it_has_applied_it() {
     let follower = leader % NODES + 1;
     let identity = cluster.identity(leader, agent);
     let key = SigningKey::from_bytes(&[13; 32]);
-    let path = format!("/agents/{}/queries", agent.0);
     let commits = &cluster.slot(follower).trip.commits;
     let session = Session {
         key: key.verifying_key().to_bytes(),
@@ -285,17 +287,17 @@ fn a_follower_reads_a_write_once_it_has_applied_it() {
         std::thread::scope(|scope| {
             let closed = commits.close();
             let call = signed_increment(&identity, &key, session, sequence, increment, 4);
-            let calls = format!("/agents/{}/calls", agent.0);
-            let answer = post_within(cluster.target(leader), &calls, &call, ANSWERED).unwrap();
+            let call = naming(agent, &call);
+            let answer = send_within(cluster.target(leader), Kind::Call, &call, ANSWERED).unwrap();
             let Response::Ran { at, .. } = answer else {
                 panic!("{answer:?}")
             };
             let consistency = consistency.unwrap_or(Consistency::Applied { at });
-            let query = value_query(&identity, &key, value, consistency);
+            let query = naming(agent, &value_query(&identity, &key, value, consistency));
             let (answered, read) = std::sync::mpsc::channel();
-            let (path, target) = (&path, cluster.target(follower));
+            let target = cluster.target(follower);
             scope.spawn(move || {
-                let _ = answered.send(post_within(target, path, &query, ANSWERED));
+                let _ = answered.send(send_within(target, Kind::Query, &query, ANSWERED));
             });
             std::thread::sleep(Duration::from_millis(300));
             let early = read.try_recv();
@@ -323,12 +325,12 @@ fn a_leader_cut_off_answers_no_linearizable_read() {
     let leader = cluster.leader(agent).unwrap();
     let identity = cluster.identity(leader, agent);
     let key = SigningKey::from_bytes(&[14; 32]);
-    let path = format!("/agents/{}/queries", agent.0);
     cluster.hub.isolate(leader);
-    let answer = post_within(
+    let query = value_query(&identity, &key, value, Consistency::Linearizable);
+    let answer = send_within(
         cluster.target(leader),
-        &path,
-        &value_query(&identity, &key, value, Consistency::Linearizable),
+        Kind::Query,
+        &naming(agent, &query),
         ANSWERED,
     );
     cluster.hub.heal();
@@ -358,9 +360,9 @@ fn a_query_a_replica_is_behind_for_goes_to_another() {
         let Response::Ran { at, .. } = answer else {
             panic!("{answer:?}")
         };
-        let path = format!("/agents/{}/queries", agent.0);
         let query = value_query(&identity, &key, value, Consistency::Applied { at });
-        let answer = post_within(cluster.target(follower), &path, &query, ANSWERED);
+        let query = naming(agent, &query);
+        let answer = send_within(cluster.target(follower), Kind::Query, &query, ANSWERED);
         assert!(
             matches!(answer, Ok(Response::Rejected(Rejection::Behind))),
             "{answer:?}"

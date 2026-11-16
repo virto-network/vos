@@ -136,8 +136,8 @@ pub fn query_at(
 ) -> Option<Response> {
     let not_after = vos_node::wall_clock() + 60_000;
     let query = signed_query(identity, key, not_after, consistency, instance, method);
-    let path = format!("/agents/{}/queries", agent.0);
-    let (_, body) = vos_node::client::post(target, &path, &query).ok()?;
+    let query = vos_node::client::naming(agent, &query);
+    let (_, body) = vos_node::client::send(target, vos_api::Kind::Query, &query).ok()?;
     Response::decode(&body).ok().map(|(answer, _)| answer)
 }
 

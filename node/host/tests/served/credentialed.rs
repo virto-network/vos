@@ -447,8 +447,9 @@ fn every_ingress_refusal_comes_in_its_check_order() {
         [0x9a; 32],
     );
     let path = format!("/agents/{}/credentialed", agent.0);
-    let largest = vec![0; vos_api::CREDENTIALED_HTTP];
-    let (status, _) = client::post(front.target(), &path, &largest).unwrap();
+    let largest = client::naming(agent, &vec![0; vos_api::CREDENTIALED_HTTP]);
+    let credentialed = vos_api::Kind::Credentialed;
+    let (status, _) = client::send(front.target(), credentialed, &largest).unwrap();
     assert_eq!(status, 400, "the largest body is read");
     let mut stream = std::net::TcpStream::connect(front.target().authority()).unwrap();
     let head = format!(
@@ -462,7 +463,8 @@ fn every_ingress_refusal_comes_in_its_check_order() {
         &answer, b"HTTP/1.1 413",
         "past the frame's size, from the head"
     );
-    let (status, body) = client::post(&target, &path, &[0xff]).unwrap();
+    let malformed = client::naming(agent, &[0xff]);
+    let (status, body) = client::send(&target, credentialed, &malformed).unwrap();
     assert_eq!(status, 400);
     assert_eq!(
         Response::decode_exact(&body),
@@ -1059,19 +1061,16 @@ const SCOPE_VECTOR: [u8; 32] = [
 ];
 
 /// A device request's answer, its bytes sent as they leave the library:
-/// its kind's two bytes and the agent's four name the route, the rest is
-/// the body.
+/// its kind's two bytes, then its body, the agent's four first.
 fn device_send(founded: &Founded, at: NodeNumber, request: &[u8]) -> Vec<u8> {
     let kind = u16::from_le_bytes([request[0], request[1]]);
     let agent = u32::from_le_bytes(request[2..6].try_into().unwrap());
     assert_eq!(agent, founded.agent.0);
-    let route = match kind {
-        k if k == vos_api::Kind::Query as u16 => "queries",
-        k if k == vos_api::Kind::Credentialed as u16 => "credentialed",
-        other => panic!("not a device request: {other:#x}"),
+    let kind = match vos_api::Kind::from_u16(kind) {
+        Some(kind @ (vos_api::Kind::Query | vos_api::Kind::Credentialed)) => kind,
+        _ => panic!("not a device request: {kind:#x}"),
     };
-    let path = format!("/agents/{agent}/{route}");
-    let (_, body) = client::post(founded.cluster.target(at), &path, &request[6..]).unwrap();
+    let (_, body) = client::send(founded.cluster.target(at), kind, &request[2..]).unwrap();
     body
 }
 

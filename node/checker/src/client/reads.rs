@@ -3,6 +3,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use vos_api::Kind;
 use vos_node::client::ClientError;
 use vos_wire::Decode;
 use vos_wire::ids::InstanceId;
@@ -138,8 +139,8 @@ impl Client {
         instance: InstanceId,
         consistency: Consistency,
     ) -> Result<(u64, u64), Result<Response, ClientError>> {
-        let path = format!("/agents/{}/queries", self.agent.0);
-        match post(nodes, at, &path, &self.query(nodes, instance, consistency)) {
+        let route = (Kind::Query, self.agent);
+        match post(nodes, at, route, &self.query(nodes, instance, consistency)) {
             Ok(Response::Ran {
                 outcome: Outcome::Done(bytes),
                 at,

@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::SigningKey;
 use std::collections::HashMap;
 
+use vos_api::Kind;
 use vos_checker::calls::{done, installed};
 use vos_checker::hooks::{FailNextSync, Gate, carries};
 use vos_checker::programs::Programs;
@@ -224,8 +225,10 @@ impl Served {
         start
     }
 
-    fn post(&self, path: &str, body: &[u8]) -> Response {
-        let (_, body) = vos_node::client::post(&self.target, path, body).unwrap();
+    /// A request of `kind` to `agent` carrying `body`, sent once.
+    fn post(&self, (kind, agent): (Kind, AgentId), body: &[u8]) -> Response {
+        let body = vos_node::client::naming(agent, body);
+        let (_, body) = vos_node::client::send(&self.target, kind, &body).unwrap();
         Response::decode(&body).unwrap().0
     }
 }

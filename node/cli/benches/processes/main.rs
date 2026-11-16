@@ -288,9 +288,13 @@ fn counters_hold(space: &Space, agents: &[Signed]) {
             signed.value,
         );
         let leader = &space.processes[space.leader(signed.agent)];
-        let path = format!("/agents/{}/queries", signed.agent.0);
-        let answer =
-            vos_node::client::post_within(&leader.target, &path, &body, Duration::from_secs(5));
+        let body = vos_node::client::naming(signed.agent, &body);
+        let answer = vos_node::client::send_within(
+            &leader.target,
+            vos_api::Kind::Query,
+            &body,
+            Duration::from_secs(5),
+        );
         let value = match answer {
             Ok(Response::Ran {
                 outcome: Outcome::Done(bytes),

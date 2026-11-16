@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
-use vos_node::client::{ClientError, post_within, signed_call};
+use vos_api::Kind;
+use vos_node::client::{ClientError, naming, send_within, signed_call};
 use vos_wire::abi::Refusal;
 use vos_wire::defaults::SESSION_SKEW_MS;
 use vos_wire::ids::{AgentId, InstanceId, Session};
@@ -71,14 +72,15 @@ pub fn clients(
 const KEY_SESSIONS: u64 = 32;
 const _: () = assert!(KEY_SESSIONS < vos_wire::defaults::MAX_KEY_SESSIONS);
 
-/// POST `body` at node `at`'s `path`, answered within [`ATTEMPT`].
+/// A request of `route`'s kind to its agent carrying `body` at node `at`,
+/// answered within [`ATTEMPT`].
 fn post(
     nodes: &dyn Nodes,
     at: NodeNumber,
-    path: &str,
+    (kind, agent): (Kind, AgentId),
     body: &[u8],
 ) -> Result<Response, ClientError> {
-    post_within(nodes.target(at), path, body, ATTEMPT)
+    send_within(nodes.target(at), kind, &naming(agent, body), ATTEMPT)
 }
 
 /// The node of `count` whose turn `turn` is, numbered from 1.
@@ -388,7 +390,7 @@ impl Client {
     /// Send request `request` until it is answered, following redirects
     /// and moving on from a node that fails; check its answer.
     fn send(&self, nodes: &dyn Nodes, mode: Mode, request: u64) {
-        let path = format!("/agents/{}/calls", self.agent.0);
+        let route = (Kind::Call, self.agent);
         let until = Instant::now() + ANSWERED;
         let count = nodes.count();
         self.sent.fetch_max(request, Ordering::SeqCst);
@@ -418,7 +420,7 @@ impl Client {
                 client.calling.store(at % count + 1, Ordering::SeqCst);
             };
             let offset = nodes.offset();
-            match post(nodes, at, &path, &body) {
+            match post(nodes, at, route, &body) {
                 Ok(Response::Ran {
                     outcome,
                     at: answered_at,
@@ -599,13 +601,13 @@ impl Client {
     /// Send `captured`, requests of sessions every node has collected, to
     /// every node: none may run, the run one answered from no window.
     pub fn replay(&self, nodes: &dyn Nodes, captured: &[Vec<u8>]) {
-        let path = format!("/agents/{}/calls", self.agent.0);
+        let route = (Kind::Call, self.agent);
         for body in captured {
             for number in 1..=nodes.count() {
                 let until = Instant::now() + ANSWERED;
                 loop {
                     assert!(Instant::now() < until, "a replay was never answered");
-                    match post(nodes, number, &path, body) {
+                    match post(nodes, number, route, body) {
                         Ok(
                             Response::Rejected(Rejection::StaleSession { .. })
                             | Response::TimedOut

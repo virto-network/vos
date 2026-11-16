@@ -4,14 +4,15 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use vos_api::Kind;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, WorkflowId};
 use vos_wire::ingress::{Consistency, Rejection, Response};
 use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode};
 
 use super::{
-    Client, ClientError, Target, Transport, decode_answer, signed_query, signed_workflow_read,
-    workflow_read_not_after,
+    Client, ClientError, Target, Transport, decode_answer, naming, signed_query,
+    signed_workflow_read, workflow_read_not_after,
 };
 
 impl Client {
@@ -45,7 +46,6 @@ impl Client {
         consistency: Consistency,
     ) -> Result<Response, ClientError> {
         let identity = self.identity(agent)?;
-        let path = format!("/agents/{}/queries", agent.0);
         self.with_learned_time(|offset| {
             let query = signed_query(
                 &identity,
@@ -56,7 +56,7 @@ impl Client {
                 method,
                 arguments.to_vec(),
             );
-            self.read(agent, &path, &query.encode())
+            self.read(agent, Kind::Query, &query.encode())
         })
     }
 
@@ -89,7 +89,6 @@ impl Client {
     ) -> Result<Response, ClientError> {
         let identity = self.identity(agent)?;
         let wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
-        let path = format!("/agents/{}/workflows", agent.0);
         self.with_learned_time(|offset| {
             let now = crate::wall_clock().saturating_add_signed(offset);
             let read = signed_workflow_read(
@@ -100,7 +99,7 @@ impl Client {
                 workflow,
                 wait_ms,
             );
-            self.read(agent, &path, &read.encode())
+            self.read(agent, Kind::Workflow, &read.encode())
         })
     }
 
@@ -121,12 +120,14 @@ impl Client {
         read(offset)
     }
 
-    /// A signed read, `body` posted to `path`: it changes nothing, so one
-    /// this replica cannot answer now goes to the others in turn, the
-    /// client still calling this one. An answer raises the agent's floor.
-    fn read(&self, agent: AgentId, path: &str, body: &[u8]) -> Result<Response, ClientError> {
+    /// A signed read of `kind` to `agent` carrying `body`: it changes
+    /// nothing, so one this replica cannot answer now goes to the others in
+    /// turn, the client still calling this one. An answer raises the
+    /// agent's floor.
+    fn read(&self, agent: AgentId, kind: Kind, body: &[u8]) -> Result<Response, ClientError> {
+        let body = naming(agent, body);
         let ask = |transport: &Transport| -> Result<Response, ClientError> {
-            let (status, answered) = transport.post_repeatable(path, body)?;
+            let (status, answered) = transport.repeatable(kind, &body)?;
             decode_answer(status, &answered)
         };
         let unanswered = |answer: &Result<Response, ClientError>| {
@@ -198,8 +199,8 @@ pub fn schema(
 
 impl Transport {
     fn schema(&self, agent: AgentId, instance: InstanceId) -> Result<Option<Schema>, ClientError> {
-        let path = format!("/agents/{}/instances/{}/schema", agent.0, instance.0);
-        let (status, body) = self.get(&path, None)?;
+        let asked = (agent.0, instance.0).encode();
+        let (status, body) = self.repeatable(Kind::Schema, &asked)?;
         if status == 404 {
             return Ok(None);
         }

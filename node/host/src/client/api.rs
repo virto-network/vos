@@ -1,7 +1,7 @@
-//! The node API as a blocking client's transport: HTTP's requests
-//! translated by the gateway's route table into frames, over the node's
-//! unix socket or QUIC, and the answers translated back. A client then
-//! speaks one interface, whichever transport its target names.
+//! The node API as a blocking client's transport: a request's frame over
+//! the node's unix socket or QUIC, its answer frame given as the gateway's
+//! HTTP gives it. A client then speaks one interface, whichever transport
+//! its target names.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
@@ -12,11 +12,11 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use vos_api::{Framing, MAX_ANSWER, Operated, frame};
-use vos_http::routes::{self, Authorization, Routed};
+use vos_api::{Framing, Kind, MAX_ANSWER, frame};
 use vos_wire::Encode;
 
 use super::target::Api as Way;
+use super::transport::Body;
 use super::{ClientError, Target};
 use crate::lock;
 
@@ -70,51 +70,24 @@ impl Api {
         }
     }
 
-    /// An HTTP request as the gateway translates it: its status and body.
-    /// A route the table answers with no node is answered here.
-    pub(super) fn request(
+    /// A frame of `kind` carrying `body`: its answer's status and body, as
+    /// the gateway's HTTP gives them.
+    pub(super) fn send(
         &self,
-        method: &str,
-        path: &str,
-        authorization: Option<&str>,
-        body: &[u8],
+        kind: Kind,
+        body: Body<'_>,
         repeatable: bool,
     ) -> Result<(u16, Vec<u8>), ClientError> {
-        let request = vos_http::Request {
-            method: method.to_string(),
-            path: path.to_string(),
-            headers: authorization
-                .map(|value| ("authorization".to_string(), value.as_bytes().to_vec()))
-                .into_iter()
-                .collect(),
-            body: body.to_vec(),
-            peer: None,
-            large: None,
-        };
-        let (kind, body) = match routes::route(&request) {
-            Routed::Answer(answer) => return Ok((answer.status, answer.body)),
-            Routed::Request { kind, body } => (kind, body),
-            Routed::Operator {
-                authorization,
-                kind,
-                inner,
-            } => {
-                let Authorization::Operated(credentials) = authorization else {
-                    return Err(ClientError::Http(
-                        "the node API takes a signed operator request only".into(),
-                    ));
-                };
-                match inner {
-                    Ok(inner) => (
-                        kind,
-                        Operated::with_credentials(&credentials, inner).encode(),
-                    ),
-                    Err(answer) => return Ok((answer.status, answer.body)),
-                }
+        let operated;
+        let body = match body {
+            Body::Plain(body) => body,
+            Body::Operated(envelope) => {
+                operated = envelope.encode();
+                &operated[..]
             }
         };
-        let (answered, bytes) = self.exchange(kind as u16, &body, repeatable)?;
-        let answer = routes::answer(answered, &bytes);
+        let (answered, bytes) = self.exchange(kind as u16, body, repeatable)?;
+        let answer = vos_http::routes::answer(answered, &bytes);
         Ok((answer.status, answer.body))
     }
 

@@ -608,10 +608,10 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
     let front = Front::serve(upstreams, GATEWAY);
     // Each request's bytes and each answer's status and body as they came.
     let mut https: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
-    let route = format!("/agents/{}/credentialed", agent.0);
     let mut post = |name: String, target: &Target, call: &Credentialed| {
         let body = call.encode();
-        let (status, answer) = client::post(target, &route, &body).unwrap();
+        let (status, answer) =
+            client::send(target, ApiKind::Credentialed, &client::naming(agent, &body)).unwrap();
         let decoded = Response::decode_exact(&answer).expect("an answer");
         let kept = [
             status.to_string().into_bytes(),

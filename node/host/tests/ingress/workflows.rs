@@ -201,19 +201,19 @@ fn a_read_waits_for_its_workflow_within_its_bound() {
     // Signed by the key that reads, good until its time.
     let identity = client.identity(served.agent).unwrap();
     let key = SigningKey::from_bytes(&[1; 32]);
-    let path = format!("/agents/{}/workflows", served.agent.0);
+    let route = (Kind::Workflow, served.agent);
     let now = served.now();
     let consistency = Consistency::Applied { at: 0 };
     let body = signed_read(&identity, &key, now + 10_000, consistency, workflow, 0);
     let (mut read, _) = WorkflowRead::decode(&body).unwrap();
     read.workflow = WorkflowId(workflow.0 + 1);
     assert_eq!(
-        served.post(&path, &read.encode()),
+        served.post(route, &read.encode()),
         Response::Rejected(Rejection::BadSignature)
     );
     let stale = signed_read(&identity, &key, now - 1, consistency, workflow, 0);
     assert_eq!(
-        served.post(&path, &stale),
+        served.post(route, &stale),
         Response::Rejected(Rejection::StaleQuery { now })
     );
     // Good no longer than the horizon past its wait: a read captured
@@ -221,16 +221,16 @@ fn a_read_waits_for_its_workflow_within_its_bound() {
     let far = now + workflow_read_horizon(1_000) + 1;
     let ahead = signed_read(&identity, &key, far, consistency, workflow, 1_000);
     assert_eq!(
-        served.post(&path, &ahead),
+        served.post(route, &ahead),
         Response::Rejected(Rejection::StaleQuery { now })
     );
     let within = signed_read(&identity, &key, far - 1, consistency, workflow, 1_000);
     assert!(matches!(
-        served.post(&path, &within),
+        served.post(route, &within),
         Response::Workflow { .. }
     ));
     assert!(matches!(
-        served.post(&path, &body),
+        served.post(route, &body),
         Response::Workflow {
             status: WorkflowStatus::Ended(_),
             ..
