@@ -1886,6 +1886,35 @@ fn the_previous_device_format_is_admitted_until_it_is_retired() {
     restart(vec![(previous, Some(now))]);
     assert!(window(&founded, at, CREDENTIALS).formats.is_empty());
     assert!(matches!(sign_in(3, &both), Err(DeviceError::Window)));
+
+    // The agent's log retires only a format the release admits; its
+    // retirement of 47 outlives a restart that admits 47 again.
+    let retire = |format| {
+        smol::block_on(founded.cluster.leading(founded.agent).retire_format(
+            founded.agent,
+            format,
+            now,
+        ))
+        .unwrap()
+    };
+    assert!(matches!(
+        retire(previous),
+        vos_node::Reply::Ran(Outcome::Failed {
+            code: Failure::Unknown,
+            ..
+        })
+    ));
+    restart(vec![(DEVICE_FORMAT, None)]);
+    assert!(matches!(
+        retire(DEVICE_FORMAT),
+        vos_node::Reply::Ran(Outcome::Done(ref kept)) if Option::<u64>::decode_exact(kept) == Some(Some(now))
+    ));
+    vos_checker::spaces::wait_in_process("the retirement applied", || {
+        window(&founded, at, CREDENTIALS).formats.is_empty()
+    });
+    restart(vec![(DEVICE_FORMAT, None)]);
+    assert!(window(&founded, at, CREDENTIALS).formats.is_empty());
+    assert!(matches!(sign_in(3, &both), Err(DeviceError::Window)));
 }
 
 /// A device format the release does not admit binds every replica, whatever

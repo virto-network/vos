@@ -57,7 +57,7 @@ pub fn prove_shaped(
 /// program `side_note` holds ([`crate::kernel::kernel_side_note`]): the
 /// root every segment of the class commits, whatever its run, which a
 /// kernel's program id pins. `None` on a format the registry does not admit
-/// or a malformed shape.
+/// or a malformed or empty shape.
 pub fn program_commitment_for_shape(
     side_note: &SideNote,
     shape: &SegmentShape,
@@ -65,7 +65,7 @@ pub fn program_commitment_for_shape(
 ) -> Option<Commitment> {
     use crate::pcs::ProofHash;
     check(shape).ok()?;
-    if shape.log_sizes.contains(&0) {
+    if shape.components == 0 || shape.log_sizes.contains(&0) {
         return None;
     }
     install_thread_pool();

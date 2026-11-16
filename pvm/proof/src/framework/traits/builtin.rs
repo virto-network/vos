@@ -136,10 +136,9 @@ pub trait BuiltInProverComponent: BuiltInComponent {
     /// size. Every chip honours it: a fixed table repeats its entries with no
     /// multiplicity, a boundary or the program's code adds rows that make no
     /// claim (the masked segment pads every chip to its masking's floor), so
-    /// a kernel's shape pins every log size; among them the canonical *forcing set*
-    /// ([`chip_idx::FORCING`](crate::chip_idx::FORCING)), the variable
-    /// preprocessed-bearing chips whose `log_size` the program commitment
-    /// depends on. Padding rows are `is_real = 0` and inert, so a forced
+    /// a kernel's shape pins every log size; among them those of the
+    /// preprocessed-bearing chips whose rows a run varies, which a shape's
+    /// class root depends on. Padding rows are `is_real = 0` and inert, so a forced
     /// larger trace proves the identical statement; a forcing-set chip whose
     /// `generate_preprocessed_trace` re-derives its own `log_size` from
     /// `side_note` must switch to the passed (forced) `log_size` param so

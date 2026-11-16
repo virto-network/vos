@@ -17,7 +17,7 @@ classes and proved to one final proof:
 
 | Format | Proof | Proved by | Verified by |
 |---|---|---|---|
-| 47 | a device proof, masked, under its program | `vos-pvm-recair` (`device::Program::prove`), on a phone through `vos-light` | a space's ingress (`device::Verifier`) |
+| 47 | a device proof, masked, under its program | `vos-pvm-recair` (`device::Program::prove`), on a phone through `vos-light` | `vos-pvm-recair`'s `device::Verifier`, run by `vos-node`'s ingress |
 
 28 (the wrap, unmasked) is the tests' and the fixtures' alone, behind
 `test-formats`, which no production build enables.
@@ -37,7 +37,7 @@ use vos_pvm_proof::{format::SEGMENT, kernel::trace_kernel, prove_kernel};
 
 let trace = trace_kernel(&blob, &arguments, gas).expect("a halting run");
 let segments = prove_kernel(&trace.side_note, &shape, 0, &SEGMENT).expect("proofs");
-let proofs = segments.into_iter().map(|segment| segment.proof).collect();
+let proofs: Vec<_> = segments.into_iter().map(|segment| segment.proof).collect();
 vos_pvm_proof_verifier::verify_kernel_chain(proofs, &program, &entry).expect("valid");
 ```
 

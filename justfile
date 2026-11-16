@@ -579,6 +579,8 @@ _forbidden +gates:
         [test-formats "--manifest-path pvm/proof/final-verifier/wasm/blob/Cargo.toml" [test-formats] []] \
         [test-formats "-p vos-statement --features fixtures,pvm-guest" [test-formats] []] \
         [test-formats "-p vos-statement-service --features pvm-guest" [test-formats] []] \
+        [test-formats "--manifest-path node/light/android/Cargo.toml --features android" [test-formats] []] \
+        [test-formats "--manifest-path node/gateway/demo/Cargo.toml" [test-formats] []] \
         [store-dump "-p vos-cli" [dump] []] \
         [store-dump "-p vos-cli --features prover" [dump] []] \
         [store-dump "-p vos-node" [dump] []] \

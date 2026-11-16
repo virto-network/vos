@@ -20,7 +20,9 @@
 //!   the multiplication, no column a constraint pins to zero), and 32's
 //!   leaves verify it. 28, 32 and 39 prove the recursion AIR
 //!   (`vos-pvm-recair-air`). A number not in [`REGISTRY`] is refused as
-//!   unregistered; 44 and 46 are never reused.
+//!   unregistered; 44 and 46 are never reused, and 48 is the tests' second
+//!   device format (`vos-pvm-recair`'s `device::TEST_FORMAT`), never
+//!   registered.
 //! - **Every format** takes exactly its parameters, mixes the boundary
 //!   states as the boundary chips' bytes and grinds its interaction PoW
 //!   before the relation challenges. 47 is the device format: a space's

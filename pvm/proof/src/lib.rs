@@ -231,11 +231,6 @@ macro_rules! chips {
             /// page Merkle chips and the fixed tables. A kernel's shape without one
             /// is refused.
             pub const ALWAYS: u32 = ALL & !OPTIONAL;
-
-            /// The canonical forcing set: the chips whose log size the program
-            /// commitment depends on and a run's rows vary, padded to a profile's
-            /// floors by canonical proving.
-            pub const FORCING: u32 = 1 << BLAKE2B | 1 << BLAKE2B_BOUNDARY | 1 << MEMORY_PAGE;
         }
 
         #[cfg(feature = "wire")]

@@ -706,7 +706,7 @@ mod tests {
     #[test]
     fn the_admitted_formats_are_checked() {
         assert!(DevicePrograms::admitting(DEVICE_FORMATS).is_some());
-        let previous = device::FORMATS[1].number;
+        let previous = device::TEST_FORMAT.number;
         assert!(DevicePrograms::admitting(&[(previous, None)]).is_some());
         assert!(DevicePrograms::admitting(&[]).is_none(), "none");
         assert!(

@@ -27,7 +27,7 @@ pub struct ComponentOodsMask {
     pub preproc_indices: alloc::vec::Vec<usize>,
 }
 
-/// The OODS data reconstructed from a real canonical segment proof by replaying
+/// The OODS data reconstructed from a real segment proof by replaying
 /// the verifier's Fiat-Shamir transcript (the channel-affecting steps of
 /// `verify_components` + the stwo verifier head) — the
 /// inputs the recursion verifier-AIR re-evaluates the inner composition against,
@@ -49,7 +49,7 @@ pub struct OodsReconstruction {
     pub composition_value: SecureField,
 }
 
-/// Replay a real canonical segment proof's verifier transcript to the OODS point
+/// Replay a real segment proof's verifier transcript to the OODS point
 /// and return everything the verifier-AIR needs to re-evaluate the inner
 /// composition in-AIR (the per-component masks sliced from `sampled_values`, the
 /// drawn `lookup_elements`/`random_coeff`/`oods_point`-derived scalars, the
@@ -249,7 +249,7 @@ fn recursion_verify_prefix<MC: PcsStack>(
     }
 }
 
-/// The full Fiat-Shamir transcript of a real canonical segment proof's
+/// The full Fiat-Shamir transcript of a real segment proof's
 /// verification, recorded as an ordered Poseidon2 permutation sequence — the
 /// ground truth the native-recursion verifier-AIR's in-AIR `ChannelChip` replay
 /// reproduces row-for-row, and the source of every channel-derived challenge
@@ -267,7 +267,7 @@ pub struct RecursionTranscript {
     pub prefix_len: usize,
 }
 
-/// Record a real canonical segment proof's full verifier transcript by handing a
+/// Record a real segment proof's full verifier transcript by handing a
 /// recording [`Poseidon2M31Channel`](crate::poseidon2::Poseidon2M31Channel)
 /// through the SAME Fiat-Shamir sequence [`verify`](super::verify) drives — the vos-pvm-proof prefix
 /// (`recursion_verify_prefix`) followed by stwo's `verify` head + FRI commit +
@@ -311,7 +311,7 @@ pub fn record_canonical_transcript(proof: &Proof) -> RecursionTranscript {
 }
 
 /// Every transcript-derived datum the per-child verifier-AIR's FRI / DEEP-quotient
-/// / Merkle-decommit consumers need from a real canonical segment proof, extracted
+/// / Merkle-decommit consumers need from a real segment proof, extracted
 /// by replaying stwo's `verify` head + `verify_values` step by step via PUBLIC
 /// stwo calls (so each challenge / query set is captured as it is drawn, rather
 /// than fished out of the raw record stream). The raw per-tree / per-FRI-layer
@@ -385,7 +385,7 @@ pub struct DeepBatch {
 }
 
 /// Extract every transcript-derived datum the per-child verifier-AIR needs from a
-/// real canonical segment proof (see [`RecursionData`]). Replays stwo's `verify`
+/// real segment proof (see [`RecursionData`]). Replays stwo's `verify`
 /// head + `verify_values` via PUBLIC stwo calls on a recording channel, capturing
 /// the composition/DEEP coeffs, the OODS point, the per-FRI-layer fold alphas (by
 /// bracketing `FriVerifier::commit`), the query positions, and the first-layer FRI

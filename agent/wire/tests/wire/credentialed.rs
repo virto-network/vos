@@ -58,7 +58,7 @@ fn the_request_and_its_refusals_encode_as_pinned() {
         arguments: vec![0xaa, 0xbb],
         nonce: [5; 16],
         expires_ms: 9,
-        format: 46,
+        format: 47,
         claim: vec![6; 40],
         proof: vec![0xcc],
     };
@@ -69,7 +69,7 @@ fn the_request_and_its_refusals_encode_as_pinned() {
         &[0xaa, 0xbb],
         &[5; 16],
         &9u64.to_le_bytes(),
-        &46u32.to_le_bytes(),
+        &47u32.to_le_bytes(),
         &40u32.to_le_bytes(),
         &[6; 40],
         &1u32.to_le_bytes(),

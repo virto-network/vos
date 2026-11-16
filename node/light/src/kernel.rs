@@ -254,6 +254,7 @@ mod tests {
     /// both, and with the previous one's where it admits that format alone.
     #[test]
     fn the_newest_admitted_format_is_chosen() {
+        // Any number but 47's: the window and the app name it alone.
         let previous = 48;
         let app = [shipped(2, DEVICE_FORMAT), shipped(1, previous)];
         let chosen = |window: &DeviceWindow| {

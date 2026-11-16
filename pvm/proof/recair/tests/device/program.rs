@@ -197,11 +197,14 @@ fn a_proof_whose_interaction_pow_fails_is_refused_before_its_decode() {
 fn a_proof_of_one_device_format_is_refused_under_the_other() {
     let previous = vos_pvm_recair::device::format(48).expect("48 is proved");
     assert_eq!(vos_pvm_recair::device::FORMATS[0], FORMAT);
-    let word = Program::install(&FORMAT, &blob(), &witness(1), 0).expect("installs");
-    let old = Program::install(previous, &blob(), &witness(1), 0).expect("installs");
-    assert_eq!((word.format().number, old.format().number), (47, 48));
-    assert_ne!(word.id(), old.id());
-    for (program, other) in [(&word, &old), (&old, &word)] {
+    let current = Program::install(&FORMAT, &blob(), &witness(1), 0).expect("installs");
+    let other_format = Program::install(previous, &blob(), &witness(1), 0).expect("installs");
+    assert_eq!(
+        (current.format().number, other_format.format().number),
+        (47, 48)
+    );
+    assert_ne!(current.id(), other_format.id());
+    for (program, other) in [(&current, &other_format), (&other_format, &current)] {
         let (proof, _) = program
             .prove(&witness(2), MaskRng::default())
             .expect("proves");
