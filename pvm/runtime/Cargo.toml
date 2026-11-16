@@ -2,7 +2,7 @@
 name = "vos-pvm"
 version.workspace = true
 edition.workspace = true
-license = "Apache-2.0"
+license.workspace = true
 authors.workspace = true
 description = "Gray Paper v0.8.0 PVM runtime used by VOS."
 

@@ -5,6 +5,7 @@
 name = "credentials-next"
 version.workspace = true
 edition.workspace = true
+license = "AGPL-3.0-or-later"
 publish.workspace = true
 
 [[bin]]

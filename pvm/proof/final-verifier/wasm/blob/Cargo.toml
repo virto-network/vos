@@ -14,7 +14,7 @@
 name = "vos-pvm-final-verifier-wasm"
 version = "0.1.0"
 edition = "2024"
-license = "Apache-2.0"
+license = "AGPL-3.0-or-later"
 publish = false
 
 [lib]

@@ -2,7 +2,7 @@
 name = "vos-statement"
 edition.workspace = true
 version.workspace = true
-license = "Apache-2.0"
+license.workspace = true
 description = "A proved statement as a venue judges it: its types, its canonical encoding, its io-hash and id, and the venue's check of a final proof against it. no_std, with no dependency on VOS beyond the final verifier."
 
 [features]

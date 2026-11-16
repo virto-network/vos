@@ -2,7 +2,7 @@
 name = "vos-pvm-proof-verifier"
 edition.workspace = true
 version.workspace = true
-license = "Apache-2.0"
+license.workspace = true
 
 [dependencies]
 vos-pvm-proof = { path = "..", default-features = false }

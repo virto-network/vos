@@ -2,7 +2,7 @@
 name = "vos-pvm-program"
 version.workspace = true
 edition.workspace = true
-license = "Apache-2.0"
+license.workspace = true
 authors.workspace = true
 description = "Portable codec and memory layout for standard PVM programs."
 

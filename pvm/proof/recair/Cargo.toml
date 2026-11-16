@@ -2,7 +2,7 @@
 name = "vos-pvm-recair"
 edition.workspace = true
 version.workspace = true
-license = "Apache-2.0"
+license.workspace = true
 description = "The recursion AIR's prover: circuits built by a Context, their wiring checked, traced, proved and verified on the Poseidon2-M31 channel."
 
 [dependencies]
