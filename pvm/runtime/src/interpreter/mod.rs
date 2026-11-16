@@ -301,19 +301,6 @@ impl Interpreter {
         self.pending_host_call = pending_host_call;
     }
 
-    /// Create a simple PVM for testing (code only, trivial bitmask).
-    pub fn new_simple(
-        code: Vec<u8>,
-        registers: [u64; PVM_REGISTER_COUNT],
-        flat_mem: Vec<u8>,
-        gas: Gas,
-    ) -> Self {
-        // Build a bitmask where every byte is marked as an instruction start
-        // This is a simplified mode; real programs use parse_blob.
-        let bitmask = vec![1u8; code.len()];
-        Self::new(code, bitmask, vec![], registers, flat_mem, gas)
-    }
-
     /// Install the per-page permission map. `perms` must have exactly one
     /// entry per 4 KiB page of guest memory — the accessors rely on the
     /// page bounds check doubling as the byte-range check.
@@ -2650,78 +2637,6 @@ fn smod_i64(a: i64, b: i64) -> i64 {
     }
 }
 
-/// Compute the set of basic block start indices (ϖ, eq A.5).
-/// Compact bitset: 1 bit per code byte, stored as `Vec<u64>`.
-/// 64x more cache-friendly than `Vec<bool>` for the compilation hot loop.
-pub struct BitSet {
-    pub words: Vec<u64>,
-}
-
-impl BitSet {
-    /// Create a bitset with `n` bits, all cleared.
-    pub fn new(n: usize) -> Self {
-        Self {
-            words: vec![0u64; n.div_ceil(64)],
-        }
-    }
-
-    /// Set bit at index `i`.
-    #[inline(always)]
-    pub fn set(&mut self, i: usize) {
-        self.words[i / 64] |= 1u64 << (i % 64);
-    }
-
-    /// Test bit at index `i`.
-    #[inline(always)]
-    pub fn get(&self, i: usize) -> bool {
-        (self.words[i / 64] >> (i % 64)) & 1 != 0
-    }
-
-    /// Build a rank index for O(1) rank queries.
-    /// `rank_index[i]` = number of set bits in `words[0..i]` (prefix popcount sum).
-    pub fn build_rank_index(&self) -> Vec<u32> {
-        let mut idx = Vec::with_capacity(self.words.len());
-        let mut sum = 0u32;
-        for &w in &self.words {
-            idx.push(sum);
-            sum += w.count_ones();
-        }
-        idx
-    }
-
-    /// Count set bits before position `pos` using the pre-built rank index.
-    /// This is the rank(pos) operation: number of 1-bits at positions 0..pos.
-    #[inline(always)]
-    pub fn rank(&self, rank_index: &[u32], pos: usize) -> usize {
-        let word_idx = pos / 64;
-        let bit_idx = pos % 64;
-        let prefix = rank_index[word_idx] as usize;
-        let mask = if bit_idx == 0 {
-            0
-        } else {
-            (1u64 << bit_idx) - 1
-        };
-        prefix + (self.words[word_idx] & mask).count_ones() as usize
-    }
-
-    /// Collect all set bit positions into a Vec.
-    pub fn collect_set_positions(&self) -> Vec<u32> {
-        let mut positions = Vec::new();
-        for (word_idx, &word) in self.words.iter().enumerate() {
-            let mut bits = word;
-            while bits != 0 {
-                let bit = bits.trailing_zeros() as usize;
-                positions.push((word_idx * 64 + bit) as u32);
-                bits &= bits - 1;
-            }
-        }
-        positions
-    }
-}
-
-/// Compute basic block starts as a compact bitset + precomputed skip table.
-/// The bitset is 64x smaller than `Vec<bool>`, improving L1 cache utilization
-/// during the hot compilation loop (~1.75KB vs ~112KB for ecrecover).
 /// Compute the skip (number of argument bytes) for instruction at `pc` by
 /// scanning the bitmask for the next instruction start.
 ///
@@ -2771,28 +2686,6 @@ pub fn skip_for_bitmask(bitmask: &[u8], pc: usize) -> usize {
     s
 }
 
-/// Compute basic block starts AND a precomputed skip table in a single pass.
-/// `skip_table[pc]` = number of bytes to skip after the opcode byte (instruction size - 1).
-/// Only valid at instruction-start PCs (where `bitmask[pc]` == 1).
-///
-/// Basic blocks per GP: {PC=0} ∪ {post-terminator PCs}. Branch/djump targets
-/// must land on one of these (validated at execution); gas blocks use the
-/// same boundaries (GP PR #508, grey PR #154).
-pub fn compute_basic_block_starts_with_skips(code: &[u8], bitmask: &[u8]) -> (Vec<bool>, Vec<u8>) {
-    compute_bb_starts_inner(code, bitmask)
-}
-
-pub fn compute_basic_block_starts(code: &[u8], bitmask: &[u8]) -> Vec<bool> {
-    compute_bb_starts_inner(code, bitmask).0
-}
-
-/// Compute gas block starts: {PC=0} ∪ {post-terminator PCs}.
-///
-/// Gas blocks coincide with GP basic blocks — one shared computation.
-pub fn compute_gas_block_starts(code: &[u8], bitmask: &[u8]) -> Vec<bool> {
-    compute_basic_block_starts(code, bitmask)
-}
-
 /// Map each externally enterable instruction counter to the gas block that
 /// contains it. Argument-byte positions remain `u32::MAX`. The synthetic
 /// end-of-code opcode-zero position is included at `code.len()`.
@@ -2831,14 +2724,16 @@ pub(crate) fn compute_gas_block_start_by_pc(
     result
 }
 
-fn compute_bb_starts_inner(code: &[u8], bitmask: &[u8]) -> (Vec<bool>, Vec<u8>) {
+/// The basic block starts (ϖ, eq A.5): {PC=0} ∪ {post-terminator PCs}.
+/// Branch/djump targets must land on one of these (validated at execution);
+/// gas blocks use the same boundaries (GP PR #508, grey PR #154).
+pub fn compute_basic_block_starts(code: &[u8], bitmask: &[u8]) -> Vec<bool> {
     let len = code.len();
     if len == 0 {
-        return (vec![], vec![]);
+        return vec![];
     }
 
     let mut starts = vec![false; len];
-    let mut skip_table = vec![0u8; len];
 
     // Index 0 is always a basic block start if it's a valid instruction
     if !bitmask.is_empty() && bitmask[0] == 1 && Opcode::from_byte(code[0]).is_some() {
@@ -2870,7 +2765,6 @@ fn compute_bb_starts_inner(code: &[u8], bitmask: &[u8]) -> (Vec<bool>, Vec<u8>) 
             }
             s
         };
-        skip_table[i] = skip as u8;
 
         if op.is_terminator() {
             // The instruction after a terminator starts a new block
@@ -2887,7 +2781,7 @@ fn compute_bb_starts_inner(code: &[u8], bitmask: &[u8]) -> (Vec<bool>, Vec<u8>) 
         i += 1 + skip; // advance to next instruction start
     }
 
-    (starts, skip_table)
+    starts
 }
 
 /// Compute each basic block's pipeline gas cost.
@@ -3260,7 +3154,8 @@ mod tests {
 
     /// Helper to create a VM with simple bitmask (every byte is instruction start).
     fn simple_vm(code: Vec<u8>, gas: Gas) -> Interpreter {
-        Interpreter::new_simple(code, [0; 13], Vec::new(), gas)
+        let bitmask = vec![1u8; code.len()];
+        Interpreter::new(code, bitmask, vec![], [0; 13], Vec::new(), gas)
     }
 
     #[test]
@@ -3490,7 +3385,7 @@ mod tests {
     ///   PC 3: MoveReg (100)     — NOT a terminator
     ///   PC 4: Jump (40)         — terminator, offset = 0 bytes (skip=0)
     ///                             target = PC 4 + 0 = PC 4 (self-loop, but
-    ///                             compute_bb_starts_inner reads code[i+1..i+5])
+    ///                             compute_basic_block_starts reads code[i+1..i+5])
     ///
     /// For a cleaner branch target, use explicit bitmask to give Jump a 4-byte
     /// offset field pointing at a non-post-terminator PC.
@@ -3566,7 +3461,7 @@ mod tests {
     #[test]
     fn test_block_gas_costs_only_at_gas_block_starts() {
         let (code, bitmask) = branch_target_mid_block_program();
-        let gas_starts = compute_gas_block_starts(&code, &bitmask);
+        let gas_starts = compute_basic_block_starts(&code, &bitmask);
         let costs = compute_block_gas_costs(&code, &bitmask, &gas_starts);
 
         // Gas costs should be nonzero only at gas block starts

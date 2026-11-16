@@ -647,16 +647,6 @@ impl Assembler {
         self.flush_instbuf(ib);
     }
 
-    /// mov qword [base + disp], sign-extended imm32
-    pub fn mov_store64_imm(&mut self, base: Reg, disp: i32, imm: i32) {
-        let mut ib = InstBuf::new();
-        ib.push(0x48 | base.hi());
-        ib.push(0xC7);
-        Self::modrm_disp_ib(&mut ib, 0, base, disp);
-        ib.push_i32(imm);
-        self.flush_instbuf(ib);
-    }
-
     // -- SIB-based memory access [base + index] --
 
     /// movzx r64, byte [base + index] — zero-extending u8 load
@@ -826,39 +816,6 @@ impl Assembler {
         self.flush_instbuf(ib);
     }
 
-    /// movzx r64, byte `[rax]` (simple deref, no SIB needed) — for perm table lookup
-    pub fn movzx_load8_deref(&mut self, dst: Reg, base: Reg) {
-        let mut ib = InstBuf::new();
-        ib.push(0x48 | (dst.hi() << 2) | base.hi());
-        ib.push(0x0F);
-        ib.push(0xB6);
-        if base.lo() == 5 {
-            ib.push((dst.lo() << 3) | base.lo() | 0x40);
-            ib.push(0);
-        } else if base.lo() == 4 {
-            ib.push((dst.lo() << 3) | 4);
-            ib.push(0x24);
-        } else {
-            ib.push((dst.lo() << 3) | base.lo());
-        }
-        self.flush_instbuf(ib);
-    }
-
-    /// cmp byte [base + index + disp32], imm8 — compare memory byte with SIB+displacement
-    pub fn cmp_byte_sib_disp32(&mut self, base: Reg, index: Reg, disp: i32, imm: u8) {
-        let mut ib = InstBuf::new();
-        let rex = 0x40 | (index.hi() << 1) | base.hi();
-        if rex != 0x40 {
-            ib.push(rex);
-        }
-        ib.push(0x80);
-        ib.push(0xBC); // mod=10, reg=/7(CMP), rm=100(SIB)
-        ib.push((index.lo() << 3) | base.lo());
-        ib.push_i32(disp);
-        ib.push(imm);
-        self.flush_instbuf(ib);
-    }
-
     /// cmp byte [base + disp32], imm8.
     pub fn cmp_byte_mem_disp32(&mut self, base: Reg, disp: i32, imm: u8) {
         let mut ib = InstBuf::new();
@@ -867,26 +824,6 @@ impl Assembler {
         }
         ib.push(0x80);
         Self::modrm_disp_ib(&mut ib, 7, base, disp);
-        ib.push(imm);
-        self.flush_instbuf(ib);
-    }
-
-    /// cmp byte `[reg]`, imm8 — compare memory byte with immediate
-    pub fn cmp_byte_deref_imm(&mut self, base: Reg, imm: u8) {
-        let mut ib = InstBuf::new();
-        if base.needs_rex() {
-            ib.push(0x41 | base.hi());
-        }
-        ib.push(0x80);
-        if base.lo() == 5 {
-            ib.push(0x78 | base.lo());
-            ib.push(0);
-        } else if base.lo() == 4 {
-            ib.push(0x38 | 4);
-            ib.push(0x24);
-        } else {
-            ib.push(0x38 | base.lo());
-        }
         ib.push(imm);
         self.flush_instbuf(ib);
     }
@@ -945,21 +882,6 @@ impl Assembler {
     #[inline(always)]
     pub fn test_rr(&mut self, a: Reg, b: Reg) {
         self.alu_rr64(0x85, a, b);
-    }
-
-    /// `test byte [base + disp32], imm8` — test memory byte against immediate bitmask.
-    #[inline(always)]
-    pub fn test_byte_mem_disp32(&mut self, base: Reg, disp: i32, imm: u8) {
-        let mut ib = InstBuf::new();
-        if base.needs_rex() {
-            ib.push(0x41 | base.hi());
-        }
-        ib.push(0xF6); // TEST r/m8, imm8
-        // ModRM: mod=10 (disp32), reg=000 (/0 = TEST), rm=base.lo()
-        ib.push(0x80 | base.lo());
-        ib.push_i32(disp);
-        ib.push(imm);
-        self.flush_instbuf(ib);
     }
 
     #[inline(always)]
@@ -1046,18 +968,6 @@ impl Assembler {
         self.alu_ri32(7, a, imm);
     }
 
-    /// cmp dword [base + disp], imm32
-    pub fn cmp_mem32_imm(&mut self, base: Reg, disp: i32, imm: i32) {
-        let mut ib = InstBuf::new();
-        if base.hi() != 0 {
-            ib.push(0x41);
-        }
-        ib.push(0x81);
-        Self::modrm_disp_ib(&mut ib, 7, base, disp);
-        ib.push_i32(imm);
-        self.flush_instbuf(ib);
-    }
-
     /// cmp dword [base + disp], reg32  (sets flags: mem vs reg)
     pub fn cmp_mem32_r(&mut self, base: Reg, disp: i32, src: Reg) {
         let mut ib = InstBuf::new();
@@ -1105,15 +1015,6 @@ impl Assembler {
         self.rex_w_b(base);
         self.emit(0x81);
         self.modrm_disp32(5, base, disp);
-        self.emit_i32(imm);
-    }
-
-    /// add qword [base + disp32], imm32
-    pub fn add_mem64_imm32(&mut self, base: Reg, disp: i32, imm: i32) {
-        // Same as sub_mem64_imm32 — offset() must be accurate for patching.
-        self.rex_w_b(base);
-        self.emit(0x81);
-        self.modrm_disp32(0, base, disp);
         self.emit_i32(imm);
     }
 
@@ -1310,24 +1211,6 @@ impl Assembler {
     pub fn sar_ri64(&mut self, dst: Reg, imm: u8) {
         self.shift_ri64(7, dst, imm);
     }
-    pub fn shl_cl64(&mut self, dst: Reg) {
-        self.shift_cl64(4, dst);
-    }
-    pub fn shr_cl64(&mut self, dst: Reg) {
-        self.shift_cl64(5, dst);
-    }
-    pub fn sar_cl64(&mut self, dst: Reg) {
-        self.shift_cl64(7, dst);
-    }
-    pub fn rol_cl64(&mut self, dst: Reg) {
-        self.shift_cl64(0, dst);
-    }
-    pub fn ror_cl64(&mut self, dst: Reg) {
-        self.shift_cl64(1, dst);
-    }
-    pub fn rol_ri64(&mut self, dst: Reg, imm: u8) {
-        self.shift_ri64(0, dst, imm);
-    }
     pub fn ror_ri64(&mut self, dst: Reg, imm: u8) {
         self.shift_ri64(1, dst, imm);
     }
@@ -1340,24 +1223,6 @@ impl Assembler {
     }
     pub fn sar_ri32(&mut self, dst: Reg, imm: u8) {
         self.shift_ri32(7, dst, imm);
-    }
-    pub fn shl_cl32(&mut self, dst: Reg) {
-        self.shift_cl32(4, dst);
-    }
-    pub fn shr_cl32(&mut self, dst: Reg) {
-        self.shift_cl32(5, dst);
-    }
-    pub fn sar_cl32(&mut self, dst: Reg) {
-        self.shift_cl32(7, dst);
-    }
-    pub fn rol_cl32(&mut self, dst: Reg) {
-        self.shift_cl32(0, dst);
-    }
-    pub fn ror_cl32(&mut self, dst: Reg) {
-        self.shift_cl32(1, dst);
-    }
-    pub fn rol_ri32(&mut self, dst: Reg, imm: u8) {
-        self.shift_ri32(0, dst, imm);
     }
     pub fn ror_ri32(&mut self, dst: Reg, imm: u8) {
         self.shift_ri32(1, dst, imm);
@@ -1555,12 +1420,6 @@ impl Assembler {
         self.emit(0x58 + reg.lo());
     }
 
-    /// push sign-extended imm32 (5 bytes: 0x68 + imm32).
-    pub fn push_imm32(&mut self, imm: i32) {
-        self.emit(0x68);
-        self.emit_i32(imm);
-    }
-
     // -- Branches and jumps --
 
     /// jmp to label — uses rel8 for backward jumps within ±127 bytes.
@@ -1607,19 +1466,6 @@ impl Assembler {
         self.rex_opt_b(reg);
         self.emit(0xFF);
         self.emit(0xE0 | reg.lo()); // /4
-    }
-
-    /// call r64 (indirect)
-    pub fn call_reg(&mut self, reg: Reg) {
-        self.rex_opt_b(reg);
-        self.emit(0xFF);
-        self.emit(0xD0 | reg.lo()); // /2
-    }
-
-    /// call label
-    pub fn call_label(&mut self, label: Label) {
-        self.emit(0xE8);
-        self.emit_label_fixup(label);
     }
 
     /// ret

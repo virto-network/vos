@@ -366,14 +366,6 @@ static CATEGORY_LUT: [InstructionCategory; 256] = {
     t
 };
 
-impl InstructionCategory {
-    /// Look up category from raw opcode byte via static table (O(1), no branching).
-    #[inline(always)]
-    pub fn from_opcode_byte(b: u8) -> Self {
-        CATEGORY_LUT[b as usize]
-    }
-}
-
 /// Combined opcode validation + category lookup in a single array access.
 /// Returns (is_valid, category) packed into a u8: high bit = valid, low 4 bits = category.
 static OPCODE_COMBINED: [u8; 256] = {
