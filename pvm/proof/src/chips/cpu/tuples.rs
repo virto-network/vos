@@ -189,8 +189,7 @@ pub(super) const FLAG_BYTES: [(Column, [&[Column]; 8]); 6] = [
 /// a0..a3 are φ[7..=10] after the transpiler's register map.
 pub(super) const BLAKE2B_CALL_REGS: [u32; 4] = [10, 7, 8, 9];
 
-/// The number of limbs `columns` hold.
 #[cfg(feature = "prover")]
-pub(super) fn width(columns: &[Column]) -> usize {
-    columns.iter().map(|column| column.const_size()).sum()
-}
+mod fill;
+#[cfg(feature = "prover")]
+pub(super) use fill::width;

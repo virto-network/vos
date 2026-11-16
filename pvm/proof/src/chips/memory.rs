@@ -375,6 +375,11 @@ impl BuiltInComponent for MemoryChip {
     }
 }
 
+#[cfg(feature = "prover")]
+mod fill;
+#[cfg(feature = "prover")]
+pub(crate) use fill::access_entries;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,8 +398,3 @@ mod tests {
         );
     }
 }
-
-#[cfg(feature = "prover")]
-mod fill;
-#[cfg(feature = "prover")]
-pub(crate) use fill::access_entries;

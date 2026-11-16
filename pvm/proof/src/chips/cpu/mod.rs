@@ -1,25 +1,9 @@
 use stwo::core::fields::m31::BaseField;
-#[cfg(feature = "prover")]
-use stwo::{
-    core::{ColumnVec, fields::qm31::SecureField},
-    prover::{
-        backend::simd::SimdBackend,
-        poly::{BitReversedOrder, circle::CircleEvaluation},
-    },
-};
 use stwo_constraint_framework::EvalAtRow;
 
 use crate::trace::eval::TraceEval;
-#[cfg(feature = "prover")]
-use crate::trace::{builder::FinalizedTrace, component::ComponentTrace};
 
 use crate::framework::BuiltInComponent;
-#[cfg(feature = "prover")]
-use crate::framework::BuiltInProverComponent;
-#[cfg(feature = "prover")]
-use crate::lookups::AllLookupElements;
-#[cfg(feature = "prover")]
-use crate::side_note::SideNote;
 
 // Opcode classification + register-access derivation consume `vos_pvm`
 // types (`Opcode`, `InstructionCategory`) and `PvmStep` witnesses, all of
@@ -56,8 +40,6 @@ pub(crate) use reg_access::{static_destination, step_reg_accesses};
 #[derive(Clone, Copy)]
 pub struct CpuChip;
 
-// ── Trace generation ───────────────────────────────────────────────────────
-
 impl BuiltInComponent for CpuChip {
     /// Bound 1 admits algebraic degree ≤ 3, which the paired logup
     /// constraints use (see `CONSTRAINTS.md`). The body constraints stay
@@ -81,24 +63,4 @@ impl BuiltInComponent for CpuChip {
 }
 
 #[cfg(feature = "prover")]
-impl BuiltInProverComponent for CpuChip {
-    fn generate_main_trace_min(
-        &self,
-        side_note: &mut SideNote,
-        min_log_size: u32,
-    ) -> FinalizedTrace {
-        trace_fill::generate_main_trace(side_note, min_log_size)
-    }
-
-    fn generate_interaction_trace(
-        &self,
-        component_trace: &ComponentTrace,
-        _side_note: &SideNote,
-        lookup_elements: &AllLookupElements,
-    ) -> (
-        ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
-        SecureField,
-    ) {
-        interaction::generate_interaction_trace(component_trace, lookup_elements)
-    }
-}
+mod fill;
