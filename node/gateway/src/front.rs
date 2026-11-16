@@ -8,45 +8,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 use vos_api::{ENVELOPE, Mark, Operated};
 use vos_http::routes::{self, Authorization, Routed};
-use vos_http::{Handler, Head, Limits as HttpLimits, Serve, Spawned};
+use vos_http::{Handler, Head, Limits as HttpLimits, Serve};
 use vos_wire::Encode;
 use vos_wire::abi::cap;
 use vos_wire::ingress::{OperatorRefusal, Rejection, Response};
 
 use crate::limits::Limits;
 use crate::routing::Gateway;
-
-/// A TCP listener on tokio, its streams as futures-io's.
-pub struct TokioListener(pub tokio::net::TcpListener);
-
-impl vos_http::Listener for TokioListener {
-    type Stream = Compat<tokio::net::TcpStream>;
-
-    async fn accept(&mut self) -> std::io::Result<(Self::Stream, SocketAddr)> {
-        let (stream, peer) = self.0.accept().await?;
-        let _ = stream.set_nodelay(true);
-        Ok((stream.compat(), peer))
-    }
-}
-
-/// A connection's task on tokio, ended when cancelled.
-struct Task(tokio::task::JoinHandle<()>);
-
-impl Spawned for Task {
-    fn is_finished(&self) -> bool {
-        self.0.is_finished()
-    }
-
-    fn cancel(self: Box<Self>) -> vos_http::BoxFuture<()> {
-        self.0.abort();
-        Box::pin(async move {
-            let _ = self.0.await;
-        })
-    }
-}
 
 /// How the gateway serves HTTP, on the clearnet: what it relays is marked
 /// [`Mark::Clearnet`], and its clients' addresses bound it.
@@ -90,7 +60,6 @@ pub async fn serve(
             large: vos_http::LARGE,
             credentialed_large: vos_http::CREDENTIALED_LARGE,
         },
-        spawn: Arc::new(|connection| Box::new(Task(tokio::spawn(connection)))),
         admit: Some(Arc::new(move |peer: SocketAddr| {
             limits
                 .connect(peer.ip())
@@ -98,7 +67,7 @@ pub async fn serve(
         })),
         head: Some(head),
     };
-    vos_http::serve(TokioListener(listener), serve, stop).await;
+    vos_http::serve(listener, serve, stop).await;
 }
 
 /// A request's answer from its head, before its body is read: past its

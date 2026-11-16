@@ -1,18 +1,18 @@
-//! A small HTTP/1.1 server: requests with `Content-Length` bodies over
-//! keep-alive connections, plain or in TLS, on whatever runtime spawns
-//! its connections.
+//! A small HTTP/1.1 server on tokio: requests with `Content-Length` bodies
+//! over keep-alive connections, plain or in TLS.
 
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
 
-use futures_lite::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::time::timeout;
 
-/// The most a request's or an answer's head may hold.
-pub const MAX_HEAD: usize = 16 << 10;
+use crate::request::{Large, MAX_HEAD, Request, Response, Slot, content_length};
 
 /// What one connection may take.
 #[derive(Clone)]
@@ -45,92 +45,18 @@ pub const LARGE: usize = 4;
 /// says otherwise: about 100 MiB of them at their largest.
 pub const CREDENTIALED_LARGE: usize = 64;
 
-pub struct Request {
-    pub method: String,
-    pub path: String,
-    pub headers: Vec<(String, Vec<u8>)>,
-    pub body: Vec<u8>,
-    /// Where the connection came from.
-    pub peer: Option<SocketAddr>,
-    /// The body's place among the large bodies the server holds at once,
-    /// if it is large: given back when dropped, so a handler done with
-    /// the body may give it back before it answers.
-    pub large: Option<Large>,
-}
-
-/// A large body's place: see [`Request::large`].
-pub struct Large {
-    _place: Slot,
-}
-
-impl Request {
-    pub fn header(&self, name: &str) -> Option<&[u8]> {
-        self.headers
-            .iter()
-            .find(|(header, _)| header.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.as_slice())
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Response {
-    pub status: u16,
-    pub body: Vec<u8>,
-}
-
-impl Response {
-    pub fn new(status: u16, body: Vec<u8>) -> Self {
-        Self { status, body }
-    }
-
-    /// 404, with no body.
-    pub fn not_found() -> Self {
-        Self::new(404, Vec::new())
-    }
-}
-
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 pub type Handler = Arc<dyn Fn(Request) -> BoxFuture<Response> + Send + Sync>;
-
-/// A connection's task as its runtime spawned it.
-pub trait Spawned: Send {
-    fn is_finished(&self) -> bool;
-    /// End it, and wait until it ended.
-    fn cancel(self: Box<Self>) -> BoxFuture<()>;
-}
 
 /// A request's answer from its head, before its body is read (`body` is
 /// empty, `peer` set), or `None` to read the body and run the handler:
 /// a refusal whose answer never depends on the body.
 pub type Head = Arc<dyn Fn(&Request) -> Option<Response> + Send + Sync>;
 
-/// Spawns a connection's task on the server's runtime.
-pub type Spawn = Arc<dyn Fn(BoxFuture<()>) -> Box<dyn Spawned> + Send + Sync>;
-
 /// What a connection from an address holds while it lasts, or `None` to
 /// close it on accept: a limit per address.
 pub type Admit = Arc<dyn Fn(SocketAddr) -> Option<Box<dyn Send>> + Send + Sync>;
-
-/// Where connections come from.
-pub trait Listener: Send {
-    type Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static;
-    fn accept(
-        &mut self,
-    ) -> impl Future<Output = std::io::Result<(Self::Stream, SocketAddr)>> + Send;
-}
-
-impl Listener for async_net::TcpListener {
-    type Stream = async_net::TcpStream;
-
-    async fn accept(&mut self) -> std::io::Result<(Self::Stream, SocketAddr)> {
-        let (stream, peer) = async_net::TcpListener::accept(self).await?;
-        // An answer goes as soon as it is written, not once the client
-        // acknowledges what went before it.
-        let _ = stream.set_nodelay(true);
-        Ok((stream, peer))
-    }
-}
 
 /// How long a client has to finish its TLS handshake.
 const HANDSHAKE: Duration = Duration::from_secs(10);
@@ -141,35 +67,39 @@ pub struct Serve {
     pub tls: Option<Arc<rustls::ServerConfig>>,
     pub handler: Handler,
     pub limits: Limits,
-    pub spawn: Spawn,
     pub admit: Option<Admit>,
     pub head: Option<Head>,
 }
 
 /// Accept connections on `listener` and answer each request with the
-/// handler, until the listener fails or `stop` resolves; then end every
-/// connection before returning. With TLS, each connection is in TLS.
-pub async fn serve(listener: impl Listener, serve: Serve, stop: impl Future<Output = ()>) {
-    let mut connections: Vec<Box<dyn Spawned>> = Vec::new();
-    let accepting = async {
-        accept(listener, serve, &mut connections).await;
-    };
-    futures_lite::future::or(accepting, stop).await;
+/// handler, each connection a task on the runtime, until the listener
+/// fails or `stop` resolves; then end every connection before returning.
+/// With TLS, each connection is in TLS.
+pub async fn serve(listener: TcpListener, serve: Serve, stop: impl Future<Output = ()>) {
+    let mut connections = Vec::new();
+    tokio::select! {
+        () = accept(listener, serve, &mut connections) => {}
+        () = stop => {}
+    }
     for connection in connections {
-        connection.cancel().await;
+        connection.abort();
+        let _ = connection.await;
     }
 }
 
 async fn accept(
-    mut listener: impl Listener,
+    listener: TcpListener,
     serve: Serve,
-    connections: &mut Vec<Box<dyn Spawned>>,
+    connections: &mut Vec<tokio::task::JoinHandle<()>>,
 ) {
     let open = Arc::new(AtomicUsize::new(0));
     let large = Arc::new(AtomicUsize::new(0));
     let credentialed = Arc::new(AtomicUsize::new(0));
-    let acceptor = serve.tls.clone().map(futures_rustls::TlsAcceptor::from);
+    let acceptor = serve.tls.clone().map(tokio_rustls::TlsAcceptor::from);
     while let Ok((stream, peer)) = listener.accept().await {
+        // An answer goes as soon as it is written, not once the client
+        // acknowledges what went before it.
+        let _ = stream.set_nodelay(true);
         connections.retain(|connection| !connection.is_finished());
         let Some(slot) = Slot::take(&open, serve.limits.connections) else {
             continue;
@@ -189,14 +119,14 @@ async fn accept(
             credentialed: Arc::clone(&credentialed),
         };
         let acceptor = acceptor.clone();
-        connections.push((serve.spawn)(Box::pin(async move {
+        connections.push(tokio::spawn(async move {
             let _slot = slot;
             let _admitted = admitted;
             let served = match acceptor {
                 Some(acceptor) => match timeout(HANDSHAKE, acceptor.accept(stream)).await {
-                    Some(Ok(stream)) => connection(stream, peer, &shared).await,
-                    Some(Err(error)) => Err(error),
-                    None => Err(std::io::Error::new(
+                    Ok(Ok(stream)) => connection(stream, peer, &shared).await,
+                    Ok(Err(error)) => Err(error),
+                    Err(_) => Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "a slow TLS handshake",
                     )),
@@ -206,18 +136,8 @@ async fn accept(
             if let Err(error) = served {
                 tracing::debug!("an HTTP connection ended: {error}");
             }
-        })));
+        }));
     }
-}
-
-/// `work`'s output, unless `limit` passes first.
-pub async fn timeout<T>(limit: Duration, work: impl Future<Output = T>) -> Option<T> {
-    let work = async { Some(work.await) };
-    futures_lite::future::or(work, async {
-        async_io::Timer::after(limit).await;
-        None
-    })
-    .await
 }
 
 /// What every connection of a server shares.
@@ -228,28 +148,6 @@ struct Shared {
     /// The large bodies held now: installs', and credentialed calls'.
     large: Arc<AtomicUsize>,
     credentialed: Arc<AtomicUsize>,
-}
-
-/// A place among those counted (connections, or large bodies), given back
-/// when its holder ends, however it ends: a handler's panic, or a cancel,
-/// too.
-struct Slot(Arc<AtomicUsize>);
-
-impl Slot {
-    /// A place among `open`, if fewer than `most` hold one.
-    fn take(open: &Arc<AtomicUsize>, most: usize) -> Option<Self> {
-        open.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
-            (held < most).then_some(held + 1)
-        })
-        .ok()
-        .map(|_| Slot(Arc::clone(open)))
-    }
-}
-
-impl Drop for Slot {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
 }
 
 /// How long one request may take to arrive, head and body, from its first
@@ -294,11 +192,6 @@ fn closes(request: &Request) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case(b"close"))
 }
 
-/// A `Content-Length` header's value, if it is a length.
-pub fn content_length(value: &[u8]) -> Option<usize> {
-    std::str::from_utf8(value).ok()?.trim().parse().ok()
-}
-
 fn invalid(message: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message.to_string())
 }
@@ -315,7 +208,7 @@ async fn read(
         Some(deadline) => idle.min(deadline.saturating_duration_since(Instant::now())),
         None => idle,
     };
-    timeout(wait, stream.read(chunk)).await.unwrap_or_else(|| {
+    timeout(wait, stream.read(chunk)).await.unwrap_or_else(|_| {
         Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "an idle or slow connection",
@@ -527,14 +420,13 @@ mod tests {
             large: Arc::new(AtomicUsize::new(0)),
             credentialed: Arc::new(AtomicUsize::new(0)),
         };
-        let mut stream = futures_lite::io::Cursor::new(bytes);
+        let mut stream = std::io::Cursor::new(bytes);
         let peer = SocketAddr::from(([127, 0, 0, 1], 1));
-        let read = futures_lite::future::block_on(read_request(
-            &mut stream,
-            &mut Vec::new(),
-            peer,
-            &shared,
-        ));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("a runtime");
+        let read = runtime.block_on(read_request(&mut stream, &mut Vec::new(), peer, &shared));
         match read.expect("a read") {
             Read::Answered(response, None) => Some(response.status),
             _ => None,

@@ -12,7 +12,7 @@ use vos_wire::ingress::{
 };
 use vos_wire::{Decode, Encode};
 
-use crate::server::{Request, Response};
+use crate::request::{Request, Response};
 
 /// The scheme of an `Authorization` header carrying an operator's
 /// envelope.

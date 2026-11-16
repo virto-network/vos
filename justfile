@@ -867,6 +867,7 @@ check: fmt-check check-tiers build-test-actors build-programs build-final-verify
 # prover library tests, and the lints of other feature sets.
 gate: check doc-check deny check-venue-rules check-no-std check-no-leaks check-no-faults check-kit fuzz-replay
     cargo clippy -p vos-venue --all-targets --quiet -- -D warnings
+    cargo clippy -p vos-http --all-targets --quiet -- -D warnings
     cargo clippy -p vos-pvm-recair --no-default-features --lib --quiet -- -D warnings
     cargo clippy -p vos-light --lib --quiet -- -D warnings
     just clippy-prover

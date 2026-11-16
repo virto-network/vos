@@ -48,7 +48,7 @@ toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 vos-api = { workspace = true, features = ["client", "quic"] }
-vos-http = { workspace = true }
+vos-http = { workspace = true, features = ["server"] }
 vos-net = { workspace = true }
 vos-wire = { workspace = true }
 s4-server = { workspace = true, optional = true }
