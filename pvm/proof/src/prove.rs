@@ -26,6 +26,7 @@ use crate::{lookups::AllLookupElements, side_note::SideNote};
 
 pub use crate::proof::{Proof, SegmentState};
 
+pub(crate) mod active;
 #[cfg(feature = "debug-internals")]
 mod debug;
 mod preprocessed;
