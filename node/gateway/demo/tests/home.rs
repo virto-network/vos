@@ -17,9 +17,9 @@ use std::sync::{Arc, Mutex};
 use ed25519_dalek::{Signer as _, SigningKey};
 use hmac::{Hmac, Mac as _};
 use s4_credential_contract::KeyAnswer;
-use s4_credential_contract::personal::{Claim, Home as Code, KitKind};
 use vos_facility::chrome::{Answer, Form};
 use vos_facility::node::{Device, Node, Prompts};
+use vos_facility::personal::{Claim, Home as Code, KitKind};
 use vos_facility::source::Kind;
 use vos_gateway_demo::home::{HOME_CREDENTIALS, HOMES, Home};
 use vos_gateway_demo::{LocalSpace, Rate, Served, random};
@@ -169,7 +169,7 @@ fn phone(dial: &Arc<Onions>) -> (Node, tempfile::TempDir) {
     )
     .unwrap();
     // The joiner's open claim at its next background pass, not hours on.
-    node.set_claim_delay(0..0).unwrap();
+    node.space().unwrap().set_claim_delay(0..0);
     (node, directory)
 }
 
@@ -252,13 +252,15 @@ fn a_phone_claims_at_the_demos_home_and_pairs_a_second_over_the_onion() {
     let (first, _first_store) = phone(&dial);
     let first_hand = Hand::new(0x11);
     let claimed = first
+        .personal()
+        .unwrap()
         .claim(
+            &*first_hand,
             Claim {
                 home: code.clone(),
                 kit: KitKind::Phrase,
                 label: "first phone".into(),
             },
-            &*first_hand,
         )
         .unwrap();
     assert_eq!(claimed.device, 0);
@@ -276,21 +278,25 @@ fn a_phone_claims_at_the_demos_home_and_pairs_a_second_over_the_onion() {
     // The second paired from it through the inbox's slot.
     let (second, _second_store) = phone(&dial);
     let second_hand = Hand::new(0x22);
-    let offer = first.pair_offer(&*first_hand).unwrap();
+    let offer = first.personal().unwrap().pair_offer(&*first_hand).unwrap();
     let (opened, joined) = std::thread::scope(|scope| {
-        let opener = scope.spawn(|| first.pair_await(&*first_hand));
-        let joined = second.pair_join(&offer.code, "second phone", &*second_hand);
+        let opener = scope.spawn(|| first.personal().unwrap().pair_await(&*first_hand));
+        let joined =
+            second
+                .personal()
+                .unwrap()
+                .pair_join(&*second_hand, &offer.code, "second phone");
         (opener.join().unwrap().unwrap(), joined.unwrap())
     });
     assert_eq!((opened.device, joined.device), (1, 1));
-    assert_eq!(second.devices().unwrap().len(), 2);
+    assert_eq!(second.personal().unwrap().devices().unwrap().len(), 2);
 
     // Its open claim by its background job, then, past its probation, its
     // re-proof of the lease under its own nullifier; both phones' jobs sync.
     second.sync_personal().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(POLICY.probation_ms + 500));
     second.sync_personal().unwrap();
-    second.renew(&*second_hand).unwrap();
+    second.personal().unwrap().renew(&*second_hand).unwrap();
     for phone in [&first, &second] {
         let synced = phone.sync_personal().unwrap();
         assert_eq!((synced.synced, synced.failed), (1, 0));

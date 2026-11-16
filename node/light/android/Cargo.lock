@@ -1498,7 +1498,7 @@ dependencies = [
  "proc-macro-crate",
  "proc-macro2",
  "quote",
- "sha3 0.12.0",
+ "sha3 0.10.9",
  "strum",
  "syn 3.0.6",
  "unicode-ident",
@@ -2373,6 +2373,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "glob"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
+
+[[package]]
 name = "glob-match"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2444,7 +2450,10 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash 0.1.5",
+ "serde",
 ]
 
 [[package]]
@@ -2465,8 +2474,6 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash 0.2.0",
- "serde",
- "serde_core",
 ]
 
 [[package]]
@@ -2950,6 +2957,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "java-locator"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09c46c1fe465c59b1474e665e85e1256c3893dd00927b8d55f63b09044c1e64f"
+dependencies = [
+ "glob",
+]
+
+[[package]]
 name = "jni"
 version = "0.22.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2957,8 +2973,10 @@ checksum = "5efd9a482cf3a427f00d6b35f14332adc7902ce91efb778580e180ff90fa3498"
 dependencies = [
  "cfg-if",
  "combine",
+ "java-locator",
  "jni-macros",
  "jni-sys",
+ "libloading",
  "log",
  "simd_cesu8",
  "thiserror 2.0.18",
@@ -3099,6 +3117,16 @@ name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+
+[[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
 
 [[package]]
 name = "liblzma"
@@ -5111,7 +5139,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s4-credential-contract"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=bbfaa73cc015a82292b82e7d503e1ff6c5baad9b#bbfaa73cc015a82292b82e7d503e1ff6c5baad9b"
+source = "git+https://codeberg.org/Virto/s4?rev=084f598218c9468cbdd30dcad139d94e7cd754bc#084f598218c9468cbdd30dcad139d94e7cd754bc"
 dependencies = [
  "hex",
  "jni",
@@ -5123,7 +5151,7 @@ dependencies = [
 [[package]]
 name = "s4-protocol"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=bbfaa73cc015a82292b82e7d503e1ff6c5baad9b#bbfaa73cc015a82292b82e7d503e1ff6c5baad9b"
+source = "git+https://codeberg.org/Virto/s4?rev=084f598218c9468cbdd30dcad139d94e7cd754bc#084f598218c9468cbdd30dcad139d94e7cd754bc"
 dependencies = [
  "base64",
  "ciborium",
@@ -5135,7 +5163,7 @@ dependencies = [
 [[package]]
 name = "s4-rui"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=bbfaa73cc015a82292b82e7d503e1ff6c5baad9b#bbfaa73cc015a82292b82e7d503e1ff6c5baad9b"
+source = "git+https://codeberg.org/Virto/s4?rev=084f598218c9468cbdd30dcad139d94e7cd754bc#084f598218c9468cbdd30dcad139d94e7cd754bc"
 dependencies = [
  "base64",
  "libc",
@@ -5153,7 +5181,7 @@ dependencies = [
 [[package]]
 name = "s4-server"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=bbfaa73cc015a82292b82e7d503e1ff6c5baad9b#bbfaa73cc015a82292b82e7d503e1ff6c5baad9b"
+source = "git+https://codeberg.org/Virto/s4?rev=084f598218c9468cbdd30dcad139d94e7cd754bc#084f598218c9468cbdd30dcad139d94e7cd754bc"
 dependencies = [
  "rand 0.10.3",
  "russh",
@@ -5166,7 +5194,7 @@ dependencies = [
 [[package]]
 name = "s4-widgets"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=bbfaa73cc015a82292b82e7d503e1ff6c5baad9b#bbfaa73cc015a82292b82e7d503e1ff6c5baad9b"
+source = "git+https://codeberg.org/Virto/s4?rev=084f598218c9468cbdd30dcad139d94e7cd754bc#084f598218c9468cbdd30dcad139d94e7cd754bc"
 dependencies = [
  "s4-protocol",
  "serde",
@@ -5992,7 +6020,7 @@ dependencies = [
  "dashmap",
  "educe 0.5.11",
  "fnv",
- "hashbrown 0.17.1",
+ "hashbrown 0.15.5",
  "hex",
  "indexmap 2.14.0",
  "itertools 0.12.1",
@@ -6013,7 +6041,7 @@ name = "stwo-constraint-framework"
 version = "2.2.0"
 source = "git+https://github.com/olanod/stwo?rev=e14925a81606b4d68c6a5d3047d382a20bd953d3#e14925a81606b4d68c6a5d3047d382a20bd953d3"
 dependencies = [
- "hashbrown 0.17.1",
+ "hashbrown 0.15.5",
  "itertools 0.12.1",
  "num-traits",
  "rand 0.8.6",

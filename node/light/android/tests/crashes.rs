@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use common::phone::*;
 use common::world::{Death, Step};
 use common::*;
-use s4_credential_contract::personal::{Claim, KitKind};
+use vos_facility::personal::{Claim, KitKind};
 use vos_wire::personal::Policy;
 
 /// The deaths tried in `trace`: at each call (by its occurrence) and each
@@ -71,10 +71,11 @@ fn pool(world: &World, home: u32) -> usize {
 
 /// Whether `phone` holds the personal space and reads itself in its set.
 fn holds(phone: &Held) -> bool {
-    phone
-        .node
-        .devices()
-        .is_ok_and(|devices| devices.iter().any(|device| device.me && !device.removed))
+    phone.node.personal().is_ok_and(|personal| {
+        personal
+            .devices()
+            .is_ok_and(|devices| devices.iter().any(|device| device.me && !device.removed))
+    })
 }
 
 /// A claim killed anywhere: claimed again, it ends at the agent the first
@@ -87,7 +88,12 @@ fn a_claim_killed_at_any_step_ends_at_one_agent_with_one_kit() {
         let home = world.home(HOME, 2, 2);
         let phone = phone(&world, 1);
         world.trace_from_now(1);
-        phone.node.claim(claim(&world, home), &*phone.hand).unwrap();
+        phone
+            .node
+            .personal()
+            .unwrap()
+            .claim(&*phone.hand, claim(&world, home))
+            .unwrap();
         world.trace(1)
     };
     each(&deaths(&trace), |step, nth, death| {
@@ -95,19 +101,28 @@ fn a_claim_killed_at_any_step_ends_at_one_agent_with_one_kit() {
         let world = world();
         let home = world.home(HOME, 2, 2);
         let phone = phone(&world, 1);
-        phone.node.set_wait(3_000).unwrap();
+        phone.node.space().unwrap().set_wait(3_000);
         world.kill(1, step, nth, death);
-        let cut = phone.node.claim(claim(&world, home), &*phone.hand);
+        let cut = phone
+            .node
+            .personal()
+            .unwrap()
+            .claim(&*phone.hand, claim(&world, home));
         assert!(world.died(1), "{at}: not reached: {cut:?}");
         let phone = phone.restart(&world);
-        match phone.node.claim(claim(&world, home), &*phone.hand) {
+        match phone
+            .node
+            .personal()
+            .unwrap()
+            .claim(&*phone.hand, claim(&world, home))
+        {
             Ok(_) => {}
             Err(refusal) if refusal.message.contains("holds a personal space already") => {}
             Err(refusal) => panic!("{at}: the claim again: {refusal:?}"),
         }
         let synced = phone.node.sync_personal().unwrap();
         assert_eq!(synced.failed, 0, "{at}");
-        let devices = phone.node.devices().unwrap();
+        let devices = phone.node.personal().unwrap().devices().unwrap();
         assert!(devices.len() == 1 && devices[0].me, "{at}: {devices:?}");
         assert_eq!(pool(&world, home), 1, "{at}: one agent given");
         assert_eq!(phone.hand.phrases.lock().unwrap().len(), 1, "{at}: one kit");
@@ -157,22 +172,32 @@ fn a_pairing_with_its_joiner_killed_at_any_step_ends_paired() {
         // Each wait well inside the slot, and long enough that a loaded
         // host's commit is confirmed within it.
         for phone in [&first, &second] {
-            phone.node.set_wait(WAIT_MS).unwrap();
+            phone.node.space().unwrap().set_wait(WAIT_MS);
         }
         world.kill(2, step, nth, death);
-        let code = first.node.pair_offer(&*first.hand).unwrap();
+        let code = first
+            .node
+            .personal()
+            .unwrap()
+            .pair_offer(&*first.hand)
+            .unwrap();
         let second = std::thread::scope(|scope| {
-            let opener = scope.spawn(|| first.node.pair_await(&*first.hand));
-            let cut = second.node.pair_join(&code.code, "second", &*second.hand);
+            let opener = scope.spawn(|| first.node.personal().unwrap().pair_await(&*first.hand));
+            let cut =
+                second
+                    .node
+                    .personal()
+                    .unwrap()
+                    .pair_join(&*second.hand, &code.code, "second");
             assert!(world.died(2), "{at}: not reached: {cut:?}");
             let second = second.restart(&world);
-            second.node.set_wait(WAIT_MS).unwrap();
+            second.node.space().unwrap().set_wait(WAIT_MS);
             // Its pass puts an acknowledgement its last process kept.
             let _ = second.node.sync_personal();
             // A pairing cut short before its hello is cancelled by the user;
             // one past it ends with its slot.
             std::thread::sleep(Duration::from_millis(500));
-            first.node.pair_cancel().unwrap();
+            first.node.space().unwrap().pair_cancel();
             let _ = opener.join().unwrap();
             second
         });
@@ -184,7 +209,7 @@ fn a_pairing_with_its_joiner_killed_at_any_step_ends_paired() {
             first.pair(&second, "second");
         }
         assert!(holds(&second), "{at}");
-        let standing = first.node.devices().unwrap();
+        let standing = first.node.personal().unwrap().devices().unwrap();
         assert_eq!(
             standing.iter().filter(|device| !device.removed).count(),
             2,
@@ -215,12 +240,23 @@ fn a_pairing_whose_opener_dies_at_its_commit_ends_paired() {
         let first = phone(&world, 1);
         let second = phone(&world, 2);
         first.claim(&world, home, KitKind::Phrase, "first");
-        second.node.set_wait(15_000).unwrap();
+        second.node.space().unwrap().set_wait(15_000);
         world.kill(1, Step::call("commit"), 1, death);
-        let code = first.node.pair_offer(&*first.hand).unwrap();
+        let code = first
+            .node
+            .personal()
+            .unwrap()
+            .pair_offer(&*first.hand)
+            .unwrap();
         let (first, joined) = std::thread::scope(|scope| {
-            let joiner = scope.spawn(|| second.node.pair_join(&code.code, "second", &*second.hand));
-            let cut = first.node.pair_await(&*first.hand);
+            let joiner = scope.spawn(|| {
+                second
+                    .node
+                    .personal()
+                    .unwrap()
+                    .pair_join(&*second.hand, &code.code, "second")
+            });
+            let cut = first.node.personal().unwrap().pair_await(&*first.hand);
             assert!(world.died(1), "{death:?}: not reached: {cut:?}");
             let first = first.restart(&world);
             while !joiner.is_finished() {
@@ -238,12 +274,16 @@ fn a_pairing_whose_opener_dies_at_its_commit_ends_paired() {
                 let third = phone(&world, 3);
                 first.pair(&third, "third");
                 assert!(holds(&third));
-                assert_eq!(first.node.devices().unwrap().len(), 2);
+                assert_eq!(first.node.personal().unwrap().devices().unwrap().len(), 2);
                 continue;
             }
         }
         assert!(holds(&second), "{death:?}");
-        assert_eq!(first.node.devices().unwrap().len(), 2, "{death:?}");
+        assert_eq!(
+            first.node.personal().unwrap().devices().unwrap().len(),
+            2,
+            "{death:?}"
+        );
     }
 }
 
@@ -271,7 +311,9 @@ fn a_restore_killed_at_any_step_matures_once_resumed() {
         world.trace_from_now(2);
         fresh
             .node
-            .restore(request(&world, home), KitKind::Phrase, &*fresh.hand)
+            .personal()
+            .unwrap()
+            .restore(&*fresh.hand, request(&world, home), KitKind::Phrase)
             .unwrap();
         world.trace(2)
     };
@@ -283,20 +325,26 @@ fn a_restore_killed_at_any_step_matures_once_resumed() {
         let fresh = phone(&world, 2);
         fresh.hand.will_enter(words);
         world.kill(2, step, nth, death);
-        let cut = fresh
-            .node
-            .restore(request(&world, home), KitKind::Phrase, &*fresh.hand);
+        let cut = fresh.node.personal().unwrap().restore(
+            &*fresh.hand,
+            request(&world, home),
+            KitKind::Phrase,
+        );
         assert!(world.died(2), "{at}: not reached: {cut:?}");
         let fresh = fresh.restart(&world);
         fresh
             .node
-            .restore(request(&world, home), KitKind::Phrase, &*fresh.hand)
+            .personal()
+            .unwrap()
+            .restore(&*fresh.hand, request(&world, home), KitKind::Phrase)
             .unwrap_or_else(|refusal| panic!("{at}: the restore again: {refusal:?}"));
         assert_eq!(fresh.hand.phrases.lock().unwrap().len(), 1, "{at}: one kit");
         after(policy().kit_delay_ms);
         let restored = fresh
             .node
-            .restored(KitKind::Phrase, &*fresh.hand)
+            .personal()
+            .unwrap()
+            .restored(&*fresh.hand, KitKind::Phrase)
             .unwrap_or_else(|refusal| panic!("{at}: restored: {refusal:?}"));
         assert_eq!(restored.agent, agent, "{at}");
         assert!(holds(&fresh), "{at}");
@@ -324,7 +372,9 @@ fn a_move_killed_at_any_step_ends_at_one_agent_with_one_kit() {
         world.trace_from_now(1);
         phone
             .node
-            .move_home(moving(&world, elsewhere), &*phone.hand)
+            .personal()
+            .unwrap()
+            .move_home(&*phone.hand, moving(&world, elsewhere))
             .unwrap();
         world.trace(1)
     };
@@ -335,17 +385,21 @@ fn a_move_killed_at_any_step_ends_at_one_agent_with_one_kit() {
         let elsewhere = world.home(ELSEWHERE, 3, 2);
         let phone = phone(&world, 1);
         phone.claim(&world, home, KitKind::Phrase, "phone");
-        phone.node.set_wait(3_000).unwrap();
+        phone.node.space().unwrap().set_wait(3_000);
         world.kill(1, step, nth, death);
         let cut = phone
             .node
-            .move_home(moving(&world, elsewhere), &*phone.hand);
+            .personal()
+            .unwrap()
+            .move_home(&*phone.hand, moving(&world, elsewhere));
         assert!(world.died(1), "{at}: not reached: {cut:?}");
         let phone = phone.restart(&world);
         let _ = phone.node.sync_personal();
         match phone
             .node
-            .move_home(moving(&world, elsewhere), &*phone.hand)
+            .personal()
+            .unwrap()
+            .move_home(&*phone.hand, moving(&world, elsewhere))
         {
             Ok(_) => {}
             Err(refusal) if refusal.message.contains("at that home already") => {}

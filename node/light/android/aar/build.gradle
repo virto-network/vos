@@ -3,7 +3,7 @@
 
 // The facility's Android library, `team.virto.vos:facility`: its `:vos`
 // process (`team.virto.s4.vos`: the service, the background job, its
-// notices), the personal space's screens (`team.virto.s4.personal`) and
+// notices), the personal space's screens (`team.virto.vos.personal`) and
 // the facility's native library for ARM64 phones, `libvos_facility.so`
 // (`-PjniLibs=<dir>`, which `cargo ndk` filled). Published to the local
 // Maven repository `-Prepository=<dir>`, from which s4's `-Ps4Vos` build
@@ -46,6 +46,12 @@ android {
         // The screens' logic is tested on the host: the parcelables it
         // fills are plain fields.
         unitTests.returnDefaultValues = true
+    }
+
+    // The facility's own interface (`IVosPersonal`, `src/main/aidl`), its
+    // parcelables' Rust form `vos_facility::personal::contract`'s.
+    buildFeatures {
+        aidl = true
     }
 
     publishing {

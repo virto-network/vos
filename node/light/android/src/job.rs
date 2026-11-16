@@ -216,7 +216,7 @@ impl Job {
         let started_ms = now_ms();
         state.runs.push(JobRun {
             started_ms,
-            personal: part == Part::Personal,
+            apart: part == Part::Personal,
             ..JobRun::default()
         });
         if state.runs.len() > RUNS {
@@ -293,7 +293,7 @@ impl Job {
                 synced: synced.synced,
                 failed: synced.failed,
                 notices: synced.notices.len() as u32,
-                personal: part == Part::Personal,
+                apart: part == Part::Personal,
             };
         }
         self.runs.write(&state).map_err(job_error)?;

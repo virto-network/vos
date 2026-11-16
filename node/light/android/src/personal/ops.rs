@@ -43,13 +43,13 @@ use super::{
 };
 use crate::enrollment::Enrollment;
 use crate::job::now_ms;
+use crate::personal::{
+    Claim, Claimed, Device, Home, KitKind, Membership, Moved, Owed, PairCode, Paired, Posted,
+};
 use crate::session::{Inner, store_error};
 use crate::source::{Kind, Reference};
 use crate::{Answer, Code as Refused, Form, Refusal, refused};
 use s4_credential_contract::KeyAnswer;
-use s4_credential_contract::personal::{
-    Claim, Claimed, Device, Home, KitKind, Membership, Moved, Owed, PairCode, Paired, Posted,
-};
 
 /// How long a flow waits for the agent to take a claim (ms), and between
 /// reads of a slot or a log.
@@ -1324,7 +1324,7 @@ impl Space {
 
     fn joining(&self, prompts: Lent<'_>, code: &[u8], label: &str) -> Result<Paired, Refusal> {
         let delay = self.draw_claim_delay()?;
-        s4_credential_contract::personal::label(label)?;
+        crate::personal::label(label)?;
         let code = Code::from_bytes(code)
             .ok_or_else(|| refused(Refused::Arguments, "not a pairing code"))?;
         let mut held = self.held();
@@ -1965,6 +1965,12 @@ impl Space {
 
     /// `regroup`: the devices named removed and a new group started.
     pub fn regroup(&self, prompts: Lent<'_>, remove: Vec<u32>) -> Result<Posted, Refusal> {
+        if remove.len() > super::MAX_REGROUP {
+            return Err(crate::refused(
+                crate::Code::Arguments,
+                format!("a regroup names at most {} devices", super::MAX_REGROUP),
+            ));
+        }
         self.operate(&mut self.held(), prompts, "regroup", remove.encode(), None)
     }
 

@@ -19,12 +19,24 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
+import team.virto.vos.personal.ClaimRequest;
+import team.virto.vos.personal.Claimed;
+import team.virto.vos.personal.Device;
+import team.virto.vos.personal.IVosPersonal;
+import team.virto.vos.personal.Membership;
+import team.virto.vos.personal.Moved;
+import team.virto.vos.personal.Notice;
+import team.virto.vos.personal.PairCode;
+import team.virto.vos.personal.Paired;
+import team.virto.vos.personal.Posted;
+import team.virto.vos.personal.Synced;
 
 /**
  * The VOS facility in the app's own {@code :vos} process: {@code libvos_facility.so}, opened once
- * for the process, and the {@link IVosNode} it serves. The prover's memory, the secrets a proof
- * takes and the gateway connections stay in this process, so the UI's death touches no proof or
- * sync, and this process's death leaves the UI running.
+ * for the process, and the two interfaces it serves: s4's {@link IVosNode}, which s4's client
+ * calls, and the facility's own {@link IVosPersonal}, which its screens call. The prover's
+ * memory, the secrets a proof takes and the gateway connections stay in this process, so the UI's
+ * death touches no proof or sync, and this process's death leaves the UI running.
  *
  * <p>Any component of this process reaches the facility through {@link #get}: the bound {@link
  * VosNodeService} the UI calls, and the background job ({@link SyncWorker}), which runs {@link
@@ -54,6 +66,7 @@ public final class VosNode {
   private final Context context;
   private final long handle;
   private final IVosNode.Stub binder = new Served();
+  private final IVosPersonal.Stub personal = new Personal();
   /** The sessions each UI token opened, closed when its process dies or it releases them. */
   private final Map<IBinder, Set<Long>> held = new HashMap<>();
   /** The token each UI process last held, by its pid. */
@@ -90,9 +103,21 @@ public final class VosNode {
     Background.schedule(context);
   }
 
-  /** The interface this process serves. */
+  /** s4's interface, as this process serves it. */
   IVosNode binder() {
     return binder;
+  }
+
+  /** The facility's own interface, as this process serves it. */
+  IVosPersonal personal() {
+    return personal;
+  }
+
+  /** Only this app's own processes are served. */
+  private static void caller() {
+    if (Binder.getCallingUid() != Process.myUid()) {
+      throw new SecurityException("the VOS facility serves this app alone");
+    }
   }
 
   /**
@@ -211,14 +236,8 @@ public final class VosNode {
     nativeCloseAll(handle, closing, new Refusal());
   }
 
-  /** The interface, for this app's own processes alone. */
+  /** s4's interface, for this app's own processes alone. */
   private final class Served extends IVosNode.Stub {
-    private void caller() {
-      if (Binder.getCallingUid() != Process.myUid()) {
-        throw new SecurityException("the VOS facility serves this app alone");
-      }
-    }
-
     @Override
     public void hold(IBinder client) {
       caller();
@@ -313,6 +332,57 @@ public final class VosNode {
     }
 
     @Override
+    public void foreground(boolean foreground) {
+      caller();
+      nativeForeground(handle, foreground, new Refusal());
+    }
+
+    @Override
+    public EnrolledSpace[] enrollments(Refusal refused) {
+      caller();
+      return nativeEnrollments(handle, EnrolledSpace.class, refused);
+    }
+
+    @Override
+    public JobRun[] runs(Refusal refused) {
+      caller();
+      return VosNode.this.runs(refused);
+    }
+
+    @Override
+    public ParcelFileDescriptor openStream(StreamTarget target, Refusal refused) {
+      caller();
+      int descriptor = nativeOpenStream(handle, target, refused);
+      return descriptor < 0 ? null : ParcelFileDescriptor.adoptFd(descriptor);
+    }
+
+    @Override
+    public byte[] screens(StreamTarget gateway, ParcelFileDescriptor end, Refusal refused) {
+      try {
+        caller();
+      } catch (RuntimeException refusedCaller) {
+        closeQuietly(end);
+        throw refusedCaller;
+      }
+      if (end == null) {
+        refused.code = ErrorCode.ARGUMENTS;
+        refused.message = "the screens need the UI's end of a socket pair";
+        return null;
+      }
+      // The light node owns the descriptor from here, and closes it with the session.
+      return nativeScreens(handle, gateway, end.detachFd(), refused);
+    }
+
+    @Override
+    public boolean clearnet(byte[] hostKey, Refusal refused) {
+      caller();
+      return nativeClearnet(handle, hostKey, refused);
+    }
+  }
+
+  /** The facility's own interface, for this app's own processes alone. */
+  private final class Personal extends IVosPersonal.Stub {
+    @Override
     public Synced sync(Refusal refused) {
       caller();
       return VosNode.this.sync(refused);
@@ -322,12 +392,6 @@ public final class VosNode {
     public Synced syncPersonal(Refusal refused) {
       caller();
       return VosNode.this.syncPersonal(refused);
-    }
-
-    @Override
-    public void foreground(boolean foreground) {
-      caller();
-      nativeForeground(handle, foreground, new Refusal());
     }
 
     @Override
@@ -502,48 +566,6 @@ public final class VosNode {
     public Moved moveHome(ClaimRequest request, IVosPrompts prompts, Refusal refused) {
       caller();
       return nativeMoveHome(handle, request, prompts, refused);
-    }
-
-    @Override
-    public EnrolledSpace[] enrollments(Refusal refused) {
-      caller();
-      return nativeEnrollments(handle, EnrolledSpace.class, refused);
-    }
-
-    @Override
-    public JobRun[] runs(Refusal refused) {
-      caller();
-      return VosNode.this.runs(refused);
-    }
-
-    @Override
-    public ParcelFileDescriptor openStream(StreamTarget target, Refusal refused) {
-      caller();
-      int descriptor = nativeOpenStream(handle, target, refused);
-      return descriptor < 0 ? null : ParcelFileDescriptor.adoptFd(descriptor);
-    }
-
-    @Override
-    public byte[] screens(StreamTarget gateway, ParcelFileDescriptor end, Refusal refused) {
-      try {
-        caller();
-      } catch (RuntimeException refusedCaller) {
-        closeQuietly(end);
-        throw refusedCaller;
-      }
-      if (end == null) {
-        refused.code = ErrorCode.ARGUMENTS;
-        refused.message = "the screens need the UI's end of a socket pair";
-        return null;
-      }
-      // The light node owns the descriptor from here, and closes it with the session.
-      return nativeScreens(handle, gateway, end.detachFd(), refused);
-    }
-
-    @Override
-    public boolean clearnet(byte[] hostKey, Refusal refused) {
-      caller();
-      return nativeClearnet(handle, hostKey, refused);
     }
   }
 
