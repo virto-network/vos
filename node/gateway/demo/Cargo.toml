@@ -58,3 +58,9 @@ fjall = { git = "https://github.com/olanod/fjall", rev = "cffa5f7620be864277f7d5
 # As VOS's workspace: the prover's crates optimized, since tests prove.
 [profile.dev.package."*"]
 opt-level = 3
+# No debug info in dependencies, line tables alone in the crate, as the
+# workspace's profiles.
+debug = false
+
+[profile.dev]
+debug = "line-tables-only"

@@ -128,6 +128,18 @@ homepage = "https://github.com/virto-network/vos"
 authors = ["Daniel Olano <daniel@olanod.com>"]
 readme = "README.md"
 
+# Dev and test builds keep line tables alone (a backtrace names its file
+# and line), and dependencies no debug info: full debug info made a
+# worktree's `target/` tens of GB and its links slow.
+[profile.dev]
+debug = "line-tables-only"
+[profile.dev.package."*"]
+debug = false
+[profile.test]
+debug = "line-tables-only"
+[profile.test.package."*"]
+debug = false
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

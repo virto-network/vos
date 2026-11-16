@@ -16,6 +16,14 @@ publish = false
 # The prover's dependencies optimized even in tests, which prove.
 [profile.dev.package."*"]
 opt-level = 3
+# Line tables alone, in the dependencies too: `tests/leaks.rs` tells the
+# recursion crate's frees from the others by the frames of a backtrace,
+# and recair's code inlined into another crate keeps its frames only with
+# that crate's line tables.
+debug = "line-tables-only"
+
+[profile.dev]
+debug = "line-tables-only"
 
 # The C ABI build is the shared library the app's `:vos` process loads,
 # `libvos_facility.so`.
