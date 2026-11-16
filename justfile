@@ -116,11 +116,11 @@ vectors:
 # full 2,000, 32 and 256), the masked acceptance above 2^16
 # rows, and the final verifier's decode, verify and Wasm gates as the
 # maximum over 12 seeds of the masked wrap (on the JAM-only host's
-# `final-verify.elf`, built by `check-no-std`, and `judge-wasm`'s blob),
+# `final-verify.elf`, built by `build-final-verify`, and `judge-wasm`'s blob),
 # one test at a time, the device formats' leakage gates (47's and 46's)
 # among them. Last, the wrap files the suites wrote
 # checked to be final wraps alone, and the carrier audit (`test-carriers`).
-test-proof: build-test-actors build-programs judge-wasm
+test-proof: build-test-actors build-programs build-final-verify judge-wasm
     cargo test -p vos-pvm-proof --features debug-internals --lib --bins --test gates --test isa -- --test-threads=2
     for test in (cargo test -p vos-pvm-proof --features debug-internals --test kernel -- --list --format terse --skip reads:: --skip wrap_files:: | lines | where {|line| $line ends-with ': test' } | each {|line| $line | str replace ': test' '' }) { cargo test -p vos-pvm-proof --features debug-internals --test kernel $test -- --exact --test-threads=1 }
     cargo test -p vos-pvm-proof --features debug-internals --test kernel reads:: -- --test-threads=1
