@@ -14,11 +14,6 @@ target = "recursion"
 seconds = 191
 
 [[heavy]]
-package = "vos-pvm-recair"
-target = "segment"
-seconds = 126
-
-[[heavy]]
 package = "vos-light"
 target = "sealed"
 seconds = 95
