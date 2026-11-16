@@ -27,7 +27,7 @@ default:
 core_crates := "-p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-pvm-codec-derive -p vos-pvm-proof-derive -p vos-raft -p merkle-crdt -p vos-mls -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-anchor -p vos-statement -p vos-statement-service --features vos-anchor/vectors,vos-statement/fixtures"
 
 # The agent's suites' crates, which `test-agent`, `check` and `gate` run.
-agent_crates := "-p vos-exec -p vos-light -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-api -p vos-http -p vos-gateway -p vos-node -p vos-node-prover -p vos-venue -p vos-net -p vos-cli -p vos-jam-dev -p vos-scale -p vos-keeper"
+agent_crates := "-p vos-exec -p vos-light -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-api -p vos-http -p vos-gateway -p vos-node -p vos-node-prover -p vos-venue -p vos-kreivo -p vos-net -p vos-cli -p vos-jam-dev -p vos-scale -p vos-keeper"
 
 # A guest build for the PVM: the statement's target, its standard library
 # built from source. Every guest and blob build sets `CARGO_INCREMENTAL` to
@@ -206,11 +206,11 @@ repro-aarch64: build-test-actors
 
 # The conformance vectors of Kreivo's spaces pallet and the mutation lists
 # (`node/venue/conformance`, `spaces-pallet.md` §10), written anew by the
-# reference mock (`node/venue/src/kreivo`) over the golden fixtures: after a
+# reference mock (`tools/kreivo`) over the golden fixtures: after a
 # change of the design, the mock or the fixtures. `check` refuses vectors
 # the mock does not write.
 conformance:
-    with-env { VOS_CONFORMANCE: "write" } { cargo test -p vos-venue kreivo::conformance::the_vectors_are_the_generators }
+    with-env { VOS_CONFORMANCE: "write" } { cargo test -p vos-kreivo conformance::the_vectors_are_the_generators }
 
 # The tests run on mimalloc as the node's binary does, and as it does with
 # transparent huge pages off.
@@ -225,7 +225,7 @@ fmt-check:
 # item.
 doc-check:
     with-env { RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links" } { cargo doc --workspace --no-deps --quiet }
-    with-env { RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links" } { cargo doc -p vos-venue --features kreivo-mock,model --no-deps --quiet }
+    with-env { RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links" } { cargo doc -p vos-venue -p vos-kreivo --features vos-venue/model,vos-kreivo/mock --no-deps --quiet }
 
 clippy:
     cargo clippy --workspace --all-targets --quiet -- -D warnings
@@ -234,7 +234,8 @@ clippy:
     cargo clippy -p vos-cli --no-default-features --all-targets --quiet -- -D warnings
     cargo clippy -p vos-pvm-proof --features debug-internals --all-targets --quiet -- -D warnings
     cargo clippy -p vos-venue --all-targets --quiet -- -D warnings
-    for features in [model kreivo kreivo-mock] { cargo clippy -p vos-venue --features $features --quiet -- -D warnings }
+    cargo clippy -p vos-venue --features model --quiet -- -D warnings
+    cargo clippy -p vos-kreivo --features mock --quiet -- -D warnings
     just clippy-prover
 
 # The node and `vos` with the masked prover (`prover`): they build and lint
@@ -545,20 +546,21 @@ check-no-faults: (_forbidden "faults")
 # name once, prints every feature enabled and package held, and fails on
 # any, or when a build does not resolve.
 _forbidden +gates:
+    let tools = (cargo metadata --no-deps --format-version 1 | from json | get packages | where {|package| $package.manifest_path | str starts-with $"(pwd)/tools/" } | get name); \
     let table = [ \
         [gate args features packages]; \
         [faults "--workspace" [faults] []] \
         [faults "-p vos-cli" [faults] []] \
         [faults "-p vos-cli --features prover" [faults] []] \
-        [jam-dev "-p vos-cli" [] [vos-jam-dev vos-jam]] \
-        [jam-dev "-p vos-cli --features prover" [] [vos-jam-dev vos-jam]] \
-        [jam-dev "-p vos-node" [] [vos-jam-dev vos-jam]] \
-        [jam-dev "-p vos-node --features prover" [] [vos-jam-dev vos-jam]] \
-        [venue-clients "--workspace" [kreivo-mock model] []] \
-        [venue-clients "-p vos-cli" [kreivo-mock kreivo model] []] \
-        [venue-clients "-p vos-cli --features prover" [kreivo-mock kreivo model] []] \
-        [venue-clients "-p vos-node" [kreivo-mock kreivo model] []] \
-        [venue-clients "-p vos-node --features prover" [kreivo-mock kreivo model] []] \
+        [tools "-p vos-cli" [] $tools] \
+        [tools "-p vos-cli --features prover" [] $tools] \
+        [tools "-p vos-node" [] $tools] \
+        [tools "-p vos-node --features prover" [] $tools] \
+        [venue-model "--workspace" [model] []] \
+        [venue-model "-p vos-cli" [model] []] \
+        [venue-model "-p vos-cli --features prover" [model] []] \
+        [venue-model "-p vos-node" [model] []] \
+        [venue-model "-p vos-node --features prover" [model] []] \
         [seeded-masks "--workspace" [seeded-masks] []] \
         [seeded-masks "-p vos-cli --features prover" [seeded-masks] []] \
         [seeded-masks "-p vos-light" [seeded-masks] []] \
@@ -589,10 +591,6 @@ _forbidden +gates:
         [heap-peak "-p vos-cli --features prover" [heap-peak] []] \
         [heap-peak "-p vos-statement --features pvm-guest" [heap-peak] []] \
         [heap-peak "-p vos-statement-service --features pvm-guest" [heap-peak] []] \
-        [scale "-p vos-cli" [] [vos-scale]] \
-        [scale "-p vos-cli --features prover" [] [vos-scale]] \
-        [scale "-p vos-node" [] [vos-scale]] \
-        [scale "-p vos-node --features prover" [] [vos-scale]] \
     ]; \
     let failures = ($table | where gate in [{{gates}}] | group-by args | items {|args, rows| \
         let resolved = (cargo tree ...($args | split row ' ') -e no-dev --target all -f '{p}|{f}' --prefix none | complete); \
@@ -638,43 +636,35 @@ check-release-names:
 # space's status and listed keys, which a re-founded space's anchoring
 # keeps, are not flagged.
 check-venue-rules:
-    let roots = [pvm/proof/statement/src pvm/proof/statement/service/src node/venue/src tools/jam-dev/src]; \
+    let roots = [pvm/proof/statement/src pvm/proof/statement/service/src node/venue/src tools/kreivo/src tools/jam-dev/src]; \
     let markers = ['MAX_ROOT_AGE_MS' '\.boundary\(' 'verify_strict' 'SMALL_ORDER' 'small_order\(' 'registrable' 'MIN_LENGTH_MS' 'MAX_LENGTH_MS' 'MAX_FOUNDING_KEYS' '[<>]=?\s*last\b' '\blast\s*[<>]']; \
-    let allowed = [[file marker]; [node/venue/src/lib.rs verify_strict] [pvm/proof/statement/service/src/refine.rs verify_strict] [node/venue/src/kreivo/mock/chain.rs MAX_FOUNDING_KEYS]]; \
+    let allowed = [[file marker]; [node/venue/src/lib.rs verify_strict] [pvm/proof/statement/service/src/refine.rs verify_strict] [tools/kreivo/src/mock/chain.rs MAX_FOUNDING_KEYS]]; \
     let sources = ($roots | each {|root| glob $"($root)/**/*.rs" } | flatten | each {|path| $path | path relative-to $env.PWD } | where {|path| not ($path =~ '(^|/)(tests?|conformance)(/|\.rs$)') }); \
     let found = ($sources | each {|file| let code = (open --raw $file | lines | take until {|line| $line =~ '^#\[cfg\(test\)\]' } | each {|line| $line | str replace -r '//.*$' '' } | str join "\n" | str replace -a -r '(?m)^\s*(pub )?use [^;]*;' ''); $markers | where {|marker| ($code =~ $marker) and not ($allowed | any {|a| $a.file == $file and $a.marker == $marker }) } | each {|marker| $"($file) holds ($marker)" } } | flatten); \
-    let calls = [[file call]; [pvm/proof/statement/src/model.rs 'rules::anchored('] [pvm/proof/statement/service/src/accumulate.rs 'rules::anchor('] [pvm/proof/statement/service/src/accumulate.rs 'rules::register('] [pvm/proof/statement/service/src/accumulate.rs 'rules::anchored('] [pvm/proof/statement/service/src/refine.rs 'rules::registration('] [node/venue/src/model.rs 'rules::anchor('] [node/venue/src/model.rs 'rules::register('] [node/venue/src/model.rs 'rules::registration('] [node/venue/src/model.rs 'rules::anchored('] [node/venue/src/kreivo/mock/pallet.rs 'rules::anchor('] [node/venue/src/kreivo/mock/pallet.rs 'rules::register('] [node/venue/src/kreivo/mock/pallet.rs 'rules::registration('] [node/venue/src/kreivo/mock/pallet.rs 'rules::anchored('] [node/venue/src/kreivo/venue.rs 'rules::anchored('] [tools/jam-dev/src/venue.rs 'rules::anchored('] [node/venue/src/model.rs 'rules::add_key('] [pvm/proof/statement/service/src/accumulate.rs 'rules::add_key('] [node/venue/src/kreivo/mock/pallet.rs 'rules::add_key(']]; \
+    let calls = [[file call]; [pvm/proof/statement/src/model.rs 'rules::anchored('] [pvm/proof/statement/service/src/accumulate.rs 'rules::anchor('] [pvm/proof/statement/service/src/accumulate.rs 'rules::register('] [pvm/proof/statement/service/src/accumulate.rs 'rules::anchored('] [pvm/proof/statement/service/src/refine.rs 'rules::registration('] [node/venue/src/model.rs 'rules::anchor('] [node/venue/src/model.rs 'rules::register('] [node/venue/src/model.rs 'rules::registration('] [node/venue/src/model.rs 'rules::anchored('] [tools/kreivo/src/mock/pallet.rs 'rules::anchor('] [tools/kreivo/src/mock/pallet.rs 'rules::register('] [tools/kreivo/src/mock/pallet.rs 'rules::registration('] [tools/kreivo/src/mock/pallet.rs 'rules::anchored('] [tools/kreivo/src/venue.rs 'rules::anchored('] [tools/jam-dev/src/venue.rs 'rules::anchored('] [node/venue/src/model.rs 'rules::add_key('] [pvm/proof/statement/service/src/accumulate.rs 'rules::add_key('] [tools/kreivo/src/mock/pallet.rs 'rules::add_key(']]; \
     let missing = ($calls | where {|row| not (open --raw $row.file | str contains $row.call) } | each {|row| $"($row.file) calls no ($row.call)" }); \
     for failure in ($found ++ $missing) { print -e $failure }; \
     if ($found ++ $missing | is-not-empty) { error make { msg: "an anchor rule lives outside vos_anchor::venue, or a venue does not call it" } }; \
     print $"the venue rules live in vos_anchor::venue alone: ($sources | length) files searched, ($calls | length) calls found"
 
 # Every `check-no-*` gate below, each build resolved once.
-check-no-leaks: (_forbidden "jam-dev" "venue-clients" "seeded-masks" "debug-internals" "test-formats" "store-dump" "heap-peak" "scale") _seeded-masks-unimplied _debug-names-absent
-    print "no test seam, debug output, test format, store dump, heap peak, JAM client, venue client or scale harness in a production build"
+check-no-leaks: (_forbidden "tools" "venue-model" "seeded-masks" "debug-internals" "test-formats" "store-dump" "heap-peak") _seeded-masks-unimplied _debug-names-absent
+    print "no test seam, debug output, test format, store dump, heap peak, model venue or development tool in a production build"
 
-# A node knows no JAM: the JAM client (a PolkaJam node's RPC and `jamt`,
-# the statements service's client and `JamVenue`) is development tooling,
-# `vos-jam-dev`, and neither the `vos` binary, with or without the prover,
-# nor `vos-node` depends on it, nor on the agent-as-JAM-service builder
-# (`vos-jam`), on a normal or build edge.
-check-no-jam-dev: (_forbidden "jam-dev")
-    print "no JAM client in the node"
+# A node links none of VOS's development tooling (`tools/`): the JAM
+# builder (`vos-jam`) and client (`vos-jam-dev`), Kreivo's client and its
+# pallet's mock (`vos-kreivo`), the scale harness and the phone bench.
+# Neither the `vos` binary, with or without the prover, nor `vos-node`
+# holds a package under `tools/`, on a normal or build edge.
+check-no-tools: (_forbidden "tools")
+    print "no development tool in the node"
 
-# A node carries no venue's client: `vos-venue`'s model venue (`model`),
-# its client of Kreivo's spaces pallet (`kreivo`) and that pallet's mock
-# (`kreivo-mock`) reach neither the `vos` binary, with or without the
-# prover, nor `vos-node`, on a normal or build edge (the tests enable them
-# on dev edges, the carrier audit's checker `kreivo`), and no normal or
-# build edge of any workspace member enables the model or the mock.
-check-no-venue-clients: (_forbidden "venue-clients")
-    print "no venue client in the node"
-
-# The scale harness (`tools/scale`, `vos-scale`) is development tooling:
-# neither the `vos` binary, with or without the prover, nor `vos-node`
-# depends on it, on a normal or build edge.
-check-no-scale: (_forbidden "scale")
-    print "no scale harness in the node"
+# A node carries no venue's client: `vos-venue`'s model venue (`model`)
+# reaches neither the `vos` binary, with or without the prover, nor
+# `vos-node`, on a normal or build edge (the tests enable it on dev
+# edges), and no normal or build edge of any workspace member enables it.
+check-no-venue-model: (_forbidden "venue-model")
+    print "no model venue in the node"
 
 # The masked prover's test seams (`vos-pvm-recair`'s `seeded-masks`: the
 # seeded randomness `MaskRng::Seeded` and the forced proof

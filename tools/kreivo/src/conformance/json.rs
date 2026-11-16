@@ -6,9 +6,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use super::{account_id, hex};
-use crate::kreivo::mock::keys;
-use crate::kreivo::mock::types::{DispatchError, PALLET_INDEX};
-use crate::kreivo::mock::{Constants, Origin, Verdict};
+use crate::mock::keys;
+use crate::mock::types::{DispatchError, PALLET_INDEX};
+use crate::mock::{Constants, Origin, Verdict};
 
 /// The vectors' file.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

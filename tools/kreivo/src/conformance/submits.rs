@@ -5,11 +5,11 @@ use vos_statement::{RootRead, SpaceId, Statement};
 
 use super::world::*;
 use super::{Fixtures, Vector};
-use crate::kreivo::mock::keys;
-use crate::kreivo::mock::types::{
+use crate::mock::keys;
+use crate::mock::types::{
     Active, Call, Error, Handler, PAUSE_ANCHOR, PAUSE_REGISTER, PAUSE_SUBMIT, ProgramInfo,
 };
-use crate::kreivo::mock::{Chain, Origin, Payer};
+use crate::mock::{Chain, Origin, Payer};
 
 pub(super) fn g6(fx: &Fixtures) -> Vector {
     let mut w = World::new(fx, false);
@@ -63,7 +63,7 @@ pub(super) fn g7(fx: &Fixtures) -> Vector {
         ..s.roots[0]
     };
     w.refused(changed(&|s| s.roots[0] = unanchored), proof.clone(), 5);
-    assert!(crate::proof_refused(fx.tampered_code));
+    assert!(vos_venue::proof_refused(fx.tampered_code));
     w.refused(s.encode(), fx.tampered.clone(), fx.tampered_code);
     // The activation windows: the fixture's own format and program stored,
     // but not active now.

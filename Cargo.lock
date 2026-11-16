@@ -8544,6 +8544,7 @@ dependencies = [
  "tracing-subscriber",
  "vos-api",
  "vos-gateway",
+ "vos-kreivo",
  "vos-net",
  "vos-node",
  "vos-node-prover",
@@ -8700,6 +8701,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "vos-kreivo"
+version = "0.1.0"
+dependencies = [
+ "blake2 0.10.6",
+ "ed25519-dalek 2.2.0",
+ "parity-scale-codec",
+ "serde",
+ "serde_json",
+ "stwo",
+ "tracing",
+ "twox-hash",
+ "vos-anchor",
+ "vos-pvm-final-verifier",
+ "vos-statement",
+ "vos-venue",
+]
+
+[[package]]
 name = "vos-light"
 version = "0.1.0"
 dependencies = [
@@ -8800,6 +8819,7 @@ dependencies = [
  "vos-jam",
  "vos-jam-dev",
  "vos-keeper",
+ "vos-kreivo",
  "vos-light",
  "vos-net",
  "vos-node-prover",
@@ -9147,16 +9167,9 @@ dependencies = [
 name = "vos-venue"
 version = "0.1.0"
 dependencies = [
- "blake2 0.10.6",
  "ed25519-dalek 2.2.0",
- "parity-scale-codec",
- "serde",
- "serde_json",
- "stwo",
  "tracing",
- "twox-hash",
  "vos-anchor",
- "vos-pvm-final-verifier",
  "vos-statement",
 ]
 

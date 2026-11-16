@@ -82,7 +82,7 @@ impl Setup {
         assert!(
             outcome.events.iter().any(|event| matches!(
                 event,
-                crate::kreivo::mock::types::Event::Anchored { window: 5, .. }
+                crate::mock::types::Event::Anchored { window: 5, .. }
             )),
             "{outcome:?}"
         );
@@ -101,7 +101,7 @@ impl Setup {
                 .get(&keys::equivocations(&self.space.0, 0, 5))
                 .cloned()
         });
-        let evidence: crate::kreivo::mock::types::Evidence =
+        let evidence: crate::mock::types::Evidence =
             calls::read(&evidence.expect("the evidence")).unwrap();
         assert_eq!(evidence.first_signer, stolen.verifying_key().to_bytes());
         assert_eq!(evidence.second_signer, self.key.verifying_key().to_bytes());

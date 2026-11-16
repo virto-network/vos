@@ -340,7 +340,7 @@ fn a_venue_reached_late_anchors_once_reached() {
     let setup = Setup::new(true);
     let tries = Arc::new(AtomicUsize::new(0));
     let (chain, counted) = (Arc::clone(&setup.chain), Arc::clone(&tries));
-    let connect: crate::kreivo::venue::Connect = Box::new(move || {
+    let connect: crate::venue::Connect = Box::new(move || {
         if counted.fetch_add(1, Ordering::SeqCst) < 3 {
             return Err(Lost("down".into()));
         }

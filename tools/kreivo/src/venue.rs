@@ -44,8 +44,8 @@ use super::calls::{
 };
 use super::send::KreivoSend;
 use super::transport::{Backoff, Lost, Sender, Transport};
-use crate::queue::AnchorQueue;
-use crate::{AnchorOutcome, Held as Holding, Status, SubmitOutcome, UNJUDGED, VenueClient};
+use vos_venue::queue::AnchorQueue;
+use vos_venue::{AnchorOutcome, Held as Holding, Status, SubmitOutcome, UNJUDGED, VenueClient};
 
 /// How the client paces itself, and what it takes a submit to cost.
 #[derive(Clone, Debug)]
@@ -494,7 +494,7 @@ impl VenueClient for KreivoVenue {
         let Some(id) = self.shared.id.get() else {
             return AnchorOutcome::NotYet;
         };
-        if !crate::signed(anchor, id) {
+        if !vos_venue::signed(anchor, id) {
             return AnchorOutcome::NotYet;
         }
         let mut state = self.shared.state();

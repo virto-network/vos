@@ -8,12 +8,12 @@ use std::time::{Duration, Instant};
 
 use vos_jam_dev::JamVenue;
 use vos_jam_dev::live::{PolkaJam, Watch};
+use vos_kreivo::Transport;
+use vos_kreivo::calls::AccountId;
+use vos_kreivo::transport::{Included, Lost, SendError, Signed};
 use vos_node_prover::masked::Disclosing;
 use vos_node_prover::{Internals, ProveError, Prover};
 use vos_statement_service::state::Outcome;
-use vos_venue::kreivo::Transport;
-use vos_venue::kreivo::calls::AccountId;
-use vos_venue::kreivo::transport::{Included, Lost, SendError, Signed};
 use vos_venue::vos_statement::{ProgramId, Statement};
 use vos_venue::{SubmitOutcome, VenueClient};
 use vos_wire::result::Attest;

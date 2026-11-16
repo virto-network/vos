@@ -20,15 +20,11 @@ impl Pallet {
     }
 
     /// `call` by `who`: Ok, its events; or its pallet error.
-    fn call(
-        &mut self,
-        who: [u8; 32],
-        call: Call,
-    ) -> Result<Vec<crate::kreivo::mock::types::Event>, Error> {
+    fn call(&mut self, who: [u8; 32], call: Call) -> Result<Vec<crate::mock::types::Event>, Error> {
         let outcome = self.chain.submit(Origin::Signed(who), &call.bytes());
         match outcome.verdict {
             Verdict::Ok => Ok(outcome.events),
-            Verdict::Err(crate::kreivo::mock::types::DispatchError::Module(module)) => {
+            Verdict::Err(crate::mock::types::DispatchError::Module(module)) => {
                 Err(Error::from_index(module.error[0]).expect("a pallet error"))
             }
             other => panic!("{call:?}: {other:?}"),
@@ -101,9 +97,9 @@ impl vos_anchor::suite::Harness for Pallet {
         use vos_anchor::venue::AnchorRefusal as Rule;
         match self.call(OPERATOR, Call::anchor(anchor)) {
             Ok(events) => {
-                let ended = events.iter().any(|event| {
-                    matches!(event, crate::kreivo::mock::types::Event::SpaceEnded { .. })
-                });
+                let ended = events
+                    .iter()
+                    .any(|event| matches!(event, crate::mock::types::Event::SpaceEnded { .. }));
                 if ended { Answer::Evidence } else { Answer::New }
             }
             Err(Error::AlreadyAnchored) => Answer::Again,

@@ -14,7 +14,6 @@ use vos_net::memory::Hub;
 use vos_node::store::EntryKind;
 use vos_node::{Hooks, Node};
 use vos_statement_service::item::Item;
-use vos_venue::kreivo;
 use vos_venue::vos_statement::Statement;
 use vos_venue::{AnchorOutcome, SubmitOutcome, VenueClient};
 use vos_wire::ids::AgentId;
@@ -91,7 +90,7 @@ pub fn anchor_carriers(anchor: &Anchor) -> Vec<(String, Vec<u8>)> {
         ("the anchor".into(), anchor.encode()),
         (
             "Kreivo's anchor call".into(),
-            kreivo::calls::Call::anchor(anchor).bytes(),
+            vos_kreivo::calls::Call::anchor(anchor).bytes(),
         ),
         ("JAM's anchor item".into(), Item::Anchor(*anchor).encode()),
     ]
@@ -106,7 +105,7 @@ pub fn submission_carriers(statement: &Statement, proof: &[u8]) -> Vec<(String, 
         ("the final proof".into(), proof.to_vec()),
         (
             "Kreivo's submit call".into(),
-            kreivo::calls::Call::Submit {
+            vos_kreivo::calls::Call::Submit {
                 payer: [0; 32],
                 statement: encoded.clone(),
                 proof: proof.to_vec(),

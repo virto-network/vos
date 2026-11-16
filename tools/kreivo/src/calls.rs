@@ -213,7 +213,7 @@ impl From<SpaceStatus> for vos_anchor::venue::Status {
     }
 }
 
-impl From<SpaceStatus> for crate::Status {
+impl From<SpaceStatus> for vos_venue::Status {
     fn from(status: SpaceStatus) -> Self {
         match status {
             SpaceStatus::Active => Self::Active,

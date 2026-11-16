@@ -18,8 +18,8 @@ use super::calls::{
 };
 use super::transport::{Invalid, Sender, Sent, Unsent};
 use super::venue::{Alert, Shared};
-use crate::queue::{AnchorSend, Fate};
-use crate::{AnchorOutcome, SubmitOutcome, UNJUDGED};
+use vos_venue::queue::{AnchorSend, Fate};
+use vos_venue::{AnchorOutcome, SubmitOutcome, UNJUDGED};
 
 /// How long an anchor the pool refused waits before it goes again.
 const POOL_BACKOFF: Duration = Duration::from_secs(30);

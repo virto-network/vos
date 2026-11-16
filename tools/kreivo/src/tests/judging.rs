@@ -27,7 +27,7 @@ fn statements_are_judged_through_the_client() {
     other.output.push(0);
     let refused = venue.submit(&other, &fx.proof);
     assert!(
-        matches!(refused, SubmitOutcome::Refused(code) if crate::proof_refused(code)),
+        matches!(refused, SubmitOutcome::Refused(code) if vos_venue::proof_refused(code)),
         "the proof refused against another statement: {refused:?}"
     );
     assert_eq!(
