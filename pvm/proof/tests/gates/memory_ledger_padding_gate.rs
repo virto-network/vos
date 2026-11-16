@@ -287,3 +287,44 @@ fn a_padding_flag_of_two_cannot_mint_a_write() {
     }
     assert_chip(&MemoryChip, &refilled(&honest, &rows, &sn), &sn);
 }
+
+/// Padding between the memory ledger's real rows is harmless: the honest
+/// ledger turned so that its padding lies between real rows, every cyclic
+/// neighbour kept, satisfies MemoryChip, each tuple consumed as before. A
+/// run of real rows after padding starts with a `ts = 0` write and every
+/// group ends with a closing read, a byte's the listed page's alone
+/// (`MemoryPageChip`, a page once: its leaf the trie's one at its index), so
+/// each byte is one group wherever padding lies. The register ledger's is
+/// the device's gate (`device::memory`), on the same chip.
+#[test]
+fn padding_between_the_ledgers_real_rows_is_harmless() {
+    let mut sn = side_note();
+    let honest = MemoryChip.generate_component_trace(&mut sn);
+    let rows = 1usize << honest.log_size;
+    let stored = stored_index(honest.log_size);
+    let natural: Vec<Vec<BaseField>> = honest
+        .original_trace
+        .iter()
+        .map(|column| {
+            (0..rows)
+                .map(|row| column.as_slice()[stored[row]])
+                .collect()
+        })
+        .collect();
+    let padding = &natural[Ledger::IsPadding.offset()];
+    let real = padding
+        .iter()
+        .filter(|&&flag| flag == BaseField::from(0))
+        .count();
+    let turn = |row: usize| (row + real / 2) % rows;
+    let is_real = |row: usize| padding[turn(row)] == BaseField::from(0);
+    assert!(real >= 2 && is_real(0) && is_real(rows - 1));
+    assert!(padding.contains(&BaseField::from(1)));
+    let mut turned = honest.clone();
+    for (column, values) in turned.original_trace.iter_mut().zip(&natural) {
+        for row in 0..rows {
+            column.as_mut_slice()[stored[row]] = values[turn(row)];
+        }
+    }
+    assert_chip(&MemoryChip, &turned, &sn);
+}

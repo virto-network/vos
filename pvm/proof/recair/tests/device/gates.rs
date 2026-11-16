@@ -730,22 +730,59 @@ fn blob_with_other_data() -> Vec<u8> {
     blob
 }
 
-/// A tampered proof is refused, never a panic: a claimed sum, a sample, the
-/// interaction PoW, the io-hash.
+/// A tampered or malformed proof is refused, never a panic: a claimed sum,
+/// a sample of each tree (a main, an interaction, a composition column, an
+/// `R` column), a queried value of each, a salt's queried value, the
+/// interaction PoW, the io-hash; and a part of its structure more or fewer.
 #[test]
 fn a_tampered_proof_is_refused() {
     let format = format();
     let program = the_program();
     let (honest, _) =
         prove::<P2>(&format, program, &blob(), &witness(1), MaskRng::Seeded(6)).expect("proves");
-    type Mutation = Box<dyn Fn(&mut Proof<P2>)>;
+    let one = SecureField::one();
+    let salts = format.masking.expect("masked").salt_columns;
+    type Mutation<'a> = Box<dyn Fn(&mut Proof<P2>) + 'a>;
     let mutations: Vec<Mutation> = vec![
-        Box::new(|p| p.proof.claimed_sums[0] += SecureField::one()),
+        Box::new(|p| p.proof.claimed_sums[0] += one),
         Box::new(|p| p.proof.interaction_pow ^= 1),
-        Box::new(|p| p.proof.stark_proof.0.sampled_values[1][0][0] += SecureField::one()),
-        Box::new(|p| p.proof.stark_proof.0.sampled_values[2][3][0] += SecureField::one()),
+        Box::new(|p| p.proof.stark_proof.0.sampled_values[1][0][0] += one),
+        Box::new(|p| p.proof.stark_proof.0.sampled_values[2][3][0] += one),
+        Box::new(|p| p.proof.stark_proof.0.sampled_values[3][0][0] += one),
+        Box::new(|p| p.proof.stark_proof.0.sampled_values[3][5][0] += one),
+        Box::new(|p| p.proof.stark_proof.0.queried_values[1][2][0] += BaseField::one()),
+        Box::new(|p| p.proof.stark_proof.0.queried_values[2][1][0] += BaseField::one()),
+        Box::new(|p| p.proof.stark_proof.0.queried_values[3][0][0] += BaseField::one()),
+        Box::new(move |p| {
+            let tree = &mut p.proof.stark_proof.0.queried_values[1];
+            let last = tree.len() - salts;
+            tree[last][0] += BaseField::one();
+        }),
         Box::new(|p| p.io[31] ^= 0x80),
-        Box::new(|p| p.proof.claimed_sums.pop().map(drop).unwrap_or(())),
+        Box::new(|p| {
+            p.proof.claimed_sums.pop();
+        }),
+        Box::new(|p| p.proof.claimed_sums.push(SecureField::zero())),
+        Box::new(|p| {
+            p.proof.stark_proof.0.commitments.pop();
+        }),
+        Box::new(|p| {
+            p.proof.stark_proof.0.sampled_values[1].pop();
+        }),
+        Box::new(|p| p.proof.stark_proof.0.sampled_values[2][4].push(SecureField::zero())),
+        Box::new(|p| {
+            p.proof.stark_proof.0.queried_values[2].pop();
+        }),
+        Box::new(|p| {
+            p.proof.stark_proof.0.queried_values[1][0].pop();
+        }),
+        Box::new(|p| {
+            p.proof.stark_proof.0.decommitments[1].hash_witness.pop();
+        }),
+        Box::new(|p| {
+            p.proof.stark_proof.0.fri_proof.inner_layers.pop();
+        }),
+        Box::new(|p| p.proof.stark_proof.0.config.fri_config.n_queries += 1),
     ];
     for (k, mutate) in mutations.iter().enumerate() {
         let mut proof = honest.clone();

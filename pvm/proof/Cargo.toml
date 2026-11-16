@@ -45,7 +45,7 @@ wire = ["dep:vos-wire"]
 # (`CPU_DUMP`, `CPU_EXPR_DUMP`, `VOS_PROOF_PROFILE`): no production build
 # enables it (`just check-no-debug-internals`).
 debug-internals = ["prover"]
-# The masked segment's forging seam (`masked::MaskedSegmentTrace`'s
+# The masked device segment's forging seam (`masked::ChipTraces`'s
 # `*_columns_mut`), for the soundness gates' forced proofs alone: no
 # production build enables it (`just check-no-leaks`).
 seeded-masks = ["prover"]

@@ -42,7 +42,6 @@ mod layout;
 mod rank;
 mod rng;
 mod salts;
-pub mod segment;
 
 use std::time::{Duration, Instant};
 

@@ -33,8 +33,8 @@ use vos_pvm_proof::device::{DEVICE_MAX_LOG_SIZE, DeviceLayout, DeviceShape, devi
 use vos_pvm_proof::format::Format;
 use vos_pvm_proof::framework_access::AllLookupElements;
 use vos_pvm_proof::masked::{
-    ChipSet, Components, DeviceComponents, DeviceSizes, MaskedDeviceTrace, device_bound_sums,
-    device_preprocessed, device_public_values, masked_device_trace,
+    DeviceComponents, DeviceSizes, MaskedDeviceTrace, device_bound_sums, device_preprocessed,
+    device_public_values, masked_device_trace,
 };
 use vos_pvm_proof::side_note::SideNote;
 use vos_pvm_recair_air::masked::MaskedComponents;
@@ -46,9 +46,9 @@ use super::{
 use crate::prove::ProveError;
 use crate::trace::FirstRowFraction;
 
-impl<S: ChipSet> MaskedProvers for Components<S> {
+impl MaskedProvers for DeviceComponents {
     fn provers(&self) -> Vec<&dyn ComponentProver<SimdBackend>> {
-        Components::provers(self)
+        DeviceComponents::provers(self)
     }
 }
 
@@ -116,7 +116,7 @@ pub struct DeviceProof<H: MerkleHasherLifted> {
 /// proof.
 pub fn device_floors(format: &Format, shape: DeviceShape) -> Option<Vec<u32>> {
     let any = format.masking?.log_mask_rows + 2;
-    let chips = vos_pvm_proof::masked::Device::chips(shape)?;
+    let chips = DeviceComponents::chips(shape)?;
     let layout = DeviceComponents::layout(shape, &vec![any; chips.len()])?;
     let rows = mask_rows(format, &layout)?;
     let covered = reveals(format, &layout)?

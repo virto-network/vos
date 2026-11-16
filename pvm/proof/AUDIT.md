@@ -33,7 +33,7 @@ visibility outside the parent depends on where an item sits:
 | `src/core/step.rs`, `src/memory_layout.rs`, `src/sparse_memory.rs` | `step/trace.rs`, `memory_layout/host.rs`, `sparse_memory/host.rs` |
 | `src/framework/traits/{builtin,erased}.rs`: the verifier's chip traits | `builtin/prover.rs`, `erased/prover.rs`: `BuiltInProverComponent`, `MachineProverComponent` |
 | `src/poseidon2/mod.rs`: the hasher and the channel | `poseidon2/simd_backend.rs`: the prover's backends |
-| `src/masked/mod.rs`: the masked component sets | `masked/trace.rs` |
+| `src/masked/mod.rs`: the masked device set | `masked/trace.rs` |
 | `src/lib.rs`: the chip table (`chips!`) | `src/prove/active.rs`: which chips a trace activates |
 
 Whole modules behind `prover`: `side_note`, `kernel`, `prove`, `verify`

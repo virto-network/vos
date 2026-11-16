@@ -675,7 +675,7 @@ last for decades.**
   - the security tool's counts (`security.rs`);
   - the leaf's binding, the wrap, `vos-pvm-final-verifier` and
     `vos-statement`, and `derive` with the program id's derivation;
-  - the mobile proofs: the masked segment chips
+  - the mobile proofs: the masked chips
     (the blinding joined to each chip's last batch, the public sums); the
     device shape (its four chips in place of the page boundary, the
     first-touch and permission rules), the Poseidon2 chip on both shapes,
@@ -1839,12 +1839,12 @@ that narrows the inner proof makes folds cheaper too.
 | a prover's internals leave the role | the carrier audit (A.5) on the model venue and on chain |
 | an honest proof is refused | **retired:** the fork's SIMD reduction of a Blake2s-M31 digest word made canonical; 180,000 masked Blake2s-M31 proofs at 43 queries and PoW 20 and 20,000 at 47 queries and PoW 16, none refused [measured, 2026-10-27] |
 | the device profile misses 1 s on the phone | **retired:** 645 ms, 427 MiB, 0.87–0.88 MB, accepted at ingress (§8) [measured, Fairphone 6, 2026-11-01] |
-| masking the segment chips leaks or breaks the nodes' proofs | soundness and leakage gates on a masked segment and on the device shape (two witnesses at equal public values); the unmasked proofs byte for byte unchanged |
+| masking the segment chips leaks or breaks the nodes' proofs | soundness and leakage gates on the device shape (two witnesses at equal public values); the unmasked proofs byte for byte unchanged |
 | `h = 256` reveals more than its randomizer covers | the revealed-rows argument (§5); R1 on every transcript; `device_floors` at install; a leakage gate at `h = 256` |
 | format 41's wider AIR overflows a kernel leaf | the leaves counted as built, within 2^16 / 2^17 / 2^16; the Poseidon2 chip's 17-page class (§3.2) |
 | a device proof's shape leaks its witness | the trace padded to the program's log sizes, which a public reference run sets (§8); branch-free kernels; a test of two path shapes under one program |
 | the signature chips' cost or soundness | a gate ladder per chip; a phone run (`open.md`) |
-| a ledger's padding splits an address into two groups | segments: **held**, a byte's and a register's boundary produced once, padding inside each ledger verifying harmless, the masked segment verifier refusing a first timestamp below 1; device 47: **held**, its word ledger keeping padding past the real rows and its last row padding; device 46: **not held**, `DeviceMemoryChip` lets a byte have two boundary rows, so 47's release retires it at once and a node admits it only where configured (`open.md`) [reviewed, 2026-11-10; built] |
+| a ledger's padding splits an address into two groups | segments: **held**, a byte's and a register's boundary produced once, padding inside each ledger harmless; device 47: **held**, its word ledger keeping padding past the real rows and its last row padding; device 46: **not held**, `DeviceMemoryChip` lets a byte have two boundary rows, so 47's release retires it at once and a node admits it only where configured (`open.md`) [reviewed, 2026-11-10; built] |
 
 ## 11. Design choices
 

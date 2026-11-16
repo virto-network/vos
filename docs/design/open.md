@@ -76,12 +76,11 @@ The scale results are in `core-model.md` §14, "The scale test".
     index once. The register ledger: a chain starts only with a register's
     `ts = 0` write (`ChainStartH`), the boundary chip's thirteen, bound to
     the public registers. The program memory is a preprocessed read-only
-    table. Padding inside both ledgers verifies, harmless (gate
-    `segment::gates::padding_between_the_ledgers_real_rows_is_harmless`,
-    on the segment AIR proved masked). The masked segment verifier
-    refuses a first timestamp below 1 as the unmasked one does (gate
-    `segment::gates::a_first_timestamp_of_zero_is_refused`). 28, 32 and 39
-    prove the recursion AIR, which has no memory argument.
+    table. Padding inside both ledgers is harmless (gates
+    `memory_ledger_padding_gate::padding_between_the_ledgers_real_rows_is_harmless`
+    and, on the register ledger, the device's
+    `memory::register_ledger_padding_between_real_rows_is_harmless`). 28, 32
+    and 39 prove the recursion AIR, which has no memory argument.
   - **Device 46: not consistent; retired behind 47.** `DeviceMemoryChip`
     lets a byte have as many rows as the prover puts (its address bits
     free, no ordering, `Last` and `ClosingTs` free), so a byte can have

@@ -1,8 +1,7 @@
 //! A run's columns as a masked segment proves them: each active chip's
 //! preprocessed, main and interaction columns, and its interaction trace
-//! with its blinding fraction ([`ChipTraces::interaction`]). The node's
-//! segment ([`masked_segment_trace`]) takes each chip at least a floor; the
-//! device's ([`masked_device_trace`]) at the program's log sizes exactly.
+//! with its blinding fraction ([`ChipTraces::interaction`]), each chip at
+//! the program's log size exactly ([`masked_device_trace`]).
 
 use num_traits::Zero;
 use rayon::prelude::*;
@@ -17,16 +16,15 @@ use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::poly::circle::CircleEvaluation;
 use stwo_constraint_framework::PREPROCESSED_TRACE_IDX;
 
+use crate::chip_idx;
 use crate::framework::MachineProverComponent;
 use crate::lookups::AllLookupElements;
-use crate::proof::SegmentState;
 use crate::prove::{
-    ProvingError, backfill_final_regs, backfill_initial_regs, derive_segment_states,
-    generate_component_traces, prepare_side_note_for_verification, validate_memory_witnesses,
+    ProvingError, generate_component_traces, prepare_side_note_for_verification,
+    validate_memory_witnesses,
 };
 use crate::side_note::SideNote;
 use crate::trace::component::ComponentTrace;
-use crate::{BASE_COMPONENTS, chip_idx, chips_of_mask};
 
 /// Columns as Stwo's evaluations, in bit-reversed order.
 pub type Evaluations = ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>;
@@ -39,68 +37,6 @@ pub struct ChipTraces {
     /// The per-program CPU the first chip is, its cut columns zeroed in its
     /// trace; `None` for the full CPU.
     cpu: Option<crate::chips::ProgramCpuChip>,
-}
-
-/// A run's chips, traced as the node's segment: what the masked prover
-/// commits.
-pub struct MaskedSegmentTrace {
-    /// The chips, as an active-chip mask.
-    pub active: u32,
-    /// Each chip's log size, in chip order.
-    pub log_sizes: Vec<u32>,
-    pub initial_state: SegmentState,
-    pub final_state: SegmentState,
-    chips: ChipTraces,
-}
-
-impl core::ops::Deref for MaskedSegmentTrace {
-    type Target = ChipTraces;
-
-    fn deref(&self) -> &ChipTraces {
-        &self.chips
-    }
-}
-
-impl core::ops::DerefMut for MaskedSegmentTrace {
-    fn deref_mut(&mut self) -> &mut ChipTraces {
-        &mut self.chips
-    }
-}
-
-/// `side_note`'s run traced over the chips `active` names, each chip at
-/// least its floor in `floors` (in chip order): the unmasked prover's
-/// preparation, then the chips' main and preprocessed columns.
-pub fn masked_segment_trace(
-    side_note: &mut SideNote,
-    active: u32,
-    floors: &[u32],
-) -> Result<MaskedSegmentTrace, ProvingError> {
-    if active & !chip_idx::ALL != 0 || active.count_ones() as usize != floors.len() {
-        return Err(ProvingError::MalformedShape);
-    }
-    prepare_side_note_for_verification(side_note);
-    validate_memory_witnesses(side_note)?;
-    backfill_initial_regs(side_note);
-    if side_note.closing_chip_active {
-        backfill_final_regs(side_note);
-    }
-    side_note.ingest_memory_pages();
-    let components: Vec<_> = chips_of_mask(active)
-        .map(|chip| BASE_COMPONENTS[chip])
-        .collect();
-    let traces = generate_component_traces(side_note, &components, floors);
-    let (initial_state, final_state) = derive_segment_states(side_note);
-    Ok(MaskedSegmentTrace {
-        active,
-        log_sizes: traces.iter().map(ComponentTrace::log_size).collect(),
-        initial_state,
-        final_state,
-        chips: ChipTraces {
-            components,
-            traces,
-            cpu: None,
-        },
-    })
 }
 
 /// A run's chips, traced as the device's segment (`crate::device`).
@@ -159,9 +95,8 @@ pub fn masked_device_trace(
     sizes: DeviceSizes<'_>,
 ) -> Result<MaskedDeviceTrace, ProvingError> {
     let (DeviceSizes::Pinned(log_sizes) | DeviceSizes::AtLeast(log_sizes)) = sizes;
-    use super::ChipSet;
     let active = shape.chips;
-    let chips = super::Device::chips(shape).ok_or(ProvingError::MalformedShape)?;
+    let chips = super::DeviceComponents::chips(shape).ok_or(ProvingError::MalformedShape)?;
     if chips.len() != log_sizes.len() {
         return Err(ProvingError::MalformedShape);
     }
@@ -226,8 +161,7 @@ pub fn device_preprocessed(
     shape: crate::device::DeviceShape,
     log_sizes: &[u32],
 ) -> Result<Evaluations, ProvingError> {
-    use super::ChipSet;
-    let chips = super::Device::chips(shape).ok_or(ProvingError::MalformedShape)?;
+    let chips = super::DeviceComponents::chips(shape).ok_or(ProvingError::MalformedShape)?;
     if chips.len() != log_sizes.len() {
         return Err(ProvingError::MalformedShape);
     }
@@ -243,14 +177,6 @@ pub fn device_preprocessed(
             crate::device_component(chip).generate_preprocessed_trace(log_size, &side_note)
         })
         .collect())
-}
-
-impl MaskedSegmentTrace {
-    /// The values mixed after the main tree's root: the boundary states
-    /// ([`super::public_values`]).
-    pub fn public(&self) -> Vec<SecureField> {
-        super::public_values(&self.initial_state, &self.final_state)
-    }
 }
 
 impl ChipTraces {
@@ -361,7 +287,7 @@ fn blinded(
     (columns, claimed_sum + blind)
 }
 
-impl<S: super::ChipSet> super::Components<S> {
+impl super::DeviceComponents {
     /// The chips' provers, in the set's order.
     pub fn provers(&self) -> Vec<&dyn stwo::prover::ComponentProver<SimdBackend>> {
         self.components
