@@ -240,7 +240,7 @@ pub const CREDENTIAL_HORIZON_MS: u64 = 120_000;
 /// or of one past its date, on every replica, so no node's configuration
 /// admits it for the space.
 pub const DEVICE_FORMATS: &[(u32, Option<u64>)] = &[(47, None)];
-const _: () = assert!(!DEVICE_FORMATS.is_empty() && DEVICE_FORMATS.len() <= 2);
+const _: () = assert!(matches!(DEVICE_FORMATS.len(), 1 | 2));
 
 /// How long past its `expires_ms` a credentialed call's binding digest stays
 /// recorded, in milliseconds of batch time: past it, the sweep forgets it,
