@@ -68,16 +68,6 @@ impl DeviceLayout {
             .position(|range| range.first <= page && page < range.end)
     }
 
-    /// The data table's entries, address and byte.
-    pub fn data_entries(&self) -> impl Iterator<Item = (u32, u8)> + '_ {
-        self.data.iter().flat_map(|(base, bytes)| {
-            bytes
-                .iter()
-                .enumerate()
-                .map(move |(offset, &byte)| (base + offset as u32, byte))
-        })
-    }
-
     /// Whether no page lies in two regions.
     pub fn is_disjoint(&self) -> bool {
         self.regions.iter().enumerate().all(|(k, a)| {
