@@ -225,7 +225,7 @@ fmt-check:
 # item.
 doc-check:
     with-env { RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links" } { cargo doc --workspace --no-deps --quiet }
-    with-env { RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links" } { cargo doc -p vos-venue -p vos-kreivo --features vos-venue/model,vos-kreivo/mock --no-deps --quiet }
+    with-env { RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links" } { cargo doc -p vos-venue -p vos-kreivo --features vos-venue/model,vos-kreivo/kreivo-mock --no-deps --quiet }
 
 clippy:
     cargo clippy --workspace --all-targets --quiet -- -D warnings
@@ -235,7 +235,7 @@ clippy:
     cargo clippy -p vos-pvm-proof --features debug-internals --all-targets --quiet -- -D warnings
     cargo clippy -p vos-venue --all-targets --quiet -- -D warnings
     cargo clippy -p vos-venue --features model --quiet -- -D warnings
-    cargo clippy -p vos-kreivo --features mock --quiet -- -D warnings
+    cargo clippy -p vos-kreivo --features kreivo-mock --quiet -- -D warnings
     just clippy-prover
 
 # The node and `vos` with the masked prover (`prover`): they build and lint
@@ -547,6 +547,7 @@ check-no-faults: (_forbidden "faults")
 # any, or when a build does not resolve.
 _forbidden +gates:
     let tools = (cargo metadata --no-deps --format-version 1 | from json | get packages | where {|package| $package.manifest_path | str starts-with $"(pwd)/tools/" } | get name); \
+    if not ([vos-jam vos-kreivo] | all {|package| $package in $tools }) { error make { msg: $"the tools under tools/ not found: ($tools)" } }; \
     let table = [ \
         [gate args features packages]; \
         [faults "--workspace" [faults] []] \
@@ -556,7 +557,7 @@ _forbidden +gates:
         [tools "-p vos-cli --features prover" [] $tools] \
         [tools "-p vos-node" [] $tools] \
         [tools "-p vos-node --features prover" [] $tools] \
-        [venue-model "--workspace" [model] []] \
+        [venue-model "--workspace" [model kreivo-mock] []] \
         [venue-model "-p vos-cli" [model] []] \
         [venue-model "-p vos-cli --features prover" [model] []] \
         [venue-model "-p vos-node" [model] []] \
@@ -662,7 +663,8 @@ check-no-tools: (_forbidden "tools")
 # A node carries no venue's client: `vos-venue`'s model venue (`model`)
 # reaches neither the `vos` binary, with or without the prover, nor
 # `vos-node`, on a normal or build edge (the tests enable it on dev
-# edges), and no normal or build edge of any workspace member enables it.
+# edges), and no normal or build edge of any workspace member enables it,
+# nor Kreivo's mock (`vos-kreivo`'s `kreivo-mock`).
 check-no-venue-model: (_forbidden "venue-model")
     print "no model venue in the node"
 

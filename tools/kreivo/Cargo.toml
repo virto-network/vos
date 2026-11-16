@@ -9,7 +9,7 @@ publish = false
 [features]
 # The reference mock of the pallet and a transport over it, for the node's
 # tests.
-mock = []
+kreivo-mock = []
 
 [dependencies]
 blake2 = "0.10"

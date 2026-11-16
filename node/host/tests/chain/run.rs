@@ -364,7 +364,7 @@ impl Run {
                     .filter(|(_, node)| node.applied(asked.agent).is_some())
                     .find_map(|(_, node)| {
                         let record: Workflow = vos_checker::applied(
-                            node.store(),
+                            node.probes().store(),
                             asked.agent,
                             &keys::workflow(asked.read.workflow),
                         )?;

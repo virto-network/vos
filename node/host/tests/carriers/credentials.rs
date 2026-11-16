@@ -326,7 +326,7 @@ fn refused(answer: Result<Answer, DeviceError>, code: CredentialRefusal) -> Answ
 fn credentialed_steps(node: &vos_node::Node, agent: AgentId) -> Vec<Step> {
     let through = node.applied(agent).unwrap_or(0);
     (1..=through)
-        .filter_map(|index| node.store().log_entry(agent, index).ok().flatten())
+        .filter_map(|index| node.probes().store().log_entry(agent, index).ok().flatten())
         .filter(|entry| entry.kind == EntryKind::Result)
         .filter_map(|entry| WorkResult::decode(&entry.body).ok())
         .flat_map(|(result, _)| result.steps)
