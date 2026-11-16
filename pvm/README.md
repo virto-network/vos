@@ -8,7 +8,8 @@ released with the rest of the repository.
 
 The runtime, compiler, codec, and proof foundations were imported from the Virto JAR fork at
 commit `41d31e64b0f5d6c57a43769d7b8785556a311684`. That source descended from
-the JAM/JAR implementation, which was licensed under Apache-2.0.
+the JAM/JAR implementation, which was licensed under Apache-2.0
+(`LICENSE-APACHE-2.0`).
 
 Only the execution-related crates were imported. Consensus, networking,
 storage, RPC, and node code from the upstream repository are not included.
@@ -17,8 +18,8 @@ These crates are licensed under the AGPL-3.0-or-later, as the rest of the
 repository (`LICENSE` at its root). Files adapted from third-party code keep
 their notices: `proof/NOTICE` (the Nexus zkVM, Stwo), `proof/recair/NOTICE`
 (StarkWare's proving circuits, Stwo) and `proof/poseidon2/src/packed/`
-(Plonky3), under the Apache-2.0 text in `proof/LICENSE-APACHE-2.0` and
-Plonky3's MIT licence.
+(Plonky3), under the Apache-2.0 text in `LICENSE-APACHE-2.0` and Plonky3's
+MIT licence.
 
 VOS-specific evolution starts from the imported commit. This directory is the
 only place in the repository where upstream JAM/JAR terminology and

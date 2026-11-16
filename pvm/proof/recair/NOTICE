@@ -4,7 +4,7 @@ Licensed under the GNU Affero General Public License, version 3 or later.
 This crate adapts code from starkware-libs/proving
 (https://github.com/starkware-libs/proving), at revision 916aefb5,
 Copyright StarkWare Industries Ltd., licensed under the Apache License,
-Version 2.0 (`../LICENSE-APACHE-2.0`). Each adapted file names its sources
+Version 2.0 (`../../LICENSE-APACHE-2.0`). Each adapted file names its sources
 at its top and states that it was modified (Apache-2.0 §4(b)):
 
 - src/context/mod.rs, from crates/circuits/src/context.rs and
