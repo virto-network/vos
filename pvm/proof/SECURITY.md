@@ -529,7 +529,8 @@ window's cadence for it.
 
 ## The external audit
 
-Required before value rides on a proof. Its scope:
+Required before value rides on a proof. [AUDIT.md](AUDIT.md) maps its
+scope to files and functions. Its scope:
 
 - the base segment AIR, above all the parts listed above as not yet under
   a forgery gate;

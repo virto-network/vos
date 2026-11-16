@@ -46,6 +46,8 @@ wrap with `vos_pvm_recair::tree::prove_final`.
 
 Read [SECURITY.md](SECURITY.md) before accepting proofs in production. It
 defines the trust boundary and what the AIR binds.
+[AUDIT.md](AUDIT.md) maps, path by path, the files and functions that
+decide what a verifier accepts, and which code is check, pin or fill.
 [docs/status.md](docs/status.md) tracks constraint coverage, while
 [src/chips/cpu/CONSTRAINTS.md](src/chips/cpu/CONSTRAINTS.md) explains the AIR
 and its shared lookup tables. The design is `docs/design/proving.md`.
