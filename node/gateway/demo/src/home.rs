@@ -92,10 +92,14 @@ impl LocalSpace {
         for (instance, elf, role) in [
             (
                 HOME_CREDENTIALS,
-                elf(vos_testkit::programs::credentials_elf())?,
+                elf(vos_testkit::programs::program_elf("vos-credentials"))?,
                 "registrar",
             ),
-            (HOMES, elf(vos_testkit::programs::homes_elf())?, "operator"),
+            (
+                HOMES,
+                elf(vos_testkit::programs::program_elf("vos-homes"))?,
+                "operator",
+            ),
         ] {
             let install = Install {
                 instance,
@@ -162,7 +166,7 @@ impl LocalSpace {
 
     /// Make and stock personal agents until `home`'s pool holds `pool`.
     pub fn top_up(&self, home: &Home, pool: u32) -> Result<u32, String> {
-        let elf = std::fs::read(vos_testkit::programs::personal_elf())
+        let elf = std::fs::read(vos_testkit::programs::program_elf("vos-personal"))
             .map_err(|error| format!("`Personal`'s ELF: {error}"))?;
         self.keeper(home)
             .top_up(pool, &elf, 4)

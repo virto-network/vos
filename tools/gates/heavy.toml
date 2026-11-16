@@ -1,0 +1,88 @@
+# The heavy test targets: the workspace's test binaries `just check` leaves
+# to `just gate`, each with its warm run's seconds [measured, this
+# repository's development machine, 2026-11-13]. A test binary past about
+# 20 s belongs here; `just check-tiers` holds the recipes to the list.
+
+[[heavy]]
+package = "vos-node"
+target = "served"
+seconds = 194
+
+[[heavy]]
+package = "vos-pvm-recair"
+target = "recursion"
+seconds = 191
+
+[[heavy]]
+package = "vos-pvm-recair"
+target = "segment"
+seconds = 126
+
+[[heavy]]
+package = "vos-light"
+target = "sealed"
+seconds = 95
+
+# `test-reads`' seven tests of it; the whole binary is `test-proof`'s.
+[[heavy]]
+package = "vos-pvm-proof"
+target = "kernel"
+seconds = 93
+
+[[heavy]]
+package = "vos-node"
+target = "cluster"
+seconds = 77
+
+[[heavy]]
+package = "vos-testkit"
+target = "agent"
+seconds = 75
+
+[[heavy]]
+# [measured, compumax, 2026-11-16]: a harness of its own, rounds of
+# killed node processes.
+package = "vos-node"
+target = "tree_crash"
+seconds = 66
+
+[[heavy]]
+# [measured, compumax, 2026-11-16]: a harness of its own, rounds of
+# killed node processes.
+package = "vos-node"
+target = "cut_crash"
+seconds = 59
+
+[[heavy]]
+package = "vos-raft"
+target = "simulated"
+seconds = 49
+
+[[heavy]]
+package = "vos-node"
+target = "ingress"
+seconds = 43
+
+[[heavy]]
+package = "vos-pvm-recair"
+target = "gates"
+seconds = 38
+
+[[heavy]]
+package = "vos-node-prover"
+target = "masked"
+seconds = 33
+
+[[heavy]]
+# [measured, compumax, 2026-11-16]: a harness of its own, rounds of
+# killed node processes.
+package = "vos-node"
+target = "crash"
+seconds = 31
+
+[[heavy]]
+# [measured, compumax, 2026-11-16]: under 20 s, heavy beside `vos-node`'s
+# `crash`, since one invocation selects test targets by name.
+package = "vos-light"
+target = "crash"
+seconds = 11

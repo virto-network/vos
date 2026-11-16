@@ -404,7 +404,7 @@ impl Cluster {
         self.install_package(
             agent,
             vos_wire::served::REPRESENTATIVE,
-            &vos_checker::programs::representative_package(),
+            &vos_checker::programs::program_package("vos-representative"),
         );
         agent
     }

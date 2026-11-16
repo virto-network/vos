@@ -174,7 +174,7 @@ fn space_of(sockets: &mut Sockets, home: &Founded) -> HomeSpace {
 /// A home-only space: its keeper's pool of two agents, its open claim's
 /// difficulty low.
 fn open(home: &Founded) {
-    let personal = std::fs::read(vos_checker::programs::personal_elf()).unwrap();
+    let personal = std::fs::read(vos_checker::programs::program_elf("vos-personal")).unwrap();
     assert_eq!(home.keeper().top_up(2, &personal, 16).unwrap(), 2);
     home.write::<(), CredentialError>(CREDENTIALS, "open", (4u8, 16u32, 86_400_000u64))
         .unwrap();

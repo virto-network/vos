@@ -193,7 +193,7 @@ Every host, nodes and drivers alike, needs:
 
 The coordinator also needs the repository, built from its root:
 
-    just release build-agent build-representative build-test-actors
+    just release build-programs build-test-actors
 
 `just release` builds the static `vos` and `vos-scale` under
 `target/x86_64-unknown-linux-musl/release/`. `deploy` takes them from

@@ -46,9 +46,12 @@ origin rather than who the member is.
 - `agent/`: the agent side.
   - `wire` (shared wire types), `sdk` and `sdk-macros` (`#[actor]`,
     `#[messages]`), `tree` (the committed maps' Merkle tree), `testkit`
-    (a native host and the reference model of the default agent).
-  - The guest programs: `default` (the default agent), `representative`,
-    `credentials`, `test-actors`.
+    (the tests' world of agents, and the reference model of the default
+    agent).
+  - The guest programs, listed in [`programs.toml`](programs.toml):
+    `default` (the default agent), `representative`, `credentials`,
+    `personal`, `payments`, `homes`, `credential-book`, `device-book`;
+    and `test-actors`.
 - `node/`: the node, and the light node.
   - `host` (storage, the leader loops, the API), `exec` (the agent
     program's runs, which the node and the light node share), `light` (the
@@ -71,10 +74,21 @@ origin rather than who the member is.
 The recipes are in the [`justfile`](justfile) (it runs under `nu`);
 `just` lists them.
 
-- `just check`: the quick gate after each change: formatting, the docs'
-  links, the `no_std` builds, the leak checks, the lints and the fast
-  suites of the node, the agent and the crates under them.
-- `just ci`: everything but the prover suites, before a merge.
+The gates are five tiers, each holding the one before it (`check` ⊆
+`gate` ⊆ `ci` ⊆ `ci-full` ⊆ `slice-gate`):
+
+- `just check`: the light check after every edit, minutes warm:
+  formatting, the workspace's lints and every fast test (the heavy test
+  binaries are listed in `tools/gates/heavy.toml`).
+- `just test-changed [base]`: the tests of the crates a change touches
+  and of those that depend on them (`--heavy` adds the heavy binaries).
+- `just gate`: the step gate, before a step's commit: `check`, the heavy
+  tests, the docs' links, the `no_std` builds, every guest rebuilt to
+  `blobs.lock`, the leak checks, the verifier kit, and the suites outside
+  the workspace (the gateway's onion and SSH ports with the demo, the
+  light node's Tor client, the `vos.credential` facility).
+- `just ci`: `gate` and everything else but the prover suites, before a
+  merge.
 - `just test-proof`: the prover suites (run under a 12 GiB memory limit).
 - `just ci-full`: `ci`, the prover suites, the soundness gates at their
   medium sizes and the fuzz targets a minute each.
@@ -82,5 +96,10 @@ The recipes are in the [`justfile`](justfile) (it runs under `nu`);
   and the fuzz targets five minutes each.
 - `just check-blobs`: the venue guests and agent programs rebuild to the
   hashes pinned in `blobs.lock`.
+- `just repin`: every pin store written anew after a change that moves a
+  guest or a circuit (`blobs.lock`, the facility's release artifacts, the
+  device programs' and the known programs' ids, the fixtures, the
+  conformance vectors, the kit's lock file); at a merge, run it instead
+  of resolving pins by hand.
 - `just e2e-chain`: an agent's statements proved and judged at a JAM
   statements service on a PolkaJam testnet.

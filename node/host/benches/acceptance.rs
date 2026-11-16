@@ -14,7 +14,7 @@
 //!   that agent's would arrive; each resumed step runs its round and
 //!   awaits the next reply.
 //!
-//! `cargo bench -p vos-node --bench acceptance` (after `just build-agent
+//! `cargo bench -p vos-node --bench acceptance` (after `just build-programs
 //! build-test-actors`); `VOS_PVM_BACKEND=interpreter` runs the
 //! interpreter. Data goes under `target/`: on the reference laptop `/tmp`
 //! is tmpfs.

@@ -1,9 +1,9 @@
 //! The release build of the light node's artifacts (`light-node.md` §4.4),
 //! on the host: the default agent's program, linked, and the notes
-//! actor's package, derived, from their ELFs (`just build-agent
+//! actor's package, derived, from their ELFs (`just build-programs
 //! build-test-actors`), written to `OUT_DIR` for `vos-phone light` to
 //! embed; and the stock kernels' release artifacts, `auth` and `owner`
-//! from the credential actor's ELF (`just build-credentials`), for `run`,
+//! from the credential actor's ELF (`just build-programs`), for `run`,
 //! with the arguments their reference programs return, the public
 //! statements the device cells prove them on.
 //! Without the ELFs they are empty, and the commands say so.

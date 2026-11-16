@@ -98,7 +98,7 @@ fn device_artifact(cell: &str) -> Device {
     };
     assert!(
         !bytes.is_empty(),
-        "built without the credential actor's ELF: `just build-credentials` first"
+        "built without the credential actor's ELF: `just build-programs` first"
     );
     Device::decode_exact(bytes).expect("a release artifact")
 }

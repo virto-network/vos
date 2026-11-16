@@ -1,6 +1,6 @@
 # The personal agent's actor (`light-node.md` §3.3–§3.7), installed in each
 # agent of a home's pool, built for the PVM with the guest toolchain:
-# `just build-personal`.
+# `just build-programs`.
 [package]
 name = "vos-personal"
 version = "0.1.0"

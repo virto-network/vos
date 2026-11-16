@@ -1,6 +1,6 @@
 # The home's actor (`light-node.md` §3.3), installed beside the home's
 # credential actor: the pool of personal agents and their claims, built
-# for the PVM with the guest toolchain: `just build-homes`.
+# for the PVM with the guest toolchain: `just build-programs`.
 [package]
 name = "vos-homes"
 version = "0.1.0"

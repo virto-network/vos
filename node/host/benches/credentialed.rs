@@ -35,7 +35,7 @@
 //!   A,B,… [--seconds S] k`: the generator alone, from another host, at
 //!   `PER_EXECUTOR·k` a second over QUIC.
 //!
-//! After `just build-agent build-test-actors`.
+//! After `just build-programs build-test-actors`.
 
 use std::io::BufRead;
 use std::sync::Arc;
@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::SigningKey;
 use rayon::prelude::*;
 use vos_checker::calls::installed;
-use vos_checker::programs::{Programs, actor, method, package, payments, payments_elf};
+use vos_checker::programs::{Programs, actor, method, package, program, program_elf};
 use vos_light::{Call, DeviceProgram, Prover, ProverConfig, Threads};
 use vos_node::client::{self, Client, ClientError, Operator, Target};
 use vos_node::{Config, Node};
@@ -116,7 +116,7 @@ fn start(executors: usize) -> Served {
     let owner = vos_light::owner(&secret()).to_bytes();
     let operator = Principal::Client(operator_key);
     let mut client = Client::new(&socket, key);
-    let payments = payments();
+    let payments = program("vos-payments");
     let mut agents = Vec::new();
     for _ in 0..AGENTS {
         let agent = node.create_agent().unwrap();
@@ -124,13 +124,13 @@ fn start(executors: usize) -> Served {
         installed(smol::block_on(node.install(
             agent,
             CREDENTIALS,
-            &std::fs::read(vos_checker::programs::credentials_elf()).unwrap(),
+            &std::fs::read(vos_checker::programs::program_elf("vos-credentials")).unwrap(),
             vec![(b"registrar".to_vec(), 1)],
         )));
         installed(smol::block_on(node.install(
             agent,
             PAYMENTS,
-            &std::fs::read(payments_elf()).unwrap(),
+            &std::fs::read(program_elf("vos-payments")).unwrap(),
             roles,
         )));
         installed(smol::block_on(node.install(
@@ -216,9 +216,9 @@ impl Reached {
     }
 
     fn made(&self, count: usize, expires_ms: u64) -> Vec<(AgentId, Credentialed)> {
-        let transfer = method(&payments(), "transfer");
+        let transfer = method(&program("vos-payments"), "transfer");
         let arguments = vos_light::transfer_arguments("payee", 1);
-        let elf = std::fs::read(vos_checker::programs::credentials_elf()).unwrap();
+        let elf = std::fs::read(vos_checker::programs::program_elf("vos-credentials")).unwrap();
         let owner = vos_light::release::device(&elf, "owner").expect("the stock owner kernel");
         let program = DeviceProgram::released(&owner).expect("its program");
         let secret = secret();

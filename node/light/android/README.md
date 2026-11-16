@@ -153,7 +153,7 @@ the repository's root:
 
 - `just test-facility`: its lints and its suites with the `android`
   feature, the release artifacts held to this tree's guests among them
-  (part of `just check`);
+  (part of `just gate`);
 - `just facility-release`: the release artifacts written anew;
 - `just android-facility [out]`: the Android library (`aar/`,
   `team.virto.vos:facility`) published to the local Maven repository

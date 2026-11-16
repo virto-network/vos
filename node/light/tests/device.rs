@@ -106,7 +106,7 @@ fn call(arguments: &[u8]) -> Call {
 fn programs() -> &'static (DeviceProgram, DeviceProgram) {
     static PROGRAMS: OnceLock<(DeviceProgram, DeviceProgram)> = OnceLock::new();
     PROGRAMS.get_or_init(|| {
-        let elf = std::fs::read(vos_testkit::programs::credentials_elf()).unwrap();
+        let elf = std::fs::read(vos_testkit::programs::program_elf("vos-credentials")).unwrap();
         let program = |kernel| {
             DeviceProgram::released(&vos_light::release::device(&elf, kernel).unwrap()).unwrap()
         };
@@ -679,7 +679,7 @@ fn a_root_unknown_answer_proves_anew_at_the_new_root() {
 /// whose shape or id is not the artifact's refused.
 #[test]
 fn the_stock_kernels_programs_come_from_their_release_artifacts() {
-    let elf = std::fs::read(vos_testkit::programs::credentials_elf()).unwrap();
+    let elf = std::fs::read(vos_testkit::programs::program_elf("vos-credentials")).unwrap();
     let devices = vos_light::release::devices(&elf).unwrap();
     let methods: Vec<MethodId> = devices.iter().map(|device| device.method).collect();
     let mut expected = vec![
@@ -704,39 +704,48 @@ fn the_stock_kernels_programs_come_from_their_release_artifacts() {
 
 /// What a stock kernel's program is under format 47: its chips, its log
 /// sizes and its id, as a release computes them from the credential
-/// actor's ELF and the facility embeds them (`node/light/android/release`). Every app proves
+/// actor's ELF and the facility embeds them (`node/light/android/release`),
+/// pinned in `tests/device.pins`, a line a kernel. Every app proves
 /// under this id, so a prover change that moves it (a CPU column, a chip's
 /// index, a trace's rows on the reference run, a preprocessed column) is a
 /// new device format, never the same number: this gate fails first. A
-/// change of the credential actor's kernels moves it too, re-pinned with
-/// `blobs.lock` in the same commit, and the facility's artifacts with it
-/// (`just facility-release`).
+/// change of the credential actor's kernels moves it too: `just repin`
+/// writes the pins anew (this test, under `VOS_PINS=write`), with
+/// `blobs.lock` and the facility's artifacts.
 #[test]
 fn the_stock_kernels_programs_are_pinned() {
-    const AUTH: (u32, [u32; 18], [u8; 32]) = (
-        1_022_619_925,
-        [
-            11, 10, 11, 10, 10, 12, 10, 10, 11, 10, 11, 10, 10, 10, 10, 10, 10, 10,
-        ],
-        [
-            9, 248, 65, 144, 64, 137, 80, 189, 172, 188, 63, 117, 252, 191, 42, 143, 95, 137, 28,
-            38, 139, 191, 225, 100, 163, 66, 121, 170, 24, 203, 58, 243,
-        ],
+    let elf = std::fs::read(vos_testkit::programs::program_elf("vos-credentials")).unwrap();
+    let computed: String = ["auth", "owner"]
+        .iter()
+        .map(|kernel| {
+            let device = vos_light::release::device(&elf, kernel).unwrap();
+            assert_eq!(device.format, DEVICE_FORMAT);
+            let log_sizes: Vec<String> = device.log_sizes.iter().map(u32::to_string).collect();
+            format!(
+                "{kernel} {} {} {}\n",
+                device.chips,
+                log_sizes.join(","),
+                hex::encode(device.id)
+            )
+        })
+        .collect();
+    let pins = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/device.pins");
+    let pinned = std::fs::read_to_string(&pins).unwrap();
+    let header: String = pinned
+        .lines()
+        .take_while(|line| line.starts_with('#'))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    if pinned != format!("{header}{computed}")
+        && std::env::var("VOS_PINS").as_deref() == Ok("write")
+    {
+        std::fs::write(&pins, format!("{header}{computed}")).unwrap();
+        eprintln!("{}: written", pins.display());
+        return;
+    }
+    assert_eq!(
+        format!("{header}{computed}"),
+        pinned,
+        "the stock kernels' programs moved: `just repin`"
     );
-    const OWNER: (u32, [u32; 18], [u8; 32]) = (
-        1_022_619_925,
-        [10; 18],
-        [
-            90, 162, 111, 236, 194, 116, 207, 245, 83, 68, 151, 156, 251, 205, 55, 109, 175, 213,
-            118, 24, 78, 207, 153, 118, 207, 183, 169, 253, 12, 240, 255, 154,
-        ],
-    );
-    let elf = std::fs::read(vos_testkit::programs::credentials_elf()).unwrap();
-    let pinned = [AUTH, OWNER].map(|(chips, log_sizes, id)| (chips, log_sizes.to_vec(), id));
-    let computed = ["auth", "owner"].map(|kernel| {
-        let device = vos_light::release::device(&elf, kernel).unwrap();
-        assert_eq!(device.format, DEVICE_FORMAT);
-        (device.chips, device.log_sizes, device.id)
-    });
-    assert_eq!(computed, pinned);
 }

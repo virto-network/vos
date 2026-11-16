@@ -1,6 +1,6 @@
 # The credential book (`light-node.md` §3.1), a local actor: the spaces the
 # user is a member of, each device's handles there and the methods pinned,
-# built for the PVM with the guest toolchain: `just build-credential-book`.
+# built for the PVM with the guest toolchain: `just build-programs`.
 [package]
 name = "vos-credential-book"
 version = "0.1.0"

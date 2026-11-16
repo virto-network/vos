@@ -200,7 +200,7 @@ every input by construction:
   below with what guards it. Two had no guard and are the fork's fix
   (DIVERGENCE-013).
 - **Fuzzing:** seven targets (`fuzz/`), a checked-in corpus replayed by
-  `just check` (`just fuzz-replay`), and `just fuzz`, a minute a target in
+  `just gate` (`just fuzz-replay`), and `just fuzz`, a minute a target in
   `ci-full` and five in the full gate (`just slice-gate`).
 
 ### Stwo's verify path, audited
@@ -256,7 +256,7 @@ The channel's draws and `verify_pow_nonce` index nothing from the proof.
 
 `fuzz/replay/<target>/` holds each target's corpus, minimized by
 `cargo fuzz cmin` after a five-minute run and kept small; `just
-fuzz-replay` (in `just check`) runs every input once; `cargo run --example
+fuzz-replay` (in `just gate`) runs every input once; `cargo run --example
 paths` lists what each input reaches. It covers:
 
 - format 39 by bytes: every header word, the decode, non-canonical

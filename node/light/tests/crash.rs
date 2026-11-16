@@ -29,7 +29,7 @@ const TEAR_REACH: u64 = TEAR / 32;
 
 fn artifacts() -> (Vec<u8>, Package) {
     let read = |path: std::path::PathBuf| std::fs::read(path).unwrap();
-    let agent = release::agent(&read(programs::agent_elf())).unwrap();
+    let agent = release::agent(&read(programs::program_elf("vos-agent"))).unwrap();
     let notes = release::package(&read(programs::actor_elf("notes")), 1).unwrap();
     (agent, notes)
 }

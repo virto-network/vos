@@ -260,7 +260,7 @@ impl Alongside for Cuts {
             || cluster.leading(representative),
             representative,
             vos_wire::served::REPRESENTATIVE,
-            &vos_checker::programs::representative_package(),
+            &vos_checker::programs::program_package("vos-representative"),
         );
         *self.representative.lock().unwrap() = Some(representative);
     }

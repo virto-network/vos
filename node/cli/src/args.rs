@@ -105,7 +105,7 @@ pub struct RunArgs {
     /// The node's data directory: its store, its keys and its API's socket.
     #[arg(long)]
     pub data: PathBuf,
-    /// The agent program, as built by `just build-agent`.
+    /// The agent program, as built by `just build-programs`.
     #[arg(long, env = "VOS_AGENT")]
     pub agent: PathBuf,
     /// The space's nodes, one per line: number, key, peer address and

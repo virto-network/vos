@@ -23,9 +23,7 @@ use std::time::Duration;
 use ed25519_dalek::SigningKey;
 use vos_checker::Nodes;
 use vos_checker::calls::installed;
-use vos_checker::programs::{
-    actor, actor_elf, credentials, credentials_elf, method, payments, payments_elf,
-};
+use vos_checker::programs::{actor, actor_elf, method, program_elf};
 use vos_light::release::Device;
 use vos_light::{AuthWitness, Call, DEVICE_FORMAT, DeviceProgram, Prover, ProverConfig, Threads};
 use vos_net::Class;
@@ -120,11 +118,11 @@ impl Founded {
             .create_replicated((1..=NODES).collect())
             .unwrap();
         let elf = |path: std::path::PathBuf| std::fs::read(path).unwrap();
-        let credentials_elf = elf(credentials_elf());
+        let credentials_elf = elf(program_elf("vos-credentials"));
         let installs = [
             (CREDENTIALS, credentials_elf.clone(), "registrar"),
             (POLL, elf(actor_elf("poll")), "operator"),
-            (PAYMENTS, elf(payments_elf()), "operator"),
+            (PAYMENTS, elf(program_elf("vos-payments")), "operator"),
         ];
         for (instance, elf, role) in installs {
             install(&cluster, agent, instance, &elf, role);
@@ -148,9 +146,9 @@ impl Founded {
             agent,
             space,
             operator: Mutex::new(operator),
-            credentials: credentials(),
+            credentials: vos_checker::programs::program("vos-credentials"),
             poll: actor("poll"),
-            payments: payments(),
+            payments: vos_checker::programs::program("vos-payments"),
             nonce: AtomicU64::new(0),
             auth: program("auth"),
             owner: program("owner"),
@@ -1495,7 +1493,10 @@ fn an_app_one_release_behind_signs_in_until_its_window_closes() {
     let agent = founded.agent;
     let auth = founded.method(CREDENTIALS, "auth");
     let elf = |path: std::path::PathBuf| std::fs::read(path).unwrap();
-    let (release_one, release_two) = (elf(credentials_elf()), elf(actor_elf("credentials-next")));
+    let (release_one, release_two) = (
+        elf(program_elf("vos-credentials")),
+        elf(actor_elf("credentials-next")),
+    );
     let one = stock(&release_one, "auth");
     let two = stock(&release_two, "auth");
     assert_ne!(one.id, two.id);
@@ -1749,7 +1750,7 @@ fn the_previous_device_format_is_admitted_until_it_is_retired() {
     assert_eq!((DEVICE_FORMAT, previous), (47, 46));
     let founded = Founded::new();
     let auth = founded.method(CREDENTIALS, "auth");
-    let elf = std::fs::read(credentials_elf()).unwrap();
+    let elf = std::fs::read(program_elf("vos-credentials")).unwrap();
     let current = stock(&elf, "auth");
     let byte = vos_light::release::devices_in(previous, &elf)
         .unwrap()
@@ -1902,7 +1903,7 @@ fn a_retired_format_one_replica_admits_is_refused_at_apply() {
     let previous = vos_pvm_recair::device::FORMATS[1].number;
     let founded = Founded::new();
     let auth = founded.method(CREDENTIALS, "auth");
-    let elf = std::fs::read(credentials_elf()).unwrap();
+    let elf = std::fs::read(program_elf("vos-credentials")).unwrap();
     let byte = vos_light::release::devices_in(previous, &elf)
         .unwrap()
         .into_iter()

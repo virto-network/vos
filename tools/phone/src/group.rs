@@ -305,7 +305,7 @@ pub fn group(args: &[String]) {
     let dir = dir.expect("--dir DIR");
     if AGENT.is_empty() {
         eprintln!(
-            "built without the release artifacts: `just build-agent build-test-actors`, then build again"
+            "built without the release artifacts: `just build-programs build-test-actors`, then build again"
         );
         std::process::exit(2);
     }

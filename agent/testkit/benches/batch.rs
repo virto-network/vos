@@ -13,7 +13,7 @@
 //! and its accumulate. A typical suspension holds three pages; the
 //! budget, capture plus restore of 50 KB, is 1 ms.
 //!
-//! `cargo bench -p vos-testkit --bench batch` (after `just build-agent
+//! `cargo bench -p vos-testkit --bench batch` (after `just build-programs
 //! build-test-actors`).
 
 use std::collections::{BTreeMap, HashMap};
@@ -336,7 +336,7 @@ fn main() {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         if std::env::var_os("VOS_PVM_PERF_MAP").is_some() {
             vos_pvm::perf_map::enable().unwrap();
-            let elf = std::fs::read(vos_testkit::programs::agent_elf()).unwrap();
+            let elf = std::fs::read(vos_testkit::programs::program_elf("vos-agent")).unwrap();
             let (blob, functions) = vos_pvm_compiler::link_elf_spi_with_symbols(&elf).unwrap();
             let program = vos_pvm::spi::parse_standard_program(&blob).unwrap();
             vos_pvm::perf_map::register(&program.code.code, functions);

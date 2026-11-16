@@ -91,6 +91,8 @@ vos-testkit = { path = "../../agent/testkit" }
 # The crash rounds.
 vos-checker = { path = "../checker" }
 tempfile = "3"
+# The pinned device programs' ids (`tests/device.pins`).
+hex = "0.4"
 # The client over arti's tests: a runtime, as the facility's.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
 # The merge fields' convergence, on their native model.

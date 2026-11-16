@@ -1,6 +1,6 @@
 # `Payments`, the space's ledger of owner-proven payments
 # (`light-node.md` §5.2): cipher-clerk's kernel in an actor, built for the
-# PVM with the guest toolchain: `just build-payments`.
+# PVM with the guest toolchain: `just build-programs`.
 [package]
 name = "vos-payments"
 version = "0.1.0"

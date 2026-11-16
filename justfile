@@ -3,10 +3,30 @@ set shell := ["nu", "-c"]
 default:
     @just --list
 
-# The fast suites' crates, which `test` and `check` run.
-core_crates := "-p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-anchor -p vos-statement -p vos-statement-service --features vos-anchor/vectors,vos-statement/fixtures"
+# The gates are five tiers, each holding the one before it:
+#
+#   check ⊆ gate ⊆ ci ⊆ ci-full ⊆ slice-gate
+#
+# - `check`: the light check after every edit, minutes warm: formatting,
+#   the workspace's lints and the fast tests.
+# - `gate`: the step gate, before a step's commit: `check`, the heavy test
+#   targets (`tools/gates/heavy.toml`), every guest and its blob, the
+#   production builds' checks and the suites outside the workspace.
+# - `ci`: before a merge (the pre-push hook).
+# - `ci-full`: at a milestone, the prover suites.
+# - `slice-gate`: at a slice's end, `ci-full`'s prover suites at their full
+#   N and its fuzz targets five times as long.
+# A suite belongs to the lowest tier that can afford it; `just check-tiers`
+# holds the recipes to that. `just test-changed` runs the tests a change
+# touches. Outside every tier, on purpose: what needs a PolkaJam testnet
+# (`jam-testnet`, `jam-statements-testnet`, `e2e-chain`), an aarch64
+# toolchain (`repro-aarch64`), the Android SDK (`android-facility`,
+# `phone`) or a release (`release`, `vendor-verifier`).
 
-# The agent's suites' crates, which `test-agent` and `check` run.
+# The fast suites' crates, which `test`, `check` and `gate` run.
+core_crates := "-p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-pvm-codec-derive -p vos-pvm-proof-derive -p vos-raft -p merkle-crdt -p vos-mls -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-anchor -p vos-statement -p vos-statement-service --features vos-anchor/vectors,vos-statement/fixtures"
+
+# The agent's suites' crates, which `test-agent`, `check` and `gate` run.
 agent_crates := "-p vos-exec -p vos-light -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-api -p vos-http -p vos-gateway -p vos-node -p vos-node-prover -p vos-venue -p vos-net -p vos-cli -p vos-jam-dev -p vos-scale -p vos-keeper"
 
 # A guest build for the PVM: the statement's target, its standard library
@@ -47,7 +67,7 @@ test-recair:
 
 # Bench guests, built with the guest toolchain in `pvm/guest`.
 build-bench-guests:
-    with-env { CARGO_INCREMENTAL: "0" } { for guest in [workflows actor agent hash-software hash-precompile poseidon2 diverse] { do { cd $"pvm/bench/guests/($guest)"; cargo build --release --target ../../../guest/riscv64em-vos.json } } }
+    with-env { CARGO_INCREMENTAL: "0" } { for guest in [pvm/bench/guests/workflows pvm/bench/guests/actor pvm/bench/guests/agent pvm/bench/guests/hash-software pvm/bench/guests/hash-precompile pvm/bench/guests/poseidon2 pvm/bench/guests/diverse] { do { cd $guest; cargo build --release --target ../../../guest/riscv64em-vos.json } } }
 
 # Cross-host checks that need the bench guests. The bench tests that prove
 # run in `test-bench-proof`.
@@ -100,7 +120,7 @@ vectors:
 # one test at a time, the device formats' leakage gates (47's and 46's)
 # among them. Last, the wrap files the suites wrote
 # checked to be final wraps alone, and the carrier audit (`test-carriers`).
-test-proof: build-test-actors judge-wasm
+test-proof: build-test-actors build-programs judge-wasm
     cargo test -p vos-pvm-proof --features debug-internals --lib --bins --test gates --test isa -- --test-threads=2
     for test in (cargo test -p vos-pvm-proof --features debug-internals --test kernel -- --list --format terse --skip reads:: --skip wrap_files:: | lines | where {|line| $line ends-with ': test' } | each {|line| $line | str replace ': test' '' }) { cargo test -p vos-pvm-proof --features debug-internals --test kernel $test -- --exact --test-threads=1 }
     cargo test -p vos-pvm-proof --features debug-internals --test kernel reads:: -- --test-threads=1
@@ -123,9 +143,9 @@ test-proof: build-test-actors judge-wasm
 # Tor client and carried by the gateway's onion in process (the demo's
 # `tests/carriers.rs`, outside the workspace), every carrier searched
 # again. About ten minutes and 6 GiB.
-test-carriers: build-test-actors build-agent build-representative build-credentials build-payments
+test-carriers: build-test-actors build-programs
     cargo test -p vos-node --features disclosing --test carriers -- audit:: credentials:: --nocapture --test-threads=1
-    cargo test -p vos-phone --test outputs -- --nocapture
+    cargo test -p vos-phone --bins --test outputs -- --nocapture
     cargo test --manifest-path node/gateway/demo/Cargo.toml --ignore-rust-version --test carriers -- --nocapture
 
 # The golden fixtures (`pvm/proof/fixtures`) judged in Wasm, by the final
@@ -169,7 +189,7 @@ _at-fixed-path dir +args:
 # anew by their generator, `pvm/proof/tests/kernel/fixtures.rs`: at a format bump,
 # or a change of the AIR or a kernel's shape. `test-proof` refuses fixtures
 # the generator does not make.
-fixtures:
+fixtures: build-test-actors build-programs
     with-env { VOS_FIXTURES: "write" } { cargo test -p vos-pvm-proof --test kernel fixtures::the_fixtures_are_the_generators }
 
 # The reproducibility gate on aarch64: `vos program-id`, built for aarch64
@@ -199,7 +219,7 @@ export MIMALLOC_ALLOW_THP := "0"
 # Formatting: the workspace's, and each crate's it excludes.
 fmt-check:
     cargo fmt --all -- --check
-    for manifest in ([agent/default agent/representative agent/credentials agent/personal agent/payments agent/homes agent/credential-book agent/device-book agent/test-actors pvm/bench/guests pvm/proof/fuzz pvm/proof/final-verifier/wasm node/gateway/demo node/light/android] | each {|dir| glob $'($dir)/**/Cargo.toml' --exclude ['**/target/**'] } | flatten | where {|manifest| open --raw $manifest | str contains '[package]' }) { cargo fmt --manifest-path $manifest -- --check }
+    for manifest in (((open programs.toml | get program.crate) ++ [agent/test-actors pvm/bench/guests pvm/proof/fuzz pvm/proof/final-verifier/wasm node/gateway/demo node/light/android]) | each {|dir| glob $'($dir)/**/Cargo.toml' --exclude ['**/target/**'] } | flatten | where {|manifest| open --raw $manifest | str contains '[package]' }) { cargo fmt --manifest-path $manifest -- --check }
 
 # The docs' links: none broken, and none from a public doc to a private
 # item.
@@ -231,39 +251,30 @@ jar-check:
     let hits = (rg -n --glob '!**/target/**' 'IsaMode|CapabilityManifest|\blink_elf\b|link_elf_with_argument_pages|run_with_vos_stubs|ECALL_VOS_|VOS_OBJECT_CAP|Opcode::Ecall\b|ExitReason::Ecall|ExitReason::Trap\b|vos_pvm::kernel::|InvocationKernel|vm_pool|JAR\\x02|\.gp072\.json|\bGasModel\b|\bPerInstruction\b|\bmem_cycles\b|Opcode::Sbrk|\bsbrk\(|(?i:csr\w*,? 0x800)\b|\(\d, 0x800\)|Some\(0x800\)' pvm | complete); if ($hits.exit_code == 0) { print $hits.stdout; error make { msg: "JAR remnants found" } } else { print "no JAR remnants" }
 
 # The SDK's test actors, built with the guest toolchain in `pvm/guest`,
-# from the fixed path: some depend on crates outside their workspace.
+# from the fixed path: some depend on crates outside their workspace. The
+# stamp it leaves (`.built`, as `build-programs`') is what the testkit
+# holds the sources to: a test refuses guests older than their sources.
 build-test-actors:
     just _at-fixed-path agent/test-actors --release --target ../../pvm/guest/riscv64em-vos.json
+    touch agent/test-actors/target/riscv64em-vos/release/.built
 
-# The default agent program, built in the agent's guest workspace
-# (`agent/programs`) with the guest toolchain in `pvm/guest`.
-build-agent: (_build-program "vos-agent")
-
-# The space's representative, built in the agent's guest workspace.
-build-representative: (_build-program "vos-representative")
-
-# The credential actor, a library actor, built in the agent's guest
-# workspace.
-build-credentials: (_build-program "vos-credentials")
-
-# The personal agent's actor, built in the agent's guest workspace.
-build-personal: (_build-program "vos-personal")
-
-# The space's ledger, `Payments`, built in the agent's guest workspace.
-build-payments: (_build-program "vos-payments")
-
-# The home's actor, `Homes`, built in the agent's guest workspace.
-build-homes: (_build-program "vos-homes")
-
-# The light node's local actors, the credential book and the device book,
-# built in the agent's guest workspace.
-build-credential-book: (_build-program "vos-credential-book")
-build-device-book: (_build-program "vos-device-book")
+# The agent's guest programs (`programs.toml`), each built alone in the
+# agent's guest workspace (`agent/programs`) with the guest toolchain in
+# `pvm/guest`.
+build-programs:
+    for program in (open programs.toml | get program) { just build-program $program.name }
+    touch agent/programs/target/riscv64em-vos/release/.built
 
 # One of the agent's guest programs, alone, from the fixed path
 # (`_at-fixed-path`): its features never unified with another's.
-_build-program package:
+build-program package:
+    if "{{package}}" not-in (open programs.toml | get program.name) { error make { msg: "{{package}} is no program of programs.toml" } }
     just _at-fixed-path agent/programs --release -p {{package}} --target ../../pvm/guest/riscv64em-vos.json
+
+# The guest programs, each with its crate, its ELF and the pin stores it
+# feeds (`programs.toml`).
+programs:
+    @open programs.toml | get program | each {|program| $"($program.name)  ($program.crate)  ($program.elf)  pins: ($program.pins | str join ', ')" } | str join "\n"
 
 # The JAM statements service's program, `statement-service.elf`.
 build-statement-service: (_venue-guest "vos-statement-service" "statement-service" "pvm-guest")
@@ -273,9 +284,8 @@ build-statement-service: (_venue-guest "vos-statement-service" "statement-servic
 build-final-verify: (_venue-guest "vos-statement" "final-verify" "pvm-guest") (_venue-guest "vos-statement" "final-verify-test" "pvm-guest,test-formats")
 
 # Every guest blob `blobs.lock` pins, its hash then its path from the
-# repository's root: the venue's programs, the default agent, the
-# representative, the credential actor, the personal agent's actor, the
-# ledger, the final verifier's Wasm blobs and the test actors (the bins of
+# repository's root: the venue's programs, the agent's guest programs
+# (`programs.toml`), the final verifier's Wasm blobs and the test actors (the bins of
 # their workspace, so an ELF another branch left in its target is none). Each is hashed with its symbols and
 # relocations stripped (the toolchain's `rust-objcopy`): an out-of-tree
 # workspace's symbol names hash its path dependencies' absolute paths
@@ -284,15 +294,48 @@ build-final-verify: (_venue-guest "vos-statement" "final-verify" "pvm-guest") (_
 # Wasm blobs, whose code that hash orders, are built from a fixed path
 # (`_at-fixed-path`).
 _blob-hashes:
-    if ($env.CARGO_TARGET_DIR? | is-not-empty) { error make { msg: "the blobs are hashed where the recipes build them: unset CARGO_TARGET_DIR" } }; let fixed = ["target/riscv64em-vos/release/final-verify.elf" "target/riscv64em-vos/release/final-verify-test.elf" "target/riscv64em-vos/release/statement-service.elf" "agent/programs/target/riscv64em-vos/release/vos-agent.elf" "agent/programs/target/riscv64em-vos/release/vos-representative.elf" "agent/programs/target/riscv64em-vos/release/vos-credentials.elf" "agent/programs/target/riscv64em-vos/release/vos-personal.elf" "agent/programs/target/riscv64em-vos/release/vos-payments.elf" "agent/programs/target/riscv64em-vos/release/vos-homes.elf" "agent/programs/target/riscv64em-vos/release/vos-credential-book.elf" "agent/programs/target/riscv64em-vos/release/vos-device-book.elf" "pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm" "pvm/proof/final-verifier/wasm/blob/target/test-formats/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm"]; let actors = (cargo metadata --manifest-path agent/test-actors/Cargo.toml --no-deps --format-version 1 | from json | get packages.targets | flatten | where {|target| "bin" in $target.kind } | get name | sort | each {|name| $"agent/test-actors/target/riscv64em-vos/release/($name).elf" }); let sysroot = (rustc --print sysroot | str trim); let objcopy = ($sysroot | path join lib rustlib (rustc -vV | lines | parse "host: {host}" | get host.0) bin rust-objcopy); let stripped = (mktemp -t); for path in ($fixed ++ $actors) { with-env { LD_LIBRARY_PATH: ($sysroot | path join lib) } { ^$objcopy --strip-all $path $stripped }; print $"(open --raw $stripped | hash sha256)  ($path)" }; rm $stripped
+    if ($env.CARGO_TARGET_DIR? | is-not-empty) { error make { msg: "the blobs are hashed where the recipes build them: unset CARGO_TARGET_DIR" } }; let fixed = ["target/riscv64em-vos/release/final-verify.elf" "target/riscv64em-vos/release/final-verify-test.elf" "target/riscv64em-vos/release/statement-service.elf"] ++ (open programs.toml | get program.elf) ++ ["pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm" "pvm/proof/final-verifier/wasm/blob/target/test-formats/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm"]; let actors = (cargo metadata --manifest-path agent/test-actors/Cargo.toml --no-deps --format-version 1 | from json | get packages.targets | flatten | where {|target| "bin" in $target.kind } | get name | sort | each {|name| $"agent/test-actors/target/riscv64em-vos/release/($name).elf" }); let sysroot = (rustc --print sysroot | str trim); let objcopy = ($sysroot | path join lib rustlib (rustc -vV | lines | parse "host: {host}" | get host.0) bin rust-objcopy); let stripped = (mktemp -t); for path in ($fixed ++ $actors) { with-env { LD_LIBRARY_PATH: ($sysroot | path join lib) } { ^$objcopy --strip-all $path $stripped }; print $"(open --raw $stripped | hash sha256)  ($path)" }; rm $stripped
 
 # Every guest blob `blobs.lock` pins, built as `check` builds it.
-build-blobs: build-final-verify build-statement-service build-agent build-representative build-credentials build-personal build-payments build-homes build-credential-book build-device-book build-wasm-blobs build-test-actors
+build-blobs: build-final-verify build-statement-service build-programs build-wasm-blobs build-test-actors
 
 # `blobs.lock` written anew from the blobs as built: after a change that
 # moves one, which the lock's diff then shows.
 blobs-lock: build-blobs
     {{_hashed}}; $built | prepend ["# Every pinned guest blob's SHA-256, its symbols and relocations stripped," "# as `just build-blobs` builds it: `just blobs-lock` writes it, `just" "# check-blobs` checks it (the justfile's `_blob-hashes` says which blobs)."] | str join "\n" | $in + "\n" | save -f blobs.lock
+
+# Every pin store written anew from this tree, in dependency order, after
+# a change that moves a guest, a circuit or the lock file: one command at
+# a merge, where two branches' pins are never merged by hand. On a tree
+# whose pins are current it changes nothing.
+# 1. the guests built, and `blobs.lock` (`blobs-lock`);
+# 2. the facility's release artifacts (`facility-release`);
+# 3. the stock kernels' device programs, `node/light/tests/device.pins`;
+# 4. the known programs' ids and the circuits' constants,
+#    `pvm/proof/src/constants.rs` (the recursion's circuits are built:
+#    minutes, and several GiB);
+# 5. the golden fixtures, `pvm/proof/fixtures` (`fixtures`: it proves,
+#    under the 12 GiB limit `test-proof` names);
+# 6. the conformance vectors over them, `node/venue/conformance`
+#    (`conformance`);
+# 7. the verifier kit's lock file, `pvm/proof/kit/Cargo.lock` (`kit-lock`).
+# The pinning tests write under `VOS_PINS=write` what moved, and are run
+# again without it, so a store a write did not settle fails here. Not
+# written, on purpose: the final verifier's own constants
+# (`pvm/proof/final-verifier/src/constants.rs`), a venue's verifying key,
+# which a circuit change moves by hand; and the fuzz targets' replay corpus
+# (`pvm/proof/fuzz/replay`), which is kept, not generated. Last, the stores
+# that moved are listed.
+repin: blobs-lock facility-release
+    with-env { VOS_PINS: "write" } { cargo test -p vos-light --test device the_stock_kernels_programs_are_pinned }
+    cargo test -p vos-light --test device the_stock_kernels_programs_are_pinned
+    with-env { VOS_PINS: "write" } { cargo test -p vos-pvm-proof --test kernel constants:: -- --test-threads=1 }
+    rustfmt --edition 2024 pvm/proof/src/constants.rs
+    cargo test -p vos-pvm-proof --test kernel constants:: -- --test-threads=1
+    just fixtures
+    just conformance
+    just kit-lock
+    let moved = (git status --porcelain -- blobs.lock node/light/android/release node/light/tests/device.pins pvm/proof/src/constants.rs pvm/proof/fixtures node/venue/conformance pvm/proof/kit/Cargo.lock | lines); if ($moved | is-empty) { print "repin: every pin store is this tree's already" } else { print "repin: moved"; $moved | each {|line| print $line }; null }
 
 # The pinned blobs' hashes, `_blob-hashes`' lines; its failure fails the
 # recipe that reads them.
@@ -302,29 +345,27 @@ _hashed := 'let hashed = (just _blob-hashes | complete); if $hashed.exit_code !=
 # the lock naming every blob built: a change that moves a blob moves its
 # line.
 check-blobs: build-blobs
-    {{_hashed}}; let locked = (open --raw blobs.lock | lines | where {|line| not ($line | str starts-with "#") }); let moved = ($built | where {|line| $line not-in $locked }); let gone = ($locked | where {|line| $line not-in $built }); for line in $moved { print -e $"built: ($line)" }; for line in $gone { print -e $"locked: ($line)" }; if ($moved ++ $gone | is-not-empty) { error make { msg: "the guest blobs are not blobs.lock's: `just blobs-lock` after a change that moves them" } }; print $"every pinned guest blob is blobs.lock's: ($built | length) blobs"
+    {{_hashed}}; let locked = (open --raw blobs.lock | lines | where {|line| not ($line | str starts-with "#") }); let moved = ($built | where {|line| $line not-in $locked }); let gone = ($locked | where {|line| $line not-in $built }); for line in $moved { print -e $"built: ($line)" }; for line in $gone { print -e $"locked: ($line)" }; if ($moved ++ $gone | is-not-empty) { error make { msg: "the guest blobs are not blobs.lock's: `just repin` after a change that moves them" } }; print $"every pinned guest blob is blobs.lock's: ($built | length) blobs"
 
 # The SDK, its macros' restrictions, the test actors on the testkit, the
 # default agent against it, the checker's own model, the node running the
 # agent, the network between nodes, and the `vos` command.
-test-agent: build-test-actors build-agent build-representative build-credentials build-personal build-payments build-homes build-credential-book build-device-book
+test-agent: build-test-actors build-programs
     cargo test {{agent_crates}}
-    cargo test -p vos-cli --features faults --test processes faults::
-    cargo test -p vos-cli --features faults --test fault_suite
+    just test-faults
     just test-reads
 
-# The gateway's SSH port and its `vos-api` subsystem (`vos-gateway`'s
-# `ssh` feature), on s4-server: a dependency built apart from the default
-# workspace build, its crates asking a newer stable Rust than the
-# workspace's nightly names, which builds them. Then the demo on a local
-# space (`node/gateway/demo`, outside the workspace): a headless s4 client
-# enrolling, signing in and paying through the SSH port, proving with the
-# device library through s4's `vos.credential` facility.
+# The slow fault runs: the fault build's process tests and the
+# five-process fault suite.
+test-faults: build-test-actors build-programs
+    cargo test -p vos-cli --features faults --test processes faults::
+    cargo test -p vos-cli --features faults --test fault_suite
+
 # The onion's ports and the SSH relay's caps on the `tor` feature (arti,
 # pinned exactly; `--ignore-rust-version` as s4's): clippy, and the
 # gateway's tests, the flood of junk proven calls held to the caps among
 # them. No network: the onion's streams are made in process.
-test-gateway-onion: build-test-actors build-agent
+test-gateway-onion: build-test-actors build-programs
     cargo clippy -p vos-gateway --features tor --ignore-rust-version --all-targets --quiet -- -D warnings
     cargo test -p vos-gateway --features tor --ignore-rust-version
 
@@ -337,7 +378,14 @@ test-light-tor:
     cargo test -p vos-light --features tor --ignore-rust-version --test tor --test tor_state
     cargo test -p vos-light --features tor --ignore-rust-version --lib -- tor:: route::
 
-test-gateway-ssh: build-test-actors build-agent build-credentials build-payments build-homes build-personal
+# The gateway's SSH port and its `vos-api` subsystem (`vos-gateway`'s
+# `ssh` feature), on s4-server: a dependency built apart from the default
+# workspace build, its crates asking a newer stable Rust than the
+# workspace's nightly names, which builds them. Then the demo on a local
+# space (`node/gateway/demo`, outside the workspace): a headless s4 client
+# enrolling, signing in and paying through the SSH port, proving with the
+# device library through s4's `vos.credential` facility.
+test-gateway-ssh: build-test-actors build-programs
     cargo clippy -p vos-gateway --features ssh --ignore-rust-version --all-targets --quiet -- -D warnings
     cargo test -p vos-gateway --features ssh --ignore-rust-version
     cargo clippy --manifest-path node/gateway/demo/Cargo.toml --ignore-rust-version --all-targets --quiet -- -D warnings
@@ -349,7 +397,7 @@ test-gateway-ssh: build-test-actors build-agent build-credentials build-payments
 # suites with the `android` feature, as the app's `:vos` process builds
 # it; among them `tests/release.rs`, which holds the release artifacts it
 # embeds to this tree's guests.
-test-facility: build-agent build-credentials build-personal build-credential-book build-device-book
+test-facility: build-programs
     cargo clippy --manifest-path node/light/android/Cargo.toml --features android --ignore-rust-version --all-targets --quiet -- -D warnings
     cargo test --manifest-path node/light/android/Cargo.toml --features android --ignore-rust-version
 
@@ -358,7 +406,7 @@ test-facility: build-agent build-credentials build-personal build-credential-boo
 # `owner.device`, from the credential actor), the default agent's program,
 # linked, and the light node's local actors' packages. After a change that
 # moves a guest, which `test-facility` then fails on.
-facility-release: build-agent build-credentials build-credential-book build-device-book
+facility-release: build-programs
     cargo run --manifest-path node/light/android/Cargo.toml --ignore-rust-version --example release
 
 # The facility's Android library, for s4's `-Ps4Vos` build: the facility's
@@ -421,7 +469,7 @@ android-facility out="target/android/maven":
 # starts and stops: a workflow suspended in one work package and resumed in
 # later ones, every read witnessed. Outside `ci`: it needs the PolkaJam
 # binaries, in POLKAJAM or the directory `testnet.sh` names by default.
-jam-testnet: build-test-actors build-agent
+jam-testnet: build-test-actors build-programs
     bash tools/jam-dev/testnet.sh
 
 # The JAM statements service on a local PolkaJam testnet, which it starts
@@ -444,7 +492,7 @@ jam-statements-testnet: build-statement-service
 # binaries and a C compiler. About 25 minutes, one
 # masked proof at a time (about 6 GiB): run it under a 12 GiB limit, e.g.
 # `systemd-run --user --scope -p MemoryMax=12G -p MemorySwapMax=0 just e2e-chain`.
-e2e-chain: build-test-actors build-agent build-representative build-statement-service
+e2e-chain: build-test-actors build-programs build-statement-service
     cargo test -p vos-node --features chain --test chain --no-run
     bash tools/jam-dev/testnet.sh chain
 
@@ -736,7 +784,7 @@ _kit-workspace:
     if not ((do { rustup target list --installed --toolchain 1.94.1 } | complete).stdout | lines | any {|target| $target == 'wasm32v1-none' }) { rustup toolchain install 1.94.1 --profile minimal --target wasm32v1-none --no-self-update }
     rm -rf target/kit/build
     python3 -I pvm/proof/kit/vos_kit.py vendor target/kit/build/vendor/vos-verifier
-    {workspace: {resolver: "3", members: (glob target/kit/build/vendor/vos-verifier/*/Cargo.toml | each {|manifest| $manifest | path dirname | path relative-to ($env.PWD | path join target/kit/build) } | sort)}} | to toml | save -f target/kit/build/Cargo.toml
+    {workspace: {resolver: "3", members: (glob target/kit/build/vendor/vos-verifier/*/Cargo.toml | each {|manifest| $manifest | path dirname | path relative-to ($env.PWD | path join target/kit/build) } | sort)}, profile: {dev: {debug: false}}} | to toml | save -f target/kit/build/Cargo.toml
     cp pvm/proof/kit/Cargo.lock target/kit/build/Cargo.lock
 
 # The fuzz targets (`pvm/proof/fuzz`, built apart with `cargo fuzz`): the
@@ -769,42 +817,79 @@ fuzz secs="60":
     cd pvm/proof/fuzz; cargo run --release --example seed
     cd pvm/proof/fuzz; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{fuzz_targets}}" | split row ' ') { mkdir $"corpus/($target)"; let build = if $target == "prove_verify_roundtrip" { [-O -s none --target-dir target/no-sanitizer] } else { [-a] }; cargo fuzz run ...$build $target $"corpus/($target)" $"replay/($target)" -- -max_total_time={{secs}} -max_len=262145 -len_control=0 -rss_limit_mb=8192 -timeout=600 } }
 
-# Checks before pushing: everything except proving.
-# The quick gate, after each change: formatting, the docs' links, the
-# builds without std, the verifier kit, the workspace's lints, and the
-# suites of the node, the agent, vos-raft and the crates under them.
-# Left to `just ci`: the slow fault runs (the five-process fault suite, the
-# fault build's process tests), the PVM vectors, the bench and prover
-# library tests, and the lints of other feature sets.
-check: fmt-check doc-check check-venue-rules check-no-std check-no-leaks check-no-faults check-kit build-test-actors build-agent build-representative build-credentials build-personal build-payments build-homes build-credential-book build-device-book fuzz-replay
+# The light check, after every edit, and the innermost tier: formatting,
+# the gates' own tripwire, the workspace's lints, and every test target of
+# the fast suites' crates but the heavy ones (`tools/gates/heavy.toml`,
+# each a binary past about 20 s): minutes, warm. It builds the guests its
+# tests run, the agent's programs, the test actors and the venues' refine
+# programs, and nothing else outside the workspace.
+check: fmt-check check-tiers build-test-actors build-programs build-final-verify build-statement-service
     cargo clippy --workspace --all-targets --quiet -- -D warnings
+    cargo test {{core_crates}} ...(python3 -I tools/gates/tiers.py fast {{core_crates}} | split row ' ')
+    cargo test -p vos-pvm-recair ...(python3 -I tools/gates/tiers.py fast -p vos-pvm-recair | split row ' ') -- --test-threads=4
+    cargo test {{agent_crates}} ...(python3 -I tools/gates/tiers.py fast {{agent_crates}} | split row ' ')
+
+# The step gate, after each step of work and before its commit: `check`,
+# then the docs' links, the venue rules' tripwire, the builds without std
+# with every guest built and its blob checked, the production builds'
+# leaks, the verifier kit, the fuzz corpus replayed, the lints of the
+# feature sets a step touches, the heavy test targets and the doc tests of
+# the fast suites' crates, and the edge's suites: the gateway's onion and
+# SSH ports with the demo, the light node's Tor client and the
+# `vos.credential` facility; last the reads at a cut.
+# Left to `just ci`: the slow fault runs, the PVM vectors, the bench and
+# prover library tests, and the lints of other feature sets.
+gate: check doc-check check-venue-rules check-no-std check-no-leaks check-no-faults check-kit fuzz-replay
     cargo clippy -p vos-venue --all-targets --quiet -- -D warnings
     cargo clippy -p vos-pvm-recair --no-default-features --lib --quiet -- -D warnings
     cargo clippy -p vos-light --lib --quiet -- -D warnings
     just clippy-prover
-    cargo test {{core_crates}}
-    just test-recair
-    cargo test {{agent_crates}}
+    cargo test {{core_crates}} ...(python3 -I tools/gates/tiers.py heavy {{core_crates}} | split row ' ')
+    cargo test {{core_crates}} --doc
+    cargo test -p vos-pvm-recair ...(python3 -I tools/gates/tiers.py heavy -p vos-pvm-recair | split row ' ') -- --test-threads=4
+    cargo test {{agent_crates}} ...(python3 -I tools/gates/tiers.py heavy {{agent_crates}} | split row ' ')
+    cargo test {{agent_crates}} --doc
     just test-gateway-onion
     just test-light-tor
+    just test-gateway-ssh
     just test-facility
     just test-reads
 
+# The tests a change touches (`tools/gates/tiers.py changed`): `cargo
+# test` for the workspace's crates that differ from `base`, and those that
+# depend on them; the fast test targets alone, or with `--heavy` the heavy
+# ones too. The prover's own suites stay `ci`'s and above.
+test-changed base="vos-core" *flags="": build-test-actors build-programs
+    python3 -I tools/gates/tiers.py changed {{base}} {{flags}}
+
+# The gates' tripwire (`tools/gates/tiers.py`): the tiers nest, every test
+# target of the workspace is run by `check` or listed heavy and run by
+# `gate`, or run by a tier above; every workspace outside the root's is
+# built or tested by a tier; and the agent's guest workspace builds the
+# programs `programs.toml` names.
+check-tiers:
+    python3 -I tools/gates/tiers.py check
+
 # The live runs of reads at a cut on the agent's model, with no proving:
 # the window's, the balance's and a small map's reads, re-traced, and the
-# kernels' refusals, so a change of the served contract fails `check`.
+# kernels' refusals, so a change of the served contract fails `gate`.
 # One at a time: four at once were killed past 12 GiB. Each is named
 # exactly, and the recipe fails unless every name is a test, so a renamed
 # test is not skipped unseen.
 reads_tests := "window_kernel::the_window_settles_at_a_cut window_kernel::a_carried_state_that_does_not_open_is_refused window_kernel::an_older_cut_is_refused window_kernel::rows_off_the_cut_are_refused balance::a_balance_is_stated_at_a_cut balance::a_commitment_that_does_not_open_is_refused reads::a_read_at_a_cut_re_runs_as_its_live_run"
 
-test-reads:
+test-reads: build-test-actors build-programs
     let named = ([{{reads_tests}}] | length); let listed = (cargo test -p vos-pvm-proof --test kernel -- --list --exact {{reads_tests}} | lines | where {|line| $line ends-with ': test' } | length); if $listed != $named { error make { msg: $"test-reads names ($named) tests, of which ($listed) exist" } }
     cargo test -p vos-pvm-proof --test kernel -- --test-threads=1 --exact {{reads_tests}}
 
-# Everything but the prover suites: before a merge, and at the end of each
-# planned stage of work.
-ci: fmt-check doc-check check-no-std clippy jar-check test vectors test-bench test-agent check-no-faults check-no-leaks check-kit fuzz-replay
+# Before a merge, and at the end of each planned stage of work: `gate`,
+# and everything else but the prover suites: the lints of every feature
+# set, the JAR check, the PVM vectors, the bench's cross-host checks, the
+# slow fault runs, the statement's heap peak and the prover's library
+# tests.
+ci: gate clippy jar-check vectors test-bench test-faults
+    cargo test -p vos-statement --features heap-peak --test heap
+    cargo test -p vos-pvm-proof --lib
 
 # The gate at a milestone: `ci` plus the release binary's scan, the prover
 # suites, the soundness gates (the leakage tests at their medium N), the
@@ -813,13 +898,13 @@ ci: fmt-check doc-check check-no-std clippy jar-check test vectors test-bench te
 # Run alone on the machine, its builds may take `CARGO_BUILD_JOBS` 8 to 12:
 # the proving tests keep their own thread limits (`test-proof`'s
 # `--test-threads`), so the peak stays under the cap.
-ci-full: ci check-release-names test-proof test-bench-proof (fuzz "60")
+ci-full: ci check-release-names test-bench-proof test-proof (fuzz "60")
 
-# The gate at a slice's end: `ci-full`'s, with the leakage tests at their
-# full N (2,000 proofs a witness on the small circuit, 32 on the real wrap,
-# 256 a kernel on the masked segment) and the fuzz targets five minutes
-# each. Under the same limit.
-slice-gate: ci test-bench-proof
+# The gate at a slice's end: `ci-full`'s recipes, with the leakage tests at
+# their full N (2,000 proofs a witness on the small circuit, 32 on the real
+# wrap, 256 a kernel on the masked segment) and the fuzz targets five
+# minutes each. Under the same limit.
+slice-gate: ci check-release-names test-bench-proof
     with-env { LEAKAGE_N: "2000", LEAKAGE_WRAP_N: "32", LEAKAGE_SEGMENT_N: "256" } { just test-proof }
     just fuzz 300
 

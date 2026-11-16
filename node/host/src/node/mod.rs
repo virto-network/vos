@@ -590,7 +590,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../../agent/programs/target/riscv64em-vos/release/vos-agent.elf"
         );
-        let elf = std::fs::read(path).expect("run `just build-agent`");
+        let elf = std::fs::read(path).expect("run `just build-programs`");
         vos_pvm_compiler::link_elf_spi(&elf).expect("links")
     }
 

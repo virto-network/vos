@@ -942,7 +942,7 @@ tag's, byte for byte.
   hand-rolled encodings. It takes `parity-scale-codec` as a std, test-only
   dependency, outside the vendored tree.
 - **The files** (`conformance/` in the kit; in VOS `node/venue/conformance`,
-  written by `just conformance`, refused stale by `just check`):
+  written by `just conformance`, refused stale by `just check`, the vectors' own test):
   - `spaces.json`: the constants (§4's suggested values, `UNITS =
     10^12`, `FeeBound = UNITS`, the existential deposit `UNITS / 1000`,
     `ForfeitTo` the `py/trsry` pallet account), labels for the accounts and

@@ -19,7 +19,7 @@ use ed25519_dalek::{Signer as _, SigningKey};
 use vos_api::{Framing, Kind, Mark, marked};
 use vos_checker::Nodes;
 use vos_checker::calls::installed;
-use vos_checker::programs::{credentials_elf, personal_elf};
+use vos_checker::programs::program_elf;
 use vos_light::group::{DeviceGroup, Event};
 use vos_light::home::{self, Claim, ClaimError, Home as HomeSpace};
 use vos_light::kit::KitSecret;
@@ -334,9 +334,10 @@ pub(crate) struct Phone {
 impl Phone {
     pub(crate) fn new(n: u8, home: &HomeSpace) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let agent =
-            vos_light::release::agent(&std::fs::read(vos_testkit::programs::agent_elf()).unwrap())
-                .unwrap();
+        let agent = vos_light::release::agent(
+            &std::fs::read(vos_testkit::programs::program_elf("vos-agent")).unwrap(),
+        )
+        .unwrap();
         let light = Light::open(dir.path(), &agent, Config::default()).unwrap();
         let admin = SigningKey::from_bytes(&[n | 0x80; 32]);
         let mut phone = Self {
@@ -558,7 +559,7 @@ pub(crate) fn wait(what: &str, mut done: impl FnMut() -> bool) {
 fn a_personal_space_is_claimed_paired_and_its_first_phone_retired() {
     let home = Founded::with(policy());
     let keeper = home.keeper();
-    let personal_elf = std::fs::read(personal_elf()).unwrap();
+    let personal_elf = std::fs::read(program_elf("vos-personal")).unwrap();
     assert_eq!(keeper.top_up(2, &personal_elf, 16).unwrap(), 2);
     home.write::<(), CredentialError>(CREDENTIALS, "open", (4u8, 16u32, 86_400_000u64))
         .unwrap();
@@ -576,7 +577,7 @@ fn a_personal_space_is_claimed_paired_and_its_first_phone_retired() {
         homes: HOMES,
         credentials: CREDENTIALS,
     };
-    let credentials = std::fs::read(credentials_elf()).unwrap();
+    let credentials = std::fs::read(program_elf("vos-credentials")).unwrap();
     let owner_kernel = DeviceProgram::released(
         &vos_light::release::device(&credentials, "owner").expect("the stock kernel"),
     )
@@ -929,7 +930,7 @@ impl Club {
             .unwrap()
             .create_replicated((1..=NODES).collect())
             .unwrap();
-        let credentials = std::fs::read(credentials_elf()).unwrap();
+        let credentials = std::fs::read(program_elf("vos-credentials")).unwrap();
         vos_checker::spaces::wait_in_process("an install", || {
             match smol::block_on(cluster.leading(agent).install(
                 agent,

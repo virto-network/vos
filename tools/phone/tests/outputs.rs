@@ -96,7 +96,7 @@ fn the_benchs_lines_and_proofs_hold_no_secret() {
     let kernel = dir.path().join("kernel");
     let witness = dir.path().join("input");
     let proved = dir.path().join("kernel.proof");
-    let elf = std::fs::read(vos_testkit::programs::credentials_elf()).unwrap();
+    let elf = std::fs::read(vos_testkit::programs::program_elf("vos-credentials")).unwrap();
     let device = vos_light::release::device(&elf, "auth").unwrap();
     std::fs::write(&kernel, vos_wire::Encode::encode(&device)).unwrap();
     std::fs::write(&witness, &input).unwrap();

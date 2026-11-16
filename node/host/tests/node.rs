@@ -1,4 +1,4 @@
-//! The node host with the default agent (`just build-agent`) and the test
+//! The node host with the default agent (`just build-programs`) and the test
 //! actors (`just build-test-actors`): batches applied before anything is
 //! sent, admission, failing refines, and messages between agents applied
 //! exactly once across stops and restarts.

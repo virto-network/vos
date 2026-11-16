@@ -25,7 +25,7 @@
 //! its send lag, and one whose p99 lag passes 0.5 ms is marked invalid.
 //! Each run gives every process's CPU, and the CPU per commit.
 //!
-//! `cargo bench -p vos-cli --bench processes` (after `just build-agent
+//! `cargo bench -p vos-cli --bench processes` (after `just build-programs
 //! build-test-actors`). Its settings:
 //! - `ROWS` picks rows (`agent,agents,quiet,query,linearizable,idle,
 //!   failover,failover-idle,soak,resume,catch-up`; all but the last five

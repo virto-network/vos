@@ -44,9 +44,7 @@ use vos_checker::Nodes;
 use vos_checker::calls::installed;
 use vos_checker::carriers::{self, Audit, Kind, Logs, Reach};
 use vos_checker::processes::Front;
-use vos_checker::programs::{
-    actor, actor_elf, credentials, credentials_elf, method, payments, payments_elf,
-};
+use vos_checker::programs::{actor, actor_elf, method, program, program_elf};
 use vos_light::wire::{self, Answer};
 use vos_light::{
     AuthWitness, Call, DEVICE_FORMAT, DeviceError, DeviceProgram, Proven, Prover, ProverConfig,
@@ -187,9 +185,13 @@ impl Founded {
             .unwrap();
         let elf = |path: std::path::PathBuf| std::fs::read(path).unwrap();
         for (instance, elf, role) in [
-            (CREDENTIALS, elf(credentials_elf()), "registrar"),
+            (
+                CREDENTIALS,
+                elf(program_elf("vos-credentials")),
+                "registrar",
+            ),
             (POLL, elf(actor_elf("poll")), "operator"),
-            (PAYMENTS, elf(payments_elf()), "operator"),
+            (PAYMENTS, elf(program_elf("vos-payments")), "operator"),
             (DEVICE, elf(actor_elf("device")), "operator"),
         ] {
             let roles = vec![(role.as_bytes().to_vec(), ROLE)];
@@ -230,9 +232,9 @@ impl Founded {
 
     fn method(&self, instance: InstanceId, name: &str) -> u32 {
         let program = match instance {
-            CREDENTIALS => credentials(),
+            CREDENTIALS => program("vos-credentials"),
             POLL => actor("poll"),
-            PAYMENTS => payments(),
+            PAYMENTS => program("vos-payments"),
             _ => actor("device"),
         };
         method(&program, name).0
@@ -416,7 +418,7 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
         ..ProverConfig::default()
     })
     .unwrap();
-    let credentials_elf = std::fs::read(credentials_elf()).unwrap();
+    let credentials_elf = std::fs::read(program_elf("vos-credentials")).unwrap();
     let stock = |kernel| vos_light::release::device(&credentials_elf, kernel).unwrap();
     let (auth, owner_kernel) = (stock("auth"), stock("owner"));
     let auth_program = DeviceProgram::released(&auth).unwrap();

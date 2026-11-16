@@ -52,7 +52,7 @@ pub fn light(args: &[String]) {
     let store = store.expect("--store DIR");
     if AGENT.is_empty() || NOTES.is_empty() {
         eprintln!(
-            "built without the release artifacts: `just build-agent build-test-actors`, then build again"
+            "built without the release artifacts: `just build-programs build-test-actors`, then build again"
         );
         std::process::exit(2);
     }

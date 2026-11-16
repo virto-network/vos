@@ -101,13 +101,13 @@ impl LocalSpace {
         let installs = [
             (
                 CREDENTIALS,
-                elf(vos_testkit::programs::credentials_elf())?,
+                elf(vos_testkit::programs::program_elf("vos-credentials"))?,
                 "registrar",
             ),
             (POLL, elf(actor_elf("poll"))?, "operator"),
             (
                 PAYMENTS,
-                elf(vos_testkit::programs::payments_elf())?,
+                elf(vos_testkit::programs::program_elf("vos-payments"))?,
                 "operator",
             ),
         ];
@@ -135,9 +135,12 @@ impl LocalSpace {
             agent,
             operator: Mutex::new(Client::new(&target, key)),
             programs: [
-                (CREDENTIALS, vos_testkit::programs::credentials()),
+                (
+                    CREDENTIALS,
+                    vos_testkit::programs::program("vos-credentials"),
+                ),
                 (POLL, vos_testkit::programs::actor("poll")),
-                (PAYMENTS, vos_testkit::programs::payments()),
+                (PAYMENTS, vos_testkit::programs::program("vos-payments")),
             ],
         };
         space.write(CREDENTIALS, "found", handle)?;

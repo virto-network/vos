@@ -409,7 +409,7 @@ fn digest(shown: &str) -> [u8; 32] {
 /// the actor's code and data and the transpiler, never another crate's
 /// edit that leaves those as they are.
 fn stock() -> Stock {
-    let elf = std::fs::read(vos_testkit::programs::credentials_elf()).unwrap();
+    let elf = std::fs::read(vos_testkit::programs::program_elf("vos-credentials")).unwrap();
     let artifact =
         |kernel| vos_wire::Encode::encode(&vos_light::release::device(&elf, kernel).unwrap());
     let stock = Stock {

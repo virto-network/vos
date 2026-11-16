@@ -54,7 +54,7 @@ wait_file() {
 }
 {
   cd "$root"
-  just build-agent build-credentials build-test-actors >/dev/null
+  just build-programs build-test-actors >/dev/null
   cargo build --release -p vos-node --example device_ingress
   if [ "${PG2_LOCAL:-0}" = 1 ]; then
     mkdir -p "$dir"; uname -a

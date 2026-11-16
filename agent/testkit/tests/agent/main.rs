@@ -1,4 +1,4 @@
-//! The default agent (`agent/default`, built by `just build-agent`) on the
+//! The default agent (`agent/default`, built by `just build-programs`) on the
 //! node's refine and accumulate hosts, step by step against the testkit.
 //! The tests fail, not skip, when the programs are missing.
 

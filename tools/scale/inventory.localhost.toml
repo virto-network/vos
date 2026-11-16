@@ -1,6 +1,6 @@
 # The harness's smoke: four nodes and a driver on this machine, each a
 # `localhost` entry with its own ports, directory and cores. Run from the
-# repository's root after `just release build-agent build-representative
+# repository's root after `just release build-programs
 # build-test-actors`:
 #
 #   target/x86_64-unknown-linux-musl/release/vos-scale \

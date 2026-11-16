@@ -312,7 +312,7 @@ fn no_carrier_through_the_onion_holds_a_members_device_secret_or_its_place() {
         ..ProverConfig::default()
     })
     .unwrap();
-    let elf = std::fs::read(vos_testkit::programs::credentials_elf()).unwrap();
+    let elf = std::fs::read(vos_testkit::programs::program_elf("vos-credentials")).unwrap();
     let stock = |kernel| vos_light::release::device(&elf, kernel).unwrap();
     let (auth, owner_kernel) = (stock("auth"), stock("owner"));
     let auth_program = DeviceProgram::released(&auth).unwrap();

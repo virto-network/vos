@@ -83,7 +83,7 @@ struct DeployArgs {
     /// `just release` built.
     #[arg(long)]
     bins: Option<PathBuf>,
-    /// The agent program's ELF (`just build-agent`).
+    /// The agent program's ELF (`just build-programs`).
     #[arg(long)]
     agent: Option<PathBuf>,
 }
@@ -128,7 +128,7 @@ struct PersonalArgs {
     /// for the fill.
     #[arg(long, default_value_t = 0)]
     personal: u32,
-    /// `Personal`'s ELF (`just build-personal`).
+    /// `Personal`'s ELF (`just build-programs`).
     #[arg(long)]
     personal_elf: Option<PathBuf>,
     /// The home's stand-in, the `home` test actor (`just build-test-actors`).

@@ -45,7 +45,7 @@ pub struct TestnetArgs {
     /// The node's JSON-RPC, `host:port`.
     #[arg(long, default_value = "localhost:19800")]
     pub rpc: String,
-    /// The agent program, as built by `just build-agent`.
+    /// The agent program, as built by `just build-programs`.
     #[arg(long, env = "VOS_AGENT")]
     pub agent: PathBuf,
     /// The test actors' programs, as `just build-test-actors` builds them.

@@ -10,9 +10,7 @@
 //! persons, whose devices enroll and revoke each other by their owner
 //! proofs.
 
-use vos_testkit::programs::{
-    actor, actor_elf, credentials, credentials_elf, method, payments, payments_elf,
-};
+use vos_testkit::programs::{actor, actor_elf, method, program, program_elf};
 use vos_wire::abi::cap::Target;
 use vos_wire::abi::{Failure, Refusal};
 use vos_wire::batch::{Admin, CredentialedInput, Input, Request};
@@ -78,8 +76,8 @@ impl Agent {
 
     fn on(mut node: Node) -> Self {
         let poll_elf = std::fs::read(actor_elf("poll")).unwrap();
-        let payments_elf = std::fs::read(payments_elf()).unwrap();
-        let credentials_elf = std::fs::read(credentials_elf()).unwrap();
+        let payments_elf = std::fs::read(program_elf("vos-payments")).unwrap();
+        let credentials_elf = std::fs::read(program_elf("vos-credentials")).unwrap();
         // An auth guard needs the agent's credential actor.
         let before = Self::install(&mut node, POLL, &poll_elf, &[]);
         assert_eq!(failed(&before), Failure::Credentials);
@@ -118,8 +116,8 @@ impl Agent {
         node.batch(START, roles.to_vec());
         let mut agent = Self {
             node,
-            credentials: credentials(),
-            payments: payments(),
+            credentials: program("vos-credentials"),
+            payments: program("vos-payments"),
             poll: actor("poll"),
             sessions: 0,
             nonce: 0,

@@ -3,7 +3,7 @@
 //! package whose ELF is `ELF`, each written to `DIR/NAME.device` in its
 //! encoding ([`vos_light::release::Device`]): what an app embeds for the
 //! stock kernels, `auth` and `owner` from the credential actor's ELF
-//! (`just build-credentials`).
+//! (`just build-programs`).
 
 use vos_wire::Encode;
 

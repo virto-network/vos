@@ -1,5 +1,5 @@
 # The space's representative, a system agent's actor, built for the PVM
-# with the guest toolchain: `just build-representative`.
+# with the guest toolchain: `just build-programs`.
 [package]
 name = "vos-representative"
 version = "0.1.0"

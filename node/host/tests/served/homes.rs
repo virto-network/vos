@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::SigningKey;
 use vos_checker::Nodes;
 use vos_checker::calls::installed;
-use vos_checker::programs::{actor_elf, credentials_elf, homes_elf, personal_elf};
+use vos_checker::programs::{actor_elf, program_elf};
 use vos_keeper::{Home, Keeper, KeeperError};
 use vos_light::{
     AuthWitness, Call, DeviceError, DeviceProgram, Prover, ProverConfig, Threads, method_id,
@@ -102,8 +102,8 @@ impl Founded {
             .unwrap()
             .create_replicated((1..=NODES).collect())
             .unwrap();
-        let credentials = std::fs::read(credentials_elf()).unwrap();
-        let homes = std::fs::read(homes_elf()).unwrap();
+        let credentials = std::fs::read(program_elf("vos-credentials")).unwrap();
+        let homes = std::fs::read(program_elf("vos-homes")).unwrap();
         for (instance, elf, role) in [
             (CREDENTIALS, &credentials, "registrar"),
             (HOMES, &homes, "operator"),
@@ -361,7 +361,7 @@ fn a_pool_of_200_is_made_by_the_keeper_and_claimed() {
     home.write::<Vec<u32>, CredentialError>(CREDENTIALS, "enroll_many", members.clone())
         .unwrap();
     let keeper = home.keeper();
-    let personal = std::fs::read(personal_elf()).unwrap();
+    let personal = std::fs::read(program_elf("vos-personal")).unwrap();
     let made = Instant::now();
     assert_eq!(keeper.top_up(POOL, &personal, 16).unwrap(), POOL);
     eprintln!(

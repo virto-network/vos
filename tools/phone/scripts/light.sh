@@ -17,7 +17,7 @@
 # was pushed is removed at the end. Exits 0 when every step passed.
 #
 # <vos-phone> is `tools/phone/build.sh`'s `vos-phone-timing`, built after
-# `just build-agent build-test-actors` (its build script embeds the
+# `just build-programs build-test-actors` (its build script embeds the
 # artifacts from those ELFs); the phone is adb's LIGHT_SERIAL (the gate
 # phone's by default). With LIGHT_LOCAL=1 the "phone" is this host and
 # <vos-phone> an x86 build (`cargo build --release -p vos-phone`): the

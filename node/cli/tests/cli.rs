@@ -7,7 +7,7 @@ use std::process::{Command, Output};
 use std::time::Duration;
 
 use vos_checker::processes::{Running, Started, read_log, run};
-use vos_checker::programs::{actor_elf, agent, agent_elf};
+use vos_checker::programs::{actor_elf, agent, program_elf};
 use vos_checker::wait_until;
 
 const VOS: &str = env!("CARGO_BIN_EXE_vos");
@@ -243,7 +243,7 @@ fn the_founding_node_creates_the_representative_once() {
     let config = dir.path().join("node.toml");
     let config = config.to_str().unwrap();
     std::fs::write(config, "executor = 2\n").unwrap();
-    let agent = agent_elf();
+    let agent = program_elf("vos-agent");
     let run = [
         "node", "run", "--data", &data, "--space", space, "--config", config,
     ];
@@ -331,7 +331,7 @@ fn an_operator_installs_a_package() {
     let ledger = actor_elf("ledger");
     let instance_2 = |elf: &Path| install(&url, &data, &agent, "2", elf);
 
-    let refused = vos_fails(instance_2(&agent_elf()));
+    let refused = vos_fails(instance_2(&program_elf("vos-agent")));
     assert!(refused.contains("vos_schema"), "{refused}");
     let unmapped = vos(instance_2(&ledger));
     assert!(unmapped.starts_with("failed 6"), "unknown: {unmapped}");

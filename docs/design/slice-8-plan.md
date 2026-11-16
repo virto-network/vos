@@ -15,7 +15,8 @@ estimates, and places what slice 7 carried.
   `#[ignore]`, no Co-Authored-By, fix pre-existing failures; one Opus
   review a step; a Fable review at each milestone's end and at the slice
   end, with an Opus code-quality review at the slice end folded as a
-  behaviour-preserving step; `just check` a step, `ci-full` with fuzz at 1
+  behaviour-preserving step; `just gate` a step (`just check` is the light
+  check while editing), `ci-full` with fuzz at 1
   minute a target and leakage at medium N at milestones, 5-minute fuzz and
   full-N leakage at the slice end.
 - **One heavy run at a time:** proving gates (leakage, `ci-full`, phone
@@ -545,8 +546,8 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   its AIDL and its UI side, and its client's facilities may carry a
   host's stream and pin its host key (`Carrier::carry`, `admit`). The
   embedded artifacts are held to this tree's guests by a test
-  (`tests/release.rs`), so a guest that moves fails `just check` until
-  `just facility-release`. One build: `just android-facility` here, then
+  (`tests/release.rs`), so a guest that moves fails `just gate` until
+  `just repin`. One build: `just android-facility` here, then
   `just android-build-vos <repository>` in s4.
 
 ### M4 acceptance
@@ -606,7 +607,7 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
 - **Built** (2026-11-08, `light-node.md` §6.2 "Built"): `vos_light::route`
   (the policy, unconditional) and `vos_light::tor` behind `vos-light`'s
   `tor` feature (arti-client 0.47.0 with `bridge-client` and
-  `static-sqlite`, russh on ring), `just test-light-tor` in `check`. The
+  `static-sqlite`, russh on ring), `just test-light-tor` in `gate`. The
   gate's refusal and capture: `node/light/tests/tor.rs`
   (`an_anonymous_call_is_refused_on_a_clearnet_only_path`,
   `isolation_groups_never_share_a_circuit_or_an_ssh_key`, against an

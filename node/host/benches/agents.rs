@@ -18,7 +18,7 @@
 //! so three times the machine for nodes sharing it), `LINGER_MS` and
 //! `MAX_INPUTS` its batching.
 //!
-//! `cargo bench -p vos-node --bench agents` (after `just build-agent
+//! `cargo bench -p vos-node --bench agents` (after `just build-programs
 //! build-test-actors`). Data goes under `target/`: on the reference laptop
 //! `/tmp` is tmpfs.
 

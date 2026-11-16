@@ -1,13 +1,9 @@
 # The agent's guest programs, built for the PVM with the guest toolchain,
-# each alone: the default agent (`just build-agent`), the space's
-# representative (`just build-representative`), the credential actor
-# (`just build-credentials`), the personal agent's actor (`just
-# build-personal`), the ledger (`just build-payments`), the home's (`just
-# build-homes`), and the local actors the light node ships, the credential
-# book and the device book (`just build-credential-book`, `just
-# build-device-book`). One lockfile, toolchain, target configuration and
-# release profile for the eight; no `.cargo/config.toml` above it, whose
-# `build-std` would reach the host crates under `agent/`.
+# each alone (`just build-programs`): the programs `programs.toml` names,
+# which `just check-tiers` holds these members to. One lockfile, toolchain,
+# target configuration and release profile for them all; no
+# `.cargo/config.toml` above it, whose `build-std` would reach the host
+# crates under `agent/`.
 [workspace]
 resolver = "3"
 members = [

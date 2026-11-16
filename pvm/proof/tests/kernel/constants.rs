@@ -2,7 +2,8 @@
 //! recomputed from their sources: each known kernel's program id from its
 //! test actor's ELF, derived as an install derives it, `H_fold` from the
 //! fold circuit and the wrap's preprocessed roots from the wrap circuit.
-//! `test-proof` runs it under both of the prover's feature sets.
+//! `test-proof` runs it under both of the prover's feature sets; under
+//! `VOS_PINS=write` (`just repin`) it writes the constants that moved.
 
 use vos_pvm_proof::constants;
 use vos_pvm_proof::format::SEGMENT;
@@ -74,17 +75,25 @@ fn the_constants_are_the_repositorys() {
             constants::WRAP_ROOT_39,
         ),
     ];
-    for (name, words, _) in &computed {
-        eprintln!("{name}: {words:?}");
-    }
-    for (name, bytes, _) in &roots {
-        eprintln!("{name}: {bytes:?}");
+    let moved = computed.iter().any(|(_, words, pinned)| words != pinned)
+        || roots.iter().any(|(_, bytes, pinned)| bytes != pinned);
+    if moved && std::env::var("VOS_PINS").as_deref() == Ok("write") {
+        let values = computed
+            .iter()
+            .map(|(name, words, _)| (*name, words.map(u64::from).to_vec()))
+            .chain(
+                roots
+                    .iter()
+                    .map(|(name, bytes, _)| (*name, bytes.map(u64::from).to_vec())),
+            );
+        write(values);
+        return;
     }
     for (name, words, pinned) in computed {
-        assert_eq!(words, pinned, "{name}");
+        assert_eq!(words, pinned, "{name} moved: `just repin`");
     }
     for (name, bytes, pinned) in roots {
-        assert_eq!(bytes, pinned, "{name}");
+        assert_eq!(bytes, pinned, "{name} moved: `just repin`");
     }
     assert_eq!(
         constants::WRAP_ROOT_28,
@@ -94,4 +103,33 @@ fn the_constants_are_the_repositorys() {
         constants::WRAP_ROOT_39,
         vos_pvm_final_verifier::PREPROCESSED_ROOT_39
     );
+}
+
+/// Write `constants` into `src/constants.rs`, each its array's values, as
+/// rustfmt lays an array out: `just repin`'s write (`VOS_PINS=write`).
+fn write(constants: impl Iterator<Item = (&'static str, Vec<u64>)>) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/constants.rs");
+    let mut source = std::fs::read_to_string(&path).unwrap();
+    for (name, values) in constants {
+        let start = source
+            .find(&format!("pub const {name}: "))
+            .unwrap_or_else(|| panic!("no {name} in {}", path.display()));
+        let open = start + source[start..].find("= [").expect("its array") + 3;
+        let close = open + source[open..].find("];").expect("its end");
+        let mut body = String::from("\n   ");
+        let mut width = 3;
+        for value in values {
+            let item = format!(" {value},");
+            if width + item.len() > 100 {
+                body.push_str("\n   ");
+                width = 3;
+            }
+            body.push_str(&item);
+            width += item.len();
+        }
+        body.push('\n');
+        source.replace_range(open..close, &body);
+    }
+    std::fs::write(&path, source).unwrap();
+    eprintln!("{}: written", path.display());
 }

@@ -94,12 +94,12 @@ impl ProgramStore for Programs {
 
 /// The default agent's program, linked, and `Personal`'s package: the
 /// facility's own artifact, and the package of this tree's personal agent
-/// (`just build-personal`), as a release makes it.
+/// (`just build-programs`), as a release makes it.
 fn artifacts() -> &'static (Vec<u8>, Package) {
     static ARTIFACTS: std::sync::OnceLock<(Vec<u8>, Package)> = std::sync::OnceLock::new();
     ARTIFACTS.get_or_init(|| {
         let agent = include_bytes!("../../release/agent.program").to_vec();
-        let elf = std::fs::read(vos_testkit::programs::personal_elf()).unwrap();
+        let elf = std::fs::read(vos_testkit::programs::program_elf("vos-personal")).unwrap();
         let personal = vos_light::release::package(&elf, 1).unwrap();
         (agent, personal)
     })

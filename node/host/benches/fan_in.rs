@@ -28,7 +28,7 @@
 //! `ROWS` picks rows (`fan-in,pairs`), `EXECUTORS` each node's executor
 //! threads, `QUEUE` each agent's queue cap.
 //!
-//! `cargo bench -p vos-node --bench fan_in` (after `just build-agent
+//! `cargo bench -p vos-node --bench fan_in` (after `just build-programs
 //! build-test-actors`). Data goes under `target/`.
 
 mod support;

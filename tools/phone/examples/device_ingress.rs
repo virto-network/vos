@@ -10,7 +10,7 @@
 //! point, then the PoW, then the decommitments; a wrong PoW is refused
 //! after every step before the decommitments.
 //!
-//! `just build-credentials`, then `cargo run --release -p vos-phone
+//! `just build-programs`, then `cargo run --release -p vos-phone
 //! --example device_ingress`
 
 use std::time::{Duration, Instant};
@@ -41,7 +41,8 @@ fn timed(ok: bool, mut run: impl FnMut() -> bool) -> (Duration, Duration) {
 }
 
 fn main() {
-    let elf = std::fs::read(vos_testkit::programs::credentials_elf()).expect("the ELF");
+    let elf =
+        std::fs::read(vos_testkit::programs::program_elf("vos-credentials")).expect("the ELF");
     let auth = device(&elf, "auth").expect("the stock auth kernel's artifact");
     let program = vos_light::DeviceProgram::released(&auth).expect("its program");
     let verifier = Program::released(&auth.kernel, auth.chips, &auth.log_sizes)

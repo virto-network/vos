@@ -16,11 +16,11 @@
 #
 # It needs systemd's user manager (`systemd-run --user`, `systemctl
 # --user`), `setsid`, `curl`, and the programs built: the agent and the test
-# actors (`just build-agent build-test-actors`) for the agent, the service
+# actors (`just build-programs build-test-actors`) for the agent, the service
 # (`just check-no-std`, or `just jam-statements-testnet`) for the
 # statements, and for `chain` the host's C compiler (`cc`) and the test
 # actors, the default agent and the representative (`just
-# build-test-actors build-agent build-representative`). POLKAJAM names
+# build-test-actors build-programs`). POLKAJAM names
 # the directory of PolkaJam's binaries, v0.8.0 by default (sha256
 # e90c8ccd… of its release archive); the run's files go
 # to a new directory under TMPDIR (or /tmp), or JAM_RUN, and the testnet's
@@ -49,14 +49,14 @@ for binary in polkajam-testnet polkajam jamt; do
 done
 if [ "$mode" = agent ] || [ "$mode" = both ]; then
     [ -f "$agent" ] && [ -f "$actors/lean.elf" ] || {
-        echo "build the agent and the test actors first: just build-agent build-test-actors" >&2
+        echo "build the agent and the test actors first: just build-programs build-test-actors" >&2
         exit 1
     }
 fi
 if [ "$mode" = chain ]; then
     [ -f "$agent" ] && [ -f "$representative" ] \
         && [ -f "$actors/balance.elf" ] && [ -f "$actors/window.elf" ] && [ -f "$actors/reader.elf" ] || {
-        echo "build the test actors, the agent and the representative first: just build-test-actors build-agent build-representative" >&2
+        echo "build the test actors, the agent and the representative first: just build-test-actors build-programs" >&2
         exit 1
     }
 fi

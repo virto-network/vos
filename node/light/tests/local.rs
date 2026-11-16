@@ -34,13 +34,13 @@ fn read(path: std::path::PathBuf) -> Vec<u8> {
 }
 
 fn agent() -> Vec<u8> {
-    release::agent(&read(programs::agent_elf())).unwrap()
+    release::agent(&read(programs::program_elf("vos-agent"))).unwrap()
 }
 
 /// The device book's first release, and its next.
 fn device_books() -> (Package, Package) {
     (
-        release::package(&read(programs::device_book_elf()), 1).unwrap(),
+        release::package(&read(programs::program_elf("vos-device-book")), 1).unwrap(),
         release::package(&read(programs::actor_elf("device-book-next")), 2).unwrap(),
     )
 }
@@ -157,7 +157,8 @@ fn the_credential_book_and_the_device_book_read_back() {
     use vos_wire::books::{Agent, DeviceHandle, Enrolled, Guard, Location, Pinned};
 
     let agent = agent();
-    let credentials = release::package(&read(programs::credential_book_elf()), 1).unwrap();
+    let credentials =
+        release::package(&read(programs::program_elf("vos-credential-book")), 1).unwrap();
     let (devices, _) = device_books();
     let dir = tempfile::tempdir().unwrap();
     let space = [0x5a; 32];

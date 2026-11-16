@@ -20,7 +20,7 @@
 //! - sends it, and prints one JSON `round` line: the answer, and whether
 //!   the call ran as the member's pseudonym.
 //!
-//! Exits 0 when every round ran. After `just build-agent build-credentials
+//! Exits 0 when every round ran. After `just build-programs
 //! build-test-actors`. `tools/phone/scripts/pg2.sh` drives it with a
 //! phone.
 
@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
 use vos_checker::calls::installed;
-use vos_checker::programs::{Programs, actor, credentials, credentials_elf, method, package};
+use vos_checker::programs::{Programs, actor, method, package, program, program_elf};
 use vos_light::{DEVICE_FORMAT, DeviceProgram, Prover, ProverConfig, Threads};
 use vos_node::client::{self, Client, Target};
 use vos_node::{Config, Node};
@@ -122,7 +122,7 @@ fn start() -> Served {
     let socket = Target::socket(path);
     let agent = node.create_agent().unwrap();
     let registrar = vec![(b"registrar".to_vec(), ROLE)];
-    let elf = std::fs::read(credentials_elf()).unwrap();
+    let elf = std::fs::read(program_elf("vos-credentials")).unwrap();
     installed(smol::block_on(node.install(
         agent,
         CREDENTIALS,
@@ -141,7 +141,7 @@ fn start() -> Served {
         Some(ROLE),
     )));
     let mut client = Client::new(&socket, key);
-    let credentials = credentials();
+    let credentials = program("vos-credentials");
     for (name, arguments) in [("found", HANDLE.encode()), ("enroll", member().encode())] {
         let answer = client
             .call(agent, CREDENTIALS, method(&credentials, name), &arguments)
@@ -182,7 +182,7 @@ impl Served {
             .query(
                 self.agent,
                 CREDENTIALS,
-                method(&credentials(), "path"),
+                method(&program("vos-credentials"), "path"),
                 &member().encode(),
                 not_after,
             )
@@ -266,7 +266,7 @@ fn wait_for(path: &Path, wait: Duration) -> Option<Vec<u8>> {
 fn main() {
     let options = options();
     std::fs::create_dir_all(&options.dir).expect("the directory");
-    let elf = std::fs::read(credentials_elf()).expect("the credential actor");
+    let elf = std::fs::read(program_elf("vos-credentials")).expect("the credential actor");
     let device =
         vos_light::release::device(&elf, "auth").expect("the stock kernel's release artifact");
     let program = DeviceProgram::released(&device).expect("the kernel's program");

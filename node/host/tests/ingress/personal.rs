@@ -12,7 +12,7 @@ use std::os::unix::net::UnixStream;
 
 use ed25519_dalek::{Signature, Verifier};
 use vos_api::{Framing, Kind, Mark, marked};
-use vos_checker::programs::{package, personal_package};
+use vos_checker::programs::{package, program_package};
 use vos_node::client::{signed_call, signed_query};
 use vos_wire::abi::Failure;
 use vos_wire::ids::{Principal, derive_id};
@@ -88,7 +88,7 @@ impl Personal {
         installed(smol::block_on(node.install(
             agent,
             PERSONAL,
-            &personal_package(),
+            &program_package("vos-personal"),
             vec![(b"homes".to_vec(), HOMES_ROLE)],
         )));
         let home = node.create_agent().unwrap();

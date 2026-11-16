@@ -23,7 +23,7 @@ use vos_wire::ids::AgentId;
 use vos_wire::ingress::{ReplicaStatus, Response};
 use vos_wire::peer::NodeNumber;
 
-use crate::programs::agent_elf;
+use crate::programs::program_elf;
 use crate::spaces::{HeldPort, free_udp_port};
 use crate::{Log, Nodes, wait_until};
 use relay::Relay;
@@ -95,7 +95,7 @@ pub fn run(
         .args(["node", "run"])
         .args(args)
         .arg("--agent")
-        .arg(agent_elf())
+        .arg(program_elf("vos-agent"))
         .stdout(Stdio::piped())
         .stderr(errors);
     if let Some(faults) = faults {
