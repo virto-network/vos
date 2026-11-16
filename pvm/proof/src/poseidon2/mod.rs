@@ -120,20 +120,6 @@ pub struct P2MerkleHasher {
     sponge: LeafSponge,
 }
 
-impl P2MerkleHasher {
-    /// The sponge's state after the whole blocks absorbed so far.
-    #[cfg(feature = "prover")]
-    fn state(&self) -> [u32; N_STATE] {
-        self.sponge.state().map(M31::value)
-    }
-
-    /// The words waiting for a whole block.
-    #[cfg(feature = "prover")]
-    fn buffered(&self) -> &[M31] {
-        self.sponge.buffered()
-    }
-}
-
 impl MerkleHasherLifted for P2MerkleHasher {
     type Hash = P2Hash;
     fn hash_children((left, right): (P2Hash, P2Hash)) -> P2Hash {
@@ -252,13 +238,6 @@ impl Poseidon2M31Channel {
         let words: Vec<M31> = values.iter().map(|&value| word(value)).collect();
         self.absorb(&words);
     }
-
-    /// The rate words of `verify_pow_nonce`'s first permutation, which a
-    /// nonce does not enter.
-    #[cfg(feature = "prover")]
-    fn pow_prefix(&self, n_bits: u32) -> [BaseField; 8] {
-        self.transcript.pow_prefix(n_bits).map(base)
-    }
 }
 
 impl Channel for Poseidon2M31Channel {
@@ -323,18 +302,9 @@ impl MerkleChannel for P2MerkleChannel {
     }
 }
 
-/// The one orphan-legal marker the custom channel needs: every super-bound of
-/// `BackendForChannel<P2MerkleChannel>` is blanket-satisfied on `CpuBackend`;
-/// legal because the trait's type parameter (`P2MerkleChannel`) is local.
-#[cfg(feature = "prover")]
-impl stwo::prover::backend::BackendForChannel<P2MerkleChannel>
-    for stwo::prover::backend::CpuBackend
-{
-}
-
-// ── SimdBackend `BackendForChannel<P2MerkleChannel>` ──────────────────────
+// ── The prover's backends: `BackendForChannel<P2MerkleChannel>` ─────────
 //
-// Production proves on `SimdBackend` (vectorized FRI / quotients / twiddles),
+// `CpuBackend` takes the channel by a marker. Production proves on `SimdBackend` (vectorized FRI / quotients / twiddles),
 // and so does the Poseidon2-M31 stack: `simd_backend` hashes leaves and nodes
 // and grinds sixteen permutations at once ([`packed`]). Its roots and nonces
 // equal `CpuBackend`'s.

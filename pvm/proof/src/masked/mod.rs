@@ -336,17 +336,6 @@ impl<S: ChipSet> Components<S> {
             set: core::marker::PhantomData,
         })
     }
-
-    /// The chips' provers, in the set's order.
-    #[cfg(feature = "prover")]
-    pub fn provers(
-        &self,
-    ) -> Vec<&dyn stwo::prover::ComponentProver<stwo::prover::backend::simd::SimdBackend>> {
-        self.components
-            .iter()
-            .map(|component| &**component)
-            .collect()
-    }
 }
 
 impl<S: ChipSet> MaskedComponents for Components<S> {

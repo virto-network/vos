@@ -1,5 +1,6 @@
 //! The Poseidon2-M31 commitment and grind on `SimdBackend`, sixteen
-//! permutations at once.
+//! permutations at once, and `CpuBackend`'s marker for the channel: the
+//! prover's backends, with the sponge and transcript reads they take.
 //!
 //! The impls are orphan-legal: each names a local type (`P2Hash`,
 //! `P2MerkleHasher`, `Poseidon2M31Channel`, `P2MerkleChannel`).
@@ -27,10 +28,37 @@ use stwo::prover::backend::{BackendForChannel, Col, Column, ColumnOps, CpuBacken
 use stwo::prover::vcs_lifted::ops::MerkleOpsLifted;
 
 use super::packed::{LANES, States, permute_x16};
-use super::{N_STATE, P2Hash, P2MerkleChannel, P2MerkleHasher, Poseidon2M31Channel, RATE};
+use super::{
+    M31, N_STATE, P2Hash, P2MerkleChannel, P2MerkleHasher, Poseidon2M31Channel, RATE, base,
+};
 
 const LOG_LANES: u32 = LANES.ilog2();
 const P: u32 = (1 << 31) - 1;
+
+impl P2MerkleHasher {
+    /// The sponge's state after the whole blocks absorbed so far.
+    fn state(&self) -> [u32; N_STATE] {
+        self.sponge.state().map(M31::value)
+    }
+
+    /// The words waiting for a whole block.
+    fn buffered(&self) -> &[M31] {
+        self.sponge.buffered()
+    }
+}
+
+impl Poseidon2M31Channel {
+    /// The rate words of `verify_pow_nonce`'s first permutation, which a
+    /// nonce does not enter.
+    fn pow_prefix(&self, n_bits: u32) -> [BaseField; 8] {
+        self.transcript.pow_prefix(n_bits).map(base)
+    }
+}
+
+/// The one orphan-legal marker the custom channel needs: every super-bound of
+/// `BackendForChannel<P2MerkleChannel>` is blanket-satisfied on `CpuBackend`;
+/// legal because the trait's type parameter (`P2MerkleChannel`) is local.
+impl BackendForChannel<P2MerkleChannel> for CpuBackend {}
 
 // Hash columns are a plain `Vec`, as `SimdBackend` stores its Blake2s hash
 // columns. They are never bit-reversed: hashes live only in the tree.

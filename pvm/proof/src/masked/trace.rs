@@ -360,3 +360,13 @@ fn blinded(
     columns.extend(running);
     (columns, claimed_sum + blind)
 }
+
+impl<S: super::ChipSet> super::Components<S> {
+    /// The chips' provers, in the set's order.
+    pub fn provers(&self) -> Vec<&dyn stwo::prover::ComponentProver<SimdBackend>> {
+        self.components
+            .iter()
+            .map(|component| &**component)
+            .collect()
+    }
+}
