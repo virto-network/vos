@@ -93,10 +93,11 @@ leaf). Read it as trusted:
   `kernel_side_note`; `src/prove/shaped.rs`: `program_commitment_for_shape`;
   `recair/src/leaf/program.rs`: `kernel_program`, a kernel's program from
   its install record.
-- `recair/src/device.rs`: `Program::of`, `Program::released`, `program_id`
-  and `Program::verifier`. A node gets a device program's `Verifier` by
-  building its prover: `DeviceProver::install` commits the preprocessed
-  tree (`recair/src/masked/device.rs`), and `.verifier()` keeps the
+- `recair/src/device/prove.rs`: `Program::of`, `Program::released` and
+  `Program::verifier`; `recair/src/device/verify.rs`: `program_id`. A node
+  gets a device program's `Verifier` by building its prover:
+  `DeviceProver::install` commits the preprocessed tree
+  (`recair/src/masked/device/prove.rs`), and `.verifier()` keeps the
   program, its masked format and its id (`node/host/src/node/admin.rs`:
   `device_program`; `node/host/src/credentialed.rs`). Ingress needs the
   prover's backend at install, whatever the layout.
@@ -108,7 +109,7 @@ leaf). Read it as trusted:
 | **39**, the masked wrap | a venue: natively, in wasm32, or as a PVM guest | `statement/src/lib.rs`: `admit`, then `Admitted::verify` → `final-verifier/src/lib.rs`: `verify` (`decode`, `Decoded::verify`) → `final-verifier/src/masked.rs`: `verify` → `verify_with` → `verify_masked` | `statement/src/lib.rs`; `final-verifier/src/{lib,masked,layout,constants}.rs`; `recair-air/src/` (`gate.rs`, `transcript.rs`, `p2.rs`, `h8.rs`, `qm31.rs`, `masked/`); `vos-pvm-poseidon2` without `packed`; `anchor/src/venue.rs`; Stwo's verifier core | `PREPROCESSED_ROOT_39` (`final-verifier/src/constants.rs`, the wrap circuit), `MASKED_WRAP` (`final-verifier/src/masked.rs`, the masked format `verify_with` holds a proof to) and the statement's program id |
 | **32**, leaves and folds | the fold and wrap circuits, in-AIR; natively only `recair/src/prove.rs`: `verify`, in tests and the prover's own check | none outside the circuits | `recair-air/src/` without `masked/`; the circuit builders in `recair/src/`: `fold/`, `wrap.rs`, `verifier/`, `context/`, `circuit.rs`, `gadgets.rs`, `value.rs` | `H_FOLD` (`src/constants.rs`), a constant of the wrap circuit |
 | **41**, a node's segment | a leaf circuit, in-AIR; no native verifier runs in production | `verifier/src/lib.rs`: `verify_standalone`, `verify_kernel_segment`, `verify_kernel_chain`, the reference a leaf is tested against | the node chip set and the AIR plumbing (below); `src/{proof,format,pcs,security,shape,program_id,boundary_binding}.rs`; `recair/src/compile/` (constraints to gates), `recair/src/leaf/`, `recair/src/verifier/{segment,shape,logup}.rs` | the program id: `src/program_id.rs` (`KernelProgram`, `LeafCircuits`, `ProgramId`), each class's shape, preprocessed root and entry state |
-| **47**, a device proof | a node's ingress, natively | `recair/src/device.rs`: `Verifier::verify` → `recair/src/masked/device.rs`: `verify_device_in` → `final-verifier/src/masked.rs`: `verify_masked` | `final-verifier/src/masked.rs`; `recair-air/src/masked/`; `src/masked/mod.rs`; `src/device.rs`; the device chip set and the plumbing (below); `src/format.rs`; the verify half of `recair/src/device.rs` and `recair/src/masked/{device,mod}.rs`, which mix proving and verifying under no feature | `recair/src/device.rs`: `program_id` (the format, the chips, the CPU cut, the log sizes, the preprocessed root) |
+| **47**, a device proof | a node's ingress, natively | `recair/src/device/verify.rs`: `Verifier::verify` → `recair/src/masked/device/verify.rs`: `verify_device_in` → `final-verifier/src/masked.rs`: `verify_masked` | `final-verifier/src/masked.rs`; `recair-air/src/masked/`; `src/masked/mod.rs`; `src/device.rs`; the device chip set and the plumbing (below); `src/format.rs`; `recair/src/device/verify.rs` and `recair/src/masked/device/verify.rs`, beside their parents' shared types (`DeviceProgram`, `DeviceProof`, the formats) and `recair/src/masked/mod.rs`'s `verifier_format`, `mask_rows` and `reveals`; the crate has no `prover` feature, and its prove halves are `device/prove.rs` and `masked/device/prove.rs`, which the verify files do not import | `recair/src/device/verify.rs`: `program_id` (the format, the chips, the CPU cut, the log sizes, the preprocessed root) |
 
 The masking's zero-knowledge rests on prover code: `recair/src/masked/`
 and `src/masked/trace.rs`.
