@@ -710,10 +710,10 @@ last for decades.**
 ## 5. Masking [built: formats 39, 46 and 47]
 
 - **Where:** the final wrap (39) and device proofs (47, 46): the masking is generic over the component set and the
-  channel. The segment chips mask (`vos_pvm_proof::masked`): each chip's
+  channel. The device's chips mask (`vos_pvm_proof::masked`): each chip's
   blinding fraction joins its last batch of fractions, so masking adds no
-  column and no degree to any chip; the boundary chips' claimed sums,
-  which the boundary states fix, stay unblinded; the fixed tables pad by
+  column and no degree to any chip; the claimed sum the public values fix
+  (DeviceIoChip's) stays unblinded; the fixed tables pad by
   repeating their entries with no multiplicity; every chip pads to four
   times its `h`. The device shape proves them masked against its program
   (`vos_pvm_recair::masked::device`): the program's chips mixed after the

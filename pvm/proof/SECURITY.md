@@ -49,8 +49,9 @@ reference shape, from the security tool (`src/security.rs`):
 - **The proven count is the same on every target.** It is taken in `f64`
   (`src/security.rs`) by IEEE 754's basic operations alone: addition,
   subtraction, multiplication and division, each correctly rounded, so
-  bit-identical wherever Rust compiles them; comparisons; and conversions
-  from integers. `pow2` builds its power from the exponent's bits and
+  bit-identical wherever Rust compiles them; comparisons, `f64::min` and
+  `is_finite`; conversions from integers, and the saturating cast of the
+  count to whole bits; and bit casts. `pow2` builds its power from the exponent's bits and
   `log2` by squaring and halving, with no `libm` call, no square root
   (`√ρ` is a power of two or one times `FRAC_1_SQRT_2`), no fused
   multiply-add (Rust never contracts one) and no NaN on an admitted shape.

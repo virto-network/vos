@@ -24,11 +24,12 @@ use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
 use crate::core::step::WORD_SIZE;
-use crate::device::{ENTRY_PC, ENTRY_TIMESTAMP, HALT_PC};
+use crate::device::ENTRY_PC;
 use crate::framework::{BuiltInComponent, Logup};
 use crate::lookups::{
     IoHashLookupElements, ProgramExecutionLookupElements, RegisterMemoryLookupElements,
 };
+use crate::program_id::{ENTRY_TIMESTAMP, HALT_PC};
 use crate::trace::eval::TraceEval;
 
 /// The io-hash's registers: φ9..12.

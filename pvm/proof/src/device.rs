@@ -22,7 +22,7 @@
 //!   argument window, the heap and the stack zero, any other address none;
 //!   each region's permission preprocessed, so no write lands on a readable
 //!   page; its entry (timestamp 1, pc 0, the layout's registers) and its halt
-//!   (pc [`HALT_PC`]) as constants; its output through the io-hash in
+//!   (pc [`HALT_PC`](crate::program_id::HALT_PC)) as constants; its output through the io-hash in
 //!   φ9..12 alone.
 //! - **The shape is the program's**, never the run's: the chips its code can
 //!   reach ([`device_chips_of_code`]) and a log size each, which the prover
@@ -162,10 +162,9 @@ impl DeviceShape {
     }
 }
 
-/// The pc a run's first step takes; its timestamp is a kernel's
-/// ([`ENTRY_TIMESTAMP`]), its halt pc too ([`HALT_PC`]).
+/// The pc a run's first step takes; its timestamp and its halt pc are a
+/// kernel's (`program_id::{ENTRY_TIMESTAMP, HALT_PC}`).
 pub const ENTRY_PC: u32 = 0;
-pub use crate::program_id::{ENTRY_TIMESTAMP, HALT_PC};
 
 /// A device layout's regions, by index: the read-only data, the argument
 /// window, the read-write data, the heap and the stack.

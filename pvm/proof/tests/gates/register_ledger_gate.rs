@@ -14,6 +14,7 @@ use stwo::core::fields::m31::BaseField;
 use vos_pvm::PVM_REGISTER_COUNT;
 use vos_pvm::instruction::Opcode;
 use vos_pvm::interpreter::Interpreter;
+use vos_pvm_proof::AirColumn;
 use vos_pvm_proof::SideNote;
 use vos_pvm_proof::chips::RegisterMemoryChip;
 use vos_pvm_proof::chips::register_memory::{
@@ -225,4 +226,70 @@ fn a_read_follows_its_register_s_writes() {
         return;
     }
     assert_ledger(&forged, &side_note);
+}
+
+/// Padding between the register ledger's real rows is harmless: the honest
+/// ledger of `φ2 = φ2 + φ1; φ3 = φ2 + φ2`, turned so that its padding lies
+/// between real rows, every cyclic neighbour kept, satisfies
+/// RegisterMemoryChip, each tuple consumed as before. Each real row after
+/// padding starts a chain, which must be its register's `ts = 0` write, the
+/// boundary chip's one a register, so each register is one chain wherever
+/// padding lies.
+#[test]
+fn padding_between_the_ledgers_real_rows_is_harmless() {
+    let code = vec![
+        Opcode::Add64 as u8,
+        (1 << 4) | 2,
+        2,
+        Opcode::Add64 as u8,
+        (2 << 4) | 2,
+        3,
+        Opcode::Trap as u8,
+    ];
+    let bitmask = vec![1, 0, 0, 1, 0, 0, 1];
+    let mut registers = [0u64; PVM_REGISTER_COUNT];
+    registers[1] = 7;
+    registers[2] = 5;
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        registers,
+        vec![0; 1 << 16],
+        10_000,
+    );
+    let mut tracer = TracingPvm::new(pvm);
+    assert_eq!(tracer.run(), vos_pvm::ExitReason::Panic);
+    let mut sn = SideNote::new(tracer.into_trace(), code, bitmask).with_initial_regs(registers);
+    let honest = RegisterMemoryChip.generate_component_trace(&mut sn);
+    assert_ledger(&honest, &sn);
+    let rows = 1usize << honest.log_size;
+    let stored: Vec<usize> = (0..rows)
+        .map(|row| crate::forge::stored(honest.log_size, row))
+        .collect();
+    let natural: Vec<Vec<BaseField>> = honest
+        .original_trace
+        .iter()
+        .map(|column| {
+            (0..rows)
+                .map(|row| column.as_slice()[stored[row]])
+                .collect()
+        })
+        .collect();
+    let padding = &natural[Ledger::IsPadding.offset()];
+    let real = padding
+        .iter()
+        .filter(|&&flag| flag == BaseField::from(0))
+        .count();
+    let turn = |row: usize| (row + real / 2) % rows;
+    let is_real = |row: usize| padding[turn(row)] == BaseField::from(0);
+    assert!(real >= 2 && is_real(0) && is_real(rows - 1));
+    assert!(padding.contains(&BaseField::from(1)));
+    let mut turned = honest.clone();
+    for (column, values) in turned.original_trace.iter_mut().zip(&natural) {
+        for row in 0..rows {
+            column.as_mut_slice()[stored[row]] = values[turn(row)];
+        }
+    }
+    assert_ledger(&turned, &sn);
 }
