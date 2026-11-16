@@ -2,7 +2,7 @@
 name = "vos-pvm-recair-air"
 edition.workspace = true
 version.workspace = true
-license.workspace = true
+license = "GPL-3.0-or-later"
 description = "The recursion AIR's constraint bodies: the Poseidon2-M31 permutation, the QM31 gate and the DEEP accumulator, wired by one Gate relation. no_std, without the prover."
 
 [dependencies]

@@ -2,7 +2,7 @@
 name = "vos-pvm-final-verifier"
 edition.workspace = true
 version.workspace = true
-license.workspace = true
+license = "GPL-3.0-or-later"
 description = "The final wrap's verifier: a format-39 proof (masked, its fixed layout) against its 24 public words, the program id and the io-hash; and format 28 under `test-formats`. no_std, for x86, wasm32 and the PVM."
 
 [features]

@@ -2,7 +2,7 @@
 name = "vos-pvm-poseidon2"
 edition.workspace = true
 version.workspace = true
-license.workspace = true
+license = "GPL-3.0-or-later"
 description = "Poseidon2 over M31, width 16: the permutation, its parameters, and its sponge, Merkle and transcript modes. no_std, without Stwo."
 
 [features]

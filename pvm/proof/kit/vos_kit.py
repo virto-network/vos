@@ -13,6 +13,10 @@ The kit holds:
   reads (`../fixtures` from its manifest);
 - `conformance/`: the conformance vectors G1–G17 (`spaces.json`) and the
   mutation lists (`mutations.json`), which VOS's reference mock generates;
+- the licence texts, each its path in VOS and its name in the kit: the
+  GPL-3.0 the five crates are under, and the Apache-2.0 beside the
+  MIT text in `vos-pvm-poseidon2`'s `src/packed/` (Plonky3's, MIT or
+  Apache-2.0);
 - this script, `vos_kit.py`;
 - `VENDOR`: the repository (for information), the commit, the tag, the
   Stwo pin and the tree's hash;
@@ -95,6 +99,12 @@ CONFORMANCE: list[tuple[str, str]] = [
     ("node/venue/conformance/mutations.json", "mutations.json"),
 ]
 
+# The licence texts, each its path in VOS and its name in the kit.
+LICENSES: list[tuple[str, str]] = [
+    ("pvm/proof/LICENSE-GPL-3.0", "LICENSE-GPL-3.0"),
+    ("pvm/LICENSE-APACHE-2.0", "LICENSE-APACHE-2.0"),
+]
+
 # The kit's own files, beside the crates.
 VENDOR = "VENDOR"
 KIT_SCRIPT = "vos_kit.py"
@@ -162,6 +172,7 @@ def sources() -> list[str]:
         ["Cargo.toml", SCRIPT, FIXTURES]
         + [directory for _, directory in CRATES]
         + [path for path, _ in CONFORMANCE]
+        + [path for path, _ in LICENSES]
     )
 
 
@@ -446,6 +457,8 @@ def kit(tree: Tree) -> dict[str, bytes]:
         files[f"fixtures/{Path(path).name}"] = tree.files[path]
     for path, name in CONFORMANCE:
         files[f"conformance/{name}"] = tree.read(path)
+    for path, name in LICENSES:
+        files[name] = tree.read(path)
     files[KIT_SCRIPT] = tree.read(SCRIPT)
     # A checkout that converts line endings would change the kit's bytes.
     files[".gitattributes"] = b"* -text\n"

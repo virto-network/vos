@@ -797,8 +797,10 @@ example code, Apache-2.0, and keep that attribution):
   independent gate list to cross-check the compiler.
 - Not reused: the wide interleaved rows, the latches, the per-child verifier.
 
-**Licence plan.** The recursion crates are AGPL-3.0-or-later, as every
-crate of the repository. Each adapted file carries "Adapted from
+**Licence plan.** The recursion prover (`vos-pvm-recair`) is
+AGPL-3.0-or-later, as the repository; the recursion AIR (`vos-pvm-recair-air`),
+which the verifier kit vendors into a chain's runtime, is GPL-3.0-or-later.
+Each adapted file carries "Adapted from
 starkware-libs/proving, crates/<path>, at 916aefb5 (Apache-2.0), modified", a
 `NOTICE` lists the files and the Stwo example, and the modification notice of
 Apache-2.0 §4(b) is kept.

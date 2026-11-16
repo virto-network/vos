@@ -15,7 +15,11 @@ Only the execution-related crates were imported. Consensus, networking,
 storage, RPC, and node code from the upstream repository are not included.
 
 These crates are licensed under the AGPL-3.0-or-later, as the rest of the
-repository (`LICENSE` at its root). Files adapted from third-party code keep
+repository (`LICENSE` at its root), but for the five the verifier kit vendors
+into a chain's runtime (`proof/kit/vos_kit.py`): `vos-anchor`,
+`vos-statement`, `vos-pvm-final-verifier`, `vos-pvm-recair-air` and
+`vos-pvm-poseidon2`, under the GPL-3.0-or-later (`proof/LICENSE-GPL-3.0`),
+which the kit ships with them. Files adapted from third-party code keep
 their notices: `proof/NOTICE` (the Nexus zkVM, Stwo), `proof/recair/NOTICE`
 (StarkWare's proving circuits, Stwo) and `proof/poseidon2/src/packed/`
 (Plonky3), under the Apache-2.0 text in `LICENSE-APACHE-2.0` and Plonky3's
