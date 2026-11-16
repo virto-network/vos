@@ -592,6 +592,7 @@ fn every_ingress_refusal_comes_in_its_check_order() {
     let node = founded.cluster.node(at).unwrap();
     let applied = node.applied(agent).unwrap();
     let entries = node
+        .probes()
         .store()
         .log_range(agent, 1, applied, usize::MAX)
         .unwrap();
@@ -838,7 +839,7 @@ fn a_verified_call_holds_no_large_place_while_it_waits_to_apply() {
     let founded = &founded;
     let free = |at: NodeNumber| {
         let node = founded.cluster.node(at).unwrap();
-        node.credentialed_places_free() == vos_node::CREDENTIALED_BODIES
+        node.probes().credentialed_places_free() == vos_node::CREDENTIALED_BODIES
     };
     let verified = |at: NodeNumber| {
         let node = founded.cluster.node(at).unwrap();

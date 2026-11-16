@@ -117,6 +117,7 @@ fn a_retired_leader_keeps_its_committed_placement() {
     let held = held.unwrap();
     let record = cluster
         .node(leader)
+        .probes()
         .store()
         .agents()
         .unwrap()
@@ -210,6 +211,7 @@ fn a_retirement_cut_short_finishes_at_the_next_start() {
     wait_until("the old epoch is dropped", || {
         cluster
             .node(removed)
+            .probes()
             .store()
             .stale_epochs(agent)
             .unwrap()
@@ -302,7 +304,16 @@ fn a_removed_replica_back_with_its_old_log_disturbs_nothing() {
     cluster.converged(agent);
     cluster.stop(removed);
     let replicas = cluster.replace(leader, agent, &[1, 2, 3], removed, 4);
-    let term = |cluster: &Cluster| cluster.node(leader).store().raft(agent).unwrap().hard.term;
+    let term = |cluster: &Cluster| {
+        cluster
+            .node(leader)
+            .probes()
+            .store()
+            .raft(agent)
+            .unwrap()
+            .hard
+            .term
+    };
     let before = term(&cluster);
     cluster.start(removed);
     retired(cluster.node(removed), agent);
@@ -459,6 +470,7 @@ fn a_replica_retired_twice_keeps_its_first_floor() {
     retired(cluster.node(gone), agent);
     let floor = cluster
         .node(gone)
+        .probes()
         .store()
         .raft(agent)
         .unwrap()
@@ -478,6 +490,7 @@ fn a_replica_retired_twice_keeps_its_first_floor() {
     assert!(
         cluster
             .node(gone)
+            .probes()
             .store()
             .raft(agent)
             .unwrap()
@@ -486,14 +499,33 @@ fn a_replica_retired_twice_keeps_its_first_floor() {
     );
     // The retirement's batch moves the state to a new, empty epoch: once
     // the epoch moves, its floor is written.
-    let epoch = cluster.node(gone).store().snapshot().epoch(agent).unwrap();
+    let epoch = cluster
+        .node(gone)
+        .probes()
+        .store()
+        .snapshot()
+        .epoch(agent)
+        .unwrap();
     cluster.replace(leader, agent, &again, gone, 4);
     retired(cluster.node(gone), agent);
     wait_until("the retirement is written", || {
-        cluster.node(gone).store().snapshot().epoch(agent).unwrap() != epoch
+        cluster
+            .node(gone)
+            .probes()
+            .store()
+            .snapshot()
+            .epoch(agent)
+            .unwrap()
+            != epoch
     });
     assert_eq!(
-        cluster.node(gone).store().raft(agent).unwrap().vote_floor,
+        cluster
+            .node(gone)
+            .probes()
+            .store()
+            .raft(agent)
+            .unwrap()
+            .vote_floor,
         Some(floor),
         "the second retirement lowered the floor"
     );

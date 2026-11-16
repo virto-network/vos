@@ -290,6 +290,7 @@ pub struct Proven {
 /// The proof of `keys`, raw as the map's handler wrote them, from one
 /// storage snapshot, against the map's root: the node of the agent's tree
 /// at its prefix.
+#[cfg(any(test, feature = "dump"))]
 pub(crate) fn prove<K: AsRef<[u8]>>(
     snapshot: &Snapshot,
     agent: AgentId,

@@ -38,6 +38,7 @@ fn the_operator_sets_an_agent_to_report_every_window() {
     let set = || {
         served
             .node
+            .probes()
             .store()
             .snapshot()
             .get(served.agent, &keys::every_window())

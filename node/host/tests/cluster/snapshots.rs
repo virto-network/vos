@@ -22,7 +22,7 @@ fn every_replica_compacts_its_log_as_it_applies() {
     cluster.converged(agent);
     wait_until("every replica compacts", || {
         cluster.running().all(|(_, node)| {
-            let rows = node.store().raft(agent).unwrap();
+            let rows = node.probes().store().raft(agent).unwrap();
             rows.log_start.0 > 20 && rows.log.len() < 20
         })
     });
@@ -47,7 +47,7 @@ fn a_log_compacts_on_its_bytes_and_keeps_a_tail_within_them() {
     // past its start before a compaction is due.
     wait_until("every replica compacts", || {
         cluster.running().all(|(_, node)| {
-            let rows = node.store().raft(agent).unwrap();
+            let rows = node.probes().store().raft(agent).unwrap();
             rows.log_start.0 > 20 && rows.log.len() <= 16
         })
     });
@@ -78,9 +78,15 @@ fn a_follower_behind_the_log_catches_up_by_a_snapshot() {
     cluster.converged(agent);
     let caught_up = cluster.node(follower);
     assert!(log_start(caught_up, agent) > 20, "installed a snapshot");
-    assert_eq!(caught_up.pinned(), cluster.node(leader).pinned());
-    assert!(!caught_up.pinned().is_empty(), "the program it missed");
-    let last = |node: &Node| node.store().snapshot().last_result(agent).unwrap();
+    assert_eq!(
+        caught_up.probes().pinned(),
+        cluster.node(leader).probes().pinned()
+    );
+    assert!(
+        !caught_up.probes().pinned().is_empty(),
+        "the program it missed"
+    );
+    let last = |node: &Node| node.probes().store().snapshot().last_result(agent).unwrap();
     assert_eq!(last(caught_up), last(cluster.node(leader)));
     assert_eq!(cluster.value(follower, agent), total);
     old_epochs_dropped(caught_up, agent);
@@ -149,9 +155,9 @@ fn a_snapshot_stream_outlasting_the_leaders_deadline_goes_on() {
     // Counted once the switch's state is in: a moment after a loaded host
     // shows it.
     wait_until("the switch is counted", || {
-        caught_up.snapshots_installed() > 0
+        caught_up.probes().snapshots_installed() > 0
     });
-    assert_eq!(caught_up.snapshots_installed(), 1, "switched once");
+    assert_eq!(caught_up.probes().snapshots_installed(), 1, "switched once");
     assert_eq!(cluster.value(follower, agent), total);
     // While the follower was stopped, the leader's streams to it fell
     // silent and ended, as many as the stop lasted. Once the follower
@@ -244,9 +250,13 @@ fn a_snapshot_cut_short_is_sent_again() {
     // A stream cut short is dropped once idle for 30 s, if no other
     // replaces it first.
     vos_checker::wait_until("no staged rows are left", STAGED_IDLE, || {
-        cluster
-            .running()
-            .all(|(_, node)| node.store().stale_epochs(agent).unwrap().is_empty())
+        cluster.running().all(|(_, node)| {
+            node.probes()
+                .store()
+                .stale_epochs(agent)
+                .unwrap()
+                .is_empty()
+        })
     });
 }
 
@@ -271,6 +281,7 @@ fn a_snapshot_waits_for_the_programs_it_names() {
     wait_until("the follower stages the snapshot", || {
         !cluster
             .node(follower)
+            .probes()
             .store()
             .stale_epochs(agent)
             .unwrap()
@@ -283,11 +294,11 @@ fn a_snapshot_waits_for_the_programs_it_names() {
         0,
         "switched without the program"
     );
-    assert!(cluster.node(follower).pinned().is_empty());
+    assert!(cluster.node(follower).probes().pinned().is_empty());
     withheld.withhold(false);
     cluster.converged(agent);
     assert_eq!(
-        cluster.node(follower).pinned(),
-        cluster.node(leader).pinned()
+        cluster.node(follower).probes().pinned(),
+        cluster.node(leader).probes().pinned()
     );
 }

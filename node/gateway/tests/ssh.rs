@@ -193,7 +193,7 @@ async fn the_relay_set_is_relayed_and_any_other_kind_refused() {
         answers.next(&mut channel).await,
         Some((Kind::NodeKey as u16, 2, served.node.id().encode()))
     );
-    let asked = served.node.api_frames();
+    let asked = served.node.probes().api_frames();
     // A workflow read's header alone: refused before its body, no node
     // asked.
     let header = vos_api::Header::of(Framing::Stream, Kind::Workflow as u16, 3, 100);
@@ -208,7 +208,7 @@ async fn the_relay_set_is_relayed_and_any_other_kind_refused() {
         Some(FrameError::NotRelayed)
     );
     assert_eq!(answers.next(&mut channel).await, None, "the channel closes");
-    assert_eq!(served.node.api_frames(), asked);
+    assert_eq!(served.node.probes().api_frames(), asked);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -87,6 +87,7 @@ impl Calls {
 
     /// The calls queued in their lanes and not yet answered, with the
     /// duplicates waiting on them.
+    #[cfg(any(test, feature = "dump"))]
     pub(crate) fn in_flight(&self) -> usize {
         lock(&self.lanes)
             .values()

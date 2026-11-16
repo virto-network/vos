@@ -32,7 +32,7 @@ fn terms(cluster: &Cluster, agents: &[AgentId]) -> Vec<u64> {
         .map(|&agent| {
             cluster
                 .running()
-                .map(|(_, node)| node.store().raft(agent).unwrap().hard.term)
+                .map(|(_, node)| node.probes().store().raft(agent).unwrap().hard.term)
                 .max()
                 .unwrap()
         })
@@ -237,6 +237,7 @@ fn a_peer_on_other_lanes_is_refused_whole() {
     let refused = |at: NodeNumber| {
         cluster
             .node(at)
+            .probes()
             .dropped(vos_node::peer::Refusal::OtherLanes)
     };
     wait_until("each side refuses the other", || {

@@ -577,7 +577,7 @@ async fn a_request_naming_another_method_never_reaches_the_node() {
                 (field.to_owned(), Value::Bytes(request(instance, name))),
                 ("proving_ms".to_owned(), Value::from(0u64)),
             ]));
-            let frames = space.node().api_frames();
+            let frames = space.node().probes().api_frames();
             let at = phone.click("Sign in with my device").await;
             let shown = phone
                 .settle(at, &["node's answer", "refused", "Signed in", "Not done"])
@@ -587,7 +587,7 @@ async fn a_request_naming_another_method_never_reaches_the_node() {
                 "{name} as {field}: {shown}"
             );
             assert_eq!(
-                space.node().api_frames(),
+                space.node().probes().api_frames(),
                 frames,
                 "{name} as {field} reached the node"
             );

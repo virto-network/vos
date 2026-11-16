@@ -37,19 +37,24 @@ pub(crate) fn clock() -> WindowClock {
 
 /// The cuts `node` holds of `agent`: each window's version.
 pub(crate) fn cuts(node: &Node, agent: AgentId) -> BTreeMap<u64, u64> {
-    vos_checker::cuts(&node.store().snapshot(), agent)
+    vos_checker::cuts(&node.probes().store().snapshot(), agent)
 }
 
 /// `agent`'s state version on `node`.
 pub(crate) fn version(node: &Node, agent: AgentId) -> u64 {
-    vos_checker::applied(node.store(), agent, &keys::version()).unwrap_or(0)
+    vos_checker::applied(node.probes().store(), agent, &keys::version()).unwrap_or(0)
 }
 
 /// `agent`'s applied index as `node`'s store holds it: the index written
 /// in the commit of its apply. The node's own count of it moves once that
 /// commit returns, so a row an apply wrote can be read before it does.
 pub(crate) fn stored_applied(node: &Node, agent: AgentId) -> u64 {
-    node.store().snapshot().applied(agent).unwrap().unwrap_or(0)
+    node.probes()
+        .store()
+        .snapshot()
+        .applied(agent)
+        .unwrap()
+        .unwrap_or(0)
 }
 
 /// The work results of `agent`'s log on `node` past index `after`, through
@@ -58,7 +63,7 @@ pub(crate) fn results(node: &Node, agent: AgentId, after: u64) -> Vec<(u64, Work
     let through = stored_applied(node, agent);
     (after + 1..=through)
         .filter_map(|index| {
-            let entry = node.store().log_entry(agent, index).unwrap()?;
+            let entry = node.probes().store().log_entry(agent, index).unwrap()?;
             if entry.kind != EntryKind::Result {
                 return None;
             }
@@ -149,7 +154,7 @@ pub(crate) type Settled = (Hash, u64, BTreeMap<Vec<u8>, ([u8; 16], Vec<u8>)>);
 pub(crate) fn settled(node: &Node, agent: AgentId) -> Settled {
     let mut settled = None;
     wait_until("the root built at the agent's version", || {
-        let snapshot = node.store().snapshot();
+        let snapshot = node.probes().store().snapshot();
         let at = version(node, agent);
         let Ok((root, built)) = roots::agent_root(&snapshot, agent) else {
             return false;
@@ -254,7 +259,8 @@ pub(crate) fn ask_in(
             continue;
         }
         wait_until("every replica holds the request", || {
-            node.store()
+            node.probes()
+                .store()
                 .snapshot()
                 .get(agent, &keys::request(window, id))
                 .unwrap()
@@ -267,7 +273,7 @@ pub(crate) fn ask_in(
 /// `agent`'s replicated rows on `node` ([`keys::is_replicated`]) and its
 /// applied index, from one store snapshot.
 pub(crate) fn replicated(node: &Node, agent: AgentId) -> (Option<u64>, Rows) {
-    let snapshot = node.store().snapshot();
+    let snapshot = node.probes().store().snapshot();
     let rows = vos_checker::replicated(&snapshot, agent);
     (snapshot.applied(agent).unwrap(), rows)
 }
@@ -352,7 +358,7 @@ pub(crate) fn delay(clock: &WindowClock) -> u64 {
 /// Whether `node`'s replica of the representative has closed `window`.
 pub(crate) fn closed_on(node: &Node, representative: AgentId, window: u64) -> bool {
     vos_checker::applied::<(u64, Option<AgentId>)>(
-        node.store(),
+        node.probes().store(),
         representative,
         &keys::close_mark(),
     )
@@ -362,7 +368,8 @@ pub(crate) fn closed_on(node: &Node, representative: AgentId, window: u64) -> bo
 /// Whether `representative`'s replica on `node` holds some agent's report
 /// of `window`.
 pub(crate) fn reported_on(node: &Node, representative: AgentId, window: u64) -> bool {
-    node.store()
+    node.probes()
+        .store()
         .snapshot()
         .scan(representative, &representative_asks_of(window), None)
         .next()
@@ -404,7 +411,7 @@ pub(crate) fn rep_root(cluster: &Cluster, representative: AgentId, window: u64) 
             .running()
             .filter(|(_, node)| node.applied(representative).is_some())
             .map(|(_, node)| {
-                roots::cut_root(&node.store().snapshot(), representative, window).unwrap()
+                roots::cut_root(&node.probes().store().snapshot(), representative, window).unwrap()
             })
             .collect();
         let all = built.iter().all(Option::is_some) && !built.is_empty();
@@ -428,8 +435,11 @@ pub(crate) fn ended(cluster: &Cluster, agent: AgentId, id: RequestId) -> Outcome
             .running()
             .filter(|(_, node)| node.applied(agent).is_some())
             .find_map(|(_, node)| {
-                let record: Workflow =
-                    vos_checker::applied(node.store(), agent, &keys::workflow(id.workflow))?;
+                let record: Workflow = vos_checker::applied(
+                    node.probes().store(),
+                    agent,
+                    &keys::workflow(id.workflow),
+                )?;
                 match record.state {
                     WorkflowState::Ended(outcome) => Some(outcome),
                     _ => None,
@@ -477,7 +487,8 @@ pub(crate) fn replica(cluster: &Cluster, agent: AgentId) -> &Node {
 /// Whether `representative`'s replica on `node` holds `agent`'s root at
 /// `window`'s cut.
 pub(crate) fn holds(node: &Node, representative: AgentId, agent: AgentId, window: u64) -> bool {
-    node.store()
+    node.probes()
+        .store()
         .snapshot()
         .get(
             representative,

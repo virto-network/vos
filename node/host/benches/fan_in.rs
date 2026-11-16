@@ -101,7 +101,7 @@ struct Pair {
 
 /// A `u64` of `agent`'s applied state on `node`, 0 when absent.
 fn mark(node: &Node, agent: AgentId, key: &[u8]) -> u64 {
-    vos_checker::mark(node.store(), agent, key)
+    vos_checker::mark(node.probes().store(), agent, key)
 }
 
 /// The messages `pair` sent, those its receiver applied, and those its
@@ -173,10 +173,16 @@ fn counts(nodes: &Nodes, pairs: &[Pair]) -> Counts {
     Counts {
         requests: nodes
             .iter()
-            .map(|node| node.frames_arrived(Class::Requests))
+            .map(|node| node.probes().frames_arrived(Class::Requests))
             .sum(),
-        deliveries: nodes.iter().map(|node| node.messages_sent_across()).sum(),
-        full: nodes.iter().map(|node| node.dropped(Refusal::Full)).sum(),
+        deliveries: nodes
+            .iter()
+            .map(|node| node.probes().messages_sent_across())
+            .sum(),
+        full: nodes
+            .iter()
+            .map(|node| node.probes().dropped(Refusal::Full))
+            .sum(),
         sent,
         applied,
         stats: nodes.iter().map(|node| node.stats()).collect(),

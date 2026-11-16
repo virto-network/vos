@@ -207,6 +207,7 @@ impl Served {
     /// Whether the agent holds `session`.
     fn holds(&self, session: &Session) -> bool {
         self.node
+            .probes()
             .store()
             .snapshot()
             .get(self.agent, &keys::session_index(session))

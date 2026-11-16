@@ -194,9 +194,13 @@ fn an_agent_that_misses_the_close_ends_not_closed() {
     anchoring.set_clocks(&cluster, b0 + 1_000);
     let mut proof: Option<CutProof> = None;
     wait_until("the late agent proves its read at window 0's cut", || {
-        proof = roots::cut_proof(&replica(&cluster, late).store().snapshot(), late, missed)
-            .unwrap()
-            .filter(|proof| proof.window == 0);
+        proof = roots::cut_proof(
+            &replica(&cluster, late).probes().store().snapshot(),
+            late,
+            missed,
+        )
+        .unwrap()
+        .filter(|proof| proof.window == 0);
         proof.is_some()
     });
     let proof = proof.unwrap();
@@ -223,7 +227,7 @@ fn an_agent_that_misses_the_close_ends_not_closed() {
     let mut closed: Option<ClosedRow> = None;
     wait_until("the on-time agent's close", || {
         closed = vos_checker::applied(
-            replica(&cluster, on_time).store(),
+            replica(&cluster, on_time).probes().store(),
             on_time,
             &keys::closed(0),
         );
@@ -304,12 +308,12 @@ fn a_representative_failover_keeps_one_root() {
     cluster.start(old);
     let back = cluster.node(old);
     wait_until("the old leader builds the cut", || {
-        roots::cut_root(&back.store().snapshot(), representative, 0)
+        roots::cut_root(&back.probes().store().snapshot(), representative, 0)
             .unwrap()
             .is_some()
     });
     assert_eq!(
-        roots::cut_root(&back.store().snapshot(), representative, 0)
+        roots::cut_root(&back.probes().store().snapshot(), representative, 0)
             .unwrap()
             .map(|(root, _)| root),
         Some(rep_root)
@@ -367,7 +371,7 @@ fn a_representative_leader_change_before_the_close_sends_it_once() {
     assert_eq!(attests.len(), 1, "resumed once");
     assert_eq!(attests[0].roots, [root]);
     let sent: Option<u64> = vos_checker::applied(
-        replica(&cluster, representative).store(),
+        replica(&cluster, representative).probes().store(),
         representative,
         &keys::pair_out(agent),
     );
@@ -462,7 +466,7 @@ fn only_a_reported_window_is_anchored() {
         std::thread::sleep(Duration::from_secs(2));
     }
     for (_, node) in cluster.running() {
-        let snapshot = node.store().snapshot();
+        let snapshot = node.probes().store().snapshot();
         assert!(
             roots::anchors(&snapshot, representative, None)
                 .unwrap()
@@ -555,7 +559,8 @@ fn a_late_build_closes_the_asks_its_cut_holds() {
     anchoring.set_clocks(&cluster, past_close(&clock, 0));
     wait_until("every replica records the cut of window 0", || {
         replicas().all(|(_, node)| {
-            node.store()
+            node.probes()
+                .store()
                 .snapshot()
                 .get(representative, &keys::cut(0))
                 .unwrap()
@@ -575,7 +580,7 @@ fn a_late_build_closes_the_asks_its_cut_holds() {
         },
     );
     for (_, node) in replicas() {
-        let snapshot = node.store().snapshot();
+        let snapshot = node.probes().store().snapshot();
         assert_eq!(roots::cut_root(&snapshot, representative, 0).unwrap(), None);
     }
 
@@ -583,7 +588,8 @@ fn a_late_build_closes_the_asks_its_cut_holds() {
     let rep_root = rep_root(&cluster, representative, 0);
     let root = stated(&cluster, 0, &rep_root);
     for (_, node) in replicas() {
-        let anchors = roots::anchors(&node.store().snapshot(), representative, None).unwrap();
+        let anchors =
+            roots::anchors(&node.probes().store().snapshot(), representative, None).unwrap();
         assert_eq!(
             anchors.get(&0),
             Some(&root.root),

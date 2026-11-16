@@ -188,7 +188,8 @@ fn rows(cluster: &Cluster, representative: AgentId, window: u64) -> [u8; 32] {
                 .running()
                 .filter(|(_, node)| node.applied(representative).is_some())
                 .map(|(_, node)| {
-                    roots::anchor_of(&node.store().snapshot(), representative, window).unwrap()
+                    roots::anchor_of(&node.probes().store().snapshot(), representative, window)
+                        .unwrap()
                 })
                 .collect();
             root = held.first().copied().flatten();
@@ -332,7 +333,7 @@ fn overtaken() -> (Anchoring, Cluster, AgentId, NodeNumber, [u8; 32], Offers) {
 /// Write `root` as `representative`'s row of window 0 on node `number`, as
 /// an apply bug, a cloned store or a compromise would leave it.
 fn forge_row(cluster: &Cluster, number: NodeNumber, representative: AgentId, root: [u8; 32]) {
-    let store = cluster.node(number).store();
+    let store = cluster.node(number).probes().store();
     let epoch = store.snapshot().epoch(representative).unwrap();
     let mut batch = store.batch();
     let forged = Write {

@@ -13,6 +13,8 @@ mod config;
 mod directory;
 mod error;
 mod open;
+#[cfg(any(test, feature = "dump"))]
+mod probes;
 mod queue;
 mod recording;
 

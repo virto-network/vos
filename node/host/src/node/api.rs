@@ -7,7 +7,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use vos_pvm::pool::CodeHash;
 use vos_raft::Role;
 use vos_wire::Decode;
 use vos_wire::batch::{Admin, Message, Request};
@@ -20,7 +19,6 @@ use vos_wire::result::Outcome;
 use super::{CallError, Error, Inner, Node, Pending, ReplaceError, Reply};
 use crate::lock;
 use crate::queries::Asked;
-use crate::store::Fjall;
 
 impl Inner {
     /// This node's replica of `agent`, if it runs one: its Raft state, or
@@ -72,55 +70,6 @@ impl Node {
     /// The node's identity, its public key, which its TLS presents.
     pub fn id(&self) -> NodeId {
         self.inner.node_id
-    }
-
-    /// Requests the node API's socket and QUIC endpoint brought.
-    pub fn api_frames(&self) -> u64 {
-        self.api.frames.load(Ordering::Relaxed)
-    }
-
-    /// The node API's places for credentialed calls' large bodies free
-    /// now, from the socket and QUIC together.
-    pub fn credentialed_places_free(&self) -> usize {
-        self.api.credentialed_free()
-    }
-
-    /// The calls this node queued in their lanes as their agent's leader
-    /// and has not answered yet, with the duplicates waiting on them.
-    pub fn calls_in_flight(&self) -> usize {
-        self.inner.calls.in_flight()
-    }
-
-    /// Snapshots this node's groups switched to.
-    pub fn snapshots_installed(&self) -> u64 {
-        self.inner.counters.installed.load(Ordering::Relaxed)
-    }
-
-    /// Snapshot streams this node started to its followers.
-    pub fn snapshots_streamed(&self) -> u64 {
-        self.inner.counters.streamed.load(Ordering::Relaxed)
-    }
-
-    /// Messages this node sent toward agents on other nodes, again on
-    /// rounds included.
-    pub fn messages_sent_across(&self) -> u64 {
-        self.inner.counters.sent_across.load(Ordering::Relaxed)
-    }
-
-    /// Messages this node relayed to their agent's leader.
-    pub fn messages_relayed(&self) -> u64 {
-        self.inner.counters.relayed.load(Ordering::Relaxed)
-    }
-
-    /// Frames of `class` that arrived here from other nodes; none of
-    /// liveness, which are not counted.
-    pub fn frames_arrived(&self, class: vos_net::Class) -> u64 {
-        self.inner.counters.arrived[class as usize].load(Ordering::Relaxed)
-    }
-
-    /// Arrivals this node dropped for `refusal`.
-    pub fn dropped(&self, refusal: crate::peer::Refusal) -> u64 {
-        self.inner.drops.get(refusal)
     }
 
     /// Create an agent running the node's agent program, replicated on
@@ -374,45 +323,6 @@ impl Node {
     /// route reports them.
     pub fn stats(&self) -> vos_wire::ingress::Stats {
         self.inner.stats()
-    }
-
-    /// The node's storage, to read applied state and the log.
-    pub fn store(&self) -> &Fjall {
-        &self.inner.store
-    }
-
-    /// The latest root of `agent`'s committed map `map`, the node of the
-    /// agent's tree at the map's prefix, the state version it holds, and a
-    /// proof of `keys` against it, from one storage snapshot. Refused as
-    /// building while a build is part-way through the tree and a write to
-    /// the map waits.
-    pub fn prove<K: AsRef<[u8]>>(
-        &self,
-        agent: AgentId,
-        map: vos_wire::ids::MapId,
-        keys: &[K],
-    ) -> Result<crate::roots::Proven, crate::roots::Error> {
-        crate::roots::prove(&self.inner.store.snapshot(), agent, map, keys)
-    }
-
-    /// The blobs some agent keeps here: the programs its instances run.
-    pub fn pinned(&self) -> Vec<[u8; 32]> {
-        self.inner.blobs.pinned().unwrap_or_default()
-    }
-
-    /// Whether the blob store holds `hash`.
-    pub fn stores_blob(&self, hash: &[u8; 32]) -> bool {
-        self.inner.blobs.contains(hash).unwrap_or(false)
-    }
-
-    /// Whether the machine pool holds `program`: instances of it run
-    /// without loading it first.
-    pub fn pooled(&self, program: &[u8; 32]) -> bool {
-        self.inner
-            .machines
-            .pool
-            .program(&CodeHash(*program))
-            .is_some()
     }
 
     /// Serve the node API on a unix socket at `path`, its file given

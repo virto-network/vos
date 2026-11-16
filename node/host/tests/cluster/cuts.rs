@@ -203,7 +203,8 @@ fn a_leaders_clock_jumping_ahead_cuts_every_window_it_passes_at_one_version() {
             cuts(cluster.node(number), agent) == jumped
         });
     }
-    let mark: u64 = vos_checker::applied(node.store(), agent, &keys::batch_time()).unwrap();
+    let mark: u64 =
+        vos_checker::applied(node.probes().store(), agent, &keys::batch_time()).unwrap();
     assert!(mark >= ahead, "the mark at the leader's clock");
     cluster.offsets[usize::from(leader) - 1].store(0, Ordering::SeqCst);
     stays("nothing more", Duration::from_secs(1), || {
@@ -211,8 +212,12 @@ fn a_leaders_clock_jumping_ahead_cuts_every_window_it_passes_at_one_version() {
     });
     for number in 1..=3 {
         assert_eq!(cuts(cluster.node(number), agent), jumped, "nothing more");
-        let held: u64 =
-            vos_checker::applied(cluster.node(number).store(), agent, &keys::batch_time()).unwrap();
+        let held: u64 = vos_checker::applied(
+            cluster.node(number).probes().store(),
+            agent,
+            &keys::batch_time(),
+        )
+        .unwrap();
         assert!(held >= mark, "batch time never goes back");
     }
 }
@@ -246,10 +251,10 @@ fn a_replica_down_across_a_cut_holds_its_proofs_on_return() {
         let node = cluster.node(leading);
         let mut proof = None;
         wait_until("the leader's replica builds the cut", || {
-            proof = roots::cut_proof(&node.store().snapshot(), agent, id).unwrap();
+            proof = roots::cut_proof(&node.probes().store().snapshot(), agent, id).unwrap();
             proof.is_some()
         });
-        let root = roots::cut_root(&node.store().snapshot(), agent, 0).unwrap();
+        let root = roots::cut_root(&node.probes().store().snapshot(), agent, 0).unwrap();
         if by_snapshot {
             cluster.compacted_past(agent, stopped_at);
         }
@@ -257,11 +262,11 @@ fn a_replica_down_across_a_cut_holds_its_proofs_on_return() {
         let back = cluster.node(follower);
         wait_until("the replica returns and builds the cut", || {
             back.applied(agent) >= cluster.node(leading).applied(agent)
-                && roots::cut_proof(&back.store().snapshot(), agent, id)
+                && roots::cut_proof(&back.probes().store().snapshot(), agent, id)
                     .unwrap()
                     .is_some()
         });
-        let snapshot = back.store().snapshot();
+        let snapshot = back.probes().store().snapshot();
         assert_eq!(roots::cut_proof(&snapshot, agent, id).unwrap(), proof);
         assert_eq!(roots::cut_root(&snapshot, agent, 0).unwrap(), root);
         if by_snapshot {
@@ -301,12 +306,12 @@ fn a_leader_change_between_a_cut_and_its_close_keeps_its_proofs() {
             let node = cluster.node(number);
             let mut proof = None;
             wait_until("every replica builds the cut and its proof", || {
-                proof = roots::cut_proof(&node.store().snapshot(), agent, id).unwrap();
+                proof = roots::cut_proof(&node.probes().store().snapshot(), agent, id).unwrap();
                 proof.is_some()
             });
             assert_eq!(cuts(node, agent).get(&0), Some(&at_cut), "cut(0)");
             assert_eq!(
-                roots::cut_root(&node.store().snapshot(), agent, 0).unwrap(),
+                roots::cut_root(&node.probes().store().snapshot(), agent, 0).unwrap(),
                 Some((root, at_cut))
             );
             proof.unwrap()
@@ -352,10 +357,11 @@ fn a_leader_change_between_a_cut_and_its_close_keeps_its_proofs() {
         wait_until("the replica applies the new leader's writes", || {
             node.applied(agent) >= cluster.node(new).applied(agent)
         });
-        let held = roots::cut_proof(&node.store().snapshot(), agent, id).unwrap();
+        let held = roots::cut_proof(&node.probes().store().snapshot(), agent, id).unwrap();
         assert_eq!(held, Some(proof.clone()), "node {number} keeps the proof");
         assert!(
-            node.store()
+            node.probes()
+                .store()
                 .snapshot()
                 .get(agent, &keys::request(0, id))
                 .unwrap()
@@ -369,14 +375,14 @@ fn a_leader_change_between_a_cut_and_its_close_keeps_its_proofs() {
         restarted.applied(agent) >= cluster.node(new).applied(agent)
     });
     assert_eq!(
-        roots::cut_proof(&restarted.store().snapshot(), agent, id).unwrap(),
+        roots::cut_proof(&restarted.probes().store().snapshot(), agent, id).unwrap(),
         Some(proof)
     );
     same_state(&cluster, agent);
     wait_until("every replica builds the same root", || {
         let roots: Vec<_> = cluster
             .running()
-            .map(|(_, node)| roots::agent_root(&node.store().snapshot(), agent).ok())
+            .map(|(_, node)| roots::agent_root(&node.probes().store().snapshot(), agent).ok())
             .collect();
         roots.iter().all(Option::is_some) && roots.windows(2).all(|pair| pair[0] == pair[1])
     });
@@ -421,7 +427,7 @@ fn a_read_at_a_cut_is_served_by_its_leader() {
     let mut ended = None;
     wait_until("the read is served and its workflow ends", || {
         let record: Option<vos_wire::records::Workflow> =
-            vos_checker::applied(node.store(), agent, &keys::workflow(id.workflow));
+            vos_checker::applied(node.probes().store(), agent, &keys::workflow(id.workflow));
         ended = record.and_then(|record| match record.state {
             vos_wire::records::WorkflowState::Ended(outcome) => Some(outcome),
             _ => None,
@@ -459,7 +465,7 @@ fn a_read_at_a_cut_is_served_by_its_leader() {
     assert_eq!(cuts(node, agent).get(&0), Some(&at_cut));
     for (_, node) in cluster.running() {
         wait_until("every replica answers the request", || {
-            let snapshot = node.store().snapshot();
+            let snapshot = node.probes().store().snapshot();
             snapshot
                 .get(agent, &keys::request(0, id))
                 .unwrap()

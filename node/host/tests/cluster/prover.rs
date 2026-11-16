@@ -228,7 +228,8 @@ fn statement(attest: &Attest) -> Statement {
 /// Whether every running replica of `agent` holds statement `id` recorded.
 fn recorded(cluster: &Cluster, agent: AgentId, id: &StatementId) -> bool {
     cluster.running().all(|(_, node)| {
-        node.store()
+        node.probes()
+            .store()
             .snapshot()
             .get(agent, &keys::proven(0, &id.0))
             .unwrap()
@@ -315,6 +316,7 @@ fn a_leader_change_submits_a_recorded_statement_once() {
     assert_eq!(proofs.made.load(Ordering::SeqCst), 2);
     for (_, node) in cluster.running() {
         let record = node
+            .probes()
             .store()
             .snapshot()
             .get(agent, &keys::attested(0, &attest.digest()))
@@ -370,7 +372,8 @@ fn a_record_read_after_its_proof_is_recorded_is_proved_again() {
     for &follower in &followers {
         let node = cluster.node(follower);
         wait_until("the follower's worker holds the statement proved", || {
-            node.store()
+            node.probes()
+                .store()
                 .prover_jobs()
                 .unwrap()
                 .iter()
@@ -405,7 +408,8 @@ fn a_record_applied_during_a_proof_is_proved() {
     let (agents, first) = stated(&cluster, &anchoring);
     let agent = agents.reader;
     let proving = |node: &Node| {
-        node.store()
+        node.probes()
+            .store()
             .prover_jobs()
             .unwrap()
             .iter()
@@ -423,6 +427,7 @@ fn a_record_applied_during_a_proof_is_proved() {
     cluster.compacted_past(agent, index);
     for (_, node) in cluster.running() {
         let held = node
+            .probes()
             .store()
             .snapshot()
             .get(agent, &keys::attested(1, &second.digest()))
@@ -494,6 +499,7 @@ fn a_snapshot_installed_replica_proves_a_queued_statement() {
     wait_until("the follower installs a snapshot and holds the job", || {
         log_start(back, agent) > stopped_at
             && back
+                .probes()
                 .store()
                 .prover_jobs()
                 .unwrap()

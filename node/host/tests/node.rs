@@ -94,14 +94,20 @@ fn value(node: &Node, programs: &Programs, agent: AgentId) -> u64 {
 }
 
 fn applied(node: &Node, agent: AgentId) -> u64 {
-    node.store().snapshot().applied(agent).unwrap().unwrap_or(0)
+    node.probes()
+        .store()
+        .snapshot()
+        .applied(agent)
+        .unwrap()
+        .unwrap_or(0)
 }
 
 /// The work results `agent` applied: its batches, not its leaders' no-ops.
 fn results(node: &Node, agent: AgentId) -> usize {
     (1..=applied(node, agent))
         .filter(|index| {
-            node.store()
+            node.probes()
+                .store()
                 .log_entry(agent, *index)
                 .unwrap()
                 .is_some_and(|entry| entry.kind == EntryKind::Result)
@@ -111,10 +117,14 @@ fn results(node: &Node, agent: AgentId) -> usize {
 
 /// `agent` has no unacknowledged message to `to`, and acknowledged `sent`.
 fn outbox_cleared(node: &Node, agent: AgentId, to: AgentId, sent: u64) -> bool {
-    vos_checker::applied::<u64>(node.store(), agent, &keys::acked(to)) == Some(sent)
+    vos_checker::applied::<u64>(node.probes().store(), agent, &keys::acked(to)) == Some(sent)
         && (1..=sent).all(|sequence| {
-            vos_checker::applied::<Vec<u8>>(node.store(), agent, &keys::outbox(to, sequence))
-                .is_none()
+            vos_checker::applied::<Vec<u8>>(
+                node.probes().store(),
+                agent,
+                &keys::outbox(to, sequence),
+            )
+            .is_none()
         })
 }
 
@@ -156,7 +166,7 @@ fn calls_apply_and_survive_a_restart() {
         before,
         "a query never enters the log"
     );
-    let entry = node.store().log_entry(agent, before).unwrap();
+    let entry = node.probes().store().log_entry(agent, before).unwrap();
     assert!(entry.is_some(), "each applied batch is in the log");
     let unknown = smol::block_on(node.call(AgentId(99), session.request(increment, 1u64)));
     assert_eq!(unknown, Err(CallError::NoAgent));
@@ -378,7 +388,7 @@ fn agents_exchange_messages_and_acks_clear_outboxes() {
         outbox_cleared(&node, sender, target, 2)
     });
     assert_eq!(
-        vos_checker::applied::<u64>(node.store(), target, &keys::pair_in(sender)),
+        vos_checker::applied::<u64>(node.probes().store(), target, &keys::pair_in(sender)),
         Some(2)
     );
 }
@@ -524,7 +534,7 @@ fn redelivery_while_the_sender_sends_more_applies_each_once() {
         outbox_cleared(&node, SENDER, TARGET, 4)
     });
     assert_eq!(
-        vos_checker::applied::<u64>(node.store(), TARGET, &keys::pair_in(SENDER)),
+        vos_checker::applied::<u64>(node.probes().store(), TARGET, &keys::pair_in(SENDER)),
         Some(4)
     );
 }
@@ -566,7 +576,7 @@ fn a_gap_is_dropped_unacknowledged_until_it_fills() {
         value(&node, &programs, target) == 21
     });
     wait_until("and are acknowledged", || {
-        vos_checker::applied::<u64>(node.store(), sender, &keys::acked(target)).is_some()
+        vos_checker::applied::<u64>(node.probes().store(), sender, &keys::acked(target)).is_some()
             || applied(&node, sender) > leading
     });
 }

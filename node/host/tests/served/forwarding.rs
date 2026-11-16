@@ -158,7 +158,7 @@ fn a_leader_whose_clock_trails_times_its_batches_at_the_agents() {
         .with_routes(cluster.routes());
     let batch_time = || {
         let node = cluster.node(leader).unwrap();
-        vos_checker::applied::<u64>(node.store(), agent, &keys::batch_time()).unwrap()
+        vos_checker::applied::<u64>(node.probes().store(), agent, &keys::batch_time()).unwrap()
     };
     let offset = &cluster.slot(leader).offset;
     offset.store(30_000, Ordering::SeqCst);
@@ -216,7 +216,7 @@ fn a_resend_of_a_queued_first_call_joins_it_past_the_skew() {
         let node = cluster.node(leader).unwrap();
         // Joined, or answered at once: then its answer fails the test.
         wait_until("the resend joins the first", ANSWERED, || {
-            node.calls_in_flight() == 2 || second.is_finished()
+            node.probes().calls_in_flight() == 2 || second.is_finished()
         });
         drop(node);
         drop(closed);

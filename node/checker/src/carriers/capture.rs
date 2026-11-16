@@ -367,6 +367,7 @@ pub fn node_carriers(
         );
     }
     let jobs: Vec<u8> = node
+        .probes()
         .store()
         .prover_jobs()
         .unwrap()
@@ -377,7 +378,7 @@ pub fn node_carriers(
     audit.carrier(
         format!("node {number}: the store's rows"),
         reach,
-        store(node.store()),
+        store(node.probes().store()),
     );
 }
 
@@ -385,7 +386,7 @@ pub fn node_carriers(
 fn log_entries(node: &Node, agent: AgentId) -> Vec<u8> {
     let through = node.applied(agent).unwrap_or(0);
     (1..=through)
-        .filter_map(|index| node.store().log_entry(agent, index).ok().flatten())
+        .filter_map(|index| node.probes().store().log_entry(agent, index).ok().flatten())
         .flat_map(|entry| entry.body)
         .collect()
 }
@@ -393,10 +394,16 @@ fn log_entries(node: &Node, agent: AgentId) -> Vec<u8> {
 /// The work results of `agent`'s log on `node`, through its applied index
 /// in the store, each encoded.
 fn work_results(node: &Node, agent: AgentId) -> Vec<u8> {
-    let through = node.store().snapshot().applied(agent).unwrap().unwrap_or(0);
+    let through = node
+        .probes()
+        .store()
+        .snapshot()
+        .applied(agent)
+        .unwrap()
+        .unwrap_or(0);
     (1..=through)
         .filter_map(|index| {
-            let entry = node.store().log_entry(agent, index).unwrap()?;
+            let entry = node.probes().store().log_entry(agent, index).unwrap()?;
             if entry.kind != EntryKind::Result {
                 return None;
             }

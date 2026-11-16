@@ -28,7 +28,8 @@ use crate::common::{
 /// transform is the field's, whichever the SDK's default.
 fn entries(node: &Node, agent: AgentId) -> MapId {
     let tag = table_tag("entries");
-    node.store()
+    node.probes()
+        .store()
         .snapshot()
         .scan(agent, &keys::instance_committed(COUNTER), None)
         .find_map(|row| {
@@ -69,13 +70,13 @@ fn write(cluster: &Cluster, agent: AgentId, sequences: std::ops::RangeInclusive<
 
 /// The agent's state version on `node`.
 fn version(node: &Node, agent: AgentId) -> u64 {
-    vos_checker::applied(node.store(), agent, &keys::version()).unwrap_or(0)
+    vos_checker::applied(node.probes().store(), agent, &keys::version()).unwrap_or(0)
 }
 
 /// The map's root on `node`, once built at the agent's version with no key
 /// left dirty.
 fn settled(node: &Node, agent: AgentId) -> Option<(Hash, u64)> {
-    let snapshot = node.store().snapshot();
+    let snapshot = node.probes().store().snapshot();
     let at = version(node, agent);
     let dirty = snapshot
         .scan(agent, &keys::dirty_prefix(), None)
@@ -93,7 +94,7 @@ fn settled(node: &Node, agent: AgentId) -> Option<(Hash, u64)> {
 /// present and absent keys verifies.
 fn check(node: &Node, agent: AgentId, root: Hash) {
     let map = entries(node, agent);
-    let snapshot = node.store().snapshot();
+    let snapshot = node.probes().store().snapshot();
     let tree = AgentStore::open(&snapshot, agent).unwrap();
     let prefix = keys::committed_rows(&map);
     let mut leaves = Vec::new();
@@ -124,7 +125,7 @@ fn check(node: &Node, agent: AgentId, root: Hash) {
     let stored = |prefix: Vec<u8>| snapshot.scan(agent, &prefix, None).count();
     assert_eq!(stored(keys::seed_prefix()), 0, "seed rows left");
     let asked: Vec<Vec<u8>> = (0..320u64).map(|key| key.to_be_bytes().to_vec()).collect();
-    let proven = node.prove(agent, map, &asked).unwrap();
+    let proven = node.probes().prove(agent, map, &asked).unwrap();
     assert_eq!(proven.root, root);
     let claims: Vec<_> = proven
         .leaves
@@ -203,7 +204,7 @@ fn a_failed_build_is_tried_again() {
     write(&cluster, agent, 1..=8);
     same_root(&cluster, agent, &[1]);
     let node = cluster.node(1);
-    let store = node.store();
+    let store = node.probes().store();
     let built = store
         .snapshot()
         .get(agent, &keys::built())

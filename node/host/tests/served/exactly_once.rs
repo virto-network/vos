@@ -182,7 +182,11 @@ pub(crate) fn exactly_once(
     let across: u64 = (1..=NODES)
         .map(|number| {
             cluster.slot(number).sent_across.load(Ordering::SeqCst)
-                + cluster.node(number).unwrap().messages_sent_across()
+                + cluster
+                    .node(number)
+                    .unwrap()
+                    .probes()
+                    .messages_sent_across()
         })
         .sum();
     println!("messages sent across nodes: {across}");
@@ -190,7 +194,7 @@ pub(crate) fn exactly_once(
         (1..=NODES)
             .map(|number| {
                 cluster.slot(number).installed.load(Ordering::SeqCst)
-                    + cluster.node(number).unwrap().snapshots_installed()
+                    + cluster.node(number).unwrap().probes().snapshots_installed()
             })
             .sum()
     };
@@ -268,7 +272,7 @@ fn check_tours(
         let forwards = forwarded[at] / 5;
         for number in 1..=NODES {
             let node = cluster.node(number).unwrap();
-            let mark = |agent, key: &[u8]| vos_checker::mark(node.store(), agent, key);
+            let mark = |agent, key: &[u8]| vos_checker::mark(node.probes().store(), agent, key);
             let mut checked = Err(String::new());
             wait_until("every replica holds every tour's effects", ANSWERED, || {
                 checked = (|| {
@@ -302,7 +306,14 @@ fn check_tours(
                 "every tour started once"
             );
             let pins = keys::workflow_pins_prefix();
-            assert_eq!(node.store().snapshot().scan(agent, &pins, None).count(), 0);
+            assert_eq!(
+                node.probes()
+                    .store()
+                    .snapshot()
+                    .scan(agent, &pins, None)
+                    .count(),
+                0
+            );
         }
     }
     messages
@@ -330,7 +341,7 @@ fn check_forwards(
         let messages = sent[at] / 5 + toured[at];
         for number in 1..=NODES {
             let node = cluster.node(number).unwrap();
-            let mark = |agent, key: &[u8]| vos_checker::mark(node.store(), agent, key);
+            let mark = |agent, key: &[u8]| vos_checker::mark(node.probes().store(), agent, key);
             let counted = |agent, instance| query(&node, agent, instance, value);
             let want = (
                 Ok(Outcome::Done(total.encode())),
@@ -346,7 +357,8 @@ fn check_forwards(
                     counted(next_agent, INBOX),
                     mark(client.agent, &keys::acked(next_agent)),
                     mark(client.agent, &keys::pair_out(next_agent)),
-                    node.store()
+                    node.probes()
+                        .store()
                         .snapshot()
                         .scan(client.agent, &keys::outbox_prefix(), None)
                         .count(),

@@ -42,7 +42,7 @@ fn install_request(served: &Served, authorization: &str) -> String {
 #[test]
 fn install_size_bodies_are_bounded_and_refused_from_their_heads() {
     let served = Served::start(PerAddress::default());
-    let before = served.node.api_frames();
+    let before = served.node.probes().api_frames();
     let held: Vec<TcpStream> = (0..vos_http::LARGE)
         .map(|_| {
             let mut stream = TcpStream::connect(served.front.address).unwrap();
@@ -92,7 +92,7 @@ fn install_size_bodies_are_bounded_and_refused_from_their_heads() {
             )))
         )
     );
-    assert_eq!(served.node.api_frames(), before, "no node asked");
+    assert_eq!(served.node.probes().api_frames(), before, "no node asked");
     // A place given back is taken again.
     drop(held);
     std::thread::sleep(Duration::from_millis(500));
@@ -117,16 +117,16 @@ fn install_size_bodies_are_bounded_and_refused_from_their_heads() {
 #[test]
 fn a_refusal_for_size_never_reaches_the_node() {
     let served = Served::start(PerAddress::default());
-    let before = served.node.api_frames();
+    let before = served.node.probes().api_frames();
     let path = format!("/agents/{}/install", served.agent.0);
     let header = format!(
         "POST {path} HTTP/1.1\r\nHost: node\r\nContent-Length: {}\r\n\r\n",
         vos_wire::abi::cap::MAX_ELF + vos_api::ENVELOPE + 1
     );
     assert_eq!(exchange(served.front.address, header.as_bytes()).0, 413);
-    assert_eq!(served.node.api_frames(), before);
+    assert_eq!(served.node.probes().api_frames(), before);
     let (status, body, _) = exchange(served.front.address, &request("GET", "/time", &[], b""));
     assert_eq!(status, 200);
     assert_eq!(u64::decode_exact(&body), Some(served.now()));
-    assert_eq!(served.node.api_frames(), before + 1);
+    assert_eq!(served.node.probes().api_frames(), before + 1);
 }
