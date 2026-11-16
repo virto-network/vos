@@ -3,8 +3,8 @@
 //! limits per address and leader-aware routing; with the `ssh` feature,
 //! s4's SSH port and its `vos-api` subsystem, serving the screens of an
 //! application built on this library (`ssh::App`); with the `tor`
-//! feature, an onion service in process serving the same SSH and HTTP and
-//! nothing else (`light-node.md` §6.1). It holds no authority: every
+//! feature, an onion service in process serving the same SSH and nothing
+//! else (`light-node.md` §6.1). It holds no authority: every
 //! signature, proof and check is a node's.
 
 pub mod caps;

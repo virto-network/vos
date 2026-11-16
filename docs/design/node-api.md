@@ -59,7 +59,7 @@ run. Everything here is built.
 - **The transport mark** [decided, `light-node.md` §3.3, E17, E22]: the
   transport a gateway received a request on, which it writes on every
   frame it relays (`vos_api::Mark`): 1, clearnet, from its HTTP and SSH
-  ports; 2, onion, from its onion service's own HTTP server and SSH port
+  ports; 2, onion, from its onion service's own SSH port
   (`light-node.md` §6.1, §6 below). A
   relay never passes a client's mark on: the `vos-api` subsystem relays
   each frame anew under its port's mark. Every other sender (a local
@@ -454,18 +454,21 @@ could replay, and a relay keeps nothing it can reuse.
     client facility share it. The multiplexed client only queues a whole
     frame; its task writes it, so a request cancelled at any point leaves
     no part of a frame on a stream others share.
-  - `vos-http` (`node/http`): the HTTP/1.1 server (runtime-neutral: an
-    accept stream and a spawn function), the public TLS, and the route
-    table (path parsing, `status`, the operator header, the answer's HTTP
-    form). The gateway imports it; so does the node's client, for HTTP to
-    a gateway. The node serves no HTTP.
+  - `vos-http` (`node/http`): the request types, the public TLS, the
+    route table (path parsing, `status`, the operator header, the
+    answer's HTTP form) and its inverse (`routes::path`, a kind and its
+    frame body as a route), and behind its `server` feature the HTTP/1.1
+    server on tokio. The gateway serves it; the node's client reads the
+    routes alone, for HTTP to a gateway, and the node serves no HTTP. The
+    client's requests are a kind and its body whatever its transport: the
+    node API sends the frame as it is, a gateway's HTTP the route
+    `routes::path` gives it.
   - `vos-gateway` (`node/gateway`), a library and the binary
     `vos-gateway`, depending on `vos-api`, `vos-http`, `vos-wire`,
     `vos-net`'s TLS builders and `s4-server`, never on the node.
 - **Runtime:** tokio. s4-server is tokio and russh and installs no
   runtime; the binary builds a multi-threaded tokio runtime, serves HTTP
-  through `tokio_util::compat` over the runtime-neutral server, and dials
-  nodes with quinn's tokio runtime. One runtime, no bridge; the codec is
+  on it, and dials nodes with quinn's tokio runtime. One runtime, no bridge; the codec is
   sans-IO, so the smol node and the tokio gateway share it.
 - **HTTP:** `Content-Length` bodies only, keep-alive, 16 KiB heads, 30 s
   idle, 60 s a request, plain on loopback or TLS 1.3 (a certificate for
@@ -510,7 +513,9 @@ could replay, and a relay keeps nothing it can reuse.
   one); its key file `gateway.key` (its QUIC client key, which the nodes
   list in `gateways`, and the key its own-key HTTPS presents); the HTTP
   listener and public TLS from PEM files or its own key; the per-address
-  limits; the SSH port, host key and limits; `app.key`.
+  limits; the SSH port and host key; the onion. A section the build
+  cannot serve (`ssh` without the `ssh` feature, `[onion]` without
+  `tor`) or an onion with no SSH port is refused at start.
 - **Leader-aware routing:** a request goes to the agent's leader as last
   learned (`Call`, `Credentialed`), any upstream (reads), or the one node
   it is signed for (operator kinds, by the envelope's `node`, never
@@ -575,12 +580,16 @@ could replay, and a relay keeps nothing it can reuse.
   The subsystem runs under s4's rule for channel input: the SSH loop's
   `data` callback never awaits, its queue `try_send`s and closes the
   connection when full.
-- **The s4 app's client key:** `app.key`, an ordinary VOS client key
-  apart from `gateway.key`, with which the gateway's s4 app sends the
-  claims (`claim(member)`, `open`) of members with no key of their
-  own; its authority is the registrar's invitations, which name the
-  digests. Its calls run in one session per agent, so the app sends one
-  claim at a time to an agent, in order.
+- **An s4 application on the SSH port:** `vos-gateway` serves a
+  placeholder screen; an application is a program built on the
+  `vos_gateway` library, handing its screens and host services to the SSH
+  port through `ssh::App` (`ssh::serve(config, gateway, port, app, …)`,
+  `served::onion(…, app)`), the port keeping its host key, limits,
+  anonymous policy and `vos-api` subsystem. The demo
+  (`node/gateway/demo`) is one: its own client key (`app.key`, apart
+  from `gateway.key`) sends the claims (`claim(member)`, `open`) of
+  members with no key of their own, its authority the registrar's
+  invitations, one session per agent, one claim at a time, in order.
 - **s4 as a dependency:** a git dependency on codeberg's `Virto/s4`,
   pinned by rev from its `vos` branch, behind the gateway's `ssh`
   feature; s4's crates ask a newer stable Rust than the workspace's
@@ -588,12 +597,14 @@ could replay, and a relay keeps nothing it can reuse.
   (`just test-gateway-ssh`).
 - **The onion service** [decided, `light-node.md` §6.1, §6.6, E23]:
   `[onion]` in the gateway's file. Its streams arrive on rendezvous
-  circuits for virtual port 22 or 80, anything else refused `DONE`. Port
-  80 is the gateway's own HTTP server, plain inside the onion, marking
-  onion; port 22, with an SSH port, the onion's own SSH server marking
-  onion, the same screens (the demo's, when the file names it, its claims
-  marked onion) and `vos-api` subsystem as the SSH port, each stream
-  handed to s4-server with its circuit's address. A circuit counts as an address of its own,
+  circuits for virtual port 22, anything else refused `DONE`: the onion
+  serves SSH alone (E23), so the file must name an SSH port. Port 22 is
+  the onion's own SSH server marking onion, the same screens (an
+  application's, its claims marked onion) and `vos-api` subsystem as the
+  SSH port, each stream handed to s4-server with its circuit's address.
+  HTTP is the clearnet's: its clients are VOS's own tools (`vos`, the
+  keeper, the tests) and future web clients; no client reaches a node
+  over HTTP anonymously. A circuit counts as an address of its own,
   `fd76:6f73:<circuit>::/64`, each stream a port of it: 4 connections at
   once, 20 requests a second with a burst of 40; 8 streams at once a
   circuit (arti's `max_concurrent_streams_per_circuit` too), 1,024
@@ -668,11 +679,11 @@ could replay, and a relay keeps nothing it can reuse.
 | 16 | `api_connections` refused at accept (the socket) and at the handshake (QUIC); the 60 s frame deadline on both; a stale socket file replaced, and a twin refused by the lock | node |
 | 17 | the gateway's 413 never reaching the node (its count of API frames unchanged) | gateway |
 | 18 | an agent's admission: an unknown key's 10^4 session attempts, each a session of its own with no valid signature, all `UnknownKey`, the node's verifications and the agent's applied index unchanged; a key admitted by another agent's message refused until applied, then its session created; a key revoked keeping its session and creating no other; every kind that reads an onion-only agent refused unmarked and clearnet, over the socket and QUIC, before any verification; the installs that would leave no declaring actor failing `Admission` | node |
-| 19 | the mark on the relay path: an HTTP port marking clearnet and one marking onion in front of the onion-only agent, the clearnet's call `OnionOnly`, the onion's `UnknownKey` then run; the `vos-api` subsystem relaying an onion-marked query under its clearnet port's mark (`OnionOnly`) and under an onion port's (answered) | gateway |
+| 19 | the mark on the relay path: an HTTP port marking clearnet and the relay marking onion in front of the onion-only agent, the clearnet's call `OnionOnly`, the onion's `UnknownKey` then run; the `vos-api` subsystem relaying an onion-marked query under its clearnet port's mark (`OnionOnly`) and under an onion port's (answered) | gateway |
 | 20 | the codec: the mark pinned, each read back, an unknown one `UnknownMark` from the header; the fuzz target's frames written again being the bytes read | `vos-api` |
 | 21 | a space's own ask of the mark: proven calls refused unmarked and clearnet before any proof is read while key-signed queries are answered; an onion-only space refusing every read of an agent off the onion, an agent's record open | node |
 | 22 | a flood of junk proven calls, a device proof's size each, from eight connections through a port capped as the onion's: at most its proven calls held at once behind it, the rest waiting with their bodies unread, every place given back; a connection past its own answered `Busy` from the header and closed; a member's queries, a session's call and the member's own proven call on another connection answered meanwhile | gateway |
-| 23 | the onion's streams: a circuit one address and each stream a port of it, the circuits' and streams' caps; HTTP and SSH streams each at its server's listener with its circuit's address, other ports refused; SSH streams on circuits serving the screens and the `vos-api` subsystem marked onion, a circuit's channels and streams capped | gateway |
+| 23 | the onion's streams: a circuit one address and each stream a port of it, the circuits' and streams' caps; SSH streams at the SSH server's listener with their circuit's address, other ports (HTTP's among them) refused; SSH streams on circuits serving the screens and the `vos-api` subsystem marked onion, a circuit's channels and streams capped | gateway |
 
 ## 9. Design choices
 
