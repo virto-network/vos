@@ -164,8 +164,10 @@ the repository's root:
 
 - `just test-facility`: its lints and its suites with the `android`
   feature, the release artifacts held to this tree's guests among them,
-  and the JVM round trip when the SDK and a JDK are here (part of `just
-  check`);
+  every s4 revision VOS names held to one (`tests/pin.rs`), and the
+  JVM round trip when the SDK and a JDK are here (part of `just check`);
+- `just pin-s4 <rev>`: s4 pinned at another revision in every manifest
+  and lockfile that names it;
 - `just facility-release`: the release artifacts written anew;
 - `just android-facility [out]`: the Android library (`aar/`,
   `team.virto.vos:facility`) published to the local Maven repository

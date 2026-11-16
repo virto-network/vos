@@ -349,9 +349,10 @@ test-gateway-ssh: build-test-actors build-agent build-credentials build-payments
 # suites with the `android` feature, as the app's `:vos` process builds
 # it; among them `tests/release.rs`, which holds the release artifacts it
 # embeds to this tree's guests.
-# Among them too, the JNI table's (every Java `native` declaration is one
-# of `natives!`); and the facility's own interface's round trip on a JVM
-# when the JDK and the SDK are here (`facility-contract`).
+# Among them too, `tests/pin.rs` (every s4 revision named is one) and the
+# JNI table's (every Java `native` declaration is one of `natives!`); and
+# the facility's own interface's round trip on a JVM when the JDK and the
+# SDK are here (`facility-contract`).
 test-facility: build-agent build-credentials build-personal build-credential-book build-device-book
     cargo clippy --manifest-path node/light/android/Cargo.toml --features android --ignore-rust-version --all-targets --quiet -- -D warnings
     cargo test --manifest-path node/light/android/Cargo.toml --features android --ignore-rust-version
@@ -366,6 +367,18 @@ facility-contract:
     let sdk = ($env.ANDROID_HOME? | default ($env.ANDROID_SDK_ROOT? | default "/opt/android-sdk")); \
     let java = ($env.S4_ANDROID_JAVA_HOME? | default ($env.JAVA_HOME? | default "/usr/lib/jvm/java-17-openjdk")); \
     if not (($"($sdk)/build-tools/36.1.0/aidl" | path exists) and ($"($java)/bin/javac" | path exists)) { print -e $"facility-contract SKIPPED: no aidl under ($sdk) or no javac under ($java)" } else { with-env { ANDROID_HOME: $sdk, JAVA_HOME: $java, ANDROID_BUILD_TOOLS_VERSION: "36.1.0" } { cargo test --manifest-path node/light/android/Cargo.toml --features jvm --ignore-rust-version --test jvm } }
+
+# Pin s4 at `rev` (a full commit id) everywhere VOS names it: the
+# workspace's `s4-server`, the facility's and the demo's crates (outside
+# the workspace), each lockfile moved with it. The facility's
+# `tests/pin.rs` fails while any two differ.
+pin-s4 rev:
+    if not ("{{rev}}" =~ '^[0-9a-f]{40}$') { error make { msg: "a full 40-digit commit id" } }; \
+    for manifest in [Cargo.toml node/light/android/Cargo.toml node/gateway/demo/Cargo.toml] { open --raw $manifest | str replace --all --regex '(git = "https://codeberg.org/Virto/s4", rev = ")[0-9a-f]{40}"' ('${1}' + "{{rev}}" + '"') | save --force --raw $manifest }; \
+    cargo update -p s4-server; \
+    cargo update --manifest-path node/light/android/Cargo.toml -p s4-protocol -p s4-credential-contract -p s4-server; \
+    cargo update --manifest-path node/gateway/demo/Cargo.toml -p s4-protocol -p s4-credential-contract -p s4-server; \
+    print $"s4 pinned at {{rev}}"
 
 # The facility's release artifacts (`node/light/android/release`) written
 # anew from this tree's guests: the stock kernels' (`auth.device`,
