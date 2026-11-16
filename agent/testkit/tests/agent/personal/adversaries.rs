@@ -315,12 +315,21 @@ impl Game {
         }
     }
 
+    /// The owner's device settles what fell due before it reads again: a
+    /// read shows what the agent stores, and every call settles first, so
+    /// once a resolution removed a thief device its operations may be
+    /// cancelled by then, and a contest resting on its vetoes pending again.
+    fn settle(&mut self) {
+        self.home.wake(self.reader()).unwrap();
+    }
+
     /// The owner's round: veto every operation of the thief's but a removal
     /// of its devices, remove each of its devices, and settle every contest
     /// over those removals in the owner's favour.
     fn defend(&mut self) {
         let owners = self.owner.devices();
         let acting = owners[0];
+        self.settle();
         let open = open(&self.home, self.reader());
         let thiefs = self.thiefs();
         for (index, operation) in &open {
@@ -377,6 +386,7 @@ impl Game {
                     }
                 }
             }
+            self.settle();
         }
     }
 
@@ -443,6 +453,63 @@ fn play(owner: Owner, thefts: Vec<Theft>, notice: usize) {
     }
     game.finish();
     game.check();
+}
+
+/// The thief removes the owner's device, pairs a device, and vetoes the
+/// owner's removal of it; the kit upholds the owner's removal of the
+/// thief's own device, so that veto lifts with its silencing at the next
+/// call, the removal of the paired device pending again and maturing at
+/// its own time.
+#[test]
+fn a_veto_lifted_by_its_vetoers_removal_leaves_the_removal_pending() {
+    play(
+        Owner::DeviceAndKit,
+        vec![
+            Theft::Remove { who: 0, pick: 66 },
+            Theft::Pair,
+            Theft::Remove { who: 5, pick: 0 },
+            Theft::Alive { who: 0 },
+            Theft::Veto { who: 92, pick: 38 },
+        ],
+        4,
+    );
+}
+
+/// The same, the thief pairing first and the owner noticing at its
+/// removal.
+#[test]
+fn a_veto_lifted_by_its_vetoers_removal_after_a_pairing() {
+    play(
+        Owner::DeviceAndKit,
+        vec![
+            Theft::Pair,
+            Theft::Veto { who: 0, pick: 0 },
+            Theft::Remove { who: 68, pick: 129 },
+            Theft::Veto { who: 254, pick: 80 },
+        ],
+        3,
+    );
+}
+
+/// The same with two paired devices, the thief vetoing the owner's removal
+/// of the second.
+#[test]
+fn a_veto_lifted_by_its_vetoers_removal_leaves_a_second_removal_pending() {
+    play(
+        Owner::DeviceAndKit,
+        vec![
+            Theft::Remove { who: 0, pick: 84 },
+            Theft::Pair,
+            Theft::Veto { who: 0, pick: 44 },
+            Theft::Pair,
+            Theft::Veto {
+                who: 175,
+                pick: 142,
+            },
+            Theft::Veto { who: 114, pick: 35 },
+        ],
+        5,
+    );
 }
 
 proptest! {

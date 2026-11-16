@@ -662,6 +662,54 @@ fn a_removed_devices_vetoes_and_operations_count_no_more() {
     );
 }
 
+/// Rule 9 inside the delay: a contest resting on a removed device's veto
+/// alone is pending again once a call settles its silencing, which a read
+/// does not, so the kit has no contest to resolve, and the removal matures
+/// at its own time.
+#[test]
+fn a_contest_lifted_inside_the_delay_matures_at_its_own_time() {
+    let mut home = seasoned(3);
+    let removal = home.operate(admin(0), "remove", 2u32).unwrap();
+    let matures = home.operation(sync(0), removal).matures;
+    home.operate(admin(1), "veto", removal).unwrap();
+    let vetoers = home.operate(admin(0), "remove", 1u32).unwrap();
+    home.operate(admin(1), "veto", vetoers).unwrap();
+    home.operate(KIT, "resolve", (vetoers, true)).unwrap();
+    assert_eq!(standing(&home, sync(0), 1), Standing::Removed);
+    assert_eq!(
+        state(&home, sync(0), removal),
+        OpState::Contested,
+        "a read shows what the agent stores"
+    );
+    assert_eq!(
+        home.operate(KIT, "resolve", (removal, true)),
+        Err(PersonalError::Uncontested),
+        "a call settles the silencing before it runs"
+    );
+    assert_eq!(
+        state(&home, sync(0), removal),
+        OpState::Contested,
+        "refused, it wrote nothing"
+    );
+    home.call::<Recorded>(sync(0), "alive", ()).unwrap();
+    assert_eq!(state(&home, sync(0), removal), OpState::Pending);
+    assert_eq!(
+        home.operation(sync(0), removal).matures,
+        matures,
+        "due at its own time"
+    );
+    home.pass(matures - home.overview().at - 1);
+    assert_eq!(standing(&home, sync(0), 2), Standing::Active);
+    home.call::<Recorded>(sync(0), "alive", ()).unwrap();
+    assert_eq!(state(&home, sync(0), removal), OpState::Pending);
+    home.call::<Recorded>(sync(0), "alive", ()).unwrap();
+    assert_eq!(
+        state(&home, sync(0), removal),
+        OpState::Matured { at: matures }
+    );
+    assert_eq!(standing(&home, sync(0), 2), Standing::Removed);
+}
+
 /// B6: every operation and veto is an admin call whose evidence its
 /// signer posts, a device under its sync key and the kit under its own.
 #[test]
