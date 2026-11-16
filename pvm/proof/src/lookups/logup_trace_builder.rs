@@ -227,7 +227,7 @@ impl LogupTraceBuilder {
     }
 }
 
-#[cfg(all(test, feature = "prover"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::chips::blake2b::{Blake2bBoundaryChip, BoundaryColumn};

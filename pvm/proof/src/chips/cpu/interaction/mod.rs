@@ -11,8 +11,6 @@
 //! cpu/constraints/, then add the prover-side emission here, then run
 //! the minimum sweep (CONSTRAINTS.md rule 6).
 
-#![cfg(feature = "prover")]
-
 use num_traits::One;
 use stwo::{
     core::{ColumnVec, fields::m31::BaseField, fields::qm31::SecureField},

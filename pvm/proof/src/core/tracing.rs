@@ -636,7 +636,56 @@ pub(crate) fn decode_mem_access(
     }
 }
 
-#[cfg(all(test, feature = "prover"))]
+/// Decode register indices from decoded instruction arguments.
+/// The register write a step records: the register its opcode writes when
+/// it executed, even if it wrote the value the register held (the proof
+/// fixes each instruction's write), and otherwise what it changed, if
+/// anything. A dynamic jump to the halt address executes, writing before it
+/// jumps; a step the machine stopped (out of gas, a fault, a trap, a host
+/// call) does not. An error when the step changed a register other than
+/// that one, or more than one.
+pub(crate) fn recorded_write(
+    opcode: Opcode,
+    (reg_a, reg_b, reg_d): (usize, usize, usize),
+    regs_before: &[u64; PVM_REGISTER_COUNT],
+    regs_after: &[u64; PVM_REGISTER_COUNT],
+    exit: Option<&ExitReason>,
+) -> Result<Option<usize>, &'static str> {
+    let mut changed = (0..PVM_REGISTER_COUNT).filter(|&i| regs_before[i] != regs_after[i]);
+    let first = changed.next();
+    if changed.next().is_some() {
+        return Err("one instruction changed more than one register");
+    }
+    if exit.is_some() && exit != Some(&ExitReason::Halt) {
+        return Ok(first);
+    }
+    let destination =
+        crate::chips::cpu::static_destination(opcode, reg_a, reg_b, reg_d, regs_before);
+    if first.is_some() && first != destination {
+        return Err("an instruction changed a register other than its destination");
+    }
+    Ok(destination)
+}
+
+pub(crate) fn decode_reg_indices(
+    _opcode: Opcode,
+    decoded_args: &args::Args,
+) -> (usize, usize, usize) {
+    match decoded_args {
+        args::Args::ThreeReg { ra, rb, rd } => (*ra, *rb, *rd),
+        args::Args::TwoReg { rd, ra } => (*rd, *ra, 0),
+        args::Args::TwoRegImm { ra, rb, .. } => (*ra, *rb, 0),
+        args::Args::TwoRegOffset { ra, rb, .. } => (*ra, *rb, 0),
+        args::Args::TwoRegTwoImm { ra, rb, .. } => (*ra, *rb, 0),
+        args::Args::RegImm { ra, .. } => (*ra, 0, 0),
+        args::Args::RegExtImm { ra, .. } => (*ra, 0, 0),
+        args::Args::RegTwoImm { ra, .. } => (*ra, 0, 0),
+        args::Args::RegImmOffset { ra, .. } => (*ra, 0, 0),
+        _ => (0, 0, 0),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -790,54 +839,5 @@ mod tests {
             trace[0].next_pc, 0,
             "unhandled row must expose the cause PC",
         );
-    }
-}
-
-/// Decode register indices from decoded instruction arguments.
-/// The register write a step records: the register its opcode writes when
-/// it executed, even if it wrote the value the register held (the proof
-/// fixes each instruction's write), and otherwise what it changed, if
-/// anything. A dynamic jump to the halt address executes, writing before it
-/// jumps; a step the machine stopped (out of gas, a fault, a trap, a host
-/// call) does not. An error when the step changed a register other than
-/// that one, or more than one.
-pub(crate) fn recorded_write(
-    opcode: Opcode,
-    (reg_a, reg_b, reg_d): (usize, usize, usize),
-    regs_before: &[u64; PVM_REGISTER_COUNT],
-    regs_after: &[u64; PVM_REGISTER_COUNT],
-    exit: Option<&ExitReason>,
-) -> Result<Option<usize>, &'static str> {
-    let mut changed = (0..PVM_REGISTER_COUNT).filter(|&i| regs_before[i] != regs_after[i]);
-    let first = changed.next();
-    if changed.next().is_some() {
-        return Err("one instruction changed more than one register");
-    }
-    if exit.is_some() && exit != Some(&ExitReason::Halt) {
-        return Ok(first);
-    }
-    let destination =
-        crate::chips::cpu::static_destination(opcode, reg_a, reg_b, reg_d, regs_before);
-    if first.is_some() && first != destination {
-        return Err("an instruction changed a register other than its destination");
-    }
-    Ok(destination)
-}
-
-pub(crate) fn decode_reg_indices(
-    _opcode: Opcode,
-    decoded_args: &args::Args,
-) -> (usize, usize, usize) {
-    match decoded_args {
-        args::Args::ThreeReg { ra, rb, rd } => (*ra, *rb, *rd),
-        args::Args::TwoReg { rd, ra } => (*rd, *ra, 0),
-        args::Args::TwoRegImm { ra, rb, .. } => (*ra, *rb, 0),
-        args::Args::TwoRegOffset { ra, rb, .. } => (*ra, *rb, 0),
-        args::Args::TwoRegTwoImm { ra, rb, .. } => (*ra, *rb, 0),
-        args::Args::RegImm { ra, .. } => (*ra, 0, 0),
-        args::Args::RegExtImm { ra, .. } => (*ra, 0, 0),
-        args::Args::RegTwoImm { ra, .. } => (*ra, 0, 0),
-        args::Args::RegImmOffset { ra, .. } => (*ra, 0, 0),
-        _ => (0, 0, 0),
     }
 }

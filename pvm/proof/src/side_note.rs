@@ -143,7 +143,6 @@ pub struct SideNote {
     /// `MemoryRootBoundaryChip` consumes the root.  `None` until ingested (and
     /// on the verify path, which never needs it — the new chips are
     /// unconditionally active and their preprocessed traces are row-index pure).
-    #[cfg(feature = "prover")]
     pub memory_pages: Option<MemoryPagePayload>,
     /// The pages the program may touch, and how: `MemoryPageChip`'s
     /// preprocessed regions, so part of its proof's program identity. Read
@@ -153,12 +152,10 @@ pub struct SideNote {
     /// A device proof's run (`crate::device`): its layout and the words it
     /// touches, whose first touches and closing reads `DeviceWordMemoryChip`
     /// produces in place of the page boundary. `None` on a node's proof.
-    #[cfg(feature = "prover")]
     pub device: Option<alloc::sync::Arc<crate::device::DeviceRun>>,
 }
 
 /// One listed page's entering and exit byte images (each `PAGE_SIZE` bytes).
-#[cfg(feature = "prover")]
 #[derive(Clone, Debug)]
 pub struct MemoryPageImage {
     pub page_idx: u32,
@@ -169,7 +166,6 @@ pub struct MemoryPageImage {
 }
 
 /// Per-segment memory-page Merkle boundary payload (design §1–§3).
-#[cfg(feature = "prover")]
 #[derive(Clone, Debug)]
 pub struct MemoryPagePayload {
     /// Listed pages with entering/exit images, sorted ascending by page index;
@@ -333,10 +329,8 @@ impl SideNote {
             bitwise_entries: Vec::new(),
             compare_entries: Vec::new(),
             divrem_entries: Vec::new(),
-            #[cfg(feature = "prover")]
             memory_pages: None,
             memory_layout: None,
-            #[cfg(feature = "prover")]
             device: None,
         }
     }
@@ -349,7 +343,6 @@ impl SideNote {
     /// multiproof, and seeds `merkle_blake2b_calls` with the exact compressions
     /// the `Blake2bBoundaryChip` must prove (one per in-circuit consumption,
     /// duplicates kept).  Prove-path only; idempotent (rebuilds from scratch).
-    #[cfg(feature = "prover")]
     pub fn ingest_memory_pages(&mut self) {
         use crate::page_merkle;
         let mut touched = page_merkle::touched_pages(self);
