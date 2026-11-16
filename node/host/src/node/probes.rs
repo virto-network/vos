@@ -44,11 +44,6 @@ impl<'a> Probes<'a> {
         self.0.inner.counters.installed.load(Ordering::Relaxed)
     }
 
-    /// Snapshot streams this node started to its followers.
-    pub fn snapshots_streamed(&self) -> u64 {
-        self.0.inner.counters.streamed.load(Ordering::Relaxed)
-    }
-
     /// Messages this node sent toward agents on other nodes, again on
     /// rounds included.
     pub fn messages_sent_across(&self) -> u64 {

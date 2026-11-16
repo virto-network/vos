@@ -100,11 +100,6 @@ pub fn equivocations(space: &Space, kind: u8, window: u64) -> Vec<u8> {
     )
 }
 
-/// Every `Equivocations` entry of `space` is under it.
-pub fn equivocations_of(space: &Space) -> Vec<u8> {
-    key(Item::Equivocations, &[space])
-}
-
 pub fn budget(space: &Space) -> Vec<u8> {
     key(Item::Budget, &[space])
 }
