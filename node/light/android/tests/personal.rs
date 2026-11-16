@@ -415,17 +415,20 @@ fn the_joiners_open_claim_waits_for_its_drawn_time() {
     let first = phone(&world, 0x51);
     let second = phone(&world, 0x52);
     first.claim(&world, home, KitKind::Phrase, "first");
-    second.node.set_claim_delay(2_000..2_500).unwrap();
+    // Long enough that a loaded host's pairing, its suites proving beside
+    // it, ends before the claim falls due.
+    second.node.set_claim_delay(10_000..10_500).unwrap();
     let members = || world.state.lock().unwrap().spaces[&home].tree.members();
     let before = members();
     let paired_at = wall();
     first.pair(&second, "second");
     let due = second.node.claim_due().unwrap().expect("the claim owed");
     assert!(
-        due >= paired_at + 2_000 && due < wall() + 2_500,
+        due >= paired_at + 10_000 && due < wall() + 10_500,
         "drawn in range"
     );
     assert_eq!(members(), before, "not made at the pairing");
+    assert!(wall() < due, "the pairing outlasted the claim's delay");
     second.node.sync_personal().unwrap();
     assert_eq!(members(), before, "not made before its time");
     let early = second.node.renew(&*second.hand).unwrap_err();
