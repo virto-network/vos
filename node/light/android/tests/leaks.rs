@@ -27,17 +27,29 @@ use vos_facility::node::{Device, Prompts};
 use vos_facility::{Enroll, Outcome, Pay, SignIn};
 
 /// Freed blocks up to this size are searched: the facility's own buffers,
-/// futures and tasks, not the prover's traces, which hold `s`'s words by
-/// design (`vos-light`'s SECURITY.md).
+/// futures and tasks, not the prover's large traces, which hold `s`'s
+/// words by design (`vos-light`'s SECURITY.md); the prover's smaller
+/// buffers are told apart by their frames (`by_the_prover`).
 const SEARCHED: usize = 16 << 10;
 
 /// The secrets a freed block must not hold, and how many blocks did: in
-/// `FOUND`, and in `RECAIR` those the device prover's builder freed
-/// (recair's `Context`, whose copy of the values is freed, not overwritten:
-/// a gap `vos-light`'s SECURITY.md states).
+/// `FOUND`, with the first such block's backtrace in `FIRST`, and in
+/// `PROVER` those the device prover freed, which `vos-light`'s SECURITY.md
+/// states are freed, not overwritten: the kernel's traced run (its trace
+/// frames and the Poseidon2 states of its side note) and the recursion
+/// builder's `Context`.
 static SECRETS: OnceLock<Vec<(&'static str, [u8; 32])>> = OnceLock::new();
 static FOUND: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
-static RECAIR: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
+static FIRST: [OnceLock<String>; 8] = [const { OnceLock::new() }; 8];
+static PROVER: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
+
+/// Whether a free's backtrace is the device prover's (`vos-pvm-recair`'s
+/// `device`): a frame of its crate, or, since an inlined frame names its
+/// function alone, a frame in its source files.
+fn by_the_prover(trace: &str) -> bool {
+    trace.contains("vos_pvm_recair::") || trace.contains("pvm/proof/recair/src/")
+}
+
 static ARMED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
@@ -64,13 +76,13 @@ impl Searching {
             if contains(block, secret) {
                 TRACING.with(|tracing| tracing.set(true));
                 let trace = std::backtrace::Backtrace::force_capture().to_string();
-                TRACING.with(|tracing| tracing.set(false));
-                let found = if trace.contains("vos_pvm_recair::") {
-                    &RECAIR
+                if by_the_prover(&trace) {
+                    PROVER[index].fetch_add(1, Ordering::Relaxed);
                 } else {
-                    &FOUND
-                };
-                found[index].fetch_add(1, Ordering::Relaxed);
+                    FOUND[index].fetch_add(1, Ordering::Relaxed);
+                    let _ = FIRST[index].set(trace);
+                }
+                TRACING.with(|tracing| tracing.set(false));
             }
         }
     }
@@ -511,8 +523,25 @@ fn nothing_the_facility_shows_or_keeps_carries_a_secret() {
             .filter(|(_, blocks)| *blocks > 0)
             .collect::<Vec<_>>()
     };
-    assert_eq!(held(&FOUND), [], "freed heap blocks held secrets");
-    eprintln!("freed by recair's Context: {:?}", held(&RECAIR));
+    let firsts = FIRST
+        .iter()
+        .zip(secrets.iter())
+        .filter_map(|(first, (name, _))| first.get().map(|trace| format!("{name}:\n{trace}")))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        held(&FOUND),
+        [],
+        "freed heap blocks held secrets; each one's first free:\n{}",
+        firsts.join("\n")
+    );
+    let prover = held(&PROVER);
+    eprintln!("freed by the device prover: {prover:?}");
+    // The prover's traced run holds `s`: its frees are attributed to it,
+    // or the attribution matched nothing and proves nothing.
+    assert!(
+        prover.iter().any(|(name, _)| *name == "s"),
+        "no free attributed to the device prover held `s`: {prover:?}"
+    );
     forbidden.check("stderr", &printed, true);
     for (name, answer) in &answers {
         forbidden.check(name, answer, false);
