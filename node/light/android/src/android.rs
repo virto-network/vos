@@ -16,7 +16,7 @@
 //! Nothing here unwinds into the JVM: a panic is a refusal of
 //! [`Code::Failed`].
 
-use std::os::fd::{FromRawFd as _, IntoRawFd as _};
+use std::os::fd::FromRawFd as _;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -262,20 +262,11 @@ fn kit(byte: jbyte) -> Result<KitKind, Refusal> {
     KitKind::from_byte(byte as u8).ok_or_else(|| refused(Code::Arguments, "no such kit kind"))
 }
 
-/// A descriptor answered to Java: -1 for none.
-#[repr(transparent)]
-pub struct Descriptor(jint);
-
-impl Default for Descriptor {
-    fn default() -> Self {
-        Self(-1)
-    }
-}
-
 /// The native methods, each `fn` its JNI symbol, its arguments after the
 /// facility's handle, its answer and its body, given the environment and
 /// the facility. An `op` takes the operation's `out Refusal` last, which a
-/// refusal is written into; a `quiet` one takes none; a `bare` one takes no
+/// refusal is written into, and a `personal` one its `out Refused`; a
+/// `quiet` one takes none; a `bare` one takes no
 /// handle either. Statements after `take` run first, before the
 /// environment is reached. `NATIVES` lists every symbol and its Java
 /// arity.
@@ -493,17 +484,10 @@ natives! {
         array(env, &element, &all)
     }
 
-    /// A stream to the target, served into one end of a socket pair: the
-    /// other end's descriptor, which the caller owns; -1 when refused.
-    op fn Java_team_virto_s4_vos_VosNode_nativeOpenStream(target: JObject<'l>) -> Descriptor, |env, node| {
-        let target = StreamTarget::from_java(env, &target)?;
-        let theirs = node.open_stream(target)?;
-        Ok(Descriptor(theirs.into_raw_fd()))
-    }
-
     /// s4's screen session with the target's gateway, carried between the
     /// UI's end of a socket pair, `descriptor` (owned from here), and that
-    /// gateway's SSH port: the SSH host key the space pinned for that port.
+    /// gateway's SSH port: the SSH host key the space pinned for that port,
+    /// or none (an empty array) for an onion service first contacted.
     op fn Java_team_virto_s4_vos_VosNode_nativeScreens(
         gateway: JObject<'l>,
         descriptor: jint,
@@ -514,7 +498,8 @@ natives! {
         let end = end.ok_or_else(|| crate::refused(Code::Arguments, "no socket pair's end"))?;
         let gateway = StreamTarget::from_java(env, &gateway)?;
         let host_key = node.screens(gateway, end)?;
-        env.byte_array_from_slice(&host_key).map_err(failed)
+        env.byte_array_from_slice(host_key.as_ref().map_or(&[][..], |key| &key[..]))
+            .map_err(failed)
     }
 
     op fn Java_team_virto_s4_vos_VosNode_nativeSyncPersonal() -> JObject<'l>, |env, node| {

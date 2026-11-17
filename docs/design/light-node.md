@@ -3728,15 +3728,17 @@ device's crates faster); Q9's size argument for it is small.
   `Client` whose every space is set from the onions pinned at enrollment
   (the enrollment carries the onion set, each onion with its SSH host key),
   its clearnet only the per-space opt-out of key-signed calls, kept with
-  each `refresh_onions` answer in `routes.state`. A spare circuit is kept
+  each `refresh_onions` answer as rows of the facility's database. A spare circuit is kept
   while a session is open; the client is dormant in the background and
   woken around each job. Every request is `client.request` under its
   purpose: a sign-in's and a payment's proof sent by the facility itself
   (`Proven`; the s4 server gets the node's answer, never the request), the
   node's time (`Fetch`), the tree (`Feed`, a `TreeKeeper` kept beside the
   enrollment), open claims (`Member`), the personal agent (`Personal` for
-  what the user does, `Background` for its job). A stream to a gateway's
-  `.onion` goes over Tor too.
+  what the user does, `Background` for its job). s4's screens to an onion
+  service no space pins go over Tor too, on a circuit of their own with no
+  host key pinned (first contact, the client's known hosts deciding it);
+  `:vos` opens no other stream [amended 2026-11-17, fb2 L7].
 - **The personal space**: every flow of §3.8 and §3.9 and the device set's
   operations, named on `IVosPersonal`; the light node under
   `light/`; the admin key in the UI's Keystore (Ed25519, strong biometric
@@ -3770,25 +3772,41 @@ device's crates faster); Q9's size argument for it is small.
   regrouper's "Commit now" starts the new group of it alone
   (`DeviceGroup::regroup`); each other device, out and its sync key
   admitted no more, pairs again from it, leaving the space it held at
-  the pairing's offer (`Space::leave`) and joining with new sync and admin
-  keys.
-- **Leaving** [built, `node/light/android`'s `Space::leave`, 2026-11-17]:
+  the pairing's offer (`vos_light::space::Personal`'s leave) and joining
+  with new sync and admin keys.
+- **Leaving** [built, `vos_light::space`, 2026-11-17]:
   a device gives up its personal space with no call to its agent: a light
   node store made anew under the next generation's directory
   (`light.<n>`), the local actors installed there, then made the
-  device's by one write of the state file, which keeps the secret source
+  device's by its first batch (`p/ready`), which keeps the secret source
   and the label and drops the home, the agent, the admin key's public
   half and every flow's state; the old directory is deleted after, or at
-  the next open. The old admin key stays in the UI's keystore, unused
+  the next open, which takes the newest store so marked. The old admin key stays in the UI's keystore, unused
   (`open.md`). A move home is a leave and a claim (§3.9), the new home
   asked first for all it could refuse (its open claim, an agent to give,
   no agent under the device's nullifier); a pairing
   leaves first when the device holds another personal space, or this
   one's while the set no longer holds it live (the agent admits its key
   no more), and is refused while the set holds it live. The light node's
-  store is laid out anew (`LAYOUT` 6, `personal.state` version 3): a phone
-  of an earlier build clears the facility's data and claims or pairs
-  again.
+  store is laid out anew (`LAYOUT` 7): a phone of an earlier build clears
+  the facility's data and claims or pairs again.
+- **One engine, the flows in `vos-light`** [built, fb2 part 2,
+  2026-11-17, decision 12]: every flow is `vos_light::space::Personal`'s,
+  over a `Host` (requests, routes, proofs, the enrollments) and `Prompts`
+  (the kit's words and card, the source, the admin key), refusing with
+  `space::Error`; the facility is their adapter. What the device keeps
+  of its personal space is rows of the light store (`p/…`), each written
+  in the batch of the group change it describes (`Claim::prepare_with`,
+  `DeviceGroup::join_with`, `group::restoring_with`), with no state file
+  and nothing to reconcile at open. The facility's enrollments, routes,
+  bridges and jobs' runs are rows of its own database (`facility/`, its
+  layout 1), SCALE of its own types, read strictly. `IVosPersonal.status`
+  names the phase (with a restore's maturity), Tor's state, the
+  memberships owed and the notices standing; the personal flows refuse
+  with `Refused` (a `Why` per error kind); a notice carries who signed
+  it, whether it is contested, an alarm's kind and its `Remedy`. One test
+  double for all of it: `vos_light::testing` (`Phone`, `World`,
+  `Reach`) and `vos_testkit::personal::Agent`.
 - **Pairing after the set changed** [built, `node/light/android`]: the
   opener reads the log and settles what fell due before its pairing's
   commit, and a replaced admin key is taken before any admin call, so a

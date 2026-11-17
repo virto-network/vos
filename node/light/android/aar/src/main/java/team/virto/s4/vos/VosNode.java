@@ -351,13 +351,6 @@ public final class VosNode {
     }
 
     @Override
-    public ParcelFileDescriptor openStream(StreamTarget target, Refusal refused) {
-      caller();
-      int descriptor = nativeOpenStream(handle, target, refused);
-      return descriptor < 0 ? null : ParcelFileDescriptor.adoptFd(descriptor);
-    }
-
-    @Override
     public byte[] screens(StreamTarget gateway, ParcelFileDescriptor end, Refusal refused) {
       try {
         caller();
@@ -641,8 +634,6 @@ public final class VosNode {
 
   private static native JobRun[] nativeRuns(
       long handle, Class<JobRun> element, Refusal refused);
-
-  private static native int nativeOpenStream(long handle, StreamTarget target, Refusal refused);
 
   private static void closeQuietly(ParcelFileDescriptor descriptor) {
     if (descriptor == null) {

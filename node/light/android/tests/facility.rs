@@ -300,23 +300,32 @@ async fn nothing_is_proved_before_enrollment_or_for_an_unknown_operation() {
     );
 }
 
-/// The s4 session's stream to a gateway's onion goes over Tor, on a
-/// circuit of its own: the world's gateway answers it with its SSH banner.
+/// s4's screens to an onion service no space was enrolled through go over
+/// Tor all the same, on a circuit of their own, with no host key pinned
+/// (the client's known hosts decide it, as for any first contact): the
+/// world's gateway answers with its SSH banner. A name that is no onion
+/// service's address is refused, never resolved.
 #[test]
-fn a_stream_to_an_onion_goes_over_tor() {
+fn a_first_contact_with_an_onion_goes_over_tor() {
     use std::io::Read as _;
+    use std::os::fd::OwnedFd;
 
     let world = world();
     let directory = tempfile::tempdir().unwrap();
     let node = node(&world, directory.path(), Arc::new(Phone::new(9)));
-    let mut stream = node
-        .open_stream(vos_facility::StreamTarget {
-            host: world::address(&world, 1).to_ascii_uppercase(),
-            port: 22,
-        })
+    let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let pinned = node
+        .screens(
+            vos_facility::StreamTarget {
+                host: world::address(&world, 1).to_ascii_uppercase(),
+                port: 22,
+            },
+            OwnedFd::from(theirs),
+        )
         .unwrap();
+    assert_eq!(pinned, None, "no key pinned at first contact");
     let mut banner = [0; 8];
-    stream.read_exact(&mut banner).unwrap();
+    ours.read_exact(&mut banner).unwrap();
     assert_eq!(&banner, b"SSH-2.0-");
     let seen = world.state.lock().unwrap().seen.clone();
     assert_eq!(seen.len(), 1);
@@ -324,11 +333,15 @@ fn a_stream_to_an_onion_goes_over_tor() {
         world::onion_of(&seen[0].target),
         Some(world::address(&world, 1))
     );
+    let (_ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
     let refused = node
-        .open_stream(vos_facility::StreamTarget {
-            host: "nowhere.onion".into(),
-            port: 22,
-        })
+        .screens(
+            vos_facility::StreamTarget {
+                host: "nowhere.onion".into(),
+                port: 22,
+            },
+            OwnedFd::from(theirs),
+        )
         .unwrap_err();
     assert_eq!(refused.code, Code::Api);
 }
@@ -375,7 +388,7 @@ fn the_screens_go_over_the_spaces_onion_or_its_opt_out() {
     let before = world.state.lock().unwrap().seen.len();
     assert_eq!(
         screens("GATEWAY.test").unwrap(),
-        world.onion(1).ssh_host_key
+        Some(world.onion(1).ssh_host_key)
     );
     // The screens' stream among any the background job dialled meanwhile:
     // to the onion, on a circuit no earlier stream took.
@@ -395,11 +408,11 @@ fn the_screens_go_over_the_spaces_onion_or_its_opt_out() {
     );
     assert_eq!(
         screens("gateway.test.").unwrap(),
-        world.onion(1).ssh_host_key,
+        Some(world.onion(1).ssh_host_key),
         "the gateway's name with its root's dot"
     );
     node.opt_out(HANDLE, true).unwrap();
-    assert_eq!(screens("gateway.test").unwrap(), ssh_host_key());
+    assert_eq!(screens("gateway.test").unwrap(), Some(ssh_host_key()));
     let seen = world.state.lock().unwrap().seen.clone();
     assert_eq!(
         world::onion_of(&seen.last().unwrap().target),
@@ -487,7 +500,7 @@ fn the_onion_is_preferred_and_a_gateway_spelled_otherwise_is_refused() {
         (key, world::onion_of(&last))
     };
     let (key, onion) = screens();
-    assert_eq!(key, world.onion(1).ssh_host_key);
+    assert_eq!(key, Some(world.onion(1).ssh_host_key));
     assert!(onion.is_some(), "an onion");
     // The first opted out: the second's onion, not the first's clearnet.
     node.opt_out(HANDLE, true).unwrap();
@@ -509,7 +522,7 @@ fn the_onion_is_preferred_and_a_gateway_spelled_otherwise_is_refused() {
     // Both opted out: the clearnet port, and s4's own connection allowed.
     node.opt_out(OTHER_HANDLE, true).unwrap();
     let (key, onion) = screens();
-    assert_eq!((key, onion), (ssh_host_key(), None));
+    assert_eq!((key, onion), (Some(ssh_host_key()), None));
     node.clearnet(ssh_host_key()).unwrap();
     node.opt_out(HANDLE, false).unwrap();
     assert!(node.clearnet(ssh_host_key()).is_err(), "back on Tor");

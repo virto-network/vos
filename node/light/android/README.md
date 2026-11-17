@@ -74,14 +74,20 @@ use of a secret source's key with the prompt that authorizes it
 handing `:vos` only the result.
 
 `IVosNode` also carries the jobs' runs kept (`runs`), the enrollments kept,
-and a byte stream (`openStream`) served into one end of a Unix socket pair
-whose other end the UI holds as a `ParcelFileDescriptor` (`src/stream.rs`: to
-a `.onion` over Tor, else a TCP connection to the host the user named).
-`IVosPersonal` carries the two background passes, each its own periodic job
+and s4's screens (`screens`): s4's SSH bytes between the UI's end of a Unix
+socket pair and a gateway, over the routes of the space enrolled through it
+with the host key it pinned, or, for an onion service no space pins, over Tor
+with no key pinned (`src/stream.rs`), the client's known hosts deciding it.
+`:vos` opens no TCP connection to a host the user named. `IVosPersonal`
+carries the two background passes, each its own periodic job
 in `:vos` with no UI (`src/job.rs`): `sync`, every enrollment's tree read from
 its feed if due, and `syncPersonal`, the personal space's pass at its agent;
-Tor's bridges and the per-space opt-out; and the personal space's operations
-(`src/personal/`, called as `node.personal()?.claim(..)`). Every native
+Tor's bridges and the per-space opt-out; the personal space's status
+(`status`: its phase, a restore's maturity, Tor's state, the memberships owed,
+the notices standing, what needs repair), which the screens branch on; and the
+personal space's operations (`src/personal/`, called as
+`node.personal()?.claim(..)`), each refusing with a `Refused` of its `Why`
+(`vos_light::space::Error`'s kinds), worded by the screens' `Words`. Every native
 method is one entry of `src/android.rs`'s `natives!` table, which
 `cargo test` holds the Java `native` declarations to. A debug build's probe
 runs from a shell through s4's `VosProbe` (`am instrument -w -r -e op sync -e
@@ -108,20 +114,31 @@ they held). Each admin call is signed by the admin key, an Ed25519 key in the
 UI's Keystore behind a strong biometric (`IVosPrompts.signKey`). The light
 node's artifacts (`release/agent.program`, `release/*-book.package`) are
 embedded, `just facility-release` writes them with the stock kernels', and the
-tests run this tree's personal agent in process. A local actor installed at an
-earlier release than the app carries is upgraded in place.
+tests run this tree's personal agent in process (`vos_testkit::personal`), its
+user and phone the shared `Phone` (`vos_light::testing`, this crate's
+`testing` feature). A local actor installed at an earlier release than the app
+carries is upgraded in place.
 
-What the device keeps beside the light node is `personal.state`, versioned: a
-file or a store this build does not read is refused and left as it is, the
-personal space named in need of repair, sign-in and payments unaffected. Each
-flow keeps its keys the moment it makes them, and the home and agent it goes to
-before the call that makes it so: `:vos` killed at any step leaves a flow that
-the same call resumes (a claim, a restore, a move: no new kit, no second agent)
-or the background job finishes (a pairing's acknowledgement, the credential
-book's records). Leaving a personal space (a move, a pairing from another one)
-makes the light node's store anew under `light.<n>`, made the device's by one
-write of `personal.state`, the old store deleted after. `tests/crashes.rs` kills
-it at each request of each flow. A device paired in enrolls in each offered
+The flows are `vos_light::space`'s, over a `Host` and a `Prompts`; this crate is
+their adapter (`src/personal/`): the contract's types, `Refused`, the forms'
+words. What the device keeps of its personal space is rows of the light node's
+store (`p/…`), each written in the batch of the group change it describes: a
+store this build does not read is refused and left as it is, the personal space
+named in need of repair, sign-in and payments unaffected. What the facility
+keeps apart from it (its enrollments, each space's routes, the bridges, the
+jobs' runs) is rows of its own fjall database under `facility/`
+(`src/kept.rs`), each SCALE of a facility-owned type, its layout checked at
+open: a database of another layout is refused and left as it is, a row that does
+not decode is an error, never a default. The credential trees and the
+rendezvous tally stay files. Each flow keeps its keys the moment it makes them:
+`:vos` killed at any step leaves a flow that the same call resumes (a claim, a
+restore, a move: no new kit, no second agent) or the background job finishes (a
+pairing's acknowledgement, the credential book's records). Leaving a personal
+space (a move, a pairing from another one) makes the light node's store anew
+under `light.<n>`, made the device's by its first batch, the old store deleted
+after. `tests/crashes.rs` kills it at each request of each flow. A phone of an
+earlier build (light `LAYOUT` 6 or before, enrollments as TOML files) clears the
+app's data and claims or pairs again, and enrolls again. A device paired in enrolls in each offered
 space with the key its handle there came from.
 
 ## Tor

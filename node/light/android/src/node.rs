@@ -41,7 +41,6 @@ use crate::job::{Job, Part};
 use crate::net::{Arti, Net};
 use crate::personal::{Artifacts, PersonalStatus, Phase, Refused, Space, Why};
 use crate::source::{BoxFuture, Kind, Output, Reference, Source, SourceError};
-use crate::stream::{Dialer, Tcp};
 use crate::{
     Answer, Code, Enroll, Enrolled, EnrolledSpace, Facility, Form, Gateway, JobRun, Paid, Pay,
     Refusal, Session, SignIn, SignedIn, StreamTarget, Synced, Warming, refused,
@@ -166,8 +165,6 @@ const SESSIONS: usize = 64;
 pub struct Node {
     runtime: tokio::runtime::Runtime,
     facility: Facility,
-    /// What `open_stream` dials: the s4 session's own transport.
-    streams: Arc<dyn Dialer>,
     job: Job,
     /// The personal space, or why it does not open: sign-in and payments
     /// run whatever it is.
@@ -198,6 +195,14 @@ fn no_personal() -> Refused {
         detail: "this facility runs no personal space".into(),
         ..Refused::default()
     }
+}
+
+/// Whether `host` names an onion service, in any case and with its root's
+/// dot.
+fn onion(host: &str) -> bool {
+    host.trim_end_matches('.')
+        .to_ascii_lowercase()
+        .ends_with(".onion")
 }
 
 /// The runtime the facility runs on.
@@ -283,7 +288,6 @@ impl Node {
         Ok(Self {
             runtime,
             facility,
-            streams: Arc::new(Tcp),
             job,
             personal,
             sessions: Mutex::new(Sessions::default()),
@@ -525,54 +529,43 @@ impl Node {
         self.facility.enrollments()
     }
 
-    /// A stream to `target`, served into one end of a socket pair for as
-    /// long as both sides keep it open: the other end.
-    pub fn open_stream(
-        &self,
-        target: StreamTarget,
-    ) -> Result<std::os::unix::net::UnixStream, Refusal> {
-        if target.host.is_empty() || target.port == 0 {
-            return Err(refused(Code::Arguments, "a stream names a host and a port"));
-        }
-        self.awake(|| {
-            self.runtime.block_on(async {
-                // An onion's over Tor, never resolved on the clearnet; a host
-                // the user named, as they named it.
-                let stream = if target.host.to_ascii_lowercase().ends_with(".onion") {
-                    self.facility
-                        .net()
-                        .onion_stream(&target.host, target.port)
-                        .await
-                        .map(|stream| Box::new(stream) as Box<dyn crate::stream::Duplex>)
-                } else {
-                    self.streams.dial(&target).await
-                }
-                .map_err(|error| refused(Code::Api, error.to_string()))?;
-                crate::stream::serve(stream)
-                    .map_err(|error| refused(Code::Failed, error.to_string()))
-            })
-        })
-    }
-
     /// s4's screen session with the gateway `gateway` names, carried
     /// between `end` (the UI's end of a socket pair) and that gateway's SSH
     /// port over its space's routes, on a circuit of its own, for as long
     /// as both sides keep it open: the SSH host key the space pinned for
-    /// that port, the one the UI accepts. `NotEnrolled` when no space was
-    /// enrolled through that gateway: the UI connects itself.
+    /// that port, the one the UI accepts. An onion service no space was
+    /// enrolled through is carried over Tor all the same, on a circuit of
+    /// its own, with no key pinned: the client's known hosts decide it, as
+    /// for any first contact. `NotEnrolled` for any other gateway no space
+    /// was enrolled through: the UI connects itself.
     pub fn screens(
         &self,
         gateway: StreamTarget,
         end: std::os::fd::OwnedFd,
-    ) -> Result<[u8; 32], Refusal> {
+    ) -> Result<Option<[u8; 32]>, Refusal> {
         let _entered = self.runtime.enter();
-        let space = self.facility.screens_space(&gateway)?;
+        let space = match self.facility.screens_space(&gateway) {
+            Ok(space) => space,
+            Err(refusal) if refusal.code == Code::NotEnrolled && onion(&gateway.host) => {
+                let host = gateway.host.trim_end_matches('.');
+                let stream = self
+                    .awake(|| {
+                        self.runtime
+                            .block_on(self.facility.net().onion_stream(host, gateway.port))
+                    })
+                    .map_err(|error| refused(Code::Api, error.to_string()))?;
+                crate::stream::carry(end, Box::new(stream))
+                    .map_err(|error| refused(Code::Failed, error.to_string()))?;
+                return Ok(None);
+            }
+            Err(refusal) => return Err(refusal),
+        };
         let screens = self.awake(|| {
             self.runtime
                 .block_on(self.facility.net().client().screens_fd(space, end))
         });
         screens
-            .map(|screens| screens.ssh_host_key)
+            .map(|screens| Some(screens.ssh_host_key))
             .map_err(|error| refused(Code::Api, error.to_string()))
     }
 

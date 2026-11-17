@@ -42,6 +42,16 @@ searched for the secret by its `tests/leaks.rs`.
   scope's nodes with the rows they wrote; the store is mended at open as
   a node's is (`vos_exec::store::recover`), and one written in another
   layout is refused.
+- **The personal space's state is the store's rows** (`vos_light::space`):
+  the home and agent, the secret source's key, the admin key's public
+  half, the label, a restore's and a joiner's state, under `p/` of the
+  group keyspace, each written in the batch of the group change it
+  describes (a claim's, a pairing's group's, a restore's split's), so a
+  process killed at any step leaves the device before the change or
+  after it. A row that does not decode is the personal space in need of
+  repair, never a default. A store is the device's once its first batch
+  marks it so: a leave makes the next store and marks it, and an open
+  takes the newest marked store and deletes a newer one cut short.
 - **A local call is a merge handler's operation:** the merge entry runs
   `#[msg(merge)]` handlers alone, writing their merge fields alone and
   reading no row, and records nothing for a handler that fails. A peer's
@@ -340,6 +350,12 @@ not (`light-node.md` §6.2–§6.7).
   route at all: with no onion pinned they are refused, nothing dialed. A
   proven call goes only under its own purpose, which carries nothing
   else, so it never rides a connection that may be on the clearnet.
+- **One stream path:** the facility carries s4's SSH bytes only through
+  `screens`: an enrolled gateway's over its space's routes, with the host
+  key the space pinned, and an onion service no space pins over Tor on a
+  circuit of its own, no key pinned (the client's known hosts decide it, as
+  for any first contact). `:vos` opens no TCP connection to a host a user
+  named.
 - **One connection a purpose, each its own circuit and SSH key:** each
   connection's stream takes an arti isolation token drawn for it alone,
   which arti's circuit manager shares with no other stream, and its SSH

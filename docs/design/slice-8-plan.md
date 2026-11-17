@@ -515,6 +515,18 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   (`CarriedAuthor`, `CARRIED`), `Waiting::Moving`, `DeviceGroup::rejoin`
   and both moving suites deleted; the facility's `Space::leave` makes the
   light node's store anew (`LAYOUT` 6, `personal.state` version 3).
+- **Built** (2026-11-17, fb2 part 2, owner's decision 12, before F2): the
+  personal flows moved to `vos_light::space` (`Host` + `Prompts`, a typed
+  `Error`), the facility their adapter; one test double
+  (`vos_light::testing`, `vos_testkit::personal::Agent`) and a light-level
+  flow suite (`node/light/tests/space.rs`: a claim and a pairing, a
+  regroup's removal set as the agent's); `personal.state` replaced by
+  light-store rows written in the group change's batch (`LAYOUT` 7); the
+  facility's enrollments, routes, bridges and runs in its own database
+  (`facility/`, strict, its own types); `IVosPersonal.status` and
+  `Refused`; method-id constants (`vos_wire::*::method`) and one
+  `wire::answer`; `openStream`, the TCP dialer and the probe's `stream` op
+  deleted, `Carried.host_key` optional (an onion first contacted).
   Valid only while the personal space holds the two books.
 
 ### 8.24b The `:vos` process and its Binder interface — F
