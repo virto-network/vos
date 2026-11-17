@@ -71,6 +71,10 @@ pub struct H8Eval {
     pub relation: GateRelation,
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "a component's log size is a circuit's, below 32, so adding the constraint expansion cannot overflow"
+)]
 impl FrameworkEval for H8Eval {
     fn log_size(&self) -> u32 {
         self.log_size
@@ -87,6 +91,11 @@ impl FrameworkEval for H8Eval {
     }
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    reason = "a constraint body's: its arithmetic is a field's or a constraint expression's, modular, and it indexes fixed-size arrays of its own columns by its layout's constant offsets"
+)]
 impl Body for H8Eval {
     fn body<E: EvalAtRow>(&self, eval: &mut E) {
         let pre: [E::F; 7] = from_fn(|i| {

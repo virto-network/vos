@@ -98,6 +98,10 @@ impl P2Mode {
     /// The selectors a row of this mode sets, in [`P2Mode::ALL`]'s order:
     /// its own at 1; a tagged row's leaf start and node at 1 and channel
     /// first at −1.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "a mode's index is below 7, `ALL`'s length"
+    )]
     pub const fn selectors(self) -> [i8; 7] {
         let mut selectors = [0; 7];
         match self {
@@ -214,6 +218,10 @@ pub struct P2Eval {
 
 /// The S-box over `y`, as two columns: `a = y²`, `out = a²·y`. In the last
 /// round `out` is also read at offset −1, returned second.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "a constraint expression's arithmetic is a field's, modular"
+)]
 fn sbox<E: EvalAtRow>(eval: &mut E, y: E::F, last_round: bool) -> (E::F, Option<E::F>) {
     let a = eval.next_trace_mask();
     let (out, prev) = if last_round {
@@ -229,6 +237,11 @@ fn sbox<E: EvalAtRow>(eval: &mut E, y: E::F, last_round: bool) -> (E::F, Option<
 
 /// A full round over `state`: its constants, the S-boxes, the external
 /// matrix. The last round's S-box outputs at offset −1 go to `prev`.
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    reason = "a constraint body's: its arithmetic is a field's or a constraint expression's, modular, and it indexes fixed-size arrays of its own columns by its layout's constant offsets: `j < N_STATE` and `round < FULL_ROUNDS`"
+)]
 fn full_round<E: EvalAtRow>(
     eval: &mut E,
     state: &mut [E::F; N_STATE],
@@ -248,6 +261,10 @@ fn full_round<E: EvalAtRow>(
     apply_external_round_matrix(state);
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "a component's log size is a circuit's, below 32, so adding the constraint expansion cannot overflow"
+)]
 impl FrameworkEval for P2Eval {
     fn log_size(&self) -> u32 {
         self.log_size
@@ -264,6 +281,11 @@ impl FrameworkEval for P2Eval {
     }
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    reason = "a constraint body's: its arithmetic is a field's or a constraint expression's, modular, and it indexes fixed-size arrays of its own columns by its layout's constant offsets"
+)]
 impl Body for P2Eval {
     fn body<E: EvalAtRow>(&self, eval: &mut E) {
         let pre: [E::F; 33] = from_fn(|i| {
@@ -392,6 +414,11 @@ impl Body for P2Eval {
 
 /// The permutation's columns for `input`: the input, then each S-box's `a`
 /// and `out` in [`main`]'s order; and the permutation's output.
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    reason = "the trace generator's: `columns` holds a row's `main::M` columns, which the S-boxes fill two at a time in `main`'s order; `j < N_STATE`, `round < FULL_ROUNDS`; M31's arithmetic is modular"
+)]
 pub fn permutation_columns(input: [M31; N_STATE], columns: &mut [M31]) -> [M31; N_STATE] {
     debug_assert_eq!(columns.len(), main::M);
     columns[..N_STATE].copy_from_slice(&input);
@@ -428,6 +455,11 @@ pub fn permutation_columns(input: [M31; N_STATE], columns: &mut [M31]) -> [M31; 
 
 /// The words a chained row reads from its predecessor: the external matrix
 /// over the last round's S-box outputs, read from `columns`.
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    reason = "`columns` is a row's `main::M` columns, past the last round's S-box outputs at `main::SBOXES + 2·(LAST_ROUND_SBOXES + j) + 1` for `j < N_STATE`"
+)]
 pub fn output_of_columns(columns: &[M31]) -> [M31; N_STATE] {
     let mut state: [M31; N_STATE] =
         from_fn(|j| columns[main::SBOXES + 2 * (LAST_ROUND_SBOXES + j) + 1]);

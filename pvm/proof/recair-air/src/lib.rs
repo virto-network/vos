@@ -21,8 +21,26 @@
 //!
 //! The crate is `no_std` and depends on no prover: the prover (`vos-pvm-recair`)
 //! and the final verifier (`vos-pvm-final-verifier`) share it.
+//!
+//! **No input panics it:** outside its tests, an index, a slice, an
+//! `unwrap`, an `expect`, a `panic!` or an arithmetic that can overflow is a
+//! lint error, each one left allowed in place with the reason it cannot
+//! fail, as in the final verifier, which links it.
 
 #![no_std]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::arithmetic_side_effects,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
 
 extern crate alloc;
 

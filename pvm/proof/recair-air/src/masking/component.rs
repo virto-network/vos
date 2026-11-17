@@ -76,6 +76,10 @@ impl<E: FrameworkEval> Component for Rebound<'_, E> {
         Component::preprocessed_column_indices(self.layout)
     }
 
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "the verifier's `sample_points` refuses a set whose preprocessed indices are not below the preprocessed tree's width, and `check_shape` holds `mask` to those points, a tree each; the prover's mask is its own trees'"
+    )]
     fn evaluate_constraint_quotients_at_point(
         &self,
         point: CirclePoint<SecureField>,
@@ -117,6 +121,10 @@ impl<C: Component + ?Sized> Component for MaskedComponent<'_, C> {
         self.inner.max_constraint_log_degree_bound()
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "a column's log size is a circuit's, below 32, so the one level of extension cannot overflow"
+    )]
     fn trace_log_degree_bounds(&self) -> TreeVec<ColumnVec<u32>> {
         self.inner
             .trace_log_degree_bounds()

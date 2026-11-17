@@ -11,6 +11,10 @@ pub const RATE: usize = 8;
 pub type Digest = [M31; 8];
 
 /// The first eight words of `state`.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "`i < 8` indexes a state of 16 words"
+)]
 pub fn digest_of(state: &[M31; N_STATE]) -> Digest {
     core::array::from_fn(|i| state[i])
 }
@@ -36,6 +40,11 @@ pub struct LeafSponge {
     buffered: usize,
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "`buffered` stays below `RATE`: a block is absorbed, and `buffered` reset, the moment it reaches it; so `buffer[buffered]`, `buffered + 1` and `buffer[..buffered]` are in range, and a state word's addition is M31's"
+)]
 impl LeafSponge {
     /// Append `values` to the row.
     pub fn absorb(&mut self, values: impl IntoIterator<Item = M31>) {

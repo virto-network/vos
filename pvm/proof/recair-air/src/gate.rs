@@ -131,15 +131,27 @@ impl Layout {
         }
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "a layout's reserved wires and outputs are a circuit's few addresses, below `end`, which checks their sum; the verifier's is the wrap's constant `LAYOUT`"
+    )]
     pub const fn one(&self) -> u32 {
         self.zero + 1
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "a layout's reserved wires and outputs are a circuit's few addresses, below `end`, which checks their sum; the verifier's is the wrap's constant `LAYOUT`"
+    )]
     pub const fn u(&self) -> u32 {
         self.zero + 2
     }
 
     /// Output `i`'s address.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "a layout's reserved wires and outputs are a circuit's few addresses, below `end`, which checks their sum; the verifier's is the wrap's constant `LAYOUT`"
+    )]
     pub const fn output(&self, i: u32) -> u32 {
         self.first_output + i
     }

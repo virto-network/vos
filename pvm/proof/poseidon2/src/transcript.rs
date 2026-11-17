@@ -84,6 +84,10 @@ impl Transcript {
     }
 
     /// Absorb `values` as one run.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "M31's addition is modular: it neither overflows nor panics"
+    )]
     pub fn absorb(&mut self, values: &[M31], observer: &mut impl Observer) {
         let mut state = self.seeded();
         if values.is_empty() {
@@ -100,6 +104,10 @@ impl Transcript {
     }
 
     /// Draw eight words.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "a transcript draws a proof's bounded count of challenges between absorbs, far fewer than 2^32"
+    )]
     pub fn squeeze(&mut self, observer: &mut impl Observer) -> Digest {
         let mut state = self.seeded();
         state[8] = M31::from(self.n_draws);
@@ -139,11 +147,19 @@ pub fn pow_passes(prefix: &Digest, n_bits: u32, nonce: u64, observer: &mut impl 
 
 /// A u64's four 16-bit limbs, little-endian: every value its own words, so no
 /// two values absorb alike.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "`16·i` is at most 48 for `i < 4`"
+)]
 pub fn u64_limbs(value: u64) -> [M31; 4] {
     core::array::from_fn(|i| M31::new(((value >> (16 * i)) & 0xffff) as u32))
 }
 
 /// A u32's two 16-bit limbs, little-endian.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "`16·i` is at most 16 for `i < 2`"
+)]
 pub fn u32_limbs(value: u32) -> [M31; 2] {
     core::array::from_fn(|i| M31::new((value >> (16 * i)) & 0xffff))
 }

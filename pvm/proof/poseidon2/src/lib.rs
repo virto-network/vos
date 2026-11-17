@@ -29,11 +29,35 @@
 //! **The `packed` feature** adds sixteen permutations at once on the widest
 //! SIMD the build targets ([`packed`]), for the prover's hashing; the scalar
 //! [`permute`] is the reference, and the packed code equals it lane for lane.
+//!
+//! **No input panics it:** outside its tests, an index, a slice, an
+//! `unwrap`, an `expect`, a `panic!` or an arithmetic that can overflow is a
+//! lint error, each one left allowed in place with the reason it cannot
+//! fail, as in the final verifier, which links it; the
+//! packed code, the prover's alone, is allowed as a whole.
 
 #![no_std]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::arithmetic_side_effects,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
 
 mod field;
 #[cfg(feature = "packed")]
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    reason = "the prover's hashing, on no verify path: its lanes' arithmetic is M31's, and the packed permutation equals the scalar one lane for lane"
+)]
 pub mod packed;
 mod permutation;
 mod sponge;

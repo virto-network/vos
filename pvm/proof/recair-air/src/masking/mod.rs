@@ -83,6 +83,10 @@ impl<B> MaskedEval<B> {
     }
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "a component's log size is a circuit's, below 32, so adding the constraint expansion cannot overflow"
+)]
 impl<B: Body> FrameworkEval for MaskedEval<B> {
     fn log_size(&self) -> u32 {
         self.inner.log_size()
@@ -240,6 +244,10 @@ pub fn committed_log_sizes(
     for tree in [&mut main, &mut interaction] {
         tree.extend(core::iter::repeat_n(composition, masking.salt_columns));
     }
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "a format's masking pins a few columns each: their sum with the composition's 4 cannot overflow"
+    )]
     let composition_tree = core::iter::repeat_n(
         composition,
         COMPOSITION_COLUMNS + masking.fri_mask_columns + masking.salt_columns,
@@ -275,7 +283,7 @@ pub fn sample_points(
     let committed = committed_log_sizes(set, masking)?;
     let air_level = air_log_size(set)?;
     let at_composition = composition_point(set, oods_point)?;
-    let n_preprocessed = committed[0].len();
+    let n_preprocessed = committed.first()?.len();
     let components = set.components();
     let indexed = components.iter().all(|component| {
         component
@@ -330,6 +338,10 @@ pub fn sample_points_from_zero(
             } else {
                 oods_point
             };
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "the circle group's addition is modular: it neither overflows nor panics"
+            )]
             for point in column_points {
                 *point = base + *point;
             }

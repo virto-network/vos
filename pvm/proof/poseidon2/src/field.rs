@@ -23,6 +23,10 @@ impl M31 {
     }
 
     /// `value mod p`, for `value < 2p²`.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "`value < 2p² < 2^63`, so `(value >> 31) + value + 1` and `quotient + value` stay below 2^64"
+    )]
     pub const fn reduce(value: u64) -> Self {
         let quotient = ((value >> 31) + value + 1) >> 31;
         Self(((quotient + value) & P as u64) as u32)
@@ -39,6 +43,10 @@ impl M31 {
     }
 
     /// `self^5`, the S-box.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "M31's multiplication is modular: it neither overflows nor panics"
+    )]
     pub fn pow5(self) -> Self {
         let square = self * self;
         square * square * self
@@ -47,12 +55,20 @@ impl M31 {
 
 impl From<u32> for M31 {
     /// `value mod p`.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "`(value & P) + (value >> 31)` is at most `p + 1`"
+    )]
     fn from(value: u32) -> Self {
         // `2^31 ≡ 1`, so the top bit folds onto the rest, below p + 2.
         Self::partial_reduce((value & P) + (value >> 31))
     }
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "both words are below p, so their sum is below 2p < 2^32"
+)]
 impl Add for M31 {
     type Output = Self;
     fn add(self, rhs: Self) -> Self {
@@ -61,12 +77,20 @@ impl Add for M31 {
     }
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "M31's addition is modular: it neither overflows nor panics"
+)]
 impl AddAssign for M31 {
     fn add_assign(&mut self, rhs: Self) {
         *self = *self + rhs;
     }
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "`self < p`, so `self + p < 2^32`, and `rhs < p` leaves it positive"
+)]
 impl Sub for M31 {
     type Output = Self;
     fn sub(self, rhs: Self) -> Self {
@@ -74,6 +98,10 @@ impl Sub for M31 {
     }
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the product of two words below 2^31 is below 2^62"
+)]
 impl Mul for M31 {
     type Output = Self;
     fn mul(self, rhs: Self) -> Self {
@@ -81,6 +109,10 @@ impl Mul for M31 {
     }
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "M31's multiplication is modular: it neither overflows nor panics"
+)]
 impl MulAssign for M31 {
     fn mul_assign(&mut self, rhs: Self) {
         *self = *self * rhs;

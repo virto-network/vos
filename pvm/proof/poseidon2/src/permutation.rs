@@ -194,6 +194,11 @@ pub(crate) const INTERNAL_DIAG_SHIFTS: [u8; N_STATE - 1] =
 
 /// The internal matrix is `1 + diag(INTERNAL_DIAGONAL)`, with `1` the all-ones
 /// matrix: `[-2, 2^0, 2^1, …, 2^8, 2^10, 2^12, 2^13, 2^14, 2^15, 2^16]`.
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "evaluated when the crate compiles: an index out of range or an overflow fails the build"
+)]
 pub(crate) const INTERNAL_DIAGONAL: [u32; N_STATE] = {
     let mut diagonal = [P - 2; N_STATE];
     let mut i = 1;
@@ -207,6 +212,10 @@ pub(crate) const INTERNAL_DIAGONAL: [u32; N_STATE] = {
 /// `M4 = [[2, 3, 1, 1], [1, 2, 3, 1], [1, 1, 2, 3], [3, 1, 1, 2]]`, the 4×4
 /// block of the external matrix (Plonky3's `MDSMat4`). Generic over the word,
 /// so a constraint body applies it to its expressions.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "a word's addition and multiplication are a field's, or a constraint expression's: modular, neither overflowing nor panicking"
+)]
 pub fn apply_m4<F>(x: [F; 4]) -> [F; 4]
 where
     F: Clone + Add<F, Output = F>,
@@ -226,6 +235,11 @@ where
 
 /// The external matrix `circ(2·M4, M4, M4, M4)`: `M4` on each block of four
 /// words, then every word gains the sum of the words in its position mod 4.
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    reason = "a word's addition and multiplication are a field's, or a constraint expression's: modular, neither overflowing nor panicking; a block of `chunks_exact_mut(4)` holds four words, and `j + 12` and `4i + j` are below 16 for `i, j < 4`"
+)]
 pub fn apply_external_round_matrix<F>(state: &mut [F; N_STATE])
 where
     F: Clone + AddAssign<F> + Add<F, Output = F>,
@@ -263,6 +277,11 @@ where
 }
 
 /// The internal diagonal as words, for the permutation.
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "evaluated when the crate compiles: an index out of range or an overflow fails the build"
+)]
 const INTERNAL_DIAGONAL_WORDS: [M31; N_STATE] = {
     let mut diagonal = [M31::ZERO; N_STATE];
     let mut i = 0;
@@ -273,6 +292,11 @@ const INTERNAL_DIAGONAL_WORDS: [M31; N_STATE] = {
     diagonal
 };
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    reason = "a word's addition and multiplication are a field's, or a constraint expression's: modular, neither overflowing nor panicking; the state holds 16 words, so `state[0]` and `state[1..]` are in range"
+)]
 fn internal_round_matrix<F, C>(state: &mut [F; N_STATE], diagonal: [C; N_STATE])
 where
     F: Clone + Add<F, Output = F> + Mul<C, Output = F>,
@@ -298,6 +322,10 @@ pub fn permute(state: &mut [M31; N_STATE]) {
 /// word, then the external matrix. A partial round adds its constant to word
 /// 0, applies the S-box to word 0, then the internal matrix. `external[..4]`
 /// are the first full rounds' constants and `external[4..]` the last's.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "M31's addition is modular: it neither overflows nor panics"
+)]
 pub fn permute_with(
     state: &mut [M31; N_STATE],
     external: &[[M31; N_STATE]; FULL_ROUNDS],
@@ -316,6 +344,10 @@ pub fn permute_with(
     }
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "M31's addition is modular: it neither overflows nor panics"
+)]
 fn full_round(state: &mut [M31; N_STATE], constants: &[M31; N_STATE]) {
     for (word, &constant) in state.iter_mut().zip(constants) {
         *word = (*word + constant).pow5();
