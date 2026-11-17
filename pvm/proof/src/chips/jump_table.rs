@@ -105,3 +105,5 @@ impl BuiltInComponent for JumpTableChip {
 mod fill;
 #[cfg(feature = "prover")]
 mod pin;
+#[cfg(feature = "prover")]
+pub(crate) use pin::table_log_size;

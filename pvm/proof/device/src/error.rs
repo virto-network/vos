@@ -31,7 +31,9 @@ pub enum Error {
     Reference,
     /// The reference run does not trace over the device chips.
     Trace,
-    /// A log size more or fewer than the program's chips.
+    /// A log size more or fewer than the program's chips, or a table (the
+    /// code, the jump table, the data) larger than its chip's log size
+    /// holds.
     Sizes,
     /// Chip `chip` (its index in `DEVICE_ORDER`) under its floor.
     Floor { chip: usize },

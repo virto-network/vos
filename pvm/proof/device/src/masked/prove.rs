@@ -7,6 +7,7 @@ use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use stwo::prover::backend::BackendForChannel;
 use stwo::prover::backend::simd::SimdBackend;
 use vos_pvm_final_verifier::masking::MaskedProof;
+use vos_pvm_proof::SegmentError;
 use vos_pvm_proof::chips::CpuColumns;
 use vos_pvm_proof::device::{DEVICE_MAX_LOG_SIZE, DeviceLayout, DeviceShape, device_chips_of_code};
 use vos_pvm_proof::format::Format;
@@ -49,8 +50,10 @@ pub fn device_shape(
 /// Kernel `blob`'s device program under `format` on `MC`'s trees, at the
 /// chips `active` and the log sizes `log_sizes`: its layout and its
 /// preprocessed root, computed from the kernel alone. Refused when `active`
-/// is not the chips its code reaches, a log size is under its floor, or one
-/// is above `DEVICE_MAX_LOG_SIZE`, where the format's count stops holding.
+/// is not the chips its code reaches, a log size is under its floor, one
+/// is above `DEVICE_MAX_LOG_SIZE`, where the format's count stops holding,
+/// or a table (the code, the jump table, the data) does not fit its chip's
+/// log size.
 pub fn install<MC: MerkleChannel>(
     format: &Format,
     blob: &[u8],
@@ -118,7 +121,10 @@ where
             return Err(Error::Ceiling { chip, needs });
         }
         let preprocessed =
-            device_preprocessed(&code, &layout, shape, log_sizes).map_err(|_| Error::Trace)?;
+            device_preprocessed(&code, &layout, shape, log_sizes).map_err(|error| match error {
+                SegmentError::Shape { .. } => Error::Sizes,
+                _ => Error::Trace,
+            })?;
         let committed =
             Committed::<MC>::new(format, log_sizes, preprocessed).ok_or(Error::Sizes)?;
         Ok(Self {
