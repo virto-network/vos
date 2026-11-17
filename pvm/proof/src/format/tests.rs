@@ -10,8 +10,13 @@ use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::{PcsConfig, TreeVec};
 use stwo_constraint_framework::TraceLocationAllocator;
 
-/// The segment AIR's shape with every chip at `2^log_size` rows.
-fn segment_air_shape(log_size: u32, format: &Format) -> SecurityShape {
+/// `f` of the segment AIR's layout and components with every chip at
+/// `2^log_size` rows.
+fn with_segment_air<R>(
+    log_size: u32,
+    format: &Format,
+    f: impl FnOnce(&crate::framework_access::AirLayout, &[&dyn Component]) -> R,
+) -> R {
     let count = crate::chip_idx::COUNT;
     let mask = ((1u64 << count) - 1) as u32;
     let log_sizes = alloc::vec![log_size; count];
@@ -33,9 +38,30 @@ fn segment_air_shape(log_size: u32, format: &Format) -> SecurityShape {
         mask,
     );
     let refs: Vec<&dyn Component> = components.iter().map(|c| &**c).collect();
-    air_layout(&format.pcs_config(), &refs, &trees)
-        .unwrap()
-        .security_shape(&refs)
+    f(
+        &air_layout(&format.pcs_config(), &refs, &trees).unwrap(),
+        &refs,
+    )
+}
+
+/// The segment AIR's shape with every chip at `2^log_size` rows.
+fn segment_air_shape(log_size: u32, format: &Format) -> SecurityShape {
+    with_segment_air(log_size, format, |layout, refs| layout.security_shape(refs))
+}
+
+/// The lifted tree binds a column to its size only by the periodicity
+/// value of a column sampled at two points (`SECURITY.md`, "Masking"):
+/// every main and interaction column of the segment AIR is sampled at one
+/// or two points, a preprocessed column at most one.
+#[test]
+fn every_segment_column_is_sampled_at_one_or_two_points() {
+    let samples = with_segment_air(10, &SEGMENT, |layout, _| layout.samples.clone());
+    assert!(samples[0].iter().all(|&n| n <= 1), "{:?}", samples[0]);
+    for tree in &samples[1..3] {
+        assert!(!tree.is_empty());
+        assert!(tree.iter().all(|n| (1..=2).contains(n)), "{tree:?}");
+    }
+    assert!(samples[1..3].iter().flatten().any(|&n| n == 2));
 }
 
 /// The registry's segment reference shape is the segment AIR's, every
@@ -48,6 +74,33 @@ fn the_reference_shapes_are_the_segment_airs() {
         crate::lookups::MAX_RELATION_WIDTH as u64,
         SEGMENT_RELATION_WIDTH
     );
+}
+
+/// Logup forces integer cancellation only below `p` fractions: the full set
+/// at 2^20 (0.855·p) is counted, at 2^21 refused as outside the analysis.
+#[test]
+fn a_shape_whose_fractions_reach_p_is_outside_the_analysis() {
+    let config = SEGMENT.pcs_config();
+    let check =
+        |shape: &SecurityShape| crate::proof::check_format_security(&SEGMENT, &config, shape);
+    assert!(check(&segment_air_shape(20, &SEGMENT)).is_ok());
+    let wide = segment_air_shape(21, &SEGMENT);
+    assert!(
+        wide.logup_fractions >= (1 << 31) - 1,
+        "{}",
+        wide.logup_fractions
+    );
+    assert_eq!(check(&wide), Err(crate::proof::SecurityError::Outside));
+    let at_p = SecurityShape {
+        logup_fractions: (1 << 31) - 1,
+        ..SEGMENT_REFERENCE
+    };
+    assert_eq!(check(&at_p), Err(crate::proof::SecurityError::Outside));
+    let below = SecurityShape {
+        logup_fractions: (1 << 31) - 2,
+        ..SEGMENT_REFERENCE
+    };
+    assert!(check(&below).is_ok());
 }
 
 /// The tool's two counts, pinned per format at its reference shape:

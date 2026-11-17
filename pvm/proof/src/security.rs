@@ -71,6 +71,11 @@
 //! `γ`'s limit, `1 - γ > √ρ` for every `m`, so it holds at whatever `m` the
 //! count is taken.
 //!
+//! It also refuses a shape whose logup fractions reach `p = 2^31 - 1`: a
+//! relation's sum over M31 forces its multiplicities to cancel as integers
+//! only while it has fewer than `p` entries, and `N`, every relation's
+//! fractions together, bounds each relation's.
+//!
 //! **Masking variant (c)** ([`SecurityShape::variant_c`], `proving.md` §5)
 //! moves an AIR whose tallest component has `N = 2^m` rows to other levels;
 //! every formula stays. Every main and interaction column is committed as
@@ -161,7 +166,7 @@ pub fn conjectured_bits(params: &FormatParams) -> Option<u32> {
 
 /// Both counts, `None` for parameters outside the analysis (a blowup of 0
 /// or above 30, a degree bound outside the M31 circle, no queries, a shape
-/// outside the multi-point precondition).
+/// outside the multi-point precondition, logup fractions reaching `p`).
 pub fn security_bits(params: &FormatParams, shape: &SecurityShape) -> Option<SecurityBits> {
     Some(SecurityBits {
         conjectured: conjectured_bits(params)?,
@@ -216,9 +221,12 @@ const M_MIN: u32 = 3;
 /// Far past where any term balances for our parameters.
 const M_MAX: u32 = 1 << 20;
 
+/// `p`, M31's modulus.
+const M31_MODULUS: u32 = (1 << 31) - 1;
+
 /// `|F|` of QM31, `(2^31 - 1)^4`.
 fn field_size() -> f64 {
-    let p = ((1u64 << 31) - 1) as f64;
+    let p = f64::from(M31_MODULUS);
     p * p * p * p
 }
 
@@ -266,6 +274,7 @@ impl Analysis {
             || shape.log_degree_bound <= params.log_last_layer
             || shape.composition_point_doublings > shape.log_degree_bound
             || params.fold_step == 0
+            || shape.logup_fractions >= u64::from(M31_MODULUS)
         {
             return None;
         }
