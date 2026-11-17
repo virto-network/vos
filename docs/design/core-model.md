@@ -644,7 +644,7 @@ Why handlers run to completion:
 ### 8.6 Proven calls and origins [decided]
 
 `identity-and-authority.md` §5 pins them; the core model's part:
-- **The origins** are the logged caller's variants (`vos_wire::ids::Principal`):
+- **The origins** are the logged caller's variants (`vos_abi::ids::Principal`):
   `Client(key)` 0, `Agent(id)` 1, `Instance(id)` 2, `Anonymous { scope,
   nullifier }` 3 (the stock auth kernel's pseudonym in its scope),
   `Owner(digest)` 4 (the stock owner kernel's digest) and `Kernel {
@@ -895,7 +895,7 @@ rule on a log, masking, a list type, and thin clients.
   records, or a run that fails where the issuing device records an
   operation only when its run is done) is quarantined, never applied, and
   listed with its author.
-- **The storage-backed types** [decided; built, `vos_wire::merge`, the
+- **The storage-backed types** [decided; built, `vos_abi::merge`, the
   SDK's `crdt`]. A merge field keeps **one entry an element or key and
   author chain**, under the element's row and the author's key: the
   stamp of the write that made it (the node's Lamport clock, one more than

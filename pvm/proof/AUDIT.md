@@ -12,10 +12,11 @@ files and functions to read for it. Paths below are relative to
 into the verifier build, though not every such item is read on a
 verifier's path (a few constants of a chip's layout are the prover's
 alone). The crate's `--no-default-features` build, which also leaves out
-the `wire` feature's checks, compiles exactly those items, and
-`just check-no-std` builds it for `thumbv7em-none-eabihf` and
-`wasm32-unknown-unknown` through `vos-pvm-proof-verifier`, so check code
-that called into prover code would fail to compile there.
+the `abi` feature's checks against the actor ABI's records, compiles
+exactly those items, and `just check-no-std` builds it for
+`thumbv7em-none-eabihf` and `wasm32-unknown-unknown` through
+`vos-pvm-proof-verifier`, so check code that called into prover code
+would fail to compile there.
 
 Prover code sits in child modules, each declared on one line at the edge
 of its parent, `#[cfg(feature = "prover")] mod fill;`, with a gated

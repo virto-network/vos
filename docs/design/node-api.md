@@ -211,7 +211,7 @@ budget, past which it is answered `Busy`.
   and the two reads; `Stats` and `Status` 4 KiB plus 156. `Credentialed`
   is a device proof's 1.5 MiB budget plus `cap::REQUEST` plus 4 KiB (the
   agent inside the 4 KiB); the gateway's HTTP limit for it is 4 less.
-  `MAX_ELF` lives in `vos-wire` (`vos_wire::abi::cap::MAX_ELF`), so the
+  `MAX_ELF` lives in `vos-abi` (`vos_abi::abi::cap::MAX_ELF`), so the
   API's table pulls no compiler into the gateway or a client.
 - **Answers are the HTTP bodies,** so the gateway passes them through:
   `NodeKey` the 32 bytes of `GET /`; `AgentInfo`, `Schema` and
@@ -247,9 +247,9 @@ budget, past which it is answered `Busy`.
   (`identity-and-authority.md` §6); no kind of their own.
 - **An agent's admission** [decided, `light-node.md` §3.3]: an actor
   declares it, `#[actor(known_keys, onion_only)]`, and its schema carries
-  it (`vos_wire::schema::Admission`, after the credentials' part of the
+  it (`vos_abi::schema::Admission`, after the credentials' part of the
   section); its install writes the agent's row `admission`
-  (`vos_wire::keys::admission`: the declaring instance and the two flags),
+  (`vos_abi::keys::admission`: the declaring instance and the two flags),
   which ingress reads as it reads the credential ring. One actor of an
   agent declares it: an install declaring one at another instance, or
   installing a program that declares none over the declaring instance,
@@ -263,7 +263,7 @@ budget, past which it is answered `Busy`.
   - **known keys only:** a `Call` whose session the agent does not hold
     (its row `session_index` absent) is refused `Admission(UnknownKey)`
     unless its session's key is a row of the declaring actor's hashed
-    table `admitted` (`vos_wire::keys::admitted`; any value, its presence
+    table `admitted` (`vos_abi::keys::admitted`; any value, its presence
     read). So an unknown key costs three point reads (the agent's row
     `admission`, the session's, the key's), no verification and no write:
     10^4 session attempts verified nothing and wrote nothing (§8, test

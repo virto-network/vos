@@ -550,5 +550,6 @@ admitted. What its operators are trusted with, and the limits that stay
   drives `50·k`, and the gate's rate for device proofs is open
   (`docs/design/open.md`).
 - The request's decode and the device verifier's bytes are fuzzed
-  (`credentialed_decode`, `device_verify_bytes`).
+  (`node/fuzz`'s `credentialed_decode`, `pvm/proof/fuzz`'s
+  `device_verify_bytes`).
 - The gateway adds its own limits per address before any of this.

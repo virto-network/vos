@@ -166,7 +166,7 @@ It has a deterministic encoding, since every replica and the witness
 compare it, and on JAM its size is paid as payload.
 
 **The kinds of origin,** each a variant of the logged caller
-(`vos_wire::ids::Principal`) with its codec index:
+(`vos_abi::ids::Principal`) with its codec index:
 - `Client(key)`, 0: a client's ed25519 key, in a session it signs. The
   identity agent (§6) turns it into `Identity { id }`, a person or service
   in this space through a device, at index 5, reserved;

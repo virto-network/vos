@@ -37,17 +37,20 @@ origin rather than who the member is.
 
 - `pvm/`: the PVM.
   - `runtime` (interpreter and recompiler), `compiler` (RISC-V ELF to
-    PVM), `program` (the standard-program format), `codec`.
+    PVM), `program` (the standard-program format), `codec`, `abi` (the
+    actor ABI: the host calls, the identifiers, the key layout, the
+    schema, an install's records, a step's result, the messages between
+    agents and the credential tree) and `tree` (the committed maps'
+    Merkle tree).
   - `proof/`: the STARK prover and verifiers: the zkVM, the recursion AIR
     (`recair`, `recair-air`), Poseidon2, the final verifier, the statement
     a venue judges, `anchor` (a space's identity, windows and roots), the
     JAM statements service and the precompile shims.
   - `guest/`: the guest toolchain; `bench`: benches and cross-host checks.
 - `agent/`: the agent side.
-  - `wire` (shared wire types), `sdk` and `sdk-macros` (`#[actor]`,
-    `#[messages]`), `tree` (the committed maps' Merkle tree), `testkit`
-    (the tests' world of agents, and the reference model of the default
-    agent).
+  - `wire` (the node's formats and the stock actors' messages), `sdk`
+    and `sdk-macros` (`#[actor]`, `#[messages]`), `testkit` (the tests'
+    world of agents, and the reference model of the default agent).
   - The guest programs, listed in [`programs.toml`](programs.toml):
     `default` (the default agent), `representative`, `credentials`,
     `personal`, `payments`, `homes`, `credential-book`, `device-book`;
@@ -62,7 +65,8 @@ origin rather than who the member is.
     command).
   - `http` and `gateway`: the HTTP front and the gateway, which hold no
     authority.
-  - `checker`: the exactly-once checker and the shared test harness.
+  - `checker`: the exactly-once checker and the shared test harness;
+    `fuzz`: the node API's and ingress's fuzz targets.
 - `support/`: `vos-raft` (a `no_std` Raft core with a deterministic
   simulator) and `merkle-crdt`.
 - `tools/`: tooling no node links: `jam` (an agent as a JAM service, from

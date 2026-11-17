@@ -81,7 +81,7 @@ Two things a pin depends on that are not in the source:
   at `/tmp/vos-checkout`; the venue guests remap their paths instead
   (`_venue-guest`); the agent programs also trim theirs
   (`trim-paths`). So a blob is the same bytes from any checkout.
-- **The shape policy** (`vos_wire::records::Shape::POLICY`): the version
+- **The shape policy** (`vos_abi::records::Shape::POLICY`): the version
   of `vos_pvm_compiler::shape`'s choice of a kernel's classes and each
   chip's capacity in them. A kernel's shape, and so its program id, is
   derived under it; a change to the policy is a new version, and a

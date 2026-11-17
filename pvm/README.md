@@ -1,8 +1,12 @@
 # VOS PVM
 
 This directory owns the virtual machine, compiler, snapshot codec, and proof
-implementation used by VOS. Runtime and compiler changes are reviewed and
-released with the rest of the repository.
+implementation used by VOS, the actor ABI (`abi`) and the committed maps'
+Merkle tree its keys are laid out for (`tree`), both VOS's own. No package
+here depends on a path outside this directory but `support/`'s (`just
+check-layers`, which names the one exemption: the prover's kernel tests).
+Runtime and compiler changes are reviewed and released with the rest of the
+repository.
 
 ## Source provenance
 

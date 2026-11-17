@@ -1507,7 +1507,7 @@ seen      = [(scope, position)]             (the highest position the writer had
 - **Retries:** the push queue keeps sealed bytes and reseals only after
   `StaleEpoch`; the agent deduplicates by id before checking the epoch.
 - **Size:** at most 60 KiB an envelope, under `cap::VALUE` and
-  `cap::REQUEST` (64 KiB, `agent/wire/src/abi/cap.rs`); larger objects
+  `cap::REQUEST` (64 KiB, `pvm/abi/src/abi/cap.rs`); larger objects
   are chunked; pushes pipeline, 16 in flight on one channel.
 
 **Seal at push:** a device keeps unsynced operations in its local store and
@@ -3777,7 +3777,7 @@ device's crates faster); Q9's size argument for it is small.
 - **Limits that bind the personal agent** [built]: 64 KiB a call's
   arguments, a reply and a row; 256 KiB a step's writes; 16 in flight on
   one `vos-api` channel; one answer a request, no push
-  (`agent/wire/src/abi/cap.rs`, `node-api.md` §2). §3.6 sizes envelopes
+  (`pvm/abi/src/abi/cap.rs`, `node-api.md` §2). §3.6 sizes envelopes
   and pushes under them.
 
 ### 7.3 s4

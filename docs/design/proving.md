@@ -525,7 +525,7 @@ pub struct Statement {
 
   The prover role computes it from the install's record of the kernel (its
   hash, image root and shape, the shape's policy version among it,
-  `vos_wire::records::Shape::POLICY`; the
+  `vos_abi::records::Shape::POLICY`; the
   `Derivation`'s transpiler version), with each class's preprocessed root
   and leaf circuit: an install derives without the prover's stack. Venues
   store and compare it; they never compute it.
@@ -1486,8 +1486,8 @@ same statement under BLAKE2b's io-hash [measured, Fairphone 6,
   reachable call, and the derivation keeps everything a relocation
   reaches. So nothing a device kernel reaches may call `compute_io_hash`,
   the SDK's node ends (`attested`, `attested_output`) or
-  `vos_wire::credentials`' BLAKE2b helpers (`tag_word`, `scope`,
-  `Bound::digest`); a kernel takes the tags as `Tag::word()`'s constants.
+  the credential tree's BLAKE2b helpers (`vos_abi::credentials::tag_word`,
+  `vos_wire::credentials`' `scope` and `Bound::digest`); a kernel takes the tags as `Tag::word()`'s constants.
   The derivation refuses one that does, and a gate holds the auth kernel's
   device chips to neither BLAKE2b's nor the AND table's
   (`device_kernel::a_device_kernels_shape_holds_no_blake2b`).
@@ -1967,13 +1967,13 @@ counts as conjectured / proven at the reference shape [model]:
 | 41 | segments | Poseidon2-M31 | 2, 40, 24, 1, 0, 8 | 100 / 60 | 104 / 62 | admitted |
 | 32 | leaf and fold (one padded shape) | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 63 | reserved |
 | 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 5, 24, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 | admitted: the final format |
-| 46 | device proofs, masked (variant (c)), `h = 256`, the full CPU and the byte ledger | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 (62.82), on its masked shape | registered and verifiable; a node admits it only where configured (its byte ledger unsound, `open.md`) |
 | 47 | device proofs, masked (variant (c)), `h = 256`, the per-program CPU and the word ledger | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 (62.82), on its masked shape | admitted: the device format |
 
 - **A number names one AIR and one set of parameters,** and is never
   reused: every number not in the table is refused. 38 is held by no
-  format; the tests use it as "a number no format holds". 28 and 44 are
-  retired and never reused.
+  format; the tests use it as "a number no format holds". 28, 44 and 46
+  are retired and never reused: 46's memory ledger of a row a byte does
+  not keep a byte one group, so its memory argument is unsound.
 - **Each entry** holds its channel, its parameters, the DEEP batching its
   proven floor assumes and both bit counts.
 - **Every entry uses A.3's encodings** and exactly its parameters.
@@ -1982,7 +1982,7 @@ counts as conjectured / proven at the reference shape [model]:
   queries, and a fold verifies under half the recursion AIR's shape. On the
   segment shape 41's count is its query term's, 62.81; 32's parameters give
   62.74, their batching term binding.
-- **41, 46 and 47 name the segment AIR,** hardened, without the columns and
+- **41 and 47 name the segment AIR,** hardened, without the columns and
   next-row masks no constraint reads (§3.2), its chip set shared by the
   node's segments and the device shape; 32 and 39 prove the
   recursion AIR, 32's leaves verifying the segment AIR. A reserved entry is refused until its AIR and channel
@@ -1997,7 +1997,7 @@ counts as conjectured / proven at the reference shape [model]:
 - the `Statement`;
 - the final proof.
 
-`Attest` (`agent/wire/src/result.rs`) is `{ program, window,
+`Attest` (`pvm/abi/src/result.rs`) is `{ program, window,
 witness_input, output, public_args, roots }`:
 - **`window`:** the window whose cut it read at, for a read at a cut;
   none for a plain attest;
