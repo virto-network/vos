@@ -2595,8 +2595,10 @@ format, the chips, the sizes and the root.
     programs for the kernel: the app or the space must update"); a window
     a node could not compute whole yet (a blob it does not hold) is marked
     `unavailable`, and the app asks again rather than saying either side
-    must update. An app ships the current release's artifacts and the
-    previous one's [proposed].
+    must update. An app ships its release's artifacts, one per kernel
+    (the facility's `release/`) [built]; shipping the previous release's
+    beside them, so an app outlives a space's move to the next one, is
+    [proposed].
   - **One claim per window:** two versions in one window must compute
     identical claims (auth's nullifier, owner's digest) with identical
     meaning, so a `once` scope admits a member once whichever version

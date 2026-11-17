@@ -24,13 +24,13 @@
 //!   (`vos-pvm-recair-air`). A number not in [`REGISTRY`] is refused as
 //!   unregistered, and 28, 44 and 46 as retired ([`RETIRED`]), never
 //!   reused; 48 is the tests' second
-//!   device format (`vos-pvm-recair`'s `device::TEST_FORMAT`), never
+//!   device format (`vos-pvm-device`'s `TEST_FORMAT`), never
 //!   registered.
 //! - **Every format** takes exactly its parameters, mixes the boundary
 //!   states as the boundary chips' bytes and grinds its interaction PoW
 //!   before the relation challenges. 47 is the device format: a space's
 //!   ingress verifies device proofs against the program it computes from
-//!   the installed kernel (`vos-pvm-recair`'s `device`), its CPU the
+//!   the installed kernel (`vos-pvm-device`), its CPU the
 //!   program's columns (`chips::CpuColumns::of_code`) and its memory ledger a row a
 //!   word (`chips::WordMemoryChip`). 46 is retired and never reused: its
 //!   ledger of a row a byte does not keep a byte one group, so its memory

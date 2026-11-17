@@ -17,13 +17,15 @@ classes and proved to one final proof:
 
 | Format | Proof | Proved by | Verified by |
 |---|---|---|---|
-| 47 | a device proof, masked, under its program | `vos-pvm-recair` (`device::Program::prove`), on a phone through `vos-light` | `vos-pvm-recair`'s `device::Verifier`, run by `vos-node`'s ingress |
+| 47 | a device proof, masked, under its program | `vos-pvm-device` (`Program::prove`), on a phone through `vos-light` | `vos-pvm-device`'s `Verifier`, run by `vos-node`'s ingress |
 
 | Package | Purpose |
 |---|---|
 | `vos-pvm-proof` | the segment AIR: trace, prove, the format registry, the device chips |
 | `vos-pvm-proof-verifier` | the segment's native verifier, `no_std` |
-| `vos-pvm-recair`, `vos-pvm-recair-air` | the recursion AIR: leaves, folds, the wrap, the masked prover, device programs |
+| `vos-pvm-recair-air` | the recursion AIR's columns and constraints, and the format registry's plain data, `no_std` |
+| `vos-pvm-recair` | the recursion: leaves, folds, the wrap, the masked prover |
+| `vos-pvm-device` | a device program: made from its kernel or its release artifact, proved, verified |
 | `vos-pvm-final-verifier` | the wrap's verifier, `no_std`, for x86, wasm32 and the PVM |
 | `vos-statement` | a statement as a venue judges it |
 
@@ -40,6 +42,50 @@ vos_pvm_proof_verifier::verify_kernel_chain(proofs, &program, &entry).expect("va
 
 The node's [prover](../../node/prover) proves a kernel's statements to the
 wrap with `vos_pvm_recair::tree::prove_final`.
+
+## Pins, and re-pinning
+
+What a verifier accepts is pinned in files the tree checks against what it
+builds. Each is written by a recipe, never by hand, except the two named
+last:
+
+| Pin | Holds | Written by | Checked by |
+|---|---|---|---|
+| `blobs.lock` | every guest blob's SHA-256, stripped: the venue guests (`final-verify.elf`, `statement-service.elf`), the agent programs, the test actors, the final verifier's Wasm blob | `just blobs-lock` | `just check-blobs` |
+| `node/light/android/release` | the facility's release artifacts: the stock kernels' device programs, the default agent's program, the local actors' packages | `just facility-release` | `just test-facility` |
+| `node/light/tests/device.pins` | the stock kernels' device program ids | `VOS_PINS=write` on `vos-light`'s `device` test | the same test |
+| `pvm/proof/src/constants.rs` | the known programs' ids and the circuits' constants (`H_FOLD`, the leaf circuits) | `VOS_PINS=write` on `vos-pvm-proof`'s `kernel` test, `constants::` | the same test |
+| `pvm/proof/fixtures` | the golden fixtures: segment proofs and their patches, the wrap's proofs, the statements' cases | `just fixtures` | `the_fixtures_are_the_generators`, in `test-proof`: every file the generator's bytes, and no file it does not make |
+| `tools/kreivo/conformance` | Kreivo's spaces pallet's conformance vectors, over the fixtures | `just conformance` | `just check` |
+| `pvm/proof/kit/Cargo.lock` | the verifier kit's lock file, VOS's pruned to what the kit links | `just kit-lock` | `just check-kit` |
+| `pvm/proof/final-verifier/src/constants.rs` | the wrap's preprocessed root (`PREPROCESSED_ROOT_39`), a venue's verifying key | by hand, at a change of the wrap's circuit | `vos-pvm-proof`'s `constants::` test computes it |
+| `pvm/proof/fuzz/replay` | each fuzz target's replay corpus: inputs kept because they reached a path once, a regression set never generated | the fuzzer, kept by hand | `just fuzz-replay`, in `gate` |
+
+After a change that moves a guest, a circuit or the lock file, `just
+repin` writes every generated store anew in dependency order (guests and
+`blobs.lock`, the release artifacts, the device program ids, the
+constants, the fixtures, the conformance vectors, the kit's lock file),
+runs each pinning test again without its write mode, and lists the stores
+that moved. On a tree whose pins are current it changes nothing. At a
+merge, run it instead of resolving pins by hand, and check that the
+stores that moved are the ones the change meant to move: a program id is
+a venue's pin, and a moved one is a release.
+
+Two things a pin depends on that are not in the source:
+
+- **The checkout's path.** Cargo hashes a package outside its workspace's
+  root by its absolute path into its symbols, whose order lays out a
+  program's code. The guests whose path dependencies lie outside their
+  workspace (the agent programs, the test actors, the Wasm blob) are
+  built through the justfile's `_at-fixed-path`, as if the checkout were
+  at `/tmp/vos-checkout`; the venue guests remap their paths instead
+  (`_venue-guest`); the agent programs also trim theirs
+  (`trim-paths`). So a blob is the same bytes from any checkout.
+- **The shape policy** (`vos_wire::records::Shape::POLICY`): the version
+  of `vos_pvm_compiler::shape`'s choice of a kernel's classes and each
+  chip's capacity in them. A kernel's shape, and so its program id, is
+  derived under it; a change to the policy is a new version, and a
+  record of another version is refused where it is read.
 
 Read [SECURITY.md](SECURITY.md) before accepting proofs in production. It
 defines the trust boundary and what the AIR binds.

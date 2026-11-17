@@ -18,7 +18,7 @@
 //! leaves (32) and wraps the root (39), which `vos-pvm-final-verifier`
 //! verifies at a venue. A device proves a device kernel's whole run as one
 //! masked proof (47) over the device chips ([`device`], [`masked`]), which
-//! `vos-pvm-recair`'s `device` proves and a space's ingress verifies. The
+//! `vos-pvm-device` proves and a space's ingress verifies. The
 //! segment's native verifier, the one a leaf is held to, is
 //! `vos-pvm-proof-verifier`'s `verify_standalone`.
 //!

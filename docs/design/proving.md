@@ -524,7 +524,8 @@ pub struct Statement {
   count. A fold takes those 44 words as its witness.
 
   The prover role computes it from the install's record of the kernel (its
-  hash, image root and shape, the shape's policy version among it; the
+  hash, image root and shape, the shape's policy version among it,
+  `vos_wire::records::Shape::POLICY`; the
   `Derivation`'s transpiler version), with each class's preprocessed root
   and leaf circuit: an install derives without the prover's stack. Venues
   store and compare it; they never compute it.
@@ -561,9 +562,9 @@ pub struct Statement {
   - `statement/service` (`vos-statement-service`): the JAM statements
     service (§6), its refine and accumulate over `vos-statement`, built
     as a JAM program (`statement-service.elf`);
-  - the device profile (§8): `recair`'s `device` (the device program
-    from a kernel's release, its verifier and pre-check, `H_io` of a
-    claim), `masked::device` (the masked device segment);
+  - the device profile (§8): `vos-pvm-device` (the device program
+    from a kernel or its release, its verifier and pre-check, `H_io` of a
+    claim, and its `masked` module, the masked device segment);
     `vos-pvm-proof`'s `device` (the shape) and `masked` (the masked
     segment chips);
   - `device` (`vos-light`, `node/light`): the device library (§8), `std`,

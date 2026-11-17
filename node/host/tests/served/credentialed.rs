@@ -1734,7 +1734,7 @@ fn an_app_one_release_behind_signs_in_until_its_window_closes() {
 
 /// The device formats' window (`light-node.md` §4.4) at one node: by
 /// default it admits 47 alone and refuses a proof of the tests' second
-/// format, 48 (`device::TEST_FORMAT`), `Format`. Restarted admitting both,
+/// format, 48 (`vos_pvm_device::TEST_FORMAT`), `Format`. Restarted admitting both,
 /// its window names the stock `auth` kernel's program in each, an app
 /// shipping both chooses 47 and one shipping 48 alone chooses 48, and a 47
 /// proof is run as its member's pseudonym. Restarted with 48 retired now: a
