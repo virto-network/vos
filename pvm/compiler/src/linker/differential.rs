@@ -824,16 +824,28 @@ fn a_fused_constant_stays_in_its_register() {
 /// `lui t0, 0x80000`, alone or with an `addi` of 0, then `sub` subtracts
 /// -2^31, so adds 2^31, which no 32-bit immediate holds: the subtraction
 /// stays a register one, into another register and into the constant's own.
+/// `subw` of it adds -2^31 modulo 2^32, which one does.
 #[test]
 fn subtracting_the_least_32_bit_constant_adds_two_to_the_31() {
-    for rd in [6, 5] {
-        let sub = Inst::Op {
-            f3: 0,
-            f7: 0x20,
-            rd,
-            rs1: 7,
-            rs2: 5,
-        };
+    let subs = |rd| {
+        [
+            Inst::Op {
+                f3: 0,
+                f7: 0x20,
+                rd,
+                rs1: 7,
+                rs2: 5,
+            },
+            Inst::Op32 {
+                f3: 0,
+                f7: 0x20,
+                rd,
+                rs1: 7,
+                rs2: 5,
+            },
+        ]
+    };
+    for sub in [6, 5].into_iter().flat_map(subs) {
         let lui = Inst::Lui {
             rd: 5,
             imm: i32::MIN,
