@@ -122,6 +122,9 @@ pub mod memory_layout;
 pub mod proof;
 pub mod segment;
 pub mod sparse_memory;
+// The native segment verifier from a proof and its preprocessed root, the
+// one copy of its checks (`vos-pvm-proof-verifier`'s `verify_standalone`).
+pub mod standalone;
 pub mod trace;
 
 // The format registry, the PCS stacks it selects at run time, the
@@ -361,15 +364,12 @@ pub use format::Format;
 pub use pcs::{Commitment, StarkProofAny};
 pub use proof::{Proof, SegmentState};
 // The chips a trace activates (`prove/active.rs`).
-#[cfg(feature = "prover")]
-pub(crate) use prove::active::active_components_verifier;
 #[doc(hidden)]
 #[cfg(feature = "prover")]
 pub use prove::active::{
     active_component_mask, active_components, all_components, opcode_component_mask,
 };
-#[doc(hidden)]
-#[cfg(feature = "prover")]
+#[cfg(feature = "chip-isolated")]
 pub use prove::prove_with_boundary_override;
 pub use sparse_memory::{SPARSE_MEMORY_PAGE_SIZE, SparseMemoryImage, SparseMemoryPage};
 // ── Prove: the stable surface ────────────────────────────────────────
@@ -392,9 +392,7 @@ pub use prove::{
     ProveProfile, install_thread_pool, prepare_side_note_for_verification, prove_profiled,
 };
 #[cfg(feature = "debug-internals")]
-pub use prove::{
-    debug_assert_constraints_explicit, debug_claimed_sums, prove_chip_isolated_format,
-};
+pub use prove::{debug_assert_constraints_explicit, prove_chip_isolated_format};
 #[cfg(feature = "prover")]
 pub use side_note::SideNote;
 pub use stwo::core::fri::FriConfig;
@@ -407,13 +405,14 @@ pub use verify::{DEFAULT_MAX_LOG_SIZE, verify};
 // Advanced verify surface (explicit components)
 // and the recursion seams the in-AIR verifier is checked against.
 #[cfg(feature = "chip-isolated")]
+pub use verify::record_canonical_transcript;
+#[cfg(feature = "chip-isolated")]
 pub use verify::verify_with_explicit_components;
 #[doc(hidden)]
 #[cfg(feature = "prover")]
 pub use verify::{
-    ComponentOodsMask, OodsReconstruction, RecursionData, RecursionTranscript, SampleLayout,
-    extract_recursion_data, reconstruct_oods_for_recursion, record_canonical_transcript,
-    replay_stark, sample_layout, sample_layout_of,
+    OodsReconstruction, RecursionData, RecursionTranscript, SampleLayout, extract_recursion_data,
+    reconstruct_oods_for_recursion, replay_stark, sample_layout, sample_layout_of,
 };
 
 /// Chip-isolated harness surface — re-exports the trait

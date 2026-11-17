@@ -146,7 +146,7 @@ impl BuiltInComponent for RegisterMemoryChip {
         // The ledger is sorted by (RegAddr, Ts0).  These constraints pin that
         // ordering and bind each read to the immediately-preceding same-reg
         // row, closing the read-consistency soundness gap (see
-        // docs/design/ledger-read-consistency.md).  All
+        // pvm/proof/docs/design/ledger-read-consistency.md).  All
         // constraints stay ≤ degree 2 (this chip can't raise
         // LOG_CONSTRAINT_DEGREE_BOUND), via the BothRealH / OrderValH helpers.
         let is_pad_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsPadding);
@@ -207,6 +207,10 @@ impl BuiltInComponent for RegisterMemoryChip {
         //     registers are contiguous (no value-chain bleed) AND key_same is
         //     forced truthful (claiming 0 on equal regs yields −1, which has no
         //     28-bit decomposition).
+        // The timestamps enter reduced mod p, so two accesses about 2^30
+        // steps apart would alias; the chain's `ts = 0` start (below) keeps
+        // a provable segment's accesses under 2^28, a soundness bound
+        // (`crate::standalone::TIMESTAMP_BOUND`).
         let two = E::F::from(BaseField::from(2u32));
         let recomposed = super::ordering::recompose(eval, &order_bits, two.clone());
         eval.add_constraint(recomposed - both_real_h[0].clone() * order_val_h[0].clone());

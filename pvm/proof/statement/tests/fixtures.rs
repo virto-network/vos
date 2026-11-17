@@ -95,7 +95,7 @@ fn every_fixture_is_judged_on_the_jam_only_host_as_recorded() {
         );
         if accepted {
             assert_eq!(report.id, fixture.input.statement.id().0);
-            assert!(gas <= 150_000_000, "{gas} gas");
+            jam::pinned(&jam::counts(), "statement-judged-gas", gas, 0);
         }
     }
 }

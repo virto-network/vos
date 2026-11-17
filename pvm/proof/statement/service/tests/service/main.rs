@@ -54,7 +54,12 @@ fn a_140_kib_extrinsic_is_read_as_the_proof() {
         landed.outcome.refine_gas as f64 / 1e6,
         landed.accumulate
     );
-    assert!(landed.refine <= 150_000_000, "{}", landed.refine);
+    jam::pinned(
+        &jam::counts(),
+        "statement-service-refine-gas",
+        landed.refine,
+        0,
+    );
 
     let length = Refusal::Proof(vos_statement::vos_pvm_final_verifier::Error::Length).code();
     let mut rig = fixture_rig(&valid);

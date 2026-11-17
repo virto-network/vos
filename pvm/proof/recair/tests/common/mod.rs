@@ -7,6 +7,7 @@
 pub mod every_chip;
 pub mod kernel;
 pub mod leakage;
+pub mod wrap_files;
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

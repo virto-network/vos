@@ -40,6 +40,12 @@ fn blob() -> Vec<u8> {
 /// [`blob`] reading `argument` more witness bytes after its first 64, onto
 /// its stack a page on.
 fn blob_reading(argument: i32) -> Vec<u8> {
+    blob_of(CALLS, argument)
+}
+
+/// The kernel making `calls` Poseidon2 calls, reading `argument` more
+/// witness bytes as [`blob_reading`] does.
+fn blob_of(calls: i32, argument: i32) -> Vec<u8> {
     let mut asm = Assembler::new();
     asm.set_heap_pages(1).set_stack_pages(24);
     asm.add_imm_64(Reg::S0, Reg::SP, -0x1_7800)
@@ -60,7 +66,7 @@ fn blob_reading(argument: i32) -> Vec<u8> {
         .ecalli(ECALL_POSEIDON2)
         .add_imm_64(Reg::T2, Reg::T2, 1);
     let here = asm.current_offset();
-    asm.branch_lt_u_imm(Reg::T2, CALLS, start.wrapping_sub(here))
+    asm.branch_lt_u_imm(Reg::T2, calls, start.wrapping_sub(here))
         .move_reg(Reg::A0, Reg::S0)
         .add_imm_64(Reg::A1, Reg::S0, 64)
         .load_imm(Reg::A2, 128)
@@ -180,6 +186,52 @@ fn a_node_kernels_poseidon2_calls_prove_through_segments() {
     let proofs: Vec<Proof> = segments.into_iter().map(|segment| segment.proof).collect();
     let registers = verify_kernel_chain(proofs, &program, &entry).expect("the chain verifies");
     assert_eq!(&registers[9..13], &[0x11, 0x22, 0x33, 0x44]);
+}
+
+/// The production entry point, end to end: the kernel's run proved to its
+/// final proof by `tree::prove_final` (the class cut, a leaf a segment at
+/// its position, adjacent pairs folded, an odd node carried up, the root
+/// wrapped masked), and its bytes accepted by the final verifier against
+/// the statement the run makes, the program's id and its io-hash. 15,000
+/// calls, five steps each: past two of the widest class's 2^15 steps, so
+/// the run takes at least three segments.
+#[test]
+fn a_node_kernels_run_proves_to_its_final_proof() {
+    let blob = blob_of(15_000, 0);
+    let record = record(&blob);
+    let (program, entry) = vos_pvm_recair::leaf::kernel_program(
+        &blob,
+        &record,
+        vos_pvm_compiler::TRANSPILER_VERSION,
+        &SEGMENT,
+    )
+    .expect("the kernel's program");
+    let trace = trace_kernel(&blob, &witness(), 100_000_000).expect("halts");
+    let (bytes, stats) =
+        vos_pvm_recair::tree::prove_final(&program, &entry, &trace.side_note).expect("proves");
+    eprintln!(
+        "prove_final: {} segments, {} leaves, {} folds in {:.2}s (the wrap {:.2}s), {} bytes",
+        stats.segments,
+        stats.leaves,
+        stats.folds,
+        stats.took().as_secs_f64(),
+        stats.wrap_took.as_secs_f64(),
+        bytes.len(),
+    );
+    assert!(stats.segments >= 3, "{} segments", stats.segments);
+    assert_eq!(stats.leaves, stats.segments);
+    assert_eq!(stats.folds, stats.leaves - 1);
+    let statement = vos_pvm_final_verifier::PublicWords {
+        program: program.id(),
+        io_hash: trace.io_hash,
+    };
+    let format = vos_pvm_final_verifier::masked::FORMAT;
+    let verified = vos_pvm_final_verifier::verify(format, &[format], &bytes, &statement.words())
+        .expect("the final proof verifies");
+    assert_eq!(verified, statement);
+    let mut other = statement;
+    other.io_hash[0] ^= 1;
+    assert!(vos_pvm_final_verifier::verify(format, &[format], &bytes, &other.words()).is_err());
 }
 
 /// A forged run proved over the full chip set is refused, by the prover or

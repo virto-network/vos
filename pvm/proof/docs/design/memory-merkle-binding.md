@@ -255,12 +255,11 @@ All four are **unconditionally active** (the page set is never empty, §0).
 - `SegmentState` carries `memory_root: [u8; 32]`; derived `PartialEq`
   extends both chain-continuity struct-eqs to it.
 - FS mix: the roots enter the channel immediately after the `final_ts` mix,
-  identically at the three sites (`prove.rs`, `verify.rs`,
-  `verifier/src/lib.rs`) — before lookup-element draw, so the claimed-sum
-  recomputation is sound. The standalone-verifier mix and the root binding
-  equality are **strictly unconditional** (no gating on any prover-derived
-  signal); the host `verify.rs` path keeps parity with its existing
-  `closing_chip_active` gate, which is not a trust boundary.
+  identically at the prover (`prove.rs`) and the one verifier
+  (`proof::replay_prefix`, which `src/standalone.rs` runs, the prover-side
+  `verify.rs` through it) — before lookup-element draw, so the claimed-sum
+  recomputation is sound. The mix and the root binding equality are
+  **strictly unconditional** (no gating on any prover-derived signal).
 - `boundary_positions_in_mask` **requires** the new chips' mask bits
   (returns None → reject if `MEMORY_ROOT_BOUNDARY`, `MEMORY_PAGE`,
   `MEMORY_MERKLE`, or `BLAKE2B_BOUNDARY` is missing).

@@ -7,7 +7,7 @@
 //! multiproof — recompute `initial_root` from the entering page images and
 //! `final_root` from the exit images, sharing the untouched-subtree witnesses
 //! — and binds both roots in-circuit (see
-//! `docs/design/memory-merkle-binding.md`).
+//! `pvm/proof/docs/design/memory-merkle-binding.md`).
 //!
 //! The tree itself — its domain tags, leaf and node — is
 //! `vos_pvm_program::image`'s, the one a program's image root is computed

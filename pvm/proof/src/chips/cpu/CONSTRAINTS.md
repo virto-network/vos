@@ -81,10 +81,10 @@ Every `eval.add_to_relation(RelationEntry::new(rel, mult, &[tuple]))` in
   - the same tuple values per row,
   - the same emission **order** (so pairing matches).
 
-Mismatches usually surface as `ConstraintsNotSatisfied` with the
-`debug_claimed_sums` totals balancing — confusing.  Use that helper to
-distinguish "logup imbalance" (totals nonzero) from "structural mismatch"
-(totals zero but constraints fail).
+Mismatches usually surface as `ConstraintsNotSatisfied` while the claimed
+sums still balance — confusing. `debug_assert_constraints_explicit`
+(`debug-internals`) names the first failing row and constraint; a "claimed
+logup sum is not zero" refusal is a lookup imbalance instead.
 
 ## 4. Multiplicity registration on producer chips
 

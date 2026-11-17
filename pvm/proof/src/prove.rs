@@ -36,7 +36,7 @@ mod request;
 mod shaped;
 
 #[cfg(feature = "debug-internals")]
-pub use debug::{debug_assert_constraints_explicit, debug_claimed_sums};
+pub use debug::debug_assert_constraints_explicit;
 pub use profile::ProveProfile;
 pub(crate) use request::{ProveRequest, Sizes};
 pub use shaped::{KernelSegment, program_commitment_for_shape, prove_kernel, prove_shaped};
@@ -293,7 +293,7 @@ fn prove_impl(
 ) -> Result<(Proof, ProveProfile), SegmentError> {
     prepare_side_note_for_verification(side_note);
     // Filter BASE_COMPONENTS to active chips for THIS trace.
-    // Verifier reconstructs the same list via active_components_verifier().
+    // The verifier reconstructs the same list from the proof's component mask.
     let components_owned = super::active_components(side_note);
     let components: &[&dyn crate::framework::MachineProverComponent] = &components_owned;
     let component_mask = super::active_component_mask(side_note);
@@ -448,8 +448,8 @@ pub(crate) fn derive_segment_states(side_note: &SideNote) -> (SegmentState, Segm
 /// boundary-binding gate test (`tests/gates/boundary_binding.rs`) can assert
 /// such proofs are REJECTED by `verify` / `verify_standalone`. It grants
 /// no capability an adversary lacks, but it is not part of the supported
-/// proving API.
-#[doc(hidden)]
+/// proving API: a test seam (`chip-isolated`).
+#[cfg(feature = "chip-isolated")]
 pub fn prove_with_boundary_override(
     side_note: &mut SideNote,
     initial_state: SegmentState,

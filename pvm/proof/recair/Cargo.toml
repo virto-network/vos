@@ -10,8 +10,8 @@ vos-pvm-recair-air = { workspace = true }
 # The wrap's proof, its public words and its layout, which the prover
 # produces and the final verifier reads; format 39's fixed layout.
 vos-pvm-final-verifier = { workspace = true }
-# A watched tree's proofs' encoding.
-postcard = { version = "1", features = ["alloc"] }
+# A watched tree's proofs' encoding (`watch`).
+postcard = { version = "1", features = ["alloc"], optional = true }
 vos-pvm-poseidon2 = { workspace = true }
 vos-pvm-precompiles = { workspace = true }
 # The Poseidon2-M31 channel and its SIMD backend, the format registry, the
@@ -47,24 +47,27 @@ recursion = []
 # enables it (`just check-no-seeded-masks`).
 seeded-masks = ["vos-pvm-proof/seeded-masks"]
 # The masking's heavy gates, for `just test-proof`: the statistical leakage
-# tests at full N (2,000 proofs a witness on the small circuit, 32 on the
-# real wrap), the masked acceptance above 2^16 rows, and the final
-# verifier's gas and Wasm gates over seeds (the device format's leakage
-# gate is `vos-pvm-device`'s). No code of the crate's.
+# tests at a medium N (500 proofs a witness on the small circuit, 16 on the
+# real wrap; `LEAKAGE_N` and `LEAKAGE_WRAP_N` set others, and `just
+# slice-gate` the full 2,000 and 32), the masked acceptance above 2^16
+# rows, and the final verifier's gas and Wasm gates over seeds (the device
+# format's leakage gate is `vos-pvm-device`'s). No code of the crate's.
 heavy-gates = []
 # A run's tree shown proof by proof as it is built (`tree::prove_final_watched`,
 # `tree::Built`'s roots and encoding): the carrier audit's seam, for its
 # tests (a dev edge or a test's feature). No production build enables it
 # (`just check-no-debug-internals`).
-watch = ["recursion"]
+watch = ["recursion", "dep:postcard"]
 
 [dev-dependencies]
-# The masked prover's tests reproduce a proof byte for byte from a seed.
-vos-pvm-recair = { path = ".", features = ["recursion", "seeded-masks"] }
+# The masked prover's tests reproduce a proof byte for byte from a seed;
+# `watch` so the tests and `clippy --all-targets` compile its code.
+vos-pvm-recair = { path = ".", features = ["recursion", "seeded-masks", "watch"] }
 # A verifier pinning other salts, `R` or widths, which refuses the wrap's
 # proofs.
 vos-pvm-final-verifier = { workspace = true, features = ["other-pins"] }
-bincode = "1"
+# The fixtures' and the proofs' encoding, and their sizes.
+postcard = { version = "1", features = ["alloc"] }
 vos-pvm = { workspace = true }
 # A small kernel, laid out as the loader lays it out.
 vos-pvm-program = { workspace = true }

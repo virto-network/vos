@@ -499,3 +499,33 @@ fn standalone_verify_rejects_zero_format_version() {
         "got: {msg}"
     );
 }
+
+/// A boundary timestamp at or above 2^28, where the ledgers' mod-p
+/// comparison would alias two accesses, is refused before any
+/// cryptographic work: the format-41 fixture with either boundary's
+/// timestamp at 2^30, against its own root.
+#[test]
+fn standalone_verify_refuses_a_boundary_timestamp_past_its_bound() {
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../fixtures");
+    let proof: Proof = postcard::from_bytes(
+        &std::fs::read(format!("{fixtures}/segment-41.proof")).expect("the format-41 fixture"),
+    )
+    .expect("a proof");
+    let root: CommitmentHash = postcard::from_bytes(
+        &std::fs::read(format!("{fixtures}/segment-41.root")).expect("its root"),
+    )
+    .expect("a root");
+    assert!(proof.final_state.timestamp < vos_pvm_proof_verifier::TIMESTAMP_BOUND);
+    for initial in [true, false] {
+        let mut forged = proof.clone();
+        let state = if initial {
+            &mut forged.initial_state
+        } else {
+            &mut forged.final_state
+        };
+        state.timestamp = 1 << 30;
+        let error = verify_standalone(forged, root).expect_err("past the bound");
+        let message = format!("{error:?}");
+        assert!(message.contains("at or above 2^28"), "got: {message}");
+    }
+}

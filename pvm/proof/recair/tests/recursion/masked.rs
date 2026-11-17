@@ -32,6 +32,7 @@
 //! 16 [measured]).
 
 use crate::common::bump_m31;
+use crate::common::wrap_files::write;
 use crate::jam;
 use crate::wrap::one_segment;
 
@@ -79,23 +80,6 @@ fn masked_wrap() -> &'static Masked {
             words,
         }
     })
-}
-
-/// A wrap's proof, format and public words, under the target's tmp
-/// directory as `wrap/<name>.{proof,format,words}`: the Wasm harness's
-/// input (`final-verifier/wasm/run`) and the fuzz targets'
-/// `format::MASKED_WRAP` golden.
-fn write(name: &str, format: u32, proof: &[u8], words: &[u32; PUBLIC_WORDS]) {
-    let directory = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("wrap");
-    std::fs::create_dir_all(&directory).expect("the wrap's directory");
-    let words: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
-    for (extension, bytes) in [
-        ("proof", proof),
-        ("format", &format.to_le_bytes()[..]),
-        ("words", &words),
-    ] {
-        std::fs::write(directory.join(format!("{name}.{extension}")), bytes).expect("writes");
-    }
 }
 
 /// The wrap's set under any relations: its trees' layout.
@@ -403,8 +387,9 @@ fn the_layout_refuses_truncations_and_trailing_bytes() {
     }
 }
 
-/// The masked wrap on the JAM-only host, by the venue's guest: accepted
-/// within 125M gas of verify and 4M of decode, its phases reported; a proof
+/// The masked wrap on the JAM-only host, by the venue's guest: accepted,
+/// its verify's gas its pin (`pvm/proof/counts.txt`) and its decode within
+/// 4M, its phases reported; a proof
 /// tampered at its middle byte, and other words, refused without a panic;
 /// another format refused as one the guest does not link.
 #[test]
@@ -430,7 +415,7 @@ fn the_masked_wrap_verifies_on_the_jam_only_host() {
     );
     assert_eq!(report.verdict, jam::ACCEPT, "{}", report.error);
     assert!(decode <= 4_000_000, "decode {decode} gas");
-    assert!(verify <= 125_000_000, "verify {verify} gas");
+    jam::pinned(&jam::counts(), "masked-wrap-verify-gas", verify, 0);
 
     let request = jam::words_request(masked::FORMAT, &masked.words);
     let mut tampered = masked.bytes.clone();

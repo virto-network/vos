@@ -125,46 +125,6 @@ pub struct Proof {
 }
 
 impl Proof {
-    /// Reconstruct the 32-byte actor-IO binding hash from
-    /// the final-state register window φ[9..13].
-    ///
-    /// A binding actor places `H = compute_io_hash(public, return)` (see
-    /// `vos::zk`) into φ[9..12] as part of its Gray Paper halt jump — the four
-    /// hash words are passed as inline-asm `in` operands (`a2..a5`), so
-    /// the compiler materialises them via real instructions immediately
-    /// before halt. No host/tracer cooperation is involved: the binding
-    /// is just ordinary register state at halt.  The verifier's
-    /// boundary-binding check (`boundary_binding`) equates this field to
-    /// the closing chip's committed RegVal column, which is pinned to the
-    /// trace's true final registers by `RegisterMemoryChip` read-consistency
-    /// (masked `prev_value` + `(reg, ts)` sortedness + the `is_write` limb).
-    /// So this hash is bound to the genuine halting register state, sound
-    /// against a from-scratch prover. The host verifier (the `prover`
-    /// extension's `verify`) additionally checks it against a locally
-    /// recomputed `vos::zk::compute_io_hash`, composed with the STARK-validity
-    /// check against the trusted program commitment — so the io-binding can't
-    /// be checked without validity.
-    ///
-    /// Decoding is the exact inverse of the guest-side encoding: word
-    /// φ\[9\] → bytes 0..8, φ\[10\] → 8..16, φ\[11\] → 16..24, φ\[12\] → 24..32,
-    /// each little-endian.  `registers[9..13]` is statically in bounds
-    /// (registers is `[u64; 13]`).
-    ///
-    /// Proofs from non-binding actors leave φ[9..13] at their cold-start
-    /// zero, so this returns `[0u8; 32]` — which fails any real
-    /// `compute_io_hash` equality check, the intended "unbound proof"
-    /// rejection.
-    pub fn public_io_hash(&self) -> [u8; 32] {
-        let mut out = [0u8; 32];
-        for (bytes, word) in out
-            .chunks_exact_mut(8)
-            .zip(&self.final_state.registers[9..13])
-        {
-            bytes.copy_from_slice(&word.to_le_bytes());
-        }
-        out
-    }
-
     /// The program commitment: the preprocessed tree's root.
     pub fn preprocessed_commitment(&self) -> Option<crate::pcs::Commitment> {
         self.stark_proof.commitment(0)

@@ -267,7 +267,7 @@ fn a_10k_gate_circuit_proves_and_verifies() {
     let started = Instant::now();
     let proof = prove(&finalized.circuit, &finalized.witness).expect("proves");
     let proving = started.elapsed();
-    let size = bincode::serialize(&proof).unwrap().len();
+    let size = postcard::to_allocvec(&proof).unwrap().len();
     let started = Instant::now();
     verify(proof, &hash).expect("verifies");
     let verifying = started.elapsed();

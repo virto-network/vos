@@ -14,3 +14,4 @@ mod leaves;
 mod masked;
 mod verifier;
 mod wrap;
+mod wrap_files;

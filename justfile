@@ -64,7 +64,7 @@ phone out="target/phone":
 # prover, four at a time: at every core at once the recursion suite passed
 # 12 GiB, the limit the gates run under.
 test-recair:
-    cargo test -p vos-pvm-recair -p vos-pvm-device -- --test-threads=4
+    cargo test -p vos-pvm-recair -p vos-pvm-device -- --test-threads=4 --skip wrap_files::
 
 # Bench guests, built with the guest toolchain in `pvm/guest`.
 build-bench-guests:
@@ -125,14 +125,14 @@ vectors:
 test-proof: build-test-actors build-programs build-final-verify judge-wasm
     cargo test -p vos-pvm-proof --features debug-internals --lib --bins --test gates --test isa -- --test-threads=2
     cargo test -p vos-kernel-tests --features debug-internals --lib --test witness_input -- --test-threads=2
-    for test in (cargo test -p vos-pvm-proof --features debug-internals --test kernel -- --list --format terse --skip wrap_files:: | lines | where {|line| $line ends-with ': test' } | each {|line| $line | str replace ': test' '' }) { cargo test -p vos-pvm-proof --features debug-internals --test kernel $test -- --exact --test-threads=1 }
+    for test in (cargo test -p vos-pvm-proof --features debug-internals --test kernel -- --list --format terse | lines | where {|line| $line ends-with ': test' } | each {|line| $line | str replace ': test' '' }) { cargo test -p vos-pvm-proof --features debug-internals --test kernel $test -- --exact --test-threads=1 }
     for test in (cargo test -p vos-kernel-tests --features debug-internals --test kernel -- --list --format terse --skip reads:: | lines | where {|line| $line ends-with ': test' } | each {|line| $line | str replace ': test' '' }) { cargo test -p vos-kernel-tests --features debug-internals --test kernel $test -- --exact --test-threads=1 }
     cargo test -p vos-kernel-tests --features debug-internals --test kernel reads:: -- --test-threads=1
     cargo test -p vos-pvm-proof --test kernel constants:: -- --test-threads=1
     cargo test -p vos-kernel-tests --test kernel constants:: -- --test-threads=1
     cargo test -p vos-pvm-recair --features heavy-gates --test circuit --test recursion -- leakage heavy --test-threads=1
     cargo test -p vos-pvm-device --features heavy-gates --test device -- leakage heavy --test-threads=1
-    cargo test -p vos-pvm-proof --features debug-internals --test kernel wrap_files:: -- --test-threads=1
+    cargo test -p vos-pvm-recair --test recursion wrap_files:: -- --test-threads=1
     just test-carriers
 
 # The carrier audit (`proving.md` §5's R7, `vos_checker::carriers`):
@@ -327,7 +327,12 @@ blobs-lock: build-blobs
 #    `pvm/proof/src/constants.rs` (the recursion's circuits are built:
 #    minutes, and several GiB);
 # 5. the golden fixtures, `pvm/proof/fixtures` (`fixtures`: it proves,
-#    under the 12 GiB limit `test-proof` names);
+#    under the 12 GiB limit `test-proof` names), and the proving gates'
+#    counts over them, `pvm/proof/counts.txt`: a statement judged
+#    and refined on the JAM-only host, the one-segment masked wrap's verify
+#    (the heavy gates' counts and the node's,
+#    `node/kernel-tests/tests/counts.txt`, are `test-proof`'s runs under
+#    `VOS_PINS=write`);
 # 6. the conformance vectors over them, `tools/kreivo/conformance`
 #    (`conformance`);
 # 7. the verifier kit's lock file, `pvm/proof/kit/Cargo.lock` (`kit-lock`).
@@ -347,9 +352,12 @@ repin: blobs-lock facility-release
     cargo test -p vos-pvm-proof --test kernel constants:: -- --test-threads=1
     cargo test -p vos-kernel-tests --test kernel constants:: -- --test-threads=1
     just fixtures
+    with-env { VOS_PINS: "write" } { cargo test -p vos-statement --features fixtures --test fixtures every_fixture_is_judged_on_the_jam_only_host_as_recorded -- --exact }
+    with-env { VOS_PINS: "write" } { cargo test -p vos-statement-service --test service a_256_kib_extrinsic_is_read_as_the_proof -- --exact }
+    with-env { VOS_PINS: "write" } { cargo test -p vos-pvm-recair --test recursion masked::the_masked_wrap_verifies_on_the_jam_only_host -- --exact }
     just conformance
     just kit-lock
-    let moved = (git status --porcelain -- blobs.lock node/light/android/release node/light/tests/device.pins pvm/proof/src/constants.rs pvm/proof/fixtures tools/kreivo/conformance pvm/proof/kit/Cargo.lock | lines); if ($moved | is-empty) { print "repin: every pin store is this tree's already" } else { print "repin: moved"; $moved | each {|line| print $line }; null }
+    let moved = (git status --porcelain -- blobs.lock node/light/android/release node/light/tests/device.pins pvm/proof/src/constants.rs pvm/proof/fixtures pvm/proof/counts.txt tools/kreivo/conformance pvm/proof/kit/Cargo.lock node/kernel-tests/tests/counts.txt | lines); if ($moved | is-empty) { print "repin: every pin store is this tree's already" } else { print "repin: moved"; $moved | each {|line| print $line }; null }
 
 # The pinned blobs' hashes, `_blob-hashes`' lines; its failure fails the
 # recipe that reads them.
@@ -653,7 +661,15 @@ check-venue-rules:
     if ($found ++ $missing | is-not-empty) { error make { msg: "an anchor rule lives outside vos_anchor::venue, or a venue does not call it" } }; \
     print $"the venue rules live in vos_anchor::venue alone: ($sources | length) files searched, ($calls | length) calls found"
 
-# Every `check-no-*` gate below, each build resolved once.
+# Every `check-no-*` gate below, each build resolved once, and two more
+# of the table's: the model venue (`venue-model`: `vos-venue`'s `model`
+# and Kreivo's mock, `kreivo-mock`, on no normal or build edge of any
+# workspace member; `vos-statement`'s `model-judge` in neither the node,
+# the `vos` binary nor the JAM statements service's program, which the
+# development tools' harnesses link), and the guests' heap peak
+# (`heap-peak`: `vos-statement`'s and the JAM statements service's, a
+# measurement build's, in no workspace member's, the `vos` binary's with
+# the prover nor the venues' guests' builds).
 check-no-leaks: (_forbidden "tools" "venue-model" "seeded-masks" "debug-internals" "test-device-format" "store-dump" "heap-peak") _seeded-masks-unimplied _debug-names-absent
     print "no test seam, debug output, test device format, store dump, heap peak, model venue or development tool in a production build"
 
@@ -664,18 +680,6 @@ check-no-leaks: (_forbidden "tools" "venue-model" "seeded-masks" "debug-internal
 # holds a package under `tools/`, on a normal or build edge.
 check-no-tools: (_forbidden "tools")
     print "no development tool in the node"
-
-# A node carries no venue's client: `vos-venue`'s model venue (`model`)
-# reaches neither the `vos` binary, with or without the prover, nor
-# `vos-node`, on a normal or build edge (the tests enable it on dev
-# edges), and no normal or build edge of any workspace member enables it,
-# nor Kreivo's mock (`vos-kreivo`'s `kreivo-mock`). Neither the node, the
-# `vos` binary nor the JAM statements service's program links
-# `vos-statement`'s model venue either (`model-judge`: a judge whose pinned
-# program and state its input carries), which the development tools'
-# harnesses do.
-check-no-venue-model: (_forbidden "venue-model")
-    print "no model venue in the node"
 
 # The masked prover's test seams (`vos-pvm-recair`'s `seeded-masks`: the
 # seeded randomness `MaskRng::Seeded` and the forced proof
@@ -710,14 +714,6 @@ check-no-debug-internals: (_forbidden "debug-internals") _debug-names-absent
 # checker enables it, a dev edge of both).
 check-no-store-dump: (_forbidden "store-dump")
     print "no store dump in a production build"
-
-# The guests' heap peak (`vos-statement`'s and the JAM statements service's
-# `heap-peak`), a measurement build's, reaches no production build: no
-# normal or build edge of any workspace member, of the `vos` binary with
-# the prover, nor of the venues' guests (`final-verify` and the service's
-# program) enables it.
-check-no-heap-peak: (_forbidden "heap-peak")
-    print "no heap peak in a production build"
 
 # The builds without std. vos-raft and merkle-crdt (without its fjall store)
 # for an embedded target, on core and alloc alone, built from the
@@ -902,7 +898,7 @@ gate: check doc-check deny check-venue-rules check-no-std check-no-leaks check-n
     just clippy-prover
     cargo test {{core_crates}} ...(python3 -I tools/gates/tiers.py heavy {{core_crates}} | split row ' ')
     cargo test {{core_crates}} --doc
-    cargo test -p vos-pvm-recair -p vos-pvm-device ...(python3 -I tools/gates/tiers.py heavy -p vos-pvm-recair -p vos-pvm-device | split row ' ') -- --test-threads=4
+    cargo test -p vos-pvm-recair -p vos-pvm-device ...(python3 -I tools/gates/tiers.py heavy -p vos-pvm-recair -p vos-pvm-device | split row ' ') -- --test-threads=4 --skip wrap_files::
     cargo test {{agent_crates}} ...(python3 -I tools/gates/tiers.py heavy {{agent_crates}} | split row ' ')
     cargo test {{agent_crates}} --doc
     just test-gateway-onion

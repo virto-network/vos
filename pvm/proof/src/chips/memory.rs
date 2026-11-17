@@ -172,7 +172,7 @@ impl BuiltInComponent for MemoryChip {
         // The ledger is sorted by (Address, Timestamp).  These constraints pin
         // that ordering and bind each read to the immediately-preceding
         // same-address row (closing the read-consistency soundness gap).  All
-        // constraints stay ≤ degree 2.  See docs/design/ledger-read-consistency.md.
+        // constraints stay ≤ degree 2.  See pvm/proof/docs/design/ledger-read-consistency.md.
         let is_pad_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsPadding);
         let address_next = crate::trace::trace_eval_next_row!(trace_eval, Column::Address);
         let timestamp_next = crate::trace::trace_eval_next_row!(trace_eval, Column::Timestamp);
@@ -218,7 +218,11 @@ impl BuiltInComponent for MemoryChip {
         // (a precompile whose output overlaps its input) reads the value
         // from before it; lo=1 ⇒ lo strictly increases (hi equal) ⇒ addr↑;
         // hi=1 ⇒ hi strictly increases ⇒ addr↑.  0 on every non-real→real
-        // transition (all three coeffs are 0 there).
+        // transition (all three coeffs are 0 there). The timestamps enter
+        // reduced mod p, so two accesses about 2^30 steps apart would alias;
+        // each address's run starting at a `ts = 0` write keeps a provable
+        // segment's accesses under 2^28, a soundness bound
+        // (`crate::standalone::TIMESTAMP_BOUND`).
         let combine_ts = |bytes: &[E::F; 8]| -> E::F {
             let mut acc = E::F::zero();
             let mut pow = E::F::one();

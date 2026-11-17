@@ -273,7 +273,10 @@ attribution). Its full design is `recursion-air.md`.
   at zero only costs the prover its statement.
 - **Every segment's initial ts is not zero,** as the native verifier
   refuses a segment starting at ts 0 (memory-boundary anchoring): one of
-  the ts's two wires has an inverse.
+  the ts's two wires has an inverse. The native verifier also bounds both
+  boundary timestamps under 2^28, the ledgers' range; the leaf does not,
+  and rests on the fold chain from ts 1 (`pvm/proof/SECURITY.md`, "The
+  leaf's binding").
 - **The halt flag holds** when `pc_out` equals a leaf-circuit constant,
   `PVM_HALT_ADDR` (2^32 − 2^16, `pvm/runtime/src/lib.rs:88`): the return
   address the loader puts in φ0.
@@ -1884,7 +1887,7 @@ Each is stated, with its reason, in the section it governs:
 The specs the recursion, the venues and their tests are built to.
 
 **A.1 The transcript.** The in-AIR verifier replays the native
-verifier's (`verify_standalone_on` in `pvm/proof/verifier/src/lib.rs`,
+verifier's (`verify_on` in `pvm/proof/src/standalone.rs`,
 through `vos_pvm_proof::proof::replay_prefix`, then Stwo's `verify`), in
 this order:
 1. the domain, format and PCS configuration, then each chip's log size.
