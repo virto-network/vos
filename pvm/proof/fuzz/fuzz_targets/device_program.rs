@@ -3,6 +3,8 @@
 //! witness bytes, states a fixed io-hash and halts, installed on a
 //! reference of 16 bytes.
 
+#![allow(dead_code)]
+
 use vos_pvm_compiler::assembler::{Assembler, Reg};
 use vos_pvm_device::{Program, FORMAT};
 use vos_pvm_proof::core::ecall::ECALL_WITNESS_INPUT;
@@ -13,8 +15,8 @@ const IO: [u32; 4] = [0x4433_2211, 0x0807_0605, 0x7f00_00ff, 0x1abc_def0];
 /// The kernel's witness: 16 bytes.
 pub const WITNESS: [u8; 16] = [7; 16];
 
-/// The kernel.
-fn kernel() -> Vec<u8> {
+/// The kernel, a standard program.
+pub fn kernel() -> Vec<u8> {
     let mut asm = Assembler::new();
     asm.set_stack_pages(1)
         .add_imm_64(Reg::S0, Reg::SP, -16)
