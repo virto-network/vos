@@ -175,4 +175,12 @@ decide what a verifier accepts, and which code is check, pin or fill.
 [src/chips/cpu/CONSTRAINTS.md](src/chips/cpu/CONSTRAINTS.md) explains the AIR
 and its shared lookup tables. The design is `docs/design/proving.md`.
 
+The docs' x86 times and memory assume the host's own code generation:
+`.cargo/config.toml` builds for an x86-64 host with `target-cpu=native`,
+so Stwo's SIMD backend and the packed Poseidon2 run on AVX2 (AVX-512
+where the host has it), and the tests' profile, which the numbers come
+from, optimizes the proof crates alone. A portable build (`RUSTFLAGS=""`)
+has no AVX2 path and proves slower, by a factor not measured; the guests
+and the Wasm blob are other targets, unaffected.
+
 The proof system is built on [Stwo](https://github.com/starkware-libs/stwo).

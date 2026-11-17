@@ -85,7 +85,9 @@ rests on the conjectured count.
   host verifier; arithmetic; BLAKE2b) found holes that the tamper tests had
   not. Each was fixed only after a forgery gate, a consistent forged
   trace, was written and accepted by the unfixed AIR; the gates stay as
-  tests (`tests/gates/*_gate.rs`).
+  tests (`tests/gates/*_gate.rs`), run by `just test-proof` (behind
+  `debug-internals`), which `just ci-full` runs: not `check`, `gate` or
+  `ci`.
 - **Not yet under a forgery gate of that kind:** PROGRAM_MEMORY's decode
   binding, JUMP_TABLE (one padding fix), the lookup tables, MEMORY_PAGE and
   MEMORY_MERKLE, the witness-input chip, the boundary-binding argument

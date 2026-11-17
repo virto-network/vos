@@ -20,6 +20,13 @@ verifier, and the gates its build passed.
     `recair/tests/recursion/leaves.rs`. The counts marked pre-hardening
     are an older count over the pre-hardening shape, not recounted;
   - **[projected]**: time and memory from other provers' measured rates.
+- **How a measured time or memory was built, and by what:** a `cargo
+  test` binary's, the test profile with `target-cpu=native` (as
+  `proving.md`'s status list says); the circuits' counts and the wrap's
+  gas by `vos-pvm-recair`'s and `vos-statement`'s suites (`just
+  test-proof`), the window kernel's segments, leaves, folds and wrap by
+  the node side's `vos-kernel-tests` (the window kernel is a test
+  actor's, which a tree of `pvm/` alone does not hold).
 - **Paths:**
   - `P` = vos-core's `pvm/proof` (at `b5d42dc2`);
   - `ST` = Stwo at the fork's pin `e14925a8` (`olanod/stwo`, `crates/`);
@@ -745,7 +752,8 @@ verify_values}`), never `core::verifier::verify`, whose composition split
 is hardcoded (DIVERGENCE-004); the two facts it leaves to Stwo are pinned
 by the format: the trees' widths (57 / 381 / 48 / 20) and the FRI round
 list (`[3, 3, 3, 2]`). `R` has 8 columns, so it needs no rank check. A
-venue links it (391,784 bytes as a PVM program); the
+venue links it (the JAM statements service's program, 391,784 bytes as a
+PVM program [measured, 2026-10-24]); the
 `valid` fixture verifies in 79.3M gas on the JAM-only host, its decode
 1.50M (`proving.md` §3.5).
 
@@ -755,7 +763,8 @@ statement's types, canonical decode, io-hash and id, and the venue's check
 (`judge`), which verifies against the pinned program id and the recomputed
 io-hash. `decode` reads at most 256 KiB, one postcard encoding and nothing
 after it. On the JAM-only host the venue runs as `vos-statement`'s refine
-program (`final-verify.elf`, 494 KB as a PVM program), verifying words or
+program (`final-verify.elf`, the harnesses', 454,662 bytes as a PVM
+program [measured, 2026-10-24]), verifying words or
 judging a statement; the Wasm blob (305 KB) exports both.
 
 ## 9. What to adapt, from where
@@ -835,7 +844,7 @@ needs the SIMD Poseidon2 hasher for speed, not for correctness.
 | R10 | **The wrap's gas**: the fit is on a one-component proxy | §10's step 7 verifies the real wrap on the JAM-only host |
 | R11 | **The final verifier needs nightly** (the pin's `portable_simd` is prover-only; riscv64em-vos needs build-std) | §10's step 1 builds the skeleton with no nightly feature in the source: on stable for x86 and wasm32, on the pinned nightly with build-std for JAM |
 | R12 | **Signed multiplicities**: a yield by a first consumer is new soundness surface | §1.1's argument; the `Context`'s static checks; the audit of that argument; the forgery gates (`recair/tests/gates`): a malicious prover that skips the static check and Stwo's own, its proof refused by the verifier, by name, for a use carrying another value, a public use added or dropped, a yield consumed once more, a second yield (a negative multiplicity: refused as another circuit, since the relation alone balances it and only checked wirings are committed, which a test pins); likewise `p2`'s modes and chaining and `assert_one_of`; unread lanes, and reads of no wire, by the static check in `check_wiring` on every circuit; the leaf's boundary bytes by the leaf's logup and OODS checks, two of them also proved and refused by the verifier |
-| R13 | **Masking the wrap** costs more than (c)'s ×1.6 | a masked toy wrap measured memory ×1.41 and gas ×1.21–1.24, time ×2.6–2.9 (Blake2b Merkle hashing at a lifting one level higher); the masked wrap as built (format 39): a 3.6 GiB heap and 79.3M gas [measured], within the gate (≤ 24 GiB, ≤ 200M gas, `proving.md` §10) |
+| R13 | **Masking the wrap** costs more than (c)'s ×1.6 | a masked toy wrap measured memory ×1.41 and gas ×1.21–1.24, time ×2.6–2.9 (Blake2b Merkle hashing at a lifting one level higher); the masked wrap as built (format 39): a 3.6 GiB heap and 79.3M gas [measured], within the design's budget (≤ 24 GiB, ≤ 200M gas, `proving.md` §10) and the tests' tighter bounds (`proving.md` A.7) |
 
 ## Appendix: the verifier cost model
 

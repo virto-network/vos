@@ -14,6 +14,18 @@ proofs a phone makes. The recursion AIR's own design is
   (Snapdragon 7s Gen 3: four Cortex-A720-class and four A520 cores). A
   [measured] number with no hardware or date ran on the x86 dev machine,
   on or before 2026-11-01.
+- **How a number was built and where it is measured:** an x86 [measured]
+  time or memory is a `cargo test` binary's unless it says otherwise: the
+  test profile (`opt-level = 3` for the proof crates alone, the root
+  `Cargo.toml`; debug assertions and overflow checks on; no LTO) with
+  `target-cpu=native` (`.cargo/config.toml`: AVX2 and the host's other
+  features). A release build, or a portable one without AVX2, differs.
+  Each says which run measured it: a test or recipe of `pvm/` (`just
+  test-proof`'s suites; the fixtures' gas, `vos-statement`'s fixtures
+  test and `just judge-wasm`), or **[node side]**: the node side's tests
+  and tools (`node/kernel-tests`' kernels and `throughput`, the phone
+  bench `tools/phone`, the end-to-end runs), which a tree of `pvm/`
+  alone does not hold. Every phone number is the phone bench's.
 - **Open work** is listed in `open.md`.
 
 ## 1. Requirements [decided]
@@ -53,7 +65,8 @@ proofs a phone makes. The recursion AIR's own design is
 - **A small final proof is cheap to verify.**
   - A proxy (320 columns, log 16, blowup 64, 13 queries, fold step 3, a
     2^6 last layer) measured 54.4M gas and 80 KB unmasked; about 66–76M
-    and 102–112 KB masked [projected].
+    and 102–112 KB masked [projected]. Superseded by the built wrap's
+    measurements (§3.5).
   - In a Wasm runtime it takes 23M instructions, about 1.7 ms. On Kreivo
     a proof is about 0.3% of a block's weight, and its bytes bind first.
 - **Recursion works on StarkWare's design** [measured on their stack]:
@@ -238,7 +251,8 @@ attribution). Its full design is `recursion-air.md`.
     auth device kernel's 7.3% [measured, x86 dev machine, 2026-10-31];
   - **the throughput:** the window statement proves end to end in 33.3 s
     on format 41 (3 segments 17.0 s, 3 leaves 5.7 s, 2 folds 3.5 s, the
-    masked wrap 7.1 s) [measured, x86 dev machine, 2026-10-31].
+    masked wrap 7.1 s) [measured, x86 dev machine, 2026-10-31; node side:
+    `vos-kernel-tests`' window kernel, `Totals::report`].
 - **Unmasked.** Segments never leave the prover role.
 
 ### 3.3 Leaf circuits
@@ -577,7 +591,7 @@ pub struct Statement {
   uses no nightly feature: it builds on stable for x86 and wasm32, and the
   JAM build runs on the pinned nightly with build-std.
 
-## 4. Security levels [proposed]
+## 4. Security levels [built: the formats and their counts, pinned by tests; the counts not reviewed outside]
 
 **Soundness only has to hold until a proof is verified; hiding has to
 last for decades.**
@@ -615,6 +629,16 @@ last for decades.**
   threads (median 0.26 s, 95th percentile 1.44 s), against 0.028 s at 20
   [measured, x86 dev machine, 128 grinds each, SIMD]; interaction PoW 8
   is negligible.
+- **The wrap's grind:** format 39's PoW 26 is ground with scalar
+  Blake2b-256 (RustCrypto's `blake2`; the fork's Blake2b grinder hashes
+  one nonce at a time, parallel over threads alone): 2^26 hashes
+  expected, at about 410 cycles a compression (§8's native BLAKE2b) about
+  8–10M a second a thread, 50–70M on the dev machine's pool, so about
+  1–1.5 s on average and about three times that at the 95th percentile
+  (the grind's geometric tail) [est], beside the wrap's 7.1 s. Not
+  measured yet: the run that measures it times `<SimdBackend as
+  GrindOps<Blake2bChannel>>::grind` at 26 bits over 64 or more channel
+  states, as the segment's 128 grinds were.
   Leaves and folds keep PoW 20, and their 44 queries make a fold about 13%
   dearer than 39 would [model]. The inner proven count is set by the query
   term.
@@ -838,7 +862,7 @@ last for decades.**
   - proving time (mitigated by publishing at the window cadence);
   - the public fields the kernel declares.
 
-## 6. Verifiers [proposed]
+## 6. Verifiers [built: the final verifier, the statement, the JAM statements service and the venue rules; Kreivo's pallet proposed]
 
 - **Peers:** native, on the same crate.
 - **Kreivo, a general-purpose pallet** [decided], `pallet-spaces`
@@ -900,7 +924,8 @@ last for decades.**
     `panic` and unchecked arithmetic outside their tests; every such site
     on the fork's verify path at the pin is listed with its guard
     (`SECURITY.md`, § Panic-freedom); the fuzz targets (`pvm/proof/fuzz`)
-    run in CI.
+    are replayed from their corpora in `just gate` and fuzzed a minute a
+    target in `just ci-full`.
   - **Every re-pin is a governance event at every venue:** a segment
     format bump (any base-AIR hardening) changes every program id, and a
     change to `recair`'s compiler or gate set changes every leaf-circuit
@@ -959,7 +984,7 @@ last for decades.**
   comes later (`open.md`). The worker proves statements at an anchored cut
   alone (an attest with a window), the only statements a venue judges.
 
-## 7. Roots and anchors [proposed]
+## 7. Roots and anchors [decided, and built in `vos-anchor`; Kreivo's pallet proposed]
 
 The anchoring protocol keeps as few states as it can: its state machine
 had grown hard to reason about, so equivocation is terminal, a node has
@@ -1067,7 +1092,10 @@ a device kernel proved under the device profile (format 47): the stock
 phone's budgets for a statement under the device profile: at most 1.0 s,
 1 GiB of peak resident memory and a 1.5 MiB proof, verified on the phone
 and accepted at a space's ingress, its verify at ingress at most 40 ms on
-one x86 core. All are met (below).
+one x86 core. Measured (below): met at format 46, since retired, on the
+Fairphone 6 (the time, the memory, the proof and the ingress verify),
+and at format 47 on the Pixel 1; format 47 on the Fairphone 6 is
+pending, the phone sessions'.
 
 **1. The credential values and the stock kernels** [built]. The stock
 kernels prove facts about a device secret `s`, and a space's ingress
@@ -1626,8 +1654,10 @@ many requests wait, then keeps its verifier. A guard admits its kernel's
 release and, until its date, the previous one (`light-node.md` §4.4,
 compatibility windows); the binding names which. A run is traced with at most 2^18 gas
 (`device::GAS`): the CPU's most steps, and as much again for its
-Poseidon2 calls (about 109 a run, fewer as its steps grow; a kernel past
-them fails its install out of gas). The stock auth kernel's arguments
+Poseidon2 calls (3,000 gas a call, `POSEIDON2_GAS`: at most 87 a run,
+`2^18 / 3,000`, fewer as its steps grow, as the stock auth kernel's 43
+take 129,000 beside its 19,000 or so steps; a kernel past them fails its
+install out of gas). The stock auth kernel's arguments
 are the path's 32 siblings from the leaf's level up and its slot (eight
 little-endian bytes), the secret's 32 bytes and the claim, in that order,
 which `vos-light`'s `prove_auth` writes; a kernel that reads them
@@ -1817,7 +1847,7 @@ that narrows the inner proof makes folds cheaper too.
 | the final wrap misses its gas or size | **retired:** the masked wrap verified on the JAM-only host in 79.3M gas and in Wasm in 44.9M instructions (§3.5) [measured] |
 | the multi-step FRI path, or the Blake2b channel, is unsound | a review plus tamper tests before a format admits them |
 | the wrap misses its 80 proven bits | **retired:** affine DEEP batching, 82.6 proven bits (§3.5) [model] |
-| masking the wrap costs more than (c)'s factor | **retired:** format 39 at a 3.6 GiB heap and 79.3M gas [measured], within the bound of 24 GiB and 200M gas; leakage and soundness tests |
+| masking the wrap costs more than (c)'s factor | **retired:** format 39 at a 3.6 GiB heap and 79.3M gas [measured], within the design's budget of 24 GiB and 200M gas and the tests' tighter bounds (A.7); leakage and soundness tests |
 | the cut and held build fail under failover | the cut and the held build across a leader change |
 | the prover worker falls behind the window cadence | the worker measured against the cadence |
 | the teammate's pallet diverges from the design | the pallet against the conformance vectors |
@@ -2122,12 +2152,20 @@ changed. Every verdict is the same natively, in Wasm (PVF and client;
 - **Cheap refusals:** a judgement refused before its proof costs no proof
   lookup on the JAM-only host, and a proof longer than 256 KiB is refused
   before its lookup.
-- **The guests' size:** the venue's guest's program is 391,784 bytes,
-  within JAM's 4,000,000-byte bound on a
+- **The guests' size:** the JAM statements service's program is 391,784
+  bytes (the harnesses' `final-verify.elf`, 454,662) [measured,
+  2026-10-24], within JAM's 4,000,000-byte bound on a
   service's code, its only size bound.
 
-**A.7 Budgets per node.** Heavy tests run
-under `systemd-run` with these caps as `MemoryMax`.
+**A.7 Budgets per node** [projected: the design's budgets], each beside
+what is measured. The tests hold tighter bounds of their own: the masked
+wrap's refuses past a 4,608 MiB heap peak or 8 GiB resident
+(`pvm/proof/tests/common/mod.rs`), its verify on the JAM-only host past
+125M gas (`vos-pvm-recair`'s `recursion` test) and a fixture's judgement
+there past 150M (`vos-statement`'s `fixtures` test); and `just
+test-proof` runs every prover suite under one 12 GiB `MemoryMax`, which a
+segment's measured 4.8 GiB fits (`recursion-air.md` §4.8), not its 24 GiB
+budget.
 
 | node | rows | memory | time |
 |---|---|---|---|
@@ -2136,5 +2174,8 @@ under `systemd-run` with these caps as `MemoryMax`.
 | fold | the padded shape | ≤ 4 GiB; 942 MiB of heap [measured] | 1.2–2.6 s [projected]; ≤ the leaf's; 1.5 s [measured] |
 | wrap (39) | ≤ 2^17; 2^14 / 2^15 / 2^11 [measured] | ≤ 8 GiB; a 3,627 MiB heap [measured] | ≤ 15 s; 7.44–8.40 s under load [measured] |
 
-A window of 16 segments proves end to end in about 3–5 minutes
-[projected].
+A window of 16 segments proves end to end on one prover in about 2.6
+minutes by the window statement's measured times (§3.2: a segment 5.7 s,
+a leaf 1.9 s, a fold 1.75 s, the wrap 7.1 s; 16 × 5.7 + 16 × 1.9 + 15 ×
+1.75 + 7.1 ≈ 155 s) [derived, node side], inside the 3–5 minutes the
+design projected.

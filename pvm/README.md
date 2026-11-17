@@ -4,8 +4,7 @@ This directory owns the virtual machine, compiler, snapshot codec, and proof
 implementation used by VOS, the actor ABI (`abi`) and the committed maps'
 Merkle tree its keys are laid out for (`tree`), both VOS's own. No package
 here depends on a path outside this directory, on any edge, dev edges
-included (`just check-layers`, which would allow `support/`'s vendored
-crates, of which none is depended on). Runtime and compiler changes are
+included (`just check-layers`). Runtime and compiler changes are
 reviewed and released with the rest of the repository.
 
 ## What it needs from outside it
@@ -27,9 +26,11 @@ merged with the trees around it:
   (`agent/test-actors`, on the node side), built there and committed here;
   the directory's tests read the committed file alone.
 - **The shared files:** the root `Cargo.toml` and `Cargo.lock`,
-  `blobs.lock` and the `justfile`. The venue guests (`final-verify.elf`,
-  `statement-service.elf`) resolve on the root lock, so a dependency
-  change outside this directory can move their bytes.
+  `blobs.lock` and the `justfile`. The PVM guests `blobs.lock` pins
+  (`statement-service.elf`, the JAM statements service's program, the
+  one deployed; `final-verify.elf`, the harnesses' JAM-only program)
+  resolve on the root lock, so a dependency change outside this directory
+  can move their bytes.
 
 ## What reads it from outside
 
