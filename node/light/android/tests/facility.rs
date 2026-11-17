@@ -411,6 +411,21 @@ fn the_screens_go_over_the_spaces_onion_or_its_opt_out() {
         Some(world.onion(1).ssh_host_key),
         "the gateway's name with its root's dot"
     );
+    let (_ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let own = node
+        .screens(
+            vos_facility::StreamTarget {
+                host: world::address(&world, 1),
+                port: 22,
+            },
+            OwnedFd::from(theirs),
+        )
+        .unwrap();
+    assert_eq!(
+        own,
+        Some(world.onion(1).ssh_host_key),
+        "the space's own onion is the space's, its key pinned"
+    );
     node.opt_out(HANDLE, true).unwrap();
     assert_eq!(screens("gateway.test").unwrap(), Some(ssh_host_key()));
     let seen = world.state.lock().unwrap().seen.clone();

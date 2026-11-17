@@ -263,6 +263,12 @@ impl Arti {
         bootstrapped
     }
 
+    /// Tor held back for `why`: no bootstrap is tried until the user asks.
+    pub fn hold(&self, why: String) {
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) =
+            (crate::personal::Tor::Blocked, why);
+    }
+
     /// Tor's state as its last bootstrap found it, and why it is blocked.
     pub fn state(&self) -> (crate::personal::Tor, String) {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -346,13 +352,11 @@ impl Net {
         }
     }
 
-    /// The bridges kept, which the process's arti is built with.
-    pub fn bridges_kept(directory: &Path) -> Vec<String> {
-        Kept::open(directory)
-            .and_then(|kept| kept.get(BRIDGES))
-            .ok()
-            .flatten()
-            .unwrap_or_default()
+    /// The bridges kept, which the process's arti is built with; why they
+    /// cannot be read, when the database is refused or the row does not
+    /// decode.
+    pub fn bridges_kept(directory: &Path) -> Result<Vec<String>, String> {
+        Ok(Kept::open(directory)?.get(BRIDGES)?.unwrap_or_default())
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -570,6 +574,12 @@ impl Net {
         kept.put(BRIDGES, &lines)?;
         self.state().bridges = lines;
         Ok(())
+    }
+
+    /// Why the facility's database does not read, if it does not: every
+    /// route then its pinned one, every change refused.
+    pub fn repair(&self) -> Option<String> {
+        self.kept.as_ref().err().cloned()
     }
 
     /// Tor's state, and why it is blocked: connected for a client that

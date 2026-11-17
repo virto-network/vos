@@ -324,6 +324,15 @@ public final class Words {
       case ErrorCode.STORE:
         into.why = Why.STORE;
         break;
+      case ErrorCode.ARGUMENTS:
+        into.why = Why.ARGUMENTS;
+        break;
+      case ErrorCode.SOURCE:
+        into.why = Why.SOURCE;
+        break;
+      case ErrorCode.PROVE:
+        into.why = Why.PROVE;
+        break;
       default:
         into.why = Why.FAILED;
     }

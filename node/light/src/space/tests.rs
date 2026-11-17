@@ -295,38 +295,43 @@ fn a_restore_is_refused_while_a_claim_waits() {
     );
 }
 
-/// The device's store is the newest a first batch made its own: a newer
-/// one with none (a leave cut short) is deleted, and so is one a fresh
-/// install was killed before writing; a leave whose first batch was
-/// written is the device's.
+/// The device's store is the newest named: a store is made whole under a
+/// partial directory and named once its first batch is written, so a leave
+/// cut short (its partial store beside the device's) leaves the device's
+/// standing, and is deleted at the next open; a leave named is the
+/// device's; a named store its first batch did not mark is refused, kept.
 #[test]
-fn the_store_is_the_newest_made_the_devices() {
+fn the_store_is_the_newest_named() {
     let artifacts = artifacts();
     let directory = tempfile::tempdir().unwrap();
     let (generation, light) = store(directory.path(), &artifacts).unwrap();
     assert_eq!(generation, 0);
     assert!(rows::ready(light.store()).unwrap());
     drop(light);
-    let cut = light_dir(directory.path(), 1);
+    let cut = partial(directory.path(), 1);
     create_private(&cut).unwrap();
     drop(Light::open(&cut, &artifacts.agent, Config::default()).unwrap());
     let (generation, light) = store(directory.path(), &artifacts).unwrap();
-    assert_eq!(generation, 0);
-    assert!(!cut.exists(), "the leave cut short deleted");
+    assert_eq!(generation, 0, "a partial store is no generation");
     drop(light);
+    drop_stores(directory.path(), 0);
+    assert!(!cut.exists(), "the leave cut short deleted");
     drop(fresh(directory.path(), &artifacts, 1, &State::default()).unwrap());
+    assert!(
+        fresh(directory.path(), &artifacts, 1, &State::default()).is_err(),
+        "a named store is never written over"
+    );
     let (generation, light) = store(directory.path(), &artifacts).unwrap();
     assert_eq!(generation, 1, "the leave's store is the device's");
     drop(light);
 
-    let killed = tempfile::tempdir().unwrap();
-    let first = light_dir(killed.path(), 0);
-    create_private(&first).unwrap();
-    drop(Light::open(&first, &artifacts.agent, Config::default()).unwrap());
-    let (generation, light) = store(killed.path(), &artifacts).unwrap();
-    assert_eq!(generation, 0);
-    assert!(
-        rows::ready(light.store()).unwrap(),
-        "made anew and the device's"
-    );
+    let unmarked = tempfile::tempdir().unwrap();
+    let named = light_dir(unmarked.path(), 0);
+    create_private(&named).unwrap();
+    drop(Light::open(&named, &artifacts.agent, Config::default()).unwrap());
+    assert!(matches!(
+        store(unmarked.path(), &artifacts),
+        Err(Error::NeedsRepair(_))
+    ));
+    assert!(named.exists(), "kept as it is");
 }

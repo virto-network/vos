@@ -87,7 +87,8 @@ Tor's bridges and the per-space opt-out; the personal space's status
 the notices standing, what needs repair), which the screens branch on; and the
 personal space's operations (`src/personal/`, called as
 `node.personal()?.claim(..)`), each refusing with a `Refused` of its `Why`
-(`vos_light::space::Error`'s kinds), worded by the screens' `Words`. Every native
+(`vos_light::space::Error`'s kinds), worded by the screens' `Words`. Every
+native
 method is one entry of `src/android.rs`'s `natives!` table, which
 `cargo test` holds the Java `native` declarations to. A debug build's probe
 runs from a shell through s4's `VosProbe` (`am instrument -w -r -e op sync -e
@@ -138,7 +139,8 @@ space (a move, a pairing from another one) makes the light node's store anew
 under `light.<n>`, made the device's by its first batch, the old store deleted
 after. `tests/crashes.rs` kills it at each request of each flow. A phone of an
 earlier build (light `LAYOUT` 6 or before, enrollments as TOML files) clears the
-app's data and claims or pairs again, and enrolls again. A device paired in enrolls in each offered
+app's data and claims or pairs again, and enrolls again. A device paired in
+enrolls in each offered
 space with the key its handle there came from.
 
 ## Tor

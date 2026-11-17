@@ -318,6 +318,28 @@ impl Facility {
             .collect())
     }
 
+    /// The space whose routes pin the onion service `host` names, if one
+    /// does: s4's screens to it are that space's, with the key it pinned.
+    pub fn onion_space(&self, host: &str) -> Result<Option<crate::net::SpaceId>, Refusal> {
+        let Some(key) = vos_light::tor::onion_key(host.trim_end_matches('.')) else {
+            return Ok(None);
+        };
+        let net = &self.inner.net;
+        for enrollment in self.inner.store.all().map_err(store_error)? {
+            if net.client().routes(&enrollment.handle).is_none() {
+                net.pin(enrollment.handle, pinned(&enrollment));
+            }
+            let pins = net
+                .client()
+                .routes(&enrollment.handle)
+                .is_some_and(|routes| routes.onions.iter().any(|onion| onion.key == key));
+            if pins {
+                return Ok(Some(enrollment.handle));
+            }
+        }
+        Ok(None)
+    }
+
     /// The space whose screens the gateway `gateway` names serves: one
     /// enrolled through that gateway whose routes take its onion, before
     /// one the user opted out to its clearnet port, before one whose

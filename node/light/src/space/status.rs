@@ -61,6 +61,12 @@ impl<H: Host> Personal<H> {
 }
 
 fn phase(held: &Held) -> Result<Phase, super::Error> {
+    // A restore stands until `restored` clears it, its group made or not.
+    if let Some(restoring) = &held.state.restoring {
+        return Ok(Phase::Restoring {
+            matures: restoring.matures,
+        });
+    }
     if let Some(group) = &held.group {
         return Ok(match group.course() {
             Course::Out => Phase::Removed,
@@ -69,11 +75,6 @@ fn phase(held: &Held) -> Result<Phase, super::Error> {
                 Phase::Joining
             }
             Course::Following => Phase::Held,
-        });
-    }
-    if let Some(restoring) = &held.state.restoring {
-        return Ok(Phase::Restoring {
-            matures: restoring.matures,
         });
     }
     if crate::home::Claim::pending(held.light.store())

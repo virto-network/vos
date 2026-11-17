@@ -231,7 +231,9 @@ impl<H: Host> Personal<H> {
 
     /// The restore matured: the kit entered again opens `R1`, the archive
     /// recovered from the recovery scope, the device's group started from
-    /// what the agent holds, the personal space read back.
+    /// what the agent holds, the personal space read back. Called again
+    /// after a process killed between its writes, it finishes from the
+    /// group already made.
     pub fn restored(&self, prompts: &dyn Prompts, kind: KitKind) -> Result<Claimed, Error> {
         let mut held = self.held();
         let (kept, agent) = (
@@ -311,16 +313,25 @@ impl<H: Host> Personal<H> {
             r_hash,
             devices,
         };
-        let mut group = DeviceGroup::restore(
-            held.light.store(),
-            GroupAgent {
-                identity: agent.1,
-                instance: PERSONAL,
-            },
-            device,
-            read,
-        )
-        .map_err(failed)?;
+        // A restore cut short after its group was made resumes with it:
+        // the archive merged again, the restore's row cleared.
+        let mut group = match held.group.take() {
+            Some(group) if group.agent().identity == agent.1 => group,
+            Some(other) => {
+                held.group = Some(other);
+                return Err(Error::AlreadyHeld);
+            }
+            None => DeviceGroup::restore(
+                held.light.store(),
+                GroupAgent {
+                    identity: agent.1,
+                    instance: PERSONAL,
+                },
+                device,
+                read,
+            )
+            .map_err(failed)?,
+        };
         group.inherit(&archive).map_err(failed)?;
         let id = group.id().unwrap_or(0);
         held.group = Some(group);

@@ -3728,9 +3728,9 @@ device's crates faster); Q9's size argument for it is small.
   `Client` whose every space is set from the onions pinned at enrollment
   (the enrollment carries the onion set, each onion with its SSH host key),
   its clearnet only the per-space opt-out of key-signed calls, kept with
-  each `refresh_onions` answer as rows of the facility's database. A spare circuit is kept
-  while a session is open; the client is dormant in the background and
-  woken around each job. Every request is `client.request` under its
+  each `refresh_onions` answer as rows of the facility's database. A
+  spare circuit is kept while a session is open; the client is dormant
+  in the background and woken around each job. Every request is `client.request` under its
   purpose: a sign-in's and a payment's proof sent by the facility itself
   (`Proven`; the s4 server gets the node's answer, never the request), the
   node's time (`Fetch`), the tree (`Feed`, a `TreeKeeper` kept beside the
@@ -3738,7 +3738,7 @@ device's crates faster); Q9's size argument for it is small.
   what the user does, `Background` for its job). s4's screens to an onion
   service no space pins go over Tor too, on a circuit of their own with no
   host key pinned (first contact, the client's known hosts deciding it);
-  `:vos` opens no other stream [amended 2026-11-17, fb2 L7].
+  `:vos` opens no other stream.
 - **The personal space**: every flow of §3.8 and §3.9 and the device set's
   operations, named on `IVosPersonal`; the light node under
   `light/`; the admin key in the UI's Keystore (Ed25519, strong biometric
@@ -3780,9 +3780,11 @@ device's crates faster); Q9's size argument for it is small.
   (`light.<n>`), the local actors installed there, then made the
   device's by its first batch (`p/ready`), which keeps the secret source
   and the label and drops the home, the agent, the admin key's public
-  half and every flow's state; the old directory is deleted after, or at
-  the next open, which takes the newest store so marked. The old admin key stays in the UI's keystore, unused
-  (`open.md`). A move home is a leave and a claim (§3.9), the new home
+  half and every flow's state, and named once written (made under
+  `light.<n>.partial`); the old directory is deleted after, or at the
+  next open, which takes the newest store named. The old admin key stays
+  in the UI's keystore, unused (`open.md`). A move home is a leave and a claim
+  (§3.9), the new home
   asked first for all it could refuse (its open claim, an agent to give,
   no agent under the device's nullifier); a pairing
   leaves first when the device holds another personal space, or this
@@ -3790,9 +3792,9 @@ device's crates faster); Q9's size argument for it is small.
   no more), and is refused while the set holds it live. The light node's
   store is laid out anew (`LAYOUT` 7): a phone of an earlier build clears
   the facility's data and claims or pairs again.
-- **One engine, the flows in `vos-light`** [built, fb2 part 2,
-  2026-11-17, decision 12]: every flow is `vos_light::space::Personal`'s,
-  over a `Host` (requests, routes, proofs, the enrollments) and `Prompts`
+- **One engine, the flows in `vos-light`** [built, `vos_light::space`]:
+  every flow is `vos_light::space::Personal`'s, over a `Host` (requests,
+  routes, proofs, the enrollments) and `Prompts`
   (the kit's words and card, the source, the admin key), refusing with
   `space::Error`; the facility is their adapter. What the device keeps
   of its personal space is rows of the light store (`p/…`), each written

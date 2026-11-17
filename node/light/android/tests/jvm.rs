@@ -173,7 +173,6 @@ fn every_type_crosses_its_parcelable_unchanged() {
                 env,
                 Refused {
                     why: *why,
-                    at: u64::MAX,
                     device: 3,
                     detail: "NotAdmitted".into(),
                 },

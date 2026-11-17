@@ -45,11 +45,13 @@ final class OverviewScreen extends Screen {
         });
   }
 
-  /** Whether the phone holds a group its devices are listed from. */
+  /**
+   * Whether the phone holds a group its devices are listed from: not while it joins, its sync key
+   * not yet admitted.
+   */
   private boolean holds() {
     return status != null
         && (status.phase == Phase.HELD
-            || status.phase == Phase.JOINING
             || status.phase == Phase.REMOVED
             || status.phase == Phase.STUCK);
   }
@@ -118,7 +120,8 @@ final class OverviewScreen extends Screen {
         break;
       case Phase.JOINING:
         into.addView(text(Words.phase(status.phase)));
-        break;
+        into.addView(button("Sync now", v -> sync()));
+        return;
       default:
         break;
     }

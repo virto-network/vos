@@ -267,10 +267,10 @@ impl Runs {
     }
 }
 
-fn job_error(_: String) -> Refusal {
+fn job_error(error: String) -> Refusal {
     refused(
         Code::Store,
-        "the background job's runs could not be read or kept",
+        format!("the background job's runs could not be read or kept: {error}"),
     )
 }
 

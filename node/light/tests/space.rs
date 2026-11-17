@@ -13,7 +13,7 @@ use vos_abi::Encode;
 use vos_light::space::{Artifacts, CREDENTIAL_BOOK, Claim, DEVICE_BOOK, Error, Personal};
 use vos_light::testing::{Phone, Reach, World, policy};
 use vos_testkit::programs::program_elf;
-use vos_wire::personal::{KitKind, Standing};
+use vos_wire::personal::{KitKind, PersonalError, Standing};
 
 const HOME: [u8; 32] = [0x61; 32];
 
@@ -120,7 +120,7 @@ fn a_space_is_claimed_and_paired_through_the_light_node() {
     assert_eq!(again.unwrap_err(), Error::AlreadyHeld);
 
     let second = device(&world, 0x22);
-    let id = second_of(&first, &second);
+    let id = first.pair(&second);
     assert_eq!(id, 1);
     assert_eq!(second.space.devices().unwrap().len(), 2);
     assert_eq!(first.standing(1), Some(Standing::Probation));
@@ -136,16 +136,12 @@ fn a_space_is_claimed_and_paired_through_the_light_node() {
     first.space.pair_cancel();
 }
 
-fn second_of(first: &Device, second: &Device) -> u32 {
-    first.pair(second)
-}
-
-/// A regroup's removal set is the agent's: the regrouper's commit names
-/// every device the agent's live set removes, or the agent refuses it
-/// (`MissingRemoval`, `NotMatured`). A device still on probation when the
-/// regroup opens and one paired while it is open (whose add the regroup
-/// voids, dropping it) are both out once it matures; the regrouper's
-/// commit takes, and it alone stays in the set.
+/// A regroup's removal set is the agent's: the regrouper's commit carries
+/// the removals the light node voices, which the agent takes only when
+/// they are exactly its live set's (`check_removals`). A device still on
+/// probation when the regroup opens and one paired while it is open are
+/// both out once it matures; the regrouper's commit takes, and it alone
+/// stays in the set.
 #[test]
 fn a_regroup_removes_what_the_agent_removes() {
     let world = World::new();
@@ -165,7 +161,6 @@ fn a_regroup_removes_what_the_agent_removes() {
     after(policy().operation_delay_ms);
     first.space.update(&first.phone).unwrap();
     let devices = first.space.devices().unwrap();
-    eprintln!("after the regroup: {devices:?}");
     for device in &devices {
         if device.me {
             assert!(!device.removed, "the regrouper stays: {devices:?}");
@@ -182,9 +177,11 @@ fn a_regroup_removes_what_the_agent_removes() {
         assert!(devices.iter().any(|device| device.id == id), "{id} listed");
     }
     let refused = late.space.update(&late.phone).unwrap_err();
-    eprintln!("the late device's next update: {refused:?}");
     assert!(
-        matches!(refused, Error::Regrouped { by: 0 } | Error::AgentRefused(_)),
+        matches!(
+            refused,
+            Error::Regrouped { by: 0 } | Error::AgentRefused(PersonalError::NotAdmitted)
+        ),
         "{refused:?}"
     );
 }

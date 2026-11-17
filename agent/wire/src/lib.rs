@@ -14,9 +14,9 @@ extern crate alloc;
 
 /// The method ids of an actor's handlers, each a constant named after its
 /// handler, and [`ALL`](personal::method::ALL) with their names: what host
-/// code calls an actor with or compares a call's method to, so a handler
-/// renamed is a build error there and a failure of the test that resolves
-/// each name in the built actor (`vos-testkit`'s `methods` test).
+/// code calls an actor with or compares a call's method to, each name held
+/// to the built actor by the test that resolves it there (`vos-testkit`'s
+/// `methods` test), so a handler renamed fails that test.
 macro_rules! methods {
     ($($id:ident = $name:literal;)*) => {
         $(

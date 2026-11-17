@@ -25,8 +25,8 @@ pub enum Error {
     NoRestore,
     /// No pairing was offered.
     NoPairing,
-    /// The personal space's file or store is one this build does not
-    /// read: kept as it is; sign-in and payments run.
+    /// The personal space's store, or a row of it, is one this build does
+    /// not read: kept as it is; sign-in and payments run.
     NeedsRepair(String),
 
     // ----- the user -----

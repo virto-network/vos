@@ -350,14 +350,12 @@ parcel! {
         pub repair: String => String,
     }
 
-    /// Why a personal operation was refused: its kind, a time or a device
-    /// it names (a restore's maturity, the device that regrouped), and its
-    /// detail (an agent's error's name, a store's failure): no prose the
-    /// screen shows as it is.
+    /// Why a personal operation was refused: its kind, a device it names
+    /// (the one that regrouped), and its detail (an agent's error's name, a
+    /// store's failure): no prose the screen shows as it is.
     #[derive(Clone, Debug, PartialEq, Eq, Default)]
     pub struct Refused {
         pub why: Why => enum Why,
-        pub at: u64 => long,
         pub device: u32 => long,
         pub detail: String => String,
     }
@@ -543,10 +541,11 @@ impl From<Refused> for Refusal {
             Why::Failed | Why::UnknownAgent => Code::Failed,
             _ => Code::Refused,
         };
-        let message = if refused.detail.is_empty() {
-            format!("{:?}", refused.why)
-        } else {
-            format!("{:?}: {}", refused.why, refused.detail)
+        // In need of repair, as `From<Refusal>` reads it back.
+        let message = match (refused.why, refused.detail.is_empty()) {
+            (Why::NeedsRepair, _) => format!("needs repair: {}", refused.detail),
+            (why, true) => format!("{why:?}"),
+            (why, false) => format!("{why:?}: {}", refused.detail),
         };
         Refusal::new(code, message)
     }
@@ -563,7 +562,6 @@ impl Refused {
         use s4_credential_contract::java::{Fields, Value as _};
         let fields = Fields::of::<Self>(object)?;
         self.why.write(&fields, env, "why")?;
-        self.at.write(&fields, env, "at")?;
         self.device.write(&fields, env, "device")?;
         self.detail.write(&fields, env, "detail")
     }
@@ -573,5 +571,23 @@ impl Refused {
 impl From<s4_credential_contract::java::JavaError> for Refused {
     fn from(error: s4_credential_contract::java::JavaError) -> Self {
         Refused::from(Refusal::from(error))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A personal refusal in need of repair stays so across s4's refusal.
+    #[test]
+    fn a_refusal_in_need_of_repair_crosses_s4s_and_back() {
+        let refused = Refused {
+            why: Why::NeedsRepair,
+            detail: "its store: layout 6".into(),
+            ..Refused::default()
+        };
+        let back = Refused::from(Refusal::from(refused));
+        assert_eq!(back.why, Why::NeedsRepair);
+        assert!(back.detail.contains("its store: layout 6"));
     }
 }

@@ -224,18 +224,26 @@ impl Node {
         device: Arc<dyn Device>,
     ) -> std::io::Result<Self> {
         let runtime = runtime()?;
-        let net = {
+        // Bridges that do not read are not none: Tor is held back rather
+        // than tried directly where they were needed.
+        let bridges = Net::bridges_kept(&directory);
+        let (net, arti) = {
             let _entered = runtime.enter();
-            let arti = Arti::new(tor, &Net::bridges_kept(&directory))
+            let arti = Arti::new(tor, bridges.as_deref().unwrap_or_default())
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
-            Arc::new(Net::over(arti, &directory))
+            (Arc::new(Net::over(Arc::clone(&arti), &directory)), arti)
         };
         let node = Self::over(runtime, directory, device, net, crate::personal::embedded())?;
-        let net = Arc::clone(node.facility.net());
-        node.runtime.spawn(async move {
-            // A failure is named when the chrome asks (`bootstrap`).
-            let _ = net.bootstrap().await;
-        });
+        match bridges {
+            Ok(_) => {
+                let net = Arc::clone(node.facility.net());
+                node.runtime.spawn(async move {
+                    // A failure is named when the chrome asks (`bootstrap`).
+                    let _ = net.bootstrap().await;
+                });
+            }
+            Err(why) => arti.hold(format!("the bridges kept do not read: {why}")),
+        }
         Ok(node)
     }
 
@@ -533,9 +541,10 @@ impl Node {
     /// between `end` (the UI's end of a socket pair) and that gateway's SSH
     /// port over its space's routes, on a circuit of its own, for as long
     /// as both sides keep it open: the SSH host key the space pinned for
-    /// that port, the one the UI accepts. An onion service no space was
-    /// enrolled through is carried over Tor all the same, on a circuit of
-    /// its own, with no key pinned: the client's known hosts decide it, as
+    /// that port, the one the UI accepts; a space's own onion is that
+    /// space's, however it was enrolled. An onion service no space pins is
+    /// carried over Tor all the same, on a circuit of its own, with no key
+    /// pinned: the client's known hosts decide it, as
     /// for any first contact. `NotEnrolled` for any other gateway no space
     /// was enrolled through: the UI connects itself.
     pub fn screens(
@@ -547,6 +556,9 @@ impl Node {
         let space = match self.facility.screens_space(&gateway) {
             Ok(space) => space,
             Err(refusal) if refusal.code == Code::NotEnrolled && onion(&gateway.host) => {
+                if let Some(space) = self.facility.onion_space(&gateway.host)? {
+                    return self.carried(space, end).map(Some);
+                }
                 let host = gateway.host.trim_end_matches('.');
                 let stream = self
                     .awake(|| {
@@ -560,12 +572,21 @@ impl Node {
             }
             Err(refusal) => return Err(refusal),
         };
+        self.carried(space, end).map(Some)
+    }
+
+    /// s4's screens carried over `space`'s routes: the key it pinned.
+    fn carried(
+        &self,
+        space: crate::net::SpaceId,
+        end: std::os::fd::OwnedFd,
+    ) -> Result<[u8; 32], Refusal> {
         let screens = self.awake(|| {
             self.runtime
                 .block_on(self.facility.net().client().screens_fd(space, end))
         });
         screens
-            .map(|screens| Some(screens.ssh_host_key))
+            .map(|screens| screens.ssh_host_key)
             .map_err(|error| refused(Code::Api, error.to_string()))
     }
 
@@ -595,7 +616,15 @@ impl Node {
     /// Tor's state and the notices standing after the last pass.
     pub fn status(&self) -> Result<PersonalStatus, Refused> {
         let (tor, tor_why) = self.facility.net().tor();
-        let standing = self.job.standing().map_err(Refused::from)?;
+        // The facility's database not read is the facility in need of
+        // repair, whatever the personal space is.
+        let (standing, mut repair) = match self.job.standing() {
+            Ok(standing) => (standing, None),
+            Err(refusal) => (Vec::new(), Some(refusal.message)),
+        };
+        if let Some(why) = self.facility.net().repair() {
+            repair.get_or_insert(why);
+        }
         let mut status = match &self.personal {
             Some(Ok(space)) => space.status()?,
             Some(Err(refused)) if refused.why == Why::NeedsRepair => PersonalStatus {
@@ -607,6 +636,9 @@ impl Node {
             None => return Err(no_personal()),
         };
         (status.tor, status.tor_why, status.standing) = (tor, tor_why, standing);
+        if let Some(repair) = repair {
+            (status.phase, status.repair) = (Phase::NeedsRepair, repair);
+        }
         Ok(status)
     }
 

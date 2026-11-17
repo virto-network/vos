@@ -1017,6 +1017,9 @@ fn a_facility_database_this_build_does_not_read_is_refused_and_kept() {
     };
     let refused = phone.node.enrollments().unwrap_err();
     assert_eq!(refused.code, Code::Store, "{refused:?}");
+    let status = phone.node.status().unwrap();
+    assert_eq!(status.phase, vos_facility::personal::Phase::NeedsRepair);
+    assert!(status.repair.contains("needs repair"), "{status:?}");
     let devices = phone
         .node
         .personal()

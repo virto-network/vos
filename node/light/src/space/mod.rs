@@ -203,30 +203,41 @@ fn light_dir(directory: &Path, generation: u32) -> PathBuf {
 }
 
 /// The device's store under `directory`, and its generation: the
-/// newest a first batch made the device's. A newer one with none is a
-/// leave cut short, deleted; none at all, a fresh install, made now.
-/// One this build does not read is refused, and left as it is.
+/// newest, each one there made whole before it is named ([`fresh`]); none
+/// at all, a fresh install, made now. One this build does not read, or
+/// one its first batch did not make the device's, is refused, and left as
+/// it is.
 fn store(directory: &Path, artifacts: &Artifacts) -> Result<(u32, Light), Error> {
-    let mut generations = generations(directory);
-    generations.sort_unstable_by(|a, b| b.cmp(a));
-    for generation in &generations {
-        let dir = light_dir(directory, *generation);
-        let light = Light::open(&dir, &artifacts.agent, Config::default())
-            .map_err(|error| Error::NeedsRepair(format!("its store: {error}")))?;
-        if rows::ready(light.store())? {
-            return Ok((*generation, light));
-        }
-        drop(light);
-        std::fs::remove_dir_all(&dir).map_err(store_failed)?;
+    let generations = generations(directory)?;
+    let Some(generation) = generations.iter().copied().max() else {
+        return Ok((0, fresh(directory, artifacts, 0, &State::default())?));
+    };
+    let light = Light::open(
+        &light_dir(directory, generation),
+        &artifacts.agent,
+        Config::default(),
+    )
+    .map_err(|error| Error::NeedsRepair(format!("its store: {error}")))?;
+    if !rows::ready(light.store())? {
+        return Err(Error::NeedsRepair(
+            "its store was not made the device's".into(),
+        ));
     }
-    let generation = generations.first().copied().unwrap_or(0);
-    let light = fresh(directory, artifacts, generation, &State::default())?;
     Ok((generation, light))
 }
 
+/// Where a store of `generation` is made before it is named.
+fn partial(directory: &Path, generation: u32) -> PathBuf {
+    let mut dir = light_dir(directory, generation).into_os_string();
+    dir.push(".partial");
+    PathBuf::from(dir)
+}
+
 /// A store made anew as generation `generation`, its local actors
-/// installed, made the device's by its first batch, which writes
-/// `state`.
+/// installed, made the device's by its first batch, which writes `state`:
+/// all of it under a partial directory, renamed to the generation's once
+/// written, so a store cut short is never one the next open takes. A
+/// generation already there is refused: nothing named is written over.
 fn fresh(
     directory: &Path,
     artifacts: &Artifacts,
@@ -235,34 +246,54 @@ fn fresh(
 ) -> Result<Light, Error> {
     let dir = light_dir(directory, generation);
     if dir.exists() {
-        std::fs::remove_dir_all(&dir).map_err(store_failed)?;
+        return Err(Error::NeedsRepair(format!(
+            "its store of generation {generation} is there already"
+        )));
     }
-    create_private(&dir).map_err(store_failed)?;
-    let light = Light::open(&dir, &artifacts.agent, Config::default()).map_err(store_failed)?;
-    install(&light, &artifacts.books)?;
-    light
-        .store()
-        .write_group_rows(state.first_rows())
+    let making = partial(directory, generation);
+    if making.exists() {
+        std::fs::remove_dir_all(&making).map_err(store_failed)?;
+    }
+    create_private(&making).map_err(store_failed)?;
+    {
+        let light =
+            Light::open(&making, &artifacts.agent, Config::default()).map_err(store_failed)?;
+        install(&light, &artifacts.books)?;
+        light
+            .store()
+            .write_group_rows(state.first_rows())
+            .map_err(store_failed)?;
+    }
+    std::fs::rename(&making, &dir).map_err(store_failed)?;
+    std::fs::File::open(directory)
+        .and_then(|directory| directory.sync_all())
         .map_err(store_failed)?;
-    Ok(light)
+    Light::open(&dir, &artifacts.agent, Config::default()).map_err(store_failed)
 }
 
-/// The generations of the stores under `directory`.
-fn generations(directory: &Path) -> Vec<u32> {
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return Vec::new();
+/// The generations of the stores under `directory` (a partial one is
+/// none).
+fn generations(directory: &Path) -> Result<Vec<u32>, Error> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(store_failed(error)),
     };
-    entries
-        .flatten()
-        .filter(|entry| entry.path().is_dir())
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            match name.strip_prefix(LIGHT)? {
-                "" => Some(0),
-                rest => rest.strip_prefix('.')?.parse().ok(),
-            }
-        })
-        .collect()
+    let mut generations = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(store_failed)?;
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let generation = match name.strip_prefix(LIGHT) {
+            Some("") => Some(0),
+            Some(rest) => rest.strip_prefix('.').and_then(|rest| rest.parse().ok()),
+            None => None,
+        };
+        generations.extend(generation);
+    }
+    Ok(generations)
 }
 
 /// The stores of generations other than `generation` under `directory`,
@@ -456,7 +487,7 @@ impl<H: Host> Personal<H> {
     /// The personal space under `directory`, its light node opened from
     /// `artifacts`, its local actors installed or upgraded, what a flow
     /// left done in the store made the device's, its homes' routes told to
-    /// the host. A state file or a store this build does not read is
+    /// the host. A store this build does not read, or a row of it, is
     /// refused as in need of repair, and left as it is.
     pub fn open(directory: &Path, artifacts: &Artifacts, host: H) -> Result<Self, Error> {
         let (generation, light) = store(directory, artifacts)?;
@@ -542,8 +573,8 @@ impl<H: Host> Personal<H> {
     /// the home, the agent, the admin key and every flow's state; the old
     /// store's directory deleted after. The device then holds no personal
     /// space, as at a fresh install: it claims, or pairs, with new sync and
-    /// admin keys. Cut short before that batch, the old space stands; after
-    /// it, the old directory goes at the next open.
+    /// admin keys. Cut short before the new store is named, the old space
+    /// stands; after, the old directory goes at the next open.
     fn leave(&self, held: &mut Held) -> Result<(), Error> {
         let generation = held.generation + 1;
         let state = State {
