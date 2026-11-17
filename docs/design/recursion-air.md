@@ -688,7 +688,7 @@ and fold layout of §1.1 is unchanged.
 | memory, time | 2.2–4.9 GiB, 4.4–9.5 s unmasked [projected]; masked (format 39) as built: a 3.6 GiB heap [measured] | projected, measured |
 | JAM gas, unmasked | 81.1M with the model's Blake2s; **85.2M Blake2b-256 in software (×1.05); 64.1M through `0x400` (×0.79)** | model |
 | JAM gas, masked | **79.3M** as built, the decode 1.50M of it [measured] | measured |
-| proof | about 122 KB unmasked [model]; masked as built 144,260 B (`wrap.proof`) [measured, 2026-11-01] | model, measured |
+| proof | about 122 KB unmasked [model]; masked as built, `wrap.proof` is 142,468 bytes (the committed fixture) | model, measured |
 
 - The gas uses a fit, within 5.8%, measured on a proxy verifier
   (`gas ≈ −4.2M + 59.3k·C + 2,171·q·C + 17,183·P + 9,376·F`) at 458 columns,
@@ -712,7 +712,7 @@ and fold layout of §1.1 is unchanged.
 
 ## 8. `vos-pvm-final-verifier`
 
-At `pvm/proof/final-verifier`, no_std, for x86, wasm32 and riscv64em-javm
+At `pvm/proof/final-verifier`, no_std, for x86, wasm32 and riscv64em-vos
 (`proving.md` §3.6). The source uses no nightly feature: it builds on stable
 for x86 and wasm32, and the JAM build runs on the pinned nightly with
 build-std. It holds:
@@ -833,7 +833,7 @@ needs the SIMD Poseidon2 hasher for speed, not for correctness.
 | R8 | **Time and memory** come from other provers' rates | §10's steps 4–6 measure |
 | R9 | **Fold step 3 or the Blake2b channel is unsound** | the fork's review and tamper tests before the format admits them (§10's step 7) |
 | R10 | **The wrap's gas**: the fit is on a one-component proxy | §10's step 7 verifies the real wrap on the JAM-only host |
-| R11 | **The final verifier needs nightly** (the pin's `portable_simd` is prover-only; riscv64em-javm needs build-std) | §10's step 1 builds the skeleton with no nightly feature in the source: on stable for x86 and wasm32, on the pinned nightly with build-std for JAM |
+| R11 | **The final verifier needs nightly** (the pin's `portable_simd` is prover-only; riscv64em-vos needs build-std) | §10's step 1 builds the skeleton with no nightly feature in the source: on stable for x86 and wasm32, on the pinned nightly with build-std for JAM |
 | R12 | **Signed multiplicities**: a yield by a first consumer is new soundness surface | §1.1's argument; the `Context`'s static checks; the audit of that argument; the forgery gates (`recair/tests/gates`): a malicious prover that skips the static check and Stwo's own, its proof refused by the verifier, by name, for a use carrying another value, a public use added or dropped, a yield consumed once more, a second yield (a negative multiplicity: refused as another circuit, since the relation alone balances it and only checked wirings are committed, which a test pins); likewise `p2`'s modes and chaining and `assert_one_of`; unread lanes, and reads of no wire, by the static check in `check_wiring` on every circuit; the leaf's boundary bytes by the leaf's logup and OODS checks, two of them also proved and refused by the verifier |
 | R13 | **Masking the wrap** costs more than (c)'s ×1.6 | a masked toy wrap measured memory ×1.41 and gas ×1.21–1.24, time ×2.6–2.9 (Blake2b Merkle hashing at a lifting one level higher); the masked wrap as built (format 39): a 3.6 GiB heap and 79.3M gas [measured], within the gate (≤ 24 GiB, ≤ 200M gas, `proving.md` §10) |
 

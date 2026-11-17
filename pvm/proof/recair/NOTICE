@@ -16,8 +16,9 @@ at its top and states that it was modified (Apache-2.0 §4(b)):
 - src/value.rs, from crates/circuits/src/ivalue.rs.
 
 It also adapts code from Stwo (https://github.com/starkware-libs/stwo), as
-the workspace pins it (the fork olanod/stwo at bbfa8bc3), Copyright
-StarkWare Industries Ltd., licensed under the Apache License, Version 2.0,
+of the fork olanod/stwo at bbfa8bc3, an ancestor of the workspace's pin,
+Copyright StarkWare Industries Ltd., licensed under the Apache License,
+Version 2.0,
 each file naming its source and stating that it was modified:
 
 - src/verifier/merkle.rs's `expand_decommitment`, from

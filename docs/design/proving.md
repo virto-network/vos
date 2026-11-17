@@ -408,10 +408,11 @@ attribution). Its full design is `recursion-air.md`.
   - **the window kernel's wrap:** 148,868 bytes, proved in 7.44 s under
     load at a 3,627 MiB heap peak;
   - **on the JAM-only host** (`final-verify.elf`, Blake2b-256 in
-    software, the guests' allocator a bump over its arena): a `valid`
-    fixture proof of 146,564 bytes in 79.3M gas, the decode 1.50M of it
-    and the verify 77.8M; the JAM statements service's refine of one
-    statement 79.4M;
+    software, the guests' allocator a bump over its arena): the `valid`
+    fixture's proof, 146,564 bytes in the fixtures of that measurement
+    (A.6 gives the committed one's length), in 79.3M gas, the decode
+    1.50M of it and the verify 77.8M; the JAM statements service's
+    refine of one statement 79.4M;
   - **in Wasm** under the PVF's semantics: 44.9M instructions (the window
     kernel's proof), 46.4M of the 50M budget at the worst shape.
 - **Levers:** the Blake2b hook is deferred, a lever for when ref_time
@@ -545,7 +546,7 @@ pub struct Statement {
   - `recair-air` (`vos-pvm-recair-air`): the components' constraint bodies,
     no_std, with no prover dependency;
   - `final-verifier` (`vos-pvm-final-verifier`): no_std, for x86, wasm32
-    and riscv64em-javm;
+    and riscv64em-vos (the PVM target);
   - `anchor` (`vos-anchor`): `SpaceId` and the genesis it hashes, the
     window clock, root kinds, anchors, and the digests a venue checks
     signatures over (the space root, the anchor, the registration, a JAM
@@ -866,8 +867,9 @@ last for decades.**
     reference mock of the designed pallet and the conformance vectors
     (`tools/kreivo/conformance`), which the teammate's pallet must pass.
     The chain transport (on sube, signing with the node's sr25519
-    authority key) is a port of master's substrate extension onto the
-    node's extension host: VOS's work once that host exists. The pallet is
+    authority key) is a port of the substrate extension VOS's master held
+    at `d2378274c` (`extensions/substrate`, removed from master with the
+    change that lands `pvm/` alone) onto the node's extension host: VOS's work once that host exists. The pallet is
     the teammate's. Until both exist, no node reaches Kreivo
     (`spaces-pallet.md` §9.1; `open.md`).
   - The weights and benchmarks are the teammate's.
@@ -2079,9 +2081,10 @@ kernel stating a fixed statement `S` (two roots of its space, a nonce, an
 output; its `public_args` a venue's id and a nonce, which the io-hash
 binds and no venue reads apart) in three segments, folds them and wraps
 the root under format 39, masked from the seeded test seam
-(`MaskRng::Seeded`, so the bytes are its own every run: `wrap.proof`,
-148,612 bytes); and it wraps two roots that are not a whole run, as a
-cheating prover would, the wrap's checks failing (`wrap-prefix.proof`, `wrap-midway.proof`). The
+(`MaskRng::Seeded`, so the bytes are its own every run; `wrap.proof` is
+142,468 bytes, a size that moves a few percent with the seed); and it
+wraps two roots that are not a whole run, as a cheating prover would,
+the wrap's checks failing (`wrap-prefix.proof`, `wrap-midway.proof`). The
 generator makes the same bytes in every build of the prover: a kernel's
 program id does not depend on the features a build turns on (the drawn
 relations are kept in the order drawn, never in `TypeId` order).

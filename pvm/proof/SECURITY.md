@@ -301,7 +301,9 @@ decommitments and queried values; each tree's sampled and queried columns
 its pinned width; each column's samples its sample points; FRI's inner
 layers its rounds; the last layer `2^6`; every limb canonical), and its
 fixed layout's pins and bounds. "Ours" is a value the verifier
-computes from the format, never read from the proof.
+computes from the format, never read from the proof. The sites below were
+audited at the fork's revision `e14925a8`, the workspace's pin (`just
+doc-check` fails when the pin moves and this line does not).
 
 | # | site (`crates/stwo/src/core/…`) | guard |
 |---|---|---|
@@ -394,8 +396,9 @@ SIMD backend's Blake2s-M31 digest words reduced canonically over the whole
 u32 range, as the verifier reduces them, on `vos/grind-chunks`' `4cd1f83f`:
 the prover's parallel grind in chunks of 2^14 nonces, its nonce unchanged,
 on `vos/verify-panics`' `c3ec9813`, on `vos/wrap`'s `ab294189`). Its divergence
-log, in the fork's tree at the pinned revision
-(<https://github.com/olanod/stwo/blob/e14925a81606b4d68c6a5d3047d382a20bd953d3/.claude/skills/paper-implementation-divergence-log.md>), holds two
+log is kept in the fork's tree at the pinned revision, in its tools'
+configuration directory (`.claude/skills/`) rather than its docs
+(<https://github.com/olanod/stwo/blob/e14925a81606b4d68c6a5d3047d382a20bd953d3/.claude/skills/paper-implementation-divergence-log.md>), and holds two
 open items both wraps' counts rest on, and one the verifier's
 panic-freedom does:
 
@@ -697,17 +700,23 @@ Who performs it, and when, is open.
   proof is verified directly (a reference path; no production build
   verifies one natively).
 - [ ] **Plan for liveness failures:** a fallback or another prover.
-- [ ] **Treat `javm` as the reference:** a proof shows a trace matches
-  javm's PVM semantics, so a javm bug is a bug here.
+- [ ] **Treat `vos-pvm` as the reference:** a proof shows a trace matches
+  the PVM semantics of `vos-pvm` (`pvm/runtime`, in this repository, at
+  the Gray Paper pin `pvm/SPECIFICATION.md` names), so an interpreter bug
+  is a bug here.
 
 ## Reporting issues
 
-Soundness or verifier-DoS bugs: a private issue, or the maintainers
-directly. Interpreter divergences belong in the javm tracker.
+Report soundness and verifier-DoS bugs privately, never in a public
+issue: **[the owner supplies the private contact address here before
+release]**. Interpreter divergences from the Gray Paper are proving bugs
+(the tracer drives the interpreter) and are reported the same way.
 
 ## Stability
 
-- Stwo and javm are pinned to git revisions in the workspace's
-  `Cargo.toml`; a deployer who vendors this crate pins them too.
+- Stwo is pinned to a git revision in the workspace's `Cargo.toml`; a
+  deployer who vendors this crate pins it too. The interpreter, `vos-pvm`
+  (`pvm/runtime`), is a path member of this repository, versioned with
+  it.
 - A proof's encoding is specified by its source and its format number
   alone; keep a verifier build beside any archived proof.
