@@ -10,7 +10,7 @@ all-features = true
 version = 2
 yanked = "warn"
 # Each advisory left open, with what holds it: none has an upgrade the
-# crate that pulls it accepts. Reviewed 2026-11-13.
+# crate that pulls it accepts. Reviewed 2026-11-17.
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = "rsa 0.9 (Marvin timing): arti's tor-llcrypto and ssh-key verify RSA identity keys of relays, public data; VOS signs nothing with RSA. No fixed 0.9." },
     { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 (timing): through elliptic-curve 0.13 (mls-rs's P-256/P-384 suites, arti) and through starknet-ff under Stwo, the prover; the device group's suite is CURVE25519_AES128 (`vos-mls`). Fixed in 0.7 only, which neither takes." },
@@ -18,6 +18,8 @@ ignore = [
     { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill unmaintained: heapless 0.7 under postcard 1; no code path on a target without atomics." },
     { id = "RUSTSEC-2025-0141", reason = "bincode 1 unmaintained: a dev-dependency of the proving crates' tests (vos-pvm-proof, its verifier, vos-pvm-recair); nothing a node ships decodes with it." },
     { id = "RUSTSEC-2024-0436", reason = "paste unmaintained: a build-time macro under arti's dependencies and under ark-ff (starknet-ff, Stwo)." },
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained: under russh through russh-util (the gateway's SSH port, s4-server, the light node's SSH client), which names no replacement yet; no upgrade exists." },
+    { id = "RUSTSEC-2026-0542", reason = "humantime unmaintained (it wraps chrono): durations in arti's configuration and directory crates; arti names no replacement yet, and no upgrade exists." },
 ]
 
 [licenses]
