@@ -509,7 +509,7 @@ fn every_masked_value_is_fresh_and_the_seam_reproduces_bytes() {
 #[test]
 fn the_seeded_proof_of_a_small_circuit_is_pinned() {
     use blake2::Digest;
-    const PINNED: &str = "a9a343f12d1be5c67d36798875012a0c1fadfc2d4e253dbcbcb0542e8ae844e9";
+    const PINNED: &str = "b53c2d129e34ded70f2afcfc50ccb32880b10c842eb391509f44ae929fe57d6b";
     let proof = prove::<Blake2bMerkleChannel>(&format(), &circuit(5), MaskRng::Seeded(7))
         .unwrap()
         .0;

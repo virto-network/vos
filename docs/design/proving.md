@@ -398,16 +398,25 @@ attribution). Its full design is `recursion-air.md`.
 - **One wrap per statement,** a 1-to-1 node over the root. Its tallest
   component is 2^15 rows [model].
 - **Parameters** (format 39, masked under variant (c), A.4): blowup 32,
-  24 queries, PoW 26, interaction PoW 8, fold step 3, a 2^6 last layer,
+  16 queries, PoW 26, interaction PoW 8, fold step 3, a 2^6 last layer,
   and **affine DEEP batching** (an independent coefficient a sampled
-  value). That is 146 conjectured and 82 proven bits (82.70; 80 needs 23
-  queries) [model].
+  value). That is 106 conjectured and 65 proven bits (65.80, the query
+  term binding; batching 65.86, the first FRI fold 66.05) [model].
+- **Why 16 queries:** inner soundness carries through (§4), so the
+  system's proven bound is the weakest inner format's, 62.81 bits, and
+  no wrap count above it buys the system a bit. Format 39's floor is
+  therefore the weakest inner format's on either count, 104 / 63, and 16
+  queries is the least that clears it: 15 count 101 / 63 (63.37), below
+  the segments' 104 conjectured; 24, as format 39 first took for a
+  proven 80, counted 146 / 82 (82.70) at about 40% more bytes. Blowup 64
+  at 13 queries counts 104 / 64 at twice the prover's memory [model].
 - **Why affine batching:** Stwo batches the sampled values by powers of one
   coefficient, and that term's error is the values' count times a
   proximity-gap error that grows with the blowup. Batched by powers, the
   masked wrap caps at 76.98 proven bits at blowup 32 and 74.48 at blowup
-  64 however many queries are taken; only blowup 8, with 41 queries,
-  reaches 80 [model].
+  64 however many queries are taken, and at 16 queries counts 65.33,
+  above the floor too [model]: the floor does not need affine batching,
+  and the wrap keeps it, as the device format does.
 
   **Chosen: affine batching,** built in our fork for the configurations
   that ask for it (`PcsConfig::deep_batching`, its `DIVERGENCE-012`) and
@@ -423,8 +432,17 @@ attribution). Its full design is `recursion-air.md`.
   0.8.0 has no hash host call), so a JAM verifier hashes in software. On
   Kreivo the host hash would shorten ref_time, but proof_size binds a
   block and length sets the fee.
-- **Built, format 39** [measured, x86 dev machine, 2026-10-19 and
-  2026-10-24], its proof decoded from a fixed layout
+- **Built, format 39 at 16 queries** [measured, compumax, 2026-11-18,
+  `just repin`'s runs of the fixtures' tests, test profile]: `wrap.proof`
+  is 103,236 bytes; on the JAM-only host the `valid` fixture's verify
+  59.2M gas (59,202,860), a statement judged 61.3M (61,264,627) and the
+  JAM statements service's refine of one 61.3M (61,295,265), the pins of
+  `pvm/proof/counts.txt`; over 12 seeds of the one-segment run's wrap
+  (`just repin-proof`, sigma, 2026-11-18) the verify at most 60.5M gas
+  and in Wasm under the PVF's semantics 35.0M instructions, at the fitted
+  worst shape 62.5M gas and 36.1M instructions of the 50M budget;
+- **Built, format 39 at 24 queries** [measured, x86 dev machine,
+  2026-10-19 and 2026-10-24], its proof decoded from a fixed layout
   (`vos_pvm_final_verifier::masked`), never postcard:
   - **the window kernel's wrap:** 148,868 bytes, proved in 7.44 s under
     load at a 3,627 MiB heap peak;
@@ -516,7 +534,7 @@ pub struct Statement {
   root anchored (`vos_anchor::venue::anchored`: the space active at the
   venue, the root held at its window, not past `MaxRootAge`); the
   io-hash recomputed from the fields and the id from it; a repeat; then the
-  final proof (at most 256 KiB, the format's own decode and nothing after
+  final proof (at most 140 KiB, the format's own decode and nothing after
   it) against the pinned program id and the recomputed io-hash. **The
   program id is the venue's argument, never the caller's:** a venue that
   verified against the statement's or the proof's id would accept any
@@ -623,7 +641,7 @@ last for decades.**
 | segment proofs (format 41) | ≥ 100 / ≥ 60 | blowup 4 (log 2), 40 queries, PoW 24, plus interaction PoW 8; FRI fold step 1, log last-layer degree bound 0 | 104 / 62 (62.81) |
 | leaf and fold proofs (32) | ≥ 100 / ≥ 60 | blowup 4, 44 queries, PoW 20, plus interaction PoW 8; fold step 1, last layer 2^0 | 108 / 63 |
 | device proofs (47; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | blowup 4, 47 queries, PoW 16, interaction PoW 8; variant (c), `h = 256` (§8, "The device parameters") | 110 / 62 (62.82, each) |
-| the final wrap, masked (39) | ≥ 100 / ≥ 80 | blowup 32 (log 5), 24 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching (§3.5); variant (c) | 146 / 82 (82.70) |
+| the final wrap, masked (39) | ≥ 104 / ≥ 63, the weakest inner format's | blowup 32 (log 5), 16 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching (§3.5); variant (c) | 106 / 65 (65.80) |
 
 - **The counts** are the security tool's (`pvm/proof/src/security.rs`) at
   each format's reference shape [model], pinned by the format tests.
@@ -662,7 +680,7 @@ last for decades.**
 
 - **Inner soundness carries through:** forging a fold's input forges the
   final proof. **The system's proven bound is therefore the weakest inner
-  format's, 62.81 bits (format 41), not the wrap's 82.6;** its conjectured
+  format's, 62.81 bits (format 41), not the wrap's 65.80;** its conjectured
   bound is 104. Under Grover's heuristic that is about 31 proven and 52
   conjectured bits against a quantum prover, so post-quantum readiness
   rests on the conjectured count. All counts are the security tool's own
@@ -890,7 +908,8 @@ last for decades.**
     or a repeat, forfeited on any other refusal; normal length and weight
     fees, paid by the sovereign account through `ChargeSpaceFee` within a
     spend budget per window. A proof's length counts as proof_size, so
-    about 20 statements fit a block on one core.
+    about 28 statements of about 103 KB fit a block on one core (about
+    20 at the 24-query wrap's 146 KB) [estimate].
   - **The Kreivo client** (`vos_kreivo::KreivoVenue`, in `tools/kreivo`,
     which no node links): the representative and the worker would anchor
     and submit through it, a
@@ -919,7 +938,7 @@ last for decades.**
     Steps 1–7 but the statement's own decode are `vos_statement::judge`,
     the program's pinned id passed in from the registry.
     The pallet caps the extrinsic's length itself (step 1): `judge`
-    applies its 256 KiB cap at the proof's decode, after the cheap checks.
+    applies its 140 KiB cap at the proof's decode, after the cheap checks.
     The statement's words are an input to the verifier, never an output.
   - **Panic-free by construction:** a FRAME runtime cannot catch a panic
     (no unwinding on wasm32 without std; a panic aborts the block's
@@ -954,7 +973,7 @@ last for decades.**
     verifier stack vendored into Kreivo with a sync check against a VOS
     tag (VOS's kit, `pvm/proof/kit`); frame-contrib and crates.io later.
 - **The JAM statements service** (`vos-statement-service`): a dedicated
-  service; refine verifies anchors' signatures and statements (79.4M gas
+  service; refine verifies anchors' signatures and statements (61.3M gas
   a statement [measured]; a report's accumulate has 10M); accumulate
   holds the spaces,
   anchors and repeats, and records, checking an anchor's signer against
@@ -1855,10 +1874,10 @@ that narrows the inner proof makes folds cheaper too.
 | signed multiplicities in the wiring are new soundness surface | the `Context`'s static checks; the audit of the wiring argument (`recursion-air.md` §1.1) |
 | the gate compiler is wrong | equivalence tests (constraint ≡ gate) on every chip; tamper tests |
 | a kernel's leaf is too big for the padded shape | `derive` computes each kernel's leaf rows and refuses one over the limit (§3.3); the levers of §3.4 |
-| the final wrap misses its gas or size | **retired:** the masked wrap verified on the JAM-only host in 79.3M gas and in Wasm in 44.9M instructions (§3.5) [measured] |
+| the final wrap misses its gas or size | **retired:** the masked wrap verified on the JAM-only host in 59.2M gas and in Wasm in 36.1M instructions at the worst shape (§3.5) [measured] |
 | the multi-step FRI path, or the Blake2b channel, is unsound | a review plus tamper tests before a format admits them |
-| the wrap misses its 80 proven bits | **retired:** affine DEEP batching, 82.6 proven bits (§3.5) [model] |
-| masking the wrap costs more than (c)'s factor | **retired:** format 39 at a 3.6 GiB heap and 79.3M gas [measured], within the design's budget of 24 GiB and 200M gas and the tests' tighter bounds (A.7); leakage and soundness tests |
+| the wrap is weaker than the inner formats | **retired:** 16 queries, 106 / 65 proven bits (65.80), above the weakest inner format's 104 / 62.81 (§3.5) [model] |
+| masking the wrap costs more than (c)'s factor | **retired:** format 39 at a 3.6 GiB heap and 79.3M gas at 24 queries [measured], within the design's budget of 24 GiB and 200M gas and the tests' tighter bounds (A.7); leakage and soundness tests |
 | the cut and held build fail under failover | the cut and the held build across a leader change |
 | the prover worker falls behind the window cadence | the worker measured against the cadence |
 | the teammate's pallet diverges from the design | the pallet against the conformance vectors |
@@ -2013,7 +2032,7 @@ counts as conjectured / proven at the reference shape [model]:
 |---|---|---|---|---|---|---|
 | 41 | segments | Poseidon2-M31 | 2, 40, 24, 1, 0, 8 | 100 / 60 | 104 / 62 | admitted |
 | 32 | leaf and fold (one padded shape) | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 63 | internal: proved and verified inside the prover alone, refused where a proof names it (`Status::Internal`) |
-| 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 5, 24, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 | admitted: the final format |
+| 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 5, 16, 26, 3, 6, 8, affine DEEP batching | 104 / 63 | 106 / 65 | admitted: the final format |
 | 47 | device proofs, masked (variant (c)), `h = 256`, the per-program CPU and the word ledger | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 (62.82), on its masked shape | admitted: the device format |
 
 - **A number names one AIR and one set of parameters,** and is never
@@ -2123,7 +2142,7 @@ output; its `public_args` a venue's id and a nonce, which the io-hash
 binds and no venue reads apart) in three segments, folds them and wraps
 the root under format 39, masked from the seeded test seam
 (`MaskRng::Seeded`, so the bytes are its own every run; `wrap.proof` is
-142,468 bytes, a size that moves a few percent with the seed); and it
+103,236 bytes, a size that moves a few percent with the seed); and it
 wraps two roots that are not a whole run, as a cheating prover would,
 the wrap's checks failing (`wrap-prefix.proof`, `wrap-midway.proof`). The
 generator makes the same bytes in every build of the prover: a kernel's
@@ -2139,7 +2158,7 @@ changed. Every verdict is the same natively, in Wasm (PVF and client;
 
 | case | verdict | JAM-only host [measured] |
 |---|---|---|
-| valid | accepted | 79.4M gas |
+| valid | accepted | 61.3M gas |
 | tampered | `0x112` | 47.6M |
 | wrong program; wrong io-hash; the nonce; the roots' order; a root dropped | `0x108` | 11.0M |
 | prefix; mid-way | `0x109` | 11.1M |
@@ -2161,7 +2180,7 @@ changed. Every verdict is the same natively, in Wasm (PVF and client;
   probability 255/256, or otherwise at the logup sums (`0x109`); a wrap
   proved over a refused root does not balance its logup sums.
 - **Cheap refusals:** a judgement refused before its proof costs no proof
-  lookup on the JAM-only host, and a proof longer than 256 KiB is refused
+  lookup on the JAM-only host, and a proof longer than 140 KiB is refused
   before its lookup.
 - **The guests' size:** the JAM statements service's program is 391,784
   bytes (the harnesses' `final-verify.elf`, 454,662) [measured,
