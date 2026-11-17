@@ -52,8 +52,9 @@
 //!   (`cpu/constraints/memory.rs`), the boundary chips being the register
 //!   relation's only other producers; a memory root's limbs are the node
 //!   compression's output (`chips/memory_merkle.rs`), which BLAKE2b's
-//!   boundary compression core derives through Range256 lookups
-//!   (`chips/blake2b/boundary.rs`, under `blake2b_boundary_gate`).
+//!   boundary compression derives as an XOR of byte pairs the bitwise
+//!   table's lookups fix (`chips/blake2b/compression/constraints.rs`,
+//!   `output`; the chip under `blake2b_boundary_gate`).
 //!
 //! So a wire past 255 never reaches a leaf whose statement the wrap
 //! accepts. The boundary timestamps' range rests on the same chain: the run

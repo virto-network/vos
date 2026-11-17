@@ -206,11 +206,11 @@ fn at_worst(hashes: &[f64], costs: &[f64], most: f64) -> f64 {
 
 /// The verify gates as the maximum over 12 seeds of the one-segment run's
 /// masked wrap ([`gate_proofs`]): on the JAM-only host the decode at most
-/// 4M gas and the verify at most 125M; in Wasm (the final verifier's blob,
-/// `just judge-wasm`) at most 50M instructions under the PVF's semantics.
-/// Each seed's witness hashes are held to the most 24 distinct queries can
-/// take, and each gate also to its cost there, extrapolated along the
-/// seeds' fit.
+/// 4M gas and the verify its pin (`pvm/proof/counts.txt`); in Wasm (the
+/// final verifier's blob, `just judge-wasm`) its pin and at most 50M
+/// instructions under the PVF's semantics. Each seed's witness hashes are
+/// held to the most 24 distinct queries can take, and each gate also to its
+/// cost there, extrapolated along the seeds' fit (within 2% of its pin).
 #[test]
 fn heavy_the_verify_gates_hold_over_seeds() {
     let (program, _) = jam::program();

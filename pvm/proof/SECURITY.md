@@ -214,7 +214,8 @@ along the fold chain, not in a leaf alone (`recair/src/leaf/mod.rs`):
   requires), every exit equals the next entry wire for wire (the fold's
   continuity), and an exit is bytes the AIR produced (the next timestamp's
   and a register write's limbs Range256-checked, a memory root the
-  BLAKE2b boundary compression's output, under `blake2b_boundary_gate`) or
+  BLAKE2b boundary compression's output, an XOR of byte pairs the bitwise
+  table fixes, the chip under `blake2b_boundary_gate`) or
   a copy of its entry.
 - **Timestamps stay in the ledgers' range.** The register and memory
   ledgers compare `2·ts + is_write` reduced mod p, so two accesses about

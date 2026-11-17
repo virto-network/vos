@@ -387,8 +387,9 @@ fn the_layout_refuses_truncations_and_trailing_bytes() {
     }
 }
 
-/// The masked wrap on the JAM-only host, by the venue's guest: accepted
-/// within 125M gas of verify and 4M of decode, its phases reported; a proof
+/// The masked wrap on the JAM-only host, by the venue's guest: accepted,
+/// its verify's gas its pin (`pvm/proof/counts.txt`) and its decode within
+/// 4M, its phases reported; a proof
 /// tampered at its middle byte, and other words, refused without a panic;
 /// another format refused as one the guest does not link.
 #[test]

@@ -187,11 +187,11 @@ pub fn root() -> PathBuf {
         .to_path_buf()
 }
 
-/// The pinned counts of the proving gates (`pvm/proof/fixtures/counts.txt`):
+/// The pinned counts of the proving gates (`pvm/proof/counts.txt`):
 /// a JAM verify's gas, a statement's judgement, the Wasm verifier's
 /// instructions.
 pub fn counts() -> PathBuf {
-    root().join("pvm/proof/fixtures/counts.txt")
+    root().join("pvm/proof/counts.txt")
 }
 
 /// `count`, a gate's measured count, held to its pin `name` in `file` (one
