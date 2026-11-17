@@ -81,26 +81,26 @@ The recipes are in the [`justfile`](justfile) (it runs under `nu`);
 `just` lists them.
 
 The gates are five tiers, each holding the one before it (`check` ⊆
-`gate` ⊆ `ci` ⊆ `ci-full` ⊆ `slice-gate`):
+`gate` ⊆ `ci` ⊆ `ci-full` ⊆ `slice-gate`), named for when they run. There
+is no hosted CI: `ci` is the pre-push hook's recipe (`just
+install-hooks`).
 
-- `just check`: the light check after every edit, minutes warm:
-  formatting, the workspace's lints and every fast test (the heavy test
-  binaries are listed in `tools/gates/heavy.toml`).
+| tier | adds | holds | when |
+|---|---|---|---|
+| `just check` | formatting, the gates' tripwire, the workspace's lints, every fast test (the heavy binaries are listed in `tools/gates/heavy.toml`) | the final verifier's layout constants, the conformance vectors | after every edit; minutes, warm |
+| `just gate` | the heavy tests, the docs' tripwire, deny, the `no_std` builds, every guest rebuilt to `blobs.lock`, the leak checks, the verifier kit, the fuzz corpora replayed and their reach, and the suites outside the workspace (the gateway's onion and SSH ports with the demo, the light node's Tor client, the `vos.credential` facility) | `blobs.lock`, the wrap's preprocessed root, the leaf tables, the kit's lock, the facility's release artifacts | before each commit |
+| `just ci` | every feature set's lints, the JAR check, the PVM vectors, the bench's cross-host checks, the slow fault runs, the prover's library tests | the formats' bit counts | before a push |
+| `just ci-full` | the prover suites (`just test-proof`: the forgery and soundness gates, leakage at medium sizes), the bench's proving tests, the fuzz targets a minute each | `H_FOLD`, the known programs' ids, the golden fixtures | by hand, before a release candidate, under a 12 GiB memory limit |
+| `just slice-gate` | the leakage tests at their full sizes, the fuzz targets five minutes each | | by hand, before a release |
+
+Beside the tiers:
+
 - `just test-changed [base]`: the tests of the crates a change touches
   and of those that depend on them (`--heavy` adds the heavy binaries).
-- `just gate`: the step gate, before a step's commit: `check`, the heavy
-  tests, the docs' links, the `no_std` builds, every guest rebuilt to
-  `blobs.lock`, the leak checks, the verifier kit, and the suites outside
-  the workspace (the gateway's onion and SSH ports with the demo, the
-  light node's Tor client, the `vos.credential` facility).
-- `just ci`: `gate` and everything else but the prover suites, before a
-  merge.
-- `just test-proof`: the prover suites (run under a 12 GiB memory limit).
-- `just ci-full`: `ci`, the prover suites, the soundness gates at their
-  medium sizes and the fuzz targets a minute each.
-- `just slice-gate`: the full gate: the leakage tests at their full sizes
-  and the fuzz targets five minutes each.
-- `just check-blobs`: the venue guests and agent programs rebuild to the
+- `just test-proof`: the prover suites alone (run under a 12 GiB memory
+  limit).
+- `just check-blobs`: the pinned blobs (the JAM statements service's
+  program, the harnesses' and the agent programs) rebuild to the
   hashes pinned in `blobs.lock`.
 - `just repin`: every pin store written anew after a change that moves a
   guest or a circuit (`blobs.lock`, the facility's release artifacts, the

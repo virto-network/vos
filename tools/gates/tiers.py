@@ -417,7 +417,9 @@ def main():
             print(" ".join(flags(tier, arguments[1:])))
         case ["changed"]:
             rest = [argument for argument in arguments[1:] if argument != "--heavy"]
-            changed(rest[0] if rest else "vos-core", "--heavy" in arguments)
+            if len(rest) != 1:
+                sys.exit("changed takes the base to compare with: the justfile's `test-changed` passes its own")
+            changed(rest[0], "--heavy" in arguments)
         case _:
             sys.exit(__doc__)
 

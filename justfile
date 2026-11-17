@@ -7,15 +7,30 @@ default:
 #
 #   check ⊆ gate ⊆ ci ⊆ ci-full ⊆ slice-gate
 #
-# - `check`: the light check after every edit, minutes warm: formatting,
-#   the workspace's lints and the fast tests.
-# - `gate`: the step gate, before a step's commit: `check`, the heavy test
-#   targets (`tools/gates/heavy.toml`), every guest and its blob, the
-#   production builds' checks and the suites outside the workspace.
-# - `ci`: before a merge (the pre-push hook).
-# - `ci-full`: at a milestone, the prover suites.
-# - `slice-gate`: at a slice's end, `ci-full`'s prover suites at their full
-#   N and its fuzz targets five times as long.
+# Each named for when it runs, by what it adds, the pins it holds and its
+# cost. There is no hosted CI: "ci" names the pre-push hook's recipe.
+# - `check`, after every edit (minutes, warm): formatting, the gates' own
+#   tripwire, the workspace's lints and the fast tests. Holds the final
+#   verifier's layout constants (format 39's), the conformance vectors.
+# - `gate`, before each commit (tens of minutes): `check`, the heavy test
+#   targets (`tools/gates/heavy.toml`), the docs' tripwire, deny, the
+#   builds without std, every guest and its blob, the leak checks, the
+#   verifier kit, the fuzz corpora replayed and their reach, and the
+#   suites outside the workspace. Holds `blobs.lock`, the wrap's
+#   preprocessed root, the compiler's leaf tables, the kit's lock and the
+#   facility's release artifacts.
+# - `ci`, before a push (the pre-push hook, `just install-hooks`): `gate`
+#   and every feature set's lints, the JAR check, the PVM vectors, the
+#   bench's cross-host checks, the slow fault runs and the prover's library
+#   tests. Holds the formats' bit counts (`COUNTS`).
+# - `ci-full`, by hand before a release candidate (hours, under a 12 GiB
+#   memory cap): `ci` and the prover suites (`test-proof`: the forgery and
+#   soundness gates, the leakage tests at a medium N), the bench's proving
+#   tests and the fuzz targets a minute each. Holds `H_FOLD`, the known
+#   programs' ids and the golden fixtures.
+# - `slice-gate`, the full gate, by hand before a release: `ci-full` with
+#   the leakage tests at their full N and the fuzz targets five minutes
+#   each.
 # A suite belongs to the lowest tier that can afford it; `just check-tiers`
 # holds the recipes to that. `just test-changed` runs the tests a change
 # touches. Outside every tier, on purpose: what needs a PolkaJam testnet
@@ -23,7 +38,7 @@ default:
 # toolchain (`repro-aarch64`), the Android SDK (`android-facility`,
 # `phone`) or a release (`release`, `vendor-verifier`).
 
-# The fast suites' crates, which `test`, `check` and `gate` run.
+# The fast suites' crates, which `check` and `gate` run.
 core_crates := "-p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-pvm-codec-derive -p vos-pvm-proof-derive -p vos-raft -p merkle-crdt -p vos-mls -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-abi -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-anchor -p vos-statement -p vos-statement-service --features vos-anchor/vectors,vos-statement/fixtures"
 
 # The agent's suites' crates, which `test-agent`, `check` and `gate` run.
@@ -45,26 +60,10 @@ guest_flags := "--target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core
 _venue-guest package bin features:
     let cargo = ($env.CARGO_HOME? | default ($env.HOME | path join .cargo)); let sysroot = (rustc --print sysroot | str trim); let remaps = [$"--remap-path-prefix=($env.PWD)/=" $"--remap-path-prefix=($cargo)=/cargo" $"--remap-path-prefix=($sysroot)=/rustc"]; with-env { CARGO_INCREMENTAL: "0", CARGO_ENCODED_RUSTFLAGS: ($remaps | str join (char -u "1f")) } { cargo build -p {{package}} --release --features {{features}} --bin {{bin}} {{guest_flags}} }
 
-# Fast suites: runtime, compiler, program format, codec, support crates,
-# precompile shim, Poseidon2, verifier, the recursion AIR and its gate VM,
-# prover library, the actor ABI and the node's wire types. The node runs
-# the agent, so it is tested with it.
-test:
-    cargo test {{core_crates}}
-    cargo test -p vos-statement --features heap-peak --test heap
-    just test-recair
-    cargo test -p vos-pvm-proof --lib
-
 # The phone bench's two Android binaries (arm64-v8a, the NDK s4 builds
 # with), the seeded one holding an x86 run's proof hashes: `tools/phone`.
 phone out="target/phone":
     tools/phone/build.sh {{out}}
-
-# The recursion AIR's prover tests and the device profile's, on its masked
-# prover, four at a time: at every core at once the recursion suite passed
-# 12 GiB, the limit the gates run under.
-test-recair:
-    cargo test -p vos-pvm-recair -p vos-pvm-device -- --test-threads=4
 
 # Bench guests, built with the guest toolchain in `pvm/guest`.
 build-bench-guests:
@@ -109,7 +108,7 @@ vectors:
 # GiB), so the recipe fits under a 12 GiB limit, e.g.
 # `systemd-run --user --scope -p MemoryMax=12G -p MemorySwapMax=0 just test-proof`.
 # They cover every admitted format, the Poseidon2-M31 segment format among
-# them; the verifier's suite runs in `test`.
+# them; the verifier's suite runs in `check`.
 # Then the masking's heavy gates (`vos-pvm-recair`'s and `vos-pvm-device`'s
 # `heavy-gates`): the
 # leakage tests at a medium N (500 proofs a witness on the small circuit, 16
@@ -174,11 +173,22 @@ build-wasm-blobs:
 # workspace's root by its absolute path into its symbols, whose order
 # lays out the program's code: built from the fixed path, a guest whose
 # path dependencies lie outside its workspace is the same bytes from any
-# checkout.
+# checkout. The path is part of the blobs' bytes, so it cannot move to a
+# per-user directory: on a host with other users, `/tmp/vos-checkout` or
+# its lock made by another user (who builds from it, or left it) blocks
+# this user's builds, and the recipe stops naming that user; build inside
+# a private mount namespace that binds the checkout at the fixed path
+# instead.
 _at-fixed-path dir +args:
     #!/usr/bin/env bash
     set -euo pipefail
     fixed=/tmp/vos-checkout
+    for entry in "$fixed.lock" "$fixed"; do
+        if [ -e "$entry" ] || [ -L "$entry" ]; then
+            owner=$(stat -c %U "$entry")
+            if [ "$owner" != "$(id -un)" ]; then echo "$entry is $owner's, not $(id -un)'s: another user builds from the fixed path on this host" >&2; exit 1; fi
+        fi
+    done
     exec 9>"$fixed.lock"
     flock 9
     if [ -e "$fixed" ] && [ ! -L "$fixed" ]; then echo "$fixed is not a symbolic link" >&2; exit 1; fi
@@ -292,7 +302,9 @@ programs:
 # The JAM statements service's program, `statement-service.elf`.
 build-statement-service: (_venue-guest "vos-statement-service" "statement-service" "pvm-guest")
 
-# The venue's JAM refine program, `final-verify.elf`.
+# The model venue's JAM refine program, the harnesses' (`final-verify.elf`):
+# it links the model judge, whose pinned program and state its input
+# carries, and is deployed nowhere.
 build-final-verify: (_venue-guest "vos-statement" "final-verify" "pvm-guest")
 
 # Every guest blob `blobs.lock` pins, its hash then its path from the
@@ -307,6 +319,27 @@ build-final-verify: (_venue-guest "vos-statement" "final-verify" "pvm-guest")
 # (`_at-fixed-path`).
 _blob-hashes:
     if ($env.CARGO_TARGET_DIR? | is-not-empty) { error make { msg: "the blobs are hashed where the recipes build them: unset CARGO_TARGET_DIR" } }; let fixed = ["target/riscv64em-vos/release/final-verify.elf" "target/riscv64em-vos/release/statement-service.elf"] ++ (open programs.toml | get program.elf) ++ ["pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm"]; let actors = (cargo metadata --manifest-path agent/test-actors/Cargo.toml --no-deps --format-version 1 | from json | get packages.targets | flatten | where {|target| "bin" in $target.kind } | get name | sort | each {|name| $"agent/test-actors/target/riscv64em-vos/release/($name).elf" }); let sysroot = (rustc --print sysroot | str trim); let objcopy = ($sysroot | path join lib rustlib (rustc -vV | lines | parse "host: {host}" | get host.0) bin rust-objcopy); let stripped = (mktemp -t); for path in ($fixed ++ $actors) { with-env { LD_LIBRARY_PATH: ($sysroot | path join lib) } { ^$objcopy --strip-all $path $stripped }; print $"(open --raw $stripped | hash sha256)  ($path)" }; rm $stripped
+
+# The pinned blobs by role: `final-verify.elf` and the Wasm blob, the
+# harnesses' programs, deployed nowhere, link the model judge
+# (`vos-statement`'s `model-judge`, whose pinned program and state its
+# input carries); `statement-service.elf`, the one deployed, links none
+# (`check-no-venue-model`); every other line of `blobs.lock` is an agent
+# program (`programs.toml`) or a test actor, on the node side. A blob that
+# joins the lock joins one of these, or fails here.
+check-blob-roles:
+    let judges = {|args| cargo tree ...($args | split row ' ') -e no-dev --target all -f '{p}|{f}' --prefix none | lines | any {|line| \
+        let parts = ($line | str replace ' (*)' '' | split row '|'); \
+        ($parts.0 | str starts-with 'vos-statement v') and ('model-judge' in ($parts.1? | default '' | split row ',')) } }; \
+    for harness in ["-p vos-statement --features pvm-guest" "--manifest-path pvm/proof/final-verifier/wasm/blob/Cargo.toml"] { \
+        if not (do $judges $harness) { error make { msg: $"cargo tree ($harness) links no model judge: a harness's blob no longer, its role changed" } } }; \
+    let harnesses = [target/riscv64em-vos/release/final-verify.elf pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm]; \
+    let deployed = [target/riscv64em-vos/release/statement-service.elf]; \
+    let programs = (if ('programs.toml' | path exists) { open programs.toml | get program.elf } else { [] }); \
+    let pinned = (open --raw blobs.lock | lines | where {|line| not ($line | str starts-with '#') and $line != '' } | each {|line| $line | split row '  ' | last }); \
+    let unknown = ($pinned | where {|path| $path not-in ($harnesses ++ $deployed ++ $programs) and not ($path | str starts-with 'agent/test-actors/') }); \
+    if ($unknown | is-not-empty) { error make { msg: $"blobs.lock pins blobs of no role: ($unknown | str join ', ')" } }; \
+    print $"the pinned blobs by role: ($harnesses | length) harnesses' linking the model judge, ($deployed | length) deployed, ($pinned | length) in all"
 
 # Every guest blob `blobs.lock` pins, built as `check` builds it.
 build-blobs: build-final-verify build-statement-service build-programs build-wasm-blobs build-test-actors
@@ -358,7 +391,7 @@ _hashed := 'let hashed = (just _blob-hashes | complete); if $hashed.exit_code !=
 # Every pinned guest blob built and hashed, each its `blobs.lock` hash, and
 # the lock naming every blob built: a change that moves a blob moves its
 # line.
-check-blobs: build-blobs
+check-blobs: build-blobs check-blob-roles
     {{_hashed}}; let locked = (open --raw blobs.lock | lines | where {|line| not ($line | str starts-with "#") }); let moved = ($built | where {|line| $line not-in $locked }); let gone = ($locked | where {|line| $line not-in $built }); for line in $moved { print -e $"built: ($line)" }; for line in $gone { print -e $"locked: ($line)" }; if ($moved ++ $gone | is-not-empty) { error make { msg: "the guest blobs are not blobs.lock's: `just repin` after a change that moves them" } }; print $"every pinned guest blob is blobs.lock's: ($built | length) blobs"
 
 # The SDK, its macros' restrictions, the test actors on the testkit, the
@@ -774,8 +807,9 @@ vendor-verifier dir rev="":
 # fixtures and the conformance vectors with it, every file compared; here
 # against this checkout, a kit vendored at a commit accepted. A consumer
 # runs `pvm/proof/kit/vos-sync.sh`, copied outside its kit, which pins VOS's
-# repository and runs the tag's script, never the kit's own:
-# `scripts/vos-sync.sh vendor/vos-verifier` (`spaces-pallet.md` §3.1).
+# repository, refuses a kit of another tag than the one it expects and
+# runs the tag's script, never the kit's own: `scripts/vos-sync.sh
+# vendor/vos-verifier <tag>` (`spaces-pallet.md` §3.1).
 vos-sync dir:
     python3 -I pvm/proof/kit/vos_kit.py sync {{dir}} --vos . --allow-untagged --scratch target/kit/scratch
 
@@ -927,8 +961,8 @@ deny:
 # The layers: a package under `pvm/` has no path dependency outside
 # `pvm/`, on a normal, a build or a dev edge, so the PVM, its compiler,
 # its prover and the actor ABI read, build and test alone. Git and registry
-# dependencies (the Stwo fork) and `support/`'s vendored crates are
-# allowed, and listed. Every package under `pvm/` is read, the
+# dependencies (the Stwo fork) are allowed, and listed. Every package
+# under `pvm/` is read, the
 # workspaces built apart included (`cargo metadata` of each manifest).
 check-layers:
     let manifests = (glob pvm/**/Cargo.toml --exclude ['**/target/**'] | where {|manifest| open --raw $manifest | str contains '[package]' }); \
@@ -936,8 +970,7 @@ check-layers:
     let packages = ($manifests | each {|manifest| cargo metadata --no-deps --offline --format-version 1 --manifest-path $manifest | from json | get packages | where manifest_path == $manifest | first }); \
     let edges = ($packages | each {|package| $package.dependencies | each {|dependency| { package: $package.name, dependency: $dependency.name, kind: ($dependency.kind | default normal), path: ($dependency.path? | default "" | if ($in | is-empty) { "" } else { $in | path relative-to $env.PWD }), source: ($dependency.source? | default "") } } } | flatten); \
     let local = ($edges | where path != ""); \
-    let outside = ($local | where {|edge| not ($edge.path | str starts-with "pvm/") and not ($edge.path | str starts-with "support/") }); \
-    print $"support/ crates allowed: ($local | where {|edge| $edge.path | str starts-with 'support/' } | get dependency | uniq | str join ', ' | if ($in | is-empty) { 'none' } else { $in })"; \
+    let outside = ($local | where {|edge| not ($edge.path | str starts-with "pvm/") }); \
     print $"git crates allowed: ($edges | where {|edge| $edge.source | str starts-with 'git+' } | get dependency | uniq | str join ', ')"; \
     for edge in $outside { print -e $"($edge.package) -> ($edge.dependency) \(($edge.kind)\): ($edge.path) is outside pvm/" }; \
     if ($outside | is-not-empty) { error make { msg: "a package under pvm/ depends on a path outside pvm/" } }; \
