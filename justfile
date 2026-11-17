@@ -221,8 +221,11 @@ fmt-check:
     for manifest in (((open programs.toml | get program.crate) ++ [agent/test-actors pvm/bench/guests pvm/proof/fuzz node/fuzz pvm/proof/final-verifier/wasm node/gateway/demo node/light/android]) | each {|dir| glob $'($dir)/**/Cargo.toml' --exclude ['**/target/**'] } | flatten | where {|manifest| open --raw $manifest | str contains '[package]' }) { cargo fmt --manifest-path $manifest -- --check }
 
 # The docs' links: none broken, and none from a public doc to a private
-# item.
+# item; and the proof docs' tripwire (`tools/gates/docs.py`): no doc names
+# deleted code as built, every path the audit map names exists, and
+# SECURITY.md names every fuzz target.
 doc-check:
+    python3 -I tools/gates/docs.py
     with-env { RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links" } { cargo doc --workspace --no-deps --quiet }
     with-env { RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links" } { cargo doc -p vos-venue -p vos-kreivo --features vos-venue/model,vos-kreivo/kreivo-mock --no-deps --quiet }
 
