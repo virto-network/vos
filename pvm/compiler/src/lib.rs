@@ -47,6 +47,10 @@ pub enum TranspileError {
     RegisterMapping(u8),
     #[error("invalid section: {0}")]
     InvalidSection(String),
+    /// A branch or jump of a whole program whose target no code section
+    /// holds: linked, it would run whatever its offset bytes name.
+    #[error("unresolved branch target {target:#x}")]
+    UnresolvedTarget { target: u64 },
 }
 
 /// A program's functions: each one's first PVM instruction in its code, and

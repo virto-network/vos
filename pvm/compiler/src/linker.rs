@@ -305,7 +305,7 @@ pub(crate) fn transpile_with(elf: &LinkedElf, link: Link) -> Result<TranspiledEl
             ctx.emit_op(Opcode::Trap);
         }
     }
-    ctx.apply_fixups();
+    ctx.apply_fixups()?;
 
     let mut ro_data = elf.ro_data.clone();
     let mut rw_data = elf.rw_data.clone();

@@ -439,32 +439,27 @@ impl TranslationContext {
         })
     }
 
-    pub(crate) fn apply_fixups(&mut self) {
+    /// Patches every branch and jump with its target's PVM offset, and the
+    /// jump table's return addresses. A kernel's target never translated
+    /// reaches the shared trap; any other program's is a link error.
+    pub(crate) fn apply_fixups(&mut self) -> Result<(), TranspileError> {
         let mut trap = None;
         // PC-relative fixups (branches, jumps)
         for (pvm_offset, rv_target, size) in self.fixups.drain(..).collect::<Vec<_>>() {
-            let target = match self.address_map.get(&rv_target) {
-                Some(&pvm_target) => Some(pvm_target),
-                None if self.trap_unresolved => Some(self.shared_trap(&mut trap)),
-                None => None,
+            let pvm_target = match self.address_map.get(&rv_target) {
+                Some(&pvm_target) => pvm_target,
+                None if self.trap_unresolved => self.shared_trap(&mut trap),
+                None => return Err(TranspileError::UnresolvedTarget { target: rv_target }),
             };
-            if let Some(pvm_target) = target {
-                let inst_pc = self
-                    .fixup_pcs
-                    .get(&pvm_offset)
-                    .copied()
-                    .unwrap_or(pvm_offset as u32 - 1);
-                let relative = (pvm_target as i64 - inst_pc as i64) as i32;
-                let bytes = relative.to_le_bytes();
-                self.code[pvm_offset..pvm_offset + size as usize]
-                    .copy_from_slice(&bytes[..size as usize]);
-            } else {
-                tracing::warn!(
-                    "unresolved fixup: rv_target={:#x}, pvm_offset={}",
-                    rv_target,
-                    pvm_offset
-                );
-            }
+            let inst_pc = self
+                .fixup_pcs
+                .get(&pvm_offset)
+                .copied()
+                .unwrap_or(pvm_offset as u32 - 1);
+            let relative = (pvm_target as i64 - inst_pc as i64) as i32;
+            let bytes = relative.to_le_bytes();
+            self.code[pvm_offset..pvm_offset + size as usize]
+                .copy_from_slice(&bytes[..size as usize]);
         }
 
         // Resolve return address fixups in the jump table. A call whose
@@ -480,6 +475,7 @@ impl TranslationContext {
             };
             self.jump_table[jt_idx] = target;
         }
+        Ok(())
     }
 }
 

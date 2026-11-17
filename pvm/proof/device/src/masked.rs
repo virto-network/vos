@@ -22,6 +22,14 @@
 //!   refusals (`vos_pvm_final_verifier::Error`), which the forgery gates
 //!   tell apart; a program's verifier ([`crate::Verifier`]) refuses with a
 //!   [`crate::Refusal`].
+//! - **This is the gates' layer:** its functions take a `Format` itself
+//!   (`vos_pvm_proof::format::Format`, its fields public), so the forgery
+//!   and leakage gates prove and verify under small formats no registry
+//!   holds. Production enters through [`crate::Program`] and
+//!   [`crate::Verifier`] alone, which take a format by its number from
+//!   [`crate::FORMATS`] and hash its parameters into the program's id
+//!   ([`crate::DeviceProgramId`]); nothing in production builds a format of
+//!   its own.
 
 use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use vos_pvm_final_verifier::masking::MaskedProof;

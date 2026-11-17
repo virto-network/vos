@@ -252,8 +252,9 @@ fn a_crafted_package_derives_in_bounded_time() {
 
 /// A kernel's prologue, which its derivation places at the first 16-byte
 /// boundary past the code, calls the entry by an AUIPC and JALR pair. Code
-/// of the kernel that jumps between the two would split the pair, so the
-/// derivation refuses it, as it does any target that splits one.
+/// that jumps there jumps past every code section of the whole program, so
+/// the derivation refuses it at the program's own link, before its kernels'
+/// (whose link refuses a target that splits a call pair).
 #[test]
 fn a_kernel_jumping_into_its_prologue_is_refused() {
     // `_start` returns; the entry jumps to the prologue's JALR, at the
@@ -292,11 +293,11 @@ fn a_kernel_jumping_into_its_prologue_is_refused() {
             Section::table(".rela.rodata", RELA, relocation(attest + 8, 1, 2, 0), 4, 2),
         ],
     );
-    let refused = derive(&elf).expect_err("a split call pair is refused");
+    let refused = derive(&elf).expect_err("a jump past the code is refused");
     assert!(
         refused
             .to_string()
-            .contains("splits a relocated AUIPC+JALR call pair"),
+            .contains(&format!("unresolved branch target {:#x}", TEXT + 96)),
         "{refused}"
     );
 }
