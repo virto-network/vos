@@ -58,12 +58,7 @@ pub fn program() -> (Vec<u8>, usize) {
 /// `target/riscv64em-vos/release/<name>.elf` of the workspace holding the
 /// crate that includes this file, linked: its program and its ELF's length.
 pub fn guest(name: &str) -> (Vec<u8>, usize) {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let root = manifest
-        .ancestors()
-        .find(|dir| dir.join("Cargo.lock").exists() && dir.join("pvm").is_dir())
-        .expect("the workspace's root");
-    let path = root.join(format!("target/riscv64em-vos/release/{name}.elf"));
+    let path = root().join(format!("target/riscv64em-vos/release/{name}.elf"));
     let elf = std::fs::read(&path).unwrap_or_else(|error| {
         panic!(
             "{} missing ({error}); run `just check-no-std`",
@@ -181,4 +176,67 @@ pub fn accumulate(
         .try_run()
         .expect("the accumulate host");
     (invocation.exit, invocation.gas_used)
+}
+
+/// The root of the workspace holding the crate that includes this file.
+pub fn root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .find(|dir| dir.join("Cargo.lock").exists() && dir.join("pvm").is_dir())
+        .expect("the workspace's root")
+        .to_path_buf()
+}
+
+/// The pinned counts of the proving gates (`pvm/proof/fixtures/counts.txt`):
+/// a JAM verify's gas, a statement's judgement, the Wasm verifier's
+/// instructions.
+pub fn counts() -> PathBuf {
+    root().join("pvm/proof/fixtures/counts.txt")
+}
+
+/// `count`, a gate's measured count, held to its pin `name` in `file` (one
+/// `name value` a line, `#` comments): equal when `percent` is 0 (a count
+/// of fixed inputs, which every run repeats), else within `percent` of it.
+/// Under `VOS_PINS=write` (`just repin`) the pin is written instead, so
+/// every movement is a diff of the file; run the writing tests one at a
+/// time.
+pub fn pinned(file: &std::path::Path, name: &str, count: u64, percent: u64) {
+    let text = std::fs::read_to_string(file).unwrap_or_default();
+    let pin = text
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .find_map(|line| {
+            let (key, value) = line.split_once(' ')?;
+            (key == name).then(|| value.trim().parse::<u64>().ok())?
+        });
+    if std::env::var("VOS_PINS").as_deref() == Ok("write") {
+        if pin != Some(count) {
+            let line = format!("{name} {count}");
+            let mut lines: Vec<String> = text
+                .lines()
+                .filter(|line| line.split_once(' ').map(|(key, _)| key) != Some(name))
+                .map(str::to_string)
+                .collect();
+            lines.push(line);
+            let (comments, mut pins): (Vec<String>, Vec<String>) =
+                lines.into_iter().partition(|line| line.starts_with('#'));
+            pins.sort();
+            let body: Vec<String> = comments.into_iter().chain(pins).collect();
+            std::fs::write(file, body.join("\n") + "\n").expect("writes the pins");
+            eprintln!("{}: {name} written, {count}", file.display());
+        }
+        return;
+    }
+    let pin = pin.unwrap_or_else(|| {
+        panic!(
+            "{name} has no pin in {}: `VOS_PINS=write` writes it",
+            file.display()
+        )
+    });
+    let within = count.abs_diff(pin).saturating_mul(100) <= pin.saturating_mul(percent);
+    assert!(
+        within,
+        "{name}: {count}, its pin {pin} (within {percent}%): a moved count is re-pinned \
+         under `VOS_PINS=write`"
+    );
 }

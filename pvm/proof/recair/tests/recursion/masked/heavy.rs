@@ -285,14 +285,17 @@ fn heavy_the_verify_gates_hold_over_seeds() {
          {verify_worst:.0}"
     );
     assert!(decode <= 4_000_000, "decode {decode} gas");
-    assert!(verify <= 125_000_000, "verify {verify} gas");
     assert!(
         decode_worst <= 4e6,
         "decode {decode_worst} gas at the worst shape"
     );
-    assert!(
-        verify_worst <= 125e6,
-        "verify {verify_worst} gas at the worst shape"
+    let counts = jam::counts();
+    jam::pinned(&counts, "masked-wrap-verify-gas-max", verify, 0);
+    jam::pinned(
+        &counts,
+        "masked-wrap-verify-gas-worst",
+        verify_worst.round() as u64,
+        2,
     );
 
     let wasm = workspace().join("pvm/proof/final-verifier/wasm");
@@ -333,6 +336,13 @@ fn heavy_the_verify_gates_hold_over_seeds() {
     eprintln!(
         "the maximum over {GATE_SEEDS} seeds: {max} instructions; at the worst shape, by \
          the seeds' fit: {wasm_worst:.0}"
+    );
+    jam::pinned(&counts, "masked-wrap-wasm-instructions-max", max, 0);
+    jam::pinned(
+        &counts,
+        "masked-wrap-wasm-instructions-worst",
+        wasm_worst.round() as u64,
+        2,
     );
     assert!(max <= 50_000_000, "{max} Wasm instructions");
     assert!(

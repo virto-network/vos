@@ -194,6 +194,11 @@ pub fn verified_wrap(
         report.peak_live >> 10,
     );
     assert_eq!(report.verdict, jam::ACCEPT, "{}", report.error);
-    assert!(gas <= 150_000_000, "{gas} gas");
+    jam::pinned(
+        &jam::root().join("node/kernel-tests/tests/counts.txt"),
+        "predicate-wrap-verify-gas",
+        gas,
+        2,
+    );
     wrap_files::write(name, format, proof, words);
 }

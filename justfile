@@ -327,7 +327,12 @@ blobs-lock: build-blobs
 #    `pvm/proof/src/constants.rs` (the recursion's circuits are built:
 #    minutes, and several GiB);
 # 5. the golden fixtures, `pvm/proof/fixtures` (`fixtures`: it proves,
-#    under the 12 GiB limit `test-proof` names);
+#    under the 12 GiB limit `test-proof` names), and the proving gates'
+#    counts over them, `pvm/proof/fixtures/counts.txt`: a statement judged
+#    and refined on the JAM-only host, the one-segment masked wrap's verify
+#    (the heavy gates' counts and the node's,
+#    `node/kernel-tests/tests/counts.txt`, are `test-proof`'s runs under
+#    `VOS_PINS=write`);
 # 6. the conformance vectors over them, `tools/kreivo/conformance`
 #    (`conformance`);
 # 7. the verifier kit's lock file, `pvm/proof/kit/Cargo.lock` (`kit-lock`).
@@ -347,9 +352,12 @@ repin: blobs-lock facility-release
     cargo test -p vos-pvm-proof --test kernel constants:: -- --test-threads=1
     cargo test -p vos-kernel-tests --test kernel constants:: -- --test-threads=1
     just fixtures
+    with-env { VOS_PINS: "write" } { cargo test -p vos-statement --features fixtures --test fixtures every_fixture_is_judged_on_the_jam_only_host_as_recorded -- --exact }
+    with-env { VOS_PINS: "write" } { cargo test -p vos-statement-service --test service a_256_kib_extrinsic_is_read_as_the_proof -- --exact }
+    with-env { VOS_PINS: "write" } { cargo test -p vos-pvm-recair --test recursion masked::the_masked_wrap_verifies_on_the_jam_only_host -- --exact }
     just conformance
     just kit-lock
-    let moved = (git status --porcelain -- blobs.lock node/light/android/release node/light/tests/device.pins pvm/proof/src/constants.rs pvm/proof/fixtures tools/kreivo/conformance pvm/proof/kit/Cargo.lock | lines); if ($moved | is-empty) { print "repin: every pin store is this tree's already" } else { print "repin: moved"; $moved | each {|line| print $line }; null }
+    let moved = (git status --porcelain -- blobs.lock node/light/android/release node/light/tests/device.pins pvm/proof/src/constants.rs pvm/proof/fixtures tools/kreivo/conformance pvm/proof/kit/Cargo.lock node/kernel-tests/tests/counts.txt | lines); if ($moved | is-empty) { print "repin: every pin store is this tree's already" } else { print "repin: moved"; $moved | each {|line| print $line }; null }
 
 # The pinned blobs' hashes, `_blob-hashes`' lines; its failure fails the
 # recipe that reads them.
