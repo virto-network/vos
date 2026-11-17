@@ -58,7 +58,7 @@ pub const LOG_DEGREE_BOUND: u32 = 17;
 
 /// FRI's folding rounds at `format::MASKED_WRAP`'s degree bound,
 /// 2^[`LOG_DEGREE_BOUND`], to its 2^6 last layer: the first with the circle
-/// fold in it ([`fri_rounds`]).
+/// fold in it ([`fri_rounds`](crate::masking::fri_rounds)).
 pub const FRI_ROUNDS: [u32; 4] = [3, 3, 3, 2];
 
 /// `format::MASKED_WRAP`'s samples of column `column` of tree `tree`, as its
