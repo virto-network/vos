@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # The sync check of a vendored VOS verifier kit, as a consumer runs it
 # (VOS's `docs/design/spaces-pallet.md` §3.1). Kept outside the kit, under
 # the consumer's review (e.g. Kreivo's `scripts/vos-sync.sh`, CODEOWNERS),

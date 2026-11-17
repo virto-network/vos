@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """The sync check's own test (`just check-kit`), on a scratch clone of VOS
 with a test tag at `--rev`:
 - a kit vendored at the tag syncs, by `vos_kit.py` and by the consumer's

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """VOS's verifier kit: the crates a venue links to judge VOS statements,
 vendored for a chain's runtime (Kreivo's `vendor/vos-verifier/`), and the
 check that a vendored kit is exactly VOS's at the commit it names.
@@ -14,7 +15,9 @@ The kit holds:
 - `conformance/`: the conformance vectors G1–G17 (`spaces.json`) and the
   mutation lists (`mutations.json`), which VOS's reference mock generates;
 - the licence texts, each its path in VOS and its name in the kit: the
-  GPL-3.0 the five crates are under, and the Apache-2.0 beside the
+  GPL-3.0 the five crates, the fixtures, the conformance vectors and the
+  kit's scripts are under (`VENDOR` says so; the data files carry no
+  header, so their bytes stay the fixtures'), and the Apache-2.0 beside the
   MIT text in `vos-pvm-poseidon2`'s `src/packed/` (Plonky3's, MIT or
   Apache-2.0);
 - this script, `vos_kit.py`;
@@ -467,6 +470,11 @@ def kit(tree: Tree) -> dict[str, bytes]:
         "# by `vos_kit.py vendor`. Every file here is generated: change it in VOS",
         "# and vendor again. `python3 -I vos_kit.py sync <this directory>` checks",
         "# it against the commit below.",
+        "#",
+        "# Licence: the GPL-3.0-or-later (`LICENSE-GPL-3.0`) covers the five",
+        "# crates, the golden fixtures, the conformance vectors and",
+        "# `vos_kit.py`; `vos-pvm-poseidon2`'s",
+        "# `src/packed/` keeps Plonky3's MIT notice, beside `LICENSE-APACHE-2.0`.",
         f"repository = {toml_value(tree.repository)}",
         f"commit = {toml_value(tree.commit)}",
     ]
