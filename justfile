@@ -587,7 +587,7 @@ _forbidden +gates:
         [debug-internals "--manifest-path pvm/proof/final-verifier/wasm/blob/Cargo.toml" [debug-internals] []] \
         [test-device-format "--workspace" [test-device-format] []] \
         [test-device-format "-p vos-cli --features prover" [test-device-format] []] \
-        [test-device-format "--manifest-path node/light/android/Cargo.toml --features android" [test-device-format testing] [vos-testkit]] \
+        [test-device-format "--manifest-path node/light/android/Cargo.toml --features android" [test-device-format] [vos-testkit]] \
         [test-device-format "--manifest-path node/gateway/demo/Cargo.toml" [test-device-format] []] \
         [store-dump "-p vos-cli" [dump] []] \
         [store-dump "-p vos-cli --features prover" [dump] []] \
