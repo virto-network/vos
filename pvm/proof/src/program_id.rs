@@ -263,6 +263,12 @@ impl core::fmt::Display for KernelError {
 
 impl core::error::Error for KernelError {}
 
+impl From<KernelError> for stwo::core::verifier::VerificationError {
+    fn from(refusal: KernelError) -> Self {
+        Self::InvalidStructure(alloc::string::ToString::to_string(&refusal))
+    }
+}
+
 /// A byte string's 16-bit limbs, little-endian, the last zero-extended.
 fn byte_limbs(bytes: &[u8]) -> impl Iterator<Item = BaseField> + '_ {
     bytes.chunks(2).map(|pair| {

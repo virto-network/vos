@@ -25,13 +25,12 @@ use stwo::prover::poly::circle::PolyOps;
 use stwo::prover::poly::twiddles::TwiddleTree;
 use stwo::prover::{CommitmentSchemeProver, ComponentProver, ProvingError};
 use vos_pvm_poseidon2::Digest;
-use vos_pvm_proof::format::{ChannelKind, Format, LEAF_FOLD, ProofKind};
+use vos_pvm_proof::format::{ChannelKind, Format, LEAF_FOLD, ProofKind, mix_statement_header};
 use vos_pvm_proof::pcs::ProofHash;
 use vos_pvm_proof::poseidon2::{P2Hash, P2MerkleChannel, P2MerkleHasher, Poseidon2M31Channel};
 use vos_pvm_proof::proof::{
     MAX_FRI_QUERIES, MAX_MERKLE_WITNESS_HASHES, MAX_PROOF_LOG_SIZE, MIN_PROOF_LOG_SIZE,
     PROOF_COMMITMENT_TREE_COUNT, check_format_security, check_interaction_pow,
-    mix_statement_header,
 };
 use vos_pvm_recair_air::gate::{GATE_WIDTH, Layout, public_logup_sum};
 use vos_pvm_recair_air::transcript::{Prefix, replay_prefix};

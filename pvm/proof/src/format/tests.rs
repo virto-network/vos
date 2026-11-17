@@ -40,7 +40,7 @@ fn segment_air_shape(log_size: u32, format: &Format) -> SecurityShape {
 
 /// The registry's segment reference shape is the segment AIR's, every
 /// chip at 2^20 rows (the device's, the masked device set's, is
-/// `vos-pvm-recair`'s device tests').
+/// `vos-pvm-device`'s tests').
 #[test]
 fn the_reference_shapes_are_the_segment_airs() {
     assert_eq!(segment_air_shape(20, &SEGMENT), SEGMENT_REFERENCE);

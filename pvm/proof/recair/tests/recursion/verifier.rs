@@ -346,7 +346,7 @@ fn regrind_interaction(real: &Real, bytes: &[u8]) -> u64 {
         unreachable!()
     };
     let mut channel = Poseidon2M31Channel::default();
-    vos_pvm_proof::proof::mix_statement_header(
+    vos_pvm_proof::format::mix_statement_header(
         &mut channel,
         real.shape.stark.format.number,
         &real.shape.config(),

@@ -19,8 +19,8 @@ use rand_chacha::rand_core::SeedableRng;
 use rayon::prelude::*;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::DeepBatching;
+use vos_pvm_proof::format::statement_header_words;
 use vos_pvm_proof::format::{Format, Masking};
-use vos_pvm_proof::proof::statement_header_words;
 
 use super::MainColumns;
 use crate::prove::CircuitError;
@@ -81,7 +81,7 @@ pub(crate) struct Statement<'a> {
 /// The witness digest R4 hedges with: `BLAKE2b-256` of the domain, the
 /// statement's words as u64 little-endian (the count of its header's words,
 /// then the header the transcript mixes,
-/// `vos_pvm_proof::proof::statement_header_words`: the format's number, its
+/// `vos_pvm_proof::format::statement_header_words`: the format's number, its
 /// configuration and each log size; then its DEEP batching, its interaction
 /// PoW, its channel's tag and its masking), the public values' count and
 /// each value's 4 limbs, as u32 little-endian, then each main column's digest

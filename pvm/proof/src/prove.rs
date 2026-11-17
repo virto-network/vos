@@ -510,7 +510,7 @@ where
     let twiddles = preprocessed::twiddles_for(components, &log_sizes, &config);
 
     let prover_channel = &mut MC::C::default();
-    crate::proof::mix_statement_header(prover_channel, format.number, &config, &log_sizes);
+    crate::format::mix_statement_header(prover_channel, format.number, &config, &log_sizes);
 
     let mut commitment_scheme = CommitmentSchemeProver::<SimdBackend, MC>::new(config, &twiddles);
     // Stwo v2.x requires polynomial coefficients to be stored — without

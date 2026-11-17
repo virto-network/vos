@@ -171,7 +171,7 @@ fn the_interaction_pow_is_checked() {
 fn transcript_before_interaction_pow(proof: &Proof) -> Poseidon2M31Channel {
     use stwo::core::channel::MerkleChannel;
     let mut channel = Poseidon2M31Channel::default();
-    vos_pvm_proof::proof::mix_statement_header(
+    vos_pvm_proof::format::mix_statement_header(
         &mut channel,
         proof.format_version,
         &proof.pcs_config,

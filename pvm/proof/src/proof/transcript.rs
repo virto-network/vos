@@ -9,10 +9,9 @@ use stwo::core::{
     pcs::{CommitmentSchemeVerifier, PcsConfig, TreeVec},
     proof::StarkProof,
 };
-pub use vos_pvm_recair_air::format::{mix_statement_header, statement_header_words};
 
 use super::{Malformed, Proof, SecurityError, SegmentState};
-use crate::format::{Format, FormatParams};
+use crate::format::{Format, FormatParams, mix_statement_header};
 use crate::lookups::AllLookupElements;
 use crate::pcs::{FsChannel, PcsStack};
 use crate::security::{SecurityBits, SecurityShape};

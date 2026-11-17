@@ -85,6 +85,12 @@ impl core::fmt::Display for ShapeError {
 
 impl core::error::Error for ShapeError {}
 
+impl From<ShapeError> for stwo::core::verifier::VerificationError {
+    fn from(refusal: ShapeError) -> Self {
+        Self::InvalidStructure(alloc::string::ToString::to_string(&refusal))
+    }
+}
+
 /// A class of segment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SegmentClass {

@@ -72,9 +72,9 @@ use stwo::prover::{
 };
 use stwo_constraint_framework::Relation;
 use vos_pvm_final_verifier::masking::{MaskedFormat, shape_of};
+use vos_pvm_proof::format::mix_statement_header;
 use vos_pvm_proof::format::{Format, Masking};
 use vos_pvm_proof::masked::DeviceComponents;
-use vos_pvm_proof::proof::mix_statement_header;
 use vos_pvm_recair_air::masking::{
     self as air, BLIND_COLUMNS, BlindRelation, MASKED_COLUMN_EXPANSION,
     MASKED_LOG_CONSTRAINT_EXPANSION, MaskedComponent, MaskedComponents,

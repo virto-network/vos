@@ -99,8 +99,7 @@ fn verify_components(
     // format's channel, and every log size under `DEFAULT_MAX_LOG_SIZE` (so a
     // malicious prover can't force a giant Merkle commitment phase), before
     // any cryptographic work.
-    let format = crate::proof::preflight_proof_structure(&mut proof, DEFAULT_MAX_LOG_SIZE)
-        .map_err(|error| VerificationError::InvalidStructure(error.to_string()))?;
+    let format = crate::proof::preflight_proof_structure(&mut proof, DEFAULT_MAX_LOG_SIZE)?;
     if proof.pcs_config.fri_config.log_blowup_factor > crate::proof::MAX_RECOMMIT_LOG_BLOWUP {
         return Err(VerificationError::InvalidStructure(format!(
             "proof-side recommitment rejects FRI log blowup above {}",
@@ -166,10 +165,8 @@ where
         stark,
         &shape_component_refs,
         &expected_log_sizes,
-    )
-    .map_err(|error| VerificationError::InvalidStructure(error.to_string()))?;
-    crate::proof::check_format_security(format, &config, &security_shape)
-        .map_err(|error| VerificationError::InvalidStructure(error.to_string()))?;
+    )?;
+    crate::proof::check_format_security(format, &config, &security_shape)?;
 
     verify_preprocessed_trace::<MC>(
         stark,
@@ -234,8 +231,7 @@ where
         &config,
         protocol_shape,
         &expected_log_sizes,
-    )
-    .map_err(|error| VerificationError::InvalidStructure(error.to_string()))?;
+    )?;
     if sampled_queries != protocol_shape.query_count {
         return Err(VerificationError::InvalidStructure(
             "queried-value rows differ from Fiat-Shamir query positions".to_string(),
@@ -300,8 +296,7 @@ fn transcript_prefix<'a, MC: PcsStack>(
             }
             lookup_elements
         },
-    )
-    .map_err(|error| VerificationError::InvalidStructure(error.to_string()))?;
+    )?;
     let tree_span_provider = &mut TraceLocationAllocator::default();
     let verifier_components = components
         .iter()

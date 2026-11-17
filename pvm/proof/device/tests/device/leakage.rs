@@ -35,11 +35,11 @@ use stwo::core::fields::qm31::SecureField;
 use stwo::core::proof::StarkProof;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
+use vos_pvm_proof::format::mix_statement_header;
 use vos_pvm_proof::masked::{
     DeviceComponents, DeviceSizes, device_io_position, device_public_values, masked_device_trace,
 };
 use vos_pvm_proof::poseidon2::P2MerkleChannel;
-use vos_pvm_proof::proof::mix_statement_header;
 use vos_pvm_recair::masked::MaskRng;
 use vos_pvm_recair_air::masking::MaskedComponents;
 

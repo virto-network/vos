@@ -297,7 +297,7 @@ where
     );
     #[cfg(not(feature = "seeded-masks"))]
     let proved = {
-        let Checks { .. } = checks;
+        let _ = checks;
         vos_pvm_recair::masked::prove_masked_program::<MC, DeviceComponents>(
             format, program, trace, committed, rng,
         )

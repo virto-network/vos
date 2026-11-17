@@ -165,7 +165,7 @@ impl SegmentShape {
         );
 
         let header =
-            vos_pvm_proof::proof::statement_header_words(format.number, &config, log_sizes);
+            vos_pvm_proof::format::statement_header_words(format.number, &config, log_sizes);
 
         let layout = sample_layout(component_mask, log_sizes, &config);
         if let Err(refusal) = check_format_security(format, &config, &layout.security_shape) {

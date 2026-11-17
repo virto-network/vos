@@ -33,9 +33,10 @@ use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::{CommitmentSchemeVerifier, PcsConfig, TreeVec};
 use vos_pvm_proof::format::LEAF_FOLD_LOG_SIZES;
+use vos_pvm_proof::format::mix_statement_header;
 use vos_pvm_proof::framework_access::{AllLookupElements, air_layout};
 use vos_pvm_proof::poseidon2::{P2MerkleChannel, Poseidon2M31Channel};
-use vos_pvm_proof::proof::{check_format_security, check_interaction_pow, mix_statement_header};
+use vos_pvm_proof::proof::{check_format_security, check_interaction_pow};
 use vos_pvm_proof::{RecursionData, SampleLayout, sample_layout_of};
 use vos_pvm_recair_air::gate::{FIRST_OUTPUT_ADDRESS, GATE_WIDTH, U_ADDRESS};
 use vos_pvm_recair_air::transcript::replay_prefix;
@@ -52,7 +53,7 @@ use crate::verifier::channel::Channel;
 use crate::verifier::stark::{Draws, StarkShape, StarkValues, interaction, verify_rest};
 use crate::verifier::witness::{digest_wires, drawn_positions, pack};
 use crate::verifier::{ShapeMismatch, WitnessError};
-use vos_pvm_proof::proof::statement_header_words;
+use vos_pvm_proof::format::statement_header_words;
 
 /// The relation a recursion AIR proof draws, by the name its components'
 /// recordings give it.

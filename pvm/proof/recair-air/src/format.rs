@@ -316,7 +316,7 @@ pub enum Refused {
     /// ([`Status::Internal`]).
     Internal,
     /// The entry names another kind of proof than the verifier reads.
-    WrongKind,
+    NotSegment,
 }
 
 /// Shown as what is said of the format: `proof format 18 {refused}` reads
@@ -327,7 +327,7 @@ impl core::fmt::Display for Refused {
             Self::Unregistered => "is not registered",
             Self::Retired => "is retired and not registered",
             Self::Internal => "is registered but not admitted",
-            Self::WrongKind => "does not name segment proofs",
+            Self::NotSegment => "does not name segment proofs",
         })
     }
 }
@@ -354,7 +354,7 @@ pub fn admitted(number: u32) -> Result<&'static Format, Refused> {
 pub fn admitted_segment(number: u32) -> Result<&'static Format, Refused> {
     let format = admitted(number)?;
     if format.kind != ProofKind::Segment {
-        return Err(Refused::WrongKind);
+        return Err(Refused::NotSegment);
     }
     Ok(format)
 }
@@ -458,8 +458,8 @@ mod tests {
     fn the_registry_refuses_by_cause() {
         assert!(REGISTRY.windows(2).all(|w| w[0].number < w[1].number));
         assert_eq!(admitted(32), Err(Refused::Internal));
-        assert_eq!(admitted_segment(39), Err(Refused::WrongKind));
-        assert_eq!(admitted_segment(47), Err(Refused::WrongKind));
+        assert_eq!(admitted_segment(39), Err(Refused::NotSegment));
+        assert_eq!(admitted_segment(47), Err(Refused::NotSegment));
         assert_eq!(admitted_segment(41), Ok(&SEGMENT));
         for number in RETIRED {
             assert!(lookup(number).is_none());

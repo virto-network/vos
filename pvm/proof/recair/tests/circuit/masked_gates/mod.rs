@@ -58,8 +58,8 @@ use vos_pvm_final_verifier::Error;
 use vos_pvm_final_verifier::masking::{Claim, replay, verify_masked};
 use vos_pvm_poseidon2::{M31, N_STATE};
 use vos_pvm_proof::format::Format;
+use vos_pvm_proof::format::mix_statement_header;
 use vos_pvm_proof::poseidon2::P2MerkleChannel;
-use vos_pvm_proof::proof::mix_statement_header;
 use vos_pvm_recair::circuit::Qm31Wiring;
 use vos_pvm_recair::masked::{
     MaskRng, MaskedTrace, prove_masked, prove_masked_unchecked, verifier_format,

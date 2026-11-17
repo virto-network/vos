@@ -6,9 +6,9 @@ use stwo::core::vcs::blake2_hash::Blake2sHash;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 use vos_pvm_final_verifier::masking::MaskedFormat;
 use vos_pvm_proof::format::Format;
+use vos_pvm_recair::masked::MaskedProof;
 
 use super::{DeviceProgramId, Hasher, MAX_PROOF_BYTES, Refusal};
-use vos_pvm_recair::masked::MaskedProof;
 
 use crate::masked::{DeviceProgram, DeviceProof, device_format, verify_device_in};
 

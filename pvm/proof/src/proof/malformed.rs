@@ -160,3 +160,15 @@ impl core::fmt::Display for Malformed {
 }
 
 impl core::error::Error for Malformed {}
+
+impl From<Malformed> for stwo::core::verifier::VerificationError {
+    fn from(refusal: Malformed) -> Self {
+        Self::InvalidStructure(alloc::string::ToString::to_string(&refusal))
+    }
+}
+
+impl From<SecurityError> for stwo::core::verifier::VerificationError {
+    fn from(refusal: SecurityError) -> Self {
+        Self::InvalidStructure(alloc::string::ToString::to_string(&refusal))
+    }
+}

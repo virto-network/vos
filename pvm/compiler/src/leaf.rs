@@ -59,7 +59,7 @@ pub struct Chip {
 use Mask::{Current, Next, Previous};
 
 /// The statement header's words before its log sizes
-/// (`vos_pvm_proof::proof::statement_header_words`): the domain's two, the
+/// (`vos_pvm_proof::format::statement_header_words`): the domain's two, the
 /// format, the PCS configuration's five, and no lifting height's one.
 const HEADER_WORDS: usize = 9;
 

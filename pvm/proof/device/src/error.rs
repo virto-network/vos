@@ -55,9 +55,25 @@ pub enum Error {
 
 impl Error {
     /// Whether the failure is the kernel's own, failing every time for its
-    /// bytes, as against the prover's, which another attempt may pass.
+    /// bytes, as against the prover's, which another attempt may pass, or
+    /// the build's (a format it does not prove).
     pub fn is_of_the_kernel(&self) -> bool {
-        !matches!(self, Self::Prove)
+        match self {
+            Self::IdMismatch
+            | Self::Layout
+            | Self::Chips
+            | Self::Halt
+            | Self::Arguments
+            | Self::Reference
+            | Self::Trace
+            | Self::Sizes
+            | Self::Floor { .. }
+            | Self::Ceiling { .. }
+            | Self::Masking
+            | Self::Fit
+            | Self::Unsatisfied => true,
+            Self::Format(_) | Self::Prove => false,
+        }
     }
 }
 
