@@ -205,7 +205,9 @@ unsafe extern "C" fn refine_main(args: *const u8, len: u64) -> Output {
         Some((service, args.payload))
     });
     let mut output = match (config, service) {
-        (None, Some((_, payload))) => refine_unconfigured(&payload),
+        (None, service) => {
+            refine_unconfigured(service.as_ref().map_or(&[][..], |(_, payload)| payload))
+        }
         (Some(config), Some((service, payload))) => {
             refine(&config, venue(&config, service), &payload, &mut Proof)
         }
