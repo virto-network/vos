@@ -8470,6 +8470,7 @@ dependencies = [
  "vos-keeper",
  "vos-light",
  "vos-node",
+ "vos-pvm-device",
  "vos-pvm-precompiles",
  "vos-pvm-recair",
  "vos-testkit",

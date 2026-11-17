@@ -47,6 +47,8 @@ s4-credential-contract = { git = "https://codeberg.org/Virto/s4", rev = "084f598
 vos-checker = { path = "../../checker" }
 # The carrier audit's watch of a sign-in's masks.
 vos-pvm-recair = { path = "../../../pvm/proof/recair", default-features = false, features = ["watch"] }
+# A sign-in's device proof made and encoded outside the facility.
+vos-pvm-device = { path = "../../../pvm/proof/device" }
 tracing = "0.1"
 # The stock kernels' release artifacts, from this tree's credential actor.
 vos-light = { path = "../../light", features = ["release"] }

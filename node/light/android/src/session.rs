@@ -468,7 +468,9 @@ impl Inner {
         self.programs.get(warm::key(kernel), || {
             <Release as vos_wire::Decode>::decode_exact(kernel)
                 .ok_or(DeviceError::Prove)
-                .and_then(|device| DeviceProgram::from_release(&device))
+                .and_then(|device| {
+                    DeviceProgram::from_release(&device).map_err(DeviceError::Program)
+                })
         })
     }
 
@@ -1547,7 +1549,7 @@ mod tests {
         let renamed = vos_wire::Encode::encode(&renamed);
         assert_eq!(
             facility.inner.program(&renamed).map(drop),
-            Err(DeviceError::Prove)
+            Err(DeviceError::Program(vos_light::ProgramError::IdMismatch))
         );
     }
 }

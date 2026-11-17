@@ -129,6 +129,7 @@ pub use secret::{DeviceSecret, derive_secret, member, owner, source_input};
 pub use store::{Store, StoreError};
 pub use threads::thread_pool;
 pub use tree::{Synced, TreeKeeper};
+pub use vos_pvm_device::Error as ProgramError;
 
 use vos_wire::credentials::{self, P};
 use vos_wire::ingress::Rejection;
@@ -200,7 +201,7 @@ pub enum DeviceError {
     /// The device program could not be made, or a run of it not proved:
     /// why, as the device profile says (`vos_pvm_device::Error`, which
     /// holds no value of a run). Shown as [`DeviceError::Prove`] is.
-    Program(vos_pvm_device::Error),
+    Program(ProgramError),
     /// An answer that does not decode, or is not the request's outcome.
     Decode,
     /// A proof that does not verify against its call.
