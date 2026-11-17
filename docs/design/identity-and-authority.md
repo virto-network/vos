@@ -246,7 +246,7 @@ proves and the kernel's claim.
       pub arguments: Vec<u8>,          // at most cap::REQUEST - cap::CLAIM
       pub nonce: [u8; 16],             // the client's, at random
       pub expires_ms: u64,             // by the node's clock
-      pub format: u32,                 // 46, the device format
+      pub format: u32,                 // 47, the device format
       pub claim: Vec<u8>,              // the kernel's public arguments, at most cap::CLAIM (1 KiB)
       pub proof: Vec<u8>,
   }
@@ -390,7 +390,7 @@ proves and the kernel's claim.
   1. `expires_ms < t`: refused, `Refusal::CredentialExpired` (7);
      after the binding's check (2), the device format one the release
      does not admit
-     (`defaults::DEVICE_FORMATS`, 47 alone, 46 retired at once), or
+     (`defaults::DEVICE_FORMATS`, 47 alone), or
      past its release's date or the date the agent's log retired it at
      (`Admin::RetireFormat`, the operator's `Retire::Format` for an
      agent, one call for each agent that takes proven calls): refused,

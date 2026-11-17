@@ -80,31 +80,9 @@ The scale results are in `core-model.md` §14, "The scale test".
     `memory_ledger_padding_gate::padding_between_the_ledgers_real_rows_is_harmless`
     and `register_ledger_gate::padding_between_the_ledgers_real_rows_is_harmless`).
     32 and 39 prove the recursion AIR, which has no memory argument.
-  - **Device 46: not consistent; retired behind 47.** `DeviceMemoryChip`
-    lets a byte have as many rows as the prover puts (its address bits
-    free, no ordering, `Last` and `ClosingTs` free), so a byte can have
-    two groups, each in a sorted run of its own and started and closed by
-    its own boundary row: a read in the second sees the byte's first
-    touch, or any write placed with it, instead of the last write before
-    it. It needs one spare `DeviceMemoryChip` row and about four spare
-    ledger rows at the program's log sizes (auth's ledger: 12,754 of 2^14
-    rows). In one sorted run a second boundary row does not balance (its
-    `ts = 0` write is no start, and only a start consumes the permission),
-    so the gap needs both. On paper a riscv64 kernel's stack spill reloads
-    its first touch (zero) or an older spill, so a value the kernel's
-    control flow reads back, a check's result among them, could be
-    another. Its register ledger (`DeviceBoundaryChip`'s preprocessed
-    registers, entry at timestamp 1) and program memory are consistent.
-    Gate `device::memory::byte_ledger_padding_between_real_rows_is_accepted_today`
-    holds the byte ledger's acceptance of padding inside it (the shape's
-    byte ledger) and flips if the ledger takes a last-row column. Format
-    47's release retires 46 at once (`DEVICE_FORMATS`: 46's date 0), so a
-    node refuses a 46 proof `Format`, and apply refuses one on every
-    replica whatever a node's configuration admits (the proven input
-    carries its format; `Config::device_formats` admitting 46 is the
-    window's gate's alone); the format registry marks it retired. 46's
-    code, fuzz target and leakage gate stay until it is deleted. Device proofs
-    are in no leaf, fold, wrap, venue or `MANIFEST` pin.
+  - **Device 46:** retired and deleted; its number is never reused. Its
+    byte ledger let a byte have two boundary rows, so a read could see a
+    byte's first touch instead of its last write.
   - **Device 47 (the word ledger):** consistent. `IsLast` keeps padding
     past the real rows, one sorted run, a word one group; a second
     boundary row's `ts = 0` write has no start to consume it (gates
@@ -114,7 +92,9 @@ The scale results are in `core-model.md` §14, "The scale test".
     the all-real cyclic trace, every row one word at one sort key with no
     group start (gate `word_ledger_gate::an_all_real_ledger_is_refused`,
     its control that every other constraint holds on it). Its register
-    ledger and program memory are 46's.
+    ledger (`DeviceBoundaryChip`'s preprocessed registers, entry at
+    timestamp 1) and program memory (preprocessed, read-only) are
+    consistent.
 
   Keeping a byte-ledger format for segments: the word ledger's `IsLast`
   on `MemoryChip` (one preprocessed column and one degree-3 constraint)
@@ -130,7 +110,7 @@ The scale results are in `core-model.md` §14, "The scale test".
 - **The signature chips:** SHA-256 and SHA-512, the bignum chip, and the
   P-256 and Ed25519 drivers, so a device can prove over a hardware key's
   signature instead of a device-held secret.
-- **A device format with a heavier interaction PoW:** format 46's is 8
+- **A device format with a heavier interaction PoW:** format 47's is 8
   bits, so well-formed junk ground for 2^8 nonces passes ingress's
   pre-check and costs a decode and the composition (11–27 ms on one x86
   thread) before its 16-bit PoW refuses it; 16 or more bits would refuse

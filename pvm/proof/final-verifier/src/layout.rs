@@ -1,5 +1,5 @@
 //! `format::MASKED_WRAP`'s bytes: a fixed layout
-//! (`vos_pvm_proof::format::ProofBytes::FixedLayout`).
+//! (`vos_pvm_recair_air::format::ProofBytes::FixedLayout`).
 //!
 //! The fields in a fixed order, every integer little-endian at its width,
 //! no varints; a vector whose length the proof chooses a `u32` count, then

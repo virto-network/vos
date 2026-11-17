@@ -49,17 +49,34 @@ What a verifier accepts is pinned in files the tree checks against what it
 builds. Each is written by a recipe, never by hand, except the two named
 last:
 
-| Pin | Holds | Written by | Checked by |
-|---|---|---|---|
-| `blobs.lock` | every guest blob's SHA-256, stripped: the venue guests (`final-verify.elf`, `statement-service.elf`), the agent programs, the test actors, the final verifier's Wasm blob | `just blobs-lock` | `just check-blobs` |
-| `node/light/android/release` | the facility's release artifacts: the stock kernels' device programs, the default agent's program, the local actors' packages | `just facility-release` | `just test-facility` |
-| `node/light/tests/device.pins` | the stock kernels' device program ids | `VOS_PINS=write` on `vos-light`'s `device` test | the same test |
-| `pvm/proof/src/constants.rs` | the known programs' ids and the circuits' constants (`H_FOLD`, the leaf circuits) | `VOS_PINS=write` on `vos-pvm-proof`'s `kernel` test, `constants::` | the same test |
-| `pvm/proof/fixtures` | the golden fixtures: segment proofs and their patches, the wrap's proofs, the statements' cases | `just fixtures` | `the_fixtures_are_the_generators`, in `test-proof`: every file the generator's bytes, and no file it does not make |
-| `tools/kreivo/conformance` | Kreivo's spaces pallet's conformance vectors, over the fixtures | `just conformance` | `just check` |
-| `pvm/proof/kit/Cargo.lock` | the verifier kit's lock file, VOS's pruned to what the kit links | `just kit-lock` | `just check-kit` |
-| `pvm/proof/final-verifier/src/constants.rs` | the wrap's preprocessed root (`PREPROCESSED_ROOT_39`), a venue's verifying key | by hand, at a change of the wrap's circuit | `vos-pvm-proof`'s `constants::` test computes it |
-| `pvm/proof/fuzz/replay`, `node/fuzz/replay` | each fuzz target's replay corpus, the prover's and the node's: inputs kept because they reached a path once, a regression set never generated | the fuzzer, kept by hand | `just fuzz-replay`, in `gate` |
+| Pin | Holds | Written by | Checked by | Tier |
+|---|---|---|---|---|
+| `blobs.lock` | every guest blob's SHA-256, stripped: the venue guests (`final-verify.elf`, `statement-service.elf`), the agent programs, the test actors, the final verifier's Wasm blob | `just blobs-lock` | `just check-blobs` | `gate` |
+| `node/light/android/release` | the facility's release artifacts: the stock kernels' device programs, the default agent's program, the local actors' packages | `just facility-release` | `just test-facility` | `gate` |
+| `node/light/tests/device.pins` | the stock kernels' device program ids | `VOS_PINS=write` on `vos-light`'s `device` test | the same test | `check` |
+| `pvm/proof/src/constants.rs` | the known programs' ids and the circuits' constants (`H_FOLD`, the leaf circuits) | `VOS_PINS=write` on `vos-pvm-proof`'s `kernel` test, `constants::` | the same test | `ci-full` (`test-proof`); a moved fold circuit moves the wrap's root, which `gate` checks |
+| `pvm/proof/fixtures` | the golden fixtures: segment proofs and their patches, the wrap's proofs, the statements' cases | `just fixtures` | `the_fixtures_are_the_generators`: every file the generator's bytes, and no file it does not make | `ci-full` (`test-proof`) |
+| `tools/kreivo/conformance` | Kreivo's spaces pallet's conformance vectors, over the fixtures | `just conformance` | `just check` | `check` |
+| `pvm/proof/kit/Cargo.lock` | the verifier kit's lock file, VOS's pruned to what the kit links | `just kit-lock` | `just check-kit` | `gate` |
+| `pvm/proof/final-verifier/src/constants.rs` | the wrap's preprocessed root (`PREPROCESSED_ROOT_39`), a venue's verifying key | by hand, at a change of the wrap's circuit | `vos-pvm-recair`'s `recursion` test (`masked::`) and `vos-pvm-proof`'s `constants::` test compute it | `gate`; `ci-full` |
+| `pvm/proof/fuzz/replay`, `node/fuzz/replay` | each fuzz target's replay corpus, the prover's and the node's: inputs kept because they reached a path once, a regression set never generated | the fuzzer, kept by hand | `just fuzz-replay`; `cargo run --release --example paths` in `pvm/proof/fuzz` lists what each input reaches | `gate` |
+
+**Constants typed by hand and held by a test,** besides the wrap's root:
+format 39's layout and shape (`LOG_SIZES`, `TREE_WIDTHS`, `DEEP_VALUES`,
+`samples`, `FRI_ROUNDS`, `LOG_DEGREE_BOUND`, in
+`final-verifier/src/{constants,masked}.rs`), held by the final verifier's
+own tests (`check`) and `vos-pvm-recair`'s `recursion` test against the
+built wrap (`gate`); the formats' bit counts (`COUNTS`, `src/format.rs`),
+held by the format tests (`vos-pvm-proof --lib`, `ci`); and the compiler's
+leaf tables (`pvm/compiler/src/leaf.rs`), held to the built leaves by
+`vos-pvm-recair`'s `recursion` test (`leaf_rows`, `gate`).
+
+`pvm/proof/fuzz/Cargo.lock` is not committed: the fuzz workspace resolves
+afresh at each build (its crates by path, Stwo at the workspace's pinned
+revision, typed again in `fuzz/Cargo.toml`), and the replay holds no
+pinned bytes, only that no input crashes. `just repro-aarch64`, which
+checks the program ids and the circuits' constants on aarch64 under QEMU,
+is in no tier: it needs a cross toolchain, and is run by hand.
 
 After a change that moves a guest, a circuit or the lock file, `just
 repin` writes every generated store anew in dependency order (guests and

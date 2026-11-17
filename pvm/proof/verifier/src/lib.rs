@@ -232,8 +232,8 @@ fn verify_standalone_on<MC: PcsStack>(
             "log sizes len mismatch".to_string(),
         ));
     }
-    // Reject `initial_state.timestamp < 1` per segment (the production
-    // consumer verifies single proofs here, not only the chain wrapper).  Step timestamps start at 1, so `initial_ts ≥ 1` excludes the
+    // Reject `initial_state.timestamp < 1` per segment (a single proof is
+    // verified here, not only by the chain wrapper). Step timestamps start at 1, so `initial_ts ≥ 1` excludes the
     // ts=0 per-page boundary writes from being forged as real steps, and (with
     // the CpuChip ts-chain) lands every step ts in [initial_ts, final_ts).
     if proof.initial_state.timestamp < 1 {

@@ -395,7 +395,11 @@ fn header_words<'a>(
 /// A.1's first item, as the words `mix_u64` takes: the protocol domain,
 /// the exact format generation and the PCS configuration, then each
 /// component's log size. This prefix authenticates every format's
-/// transcript, the segment's, the recursion's and the masked ones'.
+/// transcript, the segment's, the recursion's and the masked ones'. It
+/// does not mix the DEEP batching, the interaction PoW's bits or the
+/// masking: the format's number names them, one registry entry a number
+/// never reused, and every verifier takes them from its entry, never from
+/// a proof.
 pub fn statement_header_words(
     format_version: u32,
     config: &PcsConfig,

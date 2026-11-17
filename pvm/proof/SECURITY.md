@@ -7,15 +7,19 @@ statement, §4 the security levels, §6 the verifiers) and
 `docs/design/recursion-air.md`; [`docs/status.md`](./docs/status.md)
 lists what the AIR binds per opcode.
 
-There are two verifying paths:
+Two paths verify in production, and one is a reference:
 
-- **A segment proof,** verified by `vos-pvm-proof-verifier`
-  (`verify_standalone`, `verify_kernel_segment`, the chain verifiers):
-  format 41. Peers and tests use it.
 - **A statement,** a kernel's whole run: its segments (41) verified in
   leaves, folded (32), the root wrapped (39), the wrap verified by
   `vos-pvm-final-verifier` and judged by `vos-statement`. This is what a venue
-  (a chain's pallet, the JAM agent) accepts.
+  (a chain's pallet, the JAM statements service) accepts.
+- **A device proof** (47), a device kernel's run, verified natively at a
+  node's ingress by `vos-pvm-device` (`Verifier::verify`) against the
+  program the node computed from the kernel.
+- **A segment proof** (41), verified natively by `vos-pvm-proof-verifier`
+  (`verify_standalone`, `verify_kernel_segment`, the chain verifiers): the
+  reference the leaf circuit is held to (the recursion's tests), linked by
+  no production build; a node verifies segments inside its leaves.
 
 ## Formats and their bit counts
 
@@ -26,7 +30,7 @@ reference shape, from the security tool (`src/security.rs`):
 | format | proofs | channel | counts | floors | status |
 |---|---|---|---|---|---|
 | 41 | segments, the shared chip set (the Poseidon2 call among a node kernel's) | Poseidon2-M31 | 104 / 62.81 | 100 / 60 | admitted |
-| 32 | leaves and folds | Poseidon2-M31 | 108 / 63 | 100 / 60 | reserved: proved and verified inside the recursion, refused by every outside verifier |
+| 32 | leaves and folds | Poseidon2-M31 | 108 / 63 | 100 / 60 | internal (`Status::Internal`): proved and verified inside the recursion, refused by every outside verifier |
 | 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 146 / 82.70 | 100 / 80 | admitted: what venues accept |
 | 47 | device proofs, masked (variant (c)), `h = 256`, the per-program CPU and the word ledger | Blake2s-M31 | 110 / 62.82 | 100 / 60 | admitted: proven calls at a space's ingress, a device kernel's run each |
 
@@ -44,7 +48,15 @@ reference shape, from the security tool (`src/security.rs`):
   rows) batches 7,470; 47 counts 62.82 by affine batching.
 - A verifier rejects a number the registry does not admit
   (`format::lookup`), and a proof on another channel than its format's. The proof's configuration must equal
-  the format's, and its counts at its own shape must reach the floors.
+  the format's. The segment's and the recursion's verifiers count again at
+  the proof's own shape and refuse it below either floor. The masked
+  formats' (39, 47) count nothing at verify time: their shapes are pinned
+  at or under the reference shape (39's fixed layout; a device program's
+  log sizes at most `DEVICE_MAX_LOG_SIZE`, which install refuses past),
+  and every term of the count is monotone in the shape, so the
+  reference's count bounds every proof's (`src/format.rs`'s notes; the
+  device format's gate counts the cut device set too,
+  `device/tests/device/format.rs`).
 - **The proven count is the same on every target.** It is taken in `f64`
   (`src/security.rs`) by IEEE 754's basic operations alone: addition,
   subtraction, multiplication and division, each correctly rounded, so
@@ -118,7 +130,7 @@ rests on the conjectured count.
 | `proof.interaction_pow` | no | checked against the format's bits before any relation challenge |
 | `proof.stark_proof` | no | verified by Stwo, after a hostile-input preflight of every nested length |
 | `proof.claimed_sums` | no | must sum to zero; the boundary chips' must equal the sums recomputed from the boundary states |
-| `proof.log_sizes` | no | capped by `DEFAULT_MAX_LOG_SIZE` (overridable) |
+| `proof.log_sizes` | no | capped by `DEFAULT_MAX_LOG_SIZE`; no public verify entry takes another cap (only the bare preflight, `proof::preflight_proof_structure`, does) |
 | `proof.initial_state`, `proof.final_state` | bound | registers, pc and ts bound to the committed boundary columns and to the trace; `memory_root` to the in-AIR page tree of the images |
 | `proof.pcs_config` | no | the format's exactly; Fiat–Shamir-bound |
 | `hash`, the preprocessed root | **yes** | the class's program identity: its code, layout and permissions, at its shape. For a kernel, the install's record derives it, and the program id covers it |
@@ -181,12 +193,59 @@ the boundary binding, then Stwo's verifier, in that order.
   recursion's compiler or gates changes every leaf circuit's hash, the fold
   circuit's hash and the wrap's pinned root.
 
+## Trust boundary: a device proof
+
+`vos_pvm_device::Verifier::verify(io, bytes)` (`device/src/verify.rs`),
+which a node runs natively at ingress on bytes a caller submits:
+
+| input | trusted? | |
+|---|---|---|
+| the `Verifier`: the program, its masked format and its id | **yes** | computed by the node from the kernel and its release (`Program::from_kernel`, then `Program::verifier`): its chips (what its code can reach, `device_chips_of_code`), its CPU cut (`CpuColumns::of_code`), a log size each (its reference run's, raised by the headroom), its layout and the preprocessed root those commit; the format looked up by its number in `FORMATS`. Never read from a proof |
+| `io`, the io-hash | **yes** | computed by ingress from the claim it holds (`claim_io`: `H_io` of the claim's bytes, no output, no root), never the proof's |
+| `bytes` | no | at most `MAX_PROOF_BYTES` (1.5 MiB), then checked as below |
+
+**The order of its refusals:** `precheck` (the length; the leading fields
+read; the format number the program's; the interaction PoW over the
+header, the program's chips, the first two roots and `io`, as the
+transcript mixes them), then the decode (postcard, canonical: re-encoded to
+the same bytes, nothing after it), then `verify_masked` under the
+program's pinned masked format: the shape before any Stwo call, the
+preprocessed root the program's, the claimed sums cancelling and
+DeviceIoChip's the one `io` fixes, then Stwo's `verify_values`. Each maps
+to one `Refusal`.
+
+**What an accepted proof proves:** a run of the program's code, from its
+entry (timestamp 1, pc 0, the layout's registers) to its halt pc, its
+first touches the layout's (the data table, zero stack and heap, nothing
+else), no write landing on a read-only region, with the io-hash `io` in
+φ9..12 at the halt. Every other register and every value of the run stay
+masked (§ Masking).
+
+**The CPU cut:** a program's CPU is the full CPU's AIR with the columns its
+code never sets fixed to zero, and the constraints and fractions that
+vanish under that cut dropped (`src/chips/cpu/cut.rs`): every cut trace is
+a trace of the full AIR, so the cut proves no statement the full CPU does
+not. The code binds the cut (an instruction's flags are its code's, by the
+program memory's lookup), and the cut enters the program's id and its
+transcript. The pin code that decides it (`src/chips/cpu/cut/pin.rs`,
+`src/device/pin.rs`) is in the audit's scope.
+
+**A panic is a refusal, not a crash:** the device crate runs with std and
+is not linted panic-free; ingress catches a verifier's panic and counts it
+a failed proof (`node/host/src/credentialed.rs`'s `verifies`). The fuzz
+target `device_verify_bytes` holds it to no panic on arbitrary bytes.
+
+**The interaction PoW is 8 bits:** well-formed junk ground for 2^8 nonces
+passes `precheck` and costs a decode and the composition (11–27 ms on one
+x86 thread) before the PoW refuses it (`docs/design/open.md`).
+
 ## Panic-freedom
 
 A FRAME runtime cannot catch a panic (no unwinding on wasm32 without std;
 a panic aborts the block's import), so no guard can wrap the verifier. The
-final verifier, `vos-statement` and `vos-anchor` must be panic-free on
-every input by construction:
+five crates the kit vendors (the final verifier, `vos-statement`,
+`vos-anchor`, `vos-pvm-recair-air` and `vos-pvm-poseidon2`) must be
+panic-free on every input by construction:
 
 - **The crates' own code:** outside their tests, `clippy::unwrap_used`,
   `expect_used`, `indexing_slicing`, `panic`, `arithmetic_side_effects`,
@@ -196,18 +255,37 @@ every input by construction:
   check-no-std` lints for their targets). Each allowance is in place with
   its reason: QM31's modular addition (the logup sums, twice), the
   compact's big-integer mode (`width` 4 to 8 once checked), `vos-statement`'s
-  `fixtures` reader (the harnesses', std, never a venue's), and the JAM
-  program's allocator (sums of `Layout` sizes and arena offsets). No lint
-  covers `assert!`: the crates hold none outside their tests. `split_at`
-  and `copy_from_slice`, which no lint covers either, appear once, at
-  lengths equal by construction (`codec.rs`'s big-integer mode).
+  `fixtures` reader (the harnesses', std, never a venue's), the JAM
+  program's allocator (sums of `Layout` sizes and arena offsets); in
+  `vos-pvm-recair-air`, the constraint bodies' field arithmetic and their
+  fixed-size arrays indexed by the layout's constant offsets, the circle
+  group's addition, a format's masking's few columns summed, the wrap
+  layout's reserved wires, and `Rebound`'s preprocessed indices (below
+  the preprocessed tree's width, which `sample_points` checks); in
+  `vos-pvm-poseidon2`, M31's arithmetic (each operation's bound in its
+  reason), the permutation's fixed 16-word state, the sponge's buffer
+  (below `RATE`) and the tables built when the crate compiles; its
+  `packed` module, the prover's alone, is allowed whole. No lint covers
+  `assert!`: the crates hold one outside their tests, `M31::new`'s, whose
+  callers pass constants and 16-bit limbs. `split_at` and
+  `copy_from_slice`, which no lint covers either, appear at lengths equal
+  by construction (`codec.rs`'s big-integer mode; a digest's eight words
+  into a 16-word state).
 - **Stwo's code at the pin:** every index, `unwrap`, `expect`, `zip_eq`,
   `assert` and unchecked arithmetic reachable from format 39's
   `masking::verify_masked` (its `replay`, then `verify_values`) is in the
   table below with what guards it. Two had no guard and are the fork's fix
   (DIVERGENCE-013).
-- **Fuzzing:** seven targets (`fuzz/`), a checked-in corpus replayed by
-  `just gate` (`just fuzz-replay`), and `just fuzz`, a minute a target in
+- **Fuzzing:** eight targets (`fuzz/`, the justfile's
+  `proof_fuzz_targets`): the final verifier on arbitrary bytes
+  (`final_verifier_bytes`), on the golden wraps mutated
+  (`final_verifier_mutate`), on format 39's layout past its header
+  (`masked_bytes`) and on its queried parts reshaped (`masked_shape`); the
+  statement's decoder and the venue's check (`statement_decode`); the
+  anchor's decoders (`anchor_decode`); prove-then-verify on random
+  programs (`prove_verify_roundtrip`); and the device verifier on ingress's
+  bytes (`device_verify_bytes`). A checked-in corpus is replayed by `just
+  gate` (`just fuzz-replay`), and `just fuzz` runs a minute a target in
   `ci-full` and five in the full gate (`just slice-gate`).
 
 ### Stwo's verify path, audited
@@ -251,7 +329,13 @@ computes from the format, never read from the proof.
 | 27 | `fold_line`'s and `fold_circle_into_line`'s twiddle inversions (`x.inverse()`, `p.y.inverse()`) | ours: points of canonic cosets (y ≠ 0: y is 0 only at points of order at most 2) and of their line domains (x is 0 only at order-4 points, a domain of 2; FRI stops at the last layer's domain, at least 2^7) |
 
 Field inversions elsewhere on the path (M31, QM31) are only 3, 4, 17 and
-27.
+27, and VOS's own: `vos-pvm-recair-air`'s `public_logup_sum`
+(`recair-air/src/gate.rs`, called from `final-verifier/src/masked.rs`)
+inverts each public term's `Gate` denominator, 25 on the wrap, and
+`QM31::inverse` asserts non-zero at the pin; a denominator is zero with
+probability about 2^-124 a term, over challenges drawn after the main
+root. The device path has the same shape in DeviceIoChip's recomputed sum
+(`src/chips/device_boundary.rs`'s `io_claimed_sum`, 4 terms, φ9..12).
 The channel's draws and `verify_pow_nonce` index nothing from the proof.
 
 ### The corpus
@@ -337,7 +421,10 @@ panic-freedom does:
 
 ## Masking
 
-Format 39's wraps are masked; segment, leaf and fold proofs are unmasked:
+Format 39's wraps and format 47's device proofs are masked, over one
+masked verifier (`final-verifier/src/masking.rs`, the device's component
+set laid out as its program pins it); segment, leaf and fold proofs are
+unmasked:
 their witness (digests, positions, the io-hash, the fold word) and their
 trace are in the clear, and they must never leave the prover role.
 
@@ -554,7 +641,12 @@ scope to files and functions. Its scope:
   id's derivation;
 - the masking: the masked transcript's order, R1 to R4, the blinding's
   soundness, and the zero-knowledge argument's premises; later, the public
-  sums' re-cut.
+  sums' re-cut;
+- the device path: `vos-pvm-device`'s pre-check, decode and verify; the
+  device chip set (the word ledger's three chips, DeviceBoundaryChip,
+  DeviceIoChip and the data table); the CPU cut and the pin code that
+  computes a program's chips and cut from its code; a device program's id;
+  the stock kernels.
 
 Who performs it, and when, is open.
 
@@ -583,7 +675,8 @@ Who performs it, and when, is open.
 - [ ] **Cap the submission's length** before decoding it; key accepted
   statements on the statement id.
 - [ ] **Publish a segment's expected shape and boundary** where a segment
-  proof is verified directly; set `max_log_size` to the honest shapes.
+  proof is verified directly (a reference path; no production build
+  verifies one natively).
 - [ ] **Plan for liveness failures:** a fallback or another prover.
 - [ ] **Treat `javm` as the reference:** a proof shows a trace matches
   javm's PVM semantics, so a javm bug is a bug here.

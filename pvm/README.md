@@ -3,10 +3,34 @@
 This directory owns the virtual machine, compiler, snapshot codec, and proof
 implementation used by VOS, the actor ABI (`abi`) and the committed maps'
 Merkle tree its keys are laid out for (`tree`), both VOS's own. No package
-here depends on a path outside this directory but `support/`'s (`just
-check-layers`, which exempts by name the prover's kernel tests' dev edges
-to the testkit and the model venue). Runtime and compiler changes are
-reviewed and released with the rest of the repository.
+here depends on a path outside this directory (`just check-layers`, which
+would allow `support/`'s vendored crates, none depended on today, and
+exempts by name the prover's kernel tests' dev edges to the testkit and
+the model venue). Runtime and compiler changes are reviewed and released
+with the rest of the repository.
+
+## What it needs from outside it
+
+The Cargo rule above holds, but these read or build against the rest of
+the repository, so the directory is reviewed alone and built, pinned and
+merged with the trees around it:
+
+- **The prover's kernel tests** (`proof/tests/kernel`, the exempted dev
+  edges): they run a kernel against the agent's reference model
+  (`agent/testkit`, and `agent/wire` through it), judge its statements at
+  the model venue (`node/venue`), and run the built test actors
+  (`agent/test-actors`). They hold the checkers of two pins (the
+  constants' and the fixtures'), are what `just repin` and `just
+  fixtures` write those pins with, and hold `just test-reads`' tests, in
+  `gate`.
+- **The verifier kit** (`proof/kit/vos_kit.py`) carries Kreivo's
+  conformance vectors from `tools/kreivo/conformance/`, so vendoring it
+  and `just check-kit` read that directory.
+- **The shared files:** the root `Cargo.toml` and `Cargo.lock`,
+  `blobs.lock`, `programs.toml` and the `justfile`. The venue guests
+  (`final-verify.elf`, `statement-service.elf`) resolve on the root
+  lock, so a dependency change outside this directory can move their
+  bytes.
 
 ## Source provenance
 
