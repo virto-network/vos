@@ -280,12 +280,9 @@ pub(crate) fn peephole_fuse_load_imm_alu(
                     && (matches_ra != matches_rb)
                 {
                     let result = if matches_rb {
-                        let neg_k = -(load_val as i32) as i64;
-                        if neg_k >= i32::MIN as i64 && neg_k <= i32::MAX as i64 {
-                            Some((Opcode::AddImm64, alu_ra, neg_k as i32))
-                        } else {
-                            None
-                        }
+                        i32::try_from(-load_val)
+                            .ok()
+                            .map(|neg_k| (Opcode::AddImm64, alu_ra, neg_k))
                     } else {
                         Some((Opcode::NegAddImm64, alu_rb, load_val as i32))
                     };
