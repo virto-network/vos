@@ -842,7 +842,8 @@ fn a_personal_space_is_claimed_paired_and_its_first_phone_retired() {
     );
 
     // A second claim: refused at the device, which holds the archive, and
-    // at `Homes`, whose nullifier index holds the agent.
+    // at `Homes`, whose nullifier index holds the agent, once the second
+    // made the open claim a claim starts with.
     assert!(matches!(
         Claim::prepare(
             second.light.store(),
@@ -867,6 +868,7 @@ fn a_personal_space_is_claimed_paired_and_its_first_phone_retired() {
         expires(&mut sockets),
     )
     .unwrap();
+    open_claim(&mut sockets, &space, &second);
     let path = second
         .path(
             &mut sockets,
