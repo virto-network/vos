@@ -1564,7 +1564,7 @@ MiB; owner 259 steps (385), 6.29M → 5.32M cells (−15.4%), 859,617 →
 748,356 bytes, peak 225 → 141 MiB; every proof verified; the times, at
 load average 20–23 from other work, too noisy to read [measured, x86 dev
 machine (Intel Core Ultra 7 155H), four threads, 2026-11-11]. PG1′ and
-PG2′ on 47 are the phone sessions' (plan 8.10).
+PG2′ on 47 are the phone sessions', pending.
 
 **Format 46** [retired and deleted]: the device parameters over the full
 CPU and a ledger a row a byte, which let a byte have two boundary rows

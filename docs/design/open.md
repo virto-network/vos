@@ -173,7 +173,7 @@ The scale results are in `core-model.md` §14, "The scale test".
   space or to JAM, then reputation, and opt-in linking (`identity-and-authority.md` §7).
 - **Secret sources:** sources that span devices, iOS, and recovery across
   devices.
-- **Node-signed feed heads** (slice 9): a node's signature over the
+- **Node-signed feed heads** (next, not built): a node's signature over the
   credential tree feed's head (its newest root, the feed's length and the
   node's time), relayed by the gateway and checked by the keeper, so a
   gateway can no longer end a device's feed answers early at a root of its
@@ -200,39 +200,40 @@ The scale results are in `core-model.md` §14, "The scale test".
   need the facility's kit-signed `resolve` and `remove` (and their
   screens) before a phone runs them.
 - **Every personal agent lapses at month 13** [risk, dated 2026-11-17,
-  the owner's decision 16]: the yearly re-proof flow and the joiners' open
-  claim (E28) move to slice 9, so no device proves `Homes.renew`, and a
+  the owner's choice]: the yearly re-proof flow and the joiners' open
+  claim (`light-node.md`'s E28) are deferred to the next stage of work, so
+  no device proves `Homes.renew`, and a
   joiner holds no leaf at a home-only home to prove it with. Each agent's
   lease runs out 13 months after its claim and it enters its 180 days'
   grace (pushes refused; reads and a restore still served) unless
-  slice 9 ships both before then or the home sets a longer lease
+  that work ships both before then or the home sets a longer lease
   (`Policy::lease_ms`, 395 days by default). `Homes.renew`, `Personal.renew`, the
   recorded nullifiers, the lease and the grace stay built.
-- **The MLS leaf's year** [risk, dated 2026-11-17, decision 16]: a leaf
+- **The MLS leaf's year** [risk, dated 2026-11-17]: a leaf
   made from a key package lives 365 days (mls-rs's lifetime), and a
   joiner's Welcome refuses a tree holding a leaf past it. The yearly
-  prompt that renewed it moves to slice 9 with the re-proof; until then
+  prompt that renewed it is deferred with the re-proof; until then
   any commit of a device renews its own leaf ("Commit now" makes one), so
   a device that commits nothing for a year blocks the next pairing until
   it commits or is removed.
-- **No notice of a lapsed lease** [risk, dated 2026-11-17, decision 16]:
+- **No notice of a lapsed lease** [risk, dated 2026-11-17]:
   the notice that raised the yearly re-proof also raised a lapsed lease,
   and went with it; a lapsed agent's pushes are refused (`Lapsed`) with
-  no notice of its own. Slice 9's re-proof flow brings both back.
+  no notice of its own. The deferred re-proof flow brings both back.
 - **A left personal space's admin key** [known limit, dated 2026-11-17]:
   a leave (a move, a pairing from another space) drops the light node's
   store and keys but leaves the admin key in the UI's keystore, where it
   could still sign at the old agent, at which the device stays listed
   until its other devices remove it. Deleting it needs a prompts call of
   its own.
-- **Scope checkpoints** [slice 9, dated 2026-11-17, decision 16;
+- **Scope checkpoints** [deferred, dated 2026-11-17;
   `light-node.md` §3.6, §8 C4; `node/light/SECURITY.md`]: a newly paired
   or restored device reads each scope from its start and has read no
   position to hold the operators to, so it can be served a shortened
   scope (its newest envelopes withheld) without an alarm; `Partition`
   is raised only once a later envelope's `seen` position crosses the cut.
   `Personal`'s `acknowledge` and `acknowledgements` stay for them.
-- **Restore elsewhere and the move's carry** [slice 9, decision 16;
+- **Restore elsewhere and the move's carry** [deferred, dated 2026-11-17;
   `light-node.md` §3.9]: a restore lands at its own home (then moves),
   and a move carries nothing, valid only while the personal space holds
   the credential and device books; a third local actor whose rows no
