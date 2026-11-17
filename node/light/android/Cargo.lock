@@ -8064,7 +8064,6 @@ dependencies = [
  "bytemuck",
  "getrandom 0.2.17",
  "num-traits",
- "postcard",
  "rand 0.8.6",
  "rand_chacha 0.3.1",
  "rayon",

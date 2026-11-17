@@ -1442,9 +1442,7 @@ dependencies = [
 name = "vos-pvm-proof-verifier"
 version = "0.1.0"
 dependencies = [
- "num-traits",
  "stwo",
- "stwo-constraint-framework",
  "vos-pvm-proof",
 ]
 
@@ -1456,7 +1454,6 @@ dependencies = [
  "bytemuck",
  "getrandom 0.2.17",
  "num-traits",
- "postcard",
  "rand",
  "rand_chacha",
  "rayon",
