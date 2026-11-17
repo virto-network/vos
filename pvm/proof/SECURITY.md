@@ -392,7 +392,8 @@ SIMD backend's Blake2s-M31 digest words reduced canonically over the whole
 u32 range, as the verifier reduces them, on `vos/grind-chunks`' `4cd1f83f`:
 the prover's parallel grind in chunks of 2^14 nonces, its nonce unchanged,
 on `vos/verify-panics`' `c3ec9813`, on `vos/wrap`'s `ab294189`). Its divergence
-log (`.claude/skills/paper-implementation-divergence-log.md`) holds two
+log, in the fork's tree at the pinned revision
+(<https://github.com/olanod/stwo/blob/e14925a81606b4d68c6a5d3047d382a20bd953d3/.claude/skills/paper-implementation-divergence-log.md>), holds two
 open items both wraps' counts rest on, and one the verifier's
 panic-freedom does:
 
