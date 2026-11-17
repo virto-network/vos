@@ -3,10 +3,10 @@
 # check-blobs` checks it (the justfile's `_blob-hashes` says which blobs).
 d8908fd65823527ee7660bcb20823da9b3ee1dc3b777e228414f3d241bafa277  target/riscv64em-vos/release/final-verify.elf
 ca1e018d918c8de14c2004243076febe98b181812df0f38ba516ca139c95d2af  target/riscv64em-vos/release/statement-service.elf
-152459c654a27532fa149191288965351474cee81be8123aa0cb1a84a8351f3d  agent/programs/target/riscv64em-vos/release/vos-agent.elf
+2d6cf56a6748d14c45a52ee7ab98c48d18b6f143e700c2d7a3bcd27ab1779c70  agent/programs/target/riscv64em-vos/release/vos-agent.elf
 7b88fe03e7dc51c7bea81bf26a16318199457e64e2b01210122655b53cca46a3  agent/programs/target/riscv64em-vos/release/vos-representative.elf
 103a4c6edaced84091565a8d49526d464848ccc83fb51b03df6b95296fd853df  agent/programs/target/riscv64em-vos/release/vos-credentials.elf
-bd557a8ce07e2482a5a02764a7097b67128a5fbd795c379a17dbd7e9e430bf2d  agent/programs/target/riscv64em-vos/release/vos-personal.elf
+2193af90c3f817fa1a094cc723b2e04c7b3ce16be414156d3be1ca47f6a1b922  agent/programs/target/riscv64em-vos/release/vos-personal.elf
 c22adad542dee9377afd36821d759496b8fbf0af75bdbd710e5f307297dae006  agent/programs/target/riscv64em-vos/release/vos-payments.elf
 5ddfcbc8543549ea7ec9c30ad4c1bee1edbfb46f8f53efffad75e8b8c5332928  agent/programs/target/riscv64em-vos/release/vos-homes.elf
 6b52f19b437273a58c0cb425b8f9d91a95c7f3e6583428041ee456ff0374c0e1  agent/programs/target/riscv64em-vos/release/vos-credential-book.elf

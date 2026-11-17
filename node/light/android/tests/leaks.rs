@@ -481,27 +481,21 @@ fn nothing_the_facility_shows_or_keeps_carries_a_secret() {
     for form in forms.iter() {
         forbidden.check("a chrome form", form.as_bytes(), true);
     }
-    let top = std::fs::read_dir(&store)
+    for path in std::fs::read_dir(&store)
         .unwrap()
         .map(|entry| entry.unwrap().path())
-        .filter(|path| path.is_file());
-    let database = files_under(&store.join(vos_facility::kept::DIRECTORY));
-    for path in top.chain(database) {
+        .filter(|path| path.is_file())
+    {
         let kept = std::fs::read(&path).unwrap();
-        forbidden.check("a file of the store or its database", &kept, true);
+        forbidden.check("a file of the store", &kept, true);
     }
-}
-
-/// Every file under `directory`, its subdirectories' with them.
-fn files_under(directory: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut files = Vec::new();
-    for entry in std::fs::read_dir(directory).unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
-            files.extend(files_under(&path));
-        } else {
-            files.push(path);
-        }
+    // The facility's database, row by row: what it keeps.
+    let kept = vos_facility::kept::Kept::open(&store).unwrap();
+    for (key, value) in kept.raw(b"").unwrap() {
+        forbidden.check(
+            "a row of the facility's database",
+            &[key, value].concat(),
+            true,
+        );
     }
-    files
 }

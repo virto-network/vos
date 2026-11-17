@@ -343,7 +343,7 @@ fn the_device_sets_operations_are_signed_by_the_admin_key() {
         .unwrap()
         .replace_admin_of(&*third.hand, &offer)
         .unwrap_err();
-    assert!(own.detail.contains("Targeted"), "{own:?}");
+    assert_eq!(own.why, Why::OwnKey, "{own:?}");
     after(policy().probation_ms.max(policy().seasoning_ms));
     for phone in [&first, &second, &third] {
         phone.node.sync_personal().unwrap();
