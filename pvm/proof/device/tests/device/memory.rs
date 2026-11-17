@@ -7,7 +7,6 @@ use stwo::core::channel::MerkleChannel;
 use stwo::core::fields::m31::BaseField;
 use stwo::core::utils::{bit_reverse_index, coset_index_to_circle_domain_index};
 use stwo::core::verifier::VerificationError;
-use stwo::prover::ProvingError;
 use vos_pvm::instruction::Opcode;
 use vos_pvm_compiler::assembler::{Assembler, Reg};
 use vos_pvm_device::masked::{
@@ -21,7 +20,6 @@ use vos_pvm_proof::format::Format;
 use vos_pvm_proof::masked::MaskedDeviceTrace;
 use vos_pvm_proof::poseidon2::P2MerkleChannel;
 use vos_pvm_proof::side_note::SideNote;
-use vos_pvm_recair::ProveError;
 use vos_pvm_recair::masked::{Checks, MaskRng};
 
 use crate::support::{HEAP, RO_BASE, RO_DATA, RW_BASE, RW_DATA, io_and_halt};
@@ -169,10 +167,7 @@ fn refused_as_a_broken_constraint(
     let error = prove_device::<P2>(format, program, &mut side_note(), MaskRng::Seeded(7))
         .expect_err("the prover refuses");
     assert!(
-        matches!(
-            error,
-            ProveError::Stwo(ProvingError::ConstraintsNotSatisfied)
-        ),
+        matches!(error, vos_pvm_device::Error::Unsatisfied),
         "{error:?}"
     );
     let proof = forced(format, program, &mut side_note(), |_| {});

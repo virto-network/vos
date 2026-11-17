@@ -62,7 +62,8 @@ fn main() {
                     .iter()
                     .find(|(bound, _, _)| *bound == method)
                     .expect("the stock kernel's reference");
-                vos_pvm_device::reference_arguments(reference)
+                vos_pvm_device::ReferenceProgram(reference)
+                    .arguments()
                     .expect("the stock kernel's reference arguments")
             })
             .unwrap_or_default();

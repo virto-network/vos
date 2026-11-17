@@ -1,16 +1,17 @@
-//! A device program's prover: its install from the kernel, its runs traced
-//! and proved at its shape.
+//! A device program's prover: its program from the kernel or from a release
+//! artifact, its runs traced and proved at its shape.
 
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
-use vos_pvm_final_verifier::Error;
 use vos_pvm_proof::format::Format;
+use vos_pvm_proof::kernel::KernelTraceError;
+use vos_pvm_proof::side_note::SideNote;
 
-use super::Hasher;
-use super::verify::{Masked, Verifier, encode, masked, program_id, verify};
-use vos_pvm_recair::ProveError;
-use vos_pvm_recair::masked::{MaskRng, MaskStats, MaskedProof};
-
+use super::verify::{Masked, Verifier, encode, masked, verify};
+use super::{
+    DeviceProgramId, Error, Hasher, ReferenceArguments, ReferenceProgram, Refusal, Release,
+};
 use crate::masked::{DeviceProgram, DeviceProof, DeviceProver, device_shape};
+use crate::{MaskRng, MaskStats, MaskedProof};
 
 /// The most gas a device kernel's run is traced with, 2^18: a step a unit,
 /// a Poseidon2 call 3,000, so the most steps the device format's CPU holds,
@@ -33,61 +34,71 @@ pub struct Program {
     format: Format,
     prover: DeviceProver<Blake2sM31MerkleChannel>,
     kernel: Vec<u8>,
-    id: [u8; 32],
+    id: DeviceProgramId,
     masked: Masked,
 }
 
 impl Program {
-    /// Kernel `kernel`'s program under the device format `format`, its log
-    /// sizes the ones its run on `reference` needs (each at least its
-    /// floor), each raised by `headroom`. Refused when the kernel does not
-    /// run to its halt on `reference`, or a raised size is past
+    /// Kernel `kernel`'s program under device format `format`, as a node's
+    /// install computes it and a release build embeds it: its log sizes
+    /// those its run on what `reference` returns needs (each at least its
+    /// floor), each raised by `headroom`. Refused when this build proves no
+    /// such format, the reference does not return the arguments alone, the
+    /// kernel does not run to its halt on them, or a raised size is past
     /// `DEVICE_MAX_LOG_SIZE`.
-    pub fn install(
-        format: &Format,
+    pub fn from_kernel(
+        format: u32,
         kernel: &[u8],
-        reference: &[u8],
+        reference: ReferenceProgram<'_>,
         headroom: u8,
-    ) -> Result<Self, ProveError> {
-        let mut run = trace(kernel, reference)?;
+    ) -> Result<Self, Error> {
+        let arguments = reference.arguments()?;
+        Self::sized_for(format, kernel, ReferenceArguments(&arguments), headroom)
+    }
+
+    /// Kernel `kernel`'s program under device format `format`, its log sizes
+    /// those its run on `reference` needs, each raised by `headroom`: a
+    /// test's or a bench's, which holds the arguments without a reference
+    /// program ([`Program::from_kernel`]).
+    pub fn sized_for(
+        format: u32,
+        kernel: &[u8],
+        reference: ReferenceArguments<'_>,
+        headroom: u8,
+    ) -> Result<Self, Error> {
+        let format = crate::format(format).ok_or(Error::Format(format))?;
+        let mut run = trace(kernel, reference.0, GAS)?;
         let (active, log_sizes) = device_shape(format, kernel, &mut run)?;
         drop(run);
         let log_sizes: Vec<u32> = log_sizes
             .iter()
             .map(|size| size + u32::from(headroom))
             .collect();
-        Self::released(format, kernel, active, &log_sizes)
+        Self::at(format, kernel, active, &log_sizes)
     }
 
-    /// The program of a device kernel's release under the device format
-    /// `format`: `kernel` sized on what its reference program `reference`
-    /// returns ([`reference_arguments`]), raised by `headroom`.
-    pub fn of(
-        format: &Format,
-        kernel: &[u8],
-        reference: &[u8],
-        headroom: u8,
-    ) -> Result<Self, ProveError> {
-        Self::install(format, kernel, &reference_arguments(reference)?, headroom)
+    /// The program `release` names: its preprocessed tree committed from
+    /// the kernel at the artifact's chips and log sizes in its format, no
+    /// reference run and no transpiler. Refused when this build proves no
+    /// such format, the chips are not the kernel's code's, a size is under
+    /// its floor or past `DEVICE_MAX_LOG_SIZE`, or the program's id is not
+    /// the artifact's.
+    pub fn from_release(release: &Release) -> Result<Self, Error> {
+        let format = crate::format(release.format).ok_or(Error::Format(release.format))?;
+        let program = Self::at(format, &release.kernel, release.chips, &release.log_sizes)?;
+        if program.id.0 != release.id {
+            return Err(Error::IdMismatch);
+        }
+        Ok(program)
     }
 
-    /// The program of `kernel` under the device format `format` at the chips
-    /// `active` and the log sizes `log_sizes`, as a release embeds it: its
-    /// preprocessed tree committed from the kernel, no run of anything.
-    /// Refused when `active` is not the chips the kernel's code reaches, or
-    /// a size is under its floor or past `DEVICE_MAX_LOG_SIZE`.
-    pub fn released(
-        format: &Format,
-        kernel: &[u8],
-        active: u32,
-        log_sizes: &[u32],
-    ) -> Result<Self, ProveError> {
+    /// The program of `kernel` under `format` at the chips `active` and the
+    /// log sizes `log_sizes`.
+    fn at(format: &Format, kernel: &[u8], active: u32, log_sizes: &[u32]) -> Result<Self, Error> {
         let prover =
             DeviceProver::<Blake2sM31MerkleChannel>::install(format, kernel, active, log_sizes)?;
-        let id = program_id(format, prover.program());
-        let masked = masked(format, prover.program()).ok_or(ProveError::TraceShape(
-            "a program outside the format's shape",
-        ))?;
+        let id = DeviceProgramId::of(format, prover.program());
+        let masked = masked(format, prover.program()).ok_or(Error::Masking)?;
         Ok(Self {
             format: *format,
             prover,
@@ -99,11 +110,12 @@ impl Program {
 
     /// Whether the kernel's run on `arguments` fits the program's shape: it
     /// runs to its halt, and needs no chip past its log size. A witness
-    /// that does not fit fails to prove (`device_fits`, `light-node.md`
+    /// that does not fit fails to prove ([`Error::Fit`], `light-node.md`
     /// §4.4).
-    pub fn fits(&self, arguments: &[u8]) -> Result<(), ProveError> {
-        let mut run = trace(&self.kernel, arguments)?;
-        let (active, needed) = device_shape(&self.format, &self.kernel, &mut run)?;
+    pub fn fits(&self, arguments: &[u8]) -> Result<(), Error> {
+        let mut run = trace(&self.kernel, arguments, GAS)?;
+        let (active, needed) =
+            device_shape(&self.format, &self.kernel, &mut run).map_err(|_| Error::Fit)?;
         let program = self.program();
         if active != program.active
             || needed
@@ -111,7 +123,7 @@ impl Program {
                 .zip(&program.log_sizes)
                 .any(|(needed, size)| needed > size)
         {
-            return Err(ProveError::TraceShape("a run past the program's shape"));
+            return Err(Error::Fit);
         }
         Ok(())
     }
@@ -133,7 +145,7 @@ impl Program {
     }
 
     /// Its id, which a binding names.
-    pub fn id(&self) -> &[u8; 32] {
+    pub fn id(&self) -> &DeviceProgramId {
         &self.id
     }
 
@@ -154,22 +166,23 @@ impl Program {
     }
 
     /// The kernel's run on `arguments`, through its witness input, proved
-    /// under the program, its masks from `rng`. A run that does not halt,
-    /// or needs more rows than the program's shape, is refused.
+    /// under the program, its masks from `rng`. A run that does not halt
+    /// ([`Error::Halt`]), or needs more rows than the program's shape
+    /// ([`Error::Fit`]), is refused.
     pub fn prove(
         &self,
         arguments: &[u8],
         rng: MaskRng,
-    ) -> Result<(DeviceProof<Hasher>, MaskStats), ProveError> {
-        let mut run = trace(&self.kernel, arguments)?;
+    ) -> Result<(DeviceProof<Hasher>, MaskStats), Error> {
+        let mut run = trace(&self.kernel, arguments, GAS)?;
         let proved = self.prover.prove(&mut run, rng);
         drop(run);
         proved
     }
 
-    /// Verifies the proof in `bytes` ([`decode`](super::decode)) of this program's kernel
-    /// stating the io-hash `io`.
-    pub fn verify(&self, io: &[u8; 32], bytes: &[u8]) -> Result<(), Error> {
+    /// Verifies the proof in `bytes` ([`decode`](super::decode)) of this
+    /// program's kernel stating the io-hash `io`.
+    pub fn verify(&self, io: &[u8; 32], bytes: &[u8]) -> Result<(), Refusal> {
         verify(&self.format, self.program(), &self.masked, io, bytes)
     }
 
@@ -185,26 +198,34 @@ impl Program {
     }
 }
 
-/// The reference arguments a device kernel's reference program
-/// `reference` returns: its output, run to its halt on no input within
-/// [`REFERENCE_GAS`], stating no public arguments.
-pub fn reference_arguments(reference: &[u8]) -> Result<Vec<u8>, ProveError> {
-    let run = vos_pvm_proof::kernel::trace_kernel(reference, &[], REFERENCE_GAS)
-        .map_err(|error| ProveError::Segment(format!("the reference: {error:?}")))?;
-    match vos_pvm_precompiles::device_return_parts(&run.output) {
-        Some(([], output)) => Ok(output.to_vec()),
-        _ => Err(ProveError::Segment(
-            "the reference returns no arguments alone".into(),
-        )),
+impl ReferenceProgram<'_> {
+    /// The reference arguments it returns: its output, run to its halt on
+    /// no input within [`REFERENCE_GAS`], stating no public arguments.
+    pub fn arguments(&self) -> Result<Vec<u8>, Error> {
+        let run = trace_run(self.0, &[], REFERENCE_GAS)?;
+        match vos_pvm_precompiles::device_return_parts(&run.output) {
+            Some(([], output)) => Ok(output.to_vec()),
+            _ => Err(Error::Reference),
+        }
     }
 }
 
-/// `kernel`'s run on `arguments`, traced to its halt.
-fn trace(
-    kernel: &[u8],
+/// `kernel`'s run on `arguments`, traced to its halt within `gas`.
+fn trace(kernel: &[u8], arguments: &[u8], gas: u64) -> Result<SideNote, Error> {
+    trace_run(kernel, arguments, gas).map(|trace| trace.side_note)
+}
+
+/// [`trace`], the whole run: [`Error::Layout`] for a blob that is not a
+/// standard program, [`Error::Arguments`] for arguments the run does not
+/// read whole, [`Error::Halt`] for a run that does not halt.
+fn trace_run(
+    blob: &[u8],
     arguments: &[u8],
-) -> Result<vos_pvm_proof::side_note::SideNote, ProveError> {
-    vos_pvm_proof::kernel::trace_kernel(kernel, arguments, GAS)
-        .map(|trace| trace.side_note)
-        .map_err(|error| ProveError::Segment(format!("{error:?}")))
+    gas: u64,
+) -> Result<vos_pvm_proof::kernel::KernelTrace, Error> {
+    vos_pvm_proof::kernel::trace_kernel(blob, arguments, gas).map_err(|error| match error {
+        KernelTraceError::Program => Error::Layout,
+        KernelTraceError::Input | KernelTraceError::Unread { .. } => Error::Arguments,
+        KernelTraceError::Exit(_) | KernelTraceError::Output => Error::Halt,
+    })
 }

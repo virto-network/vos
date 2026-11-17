@@ -15,7 +15,6 @@ use stwo::core::fields::qm31::SecureField;
 use stwo::core::utils::{bit_reverse_index, coset_index_to_circle_domain_index};
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 use stwo::core::verifier::VerificationError;
-use stwo::prover::ProvingError;
 use stwo::prover::backend::BackendForChannel;
 use stwo::prover::backend::simd::SimdBackend;
 use vos_pvm_compiler::assembler::{Assembler, Reg};
@@ -36,7 +35,6 @@ use vos_pvm_proof::masked::{DeviceComponents, device_bound_sums, device_public_v
 use vos_pvm_proof::poseidon2::P2MerkleChannel;
 use vos_pvm_proof::segment::SegmentCursor;
 use vos_pvm_proof::side_note::SideNote;
-use vos_pvm_recair::ProveError;
 use vos_pvm_recair::masked::{Checks, MaskRng};
 use vos_pvm_recair_air::masking::MaskedComponents;
 
@@ -83,10 +81,7 @@ fn refused_as_a_broken_constraint(
     let error = prove_device::<P2>(&format(), program, &mut side_note(), MaskRng::Seeded(7))
         .expect_err("the prover refuses");
     assert!(
-        matches!(
-            error,
-            ProveError::Stwo(ProvingError::ConstraintsNotSatisfied)
-        ),
+        matches!(error, vos_pvm_device::Error::Unsatisfied),
         "{error:?}"
     );
     let proof = forced(program, &mut side_note(), |_, _| {}, UNCHECKED);
@@ -220,7 +215,17 @@ fn a_program_outside_the_formats_count_is_refused() {
     let mut short = honest.clone();
     short.log_sizes[0] =
         vos_pvm_device::masked::device_floors(&format, honest.shape()).expect("floors")[0] - 1;
-    assert!(install::<P2>(&format, &blob(), tall.active, &tall.log_sizes).is_err());
+    assert_eq!(
+        install::<P2>(&format, &blob(), tall.active, &tall.log_sizes).map(|_| ()),
+        Err(vos_pvm_device::Error::Ceiling {
+            chip: 0,
+            needs: DEVICE_MAX_LOG_SIZE + 1
+        })
+    );
+    assert_eq!(
+        install::<P2>(&format, &blob(), short.active, &short.log_sizes).map(|_| ()),
+        Err(vos_pvm_device::Error::Floor { chip: 0 })
+    );
     for program in [&tall, &short] {
         assert!(matches!(
             verify::<P2>(&format, program, &proof),
@@ -228,7 +233,7 @@ fn a_program_outside_the_formats_count_is_refused() {
         ));
         assert!(matches!(
             prove::<P2>(&format, program, &blob(), &witness(1), MaskRng::Seeded(5)),
-            Err(ProveError::TraceShape(_))
+            Err(vos_pvm_device::Error::Sizes)
         ));
     }
 }
@@ -285,10 +290,7 @@ fn a_run_past_the_programs_shape_is_refused() {
     verify_device::<P2>(&format, &program, &proof).expect("verifies");
     let error = prove_device::<P2>(&format, &program, &mut short(1000), MaskRng::Seeded(3))
         .expect_err("past the shape");
-    assert!(
-        matches!(&error, ProveError::Segment(message) if message.contains("its shape")),
-        "{error:?}"
-    );
+    assert!(matches!(&error, vos_pvm_device::Error::Fit), "{error:?}");
 }
 
 /// A first touch of a data byte other than the data table's is refused: the

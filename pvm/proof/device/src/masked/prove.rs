@@ -14,7 +14,6 @@ use vos_pvm_proof::masked::{
     DeviceComponents, DeviceSizes, MaskedDeviceTrace, device_preprocessed, masked_device_trace,
 };
 use vos_pvm_proof::side_note::SideNote;
-
 use vos_pvm_recair::ProveError;
 use vos_pvm_recair::masked::{Checks, Committed, MaskRng, MaskStats, MaskedTrace};
 use vos_pvm_recair::trace::FirstRowFraction;
@@ -22,6 +21,7 @@ use vos_pvm_recair_air::masking::MaskedComponents;
 
 use super::verify::{device_floors, device_format};
 use super::{DeviceProgram, DeviceProof};
+use crate::Error;
 
 /// The device shape of kernel `blob` under `format`: the chips its code can
 /// reach, and a log size each at least `reference`'s run needs and at least
@@ -32,19 +32,16 @@ pub fn device_shape(
     format: &Format,
     blob: &[u8],
     reference: &mut SideNote,
-) -> Result<(u32, Vec<u32>), ProveError> {
-    let layout =
-        DeviceLayout::of_program(blob).ok_or(ProveError::TraceShape("not a standard program"))?;
+) -> Result<(u32, Vec<u32>), Error> {
+    let layout = DeviceLayout::of_program(blob).ok_or(Error::Layout)?;
     let active = device_chips_of_code(&reference.code, &reference.bitmask);
     let shape = DeviceShape {
         chips: active,
         cpu: CpuColumns::of_code(&reference.code, &reference.bitmask),
     };
-    let floors = device_floors(format, shape).ok_or(ProveError::TraceShape(
-        "the format's masking does not fit the chips, or an h under the rows a chip reveals",
-    ))?;
+    let floors = device_floors(format, shape).ok_or(Error::Masking)?;
     let trace = masked_device_trace(reference, &layout, shape, DeviceSizes::AtLeast(&floors))
-        .map_err(|error| ProveError::Segment(error.to_string()))?;
+        .map_err(|_| Error::Trace)?;
     Ok((active, trace.log_sizes.clone()))
 }
 
@@ -58,7 +55,7 @@ pub fn install<MC: MerkleChannel>(
     blob: &[u8],
     active: u32,
     log_sizes: &[u32],
-) -> Result<DeviceProgram<MC::H>, ProveError>
+) -> Result<DeviceProgram<MC::H>, Error>
 where
     SimdBackend: BackendForChannel<MC>,
 {
@@ -88,36 +85,41 @@ where
         blob: &[u8],
         active: u32,
         log_sizes: &[u32],
-    ) -> Result<Self, ProveError> {
-        let layout = DeviceLayout::of_program(blob)
-            .ok_or(ProveError::TraceShape("not a standard program"))?;
+    ) -> Result<Self, Error> {
+        let layout = DeviceLayout::of_program(blob).ok_or(Error::Layout)?;
         if !layout.is_disjoint() {
-            return Err(ProveError::TraceShape("the layout's regions overlap"));
+            return Err(Error::Layout);
         }
-        let code = vos_pvm_proof::kernel::kernel_side_note(blob)
-            .map_err(|error| ProveError::Segment(format!("{error:?}")))?;
+        let code = vos_pvm_proof::kernel::kernel_side_note(blob).map_err(|_| Error::Layout)?;
         if active != device_chips_of_code(&code.code, &code.bitmask) {
-            return Err(ProveError::TraceShape("the chips are not the code's"));
+            return Err(Error::Chips);
         }
         let shape = DeviceShape {
             chips: active,
             cpu: CpuColumns::of_code(&code.code, &code.bitmask),
         };
-        let floors = device_floors(format, shape).ok_or(ProveError::TraceShape(
-            "the format's masking does not fit the chips, or an h under the rows a chip reveals",
-        ))?;
-        if floors.len() != log_sizes.len() || log_sizes.iter().zip(&floors).any(|(s, f)| s < f) {
-            return Err(ProveError::TraceShape("a log size under its floor"));
+        let floors = device_floors(format, shape).ok_or(Error::Masking)?;
+        if floors.len() != log_sizes.len() {
+            return Err(Error::Sizes);
         }
-        if log_sizes.iter().any(|&size| size > DEVICE_MAX_LOG_SIZE) {
-            return Err(ProveError::TraceShape(
-                "a log size above the device format's reference",
-            ));
+        if let Some(chip) = log_sizes
+            .iter()
+            .zip(&floors)
+            .position(|(size, floor)| size < floor)
+        {
+            return Err(Error::Floor { chip });
         }
-        let preprocessed = device_preprocessed(&code, &layout, shape, log_sizes)
-            .map_err(|error| ProveError::Segment(error.to_string()))?;
-        let committed = Committed::<MC>::new(format, log_sizes, preprocessed)
-            .ok_or(ProveError::TraceShape("a component's log size overflows"))?;
+        if let Some((chip, &needs)) = log_sizes
+            .iter()
+            .enumerate()
+            .find(|(_, size)| **size > DEVICE_MAX_LOG_SIZE)
+        {
+            return Err(Error::Ceiling { chip, needs });
+        }
+        let preprocessed =
+            device_preprocessed(&code, &layout, shape, log_sizes).map_err(|_| Error::Trace)?;
+        let committed =
+            Committed::<MC>::new(format, log_sizes, preprocessed).ok_or(Error::Sizes)?;
         Ok(Self {
             format: *format,
             program: DeviceProgram {
@@ -147,7 +149,7 @@ where
         &self,
         side_note: &mut SideNote,
         rng: MaskRng,
-    ) -> Result<(DeviceProof<MC::H>, MaskStats), ProveError> {
+    ) -> Result<(DeviceProof<MC::H>, MaskStats), Error> {
         prove_device_with::<MC>(
             &self.format,
             &self.program,
@@ -170,7 +172,7 @@ pub fn prove_device<MC: MerkleChannel>(
     program: &DeviceProgram<MC::H>,
     side_note: &mut SideNote,
     rng: MaskRng,
-) -> Result<(DeviceProof<MC::H>, MaskStats), ProveError>
+) -> Result<(DeviceProof<MC::H>, MaskStats), Error>
 where
     SimdBackend: BackendForChannel<MC>,
 {
@@ -199,7 +201,7 @@ pub fn prove_device_forced<MC: MerkleChannel>(
     tamper: impl FnOnce(&mut MaskedDeviceTrace),
     blind: impl Fn(&AllLookupElements, &mut [FirstRowFraction]),
     checks: Checks,
-) -> Result<(DeviceProof<MC::H>, MaskStats), ProveError>
+) -> Result<(DeviceProof<MC::H>, MaskStats), Error>
 where
     SimdBackend: BackendForChannel<MC>,
 {
@@ -211,14 +213,14 @@ where
 pub fn device_trace<H: MerkleHasherLifted>(
     program: &DeviceProgram<H>,
     side_note: &mut SideNote,
-) -> Result<MaskedDeviceTrace, ProveError> {
+) -> Result<MaskedDeviceTrace, Error> {
     masked_device_trace(
         side_note,
         &program.layout,
         program.shape(),
         DeviceSizes::Pinned(&program.log_sizes),
     )
-    .map_err(|error| ProveError::Segment(error.to_string()))
+    .map_err(|_| Error::Fit)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -231,13 +233,11 @@ fn prove_device_with<MC: MerkleChannel>(
     tamper: impl FnOnce(&mut MaskedDeviceTrace),
     blind: impl Fn(&AllLookupElements, &mut [FirstRowFraction]),
     checks: Checks,
-) -> Result<(DeviceProof<MC::H>, MaskStats), ProveError>
+) -> Result<(DeviceProof<MC::H>, MaskStats), Error>
 where
     SimdBackend: BackendForChannel<MC>,
 {
-    device_format(format, program, &program.header()).ok_or(ProveError::TraceShape(
-        "a log size under its floor or above the device format's reference",
-    ))?;
+    device_format(format, program, &program.header()).ok_or(Error::Sizes)?;
     let mut trace = device_trace(program, side_note)?;
     let side_note: &SideNote = side_note;
     tamper(&mut trace);
@@ -287,19 +287,26 @@ fn prove_masked<MC: MerkleChannel>(
     committed: Option<&Committed<MC>>,
     rng: MaskRng,
     checks: Checks,
-) -> Result<(vos_pvm_recair::masked::MaskedProof<MC::H>, MaskStats), ProveError>
+) -> Result<(vos_pvm_recair::masked::MaskedProof<MC::H>, MaskStats), Error>
 where
     SimdBackend: BackendForChannel<MC>,
 {
     #[cfg(feature = "seeded-masks")]
-    return vos_pvm_recair::masked::prove_masked_program_forced::<MC, DeviceComponents>(
+    let proved = vos_pvm_recair::masked::prove_masked_program_forced::<MC, DeviceComponents>(
         format, program, trace, committed, rng, checks,
     );
     #[cfg(not(feature = "seeded-masks"))]
-    {
-        let _ = checks;
+    let proved = {
+        let Checks { .. } = checks;
         vos_pvm_recair::masked::prove_masked_program::<MC, DeviceComponents>(
             format, program, trace, committed, rng,
         )
-    }
+    };
+    // The masked prover's other refusals (R1's, the randomness', its own
+    // checks of the trace's shape) are the prover's: their reasons name a
+    // run's rows, and are not passed on.
+    proved.map_err(|error| match error {
+        ProveError::Stwo(stwo::prover::ProvingError::ConstraintsNotSatisfied) => Error::Unsatisfied,
+        _ => Error::Prove,
+    })
 }

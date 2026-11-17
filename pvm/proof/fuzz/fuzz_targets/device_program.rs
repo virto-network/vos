@@ -4,8 +4,8 @@
 //! reference of 16 bytes.
 
 use vos_pvm_compiler::assembler::{Assembler, Reg};
-use vos_pvm_proof::core::ecall::ECALL_WITNESS_INPUT;
 use vos_pvm_device::{Program, FORMAT};
+use vos_pvm_proof::core::ecall::ECALL_WITNESS_INPUT;
 
 /// The words the kernel leaves in φ9..12, its io-hash.
 const IO: [u32; 4] = [0x4433_2211, 0x0807_0605, 0x7f00_00ff, 0x1abc_def0];
@@ -33,5 +33,11 @@ fn kernel() -> Vec<u8> {
 
 /// The program under the device format.
 pub fn program() -> Program {
-    Program::install(&FORMAT, &kernel(), &WITNESS, 0).expect("the kernel installs")
+    Program::sized_for(
+        FORMAT.number,
+        &kernel(),
+        vos_pvm_device::ReferenceArguments(&WITNESS),
+        0,
+    )
+    .expect("the kernel installs")
 }

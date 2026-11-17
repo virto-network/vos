@@ -4,10 +4,8 @@
 //! device format itself.
 
 use vos_pvm_compiler::assembler::{Assembler, Reg};
-use vos_pvm_device::{FORMAT, MAX_PROOF_BYTES, Program, decode, encode, program_id};
-use vos_pvm_final_verifier::Error;
+use vos_pvm_device::{DeviceProgramId, FORMAT, MAX_PROOF_BYTES, Program, Refusal, decode, encode};
 use vos_pvm_proof::core::ecall::ECALL_WITNESS_INPUT;
-use vos_pvm_recair::ProveError;
 use vos_pvm_recair::masked::MaskRng;
 
 use crate::support::{blob, io_and_halt, io_bytes, witness};
@@ -32,18 +30,27 @@ fn reader() -> Vec<u8> {
 #[test]
 fn a_run_past_the_programs_log_sizes_is_refused_by_the_prover() {
     let kernel = reader();
-    let program = Program::install(&FORMAT, &kernel, &[7; 16], 0).expect("installs");
+    let program = Program::sized_for(
+        FORMAT.number,
+        &kernel,
+        vos_pvm_device::ReferenceArguments(&[7; 16]),
+        0,
+    )
+    .expect("installs");
     let (proof, _) = program.prove(&[9; 16], MaskRng::default()).expect("proves");
     let bytes = encode(&FORMAT, &proof.proof).expect("encodes");
     program.verify(&proof.io, &bytes).expect("verifies");
     let error = program
         .prove(&[9; 4000], MaskRng::default())
         .expect_err("past the shape");
-    assert!(
-        matches!(&error, ProveError::Segment(message) if message.contains("its shape")),
-        "{error:?}"
-    );
-    let larger = Program::install(&FORMAT, &kernel, &[7; 4000], 0).expect("installs");
+    assert!(matches!(&error, vos_pvm_device::Error::Fit), "{error:?}");
+    let larger = Program::sized_for(
+        FORMAT.number,
+        &kernel,
+        vos_pvm_device::ReferenceArguments(&[7; 4000]),
+        0,
+    )
+    .expect("installs");
     assert_ne!(larger.log_sizes(), program.log_sizes());
     assert_ne!(larger.id(), program.id());
 }
@@ -53,19 +60,43 @@ fn a_run_past_the_programs_log_sizes_is_refused_by_the_prover() {
 /// sizes or another format another id.
 #[test]
 fn a_programs_id_names_its_kernel_its_shape_and_its_format() {
-    let program = Program::install(&FORMAT, &blob(), &witness(1), 0).expect("installs");
-    let again = Program::install(&FORMAT, &blob(), &witness(2), 0).expect("installs");
+    let program = Program::sized_for(
+        FORMAT.number,
+        &blob(),
+        vos_pvm_device::ReferenceArguments(&witness(1)),
+        0,
+    )
+    .expect("installs");
+    let again = Program::sized_for(
+        FORMAT.number,
+        &blob(),
+        vos_pvm_device::ReferenceArguments(&witness(2)),
+        0,
+    )
+    .expect("installs");
     assert_eq!(program.id(), again.id());
-    assert_eq!(*program.id(), program_id(&FORMAT, program.program()));
+    assert_eq!(
+        *program.id(),
+        DeviceProgramId::of(&FORMAT, program.program())
+    );
     let mut taller = program.program().clone();
     taller.log_sizes[0] += 1;
-    assert_ne!(program_id(&FORMAT, &taller), *program.id());
+    assert_ne!(DeviceProgramId::of(&FORMAT, &taller), *program.id());
     let other = vos_pvm_proof::format::Format {
         number: 99,
         ..FORMAT
     };
-    assert_ne!(program_id(&other, program.program()), *program.id());
-    let reader = Program::install(&FORMAT, &reader(), &[7; 64], 0).expect("installs");
+    assert_ne!(
+        DeviceProgramId::of(&other, program.program()),
+        *program.id()
+    );
+    let reader = Program::sized_for(
+        FORMAT.number,
+        &reader(),
+        vos_pvm_device::ReferenceArguments(&[7; 64]),
+        0,
+    )
+    .expect("installs");
     assert_ne!(reader.id(), program.id());
 }
 
@@ -74,7 +105,13 @@ fn a_programs_id_names_its_kernel_its_shape_and_its_format() {
 /// and they hold no io-hash, which the verifier takes from its caller.
 #[test]
 fn a_device_proofs_bytes_are_canonical() {
-    let program = Program::install(&FORMAT, &blob(), &witness(1), 0).expect("installs");
+    let program = Program::sized_for(
+        FORMAT.number,
+        &blob(),
+        vos_pvm_device::ReferenceArguments(&witness(1)),
+        0,
+    )
+    .expect("installs");
     let (proof, _) = program
         .prove(&witness(3), MaskRng::default())
         .expect("proves");
@@ -86,14 +123,14 @@ fn a_device_proofs_bytes_are_canonical() {
     );
     let mut longer = bytes.clone();
     longer.push(0);
-    assert!(matches!(decode(&FORMAT, &longer), Err(Error::Decode)));
+    assert!(matches!(decode(&FORMAT, &longer), Err(Refusal::Decode)));
     assert!(decode(&FORMAT, &bytes[..bytes.len() - 1]).is_err());
     let mut other = bytes.clone();
     other[0] = 44;
-    assert!(matches!(decode(&FORMAT, &other), Err(Error::Format)));
+    assert!(matches!(decode(&FORMAT, &other), Err(Refusal::Format)));
     assert!(matches!(
         decode(&FORMAT, &vec![0; MAX_PROOF_BYTES + 1]),
-        Err(Error::Length)
+        Err(Refusal::Length)
     ));
     let mut io = proof.io;
     io[0] ^= 1;
@@ -107,7 +144,13 @@ fn a_device_proofs_bytes_are_canonical() {
 #[test]
 fn a_queried_value_plus_p_is_refused() {
     use stwo::core::fields::m31::{BaseField, P};
-    let program = Program::install(&FORMAT, &blob(), &witness(1), 0).expect("installs");
+    let program = Program::sized_for(
+        FORMAT.number,
+        &blob(),
+        vos_pvm_device::ReferenceArguments(&witness(1)),
+        0,
+    )
+    .expect("installs");
     let (proof, _) = program
         .prove(&witness(3), MaskRng::default())
         .expect("proves");
@@ -121,7 +164,7 @@ fn a_queried_value_plus_p_is_refused() {
     );
     assert!(matches!(
         program.verify(&proof.io, &bytes),
-        Err(Error::Noncanonical)
+        Err(Refusal::Noncanonical)
     ));
 }
 
@@ -132,7 +175,13 @@ fn a_queried_value_plus_p_is_refused() {
 /// by the checks after it.
 #[test]
 fn a_proof_whose_interaction_pow_fails_is_refused_before_its_decode() {
-    let program = Program::install(&FORMAT, &blob(), &witness(1), 0).expect("installs");
+    let program = Program::sized_for(
+        FORMAT.number,
+        &blob(),
+        vos_pvm_device::ReferenceArguments(&witness(1)),
+        0,
+    )
+    .expect("installs");
     let (proof, _) = program
         .prove(&witness(3), MaskRng::default())
         .expect("proves");
@@ -147,14 +196,14 @@ fn a_proof_whose_interaction_pow_fails_is_refused_before_its_decode() {
             let bytes = encode(&FORMAT, &other).expect("encodes");
             matches!(
                 program.verify(&proof.io, &bytes),
-                Err(Error::InteractionPow)
+                Err(Refusal::InteractionPow)
             )
         })
         .count();
     assert!(refused >= 12, "{refused} of 16 refused at the pre-check");
     assert!(matches!(
         program.verify(&proof.io, &bytes[..9]),
-        Err(Error::Decode)
+        Err(Refusal::Decode)
     ));
     let mut root = proof.proof.clone();
     root.stark_proof.0.commitments[1].0[0] ^= 1;
@@ -197,8 +246,20 @@ fn a_proof_whose_interaction_pow_fails_is_refused_before_its_decode() {
 fn a_proof_of_one_device_format_is_refused_under_the_other() {
     let previous = vos_pvm_device::format(48).expect("48 is proved");
     assert_eq!(vos_pvm_device::FORMATS[0], FORMAT);
-    let current = Program::install(&FORMAT, &blob(), &witness(1), 0).expect("installs");
-    let other_format = Program::install(previous, &blob(), &witness(1), 0).expect("installs");
+    let current = Program::sized_for(
+        FORMAT.number,
+        &blob(),
+        vos_pvm_device::ReferenceArguments(&witness(1)),
+        0,
+    )
+    .expect("installs");
+    let other_format = Program::sized_for(
+        previous.number,
+        &blob(),
+        vos_pvm_device::ReferenceArguments(&witness(1)),
+        0,
+    )
+    .expect("installs");
     assert_eq!(
         (current.format().number, other_format.format().number),
         (47, 48)
@@ -212,7 +273,7 @@ fn a_proof_of_one_device_format_is_refused_under_the_other() {
         program.verify(&proof.io, &bytes).expect("verifies");
         assert!(matches!(
             other.verify(&proof.io, &bytes),
-            Err(Error::Format)
+            Err(Refusal::Format)
         ));
     }
 }
@@ -238,14 +299,20 @@ fn the_device_programs_id_is_pinned() {
         65, 178, 245, 91, 215, 220, 180, 111, 175, 221, 41, 102, 30, 132, 209, 241, 155, 149, 147,
         234, 200, 68, 72, 136, 17, 31, 215, 145, 87, 138, 187, 240,
     ];
-    let program = Program::install(&FORMAT, &blob(), &witness(1), 0).expect("installs");
+    let program = Program::sized_for(
+        FORMAT.number,
+        &blob(),
+        vos_pvm_device::ReferenceArguments(&witness(1)),
+        0,
+    )
+    .expect("installs");
     assert_eq!(FORMAT.number, 47);
     assert_eq!(
         (
             program.chips(),
             program.log_sizes(),
             &program.program().cpu.words()[..],
-            *program.id()
+            program.id().0
         ),
         (CHIPS, &LOG_SIZES[..], &CPU[..], ID)
     );

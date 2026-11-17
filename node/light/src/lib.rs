@@ -65,7 +65,7 @@
 //! - **Proven calls** ([`Prover`]): a device kernel's run proved under the
 //!   program's device format (47, the device format), against the program ingress computes from the same
 //!   kernel, which the app embeds as a release artifact
-//!   ([`release::Device`], [`DeviceProgram`]). The stock kernels of the
+//!   ([`release::Release`], [`DeviceProgram`]). The stock kernels of the
 //!   credential actor take the secret: auth, a member's leaf under the
 //!   actor's root with its nullifier in a scope ([`Prover::prove_auth`]);
 //!   owner, the secret behind a row's owner digest
@@ -197,6 +197,10 @@ pub enum DeviceError {
     Witness,
     /// The prover failed, or the operating system's randomness did.
     Prove,
+    /// The device program could not be made, or a run of it not proved:
+    /// why, as the device profile says (`vos_pvm_device::Error`, which
+    /// holds no value of a run). Shown as [`DeviceError::Prove`] is.
+    Program(vos_pvm_device::Error),
     /// An answer that does not decode, or is not the request's outcome.
     Decode,
     /// A proof that does not verify against its call.
@@ -223,7 +227,7 @@ impl core::fmt::Display for DeviceError {
             DeviceError::Config => "the configuration or the call is out of bounds",
             DeviceError::Memory => "the memory allowed is below a proof's",
             DeviceError::Witness => "the witness does not satisfy the statement",
-            DeviceError::Prove => "the prover failed",
+            DeviceError::Prove | DeviceError::Program(_) => "the prover failed",
             DeviceError::Decode => "the answer does not decode",
             DeviceError::Verify => "the proof does not verify",
             DeviceError::Unavailable => "the node holds the space's programs not yet: ask again",

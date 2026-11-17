@@ -153,7 +153,7 @@ impl Prover {
             map_root: witness.root.to_bytes(),
             scope: scope.to_bytes(),
             nullifier: secret::nullifier(secret, &scope).to_bytes(),
-            binding: call.binding(program.id()).to_bytes(),
+            binding: call.binding(&program.id().0).to_bytes(),
         }
         .encode();
         // The arguments as the kernel reads them in place: the path's 32
@@ -177,7 +177,7 @@ impl Prover {
         call.check()?;
         let claim = OwnerClaim {
             owner: secret::owner(secret).to_bytes(),
-            binding: call.binding(program.id()).to_bytes(),
+            binding: call.binding(&program.id().0).to_bytes(),
         }
         .encode();
         self.prove_stock(program, secret, claim, Vec::new())
@@ -204,7 +204,7 @@ impl Prover {
             return Err(DeviceError::Prove);
         }
         Ok(Proven {
-            format: program.format(),
+            format: program.format().number,
             claim,
             proof: proof.proof,
         })
@@ -223,11 +223,14 @@ pub fn verify(
     program: &DeviceProgram,
     name: Option<&[u8]>,
 ) -> Result<(), DeviceError> {
-    if proof.format != program.format() || proof.claim.len() > cap::CLAIM || call.check().is_err() {
+    if proof.format != program.format().number
+        || proof.claim.len() > cap::CLAIM
+        || call.check().is_err()
+    {
         return Err(DeviceError::Verify);
     }
     let binding = claim_binding(&proof.claim).ok_or(DeviceError::Verify)?;
-    if *binding != call.binding(program.id()).to_bytes() {
+    if *binding != call.binding(&program.id().0).to_bytes() {
         return Err(DeviceError::Verify);
     }
     if let Some(name) = name {
@@ -240,5 +243,7 @@ pub fn verify(
         }
     }
     let io = claim_io(&proof.claim).ok_or(DeviceError::Verify)?;
-    program.verify_io(&io, &proof.proof)
+    program
+        .verify(&io, &proof.proof)
+        .map_err(|_| DeviceError::Verify)
 }

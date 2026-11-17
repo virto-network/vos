@@ -53,8 +53,13 @@ fn every_path_shape_proves_under_one_device_program() {
     use vos_pvm_device::{FORMAT, MAX_PROOF_BYTES, Program, auth_reference, claim_io, encode};
     use vos_pvm_recair::masked::MaskRng;
     let blob = kernel("device", "auth");
-    let program =
-        Program::install(&FORMAT, &blob, &auth_reference(), 0).expect("the kernel's program");
+    let program = Program::sized_for(
+        FORMAT.number,
+        &blob,
+        vos_pvm_device::ReferenceArguments(&auth_reference()),
+        0,
+    )
+    .expect("the kernel's program");
     let full: Vec<usize> = (0..32).collect();
     let shapes = [
         vos_testkit::model::device_auth_arguments(0x0101_0101, 0, &[]),
@@ -62,7 +67,13 @@ fn every_path_shape_proves_under_one_device_program() {
     ];
     let mut proofs = Vec::new();
     for (input, public) in &shapes {
-        let own = Program::install(&FORMAT, &blob, input, 0).expect("its own run's program");
+        let own = Program::sized_for(
+            FORMAT.number,
+            &blob,
+            vos_pvm_device::ReferenceArguments(input),
+            0,
+        )
+        .expect("its own run's program");
         assert_eq!(own.id(), program.id());
         assert_eq!(own.log_sizes(), program.log_sizes());
         let (proof, stats) = program
@@ -176,8 +187,13 @@ fn sdk_form_kernels_prove_under_their_programs() {
     ];
     for (method, (reference, _), (input, public)) in cases {
         let blob = kernel("sdk-device", method);
-        let program =
-            Program::install(&FORMAT, &blob, &reference, 0).expect("the kernel's program");
+        let program = Program::sized_for(
+            FORMAT.number,
+            &blob,
+            vos_pvm_device::ReferenceArguments(&reference),
+            0,
+        )
+        .expect("the kernel's program");
         let (proof, _) = program
             .prove(&input, MaskRng::default())
             .expect("proves under the kernel's program");
@@ -227,13 +243,27 @@ fn credentials() -> Vec<u8> {
 /// program their own arguments prove under.
 #[test]
 fn a_reference_program_returns_its_kernels_reference_arguments() {
-    use vos_pvm_device::{FORMAT, Program, auth_reference, reference_arguments};
+    use vos_pvm_device::{FORMAT, Program, ReferenceProgram, auth_reference};
     let (kernel, reference, headroom) = release(&vos_testkit::programs::package("device"), "auth");
     assert_eq!(headroom, 0);
-    let arguments = reference_arguments(&reference).expect("the reference runs");
+    let arguments = ReferenceProgram(&reference)
+        .arguments()
+        .expect("the reference runs");
     assert_eq!(arguments, auth_reference());
-    let program = Program::of(&FORMAT, &kernel, &reference, headroom).expect("its program");
-    let sized = Program::install(&FORMAT, &kernel, &auth_reference(), 0).expect("its program");
+    let program = Program::from_kernel(
+        FORMAT.number,
+        &kernel,
+        vos_pvm_device::ReferenceProgram(&reference),
+        headroom,
+    )
+    .expect("its program");
+    let sized = Program::sized_for(
+        FORMAT.number,
+        &kernel,
+        vos_pvm_device::ReferenceArguments(&auth_reference()),
+        0,
+    )
+    .expect("its program");
     assert_eq!(program.id(), sized.id());
     let credentials = credentials();
     let sdk_device = vos_testkit::programs::package("sdk-device");
@@ -245,8 +275,16 @@ fn a_reference_program_returns_its_kernels_reference_arguments() {
         (&sdk_device, "owner_lean"),
     ] {
         let (kernel, reference, headroom) = release(elf, method);
-        let arguments = reference_arguments(&reference).expect("the reference runs");
-        let program = Program::of(&FORMAT, &kernel, &reference, headroom).expect("its program");
+        let arguments = ReferenceProgram(&reference)
+            .arguments()
+            .expect("the reference runs");
+        let program = Program::from_kernel(
+            FORMAT.number,
+            &kernel,
+            vos_pvm_device::ReferenceProgram(&reference),
+            headroom,
+        )
+        .expect("its program");
         program.fits(&arguments).expect("its reference fits");
         println!("{method}: log sizes {:?}", program.log_sizes());
     }
@@ -255,12 +293,24 @@ fn a_reference_program_returns_its_kernels_reference_arguments() {
         let (stock, stock_reference, _) = release(&credentials, method);
         let (test, test_reference, _) = release(&sdk_device, method);
         assert_eq!(
-            reference_arguments(&stock_reference).unwrap(),
-            reference_arguments(&test_reference).unwrap(),
+            ReferenceProgram(&stock_reference).arguments().unwrap(),
+            ReferenceProgram(&test_reference).arguments().unwrap(),
             "{method}'s reference arguments"
         );
-        let stock = Program::of(&FORMAT, &stock, &stock_reference, 0).unwrap();
-        let test = Program::of(&FORMAT, &test, &test_reference, 0).unwrap();
+        let stock = Program::from_kernel(
+            FORMAT.number,
+            &stock,
+            vos_pvm_device::ReferenceProgram(&stock_reference),
+            0,
+        )
+        .unwrap();
+        let test = Program::from_kernel(
+            FORMAT.number,
+            &test,
+            vos_pvm_device::ReferenceProgram(&test_reference),
+            0,
+        )
+        .unwrap();
         assert_eq!(stock.log_sizes(), test.log_sizes(), "{method}");
     }
 }
@@ -272,8 +322,20 @@ fn a_headroom_raises_every_log_size() {
     use vos_pvm_device::{FORMAT, Program, encode};
     use vos_pvm_recair::masked::MaskRng;
     let (kernel, reference, _) = release(&credentials(), "owner");
-    let program = Program::of(&FORMAT, &kernel, &reference, 0).unwrap();
-    let raised = Program::of(&FORMAT, &kernel, &reference, 1).unwrap();
+    let program = Program::from_kernel(
+        FORMAT.number,
+        &kernel,
+        vos_pvm_device::ReferenceProgram(&reference),
+        0,
+    )
+    .unwrap();
+    let raised = Program::from_kernel(
+        FORMAT.number,
+        &kernel,
+        vos_pvm_device::ReferenceProgram(&reference),
+        1,
+    )
+    .unwrap();
     assert_ne!(program.id(), raised.id());
     let expected: Vec<u32> = program.log_sizes().iter().map(|size| size + 1).collect();
     assert_eq!(raised.log_sizes(), &expected[..]);
@@ -314,7 +376,13 @@ fn random_witnesses_fit_the_reference_programs() {
     .map(|(name, (kernel, reference, headroom))| {
         (
             name,
-            Program::of(&FORMAT, &kernel, &reference, headroom).expect("its program"),
+            Program::from_kernel(
+                FORMAT.number,
+                &kernel,
+                vos_pvm_device::ReferenceProgram(&reference),
+                headroom,
+            )
+            .expect("its program"),
         )
     });
     for _ in 0..12 {
@@ -357,7 +425,19 @@ fn two_releases_compute_one_claim() {
             Some((&public[..], &[][..]))
         );
     }
-    let lean = Program::of(&FORMAT, &lean, &lean_reference, 0).unwrap();
-    let next = Program::of(&FORMAT, &next, &next_reference, 0).unwrap();
+    let lean = Program::from_kernel(
+        FORMAT.number,
+        &lean,
+        vos_pvm_device::ReferenceProgram(&lean_reference),
+        0,
+    )
+    .unwrap();
+    let next = Program::from_kernel(
+        FORMAT.number,
+        &next,
+        vos_pvm_device::ReferenceProgram(&next_reference),
+        0,
+    )
+    .unwrap();
     assert_ne!(lean.id(), next.id());
 }

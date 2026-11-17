@@ -108,7 +108,7 @@ fn programs() -> &'static (DeviceProgram, DeviceProgram) {
     PROGRAMS.get_or_init(|| {
         let elf = std::fs::read(vos_testkit::programs::program_elf("vos-credentials")).unwrap();
         let program = |kernel| {
-            DeviceProgram::released(&vos_light::release::device(&elf, kernel).unwrap()).unwrap()
+            DeviceProgram::from_release(&vos_light::release::device(&elf, kernel).unwrap()).unwrap()
         };
         (program("auth"), program("owner"))
     })
@@ -313,7 +313,7 @@ fn each_proof_verifies_against_its_call_alone() {
         Some(claim.scope),
         scope(&call.space, call.agent, call.instance, NAME).map(|scope| scope.to_bytes())
     );
-    assert_eq!(claim.binding, call.binding(auth_program.id()).to_bytes());
+    assert_eq!(claim.binding, call.binding(&auth_program.id().0).to_bytes());
     assert_eq!(
         verify(&auth, &self::call(b"no"), auth_program, Some(NAME)),
         Err(DeviceError::Verify)
@@ -565,7 +565,7 @@ fn the_wire_requests_and_answers() {
             format: DEVICE_FORMAT,
             claim: OwnerClaim {
                 owner: owner(&secret).to_bytes(),
-                binding: call.binding(owner_program().id()).to_bytes(),
+                binding: call.binding(&owner_program().id().0).to_bytes(),
             }
             .encode(),
             proof: proof.proof.clone(),
@@ -690,15 +690,18 @@ fn the_stock_kernels_programs_come_from_their_release_artifacts() {
     assert_eq!(methods, expected);
     for device in &devices {
         assert_eq!(device.elf, vos_pvm_compiler::derive(&elf).unwrap().elf);
-        let program = DeviceProgram::released(device).unwrap();
-        assert_eq!(program.id(), &device.id);
+        let program = DeviceProgram::from_release(device).unwrap();
+        assert_eq!(program.id().0, device.id);
         assert_eq!(program.log_sizes(), &device.log_sizes[..]);
         let mut raised = device.clone();
         raised.log_sizes[0] += 1;
-        assert!(DeviceProgram::released(&raised).is_err(), "another shape");
+        assert!(
+            DeviceProgram::from_release(&raised).is_err(),
+            "another shape"
+        );
         let mut renamed = device.clone();
         renamed.id[0] ^= 1;
-        assert!(DeviceProgram::released(&renamed).is_err(), "another id");
+        assert!(DeviceProgram::from_release(&renamed).is_err(), "another id");
     }
 }
 

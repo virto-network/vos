@@ -315,8 +315,8 @@ fn no_carrier_through_the_onion_holds_a_members_device_secret_or_its_place() {
     let elf = std::fs::read(vos_testkit::programs::program_elf("vos-credentials")).unwrap();
     let stock = |kernel| vos_light::release::device(&elf, kernel).unwrap();
     let (auth, owner_kernel) = (stock("auth"), stock("owner"));
-    let auth_program = DeviceProgram::released(&auth).unwrap();
-    let owner_program = DeviceProgram::released(&owner_kernel).unwrap();
+    let auth_program = DeviceProgram::from_release(&auth).unwrap();
+    let owner_program = DeviceProgram::from_release(&owner_kernel).unwrap();
     let space_id = space.space_id();
     let mut answers = Vec::new();
     let mut proven = |call: &Call, proof: &Proven| -> Answer {
@@ -373,7 +373,7 @@ fn no_carrier_through_the_onion_holds_a_members_device_secret_or_its_place() {
         map_root: witness.root.to_bytes(),
         scope: scope.to_bytes(),
         nullifier: tree::digest(&nullifier),
-        binding: watched.binding(auth_program.id()).to_bytes(),
+        binding: watched.binding(&auth_program.id().0).to_bytes(),
     }
     .encode();
     let mut arguments = path.siblings.0.concat();
@@ -383,13 +383,7 @@ fn no_carrier_through_the_onion_holds_a_members_device_secret_or_its_place() {
     audit
         .needles
         .kernel_arguments("the member", &arguments, claim.len());
-    let kernel = vos_pvm_device::Program::released(
-        &vos_pvm_device::FORMAT,
-        &auth.kernel,
-        auth.chips,
-        &auth.log_sizes,
-    )
-    .unwrap();
+    let kernel = vos_pvm_device::Program::from_release(&auth).unwrap();
     let ((proved, _), drawn) = drawn_in(|| kernel.prove(&arguments, MaskRng::default()).unwrap());
     let drawn: Vec<(&str, Vec<u8>)> = drawn.into_iter().map(|d| (d.what, d.bytes)).collect();
     for what in [
@@ -406,8 +400,7 @@ fn no_carrier_through_the_onion_holds_a_members_device_secret_or_its_place() {
     let watched_proof = Proven {
         format: DEVICE_FORMAT,
         claim,
-        proof: vos_pvm_device::encode(&vos_pvm_device::FORMAT, &proved.proof)
-            .unwrap(),
+        proof: vos_pvm_device::encode(&vos_pvm_device::FORMAT, &proved.proof).unwrap(),
     };
     let answer = proven(&watched, &watched_proof);
     ran(&answer);

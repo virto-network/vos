@@ -7,8 +7,8 @@ use stwo::core::channel::MerkleChannel;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 use vos_pvm::instruction::Opcode;
 use vos_pvm_compiler::assembler::{Assembler, Reg};
+use vos_pvm_device::DeviceProgramId;
 use vos_pvm_device::masked::{DeviceProgram, prove_device_forced, verify_device};
-use vos_pvm_device::program_id;
 use vos_pvm_proof::chips::CpuColumns;
 use vos_pvm_proof::core::ecall::{ECALL_POSEIDON2, ECALL_WITNESS_INPUT};
 use vos_pvm_proof::format::{ChannelKind, Format};
@@ -79,8 +79,8 @@ fn a_per_program_cpu_proves_its_kernel() {
         ..narrow.clone()
     };
     assert_ne!(
-        program_id(&per_program(), &whole_cpu),
-        program_id(&per_program(), &narrow)
+        DeviceProgramId::of(&per_program(), &whole_cpu),
+        DeviceProgramId::of(&per_program(), &narrow)
     );
     assert_ne!(whole_cpu.header(), narrow.header());
     let (cut, _) = prove::<B2>(
@@ -117,8 +117,8 @@ fn a_program_with_another_programs_cpu_is_another_program() {
         ..narrow.clone()
     };
     assert_ne!(
-        program_id(&per_program(), &borrowed),
-        program_id(&per_program(), &narrow)
+        DeviceProgramId::of(&per_program(), &borrowed),
+        DeviceProgramId::of(&per_program(), &narrow)
     );
     let (honest, _) = prove::<B2>(
         &per_program(),

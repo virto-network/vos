@@ -18,7 +18,7 @@
 //! ring, `once`), or a device kernel of the method's own actor, whose
 //! claim its handler checks at apply. Its program is one this node
 //! computes from a release of the installed kernel
-//! ([`vos_pvm_device::Program::of`], kept per release), its
+//! ([`vos_pvm_device::Program::from_kernel`], kept per release), its
 //! io-hash the Poseidon2 `H_io` of the claim, and the claim's last 32
 //! bytes the binding naming that program's id.
 //!
@@ -41,8 +41,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use vos_pvm_device::ProveError;
-use vos_pvm_device::{self as device, Verifier};
+use vos_pvm_device::{self as device, ReferenceProgram, Verifier};
 use vos_wire::abi::Kind;
 use vos_wire::abi::cap;
 use vos_wire::batch::CredentialedInput;
@@ -356,7 +355,7 @@ impl Inner {
         release: DeviceRelease,
         format: u32,
     ) -> Result<Option<Arc<Verifier>>, Refused> {
-        let in_format = *device::format(format).ok_or(Refused::Code(CredentialRefusal::Format))?;
+        device::format(format).ok_or(Refused::Code(CredentialRefusal::Format))?;
         let place = self.calls.devices.place(release, format);
         let blobs = self.blobs.clone();
         place
@@ -366,9 +365,15 @@ impl Inner {
                         blobs.get(&hash).ok().flatten().ok_or(Refused::Unavailable)
                     };
                     let (kernel, reference) = (blob(release.kernel.0)?, blob(release.reference.0)?);
-                    match device::Program::of(&in_format, &kernel, &reference, release.headroom) {
+                    let program = device::Program::from_kernel(
+                        format,
+                        &kernel,
+                        ReferenceProgram(&reference),
+                        release.headroom,
+                    );
+                    match program {
                         Ok(program) => Ok(Some(Arc::new(program.verifier()))),
-                        Err(error) if of_the_kernel(&error) => Ok(None),
+                        Err(error) if error.is_of_the_kernel() => Ok(None),
                         Err(_) => Err(Refused::Unavailable),
                     }
                 })
@@ -416,7 +421,7 @@ impl Inner {
                 for format in &formats {
                     match self.device_program(release, format.format).await {
                         Ok(Some(program)) => programs.push(ProgramWindow {
-                            id: *program.id(),
+                            id: program.id().0,
                             format: format.format,
                             retires_ms: retires(&release),
                         }),
@@ -561,7 +566,7 @@ impl Inner {
                     agent,
                     instance: call.instance,
                     method: call.method,
-                    program: program.id(),
+                    program: &program.id().0,
                     arguments: &call.arguments,
                     nonce: &call.nonce,
                     expires_ms: call.expires_ms,
@@ -595,7 +600,7 @@ impl Inner {
                     .owner,
             ),
             _ => Principal::Kernel {
-                program: *program.id(),
+                program: program.id().0,
             },
         };
         // A claim within the cap is far under `H_io`'s bound.
@@ -625,20 +630,6 @@ fn logged(snapshot: &Snapshot, agent: AgentId, format: u32) -> Option<u64> {
     read::<u64>(snapshot, agent, &keys::format_retired(format))
         .ok()
         .flatten()
-}
-
-/// Whether a device program's computation failed for its kernel's bytes,
-/// as it fails every time: its layout or shape, its run, its witness, the
-/// wiring or the masking's layout. Any other failure may pass again.
-fn of_the_kernel(error: &ProveError) -> bool {
-    matches!(
-        error,
-        ProveError::TraceShape(_)
-            | ProveError::Segment(_)
-            | ProveError::Witness(_)
-            | ProveError::Wiring(_)
-            | ProveError::Masking(_)
-    )
 }
 
 /// The window of the device kernel `name` names in `installed` at `now`:

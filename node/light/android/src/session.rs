@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use vos_light::release::Device;
+use vos_light::release::Release;
 use vos_light::route::{Clearnet, Purpose};
 use vos_light::tor::Registrar;
 use vos_light::wire;
@@ -59,7 +59,7 @@ const REFRESH_EVERY: Duration = Duration::from_secs(30);
 const REFRESH_SPREAD: Duration = Duration::from_secs(5);
 
 /// The release artifacts of VOS's stock kernels, each an encoded
-/// `vos_light::release::Device`: the programs the device proves sign-ins
+/// `vos_light::release::Release`: the programs the device proves sign-ins
 /// and payments with, never one a server sends.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stock {
@@ -468,7 +468,7 @@ impl Inner {
         self.programs.get(warm::key(kernel), || {
             <Device as vos_wire::Decode>::decode_exact(kernel)
                 .ok_or(DeviceError::Prove)
-                .and_then(|device| DeviceProgram::released(&device))
+                .and_then(|device| DeviceProgram::from_release(&device))
         })
     }
 

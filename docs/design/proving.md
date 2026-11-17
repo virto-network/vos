@@ -1237,11 +1237,12 @@ pub fn verify(proof: &Proven, call: &Call, program: &DeviceProgram, name: Option
               -> Result<(), DeviceError>;
 pub fn claim_io(claim: &[u8]) -> Option<[u8; 32]>;
 
-/// A device kernel's program, from its release artifact, as every node computes it.
-pub struct DeviceProgram(/* the chips, the log sizes, the committed tree */);
-impl DeviceProgram {
-    pub fn released(device: &release::Device) -> Result<Self, DeviceError>;  // no run
-    pub fn id(&self) -> &[u8; 32];
+/// A device kernel's program, from its release artifact, as every node
+/// computes it: `vos_pvm_device::Program`, re-exported.
+pub use vos_pvm_device::Program as DeviceProgram;
+impl Program {
+    pub fn from_release(release: &Release) -> Result<Self, vos_pvm_device::Error>;  // no run
+    pub fn id(&self) -> &DeviceProgramId;
 }
 
 // The wire (identity-and-authority.md §5–§6): node-API requests, each its
@@ -1593,13 +1594,15 @@ preprocessed root commits its code, data table, regions, permissions and
 entry registers. Its reference run is on what the kernel's reference
 program returns (`#[attestable(device, reference = path, headroom = k)]`,
 the derivation's `references`), each size raised by its headroom
-(`Program::of`); the stock kernels' reference is auth's public
+(`Program::from_kernel`, the reference a `ReferenceProgram`, distinct
+from the `ReferenceArguments` a test sizes a program on,
+`Program::sized_for`); the stock kernels' reference is auth's public
 reference statement (`vos_sdk::p2::reference`, and `auth_reference` in
 the hand-lean test kernel's layout: a fixed, public secret's member at
 slot 0 of the empty tree, a fixed scope and binding), so every node computes one
 program from the installed kernel's release, and a release build the
 same from the same package (`light-node.md` §4.4, which a device embeds
-and commits without a run, `Program::released`); a branch-free kernel's
+and commits without a run, `Program::from_release`); a branch-free kernel's
 every witness runs to those sizes. The program id, which a binding names, is
 BLAKE2b-256 of `"vos/device/program/v1"`, the format's number and
 parameters (log blowup, queries, PoW, fold step, log last layer,

@@ -17,7 +17,6 @@ use stwo::core::fields::qm31::SecureField;
 use stwo::core::utils::{bit_reverse_index, coset_index_to_circle_domain_index};
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 use stwo::core::verifier::VerificationError;
-use stwo::prover::ProvingError;
 use stwo::prover::backend::BackendForChannel;
 use stwo::prover::backend::simd::SimdBackend;
 use vos_pvm_device::masked::{prove_device_forced, verify_device};
@@ -29,7 +28,6 @@ use vos_pvm_proof::format::{ChannelKind, Format};
 use vos_pvm_proof::framework_access::AllLookupElements;
 use vos_pvm_proof::masked::{DeviceComponents, MaskedDeviceTrace};
 use vos_pvm_proof::poseidon2::P2MerkleChannel;
-use vos_pvm_recair::ProveError;
 use vos_pvm_recair::masked::{Checks, MaskRng, mask_rows};
 use vos_pvm_recair::trace::FirstRowFraction;
 use vos_pvm_recair_air::masking::{
@@ -132,7 +130,7 @@ fn forced(
     tamper: impl FnOnce(&mut MaskedDeviceTrace),
     blind: impl Fn(&AllLookupElements, &mut [FirstRowFraction]),
     checked: bool,
-) -> Result<Proof<P2>, ProveError> {
+) -> Result<Proof<P2>, vos_pvm_device::Error> {
     let checks = Checks {
         constraints: checked,
         ..Checks::ALL
@@ -162,10 +160,7 @@ fn a_broken_constraint_on_the_first_last_or_wrap_row_is_refused() {
         let tamper = |trace: &mut MaskedDeviceTrace| bump(trace, at, column, row, 1);
         let refused = forced(4, tamper, |_, _| {}, true);
         assert!(
-            matches!(
-                refused,
-                Err(ProveError::Stwo(ProvingError::ConstraintsNotSatisfied))
-            ),
+            matches!(refused, Err(vos_pvm_device::Error::Unsatisfied)),
             "row {row}: {refused:?}"
         );
         let proof = forced(4, tamper, |_, _| {}, false).expect("a forced proof");
@@ -205,10 +200,7 @@ fn an_unbalanced_relation_cancelled_by_the_blinding_is_refused() {
     };
     let refused = forced(5, tamper, cancel, true);
     assert!(
-        matches!(
-            refused,
-            Err(ProveError::Stwo(ProvingError::ConstraintsNotSatisfied))
-        ),
+        matches!(refused, Err(vos_pvm_device::Error::Unsatisfied)),
         "{refused:?}"
     );
     let cancelled = forced(5, tamper, cancel, false).expect("a forced proof");

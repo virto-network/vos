@@ -1,7 +1,7 @@
 //! The phone bench (`proving.md` §8): the device
 //! library's proven calls by the stock kernels, auth and owner, proved
 //! through `vos-light` on fixed statements under the device format from
-//! the kernels' release artifacts (`release::Device`, which the binary
+//! the kernels' release artifacts (`release::Release`, which the binary
 //! embeds, computed from the credential actor's ELF at build), timed,
 //! verified, their peak memory read, and the PoW grinds timed alone.
 //!
@@ -25,9 +25,9 @@
 //!
 //! - `vos-phone kernel --device PATH --input PATH --out PATH [--claim N] [--threads auto|N]`:
 //!   a device kernel proved as the device library proves it for a space's
-//!   ingress, from its release artifact (`release::Device`, the program
+//!   ingress, from its release artifact (`release::Release`, the program
 //!   ingress computes from the installed kernel, computed at release:
-//!   `DeviceProgram::released`; `Prover::prove_kernel`, the device format, 47), on its
+//!   `DeviceProgram::from_release`; `Prover::prove_kernel`, the device format, 47), on its
 //!   witness input, verified here against the io-hash of the input's last
 //!   `N` bytes, its claim (128 by default, the stock auth kernel's); the
 //!   proof's bytes written to `--out`, one `kernel` line.
@@ -65,7 +65,7 @@ use sha2::{Digest as _, Sha256};
 use stwo::core::channel::{Blake2sM31Channel, Channel};
 use stwo::core::proof_of_work::GrindOps;
 use stwo::prover::backend::simd::SimdBackend;
-use vos_light::release::Device;
+use vos_light::release::Release;
 use vos_light::{
     AuthWitness, Call, DEVICE_FORMAT, DeviceProgram, Digest, Proven, Prover, ProverConfig, Threads,
     derive_secret, member, verify,
@@ -90,7 +90,7 @@ static AUTH: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/auth.device"));
 static OWNER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/owner.device"));
 
 /// The stock kernel `cell`'s embedded release artifact.
-fn device_artifact(cell: &str) -> Device {
+fn device_artifact(cell: &str) -> Release {
     let bytes = match cell {
         "auth" => AUTH,
         "owner" => OWNER,
@@ -100,12 +100,12 @@ fn device_artifact(cell: &str) -> Device {
         !bytes.is_empty(),
         "built without the credential actor's ELF: `just build-programs` first"
     );
-    Device::decode_exact(bytes).expect("a release artifact")
+    Release::decode_exact(bytes).expect("a release artifact")
 }
 
 /// The stock kernel `cell`'s program, from its embedded release artifact.
 fn program(cell: &str) -> DeviceProgram {
-    DeviceProgram::released(&device_artifact(cell)).expect("the stock kernel's program")
+    DeviceProgram::from_release(&device_artifact(cell)).expect("the stock kernel's program")
 }
 /// The guard name of every cell.
 const NAME: &[u8] = b"login";
@@ -310,7 +310,7 @@ fn cell(cell: &str, options: &Options) {
     println!(
         "{{\"kind\":\"cell\",\"cell\":\"{cell}\",\"format\":{},\"program\":\"{}\",\"threads\":{},\"reps\":{},\"prove_ms_p50\":{:.1},\"prove_ms_p95\":{:.1},\"prove_ms_min\":{:.1},\"prove_ms_max\":{:.1},\"prove_ms_runs\":[{}],\"verify_ms\":{verify_ms:.2},\"proof_bytes\":{},\"distinct_proofs\":{distinct},\"proof_sha256\":\"{last}\",\"matches_x86\":{matches_x86},\"verified\":true,\"peak_rss_mib\":{:.1}}}",
         DEVICE_FORMAT,
-        hex(program.id()),
+        hex(&program.id().0),
         prover.threads(),
         options.reps,
         quantile(&sorted, 0.5),
@@ -487,7 +487,7 @@ fn kernel(args: &[String]) {
             "--device" => {
                 let bytes = std::fs::read(value).expect("the device artifact");
                 device = Some(
-                    vos_light::release::Device::decode_exact(&bytes)
+                    vos_light::release::Release::decode_exact(&bytes)
                         .expect("a device kernel's release artifact"),
                 );
             }
@@ -511,7 +511,7 @@ fn kernel(args: &[String]) {
     })
     .expect("a prover");
     let started = Instant::now();
-    let program = vos_light::DeviceProgram::released(&device).expect("the kernel's program");
+    let program = vos_light::DeviceProgram::from_release(&device).expect("the kernel's program");
     let install = started.elapsed();
     let started = Instant::now();
     let proof = prover
@@ -520,7 +520,7 @@ fn kernel(args: &[String]) {
     let proved = started.elapsed();
     let claim = &input[input.len().saturating_sub(claim)..];
     let started = Instant::now();
-    let verified = Some(proof.io) == vos_light::claim_io(claim) && program.verify(&proof).is_ok();
+    let verified = Some(proof.io) == vos_light::claim_io(claim) && proof.verify(&program).is_ok();
     let verify = started.elapsed();
     std::fs::write(&out, &proof.proof).expect("the proof written");
     println!(
@@ -528,7 +528,7 @@ fn kernel(args: &[String]) {
          \"install_ms\":{:.1},\"prove_ms\":{:.1},\"verify_ms\":{:.2},\"proof_bytes\":{},\
          \"io\":\"{}\",\"verified\":{verified},\"peak_rss_mib\":{:.1}}}",
         prover.threads(),
-        hex(program.id()),
+        hex(&program.id().0),
         program.log_sizes(),
         ms(install),
         ms(proved),

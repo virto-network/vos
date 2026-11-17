@@ -220,7 +220,7 @@ impl Reached {
         let arguments = vos_light::transfer_arguments("payee", 1);
         let elf = std::fs::read(vos_checker::programs::program_elf("vos-credentials")).unwrap();
         let owner = vos_light::release::device(&elf, "owner").expect("the stock owner kernel");
-        let program = DeviceProgram::released(&owner).expect("its program");
+        let program = DeviceProgram::from_release(&owner).expect("its program");
         let secret = secret();
         (0..count)
             .into_par_iter()

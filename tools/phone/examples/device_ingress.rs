@@ -44,8 +44,8 @@ fn main() {
     let elf =
         std::fs::read(vos_testkit::programs::program_elf("vos-credentials")).expect("the ELF");
     let auth = device(&elf, "auth").expect("the stock auth kernel's artifact");
-    let program = vos_light::DeviceProgram::released(&auth).expect("its program");
-    let verifier = Program::released(&FORMAT, &auth.kernel, auth.chips, &auth.log_sizes)
+    let program = vos_light::DeviceProgram::from_release(&auth).expect("its program");
+    let verifier = Program::from_release(&auth)
         .expect("its program")
         .verifier();
     let secret = derive_secret(&[0x5e; 32], &[7; 32]);
@@ -100,7 +100,7 @@ fn main() {
         vos_pvm_device::FORMAT.number
     );
     let decoded = decode(&FORMAT, &honest).unwrap();
-    let released = Program::released(&FORMAT, &auth.kernel, auth.chips, &auth.log_sizes).unwrap();
+    let released = Program::from_release(&auth).unwrap();
     let device_program = released.program();
     let header = device_program.header();
     let steps: [(&str, &dyn Fn() -> bool); 5] = [

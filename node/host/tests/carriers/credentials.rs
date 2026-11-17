@@ -421,8 +421,8 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
     let credentials_elf = std::fs::read(program_elf("vos-credentials")).unwrap();
     let stock = |kernel| vos_light::release::device(&credentials_elf, kernel).unwrap();
     let (auth, owner_kernel) = (stock("auth"), stock("owner"));
-    let auth_program = DeviceProgram::released(&auth).unwrap();
-    let owner_program = DeviceProgram::released(&owner_kernel).unwrap();
+    let auth_program = DeviceProgram::from_release(&auth).unwrap();
+    let owner_program = DeviceProgram::from_release(&owner_kernel).unwrap();
     let mut calls = Socket::connect(&founded.cluster.dir(at).join("api.sock"));
     let mut send = |call: &Call, proof: &Proven| {
         wire::credentialed_answer(&calls.send(&wire::credentialed(call, proof)))
@@ -498,7 +498,7 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
     // An actor's own kernel's sign-in, its replay, and its proof sent to a
     // stock guard.
     let device = vos_light::release::device(&vos_testkit::programs::package("device"), "auth");
-    let program = DeviceProgram::released(&device.unwrap()).unwrap();
+    let program = DeviceProgram::from_release(&device.unwrap()).unwrap();
     let siblings = witness.siblings.map(|sibling| sibling.0);
     let device_proof_of = |call: &Call| {
         let scope = tree::scope(&founded.space, agent, DEVICE, b"login");
@@ -510,7 +510,7 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
             &witness.root.to_bytes(),
             &scope,
             &nullifier,
-            &call.binding(program.id()).to_bytes(),
+            &call.binding(&program.id().0).to_bytes(),
         );
         let arguments = vos_pvm_device::auth_arguments(&siblings, &words, witness.slot, &public);
         let proof = prover.prove_kernel(&program, &arguments).unwrap();
@@ -549,7 +549,7 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
         map_root: witness.root.to_bytes(),
         scope: scope.to_bytes(),
         nullifier: tree::digest(&nullifier),
-        binding: watched.binding(auth_program.id()).to_bytes(),
+        binding: watched.binding(&auth_program.id().0).to_bytes(),
     }
     .encode();
     let mut arguments = path.siblings.0.concat();
@@ -559,13 +559,7 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
     audit
         .needles
         .kernel_arguments("the member", &arguments, claim.len());
-    let kernel = vos_pvm_device::Program::released(
-        &vos_pvm_device::FORMAT,
-        &auth.kernel,
-        auth.chips,
-        &auth.log_sizes,
-    )
-    .unwrap();
+    let kernel = vos_pvm_device::Program::from_release(&auth).unwrap();
     let ((proved, _), drawn) = drawn_in(|| kernel.prove(&arguments, MaskRng::default()).unwrap());
     let drawn: Vec<(&str, Vec<u8>)> = drawn.into_iter().map(|d| (d.what, d.bytes)).collect();
     for what in [

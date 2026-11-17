@@ -4,11 +4,10 @@ use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest as _};
 use stwo::core::vcs::blake2_hash::Blake2sHash;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
-use vos_pvm_final_verifier::Error;
 use vos_pvm_final_verifier::masking::MaskedFormat;
 use vos_pvm_proof::format::Format;
 
-use super::{Hasher, MAX_PROOF_BYTES};
+use super::{DeviceProgramId, Hasher, MAX_PROOF_BYTES, Refusal};
 use vos_pvm_recair::masked::MaskedProof;
 
 use crate::masked::{DeviceProgram, DeviceProof, device_format, verify_device_in};
@@ -38,13 +37,13 @@ pub(super) fn masked(format: &Format, program: &DeviceProgram<Hasher>) -> Option
 pub struct Verifier {
     pub(super) format: Format,
     pub(super) program: DeviceProgram<Hasher>,
-    pub(super) id: [u8; 32],
+    pub(super) id: DeviceProgramId,
     pub(super) masked: Masked,
 }
 
 impl Verifier {
     /// Its id, which a binding names.
-    pub fn id(&self) -> &[u8; 32] {
+    pub fn id(&self) -> &DeviceProgramId {
         &self.id
     }
 
@@ -55,7 +54,7 @@ impl Verifier {
 
     /// Verifies the proof in `bytes` ([`decode`]) of this program's kernel
     /// stating the io-hash `io`.
-    pub fn verify(&self, io: &[u8; 32], bytes: &[u8]) -> Result<(), Error> {
+    pub fn verify(&self, io: &[u8; 32], bytes: &[u8]) -> Result<(), Refusal> {
         verify(&self.format, &self.program, &self.masked, io, bytes)
     }
 }
@@ -66,7 +65,7 @@ pub(super) fn verify(
     masked: &Masked,
     io: &[u8; 32],
     bytes: &[u8],
-) -> Result<(), Error> {
+) -> Result<(), Refusal> {
     let header = program.header();
     let masked = MaskedFormat {
         log_sizes: &program.log_sizes,
@@ -78,7 +77,7 @@ pub(super) fn verify(
         io: *io,
         proof: decode(format, bytes)?,
     };
-    verify_device_in::<Blake2sM31MerkleChannel>(&masked, program, proof)
+    verify_device_in::<Blake2sM31MerkleChannel>(&masked, program, proof).map_err(Refusal::of)
 }
 
 /// A proof's encoding's leading fields, as [`Wire`] and its STARK proof
@@ -105,13 +104,13 @@ fn precheck(
     masked: &MaskedFormat<'_>,
     io: &[u8; 32],
     bytes: &[u8],
-) -> Result<(), Error> {
+) -> Result<(), Refusal> {
     if bytes.len() > MAX_PROOF_BYTES {
-        return Err(Error::Length);
+        return Err(Refusal::Length);
     }
-    let (head, _): (Head, &[u8]) = postcard::take_from_bytes(bytes).map_err(|_| Error::Decode)?;
+    let (head, _): (Head, &[u8]) = postcard::take_from_bytes(bytes).map_err(|_| Refusal::Decode)?;
     if head.format_version != format.number {
-        return Err(Error::Format);
+        return Err(Refusal::Format);
     }
     let public = vos_pvm_proof::masked::device_public_values(io);
     let holds = vos_pvm_final_verifier::masking::interaction_pow_holds::<Blake2sM31MerkleChannel>(
@@ -120,47 +119,49 @@ fn precheck(
         &head.commitments,
         head.interaction_pow,
     );
-    holds.then_some(()).ok_or(Error::InteractionPow)
+    holds.then_some(()).ok_or(Refusal::InteractionPow)
 }
 
-/// The id of `program` under `format`: BLAKE2b-256 of the domain, the
-/// format's number, its parameters (log blowup, queries, PoW, fold step,
-/// log last layer, interaction PoW, `log h`), the chips, the count of log
-/// sizes and each, when the CPU is cut its column words (eight
-/// little-endian bytes each), the word ledger's tag (eight little-endian
-/// bytes, `DEVICE_WORD_MEMORY_TAG`), and the preprocessed
-/// root, every other integer four little-endian bytes.
-pub fn program_id(format: &Format, program: &DeviceProgram<Hasher>) -> [u8; 32] {
-    let params = &format.params;
-    let log_mask_rows = format.masking.map_or(0, |masking| masking.log_mask_rows);
-    let mut hash = Blake2b::<U32>::new();
-    hash.update(PROGRAM_DOMAIN);
-    for word in [
-        format.number,
-        params.log_blowup,
-        params.n_queries as u32,
-        params.pow_bits,
-        params.fold_step,
-        params.log_last_layer,
-        params.interaction_pow_bits,
-        log_mask_rows,
-        program.active,
-        program.log_sizes.len() as u32,
-    ]
-    .into_iter()
-    .chain(program.log_sizes.iter().copied())
-    {
-        hash.update(word.to_le_bytes());
-    }
-    if program.cpu != vos_pvm_proof::chips::CpuColumns::ALL {
-        for word in program.cpu.words() {
+impl DeviceProgramId {
+    /// The id of `program` under `format`: BLAKE2b-256 of the domain, the
+    /// format's number, its parameters (log blowup, queries, PoW, fold
+    /// step, log last layer, interaction PoW, `log h`), the chips, the count
+    /// of log sizes and each, when the CPU is cut its column words (eight
+    /// little-endian bytes each), the word ledger's tag (eight
+    /// little-endian bytes, `DEVICE_WORD_MEMORY_TAG`), and the preprocessed
+    /// root, every other integer four little-endian bytes.
+    pub fn of(format: &Format, program: &DeviceProgram<Hasher>) -> Self {
+        let params = &format.params;
+        let log_mask_rows = format.masking.map_or(0, |masking| masking.log_mask_rows);
+        let mut hash = Blake2b::<U32>::new();
+        hash.update(PROGRAM_DOMAIN);
+        for word in [
+            format.number,
+            params.log_blowup,
+            params.n_queries as u32,
+            params.pow_bits,
+            params.fold_step,
+            params.log_last_layer,
+            params.interaction_pow_bits,
+            log_mask_rows,
+            program.active,
+            program.log_sizes.len() as u32,
+        ]
+        .into_iter()
+        .chain(program.log_sizes.iter().copied())
+        {
             hash.update(word.to_le_bytes());
         }
+        if program.cpu != vos_pvm_proof::chips::CpuColumns::ALL {
+            for word in program.cpu.words() {
+                hash.update(word.to_le_bytes());
+            }
+        }
+        hash.update(crate::masked::DEVICE_WORD_MEMORY_TAG.to_le_bytes());
+        let Blake2sHash(root) = program.circuit;
+        hash.update(root);
+        Self(hash.finalize().into())
     }
-    hash.update(crate::masked::DEVICE_WORD_MEMORY_TAG.to_le_bytes());
-    let Blake2sHash(root) = program.circuit;
-    hash.update(root);
-    hash.finalize().into()
 }
 
 /// The canonical encoding of a device proof's masked part.
@@ -187,14 +188,14 @@ pub fn encode(format: &Format, proof: &MaskedProof<Hasher>) -> Option<Vec<u8>> {
 /// The proof in `bytes` under the device format `format`: at most
 /// [`MAX_PROOF_BYTES`], read whole and canonical (re-encoded, the same
 /// bytes).
-pub fn decode(format: &Format, bytes: &[u8]) -> Result<MaskedProof<Hasher>, Error> {
+pub fn decode(format: &Format, bytes: &[u8]) -> Result<MaskedProof<Hasher>, Refusal> {
     if bytes.len() > MAX_PROOF_BYTES {
-        return Err(Error::Length);
+        return Err(Refusal::Length);
     }
     let (wire, rest): (Wire, &[u8]) =
-        postcard::take_from_bytes(bytes).map_err(|_| Error::Decode)?;
+        postcard::take_from_bytes(bytes).map_err(|_| Refusal::Decode)?;
     if wire.format_version != format.number {
-        return Err(Error::Format);
+        return Err(Refusal::Format);
     }
     let proof = MaskedProof {
         interaction_pow: wire.interaction_pow,
@@ -202,7 +203,7 @@ pub fn decode(format: &Format, bytes: &[u8]) -> Result<MaskedProof<Hasher>, Erro
         stark_proof: wire.stark_proof,
     };
     if !rest.is_empty() || encode(format, &proof).as_deref() != Some(bytes) {
-        return Err(Error::Decode);
+        return Err(Refusal::Decode);
     }
     Ok(proof)
 }
@@ -225,7 +226,7 @@ mod tests {
     fn a_decode_refuses_what_is_not_one_proof() {
         assert!(matches!(
             decode(&FORMAT, &vec![0; MAX_PROOF_BYTES + 1]),
-            Err(Error::Length)
+            Err(Refusal::Length)
         ));
         assert!(decode(&FORMAT, &[]).is_err());
         let mut other = Vec::new();

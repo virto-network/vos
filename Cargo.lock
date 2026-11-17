@@ -8949,6 +8949,7 @@ dependencies = [
  "stwo",
  "stwo-constraint-framework",
  "vos-pvm",
+ "vos-pvm-codec",
  "vos-pvm-compiler",
  "vos-pvm-device",
  "vos-pvm-final-verifier",

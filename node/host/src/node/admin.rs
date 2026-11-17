@@ -379,11 +379,16 @@ fn device_program(
     reference: &[u8],
     headroom: u8,
 ) -> Result<vos_pvm_device::Verifier, CallError> {
-    vos_pvm_device::Program::of(&vos_pvm_device::FORMAT, kernel, reference, headroom)
-        .map(|program| program.verifier())
-        .map_err(|error| {
-            CallError::Failed(format!(
-                "device kernel {method:#010x}: no program under the device format: {error}"
-            ))
-        })
+    vos_pvm_device::Program::from_kernel(
+        vos_pvm_device::FORMAT.number,
+        kernel,
+        vos_pvm_device::ReferenceProgram(reference),
+        headroom,
+    )
+    .map(|program| program.verifier())
+    .map_err(|error| {
+        CallError::Failed(format!(
+            "device kernel {method:#010x}: no program under the device format: {error}"
+        ))
+    })
 }

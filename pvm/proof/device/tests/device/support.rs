@@ -16,7 +16,6 @@ use vos_pvm_proof::core::ecall::{ECALL_POSEIDON2, ECALL_WITNESS_INPUT};
 use vos_pvm_proof::format::{ChannelKind, Format, FormatParams, Masking, SEGMENT};
 use vos_pvm_proof::poseidon2::P2MerkleChannel;
 use vos_pvm_proof::side_note::SideNote;
-use vos_pvm_recair::ProveError;
 use vos_pvm_recair::masked::MaskRng;
 use vos_pvm_recair::masked::MaskStats;
 
@@ -165,7 +164,7 @@ pub fn prove<MC: MerkleChannel>(
     blob: &[u8],
     input: &[u8],
     rng: MaskRng,
-) -> Result<(Proof<MC>, MaskStats), ProveError>
+) -> Result<(Proof<MC>, MaskStats), vos_pvm_device::Error>
 where
     SimdBackend: BackendForChannel<MC>,
 {

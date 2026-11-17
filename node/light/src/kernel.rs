@@ -3,85 +3,23 @@
 //! computed from the kernel as a space's ingress computes it), and a run
 //! of it proved against that program.
 
-use vos_pvm_device::{self as profile, Program};
 use vos_wire::ids::MethodId;
 use vos_wire::ingress::DeviceWindow;
 
-use crate::release::Device;
+use crate::release::Release;
 use crate::{DeviceError, Prover};
+
+/// A device kernel's program under a device format (the device format, or
+/// another this build proves, `vos_pvm_device::FORMATS`): the chips its
+/// code reaches, a log size each and the preprocessed root they commit, all
+/// computed from the kernel, never taken from a proof. A branch-free kernel
+/// proves every witness under its one program. The light node takes its
+/// programs as release artifacts (`DeviceProgram::from_release`).
+pub use vos_pvm_device::Program as DeviceProgram;
 
 /// The device format's number, the registry's: format 47, the one this
 /// light node's release artifacts are computed in.
-pub const DEVICE_FORMAT: u32 = profile::FORMAT.number;
-
-/// A device kernel's program under a device format (the device format, or
-/// another this build proves, [`profile::FORMATS`]): the chips its code
-/// reaches, a log size each and the preprocessed root they commit, all
-/// computed from the kernel, never taken from a proof. A branch-free kernel
-/// proves every witness under its one program.
-pub struct DeviceProgram(Program);
-
-impl DeviceProgram {
-    /// Kernel `kernel`'s program, its log sizes those its run on
-    /// `reference` needs, each raised by `headroom`: [`DeviceError::Prove`]
-    /// when the kernel does not run to its halt on it, or needs more than
-    /// the format's shape. A test's, or a bench's: the light node takes its
-    /// programs as release artifacts ([`DeviceProgram::released`]).
-    pub fn install(kernel: &[u8], reference: &[u8], headroom: u8) -> Result<Self, DeviceError> {
-        Program::install(&profile::FORMAT, kernel, reference, headroom)
-            .map(Self)
-            .map_err(|_| DeviceError::Prove)
-    }
-
-    /// The program a release artifact names: its preprocessed tree
-    /// committed from the kernel at the artifact's chips and log sizes in
-    /// its format, no reference run and no transpiler;
-    /// [`DeviceError::Prove`] when this build proves no such format, that is
-    /// no program of it, or its id is not the artifact's.
-    pub fn released(device: &Device) -> Result<Self, DeviceError> {
-        let format = profile::format(device.format).ok_or(DeviceError::Prove)?;
-        let program = Program::released(format, &device.kernel, device.chips, &device.log_sizes)
-            .map_err(|_| DeviceError::Prove)?;
-        if *program.id() != device.id {
-            return Err(DeviceError::Prove);
-        }
-        Ok(Self(program))
-    }
-
-    /// Its id, which a binding names.
-    pub fn id(&self) -> &[u8; 32] {
-        self.0.id()
-    }
-
-    /// The device format it proves under.
-    pub fn format(&self) -> u32 {
-        self.0.format().number
-    }
-
-    /// Each chip's log size, in the device order.
-    pub fn log_sizes(&self) -> &[u32] {
-        self.0.log_sizes()
-    }
-
-    /// The chips, a device mask.
-    pub fn chips(&self) -> u32 {
-        self.0.program().active
-    }
-
-    /// Verifies `proof`'s bytes under this program against its io-hash,
-    /// which a caller holding the claim computes itself ([`claim_io`]).
-    pub fn verify(&self, proof: &DeviceProof) -> Result<(), DeviceError> {
-        if proof.format != self.format() {
-            return Err(DeviceError::Verify);
-        }
-        self.verify_io(&proof.io, &proof.proof)
-    }
-
-    /// Verifies a proof's bytes `proof` under this program against `io`.
-    pub(crate) fn verify_io(&self, io: &[u8; 32], proof: &[u8]) -> Result<(), DeviceError> {
-        self.0.verify(io, proof).map_err(|_| DeviceError::Verify)
-    }
-}
+pub const DEVICE_FORMAT: u32 = vos_pvm_device::FORMAT.number;
 
 /// The newest of `shipped`, the release artifacts a light node ships for
 /// device kernel `method`, that a space's `window` admits: its program id
@@ -93,10 +31,10 @@ impl DeviceProgram {
 /// newest first, a release's artifact in the device format before its
 /// artifact in the previous one.
 pub fn choose<'a>(
-    shipped: &'a [Device],
+    shipped: &'a [Release],
     window: &DeviceWindow,
     method: MethodId,
-) -> Result<&'a Device, DeviceError> {
+) -> Result<&'a Release, DeviceError> {
     let admitted = window
         .kernels
         .iter()
@@ -125,7 +63,7 @@ pub fn choose<'a>(
 /// arguments' encoding: `H_io` of it, no output, no root; `None` past
 /// `H_io`'s bound.
 pub fn claim_io(claim: &[u8]) -> Option<[u8; 32]> {
-    profile::claim_io(claim)
+    vos_pvm_device::claim_io(claim)
 }
 
 /// A device kernel's proof: the io-hash its run states and the proof's
@@ -138,11 +76,25 @@ pub struct DeviceProof {
     pub proof: Vec<u8>,
 }
 
+impl DeviceProof {
+    /// Verifies it under `program` against its io-hash, which a caller
+    /// holding the claim computes itself ([`claim_io`]): its format the
+    /// program's, then its bytes.
+    pub fn verify(&self, program: &DeviceProgram) -> Result<(), DeviceError> {
+        if self.format != program.format().number {
+            return Err(DeviceError::Verify);
+        }
+        program
+            .verify(&self.io, &self.proof)
+            .map_err(|_| DeviceError::Verify)
+    }
+}
+
 impl Prover {
     /// `program`'s kernel run on `arguments`, through its witness input,
     /// proved under the program's format in this prover's pool. A run that
     /// does not halt, or needs more rows than the program's shape, is
-    /// [`DeviceError::Prove`].
+    /// [`DeviceError::Program`], its cause the device profile's.
     pub fn prove_kernel(
         &self,
         program: &DeviceProgram,
@@ -150,13 +102,12 @@ impl Prover {
     ) -> Result<DeviceProof, DeviceError> {
         self.pool.install(|| {
             let (proof, _) = program
-                .0
                 .prove(arguments, self.masks)
-                .map_err(|_| DeviceError::Prove)?;
+                .map_err(DeviceError::Program)?;
             Ok(DeviceProof {
-                format: program.format(),
+                format: program.format().number,
                 io: proof.io,
-                proof: program.0.encode(&proof.proof).ok_or(DeviceError::Prove)?,
+                proof: program.encode(&proof.proof).ok_or(DeviceError::Prove)?,
             })
         })
     }
@@ -171,8 +122,8 @@ mod tests {
     const AUTH: MethodId = MethodId(7);
 
     /// A release artifact of `AUTH` whose program id is `id`, in `format`.
-    fn shipped(id: u8, format: u32) -> Device {
-        Device {
+    fn shipped(id: u8, format: u32) -> Release {
+        Release {
             elf: [id; 32],
             method: AUTH,
             kernel: Vec::new(),

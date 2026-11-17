@@ -48,9 +48,14 @@ static PROVER: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
 /// an inlined frame names its function alone, a frame in their source
 /// files.
 fn by_the_prover(trace: &str) -> bool {
-    ["vos_pvm_device::", "pvm/proof/device/src/", "vos_pvm_recair::", "pvm/proof/recair/src/"]
-        .iter()
-        .any(|frame| trace.contains(frame))
+    [
+        "vos_pvm_device::",
+        "pvm/proof/device/src/",
+        "vos_pvm_recair::",
+        "pvm/proof/recair/src/",
+    ]
+    .iter()
+    .any(|frame| trace.contains(frame))
 }
 
 static ARMED: AtomicBool = AtomicBool::new(false);

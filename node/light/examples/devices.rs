@@ -1,7 +1,7 @@
 //! `cargo run -p vos-light --features release --example devices -- ELF DIR
 //! NAME…`: the release artifacts of the device kernels `NAME…` of the
 //! package whose ELF is `ELF`, each written to `DIR/NAME.device` in its
-//! encoding ([`vos_light::release::Device`]): what an app embeds for the
+//! encoding ([`vos_light::release::Release`]): what an app embeds for the
 //! stock kernels, `auth` and `owner` from the credential actor's ELF
 //! (`just build-programs`).
 

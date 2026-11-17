@@ -578,7 +578,7 @@ fn a_personal_space_is_claimed_paired_and_its_first_phone_retired() {
         credentials: CREDENTIALS,
     };
     let credentials = std::fs::read(program_elf("vos-credentials")).unwrap();
-    let owner_kernel = DeviceProgram::released(
+    let owner_kernel = DeviceProgram::from_release(
         &vos_light::release::device(&credentials, "owner").expect("the stock kernel"),
     )
     .unwrap();

@@ -1,31 +1,41 @@
-//! Device programs as a space's ingress and a member's device both take
-//! them (`proving.md` §8): a device kernel's program under a device format
-//! (47, [`FORMAT`]; [`FORMATS`] the ones this build proves and verifies),
-//! its id, a proof's bytes, and the auth statement's arguments and io-hash.
+//! The device profile (`proving.md` §8): a device kernel's program under a
+//! device format (47, [`FORMAT`]; [`FORMATS`] the ones this build proves
+//! and verifies), its id, a run of it proved masked on the Blake2s-M31
+//! channel, a proof's bytes, and the auth statement's arguments and
+//! io-hash. A space's ingress and a member's device both take it; it links
+//! the masked prover without the recursion.
 //!
-//! - **The program** ([`Program`]) is computed from the kernel's release
-//!   alone (`vos_wire::records::DeviceRelease`): the chips its code reaches
-//!   (`device_chips_of_code`), and a log size each that its reference run
-//!   needs, raised by its headroom, at least the masking's floor and at
-//!   most `DEVICE_MAX_LOG_SIZE`; its preprocessed root committed then. The
-//!   reference run's arguments are what the kernel's reference program
-//!   returns ([`reference_arguments`]), so every node computes the same
-//!   program from the installed kernel, and a release the same from the
-//!   same package: nothing of the program is taken from a request. A
-//!   release embeds the program's shape ([`Program::released`]), so a
-//!   device runs neither the reference nor the transpiler.
+//! - **The program** ([`Program`]) is computed from the kernel alone: the
+//!   chips its code reaches (`device_chips_of_code`), and a log size each
+//!   that its reference run needs, raised by its headroom, at least the
+//!   masking's floor and at most `DEVICE_MAX_LOG_SIZE`; its preprocessed
+//!   root committed then. The reference run's arguments are what the
+//!   kernel's reference program returns ([`Program::from_kernel`]), so
+//!   every node computes the same program from the installed kernel, and a
+//!   release the same from the same package: nothing of the program is
+//!   taken from a request. A release artifact ([`Release`]) embeds the
+//!   program's shape and id ([`Program::from_release`]), so a device runs
+//!   neither the reference nor the transpiler. The reference program and
+//!   the reference arguments are distinct types ([`ReferenceProgram`],
+//!   [`ReferenceArguments`]), so one is never passed for the other.
 //! - **The trace is the program's shape:** the prover pads every chip to
-//!   the program's log sizes and refuses a run that needs more, so a
-//!   branch-free kernel proves every witness under one program, its
-//!   proof's shape the same.
-//! - **The id** ([`Program::id`]) is what a binding names: BLAKE2b-256 of
-//!   a domain, the format's number and parameters, the chips, the log
+//!   the program's log sizes and refuses a run that needs more
+//!   ([`Error::Fit`]), so a branch-free kernel proves every witness under
+//!   one program, its proof's shape the same.
+//! - **The id** ([`DeviceProgramId`]) is what a binding names: BLAKE2b-256
+//!   of a domain, the format's number and parameters, the chips, the log
 //!   sizes and the preprocessed root, every one of which the transcript
 //!   also mixes.
 //! - **A proof's bytes** ([`encode`], [`decode`]) are the masked proof's
 //!   postcard encoding, at most [`MAX_PROOF_BYTES`] and canonical. They
 //!   hold no io-hash: the verifier takes the io-hash from the caller, who
-//!   computes it from the claim it holds ([`claim_io`]).
+//!   computes it from the claim it holds ([`claim_io`]), and refuses a
+//!   proof with a [`Refusal`].
+//! - **Errors** ([`Error`], [`Refusal`]) hold no value of a run, so any may
+//!   be logged.
+//! - **The masked segment** ([`masked`]) is the layer under the program:
+//!   the device chip set proved and verified masked, which the forgery and
+//!   leakage gates drive directly.
 //! - **The hand-lean auth kernel** (the `device` test actor's, the
 //!   reference the SDK form is measured against) states a kind byte, then
 //!   `map_root`, `scope`, `nullifier` and `binding`, as its public
@@ -34,15 +44,52 @@
 
 use vos_pvm_proof::format::{DEVICE_PROOF, Format};
 use vos_wire::credentials::{self, DEPTH, EMPTY, Tag, Words};
+use vos_wire::ids::MethodId;
+use vos_wire::{Decode, Encode};
 
+mod error;
 pub mod masked;
 mod prove;
 mod verify;
 
-pub use prove::{GAS, Program, REFERENCE_GAS, reference_arguments};
-pub use verify::{Verifier, claim_io, decode, encode, program_id};
-pub use vos_pvm_recair::ProveError;
+pub use error::{Error, Refusal};
+pub use prove::{GAS, Program, REFERENCE_GAS};
+pub use verify::{Verifier, claim_io, decode, encode};
 pub use vos_pvm_recair::masked::{MaskRng, MaskStats, MaskedProof};
+
+/// A device program's id, which a binding names ([`Program::id`]): a hash
+/// of the format and the program, distinct from a kernel's segment program
+/// id (`vos_pvm_proof::program_id::ProgramId`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DeviceProgramId(pub [u8; 32]);
+
+/// A device kernel's reference program: the blob whose run returns the
+/// kernel's reference arguments.
+#[derive(Clone, Copy, Debug)]
+pub struct ReferenceProgram<'a>(pub &'a [u8]);
+
+/// A device kernel's reference arguments: what its reference program
+/// returns, the run a program's log sizes are measured on.
+#[derive(Clone, Copy, Debug)]
+pub struct ReferenceArguments<'a>(pub &'a [u8]);
+
+/// A device kernel's release artifact (`light-node.md` §4.4): method
+/// `method`'s kernel of the package whose ELF hash is `elf`, and its device
+/// program as every node computes it from that package
+/// ([`Program::from_kernel`]): its format, its chips, its log sizes and its
+/// id. A device commits the program's preprocessed tree from these
+/// ([`Program::from_release`]) and checks the id it gets.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Release {
+    pub elf: [u8; 32],
+    pub method: MethodId,
+    pub kernel: Vec<u8>,
+    pub format: u32,
+    pub chips: u32,
+    pub log_sizes: Vec<u32>,
+    /// The program's id, its [`DeviceProgramId`]'s bytes.
+    pub id: [u8; 32],
+}
 
 /// The device format: format 47, the per-program CPU and the word ledger.
 pub const FORMAT: Format = DEVICE_PROOF;

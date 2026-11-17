@@ -15,14 +15,17 @@
 //!   recomputes from them, every other blinded.
 //! - **The trace is the program's shape** (a witness-independent
 //!   trace): every chip at its program's log size, the prover refusing a run
-//!   that needs more ([`vos_pvm_proof::ProvingError::Shape`]), so a proof's
-//!   shape never depends on its witness. A kernel whose step count does not depend on its
-//!   witness (branch-free) proves every witness under one program.
+//!   that needs more ([`crate::Error::Fit`]), so a proof's shape never
+//!   depends on its witness. A kernel whose step count does not depend on
+//!   its witness (branch-free) proves every witness under one program.
+//! - **Its verifier** ([`verify_device`]) returns the masked verifier's own
+//!   refusals (`vos_pvm_final_verifier::Error`), which the forgery gates
+//!   tell apart; a program's verifier ([`crate::Verifier`]) refuses with a
+//!   [`crate::Refusal`].
 
 use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use vos_pvm_proof::chips::CpuColumns;
 use vos_pvm_proof::device::{DeviceLayout, DeviceShape};
-
 use vos_pvm_recair::masked::MaskedProof;
 
 mod prove;

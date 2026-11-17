@@ -126,7 +126,7 @@ own. Its program (the kernel's chips, their log sizes
 and the preprocessed root) is one this node computes from a release of
 the installed kernel (the kernel, its reference program and its
 headroom) by a run on the arguments the reference returns
-(`vos_pvm_device::Program::of`), in the proof's format, never
+(`vos_pvm_device::Program::from_kernel`), in the proof's format, never
 one a request names, and kept as its verifier alone (the program, its
 masked format and its id), by release and format. The
 leader computes every device kernel's at the install, which fails for a

@@ -6,18 +6,20 @@
 //!   and its programs, transpiled from its ELF. The agent program is the
 //!   default agent, linked. A package of another [`TRANSPILER`] is refused
 //!   at its install.
-//! - A [`Device`] is a device kernel's program as a space computes it from
-//!   the same ELF: the kernel, its chips and log sizes, and the program's
-//!   id. The app ships the stock kernels' (and any kernel it puts a secret
-//!   into), the current release's and the previous one's, and proves with
-//!   the newest a space's window admits ([`crate::choose`]): the app and
-//!   the space take one release artifact, the ELF, by its hash.
+//! - A [`Release`] is a device kernel's program as a space computes it
+//!   from the same ELF: the kernel, its chips and log sizes, and the
+//!   program's id (`vos_pvm_device::Release`). The app ships the stock
+//!   kernels' (and any kernel it puts a secret into), in the device format,
+//!   and proves with the newest a space's window admits
+//!   ([`crate::choose`]): the app and the space take one release artifact,
+//!   the ELF, by its hash.
 //!
 //! The `release` feature builds them from ELFs (`package`, `agent`,
 //! `devices`): the release build's edge to the transpiler, which the app's
 //! build never enables.
 
 use vos_pvm::pool::CodeHash;
+#[cfg(feature = "release")]
 use vos_wire::ids::MethodId;
 use vos_wire::records::Derivation;
 use vos_wire::{Decode, Encode};
@@ -27,23 +29,11 @@ use vos_wire::{Decode, Encode};
 /// release build checks.
 pub const TRANSPILER: u32 = 1;
 
-/// A device kernel's release artifact: method `method`'s kernel of the
-/// package whose ELF hash (`vos_pvm_compiler::Derived::elf`) is `elf`,
-/// and its device program as every node computes it from that package
-/// (`vos_pvm_device::Program::of`):
-/// its chips, its log sizes, its format and its id. The light node
-/// commits the program's preprocessed tree from these at its first proof
-/// ([`crate::DeviceProgram::released`]) and checks the id it gets.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct Device {
-    pub elf: [u8; 32],
-    pub method: MethodId,
-    pub kernel: Vec<u8>,
-    pub format: u32,
-    pub chips: u32,
-    pub log_sizes: Vec<u32>,
-    pub id: [u8; 32],
-}
+/// A device kernel's release artifact, its ELF hash that of
+/// `vos_pvm_compiler::Derived::elf`: the light node commits the program's
+/// preprocessed tree from it at its first proof
+/// ([`crate::DeviceProgram::from_release`]) and checks the id it gets.
+pub use vos_pvm_device::Release;
 
 /// A local actor's release artifact: its derivation, its programs (the
 /// actor's, then each kernel's, then each reference's, in the
@@ -102,7 +92,7 @@ pub fn agent(elf: &[u8]) -> Result<Vec<u8>, String> {
 /// a node's install computes it, from its reference run, in the device
 /// format.
 #[cfg(feature = "release")]
-pub fn devices(elf: &[u8]) -> Result<Vec<Device>, String> {
+pub fn devices(elf: &[u8]) -> Result<Vec<Release>, String> {
     devices_in(vos_pvm_device::FORMAT.number, elf)
 }
 
@@ -110,8 +100,8 @@ pub fn devices(elf: &[u8]) -> Result<Vec<Device>, String> {
 /// proves (`vos_pvm_device::FORMATS`): an app's artifacts for a
 /// space that admits only that format.
 #[cfg(feature = "release")]
-pub fn devices_in(format: u32, elf: &[u8]) -> Result<Vec<Device>, String> {
-    let format = vos_pvm_device::format(format)
+pub fn devices_in(format: u32, elf: &[u8]) -> Result<Vec<Release>, String> {
+    vos_pvm_device::format(format)
         .ok_or_else(|| format!("no device format {format} in this build"))?;
     let derived = vos_pvm_compiler::derive(elf).map_err(|error| error.to_string())?;
     let derivation = derived.derivation();
@@ -125,15 +115,20 @@ pub fn devices_in(format: u32, elf: &[u8]) -> Result<Vec<Device>, String> {
                 .find(|(bound, _)| bound == method)
                 .map(|(_, kernel)| kernel.clone())
                 .ok_or_else(|| format!("device kernel {method:#010x} has no kernel"))?;
-            let program = vos_pvm_device::Program::of(format, &kernel, reference, *headroom)
-                .map_err(|error| format!("device kernel {method:#010x}: {error}"))?;
-            Ok(Device {
+            let program = vos_pvm_device::Program::from_kernel(
+                format,
+                &kernel,
+                vos_pvm_device::ReferenceProgram(reference),
+                *headroom,
+            )
+            .map_err(|error| format!("device kernel {method:#010x}: {error}"))?;
+            Ok(Release {
                 elf: derivation.elf,
                 method: MethodId(*method),
-                format: format.number,
+                format,
                 chips: program.chips(),
                 log_sizes: program.log_sizes().to_vec(),
-                id: *program.id(),
+                id: program.id().0,
                 kernel,
             })
         })
@@ -143,7 +138,7 @@ pub fn devices_in(format: u32, elf: &[u8]) -> Result<Vec<Device>, String> {
 /// The release artifact of device kernel `method`, by name, of the package
 /// whose ELF is `elf` ([`devices`]).
 #[cfg(feature = "release")]
-pub fn device(elf: &[u8], method: &str) -> Result<Device, String> {
+pub fn device(elf: &[u8], method: &str) -> Result<Release, String> {
     let id = MethodId(crate::method_id(method));
     devices(elf)?
         .into_iter()

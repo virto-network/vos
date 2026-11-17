@@ -212,11 +212,11 @@ devices decrypt each other's messages".
 - **Release artifacts** (`vos_light::release`, built behind its `release`
   feature on the host that builds the app): the local actors' packages,
   the agent program, and the device kernels' programs
-  (`release::Device`: the kernel, its chips, its log sizes, its id, and
+  (`release::Release`, `vos_pvm_device::Release`: the kernel, its chips, its log sizes, its id, and
   the hash of the ELF it came from, as an install record names it, its
   temporary symbols' names left out). The device library commits a
   program's preprocessed tree from its artifact
-  (`DeviceProgram::released`), checking the id; it never runs a reference
+  (`DeviceProgram::from_release`), checking the id; it never runs a reference
   or the transpiler, and installs no package another transpiler derived
   (`release::TRANSPILER`).
 
@@ -2508,7 +2508,7 @@ format, the chips, the sizes and the root.
   headroom), refusing a device kernel without one. A device kernel's
   **release** is the three (`DeviceRelease`: kernel, reference,
   headroom). The install computes every device kernel's program from its
-  release (`vos_pvm_device::Program::of`: the reference run, then
+  release (`vos_pvm_device::Program::from_kernel`: the reference run, then
   the kernel's run on its output), refusing the install when either fails;
   a replica that did not install computes it from the stored blobs at the
   first proof or window read naming it, once a release.
@@ -2528,12 +2528,12 @@ format, the chips, the sizes and the root.
   8.24b]: the release build computes each device kernel's program
   from the package's ELF as a node's install does
   (`vos_light::release::devices`), the stock kernels' among them, and the
-  app embeds the artifacts (`release::Device`: the kernel, its chips and
+  app embeds the artifacts (`release::Release`, `vos_pvm_device::Release`: the kernel, its chips and
   log sizes, its id, the ELF's hash) beside the local actors' packages
   (the phone bench's `kernel` command takes one, `tools/phone`). The phone
   runs no transpiler and no reference run: it commits a program's
   preprocessed tree from its artifact and checks the id
-  (`DeviceProgram::released`). "Reproducible" reduces to the app and the
+  (`DeviceProgram::from_release`). "Reproducible" reduces to the app and the
   space taking the same release artifact, the ELF, by its hash: the
   space's window names the ids the app's artifacts name (the window
   test checks it; the guest blobs are path-independent, `blobs.lock`).

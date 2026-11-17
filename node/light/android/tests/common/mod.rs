@@ -310,8 +310,8 @@ pub fn credentialed(request: &[u8]) -> (AgentId, Credentialed) {
 
 /// The program of the release artifact `artifact`.
 pub fn program(artifact: &[u8]) -> vos_light::DeviceProgram {
-    let device = vos_light::release::Device::decode_exact(artifact).expect("a release artifact");
-    vos_light::DeviceProgram::released(&device).expect("its program")
+    let device = vos_light::release::Release::decode_exact(artifact).expect("a release artifact");
+    vos_light::DeviceProgram::from_release(&device).expect("its program")
 }
 
 /// The request's proof checked as ingress's stateless checks do, under the

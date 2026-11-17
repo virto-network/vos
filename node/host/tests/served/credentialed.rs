@@ -24,7 +24,7 @@ use ed25519_dalek::SigningKey;
 use vos_checker::Nodes;
 use vos_checker::calls::installed;
 use vos_checker::programs::{actor, actor_elf, method, program_elf};
-use vos_light::release::Device;
+use vos_light::release::Release;
 use vos_light::{AuthWitness, Call, DEVICE_FORMAT, DeviceProgram, Prover, ProverConfig, Threads};
 use vos_net::Class;
 use vos_node::client::{self, Client};
@@ -77,7 +77,7 @@ impl Secret {
 
 /// The stock kernel `kernel`'s release artifact, from the credential
 /// actor's ELF `elf`, as an app embeds it.
-fn stock(elf: &[u8], kernel: &str) -> Device {
+fn stock(elf: &[u8], kernel: &str) -> Release {
     vos_light::release::device(elf, kernel).expect("a stock kernel's release artifact")
 }
 
@@ -140,7 +140,8 @@ impl Founded {
         let operator = Client::new(cluster.target(leader), key).with_routes(cluster.routes());
         let space = cluster.space.id();
         assert_ne!(space, SpaceId::NONE);
-        let program = |kernel| DeviceProgram::released(&stock(&credentials_elf, kernel)).unwrap();
+        let program =
+            |kernel| DeviceProgram::from_release(&stock(&credentials_elf, kernel)).unwrap();
         let founded = Self {
             cluster,
             agent,
@@ -343,7 +344,7 @@ impl Founded {
             agent: self.agent,
             instance: call.instance,
             method: call.method,
-            program: self.auth.id(),
+            program: &self.auth.id().0,
             arguments: &call.arguments,
             nonce: &call.nonce,
             expires_ms: call.expires_ms,
@@ -1308,7 +1309,7 @@ fn an_actor_kernels_proof_is_checked_by_its_handler_at_apply() {
         path.expect("an enrolled member's path")
     };
     let one = vos_light::release::device(&elf("device"), "auth").unwrap();
-    let program = DeviceProgram::released(&one).unwrap();
+    let program = DeviceProgram::from_release(&one).unwrap();
     let call = |method: MethodId, instance: InstanceId, at: NodeNumber| {
         founded.call_of(at, instance, method, ())
     };
@@ -1325,7 +1326,7 @@ fn an_actor_kernels_proof_is_checked_by_its_handler_at_apply() {
     // The kernel's proof of the member for `call`, its claim under
     // `program` in the scope `name` gives.
     let prove = |call: &Call, program: &DeviceProgram, name: &str| {
-        let binding = call.binding(program.id()).to_bytes();
+        let binding = call.binding(&program.id().0).to_bytes();
         let (scope, nullifier) = nullifier(name);
         let claim = device_claim(&path.root, &scope, &nullifier, &binding);
         let siblings = path
@@ -1372,7 +1373,7 @@ fn an_actor_kernels_proof_is_checked_by_its_handler_at_apply() {
     let proof = prove(&signin, &program, "login");
     assert_eq!(
         signed_in(send(at, &signin, &proof)),
-        (nullifier("login").1, *program.id()),
+        (nullifier("login").1, program.id().0),
         "the claim's nullifier, the caller the kernel's program"
     );
     assert_eq!(
@@ -1446,7 +1447,7 @@ fn an_actor_kernels_proof_is_checked_by_its_handler_at_apply() {
     vos_checker::spaces::wait_in_process("the upgrade applied", || {
         window(&founded, at, DEVICE).kernels[0].programs.len() == 2
     });
-    let next = DeviceProgram::released(&two).unwrap();
+    let next = DeviceProgram::from_release(&two).unwrap();
     let first = call(login, DEVICE, at);
     assert_eq!(
         signed_in(send(at, &first, &prove(&first, &program, "late"))),
@@ -1511,9 +1512,9 @@ fn an_app_one_release_behind_signs_in_until_its_window_closes() {
         .map(|secret| witness(&founded.path(secret)));
     // The app's sign-in: the newest program it ships that the space's
     // window admits, chosen before anything is proved.
-    let sign_in_as = |member: usize, app: &[Device]| {
+    let sign_in_as = |member: usize, app: &[Release]| {
         let chosen = vos_light::choose(app, &window(&founded, at, CREDENTIALS), auth)?;
-        let program = DeviceProgram::released(chosen).unwrap();
+        let program = DeviceProgram::from_release(chosen).unwrap();
         let call = founded.call(at, POLL, "vote", 3u8);
         let proof = founded
             .prover
@@ -1528,7 +1529,7 @@ fn an_app_one_release_behind_signs_in_until_its_window_closes() {
         vos_light::verify(&proof, &call, &program, Some(b"vote")).unwrap();
         Ok::<_, DeviceError>((chosen.id, call, proof))
     };
-    let sign_in = |app: &[Device]| sign_in_as(0, app);
+    let sign_in = |app: &[Release]| sign_in_as(0, app);
     let send = |call: &Call, proof: &Proven| {
         wire::credentialed_answer(&device_send(&founded, at, &wire::credentialed(call, proof)))
             .unwrap()
@@ -1677,7 +1678,7 @@ fn an_app_one_release_behind_signs_in_until_its_window_closes() {
     );
     assert!(matches!(sign_in(&two_only), Err(DeviceError::Window)));
     let login = |member: usize| {
-        let program = DeviceProgram::released(&one).unwrap();
+        let program = DeviceProgram::from_release(&one).unwrap();
         let call = founded.call(at, POLL, "login", ());
         let proof = founded
             .prover
@@ -1783,9 +1784,9 @@ fn the_previous_device_format_is_admitted_until_it_is_retired() {
             .collect()
     };
     // The member's sign-in with the program its app chooses at `at`.
-    let sign_in = |member: usize, app: &[Device]| {
+    let sign_in = |member: usize, app: &[Release]| {
         let chosen = vos_light::choose(app, &window(&founded, at, CREDENTIALS), auth)?;
-        let program = DeviceProgram::released(chosen).unwrap();
+        let program = DeviceProgram::from_release(chosen).unwrap();
         let call = founded.call(at, POLL, "login", ());
         let proof = founded
             .prover
@@ -1833,7 +1834,7 @@ fn the_previous_device_format_is_admitted_until_it_is_retired() {
     assert_eq!(formats(&window_47), [DEVICE_FORMAT]);
     assert_eq!(programs(&window_47), [(current.id, DEVICE_FORMAT)]);
     assert!(matches!(sign_in(0, &only_other), Err(DeviceError::Window)));
-    let other_program = DeviceProgram::released(&other).unwrap();
+    let other_program = DeviceProgram::from_release(&other).unwrap();
     let call = founded.call(at, POLL, "login", ());
     let refused = founded
         .prover
@@ -1958,7 +1959,7 @@ fn a_format_the_release_does_not_admit_is_refused_at_apply() {
             &witness(&path),
             b"login",
             &call,
-            &DeviceProgram::released(&other).unwrap(),
+            &DeviceProgram::from_release(&other).unwrap(),
         )
         .unwrap();
     assert_eq!(proof.format, previous);

@@ -10,7 +10,7 @@
 //! [--rounds N] [--wait S] [--prove]`:
 //! - writes `DIR/auth.device`, the kernel's release artifact (the kernel
 //!   and its device program as the install computes it, the device
-//!   library's `release::Device`), then for round `n`
+//!   library's `release::Release`), then for round `n`
 //!   `DIR/n.input`, the kernel's witness input (the member's path and its
 //!   slot, its secret, and auth's claim for this round's call, good for
 //!   110 s by the node's clock);
@@ -269,7 +269,7 @@ fn main() {
     let elf = std::fs::read(program_elf("vos-credentials")).expect("the credential actor");
     let device =
         vos_light::release::device(&elf, "auth").expect("the stock kernel's release artifact");
-    let program = DeviceProgram::released(&device).expect("the kernel's program");
+    let program = DeviceProgram::from_release(&device).expect("the kernel's program");
     let served = start();
     std::fs::write(
         options.dir.join("auth.device"),
@@ -285,7 +285,7 @@ fn main() {
     });
     let mut accepted = 0;
     for round in 1..=options.rounds {
-        let (mut call, input) = served.round(round, program.id());
+        let (mut call, input) = served.round(round, &program.id().0);
         let input_path = options.dir.join(format!("{round}.input"));
         let proof_path = options.dir.join(format!("{round}.proof"));
         let _ = std::fs::remove_file(&proof_path);

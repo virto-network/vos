@@ -141,7 +141,7 @@ impl Founded {
             agent,
             space,
             caller: Mutex::new(caller),
-            auth: DeviceProgram::released(&device).unwrap(),
+            auth: DeviceProgram::from_release(&device).unwrap(),
         };
         founded
             .write::<(), CredentialError>(CREDENTIALS, "found", handle)
