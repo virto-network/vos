@@ -54,6 +54,7 @@ mod android;
 pub mod chrome;
 pub mod enrollment;
 pub mod job;
+pub mod kept;
 pub mod net;
 pub mod node;
 pub mod personal;

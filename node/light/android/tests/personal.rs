@@ -983,6 +983,70 @@ fn a_personal_space_this_build_does_not_read_is_kept_and_sign_in_runs() {
     }
 }
 
+/// The facility's database of a layout this build does not read is
+/// refused and left as it is: its enrollments are not read (so no sign-in
+/// runs on what it holds), and the personal space, apart from it, still
+/// answers.
+#[test]
+fn a_facility_database_this_build_does_not_read_is_refused_and_kept() {
+    let world = world();
+    let home = world.home(HOME, 2, 1);
+    let phone = phone(&world, 0xe2);
+    world.enroll(AGENT, &phone.enroll());
+    phone.claim(&world, home, KitKind::Phrase, "phone");
+    let Held {
+        node,
+        hand,
+        tag,
+        _directory,
+    } = phone;
+    drop(node);
+    let layout = |directory: &std::path::Path| {
+        let db = fjall::Database::builder(directory.join(vos_facility::kept::DIRECTORY))
+            .open()
+            .unwrap();
+        let rows = db
+            .keyspace("rows", fjall::KeyspaceCreateOptions::default)
+            .unwrap();
+        rows.insert(b"layout", 99u32.to_be_bytes()).unwrap();
+        db.persist(fjall::PersistMode::SyncAll).unwrap();
+        rows.get(b"layout").unwrap().map(|value| value.to_vec())
+    };
+    assert_eq!(
+        layout(_directory.path()),
+        Some(99u32.to_be_bytes().to_vec())
+    );
+    let phone = Held {
+        node: node_as(&world, _directory.path(), tag, &hand),
+        hand,
+        tag,
+        _directory,
+    };
+    let refused = phone.node.enrollments().unwrap_err();
+    assert_eq!(refused.code, Code::Store, "{refused:?}");
+    let devices = phone
+        .node
+        .personal()
+        .and_then(|personal| personal.devices())
+        .unwrap();
+    assert_eq!(devices.len(), 1);
+    let Held {
+        node, _directory, ..
+    } = phone;
+    drop(node);
+    let db = fjall::Database::builder(_directory.path().join(vos_facility::kept::DIRECTORY))
+        .open()
+        .unwrap();
+    let rows = db
+        .keyspace("rows", fjall::KeyspaceCreateOptions::default)
+        .unwrap();
+    assert_eq!(
+        rows.get(b"layout").unwrap().map(|value| value.to_vec()),
+        Some(99u32.to_be_bytes().to_vec()),
+        "the database kept"
+    );
+}
+
 /// A restore an `alive` cancelled: the kit entered again opens a new
 /// restore, which matures, rather than resuming the cancelled one.
 #[test]

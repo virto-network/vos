@@ -412,23 +412,14 @@ fn nothing_the_facility_shows_or_keeps_carries_a_secret() {
     // Another origin's enrollment, unreadable: its member digest, its file
     // and the directory stay on the device.
     let other_member = hex::encode([0x77; 32]);
-    let kept = std::fs::read_dir(&store)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "toml")
-        })
-        .unwrap();
-    let text = std::fs::read_to_string(&kept).unwrap();
-    let corrupt = text.replace(&hex::encode(member), &other_member).replacen(
-        &format!("member = \"{other_member}\""),
-        &format!("member = \"{other_member}"),
-        1,
-    );
-    assert_ne!(corrupt, text);
-    let other = store.join(format!("{}.toml", "0".repeat(32)));
-    std::fs::write(&other, corrupt).unwrap();
+    let kept = vos_facility::kept::Kept::open(&store).unwrap();
+    let (_, row) = kept.raw(b"enrollment/").unwrap().remove(0);
+    let member_at = row.windows(32).position(|window| window == member).unwrap();
+    let mut corrupt = row.clone();
+    corrupt[member_at..member_at + 32].copy_from_slice(&[0x77; 32]);
+    corrupt.pop();
+    let other = [b"enrollment/".as_slice(), &[0; 16]].concat();
+    kept.write(&other, Some(corrupt)).unwrap();
     shown.will_confirm(&[]);
     let unreadable = node
         .enroll(session, Enroll::read(&enrollment()).unwrap(), prompts())
@@ -438,7 +429,7 @@ fn nothing_the_facility_shows_or_keeps_carries_a_secret() {
     for (what, pattern) in [
         ("another origin's member digest", other_member.as_str()),
         ("the enrollments' directory", store_text),
-        ("another origin's file", "0000000000000000"),
+        ("another origin's row", "00000000000000000000000000000000"),
     ] {
         assert!(
             !contains(&unreadable, pattern.as_bytes()),
@@ -446,7 +437,8 @@ fn nothing_the_facility_shows_or_keeps_carries_a_secret() {
         );
     }
     answers.push(("an unreadable enrollment's error", unreadable));
-    std::fs::remove_file(&other).unwrap();
+    kept.write(&other, None).unwrap();
+    drop(kept);
 
     node.close(session);
     drop(node);
@@ -489,11 +481,27 @@ fn nothing_the_facility_shows_or_keeps_carries_a_secret() {
     for form in forms.iter() {
         forbidden.check("a chrome form", form.as_bytes(), true);
     }
-    for entry in std::fs::read_dir(&store).unwrap() {
+    let top = std::fs::read_dir(&store)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_file());
+    let database = files_under(&store.join(vos_facility::kept::DIRECTORY));
+    for path in top.chain(database) {
+        let kept = std::fs::read(&path).unwrap();
+        forbidden.check("a file of the store or its database", &kept, true);
+    }
+}
+
+/// Every file under `directory`, its subdirectories' with them.
+fn files_under(directory: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(directory).unwrap() {
         let path = entry.unwrap().path();
-        if path.is_file() {
-            let kept = std::fs::read(&path).unwrap();
-            forbidden.check("a file of the store", &kept, true);
+        if path.is_dir() {
+            files.extend(files_under(&path));
+        } else {
+            files.push(path);
         }
     }
+    files
 }

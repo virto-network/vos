@@ -293,13 +293,10 @@ async fn nothing_is_proved_before_enrollment_or_for_an_unknown_operation() {
         .await
         .unwrap_err();
     assert_eq!(error.code, Code::Declined);
-    assert!(
-        std::fs::read_dir(directory.path()).map_or(true, |entries| entries.flatten().all(
-            |entry| entry
-                .path()
-                .extension()
-                .is_none_or(|extension| extension != "toml")
-        ))
+    assert_eq!(
+        Store::new(directory.path()).all().unwrap(),
+        Vec::new(),
+        "nothing enrolled"
     );
 }
 

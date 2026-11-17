@@ -74,19 +74,13 @@ fn signed_in(node: &Node, session: u64) {
     }
 }
 
-/// Every enrollment file of the store, and its bytes.
-fn files(directory: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
-    std::fs::read_dir(directory)
+/// Every enrollment row of the store, and its bytes.
+fn files(directory: &Path) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    vos_facility::kept::Kept::open(directory)
         .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "toml")
-        })
-        .map(|path| {
-            let bytes = std::fs::read(&path).unwrap();
-            (path, bytes)
-        })
+        .raw(b"enrollment/")
+        .unwrap()
+        .into_iter()
         .collect()
 }
 
@@ -137,7 +131,7 @@ fn killed_during(role: &str, test: &str, marker: &str, most: Duration) {
         enrolled.member
     };
     let kept = files(&store);
-    assert_eq!(kept.len(), 1, "one enrollment, one file");
+    assert_eq!(kept.len(), 1, "one enrollment, one row");
 
     for kill in 0..KILLS {
         let mut process = Command::new(std::env::current_exe().unwrap())

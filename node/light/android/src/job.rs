@@ -35,14 +35,14 @@
 //!   never a key behind a prompt; Android starts no job of the app before
 //!   that unlock.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use vos_abi::{Decode, Encode};
 use vos_light::group::Alarm;
 
-use crate::enrollment::{create_private, write_private};
+use crate::kept::Kept;
 use crate::{Code, Facility, JobRun, Notice, Pending, Refusal, Seen, Synced, refused};
 
 /// The runs kept.
@@ -55,8 +55,8 @@ pub const STANDS_MS: u64 = 7 * 24 * 3_600_000;
 /// The once-raised notices kept standing, the latest.
 const STANDING: usize = 16;
 
-/// The runs' file, beside the enrollments (which are `.toml`).
-const FILE: &str = "job.state";
+/// The runs' row of the facility's database ([`crate::kept`]).
+const RUNS_ROW: &[u8] = b"runs";
 
 /// The device's personal space, as a pass syncs it.
 pub trait Personal: Send + Sync {
@@ -91,18 +91,124 @@ pub struct Passed {
 }
 
 /// A notice raised, and the device's time it was first raised at.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 struct Raised {
     notice: Notice,
     since: u64,
 }
 
-/// What the runs' file holds: the runs, the latest last, and the notices
-/// standing.
-#[derive(Debug, Default, Serialize, Deserialize)]
+/// The runs, the latest last, and the notices standing.
+#[derive(Debug, Default)]
 struct State {
     runs: Vec<JobRun>,
     raised: Vec<Raised>,
+}
+
+/// A run as its row keeps it.
+#[derive(Encode, Decode)]
+struct Run {
+    started_ms: u64,
+    finished_ms: u64,
+    bytes_down: u64,
+    bytes_up: u64,
+    synced: u32,
+    failed: u32,
+    notices: u32,
+    apart: bool,
+}
+
+/// A notice standing as its row keeps it: its kind's byte.
+#[derive(Encode, Decode)]
+struct Stood {
+    pending: u8,
+    index: u64,
+    at: u64,
+    matures: u64,
+    fresh: bool,
+    detail: String,
+    since: u64,
+}
+
+/// The runs' row.
+#[derive(Encode, Decode)]
+struct Row {
+    runs: Vec<Run>,
+    raised: Vec<Stood>,
+}
+
+impl From<&State> for Row {
+    fn from(state: &State) -> Self {
+        Row {
+            runs: state
+                .runs
+                .iter()
+                .map(|run| Run {
+                    started_ms: run.started_ms,
+                    finished_ms: run.finished_ms,
+                    bytes_down: run.bytes_down,
+                    bytes_up: run.bytes_up,
+                    synced: run.synced,
+                    failed: run.failed,
+                    notices: run.notices,
+                    apart: run.apart,
+                })
+                .collect(),
+            raised: state
+                .raised
+                .iter()
+                .map(|raised| Stood {
+                    pending: raised.notice.pending as u8,
+                    index: raised.notice.index,
+                    at: raised.notice.at,
+                    matures: raised.notice.matures,
+                    fresh: raised.notice.fresh,
+                    detail: raised.notice.detail.clone(),
+                    since: raised.since,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl Row {
+    /// The state it keeps; a notice of a kind this build does not know is
+    /// a row in need of repair.
+    fn state(self) -> Result<State, String> {
+        let raised = self
+            .raised
+            .into_iter()
+            .map(|stood| {
+                let pending = Pending::from_byte(stood.pending)
+                    .ok_or("the facility's database needs repair: a notice's kind is not known")?;
+                Ok(Raised {
+                    notice: Notice {
+                        pending,
+                        index: stood.index,
+                        at: stood.at,
+                        matures: stood.matures,
+                        fresh: stood.fresh,
+                        detail: stood.detail,
+                    },
+                    since: stood.since,
+                })
+            })
+            .collect::<Result<_, String>>()?;
+        let runs = self
+            .runs
+            .into_iter()
+            .map(|run| JobRun {
+                started_ms: run.started_ms,
+                finished_ms: run.finished_ms,
+                bytes_down: run.bytes_down,
+                bytes_up: run.bytes_up,
+                synced: run.synced,
+                failed: run.failed,
+                notices: run.notices,
+                apart: run.apart,
+            })
+            .collect();
+        Ok(State { runs, raised })
+    }
 }
 
 /// Whether a pass raises `notice` once rather than while its condition
@@ -111,47 +217,38 @@ fn once(notice: &Notice) -> bool {
     matches!(notice.pending, Pending::Restoring | Pending::Alarm)
 }
 
-/// The job's runs, kept under the facility's directory.
+/// The job's runs, a row of the facility's database under its directory.
 pub struct Runs {
-    directory: PathBuf,
+    kept: Result<Kept, String>,
 }
 
 impl Runs {
     pub fn new(directory: impl Into<PathBuf>) -> Self {
         Self {
-            directory: directory.into(),
+            kept: Kept::open(&directory.into()),
         }
     }
 
-    fn path(&self) -> PathBuf {
-        self.directory.join(FILE)
+    fn kept(&self) -> Result<&Kept, String> {
+        self.kept.as_ref().map_err(Clone::clone)
     }
 
-    /// The state kept; a file that does not parse (another layout's) is
-    /// started anew rather than stopping every run after it.
+    /// The state kept, read strictly.
     fn read(&self) -> Result<State, String> {
-        let path = self.path();
-        match std::fs::read_to_string(&path) {
-            Ok(text) => Ok(toml::from_str(&text).unwrap_or_default()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(State::default()),
-            Err(error) => Err(failure(&path, error)),
+        match self.kept()?.get::<Row>(RUNS_ROW)? {
+            Some(row) => row.state(),
+            None => Ok(State::default()),
         }
     }
 
     fn write(&self, state: &State) -> Result<(), String> {
-        let text = toml::to_string(state).map_err(|error| error.to_string())?;
-        create_private(&self.directory)?;
-        write_private(&self.path(), text.as_bytes())
+        self.kept()?.put(RUNS_ROW, &Row::from(state))
     }
 
     /// The runs kept, the latest last.
     pub fn all(&self) -> Result<Vec<JobRun>, String> {
         Ok(self.read()?.runs)
     }
-}
-
-fn failure(path: &Path, error: impl std::fmt::Display) -> String {
-    format!("{}: {error}", path.display())
 }
 
 fn job_error(_: String) -> Refusal {
