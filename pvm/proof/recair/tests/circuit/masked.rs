@@ -317,21 +317,28 @@ fn leaves_and_folds_never_reference_the_masking() {
         .flat_map(|dir| sources(&root.join(dir)))
         .collect();
     assert!(found.len() > 3);
-    let needles = [["mask", "ed::"].concat(), blinding()];
+    let needles = [
+        ["mask", "ed::"].concat(),
+        ["mask", "ing::"].concat(),
+        blinding(),
+    ];
     assert_eq!(naming(found, &needles), Vec::<PathBuf>::new());
 }
 
 /// The blinding relation is the masked evaluation's alone: no module of the
-/// recursion AIR but `masked`'s (`masked/`) names it.
+/// recursion AIR but the masking's (`masking/`) and the masked wrap's set
+/// (`wrap.rs`) names it.
 #[test]
-fn only_the_masked_module_names_the_blinding_relation() {
+fn only_the_masking_names_the_blinding_relation() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../recair-air/src");
-    let masked = root.join("masked");
+    let masking = root.join("masking");
+    let wrap = root.join("wrap.rs");
     let found = sources(&root);
-    assert!(found.iter().any(|path| path.ends_with("masked/mod.rs")));
+    assert!(found.iter().any(|path| path.ends_with("masking/mod.rs")));
+    assert!(found.contains(&wrap));
     let others: Vec<PathBuf> = found
         .into_iter()
-        .filter(|path| !path.starts_with(&masked))
+        .filter(|path| !path.starts_with(&masking) && *path != wrap)
         .collect();
     assert!(others.len() >= 5);
     assert_eq!(naming(others, &[blinding()]), Vec::<PathBuf>::new());
