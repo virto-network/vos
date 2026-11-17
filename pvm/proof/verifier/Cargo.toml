@@ -17,4 +17,4 @@ num-traits = { version = "0.2", default-features = false }
 vos-pvm = { workspace = true }
 vos-pvm-proof = { path = ".." } # tests use the prover too
 bincode = "1"          # on-wire proof serialization (size measurement)
-postcard = { version = "1", features = ["alloc"] } # the settlement verifier's wire format
+postcard = { version = "1", features = ["alloc"] } # the segment proofs' wire format

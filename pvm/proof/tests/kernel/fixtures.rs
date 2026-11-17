@@ -45,7 +45,7 @@ use vos_pvm_proof_verifier::{verify_kernel_segment, verify_standalone};
 const FORMATS: [(&Format, u32); 1] = [(&SEGMENT, MASKED_WRAP.number)];
 
 /// Set to `write` to write the fixtures instead of comparing them.
-const MODE: &str = "VOS_FIXTURES";
+const MODE: &str = "VOS_PINS";
 
 /// Bytes made from a proof's: `removed` bytes at `offset` replaced by
 /// `inserted`.

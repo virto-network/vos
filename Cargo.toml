@@ -136,14 +136,11 @@ readme = "README.md"
 
 # Dev and test builds keep line tables alone (a backtrace names its file
 # and line), and dependencies no debug info: full debug info made a
-# worktree's `target/` tens of GB and its links slow.
+# worktree's `target/` tens of GB and its links slow. The test profile
+# inherits dev's, its package overrides among them, so each is set once.
 [profile.dev]
 debug = "line-tables-only"
 [profile.dev.package."*"]
-debug = false
-[profile.test]
-debug = "line-tables-only"
-[profile.test.package."*"]
 debug = false
 
 [profile.release]
@@ -155,99 +152,57 @@ codegen-units = 1
 # node runs it.
 [profile.dev.package.fjall]
 debug-assertions = false
-[profile.test.package.fjall]
-debug-assertions = false
 
 [profile.dev.package.vos-pvm]
-opt-level = 3
-[profile.test.package.vos-pvm]
 opt-level = 3
 # Linking an agent's program takes seconds unoptimized: a node process
 # a test restarts starts in time only with it optimized.
 [profile.dev.package.vos-pvm-compiler]
-opt-level = 3
-[profile.test.package.vos-pvm-compiler]
 opt-level = 3
 
 # The final wrap hashes with Blake2b-256 (RustCrypto's `blake2`): its
 # Merkle trees and its PoW grind.
 [profile.dev.package.blake2]
 opt-level = 3
-[profile.test.package.blake2]
-opt-level = 3
 [profile.dev.package.stwo]
-opt-level = 3
-[profile.test.package.stwo]
 opt-level = 3
 [profile.dev.package.stwo-constraint-framework]
 opt-level = 3
-[profile.test.package.stwo-constraint-framework]
-opt-level = 3
 [profile.dev.package.vos-pvm-proof]
 opt-level = 3
-[profile.test.package.vos-pvm-proof]
-opt-level = 3
 [profile.dev.package.vos-pvm-proof-verifier]
-opt-level = 3
-[profile.test.package.vos-pvm-proof-verifier]
 opt-level = 3
 # The window kernel's test builds a tree of a million rows, hashing in
 # software.
 [profile.dev.package.vos-tree]
 opt-level = 3
-[profile.test.package.vos-tree]
-opt-level = 3
 [profile.dev.package.vos-pvm-precompiles]
 opt-level = 3
-[profile.test.package.vos-pvm-precompiles]
-opt-level = 3
 [profile.dev.package.vos-pvm-poseidon2]
-opt-level = 3
-[profile.test.package.vos-pvm-poseidon2]
 opt-level = 3
 # The recursion AIR's prover: its tests prove.
 [profile.dev.package.vos-pvm-recair-air]
 opt-level = 3
-[profile.test.package.vos-pvm-recair-air]
-opt-level = 3
 [profile.dev.package.vos-pvm-final-verifier]
-opt-level = 3
-[profile.test.package.vos-pvm-final-verifier]
 opt-level = 3
 [profile.dev.package.vos-statement]
 opt-level = 3
-[profile.test.package.vos-statement]
-opt-level = 3
 [profile.dev.package.vos-pvm-recair]
 opt-level = 3
-[profile.test.package.vos-pvm-recair]
-opt-level = 3
 [profile.dev.package.vos-pvm-device]
-opt-level = 3
-[profile.test.package.vos-pvm-device]
 opt-level = 3
 # The masked wrap's randomness: ChaCha20 streams for every mask and salt.
 [profile.dev.package.rand_chacha]
 opt-level = 3
-[profile.test.package.rand_chacha]
-opt-level = 3
 [profile.dev.package.ppv-lite86]
-opt-level = 3
-[profile.test.package.ppv-lite86]
 opt-level = 3
 # Ed25519 signing and strict verification: merkle-crdt's suites sign and
 # check every node of thousands of generated DAGs.
 [profile.dev.package.curve25519-dalek]
 opt-level = 3
-[profile.test.package.curve25519-dalek]
-opt-level = 3
 [profile.dev.package.ed25519-dalek]
 opt-level = 3
-[profile.test.package.ed25519-dalek]
-opt-level = 3
 [profile.dev.package.sha2]
-opt-level = 3
-[profile.test.package.sha2]
 opt-level = 3
 
 [workspace.dependencies]
@@ -278,8 +233,6 @@ vos-statement-service = { path = "pvm/proof/statement/service" }
 vos-pvm = { path = "pvm/runtime" }
 vos-pvm-compiler = { path = "pvm/compiler" }
 vos-pvm-program = { path = "pvm/program" }
-vos-pvm-codec = { path = "pvm/codec", default-features = false }
-vos-pvm-codec-derive = { path = "pvm/codec-derive" }
 vos-wire = { path = "agent/wire" }
 vos-abi = { path = "pvm/abi" }
 vos-tree = { path = "pvm/tree" }
@@ -315,8 +268,6 @@ cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", tag = "v0.3
 stwo = { git = "https://github.com/olanod/stwo", rev = "e14925a81606b4d68c6a5d3047d382a20bd953d3", default-features = false }
 stwo-constraint-framework = { git = "https://github.com/olanod/stwo", rev = "e14925a81606b4d68c6a5d3047d382a20bd953d3", default-features = false }
 
-num-traits = "0.2"
 serde = { version = "1", features = ["derive"] }
 rayon = "1.10"
 impl-trait-for-tuples = "0.2.2"
-subtle = { version = "2.6", default-features = false }

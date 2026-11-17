@@ -192,7 +192,7 @@ _at-fixed-path dir +args:
 # makes is removed. `test-proof` refuses fixtures the generator does not
 # make, byte for byte, and a directory holding any file but its.
 fixtures:
-    with-env { VOS_FIXTURES: "write" } { cargo test -p vos-pvm-proof --test kernel fixtures::the_fixtures_are_the_generators }
+    with-env { VOS_PINS: "write" } { cargo test -p vos-pvm-proof --test kernel fixtures::the_fixtures_are_the_generators }
 
 # The reproducibility gate on aarch64: `vos program-id`, built for aarch64
 # with the masked prover and run under qemu-user, recomputes each known
