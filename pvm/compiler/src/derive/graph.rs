@@ -113,35 +113,61 @@ impl<'a> Graph<'a> {
             .map(|&(_, to)| to)
     }
 
-    /// What a function's code names: the calls and PC-relative pairs in
-    /// it, and their symbols, its direct branches and jumps out of it, and
-    /// the call and address pairs no relocation names, which the scan
-    /// finds.
-    fn named_by_code(&self, (start, end): (u64, u64)) -> Vec<u64> {
+    /// What a function's code names that no function scanned before named
+    /// (`scanned`, the walk's): the calls and PC-relative pairs in it, and
+    /// their symbols, its direct branches and jumps out of it, and the call
+    /// and address pairs no relocation names, which the scan finds. Each
+    /// relocation, word and word pair is read once a walk, so functions
+    /// whose ranges overlap cost what their union holds; what they named
+    /// was reached already.
+    fn named_by_code(&self, (start, end): (u64, u64), scanned: &mut Scanned) -> Vec<u64> {
         let elf = self.elf;
-        let mut named: Vec<u64> = elf
-            .call_targets
-            .range(start..end)
-            .chain(elf.hi20_targets.range(start..end))
+        let parts = scanned.relocations.take(start, end);
+        let mut named: Vec<u64> = parts
+            .iter()
+            .flat_map(|&(from, to)| elf.call_targets.range(from..to))
+            .chain(
+                parts
+                    .iter()
+                    .flat_map(|&(from, to)| elf.hi20_targets.range(from..to)),
+            )
             .map(|(_, &to)| to)
-            .chain(Self::named_in(&self.symbols, start, end))
+            .chain(
+                parts
+                    .iter()
+                    .flat_map(|&(from, to)| Self::named_in(&self.symbols, from, to)),
+            )
             .collect();
         let Some(code) = self.code(start, end) else {
             return named;
         };
-        for (index, word) in riscv::words(code).enumerate() {
-            let address = start + index as u64 * 4;
+        // A word at `address` is read with the words at the same offset
+        // modulo four; a pair needs the next word in the range.
+        let words = code.len() as u64 / 4 * 4;
+        let phase = (start % 4) as usize;
+        let single = scanned.words[phase].take(start, start + words);
+        let paired = scanned.pairs[phase].take(start, start + words.saturating_sub(4));
+        let parts = merge_ranges(single.iter().chain(&paired).copied().collect());
+        for address in parts
+            .into_iter()
+            .flat_map(|(from, to)| (from..to).step_by(4))
+        {
+            let index = ((address - start) / 4) as usize;
+            let word = riscv::word_at(code, index * 4).expect("a whole word");
             let offset = match riscv::opcode(word) {
                 op::JAL => Some(i64::from(decode_j_imm(word))),
                 op::BRANCH => Some(i64::from(decode_b_imm(word))),
                 _ => None,
             };
-            if let Some(offset) = offset {
+            if let Some(offset) = offset
+                && in_ranges(&single, address)
+            {
                 named.push(address.wrapping_add_signed(offset));
             }
             // AUIPC then JALR or ADDI on its register: a call or an address
             // the scan finds.
             if riscv::opcode(word) == op::AUIPC
+                && in_ranges(&paired, address)
                 && let Some(next) = riscv::word_at(code, index * 4 + 4)
                 && riscv::rs1(next) == riscv::rd(word)
                 && riscv::funct3(next) == 0
@@ -245,6 +271,56 @@ fn blocks(elf: &LinkedElf, objects: &BTreeMap<u64, u64>) -> Vec<(u64, u64)> {
     blocks
 }
 
+/// Address ranges already read, sorted and disjoint, by start.
+#[derive(Default)]
+struct Ranges(BTreeMap<u64, u64>);
+
+impl Ranges {
+    /// The parts of `[start, end)` not read yet, in order; the whole range
+    /// is read after.
+    fn take(&mut self, start: u64, end: u64) -> Vec<(u64, u64)> {
+        if start >= end {
+            return Vec::new();
+        }
+        let (mut lo, mut hi, mut at) = (start, end, start);
+        if let Some((&from, &to)) = self.0.range(..start).next_back()
+            && to >= start
+        {
+            (lo, hi, at) = (from, hi.max(to), to.max(start));
+            self.0.remove(&from);
+        }
+        let mut parts = Vec::new();
+        let within: Vec<(u64, u64)> = self
+            .0
+            .range(start..=end)
+            .map(|(&from, &to)| (from, to))
+            .collect();
+        for (from, to) in within {
+            if from > at {
+                parts.push((at, from));
+            }
+            at = at.max(to);
+            hi = hi.max(to);
+            self.0.remove(&from);
+        }
+        if at < end {
+            parts.push((at, end));
+        }
+        self.0.insert(lo, hi);
+        parts
+    }
+}
+
+/// What a walk has read of the code: the ranges whose relocations it
+/// read, and by an address's offset modulo four the words whose branches
+/// and whose pairs it read.
+#[derive(Default)]
+pub(super) struct Scanned {
+    relocations: Ranges,
+    words: [Ranges; 4],
+    pairs: [Ranges; 4],
+}
+
 /// What a kernel's entry reaches: each function by its range, with the
 /// function it was reached from, and each data object by its range.
 pub(super) struct Reached {
@@ -263,6 +339,7 @@ impl Reached {
             Code((u64, u64)),
             Data((u64, u64)),
         }
+        let mut scanned = Scanned::default();
         let mut queue = VecDeque::new();
         if let Some(function) = graph.function(entry) {
             reached.functions.insert(function, None);
@@ -270,7 +347,9 @@ impl Reached {
         }
         while let Some(node) = queue.pop_front() {
             let (from, named) = match node {
-                Node::Code(function) => (Some(function), graph.named_by_code(function)),
+                Node::Code(function) => {
+                    (Some(function), graph.named_by_code(function, &mut scanned))
+                }
                 Node::Data(object) => (None, graph.named_by_data(object)),
             };
             for target in named {
