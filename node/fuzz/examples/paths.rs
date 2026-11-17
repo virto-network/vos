@@ -1,9 +1,11 @@
-//! Lists what each input of the checked-in corpus (`replay/<target>/`)
-//! reaches: the events the node API's reader gives it, or whether it
-//! decodes as its target's input, counted by verdict a target.
+//! Lists what each input of the checked-in corpus (`replay/<target>.tar`,
+//! unpacked into `target/replay/<target>/`) reaches: the events the node
+//! API's reader gives it, or whether it decodes as its target's input,
+//! counted by verdict a target.
 //!
 //! ```text
 //! cd node/fuzz
+//! python3 -I ../../pvm/proof/fuzz/corpus.py unpack replay target/replay
 //! cargo run --release --example paths
 //! ```
 
@@ -53,9 +55,9 @@ fn paths(target: &str, bytes: &[u8]) -> Vec<String> {
 }
 
 fn main() {
-    let replay = Path::new(env!("CARGO_MANIFEST_DIR")).join("replay");
+    let replay = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/replay");
     let mut targets: Vec<_> = std::fs::read_dir(&replay)
-        .expect("the replay corpus")
+        .expect("the replay corpus, unpacked: `python3 -I ../../pvm/proof/fuzz/corpus.py unpack replay target/replay`")
         .map(|entry| entry.expect("an entry").path())
         .collect();
     targets.sort();

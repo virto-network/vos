@@ -345,13 +345,15 @@ The channel's draws and `verify_pow_nonce` index nothing from the proof.
 
 ### The corpus
 
-`fuzz/replay/<target>/` holds each target's corpus, rebuilt by `just
-fuzz-refresh` (seeded from the goldens, fuzzed, merged to the inputs that
-add coverage) and pruned to what a verdict needs, a whole proof kept only
-where no smaller input reaches it; `just fuzz-replay` (in `just gate`)
-runs every input once, and `just fuzz-reach` (in `gate` too) holds what
-the corpus reaches to `fuzz/reach.txt`, which `cargo run --example
-paths` writes. It reaches:
+`fuzz/replay/<target>.tar` holds each target's corpus, one archive
+(`fuzz/corpus.py`: sorted names, no times or owners, so the same inputs
+are the same bytes), rebuilt by `just fuzz-refresh` (seeded from the
+goldens, fuzzed, merged to the inputs that add coverage) and pruned to
+what a verdict needs, a whole proof kept only where no smaller input
+reaches it; `just fuzz-replay` (in `just gate`) unpacks the archives into
+`fuzz/target/replay/` and runs every input once, and `just fuzz-reach`
+(in `gate` too) holds what the corpus reaches to `fuzz/reach.txt`, which
+`cargo run --example paths` writes. It reaches:
 
 - format 39 by bytes (`final_verifier_bytes`, `masked_bytes` past the
   golden's header): the format word, the decode, non-canonical encodings,

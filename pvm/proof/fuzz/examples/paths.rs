@@ -1,7 +1,7 @@
-//! Lists what each input of the checked-in corpus (`replay/<target>/`)
-//! reaches: the verdict its target's verifier, decoder or venue gives it,
-//! counted by verdict a target. `prove_verify_roundtrip`'s inputs are
-//! programs, counted alone.
+//! Lists what each input of the checked-in corpus (`replay/<target>.tar`,
+//! unpacked into `target/replay/<target>/`) reaches: the verdict its
+//! target's verifier, decoder or venue gives it, counted by verdict a
+//! target. `prove_verify_roundtrip`'s inputs are programs, counted alone.
 //!
 //! With `--each`, it prints a line `<target>\t<input>\t<verdict>` for
 //! each verdict of each input instead: what a corpus is pruned by.
@@ -13,6 +13,7 @@
 //!
 //! ```text
 //! cd pvm/proof/fuzz
+//! python3 -I corpus.py unpack replay target/replay
 //! cargo run --release --example paths [-- --expect reach.txt]
 //! ```
 
@@ -171,9 +172,9 @@ fn main() {
         _ => panic!("usage: paths [--each | --expect <file>]"),
     };
     let mut reached: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let replay = Path::new(env!("CARGO_MANIFEST_DIR")).join("replay");
+    let replay = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/replay");
     let mut targets: Vec<_> = std::fs::read_dir(&replay)
-        .expect("the replay corpus")
+        .expect("the replay corpus, unpacked: `python3 -I corpus.py unpack replay target/replay`")
         .map(|entry| entry.expect("an entry").path())
         .collect();
     targets.sort();

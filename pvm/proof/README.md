@@ -59,7 +59,7 @@ last:
 | `tools/kreivo/conformance` | Kreivo's spaces pallet's conformance vectors, over the fixtures | `just conformance` | `just check` | `check` |
 | `pvm/proof/kit/Cargo.lock` | the verifier kit's lock file, VOS's pruned to what the kit links | `just kit-lock` | `just check-kit` | `gate` |
 | `pvm/proof/final-verifier/src/constants.rs` | the wrap's preprocessed root (`PREPROCESSED_ROOT_39`), a venue's verifying key | by hand, at a change of the wrap's circuit | `vos-pvm-recair`'s `recursion` test (`masked::`) and `vos-pvm-proof`'s `constants::` test compute it | `gate`; `ci-full` |
-| `pvm/proof/fuzz/replay`, `node/fuzz/replay` | each fuzz target's replay corpus, the prover's and the node's: inputs kept because they reached a path | the prover's: `just fuzz-refresh` (seeded from the goldens, fuzzed, merged); the node's: the fuzzer, kept by hand | `just fuzz-replay` | `gate` |
+| `pvm/proof/fuzz/replay`, `node/fuzz/replay` | each fuzz target's replay corpus, the prover's and the node's, one archive a target (`<target>.tar`, `pvm/proof/fuzz/corpus.py`: the same inputs, the same bytes): inputs kept because they reached a path | the prover's: `just fuzz-refresh` (seeded from the goldens, fuzzed, merged, packed); the node's: the fuzzer, kept by hand | `just fuzz-replay` (unpacked into each workspace's `target/replay/`) | `gate` |
 | `pvm/proof/fuzz/reach.txt` | the verdicts each of the prover's replay corpora reaches, its accepted goldens among them | from `just fuzz-reach`'s output after `just fuzz-refresh` | `just fuzz-reach` | `gate` |
 
 **Constants typed by hand and held by a test,** besides the wrap's root:
