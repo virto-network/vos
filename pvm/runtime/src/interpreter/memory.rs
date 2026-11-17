@@ -876,7 +876,11 @@ impl FrameTable {
         }
     }
 
-    /// The frame of `page`, which must be inside the span.
+    /// The frame of `page`.
+    ///
+    /// # Safety
+    ///
+    /// `page` lies inside the span, which the directory covers.
     #[inline(always)]
     unsafe fn get_unchecked(&self, page: usize) -> u32 {
         // SAFETY: the caller bounds page by the span, which the directory

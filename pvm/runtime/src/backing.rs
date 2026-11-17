@@ -153,7 +153,11 @@ impl Drop for CodeWindow {
     }
 }
 
+// SAFETY: the window owns its mapping, unmapped once on drop, and its
+// methods only hand out pointers into it: every access through them is an
+// unsafe caller's, under that caller's own argument.
 unsafe impl Send for CodeWindow {}
+// SAFETY: as for `Send`: `&CodeWindow` reads no memory behind its pointers.
 unsafe impl Sync for CodeWindow {}
 
 // ─── Tests ────────────────────────────────────────────────────────────────

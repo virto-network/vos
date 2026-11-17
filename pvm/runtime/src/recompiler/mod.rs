@@ -497,7 +497,12 @@ fn flat_check_perm(ctx: &JitContext, addr: u32, len: u32, min_perm: u8) -> bool 
     true
 }
 
-/// Read from flat buffer. Caller must have checked permissions.
+/// Read from flat buffer.
+///
+/// # Safety
+///
+/// `ctx.flat_buf` is the guest's 4 GiB mapping, and the caller checked the
+/// `len` bytes from `addr` readable (`flat_check_perm`).
 unsafe fn flat_read(ctx: &JitContext, addr: u32, len: usize) -> u64 {
     // SAFETY: caller verified every cyclic byte through flat_check_perm.
     let mut value = 0u64;
@@ -510,7 +515,12 @@ unsafe fn flat_read(ctx: &JitContext, addr: u32, len: usize) -> u64 {
     value
 }
 
-/// Write to flat buffer. Caller must have checked permissions.
+/// Write to flat buffer.
+///
+/// # Safety
+///
+/// `ctx.flat_buf` is the guest's 4 GiB mapping, and the caller checked the
+/// bytes from `addr` writable (`flat_check_perm`).
 unsafe fn flat_write(ctx: &JitContext, addr: u32, bytes: &[u8]) {
     // SAFETY: caller verified every cyclic byte through flat_check_perm.
     for (offset, byte) in bytes.iter().copied().enumerate() {

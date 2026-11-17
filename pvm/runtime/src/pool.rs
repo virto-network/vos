@@ -697,7 +697,9 @@ pub(crate) fn prepared_code(
     code: &CodeBlob,
     backend: PvmBackend,
 ) -> Result<PreparedExecution, String> {
-    /// Code bytes kept across programs before the cache starts over.
+    /// Code bytes kept across programs before the cache starts over:
+    /// counted by blob, while each entry keeps its native code and per-byte
+    /// tables too, several times its blob.
     const CAPACITY_BYTES: usize = 64 << 20;
 
     struct Cache {

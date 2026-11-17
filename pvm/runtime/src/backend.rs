@@ -219,6 +219,8 @@ impl PreparedExecution {
             if span > isize::MAX as u64 {
                 return Err("flat memory span exceeds host address space".into());
             }
+            // Up to 4 GiB, zeroed by the allocator, which aborts the process
+            // when it cannot: the sparse model is the one a caller bounds.
             crate::interpreter::Memory::flat(vec![0; span as usize])
         })
     }
