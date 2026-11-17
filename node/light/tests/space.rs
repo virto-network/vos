@@ -94,14 +94,21 @@ impl Device {
     }
 }
 
-/// A world whose homes keep a joiner on probation long past a pairing's
-/// time over the in-process Tor.
+/// The suite's policy: a joiner on probation, and an operation open, long
+/// past a pairing's time over the in-process Tor, so each is seen as it is
+/// while the next step runs.
+fn suite() -> Policy {
+    Policy {
+        probation_ms: 60_000,
+        operation_delay_ms: 15_000,
+        kit_delay_ms: 20_000,
+        ..policy()
+    }
+}
+
 fn world() -> Arc<World> {
     let world = World::new();
-    world.state.lock().unwrap().policy = Some(Policy {
-        probation_ms: 60_000,
-        ..policy()
-    });
+    world.state.lock().unwrap().policy = Some(suite());
     world
 }
 
@@ -160,7 +167,7 @@ fn a_regroup_removes_what_the_agent_removes() {
     let first = device(&world, 0x31);
     first.claim(&world, home);
     // Seasoned, so it may regroup.
-    after(policy().seasoning_ms);
+    after(suite().seasoning_ms);
     let probation = device(&world, 0x32);
     let on_probation = first.pair(&probation);
     first.space.regroup(&first.phone).unwrap();
@@ -169,7 +176,7 @@ fn a_regroup_removes_what_the_agent_removes() {
     let late = device(&world, 0x33);
     let added = first.pair(&late);
     assert_ne!(added, on_probation);
-    after(policy().operation_delay_ms);
+    after(suite().operation_delay_ms);
     first.space.update(&first.phone).unwrap();
     let devices = first.space.devices().unwrap();
     for device in &devices {
