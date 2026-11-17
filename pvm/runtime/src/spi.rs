@@ -14,6 +14,25 @@ pub use vos_pvm_program::{
     read_nat,
 };
 
+/// The most code bytes a program may hold, on either backend: what every
+/// validation of a code blob ([`validate_code_blob`]) and every compile
+/// (`backend::compile`, `recompiler::compile_code`, `RecompiledPvm::new`)
+/// refuses past, so a program's prepared tables and native code stay
+/// bounded by its length and the recompiler's offsets fit an `i32` (at
+/// most `recompiler::asm::INSTRUCTION` native bytes for each code byte).
+pub const MAX_CODE: usize = 2 << 20;
+
+/// `code` refused past [`MAX_CODE`] bytes: a compile's guard.
+pub(crate) fn code_fits(code: &[u8]) -> Result<(), alloc::string::String> {
+    if code.len() > MAX_CODE {
+        return Err(alloc::format!(
+            "{} bytes of code, past {MAX_CODE}",
+            code.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Whether a machine of `program` may start at `pc`: an instruction's first
 /// byte, with a known opcode. Runtime counters are u32 even on a 64-bit
 /// host, so a larger register is no entry rather than truncated.
@@ -34,7 +53,11 @@ pub(crate) fn is_entry(program: &CodeBlob, pc: u64) -> bool {
 pub fn validate_code_blob(program: &CodeBlob, initial_pc: u64) -> bool {
     let code = &program.code;
     let bitmask = &program.bitmask;
-    if code.is_empty() || bitmask.len() != code.len() || !is_entry(program, initial_pc) {
+    if code.is_empty()
+        || code.len() > MAX_CODE
+        || bitmask.len() != code.len()
+        || !is_entry(program, initial_pc)
+    {
         return false;
     }
 

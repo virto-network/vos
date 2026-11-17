@@ -77,27 +77,40 @@ impl RefineContext {
     /// key, a four-byte value length and the value; φ7 becomes the bytes
     /// written, 0 when no rows remain, or `FULL` when the next row alone
     /// exceeds φ12. Costs the base price and [`STATE_READ_BYTE_GAS`] per
-    /// byte written.
+    /// byte written. No row is read past the bytes the gas left pays for:
+    /// the first such row stops the call, a panic if the output range to
+    /// its end is not writable, else out of gas.
     pub(super) fn state_scan(&mut self) -> Result<(), Stop> {
         self.charge(BASE_CALL_GAS)?;
         let registers = *self.outer.registers();
         let prefix = self.read_outer(registers[7], registers[8])?;
         let cursor = self.read_outer(registers[9], registers[10])?;
         let capacity = usize::try_from(registers[12]).unwrap_or(usize::MAX);
+        let affordable = self.outer.gas_remaining() / STATE_READ_BYTE_GAS;
         let reader = self.state.as_ref().expect("dispatched only with a reader");
         let after = (!cursor.is_empty()).then_some(cursor.as_slice());
         let mut out = Vec::new();
         let mut full = false;
+        let mut unpaid = None;
         for (key, value) in reader.rows(&prefix, after) {
             let row = 8 + key.len() + value.len();
             if out.len() + row > capacity {
                 full = out.is_empty();
                 break;
             }
+            let len = (out.len() + row) as u64;
+            if len > affordable {
+                unpaid = Some(len);
+                break;
+            }
             out.extend_from_slice(&(key.len() as u32).to_le_bytes());
             out.extend_from_slice(&key);
             out.extend_from_slice(&(value.len() as u32).to_le_bytes());
             out.extend_from_slice(&value);
+        }
+        if let Some(len) = unpaid {
+            self.outer_range(registers[11], len)?;
+            return self.charge(len.saturating_mul(STATE_READ_BYTE_GAS));
         }
         let (address, len) = self.outer_range(registers[11], out.len() as u64)?;
         self.charge(len as u64 * STATE_READ_BYTE_GAS)?;

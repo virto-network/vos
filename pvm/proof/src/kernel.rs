@@ -48,6 +48,12 @@ pub struct KernelTrace {
 pub enum KernelTraceError {
     /// The blob is not a standard program, or its layout does not fit.
     Program,
+    /// A jump-table entry, a static jump's or a branch's target is no basic
+    /// block start (`vos_pvm::interpreter::bad_transfer`): the machine
+    /// panics at that transfer, and the pin, which knows instruction starts
+    /// alone, would let a proof continue there or, for a table entry naming
+    /// the halt address, end as a halt.
+    Transfer,
     /// The input is past a witness input's cap.
     Input,
     /// The run stopped otherwise than by its halt.
@@ -122,13 +128,24 @@ fn load(
 
 /// Kernel `blob`'s program as a proof sees it before any run: its code,
 /// jump table, initial memory and layout, and no step. What its
-/// preprocessed roots are computed from.
+/// preprocessed roots are computed from. Refused if any of its control
+/// transfers lands on no basic block start ([`KernelTraceError::Transfer`]).
 pub fn kernel_side_note(blob: &[u8]) -> Result<SideNote, KernelTraceError> {
     let (machine, image, permissions) = load(blob, &[], 0, |_| {})?;
-    Ok(TracingPvm::new(machine)
+    let side_note = TracingPvm::new(machine)
         .into_side_note()
         .with_sparse_memory(image)
-        .with_memory_layout(permissions))
+        .with_memory_layout(permissions);
+    if vos_pvm::interpreter::bad_transfer(
+        &side_note.code,
+        &side_note.bitmask,
+        &side_note.jump_table,
+    )
+    .is_some()
+    {
+        return Err(KernelTraceError::Transfer);
+    }
+    Ok(side_note)
 }
 
 /// Run kernel `blob` with `gas` on `input`, its witness input, as the
@@ -249,4 +266,59 @@ fn trace(
         io_hash,
         reads,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use vos_pvm_compiler::assembler::{Assembler, Reg};
+
+    use super::{KernelTraceError, kernel_side_note};
+
+    /// `asm`'s program with jump table `table`.
+    fn with_table(asm: &Assembler, table: &[u32]) -> Vec<u8> {
+        let mut program = vos_pvm_program::parse_standard_program(&asm.build()).unwrap();
+        program.code.jump_table = table.to_vec();
+        vos_pvm_program::build_standard_program(&program).unwrap()
+    }
+
+    /// A jump-table entry naming the halt address, through which a dynamic
+    /// jump would end a proved run as a halt where the machine panics, is
+    /// refused; one naming a block start is not.
+    #[test]
+    fn a_jump_table_naming_the_halt_address_is_refused() {
+        let mut asm = Assembler::new();
+        asm.set_stack_pages(1);
+        asm.load_imm(Reg::T0, 2).jump_ind(Reg::T0, 0);
+        let halt = vos_pvm::PVM_HALT_ADDR as u32;
+        assert_eq!(
+            kernel_side_note(&with_table(&asm, &[halt])).err(),
+            Some(KernelTraceError::Transfer)
+        );
+        assert!(kernel_side_note(&with_table(&asm, &[0])).is_ok());
+    }
+
+    /// A branch to an instruction inside a block is refused; with a
+    /// `fallthrough` ending the block before it, it is not.
+    #[test]
+    fn a_branch_into_a_block_is_refused() {
+        let blob = |ended: bool| {
+            let mut asm = Assembler::new();
+            asm.set_stack_pages(1);
+            asm.load_imm(Reg::T0, 0);
+            if ended {
+                asm.fallthrough();
+            }
+            let target = asm.current_offset();
+            asm.load_imm(Reg::T1, 0);
+            let here = asm.current_offset();
+            asm.branch_lt_u_imm(Reg::T0, 1, target.wrapping_sub(here))
+                .jump_ind(Reg::RA, 0);
+            asm.build()
+        };
+        assert_eq!(
+            kernel_side_note(&blob(false)).err(),
+            Some(KernelTraceError::Transfer)
+        );
+        assert!(kernel_side_note(&blob(true)).is_ok());
+    }
 }

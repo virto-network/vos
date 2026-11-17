@@ -717,8 +717,9 @@ impl Terms {
 /// `i`'s log size, 0 for a chip outside the shape).
 ///
 /// # Panics
-/// When `chips` names a chip outside the segment AIR or a chip of it has no
-/// log size.
+/// When `chips` names no chip, a chip outside the segment AIR, or a chip
+/// with no log size. `derive` calls it on shapes it built itself; a caller
+/// holding a shape from elsewhere checks those first.
 pub fn leaf_terms(chips: u32, log_sizes: &[u8; SEGMENT_CHIPS]) -> Terms {
     assert_eq!(chips >> SEGMENT_CHIPS, 0, "chips of the segment AIR");
     let active: Vec<(usize, u32)> = (0..SEGMENT_CHIPS)

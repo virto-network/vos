@@ -224,7 +224,7 @@ fn trace_run(
     gas: u64,
 ) -> Result<vos_pvm_proof::kernel::KernelTrace, Error> {
     vos_pvm_proof::kernel::trace_kernel(blob, arguments, gas).map_err(|error| match error {
-        KernelTraceError::Program => Error::Layout,
+        KernelTraceError::Program | KernelTraceError::Transfer => Error::Layout,
         KernelTraceError::Input | KernelTraceError::Unread => Error::Arguments,
         KernelTraceError::Exit | KernelTraceError::Output => Error::Halt,
     })

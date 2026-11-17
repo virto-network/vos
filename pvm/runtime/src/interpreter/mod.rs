@@ -2784,6 +2784,86 @@ pub fn compute_basic_block_starts(code: &[u8], bitmask: &[u8]) -> Vec<bool> {
     starts
 }
 
+/// A control transfer the machine panics on whatever its registers hold: a
+/// target that is no basic block start ([`compute_basic_block_starts`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BadTransfer {
+    /// Jump-table entry `index` names `target`.
+    JumpTable { index: usize, target: u32 },
+    /// The jump or branch at `pc` names `target`; for a branch, its
+    /// fall-through as well.
+    Static { pc: usize, target: u64 },
+}
+
+impl core::fmt::Display for BadTransfer {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::JumpTable { index, target } => {
+                write!(
+                    f,
+                    "jump-table entry {index} names {target:#x}, no basic block start"
+                )
+            }
+            Self::Static { pc, target } => write!(
+                f,
+                "the instruction at {pc:#x} transfers to {target:#x}, no basic block start"
+            ),
+        }
+    }
+}
+
+/// The first control transfer of a program that the machine panics on
+/// whatever its registers hold (eq A.17, A.18): a jump-table entry, a
+/// static jump's or branch's target, or a branch's fall-through that is no
+/// basic block start. The halt address is none, so a jump-table entry
+/// naming it is one; a dynamic jump reaches the halt only through its
+/// address, never through the table. `None` when every transfer lands on a
+/// block start.
+pub fn bad_transfer(code: &[u8], bitmask: &[u8], jump_table: &[u32]) -> Option<BadTransfer> {
+    let starts = compute_basic_block_starts(code, bitmask);
+    let is_start = |target: u64| {
+        usize::try_from(target)
+            .ok()
+            .and_then(|target| starts.get(target))
+            .copied()
+            .unwrap_or(false)
+    };
+    if let Some((index, &target)) = jump_table
+        .iter()
+        .enumerate()
+        .find(|&(_, &target)| !is_start(u64::from(target)))
+    {
+        return Some(BadTransfer::JumpTable { index, target });
+    }
+    let mut pc = 0;
+    while pc < code.len() {
+        if bitmask.get(pc) != Some(&1) {
+            pc += 1;
+            continue;
+        }
+        let skip = skip_for_bitmask(bitmask, pc);
+        let transfer = Opcode::from_byte(code[pc]).and_then(|opcode| {
+            match args::decode_args(code, pc, skip, opcode.category()) {
+                Args::Offset { offset } => Some((offset, false)),
+                Args::RegImmOffset { offset, .. } => Some((offset, opcode != Opcode::LoadImmJump)),
+                Args::TwoRegOffset { offset, .. } => Some((offset, true)),
+                _ => None,
+            }
+        });
+        if let Some((target, conditional)) = transfer {
+            if !is_start(target) {
+                return Some(BadTransfer::Static { pc, target });
+            }
+            let next = (pc + 1 + skip) as u64;
+            if conditional && !is_start(next) {
+                return Some(BadTransfer::Static { pc, target: next });
+            }
+        }
+        pc += 1 + skip;
+    }
+    None
+}
+
 /// Compute each basic block's pipeline gas cost.
 ///
 /// Uses the same GasSimulator as the recompiler — single code path.

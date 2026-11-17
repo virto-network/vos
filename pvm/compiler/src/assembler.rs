@@ -26,7 +26,6 @@ pub enum Reg {
 pub struct Assembler {
     code: Vec<u8>,
     bitmask: Vec<u8>,
-    jump_table: Vec<u32>,
     ro_data: Vec<u8>,
     rw_data: Vec<u8>,
     heap_pages: u32,
@@ -48,7 +47,6 @@ impl Assembler {
         Self {
             code: Vec::new(),
             bitmask: Vec::new(),
-            jump_table: Vec::new(),
             ro_data: Vec::new(),
             rw_data: Vec::new(),
             heap_pages: 0,
@@ -76,21 +74,6 @@ impl Assembler {
     pub fn set_stack_pages(&mut self, pages: u32) -> &mut Self {
         self.stack_pages = pages;
         self
-    }
-
-    /// Add a jump table entry pointing to the current code offset.
-    /// Returns the jump table index.
-    pub fn add_jump_entry(&mut self) -> usize {
-        let idx = self.jump_table.len();
-        self.jump_table.push(self.code.len() as u32);
-        idx
-    }
-
-    /// Add a jump table entry pointing to a specific code offset.
-    pub fn add_jump_entry_at(&mut self, offset: u32) -> usize {
-        let idx = self.jump_table.len();
-        self.jump_table.push(offset);
-        idx
     }
 
     /// Get the current code offset.
@@ -214,26 +197,6 @@ impl Assembler {
         self
     }
 
-    /// Opcode 81: branch_eq_imm (branch if register == immediate)
-    pub fn branch_eq_imm(&mut self, rd: Reg, imm: i32, target: u32) -> &mut Self {
-        self.emit_byte(81, true);
-        let reg_byte = (rd as u8) | (4 << 4);
-        self.emit_byte(reg_byte, false);
-        self.emit_imm(imm as i64, 4);
-        self.emit_imm(target as i64, 4);
-        self
-    }
-
-    /// Opcode 82: branch_ne_imm (branch if register != immediate)
-    pub fn branch_ne_imm(&mut self, rd: Reg, imm: i32, target: u32) -> &mut Self {
-        self.emit_byte(82, true);
-        let reg_byte = (rd as u8) | (4 << 4);
-        self.emit_byte(reg_byte, false);
-        self.emit_imm(imm as i64, 4);
-        self.emit_imm(target as i64, 4);
-        self
-    }
-
     /// Opcode 83: branch_lt_u_imm (branch if register < unsigned immediate)
     pub fn branch_lt_u_imm(&mut self, rd: Reg, imm: i32, target: u32) -> &mut Self {
         self.emit_byte(83, true);
@@ -303,14 +266,6 @@ impl Assembler {
         self
     }
 
-    /// Opcode 131: add_imm_32 (rD = rA + imm, 32-bit)
-    pub fn add_imm_32(&mut self, rd: Reg, ra: Reg, imm: i32) -> &mut Self {
-        self.emit_byte(131, true);
-        self.emit_byte((rd as u8) | ((ra as u8) << 4), false);
-        self.emit_imm(imm as i64, 4);
-        self
-    }
-
     /// Opcode 149: add_imm_64 (rD = rA + imm, 64-bit)
     pub fn add_imm_64(&mut self, rd: Reg, ra: Reg, imm: i32) -> &mut Self {
         self.emit_byte(149, true);
@@ -350,7 +305,7 @@ impl Assembler {
                 .checked_mul(vos_pvm_program::PAGE_SIZE)
                 .expect("assembled stack size fits u32"),
             code: vos_pvm_program::CodeBlob {
-                jump_table: self.jump_table.clone(),
+                jump_table: Vec::new(),
                 code: self.code.clone(),
                 bitmask: self.bitmask.clone(),
             },

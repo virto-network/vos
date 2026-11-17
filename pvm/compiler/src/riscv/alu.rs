@@ -372,8 +372,11 @@ impl TranslationContext {
             // Special case: SUB rd, rs1, load_rd → neg_add_imm rd, rs1, -imm
             // SUB is not commutative, but if rs2 is the loaded register:
             // rd = rs1 - imm = rs1 + (-imm)
-            if (funct7, funct3) == (0x20, 0) && rs2 == load_rd && rs1 != load_rd {
-                let neg_imm = (-(load_val as i32) as i64) as i32;
+            if (funct7, funct3) == (0x20, 0)
+                && rs2 == load_rd
+                && rs1 != load_rd
+                && let Ok(neg_imm) = i32::try_from(-load_val)
+            {
                 // Use add_imm with negated immediate (avoids neg_add_imm)
                 self.drop_dead_load(rd, load_rd, undo_pos, addr);
                 let pvm_rd = self.require_reg(rd)?;
@@ -743,7 +746,9 @@ impl TranslationContext {
 
             // SUB with loaded rs2: SUBW rd, rs1, load_rd → add_imm_32 rd, rs1, -imm
             if (funct7, funct3) == (0x20, 0) && rs2 == load_rd && rs1 != load_rd {
-                let neg_imm = (-(load_val as i32) as i64) as i32;
+                // In 32 bits the negation wraps as the subtraction does:
+                // -(-2^31) is -2^31 modulo 2^32.
+                let neg_imm = imm.wrapping_neg();
                 self.drop_dead_load(rd, load_rd, undo_pos, addr);
                 let pvm_rd = self.require_reg(rd)?;
                 let pvm_rs1 = self.require_reg(rs1)?;

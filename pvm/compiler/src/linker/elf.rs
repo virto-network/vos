@@ -272,6 +272,18 @@ pub(super) fn sections(data: &[u8]) -> Result<Sections, TranspileError> {
     let mut symtab_idx = None;
     let mut schema = None;
     let mut heap = None;
+    // The bytes copied out of the file: at most its length, so sections
+    // that share bytes cannot multiply them.
+    let mut copied = 0usize;
+    let mut copy = |bytes: &[u8]| {
+        copied += bytes.len();
+        if copied > data.len() {
+            return Err(TranspileError::ElfParse(
+                "its loaded sections share the file's bytes".into(),
+            ));
+        }
+        Ok(bytes.to_vec())
+    };
 
     for (i, s) in sections.iter().enumerate() {
         let name = get_name(s.name_off);
@@ -302,7 +314,7 @@ pub(super) fn sections(data: &[u8]) -> Result<Sections, TranspileError> {
 
         if is_exec {
             if let Some(bytes) = bytes {
-                code_sections.push((s.file_off, s.addr, bytes.to_vec()));
+                code_sections.push((s.file_off, s.addr, copy(bytes)?));
             }
         } else if name.starts_with(".rodata")
             || name == ".srodata"
@@ -310,10 +322,11 @@ pub(super) fn sections(data: &[u8]) -> Result<Sections, TranspileError> {
             || name == ".vos_schema"
         {
             if let Some(bytes) = bytes {
+                let bytes = copy(bytes)?;
                 if name == ".vos_schema" {
-                    schema = Some(bytes.to_vec());
+                    schema = Some(bytes.clone());
                 }
-                ro_sections.push((s.addr, size, bytes.to_vec()));
+                ro_sections.push((s.addr, size, bytes));
             }
         } else if is_write {
             if name == ".vos_heap" {
@@ -322,7 +335,7 @@ pub(super) fn sections(data: &[u8]) -> Result<Sections, TranspileError> {
             if s.sh_type == SHT_NOBITS {
                 rw_sections.push((s.addr, size, None));
             } else if let Some(bytes) = bytes {
-                rw_sections.push((s.addr, size, Some(bytes.to_vec())));
+                rw_sections.push((s.addr, size, Some(copy(bytes)?)));
             }
         }
     }

@@ -25,7 +25,14 @@ pub(crate) fn spi_blob(t: TranspiledElf) -> Result<Vec<u8>, TranspileError> {
     let ro_data = if t.ro_data.is_empty() {
         Vec::new()
     } else if t.ro_base >= Z_Z {
-        let mut v = vec![0u8; (t.ro_base - Z_Z) as usize];
+        let padding = t.ro_base - Z_Z;
+        if padding > limits::DATA {
+            return Err(TranspileError::InvalidSection(format!(
+                "SPI: read-only data linked at {:#x}, far past its GP base",
+                t.ro_base
+            )));
+        }
+        let mut v = vec![0u8; padding as usize];
         v.extend_from_slice(&t.ro_data);
         v
     } else {

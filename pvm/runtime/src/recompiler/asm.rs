@@ -9,8 +9,21 @@
 //! The key invariant: `self.buf` points to a valid allocation of at least
 //! `self.capacity` bytes (either a Vec's backing store or an mmap region).
 //! All emission functions have `debug_assert!(self.write_pos + N <= self.capacity)`
-//! guards. Callers must ensure capacity via `ensure_capacity()` before emitting.
+//! guards. Callers reserve room via [`Assembler::reserve`] before each
+//! instruction or sequence, in every build: a reservation grows the buffer to
+//! hold it and `SLACK` more, and refuses one past `MAX_NATIVE` or one made
+//! after the previous sequence overran its own, so every native offset fits
+//! an `i32` and its casts to `u32` and `i32` are exact. That no instruction
+//! overruns [`INSTRUCTION`] is the codegen's tests'.
 //! Vec length is synced via `set_len(write_pos)` only at finalization boundaries.
+
+/// The bytes reserved for one PVM instruction's native code.
+pub const INSTRUCTION: usize = 512;
+/// Room past a reservation: `flush_instbuf` always writes 16 bytes.
+const SLACK: usize = 16;
+/// The most native code: its offsets are `i32` displacements and dispatch
+/// entries.
+const MAX_NATIVE: usize = i32::MAX as usize;
 
 /// Instruction buffer: accumulates x86 bytes in a u128 register, then flushes
 /// with a single bulk write. Avoids per-byte memory stores.
@@ -164,6 +177,8 @@ pub struct Assembler {
     /// The Vec is pre-sized but labels_len tracks the logical length.
     labels_len: usize,
     fixups: Vec<Fixup>,
+    /// Where the current reservation ends ([`Assembler::reserve`]).
+    limit: usize,
 }
 
 /// Unbound label sentinel. We use 0 so that bulk label allocation can use
@@ -190,6 +205,7 @@ impl Assembler {
             labels: Vec::new(),
             labels_len: 0,
             fixups: Vec::new(),
+            limit: 0,
         }
     }
 
@@ -208,6 +224,7 @@ impl Assembler {
             labels: vec![0u32; label_capacity],
             labels_len: 0,
             fixups: Vec::with_capacity(2048),
+            limit: 0,
         }
     }
 
@@ -245,17 +262,17 @@ impl Assembler {
             // (one per forward branch + one per OOG stub jcc). Over-allocating to
             // label_capacity wastes ~1.5MB for ecrecover.
             fixups: Vec::with_capacity(2048),
+            limit: 0,
         })
     }
 
-    /// Ensure at least `additional` bytes of capacity remain.
-    /// Called before emitting large sequences. Most individual instructions
-    /// need at most ~32 bytes, so this is rarely needed mid-compilation.
+    /// Grow the buffer to hold at least `additional` bytes past the write
+    /// position: an error when the mapping cannot grow.
     #[cold]
-    fn grow(&mut self, additional: usize) {
+    fn grow(&mut self, additional: usize) -> Result<(), String> {
         match &mut self.code_buf {
             CodeBuf::Vec(code) => {
-                // SAFETY: write_pos <= code.capacity() is maintained by ensure_capacity().
+                // SAFETY: write_pos <= code.capacity() is maintained by reserve().
                 // set_len(write_pos) exposes the bytes we've written so reserve() copies them.
                 unsafe {
                     code.set_len(self.write_pos);
@@ -283,7 +300,7 @@ impl Assembler {
                     )
                 };
                 if new_ptr == libc::MAP_FAILED {
-                    panic!("mremap failed: need {new_cap} bytes");
+                    return Err(format!("mremap failed: need {new_cap} bytes"));
                 }
                 *ptr = new_ptr as *mut u8;
                 *capacity = new_cap;
@@ -291,14 +308,35 @@ impl Assembler {
                 self.capacity = new_cap;
             }
         }
+        Ok(())
     }
 
-    /// Check capacity and grow if needed. Inlined for the fast path (no grow).
+    /// Reserve `n` bytes for the next sequence, growing the buffer if
+    /// needed. Refused when the previous sequence wrote past its own
+    /// reservation, or the code would pass `MAX_NATIVE`.
     #[inline(always)]
-    pub fn ensure_capacity(&mut self, n: usize) {
-        if self.write_pos + n > self.capacity {
-            self.grow(n);
+    pub fn reserve(&mut self, n: usize) -> Result<(), String> {
+        self.within_reservation()?;
+        let end = self.write_pos + n;
+        if end > MAX_NATIVE {
+            return Err(format!("native code past {MAX_NATIVE} bytes"));
         }
+        if end + SLACK > self.capacity {
+            self.grow(n + SLACK)?;
+        }
+        self.limit = end;
+        Ok(())
+    }
+
+    /// Refused when the code written passes the last reservation.
+    pub fn within_reservation(&self) -> Result<(), String> {
+        if self.write_pos > self.limit {
+            return Err(format!(
+                "native code overran its reservation: {} bytes past it",
+                self.write_pos - self.limit
+            ));
+        }
+        Ok(())
     }
 
     /// Allocate a new label.
@@ -327,7 +365,8 @@ impl Assembler {
         }
     }
 
-    /// Bind a label to the current write position.
+    /// Bind a label to the current write position, which a reservation
+    /// keeps below `MAX_NATIVE`.
     pub fn bind_label(&mut self, label: Label) {
         self.labels[label.0 as usize] = (self.write_pos + 1) as u32; // +1: 0 is LABEL_UNBOUND
     }
@@ -350,7 +389,7 @@ impl Assembler {
     // All emission writes directly to the buffer via raw pointer,
     // bypassing Vec::push's capacity check and len update.
     // SAFETY for all emit* functions: write_pos + N <= capacity is guarded by
-    // debug_assert. Callers ensure capacity via ensure_capacity() before sequences.
+    // debug_assert. Callers reserve room via reserve() before sequences.
 
     #[inline(always)]
     fn emit(&mut self, b: u8) {
@@ -385,8 +424,8 @@ impl Assembler {
         debug_assert!(self.write_pos + len <= self.capacity);
         // SAFETY: write_pos + len <= capacity is asserted above. We always
         // write both 8-byte halves (16 bytes total) even if len < 16 — this
-        // is safe because ensure_capacity(512) guarantees ample slack beyond
-        // the actual instruction bytes.
+        // is safe because reserve() leaves SLACK (16) bytes past the
+        // reservation.
         unsafe {
             let p = self.buf.add(self.write_pos);
             std::ptr::write_unaligned(p as *mut u64, ib.out as u64);
@@ -1500,20 +1539,9 @@ impl Assembler {
 
     // -- Misc --
 
-    /// ud2 (undefined instruction, for traps)
-    pub fn ud2(&mut self) {
-        self.emit(0x0F);
-        self.emit(0x0B);
-    }
-
     /// nop
     pub fn nop(&mut self) {
         self.emit(0x90);
-    }
-
-    /// int3 (debug breakpoint)
-    pub fn int3(&mut self) {
-        self.emit(0xCC);
     }
 
     // === Finalization ===

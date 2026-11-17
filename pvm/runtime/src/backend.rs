@@ -135,13 +135,15 @@ enum ResolvedBackend {
     Recompiler,
 }
 
-/// Compile PVM code into a `CompiledProgram` using the selected backend.
+/// Compile PVM code into a `CompiledProgram` using the selected backend:
+/// refused on either past [`crate::spi::MAX_CODE`] bytes.
 pub fn compile(
     code: &[u8],
     bitmask: &[u8],
     jump_table: &[u32],
     backend: PvmBackend,
 ) -> Result<CompiledProgram, alloc::string::String> {
+    crate::spi::code_fits(code)?;
     match resolve_backend(backend)? {
         ResolvedBackend::Interpreter => Ok(CompiledProgram::Interpreter(
             crate::interpreter::Interpreter::predecode(code, bitmask, jump_table),
@@ -217,6 +219,8 @@ impl PreparedExecution {
             if span > isize::MAX as u64 {
                 return Err("flat memory span exceeds host address space".into());
             }
+            // Up to 4 GiB, zeroed by the allocator, which aborts the process
+            // when it cannot: the sparse model is the one a caller bounds.
             crate::interpreter::Memory::flat(vec![0; span as usize])
         })
     }

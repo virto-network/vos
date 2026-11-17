@@ -821,6 +821,54 @@ fn a_fused_constant_stays_in_its_register() {
     }
 }
 
+/// `lui t0, 0x80000`, alone or with an `addi` of 0, then `sub` subtracts
+/// -2^31, so adds 2^31, which no 32-bit immediate holds: the subtraction
+/// stays a register one, into another register and into the constant's own.
+/// `subw` of it adds -2^31 modulo 2^32, which one does.
+#[test]
+fn subtracting_the_least_32_bit_constant_adds_two_to_the_31() {
+    let subs = |rd| {
+        [
+            Inst::Op {
+                f3: 0,
+                f7: 0x20,
+                rd,
+                rs1: 7,
+                rs2: 5,
+            },
+            Inst::Op32 {
+                f3: 0,
+                f7: 0x20,
+                rd,
+                rs1: 7,
+                rs2: 5,
+            },
+        ]
+    };
+    for sub in [6, 5].into_iter().flat_map(subs) {
+        let lui = Inst::Lui {
+            rd: 5,
+            imm: i32::MIN,
+        };
+        let loads = [
+            vec![Item::Plain(lui), Item::Plain(sub.clone())],
+            vec![Item::Constant {
+                rd: 5,
+                value: i32::MIN,
+                reader: sub,
+            }],
+        ];
+        for items in &loads {
+            for t2 in [0, 1, 1 << 31, 1 << 63] {
+                let mut registers = [0; 11];
+                registers[2] = t2;
+                check(items, &registers)
+                    .unwrap_or_else(|error| panic!("{items:?}, t2 {t2:#x}: {error}"));
+            }
+        }
+    }
+}
+
 /// `beq x0, x0` always branches and `bne x0, x0` never does: register 0 of
 /// the PVM holds the return address, not zero.
 #[test]

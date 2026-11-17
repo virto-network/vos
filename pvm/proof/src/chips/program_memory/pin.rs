@@ -95,7 +95,7 @@ pub(crate) fn pack_flags(
     out
 }
 
-/// Decode the instruction at `pc` (which must be a basic-block start) into
+/// Decode the instruction at `pc` (an instruction start) into
 /// the canonical tuple consumed by CpuChip.  Mirrors the tracer's per-step
 /// decoding plus classify_opcode's flag derivation, so the preprocessed
 /// table 1:1 reproduces what CpuChip's main columns hold for the matching
@@ -115,7 +115,9 @@ fn decode_at(code: &[u8], bitmask: &[u8], pc: usize) -> Decoded {
     let branch_target_canon = crate::core::tracing::decode_branch_target(&decoded_args);
     // Only the halt selector of a dynamic jump continues at the halt
     // address; a static jump there would end a segment at it, as a halt
-    // does, where the machine panics. `derive` refuses such a program.
+    // does, where the machine panics. The pin's program is refused when a
+    // static target is no basic block start (`kernel::kernel_side_note`,
+    // as `derive`), so a pinned program never fails this.
     assert_ne!(
         u64::from(branch_target_canon),
         vos_pvm::PVM_HALT_ADDR,

@@ -8,6 +8,13 @@
 //! A write to a guest-writable page of a slot that does not track writes
 //! yet is not a guest fault: the handler starts tracking the slot and
 //! returns, so the store retries (`Activation`).
+//!
+//! It assumes it stays the process's SIGSEGV handler once installed (no
+//! later `sigaction` replaces it while compiled code runs), and that any
+//! handler installed before it is one it may chain to for a fault outside
+//! compiled code. Every fault whose instruction pointer lies in compiled
+//! code is taken as the guest's: a host bug faulting there is reported as
+//! a guest page fault, not as a crash.
 
 use std::cell::Cell;
 use std::ptr::null_mut;
@@ -72,6 +79,10 @@ pub fn ensure_installed() {
     INIT.call_once(|| unsafe { install_handler() });
 }
 
+/// # Safety
+///
+/// Replaces the process's SIGSEGV disposition: called once (`INIT`), and
+/// before any other thread reads `PREV_SIGSEGV`.
 unsafe fn install_handler() {
     // SAFETY: sigaction() is called with a properly initialized sigaction struct.
     // The handler pointer is a valid extern "C" fn with the correct signature.
@@ -91,6 +102,10 @@ unsafe fn install_handler() {
     }
 }
 
+/// # Safety
+///
+/// Changes the calling thread's alternate signal stack: called on the
+/// thread that runs compiled code, before it does.
 unsafe fn install_sigaltstack() {
     // SAFETY: mmap allocates a fresh anonymous mapping with a guard page at the
     // bottom (PROT_NONE) and stack space above (PROT_READ|PROT_WRITE).
@@ -140,6 +155,11 @@ unsafe fn install_sigaltstack() {
 /// SIGSEGV handler: intercepts page faults from JIT code and redirects to the
 /// exit sequence. Only handles faults at registered trap sites within our
 /// native code region; all others are delegated to the previous handler.
+///
+/// # Safety
+///
+/// Called by the kernel alone, with the `siginfo` and `ucontext` of a
+/// SIGSEGV on this thread.
 unsafe extern "C" fn sigsegv_handler(
     signum: libc::c_int,
     _siginfo: *mut libc::siginfo_t,
@@ -237,6 +257,12 @@ unsafe extern "C" fn sigsegv_handler(
     }
 }
 
+/// Hand the signal to the handler [`install_handler`] replaced.
+///
+/// # Safety
+///
+/// Called from [`sigsegv_handler`] with the arguments it was given, after
+/// `install_handler` ran.
 unsafe fn delegate_to_previous(
     signum: libc::c_int,
     siginfo: *mut libc::siginfo_t,

@@ -65,7 +65,10 @@
 //!
 //! **Bounded work:** every lookup is logarithmic, and a kernel is built
 //! from what its entry reaches alone, so a derivation's work grows with the
-//! ELF once and with each kernel's reach and size, whatever the ELF claims.
+//! ELF once and with each kernel's reach and size, whatever the ELF claims:
+//! the sections it copies hold at most the file's bytes, the walk reads
+//! each code byte once however function ranges overlap, and the programs
+//! it keeps hold at most [`MAX_DERIVED`] bytes.
 //!
 //! **Bit-reproducible:** the output's order comes from sorted sections,
 //! symbols and addresses, never from a map's iteration, so the same ELF and
@@ -135,6 +138,10 @@ const HEADROOM_SHIFT: u32 = 40;
 
 /// The largest ELF a derivation reads: an install's body.
 pub use vos_abi::abi::cap::MAX_ELF;
+
+/// The most bytes a derivation's programs hold together: its actor's, its
+/// kernels' and their references'.
+pub const MAX_DERIVED: usize = 4 * MAX_ELF;
 
 /// The most attestable methods an actor may have: a schema's methods.
 const MAX_ATTESTABLES: usize = 1024;
@@ -227,8 +234,10 @@ pub enum DeriveError {
          read-write data at {end:#x} from a page: build with the guest's linker script"
     )]
     Heap { start: u64, size: u64, end: u64 },
-    #[error("a kernel's instruction at {0:#x} jumps statically to the halt address")]
-    HaltTarget(u64),
+    #[error("the derivation's programs hold {0} bytes, past {MAX_DERIVED}")]
+    Derived(usize),
+    #[error("a kernel's control transfer panics whatever its registers hold: {0}")]
+    Transfer(vos_pvm::interpreter::BadTransfer),
     #[error("a kernel reaches code from {0:#x} to {1:#x}, which no code section holds whole")]
     Unreadable(u64, u64),
     #[error(
@@ -291,15 +300,25 @@ pub fn derive(elf: &[u8]) -> Result<Derived, DeriveError> {
         .map(|entry| entry.method)
         .collect();
     let inputs: Vec<Input> = entries.iter().map(|entry| entry.input).collect();
+    // Each program is counted as it is made: a derivation holds at most
+    // `MAX_DERIVED` bytes and one program more.
+    let mut held = actor.len();
+    let mut hold = |program: Vec<u8>| {
+        held += program.len();
+        if held > MAX_DERIVED {
+            return Err(DeriveError::Derived(held));
+        }
+        Ok(program)
+    };
     let kernels: Vec<(u32, Vec<u8>)> = entries
         .into_iter()
-        .map(|entry| Ok((entry.method, kernel(&graph, &entry)?)))
+        .map(|entry| Ok((entry.method, hold(kernel(&graph, &entry)?)?)))
         .collect::<Result<_, DeriveError>>()?;
     let references = reference_entries
         .into_iter()
         .map(|entry| {
             let headroom = entry.reference.expect("a reference entry");
-            Ok((entry.method, kernel(&graph, &entry)?, headroom))
+            Ok((entry.method, hold(kernel(&graph, &entry)?)?, headroom))
         })
         .collect::<Result<_, DeriveError>>()?;
     let shapes = kernels
@@ -412,7 +431,9 @@ fn invocation_heap(elf: &mut LinkedElf) -> Result<u32, DeriveError> {
         return Ok(0);
     }
     let kept = start + INVOCATION_HEAP;
-    elf.rw_len = kept - elf.rw_base;
+    elf.rw_len = kept
+        .checked_sub(elf.rw_base)
+        .ok_or(DeriveError::Heap { start, size, end })?;
     Ok(((end.next_multiple_of(PAGE) - kept) / PAGE) as u32)
 }
 
@@ -613,6 +634,51 @@ mod tests {
             .into_iter()
             .flat_map(u32::to_le_bytes)
             .collect()
+    }
+
+    /// A kernel whose jump table names the halt address, or whose branch
+    /// lands inside a block, is refused; with the entry a block start, or
+    /// a `fallthrough` ending the block before the target, it is not.
+    #[test]
+    fn a_kernel_transferring_to_no_block_start_is_refused() {
+        use crate::assembler::{Assembler, Reg};
+        use vos_pvm::interpreter::BadTransfer;
+        let code = |asm: &Assembler| {
+            vos_pvm::spi::parse_standard_program(&asm.build())
+                .unwrap()
+                .code
+        };
+        let halt = vos_pvm::PVM_HALT_ADDR as u32;
+        let mut trap = Assembler::new();
+        trap.trap();
+        let blob = code(&trap);
+        assert!(matches!(
+            kernel::transfers(&blob.code, &blob.bitmask, &[0, halt]),
+            Err(DeriveError::Transfer(BadTransfer::JumpTable { index: 1, target })) if target == halt
+        ));
+        assert!(kernel::transfers(&blob.code, &blob.bitmask, &[0]).is_ok());
+
+        let branching = |ended: bool| {
+            let mut asm = Assembler::new();
+            asm.load_imm(Reg::T0, 0);
+            if ended {
+                asm.fallthrough();
+            }
+            let target = asm.current_offset();
+            asm.load_imm(Reg::T1, 0);
+            let here = asm.current_offset();
+            asm.branch_lt_u_imm(Reg::T0, 1, target.wrapping_sub(here))
+                .trap();
+            (code(&asm), here, target)
+        };
+        let (blob, here, target) = branching(false);
+        assert!(matches!(
+            kernel::transfers(&blob.code, &blob.bitmask, &[]),
+            Err(DeriveError::Transfer(BadTransfer::Static { pc, target: to }))
+                if (pc, to) == (here as usize, u64::from(target))
+        ));
+        let (blob, ..) = branching(true);
+        assert!(kernel::transfers(&blob.code, &blob.bitmask, &[]).is_ok());
     }
 
     /// Ids 110 to 114 are no precompile: a kernel that reaches one is

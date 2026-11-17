@@ -179,27 +179,9 @@ pub(crate) struct TranspiledElf {
 }
 
 impl TranspiledElf {
-    /// The pc of an instruction whose static jump or branch target is the
-    /// halt address, if one is: only a dynamic jump through the halt entry
-    /// reaches it, as the proof's halt selector does.
-    pub(crate) fn static_halt_target(&self) -> Option<u64> {
-        use vos_pvm::args::{Args, decode_args};
-        (0..self.code.len())
-            .filter(|&pc| self.bitmask.get(pc) == Some(&1))
-            .find(|&pc| {
-                let Some(opcode) = Opcode::from_byte(self.code[pc]) else {
-                    return false;
-                };
-                let skip = vos_pvm::interpreter::skip_for_bitmask(&self.bitmask, pc);
-                let target = match decode_args(&self.code, pc, skip, opcode.category()) {
-                    Args::Offset { offset }
-                    | Args::RegImmOffset { offset, .. }
-                    | Args::TwoRegOffset { offset, .. } => offset,
-                    _ => return false,
-                };
-                target as u32 as u64 == vos_pvm::PVM_HALT_ADDR
-            })
-            .map(|pc| pc as u64)
+    /// The code, its bitmask and its jump table.
+    pub(crate) fn code(&self) -> (&[u8], &[u8], &[u32]) {
+        (&self.code, &self.bitmask, &self.jump_table)
     }
 }
 

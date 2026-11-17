@@ -313,3 +313,167 @@ fn no_methods() -> Vec<u8> {
     ]
     .concat()
 }
+
+/// `elf` with every code section's header naming the first one's bytes.
+fn aliased(mut elf: Vec<u8>) -> Vec<u8> {
+    let field = |elf: &[u8], at: usize| u64::from_le_bytes(elf[at..at + 8].try_into().unwrap());
+    let table = field(&elf, 40) as usize;
+    let count = u16::from_le_bytes(elf[60..62].try_into().unwrap()) as usize;
+    let mut first: Option<Vec<u8>> = None;
+    for index in 0..count {
+        let header = table + 64 * index;
+        if field(&elf, header + 8) & EXECUTE == 0 {
+            continue;
+        }
+        match &first {
+            None => first = Some(elf[header + 24..header + 40].to_vec()),
+            Some(span) => elf[header + 24..header + 40].copy_from_slice(span),
+        }
+    }
+    elf
+}
+
+/// Code sections that all name one span of the file are refused as they
+/// are parsed: 4,093 of them over 64 KiB would copy 256 MiB.
+#[test]
+fn sections_sharing_the_files_bytes_are_refused() {
+    let mut sections = vec![Section::loaded(".text", EXECUTE, TEXT, vec![0; 1 << 16])];
+    for _ in 0..4093 {
+        sections.push(Section::loaded(".text", EXECUTE, TEXT, Vec::new()));
+    }
+    let elf = aliased(elf(TEXT, sections));
+    let started = Instant::now();
+    let refused = derive(&elf).expect_err("shared bytes are refused");
+    assert!(
+        refused.to_string().contains("share the file's bytes"),
+        "{refused}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// Read-only data linked just under the address space's top is refused
+/// before the blob's padding to it is allocated.
+#[test]
+fn read_only_data_linked_far_up_is_refused() {
+    let code: Vec<u8> = i_type(0x67, 0, 0, RA, 0).to_le_bytes().to_vec();
+    let elf = elf(
+        TEXT,
+        vec![
+            Section::loaded(".rodata", 0, 0xFFFF_F000, vec![1]),
+            Section::loaded(".text", EXECUTE, TEXT, code),
+        ],
+    );
+    let refused = vos_pvm_compiler::link_elf_spi(&elf).expect_err("refused");
+    assert!(refused.to_string().contains("far past"), "{refused}");
+}
+
+/// A package of `methods` attestable methods, each naming the one entry,
+/// over read-only data with one byte linked at `high`.
+fn many_kernels(methods: u64, high: u64) -> Vec<u8> {
+    let start = TEXT;
+    let entry = TEXT + 4;
+    let code: Vec<u8> = [i_type(0x67, 0, 0, RA, 0), i_type(0x67, 0, 0, RA, 0)]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    let schema = no_methods();
+    let attest = SCHEMA + schema.len() as u64;
+    let table: Vec<u8> = (1..=methods)
+        .flat_map(|method| [method.to_le_bytes(), entry.to_le_bytes()])
+        .flatten()
+        .collect();
+    let strtab = b"\0entry\0_start\0VOS_ATTEST\0".to_vec();
+    let symtab = [
+        symbol(0, 0, 0, 0),
+        symbol(1, 2, entry, 4),
+        symbol(7, 2, start, 4),
+        symbol(14, 1, attest, 16 * methods),
+    ]
+    .concat();
+    elf(
+        start,
+        vec![
+            Section::loaded(".vos_schema", 0, SCHEMA, schema),
+            Section::loaded(".rodata", 0, attest, table),
+            Section::loaded(".rodata.high", 0, high, vec![1]),
+            Section::loaded(".text", EXECUTE, TEXT, code),
+            Section::table(".symtab", SYMTAB, symtab, 6, 0),
+            Section::table(".strtab", STRTAB, strtab, 0, 0),
+            // R_RISCV_64 of the entry, in the attestables' table.
+            Section::table(".rela.rodata", RELA, relocation(attest + 8, 1, 2, 0), 5, 2),
+        ],
+    )
+}
+
+/// 1,024 kernels of one entry, each holding read-only data that spans
+/// 15 MiB, pass what a derivation holds: refused as they are made.
+#[test]
+fn kernels_past_what_a_derivation_holds_are_refused() {
+    let elf = many_kernels(1024, 0xF0_0000);
+    let started = Instant::now();
+    match derive(&elf) {
+        Err(vos_pvm_compiler::DeriveError::Derived(held)) => {
+            assert!(held > vos_pvm_compiler::MAX_DERIVED)
+        }
+        other => panic!("{:?}", other.map(|derived| derived.kernels.len())),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// `2^16` function symbols, one at each instruction of a chain of jumps
+/// and each sized to the code's end, so their ranges all overlap: the
+/// entry's walk reads each instruction once, not once for each range
+/// holding it.
+#[test]
+fn overlapping_functions_are_walked_once() {
+    const FUNCTIONS: u64 = 1 << 16;
+    let start = TEXT;
+    let entry = TEXT + 4;
+    let end = entry + 4 * FUNCTIONS;
+    let code: Vec<u8> = std::iter::once(i_type(0x67, 0, 0, RA, 0))
+        .chain((1..FUNCTIONS).map(|_| jal(0, 4)))
+        .chain(std::iter::once(i_type(0x67, 0, 0, RA, 0)))
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    let schema = no_methods();
+    let attest = SCHEMA + schema.len() as u64;
+    let table = [1u64.to_le_bytes(), entry.to_le_bytes()].concat();
+    let strtab = b"\0entry\0_start\0VOS_ATTEST\0".to_vec();
+    let mut symtab = [
+        symbol(0, 0, 0, 0),
+        symbol(7, 2, start, 4),
+        symbol(14, 1, attest, 16),
+    ]
+    .concat();
+    for at in (entry..end).step_by(4) {
+        symtab.extend(symbol(1, 2, at, end - at));
+    }
+    let elf = elf(
+        start,
+        vec![
+            Section::loaded(".vos_schema", 0, SCHEMA, schema),
+            Section::loaded(".rodata", 0, attest, table),
+            Section::loaded(".text", EXECUTE, TEXT, code),
+            Section::table(".symtab", SYMTAB, symtab, 5, 0),
+            Section::table(".strtab", STRTAB, strtab, 0, 0),
+            // R_RISCV_64 of the entry, in the attestables' table.
+            Section::table(".rela.rodata", RELA, relocation(attest + 8, 3, 2, 0), 4, 2),
+        ],
+    );
+    let started = Instant::now();
+    let derived = derive(&elf).expect("derives");
+    let took = started.elapsed();
+    assert_eq!(derived.kernels.len(), 1);
+    assert!(
+        took < Duration::from_secs(30),
+        "{FUNCTIONS} overlapping functions: {took:?}"
+    );
+}
