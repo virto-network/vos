@@ -3,7 +3,7 @@
 //! The zkVM RAM is committed as a complete binary Merkle tree of depth
 //! [`DEPTH`], keyed by **page address** (`addr >> PAGE_BITS`): each leaf is the
 //! blake2b-256 hash of a [`PAGE_SIZE`]-byte page; absent / never-touched pages
-//! hold the all-zero default leaf.  Per segment the prover proves a boundary
+//! hold the default leaf, `leaf` of the all-zero page.  Per segment the prover proves a boundary
 //! multiproof — recompute `initial_root` from the entering page images and
 //! `final_root` from the exit images, sharing the untouched-subtree witnesses
 //! — and binds both roots in-circuit (see
@@ -22,9 +22,9 @@
 //! - `node(l, r)  = blake2b256(NODE_TAG ‖ l ‖ r)`  (2 128-byte blocks)
 //!
 //! The tags are distinct full 128-byte first blocks, giving leaf/node domain
-//! separation as distinct chaining states; the absent-page default is the
-//! all-zero leaf, which cannot collide with `leaf(page)` except with
-//! negligible probability.
+//! separation as distinct chaining states; the absent-page default is
+//! `leaf` of the all-zero page, so an absent page and a present page of
+//! zeros are one leaf.
 
 use alloc::vec::Vec;
 

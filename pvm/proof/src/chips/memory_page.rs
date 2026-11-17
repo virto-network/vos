@@ -76,7 +76,9 @@ pub enum Column {
     /// After-pass leaf chaining state leaving this block.
     #[size = 64]
     HOutAfter,
-    /// Closing-read timestamp (`= final_state.timestamp`), 8 LE limbs.
+    /// Closing-read timestamp, 8 LE limbs: a witness, bound to no final
+    /// state; the ledger takes the one closing read as its group's last
+    /// row.
     #[size = 8]
     ClosingTs,
     /// 20-bit boolean decomposition of the page index (so `idx < 2^DEPTH`);

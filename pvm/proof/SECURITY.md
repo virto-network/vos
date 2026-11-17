@@ -105,7 +105,18 @@ rests on the conjectured count.
   memory ledger at the call's timestamp, the addresses a carry chain that
   cannot wrap past 2^32. The register ledger orders reads before writes in
   a step, so a call cannot read its own result. What a kernel read is the
-  `witness_input` of its attest.
+  `witness_input` of its attest. The live host returns `min(capacity,
+  remaining)` bytes (`src/core/ecall.rs`); the AIR binds only the count's
+  bound, so a proved run may return a short read and then more bytes,
+  which no live stream does. A kernel must not take a short read for the
+  end of its input.
+- **The Poseidon2 call (`0x402`)** computes `C(l, r)`, the width-16
+  permutation of `l ‖ r` truncated to 8 words, with no feed-forward: a
+  pseudo-compression, a preimage of any digest one inverse permutation
+  when both inputs are free. It is safe in a fixed-depth tree over sponge
+  leaves, or a chain from a fixed tag with a length block (`H_io`), and
+  not as a general two-input commitment: a kernel must not commit to a
+  pair of free values with one call.
 - **The halt rule:** a halting step's `next_pc` is `PVM_HALT_ADDR`
   (2^32 − 2^16), which no code offset reaches, so a segment ends at that
   pc exactly when it ends at a halt. A trap keeps `next_pc = pc`: a panic
@@ -135,6 +146,7 @@ rests on the conjectured count.
 | `proof.log_sizes` | no | capped by `DEFAULT_MAX_LOG_SIZE`; no public verify entry takes another cap (only the bare preflights, `proof::preflight_proof_structure` and `proof::preflight_proof_structure_readonly`, do) |
 | `proof.initial_state`, `proof.final_state` | bound | registers, pc and ts bound to the committed boundary columns and to the trace; `memory_root` to the in-AIR page tree of the images |
 | `proof.pcs_config` | no | the format's exactly; Fiat–Shamir-bound |
+| `proof.component_mask` | no | the chips it names: within this AIR's, its popcount the component count. Format 41's header mixes no mask: a kernel's verifier pins it to one of its shape's classes (`class_of`), and the leaf's constants pin it; in bare `verify_standalone` it is the prover's, and dropping or adding a chip only restricts the traces that verify |
 | `hash`, the preprocessed root | **yes** | the class's program identity: its code, layout and permissions, at its shape. For a kernel, the install's record derives it, and the program id covers it |
 
 The preflight, the format checks, the root against `hash`, the logup sum,
@@ -230,7 +242,22 @@ a trace of the full AIR, so the cut proves no statement the full CPU does
 not. The code binds the cut (an instruction's flags are its code's, by the
 program memory's lookup), and the cut enters the program's id and its
 transcript. The pin code that decides it (`src/chips/cpu/cut/pin.rs`,
-`src/device/pin.rs`) is in the audit's scope.
+`src/device/pin.rs`) is in the audit's scope. A test evaluates the full
+AIR at random points with the cut columns zero, over each opcode's,
+each precompile's and random programs' cuts and random column sets, and
+finds every dropped constraint and fraction numerator zero.
+
+**Columns bound by tuple equality alone.** A few columns are never range
+checked themselves: the word boundary's `Initial` and `Last`,
+DeviceBoundaryChip's `FinalValue`, DeviceIoChip's `Value`, and the word
+ledger's `Address`, `Value` and `Timestamp`. Each is bound only by the
+relation tuples it shares with another chip: the data table's
+preprocessed words and the ledger's first and closing rows, the register
+ledger's closing read, the io-hash words the verifier fixes from `io`, the
+accesses the CPU and the precompiles produce. Below `p` fractions a
+relation, logup forces those tuples to match as multisets, so each such
+column holds a value its counterpart bounds; a change to a counterpart's
+own checks is a change to these columns' soundness.
 
 **A panic is a refusal, not a crash:** the device crate runs with std and
 is not linted panic-free; ingress catches a verifier's panic and counts it
@@ -539,6 +566,23 @@ Its count is the security tool's under (c):
   `2N` (`log_degree_bound` `m+1`) and overstate the batching term by about
   1 bit.
 
+**The lifted tree binds no column to its own size.** The fork's lifted
+Merkle verifier hashes one flat row a query, and FRI tests only the global
+degree bound, so a column sampled at one point may be any polynomial below
+that bound: a small chip may run as a longer cyclic trace. The only
+per-column size binding is the periodicity value the DEEP batch adds for a
+column sampled at two points. That is enough, by our own derivation,
+reviewed by no one: every next-row read and every logup running sum is a
+two-sample column, hence periodic at its chip's size, so each row's
+fraction is periodic and any one period is a valid trace with the same
+claimed sum; the same holds under masking (the columns at level `n + 1`,
+the AIR at `m + 1`). It needs every committed column at no more than two
+sample points, since a third would get no periodicity value; tests hold
+the segment chip set, the device set, the recursion AIR and the masked
+wrap to that (`every_*_column_is_sampled_at_one_or_two_points`,
+`the_sample_points_match_pin_b`). The argument belongs with the lifted
+count above in the cryptographer's review.
+
 **Zero knowledge** is the argument's: honest-verifier zero knowledge of
 the masked IOP, so zero knowledge in the programmable random-oracle model,
 conditional on the rank check (R1: for every column class, the
@@ -690,7 +734,9 @@ Who performs it, and when, is open.
   kernel and its install record by someone other than its prover; pin the
   final verifier's build (its wrap root is a constant of it).
 - [ ] **Audit each kernel** whose id you pin: its roots, its nonces, its
-  salted fields.
+  salted fields, and that it never takes a short witness read for the end
+  of its input (a proved read returns at most the capacity, not the live
+  `min(capacity, remaining)`).
 - [ ] **Cap the submission's length** before decoding it; key accepted
   statements on the statement id.
 - [ ] **Publish a segment's expected shape and boundary** where a segment
