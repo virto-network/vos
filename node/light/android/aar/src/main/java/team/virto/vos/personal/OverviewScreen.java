@@ -4,26 +4,18 @@
 package team.virto.vos.personal;
 
 import android.widget.LinearLayout;
-import team.virto.s4.vos.ErrorCode;
-import team.virto.s4.vos.Refusal;
 
 /**
- * The personal space at a glance: without one, the ways to get one (back this phone up, join from
- * another device, restore from the kit); with one, its devices, what waits for the user, Tor's
- * state ("backup paused" on a network that blocks it), and every flow.
+ * The personal space at a glance, from its status: without one, the ways to get one (back this
+ * phone up, join from another device, restore from the kit); a flow under way, the way to finish
+ * it; with one, its devices, what waits for the user, Tor's state ("backup paused" on a network
+ * that blocks it), and every flow.
  */
 final class OverviewScreen extends Screen {
-  /** Whether the device holds a personal space: unknown until read. */
-  private Boolean holds;
+  /** The personal space's status: unknown until read. */
+  private PersonalStatus status;
   private Device[] devices;
-  private Notice[] open;
-  private Notice[] raised;
   private String unread;
-  /** Tor's bootstrap refused, and why: backup paused. */
-  private String paused;
-  private boolean torRead;
-  /** A read of Tor's state under way. */
-  private boolean torReading;
 
   OverviewScreen(PersonalActivity app) {
     super(app);
@@ -36,23 +28,32 @@ final class OverviewScreen extends Screen {
 
   @Override
   void shown() {
-    // The device set's operations open are read on the device: whether it holds a space.
     app.read(
-        (personal, prompts, refused) -> personal.operations(refused),
-        operations -> {
-          holds = true;
-          open = operations;
+        (personal, prompts, refused) -> personal.status(refused),
+        read -> {
+          status = read;
+          unread = null;
           redraw();
-          readDevices();
+          if (holds()) {
+            readDevices();
+          }
         },
         refused -> {
-          holds = refused.code == ErrorCode.NOT_ENROLLED ? false : null;
-          unread = holds == null ? Words.refusal(refused.code, refused.message) : null;
+          status = null;
+          unread = Words.why(refused);
           redraw();
         });
-    if (!torRead) {
-      readTor();
-    }
+  }
+
+  /**
+   * Whether the phone holds a group its devices are listed from: not while it joins, its sync key
+   * not yet admitted.
+   */
+  private boolean holds() {
+    return status != null
+        && (status.phase == Phase.HELD
+            || status.phase == Phase.REMOVED
+            || status.phase == Phase.STUCK);
   }
 
   private void readDevices() {
@@ -64,68 +65,70 @@ final class OverviewScreen extends Screen {
           redraw();
         },
         refused -> {
-          unread = Words.refusal(refused.code, refused.message);
+          unread = Words.why(refused);
           redraw();
         });
   }
 
-  /** Tor's state, on its own thread: a bootstrap waits for the network. */
-  private void readTor() {
-    if (torReading) {
-      return;
-    }
-    torReading = true;
-    new Thread(
-            () -> {
-              Refusal refused = new Refusal();
-              boolean up;
-              try {
-                up = app.personal().bootstrap(refused);
-              } catch (android.os.RemoteException | RuntimeException gone) {
-                up = false;
-                refused.message = "the facility stopped";
-              }
-              boolean working = up;
-              app.runOnUiThread(
-                  () -> {
-                    torRead = true;
-                    torReading = false;
-                    paused = working ? null : Words.refusal(refused.code, refused.message);
-                    redraw();
-                  });
-            },
-            "vos.tor")
-        .start();
-  }
-
   @Override
   void build(LinearLayout into) {
-    if (!torRead) {
-      into.addView(text("Tor: starting…"));
-    } else if (paused != null) {
-      into.addView(warning("Backup paused: " + paused));
+    if (status == null) {
+      into.addView(text(unread == null ? "Reading…" : "Not read: " + unread));
+      into.addView(button("Try again", v -> shown()));
+      return;
+    }
+    if (status.tor == Tor.BLOCKED) {
+      into.addView(warning("Backup paused: " + Words.tor(status.tor, status.torWhy)));
       into.addView(
           text(
               "Your devices do not sync while Tor cannot connect. On a network that blocks Tor, "
                   + "add bridges."));
     } else {
-      into.addView(text("Tor: connected."));
+      into.addView(text(Words.tor(status.tor, status.torWhy) + "."));
     }
     into.addView(button("Tor and bridges", v -> app.open(new NetworkScreen(app))));
-    if (holds == null) {
-      into.addView(text(unread == null ? "Reading…" : "Not read: " + unread));
-      into.addView(button("Try again", v -> shown()));
-      return;
-    }
-    if (!holds) {
-      none(into);
-      return;
+    long now = System.currentTimeMillis();
+    switch (status.phase) {
+      case Phase.NONE:
+        none(into);
+        return;
+      case Phase.NEEDS_REPAIR:
+        into.addView(warning(Words.phase(status.phase)));
+        if (status.repair != null && !status.repair.isEmpty()) {
+          into.addView(text(status.repair));
+        }
+        return;
+      case Phase.CLAIMING:
+        into.addView(warning(Words.phase(status.phase)));
+        into.addView(button("Finish the claim", v -> app.open(new ClaimScreen(app))));
+        return;
+      case Phase.RESTORING:
+        into.addView(
+            warning(
+                Words.phase(status.phase)
+                    + (status.matures > 0
+                        ? ": it takes effect " + Words.until(status.matures, now)
+                        : "")
+                    + "."));
+        into.addView(button("Finish the restore", v -> app.open(new RestoreScreen(app))));
+        return;
+      case Phase.REMOVED:
+      case Phase.STUCK:
+        into.addView(warning(Words.phase(status.phase)));
+        into.addView(
+            button("Pair this phone again", v -> app.open(new PairScreen(app, false))));
+        break;
+      case Phase.JOINING:
+        into.addView(text(Words.phase(status.phase)));
+        into.addView(button("Sync now", v -> sync()));
+        return;
+      default:
+        break;
     }
     into.addView(heading("Your devices"));
     if (devices == null) {
       into.addView(text(unread == null ? "Reading your devices…" : "Not read: " + unread));
     } else {
-      long now = System.currentTimeMillis();
       for (Device device : devices) {
         into.addView(
             text(
@@ -137,16 +140,11 @@ final class OverviewScreen extends Screen {
                     + Words.ago(device.seen, now)));
       }
     }
-    if (open != null && open.length > 0) {
-      into.addView(warning(open.length + " change(s) to your devices wait for you."));
+    if (status.owed > 0) {
+      into.addView(warning(status.owed + " membership(s) of your other spaces wait for you."));
     }
-    if (raised != null) {
-      for (Notice notice : raised) {
-        into.addView(
-            warning(
-                Words.pending(notice.pending)
-                    + (notice.detail.isEmpty() ? "" : " (" + notice.detail + ")")));
-      }
+    for (Notice notice : status.standing) {
+      into.addView(warning(Words.notice(notice)));
     }
     into.addView(button("Devices, changes and keys", v -> app.open(new DevicesScreen(app))));
     into.addView(button("Pair a new device", v -> app.open(new PairScreen(app, true))));
@@ -172,9 +170,8 @@ final class OverviewScreen extends Screen {
   private void sync() {
     app.run(
         "Syncing your personal space…",
-        (personal, prompts, refused) -> personal.syncPersonal(refused),
+        PersonalActivity.own((personal, refused) -> personal.syncPersonal(refused)),
         (Synced synced) -> {
-          raised = synced.notices;
           shown();
           if (synced.failed > 0) {
             app.say("The sync did not finish: " + synced.failed + " failed. It runs again later.");

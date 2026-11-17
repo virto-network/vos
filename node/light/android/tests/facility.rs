@@ -17,10 +17,7 @@ use common::*;
 async fn enroll_sign_in_and_pay_as_the_chrome_confirmed() {
     let world = world();
     let directory = tempfile::tempdir().unwrap();
-    let source = Arc::new(Software {
-        key: [9; 32],
-        uses: Mutex::new(0),
-    });
+    let source = Arc::new(Phone::new(9));
     let facility = facility(
         &world,
         directory.path(),
@@ -43,12 +40,12 @@ async fn enroll_sign_in_and_pay_as_the_chrome_confirmed() {
             .iter()
             .any(|(_, value)| value.contains("vote (once in scope “vote”)"))
     );
-    let output = {
-        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&[9; 32]).unwrap();
-        mac.update(&vos_light::source_input(&HANDLE));
-        let output: [u8; 32] = mac.finalize().into_bytes().into();
-        output
-    };
+    // The phone's first keystore key, the enrollment's source.
+    let alias = format!("vos.device.{}", 9u8 * 16 + 1);
+    let output = vos_light::testing::hmac(
+        &vos_light::testing::hmac(&[9; 32], alias.as_bytes()),
+        &vos_light::source_input(&HANDLE),
+    );
     let secret = vos_light::derive_secret(&output, &HANDLE);
     let member = vos_light::member(&secret).to_bytes();
     assert_eq!(bytes(field(&enrolled, "member")), member.to_vec());
@@ -274,14 +271,7 @@ async fn enroll_sign_in_and_pay_as_the_chrome_confirmed() {
 async fn nothing_is_proved_before_enrollment_or_for_an_unknown_operation() {
     let world = world();
     let directory = tempfile::tempdir().unwrap();
-    let facility = facility(
-        &world,
-        directory.path(),
-        Arc::new(Software {
-            key: [9; 32],
-            uses: Mutex::new(0),
-        }),
-    );
+    let facility = facility(&world, directory.path(), Arc::new(Phone::new(9)));
     let session = facility.session(gateway());
     let chrome = Scripted::default();
     let login = object(&[
@@ -303,41 +293,39 @@ async fn nothing_is_proved_before_enrollment_or_for_an_unknown_operation() {
         .await
         .unwrap_err();
     assert_eq!(error.code, Code::Declined);
-    assert!(
-        std::fs::read_dir(directory.path()).map_or(true, |entries| entries.flatten().all(
-            |entry| entry
-                .path()
-                .extension()
-                .is_none_or(|extension| extension != "toml")
-        ))
+    assert_eq!(
+        Store::new(directory.path()).all().unwrap(),
+        Vec::new(),
+        "nothing enrolled"
     );
 }
 
-struct Phone;
-
-impl vos_facility::node::Device for Phone {
-    fn kinds(&self) -> Vec<Kind> {
-        vec![Kind::Keystore]
-    }
-}
-
-/// The s4 session's stream to a gateway's onion goes over Tor, on a
-/// circuit of its own: the world's gateway answers it with its SSH banner.
+/// s4's screens to an onion service no space was enrolled through go over
+/// Tor all the same, on a circuit of their own, with no host key pinned
+/// (the client's known hosts decide it, as for any first contact): the
+/// world's gateway answers with its SSH banner. A name that is no onion
+/// service's address is refused, never resolved.
 #[test]
-fn a_stream_to_an_onion_goes_over_tor() {
+fn a_first_contact_with_an_onion_goes_over_tor() {
     use std::io::Read as _;
+    use std::os::fd::OwnedFd;
 
     let world = world();
     let directory = tempfile::tempdir().unwrap();
-    let node = node(&world, directory.path(), Arc::new(Phone));
-    let mut stream = node
-        .open_stream(vos_facility::StreamTarget {
-            host: world::address(&world, 1).to_ascii_uppercase(),
-            port: 22,
-        })
+    let node = node(&world, directory.path(), Arc::new(Phone::new(9)));
+    let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let pinned = node
+        .screens(
+            vos_facility::StreamTarget {
+                host: world::address(&world, 1).to_ascii_uppercase(),
+                port: 22,
+            },
+            OwnedFd::from(theirs),
+        )
         .unwrap();
+    assert_eq!(pinned, None, "no key pinned at first contact");
     let mut banner = [0; 8];
-    stream.read_exact(&mut banner).unwrap();
+    ours.read_exact(&mut banner).unwrap();
     assert_eq!(&banner, b"SSH-2.0-");
     let seen = world.state.lock().unwrap().seen.clone();
     assert_eq!(seen.len(), 1);
@@ -345,44 +333,17 @@ fn a_stream_to_an_onion_goes_over_tor() {
         world::onion_of(&seen[0].target),
         Some(world::address(&world, 1))
     );
+    let (_ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
     let refused = node
-        .open_stream(vos_facility::StreamTarget {
-            host: "nowhere.onion".into(),
-            port: 22,
-        })
+        .screens(
+            vos_facility::StreamTarget {
+                host: "nowhere.onion".into(),
+                port: 22,
+            },
+            OwnedFd::from(theirs),
+        )
         .unwrap_err();
     assert_eq!(refused.code, Code::Api);
-}
-
-/// A client whose user confirms everything, its key in memory.
-struct Confirming;
-
-impl vos_facility::node::Prompts for Confirming {
-    fn confirm(&self, _: vos_facility::Form) -> Answer {
-        Answer::Confirmed {
-            choice: 0,
-            values: Vec::new(),
-        }
-    }
-
-    fn create_key(&self, _: Kind) -> s4_credential_contract::KeyAnswer {
-        s4_credential_contract::KeyAnswer::Done(b"vos.device.screens".to_vec().into())
-    }
-
-    fn evaluate_key(
-        &self,
-        _: Kind,
-        _: &[u8],
-        input: &[u8; 32],
-    ) -> s4_credential_contract::KeyAnswer {
-        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&[9; 32]).unwrap();
-        mac.update(input);
-        s4_credential_contract::KeyAnswer::Done(mac.finalize().into_bytes().to_vec().into())
-    }
-
-    fn sign_key(&self, _: Kind, _: &[u8], _: &[u8]) -> s4_credential_contract::KeyAnswer {
-        s4_credential_contract::KeyAnswer::Declined
-    }
 }
 
 /// s4's screens with an enrolled space's gateway go over its onion, on a
@@ -399,7 +360,7 @@ fn the_screens_go_over_the_spaces_onion_or_its_opt_out() {
 
     let world = world();
     let directory = tempfile::tempdir().unwrap();
-    let node = node(&world, directory.path(), Arc::new(Phone));
+    let node = node(&world, directory.path(), Arc::new(Phone::new(9)));
     // The app in the foreground: a dormant client closes the screens.
     node.foreground(true);
     let session = node.open_session(vos_facility::Gateway {
@@ -409,7 +370,7 @@ fn the_screens_go_over_the_spaces_onion_or_its_opt_out() {
     node.enroll(
         session,
         vos_facility::Enroll::read(&enrollment()).unwrap(),
-        Arc::new(Confirming),
+        Arc::new(Phone::new(9)),
     )
     .unwrap();
     let screens = |host: &str| {
@@ -427,7 +388,7 @@ fn the_screens_go_over_the_spaces_onion_or_its_opt_out() {
     let before = world.state.lock().unwrap().seen.len();
     assert_eq!(
         screens("GATEWAY.test").unwrap(),
-        world.onion(1).ssh_host_key
+        Some(world.onion(1).ssh_host_key)
     );
     // The screens' stream among any the background job dialled meanwhile:
     // to the onion, on a circuit no earlier stream took.
@@ -447,11 +408,26 @@ fn the_screens_go_over_the_spaces_onion_or_its_opt_out() {
     );
     assert_eq!(
         screens("gateway.test.").unwrap(),
-        world.onion(1).ssh_host_key,
+        Some(world.onion(1).ssh_host_key),
         "the gateway's name with its root's dot"
     );
+    let (_ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let own = node
+        .screens(
+            vos_facility::StreamTarget {
+                host: world::address(&world, 1),
+                port: 22,
+            },
+            OwnedFd::from(theirs),
+        )
+        .unwrap();
+    assert_eq!(
+        own,
+        Some(world.onion(1).ssh_host_key),
+        "the space's own onion is the space's, its key pinned"
+    );
     node.opt_out(HANDLE, true).unwrap();
-    assert_eq!(screens("gateway.test").unwrap(), ssh_host_key());
+    assert_eq!(screens("gateway.test").unwrap(), Some(ssh_host_key()));
     let seen = world.state.lock().unwrap().seen.clone();
     assert_eq!(
         world::onion_of(&seen.last().unwrap().target),
@@ -494,7 +470,7 @@ fn the_onion_is_preferred_and_a_gateway_spelled_otherwise_is_refused() {
     let world = world();
     world.space_at(OTHER, [0x1e; 32], OTHER_HANDLE, [0x52; 32], 2);
     let directory = tempfile::tempdir().unwrap();
-    let node = node(&world, directory.path(), Arc::new(Phone));
+    let node = node(&world, directory.path(), Arc::new(Phone::new(9)));
     node.foreground(true);
     // Two applications at one gateway, a space each.
     for (application, enrollment) in [
@@ -512,7 +488,7 @@ fn the_onion_is_preferred_and_a_gateway_spelled_otherwise_is_refused() {
         node.enroll(
             session,
             vos_facility::Enroll::read(&enrollment).unwrap(),
-            Arc::new(Confirming),
+            Arc::new(Phone::new(9)),
         )
         .unwrap();
         node.close(session);
@@ -539,7 +515,7 @@ fn the_onion_is_preferred_and_a_gateway_spelled_otherwise_is_refused() {
         (key, world::onion_of(&last))
     };
     let (key, onion) = screens();
-    assert_eq!(key, world.onion(1).ssh_host_key);
+    assert_eq!(key, Some(world.onion(1).ssh_host_key));
     assert!(onion.is_some(), "an onion");
     // The first opted out: the second's onion, not the first's clearnet.
     node.opt_out(HANDLE, true).unwrap();
@@ -561,7 +537,7 @@ fn the_onion_is_preferred_and_a_gateway_spelled_otherwise_is_refused() {
     // Both opted out: the clearnet port, and s4's own connection allowed.
     node.opt_out(OTHER_HANDLE, true).unwrap();
     let (key, onion) = screens();
-    assert_eq!((key, onion), (ssh_host_key(), None));
+    assert_eq!((key, onion), (Some(ssh_host_key()), None));
     node.clearnet(ssh_host_key()).unwrap();
     node.opt_out(HANDLE, false).unwrap();
     assert!(node.clearnet(ssh_host_key()).is_err(), "back on Tor");
@@ -577,10 +553,7 @@ fn the_onion_is_preferred_and_a_gateway_spelled_otherwise_is_refused() {
 async fn a_refused_root_is_proved_again_and_a_retired_format_asks_for_an_update() {
     let world = world();
     let directory = tempfile::tempdir().unwrap();
-    let source = Arc::new(Software {
-        key: [9; 32],
-        uses: Mutex::new(0),
-    });
+    let source = Arc::new(Phone::new(9));
     let facility = facility(
         &world,
         directory.path(),

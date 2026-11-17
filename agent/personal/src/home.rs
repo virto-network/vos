@@ -1,13 +1,13 @@
 //! The home's `Homes` (`agent/homes`), as `Personal` messages it: its
 //! answer to a claim, each device's nullifier once its add is confirmed
-//! and again once its removal matures, and each new kit's keys. `Homes` depends on this crate for the
-//! messages it sends here, so these are declared by hand, their ids the
-//! handlers' names derive.
+//! and again once its removal matures, and each new kit's keys. `Homes`
+//! depends on this crate for the messages it sends here, so these are
+//! declared by hand, their ids `vos_wire::homes::method`'s, which the
+//! testkit's `methods` test holds to `Homes`' handlers.
 
 use alloc::vec::Vec;
 
 use vos_sdk::context::{Method, Never};
-use vos_sdk::method_id;
 use vos_sdk::prelude::*;
 use vos_wire::personal::PersonalError;
 
@@ -43,18 +43,18 @@ pub struct Rekey {
 }
 
 macro_rules! sent {
-    ($message:ident, $name:literal) => {
+    ($message:ident, $id:ident) => {
         impl Method for $message {
             type Actor = Homes;
-            const ID: u32 = method_id!($name);
+            const ID: u32 = vos_wire::homes::method::$id.0;
             type Reply = ();
             type Error = Never;
         }
     };
 }
 
-sent!(Assigned, "assigned");
-sent!(Refused, "refused");
-sent!(Record, "record");
-sent!(Forget, "forget");
-sent!(Rekey, "rekey");
+sent!(Assigned, ASSIGNED);
+sent!(Refused, REFUSED);
+sent!(Record, RECORD);
+sent!(Forget, FORGET);
+sent!(Rekey, REKEY);

@@ -529,6 +529,7 @@ dependencies = [
  "vos-abi",
  "vos-pvm-codec",
  "vos-pvm-precompiles",
+ "vos-sdk-macros",
  "vos-tree",
 ]
 

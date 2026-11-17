@@ -14,6 +14,36 @@ use vos_abi::credentials::{
 use vos_abi::SpaceId;
 use vos_abi::ids::{AgentId, InstanceId, MethodId};
 
+/// The credential actor's handlers.
+pub mod method {
+    methods! {
+        FOUND = "found";
+        ENROLL = "enroll";
+        ENROLL_MANY = "enroll_many";
+        INVITE = "invite";
+        CLAIM = "claim";
+        OPEN = "open";
+        CLAIM_OPEN = "claim_open";
+        REVOKE = "revoke";
+        REGISTER = "register";
+        LIMIT = "limit";
+        RESET = "reset";
+        REVOKE_PERSON = "revoke_person";
+        ENROLL_DEVICE = "enroll_device";
+        CONFIRM_DEVICE = "confirm_device";
+        REVOKE_DEVICE = "revoke_device";
+        PATH = "path";
+        ROOT = "root";
+        FEED = "feed";
+        FEED_AFTER = "feed_after";
+        SET_ONIONS = "set_onions";
+        ONIONS = "onions";
+        HANDLE = "handle";
+        COUNT = "count";
+        OPENING = "opening";
+    }
+}
+
 /// The most roots the ring keeps: it bounds storage, never freshness.
 pub const RING: usize = 64;
 

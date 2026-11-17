@@ -505,7 +505,7 @@ impl Client {
             registrar.agent,
             &registrar.identity,
             registrar.instance,
-            "onions",
+            vos_wire::credentials::method::ONIONS,
             Vec::new(),
             now + 60_000,
         )

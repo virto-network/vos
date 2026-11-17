@@ -23,9 +23,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use vos_abi::credentials::Digest as Bytes;
-use vos_abi::ids::InstanceId;
+use vos_abi::ids::{InstanceId, MethodId};
 use vos_abi::{Decode, Encode};
 use vos_wire::credentials::{meets, open_work};
+use vos_wire::homes;
 use vos_wire::personal::{Body, Entry, Kit, NewDevice};
 use zeroize::Zeroize;
 
@@ -33,7 +34,7 @@ pub use vos_wire::homes::SCOPE;
 
 use crate::group::{Agent, DeviceGroup, GroupError};
 use crate::kit::{KitKey, Split};
-use crate::store::{Store, StoreError};
+use crate::store::{Change, Store, StoreError};
 use crate::{AuthWitness, Call, DeviceError, DeviceProgram, DeviceSecret, Proven, Prover};
 use crate::{call, secret};
 
@@ -61,12 +62,17 @@ impl Home {
         nullifier(secret, &self.space, self.agent, self.homes.0)
     }
 
-    fn call(&self, method: &str, arguments: Vec<u8>, expires_ms: u64) -> Result<Call, DeviceError> {
+    fn call(
+        &self,
+        method: MethodId,
+        arguments: Vec<u8>,
+        expires_ms: u64,
+    ) -> Result<Call, DeviceError> {
         Call::new(
             self.space,
             self.agent,
             self.homes.0,
-            call::method_id(method),
+            method.0,
             arguments,
             expires_ms,
         )
@@ -87,7 +93,7 @@ pub fn open_claim(
         home.agent,
         &home.identity,
         home.credentials.0,
-        "claim_open",
+        vos_wire::credentials::method::CLAIM_OPEN,
         (*member, nonce).encode(),
         now,
     )
@@ -195,6 +201,19 @@ impl Claim {
         agent: u32,
         identity: [u8; 32],
     ) -> Result<Self, ClaimError> {
+        Self::prepare_with(store, device, keys, agent, identity, Vec::new())
+    }
+
+    /// [`Claim::prepare`], `rows` of the group keyspace written in the
+    /// same batch: what the claim makes the device's beside it.
+    pub fn prepare_with(
+        store: &Store,
+        device: NewDevice,
+        keys: Vec<KitKey>,
+        agent: u32,
+        identity: [u8; 32],
+        rows: Vec<Change>,
+    ) -> Result<Self, ClaimError> {
         if holds_archive(store)? || store.group_row(CLAIM_ROW)?.is_some() {
             return Err(ClaimError::Held);
         }
@@ -207,7 +226,9 @@ impl Claim {
             agent,
             identity,
         });
-        store.write_group_rows(vec![(CLAIM_ROW.to_vec(), Some(claim.0.encode()))])?;
+        let mut writes = vec![(CLAIM_ROW.to_vec(), Some(claim.0.encode()))];
+        writes.extend(rows);
+        store.write_group_rows(writes)?;
         Ok(claim)
     }
 
@@ -236,7 +257,7 @@ impl Claim {
         let mut arguments = self.0.device.encode();
         self.0.kit.encode_to(&mut arguments);
         self.0.agent.encode_to(&mut arguments);
-        let call = home.call("claim", arguments.clone(), expires_ms);
+        let call = home.call(homes::method::CLAIM, arguments.clone(), expires_ms);
         arguments.zeroize();
         call
     }
@@ -246,7 +267,14 @@ impl Claim {
     /// after `KitTaken`, with another kit, since the same key indexes the
     /// same agent again.
     pub fn abandon(self, store: &Store) -> Result<(), ClaimError> {
-        store.write_group_rows(vec![(CLAIM_ROW.to_vec(), None)])?;
+        self.abandon_with(store, Vec::new())
+    }
+
+    /// [`Claim::abandon`], `rows` written in the same batch.
+    pub fn abandon_with(self, store: &Store, rows: Vec<Change>) -> Result<(), ClaimError> {
+        let mut writes = vec![(CLAIM_ROW.to_vec(), None)];
+        writes.extend(rows);
+        store.write_group_rows(writes)?;
         Ok(())
     }
 
@@ -347,7 +375,7 @@ impl Prover {
         call: &Call,
         program: &DeviceProgram,
     ) -> Result<Proven, DeviceError> {
-        if call.method != call::method_id("claim") {
+        if call.method != homes::method::CLAIM.0 {
             return Err(DeviceError::Reserved);
         }
         self.prove_in_scope(secret, witness, SCOPE, call, program)

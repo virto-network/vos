@@ -390,6 +390,8 @@ test-gateway-onion: build-test-actors build-programs
 test-light-tor:
     cargo clippy -p vos-light --features tor --ignore-rust-version --all-targets --quiet -- -D warnings
     cargo test -p vos-light --features tor --ignore-rust-version --test tor --test tor_state
+    cargo clippy -p vos-light --features testing --ignore-rust-version --all-targets --quiet -- -D warnings
+    cargo test -p vos-light --features testing --ignore-rust-version --test space
     cargo test -p vos-light --features tor --ignore-rust-version --lib -- tor:: route::
 
 # The gateway's SSH port and its `vos-api` subsystem (`vos-gateway`'s
@@ -416,8 +418,8 @@ test-gateway-ssh: build-test-actors build-programs
 # the facility's own interface's round trip on a JVM when the JDK and the
 # SDK are here (`facility-contract`).
 test-facility: build-programs
-    cargo clippy --manifest-path node/light/android/Cargo.toml --features android --ignore-rust-version --all-targets --quiet -- -D warnings
-    cargo test --manifest-path node/light/android/Cargo.toml --features android --ignore-rust-version
+    cargo clippy --manifest-path node/light/android/Cargo.toml --features android,testing --ignore-rust-version --all-targets --quiet -- -D warnings
+    cargo test --manifest-path node/light/android/Cargo.toml --features android,testing --ignore-rust-version
     just facility-contract
 
 # The facility's own interface (`IVosPersonal`, the AAR's `src/main/aidl`)
@@ -585,7 +587,7 @@ _forbidden +gates:
         [debug-internals "--manifest-path pvm/proof/final-verifier/wasm/blob/Cargo.toml" [debug-internals] []] \
         [test-device-format "--workspace" [test-device-format] []] \
         [test-device-format "-p vos-cli --features prover" [test-device-format] []] \
-        [test-device-format "--manifest-path node/light/android/Cargo.toml --features android" [test-device-format] []] \
+        [test-device-format "--manifest-path node/light/android/Cargo.toml --features android" [test-device-format] [vos-testkit]] \
         [test-device-format "--manifest-path node/gateway/demo/Cargo.toml" [test-device-format] []] \
         [store-dump "-p vos-cli" [dump] []] \
         [store-dump "-p vos-cli --features prover" [dump] []] \

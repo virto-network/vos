@@ -5139,7 +5139,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s4-credential-contract"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=0bba2442e07386d9ab33e64e2339bc438af24cd4#0bba2442e07386d9ab33e64e2339bc438af24cd4"
+source = "git+https://codeberg.org/Virto/s4?rev=e548d93e6016cd01ef10d7180759579e3cf54f99#e548d93e6016cd01ef10d7180759579e3cf54f99"
 dependencies = [
  "hex",
  "jni",
@@ -5151,7 +5151,7 @@ dependencies = [
 [[package]]
 name = "s4-protocol"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=0bba2442e07386d9ab33e64e2339bc438af24cd4#0bba2442e07386d9ab33e64e2339bc438af24cd4"
+source = "git+https://codeberg.org/Virto/s4?rev=e548d93e6016cd01ef10d7180759579e3cf54f99#e548d93e6016cd01ef10d7180759579e3cf54f99"
 dependencies = [
  "base64",
  "ciborium",
@@ -5163,7 +5163,7 @@ dependencies = [
 [[package]]
 name = "s4-rui"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=0bba2442e07386d9ab33e64e2339bc438af24cd4#0bba2442e07386d9ab33e64e2339bc438af24cd4"
+source = "git+https://codeberg.org/Virto/s4?rev=e548d93e6016cd01ef10d7180759579e3cf54f99#e548d93e6016cd01ef10d7180759579e3cf54f99"
 dependencies = [
  "base64",
  "libc",
@@ -5181,7 +5181,7 @@ dependencies = [
 [[package]]
 name = "s4-server"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=0bba2442e07386d9ab33e64e2339bc438af24cd4#0bba2442e07386d9ab33e64e2339bc438af24cd4"
+source = "git+https://codeberg.org/Virto/s4?rev=e548d93e6016cd01ef10d7180759579e3cf54f99#e548d93e6016cd01ef10d7180759579e3cf54f99"
 dependencies = [
  "rand 0.10.3",
  "russh",
@@ -5194,7 +5194,7 @@ dependencies = [
 [[package]]
 name = "s4-widgets"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=0bba2442e07386d9ab33e64e2339bc438af24cd4#0bba2442e07386d9ab33e64e2339bc438af24cd4"
+source = "git+https://codeberg.org/Virto/s4?rev=e548d93e6016cd01ef10d7180759579e3cf54f99#e548d93e6016cd01ef10d7180759579e3cf54f99"
 dependencies = [
  "s4-protocol",
  "serde",
@@ -6419,21 +6419,6 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "0.9.12+spec-1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf92845e79fc2e2def6a5d828f0801e29a2f8acc037becc5ab08595c7d5e9863"
-dependencies = [
- "indexmap 2.14.0",
- "serde_core",
- "serde_spanned 1.1.1",
- "toml_datetime 0.7.5+spec-1.1.0",
- "toml_parser",
- "toml_writer",
- "winnow 0.7.15",
-]
-
-[[package]]
-name = "toml"
 version = "1.1.5+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "12c0ba9680044b4ce98d391a62094047eada0d64860b80166c39f4a6b5640785"
@@ -6454,15 +6439,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22cddaf88f4fbc13c51aebbf5f8eceb5c7c5a9da2ac40a13519eb5b0a0e8f11c"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "toml_datetime"
-version = "0.7.5+spec-1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92e1cfed4a3038bc5a127e35a2d360f145e1f4b971b551a2ba5fd7aedf7e1347"
-dependencies = [
- "serde_core",
 ]
 
 [[package]]
@@ -7900,7 +7876,6 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
- "toml 0.9.12+spec-1.1.0",
  "vos-abi",
  "vos-api",
  "vos-exec",
@@ -7924,6 +7899,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "fjall",
  "getrandom 0.2.17",
+ "hmac 0.12.1",
  "libc",
  "merkle-crdt",
  "rayon",
@@ -7944,6 +7920,7 @@ dependencies = [
  "vos-pvm-compiler",
  "vos-pvm-device",
  "vos-pvm-precompiles",
+ "vos-testkit",
  "vos-wire",
  "x25519-dalek",
  "zeroize",
@@ -8113,10 +8090,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "vos-sdk-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+ "vos-abi",
+]
+
+[[package]]
 name = "vos-testkit"
 version = "0.1.0"
 dependencies = [
  "blake2 0.10.6",
+ "ed25519-dalek 2.2.0",
  "vos-abi",
  "vos-pvm",
  "vos-pvm-compiler",
@@ -8139,6 +8127,7 @@ dependencies = [
  "vos-abi",
  "vos-pvm-codec",
  "vos-pvm-precompiles",
+ "vos-sdk-macros",
  "vos-tree",
 ]
 

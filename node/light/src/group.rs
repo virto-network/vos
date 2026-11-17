@@ -67,7 +67,7 @@ use vos_wire::personal::{
 use zeroize::Zeroize;
 
 use crate::kit::{KitKey, Split};
-use crate::store::{Store, StoreError};
+use crate::store::{Change, Store, StoreError};
 
 pub use archive::Archive;
 
@@ -594,7 +594,7 @@ impl Made {
     }
 
     fn vetoes_any(&self) -> bool {
-        self.method == crate::call::method_id("veto")
+        self.method == vos_wire::personal::method::VETO.0
     }
 }
 
@@ -824,16 +824,26 @@ pub fn credential(device: &NewDevice) -> Vec<u8> {
 /// [`DeviceGroup::restore`] makes it the kit's. Only for a store with no
 /// device group.
 pub fn restoring(store: &Store, keys: &[KitKey], agent: &Agent) -> Result<Split, GroupError> {
+    restoring_with(store, keys, agent, |_| Vec::new())
+}
+
+/// [`restoring`], the rows `rows` makes of the split written in the same
+/// batch: what the restore makes the device's beside it.
+pub fn restoring_with(
+    store: &Store,
+    keys: &[KitKey],
+    agent: &Agent,
+    rows: impl FnOnce(&Split) -> Vec<Change>,
+) -> Result<Split, GroupError> {
     if store.group_row(STATE)?.is_some() {
         return Err(GroupError::Grouped);
     }
     let split = Split::draw(keys, &agent.identity).ok_or(GroupError::Kit)?;
     let mut archive = store.archive()?;
     archive.draw(*split.r());
-    store.write_group_rows(vec![(
-        crate::store::ARCHIVE_ROW.to_vec(),
-        Some(archive.encode()),
-    )])?;
+    let mut writes = vec![(crate::store::ARCHIVE_ROW.to_vec(), Some(archive.encode()))];
+    writes.extend(rows(&split));
+    store.write_group_rows(writes)?;
     Ok(split)
 }
 
@@ -962,16 +972,33 @@ impl DeviceGroup {
     /// commit that adds it. Its store's archive becomes the pairing's; a
     /// store whose naming secret named a scope already is refused.
     pub fn join(store: &Store, me: NewDevice, pairing: Pairing) -> Result<Self, GroupError> {
+        Self::join_with(store, me, pairing, Vec::new())
+    }
+
+    /// [`DeviceGroup::join`], `rows` of the group keyspace written in the
+    /// batch that makes the group: what the pairing makes the device's
+    /// beside it.
+    pub fn join_with(
+        store: &Store,
+        me: NewDevice,
+        pairing: Pairing,
+        rows: Vec<Change>,
+    ) -> Result<Self, GroupError> {
         if store.group_row(STATE)?.is_some() {
             return Err(GroupError::Grouped);
         }
         if store.scoped()? {
             return Err(GroupError::Scoped);
         }
-        Self::joined(store, me, pairing)
+        Self::joined(store, me, pairing, rows)
     }
 
-    fn joined(store: &Store, me: NewDevice, pairing: Pairing) -> Result<Self, GroupError> {
+    fn joined(
+        store: &Store,
+        me: NewDevice,
+        pairing: Pairing,
+        extra: Vec<Change>,
+    ) -> Result<Self, GroupError> {
         let Pairing {
             agent,
             next,
@@ -1012,7 +1039,9 @@ impl DeviceGroup {
             assigned,
         };
         let mut mls = Mls::open(mls_namespace(store), &credential(&me), BTreeMap::new())?;
-        mls.write(rows(&state, Some(&archive)))?;
+        let mut writes = rows(&state, Some(&archive));
+        writes.extend(extra);
+        mls.write(writes)?;
         Ok(Self {
             store: store.clone(),
             mls,

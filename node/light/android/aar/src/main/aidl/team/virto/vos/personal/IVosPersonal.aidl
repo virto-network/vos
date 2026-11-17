@@ -13,7 +13,9 @@ import team.virto.vos.personal.Membership;
 import team.virto.vos.personal.Notice;
 import team.virto.vos.personal.PairCode;
 import team.virto.vos.personal.Paired;
+import team.virto.vos.personal.PersonalStatus;
 import team.virto.vos.personal.Posted;
+import team.virto.vos.personal.Refused;
 import team.virto.vos.personal.Synced;
 
 /**
@@ -21,8 +23,9 @@ import team.virto.vos.personal.Synced;
  * processes: the background jobs' passes, Tor's bridges, bootstrap and opt-outs, and the personal
  * space's flows. Served by `VosNodeService` in `:vos` beside s4's `IVosNode`, bound by the intent
  * action `team.virto.vos.personal.IVosPersonal`. An operation that refuses answers null, false or
- * 0 and fills its `out Refusal`; a `RemoteException` means the facility's process stopped. The
- * prompts an operation is lent are s4's `IVosPrompts`.
+ * 0 and fills its `out` refusal: the facility's own (the syncs, Tor) s4's `Refusal`, the personal
+ * space's a `Refused` the screens branch on; a `RemoteException` means the facility's process
+ * stopped. The prompts an operation is lent are s4's `IVosPrompts`.
  */
 interface IVosPersonal {
     /** One run of the spaces' sync, apart from every proof: the spaces' background job's. */
@@ -47,14 +50,21 @@ interface IVosPersonal {
      */
     boolean optOut(in byte[] handle, boolean optedOut, out Refusal refused);
 
+    /**
+     * The personal space's state, read without a request: what a screen branches on (its phase, a
+     * restore's maturity, Tor's state, the memberships owed, the notices standing). Refused only
+     * when this facility runs no personal space.
+     */
+    PersonalStatus status(out Refused refused);
+
     /** Claim a personal agent at a home-only space, with a kit of the kind asked. */
-    Claimed claim(in ClaimRequest request, IVosPrompts prompts, out Refusal refused);
+    Claimed claim(in ClaimRequest request, IVosPrompts prompts, out Refused refused);
 
     /** Open a pairing slot: the QR code to show. */
-    PairCode pairOffer(IVosPrompts prompts, out Refusal refused);
+    PairCode pairOffer(IVosPrompts prompts, out Refused refused);
 
     /** Drive the pairing the code shown opened to its end: the new device added. */
-    Paired pairAwait(IVosPrompts prompts, out Refusal refused);
+    Paired pairAwait(IVosPrompts prompts, out Refused refused);
 
     /**
      * Cancel the pairing under way (`pairAwait`'s or `pairJoin`'s): it answers its refusal at its
@@ -67,82 +77,82 @@ interface IVosPersonal {
      * space, or this one's once out of it (its removal matured, as after a regroup), leaves it
      * first; one the set still holds live is refused.
      */
-    Paired pairJoin(in byte[] code, String label, IVosPrompts prompts, out Refusal refused);
+    Paired pairJoin(in byte[] code, String label, IVosPrompts prompts, out Refused refused);
 
     /** The memberships owed on this device: enrollments of a device it paired, its confirmations. */
-    Membership[] memberships(out Refusal refused);
+    Membership[] memberships(out Refused refused);
 
     /** Enroll the device a pairing added in the membership's space, by this device's owner proof. */
-    boolean enrollDevice(in Membership membership, IVosPrompts prompts, out Refusal refused);
+    boolean enrollDevice(in Membership membership, IVosPrompts prompts, out Refused refused);
 
     /** This device's own confirmation in the membership's space. */
-    boolean confirmDevice(in Membership membership, IVosPrompts prompts, out Refusal refused);
+    boolean confirmDevice(in Membership membership, IVosPrompts prompts, out Refused refused);
 
     /** Give up an enrollment owed. */
-    boolean dropEnrollment(in Membership membership, out Refusal refused);
+    boolean dropEnrollment(in Membership membership, out Refused refused);
 
     /** Revoke a removed device's leaf in every space its handles name: how many. */
-    int revoke(long device, IVosPrompts prompts, out Refusal refused);
+    int revoke(long device, IVosPrompts prompts, out Refused refused);
 
     /** The device set, as the personal agent holds it. */
-    Device[] devices(out Refusal refused);
+    Device[] devices(out Refused refused);
 
     /** The device set's operations open. */
-    Notice[] operations(out Refusal refused);
+    Notice[] operations(out Refused refused);
 
     /** Remove a device (retire a phone), by the admin key. */
-    Posted remove(long device, IVosPrompts prompts, out Refusal refused);
+    Posted remove(long device, IVosPrompts prompts, out Refused refused);
 
     /** Veto an operation open, by the admin key. */
-    Posted veto(long index, IVosPrompts prompts, out Refusal refused);
+    Posted veto(long index, IVosPrompts prompts, out Refused refused);
 
     /** Cosign an operation open, which makes it immediate, by the admin key. */
-    Posted cosign(long index, IVosPrompts prompts, out Refusal refused);
+    Posted cosign(long index, IVosPrompts prompts, out Refused refused);
 
     /** Resolve a contested operation: upheld, or dropped. */
-    Posted resolve(long index, boolean upheld, IVosPrompts prompts, out Refusal refused);
+    Posted resolve(long index, boolean upheld, IVosPrompts prompts, out Refused refused);
 
     /** Rotate the recovery kit to a new one of the kind. */
-    Posted rotateKit(KitKind kit, IVosPrompts prompts, out Refusal refused);
+    Posted rotateKit(KitKind kit, IVosPrompts prompts, out Refused refused);
 
     /**
      * Replace this device's admin key with a new one (its old key lost, or
      * invalidated by a new biometric), the kit of the kind signing the
      * replacement: it matures after the kit's delay.
      */
-    Posted replaceAdmin(KitKind kit, IVosPrompts prompts, out Refusal refused);
+    Posted replaceAdmin(KitKind kit, IVosPrompts prompts, out Refused refused);
 
     /**
      * A new admin key for this device, offered to another seasoned device of the set to sign its
      * replacement (`replaceAdminOf`): the offer's bytes, device (u32 BE) ‖ key ‖ flags ‖ the
      * device's sync-key signature over them, which `replaceAdminOf` checks before it asks.
      */
-    byte[] adminOffer(IVosPrompts prompts, out Refusal refused);
+    byte[] adminOffer(IVosPrompts prompts, out Refused refused);
 
     /**
      * Another device's admin key replaced by the one its offer names, signed by this device's
      * admin key: a seasoned device other than the one replaced; the new key on its probation.
      */
-    Posted replaceAdminOf(in byte[] code, IVosPrompts prompts, out Refusal refused);
+    Posted replaceAdminOf(in byte[] code, IVosPrompts prompts, out Refused refused);
 
     /** Remove every other device and start a new group of this one alone. */
-    Posted regroup(IVosPrompts prompts, out Refusal refused);
+    Posted regroup(IVosPrompts prompts, out Refused refused);
 
     /** Commit now: every matured removal carried, this device's leaf updated. */
-    boolean update(IVosPrompts prompts, out Refusal refused);
+    boolean update(IVosPrompts prompts, out Refused refused);
 
     /**
      * Open a restore from the kit of kind `old` at the request's home, a new kit of the request's
      * kind split for it; it matures after the kit's delay unless a device answers.
      */
-    Posted restore(in ClaimRequest request, KitKind old, IVosPrompts prompts, out Refusal refused);
+    Posted restore(in ClaimRequest request, KitKind old, IVosPrompts prompts, out Refused refused);
 
     /** The restore matured: the kit entered again, the personal space read back. */
-    Claimed restored(KitKind kit, IVosPrompts prompts, out Refusal refused);
+    Claimed restored(KitKind kit, IVosPrompts prompts, out Refused refused);
 
     /**
      * Move to another home, carrying nothing: this device leaves the personal space it holds and
      * claims an agent there with a new kit of the kind asked; the other devices pair again.
      */
-    Claimed moveHome(in ClaimRequest request, IVosPrompts prompts, out Refusal refused);
+    Claimed moveHome(in ClaimRequest request, IVosPrompts prompts, out Refused refused);
 }

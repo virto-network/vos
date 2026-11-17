@@ -10,6 +10,29 @@ use scale::{Decode, Encode};
 
 use crate::personal::Policy;
 
+/// `Homes`' handlers.
+pub mod method {
+    methods! {
+        CONFIGURE = "configure";
+        STOCK = "stock";
+        RELEASE = "release";
+        CLAIM = "claim";
+        RENEW = "renew";
+        ASSIGNED = "assigned";
+        REFUSED = "refused";
+        RECORD = "record";
+        FORGET = "forget";
+        REKEY = "rekey";
+        POOLED = "pooled";
+        AGENT = "agent";
+        FIND = "find";
+        STANDING_OF = "standing_of";
+        TALLY = "tally";
+        AGENTS = "agents";
+        CONFIGURED = "configured";
+    }
+}
+
 /// The auth guard's name, and the scope's, of a claim and a re-proof: the
 /// light node proves in it only for these.
 pub const SCOPE: &[u8] = b"home";

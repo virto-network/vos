@@ -11,56 +11,22 @@
 mod common;
 
 use common::*;
-use s4_credential_contract::KeyAnswer;
 use vos_facility::job::{Passed, Personal, RUNS};
 use vos_facility::node::{Device, Node, Prompts};
 use vos_facility::{Enroll, Notice, Pending, Seen};
 use vos_light::group::Alarm;
 
-struct Phone;
-
-impl Device for Phone {
-    fn kinds(&self) -> Vec<Kind> {
-        vec![Kind::Keystore]
-    }
-}
-
-/// A client whose user confirms everything, its key in memory.
-struct Client;
-
-impl Prompts for Client {
-    fn confirm(&self, _: vos_facility::Form) -> vos_facility::Answer {
-        vos_facility::Answer::Confirmed {
-            choice: 0,
-            values: Vec::new(),
-        }
-    }
-
-    fn create_key(&self, _: Kind) -> KeyAnswer {
-        KeyAnswer::Done(b"vos.device.job".to_vec().into())
-    }
-
-    fn evaluate_key(&self, _: Kind, _: &[u8], input: &[u8; 32]) -> KeyAnswer {
-        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&[9; 32]).unwrap();
-        mac.update(input);
-        KeyAnswer::Done(mac.finalize().into_bytes().to_vec().into())
-    }
-
-    fn sign_key(&self, _: Kind, _: &[u8], _: &[u8]) -> KeyAnswer {
-        KeyAnswer::Declined
-    }
-}
-
 /// A node enrolled in the world's space, the member in its tree.
 fn enrolled(directory: &std::path::Path) -> (Node, Arc<World>) {
     let world = world();
-    let node = node(&world, directory, Arc::new(Phone));
+    let phone = Arc::new(Phone::new(9));
+    let node = node(&world, directory, Arc::clone(&phone) as Arc<dyn Device>);
     let session = node.open_session(gateway());
     let enrolled = node
         .enroll(
             session,
             Enroll::read(&enrollment()).unwrap(),
-            Arc::new(Client),
+            phone as Arc<dyn Prompts>,
         )
         .unwrap();
     world.enroll(AGENT, &enrolled.member);
@@ -145,7 +111,8 @@ fn removal() -> Notice {
         at: 1_000,
         matures: 1_000 + 72 * 3_600_000,
         fresh: false,
-        detail: "by device 1".into(),
+        by: 1,
+        ..Notice::default()
     }
 }
 
@@ -219,11 +186,9 @@ fn an_alarm_stands_after_the_pass_that_raised_it() {
     let (node, _world) = enrolled(directory.path());
     let alarm = Notice {
         pending: Pending::Alarm,
-        index: 0,
-        at: 0,
-        matures: 0,
-        fresh: false,
-        detail: "Rollback { next: 4 }".into(),
+        index: 4,
+        alarm: vos_facility::personal::contract::Alarm::Rollback,
+        ..Notice::default()
     };
     let rollback = Alarm::Rollback { next: 4 };
     let found = |notices: Vec<Notice>, stopped: Option<&str>| {

@@ -11,7 +11,6 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 /// A boxed future, as the facility's traits return them.
@@ -25,16 +24,14 @@ pub use s4_credential_contract::Kind;
 pub const RP_ID: &str = "vos.device";
 
 /// What the device keeps to reach its source again.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[derive(Clone, Debug, PartialEq, Eq, vos_abi::Encode, vos_abi::Decode)]
 pub enum Reference {
     /// The Keystore key's alias.
+    #[codec(index = 1)]
     Keystore { alias: String },
-    /// The security key's credential id, in hex.
-    SecurityKey {
-        #[serde(with = "hex_bytes")]
-        credential: Vec<u8>,
-    },
+    /// The security key's credential id.
+    #[codec(index = 2)]
+    SecurityKey { credential: Vec<u8> },
 }
 
 impl Reference {
@@ -98,18 +95,6 @@ pub trait Source: Send + Sync + 'static {
         reference: &'a Reference,
         input: [u8; 32],
     ) -> BoxFuture<'a, Result<Output, SourceError>>;
-}
-
-mod hex_bytes {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&hex::encode(bytes))
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
-        hex::decode(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
-    }
 }
 
 #[cfg(test)]

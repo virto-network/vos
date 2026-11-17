@@ -37,11 +37,11 @@
 //! No push-notification token is given to any space (§8, L3).
 
 use ed25519_dalek::Signer as _;
-use vos_abi::ids::InstanceId;
+use vos_abi::ids::{InstanceId, MethodId};
 use vos_abi::{Decode, Encode};
 use vos_wire::personal::{
     Attached, Body, DeviceId, DeviceView, Entry, Op, Overview, PersonalError, Recorded, Signer,
-    Vote, Voted,
+    Vote, Voted, method,
 };
 
 use crate::group::{self, Alarm, DeviceGroup, Event, Open};
@@ -87,13 +87,13 @@ pub enum Post {
 }
 
 impl Post {
-    /// The method's name.
-    pub fn name(&self) -> &'static str {
+    /// The method.
+    pub fn method(&self) -> MethodId {
         match self {
-            Post::Confirm { .. } => "confirm",
-            Post::Nack { .. } => "nack",
-            Post::Evidence { .. } => "evidence",
-            Post::Alive => "alive",
+            Post::Confirm { .. } => method::CONFIRM,
+            Post::Nack { .. } => method::NACK,
+            Post::Evidence { .. } => method::EVIDENCE,
+            Post::Alive => method::ALIVE,
         }
     }
 

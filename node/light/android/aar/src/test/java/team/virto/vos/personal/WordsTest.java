@@ -39,10 +39,28 @@ public final class WordsTest {
 
   @Test
   public void aContestIsReadFromTheDetail() {
-    assertTrue(Words.contested("by device 2, contested"));
-    assertFalse(Words.contested("by device 2"));
-    assertFalse(Words.contested("by the kit"));
-    assertFalse(Words.contested(null));
+    Notice notice = new Notice();
+    notice.pending = Pending.REMOVE;
+    notice.by = 2;
+    notice.contested = true;
+    assertEquals("A device is being removed (by device 2, contested)", Words.notice(notice));
+    notice.byKit = true;
+    assertEquals("A device is being removed (by the kit)", Words.notice(notice));
+    Notice alarm = new Notice();
+    alarm.pending = Pending.ALARM;
+    alarm.alarm = Alarm.CANNOT_FOLLOW;
+    alarm.index = 3;
+    alarm.remedy = Remedy.REGROUP;
+    assertEquals(
+        "This device cannot follow epoch 3: no other device to pair from, regroup",
+        Words.notice(alarm));
+    Refused regrouped = new Refused();
+    regrouped.why = Why.REGROUPED;
+    regrouped.device = 4;
+    assertEquals("device 4 regrouped: pair this phone again", Words.why(regrouped));
+    Refused theirs = new Refused();
+    Words.refused(ErrorCode.DECLINED, "", theirs);
+    assertEquals(Why.DECLINED, theirs.why);
   }
 
   @Test

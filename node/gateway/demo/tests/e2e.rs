@@ -17,48 +17,16 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hmac::{Hmac, Mac as _};
 use russh::keys::{PublicKeyOrCertificate, ssh_key};
 use russh::{ChannelMsg, client};
 use s4_protocol::{Message, Value};
 use vos_facility::chrome::{Answer, Chrome, Form};
 use vos_facility::enrollment::Store;
 use vos_facility::net::Net;
-use vos_facility::source::{BoxFuture, Kind, Output, Reference, Source, SourceError};
+use vos_facility::source::BoxFuture;
 use vos_facility::{Facility, Gateway, Operation, Session, Stock};
 use vos_gateway_demo::{LocalSpace, host_key, local, random};
 use vos_light::tor::{Circuit, Dial, Dialing, Stream, Target};
-
-/// An HMAC-SHA-256 key in memory, standing in for the phone's Keystore.
-struct Software([u8; 32]);
-
-impl Source for Software {
-    fn kinds(&self) -> Vec<Kind> {
-        vec![Kind::Keystore]
-    }
-
-    fn create(&self, _kind: Kind) -> BoxFuture<'_, Result<Reference, SourceError>> {
-        Box::pin(async {
-            Ok(Reference::Keystore {
-                alias: "vos.device.test".into(),
-            })
-        })
-    }
-
-    fn evaluate<'a>(
-        &'a self,
-        _reference: &'a Reference,
-        input: [u8; 32],
-    ) -> BoxFuture<'a, Result<Output, SourceError>> {
-        Box::pin(async move {
-            let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&self.0).expect("any key");
-            mac.update(&input);
-            Ok(Output::new(zeroize::Zeroizing::new(
-                mac.finalize().into_bytes().into(),
-            )))
-        })
-    }
-}
 
 /// The user, as a script: each form answered in turn, each kept.
 #[derive(Default)]
@@ -435,9 +403,13 @@ async fn demo(user: Arc<User>) -> (Arc<LocalSpace>, Headless, [tempfile::TempDir
     let _gateway = space.gateway(listener, host_key(), random(), vec![random()]);
     let store = tempfile::tempdir().unwrap();
     let net = Arc::new(Net::new(Arc::new(Local(address)), store.path()));
-    let facility = Facility::new(Store::new(store.path()), Arc::new(Software(random())), net)
-        .with_stock(stock())
-        .with_tick(Duration::from_millis(200));
+    let facility = Facility::new(
+        Store::new(store.path()),
+        Arc::new(vos_facility::testing::Phone::new(random::<1>()[0])),
+        net,
+    )
+    .with_stock(stock())
+    .with_tick(Duration::from_millis(200));
     let phone = Headless::connect(address, facility, user).await;
     (space, phone, [data, store])
 }

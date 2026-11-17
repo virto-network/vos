@@ -17,6 +17,8 @@ vos-pvm-compiler = { workspace = true }
 vos-tree = { workspace = true }
 vos-abi = { workspace = true }
 vos-wire = { workspace = true }
+# A personal agent's calls and queries checked as ingress checks them.
+ed25519-dalek = "2"
 
 [dev-dependencies]
 lz4_flex = "0.13"

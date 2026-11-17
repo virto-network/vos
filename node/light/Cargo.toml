@@ -30,6 +30,11 @@ tor = [
     "dep:data-encoding",
 ]
 
+# The personal space's test doubles (`testing`): one phone, one world of
+# homes behind an in-process gateway, a phone's host over it. Tests and
+# tools only.
+testing = ["tor", "release", "dep:vos-testkit", "dep:hmac"]
+
 [dependencies]
 # The local agent's store.
 fjall = { workspace = true }
@@ -83,6 +88,9 @@ tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync", "ma
 tokio-util = { version = "0.7", features = ["compat"], optional = true }
 sha3 = { version = "0.10", optional = true }
 data-encoding = { version = "2", optional = true }
+# The test doubles' personal agents and keys (`testing`).
+vos-testkit = { path = "../../agent/testkit", optional = true }
+hmac = { version = "0.12", optional = true }
 
 [dev-dependencies]
 # The release build, as the tests compute the artifacts.
@@ -115,6 +123,10 @@ required-features = ["tor"]
 [[test]]
 name = "tor_state"
 required-features = ["tor"]
+
+[[test]]
+name = "space"
+required-features = ["testing"]
 
 [[example]]
 name = "devices"

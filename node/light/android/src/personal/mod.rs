@@ -1,755 +1,485 @@
 // SPDX-FileCopyrightText: 2026 Virto
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! The device's personal space (VOS's `light-node.md` §3): the light node
-//! with its local actors, the device group at the personal agent, and the
-//! flows the chrome drives, each the light node's own, over Tor alone.
-//!
-//! - **What the device keeps** ([`FILE`], and the light node's store under
-//!   [`LIGHT`]): the home and the agent it claimed or joined, the secret
-//!   source's key it proves there with, its admin key's public half (the key is
-//!   the UI's, behind a strong biometric), its label. Every group, claim and
-//!   pairing row is the light node's, each change one batch. The file is
-//!   versioned ([`STATE_VERSION`]): one this build does not read is refused and
-//!   kept as it is, the personal space named in need of repair, sign-in and
-//!   payments unaffected.
-//! - **What a flow keeps before its step at the agent**: each key the
-//!   moment it is made, and the home and agent the flow takes the group to
-//!   before the call that makes it so; a restart finishes what the store
-//!   shows done ([`Space::open`]), a flow called again resumes what it
-//!   shows held, and the pass finishes what needs no prompt (an
-//!   acknowledgement, the credential book).
-//! - **The flows** ([`Space`]'s methods): the claim at a home-only space
-//!   with a phrase or a security-key kit; pairing, as the device that shows
-//!   the code ([`Space::pair_offer`], [`Space::pair_await`]) and as the one
-//!   that scans it ([`Space::pair_join`], which also pairs again a device
-//!   that holds another personal space, or a removed one, leaving it
-//!   first); the memberships a pairing leaves; the device set's
-//!   operations; a restore from the kit; a move home.
-//! - **Leaving** ([`Space::leave`]): a device gives up the personal space
-//!   it holds with no call to its agent: its light node's store made anew,
-//!   as at a fresh install. A move home is a leave and a claim at the new
-//!   home, a device paired again after a move or a regroup a leave and a
-//!   pairing: nothing is carried, since the personal space holds the
-//!   credential book and the device book alone, which each device writes
-//!   again from what it holds ([`Artifacts::embedded`]).
-//! - **The prompts are the UI's**: a form, a secret source's output, a
-//!   security key's `hmac-secret`, the admin key's signature over bytes
-//!   prepared here; none is asked outside a flow the user started.
-//! - **The pass** ([`crate::job::Personal`]): the background job's, on the
-//!   `Background` isolation group, a flow's on `Personal`; the personal
-//!   agent's traffic never shares a circuit with a proof.
+//! The device's personal space (VOS's `light-node.md` §3), as the
+//! facility serves it: `vos_light::space`'s flows over the facility's
+//! client, prover and enrollments ([`Reach`]), the chrome's prompts in
+//! their forms ([`Asked`]), the interface's types converted at the
+//! boundary and each flow's error a [`Refusal`]. The orchestration is
+//! `vos-light`'s; nothing of it is here.
 
 pub mod contract;
-pub mod link;
-mod ops;
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::path::Path;
+use std::sync::Arc;
 
-use ed25519_dalek::SigningKey;
 use vos_abi::ids::InstanceId;
-use vos_abi::result::Outcome;
-use vos_abi::{Decode, Encode};
-use vos_light::group::{Alarm, DeviceGroup};
-use vos_light::home::Home as HomeSpace;
-use vos_light::kit::KitKey;
-use vos_light::memberships;
-use vos_light::route::Purpose;
-use vos_light::{Config, Light};
+use vos_light::group::Alarm;
+use vos_light::route::{Purpose, Route};
+use vos_light::space::{self, AdminKey, Approval, Card, Enrolled, Error, Host, Proof};
+use vos_light::wire;
 use vos_wire::credentials::Onion;
-use vos_wire::personal::{NewDevice, NewKit};
+use zeroize::Zeroizing;
 
-use crate::enrollment::{create_private, write_private};
 use crate::job::{Passed, Personal};
-use crate::net::{Net, Pinned};
+use crate::net::Pinned;
 use crate::node::Prompts;
-use crate::source::Reference;
-use crate::{Code, Facility, Refusal, refused};
-use link::{Agent, AgentLink, Signer};
+use crate::session::Inner;
+use crate::source::{Kind, Reference};
+use crate::{Answer, Code, Facility, Field, Form};
+use s4_credential_contract::KeyAnswer;
 
 pub use contract::{
     Claim, Claimed, Device, Home, KitKind, MAX_LABEL, Membership, Notice, Owed, PairCode, Paired,
-    Pending, Posted, Seen, Synced, label,
+    Pending, PersonalStatus, Phase, Posted, Refused, Seen, Synced, Tor, Why, label,
 };
-pub use ops::{AdminOffer, Removal};
+pub use vos_light::space::{AdminOffer, Artifacts, CREDENTIAL_BOOK, DEVICE_BOOK, LIGHT, PERSONAL};
 
-impl Held {
-    /// [`State::arrived`] by the group held.
-    fn arrived(&mut self) -> bool {
-        let Held { state, group, .. } = self;
-        state.arrived(group.as_ref())
+/// The light node's artifacts this crate embeds (`just facility-release`):
+/// the default agent's program, and the local actors' packages.
+pub fn embedded() -> Artifacts {
+    Artifacts {
+        agent: include_bytes!("../../release/agent.program").to_vec(),
+        books: vec![
+            (
+                CREDENTIAL_BOOK,
+                include_bytes!("../../release/credential-book.package").to_vec(),
+            ),
+            (
+                DEVICE_BOOK,
+                include_bytes!("../../release/device-book.package").to_vec(),
+            ),
+        ],
     }
 }
 
-/// The personal space's file, beside the enrollments: [`MAGIC`], its
-/// version (u16, little-endian), then what the device keeps.
-pub const FILE: &str = "personal.state";
-/// The file's first bytes.
-const MAGIC: &[u8; 8] = b"vos/pst\0";
-/// The version of what the file keeps, which this build writes. A file of
-/// another version, or of none (an earlier build's), is refused and its
-/// bytes kept ([`read_state`]).
-pub const STATE_VERSION: u16 = 3;
-/// The light node's store, under the facility's directory: the directory
-/// of the first store, and the prefix of each later one's, which a leave
-/// makes anew ([`light_dir`]).
-pub const LIGHT: &str = "light";
-/// `Personal`'s instance in every personal agent.
-pub const PERSONAL: InstanceId = InstanceId(5);
-/// The local actors: the credential book and the device book.
-pub const CREDENTIAL_BOOK: InstanceId = InstanceId(1);
-pub const DEVICE_BOOK: InstanceId = InstanceId(2);
+/// A removed device whose leaf a retirement revokes in each space.
+pub type Removal = u32;
 
-/// The light node's artifacts this crate embeds (`just facility-release`): the
-/// default agent's program, and the local actors' packages.
-#[derive(Clone)]
-pub struct Artifacts {
-    pub agent: Vec<u8>,
-    pub books: Vec<(InstanceId, Vec<u8>)>,
-}
-
-impl Artifacts {
-    /// The local actors are the credential book and the device book, which
-    /// each device writes again from what it holds: so a leave, a move home
-    /// among them, carries nothing ([`Space::leave`]). A local actor holding
-    /// what no device writes again needs the move to carry its scope first.
-    pub fn embedded() -> Self {
-        Self {
-            agent: include_bytes!("../../release/agent.program").to_vec(),
-            books: vec![
-                (
-                    CREDENTIAL_BOOK,
-                    include_bytes!("../../release/credential-book.package").to_vec(),
-                ),
-                (
-                    DEVICE_BOOK,
-                    include_bytes!("../../release/device-book.package").to_vec(),
-                ),
-            ],
-        }
-    }
-}
-
-/// A home as kept: where it is, and its onions.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct Kept {
-    pub home: HomeSpace,
-    pub onions: Vec<Onion>,
-}
-
-/// What the device keeps of its personal space.
-#[derive(Clone, Default, Encode, Decode)]
-struct State {
-    /// The home its agent is at.
-    home: Option<Kept>,
-    /// The agent and its identity.
-    agent: Option<(u32, [u8; 32])>,
-    /// The secret source's key the device proves with at its homes and
-    /// derives its handles in offered spaces from (`Reference::to_bytes`).
-    source: Option<Vec<u8>>,
-    /// The admin key's public half and its attestation, as its key in the
-    /// UI's keystore answered them.
-    admin: Option<([u8; 32], bool, bool)>,
-    label: String,
-    /// The home and agent a claim, a pairing or a move takes the group
-    /// to, kept before the step that makes it so at the agent, until the
-    /// store's group is there.
-    bound: Option<Bound>,
-    /// The admin keys offered to replace this device's, the newest last,
-    /// until the set shows one of them.
-    next_admin: Vec<([u8; 32], bool, bool)>,
-    /// A restore opened, from before its call until it matures.
-    restoring: Option<Restoring>,
-    /// A joiner's acknowledgement of its pairing's handover, kept before
-    /// it is put in the slot, until it is.
-    acked: Option<Acked>,
-    /// Each local actor's instance and the release installed there.
-    books: Vec<(u32, u32)>,
-    /// The light node's store's generation: its directory
-    /// ([`light_dir`]), the next one's made by each leave.
-    store: u32,
-}
-
-/// The directory of the light node's store of `generation` under
-/// `directory`.
-fn light_dir(directory: &Path, generation: u32) -> PathBuf {
-    match generation {
-        0 => directory.join(LIGHT),
-        n => directory.join(format!("{LIGHT}.{n}")),
-    }
-}
-
-/// The stores of generations other than `generation` under `directory`,
-/// deleted: a leave's old store, or the new one a leave cut short before
-/// it was the device's.
-fn drop_stores(directory: &Path, generation: u32) {
-    let current = light_dir(directory, generation);
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let ours = name == LIGHT
-            || name
-                .strip_prefix(LIGHT)
-                .is_some_and(|rest| rest.starts_with('.'));
-        if ours && path != current && path.is_dir() {
-            let _ = std::fs::remove_dir_all(&path);
-        }
-    }
-}
-
-/// Where a flow takes the device's group: the home, and the agent there.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-struct Bound {
-    home: Kept,
-    agent: (u32, [u8; 32]),
-}
-
-/// A restore opened at the agent of `home`: the next kit's key and its
-/// `R`'s hash; the call's arguments (this device, the kit split for it);
-/// the `R2` its evidence carries, until it is posted; and the kit-signed
-/// call as signed, before it was sent.
-#[derive(Clone, Encode, Decode)]
-struct Restoring {
-    next: KitKey,
-    r_hash: [u8; 32],
-    arguments: Vec<u8>,
-    r2: Option<[u8; 32]>,
-    signed: Option<(Vec<u8>, [u8; 64])>,
-}
-
-impl Restoring {
-    /// A restore of `device` with `kit`, split for the next kit `next`.
-    fn new(device: &NewDevice, kit: &NewKit, next: KitKey, r2: [u8; 32]) -> Self {
-        Self {
-            next,
-            r_hash: kit.r_hash,
-            arguments: (device.clone(), kit.clone()).encode(),
-            r2: Some(r2),
-            signed: None,
-        }
-    }
-}
-
-/// A joiner's acknowledgement, and what its put in the slot takes of the
-/// code scanned: the home's handle and onions, the agent, the slot key's
-/// seed and the slot's expiry (ms). Nothing else of the code is kept.
-#[derive(Clone, Encode, Decode)]
-struct Acked {
-    handle: [u8; 32],
-    onions: Vec<Onion>,
-    agent: (u32, [u8; 32]),
-    slot: [u8; 32],
-    expires: u64,
-    ack: Vec<u8>,
-}
-
-/// What `bytes`, `personal.state`'s, keep, or why this build does not read
-/// them.
-fn read_state(bytes: &[u8]) -> Result<State, String> {
-    let body = bytes
-        .strip_prefix(MAGIC.as_slice())
-        .ok_or("names no version")?;
-    let (version, body) = body.split_first_chunk::<2>().ok_or("is cut short")?;
-    match u16::from_le_bytes(*version) {
-        STATE_VERSION => State::decode_exact(body).ok_or_else(|| "does not decode".into()),
-        other => Err(format!(
-            "is of version {other}, and this build reads {STATE_VERSION}"
-        )),
-    }
-}
-
-/// `state` as `personal.state` keeps it.
-fn state_bytes(state: &State) -> Vec<u8> {
-    let mut bytes = MAGIC.to_vec();
-    bytes.extend_from_slice(&STATE_VERSION.to_le_bytes());
-    state.encode_to(&mut bytes);
-    bytes
-}
-
-impl State {
-    /// A pairing's what the store shows it never joined dropped: the
-    /// home and agent it was to take the group to, its acknowledgement.
-    /// Whether it changed.
-    fn unjoined(
-        &mut self,
-        store: &vos_light::Store,
-        group: Option<&DeviceGroup>,
-    ) -> Result<bool, Refusal> {
-        let Some(bound) = &self.bound else {
-            return Ok(false);
-        };
-        let there = group.is_some_and(|group| group.agent().identity == bound.agent.1);
-        let held = vos_light::home::Claim::pending(store)
-            .map_err(store_failed)?
-            .is_some();
-        if there || held {
-            return Ok(false);
-        }
-        self.bound = None;
-        self.acked = None;
-        Ok(true)
-    }
-
-    /// The home and agent a flow took the group to are the device's once
-    /// the store's group is at that agent: a claim, a pairing or a move
-    /// whose last step the process did not live to see. Whether it
-    /// changed.
-    fn arrived(&mut self, group: Option<&DeviceGroup>) -> bool {
-        let at = |bound: &Bound| group.is_some_and(|group| group.agent().identity == bound.agent.1);
-        match self.bound.take() {
-            Some(bound) if at(&bound) => {
-                self.home = Some(bound.home);
-                self.agent = Some(bound.agent);
-                true
-            }
-            other => {
-                self.bound = other;
-                false
-            }
-        }
-    }
-}
-
-/// The personal space in need of repair: what does not read, kept as it
-/// is.
-fn needs_repair(why: impl std::fmt::Display) -> Refusal {
-    refused(
-        Code::Store,
-        format!(
-            "the personal space needs repair: {why}. Nothing was changed; sign-in and payments \
-             are not affected"
-        ),
-    )
-}
-
-/// Each local actor in `books` installed, or upgraded in place: one not
-/// installed, or installed at a release before the package's. `kept`
-/// holds each instance's release installed; whether it changed.
-fn install(
-    light: &Light,
-    books: &[(InstanceId, Vec<u8>)],
-    kept: &mut Vec<(u32, u32)>,
-) -> Result<bool, Refusal> {
-    let installed = light.instances().map_err(store_failed)?;
-    let mut changed = false;
-    for (instance, package) in books {
-        let package = vos_light::release::Package::decode_exact(package)
-            .ok_or_else(|| store_failed("a local actor's package does not decode"))?;
-        let at = kept
-            .iter()
-            .find(|(id, _)| *id == instance.0)
-            .map(|(_, release)| *release);
-        if installed.contains(instance) && at.is_some_and(|at| at >= package.release) {
-            continue;
-        }
-        let release = match light.install(*instance, &package, Vec::new()) {
-            Ok(Outcome::Done(_)) => package.release,
-            Ok(other) => {
-                return Err(store_failed(format!(
-                    "a local actor's install answered {other:?}"
-                )));
-            }
-            // Installed already at a later release than this build's.
-            Err(vos_light::Error::Release { installed }) if installed > package.release => {
-                installed
-            }
-            Err(error) => return Err(store_failed(error)),
-        };
-        kept.retain(|(id, _)| *id != instance.0);
-        kept.push((instance.0, release));
-        changed = true;
-    }
-    Ok(changed)
-}
-
-/// What a flow holds while it runs: the light node, its device group, the
-/// keys' sessions, and a pairing under way.
-struct Held {
-    light: Light,
-    group: Option<DeviceGroup>,
-    state: State,
-    sync: Signer,
-    admin: Signer,
-    pairing: Option<ops::Pairing>,
-}
-
-/// The device's personal space.
-pub struct Space {
+/// The facility as the personal space's host: requests over its client on
+/// its runtime, proofs on its prover one at a time, its enrollments.
+pub struct Reach {
     facility: Facility,
     runtime: tokio::runtime::Handle,
-    file: PathBuf,
-    held: Mutex<Held>,
-    waiting: Waiting,
-    /// How long a flow waits for the agent (ms): [`ops::WAIT`] unless set.
-    wait: AtomicU64,
-    /// The light node's store and the source kept, as an enrollment asks
-    /// them while a flow holds the rest.
-    owed: (Mutex<vos_light::Store>, Mutex<Option<Vec<u8>>>),
-    /// The facility's directory, and the artifacts a store made anew
-    /// installs ([`Space::leave`]).
-    directory: PathBuf,
-    artifacts: Artifacts,
 }
 
-/// Whether a pairing waits on its slot, and whether the chrome cancelled
-/// it: kept apart from the held state, so a cancel never waits for the
-/// pairing it stops, which reads it between two reads of the slot.
-#[derive(Default)]
-struct Waiting {
-    waiting: AtomicBool,
-    cancelled: AtomicBool,
-}
-
-impl Waiting {
-    fn start(&self) {
-        self.cancelled.store(false, Ordering::SeqCst);
-        self.waiting.store(true, Ordering::SeqCst);
+impl Host for Reach {
+    fn request(
+        &self,
+        space: &[u8; 32],
+        purpose: Purpose,
+        request: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        self.runtime
+            .block_on(self.facility.net().request(*space, purpose, request))
     }
 
-    fn end(&self) {
-        self.waiting.store(false, Ordering::SeqCst);
-        self.cancelled.store(false, Ordering::SeqCst);
-    }
-
-    fn cancel(&self) {
-        if self.waiting.load(Ordering::SeqCst) {
-            self.cancelled.store(true, Ordering::SeqCst);
-        }
-    }
-
-    fn cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
-    }
-}
-
-fn store_failed(error: impl std::fmt::Display) -> Refusal {
-    refused(Code::Store, format!("the personal space's store: {error}"))
-}
-
-pub(crate) fn failed(error: impl std::fmt::Display) -> Refusal {
-    refused(Code::Failed, error.to_string())
-}
-
-pub(crate) fn unreached(error: impl std::fmt::Display) -> Refusal {
-    refused(Code::Api, error.to_string())
-}
-
-impl Space {
-    /// The personal space under `directory` (the facility's), its light
-    /// node opened from `artifacts`, its local actors installed or
-    /// upgraded, what a flow left done in the store made the device's, its
-    /// homes' routes told to the facility's client. A state file or a
-    /// store this build does not read is refused as in need of repair, and
-    /// left as it is.
-    pub fn open(
-        directory: &Path,
-        artifacts: &Artifacts,
-        facility: Facility,
-        runtime: tokio::runtime::Handle,
-    ) -> Result<Self, Refusal> {
-        let file = directory.join(FILE);
-        let mut state = match std::fs::read(&file) {
-            Ok(bytes) => {
-                read_state(&bytes).map_err(|why| needs_repair(format!("its file {why}")))?
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => State::default(),
-            Err(error) => return Err(needs_repair(format!("its file does not read: {error}"))),
-        };
-        drop_stores(directory, state.store);
-        let dir = light_dir(directory, state.store);
-        create_private(&dir).map_err(store_failed)?;
-        let light = Light::open(&dir, &artifacts.agent, Config::default())
-            .map_err(|error| needs_repair(format!("its store: {error}")))?;
-        let mut changed = install(&light, &artifacts.books, &mut state.books)?;
-        let group = DeviceGroup::open(light.store())
-            .map_err(|error| needs_repair(format!("its device group: {error}")))?;
-        changed |= state.arrived(group.as_ref());
-        changed |= state.unjoined(light.store(), group.as_ref())?;
-        if state
-            .acked
-            .as_ref()
-            .is_some_and(|acked| acked.expires < crate::job::now_ms())
-        {
-            state.acked = None;
-            changed = true;
-        }
-        let sync = Signer::new(light.sync_key().verifying_key().to_bytes());
-        let admin = Signer::new(state.admin.map(|(key, ..)| key).unwrap_or_default());
-        let owed = (
-            Mutex::new(light.store().clone()),
-            Mutex::new(state.source.clone()),
-        );
-        let space = Self {
-            facility,
-            runtime,
-            file,
-            held: Mutex::new(Held {
-                light,
-                group,
-                state,
-                sync,
-                admin,
-                pairing: None,
-            }),
-            waiting: Waiting::default(),
-            wait: AtomicU64::new(ops::WAIT_MS),
-            owed,
-            directory: directory.to_path_buf(),
-            artifacts: artifacts.clone(),
-        };
-        let held = space.held();
-        if changed {
-            space.keep(&held.state)?;
-        }
-        let bound = held.state.bound.as_ref().map(|bound| &bound.home);
-        for kept in [held.state.home.as_ref(), bound].into_iter().flatten() {
-            space.pin(kept);
-        }
-        drop(held);
-        Ok(space)
-    }
-
-    fn held(&self) -> MutexGuard<'_, Held> {
-        self.held.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn net(&self) -> &Net {
-        self.facility.net()
-    }
-
-    /// A home's routes: its onions, onion-only (E17).
-    fn pin(&self, kept: &Kept) {
-        self.net().pin(
-            kept.home.handle,
+    fn pin(&self, home: &[u8; 32], onions: &[Onion]) {
+        self.facility.net().pin(
+            *home,
             Pinned {
-                onions: kept.onions.clone(),
+                onions: onions.to_vec(),
                 clearnet: None,
                 onion_only: true,
             },
         );
     }
 
-    fn keep(&self, state: &State) -> Result<(), Refusal> {
-        write_private(&self.file, &state_bytes(state)).map_err(store_failed)?;
-        *self.owed.1.lock().unwrap_or_else(|e| e.into_inner()) = state.source.clone();
-        Ok(())
-    }
-
-    /// Whether the device holds a personal space's group.
-    pub fn grouped(&self) -> bool {
-        self.held().group.is_some()
-    }
-
-    /// Leave the personal space this device holds, for good, with no call
-    /// to its agent: a store made anew under the next generation's
-    /// directory, the local actors installed there, then made the device's
-    /// by one write of the state file, which drops the home, the agent, the
-    /// admin key and every flow's state and keeps the source and the label;
-    /// the old store's directory deleted after. The device then holds no
-    /// personal space, as at a fresh install: it claims, or pairs, with new
-    /// sync and admin keys. Cut short before the write, the old space
-    /// stands; after it, the old directory goes at the next open.
-    fn leave(&self, held: &mut Held) -> Result<(), Refusal> {
-        let generation = held.state.store + 1;
-        let dir = light_dir(&self.directory, generation);
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir).map_err(store_failed)?;
+    fn route(&self, space: &[u8; 32], purpose: Purpose) -> Route {
+        match self.facility.net().client().routes(space) {
+            Some(routes) => routes.route(purpose).unwrap_or(Route::Clearnet),
+            None => Route::Clearnet,
         }
-        create_private(&dir).map_err(store_failed)?;
-        let light =
-            Light::open(&dir, &self.artifacts.agent, Config::default()).map_err(store_failed)?;
-        let mut state = State {
-            source: held.state.source.clone(),
-            label: held.state.label.clone(),
-            store: generation,
-            ..State::default()
+    }
+
+    fn prove(&self, proof: Proof) -> Result<Vec<u8>, Error> {
+        let inner = Arc::clone(self.facility.inner());
+        let proved = match proof {
+            Proof::Home {
+                secret,
+                witness,
+                call,
+            } => self.runtime.block_on(Inner::prove(
+                &inner,
+                |stock| &stock.auth,
+                move |prover, program| {
+                    let proof = prover.prove_home(&secret, &witness, &call, program);
+                    drop(secret);
+                    proof.map(|proof| wire::credentialed(&call, &proof))
+                },
+            )),
+            Proof::Owner { secret, call } => self.runtime.block_on(Inner::prove(
+                &inner,
+                |stock| &stock.owner,
+                move |prover, program| {
+                    let proof = prover.prove_owner(&secret, &call, program);
+                    drop(secret);
+                    proof.map(|proof| wire::credentialed(&call, &proof))
+                },
+            )),
         };
-        install(&light, &self.artifacts.books, &mut state.books)?;
-        self.keep(&state)?;
-        *self.owed.0.lock().unwrap_or_else(|e| e.into_inner()) = light.store().clone();
-        held.sync = Signer::new(light.sync_key().verifying_key().to_bytes());
-        held.admin = Signer::new([0; 32]);
-        held.group = None;
-        held.pairing = None;
-        held.state = state;
-        held.light = light;
-        drop_stores(&self.directory, generation);
-        Ok(())
-    }
-
-    /// How long a flow waits for the agent (ms), [`ops::WAIT`] unless
-    /// set: tests shorten it.
-    #[doc(hidden)]
-    pub fn set_wait(&self, ms: u64) {
-        self.wait.store(ms, Ordering::Relaxed);
-    }
-
-    fn wait(&self) -> std::time::Duration {
-        std::time::Duration::from_millis(self.wait.load(Ordering::Relaxed))
-    }
-
-    /// The data key of the scope `name` names at the confirmed epoch.
-    pub fn scope_key(&self, name: &[u8]) -> Result<[u8; 32], Refusal> {
-        let mut held = self.held();
-        let group = held
-            .group
-            .as_mut()
-            .ok_or_else(|| refused(Code::NotEnrolled, "this device holds no personal space"))?;
-        let scope = group.archive().scope(name);
-        group.key(scope).map_err(failed)
-    }
-
-    /// How many spaces the credential book records `device`'s handle in,
-    /// as this device's light node reads the book: what reached it.
-    #[doc(hidden)]
-    pub fn recorded(&self, device: u32) -> usize {
-        memberships::handles_of(&self.held().light, CREDENTIAL_BOOK, device)
-            .map_or(0, |handles| handles.len())
-    }
-
-    /// The light node's sync key's public half: the device's author.
-    pub fn sync_key(&self) -> [u8; 32] {
-        self.held().light.sync_key().verifying_key().to_bytes()
-    }
-}
-
-/// A link of `purpose` to the agent `agent` at `home`, its sync key's
-/// session `signer`.
-fn link<'a>(
-    net: &'a Net,
-    runtime: &'a tokio::runtime::Handle,
-    home: &Kept,
-    purpose: Purpose,
-    agent: (u32, [u8; 32]),
-    sync: &'a SigningKey,
-    signer: &'a mut Signer,
-) -> AgentLink<'a> {
-    AgentLink::new(
-        net,
-        runtime,
-        home.home.handle,
-        purpose,
-        Agent {
-            agent: agent.0,
-            identity: agent.1,
-            instance: PERSONAL,
-        },
-        sync,
-        signer,
-    )
-}
-
-impl Personal for Space {
-    /// The background job's pass, on its own isolation group: a joiner's
-    /// acknowledgement left by a process that died first put in its slot,
-    /// the light node's job, and the credential book's records of this
-    /// device's enrollments.
-    fn pass(&self, now: u64, runtime: &tokio::runtime::Handle) -> Result<Passed, String> {
-        let mut held = self.held();
-        let mut failures = Vec::new();
-        if let Err(refusal) = self.acknowledge(&mut held) {
-            failures.push(format!(
-                "the pairing's acknowledgement: {}",
-                refusal.message
-            ));
-        }
-        let Held {
-            light,
-            group,
-            state,
-            sync,
-            ..
-        } = &mut *held;
-        let (Some(group), Some(home), Some(agent)) = (group.as_mut(), &state.home, state.agent)
-        else {
-            return Err("no personal space".into());
-        };
-        let key = light.sync_key().clone();
-        let mut link = link(
-            self.net(),
-            runtime,
-            home,
-            Purpose::Background,
-            agent,
-            &key,
-            sync,
-        );
-        let instances = light.instances().map_err(|error| error.to_string())?;
-        let pass = match vos_light::job::run(light, group, &mut link, &instances, now) {
-            Ok(pass) => pass,
-            Err(stopped) => {
-                failures.push(stopped.error.to_string());
-                *stopped.pass
-            }
-        };
-        if let Some(device) = group.id() {
-            self.book(light, device);
-        }
-        Ok(Passed {
-            notices: pass.notices().into_iter().map(crate::job::notice).collect(),
-            alarms: pass.alarms.clone(),
-            seen: pass
-                .seen
-                .iter()
-                .map(|(device, at)| Seen {
-                    device: *device,
-                    at: *at,
-                })
-                .collect(),
-            stopped: (!failures.is_empty()).then(|| failures.join("; ")),
+        proved.map_err(|refusal| match refusal.code {
+            Code::Refused => Error::Update,
+            _ => Error::Prove(refusal.message),
         })
     }
 
-    fn acknowledge(&self, alarms: &[Alarm]) -> Result<(), String> {
-        let mut held = self.held();
-        let group = held.group.as_mut().ok_or("no personal space")?;
-        group.acknowledge(alarms).map_err(|error| error.to_string())
+    fn enrollments(&self) -> Result<Vec<Enrolled>, String> {
+        Ok(self
+            .facility
+            .inner()
+            .store
+            .all()?
+            .into_iter()
+            .map(|enrollment| Enrolled {
+                space: enrollment.space,
+                handle: enrollment.handle,
+                member: enrollment.member,
+                owner: enrollment.owner,
+                source: enrollment.source.to_bytes(),
+                credentials: (
+                    enrollment.credentials.agent,
+                    enrollment.credentials.instance,
+                ),
+                agents: enrollment
+                    .agents
+                    .iter()
+                    .map(|agent| (agent.agent, agent.identity))
+                    .collect(),
+            })
+            .collect())
+    }
+
+    fn now(&self) -> u64 {
+        crate::job::now_ms()
     }
 }
 
-impl crate::session::Paired for Space {
-    fn owed_source(&self, handle: &[u8; 32]) -> Result<Option<Reference>, String> {
-        let store = self
-            .owed
-            .0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let owed = memberships::confirmations(&store).map_err(|error| error.to_string())?;
-        if !owed.iter().any(|membership| membership.handle == *handle) {
-            return Ok(None);
+/// The chrome's prompts, lent to one flow, as the personal space asks
+/// them: each kit shown and entered in a form, each key's use the UI's.
+pub struct Asked<'a>(pub &'a dyn Prompts);
+
+/// The kit's card's rows: the home's handle and each onion with its SSH
+/// host key.
+fn card_rows(card: &Card) -> Vec<(String, String)> {
+    let mut rows = vec![("Home".to_owned(), hex::encode(card.handle))];
+    for (at, onion) in card.onions.iter().enumerate() {
+        rows.push((
+            format!("Onion {}", at + 1),
+            vos_light::tor::onion_address(&onion.key),
+        ));
+        rows.push((
+            format!("Onion {} host key", at + 1),
+            hex::encode(onion.ssh_host_key),
+        ));
+    }
+    rows
+}
+
+/// A key's answer, its bytes or why there are none.
+fn key_answer(answer: KeyAnswer) -> Result<Zeroizing<Vec<u8>>, Error> {
+    match answer {
+        KeyAnswer::Done(bytes) => Ok(bytes),
+        KeyAnswer::Declined => Err(Error::Declined),
+        KeyAnswer::Failed(message) => Err(Error::Source(message)),
+    }
+}
+
+/// 32 bytes of a key's answer.
+fn thirty_two(answer: KeyAnswer, what: &str) -> Result<Zeroizing<[u8; 32]>, Error> {
+    let bytes = key_answer(answer)?;
+    let mut out = Zeroizing::new([0; 32]);
+    if bytes.len() != 32 {
+        return Err(Error::Source(format!("{what} is not 32 bytes")));
+    }
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+impl Asked<'_> {
+    fn shown(&self, form: Form) -> bool {
+        matches!(self.0.confirm(form), Answer::Confirmed { .. })
+    }
+}
+
+impl space::Prompts for Asked<'_> {
+    fn show_phrase(&self, words: &str, card: &Card) -> bool {
+        let rows = words
+            .split(' ')
+            .enumerate()
+            .map(|(at, word)| (format!("{}", at + 1), word.to_owned()))
+            .chain(card_rows(card))
+            .collect();
+        self.shown(Form {
+            title: "Your recovery phrase".into(),
+            detail: "Write these 24 words down, in order, with the card below them, and keep \
+                     them apart from this phone. They restore your personal space at this home \
+                     if every device is lost; this is the only time they are shown."
+                .into(),
+            rows,
+            fields: Vec::new(),
+            notice: None,
+            choices: vec!["I wrote them down".into()],
+        })
+    }
+
+    fn show_card(&self, card: &Card) -> bool {
+        self.shown(Form {
+            title: "Your recovery key's card".into(),
+            detail: "Write this card down and keep it with the security key: it names the home \
+                     a restore with the key goes to."
+                .into(),
+            rows: card_rows(card),
+            fields: Vec::new(),
+            notice: None,
+            choices: vec!["I wrote it down".into()],
+        })
+    }
+
+    fn enter_phrase(&self) -> Option<Zeroizing<String>> {
+        let answer = self.0.confirm(Form {
+            title: "Enter your recovery phrase".into(),
+            detail: "The 24 words you wrote down, in order, separated by spaces.".into(),
+            rows: Vec::new(),
+            fields: vec![Field {
+                label: "Words".into(),
+                value: String::new(),
+            }],
+            notice: None,
+            choices: vec!["Restore".into()],
+        });
+        match answer {
+            Answer::Confirmed { values, .. } => Some(Zeroizing::new(values.join(" "))),
+            Answer::Declined => None,
         }
-        let source = self
-            .owed
-            .1
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        source
-            .as_deref()
-            .and_then(Reference::from_bytes)
-            .map(Some)
-            .ok_or_else(|| "a confirmation is owed with no source kept".into())
     }
 
-    fn enrolled(&self) {
-        let held = self.held();
-        if let Some(device) = held.group.as_ref().and_then(DeviceGroup::id) {
-            self.book(&held.light, device);
-        }
+    fn approve_admin(&self, approval: &Approval) -> bool {
+        let label = &approval.label;
+        self.shown(Form {
+            title: "Approve a new admin key".into(),
+            detail: format!(
+                "\"{label}\" asks to replace its admin key. Approve only if that device shows \
+                 the same key check: the new key signs nothing until its probation ends."
+            ),
+            rows: vec![
+                ("Device".into(), format!("{} ({label})", approval.device)),
+                ("Key check".into(), approval.check.clone()),
+                (
+                    "Key kept in".into(),
+                    if approval.hardware {
+                        "hardware"
+                    } else {
+                        "software"
+                    }
+                    .into(),
+                ),
+            ],
+            fields: Vec::new(),
+            notice: None,
+            choices: vec!["Approve".into()],
+        })
+    }
+
+    fn create_source(&self) -> Result<Vec<u8>, Error> {
+        let key = key_answer(self.0.create_key(Kind::Keystore))?;
+        Reference::from_bytes(&[&[Kind::Keystore as u8], &key[..]].concat())
+            .map(|reference| reference.to_bytes())
+            .ok_or_else(|| Error::Source("the source's key handle".into()))
+    }
+
+    fn evaluate_source(
+        &self,
+        source: &[u8],
+        input: &[u8; 32],
+    ) -> Result<Zeroizing<[u8; 32]>, Error> {
+        let reference = Reference::from_bytes(source)
+            .ok_or_else(|| Error::Source("the source's key handle".into()))?;
+        let bytes = reference.to_bytes();
+        thirty_two(
+            self.0.evaluate_key(reference.kind(), &bytes[1..], input),
+            "the source's output",
+        )
+    }
+
+    fn create_kit_key(&self) -> Result<Vec<u8>, Error> {
+        key_answer(self.0.create_key(Kind::Kit)).map(|id| id.to_vec())
+    }
+
+    fn kit_secret(&self, id: &[u8], salt: &[u8; 32]) -> Result<Zeroizing<[u8; 32]>, Error> {
+        thirty_two(
+            self.0.evaluate_key(Kind::Kit, id, salt),
+            "the security key's output",
+        )
+    }
+
+    fn create_admin(&self) -> Result<AdminKey, Error> {
+        let bytes = key_answer(self.0.create_key(Kind::Admin))?;
+        let (key, flags) = bytes
+            .split_first_chunk::<32>()
+            .ok_or_else(|| Error::Source("the admin key's answer is short".into()))?;
+        let flags = flags.first().copied().unwrap_or(0);
+        Ok(AdminKey {
+            key: *key,
+            hardware: flags & 1 != 0,
+            verified_boot: flags & 2 != 0,
+        })
+    }
+
+    fn sign_admin(&self, key: &[u8; 32], message: &[u8]) -> Result<[u8; 64], Error> {
+        let bytes = key_answer(self.0.sign_key(Kind::Admin, key, message))?;
+        <[u8; 64]>::try_from(bytes.as_slice())
+            .map_err(|_| Error::Source("a signature is 64 bytes".into()))
     }
 }
 
-/// The source reference kept, or none.
-fn reference(state: &State) -> Option<Reference> {
-    Reference::from_bytes(state.source.as_deref()?)
+/// Why `error`, as the screens branch on it: its kind, a time or a
+/// device it names, and the inner error's name or the failure's detail.
+pub fn refusal(error: Error) -> Refused {
+    let why = |why| Refused {
+        why,
+        ..Refused::default()
+    };
+    let detailed = |kind, detail: String| Refused {
+        why: kind,
+        detail,
+        ..Refused::default()
+    };
+    match error {
+        Error::NoSpace => why(Why::NoSpace),
+        Error::AlreadyHeld => why(Why::AlreadyHeld),
+        Error::HoldsKeys => why(Why::HoldsKeys),
+        Error::ClaimElsewhere { home } => detailed(Why::ClaimElsewhere, hex::encode(home)),
+        Error::AtThatHome => why(Why::AtThatHome),
+        Error::NoRestore => why(Why::NoRestore),
+        Error::NoPairing => why(Why::NoPairing),
+        Error::NeedsRepair(detail) => detailed(Why::NeedsRepair, detail),
+        Error::Declined => why(Why::Declined),
+        Error::Cancelled => why(Why::Cancelled),
+        Error::NotAKit => why(Why::NotAKit),
+        Error::WrongKit => why(Why::WrongKit),
+        Error::NotAPairingCode => why(Why::NotAPairingCode),
+        Error::NotAnOffer => why(Why::NotAnOffer),
+        Error::StaleOffer => why(Why::StaleOffer),
+        Error::OwnKey => why(Why::OwnKey),
+        Error::NotInSet => why(Why::NotInSet),
+        Error::Source(detail) => detailed(Why::Source, detail),
+        Error::NoOpenClaim => why(Why::NoOpenClaim),
+        Error::OpenClaimRefused(detail) => detailed(Why::OpenClaimRefused, detail),
+        Error::NoAgentToGive => why(Why::NoAgentToGive),
+        Error::NoAgentForKit => why(Why::NoAgentForKit),
+        Error::HoldsAgentThere => why(Why::HoldsAgentThere),
+        Error::UnknownAgent => why(Why::UnknownAgent),
+        Error::NoLeaf => why(Why::NoLeaf),
+        Error::HomeRefused(error) => detailed(Why::HomeRefused, format!("{error:?}")),
+        Error::Update => why(Why::Update),
+        Error::Rejected(detail) => detailed(Why::Rejected, detail),
+        Error::AgentRefused(error) => detailed(Why::AgentRefused, format!("{error:?}")),
+        Error::NotTakenYet => why(Why::NotTakenYet),
+        Error::NotJoinedYet => why(Why::NotJoinedYet),
+        Error::AwaitsVotes => why(Why::AwaitsVotes),
+        Error::Undecided => why(Why::Undecided),
+        Error::CommitVoid => why(Why::CommitVoid),
+        Error::CommittedMeanwhile => why(Why::CommittedMeanwhile),
+        Error::SlotExpired => why(Why::SlotExpired),
+        Error::InSetAlready => why(Why::InSetAlready),
+        Error::NotInAgentSet => why(Why::NotInAgentSet),
+        Error::Regrouped { by } => Refused {
+            why: Why::Regrouped,
+            device: by,
+            ..Refused::default()
+        },
+        Error::NotEnrolled => why(Why::NotEnrolled),
+        Error::NothingOwed => why(Why::NothingOwed),
+        Error::Spent => why(Why::Spent),
+        Error::RegistrarRefused(error) => detailed(
+            Why::RegistrarRefused,
+            error.map(|error| format!("{error:?}")).unwrap_or_default(),
+        ),
+        Error::Unreachable(detail) => detailed(Why::Unreachable, detail),
+        Error::Prove(detail) => detailed(Why::Prove, detail),
+        Error::Store(detail) => detailed(Why::Store, detail),
+        Error::Failed(detail) => detailed(Why::Failed, detail),
+    }
 }
+
+fn kit(kind: KitKind) -> vos_wire::personal::KitKind {
+    match kind {
+        KitKind::Phrase => vos_wire::personal::KitKind::Phrase,
+        KitKind::SecurityKey => vos_wire::personal::KitKind::SecurityKey,
+    }
+}
+
+/// A claim as the chrome makes it, checked, as the personal space takes it.
+fn claim(request: Claim) -> Result<space::Claim, Refused> {
+    let request = request.check()?;
+    let home = request.home;
+    Ok(space::Claim {
+        home: space::Kept {
+            home: vos_light::home::Home {
+                space: home.space,
+                handle: home.handle,
+                agent: home.agent,
+                identity: home.identity,
+                homes: InstanceId(home.homes),
+                credentials: InstanceId(home.credentials),
+            },
+            onions: crate::net::onions(&home.onions),
+        },
+        kit: kit(request.kit),
+        label: request.label,
+    })
+}
+
+fn claimed(claimed: space::Claimed) -> Claimed {
+    Claimed {
+        agent: claimed.agent,
+        device: claimed.device,
+    }
+}
+
+fn paired(paired: space::Paired) -> Paired {
+    Paired {
+        device: paired.device,
+        memberships: paired.memberships,
+    }
+}
+
+fn posted(posted: space::Posted) -> Posted {
+    Posted {
+        index: posted.index,
+        at: posted.at,
+    }
+}
+
+fn membership(membership: space::Membership) -> Membership {
+    Membership {
+        space: membership.space,
+        handle: membership.handle,
+        agent: membership.agent,
+        instance: membership.instance,
+        owed: match membership.owed {
+            space::Owed::Enroll => Owed::Enroll,
+            space::Owed::Confirm => Owed::Confirm,
+        },
+    }
+}
+
+fn of_membership(membership: Membership) -> space::Membership {
+    space::Membership {
+        space: membership.space,
+        handle: membership.handle,
+        agent: membership.agent,
+        instance: membership.instance,
+        owed: match membership.owed {
+            Owed::Enroll => space::Owed::Enroll,
+            Owed::Confirm => space::Owed::Confirm,
+        },
+    }
+}
+
+/// The device's personal space, as the facility serves it.
+pub struct Space(space::Personal<Reach>);
 
 /// The prompts a flow is lent.
 pub type Lent<'a> = &'a dyn Prompts;
@@ -757,166 +487,297 @@ pub type Lent<'a> = &'a dyn Prompts;
 /// A shared space, as the node holds it.
 pub type Shared = Arc<Space>;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use vos_wire::personal::{AdminClass, Attestation, KitKind};
+impl Space {
+    /// The personal space under `directory` (the facility's), its light
+    /// node opened from `artifacts`, its homes' routes told to the
+    /// facility's client. One this build does not read is refused as in
+    /// need of repair, and left as it is.
+    pub fn open(
+        directory: &Path,
+        artifacts: &Artifacts,
+        facility: Facility,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<Self, Refused> {
+        space::Personal::open(directory, artifacts, Reach { facility, runtime })
+            .map(Space)
+            .map_err(refusal)
+    }
 
-    /// A state with each field set, its values fixed.
-    fn every_field() -> State {
-        let home = Kept {
-            home: HomeSpace {
-                space: [1; 32],
-                handle: [2; 32],
-                agent: 3,
-                identity: [4; 32],
-                homes: InstanceId(5),
-                credentials: InstanceId(6),
-            },
-            onions: vec![Onion {
-                key: [7; 32],
-                ssh_host_key: [8; 32],
-            }],
+    pub fn grouped(&self) -> bool {
+        self.0.grouped()
+    }
+
+    /// The personal space's state as the device holds it, the facility's
+    /// parts (Tor, the notices standing) left for the node to fill.
+    pub fn status(&self) -> Result<PersonalStatus, Refused> {
+        let status = self.0.status().map_err(refusal)?;
+        let (phase, matures) = match status.phase {
+            space::Phase::None => (Phase::None, 0),
+            space::Phase::Claiming => (Phase::Claiming, 0),
+            space::Phase::Joining => (Phase::Joining, 0),
+            space::Phase::Held => (Phase::Held, 0),
+            space::Phase::Restoring { matures } => (Phase::Restoring, matures),
+            space::Phase::Removed => (Phase::Removed, 0),
+            space::Phase::Stuck => (Phase::Stuck, 0),
         };
-        let device = NewDevice {
-            sync: [9; 32],
-            admin: [10; 32],
-            class: AdminClass::Strong,
-            attestation: Attestation {
-                hardware: true,
-                verified_boot: false,
-            },
-            nullifier: [11; 32],
-            label: b"phone".to_vec(),
-        };
-        let kit = NewKit {
-            entries: vec![vos_wire::personal::KitEntry {
-                kind: KitKind::SecurityKey,
-                signing: [30; 32],
-                sealing: [31; 32],
-                sealed_r1: vec![32; 2],
-            }],
-            r2_hash: [12; 32],
-            r_hash: [13; 32],
-        };
-        let next = KitKey {
-            kind: KitKind::Phrase,
-            signing: [14; 32],
-            sealing: [15; 32],
-        };
-        let mut restoring = Restoring::new(&device, &kit, next, [16; 32]);
-        restoring.signed = Some((vec![17; 3], [18; 64]));
-        State {
-            home: Some(home.clone()),
-            agent: Some((19, [20; 32])),
-            source: Some(b"\x01vos.device.1".to_vec()),
-            admin: Some(([21; 32], true, true)),
-            label: "phone".into(),
-            bound: Some(Bound {
-                home: home.clone(),
-                agent: (22, [23; 32]),
-            }),
-            next_admin: vec![([24; 32], false, true)],
-            restoring: Some(restoring),
-            acked: Some(Acked {
-                handle: [28; 32],
-                onions: Vec::new(),
-                agent: (33, [34; 32]),
-                slot: [35; 32],
-                expires: 36,
-                ack: vec![29; 4],
-            }),
-            books: vec![(1, 2), (2, 3)],
-            store: 4,
+        let home = status.home.map_or_else(Home::default, |kept| Home {
+            space: kept.home.space,
+            handle: kept.home.handle,
+            agent: kept.home.agent,
+            identity: kept.home.identity,
+            homes: kept.home.homes.0,
+            credentials: kept.home.credentials.0,
+            onions: kept
+                .onions
+                .iter()
+                .map(|onion| s4_credential_contract::Onion {
+                    key: onion.key,
+                    ssh_host_key: onion.ssh_host_key,
+                })
+                .collect(),
+        });
+        Ok(PersonalStatus {
+            phase,
+            matures,
+            home,
+            agent: status.agent.map_or(0, |(agent, _)| agent),
+            device: status.device.unwrap_or(0),
+            owed: status.owed,
+            ..PersonalStatus::default()
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn set_wait(&self, ms: u64) {
+        self.0.set_wait(ms);
+    }
+
+    pub fn scope_key(&self, name: &[u8]) -> Result<[u8; 32], Refused> {
+        self.0.scope_key(name).map_err(refusal)
+    }
+
+    #[doc(hidden)]
+    pub fn recorded(&self, device: u32) -> usize {
+        self.0.recorded(device)
+    }
+
+    pub fn sync_key(&self) -> [u8; 32] {
+        self.0.sync_key()
+    }
+
+    pub fn claim(&self, prompts: Lent<'_>, request: Claim) -> Result<Claimed, Refused> {
+        let request = claim(request)?;
+        self.0
+            .claim(&Asked(prompts), request)
+            .map(claimed)
+            .map_err(refusal)
+    }
+
+    pub fn pair_offer(&self, _prompts: Lent<'_>) -> Result<PairCode, Refused> {
+        let code = self.0.pair_offer().map_err(refusal)?;
+        Ok(PairCode {
+            code: code.code,
+            expires_ms: code.expires_ms,
+        })
+    }
+
+    pub fn pair_await(&self, prompts: Lent<'_>) -> Result<Paired, Refused> {
+        self.0
+            .pair_await(&Asked(prompts))
+            .map(paired)
+            .map_err(refusal)
+    }
+
+    pub fn pair_cancel(&self) {
+        self.0.pair_cancel();
+    }
+
+    pub fn pair_join(
+        &self,
+        prompts: Lent<'_>,
+        code: &[u8],
+        label: &str,
+    ) -> Result<Paired, Refused> {
+        contract::label(label)?;
+        self.0
+            .pair_join(&Asked(prompts), code, label)
+            .map(paired)
+            .map_err(refusal)
+    }
+
+    pub fn memberships(&self) -> Result<Vec<Membership>, Refused> {
+        let all = self.0.memberships().map_err(refusal)?;
+        Ok(all.into_iter().map(membership).collect())
+    }
+
+    pub fn enroll_device(&self, prompts: Lent<'_>, owed: Membership) -> Result<(), Refused> {
+        self.0
+            .enroll_device(&Asked(prompts), of_membership(owed))
+            .map_err(refusal)
+    }
+
+    pub fn confirm_device(&self, prompts: Lent<'_>, owed: Membership) -> Result<(), Refused> {
+        self.0
+            .confirm_device(&Asked(prompts), of_membership(owed))
+            .map_err(refusal)
+    }
+
+    pub fn drop_enrollment(&self, owed: Membership) -> Result<(), Refused> {
+        self.0.drop_enrollment(of_membership(owed)).map_err(refusal)
+    }
+
+    pub fn revoke(&self, prompts: Lent<'_>, device: Removal) -> Result<u32, Refused> {
+        self.0.revoke(&Asked(prompts), device).map_err(refusal)
+    }
+
+    pub fn devices(&self) -> Result<Vec<Device>, Refused> {
+        let all = self.0.devices().map_err(refusal)?;
+        Ok(all
+            .into_iter()
+            .map(|device| Device {
+                id: device.id,
+                label: device.label,
+                strong: device.strong,
+                standing: device.standing as u8,
+                seen: device.seen,
+                removed: device.removed,
+                me: device.me,
+            })
+            .collect())
+    }
+
+    pub fn operations(&self) -> Result<Vec<Notice>, Refused> {
+        let open = self.0.operations().map_err(refusal)?;
+        Ok(open.into_iter().map(crate::job::notice).collect())
+    }
+
+    pub fn remove(&self, prompts: Lent<'_>, device: u32) -> Result<Posted, Refused> {
+        self.0
+            .remove(&Asked(prompts), device)
+            .map(posted)
+            .map_err(refusal)
+    }
+
+    pub fn veto(&self, prompts: Lent<'_>, index: u64) -> Result<Posted, Refused> {
+        self.0
+            .veto(&Asked(prompts), index)
+            .map(posted)
+            .map_err(refusal)
+    }
+
+    pub fn cosign(&self, prompts: Lent<'_>, index: u64) -> Result<Posted, Refused> {
+        self.0
+            .cosign(&Asked(prompts), index)
+            .map(posted)
+            .map_err(refusal)
+    }
+
+    pub fn resolve(&self, prompts: Lent<'_>, index: u64, upheld: bool) -> Result<Posted, Refused> {
+        self.0
+            .resolve(&Asked(prompts), index, upheld)
+            .map(posted)
+            .map_err(refusal)
+    }
+
+    pub fn rotate_kit(&self, prompts: Lent<'_>, kind: KitKind) -> Result<Posted, Refused> {
+        self.0
+            .rotate_kit(&Asked(prompts), kit(kind))
+            .map(posted)
+            .map_err(refusal)
+    }
+
+    pub fn replace_admin(&self, prompts: Lent<'_>, kind: KitKind) -> Result<Posted, Refused> {
+        self.0
+            .replace_admin(&Asked(prompts), kit(kind))
+            .map(posted)
+            .map_err(refusal)
+    }
+
+    pub fn admin_offer(&self, prompts: Lent<'_>) -> Result<Vec<u8>, Refused> {
+        self.0.admin_offer(&Asked(prompts)).map_err(refusal)
+    }
+
+    pub fn replace_admin_of(&self, prompts: Lent<'_>, code: &[u8]) -> Result<Posted, Refused> {
+        self.0
+            .replace_admin_of(&Asked(prompts), code)
+            .map(posted)
+            .map_err(refusal)
+    }
+
+    pub fn regroup(&self, prompts: Lent<'_>) -> Result<Posted, Refused> {
+        self.0.regroup(&Asked(prompts)).map(posted).map_err(refusal)
+    }
+
+    pub fn update(&self, prompts: Lent<'_>) -> Result<(), Refused> {
+        self.0.update(&Asked(prompts)).map_err(refusal)
+    }
+
+    pub fn restore(
+        &self,
+        prompts: Lent<'_>,
+        request: Claim,
+        old: KitKind,
+    ) -> Result<Posted, Refused> {
+        let request = claim(request)?;
+        self.0
+            .restore(&Asked(prompts), request, kit(old))
+            .map(posted)
+            .map_err(refusal)
+    }
+
+    pub fn restored(&self, prompts: Lent<'_>, kind: KitKind) -> Result<Claimed, Refused> {
+        self.0
+            .restored(&Asked(prompts), kit(kind))
+            .map(claimed)
+            .map_err(refusal)
+    }
+
+    pub fn move_home(&self, prompts: Lent<'_>, request: Claim) -> Result<Claimed, Refused> {
+        let request = claim(request)?;
+        self.0
+            .move_home(&Asked(prompts), request)
+            .map(claimed)
+            .map_err(refusal)
+    }
+}
+
+impl Personal for Space {
+    fn pass(&self, now: u64, _runtime: &tokio::runtime::Handle) -> Result<Passed, String> {
+        let passed = self.0.pass(now).map_err(|error| error.to_string())?;
+        Ok(Passed {
+            notices: passed.notices.into_iter().map(crate::job::notice).collect(),
+            alarms: passed.alarms,
+            seen: passed
+                .seen
+                .into_iter()
+                .map(|(device, at)| Seen { device, at })
+                .collect(),
+            stopped: passed.stopped,
+        })
+    }
+
+    fn acknowledge(&self, alarms: &[Alarm]) -> Result<(), String> {
+        self.0
+            .acknowledge_alarms(alarms)
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl crate::session::Paired for Space {
+    fn owed_source(&self, handle: &[u8; 32]) -> Result<Option<Reference>, String> {
+        match self
+            .0
+            .owed_source(handle)
+            .map_err(|error| error.to_string())?
+        {
+            None => Ok(None),
+            Some(bytes) => Reference::from_bytes(&bytes)
+                .map(Some)
+                .ok_or_else(|| "a confirmation is owed with no source kept".into()),
         }
     }
 
-    /// The bytes of [`every_field`] in [`STATE_VERSION`]: a change to what
-    /// the file keeps, or to how a type it holds encodes, fails here, and
-    /// is a new version.
-    const PINNED: &str = concat!(
-        "766f732f70737400030001010101010101010101010101010101010101010101010101010101010101010102",
-        "0202020202020202020202020202020202020202020202020202020202020203000000040404040404040404",
-        "0404040404040404040404040404040404040404040404050000000600000001000000070707070707070707",
-        "0707070707070707070707070707070707070707070707080808080808080808080808080808080808080808",
-        "0808080808080808080808011300000014141414141414141414141414141414141414141414141414141414",
-        "14141414010d00000001766f732e6465766963652e3101151515151515151515151515151515151515151515",
-        "151515151515151515151501010500000070686f6e6501010101010101010101010101010101010101010101",
-        "0101010101010101010101020202020202020202020202020202020202020202020202020202020202020203",
-        "0000000404040404040404040404040404040404040404040404040404040404040404050000000600000001",
-        "0000000707070707070707070707070707070707070707070707070707070707070707080808080808080808",
-        "0808080808080808080808080808080808080808080808160000001717171717171717171717171717171717",
-        "1717171717171717171717171717170100000018181818181818181818181818181818181818181818181818",
-        "18181818181818000101000e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0f",
-        "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0d0d0d0d0d0d0d0d0d0d0d0d0d",
-        "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0df7000000090909090909090909090909090909090909090909",
-        "09090909090909090909090a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a00",
-        "01000b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0500000070686f6e6501",
-        "000000011e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1f1f1f1f1f1f1f1f",
-        "1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f0200000020200c0c0c0c0c0c0c0c0c0c0c0c0c0c",
-        "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d",
-        "0d0d0d0d0d0d0110101010101010101010101010101010101010101010101010101010101010100103000000",
-        "1111111212121212121212121212121212121212121212121212121212121212121212121212121212121212",
-        "1212121212121212121212121212121212121212121212011c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c",
-        "1c1c1c1c1c1c1c1c1c1c1c1c0000000021000000222222222222222222222222222222222222222222222222",
-        "2222222222222222232323232323232323232323232323232323232323232323232323232323232324000000",
-        "00000000040000001d1d1d1d020000000100000002000000020000000300000004000000",
-    );
-
-    #[test]
-    fn the_state_files_layout_is_pinned_to_its_version() {
-        let bytes = state_bytes(&every_field());
-        assert_eq!(hex::encode(&bytes), PINNED);
-        let read = read_state(&bytes).unwrap();
-        assert_eq!(state_bytes(&read), bytes);
-    }
-
-    #[test]
-    fn a_state_file_of_another_version_or_none_is_refused() {
-        let bytes = state_bytes(&every_field());
-        let mut later = bytes.clone();
-        later[MAGIC.len()..MAGIC.len() + 2].copy_from_slice(&(STATE_VERSION + 1).to_le_bytes());
-        assert!(read_state(&later).err().unwrap().contains("version 4"));
-        let unversioned = every_field().encode();
-        assert!(
-            read_state(&unversioned)
-                .err()
-                .unwrap()
-                .contains("no version")
-        );
-        assert!(read_state(&bytes[..bytes.len() - 1]).is_err());
-        assert!(read_state(&bytes[..MAGIC.len() + 1]).is_err());
-        assert!(read_state(&[bytes.as_slice(), &[0]].concat()).is_err());
-    }
-
-    /// A local actor upgraded in place to a later release the app carries,
-    /// never downgraded to an earlier one.
-    #[test]
-    fn a_local_actor_is_upgraded_in_place() {
-        let directory = tempfile::tempdir().unwrap();
-        let artifacts = Artifacts::embedded();
-        let light = Light::open(directory.path(), &artifacts.agent, Config::default()).unwrap();
-        let mut kept = Vec::new();
-        assert!(install(&light, &artifacts.books, &mut kept).unwrap());
-        assert!(!install(&light, &artifacts.books, &mut kept).unwrap());
-        let (instance, package) = &artifacts.books[0];
-        let first = vos_light::release::Package::decode_exact(package).unwrap();
-        let next = vos_light::release::Package {
-            release: first.release + 1,
-            ..first.clone()
-        };
-        let books = vec![(*instance, next.encode())];
-        assert!(install(&light, &books, &mut kept).unwrap());
-        assert!(kept.contains(&(instance.0, first.release + 1)));
-        // The upgrade stands: the earlier release is refused under it.
-        assert!(matches!(
-            light.install(*instance, &first, Vec::new()),
-            Err(vos_light::Error::Release { installed }) if installed == first.release + 1
-        ));
-        assert!(!install(&light, &artifacts.books, &mut kept).unwrap());
-        // A record lost: the installed release is learnt from the refusal.
-        let mut lost = Vec::new();
-        assert!(install(&light, &artifacts.books, &mut lost).unwrap());
-        assert!(lost.contains(&(instance.0, first.release + 1)));
+    fn enrolled(&self) {
+        self.0.enrolled();
     }
 }

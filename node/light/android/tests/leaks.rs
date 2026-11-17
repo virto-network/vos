@@ -18,11 +18,10 @@ mod common;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::Read as _;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use blake2::{Blake2b512, Digest as _};
 use common::*;
-use s4_credential_contract::KeyAnswer;
 use vos_facility::node::{Device, Prompts};
 use vos_facility::{Enroll, Outcome, Pay, SignIn};
 
@@ -135,72 +134,14 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window[0] == needle[0] && window == needle)
 }
 
-/// The source's key, and what it answers: 0 its output, 1 declined, 2 a
-/// failure.
-const KEY: [u8; 32] = [0x6b; 32];
-static MODE: AtomicU8 = AtomicU8::new(0);
+/// The phone's seed, and its keystore's output for the space: the first
+/// key it makes, the enrollment's.
+const SEED: u8 = 0x6b;
 
 fn output() -> [u8; 32] {
-    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&KEY).unwrap();
-    mac.update(&vos_light::source_input(&HANDLE));
-    mac.finalize().into_bytes().into()
-}
-
-struct Phone;
-
-impl Device for Phone {
-    fn kinds(&self) -> Vec<Kind> {
-        vec![Kind::Keystore]
-    }
-}
-
-/// The client's prompts: the chrome's script and what it was handed, and
-/// the key, answering as [`MODE`] says.
-#[derive(Default)]
-struct Shown {
-    forms: Mutex<Vec<Vec<u8>>>,
-    answers: Mutex<VecDeque<Answer>>,
-}
-
-impl Prompts for Shown {
-    fn confirm(&self, form: Form) -> Answer {
-        self.forms
-            .lock()
-            .unwrap()
-            .push(format!("{form:?}").into_bytes());
-        self.answers
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or(Answer::Declined)
-    }
-
-    fn create_key(&self, _: Kind) -> KeyAnswer {
-        KeyAnswer::Done(b"vos.device.leaks".to_vec().into())
-    }
-
-    fn sign_key(&self, _: Kind, _: &[u8], _: &[u8]) -> KeyAnswer {
-        KeyAnswer::Declined
-    }
-
-    fn evaluate_key(&self, _: Kind, _: &[u8], input: &[u8; 32]) -> KeyAnswer {
-        match MODE.load(Ordering::SeqCst) {
-            0 => {
-                let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&KEY).unwrap();
-                mac.update(input);
-                KeyAnswer::Done(mac.finalize().into_bytes().to_vec().into())
-            }
-            1 => KeyAnswer::Declined,
-            _ => KeyAnswer::Failed("the keystore failed".into()),
-        }
-    }
-}
-
-fn answer(values: &[&str]) -> Answer {
-    Answer::Confirmed {
-        choice: 0,
-        values: values.iter().map(|value| (*value).to_owned()).collect(),
-    }
+    let alias = format!("vos.device.{}", SEED.wrapping_mul(16).wrapping_add(1));
+    let key = vos_light::testing::hmac(&[SEED; 32], alias.as_bytes());
+    vos_light::testing::hmac(&key, &vos_light::source_input(&HANDLE))
 }
 
 /// An answer's bytes as the server is answered: the outcome's CBOR, or the
@@ -353,21 +294,18 @@ fn nothing_the_facility_shows_or_keeps_carries_a_secret() {
     let store = directory.path().join("credentials");
     let store_text = store.to_str().unwrap();
     let stderr_path = directory.path().join("stderr");
-    let shown = Arc::new(Shown::default());
+    let shown = Arc::new(Phone::new(SEED));
     let prompts = || Arc::clone(&shown) as Arc<dyn Prompts>;
     let mut answers = Vec::new();
 
     let stderr = Stderr::capture(&stderr_path);
     ARMED.store(true, Ordering::SeqCst);
-    let node = node(&world, &store, Arc::new(Phone));
+    let node = node(&world, &store, Arc::clone(&shown) as Arc<dyn Device>);
     let session = node.open_session(gateway());
 
     // Enrollment, its digests the secret's.
-    shown
-        .answers
-        .lock()
-        .unwrap()
-        .extend([answer(&[]), answer(&[])]);
+    shown.will_confirm(&[]);
+    shown.will_confirm(&[]);
     let enrolled = node
         .enroll(session, Enroll::read(&enrollment()).unwrap(), prompts())
         .unwrap();
@@ -393,10 +331,10 @@ fn nothing_the_facility_shows_or_keeps_carries_a_secret() {
     ]))
     .unwrap();
     let signed = loop {
-        shown.answers.lock().unwrap().push_back(answer(&[]));
+        shown.will_confirm(&[]);
         match node.sign_in(session, login.clone(), prompts()) {
             Err(refusal) if refusal.code == Code::NoPath => {
-                shown.answers.lock().unwrap().clear();
+                shown.confirms.lock().unwrap().clear();
                 std::thread::sleep(Duration::from_millis(200));
             }
             signed => break signed.unwrap(),
@@ -424,11 +362,7 @@ fn nothing_the_facility_shows_or_keeps_carries_a_secret() {
         ("amount", Value::from(20u64)),
     ]))
     .unwrap();
-    shown
-        .answers
-        .lock()
-        .unwrap()
-        .push_back(answer(&["shop", "20"]));
+    shown.will_confirm(&["shop", "20"]);
     let paid = node.pay(session, pay.clone(), prompts()).map(Outcome::Paid);
     assert!(paid.is_ok());
     answers.push(("the payment's answer", carried(&paid)));
@@ -438,29 +372,24 @@ fn nothing_the_facility_shows_or_keeps_carries_a_secret() {
         assert_eq!(code(&answer), Some(expected), "{name}");
         answers.push((name, carried(&answer)));
     };
-    MODE.store(1, Ordering::SeqCst);
-    shown.answers.lock().unwrap().push_back(answer(&[]));
+    shown.decline(1);
+    shown.will_confirm(&[]);
     failed(
         "a refused source",
         node.sign_in(session, login.clone(), prompts())
             .map(Outcome::SignedIn),
         Code::Declined,
     );
-    MODE.store(2, Ordering::SeqCst);
-    shown.answers.lock().unwrap().push_back(answer(&[]));
+    shown.fail(1);
+    shown.will_confirm(&[]);
     failed(
         "a failed source",
         node.sign_in(session, login.clone(), prompts())
             .map(Outcome::SignedIn),
         Code::Source,
     );
-    MODE.store(0, Ordering::SeqCst);
     world.state.lock().unwrap().bad_time = true;
-    shown
-        .answers
-        .lock()
-        .unwrap()
-        .push_back(answer(&["shop", "21"]));
+    shown.will_confirm(&["shop", "21"]);
     failed(
         "a node's bad time",
         node.pay(session, pay, prompts()).map(Outcome::Paid),
@@ -483,24 +412,15 @@ fn nothing_the_facility_shows_or_keeps_carries_a_secret() {
     // Another origin's enrollment, unreadable: its member digest, its file
     // and the directory stay on the device.
     let other_member = hex::encode([0x77; 32]);
-    let kept = std::fs::read_dir(&store)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "toml")
-        })
-        .unwrap();
-    let text = std::fs::read_to_string(&kept).unwrap();
-    let corrupt = text.replace(&hex::encode(member), &other_member).replacen(
-        &format!("member = \"{other_member}\""),
-        &format!("member = \"{other_member}"),
-        1,
-    );
-    assert_ne!(corrupt, text);
-    let other = store.join(format!("{}.toml", "0".repeat(32)));
-    std::fs::write(&other, corrupt).unwrap();
-    shown.answers.lock().unwrap().push_back(answer(&[]));
+    let kept = vos_facility::kept::Kept::open(&store).unwrap();
+    let (_, row) = kept.raw(b"enrollment/").unwrap().remove(0);
+    let member_at = row.windows(32).position(|window| window == member).unwrap();
+    let mut corrupt = row.clone();
+    corrupt[member_at..member_at + 32].copy_from_slice(&[0x77; 32]);
+    corrupt.pop();
+    let other = [b"enrollment/".as_slice(), &[0; 16]].concat();
+    kept.write(&other, Some(corrupt)).unwrap();
+    shown.will_confirm(&[]);
     let unreadable = node
         .enroll(session, Enroll::read(&enrollment()).unwrap(), prompts())
         .map(Outcome::Enrolled);
@@ -509,7 +429,7 @@ fn nothing_the_facility_shows_or_keeps_carries_a_secret() {
     for (what, pattern) in [
         ("another origin's member digest", other_member.as_str()),
         ("the enrollments' directory", store_text),
-        ("another origin's file", "0000000000000000"),
+        ("another origin's row", "00000000000000000000000000000000"),
     ] {
         assert!(
             !contains(&unreadable, pattern.as_bytes()),
@@ -517,7 +437,8 @@ fn nothing_the_facility_shows_or_keeps_carries_a_secret() {
         );
     }
     answers.push(("an unreadable enrollment's error", unreadable));
-    std::fs::remove_file(&other).unwrap();
+    kept.write(&other, None).unwrap();
+    drop(kept);
 
     node.close(session);
     drop(node);
@@ -555,16 +476,26 @@ fn nothing_the_facility_shows_or_keeps_carries_a_secret() {
     for (name, answer) in &answers {
         forbidden.check(name, answer, false);
     }
-    let forms = shown.forms.lock().unwrap();
+    let forms = shown.shown.lock().unwrap();
     assert!(forms.len() >= 5);
     for form in forms.iter() {
-        forbidden.check("a chrome form", form, true);
+        forbidden.check("a chrome form", form.as_bytes(), true);
     }
-    for entry in std::fs::read_dir(&store).unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_file() {
-            let kept = std::fs::read(&path).unwrap();
-            forbidden.check("a file of the store", &kept, true);
-        }
+    for path in std::fs::read_dir(&store)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_file())
+    {
+        let kept = std::fs::read(&path).unwrap();
+        forbidden.check("a file of the store", &kept, true);
+    }
+    // The facility's database, row by row: what it keeps.
+    let kept = vos_facility::kept::Kept::open(&store).unwrap();
+    for (key, value) in kept.raw(b"").unwrap() {
+        forbidden.check(
+            "a row of the facility's database",
+            &[key, value].concat(),
+            true,
+        );
     }
 }

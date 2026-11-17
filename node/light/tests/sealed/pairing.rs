@@ -313,7 +313,7 @@ fn a_phone_is_paired_through_the_slot_and_reads_at_once() {
         call.arguments,
         (handle_of(2, &club()).member, handle_of(2, &club()).owner).encode()
     );
-    assert_eq!(call.method, vos_light::method_id("enroll_device"));
+    assert_eq!(call.method, vos_wire::credentials::method::ENROLL_DEVICE.0);
     memberships::done(&phones[0].store, &club()).unwrap();
     assert!(
         memberships::enrollments(&phones[0].store)
@@ -591,7 +591,7 @@ fn a_phone_is_retired_once_its_successor_is_paired() {
     assert_eq!(revoked, vec![(club(), handle_of(1, &club()))]);
     let (membership, handle) = &revoked[0];
     let call = memberships::revoke_call(membership, &handle.member, home.now() + 60_000).unwrap();
-    assert_eq!(call.method, vos_light::method_id("revoke_device"));
+    assert_eq!(call.method, vos_wire::credentials::method::REVOKE_DEVICE.0);
     assert_eq!(call.arguments, handle_of(1, &club()).member.encode());
     assert_eq!(
         (call.space, call.agent, call.instance),
@@ -639,7 +639,7 @@ fn a_claim_with_a_phrase_and_a_security_key_starts_the_group() {
         Err(ClaimError::Kit)
     ));
     let call = claim.call(&home_space(&home), home.now() + 60_000).unwrap();
-    assert_eq!(call.method, vos_light::method_id("claim"));
+    assert_eq!(call.method, vos_wire::homes::method::CLAIM.0);
     drop(claim);
 
     // Again after a restart, the same claim.

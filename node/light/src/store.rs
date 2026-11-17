@@ -32,10 +32,11 @@ use vos_wire::apply::State;
 
 use crate::group::Archive;
 
-/// The number of the store's layout: where its rows live. A store written
-/// in another is refused at open. Numbered apart from the node's store's
+/// The number of the store's layout: where its rows live, and how the
+/// personal space's rows encode (`crate::space`). A store written in
+/// another is refused at open. Numbered apart from the node's store's
 /// layouts.
-pub const LAYOUT: u32 = 6;
+pub const LAYOUT: u32 = 7;
 
 /// The block cache the store keeps by default: a phone's.
 pub const CACHE_BYTES: u64 = 16 << 20;
@@ -56,6 +57,9 @@ pub type Program = ([u8; 32], Vec<u8>);
 
 /// One row: its key and its value.
 pub type Row = (Vec<u8>, Vec<u8>);
+
+/// A row's change: its key and its new value, `None` deleting it.
+pub type Change = (Vec<u8>, Option<Vec<u8>>);
 
 /// Why the store cannot be used.
 #[derive(Debug)]
@@ -249,10 +253,7 @@ impl Store {
     }
 
     /// Write `rows` of the group keyspace, synced: `None` deletes.
-    pub(crate) fn write_group_rows(
-        &self,
-        rows: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-    ) -> Result<(), StoreError> {
+    pub(crate) fn write_group_rows(&self, rows: Vec<Change>) -> Result<(), StoreError> {
         let mut batch = self.0.db.batch();
         for (key, value) in rows {
             match value {

@@ -50,7 +50,7 @@ final class DevicesScreen extends Screen {
           redraw();
         },
         refused -> {
-          unread = Words.refusal(refused.code, refused.message);
+          unread = Words.why(refused);
           redraw();
         });
   }
@@ -117,12 +117,11 @@ final class DevicesScreen extends Screen {
     for (Notice notice : open) {
       into.addView(
           text(
-              Words.pending(notice.pending)
-                  + (notice.detail.isEmpty() ? "" : " (" + notice.detail + ")")
+              Words.notice(notice)
                   + (notice.matures > 0
                       ? ", it takes effect " + Words.until(notice.matures, now)
                       : "")));
-      if (Words.contested(notice.detail)) {
+      if (notice.contested) {
         into.addView(
             buttons(
                 button("Uphold it", v -> posted("Upholding…", notice, true)),
@@ -229,7 +228,7 @@ final class DevicesScreen extends Screen {
         "Revoking " + device.label + " in your other spaces…",
         (personal, prompts, refused) -> {
           int revoked = personal.revoke(device.id, prompts, refused);
-          return refused.code == 0 ? revoked : null;
+          return refused.why == Why.NONE ? revoked : null;
         },
         (Integer revoked) -> app.say("Revoked in " + revoked + " space(s)."));
   }

@@ -12,10 +12,13 @@
 //!   a space the user opted out of Tor after the plain warning
 //!   ([`OPT_OUT_WARNING`]); a proof, a read that prepares one, the
 //!   personal agent's and `Homes`' traffic never do (`vos_light::route`).
-//! - **What is kept** beside the enrollments ([`FILE`]): each space's
-//!   onion set as its registrar last served it, the user's opt-out, and
-//!   the bridges pasted in the chrome. A space's enrollment pins its
-//!   first set; a refresh's replaces it.
+//! - **What is kept**, rows of the facility's database ([`crate::kept`]):
+//!   each space's onion set as its registrar last served it, the user's
+//!   opt-out ([`ROUTES`]), and the bridges pasted in the chrome
+//!   ([`BRIDGES`]). A space's enrollment pins its first set; a refresh's
+//!   replaces it. A database this build does not read leaves each space
+//!   its pinned routes (Tor) and refuses every change, so nothing in it
+//!   is written over.
 //! - **One arti a process** ([`Arti`]): its state in the app's private
 //!   files, its bridges replaced by building it anew.
 //! - **What a run read and wrote** ([`Count`]): every stream of the
@@ -37,21 +40,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 
-use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use vos_abi::{Decode as _, Encode as _};
+use vos_abi::{Decode, Encode};
 use vos_light::route::{Clearnet, Purpose, Refused, Routes};
 use vos_light::tor::{BootstrapError, Circuit, Client, Config, Dial, Dialing, Registrar, Target};
 use vos_light::tor::{Hour, Tor, TorConfig};
 use vos_wire::credentials::Onion;
 
-use crate::enrollment::{create_private, write_private};
+use crate::enrollment::write_private;
+use crate::kept::Kept;
 
 pub use vos_light::route::OPT_OUT_WARNING;
 pub use vos_light::tor::SpaceId;
 
-/// The routes' file, beside the enrollments.
-pub const FILE: &str = "routes.state";
+/// Each space's routes' row: this prefix, then the space's id.
+pub const ROUTES: &[u8] = b"routes/";
+
+/// The bridges' row.
+pub const BRIDGES: &[u8] = b"bridges";
 
 /// The client's rendezvous, an hour a line, beside the enrollments.
 pub const RENDEZVOUS: &str = "rendezvous.txt";
@@ -60,10 +66,9 @@ pub const RENDEZVOUS: &str = "rendezvous.txt";
 const RENDEZVOUS_KEPT: &str = "rendezvous.state";
 
 /// A space's routes as kept: its onion set, and the user's opt-out.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-struct Kept {
-    /// Each onion's key and its SSH host key, in hex.
-    onions: Vec<(String, String)>,
+#[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
+struct Route {
+    onions: Vec<Onion>,
     opted_out: bool,
     /// When the registrar's set was last read, by the device's clock.
     onions_ms: u64,
@@ -72,11 +77,27 @@ struct Kept {
 /// How often a space's onion set is read again from its registrar.
 pub const ONIONS_EVERY_MS: u64 = 24 * 60 * 60 * 1000;
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+/// What the routes' rows hold, read at the start: by the space's id.
+#[derive(Debug, Default)]
 struct State {
-    /// By the space's id, in hex.
-    spaces: BTreeMap<String, Kept>,
+    spaces: BTreeMap<SpaceId, Route>,
     bridges: Vec<String>,
+}
+
+fn route_key(space: &SpaceId) -> Vec<u8> {
+    [ROUTES, space.as_slice()].concat()
+}
+
+/// What `kept` holds of the routes.
+fn read(kept: &Kept) -> Result<State, String> {
+    let mut spaces = BTreeMap::new();
+    for (key, route) in kept.under::<Route>(ROUTES)? {
+        let space = SpaceId::try_from(&key[ROUTES.len()..])
+            .map_err(|_| "the facility's database needs repair: a route's key is not a space's")?;
+        spaces.insert(space, route);
+    }
+    let bridges = kept.get(BRIDGES)?.unwrap_or_default();
+    Ok(State { spaces, bridges })
 }
 
 /// What a space pins: its onions, the gateway's clearnet port with its
@@ -88,27 +109,7 @@ pub struct Pinned {
     pub onion_only: bool,
 }
 
-/// The contract's onions as the light node takes them.
-pub fn onions(of: &[s4_credential_contract::Onion]) -> Vec<Onion> {
-    of.iter()
-        .map(|onion| Onion {
-            key: onion.key,
-            ssh_host_key: onion.ssh_host_key,
-        })
-        .collect()
-}
-
-fn onion_row(onion: &Onion) -> (String, String) {
-    (hex::encode(onion.key), hex::encode(onion.ssh_host_key))
-}
-
-fn onion_of((key, ssh): &(String, String)) -> Option<Onion> {
-    let decode = |text: &String| hex::decode(text).ok()?.try_into().ok();
-    Some(Onion {
-        key: decode(key)?,
-        ssh_host_key: decode(ssh)?,
-    })
-}
+pub use crate::enrollment::onions;
 
 /// The bytes the client's streams read and wrote.
 #[derive(Clone, Default)]
@@ -195,6 +196,8 @@ pub struct Arti {
     tor: RwLock<Option<Tor>>,
     /// Whether the client is dormant, for an arti built anew.
     dormant: std::sync::atomic::AtomicBool,
+    /// What its last bootstrap found, and why it failed.
+    state: Mutex<(crate::personal::Tor, String)>,
 }
 
 impl Arti {
@@ -206,6 +209,7 @@ impl Arti {
             directory,
             tor: RwLock::new(None),
             dormant: Default::default(),
+            state: Mutex::default(),
         });
         arti.rebuild(bridges)?;
         Ok(arti)
@@ -230,7 +234,7 @@ impl Arti {
     /// goes through; on a failure the one built before stays.
     async fn replace(&self, bridges: &[String]) -> Result<(), BootstrapError> {
         let candidate = self.build(bridges)?;
-        candidate.bootstrap().await?;
+        self.found(candidate.bootstrap().await)?;
         *self.tor.write().unwrap_or_else(|e| e.into_inner()) = Some(candidate);
         Ok(())
     }
@@ -242,10 +246,32 @@ impl Arti {
     /// Bootstrap the arti built last: its failure named (a wrong clock, a
     /// bridge that does not answer, a network that blocks Tor).
     pub async fn bootstrap(&self) -> Result<(), BootstrapError> {
-        match self.current() {
+        let bootstrapped = match self.current() {
             Some(tor) => tor.bootstrap().await,
             None => Err(BootstrapError::Tor("not built".into())),
-        }
+        };
+        self.found(bootstrapped)
+    }
+
+    /// A bootstrap's outcome kept as Tor's state.
+    fn found(&self, bootstrapped: Result<(), BootstrapError>) -> Result<(), BootstrapError> {
+        use crate::personal::Tor as State;
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = match &bootstrapped {
+            Ok(()) => (State::Connected, String::new()),
+            Err(error) => (State::Blocked, error.to_string()),
+        };
+        bootstrapped
+    }
+
+    /// Tor held back for `why`: no bootstrap is tried until the user asks.
+    pub fn hold(&self, why: String) {
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) =
+            (crate::personal::Tor::Blocked, why);
+    }
+
+    /// Tor's state as its last bootstrap found it, and why it is blocked.
+    pub fn state(&self) -> (crate::personal::Tor, String) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -273,7 +299,10 @@ pub struct Net {
     /// The space a spare connection is kept for.
     spare: Mutex<Option<SpaceId>>,
     count: Count,
-    file: PathBuf,
+    directory: PathBuf,
+    /// The facility's database, and the routes read from it; or why it
+    /// cannot be read, every change then refused.
+    kept: Result<Kept, String>,
     state: Mutex<State>,
     arti: Option<Arc<Arti>>,
     /// Every space whose routes were pinned.
@@ -301,14 +330,13 @@ impl Net {
             dial,
             count: count.clone(),
         });
-        let file = directory.join(FILE);
-        let state = std::fs::read_to_string(&file)
-            .ok()
-            .and_then(|text| toml::from_str(&text).ok())
-            .unwrap_or_default();
+        let (kept, state) = match Kept::open(directory).and_then(|kept| Ok((read(&kept)?, kept))) {
+            Ok((state, kept)) => (Ok(kept), state),
+            Err(error) => (Err(error), State::default()),
+        };
         let client = Client::new(Arc::clone(&counted) as Arc<dyn Dial>, Config::default());
-        let kept = std::fs::read(directory.join(RENDEZVOUS_KEPT)).ok();
-        if let Some(hours) = kept.and_then(|bytes| Vec::<Hour>::decode_exact(&bytes)) {
+        let opened = std::fs::read(directory.join(RENDEZVOUS_KEPT)).ok();
+        if let Some(hours) = opened.and_then(|bytes| Vec::<Hour>::decode_exact(&bytes)) {
             client.restore_opened(&hours);
         }
         Self {
@@ -316,32 +344,32 @@ impl Net {
             dial: counted,
             spare: Mutex::new(None),
             count,
-            file,
+            directory: directory.to_path_buf(),
+            kept,
             state: Mutex::new(state),
             arti,
             pinned: Mutex::default(),
         }
     }
 
-    /// The bridges kept, which the process's arti is built with.
-    pub fn bridges_kept(directory: &Path) -> Vec<String> {
-        std::fs::read_to_string(directory.join(FILE))
-            .ok()
-            .and_then(|text| toml::from_str::<State>(&text).ok())
-            .map(|state| state.bridges)
-            .unwrap_or_default()
+    /// The bridges kept, which the process's arti is built with; why they
+    /// cannot be read, when the database is refused or the row does not
+    /// decode.
+    pub fn bridges_kept(directory: &Path) -> Result<Vec<String>, String> {
+        Ok(Kept::open(directory)?.get(BRIDGES)?.unwrap_or_default())
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn keep(&self, state: &State) -> Result<(), NetError> {
-        let text = toml::to_string(state).map_err(|error| error.to_string())?;
-        if let Some(directory) = self.file.parent() {
-            create_private(directory)?;
+    /// `space`'s routes as `state` holds them, kept.
+    fn keep(&self, state: &State, space: &SpaceId) -> Result<(), NetError> {
+        let kept = self.kept.as_ref().map_err(Clone::clone)?;
+        match state.spaces.get(space) {
+            Some(route) => kept.put(&route_key(space), route),
+            None => kept.remove(&route_key(space)),
         }
-        write_private(&self.file, text.as_bytes())
     }
 
     /// A stream to the onion service at `address`, `port`, on a circuit of
@@ -373,12 +401,11 @@ impl Net {
     /// `space`'s routes from what it pins, the onion set a refresh kept in
     /// place of the pinned one, and the user's opt-out re-applied.
     pub fn pin(&self, space: SpaceId, pinned: Pinned) {
-        let kept = self.state().spaces.get(&hex::encode(space)).cloned();
+        let kept = self.state().spaces.get(&space).cloned();
         let mut routes = Routes::new(pinned.onions, pinned.clearnet, pinned.onion_only);
         if let Some(kept) = kept {
-            let onions: Vec<Onion> = kept.onions.iter().filter_map(onion_of).collect();
-            if !onions.is_empty() {
-                routes.onions = onions;
+            if !kept.onions.is_empty() {
+                routes.onions = kept.onions;
             }
             if kept.opted_out {
                 // Refused for an onion-only space or one with no clearnet
@@ -428,9 +455,7 @@ impl Net {
 
     /// The client's tally, an hour a line, written to [`RENDEZVOUS`].
     pub fn keep_rendezvous(&self) {
-        let Some(directory) = self.file.parent() else {
-            return;
-        };
+        let directory = &self.directory;
         let hours = self.client.opened();
         let lines: String = hours.iter().map(|hour| format!("{hour}\n")).collect();
         let _ = write_private(&directory.join(RENDEZVOUS_KEPT), &hours.encode());
@@ -463,12 +488,8 @@ impl Net {
         let opted_out = routes.opted_out();
         self.client.set_space(space, routes);
         let mut state = self.state();
-        state
-            .spaces
-            .entry(hex::encode(space))
-            .or_default()
-            .opted_out = opted_out;
-        let _ = self.keep(&state);
+        state.spaces.entry(space).or_default().opted_out = opted_out;
+        let _ = self.keep(&state, &space);
         Ok(())
     }
 
@@ -492,10 +513,10 @@ impl Net {
             .await
             .map_err(|error| error.to_string())?;
         let mut state = self.state();
-        let kept = state.spaces.entry(hex::encode(space)).or_default();
-        kept.onions = onions.iter().map(onion_row).collect();
+        let kept = state.spaces.entry(space).or_default();
+        kept.onions = onions.clone();
         kept.onions_ms = crate::job::now_ms();
-        self.keep(&state)?;
+        self.keep(&state, &space)?;
         Ok(onions)
     }
 
@@ -509,7 +530,7 @@ impl Net {
         let last = self
             .state()
             .spaces
-            .get(&hex::encode(space))
+            .get(&space)
             .map_or(0, |kept| kept.onions_ms);
         if now_ms.saturating_sub(last) < ONIONS_EVERY_MS {
             return Ok(false);
@@ -549,9 +570,25 @@ impl Net {
         arti.replace(&lines)
             .await
             .map_err(|error| error.to_string())?;
-        let mut state = self.state();
-        state.bridges = lines;
-        self.keep(&state)
+        let kept = self.kept.as_ref().map_err(Clone::clone)?;
+        kept.put(BRIDGES, &lines)?;
+        self.state().bridges = lines;
+        Ok(())
+    }
+
+    /// Why the facility's database does not read, if it does not: every
+    /// route then its pinned one, every change refused.
+    pub fn repair(&self) -> Option<String> {
+        self.kept.as_ref().err().cloned()
+    }
+
+    /// Tor's state, and why it is blocked: connected for a client that
+    /// runs no arti (an in-process dial).
+    pub fn tor(&self) -> (crate::personal::Tor, String) {
+        match &self.arti {
+            Some(arti) => arti.state(),
+            None => (crate::personal::Tor::Connected, String::new()),
+        }
     }
 
     /// Bootstrap the process's arti, if it runs one.

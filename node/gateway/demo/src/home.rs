@@ -25,7 +25,7 @@ use crate::LocalSpace;
 /// agent.
 pub const HOME_CREDENTIALS: InstanceId = InstanceId(9);
 pub const HOMES: InstanceId = InstanceId(3);
-pub const PERSONAL: InstanceId = InstanceId(5);
+pub use vos_wire::personal::PERSONAL;
 /// The registrar's and the operator's role byte at a home's agent: the
 /// operator's key holds both, as the keeper's.
 const ROLE: u8 = 1;

@@ -358,6 +358,11 @@ impl Light {
         Ok(merkle_crdt::Store::node(scope.store(), cid)?)
     }
 
+    /// The release installed at `instance`, if one is.
+    pub fn release(&self, instance: InstanceId) -> Result<Option<u32>, Error> {
+        release(&self.store.snapshot(), instance)
+    }
+
     /// The instances installed, in order.
     pub fn instances(&self) -> Result<Vec<InstanceId>, Error> {
         let snapshot = self.store.snapshot();

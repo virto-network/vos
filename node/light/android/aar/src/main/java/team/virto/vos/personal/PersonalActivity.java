@@ -27,7 +27,6 @@ import java.util.concurrent.Executors;
 import team.virto.s4.KeySources;
 import team.virto.s4.VosClient;
 import team.virto.s4.VosPrompts;
-import team.virto.s4.vos.ErrorCode;
 import team.virto.s4.vos.Refusal;
 
 /**
@@ -64,7 +63,24 @@ public final class PersonalActivity extends Activity {
 
   /** One operation of the facility, its prompts lent, its refusal filled when it refuses. */
   interface Call<T> {
-    T call(IVosPersonal personal, VosPrompts prompts, Refusal refused) throws RemoteException;
+    T call(IVosPersonal personal, VosPrompts prompts, Refused refused) throws RemoteException;
+  }
+
+  /** One of the facility's own operations (the syncs, Tor), which refuse with s4's refusal. */
+  interface Own<T> {
+    T call(IVosPersonal personal, Refusal refused) throws RemoteException;
+  }
+
+  /** {@code own} as a {@link Call}: its refusal's code and message as a {@link Refused}. */
+  static <T> Call<T> own(Own<T> own) {
+    return (personal, prompts, refused) -> {
+      Refusal theirs = new Refusal();
+      T result = own.call(personal, theirs);
+      if (theirs.code != 0) {
+        Words.refused(theirs.code, theirs.message, refused);
+      }
+      return result;
+    };
   }
 
   interface Done<T> {
@@ -301,7 +317,7 @@ public final class PersonalActivity extends Activity {
       Done<T> done,
       Call<Void> cancel,
       boolean covered,
-      Done<Refusal> refusedThen) {
+      Done<Refused> refusedThen) {
     VosPrompts prompts = new VosPrompts(keys, forms);
     busy.setLayoutParams(
         covered
@@ -326,18 +342,18 @@ public final class PersonalActivity extends Activity {
     busy.setVisibility(View.VISIBLE);
     worker.execute(
         () -> {
-          Refusal refused = new Refusal();
+          Refused refused = new Refused();
           T result = null;
           try {
             result = call.call(binding.personal(), prompts, refused);
           } catch (RemoteException | RuntimeException error) {
             Log.w(TAG, doing + " failed", error);
-            refused.code = ErrorCode.FAILED;
-            refused.message = "the facility stopped: " + error.getMessage();
+            refused.why = Why.FAILED;
+            refused.detail = "the facility stopped: " + error.getMessage();
           } finally {
             prompts.release();
           }
-          T answered = refused.code != 0 ? null : result;
+          T answered = refused.why != Why.NONE ? null : result;
           runOnUiThread(
               () -> {
                 if (isDestroyed()) {
@@ -369,7 +385,7 @@ public final class PersonalActivity extends Activity {
     new Thread(
             () -> {
               try {
-                cancel.call(bound != null ? bound : binding.personal(), prompts, new Refusal());
+                cancel.call(bound != null ? bound : binding.personal(), prompts, new Refused());
               } catch (RemoteException | RuntimeException gone) {
                 Log.w(TAG, "cancel not delivered: " + gone);
               }
@@ -379,18 +395,18 @@ public final class PersonalActivity extends Activity {
   }
 
   /** Read {@code call} off the main thread, uncovered; {@code done} takes its result or null. */
-  <T> void read(Call<T> call, Done<T> done, Done<Refusal> refusedThen) {
+  <T> void read(Call<T> call, Done<T> done, Done<Refused> refusedThen) {
     worker.execute(
         () -> {
-          Refusal refused = new Refusal();
+          Refused refused = new Refused();
           T result = null;
           try {
             result = call.call(binding.personal(), null, refused);
           } catch (RemoteException | RuntimeException error) {
-            refused.code = ErrorCode.FAILED;
-            refused.message = "the facility stopped: " + error.getMessage();
+            refused.why = Why.FAILED;
+            refused.detail = "the facility stopped: " + error.getMessage();
           }
-          T answered = refused.code != 0 ? null : result;
+          T answered = refused.why != Why.NONE ? null : result;
           runOnUiThread(
               () -> {
                 if (isDestroyed()) {
@@ -406,13 +422,13 @@ public final class PersonalActivity extends Activity {
   }
 
   /** Say a refusal, quietly when the user declined. */
-  void refused(Refusal refused) {
-    if (refused.code == ErrorCode.DECLINED) {
+  void refused(Refused refused) {
+    if (refused.why == Why.DECLINED || refused.why == Why.CANCELLED) {
       return;
     }
     new AlertDialog.Builder(this)
         .setTitle("Not done")
-        .setMessage(Words.refusal(refused.code, refused.message))
+        .setMessage(Words.why(refused))
         .setPositiveButton("OK", null)
         .show();
   }

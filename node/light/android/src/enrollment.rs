@@ -7,24 +7,105 @@
 //! the space's tree holds, public, so the path can be kept from a session's
 //! start without asking the source, and the gateway it was made through, so
 //! a sync reaches it with no session open; keyed by the verified SSH host
-//! and the application that asked. No secret, no source output and no proof is ever
-//! written.
+//! and the application that asked, a row each of the facility's database
+//! ([`crate::kept`]). No secret, no source output and no proof is ever
+//! written. Its types are the facility's: s4's are converted at the
+//! boundary ([`Enrollment::pins`], the enroll).
 
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use vos_abi::{Decode, Encode};
 
+use crate::kept::Kept;
 use crate::source::Reference;
 
-pub use s4_credential_contract::{Agent, Guard, Location, Method, Onion};
+pub use vos_wire::credentials::Onion;
+
+/// A space's agent: its id and the identity calls to it are signed for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Agent {
+    pub agent: u32,
+    pub identity: [u8; 32],
+}
+
+/// An actor's place: its agent and instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Location {
+    pub agent: u32,
+    pub instance: u32,
+}
+
+/// What a pinned method's proof shows.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum Guard {
+    /// Membership, its nullifier in the scope `scope`; `once` admits each
+    /// member once there.
+    #[codec(index = 0)]
+    Auth { scope: String, once: bool },
+    /// Ownership of the ledger account the device's owner digest holds.
+    #[codec(index = 1)]
+    Owner,
+}
+
+/// A method the device may prove for: its place, its name, its guard.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Method {
+    pub agent: u32,
+    pub instance: u32,
+    pub name: String,
+    pub guard: Guard,
+}
+
+impl From<&s4_credential_contract::Agent> for Agent {
+    fn from(agent: &s4_credential_contract::Agent) -> Self {
+        Self {
+            agent: agent.agent,
+            identity: agent.identity,
+        }
+    }
+}
+
+impl From<s4_credential_contract::Location> for Location {
+    fn from(location: s4_credential_contract::Location) -> Self {
+        Self {
+            agent: location.agent,
+            instance: location.instance,
+        }
+    }
+}
+
+impl From<&s4_credential_contract::Method> for Method {
+    fn from(method: &s4_credential_contract::Method) -> Self {
+        Self {
+            agent: method.agent,
+            instance: method.instance,
+            name: method.name.clone(),
+            guard: match &method.guard {
+                s4_credential_contract::Guard::Auth { scope, once } => Guard::Auth {
+                    scope: scope.clone(),
+                    once: *once,
+                },
+                s4_credential_contract::Guard::Owner => Guard::Owner,
+            },
+        }
+    }
+}
+
+/// The contract's onions as the facility keeps them.
+pub fn onions(of: &[s4_credential_contract::Onion]) -> Vec<Onion> {
+    of.iter()
+        .map(|onion| Onion {
+            key: onion.key,
+            ssh_host_key: onion.ssh_host_key,
+        })
+        .collect()
+}
 
 /// One enrollment, pinned at the user's confirmation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Enrollment {
-    #[serde(with = "hex32")]
     pub handle: [u8; 32],
-    #[serde(with = "hex32")]
     pub space: [u8; 32],
     pub agents: Vec<Agent>,
     pub methods: Vec<Method>,
@@ -32,11 +113,9 @@ pub struct Enrollment {
     pub credentials: Location,
     pub source: Reference,
     /// The member digest, the leaf the device keeps the tree for.
-    #[serde(with = "hex32")]
     pub member: [u8; 32],
     /// The owner digest, public: the device's handle there, which the
     /// person's other devices name to enroll or revoke it.
-    #[serde(with = "hex32")]
     pub owner: [u8; 32],
     /// The gateway the enrollment was made through: where it is, its host
     /// key's fingerprint and the application its `ServerHello` named, the
@@ -48,7 +127,6 @@ pub struct Enrollment {
     /// The host key's ed25519 key, if the session verified one: the
     /// clearnet route key-signed calls may take once the user opts the
     /// space out of Tor.
-    #[serde(with = "hex32_option")]
     pub host_key: Option<[u8; 32]>,
     /// The space's onion set as enrollment pinned it; a refresh keeps the
     /// registrar's newer one beside it (`crate::net`).
@@ -74,17 +152,23 @@ impl Enrollment {
     pub fn pins(&self, request: &crate::Enroll) -> bool {
         self.handle == request.handle
             && self.space == request.space
-            && self.agents == request.agents
-            && self.methods == request.methods
-            && self.credentials == request.credentials
+            && self.agents == request.agents.iter().map(Agent::from).collect::<Vec<_>>()
+            && self.methods == request.methods.iter().map(Method::from).collect::<Vec<_>>()
+            && self.credentials == Location::from(request.credentials)
     }
 }
 
-/// The enrollments, a file each under one directory, private to the user.
-#[derive(Clone, Debug)]
+/// The enrollments, a row each of the facility's database under
+/// [`ENROLLMENT`], and each one's credential tree, a file beside it under
+/// the facility's directory.
+#[derive(Clone)]
 pub struct Store {
     directory: PathBuf,
+    kept: Result<Kept, String>,
 }
+
+/// The enrollments' rows' prefix, then the origin's digest.
+const ENROLLMENT: &[u8] = b"enrollment/";
 
 /// Where a server is: its verified SSH host key and the application that
 /// asked.
@@ -96,105 +180,84 @@ pub struct Origin {
     pub application: String,
 }
 
-impl Store {
-    pub fn new(directory: impl Into<PathBuf>) -> Self {
-        Self {
-            directory: directory.into(),
-        }
-    }
-
-    fn path(&self, origin: &Origin) -> PathBuf {
+impl Origin {
+    fn digest(&self) -> [u8; 16] {
         let mut hash = Sha256::new();
-        hash.update(origin.host.as_bytes());
+        hash.update(self.host.as_bytes());
         hash.update([0]);
-        hash.update(origin.application.as_bytes());
-        self.directory
-            .join(format!("{}.toml", hex::encode(&hash.finalize()[..16])))
+        hash.update(self.application.as_bytes());
+        hash.finalize()[..16].try_into().expect("16 bytes")
+    }
+}
+
+impl Store {
+    /// The enrollments of the facility whose directory is `directory`.
+    pub fn new(directory: impl Into<PathBuf>) -> Self {
+        let directory = directory.into();
+        let kept = Kept::open(&directory);
+        Self { directory, kept }
     }
 
-    /// Where `origin`'s credential tree is kept, beside its enrollment.
+    /// The facility's database, or why it cannot be read.
+    pub fn kept(&self) -> Result<&Kept, String> {
+        self.kept.as_ref().map_err(Clone::clone)
+    }
+
+    fn key(origin: &Origin) -> Vec<u8> {
+        [ENROLLMENT, &origin.digest()].concat()
+    }
+
+    /// Where `origin`'s credential tree is kept.
     pub fn tree_path(&self, origin: &Origin) -> PathBuf {
-        self.path(origin).with_extension("tree")
+        self.directory
+            .join(format!("{}.tree", hex::encode(origin.digest())))
     }
 
-    /// The directory the enrollments are kept under.
+    /// The directory the facility keeps its state under.
     pub fn directory(&self) -> &Path {
         &self.directory
     }
 
     /// The enrollment pinned for `origin`, if there is one.
     pub fn get(&self, origin: &Origin) -> Result<Option<Enrollment>, String> {
-        let path = self.path(origin);
-        match std::fs::read_to_string(&path) {
-            Ok(text) => toml::from_str(&text)
-                .map(Some)
-                .map_err(|error| format!("{}: {error}", path.display())),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(format!("{}: {error}", path.display())),
-        }
+        self.kept()?.get(&Self::key(origin))
     }
 
-    /// Pin `enrollment` for `origin`, written whole or not at all.
+    /// Pin `enrollment` for `origin`.
     pub fn put(&self, origin: &Origin, enrollment: &Enrollment) -> Result<(), String> {
-        let text = toml::to_string(enrollment).map_err(|error| error.to_string())?;
-        create_private(&self.directory)?;
-        let path = self.path(origin);
-        write_private(&path, text.as_bytes())
+        self.kept()?.put(&Self::key(origin), enrollment)
     }
 
     /// Whether any enrollment is kept: its source's key already exists.
     pub fn any(&self) -> bool {
-        std::fs::read_dir(&self.directory).is_ok_and(|entries| {
-            entries.flatten().any(|entry| {
-                entry
-                    .path()
-                    .extension()
-                    .is_some_and(|extension| extension == "toml")
-            })
-        })
+        self.all().is_ok_and(|all| !all.is_empty())
     }
 
     /// Every enrollment kept for another origin than `origin`.
     pub fn others(&self, origin: &Origin) -> Result<Vec<Enrollment>, String> {
-        self.read(Some(&self.path(origin)))
+        let skip = Self::key(origin);
+        Ok(self
+            .kept()?
+            .under::<Enrollment>(ENROLLMENT)?
+            .into_iter()
+            .filter(|(key, _)| *key != skip)
+            .map(|(_, enrollment)| enrollment)
+            .collect())
     }
 
     /// Every enrollment kept.
     pub fn all(&self) -> Result<Vec<Enrollment>, String> {
-        self.read(None)
-    }
-
-    /// Every enrollment kept but the one at `skip`.
-    fn read(&self, skip: Option<&Path>) -> Result<Vec<Enrollment>, String> {
-        let entries = match std::fs::read_dir(&self.directory) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(format!("{}: {error}", self.directory.display())),
-        };
-        let mut enrollments = Vec::new();
-        for entry in entries {
-            let path = entry.map_err(|error| error.to_string())?.path();
-            if skip == Some(path.as_path())
-                || path.extension().is_none_or(|extension| extension != "toml")
-            {
-                continue;
-            }
-            let text = std::fs::read_to_string(&path)
-                .map_err(|error| format!("{}: {error}", path.display()))?;
-            enrollments.push(
-                toml::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?,
-            );
-        }
-        Ok(enrollments)
+        Ok(self
+            .kept()?
+            .under::<Enrollment>(ENROLLMENT)?
+            .into_iter()
+            .map(|(_, enrollment)| enrollment)
+            .collect())
     }
 
     /// Forget `origin`'s enrollment: the source's key is left as it is.
     pub fn remove(&self, origin: &Origin) -> Result<(), String> {
-        match std::fs::remove_file(self.path(origin)) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.to_string()),
-        }
+        self.kept()?.remove(&Self::key(origin))
     }
 }
 
@@ -229,47 +292,6 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
             None => Ok(()),
         })
         .map_err(|error| format!("{}: {error}", path.display()))
-}
-
-mod hex32_option {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(
-        bytes: &Option<[u8; 32]>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&bytes.map(hex::encode).unwrap_or_default())
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Option<[u8; 32]>, D::Error> {
-        let text = String::deserialize(deserializer)?;
-        if text.is_empty() {
-            return Ok(None);
-        }
-        hex::decode(&text)
-            .ok()
-            .and_then(|bytes| bytes.try_into().ok())
-            .map(Some)
-            .ok_or_else(|| serde::de::Error::custom("32 bytes in hex, or none"))
-    }
-}
-
-mod hex32 {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&hex::encode(bytes))
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[u8; 32], D::Error> {
-        let text = String::deserialize(deserializer)?;
-        hex::decode(&text)
-            .ok()
-            .and_then(|bytes| bytes.try_into().ok())
-            .ok_or_else(|| serde::de::Error::custom("32 bytes in hex"))
-    }
 }
 
 #[cfg(test)]
@@ -348,10 +370,12 @@ mod tests {
             use std::os::unix::fs::PermissionsExt as _;
             let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode(&directory.path().join("credentials")), 0o700);
-            assert_eq!(mode(&store.path(&origin)), 0o600);
+            let kept = directory
+                .path()
+                .join("credentials")
+                .join(crate::kept::DIRECTORY);
+            assert_eq!(mode(&kept), 0o700);
         }
-        let text = std::fs::read_to_string(store.path(&origin)).unwrap();
-        assert!(text.contains("vos.device.1") && text.contains(&hex::encode([1u8; 32])));
         store.remove(&origin).unwrap();
         assert_eq!(store.get(&origin).unwrap(), None);
     }

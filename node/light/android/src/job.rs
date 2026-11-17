@@ -35,14 +35,14 @@
 //!   never a key behind a prompt; Android starts no job of the app before
 //!   that unlock.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use vos_abi::{Decode, Encode};
 use vos_light::group::Alarm;
 
-use crate::enrollment::{create_private, write_private};
+use crate::kept::Kept;
 use crate::{Code, Facility, JobRun, Notice, Pending, Refusal, Seen, Synced, refused};
 
 /// The runs kept.
@@ -55,8 +55,8 @@ pub const STANDS_MS: u64 = 7 * 24 * 3_600_000;
 /// The once-raised notices kept standing, the latest.
 const STANDING: usize = 16;
 
-/// The runs' file, beside the enrollments (which are `.toml`).
-const FILE: &str = "job.state";
+/// The runs' row of the facility's database ([`crate::kept`]).
+const RUNS_ROW: &[u8] = b"runs";
 
 /// The device's personal space, as a pass syncs it.
 pub trait Personal: Send + Sync {
@@ -91,18 +91,140 @@ pub struct Passed {
 }
 
 /// A notice raised, and the device's time it was first raised at.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 struct Raised {
     notice: Notice,
     since: u64,
 }
 
-/// What the runs' file holds: the runs, the latest last, and the notices
-/// standing.
-#[derive(Debug, Default, Serialize, Deserialize)]
+/// The runs, the latest last, and the notices standing.
+#[derive(Debug, Default)]
 struct State {
     runs: Vec<JobRun>,
     raised: Vec<Raised>,
+}
+
+/// A run as its row keeps it.
+#[derive(Encode, Decode)]
+struct Run {
+    started_ms: u64,
+    finished_ms: u64,
+    bytes_down: u64,
+    bytes_up: u64,
+    synced: u32,
+    failed: u32,
+    notices: u32,
+    apart: bool,
+}
+
+/// A notice standing as its row keeps it: its kinds' bytes.
+#[derive(Encode, Decode)]
+struct Stood {
+    pending: u8,
+    index: u64,
+    at: u64,
+    matures: u64,
+    fresh: bool,
+    by: u32,
+    by_kit: bool,
+    contested: bool,
+    alarm: u8,
+    remedy: u8,
+    since: u64,
+}
+
+/// The runs' row.
+#[derive(Encode, Decode)]
+struct Row {
+    runs: Vec<Run>,
+    raised: Vec<Stood>,
+}
+
+impl From<&State> for Row {
+    fn from(state: &State) -> Self {
+        Row {
+            runs: state
+                .runs
+                .iter()
+                .map(|run| Run {
+                    started_ms: run.started_ms,
+                    finished_ms: run.finished_ms,
+                    bytes_down: run.bytes_down,
+                    bytes_up: run.bytes_up,
+                    synced: run.synced,
+                    failed: run.failed,
+                    notices: run.notices,
+                    apart: run.apart,
+                })
+                .collect(),
+            raised: state
+                .raised
+                .iter()
+                .map(|raised| Stood {
+                    pending: raised.notice.pending as u8,
+                    index: raised.notice.index,
+                    at: raised.notice.at,
+                    matures: raised.notice.matures,
+                    fresh: raised.notice.fresh,
+                    by: raised.notice.by,
+                    by_kit: raised.notice.by_kit,
+                    contested: raised.notice.contested,
+                    alarm: raised.notice.alarm as u8,
+                    remedy: raised.notice.remedy as u8,
+                    since: raised.since,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl Row {
+    /// The state it keeps; a notice of a kind this build does not know is
+    /// a row in need of repair.
+    fn state(self) -> Result<State, String> {
+        let raised = self
+            .raised
+            .into_iter()
+            .map(|stood| {
+                let unknown = "the facility's database needs repair: a notice's kind is not known";
+                let pending = Pending::from_byte(stood.pending).ok_or(unknown)?;
+                let alarm =
+                    crate::personal::contract::Alarm::from_byte(stood.alarm).ok_or(unknown)?;
+                let remedy =
+                    crate::personal::contract::Remedy::from_byte(stood.remedy).ok_or(unknown)?;
+                Ok(Raised {
+                    notice: Notice {
+                        pending,
+                        index: stood.index,
+                        at: stood.at,
+                        matures: stood.matures,
+                        fresh: stood.fresh,
+                        by: stood.by,
+                        by_kit: stood.by_kit,
+                        contested: stood.contested,
+                        alarm,
+                        remedy,
+                    },
+                    since: stood.since,
+                })
+            })
+            .collect::<Result<_, String>>()?;
+        let runs = self
+            .runs
+            .into_iter()
+            .map(|run| JobRun {
+                started_ms: run.started_ms,
+                finished_ms: run.finished_ms,
+                bytes_down: run.bytes_down,
+                bytes_up: run.bytes_up,
+                synced: run.synced,
+                failed: run.failed,
+                notices: run.notices,
+                apart: run.apart,
+            })
+            .collect();
+        Ok(State { runs, raised })
+    }
 }
 
 /// Whether a pass raises `notice` once rather than while its condition
@@ -111,37 +233,32 @@ fn once(notice: &Notice) -> bool {
     matches!(notice.pending, Pending::Restoring | Pending::Alarm)
 }
 
-/// The job's runs, kept under the facility's directory.
+/// The job's runs, a row of the facility's database under its directory.
 pub struct Runs {
-    directory: PathBuf,
+    kept: Result<Kept, String>,
 }
 
 impl Runs {
     pub fn new(directory: impl Into<PathBuf>) -> Self {
         Self {
-            directory: directory.into(),
+            kept: Kept::open(&directory.into()),
         }
     }
 
-    fn path(&self) -> PathBuf {
-        self.directory.join(FILE)
+    fn kept(&self) -> Result<&Kept, String> {
+        self.kept.as_ref().map_err(Clone::clone)
     }
 
-    /// The state kept; a file that does not parse (another layout's) is
-    /// started anew rather than stopping every run after it.
+    /// The state kept, read strictly.
     fn read(&self) -> Result<State, String> {
-        let path = self.path();
-        match std::fs::read_to_string(&path) {
-            Ok(text) => Ok(toml::from_str(&text).unwrap_or_default()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(State::default()),
-            Err(error) => Err(failure(&path, error)),
+        match self.kept()?.get::<Row>(RUNS_ROW)? {
+            Some(row) => row.state(),
+            None => Ok(State::default()),
         }
     }
 
     fn write(&self, state: &State) -> Result<(), String> {
-        let text = toml::to_string(state).map_err(|error| error.to_string())?;
-        create_private(&self.directory)?;
-        write_private(&self.path(), text.as_bytes())
+        self.kept()?.put(RUNS_ROW, &Row::from(state))
     }
 
     /// The runs kept, the latest last.
@@ -150,14 +267,10 @@ impl Runs {
     }
 }
 
-fn failure(path: &Path, error: impl std::fmt::Display) -> String {
-    format!("{}: {error}", path.display())
-}
-
-fn job_error(_: String) -> Refusal {
+fn job_error(error: String) -> Refusal {
     refused(
         Code::Store,
-        "the background job's runs could not be read or kept",
+        format!("the background job's runs could not be read or kept: {error}"),
     )
 }
 
@@ -168,11 +281,14 @@ pub fn now_ms() -> u64 {
         .map_or(0, |since| since.as_millis() as u64)
 }
 
-/// A notice's key among the raised: what it is, where, and its detail.
-fn key(notice: &Notice) -> String {
-    format!(
-        "{}:{}:{}",
-        notice.pending as u8, notice.index, notice.detail
+/// A notice's key among the raised: what it is, and where.
+fn key(notice: &Notice) -> (u8, u64, u8, u32, bool) {
+    (
+        notice.pending as u8,
+        notice.index,
+        notice.alarm as u8,
+        notice.by,
+        notice.by_kit,
     )
 }
 
@@ -200,6 +316,16 @@ impl Job {
 
     pub fn runs(&self) -> Result<Vec<JobRun>, Refusal> {
         self.runs.all().map_err(job_error)
+    }
+
+    /// The notices standing after the last pass.
+    pub fn standing(&self) -> Result<Vec<Notice>, Refusal> {
+        let state = self.runs.read().map_err(job_error)?;
+        Ok(state
+            .raised
+            .into_iter()
+            .map(|raised| raised.notice)
+            .collect())
     }
 
     /// One run of `part` on `runtime`: the run written as started first
@@ -370,11 +496,7 @@ pub(crate) fn notice(raised: vos_light::job::Notice) -> Notice {
     use vos_light::job::{Kind, Notice as Found};
     let plain = |pending| Notice {
         pending,
-        index: 0,
-        at: 0,
-        matures: 0,
-        fresh: false,
-        detail: String::new(),
+        ..Notice::default()
     };
     match raised {
         Found::Operation {
@@ -396,77 +518,68 @@ pub(crate) fn notice(raised: vos_light::job::Notice) -> Notice {
             index,
             at: at.unwrap_or(0),
             matures,
-            fresh: false,
-            detail: match (by, contested) {
-                (vos_wire::personal::Signer::Kit(_), _) => "by the kit".into(),
-                (vos_wire::personal::Signer::Device(device), false) => {
-                    format!("by device {device}")
-                }
-                (vos_wire::personal::Signer::Device(device), true) => {
-                    format!("by device {device}, contested")
-                }
+            by: match by {
+                vos_wire::personal::Signer::Device(device) => device,
+                vos_wire::personal::Signer::Kit(_) => 0,
             },
+            by_kit: matches!(by, vos_wire::personal::Signer::Kit(_)),
+            contested,
+            ..Notice::default()
         },
         Found::Restore => plain(Pending::Restoring),
         Found::Removed => plain(Pending::Removed),
         Found::Stuck => plain(Pending::Stuck),
-        Found::Alarm(alarm) => Notice {
-            detail: described(&alarm),
-            ..plain(Pending::Alarm)
-        },
+        Found::Alarm(found) => {
+            let (alarm, index, remedy) = alarm(&found);
+            Notice {
+                index,
+                alarm,
+                remedy,
+                ..plain(Pending::Alarm)
+            }
+        }
     }
 }
 
-/// What the chrome says of `alarm`: each kind in its own words, so a kind
-/// this build does not name fails to build rather than show as code.
-pub(crate) fn described(alarm: &Alarm) -> String {
-    match alarm {
-        Alarm::Log { index } => format!("the log does not chain at entry {index}"),
-        Alarm::SplitLog { epoch, device } => {
-            format!("device {device}'s vote on epoch {epoch} is of another log")
-        }
-        Alarm::NamedAbsent { epoch, .. } => {
-            format!("epoch {epoch} names this device absent though it called")
-        }
-        Alarm::Refused { epoch, committer } => {
-            format!("this device refused device {committer}'s epoch {epoch}")
-        }
-        Alarm::CannotFollow {
-            epoch, committer, ..
-        } => format!("this device cannot follow device {committer}'s epoch {epoch}"),
-        Alarm::Verdict { epoch } => {
-            format!("the agent's verdict on epoch {epoch} is not this device's")
-        }
-        Alarm::Unsigned { index } => format!("log entry {index} matures with no evidence"),
-        Alarm::Clock { skew_ms } => format!(
-            "this device's clock is {} s off the agent's",
-            skew_ms / 1_000
+/// An alarm's kind, its place (a log index, an epoch, a position, a skew
+/// in seconds) and its remedy: each kind its own, so one this build does
+/// not name fails to build.
+fn alarm(
+    alarm: &Alarm,
+) -> (
+    crate::personal::contract::Alarm,
+    u64,
+    crate::personal::contract::Remedy,
+) {
+    use crate::personal::contract::{Alarm as Kind, Remedy};
+    let none = Remedy::None;
+    match *alarm {
+        Alarm::Log { index } => (Kind::Log, index, none),
+        Alarm::SplitLog { epoch, .. } => (Kind::SplitLog, epoch, none),
+        Alarm::NamedAbsent { epoch, .. } => (Kind::NamedAbsent, epoch, none),
+        Alarm::Refused { epoch, .. } => (Kind::Refused, epoch, none),
+        Alarm::CannotFollow { epoch, remedy, .. } => (
+            Kind::CannotFollow,
+            epoch,
+            match remedy {
+                vos_light::group::Remedy::RePair => Remedy::RePair,
+                vos_light::group::Remedy::Regroup => Remedy::Regroup,
+            },
         ),
-        Alarm::Kit { index } => format!("the kit signed operation {index}"),
-        Alarm::Rollback { next } => format!("the agent's log went back to {next}"),
-        Alarm::View { index } => format!("a device saw log entry {index} otherwise"),
-        Alarm::Dropped { index } => format!("this device's call at {index} is not in the log"),
-        Alarm::Partition { scope, position } => {
-            format!("the agent serves less of {scope:?} than {position}, which a device read")
-        }
-        Alarm::Withheld { scope, position } => {
-            format!("the agent withheld {scope:?} at {position}")
-        }
-        Alarm::Stale { scope, position } => {
-            format!("{scope:?} at {position} is sealed under a past epoch")
-        }
-        Alarm::Author { scope, position } => {
-            format!("{scope:?} at {position} is by no device of the set")
-        }
-        Alarm::Deleted { scope, position } => {
-            format!("this device's {scope:?} at {position} is gone: pushed again")
-        }
-        Alarm::Unserved { next } => {
-            format!("the agent named its log's head at {next} and served less of it")
-        }
-        Alarm::Policy { index } => {
-            format!("log entry {index} lowers the device set's delays: refused")
-        }
+        Alarm::Verdict { epoch } => (Kind::Verdict, epoch, none),
+        Alarm::Unsigned { index } => (Kind::Unsigned, index, none),
+        Alarm::Clock { skew_ms } => (Kind::Clock, skew_ms / 1_000, none),
+        Alarm::Kit { index } => (Kind::Kit, index, none),
+        Alarm::Rollback { next } => (Kind::Rollback, next, none),
+        Alarm::View { index } => (Kind::View, index, none),
+        Alarm::Dropped { index } => (Kind::Dropped, index, none),
+        Alarm::Partition { position, .. } => (Kind::Partition, position, none),
+        Alarm::Withheld { position, .. } => (Kind::Withheld, position, none),
+        Alarm::Stale { position, .. } => (Kind::Stale, position, none),
+        Alarm::Author { position, .. } => (Kind::Author, position, none),
+        Alarm::Deleted { position, .. } => (Kind::Deleted, position, none),
+        Alarm::Unserved { next } => (Kind::Unserved, next, none),
+        Alarm::Policy { index } => (Kind::Policy, index, none),
     }
 }
 
@@ -474,14 +587,25 @@ pub(crate) fn described(alarm: &Alarm) -> String {
 mod tests {
     use super::*;
 
-    /// The alarms a pass raises name themselves: the head served short and
-    /// a lowered policy among them.
+    /// An alarm is raised as its kind, its place and its remedy.
     #[test]
-    fn an_alarm_names_itself() {
-        assert!(described(&Alarm::Unserved { next: 9 }).contains("head at 9"));
-        assert!(described(&Alarm::Policy { index: 4 }).contains("entry 4 lowers"));
+    fn an_alarm_is_raised_as_its_kind() {
         let raised = notice(vos_light::job::Notice::Alarm(Alarm::Policy { index: 4 }));
         assert_eq!(raised.pending, Pending::Alarm);
-        assert_eq!(raised.detail, described(&Alarm::Policy { index: 4 }));
+        assert_eq!(raised.alarm, crate::personal::contract::Alarm::Policy);
+        assert_eq!(raised.index, 4);
+        let stuck = notice(vos_light::job::Notice::Alarm(Alarm::CannotFollow {
+            epoch: 3,
+            committer: 1,
+            remedy: vos_light::group::Remedy::Regroup,
+        }));
+        assert_eq!(
+            (stuck.alarm, stuck.index, stuck.remedy),
+            (
+                crate::personal::contract::Alarm::CannotFollow,
+                3,
+                crate::personal::contract::Remedy::Regroup
+            )
+        );
     }
 }

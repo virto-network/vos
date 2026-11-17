@@ -19,6 +19,7 @@ import team.virto.vos.personal.Notice;
 import team.virto.vos.personal.Pending;
 import team.virto.vos.personal.PersonalActivity;
 import team.virto.vos.personal.Synced;
+import team.virto.vos.personal.Words;
 
 /**
  * The background job's local notifications, posted in {@code :vos}: one for each notice a pass
@@ -121,7 +122,8 @@ final class Notices {
 
   /** A notice's notification id: what it is and where. */
   private static int id(Notice notice) {
-    return 31 * (31 * notice.pending + (int) (notice.index ^ (notice.index >>> 32))) + notice.detail.hashCode();
+    int id = 31 * notice.pending + (int) (notice.index ^ (notice.index >>> 32));
+    return 31 * (31 * id + notice.alarm) + (int) notice.by + (notice.byKit ? 1 << 30 : 0);
   }
 
   /**
@@ -149,10 +151,12 @@ final class Notices {
 
   /** A notice's notification, opening the personal space's screens. */
   private static Notification notification(Context context, Notice notice) {
-    String text = context.getString(text(notice.pending));
-    if (!notice.detail.isEmpty()) {
-      text = text + " (" + notice.detail + ")";
-    }
+    // An alarm in its own words; an operation's kind as the notification channel words it, who
+    // signed it after.
+    String text =
+        notice.pending == Pending.ALARM
+            ? Words.notice(notice)
+            : context.getString(text(notice.pending)) + Words.signer(notice);
     return builder(context, 0, new Intent(context, PersonalActivity.class))
         .setContentTitle(context.getString(R.string.vos_pending_title))
         .setContentText(text)

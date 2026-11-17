@@ -31,11 +31,12 @@
 use vos_abi::ids::{InstanceId, MethodId, Principal};
 use vos_abi::result::Outcome;
 use vos_abi::{Decode, Encode};
-use vos_wire::books::{DeviceHandle, Enrolled, Space};
+use vos_wire::books::{DeviceHandle, Enrolled, Space, credential_book};
+use vos_wire::credentials;
 
 use crate::pairing::{Hello, Membership};
-use crate::store::{Store, StoreError};
-use crate::{Call, DeviceError, Error, Light, call};
+use crate::store::{Change, Store, StoreError};
+use crate::{Call, DeviceError, Error, Light};
 
 /// The rows of the enrollments held and the confirmations owed, by space.
 const ENROLL: &[u8] = b"m/enroll/";
@@ -48,12 +49,17 @@ fn key(prefix: &[u8], space: &Space, handle: &[u8; 32]) -> Vec<u8> {
 }
 
 impl Membership {
-    fn call(&self, method: &str, arguments: Vec<u8>, expires_ms: u64) -> Result<Call, DeviceError> {
+    fn call(
+        &self,
+        method: MethodId,
+        arguments: Vec<u8>,
+        expires_ms: u64,
+    ) -> Result<Call, DeviceError> {
         Call::new(
             self.space,
             self.agent,
             self.credentials.0,
-            call::method_id(method),
+            method.0,
             arguments,
             expires_ms,
         )
@@ -73,7 +79,8 @@ impl Enrollment {
     /// device's owner secret in the space ([`crate::Prover::prove_owner`]).
     pub fn call(&self, expires_ms: u64) -> Result<Call, DeviceError> {
         let arguments = (self.device.member, self.device.owner).encode();
-        self.membership.call("enroll_device", arguments, expires_ms)
+        self.membership
+            .call(credentials::method::ENROLL_DEVICE, arguments, expires_ms)
     }
 }
 
@@ -125,15 +132,19 @@ pub fn done(store: &Store, membership: &Membership) -> Result<(), StoreError> {
 /// The confirmations of the joiner offered `memberships`, held in `store`
 /// until [`confirmed`].
 pub fn expect(store: &Store, memberships: &[Membership]) -> Result<(), StoreError> {
-    store.write_group_rows(
-        memberships
-            .iter()
-            .map(|membership| {
-                let key = key(CONFIRM, &membership.space, &membership.handle);
-                (key, Some(membership.encode()))
-            })
-            .collect(),
-    )
+    store.write_group_rows(expected(memberships))
+}
+
+/// The rows [`expect`] writes, for a batch of the caller's: a pairing's
+/// group's.
+pub fn expected(memberships: &[Membership]) -> Vec<Change> {
+    memberships
+        .iter()
+        .map(|membership| {
+            let key = key(CONFIRM, &membership.space, &membership.handle);
+            (key, Some(membership.encode()))
+        })
+        .collect()
 }
 
 /// The confirmations owed.
@@ -149,7 +160,11 @@ pub fn confirm_call(
     member: &[u8; 32],
     expires_ms: u64,
 ) -> Result<Call, DeviceError> {
-    membership.call("confirm_device", member.encode(), expires_ms)
+    membership.call(
+        credentials::method::CONFIRM_DEVICE,
+        member.encode(),
+        expires_ms,
+    )
 }
 
 /// The confirmation in `membership` made: no longer owed.
@@ -166,7 +181,11 @@ pub fn revoke_call(
     member: &[u8; 32],
     expires_ms: u64,
 ) -> Result<Call, DeviceError> {
-    membership.call("revoke_device", member.encode(), expires_ms)
+    membership.call(
+        credentials::method::REVOKE_DEVICE,
+        member.encode(),
+        expires_ms,
+    )
 }
 
 fn rows<T: Decode>(store: &Store, prefix: &[u8]) -> Result<Vec<T>, StoreError> {
@@ -196,13 +215,13 @@ impl From<Error> for ReadError {
 fn read<T: Decode>(
     light: &Light,
     book: InstanceId,
-    method: &str,
+    method: MethodId,
     arguments: Vec<u8>,
 ) -> Result<T, ReadError> {
     let outcome = light.query(
         Principal::Client(light.sync_key().verifying_key().to_bytes()),
         book,
-        MethodId(call::method_id(method)),
+        method,
         arguments,
     )?;
     match &outcome {
@@ -237,10 +256,11 @@ pub fn handles_of(
     book: InstanceId,
     device: u32,
 ) -> Result<Vec<(Membership, DeviceHandle)>, ReadError> {
-    let spaces: Vec<(Space, Enrolled)> = read(light, book, "spaces", Vec::new())?;
+    let spaces: Vec<(Space, Enrolled)> = read(light, book, credential_book::SPACES, Vec::new())?;
     let mut held = Vec::new();
     for (space, enrolled) in spaces {
-        let handles: Vec<(u32, DeviceHandle)> = read(light, book, "handles", space.encode())?;
+        let handles: Vec<(u32, DeviceHandle)> =
+            read(light, book, credential_book::HANDLES, space.encode())?;
         if let Some((_, handle)) = handles.into_iter().find(|(id, _)| *id == device)
             && let Some(membership) = membership_of(space, &enrolled, handle.handle)
         {
@@ -262,7 +282,7 @@ pub fn record(
 ) -> Result<Outcome, Error> {
     light.call(
         book,
-        MethodId(call::method_id("handle")),
+        credential_book::HANDLE,
         (space, device, handle).encode(),
     )
 }

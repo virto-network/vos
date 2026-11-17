@@ -1,38 +1,32 @@
-// SPDX-FileCopyrightText: 2026 Virto
-// SPDX-License-Identifier: AGPL-3.0-or-later
-
-//! The link to the personal agent over Tor: sealed sync's [`Link`] and the
-//! pass's [`Control`], every request through the facility's client to the
-//! home's onion under one purpose (`Personal` for what the user does,
-//! `Background` for the job's pass), so the two never share a circuit or
-//! an SSH key.
+//! The link to the personal agent: sealed sync's [`Link`] and the pass's
+//! [`Control`], every request through the [`Host`] to the home under one
+//! purpose (`Personal` for what the user does, `Background` for the job's
+//! pass), so the two never share a circuit or an SSH key.
 //!
 //! A call is signed by a key in a session the link keeps for it: the sync
 //! key's in-process, the admin key's in the UI process behind its strong
 //! biometric (the [`Sign`] a flow lends). A call refused with `Settling` is
 //! sent again after a `wake`. A read is a query signed by the sync key.
-//! Every round trip blocks the calling thread on the facility's runtime:
-//! sealed sync and the pass are synchronous, and are never called on it.
+//! Every round trip blocks the calling thread: sealed sync and the pass
+//! are synchronous.
 
 use std::time::Instant;
 
+use super::Host;
+use crate::job::{Control, Post};
+use crate::personal::{Answer, Frontier, Link};
+use crate::route::{Purpose, Route};
+use crate::wire;
 use ed25519_dalek::{Signer as _, SigningKey};
-use vos_abi::abi::Failure;
 use vos_abi::ids::{AgentId, InstanceId, MethodId, Session};
 use vos_abi::result::Outcome;
 use vos_abi::{Decode, Encode};
 use vos_api::Kind;
-use vos_light::job::{Control, Post};
-use vos_light::personal::{Answer, Frontier, Link};
-use vos_light::route::{Purpose, Route};
-use vos_light::wire;
 use vos_wire::defaults::SESSION_EXPIRY_MS;
 use vos_wire::ingress::{self, Consistency, QueryCall, Response};
 use vos_wire::personal::{
-    DeviceView, Entry, Envelope, Overview, PersonalError, Pushed, Scope, Woken,
+    DeviceView, Entry, Envelope, Overview, PersonalError, Pushed, Scope, Woken, method,
 };
-
-use crate::net::{Net, SpaceId};
 
 /// How long a query is good for, by the node's clock.
 const QUERY_MS: u64 = 60_000;
@@ -87,25 +81,13 @@ pub struct Called {
 
 /// The handler's answer in `outcome`: its reply, or `Personal`'s error.
 pub fn answer<T: Decode>(outcome: &Outcome) -> Result<Result<T, PersonalError>, String> {
-    match outcome {
-        Outcome::Done(bytes) => T::decode_exact(bytes)
-            .map(Ok)
-            .ok_or_else(|| "the agent's reply does not decode".into()),
-        Outcome::Failed {
-            code: Failure::Handler,
-            detail,
-        } => PersonalError::decode_exact(detail)
-            .map(Err)
-            .ok_or_else(|| "the agent's error does not decode".into()),
-        other => Err(format!("the agent answered {other:?}")),
-    }
+    wire::answer(outcome).map_err(|_| format!("the agent answered {outcome:?}"))
 }
 
 /// A link to the personal agent at the home `space`.
-pub struct AgentLink<'a> {
-    net: &'a Net,
-    runtime: &'a tokio::runtime::Handle,
-    space: SpaceId,
+pub struct AgentLink<'a, H: Host> {
+    host: &'a H,
+    space: [u8; 32],
     purpose: Purpose,
     agent: Agent,
     sync: &'a SigningKey,
@@ -114,19 +96,17 @@ pub struct AgentLink<'a> {
     clock: Option<(u64, Instant)>,
 }
 
-impl<'a> AgentLink<'a> {
+impl<'a, H: Host> AgentLink<'a, H> {
     pub fn new(
-        net: &'a Net,
-        runtime: &'a tokio::runtime::Handle,
-        space: SpaceId,
+        host: &'a H,
+        space: [u8; 32],
         purpose: Purpose,
         agent: Agent,
         sync: &'a SigningKey,
         signer: &'a mut Signer,
     ) -> Self {
         Self {
-            net,
-            runtime,
+            host,
             space,
             purpose,
             agent,
@@ -142,8 +122,7 @@ impl<'a> AgentLink<'a> {
 
     /// `request`'s answer body, sent under the link's purpose.
     pub fn send(&self, request: &[u8]) -> Result<Vec<u8>, String> {
-        self.runtime
-            .block_on(self.net.request(self.space, self.purpose, request))
+        self.host.request(&self.space, self.purpose, request)
     }
 
     /// The node's time now: read once a link, then counted on.
@@ -166,10 +145,10 @@ impl<'a> AgentLink<'a> {
         &mut self,
         signer: &mut Signer,
         sign: Sign<'_>,
-        name: &str,
+        method: MethodId,
         arguments: Vec<u8>,
     ) -> Result<Called, String> {
-        self.signed_held(signer, sign, name, arguments, &mut |_, _| Ok(()))
+        self.signed_held(signer, sign, method, arguments, &mut |_, _| Ok(()))
     }
 
     /// The same, its message and signature given to `hold` before the call
@@ -178,7 +157,7 @@ impl<'a> AgentLink<'a> {
         &mut self,
         signer: &mut Signer,
         sign: Sign<'_>,
-        name: &str,
+        method: MethodId,
         arguments: Vec<u8>,
         hold: Hold<'_>,
     ) -> Result<Called, String> {
@@ -203,7 +182,7 @@ impl<'a> AgentLink<'a> {
             session,
             sequence: signer.next,
             instance: self.agent.instance,
-            method: MethodId(vos_light::method_id(name)),
+            method,
             arguments,
             signature: [0; 64],
         };
@@ -228,16 +207,16 @@ impl<'a> AgentLink<'a> {
 
     /// The sync key's call of `name`, sent again after a `wake` while the
     /// agent answers `Settling`.
-    pub fn call<T: Decode>(&mut self, name: &str, arguments: Vec<u8>) -> Answer<T, String> {
-        answer(&self.call_raw(name, arguments)?.outcome)
+    pub fn call<T: Decode>(&mut self, method: MethodId, arguments: Vec<u8>) -> Answer<T, String> {
+        answer(&self.call_raw(method, arguments)?.outcome)
     }
 
     /// The same, its outcome as it came.
-    pub fn call_raw(&mut self, name: &str, arguments: Vec<u8>) -> Result<Called, String> {
+    pub fn call_raw(&mut self, method: MethodId, arguments: Vec<u8>) -> Result<Called, String> {
         let key = self.sync.clone();
         let sign = move |message: &[u8]| Ok(key.sign(message).to_bytes());
         let mut signer = *self.signer;
-        let called = self.settled(&mut signer, &sign, name, arguments);
+        let called = self.settled(&mut signer, &sign, method, arguments);
         *self.signer = signer;
         called
     }
@@ -248,10 +227,10 @@ impl<'a> AgentLink<'a> {
         &mut self,
         signer: &mut Signer,
         sign: Sign<'_>,
-        name: &str,
+        method: MethodId,
         arguments: Vec<u8>,
     ) -> Result<Called, String> {
-        self.settled_held(signer, sign, name, arguments, &mut |_, _| Ok(()))
+        self.settled_held(signer, sign, method, arguments, &mut |_, _| Ok(()))
     }
 
     /// The same, each call's message held before it is sent
@@ -261,12 +240,12 @@ impl<'a> AgentLink<'a> {
         &mut self,
         signer: &mut Signer,
         sign: Sign<'_>,
-        name: &str,
+        method: MethodId,
         arguments: Vec<u8>,
         hold: Hold<'_>,
     ) -> Result<Called, String> {
         for _ in 0..WAKES {
-            let called = self.signed_held(signer, sign, name, arguments.clone(), &mut *hold)?;
+            let called = self.signed_held(signer, sign, method, arguments.clone(), &mut *hold)?;
             let settling = matches!(
                 answer::<()>(&called.outcome),
                 Ok(Err(PersonalError::Settling))
@@ -280,14 +259,18 @@ impl<'a> AgentLink<'a> {
     }
 
     /// The sync key's query of `name` with `arguments`.
-    pub fn query<T: Decode>(&mut self, name: &str, arguments: impl Encode) -> Answer<T, String> {
+    pub fn query<T: Decode>(
+        &mut self,
+        method: MethodId,
+        arguments: impl Encode,
+    ) -> Answer<T, String> {
         let not_after = self.now()? + QUERY_MS;
         let mut query = QueryCall {
             key: self.sync.verifying_key().to_bytes(),
             not_after,
             consistency: Consistency::Applied { at: 0 },
             instance: self.agent.instance,
-            method: MethodId(vos_light::method_id(name)),
+            method,
             arguments: arguments.encode(),
             signature: [0; 64],
         };
@@ -306,7 +289,7 @@ impl<'a> AgentLink<'a> {
         let mut entries = Vec::new();
         let mut next = from;
         loop {
-            let page: Vec<(u64, Entry)> = match self.query("log", next)? {
+            let page: Vec<(u64, Entry)> = match self.query(method::LOG, next)? {
                 Ok(page) => page,
                 Err(error) => return Ok(Err(error)),
             };
@@ -319,14 +302,11 @@ impl<'a> AgentLink<'a> {
     }
 }
 
-impl Link for AgentLink<'_> {
+impl<H: Host> Link for AgentLink<'_, H> {
     type Error = String;
 
     fn route(&self) -> Route {
-        match self.net.client().routes(&self.space) {
-            Some(routes) => routes.route(self.purpose).unwrap_or(Route::Clearnet),
-            None => Route::Clearnet,
-        }
+        self.host.route(&self.space, self.purpose)
     }
 
     fn push(
@@ -335,43 +315,43 @@ impl Link for AgentLink<'_> {
     ) -> Result<Vec<Result<Pushed, PersonalError>>, String> {
         envelopes
             .iter()
-            .map(|envelope| self.call::<Pushed>("push", envelope.encode()))
+            .map(|envelope| self.call::<Pushed>(method::PUSH, envelope.encode()))
             .collect()
     }
 
     fn since(&mut self, scope: Scope, position: u64) -> Answer<Vec<Envelope>, String> {
-        self.query("since", (scope, position))
+        self.query(method::SINCE, (scope, position))
     }
 
     fn wake(&mut self) -> Answer<Woken, String> {
         let key = self.sync.clone();
         let sign = move |message: &[u8]| Ok(key.sign(message).to_bytes());
         let mut signer = *self.signer;
-        let called = self.signed(&mut signer, &sign, "wake", Vec::new());
+        let called = self.signed(&mut signer, &sign, method::WAKE, Vec::new());
         *self.signer = signer;
         answer(&called?.outcome)
     }
 
     fn frontier(&mut self, device: u32) -> Answer<Frontier, String> {
-        self.query("frontier", device)
+        self.query(method::FRONTIER, device)
     }
 }
 
-impl Control for AgentLink<'_> {
+impl<H: Host> Control for AgentLink<'_, H> {
     fn log(&mut self, from: u64) -> Answer<Vec<(u64, Entry)>, String> {
-        self.query("log", from)
+        self.query(method::LOG, from)
     }
 
     fn overview(&mut self) -> Answer<Overview, String> {
-        self.query("overview", ())
+        self.query(method::OVERVIEW, ())
     }
 
     fn devices(&mut self) -> Answer<Vec<DeviceView>, String> {
-        self.query("devices", ())
+        self.query(method::DEVICES, ())
     }
 
     fn post(&mut self, post: &Post) -> Answer<u64, String> {
-        let called = self.call_raw(post.name(), post.arguments())?;
+        let called = self.call_raw(post.method(), post.arguments())?;
         Ok(match &called.outcome {
             Outcome::Done(reply) => {
                 Ok(post.at(reply).ok_or("the agent's reply does not decode")?)
