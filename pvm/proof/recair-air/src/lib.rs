@@ -28,6 +28,7 @@
 //! fail, as in the final verifier, which links it.
 
 #![no_std]
+#![forbid(unsafe_code)]
 #![cfg_attr(
     not(test),
     deny(

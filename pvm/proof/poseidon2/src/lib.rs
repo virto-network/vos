@@ -34,9 +34,11 @@
 //! `unwrap`, an `expect`, a `panic!` or an arithmetic that can overflow is a
 //! lint error, each one left allowed in place with the reason it cannot
 //! fail, as in the final verifier, which links it; the
-//! packed code, the prover's alone, is allowed as a whole.
+//! packed code, the prover's alone, is allowed as a whole. `unsafe` code is
+//! a compile error outside `packed`.
 
 #![no_std]
+#![deny(unsafe_code)]
 #![cfg_attr(
     not(test),
     deny(
@@ -57,6 +59,10 @@ mod field;
     clippy::arithmetic_side_effects,
     clippy::indexing_slicing,
     reason = "the prover's hashing, on no verify path: its lanes' arithmetic is M31's, and the packed permutation equals the scalar one lane for lane"
+)]
+#[allow(
+    unsafe_code,
+    reason = "the prover's SIMD intrinsics, behind `packed`: no verify path links them"
 )]
 pub mod packed;
 mod permutation;

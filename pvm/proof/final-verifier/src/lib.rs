@@ -39,6 +39,7 @@
 //! guard them, are listed in `pvm/proof/SECURITY.md`.
 
 #![no_std]
+#![forbid(unsafe_code)]
 #![cfg_attr(
     not(test),
     deny(
