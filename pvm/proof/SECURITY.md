@@ -55,8 +55,10 @@ reference shape, from the security tool (`src/security.rs`):
   log sizes at most `DEVICE_MAX_LOG_SIZE`, which install refuses past),
   and every term of the count is monotone in the shape, so the
   reference's count bounds every proof's (`src/format.rs`'s notes; the
-  device format's gate counts the cut device set too,
-  `device/tests/device/format.rs`).
+  device format's gates count a cut CPU and a smaller program against the
+  reference, `device/tests/device/format.rs`'s
+  `the_reference_bounds_the_per_program_cpu` and
+  `the_reference_bounds_smaller_programs`).
 - **The proven count is the same on every target.** It is taken in `f64`
   (`src/security.rs`) by IEEE 754's basic operations alone: addition,
   subtraction, multiplication and division, each correctly rounded, so
@@ -266,8 +268,11 @@ panic-free on every input by construction:
   reason), the permutation's fixed 16-word state, the sponge's buffer
   (below `RATE`) and the tables built when the crate compiles; its
   `packed` module, the prover's alone, is allowed whole. No lint covers
-  `assert!`: the crates hold one outside their tests, `M31::new`'s, whose
-  callers pass constants and 16-bit limbs. `split_at` and
+  `assert!`: outside their tests the crates hold `M31::new`'s, whose
+  callers pass constants and 16-bit limbs, and three `debug_assert!`s,
+  compiled out of a release build, in `vos-pvm-recair-air`'s `p2.rs` (the
+  body's selector loop over `P2Mode::ALL`, which holds no tagged mode, and
+  the prover's trace generator). `split_at` and
   `copy_from_slice`, which no lint covers either, appear at lengths equal
   by construction (`codec.rs`'s big-integer mode; a digest's eight words
   into a 16-word state).

@@ -559,11 +559,11 @@ _forbidden +gates:
         [tools "-p vos-node" [] $tools] \
         [tools "-p vos-node --features prover" [] $tools] \
         [venue-model "--workspace" [model kreivo-mock] []] \
-        [venue-model "-p vos-cli" [model] []] \
-        [venue-model "-p vos-cli --features prover" [model] []] \
-        [venue-model "-p vos-node" [model] []] \
-        [venue-model "-p vos-node --features prover" [model] []] \
-        [venue-model "-p vos-statement-service --features pvm-guest" [model] []] \
+        [venue-model "-p vos-cli" [model model-judge] []] \
+        [venue-model "-p vos-cli --features prover" [model model-judge] []] \
+        [venue-model "-p vos-node" [model model-judge] []] \
+        [venue-model "-p vos-node --features prover" [model model-judge] []] \
+        [venue-model "-p vos-statement-service --features pvm-guest" [model model-judge] []] \
         [seeded-masks "--workspace" [seeded-masks other-pins chip-isolated] []] \
         [seeded-masks "-p vos-cli --features prover" [seeded-masks other-pins chip-isolated] []] \
         [seeded-masks "-p vos-light" [seeded-masks other-pins chip-isolated] []] \
@@ -661,9 +661,11 @@ check-no-tools: (_forbidden "tools")
 # reaches neither the `vos` binary, with or without the prover, nor
 # `vos-node`, on a normal or build edge (the tests enable it on dev
 # edges), and no normal or build edge of any workspace member enables it,
-# nor `vos-statement`'s (`model`: a judge whose pinned program and state its
-# input carries), nor Kreivo's mock (`vos-kreivo`'s `kreivo-mock`); the JAM
-# statements service's program links no model venue either.
+# nor Kreivo's mock (`vos-kreivo`'s `kreivo-mock`). Neither the node, the
+# `vos` binary nor the JAM statements service's program links
+# `vos-statement`'s model venue either (`model-judge`: a judge whose pinned
+# program and state its input carries), which the development tools'
+# harnesses do.
 check-no-venue-model: (_forbidden "venue-model")
     print "no model venue in the node"
 
@@ -775,7 +777,7 @@ vos-sync dir:
 # workspace of its own, built alone and `--locked` (on the kit's lockfile,
 # `pvm/proof/kit/Cargo.lock`) for `wasm32v1-none` on Kreivo's stable
 # toolchain (1.94.1, the target installed as Kreivo's CI installs it), no
-# `std` feature, model venue (`vos-statement`'s `model`) or test seam
+# `std` feature, model venue (`vos-statement`'s `model-judge`) or test seam
 # (the final verifier's `other-pins`) enabled in any crate it links;
 # `vos-statement`'s `fixtures`
 # reader built for the host; and the sync check's own test
@@ -783,7 +785,7 @@ vos-sync dir:
 # the kit's own script never trusted, `VENDOR`'s tag required and checked.
 check-kit: _kit-workspace
     cd target/kit/build; cargo +1.94.1 build --workspace --target wasm32v1-none --locked --quiet
-    cd target/kit/build; let std = (cargo +1.94.1 tree --workspace -e normal --target wasm32v1-none -f '{p}|{f}' --prefix none --locked | lines | where {|line| $line | split row '|' | last | split row ',' | any {|feature| $feature in [std model other-pins] } } | uniq); if ($std | is-not-empty) { error make { msg: $"std, the model venue or a test seam reaches the kit: ($std | str join ', ')" } } else { print "no std feature, model venue or test seam in the kit's wasm32v1-none build" }
+    cd target/kit/build; let std = (cargo +1.94.1 tree --workspace -e normal --target wasm32v1-none -f '{p}|{f}' --prefix none --locked | lines | where {|line| $line | split row '|' | last | split row ',' | any {|feature| $feature in [std model-judge other-pins] } } | uniq); if ($std | is-not-empty) { error make { msg: $"std, the model venue or a test seam reaches the kit: ($std | str join ', ')" } } else { print "no std feature, model venue or test seam in the kit's wasm32v1-none build" }
     cd target/kit/build; cargo +1.94.1 build -p vos-statement --features fixtures --locked --quiet
     python3 -I pvm/proof/kit/check.py --scratch target/kit/sync
 

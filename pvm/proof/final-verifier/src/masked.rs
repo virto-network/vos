@@ -158,7 +158,7 @@ fn verify_under(
             circuit: Blake2bHash(*preprocessed_root),
             public: &public,
             public_sum: &public_sum,
-            bound_sums: None,
+            bound_sums: &|_, _| true,
             interaction_pow: proof.interaction_pow,
             claimed_sums: &proof.claimed_sums,
         },

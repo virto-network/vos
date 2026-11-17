@@ -74,7 +74,7 @@ where
         circuit: own_circuit(proof),
         public: &proof.outputs,
         public_sum: &public_sum,
-        bound_sums: None,
+        bound_sums: &|_, _| true,
         interaction_pow: proof.interaction_pow,
         claimed_sums: &proof.claimed_sums,
     };

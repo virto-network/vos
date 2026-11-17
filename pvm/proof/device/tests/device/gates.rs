@@ -674,7 +674,7 @@ fn the_program_is_mixed_into_the_transcript() {
             circuit: program.circuit,
             public: &public,
             public_sum: &zero,
-            bound_sums: Some(&bound),
+            bound_sums: &bound,
             interaction_pow: proof.proof.interaction_pow,
             claimed_sums: &proof.proof.claimed_sums,
         };

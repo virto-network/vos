@@ -29,7 +29,7 @@ fn a_malformed_proof_is_an_error_never_a_panic() {
                 circuit,
                 public: &proof.outputs,
                 public_sum: &public_sum,
-                bound_sums: None,
+                bound_sums: &|_, _| true,
                 interaction_pow: proof.interaction_pow,
                 claimed_sums,
             },

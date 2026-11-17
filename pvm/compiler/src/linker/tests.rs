@@ -83,11 +83,45 @@ fn a_branch_into_pruned_code_traps() {
     let blob = spi_blob(kernel).expect("links");
     let invocation = refine::execute(&blob, &[], 10_000_000).expect("executes");
     assert_eq!(invocation.exit, ExitReason::Panic);
+    // Linked whole, the same branch reaches no code: a link error.
+    assert!(matches!(
+        transpile_with(&elf, Link::Whole),
+        Err(TranspileError::UnresolvedTarget { target }) if target == TEXT_VADDR + 0x1000
+    ));
     let falls = pruned(&assemble(&[addi(A0, A0, 1)]), Vec::new(), Vec::new());
     let kernel = transpile_with(&falls, Link::Kernel).expect("translates");
     let blob = spi_blob(kernel).expect("links");
     let invocation = refine::execute(&blob, &[], 10_000_000).expect("executes");
     assert_eq!(invocation.exit, ExitReason::Panic);
+}
+
+/// A control-flow target between a relocated call pair's AUIPC and JALR,
+/// which the link fuses into one instruction, would split the pair: the
+/// link refuses it.
+#[test]
+fn a_target_splitting_a_call_pair_is_refused() {
+    const CALLEE: u64 = TEXT_VADDR + 12;
+    let text = assemble(&[
+        auipc(T0, 0), // R_RISCV_CALL_PLT relocation lives here
+        jalr(RA, T0),
+        jal(0, -4), // to the pair's JALR
+        jalr(0, RA),
+    ]);
+    let mut elf = LinkedElf {
+        relocations: 1,
+        call_targets: BTreeMap::from([(TEXT_VADDR, CALLEE)]),
+        ..LinkedElf::text(TEXT_VADDR, text)
+    };
+    elf.control_flow_targets.extend([TEXT_VADDR + 4, CALLEE]);
+    for link in [Link::Whole, Link::Kernel] {
+        let refused = transpile_with(&elf, link).err().expect("refused");
+        assert!(
+            refused
+                .to_string()
+                .contains("splits a relocated AUIPC+JALR call pair"),
+            "{refused}"
+        );
+    }
 }
 
 #[test]

@@ -231,9 +231,9 @@ pub struct Claim<'a, R, Hash> {
     /// sums must cancel (zero for a set with no public term).
     pub public_sum: &'a dyn Fn(&R) -> SecureField,
     /// Whether the claimed sums the public values fix
-    /// ([`MaskedComponents::public_sums`]) are theirs under the relations;
-    /// `None` for a set with none.
-    pub bound_sums: Option<&'a BoundSums<'a, R>>,
+    /// ([`MaskedComponents::public_sums`]) are theirs under the relations
+    /// (always, for a set with none).
+    pub bound_sums: &'a BoundSums<'a, R>,
     pub interaction_pow: u64,
     pub claimed_sums: &'a [SecureField],
 }
@@ -396,10 +396,7 @@ pub fn replay<MC: MerkleChannel, C: MaskedComponents>(
     if !total.is_zero() {
         return Err(Error::Logup);
     }
-    if claim
-        .bound_sums
-        .is_some_and(|bound| !bound(&relations, claim.claimed_sums))
-    {
+    if !(claim.bound_sums)(&relations, claim.claimed_sums) {
         return Err(Error::Logup);
     }
 

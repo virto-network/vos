@@ -6,18 +6,18 @@ license = "GPL-3.0-or-later"
 description = "A proved statement as a venue judges it: its types, its canonical encoding, its io-hash and id, and the venue's check of a final proof against it. no_std, with no dependency on VOS beyond the final verifier."
 
 [features]
-# The model venue (`model`): a venue as plain data, whose pinned program
+# The model venue (`model`, under `model-judge`): a venue as plain data, whose pinned program
 # and state a judgement's input bytes carry, for the harnesses that judge
 # the golden fixtures and the conformance vectors natively, in Wasm and on
 # the JAM-only host. Never a deployed venue's: no production build, and not
 # the verifier kit's own build, enables it (`just check-no-leaks`, `just
 # check-kit`).
-model = []
+model-judge = []
 # The golden fixtures' reader (`fixtures`), for the venues' harnesses: std.
-fixtures = ["model", "vos-anchor/vectors"]
+fixtures = ["model-judge", "vos-anchor/vectors"]
 # The model venue as a JAM refine program (`src/bin/final-verify.rs`), for
 # the PVM target only: no_main, its own allocator and panic handler.
-pvm-guest = ["model"]
+pvm-guest = ["model-judge"]
 # The guests' heap peak (`guest/heap.rs`): the highest top the allocator
 # reached, which a guest reports as its high-water mark, for measurement
 # builds of `final-verify` only. Without it the report gives the top at the

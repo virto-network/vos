@@ -124,11 +124,12 @@ The masking's zero-knowledge rests on prover code: `recair/src/masked/`,
 `device/src/masked/prove.rs` and `src/masked/trace.rs`.
 
 **A masked claim's checks are all mandatory.** `masking::Claim` carries
-the circuit's root and the public terms' logup sum as plain fields, never
-optional: every caller of `verify_masked` checks the preprocessed root
-against the root it pins and the claimed sums against the public terms.
-Only `bound_sums` is optional, for a set no public value fixes a sum of
-(the wrap's).
+the circuit's root, the public terms' logup sum and the check of the sums
+the public values fix (`bound_sums`, the device's io-hash binding) as
+plain fields, never optional: every caller of `verify_masked` checks the
+preprocessed root against the root it pins, the claimed sums against the
+public terms, and the fixed sums against the public values (a set with
+none, the wrap, passes a check that holds).
 
 ### The JAM statements service
 
@@ -165,7 +166,7 @@ check-kit` off the kit's build: `vos-pvm-proof`'s `chip-isolated`
 `verify_standalone` refuses); `vos-pvm-recair`'s `seeded-masks` (seeded
 randomness, the forced prove); `vos-pvm-final-verifier`'s `other-pins`
 (`masked::verify_with`, the wrap under other pins); `vos-pvm-device`'s
-`test-device-format`; and `vos-statement`'s `model` (a judge whose pinned
+`test-device-format`; and `vos-statement`'s `model-judge` (`model`, a judge whose pinned
 program and venue state its input bytes carry, for the harnesses and the
 conformance vectors). `vos-pvm-device`'s `masked` module takes a `Format`
 itself, the gates' layer; production enters through `Program` and
