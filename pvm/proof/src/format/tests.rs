@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use num_traits::Zero;
 use stwo::core::air::Component;
 use stwo::core::fields::qm31::SecureField;
-use stwo::core::pcs::TreeVec;
+use stwo::core::pcs::{PcsConfig, TreeVec};
 use stwo_constraint_framework::TraceLocationAllocator;
 
 /// The segment AIR's shape with every chip at `2^log_size` rows.
@@ -57,8 +57,10 @@ fn the_bit_counts_are_pinned_per_format() {
     let pinned: Vec<(u32, u32, u32)> = REGISTRY
         .iter()
         .map(|format| {
-            let bits = crate::security::security_bits(&format.params, &format.reference).unwrap();
-            assert_eq!(bits, format.bits, "format {}", format.number);
+            let counted = count(format).expect("a count for every registered format");
+            let bits = crate::security::security_bits(&format.params, &counted.reference).unwrap();
+            assert_eq!(bits, counted.bits, "format {}", format.number);
+            assert!(counted.meets(&format.floor), "format {}", format.number);
             (format.number, bits.conjectured, bits.proven)
         })
         .collect();
@@ -66,7 +68,12 @@ fn the_bit_counts_are_pinned_per_format() {
         pinned,
         [(32, 108, 63), (39, 146, 82), (41, 104, 62), (47, 110, 62),]
     );
-    assert!(REGISTRY.iter().all(Format::meets_floors));
+    assert!(
+        REGISTRY
+            .iter()
+            .zip(COUNTS)
+            .all(|(format, count)| format.number == count.number)
+    );
     // Every format grinds an interaction PoW: the prover always grinds
     // and the verifier always checks one.
     assert!(
@@ -82,19 +89,20 @@ fn the_bit_counts_are_pinned_per_format() {
 /// count clears 62.
 #[test]
 fn the_parameters_are_the_least_that_clear_their_margins() {
-    let count = |params: &FormatParams, shape: &SecurityShape| {
+    let proven = |params: &FormatParams, shape: &SecurityShape| {
         crate::security::proven_count(params, shape).unwrap()
     };
-    let segment = count(&SEGMENT.params, &SEGMENT_REFERENCE);
+    let device = count(&DEVICE_PROOF).unwrap().reference;
+    let segment = proven(&SEGMENT.params, &SEGMENT_REFERENCE);
     assert!((62.81..62.82).contains(&segment), "{segment}");
-    let at_44 = count(&LEAF_FOLD.params, &SEGMENT_REFERENCE);
+    let at_44 = proven(&LEAF_FOLD.params, &SEGMENT_REFERENCE);
     assert!((62.74..62.75).contains(&at_44), "{at_44}");
     let fewer = FormatParams {
         n_queries: DEVICE_PROOF.params.n_queries - 1,
         ..DEVICE_PROOF.params
     };
-    assert!(count(&DEVICE_PROOF.params, &DEVICE_PROOF.reference) >= 62.0);
-    assert!(count(&fewer, &DEVICE_PROOF.reference) < 62.0);
+    assert!(proven(&DEVICE_PROOF.params, &device) >= 62.0);
+    assert!(proven(&fewer, &device) < 62.0);
 }
 
 /// A proof's config does not carry its batching: deserialized, it reads
@@ -119,8 +127,8 @@ fn the_verifier_takes_the_batching_from_the_format() {
 }
 
 /// Every number names one entry; only 39, 41 and 47 are admitted, and a
-/// segment verifier takes 41 alone; every other number, one an earlier
-/// format took among them, is refused as unregistered.
+/// segment verifier takes 41 alone; every other number is refused, as
+/// retired when an earlier format took it, else as unregistered.
 #[test]
 fn the_registry_numbers_round_trip() {
     for format in REGISTRY {
@@ -140,8 +148,11 @@ fn the_registry_numbers_round_trip() {
             continue;
         }
         assert!(lookup(number).is_none());
-        let error = admitted(number).unwrap_err();
-        assert!(error.contains("not registered"), "{error}");
+        let refused = match RETIRED.contains(&number) {
+            true => Refused::Retired,
+            false => Refused::Unregistered,
+        };
+        assert_eq!(admitted(number), Err(refused));
     }
 }
 
@@ -155,7 +166,7 @@ fn a_proof_below_a_floor_is_refused() {
     let config = SEGMENT.pcs_config();
     assert_eq!(
         check(&SEGMENT, &config, &SEGMENT_REFERENCE).unwrap(),
-        SEGMENT.bits
+        count(&SEGMENT).unwrap().bits
     );
 
     let mut fewer = config;

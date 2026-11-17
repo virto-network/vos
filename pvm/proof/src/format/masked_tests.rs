@@ -46,9 +46,10 @@ fn least_queries(base: FormatParams) -> Option<usize> {
 fn the_unmasked_counts_do_not_move() {
     let counted_masked = [MASKED_WRAP.number, DEVICE_PROOF.number];
     for format in REGISTRY {
+        let counted = super::count(&format).unwrap();
         let doublings = u32::from(counted_masked.contains(&format.number));
         assert_eq!(
-            format.reference.composition_point_doublings, doublings,
+            counted.reference.composition_point_doublings, doublings,
             "format {}",
             format.number
         );
@@ -60,8 +61,8 @@ fn the_unmasked_counts_do_not_move() {
         );
         if format.number != MASKED_WRAP.number {
             assert_eq!(
-                security_bits(&format.params, &format.reference).unwrap(),
-                format.bits,
+                security_bits(&format.params, &counted.reference).unwrap(),
+                counted.bits,
                 "format {}",
                 format.number
             );
@@ -114,14 +115,18 @@ fn format_39_counts_146_and_82() {
             proven: 82
         })
     );
-    assert!(MASKED_WRAP.meets_floors());
+    assert!(
+        super::count(&MASKED_WRAP)
+            .unwrap()
+            .meets(&MASKED_WRAP.floor)
+    );
     assert_eq!(
         crate::proof::check_format_security(
             &MASKED_WRAP,
             &MASKED_WRAP.pcs_config(),
             &MASKED_WRAP_REFERENCE
         ),
-        Ok(MASKED_WRAP.bits)
+        Ok(super::count(&MASKED_WRAP).unwrap().bits)
     );
 
     let terms = term_bits(&params, &MASKED_WRAP_REFERENCE).unwrap();

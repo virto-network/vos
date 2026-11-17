@@ -8944,7 +8944,6 @@ dependencies = [
  "num-traits",
  "serde",
  "stwo",
- "vos-pvm-proof",
  "vos-pvm-recair-air",
 ]
 

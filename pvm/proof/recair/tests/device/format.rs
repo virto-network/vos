@@ -14,8 +14,7 @@ use vos_pvm_proof::framework_access::MAX_RELATION_WIDTH;
 use vos_pvm_proof::masked::{DeviceComponents, drive_masked_device_chip};
 use vos_pvm_proof::security::{SecurityShape, proven_count, security_bits};
 use vos_pvm_recair::masked::device::{device_floors, device_reveals};
-use vos_pvm_recair::masked::mask_pins;
-use vos_pvm_recair_air::masked::{
+use vos_pvm_recair_air::masking::{
     BlindRelation, MaskedComponent, MaskedComponents, air_log_size, committed_log_sizes,
     composition_log_degree_bound, sample_points,
 };
@@ -31,7 +30,7 @@ fn device_shape(log_size: u32) -> SecurityShape {
 /// The masked shape of the device set `set_shape`: every chip it may hold
 /// and its CPU.
 fn shape_of(set_shape: DeviceShape, log_size: u32) -> SecurityShape {
-    let pins = mask_pins(&DEVICE_PROOF.masking.unwrap());
+    let pins = DEVICE_PROOF.masking.unwrap();
     let chips: Vec<usize> = device_chips_of_mask(DEVICE_ALL).collect();
     let set = DeviceComponents::layout(set_shape, &vec![log_size; chips.len()]).unwrap();
     let trees = committed_log_sizes(&set, &pins).unwrap();
@@ -94,10 +93,11 @@ fn the_device_reference_shape_is_the_built_sets() {
     let format = DEVICE_PROOF;
     let built = device_shape(DEVICE_MAX_LOG_SIZE);
     assert_eq!(built, DEVICE_REFERENCE);
-    assert_eq!(format.reference, DEVICE_REFERENCE);
+    let counted = vos_pvm_proof::format::count(&format).unwrap();
+    assert_eq!(counted.reference, DEVICE_REFERENCE);
     let bits = security_bits(&format.params, &built).unwrap();
-    assert_eq!(bits, format.bits);
-    assert!(format.meets_floors());
+    assert_eq!(bits, counted.bits);
+    assert!(counted.meets(&format.floor));
     let count = proven_count(&format.params, &built).unwrap();
     assert!(count >= 62.0, "{count}");
     let fewer = FormatParams {

@@ -50,7 +50,8 @@ use stwo::core::vcs::blake2b_hash::Blake2bHash;
 use stwo::core::vcs_lifted::blake2b_merkle::Blake2bMerkleHasher;
 use stwo::core::vcs_lifted::verifier::MerkleDecommitmentLifted;
 
-use crate::masked::{CONFIG, FORMAT, FRI_ROUNDS, LOG_DEGREE_BOUND, TREES, samples};
+use crate::masked::{CONFIG, FORMAT, FRI_ROUNDS, LOG_DEGREE_BOUND, samples};
+use crate::masking::TREES;
 use crate::{Error, LOG_SIZES, MAX_PROOF_BYTES, TREE_WIDTHS, WrapProof};
 
 /// A hash's bytes.

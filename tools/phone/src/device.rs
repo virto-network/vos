@@ -32,7 +32,7 @@ use vos_pvm_recair::masked::device::{
     DeviceProof, DeviceProver, device_shape, install, verify_device,
 };
 use vos_pvm_recair::masked::{MaskRng, MaskedProof};
-use vos_pvm_recair_air::masked::MaskedComponents;
+use vos_pvm_recair_air::masking::MaskedComponents;
 
 use crate::{hex, ms, peak_rss_mib, quantile};
 

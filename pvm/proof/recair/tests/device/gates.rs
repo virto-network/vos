@@ -20,7 +20,7 @@ use stwo::prover::backend::BackendForChannel;
 use stwo::prover::backend::simd::SimdBackend;
 use vos_pvm_compiler::assembler::{Assembler, Reg};
 use vos_pvm_final_verifier::Error;
-use vos_pvm_final_verifier::masked::{Claim, verify_masked};
+use vos_pvm_final_verifier::masking::{Claim, verify_masked};
 use vos_pvm_proof::AirColumn;
 use vos_pvm_proof::chips::poseidon2;
 use vos_pvm_proof::core::ecall::ECALL_WITNESS_INPUT;
@@ -38,7 +38,7 @@ use vos_pvm_recair::masked::device::{
     prove_device_forced, verify_device,
 };
 use vos_pvm_recair::masked::{Checks, MaskRng};
-use vos_pvm_recair_air::masked::MaskedComponents;
+use vos_pvm_recair_air::masking::MaskedComponents;
 
 use crate::support::{
     HEAP, IO, Proof, RO_BASE, STACK_TOP, blob, format, io_and_halt, io_bytes, program, prove, run,

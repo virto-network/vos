@@ -1,7 +1,10 @@
 //! The known programs' constants, pinned in the repository: the program
 //! ids of the kernels the slice's statements are made by, the fold
-//! circuit's hash `H_fold` (every node's fold word) and the final wrap's
-//! preprocessed root (`format::MASKED_WRAP`).
+//! circuit's hash `H_fold` (every node's fold word), and the final wrap's
+//! preprocessed root (`format::MASKED_WRAP`), the final verifier's constant
+//! re-exported: `just repin` writes the others, and a circuit change that
+//! moves the root is written into `vos-pvm-final-verifier` by hand (a
+//! venue's verifying key).
 //!
 //! `test-proof` recomputes each from its source under both of the
 //! prover's feature sets (with and without `debug-internals`), and `just
@@ -38,8 +41,5 @@ pub const H_FOLD: [u32; 8] = [
 ];
 
 /// The final wrap's preprocessed root under `format::MASKED_WRAP`, on the
-/// Blake2b-256 trees: its columns one level up under blowup 32.
-pub const WRAP_ROOT_39: [u8; 32] = [
-    242, 222, 64, 119, 8, 117, 210, 231, 91, 134, 186, 46, 66, 17, 191, 228, 202, 180, 196, 8, 255,
-    79, 80, 233, 170, 53, 248, 208, 10, 0, 176, 135,
-];
+/// Blake2b-256 trees: the final verifier's, the one copy a venue holds.
+pub use vos_pvm_final_verifier::PREPROCESSED_ROOT_39;

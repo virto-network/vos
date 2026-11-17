@@ -1,7 +1,7 @@
 //! The recursion AIR's transcript, as its prover runs it and every verifier
 //! of its proofs replays it:
 //! 1. the proof's domain, the format and the PCS configuration, then the
-//!    components' log sizes (`vos_pvm_proof::proof::mix_statement_header`);
+//!    components' log sizes ([`crate::format::mix_statement_header`]);
 //! 2. the preprocessed root, then the main trace's root;
 //! 3. the public values, in their addresses' order: a leaf's or a fold's
 //!    outputs, the wrap's words, each word the QM31 `(w, 0, 0, 0)`; the

@@ -5,7 +5,7 @@ use blake2::{Blake2b, Digest as _};
 use stwo::core::vcs::blake2_hash::Blake2sHash;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 use vos_pvm_final_verifier::Error;
-use vos_pvm_final_verifier::masked::MaskedFormat;
+use vos_pvm_final_verifier::masking::MaskedFormat;
 use vos_pvm_proof::format::Format;
 
 use super::{Hasher, MAX_PROOF_BYTES};
@@ -113,7 +113,7 @@ fn precheck(
         return Err(Error::Format);
     }
     let public = vos_pvm_proof::masked::device_public_values(io);
-    let holds = vos_pvm_final_verifier::masked::interaction_pow_holds::<Blake2sM31MerkleChannel>(
+    let holds = vos_pvm_final_verifier::masking::interaction_pow_holds::<Blake2sM31MerkleChannel>(
         masked,
         &public,
         &head.commitments,

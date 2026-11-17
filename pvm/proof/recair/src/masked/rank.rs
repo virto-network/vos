@@ -22,7 +22,7 @@ use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::utils::bit_reverse_index;
 use stwo::core::verifier::PREPROCESSED_TRACE_IDX;
 use stwo::prover::backend::simd::m31::{N_LANES, PackedM31};
-use vos_pvm_recair_air::masked::MASKED_COLUMN_EXPANSION;
+use vos_pvm_recair_air::masking::MASKED_COLUMN_EXPANSION;
 
 /// What R1 found: the column classes it checked, the most functionals one
 /// class revealed, and whether every class's had full row rank.

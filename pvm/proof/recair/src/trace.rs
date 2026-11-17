@@ -368,7 +368,7 @@ fn component_interaction(
 
 /// A fraction on every row of a component, its numerator `numerator` at the
 /// coset's first row and zero on every other: `b / combine_B(1)`, the
-/// masked wrap's blinding of a claimed sum (`vos_pvm_recair_air::masked`).
+/// masked wrap's blinding of a claimed sum (`vos_pvm_recair_air::masking`).
 #[derive(Clone, Copy, Debug)]
 pub struct FirstRowFraction {
     pub numerator: SecureField,

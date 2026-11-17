@@ -34,8 +34,8 @@ use vos_pvm_proof::proof::{
     mix_statement_header,
 };
 use vos_pvm_recair_air::gate::{GATE_WIDTH, Layout, public_logup_sum};
-use vos_pvm_recair_air::masked::WrapComponents;
 use vos_pvm_recair_air::transcript::{Prefix, replay_prefix};
+use vos_pvm_recair_air::wrap::WrapComponents;
 use vos_pvm_recair_air::{Components, GateRelation, LOG_CONSTRAINT_EXPANSION, LogSizes};
 
 use crate::circuit::{Circuit, WiringError};

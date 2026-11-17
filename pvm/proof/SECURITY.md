@@ -203,7 +203,7 @@ every input by construction:
   lengths equal by construction (`codec.rs`'s big-integer mode).
 - **Stwo's code at the pin:** every index, `unwrap`, `expect`, `zip_eq`,
   `assert` and unchecked arithmetic reachable from format 39's
-  `masked::verify_masked` (its `replay`, then `verify_values`) is in the
+  `masking::verify_masked` (its `replay`, then `verify_values`) is in the
   table below with what guards it. Two had no guard and are the fork's fix
   (DIVERGENCE-013).
 - **Fuzzing:** seven targets (`fuzz/`), a checked-in corpus replayed by

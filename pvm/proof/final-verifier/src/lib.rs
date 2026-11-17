@@ -9,8 +9,8 @@
 //! public use and each public word's add to zero: that is what binds the
 //! words to the circuit's wires (`vos_pvm_recair_air::gate`).
 //!
-//! **One format** (`vos_pvm_proof::format`): **39** ([`masked`]), the
-//! masked wrap. Its bytes are a fixed layout ([`masked::decode`]): one
+//! **One format** (`vos_pvm_recair_air::format`): **39** ([`masked`]), the
+//! masked wrap, verified by the masked verifier ([`masking`]). Its bytes are a fixed layout ([`masked::decode`]): one
 //! encoding a proof.
 //!
 //! **Dispatch is by the statement's format** ([`verify`], [`decode`]): a
@@ -58,12 +58,11 @@ extern crate alloc;
 mod constants;
 mod layout;
 pub mod masked;
+pub mod masking;
 
 use serde::{Deserialize, Serialize};
-use stwo::core::channel::Channel;
 use stwo::core::fields::m31::{BaseField, P};
 use stwo::core::fields::qm31::SecureField;
-use stwo::core::pcs::PcsConfig;
 use stwo::core::proof::StarkProof;
 use stwo::core::vcs_lifted::blake2b_merkle::Blake2bMerkleHasher;
 use stwo::core::verifier::VerificationError;
@@ -272,34 +271,6 @@ pub fn verify(
 /// The QM31 `(w, 0, 0, 0)`.
 fn embed(word: u32) -> SecureField {
     SecureField::from(BaseField::from_u32_unchecked(word))
-}
-
-/// A.1's first item: the domain, the format and the PCS configuration, then
-/// each component's log size (`vos_pvm_proof::proof::mix_statement_header`).
-pub fn mix_header(channel: &mut impl Channel, format: u32, config: &PcsConfig, log_sizes: &[u32]) {
-    let fri = config.fri_config;
-    for word in [
-        u64::from_le_bytes(*b"VOS/PVM/"),
-        u64::from_le_bytes(*b"STARK/FS"),
-        u64::from(format),
-        u64::from(config.pow_bits),
-        fri.n_queries as u64,
-        u64::from(fri.log_blowup_factor),
-        u64::from(fri.log_last_layer_degree_bound),
-        u64::from(fri.fold_step),
-    ] {
-        channel.mix_u64(word);
-    }
-    match config.lifting_log_size {
-        None => channel.mix_u64(0),
-        Some(lifting) => {
-            channel.mix_u64(1);
-            channel.mix_u64(u64::from(lifting));
-        }
-    }
-    for &log_size in log_sizes {
-        channel.mix_u64(u64::from(log_size));
-    }
 }
 
 fn base_is_canonical(value: &BaseField) -> bool {

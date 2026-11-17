@@ -1,6 +1,8 @@
-//! The recursion AIR as the masked wrap proves it: masking variant (c)
-//! (`docs/design/proving.md` §5, R1–R8), the
-//! AIR of `format::MASKED_WRAP` in `vos_pvm_proof::format`'s registry.
+//! Masking variant (c) (`docs/design/proving.md` §5, R1–R8), over any
+//! component set a masked format proves: the masked wrap's
+//! ([`crate::wrap::WrapComponents`], [`crate::format::MASKED_WRAP`]) and the
+//! device set's (`vos_pvm_proof::masked`, [`crate::format::DEVICE_PROOF`]).
+//! A masked format's [`Masking`] lays its trees out.
 //!
 //! - **Constraint bound `log_size + 2`**
 //!   ([`MASKED_LOG_CONSTRAINT_EXPANSION`]): every main and interaction
@@ -17,10 +19,9 @@
 //! - **The composition sampled at `π(z)`** ([`composition_point`]): its
 //!   quotients lift one doubling less than the masked columns'.
 //!
-//! The masking is the wrap's alone: leaves and folds never read this module,
-//! and their components keep [`crate::LOG_CONSTRAINT_EXPANSION`]. Everything
-//! here is generic over the component set ([`MaskedComponents`]);
-//! [`WrapComponents`] is the recursion AIR's.
+//! Leaves and folds never read this module, and their components keep
+//! [`crate::LOG_CONSTRAINT_EXPANSION`]. Everything here is generic over the
+//! component set ([`MaskedComponents`]).
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -36,6 +37,7 @@ use stwo::core::pcs::TreeVec;
 use stwo_constraint_framework::{EvalAtRow, FrameworkEval, RelationEntry, relation};
 
 use crate::Body;
+use crate::format::Masking;
 
 /// The constraint bound over the log size: `4N`, the composition whole.
 pub const MASKED_LOG_CONSTRAINT_EXPANSION: u32 = 2;
@@ -58,25 +60,10 @@ pub const TREES: usize = 4;
 const AIR_TREES: usize = TREES - 1;
 
 mod component;
-mod wrap;
 
 pub use component::{MaskedComponent, Rebound};
-pub use wrap::WrapComponents;
 
 relation!(BlindRelation, 1);
-
-/// What a masked format commits beside the AIR's columns: the trees' layout
-/// its masking pins (`vos_pvm_proof::format::Masking`, whose entry for
-/// `format::MASKED_WRAP` the final verifier pins as `masked::PINS`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MaskPins {
-    /// The salt columns at the end of each salted tree (main, interaction,
-    /// composition), never sampled.
-    pub salt_columns: usize,
-    /// The FRI mask `R`'s uniform base columns, in the composition tree after
-    /// the composition's own.
-    pub fri_mask_columns: usize,
-}
 
 /// A component masked: its body, then its blinding columns and their one
 /// fraction on [`BlindRelation`], then its fractions finalized in pairs, at
@@ -234,7 +221,7 @@ pub fn composition_log_degree_bound(set: &impl MaskedComponents) -> Option<u32> 
 /// lifting height. `None` for an empty set or a level past `u32`.
 pub fn committed_log_sizes(
     set: &impl MaskedComponents,
-    pins: &MaskPins,
+    masking: &Masking,
 ) -> Option<TreeVec<Vec<u32>>> {
     let composition = composition_log_degree_bound(set)?;
     let preprocessed = set
@@ -251,11 +238,11 @@ pub fn committed_log_sizes(
     }
     let [mut main, mut interaction] = trace;
     for tree in [&mut main, &mut interaction] {
-        tree.extend(core::iter::repeat_n(composition, pins.salt_columns));
+        tree.extend(core::iter::repeat_n(composition, masking.salt_columns));
     }
     let composition_tree = core::iter::repeat_n(
         composition,
-        COMPOSITION_COLUMNS + pins.fri_mask_columns + pins.salt_columns,
+        COMPOSITION_COLUMNS + masking.fri_mask_columns + masking.salt_columns,
     )
     .collect();
     Some(TreeVec(alloc::vec![
@@ -283,9 +270,9 @@ pub fn composition_point(
 pub fn sample_points(
     set: &impl MaskedComponents,
     oods_point: CirclePoint<SecureField>,
-    pins: &MaskPins,
+    masking: &Masking,
 ) -> Option<TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>>> {
-    let committed = committed_log_sizes(set, pins)?;
+    let committed = committed_log_sizes(set, masking)?;
     let air_level = air_log_size(set)?;
     let at_composition = composition_point(set, oods_point)?;
     let n_preprocessed = committed[0].len();
@@ -315,9 +302,9 @@ pub fn sample_points(
         tree.resize(width, Vec::new());
     }
     let composition = core::iter::repeat_n(at_composition, COMPOSITION_COLUMNS)
-        .chain(core::iter::repeat_n(oods_point, pins.fri_mask_columns))
+        .chain(core::iter::repeat_n(oods_point, masking.fri_mask_columns))
         .map(|point| alloc::vec![point])
-        .chain(core::iter::repeat_n(Vec::new(), pins.salt_columns))
+        .chain(core::iter::repeat_n(Vec::new(), masking.salt_columns))
         .collect();
     points.push(composition);
     Some(points)
@@ -397,16 +384,14 @@ mod tests {
 
     use stwo::core::circle::SECURE_FIELD_CIRCLE_GEN;
 
+    use crate::wrap::WrapComponents;
     use crate::{GateRelation, LogSizes, h8, p2, qm31};
 
     /// `format::MASKED_WRAP`'s log sizes.
     const LOG_SIZES: LogSizes = [14, 15, 11];
 
-    /// Pin A's: 8 salt columns a tree and an `R` of 8.
-    const MASKED_WRAP_PINS: MaskPins = MaskPins {
-        salt_columns: 8,
-        fri_mask_columns: 8,
-    };
+    /// Pin A's: 8 salt columns a tree and an `R` of 8, `h = 256`.
+    const MASKED_WRAP_MASKING: Masking = crate::format::MASKED_WRAP_MASKING;
 
     fn wrap() -> WrapComponents {
         WrapComponents::layout(&LOG_SIZES)
@@ -420,7 +405,7 @@ mod tests {
     #[test]
     fn the_masked_trees_match_pin_a() {
         let wrap = wrap();
-        let trees = committed_log_sizes(&wrap, &MASKED_WRAP_PINS).unwrap();
+        let trees = committed_log_sizes(&wrap, &MASKED_WRAP_MASKING).unwrap();
         assert_eq!(
             trees.iter().map(Vec::len).collect::<Vec<_>>(),
             [57, 381, 48, 20]
@@ -518,8 +503,8 @@ mod tests {
     fn the_sample_points_match_pin_b() {
         let wrap = wrap();
         let z = SECURE_FIELD_CIRCLE_GEN.mul(7);
-        let points = sample_points(&wrap, z, &MASKED_WRAP_PINS).unwrap();
-        let trees = committed_log_sizes(&wrap, &MASKED_WRAP_PINS).unwrap();
+        let points = sample_points(&wrap, z, &MASKED_WRAP_MASKING).unwrap();
+        let trees = committed_log_sizes(&wrap, &MASKED_WRAP_MASKING).unwrap();
         assert_eq!(
             points.iter().map(Vec::len).collect::<Vec<_>>(),
             trees.iter().map(Vec::len).collect::<Vec<_>>()
@@ -551,11 +536,12 @@ mod tests {
             SECURE_FIELD_CIRCLE_GEN.mul(7),
             SECURE_FIELD_CIRCLE_GEN.mul(0x1234_5678_9abc),
         ] {
-            let mut points = sample_points(&wrap, CirclePoint::zero(), &MASKED_WRAP_PINS).unwrap();
+            let mut points =
+                sample_points(&wrap, CirclePoint::zero(), &MASKED_WRAP_MASKING).unwrap();
             sample_points_from_zero(&mut points, &wrap, z).unwrap();
             assert_eq!(
                 points.0,
-                sample_points(&wrap, z, &MASKED_WRAP_PINS).unwrap().0
+                sample_points(&wrap, z, &MASKED_WRAP_MASKING).unwrap().0
             );
         }
     }
@@ -586,7 +572,7 @@ mod tests {
         let built = WrapComponents::build(&relation, &blind, &LOG_SIZES, &claimed_sums);
         assert!(<WrapComponents as MaskedComponents>::layout((), &LOG_SIZES[..2]).is_none());
         let z = SECURE_FIELD_CIRCLE_GEN.mul(11);
-        let points = sample_points(&layout, z, &MASKED_WRAP_PINS).unwrap();
+        let points = sample_points(&layout, z, &MASKED_WRAP_MASKING).unwrap();
         let samples = TreeVec(
             points
                 .iter()

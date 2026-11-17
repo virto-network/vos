@@ -8,7 +8,7 @@ use stwo::core::channel::Channel;
 use stwo::core::fields::qm31::SecureField;
 use stwo_constraint_framework::{FrameworkComponent, TraceLocationAllocator};
 
-use super::{BlindRelation, MaskedComponents, MaskedEval, Rebound};
+use crate::masking::{BlindRelation, MaskedComponents, MaskedEval, Rebound};
 use crate::{GateRelation, LogSizes, evals, h8, p2, preprocessed_ids, qm31};
 
 /// The recursion AIR masked: [`p2`], [`qm31`] and [`h8`], each a

@@ -55,7 +55,7 @@ use stwo::prover::fri::FriProver;
 use stwo::prover::poly::circle::{PolyOps, SecureEvaluation};
 use stwo::prover::secure_column::SecureColumnByCoords;
 use vos_pvm_final_verifier::Error;
-use vos_pvm_final_verifier::masked::{Claim, replay, verify_masked};
+use vos_pvm_final_verifier::masking::{Claim, replay, verify_masked};
 use vos_pvm_poseidon2::{M31, N_STATE};
 use vos_pvm_proof::format::Format;
 use vos_pvm_proof::poseidon2::P2MerkleChannel;
@@ -68,10 +68,10 @@ use vos_pvm_recair::prove::prove_on;
 use vos_pvm_recair::trace::{self, FirstRowFraction, MainTrace};
 use vos_pvm_recair::{Circuit, Finalized, ProveError, RecairProof, Witness};
 use vos_pvm_recair_air::gate::GateRelation;
-use vos_pvm_recair_air::masked::{
-    BlindRelation, MaskedComponent, MaskedComponents, WrapComponents, composition_log_degree_bound,
-    sample_points,
+use vos_pvm_recair_air::masking::{
+    BlindRelation, MaskedComponent, MaskedComponents, composition_log_degree_bound, sample_points,
 };
+use vos_pvm_recair_air::wrap::WrapComponents;
 use vos_pvm_recair_air::{h8, p2, qm31};
 
 /// A random circuit of every gate, each component at `2^log_sizes` rows.
@@ -153,7 +153,7 @@ where
 /// over the classes, not the sample points themselves (those are
 /// `masked.rs`' tests and the verifier's).
 fn column_classes(set: &WrapComponents, format: &Format) -> usize {
-    let pins = vos_pvm_recair::masked::mask_pins(&format.masking.expect("masked"));
+    let pins = format.masking.expect("masked");
     let z = CirclePoint::<SecureField>::get_point(98_765);
     let points = sample_points(set, z, &pins).expect("the sample points");
     let composition = composition_log_degree_bound(set).expect("the composition's bound");

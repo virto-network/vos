@@ -73,6 +73,9 @@ vos-pvm-poseidon2 = { workspace = true }
 # The masking's AIR side (variant (c)), which the masked segment
 # (`masked`) lays the chips out by.
 vos-pvm-recair-air = { workspace = true }
+# The final wrap's preprocessed root, which `constants` re-exports: one copy,
+# the venue's.
+vos-pvm-final-verifier = { workspace = true }
 vos-wire = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
 
@@ -97,8 +100,6 @@ vos-tree = { workspace = true }
 # final verifier; the fixtures' masked wraps, from the seeded seam
 # (`seeded-masks`, a dev edge: no production build has it).
 vos-pvm-recair = { workspace = true, features = ["recursion", "seeded-masks"] }
-# The final verifier the kernels' wraps and the fixtures are verified by.
-vos-pvm-final-verifier = { workspace = true }
 # The golden statements: their types, the venue's check, the fixtures'
 # encoding, and the venue's JAM refine program on the JAM-only host.
 vos-statement = { workspace = true, features = ["fixtures"] }

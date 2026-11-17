@@ -10,7 +10,7 @@
 
 use crate::common::random_circuit;
 use vos_pvm_final_verifier::Error;
-use vos_pvm_final_verifier::masked::{Claim, MaskedFormat, replay, verify_masked};
+use vos_pvm_final_verifier::masking::{Claim, MaskedFormat, replay, verify_masked};
 
 use num_traits::{One, Zero};
 use stwo::core::air::Component;
@@ -33,11 +33,11 @@ use vos_pvm_recair::prove::{prove_masked_on, prove_masked_tampered};
 use vos_pvm_recair::trace::{self, FirstRowFraction};
 use vos_pvm_recair::{Finalized, ProveError, RecairProof};
 use vos_pvm_recair_air::gate::{GateRelation, Layout, public_logup_sum};
-use vos_pvm_recair_air::masked::{
-    BlindRelation, MaskedComponents, MaskedEval, Rebound, WrapComponents, blinded_components,
-    blinds_its_sums,
+use vos_pvm_recair_air::masking::{
+    BlindRelation, MaskedComponents, MaskedEval, Rebound, blinded_components, blinds_its_sums,
 };
 use vos_pvm_recair_air::p2::{self, P2Eval};
+use vos_pvm_recair_air::wrap::WrapComponents;
 
 /// Each component's rows in the small circuits.
 pub(crate) const LOG_SIZE: u32 = 9;

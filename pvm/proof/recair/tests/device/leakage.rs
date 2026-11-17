@@ -41,7 +41,7 @@ use vos_pvm_proof::masked::{
 use vos_pvm_proof::poseidon2::P2MerkleChannel;
 use vos_pvm_proof::proof::mix_statement_header;
 use vos_pvm_recair::masked::MaskRng;
-use vos_pvm_recair_air::masked::MaskedComponents;
+use vos_pvm_recair_air::masking::MaskedComponents;
 
 use crate::common::leakage::{
     Fields, Key, Kind, Verdicts, indistinguishable, leaked, published, uniform,

@@ -6,12 +6,12 @@ use stwo::core::channel::MerkleChannel;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use vos_pvm_final_verifier::Error;
-use vos_pvm_final_verifier::masked::{Claim, MaskedFormat, verify_masked};
+use vos_pvm_final_verifier::masking::{Claim, MaskedFormat, verify_masked};
 use vos_pvm_proof::device::{DEVICE_MAX_LOG_SIZE, DeviceShape};
 use vos_pvm_proof::format::Format;
 use vos_pvm_proof::framework_access::AllLookupElements;
 use vos_pvm_proof::masked::{DeviceComponents, device_bound_sums, device_public_values};
-use vos_pvm_recair_air::masked::MaskedComponents;
+use vos_pvm_recair_air::masking::MaskedComponents;
 
 use super::super::{Reveal, mask_rows, reveals, verifier_format};
 use super::{DeviceProgram, DeviceProof};

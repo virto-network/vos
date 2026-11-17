@@ -45,16 +45,16 @@ use stwo::core::fields::qm31::SecureField;
 use stwo::core::fri::{CirclePolyDegreeBound, FriVerificationError, FriVerifier};
 use stwo::core::vcs::blake2b_hash::Blake2bHash;
 use stwo::core::vcs_lifted::blake2b_merkle::Blake2bMerkleChannel;
-use vos_pvm_final_verifier::masked::{
-    self, FRI_ROUNDS, MASKED_WRAP, MaskedFormat, fri_rounds, shape_of, verify_with,
-};
+use vos_pvm_final_verifier::masked::{self, FRI_ROUNDS, MASKED_WRAP, verify_with};
+use vos_pvm_final_verifier::masking::{MaskedFormat, fri_rounds, shape_of};
 use vos_pvm_final_verifier::{
     Error, MAX_PROOF_BYTES, PREPROCESSED_ROOT_39, PUBLIC_WORDS, Statement, WrapProof,
 };
 use vos_pvm_proof::format::{self, ProofBytes, Status};
 use vos_pvm_recair::masked::verifier_format;
 use vos_pvm_recair::wrap::{self, WrapCircuit};
-use vos_pvm_recair_air::masked::{MaskPins, WrapComponents};
+use vos_pvm_recair_air::format::Masking;
+use vos_pvm_recair_air::wrap::WrapComponents;
 
 /// The one-segment run's root wrapped under `format::MASKED_WRAP`
 /// (`crate::wrap::SEED`'s masks): the proof, its bytes and its public
@@ -135,7 +135,11 @@ fn the_masked_wrap_verifies_under_the_registrys_entry() {
         Blake2bHash(PREPROCESSED_ROOT_39)
     );
     assert_eq!(
-        vos_pvm_proof::security::fri_rounds(&entry.params, &entry.reference).unwrap(),
+        vos_pvm_proof::security::fri_rounds(
+            &entry.params,
+            &format::count(entry).unwrap().reference
+        )
+        .unwrap(),
         FRI_ROUNDS
     );
     assert_eq!(
@@ -297,31 +301,31 @@ fn another_salt_count_or_r_width_is_refused() {
     let masked = masked_wrap();
     let words = masked.words;
     let layout = layout();
-    let pins = MASKED_WRAP.pins;
+    let pinned = MASKED_WRAP.masking;
     let others = [
-        MaskPins {
-            salt_columns: pins.salt_columns - 1,
-            ..pins
+        Masking {
+            salt_columns: pinned.salt_columns - 1,
+            ..pinned
         },
-        MaskPins {
-            salt_columns: pins.salt_columns + 1,
-            ..pins
+        Masking {
+            salt_columns: pinned.salt_columns + 1,
+            ..pinned
         },
-        MaskPins {
-            fri_mask_columns: pins.fri_mask_columns - 1,
-            ..pins
+        Masking {
+            fri_mask_columns: pinned.fri_mask_columns - 1,
+            ..pinned
         },
-        MaskPins {
-            fri_mask_columns: pins.fri_mask_columns + 1,
-            ..pins
+        Masking {
+            fri_mask_columns: pinned.fri_mask_columns + 1,
+            ..pinned
         },
     ];
-    for pins in others {
+    for masking in others {
         let pinned = MaskedFormat {
-            pins,
+            masking,
             ..MASKED_WRAP
         };
-        let (tree_widths, deep_values) = shape_of(&layout, &pins).unwrap();
+        let (tree_widths, deep_values) = shape_of(&layout, &masking).unwrap();
         let laid_out = MaskedFormat {
             tree_widths,
             deep_values,
@@ -333,7 +337,7 @@ fn another_salt_count_or_r_width_is_refused() {
             })
             .unwrap();
             eprintln!(
-                "a verifier at {pins:?}, widths {:?}: {error}",
+                "a verifier at {masking:?}, widths {:?}: {error}",
                 format.tree_widths
             );
             assert!(matches!(error, Error::Shape(_)), "{error}");

@@ -8,8 +8,12 @@
 //! - [`h8`]: the DEEP accumulator over eight M31 samples;
 //! - [`gate`]: the `Gate` relation `(address, l0, l1, l2, l3)` that wires
 //!   them, with signed, preprocessed multiplicities, and why it is sound;
-//! - [`masked`]: the three as the masked wrap proves them, masked, blinded
-//!   and at a constraint bound of `4N`; leaves and folds never use it.
+//! - [`masking`]: masking variant (c) over any component set, masked,
+//!   blinded and at a constraint bound of `4N`; leaves and folds never use
+//!   it;
+//! - [`wrap`]: the three as the masked wrap proves them;
+//! - [`format`]: the proof formats' registry, its plain data, and the
+//!   header every format's transcript starts with.
 //!
 //! A circuit is the components' preprocessed columns: its coefficients,
 //! selectors, addresses and multiplicities. Every constraint is of degree at
@@ -22,12 +26,14 @@
 
 extern crate alloc;
 
+pub mod format;
 pub mod gate;
 pub mod h8;
-pub mod masked;
+pub mod masking;
 pub mod p2;
 pub mod qm31;
 pub mod transcript;
+pub mod wrap;
 
 use alloc::vec::Vec;
 
@@ -49,7 +55,7 @@ pub const LOG_CONSTRAINT_EXPANSION: u32 = 1;
 
 /// A component's body: its columns, constraints and relation entries, its
 /// fractions not yet finalized. A component's own `evaluate` finalizes them
-/// in pairs; the masked wrap's ([`masked::MaskedEval`]) adds its blinding
+/// in pairs; the masked wrap's ([`masking::MaskedEval`]) adds its blinding
 /// fraction first.
 pub trait Body: FrameworkEval + Sync {
     fn body<E: EvalAtRow>(&self, eval: &mut E);

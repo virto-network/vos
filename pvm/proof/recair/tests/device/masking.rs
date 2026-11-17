@@ -30,9 +30,9 @@ use vos_pvm_proof::masked::{DeviceComponents, MaskedDeviceTrace};
 use vos_pvm_proof::poseidon2::P2MerkleChannel;
 use vos_pvm_recair::ProveError;
 use vos_pvm_recair::masked::device::{prove_device_forced, verify_device};
-use vos_pvm_recair::masked::{Checks, MaskRng, mask_pins, mask_rows};
+use vos_pvm_recair::masked::{Checks, MaskRng, mask_rows};
 use vos_pvm_recair::trace::FirstRowFraction;
-use vos_pvm_recair_air::masked::{
+use vos_pvm_recair_air::masking::{
     MaskedComponent, MaskedComponents, composition_log_degree_bound, sample_points,
 };
 
@@ -48,7 +48,7 @@ type P2 = P2MerkleChannel;
 fn column_classes(format: &Format, shape: DeviceShape, log_sizes: &[u32]) -> usize {
     let set = DeviceComponents::layout(shape, log_sizes).expect("the layout");
     let rows = mask_rows(format, &set).expect("the masks' sizes");
-    let pins = mask_pins(&format.masking.expect("masked"));
+    let pins = format.masking.expect("masked");
     let z = CirclePoint::<SecureField>::get_point(98_765);
     let points = sample_points(&set, z, &pins).expect("the sample points");
     let composition = composition_log_degree_bound(&set).expect("the composition's bound");

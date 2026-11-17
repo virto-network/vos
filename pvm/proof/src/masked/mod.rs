@@ -1,7 +1,7 @@
 //! The device's segment AIR masked: variant (c) (`docs/design/proving.md`
 //! §5) over the device's chips (`crate::device`), a component set the
 //! masked prover and verifier take
-//! (`vos_pvm_recair_air::masked::MaskedComponents`).
+//! (`vos_pvm_recair_air::masking::MaskedComponents`).
 //!
 //! - **A chip masked** ([`MaskedChipEval`]): its constraints and fractions,
 //!   then its blinding columns `b` (one QM31) and their fraction
@@ -36,7 +36,7 @@ use stwo_constraint_framework::{
     EvalAtRow, FrameworkComponent, FrameworkEval, InfoEvaluator, RelationEntry,
     TraceLocationAllocator,
 };
-use vos_pvm_recair_air::masked::{
+use vos_pvm_recair_air::masking::{
     BLIND_COLUMNS, BlindRelation, MASKED_LOG_CONSTRAINT_EXPANSION, MaskedComponents,
 };
 

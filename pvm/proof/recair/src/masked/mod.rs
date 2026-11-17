@@ -1,7 +1,7 @@
 //! The masked prover: masking variant (c) (`docs/design/proving.md` §5,
 //! R1–R8), over any component set ([`MaskedComponents`]) and any Merkle
 //! channel, in the masked transcript's order
-//! (`vos_pvm_final_verifier::masked`):
+//! (`vos_pvm_final_verifier::masking`):
 //!
 //! 1. the header, at the format's number and configuration, and the log
 //!    sizes;
@@ -72,13 +72,14 @@ use stwo::prover::{
     DomainEvaluationAccumulator, ProvingError, Trace,
 };
 use stwo_constraint_framework::Relation;
-use vos_pvm_final_verifier::masked::{MaskedFormat, shape_of};
+use vos_pvm_final_verifier::masking::{MaskedFormat, shape_of};
 use vos_pvm_proof::format::{Format, Masking};
 use vos_pvm_proof::proof::mix_statement_header;
-use vos_pvm_recair_air::masked::{
+use vos_pvm_recair_air::masking::{
     self as air, BLIND_COLUMNS, BlindRelation, MASKED_COLUMN_EXPANSION,
-    MASKED_LOG_CONSTRAINT_EXPANSION, MaskPins, MaskedComponent, MaskedComponents, WrapComponents,
+    MASKED_LOG_CONSTRAINT_EXPANSION, MaskedComponent, MaskedComponents,
 };
+use vos_pvm_recair_air::wrap::WrapComponents;
 
 pub use drawn::{Drawn, drawn_in};
 use layout::MaskLayout;
@@ -93,14 +94,6 @@ use commit::{commit_composition, commit_interaction, commit_main};
 /// The attempts R1 may refuse before the prover gives up
 /// ([`ProveError::MaskRank`]).
 pub const MAX_ATTEMPTS: u32 = 8;
-
-/// The trees' layout a masking pins.
-pub const fn mask_pins(masking: &Masking) -> MaskPins {
-    MaskPins {
-        salt_columns: masking.salt_columns,
-        fri_mask_columns: masking.fri_mask_columns,
-    }
-}
 
 /// The masked lifting height of components of `log_sizes` under
 /// `format`'s blowup: the tallest, raised by the masked constraint
@@ -185,7 +178,7 @@ pub(crate) fn extend_preprocessed(
 }
 
 /// A masked registry entry as its verifier pins it
-/// (`vos_pvm_final_verifier::masked::MaskedFormat`): its number, its
+/// (`vos_pvm_final_verifier::masking::MaskedFormat`): its number, its
 /// configuration and interaction PoW, its masking, `log_sizes`, and the
 /// trees' widths and DEEP values of the component set laid out as `layout`
 /// at them. `None` for an unmasked format or a set whose masks do not fit
@@ -196,14 +189,12 @@ pub fn verifier_format<'a>(
     layout: &impl MaskedComponents,
 ) -> Option<MaskedFormat<'a>> {
     let masking = format.masking?;
-    let pins = mask_pins(&masking);
-    let (tree_widths, deep_values) = shape_of(layout, &pins)?;
+    let (tree_widths, deep_values) = shape_of(layout, &masking)?;
     Some(MaskedFormat {
         number: format.number,
         config: format.pcs_config(),
         interaction_pow_bits: format.interaction_pow_bits(),
-        pins,
-        log_mask_rows: masking.log_mask_rows,
+        masking,
         log_sizes,
         tree_widths,
         deep_values,
@@ -764,9 +755,9 @@ fn checked_points<MC: MerkleChannel, R, A>(
 where
     SimdBackend: BackendForChannel<MC>,
 {
-    let points = air::sample_points(set, oods_point, &mask_pins(&setup.masking)).ok_or(
-        ProveError::Masking("the set's mask points do not fit its trees"),
-    )?;
+    let points = air::sample_points(set, oods_point, &setup.masking).ok_or(ProveError::Masking(
+        "the set's mask points do not fit its trees",
+    ))?;
     let fits = points.len() == scheme.trees.len()
         && points
             .iter()

@@ -13,20 +13,21 @@ use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::quotients::deep_values_of_column;
 use stwo_constraint_framework::expr::ExprEvaluator;
 use stwo_constraint_framework::{FrameworkEval, InfoEvaluator, Relation};
-use vos_pvm_final_verifier::masked::PINS;
 use vos_pvm_proof::format::{MASKED_WRAP, MASKED_WRAP_REFERENCE, SEGMENT_REFERENCE};
 use vos_pvm_proof::framework_access::{
     AllLookupElements, draw_all_lookup_elements, drive_chip_oods,
 };
 use vos_pvm_proof::security::{SecurityShape, proven_count};
+use vos_pvm_recair_air::format::MASKED_WRAP_MASKING;
 use vos_pvm_recair_air::gate::{GATE_WIDTH, GateRelation};
 use vos_pvm_recair_air::h8::H8Eval;
-use vos_pvm_recair_air::masked::{
-    BlindRelation, MaskedComponent, MaskedComponents, MaskedEval, WrapComponents, air_log_size,
+use vos_pvm_recair_air::masking::{
+    BlindRelation, MaskedComponent, MaskedComponents, MaskedEval, air_log_size,
     committed_log_sizes, composition_log_degree_bound, composition_point, sample_points,
 };
 use vos_pvm_recair_air::p2::P2Eval;
 use vos_pvm_recair_air::qm31::Qm31Eval;
+use vos_pvm_recair_air::wrap::WrapComponents;
 use vos_pvm_recair_air::{LogSizes, h8, p2, qm31};
 
 use crate::common::sources;
@@ -220,9 +221,9 @@ fn masked_wrap_shape() -> SecurityShape {
     let relation = GateRelation::dummy();
     let blind = BlindRelation::dummy();
     let wrap = WrapComponents::build(&relation, &blind, &LOG_SIZES, &[SecureField::default(); 3]);
-    let trees = committed_log_sizes(&wrap, &PINS).unwrap();
+    let trees = committed_log_sizes(&wrap, &MASKED_WRAP_MASKING).unwrap();
     let z = CirclePoint::<SecureField>::get_point(1);
-    let points = sample_points(&wrap, z, &PINS).unwrap();
+    let points = sample_points(&wrap, z, &MASKED_WRAP_MASKING).unwrap();
     let components = wrap.components();
     let columns = points.iter().flatten();
 

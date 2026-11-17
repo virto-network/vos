@@ -1,4 +1,7 @@
-//! The proof format registry.
+//! The proof format registry: the entries' plain data, defined once in
+//! `vos_pvm_recair_air::format` (which the final verifier reads too) and
+//! re-exported here, and each entry's security count at its reference shape
+//! ([`COUNTS`]).
 //!
 //! A proof's `format_version` names an entry here, and the entry decides, at
 //! run time, the proof's channel, its parameters and its encodings: one
@@ -19,7 +22,8 @@
 //!   the multiplication, no column a constraint pins to zero), and 32's
 //!   leaves verify it. 32 and 39 prove the recursion AIR
 //!   (`vos-pvm-recair-air`). A number not in [`REGISTRY`] is refused as
-//!   unregistered; 28, 44 and 46 are never reused, and 48 is the tests' second
+//!   unregistered, and 28, 44 and 46 as retired ([`RETIRED`]), never
+//!   reused; 48 is the tests' second
 //!   device format (`vos-pvm-recair`'s `device::TEST_FORMAT`), never
 //!   registered.
 //! - **Every format** takes exactly its parameters, mixes the boundary
@@ -30,10 +34,9 @@
 //!   program's columns (`chips::CpuColumns::of_code`) and its memory ledger a row a
 //!   word (`chips::WordMemoryChip`). 46 is retired and never reused: its
 //!   ledger of a row a byte does not keep a byte one group, so its memory
-//!   argument is unsound. 32
-//!   is registered and refused
-//!   although its AIR and channel exist: `vos-pvm-recair` proves and verifies
-//!   its proofs natively, pinning each circuit by its hash, and no verifier
+//!   argument is unsound. 32 is internal
+//!   ([`Status::Internal`]), registered and refused: `vos-pvm-recair` proves
+//!   and verifies its proofs natively, pinning each circuit by its hash, and no verifier
 //!   outside the recursion reads a leaf or a fold. 39 is admitted: the
 //!   masked wrap, `vos-pvm-recair`'s masked prover on the fork's Blake2b-256
 //!   channel and `vos-pvm-final-verifier`'s masked verifier, fold step 3
@@ -83,8 +86,8 @@
 //!   ([`Masking`]): its salt and FRI-mask columns and its randomizer's size,
 //!   which a prover and a verifier take from the format, never from a
 //!   proof.
-//! - **The bit counts** are [`crate::security`]'s, at each entry's reference
-//!   shape. The segment's and the recursion's verifiers count again at the
+//! - **The bit counts** ([`COUNTS`]) are [`crate::security`]'s, at each
+//!   entry's reference shape. The segment's and the recursion's verifiers count again at the
 //!   proof's own shape and refuse a proof below either floor; the masked
 //!   formats' (39, 47) do not: their shapes are pinned at or under the
 //!   reference shape (a fixed layout, a device program's log sizes at most
@@ -92,8 +95,7 @@
 //!   the count is monotone in the shape, so the reference's count bounds
 //!   every proof's.
 
-use stwo::core::fri::FriConfig;
-use stwo::core::pcs::PcsConfig;
+pub use vos_pvm_recair_air::format::*;
 
 use crate::security::{SecurityBits, SecurityShape};
 
@@ -103,346 +105,63 @@ pub use reference::{
     DEVICE_REFERENCE, LEAF_FOLD_REFERENCE, MASKED_WRAP_REFERENCE, SEGMENT_REFERENCE,
 };
 
-/// What a format proves.
+/// A registered format's security count: the shape it is counted at, and
+/// [`crate::security::security_bits`] there, pinned by the format tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProofKind {
-    Segment,
-    LeafFold,
-    Wrap,
-    Device,
-}
-
-/// The Merkle hash and Fiat–Shamir channel of a format. Its tag (`as u8`)
-/// is pinned: the masked prover's witness digest binds it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum ChannelKind {
-    Poseidon2M31 = 1,
-    Blake2sM31 = 2,
-    Blake2b256 = 3,
-}
-
-/// How a format's DEEP quotient batches its sampled values: by powers of one
-/// coefficient (Stwo's), or with an independent coefficient a sampled value
-/// (the fork's, `DIVERGENCE-012`), whose error loses the factor of the
-/// values' count. A proof does not carry it: a verifier sets it from the
-/// format ([`Format::verifier_config`]).
-pub use stwo::core::pcs::DeepBatching;
-
-/// How a format's proofs are laid out in bytes when they leave the prover.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProofBytes {
-    /// The proof's serde form as its postcard encoding (segment, leaf and
-    /// fold, and device proofs): varint lengths, whose canonical form a
-    /// decoder checks by re-encoding.
-    Postcard,
-    /// The fields in a fixed order, little-endian, with explicit u32 counts
-    /// and no varints, every count checked against the format before any
-    /// allocation, nothing after the last field: one encoding a proof.
-    FixedLayout,
-}
-
-/// Whether a verifier accepts a format.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Status {
-    Admitted,
-    /// Registered, with its parameters and counts, and refused until its AIR
-    /// and channel exist.
-    Reserved,
-}
-
-/// A format's PCS parameters, and its interaction PoW.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FormatParams {
-    pub log_blowup: u32,
-    pub n_queries: usize,
-    pub pow_bits: u32,
-    pub fold_step: u32,
-    pub log_last_layer: u32,
-    pub interaction_pow_bits: u32,
-    pub batching: DeepBatching,
-}
-
-impl FormatParams {
-    pub const fn pcs_config(&self) -> PcsConfig {
-        PcsConfig {
-            pow_bits: self.pow_bits,
-            fri_config: FriConfig {
-                log_last_layer_degree_bound: self.log_last_layer,
-                log_blowup_factor: self.log_blowup,
-                n_queries: self.n_queries,
-                fold_step: self.fold_step,
-            },
-            lifting_log_size: None,
-            deep_batching: self.batching,
-        }
-    }
-
-    /// The parameters of a proof's own config, with its format's
-    /// `interaction_pow_bits` and `batching`: a proof's config does not
-    /// carry its batching.
-    pub fn of(config: &PcsConfig, interaction_pow_bits: u32, batching: DeepBatching) -> Self {
-        Self {
-            log_blowup: config.fri_config.log_blowup_factor,
-            n_queries: config.fri_config.n_queries,
-            pow_bits: config.pow_bits,
-            fold_step: config.fri_config.fold_step,
-            log_last_layer: config.fri_config.log_last_layer_degree_bound,
-            interaction_pow_bits,
-            batching,
-        }
-    }
-}
-
-/// A masked format's masking (`proving.md` §5, R6): what its trees commit
-/// beside the AIR's columns, and the randomizer's size. A prover masks with
-/// it and a verifier lays the trees out by it; neither reads it from a
-/// proof.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Masking {
-    /// The uniform salt columns at the end of each salted tree (main,
-    /// interaction, composition), never sampled.
-    pub salt_columns: usize,
-    /// The FRI mask `R`'s uniform base columns, in the composition tree
-    /// after the composition's own, sampled at the out-of-domain point.
-    pub fri_mask_columns: usize,
-    /// `log2 h`: each masked column is `f + v_H·r`, `r` of `h` random
-    /// coefficients.
-    pub log_mask_rows: u32,
-}
-
-/// The least counts a verifier accepts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SecurityFloor {
-    pub conjectured: u32,
-    pub proven: u32,
-}
-
-/// One registry entry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Format {
+pub struct Count {
+    /// The format's number.
     pub number: u32,
-    pub kind: ProofKind,
-    pub channel: ChannelKind,
-    /// The parameters a proof must carry exactly.
-    pub params: FormatParams,
-    pub bytes: ProofBytes,
-    /// The masking's pins for a masked format, `None` for an unmasked one.
-    pub masking: Option<Masking>,
-    pub floor: SecurityFloor,
-    pub status: Status,
-    /// The shape [`Format::bits`] is counted at.
+    /// The shape [`Count::bits`] is counted at.
     pub reference: SecurityShape,
-    /// [`crate::security::security_bits`] at `reference`, pinned by the
-    /// format tests.
     pub bits: SecurityBits,
 }
 
-impl Format {
-    /// The format's configuration, its DEEP batching among it.
-    pub const fn pcs_config(&self) -> PcsConfig {
-        self.params.pcs_config()
-    }
-
-    /// The configuration a verifier checks a proof under: the proof's own,
-    /// with the format's DEEP batching, which a proof does not carry (its
-    /// deserialized config reads [`DeepBatching::Powers`]).
-    pub const fn verifier_config(&self, proof: &PcsConfig) -> PcsConfig {
-        PcsConfig {
-            deep_batching: self.params.batching,
-            ..*proof
-        }
-    }
-
-    /// The interaction PoW a proof under this format grinds, 0 for none.
-    pub const fn interaction_pow_bits(&self) -> u32 {
-        self.params.interaction_pow_bits
-    }
-
-    /// Whether [`Format::bits`] clears both floors.
-    pub const fn meets_floors(&self) -> bool {
-        self.bits.conjectured >= self.floor.conjectured && self.bits.proven >= self.floor.proven
+impl Count {
+    /// Whether the count clears both of `floor`'s.
+    pub const fn meets(&self, floor: &SecurityFloor) -> bool {
+        self.bits.conjectured >= floor.conjectured && self.bits.proven >= floor.proven
     }
 }
 
-/// Segments': fewer queries and more PoW than [`LEAF_FOLD_PARAMS`], for the
-/// kernel leaf's rows, which grow with the queries times the segment's width.
-/// Counted on format 41's reference: 62.81 proven bits.
-const SEGMENT_PARAMS: FormatParams = FormatParams {
-    log_blowup: 2,
-    n_queries: 40,
-    pow_bits: 24,
-    fold_step: 1,
-    log_last_layer: 0,
-    interaction_pow_bits: 8,
-    batching: DeepBatching::Powers,
-};
-
-/// Leaves' and folds': a fold verifies under half the recursion AIR's
-/// shape, so its rows leave room for 44 queries.
-const LEAF_FOLD_PARAMS: FormatParams = FormatParams {
-    log_blowup: 2,
-    n_queries: 44,
-    pow_bits: 20,
-    fold_step: 1,
-    log_last_layer: 0,
-    interaction_pow_bits: 8,
-    batching: DeepBatching::Powers,
-};
-
-/// Device proofs', picked by measurement (see the module's notes).
-const DEVICE: FormatParams = FormatParams {
-    log_blowup: 2,
-    n_queries: 47,
-    pow_bits: 16,
-    fold_step: 1,
-    log_last_layer: 0,
-    interaction_pow_bits: 8,
-    batching: DeepBatching::Affine,
-};
-
-const INNER_FLOOR: SecurityFloor = SecurityFloor {
-    conjectured: 100,
-    proven: 60,
-};
-
-pub const SEGMENT: Format = Format {
-    number: 41,
-    kind: ProofKind::Segment,
-    channel: ChannelKind::Poseidon2M31,
-    params: SEGMENT_PARAMS,
-    bytes: ProofBytes::Postcard,
-    masking: None,
-    floor: INNER_FLOOR,
-    status: Status::Admitted,
-    reference: SEGMENT_REFERENCE,
-    bits: SecurityBits {
-        conjectured: 104,
-        proven: 62,
+/// Every registered format's count, in [`REGISTRY`]'s order.
+pub const COUNTS: [Count; 4] = [
+    Count {
+        number: LEAF_FOLD.number,
+        reference: LEAF_FOLD_REFERENCE,
+        bits: SecurityBits {
+            conjectured: 108,
+            proven: 63,
+        },
     },
-};
-
-/// The padded shape every leaf and fold proves at, [`LEAF_FOLD`]'s
-/// (`proving.md` §3.4): `p2`, `qm31` and `h8` at 2^16, 2^17 and 2^16 rows.
-/// One shape for both, so a fold verifies either child with one circuit,
-/// and a fold's own rows fit it (`recursion-air.md` §6, the fixed point).
-pub const LEAF_FOLD_LOG_SIZES: [u32; 3] = [16, 17, 16];
-
-pub const LEAF_FOLD: Format = Format {
-    number: 32,
-    kind: ProofKind::LeafFold,
-    channel: ChannelKind::Poseidon2M31,
-    params: LEAF_FOLD_PARAMS,
-    bytes: ProofBytes::Postcard,
-    masking: None,
-    floor: INNER_FLOOR,
-    status: Status::Reserved,
-    reference: LEAF_FOLD_REFERENCE,
-    bits: SecurityBits {
-        conjectured: 108,
-        proven: 63,
+    Count {
+        number: MASKED_WRAP.number,
+        reference: MASKED_WRAP_REFERENCE,
+        bits: SecurityBits {
+            conjectured: 146,
+            proven: 82,
+        },
     },
-};
-
-/// Format 39's masking: 8 salt columns a tree (248 bits); an `R` of 8
-/// columns, whose 8 independent DEEP coefficients span QM31 over M31 but
-/// with probability about `p^-5`, so R3 holds without a check; and `h = 256`,
-/// at least `2(4|O| + q(|O| + 1)) = 160` for `q = 24` queries and `|O| = 2`
-/// offsets, and at most a quarter of the smallest component's `2^11` rows.
-pub const MASKED_WRAP_MASKING: Masking = Masking {
-    salt_columns: 8,
-    fri_mask_columns: 8,
-    log_mask_rows: 8,
-};
-
-/// The final wrap, masked: see the module's notes.
-pub const MASKED_WRAP: Format = Format {
-    number: 39,
-    kind: ProofKind::Wrap,
-    channel: ChannelKind::Blake2b256,
-    params: FormatParams {
-        log_blowup: 5,
-        n_queries: 24,
-        pow_bits: 26,
-        fold_step: 3,
-        log_last_layer: 6,
-        interaction_pow_bits: 8,
-        batching: DeepBatching::Affine,
+    Count {
+        number: SEGMENT.number,
+        reference: SEGMENT_REFERENCE,
+        bits: SecurityBits {
+            conjectured: 104,
+            proven: 62,
+        },
     },
-    bytes: ProofBytes::FixedLayout,
-    masking: Some(MASKED_WRAP_MASKING),
-    floor: SecurityFloor {
-        conjectured: 100,
-        proven: 80,
+    Count {
+        number: DEVICE_PROOF.number,
+        reference: DEVICE_REFERENCE,
+        bits: SecurityBits {
+            conjectured: 110,
+            proven: 62,
+        },
     },
-    status: Status::Admitted,
-    reference: MASKED_WRAP_REFERENCE,
-    bits: SecurityBits {
-        conjectured: 146,
-        proven: 82,
-    },
-};
+];
 
-/// The device format's masking: 8 salt columns a tree; an `R` of 8 columns (R3
-/// under affine batching); and `h = 256`, at least the
-/// `4|O| + q(|O| + 1) = 149` rows a column reveals for `q = 47` queries and
-/// `|O| = 2` offsets, every device chip's widest (`proving.md` §5), so each
-/// component pads to `4h = 2^10` rows.
-pub const DEVICE_MASKING: Masking = Masking {
-    salt_columns: 8,
-    fri_mask_columns: 8,
-    log_mask_rows: 8,
-};
-
-/// Device proofs under the per-program CPU and the word ledger, masked:
-/// the device format; see the module's notes.
-pub const DEVICE_PROOF: Format = Format {
-    number: 47,
-    kind: ProofKind::Device,
-    channel: ChannelKind::Blake2sM31,
-    params: DEVICE,
-    bytes: ProofBytes::Postcard,
-    masking: Some(DEVICE_MASKING),
-    floor: INNER_FLOOR,
-    status: Status::Admitted,
-    reference: DEVICE_REFERENCE,
-    bits: SecurityBits {
-        conjectured: 110,
-        proven: 62,
-    },
-};
-
-/// Every registered format, by number.
-pub const REGISTRY: [Format; 4] = [LEAF_FOLD, MASKED_WRAP, SEGMENT, DEVICE_PROOF];
-
-/// The entry for `number`, admitted or not.
-pub fn lookup(number: u32) -> Option<&'static Format> {
-    REGISTRY.iter().find(|format| format.number == number)
-}
-
-/// The entry for `number`, if a verifier accepts proofs under it.
-pub fn admitted(number: u32) -> Result<&'static Format, alloc::string::String> {
-    match lookup(number) {
-        Some(format) if format.status == Status::Admitted => Ok(format),
-        Some(format) => Err(alloc::format!(
-            "proof format {number} ({:?}) is registered but not admitted",
-            format.kind
-        )),
-        None => Err(alloc::format!("proof format {number} is not registered")),
-    }
-}
-
-/// The entry for `number`, if it is admitted and names segment proofs: what
-/// a segment verifier accepts.
-pub fn admitted_segment(number: u32) -> Result<&'static Format, alloc::string::String> {
-    let format = admitted(number)?;
-    if format.kind != ProofKind::Segment {
-        return Err(alloc::format!(
-            "proof format {number} ({:?}) does not name segment proofs",
-            format.kind
-        ));
-    }
-    Ok(format)
+/// `format`'s count; `None` for a format the registry does not hold.
+pub fn count(format: &Format) -> Option<&'static Count> {
+    COUNTS.iter().find(|count| count.number == format.number)
 }
 
 #[cfg(test)]

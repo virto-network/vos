@@ -3,7 +3,9 @@
 //! test actor's ELF, derived as an install derives it, `H_fold` from the
 //! fold circuit and the wrap's preprocessed root from the wrap circuit.
 //! `test-proof` runs it under both of the prover's feature sets; under
-//! `VOS_PINS=write` (`just repin`) it writes the constants that moved.
+//! `VOS_PINS=write` (`just repin`) it writes the constants that moved, but
+//! the wrap's root, the final verifier's own (a venue's verifying key),
+//! which a circuit change moves by hand.
 
 use vos_pvm_proof::constants;
 use vos_pvm_proof::format::SEGMENT;
@@ -37,7 +39,7 @@ pub fn program_id(actor: &str, name: &str) -> [u32; 8] {
 }
 
 /// Each constant is what its source computes, the wrap's root the final
-/// verifier's too.
+/// verifier's.
 #[test]
 fn the_constants_are_the_repositorys() {
     let computed = [
@@ -62,35 +64,23 @@ fn the_constants_are_the_repositorys() {
             constants::H_FOLD,
         ),
     ];
-    let wrap = WrapCircuit::get();
-    let roots = [(
-        "WRAP_ROOT_39",
-        wrap.masked_preprocessed_root().0,
-        constants::WRAP_ROOT_39,
-    )];
-    let moved = computed.iter().any(|(_, words, pinned)| words != pinned)
-        || roots.iter().any(|(_, bytes, pinned)| bytes != pinned);
+    let moved = computed.iter().any(|(_, words, pinned)| words != pinned);
     if moved && std::env::var("VOS_PINS").as_deref() == Ok("write") {
-        let values = computed
-            .iter()
-            .map(|(name, words, _)| (*name, words.map(u64::from).to_vec()))
-            .chain(
-                roots
-                    .iter()
-                    .map(|(name, bytes, _)| (*name, bytes.map(u64::from).to_vec())),
-            );
-        write(values);
-        return;
-    }
-    for (name, words, pinned) in computed {
-        assert_eq!(words, pinned, "{name} moved: `just repin`");
-    }
-    for (name, bytes, pinned) in roots {
-        assert_eq!(bytes, pinned, "{name} moved: `just repin`");
+        write(
+            computed
+                .iter()
+                .map(|(name, words, _)| (*name, words.map(u64::from).to_vec())),
+        );
+    } else {
+        for (name, words, pinned) in computed {
+            assert_eq!(words, pinned, "{name} moved: `just repin`");
+        }
     }
     assert_eq!(
-        constants::WRAP_ROOT_39,
-        vos_pvm_final_verifier::PREPROCESSED_ROOT_39
+        WrapCircuit::get().masked_preprocessed_root().0,
+        constants::PREPROCESSED_ROOT_39,
+        "the wrap circuit's root moved: a new venue verifying key, written by hand into \
+         `vos-pvm-final-verifier`'s `PREPROCESSED_ROOT_39`"
     );
 }
 
