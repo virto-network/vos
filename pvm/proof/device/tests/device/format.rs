@@ -85,6 +85,30 @@ fn shape_of(set_shape: DeviceShape, log_size: u32) -> SecurityShape {
     }
 }
 
+/// The lifted tree binds a column to its size only by the periodicity
+/// value of a column sampled at two points (`SECURITY.md`, "Masking"):
+/// every committed column of the device set, every chip a device program
+/// may hold, is sampled at one or two points, but the preprocessed columns
+/// no chip reads and the salts, at none.
+#[test]
+fn every_device_column_is_sampled_at_one_or_two_points() {
+    let pins = DEVICE_PROOF.masking.unwrap();
+    let chips = device_chips_of_mask(DEVICE_ALL).count();
+    let set = DeviceComponents::layout(DEVICE_ALL.into(), &vec![10; chips]).unwrap();
+    let points = sample_points(&set, CirclePoint::<SecureField>::get_point(1), &pins).unwrap();
+    assert!(points[0].iter().all(|column| column.len() <= 1));
+    for tree in 1..4 {
+        let salts = pins.salt_columns;
+        let (columns, salted) = points[tree].split_at(points[tree].len() - salts);
+        assert!(
+            columns.iter().all(|c| (1..=2).contains(&c.len())),
+            "tree {tree}"
+        );
+        assert!(salted.iter().all(Vec::is_empty), "tree {tree}");
+    }
+    assert!(points.iter().flatten().any(|column| column.len() == 2));
+}
+
 /// The registry's reference for the device format is its built set's
 /// masked shape at `DEVICE_MAX_LOG_SIZE`, field for field; it counts its
 /// pinned bits on it, and one query fewer falls under 62.

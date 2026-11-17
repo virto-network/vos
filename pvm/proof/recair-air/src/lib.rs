@@ -270,6 +270,41 @@ mod tests {
         );
     }
 
+    /// The lifted tree binds a column to its size only by the periodicity
+    /// value of a column sampled at two points (`SECURITY.md`, "Masking"):
+    /// every main and interaction column of the recursion AIR is sampled at
+    /// one or two points, a preprocessed column at most one.
+    #[test]
+    fn every_recursion_column_is_sampled_at_one_or_two_points() {
+        let log_sizes = [16, 17, 16];
+        let components = Components::new(
+            &GateRelation::dummy(),
+            &log_sizes,
+            &[SecureField::default(); 3],
+        );
+        let samples = stwo::core::air::Components {
+            components: components.as_dyn().to_vec(),
+            n_preprocessed_columns: preprocessed_ids().len(),
+        }
+        .mask_points(
+            stwo::core::circle::CirclePoint::<SecureField>::get_point(1),
+            19,
+            false,
+        );
+        assert!(samples[0].iter().all(|column| column.len() <= 1));
+        for tree in 1..3 {
+            assert_eq!(
+                samples[tree].len(),
+                committed_log_sizes(&log_sizes)[tree].len()
+            );
+            assert!(
+                samples[tree].iter().all(|c| (1..=2).contains(&c.len())),
+                "tree {tree}"
+            );
+        }
+        assert!(samples.iter().flatten().any(|column| column.len() == 2));
+    }
+
     /// The column counts of `recursion-air.md` §1.2: 57 preprocessed, 361
     /// main and 32 interaction columns.
     #[test]
