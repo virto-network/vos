@@ -99,6 +99,7 @@ extern crate std;
 
 #[cfg(feature = "fixtures")]
 pub mod fixtures;
+#[cfg(feature = "model")]
 pub mod model;
 
 use alloc::vec::Vec;

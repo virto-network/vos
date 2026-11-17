@@ -119,12 +119,24 @@ pub fn verify_bytes(bytes: &[u8], words: &[u32; PUBLIC_WORDS]) -> Result<Stateme
 /// public `words`, and returns the statement they make: the program id and
 /// the io-hash.
 pub fn verify(proof: WrapProof, words: &[u32; PUBLIC_WORDS]) -> Result<Statement, Error> {
-    verify_with(&MASKED_WRAP, &PREPROCESSED_ROOT_39, proof, words)
+    verify_under(&MASKED_WRAP, &PREPROCESSED_ROOT_39, proof, words)
 }
 
 /// [`verify`] under `format`'s pins and the circuit `preprocessed_root`: a
 /// verifier pinning other salts, `R` or widths refuses `MASKED_WRAP`'s proofs.
+/// A test seam (`other-pins`): a production verifier pins
+/// [`MASKED_WRAP`] and [`PREPROCESSED_ROOT_39`], and takes neither.
+#[cfg(feature = "other-pins")]
 pub fn verify_with(
+    format: &MaskedFormat<'_>,
+    preprocessed_root: &[u8; 32],
+    proof: WrapProof,
+    words: &[u32; PUBLIC_WORDS],
+) -> Result<Statement, Error> {
+    verify_under(format, preprocessed_root, proof, words)
+}
+
+fn verify_under(
     format: &MaskedFormat<'_>,
     preprocessed_root: &[u8; 32],
     proof: WrapProof,
@@ -143,9 +155,9 @@ pub fn verify_with(
         format,
         &Claim {
             log_sizes: &proof.log_sizes,
-            circuit: Some(Blake2bHash(*preprocessed_root)),
+            circuit: Blake2bHash(*preprocessed_root),
             public: &public,
-            public_sum: Some(&public_sum),
+            public_sum: &public_sum,
             bound_sums: None,
             interaction_pow: proof.interaction_pow,
             claimed_sums: &proof.claimed_sums,

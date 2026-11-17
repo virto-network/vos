@@ -32,7 +32,8 @@ use crate::common::leakage::published;
 use crate::common::random_circuit;
 use crate::leakage::{Witness as PrivateWitness, private_circuit};
 use crate::masked_prover::{
-    LOG_SIZE, Proof, circuit, format, prove, public_sum, verify, verify_as, wrap_layout,
+    LOG_SIZE, Proof, circuit, format, own_circuit, prove, public_sum, verify, verify_as,
+    wrap_layout,
 };
 
 use num_traits::{One, Zero};

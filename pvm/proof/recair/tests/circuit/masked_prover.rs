@@ -22,6 +22,7 @@ use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::quotients::{DeepCoefficients, deep_values_of_column};
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 use stwo::core::vcs_lifted::blake2b_merkle::Blake2bMerkleChannel;
+use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use stwo::prover::backend::BackendForChannel;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::{ComponentProver, ProvingError};
@@ -115,6 +116,13 @@ pub(crate) fn public_sum(outputs: &[SecureField], relation: &GateRelation) -> Se
     )
 }
 
+/// The circuit a small proof is checked against: the preprocessed root it
+/// commits, read back, so its checks run past the circuit's. The circuit's
+/// pin is the wrap's tests' (`recursion::masked`) and the device's.
+pub(crate) fn own_circuit<H: MerkleHasherLifted>(proof: &RecairProof<H>) -> H::Hash {
+    proof.stark_proof.commitments[0]
+}
+
 /// Verifies a masked proof of a small circuit on `MC`, over the set laid
 /// out as `layout`.
 pub(crate) fn verify_as<MC: MerkleChannel, C: MaskedComponents<Relations = GateRelation>>(
@@ -127,9 +135,9 @@ pub(crate) fn verify_as<MC: MerkleChannel, C: MaskedComponents<Relations = GateR
         &verifier_format(format, &proof.log_sizes, layout).expect("a masked format"),
         &Claim {
             log_sizes: &proof.log_sizes,
-            circuit: None,
+            circuit: own_circuit(proof),
             public: &proof.outputs,
-            public_sum: Some(&public_sum),
+            public_sum: &public_sum,
             bound_sums: None,
             interaction_pow: proof.interaction_pow,
             claimed_sums: &proof.claimed_sums,
@@ -188,9 +196,9 @@ fn fri_mask_coefficients(format: &Format, proof: &Proof<Blake2bMerkleChannel>) -
     };
     let claim = Claim {
         log_sizes: &proof.log_sizes,
-        circuit: None,
+        circuit: own_circuit(proof),
         public: &proof.outputs,
-        public_sum: Some(&public_sum),
+        public_sum: &public_sum,
         bound_sums: None,
         interaction_pow: proof.interaction_pow,
         claimed_sums: &proof.claimed_sums,
@@ -438,9 +446,9 @@ fn a_one_component_set_is_refused() {
         &pinned,
         &Claim {
             log_sizes: &log_sizes,
-            circuit: None,
+            circuit: own_circuit(&proof),
             public: &finalized.witness.outputs,
-            public_sum: None,
+            public_sum: &|_: &GateRelation| SecureField::zero(),
             bound_sums: None,
             interaction_pow: proof.interaction_pow,
             claimed_sums: &proof.claimed_sums[..1],

@@ -19,15 +19,16 @@ fn a_malformed_proof_is_an_error_never_a_panic() {
     // them; a proof's own are its claim's.
     let layout = wrap_layout(&proof.log_sizes);
     let pinned = verifier_format(&format, &proof.log_sizes, &layout).expect("a masked format");
+    let circuit = own_circuit(&proof);
     let verified = |proof: &P, log_sizes: &[u32], claimed_sums: &[SecureField]| {
         let public_sum = |relation: &GateRelation| public_sum(&proof.outputs, relation);
         verify_masked::<Blake2bMerkleChannel, WrapComponents>(
             &pinned,
             &Claim {
                 log_sizes,
-                circuit: None,
+                circuit,
                 public: &proof.outputs,
-                public_sum: Some(&public_sum),
+                public_sum: &public_sum,
                 bound_sums: None,
                 interaction_pow: proof.interaction_pow,
                 claimed_sums,

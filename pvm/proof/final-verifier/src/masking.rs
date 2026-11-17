@@ -222,14 +222,14 @@ pub type BoundSums<'a, R> = dyn Fn(&R, &[SecureField]) -> bool + 'a;
 pub struct Claim<'a, R, Hash> {
     /// Each component's log size, the proof's: the format's or refused.
     pub log_sizes: &'a [u32],
-    /// The preprocessed root the circuit pins; `None` for a set whose
-    /// circuit is not checked.
-    pub circuit: Option<Hash>,
+    /// The preprocessed root the circuit pins: the verifier's own, never
+    /// the proof's.
+    pub circuit: Hash,
     /// The values mixed after the main tree's root.
     pub public: &'a [SecureField],
     /// The public terms' logup sum under the relations, which the claimed
-    /// sums must cancel; `None` for a set whose sums are not checked.
-    pub public_sum: Option<&'a dyn Fn(&R) -> SecureField>,
+    /// sums must cancel (zero for a set with no public term).
+    pub public_sum: &'a dyn Fn(&R) -> SecureField,
     /// Whether the claimed sums the public values fix
     /// ([`MaskedComponents::public_sums`]) are theirs under the relations;
     /// `None` for a set with none.
@@ -387,16 +387,14 @@ pub fn replay<MC: MerkleChannel, C: MaskedComponents>(
     let (relations, blind) = C::draw(layout.active(), &mut channel);
     channel.mix_felts(claim.claimed_sums);
     scheme.commit(interaction_root, interaction_tree, &mut channel);
-    if let Some(public_sum) = claim.public_sum {
-        #[allow(
-            clippy::arithmetic_side_effects,
-            reason = "QM31's addition is modular: it neither overflows nor panics"
-        )]
-        let total =
-            claim.claimed_sums.iter().copied().sum::<SecureField>() + public_sum(&relations);
-        if !total.is_zero() {
-            return Err(Error::Logup);
-        }
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "QM31's addition is modular: it neither overflows nor panics"
+    )]
+    let total =
+        claim.claimed_sums.iter().copied().sum::<SecureField>() + (claim.public_sum)(&relations);
+    if !total.is_zero() {
+        return Err(Error::Logup);
     }
     if claim
         .bound_sums
@@ -469,10 +467,7 @@ fn admitted<H: MerkleHasherLifted, C: MaskedComponents>(
     if !claim.claimed_sums.iter().all(secure_is_canonical) {
         return Err(Error::Noncanonical);
     }
-    if claim
-        .circuit
-        .is_some_and(|root| proof.commitments.first() != Some(&root))
-    {
+    if proof.commitments.first() != Some(&claim.circuit) {
         return Err(Error::Circuit);
     }
     Ok((trees, points))

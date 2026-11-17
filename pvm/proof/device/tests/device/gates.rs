@@ -671,9 +671,9 @@ fn the_program_is_mixed_into_the_transcript() {
         };
         let claim = Claim {
             log_sizes: &program.log_sizes,
-            circuit: Some(program.circuit),
+            circuit: program.circuit,
             public: &public,
-            public_sum: Some(&zero),
+            public_sum: &zero,
             bound_sums: Some(&bound),
             interaction_pow: proof.proof.interaction_pow,
             claimed_sums: &proof.proof.claimed_sums,

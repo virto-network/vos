@@ -11,3 +11,11 @@ stwo = { workspace = true }
 vos-pvm-recair-air = { workspace = true }
 num-traits = { version = "0.2", default-features = false }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+
+[features]
+# The wrap verified under pins other than its own (`masked::verify_with`),
+# for the tests that a verifier pinning other salts, `R` or widths refuses
+# format 39's proofs, on a dev edge. No production build, and not the
+# verifier kit's own build, enables it (`just check-no-leaks`, `just
+# check-kit`).
+other-pins = []

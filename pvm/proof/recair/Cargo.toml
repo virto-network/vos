@@ -61,6 +61,9 @@ watch = ["recursion"]
 [dev-dependencies]
 # The masked prover's tests reproduce a proof byte for byte from a seed.
 vos-pvm-recair = { path = ".", features = ["recursion", "seeded-masks"] }
+# A verifier pinning other salts, `R` or widths, which refuses the wrap's
+# proofs.
+vos-pvm-final-verifier = { workspace = true, features = ["other-pins"] }
 bincode = "1"
 vos-pvm = { workspace = true }
 # A small kernel, laid out as the loader lays it out.

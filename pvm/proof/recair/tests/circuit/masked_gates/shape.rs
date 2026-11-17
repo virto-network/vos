@@ -71,9 +71,9 @@ where
     let pinned = verifier_format(format, &proof.log_sizes, &layout).expect("a masked format");
     let claim = Claim {
         log_sizes: &proof.log_sizes,
-        circuit: None,
+        circuit: own_circuit(proof),
         public: &proof.outputs,
-        public_sum: Some(&public_sum),
+        public_sum: &public_sum,
         bound_sums: None,
         interaction_pow: proof.interaction_pow,
         claimed_sums: &proof.claimed_sums,

@@ -560,13 +560,14 @@ _forbidden +gates:
         [venue-model "-p vos-cli --features prover" [model] []] \
         [venue-model "-p vos-node" [model] []] \
         [venue-model "-p vos-node --features prover" [model] []] \
-        [seeded-masks "--workspace" [seeded-masks] []] \
-        [seeded-masks "-p vos-cli --features prover" [seeded-masks] []] \
-        [seeded-masks "-p vos-light" [seeded-masks] []] \
-        [seeded-masks "--manifest-path agent/programs/Cargo.toml --workspace" [seeded-masks] []] \
-        [seeded-masks "--manifest-path pvm/proof/fuzz/Cargo.toml" [seeded-masks] []] \
-        [seeded-masks "--manifest-path pvm/proof/final-verifier/wasm/run/Cargo.toml" [seeded-masks] []] \
-        [seeded-masks "--manifest-path pvm/proof/final-verifier/wasm/blob/Cargo.toml" [seeded-masks] []] \
+        [venue-model "-p vos-statement-service --features pvm-guest" [model] []] \
+        [seeded-masks "--workspace" [seeded-masks other-pins] []] \
+        [seeded-masks "-p vos-cli --features prover" [seeded-masks other-pins] []] \
+        [seeded-masks "-p vos-light" [seeded-masks other-pins] []] \
+        [seeded-masks "--manifest-path agent/programs/Cargo.toml --workspace" [seeded-masks other-pins] []] \
+        [seeded-masks "--manifest-path pvm/proof/fuzz/Cargo.toml" [seeded-masks other-pins] []] \
+        [seeded-masks "--manifest-path pvm/proof/final-verifier/wasm/run/Cargo.toml" [seeded-masks other-pins] []] \
+        [seeded-masks "--manifest-path pvm/proof/final-verifier/wasm/blob/Cargo.toml" [seeded-masks other-pins] []] \
         [debug-internals "--workspace" [debug-internals disclosing watch] []] \
         [debug-internals "-p vos-cli --features prover" [debug-internals disclosing watch] []] \
         [debug-internals "-p vos-statement-service --features pvm-guest" [debug-internals] []] \
@@ -657,13 +658,17 @@ check-no-tools: (_forbidden "tools")
 # reaches neither the `vos` binary, with or without the prover, nor
 # `vos-node`, on a normal or build edge (the tests enable it on dev
 # edges), and no normal or build edge of any workspace member enables it,
-# nor Kreivo's mock (`vos-kreivo`'s `kreivo-mock`).
+# nor `vos-statement`'s (`model`: a judge whose pinned program and state its
+# input carries), nor Kreivo's mock (`vos-kreivo`'s `kreivo-mock`); the JAM
+# statements service's program links no model venue either.
 check-no-venue-model: (_forbidden "venue-model")
     print "no model venue in the node"
 
 # The masked prover's test seams (`vos-pvm-recair`'s `seeded-masks`: the
 # seeded randomness `MaskRng::Seeded` and the forced proof
-# `prove_masked_unchecked`) reach no production build: no normal or build edge
+# `prove_masked_unchecked`), and the final verifier's (`other-pins`: the wrap
+# verified under other pins, `masked::verify_with`) reach no production
+# build: no normal or build edge
 # of any workspace member, nor of the workspaces built apart (the agent,
 # the fuzz targets, the final verifier's Wasm blob and its runner), enables
 # it (the prover's tests enable it on a dev edge), and the proof crate's
@@ -766,13 +771,15 @@ vos-sync dir:
 # workspace of its own, built alone and `--locked` (on the kit's lockfile,
 # `pvm/proof/kit/Cargo.lock`) for `wasm32v1-none` on Kreivo's stable
 # toolchain (1.94.1, the target installed as Kreivo's CI installs it), no
-# `std` feature enabled in any crate it links; `vos-statement`'s `fixtures`
+# `std` feature, model venue (`vos-statement`'s `model`) or test seam
+# (the final verifier's `other-pins`) enabled in any crate it links;
+# `vos-statement`'s `fixtures`
 # reader built for the host; and the sync check's own test
 # (`pvm/proof/kit/check.py`): a one-byte change in a vendored file refused,
 # the kit's own script never trusted, `VENDOR`'s tag required and checked.
 check-kit: _kit-workspace
     cd target/kit/build; cargo +1.94.1 build --workspace --target wasm32v1-none --locked --quiet
-    cd target/kit/build; let std = (cargo +1.94.1 tree --workspace -e normal --target wasm32v1-none -f '{p}|{f}' --prefix none --locked | lines | where {|line| $line | split row '|' | last | split row ',' | any {|feature| $feature == 'std' } } | uniq); if ($std | is-not-empty) { error make { msg: $"std reaches the kit: ($std | str join ', ')" } } else { print "no std feature in the kit's wasm32v1-none build" }
+    cd target/kit/build; let std = (cargo +1.94.1 tree --workspace -e normal --target wasm32v1-none -f '{p}|{f}' --prefix none --locked | lines | where {|line| $line | split row '|' | last | split row ',' | any {|feature| $feature in [std model other-pins] } } | uniq); if ($std | is-not-empty) { error make { msg: $"std, the model venue or a test seam reaches the kit: ($std | str join ', ')" } } else { print "no std feature, model venue or test seam in the kit's wasm32v1-none build" }
     cd target/kit/build; cargo +1.94.1 build -p vos-statement --features fixtures --locked --quiet
     python3 -I pvm/proof/kit/check.py --scratch target/kit/sync
 

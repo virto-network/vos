@@ -113,9 +113,9 @@ pub fn verify_device_in<MC: MerkleChannel>(
     };
     let claim = Claim {
         log_sizes: &program.log_sizes,
-        circuit: Some(program.circuit),
+        circuit: program.circuit,
         public: &public,
-        public_sum: Some(&zero),
+        public_sum: &zero,
         bound_sums: Some(&bound),
         interaction_pow: proof.proof.interaction_pow,
         claimed_sums: &proof.proof.claimed_sums,
