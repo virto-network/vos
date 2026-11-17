@@ -159,16 +159,17 @@ none, the wrap, passes a check that holds).
 ### Test seams
 
 Public items a production build never compiles, each behind a feature
-`just check-no-leaks` keeps off every production edge and `just
-check-kit` off the kit's build: `vos-pvm-proof`'s `chip-isolated`
+`just check-no-leaks` keeps off every production edge (and `just
+check-kit` off the kit's build, for the kit's crates): `vos-pvm-proof`'s `chip-isolated`
 (`prove_with_explicit_components`, `verify_with_explicit_components`,
 `harness`; their proofs carry `component_mask = 0`, which
 `verify_standalone` refuses); `vos-pvm-recair`'s `seeded-masks` (seeded
 randomness, the forced prove); `vos-pvm-final-verifier`'s `other-pins`
 (`masked::verify_with`, the wrap under other pins); `vos-pvm-device`'s
-`test-device-format`; and `vos-statement`'s `model-judge` (`model`, a judge whose pinned
-program and venue state its input bytes carry, for the harnesses and the
-conformance vectors). `vos-pvm-device`'s `masked` module takes a `Format`
+`test-device-format`; and `vos-statement`'s `model-judge` (`model`, a
+judge whose pinned program and venue state its input bytes carry, for the
+harnesses and the conformance vectors; the development tools link it, the
+node, `vos` and the JAM statements service's program never). `vos-pvm-device`'s `masked` module takes a `Format`
 itself, the gates' layer; production enters through `Program` and
 `Verifier` alone.
 

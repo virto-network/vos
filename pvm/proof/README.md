@@ -59,7 +59,8 @@ last:
 | `tools/kreivo/conformance` | Kreivo's spaces pallet's conformance vectors, over the fixtures | `just conformance` | `just check` | `check` |
 | `pvm/proof/kit/Cargo.lock` | the verifier kit's lock file, VOS's pruned to what the kit links | `just kit-lock` | `just check-kit` | `gate` |
 | `pvm/proof/final-verifier/src/constants.rs` | the wrap's preprocessed root (`PREPROCESSED_ROOT_39`), a venue's verifying key | by hand, at a change of the wrap's circuit | `vos-pvm-recair`'s `recursion` test (`masked::`) and `vos-pvm-proof`'s `constants::` test compute it | `gate`; `ci-full` |
-| `pvm/proof/fuzz/replay`, `node/fuzz/replay` | each fuzz target's replay corpus, the prover's and the node's: inputs kept because they reached a path once, a regression set never generated | the fuzzer, kept by hand | `just fuzz-replay`; `cargo run --release --example paths` in `pvm/proof/fuzz` lists what each input reaches | `gate` |
+| `pvm/proof/fuzz/replay`, `node/fuzz/replay` | each fuzz target's replay corpus, the prover's and the node's: inputs kept because they reached a path | the prover's: `just fuzz-refresh` (seeded from the goldens, fuzzed, merged); the node's: the fuzzer, kept by hand | `just fuzz-replay` | `gate` |
+| `pvm/proof/fuzz/reach.txt` | the verdicts each of the prover's replay corpora reaches, its accepted goldens among them | from `just fuzz-reach`'s output after `just fuzz-refresh` | `just fuzz-reach` | `gate` |
 
 **Constants typed by hand and held by a test,** besides the wrap's root:
 format 39's layout and shape (`LOG_SIZES`, `TREE_WIDTHS`, `DEEP_VALUES`,
@@ -77,6 +78,12 @@ revision, typed again in `fuzz/Cargo.toml`), and the replay holds no
 pinned bytes, only that no input crashes. `just repro-aarch64`, which
 checks the program ids and the circuits' constants on aarch64 under QEMU,
 is in no tier: it needs a cross toolchain, and is run by hand.
+
+The prover's replay corpora hold the goldens' proofs: a change that
+moves the fixtures or a device program moves what they reach (an old
+golden is another honest proof, and the targets' oracle fails on an
+accepted proof that is not a current golden), so `just fuzz-refresh` follows `just repin` there, and
+`reach.txt` is written from its `just fuzz-reach` anew.
 
 After a change that moves a guest, a circuit or the lock file, `just
 repin` writes every generated store anew in dependency order (guests and
