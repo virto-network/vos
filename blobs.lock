@@ -1,8 +1,8 @@
 # Every pinned guest blob's SHA-256, its symbols and relocations stripped,
 # as `just build-blobs` builds it: `just blobs-lock` writes it, `just
 # check-blobs` checks it (the justfile's `_blob-hashes` says which blobs).
-8eaef15ecd9f4a7c594bdf4a38c51c390f8f865461b36c99f80cde71f4aaf99a  target/riscv64em-vos/release/final-verify.elf
-4aadd58eb9b615e555c17d47337905ec4956c2961c9a3a3ee06ed0258fde8e58  target/riscv64em-vos/release/statement-service.elf
+7d0dda60013a516b7f8d0ffb07a3a6263cfa1f19123680e049a32f01593ab5a2  target/riscv64em-vos/release/final-verify.elf
+a987c7147afcc9a66499aa831ead92a20d45c3f6a9ce2fa93c49fa1e7dafe3a2  target/riscv64em-vos/release/statement-service.elf
 f7d9be05bbf51f4a7122f59edec85e18e1258276bfebc6c4c99689615bcb5233  agent/programs/target/riscv64em-vos/release/vos-agent.elf
 7b88fe03e7dc51c7bea81bf26a16318199457e64e2b01210122655b53cca46a3  agent/programs/target/riscv64em-vos/release/vos-representative.elf
 4480ead1edcc7856e48a772c7dc6b0cd1166776186746cef28a0b43481209c06  agent/programs/target/riscv64em-vos/release/vos-credentials.elf
@@ -11,7 +11,7 @@ c22adad542dee9377afd36821d759496b8fbf0af75bdbd710e5f307297dae006  agent/programs
 74246af82aa746217b56526a3ddec993fcbd108c5fc510cf834fb99cb2439f7f  agent/programs/target/riscv64em-vos/release/vos-homes.elf
 6b52f19b437273a58c0cb425b8f9d91a95c7f3e6583428041ee456ff0374c0e1  agent/programs/target/riscv64em-vos/release/vos-credential-book.elf
 e88eb723620c8ee3d0363b853c55391e09204e54628d325eec6c19ccf03a6a91  agent/programs/target/riscv64em-vos/release/vos-device-book.elf
-229265b3a8523eaecf9300f1132ac52b357736be369b51caa20305a9b5226eb9  pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm
+aada89ca43f9f4f5b1fc33db5d3b091e91ebc62c72fda27c3d827eac975daa3c  pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm
 3f73fcef5b751cc8f5084aa22ffdf7867894c9421e1daa03f25ecc87bde560ac  agent/test-actors/target/riscv64em-vos/release/accounts.elf
 ab61a2bfa43cf70c9beaf0b572b300709e65c8eda1974985bba53c2a831b33fd  agent/test-actors/target/riscv64em-vos/release/ample.elf
 58fb53b8689ed1e6711b1be57bab93f6529de82de0a846d8e2a74b4bf45868ed  agent/test-actors/target/riscv64em-vos/release/balance.elf
