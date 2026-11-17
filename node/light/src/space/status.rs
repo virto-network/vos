@@ -47,7 +47,9 @@ impl<H: Host> Personal<H> {
         let phase = phase(&held)?;
         let store = held.light.store();
         let owed = memberships::enrollments(store).map_err(store_failed)?.len()
-            + memberships::confirmations(store).map_err(store_failed)?.len();
+            + memberships::confirmations(store)
+                .map_err(store_failed)?
+                .len();
         Ok(Status {
             phase,
             home: held.state.home.clone(),
