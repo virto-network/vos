@@ -3,12 +3,7 @@
 
 package team.virto.vos.personal;
 
-import android.widget.CheckBox;
 import android.widget.LinearLayout;
-import java.util.ArrayList;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
 
 /**
  * The device set: each device's standing and last sync, a phone retired (removed, then its
@@ -21,7 +16,6 @@ final class DevicesScreen extends Screen {
   private Notice[] open;
   private Membership[] owed;
   private String unread;
-  private final Set<Long> regrouped = new HashSet<>();
 
   DevicesScreen(PersonalActivity app) {
     super(app);
@@ -95,16 +89,6 @@ final class DevicesScreen extends Screen {
       if (device.me) {
         continue;
       }
-      CheckBox pick = check("In a regroup, leave it out", regrouped.contains(device.id));
-      pick.setOnCheckedChangeListener(
-          (box, checked) -> {
-            if (checked) {
-              regrouped.add(device.id);
-            } else {
-              regrouped.remove(device.id);
-            }
-          });
-      into.addView(pick);
       if (device.removed) {
         into.addView(button("Revoke it in your other spaces", v -> revoke(device)));
       } else {
@@ -113,21 +97,15 @@ final class DevicesScreen extends Screen {
     }
     into.addView(
         button(
-            "Regroup without the devices left out",
-            v -> {
-              if (regrouped.isEmpty()) {
-                app.say("Tick the devices to leave out first.");
-                return;
-              }
-              app.ask(
-                  "Regroup",
-                  "The devices left out are removed and your other devices start a new group."
-                      + " Once it matures, each device you keep hands this phone its key"
-                      + " package when it syncs (Sync now there, or its background job);"
-                      + " then tap Commit now here.",
-                  "Regroup",
-                  this::regroup);
-            }));
+            "Regroup on this phone alone",
+            v ->
+                app.ask(
+                    "Regroup",
+                    "Every other device is removed and this phone starts a new group alone. Once"
+                        + " it matures, tap Commit now here; then pair each other device again"
+                        + " from this phone.",
+                    "Regroup",
+                    this::regroup)));
   }
 
   private void operations(LinearLayout into) {
@@ -292,18 +270,10 @@ final class DevicesScreen extends Screen {
   }
 
   private void regroup() {
-    long[] remove = new long[regrouped.size()];
-    List<Long> ids = new ArrayList<>(regrouped);
-    for (int i = 0; i < remove.length; i++) {
-      remove[i] = ids.get(i);
-    }
     app.run(
         "Regrouping…",
-        (personal, prompts, refused) -> personal.regroup(remove, prompts, refused),
-        posted -> {
-          regrouped.clear();
-          taken(posted);
-        });
+        (personal, prompts, refused) -> personal.regroup(prompts, refused),
+        this::taken);
   }
 
   private void taken(Posted posted) {

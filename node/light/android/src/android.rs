@@ -641,22 +641,15 @@ natives! {
         made(env, &posted)
     }
 
-    op fn Java_team_virto_s4_vos_VosNode_nativeRegroup(remove: JLongArray<'l>, lent: JObject<'l>) -> JObject<'l>, |env, node| {
-        let remove = longs(env, &remove)?.into_iter().map(word).collect::<Result<Vec<_>, _>>()?;
+    op fn Java_team_virto_s4_vos_VosNode_nativeRegroup(lent: JObject<'l>) -> JObject<'l>, |env, node| {
         let lent = prompts(env, &lent)?;
-        let posted = node.personal()?.regroup(&*lent, remove)?;
+        let posted = node.personal()?.regroup(&*lent)?;
         made(env, &posted)
     }
 
     op fn Java_team_virto_s4_vos_VosNode_nativeUpdate(lent: JObject<'l>) -> jboolean, |env, node| {
         let lent = prompts(env, &lent)?;
         node.personal()?.update(&*lent)?;
-        Ok(true)
-    }
-
-    op fn Java_team_virto_s4_vos_VosNode_nativeRenew(lent: JObject<'l>) -> jboolean, |env, node| {
-        let lent = prompts(env, &lent)?;
-        node.personal()?.renew(&*lent)?;
         Ok(true)
     }
 
@@ -676,8 +669,8 @@ natives! {
     op fn Java_team_virto_s4_vos_VosNode_nativeMoveHome(request: JObject<'l>, lent: JObject<'l>) -> JObject<'l>, |env, node| {
         let request = Claim::from_java(env, &request)?;
         let lent = prompts(env, &lent)?;
-        let moved = node.personal()?.move_home(&*lent, request)?;
-        made(env, &moved)
+        let claimed = node.personal()?.move_home(&*lent, request)?;
+        made(env, &claimed)
     }
 }
 

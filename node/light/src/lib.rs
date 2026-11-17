@@ -27,19 +27,15 @@
 //!   confirmed epoch, and the recovery envelopes under `R`; over the onion
 //!   alone.
 //! - **The home** ([`home`]): the open claim's work, the device's
-//!   nullifier in the home's scope, that scope reserved for the claim and
-//!   its re-proofs, the claim of a personal agent (refused on a device
-//!   that holds one's archive) and the yearly re-proof.
+//!   nullifier in the home's scope, that scope reserved for the claim, and
+//!   the claim of a personal agent (refused on a device that holds one's
+//!   archive).
 //! - **Pairing** ([`pairing`]): a new device joined through a pairing
 //!   slot's inbox over Noise `XXpsk3`, the QR code carrying the slot and
-//!   the pre-shared code; the archive, `R` and the checkpoints handed over
-//!   on the channel.
+//!   the pre-shared code; the archive and `R` handed over on the channel.
 //! - **Memberships** ([`memberships`]): a new device enrolled in every
 //!   other space by another of the person's devices, each deferrable,
 //!   confirmed by its own proof; a retired one revoked.
-//! - **Moving home** ([`moving`]): an agent claimed at another home, a
-//!   new group there, the kit split anew, every node carried; the other
-//!   devices paired again, each carrying what the new home lacks.
 //! - **The recovery kit** ([`kit`]): a phrase or a security key's 32
 //!   bytes, the kit's signing and sealing keys, and `R = R1 ⊕ R2` split
 //!   across the kit and the agent.
@@ -102,7 +98,6 @@ mod kernel;
 pub mod kit;
 mod light;
 pub mod memberships;
-pub mod moving;
 pub mod pairing;
 pub mod personal;
 mod prover;
@@ -214,7 +209,7 @@ pub enum DeviceError {
     /// again, or another replica.
     Unavailable,
     /// A proof in the home's reserved scope for a call that is not its
-    /// claim or re-proof (`light-node.md` §3.3).
+    /// claim (`light-node.md` §3.3).
     Reserved,
     /// The node's ingress refused the request, before its agent saw it:
     /// why, as the node said (an admission the agent asks, a stale query, a
@@ -232,7 +227,7 @@ impl core::fmt::Display for DeviceError {
             DeviceError::Decode => "the answer does not decode",
             DeviceError::Verify => "the proof does not verify",
             DeviceError::Unavailable => "the node holds the space's programs not yet: ask again",
-            DeviceError::Reserved => "the home's scope proves only its claim and re-proofs",
+            DeviceError::Reserved => "the home's scope proves only its claim",
             DeviceError::Rejected(rejection) => {
                 return write!(f, "the node's ingress refused the request: {rejection:?}");
             }

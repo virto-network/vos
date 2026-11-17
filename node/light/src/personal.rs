@@ -30,13 +30,6 @@
 //!   kit's copy never lags: what a kit reads ([`open_recovery`],
 //!   [`recover`]) after a restore releases `R2`. A new `R` seals the whole
 //!   archive again.
-//! - **Reading back** ([`read_back`]): a restored device reading a scope
-//!   of the agent it restored at with the archive it recovered, before any
-//!   group of its own.
-//! - **Carrying** ([`SealedSync::carry`]): every node of a scope the agent
-//!   lacks, pushed in causal order: a move's to its new home, and a device
-//!   paired again there carrying what the move did not; and the notice a
-//!   move leaves at the home it left ([`SealedSync::announce`]).
 //! - **Tor only** (E17): a link names its [`Route`], and every request is
 //!   refused before it leaves unless the route is the onion, so the light
 //!   node has no clearnet route for any kind addressed to the personal
@@ -66,12 +59,6 @@ use crate::sealed::{self, Body, MAX_BODY, OpenError, View};
 use crate::sync::{Blake2b256, Held, Quarantined};
 use merkle_crdt::Hasher as _;
 
-mod carry;
-mod checkpoint;
-
-pub use carry::Carried;
-pub use checkpoint::{Acknowledging, checkpoint_hash};
-
 /// The envelopes a push sends in one round trip, in flight at once.
 pub const PIPELINE: usize = 16;
 
@@ -81,10 +68,6 @@ const WAKES: usize = 8;
 /// The name the archive's scope derives from, apart from every instance's
 /// (four bytes).
 pub const ARCHIVE_NAME: &[u8] = b"vos/personal/archive";
-
-/// The prefix of every row of sealed sync with one agent, in the group
-/// keyspace: a move deletes them all.
-pub(crate) const SYNC_ROWS: &[u8] = b"s/";
 
 /// The rows of the archive's and the recovery scope's reading, in the
 /// group keyspace: each one's cursor and the epoch read or pushed there.
@@ -194,9 +177,6 @@ pub enum SyncError<E> {
     TooLarge {
         seq: u64,
     },
-    /// No checkpoint at the scope's cursor: it has read nothing yet, or
-    /// holds nodes whose parents it has not read.
-    Incomplete,
 }
 
 impl<E> From<GroupError> for SyncError<E> {
@@ -231,7 +211,6 @@ impl<E: core::fmt::Debug> std::fmt::Display for SyncError<E> {
             SyncError::Disordered => f.write_str("a page out of order"),
             SyncError::Unanswered => f.write_str("a push the link did not answer"),
             SyncError::TooLarge { seq } => write!(f, "node {seq} does not fit an envelope"),
-            SyncError::Incomplete => f.write_str("the scope's causal past is not complete"),
         }
     }
 }
@@ -259,10 +238,6 @@ pub enum Waiting {
     /// The agent's page skips this position ([`Alarm::Withheld`]): read
     /// again.
     Withheld(u64),
-    /// A move's claim waits beside this group ([`crate::moving::Move`]): its
-    /// keys named what it carries, so nothing more is read here; the scope
-    /// is read at the new home once the move starts its group there.
-    Moving,
 }
 
 /// Why an envelope read was passed over.
@@ -316,8 +291,6 @@ pub struct Caught {
     pub waiting: Option<Waiting>,
     /// What the reading detected (§8, B3, B4, B19, A7).
     pub alarms: Vec<Alarm>,
-    /// The checkpoint the scope started from, at its position.
-    pub started: Option<u64>,
 }
 
 impl Caught {
@@ -529,70 +502,6 @@ pub fn recover(
     open_recovery(&r, agent, envelopes)
 }
 
-/// Read `instance`'s scope at the agent whose identity is `agent` over
-/// `link` from its start, every envelope opened under `archive`'s keys of
-/// its epoch and its node applied, no cursor stored: a restored device
-/// reading its old scopes with the archive it recovered, before any group
-/// of its own. Envelopes that do not open are passed over.
-pub fn read_back<L: Link>(
-    light: &Light,
-    archive: &Archive,
-    agent: &[u8; 32],
-    link: &mut L,
-    instance: InstanceId,
-) -> Result<Caught, SyncError<L::Error>> {
-    if link.route() != Route::Onion {
-        return Err(SyncError::Clearnet);
-    }
-    let scope = light.scope_id(instance)?.0;
-    let mut caught = Caught::default();
-    let mut from = 0;
-    loop {
-        if link.route() != Route::Onion {
-            return Err(SyncError::Clearnet);
-        }
-        let page = link
-            .since(scope, from)
-            .map_err(SyncError::Link)?
-            .map_err(SyncError::Refused)?;
-        if page.is_empty() {
-            return Ok(caught);
-        }
-        let mut nodes = Vec::with_capacity(page.len());
-        for envelope in page {
-            if envelope.position <= from {
-                return Err(SyncError::Disordered);
-            }
-            from = envelope.position;
-            caught.envelopes += 1;
-            caught.bytes += envelope.bytes.len();
-            let why = match sealed::header_of(&envelope.bytes) {
-                _ if envelope_id(&envelope.bytes) != envelope.id => Unusable::Id,
-                Err(error) => Unusable::Opened(error),
-                Ok(header) if header.scope != scope => Unusable::Scope,
-                Ok(header) => {
-                    let keys = Zeroizing::new(archive.keys(header.epoch, &scope).to_vec());
-                    match sealed::open(&keys, agent, &envelope.bytes) {
-                        Ok((_, body)) => match Body::decode_exact(&body) {
-                            Some(body) => {
-                                nodes.push(body.node);
-                                continue;
-                            }
-                            None => Unusable::Body,
-                        },
-                        Err(error) => Unusable::Opened(error),
-                    }
-                }
-            };
-            caught.passed.push(Passed {
-                position: envelope.position,
-                why,
-            });
-        }
-        caught.absorb(light.ingest(instance, nodes, None)?);
-    }
-}
-
 /// The archive scope's reading, stored: its cursor, and the confirmed
 /// epoch and the digest of the archive the agent is known to hold for it,
 /// this device's own or one it read.
@@ -646,10 +555,6 @@ impl<'a, L: Link> SealedSync<'a, L> {
 
     pub fn group(&mut self) -> &mut DeviceGroup {
         self.group
-    }
-
-    pub(crate) fn light(&self) -> &Light {
-        self.light
     }
 
     /// The link, for a request: refused unless it still reaches the agent
@@ -858,9 +763,7 @@ impl<'a, L: Link> SealedSync<'a, L> {
     /// Read `instance`'s scope from its cursor to the agent's end: each
     /// page's envelopes opened, their nodes applied and the page's position
     /// stored, in one batch a page. Stops before an envelope it cannot open
-    /// yet ([`Caught::waiting`]). A scope read for the first time starts
-    /// from the checkpoint this device trusts, if there is one
-    /// ([`Caught::started`]).
+    /// yet ([`Caught::waiting`]).
     ///
     /// What the agent serves is checked as it is read (§8, B3, B4, B19,
     /// A7): positions are dense, so one skipped is withheld; epochs never go
@@ -882,14 +785,6 @@ impl<'a, L: Link> SealedSync<'a, L> {
         // epoch.
         drop(Zeroizing::new(self.group.key(scope)?));
         let mut caught = Caught::default();
-        if crate::moving::claiming(self.light.store())? {
-            caught.waiting = Some(Waiting::Moving);
-            return Ok(caught);
-        }
-        if self.light.cursor(instance)?.is_none() {
-            caught.started = self.start(instance, scope, &mut caught.alarms)?;
-            self.keep_alarms(&caught.alarms)?;
-        }
         let mut scan = Scan::new(self.tracked()?);
         loop {
             let from = self.light.cursor(instance)?.unwrap_or(0);
@@ -1047,12 +942,8 @@ impl<'a, L: Link> SealedSync<'a, L> {
         let Some(header) = merkle_crdt::Header::<Blake2b256>::read(&body.node) else {
             return Ok(Err(Unusable::Body));
         };
-        // A device of a group a move left is read as the set's up to the
-        // node the keys of a device of the set name it carried to,
-        // whoever pushed it.
-        let carried = self.carried(scan, scope, &header.author.0, header.seq, position)?;
         let within = match self.group.author(&header.author.0) {
-            None => carried,
+            None => false,
             Some((_, false)) => true,
             Some((device, true)) => {
                 let last = self.last(scan, device, scope)?;
@@ -1067,7 +958,7 @@ impl<'a, L: Link> SealedSync<'a, L> {
                         scan.cut.push(device);
                     }
                 }
-                carried || last.is_some_and(|last| position <= last)
+                last.is_some_and(|last| position <= last)
             }
         };
         if !within {
@@ -1130,58 +1021,14 @@ impl<'a, L: Link> SealedSync<'a, L> {
             .map(|(_, last)| *last))
     }
 
-    /// Whether the node numbered `seq` by `author` at `scope`'s `position`
-    /// was carried by a move: one the keys of a device of the set name up
-    /// to a number past it (`NewDevice::carried`, as the log holds them),
-    /// while that device has a voice, and after its removal only at
-    /// positions up to its frontier.
-    fn carried(
-        &mut self,
-        scan: &mut Scan,
-        scope: Scope,
-        author: &[u8; 32],
-        seq: u64,
-        position: u64,
-    ) -> Result<bool, SyncError<L::Error>> {
-        for (through, removed) in self.group.carriers(author, &scope) {
-            if seq > through {
-                continue;
-            }
-            match removed {
-                None => return Ok(true),
-                Some(carrier) => {
-                    if self
-                        .last(scan, carrier, scope)?
-                        .is_some_and(|last| position <= last)
-                    {
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-        Ok(false)
-    }
-
-    /// The number up to which `author`'s nodes in `scope` were carried, as
-    /// the keys of a device of the set with a voice name it.
-    fn carried_through(&self, author: &[u8; 32], scope: &Scope) -> Option<u64> {
-        self.group
-            .carriers(author, scope)
-            .into_iter()
-            .filter(|(_, removed)| removed.is_none())
-            .map(|(through, _)| through)
-            .max()
-    }
-
     /// Cut a removed device's author off in `instance`'s scope, one past its
     /// node at its frontier, the position of its last envelope there that
     /// the agent took: from 0 when it has none there; from the node's
     /// number plus one when `removed` is that node, or when this device
     /// read it before; from `removed`'s own number when it is past the
     /// frontier and the node there was not read, an upper bound a lower
-    /// cutoff replaces, as when the node there is another author's (one it
-    /// carried). Never below one past what a move carried of it. Whether it
-    /// was cut off; not yet, while the frontier's node is ahead. So the
+    /// cutoff replaces. Whether it was cut off; not yet, while the
+    /// frontier's node is ahead. So the
     /// frontier the agent's log gives is the one source of a removed
     /// author's cutoff, which filters its entries at read and quarantines
     /// its later operations at ingest.
@@ -1216,12 +1063,9 @@ impl<'a, L: Link> SealedSync<'a, L> {
                 None => None,
             },
         };
-        let Some(mut from) = from else {
+        let Some(from) = from else {
             return Ok(false);
         };
-        if let Some(through) = self.carried_through(&removed.author.0, &scope) {
-            from = from.max(through.saturating_add(1));
-        }
         self.light.cut_off(instance, removed.author, from)?;
         Ok(true)
     }
@@ -1488,11 +1332,8 @@ impl<'a, L: Link> SealedSync<'a, L> {
     /// and nothing while the log names an `R` this device does not hold
     /// yet: a removed device may hold the one before; a new `R` reads the
     /// scope again from its start and pushes the whole archive under it.
-    /// Nothing while a move is held here.
     pub fn recovery(&mut self) -> Result<Kept, SyncError<L::Error>> {
-        // A move pushes its recovery envelopes last, once it carried
-        // everything ([`crate::moving::finish`]).
-        if !self.group.holds_recovery() || crate::moving::moving(self.light.store())? {
+        if !self.group.holds_recovery() {
             return Ok(Kept::default());
         }
         let Some((since, key)) = self

@@ -9,9 +9,9 @@
 //! head and batch time checked; each scope's queued operations pushed and
 //! its envelopes read by its cursor, the log followed again where a push or
 //! a page waits for an epoch, the archive read where a page waits for a
-//! key; the archive and the recovery envelopes kept; each scope's
-//! checkpoints acknowledged and a sample of its own pushes audited; the
-//! device set read for each device's last call.
+//! key; the archive and the recovery envelopes kept; a sample of each
+//! scope's own pushes audited; the device set read for each device's last
+//! call.
 //!
 //! **A pass killed at any point leaves the store consistent:** every
 //! change it makes is one of the device group's or sealed sync's batches,
@@ -30,7 +30,7 @@
 //! **What the chrome raises** ([`Pass::notices`]): the device set's open
 //! operations, each a local notification while it can be vetoed; a
 //! pending restore; this device's removal, and that it cannot follow, for
-//! as long as either holds; the yearly re-proof; and every alarm kept,
+//! as long as either holds; and every alarm kept,
 //! from the batch that consumed its evidence until the chrome, its user
 //! having seen it, acknowledges it ([`DeviceGroup::acknowledge`]): a pass
 //! killed or stopped after an alarm loses none.
@@ -45,7 +45,6 @@ use vos_wire::personal::{
 };
 
 use crate::group::{self, Alarm, DeviceGroup, Event, Open};
-use crate::home;
 use crate::light::Light;
 use crate::personal::{Answer, Link, SealedSync, SyncError, Waiting};
 use crate::route::Route;
@@ -170,8 +169,6 @@ pub enum Notice {
     /// This device cannot follow the confirmed epoch: it re-pairs, or
     /// regroups.
     Stuck,
-    /// The yearly re-proof and the leaf's update are due.
-    Renew,
     Alarm(Alarm),
 }
 
@@ -229,9 +226,8 @@ pub struct Pass {
     /// Each device's last call the agent took, by its batch time (0 before
     /// any).
     pub seen: Vec<(DeviceId, u64)>,
-    /// The agent's batch time, and whether the yearly re-proof is due.
+    /// The agent's batch time.
     pub at: u64,
-    pub renew: bool,
     /// Where the device is after the pass.
     pub course: group::Course,
 }
@@ -263,9 +259,6 @@ impl Pass {
             group::Course::Out => notices.push(Notice::Removed),
             group::Course::Stuck { .. } => notices.push(Notice::Stuck),
             group::Course::Following => {}
-        }
-        if self.renew {
-            notices.push(Notice::Renew);
         }
         notices.extend(self.alarms.iter().copied().map(Notice::Alarm));
         notices
@@ -359,13 +352,6 @@ fn passing<L: Control>(
     if let Some(alarm) = group::clock(now, overview.at) {
         pass.raise(alarm);
     }
-    pass.renew = overview.lapsed
-        || home::renewal_due(
-            group,
-            overview.lease_until,
-            group.policy().lease_ms,
-            overview.at,
-        );
     if group.course() == group::Course::Following {
         sealed(light, group, link, instances, pass)?;
     }
@@ -377,7 +363,7 @@ fn passing<L: Control>(
 }
 
 /// The scopes pushed and read, the archive and the recovery envelopes
-/// kept, the checkpoints acknowledged and one own push audited.
+/// kept, and one own push audited.
 fn sealed<L: Control>(
     light: &Light,
     group: &mut DeviceGroup,
@@ -390,10 +376,9 @@ fn sealed<L: Control>(
     }
     keep(light, group, link, instances, pass)?;
     for instance in instances {
-        let mut sync = SealedSync::new(light, group, link, instances.to_vec())?;
-        let acknowledging = sync.acknowledge(*instance)?;
-        let audited = sync.audit(*instance, AUDIT_SAMPLE)?;
-        for alarm in acknowledging.alarms.into_iter().chain(audited.alarms) {
+        let audited = SealedSync::new(light, group, link, instances.to_vec())?
+            .audit(*instance, AUDIT_SAMPLE)?;
+        for alarm in audited.alarms {
             pass.raise(alarm);
         }
     }
@@ -567,7 +552,6 @@ fn scope<L: Control>(
             // Read again once: a page withheld twice waits for the next pass.
             Some(Waiting::Withheld(_)) if withheld => break,
             Some(Waiting::Withheld(_)) => withheld = true,
-            Some(Waiting::Moving) => break,
         }
     }
     if let Some(waiting) = waiting {

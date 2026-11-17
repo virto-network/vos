@@ -13,14 +13,14 @@
 //! - **The handshake:** the joiner scans the code ([`Joiner::scan`]) and
 //!   leaves the second message in the slot under the slot key; the opener
 //!   answers with the third, carrying its [`Offer`]: the home, which the
-//!   joiner's "home" nullifier and its open claim are of, and the user's
-//!   other memberships, which it is enrolled in.
+//!   joiner's "home" nullifier is of, and the user's other memberships,
+//!   which it is enrolled in.
 //! - **Over the channel:** the joiner sends its [`Hello`] (its keys, its
 //!   nullifier, its key package, its handles in the offered spaces); the
 //!   opener pairs it ([`crate::group::DeviceGroup::pair`]) and hands over
-//!   the [`crate::group::Pairing`] (the log as it verified it, the key
-//!   archive with the naming secret and `R`, and its newest checkpoint per
-//!   scope), in as many items as it takes; the joiner acknowledges it by
+//!   the [`crate::group::Pairing`] (the log as it verified it, and the key
+//!   archive with the naming secret and `R`), in as many items as it
+//!   takes; the joiner acknowledges it by
 //!   its hash. Only then does the opener make the commit adding the joiner,
 //!   which closes the slot and deletes its items.
 //!

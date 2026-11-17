@@ -240,7 +240,7 @@ fn a_pass_with_nothing_new_reads_little() {
         "quiet pass: {} requests, {} bytes of answers",
         quiet.requests, quiet.down
     );
-    assert_eq!(quiet.requests, 7);
+    assert_eq!(quiet.requests, 6);
     assert!(quiet.down < 1 << 10, "{} bytes", quiet.down);
 }
 

@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 
 use proptest::prelude::*;
 use vos_wire::personal::{
-    DeviceView, NewAdmin, Op, OpState, Operation, RECOVERY, RecoveryView, Signer, Standing,
+    DeviceView, NewAdmin, Op, OpState, Operation, RECOVERY, RecoveryView, Signer, Standing, Status,
 };
 
 use super::*;
@@ -103,7 +103,6 @@ enum Theft {
     },
     Regroup {
         who: u8,
-        mask: u8,
     },
     Add {
         who: u8,
@@ -127,7 +126,7 @@ fn theft() -> impl Strategy<Value = Theft> {
             .prop_map(|(who, pick, upheld)| Theft::Resolve { who, pick, upheld }),
         1 => (who, pick).prop_map(|(who, pick)| Theft::Replace { who, pick }),
         1 => who.prop_map(|who| Theft::Rotate { who }),
-        1 => (who, any::<u8>()).prop_map(|(who, mask)| Theft::Regroup { who, mask }),
+        1 => who.prop_map(|who| Theft::Regroup { who }),
         1 => who.prop_map(|who| Theft::Add { who }),
         1 => who.prop_map(|who| Theft::Alive { who }),
         3 => (1u16..180).prop_map(Theft::Pass),
@@ -215,7 +214,7 @@ impl Game {
             | Theft::Resolve { who, .. }
             | Theft::Replace { who, .. }
             | Theft::Rotate { who }
-            | Theft::Regroup { who, .. }
+            | Theft::Regroup { who }
             | Theft::Add { who }
             | Theft::Alive { who } => who,
         };
@@ -225,10 +224,8 @@ impl Game {
         };
         let keys = device_keys(id);
         let admin = Principal::Client(keys.admin);
-        let all: Vec<DeviceId> = devices(&self.home, self.reader())
-            .into_iter()
-            .map(|view| view.id)
-            .collect();
+        let views = devices(&self.home, self.reader());
+        let all: Vec<DeviceId> = views.iter().map(|view| view.id).collect();
         let device_at = |pick: u8| all[pick as usize % all.len()];
         let _ = match *theft {
             Theft::Remove { pick, .. } => self.home.operate(admin, "remove", device_at(pick)),
@@ -265,11 +262,12 @@ impl Game {
                 }
                 index
             }
-            Theft::Regroup { mask, .. } => {
-                let named: Vec<DeviceId> = all
+            Theft::Regroup { .. } => {
+                // A regroup names every other live device.
+                let named: Vec<DeviceId> = views
                     .iter()
-                    .copied()
-                    .filter(|id| mask & (1 << (id % 8)) != 0)
+                    .filter(|view| view.id != id && view.device.status == Status::Live)
+                    .map(|view| view.id)
                     .collect();
                 self.home.operate(admin, "regroup", named)
             }

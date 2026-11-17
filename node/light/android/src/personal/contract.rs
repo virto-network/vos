@@ -24,14 +24,11 @@ pub const ACTION: &str = "team.virto.vos.personal.IVosPersonal";
 
 /// A device's label, at most this many bytes (`vos_wire::books::LABEL_BYTES`).
 pub const MAX_LABEL: usize = 64;
-/// The most devices one regroup names.
-pub const MAX_REGROUP: usize = 16;
 
 byte_enum! {
     package "team.virto.vos.personal";
     /// What a local notification raises: a pending operation of the device
-    /// set, a pending restore, this device's removal, the yearly re-proof,
-    /// or an alarm.
+    /// set, a pending restore, this device's removal, or an alarm.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
     pub enum Pending {
         /// A device added by a delayed admin.
@@ -41,7 +38,7 @@ byte_enum! {
         Replace = 2 as REPLACE,
         /// The recovery kit replaced.
         Rotate = 3 as ROTATE,
-        /// The devices named removed and a new group started.
+        /// Every other device removed and a new group started by one alone.
         Regroup = 4 as REGROUP,
         /// Every device removed by the kit's restore, signed by the kit.
         Restore = 5 as RESTORE,
@@ -49,8 +46,6 @@ byte_enum! {
         Restoring = 6 as RESTORING,
         /// This device is out of its group.
         Removed = 7 as REMOVED,
-        /// The yearly re-proof is due.
-        Renew = 8 as RENEW,
         /// The personal space raised an alarm: `detail` names it.
         Alarm = 9 as ALARM,
         /// This device cannot follow its group: it re-pairs, or regroups.
@@ -151,8 +146,8 @@ parcel! {
         pub label: String => String,
     }
 
-    /// A claim's (or a restore's) result: the agent, and this device's id
-    /// in its set.
+    /// A claim's (or a restore's, or a move's) result: the agent, and this
+    /// device's id in its set.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct Claimed {
         pub agent: u32 => long,
@@ -207,14 +202,6 @@ parcel! {
     pub struct Posted {
         pub index: u64 => long,
         pub at: u64 => long,
-    }
-
-    /// `move_home`'s result: the new agent, and the envelopes carried
-    /// there.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct Moved {
-        pub agent: u32 => long,
-        pub carried: u64 => long,
     }
 }
 

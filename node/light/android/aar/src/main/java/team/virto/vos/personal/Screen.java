@@ -9,7 +9,6 @@ import android.text.InputType;
 import android.text.TextWatcher;
 import android.view.View;
 import android.widget.Button;
-import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.RadioButton;
@@ -148,13 +147,6 @@ abstract class Screen {
     }
     field.setInputType(type);
     return field;
-  }
-
-  final CheckBox check(String label, boolean checked) {
-    CheckBox box = new CheckBox(app);
-    box.setText(label);
-    box.setChecked(checked);
-    return box;
   }
 
   interface KeepKind {

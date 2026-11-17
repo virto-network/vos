@@ -352,8 +352,8 @@ impl Personal {
         self.open_operation(now, call, by, Op::Rotate(kit))
     }
 
-    /// Regroup, signed by a seasoned device: the devices of `remove`
-    /// removed and a new group started with the rest.
+    /// Regroup, signed by a seasoned device: every other live device, each
+    /// named in `remove`, removed and a new group started by it alone.
     #[msg(gas = 40_000_000)]
     pub async fn regroup(
         &mut self,
@@ -514,7 +514,6 @@ impl Personal {
             Some(_) if self.live_devices() >= devices::DEVICES => {
                 return Err(PersonalError::Devices);
             }
-            Some(added) if !added.bounded() => return Err(PersonalError::Malformed),
             Some(added) => {
                 let carries = self.ready_add(added);
                 let committer = self.devices.get(&by).ok_or(PersonalError::UnknownDevice)?;

@@ -410,7 +410,6 @@ pub(crate) fn notice(raised: vos_light::job::Notice) -> Notice {
         Found::Restore => plain(Pending::Restoring),
         Found::Removed => plain(Pending::Removed),
         Found::Stuck => plain(Pending::Stuck),
-        Found::Renew => plain(Pending::Renew),
         Found::Alarm(alarm) => Notice {
             detail: described(&alarm),
             ..plain(Pending::Alarm)
@@ -461,9 +460,6 @@ pub(crate) fn described(alarm: &Alarm) -> String {
         }
         Alarm::Deleted { scope, position } => {
             format!("this device's {scope:?} at {position} is gone: pushed again")
-        }
-        Alarm::Checkpoint { scope, position } => {
-            format!("a checkpoint of {scope:?} at {position} is not this device's reading")
         }
         Alarm::Unserved { next } => {
             format!("the agent named its log's head at {next} and served less of it")

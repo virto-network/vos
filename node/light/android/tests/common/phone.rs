@@ -186,15 +186,10 @@ pub struct Held {
 
 /// The facility of the phone tagged `tag` under `directory`.
 pub fn node_as(world: &Arc<World>, directory: &std::path::Path, tag: u8) -> Node {
-    let node = node_over(world.dial_as(tag), directory, Arc::new(Phone));
-    // A personal space in need of repair has no delay to set.
-    if let Ok(space) = node.space() {
-        space.set_claim_delay(0..0);
-    }
-    node
+    node_over(world.dial_as(tag), directory, Arc::new(Phone))
 }
 
-/// A phone whose open claim after a pairing is due at its next pass.
+/// A phone of the world tagged `seed`, under a directory of its own.
 pub fn phone(world: &Arc<World>, seed: u8) -> Held {
     let directory = tempfile::tempdir().unwrap();
     Held {

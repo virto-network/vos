@@ -81,8 +81,6 @@ public final class Words {
         return "A restore is pending: rotate your recovery kit";
       case Pending.REMOVED:
         return "This device was removed";
-      case Pending.RENEW:
-        return "The yearly re-proof is due";
       case Pending.STUCK:
         return "This device cannot follow the others: pair it again";
       default:

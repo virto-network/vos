@@ -5,8 +5,8 @@
 //! admin-key replacement, a delayed admin's add and a regroup.
 
 use vos_wire::personal::{
-    AdminClass, Attestation, Body, CARRIED, Cancel, CarriedAuthor, DeviceView, Entry, NewAdmin,
-    OpState, RECOVERY, RecoveryView, Standing, Verdict, Void,
+    AdminClass, Attestation, Body, Cancel, DeviceView, Entry, NewAdmin, OpState, RECOVERY,
+    RecoveryView, Standing, Verdict, Void,
 };
 
 use super::*;
@@ -598,16 +598,18 @@ fn a_delayed_admins_add_waits_then_a_commit_carries_it() {
     assert_eq!(state(&home, sync(0), contested), OpState::Contested);
 }
 
-/// A24: a regroup by a seasoned device waits and is vetoable as a removal
-/// is, and is immediate with the kit's second signature: the devices it
-/// names removed, and the pending candidate, the old group's, void.
+/// A24: a regroup by a seasoned device names every other live device,
+/// waits and is vetoable as a removal is, and is immediate with the kit's
+/// second signature: every other device removed, one paired while it was
+/// open too, its signer alone kept, and the pending candidate, the old
+/// group's, void.
 #[test]
-fn a_regroup_removes_the_devices_it_names_and_starts_a_new_group() {
+fn a_regroup_removes_every_other_device_and_starts_a_new_group() {
     let mut home = seasoned(3);
     home.pair(0, 3);
     home.pass(3 * MINUTE);
     assert_eq!(
-        home.operate(admin(3), "regroup", vec![2u32]),
+        home.operate(admin(3), "regroup", vec![0u32, 1, 2]),
         Err(PersonalError::Unseasoned)
     );
     assert_eq!(
@@ -618,14 +620,23 @@ fn a_regroup_removes_the_devices_it_names_and_starts_a_new_group() {
         home.operate(KIT, "regroup", vec![2u32]),
         Err(PersonalError::NotSigner)
     );
-    let regroup = home.operate(admin(0), "regroup", vec![2u32]).unwrap();
+    assert_eq!(
+        home.operate(admin(0), "regroup", vec![2u32]),
+        Err(PersonalError::Malformed),
+        "it keeps its signer alone"
+    );
+    let regroup = home.operate(admin(0), "regroup", vec![1u32, 2, 3]).unwrap();
     home.operate(admin(2), "veto", regroup).unwrap();
     assert_eq!(state(&home, sync(0), regroup), OpState::Contested);
+    home.pair(0, 4);
     let epoch = home.overview().confirmed + 1;
     let candidacy: Candidacy = home.call(admin(1), "commit", update(epoch, 4)).unwrap();
     home.operate(KIT, "cosign", regroup).unwrap();
     assert!(matured(state(&home, sync(0), regroup)));
-    assert_eq!(standing(&home, sync(0), 2), Standing::Removed);
+    for id in 1..=4 {
+        assert_eq!(standing(&home, sync(0), id), Standing::Removed, "{id}");
+    }
+    assert_ne!(standing(&home, sync(0), 0), Standing::Removed);
     assert_eq!(home.overview().candidate, None);
     let entries: Vec<(u64, Entry)> = home.query(sync(0), "log", candidacy.index).unwrap();
     assert!(entries.iter().any(|(_, entry)| entry.body
@@ -643,7 +654,9 @@ fn a_removed_devices_vetoes_and_operations_count_no_more() {
     let mut home = seasoned(3);
     let owners = home.operate(admin(0), "remove", 1u32).unwrap();
     home.operate(admin(2), "veto", owners).unwrap();
-    let thiefs = home.operate(admin(2), "regroup", vec![1u32]).unwrap();
+    let thiefs = home
+        .operate(admin(2), "replace", (1u32, new_admin(1)))
+        .unwrap();
     home.operate(admin(1), "veto", thiefs).unwrap();
     home.pass(5 * MINUTE);
     let removal = home.operate(admin(0), "remove", 2u32).unwrap();
@@ -874,7 +887,7 @@ fn a_call_refuses_while_operations_are_left_due_and_wake_settles_them() {
 #[test]
 fn a_regroup_and_its_targets_removal_of_its_signer_are_one_contest() {
     let mut home = seasoned(3);
-    let regroup = home.operate(admin(0), "regroup", vec![1u32]).unwrap();
+    let regroup = home.operate(admin(0), "regroup", vec![1u32, 2]).unwrap();
     let removal = home.operate(admin(1), "remove", 0u32).unwrap();
     for index in [regroup, removal] {
         assert_eq!(state(&home, sync(2), index), OpState::Contested);
@@ -1028,36 +1041,5 @@ fn the_released_r2_is_deleted_at_the_restored_devices_first_commit() {
     assert_eq!(
         released.from, pushed.position,
         "the kit reads what follows the re-seal"
-    );
-}
-
-/// A device's keys name at most `CARRIED` carried authors: an add, by
-/// commit or by operation, naming more is malformed.
-#[test]
-fn a_device_naming_too_many_carried_authors_is_refused() {
-    let mut home = seasoned(2);
-    let crowded = NewDevice {
-        carried: (0..=CARRIED as u64)
-            .map(|through| CarriedAuthor {
-                author: [9; 32],
-                scope: scope(1),
-                through,
-            })
-            .collect(),
-        ..device(4)
-    };
-    let effect = Effect {
-        add: Some(crowded.clone()),
-        remove: Vec::new(),
-        rekey: None,
-    };
-    let epoch = home.overview().confirmed + 1;
-    assert_eq!(
-        home.call::<Candidacy>(admin(0), "commit", commit(epoch, effect, vec![4; 600])),
-        Err(PersonalError::Malformed)
-    );
-    assert_eq!(
-        home.operate(admin(0), "add", crowded),
-        Err(PersonalError::Malformed)
     );
 }

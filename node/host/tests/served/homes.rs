@@ -6,8 +6,7 @@
 //! it, and assigned by `Personal`'s answer across agents; a member joining
 //! by the open claim, its work found by the device library, and claiming
 //! the agent the keeper tops the pool up with; a double claim
-//! refused at `Homes`; the scope "home" proving nothing but a claim and a
-//! re-proof; and the keeper's upgrade across the pool in batches, stopping
+//! refused at `Homes`; the scope "home" proving nothing but a claim; and the keeper's upgrade across the pool in batches, stopping
 //! at the batch an install refuses.
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -67,12 +66,10 @@ pub(crate) fn witness(path: &Path) -> AuthWitness {
     }
 }
 
-/// The home: its agent, the keeper's client there, the space, its handle
-/// and the stock `auth` kernel's program. Another home on the same nodes
-/// shares their cluster ([`Founded::beside`]).
+/// The home: its agent, the keeper's client there, the space and the
+/// stock `auth` kernel's program.
 pub(crate) struct Founded {
     pub(crate) cluster: Arc<Cluster>,
-    pub(crate) handle: [u8; 32],
     pub(crate) agent: AgentId,
     pub(crate) space: SpaceId,
     caller: Mutex<Client>,
@@ -88,13 +85,6 @@ impl Founded {
     pub(crate) fn with(policy: Policy) -> Self {
         let cluster = Cluster::founded(SEED, Some(WindowClock::DEFAULT));
         Self::on(Arc::new(cluster), HANDLE, policy)
-    }
-
-    /// Another home on this home's nodes, in their one space: its own
-    /// agent holding a credential actor whose handle is `handle`, and
-    /// `Homes` configured with `policy`.
-    pub(crate) fn beside(&self, handle: [u8; 32], policy: Policy) -> Self {
-        Self::on(Arc::clone(&self.cluster), handle, policy)
     }
 
     fn on(cluster: Arc<Cluster>, handle: [u8; 32], policy: Policy) -> Self {
@@ -138,7 +128,6 @@ impl Founded {
         let device = vos_light::release::device(&credentials, "auth").expect("the stock kernel");
         let founded = Self {
             cluster,
-            handle,
             agent,
             space,
             caller: Mutex::new(caller),
@@ -254,7 +243,6 @@ impl Founded {
             },
             nullifier: vos_light::home::nullifier(&secret(n), &self.space.0, self.agent.0, HOMES.0),
             label: vec![1; 24],
-            carried: Vec::new(),
         }
     }
 
@@ -459,7 +447,7 @@ fn a_pool_of_200_is_made_by_the_keeper_and_claimed() {
         home.claim(&prover, 0, &paths[0], kit(1_000), agent),
         Err(HomesError::Claimed)
     );
-    // The scope "home" proves a claim and a re-proof alone.
+    // The scope "home" proves a claim alone.
     let other = home.call("stock", vec![1u32], 1_001);
     assert_eq!(
         prover
@@ -468,12 +456,12 @@ fn a_pool_of_200_is_made_by_the_keeper_and_claimed() {
         Some(DeviceError::Reserved)
     );
     let renew = home.call("renew", claimed[1], 1_002);
-    assert_eq!(
-        prover
-            .prove_auth(&secret(1), &witness(&paths[1]), b"home", &renew, &home.auth)
-            .err(),
-        Some(DeviceError::Reserved)
-    );
+    for proved in [
+        prover.prove_home(&secret(1), &witness(&paths[1]), &renew, &home.auth),
+        prover.prove_auth(&secret(1), &witness(&paths[1]), b"home", &renew, &home.auth),
+    ] {
+        assert_eq!(proved.err(), Some(DeviceError::Reserved));
+    }
 
     // The next `Personal` over the pool, 16 at a time; then a program that
     // declares no admission, which every agent's install refuses.

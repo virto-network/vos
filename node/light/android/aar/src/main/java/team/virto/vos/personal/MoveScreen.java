@@ -7,8 +7,9 @@ import android.os.Build;
 import android.widget.LinearLayout;
 
 /**
- * A move home: the personal space carried to another home, with a new kit of the kind chosen
- * (its card names the new home); the other devices pair again with this one after it.
+ * A move home: this phone leaves its home and backs up at another, with a new kit of the kind
+ * chosen (its card names the new home); nothing is carried, and the other devices pair again with
+ * this one after it.
  */
 final class MoveScreen extends Screen {
   private String code = "";
@@ -27,8 +28,9 @@ final class MoveScreen extends Screen {
   void build(LinearLayout into) {
     into.addView(
         text(
-            "Your personal space moves to another home, sealed as before. Your old home keeps a "
-                + "signed notice for your other devices, which then pair again with this phone."));
+            "This phone leaves your home and backs up at another, sealed as before: your devices "
+                + "write their books there again, and nothing else is carried. Then pair each of "
+                + "your other devices again with this phone."));
     into.addView(heading("The new home"));
     HomeField home = new HomeField(into, code, text -> code = text);
     into.addView(heading("The new home's recovery kit"));
@@ -57,13 +59,9 @@ final class MoveScreen extends Screen {
     app.run(
         "Moving your personal space: the open claim's work takes about a minute…",
         (personal, prompts, refused) -> personal.moveHome(request, prompts, refused),
-        (Moved moved) -> {
+        (Claimed claimed) -> {
           app.home();
-          app.say(
-              "Moved: "
-                  + moved.carried
-                  + " sealed envelope(s) carried to the new home. On each of your other devices, "
-                  + "pair again from this phone.");
+          app.say("Moved. On each of your other devices, pair again from this phone.");
         });
   }
 }

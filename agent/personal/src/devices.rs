@@ -337,9 +337,6 @@ impl Personal {
                 if self.lapsed(now) {
                     return Err(PersonalError::Lapsed);
                 }
-                if !keys.bounded() {
-                    return Err(PersonalError::Malformed);
-                }
                 self.fresh(&[keys.sync, keys.admin])
             }
             Op::Remove(target) => {
@@ -377,14 +374,20 @@ impl Personal {
                     }
                     self.live(*device, now)?;
                 }
+                // A regroup keeps its regrouper alone: it names every other
+                // live device.
+                if self
+                    .live
+                    .iter(None)
+                    .any(|(id, ())| id != signer && !named.contains(&id))
+                {
+                    return Err(PersonalError::Malformed);
+                }
                 Ok(())
             }
             Op::Restore { device, kit } => {
                 if matches!(by, Signer::Device(_)) {
                     return Err(PersonalError::NotSigner);
-                }
-                if !device.bounded() {
-                    return Err(PersonalError::Malformed);
                 }
                 self.check_kit(&kit.entries, &[device.sync, device.admin])
             }
@@ -842,9 +845,17 @@ impl Personal {
                     previous: Vec::new(),
                 });
             }
-            Op::Regroup(named) => {
-                for device in named {
-                    self.remove_device(device, index, at, now);
+            Op::Regroup(_) => {
+                // Its regrouper alone stays: every other live device, one
+                // added while it was open too, is removed.
+                let live: Vec<DeviceId> = self
+                    .live
+                    .iter(None)
+                    .map(|(id, ())| id)
+                    .filter(|id| !matches!(operation.by, Signer::Device(by) if by == *id))
+                    .collect();
+                for id in live {
+                    self.remove_device(id, index, at, now);
                 }
                 self.new_group(now);
             }

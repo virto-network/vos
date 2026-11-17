@@ -142,7 +142,7 @@ impl Homes {
         if device.nullifier != nullifier {
             return Err(HomesError::Nullifier);
         }
-        if kit.entries.len() > KIT_ENTRIES || !device.bounded() {
+        if kit.entries.len() > KIT_ENTRIES {
             return Err(HomesError::Malformed);
         }
         let mut keys = BTreeSet::from([device.sync, device.admin]);

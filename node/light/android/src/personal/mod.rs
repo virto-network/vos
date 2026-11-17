@@ -9,22 +9,29 @@
 //!   [`LIGHT`]): the home and the agent it claimed or joined, the secret
 //!   source's key it proves there with, its admin key's public half (the
 //!   key is the UI's, behind a strong biometric), its label. Every group,
-//!   claim, move and pairing row is the light node's, each change one
-//!   batch. The file is versioned ([`STATE_VERSION`]): one this build does
+//!   claim and pairing row is the light node's, each change one batch. The file is versioned ([`STATE_VERSION`]): one this build does
 //!   not read is refused and kept as it is, the personal space named in
 //!   need of repair, sign-in and payments unaffected.
 //! - **What a flow keeps before its step at the agent**: each key the
 //!   moment it is made, and the home and agent the flow takes the group to
 //!   before the call that makes it so; a restart finishes what the store
 //!   shows done ([`Space::open`]), a flow called again resumes what it
-//!   shows held, and the pass finishes what needs no prompt (a carry, an
+//!   shows held, and the pass finishes what needs no prompt (an
 //!   acknowledgement, the credential book).
 //! - **The flows** ([`Space`]'s methods): the claim at a home-only space
 //!   with a phrase or a security-key kit; pairing, as the device that shows
 //!   the code ([`Space::pair_offer`], [`Space::pair_await`]) and as the one
-//!   that scans it ([`Space::pair_join`], which also re-pairs after a move);
-//!   the memberships a pairing leaves; the device set's operations; the
-//!   yearly re-proof; a restore from the kit; a move home.
+//!   that scans it ([`Space::pair_join`], which also pairs again a device
+//!   that holds another personal space, or a removed one, leaving it
+//!   first); the memberships a pairing leaves; the device set's
+//!   operations; a restore from the kit; a move home.
+//! - **Leaving** ([`Space::leave`]): a device gives up the personal space
+//!   it holds with no call to its agent: its light node's store made anew,
+//!   as at a fresh install. A move home is a leave and a claim at the new
+//!   home, a device paired again after a move or a regroup a leave and a
+//!   pairing: nothing is carried, since the personal space holds the
+//!   credential book and the device book alone, which each device writes
+//!   again from what it holds ([`Artifacts::embedded`]).
 //! - **The prompts are the UI's**: a form, a secret source's output, a
 //!   security key's `hmac-secret`, the admin key's signature over bytes
 //!   prepared here; none is asked outside a flow the user started.
@@ -62,8 +69,8 @@ use crate::{Code, Facility, Refusal, refused};
 use link::{Agent, AgentLink, Signer};
 
 pub use contract::{
-    Claim, Claimed, Device, Home, KitKind, MAX_LABEL, MAX_REGROUP, Membership, Moved, Notice, Owed,
-    PairCode, Paired, Pending, Posted, Seen, Synced, label,
+    Claim, Claimed, Device, Home, KitKind, MAX_LABEL, Membership, Notice, Owed, PairCode, Paired,
+    Pending, Posted, Seen, Synced, label,
 };
 pub use ops::{AdminOffer, Removal};
 
@@ -83,8 +90,10 @@ const MAGIC: &[u8; 8] = b"vos/pst\0";
 /// The version of what the file keeps, which this build writes. A file of
 /// another version, or of none (an earlier build's), is refused and its
 /// bytes kept ([`read_state`]).
-pub const STATE_VERSION: u16 = 2;
-/// The light node's store, under the facility's directory.
+pub const STATE_VERSION: u16 = 3;
+/// The light node's store, under the facility's directory: the directory
+/// of the first store, and the prefix of each later one's, which a leave
+/// makes anew ([`light_dir`]).
 pub const LIGHT: &str = "light";
 /// `Personal`'s instance in every personal agent.
 pub const PERSONAL: InstanceId = InstanceId(5);
@@ -94,12 +103,17 @@ pub const DEVICE_BOOK: InstanceId = InstanceId(2);
 
 /// The light node's artifacts this crate embeds (`just facility-release`): the
 /// default agent's program, and the local actors' packages.
+#[derive(Clone)]
 pub struct Artifacts {
     pub agent: Vec<u8>,
     pub books: Vec<(InstanceId, Vec<u8>)>,
 }
 
 impl Artifacts {
+    /// The local actors are the credential book and the device book, which
+    /// each device writes again from what it holds: so a leave, a move home
+    /// among them, carries nothing ([`Space::leave`]). A local actor holding
+    /// what no device writes again needs the move to carry its scope first.
     pub fn embedded() -> Self {
         Self {
             agent: include_bytes!("../../release/agent.program").to_vec(),
@@ -147,17 +161,45 @@ struct State {
     next_admin: Vec<([u8; 32], bool, bool)>,
     /// A restore opened, from before its call until it matures.
     restoring: Option<Restoring>,
-    /// A joiner's open claim at its home, which the background job makes
-    /// once its drawn time comes.
-    claim_due: Option<ClaimDue>,
-    /// This device's handover to another device's matured regroup, until
-    /// its new group is confirmed.
-    handover: Option<ops::regroup::Handed>,
     /// A joiner's acknowledgement of its pairing's handover, kept before
     /// it is put in the slot, until it is.
     acked: Option<Acked>,
     /// Each local actor's instance and the release installed there.
     books: Vec<(u32, u32)>,
+    /// The light node's store's generation: its directory
+    /// ([`light_dir`]), the next one's made by each leave.
+    store: u32,
+}
+
+/// The directory of the light node's store of `generation` under
+/// `directory`.
+fn light_dir(directory: &Path, generation: u32) -> PathBuf {
+    match generation {
+        0 => directory.join(LIGHT),
+        n => directory.join(format!("{LIGHT}.{n}")),
+    }
+}
+
+/// The stores of generations other than `generation` under `directory`,
+/// deleted: a leave's old store, or the new one a leave cut short before
+/// it was the device's.
+fn drop_stores(directory: &Path, generation: u32) {
+    let current = light_dir(directory, generation);
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let ours = name == LIGHT
+            || name
+                .strip_prefix(LIGHT)
+                .is_some_and(|rest| rest.starts_with('.'));
+        if ours && path != current && path.is_dir() {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
 }
 
 /// Where a flow takes the device's group: the home, and the agent there.
@@ -231,8 +273,8 @@ fn state_bytes(state: &State) -> Vec<u8> {
 
 impl State {
     /// A pairing's what the store shows it never joined dropped: the
-    /// home and agent it was to take the group to, the open claim owed
-    /// there, its acknowledgement. Whether it changed.
+    /// home and agent it was to take the group to, its acknowledgement.
+    /// Whether it changed.
     fn unjoined(
         &mut self,
         store: &vos_light::Store,
@@ -244,18 +286,9 @@ impl State {
         let there = group.is_some_and(|group| group.agent().identity == bound.agent.1);
         let held = vos_light::home::Claim::pending(store)
             .map_err(store_failed)?
-            .is_some()
-            || vos_light::moving::moving(store).map_err(store_failed)?;
+            .is_some();
         if there || held {
             return Ok(false);
-        }
-        let handle = bound.home.home.handle;
-        if self
-            .claim_due
-            .as_ref()
-            .is_some_and(|due| due.home.handle == handle)
-        {
-            self.claim_due = None;
         }
         self.bound = None;
         self.acked = None;
@@ -334,37 +367,6 @@ fn install(
     Ok(changed)
 }
 
-/// A joiner's open claim, owed at `home` for `member` from `due` (ms),
-/// and the attempts the home refused so far (one not reached is not
-/// counted).
-#[derive(Clone, Debug, Encode, Decode)]
-struct ClaimDue {
-    home: HomeSpace,
-    member: [u8; 32],
-    due: u64,
-    refused: u32,
-}
-
-/// The joiner's open claim's delay after its pairing, drawn uniformly
-/// over this range (ms): the home's operators do not link the new member
-/// to the agent by its time (`light-node.md` L5).
-pub const CLAIM_DELAY: std::ops::Range<u64> = 3_600_000..6 * 3_600_000;
-
-/// The joiner's open claim, refused, is tried again after this (ms),
-/// doubled at each of the home's refusals up to [`CLAIM_RETRY_MAX`]; each
-/// wait drawn uniformly from its upper half, so the attempts do not form a
-/// sequence the home's operators could link.
-pub const CLAIM_RETRY: u64 = 60_000;
-/// The longest wait between two attempts at an open claim (ms).
-pub const CLAIM_RETRY_MAX: u64 = 6 * 3_600_000;
-
-/// The longest wait before the next attempt at an open claim the home
-/// refused `refused` times, from a first wait of `base`.
-fn retry_after(base: u64, refused: u32) -> u64 {
-    base.saturating_mul(1 << refused.saturating_sub(1).min(32))
-        .min(CLAIM_RETRY_MAX.max(base))
-}
-
 /// What a flow holds while it runs: the light node, its device group, the
 /// keys' sessions, and a pairing under way.
 struct Held {
@@ -383,13 +385,15 @@ pub struct Space {
     file: PathBuf,
     held: Mutex<Held>,
     waiting: Waiting,
-    claim_delay: Mutex<std::ops::Range<u64>>,
-    claim_retry: AtomicU64,
     /// How long a flow waits for the agent (ms): [`ops::WAIT`] unless set.
     wait: AtomicU64,
     /// The light node's store and the source kept, as an enrollment asks
     /// them while a flow holds the rest.
-    owed: (vos_light::Store, Mutex<Option<Vec<u8>>>),
+    owed: (Mutex<vos_light::Store>, Mutex<Option<Vec<u8>>>),
+    /// The facility's directory, and the artifacts a store made anew
+    /// installs ([`Space::leave`]).
+    directory: PathBuf,
+    artifacts: Artifacts,
 }
 
 /// Whether a pairing waits on its slot, and whether the chrome cancelled
@@ -456,7 +460,8 @@ impl Space {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => State::default(),
             Err(error) => return Err(needs_repair(format!("its file does not read: {error}"))),
         };
-        let dir = directory.join(LIGHT);
+        drop_stores(directory, state.store);
+        let dir = light_dir(directory, state.store);
         create_private(&dir).map_err(store_failed)?;
         let light = Light::open(&dir, &artifacts.agent, Config::default())
             .map_err(|error| needs_repair(format!("its store: {error}")))?;
@@ -475,7 +480,10 @@ impl Space {
         }
         let sync = Signer::new(light.sync_key().verifying_key().to_bytes());
         let admin = Signer::new(state.admin.map(|(key, ..)| key).unwrap_or_default());
-        let owed = (light.store().clone(), Mutex::new(state.source.clone()));
+        let owed = (
+            Mutex::new(light.store().clone()),
+            Mutex::new(state.source.clone()),
+        );
         let space = Self {
             facility,
             runtime,
@@ -489,10 +497,10 @@ impl Space {
                 pairing: None,
             }),
             waiting: Waiting::default(),
-            claim_delay: Mutex::new(CLAIM_DELAY),
-            claim_retry: AtomicU64::new(CLAIM_RETRY),
             wait: AtomicU64::new(ops::WAIT_MS),
             owed,
+            directory: directory.to_path_buf(),
+            artifacts: artifacts.clone(),
         };
         let held = space.held();
         if changed {
@@ -537,11 +545,41 @@ impl Space {
         self.held().group.is_some()
     }
 
-    /// The joiner's open claim's delay range (ms), [`CLAIM_DELAY`] unless
-    /// set: tests shorten it, which no product caller does (L5).
-    #[doc(hidden)]
-    pub fn set_claim_delay(&self, delay: std::ops::Range<u64>) {
-        *self.claim_delay.lock().unwrap_or_else(|e| e.into_inner()) = delay;
+    /// Leave the personal space this device holds, for good, with no call
+    /// to its agent: a store made anew under the next generation's
+    /// directory, the local actors installed there, then made the device's
+    /// by one write of the state file, which drops the home, the agent, the
+    /// admin key and every flow's state and keeps the source and the label;
+    /// the old store's directory deleted after. The device then holds no
+    /// personal space, as at a fresh install: it claims, or pairs, with new
+    /// sync and admin keys. Cut short before the write, the old space
+    /// stands; after it, the old directory goes at the next open.
+    fn leave(&self, held: &mut Held) -> Result<(), Refusal> {
+        let generation = held.state.store + 1;
+        let dir = light_dir(&self.directory, generation);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).map_err(store_failed)?;
+        }
+        create_private(&dir).map_err(store_failed)?;
+        let light =
+            Light::open(&dir, &self.artifacts.agent, Config::default()).map_err(store_failed)?;
+        let mut state = State {
+            source: held.state.source.clone(),
+            label: held.state.label.clone(),
+            store: generation,
+            ..State::default()
+        };
+        install(&light, &self.artifacts.books, &mut state.books)?;
+        self.keep(&state)?;
+        *self.owed.0.lock().unwrap_or_else(|e| e.into_inner()) = light.store().clone();
+        held.sync = Signer::new(light.sync_key().verifying_key().to_bytes());
+        held.admin = Signer::new([0; 32]);
+        held.group = None;
+        held.pairing = None;
+        held.state = state;
+        held.light = light;
+        drop_stores(&self.directory, generation);
+        Ok(())
     }
 
     /// How long a flow waits for the agent (ms), [`ops::WAIT`] unless
@@ -555,44 +593,6 @@ impl Space {
         std::time::Duration::from_millis(self.wait.load(Ordering::Relaxed))
     }
 
-    /// The first wait after a refused open claim (ms), [`CLAIM_RETRY`]
-    /// unless set: tests shorten it.
-    #[doc(hidden)]
-    pub fn set_claim_retry(&self, base: u64) {
-        self.claim_retry.store(base, Ordering::Relaxed);
-    }
-
-    /// The wait before the next attempt at an open claim refused
-    /// `refused` times: drawn uniformly from the upper half of its bound.
-    fn claim_retry(&self, refused: u32) -> Result<u64, Refusal> {
-        let bound = retry_after(self.claim_retry.load(Ordering::Relaxed), refused);
-        let half = bound / 2;
-        let mut bytes = [0; 8];
-        getrandom::getrandom(&mut bytes).map_err(failed)?;
-        Ok(half + u64::from_le_bytes(bytes) % (bound - half + 1))
-    }
-
-    /// A delay drawn uniformly over the claim delay's range.
-    fn draw_claim_delay(&self) -> Result<u64, Refusal> {
-        let range = self
-            .claim_delay
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let span = range.end.saturating_sub(range.start);
-        if span == 0 {
-            return Ok(range.start);
-        }
-        let mut bytes = [0; 8];
-        getrandom::getrandom(&mut bytes).map_err(failed)?;
-        Ok(range.start + u64::from_le_bytes(bytes) % span)
-    }
-
-    /// When the joiner's open claim is due (ms), while it is owed.
-    pub fn claim_due(&self) -> Option<u64> {
-        self.held().state.claim_due.as_ref().map(|due| due.due)
-    }
-
     /// The data key of the scope `name` names at the confirmed epoch.
     pub fn scope_key(&self, name: &[u8]) -> Result<[u8; 32], Refusal> {
         let mut held = self.held();
@@ -602,6 +602,14 @@ impl Space {
             .ok_or_else(|| refused(Code::NotEnrolled, "this device holds no personal space"))?;
         let scope = group.archive().scope(name);
         group.key(scope).map_err(failed)
+    }
+
+    /// How many spaces the credential book records `device`'s handle in,
+    /// as this device's light node reads the book: what reached it.
+    #[doc(hidden)]
+    pub fn recorded(&self, device: u32) -> usize {
+        memberships::handles_of(&self.held().light, CREDENTIAL_BOOK, device)
+            .map_or(0, |handles| handles.len())
     }
 
     /// The light node's sync key's public half: the device's author.
@@ -639,9 +647,8 @@ fn link<'a>(
 impl Personal for Space {
     /// The background job's pass, on its own isolation group: a joiner's
     /// acknowledgement left by a process that died first put in its slot,
-    /// the light node's job, a kept device's handover, a carry an
-    /// interrupted move left, the credential book's records of this
-    /// device's enrollments, and the joiner's open claim once due.
+    /// the light node's job, and the credential book's records of this
+    /// device's enrollments.
     fn pass(&self, now: u64, runtime: &tokio::runtime::Handle) -> Result<Passed, String> {
         let mut held = self.held();
         let mut failures = Vec::new();
@@ -680,29 +687,8 @@ impl Personal for Space {
                 *stopped.pass
             }
         };
-        // A kept device's handover to another device's matured regroup.
-        let before = state.handover.clone();
-        let mut handed = ops::regroup::hand_over(&mut link, group, state, &key).map(drop);
-        if state.handover != before
-            && let Err(refusal) = self.keep(state)
-        {
-            // Not kept: the next pass draws its package again.
-            state.handover = before;
-            handed = Err(refusal.message);
-        }
-        if let Err(error) = handed {
-            failures.push(format!("the regroup's handover: {error}"));
-        }
-        match ops::carry(light, group, &mut link) {
-            Ok(Some(_)) => {}
-            Ok(None) => failures.push("the move's carry is not whole yet".into()),
-            Err(refusal) => failures.push(format!("the move's carry: {}", refusal.message)),
-        }
         if let Some(device) = group.id() {
             self.book(light, device);
-        }
-        if let Err(refusal) = self.claim_if_due(state, now) {
-            failures.push(format!("the open claim at the home: {}", refusal.message));
         }
         Ok(Passed {
             notices: pass.notices().into_iter().map(crate::job::notice).collect(),
@@ -728,7 +714,13 @@ impl Personal for Space {
 
 impl crate::session::Paired for Space {
     fn owed_source(&self, handle: &[u8; 32]) -> Result<Option<Reference>, String> {
-        let owed = memberships::confirmations(&self.owed.0).map_err(|error| error.to_string())?;
+        let store = self
+            .owed
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let owed = memberships::confirmations(&store).map_err(|error| error.to_string())?;
         if !owed.iter().any(|membership| membership.handle == *handle) {
             return Ok(None);
         }
@@ -795,7 +787,6 @@ mod tests {
             },
             nullifier: [11; 32],
             label: b"phone".to_vec(),
-            carried: Vec::new(),
         };
         let kit = NewKit {
             entries: vec![vos_wire::personal::KitEntry {
@@ -826,13 +817,6 @@ mod tests {
             }),
             next_admin: vec![([24; 32], false, true)],
             restoring: Some(restoring),
-            claim_due: Some(ClaimDue {
-                home: home.home,
-                member: [25; 32],
-                due: 26,
-                refused: 27,
-            }),
-            handover: None,
             acked: Some(Acked {
                 handle: [28; 32],
                 onions: Vec::new(),
@@ -842,6 +826,7 @@ mod tests {
                 ack: vec![29; 4],
             }),
             books: vec![(1, 2), (2, 3)],
+            store: 4,
         }
     }
 
@@ -849,7 +834,7 @@ mod tests {
     /// the file keeps, or to how a type it holds encodes, fails here, and
     /// is a new version.
     const PINNED: &str = concat!(
-        "766f732f70737400020001010101010101010101010101010101010101010101010101010101010101010102",
+        "766f732f70737400030001010101010101010101010101010101010101010101010101010101010101010102",
         "0202020202020202020202020202020202020202020202020202020202020203000000040404040404040404",
         "0404040404040404040404040404040404040404040404050000000600000001000000070707070707070707",
         "0707070707070707070707070707070707070707070707080808080808080808080808080808080808080808",
@@ -863,22 +848,18 @@ mod tests {
         "1717171717171717171717171717170100000018181818181818181818181818181818181818181818181818",
         "18181818181818000101000e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0f",
         "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0d0d0d0d0d0d0d0d0d0d0d0d0d",
-        "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0dfb000000090909090909090909090909090909090909090909",
+        "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0df7000000090909090909090909090909090909090909090909",
         "09090909090909090909090a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a00",
-        "01000b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0500000070686f6e6500",
-        "00000001000000011e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1f1f1f1f",
-        "1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f0200000020200c0c0c0c0c0c0c0c0c0c",
-        "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d",
-        "0d0d0d0d0d0d0d0d0d0d01101010101010101010101010101010101010101010101010101010101010101001",
-        "0300000011111112121212121212121212121212121212121212121212121212121212121212121212121212",
-        "1212121212121212121212121212121212121212121212121212120101010101010101010101010101010101",
-        "0101010101010101010101010101010102020202020202020202020202020202020202020202020202020202",
-        "0202020203000000040404040404040404040404040404040404040404040404040404040404040405000000",
-        "0600000019191919191919191919191919191919191919191919191919191919191919191a00000000000000",
-        "1b00000000011c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c000000002100",
-        "0000222222222222222222222222222222222222222222222222222222222222222223232323232323232323",
-        "232323232323232323232323232323232323232323232400000000000000040000001d1d1d1d020000000100",
-        "0000020000000200000003000000",
+        "01000b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0500000070686f6e6501",
+        "000000011e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1f1f1f1f1f1f1f1f",
+        "1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f0200000020200c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+        "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d",
+        "0d0d0d0d0d0d0110101010101010101010101010101010101010101010101010101010101010100103000000",
+        "1111111212121212121212121212121212121212121212121212121212121212121212121212121212121212",
+        "1212121212121212121212121212121212121212121212011c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c",
+        "1c1c1c1c1c1c1c1c1c1c1c1c0000000021000000222222222222222222222222222222222222222222222222",
+        "2222222222222222232323232323232323232323232323232323232323232323232323232323232324000000",
+        "00000000040000001d1d1d1d020000000100000002000000020000000300000004000000",
     );
 
     #[test]
@@ -894,7 +875,7 @@ mod tests {
         let bytes = state_bytes(&every_field());
         let mut later = bytes.clone();
         later[MAGIC.len()..MAGIC.len() + 2].copy_from_slice(&(STATE_VERSION + 1).to_le_bytes());
-        assert!(read_state(&later).err().unwrap().contains("version 3"));
+        assert!(read_state(&later).err().unwrap().contains("version 4"));
         let unversioned = every_field().encode();
         assert!(
             read_state(&unversioned)
@@ -936,16 +917,5 @@ mod tests {
         let mut lost = Vec::new();
         assert!(install(&light, &artifacts.books, &mut lost).unwrap());
         assert!(lost.contains(&(instance.0, first.release + 1)));
-    }
-
-    #[test]
-    fn a_refused_claims_wait_doubles_to_its_bound() {
-        assert_eq!(retry_after(CLAIM_RETRY, 0), CLAIM_RETRY);
-        assert_eq!(retry_after(CLAIM_RETRY, 1), CLAIM_RETRY);
-        assert_eq!(retry_after(CLAIM_RETRY, 2), 2 * CLAIM_RETRY);
-        assert_eq!(retry_after(CLAIM_RETRY, 9), 256 * CLAIM_RETRY);
-        assert_eq!(retry_after(CLAIM_RETRY, 10), CLAIM_RETRY_MAX);
-        assert_eq!(retry_after(CLAIM_RETRY, u32::MAX), CLAIM_RETRY_MAX);
-        assert_eq!(retry_after(u64::MAX, 40), u64::MAX);
     }
 }

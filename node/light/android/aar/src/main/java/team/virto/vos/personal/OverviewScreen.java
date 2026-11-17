@@ -151,11 +151,10 @@ final class OverviewScreen extends Screen {
     into.addView(button("Devices, changes and keys", v -> app.open(new DevicesScreen(app))));
     into.addView(button("Pair a new device", v -> app.open(new PairScreen(app, true))));
     into.addView(button("Sync now", v -> sync()));
-    into.addView(button("Yearly re-proof", v -> renew()));
     into.addView(button("Move home", v -> app.open(new MoveScreen(app))));
     into.addView(
         button(
-            "Pair again after a move (scan the moved device's code)",
+            "Pair again after a move or a regroup (scan the code of a device there)",
             v -> app.open(new PairScreen(app, false))));
   }
 
@@ -181,12 +180,5 @@ final class OverviewScreen extends Screen {
             app.say("The sync did not finish: " + synced.failed + " failed. It runs again later.");
           }
         });
-  }
-
-  private void renew() {
-    app.run(
-        "Re-proving at your home…",
-        (personal, prompts, refused) -> personal.renew(prompts, refused) ? Boolean.TRUE : null,
-        done -> app.say("Re-proved at your home for another year, this phone's leaf updated."));
   }
 }

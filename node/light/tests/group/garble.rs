@@ -277,7 +277,7 @@ pub fn hostile(
     spare: Option<Vec<HpkePublicKey>>,
     rules: Anything,
 ) -> Group<impl MlsConfig + use<>> {
-    let namespace = vos_light::group::mls_namespace(store).unwrap().copy();
+    let namespace = vos_light::group::mls_namespace(store).copy();
     let id = namespace
         .get(b"group")
         .unwrap()

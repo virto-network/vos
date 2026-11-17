@@ -14,7 +14,6 @@
     <string name="vos_pending_restoring">A restore of your personal space is pending: this device answered that it is alive. Rotate your recovery kit.</string>
     <string name="vos_pending_removed">This device was removed from your personal space.</string>
     <string name="vos_pending_stuck">This device cannot follow your other devices. Pair it again from one of them.</string>
-    <string name="vos_pending_renew">Your yearly re-proof is due.</string>
     <string name="vos_pending_alarm">The background sync found something wrong.</string>
     <string name="vos_personal_name">Personal space</string>
     <!-- VOS's own words for the opt-out (`vos_light::route::OPT_OUT_WARNING`). -->

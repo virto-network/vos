@@ -302,9 +302,22 @@ impl DeviceGroup {
             .set
             .claims
             .retain(|claim| claim.support == Support::Waiting);
-        let operation = self.state.call_at(op).and_then(Call::op);
+        let call = self.state.call_at(op);
+        let operation = call.and_then(Call::op);
         let every = operation.is_some_and(|(op, _)| matches!(op, Op::Restore { .. }));
-        let removes = operation.map_or_else(Vec::new, |(op, _)| removes(op).to_vec());
+        let removes = match (call, operation) {
+            // A regroup keeps its regrouper alone: every other device with
+            // a voice, one added while it was open too.
+            (Some(call), Some((Op::Regroup(_), _))) => self
+                .state
+                .devices
+                .iter()
+                .map(|(id, _)| *id)
+                .filter(|id| call.device() != Some(*id) && self.state.voiced(*id))
+                .collect(),
+            (_, Some((op, _))) => removes(op).to_vec(),
+            _ => Vec::new(),
+        };
         let support = if at > self.state.time {
             events.push(Event::Alarm(Alarm::Unsigned { index: entry }));
             Support::Refused

@@ -235,22 +235,29 @@ fn a_cosigned_removal_is_carried_once_its_cosign_verifies() {
     assert!(events.contains(&Event::Removed), "{events:?}");
 }
 
-/// A regroup naming one device, made immediate by the kit's second
-/// signature, voids the pending candidate; no commit but the regrouper's
-/// new group comes next, which the device kept joins by its Welcome from
-/// the key package it handed over. The new group's epochs count on from
-/// the agent's, its keys new, and the named device is out.
+/// A regroup keeps its regrouper alone: one naming only some of the other
+/// devices is refused; one naming them all, made immediate by the kit's
+/// second signature, voids the pending candidate, and no commit but the
+/// regrouper's new group of it alone comes next, carrying every other
+/// device's removal. The new group's epochs count on from the agent's, its
+/// keys new, and every other device is out: it pairs again.
 #[test]
-fn a_regroup_starts_a_new_group_with_the_rest() {
+fn a_regroup_starts_a_new_group_of_its_regrouper_alone() {
     let (mut home, mut phones) = seasoned(3);
     let before = agree(&mut all(&mut phones), 2);
     phones[1].update(&mut home).unwrap();
+    let partial = home.call(&phones[0].admin, "regroup", vec![2u32].encode());
+    assert_eq!(
+        partial.answer::<Recorded>(),
+        Err(PersonalError::Malformed),
+        "a regroup names every other live device"
+    );
     let regroup = operate(
         &mut home,
         &phones[0].admin,
         &phones[0].sync,
         "regroup",
-        vec![2u32].encode(),
+        vec![1u32, 2].encode(),
         None,
     );
     operate(
@@ -261,63 +268,53 @@ fn a_regroup_starts_a_new_group_with_the_rest() {
         regroup.encode(),
         None,
     );
-    let (kept, named) = phones.split_at_mut(2);
-    let events = settle(&mut home, &mut all(kept));
+    let events = settle(&mut home, &mut all(&mut phones[..1]));
     signed(&events);
-    for events in &events {
-        assert!(
-            events.iter().any(|event| matches!(
-                event,
-                Event::Voided {
-                    epoch: 3,
-                    why: Why::Regroup,
-                    ..
-                }
-            )),
-            "{events:?}"
-        );
-    }
+    assert!(
+        events[0].iter().any(|event| matches!(
+            event,
+            Event::Voided {
+                epoch: 3,
+                why: Why::Regroup,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
     assert!(matches!(
-        kept[1].group().commit(None, home.now()),
+        phones[0].group().commit(None, home.now()),
         Err(GroupError::Regroup)
     ));
-    assert!(matches!(
-        kept[1].group().regroup(Vec::new(), home.now()),
-        Err(GroupError::NoRegroup)
-    ));
-    assert_eq!(kept[0].group().regrouper(), Some(0));
-    assert_eq!(kept[1].group().regrouper(), Some(0));
+    assert_eq!(phones[0].group().regrouper(), Some(0));
 
-    let package = kept[1].group().regroup_package(home.now()).unwrap();
-    let prepared = kept[0].group().regroup(vec![package], home.now()).unwrap();
-    assert_eq!(prepared.effect.remove, vec![2]);
-    let candidacy = kept[0].send(&mut home, &prepared).unwrap();
-    assert_eq!(candidacy.set, vec![0, 1]);
-    let events = settle(&mut home, &mut all(kept));
-    signed(&events);
-    for events in &events {
-        assert!(
-            events.contains(&Event::Confirmed { epoch: 3 }),
-            "{events:?}"
-        );
-    }
-    let after = agree(&mut all(kept), 3);
+    let prepared = phones[0].group().regroup(home.now()).unwrap();
+    assert_eq!(prepared.effect.remove, vec![1, 2]);
+    let candidacy = phones[0].send(&mut home, &prepared).unwrap();
+    assert_eq!(candidacy.set, vec![0]);
+    let events = phones[0].read(&mut home);
+    signed(std::slice::from_ref(&events));
+    assert!(
+        events.contains(&Event::Confirmed { epoch: 3 }),
+        "{events:?}"
+    );
+    let after = agree(&mut all(&mut phones[..1]), 3);
     assert_ne!(after, before);
-    assert_eq!(kept[1].group().regrouper(), None, "the new group confirmed");
-    let events = relayed(&home, &kept[0], &mut named[0]);
-    assert!(events.contains(&Event::Removed), "{events:?}");
-
-    kept[1].update(&mut home).unwrap();
-    let events = settle(&mut home, &mut all(kept));
-    for events in &events {
-        assert!(
-            events.contains(&Event::Confirmed { epoch: 4 }),
-            "{events:?}"
-        );
-    }
-    agree(&mut all(kept), 4);
     assert_eq!(
-        kept[0].group().archive().keys(3, &NOTES),
+        phones[0].group().regrouper(),
+        None,
+        "the new group confirmed"
+    );
+    let (regrouper, others) = phones.split_at_mut(1);
+    for other in others {
+        let events = relayed(&home, &regrouper[0], other);
+        assert!(events.contains(&Event::Removed), "{events:?}");
+        assert!(matches!(
+            other.group().regroup(home.now()),
+            Err(GroupError::Out)
+        ));
+    }
+    assert_eq!(
+        regrouper[0].group().archive().keys(3, &NOTES),
         &[after],
         "the archive records the new group's epochs"
     );
@@ -599,7 +596,7 @@ fn a_device_that_cannot_follow_regroups() {
     home.pass(policy().operation_delay_ms);
     phones[1].alive(&mut home);
     signed(&[phones[1].read(&mut home)]);
-    let prepared = phones[1].group().regroup(Vec::new(), home.now()).unwrap();
+    let prepared = phones[1].group().regroup(home.now()).unwrap();
     assert_eq!(prepared.epoch, 3);
     assert_eq!(prepared.effect.remove, vec![0]);
     let candidacy = phones[1].send(&mut home, &prepared).unwrap();

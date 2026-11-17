@@ -1,17 +1,15 @@
 //! The recovery kit through the device group and sealed sync against
 //! `Personal` (`light-node.md` §3.5): a phrase kit and a security-key kit
-//! made and rotated; a restore here and one elsewhere, each on a fresh
-//! store, reading the personal space back; a restore cancelled by
+//! made and rotated; a restore on a fresh store, reading the personal
+//! space back; a restore cancelled by
 //! liveness and the kit rotated after it; a contested removal resolved by
 //! the kit; the kit alone removing a phone that holds only a sync key; and
 //! `R` rotated at a removal, so the removed device opens nothing the
 //! recovery scope holds after it (§3.6, D3).
 
-use std::collections::BTreeMap;
-
 use vos_light::group::{Alarm, Archive, DeviceGroup, Event, Restored};
 use vos_light::kit::{self, KitKey, KitSecret, Split};
-use vos_light::personal::{read_back, recover};
+use vos_light::personal::recover;
 use vos_wire::personal::{
     Attached, DeviceView, OpState, Operation, Overview, Recorded, RecoveryView, Woken,
 };
@@ -322,89 +320,6 @@ fn a_restore_here_reads_the_personal_space_back() {
             .is_empty(),
         "the new kit's copy holds the new epoch's keys"
     );
-}
-
-/// A restore elsewhere: the kit finds its agent by its index alone, the
-/// restore at the old home releases `R2`, and the fresh install takes the
-/// archive it recovered in and reads the personal space back from the old
-/// home, the old scopes keeping their ids, new ones named afresh; then it
-/// claims a new agent at another home, its keys there naming the old
-/// device set as its carried authors, its group there, its kit split
-/// anew; and carries the old scopes to the new home, where a phone paired
-/// there reads them.
-#[test]
-fn a_restore_elsewhere_reads_the_personal_space_back() {
-    let key = KitSecret::security_key(&mut Touch(9)).unwrap();
-    let (mut home, mut phones, _) = household_with(2, vec![key.key()]);
-    written(&mut home, &mut phones);
-    let naming = phones[0].group().archive().naming;
-    drop(phones);
-    // `Homes`' index, by the kit's key.
-    let homes_index: BTreeMap<[u8; 32], [u8; 32]> = [(key.index(), home.identity)].into();
-    let kit = KitSecret::security_key(&mut Touch(9)).unwrap();
-    assert_eq!(homes_index[&kit.index()], home.identity);
-
-    let next = KitSecret::phrase().unwrap();
-    let (mut restored, _, _) = open_restore(&mut home, &kit, &next, 9);
-    let archive = matured(&mut home, &kit, &restored);
-    assert_eq!(archive.naming, naming);
-
-    vos_light::group::recovered(&restored.store, &archive).unwrap();
-    install(&restored.light, NOTES);
-    assert_eq!(
-        scope_of(&restored, NOTES),
-        archive.scope(&vos_light::sync::scope_name(NOTES)),
-        "the old scope keeps its id"
-    );
-    assert_ne!(
-        scope_of(&restored, OTHER),
-        archive.scope(&vos_light::sync::scope_name(OTHER)),
-        "a new scope is named afresh"
-    );
-    let identity = home.identity;
-    let devices: Vec<DeviceView> = home
-        .query(restored.sync_key(), "devices", ().encode())
-        .unwrap();
-    let mut link = HomeLink::new(&mut home, &restored);
-    let caught = read_back(&restored.light, &archive, &identity, &mut link, NOTES).unwrap();
-    assert!(caught.passed.is_empty(), "{:?}", caught.passed);
-    for n in 0..2 {
-        assert_eq!(count(&restored.light, NOTES, n), Some(10 + n));
-    }
-    let authors: Vec<[u8; 32]> = devices.iter().map(|view| view.device.keys.sync).collect();
-    restored.keys.carried = vos_light::moving::carried(&restored.light, &authors).unwrap();
-    assert!(!restored.keys.carried.is_empty());
-
-    let homes = SigningKey::from_bytes(&[0x51; 32]);
-    let mut elsewhere = Home::at(&homes, policy(), [0x2e; 32]);
-    let split = restored.claim_with(&mut elsewhere, &homes, vec![next.key()]);
-    assert_eq!(r_of(&mut restored), *split.r());
-    restored.update(&mut elsewhere).unwrap();
-    let events = restored.read(&mut elsewhere);
-    assert!(
-        events.contains(&Event::Confirmed { epoch: 1 }),
-        "{events:?}"
-    );
-
-    let carried = with(&mut elsewhere, &mut restored, &[NOTES], |sync| {
-        sync.catch_up(NOTES)?;
-        sync.carry(NOTES)
-    })
-    .unwrap();
-    assert_eq!(carried.pushed.len(), 2);
-    let mut phones = vec![restored, Phone::new(10)];
-    let (first, rest) = phones.split_at_mut(1);
-    first[0].pair(&mut elsewhere, &mut rest[0]);
-    settle(&mut elsewhere, &mut phones);
-    install(&phones[1].light, NOTES);
-    let caught = with(&mut elsewhere, &mut phones[1], &[NOTES], |sync| {
-        sync.catch_up(NOTES)
-    })
-    .unwrap();
-    assert!(caught.passed.is_empty(), "{:?}", caught.passed);
-    for n in 0..2 {
-        assert_eq!(count(&phones[1].light, NOTES, n), Some(10 + n));
-    }
 }
 
 /// A leaked kit's restore: every device shows the kit's operation and

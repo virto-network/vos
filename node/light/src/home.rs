@@ -1,13 +1,12 @@
 //! The home (`light-node.md` §3.3): its open claim's work, a device's
-//! nullifier in its scope, the scope reserved, the claim of a personal
-//! agent and its yearly re-proof.
+//! nullifier in its scope, the scope reserved, and the claim of a personal
+//! agent.
 //!
 //! - **The open claim:** a home-only space admits anyone whose work meets
 //!   its registrar's difficulty under the period's salt ([`work`], over
 //!   the registrar's answer [`vos_wire::credentials::Open`]): a call of
 //!   `claim_open(member, nonce)` in a session of its own
-//!   ([`open_claim`]). A device paired at a home-only space makes its own
-//!   in the background, unlinked to the others at the registrar.
+//!   ([`open_claim`]), made by the device that claims the agent.
 //! - **The claim** ([`Claim`]): of the agent `Homes` answers `pooled` for,
 //!   the kit's `R1` sealed to that agent's identity, proved in the scope
 //!   "home". It is held in the store from before its call until the
@@ -15,13 +14,10 @@
 //!   a retry after a lost answer sends the same claim. A device that
 //!   already holds a personal space's archive (its group, or a restore's)
 //!   claims nothing ([`ClaimError::Held`]): a second device pairs.
-//! - **The yearly re-proof** ([`renewal_due`], [`renew_call`]): `Homes`'
-//!   `renew` under the device's recorded nullifier, on the same prompt as
-//!   the leaf's update (the device group's update commit).
 //! - **The scope "home"** ([`SCOPE`]) is reserved: [`Prover::prove_auth`]
-//!   refuses it, and [`Prover::prove_home`] proves in it only a claim or a
-//!   re-proof of `Homes`, so no other call can be linked to the device's
-//!   pseudonym there. A device's own nullifier in it, which its add
+//!   refuses it, and [`Prover::prove_home`] proves in it only a claim of
+//!   `Homes`, so no other call can be linked to the device's pseudonym
+//!   there. A device's own nullifier in it, which its add
 //!   records, is computed without a proof ([`nullifier`]).
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -97,21 +93,6 @@ pub fn open_claim(
     )
 }
 
-/// The yearly re-proof of `agent` at `home`, to prove in the scope "home"
-/// ([`Prover::prove_home`]) on the prompt that also signs the leaf's
-/// update.
-pub fn renew_call(home: &Home, agent: u32, expires_ms: u64) -> Result<Call, DeviceError> {
-    home.call("renew", agent.encode(), expires_ms)
-}
-
-/// Whether the yearly prompt is due at `now`, the lease running to
-/// `lease_until` (`Personal`'s overview) under a lease of `lease_ms`: in
-/// the lease's last sixth (two months of thirteen), or once the device's
-/// leaf is due its update. The prompt makes both.
-pub fn renewal_due(group: &DeviceGroup, lease_until: u64, lease_ms: u64, now: u64) -> bool {
-    group.update_due(now) || now >= lease_until.saturating_sub(lease_ms / 6)
-}
-
 /// Why a claim cannot go on.
 #[derive(Debug)]
 pub enum ClaimError {
@@ -182,12 +163,6 @@ struct Held {
     identity: [u8; 32],
 }
 
-/// Whether a claim waits in `store`: prepared, and its agent's group not
-/// yet started.
-pub(crate) fn claim_held(store: &Store) -> Result<bool, StoreError> {
-    Ok(store.group_row(CLAIM_ROW)?.is_some())
-}
-
 /// A claim of a personal agent, held in the store from before its call
 /// until the device's group starts. Its `Debug` shows no `R` or `R2`.
 pub struct Claim(Held);
@@ -223,46 +198,21 @@ impl Claim {
         if holds_archive(store)? || store.group_row(CLAIM_ROW)?.is_some() {
             return Err(ClaimError::Held);
         }
-        let claim = Self::draw(device, keys, agent, identity)?;
-        store.write_group_rows(vec![claim.row()])?;
-        Ok(claim)
-    }
-
-    /// A claim of `agent` for `device` with the kit of `keys`, `R` split
-    /// there, not yet held.
-    pub(crate) fn draw(
-        device: NewDevice,
-        keys: Vec<KitKey>,
-        agent: u32,
-        identity: [u8; 32],
-    ) -> Result<Self, ClaimError> {
         let split = Split::draw(&keys, &identity).ok_or(ClaimError::Kit)?;
-        Ok(Claim(Held {
+        let claim = Claim(Held {
             device,
             kit: split.claim(),
             keys,
             r: *split.r(),
             agent,
             identity,
-        }))
+        });
+        store.write_group_rows(vec![(CLAIM_ROW.to_vec(), Some(claim.0.encode()))])?;
+        Ok(claim)
     }
 
-    /// The claim's row, to hold it.
-    pub(crate) fn row(&self) -> (Vec<u8>, Option<Vec<u8>>) {
-        (CLAIM_ROW.to_vec(), Some(self.0.encode()))
-    }
-
-    /// The claim held in `store`, if one waits: made again as it was. A
-    /// move's claim is the move's ([`crate::moving::Move::pending`]).
+    /// The claim held in `store`, if one waits: made again as it was.
     pub fn pending(store: &Store) -> Result<Option<Self>, ClaimError> {
-        if crate::moving::moving(store)? {
-            return Ok(None);
-        }
-        Self::held(store)
-    }
-
-    /// The claim held in `store`, a move's too.
-    pub(crate) fn held(store: &Store) -> Result<Option<Self>, ClaimError> {
         let Some(mut row) = store.group_row(CLAIM_ROW)? else {
             return Ok(None);
         };
@@ -302,7 +252,7 @@ impl Claim {
 
     /// The log index of the entry assigning the agent to this claim, in
     /// its log `entries` from its start.
-    pub(crate) fn assigned(&self, entries: &[(u64, Entry)]) -> Result<u64, ClaimError> {
+    fn assigned(&self, entries: &[(u64, Entry)]) -> Result<u64, ClaimError> {
         let signing: Vec<[u8; 32]> = self.0.keys.iter().map(|key| key.signing).collect();
         entries
             .iter()
@@ -387,15 +337,9 @@ pub fn work(
     nonce.load(Ordering::Relaxed)
 }
 
-/// The methods of `Homes` a proof in its scope may name.
-fn reserved_for(method: u32) -> bool {
-    method == call::method_id("claim") || method == call::method_id("renew")
-}
-
 impl Prover {
     /// [`Prover::prove_auth`] in the scope "home", for `call` of `Homes`'
-    /// `claim` or `renew` alone; any other method is
-    /// [`DeviceError::Reserved`].
+    /// `claim` alone; any other method is [`DeviceError::Reserved`].
     pub fn prove_home(
         &self,
         secret: &DeviceSecret,
@@ -403,7 +347,7 @@ impl Prover {
         call: &Call,
         program: &DeviceProgram,
     ) -> Result<Proven, DeviceError> {
-        if !reserved_for(call.method) {
+        if call.method != call::method_id("claim") {
             return Err(DeviceError::Reserved);
         }
         self.prove_in_scope(secret, witness, SCOPE, call, program)

@@ -5,11 +5,12 @@
 //! homes in process: each a credential actor and `Homes` in front of a pool
 //! of personal agents running `Personal`, every request over the world's
 //! gateway as its onions serve it. A claim, a pairing between two
-//! facilities, the memberships it leaves, the yearly re-proof, a removal
-//! carried by a commit and revoked in each space, a move to another home;
-//! the device set's contests, kit rotations and admin replacements; a
-//! restore from the kit; and the personal agent's traffic on its own
-//! circuits, never beside a proof, never on the clearnet.
+//! facilities, the memberships it leaves, a removal carried by a commit
+//! and revoked in each space, a move to another home and a device pairing
+//! again there; the device set's contests, kit rotations, admin
+//! replacements and a regroup, its other devices pairing again; a restore
+//! from the kit; and the personal agent's traffic on its own circuits,
+//! never beside a proof, never on the clearnet.
 
 mod common;
 
@@ -22,7 +23,7 @@ use vos_light::tor::Target;
 
 /// The path the brief names: a claim with a security-key kit, a pairing
 /// between two facilities offering the club, the enrollment the first owes
-/// and the confirmation the second does, the second's yearly re-proof, the
+/// and the confirmation the second does, the
 /// first retired (removed, its removal carried by the second's commit, its
 /// leaf revoked in the club by the second's owner proof), and the second
 /// moving the personal space to another home. Every request goes to an
@@ -125,22 +126,7 @@ fn a_personal_space_is_claimed_paired_retired_and_moved() {
             .is_empty()
     );
 
-    // The second's yearly re-proof at the home under its own nullifier,
-    // once its open claim there is made by the background job.
-    second.node.sync_personal().unwrap();
-    second
-        .node
-        .personal()
-        .unwrap()
-        .renew(&*second.hand)
-        .unwrap();
-    let state = world.state.lock().unwrap();
-    let homes = state.spaces[&home].homes.as_ref().unwrap();
-    assert_eq!(homes.renewed, vec![claimed.agent]);
-    drop(state);
-
-    // The background job, on its own circuits: the first confirms the
-    // second's commit, which the re-proof's leaf update made.
+    // The background job, on its own circuits.
     let before = seen(&world).len();
     for phone in [&first, &second] {
         let synced = phone.node.sync_personal().unwrap();
@@ -200,8 +186,8 @@ fn a_personal_space_is_claimed_paired_retired_and_moved() {
     assert!(!in_club(&world, &member), "the first's leaf revoked");
     assert!(in_club(&world, &theirs));
 
-    // The second moves the personal space to another home, a phrase its
-    // new kit; everything carried, it alone in the new set.
+    // The second moves to another home, a phrase its new kit: it leaves
+    // the old one and claims there, alone in the new set.
     let moved = second
         .node
         .personal()
@@ -475,22 +461,14 @@ fn the_device_sets_operations_are_signed_by_the_admin_key() {
         "no offer"
     );
 
-    // A regroup removing the third.
+    // A regroup of the first alone, removing the others.
     let regroup = first
         .node
         .personal()
         .unwrap()
-        .regroup(&*first.hand, vec![2])
+        .regroup(&*first.hand)
         .unwrap();
     assert!(regroup.index > rotation.index);
-    assert!(
-        first
-            .node
-            .personal()
-            .unwrap()
-            .regroup(&*first.hand, vec![0; 17])
-            .is_err()
-    );
 }
 
 /// A restore from the kit: a fresh phone enters the phrase the first was
@@ -549,60 +527,6 @@ fn a_personal_space_is_restored_from_its_phrase() {
             .restore(&*fresh.hand, restore, KitKind::Phrase)
             .is_err()
     );
-}
-
-/// The joiner's open claim at its home: not made at the pairing, but by
-/// the background job once the delay drawn for it has passed; its time
-/// kept across a restart of the facility, neither lost nor drawn again.
-/// Until then its re-proof at the home is refused.
-#[test]
-fn the_joiners_open_claim_waits_for_its_drawn_time() {
-    let world = world();
-    let home = world.home(HOME, 2, 1);
-    let first = phone(&world, 0x51);
-    let second = phone(&world, 0x52);
-    first.claim(&world, home, KitKind::Phrase, "first");
-    // Long enough that a loaded host's pairing, its suites proving beside
-    // it, ends before the claim falls due.
-    second.node.space().unwrap().set_claim_delay(10_000..10_500);
-    let members = || world.state.lock().unwrap().spaces[&home].tree.members();
-    let before = members();
-    let paired_at = wall();
-    first.pair(&second, "second");
-    let due = second
-        .node
-        .space()
-        .unwrap()
-        .claim_due()
-        .expect("the claim owed");
-    assert!(
-        due >= paired_at + 10_000 && due < wall() + 10_500,
-        "drawn in range"
-    );
-    assert_eq!(members(), before, "not made at the pairing");
-    assert!(wall() < due, "the pairing outlasted the claim's delay");
-    second.node.sync_personal().unwrap();
-    assert_eq!(members(), before, "not made before its time");
-    let early = second
-        .node
-        .personal()
-        .unwrap()
-        .renew(&*second.hand)
-        .unwrap_err();
-    assert!(early.message.contains("not made yet"), "{early:?}");
-
-    let second = second.restart(&world);
-    assert_eq!(second.node.space().unwrap().claim_due(), Some(due), "kept");
-    std::thread::sleep(Duration::from_millis(due.saturating_sub(wall()) + 100));
-    second.node.sync_personal().unwrap();
-    assert_eq!(members(), before + 1, "made once due");
-    assert_eq!(second.node.space().unwrap().claim_due(), None);
-    second
-        .node
-        .personal()
-        .unwrap()
-        .renew(&*second.hand)
-        .unwrap();
 }
 
 /// Three phones claimed and paired, past their probation and seasoning.
@@ -764,202 +688,58 @@ fn a_fourth_phone_pairs_after_an_admin_replacement() {
     assert_ne!(Some(second.hand.signed_by()), old, "the new key signs");
 }
 
-/// A fourth phone paired after a regroup that left the first alone: its
-/// update starts the new group, which the fourth joins.
+/// A regroup of the first alone: once it matures, the first's update
+/// starts the new group, and the others, removed and admitted by the agent
+/// no more, pair again from it, each leaving the space it held and joining
+/// with new keys at the same agent; a fourth phone then pairs, the
+/// second's vote the one its commit needs, and all three hold the new
+/// group's keys, the third's old ones no more.
 #[test]
-fn a_fourth_phone_pairs_after_a_regroup() {
+fn after_a_regroup_the_others_pair_again() {
     let (world, first, second, third) = three_phones(0xa1);
+    let before = first.node.space().unwrap().scope_key(b"notes").unwrap();
     first
         .node
         .personal()
         .unwrap()
-        .regroup(&*first.hand, vec![1, 2])
+        .regroup(&*first.hand)
         .unwrap();
     after(policy().operation_delay_ms);
     first.node.personal().unwrap().update(&*first.hand).unwrap();
     for phone in [&second, &third] {
         let _ = phone.node.sync_personal();
     }
-    let fourth = fourth_pairs(&world, &first, &[], 0xa4);
-    let devices = fourth.node.personal().unwrap().devices().unwrap();
+    let out = third.node.personal().unwrap().devices().unwrap_err();
+    assert!(out.message.contains("NotAdmitted"), "{out:?}");
+    let devices = first.node.personal().unwrap().devices().unwrap();
     let standing: Vec<_> = devices.iter().filter(|device| !device.removed).collect();
-    assert_eq!(standing.len(), 2, "{devices:?}");
-}
+    assert_eq!(standing.len(), 1, "{devices:?}");
 
-/// A regroup keeping two of three phones, made immediate by the second's
-/// signature: the second hands its key package over from its pass, the
-/// first's commit starts the new group with it, the second joins by its
-/// Welcome and both hold the new epoch's keys; the third, named, is out
-/// and holds none of them. A fourth phone then pairs from the first, the
-/// second's vote the one its commit needs.
-#[test]
-fn a_regroup_keeps_two_of_three_and_a_fourth_pairs() {
-    let (world, first, second, third) = three_phones(0xb1);
-    let before = first.node.space().unwrap().scope_key(b"notes").unwrap();
-    let regroup = first
-        .node
-        .personal()
-        .unwrap()
-        .regroup(&*first.hand, vec![2])
-        .unwrap();
-    second
-        .node
-        .personal()
-        .unwrap()
-        .cosign(&*second.hand, regroup.index)
-        .unwrap();
-    // The second's background pass hands its key package over.
-    second.node.sync_personal().unwrap();
-    first.node.personal().unwrap().update(&*first.hand).unwrap();
-    for phone in [&second, &first, &second, &first] {
-        phone.node.sync_personal().unwrap();
-    }
-    let _ = third.node.sync_personal();
+    let old_sync = second.node.space().unwrap().sync_key();
+    let (opened, joined) = first.pair(&second, "second");
+    assert_eq!(opened.device, joined.device);
+    assert_ne!(
+        second.node.space().unwrap().sync_key(),
+        old_sync,
+        "new keys"
+    );
+    let fourth = fourth_pairs(&world, &first, &[&second], 0xa4);
     let key = first.node.space().unwrap().scope_key(b"notes").unwrap();
     assert_ne!(key, before, "a new group's keys");
-    assert_eq!(
-        second.node.space().unwrap().scope_key(b"notes").unwrap(),
-        key
-    );
+    second.node.sync_personal().unwrap();
+    for phone in [&second, &fourth] {
+        assert_eq!(
+            phone.node.space().unwrap().scope_key(b"notes").unwrap(),
+            key
+        );
+    }
     assert_ne!(
         third.node.space().unwrap().scope_key(b"notes").ok(),
         Some(key)
     );
-    for phone in [&first, &second] {
-        let devices = phone.node.personal().unwrap().devices().unwrap();
-        let standing: Vec<_> = devices.iter().filter(|device| !device.removed).collect();
-        assert_eq!(
-            standing.iter().map(|device| device.id).collect::<Vec<_>>(),
-            vec![0, 1],
-            "{devices:?}"
-        );
-    }
-    // The agent no longer admits the third's sync key.
-    let out = third.node.personal().unwrap().devices().unwrap_err();
-    assert!(out.message.contains("NotAdmitted"), "{out:?}");
-
-    let fourth = fourth_pairs(&world, &first, &[&second], 0xb4);
-    second.node.sync_personal().unwrap();
-    let key = first.node.space().unwrap().scope_key(b"notes").unwrap();
-    assert_eq!(
-        second.node.space().unwrap().scope_key(b"notes").unwrap(),
-        key
-    );
-    assert_eq!(
-        fourth.node.space().unwrap().scope_key(b"notes").unwrap(),
-        key
-    );
-}
-
-/// A regroup whose kept phone never syncs: the regrouper's commit waits a
-/// bounded time for its handover, then is refused naming it and holds
-/// nothing; the phone the regroup names commits nothing. The way on is the
-/// silent phone's removal: once it matures, the same commit starts the new
-/// group without it.
-#[test]
-fn a_regroup_waits_a_bounded_time_for_a_kept_phones_handover() {
-    let (_world, first, _second, third) = three_phones(0xc1);
-    first
-        .node
-        .personal()
-        .unwrap()
-        .regroup(&*first.hand, vec![2])
-        .unwrap();
-    after(policy().operation_delay_ms);
-    let started = std::time::Instant::now();
-    let refused = first
-        .node
-        .personal()
-        .unwrap()
-        .update(&*first.hand)
-        .unwrap_err();
-    let waited = started.elapsed();
-    assert!(
-        waited >= Duration::from_secs(10) && waited < Duration::from_secs(30),
-        "bounded: {waited:?}"
-    );
-    assert_eq!(refused.code, s4_credential_contract::Code::Refused);
-    assert!(
-        refused.message.contains("\"second\" (device 1)"),
-        "{refused:?}"
-    );
-    // The named phone commits nothing and hands nothing over.
-    assert!(third.node.personal().unwrap().update(&*third.hand).is_err());
-    first
-        .node
-        .personal()
-        .unwrap()
-        .remove(&*first.hand, 1)
-        .unwrap();
-    after(policy().operation_delay_ms);
-    first.node.personal().unwrap().update(&*first.hand).unwrap();
-    first.node.sync_personal().unwrap();
-    let devices = first.node.personal().unwrap().devices().unwrap();
+    let devices = fourth.node.personal().unwrap().devices().unwrap();
     let standing: Vec<_> = devices.iter().filter(|device| !device.removed).collect();
-    assert_eq!(standing.len(), 1, "{devices:?}");
-    first.node.space().unwrap().scope_key(b"notes").unwrap();
-}
-
-/// The joiner's open claim that the home refuses: each refusal recorded
-/// as the job's failure and the next attempt put off, the wait doubled and
-/// kept across a restart; made once the home admits it.
-#[test]
-fn a_refused_open_claim_backs_off() {
-    let world = world();
-    let home = world.home(HOME, 2, 1);
-    let first = phone(&world, 0x71);
-    let second = phone(&world, 0x72);
-    first.claim(&world, home, KitKind::Phrase, "first");
-    first.pair(&second, "second");
-    second.node.space().unwrap().set_claim_retry(4_000);
-    let members = || world.state.lock().unwrap().spaces[&home].tree.members();
-    let openings = || world.state.lock().unwrap().openings;
-    let before = members();
-    world.state.lock().unwrap().closed = true;
-
-    let asked = openings();
-    let refused_at = wall();
-    let synced = second.node.sync_personal().unwrap();
-    assert_eq!(synced.failed, 1, "the refusal is the job's failure");
-    assert_eq!(openings(), asked + 1);
-    let due = second
-        .node
-        .space()
-        .unwrap()
-        .claim_due()
-        .expect("still owed");
-    assert!(
-        due >= refused_at + 2_000 && due <= wall() + 4_000,
-        "put off"
-    );
-    // Not tried again before its time.
-    second.node.sync_personal().unwrap();
-    assert_eq!(openings(), asked + 1, "no attempt before the wait ends");
-
-    std::thread::sleep(Duration::from_millis(due.saturating_sub(wall()) + 100));
-    let refused_at = wall();
-    second.node.sync_personal().unwrap();
-    assert_eq!(openings(), asked + 2);
-    let due = second
-        .node
-        .space()
-        .unwrap()
-        .claim_due()
-        .expect("still owed");
-    assert!(
-        due >= refused_at + 4_000 && due <= wall() + 8_000,
-        "the wait doubled"
-    );
-    let second = second.restart(&world);
-    assert_eq!(second.node.space().unwrap().claim_due(), Some(due), "kept");
-    second.node.space().unwrap().set_claim_retry(4_000);
-
-    world.state.lock().unwrap().closed = false;
-    std::thread::sleep(Duration::from_millis(due.saturating_sub(wall()) + 100));
-    let synced = second.node.sync_personal().unwrap();
-    assert_eq!((synced.synced, synced.failed), (1, 0));
-    assert_eq!(members(), before + 1, "made once admitted");
-    assert_eq!(second.node.space().unwrap().claim_due(), None);
+    assert_eq!(standing.len(), 3, "{devices:?}");
 }
 
 /// A space the first phone enrolls in after its claim: recorded in the
@@ -1171,71 +951,6 @@ fn a_personal_space_this_build_does_not_read_is_kept_and_sign_in_runs() {
     }
 }
 
-/// A move whose carry was cut short (the connection lost, the process
-/// killed before its last push): the background job finishes it, and the
-/// move called again shows no new kit; the space is at its new home
-/// already.
-#[test]
-fn an_interrupted_carry_is_finished_by_the_background_job() {
-    let push = common::world::Step::call("push");
-    let moved = |kill: Option<usize>| {
-        let world = world();
-        let home = world.home(HOME, 2, 1);
-        let elsewhere = world.home(ELSEWHERE, 3, 2);
-        let phone = phone(&world, 0xf1);
-        phone.claim(&world, home, KitKind::Phrase, "phone");
-        phone.node.space().unwrap().set_wait(3_000);
-        let moving = Claim {
-            home: world.home_of(elsewhere),
-            kit: KitKind::Phrase,
-            label: "phone".into(),
-        };
-        world.trace_from_now(phone.tag);
-        if let Some(nth) = kill {
-            world.kill(phone.tag, push, nth, common::world::Death::Before);
-        }
-        let cut = phone
-            .node
-            .personal()
-            .unwrap()
-            .move_home(&*phone.hand, moving.clone());
-        (world, elsewhere, phone, moving, cut)
-    };
-    // The carry's last push is the move's last.
-    let (world, _, phone, _, moved_whole) = moved(None);
-    moved_whole.unwrap();
-    let pushes = world
-        .trace(phone.tag)
-        .iter()
-        .filter(|step| **step == push)
-        .count();
-    let (world, elsewhere, phone, moving, cut) = moved(Some(pushes));
-    assert!(world.died(phone.tag), "{cut:?}");
-    let phone = phone.restart(&world);
-    let shown = phone.hand.phrases.lock().unwrap().len();
-    let synced = phone.node.sync_personal().unwrap();
-    assert_eq!((synced.synced, synced.failed), (1, 0), "{synced:?}");
-    let again = phone
-        .node
-        .personal()
-        .unwrap()
-        .move_home(&*phone.hand, moving)
-        .unwrap_err();
-    assert!(again.message.contains("at that home already"), "{again:?}");
-    assert_eq!(
-        phone.hand.phrases.lock().unwrap().len(),
-        shown,
-        "no new kit"
-    );
-    let pool = world.state.lock().unwrap().spaces[&elsewhere]
-        .homes
-        .as_ref()
-        .unwrap()
-        .pool
-        .len();
-    assert_eq!(pool, 1, "one agent given");
-}
-
 /// A restore an `alive` cancelled: the kit entered again opens a new
 /// restore, which matures, rather than resuming the cancelled one.
 #[test]
@@ -1287,22 +1002,80 @@ fn a_restore_cancelled_by_alive_is_opened_anew() {
     assert_eq!(restored.agent, claimed.agent);
 }
 
-/// A device a move left behind pairs again at the new home, its old group
-/// still held: its hello names what it carries from the group it leaves,
-/// its key package and its rejoin are for those same keys, and it joins
-/// the moved set beside the device that moved.
+/// A move cut short after its leave (the process killed before the claim
+/// at the new home): the phone holds no personal space, its old home's
+/// space left; the move called again claims there with a new kit, and the
+/// space is at its new home.
 #[test]
-fn a_device_a_move_left_rejoins_at_the_new_home() {
+fn a_move_cut_short_after_its_leave_claims_again() {
+    let claim = common::world::Step::proven("claim");
+    let world = world();
+    let home = world.home(HOME, 2, 1);
+    let elsewhere = world.home(ELSEWHERE, 3, 2);
+    let phone = phone(&world, 0xf1);
+    phone.claim(&world, home, KitKind::Phrase, "phone");
+    phone.node.space().unwrap().set_wait(3_000);
+    let moving = Claim {
+        home: world.home_of(elsewhere),
+        kit: KitKind::Phrase,
+        label: "phone".into(),
+    };
+    world.trace_from_now(phone.tag);
+    world.kill(phone.tag, claim, 1, common::world::Death::Before);
+    let cut = phone
+        .node
+        .personal()
+        .unwrap()
+        .move_home(&*phone.hand, moving.clone());
+    assert!(world.died(phone.tag), "{cut:?}");
+    let phone = phone.restart(&world);
+    assert!(!phone.node.space().unwrap().grouped(), "the old space left");
+    let moved = phone
+        .node
+        .personal()
+        .unwrap()
+        .move_home(&*phone.hand, moving.clone())
+        .unwrap();
+    let again = phone
+        .node
+        .personal()
+        .unwrap()
+        .move_home(&*phone.hand, moving)
+        .unwrap_err();
+    assert!(again.message.contains("at that home already"), "{again:?}");
+    let pool = world.state.lock().unwrap().spaces[&elsewhere]
+        .homes
+        .as_ref()
+        .unwrap()
+        .pool
+        .len();
+    assert_eq!(pool, 1, "one agent given");
+    assert!(!world.carrying(moved.agent).is_empty());
+}
+
+/// A device a move left behind pairs again at the new home: it leaves the
+/// space it held at the old home and joins the moved set with new keys
+/// beside the device that moved, nothing carried; each device's book rows
+/// are written again there, and each reads the other's.
+#[test]
+fn a_device_a_move_left_pairs_again_at_the_new_home() {
     let world = world();
     let home = world.home(HOME, 2, 1);
     let elsewhere = world.home(ELSEWHERE, 3, 1);
     let first = phone(&world, 0x51);
     let second = phone(&world, 0x52);
+    let member = first.enroll();
+    world.enroll(AGENT, &member);
     first.claim(&world, home, KitKind::Phrase, "first phone");
     first.pair(&second, "second phone");
     for phone in [&first, &second] {
         phone.node.sync_personal().unwrap();
     }
+    assert_eq!(
+        second.node.space().unwrap().recorded(0),
+        1,
+        "the first's book"
+    );
     let moved = first
         .node
         .personal()
@@ -1316,11 +1089,19 @@ fn a_device_a_move_left_rejoins_at_the_new_home() {
             },
         )
         .unwrap();
+    assert_eq!(moved.device, 0);
     let alone = first.node.personal().unwrap().devices().unwrap();
     assert_eq!(alone.iter().filter(|device| !device.removed).count(), 1);
 
+    let old_sync = second.node.space().unwrap().sync_key();
     let (opened, joined) = first.pair(&second, "second phone");
-    assert_eq!(opened.device, joined.device);
+    assert_eq!((opened.device, joined.device), (1, 1));
+    assert_eq!((opened.memberships, joined.memberships), (1, 1));
+    assert_ne!(
+        second.node.space().unwrap().sync_key(),
+        old_sync,
+        "new keys"
+    );
     let devices = second.node.personal().unwrap().devices().unwrap();
     assert_eq!(
         devices.iter().filter(|device| !device.removed).count(),
@@ -1328,6 +1109,13 @@ fn a_device_a_move_left_rejoins_at_the_new_home() {
         "{devices:?}"
     );
     assert!(devices.iter().any(|device| device.me && !device.removed));
-    second.node.sync_personal().unwrap();
+    for phone in [&first, &second, &first, &second] {
+        phone.node.sync_personal().unwrap();
+    }
+    for phone in [&first, &second] {
+        let space = phone.node.space().unwrap();
+        assert_eq!(space.recorded(0), 1, "the first's book at the new home");
+        assert_eq!(space.recorded(1), 1, "the second's book at the new home");
+    }
     assert!(!world.carrying(moved.agent).is_empty());
 }

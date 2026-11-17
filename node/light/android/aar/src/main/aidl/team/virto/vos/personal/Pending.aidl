@@ -13,7 +13,7 @@ enum Pending {
     REPLACE = 2,
     /** The recovery kit replaced. */
     ROTATE = 3,
-    /** The devices named removed and a new group started. */
+    /** Every other device removed and a new group started by one alone. */
     REGROUP = 4,
     /** Every device removed by the kit's restore. */
     RESTORE = 5,
@@ -21,8 +21,6 @@ enum Pending {
     RESTORING = 6,
     /** This device is out of its group. */
     REMOVED = 7,
-    /** The yearly re-proof is due. */
-    RENEW = 8,
     /** The personal space raised an alarm, its detail named. */
     ALARM = 9,
     /** This device cannot follow its group: it re-pairs, or regroups. */

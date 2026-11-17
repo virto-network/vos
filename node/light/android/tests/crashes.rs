@@ -353,9 +353,9 @@ fn a_restore_killed_at_any_step_matures_once_resumed() {
 }
 
 /// A move killed anywhere: moved again, it ends at the one agent the new
-/// home gave, its kit shown once, everything carried (a carry cut short
-/// finished by the background job or by the move called again, never by a
-/// new kit).
+/// home gave, its kit shown once and one admin key made for it (a move
+/// killed before its leave leaving again, one killed after finishing its
+/// claim, never with a new kit).
 #[test]
 fn a_move_killed_at_any_step_ends_at_one_agent_with_one_kit() {
     let moving = |world: &World, home: u32| Claim {
@@ -414,6 +414,10 @@ fn a_move_killed_at_any_step_ends_at_one_agent_with_one_kit() {
         let synced = phone.node.sync_personal().unwrap();
         assert_eq!(synced.failed, 0, "{at}");
         assert!(holds(&phone), "{at}");
-        assert_eq!(phone.hand.admin_keys(), 1, "{at}: one admin key");
+        assert_eq!(
+            phone.hand.admin_keys(),
+            2,
+            "{at}: the claim's admin key and the move's"
+        );
     });
 }

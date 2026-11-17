@@ -4,26 +4,24 @@
 //! envelopes it should have refused. Each scenario is detected or refused
 //! as §8 says: a rollback (B3); equivocation on commits and on operations
 //! (B4); a partition (B19); a dropped veto (B8); a forged operation (B6);
-//! a stale-epoch push (A8, B8); a backdated envelope (A7); and a wrong
-//! checkpoint (C4), beside the checkpoints a paired device and a restore's
-//! device start from (C3, C12) and the sample audit of a device's own
-//! pushes (B2).
+//! a stale-epoch push (A8, B8); and a backdated envelope (A7); beside the
+//! sample audit of a device's own pushes (B2).
 
 use ed25519_dalek::SigningKey;
 use vos_abi::Encode;
 use vos_abi::ids::InstanceId;
-use vos_light::group::{Alarm, DeviceGroup, Event, Pairing, Restored};
+use vos_light::group::{Alarm, DeviceGroup, Event};
 use vos_light::personal::{Answer, Frontier, Link, SealedSync, Unusable, Waiting};
 use vos_light::route::Route;
 use vos_light::sealed::{self, Body as Sealed, View};
 use vos_light::sync::Quarantine;
 use vos_wire::personal::{
-    AdminCall, Attached, Body, DeviceView, Entry, Op, OpState, Overview, PersonalError, Pushed,
-    Recorded, Scope, Signer, Woken, chain,
+    AdminCall, Attached, Body, Entry, Op, OpState, Overview, PersonalError, Pushed, Recorded,
+    Scope, Signer, Woken, chain,
 };
 
 use super::home::{self, Home};
-use super::phone::{Phone, kit, kit_key};
+use super::phone::{Phone, kit_key};
 use super::{
     Broken, HomeLink, MIN, NOTES, OTHER, count, household, install, policy, scope_of, set, settle,
     stored, with,
@@ -767,8 +765,7 @@ fn a_later_configuration_lowers_no_delay() {
 /// confirmed one, and no archive names an author: the node is passed over
 /// while the phone has a voice, and so is one the planted author wrote
 /// under the key of an epoch the phone was in, placed by the operators
-/// after its removal. A restore taking in an archive names no author
-/// either: only the device set's keys carry one.
+/// after its removal.
 #[test]
 fn an_archive_plants_no_author_and_no_later_key() {
     let (mut home, mut phones, _) = super::kit::household_with(3, vec![kit_key(0)]);
@@ -854,12 +851,6 @@ fn an_archive_plants_no_author_and_no_later_key() {
     assert_eq!(caught.passed.len(), 1);
     assert_eq!(caught.passed[0].why, Unusable::Author);
     assert_eq!(count(&phones[1].light, NOTES, 99), None);
-
-    let recovered = phones[2].group().archive().shareable();
-    phones[0].group().inherit(&recovered).unwrap();
-    let group = phones[0].group.as_ref().unwrap();
-    assert!(group.carriers(&stranger.sync_key(), &scope).is_empty());
-    assert!(!group.moved_authors().contains(&stranger.sync_key()));
 }
 
 /// B6: the operators forge a device-set operation, a removal with evidence
@@ -1114,173 +1105,4 @@ fn the_audit_of_a_devices_own_pushes_pushes_a_deleted_one_again() {
     .unwrap();
     assert!(caught.alarms.is_empty(), "{:?}", caught.alarms);
     assert_eq!(count(&phones[1].light, NOTES, 2), Some(20));
-}
-
-/// C3, C4 and C12: devices that read a scope to one position cut the same
-/// checkpoint there, and each other device acknowledges it; one cut over
-/// a reading the operators cut short is not acknowledged, and its
-/// readers raise the alarm. A paired device starts from its pairing
-/// device's checkpoint, named over the pairing channel; a restore's device
-/// from the latest that two devices other than its maker acknowledged.
-#[test]
-fn checkpoints_are_acknowledged_and_trusted_as_the_rules_say() {
-    let (mut home, mut phones) = household(3);
-    let scope = scope_of(&phones[0], NOTES);
-    write(&mut home, &mut phones[1], &[NOTES], NOTES, 4);
-    for key in 1..=3 {
-        write(&mut home, &mut phones[0], &[NOTES], NOTES, key);
-    }
-    for phone in &mut phones[..2] {
-        with(&mut home, phone, &[NOTES], |sync| sync.catch_up(NOTES)).unwrap();
-    }
-    // The third reads the scope as the operators show it: without the
-    // second's envelope, on which no node of the first's depends, and
-    // numbered densely without it.
-    let caught = shown(
-        &mut home,
-        &mut phones[2],
-        &[NOTES],
-        |_, held| {
-            held.into_iter()
-                .filter(|envelope| envelope.position != 1)
-                .enumerate()
-                .map(|(n, mut envelope)| {
-                    envelope.position = n as u64 + 1;
-                    envelope
-                })
-                .collect()
-        },
-        |sync| sync.catch_up(NOTES),
-    )
-    .unwrap();
-    assert!(caught.alarms.is_empty(), "{:?}", caught.alarms);
-
-    let made = with(&mut home, &mut phones[0], &[NOTES], |sync| {
-        sync.checkpoint(NOTES)
-    })
-    .unwrap();
-    assert_eq!((made.scope, made.position), (scope, 4));
-    let wrong = with(&mut home, &mut phones[2], &[NOTES], |sync| {
-        sync.checkpoint(NOTES)
-    })
-    .unwrap();
-    assert_eq!(wrong.position, 3);
-
-    // The second recomputes the first's from its own reading, one state at
-    // one position, and refuses the third's.
-    let acked = with(&mut home, &mut phones[1], &[NOTES], |sync| {
-        sync.acknowledge(NOTES)
-    })
-    .unwrap();
-    assert_eq!(acked.acknowledged, vec![4]);
-    assert_eq!(acked.alarms, vec![Alarm::Checkpoint { scope, position: 3 }]);
-    let acked = with(&mut home, &mut phones[2], &[NOTES], |sync| {
-        sync.acknowledge(NOTES)
-    })
-    .unwrap();
-    assert!(
-        acked.acknowledged.is_empty(),
-        "past its reading, and its own"
-    );
-    assert!(acked.alarms.is_empty());
-
-    // A device paired from the second starts from the checkpoint it
-    // acknowledged.
-    let mut paired = Phone::new(4);
-    let package = DeviceGroup::key_package(&paired.store, &paired.keys, home.now()).unwrap();
-    let (prepared, mut pairing) = phones[1]
-        .group()
-        .pair(paired.keys.clone(), package, home.now())
-        .unwrap();
-    pairing.trust(made);
-    let pairing = Pairing::from_bytes(&pairing.to_bytes()).unwrap();
-    paired.group = Some(DeviceGroup::join(&paired.store, paired.keys.clone(), pairing).unwrap());
-    phones[1].send(&mut home, &prepared).unwrap();
-    phones.push(paired);
-    settle(&mut home, &mut phones);
-    let paired = &mut phones[3];
-    install(&paired.light, NOTES);
-    let caught = with(&mut home, paired, &[NOTES], |sync| sync.catch_up(NOTES)).unwrap();
-    assert_eq!(caught.started, Some(4));
-    assert_eq!(caught.envelopes, 0, "nothing read before the checkpoint");
-    for key in 1..=4 {
-        assert_eq!(count(&paired.light, NOTES, key), Some(key * 10));
-    }
-    let acked = with(&mut home, paired, &[NOTES], |sync| sync.acknowledge(NOTES)).unwrap();
-    assert_eq!(acked.acknowledged, vec![4]);
-
-    // One handed a hash its content does not give refuses it, with the
-    // alarm, and reads the scope from its start.
-    let mut misled = Phone::new(5);
-    let package = DeviceGroup::key_package(&misled.store, &misled.keys, home.now()).unwrap();
-    let (prepared, mut pairing) = phones[1]
-        .group()
-        .pair(misled.keys.clone(), package, home.now())
-        .unwrap();
-    pairing.trust(vos_light::group::Checkpoint {
-        hash: [0x0b; 32],
-        ..made
-    });
-    misled.group = Some(DeviceGroup::join(&misled.store, misled.keys.clone(), pairing).unwrap());
-    phones[1].send(&mut home, &prepared).unwrap();
-    phones.push(misled);
-    settle(&mut home, &mut phones);
-    let misled = &mut phones[4];
-    install(&misled.light, NOTES);
-    let caught = with(&mut home, misled, &[NOTES], |sync| sync.catch_up(NOTES)).unwrap();
-    assert_eq!(caught.started, None);
-    assert_eq!(
-        caught.alarms,
-        vec![Alarm::Checkpoint { scope, position: 4 }]
-    );
-    assert_eq!(caught.envelopes, 4);
-    assert_eq!(count(&misled.light, NOTES, 4), Some(40));
-
-    // Every device lost: the restore's device trusts the checkpoint the
-    // second and the fourth acknowledged, not the third's, which none did.
-    let mut restored = Phone::new(9);
-    assert!(restored.store.adopt(phones[0].group().archive()).unwrap());
-    let next = kit_key(1);
-    let split = vos_light::group::restoring(&restored.store, &[next], &home.agent()).unwrap();
-    operate(
-        &mut home,
-        &kit(0),
-        &kit(0),
-        "restore",
-        (restored.keys.clone(), split.kit.clone()).encode(),
-        Some(*split.r2()),
-    );
-    home.pass(policy().kit_delay_ms);
-    home.call(&kit(0), "wake", ().encode())
-        .answer::<Woken>()
-        .unwrap();
-    woken(&mut home, &restored.sync);
-    let overview: Overview = home
-        .query(restored.sync_key(), "overview", ().encode())
-        .unwrap();
-    let devices: Vec<DeviceView> = home
-        .query(restored.sync_key(), "devices", ().encode())
-        .unwrap();
-    let read = Restored {
-        next: overview.next,
-        chain: overview.chain,
-        time: home.now(),
-        confirmed: overview.confirmed,
-        policy: policy(),
-        kit: vec![next],
-        r_hash: split.kit.r_hash,
-        devices,
-    };
-    restored.group = Some(
-        DeviceGroup::restore(&restored.store, home.agent(), restored.keys.clone(), read).unwrap(),
-    );
-    install(&restored.light, NOTES);
-    let caught = with(&mut home, &mut restored, &[NOTES], |sync| {
-        sync.catch_up(NOTES)
-    })
-    .unwrap();
-    assert_eq!(caught.started, Some(4));
-    for key in 1..=4 {
-        assert_eq!(count(&restored.light, NOTES, key), Some(key * 10));
-    }
 }

@@ -624,7 +624,7 @@ impl DeviceGroup {
             .as_ref()
             .is_some_and(|add| add.sync == me.sync && add.admin == me.admin);
         // A matured regroup's first commit starts a new group: the
-        // regrouper's restart, which the others join by its Welcome.
+        // regrouper's restart, of it alone, every other device removed.
         let restart = self.state.set.fresh == Some(pending.by);
         let candidate = if restart && !joining {
             let mut owed = pending.effect.remove.clone();
@@ -632,18 +632,11 @@ impl DeviceGroup {
             if pending.epoch != self.state.confirmed + 1
                 || pending.effect.add.is_some()
                 || owed != self.state.owed()
+                || self.state.id != Some(pending.by)
             {
                 return Ok(Processed::Refused);
             }
-            let outcome = if self.state.id == Some(pending.by) {
-                self.mls.own(&pending.handshake)
-            } else {
-                let Some(welcome) = &pending.welcome else {
-                    return Ok(Processed::Refused);
-                };
-                self.mls.join(welcome, time)
-            };
-            match outcome {
+            match self.mls.own(&pending.handshake) {
                 Ok(candidate) => candidate,
                 Err(vos_mls::Error::Refused(_)) => return Ok(Processed::Refused),
                 Err(vos_mls::Error::NotHeld) => return Ok(Processed::Unable),
@@ -805,7 +798,6 @@ impl DeviceGroup {
             }) if mine == h => {
                 if joining {
                     self.state.id = pending.added;
-                    self.state.renewed = pending.at;
                 }
                 // A restart keeps its regrouper's leaf; any other commit
                 // renews a replaced admin key's.
@@ -815,13 +807,9 @@ impl DeviceGroup {
                     // the agent's, and a device that could not follow
                     // follows it.
                     self.state.set.fresh = None;
-                    self.state.renewed = pending.at;
                     self.state.course = Course::Following;
                 }
                 self.state.offset = pending.epoch.saturating_sub(candidate.epoch());
-                if self.state.id == Some(pending.by) {
-                    self.state.renewed = pending.at;
-                }
                 if !restart && let Some(committer) = self.state.known_mut(pending.by) {
                     committer.leaf = committer.admin;
                 }

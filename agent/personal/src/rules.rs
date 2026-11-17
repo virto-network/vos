@@ -61,7 +61,7 @@ impl Personal {
         if self.lease.is_set() {
             return Err(PersonalError::Assigned);
         }
-        if kit.entries.len() > crate::KIT_ENTRIES || !device.bounded() {
+        if kit.entries.len() > crate::KIT_ENTRIES {
             return Err(PersonalError::Malformed);
         }
         let mut keys: Vec<[u8; 32]> = Vec::from([device.sync, device.admin]);

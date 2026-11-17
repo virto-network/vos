@@ -5,9 +5,7 @@
 //! joins the home-only space by its open claim and claims a personal agent
 //! there with a phrase kit, sealed to the pooled agent `Homes` names; a
 //! second phone is paired through a slot over Noise, its "home" nullifier
-//! recorded at `Homes` as its add is confirmed, makes its own open claim
-//! after the pairing, and re-proves the lease under its nullifier; the
-//! first enrolls it in another space by its owner proof and it confirms by
+//! recorded at `Homes` as its add is confirmed; the first enrolls it in another space by its owner proof and it confirms by
 //! its own; the first is retired, removed by the second and revoked in
 //! that space; and a second claim is refused at the device and at `Homes`.
 
@@ -353,7 +351,6 @@ impl Phone {
                 },
                 nullifier: [0; 32],
                 label: vec![n; 8],
-                carried: Vec::new(),
             },
             admin: Signer::new(admin),
             light,
@@ -759,33 +756,6 @@ fn a_personal_space_is_claimed_paired_and_its_first_phone_retired() {
     // Its nullifier is recorded at `Homes` as its add is confirmed.
     wait("the second phone's nullifier recorded", || {
         home.read::<Option<u32>>(HOMES, "agent", second.keys.nullifier) == Some(agent)
-    });
-
-    // Its own open claim, after the pairing; then its re-proof under its
-    // nullifier, the yearly prompt's.
-    open_claim(&mut sockets, &space, &second);
-    let path = second
-        .path(
-            &mut sockets,
-            space.agent,
-            &space.identity,
-            CREDENTIALS,
-            &HANDLE,
-        )
-        .unwrap();
-    let renew = home::renew_call(&space, agent, expires(&mut sockets)).unwrap();
-    let proof = prover
-        .prove_home(&second.secret(&HANDLE), &auth(&path), &renew, &home.auth)
-        .unwrap();
-    assert_eq!(
-        answer::<(), HomesError>(&sockets.credentialed(&renew, &proof)),
-        Ok(())
-    );
-    wait("the lease renewed", || {
-        personal
-            .log(&mut sockets, &second.sync.key, 0)
-            .iter()
-            .any(|(_, entry)| matches!(entry.body, Body::Renewed { .. }))
     });
 
     // The first enrolls it in the club by its owner proof; it confirms by

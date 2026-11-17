@@ -110,33 +110,6 @@ fn a_reopened_store_is_the_replica_it_was() {
     assert!(!rebuilt.equivocations.is_empty());
 }
 
-/// A forgotten cursor stays forgotten across a reopen, the nodes kept: the
-/// next feed is read from its start.
-#[test]
-fn a_forgotten_cursor_is_read_from_the_start() {
-    let dir = tempfile::tempdir().unwrap();
-    let items = accepted();
-    let (db, mut replica) = open(dir.path());
-    replica
-        .catch_up(&mut Server(items[..40].to_vec(), 16), &mut crdt)
-        .unwrap();
-    assert_eq!(replica.cursor(), Some(40));
-    let have = replica.have();
-    replica.forget_cursor().unwrap();
-    assert_eq!(replica.cursor(), None);
-    drop(replica);
-    drop(db);
-
-    let (_db, mut replica) = open(dir.path());
-    assert_eq!(replica.cursor(), None);
-    assert_eq!(replica.have(), have);
-    let read = replica
-        .catch_up(&mut Server(items[..40].to_vec(), 16), &mut crdt)
-        .unwrap();
-    assert_eq!(replica.cursor(), Some(40));
-    assert!(read.applied.is_empty(), "every node read again a duplicate");
-}
-
 /// A caller's own writes ride in a commit's batch: committed with the
 /// scope's changes, in the caller's keyspace.
 #[test]

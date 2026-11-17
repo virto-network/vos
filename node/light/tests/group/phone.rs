@@ -45,7 +45,6 @@ impl Phone {
             },
             nullifier: [n; 32],
             label: vec![n; 8],
-            carried: Vec::new(),
         };
         Self {
             light,

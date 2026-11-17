@@ -7,8 +7,7 @@
 //! the gateway's onion in process (each dial a stream handed to the
 //! onion's SSH port on a circuit of its own, as arti hands them): the
 //! first claims a personal agent with a phrase kit, the second is paired
-//! from it, makes its open claim from its background job and re-proves the
-//! lease, and both sync.
+//! from it, and both sync.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -168,8 +167,6 @@ fn phone(dial: &Arc<Onions>) -> (Node, tempfile::TempDir) {
         vos_facility::personal::Artifacts::embedded(),
     )
     .unwrap();
-    // The joiner's open claim at its next background pass, not hours on.
-    node.space().unwrap().set_claim_delay(0..0);
     (node, directory)
 }
 
@@ -291,12 +288,7 @@ fn a_phone_claims_at_the_demos_home_and_pairs_a_second_over_the_onion() {
     assert_eq!((opened.device, joined.device), (1, 1));
     assert_eq!(second.personal().unwrap().devices().unwrap().len(), 2);
 
-    // Its open claim by its background job, then, past its probation, its
-    // re-proof of the lease under its own nullifier; both phones' jobs sync.
-    second.sync_personal().unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(POLICY.probation_ms + 500));
-    second.sync_personal().unwrap();
-    second.personal().unwrap().renew(&*second_hand).unwrap();
+    // Both phones' jobs sync.
     for phone in [&first, &second] {
         let synced = phone.sync_personal().unwrap();
         assert_eq!((synced.synced, synced.failed), (1, 0));

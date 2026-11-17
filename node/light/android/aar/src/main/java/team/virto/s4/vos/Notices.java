@@ -178,8 +178,6 @@ final class Notices {
         return R.string.vos_pending_restoring;
       case Pending.REMOVED:
         return R.string.vos_pending_removed;
-      case Pending.RENEW:
-        return R.string.vos_pending_renew;
       case Pending.STUCK:
         return R.string.vos_pending_stuck;
       default:

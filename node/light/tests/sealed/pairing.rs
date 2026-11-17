@@ -1,9 +1,9 @@
 //! Pairing (`light-node.md` §3.8) through a pairing slot's inbox at
 //! `Personal`, over Noise `XXpsk3`: the QR code's slot, key and code; the
 //! offer of the home and the memberships, the joiner's hello with its
-//! "home" nullifier and its handles, the handover of the log, the archive,
-//! `R` and a checkpoint, acknowledged before the commit adding the joiner,
-//! which closes the slot; the joiner reading at once from the checkpoint;
+//! "home" nullifier and its handles, the handover of the log, the archive
+//! and `R`, acknowledged before the commit adding the joiner, which closes
+//! the slot; the joiner reading at once;
 //! its enrollments and confirmations held for their prompts; a second
 //! claim refused on a device that holds the archive; a code that is not
 //! the QR's, or an item the operators replaced, failing the handshake; and
@@ -147,26 +147,17 @@ fn hello(home: &Home, joiner: &mut Phone, n: u8, offer: &Offer) -> Hello {
     }
 }
 
-/// `opener` pairs `joiner` (phone `n`) through a slot, handing over
-/// `checkpoints`: the slot's code, the commit made once the joiner
-/// acknowledged the handover, and the enrollments held.
+/// `opener` pairs `joiner` (phone `n`) through a slot: the slot's code,
+/// the commit made once the joiner acknowledged the handover, and the
+/// enrollments held.
 fn pair(
     home: &mut Home,
     opener: &mut Phone,
     joiner: &mut Phone,
     n: u8,
     offer: Offer,
-    checkpoints: Vec<vos_light::group::Checkpoint>,
 ) -> (Code, Vec<Enrollment>) {
-    pair_in(
-        home,
-        opener,
-        joiner,
-        n,
-        offer,
-        checkpoints,
-        policy().inbox_item_bytes,
-    )
+    pair_in(home, opener, joiner, n, offer, policy().inbox_item_bytes)
 }
 
 /// [`pair`], the handover in items of `item_bytes`.
@@ -176,7 +167,6 @@ fn pair_in(
     joiner: &mut Phone,
     n: u8,
     offer: Offer,
-    checkpoints: Vec<vos_light::group::Checkpoint>,
     item_bytes: u32,
 ) -> (Code, Vec<Enrollment>) {
     let (mut side, qr) = open_in(home, opener, offer.clone(), item_bytes);
@@ -201,13 +191,10 @@ fn pair_in(
     };
     assert_eq!(heard, greeting);
     let enrollments = memberships::plan(&offer.memberships, &heard);
-    let (prepared, mut pairing) = opener
+    let (prepared, pairing) = opener
         .group()
         .pair(heard.device.clone(), heard.key_package.clone(), home.now())
         .unwrap();
-    for checkpoint in checkpoints {
-        pairing.trust(checkpoint);
-    }
     let puts = side.hand_over(&pairing).unwrap();
     assert_eq!(
         puts.len() > 1,
@@ -250,8 +237,8 @@ fn view_of(home: &Home, reader: &Phone, sync: [u8; 32]) -> DeviceView {
 
 /// A phone paired through the slot: the handover acknowledged before the
 /// commit, which closes the slot; the new phone's add carries its "home"
-/// nullifier; it reads the notes at once from the checkpoint its pairing
-/// device named, and writes; its enrollment and its confirmation are held
+/// nullifier; it reads the notes at once, and writes; its enrollment and
+/// its confirmation are held
 /// until made; and neither phone claims a second agent.
 #[test]
 fn a_phone_is_paired_through_the_slot_and_reads_at_once() {
@@ -265,23 +252,12 @@ fn a_phone_is_paired_through_the_slot_and_reads_at_once() {
         sync.catch_up(NOTES)
     })
     .unwrap();
-    let made = with(&mut home, &mut phones[0], &[NOTES], |sync| {
-        sync.checkpoint(NOTES)
-    })
-    .unwrap();
 
     let offer = Offer {
         home: home_space(&home),
         memberships: vec![club()],
     };
-    let (code, enrollments) = pair(
-        &mut home,
-        &mut phones[0],
-        &mut joiner,
-        2,
-        offer.clone(),
-        vec![made],
-    );
+    let (code, enrollments) = pair(&mut home, &mut phones[0], &mut joiner, 2, offer.clone());
     phones.push(joiner);
     settle(&mut home, &mut phones);
     let joined = phones[1].group().id().expect("its add confirmed");
@@ -306,13 +282,12 @@ fn a_phone_is_paired_through_the_slot_and_reads_at_once() {
         .answer::<u64>();
     assert_eq!(refused, Err(PersonalError::NotAdmitted));
 
-    // The joiner reads from the checkpoint, and writes.
+    // The joiner reads the scope, and writes.
     install(&phones[1].light, NOTES);
     let caught = with(&mut home, &mut phones[1], &[NOTES], |sync| {
         sync.catch_up(NOTES)
     })
     .unwrap();
-    assert_eq!(caught.started, Some(made.position));
     assert!(caught.alarms.is_empty(), "{:?}", caught.alarms);
     for key in 1..=3 {
         assert_eq!(count(&phones[1].light, NOTES, key), Some(key * 10));
@@ -539,7 +514,7 @@ fn a_pairing_cut_short_is_abandoned_and_paired_again() {
     );
 
     let mut joiner = Phone::new(3);
-    pair(&mut home, &mut phones[0], &mut joiner, 3, offer, Vec::new());
+    pair(&mut home, &mut phones[0], &mut joiner, 3, offer);
     phones.push(joiner);
     settle(&mut home, &mut phones);
     assert_eq!(phones[1].group().id(), Some(1));
@@ -575,15 +550,7 @@ fn a_phone_is_retired_once_its_successor_is_paired() {
     };
     // The handover in items of 600 bytes: many, read across pages.
     let mut successor = Phone::new(3);
-    pair_in(
-        &mut home,
-        &mut phones[0],
-        &mut successor,
-        3,
-        offer,
-        Vec::new(),
-        600,
-    );
+    pair_in(&mut home, &mut phones[0], &mut successor, 3, offer, 600);
     phones.push(successor);
     settle(&mut home, &mut phones);
     let id = phones[2].group().id().unwrap();
@@ -630,42 +597,6 @@ fn a_phone_is_retired_once_its_successor_is_paired() {
         (call.space, call.agent, call.instance),
         (CLUB, club().agent, club().credentials.0)
     );
-}
-
-/// The yearly prompt: due in the lease's last sixth or once the leaf is
-/// due its update, and the leaf's update made on it.
-#[test]
-fn the_yearly_prompt_renews_the_leaf() {
-    let (mut home, mut phones) = household(2);
-    let lease = policy().lease_ms;
-    let overview: vos_wire::personal::Overview = home
-        .query(phones[0].sync_key(), "overview", ().encode())
-        .unwrap();
-    let now = home.now();
-    assert!(!home::renewal_due(
-        phones[0].group(),
-        overview.lease_until,
-        lease,
-        now
-    ));
-    let late = overview.lease_until - lease / 6;
-    assert!(home::renewal_due(
-        phones[0].group(),
-        overview.lease_until,
-        lease,
-        late
-    ));
-    let leaf = now + vos_light::group::RENEW_AFTER_MS;
-    assert!(home::renewal_due(phones[0].group(), u64::MAX, lease, leaf));
-    let renew = home::renew_call(&home_space(&home), 7, now + 60_000).unwrap();
-    assert_eq!(renew.method, vos_light::method_id("renew"));
-    assert_eq!(renew.arguments, 7u32.encode());
-    let before = phones[0].group().confirmed();
-    phones[0].update(&mut home).unwrap();
-    settle(&mut home, &mut phones);
-    for phone in &mut phones {
-        assert_eq!(phone.group().confirmed(), before + 1);
-    }
 }
 
 /// The claim with a phrase and a security key: held in the store across a

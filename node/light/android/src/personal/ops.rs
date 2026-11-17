@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! The personal space's flows, each as the light node exposes it
-//! (`vos_light::home`, `pairing`, `memberships`, `kit`, `moving`), over the
+//! (`vos_light::home`, `pairing`, `memberships`, `kit`), over the
 //! facility's client: `Personal` for the agent and `Homes`, `Member` for an
 //! open claim, `Feed` for a home's tree, `Proven` for a proof. Every flow
 //! runs on the calling thread, each request blocking on the facility's
@@ -17,11 +17,10 @@ use vos_light::group::{Agent as GroupAgent, DeviceGroup, Event, Prepared, Restor
 use vos_light::home::{self, Claim as Claiming, Home as HomeSpace};
 use vos_light::kit::{KitSecret, SecurityKey};
 use vos_light::memberships;
-use vos_light::moving::{self, Move};
 use vos_light::pairing::{
     Code, Hello, Joined, Joiner, Membership as Offered, Offer, Opened, Opener,
 };
-use vos_light::personal::{Link as _, SealedSync, recover};
+use vos_light::personal::{Link as _, recover};
 use vos_light::route::Purpose;
 use vos_light::tor::Registrar;
 use vos_light::{AuthWitness, Call, Digest, Light, TreeKeeper, wire};
@@ -31,20 +30,19 @@ use vos_wire::homes::HomesError;
 use vos_wire::personal::{
     AdminClass, Attached, Attestation, Body, Candidacy, DeviceView, Entry, InboxItem, NewAdmin,
     NewDevice, OpState, Overview, PersonalError, RECOVERY, Recorded, RecoveryView, Standing,
+    Status,
 };
 use zeroize::Zeroizing;
 
-pub(super) mod regroup;
-
 use super::link::{AgentLink, Signer, answer};
 use super::{
-    Acked, Bound, CREDENTIAL_BOOK, ClaimDue, Held, Kept, Lent, PERSONAL, Restoring, Space, State,
-    failed, link, reference, unreached,
+    Acked, Bound, CREDENTIAL_BOOK, Held, Kept, Lent, PERSONAL, Restoring, Space, State, failed,
+    link, reference, unreached,
 };
 use crate::enrollment::Enrollment;
 use crate::job::now_ms;
 use crate::personal::{
-    Claim, Claimed, Device, Home, KitKind, Membership, Moved, Owed, PairCode, Paired, Posted,
+    Claim, Claimed, Device, Home, KitKind, Membership, Owed, PairCode, Paired, Posted,
 };
 use crate::session::{Inner, store_error};
 use crate::source::{Kind, Reference};
@@ -488,30 +486,6 @@ impl Space {
         }
     }
 
-    /// The joiner's open claim, made once its time is `now` or past, then
-    /// owed no more; refused, tried again after a wait doubled at each of
-    /// the home's refusals ([`super::CLAIM_RETRY`]), kept with its time.
-    pub(super) fn claim_if_due(&self, state: &mut State, now: u64) -> Result<(), Refusal> {
-        let Some(due) = state.claim_due.as_mut().filter(|due| due.due <= now) else {
-            return Ok(());
-        };
-        if let Err(refusal) = self.open_claim(&due.home, &due.member) {
-            // The home's refusal doubles the wait; a home not reached is
-            // tried again after the first wait.
-            let refusals = if refusal.code == Refused::Api {
-                1
-            } else {
-                due.refused = due.refused.saturating_add(1);
-                due.refused
-            };
-            due.due = now.saturating_add(self.claim_retry(refusals)?);
-            self.keep(state)?;
-            return Err(refusal);
-        }
-        state.claim_due = None;
-        self.keep(state)
-    }
-
     /// `member`'s path at the newest root of `home`'s tree, read from its
     /// feed until it holds the member's leaf.
     fn home_witness(&self, home: &HomeSpace, member: &[u8; 32]) -> Result<AuthWitness, Refusal> {
@@ -670,7 +644,6 @@ impl Space {
             },
             nullifier: home.nullifier(secret),
             label: label.as_bytes().to_vec(),
-            carried: Vec::new(),
         })
     }
 
@@ -690,7 +663,15 @@ impl Space {
     /// shows it, so a retry sends the same claim.
     pub fn claim(&self, prompts: Lent<'_>, request: Claim) -> Result<Claimed, Refusal> {
         let request = request.check()?;
-        let mut held = self.held();
+        self.claiming(&mut self.held(), prompts, request)
+    }
+
+    fn claiming(
+        &self,
+        held: &mut Held,
+        prompts: Lent<'_>,
+        request: Claim,
+    ) -> Result<Claimed, Refusal> {
         if held.group.is_some() {
             return Err(refused(
                 Refused::Refused,
@@ -718,7 +699,7 @@ impl Space {
         }
         self.pin(&kept);
         let home = kept.home.clone();
-        let reference = self.source(prompts, &mut held)?;
+        let reference = self.source(prompts, held)?;
         let secret = secret(prompts, &reference, &home.handle)?;
         let member = vos_light::member(&secret).to_bytes();
         self.open_claim(&home, &member)?;
@@ -726,7 +707,7 @@ impl Space {
             Some(claim) => claim,
             None => {
                 let agent = self.pooled(&home)?;
-                let device = self.device(&mut held, prompts, &home, &secret, &request.label)?;
+                let device = self.device(held, prompts, &home, &secret, &request.label)?;
                 let kit = new_kit(prompts, request.kit, &kept)?;
                 Claiming::prepare(
                     held.light.store(),
@@ -758,7 +739,7 @@ impl Space {
             }
         }
         let kept = held.state.bound.as_ref().ok_or_else(no_space)?.home.clone();
-        let entries = self.assigned(&mut held, &kept, agent)?;
+        let entries = self.assigned(held, &kept, agent)?;
         let group = claim
             .claimed(held.light.store(), PERSONAL, &entries, now_ms())
             .map_err(failed)?;
@@ -767,7 +748,7 @@ impl Space {
         held.arrived();
         self.keep(&held.state)?;
         self.book(&held.light, device);
-        self.follow(&mut held)?;
+        self.follow(held)?;
         Ok(Claimed {
             agent: agent.0,
             device,
@@ -1068,7 +1049,7 @@ impl Space {
 
     /// `pair_await`: the pairing the code shown opened, driven to its end:
     /// the handshake's messages, the joiner's hello, the handover (the
-    /// archive, `R`, each scope's checkpoint), then, once the joiner
+    /// archive and `R`), then, once the joiner
     /// acknowledged it, the commit adding it; the enrollments it is owed
     /// held, each deferrable.
     pub fn pair_await(&self, prompts: Lent<'_>) -> Result<Paired, Refusal> {
@@ -1189,16 +1170,11 @@ impl Space {
                              have synced",
                         ));
                     }
-                    let instances = held.light.instances().map_err(failed)?;
-                    let checkpoints = self.checkpoints(held, &instances);
                     let group = held.group.as_mut().ok_or_else(no_space)?;
-                    let (made, mut pairing) = group
+                    let (made, pairing) = group
                         .pair(heard.device.clone(), heard.key_package.clone(), now_ms())
                         .map_err(failed)?;
                     *prepared = Some(made);
-                    for checkpoint in checkpoints {
-                        pairing.trust(checkpoint);
-                    }
                     for put in opener.hand_over(&pairing).map_err(failed)? {
                         self.put(held, &put.arguments())?;
                     }
@@ -1274,25 +1250,6 @@ impl Space {
         Ok(())
     }
 
-    /// Each installed scope's checkpoint, for a pairing's handover.
-    fn checkpoints(
-        &self,
-        held: &mut Held,
-        instances: &[vos_abi::ids::InstanceId],
-    ) -> Vec<vos_light::group::Checkpoint> {
-        self.with_link(held, Purpose::Personal, |link, held| {
-            let Held { light, group, .. } = held;
-            let group = group.as_mut().ok_or_else(no_space)?;
-            let mut sync =
-                SealedSync::new(light, group, link, instances.to_vec()).map_err(failed)?;
-            Ok(instances
-                .iter()
-                .filter_map(|instance| sync.checkpoint(*instance).ok())
-                .collect())
-        })
-        .unwrap_or_default()
-    }
-
     /// An item put in the pairing slot under the sync key.
     fn put(&self, held: &mut Held, arguments: &[u8]) -> Result<(), Refusal> {
         self.with_link(held, Purpose::Personal, |link, _| {
@@ -1306,10 +1263,10 @@ impl Space {
     /// `pair_join`: the code scanned, the device joined through the slot:
     /// its hello (its keys, its "home" nullifier, its key package, its
     /// handle in each offered space, each from its source at its prompt),
-    /// the handover, its group joined, or rejoined after a move; the
-    /// acknowledgement left; then its open claim at the home (`Member`, a
-    /// session of its own), so its re-proof proves under the nullifier its
-    /// add recorded. The home sees the claim follow the join.
+    /// the handover, its group joined; the acknowledgement left. A device
+    /// that holds another personal space, or this one's as a device that
+    /// cannot follow it or is out of it, leaves it once the opener's offer
+    /// is read ([`Space::leave`]); one that follows this one is refused.
     pub fn pair_join(
         &self,
         prompts: Lent<'_>,
@@ -1323,11 +1280,38 @@ impl Space {
     }
 
     fn joining(&self, prompts: Lent<'_>, code: &[u8], label: &str) -> Result<Paired, Refusal> {
-        let delay = self.draw_claim_delay()?;
         crate::personal::label(label)?;
         let code = Code::from_bytes(code)
             .ok_or_else(|| refused(Refused::Arguments, "not a pairing code"))?;
         let mut held = self.held();
+        // A device of that personal space pairs again only once out of it:
+        // refused while the set holds it live; once its removal matured the
+        // agent admits its key no more, and it leaves at the offer.
+        if held
+            .group
+            .as_ref()
+            .is_some_and(|group| group.agent().identity == code.identity)
+        {
+            let sync = held.light.sync_key().verifying_key().to_bytes();
+            let listed = self.with_link(&mut held, Purpose::Personal, |link, _| {
+                link.query::<Vec<DeviceView>>("devices", ())
+                    .map_err(unreached)
+            })?;
+            match listed {
+                Ok(views)
+                    if views.iter().any(|view| {
+                        view.device.keys.sync == sync && view.device.status == Status::Live
+                    }) =>
+                {
+                    return Err(refused(
+                        Refused::Refused,
+                        "this device is in that personal space already",
+                    ));
+                }
+                Ok(_) | Err(PersonalError::NotAdmitted) => {}
+                Err(error) => return Err(agent_refused(error)),
+            }
+        }
         let kept = Kept {
             home: HomeSpace {
                 // The rest of the home comes in the offer.
@@ -1364,7 +1348,7 @@ impl Space {
         slot_put(self, &mut slot_signer, put.arguments())?;
         let mut home = None;
         let until = code.expires;
-        let (pairing, ack, offered, device) = loop {
+        let (pairing, ack, offer, device) = loop {
             if now_ms() > until {
                 return Err(refused(Refused::Refused, "the pairing's slot expired"));
             }
@@ -1390,16 +1374,17 @@ impl Space {
             match joiner.read(&items).map_err(failed)? {
                 Joined::Waiting => std::thread::sleep(POLL),
                 Joined::Offer(offer) => {
+                    // The code is the opener's: the space this device holds
+                    // is left, and it pairs as a fresh install.
+                    if held.group.is_some()
+                        || vos_light::home::holds_archive(held.light.store()).map_err(failed)?
+                        || held.state.restoring.is_some()
+                    {
+                        self.leave(&mut held)?;
+                    }
                     let reference = self.source(prompts, &mut held)?;
                     let secret = secret(prompts, &reference, &offer.home.handle)?;
-                    let mut device =
-                        self.device(&mut held, prompts, &offer.home, &secret, label)?;
-                    // A device of a group a move left says what it carries
-                    // in its hello: the keys it rejoins with name it.
-                    if let Some(old) = held.group.as_ref() {
-                        device = moving::naming(&held.light, old, device).map_err(moved)?;
-                    }
-                    let member = vos_light::member(&secret).to_bytes();
+                    let device = self.device(&mut held, prompts, &offer.home, &secret, label)?;
                     let mut handles = Vec::new();
                     for membership in &offer.memberships {
                         let there = self::secret(prompts, &reference, &membership.handle)?;
@@ -1416,22 +1401,20 @@ impl Space {
                         })
                         .map_err(failed)?;
                     slot_put(self, &mut slot_signer, put.arguments())?;
-                    home = Some((offer, device, member));
+                    home = Some((offer, device));
                 }
                 Joined::Handover(pairing, ack) => {
-                    let (offer, device, member) = home
+                    let (offer, device) = home
                         .take()
                         .ok_or_else(|| failed("a handover before the offer"))?;
-                    break (pairing, ack, (offer, member), device);
+                    break (pairing, ack, offer, device);
                 }
             }
         };
-        let (offer, member) = offered;
         // What the pairing makes this device's is kept before the
         // acknowledgement leaves, after which the opener commits the add:
-        // the home and agent, the open claim owed there, the
-        // acknowledgement itself, which a pass puts in the slot if this
-        // process dies first.
+        // the home and agent, the acknowledgement itself, which a pass puts
+        // in the slot if this process dies first.
         let kept = Kept {
             home: offer.home.clone(),
             onions: code.onions.clone(),
@@ -1439,35 +1422,15 @@ impl Space {
         self.pin(&kept);
         held.state.bound = Some(Bound { home: kept, agent });
         held.state.label = label.to_owned();
-        // The joiner's open claim at the home, so its re-proof proves under
-        // the nullifier its add recorded: made by the background job after a
-        // drawn delay, so the home's operators do not link the new member to
-        // the agent by its time.
-        held.state.claim_due = Some(ClaimDue {
-            home: offer.home.clone(),
-            member,
-            due: now_ms().saturating_add(delay),
-            refused: 0,
-        });
         self.keep(&held.state)?;
-        let old = held.group.take();
-        let joined = match old {
-            None if !vos_light::home::holds_archive(held.light.store()).map_err(failed)? => {
-                DeviceGroup::join(held.light.store(), device, *pairing).map_err(failed)
-            }
-            old => moving::rejoin(&held.light, old, device, *pairing).map_err(moved),
-        };
-        let group = match joined {
+        let group = match DeviceGroup::join(held.light.store(), device, *pairing) {
             Ok(group) => group,
-            Err(refusal) => {
-                // Not joined: what the pairing was to make dropped, the
-                // store's group (none, or the one a rejoin left) held.
+            Err(error) => {
+                // Not joined: what the pairing was to make dropped.
                 let store = held.light.store().clone();
-                let group = DeviceGroup::open(&store).ok().flatten();
-                held.state.unjoined(&store, group.as_ref())?;
-                held.group = group;
+                held.state.unjoined(&store, None)?;
                 self.keep(&held.state)?;
-                return Err(refusal);
+                return Err(failed(error));
             }
         };
         held.group = Some(group);
@@ -1487,9 +1450,6 @@ impl Space {
         held.state.acked = None;
         self.keep(&held.state)?;
         self.joined(&mut held)?;
-        if moving::carrying(held.light.store()).map_err(failed)? {
-            self.finish_move(&mut held)?;
-        }
         let device = held.group.as_ref().and_then(DeviceGroup::id).unwrap_or(0);
         self.book(&held.light, device);
         Ok(Paired {
@@ -1963,22 +1923,27 @@ impl Space {
         )
     }
 
-    /// `regroup`: the devices named removed and a new group started.
-    pub fn regroup(&self, prompts: Lent<'_>, remove: Vec<u32>) -> Result<Posted, Refusal> {
-        if remove.len() > super::MAX_REGROUP {
-            return Err(crate::refused(
-                crate::Code::Arguments,
-                format!("a regroup names at most {} devices", super::MAX_REGROUP),
-            ));
-        }
-        self.operate(&mut self.held(), prompts, "regroup", remove.encode(), None)
+    /// `regroup`: every other live device of the set removed and a new
+    /// group started by this device alone; the others pair again from it.
+    pub fn regroup(&self, prompts: Lent<'_>) -> Result<Posted, Refusal> {
+        let mut held = self.held();
+        let me = held
+            .group
+            .as_ref()
+            .and_then(DeviceGroup::id)
+            .ok_or_else(no_space)?;
+        let remove: Vec<u32> = self
+            .views(&mut held)?
+            .into_iter()
+            .filter(|view| view.id != me && view.device.status == Status::Live)
+            .map(|view| view.id)
+            .collect();
+        self.operate(&mut held, prompts, "regroup", remove.encode(), None)
     }
 
     /// `update`: a commit now, carrying every matured removal and this
-    /// device's leaf update; the yearly prompt's. After a matured regroup
-    /// it is the regrouper's new group, with the key packages every device
-    /// it keeps handed over ([`regroup`]); a kept device hands its own over
-    /// and makes no commit.
+    /// device's leaf update. After a matured regroup it is the regrouper's
+    /// new group, of it alone.
     pub fn update(&self, prompts: Lent<'_>) -> Result<(), Refusal> {
         let mut held = self.held();
         // What fell due settled first, so the log shows every matured
@@ -1987,37 +1952,19 @@ impl Space {
         self.settle(&mut held)?;
         self.follow(&mut held)?;
         self.drop_unsent(&mut held)?;
-        let group = held.group.as_ref().ok_or_else(no_space)?;
+        let group = held.group.as_mut().ok_or_else(no_space)?;
         let prepared = match group.regrouper() {
-            Some(regrouper) if Some(regrouper) == group.id() => {
-                let packages = self.handed_over(&mut held)?;
-                let group = held.group.as_mut().ok_or_else(no_space)?;
-                group.regroup(packages, now_ms())
-            }
+            Some(regrouper) if Some(regrouper) == group.id() => group.regroup(now_ms()),
             Some(regrouper) => {
-                if !self.hand_over_now(&mut held)? {
-                    return Err(refused(
-                        Refused::Refused,
-                        format!(
-                            "this device is out of device {regrouper}'s regroup, or cannot follow \
-                             the group: it re-pairs once the new group is made"
-                        ),
-                    ));
-                }
                 return Err(refused(
                     Refused::Refused,
                     format!(
-                        "device {regrouper}'s regroup starts the new group: this device \
-                         handed it its key package, and joins the new group once that device \
-                         commits it"
+                        "device {regrouper}'s regroup starts a new group of it alone: this \
+                         device pairs again from it"
                     ),
                 ));
             }
-            None => held
-                .group
-                .as_mut()
-                .ok_or_else(no_space)?
-                .commit(None, now_ms()),
+            None => group.commit(None, now_ms()),
         }
         .map_err(failed)?;
         self.commit(&mut held, prompts, &prepared)?;
@@ -2025,39 +1972,6 @@ impl Space {
             self.follow(&mut held)?;
         }
         Ok(())
-    }
-
-    /// `renew`: the yearly re-proof at the home under this device's
-    /// nullifier, then the leaf's update on the same prompt.
-    pub fn renew(&self, prompts: Lent<'_>) -> Result<(), Refusal> {
-        let held = self.held();
-        let (kept, agent) = (
-            held.state.home.clone().ok_or_else(no_space)?,
-            held.state.agent.ok_or_else(no_space)?,
-        );
-        let reference = reference(&held.state).ok_or_else(no_space)?;
-        if held.state.claim_due.is_some() {
-            return Err(refused(
-                Refused::Refused,
-                "this device's membership at the home is not made yet: the background job makes \
-                 it within hours of the pairing",
-            ));
-        }
-        drop(held);
-        let home = &kept.home;
-        let secret = secret(prompts, &reference, &home.handle)?;
-        let member = vos_light::member(&secret).to_bytes();
-        let witness = self.home_witness(home, &member)?;
-        let now = self.time(home.handle, Purpose::Fetch)?;
-        let call = home::renew_call(home, agent.0, now + EXPIRY_MS).map_err(failed)?;
-        self.prove_home::<()>(home, secret, witness, call)?
-            .map_err(|error| {
-                refused(
-                    Refused::Refused,
-                    format!("`Homes` refused the re-proof: {error:?}"),
-                )
-            })?;
-        self.update(prompts)
     }
 
     // ----- the kit -----
@@ -2370,183 +2284,39 @@ impl Space {
 
     // ----- moving home -----
 
-    /// `move_home`: the personal space moved to another home: this
-    /// device's open claim there, the agent its `Homes` names claimed with
-    /// a new kit, a signed notice left at the old home for the other
-    /// devices, the old group left and the new one started, then everything
-    /// carried; the other devices pair again from this one.
-    pub fn move_home(&self, prompts: Lent<'_>, request: Claim) -> Result<Moved, Refusal> {
+    /// `move_home`: the personal space moved to another home, carrying
+    /// nothing: once that home answers with an agent to give, this device
+    /// leaves the space it holds, with no call to its old home
+    /// ([`Space::leave`]), and claims an agent there with a new kit, as a
+    /// first claim does; the other devices leave and pair again from this
+    /// one. Called again after a claim cut short, it finishes that claim.
+    pub fn move_home(&self, prompts: Lent<'_>, request: Claim) -> Result<Claimed, Refusal> {
         let request = request.check()?;
         let mut held = self.held();
         let kept = kept_of(&request.home);
-        // A move whose carry was cut short is finished: no new kit, no
-        // other agent.
-        if moving::carrying(held.light.store()).map_err(failed)? {
-            let agent = held.state.agent.ok_or_else(no_space)?;
-            let carried = self.finish_move(&mut held)?;
-            return Ok(Moved {
-                agent: agent.0,
-                carried,
-            });
+        if held.group.is_some()
+            && held
+                .state
+                .home
+                .as_ref()
+                .is_some_and(|at| at.home.handle == kept.home.handle)
+        {
+            return Err(refused(
+                Refused::Refused,
+                "the personal space is at that home already",
+            ));
         }
-        let pending = Move::pending(held.light.store()).map_err(failed)?;
-        match (&pending, &held.state.bound) {
-            (None, _) => {
-                let group = held.group.as_ref().ok_or_else(no_space)?;
-                if group.course() != vos_light::group::Course::Following {
-                    return Err(refused(
-                        Refused::Refused,
-                        "this device does not follow its group: it moves nothing",
-                    ));
-                }
-                if held
-                    .state
-                    .home
-                    .as_ref()
-                    .is_some_and(|at| at.home.handle == kept.home.handle)
-                {
-                    return Err(refused(
-                        Refused::Refused,
-                        "the personal space is at that home already",
-                    ));
-                }
-                if moving::moving(held.light.store()).map_err(failed)?
-                    || Claiming::pending(held.light.store())
-                        .map_err(failed)?
-                        .is_some()
-                {
-                    return Err(refused(Refused::Refused, "a move or a claim waits already"));
-                }
-            }
-            (Some(_), Some(bound)) if bound.home.home.handle != kept.home.handle => {
-                return Err(refused(
-                    Refused::Refused,
-                    "a move to another home is under way: move there again to finish it",
-                ));
-            }
-            (Some(_), _) => {}
+        let store = held.light.store();
+        let holds = held.group.is_some()
+            || vos_light::home::holds_archive(store).map_err(failed)?
+            || held.state.restoring.is_some();
+        if holds && Claiming::pending(store).map_err(failed)?.is_none() {
+            self.pin(&kept);
+            self.pooled(&kept.home)?;
+            self.leave(&mut held)?;
         }
-        held.state.home.as_ref().ok_or_else(no_space)?;
-        self.pin(&kept);
-        let home = kept.home.clone();
-        let reference = reference(&held.state).ok_or_else(no_space)?;
-        let secret = secret(prompts, &reference, &home.handle)?;
-        let member = vos_light::member(&secret).to_bytes();
-        self.open_claim(&home, &member)?;
-        let held_move = match pending {
-            Some(held_move) => held_move,
-            None => {
-                let agent = self.pooled(&home)?;
-                let label = held.state.label.clone();
-                let mut device = self.device(&mut held, prompts, &home, &secret, &label)?;
-                device.nullifier = home.nullifier(&secret);
-                let kit = new_kit(prompts, request.kit, &kept)?;
-                let group = held.group.as_ref().ok_or_else(no_space)?;
-                Move::prepare(
-                    &held.light,
-                    group,
-                    device,
-                    vec![kit.key()],
-                    agent.0,
-                    agent.1,
-                )
-                .map_err(|error| refused(Refused::Refused, error.to_string()))?
-            }
-        };
-        let agent = held_move.agent();
-        held.state.bound = Some(Bound {
-            home: kept.clone(),
-            agent,
-        });
-        // This device's open claim at the new home is made: none owed at
-        // the old one, which the space leaves.
-        held.state.claim_due = None;
-        self.keep(&held.state)?;
-        let witness = self.home_witness(&home, &member)?;
-        let now = self.time(home.handle, Purpose::Fetch)?;
-        let call = held_move.call(&home, now + EXPIRY_MS).map_err(failed)?;
-        match self.prove_home::<u32>(&home, secret, witness, call)? {
-            Ok(_) | Err(HomesError::Claimed) => {}
-            Err(error) => {
-                held_move.abandon(held.light.store()).map_err(failed)?;
-                held.state.bound = None;
-                self.keep(&held.state)?;
-                return Err(refused(
-                    Refused::Refused,
-                    format!("`Homes` refused the move: {error:?}"),
-                ));
-            }
-        }
-        // The notice at the old home, sealed under the old group's epoch,
-        // unless a process cut short left that group already.
-        if held.group.is_some() {
-            let notice = held_move.notice(&home);
-            self.with_link(&mut held, Purpose::Personal, |link, held| {
-                let Held { light, group, .. } = held;
-                let group = group.as_mut().ok_or_else(no_space)?;
-                let mut sync = SealedSync::new(light, group, link, Vec::new()).map_err(failed)?;
-                sync.announce(&notice).map(drop).map_err(failed)
-            })?;
-        }
-        let entries = self.assigned(&mut held, &kept, agent)?;
-        let old_group = held.group.take();
-        let group = match held_move.claimed(&held.light, old_group, PERSONAL, &entries, now_ms()) {
-            Ok(group) => group,
-            Err(error) => {
-                // The store's group, whichever the move left, held again.
-                held.group = DeviceGroup::open(held.light.store()).ok().flatten();
-                return Err(failed(error));
-            }
-        };
-        held.group = Some(group);
-        held.arrived();
-        held.sync = Signer::new(held.light.sync_key().verifying_key().to_bytes());
-        self.keep(&held.state)?;
-        self.follow(&mut held)?;
-        let carried = self.finish_move(&mut held)?;
-        Ok(Moved {
-            agent: agent.0,
-            carried,
-        })
+        self.claiming(&mut held, prompts, request)
     }
-
-    /// Everything carried to the new home (`moving::finish`): what the
-    /// archive and each scope hold that the new agent lacks.
-    fn finish_move(&self, held: &mut Held) -> Result<u64, Refusal> {
-        self.with_link(held, Purpose::Personal, |link, held| {
-            let Held { light, group, .. } = held;
-            let group = group.as_mut().ok_or_else(no_space)?;
-            carry(light, group, link)?.ok_or_else(|| {
-                refused(
-                    Refused::Api,
-                    "the move is not carried whole yet: sync again",
-                )
-            })
-        })
-    }
-}
-
-/// The carry of a move held in `light`'s store to the agent of `group`
-/// (`moving::finish`), if one waits: the nodes pushed once all of it went
-/// (none pushed when no move waits), or `None` while some waits.
-pub(super) fn carry(
-    light: &mut Light,
-    group: &mut DeviceGroup,
-    link: &mut AgentLink<'_>,
-) -> Result<Option<u64>, Refusal> {
-    if !moving::carrying(light.store()).map_err(failed)? {
-        return Ok(Some(0));
-    }
-    let instances = light.instances().map_err(failed)?;
-    let mut sync = SealedSync::new(light, group, link, instances).map_err(failed)?;
-    let finished = moving::finish(&mut sync).map_err(failed)?;
-    Ok(finished.done.then(|| {
-        finished
-            .scopes
-            .iter()
-            .map(|(_, _, carried)| carried.pushed.len() as u64)
-            .sum()
-    }))
 }
 
 /// Whether the restore whose arguments are `arguments` was cancelled, as
@@ -2615,14 +2385,5 @@ impl State {
         if self.next_admin.len() > KEPT {
             self.next_admin.remove(0);
         }
-    }
-}
-
-/// A move's or a rejoin's refusal: a device that carries more authors than
-/// its keys can name is refused, as nothing this device can retry fixes.
-fn moved(error: moving::MoveError) -> Refusal {
-    match error {
-        moving::MoveError::Carried => refused(Refused::Refused, error.to_string()),
-        error => failed(error),
     }
 }

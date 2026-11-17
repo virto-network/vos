@@ -16,7 +16,7 @@ use s4_credential_contract::Onion;
 use s4_credential_contract::java::{JavaError, Parcel};
 use s4_credential_contract::jvm::{compile, round_trip, with_vm};
 use vos_facility::personal::contract::{
-    AIDL, Claim, Claimed, Device, Home, KitKind, Membership, Moved, Notice, Owed, PairCode, Paired,
+    AIDL, Claim, Claimed, Device, Home, KitKind, Membership, Notice, Owed, PairCode, Paired,
     Pending, Posted, REGISTRY, Seen, Synced,
 };
 
@@ -135,13 +135,6 @@ fn every_type_crosses_its_parcelable_unchanged() {
             Posted {
                 index: u64::MAX,
                 at: 1_700_000_000_000,
-            },
-        );
-        round_trip(
-            env,
-            Moved {
-                agent: 12,
-                carried: 40,
             },
         );
 

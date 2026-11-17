@@ -21,9 +21,9 @@
 //!   once the evidence supports it (its delay passed unvetoed, or a
 //!   verified second signature or resolution), else [`Alarm::Unsigned`].
 //!   A commit carries every removal this device honours; a matured
-//!   regroup's first commit is its regrouper's new group
-//!   ([`DeviceGroup::regroup`]), joined by Welcome; a restore's device
-//!   starts its own ([`DeviceGroup::restore`]).
+//!   regroup's first commit is its regrouper's new group of it alone
+//!   ([`DeviceGroup::regroup`]), every other device removed and pairing
+//!   again; a restore's device starts its own ([`DeviceGroup::restore`]).
 //! - **Sleepers are deferred:** a device outside the set processes the
 //!   confirmed candidate when it reads it; one it cannot process, or whose
 //!   `h` is not the confirmed one, raises [`Alarm::CannotFollow`] naming the
@@ -70,15 +70,9 @@ use crate::kit::{KitKey, Split};
 use crate::store::{Store, StoreError};
 
 pub use archive::Archive;
-pub(crate) use follow::verifies;
-pub use vos_wire::personal::CarriedAuthor;
 
 /// The confirmation hash's domain.
 pub const CONFIRM: &[u8] = b"vos/personal/confirm";
-
-/// How long a device's leaf lasts before its yearly update is due: the
-/// home's re-proof prompts for both.
-pub const RENEW_AFTER_MS: u64 = 335 * vos_wire::personal::DAY_MS;
 
 /// The group's rows in the store's group keyspace, beside `vos-mls`'s
 /// namespace.
@@ -90,11 +84,8 @@ const CALLS: usize = 32;
 /// writers' views past its cursor it keeps to check.
 const MADE: usize = 16;
 const VIEWS: usize = 16;
-/// The MLS state's rows, under its generation: the number of groups the
-/// store left, so a device paired again from a group it is leaving keeps
-/// the old group's state beside its key package until it joins.
+/// The MLS state's rows.
 const MLS: &[u8] = b"mls/";
-const GENERATION: &[u8] = b"g/generation";
 /// The log's chain through each entry read, by the next index: the views
 /// writers name are checked against it.
 const CHAINS: &[u8] = b"g/chain/";
@@ -329,10 +320,6 @@ pub enum Alarm {
     /// again.
     #[codec(index = 16)]
     Deleted { scope: Scope, position: u64 },
-    /// A checkpoint of `scope` at `position` whose hash is not this
-    /// device's reading of the scope there: refused, and not acknowledged.
-    #[codec(index = 17)]
-    Checkpoint { scope: Scope, position: u64 },
     /// The agent named its log's head at `next` and, read again, served
     /// this device less of the log: entries withheld. The writers' views
     /// and this device's admin calls past what it was served count as
@@ -611,30 +598,6 @@ impl Made {
     }
 }
 
-/// A checkpoint: a scope's state after every envelope up to `position`,
-/// named by its hash, and where its content starts in the checkpoints'
-/// scope (the position before its first part).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct Checkpoint {
-    pub scope: Scope,
-    pub position: u64,
-    pub hash: [u8; 32],
-    pub from: u64,
-}
-
-/// The checkpoints a device starts a scope from.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub enum Trust {
-    /// Those its pairing device handed it over the pairing channel; none
-    /// for the claiming device.
-    #[codec(index = 0)]
-    Paired(Vec<Checkpoint>),
-    /// One two devices other than its maker acknowledged: a restore's,
-    /// which has no pairing device.
-    #[codec(index = 1)]
-    Acknowledged,
-}
-
 /// Where the device is.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
 pub enum Course {
@@ -700,9 +663,6 @@ pub(crate) struct State {
     /// The confirmed epoch less the MLS group's epoch: a new group's
     /// epochs count on from the agent's.
     pub(crate) offset: u64,
-    /// When this device's leaf was last renewed: its add, or its last
-    /// confirmed commit.
-    pub(crate) renewed: u64,
     pub(crate) policy: Policy,
     pub(crate) devices: Vec<(DeviceId, Known)>,
     pub(crate) set: Set,
@@ -720,7 +680,6 @@ pub(crate) struct State {
     pub(crate) made: Vec<Made>,
     /// Writers' views past the cursor, checked as the device reads on.
     pub(crate) views: Vec<(u64, [u8; 32])>,
-    pub(crate) trust: Trust,
     /// A head the agent named past the cursor, which the next reading of
     /// the log must reach ([`Alarm::Unserved`]).
     pub(crate) ahead: Option<u64>,
@@ -811,7 +770,6 @@ pub struct Pairing {
     recovery: Option<Named>,
     assigned: Option<u64>,
     archive: Archive,
-    checkpoints: Vec<Checkpoint>,
 }
 
 /// What a device a restore added reads from the agent once the restore
@@ -832,13 +790,6 @@ pub struct Restored {
 }
 
 impl Pairing {
-    /// Hand the new device `checkpoint`, which it starts its scope from.
-    pub fn trust(&mut self, checkpoint: Checkpoint) {
-        self.checkpoints
-            .retain(|held| held.scope != checkpoint.scope);
-        self.checkpoints.push(checkpoint);
-    }
-
     pub fn to_bytes(&self) -> Vec<u8> {
         self.encode()
     }
@@ -863,14 +814,6 @@ pub(crate) fn grouped(store: &Store) -> Result<bool, StoreError> {
     Ok(store.group_row(STATE)?.is_some())
 }
 
-/// Whether two archives are one personal space's: the naming secret of
-/// either is the other's or one of its earlier groups'.
-pub(crate) fn same_space(one: &Archive, other: &Archive) -> bool {
-    one.naming == other.naming
-        || one.previous.contains(&other.naming)
-        || other.previous.contains(&one.naming)
-}
-
 /// A device's leaf credential at its add: its sync key and its admin key.
 pub fn credential(device: &NewDevice) -> Vec<u8> {
     [&device.sync[..], &device.admin[..]].concat()
@@ -892,25 +835,6 @@ pub fn restoring(store: &Store, keys: &[KitKey], agent: &Agent) -> Result<Split,
         Some(archive.encode()),
     )])?;
     Ok(split)
-}
-
-/// A restore elsewhere's recovered archive taken into `store` before the
-/// device has a group: its naming secret one of the earlier groups', its
-/// keys merged, its `R` left out. So the device reads its old scopes back
-/// from the old agent (`crate::personal::read_back`) and names the old
-/// device set in the keys it claims the new agent with
-/// ([`crate::moving::carried`]). Only for a store with no device group.
-pub fn recovered(store: &Store, recovered: &Archive) -> Result<(), GroupError> {
-    if store.group_row(STATE)?.is_some() {
-        return Err(GroupError::Grouped);
-    }
-    let mut archive = store.archive()?;
-    archive.inherit(&recovered.without_recovery());
-    store.write_group_rows(vec![(
-        crate::store::ARCHIVE_ROW.to_vec(),
-        Some(archive.encode()),
-    )])?;
-    Ok(())
 }
 
 /// An open operation of the device set as this device verified it, for
@@ -960,28 +884,9 @@ pub struct DeviceGroup {
     raised: Vec<Alarm>,
 }
 
-/// The generation of `store`'s MLS state.
-fn generation(store: &Store) -> Result<u32, GroupError> {
-    match store.group_row(GENERATION)? {
-        Some(bytes) => u32::decode_exact(&bytes).ok_or(GroupError::Corrupt),
-        None => Ok(0),
-    }
-}
-
-/// The MLS rows' prefix of `generation`.
-fn mls_prefix(generation: u32) -> Vec<u8> {
-    [MLS, &generation.to_be_bytes()[..]].concat()
-}
-
-/// The namespace of `store`'s MLS state, `ahead` generations on.
-fn namespace(store: &Store, ahead: u32) -> Result<Namespace, GroupError> {
-    let prefix = mls_prefix(generation(store)? + ahead);
-    Ok(Namespace::current(store.group_store(), prefix))
-}
-
 /// The namespace `store`'s MLS state is in.
-pub fn mls_namespace(store: &Store) -> Result<Namespace, GroupError> {
-    namespace(store, 0)
+pub fn mls_namespace(store: &Store) -> Namespace {
+    Namespace::current(store.group_store(), MLS.to_vec())
 }
 
 impl DeviceGroup {
@@ -1010,7 +915,6 @@ impl DeviceGroup {
             calls: vec![now],
             confirmed: 0,
             offset: 0,
-            renewed: now,
             policy: Policy::DEFAULT,
             devices: vec![(0, Known::new(me.clone(), now))],
             set: Set {
@@ -1026,11 +930,10 @@ impl DeviceGroup {
             rekeyed: None,
             made: Vec::new(),
             views: Vec::new(),
-            trust: Trust::Paired(Vec::new()),
             ahead: None,
             assigned: None,
         };
-        let mut mls = Mls::open(namespace(store, 0)?, &credential(&me), BTreeMap::new())?;
+        let mut mls = Mls::open(mls_namespace(store), &credential(&me), BTreeMap::new())?;
         mls.create(now / 1000, rows(&state, None))?;
         Ok(Self {
             store: store.clone(),
@@ -1044,20 +947,13 @@ impl DeviceGroup {
     }
 
     /// A device about to be paired: its leaf's signing key drawn and a key
-    /// package made, for the pairing device's add, at `now`.
-    ///
-    /// A device of a group a move left makes it beside its group, under the
-    /// next generation, which its rejoin takes ([`DeviceGroup::rejoin`]),
-    /// an earlier pairing's key package there dropped.
+    /// package made, for the pairing device's add, at `now`. Refused for a
+    /// store that has a group.
     pub fn key_package(store: &Store, me: &NewDevice, now: u64) -> Result<Vec<u8>, GroupError> {
-        let ahead = u32::from(store.group_row(STATE)?.is_some());
-        if ahead > 0 {
-            // A pairing again cut short left its key package there.
-            let prefix = mls_prefix(generation(store)? + 1);
-            let rows = store.group_rows(&prefix, None)?;
-            store.write_group_rows(rows.into_iter().map(|(key, _)| (key, None)).collect())?;
+        if store.group_row(STATE)?.is_some() {
+            return Err(GroupError::Grouped);
         }
-        let mut mls = Mls::open(namespace(store, ahead)?, &credential(me), BTreeMap::new())?;
+        let mut mls = Mls::open(mls_namespace(store), &credential(me), BTreeMap::new())?;
         Ok(mls.key_package(now / 1000, BTreeMap::new())?)
     }
 
@@ -1075,24 +971,6 @@ impl DeviceGroup {
         Self::joined(store, me, pairing)
     }
 
-    /// A device of a group a move left joining the moved group from
-    /// `pairing`, once it left its own ([`crate::moving::rejoin`]): as
-    /// [`DeviceGroup::join`], for a store whose scopes the pairing's naming
-    /// secrets name (the same personal space), its archive's keys kept
-    /// beside the pairing's; `me` names the authors it carries
-    /// ([`crate::moving::naming`]).
-    pub fn rejoin(store: &Store, me: NewDevice, mut pairing: Pairing) -> Result<Self, GroupError> {
-        if store.group_row(STATE)?.is_some() {
-            return Err(GroupError::Grouped);
-        }
-        let mine = store.archive()?;
-        if !same_space(&pairing.archive, &mine) {
-            return Err(GroupError::Scoped);
-        }
-        pairing.archive.merge_keys(&mine);
-        Self::joined(store, me, pairing)
-    }
-
     fn joined(store: &Store, me: NewDevice, pairing: Pairing) -> Result<Self, GroupError> {
         let Pairing {
             agent,
@@ -1107,7 +985,6 @@ impl DeviceGroup {
             recovery,
             assigned,
             archive,
-            checkpoints,
         } = pairing;
         let state = State {
             agent,
@@ -1119,7 +996,6 @@ impl DeviceGroup {
             calls: Vec::new(),
             confirmed,
             offset,
-            renewed: time,
             policy,
             devices,
             set,
@@ -1132,11 +1008,10 @@ impl DeviceGroup {
             rekeyed: None,
             made: Vec::new(),
             views: Vec::new(),
-            trust: Trust::Paired(checkpoints),
             ahead: None,
             assigned,
         };
-        let mut mls = Mls::open(namespace(store, 0)?, &credential(&me), BTreeMap::new())?;
+        let mut mls = Mls::open(mls_namespace(store), &credential(&me), BTreeMap::new())?;
         mls.write(rows(&state, Some(&archive)))?;
         Ok(Self {
             store: store.clone(),
@@ -1205,7 +1080,6 @@ impl DeviceGroup {
             calls: vec![read.time],
             confirmed: read.confirmed,
             offset: read.confirmed,
-            renewed: read.time,
             policy: read.policy,
             devices,
             set: Set {
@@ -1226,11 +1100,10 @@ impl DeviceGroup {
             rekeyed: None,
             made: Vec::new(),
             views: Vec::new(),
-            trust: Trust::Acknowledged,
             ahead: None,
             assigned: Some(0),
         };
-        let mut mls = Mls::open(namespace(store, 0)?, &credential(&me), BTreeMap::new())?;
+        let mut mls = Mls::open(mls_namespace(store), &credential(&me), BTreeMap::new())?;
         mls.create(read.time / 1000, rows(&state, Some(&archive)))?;
         Ok(Self {
             store: store.clone(),
@@ -1250,7 +1123,7 @@ impl DeviceGroup {
         };
         let state = State::decode_exact(&bytes).ok_or(GroupError::Corrupt)?;
         let mls = Mls::open(
-            namespace(store, 0)?,
+            mls_namespace(store),
             &credential(&state.me),
             BTreeMap::new(),
         )?;
@@ -1356,38 +1229,8 @@ impl DeviceGroup {
         Ok(split)
     }
 
-    /// Leave this group for good, its scopes' data kept: its state, its MLS
-    /// state, the log's chains it kept and every row of its sealed sync
-    /// deleted in one batch, with the archive kept without `R` and the `R`s
-    /// drawn (another agent's split is another `R`), and the MLS state's
-    /// generation the next, `rejoining` keeping the key package made there.
-    /// A move's (`crate::moving`).
-    pub(crate) fn leave(self, rejoining: bool) -> Result<(), GroupError> {
-        let archive = self.archive.without_recovery();
-        let generation = generation(&self.store)?;
-        let mut rows = vec![
-            (STATE.to_vec(), None),
-            (crate::store::ARCHIVE_ROW.to_vec(), Some(archive.encode())),
-            (GENERATION.to_vec(), Some((generation + 1).encode())),
-        ];
-        let mls = mls_prefix(generation);
-        // A rejoin's key package waits in the next generation; a mover's
-        // starts it empty, so no pairing cut short leaves its leaf secret.
-        let next = (!rejoining).then(|| mls_prefix(generation + 1));
-        let prefixes = [CHAINS, &mls[..], crate::personal::SYNC_ROWS];
-        for prefix in prefixes.into_iter().chain(next.as_deref()) {
-            for (key, _) in self.store.group_rows(prefix, None)? {
-                rows.push((key, None));
-            }
-        }
-        self.store.write_group_rows(rows)?;
-        Ok(())
-    }
-
     /// A recovered group's archive taken in: its naming secret one of the
-    /// earlier groups' (their scopes keep their ids), its keys merged. The
-    /// authors a move carried come from the device set's keys
-    /// (`NewDevice::carried`), never from an archive.
+    /// earlier groups' (their scopes keep their ids), its keys merged.
     pub fn inherit(&mut self, recovered: &Archive) -> Result<(), GroupError> {
         self.archive.inherit(&recovered.without_recovery());
         let writes = self.writes(true)?;
@@ -1425,62 +1268,6 @@ impl DeviceGroup {
             before
         });
         self.merge_archive(&taken)
-    }
-
-    /// The devices whose keys name `author` as carried in `scope`, each
-    /// with the number named, and for one removed or out of the group its
-    /// id, whose frontier bounds what is read of it: those the log added
-    /// or the pairing handed over, and this device's own keys before the
-    /// log adds it. A device a void commit dropped names none.
-    pub fn carriers(&self, author: &[u8; 32], scope: &Scope) -> Vec<(u64, Option<DeviceId>)> {
-        let named = |keys: &NewDevice| {
-            keys.carried
-                .iter()
-                .find(|carried| carried.author == *author && carried.scope == *scope)
-                .map(|carried| carried.through)
-        };
-        let me = &self.state.me;
-        let mut carriers: Vec<(u64, Option<DeviceId>)> = self
-            .state
-            .devices
-            .iter()
-            .filter(|(_, known)| known.matured.is_some() || !known.out)
-            .filter_map(|(id, known)| {
-                let removed = known.matured.is_some() || known.out;
-                named(&known.keys).map(|through| (through, removed.then_some(*id)))
-            })
-            .collect();
-        if !self
-            .state
-            .devices
-            .iter()
-            .any(|(_, known)| known.keys.sync == me.sync)
-            && let Some(through) = named(me)
-        {
-            carriers.push((through, None));
-        }
-        carriers
-    }
-
-    /// Every author a move from this group carries, once each: each
-    /// device of the set, removed ones too, and each author their keys and
-    /// this device's name as carried; none of a device a void commit
-    /// dropped.
-    pub fn moved_authors(&self) -> Vec<[u8; 32]> {
-        let mut authors: Vec<[u8; 32]> = self
-            .state
-            .devices
-            .iter()
-            .filter(|(_, known)| known.matured.is_some() || !known.out)
-            .map(|(_, known)| &known.keys)
-            .chain([&self.state.me])
-            .flat_map(|keys| {
-                std::iter::once(keys.sync).chain(keys.carried.iter().map(|carried| carried.author))
-            })
-            .collect();
-        authors.sort_unstable();
-        authors.dedup();
-        authors
     }
 
     /// The device set's open operations, as this device verified them.
@@ -1725,16 +1512,6 @@ impl DeviceGroup {
             .collect()
     }
 
-    /// The checkpoints this device starts its scopes from.
-    pub fn trust(&self) -> &Trust {
-        &self.state.trust
-    }
-
-    /// Whether this device's leaf is due its yearly update at `now`.
-    pub fn update_due(&self, now: u64) -> bool {
-        now >= self.state.renewed.saturating_add(RENEW_AFTER_MS)
-    }
-
     fn ready(&self) -> Result<DeviceId, GroupError> {
         match self.state.course {
             Course::Following => {}
@@ -1873,24 +1650,17 @@ impl DeviceGroup {
     }
 
     /// The device whose matured regroup's new group the set waits for: the
-    /// next commit is its, with the key packages the others hand it
-    /// ([`DeviceGroup::regroup_package`]).
+    /// next commit is its.
     pub fn regrouper(&self) -> Option<DeviceId> {
         self.state.set.fresh
     }
 
-    /// A key package for the new group a regroup starts, at `now`: handed
-    /// to the regrouper as a pairing's is.
-    pub fn regroup_package(&mut self, now: u64) -> Result<Vec<u8>, GroupError> {
-        Ok(self.mls.key_package(now / 1000, rows(&self.state, None))?)
-    }
-
-    /// This device's regroup matured: start its new group at `now` with the
-    /// devices that keep their voice (their key packages, `packages`), the
-    /// first commit after the confirmed epoch, carrying every matured
-    /// removal. Held as [`DeviceGroup::commit`]'s, and called the same way;
-    /// a device that cannot follow regroups so.
-    pub fn regroup(&mut self, packages: Vec<Vec<u8>>, now: u64) -> Result<Prepared, GroupError> {
+    /// This device's regroup matured: start its new group of it alone at
+    /// `now`, the first commit after the confirmed epoch, carrying every
+    /// matured removal (every other device's). Held as
+    /// [`DeviceGroup::commit`]'s, and called the same way; a device that
+    /// cannot follow regroups so.
+    pub fn regroup(&mut self, now: u64) -> Result<Prepared, GroupError> {
         if self.state.course == Course::Out {
             return Err(GroupError::Out);
         }
@@ -1906,9 +1676,7 @@ impl DeviceGroup {
             remove,
             rekey,
         };
-        self.hold(effect, r2, |mls, rows| {
-            mls.restart(&packages, now / 1000, rows)
-        })
+        self.hold(effect, r2, |mls, rows| mls.restart(&[], now / 1000, rows))
     }
 
     /// Pair `device` at `now`: the commit adding it, and what the new
@@ -1933,7 +1701,6 @@ impl DeviceGroup {
             recovery: self.state.recovery,
             assigned: self.state.assigned,
             archive: self.archive.shareable(),
-            checkpoints: Vec::new(),
         };
         Ok((prepared, pairing))
     }

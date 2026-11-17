@@ -37,9 +37,8 @@ const MINUTE: u64 = 60_000;
 /// restore, an admin key's replacement by the kit) in five; a paired
 /// device is on probation two minutes and seasoned five after, and an
 /// admin key another device replaces takes over after the probation (E29),
-/// all within the session; the lease a day, past the hours a joiner's
-/// open claim waits (E28) and an unattended day of background runs, its
-/// re-proof due in its last four hours and made at any time before.
+/// all within the session; the lease a day, past an unattended day of
+/// background runs (no device re-proves it).
 pub const SESSION: Policy = Policy {
     operation_delay_ms: 2 * MINUTE,
     kit_delay_ms: 5 * MINUTE,

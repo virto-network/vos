@@ -86,7 +86,6 @@ fn keys(light: &Light, n: u8) -> (SigningKey, SigningKey, NewDevice) {
         },
         nullifier: [n; 32],
         label: vec![n; 8],
-        carried: Vec::new(),
     };
     (sync, admin, device)
 }

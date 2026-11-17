@@ -268,7 +268,6 @@ pub struct Homes {
     key: SigningKey,
     pub pool: Vec<u32>,
     pub kits: HashMap<[u8; 32], u32>,
-    pub renewed: Vec<u32>,
 }
 
 /// A space's agent: its identity, its credential actor and its tree, its
@@ -299,9 +298,6 @@ pub struct State {
     /// space's tree enrolls as it answers, if any: a root superseded.
     pub refusing: std::collections::VecDeque<(Response, Option<[u8; 32]>)>,
     pub feed_reads: usize,
-    /// Admit no open claim, and count the terms asked.
-    pub closed: bool,
-    pub openings: usize,
     /// The policy each personal agent is configured with at its claim,
     /// [`policy`] unless set.
     pub policy: Option<Policy>,
@@ -444,7 +440,6 @@ impl World {
             key,
             pool: agents,
             kits: HashMap::new(),
-            renewed: Vec::new(),
         });
         agent
     }
@@ -700,10 +695,6 @@ impl State {
                 );
             }
             if named("opening") {
-                self.openings += 1;
-                if self.closed {
-                    return done(Option::<Open>::None);
-                }
                 return done(Some(Open {
                     salt: [3; 32],
                     difficulty: 2,
@@ -812,19 +803,6 @@ impl State {
             let assigned = host.homes(now, &key, "assign", (device, kit).encode());
             assert!(matches!(assigned, Outcome::Done(_)), "{assigned:?}");
             return done(chosen);
-        }
-        if homes && named("renew") {
-            let chosen = u32::decode_exact(&request.arguments).unwrap();
-            let homes = space.homes.as_mut().unwrap();
-            homes.renewed.push(chosen);
-            let key = homes.key.clone();
-            let renewed =
-                self.personal
-                    .get_mut(&chosen)
-                    .unwrap()
-                    .homes(now, &key, "renew", Vec::new());
-            assert!(matches!(renewed, Outcome::Done(_)), "{renewed:?}");
-            return done(());
         }
         if named("enroll_device") {
             let (member, _owner) =

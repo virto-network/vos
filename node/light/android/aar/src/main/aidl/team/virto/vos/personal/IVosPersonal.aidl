@@ -10,7 +10,6 @@ import team.virto.vos.personal.Claimed;
 import team.virto.vos.personal.Device;
 import team.virto.vos.personal.KitKind;
 import team.virto.vos.personal.Membership;
-import team.virto.vos.personal.Moved;
 import team.virto.vos.personal.Notice;
 import team.virto.vos.personal.PairCode;
 import team.virto.vos.personal.Paired;
@@ -63,7 +62,11 @@ interface IVosPersonal {
      */
     void pairCancel();
 
-    /** Join through a scanned code (or pair again after a move), this device named `label`. */
+    /**
+     * Join through a scanned code, this device named `label`: one that holds another personal
+     * space, or this one's as a device that cannot follow it or is out of it (after a move or a
+     * regroup), leaves it first.
+     */
     Paired pairJoin(in byte[] code, String label, IVosPrompts prompts, out Refusal refused);
 
     /** The memberships owed on this device: enrollments of a device it paired, its confirmations. */
@@ -122,14 +125,11 @@ interface IVosPersonal {
      */
     Posted replaceAdminOf(in byte[] code, IVosPrompts prompts, out Refusal refused);
 
-    /** Remove the devices named and start a new group. */
-    Posted regroup(in long[] remove, IVosPrompts prompts, out Refusal refused);
+    /** Remove every other device and start a new group of this one alone. */
+    Posted regroup(IVosPrompts prompts, out Refusal refused);
 
     /** Commit now: every matured removal carried, this device's leaf updated. */
     boolean update(IVosPrompts prompts, out Refusal refused);
-
-    /** The yearly re-proof at the home, with the leaf's update on the same prompt. */
-    boolean renew(IVosPrompts prompts, out Refusal refused);
 
     /**
      * Open a restore from the kit of kind `old` at the request's home, a new kit of the request's
@@ -140,6 +140,9 @@ interface IVosPersonal {
     /** The restore matured: the kit entered again, the personal space read back. */
     Claimed restored(KitKind kit, IVosPrompts prompts, out Refusal refused);
 
-    /** Move the personal space to another home, with a new kit of the kind asked. */
-    Moved moveHome(in ClaimRequest request, IVosPrompts prompts, out Refusal refused);
+    /**
+     * Move to another home, carrying nothing: this device leaves the personal space it holds and
+     * claims an agent there with a new kit of the kind asked; the other devices pair again.
+     */
+    Claimed moveHome(in ClaimRequest request, IVosPrompts prompts, out Refusal refused);
 }

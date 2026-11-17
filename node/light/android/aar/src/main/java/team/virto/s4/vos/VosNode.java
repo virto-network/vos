@@ -24,7 +24,6 @@ import team.virto.vos.personal.Claimed;
 import team.virto.vos.personal.Device;
 import team.virto.vos.personal.IVosPersonal;
 import team.virto.vos.personal.Membership;
-import team.virto.vos.personal.Moved;
 import team.virto.vos.personal.Notice;
 import team.virto.vos.personal.PairCode;
 import team.virto.vos.personal.Paired;
@@ -533,21 +532,15 @@ public final class VosNode {
     }
 
     @Override
-    public Posted regroup(long[] remove, IVosPrompts prompts, Refusal refused) {
+    public Posted regroup(IVosPrompts prompts, Refusal refused) {
       caller();
-      return nativeRegroup(handle, remove, prompts, refused);
+      return nativeRegroup(handle, prompts, refused);
     }
 
     @Override
     public boolean update(IVosPrompts prompts, Refusal refused) {
       caller();
       return nativeUpdate(handle, prompts, refused);
-    }
-
-    @Override
-    public boolean renew(IVosPrompts prompts, Refusal refused) {
-      caller();
-      return nativeRenew(handle, prompts, refused);
     }
 
     @Override
@@ -563,7 +556,7 @@ public final class VosNode {
     }
 
     @Override
-    public Moved moveHome(ClaimRequest request, IVosPrompts prompts, Refusal refused) {
+    public Claimed moveHome(ClaimRequest request, IVosPrompts prompts, Refusal refused) {
       caller();
       return nativeMoveHome(handle, request, prompts, refused);
     }
@@ -729,12 +722,9 @@ public final class VosNode {
   private static native Posted nativeReplaceAdminOf(
       long handle, byte[] code, IVosPrompts prompts, Refusal refused);
 
-  private static native Posted nativeRegroup(
-      long handle, long[] remove, IVosPrompts prompts, Refusal refused);
+  private static native Posted nativeRegroup(long handle, IVosPrompts prompts, Refusal refused);
 
   private static native boolean nativeUpdate(long handle, IVosPrompts prompts, Refusal refused);
-
-  private static native boolean nativeRenew(long handle, IVosPrompts prompts, Refusal refused);
 
   private static native Posted nativeRestore(
       long handle, ClaimRequest request, byte old, IVosPrompts prompts, Refusal refused);
@@ -742,6 +732,6 @@ public final class VosNode {
   private static native Claimed nativeRestored(
       long handle, byte kit, IVosPrompts prompts, Refusal refused);
 
-  private static native Moved nativeMoveHome(
+  private static native Claimed nativeMoveHome(
       long handle, ClaimRequest request, IVosPrompts prompts, Refusal refused);
 }

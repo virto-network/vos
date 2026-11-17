@@ -7,8 +7,7 @@
 //! device receives it over the pairing channel; sealed under an epoch's
 //! archive key it travels to the agent, `R` with it and the drawn ones
 //! never. Archives that disagree keep every candidate key, and the AEAD
-//! decides. The authors a move carried are no archive's: each device's
-//! keys name them in the control log (`NewDevice::carried`, §3.9).
+//! decides.
 
 use blake2::Blake2b;
 use blake2::digest::Digest;

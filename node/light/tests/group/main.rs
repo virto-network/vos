@@ -98,8 +98,8 @@ fn agree(phones: &mut [&mut Phone], epoch: u64) -> [u8; 32] {
     key
 }
 
-/// The phones of a group confirm each commit: a pairing, then an update on
-/// the yearly prompt; their keys, their scope ids (from the naming secret
+/// The phones of a group confirm each commit: a pairing, then an update;
+/// their keys, their scope ids (from the naming secret
 /// the pairing carried) and their archives agree, the archive holding
 /// every confirmed epoch's key of a tracked scope; a phone reopened while a
 /// candidate is pending processes it again from the log; and a store that
@@ -126,12 +126,6 @@ fn paired_phones_confirm_one_group() {
     ));
     phones[0].group().abandon().unwrap();
 
-    assert!(!phones[1].group().update_due(home.now()));
-    assert!(
-        phones[1]
-            .group()
-            .update_due(home.now() + vos_light::group::RENEW_AFTER_MS)
-    );
     phones[1].update(&mut home).unwrap();
     phones[2].read(&mut home);
     phones[2].group = Some(DeviceGroup::open(&phones[2].store).unwrap().unwrap());
@@ -154,7 +148,6 @@ fn paired_phones_confirm_one_group() {
         assert_eq!(opened, archive);
         assert!(vos_light::group::Archive::open(&key, &[3; 24], b"other", &sealed).is_none());
     }
-    assert!(!phones[1].group().update_due(home.now()));
     assert_eq!(overview(&home, &phones[0]).confirmed, 3);
 }
 
