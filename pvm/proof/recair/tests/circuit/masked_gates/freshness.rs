@@ -40,8 +40,8 @@ fn every_opening_is_fresh() {
     eprintln!("{n} openings of one witness, {m} of two from one seed: none shared");
 }
 
-/// The claimed sums' control. Unblinded (`format::WRAP`'s
-/// parameters, unmasked), the sums a right guess of the witness computes
+/// The claimed sums' control. Unblinded (the small format's parameters,
+/// unmasked), the sums a right guess of the witness computes
 /// at the proof's relation are the proof's; blinded, none is, though their
 /// total is (the blinding sums to zero).
 #[test]

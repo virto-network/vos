@@ -36,7 +36,7 @@ agent_crates := "-p vos-exec -p vos-light -p vos-sdk -p vos-sdk-macros -p vos-te
 # and blob hashes pin and the transpiler may refuse.
 guest_flags := "--target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem"
 
-# A venue guest of the workspace (`final-verify`, `final-verify-test`,
+# A venue guest of the workspace (`final-verify`,
 # `statement-service`), built from `package` with `features`: its panic
 # locations name the repository's sources from its root, and the
 # registry's, the git checkouts' and the toolchain's under `/cargo` and
@@ -92,8 +92,7 @@ vectors:
 # attests on the agent's model, the settlement window's kernel read at a
 # cut and proved over its shape, the kernels' leaves and the window
 # kernel's folds proved on the recursion AIR, the window's and the
-# balance's whole runs folded and wrapped under format 28 and masked under
-# 39, their statements judged at the model venue against the space's
+# balance's whole runs folded and wrapped under format 39, their statements judged at the model venue against the space's
 # anchors, and the fixtures checked against their generator and judged in
 # Wasm.
 # The repository's constants (`pvm/proof/src/constants.rs`) are recomputed
@@ -149,23 +148,18 @@ test-carriers: build-test-actors build-programs
     cargo test --manifest-path node/gateway/demo/Cargo.toml --ignore-rust-version --test carriers -- --nocapture
 
 # The golden fixtures (`pvm/proof/fixtures`) judged in Wasm, by the final
-# verifier's blobs built as a runtime builds them, under the PVF's semantics
-# and the client's: the production blob (format 39 alone, a statement of 28
-# refused as a format it does not link) and the test blob (`test-formats`,
-# 28 beside it), every verdict the one its build reaches, as natively and on
-# the JAM-only host (`vos-statement`'s fixtures test); and `vos-anchor`'s
-# golden vectors computed by the production blob, every digest the pinned
-# bytes.
+# verifier's blob built as a runtime builds it, under the PVF's semantics
+# and the client's, every verdict the recorded one, as natively and on the
+# JAM-only host (`vos-statement`'s fixtures test); and `vos-anchor`'s
+# golden vectors computed by the blob, every digest the pinned bytes.
 judge-wasm: build-wasm-blobs
     cd pvm/proof/final-verifier/wasm/run; cargo build --release
-    let run = "pvm/proof/final-verifier/wasm/run/target/release/vos-pvm-final-verifier-wasm-run"; for case in [[blob task]; ["wasm32-unknown-unknown" ["judge" "pvm/proof/fixtures" "39"]] ["test-formats/wasm32-unknown-unknown" ["judge" "pvm/proof/fixtures" "28,39"]] ["wasm32-unknown-unknown" ["anchors"]]] { for semantics in [pvf client] { ^$run $"pvm/proof/final-verifier/wasm/blob/target/($case.blob)/release/vos_pvm_final_verifier_wasm.wasm" $semantics ...$case.task } }
+    let run = "pvm/proof/final-verifier/wasm/run/target/release/vos-pvm-final-verifier-wasm-run"; for task in [["judge" "pvm/proof/fixtures"] ["anchors"]] { for semantics in [pvf client] { ^$run "pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm" $semantics ...$task } }
 
-# The final verifier's Wasm blobs, built as a runtime builds them, from
-# the fixed path (`_at-fixed-path`): the production blob, and the test blob
-# (`test-formats`) in a target directory of its own.
+# The final verifier's Wasm blob, built as a runtime builds it, from the
+# fixed path (`_at-fixed-path`).
 build-wasm-blobs:
     just _at-fixed-path pvm/proof/final-verifier/wasm/blob --release
-    just _at-fixed-path pvm/proof/final-verifier/wasm/blob --release --features test-formats --target-dir target/test-formats
 
 # `cargo build` of the workspace at `dir` (from the repository's root) as
 # if the checkout were at `/tmp/vos-checkout`, a symbolic link to it held
@@ -195,14 +189,14 @@ fixtures: build-test-actors build-programs
 # The reproducibility gate on aarch64: `vos program-id`, built for aarch64
 # with the masked prover and run under qemu-user, recomputes each known
 # kernel's program id from its test actor's ELF and the circuits'
-# constants (`H_fold`, the wrap's roots), each the repository's
+# constants (`H_fold`, the wrap's root), each the repository's
 # (`pvm/proof/src/constants.rs`). It needs `qemu-aarch64`, an aarch64 GNU
 # toolchain (`aarch64-linux-gnu-gcc`, its sysroot at
 # `/usr/aarch64-linux-gnu`) and the toolchain's `aarch64-unknown-linux-gnu`
 # target; on an ARM host, run `vos program-id` natively.
 repro-aarch64: build-test-actors
     with-env { CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: "aarch64-linux-gnu-gcc", CC_aarch64_unknown_linux_gnu: "aarch64-linux-gnu-gcc", AR_aarch64_unknown_linux_gnu: "aarch64-linux-gnu-ar" } { cargo build -p vos-cli --no-default-features --features prover --target aarch64-unknown-linux-gnu }
-    let source = (open --raw pvm/proof/src/constants.rs); let pinned = {|name| $source | parse --regex ("pub const " + $name + ": \\[u\\d+; \\d+\\] = \\[(?<values>[^\\]]*)\\]") | get values.0 | split row "," | each {|value| $value | str trim } | where {|value| $value != "" } | str join " " }; let vos = {|...args| ^qemu-aarch64 -L /usr/aarch64-linux-gnu target/aarch64-unknown-linux-gnu/debug/vos program-id ...$args | str trim }; for case in [[window settle WINDOW_PROGRAM] [balance at_least BALANCE_PROGRAM] [kernels areas PREDICATE_PROGRAM]] { let printed = (do $vos $"agent/test-actors/target/riscv64em-vos/release/($case.0).elf" $case.1); if $printed != (do $pinned $case.2) { error make { msg: $"($case.2) on aarch64: ($printed)" } } }; let circuits = (do $vos "--circuits" | lines); let names = ($circuits | each {|line| $line | split row " " | first }); if $names != [H_FOLD WRAP_ROOT_28 WRAP_ROOT_39] { error make { msg: $"the circuits printed on aarch64: ($names)" } }; for line in $circuits { let parts = ($line | split row " "); if ($parts | skip 1 | str join " ") != (do $pinned $parts.0) { error make { msg: $"($parts.0) on aarch64: ($line)" } } }; print "the program ids and the circuits' constants on aarch64 are the repository's"
+    let source = (open --raw pvm/proof/src/constants.rs); let pinned = {|name| $source | parse --regex ("pub const " + $name + ": \\[u\\d+; \\d+\\] = \\[(?<values>[^\\]]*)\\]") | get values.0 | split row "," | each {|value| $value | str trim } | where {|value| $value != "" } | str join " " }; let vos = {|...args| ^qemu-aarch64 -L /usr/aarch64-linux-gnu target/aarch64-unknown-linux-gnu/debug/vos program-id ...$args | str trim }; for case in [[window settle WINDOW_PROGRAM] [balance at_least BALANCE_PROGRAM] [kernels areas PREDICATE_PROGRAM]] { let printed = (do $vos $"agent/test-actors/target/riscv64em-vos/release/($case.0).elf" $case.1); if $printed != (do $pinned $case.2) { error make { msg: $"($case.2) on aarch64: ($printed)" } } }; let circuits = (do $vos "--circuits" | lines); let names = ($circuits | each {|line| $line | split row " " | first }); if $names != [H_FOLD WRAP_ROOT_39] { error make { msg: $"the circuits printed on aarch64: ($names)" } }; for line in $circuits { let parts = ($line | split row " "); if ($parts | skip 1 | str join " ") != (do $pinned $parts.0) { error make { msg: $"($parts.0) on aarch64: ($line)" } } }; print "the program ids and the circuits' constants on aarch64 are the repository's"
 
 # The conformance vectors of Kreivo's spaces pallet and the mutation lists
 # (`node/venue/conformance`, `spaces-pallet.md` §10), written anew by the
@@ -286,9 +280,8 @@ programs:
 # The JAM statements service's program, `statement-service.elf`.
 build-statement-service: (_venue-guest "vos-statement-service" "statement-service" "pvm-guest")
 
-# The venue's JAM refine programs: `final-verify.elf`, linking format 39
-# alone, and `final-verify-test.elf`, linking 28 beside it.
-build-final-verify: (_venue-guest "vos-statement" "final-verify" "pvm-guest") (_venue-guest "vos-statement" "final-verify-test" "pvm-guest,test-formats")
+# The venue's JAM refine program, `final-verify.elf`.
+build-final-verify: (_venue-guest "vos-statement" "final-verify" "pvm-guest")
 
 # Every guest blob `blobs.lock` pins, its hash then its path from the
 # repository's root: the venue's programs, the agent's guest programs
@@ -301,7 +294,7 @@ build-final-verify: (_venue-guest "vos-statement" "final-verify" "pvm-guest") (_
 # Wasm blobs, whose code that hash orders, are built from a fixed path
 # (`_at-fixed-path`).
 _blob-hashes:
-    if ($env.CARGO_TARGET_DIR? | is-not-empty) { error make { msg: "the blobs are hashed where the recipes build them: unset CARGO_TARGET_DIR" } }; let fixed = ["target/riscv64em-vos/release/final-verify.elf" "target/riscv64em-vos/release/final-verify-test.elf" "target/riscv64em-vos/release/statement-service.elf"] ++ (open programs.toml | get program.elf) ++ ["pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm" "pvm/proof/final-verifier/wasm/blob/target/test-formats/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm"]; let actors = (cargo metadata --manifest-path agent/test-actors/Cargo.toml --no-deps --format-version 1 | from json | get packages.targets | flatten | where {|target| "bin" in $target.kind } | get name | sort | each {|name| $"agent/test-actors/target/riscv64em-vos/release/($name).elf" }); let sysroot = (rustc --print sysroot | str trim); let objcopy = ($sysroot | path join lib rustlib (rustc -vV | lines | parse "host: {host}" | get host.0) bin rust-objcopy); let stripped = (mktemp -t); for path in ($fixed ++ $actors) { with-env { LD_LIBRARY_PATH: ($sysroot | path join lib) } { ^$objcopy --strip-all $path $stripped }; print $"(open --raw $stripped | hash sha256)  ($path)" }; rm $stripped
+    if ($env.CARGO_TARGET_DIR? | is-not-empty) { error make { msg: "the blobs are hashed where the recipes build them: unset CARGO_TARGET_DIR" } }; let fixed = ["target/riscv64em-vos/release/final-verify.elf" "target/riscv64em-vos/release/statement-service.elf"] ++ (open programs.toml | get program.elf) ++ ["pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm"]; let actors = (cargo metadata --manifest-path agent/test-actors/Cargo.toml --no-deps --format-version 1 | from json | get packages.targets | flatten | where {|target| "bin" in $target.kind } | get name | sort | each {|name| $"agent/test-actors/target/riscv64em-vos/release/($name).elf" }); let sysroot = (rustc --print sysroot | str trim); let objcopy = ($sysroot | path join lib rustlib (rustc -vV | lines | parse "host: {host}" | get host.0) bin rust-objcopy); let stripped = (mktemp -t); for path in ($fixed ++ $actors) { with-env { LD_LIBRARY_PATH: ($sysroot | path join lib) } { ^$objcopy --strip-all $path $stripped }; print $"(open --raw $stripped | hash sha256)  ($path)" }; rm $stripped
 
 # Every guest blob `blobs.lock` pins, built as `check` builds it.
 build-blobs: build-final-verify build-statement-service build-programs build-wasm-blobs build-test-actors
@@ -575,15 +568,10 @@ _forbidden +gates:
         [debug-internals "--manifest-path agent/programs/Cargo.toml --workspace" [debug-internals] []] \
         [debug-internals "--manifest-path pvm/proof/final-verifier/wasm/run/Cargo.toml" [debug-internals] []] \
         [debug-internals "--manifest-path pvm/proof/final-verifier/wasm/blob/Cargo.toml" [debug-internals] []] \
-        [test-formats "--workspace" [test-formats] []] \
-        [test-formats "-p vos-cli --features prover" [test-formats] []] \
-        [test-formats "--manifest-path agent/programs/Cargo.toml --workspace" [test-formats] []] \
-        [test-formats "--manifest-path pvm/proof/final-verifier/wasm/run/Cargo.toml" [test-formats] []] \
-        [test-formats "--manifest-path pvm/proof/final-verifier/wasm/blob/Cargo.toml" [test-formats] []] \
-        [test-formats "-p vos-statement --features fixtures,pvm-guest" [test-formats] []] \
-        [test-formats "-p vos-statement-service --features pvm-guest" [test-formats] []] \
-        [test-formats "--manifest-path node/light/android/Cargo.toml --features android" [test-formats] []] \
-        [test-formats "--manifest-path node/gateway/demo/Cargo.toml" [test-formats] []] \
+        [test-device-format "--workspace" [test-device-format] []] \
+        [test-device-format "-p vos-cli --features prover" [test-device-format] []] \
+        [test-device-format "--manifest-path node/light/android/Cargo.toml --features android" [test-device-format] []] \
+        [test-device-format "--manifest-path node/gateway/demo/Cargo.toml" [test-device-format] []] \
         [store-dump "-p vos-cli" [dump] []] \
         [store-dump "-p vos-cli --features prover" [dump] []] \
         [store-dump "-p vos-node" [dump] []] \
@@ -649,8 +637,8 @@ check-venue-rules:
     print $"the venue rules live in vos_anchor::venue alone: ($sources | length) files searched, ($calls | length) calls found"
 
 # Every `check-no-*` gate below, each build resolved once.
-check-no-leaks: (_forbidden "tools" "venue-model" "seeded-masks" "debug-internals" "test-formats" "store-dump" "heap-peak") _seeded-masks-unimplied _debug-names-absent
-    print "no test seam, debug output, test format, store dump, heap peak, model venue or development tool in a production build"
+check-no-leaks: (_forbidden "tools" "venue-model" "seeded-masks" "debug-internals" "test-device-format" "store-dump" "heap-peak") _seeded-masks-unimplied _debug-names-absent
+    print "no test seam, debug output, test device format, store dump, heap peak, model venue or development tool in a production build"
 
 # A node links none of VOS's development tooling (`tools/`): the JAM
 # builder (`vos-jam`) and client (`vos-jam-dev`), Kreivo's client and its
@@ -692,18 +680,6 @@ check-no-seeded-masks: (_forbidden "seeded-masks") _seeded-masks-unimplied
 check-no-debug-internals: (_forbidden "debug-internals") _debug-names-absent
     print "no debug outputs in a production build"
 
-# Format 28, the unmasked wrap (`vos-pvm-final-verifier`'s, its prover
-# `vos-pvm-recair`'s and `vos-statement`'s `test-formats`), reaches no
-# production build: no normal
-# or build edge of any workspace member, nor of the workspaces built apart
-# that venues or nodes run (the agent, the final verifier's Wasm blob, its
-# runner), enables it (the tests enable it on dev edges, the harnesses' test
-# builds by name); and `vos-statement`'s `fixtures` and `pvm-guest`, and the
-# JAM statements service's program, do not imply it. The fuzz targets,
-# built apart, fuzz format 28's decode and verifier too, and are no venue.
-check-no-test-formats: (_forbidden "test-formats")
-    print "no test formats in a production build"
-
 # The store's dump (`vos-node`'s `dump`: `store::Fjall::dump`, every row
 # the store holds) reaches neither the `vos` binary, with or without the
 # prover, nor `vos-node`, on a normal or build edge (the carrier audit's
@@ -734,13 +710,10 @@ check-no-heap-peak: (_forbidden "heap-peak")
 # with the standard library built from source, with the venue's JAM refine
 # program, which `vos-pvm-recair`'s wrap tests and the fixtures' and the
 # end-to-end tests run on the JAM-only host: `final-verify.elf`, the
-# harness's refine program, linking format 39 alone and accepting nothing
-# without a proof, and `final-verify-test.elf`, linking 28 beside it for
-# the test policy's fixtures, its `ANCHORS` mode computing `vos-anchor`'s
-# golden vectors with no proof read; and the JAM statements service's
-# program, `statement-service.elf`, which its tests run on the JAM-only
-# host, refine and accumulate. The final verifier and `vos-statement`
-# build here without `test-formats`. The guests' bins and the Wasm blob,
+# harness's refine program, linking format 39 and accepting nothing
+# without a proof; and the JAM statements service's program,
+# `statement-service.elf`, which its tests run on the JAM-only host,
+# refine and accumulate. The guests' bins and the Wasm blob,
 # crate roots the workspace's lints do not reach, are linted here under the
 # verify path's denies. Last, every guest blob checked against
 # `blobs.lock` (`check-blobs`).
@@ -757,19 +730,17 @@ check-no-std:
     with-env { RUSTFLAGS: "-Zallow-features=" } { cargo build -p vos-statement --target wasm32-unknown-unknown --target-dir target/no-nightly-features }
     just build-final-verify
     cargo clippy -p vos-statement --release --features pvm-guest --bin final-verify {{guest_flags}} --quiet -- -D warnings
-    cargo clippy -p vos-statement --release --features pvm-guest,test-formats --bin final-verify-test {{guest_flags}} --quiet -- -D warnings
     just build-statement-service
     cargo clippy -p vos-statement-service --release --features pvm-guest --bin statement-service {{guest_flags}} --quiet -- -D warnings
     cd pvm/proof/final-verifier/wasm/blob; cargo clippy --release --quiet -- -D warnings
-    cd pvm/proof/final-verifier/wasm/blob; cargo clippy --release --features test-formats --target-dir target/test-formats --quiet -- -D warnings
     just check-blobs
 
 # The verifier kit (`pvm/proof/kit/vos_kit.py`), which a chain's runtime
 # vendors (Kreivo's `vendor/vos-verifier/`, `spaces-pallet.md` §3), written
 # into `dir`: `vos-anchor`, `vos-statement`, `vos-pvm-final-verifier`,
 # `vos-pvm-recair-air` and `vos-pvm-poseidon2` with concrete manifests (Stwo
-# a git dependency at the pin, without default features; `test-formats`
-# and `pvm-guest` left in VOS), the golden fixtures, the conformance
+# a git dependency at the pin, without default features; `pvm-guest` left
+# in VOS), the golden fixtures, the conformance
 # vectors and a `VENDOR` file naming the commit (and the tag) and the
 # tree's hash. From the working tree, or from `rev`, a tag or a commit: a
 # release vendors from a tag.

@@ -64,13 +64,7 @@ fn the_bit_counts_are_pinned_per_format() {
         .collect();
     assert_eq!(
         pinned,
-        [
-            (28, 146, 82),
-            (32, 108, 63),
-            (39, 146, 82),
-            (41, 104, 62),
-            (47, 110, 62),
-        ]
+        [(32, 108, 63), (39, 146, 82), (41, 104, 62), (47, 110, 62),]
     );
     assert!(REGISTRY.iter().all(Format::meets_floors));
     // Every format grinds an interaction PoW: the prover always grinds
@@ -103,73 +97,28 @@ fn the_parameters_are_the_least_that_clear_their_margins() {
     assert!(count(&fewer, &DEVICE_PROOF.reference) < 62.0);
 }
 
-/// The wrap counts 82.6 proven bits under affine batching, and needs 19
-/// queries for its floor of 80. Batched by powers of one coefficient it
-/// counts 74.7 at blowup 64 with 18 queries or 20, and as many queries
-/// as the analysis takes: that batching term binds, and it grows with
-/// the blowup; at blowup 8 it reaches 80 with 41 queries. The verifier's
-/// check says so.
-#[test]
-fn the_wrap_needs_affine_batching() {
-    let count = |batching, log_blowup, n_queries| {
-        let params = FormatParams {
-            log_blowup,
-            n_queries,
-            batching,
-            ..WRAP.params
-        };
-        crate::security::proven_count(&params, &WRAP_REFERENCE).unwrap()
-    };
-    assert_eq!(WRAP.params.batching, DeepBatching::Affine);
-    let affine = count(DeepBatching::Affine, 6, 20);
-    assert!((82.60..82.61).contains(&affine), "{affine}");
-    let least = |batching, log_blowup| (1..=256).find(|&q| count(batching, log_blowup, q) >= 80.0);
-    assert_eq!(least(DeepBatching::Affine, 6), Some(19));
-
-    for queries in [18, 20, 256] {
-        let bits = count(DeepBatching::Powers, 6, queries);
-        assert!((74.71..74.72).contains(&bits), "{queries} queries: {bits}");
-    }
-    assert_eq!(
-        [6, 4, 3].map(|log_blowup| least(DeepBatching::Powers, log_blowup)),
-        [None, None, Some(41)]
-    );
-    let powers = Format {
-        params: FormatParams {
-            batching: DeepBatching::Powers,
-            ..WRAP.params
-        },
-        ..WRAP
-    };
-    let error = crate::proof::check_format_security(&powers, &powers.pcs_config(), &WRAP_REFERENCE)
-        .unwrap_err();
-    assert!(
-        error.contains("74 proven bits, below format 28's floor of 80"),
-        "{error}"
-    );
-    assert_eq!(
-        crate::proof::check_format_security(&WRAP, &WRAP.pcs_config(), &WRAP_REFERENCE),
-        Ok(WRAP.bits)
-    );
-}
-
 /// A proof's config does not carry its batching: deserialized, it reads
 /// powers, and the verifier takes the format's.
 #[test]
 fn the_verifier_takes_the_batching_from_the_format() {
     let carried = PcsConfig {
         deep_batching: DeepBatching::Powers,
-        ..WRAP.pcs_config()
+        ..MASKED_WRAP.pcs_config()
     };
-    assert_eq!(WRAP.verifier_config(&carried), WRAP.pcs_config());
-    assert_eq!(WRAP.pcs_config().deep_batching, DeepBatching::Affine);
-    assert!(crate::proof::check_format_security(&WRAP, &carried, &WRAP_REFERENCE).is_ok());
+    assert_eq!(
+        MASKED_WRAP.verifier_config(&carried),
+        MASKED_WRAP.pcs_config()
+    );
+    assert_eq!(MASKED_WRAP.pcs_config().deep_batching, DeepBatching::Affine);
+    assert!(
+        crate::proof::check_format_security(&MASKED_WRAP, &carried, &MASKED_WRAP_REFERENCE).is_ok()
+    );
     for format in [SEGMENT, LEAF_FOLD] {
         assert_eq!(format.pcs_config().deep_batching, DeepBatching::Powers);
     }
 }
 
-/// Every number names one entry; only 28, 39, 41 and 47 are admitted, and a
+/// Every number names one entry; only 39, 41 and 47 are admitted, and a
 /// segment verifier takes 41 alone; every other number, one an earlier
 /// format took among them, is refused as unregistered.
 #[test]
@@ -178,13 +127,7 @@ fn the_registry_numbers_round_trip() {
         assert_eq!(lookup(format.number), Some(&format));
         assert_eq!(
             admitted(format.number).is_ok(),
-            [
-                WRAP.number,
-                SEGMENT.number,
-                MASKED_WRAP.number,
-                DEVICE_PROOF.number,
-            ]
-            .contains(&format.number)
+            [SEGMENT.number, MASKED_WRAP.number, DEVICE_PROOF.number,].contains(&format.number)
         );
         assert_eq!(
             admitted_segment(format.number).is_ok(),

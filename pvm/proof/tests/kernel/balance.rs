@@ -1,8 +1,8 @@
 //! The `balance` test actor's read at a window's cut: whether an account
 //! held at least a threshold, the account public only as a salted
 //! commitment. Run live at the cut on the agent's reference model,
-//! re-traced, proved whole, wrapped under `format::WRAP` and masked under 39,
-//! and judged at the model venue against the space's anchor.
+//! re-traced, proved whole, wrapped masked under 39, and judged at the
+//! model venue against the space's anchor.
 
 use crate::common;
 use crate::cut::{self, AGENT, Cut, INSTANCE, Rng, Venue, genesis, read_live, traced};
@@ -133,7 +133,7 @@ fn a_balance_is_accepted_at_the_model_venue() {
     );
     let (program, node, segments, mut totals) =
         cut::prove_whole("balance", &blob, &record, &trace, 1);
-    let (_, _, proof) = common::wrap_root("balance", &program, &node, &mut totals.wrap);
+    let (_, proof) = common::wrap_root("balance", &program, &node, &mut totals.wrap);
     totals.report("balance");
     eprintln!("balance: {segments} segments");
 

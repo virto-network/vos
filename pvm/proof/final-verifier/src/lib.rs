@@ -9,20 +9,15 @@
 //! public use and each public word's add to zero: that is what binds the
 //! words to the circuit's wires (`vos_pvm_recair_air::gate`).
 //!
-//! **Two formats** (`vos_pvm_proof::format`):
-//! - **39** ([`masked`]), the masked wrap: what production venues accept,
-//!   and the only one a build links by default. Its bytes are a fixed
-//!   layout ([`masked::decode`]): one encoding a proof;
-//! - **28** (`unmasked`, under the `test-formats` feature), the unmasked
-//!   wrap: the tests' and the fixtures', never a production venue's. Its
-//!   bytes are postcard's.
+//! **One format** (`vos_pvm_proof::format`): **39** ([`masked`]), the
+//! masked wrap. Its bytes are a fixed layout ([`masked::decode`]): one
+//! encoding a proof.
 //!
 //! **Dispatch is by the statement's format** ([`verify`], [`decode`]): a
 //! venue passes the format its statement names and the set it accepts; a
 //! format outside the set, or one this build does not link ([`LINKED`]), is
 //! refused, and that format's decode checks the proof's own header against
-//! it. The format is never read from the proof's bytes, whose encodings
-//! differ.
+//! it. The format is never read from the proof's bytes.
 //!
 //! **Every proof's shape is checked before any Stwo call**: Stwo's verifier
 //! refuses a malformed FRI proof, Merkle witness or queried-value shape with
@@ -63,8 +58,6 @@ extern crate alloc;
 mod constants;
 mod layout;
 pub mod masked;
-#[cfg(feature = "test-formats")]
-pub mod unmasked;
 
 use serde::{Deserialize, Serialize};
 use stwo::core::channel::Channel;
@@ -77,9 +70,7 @@ use stwo::core::verifier::VerificationError;
 use vos_pvm_recair_air::LogSizes;
 use vos_pvm_recair_air::gate::Layout;
 
-pub use constants::{
-    LOG_SIZES, MAX_PROOF_BYTES, PREPROCESSED_ROOT, PREPROCESSED_ROOT_39, TREE_WIDTHS,
-};
+pub use constants::{LOG_SIZES, MAX_PROOF_BYTES, PREPROCESSED_ROOT_39, TREE_WIDTHS};
 pub use vos_pvm_recair_air;
 
 /// The wrap's public words: the program id's 8, then the io-hash's 16 limbs.
@@ -89,14 +80,10 @@ pub const PUBLIC_WORDS: usize = 24;
 /// one and `u`.
 pub const LAYOUT: Layout = Layout::wrap(PUBLIC_WORDS as u32);
 
-/// The formats this build verifies: 39, and 28 under `test-formats`.
-#[cfg(not(feature = "test-formats"))]
+/// The formats this build verifies.
 pub const LINKED: &[u32] = &[masked::FORMAT];
-/// The formats this build verifies: 39, and 28 under `test-formats`.
-#[cfg(feature = "test-formats")]
-pub const LINKED: &[u32] = &[unmasked::FORMAT, masked::FORMAT];
 
-/// A wrap proof, of either format: its encodings differ, its fields do not.
+/// A wrap proof.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WrapProof {
     pub format_version: u32,
@@ -250,8 +237,6 @@ impl Decoded {
     pub fn verify(self, words: &[u32; PUBLIC_WORDS]) -> Result<Statement, Error> {
         match self.format {
             masked::FORMAT => masked::verify(self.proof, words),
-            #[cfg(feature = "test-formats")]
-            unmasked::FORMAT => unmasked::verify(self.proof, words),
             _ => Err(Error::Format),
         }
     }
@@ -267,8 +252,6 @@ pub fn decode(format: u32, accepted: &[u32], bytes: &[u8]) -> Result<Decoded, Er
     }
     let proof = match format {
         masked::FORMAT => masked::decode(bytes)?,
-        #[cfg(feature = "test-formats")]
-        unmasked::FORMAT => unmasked::decode(bytes)?,
         _ => return Err(Error::Format),
     };
     Ok(Decoded { format, proof })
@@ -378,13 +361,6 @@ mod tests {
         ));
     }
 
-    /// `format::MASKED_WRAP`'s preprocessed root is `format::WRAP`'s: its
-    /// columns at `n + 1` under blowup 32 are `format::WRAP`'s at `n + 6`.
-    #[test]
-    fn the_masked_preprocessed_root_is_format_28s() {
-        assert_eq!(PREPROCESSED_ROOT_39, PREPROCESSED_ROOT);
-    }
-
     /// A format outside the accepted set, or one this build does not link,
     /// is refused before its bytes are read.
     #[test]
@@ -398,8 +374,6 @@ mod tests {
             decode(masked::FORMAT, &[masked::FORMAT], &[]),
             Err(Error::Decode)
         ));
-        assert!(LINKED.contains(&masked::FORMAT));
-        #[cfg(not(feature = "test-formats"))]
         assert_eq!(LINKED, [39]);
     }
 }

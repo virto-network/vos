@@ -2,17 +2,11 @@
 //! them, from `pvm/proof/fixtures`: each a case, a venue's state, a
 //! statement, a proof and the verdict every venue must reach.
 //!
-//! - `wrap.proof`, `wrap-prefix.proof` and `wrap-midway.proof`: final proofs of `format::MASKED_WRAP`, fixed layout;
-//!   `wrap-28.proof`: `format::WRAP`'s, postcard, for the test policy's cases;
+//! - `wrap.proof`, `wrap-prefix.proof` and `wrap-midway.proof`: final
+//!   proofs of `format::MASKED_WRAP`, fixed layout;
 //! - [`CASES`]: the cases, each its name, its proof's file, a [`Patch`] of
 //!   that proof's bytes if any, its [`Input`] and its verdict's code
 //!   (`crate::code`), in this module's encoding ([`encode`]).
-//!
-//! A case's verdict is a build's linking both formats ([`RECORDED`]): the
-//! tests', and the harnesses' test builds. A production build, linking
-//! `format::MASKED_WRAP` alone, refuses a statement of `format::WRAP` as
-//! `Format` (2), the first check after the input decodes, and reaches every
-//! other case's verdict ([`Fixture::verdict_linking`]).
 //!
 //! The generator (`pvm/proof/tests/kernel/fixtures.rs`) writes them, and
 //! refuses fixtures it does not make.
@@ -37,10 +31,6 @@ use vos_anchor::codec::{self, Reader};
 
 /// The cases' file.
 pub const CASES: &str = "statements.cases";
-
-/// The formats linked by the build whose verdicts the cases record: 28 and
-/// 39.
-pub const RECORDED: &[u32] = &[28, 39];
 
 /// The fixtures' directory, `pvm/proof/fixtures`.
 pub fn directory() -> PathBuf {
@@ -173,19 +163,6 @@ pub struct Fixture {
 }
 
 impl Fixture {
-    /// The verdict of a build linking `linked`: the recorded one, or
-    /// `Format` (2) when its statement's format is one the build does not
-    /// link and the recorded build does, the format being the first check
-    /// after the input decodes.
-    pub fn verdict_linking(&self, linked: &[u32]) -> u32 {
-        let format = self.input.statement.format;
-        if RECORDED.contains(&format) && !linked.contains(&format) {
-            crate::Refusal::Format.code()
-        } else {
-            self.verdict
-        }
-    }
-
     /// A judgement's bytes (`crate::model::judge_bytes`): the input, then
     /// the proof.
     pub fn bytes(&self) -> Vec<u8> {

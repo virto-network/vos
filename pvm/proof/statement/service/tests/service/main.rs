@@ -21,7 +21,7 @@ use vos_statement::vos_anchor::{
     Anchor, MAX_ROOT_AGE_MS, RootKind, SpaceGenesis, SpaceId, WindowClock, register_digest,
     space_id,
 };
-use vos_statement::vos_pvm_final_verifier::{MAX_PROOF_BYTES, masked};
+use vos_statement::vos_pvm_final_verifier::MAX_PROOF_BYTES;
 use vos_statement_service::config::{self, Config};
 use vos_statement_service::item::{
     Control, Item, MAX_ROOTS, MAX_STATEMENT_BYTES, Op, Register, SignedControl, control_digest,
@@ -71,12 +71,11 @@ fn a_256_kib_extrinsic_is_read_as_the_proof() {
 
 /// Every golden fixture, at a service of its venue's configured with its
 /// pin and holding its venue's state, at its time: the verdict every venue
-/// reaches under the formats the service links (39 alone), and an
-/// accepted statement's id.
+/// reaches, and an accepted statement's id.
 #[test]
 fn every_fixture_is_judged_by_the_service_as_recorded() {
     for fixture in load() {
-        let expected = fixture.verdict_linking(&[masked::FORMAT]);
+        let expected = fixture.verdict;
         let mut rig = fixture_rig(&fixture);
         let statement = fixture.input.statement.encode();
         let landed = rig.item(submit(&statement), vec![fixture.proof.clone()]);

@@ -73,7 +73,7 @@ vos-keeper = { path = "../../tools/keeper" }
 vos-light = { workspace = true, features = ["release"] }
 # A second device format beside the release's, the format window's tests'
 # (`device::TEST_FORMAT`): a dev edge, no production build has it.
-vos-pvm-recair = { workspace = true, features = ["test-formats"] }
+vos-pvm-recair = { workspace = true, features = ["test-device-format"] }
 # A kernel run alone, as an attest runs it.
 vos-testkit = { path = "../../agent/testkit" }
 proptest = "1"

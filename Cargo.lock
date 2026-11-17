@@ -8942,7 +8942,6 @@ name = "vos-pvm-final-verifier"
 version = "0.1.0"
 dependencies = [
  "num-traits",
- "postcard",
  "serde",
  "stwo",
  "vos-pvm-proof",
@@ -9122,7 +9121,6 @@ dependencies = [
 name = "vos-statement"
 version = "0.1.0"
 dependencies = [
- "hex",
  "vos-anchor",
  "vos-pvm",
  "vos-pvm-compiler",

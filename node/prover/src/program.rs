@@ -7,8 +7,8 @@ use vos_wire::schema::Schema;
 
 /// The circuits' constants every statement's proof rests on, as the
 /// repository pins them (`vos_pvm_proof::constants`), computed here: by
-/// name, `H_FOLD` as its eight M31 words, `WRAP_ROOT_28` and
-/// `WRAP_ROOT_39` as their 32 bytes.
+/// name, `H_FOLD` as its eight M31 words and `WRAP_ROOT_39` as its 32
+/// bytes.
 pub fn circuits() -> Vec<(&'static str, Vec<u32>)> {
     let wrap = vos_pvm_recair::wrap::WrapCircuit::get();
     let bytes = |root: [u8; 32]| root.iter().map(|&byte| u32::from(byte)).collect();
@@ -21,7 +21,6 @@ pub fn circuits() -> Vec<(&'static str, Vec<u32>)> {
                 .map(|word| word.0)
                 .collect(),
         ),
-        ("WRAP_ROOT_28", bytes(wrap.preprocessed_root().0)),
         ("WRAP_ROOT_39", bytes(wrap.masked_preprocessed_root().0)),
     ]
 }

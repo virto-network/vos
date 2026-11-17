@@ -43,15 +43,11 @@
 //!
 //! **Formats.** [`judge`] reads a statement's proof under the statement's
 //! format, through the final verifier's dispatch, when the venue accepts it
-//! and this build links it ([`LINKED`]): `format::MASKED_WRAP` alone, and
-//! `format::WRAP` beside it only under the `test-formats` feature, which no
-//! production build enables (`just check-no-test-formats`). So the accepted
-//! set is the one gate between `format::WRAP` and a production venue.
+//! and this build links it ([`LINKED`]): `format::MASKED_WRAP`.
 //!
 //! **Keys.** A venue remembers what it accepted by the statement's id
-//! ([`Statement::id`]), never by the proof's bytes or their hash: a proof
-//! has many encodings under `format::WRAP` (postcard's), and many proofs
-//! state one statement.
+//! ([`Statement::id`]), never by the proof's bytes or their hash: many
+//! proofs state one statement.
 //!
 //! **`Seen` and time** ([`seen_expiry`]): a statement's entry may be
 //! dropped once its newest root is past [`MAX_ROOT_AGE_MS`], since a replay
@@ -119,9 +115,9 @@ pub const IO_DOMAIN: &[u8] = b"vos/io/v1";
 /// The statement id's domain.
 pub const ID_DOMAIN: &[u8] = b"vos/statement/v1";
 
-/// The final formats this build reads: `format::MASKED_WRAP`, and
-/// `format::WRAP` under `test-formats`. A venue refuses a statement of any
-/// other as [`Refusal::Format`], whatever it accepts.
+/// The final formats this build reads: `format::MASKED_WRAP`. A venue
+/// refuses a statement of any other as [`Refusal::Format`], whatever it
+/// accepts.
 pub const LINKED: &[u32] = vos_pvm_final_verifier::LINKED;
 
 /// A kernel's program id: eight M31 words, each below `p`.
@@ -581,7 +577,7 @@ mod tests {
     fn every_field_is_bound() {
         let base = statement();
         let mut reformatted = base.clone();
-        reformatted.format = 28;
+        reformatted.format = 40;
         assert_eq!(reformatted.io_hash(), base.io_hash());
         assert_eq!(reformatted.id(), base.id());
 

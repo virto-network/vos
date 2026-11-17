@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 
 use crate::common::leakage::{Fields, Key, Verdicts, indistinguishable, published, uniform};
 use crate::wrap::whole_run_root;
+use vos_pvm_proof::format::Format;
 use vos_pvm_proof::program_id::IdPreimage;
+use vos_pvm_recair::prove::prove_on;
 use vos_pvm_recair::tree::Node;
 
 /// Proofs a witness: `LEAKAGE_WRAP_N`, 16 unless it is set; at least
@@ -27,7 +29,8 @@ fn n() -> usize {
 const GATE_SEEDS: usize = 12;
 
 /// A wrap witness's N masked proofs: their fields and the first two
-/// proofs'; and its unmasked wrap's fields, N times.
+/// proofs'; and its wrap proved unmasked under 39's parameters (the
+/// control, no format's), its fields N times.
 struct Proofs {
     fields: Fields,
     first: Vec<Vec<(Key, u32)>>,
@@ -53,7 +56,13 @@ fn proofs_of(name: &str, root: &Node, program: &IdPreimage) -> Proofs {
         started.elapsed().as_secs_f64(),
         fields.0.len()
     );
-    let control = wrap::prove_unmasked(&finalized).expect("proves");
+    let unmasked = Format {
+        masking: None,
+        ..vos_pvm_proof::format::MASKED_WRAP
+    };
+    let control =
+        prove_on::<Blake2bMerkleChannel>(&unmasked, &finalized.circuit, &finalized.witness, |_| {})
+            .expect("proves");
     let control = published(&control.stark_proof, &control.claimed_sums);
     let mut unmasked = Fields::default();
     for _ in 0..n() {

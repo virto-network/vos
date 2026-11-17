@@ -34,8 +34,7 @@
 //!   output their run states.
 //! - [`wrap`] is the final wrap: a tree's root verified, its circuit, program
 //!   and run checked, the program id and io-hash its public words, proved
-//!   masked under `format::MASKED_WRAP` on the Blake2b-256 channel, or
-//!   unmasked under `format::WRAP`.
+//!   masked under `format::MASKED_WRAP` on the Blake2b-256 channel.
 //! - [`tree`] proves a run's tree node by node: leaves, folds, the wrap.
 
 pub mod circuit;

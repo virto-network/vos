@@ -14,8 +14,8 @@
 //! the agent's reference model at the cut; its kernel re-runs from the
 //! attest to the same statement, proves over its shape and verifies as a
 //! chain against its program; its leaves and folds prove and verify; and
-//! its whole run, folded to one root, wraps under `format::WRAP` and masked
-//! under 39, whose statement the model venue judges against the space's
+//! its whole run, folded to one root, wraps masked under 39, whose
+//! statement the model venue judges against the space's
 //! anchors: accepted, and refused as each thing it binds is changed.
 
 use crate::common;
@@ -622,8 +622,7 @@ fn the_windows_leaves_and_folds_prove_and_verify() {
 
 /// The window end to end on the million-row map: its run, at most 1M steps,
 /// its space path within a fifth of its budget; proved whole, folded to one
-/// root and wrapped under `format::WRAP` and masked under
-/// `format::MASKED_WRAP`; and its statement (the reader's agent and
+/// root and wrapped masked under `format::MASKED_WRAP`; and its statement (the reader's agent and
 /// instance, the peer, the currency and `c_prev` public,
 /// `(net, seq, c_new)` its output, `S_w` its root) judged at the model
 /// venue, which pins the kernel's program and holds `S_w` anchored by the
@@ -804,7 +803,7 @@ fn proved_window() -> (Statement, Vec<u8>, [u8; 32], [u8; 32]) {
     let (program, root, segments, mut totals) =
         cut::prove_whole("the window", &blob, &record, &trace, CUT);
     drop(trace);
-    let (_, _, proof) = common::wrap_root("the window", &program, &root, &mut totals.wrap);
+    let (_, proof) = common::wrap_root("the window", &program, &root, &mut totals.wrap);
     totals.report("the window");
     eprintln!(
         "the window: {segments} segments, proved end to end in {:.0}s",

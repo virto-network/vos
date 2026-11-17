@@ -1,11 +1,11 @@
-//! Fuzz target: arbitrary bytes as a wrap proof of `format::WRAP` and of format
-//! 39, each against its golden wrap's public words, dispatched by the
-//! format as a venue dispatches (`vos_pvm_final_verifier::verify`).
+//! Fuzz target: arbitrary bytes as a wrap proof of format 39, against its
+//! golden wrap's public words, dispatched by the format as a venue
+//! dispatches (`vos_pvm_final_verifier::verify`).
 //!
 //! Property: **no panic, no abort**, and **nothing accepted but a golden
 //! wrap:** bytes that verify decode to it, their re-encoding its bytes
 //! (`golden::Golden::assert_is_golden`; under 39's fixed layout, the bytes
-//! themselves). Seed the corpus with the golden wraps so the fuzzer starts
+//! themselves). Seed the corpus with the golden wrap so the fuzzer starts
 //! from proofs that decode:
 //!
 //! ```text

@@ -1,6 +1,5 @@
 //! The venue's JAM programs on the JAM-only host, at PolkaJam's prices:
-//! the refine program (`final-verify.elf`, linking `format::MASKED_WRAP` alone, and
-//! `final-verify-test.elf`, linking 28 beside it), its request as work item
+//! the refine program (`final-verify.elf`, linking `format::MASKED_WRAP`), its request as work item
 //! 0's payload and the proof as a preimage of the running service; and any
 //! service's refine and accumulate (`statement-service.elf`'s), each built
 //! by `just check-no-std`. Shared by the tests that run them, each including
@@ -33,15 +32,12 @@ const SERVICE: u64 = 7;
 enum Mode {
     Words = 0,
     Judge = 1,
-    /// The test guest's alone.
-    Anchors = 2,
 }
 
 /// What the guest reports: its verdict, the gas left at its start, after
 /// the proof's lookup, after its decode and at its end; the proof's
 /// length; its heap's peak, high-water mark and allocations; a refusal's
-/// text; a judgement's code and an accepted statement's id; a golden
-/// vector's digests.
+/// text; a judgement's code and an accepted statement's id.
 #[derive(Debug)]
 pub struct GuestReport {
     pub verdict: u64,
@@ -52,19 +48,11 @@ pub struct GuestReport {
     pub error: String,
     pub code: u64,
     pub id: [u8; 32],
-    pub digests: Vec<u8>,
 }
 
-/// The production guest, linking `format::MASKED_WRAP` alone, linked: its program and
-/// its ELF's length.
+/// The venue's guest, linked: its program and its ELF's length.
 pub fn program() -> (Vec<u8>, usize) {
     guest("final-verify")
-}
-
-/// The test guest, linking `format::WRAP` beside 39, linked: its program and its
-/// ELF's length.
-pub fn test_program() -> (Vec<u8>, usize) {
-    guest("final-verify-test")
 }
 
 /// `target/riscv64em-vos/release/<name>.elf` of the workspace holding the
@@ -97,11 +85,6 @@ pub fn words_request(format: u32, words: &[u32; PUBLIC_WORDS]) -> Vec<u8> {
 /// A request to judge a statement: `input`, then the proof.
 pub fn judge_request(input: &Input) -> Vec<u8> {
     [&[Mode::Judge as u8][..], &input.encode()].concat()
-}
-
-/// A request to compute a golden vector's digests: its encoding.
-pub fn anchors_request(vector: &[u8]) -> Vec<u8> {
-    [&[Mode::Anchors as u8][..], vector].concat()
 }
 
 /// The guest run on `request` and `proof`: its gas and its report.
@@ -150,7 +133,6 @@ pub fn run_payload(program: &[u8], payload: Vec<u8>, proof: Option<&[u8]>) -> (u
         error: String::from_utf8_lossy(&bytes[80..80 + error_len]).into_owned(),
         code: word(34),
         id: bytes[280..312].try_into().unwrap(),
-        digests: bytes[312..472].to_vec(),
     };
     (invocation.gas_used, report)
 }

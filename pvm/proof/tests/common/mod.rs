@@ -512,22 +512,17 @@ pub fn prove_fold(
     }
 }
 
-/// `root`, the root of a whole run of `program`, wrapped under `format::WRAP` on
-/// the Blake2b-256 channel within 2^17 rows and 8 GiB of heap, and verified
-/// by `vos-pvm-final-verifier`, its statement the program's id and the root's
-/// io-hash: the proof's bytes (postcard) and its public words; its proving
-/// time and peak heap added to `wrap`. The same witness is proved masked
-/// under `format::MASKED_WRAP` as well ([`masked_wrap`]): its bytes, the fixed layout.
+/// `root`, the root of a whole run of `program`, wrapped within 2^17 rows,
+/// proved masked under `format::MASKED_WRAP` ([`masked_wrap`]) and verified
+/// by `vos-pvm-final-verifier`, its statement the program's id and the
+/// root's io-hash: its public words and the proof's bytes, the fixed
+/// layout; its proving time and peak heap added to `wrap`.
 pub fn wrap_root(
     name: &str,
     program: &vos_pvm_proof::program_id::KernelProgram,
     root: &NodeRun,
     wrap: &mut Tally,
-) -> (
-    Vec<u8>,
-    [u32; vos_pvm_final_verifier::PUBLIC_WORDS],
-    Vec<u8>,
-) {
+) -> ([u32; vos_pvm_final_verifier::PUBLIC_WORDS], Vec<u8>) {
     use vos_pvm_recair::wrap::{self, WrapCircuit};
 
     let circuit = WrapCircuit::get();
@@ -542,24 +537,12 @@ pub fn wrap_root(
     assert_eq!(log_sizes, vos_pvm_final_verifier::LOG_SIZES);
     assert!(log_sizes.iter().all(|&log| log <= 17));
     let words = wrap::public_words(&finalized);
-    let (proof, proving, peak_mib) =
-        measured(|| wrap::prove_unmasked(&finalized).expect("the wrap proves"));
-    let bytes = postcard::to_allocvec(&proof).expect("encodes");
-    eprintln!(
-        "{name}'s wrap: {log_sizes:?} log sizes, proved in {:.2}s, its peak heap {peak_mib} MiB, \
-         {} bytes",
-        proving.as_secs_f64(),
-        bytes.len()
-    );
-    assert!(peak_mib <= 8 << 10, "{peak_mib} MiB");
-    wrap.add(proving, peak_mib);
-    let verified =
-        vos_pvm_final_verifier::unmasked::verify_bytes(&bytes, &words).expect("the wrap verifies");
-    assert_eq!(verified, statement);
+    assert_eq!(words, statement.words());
     assert_eq!(statement.program, program.id().words());
     assert_eq!(statement.io_hash, root.node.output.io_hash);
-    let masked = masked_wrap(name, &finalized, &words);
-    (bytes, words, masked)
+    let (bytes, proving, peak_mib) = masked_wrap(name, &finalized, &words);
+    wrap.add(proving, peak_mib);
+    (words, bytes)
 }
 
 /// The machine's load averages, as `/proc/loadavg` gives them: empty
@@ -594,12 +577,12 @@ pub fn resident_peak_mib(reset: bool) -> u64 {
 /// verifier's masked verifier at the preprocessed root the format pins: its
 /// proving time and R1's printed with the load average, and its bytes
 /// written for the Wasm harness as `wrap/<name>-39.{proof,format,words}`:
-/// the bytes.
+/// the bytes, the proving time and the peak heap.
 fn masked_wrap(
     name: &str,
     finalized: &vos_pvm_recair::Finalized<stwo::core::fields::qm31::SecureField>,
     words: &[u32; vos_pvm_final_verifier::PUBLIC_WORDS],
-) -> Vec<u8> {
+) -> (Vec<u8>, std::time::Duration, u64) {
     use stwo::core::vcs::blake2b_hash::Blake2bHash;
     use vos_pvm_final_verifier::masked;
     use vos_pvm_recair::masked::MaskRng;
@@ -636,7 +619,7 @@ fn masked_wrap(
     let verified = masked::verify_bytes(&bytes, words).expect("the masked wrap verifies");
     assert_eq!(verified.words(), *words);
     write_wrap_files(&format!("{name}-39"), masked::FORMAT, &bytes, words);
-    bytes
+    (bytes, proving, peak_mib)
 }
 
 /// A wrap's proof, its format (a little-endian `u32`) and its public words
@@ -660,20 +643,19 @@ fn write_wrap_files(
     }
 }
 
-/// A `format::WRAP` wrap's `proof`, verified against its public `words`
-/// natively and on the JAM-only host by the venue's test refine program
-/// (`final-verify-test.elf`, which links 28), and written under the
-/// target's tmp directory as `wrap/<name>.{proof,format,words}` for the
-/// Wasm harness.
+/// A `format::MASKED_WRAP` wrap's `proof`, verified against its public
+/// `words` natively and on the JAM-only host by the venue's refine program
+/// (`final-verify.elf`), and written under the target's tmp directory as
+/// `wrap/<name>.{proof,format,words}` for the Wasm harness.
 pub fn verified_wrap(
     name: &str,
     proof: &[u8],
     words: &[u32; vos_pvm_final_verifier::PUBLIC_WORDS],
 ) {
-    let format = vos_pvm_final_verifier::unmasked::FORMAT;
+    let format = vos_pvm_final_verifier::masked::FORMAT;
     vos_pvm_final_verifier::verify(format, &[format], proof, words)
         .expect("the wrap verifies natively");
-    let (program, _) = jam::test_program();
+    let (program, _) = jam::program();
     let (gas, report) = jam::run(&program, &jam::words_request(format, words), proof);
     eprintln!(
         "verified on the JAM-only host: {gas} gas ({:.1}M); heap peak {} KiB",

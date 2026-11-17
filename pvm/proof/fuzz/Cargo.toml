@@ -21,8 +21,8 @@ vos-pvm = { path = "../../runtime" }
 vos-pvm-proof = { path = ".." }
 vos-pvm-proof-verifier = { path = "../verifier" }
 # The final verifier on the bytes a venue receives: arbitrary bytes, and the
-# golden wraps' bytes and structure mutated, formats 28 and 39.
-vos-pvm-final-verifier = { path = "../final-verifier", features = ["test-formats"] }
+# golden wrap's bytes and structure mutated.
+vos-pvm-final-verifier = { path = "../final-verifier" }
 vos-statement = { path = "../statement", features = ["fixtures"] }
 # A space's genesis, anchors, migrations and golden vectors, as a venue
 # decodes them.
@@ -36,7 +36,6 @@ vos-pvm-precompiles = { path = "../precompiles" }
 # program the assembler builds.
 vos-pvm-recair = { path = "../recair", default-features = false }
 vos-pvm-compiler = { path = "../../compiler" }
-postcard = { version = "1", features = ["alloc"] }
 stwo = { git = "https://github.com/olanod/stwo", rev = "e14925a81606b4d68c6a5d3047d382a20bd953d3", default-features = false }
 
 # Skip the test profile's default panic strategy override;

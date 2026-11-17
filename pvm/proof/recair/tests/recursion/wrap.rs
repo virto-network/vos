@@ -1,11 +1,12 @@
 //! The final wrap (`proving.md` §3.5, `recursion-air.md` §7) over a small
 //! kernel's run, a standard program that sets its io-hash and halts: as one
 //! segment, whose leaf is the root, and cut in four segments, whose leaves
-//! fold to the root. Each root is wrapped, proved under `format::WRAP` on the
-//! Blake2b-256 channel and verified by `vos-pvm-final-verifier`.
+//! fold to the root. Each root is wrapped, proved masked under
+//! `format::MASKED_WRAP` from a seed on the Blake2b-256 channel and verified
+//! by `vos-pvm-final-verifier`.
 //!
-//! - **The circuit is pinned:** its log sizes and preprocessed root are the
-//!   final verifier's constants, its rows by piece, within 2^17.
+//! - **The circuit is pinned:** its log sizes are the final verifier's
+//!   constants, its rows by piece, within 2^17.
 //! - **Refusals, each by its intended check:** a root without the entry flag
 //!   or the halt flag, or with `first` other than 0 (`wrap: run`); a root
 //!   carrying a foreign W, or whose circuit is none of the program's
@@ -13,34 +14,26 @@
 //!   program`); a tampered root proof, by the check the native verifier
 //!   refuses it with. A refused wrap, proved, does not verify.
 //! - **The final verifier refuses** a tampered wrap proof, on FRI at fold
-//!   step 3 and on the Blake2b-256 trees and channel, and every malformed
-//!   shape cleanly, with an error.
-//! - **On the JAM-only host** the final verifier, a refine program
-//!   (`final-verify.elf`, built by `just check-no-std`), accepts the wrap
-//!   within 150M gas, and refuses a tampered one or other words.
+//!   step 3 and on the Blake2b-256 trees and channel, with an error.
 
 use crate::common;
-use crate::jam;
 
 use std::sync::OnceLock;
 use std::time::Instant;
 
 use stwo::core::fields::m31::{BaseField, P};
 use stwo::core::fields::qm31::SecureField;
-use stwo::core::fri::FriVerificationError;
-use stwo::core::poly::line::LinePoly;
 use stwo::core::vcs::blake2b_hash::Blake2bHash;
-use stwo::core::vcs_lifted::verifier::MerkleVerificationError;
-use stwo::core::verifier::VerificationError;
-use vos_pvm_final_verifier::{Error, PUBLIC_WORDS, Statement, WrapProof, unmasked};
+use vos_pvm_final_verifier::{Error, PUBLIC_WORDS, Statement, WrapProof, masked};
 use vos_pvm_proof::Proof;
-use vos_pvm_proof::format::{SEGMENT, WRAP};
+use vos_pvm_proof::format::SEGMENT;
 use vos_pvm_proof::kernel::trace_kernel;
 use vos_pvm_proof::poseidon2::P2Hash;
 use vos_pvm_proof::program_id::{IdPreimage, LeafCircuits};
 use vos_pvm_proof::segment::SegmentCursor;
 use vos_pvm_recair::fold::FoldCircuit;
 use vos_pvm_recair::leaf::{LeafCircuit, io_hash_of};
+use vos_pvm_recair::masked::MaskRng;
 use vos_pvm_recair::tree::{self, Node};
 use vos_pvm_recair::verifier::SegmentShape;
 use vos_pvm_recair::wrap::{self, WrapCircuit, WrapValues};
@@ -141,20 +134,26 @@ pub(crate) struct Wrapped {
     pub(crate) statement: Statement,
 }
 
-/// Wraps `root` under `program`, proves it and verifies it natively.
+/// The seed the tests' wraps are masked from.
+pub(crate) const SEED: u64 = 39;
+
+/// Wraps `root` under `program`, proves it masked from [`SEED`] and
+/// verifies it natively.
 fn wrapped(root: &Node, program: &IdPreimage, name: &str) -> Wrapped {
     let started = Instant::now();
-    let (proof, statement, words) =
-        tree::wrap_with(root, program, wrap::prove_unmasked).expect("proves");
+    let (proof, statement, words) = tree::wrap_with(root, program, |finalized| {
+        wrap::prove_masked(finalized, MaskRng::Seeded(SEED)).map(|(proof, _)| proof)
+    })
+    .expect("proves");
     assert_eq!(words, statement.words());
-    let bytes = postcard::to_allocvec(&proof).expect("encodes");
+    let bytes = wrap::proof_bytes(&proof).expect("format 39's bytes");
     eprintln!(
         "{name}: the wrap proved in {:.2}s, {} bytes",
         started.elapsed().as_secs_f64(),
         bytes.len()
     );
     assert_eq!(
-        unmasked::verify_bytes(&bytes, &words).expect("verifies"),
+        masked::verify_bytes(&bytes, &words).expect("verifies"),
         statement
     );
     Wrapped {
@@ -220,9 +219,8 @@ pub(crate) fn values_of(root: &Node, program: &IdPreimage) -> WrapValues<SecureF
         .0
 }
 
-/// The circuit: its log sizes and preprocessed root the final verifier's,
-/// its rows by piece, the tallest component 2^15, within 2^17; `format::WRAP`'s
-/// entry the final verifier's constants.
+/// The circuit: its log sizes the final verifier's, its rows by piece, the
+/// tallest component 2^15, within 2^17.
 #[test]
 fn the_wrap_circuit_is_pinned() {
     let wrap = WrapCircuit::get();
@@ -260,14 +258,6 @@ fn the_wrap_circuit_is_pinned() {
         vos_pvm_final_verifier::LOG_SIZES
     );
     assert!(topology.circuit.log_sizes().iter().all(|&log| log <= 17));
-    assert_eq!(
-        wrap.preprocessed_root(),
-        Blake2bHash(vos_pvm_final_verifier::PREPROCESSED_ROOT)
-    );
-
-    assert_eq!(WRAP.number, unmasked::FORMAT);
-    assert_eq!(WRAP.pcs_config(), unmasked::CONFIG);
-    assert_eq!(WRAP.interaction_pow_bits(), unmasked::INTERACTION_POW_BITS);
     assert_eq!(wrap.fold_word, FoldCircuit::new().hash());
 }
 
@@ -292,7 +282,7 @@ fn a_one_segment_run_wraps_through_its_leaf() {
     for word in [0, 7, 8, 23] {
         let mut words = one.wrapped.words;
         words[word] ^= 1;
-        let error = unmasked::verify(one.wrapped.proof.clone(), &words).unwrap_err();
+        let error = masked::verify(one.wrapped.proof.clone(), &words).unwrap_err();
         // The words are mixed before the interaction PoW, so another word
         // moves the transcript: the nonce falls short, or, past it, the
         // public terms do not balance.
@@ -352,9 +342,9 @@ fn a_root_without_its_ends_is_refused() {
     context.set_output_lanes(&lanes);
     let finalized = context.finalize().expect("the wiring checks");
     let words = wrap::public_words(&finalized);
-    let refused = match wrap::prove_unmasked(&finalized) {
+    let refused = match wrap::prove_masked(&finalized, MaskRng::Seeded(SEED)) {
         Err(_) => true,
-        Ok(proof) => unmasked::verify(proof, &words).is_err(),
+        Ok((proof, _)) => masked::verify(proof, &words).is_err(),
     };
     assert!(refused, "a root without its halt wraps and verifies");
 }
@@ -510,300 +500,11 @@ fn the_final_verifier_refuses_a_tampered_wrap() {
     for (name, tamper) in tampers {
         let mut proof = one.wrapped.proof.clone();
         tamper(&mut proof);
-        let error = unmasked::verify(proof, &words).expect_err(name).to_string();
+        let error = masked::verify(proof, &words).expect_err(name).to_string();
         eprintln!("{name}: {error}");
     }
     // The preprocessed root: another circuit.
     let mut proof = one.wrapped.proof.clone();
     flip(&mut proof.stark_proof.0.commitments[0]);
-    assert!(matches!(
-        unmasked::verify(proof, &words),
-        Err(Error::Circuit)
-    ));
-}
-
-/// Every malformed shape is refused with an error, each by the check meant
-/// for it: the trees' counts, a column's samples and a tree's columns by the
-/// shape's check, before Stwo indexes the proof; a noncanonical limb; the
-/// format, configuration and log sizes; and by Stwo's own errors the
-/// queried values' columns and values (the Merkle verifier's shape check),
-/// FRI's layer count, a layer's witness and the last layer's degree.
-#[test]
-fn the_final_verifier_refuses_a_malformed_shape() {
-    let one = one_segment();
-    let words = one.wrapped.words;
-    type Malform = Box<dyn Fn(&mut WrapProof)>;
-    type Expect = fn(&Error) -> bool;
-    let shape: Expect = |error| matches!(error, Error::Shape(_));
-    let noncanonical: Expect = |error| matches!(error, Error::Noncanonical);
-    let format: Expect = |error| matches!(error, Error::Format);
-    let queried: Expect = |error| {
-        matches!(
-            error,
-            Error::Stark(VerificationError::Merkle(
-                MerkleVerificationError::QueriedValuesShapeMismatch
-            ))
-        )
-    };
-    let layers: Expect = |error| {
-        matches!(
-            error,
-            Error::Stark(VerificationError::Fri(
-                FriVerificationError::InvalidNumFriLayers
-            ))
-        )
-    };
-    let witness: Expect = |error| {
-        matches!(
-            error,
-            Error::Stark(VerificationError::Fri(
-                FriVerificationError::InnerLayerEvaluationsInvalid { inner_layer: 0 }
-            ))
-        )
-    };
-    let last: Expect = |error| {
-        matches!(
-            error,
-            Error::Stark(VerificationError::Fri(
-                FriVerificationError::LastLayerDegreeInvalid
-            ))
-        )
-    };
-    let shapes: Vec<(&str, Expect, Malform)> = vec![
-        (
-            "a commitment fewer",
-            shape,
-            Box::new(|p| {
-                p.stark_proof.0.commitments.pop();
-            }),
-        ),
-        (
-            "a commitment more",
-            shape,
-            Box::new(|p| {
-                let extra = p.stark_proof.0.commitments[0];
-                p.stark_proof.0.commitments.push(extra);
-            }),
-        ),
-        (
-            "a tree of samples fewer",
-            shape,
-            Box::new(|p| {
-                p.stark_proof.0.sampled_values.pop();
-            }),
-        ),
-        (
-            "a column's sample fewer",
-            shape,
-            Box::new(|p| {
-                p.stark_proof.0.sampled_values[1][0].pop();
-            }),
-        ),
-        (
-            "a column's sample more",
-            shape,
-            Box::new(|p| p.stark_proof.0.sampled_values[2][3].push(SecureField::default())),
-        ),
-        (
-            "a composition column's sample fewer",
-            shape,
-            Box::new(|p| {
-                p.stark_proof.0.sampled_values[3][7].pop();
-            }),
-        ),
-        (
-            "a column of samples fewer",
-            shape,
-            Box::new(|p| {
-                p.stark_proof.0.sampled_values[1].pop();
-            }),
-        ),
-        (
-            "a preprocessed column's samples empty",
-            shape,
-            Box::new(|p| p.stark_proof.0.sampled_values[0][0].clear()),
-        ),
-        (
-            "a decommitment fewer",
-            shape,
-            Box::new(|p| {
-                p.stark_proof.0.decommitments.pop();
-            }),
-        ),
-        (
-            "a tree of queried values fewer",
-            shape,
-            Box::new(|p| {
-                p.stark_proof.0.queried_values.pop();
-            }),
-        ),
-        (
-            "a column of queried values fewer",
-            queried,
-            Box::new(|p| {
-                p.stark_proof.0.queried_values[2].pop();
-            }),
-        ),
-        (
-            "a queried value fewer",
-            queried,
-            Box::new(|p| {
-                p.stark_proof.0.queried_values[0][4].pop();
-            }),
-        ),
-        (
-            "an inner FRI layer fewer",
-            layers,
-            Box::new(|p| {
-                p.stark_proof.0.fri_proof.inner_layers.pop();
-            }),
-        ),
-        (
-            "an inner FRI layer more",
-            layers,
-            Box::new(|p| {
-                let extra = p.stark_proof.0.fri_proof.inner_layers[0].clone();
-                p.stark_proof.0.fri_proof.inner_layers.push(extra);
-            }),
-        ),
-        (
-            "a FRI witness value fewer",
-            witness,
-            Box::new(|p| {
-                p.stark_proof.0.fri_proof.inner_layers[0].fri_witness.pop();
-            }),
-        ),
-        (
-            "a last layer twice as long",
-            last,
-            Box::new(|p| {
-                let mut coeffs = p.stark_proof.0.fri_proof.last_layer_poly.to_vec();
-                coeffs.extend(coeffs.clone());
-                p.stark_proof.0.fri_proof.last_layer_poly = LinePoly::new(coeffs);
-            }),
-        ),
-        (
-            "a noncanonical sampled value",
-            noncanonical,
-            Box::new(|p| {
-                p.stark_proof.0.sampled_values[1][0][0] =
-                    SecureField::from_m31_array([BaseField::from_u32_unchecked(P); 4])
-            }),
-        ),
-        (
-            "a noncanonical queried value",
-            noncanonical,
-            Box::new(|p| {
-                p.stark_proof.0.queried_values[1][0][0] = BaseField::from_u32_unchecked(P)
-            }),
-        ),
-        (
-            "a noncanonical claimed sum",
-            noncanonical,
-            Box::new(|p| {
-                p.claimed_sums[0] =
-                    SecureField::from_m31_array([BaseField::from_u32_unchecked(P + 3); 4])
-            }),
-        ),
-        (
-            "another format",
-            format,
-            Box::new(|p| p.format_version = 32),
-        ),
-        ("other log sizes", format, Box::new(|p| p.log_sizes[2] += 1)),
-        (
-            "another configuration",
-            format,
-            Box::new(|p| p.stark_proof.0.config.fri_config.n_queries = 21),
-        ),
-    ];
-    for (name, expect, malform) in shapes {
-        let mut proof = one.wrapped.proof.clone();
-        malform(&mut proof);
-        let error = unmasked::verify(proof, &words).expect_err(name);
-        eprintln!("{name}: {error}");
-        assert!(expect(&error), "{name}: {error}");
-    }
-}
-
-/// The bytes: undecodable bytes, a byte after the proof and bytes over
-/// [`vos_pvm_final_verifier::MAX_PROOF_BYTES`] are refused. Postcard's varints
-/// need not be minimal, so the proof re-encoded with a longer varint is
-/// another byte string that verifies: a proof's bytes are no key for it.
-#[test]
-fn the_final_verifier_reads_one_bounded_encoding() {
-    let one = one_segment();
-    let words = one.wrapped.words;
-    let bytes = postcard::to_allocvec(&one.wrapped.proof).expect("encodes");
-    assert!(matches!(
-        unmasked::verify_bytes(&[28, 1, 2], &words),
-        Err(Error::Decode)
-    ));
-    let mut trailing = bytes.clone();
-    trailing.push(0);
-    assert!(matches!(
-        unmasked::verify_bytes(&trailing, &words),
-        Err(Error::Decode)
-    ));
-    let mut long = bytes.clone();
-    long.resize(vos_pvm_final_verifier::MAX_PROOF_BYTES + 1, 0);
-    assert!(matches!(
-        unmasked::verify_bytes(&long, &words),
-        Err(Error::Length)
-    ));
-    // The format version, 28, is the first varint: one byte, or two.
-    assert_eq!(bytes[0], 28);
-    let overlong = [&[28 | 0x80, 0][..], &bytes[1..]].concat();
-    assert_eq!(
-        unmasked::verify_bytes(&overlong, &words).expect("verifies"),
-        one.wrapped.statement
-    );
-}
-
-/// The final verifier on the JAM-only host, by the test guest (`format::WRAP`
-/// beside 39): the wrap accepted within 150M gas, its phases reported; a
-/// proof tampered at its middle byte, and other words, refused without a
-/// panic.
-#[test]
-fn the_wrap_verifies_on_the_jam_only_host() {
-    let (program, elf_len) = jam::test_program();
-    let one = one_segment();
-    let bytes = postcard::to_allocvec(&one.wrapped.proof).expect("encodes");
-    let request = jam::words_request(unmasked::FORMAT, &one.wrapped.words);
-    let (gas, report) = jam::run(&program, &request, &bytes);
-    let [start, lookup, decode, end] = report.gas;
-    eprintln!(
-        "the wrap on the JAM-only host: {gas} gas ({:.1}M): lookup {}, decode {}, verify {}; \
-         {} bytes, program {} bytes (ELF {elf_len}); heap peak {} KiB, high water {} KiB, {} \
-         allocations",
-        gas as f64 / 1e6,
-        start - lookup,
-        lookup - decode,
-        decode - end,
-        bytes.len(),
-        program.len(),
-        report.peak_live >> 10,
-        report.high_water >> 10,
-        report.allocs,
-    );
-    assert_eq!(report.verdict, jam::ACCEPT, "{}", report.error);
-    assert!(gas <= 150_000_000, "{gas} gas");
-
-    let mut tampered = bytes.clone();
-    tampered[bytes.len() / 2] ^= 1;
-    let (gas, report) = jam::run(&program, &request, &tampered);
-    eprintln!(
-        "a tampered byte: verdict {}, {gas} gas: {}",
-        report.verdict, report.error
-    );
-    assert_ne!(report.verdict, jam::ACCEPT);
-    let mut words = one.wrapped.words;
-    words[3] ^= 1;
-    let (gas, report) = jam::run(
-        &program,
-        &jam::words_request(unmasked::FORMAT, &words),
-        &bytes,
-    );
-    eprintln!("other words: {gas} gas: {}", report.error);
-    assert_eq!(report.verdict, jam::REJECT);
+    assert!(matches!(masked::verify(proof, &words), Err(Error::Circuit)));
 }

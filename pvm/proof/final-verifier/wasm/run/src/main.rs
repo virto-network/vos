@@ -29,14 +29,12 @@
 //! copy (one byte flipped at the middle) must not be accepted.
 //!
 //! ```text
-//! vos-pvm-final-verifier-wasm-run <blob.wasm> <client|pvf> judge <fixtures> <formats>
+//! vos-pvm-final-verifier-wasm-run <blob.wasm> <client|pvf> judge <fixtures>
 //! vos-pvm-final-verifier-wasm-run <blob.wasm> <client|pvf> anchors
 //! ```
 //!
 //! `judge`: every golden fixture under `<fixtures>` judged by the blob's
-//! `judge`, failing when a verdict is not the one a build linking
-//! `<formats>` reaches (comma-separated: `39` for the production blob,
-//! `28,39` for the test blob; `Fixture::verdict_linking`) (`just
+//! `judge`, failing when a verdict is not the recorded one (`just
 //! judge-wasm`). `anchors`: every golden vector of `vos-anchor` computed by
 //! the blob's `anchor_digests`, failing when its digests are not the pinned
 //! bytes, or when a vector cut short is not refused (`just judge-wasm`).
@@ -428,18 +426,13 @@ impl Runner {
         Ok((code, instructions, id))
     }
 
-    /// Every golden fixture under `directory` judged, each verdict the one
-    /// a build linking `formats` reaches.
-    fn judge(&self, directory: &str, formats: &str) -> Result<()> {
-        let linked = formats
-            .split(',')
-            .map(str::parse)
-            .collect::<Result<Vec<u32>, _>>()
-            .context("the formats, comma-separated")?;
+    /// Every golden fixture under `directory` judged, each verdict the
+    /// recorded one.
+    fn judge(&self, directory: &str) -> Result<()> {
         let fixtures = vos_statement::fixtures::load(std::path::Path::new(directory));
         let mut differ = 0;
         for fixture in &fixtures {
-            let expected = fixture.verdict_linking(&linked);
+            let expected = fixture.verdict;
             let (code, instructions, id) = self.judged(&fixture.name, &fixture.bytes())?;
             println!(
                 "JUDGE fixture={:?} expected={expected:#x} code={code:#x} instructions={} id={id}",
@@ -451,10 +444,7 @@ impl Runner {
         if differ > 0 {
             bail!("{differ} of {} fixtures judged otherwise", fixtures.len());
         }
-        println!(
-            "{} fixtures judged as recorded, linking {linked:?}",
-            fixtures.len()
-        );
+        println!("{} fixtures judged as recorded", fixtures.len());
         Ok(())
     }
 
@@ -587,10 +577,10 @@ fn run(args: &[String]) -> Result<()> {
     let runner = Runner::new(blob, semantics.parse()?)?;
     match mode.as_str() {
         "judge" => {
-            let [directory, formats] = files else {
-                bail!("judge: one fixtures directory, then the formats the blob links");
+            let [directory] = files else {
+                bail!("judge: one fixtures directory");
             };
-            runner.judge(directory, formats)
+            runner.judge(directory)
         }
         "anchors" => {
             if !files.is_empty() {

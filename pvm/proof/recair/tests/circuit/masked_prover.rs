@@ -267,7 +267,14 @@ fn an_invalid_witness_is_refused() {
         );
     }
     assert!(matches!(
-        prove::<Blake2bMerkleChannel>(&vos_pvm_proof::format::WRAP, &finalized, MaskRng::default()),
+        prove::<Blake2bMerkleChannel>(
+            &Format {
+                masking: None,
+                ..format()
+            },
+            &finalized,
+            MaskRng::default()
+        ),
         Err(ProveError::UnmaskedFormat)
     ));
 }

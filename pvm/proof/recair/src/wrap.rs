@@ -1,8 +1,7 @@
 //! The final wrap (`proving.md` §3.5, A.3; `recursion-air.md` §7): a 1-to-1
 //! node over a tree's root, proved masked under `format::MASKED_WRAP` on
-//! the Blake2b-256 channel ([`prove`]), or, under `test-formats`, unmasked
-//! under `format::WRAP`, which `vos-pvm-final-verifier` verifies against 24
-//! public words (`prove_unmasked`).
+//! the Blake2b-256 channel ([`prove`]), which `vos-pvm-final-verifier`
+//! verifies against 24 public words.
 //!
 //! **What it checks of the root,** a node of the padded shape
 //! (`format::LEAF_FOLD`), a fold's or, for a run of one segment, a leaf's:
@@ -35,7 +34,7 @@ use stwo::core::fields::qm31::SecureField;
 use stwo::core::vcs::blake2b_hash::Blake2bHash;
 use stwo::core::vcs_lifted::blake2b_merkle::{Blake2bMerkleChannel, Blake2bMerkleHasher};
 use vos_pvm_final_verifier::{PUBLIC_WORDS, Statement, WrapProof};
-use vos_pvm_proof::format::{MASKED_WRAP, ProofBytes, WRAP, lookup};
+use vos_pvm_proof::format::{MASKED_WRAP, ProofBytes, lookup};
 use vos_pvm_proof::poseidon2::P2Hash;
 use vos_pvm_proof::program_id::{ID_WORDS, IdPreimage};
 use vos_pvm_recair_air::gate::Layout;
@@ -49,8 +48,6 @@ use crate::gadgets::leaf_hash;
 use crate::leaf::preimage;
 use crate::masked::{MaskRng, MaskStats};
 use crate::prove::{ProveError, RecairProof, prove_masked_on};
-#[cfg(feature = "test-formats")]
-use crate::trace::MainTrace;
 use crate::value::{NoValue, Value};
 use crate::verifier::WitnessError;
 use crate::verifier::witness::{digest_wires, pack};
@@ -156,13 +153,6 @@ impl WrapCircuit {
         self.finalize(&WrapValues::blank(self.root))
     }
 
-    /// Its preprocessed tree's root on `format::WRAP`'s Blake2b-256 trees: what
-    /// `vos-pvm-final-verifier` pins.
-    pub fn preprocessed_root(&self) -> Blake2bHash {
-        crate::prove::preprocessed_root_on::<Blake2bMerkleChannel>(&WRAP, &self.topology().circuit)
-            .expect("the wrap's wiring checks")
-    }
-
     /// Its preprocessed tree's root as `format::MASKED_WRAP` commits it,
     /// masked: what `vos-pvm-final-verifier` pins as `PREPROCESSED_ROOT_39`.
     pub fn masked_preprocessed_root(&self) -> Blake2bHash {
@@ -229,30 +219,6 @@ pub fn prove_masked(
     Ok((wrap_proof(proof), stats))
 }
 
-/// Proves a finalized wrap circuit unmasked under `format::WRAP`, on the
-/// Blake2b-256 channel: what the unmasked tests and fixtures verify; the
-/// venues take only `format::MASKED_WRAP`.
-#[cfg(feature = "test-formats")]
-pub fn prove_unmasked(finalized: &Finalized<SecureField>) -> Result<WrapProof, ProveError> {
-    prove_unmasked_with(finalized, |_| {})
-}
-
-/// [`prove_unmasked`], with the main trace passed through `tamper` before it
-/// is committed: a seam for the refusal tests.
-#[cfg(feature = "test-formats")]
-pub fn prove_unmasked_with(
-    finalized: &Finalized<SecureField>,
-    tamper: impl FnOnce(&mut MainTrace),
-) -> Result<WrapProof, ProveError> {
-    let proof = crate::prove::prove_on::<Blake2bMerkleChannel>(
-        &WRAP,
-        &finalized.circuit,
-        &finalized.witness,
-        tamper,
-    )?;
-    Ok(wrap_proof(proof))
-}
-
 fn wrap_proof(proof: RecairProof<Blake2bMerkleHasher>) -> WrapProof {
     WrapProof {
         format_version: proof.format_version,
@@ -266,14 +232,11 @@ fn wrap_proof(proof: RecairProof<Blake2bMerkleHasher>) -> WrapProof {
 /// A wrap proof's bytes as its format lays them out
 /// (`vos_pvm_proof::format::Format::bytes`): `format::MASKED_WRAP`'s fixed
 /// layout (`vos_pvm_final_verifier::masked::encode`), the one encoding its
-/// verifier reads, or postcard's (under `test-formats`); `None` for a format
-/// the registry does not hold, or a proof its layout cannot hold.
+/// verifier reads; `None` for a format the registry does not hold or that
+/// names no wrap's bytes, or a proof its layout cannot hold.
 pub fn proof_bytes(proof: &WrapProof) -> Option<Vec<u8>> {
     match lookup(proof.format_version)?.bytes {
         ProofBytes::FixedLayout => vos_pvm_final_verifier::masked::encode(proof),
-        #[cfg(feature = "test-formats")]
-        ProofBytes::Postcard => postcard::to_allocvec(proof).ok(),
-        #[cfg(not(feature = "test-formats"))]
         ProofBytes::Postcard => None,
     }
 }

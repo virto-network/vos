@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use stwo::core::fields::qm31::SecureField;
 use vos_pvm::instruction::Opcode;
 use vos_pvm_compiler::shape::kernel_shape;
-use vos_pvm_proof::format::{Format, SEGMENT, WRAP};
+use vos_pvm_proof::format::{Format, MASKED_WRAP, SEGMENT};
 use vos_pvm_proof::kernel::trace_kernel;
 use vos_pvm_proof::pcs::{Commitment, StarkProofAny};
 use vos_pvm_proof::program_id::KernelProgram;
@@ -42,7 +42,7 @@ use vos_wire::ids::{MethodId, ProgramHash};
 
 /// The admitted segment formats, each with the one its wrong-format
 /// fixture is relabelled to: the wrap's, admitted but no segment format.
-const FORMATS: [(&Format, u32); 1] = [(&SEGMENT, WRAP.number)];
+const FORMATS: [(&Format, u32); 1] = [(&SEGMENT, MASKED_WRAP.number)];
 
 /// Set to `write` to write the fixtures instead of comparing them.
 const MODE: &str = "VOS_FIXTURES";
@@ -248,16 +248,15 @@ fn the_fixtures_are_judged() {
 
 /// The golden statements (`proving.md` A.6), which every venue judges
 /// alike: natively, in Wasm and on the JAM-only host (`vos-statement`'s
-/// fixtures test, the Wasm harness's `judge`), each build by the formats it
-/// links (`vos_statement::fixtures::Fixture::verdict_linking`).
+/// fixtures test, the Wasm harness's `judge`).
 ///
 /// The kernel states a fixed statement `S`: it sets φ9..12 to `S`'s
 /// io-hash, an output of its own, two roots of its space read and its
 /// `public_args` 32 bytes and a nonce, then halts. Its run, cut in three segments, is proved at its class, its
 /// leaves folded to a root and the root wrapped under `format::MASKED_WRAP`, masked
 /// from the seeded test seam (`MaskRng::Seeded`, so the bytes are the
-/// generator's every run): `wrap.proof`; and under `format::WRAP`:
-/// `wrap-28.proof`. Two roots that are not a whole run, wrapped under 39 as
+/// generator's every run): `wrap.proof`. Two roots that are not a whole
+/// run, wrapped under 39 as
 /// a cheating prover would (the wrap circuit's checks failing, proved
 /// anyway): `wrap-prefix.proof`, the first two segments, which set the
 /// io-hash but never halt; `wrap-midway.proof`, the last two, labelled from
@@ -266,8 +265,7 @@ fn the_fixtures_are_judged() {
 /// The production venue pins the kernel's program id, accepts
 /// `format::MASKED_WRAP`, registers `S`'s space, anchors `S`'s two roots
 /// (windows 41 and 42), judges at window 42's boundary and has accepted one
-/// other statement. The test venue is the same and accepts 28 beside 39.
-/// The cases (`statements.cases`), each a venue's state, a statement and a
+/// other statement. The cases (`statements.cases`), each a venue's state, a statement and a
 /// proof, each but the valid ones a replay of a valid statement with one
 /// thing changed, so each fails one check alone: a venue that verifies the
 /// proof before it reads its state (the JAM service's refine) reaches the
@@ -281,7 +279,6 @@ fn the_fixtures_are_judged() {
 /// - **prefix**, **mid-way:** `S` with the wraps of a part of the run;
 /// - **repeated:** `S` after the venue accepted it;
 /// - **unaccepted format:** `S` under 38, an unregistered number;
-/// - **`format::WRAP` at a production venue:** `S` under 28, with its wrap;
 /// - **wrong io-hash:** `S` with its output changed;
 /// - **another program than the pin:** the statement names another program
 ///   than the one the venue pinned;
@@ -298,15 +295,11 @@ fn the_fixtures_are_judged() {
 ///   bound by the proof's words through the io-hash;
 /// - **replayed past MaxRootAge:** `S` accepted, then the venue's time past
 ///   its newest root's `MaxRootAge`: its `Seen` entry and its anchors
-///   dropped, it is unanchored;
-/// - **the test policy:** `S` under 28 at the test venue, accepted; its
-///   wrap's byte flipped; and the transition both ways, `S` accepted under
-///   39 and replayed under 28, and accepted under 28 and replayed under 39,
-///   each repeated, since the id does not hash the format.
+///   dropped, it is unanchored.
 mod statements {
     use stwo::core::fields::qm31::SecureField;
     use vos_pvm::instruction::Opcode;
-    use vos_pvm_final_verifier::{WrapProof, masked, unmasked};
+    use vos_pvm_final_verifier::masked;
     use vos_pvm_proof::format::SEGMENT;
     use vos_pvm_proof::kernel::trace_kernel;
     use vos_pvm_proof::program_id::{KernelEntry, KernelProgram};
@@ -439,14 +432,6 @@ mod statements {
         wrap::proof_bytes(&proof).expect("the fixed layout holds it")
     }
 
-    /// The wrap of `root` under `format::WRAP`: postcard.
-    fn unmasked_wrap(root: &NodeRun, program: &KernelProgram) -> Vec<u8> {
-        let proof: WrapProof =
-            wrap::prove_unmasked(&finalized(root, program, false)).expect("the wrap proves");
-        assert_eq!(proof.format_version, unmasked::FORMAT);
-        postcard::to_allocvec(&proof).expect("encodes")
-    }
-
     /// A verdict's class: what a case's verdict must be.
     type Class = fn(u32) -> bool;
 
@@ -460,11 +445,10 @@ mod statements {
         valid: Vec<u8>,
         prefix: Vec<u8>,
         midway: Vec<u8>,
-        valid_28: Vec<u8>,
     }
 
     /// `base` proved: the whole run's wrap, a prefix's and a mid-way
-    /// part's, masked, and the whole run's under format 28.
+    /// part's, masked.
     fn proofs(base: &Statement) -> Proofs {
         let (program, entry, segments) = proved(base, &CUTS);
         let word = FoldCircuit::word();
@@ -492,25 +476,18 @@ mod statements {
         let valid = masked_wrap(&whole, &program, false);
         let prefix = masked_wrap(&head, &program, true);
         let midway = masked_wrap(&tail, &program, true);
-        let valid_28 = unmasked_wrap(&whole, &program);
 
         Proofs {
             pinned: ProgramId(program.id().words()),
             valid,
             prefix,
             midway,
-            valid_28,
         }
     }
 
     /// The cases, each judged on its proof as the generator wrote it.
     fn cases(base: Statement, proofs: &Proofs) -> Vec<Row> {
-        let Proofs {
-            pinned,
-            valid,
-            valid_28,
-            ..
-        } = proofs;
+        let Proofs { pinned, valid, .. } = proofs;
         let pinned = *pinned;
         let other = ProgramId(pinned.0.map(|word| (word + 1) % ((1 << 31) - 1)));
         let s = Statement {
@@ -530,10 +507,6 @@ mod statements {
             ));
             policy
         };
-        let test = Policy {
-            formats: vec![unmasked::FORMAT, masked::FORMAT],
-            ..production.clone()
-        };
         let input = |change: &dyn Fn(&mut Input)| {
             let mut input = Input {
                 program: pinned,
@@ -545,27 +518,6 @@ mod statements {
         };
         // The venue's time past the newest root's `MaxRootAge`.
         let past = CLOCK.boundary(42).unwrap() + MAX_ROOT_AGE_MS + 1;
-        let under_28 = |i: &mut Input| i.statement.format = unmasked::FORMAT;
-        // `S` under 28 at the test venue.
-        let at_test_venue_28 = |i: &mut Input| {
-            i.policy = test.clone();
-            under_28(i);
-        };
-        // `S` accepted under `format`'s wrap at the test venue, then recorded.
-        let accepted_under = |format: u32, proof: &[u8]| {
-            let accepted = input(&|i| {
-                i.policy = test.clone();
-                i.statement.format = format;
-            });
-            let id = accepted.judge(proof).expect("S accepted");
-            assert_eq!(id, s.id(), "S under {format}");
-            let mut policy = accepted.policy;
-            policy.record(&accepted.statement);
-            policy
-        };
-        let after_39 = accepted_under(masked::FORMAT, valid);
-        let after_28 = accepted_under(unmasked::FORMAT, valid_28);
-
         let flip = |bytes: &Vec<u8>| {
             let mut flipped = bytes.clone();
             flipped[bytes.len() / 2] ^= 1;
@@ -628,13 +580,6 @@ mod statements {
                 "wrap.proof",
                 None,
                 input(&|i| i.statement.format = 38),
-                |code| code == Refusal::Format.code(),
-            ),
-            (
-                "format 28 at a production venue",
-                "wrap-28.proof",
-                None,
-                input(&under_28),
                 |code| code == Refusal::Format.code(),
             ),
             (
@@ -733,37 +678,6 @@ mod statements {
                 }),
                 |code| code == Refusal::Unanchored.code(),
             ),
-            (
-                "format 28 at the test venue",
-                "wrap-28.proof",
-                None,
-                input(&at_test_venue_28),
-                accepted,
-            ),
-            (
-                "tampered, format 28 at the test venue",
-                "wrap-28.proof",
-                Some(flip(valid_28)),
-                input(&at_test_venue_28),
-                by_proof,
-            ),
-            (
-                "accepted under 39, replayed under 28",
-                "wrap-28.proof",
-                None,
-                input(&|i| {
-                    i.policy = after_39.clone();
-                    under_28(i);
-                }),
-                |code| code == Refusal::Repeated.code(),
-            ),
-            (
-                "accepted under 28, replayed under 39",
-                "wrap.proof",
-                None,
-                input(&|i| i.policy = after_28.clone()),
-                |code| code == Refusal::Repeated.code(),
-            ),
         ]
     }
 
@@ -776,7 +690,6 @@ mod statements {
             ("wrap.proof", &made.valid),
             ("wrap-prefix.proof", &made.prefix),
             ("wrap-midway.proof", &made.midway),
-            ("wrap-28.proof", &made.valid_28),
         ];
         let cases: Vec<Case> = cases
             .into_iter()

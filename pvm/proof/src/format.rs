@@ -7,7 +7,6 @@
 //!
 //! | number | proofs | channel | log blowup, queries, PoW, fold step, last layer, interaction PoW | floors | at its reference shape |
 //! |---|---|---|---|---|---|
-//! | 28 | the final wrap | Blake2b-256 | 6, 20, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 |
 //! | 32 | leaves and folds | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 63 |
 //! | 39 | the final wrap, masked | Blake2b-256 | 5, 24, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 |
 //! | 41 | segments | Poseidon2-M31 | 2, 40, 24, 1, 0, 8 | 100 / 60 | 104 / 62 |
@@ -18,9 +17,9 @@
 //!   segments and the device shape share (the CPU acknowledging the
 //!   Poseidon2 call, the Poseidon2 chip, the logical right shifts through
 //!   the multiplication, no column a constraint pins to zero), and 32's
-//!   leaves verify it. 28, 32 and 39 prove the recursion AIR
+//!   leaves verify it. 32 and 39 prove the recursion AIR
 //!   (`vos-pvm-recair-air`). A number not in [`REGISTRY`] is refused as
-//!   unregistered; 44 and 46 are never reused, and 48 is the tests' second
+//!   unregistered; 28, 44 and 46 are never reused, and 48 is the tests' second
 //!   device format (`vos-pvm-recair`'s `device::TEST_FORMAT`), never
 //!   registered.
 //! - **Every format** takes exactly its parameters, mixes the boundary
@@ -35,14 +34,12 @@
 //!   is registered and refused
 //!   although its AIR and channel exist: `vos-pvm-recair` proves and verifies
 //!   its proofs natively, pinning each circuit by its hash, and no verifier
-//!   outside the recursion reads a leaf or a fold. 28 is admitted:
-//!   `vos-pvm-recair` proves the wrap on the fork's Blake2b-256 channel and
-//!   `vos-pvm-final-verifier` verifies it (under its `test-formats`
-//!   feature), fold step 3 reviewed in the fork. 39 is admitted: the masked
-//!   wrap, `vos-pvm-recair`'s masked prover and `vos-pvm-final-verifier`'s
-//!   masked verifier, its bytes a fixed layout ([`ProofBytes::FixedLayout`]);
-//!   production venues accept it alone. A segment verifier takes only a
-//!   segment format ([`admitted_segment`]).
+//!   outside the recursion reads a leaf or a fold. 39 is admitted: the
+//!   masked wrap, `vos-pvm-recair`'s masked prover on the fork's Blake2b-256
+//!   channel and `vos-pvm-final-verifier`'s masked verifier, fold step 3
+//!   reviewed in the fork, its bytes a fixed layout
+//!   ([`ProofBytes::FixedLayout`]); it is the one final format. A segment
+//!   verifier takes only a segment format ([`admitted_segment`]).
 //! - **The inner formats** grind 8 bits of interaction PoW. Segments (41)
 //!   take 40 queries and 24 bits of PoW: 62.81 proven bits on 41's own
 //!   reference (every chip, the Poseidon2 chip among them, at 2^20 rows),
@@ -63,33 +60,24 @@
 //!   most 149 rows at 47 queries, so `h = 256` holds the masking's
 //!   condition without its factor two, every chip's floor at 2^10 rows.
 //!   The candidates measured are in `proving.md` §4.
-//! - **The wrap** (28) needs DEEP batching with an independent coefficient a
-//!   sampled value ([`DeepBatching::Affine`]) for its proven 80. Stwo batches
-//!   by powers of one coefficient, whose error is the batched values' count
-//!   times a proximity-gap error that grows with the blowup: at blowup 64 that
-//!   term caps the count at 74.7 however many queries are taken, 18 or 20.
-//!   The ways to 80 are affine batching at blowup 64 and 19–20 queries (about
-//!   1.06× the verifier's cost, a change to the fork for this format only), a
-//!   6-bit PoW in the batching phase at blowup 64 and 20 queries (about
-//!   1.11×), or blowup 8 with 41 queries (about 1.97×). The fork batches
-//!   affinely when a configuration asks ([`FormatParams::batching`]), and
-//!   [`crate::security`] counts 82.6 at 20 queries (80 needs 19). Batching is
-//!   not in a proof's bytes: a verifier sets it from the format
-//!   ([`Format::verifier_config`]). 39 needs it too: batched by powers, it
-//!   caps at 76.98 at blowup 32 and 74.48 at blowup 64.
-//! - **The masked wrap** (39) is 28's AIR under masking variant (c)
+//! - **The wrap** (39) is the recursion AIR under masking variant (c)
 //!   (`proving.md` §5; [`crate::security`] counts it): every main and
 //!   interaction column masked to twice its rows' degree, the preprocessed
 //!   ones left as they are, the composition committed whole at four times the
 //!   tallest component's rows and sampled at `π(z)`, R2's blinding, a FRI mask
-//!   of eight columns and salted trees. It takes a number of its own, as a
-//!   bump of 28 would make one number name two sets of parameters. Its FRI
-//!   runs at blowup 32, where each column's own extension is the size 28's is
-//!   at 64, with 24 queries: 146 / 82 (82.70), the query term binding; 23
-//!   queries is the least that clears 80 (80.84). Blowup 64 at 20 queries
-//!   counts 81.74, its DEEP batching term binding, at twice the prover's
-//!   memory. Its proofs are a fixed layout ([`ProofBytes::FixedLayout`]); 28's
-//!   are postcard.
+//!   of eight columns and salted trees. Its FRI runs at blowup 32 with 24
+//!   queries: 146 / 82 (82.70), the query term binding; 23 queries is the
+//!   least that clears 80 (80.84). Blowup 64 at 20 queries counts 81.74, its
+//!   DEEP batching term binding, at twice the prover's memory. It needs DEEP
+//!   batching with an independent coefficient a sampled value
+//!   ([`DeepBatching::Affine`]) for its proven 80: Stwo batches by powers of
+//!   one coefficient, whose error is the batched values' count times a
+//!   proximity-gap error that grows with the blowup, and batched by powers
+//!   it caps at 76.98 at blowup 32 and 74.48 at blowup 64. The fork batches
+//!   affinely when a configuration asks ([`FormatParams::batching`]).
+//!   Batching is not in a proof's bytes: a verifier sets it from the format
+//!   ([`Format::verifier_config`]). Its proofs are a fixed layout
+//!   ([`ProofBytes::FixedLayout`]).
 //! - **[`Format::masking`]** says what a format's proofs are: masking a
 //!   format's proofs is a format change. A masked format pins its masking
 //!   ([`Masking`]): its salt and FRI-mask columns and its randomizer's size,
@@ -112,7 +100,7 @@ use crate::security::{SecurityBits, SecurityShape};
 mod reference;
 
 pub use reference::{
-    DEVICE_REFERENCE, LEAF_FOLD_REFERENCE, MASKED_WRAP_REFERENCE, SEGMENT_REFERENCE, WRAP_REFERENCE,
+    DEVICE_REFERENCE, LEAF_FOLD_REFERENCE, MASKED_WRAP_REFERENCE, SEGMENT_REFERENCE,
 };
 
 /// What a format proves.
@@ -355,33 +343,6 @@ pub const LEAF_FOLD: Format = Format {
     },
 };
 
-pub const WRAP: Format = Format {
-    number: 28,
-    kind: ProofKind::Wrap,
-    channel: ChannelKind::Blake2b256,
-    params: FormatParams {
-        log_blowup: 6,
-        n_queries: 20,
-        pow_bits: 26,
-        fold_step: 3,
-        log_last_layer: 6,
-        interaction_pow_bits: 8,
-        batching: DeepBatching::Affine,
-    },
-    bytes: ProofBytes::Postcard,
-    masking: None,
-    floor: SecurityFloor {
-        conjectured: 100,
-        proven: 80,
-    },
-    status: Status::Admitted,
-    reference: WRAP_REFERENCE,
-    bits: SecurityBits {
-        conjectured: 146,
-        proven: 82,
-    },
-};
-
 /// Format 39's masking: 8 salt columns a tree (248 bits); an `R` of 8
 /// columns, whose 8 independent DEEP coefficients span QM31 over M31 but
 /// with probability about `p^-5`, so R3 holds without a check; and `h = 256`,
@@ -401,11 +362,18 @@ pub const MASKED_WRAP: Format = Format {
     params: FormatParams {
         log_blowup: 5,
         n_queries: 24,
-        ..WRAP.params
+        pow_bits: 26,
+        fold_step: 3,
+        log_last_layer: 6,
+        interaction_pow_bits: 8,
+        batching: DeepBatching::Affine,
     },
     bytes: ProofBytes::FixedLayout,
     masking: Some(MASKED_WRAP_MASKING),
-    floor: WRAP.floor,
+    floor: SecurityFloor {
+        conjectured: 100,
+        proven: 80,
+    },
     status: Status::Admitted,
     reference: MASKED_WRAP_REFERENCE,
     bits: SecurityBits {
@@ -444,7 +412,7 @@ pub const DEVICE_PROOF: Format = Format {
 };
 
 /// Every registered format, by number.
-pub const REGISTRY: [Format; 5] = [WRAP, LEAF_FOLD, MASKED_WRAP, SEGMENT, DEVICE_PROOF];
+pub const REGISTRY: [Format; 4] = [LEAF_FOLD, MASKED_WRAP, SEGMENT, DEVICE_PROOF];
 
 /// The entry for `number`, admitted or not.
 pub fn lookup(number: u32) -> Option<&'static Format> {

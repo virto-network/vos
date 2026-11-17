@@ -1,6 +1,5 @@
 //! The final verifier and the venue's check over it as a runtime-style
-//! Wasm blob: the production blob links `format::MASKED_WRAP` alone; under
-//! `test-formats`, the test blob links 28 beside it.
+//! Wasm blob, linking `format::MASKED_WRAP`.
 //!
 //! Exports, called the way a runtime API is (the host allocates the input
 //! with the runtime's allocator and passes `(ptr, len)`):

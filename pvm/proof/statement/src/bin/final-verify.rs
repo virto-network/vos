@@ -3,11 +3,7 @@
 //! way a JAM service would, or judges a statement with it as a venue does,
 //! and reports its gas by phase.
 //!
-//! Two builds of it (`src/bin/guest`): `final-verify.elf`, the production
-//! venue's, linking `format::MASKED_WRAP` alone, which refuses to build under
-//! `test-formats`; and `final-verify-test.elf` (`--features
-//! pvm-guest,test-formats`, `src/bin/final-verify-test.rs`), linking format
-//! 28 beside it, for the test policy's fixtures.
+//! It links `format::MASKED_WRAP` (`src/bin/guest`).
 //!
 //! Input, as a JAM work item gives it:
 //! - work item 0's payload (`fetch`, kind 13), at most 16 KiB: a mode byte,
@@ -23,12 +19,8 @@
 //!     carries;
 //!
 //!   then the proof's Blake2b-256 hash and its length (`u32`,
-//!   little-endian);
-//!   - 2, under `test-formats` alone (`final-verify-test.elf`'s): a golden vector of `vos-anchor`
-//!     (`vos_anchor::vectors::Vector`'s encoding), and nothing after it: its
-//!     digests are computed, and no proof is read. `final-verify.elf`
-//!     refuses it as a bad payload, so no build a venue runs accepts
-//!     without a proof;
+//!   little-endian); any other mode is refused as a bad payload, so the
+//!   program accepts nothing without a proof;
 //! - the proof, in its format's encoding, as a preimage of the running
 //!   service, read by `historical_lookup`: only once a judgement's checks
 //!   before the proof pass, and only when its length is at most
@@ -37,8 +29,8 @@
 //!
 //! Output (φ7 address, φ8 length): `Report`, every field a little-endian
 //! `u64`: the verdict, the gas left at each phase, the heap's figures, a
-//! refusal's text, a judgement's code and accepted statement id, and a
-//! vector's digests (zeros but in mode 2).
+//! refusal's text, a judgement's code and accepted statement id, and 160
+//! bytes of zeros.
 //! Blake2b-256 is computed in software: JAM serves no hash.
 
 #![no_std]
@@ -58,8 +50,5 @@
 #![no_main]
 
 extern crate alloc;
-
-#[cfg(feature = "test-formats")]
-compile_error!("final-verify links format 39 alone: build final-verify-test under test-formats");
 
 mod guest;

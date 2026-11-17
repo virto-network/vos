@@ -32,7 +32,7 @@ use vos_pvm_recair_air::{LogSizes, h8, p2, qm31};
 use crate::common::sources;
 use crate::gates::{degrees, preprocessed_of};
 
-/// The wrap's log sizes, `format::WRAP`'s and `format::MASKED_WRAP`'s.
+/// The wrap's log sizes, `format::MASKED_WRAP`'s.
 const LOG_SIZES: LogSizes = [14, 15, 11];
 
 /// Each constraint's degree is at most 3, so a constraint over columns

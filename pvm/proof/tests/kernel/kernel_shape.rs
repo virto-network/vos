@@ -439,7 +439,7 @@ fn a_predicates_leaf_proves_and_verifies() {
 
 /// `areas`, the solvency predicate's kind, end to end: its run cut in three
 /// segments of class 0, each verified in its leaf, the leaves folded to one
-/// root stating the whole run, wrapped under `format::WRAP` and verified by
+/// root stating the whole run, wrapped under `format::MASKED_WRAP` and verified by
 /// `vos-pvm-final-verifier`; its statement (rootless, its output the areas'
 /// sum) recomputes the run's io-hash, and a venue pinning its program
 /// accepts it, natively and on the JAM-only host. The wrap and the
@@ -501,7 +501,7 @@ fn the_predicate_wraps() {
     );
     assert_eq!(root.node.output.io_hash, kernel.trace.io_hash);
 
-    let (bytes, words, _) = common::wrap_root("areas", &program, &root, &mut totals.wrap);
+    let (words, bytes) = common::wrap_root("areas", &program, &root, &mut totals.wrap);
     totals.report("areas");
     common::verified_wrap("predicate", &bytes, &words);
 }

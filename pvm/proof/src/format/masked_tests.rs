@@ -2,17 +2,9 @@
 //! counts unmoved, the masked wrap's terms, the least queries that clear its
 //! floors, and its need for affine batching.
 
+use super::reference::WRAP_REFERENCE;
 use super::*;
 use crate::security::{proven_count, security_bits, term_bits};
-
-/// Format 28 as Stwo builds it: its composition of bound 2^16 split once,
-/// so FRI tests 2^15. [`WRAP_REFERENCE`] counts it one level up.
-const WRAP_BUILT: SecurityShape = SecurityShape {
-    log_degree_bound: 15,
-    log_trace_length: 15,
-    log_composition_degree_bound: 16,
-    ..WRAP_REFERENCE
-};
 
 fn count(params: &FormatParams, shape: &SecurityShape) -> f64 {
     proven_count(params, shape).unwrap()
@@ -48,8 +40,8 @@ fn least_queries(base: FormatParams) -> Option<usize> {
 
 /// Variant (c) moves no unmasked count: every format but the masked ones
 /// counted on their masked shapes (39, 47) samples its composition at the
-/// out-of-domain point itself and counts what it pins, format 28 82.60;
-/// format 39's reference is 28's at (c)'s levels.
+/// out-of-domain point itself and counts what it pins; format 39's
+/// reference is the unmasked wrap AIR's at (c)'s levels.
 #[test]
 fn the_unmasked_counts_do_not_move() {
     let counted_masked = [MASKED_WRAP.number, DEVICE_PROOF.number];
@@ -75,9 +67,6 @@ fn the_unmasked_counts_do_not_move() {
             );
         }
     }
-    let wrap = count(&WRAP.params, &WRAP_REFERENCE);
-    assert!((82.60..82.61).contains(&wrap), "{wrap}");
-
     let levels = WRAP_REFERENCE.variant_c();
     assert_eq!(
         (
@@ -151,29 +140,6 @@ fn format_39_counts_146_and_82() {
     assert!((80.84..80.85).contains(&fewer), "{fewer}");
 }
 
-/// At format 28's own parameters (blowup 64, 20 queries), (c) counts 81.74:
-/// FRI's dimension and domain both grow fourfold, which costs the DEEP
-/// batching term 2 bits, and that term binds. Counting `π(z)` moves nothing,
-/// as the DEEP term is 15 bits clear. Format 28 counts the same at its
-/// reference and as built.
-#[test]
-fn variant_c_at_format_28s_parameters_binds_the_batching_term() {
-    assert_eq!(
-        count(&WRAP.params, &WRAP_BUILT),
-        count(&WRAP.params, &WRAP_REFERENCE)
-    );
-    let at_28 = count(&WRAP.params, &MASKED_WRAP_REFERENCE);
-    assert!((81.73..81.74).contains(&at_28), "{at_28}");
-    let terms = term_bits(&WRAP.params, &MASKED_WRAP_REFERENCE).unwrap();
-    assert_eq!(terms.other.batching, at_28);
-    assert!(terms.other.deep > at_28 + 15.0, "{terms:?}");
-    let without_doubling = SecurityShape {
-        composition_point_doublings: 0,
-        ..MASKED_WRAP_REFERENCE
-    };
-    assert_eq!(count(&WRAP.params, &without_doubling), at_28);
-}
-
 /// The least query count that clears 100 / 80 masked, by blowup, fold step,
 /// last layer and PoW: format 39's shape (A: blowup 32, PoW 26, 23) and the
 /// blowup-64 alternative (B: 19, 146 / 81 at 20 queries). Fold step 2 and a
@@ -228,7 +194,7 @@ fn the_interaction_pow_does_not_bind() {
     assert!(terms.other.logup > 100.0, "{terms:?}");
 }
 
-/// Format 39 rests on affine batching (`DIVERGENCE-012`), as 28 does.
+/// Format 39 rests on affine batching (`DIVERGENCE-012`).
 /// Batched by powers, the batching term caps it at 76.98 at blowup 32 and
 /// 74.48 at blowup 64, however many queries are taken; only blowup 8, with
 /// 41 queries, reaches 80. The verifier's check says so.

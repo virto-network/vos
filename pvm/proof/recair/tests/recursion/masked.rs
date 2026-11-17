@@ -10,10 +10,10 @@
 //! - **Every masked field tampered** (14 cases) is refused with
 //!   an error, never a panic, as a proof and through its bytes; and a
 //!   verifier pinning another salt count or `R` refuses the proof.
-//! - **Cross-format proofs, both ways,** are refused as another format.
 //! - **The bytes:** truncations and a trailing byte refused.
 //! - **On the JAM-only host** the venue's refine program accepts it within
-//!   `format::MASKED_WRAP`'s gas, and refuses a tampered byte and other words.
+//!   `format::MASKED_WRAP`'s gas, and refuses a tampered byte, other words
+//!   and a format it does not link.
 //! - **No hidden state** of the run is in any carrier of the proof.
 //! - **Under `heavy-gates`** (`just test-proof`): witness
 //!   indistinguishability, uniformity and fresh randomness on the real wrap
@@ -50,15 +50,16 @@ use vos_pvm_final_verifier::masked::{
     self, FRI_ROUNDS, MASKED_WRAP, MaskedFormat, fri_rounds, shape_of, verify_with,
 };
 use vos_pvm_final_verifier::{
-    Error, MAX_PROOF_BYTES, PREPROCESSED_ROOT_39, PUBLIC_WORDS, Statement, WrapProof, unmasked,
+    Error, MAX_PROOF_BYTES, PREPROCESSED_ROOT_39, PUBLIC_WORDS, Statement, WrapProof,
 };
 use vos_pvm_proof::format::{self, ProofBytes, Status};
 use vos_pvm_recair::masked::{MaskRng, verifier_format};
 use vos_pvm_recair::wrap::{self, WrapCircuit};
 use vos_pvm_recair_air::masked::{MaskPins, WrapComponents};
 
-/// The one-segment run's root wrapped under `format::MASKED_WRAP`: the
-/// proof, its bytes and its public words.
+/// The one-segment run's root wrapped under `format::MASKED_WRAP`
+/// (`crate::wrap::SEED`'s masks): the proof, its bytes and its public
+/// words.
 struct Masked {
     proof: WrapProof,
     bytes: Vec<u8>,
@@ -69,22 +70,16 @@ fn masked_wrap() -> &'static Masked {
     static MASKED: OnceLock<Masked> = OnceLock::new();
     MASKED.get_or_init(|| {
         let one = one_segment();
-        let finalized = WrapCircuit::get().finalize(&values_of(&one.root, &one.run.program));
-        let words = wrap::public_words(&finalized);
-        assert_eq!(words, one.wrapped.words);
-        let started = Instant::now();
-        let (proof, stats) = wrap::prove_masked(&finalized, MaskRng::Seeded(39)).expect("proves");
+        let proof = one.wrapped.proof.clone();
+        let words = one.wrapped.words;
         let bytes = wrap::proof_bytes(&proof).expect("format 39's bytes");
         let postcard = postcard::to_allocvec(&proof).expect("encodes");
         eprintln!(
-            "one segment: the masked wrap proved in {:.2}s, {} bytes (postcard {}); {stats:?}",
-            started.elapsed().as_secs_f64(),
+            "one segment: the masked wrap, {} bytes (postcard {})",
             bytes.len(),
             postcard.len(),
         );
         write("one-segment-39", masked::FORMAT, &bytes, &words);
-        let unmasked = postcard::to_allocvec(&one.wrapped.proof).expect("encodes");
-        write("one-segment-28", unmasked::FORMAT, &unmasked, &words);
         Masked {
             proof,
             bytes,
@@ -142,7 +137,7 @@ fn the_masked_wrap_verifies_under_the_registrys_entry() {
     assert_eq!(entry.bytes, ProofBytes::FixedLayout);
     assert_eq!(MAX_PROOF_BYTES, 256 << 10);
     assert_eq!(
-        WrapCircuit::get().preprocessed_root(),
+        WrapCircuit::get().masked_preprocessed_root(),
         Blake2bHash(PREPROCESSED_ROOT_39)
     );
     assert_eq!(
@@ -174,7 +169,7 @@ fn the_masked_wrap_verifies_under_the_registrys_entry() {
         statement
     );
     assert!(matches!(
-        vos_pvm_final_verifier::verify(39, &[28], &masked.bytes, &masked.words),
+        vos_pvm_final_verifier::verify(39, &[40], &masked.bytes, &masked.words),
         Err(Error::Format)
     ));
 
@@ -384,43 +379,6 @@ fn another_salt_count_or_r_width_is_refused() {
     }
 }
 
-/// A `format::WRAP` proof under `format::MASKED_WRAP` and a
-/// `format::MASKED_WRAP` proof under `format::WRAP` are refused as another
-/// format (`0x4`): by their bytes, each format's decode reading its own
-/// header, and as proofs.
-#[test]
-fn cross_format_proofs_are_refused_both_ways() {
-    let masked = masked_wrap();
-    let one = one_segment();
-    let words = masked.words;
-    let both = [unmasked::FORMAT, masked::FORMAT];
-    let unmasked_bytes = postcard::to_allocvec(&one.wrapped.proof).expect("encodes");
-    let refusals = [
-        (
-            "format 28's bytes under 39",
-            refusal(|| vos_pvm_final_verifier::verify(39, &both, &unmasked_bytes, &words)),
-        ),
-        (
-            "format 39's bytes under 28",
-            refusal(|| vos_pvm_final_verifier::verify(28, &both, &masked.bytes, &words)),
-        ),
-        (
-            "format 28's proof to the masked verifier",
-            refusal(|| masked::verify(one.wrapped.proof.clone(), &words)),
-        ),
-        (
-            "format 39's proof to the unmasked verifier",
-            refusal(|| unmasked::verify(masked.proof.clone(), &words)),
-        ),
-    ];
-    for (name, refused) in refusals {
-        let error = refused.unwrap();
-        eprintln!("{name}: {error}");
-        assert!(matches!(error, Error::Format), "{name}: {error}");
-        assert_eq!(error.code(), 4);
-    }
-}
-
 /// The layout read whole: a truncation at any of a spread of lengths (each
 /// field's start among them, and the last bytes) is refused as undecodable,
 /// and so is any byte after the last field.
@@ -448,49 +406,32 @@ fn the_layout_refuses_truncations_and_trailing_bytes() {
     }
 }
 
-/// The masked wrap on the JAM-only host, by the production guest (format
-/// 39 alone): accepted within 125M gas of verify and 4M of decode (format
-/// 28's postcard: 19.9M), its phases reported beside `format::WRAP`'s on the
-/// same witness, by the test guest (28 beside 39); a proof tampered at its
-/// middle byte, and other words, refused without a panic; 28 refused by the
-/// production guest as a format it does not link.
+/// The masked wrap on the JAM-only host, by the venue's guest: accepted
+/// within 125M gas of verify and 4M of decode, its phases reported; a proof
+/// tampered at its middle byte, and other words, refused without a panic;
+/// another format refused as one the guest does not link.
 #[test]
 fn the_masked_wrap_verifies_on_the_jam_only_host() {
     let (program, elf_len) = jam::program();
-    let (test_program, test_elf_len) = jam::test_program();
     let masked = masked_wrap();
-    let one = one_segment();
-    let unmasked_bytes = postcard::to_allocvec(&one.wrapped.proof).expect("encodes");
-    let mut phases = Vec::new();
-    for (format, bytes, program, elf_len) in [
-        (
-            unmasked::FORMAT,
-            &unmasked_bytes,
-            &test_program,
-            test_elf_len,
-        ),
-        (masked::FORMAT, &masked.bytes, &program, elf_len),
-    ] {
-        let request = jam::words_request(format, &masked.words);
-        let (gas, report) = jam::run(program, &request, bytes);
-        let [start, lookup, decode, end] = report.gas;
-        let (decode, verify) = (lookup - decode, decode - end);
-        eprintln!(
-            "format {format} on the JAM-only host: {gas} gas ({:.1}M): lookup {}, decode {decode}, \
-             verify {verify}; {} bytes, program {} bytes (ELF {elf_len}); heap peak {} KiB, high \
-             water {} KiB, {} allocations",
-            gas as f64 / 1e6,
-            start - lookup,
-            bytes.len(),
-            program.len(),
-            report.peak_live >> 10,
-            report.high_water >> 10,
-            report.allocs,
-        );
-        assert_eq!(report.verdict, jam::ACCEPT, "{}", report.error);
-        phases.push((decode, verify));
-    }
-    let (decode, verify) = phases[1];
+    let bytes = &masked.bytes;
+    let request = jam::words_request(masked::FORMAT, &masked.words);
+    let (gas, report) = jam::run(&program, &request, bytes);
+    let [start, lookup, decode, end] = report.gas;
+    let (decode, verify) = (lookup - decode, decode - end);
+    eprintln!(
+        "format 39 on the JAM-only host: {gas} gas ({:.1}M): lookup {}, decode {decode}, verify \
+         {verify}; {} bytes, program {} bytes (ELF {elf_len}); heap peak {} KiB, high water {} \
+         KiB, {} allocations",
+        gas as f64 / 1e6,
+        start - lookup,
+        bytes.len(),
+        program.len(),
+        report.peak_live >> 10,
+        report.high_water >> 10,
+        report.allocs,
+    );
+    assert_eq!(report.verdict, jam::ACCEPT, "{}", report.error);
     assert!(decode <= 4_000_000, "decode {decode} gas");
     assert!(verify <= 125_000_000, "verify {verify} gas");
 
@@ -513,8 +454,8 @@ fn the_masked_wrap_verifies_on_the_jam_only_host() {
     eprintln!("other words: {gas} gas: {}", report.error);
     assert_eq!(report.verdict, jam::REJECT);
 
-    let request = jam::words_request(unmasked::FORMAT, &masked.words);
-    let (_, report) = jam::run(&program, &request, &unmasked_bytes);
+    let request = jam::words_request(40, &masked.words);
+    let (_, report) = jam::run(&program, &request, &masked.bytes);
     assert_eq!(report.verdict, jam::UNDECODABLE, "{}", report.error);
     assert_eq!(report.error, Error::Format.to_string());
 }

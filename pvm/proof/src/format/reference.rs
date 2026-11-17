@@ -61,7 +61,7 @@ pub const LEAF_FOLD_REFERENCE: SecurityShape = SecurityShape {
 
 /// The wrap (`recursion-air.md` §7): the same AIR at 2^14, 2^15 and 2^11
 /// rows.
-pub const WRAP_REFERENCE: SecurityShape = SecurityShape {
+pub(crate) const WRAP_REFERENCE: SecurityShape = SecurityShape {
     log_degree_bound: 16,
     log_trace_length: 15,
     log_composition_degree_bound: 17,

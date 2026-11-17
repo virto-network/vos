@@ -1,8 +1,7 @@
 //! The golden wraps, the fixtures' (`pvm/proof/fixtures`):
-//! `format::MASKED_WRAP`'s two accepted statements' and `format::WRAP`'s:
-//! each its proof's bytes, the 24 public words it verifies against, and the
-//! oracle for a proof a target finds accepted. Each target uses what it
-//! reads of it.
+//! `format::MASKED_WRAP`'s accepted statement's: its proof's bytes, the 24
+//! public words it verifies against, and the oracle for a proof a target
+//! finds accepted. Each target uses what it reads of it.
 
 #![allow(dead_code)]
 
@@ -17,9 +16,8 @@ pub const MASKED_HEADER: usize = 4 * 11;
 pub struct Golden {
     /// Its format.
     pub format: u32,
-    /// Its canonical encoding: postcard's, minimal varints, for 28; the
-    /// fixed layout, its one encoding, for 39. The mutation target's
-    /// starting point, and what an accepted proof re-encodes to.
+    /// Its encoding, the fixed layout, its one encoding. The mutation
+    /// target's starting point, and what an accepted proof re-encodes to.
     pub proof: Vec<u8>,
     pub words: [u32; PUBLIC_WORDS],
 }
@@ -28,12 +26,10 @@ impl Golden {
     /// The oracle for an accepted proof: it is the golden proof by value,
     /// its re-encoding the golden bytes.
     ///
-    /// Not its bytes: postcard reads a varint in any length, so an accepted
-    /// encoding may differ from the golden one (venues key on the
-    /// statement's id for it). Not its statement: the verifier returns the
-    /// words it was given, so that holds of any acceptance. A second proof
-    /// of the golden words would be a part of the proof the transcript does
-    /// not bind, which no mutation should find.
+    /// Not its statement: the verifier returns the words it was given, so
+    /// that holds of any acceptance. A second proof of the golden words
+    /// would be a part of the proof the transcript does not bind, which no
+    /// mutation should find.
     pub fn assert_is_golden(&self, proof: &vos_pvm_final_verifier::WrapProof) {
         assert!(
             self.encode(proof).as_ref() == Some(&self.proof),
@@ -41,13 +37,10 @@ impl Golden {
         );
     }
 
-    /// `proof` in the golden's format's encoding; `None` for a proof 39's
+    /// `proof` in the golden's format's encoding; `None` for a proof its
     /// layout cannot hold.
     pub fn encode(&self, proof: &vos_pvm_final_verifier::WrapProof) -> Option<Vec<u8>> {
-        match self.format {
-            vos_pvm_final_verifier::masked::FORMAT => vos_pvm_final_verifier::masked::encode(proof),
-            _ => Some(postcard::to_allocvec(proof).expect("encodes")),
-        }
+        vos_pvm_final_verifier::masked::encode(proof)
     }
 
     /// The proof in `bytes` under the golden's format.
@@ -64,12 +57,7 @@ impl Golden {
         &self,
         proof: vos_pvm_final_verifier::WrapProof,
     ) -> Result<vos_pvm_final_verifier::Statement, vos_pvm_final_verifier::Error> {
-        match self.format {
-            vos_pvm_final_verifier::masked::FORMAT => {
-                vos_pvm_final_verifier::masked::verify(proof, &self.words)
-            }
-            _ => vos_pvm_final_verifier::unmasked::verify(proof, &self.words),
-        }
+        vos_pvm_final_verifier::masked::verify(proof, &self.words)
     }
 
     /// Verifies `bytes` under the golden's format against its words, the
@@ -118,14 +106,8 @@ fn of_fixture(name: &str) -> Golden {
     golden
 }
 
-/// The goldens: `format::MASKED_WRAP`'s statement (`valid`) and
-/// `format::WRAP`'s (`format 28 at the test venue`).
-pub fn goldens() -> &'static [Golden; 2] {
-    static GOLDENS: OnceLock<[Golden; 2]> = OnceLock::new();
-    GOLDENS.get_or_init(|| {
-        [
-            of_fixture("valid"),
-            of_fixture("format 28 at the test venue"),
-        ]
-    })
+/// The goldens: `format::MASKED_WRAP`'s statement (`valid`).
+pub fn goldens() -> &'static [Golden; 1] {
+    static GOLDENS: OnceLock<[Golden; 1]> = OnceLock::new();
+    GOLDENS.get_or_init(|| [of_fixture("valid")])
 }

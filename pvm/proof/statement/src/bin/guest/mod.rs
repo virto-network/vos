@@ -1,5 +1,5 @@
-//! The venue's JAM refine program, shared by `final-verify` and
-//! `final-verify-test` (`src/bin/final-verify.rs` describes it).
+//! The venue's JAM refine program, `final-verify`'s
+//! (`src/bin/final-verify.rs` describes it).
 
 #[macro_use]
 mod runtime;
@@ -11,8 +11,6 @@ use core::fmt::Write;
 use runtime::{Call, Cursor, FetchKind, HEAP, NONE, Output, STACK_BYTES, Static, gas_left};
 use vos_pvm_final_verifier::PUBLIC_WORDS;
 use vos_statement::model::Input;
-#[cfg(feature = "test-formats")]
-use vos_statement::vos_anchor::vectors::{Digests, Vector};
 use vos_statement::{Refusal, StatementId};
 
 entries!("_start" => "verify_main");
@@ -22,16 +20,13 @@ entries!("_start" => "verify_main");
 /// The payload's buffer: a judgement's input holds the statement.
 const PAYLOAD_MAX: usize = 16 << 10;
 
-/// The payload's modes, its first byte. `Anchors`, the harness's golden
-/// vectors computed with no proof read, is the test program's alone: the
-/// production program, a venue's, accepts nothing without a proof.
+/// The payload's modes, its first byte: the program accepts nothing
+/// without a proof.
 #[derive(Clone, Copy)]
 #[repr(u8)]
 enum Mode {
     Words = 0,
     Judge = 1,
-    #[cfg(feature = "test-formats")]
-    Anchors = 2,
 }
 
 impl Mode {
@@ -39,18 +34,13 @@ impl Mode {
         Some(match byte {
             0 => Self::Words,
             1 => Self::Judge,
-            #[cfg(feature = "test-formats")]
-            2 => Self::Anchors,
             _ => return None,
         })
     }
 }
 
-/// A golden vector's digests' bytes in the report, zeros but in the test
-/// program's `Anchors` mode.
+/// The report's last field's bytes, zeros: the layout the harness reads.
 const DIGESTS_BYTES: usize = 5 * 32;
-#[cfg(feature = "test-formats")]
-const _: () = assert!(DIGESTS_BYTES == Digests::BYTES);
 
 /// The program's verdicts, `Report::verdict`.
 #[derive(Clone, Copy)]
@@ -84,7 +74,7 @@ pub struct Report {
     code: u64,
     /// An accepted statement's id.
     id: [u8; 32],
-    /// A golden vector's digests.
+    /// Zeros, the report's layout's last field.
     digests: [u8; DIGESTS_BYTES],
 }
 
@@ -174,26 +164,9 @@ fn request(mode: Mode, body: &[u8]) -> Option<(Request<Input>, [u8; 32], usize)>
             let (input, used) = Input::decode_prefix(body).ok()?;
             (Request::Judge(input), body.get(used..)?)
         }
-        #[cfg(feature = "test-formats")]
-        Mode::Anchors => return None,
     };
     let [hash @ .., l0, l1, l2, l3] = <[u8; 36]>::try_from(rest).ok()?;
     Some((request, hash, u32::from_le_bytes([l0, l1, l2, l3]) as usize))
-}
-
-/// A golden vector's digests, computed: no proof is read.
-#[cfg(feature = "test-formats")]
-fn vectors(report: &mut Report, vector: &[u8]) -> Verdict {
-    match Vector::decode(vector) {
-        Ok(vector) => {
-            report.digests = vector.digests().to_bytes();
-            Verdict::Accept
-        }
-        Err(error) => {
-            report.refuse(&error);
-            Verdict::BadPayload
-        }
-    }
 }
 
 /// The proof of `proof_len` bytes whose hash is `hash`, a preimage the
@@ -242,10 +215,6 @@ fn verify(report: &mut Report) -> Verdict {
     else {
         return Verdict::BadPayload;
     };
-    #[cfg(feature = "test-formats")]
-    if let Mode::Anchors = mode {
-        return vectors(report, body);
-    }
     let Some((request, hash, proof_len)) = request(mode, body) else {
         return Verdict::BadPayload;
     };

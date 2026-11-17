@@ -1,7 +1,7 @@
 //! The reproducibility gate's constants (`vos_pvm_proof::constants`),
 //! recomputed from their sources: each known kernel's program id from its
 //! test actor's ELF, derived as an install derives it, `H_fold` from the
-//! fold circuit and the wrap's preprocessed roots from the wrap circuit.
+//! fold circuit and the wrap's preprocessed root from the wrap circuit.
 //! `test-proof` runs it under both of the prover's feature sets; under
 //! `VOS_PINS=write` (`just repin`) it writes the constants that moved.
 
@@ -36,7 +36,7 @@ pub fn program_id(actor: &str, name: &str) -> [u32; 8] {
     program.id().words()
 }
 
-/// Each constant is what its source computes, the wrap's roots the final
+/// Each constant is what its source computes, the wrap's root the final
 /// verifier's too.
 #[test]
 fn the_constants_are_the_repositorys() {
@@ -63,18 +63,11 @@ fn the_constants_are_the_repositorys() {
         ),
     ];
     let wrap = WrapCircuit::get();
-    let roots = [
-        (
-            "WRAP_ROOT_28",
-            wrap.preprocessed_root().0,
-            constants::WRAP_ROOT_28,
-        ),
-        (
-            "WRAP_ROOT_39",
-            wrap.masked_preprocessed_root().0,
-            constants::WRAP_ROOT_39,
-        ),
-    ];
+    let roots = [(
+        "WRAP_ROOT_39",
+        wrap.masked_preprocessed_root().0,
+        constants::WRAP_ROOT_39,
+    )];
     let moved = computed.iter().any(|(_, words, pinned)| words != pinned)
         || roots.iter().any(|(_, bytes, pinned)| bytes != pinned);
     if moved && std::env::var("VOS_PINS").as_deref() == Ok("write") {
@@ -95,10 +88,6 @@ fn the_constants_are_the_repositorys() {
     for (name, bytes, pinned) in roots {
         assert_eq!(bytes, pinned, "{name} moved: `just repin`");
     }
-    assert_eq!(
-        constants::WRAP_ROOT_28,
-        vos_pvm_final_verifier::PREPROCESSED_ROOT
-    );
     assert_eq!(
         constants::WRAP_ROOT_39,
         vos_pvm_final_verifier::PREPROCESSED_ROOT_39

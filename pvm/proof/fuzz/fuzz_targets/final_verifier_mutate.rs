@@ -1,7 +1,7 @@
-//! Fuzz target: the golden wraps, formats 28 and 39, mutated by their bytes
-//! and by their structure, then verified against their public words, each
-//! under its format (`vos_pvm_final_verifier::{unmasked, masked}::verify`,
-//! and the bytes through `vos_pvm_final_verifier::verify`).
+//! Fuzz target: the golden wrap, format 39, mutated by its bytes and by its
+//! structure, then verified against its public words
+//! (`vos_pvm_final_verifier::masked::verify`, and the bytes through
+//! `vos_pvm_final_verifier::verify`).
 //!
 //! The input is a list of mutations ([`Mutation`], `arbitrary`): byte flips,
 //! insertions, removals and truncations of the encoding; and, on the
@@ -12,7 +12,7 @@
 //!
 //! Property: **no panic, no abort**, and **a mutated proof that verifies is
 //! the golden one** by value (`golden::Golden::assert_is_golden`): the
-//! mutations that cancel out, or rewrite a postcard varint longer. The
+//! mutations that cancel out. The
 //! shape checks stand before every Stwo call that would index the proof;
 //! this target is what holds them to that.
 //!

@@ -82,7 +82,7 @@ pub enum Command {
         /// The attestable method.
         #[arg(required_unless_present = "circuits")]
         method: Option<String>,
-        /// Print `H_FOLD`, `WRAP_ROOT_28` and `WRAP_ROOT_39`, computed.
+        /// Print `H_FOLD` and `WRAP_ROOT_39`, computed.
         #[arg(long, conflicts_with_all = ["elf", "method"])]
         circuits: bool,
     },

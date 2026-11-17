@@ -1,6 +1,5 @@
 //! The venue's JAM programs' runtime, shared by the guests that link the
-//! final verifier (`final-verify`, `final-verify-test` and
-//! `vos-statement-service`'s): a stack of its own and the entries onto it,
+//! final verifier (`final-verify` and `vos-statement-service`'s): a stack of its own and the entries onto it,
 //! the heap, the host calls and their convention, the output, the panic
 //! handler and the single-core atomic libcalls.
 

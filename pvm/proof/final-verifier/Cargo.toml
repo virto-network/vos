@@ -3,13 +3,7 @@ name = "vos-pvm-final-verifier"
 edition.workspace = true
 version.workspace = true
 license = "GPL-3.0-or-later"
-description = "The final wrap's verifier: a format-39 proof (masked, its fixed layout) against its 24 public words, the program id and the io-hash; and format 28 under `test-formats`. no_std, for x86, wasm32 and the PVM."
-
-[features]
-# Format 28, the unmasked wrap, and its postcard decode: the tests' and the
-# fixtures' format. No production venue accepts it; without the feature a
-# build links format 39 alone.
-test-formats = ["dep:postcard"]
+description = "The final wrap's verifier: a format-39 proof (masked, its fixed layout) against its 24 public words, the program id and the io-hash. no_std, for x86, wasm32 and the PVM."
 
 [dependencies]
 # Without features: no std, and none of the prover's nightly SIMD.
@@ -17,10 +11,8 @@ stwo = { workspace = true }
 vos-pvm-recair-air = { workspace = true }
 num-traits = { version = "0.2", default-features = false }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
-# Format 28's bytes.
-postcard = { version = "1", default-features = false, features = ["alloc"], optional = true }
 
 [dev-dependencies]
-# Formats 28's and 39's registry entries and the segment transcript's
+# Format 39's registry entry and the segment transcript's
 # header, which this crate's constants and header must equal.
 vos-pvm-proof = { workspace = true }

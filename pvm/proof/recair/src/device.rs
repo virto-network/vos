@@ -46,20 +46,20 @@ pub const FORMAT: Format = DEVICE_PROOF;
 
 /// A second device format, for the tests of a node's format window: the
 /// device format's AIR and parameters under number 48, which no release
-/// admits (`vos_wire::defaults::DEVICE_FORMATS`). Behind `test-formats`,
-/// which no production build enables.
-#[cfg(feature = "test-formats")]
+/// admits (`vos_wire::defaults::DEVICE_FORMATS`). Behind
+/// `test-device-format`, which no production build enables.
+#[cfg(feature = "test-device-format")]
 pub const TEST_FORMAT: Format = Format {
     number: 48,
     ..DEVICE_PROOF
 };
 
 /// The device formats this build proves and verifies, newest first.
-#[cfg(not(feature = "test-formats"))]
+#[cfg(not(feature = "test-device-format"))]
 pub const FORMATS: &[Format] = &[FORMAT];
 /// The device formats this build proves and verifies, newest first: the
 /// device format and [`TEST_FORMAT`].
-#[cfg(feature = "test-formats")]
+#[cfg(feature = "test-device-format")]
 pub const FORMATS: &[Format] = &[FORMAT, TEST_FORMAT];
 
 /// The device format numbered `number`, if this build proves and verifies
