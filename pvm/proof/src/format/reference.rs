@@ -77,9 +77,9 @@ pub(crate) const WRAP_REFERENCE: SecurityShape = SecurityShape {
 /// and given a periodicity value.
 const MASKED_WRAP_DEEP_VALUES: u64 = (57 + 373 + 40 + 4 + 8) + 2 * (16 + 3 * 4);
 
-/// The wrap masked under variant (c), format 39's reference: the AIR of
-/// [`WRAP_REFERENCE`] at its tallest component's 2^15 rows, its columns at
-/// degree bound 2^16, its composition whole at 2^17 and sampled at `π(z)`
+/// The wrap masked under variant (c), format 39's reference: the wrap AIR
+/// (`WRAP_REFERENCE`, unmasked) at its tallest component's 2^15 rows, its
+/// columns at degree bound 2^16, its composition whole at 2^17 and sampled at `π(z)`
 /// ([`SecurityShape::variant_c`]), plus what the masking commits beside it:
 /// the shape of the built masked components, which a test derives. The batch
 /// is counted exactly (`MASKED_WRAP_DEEP_VALUES`); it enters only the count
