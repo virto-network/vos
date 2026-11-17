@@ -128,17 +128,20 @@ searched for the secret by its `tests/leaks.rs`.
   assigned either.
 - **A restore's device trusts the agent for what came before:** it starts
   its group from what it reads of the agent after its restore matured
-  (the log's head, the device set with the authors its keys name as
-  carried, the kit), with no earlier view to check them against; from
-  then it checks the log as any device does. An author the agent names
-  so is read only up to its device's frontier once the restore's first
-  commit removes it, as any old device's own nodes are.
+  (the log's head, the device set, the kit), with no earlier view to
+  check them against; from then it checks the log as any device does. An
+  old device's nodes are read only up to its frontier once the restore's
+  first commit removes it.
 - **A device that cannot follow** reads on for the device set's
   operations, so its own regroup matures in its view, but takes no other
   candidate: it follows the others' epochs and the removals they carried
-  by the agent's word (which moves no key), and its regroup's new group
-  names only the devices it knew. A regrouper whose removal matures
-  before its new group frees the others to commit.
+  by the agent's word (which moves no key). A regroup keeps its regrouper
+  alone: the agent refuses one that does not name every other live
+  device, removes every other device at its maturity (one added while it
+  was open too), and the regrouper's new group holds it alone; the others
+  pair again, so no device joins a regrouper's group by a Welcome it
+  did not pair for. A regrouper whose removal matures before its new
+  group frees the others to commit.
 - **Data keys come from the confirmed epoch alone**, and scope ids from
   the archive's naming secret, which is the store's from its first scope
   on: a store that named a scope does not join another group. A restored
@@ -194,17 +197,11 @@ searched for the secret by its `tests/leaks.rs`.
 - **An archive read brings keys, never a writer:** from an archive the
   agent serves a device takes the keys of the epochs before its confirmed
   one, the `R` the log named, and nothing else; an archive names no
-  carried author. The authors a move carried are named by the device
-  set's keys in the control log (`NewDevice::carried`: the mover's claim,
-  the commit adding a re-paired device, which an admin key signed; a
-  paired device takes them from its pairing device as it takes the set,
-  a restore from the agent), read as the set's while the device naming
-  them has a voice and, once its removal matured, only at positions up to
+  author. A node's author is a device of the set, read as the set's while
+  it has a voice and, once its removal matured, only at positions up to
   its frontier, the first the agent answered, kept. So no device of the
   set, removed later, leaves an author or a key behind through an archive
-  that writes past the removal. A restore elsewhere names what it read
-  back from the old home, which checks no author or frontier there: the
-  old home's word, as a restore at home takes the agent's.
+  that writes past the removal.
 
 ## The secret and its containment
 
@@ -469,3 +466,20 @@ What the personal agent and the device's keys still leave open
   counts are the operators' to see.
 - **A local actor's new state shape** is not migrated: it starts a new
   scope and the device imports again (D7).
+- **A newly paired or restored device can be served a shortened scope**
+  without an alarm (C4; scope checkpoints are slice 9's, the owner's
+  decision 16 of 2026-11-17): it reads each scope from its start with no
+  position of its own to hold the operators to, so they can withhold a
+  scope's newest envelopes from it; it raises `Partition` only once a
+  later envelope's `seen` position crosses the cut, and a scope no other
+  device writes in again stays short.
+- **A move carries nothing** (2026-11-17, decision 16): a move or a
+  re-pair at the new home starts each scope there anew; only the books,
+  which every device writes again, follow. A scope's history stays at the
+  old home, for as long as its operators keep it; a device that missed
+  the move is told nothing by it. The device's sync and admin keys are
+  new at the new home (`Space::leave`), so only a reused kit and the
+  scopes' ids link the two agents for the two homes' operators together.
+- **The lease lapses 13 months after the claim** (decision 16): no device
+  re-proves in slice 8, so the agent enters its grace unless the home
+  sets a longer lease (`open.md`).

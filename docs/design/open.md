@@ -199,6 +199,34 @@ The scale results are in `core-model.md` §14, "The scale test".
   a sync key (PG3′), are driven in `node/light/tests/sealed/kit.rs` and
   need the facility's kit-signed `resolve` and `remove` (and their
   screens) before a phone runs them.
+- **Every personal agent lapses at month 13** [risk, dated 2026-11-17,
+  the owner's decision 16]: the yearly re-proof flow and the joiners' open
+  claim (E28) move to slice 9, so no device proves `Homes.renew`, and a
+  joiner holds no leaf at a home-only home to prove it with. Each agent's
+  lease runs out 13 months after its claim and it enters its 180 days'
+  grace (pushes refused; reads, a restore and a move still served) unless
+  slice 9 ships both before then or the home sets a longer lease
+  (`Policy::lease_ms`, 395 days by default). `Homes.renew`, `Personal.renew`, the
+  recorded nullifiers, the lease and the grace stay built.
+- **The MLS leaf's year** [risk, dated 2026-11-17, decision 16]: a leaf
+  made from a key package lives 365 days (mls-rs's lifetime), and a
+  joiner's Welcome refuses a tree holding a leaf past it. The yearly
+  prompt that renewed it moves to slice 9 with the re-proof; until then
+  any commit of a device renews its own leaf ("Commit now" makes one), so
+  a device that commits nothing for a year blocks the next pairing until
+  it commits or is removed.
+- **Scope checkpoints** [slice 9, dated 2026-11-17, decision 16;
+  `light-node.md` §3.6, §8 C4; `node/light/SECURITY.md`]: a newly paired
+  or restored device reads each scope from its start and has read no
+  position to hold the operators to, so it can be served a shortened
+  scope (its newest envelopes withheld) without an alarm; `Partition`
+  is raised only once a later envelope's `seen` position crosses the cut.
+  `Personal`'s `acknowledge` and `acknowledgements` stay for them.
+- **Restore elsewhere and the move's carry** [slice 9, decision 16;
+  `light-node.md` §3.9]: a restore lands at its own home (then moves),
+  and a move carries nothing, valid only while the personal space holds
+  the credential and device books; a third local actor whose rows no
+  device writes again (the wallet) needs the carry first.
 - **The registry and the root space** (`identity-and-authority.md` §12): the registry agent on JAM, the
   root space under a charter, the handover triggers' numbers, and the rules
   for exit and disputes.

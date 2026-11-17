@@ -65,7 +65,7 @@ devices decrypt each other's messages".
 | E12 | Keep MLS, built as one shared `vos-mls` layer: the personal space its first user, member messaging and virtual clients later; one stack, fewer pieces. |
 | E13 | P2 (the shielded pool, the wallet, PG4) moves to slice 9, built on the finished personal space and Tor. Slice 8 ships P1. |
 | E14 | A home-only space by default: a space the user holds no other membership in, hosting personal agents. A user may home in a space they belong to, the app stating that its operators can link the agent to them. |
-| E15 | A yearly membership re-proof (`Auth("home")`, one prompt a year) keeps the agent; an expelled member's agent lapses into a grace period, its data recoverable by the kit or a move. |
+| E15 | A yearly membership re-proof (`Auth("home")`, one prompt a year) keeps the agent; an expelled member's agent lapses into a grace period, its data recoverable by the kit or a move. [Amended 2026-11-17, decision 16: the device's re-proof flow moves to slice 9; `Homes`' `renew`, the lease and the grace stay built.] |
 | E16 | Recovery in slice 8: the phrase or printed kit, and a FIDO2 security key as a kit (the `hmac-secret` path). An encrypted export file is later. |
 | E17 | Tor-only is a rule for the personal agent: it refuses anything that did not come through the onion service. Bridges and pluggable transports weighed for slice 8 against later (§6.5). |
 | E18 | cipher-clerk v0.4 (the shielded redesign, R1–R11) moves to slice 9 with P2; P1 runs on v0.3.0 unchanged. |
@@ -78,9 +78,32 @@ devices decrypt each other's messages".
 | E25 | 8.25's flood measurement over live Tor runs on a private Tor test network (chutney) at M5's acceptance, a lighter run accepted. |
 | E26 | A scheduling decision (phone sessions), not recorded here. |
 | E27 | M3's and M4's acceptances run together: one `ci-full`, one carrier audit, one Fable review; M5's phone runs may fold into S8-P7. |
-| E28 | A joining device's open claim at a home-only space is made by the background job after a random drawn delay from its add, never at the pairing, so the home's operators cannot link the new member to the agent by its time. |
+| E28 | A joining device's open claim at a home-only space is made by the background job after a random drawn delay from its add, never at the pairing, so the home's operators cannot link the new member to the agent by its time. [Moved to slice 9, 2026-11-17, decision 16: no joiner makes an open claim; only the claiming device is a member of the home.] |
 | E29 | A device's admin key is replaced (`admin(d, new key)`) on the kit's signature or another seasoned active device's; the new key's 72 h probation stands either way. |
 | E30 | No C tor in the product, its tooling or its demo: the gateway hosts its onion with arti in process, the one path; the C tor sidecar, run once to measure it, is removed. A private test network's relays (chutney) may use C tor outside the tree. |
+
+**The scope cuts** [the owner, 2026-11-17, decision 16]: four flows that
+had no caller in the product, or carried most of the device side's
+complexity, are cut before the device side's flows move into `vos-light`:
+- **Moving home carries nothing** (§3.9): the mover leaves its personal
+  space with no call to the old home (its store made anew), claims at the
+  new home as a first claim does, and the other devices leave and pair
+  again. Valid only while the personal space holds the credential book and
+  the device book alone, which every device writes again from what it
+  holds; a local actor holding what no device writes again needs the carry
+  back first (slice 9, with the wallet).
+- **A restore is at its own home** (§3.5): restore elsewhere moves to slice
+  9 (restore there, then move). **Scope checkpoints** (8.21's) move to
+  slice 9 (§3.6): a paired or restored device reads each scope from its
+  start, and a home's operators can serve it a shortened scope without an
+  alarm at that moment (§8, C4; `open.md`).
+- **A regroup keeps its regrouper alone** (§3.5): every other device is
+  removed and pairs again; the key-package handover is gone.
+- **The joiners' open claim (E28) and the yearly re-proof flow** move to
+  slice 9 (§3.3, §3.8): only the claiming device joins the home; `Homes`'
+  `renew`, `Personal`'s lease and its grace stay built. Every agent lapses
+  13 months after its claim unless slice 9 ships both or the home sets a
+  longer lease (`open.md`).
 
 ### 1.2 Goals
 
@@ -381,6 +404,12 @@ no kit loses everything with the phone (§8, D2).
   set's authority is the personal agent's log, §3.5; this is its
   user-facing mirror).
 
+**Before a third local actor is added** [2026-11-17, decision 16]: a move
+home carries nothing (§3.9), which is valid only while the personal space
+holds just these two books, whose rows every device writes again at the
+new home from what it holds. An actor whose rows no device writes again
+(the wallet's, slice 9) needs the move's carry back first.
+
 Each actor instance is one sync scope: one merkle-crdt DAG
 (`core-model.md` §9.4's "one DAG per sync scope"). A merge handler's
 effects depend only on its operation, so every device that applies a DAG
@@ -457,7 +486,8 @@ user's other spaces.
   daily cap of open enrollments. Over the onion, the registrar learns
   only that someone joined. A new device's open claim runs in the
   background after pairing; it reads and writes through the archive
-  meanwhile (§3.8).
+  meanwhile (§3.8). [Slice 9, 2026-11-17, decision 16: no joiner makes
+  one; only the claiming device joins the home.]
 - **Each device joins on its own:** under E2 each device has its own
   member secret, so each device of the user makes its own open claim in
   the home, unlinked to the others at the registrar. The device set in
@@ -474,7 +504,7 @@ user's other spaces.
   have passed since the claim, where the device's yearly prompt first
   falls (the lease's last sixth): an earlier one renews the lease and lifts
   nothing, so a Sybil cannot re-prove at once for the larger quota
-  [built, `Personal::renew`]. Nothing an open member does reaches another user's
+  [built, `Personal::renew`; no device calls it in slice 8, decision 16]. Nothing an open member does reaches another user's
   agent (known keys, gated queries, one agent a claim). The default home
   is run by Virto, listed in the app, its cap published [decided, E20];
   anyone may run another, and users may pick it.
@@ -509,10 +539,13 @@ operator makes ahead of time**:
   claim on a device that already holds a personal space's archive, so a
   user's second device never claims a second agent by mistake.
 - **"home" is reserved:** the light node proves in that scope only for
-  its own claim and re-proofs, and the facility refuses any request
-  naming `Homes`' agent and instance.
+  its own claim (and, in slice 9, its re-proofs), and the facility refuses
+  any request naming `Homes`' agent and instance.
 
-**The lease: one re-proof a year** [decided, E15]:
+**The lease: one re-proof a year** [decided, E15; the device's flow,
+the yearly prompt and the joiner's own leaf at the home it needs, slice 9
+(2026-11-17, decision 16); `Homes`' `renew`, the lease and the grace
+built]:
 - Every device's own "home" nullifier is recorded at its add (the device
   computes it without a proof; `Personal` passes it to `Homes`, which
   refuses one already mapped to another agent). The person records (§3.8)
@@ -618,7 +651,7 @@ this is the one taken]:
   which the keeper's upgrade walks).
 - **The scope reserved** [built, `vos_light::home`]: `Prover::prove_auth`
   refuses the guard name "home" (`DeviceError::Reserved`), and
-  `Prover::prove_home` proves in it only a call of `claim` or `renew`; a
+  `Prover::prove_home` proves in it only a call of `claim`; a
   device computes its own nullifier there with no proof
   (`home::nullifier`). The facility links the library, so it refuses
   the same; its own operations are unchanged.
@@ -882,7 +915,10 @@ devices that are awake have shown they hold the same keys.
 - **Updates:** a device updates its leaf when an MLS leaf lifetime nears
   its end (a year), on the same yearly prompt as the home's re-proof
   [E15], and after its admin key is replaced; each is an admin-signed
-  commit.
+  commit. [The yearly prompt: slice 9, 2026-11-17, decision 16. Any commit
+  of a device's renews its leaf, and "Commit now" makes one; a device that
+  commits nothing for a year leaves a leaf of its key package's lifetime,
+  which a later joiner's Welcome refuses (`open.md`).]
 
 **Retention:** the agent keeps handshakes and confirmations for 180 days
 and no plaintext group information; a device away longer re-pairs (§8,
@@ -1030,12 +1066,13 @@ arm64-v8a build; the phones' timings below are S8-P1's]:
   agent's verdict is advisory: one this device cannot count raises an
   alarm, and the next candidate stops it (re-pair). A call refused with
   `Settling` is made again after a `wake`.
-- **Regroup and restore:** a matured regroup voids the pending candidate,
-  and the next commit is the regrouper's new group (`DeviceGroup::regroup`,
-  with the key packages the rest hand over as a pairing's, through the
-  inbox under their sync keys, §7.3), its epoch the
-  confirmed one plus one, carrying every removal; the rest join it by its
-  Welcome, and its epochs count on from the agent's. A device that cannot
+- **Regroup and restore:** a matured regroup voids the pending candidate
+  and removes every device but its regrouper, one added while it was open
+  too, and the next commit is the regrouper's new group of it alone
+  (`DeviceGroup::regroup`), its epoch the confirmed one plus one, carrying
+  every removal, its epochs counting on from the agent's; the others pair
+  again from it [amended 2026-11-17, decision 16: the key packages the
+  kept devices handed over, and their joining by its Welcome, are gone]. A device that cannot
   follow reads on for the device set's operations and takes no candidate
   but its own regroup's, following the others' epochs and the removals
   they carry by the agent's word. A restore's device starts its new group alone
@@ -1177,7 +1214,7 @@ spike app, its log host-verified]:
   commit that carries it, made by the next device whose user authenticates
   (the agent already refuses the removed device's keys at maturity); a
   veto, a resolve or a kit rotation is one each; the yearly re-proof and the
-  leaf renewal share one.
+  leaf renewal share one (slice 9, decision 16).
 - **Size:** the keystore signs at most 16 KiB in one Ed25519 operation
   (`IKeyMintDevice.aidl`), so an admin call's arguments stay under 15
   KiB; anything larger (a commit's Welcome) rides in its evidence call,
@@ -1264,7 +1301,11 @@ below signed by its admin key in place of the kit: it needs no `R2` (it
 holds `R`), waits 72 h and is vetoable and contestable as a removal is,
 and is immediate when two seasoned devices or the kit sign it. It removes
 the devices it names, starts a new group with the rest by Welcome, and
-the control log restarts under it.
+the control log restarts under it. [Amended 2026-11-17, decision 16: a
+regroup keeps its regrouper alone. It names every other live device, and
+at its maturity every device but the regrouper is removed, one added
+while it was open too; the new group is the regrouper's alone, and the
+others pair again from it.]
 
 **The recovery kit** [decided, E16; proposed details]:
 - **Two kinds,** either or both, each a recovery entry in the device set
@@ -1300,7 +1341,8 @@ the control log restarts under it.
   for new scopes, and **rotates the kit**, since the kit just used may be
   the one that leaked. A restore may target another home: the same restore
   at the old agent releases `R2`, and the new group lives at an agent
-  claimed elsewhere.
+  claimed elsewhere. [Slice 9, 2026-11-17, decision 16: a restore is at
+  its own home; to land elsewhere, restore there, then move (§3.9).]
 - **Kit rotation:** a new kit, a new `R`, `R1` sealed to the new kit, the
   old `R2` deleted, and the recovery envelopes re-sealed under the new `R`
   by the device that rotates. Two seasoned active devices make it at once;
@@ -1454,14 +1496,7 @@ where the text above leaves a choice, this is the one taken]:
   (`DeviceGroup::restore`, the next kit's `R` the kit's) and takes the
   recovered archive in (`DeviceGroup::inherit`): the old group's naming
   secret kept beside its own, so old scopes keep their ids and new ones
-  are named afresh. **Elsewhere:** the restore at the old agent releases
-  `R2`; the device takes the recovered archive in (`group::recovered`)
-  and reads its old scopes from the old agent with it
-  (`personal::read_back`), then claims an agent at another home with the
-  next kit split anew there, its keys naming the old agent's device set
-  as its carried authors up to the nodes it read back
-  (`moving::carried`, §3.9 "Moving home as built"), and carries them to
-  the new home (`SealedSync::carry`).
+  are named afresh. A restore elsewhere is not built (slice 9).
 - **Liveness:** every device with a voice that reads an open restore
   posts `alive` (`Event::Alive`) until the log cancels it, and shows a
   kit-signed operation for as long as it is open (`Alarm::Kit`); the
@@ -1546,7 +1581,10 @@ at 18.
 - Nodes sign nothing a device can show a third party, so detection is not
   proof.
 
-**Checkpoints at the agent's positions:**
+**Checkpoints at the agent's positions** [slice 9, 2026-11-17, decision
+16: not built; a paired or restored device reads each scope from its
+start, and the operators can serve it a shortened scope without an alarm
+then (§8, C4)]:
 - a checkpoint is a scope's state after every envelope up to a position
   `P` whose causal past is complete, so every device that has read to `P`
   computes the same state; its author pushes it sealed with `P` and the
@@ -1612,9 +1650,7 @@ the one taken]:
   epoch's itself, and no device holds a later one); its `R` only when it
   is the one the log named last (by `r_hash`); and no earlier group's
   naming secret or scope, which come from a device's own restore and
-  from a pairing alone. An archive names no carried author at all: the
-  authors a move carried are named by the device set's keys in the
-  control log (`NewDevice::carried`, §3.9). So a device, removed later,
+  from a pairing alone. An archive names no author at all. So a device, removed later,
   leaves behind no author or key that outlives its removal (A7); unless one
   there encodes as this device's whole archive (candidates are kept in
   order, so equal archives encode alike), it pushes its own, chunked,
@@ -1708,39 +1744,21 @@ choice, this is the one taken]:
   at its positions, the bytes' hash checked against the id the push was
   answered with, and one gone or replaced raises `Deleted` and its node
   is sealed and pushed again.
-- **Checkpoints** (`personal::checkpoint`): the hash is over the agent,
-  the scope, `P` and each position up to `P` that held a node with its
-  CID, in order (a node the scope refused left out, as every device
-  refuses it), so two devices at one position compute one (C3); one is
-  cut only where no node waits for a parent. Its content (those
-  nodes by position) is pushed in parts into a checkpoints' scope of its
-  own, with the maker's `made(P, hash)` signed by its sync key; a device
-  that read the scope to `P` recomputes it and signs `acknowledged`, or
-  raises `Checkpoint` (C4); a maker acknowledges none of its own. A
-  scope read for the first time starts from the checkpoint its pairing
-  device named over the pairing channel (`Pairing::trust`, with where its
-  parts start), or, for a restore's device, the latest that a device made
-  and two devices that made none of it acknowledged, each signature
-  checked against the device set; the content is checked
-  against the hash before it applies, and otherwise the scope is read
-  from its start (C12). The acknowledgements are sealed and signed, so the
-  operators cannot add one; `Personal`'s `acknowledge` table and method
-  are unused, and go with `Personal`'s next change.
+- **Checkpoints** are not built (slice 9, decision 16): every device reads
+  each scope from its start, the author of each node checked and each
+  writer's `seen` positions kept, so a scope served short of where a
+  writer had read it raises `Partition` once an envelope crosses it, never
+  at a pairing or a restore by itself.
+  `Personal`'s `acknowledge` and `acknowledgements` and their table stay
+  built, with no device calling them, for slice 9's checkpoints.
 - **Known limits:** the frontier and the device set a restore reads are
-  the agent's word (B8), and a removed device's acknowledgement counts
-  for a restore (the restore removes every device), so a removed thief
-  is one of the two; a device that cannot follow takes the devices added
-  meanwhile by the agent's word (§3.4), and their nodes as authored; a restore's device scans the checkpoints' scope
-  from its start; a device that passed over an envelope another opened
-  (M2 above) computes another hash, and raises `Checkpoint` at an honest
-  one; a consistent partition is caught only once an envelope crosses it
-  (a `seen` position, a view); the checkpoints' scope passes over an
-  envelope it cannot open without an alarm; a scope with no envelope
-  yet looks for its checkpoint at each reading; the rows by position and
-  the chain rows grow until garbage collection (§9.3). The callers of
-  `made`, `head`, `audit`, `checkpoint`, `acknowledge` and
-  `Pairing::trust` are the background job's (8.22) and pairing's
-  (8.23a); the model test drives them.
+  the agent's word (B8); a device that cannot follow takes the devices
+  added meanwhile by the agent's word (§3.4), and their nodes as authored;
+  a consistent partition is caught only once an envelope crosses it (a
+  `seen` position, a view); the rows by position and the chain rows grow
+  until garbage collection (§9.3). The callers of `made`, `head` and
+  `audit` are the background job's (8.22) and pairing's (8.23a); the
+  model test drives them.
 
 **PG6's catch-up on the clearnet** [measured, x86-64 Core Ultra 7 155H,
 load average 5–11, release, 2026-11-06; `node/host/tests/ingress/sealed.rs`
@@ -1790,8 +1808,8 @@ in the facility's `tests/job.rs` and `killed.rs`]:
   followed again on `StaleEpoch`) and read by its cursor (the log followed
   where a page waits for an epoch, the archive read where it waits for a
   key, four readings at most); the archive and the recovery envelopes
-  kept; each scope's checkpoints acknowledged (`acknowledge`) and one of
-  its own pushes audited (`audit`); the device set read. A device stuck or
+  kept; one of each scope's own pushes audited (`audit`); the device set
+  read. A device stuck or
   out reads the log, the overview and the device set and leaves its
   scopes alone. A post the agent refuses as held already (`Voted`,
   `Evidenced`) or as decided meanwhile (`NoCandidate`, `NotConfirming`) is
@@ -1803,12 +1821,11 @@ in the facility's `tests/job.rs` and `killed.rs`]:
   this pass read it (what a notification's latency is measured from); a
   pending restore (this device posted `alive`; every other device reads
   the kit's operation, `Alarm::Kit`); its removal and that it cannot
-  follow, from its course, at every pass while they hold; the yearly
-  re-proof (`home::renewal_due`); every alarm kept and not yet
-  acknowledged. **Alarms are rows:** each is written in the batch that
+  follow, from its course, at every pass while they hold; every alarm
+  kept and not yet acknowledged. **Alarms are rows:** each is written in the batch that
   consumes its evidence (the device group's state, a page's positions,
-  a scope's watches), or before the write that does (a checkpoint's
-  marks, an audit's push again), and kept (`DeviceGroup::alarms`, at most
+  a scope's watches), or before the write that does (an audit's push
+  again), and kept (`DeviceGroup::alarms`, at most
   64, a flood of one kind evicting only its own) until the chrome, its
   user having seen it, acknowledges it (`DeviceGroup::acknowledge`). A
   pass killed or stopped after the request that raised one, or a request
@@ -1851,9 +1868,10 @@ in the facility's `tests/job.rs` and `killed.rs`]:
   and the admin key's prompts are the UI's), and the app is not direct-boot
   aware, so no job runs before that unlock.
 - **First numbers** [measured, x86-64 Core Ultra 7 155H, debug,
-  2026-11-08]: a pass with nothing new on a paired phone, 7 requests and
-  376 bytes of the agent's answers (the log's head, the overview, the
-  scope's, the archive's and the checkpoints' empty pages, the device set),
+  2026-11-08; again 2026-11-17]: a pass with nothing new on a paired
+  phone, 6 requests and 372 bytes of the agent's answers (the log's head,
+  the overview, the scope's and the archive's empty pages, the device
+  set; 7 and 376 with the checkpoints' page, gone with decision 16),
   no call and so no session; s4's run with nothing new, one enrollment at a
   stand-in gateway, 2 SSH connections (the time, the root), 5.2 KB down
   and 5.6 KB up, 25 ms. The phones' numbers (PG6's 30 s and 1 MB, the
@@ -1893,7 +1911,8 @@ skip expired items, each write deletes a few; no timer).
    its pre-shared key.
 3. **Over the Noise channel,** B sends its public keys, the admin key's
    attestation and its KeyPackage; A sends the key archive, the naming
-   secret, `R`, and its newest checkpoint's hash per scope.
+   secret, `R`, and its newest checkpoint's hash per scope (slice 9,
+   decision 16).
 4. **A adds B in one admin call, on one prompt:** for a strong admin an
    add is immediate, so the add and its commit are one call,
    `commit(epoch, add(B's keys, B's "home" nullifier), handshake,
@@ -1903,7 +1922,8 @@ skip expired items, each write deletes a few; no timer).
    the archive. A delayed admin's add is an operation first and its
    commit, after the 72 h, a second call.
 5. **B joins:** fetches each scope's checkpoint (A's, by the hash it was
-   given) and the envelopes after it.
+   given) and the envelopes after it. [As built, 2026-11-17, decision 16:
+   it reads each scope from its start.]
 
 **Memberships elsewhere** (E2: each device has its own secrets):
 - **in every space other than the home, at once,** on the pairing's own
@@ -1918,7 +1938,8 @@ skip expired items, each write deletes a few; no timer).
   registrars never see the personal agent, so there is nothing to blur;
 - **in a home-only space,** B makes its own open claim (§3.3), in the
   background after pairing: no enrollment by A, no link, and no wait on
-  the pairing's path;
+  the pairing's path [slice 9, E28, 2026-11-17, decision 16: B makes
+  none, and holds no leaf at a home-only home];
 - **in a home that is the user's own space,** the user chooses "now" (the
   default, since §3.10 already concedes the link there) or "at my next
   sign-in".
@@ -2017,7 +2038,7 @@ one taken]:
   `Hello` (its `NewDevice` with its "home" nullifier from its own secret
   there, its key package, its handle in each offered space), the
   opener's handover (the `Pairing`, its archive with the naming secret and
-  `R`, and its checkpoints, `Pairing::trust`) in as many items as the
+  `R`) in as many items as the
   policy's item size takes, and the joiner's acknowledgement by the
   handover's hash: three items of the slot's four. **The commit waits for
   the acknowledgement**, since the add closes the slot and deletes its
@@ -2043,23 +2064,20 @@ one taken]:
   The registrar registers a person's first device (`register`) as it
   enrols the member, its own call; the light node calls none of the
   registrar's role methods.
-- **The joiner's open claim** at a home-only space runs after the pairing
-  (`home::open_claim`, its own work), so its re-proof proves under the
-  nullifier its add recorded; at a home that is the user's own space it
-  is the opener's enrollment there, as in any space. The background job
-  makes it at a delay drawn uniformly over 1 to 6 hours from the pairing,
-  so the home's operators do not link the new member to the agent by its
-  time (L5); the due time is kept in the device's state, so a killed
-  process neither loses nor redraws it [built, `node/light/android`]. Until
-  then the joiner works through the archive, and its re-proof waits.
+- **The joiner's open claim** is not built (slice 9, E28, decision 16):
+  only the claiming device makes one (`home::open_claim`, its own work, as
+  its claim's membership); a joiner records its "home" nullifier at its
+  add, computed with no proof, and holds no leaf at a home-only home, so
+  it proves nothing there. At a home that is the user's own space it is
+  the opener's enrollment there, as in any space.
 - **Retiring a phone:** the successor paired from the old phone (offered
   the old phone's memberships), then the old phone's removal by the other
   devices as §3.5's rules time it, carried by the next commit; the old
   phone, relayed the log, sees `Event::Removed`, which is where the app
   offers to wipe it; its leaves revoked in each space its handles name.
-- **The yearly prompt** (`home::renewal_due`): due in the lease's last
-  sixth or once the device's leaf is due its update; on it the device
-  proves `renew` (`home::renew_call`) and commits its update.
+- **The yearly prompt** is not built (slice 9, E15, decision 16): no
+  device proves `renew`, so the lease runs 13 months from the claim
+  (`open.md`); "Commit now" renews the device's leaf.
 
 ### 3.9 Home spaces: several, and moving home
 
@@ -2071,150 +2089,48 @@ are later work (§9.3).
 the user wants out): devices are full replicas, so nothing is lost but the
 agent. A device claims an agent in another home, creates a new group,
 re-splits the kit (a new `R2` at the new agent) and pushes everything,
-including recovery envelopes; the other devices pair again by QR. Until
+including recovery envelopes; the other devices pair again by QR.
+[Amended 2026-11-17, decision 16: it pushes only what it writes again,
+the books (below).] Until
 the move completes, the kit opens nothing at the new home. The old
 operators keep what they held; deletion there cannot be verified.
 
-**Moving home as built** [built, `vos_light::moving`,
-`personal::SealedSync::carry`; tested against `Personal` at three homes, and a restore at the third, in
-`node/light/tests/sealed/moving.rs`, and end to end on three nodes holding
-two home-only homes (each its own agent, credential actor and handle, and
-`Homes`, in the nodes' one space), through their sockets with the onion's
-mark, in `node/host/tests/served/moving.rs`; where the text above leaves a
-choice, this is the one taken]:
-- **The claim elsewhere** (`Move::prepare`): a device of the group that
-  follows it joins the other home as any member does (its open claim
-  there) and claims the agent that home's `Homes` answers `pooled` for, as
-  a first claim does (§3.8): the kit's keys given split anew at that
-  agent, `R1` sealed to its identity, the new `R2` in the claim, the
-  device's "home" nullifier the new home's. Its keys in the claim name
-  what it carries (`NewDevice::carried`, `moving::naming`): each device
-  of the old set, removed ones' too, and each author the old set's keys
-  named as carried, in each scope up to the highest of its nodes the
-  device holds there short of its cutoff (`moving::carried`); so a
-  second move carries what the first did. While the claim waits, the old
-  group's scopes are read no more (`Waiting::Moving`), so the move holds
-  nothing past what its keys named. The claim is held in the store
-  beside the group it leaves; a second move or claim is refused, and so
-  are a move to the agent the group has and one from a device that cannot
-  follow its group or is out of it. A claim `Homes` refuses is abandoned
-  (`Move::abandon`) and the old group stands. The kit may be the old one
-  or a new one: the same kit's index at both `Homes` links the two agents,
-  and the old one still restores at the old home (below), so the app takes
-  a new kit for a hostile home.
-- **The notice** (`moving::Notice`): once the claim is answered and before
-  it leaves, the mover leaves at the old home the new home and agent,
-  signed by its sync key and sealed under the old group's confirmed epoch
-  in a scope of its own, then pushes its archive there, which carries that
-  scope's key to the devices at later epochs (`SealedSync::announce`). A
-  device reads it only from a device of the set that is not removed
-  (`SealedSync::announced`); the operators read an envelope.
-- **Leaving, and the new group** (`Move::claimed`, once the new agent's
-  log holds the assignment, the caller giving up its handle on the old
-  group): every local scope's cursor and push queue forgotten
-  (`Light::forget_feed`, `merkle_crdt::Replica::forget_cursor`), then in
-  one batch the old group's state, the log's chains it kept, its MLS state
-  and every row of its sealed sync deleted, the MLS state's generation
-  moved on; the archive kept without the old `R`. Then the device's group alone
-  at the new agent (`DeviceGroup::create`), its `R` the new split's. The
-  naming secret stays: the scopes keep their ids, at both homes.
-- **Push everything** (`moving::finish`): the archive first; each installed
-  scope read at the new agent, then every node it holds that this device
-  neither read nor pushed there carried (`SealedSync::carry`), in causal
-  order, a node past its author's cutoff left behind (and so is one of
-  an author no device of the set is, past what the set's keys name of
-  it), and read back, so
-  that whatever another device pushed between the carried envelopes is
-  read too; the archive again; then, the move done, the recovery
-  envelopes under the new `R`, which `SealedSync::recovery` pushes no
-  earlier while a move is held. Each carry round's sealed bytes are held
-  in the store before they are sent and sent again as they are, its own
-  nodes leaving the outbox round by round.
-- **Readers at the new home** take a carried author's node as the set's up
-  to the number a device's keys name it to there, whoever pushed it
-  (`SealedSync::catch_up`, `DeviceGroup::carriers`). The keys are the
-  log's: the mover's as its claim put them, a re-paired device's as the
-  commit adding it put them, which its opener's admin key signed and
-  every device verifies; a paired device takes the others' from its
-  pairing device's word, as it takes the device set, and a restore from
-  the agent's, as it takes the device set (§8, D1). No archive names an
-  author, so no device of the set, later removed, plants one through
-  its archive, and the operators plant none. A reader
-  takes a named author's nodes as the set's while the device naming it
-  has a voice, then, once its removal matured, only at positions up to
-  that device's frontier, the first one the agent answered and kept
-  (`s/frontier/`), so a device that named an author of its own making
-  writes through it no later than it could itself (A7). A device
-  of the old set removed at the new home is cut off at its frontier
-  there, never below one past what a device with a voice names of it,
-  and a frontier envelope holding another author's carried node gives no
-  cutoff of its own. A restore elsewhere names the old agent's device set
-  the same way in the keys it claims with, from the nodes it read back
-  before the claim (`group::recovered`, `personal::read_back`): the set
-  as the old agent's operators show it, and the nodes as read back, with
-  no author, frontier or epoch checked (`read_back`, an open finding of
-  its own), so what it names is the old home's word
-  as much as a restore at home takes it.
-- **Re-pair** (`moving::rejoin`): each other device pairs again by QR from
-  a device at the new home whose move is done, its handles in the other
-  spaces kept (the offer names none). It reads the old home to its end
-  first (the app's step), then names what it carries in the keys its
-  hello gives (`moving::naming`, as the mover's claim does), which the
-  commit adding it puts in the new home's log; what it reads at the old
-  home after its hello is past what it named, and stays behind. Its key
-  package is made beside its old group, in
-  the next MLS generation of its store (`DeviceGroup::key_package`, an
-  earlier attempt's dropped), so a pairing cut short before the handover
-  leaves the old group standing. On the handover it gives up its old group
-  and leaves it as the mover did, then joins (`DeviceGroup::rejoin`),
-  refused before anything is left for a pairing of another personal space
-  (its naming secrets none of the store's); its archive's keys are kept
-  beside the pairing's. It starts its scopes from the
-  checkpoints handed over and carries what the new home lacks
-  (`moving::finish` again): what it, and the devices still at the old
-  home, wrote there after the move. A re-pair cut short after the handover
-  leaves the device with no group, its move held: it pairs again from a
-  new slot, with no old group to give up.
-- **A device that missed the move** follows the old home with the devices
-  still there; the moved devices stop being voices there once their
-  confirmation window lapses, as any sleeper does. At its next reading it
-  finds the notice, and the app asks for the re-pairing. What it, or a
-  device paired there meanwhile, writes reaches the new home with the
-  first device to pair again after reading it, and the commit adding
-  that device names the authors.
+**Moving home as built** [built, `node/light/android`'s `move_home`;
+host-tested in its `tests/personal.rs` and `crashes.rs`; amended
+2026-11-17, decision 16: nothing is carried, and `vos_light::moving`,
+`SealedSync::carry`, `NewDevice::carried` and the move's notice are gone;
+where the text above leaves a choice, this is the one taken]:
+- **Valid only while the personal space holds the credential book and the
+  device book alone** (§3.1), which every device writes again from what it
+  holds: a move drops the scopes' history at the old home. A local actor
+  whose rows no device writes again (the wallet's, slice 9) needs the
+  carry back before it is installed in the personal space.
+- **Leave, claim, pair again:** the mover checks that the new home's
+  `Homes` has an agent to give (`pooled`), leaves its personal space with
+  no call to the old home (`Space::leave`, §7.3: the light node's store
+  made anew, its sync and admin keys new), then claims at the new home as
+  a first claim does (§3.8): its open claim there, a new kit split at the
+  new agent, its own group alone. Each other device leaves and pairs
+  again by QR from a device at the new home (its pairing leaves at the
+  offer, §7.3), its handles in the other spaces kept (the offer names
+  none), and writes its book rows again there.
+- **An interrupted move** is called again: killed before its leave, it
+  leaves then; killed after, the device holds no personal space and the
+  move is a claim; once claimed, it is refused as at that home already.
+  A move to the agent the device has is refused the same way.
 - **What the old home keeps:** what it held, for as long as its operators
-  keep it: the control log, each scope's ciphertext to the move, the
-  recovery envelopes under the old `R`, and the old `R2` with the old
-  kit's entries. The moved devices are never removed there (their old
-  MLS state deleted, they read nothing pushed there after). It is let go
-  as the last device leaves it: none re-proves its lease, which lapses 13
-  months after the last re-proof, then refuses pushes and serves reads, a
-  restore and a move for the 180 days' grace (B14); reaping is later
-  work. An old kit kept across the move still restores there, unanswered
-  once no device follows it, and reads the history to the move.
-- **An interrupted move** resumes where it stopped: before the claim's
-  answer, the claim is held and sent again (`Move::pending`); once the
-  new agent assigned it, `Move::claimed` again leaves the old group
-  (again whole, if a crash cut the leave short: the cursors first, then
-  the batch) and starts the new one, or takes the one already made; then
-  `moving::carrying` holds until `moving::finish` pushed everything. A
-  round answered and lost is answered again by id, one envelope each; a
-  round sealed under an epoch since replaced is sealed again, a duplicate
-  node at worst, which readers skip.
-- *Known limits:* each device's sync and admin keys, each scope's id, and
-  a reused kit's index at `Homes` are the same at both homes, so the two
-  homes' operators together link the two agents, as the time and size of
-  the carry do; a carried author's bound grows with each device that
-  leaves the old home, so what an old device never removed there writes
-  before the last leaves is carried; the device set's keys at the new
-  home show the operators the old set's sync keys and how far each wrote
-  in each scope (each scope's id and node count, already theirs at the
-  old home); a device's keys name at most 64 carried authors
-  (`vos_wire::personal::CARRIED`, one an author and a scope), so a space whose old
-  set wrote in more scopes than that allows does not move (`Carried`); an opener whose own move is not done
-  is not refused by the library; the old home's `Homes` keeps the moved
-  devices' nullifiers until its lease lapses; a crash inside the leave is
-  argued, not tested.
+  keep it: the control log, each scope's ciphertext, the recovery
+  envelopes and the old kit's entries. The moved devices are never
+  removed there. Its lease lapses 13 months after its claim, then refuses
+  pushes and serves reads, a restore and a move for the 180 days' grace
+  (B14); reaping is later work. An old kit kept across the move still
+  restores there, and reads the history to the move.
+- *Known limits:* each scope's id and a reused kit's index at `Homes` are
+  the same at both homes, so the two homes' operators together link the
+  two agents (each device's sync and admin keys are new); a device that
+  missed the move reads on at the old home, no notice telling it of the
+  move, until its user pairs it again; the old home's `Homes` keeps the
+  moved devices' nullifiers until its lease lapses.
 
 ### 3.10 What the operators see
 
@@ -3793,8 +3709,8 @@ device's crates faster); Q9's size argument for it is small.
   last sync, remove, veto, resolve, contests, kit rotation, admin-key
   replacement; each behind the admin key's prompt), `restore` (from a
   kit), `move_home` (§3.9), the yearly re-proof (with the leaf renewal on
-  the same prompt), and local notifications for pending device
-  operations. These are the facility's own screens (its Android
+  the same prompt; slice 9, decision 16), and local notifications for
+  pending device operations. These are the facility's own screens (its Android
   library, `team.virto.vos.personal`), their own plan step (8.24), over
   the facility's own Binder interface, `IVosPersonal` (§2.2, plan 8.24b).
 - **Tor in s4's client:** its SSH connection to the gateway goes to the
@@ -3847,34 +3763,28 @@ device's crates faster); Q9's size argument for it is small.
   several kits answers with the newest. "Backup paused" is Tor's bootstrap
   refusal, on the screen and as a notification after a personal pass that
   did not finish.
-- **A regroup's handover** [built, the facility's `src/personal/ops/
-  regroup.rs`; host-tested in its `tests/personal.rs`]: once a
-  regroup matured (`DeviceGroup::regrouper` names its device), every
-  device it keeps hands the regrouper its key package
-  (`DeviceGroup::regroup_package`) as an inbox item for the devices, put
-  from its pass under the sync key with no prompt: the device, the
-  regrouper, the confirmed epoch the new group follows and the package,
-  signed by the device's sync key over `"vos/personal/regroup/handover" ‖
-  agent identity ‖ regrouper ‖ epoch ‖ device ‖ package` (the agent's word
-  on an item's author is the operators', and the epoch keeps an earlier
-  regroup's handover from being put again for a later one). The
-  item is not sealed, where §3.7 seals the devices' items: a key package
-  is public, and the regrouper may not follow the epoch the others seal
-  under. The package is drawn once and put again by each pass until the
-  new group is confirmed, its expiry moved on in the inbox's last quarter.
-  The regrouper's commit ("Commit now") reads the inbox for a verified
-  handover of every device the set still holds (none removed, its own
-  aside) to this regroup, waiting 10 s (the inbox's pages read in key
-  order, no more than the policy's items); with all of them it starts
-  the new group (`DeviceGroup::regroup`) and the kept devices join it by
-  its Welcome at their next pass, the named devices out; otherwise it
-  holds nothing and names the devices missing. A kept device that never
-  hands over is removed first (§3.5's removal; the regroup then leaves it
-  out, as its new group carries every matured removal). A kept device's
-  own commit hands its package over and commits nothing. *Known limit:*
-  a kept device that cannot follow takes no candidate but its own
-  regroup's, so it hands nothing over and the regrouper names it missing:
-  it is named in the regroup (or removed) and re-pairs after.
+- **A regroup** [built, `node/light/android`; host-tested in its
+  `tests/personal.rs`; amended 2026-11-17, decision 16]: `regroup` names
+  every other live device of the set, and once it matured the
+  regrouper's "Commit now" starts the new group of it alone
+  (`DeviceGroup::regroup`); each other device, out and its sync key
+  admitted no more, pairs again from it, leaving the space it held at
+  the pairing's offer (`Space::leave`) and joining with new sync and admin
+  keys.
+- **Leaving** [built, `node/light/android`'s `Space::leave`, 2026-11-17]:
+  a device gives up its personal space with no call to its agent: a light
+  node store made anew under the next generation's directory
+  (`light.<n>`), the local actors installed there, then made the
+  device's by one write of the state file, which keeps the secret source
+  and the label and drops the home, the agent, the admin key's public
+  half and every flow's state; the old directory is deleted after, or at
+  the next open. A move home is a leave and a claim (§3.9); a pairing
+  leaves first when the device holds another personal space, or this
+  one's while the set no longer holds it live (the agent admits its key
+  no more), and is refused while the set holds it live. The light node's
+  store is laid out anew (`LAYOUT` 6, `personal.state` version 3): a phone
+  of an earlier build clears the facility's data and claims or pairs
+  again.
 - **Pairing after the set changed** [built, `node/light/android`]: the
   opener reads the log and settles what fell due before its pairing's
   commit, and a replaced admin key is taken before any admin call, so a
@@ -3971,12 +3881,8 @@ takes only the confirmed epoch; the agent refuses its keys; devices accept
 its envelopes only up to its frontier, and the CRDT types filter its
 writes at read; the light node cuts it off there, so its later operations
 are quarantined wherever they arrive [built]. Nor does it leave a
-writer behind: an archive names no carried author, and an archive read
-takes no key of an epoch past the confirmed one; a carried author is one
-the device set's keys name in the control log (`NewDevice::carried`, the
-claim's, or an add's that an admin signed), read only while the device
-naming it has a voice and, once its removal matured, up to its frontier
-[built]. (8.18a, 8.18b, 8.20)
+writer behind: an archive names no author, and an archive read takes no
+key of an epoch past the confirmed one [built]. (8.18a, 8.18b, 8.20)
 
 **A8. A write made offline leaks to a device removed meanwhile.**
 *Mitigation:* seal at push under the confirmed epoch read just before;
@@ -4065,7 +3971,9 @@ key alone commits nothing. (8.12, 8.19)
 **A24. A device cannot follow the confirmed epoch and has no device to
 re-pair from** (a buggy commit, a lost committer, a lockout). *Mitigation:*
 a regroup signed by its admin key: 72 h and a veto, or at once with two
-seasoned devices or the kit (§3.5). (8.13, 8.23b)
+seasoned devices or the kit (§3.5); it keeps its regrouper alone, and
+the other devices pair again from it (2026-11-17, decision 16). (8.13,
+8.23b)
 
 ### 8.2 The home space and its operators
 
@@ -4149,18 +4057,21 @@ lease lapses 13 months after the last re-proof; the agent then refuses
 pushes for 180 days of grace but serves reads, a restore and a move, so the
 data stays recoverable (E15). Each device's home nullifier is recorded at
 its add, so any device can re-prove even after the claiming one is gone.
-*Known limit:* reaping after the grace is later work. (8.14)
+*Known limit:* reaping after the grace is later work; no device re-proves
+in slice 8 (decision 16; `open.md`). (8.14)
 
 **B15. The user stops using every device** with the kit in a drawer.
 *Mitigation:* the lease needs only one re-proof a year; past it, the grace
-leaves 180 days for a restore. (8.14, 8.23b)
+leaves 180 days for a restore. (8.14, 8.23b) [The re-proof flow: slice 9,
+decision 16; until then every agent lapses 13 months after its claim
+(`open.md`).]
 
 **B16. The home vanishes or turns hostile.** *Mitigation:* move home by
-re-pairing (§3.9); nothing is lost while one device holds the data.
-*Known limit:* the kit opens nothing at the new home until the move's
-last push; the devices' keys and a reused kit link the two agents for
-the two homes' operators together; a successor group and a live handover
-are later work. (8.23c)
+leaving, claiming at the new home and pairing again (§3.9; nothing
+carried, 2026-11-17, decision 16): the books are written again by every
+device. *Known limit:* a scope's history stays at the old home; a reused
+kit links the two agents for the two homes' operators together; a
+successor group and a live handover are later work. (8.23c)
 
 **B17. Personal agents fill the space's disks.** *Mitigation:* a 64 MiB
 default quota; the scale gate measures a full agent's snapshot and a
@@ -4194,17 +4105,23 @@ device's range after the fact is later work; the remedy is removing the
 device. (8.18b)
 
 **C2. The DAG grows without bound, or a user stores media.** *Mitigation:*
-checkpoints let new devices start late; the quota bounds the agent; the
+checkpoints (slice 9) let new devices start late; the quota bounds the agent; the
 push API is blob-ready. *Known limit:* garbage collection and a blob
 store are later work; media fills the quota fast. (8.20, 8.21)
 
 **C3. Two devices checkpoint at once.** *Mitigation:* checkpoints are cut
-at agent positions, so both hold the same state. (8.21)
+at agent positions, so both hold the same state. (8.21; slice 9, decision
+16)
 
 **C4. A wrong checkpoint.** *Mitigation:* a paired device trusts only its
 pairing device's checkpoint, whose hash it got over the pairing channel; a
 restore trusts one acknowledged by two devices other than its author, or
-replays. (8.21)
+replays. (8.21) [Amended 2026-11-17, decision 16: checkpoints move to
+slice 9, so every device replays each scope from its start. *Known
+limit:* a newly paired or restored device can be served a shortened
+scope (its last envelopes withheld) without an alarm: it has read no
+position to hold the operators to, and raises `Partition` only once a
+later envelope's `seen` position crosses the cut (`open.md`).]
 
 **C5. Quotas fill,** perhaps to block the filler's removal. *Mitigation:*
 operations, the commits carrying them, confirmations and `alive` are
@@ -4239,7 +4156,8 @@ until the store is opened again. (8.18b)
 
 **C12. Years of history for a two-device user.** *Mitigation:* the new
 device takes its pairing device's checkpoint, so it never replays from the
-start. (8.21)
+start. (8.21) [Slice 9, 2026-11-17, decision 16: a new device replays
+each scope from its start.]
 
 ### 8.4 Recovery and the device's life
 

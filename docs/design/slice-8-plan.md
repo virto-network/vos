@@ -50,7 +50,7 @@ ingress. Every gate has a limit it can miss.
 |---|---|---|---|
 | **PG1′ owner** | the stock `owner` kernel | ≤ 0.5 s, ≤ 512 MiB | M1 (format 46), M2 (47) |
 | **PG2′ sign-in** | the stock `auth` kernel | ≤ 1.0 s at format 46; at format 47 **the gate 0.65 s, the target 0.55 s** (a miss holds M2, the 4-way CPU split the next lever); ≤ 1 GiB; the proof ≤ 1.5 MiB | M1, M2, slice end |
-| **PG3′ flows** | enroll, sign-in and pay (P1); claim at a home-only test space with a phrase kit and with a security-key kit; pair a second device (enrolled in every other space at once, its open claim in the background); sync both ways; retire a phone; a removal let through, one contested and resolved by the kit, and the kit alone removing a phone that holds only a sync key; a restore cancelled by liveness, then one completed on a fresh install; a regroup; move home (two homes); the yearly re-proof with its leaf renewal; every secret behind its prompt; on test homes with delays and the lease in minutes and a low claim difficulty; recorded | each completes; over Tor at the median: a sign-in ≤ 4 s, a P1 payment ≤ 5 s, pairing ≤ 60 s from the scan to the second device's first read, arti and its SSH connections warm | M1 (P1, clearnet), M4 (the personal space, clearnet), M5 (over Tor), slice end |
+| **PG3′ flows** | enroll, sign-in and pay (P1); claim at a home-only test space with a phrase kit and with a security-key kit; pair a second device (enrolled in every other space at once); sync both ways; retire a phone; a removal let through, one contested and resolved by the kit, and the kit alone removing a phone that holds only a sync key; a restore cancelled by liveness, then one completed on a fresh install; a regroup keeping its regrouper alone, another device pairing again; move home (two homes: leave, claim, pair again); every secret behind its prompt; on test homes with delays and the lease in minutes and a low claim difficulty; recorded | each completes; over Tor at the median: a sign-in ≤ 4 s, a P1 payment ≤ 5 s, pairing ≤ 60 s from the scan to the second device's first read, arti and its SSH connections warm | M1 (P1, clearnet), M4 (the personal space, clearnet), M5 (over Tor), slice end |
 | **PG5 footprint** | the light node with arti, `vos-mls` and mls-rs | `.so` growth from `vos-mls` and mls-rs ≤ 2 MB (a miss: trim mls-rs's features, then the owner decides); from arti ≤ 10 MB, provisional until 8.1; idle ≤ 96 MiB; warm bootstrap ≤ 3 s p50; a day of background jobs ≤ 2% of the battery; ≤ 30 rendezvous an hour in the foreground after 8.27 | M0 (first numbers), slice end |
 | **PG6 sync** | the background job; a 1 MiB catch-up; a commit | on a locked phone after first unlock: the job ≤ 30 s and ≤ 1 MB down with nothing new, p50; the 1 MiB catch-up over Tor ≤ 20 s p50; a candidate processed on its copy ≤ 200 ms. **Recorded, as inputs to the windows:** the job in the "rare" bucket, after 3 days offline, after a force-stop, and the latency from a pending operation to its local notification | M4 (clearnet), M5 and slice end (Tor) |
 
@@ -433,6 +433,12 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   built"): `node/light/tests/sealed/detection.rs`, a test a scenario,
   with the own-push audit (B2) and the checkpoints a paired device and a
   restore's device start from; the sync key is the light node's author.
+- **Cut** (2026-11-17, owner's decision 16): the checkpoints move to
+  slice 9 (`personal::checkpoint`, `Alarm::Checkpoint`,
+  `Pairing::trust` deleted; `Personal`'s `acknowledge` kept, unused).
+  A paired or restored device reads each scope from its start, and can be
+  served a shortened scope without an alarm (`open.md`,
+  `node/light/SECURITY.md`).
 
 ### 8.22 The background job — F
 - WorkManager on the after-first-unlock keys; `alive` when a restore is
@@ -442,7 +448,7 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   **Dep:** 8.6, 8.20. **Estimate:** 1–1.5 weeks.
 - **Host result** (2026-11-08, `light-node.md` §3.6, "The background job
   as built"): `vos_light::job`, the pass over a `Control` link, its notices
-  and `DeviceView::seen`; a pass with nothing new 7 requests and 376 bytes
+  and `DeviceView::seen`; a pass with nothing new 7 requests and 376 bytes (6 and 372 once the checkpoints went, 2026-11-17)
   of answers; a pass killed before or after each request converging at
   the next. s4: WorkManager in `:vos`, the runs kept, the notices as local
   notifications, the exemption's prompt; a quiet run 5.2 KB down at a
@@ -464,6 +470,13 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   is sealed to (`pooled`, `Taken`), a kit's seal binding the agent's
   identity; the flows driven in `node/light/tests/sealed/pairing.rs` and
   end to end on three nodes in `node/host/tests/served/personal.rs`.
+- **Cut** (2026-11-17, owner's decision 16): the joiner's open claim
+  (E28) and the yearly re-proof with its prompt move to slice 9
+  (`home::renew_call`, `home::renewal_due`, `Notice::Renew`, the
+  facility's `renew` and its claim delay deleted; `Homes.renew`,
+  `Personal.renew`, the lease and the grace kept). Every agent lapses 13
+  months after its claim until slice 9 ships both or a home sets a longer
+  lease (`open.md`).
 
 ### 8.23b Kits, restore and contests — D
 - Kit creation and rotation (phrase, security key); restore here and
@@ -476,6 +489,11 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   replaced admin key's leaf renewed (`vos_mls::Mls::renew`); the gate's
   flows driven through `Personal` in the light tests' home. Pushing a
   restore-elsewhere's old scopes to the new home is 8.23c's.
+- **Cut** (2026-11-17, owner's decision 16): restore elsewhere moves to
+  slice 9 (restore at the home, then move); a regroup keeps its regrouper
+  alone, the other devices pairing again, and the key packages kept
+  devices handed over go (`DeviceGroup::regroup_package`, the facility's
+  `ops/regroup.rs`, `MAX_REGROUP`).
 
 ### 8.23c Moving home — B
 - Claim elsewhere, a new group, the kit re-split, push everything,
@@ -491,6 +509,13 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   Driven in `node/light/tests/sealed/moving.rs` and end to end on two
   homes on three nodes (each its own agent, credential actor and handle,
   in one space) in `node/host/tests/served/moving.rs`.
+- **Cut** (2026-11-17, owner's decision 16; `light-node.md` §3.9 amended):
+  moving home is leave, claim at the new home, pair again; nothing is
+  carried. `vos_light::moving`, `SealedSync::carry`, `NewDevice::carried`
+  (`CarriedAuthor`, `CARRIED`), `Waiting::Moving`, `DeviceGroup::rejoin`
+  and both moving suites deleted; the facility's `Space::leave` makes the
+  light node's store anew (`LAYOUT` 6, `personal.state` version 3).
+  Valid only while the personal space holds the two books.
 
 ### 8.24b The `:vos` process and its Binder interface — F
 - The facility in `android:process=":vos"` [E21]; Binder interfaces
@@ -508,7 +533,7 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
 - Kotlin screens over 8.24b's interface: the claim and its kits, pairing
   (show and scan a QR), devices (last sync, remove, veto, resolve,
   contests, rotation, admin key, regroup), retire a phone, restore, move
-  home, the yearly re-proof, local notifications, "backup paused" on a
+  home, the yearly re-proof (slice 9, decision 16), local notifications, "backup paused" on a
   network that blocks Tor; the prompts (strong biometric for the admin
   key).
 - **Gate:** each screen drives its flow on the phone. **Dep:** 8.24b,
@@ -527,7 +552,8 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   ZXing's core (a home's code and a pairing's, prefix and hex); the
   facility's forms in the app's own dialog. The gateway demo takes the
   node's answer and pins the gateway's onion. The joiner's open claim is
-  the background job's after a drawn delay (E28), and an admin key is
+  the background job's after a drawn delay (E28; cut 2026-11-17, decision
+  16), and an admin key is
   replaced by the kit or another seasoned device (E29). Host-tested logic
   only: the gate is the phone session.
 - **Fixes before the phone session** (2026-11-10, `light-node.md` §7.3):
@@ -535,7 +561,8 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   regroup (the opener reads the log before its commit; a replaced admin
   key settled before an admin call); a regroup keeping other devices
   takes their key packages, handed over through the inbox under their
-  sync keys, and refuses after a bounded wait naming any device missing.
+  sync keys, and refuses after a bounded wait naming any device missing
+  (cut 2026-11-17, decision 16: a regroup keeps its regrouper alone).
 - **The facility moved into VOS** (2026-11-12, owner's call; `light-node.md`
   §2.2): the facility's crate, its tests and test world, its release
   artifacts and their recipe are `node/light/android` (`vos-facility`,

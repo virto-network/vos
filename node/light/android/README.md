@@ -102,8 +102,9 @@ the claim at a home-only space with a phrase or a security-key kit; pairing,
 as the device that shows the code and as the one that scans it; the
 memberships a pairing leaves (an enrollment owed, a confirmation); the
 device set (remove, veto, cosign, resolve, rotate the kit, replace the admin
-key, regroup, a commit now); the yearly re-proof; a restore from the kit; a
-move home. Each admin call is signed by the admin key, an Ed25519 key in the
+key, a regroup keeping this device alone, a commit now); a restore from the
+kit; a move home (leave, claim at the new home; the other devices pair again
+from it, leaving the space they held). Each admin call is signed by the admin key, an Ed25519 key in the
 UI's Keystore behind a strong biometric (`IVosPrompts.signKey`). The light
 node's artifacts (`release/agent.program`, `release/*-book.package`) are
 embedded, `just facility-release` writes them with the stock kernels', and
@@ -116,8 +117,10 @@ the personal space named in need of repair, sign-in and payments unaffected.
 Each flow keeps its keys the moment it makes them, and the home and agent it
 goes to before the call that makes it so: `:vos` killed at any step leaves a
 flow that the same call resumes (a claim, a restore, a move: no new kit, no
-second agent) or the background job finishes (a pairing's acknowledgement, a
-move's carry, the credential book's records). `tests/crashes.rs` kills it at
+second agent) or the background job finishes (a pairing's acknowledgement,
+the credential book's records). Leaving a personal space (a move, a pairing
+from another one) makes the light node's store anew under `light.<n>`, made
+the device's by one write of `personal.state`, the old store deleted after. `tests/crashes.rs` kills it at
 each request of each flow. A device paired in enrolls in each offered space
 with the key its handle there came from.
 
