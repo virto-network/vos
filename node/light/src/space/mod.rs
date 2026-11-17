@@ -24,7 +24,7 @@
 //!   device that holds another personal space, or a removed one, leaving it
 //!   first); the memberships a pairing leaves; the device set's
 //!   operations; a restore from the kit; a move home.
-//! - **Leaving** ([`Personal::leave`]): a device gives up the personal space
+//! - **Leaving** (`Personal::leave`): a device gives up the personal space
 //!   it holds with no call to its agent: its light node's store made anew,
 //!   as at a fresh install. A move home is a leave and a claim at the new
 //!   home, a device paired again after a move or a regroup a leave and a
@@ -81,7 +81,7 @@ pub use status::{Phase, Status};
 
 /// The light node's store, under the personal space's directory: the
 /// directory of the first store, and the prefix of each later one's, which
-/// a leave makes anew ([`light_dir`]); the device's is the newest whose
+/// a leave makes anew (`light_dir`); the device's is the newest whose
 /// first batch made it so.
 pub const LIGHT: &str = "light";
 pub use vos_wire::personal::PERSONAL;
@@ -92,7 +92,7 @@ pub const DEVICE_BOOK: InstanceId = InstanceId(2);
 /// The light node's artifacts: the default agent's program, and the local
 /// actors' packages. The local actors are the credential book and the
 /// device book, which each device writes again from what it holds: so a
-/// leave, a move home among them, carries nothing ([`Personal::leave`]). A
+/// leave, a move home among them, carries nothing (`Personal::leave`). A
 /// local actor holding what no device writes again needs the move to carry
 /// its scope first.
 #[derive(Clone)]
@@ -412,7 +412,7 @@ struct Held {
     sync: Signer,
     admin: Signer,
     pairing: Option<pairing::Pairing>,
-    /// The store's generation: its directory ([`light_dir`]).
+    /// The store's generation: its directory (`light_dir`).
     generation: u32,
 }
 
@@ -467,7 +467,7 @@ pub struct Personal<H: Host> {
     /// them while a flow holds the rest.
     owed: (Mutex<crate::Store>, Mutex<Option<Vec<u8>>>),
     /// The personal space's directory, and the artifacts a store made anew
-    /// installs ([`Personal::leave`]).
+    /// installs (`Personal::leave`).
     directory: PathBuf,
     artifacts: Artifacts,
 }

@@ -302,7 +302,7 @@ impl<H: Host> Personal<H> {
 
     /// The personal space moved to another home, carrying nothing: once
     /// that home answers with an agent to give, this device leaves the
-    /// space it holds, with no call to its old home ([`Personal::leave`]),
+    /// space it holds, with no call to its old home (`Personal::leave`),
     /// and claims an agent there with a new kit, as a first claim does; the
     /// other devices leave and pair again from this one. Called again after
     /// a claim cut short, it finishes that claim.
