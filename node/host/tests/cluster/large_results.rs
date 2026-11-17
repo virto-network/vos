@@ -106,7 +106,7 @@ fn results(
 ) -> Vec<(u64, Option<BlobRef>)> {
     indices
         .filter_map(|index| {
-            let entry = node.store().log_entry(agent, index).unwrap()?;
+            let entry = node.probes().store().log_entry(agent, index).unwrap()?;
             match entry.kind {
                 EntryKind::Result => Some((index, None)),
                 EntryKind::LargeResult => {
@@ -146,7 +146,10 @@ fn a_large_result_travels_as_a_blob_and_applies_on_every_replica() {
         let node = cluster.node(number);
         for (index, blob) in indices.iter().zip(&blobs) {
             assert_eq!(blob_at(node, agent, *index), *blob, "node {number}");
-            assert!(node.stores_blob(&blob.hash), "node {number} holds it");
+            assert!(
+                node.probes().stores_blob(&blob.hash),
+                "node {number} holds it"
+            );
         }
     }
     // A small result stays inline, at the leader now: under load a
@@ -174,11 +177,11 @@ fn a_lagging_follower_catches_up_through_a_large_result() {
     let lagging = cluster.node(follower);
     assert!(lagging.applied(agent).unwrap() < indices[0]);
     let blob = blob_at(cluster.node(leader), agent, indices[1]);
-    assert!(!lagging.stores_blob(&blob.hash));
+    assert!(!lagging.probes().stores_blob(&blob.hash));
     cluster.hub.heal();
     cluster.converged(agent);
     assert_eq!(blob_at(lagging, agent, indices[1]), blob);
-    assert!(lagging.stores_blob(&blob.hash), "fetched");
+    assert!(lagging.probes().stores_blob(&blob.hash), "fetched");
 }
 
 /// A large result's blob stays while the log holds its entry, past its
@@ -205,7 +208,9 @@ fn a_large_results_blob_goes_once_the_log_is_compacted_past_it() {
     std::thread::sleep(Duration::from_secs(2));
     for (number, node) in cluster.running() {
         assert!(
-            blobs.iter().all(|blob| node.stores_blob(&blob.hash)),
+            blobs
+                .iter()
+                .all(|blob| node.probes().stores_blob(&blob.hash)),
             "node {number} keeps them while its log names them"
         );
     }
@@ -218,9 +223,11 @@ fn a_large_results_blob_goes_once_the_log_is_compacted_past_it() {
     }
     cluster.compacted_past(agent, last);
     wait_until("every replica collects the blobs", || {
-        cluster
-            .running()
-            .all(|(_, node)| blobs.iter().all(|blob| !node.stores_blob(&blob.hash)))
+        cluster.running().all(|(_, node)| {
+            blobs
+                .iter()
+                .all(|blob| !node.probes().stores_blob(&blob.hash))
+        })
     });
 }
 
@@ -298,7 +305,8 @@ fn serving_cluster() -> (Cluster, Vec<Arc<Serving>>) {
 
 /// Each large result `node` holds of `agent` past `after`, by index.
 fn large_blobs(node: &Node, agent: AgentId, after: u64) -> Vec<(u64, BlobRef)> {
-    node.store()
+    node.probes()
+        .store()
         .raft(agent)
         .unwrap()
         .log
@@ -403,14 +411,14 @@ fn a_follower_turns_from_a_leader_lacking_a_blob_to_a_member_holding_it() {
     serving(follower).withhold(&[1, 2, 3]);
     cluster.hub.heal();
     wait_until("the follower fetches the blob", || {
-        cluster.node(follower).stores_blob(&blob.hash)
+        cluster.node(follower).probes().stores_blob(&blob.hash)
     });
     assert!(
         serving(next).asked_by(follower).contains_key(&blob.hash),
         "the follower asked its leader first"
     );
     assert!(
-        !cluster.node(next).stores_blob(&blob.hash),
+        !cluster.node(next).probes().stores_blob(&blob.hash),
         "the leader still lacks it"
     );
     serving(old).withhold(&[]);
@@ -515,7 +523,7 @@ fn a_replica_that_lost_a_committed_entrys_blob_halts_and_fetches_it_again() {
     cluster.start(follower);
     cluster.converged(agent);
     let restarted = cluster.node(follower);
-    assert!(restarted.stores_blob(&blob.hash), "fetched again");
+    assert!(restarted.probes().stores_blob(&blob.hash), "fetched again");
     assert_eq!(large_blobs(restarted, agent, index - 1)[0], (index, blob));
 }
 
@@ -557,6 +565,7 @@ fn a_committed_entry_whose_blob_a_replica_lost_stays_committed() {
     assert!(holds(follower), "the follower kept the entry");
     let committed = cluster
         .node(follower)
+        .probes()
         .store()
         .raft(agent)
         .unwrap()
@@ -567,7 +576,7 @@ fn a_committed_entry_whose_blob_a_replica_lost_stays_committed() {
         let node = cluster.node(number);
         assert!(!node.leads(agent), "node {number} leads");
         assert!(
-            !node.stores_blob(&blob.hash),
+            !node.probes().stores_blob(&blob.hash),
             "node {number} lacks the blob"
         );
         assert!(node.applied(agent).unwrap() < index);

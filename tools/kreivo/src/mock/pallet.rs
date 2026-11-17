@@ -213,7 +213,7 @@ impl Chain {
             &controller,
             founder_key,
             founder_sig,
-            crate::verify,
+            vos_venue::verify,
         )
         .map_err(refused)?;
         let start_window =

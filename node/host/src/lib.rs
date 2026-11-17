@@ -63,7 +63,17 @@ pub fn identity(record: &CreationRecord) -> [u8; 32] {
     vos_pvm::precompile::blake2b_256(&record.encode())
 }
 
-pub(crate) use vos_http::server::timeout;
+/// `work`'s output, unless `limit` passes first.
+pub(crate) async fn timeout<T>(
+    limit: std::time::Duration,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    smol::future::or(async { Some(work.await) }, async {
+        smol::Timer::after(limit).await;
+        None
+    })
+    .await
+}
 
 /// `mutex`, locked. A lock a panic poisoned panics here too.
 #[track_caller]

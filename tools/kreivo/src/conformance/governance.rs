@@ -6,12 +6,12 @@ use vos_anchor::{SpaceGenesis, WindowClock};
 
 use super::world::*;
 use super::{Fixtures, Vector};
-use crate::kreivo::mock::keys;
-use crate::kreivo::mock::types::{
+use crate::mock::keys;
+use crate::mock::types::{
     Active, BALANCES_INDEX, BalancesCall, Call, Error, Event, Handler, MultiAddress, ProgramInfo,
     RuntimeCall, SpaceStatus,
 };
-use crate::kreivo::mock::{Account, Origin};
+use crate::mock::{Account, Origin};
 
 pub(super) fn g1(fx: &Fixtures) -> Vector {
     let mut w = World::new(fx, false);

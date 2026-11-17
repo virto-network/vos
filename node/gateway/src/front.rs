@@ -8,58 +8,22 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 use vos_api::{ENVELOPE, Mark, Operated};
 use vos_http::routes::{self, Authorization, Routed};
-use vos_http::{Handler, Head, Limits as HttpLimits, Serve, Spawned};
+use vos_http::{Handler, Head, Limits as HttpLimits, Serve};
 use vos_wire::Encode;
 use vos_wire::abi::cap;
 use vos_wire::ingress::{OperatorRefusal, Rejection, Response};
 
-use crate::caps::Caps;
 use crate::limits::Limits;
 use crate::routing::Gateway;
 
-/// A TCP listener on tokio, its streams as futures-io's.
-pub struct TokioListener(pub tokio::net::TcpListener);
-
-impl vos_http::Listener for TokioListener {
-    type Stream = Compat<tokio::net::TcpStream>;
-
-    async fn accept(&mut self) -> std::io::Result<(Self::Stream, SocketAddr)> {
-        let (stream, peer) = self.0.accept().await?;
-        let _ = stream.set_nodelay(true);
-        Ok((stream.compat(), peer))
-    }
-}
-
-/// A connection's task on tokio, ended when cancelled.
-struct Task(tokio::task::JoinHandle<()>);
-
-impl Spawned for Task {
-    fn is_finished(&self) -> bool {
-        self.0.is_finished()
-    }
-
-    fn cancel(self: Box<Self>) -> vos_http::BoxFuture<()> {
-        self.0.abort();
-        Box::pin(async move {
-            let _ = self.0.await;
-        })
-    }
-}
-
-/// How the gateway serves HTTP.
+/// How the gateway serves HTTP, on the clearnet: what it relays is marked
+/// [`Mark::Clearnet`], and its clients' addresses bound it.
 pub struct Http {
     pub tls: Option<Arc<rustls::ServerConfig>>,
     /// The most connections at once, from every address.
     pub connections: usize,
-    /// The transport its listener is, which every request it relays is
-    /// marked with: [`Mark::Clearnet`] for a TCP port, [`Mark::Onion`] for
-    /// the onion service's.
-    pub mark: Mark,
-    /// Its caps on calls and proven calls.
-    pub caps: Arc<Caps>,
 }
 
 /// Serve HTTP on `listener` in front of `gateway` until `stop` resolves.
@@ -73,24 +37,11 @@ pub async fn serve(
     http: Http,
     stop: impl Future<Output = ()>,
 ) {
-    serve_on(gateway, limits, TokioListener(listener), http, stop).await;
-}
-
-/// [`serve`] on any listener: the onion's streams among them, each from
-/// its circuit's address.
-pub async fn serve_on(
-    gateway: Arc<Gateway>,
-    limits: Arc<Limits>,
-    listener: impl vos_http::Listener + 'static,
-    http: Http,
-    stop: impl Future<Output = ()>,
-) {
-    let (mark, caps) = (http.mark, http.caps);
     let handler: Handler = {
         let gateway = Arc::clone(&gateway);
         Arc::new(move |request| {
-            let (gateway, caps) = (Arc::clone(&gateway), Arc::clone(&caps));
-            Box::pin(async move { handle(&gateway, mark, &caps, request).await })
+            let gateway = Arc::clone(&gateway);
+            Box::pin(async move { handle(&gateway, request).await })
         })
     };
     let head: Head = {
@@ -109,7 +60,6 @@ pub async fn serve_on(
             large: vos_http::LARGE,
             credentialed_large: vos_http::CREDENTIALED_LARGE,
         },
-        spawn: Arc::new(|connection| Box::new(Task(tokio::spawn(connection)))),
         admit: Some(Arc::new(move |peer: SocketAddr| {
             limits
                 .connect(peer.ip())
@@ -162,14 +112,8 @@ fn unauthorized() -> vos_http::Response {
 }
 
 /// A request's answer: its route's, through a node where it needs one,
-/// marked `mark`, the transport it came in on, a call or a proven call past
-/// `caps` answered `Busy`.
-pub async fn handle(
-    gateway: &Gateway,
-    mark: Mark,
-    caps: &Arc<Caps>,
-    request: vos_http::Request,
-) -> vos_http::Response {
+/// marked clearnet.
+pub async fn handle(gateway: &Gateway, request: vos_http::Request) -> vos_http::Response {
     let (kind, body) = match routes::route(&request) {
         Routed::Answer(answer) => return answer,
         Routed::Request { kind, body } => (kind, body),
@@ -186,9 +130,6 @@ pub async fn handle(
         },
         Routed::Operator { .. } => return unauthorized(),
     };
-    let Ok(_held) = caps.admit(kind, &body, request.peer) else {
-        return routes::respond(&Response::Busy);
-    };
-    let (answered, bytes) = gateway.relay(kind, mark, &body).await;
+    let (answered, bytes) = gateway.relay(kind, Mark::Clearnet, &body).await;
     routes::answer(answered, &bytes)
 }

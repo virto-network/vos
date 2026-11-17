@@ -58,16 +58,18 @@ origin rather than who the member is.
     light node: local actors over its own store, and the device library,
     a member's proven calls), `api` (the binary API),
     `net` (node-to-node channels), `prover` (the leader's prover worker),
-    `venue` (anchoring and submitting statements), `jam` (an agent as a
-    JAM service), `cli` (the `vos` command).
+    `venue` (anchoring and submitting statements), `cli` (the `vos`
+    command).
   - `http` and `gateway`: the HTTP front and the gateway, which hold no
     authority.
   - `checker`: the exactly-once checker and the shared test harness.
 - `support/`: `vos-raft` (a `no_std` Raft core with a deterministic
   simulator) and `merkle-crdt`.
-- `tools/`: development tooling no node links: `jam-dev` (a PolkaJam
-  testnet's driver), `scale` (the scale test's harness) and `phone` (the
-  phone bench).
+- `tools/`: tooling no node links: `jam` (an agent as a JAM service, from
+  its builder's side), `jam-dev` (a PolkaJam testnet's driver), `kreivo`
+  (a client of Kreivo's spaces pallet, its mock and the conformance
+  vectors), `scale` (the scale test's harness), `phone` (the phone bench)
+  and `keeper` (an operator's tool topping up a home's pool).
 
 ## Build and test
 

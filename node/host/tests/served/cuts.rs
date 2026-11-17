@@ -201,7 +201,8 @@ impl Cuts {
                 .filter_map(|number| cluster.node(number))
                 .any(|node| {
                     agents.iter().any(|(agent, _)| {
-                        node.store()
+                        node.probes()
+                            .store()
                             .snapshot()
                             .scan(*agent, &keys::undo_prefix(), None)
                             .next()
@@ -213,7 +214,7 @@ impl Cuts {
             }
             let representative = *self.representative.lock().unwrap();
             for node in (1..=NODES).filter_map(|number| cluster.node(number)) {
-                let snapshot = node.store().snapshot();
+                let snapshot = node.probes().store().snapshot();
                 let Some(representative) = representative else {
                     break;
                 };
@@ -286,7 +287,7 @@ impl Alongside for Cuts {
             .iter()
             .filter(|(at, _)| *at == agent)
             .count() as u64;
-        let snapshot = node.store().snapshot();
+        let snapshot = node.probes().store().snapshot();
         recorded + u64::from(noted(&snapshot, agent, recorded).is_some())
     }
 
@@ -323,7 +324,7 @@ impl Cuts {
     fn check_anchors(&self, cluster: &Cluster, representative: AgentId) {
         let space = cluster.space.id();
         let node = cluster.node(1).unwrap();
-        let latest = roots::latest_built(&node.store().snapshot(), representative)
+        let latest = roots::latest_built(&node.probes().store().snapshot(), representative)
             .unwrap()
             .expect("a cut built");
         wait_until("the representative's latest cut anchored", ANSWERED, || {
@@ -372,7 +373,10 @@ fn check_agent(cluster: &Cluster, agent: AgentId) {
         .collect();
     let mut snapshots = Vec::new();
     wait_until("every replica builds its every cut", ANSWERED, || {
-        snapshots = nodes.iter().map(|node| node.store().snapshot()).collect();
+        snapshots = nodes
+            .iter()
+            .map(|node| node.probes().store().snapshot())
+            .collect();
         let applied: Vec<_> = snapshots
             .iter()
             .map(|snapshot| snapshot.applied(agent).unwrap())
@@ -447,7 +451,7 @@ fn check_agent(cluster: &Cluster, agent: AgentId) {
 /// same on every replica: the two latest cuts it keeps the root of.
 fn closes(cluster: &Cluster, representative: AgentId) -> usize {
     let snapshots: Vec<Snapshot> = (1..=NODES)
-        .map(|number| cluster.node(number).unwrap().store().snapshot())
+        .map(|number| cluster.node(number).unwrap().probes().store().snapshot())
         .collect();
     let windows: Vec<u64> = cuts(&snapshots[0], representative)
         .into_keys()
@@ -484,7 +488,7 @@ fn check_reads(cluster: &Cluster, agent: AgentId, reads: &[u64]) -> usize {
     wait_until("every read ends on every replica", ANSWERED, || {
         outcomes.clear();
         nodes.iter().all(|node| {
-            let snapshot = node.store().snapshot();
+            let snapshot = node.probes().store().snapshot();
             reads.iter().all(|tag| match noted(&snapshot, agent, *tag) {
                 Some(code) => {
                     outcomes.insert(*tag, code);

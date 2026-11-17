@@ -96,8 +96,6 @@ pub fn measure(inventory: &Inventory, run: &Run) -> Result<Cost, String> {
         Http {
             tls: None,
             connections: 4,
-            mark: vos_api::Mark::Clearnet,
-            caps: vos_gateway::caps::Caps::none(),
         },
         async {
             let _ = stopped.await;

@@ -13,6 +13,8 @@ mod config;
 mod directory;
 mod error;
 mod open;
+#[cfg(any(test, feature = "dump"))]
+mod probes;
 mod queue;
 mod recording;
 
@@ -184,7 +186,6 @@ pub(crate) struct Inner {
 pub(crate) struct Counters {
     pub(crate) sent_across: AtomicU64,
     pub(crate) installed: AtomicU64,
-    pub(crate) streamed: AtomicU64,
     pub(crate) relayed: AtomicU64,
     /// By class; none of liveness, which the pair heartbeat takes.
     pub(crate) arrived: [AtomicU64; vos_net::Class::ALL.len()],

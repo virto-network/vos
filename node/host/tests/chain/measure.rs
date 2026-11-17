@@ -6,9 +6,9 @@
 use std::time::Duration;
 
 use parity_scale_codec::Decode;
+use vos_kreivo::calls::{Call, RuntimeCall};
+use vos_kreivo::mock::Origin;
 use vos_statement_service::state::Outcome as Judged;
-use vos_venue::kreivo::calls::{Call, RuntimeCall};
-use vos_venue::kreivo::mock::Origin;
 
 use crate::kreivo::{self, UNITS};
 use crate::run::{Run, Stated, Venue, accepted};

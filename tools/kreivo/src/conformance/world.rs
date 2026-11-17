@@ -16,12 +16,12 @@ use vos_anchor::{RootKind, SpaceGenesis, WindowClock};
 use vos_statement::{RootRead, SpaceId, Statement};
 
 use super::{Fixtures, Pre, Step, Vector, parts, pre, step};
-use crate::kreivo::mock::keys;
-use crate::kreivo::mock::types::{
+use crate::mock::keys;
+use crate::mock::types::{
     AccountId, Active, AnchorArg, AuthorityInfo, Call, DispatchError, Error, Event, Handler,
     ProgramInfo, RuntimeCall, Space, SpaceInfo, SpaceStatus,
 };
-use crate::kreivo::mock::{Account, Chain, Constants, Origin, Outcome, Verdict};
+use crate::mock::{Account, Chain, Constants, Origin, Outcome, Verdict};
 
 pub(super) const UNITS: u128 = 1_000_000_000_000;
 /// The fixtures' time: window 42's boundary of `F`'s clock.

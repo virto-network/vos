@@ -445,7 +445,7 @@ impl VenueState for StorageVenue<'_> {
     }
 
     fn verify(&self, key: &[u8; 32], digest: &[u8; 32], signature: &[u8; 64]) -> bool {
-        crate::verify(key, digest, signature)
+        vos_venue::verify(key, digest, signature)
     }
 }
 

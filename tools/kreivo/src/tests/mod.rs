@@ -28,8 +28,8 @@ use super::mock::{Account, Chain, Constants, Origin, Verdict};
 use super::send::{judged, outcome_of};
 use super::transport::{Included, Lost, SendError, Sent, Signed, Transport};
 use super::{Alert, KreivoVenue, Options, Sender};
-use crate::{AnchorOutcome, Held, Status, SubmitOutcome, UNJUDGED, VenueClient};
 use vos_statement::Refusal;
+use vos_venue::{AnchorOutcome, Held, Status, SubmitOutcome, UNJUDGED, VenueClient};
 
 const UNITS: u128 = 1_000_000_000_000;
 const VENUE: VenueId = VenueId([0x7e; 32]);

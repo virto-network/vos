@@ -46,9 +46,10 @@ use json::{
     Vector, delta, hex_parts, masked_spend, sign,
 };
 
-/// The vectors' directory, `node/venue/conformance`.
+/// The vectors' directory, `node/venue/conformance`, where the verifier
+/// kit reads them.
 fn directory() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("conformance")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../node/venue/conformance")
 }
 
 /// The vectors' file.

@@ -59,17 +59,12 @@ pub struct Config {
     /// §3.3), or the gateway does not start.
     pub space: Option<PathBuf>,
     /// Where the SSH port listens, for s4's screens and the `vos-api`
-    /// subsystem: none by default.
+    /// subsystem: none by default. A gateway built without the `ssh`
+    /// feature refuses a file that names one.
     pub ssh: Option<SocketAddr>,
     /// The SSH host key, made if missing.
     pub ssh_host_key: Option<PathBuf>,
-    /// The s4 app's client key's seed file, made if missing: an ordinary
-    /// client key, apart from the gateway's.
-    pub app_key: Option<PathBuf>,
-    /// The demo's agent and its actors, whose screens the SSH port serves.
-    #[cfg(feature = "ssh")]
-    pub demo: Option<crate::demo::Demo>,
-    /// The onion service: the same HTTP and, with an SSH port, SSH, and
+    /// The onion service: the SSH port's screens and subsystem, and
     /// nothing else.
     pub onion: Option<Onion>,
 }
@@ -105,8 +100,8 @@ pub struct Onion {
     pub circuit_streams: Option<usize>,
     /// Circuits held at once.
     pub circuits: Option<usize>,
-    /// HTTP connections and SSH channels at once from one circuit, and its
-    /// requests a second with a burst.
+    /// SSH channels at once from one circuit, and its requests a second
+    /// with a burst.
     pub circuit_connections: Option<usize>,
     pub circuit_rate: Option<u32>,
     pub circuit_burst: Option<u32>,
@@ -187,10 +182,21 @@ impl Config {
             .collect()
     }
 
-    /// Refused: a space file naming a node the gateway does not list, and
-    /// an onion whose circuits hold no stream, more streams than a
-    /// circuit's address has ports, or no circuit.
+    /// Refused: an SSH port or an onion the build cannot serve (without
+    /// the `ssh` or the `tor` feature), an onion with no SSH port to serve,
+    /// a space file naming a node the
+    /// gateway does not list, and an onion whose circuits hold no stream,
+    /// more streams than a circuit's address has ports, or no circuit.
     pub fn check(&self) -> Result<(), String> {
+        if self.ssh.is_some() && !cfg!(feature = "ssh") {
+            return Err("ssh: an SSH port needs a gateway built with the ssh feature".into());
+        }
+        if self.onion.is_some() && !cfg!(feature = "tor") {
+            return Err("[onion]: an onion needs a gateway built with the tor feature".into());
+        }
+        if self.onion.is_some() && self.ssh.is_none() {
+            return Err("[onion]: an onion serves SSH alone: name an SSH port".into());
+        }
         if let Some(onion) = &self.onion {
             let per = onion.per_circuit();
             if !(1..=usize::from(u16::MAX)).contains(&per.streams) {
@@ -367,7 +373,7 @@ mod tests {
         assert!(space_keys("1 ab 10.0.0.1:1 c\n").is_err());
         let onion = |text: &str| -> Config {
             toml::from_str(&format!(
-                "key = \"k\"\nhttp = \"127.0.0.1:80\"\nnodes = []\n[onion]\n{text}"
+                "key = \"k\"\nhttp = \"127.0.0.1:80\"\nssh = \"127.0.0.1:22\"\nnodes = []\n[onion]\n{text}"
             ))
             .unwrap()
         };
@@ -378,11 +384,34 @@ mod tests {
         ] {
             assert!(onion(&format!("{refused}\n")).check().is_err(), "{refused}");
         }
-        assert!(onion("circuit_streams = 65535\n").check().is_ok());
+        assert_eq!(
+            onion("circuit_streams = 65535\n").check().is_ok(),
+            cfg!(feature = "tor")
+        );
         let served = onion("circuit_rate = 5\n").onion.unwrap();
         assert_eq!(served.limits().rate, 5);
         assert_eq!(served.limits().connections, PER_CIRCUIT.connections);
         assert_eq!(served.caps(), PerPort::default());
+    }
+
+    #[test]
+    fn a_file_names_only_what_the_build_serves() {
+        let file = |extra: &str| -> Config {
+            toml::from_str(&format!(
+                "key = \"k\"\nhttp = \"127.0.0.1:80\"\nnodes = []\n{extra}"
+            ))
+            .unwrap()
+        };
+        assert_eq!(
+            file("ssh = \"127.0.0.1:22\"\n").check().is_ok(),
+            cfg!(feature = "ssh")
+        );
+        let onion = "ssh = \"127.0.0.1:22\"\n[onion]\n";
+        assert_eq!(file(onion).check().is_ok(), cfg!(feature = "tor"));
+        assert!(
+            file("[onion]\n").check().is_err(),
+            "an onion serves SSH alone"
+        );
     }
 
     #[test]

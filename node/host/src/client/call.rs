@@ -3,13 +3,14 @@
 
 use std::time::Duration;
 
+use vos_api::Kind;
 use vos_wire::Encode;
 use vos_wire::abi::Refusal;
 use vos_wire::defaults;
 use vos_wire::ids::{AgentId, InstanceId, MethodId};
 use vos_wire::ingress::{Contact, Rejection, Response};
 
-use super::{Client, ClientError, Transport, decode_answer, signed_call};
+use super::{Client, ClientError, Transport, decode_answer, naming, signed_call};
 
 /// What became of a call whose fate was unknown, once its session was
 /// refused.
@@ -216,8 +217,9 @@ impl Client {
         arguments: &[u8],
     ) -> Result<Response, ClientError> {
         let body = self.call_body(agent, sequence, instance, method, arguments)?;
-        let path = format!("/agents/{}/calls", agent.0);
-        let (status, body) = self.transport.post_repeatable(&path, &body)?;
+        let (status, body) = self
+            .transport
+            .repeatable(Kind::Call, &naming(agent, &body))?;
         decode_answer(status, &body)
     }
 

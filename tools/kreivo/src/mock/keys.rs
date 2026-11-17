@@ -3,8 +3,8 @@
 //! hasher, the part SCALE-encoded.
 
 use super::types::{AccountId, Space};
-pub use crate::kreivo::calls::keys::{blake2_128, twox64, twox128};
-use crate::kreivo::calls::keys::{blake2_128_concat, twox64_concat};
+pub use crate::calls::keys::{blake2_128, twox64, twox128};
+use crate::calls::keys::{blake2_128_concat, twox64_concat};
 
 /// The pallet's storage prefix.
 pub const PALLET: &[u8] = b"Spaces";
@@ -98,11 +98,6 @@ pub fn equivocations(space: &Space, kind: u8, window: u64) -> Vec<u8> {
             &twox64_concat(&window.to_le_bytes()),
         ],
     )
-}
-
-/// Every `Equivocations` entry of `space` is under it.
-pub fn equivocations_of(space: &Space) -> Vec<u8> {
-    key(Item::Equivocations, &[space])
 }
 
 pub fn budget(space: &Space) -> Vec<u8> {

@@ -240,9 +240,9 @@ impl Cluster {
             }
         };
         slot.sent_across
-            .fetch_add(node.messages_sent_across(), Ordering::SeqCst);
+            .fetch_add(node.probes().messages_sent_across(), Ordering::SeqCst);
         slot.installed
-            .fetch_add(node.snapshots_installed(), Ordering::SeqCst);
+            .fetch_add(node.probes().snapshots_installed(), Ordering::SeqCst);
         node.shutdown();
     }
 
@@ -369,7 +369,7 @@ impl Nodes for Cluster {
 /// The last sequence of `session` that `node` applied at `agent`, if it
 /// holds the session.
 pub fn session_mark(node: &Node, agent: AgentId, session: &Session) -> Option<u64> {
-    let snapshot = node.store().snapshot();
+    let snapshot = node.probes().store().snapshot();
     let value = |key: &[u8]| {
         snapshot
             .get(agent, key)

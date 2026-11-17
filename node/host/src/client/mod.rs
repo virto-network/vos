@@ -1,5 +1,6 @@
 //! A blocking client of a node's API, or of a gateway's HTTP: a client key's sessions, signed
-//! calls and queries, its workflows' results, and the operator's commands.
+//! calls and queries, its workflows' results, and the operator's commands, each a request of
+//! the node API's kinds.
 
 mod api;
 mod call;
@@ -15,6 +16,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
+use vos_api::Kind;
 use vos_wire::ids::{AgentId, InstanceId, Principal, Session};
 use vos_wire::ingress::{AgentInfo, Contact, Credentialed, DeviceWindow, NodeId, Response};
 use vos_wire::{Decode, Encode};
@@ -28,7 +30,7 @@ pub use signed::{
 };
 pub use target::Target;
 use target::authority;
-use transport::Transport;
+use transport::{Body, Transport};
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -69,24 +71,31 @@ fn decode_answer(status: u16, body: &[u8]) -> Result<Response, ClientError> {
         .map_err(|_| ClientError::Undecodable(status))
 }
 
-/// POST `body` to `path`: the status and body answered. For requests this
-/// client does not otherwise make, as a test of the ingress does.
-pub fn post(target: &Target, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>), ClientError> {
-    Transport::new(target).post_once(path, None, body)
+/// `body` prefixed by the agent it names, as a request naming one holds
+/// it.
+pub fn naming(agent: AgentId, body: &[u8]) -> Vec<u8> {
+    [&agent.0.encode()[..], body].concat()
 }
 
-/// POST `body` to `path` on a connection of its own: the answer. Each
-/// read and write, the connection's included, must be done within
-/// `within`, a positive deadline. For a caller that keeps its own
-/// deadlines and tries another node when one is slow, as a checker
-/// does.
-pub fn post_within(
+/// A request of `kind` carrying `body`, sent once: the status and body
+/// answered, as the gateway's HTTP gives them. For requests this client
+/// does not otherwise make, as a test of the ingress does.
+pub fn send(target: &Target, kind: Kind, body: &[u8]) -> Result<(u16, Vec<u8>), ClientError> {
+    Transport::new(target).once(kind, body)
+}
+
+/// A request of `kind` carrying `body`, sent once on a connection of its
+/// own: the answer. Each read and write, the connection's included, must
+/// be done within `within`, a positive deadline. For a caller that keeps
+/// its own deadlines and tries another node when one is slow, as a
+/// checker does.
+pub fn send_within(
     target: &Target,
-    path: &str,
+    kind: Kind,
     body: &[u8],
     within: Duration,
 ) -> Result<Response, ClientError> {
-    let (status, body) = Transport::within(target, within).post_once(path, None, body)?;
+    let (status, body) = Transport::within(target, within).once(kind, body)?;
     decode_answer(status, &body)
 }
 
@@ -97,8 +106,7 @@ pub fn credentialed(
     agent: AgentId,
     call: &Credentialed,
 ) -> Result<Response, ClientError> {
-    let path = format!("/agents/{}/credentialed", agent.0);
-    let (status, body) = post(target, &path, &call.encode())?;
+    let (status, body) = send(target, Kind::Credentialed, &naming(agent, &call.encode()))?;
     decode_answer(status, &body)
 }
 
@@ -106,7 +114,7 @@ pub fn credentialed(
 /// `expires_ms` is judged by. Unsigned: a relay that lies about it costs
 /// the client a new proof, never a longer life for one.
 pub fn time(target: &Target) -> Result<u64, ClientError> {
-    let (status, body) = Transport::new(target).get("/time", None)?;
+    let (status, body) = Transport::new(target).repeatable(Kind::Time, &[])?;
     u64::decode_exact(&body).ok_or(ClientError::Undecodable(status))
 }
 
@@ -129,8 +137,8 @@ pub fn devices(
     agent: AgentId,
     instance: InstanceId,
 ) -> Result<Option<DeviceWindow>, ClientError> {
-    let path = format!("/agents/{}/instances/{}/devices", agent.0, instance.0);
-    let (status, body) = Transport::new(target).get(&path, None)?;
+    let asked = (agent.0, instance.0).encode();
+    let (status, body) = Transport::new(target).repeatable(Kind::Devices, &asked)?;
     match status {
         404 => Ok(None),
         _ => DeviceWindow::decode_exact(&body)
@@ -141,7 +149,7 @@ pub fn devices(
 
 impl Transport {
     fn node_id(&self) -> Result<NodeId, ClientError> {
-        let (status, body) = self.get("/", None)?;
+        let (status, body) = self.repeatable(Kind::NodeKey, &[])?;
         let id = NodeId::decode(&body)
             .map(|(id, _)| id)
             .map_err(|_| ClientError::Undecodable(status))?;
@@ -152,7 +160,7 @@ impl Transport {
     }
 
     fn agent_info(&self, agent: AgentId) -> Result<Option<AgentInfo>, ClientError> {
-        let (status, body) = self.get(&format!("/agents/{}", agent.0), None)?;
+        let (status, body) = self.repeatable(Kind::AgentInfo, &agent.0.encode())?;
         if status == 404 {
             return Ok(None);
         }

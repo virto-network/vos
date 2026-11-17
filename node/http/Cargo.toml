@@ -3,19 +3,21 @@ name = "vos-http"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "VOS's HTTP front: a small HTTP/1.1 server on any runtime, its public TLS, and the route table that translates VOS's HTTP routes onto the node API: the gateway's."
+description = "VOS's HTTP front: a small HTTP/1.1 server on tokio (feature `server`), its public TLS, and the route table that translates VOS's HTTP routes onto the node API: the gateway's."
+
+[features]
+# The server (`server`), on tokio: the gateway's. A node reads the routes
+# and the TLS alone.
+server = ["dep:httparse", "dep:tokio", "dep:tokio-rustls", "dep:tracing"]
 
 [dependencies]
-# Timers on any runtime: async-io drives its own reactor when none runs.
-async-io = "2"
-async-net = "2"
 base64 = "0.22"
-futures-lite = "2"
-futures-rustls = { version = "0.26", default-features = false, features = ["ring"] }
-httparse = "1"
+httparse = { version = "1", optional = true }
 rcgen = { version = "0.13", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-tracing = "0.1"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "time"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
+tracing = { version = "0.1", optional = true }
 vos-api = { workspace = true }
 vos-net = { workspace = true }
 vos-wire = { workspace = true }

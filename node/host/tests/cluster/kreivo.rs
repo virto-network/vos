@@ -1,5 +1,5 @@
 //! The representative's anchors through the Kreivo client
-//! (`vos_venue::kreivo::KreivoVenue`) over the mock of Kreivo's spaces
+//! (`vos_kreivo::KreivoVenue`) over the mock of Kreivo's spaces
 //! pallet, with its fee pipeline, a second an extrinsic: each node's
 //! client signing as its own account, the space registered with every
 //! node its authority, paired with its genesis key, the sovereign account
@@ -15,12 +15,12 @@ use std::time::{Duration, Instant};
 
 use parity_scale_codec::Decode;
 use vos_checker::stays;
+use vos_kreivo::calls::{Call, RuntimeCall};
+use vos_kreivo::mock::transport::MockChain;
+use vos_kreivo::mock::types::{AuthorityInfo, SpaceInfo, SpaceStatus};
+use vos_kreivo::mock::{Account, Chain, Constants, Origin, keys};
+use vos_kreivo::{KreivoVenue, Options};
 use vos_node::Config;
-use vos_venue::kreivo::calls::{Call, RuntimeCall};
-use vos_venue::kreivo::mock::transport::MockChain;
-use vos_venue::kreivo::mock::types::{AuthorityInfo, SpaceInfo, SpaceStatus};
-use vos_venue::kreivo::mock::{Account, Chain, Constants, Origin, keys};
-use vos_venue::kreivo::{KreivoVenue, Options};
 use vos_venue::{AnchorOutcome, Status, VenueClient};
 use vos_wire::ids::AgentId;
 use vos_wire::peer::NodeNumber;

@@ -6,7 +6,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
-use vos_node::client::{post_within, workflow_read_not_after};
+use vos_api::Kind;
+use vos_node::client::{naming, send_within, workflow_read_not_after};
 use vos_wire::Decode;
 use vos_wire::ids::WorkflowId;
 use vos_wire::ingress::{Consistency, Rejection, Response, WorkflowStatus};
@@ -169,7 +170,7 @@ impl Client {
         } = touring.tours().started[&request];
         let key = SigningKey::from_bytes(&secret);
         let tour = tour(self.next_agent().expect("the next agent"), request);
-        let path = format!("/agents/{}/workflows", self.agent.0);
+        let route = (Kind::Workflow, self.agent);
         let until = Instant::now() + TOUR_ENDS;
         let count = nodes.count();
         let mut at = super::node_at(request + u64::from(self.number), count);
@@ -191,7 +192,13 @@ impl Client {
             let wait = READ_WAIT.as_millis() as u64;
             let not_after = workflow_read_not_after(nodes.time(), wait);
             let body = signed_read(&self.identity, &key, not_after, consistency, workflow, wait);
-            match post_within(nodes.target(at), &path, &body, crate::ATTEMPT + READ_WAIT) {
+            let body = naming(self.agent, &body);
+            match send_within(
+                nodes.target(at),
+                Kind::Workflow,
+                &body,
+                crate::ATTEMPT + READ_WAIT,
+            ) {
                 Ok(Response::Workflow {
                     status: WorkflowStatus::Ended(outcome),
                     ..
@@ -242,7 +249,7 @@ impl Client {
                 workflow,
                 0,
             );
-            if let Ok(Response::Workflow { status, .. }) = super::post(nodes, at, &path, &body) {
+            if let Ok(Response::Workflow { status, .. }) = super::post(nodes, at, route, &body) {
                 assert_eq!(
                     status,
                     WorkflowStatus::Unknown,

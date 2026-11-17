@@ -145,6 +145,7 @@ impl Gates {
     fn applied(&self) -> u64 {
         self.served
             .node
+            .probes()
             .store()
             .snapshot()
             .applied(self.gated)
@@ -245,7 +246,7 @@ fn an_unknown_keys_session_attempts_cost_no_verification_and_write_nothing() {
         name: [0; 16],
         t0: gates.served.now(),
     };
-    let snapshot = gates.served.node.store().snapshot();
+    let snapshot = gates.served.node.probes().store().snapshot();
     assert_eq!(
         snapshot
             .get(gates.gated, &keys::session_index(&session))

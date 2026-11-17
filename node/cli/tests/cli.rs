@@ -628,7 +628,7 @@ fn a_pending_call_whose_session_was_collected_is_lost() {
     let (node, url) = open();
     let id = vos_wire::ids::AgentId(agent.parse().unwrap());
     wait_until("the session is collected", Duration::from_secs(20), || {
-        vos_checker::applied::<u64>(node.store(), id, &keys::live_sessions()) == Some(0)
+        vos_checker::applied::<u64>(node.probes().store(), id, &keys::live_sessions()) == Some(0)
     });
     let lost = vos_fails(client(&url, "call", "increment", "0200000000000000"));
     assert!(lost.contains("lost"), "{lost}");

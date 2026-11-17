@@ -76,7 +76,7 @@ fn follower_down_past_compaction(cluster: &Cluster, agent: AgentId) {
     let installed = vos_checker::poll(ANSWERED, || {
         cluster
             .node(number)
-            .is_some_and(|node| node.snapshots_installed() > 0)
+            .is_some_and(|node| node.probes().snapshots_installed() > 0)
     });
     if !installed {
         cluster.saw("fault: a follower down past compaction, no snapshot installed");
@@ -86,6 +86,7 @@ fn follower_down_past_compaction(cluster: &Cluster, agent: AgentId) {
 /// Workflow `workflow`'s state in `node`'s applied state at `agent`.
 fn tour_state(node: &Node, agent: AgentId, workflow: WorkflowId) -> Option<WorkflowState> {
     let bytes = node
+        .probes()
         .store()
         .snapshot()
         .get(agent, &keys::workflow(workflow))
@@ -291,7 +292,7 @@ pub(crate) fn faults(cluster: &Cluster, clients: &[Client], random: &mut Random)
 /// Whether `node` holds any of `agent`'s session state: rows of the
 /// sessions' kinds, a session's row in the due index, or a count.
 fn holds_sessions(node: &Node, agent: AgentId) -> bool {
-    let snapshot = node.store().snapshot();
+    let snapshot = node.probes().store().snapshot();
     let any = Session {
         key: [0; 32],
         name: [0; 16],

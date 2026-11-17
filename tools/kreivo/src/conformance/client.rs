@@ -16,13 +16,13 @@ use parity_scale_codec::{Decode, Encode};
 use super::{Entry, File, Fixtures, ResultJson, SPACES, assemble, directory, hex, load, unhex};
 use vos_anchor::SpaceGenesis;
 
-use crate::kreivo::calls::{
+use crate::calls::{
     self, Active, AnchorRecord, AuthorityInfo, Call, Event, Evidence, Failure, PALLET, ProgramInfo,
     RuntimeCall, SpaceInfo, Spend, keys,
 };
-use crate::kreivo::mock::Constants;
-use crate::kreivo::mock::transport::{MockChain, MockTransport};
-use crate::kreivo::transport::{Invalid, Sender, Sent, Transport, Unsent};
+use crate::mock::Constants;
+use crate::mock::transport::{MockChain, MockTransport};
+use crate::transport::{Invalid, Sender, Sent, Transport, Unsent};
 
 /// The result a call's failure reports, as the vectors write it.
 fn result_of(failure: Option<Failure>) -> ResultJson {
@@ -260,7 +260,7 @@ fn the_client_passes_every_vector() {
             chain.with(|chain| chain.set_now(step.now_ms));
             let (Some(parts), Some(origin)) = (&step.call, step.origin) else {
                 chain.with(|chain| chain.on_idle());
-                let reader = chain.transport(crate::kreivo::mock::Origin::Root);
+                let reader = chain.transport(crate::mock::Origin::Root);
                 step.storage
                     .iter()
                     .for_each(|entry| read_back(&reader, entry, &at));

@@ -14,7 +14,6 @@ use vos_net::memory::Hub;
 use vos_node::store::EntryKind;
 use vos_node::{Hooks, Node};
 use vos_statement_service::item::Item;
-use vos_venue::kreivo;
 use vos_venue::vos_statement::Statement;
 use vos_venue::{AnchorOutcome, SubmitOutcome, VenueClient};
 use vos_wire::ids::AgentId;
@@ -91,7 +90,7 @@ pub fn anchor_carriers(anchor: &Anchor) -> Vec<(String, Vec<u8>)> {
         ("the anchor".into(), anchor.encode()),
         (
             "Kreivo's anchor call".into(),
-            kreivo::calls::Call::anchor(anchor).bytes(),
+            vos_kreivo::calls::Call::anchor(anchor).bytes(),
         ),
         ("JAM's anchor item".into(), Item::Anchor(*anchor).encode()),
     ]
@@ -106,7 +105,7 @@ pub fn submission_carriers(statement: &Statement, proof: &[u8]) -> Vec<(String, 
         ("the final proof".into(), proof.to_vec()),
         (
             "Kreivo's submit call".into(),
-            kreivo::calls::Call::Submit {
+            vos_kreivo::calls::Call::Submit {
                 payer: [0; 32],
                 statement: encoded.clone(),
                 proof: proof.to_vec(),
@@ -368,6 +367,7 @@ pub fn node_carriers(
         );
     }
     let jobs: Vec<u8> = node
+        .probes()
         .store()
         .prover_jobs()
         .unwrap()
@@ -378,7 +378,7 @@ pub fn node_carriers(
     audit.carrier(
         format!("node {number}: the store's rows"),
         reach,
-        store(node.store()),
+        store(node.probes().store()),
     );
 }
 
@@ -386,7 +386,7 @@ pub fn node_carriers(
 fn log_entries(node: &Node, agent: AgentId) -> Vec<u8> {
     let through = node.applied(agent).unwrap_or(0);
     (1..=through)
-        .filter_map(|index| node.store().log_entry(agent, index).ok().flatten())
+        .filter_map(|index| node.probes().store().log_entry(agent, index).ok().flatten())
         .flat_map(|entry| entry.body)
         .collect()
 }
@@ -394,10 +394,16 @@ fn log_entries(node: &Node, agent: AgentId) -> Vec<u8> {
 /// The work results of `agent`'s log on `node`, through its applied index
 /// in the store, each encoded.
 fn work_results(node: &Node, agent: AgentId) -> Vec<u8> {
-    let through = node.store().snapshot().applied(agent).unwrap().unwrap_or(0);
+    let through = node
+        .probes()
+        .store()
+        .snapshot()
+        .applied(agent)
+        .unwrap()
+        .unwrap_or(0);
     (1..=through)
         .filter_map(|index| {
-            let entry = node.store().log_entry(agent, index).unwrap()?;
+            let entry = node.probes().store().log_entry(agent, index).unwrap()?;
             if entry.kind != EntryKind::Result {
                 return None;
             }

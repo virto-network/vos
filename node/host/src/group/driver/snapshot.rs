@@ -214,7 +214,6 @@ impl Driver {
                 staged: None,
             },
         );
-        self.inner.counters.streamed.fetch_add(1, Ordering::Relaxed);
         let inner = Arc::clone(&self.inner);
         let shared = Arc::clone(&self.shared);
         let agent = self.shared.agent;

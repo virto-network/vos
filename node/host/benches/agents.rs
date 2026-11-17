@@ -325,6 +325,7 @@ fn main() {
     let (mut bytes, mut entries) = (0usize, 0usize);
     for &agent in &active {
         let log = node(&nodes, leader(&nodes, agent))
+            .probes()
             .store()
             .raft(agent)
             .unwrap()

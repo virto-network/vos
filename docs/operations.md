@@ -144,9 +144,10 @@ report or close writes the row afresh.
 
 ## The onion service
 
-A space's gateways serve the same HTTP and SSH on an onion, and nothing
-else (`design/light-node.md` §6.1, `design/node-api.md` §6). Requests
-that came through it carry the onion's mark, which a node reads for an
+A space's gateways serve the same SSH on an onion, and nothing else: no
+HTTP. The file must name an SSH port (`ssh`) for its `[onion]`
+(`design/light-node.md` §6.1, `design/node-api.md` §6). Requests that
+came through it carry the onion's mark, which a node reads for an
 onion-only agent and for the space's own `onion` setting (`"any"`,
 `"anonymous"` for its proven calls only through the onion, `"all"` for an
 onion-only space; set it alike on every node of the space).
@@ -180,8 +181,8 @@ onion-only space; set it alike on every node of the space).
   from 1 to 65,535 and `circuits` at least 1, or the gateway does not
   start.
 - **The onion's SSH:** with an SSH port, the onion's port 22 serves the
-  same screens (the demo's when the file has `[demo]`) and `vos-api`
-  subsystem, under the same `ssh_host_key`: the key the onion set lists
+  same screens (`vos-gateway`'s placeholder, or an application's built on
+  its library) and `vos-api` subsystem, under the same `ssh_host_key`: the key the onion set lists
   for that onion. Its screens' own host-service calls pass no per-circuit
   limit, only the server's bound per session; the onion's SSH server
   holds at most 128 connections in all and has no idle timeout of its

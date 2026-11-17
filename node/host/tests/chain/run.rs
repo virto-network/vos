@@ -10,11 +10,11 @@ use std::time::Duration;
 use ed25519_dalek::SigningKey;
 use vos_checker::carriers::{self, Canary, Frames, Logs, Tapped};
 use vos_jam_dev::JamVenue;
+use vos_kreivo::KreivoVenue;
 use vos_node::{Config, Hooks};
 use vos_node_prover::Prover;
 use vos_statement_service::item::Item;
 use vos_statement_service::state::{Outcome as Judged, keys as jam_keys};
-use vos_venue::kreivo::KreivoVenue;
 use vos_venue::vos_statement::{Refusal, Statement};
 use vos_venue::{Status, SubmitOutcome, VenueClient};
 use vos_wire::keys;
@@ -364,7 +364,7 @@ impl Run {
                     .filter(|(_, node)| node.applied(asked.agent).is_some())
                     .find_map(|(_, node)| {
                         let record: Workflow = vos_checker::applied(
-                            node.store(),
+                            node.probes().store(),
                             asked.agent,
                             &keys::workflow(asked.read.workflow),
                         )?;

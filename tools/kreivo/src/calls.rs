@@ -16,8 +16,6 @@ pub type Balance = u128;
 /// The pallet's index in Kreivo's runtime: every call's first byte, and
 /// its module errors' index.
 pub const PALLET: u8 = 90;
-/// Kreivo's `Balances` index.
-pub const BALANCES: u8 = 10;
 /// `MaxGenesisLen`, `MaxStatementLen` and `MaxProofLen`: a call past one
 /// does not decode at the venue.
 pub const MAX_GENESIS_LEN: usize = 2_048;
@@ -213,7 +211,7 @@ impl From<SpaceStatus> for vos_anchor::venue::Status {
     }
 }
 
-impl From<SpaceStatus> for crate::Status {
+impl From<SpaceStatus> for vos_venue::Status {
     fn from(status: SpaceStatus) -> Self {
         match status {
             SpaceStatus::Active => Self::Active,

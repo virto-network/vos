@@ -228,13 +228,6 @@ pub enum FrameError {
     UnknownMark,
 }
 
-impl FrameError {
-    /// Whether the channel goes on after it: the framing is intact.
-    pub fn keeps_open(self) -> bool {
-        self == FrameError::Unavailable
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,8 +321,6 @@ mod tests {
         assert_eq!(FrameError::NotRelayed.encode(), [3]);
         assert_eq!(FrameError::Unavailable.encode(), [4]);
         assert_eq!(FrameError::UnknownMark.encode(), [5]);
-        assert!(!FrameError::UnknownMark.keeps_open());
-        assert!(FrameError::Unavailable.keeps_open());
         use vos_wire::ingress::{OperatorRefusal, Rejection};
         let refusals = [
             (
@@ -342,6 +333,5 @@ mod tests {
         for (refusal, bytes) in refusals {
             assert_eq!(Rejection::Operator(refusal).encode(), bytes);
         }
-        assert!(!FrameError::Truncated.keeps_open());
     }
 }

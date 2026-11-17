@@ -3,17 +3,18 @@ name = "vos-gateway"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "VOS's gateway: today's HTTP routes, public TLS, limits per address and leader-aware routing in front of nodes' binary APIs, holding no authority; and s4's SSH port with the vos-api subsystem."
+description = "VOS's gateway: VOS's HTTP routes, public TLS, limits per address and leader-aware routing in front of nodes' binary APIs, holding no authority; s4's SSH port with the vos-api subsystem, serving an application's screens; and its onion, serving the SSH port."
 
 [[bin]]
 name = "vos-gateway"
 path = "src/main.rs"
 
 [features]
-# The SSH port: s4's screens and the `vos-api` subsystem, on s4-server.
+# The SSH port: an s4 application's screens and the `vos-api` subsystem,
+# on s4-server.
 ssh = ["dep:s4-server", "dep:russh"]
-# The onion service in process, on arti: the SSH port's and HTTP's own
-# onion. One arti version a release, pinned exactly (its crates break
+# The onion service in process, on arti: the SSH port's own onion. One
+# arti version a release, pinned exactly (its crates break
 # monthly); built with `--ignore-rust-version`, as s4's crates are.
 tor = [
     "ssh",
@@ -48,11 +49,9 @@ toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 vos-api = { workspace = true, features = ["client", "quic"] }
-vos-http = { workspace = true }
+vos-http = { workspace = true, features = ["server"] }
 vos-net = { workspace = true }
 vos-wire = { workspace = true }
-# An agent's identity, its creation record's BLAKE2b-256.
-vos-pvm-precompiles = { workspace = true }
 s4-server = { workspace = true, optional = true }
 russh = { version = "0.65", default-features = false, features = ["ring", "flate2"], optional = true }
 arti-client = { version = "=0.47.0", default-features = false, features = ["tokio", "rustls", "compression", "onion-service-client", "onion-service-service", "experimental-api", "static-sqlite", "vanguards"], optional = true }

@@ -1,13 +1,13 @@
 //! The onion's streams (`light-node.md` §6.1, §6.6): each arrives on a
-//! rendezvous circuit, from no address, for a virtual port, 22 (SSH) or 80
-//! (HTTP), the clearnet's protocols and nothing else. A circuit counts as
+//! rendezvous circuit, from no address, for a virtual port: 22, SSH, and
+//! nothing else. A circuit counts as
 //! one address for the limits per address: its own address, in a range of
 //! the unique local IPv6 addresses no client holds, and each stream on it
 //! a port of that address, so a connection's caps count it alone.
 //!
-//! HTTP streams go to the onion's own HTTP server, SSH streams to the
-//! onion's own SSH server, each stream handed over with its address, so
-//! both count the circuit and mark onion what they serve.
+//! Its streams go to the onion's own SSH server, each handed over with its
+//! address, so the server counts the circuit and marks onion what it
+//! serves.
 //!
 //! The streams come from arti in process (the `onion` module, with the
 //! `tor` feature).
@@ -20,12 +20,9 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 
-/// The onion's virtual port for SSH.
+/// The onion's virtual port, SSH's.
 pub const SSH: u16 = 22;
-/// The onion's virtual port for HTTP.
-pub const HTTP: u16 = 80;
 
 /// The leading 32 bits of every circuit's address: a unique local IPv6
 /// range (`fd76:6f73::/32`), held by no client.
@@ -239,8 +236,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Placed<S> {
 /// A stream from the onion, with its address.
 type Accepted = (Box<dyn Io>, SocketAddr);
 
-/// The onion's streams to one of its ports, as that port's server takes
-/// them: the HTTP server's listener, or the SSH server's.
+/// The onion's streams, as its SSH server takes them.
 pub struct OnionListener(tokio::sync::mpsc::Receiver<Accepted>);
 
 impl OnionListener {
@@ -250,64 +246,32 @@ impl OnionListener {
     }
 }
 
-impl vos_http::Listener for OnionListener {
-    type Stream = Compat<Box<dyn Io>>;
-
-    async fn accept(&mut self) -> std::io::Result<(Self::Stream, SocketAddr)> {
-        match self.next().await {
-            Some((stream, peer)) => Ok((stream.compat(), peer)),
-            None => Err(std::io::ErrorKind::BrokenPipe.into()),
-        }
-    }
-}
-
-/// Streams the onion's servers wait to take, a port's at most.
+/// Streams the onion's SSH server waits to take, at most.
 const WAITING: usize = 64;
 
-/// Where the onion's streams go: its HTTP server and, if it serves SSH,
-/// its SSH server.
+/// Where the onion's streams go: its SSH server.
 pub struct Onion {
     pub circuits: Arc<Circuits>,
-    http: tokio::sync::mpsc::Sender<Accepted>,
-    ssh: Option<tokio::sync::mpsc::Sender<Accepted>>,
+    ssh: tokio::sync::mpsc::Sender<Accepted>,
 }
 
 impl Onion {
-    /// The onion over `circuits`; and the listeners its HTTP streams and,
-    /// if it serves `ssh`, its SSH streams arrive on.
-    pub fn new(
-        circuits: Arc<Circuits>,
-        ssh: bool,
-    ) -> (Arc<Self>, OnionListener, Option<OnionListener>) {
-        let (http, accepted) = tokio::sync::mpsc::channel(WAITING);
-        let (ssh, ssh_accepted) = match ssh {
-            true => {
-                let (ssh, accepted) = tokio::sync::mpsc::channel(WAITING);
-                (Some(ssh), Some(OnionListener(accepted)))
-            }
-            false => (None, None),
-        };
-        (
-            Arc::new(Self {
-                circuits,
-                http,
-                ssh,
-            }),
-            OnionListener(accepted),
-            ssh_accepted,
-        )
+    /// The onion over `circuits`, and the listener its streams arrive on.
+    pub fn new(circuits: Arc<Circuits>) -> (Arc<Self>, OnionListener) {
+        let (ssh, accepted) = tokio::sync::mpsc::channel(WAITING);
+        (Arc::new(Self { circuits, ssh }), OnionListener(accepted))
     }
 
-    /// Whether a stream to virtual port `port` would be served: SSH, if
-    /// the onion serves it, and HTTP.
+    /// Whether a stream to virtual port `port` would be served: SSH's
+    /// alone.
     pub fn serves(&self, port: u16) -> bool {
-        port == HTTP || (port == SSH && self.ssh.is_some())
+        port == SSH
     }
 
-    /// Hand `stream`, a stream on `circuit` to virtual port `port`, to
-    /// its port's server, holding its place on the circuit until it ends:
-    /// closed at once past its circuit's streams, or for a port the onion
-    /// does not serve. The circuit's own task holds its place.
+    /// Hand `stream`, a stream on `circuit` to virtual port `port`, to the
+    /// SSH server, holding its place on the circuit until it ends: closed
+    /// at once past its circuit's streams, or for a port the onion does
+    /// not serve. The circuit's own task holds its place.
     pub async fn serve(&self, stream: impl Io, circuit: u32, port: u16) {
         if !self.serves(port) {
             self.circuits.refused();
@@ -322,11 +286,7 @@ impl Onion {
             stream,
             _place: place,
         };
-        let server = match (port, &self.ssh) {
-            (SSH, Some(ssh)) => ssh,
-            _ => &self.http,
-        };
-        let _ = server.send((Box::new(stream), peer)).await;
+        let _ = self.ssh.send((Box::new(stream), peer)).await;
     }
 }
 
@@ -368,27 +328,14 @@ mod tests {
         );
     }
 
-    /// An HTTP stream reaches the HTTP listener and an SSH stream the SSH
-    /// one, each with its circuit's address and a port of its own, holding
-    /// its place on the circuit until it ends; a stream to another port is
-    /// closed.
+    /// An SSH stream reaches the SSH server with its circuit's address
+    /// and a port of its own, holding its place on the circuit until it
+    /// ends; a stream to another port, HTTP's among them, is closed.
     #[tokio::test]
-    async fn streams_go_by_their_port() {
+    async fn streams_go_to_ssh_alone() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let circuits = Circuits::new(PerCircuit::default());
-        let (onion, mut http, ssh) = Onion::new(Arc::clone(&circuits), true);
-        let mut ssh = ssh.expect("the onion serves SSH");
-        let (mut client, served) = tokio::io::duplex(64);
-        onion.serve(served, 5, HTTP).await;
-        let (mut stream, peer) = vos_http::Listener::accept(&mut http).await.unwrap();
-        assert_eq!(peer.ip(), address(5));
-        client.write_all(b"ping").await.unwrap();
-        let mut read = [0u8; 4];
-        futures::AsyncReadExt::read_exact(&mut stream, &mut read)
-            .await
-            .unwrap();
-        assert_eq!(&read, b"ping");
-        // SSH: to the SSH server, on its circuit.
+        let (onion, mut ssh) = Onion::new(Arc::clone(&circuits));
         let (mut client, served) = tokio::io::duplex(64);
         onion.serve(served, 6, SSH).await;
         let (mut stream, peer) = ssh.next().await.unwrap();
@@ -401,11 +348,11 @@ mod tests {
         drop(stream);
         assert_eq!(circuits.streams(6), 0, "given back once it ends");
         // Another port: closed, counted.
-        let (_client, served) = tokio::io::duplex(64);
-        onion.serve(served, 7, 443).await;
-        assert_eq!(circuits.counts().streams_refused, 1);
-        // Without SSH, port 22 is another port.
-        let (onion, _http, none) = Onion::new(Arc::clone(&circuits), false);
-        assert!(none.is_none() && !onion.serves(SSH));
+        for (circuit, port) in [(5, 80), (7, 443)] {
+            let (_client, served) = tokio::io::duplex(64);
+            onion.serve(served, circuit, port).await;
+        }
+        assert_eq!(circuits.counts().streams_refused, 2);
+        assert!(!onion.serves(80));
     }
 }

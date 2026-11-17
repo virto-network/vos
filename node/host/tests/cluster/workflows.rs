@@ -87,7 +87,7 @@ impl Shop {
 
 /// A workflow's record on `node`.
 fn record(node: &Node, agent: AgentId, workflow: WorkflowId) -> Option<Workflow> {
-    vos_checker::applied(node.store(), agent, &keys::workflow(workflow))
+    vos_checker::applied(node.probes().store(), agent, &keys::workflow(workflow))
 }
 
 /// How long a workflow may take to end: its computations are long runs
@@ -128,7 +128,7 @@ fn a_workflows_snapshots_ride_the_result_blob_path() {
     let leader = cluster.node(cluster.leader(agent));
     let applied = leader.applied(agent).unwrap();
     let large = (1..=applied)
-        .filter_map(|index| leader.store().log_entry(agent, index).unwrap())
+        .filter_map(|index| leader.probes().store().log_entry(agent, index).unwrap())
         .filter(|entry| entry.kind == EntryKind::LargeResult)
         .count();
     assert!(
@@ -208,14 +208,18 @@ fn a_workflow_awaits_another_agent_and_pins_its_program_while_it_lives() {
         "the replicas pin the living workflow's program and the upgrade",
         || {
             cluster.running().all(|(_, node)| {
-                let pinned = node.pinned();
+                let pinned = node.probes().pinned();
                 pinned.contains(&program.0) && pinned.contains(&upgrade)
             })
         },
     );
     // The ended saga released its pin: the living nap's alone holds it.
     let leader = cluster.node(cluster.leader(agent));
-    let pins = vos_checker::applied::<u64>(leader.store(), agent, &keys::workflow_pins(&program));
+    let pins = vos_checker::applied::<u64>(
+        leader.probes().store(),
+        agent,
+        &keys::workflow_pins(&program),
+    );
     assert_eq!(pins, Some(1), "the living workflow's pin");
     let living = record(cluster.node(cluster.leader(agent)), agent, nap).unwrap();
     assert!(matches!(living.state, WorkflowState::Sleeping { .. }));
@@ -235,12 +239,12 @@ fn a_workflow_wakes_on_the_program_only_its_life_pins() {
     shop.upgrade(&cluster, agent);
     let leader = cluster.node(cluster.leader(agent));
     let program = record(leader, agent, nap).unwrap().program.0;
-    assert!(leader.pinned().contains(&program));
+    assert!(leader.probes().pinned().contains(&program));
     assert!(matches!(ended(&cluster, agent, nap), Outcome::Done(_)));
     wait_until("the ended workflow's program is released", || {
         cluster
             .running()
-            .all(|(_, node)| !node.pinned().contains(&program))
+            .all(|(_, node)| !node.probes().pinned().contains(&program))
     });
 }
 
@@ -259,7 +263,9 @@ fn a_workflow_starts_in_the_batch_that_installs_its_program() {
     wait_until("a batch's refine is held", || hold.refines.reached() > 0);
     let install = leader.install(agent, SHOP, &package("shop"), vec![]);
     let program = CodeHash::of(&shop.shop).0;
-    wait_until("the package is stored", || leader.stores_blob(&program));
+    wait_until("the package is stored", || {
+        leader.probes().stores_blob(&program)
+    });
     // Its install is queued once its program is stored.
     std::thread::sleep(Duration::from_millis(200));
     let started = leader.call(agent, shop.starting(&cluster, agent, 2, "nap", 0u64));
@@ -270,7 +276,7 @@ fn a_workflow_starts_in_the_batch_that_installs_its_program() {
         panic!("the workflow did not start");
     };
     let together = (before + 1..=leader.applied(agent).unwrap()).any(|index| {
-        let Some(entry) = leader.store().log_entry(agent, index).unwrap() else {
+        let Some(entry) = leader.probes().store().log_entry(agent, index).unwrap() else {
             return false;
         };
         let Ok((result, _)) = WorkResult::decode(&entry.body) else {
@@ -316,9 +322,12 @@ fn a_snapshot_carries_a_living_workflows_pin() {
     cluster.converged(agent);
     let caught_up = cluster.node(follower);
     assert!(log_start(caught_up, agent) > 20, "installed a snapshot");
-    assert!(caught_up.pinned().contains(&program));
-    assert_eq!(caught_up.pinned(), cluster.node(leader).pinned());
-    assert!(caught_up.stores_blob(&program));
+    assert!(caught_up.probes().pinned().contains(&program));
+    assert_eq!(
+        caught_up.probes().pinned(),
+        cluster.node(leader).probes().pinned()
+    );
+    assert!(caught_up.probes().stores_blob(&program));
 }
 
 /// A replica replaced retires its agent's pins, a living workflow's among
@@ -336,13 +345,13 @@ fn a_retired_replica_releases_a_living_workflows_pin() {
     wait_until("every replica pins the workflow's program", || {
         [1, 2, 3]
             .iter()
-            .all(|number| cluster.node(*number).pinned().contains(&program))
+            .all(|number| cluster.node(*number).probes().pinned().contains(&program))
     });
     cluster.replace(leader, agent, &[1, 2, 3], removed, 4);
     retired(cluster.node(removed), agent);
-    assert!(cluster.node(removed).pinned().is_empty());
+    assert!(cluster.node(removed).probes().pinned().is_empty());
     cluster.converged(agent);
-    assert!(cluster.node(4).pinned().contains(&program));
+    assert!(cluster.node(4).probes().pinned().contains(&program));
 }
 
 /// A page row a replica's store lost is data lost: its leader halts when a
@@ -363,8 +372,8 @@ fn a_lost_page_halts_the_node_that_lost_it() {
         key: keys::page(nap, held[0].0),
         value: None,
     };
-    let epoch = node.store().snapshot().epoch(agent).unwrap();
-    let mut batch = node.store().batch();
+    let epoch = node.probes().store().snapshot().epoch(agent).unwrap();
+    let mut batch = node.probes().store().batch();
     batch.rows(agent, epoch, [&lost]);
     batch.commit(PersistMode::SyncAll).unwrap();
     wait_until("the leader halts", || {

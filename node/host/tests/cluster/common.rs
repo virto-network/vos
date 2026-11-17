@@ -765,7 +765,7 @@ pub fn rows(node: &Node, agent: AgentId) -> Rows {
 /// `agent`'s applied index on `node` and its rows, from one store
 /// snapshot.
 pub fn applied_rows(node: &Node, agent: AgentId) -> (Option<u64>, Rows) {
-    let snapshot = node.store().snapshot();
+    let snapshot = node.probes().store().snapshot();
     let applied = snapshot.applied(agent).unwrap();
     (applied, vos_checker::state_rows(&snapshot, agent))
 }
@@ -773,7 +773,7 @@ pub fn applied_rows(node: &Node, agent: AgentId) -> (Option<u64>, Rows) {
 /// Where `agent`'s log on `node` starts: the index it was compacted
 /// through, or a snapshot installed at.
 pub fn log_start(node: &Node, agent: AgentId) -> u64 {
-    node.store().raft(agent).unwrap().log_start.0
+    node.probes().store().raft(agent).unwrap().log_start.0
 }
 
 /// `node` holds no epoch of `agent`'s but its current one: the one a
@@ -784,10 +784,10 @@ pub fn log_start(node: &Node, agent: AgentId) -> u64 {
 pub fn old_epochs_dropped(node: &Node, agent: AgentId) {
     let mut stale = Vec::new();
     let dropped = vos_checker::poll(STAGED_IDLE, || {
-        stale = node.store().stale_epochs(agent).unwrap();
+        stale = node.probes().store().stale_epochs(agent).unwrap();
         stale.is_empty()
     });
-    let current = node.store().snapshot().epoch(agent).unwrap();
+    let current = node.probes().store().snapshot().epoch(agent).unwrap();
     assert!(
         dropped,
         "the old epochs {stale:?} are left beside the current {current}, the log from {}",
@@ -801,7 +801,7 @@ pub fn retired(node: &Node, agent: AgentId) {
     wait_until("the replica retires", || {
         node.applied(agent).is_none()
             && rows(node, agent).is_empty()
-            && node.store().raft(agent).unwrap().log.is_empty()
+            && node.probes().store().raft(agent).unwrap().log.is_empty()
     });
 }
 

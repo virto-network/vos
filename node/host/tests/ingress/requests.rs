@@ -79,7 +79,7 @@ fn a_duplicate_in_flight_waits_for_its_answer() {
         std::thread::spawn(move || served.increment(&client, 1, 5))
     };
     wait_until("the second waits on the first", || {
-        served.node.calls_in_flight() == 2 || second.is_finished()
+        served.node.probes().calls_in_flight() == 2 || second.is_finished()
     });
     drop(closed);
     assert_eq!(done(first.join().unwrap()), 5);
@@ -133,7 +133,7 @@ fn a_request_not_consumed_is_resent_with_its_sequence() {
     // than the wait.
     let queued = |calls, sent: &std::thread::JoinHandle<Response>| {
         wait_until(&format!("{calls} calls queued"), || {
-            served.node.calls_in_flight() == calls || sent.is_finished()
+            served.node.probes().calls_in_flight() == calls || sent.is_finished()
         })
     };
     let first = send(1);

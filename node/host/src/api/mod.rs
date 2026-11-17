@@ -57,6 +57,7 @@ pub(crate) struct Api {
 pub(crate) struct Places {
     places: Arc<smol::lock::Semaphore>,
     held: Arc<AtomicUsize>,
+    #[cfg(any(test, feature = "dump"))]
     most: usize,
 }
 
@@ -77,6 +78,7 @@ impl Places {
         Self {
             places: Arc::new(smol::lock::Semaphore::new(most)),
             held: Arc::new(AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "dump"))]
             most,
         }
     }
@@ -101,6 +103,7 @@ impl Places {
     }
 
     /// The places free now, without taking one.
+    #[cfg(any(test, feature = "dump"))]
     fn free(&self) -> usize {
         self.most.saturating_sub(self.held.load(Ordering::SeqCst))
     }
@@ -172,6 +175,7 @@ impl Api {
     }
 
     /// The credentialed calls' places free now.
+    #[cfg(any(test, feature = "dump"))]
     pub(crate) fn credentialed_free(&self) -> usize {
         self.credentialed.free()
     }

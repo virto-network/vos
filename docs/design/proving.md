@@ -879,8 +879,9 @@ last for decades.**
     fees, paid by the sovereign account through `ChargeSpaceFee` within a
     spend budget per window. A proof's length counts as proof_size, so
     about 20 statements fit a block on one core.
-  - **The node's Kreivo client** (`vos_venue::kreivo::KreivoVenue`): the
-    representative and the worker anchor and submit through it, a
+  - **The Kreivo client** (`vos_kreivo::KreivoVenue`, in `tools/kreivo`,
+    which no node links): the representative and the worker would anchor
+    and submit through it, a
     `VenueClient`, the space's sovereign account paying. It reaches the
     chain by message through a `Transport`; VOS tests it against a
     reference mock of the designed pallet and the conformance vectors
@@ -955,7 +956,8 @@ last for decades.**
   deploys on JAM with JAM's own tooling. The PolkaJam JSON-RPC and `jamt`
   driver, the service's client and `JamVenue` live in `tools/jam-dev`
   (`vos-jam-dev`), which serves the end-to-end tests and the testnets;
-  neither `vos` nor `vos-node` depends on it (`just check-no-jam-dev`).
+  neither `vos` nor `vos-node` depends on it, nor on anything under
+  `tools/` (`just check-no-tools`).
   A node reaches JAM later through an extension running a light node.
 - **Venues in the node:** a space anchors and submits at one venue, through
   a `VenueClient` (`vos-venue`: the trait, `ModelVenue`, the `AnchorQueue`

@@ -1,17 +1,13 @@
 //! The actor ABI client: one function per operation of
 //! [`vos_wire::abi::Op`], following its register conventions.
 //!
-//! On the guest target an operation is an `ecalli`. Elsewhere it goes to a
-//! host function installed with [`set_host`], which receives native
-//! pointers; native tests use it to run actor code without a PVM.
+//! On the guest target an operation is an `ecalli`. Elsewhere there is no
+//! host to call: the functions compile, for crates that link an actor's
+//! library natively, and an operation is unreachable.
 
 use alloc::vec::Vec;
 
 use vos_wire::abi::{Op, Rows, cap, code};
-
-/// An operation's results: φ7 and φ8.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Results(pub u64, pub u64);
 
 /// An `ecalli` of host call `$id`, a constant, with φ7 to φ12 from `$a`,
 /// an array of six: φ7 and φ8 after it. The default agent makes its own
@@ -45,39 +41,17 @@ macro_rules! ecalli {
     }};
 }
 
+/// An operation off the guest target, where no host serves the ABI.
 #[cfg(not(target_arch = "riscv64"))]
-mod native {
-    use core::sync::atomic::{AtomicPtr, Ordering};
-
-    use super::Results;
-
-    /// A native host: the operation id and φ7..φ12, with native pointers.
-    pub type Host = fn(u64, [u64; 6]) -> Results;
-
-    static HOST: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
-
-    pub fn set_host(host: Host) {
-        HOST.store(host as *mut (), Ordering::SeqCst);
-    }
-
-    pub fn call(id: u64, args: [u64; 6]) -> Results {
-        let host = HOST.load(Ordering::SeqCst);
-        assert!(!host.is_null(), "no native host installed");
-        // SAFETY: only `set_host` stores here, and it stores a `Host`.
-        let host: Host = unsafe { core::mem::transmute::<*mut (), Host>(host) };
-        host(id, args)
-    }
+fn no_host(_id: u64, _args: [u64; 6]) -> (u64, u64) {
+    unreachable!("the actor ABI is served on the guest target alone")
 }
 
 #[cfg(not(target_arch = "riscv64"))]
-pub use native::{Host, set_host};
-
-#[cfg(not(target_arch = "riscv64"))]
 macro_rules! ecalli {
-    ($id:expr, $a:expr) => {{
-        let Results(r0, r1) = native::call($id, $a);
-        (r0, r1)
-    }};
+    ($id:expr, $a:expr) => {
+        no_host($id, $a)
+    };
 }
 
 fn ptr(bytes: &[u8]) -> u64 {

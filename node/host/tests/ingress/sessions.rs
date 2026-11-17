@@ -50,7 +50,7 @@ fn signatures_are_checked() {
     let served = Served::plain();
     let client = served.client(1);
     let agent = served.agent;
-    let path = format!("/agents/{}/calls", agent.0);
+    let route = (Kind::Call, agent);
 
     let mut body = client
         .call_body(agent, 1, COUNTER, served.increment, &5u64.encode())
@@ -58,7 +58,7 @@ fn signatures_are_checked() {
     let (mut call, _) = Call::decode(&body).unwrap();
     call.arguments = 6u64.encode();
     assert_eq!(
-        served.post(&path, &call.encode()),
+        served.post(route, &call.encode()),
         Response::Rejected(Rejection::BadSignature),
         "arguments changed after signing"
     );
@@ -66,13 +66,13 @@ fn signatures_are_checked() {
     call = Call::decode(&body).unwrap().0;
     call.session.name[0] ^= 1;
     assert_eq!(
-        served.post(&path, &call.encode()),
+        served.post(route, &call.encode()),
         Response::Rejected(Rejection::BadSignature)
     );
     call = Call::decode(&body).unwrap().0;
     call.session.key = SigningKey::from_bytes(&[2; 32]).verifying_key().to_bytes();
     assert_eq!(
-        served.post(&path, &call.encode()),
+        served.post(route, &call.encode()),
         Response::Rejected(Rejection::BadSignature)
     );
     // Signed for one agent, sent to another: the agent's identity is in
@@ -81,18 +81,18 @@ fn signatures_are_checked() {
     let Ok(Response::Created(other)) = operator.create_agent(Vec::new()) else {
         panic!("another agent")
     };
-    let elsewhere = format!("/agents/{}/calls", other.0);
+    let elsewhere = (Kind::Call, other);
     assert_eq!(
-        served.post(&elsewhere, &body),
+        served.post(elsewhere, &body),
         Response::Rejected(Rejection::BadSignature)
     );
     assert_eq!(
-        served.post(&format!("/agents/{}/calls", other.0 + 1), &body),
+        served.post((Kind::Call, AgentId(other.0 + 1)), &body),
         Response::NoAgent
     );
     body.truncate(body.len() - 1);
     assert_eq!(
-        served.post(&path, &body),
+        served.post(route, &body),
         Response::Rejected(Rejection::Malformed)
     );
 }
@@ -104,7 +104,7 @@ fn a_new_session_starts_near_the_agents_time() {
     let served = Served::plain();
     let client = served.client(1);
     let agent = served.agent;
-    let path = format!("/agents/{}/calls", agent.0);
+    let route = (Kind::Call, agent);
     let stale = |t0: u64| {
         let mut call = Call::decode(
             &client
@@ -117,7 +117,7 @@ fn a_new_session_starts_near_the_agents_time() {
         let key = SigningKey::from_bytes(&[1; 32]);
         let message = call.message(&client.identity(agent).unwrap());
         call.signature = ed25519_dalek::Signer::sign(&key, &message).to_bytes();
-        served.post(&path, &call.encode())
+        served.post(route, &call.encode())
     };
     let now = served.now();
     for t0 in [

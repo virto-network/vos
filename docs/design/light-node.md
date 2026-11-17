@@ -73,7 +73,7 @@ devices decrypt each other's messages".
 | E20 | Virto runs a public home-only space, listed in the app as the default; others may run their own, and users may pick them. |
 | E21 | The light node runs in its own `:vos` Android process behind Binder in slice 8, for crash isolation and background sync without the UI process. |
 | E22 | Tor is the light node's default transport for every space, with a per-space opt-out and a plain warning; anonymous (credentialed or proven) calls never leave the client over the clearnet in any space, enforced by the client and optionally by a space's ingress through the gateway's transport mark; a space may declare itself onion-only (the home is, E17); key-signed calls may use the clearnet where the space allows. Plain bridges in slice 8; obfs4 and Snowflake later. |
-| E23 | The gateway's onion serves only HTTP (plain inside the onion) and SSH, the clearnet's protocols; no raw node-API port. The light node speaks `vos-api` over SSH over the onion, whose relay set gains `Call` and `Credentialed`; the SSH handshake is paid once per kept-open connection. SSH over QUIC or a roaming transport later, when UDP over Tor exists. |
+| E23 | The gateway's onion serves only SSH; no raw node-API port, and no HTTP (owner, 2026-11-13: port 80 had no client, and an unused protocol on the anonymous side is surface with no user; it opens again when one exists). The light node speaks `vos-api` over SSH over the onion, whose relay set gains `Call` and `Credentialed`; the SSH handshake is paid once per kept-open connection. SSH over QUIC or a roaming transport later, when UDP over Tor exists. |
 | E24 | The device set records each admin key's attestation (a TEE key behind a strong biometric) and the verified-boot state; the chrome shows an unattested key or an unverified boot, without changing the device's admin class. |
 | E25 | 8.25's flood measurement over live Tor runs on a private Tor test network (chutney) at M5's acceptance, a lighter run accepted. |
 | E26 | A scheduling decision (phone sessions), not recorded here. |
@@ -2980,13 +2980,10 @@ with the service's key from the gateway's key directory; the returned
 stream of `RendRequest`s goes through `tor_hsservice::handle_rend_requests`,
 which yields one `StreamRequest` a client stream (a `BEGIN` to a virtual
 port); accepting it gives a `DataStream`, `AsyncRead + AsyncWrite` for
-futures and tokio. **The onion serves what the clearnet serves, and
-nothing else** [decided, E23]:
-- **22, SSH:** the same `s4-server` handler its TCP port runs, with its
-  `vos-api` subsystem relaying the node API's frames;
-- **80, HTTP:** the same `vos-http` routes (`tokio_util::compat`, as
-  today's TCP), plain inside the onion, whose own encryption and
-  self-authenticating address stand in for TLS.
+futures and tokio. **The onion serves SSH, and nothing else** [decided,
+E23]: on port 22, the same `s4-server` handler its TCP port runs, with its
+`vos-api` subsystem relaying the node API's frames. HTTP stays the
+clearnet's.
 
 **What hosting takes in arti-client 0.47** [measured, plan 8.1's spike
 gateway, 2026-11-02]:
@@ -3062,8 +3059,8 @@ gateway's `tor` feature hosts the onion in process on arti-client 0.47.0
 (pinned exactly), full vanguards on, its key from the gateway's own file
 inserted once into arti's keystore and checked against it at each start,
 arti's service-side PoW behind the `tor-pow` feature and the file's
-`pow`, off by default. Port 80 is the gateway's own HTTP server, port 22
-its own SSH server, both marking onion; any other port is refused `DONE`.
+`pow`, off by default. Port 22 is its own SSH server, marking onion; any
+other port is refused `DONE`.
 s4-server serves any source of connections (its `Listener`: a TCP
 listener, or streams handed over), so each SSH stream is handed to the
 onion's SSH server with its circuit's address, a port of it its own: the
@@ -3740,7 +3737,7 @@ version a release and budget an upgrade step each slice.
 | `vos-wire`, `vos-api` | `Credentialed.claim` in place of `CredentialPublic`; `CredentialedInput` carries the claim; `Principal::Kernel { program }` (index 7); `CredentialKind` deleted; the frame's transport mark (`node-api.md` §2; a missing mark is clearnet, §3.3) |
 | `merkle-crdt` | [built] the incremental apply (`core-model.md` §9.4); the author, its sequence and signature in the payload; a `Store` over fjall (`FjallStore`, the `fjall` feature; the core stays `no_std`); fetching by batch, sans I/O so an asynchronous client drives the round trips (`Replica::want` and `serve` for a DAG walk, `Replica::cursor` and `ingest` for `since`); the `redb` store and feature deleted (one storage engine) |
 | `vos-credentials` | the stock `auth` kernel (from the `device` test actor, in SDK form) and a new `owner` kernel, with their references; each stock guard's compatibility window of program ids (§4.4); the stock kernels' ingress checks stay in the node (§4.3); the registrar's open claim priced by work (§3.3), its person records, `enroll_device` and `revoke_device` (§3.8) |
-| `vos-gateway` | the onion service behind a `tor` feature, serving the same HTTP and SSH as the clearnet and nothing else (§6.1); the SSH `vos-api` subsystem's relay set adding `Call` and `Credentialed`, with caps per connection, circuit, agent and onion; the transport mark on every relayed request; every node of its space listed as an upstream when it serves a home (§3.3) |
+| `vos-gateway` | the onion service behind a `tor` feature, serving the same SSH as the clearnet and nothing else (§6.1); the SSH `vos-api` subsystem's relay set adding `Call` and `Credentialed`, with caps per connection, circuit, agent and onion; the transport mark on every relayed request; every node of its space listed as an upstream when it serves a home (§3.3) |
 | new system actors | `Homes` (the pool, claims, the indexes by nullifier and by kit key, the yearly re-proof and the lease) and `Personal` (the device set and its contests, liveness, the commit log and confirmations, sealed scopes, checkpoint acknowledgements, the inbox, quotas, gated queries, an append-only layout), each one package; `Payments` (replacing the `purses` test actor) |
 | new tool | the operator's keeper: topping up the pool, granting `Homes` its role, upgrading `Personal` in batches (§3.3) |
 
@@ -3771,8 +3768,7 @@ device's crates faster); Q9's size argument for it is small.
   an ordinary agent running ordinary actors: nothing in the node knows
   what a personal agent is.
 - **The gateway** keeps HTTP, TLS and SSH, and adds the onion service
-  (§6): the same HTTP routes and SSH behind an onion address, and nothing
-  else [E23]. Its SSH `vos-api` subsystem's relay set is wider than
+  (§6): the same SSH behind an onion address, and nothing else [E23]. Its SSH `vos-api` subsystem's relay set is wider than
   today's (`NodeKey`, `Time`, `AgentInfo`, `Schema`, `Devices`, `Query`;
   `node/api/src/lib.rs`, `Kind::relayed`): it adds `Credentialed` and
   `Call`, which the light node sends through it.

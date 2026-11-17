@@ -215,7 +215,7 @@ fn touring(node: &Node, replicas: &[u8], rounds: &Rounds) -> AgentId {
 
 /// Workflow `id`'s state, as `node` applied it.
 fn state(node: &Node, agent: AgentId, id: WorkflowId) -> WorkflowState {
-    vos_checker::applied::<Workflow>(node.store(), agent, &keys::workflow(id))
+    vos_checker::applied::<Workflow>(node.probes().store(), agent, &keys::workflow(id))
         .expect("the workflow's record")
         .state
 }

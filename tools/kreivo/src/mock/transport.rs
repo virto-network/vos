@@ -16,7 +16,7 @@ use parity_scale_codec::{DecodeAll, Encode};
 
 use super::types::AccountId;
 use super::{Chain, Origin, Verdict, keys};
-use crate::kreivo::transport::{Included, Invalid, Lost, SendError, Signed, Transport};
+use crate::transport::{Included, Invalid, Lost, SendError, Signed, Transport};
 
 /// How many blocks a signed extrinsic is valid for: its era.
 const ERA: u64 = 64;

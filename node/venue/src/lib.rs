@@ -5,17 +5,13 @@
 //! anchors in an [`queue::AnchorQueue`].
 //!
 //! The node carries no venue's client: venues attach to a node through
-//! extensions. What this crate holds of them, no production build enables:
+//! extensions. What this crate holds of one, no production build enables:
+//! feature `model`, `ModelVenue`, a venue modelled in memory, which the
+//! node's tests anchor and submit at.
 //!
-//! - feature `model`: `ModelVenue`, a venue modelled in memory, which the
-//!   node's tests anchor and submit at;
-//! - feature `kreivo`: `kreivo::KreivoVenue`, the client of Kreivo's spaces
-//!   pallet, built only against its mock until the pallet is vetted;
-//! - feature `kreivo-mock` (with `kreivo`): `kreivo::mock`, the reference
-//!   mock of that pallet and a transport over it.
-//!
-//! A JAM statements service is a venue only through VOS's development
-//! tooling (`vos-jam-dev`'s `JamVenue`).
+//! Kreivo's spaces pallet and a JAM statements service are venues only
+//! through VOS's development tooling (`vos-kreivo`'s `KreivoVenue`,
+//! `vos-jam-dev`'s `JamVenue`).
 
 use ed25519_dalek::{Signature, VerifyingKey};
 pub use vos_anchor::venue::{aged, fresh};
@@ -270,14 +266,12 @@ pub enum Held {
 }
 
 /// `mutex`, locked, as a holder that panicked left it.
-pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-#[cfg(any(test, feature = "kreivo"))]
-pub mod kreivo;
 #[cfg(any(test, feature = "model"))]
 mod model;
 pub mod queue;

@@ -20,8 +20,8 @@ use parity_scale_codec::Encode;
 use super::submits::g7_chain;
 use super::world::{AUTHORITY_F, F};
 use super::{Fixtures, hex};
-use crate::kreivo::mock::types::{Call, Event, RuntimeCall};
-use crate::kreivo::mock::{Chain, Origin, Verdict};
+use crate::mock::types::{Call, Event, RuntimeCall};
+use crate::mock::{Chain, Origin, Verdict};
 
 /// A statement's and a proof's code, by the model input's `judge` and by
 /// the mock's `submit` at G7's pre-state, asserted equal.
@@ -280,7 +280,10 @@ fn masked_field_mutants(judge: &Judge, proof: &[u8]) -> (Vec<Mutant>, Vec<String
         match masked::encode(&tampered) {
             Some(bytes) => {
                 let code = judge.code(&statement, &bytes);
-                assert!(crate::proof_refused(code), "{name}: refused by its proof");
+                assert!(
+                    vos_venue::proof_refused(code),
+                    "{name}: refused by its proof"
+                );
                 mutants.push(mutant(name.to_string(), proof, &bytes, code));
             }
             None => without.push(name.to_string()),

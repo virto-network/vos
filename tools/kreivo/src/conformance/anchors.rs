@@ -4,9 +4,9 @@ use parity_scale_codec::Encode;
 
 use super::world::*;
 use super::{Fixtures, Vector};
-use crate::kreivo::mock::Origin;
-use crate::kreivo::mock::keys;
-use crate::kreivo::mock::types::{
+use crate::mock::Origin;
+use crate::mock::keys;
+use crate::mock::types::{
     BalancesCall, Call, Error, Event, MultiAddress, RuntimeCall, SpaceStatus,
 };
 

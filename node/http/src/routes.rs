@@ -1,8 +1,8 @@
-//! Today's HTTP routes as node-API requests: each route's kind and frame
+//! VOS's HTTP routes as node-API requests: each route's kind and frame
 //! body, the answers given without a node (a path naming no agent, an
 //! unknown path), an operator route's authorization, and an answer
-//! frame's HTTP form. The gateway runs it, and the node API's client
-//! translates its requests by it.
+//! frame's HTTP form. The gateway routes by it ([`route`]); a client of
+//! the gateway's HTTP forms its requests by its inverse ([`path`]).
 
 use base64::Engine;
 use vos_api::{CREDENTIALS, FRAME_ERROR, FrameError, Kind, Operated};
@@ -12,7 +12,7 @@ use vos_wire::ingress::{
 };
 use vos_wire::{Decode, Encode};
 
-use crate::server::{Request, Response};
+use crate::request::{Request, Response};
 
 /// The scheme of an `Authorization` header carrying an operator's
 /// envelope.
@@ -134,6 +134,47 @@ pub fn route(request: &Request) -> Routed {
         ("POST", ["agents", id, "reports"]) => operator(Kind::Reports, agent_and(id, body)),
         ("POST", ["retire"]) => operator(Kind::Retire, Ok(body.clone())),
         _ => Routed::Answer(Response::not_found()),
+    }
+}
+
+/// The HTTP request [`route`] takes to a frame of `kind` holding `body`:
+/// its method, its path, and the part of `body` its HTTP body carries, the
+/// rest being what the path names (an agent, an instance). An operator's
+/// kind is routed by its envelope's inner body, the envelope's fields going
+/// in the `Authorization` header ([`operated_header`]). `None` for a body
+/// too short to name what its path does, or a read's body holding more.
+pub fn path(kind: Kind, body: &[u8]) -> Option<(&'static str, String, &[u8])> {
+    let id = |at: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(body.get(at..at + 4)?.try_into().ok()?))
+    };
+    let post = |suffix: &str| Some(("POST", format!("/agents/{}/{suffix}", id(0)?), &body[4..]));
+    let get =
+        |path: String, used: usize| (body.len() == used).then_some(("GET", path, &body[used..]));
+    let instance = |suffix: &str| {
+        get(
+            format!("/agents/{}/instances/{}/{suffix}", id(0)?, id(4)?),
+            8,
+        )
+    };
+    match kind {
+        Kind::NodeKey => get("/".into(), 0),
+        Kind::Time => get("/time".into(), 0),
+        Kind::AgentInfo => get(format!("/agents/{}", id(0)?), 4),
+        Kind::Schema => instance("schema"),
+        Kind::Devices => instance("devices"),
+        Kind::Call => post("calls"),
+        Kind::Query => post("queries"),
+        Kind::Workflow => post("workflows"),
+        Kind::Credentialed => post("credentialed"),
+        Kind::Stats => get("/stats".into(), 0),
+        Kind::Status => get(format!("/agents/{}/status", id(0)?), 4),
+        Kind::CreateAgent => Some(("POST", "/agents".into(), body)),
+        Kind::CreateRepresentative => Some(("POST", "/representative".into(), body)),
+        Kind::Install => post("install"),
+        Kind::Replace => post("replicas"),
+        Kind::Grant => post("roles"),
+        Kind::Reports => post("reports"),
+        Kind::Retire => Some(("POST", "/retire".into(), body)),
     }
 }
 
@@ -288,6 +329,33 @@ mod tests {
             routed("GET", "/agents/1/instances/x/schema", b""),
             Routed::Answer(Response::not_found())
         );
+    }
+
+    /// Every kind's frame, as [`path`] makes it a request, routes back to
+    /// the same kind and frame body.
+    #[test]
+    fn path_is_the_inverse_of_route() {
+        let agent = 7u32.encode();
+        let named = [&agent[..], b"abc"].concat();
+        let instance = (7u32, 2u32).encode();
+        for kind in Kind::ALL {
+            let body: &[u8] = match kind {
+                Kind::NodeKey | Kind::Time | Kind::Stats => &[],
+                Kind::AgentInfo | Kind::Status => &agent,
+                Kind::Schema | Kind::Devices => &instance,
+                _ => &named,
+            };
+            let (method, path, http) = path(kind, body).expect("a route");
+            let routed = route(&request(method, &path, http));
+            let (routed, frame) = match routed {
+                Routed::Request { kind, body } => (kind, body),
+                Routed::Operator { kind, inner, .. } => (kind, inner.expect("an agent")),
+                Routed::Answer(answer) => panic!("{kind:?}: answered {answer:?}"),
+            };
+            assert_eq!((routed, frame.as_slice()), (kind, body), "{kind:?}");
+        }
+        assert_eq!(path(Kind::Call, &[7]), None, "no agent named");
+        assert_eq!(path(Kind::AgentInfo, &named), None, "a read holding more");
     }
 
     #[test]

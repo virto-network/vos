@@ -55,6 +55,7 @@ impl Cluster {
     /// The entries `agent`'s outbox holds at node `at`.
     fn outbox(&self, at: NodeNumber, agent: AgentId) -> usize {
         self.node(at)
+            .probes()
             .store()
             .snapshot()
             .scan(agent, &keys::outbox_prefix(), None)
@@ -63,7 +64,7 @@ impl Cluster {
 
     /// A value of `agent`'s applied state at node `at`.
     fn read<T: Decode>(&self, at: NodeNumber, agent: AgentId, key: &[u8]) -> Option<T> {
-        vos_checker::applied(self.node(at).store(), agent, key)
+        vos_checker::applied(self.node(at).probes().store(), agent, key)
     }
 
     /// The runs of the steps `agent` applied at node `at` for `input`: its
@@ -72,9 +73,9 @@ impl Cluster {
     /// count of it moves only once that commit returns.
     fn runs(&self, at: NodeNumber, agent: AgentId, input: &InputRef) -> Vec<Run> {
         let node = self.node(at);
-        let applied = node.store().snapshot().applied(agent).unwrap();
+        let applied = node.probes().store().snapshot().applied(agent).unwrap();
         (1..=applied.unwrap_or(0))
-            .filter_map(|index| node.store().log_entry(agent, index).unwrap())
+            .filter_map(|index| node.probes().store().log_entry(agent, index).unwrap())
             .filter(|entry| entry.kind == EntryKind::Result)
             .flat_map(|entry| WorkResult::decode(&entry.body).unwrap().0.steps)
             .filter_map(|step| match step {
@@ -111,7 +112,7 @@ fn a_message_reaches_an_agent_on_other_nodes_once() {
         cluster.forward_once(sender, sequence, target, by);
     }
     cluster.delivered((sender, &[1]), (target, &[2, 3]), 12);
-    assert!(cluster.node(1).messages_sent_across() > 0);
+    assert!(cluster.node(1).probes().messages_sent_across() > 0);
 }
 
 /// With the sender on {1, 2, 3} and the target on {2, 3, 4}, a message
@@ -258,7 +259,7 @@ fn a_follower_relays_a_message_to_its_leader() {
     cluster.forward_once(sender, 1, target, 11);
     cluster.delivered((sender, &[1]), (target, &[2, 3, 4]), 11);
     assert!(
-        cluster.node(3).messages_relayed() > 0,
+        cluster.node(3).probes().messages_relayed() > 0,
         "node 3 relayed nothing"
     );
 }
@@ -320,10 +321,10 @@ fn a_message_failing_refine_is_consumed_once_and_never_sent_again() {
 
     // Past two rounds, nothing went again.
     let failed = hook.failed.load(Ordering::SeqCst);
-    let sent = cluster.node(1).messages_sent_across();
+    let sent = cluster.node(1).probes().messages_sent_across();
     std::thread::sleep(Duration::from_millis(3_500));
     assert_eq!(hook.failed.load(Ordering::SeqCst), failed);
-    assert_eq!(cluster.node(1).messages_sent_across(), sent);
+    assert_eq!(cluster.node(1).probes().messages_sent_across(), sent);
 
     cluster.forward_once(sender, 2, target, 3);
     cluster.delivered((sender, &[1]), (target, &[2, 3]), 3);
@@ -423,7 +424,7 @@ fn a_full_queues_drops_go_again_once_it_drained() {
     let closed = hold.refines.close();
     forwarded(&cluster, sender, target, 2..=11);
     wait_until("the receiver's full queue drops some", || {
-        hold.refines.reached() > 0 && cluster.node(2).dropped(Refusal::Full) > 0
+        hold.refines.reached() > 0 && cluster.node(2).probes().dropped(Refusal::Full) > 0
     });
     let released = Instant::now();
     drop(closed);
@@ -458,7 +459,7 @@ fn a_full_queues_drops_go_again_beside_a_steady_sender() {
         }
     });
     wait_until("the receiver's full queue drops some", || {
-        hold.refines.reached() > 0 && cluster.node(2).dropped(Refusal::Full) > 0
+        hold.refines.reached() > 0 && cluster.node(2).probes().dropped(Refusal::Full) > 0
     });
     let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {
@@ -508,7 +509,7 @@ fn a_stale_behind_changes_nothing() {
     wait_until("the target applies both, unacknowledged", || {
         cluster.value(cluster.leader(target), target) == 15 && cluster.outbox(1, sender) == 2
     });
-    let sent = cluster.node(1).messages_sent_across();
+    let sent = cluster.node(1).probes().messages_sent_across();
     replica.send(
         1,
         &PeerMessage::Behind {
@@ -518,7 +519,7 @@ fn a_stale_behind_changes_nothing() {
         },
     );
     wait_until("the sender sends its window again", || {
-        cluster.node(1).messages_sent_across() >= sent + 2
+        cluster.node(1).probes().messages_sent_across() >= sent + 2
     });
     std::thread::sleep(Duration::from_millis(200));
     let leader = cluster.leader(target);

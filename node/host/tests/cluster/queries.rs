@@ -4,9 +4,10 @@
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
+use vos_api::Kind;
 use vos_checker::calls::{Total, done, signed_query};
 use vos_checker::hooks::Gate;
-use vos_node::client::{Target, agent_info, post_within};
+use vos_node::client::{Target, agent_info, naming, send_within};
 use vos_wire::ingress::{Consistency, Response};
 
 use crate::common::{COUNTER, Cluster};
@@ -31,7 +32,6 @@ fn a_linearizable_method_reads_a_write_its_follower_has_not_applied() {
     let record = agent_info(&target, agent).unwrap().unwrap().record;
     let identity = vos_node::identity(&record);
     let key = SigningKey::from_bytes(&[13; 32]);
-    let path = format!("/agents/{}/queries", agent.0);
     let query = |method: &str| {
         let not_after = vos_node::wall_clock() + 60_000;
         let method = cluster.programs.method(method);
@@ -41,13 +41,14 @@ fn a_linearizable_method_reads_a_write_its_follower_has_not_applied() {
 
     let closed = gates[usize::from(follower) - 1].close();
     assert_eq!(done(cluster.increment_at_leader(agent, 1, 5)), 5);
-    let stale = post_within(&target, &path, &query("value"), QUERY_ANSWERED).unwrap();
+    let stale = naming(agent, &query("value"));
+    let stale = send_within(&target, Kind::Query, &stale, QUERY_ANSWERED).unwrap();
     assert_eq!(stale.total(), Some(0), "{stale:?}");
     std::thread::scope(|scope| {
         let (answered, read) = std::sync::mpsc::channel();
-        let (target, path, latest) = (&target, &path, query("latest"));
+        let (target, latest) = (&target, naming(agent, &query("latest")));
         scope.spawn(move || {
-            let _ = answered.send(post_within(target, path, &latest, QUERY_ANSWERED));
+            let _ = answered.send(send_within(target, Kind::Query, &latest, QUERY_ANSWERED));
         });
         std::thread::sleep(Duration::from_millis(300));
         let early: Option<Response> = read.try_recv().ok().map(Result::unwrap);

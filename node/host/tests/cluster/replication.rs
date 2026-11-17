@@ -31,7 +31,7 @@ fn an_agent_belongs_to_its_nodes_space() {
     assert_ne!(space, SpaceId::NONE);
     let agent = cluster.counter_agent(&[1, 2, 3]);
     for number in 1..=3 {
-        let store = cluster.node(number).store();
+        let store = cluster.node(number).probes().store();
         let records = store.agents().unwrap();
         let record = records.iter().find(|record| record.agent == agent).unwrap();
         assert_eq!(record.space, space, "node {number}");
@@ -64,7 +64,7 @@ fn a_node_of_another_space_refuses_its_agents() {
     });
     let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
     wait_until("node 3 refuses the agent's record", || {
-        cluster.node(3).dropped(PeerRefusal::OtherSpace) > 0
+        cluster.node(3).probes().dropped(PeerRefusal::OtherSpace) > 0
     });
     wait_until("nodes 1 and 2 run the group", || {
         [1, 2]
@@ -72,7 +72,15 @@ fn a_node_of_another_space_refuses_its_agents() {
             .all(|number| cluster.node(*number).applied(agent).is_some())
     });
     assert!(cluster.node(3).applied(agent).is_none());
-    assert!(cluster.node(3).store().agents().unwrap().is_empty());
+    assert!(
+        cluster
+            .node(3)
+            .probes()
+            .store()
+            .agents()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -95,7 +103,7 @@ fn an_agent_created_on_three_nodes_applies_alike_on_each() {
         );
     }
     let pins: Vec<Vec<[u8; 32]>> = (1..=3)
-        .map(|number| cluster.node(number).pinned())
+        .map(|number| cluster.node(number).probes().pinned())
         .collect();
     assert!(!pins[0].is_empty(), "the program is pinned");
     assert!(
@@ -194,7 +202,8 @@ fn a_new_leader_serves_after_the_old_one_stops_and_the_old_one_catches_up() {
     let first = cluster.leader(agent);
     assert_eq!(done(cluster.increment(first, agent, 1, 5)), 5);
     let time = |node: &Node| {
-        node.store()
+        node.probes()
+            .store()
             .snapshot()
             .last_result(agent)
             .unwrap()
@@ -229,12 +238,12 @@ fn a_partitioned_follower_catches_up_and_runs_the_program_it_missed() {
     cluster.hub.isolate(follower);
     cluster.install(agent);
     assert_eq!(done(cluster.increment_at_leader(agent, 1, 3)), 3);
-    assert!(cluster.node(follower).pinned().is_empty());
+    assert!(cluster.node(follower).probes().pinned().is_empty());
     cluster.hub.heal();
     cluster.converged(agent);
     assert_eq!(
-        cluster.node(follower).pinned(),
-        cluster.node(leader).pinned()
+        cluster.node(follower).probes().pinned(),
+        cluster.node(leader).probes().pinned()
     );
     assert_eq!(cluster.value(follower, agent), 3);
 }
@@ -322,7 +331,7 @@ fn an_input_whose_accumulate_fails_is_isolated_before_the_log() {
     assert_eq!(replies[2], Ok(Reply::Refused(Refusal::Sequence)));
     cluster.converged(agent);
     // No entry carries the poisoned input.
-    let store = node.store();
+    let store = node.probes().store();
     let applied = node.applied(agent).unwrap();
     for index in 1..=applied {
         let entry = store.log_entry(agent, index).unwrap().unwrap();
@@ -424,8 +433,8 @@ fn a_follower_fetches_a_blob_from_another_member_when_the_leader_withholds_it() 
     cluster.hub.heal();
     cluster.converged(agent);
     assert_eq!(
-        cluster.node(follower).pinned(),
-        cluster.node(leader).pinned()
+        cluster.node(follower).probes().pinned(),
+        cluster.node(leader).probes().pinned()
     );
     assert_eq!(cluster.value(follower, agent), 3);
 }
@@ -447,34 +456,37 @@ fn replicas_that_never_took_the_install_pool_the_program_on_first_use() {
     let agent = cluster.counter_agent(&[1, 2, 3]);
     let first = cluster.leader(agent);
     assert_eq!(first, 1);
-    let program = cluster.node(first).pinned()[0];
-    assert!(cluster.node(first).pooled(&program), "the install pools it");
+    let program = cluster.node(first).probes().pinned()[0];
+    assert!(
+        cluster.node(first).probes().pooled(&program),
+        "the install pools it"
+    );
     wait_until("every replica pins the program", || {
-        (1..=3).all(|number| cluster.node(number).pinned().contains(&program))
+        (1..=3).all(|number| cluster.node(number).probes().pinned().contains(&program))
     });
     assert!(
         (1..=3)
             .filter(|number| *number != first)
-            .all(|number| !cluster.node(number).pooled(&program))
+            .all(|number| !cluster.node(number).probes().pooled(&program))
     );
 
     cluster.stop(first);
     let second = cluster.leader(agent);
-    assert!(!cluster.node(second).pooled(&program));
+    assert!(!cluster.node(second).probes().pooled(&program));
     assert_eq!(done(cluster.increment(second, agent, 1, 5)), 5);
     assert!(
-        cluster.node(second).pooled(&program),
+        cluster.node(second).probes().pooled(&program),
         "pooled at its first call"
     );
 
     let follower = (1..=3)
         .find(|number| *number != first && *number != second)
         .unwrap();
-    assert!(!cluster.node(follower).pooled(&program));
+    assert!(!cluster.node(follower).probes().pooled(&program));
     cluster.caught_up(follower, agent, second);
     assert_eq!(cluster.value(follower, agent), 5);
     assert!(
-        cluster.node(follower).pooled(&program),
+        cluster.node(follower).probes().pooled(&program),
         "pooled at its first query"
     );
 }
@@ -495,7 +507,7 @@ fn a_program_leaves_the_pool_with_its_last_pin() {
     let agents: Vec<AgentId> = (0..2).map(|_| cluster.counter_agent(&[1, 2, 3])).collect();
     let leaders: Vec<NodeNumber> = agents.iter().map(|agent| cluster.leader(*agent)).collect();
     let node = (1..=3).find(|number| !leaders.contains(number)).unwrap();
-    let program = cluster.node(leaders[0]).pinned()[0];
+    let program = cluster.node(leaders[0]).probes().pinned()[0];
     for agent in &agents {
         wait_until("the replica applies the install", || {
             cluster.node(node).applied(*agent)
@@ -503,7 +515,7 @@ fn a_program_leaves_the_pool_with_its_last_pin() {
         });
         assert_eq!(cluster.value(node, *agent), 0);
     }
-    assert!(cluster.node(node).pooled(&program));
+    assert!(cluster.node(node).probes().pooled(&program));
 
     let replace = |agent: AgentId, leader: NodeNumber| {
         let replicas = cluster.replace(leader, agent, &[1, 2, 3], node, 4);
@@ -512,26 +524,29 @@ fn a_program_leaves_the_pool_with_its_last_pin() {
     };
     replace(agents[0], leaders[0]);
     assert!(
-        cluster.node(node).pooled(&program),
+        cluster.node(node).probes().pooled(&program),
         "kept while another agent pins it"
     );
     replace(agents[1], leaders[1]);
     wait_until("the pool drops the program", || {
-        !cluster.node(node).pooled(&program)
+        !cluster.node(node).probes().pooled(&program)
     });
     wait_until("the blob store drops the program", || {
-        !cluster.node(node).stores_blob(&program)
+        !cluster.node(node).probes().stores_blob(&program)
     });
     std::thread::sleep(Duration::from_millis(500));
     for (number, running) in cluster.running() {
         if number != node {
-            assert!(running.stores_blob(&program), "node {number} pins it");
+            assert!(
+                running.probes().stores_blob(&program),
+                "node {number} pins it"
+            );
         }
     }
     cluster.stop(node);
     cluster.start(node);
     assert!(
-        !cluster.node(node).pooled(&program),
+        !cluster.node(node).probes().pooled(&program),
         "a restart pools no program unpinned"
     );
 
@@ -546,12 +561,18 @@ fn a_program_leaves_the_pool_with_its_last_pin() {
         cluster.node(node).applied(third) >= cluster.node(cluster.leader(third)).applied(third)
     });
     assert_eq!(cluster.value(node, third), 0);
-    assert!(cluster.node(node).pooled(&program), "held again once run");
-    assert!(cluster.node(node).stores_blob(&program), "fetched again");
+    assert!(
+        cluster.node(node).probes().pooled(&program),
+        "held again once run"
+    );
+    assert!(
+        cluster.node(node).probes().stores_blob(&program),
+        "fetched again"
+    );
     cluster.stop(node);
     cluster.start(node);
     assert!(
-        cluster.node(node).pooled(&program),
+        cluster.node(node).probes().pooled(&program),
         "a restart pools a program pinned"
     );
 }

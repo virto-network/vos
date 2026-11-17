@@ -178,7 +178,7 @@ them and never re-implements their encodings.
 | the venue rules | the registration, the anchor rule, what is anchored and a root's freshness, over the venue's state: `Roots { now, space, held }` and `VenueState: Roots { venue, listed, last, verify }`; `Space { clock, start, status }`, `Status { Active, Blocked, Ended }`, `Held { root, signer }` | `vos_anchor::venue::{registration, register, anchor, anchored, small_order}` |
 
 - **The venue rules' state the pallet implements over its storage**
-  (`StorageVenue` in VOS's mock, `node/venue/src/kreivo/mock/types.rs`):
+  (`StorageVenue` in VOS's mock, `tools/kreivo/src/mock/types.rs`):
   - `now()`: `Timestamp.Now`;
   - `space(id)`: `Spaces[id]` as `Space { clock, start: start_window,
     status }`, `SpaceStatus` mapped one to one;
@@ -770,7 +770,7 @@ VOS ships the client's logic, not its chain transport:
 - `KreivoVenue`, the `VenueClient` the node anchors and submits through;
 - its pinned `calls`;
 - the `Sender`, which sends a call at most once;
-- the `Transport` trait under them (`node/venue/src/kreivo/transport.rs`).
+- the `Transport` trait under them (`tools/kreivo/src/transport.rs`).
 
 **Where the transport comes from.** VOS master already has a Substrate
 integration on `sube`: `extensions/substrate`. It runs sube over the
@@ -902,9 +902,9 @@ port adds it):
 
 **The contract** is the conformance vectors and the mock:
 - `node/venue/conformance/*.json` and the mock that writes them
-  (`vos-venue`'s `kreivo-mock` feature; `just conformance` regenerates them);
+  (`vos-kreivo`'s `kreivo-mock` feature; `just conformance` regenerates them);
 - the scenarios of `KreivoVenue`'s tests over the mock
-  (`node/venue/src/kreivo/tests/`, `node/host/tests/cluster/kreivo.rs`),
+  (`tools/kreivo/src/tests/`, `node/host/tests/cluster/kreivo.rs`),
   which set the mock's state directly: the port states them again over
   its transport against a dev chain carrying the pallet, its state set by
   the pallet's calls (the live Kreivo leg);
