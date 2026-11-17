@@ -209,7 +209,7 @@ fn at_worst(hashes: &[f64], costs: &[f64], most: f64) -> f64 {
 /// 4M gas and the verify its pin (`pvm/proof/counts.txt`); in Wasm (the
 /// final verifier's blob, `just judge-wasm`) its pin and at most 50M
 /// instructions under the PVF's semantics. Each seed's witness hashes are
-/// held to the most 24 distinct queries can take, and each gate also to its
+/// held to the most the format's distinct queries can take, and each gate also to its
 /// cost there, extrapolated along the seeds' fit (within 2% of its pin).
 #[test]
 fn heavy_the_verify_gates_hold_over_seeds() {
@@ -218,15 +218,16 @@ fn heavy_the_verify_gates_hold_over_seeds() {
     let request = jam::words_request(masked::FORMAT, words);
     let mut phases = Vec::new();
     let mut hashes = Vec::new();
-    // The most witness hashes 24 distinct queries can take, no sibling
+    // The most witness hashes the format's distinct queries can take, no sibling
     // shared: each trace tree at the lifting height (the preprocessed
     // one at its own, 16 + 5), and each FRI layer's tree, its domain
     // less the packed leaf of 4 values, less the level a query's coset
     // pair fills (domains 22, 19, 16, 13 for fold step 3).
-    let most_trees =
-        most_witness_hashes(masked::LOG_DEGREE_BOUND + 5, 24) * 3 + most_witness_hashes(16 + 5, 24);
+    let n_queries = masked::CONFIG.fri_config.n_queries;
+    let most_trees = most_witness_hashes(masked::LOG_DEGREE_BOUND + 5, n_queries) * 3
+        + most_witness_hashes(16 + 5, n_queries);
     let fri_bounds: Vec<usize> = (0..4u32)
-        .map(|layer| most_witness_hashes(masked::LOG_DEGREE_BOUND + 5 - 3 * layer - 3, 24))
+        .map(|layer| most_witness_hashes(masked::LOG_DEGREE_BOUND + 5 - 3 * layer - 3, n_queries))
         .collect();
     let most = (most_trees + fri_bounds.iter().sum::<usize>()) as f64;
     let mut files = Vec::new();
@@ -264,7 +265,7 @@ fn heavy_the_verify_gates_hold_over_seeds() {
         );
         eprintln!(
             "seed {seed}: {gas} gas, decode {decode}, verify {verify}; {} bytes; {queries} \
-             distinct queries; {trees} trace-tree witness hashes (at most {most_trees} for 24 \
+             distinct queries; {trees} trace-tree witness hashes (at most {most_trees} for {n_queries} \
              queries), {fri_hashes} FRI",
             bytes.len()
         );
