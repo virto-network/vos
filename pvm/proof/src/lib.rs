@@ -122,6 +122,9 @@ pub mod memory_layout;
 pub mod proof;
 pub mod segment;
 pub mod sparse_memory;
+// The native segment verifier from a proof and its preprocessed root, the
+// one copy of its checks (`vos-pvm-proof-verifier`'s `verify_standalone`).
+pub mod standalone;
 pub mod trace;
 
 // The format registry, the PCS stacks it selects at run time, the
@@ -361,8 +364,6 @@ pub use format::Format;
 pub use pcs::{Commitment, StarkProofAny};
 pub use proof::{Proof, SegmentState};
 // The chips a trace activates (`prove/active.rs`).
-#[cfg(feature = "prover")]
-pub(crate) use prove::active::active_components_verifier;
 #[doc(hidden)]
 #[cfg(feature = "prover")]
 pub use prove::active::{

@@ -155,13 +155,3 @@ pub fn opcode_component_mask(op: crate::core::opcode::Opcode) -> u32 {
     a.opcode(op);
     a.mask()
 }
-
-/// Verifier-side mirror of `active_components`, returning the
-/// same selection upcast to `&dyn MachineComponent`.
-pub(crate) fn active_components_verifier(
-    side_note: &side_note::SideNote,
-) -> alloc::vec::Vec<&'static dyn framework::MachineComponent> {
-    chips_of_mask(active_component_mask(side_note))
-        .map(|chip| BASE_COMPONENTS[chip] as &dyn framework::MachineComponent)
-        .collect()
-}

@@ -293,7 +293,7 @@ fn prove_impl(
 ) -> Result<(Proof, ProveProfile), SegmentError> {
     prepare_side_note_for_verification(side_note);
     // Filter BASE_COMPONENTS to active chips for THIS trace.
-    // Verifier reconstructs the same list via active_components_verifier().
+    // The verifier reconstructs the same list from the proof's component mask.
     let components_owned = super::active_components(side_note);
     let components: &[&dyn crate::framework::MachineProverComponent] = &components_owned;
     let component_mask = super::active_component_mask(side_note);

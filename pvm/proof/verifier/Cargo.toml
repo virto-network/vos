@@ -7,11 +7,6 @@ license.workspace = true
 [dependencies]
 vos-pvm-proof = { path = "..", default-features = false }
 stwo = { workspace = true }
-stwo-constraint-framework = { workspace = true }
-# De-featured like vos-pvm-proof's own pin (see the comment there): the workspace pin
-# carries default features (= std), which would drag libstd into a no_std
-# runtime that links this verifier.
-num-traits = { version = "0.2", default-features = false }
 
 [dev-dependencies]
 vos-pvm = { workspace = true }

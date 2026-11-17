@@ -9086,10 +9086,8 @@ name = "vos-pvm-proof-verifier"
 version = "0.1.0"
 dependencies = [
  "bincode",
- "num-traits",
  "postcard",
  "stwo",
- "stwo-constraint-framework",
  "vos-pvm",
  "vos-pvm-proof",
 ]
