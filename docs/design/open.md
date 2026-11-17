@@ -161,6 +161,49 @@ The scale results are in `core-model.md` §14, "The scale test".
   threshold, after which every item's accumulate reverts until the
   operator funds it. What a registration costs the service in bytes is
   unmeasured.
+- **The jump-table gate:** the pin and `derive` refuse a program whose
+  jump-table entry, static jump or branch lands on no basic-block start
+  (`vos_pvm::interpreter::bad_transfer`); no forgery gate yet shows what
+  the AIR alone accepts there (a CPU row continuing at the halt address
+  through the table), which needs a forged multi-chip trace the gates'
+  helpers do not build.
+- **The prover's restructures, measured first:** the recursion's circuit
+  rebuilt and its constant preprocessed tree committed again for every
+  leaf, fold and wrap (`Committed` as the device path keeps it); its trace
+  and interaction generation serial and scalar with an allocation a row;
+  a statement's segments, leaves and each level's folds proved one after
+  another on a global pool of at most 10 threads (an explicit pool and a
+  memory-bounded parallel map, in the API); the widest segment chips
+  filled one after another on one thread; a class found not to fit by
+  generating every chip's trace; the segment cursor cloning the memory
+  image for each class attempt. Each changes no proof byte.
+- **The verifier's DEEP inner loop** recomputes a per-batch constant for
+  every value at every query, in the fork's `accumulate_row_quotients`:
+  hoisting it changes no proof or transcript, but it is a divergence on
+  the verify path of the fork, for its review and a new pin.
+- **One BLAKE2b compression:** the runtime, the precompiles and the
+  segment chips' software path each write it, the IV a fourth time;
+  exporting the precompiles' one moves the guests' panic locations, so
+  every agent program id: at the next re-pin of the node's programs.
+- **The runtime's inline tests** (`recompiler/mod.rs`, `refine.rs`,
+  `interpreter/mod.rs`, `interpreter/memory.rs`, `gas_cost.rs`) move to
+  sibling `tests.rs` files, as the crate's other modules have them.
+- **Renames that move blobs:** `final-verifier/src/masked.rs` (format
+  39's decode and parameters) beside `masking.rs` (the masked verifier),
+  at the next change of the final verifier's circuit.
+- **Docs of guest-linked crates:** `vos-abi`'s credentials functions that
+  panic on values their callers validate, and `vos-pvm-codec`'s bound of
+  a decoded `Vec` by items, not bytes: one line each, at the next re-pin
+  of the node's programs.
+- **The kit's lock:** shipping the lock VOS's `check-kit` builds on beside
+  the kit, with a command listing every package of the verify graph a
+  consumer resolves at another version; and signed release tags with a
+  bootstrap that verifies them (today push access to VOS is the trust
+  root).
+- **A release-profile proving bench in `pvm/`** (`prove_final` over the
+  Poseidon2-M31 kernel, a device prove and verify), so the timings the
+  docs quote from the test profile have a reproducible twin.
+
 - **The external audit's scope:** the device shape, the stock kernels, the
   Poseidon2 chip and their masking, with the recursion AIR, the final
   verifier, `derive` and the security tool's counts. Engage before any
