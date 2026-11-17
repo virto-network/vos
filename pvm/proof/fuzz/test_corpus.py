@@ -9,12 +9,14 @@ and `unpack`'s directory is left empty.
 """
 
 import importlib.util
+import sys
 import io
 import tarfile
 import tempfile
 import unittest
 from pathlib import Path
 
+sys.dont_write_bytecode = True
 _spec = importlib.util.spec_from_file_location("corpus", Path(__file__).resolve().parent / "corpus.py")
 corpus = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(corpus)

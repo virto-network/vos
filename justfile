@@ -160,13 +160,13 @@ test-carriers: build-test-actors build-programs
 # JAM-only host (`vos-statement`'s fixtures test); and `vos-anchor`'s
 # golden vectors computed by the blob, every digest the pinned bytes.
 judge-wasm: build-wasm-blobs
-    cd pvm/proof/final-verifier/wasm/run; cargo build --release
+    cd pvm/proof/final-verifier/wasm/run; cargo build --release --locked
     let run = "pvm/proof/final-verifier/wasm/run/target/release/vos-pvm-final-verifier-wasm-run"; for task in [["judge" "pvm/proof/fixtures"] ["anchors"]] { for semantics in [pvf client] { ^$run "pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm" $semantics ...$task } }
 
 # The final verifier's Wasm blob, built as a runtime builds it, from the
-# fixed path (`_at-fixed-path`).
+# fixed path (`_at-fixed-path`), `--locked` on its lock file (`just locks`).
 build-wasm-blobs:
-    just _at-fixed-path pvm/proof/final-verifier/wasm/blob --release
+    just _at-fixed-path pvm/proof/final-verifier/wasm/blob --release --locked
 
 # `cargo build` of the workspace at `dir` (from the repository's root) as
 # if the checkout were at `/tmp/vos-checkout`, a symbolic link to it held
@@ -330,7 +330,10 @@ blobs-lock: build-blobs
 #    under the 12 GiB limit `test-proof` names);
 # 6. the conformance vectors over them, `tools/kreivo/conformance`
 #    (`conformance`);
-# 7. the verifier kit's lock file, `pvm/proof/kit/Cargo.lock` (`kit-lock`).
+# 7. the lock `check-kit` builds the kit on, `pvm/proof/kit/Cargo.lock`
+#    (`kit-lock`).
+# Before them, the side workspaces' lock files (`locks`), which the Wasm
+# blob is built on.
 # The pinning tests write under `VOS_PINS=write` what moved, and are run
 # again without it, so a store a write did not settle fails here. Not
 # written, on purpose: the final verifier's own constants
@@ -338,7 +341,7 @@ blobs-lock: build-blobs
 # which a circuit change moves by hand; and the fuzz targets' replay
 # corpora (`pvm/proof/fuzz/replay/*.tar`, `node/fuzz/replay/*.tar`),
 # which are kept, not generated. Last, the stores that moved are listed.
-repin: blobs-lock facility-release
+repin: locks blobs-lock facility-release
     with-env { VOS_PINS: "write" } { cargo test -p vos-light --test device the_stock_kernels_programs_are_pinned }
     cargo test -p vos-light --test device the_stock_kernels_programs_are_pinned
     with-env { VOS_PINS: "write" } { cargo test -p vos-pvm-proof --test kernel constants:: -- --test-threads=1 }
@@ -349,7 +352,7 @@ repin: blobs-lock facility-release
     just fixtures
     just conformance
     just kit-lock
-    let moved = (git status --porcelain -- blobs.lock node/light/android/release node/light/tests/device.pins pvm/proof/src/constants.rs pvm/proof/fixtures tools/kreivo/conformance pvm/proof/kit/Cargo.lock | lines); if ($moved | is-empty) { print "repin: every pin store is this tree's already" } else { print "repin: moved"; $moved | each {|line| print $line }; null }
+    let moved = (git status --porcelain -- blobs.lock node/light/android/release node/light/tests/device.pins pvm/proof/src/constants.rs pvm/proof/fixtures tools/kreivo/conformance pvm/proof/kit/Cargo.lock pvm/proof/final-verifier/wasm/blob/Cargo.lock pvm/proof/fuzz/Cargo.lock | lines); if ($moved | is-empty) { print "repin: every pin store is this tree's already" } else { print "repin: moved"; $moved | each {|line| print $line }; null }
 
 # The pinned blobs' hashes, `_blob-hashes`' lines; its failure fails the
 # recipe that reads them.
@@ -574,15 +577,15 @@ _forbidden +gates:
         [seeded-masks "-p vos-cli --features prover" [seeded-masks other-pins chip-isolated] []] \
         [seeded-masks "-p vos-light" [seeded-masks other-pins chip-isolated] []] \
         [seeded-masks "--manifest-path agent/programs/Cargo.toml --workspace" [seeded-masks other-pins chip-isolated] []] \
-        [seeded-masks "--manifest-path pvm/proof/fuzz/Cargo.toml" [seeded-masks other-pins chip-isolated] []] \
+        [seeded-masks "--manifest-path pvm/proof/fuzz/Cargo.toml --locked" [seeded-masks other-pins chip-isolated] []] \
         [seeded-masks "--manifest-path pvm/proof/final-verifier/wasm/run/Cargo.toml" [seeded-masks other-pins chip-isolated] []] \
-        [seeded-masks "--manifest-path pvm/proof/final-verifier/wasm/blob/Cargo.toml" [seeded-masks other-pins chip-isolated] []] \
+        [seeded-masks "--manifest-path pvm/proof/final-verifier/wasm/blob/Cargo.toml --locked" [seeded-masks other-pins chip-isolated] []] \
         [debug-internals "--workspace" [debug-internals disclosing watch] []] \
         [debug-internals "-p vos-cli --features prover" [debug-internals disclosing watch] []] \
         [debug-internals "-p vos-statement-service --features pvm-guest" [debug-internals] []] \
         [debug-internals "--manifest-path agent/programs/Cargo.toml --workspace" [debug-internals] []] \
         [debug-internals "--manifest-path pvm/proof/final-verifier/wasm/run/Cargo.toml" [debug-internals] []] \
-        [debug-internals "--manifest-path pvm/proof/final-verifier/wasm/blob/Cargo.toml" [debug-internals] []] \
+        [debug-internals "--manifest-path pvm/proof/final-verifier/wasm/blob/Cargo.toml --locked" [debug-internals] []] \
         [test-device-format "--workspace" [test-device-format] []] \
         [test-device-format "-p vos-cli --features prover" [test-device-format] []] \
         [test-device-format "--manifest-path node/light/android/Cargo.toml --features android" [test-device-format] []] \
@@ -754,7 +757,7 @@ check-no-std:
     cargo clippy -p vos-statement --release --features pvm-guest --bin final-verify {{guest_flags}} --quiet -- -D warnings
     just build-statement-service
     cargo clippy -p vos-statement-service --release --features pvm-guest --bin statement-service {{guest_flags}} --quiet -- -D warnings
-    cd pvm/proof/final-verifier/wasm/blob; cargo clippy --release --quiet -- -D warnings
+    cd pvm/proof/final-verifier/wasm/blob; cargo clippy --release --locked --quiet -- -D warnings
     just check-blobs
 
 # The verifier kit (`pvm/proof/kit/vos_kit.py`), which a chain's runtime
@@ -802,6 +805,22 @@ kit-lock: _kit-workspace
     cd target/kit/build; cargo +1.94.1 build --workspace --target wasm32v1-none --quiet
     cp target/kit/build/Cargo.lock pvm/proof/kit/Cargo.lock
 
+# The side workspaces' lock files, after a dependency changes: the root's
+# copied in, pruned by cargo to what each workspace links, kept, then held
+# to the root's (`check-locks`). The Wasm blob's (whose bytes `blobs.lock`
+# pins) and the prover's fuzz targets'; the blob's runner keeps its own,
+# for wasmtime, a tool that is no part of the blob.
+locks:
+    for dir in [pvm/proof/final-verifier/wasm/blob pvm/proof/fuzz] { cp Cargo.lock $"($dir)/Cargo.lock"; cargo metadata --manifest-path $"($dir)/Cargo.toml" --format-version 1 | ignore }
+    just check-locks
+
+# Every package of the side workspaces' lock files, its name, version and
+# source, the root lock's, but each workspace's own and the tools only it
+# links (`tools/gates/locks.py`): the verifier's dependencies resolve to
+# one version everywhere it is built.
+check-locks:
+    python3 -I tools/gates/locks.py check
+
 _kit-workspace:
     if not ((do { rustup target list --installed --toolchain 1.94.1 } | complete).stdout | lines | any {|target| $target == 'wasm32v1-none' }) { rustup toolchain install 1.94.1 --profile minimal --target wasm32v1-none --no-self-update }
     rm -rf target/kit/build
@@ -829,8 +848,10 @@ node_fuzz_targets := "api_reader operated_decode credentialed_decode"
 # sets RUSTFLAGS, which replaces the host's `target-cpu=native`
 # (`.cargo/config.toml`), so the recipes pass it again: without it the
 # prover's SIMD falls back to its generic code, and one proof takes many
-# minutes.
+# minutes. `cargo fuzz` takes no `--locked`: `cargo fetch --locked` first
+# refuses a lock file the build would change.
 fuzz-replay:
+    cd pvm/proof/fuzz; cargo fetch --locked
     cd pvm/proof/fuzz; python3 -I corpus.py unpack replay target/replay; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{proof_fuzz_targets}}" | split row ' ') { cargo fuzz run -O -s none --target-dir target/no-sanitizer $target $"target/replay/($target)" -- -runs=0 } }
     cd node/fuzz; python3 -I ../../pvm/proof/fuzz/corpus.py unpack replay target/replay; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{node_fuzz_targets}}" | split row ' ') { cargo fuzz run --fuzz-dir . -O -s none --target-dir target/no-sanitizer $target $"target/replay/($target)" -- -runs=0 } }
 
@@ -839,7 +860,7 @@ fuzz-replay:
 # lists for a target reached by one of the target's inputs at least, so a
 # corpus that drifts off a check fails `gate`.
 fuzz-reach:
-    cd pvm/proof/fuzz; python3 -I corpus.py unpack replay target/replay; with-env { RUSTFLAGS: "-C target-cpu=native" } { cargo run --release --target-dir target/no-sanitizer --example paths -- --expect reach.txt }
+    cd pvm/proof/fuzz; python3 -I corpus.py unpack replay target/replay; with-env { RUSTFLAGS: "-C target-cpu=native" } { cargo run --release --locked --target-dir target/no-sanitizer --example paths -- --expect reach.txt }
 
 # The prover's replay corpora rebuilt from the goldens (but
 # `prove_verify_roundtrip`'s, whose programs need no golden): each target
@@ -852,7 +873,7 @@ fuzz-reach:
 # remote run's diff carries it; `just fuzz-reach` then lists what the new
 # corpus reaches.
 fuzz-refresh secs="120":
-    cd pvm/proof/fuzz; cargo run --release --example seed
+    cd pvm/proof/fuzz; cargo run --release --locked --example seed
     cd pvm/proof/fuzz; python3 -I corpus.py unpack replay target/replay; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{proof_fuzz_targets}}" | split row ' ' | where {|target| $target != "prove_verify_roundtrip" }) { let max_len = if $target == "device_verify_bytes" { 1572896 } else { 262145 }; mkdir $"corpus/($target)"; cargo fuzz run -a $target $"corpus/($target)" $"target/replay/($target)" -- -max_total_time={{secs}} $"-max_len=($max_len)" -len_control=0 -rss_limit_mb=8192 -timeout=600; rm -rf $"target/merged/($target)"; mkdir $"target/merged/($target)"; cargo fuzz run -a $target $"target/merged/($target)" $"corpus/($target)" $"target/replay/($target)" -- -merge=1 $"-max_len=($max_len)" -rss_limit_mb=8192 -timeout=600; python3 -I corpus.py pack $"target/merged/($target)" $"replay/($target).tar" } }
     git add -N pvm/proof/fuzz/replay
 
@@ -865,7 +886,7 @@ fuzz-refresh secs="120":
 # too slow under either. A target with no corpus yet (none seeded, never
 # run here) starts from an empty one beside its replay.
 fuzz secs="60":
-    cd pvm/proof/fuzz; cargo run --release --example seed
+    cd pvm/proof/fuzz; cargo run --release --locked --example seed
     cd pvm/proof/fuzz; python3 -I corpus.py unpack replay target/replay; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{proof_fuzz_targets}}" | split row ' ') { let max_len = if $target == "device_verify_bytes" { 1572896 } else { 262145 }; mkdir $"corpus/($target)"; let build = if $target == "prove_verify_roundtrip" { [-O -s none --target-dir target/no-sanitizer] } else { [-a] }; cargo fuzz run ...$build $target $"corpus/($target)" $"target/replay/($target)" -- -max_total_time={{secs}} $"-max_len=($max_len)" -len_control=0 -rss_limit_mb=8192 -timeout=600 } }
     cd node/fuzz; python3 -I ../../pvm/proof/fuzz/corpus.py unpack replay target/replay; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{node_fuzz_targets}}" | split row ' ') { mkdir $"corpus/($target)"; cargo fuzz run --fuzz-dir . -a $target $"corpus/($target)" $"target/replay/($target)" -- -max_total_time={{secs}} -max_len=262145 -len_control=0 -rss_limit_mb=8192 -timeout=600 } }
 
@@ -885,7 +906,8 @@ check: fmt-check check-tiers check-layers build-test-actors build-programs build
 
 # The step gate, after each step of work and before its commit: `check`,
 # then the docs' links, the dependencies' licences and advisories (`deny`),
-# the venue rules' tripwire, the builds without std
+# the side workspaces' lock files held to the root's (`check-locks`), the
+# venue rules' tripwire, the builds without std
 # with every guest built and its blob checked, the production builds'
 # leaks, the verifier kit, the fuzz corpus replayed, the lints of the
 # feature sets a step touches, the heavy test targets and the doc tests of
@@ -894,7 +916,7 @@ check: fmt-check check-tiers check-layers build-test-actors build-programs build
 # `vos.credential` facility; last the reads at a cut.
 # Left to `just ci`: the slow fault runs, the PVM vectors, the bench and
 # prover library tests, and the lints of other feature sets.
-gate: check doc-check deny check-venue-rules check-no-std check-no-leaks check-no-faults check-kit fuzz-replay fuzz-reach
+gate: check doc-check deny check-locks check-venue-rules check-no-std check-no-leaks check-no-faults check-kit fuzz-replay fuzz-reach
     cargo clippy -p vos-venue --all-targets --quiet -- -D warnings
     cargo clippy -p vos-http --all-targets --quiet -- -D warnings
     cargo clippy -p vos-pvm-recair --no-default-features --lib --quiet -- -D warnings
@@ -923,8 +945,12 @@ test-changed base="vos-core" *flags="": build-test-actors build-programs
 # those the file names with its reason, and no source but crates.io and
 # the forks it lists. Duplicate versions and yanked crates are warnings.
 # The advisory database is fetched; without a network it is the cached one.
+# Then the side workspaces' graphs (`just locks`), on their lock files: no
+# advisory and no other source there either (the root's ignores that match
+# nothing there allowed).
 deny:
     cargo deny check --hide-inclusion-graph
+    for manifest in [pvm/proof/final-verifier/wasm/blob/Cargo.toml pvm/proof/fuzz/Cargo.toml] { cargo deny --locked --manifest-path $manifest check --hide-inclusion-graph -A advisory-not-detected advisories sources }
 
 # The layers: a package under `pvm/` has no path dependency outside
 # `pvm/`, on a normal, a build or a dev edge, so the PVM, its compiler,
