@@ -60,6 +60,8 @@ pub mod personal;
 mod session;
 pub mod source;
 pub mod stream;
+#[cfg(feature = "testing")]
+pub mod testing;
 mod warm;
 
 pub use personal::{Notice, Pending, Seen, Synced};

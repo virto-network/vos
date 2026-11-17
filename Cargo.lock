@@ -8784,6 +8784,7 @@ dependencies = [
  "fjall",
  "getrandom 0.2.17",
  "hex",
+ "hmac 0.12.1",
  "libc",
  "merkle-crdt",
  "mls-rs",
@@ -9217,6 +9218,7 @@ name = "vos-testkit"
 version = "0.1.0"
 dependencies = [
  "blake2 0.10.6",
+ "ed25519-dalek 2.2.0",
  "lz4_flex 0.13.1",
  "proptest",
  "tempfile",

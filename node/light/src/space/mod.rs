@@ -88,8 +88,7 @@ pub const STATE_VERSION: u16 = 3;
 /// directory of the first store, and the prefix of each later one's, which
 /// a leave makes anew ([`light_dir`]).
 pub const LIGHT: &str = "light";
-/// `Personal`'s instance in every personal agent.
-pub const PERSONAL: InstanceId = InstanceId(5);
+pub use vos_wire::personal::PERSONAL;
 /// The local actors: the credential book and the device book.
 pub const CREDENTIAL_BOOK: InstanceId = InstanceId(1);
 pub const DEVICE_BOOK: InstanceId = InstanceId(2);

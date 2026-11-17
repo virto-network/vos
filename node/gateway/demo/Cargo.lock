@@ -8550,6 +8550,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "fjall",
  "getrandom 0.2.17",
+ "hmac 0.12.1",
  "libc",
  "merkle-crdt",
  "rayon",
@@ -8570,6 +8571,7 @@ dependencies = [
  "vos-pvm-compiler",
  "vos-pvm-device",
  "vos-pvm-precompiles",
+ "vos-testkit",
  "vos-wire",
  "x25519-dalek",
  "zeroize",
@@ -8829,6 +8831,7 @@ name = "vos-testkit"
 version = "0.1.0"
 dependencies = [
  "blake2 0.10.6",
+ "ed25519-dalek 2.2.0",
  "vos-abi",
  "vos-pvm",
  "vos-pvm-compiler",

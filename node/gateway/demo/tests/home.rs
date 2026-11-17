@@ -9,17 +9,12 @@
 //! first claims a personal agent with a phrase kit, the second is paired
 //! from it, and both sync.
 
-use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
 
-use ed25519_dalek::{Signer as _, SigningKey};
-use hmac::{Hmac, Mac as _};
-use s4_credential_contract::KeyAnswer;
-use vos_facility::chrome::{Answer, Form};
-use vos_facility::node::{Device, Node, Prompts};
+use vos_facility::node::{Device, Node};
 use vos_facility::personal::{Claim, Home as Code, KitKind};
-use vos_facility::source::Kind;
+use vos_facility::testing::Phone;
 use vos_gateway_demo::home::{HOME_CREDENTIALS, HOMES, Home};
 use vos_gateway_demo::{LocalSpace, Rate, Served, random};
 use vos_light::tor::{Circuit, Dial, Dialing, Stream, Target};
@@ -60,92 +55,9 @@ impl Dial for Onions {
     }
 }
 
-struct Phone;
-
-impl Device for Phone {
-    fn kinds(&self) -> Vec<Kind> {
-        vec![Kind::Keystore]
-    }
-}
-
-/// A user and their phone's keys, in memory: the Keystore's HMAC key and
-/// the admin keys made behind the biometric. It confirms every form and
-/// writes down each phrase it is shown.
-struct Hand {
-    source: [u8; 32],
-    admins: Mutex<HashMap<[u8; 32], SigningKey>>,
-    made: Mutex<u8>,
-    phrases: Mutex<Vec<String>>,
-}
-
-impl Hand {
-    fn new(seed: u8) -> Arc<Self> {
-        Arc::new(Self {
-            source: [seed; 32],
-            admins: Mutex::new(HashMap::new()),
-            made: Mutex::new(seed.wrapping_mul(16)),
-            phrases: Mutex::new(Vec::new()),
-        })
-    }
-}
-
-impl Prompts for Hand {
-    fn confirm(&self, form: Form) -> Answer {
-        if form.title == "Your recovery phrase" {
-            let words: Vec<String> = form
-                .rows
-                .iter()
-                .filter(|(label, _)| label.parse::<u8>().is_ok())
-                .map(|(_, word)| word.clone())
-                .collect();
-            assert_eq!(words.len(), 24);
-            self.phrases.lock().unwrap().push(words.join(" "));
-        }
-        let values = form
-            .fields
-            .iter()
-            .map(|field| field.value.clone())
-            .collect();
-        Answer::Confirmed { choice: 0, values }
-    }
-
-    fn create_key(&self, kind: Kind) -> KeyAnswer {
-        let mut made = self.made.lock().unwrap();
-        *made = made.wrapping_add(1);
-        match kind {
-            Kind::Admin => {
-                let key = SigningKey::from_bytes(&[*made; 32]);
-                let public = key.verifying_key().to_bytes();
-                self.admins.lock().unwrap().insert(public, key);
-                // Hardware-backed, verified boot.
-                KeyAnswer::Done([&public[..], &[3]].concat().into())
-            }
-            _ => KeyAnswer::Done(format!("vos.device.{made}").into_bytes().into()),
-        }
-    }
-
-    fn evaluate_key(&self, _kind: Kind, _key: &[u8], input: &[u8; 32]) -> KeyAnswer {
-        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&self.source).unwrap();
-        mac.update(input);
-        KeyAnswer::Done(mac.finalize().into_bytes().to_vec().into())
-    }
-
-    fn sign_key(&self, kind: Kind, key: &[u8], message: &[u8]) -> KeyAnswer {
-        assert_eq!(kind, Kind::Admin, "only the admin key signs");
-        let admins = self.admins.lock().unwrap();
-        match <[u8; 32]>::try_from(key)
-            .ok()
-            .and_then(|key| admins.get(&key))
-        {
-            Some(admin) => KeyAnswer::Done(admin.sign(message).to_bytes().to_vec().into()),
-            None => KeyAnswer::Failed("no such key".into()),
-        }
-    }
-}
-
 /// A phone: its facility as `:vos` serves it, over `dial`, its store
 /// under a directory of its own.
-fn phone(dial: &Arc<Onions>) -> (Node, tempfile::TempDir) {
+fn phone(dial: &Arc<Onions>, hand: &Arc<Phone>) -> (Node, tempfile::TempDir) {
     let directory = tempfile::tempdir().unwrap();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -162,9 +74,9 @@ fn phone(dial: &Arc<Onions>) -> (Node, tempfile::TempDir) {
     let node = Node::over(
         runtime,
         directory.path().to_owned(),
-        Arc::new(Phone),
+        Arc::clone(hand) as Arc<dyn Device>,
         net,
-        vos_facility::personal::Artifacts::embedded(),
+        vos_facility::personal::embedded(),
     )
     .unwrap();
     (node, directory)
@@ -246,8 +158,8 @@ fn a_phone_claims_at_the_demos_home_and_pairs_a_second_over_the_onion() {
 
     // The first phone claims with a phrase kit: its open claim's work
     // first, then the pooled agent `Homes` names, sealed to it.
-    let (first, _first_store) = phone(&dial);
-    let first_hand = Hand::new(0x11);
+    let first_hand = Arc::new(Phone::new(0x11));
+    let (first, _first_store) = phone(&dial, &first_hand);
     let claimed = first
         .personal()
         .unwrap()
@@ -273,8 +185,8 @@ fn a_phone_claims_at_the_demos_home_and_pairs_a_second_over_the_onion() {
     );
 
     // The second paired from it through the inbox's slot.
-    let (second, _second_store) = phone(&dial);
-    let second_hand = Hand::new(0x22);
+    let second_hand = Arc::new(Phone::new(0x22));
+    let (second, _second_store) = phone(&dial, &second_hand);
     let offer = first.personal().unwrap().pair_offer(&*first_hand).unwrap();
     let (opened, joined) = std::thread::scope(|scope| {
         let opener = scope.spawn(|| first.personal().unwrap().pair_await(&*first_hand));

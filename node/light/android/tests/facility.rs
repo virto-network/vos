@@ -17,10 +17,7 @@ use common::*;
 async fn enroll_sign_in_and_pay_as_the_chrome_confirmed() {
     let world = world();
     let directory = tempfile::tempdir().unwrap();
-    let source = Arc::new(Software {
-        key: [9; 32],
-        uses: Mutex::new(0),
-    });
+    let source = Arc::new(Phone::new(9));
     let facility = facility(
         &world,
         directory.path(),
@@ -274,14 +271,7 @@ async fn enroll_sign_in_and_pay_as_the_chrome_confirmed() {
 async fn nothing_is_proved_before_enrollment_or_for_an_unknown_operation() {
     let world = world();
     let directory = tempfile::tempdir().unwrap();
-    let facility = facility(
-        &world,
-        directory.path(),
-        Arc::new(Software {
-            key: [9; 32],
-            uses: Mutex::new(0),
-        }),
-    );
+    let facility = facility(&world, directory.path(), Arc::new(Phone::new(9)));
     let session = facility.session(gateway());
     let chrome = Scripted::default();
     let login = object(&[
@@ -313,14 +303,6 @@ async fn nothing_is_proved_before_enrollment_or_for_an_unknown_operation() {
     );
 }
 
-struct Phone;
-
-impl vos_facility::node::Device for Phone {
-    fn kinds(&self) -> Vec<Kind> {
-        vec![Kind::Keystore]
-    }
-}
-
 /// The s4 session's stream to a gateway's onion goes over Tor, on a
 /// circuit of its own: the world's gateway answers it with its SSH banner.
 #[test]
@@ -329,7 +311,7 @@ fn a_stream_to_an_onion_goes_over_tor() {
 
     let world = world();
     let directory = tempfile::tempdir().unwrap();
-    let node = node(&world, directory.path(), Arc::new(Phone));
+    let node = node(&world, directory.path(), Arc::new(Phone::new(9)));
     let mut stream = node
         .open_stream(vos_facility::StreamTarget {
             host: world::address(&world, 1).to_ascii_uppercase(),
@@ -399,7 +381,7 @@ fn the_screens_go_over_the_spaces_onion_or_its_opt_out() {
 
     let world = world();
     let directory = tempfile::tempdir().unwrap();
-    let node = node(&world, directory.path(), Arc::new(Phone));
+    let node = node(&world, directory.path(), Arc::new(Phone::new(9)));
     // The app in the foreground: a dormant client closes the screens.
     node.foreground(true);
     let session = node.open_session(vos_facility::Gateway {
@@ -494,7 +476,7 @@ fn the_onion_is_preferred_and_a_gateway_spelled_otherwise_is_refused() {
     let world = world();
     world.space_at(OTHER, [0x1e; 32], OTHER_HANDLE, [0x52; 32], 2);
     let directory = tempfile::tempdir().unwrap();
-    let node = node(&world, directory.path(), Arc::new(Phone));
+    let node = node(&world, directory.path(), Arc::new(Phone::new(9)));
     node.foreground(true);
     // Two applications at one gateway, a space each.
     for (application, enrollment) in [
@@ -577,10 +559,7 @@ fn the_onion_is_preferred_and_a_gateway_spelled_otherwise_is_refused() {
 async fn a_refused_root_is_proved_again_and_a_retired_format_asks_for_an_update() {
     let world = world();
     let directory = tempfile::tempdir().unwrap();
-    let source = Arc::new(Software {
-        key: [9; 32],
-        uses: Mutex::new(0),
-    });
+    let source = Arc::new(Phone::new(9));
     let facility = facility(
         &world,
         directory.path(),

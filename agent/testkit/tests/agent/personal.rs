@@ -37,7 +37,7 @@ use vos_wire::personal::{
 
 use crate::common::{AGENT, Node};
 
-pub const PERSONAL: InstanceId = InstanceId(5);
+pub use vos_wire::personal::PERSONAL;
 /// The principal holding the role `homes`, as the home's `Homes` does.
 pub const HOMES: Principal = Principal::Client([0x50; 32]);
 const HOMES_ROLE: u8 = 1;

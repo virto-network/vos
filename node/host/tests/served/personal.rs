@@ -132,7 +132,7 @@ impl Sockets {
             agent,
             identity,
             instance.0,
-            name,
+            vos_abi::ids::MethodId(vos_light::method_id(name)),
             arguments.encode(),
             not_after,
         )

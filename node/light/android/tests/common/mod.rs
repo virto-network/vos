@@ -46,41 +46,6 @@ pub fn now() -> u64 {
     })
 }
 
-/// An HMAC-SHA-256 key in memory, standing in for the Keystore's.
-pub struct Software {
-    pub key: [u8; 32],
-    pub uses: Mutex<usize>,
-}
-
-impl Source for Software {
-    fn kinds(&self) -> Vec<Kind> {
-        vec![Kind::Keystore]
-    }
-
-    fn create(&self, _kind: Kind) -> BoxFuture<'_, Result<Reference, SourceError>> {
-        Box::pin(async {
-            Ok(Reference::Keystore {
-                alias: "test".into(),
-            })
-        })
-    }
-
-    fn evaluate<'a>(
-        &'a self,
-        _reference: &'a Reference,
-        input: [u8; 32],
-    ) -> BoxFuture<'a, Result<Output, SourceError>> {
-        Box::pin(async move {
-            *self.uses.lock().unwrap() += 1;
-            let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&self.key).unwrap();
-            mac.update(&input);
-            Ok(Output::new(zeroize::Zeroizing::new(
-                mac.finalize().into_bytes().into(),
-            )))
-        })
-    }
-}
-
 /// Answers its forms from a script, keeping what it was shown.
 #[derive(Default)]
 pub struct Scripted {
@@ -113,16 +78,50 @@ pub fn confirm(values: &[&str]) -> Answer {
     }
 }
 
-pub mod host;
 pub mod phone;
-pub mod world;
+/// The world the facility's client reaches: `vos_light::testing`'s.
+pub mod world {
+    pub use vos_light::testing::world::*;
+}
 
+pub use vos_facility::testing::Phone;
 pub use world::{World, policy, wall};
+
+/// The world, its proofs checked under the stock kernels this crate
+/// embeds.
+pub fn bare_world() -> Arc<World> {
+    let stock = Stock::embedded();
+    World::with(world::Kernels {
+        auth: stock.auth,
+        owner: stock.owner,
+    })
+}
+
+/// The home at `agent`, as the chrome names it.
+pub fn home_of(world: &World, agent: u32) -> vos_facility::personal::Home {
+    let kept = world.home_of(agent);
+    vos_facility::personal::Home {
+        space: kept.home.space,
+        handle: kept.home.handle,
+        agent,
+        identity: kept.home.identity,
+        homes: kept.home.homes.0,
+        credentials: kept.home.credentials.0,
+        onions: kept
+            .onions
+            .iter()
+            .map(|onion| s4_credential_contract::Onion {
+                key: onion.key,
+                ssh_host_key: onion.ssh_host_key,
+            })
+            .collect(),
+    }
+}
 
 /// The world with the tests' one space: its agent [`AGENT`], identity
 /// [`IDENTITY`], handle [`HANDLE`] and id [`SPACE`], through onion 1.
 pub fn world() -> Arc<World> {
-    let world = World::new();
+    let world = bare_world();
     world.space_at(AGENT, IDENTITY, HANDLE, SPACE, 1);
     world
 }

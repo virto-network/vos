@@ -1,9 +1,6 @@
-// SPDX-FileCopyrightText: 2026 Virto
-// SPDX-License-Identifier: AGPL-3.0-or-later
-
-//! The spaces a facility reaches, in process, behind a gateway that serves
-//! `vos-api` over SSH on each stream the facility's Tor client dials, as a
-//! gateway's onion does. No network: a dial is an in-memory stream to an
+//! The spaces a phone reaches, in process, behind a gateway that serves
+//! `vos-api` over SSH on each stream a Tor client dials, as a gateway's
+//! onion does. No network: a dial is an in-memory stream to an
 //! SSH server of its own, which records the connection's target, circuit,
 //! SSH key and every request it carried.
 //!
@@ -11,33 +8,38 @@
 //!   tree served from its feed (`feed`, `feed_after`), an open claim's work and `enroll_device`
 //!   placing a leaf, `revoke_device` clearing one), its onions; a home's
 //!   `Homes` too ([`World::home`]): a pool of personal agents, each one a
-//!   [`Host`] running `Personal`, claimed by a proof in the scope "home",
+//!   personal agent running `Personal` ([`vos_testkit::personal::Agent`]),
+//!   claimed by a proof in the scope "home",
 //!   which `Homes` here answers by `Personal`'s `assign`.
 //! - **Every proof is checked** as ingress's stateless checks do, under
-//!   the stock kernels' programs, and recorded.
+//!   the stock kernels' programs ([`Kernels`]), and recorded.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use ed25519_dalek::{Signer as _, SigningKey};
+use ed25519_dalek::SigningKey;
 use russh::keys::ssh_key;
 use russh::server::{Auth, Msg, Session};
 use russh::{Channel, ChannelId};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use vos_abi::credentials as tree;
 use vos_abi::credentials::{DEPTH, EMPTY, Words};
-use vos_abi::ids::{AgentId, ProgramHash};
+use vos_abi::ids::{AgentId, MethodId, ProgramHash};
 use vos_abi::result::Outcome;
 use vos_abi::{Decode, Encode, SpaceId};
 use vos_api::{Event, Framing, Kind, Reader, Requests, frame};
-use vos_light::tor::{Circuit, Dial, Dialing, Stream, Target, onion_address};
+use vos_testkit::personal::Agent;
+use vos_wire::credentials::method as credentials;
+use vos_wire::personal::method as personal;
+
+use crate::release::{Package, Release};
+use crate::space::Kept;
+use crate::tor::{Circuit, Dial, Dialing, Stream, Target, onion_address};
 use vos_wire::credentials::{Change, Feed, Onion, Open, RootEntry};
 use vos_wire::ingress::{self, AgentInfo, Credentialed, QueryCall, Response};
 use vos_wire::peer::CreationRecord;
 use vos_wire::personal::{Kit, NewDevice, Policy};
-
-use super::host::Host;
 
 /// A test home's policy: seconds, not days, and no field its default, so
 /// a device that takes `Policy::DEFAULT` for the home's is seen to. A
@@ -73,27 +75,27 @@ pub struct Step {
 }
 
 impl Step {
-    /// A call of `name`.
-    pub fn call(name: &str) -> Self {
+    /// A call of `method`.
+    pub fn call(method: MethodId) -> Self {
         Self {
             kind: Kind::Call as u16,
-            method: vos_light::method_id(name),
+            method: method.0,
         }
     }
 
-    /// A query of `name`.
-    pub fn query(name: &str) -> Self {
+    /// A query of `method`.
+    pub fn query(method: MethodId) -> Self {
         Self {
             kind: Kind::Query as u16,
-            method: vos_light::method_id(name),
+            method: method.0,
         }
     }
 
-    /// A proven call of `name`.
-    pub fn proven(name: &str) -> Self {
+    /// A proven call of `method`.
+    pub fn proven(method: MethodId) -> Self {
         Self {
             kind: Kind::Credentialed as u16,
-            method: vos_light::method_id(name),
+            method: method.0,
         }
     }
 
@@ -289,7 +291,7 @@ pub struct Space {
 #[derive(Default)]
 pub struct State {
     pub spaces: HashMap<u32, Space>,
-    pub personal: HashMap<u32, Host>,
+    pub personal: HashMap<u32, Agent>,
     pub records: HashMap<u32, CreationRecord>,
     pub seen: Vec<Seen>,
     pub credentialed: Vec<(AgentId, Credentialed)>,
@@ -309,17 +311,82 @@ pub struct State {
     next_agent: u32,
 }
 
+/// The release artifacts of the stock kernels a space's ingress checks
+/// proofs under, each an encoded [`Release`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Kernels {
+    pub auth: Vec<u8>,
+    pub owner: Vec<u8>,
+}
+
+impl Kernels {
+    /// The artifacts of this tree's credential actor (`just
+    /// build-programs`).
+    pub fn built() -> Self {
+        let elf = std::fs::read(vos_testkit::programs::program_elf("vos-credentials"))
+            .expect("the credential actor's ELF");
+        let kernel = |name| {
+            crate::release::device(&elf, name)
+                .expect("its kernel")
+                .encode()
+        };
+        Self {
+            auth: kernel("auth"),
+            owner: kernel("owner"),
+        }
+    }
+}
+
+/// The program of the release artifact `artifact`.
+pub fn program(artifact: &[u8]) -> crate::DeviceProgram {
+    let device = Release::decode_exact(artifact).expect("a release artifact");
+    crate::DeviceProgram::from_release(&device).expect("its program")
+}
+
+/// `Personal`'s package, as a release makes it from this tree's personal
+/// agent (`just build-programs`).
+pub fn personal_package() -> &'static Package {
+    static PACKAGE: std::sync::OnceLock<Package> = std::sync::OnceLock::new();
+    PACKAGE.get_or_init(|| {
+        let elf = std::fs::read(vos_testkit::programs::program_elf("vos-personal"))
+            .expect("the personal agent's ELF");
+        crate::release::package(&elf, 1).expect("its package")
+    })
+}
+
+/// A personal agent of `Personal`'s package at `agent`, its identity
+/// `identity`, its role `homes` the home's key's.
+fn personal_agent(agent: u32, identity: [u8; 32], homes: &SigningKey, now: u64) -> Agent {
+    let package = personal_package();
+    let checked = package.checked().expect("a checked package");
+    let programs: Vec<&[u8]> = checked.iter().map(|(_, program)| *program).collect();
+    Agent::new(
+        AgentId(agent),
+        identity,
+        package.derivation.clone(),
+        &programs,
+        homes.verifying_key().to_bytes(),
+        now,
+    )
+}
+
 /// The world, and the gateway in front of it.
 pub struct World {
     host_key: ssh_key::PrivateKey,
     pub state: Mutex<State>,
     /// Added to the device's clock: the world's time.
     pub offset: AtomicI64,
-    pub stock: vos_facility::Stock,
+    pub stock: Kernels,
 }
 
 impl World {
+    /// The world, its proofs checked under this tree's stock kernels.
     pub fn new() -> Arc<Self> {
+        Self::with(Kernels::built())
+    }
+
+    /// The world, its proofs checked under `stock`.
+    pub fn with(stock: Kernels) -> Arc<Self> {
         Arc::new(Self {
             host_key: ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(
                 &[7; 32],
@@ -329,7 +396,7 @@ impl World {
                 ..State::default()
             }),
             offset: AtomicI64::new(0),
-            stock: vos_facility::Stock::embedded(),
+            stock,
         })
     }
 
@@ -434,7 +501,7 @@ impl World {
             let (id, identity) = Self::agent(&mut state);
             state
                 .personal
-                .insert(id, Host::new(id, identity, &key, now));
+                .insert(id, personal_agent(id, identity, &key, now));
             agents.push(id);
         }
         state.spaces.get_mut(&agent).unwrap().homes = Some(Homes {
@@ -447,25 +514,20 @@ impl World {
         agent
     }
 
-    /// The home at `agent` as the chrome names it.
-    pub fn home_of(&self, agent: u32) -> vos_facility::personal::Home {
+    /// The home at `agent`, as a claim names it.
+    pub fn home_of(&self, agent: u32) -> Kept {
         let state = self.state.lock().unwrap();
         let space = &state.spaces[&agent];
-        vos_facility::personal::Home {
-            space: space.space,
-            handle: space.handle,
-            agent,
-            identity: space.identity,
-            homes: space.homes.as_ref().unwrap().instance,
-            credentials: space.credentials,
-            onions: space
-                .onions
-                .iter()
-                .map(|onion| s4_credential_contract::Onion {
-                    key: onion.key,
-                    ssh_host_key: onion.ssh_host_key,
-                })
-                .collect(),
+        Kept {
+            home: crate::home::Home {
+                space: space.space,
+                handle: space.handle,
+                agent,
+                identity: space.identity,
+                homes: vos_abi::ids::InstanceId(space.homes.as_ref().unwrap().instance),
+                credentials: vos_abi::ids::InstanceId(space.credentials),
+            },
+            onions: space.onions.clone(),
         }
     }
 
@@ -676,10 +738,9 @@ impl State {
             &query.message(&space.identity),
             &query.signature,
         );
-        let method = query.method.0;
-        let named = |name: &str| method == vos_light::method_id(name);
+        let named = |id: MethodId| query.method == id;
         if query.instance.0 == space.credentials {
-            if named("feed") {
+            if named(credentials::FEED) {
                 self.feed_reads += 1;
                 let space = self.spaces.get_mut(&agent).unwrap();
                 return done(
@@ -688,7 +749,7 @@ impl State {
                         .page(u64::decode_exact(&query.arguments).unwrap()),
                 );
             }
-            if named("feed_after") {
+            if named(credentials::FEED_AFTER) {
                 self.feed_reads += 1;
                 let space = self.spaces.get_mut(&agent).unwrap();
                 return done(
@@ -697,7 +758,7 @@ impl State {
                         .after(&<[u8; 32]>::decode_exact(&query.arguments).unwrap()),
                 );
             }
-            if named("opening") {
+            if named(credentials::OPENING) {
                 return done(Some(Open {
                     salt: [3; 32],
                     difficulty: 2,
@@ -706,20 +767,20 @@ impl State {
                     left: 16,
                 }));
             }
-            if named("onions") {
+            if named(credentials::ONIONS) {
                 return done(space.onions.clone());
             }
         }
         let homes = space.homes.as_ref().expect("a home's `Homes`");
         assert_eq!(query.instance.0, homes.instance);
-        if named("pooled") {
+        if named(vos_wire::homes::method::POOLED) {
             return done(homes.pool.first().copied());
         }
-        if named("find") {
+        if named(vos_wire::homes::method::FIND) {
             let index = <[u8; 32]>::decode_exact(&query.arguments).unwrap();
             return done(homes.kits.get(&index).copied());
         }
-        if named("agent") {
+        if named(vos_wire::homes::method::AGENT) {
             let nullifier = <[u8; 32]>::decode_exact(&query.arguments).unwrap();
             return done(homes.nullifiers.get(&nullifier).copied());
         }
@@ -736,7 +797,7 @@ impl State {
             &call.message(&space.identity),
             &call.signature,
         );
-        assert_eq!(call.method.0, vos_wire::credentials::method::CLAIM_OPEN.0);
+        assert_eq!(call.method, credentials::CLAIM_OPEN);
         let (member, nonce) = <([u8; 32], u64)>::decode_exact(&call.arguments).unwrap();
         assert!(vos_wire::credentials::meets(
             &vos_wire::credentials::open_work(&space.handle, &member, &[3; 32], nonce),
@@ -747,18 +808,18 @@ impl State {
 
     fn credentialed(
         &mut self,
-        stock: &vos_facility::Stock,
+        stock: &Kernels,
         agent: u32,
         request: &Credentialed,
         now: u64,
     ) -> Outcome {
         let space = self.spaces.get_mut(&agent).expect("a space's agent");
-        let proof = vos_light::Proven {
+        let proof = crate::Proven {
             format: request.format,
             claim: request.claim.clone(),
             proof: request.proof.clone(),
         };
-        let call = vos_light::Call {
+        let call = crate::Call {
             space: space.space,
             agent,
             instance: request.instance.0,
@@ -767,27 +828,27 @@ impl State {
             nonce: request.nonce,
             expires_ms: request.expires_ms,
         };
-        let named = |name: &str| request.method.0 == vos_light::method_id(name);
+        let named = |id: MethodId| request.method == id;
         let homes = space.homes.as_ref().map(|homes| homes.instance) == Some(request.instance.0);
         let (kernel, scope): (&[u8], Option<&[u8]>) = if homes {
             (&stock.auth, Some(b"home"))
-        } else if named("enroll_device")
-            || named("confirm_device")
-            || named("revoke_device")
-            || named("transfer")
+        } else if named(credentials::ENROLL_DEVICE)
+            || named(credentials::CONFIRM_DEVICE)
+            || named(credentials::REVOKE_DEVICE)
+            || request.method.0 == crate::method_id("transfer")
         {
             (&stock.owner, None)
         } else {
             (&stock.auth, None)
         };
         if let Some(scope) = scope {
-            vos_light::verify(&proof, &call, &super::program(kernel), Some(scope))
+            crate::verify(&proof, &call, &program(kernel), Some(scope))
                 .expect("the proof verifies against its call");
         } else if kernel == stock.owner.as_slice() {
-            vos_light::verify(&proof, &call, &super::program(kernel), None)
+            crate::verify(&proof, &call, &program(kernel), None)
                 .expect("the proof verifies against its call");
         }
-        if homes && named("claim") {
+        if homes && named(vos_wire::homes::method::CLAIM) {
             let (device, kit, chosen) =
                 <(NewDevice, Kit, u32)>::decode_exact(&request.arguments).unwrap();
             let homes = space.homes.as_mut().unwrap();
@@ -800,24 +861,22 @@ impl State {
             homes.pool.remove(at);
             homes.nullifiers.insert(device.nullifier, chosen);
             for entry in &kit.entries {
-                homes
-                    .kits
-                    .insert(vos_light::kit::index(&entry.signing), chosen);
+                homes.kits.insert(crate::kit::index(&entry.signing), chosen);
             }
             let key = homes.key.clone();
             let policy = self.policy.unwrap_or_else(policy);
             let host = self.personal.get_mut(&chosen).unwrap();
             host.configure(now, &key, policy);
-            let assigned = host.homes(now, &key, "assign", (device, kit).encode());
+            let (assigned, _) = host.signed(now, &key, personal::ASSIGN, (device, kit).encode());
             assert!(matches!(assigned, Outcome::Done(_)), "{assigned:?}");
             return done(chosen);
         }
-        if named("enroll_device") {
+        if named(credentials::ENROLL_DEVICE) {
             let (member, _owner) =
                 <([u8; 32], [u8; 32])>::decode_exact(&request.arguments).unwrap();
             return done(space.tree.enroll(&member, now));
         }
-        if named("revoke_device") {
+        if named(credentials::REVOKE_DEVICE) {
             let member = <[u8; 32]>::decode_exact(&request.arguments).unwrap();
             space.tree.revoke(&member, now);
             return done(());

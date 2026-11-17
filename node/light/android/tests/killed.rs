@@ -22,65 +22,31 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use common::*;
-use s4_credential_contract::KeyAnswer;
-use vos_facility::node::{Device, Node, Prompts};
+use vos_facility::node::Node;
 use vos_facility::{Enroll, SignIn};
 
-const KEY: [u8; 32] = [9; 32];
 const ROLE: &str = "S4_CREDENTIAL_KILLED_ROLE";
 const DIRECTORY: &str = "S4_CREDENTIAL_KILLED_DIRECTORY";
 const PORT: &str = "S4_CREDENTIAL_KILLED_PORT";
 /// The kills each scenario makes.
 const KILLS: usize = 5;
 
-struct Phone;
-
-impl Device for Phone {
-    fn kinds(&self) -> Vec<Kind> {
-        vec![Kind::Keystore]
-    }
-}
-
 /// A client whose user confirms everything, its key in memory; it says
-/// when a proof is about to start, its key's output handed over.
-struct Client {
-    gone: bool,
-}
-
-impl Prompts for Client {
-    fn confirm(&self, _: Form) -> Answer {
-        if self.gone {
-            return Answer::Declined;
-        }
-        Answer::Confirmed {
-            choice: 0,
-            values: Vec::new(),
-        }
+/// when a proof is about to start, its key's output handed over. Gone, it
+/// declines every prompt. Each process's holds the key the first made.
+fn client(gone: bool) -> Arc<Phone> {
+    let phone = Phone::restarted(9);
+    *phone.evaluating.lock().unwrap() = Some(|| println!("proving"));
+    if gone {
+        phone.decline(usize::MAX);
     }
-
-    fn create_key(&self, _: Kind) -> KeyAnswer {
-        KeyAnswer::Done(b"vos.device.killed".to_vec().into())
-    }
-
-    fn sign_key(&self, _: Kind, _: &[u8], _: &[u8]) -> KeyAnswer {
-        KeyAnswer::Declined
-    }
-
-    fn evaluate_key(&self, _: Kind, _: &[u8], input: &[u8; 32]) -> KeyAnswer {
-        if self.gone {
-            return KeyAnswer::Failed("the client is gone".into());
-        }
-        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&KEY).unwrap();
-        mac.update(input);
-        println!("proving");
-        KeyAnswer::Done(mac.finalize().into_bytes().to_vec().into())
-    }
+    Arc::new(phone)
 }
 
 /// The facility under `directory`, through the world's gateway at its
 /// loopback `port`.
 fn at(directory: &Path, port: u16) -> Node {
-    node_over(Arc::new(world::Loopback(port)), directory, Arc::new(Phone))
+    node_over(Arc::new(world::Loopback(port)), directory, client(false))
 }
 
 fn login() -> SignIn {
@@ -96,7 +62,7 @@ fn login() -> SignIn {
 /// A sign-in, once the path is held (a sync fetches it).
 fn signed_in(node: &Node, session: u64) {
     loop {
-        match node.sign_in(session, login(), Arc::new(Client { gone: false })) {
+        match node.sign_in(session, login(), client(false)) {
             Err(refusal) if refusal.code == Code::NoPath => {
                 node.sync().unwrap();
             }
@@ -165,11 +131,7 @@ fn killed_during(role: &str, test: &str, marker: &str, most: Duration) {
         let node = at(&store, port);
         let session = node.open_session(gateway());
         let enrolled = node
-            .enroll(
-                session,
-                Enroll::read(&enrollment()).unwrap(),
-                Arc::new(Client { gone: false }),
-            )
+            .enroll(session, Enroll::read(&enrollment()).unwrap(), client(false))
             .unwrap();
         world.enroll(AGENT, &enrolled.member);
         enrolled.member
@@ -257,24 +219,18 @@ fn a_facility_killed_during_a_sync_leaves_its_store_whole() {
 fn a_client_gone_during_an_operation_costs_only_that_operation() {
     let world = world();
     let directory = tempfile::tempdir().unwrap();
-    let node = node(&world, directory.path(), Arc::new(Phone));
+    let node = node(&world, directory.path(), client(false));
     let session = node.open_session(gateway());
     let enrolled = node
-        .enroll(
-            session,
-            Enroll::read(&enrollment()).unwrap(),
-            Arc::new(Client { gone: false }),
-        )
+        .enroll(session, Enroll::read(&enrollment()).unwrap(), client(false))
         .unwrap();
     world.enroll(AGENT, &enrolled.member);
     node.sync().unwrap();
-    let gone = node
-        .sign_in(session, login(), Arc::new(Client { gone: true }))
-        .unwrap_err();
+    let gone = node.sign_in(session, login(), client(true)).unwrap_err();
     assert_eq!(gone.code, Code::Declined);
     // A session of an earlier process names nothing here.
     let stale = node
-        .sign_in(session ^ 1, login(), Arc::new(Client { gone: false }))
+        .sign_in(session ^ 1, login(), client(false))
         .unwrap_err();
     assert_eq!(stale.code, Code::NoSession);
     signed_in(&node, session);

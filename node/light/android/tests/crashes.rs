@@ -53,7 +53,7 @@ fn each(deaths: &[(Step, usize, Death)], scenario: impl Fn(Step, usize, Death) +
 
 fn claim(world: &World, home: u32) -> Claim {
     Claim {
-        home: world.home_of(home),
+        home: home_of(world, home),
         kit: KitKind::Phrase,
         label: "phone".into(),
     }
@@ -241,7 +241,7 @@ fn a_pairing_whose_opener_dies_at_its_commit_ends_paired() {
         let second = phone(&world, 2);
         first.claim(&world, home, KitKind::Phrase, "first");
         second.node.space().unwrap().set_wait(15_000);
-        world.kill(1, Step::call("commit"), 1, death);
+        world.kill(1, Step::call(vos_wire::personal::method::COMMIT), 1, death);
         let code = first
             .node
             .personal()
@@ -298,7 +298,7 @@ fn a_restore_killed_at_any_step_matures_once_resumed() {
         (claimed.agent, lost.hand.phrase())
     };
     let request = |world: &World, home: u32| Claim {
-        home: world.home_of(home),
+        home: home_of(world, home),
         kit: KitKind::Phrase,
         label: "new phone".into(),
     };
@@ -359,7 +359,7 @@ fn a_restore_killed_at_any_step_matures_once_resumed() {
 #[test]
 fn a_move_killed_at_any_step_ends_at_one_agent_with_one_kit() {
     let moving = |world: &World, home: u32| Claim {
-        home: world.home_of(home),
+        home: home_of(world, home),
         kit: KitKind::Phrase,
         label: "phone".into(),
     };

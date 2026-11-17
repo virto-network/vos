@@ -41,6 +41,9 @@ android = ["jni", "tokio/rt-multi-thread"]
 # The facility's own interface's round trip on a JVM (`just
 # facility-contract`), on s4's contract's harness.
 jvm = ["jni", "s4-credential-contract/jvm"]
+# The shared phone double as the facility's client lends it
+# (`vos_light::testing`): the tests' and the tools'.
+testing = ["vos-light/testing"]
 
 [dependencies]
 # The facility's protocol and its Binder contract: s4's, by git revision,
@@ -71,7 +74,7 @@ jni = { version = "0.22", optional = true }
 [dev-dependencies]
 # The release artifacts computed from this tree's guests, which the
 # embedded ones must be; the personal agent's package the tests run.
-vos-light = { path = "..", features = ["release", "tor"] }
+vos-light = { path = "..", features = ["release", "tor", "testing"] }
 vos-testkit = { path = "../../../agent/testkit" }
 # The personal agent run in process, as a node runs it: the default agent's
 # program over the interpreter, its work applied as accumulate applies it.

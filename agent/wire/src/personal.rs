@@ -17,6 +17,9 @@ use alloc::vec::Vec;
 
 use scale::{Decode, Encode};
 
+/// `Personal`'s instance in every personal agent.
+pub const PERSONAL: vos_abi::ids::InstanceId = vos_abi::ids::InstanceId(5);
+
 /// `Personal`'s handlers.
 pub mod method {
     methods! {

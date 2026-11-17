@@ -108,6 +108,8 @@ mod secret;
 pub mod space;
 pub mod store;
 pub mod sync;
+#[cfg(feature = "testing")]
+pub mod testing;
 mod threads;
 #[cfg(feature = "tor")]
 pub mod tor;

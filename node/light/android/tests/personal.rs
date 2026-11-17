@@ -48,9 +48,9 @@ fn a_personal_space_is_claimed_paired_retired_and_moved() {
     );
     let cards = first.hand.cards.lock().unwrap().clone();
     assert_eq!(cards.len(), 1, "the key's card shown");
-    let onion = vos_light::tor::onion_address(&world.home_of(home).onions[0].key);
-    assert!(cards[0].contains(&("Home".into(), hex::encode(world.home_of(home).handle))));
-    assert!(cards[0].contains(&("Onion 1".into(), onion)));
+    let kept = World::home_of(&world, home);
+    assert_eq!(cards[0].handle, kept.home.handle);
+    assert_eq!(cards[0].onions, kept.onions);
     let devices = first.node.personal().unwrap().devices().unwrap();
     assert_eq!(devices.len(), 1);
     assert!(devices[0].me && devices[0].strong && !devices[0].removed);
@@ -59,7 +59,7 @@ fn a_personal_space_is_claimed_paired_retired_and_moved() {
     let again = first.node.personal().unwrap().claim(
         &*first.hand,
         Claim {
-            home: world.home_of(home),
+            home: home_of(&world, home),
             kit: KitKind::Phrase,
             label: "first phone".into(),
         },
@@ -195,7 +195,7 @@ fn a_personal_space_is_claimed_paired_retired_and_moved() {
         .move_home(
             &*second.hand,
             Claim {
-                home: world.home_of(elsewhere),
+                home: home_of(&world, elsewhere),
                 kit: KitKind::Phrase,
                 label: "second phone".into(),
             },
@@ -487,7 +487,7 @@ fn a_personal_space_is_restored_from_its_phrase() {
     let fresh = phone(&world, 0x42);
     fresh.hand.will_enter(words.clone());
     let restore = Claim {
-        home: world.home_of(home),
+        home: home_of(&world, home),
         kit: KitKind::Phrase,
         label: "new phone".into(),
     };
@@ -927,7 +927,7 @@ fn a_personal_space_this_build_does_not_read_is_kept_and_sign_in_runs() {
         let file = _directory.path().join(vos_facility::personal::FILE);
         let state = std::fs::read(&file).unwrap();
         let phone = Held {
-            node: node_as(&world, _directory.path(), tag),
+            node: node_as(&world, _directory.path(), tag, &hand),
             hand,
             tag,
             _directory,
@@ -949,7 +949,7 @@ fn a_personal_space_this_build_does_not_read_is_kept_and_sign_in_runs() {
                 personal.claim(
                     &*phone.hand,
                     Claim {
-                        home: world.home_of(home),
+                        home: home_of(&world, home),
                         kit: KitKind::Phrase,
                         label: "phone".into(),
                     },
@@ -989,7 +989,7 @@ fn a_restore_cancelled_by_alive_is_opened_anew() {
     let fresh = phone(&world, 0xc8);
     fresh.hand.will_enter(words);
     let restore = Claim {
-        home: world.home_of(home),
+        home: home_of(&world, home),
         kit: KitKind::Phrase,
         label: "new phone".into(),
     };
@@ -1034,7 +1034,7 @@ fn a_restore_cancelled_by_alive_is_opened_anew() {
 /// space is at its new home.
 #[test]
 fn a_move_cut_short_after_its_leave_claims_again() {
-    let claim = common::world::Step::proven("claim");
+    let claim = common::world::Step::proven(vos_wire::homes::method::CLAIM);
     let world = world();
     let home = world.home(HOME, 2, 1);
     let elsewhere = world.home(ELSEWHERE, 3, 2);
@@ -1042,7 +1042,7 @@ fn a_move_cut_short_after_its_leave_claims_again() {
     phone.claim(&world, home, KitKind::Phrase, "phone");
     phone.node.space().unwrap().set_wait(3_000);
     let moving = Claim {
-        home: world.home_of(elsewhere),
+        home: home_of(&world, elsewhere),
         kit: KitKind::Phrase,
         label: "phone".into(),
     };
@@ -1109,7 +1109,7 @@ fn a_device_a_move_left_pairs_again_at_the_new_home() {
         .move_home(
             &*first.hand,
             Claim {
-                home: world.home_of(elsewhere),
+                home: home_of(&world, elsewhere),
                 kit: KitKind::Phrase,
                 label: "first phone".into(),
             },
