@@ -162,9 +162,9 @@ test-proof: build-test-actors build-programs build-final-verify judge-wasm
 # (`node/kernel-tests/tests/counts.txt`). Under the 12 GiB limit
 # `test-proof` names; in no tier, as `repin` is in none.
 repin-proof: build-test-actors build-programs build-final-verify judge-wasm
-    with-env { VOS_PINS: "write" } { cargo test -p vos-pvm-recair --features heavy-gates --test recursion heavy_the_verify_gates_hold_over_seeds -- --exact --test-threads=1 }
+    with-env { VOS_PINS: "write" } { cargo test -p vos-pvm-recair --features heavy-gates --test recursion masked::heavy::heavy_the_verify_gates_hold_over_seeds -- --exact --test-threads=1 }
     with-env { VOS_PINS: "write" } { cargo test -p vos-kernel-tests --features debug-internals --test kernel kernel_shape::the_predicate_wraps -- --exact --test-threads=1 }
-    cargo test -p vos-pvm-recair --features heavy-gates --test recursion heavy_the_verify_gates_hold_over_seeds -- --exact --test-threads=1
+    cargo test -p vos-pvm-recair --features heavy-gates --test recursion masked::heavy::heavy_the_verify_gates_hold_over_seeds -- --exact --test-threads=1
     cargo test -p vos-kernel-tests --features debug-internals --test kernel kernel_shape::the_predicate_wraps -- --exact --test-threads=1
     git status --porcelain -- pvm/proof/counts.txt node/kernel-tests/tests/counts.txt
 
