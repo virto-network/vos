@@ -101,9 +101,9 @@ leaf). Read it as trusted:
   `DeviceProgramId::of`. A node gets a device program's `Verifier` by
   building its prover: `DeviceProver::install` commits the preprocessed
   tree (`device/src/masked/prove.rs`), and `.verifier()` keeps the
-  program, its masked format and its id (`node/host/src/node/admin.rs`:
-  `device_program`; `node/host/src/credentialed.rs`). Ingress needs the
-  prover's backend at install, whatever the layout.
+  program, its masked format and its id (on the node side, the host's
+  `device_program` at install and its credentialed ingress). Ingress needs
+  the prover's backend at install, whatever the layout.
 - The format registry, one copy: its plain data (each format's number,
   kind, channel, parameters, masking, floors and status, `admitted`) in
   `recair-air/src/format.rs`, `no_std`; `src/format.rs` re-exports it and

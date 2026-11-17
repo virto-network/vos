@@ -233,9 +233,17 @@ def covered(lines, members, manifests):
     return runs
 
 
+def listed_programs():
+    """`programs.toml`'s programs: none in a tree without the agent."""
+    path = ROOT / "programs.toml"
+    return tomllib.loads(path.read_text())["program"] if path.exists() else []
+
+
 def programs():
     """Where `programs.toml` and the agent's guest workspace differ."""
-    listed = tomllib.loads((ROOT / "programs.toml").read_text())["program"]
+    listed = listed_programs()
+    if not listed:
+        return []
     guests = json.loads(run("cargo", "metadata", "--no-deps", "--format-version", "1", "--offline",
                             "--manifest-path", "agent/programs/Cargo.toml"))
     built = {package["name"]: str(pathlib.Path(package["manifest_path"]).parent.relative_to(ROOT))
@@ -340,8 +348,7 @@ def changed(base, with_heavy):
     files = run("git", "diff", "--name-only", base, "--").split("\n")
     files += run("git", "ls-files", "--others", "--exclude-standard").split("\n")
     files = [file for file in files if file]
-    guests = [program["crate"] for program in
-              tomllib.loads((ROOT / "programs.toml").read_text())["program"]] + ["agent/test-actors"]
+    guests = [program["crate"] for program in listed_programs()] + ["agent/test-actors"]
     touched, everything = set(), False
     for file in files:
         owner = max((directory for directory in directories.values()
@@ -350,7 +357,8 @@ def changed(base, with_heavy):
             touched.add(next(name for name, directory in directories.items() if directory == owner))
         elif (any(file.startswith(guest + "/") for guest in guests)
               or file == "programs.toml" or file.startswith(("agent/programs/", "pvm/guest/"))):
-            touched.add(GUEST_LOADER)
+            if GUEST_LOADER in members:
+                touched.add(GUEST_LOADER)
         elif file in ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml") or file.startswith(".cargo/"):
             everything = True
     if everything:
