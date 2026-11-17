@@ -20,7 +20,7 @@ seconds = 95
 
 # `test-reads`' seven tests of it; the whole binary is `test-proof`'s.
 [[heavy]]
-package = "vos-pvm-proof"
+package = "vos-kernel-tests"
 target = "kernel"
 seconds = 93
 

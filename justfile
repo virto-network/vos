@@ -88,7 +88,8 @@ bench: build-bench-guests
 vectors:
     cargo test -p vos-pvm --test pvm_vectors
 
-# Prover integration suites, including the soundness gates behind
+# Prover integration suites (`vos-pvm-proof`'s, and the agent's kernels
+# proved, `vos-kernel-tests`'), including the soundness gates behind
 # `debug-internals`, the re-runs of the test actors' kernels from their
 # attests on the agent's model, the settlement window's kernel read at a
 # cut and proved over its shape, the kernels' leaves and the window
@@ -98,7 +99,7 @@ vectors:
 # the fixtures checked against their generator and judged in Wasm.
 # The repository's constants (`pvm/proof/src/constants.rs`) are recomputed
 # with and without `debug-internals`, and the prover worker's throughput at
-# the default window length is measured (`kernel`'s `throughput`).
+# the default window length is measured (`vos-kernel-tests`' `throughput`).
 # Memory-heavy: the library, `gates` and `isa` run two tests at a time, and
 # `kernel`, whose proving runs each take several GiB, one at a time: each
 # of its tests (a window's up to about 9 GiB at its peak) in a process of
@@ -123,9 +124,12 @@ vectors:
 # checked to be final wraps alone, and the carrier audit (`test-carriers`).
 test-proof: build-test-actors build-programs build-final-verify judge-wasm
     cargo test -p vos-pvm-proof --features debug-internals --lib --bins --test gates --test isa -- --test-threads=2
-    for test in (cargo test -p vos-pvm-proof --features debug-internals --test kernel -- --list --format terse --skip reads:: --skip wrap_files:: | lines | where {|line| $line ends-with ': test' } | each {|line| $line | str replace ': test' '' }) { cargo test -p vos-pvm-proof --features debug-internals --test kernel $test -- --exact --test-threads=1 }
-    cargo test -p vos-pvm-proof --features debug-internals --test kernel reads:: -- --test-threads=1
+    cargo test -p vos-kernel-tests --features debug-internals --lib --test witness_input -- --test-threads=2
+    for test in (cargo test -p vos-pvm-proof --features debug-internals --test kernel -- --list --format terse --skip wrap_files:: | lines | where {|line| $line ends-with ': test' } | each {|line| $line | str replace ': test' '' }) { cargo test -p vos-pvm-proof --features debug-internals --test kernel $test -- --exact --test-threads=1 }
+    for test in (cargo test -p vos-kernel-tests --features debug-internals --test kernel -- --list --format terse --skip reads:: | lines | where {|line| $line ends-with ': test' } | each {|line| $line | str replace ': test' '' }) { cargo test -p vos-kernel-tests --features debug-internals --test kernel $test -- --exact --test-threads=1 }
+    cargo test -p vos-kernel-tests --features debug-internals --test kernel reads:: -- --test-threads=1
     cargo test -p vos-pvm-proof --test kernel constants:: -- --test-threads=1
+    cargo test -p vos-kernel-tests --test kernel constants:: -- --test-threads=1
     cargo test -p vos-pvm-recair --features heavy-gates --test circuit --test recursion -- leakage heavy --test-threads=1
     cargo test -p vos-pvm-device --features heavy-gates --test device -- leakage heavy --test-threads=1
     cargo test -p vos-pvm-proof --features debug-internals --test kernel wrap_files:: -- --test-threads=1
@@ -187,7 +191,7 @@ _at-fixed-path dir +args:
 # or a change of the AIR or a kernel's shape; a file the generator no longer
 # makes is removed. `test-proof` refuses fixtures the generator does not
 # make, byte for byte, and a directory holding any file but its.
-fixtures: build-test-actors build-programs
+fixtures:
     with-env { VOS_FIXTURES: "write" } { cargo test -p vos-pvm-proof --test kernel fixtures::the_fixtures_are_the_generators }
 
 # The reproducibility gate on aarch64: `vos program-id`, built for aarch64
@@ -338,8 +342,10 @@ repin: blobs-lock facility-release
     with-env { VOS_PINS: "write" } { cargo test -p vos-light --test device the_stock_kernels_programs_are_pinned }
     cargo test -p vos-light --test device the_stock_kernels_programs_are_pinned
     with-env { VOS_PINS: "write" } { cargo test -p vos-pvm-proof --test kernel constants:: -- --test-threads=1 }
+    with-env { VOS_PINS: "write" } { cargo test -p vos-kernel-tests --test kernel constants:: -- --test-threads=1 }
     rustfmt --edition 2024 pvm/proof/src/constants.rs
     cargo test -p vos-pvm-proof --test kernel constants:: -- --test-threads=1
+    cargo test -p vos-kernel-tests --test kernel constants:: -- --test-threads=1
     just fixtures
     just conformance
     just kit-lock
@@ -920,30 +926,21 @@ deny:
 
 # The layers: a package under `pvm/` has no path dependency outside
 # `pvm/`, on a normal, a build or a dev edge, so the PVM, its compiler,
-# its prover and the actor ABI read alone. Git and registry dependencies
-# (the Stwo fork, CipherClerk) and `support/`'s vendored crates are
-# allowed, and listed. One exemption, by name: the prover's kernel tests
-# (`vos-pvm-proof`'s dev edges to `vos-testkit` and `vos-venue`) check a
-# kernel's traced run against the agent's reference model running the
-# test actors, and judge its statements at the model venue. An exemption
-# that is no edge fails too. Every package under `pvm/` is read, the
+# its prover and the actor ABI read, build and test alone. Git and registry
+# dependencies (the Stwo fork, CipherClerk) and `support/`'s vendored
+# crates are allowed, and listed. Every package under `pvm/` is read, the
 # workspaces built apart included (`cargo metadata` of each manifest).
 check-layers:
-    let exempt = [[package dependency]; [vos-pvm-proof vos-testkit] [vos-pvm-proof vos-venue]]; \
     let manifests = (glob pvm/**/Cargo.toml --exclude ['**/target/**'] | where {|manifest| open --raw $manifest | str contains '[package]' }); \
     if ($manifests | is-empty) { error make { msg: "no package under pvm/" } }; \
     let packages = ($manifests | each {|manifest| cargo metadata --no-deps --offline --format-version 1 --manifest-path $manifest | from json | get packages | where manifest_path == $manifest | first }); \
     let edges = ($packages | each {|package| $package.dependencies | each {|dependency| { package: $package.name, dependency: $dependency.name, kind: ($dependency.kind | default normal), path: ($dependency.path? | default "" | if ($in | is-empty) { "" } else { $in | path relative-to $env.PWD }), source: ($dependency.source? | default "") } } } | flatten); \
     let local = ($edges | where path != ""); \
     let outside = ($local | where {|edge| not ($edge.path | str starts-with "pvm/") and not ($edge.path | str starts-with "support/") }); \
-    let found = ($outside | where {|edge| not ($edge.kind == dev and ($exempt | any {|pair| $pair.package == $edge.package and $pair.dependency == $edge.dependency })) }); \
-    let stale = ($exempt | where {|pair| not ($outside | any {|edge| $edge.kind == dev and $edge.package == $pair.package and $edge.dependency == $pair.dependency }) }); \
     print $"support/ crates allowed: ($local | where {|edge| $edge.path | str starts-with 'support/' } | get dependency | uniq | str join ', ' | if ($in | is-empty) { 'none' } else { $in })"; \
     print $"git crates allowed: ($edges | where {|edge| $edge.source | str starts-with 'git+' } | get dependency | uniq | str join ', ')"; \
-    for edge in ($outside | where {|edge| not ($found | any {|f| $f == $edge }) }) { print $"exempt: ($edge.package) -> ($edge.dependency) \(($edge.kind), ($edge.path)\)" }; \
-    for edge in $found { print -e $"($edge.package) -> ($edge.dependency) \(($edge.kind)\): ($edge.path) is outside pvm/" }; \
-    for pair in $stale { print -e $"the exemption ($pair.package) -> ($pair.dependency) is no dev edge outside pvm/" }; \
-    if ($found ++ $stale | is-not-empty) { error make { msg: "a package under pvm/ depends on a path outside pvm/" } }; \
+    for edge in $outside { print -e $"($edge.package) -> ($edge.dependency) \(($edge.kind)\): ($edge.path) is outside pvm/" }; \
+    if ($outside | is-not-empty) { error make { msg: "a package under pvm/ depends on a path outside pvm/" } }; \
     print $"no package under pvm/ depends on a path outside it: ($packages | length) packages, ($local | length) path edges"
 
 # The gates' tripwire (`tools/gates/tiers.py`): the tiers nest, every test
@@ -963,8 +960,8 @@ check-tiers:
 reads_tests := "window_kernel::the_window_settles_at_a_cut window_kernel::a_carried_state_that_does_not_open_is_refused window_kernel::an_older_cut_is_refused window_kernel::rows_off_the_cut_are_refused balance::a_balance_is_stated_at_a_cut balance::a_commitment_that_does_not_open_is_refused reads::a_read_at_a_cut_re_runs_as_its_live_run"
 
 test-reads: build-test-actors build-programs
-    let named = ([{{reads_tests}}] | length); let listed = (cargo test -p vos-pvm-proof --test kernel -- --list --exact {{reads_tests}} | lines | where {|line| $line ends-with ': test' } | length); if $listed != $named { error make { msg: $"test-reads names ($named) tests, of which ($listed) exist" } }
-    cargo test -p vos-pvm-proof --test kernel -- --test-threads=1 --exact {{reads_tests}}
+    let named = ([{{reads_tests}}] | length); let listed = (cargo test -p vos-kernel-tests --test kernel -- --list --exact {{reads_tests}} | lines | where {|line| $line ends-with ': test' } | length); if $listed != $named { error make { msg: $"test-reads names ($named) tests, of which ($listed) exist" } }
+    cargo test -p vos-kernel-tests --test kernel -- --test-threads=1 --exact {{reads_tests}}
 
 # Before a merge, and at the end of each planned stage of work: `gate`,
 # and everything else but the prover suites: the lints of every feature

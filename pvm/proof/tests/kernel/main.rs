@@ -1,7 +1,9 @@
 #![cfg(feature = "prover")]
 
-//! Kernels: their shapes, the window kernel's run, its leaves, folds and
-//! wrap, the golden fixtures and program identity.
+//! Kernels on the prover alone: the Poseidon2-M31 kernel, the recursion's
+//! seams, program identity, the golden fixtures, the circuits' constants
+//! and the wrap files the suites write. The agent's kernels, run on its
+//! reference model, are `vos-kernel-tests`'.
 
 #[path = "../common/mod.rs"]
 mod common;
@@ -9,16 +11,9 @@ mod common;
 #[global_allocator]
 static ALLOCATOR: common::Counting = common::Counting;
 
-mod balance;
 mod constants;
-mod cut;
-mod device_kernel;
 mod fixtures;
-mod kernel_shape;
 mod poseidon2_kernel;
 mod program_identity;
-mod reads;
 mod recursion_seams;
-mod throughput;
-mod window_kernel;
 mod wrap_files;

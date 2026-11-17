@@ -1,0 +1,51 @@
+[package]
+name = "vos-kernel-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The agent's kernels proved: each test actor's kernel re-run from its attest against the agent's reference model, read at a cut, proved, folded and wrapped under format 39, and its statement judged at the model venue."
+publish = false
+
+# Tests alone: the library is empty, and every dependency is a dev edge, so
+# the test seams below reach no production build.
+[features]
+# The prover's debug outputs and soundness seams, as `vos-pvm-proof`'s
+# own suites run under them (`just test-proof`).
+debug-internals = ["vos-pvm-proof/debug-internals"]
+
+[dev-dependencies]
+vos-pvm = { workspace = true }
+vos-pvm-proof = { workspace = true, features = ["chip-isolated"] }
+vos-pvm-proof-verifier = { workspace = true }
+vos-pvm-program = { workspace = true }
+vos-pvm-compiler = { workspace = true }
+vos-pvm-precompiles = { workspace = true }
+vos-pvm-poseidon2 = { workspace = true }
+vos-pvm-final-verifier = { workspace = true }
+vos-abi = { workspace = true }
+stwo = { workspace = true }
+# The tests' heap handed back between proofs (`malloc_trim`).
+libc = "0.2"
+# The agent's reference model and the test actors it runs (`just
+# build-test-actors`): a kernel's live run, which the prover's re-run of
+# it must match.
+vos-testkit = { path = "../../agent/testkit" }
+# The window kernel's arguments: a space's pseudo-account rows in a tree at
+# two versions, their multiproofs, and the statement they make.
+cipher-clerk = { workspace = true, features = ["settlement"] }
+vos-tree = { workspace = true }
+# The kernels' leaves: a segment verified in its leaf circuit, proved and
+# verified on the recursion AIR; and the window's wrap, verified by the
+# final verifier, masked from the seeded seam (`seeded-masks`, a dev edge:
+# no production build has it).
+vos-pvm-recair = { workspace = true, features = ["recursion", "seeded-masks"] }
+# The device kernels' programs, proved and verified under the device
+# format.
+vos-pvm-device = { workspace = true }
+# The statements: their types, the venue's check, and the venue's JAM
+# refine program on the JAM-only host.
+vos-statement = { workspace = true, features = ["fixtures"] }
+# Statements at a cut judged at the model venue: the space's anchors
+# signed by its founding key.
+vos-venue = { workspace = true, features = ["model"] }
+ed25519-dalek = "2"

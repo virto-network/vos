@@ -1,5 +1,3 @@
-#![cfg(feature = "prover")]
-
 //! A kernel's witness input, its run's ends and its io-hash, on the prover's
 //! side: the tracer serves the witness input as the agent does and re-runs a
 //! kernel from what its attest recorded to the same output and io-hash; the
@@ -10,6 +8,9 @@
 //! The kernels are the `kernels` test actor's (`just build-test-actors`),
 //! run live on the agent's reference model, which the agent's own tests
 //! hold the agent to.
+
+#[path = "../../../pvm/proof/tests/common/mod.rs"]
+mod common;
 
 use std::sync::OnceLock;
 
@@ -70,7 +71,7 @@ fn reader(calls: &[(u64, u64)]) -> Vec<u8> {
         rw_data: vec![],
         heap_pages: 5,
         stack_size: PAGE as u32,
-        code: crate::common::code_of(&instructions),
+        code: common::code_of(&instructions),
     })
     .unwrap()
 }
@@ -438,7 +439,7 @@ fn an_output_past_memory_is_refused_before_it_is_allocated() {
             rw_data: vec![],
             heap_pages: 5,
             stack_size: PAGE as u32,
-            code: crate::common::code_of(&[load_imm(7, address), length, vec![50, 0]]),
+            code: common::code_of(&[load_imm(7, address), length, vec![50, 0]]),
         })
         .unwrap();
         assert!(matches!(

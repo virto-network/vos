@@ -1,7 +1,7 @@
 #![cfg(feature = "prover")]
 
 //! The instruction set proved and verified: each family's honest runs, the
-//! chips in isolation, the precompiles and the witness input.
+//! chips in isolation and the precompiles.
 
 #[path = "../common/mod.rs"]
 mod common;
@@ -16,4 +16,3 @@ mod host_call_pc;
 mod loads_signed;
 mod memory;
 mod precompiles;
-mod witness_input;

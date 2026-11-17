@@ -16,6 +16,7 @@ members = [
     "node/checker",
     "node/venue",
     "node/prover",
+    "node/kernel-tests",
     "support/vos-raft",
     "support/merkle-crdt",
     "support/mls",

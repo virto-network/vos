@@ -58,7 +58,7 @@ UNTIERED = {
 
 # The packages no light or step tier runs whole: their suites prove, and
 # belong to `ci` and above (`test-bench`, `test-proof`, `test-carriers`).
-UPPER = {"vos-pvm-proof", "vos-pvm-bench", "vos-phone"}
+UPPER = {"vos-pvm-proof", "vos-kernel-tests", "vos-pvm-bench", "vos-phone"}
 
 
 def run(*command):
@@ -167,7 +167,9 @@ def reached(dump, top, members):
             line = own.sub(
                 lambda m: " ".join(flags(m.group(1), m.group(2).split(), members)), line)
             lines.append(line)
-            for called in re.findall(r"\bjust\s+([A-Za-z_][\w-]*)", line):
+            # A recipe named in backticks, as a message's `just repin`, is
+            # no call.
+            for called in re.findall(r"(?<!`)\bjust\s+([A-Za-z_][\w-]*)", line):
                 if called in recipes:
                     stack.append(called)
     return seen, lines

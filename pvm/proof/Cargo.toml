@@ -92,33 +92,18 @@ vos-pvm-proof = { path = ".", features = ["chip-isolated"] }
 vos-pvm-compiler = { workspace = true }
 # The tests' heap handed back between proofs (`malloc_trim`).
 libc = "0.2"
-# The agent's reference model and the test actors it runs (`just
-# build-test-actors`): a kernel's live run, which the prover's re-run of
-# it must match.
-vos-testkit = { path = "../../agent/testkit" }
 bincode = "1"
 # The segment fixtures' encoding.
 postcard = { version = "1", features = ["alloc"] }
 vos-pvm-proof-verifier = { workspace = true }
-# The window kernel's arguments: a space's pseudo-account rows in a tree at
-# two versions, their multiproofs, and the statement they make.
-cipher-clerk = { workspace = true, features = ["settlement"] }
-vos-tree = { workspace = true }
 # The kernels' leaves: a segment verified in its leaf circuit, proved and
-# verified on the recursion AIR; and the window's wrap, verified by the
-# final verifier; the fixtures' masked wraps, from the seeded seam
-# (`seeded-masks`, a dev edge: no production build has it).
+# verified on the recursion AIR, folded and wrapped; the fixtures' masked
+# wraps, from the seeded seam (`seeded-masks`, a dev edge: no production
+# build has it).
 vos-pvm-recair = { workspace = true, features = ["recursion", "seeded-masks"] }
-# The device kernels' programs, proved and verified under the device
-# format.
-vos-pvm-device = { workspace = true }
 # The golden statements: their types, the venue's check, the fixtures'
 # encoding, and the venue's JAM refine program on the JAM-only host.
 vos-statement = { workspace = true, features = ["fixtures"] }
-# Statements at a cut judged at the model venue: the space's anchors
-# signed by its founding key.
-vos-venue = { workspace = true, features = ["model"] }
-ed25519-dalek = "2"
 
 # Proving benchmarks (measurement, not correctness — see benches/prove.rs).
 # `harness = false` + a custom `main` keeps them out of `cargo test` and runs

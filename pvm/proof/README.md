@@ -40,8 +40,8 @@ let proofs: Vec<_> = segments.into_iter().map(|segment| segment.proof).collect()
 vos_pvm_proof_verifier::verify_kernel_chain(proofs, &program, &entry).expect("valid");
 ```
 
-The node's [prover](../../node/prover) proves a kernel's statements to the
-wrap with `vos_pvm_recair::tree::prove_final`.
+The node's prover (`node/prover`, on the node side) proves a kernel's
+statements to the wrap with `vos_pvm_recair::tree::prove_final`.
 
 ## Pins, and re-pinning
 
@@ -51,16 +51,21 @@ last:
 
 | Pin | Holds | Written by | Checked by | Tier |
 |---|---|---|---|---|
-| `blobs.lock` | every guest blob's SHA-256, stripped: the venue guests (`final-verify.elf`, `statement-service.elf`), the agent programs, the test actors, the final verifier's Wasm blob | `just blobs-lock` | `just check-blobs` | `gate` |
-| `node/light/android/release` | the facility's release artifacts: the stock kernels' device programs, the default agent's program, the local actors' packages | `just facility-release` | `just test-facility` | `gate` |
-| `node/light/tests/device.pins` | the stock kernels' device program ids | `VOS_PINS=write` on `vos-light`'s `device` test | the same test | `check` |
-| `pvm/proof/src/constants.rs` | the known programs' ids and the circuits' constants (`H_FOLD`, the leaf circuits) | `VOS_PINS=write` on `vos-pvm-proof`'s `kernel` test, `constants::` | the same test | `ci-full` (`test-proof`); a moved fold circuit moves the wrap's root, which `gate` checks |
+| `blobs.lock` | every guest blob's SHA-256, stripped: the venue guests (`final-verify.elf`, `statement-service.elf`), the final verifier's Wasm blob and, on the node side, the agent programs and the test actors | `just blobs-lock` | `just check-blobs` | `gate` |
+| `pvm/proof/src/constants.rs` | the known programs' ids and the circuits' constants (`H_FOLD`, the leaf circuits) | `VOS_PINS=write` on the `kernel` tests' `constants::`: `vos-pvm-proof`'s for the circuits', `vos-kernel-tests`' (the node side) for the programs' ids, from the test actors | the same tests | `ci-full` (`test-proof`); a moved fold circuit moves the wrap's root, which `gate` checks |
 | `pvm/proof/fixtures` | the golden fixtures: segment proofs and their patches, the wrap's proofs, the statements' cases | `just fixtures` | `the_fixtures_are_the_generators`: every file the generator's bytes, and no file it does not make | `ci-full` (`test-proof`) |
-| `tools/kreivo/conformance` | Kreivo's spaces pallet's conformance vectors, over the fixtures | `just conformance` | `just check` | `check` |
 | `pvm/proof/kit/Cargo.lock` | the verifier kit's lock file, VOS's pruned to what the kit links | `just kit-lock` | `just check-kit` | `gate` |
 | `pvm/proof/final-verifier/src/constants.rs` | the wrap's preprocessed root (`PREPROCESSED_ROOT_39`), a venue's verifying key | by hand, at a change of the wrap's circuit | `vos-pvm-recair`'s `recursion` test (`masked::`) and `vos-pvm-proof`'s `constants::` test compute it | `gate`; `ci-full` |
-| `pvm/proof/fuzz/replay`, `node/fuzz/replay` | each fuzz target's replay corpus, the prover's and the node's, one archive a target (`<target>.tar`, `pvm/proof/fuzz/corpus.py`: the same inputs, the same bytes): inputs kept because they reached a path | the prover's: `just fuzz-refresh` (seeded from the goldens, fuzzed, merged, packed); the node's: the fuzzer, kept by hand | `just fuzz-replay` (unpacked into each workspace's `target/replay/`) | `gate` |
+| `pvm/proof/fuzz/replay` | each of the prover's fuzz targets' replay corpus, one archive a target (`<target>.tar`, `fuzz/corpus.py`: the same inputs, the same bytes): inputs kept because they reached a path | `just fuzz-refresh` (seeded from the goldens, fuzzed, merged, packed) | `just fuzz-replay` (unpacked into `fuzz/target/replay/`) | `gate` |
 | `pvm/proof/fuzz/reach.txt` | the verdicts each of the prover's replay corpora reaches, its accepted goldens among them | from `just fuzz-reach`'s output after `just fuzz-refresh` | `just fuzz-reach` | `gate` |
+
+The node side keeps pins of its own beside these, which `just repin` writes
+with them: the facility's release artifacts (`node/light/android/release`),
+the stock kernels' device program ids (`node/light/tests/device.pins`),
+the node's fuzz corpora (`node/fuzz/replay`, archives as the prover's) and
+Kreivo's conformance vectors over the fixtures (`tools/kreivo/conformance`,
+written by the reference mock, `just conformance`), which the verifier kit
+carries.
 
 **Constants typed by hand and held by a test,** besides the wrap's root:
 format 39's layout and shape (`LOG_SIZES`, `TREE_WIDTHS`, `DEEP_VALUES`,

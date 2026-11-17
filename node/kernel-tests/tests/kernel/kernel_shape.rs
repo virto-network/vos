@@ -1,5 +1,3 @@
-#![cfg(feature = "prover")]
-
 //! A kernel's shape: the chips its code can reach, which its install
 //! records, and the log sizes of each class of its segments. A kernel's
 //! segments prove over exactly that shape, and verify against its program,

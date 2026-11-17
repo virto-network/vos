@@ -12,11 +12,14 @@ It fails when
   a path the map gives relative to its parent's (`cut/pin.rs` beside
   `src/chips/cpu/cut.rs`), the end of one under `pvm/proof/`;
 - a fuzz target of the justfile's `proof_fuzz_targets` goes unnamed in
-  `pvm/proof/SECURITY.md`.
+  `pvm/proof/SECURITY.md`;
+- a relative link of a tracked Markdown doc (`[text](path)`, its
+  `#anchor` aside) names no file or directory of the tree.
 """
 
 import pathlib
 import re
+import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -86,13 +89,37 @@ def fuzz_targets() -> list[str]:
     ]
 
 
+LINK = re.compile(r"\[[^\]]*\]\(([^()\s]+)(?:\s+\"[^\"]*\")?\)")
+
+
+def links() -> list[str]:
+    tracked = subprocess.run(
+        ["git", "ls-files", "-z", "*.md"], cwd=ROOT, check=True, capture_output=True, text=True
+    ).stdout.split("\0")
+    broken = []
+    for name in filter(None, tracked):
+        doc = ROOT / name
+        text = re.sub(r"```.*?```", "", doc.read_text(), flags=re.S)
+        for line in text.splitlines():
+            for target in LINK.findall(re.sub(r"`[^`]*`", "", line)):
+                if re.match(r"[a-z][a-z0-9+.-]*:", target) or target.startswith("#"):
+                    continue
+                path = target.split("#", 1)[0]
+                if path and not (doc.parent / path).exists():
+                    broken.append(f"{name}: links {target}, which does not exist")
+    return broken
+
+
 def main() -> int:
-    failures = stale() + audit_paths() + fuzz_targets()
+    failures = stale() + audit_paths() + fuzz_targets() + links()
     for failure in failures:
         print(failure, file=sys.stderr)
     if failures:
         return 1
-    print("the proof docs name no deleted code, AUDIT.md's paths exist, SECURITY.md names every fuzz target")
+    print(
+        "the proof docs name no deleted code, AUDIT.md's paths exist, SECURITY.md names every fuzz target, "
+        "and every relative link of a tracked doc resolves"
+    )
     return 0
 
 

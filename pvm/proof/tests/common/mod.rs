@@ -697,6 +697,12 @@ pub fn standard_program(instructions: &[Vec<u8>]) -> Vec<u8> {
     .expect("a standard program")
 }
 
+/// Whether `code` is a refused proof's: [`vos_statement::Refusal::Proof`]'s
+/// class, `0x100` and the final verifier's code.
+pub fn by_proof(code: u32) -> bool {
+    code >> 8 == 1
+}
+
 /// Whether a venue's `code` refuses a proof against the words its
 /// statement makes: the interaction PoW, drawn from other words, falls
 /// short, or the claimed sums and the public terms do not add to zero.
@@ -706,4 +712,36 @@ pub fn by_words(code: u32) -> bool {
     [Error::InteractionPow, Error::Logup]
         .into_iter()
         .any(|error| code == Refusal::Proof(error).code())
+}
+
+/// Write `constants` into the proof crate's `src/constants.rs` at `path`,
+/// each its array's values, as rustfmt lays an array out: `just repin`'s
+/// write (`VOS_PINS=write`), for its `constants::` tests.
+pub fn write_constants(
+    path: &std::path::Path,
+    constants: impl Iterator<Item = (&'static str, Vec<u64>)>,
+) {
+    let mut source = std::fs::read_to_string(path).unwrap();
+    for (name, values) in constants {
+        let start = source
+            .find(&format!("pub const {name}: "))
+            .unwrap_or_else(|| panic!("no {name} in {}", path.display()));
+        let open = start + source[start..].find("= [").expect("its array") + 3;
+        let close = open + source[open..].find("];").expect("its end");
+        let mut body = String::from("\n   ");
+        let mut width = 3;
+        for value in values {
+            let item = format!(" {value},");
+            if width + item.len() > 100 {
+                body.push_str("\n   ");
+                width = 3;
+            }
+            body.push_str(&item);
+            width += item.len();
+        }
+        body.push('\n');
+        source.replace_range(open..close, &body);
+    }
+    std::fs::write(path, source).unwrap();
+    eprintln!("{}: written", path.display());
 }

@@ -1,5 +1,3 @@
-#![cfg(feature = "prover")]
-
 //! The settlement window's kernel, the `window` test actor's (`just
 //! build-test-actors`), under a carried commitment: it opens `c_prev`, the
 //! venue's commitment to a pair's running totals at its last settlement,

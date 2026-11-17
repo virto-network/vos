@@ -547,7 +547,7 @@ mod statements {
             Patch::between(bytes, &flipped)
         };
         let accepted: Class = |code| code == 0;
-        let by_proof: Class = vos_venue::proof_refused;
+        let by_proof: Class = common::by_proof;
         let by_words: Class = common::by_words;
         vec![
             ("valid", "wrap.proof", None, input(&|_| {}), accepted),
