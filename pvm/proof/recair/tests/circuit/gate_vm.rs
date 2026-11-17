@@ -7,7 +7,7 @@ use crate::common;
 use stwo::core::fields::m31::{BaseField, P};
 use stwo::core::fields::qm31::SecureField;
 use vos_pvm_recair::circuit::{Entry, WiringError, signed};
-use vos_pvm_recair::{Context, NoValue, P2Mode, ProveError, circuit_commitment, prove, verify};
+use vos_pvm_recair::{CircuitError, Context, NoValue, P2Mode, circuit_commitment, prove, verify};
 
 use common::random_circuit;
 
@@ -213,7 +213,7 @@ fn an_unchecked_circuit_is_neither_committed_nor_proved() {
     let refusal = WiringError::Unbalanced { address, total: -1 };
     assert_eq!(circuit_commitment(&circuit).err(), Some(refusal.clone()));
     match prove(&circuit, &finalized.witness) {
-        Err(ProveError::Wiring(error)) => assert_eq!(error, refusal),
+        Err(CircuitError::Wiring(error)) => assert_eq!(error, refusal),
         other => panic!("proved an unchecked circuit: {:?}", other.map(|_| ())),
     }
 }

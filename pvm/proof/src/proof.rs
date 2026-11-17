@@ -10,6 +10,8 @@ use stwo::core::{fields::qm31::SecureField, pcs::PcsConfig};
 use crate::format::Format;
 use crate::pcs::StarkProofAny;
 
+mod malformed;
+pub use malformed::{Malformed, SecurityError};
 mod transcript;
 pub use transcript::{
     check_format_security, check_interaction_pow, format_security_bits, mix_boundary_states,
@@ -171,16 +173,15 @@ impl Proof {
 
 /// The admitted format a proof names, with its Stwo proof in that format's
 /// channel.
-pub fn proof_format(proof: &Proof) -> Result<&'static Format, alloc::string::String> {
-    let format = crate::format::admitted_segment(proof.format_version)
-        .map_err(|refused| alloc::format!("proof format {} {refused}", proof.format_version))?;
+pub fn proof_format(proof: &Proof) -> Result<&'static Format, Malformed> {
+    let format = crate::format::admitted_segment(proof.format_version).map_err(|refused| {
+        Malformed::Format {
+            number: proof.format_version,
+            refused,
+        }
+    })?;
     if proof.stark_proof.channel() != format.channel {
-        return Err(alloc::format!(
-            "proof format {} runs on the {:?} channel, but its Stark proof is on {:?}",
-            format.number,
-            format.channel,
-            proof.stark_proof.channel()
-        ));
+        return Err(Malformed::Channel);
     }
     Ok(format)
 }

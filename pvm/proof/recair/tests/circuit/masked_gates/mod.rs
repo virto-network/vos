@@ -66,7 +66,7 @@ use vos_pvm_recair::masked::{
 };
 use vos_pvm_recair::prove::prove_on;
 use vos_pvm_recair::trace::{self, FirstRowFraction, MainTrace};
-use vos_pvm_recair::{Circuit, Finalized, ProveError, RecairProof, Witness};
+use vos_pvm_recair::{Circuit, CircuitError, Finalized, RecairProof, Witness};
 use vos_pvm_recair_air::gate::GateRelation;
 use vos_pvm_recair_air::masking::{
     BlindRelation, MaskedComponent, MaskedComponents, composition_log_degree_bound, sample_points,
@@ -93,7 +93,7 @@ fn prove_set<MC: MerkleChannel>(
     tamper: impl FnOnce(&mut MainTrace),
     blind: impl Fn(&GateRelation, &mut [FirstRowFraction]),
     checked: bool,
-) -> Result<Proof<MC>, ProveError>
+) -> Result<Proof<MC>, CircuitError>
 where
     SimdBackend: BackendForChannel<MC>,
 {

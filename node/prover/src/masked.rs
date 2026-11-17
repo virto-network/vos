@@ -25,7 +25,7 @@ use vos_wire::result::{Attest, KernelReturn};
 use crate::RERUN_GAS;
 #[cfg(feature = "disclosing")]
 use crate::internals::{Internals, NodeProof};
-use crate::worker::{ProveError, Prover};
+use crate::worker::{Prover, StatementError};
 
 /// A kernel's program and its run's entry, recomputed from its blob.
 type Program = Arc<(KernelProgram, KernelEntry)>;
@@ -57,19 +57,19 @@ impl MaskedProver {
     }
 
     /// `kernel`'s program and entry, from its blob.
-    fn kernel(&self, kernel: &[u8]) -> Result<Program, ProveError> {
+    fn kernel(&self, kernel: &[u8]) -> Result<Program, StatementError> {
         let hash = ProgramHash::of(kernel);
         if let Some(program) = self.programs().get(&hash) {
             return Ok(Arc::clone(program));
         }
-        let record = kernel_record(kernel).map_err(ProveError::Kernel)?;
+        let record = kernel_record(kernel).map_err(StatementError::Kernel)?;
         let program = vos_pvm_recair::leaf::kernel_program(
             kernel,
             &record,
             vos_pvm_compiler::TRANSPILER_VERSION,
             &SEGMENT,
         )
-        .map_err(|_| ProveError::Kernel("the kernel's program does not build"))?;
+        .map_err(|error| StatementError::Kernel(error.reason()))?;
         let program = Arc::new(program);
         self.programs().insert(hash, Arc::clone(&program));
         Ok(program)
@@ -83,9 +83,9 @@ impl MaskedProver {
     /// the witness whole and returns the record's public arguments, output
     /// and roots, its io-hash theirs. A kernel of no public part returns its
     /// output alone, so its record has none.
-    pub fn rerun(&self, kernel: &[u8], attest: &Attest) -> Result<KernelTrace, ProveError> {
+    pub fn rerun(&self, kernel: &[u8], attest: &Attest) -> Result<KernelTrace, StatementError> {
         let trace = trace_kernel(kernel, &attest.witness_input, RERUN_GAS)
-            .map_err(|_| ProveError::Rerun("the kernel does not re-run"))?;
+            .map_err(|_| StatementError::Rerun("the kernel does not re-run"))?;
         let parts = KernelReturn {
             public_args: attest.public_args.clone(),
             output: attest.output.clone(),
@@ -100,18 +100,18 @@ impl MaskedProver {
             }
         };
         if !returned {
-            return Err(ProveError::Rerun(
+            return Err(StatementError::Rerun(
                 "the re-run returns other public arguments, output or roots than the record's",
             ));
         }
         if trace.io_hash != parts.io_hash() {
-            return Err(ProveError::Rerun(
+            return Err(StatementError::Rerun(
                 "the re-run's io-hash is not the record's",
             ));
         }
         let read: usize = trace.reads.iter().map(|read| read.count).sum();
         if read != attest.witness_input.len() {
-            return Err(ProveError::Rerun(
+            return Err(StatementError::Rerun(
                 "the re-run does not read the witness whole",
             ));
         }
@@ -125,10 +125,10 @@ impl MaskedProver {
         &self,
         kernel: &[u8],
         attest: &Attest,
-    ) -> Result<(Vec<u8>, Internals), ProveError> {
+    ) -> Result<(Vec<u8>, Internals), StatementError> {
         use vos_pvm_recair::tree::Built;
         let public_root = kernel_record(kernel)
-            .map_err(ProveError::Kernel)?
+            .map_err(StatementError::Kernel)?
             .image_root;
         let mut internals = Internals::default();
         let mut lengths: Vec<u64> = Vec::new();
@@ -196,20 +196,20 @@ impl MaskedProver {
             &KernelEntry,
             &SideNote,
         ) -> Result<(Vec<u8>, Stats), TreeError>,
-    ) -> Result<(Vec<u8>, Stats), ProveError> {
+    ) -> Result<(Vec<u8>, Stats), StatementError> {
         let program = self.kernel(kernel)?;
         let (program, entry) = &*program;
         let trace = self.rerun(kernel, attest)?;
         prove(program, entry, &trace.side_note).map_err(|error| {
-            use vos_pvm_proof::ProvingError;
+            use vos_pvm_proof::SegmentError;
             match error {
                 // The run does not fit its kernel's shape: no proof of it
                 // can be made.
                 TreeError::Empty
-                | TreeError::Segment(ProvingError::Shape { .. } | ProvingError::MalformedShape) => {
-                    ProveError::Kernel("the run does not fit its kernel's shape")
+                | TreeError::Segment(SegmentError::Shape { .. } | SegmentError::MalformedShape) => {
+                    StatementError::Kernel("the run does not fit its kernel's shape")
                 }
-                error => ProveError::Failed(failed(&error)),
+                error => StatementError::Failed(failed(&error)),
             }
         })
     }
@@ -235,12 +235,12 @@ fn failed(error: &TreeError) -> &'static str {
 }
 
 impl Prover for MaskedProver {
-    fn program(&self, kernel: &[u8]) -> Result<ProgramId, ProveError> {
+    fn program(&self, kernel: &[u8]) -> Result<ProgramId, StatementError> {
         let program = self.kernel(kernel)?;
         Ok(ProgramId(program.0.id().words()))
     }
 
-    fn prove(&self, kernel: &[u8], attest: &Attest) -> Result<Vec<u8>, ProveError> {
+    fn prove(&self, kernel: &[u8], attest: &Attest) -> Result<Vec<u8>, StatementError> {
         self.proved(kernel, attest, vos_pvm_recair::tree::prove_final)
             .map(|(bytes, _)| bytes)
     }
@@ -266,11 +266,11 @@ impl Disclosing {
 
 #[cfg(feature = "disclosing")]
 impl Prover for Disclosing {
-    fn program(&self, kernel: &[u8]) -> Result<ProgramId, ProveError> {
+    fn program(&self, kernel: &[u8]) -> Result<ProgramId, StatementError> {
         self.masked.program(kernel)
     }
 
-    fn prove(&self, kernel: &[u8], attest: &Attest) -> Result<Vec<u8>, ProveError> {
+    fn prove(&self, kernel: &[u8], attest: &Attest) -> Result<Vec<u8>, StatementError> {
         let (proof, internals) = self.masked.prove_disclosing(kernel, attest)?;
         lock(&self.made).push((attest.clone(), internals));
         Ok(proof)

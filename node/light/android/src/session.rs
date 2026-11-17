@@ -466,7 +466,7 @@ impl Inner {
     /// enrolled guard proves with it.
     pub(crate) fn program(&self, kernel: &[u8]) -> Result<Arc<DeviceProgram>, DeviceError> {
         self.programs.get(warm::key(kernel), || {
-            <Device as vos_wire::Decode>::decode_exact(kernel)
+            <Release as vos_wire::Decode>::decode_exact(kernel)
                 .ok_or(DeviceError::Prove)
                 .and_then(|device| DeviceProgram::from_release(&device))
         })
@@ -1542,7 +1542,7 @@ mod tests {
         for artifact in [&stock.auth, &stock.owner] {
             facility.inner.program(artifact).unwrap();
         }
-        let mut renamed = <Device as vos_wire::Decode>::decode_exact(&stock.owner).unwrap();
+        let mut renamed = <Release as vos_wire::Decode>::decode_exact(&stock.owner).unwrap();
         renamed.id[0] ^= 1;
         let renamed = vos_wire::Encode::encode(&renamed);
         assert_eq!(

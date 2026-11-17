@@ -14,7 +14,7 @@ use stwo::core::{
 use super::{
     MAX_EXTENDED_LOG_SIZE, MAX_FRI_QUERIES, MAX_MERKLE_WITNESS_HASHES, MAX_PROOF_COLUMNS_PER_TREE,
     MAX_PROOF_COMPONENTS, MAX_PROOF_OWNED_BYTES, MAX_PROOF_SAMPLES_PER_COLUMN, MIN_PROOF_LOG_SIZE,
-    PROOF_COMMITMENT_TREE_COUNT, Proof, proof_format,
+    Malformed, PROOF_COMMITMENT_TREE_COUNT, Proof, proof_format,
 };
 use crate::format::Format;
 use crate::pcs::{ProofHash, StarkProofAny};
@@ -35,7 +35,7 @@ use crate::pcs::{ProofHash, StarkProofAny};
 pub fn preflight_proof_structure_readonly(
     proof: &Proof,
     max_log_size: u32,
-) -> Result<(&'static Format, usize), alloc::string::String> {
+) -> Result<(&'static Format, usize), Malformed> {
     let format = proof_format(proof)?;
     let bytes = match &proof.stark_proof {
         StarkProofAny::Poseidon2M31(stark) => preflight_structure(proof, stark, max_log_size),
@@ -48,68 +48,60 @@ fn preflight_structure<H: MerkleHasherLifted>(
     proof: &Proof,
     stark: &StarkProof<H>,
     max_log_size: u32,
-) -> Result<usize, alloc::string::String>
+) -> Result<usize, Malformed>
 where
     H::Hash: ProofHash,
 {
-    use alloc::{format, string::ToString};
-
     if proof.num_components == 0 || proof.num_components > MAX_PROOF_COMPONENTS {
-        return Err("proof component cardinality is outside protocol bounds".into());
+        return Err(Malformed::Components);
     }
     if proof.log_sizes.len() != proof.num_components
         || proof.claimed_sums.len() != proof.num_components
     {
-        return Err("proof component/log-size/claimed-sum lengths differ".into());
+        return Err(Malformed::Lengths);
     }
-    if let Some(&offending) = proof
+    if proof
         .log_sizes
         .iter()
-        .find(|&&log_size| log_size < MIN_PROOF_LOG_SIZE || log_size > max_log_size)
+        .any(|&log_size| log_size < MIN_PROOF_LOG_SIZE || log_size > max_log_size)
     {
-        return Err(format!(
-            "proof log_size {offending} is outside {MIN_PROOF_LOG_SIZE}..={max_log_size}"
-        ));
+        return Err(Malformed::LogSize);
     }
 
     let config = proof.pcs_config;
     if stark.config != config {
-        return Err("outer and embedded pcs_config differ".into());
+        return Err(Malformed::Config);
     }
     let fri = config.fri_config;
     if !(1..=16).contains(&fri.log_blowup_factor) {
-        return Err("FRI log blowup is outside Stwo's 1..=16 bound".into());
+        return Err(Malformed::Blowup);
     }
     if fri.log_last_layer_degree_bound > 10 {
-        return Err("FRI last-layer degree bound exceeds 10".into());
+        return Err(Malformed::LastLayerBound);
     }
     // Stwo 2.x exposes a configurable field but implements one-fold layers;
     // admitting another value reaches assumptions and shifts not audited here.
     if fri.fold_step != 1 {
-        return Err("FRI fold_step must equal the protocol value 1".into());
+        return Err(Malformed::FoldStep);
     }
     if !(1..=MAX_FRI_QUERIES).contains(&fri.n_queries) {
-        return Err(format!("FRI query count is outside 1..={MAX_FRI_QUERIES}"));
+        return Err(Malformed::Queries);
     }
     if config.pow_bits > 31 {
-        return Err("PCS proof-of-work bits exceed the supported bound 31".into());
+        return Err(Malformed::PowBits);
     }
 
     let max_trace_log = proof.log_sizes.iter().copied().max().unwrap_or(0);
     let max_extended_log = max_trace_log
         .checked_add(fri.log_blowup_factor)
-        .ok_or_else(|| "trace log size plus FRI blowup overflows".to_string())?;
+        .ok_or(Malformed::ExtendedLogSize)?;
     if max_extended_log > MAX_EXTENDED_LOG_SIZE {
-        return Err(format!(
-            "extended trace log size {max_extended_log} exceeds {MAX_EXTENDED_LOG_SIZE}"
-        ));
+        return Err(Malformed::ExtendedLogSize);
     }
     if let Some(lifting) = config.lifting_log_size
         && (lifting < max_extended_log || lifting > MAX_EXTENDED_LOG_SIZE)
     {
-        return Err(format!(
-            "PCS lifting log size {lifting} does not cover {max_extended_log} within the protocol bound"
-        ));
+        return Err(Malformed::Lifting);
     }
 
     if stark.commitments.len() != PROOF_COMMITMENT_TREE_COUNT
@@ -117,34 +109,26 @@ where
         || stark.decommitments.len() != PROOF_COMMITMENT_TREE_COUNT
         || stark.queried_values.len() != PROOF_COMMITMENT_TREE_COUNT
     {
-        return Err(format!(
-            "Stwo proof must contain exactly {PROOF_COMMITMENT_TREE_COUNT} commitment trees"
-        ));
+        return Err(Malformed::Trees);
     }
 
     for columns in stark.sampled_values.iter() {
         if columns.len() > MAX_PROOF_COLUMNS_PER_TREE {
-            return Err(format!(
-                "sampled-value column count {} exceeds protocol bound {MAX_PROOF_COLUMNS_PER_TREE}",
-                columns.len()
-            ));
+            return Err(Malformed::Columns);
         }
         if columns
             .iter()
             .any(|samples| samples.len() > MAX_PROOF_SAMPLES_PER_COLUMN)
         {
-            return Err("sample count per column exceeds protocol bound".into());
+            return Err(Malformed::Samples);
         }
     }
     for columns in stark.queried_values.iter() {
         if columns.len() > MAX_PROOF_COLUMNS_PER_TREE {
-            return Err(format!(
-                "queried-value column count {} exceeds protocol bound {MAX_PROOF_COLUMNS_PER_TREE}",
-                columns.len()
-            ));
+            return Err(Malformed::Columns);
         }
         if columns.iter().any(|values| values.len() > fri.n_queries) {
-            return Err("queried-value count exceeds configured FRI queries".into());
+            return Err(Malformed::QueriedValues);
         }
     }
     if stark
@@ -152,12 +136,12 @@ where
         .iter()
         .any(|decommitment| decommitment.hash_witness.len() > MAX_MERKLE_WITNESS_HASHES)
     {
-        return Err("trace Merkle witness exceeds protocol bound".into());
+        return Err(Malformed::MerkleWitness);
     }
 
     let fri_proof = &stark.fri_proof;
     if fri_proof.inner_layers.len() > MAX_EXTENDED_LOG_SIZE as usize {
-        return Err("FRI inner-layer count exceeds protocol bound".into());
+        return Err(Malformed::FriLayers);
     }
     let layer_is_bounded = |layer: &stwo::core::fri::FriLayerProof<H>| {
         layer.fri_witness.len() <= MAX_FRI_QUERIES
@@ -169,23 +153,19 @@ where
             .iter()
             .any(|layer| !layer_is_bounded(layer))
     {
-        return Err("FRI layer witness exceeds protocol bound".into());
+        return Err(Malformed::FriWitness);
     }
-    let owned_bytes = proof_owned_bytes_of(proof, stark).ok_or_else(|| {
-        alloc::format!("proof nested payload exceeds {MAX_PROOF_OWNED_BYTES} bytes")
-    })?;
+    let owned_bytes = proof_owned_bytes_of(proof, stark).ok_or(Malformed::Payload)?;
 
     let expected_last_len = 1usize
         .checked_shl(fri.log_last_layer_degree_bound)
-        .ok_or_else(|| "FRI last-layer length shift overflows".to_string())?;
+        .ok_or(Malformed::LastLayer)?;
     let coefficients_len = fri_proof.last_layer_poly.iter().count();
     if coefficients_len != expected_last_len {
-        return Err(format!(
-            "FRI last-layer polynomial has {coefficients_len} coefficients, expected {expected_last_len}"
-        ));
+        return Err(Malformed::LastLayer);
     }
     if !proof_fields_are_canonical(proof, stark) {
-        return Err("proof contains a noncanonical M31 field limb".into());
+        return Err(Malformed::Noncanonical);
     }
     Ok(owned_bytes)
 }
@@ -317,7 +297,7 @@ fn proof_owned_bytes_of<H: MerkleHasherLifted>(
 pub fn preflight_proof_structure(
     proof: &mut Proof,
     max_log_size: u32,
-) -> Result<&'static Format, alloc::string::String> {
+) -> Result<&'static Format, Malformed> {
     let (format, _bounded_bytes) = preflight_proof_structure_readonly(proof, max_log_size)?;
     match &mut proof.stark_proof {
         StarkProofAny::Poseidon2M31(stark) => normalize_last_layer(stark),
@@ -348,36 +328,28 @@ pub struct ProofProtocolShape {
 pub fn derive_protocol_degree_shape(
     config: &PcsConfig,
     composition_log_degree_bound: u32,
-) -> Result<(u32, u32), alloc::string::String> {
-    use alloc::string::ToString;
-
+) -> Result<(u32, u32), Malformed> {
     let split_composition_log = composition_log_degree_bound
         .checked_sub(1)
-        .ok_or_else(|| "composition log degree cannot be split".to_string())?;
+        .ok_or(Malformed::Composition)?;
     let required_lifting = split_composition_log
         .checked_add(config.fri_config.log_blowup_factor)
-        .ok_or_else(|| "composition log degree plus blowup overflows".to_string())?;
+        .ok_or(Malformed::Composition)?;
     if config
         .lifting_log_size
         .is_some_and(|explicit| explicit != required_lifting)
     {
-        return Err(alloc::format!(
-            "explicit lifting log size must equal the AIR-derived value {required_lifting}"
-        ));
+        return Err(Malformed::Lifting);
     }
     let lifting_log_size = required_lifting;
     if lifting_log_size > MAX_EXTENDED_LOG_SIZE {
-        return Err(alloc::format!(
-            "lifting log size {lifting_log_size} does not cover composition domain {required_lifting}"
-        ));
+        return Err(Malformed::Lifting);
     }
     let max_log_degree_bound = lifting_log_size
         .checked_sub(config.fri_config.log_blowup_factor)
-        .ok_or_else(|| "lifting log size is below FRI blowup".to_string())?;
+        .ok_or(Malformed::Lifting)?;
     if max_log_degree_bound < MIN_PROOF_LOG_SIZE {
-        return Err(alloc::format!(
-            "maximum polynomial log degree {max_log_degree_bound} is below {MIN_PROOF_LOG_SIZE}"
-        ));
+        return Err(Malformed::Composition);
     }
     Ok((lifting_log_size, max_log_degree_bound))
 }
@@ -391,47 +363,39 @@ pub fn preflight_proof_dimensions<H: MerkleHasherLifted>(
     expected_log_sizes: &[alloc::vec::Vec<u32>],
     expected_sample_counts: &[alloc::vec::Vec<usize>],
     composition_log_degree_bound: u32,
-) -> Result<ProofProtocolShape, alloc::string::String> {
-    use alloc::{format, string::ToString};
-
+) -> Result<ProofProtocolShape, Malformed> {
     if expected_log_sizes.len() != PROOF_COMMITMENT_TREE_COUNT
         || expected_sample_counts.len() != PROOF_COMMITMENT_TREE_COUNT
     {
-        return Err("AIR-derived proof layout must contain exactly four trees".into());
+        return Err(Malformed::Layout);
     }
     let fri = config.fri_config;
     let (lifting_log_size, max_log_degree_bound) =
         derive_protocol_degree_shape(config, composition_log_degree_bound)?;
 
-    for (tree_index, logs) in expected_log_sizes.iter().enumerate() {
+    for logs in expected_log_sizes {
         if logs.len() > MAX_PROOF_COLUMNS_PER_TREE {
-            return Err(format!(
-                "AIR-derived tree {tree_index} column count exceeds protocol bound"
-            ));
+            return Err(Malformed::Layout);
         }
         for &log_size in logs {
             if log_size < MIN_PROOF_LOG_SIZE {
-                return Err(format!(
-                    "tree {tree_index} column log size {log_size} is below {MIN_PROOF_LOG_SIZE}"
-                ));
+                return Err(Malformed::Layout);
             }
             let extended = log_size
                 .checked_add(fri.log_blowup_factor)
-                .ok_or_else(|| "column log size plus blowup overflows".to_string())?;
+                .ok_or(Malformed::Layout)?;
             if extended > lifting_log_size || extended > MAX_EXTENDED_LOG_SIZE {
-                return Err(format!(
-                    "tree {tree_index} column log size {log_size} is incompatible with lifting {lifting_log_size}"
-                ));
+                return Err(Malformed::Layout);
             }
         }
     }
 
     let expected_composition_logs = alloc::vec![max_log_degree_bound; 8];
     if expected_log_sizes[PROOF_COMMITMENT_TREE_COUNT - 1] != expected_composition_logs {
-        return Err("composition tree must contain eight exact split columns".into());
+        return Err(Malformed::Composition);
     }
     if expected_sample_counts[PROOF_COMMITMENT_TREE_COUNT - 1] != alloc::vec![1; 8] {
-        return Err("composition tree must contain one OODS sample per split column".into());
+        return Err(Malformed::Composition);
     }
 
     let mut common_query_count = None;
@@ -442,32 +406,27 @@ pub fn preflight_proof_dimensions<H: MerkleHasherLifted>(
             || stark.sampled_values[tree_index].len() != logs.len()
             || stark.queried_values[tree_index].len() != logs.len()
         {
-            return Err(format!(
-                "tree {tree_index} column dimensions differ from the AIR-derived layout"
-            ));
+            return Err(Malformed::Columns);
         }
         for (column, &expected_samples) in stark.sampled_values[tree_index].iter().zip(samples) {
             if column.len() != expected_samples {
-                return Err(format!(
-                    "tree {tree_index} OODS sample dimensions differ from the AIR mask"
-                ));
+                return Err(Malformed::Samples);
             }
         }
         for column in &stark.queried_values[tree_index] {
             let query_count = column.len();
             if let Some(expected) = common_query_count {
                 if query_count != expected {
-                    return Err("queried-value columns have inconsistent row counts".into());
+                    return Err(Malformed::QueriedValues);
                 }
             } else {
                 common_query_count = Some(query_count);
             }
         }
     }
-    let query_count =
-        common_query_count.ok_or_else(|| "proof contains no queried-value columns".to_string())?;
+    let query_count = common_query_count.ok_or(Malformed::QueriedValues)?;
     if query_count == 0 || query_count > fri.n_queries {
-        return Err("deduplicated FRI query count is outside configured bounds".into());
+        return Err(Malformed::QueriedValues);
     }
 
     let expected_inner_layers = max_log_degree_bound
@@ -475,13 +434,9 @@ pub fn preflight_proof_dimensions<H: MerkleHasherLifted>(
         .and_then(|after_circle_fold| {
             after_circle_fold.checked_sub(fri.log_last_layer_degree_bound)
         })
-        .ok_or_else(|| "FRI last layer exceeds the folded composition bound".to_string())?
-        as usize;
+        .ok_or(Malformed::FriLayers)? as usize;
     if stark.fri_proof.inner_layers.len() != expected_inner_layers {
-        return Err(format!(
-            "FRI inner-layer count {}, expected {expected_inner_layers}",
-            stark.fri_proof.inner_layers.len()
-        ));
+        return Err(Malformed::FriLayers);
     }
 
     Ok(ProofProtocolShape {
@@ -504,7 +459,7 @@ pub fn expected_fiat_shamir_query_count<MC: MerkleChannel>(
     config: &PcsConfig,
     shape: ProofProtocolShape,
     expected_log_sizes: &[alloc::vec::Vec<u32>],
-) -> Result<usize, alloc::string::String> {
+) -> Result<usize, Malformed> {
     use stwo::core::pcs::utils::prepare_preprocessed_query_positions;
 
     let positions = replay_query_positions::<MC>(
@@ -514,20 +469,14 @@ pub fn expected_fiat_shamir_query_count<MC: MerkleChannel>(
         shape.lifting_log_size,
     )?;
     if positions.len() != shape.query_count {
-        return Err(alloc::string::String::from(
-            "queried-value rows differ from Fiat-Shamir query positions",
-        ));
+        return Err(Malformed::QueryPositions);
     }
 
-    let preprocessed_logs = expected_log_sizes
-        .first()
-        .ok_or_else(|| alloc::string::String::from("missing preprocessed tree shape"))?;
+    let preprocessed_logs = expected_log_sizes.first().ok_or(Malformed::Layout)?;
     let preprocessed_max_extended = match preprocessed_logs.iter().copied().max() {
         Some(log_size) => log_size
             .checked_add(config.fri_config.log_blowup_factor)
-            .ok_or_else(|| {
-                alloc::string::String::from("preprocessed tree height arithmetic overflow")
-            })?,
+            .ok_or(Malformed::Layout)?,
         None => 0,
     };
     let preprocessed_height = config.lifting_log_size.unwrap_or(preprocessed_max_extended);
@@ -552,7 +501,7 @@ pub(super) fn replay_query_positions<MC: MerkleChannel>(
     stark_proof: &StarkProof<MC::H>,
     config: &PcsConfig,
     lifting_log_size: u32,
-) -> Result<Vec<usize>, alloc::string::String> {
+) -> Result<Vec<usize>, Malformed> {
     use stwo::core::{circle::CirclePoint, queries::draw_queries};
 
     // `verify_ex`: the composition coefficient, the composition root, then the
@@ -562,7 +511,7 @@ pub(super) fn replay_query_positions<MC: MerkleChannel>(
         .commitments
         .get(PROOF_COMMITMENT_TREE_COUNT - 1)
         .copied()
-        .ok_or_else(|| alloc::string::String::from("missing composition commitment"))?;
+        .ok_or(Malformed::Trees)?;
     MC::mix_root(channel, composition);
     let _ = CirclePoint::<SecureField>::get_random_point(channel);
 
@@ -603,7 +552,7 @@ pub(super) fn replay_query_positions<MC: MerkleChannel>(
 fn validate_preprocessed_query_values(
     remapped_positions: &[usize],
     columns: &[alloc::vec::Vec<stwo::core::fields::m31::BaseField>],
-) -> Result<(), alloc::string::String> {
+) -> Result<(), Malformed> {
     let mut reads: alloc::vec::Vec<usize> = (0..remapped_positions.len()).collect();
     reads.sort_by_key(|&read| remapped_positions[read]);
     for pair in reads.windows(2) {
@@ -616,9 +565,7 @@ fn validate_preprocessed_query_values(
                     .is_none_or(|(left, right)| left != right)
             })
         {
-            return Err(alloc::string::String::from(
-                "duplicate preprocessed query positions carry different values",
-            ));
+            return Err(Malformed::PreprocessedQueries);
         }
     }
     Ok(())

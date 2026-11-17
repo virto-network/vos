@@ -346,7 +346,7 @@ fn a_sparse_image_without_its_layout_is_refused() {
     assert_eq!(bare.memory_layout(), None);
     assert!(matches!(
         vos_pvm_proof::prove(&mut bare),
-        Err(vos_pvm_proof::ProvingError::NoMemoryLayout)
+        Err(vos_pvm_proof::SegmentError::NoMemoryLayout)
     ));
     let mut side_note = sparse_run().with_memory_layout(MemoryLayout::writable());
     let proof = vos_pvm_proof::prove(&mut side_note).expect("proving failed");

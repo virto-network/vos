@@ -16,7 +16,7 @@ use vos_pvm_proof::format::SEGMENT;
 use vos_pvm_proof::kernel::{KernelTrace, trace_kernel};
 use vos_pvm_proof::program_id::KernelProgram;
 use vos_pvm_proof::segment::{SegmentCursor, segment_bounds_budgeted};
-use vos_pvm_proof::{Proof, ProvingError, prove_shaped};
+use vos_pvm_proof::{Proof, SegmentError, prove_shaped};
 use vos_statement::{ProgramId, Statement};
 use vos_testkit::model::Model;
 use vos_testkit::model::Step;
@@ -415,7 +415,7 @@ pub fn prove_at_first_class(
         let shape = program.shape.segment(class).unwrap();
         match prove_shaped(&mut cursor.side_note(a, b), &shape, &SEGMENT) {
             Ok(proof) => return (class, proof),
-            Err(ProvingError::Shape { .. }) => continue,
+            Err(SegmentError::Shape { .. }) => continue,
             Err(error) => panic!("{error}"),
         }
     }

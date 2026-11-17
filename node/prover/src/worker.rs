@@ -97,7 +97,7 @@ pub trait Jobs {
 /// Why a statement is not proved. Each reason is static, so that it holds
 /// nothing of the run's values and may be logged.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ProveError {
+pub enum StatementError {
     /// The kernel's re-run on the record's witness does not make the
     /// record's statement: refused for good.
     Rerun(&'static str),
@@ -110,11 +110,11 @@ pub enum ProveError {
 /// What proves a statement.
 pub trait Prover: Send + Sync {
     /// The program id of `kernel`, a kernel's blob, recomputed from it.
-    fn program(&self, kernel: &[u8]) -> Result<ProgramId, ProveError>;
+    fn program(&self, kernel: &[u8]) -> Result<ProgramId, StatementError>;
     /// The final proof of `attest`'s statement under [`FORMAT`], its
     /// bytes as the format lays them out: `kernel` re-run on its witness,
     /// checked against it, and proved.
-    fn prove(&self, kernel: &[u8], attest: &Attest) -> Result<Vec<u8>, ProveError>;
+    fn prove(&self, kernel: &[u8], attest: &Attest) -> Result<Vec<u8>, StatementError>;
 }
 
 /// The worker's settings.
@@ -445,7 +445,7 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                 self.fetching.remove(&attest.program);
                 let program = match self.prover.program(&blob) {
                     Ok(program) => program,
-                    Err(ProveError::Kernel(_)) => ProgramId([u32::MAX; 8]),
+                    Err(StatementError::Kernel(_)) => ProgramId([u32::MAX; 8]),
                     Err(_) => return Ok(None),
                 };
                 self.programs.insert(attest.program, program);
@@ -588,7 +588,7 @@ impl<H: Host, J: Jobs> Worker<H, J> {
         let started = Instant::now();
         let prover = Arc::clone(&self.prover);
         let proved = crate::redact::proving(|| prover.prove(&kernel, &attest))
-            .unwrap_or(Err(ProveError::Failed("the prover panicked")));
+            .unwrap_or(Err(StatementError::Failed("the prover panicked")));
         let took = started.elapsed();
         match proved {
             Ok(proof) => {
@@ -603,7 +603,7 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                 tracing::info!(agent, seconds = took.as_secs_f64(), "a statement proved");
                 self.host.record(recorder, window, id, proof, attested);
             }
-            Err(ProveError::Rerun(reason)) => {
+            Err(StatementError::Rerun(reason)) => {
                 tracing::error!(
                     agent,
                     reason,
@@ -612,12 +612,12 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                 self.jobs
                     .put(&id, &job.to(State::Refused(Refusal::Rerun)))?;
             }
-            Err(ProveError::Kernel(reason)) => {
+            Err(StatementError::Kernel(reason)) => {
                 tracing::error!(agent, reason, "a record's kernel is not provable: refused");
                 self.jobs
                     .put(&id, &job.to(State::Refused(Refusal::Kernel)))?;
             }
-            Err(ProveError::Failed(reason)) => {
+            Err(StatementError::Failed(reason)) => {
                 tracing::warn!(
                     agent,
                     attempts = job.attempts,

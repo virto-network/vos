@@ -43,7 +43,6 @@
 //! permutation, absorbed into the rate, then a 1 and zeros to the next
 //! eight (`P2MerkleHasher`'s leaf).
 
-use alloc::string::String;
 use alloc::vec::Vec;
 
 use stwo::core::fields::m31::BaseField;
@@ -194,24 +193,75 @@ impl KernelEntry {
     /// The entry of `blob`, the kernel `program` pins: refused when `blob`
     /// is not the program it names, by its hash and its image root, or not
     /// a standard program.
-    pub fn of(program: &KernelProgram, blob: &[u8]) -> Result<Self, String> {
+    pub fn of(program: &KernelProgram, blob: &[u8]) -> Result<Self, KernelError> {
         if vos_pvm_precompiles::blake2b_256(blob) != program.program {
-            return Err("the blob is not the kernel's program".into());
+            return Err(KernelError::Blob);
         }
-        let standard = vos_pvm_program::parse_standard_program(blob)
-            .ok_or_else(|| String::from("the kernel is not a standard program"))?;
+        let standard =
+            vos_pvm_program::parse_standard_program(blob).ok_or(KernelError::NotStandard)?;
         if standard.image_root() != Some(program.image_root) {
-            return Err("the blob's image root is not the kernel's".into());
+            return Err(KernelError::ImageRoot);
         }
-        let layout = standard
-            .layout(&[])
-            .ok_or_else(|| String::from("the kernel's layout does not fit"))?;
+        let layout = standard.layout(&[]).ok_or(KernelError::Layout)?;
         Ok(Self {
             pc: 0,
             registers: layout.registers,
         })
     }
 }
+
+/// Why a kernel's program, or its blob against it, is refused. Value-free:
+/// a kernel is public, and a variant names the rule it breaks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelError {
+    /// The blob is not the program the kernel names, by its hash.
+    Blob,
+    /// The blob is not a standard program.
+    NotStandard,
+    /// The blob's image root is not the kernel's.
+    ImageRoot,
+    /// The kernel's layout does not fit.
+    Layout,
+    /// The kernel's shape is refused.
+    Shape(crate::shape::ShapeError),
+    /// The kernel's format is no segment format the registry holds.
+    Format,
+    /// A preprocessed root more or fewer than the shape's classes.
+    Roots,
+    /// A preprocessed root in another channel than its format's.
+    Channel,
+    /// A leaf circuit more or fewer than the shape's classes.
+    LeafCircuits,
+    /// A class's preprocessed root cannot be computed from the kernel's
+    /// code at its sizes.
+    Preprocessed,
+}
+
+impl KernelError {
+    /// What it says, a static text a log may hold.
+    pub const fn reason(&self) -> &'static str {
+        match self {
+            Self::Blob => "the blob is not the kernel's program",
+            Self::NotStandard => "the kernel is not a standard program",
+            Self::ImageRoot => "the blob's image root is not the kernel's",
+            Self::Layout => "the kernel's layout does not fit",
+            Self::Shape(error) => error.reason(),
+            Self::Format => "the kernel's format is no segment format",
+            Self::Roots => "a preprocessed root more or fewer than the classes",
+            Self::Channel => "a preprocessed root is not in its format's channel",
+            Self::LeafCircuits => "a leaf circuit more or fewer than the classes",
+            Self::Preprocessed => "a class's preprocessed root cannot be computed",
+        }
+    }
+}
+
+impl core::fmt::Display for KernelError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+
+impl core::error::Error for KernelError {}
 
 /// A byte string's 16-bit limbs, little-endian, the last zero-extended.
 fn byte_limbs(bytes: &[u8]) -> impl Iterator<Item = BaseField> + '_ {
@@ -225,36 +275,25 @@ fn byte_limbs(bytes: &[u8]) -> impl Iterator<Item = BaseField> + '_ {
 impl KernelProgram {
     /// Whether it is one a venue may pin: a well-formed shape, a segment
     /// format the registry knows, and a root per class in its channel.
-    pub fn check(&self) -> Result<(), String> {
-        self.shape.check()?;
+    pub fn check(&self) -> Result<(), KernelError> {
+        self.shape.check().map_err(KernelError::Shape)?;
         let format = crate::format::lookup(self.format)
             .filter(|format| format.kind == crate::format::ProofKind::Segment)
-            .ok_or_else(|| alloc::format!("format {} is no segment format", self.format))?;
+            .ok_or(KernelError::Format)?;
         if self.preprocessed_roots.len() != self.shape.classes.len() {
-            return Err(alloc::format!(
-                "{} preprocessed roots for {} classes",
-                self.preprocessed_roots.len(),
-                self.shape.classes.len()
-            ));
+            return Err(KernelError::Roots);
         }
         if self
             .preprocessed_roots
             .iter()
             .any(|root| root.channel() != format.channel)
         {
-            return Err(alloc::format!(
-                "a preprocessed root is not in format {}'s channel",
-                self.format
-            ));
+            return Err(KernelError::Channel);
         }
         if let LeafCircuits::Hashes(hashes) = &self.leaf_circuits
             && hashes.len() != self.shape.classes.len()
         {
-            return Err(alloc::format!(
-                "{} leaf circuits for {} classes",
-                hashes.len(),
-                self.shape.classes.len()
-            ));
+            return Err(KernelError::LeafCircuits);
         }
         Ok(())
     }
@@ -463,7 +502,7 @@ mod tests {
     fn a_malformed_program_is_refused() {
         let mut blake = program();
         blake.preprocessed_roots[0] = Commitment::Blake2sM31(Default::default());
-        assert!(blake.check().unwrap_err().contains("channel"));
+        assert_eq!(blake.check(), Err(KernelError::Channel));
         let mut short = program();
         short.preprocessed_roots.pop();
         assert!(short.check().is_err());
@@ -472,7 +511,7 @@ mod tests {
         assert!(leaf.check().is_err());
         let mut leaves = program();
         leaves.leaf_circuits = LeafCircuits::Hashes(vec![P2Hash::default()]);
-        assert!(leaves.check().unwrap_err().contains("leaf circuits"));
+        assert_eq!(leaves.check(), Err(KernelError::LeafCircuits));
     }
 
     /// Version 1's slot: its version, the hashes' count and each hash's

@@ -40,7 +40,7 @@ fn refused_both_ways(
     assert!(
         matches!(
             refused,
-            Err(ProveError::Stwo(ProvingError::ConstraintsNotSatisfied))
+            Err(CircuitError::Stwo(ProvingError::ConstraintsNotSatisfied))
         ),
         "{name}: the prover {:?}",
         refused.map(|_| ())
@@ -327,7 +327,7 @@ fn an_unbalanced_relation_cancelled_by_the_blinding_is_refused() {
     assert!(
         matches!(
             refused,
-            Err(ProveError::Stwo(ProvingError::ConstraintsNotSatisfied))
+            Err(CircuitError::Stwo(ProvingError::ConstraintsNotSatisfied))
         ),
         "{:?}",
         refused.map(|_| ())

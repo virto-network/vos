@@ -235,9 +235,13 @@ fn the_masked_wrap_needs_affine_batching() {
         &MASKED_WRAP_REFERENCE,
     )
     .unwrap_err();
-    assert!(
-        error.contains("76 proven bits, below format 39's floor of 80"),
-        "{error}"
+    assert_eq!(
+        error,
+        crate::proof::SecurityError::Proven {
+            format: 39,
+            bits: 76,
+            floor: 80
+        }
     );
 }
 

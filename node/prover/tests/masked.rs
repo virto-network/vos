@@ -6,7 +6,7 @@
 
 use vos_node_prover::masked::{MaskedProver, kernel_record};
 use vos_node_prover::program::program_id;
-use vos_node_prover::{ProveError, Prover};
+use vos_node_prover::{Prover, StatementError};
 use vos_pvm_proof::constants;
 use vos_testkit::model::Model;
 use vos_testkit::programs::{actor_elf, derived, method};
@@ -70,7 +70,7 @@ fn a_kernel_is_read_from_its_blob_alone() {
     }
     assert!(matches!(
         prover.program(b"not a kernel"),
-        Err(ProveError::Kernel(_))
+        Err(StatementError::Kernel(_))
     ));
 }
 
@@ -96,12 +96,12 @@ fn a_record_whose_rerun_is_not_its_statement_is_refused() {
             let mut attest = attest.clone();
             tamper(&mut attest);
             assert!(
-                matches!(prover.rerun(blob, &attest), Err(ProveError::Rerun(_))),
+                matches!(prover.rerun(blob, &attest), Err(StatementError::Rerun(_))),
                 "change {n}"
             );
             assert!(matches!(
                 prover.prove(blob, &attest),
-                Err(ProveError::Rerun(_))
+                Err(StatementError::Rerun(_))
             ));
         }
     }

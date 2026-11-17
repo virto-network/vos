@@ -23,7 +23,7 @@ use stwo::prover::backend::simd::column::BaseColumn;
 use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::poly::circle::{CircleCoefficients, CircleEvaluation};
 
-use crate::prove::ProveError;
+use crate::prove::CircuitError;
 
 /// Where `f + v_H·r` puts its coefficients for a column of `2^log_size`
 /// rows, masked by `2^log_mask_rows` random coefficients.
@@ -41,9 +41,9 @@ impl MaskLayout {
     /// The layout at `log_size`, refused unless `h ≤ N/4`: the masked
     /// columns' constraints must stay inside the composition's bound
     /// (`MASKED_LOG_CONSTRAINT_EXPANSION`).
-    pub fn new(log_size: u32, log_mask_rows: u32) -> Result<Self, ProveError> {
+    pub fn new(log_size: u32, log_mask_rows: u32) -> Result<Self, CircuitError> {
         if log_mask_rows + 2 > log_size || log_size >= usize::BITS - 2 {
-            return Err(ProveError::Masking(
+            return Err(CircuitError::Masking(
                 "h exceeds a quarter of a component's rows",
             ));
         }
@@ -64,7 +64,7 @@ impl MaskLayout {
             }
         }
         if lower.contains(&usize::MAX) {
-            return Err(ProveError::Masking(
+            return Err(CircuitError::Masking(
                 "a coefficient is lost in the extension",
             ));
         }
@@ -96,7 +96,7 @@ impl MaskLayout {
                 .map(|(position, _)| position)
                 .collect();
         if upper.len() != h {
-            return Err(ProveError::Masking(
+            return Err(CircuitError::Masking(
                 "v_H·r spans other than h basis elements",
             ));
         }
@@ -105,7 +105,7 @@ impl MaskLayout {
             taken[position] = true;
         }
         if upper.iter().any(|&position| taken[position]) {
-            return Err(ProveError::Masking(
+            return Err(CircuitError::Masking(
                 "v_H·r overlaps the column's coefficients",
             ));
         }
@@ -122,9 +122,9 @@ impl MaskLayout {
         &self,
         poly: &CircleCoefficients<SimdBackend>,
         rng: &mut impl Rng,
-    ) -> Result<CircleCoefficients<SimdBackend>, ProveError> {
+    ) -> Result<CircleCoefficients<SimdBackend>, CircuitError> {
         if poly.log_size() != self.log_size {
-            return Err(ProveError::Masking(
+            return Err(CircuitError::Masking(
                 "a column of another size than its layout",
             ));
         }
@@ -147,7 +147,7 @@ static LAYOUTS: Mutex<Vec<Arc<MaskLayout>>> = Mutex::new(Vec::new());
 /// The layouts for every component's size and `h` among `classes`, each a
 /// `(log_size, log_mask_rows)`: those built before taken from the process's
 /// cache, the others built in parallel and kept.
-pub(crate) fn layouts(classes: &[(u32, u32)]) -> Result<Vec<Arc<MaskLayout>>, ProveError> {
+pub(crate) fn layouts(classes: &[(u32, u32)]) -> Result<Vec<Arc<MaskLayout>>, CircuitError> {
     let mut classes = classes.to_vec();
     classes.sort_unstable();
     classes.dedup();
@@ -196,9 +196,9 @@ pub(crate) fn mask_with(
     polys: &[(&CircleCoefficients<SimdBackend>, u32)],
     seeds: Vec<[u8; 32]>,
     layouts: &[Arc<MaskLayout>],
-) -> Result<Vec<CircleCoefficients<SimdBackend>>, ProveError> {
+) -> Result<Vec<CircleCoefficients<SimdBackend>>, CircuitError> {
     if seeds.len() != polys.len() {
-        return Err(ProveError::Masking("a seed for each column"));
+        return Err(CircuitError::Masking("a seed for each column"));
     }
     polys
         .par_iter()
@@ -209,7 +209,7 @@ pub(crate) fn mask_with(
                 .find(|layout| {
                     layout.log_size == poly.log_size() && layout.log_mask_rows == log_mask_rows
                 })
-                .ok_or(ProveError::Masking("a column of a size with no layout"))?;
+                .ok_or(CircuitError::Masking("a column of a size with no layout"))?;
             layout.mask(poly, &mut ChaCha20Rng::from_seed(seed))
         })
         .collect()
@@ -221,7 +221,7 @@ pub(crate) fn mask_columns(
     polys: &[(&CircleCoefficients<SimdBackend>, u32)],
     layouts: &[Arc<MaskLayout>],
     rng: &mut ChaCha20Rng,
-) -> Result<Vec<CircleCoefficients<SimdBackend>>, ProveError> {
+) -> Result<Vec<CircleCoefficients<SimdBackend>>, CircuitError> {
     let seeds = seeds(polys.len(), rng);
     mask_with(polys, seeds, layouts)
 }
@@ -290,6 +290,9 @@ mod tests {
             let nonzero = quotient.iter().filter(|c| !c.is_zero()).count();
             assert_eq!(nonzero, h, "2^{log_size}");
         }
-        assert!(matches!(MaskLayout::new(9, 8), Err(ProveError::Masking(_))));
+        assert!(matches!(
+            MaskLayout::new(9, 8),
+            Err(CircuitError::Masking(_))
+        ));
     }
 }

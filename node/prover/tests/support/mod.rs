@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use vos_node_prover::{Host, Jobs, Options, ProveError, Prover, Record, State, Worker};
+use vos_node_prover::{Host, Jobs, Options, Prover, Record, State, StatementError, Worker};
 use vos_venue::vos_statement::{ProgramId, Refusal, Statement, StatementId};
 use vos_venue::{AnchorOutcome, Held, Status, SubmitOutcome, UNJUDGED, VenueClient};
 use vos_wire::ids::{AgentId, ProgramHash};
@@ -213,11 +213,11 @@ pub(crate) struct Proofs {
 }
 
 impl Prover for Proofs {
-    fn program(&self, kernel: &[u8]) -> Result<ProgramId, ProveError> {
+    fn program(&self, kernel: &[u8]) -> Result<ProgramId, StatementError> {
         Ok(ProgramId([kernel.len() as u32; 8]))
     }
 
-    fn prove(&self, _: &[u8], attest: &Attest) -> Result<Vec<u8>, ProveError> {
+    fn prove(&self, _: &[u8], attest: &Attest) -> Result<Vec<u8>, StatementError> {
         if self.stop.swap(false, Ordering::SeqCst) {
             loop {
                 std::thread::park();
@@ -227,7 +227,7 @@ impl Prover for Proofs {
             panic!("the prover fails");
         }
         if self.refused.lock().unwrap().as_ref() == Some(&attest.output) {
-            return Err(ProveError::Rerun("the io-hash is not the record's"));
+            return Err(StatementError::Rerun("the io-hash is not the record's"));
         }
         let made = self.made.fetch_add(1, Ordering::SeqCst);
         Ok([b"proof".as_slice(), &attest.output, &made.to_le_bytes()].concat())

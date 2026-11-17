@@ -13,13 +13,13 @@ use vos_pvm_proof::pcs::ProofHash;
 use vos_pvm_proof::poseidon2::P2Hash;
 use vos_pvm_proof::program_id::{IdPreimage, KernelEntry, KernelProgram};
 use vos_pvm_proof::shape::KernelShape;
-use vos_pvm_proof::{KernelSegment, Proof, ProvingError, SideNote};
+use vos_pvm_proof::{KernelSegment, Proof, SegmentError, SideNote};
 
 use crate::context::Finalized;
 use crate::fold::{FoldCircuit, Proved};
 use crate::leaf::{LeafCircuit, NodeOutput};
 use crate::masked::{Drawn, drawn_in};
-use crate::prove::{ProveError, RecairProof};
+use crate::prove::{CircuitError, RecairProof};
 use crate::verifier::WitnessError;
 use crate::wrap::{self, WrapCircuit};
 
@@ -46,9 +46,9 @@ pub enum TreeError {
     /// A child's or a segment's values cannot be laid out.
     Witness(WitnessError),
     /// The circuit does not prove.
-    Prove(ProveError),
+    Prove(CircuitError),
     /// A segment of the run does not prove in its program's shape.
-    Segment(ProvingError),
+    Segment(SegmentError),
     /// The run has no step.
     Empty,
     /// The wrap's proof does not fit its format's layout.
@@ -61,8 +61,8 @@ impl From<WitnessError> for TreeError {
     }
 }
 
-impl From<ProveError> for TreeError {
-    fn from(error: ProveError) -> Self {
+impl From<CircuitError> for TreeError {
+    fn from(error: CircuitError) -> Self {
         Self::Prove(error)
     }
 }
@@ -319,7 +319,7 @@ pub fn wrap(
 pub fn wrap_with(
     root: &Node,
     program: &IdPreimage,
-    prove: impl FnOnce(&Finalized<SecureField>) -> Result<WrapProof, ProveError>,
+    prove: impl FnOnce(&Finalized<SecureField>) -> Result<WrapProof, CircuitError>,
 ) -> Result<(WrapProof, Statement, [u32; PUBLIC_WORDS]), TreeError> {
     let circuit = WrapCircuit::get();
     let (values, statement) = circuit.values(root.proved(), program)?;

@@ -23,7 +23,7 @@ use vos_pvm_proof::format::{Format, Masking};
 use vos_pvm_proof::proof::statement_header_words;
 
 use super::MainColumns;
-use crate::prove::ProveError;
+use crate::prove::CircuitError;
 
 type Blake2b256 = Blake2b<U32>;
 
@@ -51,10 +51,10 @@ impl MaskRng {
         self,
         witness: &[u8; 32],
         attempt: u32,
-    ) -> Result<ChaCha20Rng, ProveError> {
+    ) -> Result<ChaCha20Rng, CircuitError> {
         let mut entropy = [0u8; 32];
         match self {
-            Self::Os => getrandom::getrandom(&mut entropy).map_err(|_| ProveError::Entropy)?,
+            Self::Os => getrandom::getrandom(&mut entropy).map_err(|_| CircuitError::Entropy)?,
             #[cfg(feature = "seeded-masks")]
             Self::Seeded(seed) => entropy[..8].copy_from_slice(&seed.to_le_bytes()),
         }

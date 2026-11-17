@@ -459,10 +459,7 @@ fn standalone_verify_rejects_oversized_log_size() {
         .expect_err("a log size past the cap is refused");
     let msg = format!("{err:?}");
     assert!(
-        msg.contains(&format!(
-            "outside 4..={}",
-            vos_pvm_proof_verifier::DEFAULT_MAX_LOG_SIZE
-        )),
+        msg.contains(&vos_pvm_proof::proof::Malformed::LogSize.to_string()),
         "got: {msg}"
     );
 }

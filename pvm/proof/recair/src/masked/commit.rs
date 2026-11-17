@@ -13,7 +13,7 @@ pub(super) fn commit_main<MC: MerkleChannel, R, A>(
     scheme: &mut Scheme<'_, MC>,
     rng: &mut ChaCha20Rng,
     channel: &mut MC::C,
-) -> Result<Vec<SecureField>, ProveError>
+) -> Result<Vec<SecureField>, CircuitError>
 where
     SimdBackend: BackendForChannel<MC>,
 {
@@ -67,7 +67,7 @@ pub(super) fn commit_interaction<MC: MerkleChannel, R, A>(
     blinding: &[SecureField],
     rng: &mut ChaCha20Rng,
     channel: &mut MC::C,
-) -> Result<Vec<SecureField>, ProveError>
+) -> Result<Vec<SecureField>, CircuitError>
 where
     SimdBackend: BackendForChannel<MC>,
 {
@@ -82,7 +82,7 @@ where
         .collect();
     let interaction_columns = (setup.interaction)(relations, &fractions);
     if interaction_columns.len() != setup.log_sizes.len() {
-        return Err(ProveError::TraceShape(
+        return Err(CircuitError::TraceShape(
             "one interaction trace per component expected",
         ));
     }
@@ -126,7 +126,7 @@ pub(super) fn commit_composition<MC: MerkleChannel, R, A>(
     provers: &ComponentProvers<'_, SimdBackend>,
     rng: &mut ChaCha20Rng,
     channel: &mut MC::C,
-) -> Result<SecureField, ProveError>
+) -> Result<SecureField, CircuitError>
 where
     SimdBackend: BackendForChannel<MC>,
 {
@@ -138,7 +138,7 @@ where
         setup.format.params.log_blowup,
     );
     if composition_poly.log_size() != setup.composition {
-        return Err(ProveError::Masking(
+        return Err(CircuitError::Masking(
             "the composition polynomial is not at its bound",
         ));
     }

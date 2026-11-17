@@ -32,7 +32,7 @@ pub fn preflight_component_dimensions<H: MerkleHasherLifted>(
     stark: &StarkProof<H>,
     components: &[&dyn Component],
     trace_log_sizes: &TreeVec<Vec<u32>>,
-) -> Result<(crate::proof::ProofProtocolShape, SecurityShape), alloc::string::String> {
+) -> Result<(crate::proof::ProofProtocolShape, SecurityShape), crate::proof::Malformed> {
     let layout = air_layout(config, components, trace_log_sizes)?;
     let protocol = crate::proof::preflight_proof_dimensions(
         config,
@@ -58,9 +58,9 @@ pub fn air_layout(
     config: &PcsConfig,
     components: &[&dyn Component],
     trace_log_sizes: &TreeVec<Vec<u32>>,
-) -> Result<AirLayout, alloc::string::String> {
+) -> Result<AirLayout, crate::proof::Malformed> {
     if trace_log_sizes.len() != 3 || trace_log_sizes[0].is_empty() || components.is_empty() {
-        return Err("AIR trace layout must contain three non-empty component trees".into());
+        return Err(crate::proof::Malformed::Layout);
     }
     let aggregate = Components {
         components: components.to_vec(),

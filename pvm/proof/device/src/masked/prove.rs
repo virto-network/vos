@@ -14,7 +14,7 @@ use vos_pvm_proof::masked::{
     DeviceComponents, DeviceSizes, MaskedDeviceTrace, device_preprocessed, masked_device_trace,
 };
 use vos_pvm_proof::side_note::SideNote;
-use vos_pvm_recair::ProveError;
+use vos_pvm_recair::CircuitError;
 use vos_pvm_recair::masked::{Checks, Committed, MaskRng, MaskStats, MaskedTrace};
 use vos_pvm_recair::trace::FirstRowFraction;
 use vos_pvm_recair_air::masking::MaskedComponents;
@@ -306,7 +306,9 @@ where
     // checks of the trace's shape) are the prover's: their reasons name a
     // run's rows, and are not passed on.
     proved.map_err(|error| match error {
-        ProveError::Stwo(stwo::prover::ProvingError::ConstraintsNotSatisfied) => Error::Unsatisfied,
+        CircuitError::Stwo(stwo::prover::ProvingError::ConstraintsNotSatisfied) => {
+            Error::Unsatisfied
+        }
         _ => Error::Prove,
     })
 }

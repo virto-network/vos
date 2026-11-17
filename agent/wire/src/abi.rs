@@ -609,7 +609,7 @@ pub mod precompile {
     /// pages, or 17 for a kernel holding the Poseidon2 chip
     /// (`vos_pvm_compiler::shape::POSEIDON2_CLASSES`), about 64 KiB written
     /// at once. A run with a call past it attests, but its proof is refused
-    /// (`ProvingError::Shape`); a kernel reads a larger input in several
+    /// (`SegmentError::Shape`); a kernel reads a larger input in several
     /// calls.
     pub const WITNESS_INPUT: u64 = 0x401;
 

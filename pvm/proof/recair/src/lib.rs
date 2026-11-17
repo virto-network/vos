@@ -57,7 +57,7 @@ pub mod wrap;
 pub use circuit::{Circuit, Entry, Qm31Op, WiringError};
 pub use context::{Bit, Context, Finalized, Message, Mismatch, P2Handle, P2Row, Var, Witness};
 pub use prove::{
-    ProveError, RecairProof, VerifyError, circuit_commitment, circuit_hash_of, prove, verify,
+    CircuitError, RecairProof, VerifyError, circuit_commitment, circuit_hash_of, prove, verify,
 };
 pub use value::{NoValue, Value};
 pub use vos_pvm_recair_air::p2::P2Mode;

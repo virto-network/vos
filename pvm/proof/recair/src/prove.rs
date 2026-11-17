@@ -77,9 +77,21 @@ impl From<String> for VerifyError {
     }
 }
 
+impl From<vos_pvm_proof::proof::Malformed> for VerifyError {
+    fn from(refusal: vos_pvm_proof::proof::Malformed) -> Self {
+        Self(refusal.to_string())
+    }
+}
+
+impl From<vos_pvm_proof::proof::SecurityError> for VerifyError {
+    fn from(refusal: vos_pvm_proof::proof::SecurityError) -> Self {
+        Self(refusal.to_string())
+    }
+}
+
 /// Why a circuit is not proved.
 #[derive(Clone, Debug)]
-pub enum ProveError {
+pub enum CircuitError {
     /// The circuit's wiring fails the static check.
     Wiring(WiringError),
     /// Stwo refused, as it does a witness that breaks a constraint.
@@ -97,13 +109,11 @@ pub enum ProveError {
     Masking(&'static str),
     /// The operating system's randomness is unavailable.
     Entropy,
-    /// The segment's run cannot be traced over its chips.
-    Segment(String),
     /// The witness does not satisfy the circuit: the piece that refuses it.
     Witness(&'static str),
 }
 
-impl core::fmt::Display for ProveError {
+impl core::fmt::Display for CircuitError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Wiring(error) => write!(f, "the wiring: {error}"),
@@ -114,13 +124,12 @@ impl core::fmt::Display for ProveError {
             Self::TraceShape(what) => write!(f, "the trace: {what}"),
             Self::Masking(what) => write!(f, "the masking: {what}"),
             Self::Entropy => f.write_str("no randomness from the operating system"),
-            Self::Segment(error) => write!(f, "the segment: {error}"),
             Self::Witness(piece) => write!(f, "the witness does not satisfy {piece}"),
         }
     }
 }
 
-impl std::error::Error for ProveError {}
+impl std::error::Error for CircuitError {}
 
 /// The format's parameters as the circuit hash takes them.
 pub(crate) fn hashed_params(format: &Format) -> [u32; 6] {
@@ -214,7 +223,10 @@ fn preprocessed_evaluations(circuit: &Circuit) -> Evaluations {
 }
 
 /// Proves `witness` over `circuit`, whose wiring must check.
-pub fn prove(circuit: &Circuit, witness: &Witness<SecureField>) -> Result<RecairProof, ProveError> {
+pub fn prove(
+    circuit: &Circuit,
+    witness: &Witness<SecureField>,
+) -> Result<RecairProof, CircuitError> {
     prove_with(circuit, witness, |_| {})
 }
 
@@ -224,7 +236,7 @@ pub fn prove_with(
     circuit: &Circuit,
     witness: &Witness<SecureField>,
     tamper: impl FnOnce(&mut MainTrace),
-) -> Result<RecairProof, ProveError> {
+) -> Result<RecairProof, CircuitError> {
     prove_on::<P2MerkleChannel>(FORMAT, circuit, witness, tamper)
 }
 
@@ -236,14 +248,14 @@ pub fn prove_on<MC: MerkleChannel>(
     circuit: &Circuit,
     witness: &Witness<SecureField>,
     tamper: impl FnOnce(&mut MainTrace),
-) -> Result<RecairProof<MC::H>, ProveError>
+) -> Result<RecairProof<MC::H>, CircuitError>
 where
     SimdBackend: BackendForChannel<MC>,
 {
     if format.masking.is_some() {
-        return Err(ProveError::MaskedFormat);
+        return Err(CircuitError::MaskedFormat);
     }
-    circuit.check_wiring().map_err(ProveError::Wiring)?;
+    circuit.check_wiring().map_err(CircuitError::Wiring)?;
     let log_sizes = circuit.log_sizes();
     let config = format.pcs_config();
     let twiddles = twiddles(&log_sizes, &config);
@@ -286,7 +298,7 @@ where
     let provers: [&dyn ComponentProver<SimdBackend>; 3] =
         [&components.p2, &components.qm31, &components.h8];
     let stark_proof = stwo::prover::prove::<SimdBackend, MC>(&provers, channel, scheme)
-        .map_err(ProveError::Stwo)?;
+        .map_err(CircuitError::Stwo)?;
     Ok(RecairProof {
         format_version: format.number,
         log_sizes,
@@ -306,7 +318,7 @@ pub fn prove_masked_on<MC: MerkleChannel>(
     circuit: &Circuit,
     witness: &Witness<SecureField>,
     rng: MaskRng,
-) -> Result<(RecairProof<MC::H>, MaskStats), ProveError>
+) -> Result<(RecairProof<MC::H>, MaskStats), CircuitError>
 where
     SimdBackend: BackendForChannel<MC>,
 {
@@ -323,7 +335,7 @@ pub fn prove_masked_tampered<MC: MerkleChannel>(
     witness: &Witness<SecureField>,
     rng: MaskRng,
     tamper: impl FnOnce(&mut MainTrace),
-) -> Result<(RecairProof<MC::H>, MaskStats), ProveError>
+) -> Result<(RecairProof<MC::H>, MaskStats), CircuitError>
 where
     SimdBackend: BackendForChannel<MC>,
 {
@@ -336,11 +348,11 @@ fn prove_masked_with<MC: MerkleChannel>(
     witness: &Witness<SecureField>,
     rng: MaskRng,
     tamper: impl FnOnce(&mut MainTrace),
-) -> Result<(RecairProof<MC::H>, MaskStats), ProveError>
+) -> Result<(RecairProof<MC::H>, MaskStats), CircuitError>
 where
     SimdBackend: BackendForChannel<MC>,
 {
-    circuit.check_wiring().map_err(ProveError::Wiring)?;
+    circuit.check_wiring().map_err(CircuitError::Wiring)?;
     let log_sizes = circuit.log_sizes();
     let mut main = trace::main_trace(circuit, witness);
     tamper(&mut main);
@@ -374,7 +386,7 @@ where
     let claimed_sums = proof
         .claimed_sums
         .try_into()
-        .map_err(|_| ProveError::TraceShape("one claimed sum per component expected"))?;
+        .map_err(|_| CircuitError::TraceShape("one claimed sum per component expected"))?;
     Ok((
         RecairProof {
             format_version: format.number,

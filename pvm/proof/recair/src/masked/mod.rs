@@ -87,12 +87,12 @@ use layout::MaskLayout;
 pub use rank::rank_m31;
 pub use rng::MaskRng;
 
-use crate::prove::ProveError;
+use crate::prove::CircuitError;
 use crate::trace::{self, Evaluations, FirstRowFraction};
 use commit::{commit_composition, commit_interaction, commit_main};
 
 /// The attempts R1 may refuse before the prover gives up
-/// ([`ProveError::MaskRank`]).
+/// ([`CircuitError::MaskRank`]).
 pub const MAX_ATTEMPTS: u32 = 8;
 
 /// The masked lifting height of components of `log_sizes` under
@@ -349,7 +349,7 @@ pub fn prove_masked<MC: MerkleChannel, C: MaskedProvers>(
     format: &Format,
     trace: MaskedTrace<'_, C::Relations, C::Active>,
     rng: MaskRng,
-) -> Result<(MaskedProof<MC::H>, MaskStats), ProveError>
+) -> Result<(MaskedProof<MC::H>, MaskStats), CircuitError>
 where
     SimdBackend: BackendForChannel<MC>,
 {
@@ -366,7 +366,7 @@ pub fn prove_masked_unchecked<MC: MerkleChannel, C: MaskedProvers>(
     format: &Format,
     trace: MaskedTrace<'_, C::Relations, C::Active>,
     rng: MaskRng,
-) -> Result<(MaskedProof<MC::H>, MaskStats), ProveError>
+) -> Result<(MaskedProof<MC::H>, MaskStats), CircuitError>
 where
     SimdBackend: BackendForChannel<MC>,
 {
@@ -404,7 +404,7 @@ pub(crate) fn prove_masked_checked<MC: MerkleChannel, C: MaskedProvers>(
     trace: MaskedTrace<'_, C::Relations, C::Active>,
     rng: MaskRng,
     checks: Checks,
-) -> Result<(MaskedProof<MC::H>, MaskStats), ProveError>
+) -> Result<(MaskedProof<MC::H>, MaskStats), CircuitError>
 where
     SimdBackend: BackendForChannel<MC>,
 {
@@ -472,7 +472,7 @@ pub fn prove_masked_program<MC: MerkleChannel, C: MaskedProvers>(
     trace: MaskedTrace<'_, C::Relations, C::Active>,
     committed: Option<&Committed<MC>>,
     rng: MaskRng,
-) -> Result<(MaskedProof<MC::H>, MaskStats), ProveError>
+) -> Result<(MaskedProof<MC::H>, MaskStats), CircuitError>
 where
     SimdBackend: BackendForChannel<MC>,
 {
@@ -489,7 +489,7 @@ pub fn prove_masked_program_forced<MC: MerkleChannel, C: MaskedProvers>(
     committed: Option<&Committed<MC>>,
     rng: MaskRng,
     checks: Checks,
-) -> Result<(MaskedProof<MC::H>, MaskStats), ProveError>
+) -> Result<(MaskedProof<MC::H>, MaskStats), CircuitError>
 where
     SimdBackend: BackendForChannel<MC>,
 {
@@ -505,28 +505,28 @@ fn prove_masked_held<MC: MerkleChannel, C: MaskedProvers>(
     committed: Option<&Committed<MC>>,
     rng: MaskRng,
     checks: Checks,
-) -> Result<(MaskedProof<MC::H>, MaskStats), ProveError>
+) -> Result<(MaskedProof<MC::H>, MaskStats), CircuitError>
 where
     SimdBackend: BackendForChannel<MC>,
 {
     let Some(masking) = format.masking else {
-        return Err(ProveError::UnmaskedFormat);
+        return Err(CircuitError::UnmaskedFormat);
     };
     if trace.log_sizes.is_empty() {
-        return Err(ProveError::TraceShape("no component"));
+        return Err(CircuitError::TraceShape("no component"));
     }
     for (component, &log_size) in trace.log_sizes.iter().enumerate() {
         if (trace.main)(component)
             .iter()
             .any(|column| column.len() != 1usize.checked_shl(log_size).unwrap_or(0))
         {
-            return Err(ProveError::TraceShape(
+            return Err(CircuitError::TraceShape(
                 "a main column of another size than its component",
             ));
         }
     }
     let lifting = lifting_log_size(format, trace.log_sizes)
-        .ok_or(ProveError::TraceShape("a component's log size overflows"))?;
+        .ok_or(CircuitError::TraceShape("a component's log size overflows"))?;
     let composition = lifting - format.params.log_blowup;
     let own;
     let (twiddles, preprocessed) = match committed {
@@ -552,16 +552,17 @@ where
         trace.main,
     );
     drawn::note("the witness digest", &witness);
-    let set_layout = C::layout(trace.active, trace.log_sizes).ok_or(ProveError::TraceShape(
+    let set_layout = C::layout(trace.active, trace.log_sizes).ok_or(CircuitError::TraceShape(
         "the component set refuses its log sizes",
     ))?;
     if !air::blinds_its_sums(&set_layout) {
-        return Err(ProveError::Masking(
+        return Err(CircuitError::Masking(
             "one blinded component: its claimed sum would be in the clear",
         ));
     }
-    let mask_rows = mask_rows(format, &set_layout)
-        .ok_or(ProveError::Masking("the set's masks do not fit its trees"))?;
+    let mask_rows = mask_rows(format, &set_layout).ok_or(CircuitError::Masking(
+        "the set's masks do not fit its trees",
+    ))?;
     let public_sums = if checks.public_unblinded {
         set_layout.public_sums()
     } else {
@@ -604,7 +605,7 @@ where
             return Ok((proof, stats));
         }
     }
-    Err(ProveError::MaskRank)
+    Err(CircuitError::MaskRank)
 }
 
 /// What every attempt shares.
@@ -651,7 +652,7 @@ fn prove_once<'a, MC: MerkleChannel, C: MaskedProvers>(
     setup: &Setup<'a, '_, C::Relations, C::Active>,
     preprocessed: &Preprocessed<'a, MC>,
     rng: &mut ChaCha20Rng,
-) -> Result<Attempt<MC::H>, ProveError>
+) -> Result<Attempt<MC::H>, CircuitError>
 where
     SimdBackend: BackendForChannel<MC>,
 {
@@ -719,7 +720,7 @@ where
         n_preprocessed_columns: provers.n_preprocessed_columns,
     };
     let composition_value = air::composition_oods_eval(&stark_proof.sampled_values).ok_or(
-        ProveError::Masking("the composition's coordinates are not sampled once each"),
+        CircuitError::Masking("the composition's coordinates are not sampled once each"),
     )?;
     if setup.check_constraints
         && composition_value
@@ -730,7 +731,7 @@ where
                 air_level,
             )
     {
-        return Err(ProveError::Stwo(ProvingError::ConstraintsNotSatisfied));
+        return Err(CircuitError::Stwo(ProvingError::ConstraintsNotSatisfied));
     }
 
     let Some(r1) = rank_check(
@@ -760,7 +761,7 @@ fn masked_set<C: MaskedProvers>(
     relations: &C::Relations,
     blind: &BlindRelation,
     claimed_sums: &[SecureField],
-) -> Result<(C, u32), ProveError> {
+) -> Result<(C, u32), CircuitError> {
     let set = C::new(
         setup.active,
         relations,
@@ -768,16 +769,16 @@ fn masked_set<C: MaskedProvers>(
         setup.log_sizes,
         claimed_sums,
     )
-    .ok_or(ProveError::TraceShape(
+    .ok_or(CircuitError::TraceShape(
         "the component set refuses its log sizes or claimed sums",
     ))?;
     if air::composition_log_degree_bound(&set) != Some(setup.composition) {
-        return Err(ProveError::Masking(
+        return Err(CircuitError::Masking(
             "the set's composition bound is not its tallest log size plus 2",
         ));
     }
     let air_level =
-        air::air_log_size(&set).ok_or(ProveError::Masking("the set has no AIR level"))?;
+        air::air_log_size(&set).ok_or(CircuitError::Masking("the set has no AIR level"))?;
     Ok((set, air_level))
 }
 
@@ -788,13 +789,13 @@ fn checked_points<MC: MerkleChannel, R, A>(
     set: &impl MaskedComponents,
     scheme: &Scheme<'_, MC>,
     oods_point: CirclePoint<SecureField>,
-) -> Result<Points, ProveError>
+) -> Result<Points, CircuitError>
 where
     SimdBackend: BackendForChannel<MC>,
 {
-    let points = air::sample_points(set, oods_point, &setup.masking).ok_or(ProveError::Masking(
-        "the set's mask points do not fit its trees",
-    ))?;
+    let points = air::sample_points(set, oods_point, &setup.masking).ok_or(
+        CircuitError::Masking("the set's mask points do not fit its trees"),
+    )?;
     let fits = points.len() == scheme.trees.len()
         && points
             .iter()
@@ -807,7 +808,7 @@ where
             .is_some_and(|start| columns[start..].iter().all(Vec::is_empty))
     });
     if !fits || !salts_unsampled {
-        return Err(ProveError::Masking(
+        return Err(CircuitError::Masking(
             "the sample points do not fit the trees, or a salt is sampled",
         ));
     }
@@ -823,7 +824,7 @@ fn rank_check<R, A>(
     points: &Points,
     oods_point: CirclePoint<SecureField>,
     query_positions: &[usize],
-) -> Result<Option<R1>, ProveError> {
+) -> Result<Option<R1>, CircuitError> {
     let started = Instant::now();
     let revealed = rank::revealed_functionals(
         components,
@@ -833,7 +834,7 @@ fn rank_check<R, A>(
         setup.lifting,
         setup.mask_rows,
     )
-    .ok_or(ProveError::Masking(
+    .ok_or(CircuitError::Masking(
         "R1's column classes do not fit the sample points",
     ))?;
     let took = started.elapsed();

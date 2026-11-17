@@ -8668,6 +8668,7 @@ dependencies = [
  "postcard",
  "serde",
  "stwo",
+ "vos-pvm-codec",
  "vos-pvm-final-verifier",
  "vos-pvm-precompiles",
  "vos-pvm-proof",

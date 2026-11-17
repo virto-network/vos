@@ -114,7 +114,8 @@ fn program_id(
         return Err("an ELF and a method, or --circuits".into());
     };
     let bytes = std::fs::read(&elf).map_err(|error| format!("{}: {error}", elf.display()))?;
-    let id = vos_node_prover::program::program_id(&bytes, &method)?;
+    let id = vos_node_prover::program::program_id(&bytes, &method)
+        .map_err(|error| format!("{method}: {error}"))?;
     println!("{}", line(&id));
     Ok(())
 }

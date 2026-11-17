@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use vos_checker::stays;
 use vos_node::{Config, Node};
-use vos_node_prover::{FORMAT, Job, Options, ProveError, Prover, State};
+use vos_node_prover::{FORMAT, Job, Options, Prover, State, StatementError};
 use vos_venue::VenueClient;
 use vos_venue::vos_statement::{ProgramId, Statement, StatementId};
 use vos_wire::batch::Request;
@@ -46,11 +46,11 @@ struct Proofs {
 }
 
 impl Prover for Proofs {
-    fn program(&self, _: &[u8]) -> Result<ProgramId, ProveError> {
+    fn program(&self, _: &[u8]) -> Result<ProgramId, StatementError> {
         Ok(PROGRAM)
     }
 
-    fn prove(&self, _: &[u8], attest: &Attest) -> Result<Vec<u8>, ProveError> {
+    fn prove(&self, _: &[u8], attest: &Attest) -> Result<Vec<u8>, StatementError> {
         while self.hold.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -68,13 +68,13 @@ struct NodeProofs {
 }
 
 impl Prover for NodeProofs {
-    fn program(&self, kernel: &[u8]) -> Result<ProgramId, ProveError> {
+    fn program(&self, kernel: &[u8]) -> Result<ProgramId, StatementError> {
         self.proofs.program(kernel)
     }
 
-    fn prove(&self, kernel: &[u8], attest: &Attest) -> Result<Vec<u8>, ProveError> {
+    fn prove(&self, kernel: &[u8], attest: &Attest) -> Result<Vec<u8>, StatementError> {
         if self.failing.load(Ordering::SeqCst) == usize::from(self.node) {
-            return Err(ProveError::Failed("this node's prover fails"));
+            return Err(StatementError::Failed("this node's prover fails"));
         }
         self.proofs.prove(kernel, attest)
     }
@@ -89,14 +89,14 @@ struct Waiting {
 }
 
 impl Prover for Waiting {
-    fn program(&self, kernel: &[u8]) -> Result<ProgramId, ProveError> {
+    fn program(&self, kernel: &[u8]) -> Result<ProgramId, StatementError> {
         if self.waiting.lock().unwrap().contains(&self.node) {
-            return Err(ProveError::Failed("this node's worker waits"));
+            return Err(StatementError::Failed("this node's worker waits"));
         }
         self.proofs.program(kernel)
     }
 
-    fn prove(&self, kernel: &[u8], attest: &Attest) -> Result<Vec<u8>, ProveError> {
+    fn prove(&self, kernel: &[u8], attest: &Attest) -> Result<Vec<u8>, StatementError> {
         self.proofs.prove(kernel, attest)
     }
 }

@@ -227,7 +227,7 @@ attribution). Its full design is `recursion-air.md`.
     touching more pages than its largest class (a witness-input read past
     about 64 KiB in one call) has no proof: the cutter cuts only between
     steps, `derive`'s and the kernel ABI's docs state the cap, and the
-    prover refuses such a run (`ProvingError::Shape`);
+    prover refuses such a run (`SegmentError::Shape`);
   - **two cuts** [decided]: the seven `MemByteActiveMonoH` columns,
     which a constraint pinned to zero, dropped (the memory chip's
     monotonicity stated directly, degree 2); logical right shifts

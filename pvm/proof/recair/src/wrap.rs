@@ -47,7 +47,7 @@ use crate::fold::{
 use crate::gadgets::leaf_hash;
 use crate::leaf::preimage;
 use crate::masked::{MaskRng, MaskStats};
-use crate::prove::{ProveError, RecairProof, prove_masked_on};
+use crate::prove::{CircuitError, RecairProof, prove_masked_on};
 use crate::value::{NoValue, Value};
 use crate::verifier::WitnessError;
 use crate::verifier::witness::{digest_wires, pack};
@@ -201,7 +201,7 @@ impl<V: Value> WrapValues<V> {
 
 /// Proves a finalized wrap circuit masked under `format::MASKED_WRAP`, on
 /// the Blake2b-256 channel, from the operating system's randomness.
-pub fn prove(finalized: &Finalized<SecureField>) -> Result<WrapProof, ProveError> {
+pub fn prove(finalized: &Finalized<SecureField>) -> Result<WrapProof, CircuitError> {
     prove_masked(finalized, MaskRng::default()).map(|(proof, _)| proof)
 }
 
@@ -209,7 +209,7 @@ pub fn prove(finalized: &Finalized<SecureField>) -> Result<WrapProof, ProveError
 pub fn prove_masked(
     finalized: &Finalized<SecureField>,
     rng: MaskRng,
-) -> Result<(WrapProof, MaskStats), ProveError> {
+) -> Result<(WrapProof, MaskStats), CircuitError> {
     let (proof, stats) = prove_masked_on::<Blake2bMerkleChannel>(
         &MASKED_WRAP,
         &finalized.circuit,

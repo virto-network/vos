@@ -14,7 +14,7 @@
 
 use vos_pvm_proof::format::Format;
 use vos_pvm_proof::poseidon2::P2Hash;
-use vos_pvm_proof::program_id::{KernelEntry, KernelProgram, LeafCircuits};
+use vos_pvm_proof::program_id::{KernelEntry, KernelError, KernelProgram, LeafCircuits};
 use vos_pvm_proof::shape::KernelShape;
 
 use super::LeafCircuit;
@@ -38,15 +38,15 @@ pub fn kernel_program(
     record: &vos_wire::records::Kernel,
     transpiler: u32,
     format: &'static Format,
-) -> Result<(KernelProgram, KernelEntry), String> {
-    let shape = KernelShape::try_from(&record.shape)?;
+) -> Result<(KernelProgram, KernelEntry), KernelError> {
+    let shape = KernelShape::try_from(&record.shape).map_err(KernelError::Shape)?;
     let side_note =
-        vos_pvm_proof::kernel::kernel_side_note(blob).map_err(|error| format!("{error:?}"))?;
+        vos_pvm_proof::kernel::kernel_side_note(blob).map_err(|_| KernelError::NotStandard)?;
     let preprocessed_roots = (0..shape.classes.len())
         .map(|class| {
             let segment = shape.segment(class).expect("a class");
             vos_pvm_proof::program_commitment_for_shape(&side_note, &segment, format)
-                .ok_or_else(|| format!("class {class}'s preprocessed root"))
+                .ok_or(KernelError::Preprocessed)
         })
         .collect::<Result<_, _>>()?;
     let mut program = KernelProgram {

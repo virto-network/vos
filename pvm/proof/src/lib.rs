@@ -378,7 +378,7 @@ pub use sparse_memory::{SPARSE_MEMORY_PAGE_SIZE, SparseMemoryImage, SparseMemory
 // over the chips its steps select: `prove` / `prove_format`.
 #[cfg(feature = "prover")]
 pub use prove::{
-    KernelSegment, ProvingError, program_commitment_for_shape, prove, prove_format, prove_kernel,
+    KernelSegment, SegmentError, program_commitment_for_shape, prove, prove_format, prove_kernel,
     prove_shaped,
 };
 // Advanced / internal prove surface: the profiling variants, the thread-pool

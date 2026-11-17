@@ -707,6 +707,8 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
         DeviceError::Memory,
         DeviceError::Witness,
         DeviceError::Prove,
+        DeviceError::Program(vos_pvm_device::Error::Fit),
+        DeviceError::Program(vos_pvm_device::Error::Ceiling { chip: 0, needs: 18 }),
         DeviceError::Decode,
         DeviceError::Verify,
     ] {

@@ -2,7 +2,7 @@
 //! at exactly a class's log size.
 
 use super::{
-    ProveRequest, ProvingError, Sizes, Target, install_thread_pool,
+    ProveRequest, SegmentError, Sizes, Target, install_thread_pool,
     prepare_side_note_for_verification, prove_with,
 };
 use crate::format::Format;
@@ -20,25 +20,25 @@ fn selected(components: u32) -> Vec<&'static dyn MachineProverComponent> {
 }
 
 /// Whether `shape` names chips of the segment AIR, a log size each.
-fn check(shape: &SegmentShape) -> Result<(), ProvingError> {
+fn check(shape: &SegmentShape) -> Result<(), SegmentError> {
     if shape.components & !crate::chip_idx::ALL != 0
         || shape.components.count_ones() as usize != shape.log_sizes.len()
     {
-        return Err(ProvingError::MalformedShape);
+        return Err(SegmentError::MalformedShape);
     }
     Ok(())
 }
 
 /// Prove a segment under `format` over `shape`: exactly its chips, each at
-/// exactly its log size. [`ProvingError::Shape`] when a chip's rows need a
+/// exactly its log size. [`SegmentError::Shape`] when a chip's rows need a
 /// larger size than the shape gives it, or a fixed chip's size is not the
-/// shape's; [`ProvingError::MalformedShape`] when the shape is not one of
+/// shape's; [`SegmentError::MalformedShape`] when the shape is not one of
 /// the segment AIR.
 pub fn prove_shaped(
     side_note: &mut SideNote,
     shape: &SegmentShape,
     format: &'static Format,
-) -> Result<Proof, ProvingError> {
+) -> Result<Proof, SegmentError> {
     check(shape)?;
     install_thread_pool();
     prepare_side_note_for_verification(side_note);
@@ -95,7 +95,7 @@ pub struct KernelSegment {
 /// rows need more refuses it before any commitment; a class of fewer steps
 /// than the window's is skipped, as its CPU holds a row a step. A window
 /// none holds is cut in half, down to one step; a step no class holds is
-/// refused with [`ProvingError::Shape`]: one touching more pages than the
+/// refused with [`SegmentError::Shape`]: one touching more pages than the
 /// largest class's (24, or 17 for a shape holding the Poseidon2 chip), as
 /// a witness-input call writing more than about 64 KiB at once.
 pub fn prove_kernel(
@@ -103,9 +103,9 @@ pub fn prove_kernel(
     shape: &KernelShape,
     cut: usize,
     format: &'static Format,
-) -> Result<Vec<KernelSegment>, ProvingError> {
-    shape.check().map_err(|_| ProvingError::MalformedShape)?;
-    let class = shape.classes.get(cut).ok_or(ProvingError::MalformedShape)?;
+) -> Result<Vec<KernelSegment>, SegmentError> {
+    shape.check().map_err(|_| SegmentError::MalformedShape)?;
+    let class = shape.classes.get(cut).ok_or(SegmentError::MalformedShape)?;
     let bounds = crate::segment::segment_bounds_budgeted(
         full,
         1 << class.log_steps,
@@ -122,7 +122,7 @@ pub fn prove_kernel(
                     class,
                     proof,
                 }),
-                Err(ProvingError::Shape {
+                Err(SegmentError::Shape {
                     log_size, pinned, ..
                 }) if log_size > pinned && b - a > 1 => {
                     let middle = a + (b - a) / 2;
@@ -138,15 +138,15 @@ pub fn prove_kernel(
 
 /// Window `[a, b)` proved at the first class of `shape` that holds its
 /// rows, and the class; or the overflow of the last class tried, a
-/// [`ProvingError::Shape`] whose size is past its pin.
+/// [`SegmentError::Shape`] whose size is past its pin.
 fn prove_at_first_class(
     cursor: &mut crate::segment::SegmentCursor<'_>,
     (a, b): (usize, usize),
     shape: &KernelShape,
     format: &'static Format,
-) -> Result<(usize, Proof), ProvingError> {
+) -> Result<(usize, Proof), SegmentError> {
     let steps = (b - a).next_power_of_two().trailing_zeros();
-    let mut overflow = ProvingError::Shape {
+    let mut overflow = SegmentError::Shape {
         chip: crate::chip_idx::CPU,
         log_size: steps,
         pinned: 0,
@@ -155,11 +155,11 @@ fn prove_at_first_class(
         if steps > u32::from(class.log_steps) {
             continue;
         }
-        let segment = shape.segment(index).ok_or(ProvingError::MalformedShape)?;
+        let segment = shape.segment(index).ok_or(SegmentError::MalformedShape)?;
         match prove_shaped(&mut cursor.side_note(a, b), &segment, format) {
             Ok(proof) => return Ok((index, proof)),
             Err(
-                error @ ProvingError::Shape {
+                error @ SegmentError::Shape {
                     log_size, pinned, ..
                 },
             ) if log_size > pinned => overflow = error,

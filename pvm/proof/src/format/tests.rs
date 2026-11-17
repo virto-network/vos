@@ -172,16 +172,27 @@ fn a_proof_below_a_floor_is_refused() {
     let mut fewer = config;
     fewer.fri_config.n_queries = 37;
     let error = check(&SEGMENT, &fewer, &SEGMENT_REFERENCE).unwrap_err();
-    assert!(error.contains("98 conjectured bits"), "{error}");
+    assert_eq!(
+        error,
+        crate::proof::SecurityError::Conjectured {
+            format: 41,
+            bits: 98,
+            floor: 100
+        }
+    );
 
     // 20 + 40 · 2 = 100 conjectured, but the query term tends to
     // 20 + 40 = 60 proven bits, and falls short of it.
     let mut less_pow = config;
     less_pow.pow_bits = 20;
     let error = check(&SEGMENT, &less_pow, &SEGMENT_REFERENCE).unwrap_err();
-    assert!(
-        error.contains("59 proven bits, below format 41's floor of 60"),
-        "{error}"
+    assert_eq!(
+        error,
+        crate::proof::SecurityError::Proven {
+            format: 41,
+            bits: 59,
+            floor: 60
+        }
     );
 
     // 2^30 sampled values over a 2^28-row trace: the batching term binds.
@@ -193,10 +204,16 @@ fn a_proof_below_a_floor_is_refused() {
         ..SEGMENT_REFERENCE
     };
     let error = check(&SEGMENT, &config, &wide).unwrap_err();
-    assert!(error.contains("proven bits"), "{error}");
+    assert!(
+        matches!(error, crate::proof::SecurityError::Proven { .. }),
+        "{error}"
+    );
 
     let mut stronger = config;
     stronger.fri_config.n_queries = 41;
     let error = check(&SEGMENT, &stronger, &SEGMENT_REFERENCE).unwrap_err();
-    assert!(error.contains("differ from format 41"), "{error}");
+    assert_eq!(
+        error,
+        crate::proof::SecurityError::Parameters { format: 41 }
+    );
 }

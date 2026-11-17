@@ -66,7 +66,8 @@ pub mod program;
 pub use internals::{Internals, NodeProof};
 pub use job::{Job, MAX_ATTEMPTS, MAX_RESUBMITS, Refusal, State, deadline};
 pub use worker::{
-    Backlog, FORMAT, Host, Jobs, Options, ProveError, Prover, Record, Stepped, Worker, statement,
+    Backlog, FORMAT, Host, Jobs, Options, Prover, Record, StatementError, Stepped, Worker,
+    statement,
 };
 
 /// The gas a prover's re-run of a kernel starts with: a kernel's own limit

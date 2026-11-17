@@ -2,7 +2,7 @@
 //! the PCS configuration, the log sizes, the boundary states and the
 //! interaction PoW; and the format's security check on a proof's parameters.
 
-use alloc::{format, string::String, vec::Vec};
+use alloc::vec::Vec;
 
 use stwo::core::{
     channel::Channel,
@@ -11,7 +11,7 @@ use stwo::core::{
 };
 pub use vos_pvm_recair_air::format::{mix_statement_header, statement_header_words};
 
-use super::{Proof, SegmentState};
+use super::{Malformed, Proof, SecurityError, SegmentState};
 use crate::format::{Format, FormatParams};
 use crate::lookups::AllLookupElements;
 use crate::pcs::{FsChannel, PcsStack};
@@ -41,10 +41,10 @@ pub fn check_interaction_pow(
     channel: &mut impl Channel,
     format: &Format,
     nonce: u64,
-) -> Result<(), String> {
+) -> Result<(), Malformed> {
     let bits = format.interaction_pow_bits();
     if !channel.verify_pow_nonce(bits, nonce) {
-        return Err(format!("interaction PoW nonce does not meet {bits} bits"));
+        return Err(Malformed::InteractionPow);
     }
     channel.mix_u64(nonce);
     Ok(())
@@ -70,7 +70,7 @@ pub fn replay_prefix<MC: PcsStack>(
     channel: &mut MC::C,
     commitment_scheme: &mut CommitmentSchemeVerifier<MC>,
     draw: impl FnOnce(&mut MC::C) -> AllLookupElements,
-) -> Result<AllLookupElements, String> {
+) -> Result<AllLookupElements, Malformed> {
     mix_statement_header(channel, format.number, &proof.pcs_config, &proof.log_sizes);
     for idx in [PREPROCESSED_TRACE_IDX, ORIGINAL_TRACE_IDX] {
         commitment_scheme.commit(stark.commitments[idx], &log_sizes[idx], channel);
@@ -93,14 +93,13 @@ pub fn format_security_bits(
     format: &Format,
     config: &PcsConfig,
     shape: &SecurityShape,
-) -> Result<SecurityBits, String> {
+) -> Result<SecurityBits, SecurityError> {
     let params = FormatParams::of(
         config,
         format.interaction_pow_bits(),
         format.params.batching,
     );
-    crate::security::security_bits(&params, shape)
-        .ok_or_else(|| String::from("parameters outside the security analysis"))
+    crate::security::security_bits(&params, shape).ok_or(SecurityError::Outside)
 }
 
 /// Refuse a proof whose counts, at its own parameters and shape, fall below
@@ -111,25 +110,26 @@ pub fn check_format_security(
     format: &Format,
     config: &PcsConfig,
     shape: &SecurityShape,
-) -> Result<SecurityBits, String> {
+) -> Result<SecurityBits, SecurityError> {
     let bits = format_security_bits(format, config, shape)?;
     if bits.conjectured < format.floor.conjectured {
-        return Err(format!(
-            "proof counts {} conjectured bits, below format {}'s floor of {}",
-            bits.conjectured, format.number, format.floor.conjectured
-        ));
+        return Err(SecurityError::Conjectured {
+            format: format.number,
+            bits: bits.conjectured,
+            floor: format.floor.conjectured,
+        });
     }
     if bits.proven < format.floor.proven {
-        return Err(format!(
-            "proof counts {} proven bits, below format {}'s floor of {}",
-            bits.proven, format.number, format.floor.proven
-        ));
+        return Err(SecurityError::Proven {
+            format: format.number,
+            bits: bits.proven,
+            floor: format.floor.proven,
+        });
     }
     if format.verifier_config(config) != format.pcs_config() {
-        return Err(format!(
-            "proof parameters differ from format {}'s",
-            format.number
-        ));
+        return Err(SecurityError::Parameters {
+            format: format.number,
+        });
     }
     Ok(bits)
 }

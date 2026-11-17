@@ -12,7 +12,7 @@ use vos_kreivo::Transport;
 use vos_kreivo::calls::AccountId;
 use vos_kreivo::transport::{Included, Lost, SendError, Signed};
 use vos_node_prover::masked::Disclosing;
-use vos_node_prover::{Internals, ProveError, Prover};
+use vos_node_prover::{Internals, Prover, StatementError};
 use vos_statement_service::state::Outcome;
 use vos_venue::vos_statement::{ProgramId, Statement};
 use vos_venue::{SubmitOutcome, VenueClient};
@@ -62,11 +62,11 @@ impl Serial {
 }
 
 impl Prover for Serial {
-    fn program(&self, kernel: &[u8]) -> Result<ProgramId, ProveError> {
+    fn program(&self, kernel: &[u8]) -> Result<ProgramId, StatementError> {
         self.masked.program(kernel)
     }
 
-    fn prove(&self, kernel: &[u8], attest: &Attest) -> Result<Vec<u8>, ProveError> {
+    fn prove(&self, kernel: &[u8], attest: &Attest) -> Result<Vec<u8>, StatementError> {
         let mut proved = lock(&self.proved);
         let start = Instant::now();
         let proof = self.masked.prove(kernel, attest)?;

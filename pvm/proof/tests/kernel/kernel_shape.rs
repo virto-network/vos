@@ -24,7 +24,7 @@ use vos_pvm_proof::program_id::{KernelEntry, KernelProgram, LeafCircuits};
 use vos_pvm_proof::segment::SegmentCursor;
 use vos_pvm_proof::shape::{KernelShape, SegmentShape};
 use vos_pvm_proof::{
-    Proof, ProvingError, program_commitment_for_shape, prove_kernel, prove_shaped,
+    Proof, SegmentError, program_commitment_for_shape, prove_kernel, prove_shaped,
 };
 use vos_pvm_proof_verifier::{
     ENTRY_TIMESTAMP, HALT_PC, verify_kernel_chain, verify_kernel_segment, verify_standalone,
@@ -336,7 +336,7 @@ fn a_segment_past_its_class_is_refused() {
     let mut smaller = shape.clone();
     smaller.log_sizes[chip_idx::CPU] = 4;
     match prove_shaped(&mut kernel.whole(), &smaller, &SEGMENT) {
-        Err(ProvingError::Shape {
+        Err(SegmentError::Shape {
             chip, pinned: 4, ..
         }) => assert_eq!(chip, chip_idx::CPU),
         other => panic!("{:?}", other.map(|proof| proof.log_sizes)),

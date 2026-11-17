@@ -20,7 +20,7 @@ use crate::chip_idx;
 use crate::framework::MachineProverComponent;
 use crate::lookups::AllLookupElements;
 use crate::prove::{
-    ProvingError, generate_component_traces, prepare_side_note_for_verification,
+    SegmentError, generate_component_traces, prepare_side_note_for_verification,
     validate_memory_witnesses,
 };
 use crate::side_note::SideNote;
@@ -76,7 +76,7 @@ impl MaskedDeviceTrace {
 #[derive(Clone, Copy, Debug)]
 pub enum DeviceSizes<'a> {
     /// The program's, exactly: a run that needs more rows of a chip is
-    /// refused ([`ProvingError::Shape`]), one that needs fewer is padded.
+    /// refused ([`SegmentError::Shape`]), one that needs fewer is padded.
     Pinned(&'a [u32]),
     /// At least these: a reference run's sizes, for choosing a program's.
     AtLeast(&'a [u32]),
@@ -93,12 +93,12 @@ pub fn masked_device_trace(
     layout: &crate::device::DeviceLayout,
     shape: crate::device::DeviceShape,
     sizes: DeviceSizes<'_>,
-) -> Result<MaskedDeviceTrace, ProvingError> {
+) -> Result<MaskedDeviceTrace, SegmentError> {
     let (DeviceSizes::Pinned(log_sizes) | DeviceSizes::AtLeast(log_sizes)) = sizes;
     let active = shape.chips;
-    let chips = super::DeviceComponents::chips(shape).ok_or(ProvingError::MalformedShape)?;
+    let chips = super::DeviceComponents::chips(shape).ok_or(SegmentError::MalformedShape)?;
     if chips.len() != log_sizes.len() {
-        return Err(ProvingError::MalformedShape);
+        return Err(SegmentError::MalformedShape);
     }
     validate_memory_witnesses(side_note)?;
     prepare_side_note_for_verification(side_note);
@@ -127,7 +127,7 @@ pub fn masked_device_trace(
             .zip(traces.iter().zip(log_sizes))
             .find(|(_, (trace, pinned))| trace.log_size != **pinned)
     {
-        return Err(ProvingError::Shape {
+        return Err(SegmentError::Shape {
             chip,
             log_size: trace.log_size,
             pinned,
@@ -160,10 +160,10 @@ pub fn device_preprocessed(
     layout: &crate::device::DeviceLayout,
     shape: crate::device::DeviceShape,
     log_sizes: &[u32],
-) -> Result<Evaluations, ProvingError> {
-    let chips = super::DeviceComponents::chips(shape).ok_or(ProvingError::MalformedShape)?;
+) -> Result<Evaluations, SegmentError> {
+    let chips = super::DeviceComponents::chips(shape).ok_or(SegmentError::MalformedShape)?;
     if chips.len() != log_sizes.len() {
-        return Err(ProvingError::MalformedShape);
+        return Err(SegmentError::MalformedShape);
     }
     let mut side_note = SideNote::new(Vec::new(), code.code.to_vec(), code.bitmask.to_vec())
         .with_jump_table(code.jump_table.to_vec());

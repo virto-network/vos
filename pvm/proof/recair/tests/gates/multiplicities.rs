@@ -25,7 +25,7 @@ use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use vos_pvm_recair::circuit::{Circuit, Entry, WiringError};
-use vos_pvm_recair::{Context, Finalized, ProveError, Var, circuit_commitment, prove};
+use vos_pvm_recair::{CircuitError, Context, Finalized, Var, circuit_commitment, prove};
 use vos_pvm_recair_air::gate::{Layout, public_logup_sum};
 
 use crate::common::Rng;
@@ -197,7 +197,7 @@ fn a_yield_consumed_once_more_is_refused() {
     assert!(
         matches!(
             prove(&forged.circuit, &forged.witness),
-            Err(ProveError::Wiring(_))
+            Err(CircuitError::Wiring(_))
         ),
         "not proved"
     );

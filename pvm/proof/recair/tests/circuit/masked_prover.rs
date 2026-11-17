@@ -31,7 +31,7 @@ use vos_pvm_recair::masked::{
 };
 use vos_pvm_recair::prove::{prove_masked_on, prove_masked_tampered};
 use vos_pvm_recair::trace::{self, FirstRowFraction};
-use vos_pvm_recair::{Finalized, ProveError, RecairProof};
+use vos_pvm_recair::{CircuitError, Finalized, RecairProof};
 use vos_pvm_recair_air::gate::{GateRelation, Layout, public_logup_sum};
 use vos_pvm_recair_air::masking::{
     BlindRelation, MaskedComponents, MaskedEval, Rebound, blinded_components, blinds_its_sums,
@@ -97,7 +97,7 @@ pub(crate) fn prove<MC: MerkleChannel>(
     format: &Format,
     finalized: &Finalized<SecureField>,
     rng: MaskRng,
-) -> Result<(Proof<MC>, MaskStats), ProveError>
+) -> Result<(Proof<MC>, MaskStats), CircuitError>
 where
     SimdBackend: BackendForChannel<MC>,
 {
@@ -150,7 +150,7 @@ fn r1_refuses_too_small_a_randomizer() {
     let finalized = circuit(1);
     assert!(matches!(
         prove::<Blake2bMerkleChannel>(&small_format(6, 8, 24), &finalized, MaskRng::default()),
-        Err(ProveError::MaskRank)
+        Err(CircuitError::MaskRank)
     ));
     let (_, stats) = prove_masked_on::<Blake2bMerkleChannel>(
         &format(),
@@ -260,7 +260,7 @@ fn an_invalid_witness_is_refused() {
         assert!(
             matches!(
                 refused,
-                Err(ProveError::Stwo(ProvingError::ConstraintsNotSatisfied))
+                Err(CircuitError::Stwo(ProvingError::ConstraintsNotSatisfied))
             ),
             "component {component}, column {column}: {:?}",
             refused.map(|_| ())
@@ -275,7 +275,7 @@ fn an_invalid_witness_is_refused() {
             &finalized,
             MaskRng::default()
         ),
-        Err(ProveError::UnmaskedFormat)
+        Err(CircuitError::UnmaskedFormat)
     ));
 }
 
@@ -411,7 +411,7 @@ fn a_one_component_set_is_refused() {
         MaskRng::default(),
     );
     assert!(
-        matches!(refused, Err(ProveError::Masking(_))),
+        matches!(refused, Err(CircuitError::Masking(_))),
         "{:?}",
         refused.map(|_| ())
     );

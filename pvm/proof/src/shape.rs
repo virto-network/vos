@@ -28,10 +28,62 @@
 //! refused. A cheating prover gains no statement from a smaller set; the
 //! shape pins the set so that it gains no other proof of the kernel either.
 
-use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::chip_idx;
+
+/// Why a shape, or a proof against one, is refused. Value-free: a shape is
+/// public (its kernel's install record), and a variant names the rule it
+/// breaks, never a run's value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShapeError {
+    /// The record is of another shape policy (`vos_wire::records::Shape::POLICY`).
+    Policy,
+    /// A chip outside the segment AIR.
+    Outside,
+    /// A chip every proof holds ([`chip_idx::ALWAYS`]) left out.
+    Missing,
+    /// No class.
+    NoClass,
+    /// More than [`MAX_CLASSES`] classes.
+    Classes,
+    /// A class sizes other chips than the shape's.
+    ClassChips,
+    /// A class's log size outside a lane's 2^4 rows to [`MAX_LOG_SIZE`].
+    LogSize,
+    /// A proof holds a chip its shape does not.
+    MoreChips,
+    /// A proof lacks a chip its shape holds.
+    FewerChips,
+    /// A proof's log sizes are no class of the shape.
+    NoSuchClass,
+}
+
+impl ShapeError {
+    /// What it says, a static text a log may hold.
+    pub const fn reason(&self) -> &'static str {
+        match self {
+            Self::Policy => "the record's shape is of another policy",
+            Self::Outside => "the shape names a chip outside the segment AIR",
+            Self::Missing => "the shape leaves out chips every proof holds",
+            Self::NoClass => "the shape has no class",
+            Self::Classes => "the shape has more classes than a kernel's record holds",
+            Self::ClassChips => "a class sizes other chips than the shape's",
+            Self::LogSize => "a class has a log size out of range",
+            Self::MoreChips => "the proof holds more chips than its kernel's shape",
+            Self::FewerChips => "the proof holds fewer chips than its kernel's shape",
+            Self::NoSuchClass => "the proof's log sizes are no class of its kernel's shape",
+        }
+    }
+}
+
+impl core::fmt::Display for ShapeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+
+impl core::error::Error for ShapeError {}
 
 /// A class of segment.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,39 +128,30 @@ impl KernelShape {
     /// holding every chip of [`chip_idx::ALWAYS`], with one to
     /// [`MAX_CLASSES`] classes, each giving every chip a log size from a
     /// lane's 2^4 rows to [`MAX_LOG_SIZE`].
-    pub fn check(&self) -> Result<(), String> {
+    pub fn check(&self) -> Result<(), ShapeError> {
         if self.components & !chip_idx::ALL != 0 {
-            return Err("the shape names a chip outside the segment AIR".into());
+            return Err(ShapeError::Outside);
         }
         if self.components & chip_idx::ALWAYS != chip_idx::ALWAYS {
-            return Err(alloc::format!(
-                "the shape leaves out chips every proof holds: {:#x}",
-                chip_idx::ALWAYS & !self.components
-            ));
+            return Err(ShapeError::Missing);
         }
         if self.classes.is_empty() {
-            return Err("the shape has no class".into());
+            return Err(ShapeError::NoClass);
         }
         if self.classes.len() > MAX_CLASSES {
-            return Err(alloc::format!(
-                "the shape has {} classes, more than {MAX_CLASSES}",
-                self.classes.len()
-            ));
+            return Err(ShapeError::Classes);
         }
         let chips = self.components.count_ones() as usize;
-        for (index, class) in self.classes.iter().enumerate() {
+        for class in &self.classes {
             if class.log_sizes.len() != chips {
-                return Err(alloc::format!(
-                    "class {index} sizes {} chips, the shape has {chips}",
-                    class.log_sizes.len()
-                ));
+                return Err(ShapeError::ClassChips);
             }
             if class
                 .log_sizes
                 .iter()
                 .any(|&size| !(4..=MAX_LOG_SIZE).contains(&size))
             {
-                return Err(alloc::format!("class {index} has a log size out of range"));
+                return Err(ShapeError::LogSize);
             }
         }
         Ok(())
@@ -129,13 +172,12 @@ impl KernelShape {
     /// The class a proof over `components` at `log_sizes` is of: the first
     /// whose sizes they are. A proof over other chips than the shape's,
     /// more or fewer, or at sizes no class gives, is refused.
-    pub fn class_of(&self, components: u32, log_sizes: &[u32]) -> Result<usize, String> {
+    pub fn class_of(&self, components: u32, log_sizes: &[u32]) -> Result<usize, ShapeError> {
+        if components & !self.components != 0 {
+            return Err(ShapeError::MoreChips);
+        }
         if components != self.components {
-            let (more, fewer) = (components & !self.components, self.components & !components);
-            return Err(alloc::format!(
-                "the proof's chips differ from its kernel's shape: {more:#x} more, \
-                 {fewer:#x} fewer"
-            ));
+            return Err(ShapeError::FewerChips);
         }
         self.classes
             .iter()
@@ -147,7 +189,7 @@ impl KernelShape {
                         .zip(log_sizes)
                         .all(|(&pinned, &size)| u32::from(pinned) == size)
             })
-            .ok_or_else(|| "the proof's log sizes are no class of its kernel's shape".into())
+            .ok_or(ShapeError::NoSuchClass)
     }
 }
 
@@ -160,37 +202,25 @@ impl KernelShape {
 /// verifier takes is of exactly one shape.
 #[cfg(feature = "wire")]
 impl TryFrom<&vos_wire::records::Shape> for KernelShape {
-    type Error = String;
+    type Error = ShapeError;
 
-    fn try_from(record: &vos_wire::records::Shape) -> Result<Self, String> {
+    fn try_from(record: &vos_wire::records::Shape) -> Result<Self, ShapeError> {
         if record.policy != vos_wire::records::Shape::POLICY {
-            return Err(alloc::format!(
-                "the record's shape policy is {}, not {}",
-                record.policy,
-                vos_wire::records::Shape::POLICY
-            ));
+            return Err(ShapeError::Policy);
         }
         if record.chips & !chip_idx::ALL != 0 {
-            return Err(alloc::format!(
-                "the record names chips past the segment AIR: {:#x}",
-                record.chips & !chip_idx::ALL
-            ));
+            return Err(ShapeError::Outside);
         }
         if record.classes.len() > MAX_CLASSES {
-            return Err(alloc::format!(
-                "the record has {} classes, more than {MAX_CLASSES}",
-                record.classes.len()
-            ));
+            return Err(ShapeError::Classes);
         }
         let outside = |size: (usize, &u8)| record.chips & 1 << size.0 == 0 && *size.1 != 0;
-        if let Some(index) = record
+        if record
             .classes
             .iter()
-            .position(|class| class.log_sizes.iter().enumerate().any(outside))
+            .any(|class| class.log_sizes.iter().enumerate().any(outside))
         {
-            return Err(alloc::format!(
-                "class {index} sizes a chip outside the record's chips"
-            ));
+            return Err(ShapeError::ClassChips);
         }
         let shape = KernelShape {
             components: record.chips,
@@ -281,7 +311,7 @@ mod tests {
     fn a_malformed_shape_is_refused() {
         let mut missing = shape();
         missing.components &= !(1 << chip_idx::MEMORY);
-        assert!(missing.check().unwrap_err().contains("leaves out"));
+        assert_eq!(missing.check(), Err(ShapeError::Missing));
         let mut outside = shape();
         outside.components |= 1 << chip_idx::COUNT;
         assert!(outside.check().is_err());
@@ -296,7 +326,7 @@ mod tests {
         assert!(huge.check().is_err());
         let mut many = shape();
         many.classes = vec![many.classes[0].clone(); MAX_CLASSES + 1];
-        assert!(many.check().unwrap_err().contains("classes"));
+        assert_eq!(many.check(), Err(ShapeError::Classes));
     }
 
     /// A record of [`shape`]'s chips, each class sized as its.
@@ -354,23 +384,35 @@ mod tests {
             change(&mut record);
             KernelShape::try_from(&record).unwrap_err()
         };
-        assert!(refusal(|r| r.policy -= 1).contains("policy"));
-        assert!(refusal(|r| r.policy += 1).contains("policy"));
-        assert!(refusal(|r| r.chips |= 1 << chip_idx::COUNT).contains("past"));
-        assert!(refusal(|r| r.chips |= 1 << 31).contains("past"));
-        assert!(refusal(|r| r.classes[1].log_sizes[chip_idx::DIVREM] = 12).contains("outside"));
-        assert!(
+        assert_eq!(refusal(|r| r.policy -= 1), ShapeError::Policy);
+        assert_eq!(refusal(|r| r.policy += 1), ShapeError::Policy);
+        assert_eq!(
+            refusal(|r| r.chips |= 1 << chip_idx::COUNT),
+            ShapeError::Outside
+        );
+        assert_eq!(refusal(|r| r.chips |= 1 << 31), ShapeError::Outside);
+        assert_eq!(
+            refusal(|r| r.classes[1].log_sizes[chip_idx::DIVREM] = 12),
+            ShapeError::ClassChips
+        );
+        assert_eq!(
             refusal(|r| {
                 r.chips &= !(1 << chip_idx::MEMORY);
                 for class in &mut r.classes {
                     class.log_sizes[chip_idx::MEMORY] = 0;
                 }
-            })
-            .contains("leaves out")
+            }),
+            ShapeError::Missing
         );
-        assert!(refusal(|r| r.classes = vec![r.classes[0]; MAX_CLASSES + 1]).contains("classes"));
-        assert!(refusal(|r| r.classes.clear()).contains("no class"));
-        assert!(refusal(|r| r.classes[0].log_sizes[chip_idx::CPU] = 0).contains("range"));
+        assert_eq!(
+            refusal(|r| r.classes = vec![r.classes[0]; MAX_CLASSES + 1]),
+            ShapeError::Classes
+        );
+        assert_eq!(refusal(|r| r.classes.clear()), ShapeError::NoClass);
+        assert_eq!(
+            refusal(|r| r.classes[0].log_sizes[chip_idx::CPU] = 0),
+            ShapeError::LogSize
+        );
         let mut most = record();
         most.classes = vec![most.classes[0]; MAX_CLASSES];
         assert!(KernelShape::try_from(&most).is_ok());

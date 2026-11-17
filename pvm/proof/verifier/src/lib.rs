@@ -91,7 +91,7 @@ fn preflight_standalone(
     max_log_size: u32,
 ) -> Result<&'static Format, VerificationError> {
     let format = vos_pvm_proof::proof::preflight_proof_structure(proof, max_log_size)
-        .map_err(VerificationError::InvalidStructure)?;
+        .map_err(|error| VerificationError::InvalidStructure(error.to_string()))?;
     // `component_mask = 0` reads as every chip, and its only producer is
     // the chip-isolated `prove_with_explicit_components` path, whose proofs
     // are not verifiable via `verify_standalone`.
@@ -170,7 +170,7 @@ fn standalone_shape<MC: PcsStack>(
             &shape_component_refs,
             &expected_log_sizes,
         )
-        .map_err(VerificationError::InvalidStructure)?;
+        .map_err(|error| VerificationError::InvalidStructure(error.to_string()))?;
     Ok((expected_log_sizes, protocol_shape, security_shape))
 }
 
@@ -199,7 +199,7 @@ pub fn proof_security_bits(
         format.number
     ))));
     vos_pvm_proof::proof::format_security_bits(format, &proof.pcs_config, &shape)
-        .map_err(VerificationError::InvalidStructure)
+        .map_err(|error| VerificationError::InvalidStructure(error.to_string()))
 }
 
 fn verify_standalone_on<MC: PcsStack>(
@@ -220,7 +220,7 @@ fn verify_standalone_on<MC: PcsStack>(
     // The format's floors, counted at this proof's own parameters and
     // shape, and its exact parameters.
     vos_pvm_proof::proof::check_format_security(format, &proof.pcs_config, &security_shape)
-        .map_err(VerificationError::InvalidStructure)?;
+        .map_err(|error| VerificationError::InvalidStructure(error.to_string()))?;
 
     if proof.claimed_sums.len() != proof.num_components {
         return Err(VerificationError::InvalidStructure(
@@ -271,7 +271,7 @@ fn verify_standalone_on<MC: PcsStack>(
             lookup_elements
         },
     )
-    .map_err(VerificationError::InvalidStructure)?;
+    .map_err(|error| VerificationError::InvalidStructure(error.to_string()))?;
 
     // Verify logup sum = 0
     if proof.claimed_sums.iter().sum::<SecureField>() != SecureField::zero() {
@@ -334,7 +334,7 @@ fn verify_standalone_on<MC: PcsStack>(
         protocol_shape,
         &log_sizes,
     )
-    .map_err(VerificationError::InvalidStructure)?;
+    .map_err(|error| VerificationError::InvalidStructure(error.to_string()))?;
     if sampled_queries != protocol_shape.query_count {
         return Err(VerificationError::InvalidStructure(
             "queried-value rows differ from Fiat-Shamir query positions".to_string(),
@@ -366,7 +366,7 @@ fn kernel_segment_class(
     program
         .shape
         .class_of(proof.component_mask, &proof.log_sizes)
-        .map_err(VerificationError::InvalidStructure)
+        .map_err(|error| VerificationError::InvalidStructure(error.to_string()))
 }
 
 /// Verify a segment of a kernel's run against its program, the preimage of
@@ -381,7 +381,7 @@ pub fn verify_kernel_segment(
 ) -> Result<usize, VerificationError> {
     program
         .check()
-        .map_err(VerificationError::InvalidStructure)?;
+        .map_err(|error| VerificationError::InvalidStructure(error.to_string()))?;
     let class = kernel_segment_class(&proof, program)?;
     verify_standalone(proof, program.preprocessed_roots[class])?;
     Ok(class)
@@ -412,7 +412,7 @@ pub fn verify_kernel_chain(
     };
     program
         .check()
-        .map_err(VerificationError::InvalidStructure)?;
+        .map_err(|error| VerificationError::InvalidStructure(error.to_string()))?;
     let start = &first.initial_state;
     if start.timestamp != ENTRY_TIMESTAMP {
         return refuse("the first segment does not start at the run's first timestamp");

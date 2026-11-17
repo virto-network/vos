@@ -43,7 +43,7 @@ pub use shaped::{KernelSegment, program_commitment_for_shape, prove_kernel, prov
 
 /// Why a proof was not produced.
 #[derive(Debug)]
-pub enum ProvingError {
+pub enum SegmentError {
     /// Stwo's refusal, or a trace whose constraints cannot hold.
     Stwo(stwo::prover::ProvingError),
     /// The registry does not admit the format, or no stack implements its
@@ -65,18 +65,18 @@ pub enum ProvingError {
     MalformedShape,
 }
 
-impl ProvingError {
+impl SegmentError {
     /// A trace whose constraints cannot hold.
     const NOT_SATISFIED: Self = Self::Stwo(stwo::prover::ProvingError::ConstraintsNotSatisfied);
 }
 
-impl From<stwo::prover::ProvingError> for ProvingError {
+impl From<stwo::prover::ProvingError> for SegmentError {
     fn from(error: stwo::prover::ProvingError) -> Self {
         Self::Stwo(error)
     }
 }
 
-impl core::fmt::Display for ProvingError {
+impl core::fmt::Display for SegmentError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Stwo(error) => error.fmt(formatter),
@@ -99,7 +99,7 @@ impl core::fmt::Display for ProvingError {
     }
 }
 
-impl std::error::Error for ProvingError {}
+impl std::error::Error for SegmentError {}
 
 /// Cap rayon's global thread pool at a sensible default for our
 /// workload, unless the user has explicitly set `RAYON_NUM_THREADS`
@@ -147,35 +147,35 @@ impl Target {
 
     /// An admitted format; the prover is told only formats a verifier
     /// accepts.
-    pub fn of(format: &'static Format) -> Result<Self, ProvingError> {
+    pub fn of(format: &'static Format) -> Result<Self, SegmentError> {
         if format.status != Status::Admitted {
-            return Err(ProvingError::FormatNotAdmitted(format.number));
+            return Err(SegmentError::FormatNotAdmitted(format.number));
         }
         Ok(Self { format })
     }
 }
 
 /// Prove under the segment format (41), over the trace's natural shape.
-pub fn prove(side_note: &mut SideNote) -> Result<Proof, ProvingError> {
+pub fn prove(side_note: &mut SideNote) -> Result<Proof, SegmentError> {
     install_thread_pool();
     let (proof, _) = prove_impl(side_note, Target::SEGMENT, false)?;
     Ok(proof)
 }
 
 /// Prove under `format`, at its parameters, over the trace's natural shape;
-/// [`ProvingError::FormatNotAdmitted`] on a format the registry does not
+/// [`SegmentError::FormatNotAdmitted`] on a format the registry does not
 /// admit.
 pub fn prove_format(
     side_note: &mut SideNote,
     format: &'static Format,
-) -> Result<Proof, ProvingError> {
+) -> Result<Proof, SegmentError> {
     install_thread_pool();
     let (proof, _) = prove_impl(side_note, Target::of(format)?, false)?;
     Ok(proof)
 }
 
 /// [`prove`], with each phase's time and the trace's shape.
-pub fn prove_profiled(side_note: &mut SideNote) -> Result<(Proof, ProveProfile), ProvingError> {
+pub fn prove_profiled(side_note: &mut SideNote) -> Result<(Proof, ProveProfile), SegmentError> {
     install_thread_pool();
     prove_impl(side_note, Target::SEGMENT, true)
 }
@@ -250,11 +250,11 @@ pub(crate) fn backfill_final_regs(side_note: &mut SideNote) {
 /// handling, while CpuChip's four-limb lookup has no fifth carry. Reject such
 /// hand-built witnesses canonically instead of admitting backend-dependent
 /// overflow or an unbalanced lookup.
-pub(crate) fn validate_memory_witnesses(side_note: &SideNote) -> Result<(), ProvingError> {
+pub(crate) fn validate_memory_witnesses(side_note: &SideNote) -> Result<(), SegmentError> {
     const ADDRESS_SPACE_SIZE: u64 = 1u64 << 32;
 
     if side_note.memory_layout().is_none() {
-        return Err(ProvingError::NoMemoryLayout);
+        return Err(SegmentError::NoMemoryLayout);
     }
 
     for step in &side_note.steps {
@@ -275,15 +275,15 @@ pub(crate) fn validate_memory_witnesses(side_note: &SideNote) -> Result<(), Prov
             (true, false) if step.mem_write.is_none() => step.mem_read.as_ref(),
             (false, true) if step.mem_read.is_none() => step.mem_write.as_ref(),
             (false, false) if step.mem_read.is_none() && step.mem_write.is_none() => continue,
-            _ => return Err(ProvingError::NOT_SATISFIED),
+            _ => return Err(SegmentError::NOT_SATISFIED),
         };
         let (Some(access), Some(expected_size)) = (access, expected_size) else {
-            return Err(ProvingError::NOT_SATISFIED);
+            return Err(SegmentError::NOT_SATISFIED);
         };
         if access.size != expected_size
             || u64::from(access.address) + u64::from(access.size) > ADDRESS_SPACE_SIZE
         {
-            return Err(ProvingError::NOT_SATISFIED);
+            return Err(SegmentError::NOT_SATISFIED);
         }
     }
     Ok(())
@@ -293,7 +293,7 @@ fn prove_impl(
     side_note: &mut SideNote,
     target: Target,
     profile: bool,
-) -> Result<(Proof, ProveProfile), ProvingError> {
+) -> Result<(Proof, ProveProfile), SegmentError> {
     prepare_side_note_for_verification(side_note);
     // Filter BASE_COMPONENTS to active chips for THIS trace.
     // Verifier reconstructs the same list via active_components_verifier().
@@ -318,7 +318,7 @@ fn prove_impl(
 pub fn prove_with_explicit_components(
     side_note: &mut SideNote,
     components: &[&'static dyn crate::framework::MachineProverComponent],
-) -> Result<Proof, ProvingError> {
+) -> Result<Proof, SegmentError> {
     install_thread_pool();
     let request = ProveRequest::new(Target::SEGMENT, components, 0, Sizes::NATURAL);
     let (proof, _) = prove_with(side_note, request)?;
@@ -337,7 +337,7 @@ pub fn prove_chip_isolated_format(
     format: &'static Format,
     component_mask: u32,
     min_log_sizes: &[u32],
-) -> Result<Proof, ProvingError> {
+) -> Result<Proof, SegmentError> {
     install_thread_pool();
     let components: Vec<&dyn crate::framework::MachineProverComponent> =
         crate::chips_of_mask(component_mask)
@@ -455,7 +455,7 @@ pub fn prove_with_boundary_override(
     side_note: &mut SideNote,
     initial_state: SegmentState,
     final_state: SegmentState,
-) -> Result<Proof, ProvingError> {
+) -> Result<Proof, SegmentError> {
     install_thread_pool();
     prepare_side_note_for_verification(side_note);
     let components_owned = super::active_components(side_note);
@@ -473,16 +473,16 @@ pub fn prove_with_boundary_override(
 pub(crate) fn prove_with(
     side_note: &mut SideNote,
     request: ProveRequest<'_>,
-) -> Result<(Proof, ProveProfile), ProvingError> {
+) -> Result<(Proof, ProveProfile), SegmentError> {
     let format = request.target.format;
     crate::with_stack!(format.channel, Stack => prove_on::<Stack>(side_note, request),
-        unbuilt => Err(ProvingError::FormatNotAdmitted(format.number)))
+        unbuilt => Err(SegmentError::FormatNotAdmitted(format.number)))
 }
 
 fn prove_on<MC: PcsStack>(
     side_note: &mut SideNote,
     request: ProveRequest<'_>,
-) -> Result<(Proof, ProveProfile), ProvingError>
+) -> Result<(Proof, ProveProfile), SegmentError>
 where
     SimdBackend: BackendForChannel<MC>,
 {
@@ -669,7 +669,7 @@ where
 /// witnesses checked (a malformed or faulting trace is the caller's error,
 /// not an expensive attempt at an unsatisfiable proof), its boundary
 /// registers filled, and its memory pages' Merkle payload built.
-fn prepare(side_note: &mut SideNote) -> Result<(), ProvingError> {
+fn prepare(side_note: &mut SideNote) -> Result<(), SegmentError> {
     validate_memory_witnesses(side_note)?;
     // RegisterMemoryBoundaryChip needs `initial_regs` populated.
     backfill_initial_regs(side_note);
@@ -696,7 +696,7 @@ fn traced_sizes(
     traces: &[ComponentTrace],
     sizes: Sizes<'_>,
     component_mask: u32,
-) -> Result<Vec<u32>, ProvingError> {
+) -> Result<Vec<u32>, SegmentError> {
     let log_sizes: Vec<u32> = traces.iter().map(ComponentTrace::log_size).collect();
     if let Sizes::Pinned(pinned) = sizes
         && let Some((position, (&log_size, &pinned))) = log_sizes
@@ -708,7 +708,7 @@ fn traced_sizes(
         let chip = crate::chips_of_mask(component_mask)
             .nth(position)
             .unwrap_or(position);
-        return Err(ProvingError::Shape {
+        return Err(SegmentError::Shape {
             chip,
             log_size,
             pinned,
