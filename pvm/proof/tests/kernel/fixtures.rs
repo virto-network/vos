@@ -186,32 +186,55 @@ fn proof(n: u32, patch: Option<&str>) -> Proof {
     postcard::from_bytes(&bytes).expect("a proof")
 }
 
-/// Every fixture is the generator's, byte for byte: proving is
-/// deterministic, so a difference is a change of the AIR, a format, the
-/// shape or the kernel, and the fixtures are written anew.
+/// Every fixture is the generator's, byte for byte, and the directory holds
+/// the generator's files and no other: proving is deterministic, so a
+/// difference is a change of the AIR, a format, the shape or the kernel,
+/// and the fixtures are written anew; a file the generator no longer makes
+/// (a retired format's) is removed by the write, and refused without it,
+/// so no fixture the generator dropped reaches the verifier kit.
 #[test]
 fn the_fixtures_are_the_generators() {
     let write = std::env::var(MODE).is_ok_and(|mode| mode == "write");
     let mut stale = Vec::new();
-    let generated = FORMATS
+    let generated: Vec<(String, Vec<u8>)> = FORMATS
         .into_iter()
         .flat_map(|(format, other)| generate(format, other))
-        .chain(statements::generate());
-    for (name, bytes) in generated {
+        .chain(statements::generate())
+        .collect();
+    if write {
+        std::fs::create_dir_all(directory()).expect("the fixtures' directory");
+    }
+    for (name, bytes) in &generated {
         if write {
-            std::fs::create_dir_all(directory()).expect("the fixtures' directory");
-            std::fs::write(directory().join(&name), &bytes).expect("writes");
+            std::fs::write(directory().join(name), bytes).expect("writes");
             eprintln!("{name}: {} bytes", bytes.len());
-        } else if std::fs::read(directory().join(&name)).ok().as_ref() != Some(&bytes) {
-            stale.push(name);
+        } else if std::fs::read(directory().join(name)).ok().as_ref() != Some(bytes) {
+            stale.push(name.clone());
+        }
+    }
+    let mut extra = Vec::new();
+    for entry in std::fs::read_dir(directory()).expect("the fixtures' directory") {
+        let name = entry
+            .expect("an entry")
+            .file_name()
+            .into_string()
+            .expect("a name");
+        if generated.iter().all(|(made, _)| *made != name) {
+            if write {
+                std::fs::remove_file(directory().join(&name)).expect("removes");
+                eprintln!("{name}: removed, the generator makes it no longer");
+            } else {
+                extra.push(name);
+            }
         }
     }
     assert!(
-        stale.is_empty(),
-        "stale fixtures under pvm/proof/fixtures: {stale:?}. The generator \
-         (pvm/proof/tests/kernel/fixtures.rs) makes other bytes: the AIR, a format, \
-         the shape or the kernel changed. Run `just fixtures` to write them \
-         anew, check the diff is the change you meant, and commit them."
+        stale.is_empty() && extra.is_empty(),
+        "stale fixtures under pvm/proof/fixtures: {stale:?}, and files the generator \
+         does not make: {extra:?}. The generator (pvm/proof/tests/kernel/fixtures.rs) \
+         makes other bytes or other files: the AIR, a format, the shape or the kernel \
+         changed. Run `just fixtures` to write them anew, check the diff is the change \
+         you meant, and commit them."
     );
 }
 

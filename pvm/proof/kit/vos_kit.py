@@ -93,8 +93,8 @@ FIXTURE_FILES = ["statements.cases", "wrap*.proof"]
 # `conformance/`, which the reference mock writes (`just conformance`); the
 # vendor and the sync carry and check them as every other file.
 CONFORMANCE: list[tuple[str, str]] = [
-    ("node/venue/conformance/spaces.json", "spaces.json"),
-    ("node/venue/conformance/mutations.json", "mutations.json"),
+    ("tools/kreivo/conformance/spaces.json", "spaces.json"),
+    ("tools/kreivo/conformance/mutations.json", "mutations.json"),
 ]
 
 # The licence texts, each its path in VOS and its name in the kit.

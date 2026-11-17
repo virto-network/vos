@@ -860,7 +860,7 @@ last for decades.**
     `VenueClient`, the space's sovereign account paying. It reaches the
     chain by message through a `Transport`; VOS tests it against a
     reference mock of the designed pallet and the conformance vectors
-    (`node/venue/conformance`), which the teammate's pallet must pass.
+    (`tools/kreivo/conformance`), which the teammate's pallet must pass.
     The chain transport (on sube, signing with the node's sr25519
     authority key) is a port of master's substrate extension onto the
     node's extension host: VOS's work once that host exists. The pallet is

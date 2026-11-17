@@ -184,8 +184,9 @@ _at-fixed-path dir +args:
 
 # The proof fixtures under `pvm/proof/fixtures` (`proving.md` A.6), written
 # anew by their generator, `pvm/proof/tests/kernel/fixtures.rs`: at a format bump,
-# or a change of the AIR or a kernel's shape. `test-proof` refuses fixtures
-# the generator does not make.
+# or a change of the AIR or a kernel's shape; a file the generator no longer
+# makes is removed. `test-proof` refuses fixtures the generator does not
+# make, byte for byte, and a directory holding any file but its.
 fixtures: build-test-actors build-programs
     with-env { VOS_FIXTURES: "write" } { cargo test -p vos-pvm-proof --test kernel fixtures::the_fixtures_are_the_generators }
 
@@ -203,7 +204,7 @@ repro-aarch64: build-test-actors
     let source = ([pvm/proof/src/constants.rs pvm/proof/final-verifier/src/constants.rs] | each {|file| open --raw $file } | str join "\n"); let pinned = {|name| $source | parse --regex ("pub const " + $name + ": \\[u\\d+; \\d+\\] = \\[(?<values>[^\\]]*)\\]") | get values.0 | split row "," | each {|value| $value | str trim } | where {|value| $value != "" } | str join " " }; let vos = {|...args| ^qemu-aarch64 -L /usr/aarch64-linux-gnu target/aarch64-unknown-linux-gnu/debug/vos program-id ...$args | str trim }; for case in [[window settle WINDOW_PROGRAM] [balance at_least BALANCE_PROGRAM] [kernels areas PREDICATE_PROGRAM]] { let printed = (do $vos $"agent/test-actors/target/riscv64em-vos/release/($case.0).elf" $case.1); if $printed != (do $pinned $case.2) { error make { msg: $"($case.2) on aarch64: ($printed)" } } }; let circuits = (do $vos "--circuits" | lines); let names = ($circuits | each {|line| $line | split row " " | first }); if $names != [H_FOLD PREPROCESSED_ROOT_39] { error make { msg: $"the circuits printed on aarch64: ($names)" } }; for line in $circuits { let parts = ($line | split row " "); if ($parts | skip 1 | str join " ") != (do $pinned $parts.0) { error make { msg: $"($parts.0) on aarch64: ($line)" } } }; print "the program ids and the circuits' constants on aarch64 are the repository's"
 
 # The conformance vectors of Kreivo's spaces pallet and the mutation lists
-# (`node/venue/conformance`, `spaces-pallet.md` §10), written anew by the
+# (`tools/kreivo/conformance`, `spaces-pallet.md` §10), written anew by the
 # reference mock (`tools/kreivo`) over the golden fixtures: after a
 # change of the design, the mock or the fixtures. `check` refuses vectors
 # the mock does not write.
@@ -320,7 +321,7 @@ blobs-lock: build-blobs
 #    minutes, and several GiB);
 # 5. the golden fixtures, `pvm/proof/fixtures` (`fixtures`: it proves,
 #    under the 12 GiB limit `test-proof` names);
-# 6. the conformance vectors over them, `node/venue/conformance`
+# 6. the conformance vectors over them, `tools/kreivo/conformance`
 #    (`conformance`);
 # 7. the verifier kit's lock file, `pvm/proof/kit/Cargo.lock` (`kit-lock`).
 # The pinning tests write under `VOS_PINS=write` what moved, and are run
@@ -339,7 +340,7 @@ repin: blobs-lock facility-release
     just fixtures
     just conformance
     just kit-lock
-    let moved = (git status --porcelain -- blobs.lock node/light/android/release node/light/tests/device.pins pvm/proof/src/constants.rs pvm/proof/fixtures node/venue/conformance pvm/proof/kit/Cargo.lock | lines); if ($moved | is-empty) { print "repin: every pin store is this tree's already" } else { print "repin: moved"; $moved | each {|line| print $line }; null }
+    let moved = (git status --porcelain -- blobs.lock node/light/android/release node/light/tests/device.pins pvm/proof/src/constants.rs pvm/proof/fixtures tools/kreivo/conformance pvm/proof/kit/Cargo.lock | lines); if ($moved | is-empty) { print "repin: every pin store is this tree's already" } else { print "repin: moved"; $moved | each {|line| print $line }; null }
 
 # The pinned blobs' hashes, `_blob-hashes`' lines; its failure fails the
 # recipe that reads them.

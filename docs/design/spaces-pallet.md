@@ -897,7 +897,7 @@ port adds it):
   - `budget` (call 10).
 
 **The contract** is the conformance vectors and the mock:
-- `node/venue/conformance/*.json` and the mock that writes them
+- `tools/kreivo/conformance/*.json` and the mock that writes them
   (`vos-kreivo`'s `kreivo-mock` feature; `just conformance` regenerates them);
 - the scenarios of `KreivoVenue`'s tests over the mock
   (`tools/kreivo/src/tests/`, `node/host/tests/cluster/kreivo.rs`),
@@ -937,7 +937,7 @@ tag's, byte for byte.
   are §8's table (and stores values through derives on §5's types), not
   hand-rolled encodings. It takes `parity-scale-codec` as a std, test-only
   dependency, outside the vendored tree.
-- **The files** (`conformance/` in the kit; in VOS `node/venue/conformance`,
+- **The files** (`conformance/` in the kit; in VOS `tools/kreivo/conformance`,
   written by `just conformance`, refused stale by `just check`, the vectors' own test):
   - `spaces.json`: the constants (§4's suggested values, `UNITS =
     10^12`, `FeeBound = UNITS`, the existential deposit `UNITS / 1000`,
