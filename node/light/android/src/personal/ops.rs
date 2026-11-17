@@ -11,6 +11,7 @@
 use std::time::Duration;
 
 use ed25519_dalek::Signer as _;
+use vos_abi::ids::MethodId;
 use vos_abi::result::Outcome;
 use vos_abi::{Decode, Encode};
 use vos_light::group::{Agent as GroupAgent, DeviceGroup, Event, Prepared, Restored};
@@ -24,13 +25,13 @@ use vos_light::personal::{Link as _, recover};
 use vos_light::route::Purpose;
 use vos_light::tor::Registrar;
 use vos_light::{AuthWitness, Call, Digest, Light, TreeKeeper, wire};
-use vos_wire::books::{DeviceHandle, Enrolled as BookEntry};
-use vos_wire::credentials::{CredentialError, Open};
-use vos_wire::homes::HomesError;
+use vos_wire::books::{DeviceHandle, Enrolled as BookEntry, credential_book};
+use vos_wire::credentials::{self, CredentialError, Open};
+use vos_wire::homes::{self, HomesError};
 use vos_wire::personal::{
     AdminClass, Attached, Attestation, Body, Candidacy, DeviceView, Entry, InboxItem, NewAdmin,
     NewDevice, OpState, Overview, PersonalError, RECOVERY, Recorded, RecoveryView, Standing,
-    Status,
+    Status, method,
 };
 use zeroize::Zeroizing;
 
@@ -424,7 +425,7 @@ impl Space {
         home: &HomeSpace,
         purpose: Purpose,
         instance: u32,
-        name: &str,
+        method: MethodId,
         arguments: Vec<u8>,
     ) -> Result<T, Refusal> {
         let now = self.time(home.handle, purpose)?;
@@ -432,7 +433,7 @@ impl Space {
             home.agent,
             &home.identity,
             instance,
-            name,
+            method,
             arguments,
             now + EXPIRY_MS,
         )
@@ -456,7 +457,7 @@ impl Space {
             home,
             Purpose::Member,
             home.credentials.0,
-            "opening",
+            credentials::method::OPENING,
             Vec::new(),
         )?;
         let terms =
@@ -535,15 +536,8 @@ impl Space {
         let answer = self.ask(home.handle, Purpose::Proven, &request)?;
         crate::session::update_refused(&answer)?;
         match wire::credentialed_answer(&answer).map_err(failed)? {
-            wire::Answer::Ran { outcome, .. } => match outcome {
-                Outcome::Done(bytes) => T::decode_exact(&bytes)
-                    .map(Ok)
-                    .ok_or_else(|| failed("`Homes`' reply does not decode")),
-                Outcome::Failed { detail, .. } => HomesError::decode_exact(&detail)
-                    .map(Err)
-                    .ok_or_else(|| failed("`Homes`' error does not decode")),
-                other => Err(failed(format!("`Homes` answered {other:?}"))),
-            },
+            wire::Answer::Ran { outcome, .. } => wire::answer(&outcome)
+                .map_err(|_| failed(format!("`Homes` answered {outcome:?}"))),
             other => Err(refused(
                 Refused::Refused,
                 format!("the home's ingress: {other:?}"),
@@ -649,8 +643,13 @@ impl Space {
 
     /// The pooled agent `Homes` at `home` names, and its identity.
     fn pooled(&self, home: &HomeSpace) -> Result<(u32, [u8; 32]), Refusal> {
-        let pooled: Option<u32> =
-            self.home_query(home, Purpose::Personal, home.homes.0, "pooled", Vec::new())?;
+        let pooled: Option<u32> = self.home_query(
+            home,
+            Purpose::Personal,
+            home.homes.0,
+            homes::method::POOLED,
+            Vec::new(),
+        )?;
         let agent =
             pooled.ok_or_else(|| refused(Refused::Refused, "the home has no agent to give"))?;
         Ok((agent, self.identity(home, agent)?))
@@ -797,7 +796,7 @@ impl Space {
             };
             let join = light.call(
                 CREDENTIAL_BOOK,
-                vos_abi::ids::MethodId(vos_light::method_id("join")),
+                credential_book::JOIN,
                 (enrollment.space, entry).encode(),
             );
             if join.is_ok() {
@@ -854,7 +853,7 @@ impl Space {
                 &mut signer,
             );
             match link
-                .call::<u64>("put", acked.ack.clone())
+                .call::<u64>(method::PUT, acked.ack.clone())
                 .map_err(unreached)?
             {
                 Ok(_) => Ok(()),
@@ -913,7 +912,7 @@ impl Space {
         &self,
         held: &mut Held,
         prompts: Lent<'_>,
-        name: &str,
+        method: MethodId,
         arguments: Vec<u8>,
         r2: Option<[u8; 32]>,
     ) -> Result<Posted, Refusal> {
@@ -923,7 +922,7 @@ impl Space {
         let sign = admin_sign(prompts, admin);
         let recorded = self.with_link(held, Purpose::Personal, |link, _| {
             let called = link
-                .settled(&mut signer, &sign, name, arguments)
+                .settled(&mut signer, &sign, method, arguments)
                 .map_err(unreached)?;
             let recorded = answer::<Recorded>(&called.outcome)
                 .map_err(failed)?
@@ -978,7 +977,7 @@ impl Space {
                 .settled_held(
                     &mut signer,
                     &group_sign,
-                    "commit",
+                    method::COMMIT,
                     prepared.arguments(),
                     &mut hold,
                 )
@@ -996,7 +995,7 @@ impl Space {
                         return Err(failed("a commit's evidence"));
                     };
                     let arguments = ((index, message), (signature, attached)).encode();
-                    link.call::<Recorded>("evidence", arguments)
+                    link.call::<Recorded>(method::EVIDENCE, arguments)
                         .map_err(unreached)?
                         .map_err(agent_refused)?;
                     Ok(candidacy)
@@ -1037,7 +1036,7 @@ impl Space {
         let (mut opener, drawn) =
             Opener::open(agent.1, offer.clone(), item_bytes).map_err(failed)?;
         let at = self.with_link(&mut held, Purpose::Personal, |link, _| {
-            link.call::<u64>("open_slot", drawn.slot.arguments())
+            link.call::<u64>(method::OPEN_SLOT, drawn.slot.arguments())
                 .map_err(unreached)?
                 .map_err(agent_refused)
         })?;
@@ -1151,7 +1150,7 @@ impl Space {
                 // The slot closed, so the next offer starts anew.
                 let slot = opener.slot();
                 self.with_link(held, Purpose::Personal, |link, _| {
-                    link.call::<u64>("close_slot", slot.encode())
+                    link.call::<u64>(method::CLOSE_SLOT, slot.encode())
                         .map_err(unreached)?
                         .map_err(agent_refused)
                         .map(drop)
@@ -1159,7 +1158,7 @@ impl Space {
                 return Err(cancelled());
             }
             let items: Vec<InboxItem> = self.with_link(held, Purpose::Personal, |link, _| {
-                link.query("inbox", Option::<(u64, [u8; 16])>::None)
+                link.query(method::INBOX, Option::<(u64, [u8; 16])>::None)
                     .map_err(unreached)?
                     .map_err(agent_refused)
             })?;
@@ -1245,7 +1244,7 @@ impl Space {
             return Ok(());
         }
         let overview: Overview = self.with_link(held, Purpose::Personal, |link, _| {
-            link.query("overview", ())
+            link.query(method::OVERVIEW, ())
                 .map_err(unreached)?
                 .map_err(agent_refused)
         })?;
@@ -1261,7 +1260,7 @@ impl Space {
     /// An item put in the pairing slot under the sync key.
     fn put(&self, held: &mut Held, arguments: &[u8]) -> Result<(), Refusal> {
         self.with_link(held, Purpose::Personal, |link, _| {
-            link.call::<u64>("put", arguments.to_vec())
+            link.call::<u64>(method::PUT, arguments.to_vec())
                 .map_err(unreached)?
                 .map_err(agent_refused)
                 .map(drop)
@@ -1302,7 +1301,7 @@ impl Space {
         {
             let sync = held.light.sync_key().verifying_key().to_bytes();
             let listed = self.with_link(&mut held, Purpose::Personal, |link, _| {
-                link.query::<Vec<DeviceView>>("devices", ())
+                link.query::<Vec<DeviceView>>(method::DEVICES, ())
                     .map_err(unreached)
             })?;
             match listed {
@@ -1348,7 +1347,7 @@ impl Space {
                     &slot,
                     signer,
                 );
-                link.call::<u64>("put", arguments)
+                link.call::<u64>(method::PUT, arguments)
                     .map_err(unreached)?
                     .map_err(agent_refused)
                     .map(drop)
@@ -1375,7 +1374,7 @@ impl Space {
                     &slot,
                     &mut slot_signer,
                 );
-                link.query("inbox", Option::<(u64, [u8; 16])>::None)
+                link.query(method::INBOX, Option::<(u64, [u8; 16])>::None)
                     .map_err(unreached)?
                     .map_err(agent_refused)?
             };
@@ -1636,7 +1635,7 @@ impl Space {
     /// The device set as the agent shows it.
     fn views(&self, held: &mut Held) -> Result<Vec<DeviceView>, Refusal> {
         self.with_link(held, Purpose::Personal, |link, _| {
-            link.query("devices", ())
+            link.query(method::DEVICES, ())
                 .map_err(unreached)?
                 .map_err(agent_refused)
         })
@@ -1703,15 +1702,33 @@ impl Space {
     /// retired, or lost): it matures after the policy's delay unless
     /// vetoed, and the next commit carries it.
     pub fn remove(&self, prompts: Lent<'_>, device: u32) -> Result<Posted, Refusal> {
-        self.operate(&mut self.held(), prompts, "remove", device.encode(), None)
+        self.operate(
+            &mut self.held(),
+            prompts,
+            method::REMOVE,
+            device.encode(),
+            None,
+        )
     }
 
     pub fn veto(&self, prompts: Lent<'_>, index: u64) -> Result<Posted, Refusal> {
-        self.operate(&mut self.held(), prompts, "veto", index.encode(), None)
+        self.operate(
+            &mut self.held(),
+            prompts,
+            method::VETO,
+            index.encode(),
+            None,
+        )
     }
 
     pub fn cosign(&self, prompts: Lent<'_>, index: u64) -> Result<Posted, Refusal> {
-        self.operate(&mut self.held(), prompts, "cosign", index.encode(), None)
+        self.operate(
+            &mut self.held(),
+            prompts,
+            method::COSIGN,
+            index.encode(),
+            None,
+        )
     }
 
     /// `resolve`: a contested operation upheld or dropped.
@@ -1719,7 +1736,7 @@ impl Space {
         self.operate(
             &mut self.held(),
             prompts,
-            "resolve",
+            method::RESOLVE,
             (index, upheld).encode(),
             None,
         )
@@ -1736,7 +1753,7 @@ impl Space {
         self.operate(
             &mut held,
             prompts,
-            "rotate",
+            method::ROTATE,
             split.kit.encode(),
             Some(*split.r2()),
         )
@@ -1785,7 +1802,7 @@ impl Space {
             );
             let sign = |message: &[u8]| Ok(signing.sign(message).to_bytes());
             let called = link
-                .settled(&mut signer, &sign, "replace", (me, admin).encode())
+                .settled(&mut signer, &sign, method::REPLACE, (me, admin).encode())
                 .map_err(unreached)?;
             let recorded = answer::<Recorded>(&called.outcome)
                 .map_err(failed)?
@@ -1925,7 +1942,7 @@ impl Space {
         self.operate(
             &mut self.held(),
             prompts,
-            "replace",
+            method::REPLACE,
             (offer.device, admin).encode(),
             None,
         )
@@ -1946,7 +1963,7 @@ impl Space {
             .filter(|view| view.id != me && view.device.status == Status::Live)
             .map(|view| view.id)
             .collect();
-        self.operate(&mut held, prompts, "regroup", remove.encode(), None)
+        self.operate(&mut held, prompts, method::REGROUP, remove.encode(), None)
     }
 
     /// `update`: a commit now, carrying every matured removal and this
@@ -2049,7 +2066,7 @@ impl Space {
                     &home,
                     Purpose::Personal,
                     home.homes.0,
-                    "find",
+                    homes::method::FIND,
                     kit.index().encode(),
                 )?;
                 let agent = found.ok_or_else(|| {
@@ -2094,8 +2111,7 @@ impl Space {
         }
         let taken = entries.iter().find_map(|(index, entry)| match &entry.body {
             Body::Operation { call, .. }
-                if call.method == vos_light::method_id("restore")
-                    && call.arguments == restoring.arguments =>
+                if call.method == method::RESTORE.0 && call.arguments == restoring.arguments =>
             {
                 Some(Posted {
                     index: *index,
@@ -2121,7 +2137,7 @@ impl Space {
                     .settled_held(
                         &mut kit_signer,
                         &sign,
-                        "restore",
+                        method::RESTORE,
                         restoring.arguments.clone(),
                         &mut hold,
                     )
@@ -2206,7 +2222,7 @@ impl Space {
                 }
             }
             let view: RecoveryView = link
-                .query("recovery", ())
+                .query(method::RECOVERY, ())
                 .map_err(unreached)?
                 .map_err(agent_refused)?;
             let mut envelopes = Vec::new();
@@ -2217,7 +2233,7 @@ impl Space {
                         envelope.position
                     });
                 let page: Vec<vos_wire::personal::Envelope> = link
-                    .query("since", (RECOVERY, after))
+                    .query(method::SINCE, (RECOVERY, after))
                     .map_err(unreached)?
                     .map_err(agent_refused)?;
                 if page.is_empty() {
@@ -2226,11 +2242,11 @@ impl Space {
                 envelopes.extend(page);
             }
             let overview: Overview = link
-                .query("overview", ())
+                .query(method::OVERVIEW, ())
                 .map_err(unreached)?
                 .map_err(agent_refused)?;
             let devices: Vec<DeviceView> = link
-                .query("devices", ())
+                .query(method::DEVICES, ())
                 .map_err(unreached)?
                 .map_err(agent_refused)?;
             (view, envelopes, overview, devices)
@@ -2333,7 +2349,7 @@ impl Space {
                 home,
                 Purpose::Personal,
                 home.homes.0,
-                "agent",
+                homes::method::AGENT,
                 home.nullifier(&secret).encode(),
             )?;
             if holding.is_some() {
@@ -2352,7 +2368,7 @@ impl Space {
 /// Whether the restore whose arguments are `arguments` was cancelled, as
 /// the log `entries` show it.
 fn restore_cancelled(entries: &[(u64, Entry)], arguments: &[u8]) -> bool {
-    let restore = vos_light::method_id("restore");
+    let restore = method::RESTORE.0;
     let Some(at) = entries.iter().find_map(|(index, entry)| match &entry.body {
         Body::Operation { call, .. } if call.method == restore && call.arguments == arguments => {
             Some(*index)
@@ -2378,7 +2394,7 @@ fn evidence(
     attached: Attached,
 ) -> Result<(), Refusal> {
     let arguments = ((index, message.to_vec()), (*signature, attached)).encode();
-    link.call::<Recorded>("evidence", arguments)
+    link.call::<Recorded>(method::EVIDENCE, arguments)
         .map_err(unreached)?
         .map_err(agent_refused)
         .map(drop)

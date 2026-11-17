@@ -17,6 +17,47 @@ use alloc::vec::Vec;
 
 use scale::{Decode, Encode};
 
+/// `Personal`'s handlers.
+pub mod method {
+    methods! {
+        CONFIGURE = "configure";
+        ASSIGN = "assign";
+        CLAIM = "claim";
+        RENEW = "renew";
+        REMOVE = "remove";
+        ADD = "add";
+        REPLACE = "replace";
+        ROTATE = "rotate";
+        REGROUP = "regroup";
+        RESTORE = "restore";
+        VETO = "veto";
+        COSIGN = "cosign";
+        RESOLVE = "resolve";
+        COMMIT = "commit";
+        EVIDENCE = "evidence";
+        CONFIRM = "confirm";
+        NACK = "nack";
+        ALIVE = "alive";
+        PUSH = "push";
+        ACKNOWLEDGE = "acknowledge";
+        OPEN_SLOT = "open_slot";
+        CLOSE_SLOT = "close_slot";
+        PUT = "put";
+        WAKE = "wake";
+        VERSION = "version";
+        OVERVIEW = "overview";
+        DEVICES = "devices";
+        OPERATIONS = "operations";
+        OPERATION = "operation";
+        RECOVERY = "recovery";
+        LOG = "log";
+        SINCE = "since";
+        INBOX = "inbox";
+        ACKNOWLEDGEMENTS = "acknowledgements";
+        FRONTIER = "frontier";
+    }
+}
+
 /// A sealed scope's id: opaque to the agent, `BLAKE2b-128("vos/personal/
 /// scope-id" ‖ naming ‖ name)` on devices.
 pub type Scope = [u8; 16];

@@ -8113,6 +8113,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vos-sdk-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+ "vos-abi",
+]
+
+[[package]]
 name = "vos-testkit"
 version = "0.1.0"
 dependencies = [
@@ -8139,6 +8149,7 @@ dependencies = [
  "vos-abi",
  "vos-pvm-codec",
  "vos-pvm-precompiles",
+ "vos-sdk-macros",
  "vos-tree",
 ]
 

@@ -16,7 +16,7 @@ use super::{
     Act, Alarm, CONFIRM, Check, Course, DeviceGroup, Event, GroupError, Known, Named, Passing,
     Pending, Processed, Remedy, Why,
 };
-use crate::call::method_id;
+use vos_wire::personal::method;
 
 /// A commit call's arguments: its epoch, effect, handshake and Welcome's
 /// hash.
@@ -115,7 +115,7 @@ impl DeviceGroup {
                 && call.method == made.method
                 && call.arguments == made.arguments
         });
-        if held || made.method != method_id("veto") {
+        if held || made.method != method::VETO.0 {
             self.state.made.remove(at);
         } else {
             self.state.made[at].dropped = true;
@@ -253,7 +253,7 @@ impl DeviceGroup {
             self.stick(pending.epoch, pending.by, events)?;
         }
         let decoded = CommitArguments::decode_exact(&call.arguments)
-            .filter(|((named, _), _)| *named == epoch && call.method == method_id("commit"));
+            .filter(|((named, _), _)| *named == epoch && call.method == method::COMMIT.0);
         let fresh = self.state.set.fresh;
         let regroup = fresh.is_some() && fresh == self.state.id && fresh == Some(by);
         if matches!(self.state.course, Course::Stuck { .. }) && !regroup {
@@ -385,7 +385,7 @@ impl DeviceGroup {
             signed.identity == agent.identity
                 && signed.session.key == pending.origin
                 && signed.instance == agent.instance
-                && signed.method.0 == method_id("commit")
+                && signed.method == method::COMMIT
                 && signed.arguments == pending.arguments
         }) && verifies(&pending.origin, message, signature)
             && welcome.as_deref().map(welcome_hash) == pending.welcome_hash;

@@ -9259,6 +9259,7 @@ dependencies = [
  "vos-pvm",
  "vos-pvm-codec",
  "vos-pvm-precompiles",
+ "vos-sdk-macros",
  "vos-tree",
 ]
 

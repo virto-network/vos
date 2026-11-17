@@ -170,7 +170,7 @@ impl Control for JobLink<'_> {
 
     fn post(&mut self, post: &Post) -> Answer<u64, Killed> {
         self.request(|home, sync| {
-            let reply = home.call(sync, post.name(), post.arguments());
+            let reply = home.call(sync, named(post.method()), post.arguments());
             match &reply.outcome {
                 Outcome::Done(bytes) => Ok(post.at(bytes).expect("the reply decodes")),
                 _ => Err(reply.answer::<()>().unwrap_err()),
@@ -600,4 +600,13 @@ fn an_alarm_outlives_the_request_failed_after_it() {
     restart(&mut phones[1]);
     let next = pass(&mut home, &mut phones[1]);
     assert!(next.pass.alarms.contains(&stale), "{:?}", next.pass.alarms);
+}
+
+/// The name of `Personal`'s method `id`, as the world calls it.
+fn named(id: vos_abi::ids::MethodId) -> &'static str {
+    vos_wire::personal::method::ALL
+        .iter()
+        .find(|(_, method)| *method == id)
+        .map(|(name, _)| *name)
+        .expect("a method of `Personal`")
 }

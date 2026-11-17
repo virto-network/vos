@@ -17,7 +17,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use ed25519_dalek::{Signer, SigningKey};
-use vos_abi::ids::{InstanceId, MethodId, Session};
+use vos_abi::ids::{InstanceId, Session};
 use vos_light::group::{Agent, DeviceGroup, Event, Prepared};
 use vos_light::{Config, Light};
 use vos_wire::ingress::call_message;
@@ -150,7 +150,7 @@ fn round(
     let index = script.append(Body::Candidate {
         call: AdminCall {
             origin: committer_admin,
-            method: vos_light::method_id("commit"),
+            method: vos_wire::personal::method::COMMIT.0,
             arguments: arguments.clone(),
         },
         by: committer as DeviceId,
@@ -168,7 +168,7 @@ fn round(
         &session,
         index,
         INSTANCE,
-        MethodId(vos_light::method_id("commit")),
+        vos_wire::personal::method::COMMIT,
         &arguments,
     );
     let signature = devices[committer].admin.sign(&message).to_bytes();

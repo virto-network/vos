@@ -10,11 +10,12 @@
 
 use ed25519_dalek::{Signer, SigningKey};
 use scale::{Decode, Encode};
+use vos_abi::abi::Failure;
 use vos_abi::ids::Session;
 use vos_abi::ids::{AgentId, InstanceId, MethodId};
 use vos_abi::result::Outcome;
 use vos_api::Kind;
-use vos_wire::credentials::Feed;
+use vos_wire::credentials::{Feed, method};
 use vos_wire::ingress::{
     self, AgentInfo, Consistency, CredentialRefusal, Credentialed, QueryCall, Rejection, Response,
     query_message,
@@ -75,7 +76,7 @@ pub fn call_request(
     agent: u32,
     identity: &[u8; 32],
     instance: u32,
-    method: &str,
+    method: MethodId,
     arguments: Vec<u8>,
     now: u64,
 ) -> Result<Vec<u8>, DeviceError> {
@@ -90,7 +91,7 @@ pub fn call_request(
         name,
         t0: now,
     };
-    let (instance, method) = (InstanceId(instance), MethodId(crate::method_id(method)));
+    let instance = InstanceId(instance);
     let message = ingress::call_message(identity, &session, 1, instance, method, &arguments);
     let call = ingress::Call {
         session,
@@ -114,6 +115,22 @@ pub fn outcome(body: &[u8]) -> Result<Outcome, DeviceError> {
     }
 }
 
+/// A handler's answer in `outcome`, a call's or a query's: its reply, or
+/// the actor's error `E` (`PersonalError`, `HomesError`,
+/// `CredentialError`); any other outcome, or one that does not decode,
+/// [`DeviceError::Decode`]. The one reading of a stock actor's answer
+/// every flow and test shares.
+pub fn answer<T: Decode, E: Decode>(outcome: &Outcome) -> Result<Result<T, E>, DeviceError> {
+    match outcome {
+        Outcome::Done(bytes) => T::decode_exact(bytes).map(Ok).ok_or(DeviceError::Decode),
+        Outcome::Failed {
+            code: Failure::Handler,
+            detail,
+        } => E::decode_exact(detail).map(Err).ok_or(DeviceError::Decode),
+        _ => Err(DeviceError::Decode),
+    }
+}
+
 /// A query's reply, decoded as `T`, from its answer.
 pub fn query_answer<T: Decode>(body: &[u8]) -> Result<T, DeviceError> {
     T::decode_exact(&reply(body)?).ok_or(DeviceError::Decode)
@@ -129,7 +146,7 @@ pub fn query_request(
     agent: u32,
     identity: &[u8; 32],
     instance: u32,
-    method: &str,
+    method: MethodId,
     arguments: Vec<u8>,
     not_after: u64,
 ) -> Result<Vec<u8>, DeviceError> {
@@ -142,7 +159,7 @@ pub fn query_request(
         not_after,
         consistency: Consistency::Applied { at: 0 },
         instance: InstanceId(instance),
-        method: MethodId(crate::method_id(method)),
+        method,
         arguments,
         signature: [0; 64],
     };
@@ -170,7 +187,14 @@ pub fn feed_query(
     from: u64,
     not_after: u64,
 ) -> Result<Vec<u8>, DeviceError> {
-    query_request(agent, identity, instance, "feed", from.encode(), not_after)
+    query_request(
+        agent,
+        identity,
+        instance,
+        method::FEED,
+        from.encode(),
+        not_after,
+    )
 }
 
 /// A query of the credential actor's `feed_after(root)`, the tree's
@@ -188,7 +212,7 @@ pub fn feed_after_query(
         agent,
         identity,
         instance,
-        "feed_after",
+        method::FEED_AFTER,
         root.encode(),
         not_after,
     )

@@ -5,12 +5,12 @@
 //! or a resolution, each verified.
 
 use vos_abi::Encode;
+use vos_abi::ids::MethodId;
 use vos_wire::ingress::CallMessage;
-use vos_wire::personal::{AdminCall, AdminClass, DeviceId, Op, Signer};
+use vos_wire::personal::{AdminCall, AdminClass, DeviceId, Op, Signer, method};
 
 use super::follow::verifies;
 use super::{Act, Alarm, Call, Check, Claim, DeviceGroup, Event, GroupError, Support};
-use crate::call::method_id;
 use crate::kit::KitKey;
 
 /// Whether a key is its signer's at a time: an active device's admin key
@@ -25,14 +25,14 @@ pub(super) enum Holds {
 
 /// The method an operation's admin call names, and its arguments as the
 /// agent encodes them.
-fn signed_as(op: &Op) -> (&'static str, Vec<u8>) {
+fn signed_as(op: &Op) -> (MethodId, Vec<u8>) {
     match op {
-        Op::Add(device) => ("add", device.encode()),
-        Op::Remove(target) => ("remove", target.encode()),
-        Op::Replace { device, admin } => ("replace", (*device, admin.clone()).encode()),
-        Op::Rotate(kit) => ("rotate", kit.encode()),
-        Op::Regroup(named) => ("regroup", named.encode()),
-        Op::Restore { device, kit } => ("restore", (device.clone(), kit.clone()).encode()),
+        Op::Add(device) => (method::ADD, device.encode()),
+        Op::Remove(target) => (method::REMOVE, target.encode()),
+        Op::Replace { device, admin } => (method::REPLACE, (*device, admin.clone()).encode()),
+        Op::Rotate(kit) => (method::ROTATE, kit.encode()),
+        Op::Regroup(named) => (method::REGROUP, named.encode()),
+        Op::Restore { device, kit } => (method::RESTORE, (device.clone(), kit.clone()).encode()),
     }
 }
 
@@ -142,13 +142,13 @@ impl DeviceGroup {
                     && *matures >= at.saturating_add(delay);
                 (name, arguments, allowed)
             }
-            Act::Veto(op) => ("veto", op.encode(), matches!(by, Signer::Device(_))),
-            Act::Cosign(op) => ("cosign", op.encode(), true),
-            Act::Resolve { op, upheld } => ("resolve", (*op, *upheld).encode(), true),
+            Act::Veto(op) => (method::VETO, op.encode(), matches!(by, Signer::Device(_))),
+            Act::Cosign(op) => (method::COSIGN, op.encode(), true),
+            Act::Resolve { op, upheld } => (method::RESOLVE, (*op, *upheld).encode(), true),
         };
         let holds = self.holds(by, &call.origin, at);
         let evidence = if allowed
-            && call.method == method_id(name)
+            && call.method == name.0
             && call.arguments == arguments
             && holds != Holds::No
         {

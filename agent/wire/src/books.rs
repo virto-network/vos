@@ -14,6 +14,35 @@ use alloc::vec::Vec;
 
 use scale::{Decode, Encode};
 
+/// The credential book's handlers.
+pub mod credential_book {
+    methods! {
+        JOIN = "join";
+        LEAVE = "leave";
+        HANDLE = "handle";
+        UNHANDLE = "unhandle";
+        PIN = "pin";
+        UNPIN = "unpin";
+        MEMBER_OF = "member_of";
+        SPACES = "spaces";
+        HANDLES = "handles";
+        PINS = "pins";
+    }
+}
+
+/// The device book's handlers.
+pub mod device_book {
+    methods! {
+        LABEL = "label";
+        UNLABEL = "unlabel";
+        SET = "set";
+        UNSET = "unset";
+        LABEL_OF = "label_of";
+        LABELS = "labels";
+        SETTINGS = "settings";
+    }
+}
+
 /// The most bytes a space's name, a pinned method's, or a guard's scope
 /// takes; none is empty.
 pub const NAME_BYTES: usize = 64;

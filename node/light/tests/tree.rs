@@ -111,10 +111,10 @@ impl Writes {
             changes: self.changes[from.min(length)..(from + 4).min(length)].to_vec(),
             length: length as u64,
         };
-        let body = if query.method == MethodId(vos_light::method_id("feed")) {
+        let body = if query.method == vos_wire::credentials::method::FEED {
             page(u64::decode_exact(&query.arguments).unwrap() as usize).encode()
         } else {
-            assert_eq!(query.method, MethodId(vos_light::method_id("feed_after")));
+            assert_eq!(query.method, vos_wire::credentials::method::FEED_AFTER);
             let root = <[u8; 32]>::decode_exact(&query.arguments).unwrap();
             self.changes
                 .iter()
@@ -352,7 +352,7 @@ fn the_feed_is_read_on_its_own_timer() {
     assert_eq!(keeper.period(), TreeKeeper::MIN_PERIOD_MS);
     assert_eq!(
         query_of(&keeper),
-        (MethodId(vos_light::method_id("feed")), 0u64.encode()),
+        (vos_wire::credentials::method::FEED, 0u64.encode()),
         "refused proof after proof with no change read between: read from the start"
     );
     keeper.ingest(&answer(&writes.page(0, end)), 2_000).unwrap();

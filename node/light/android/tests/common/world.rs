@@ -736,7 +736,7 @@ impl State {
             &call.message(&space.identity),
             &call.signature,
         );
-        assert_eq!(call.method.0, vos_light::method_id("claim_open"));
+        assert_eq!(call.method.0, vos_wire::credentials::method::CLAIM_OPEN.0);
         let (member, nonce) = <([u8; 32], u64)>::decode_exact(&call.arguments).unwrap();
         assert!(vos_wire::credentials::meets(
             &vos_wire::credentials::open_work(&space.handle, &member, &[3; 32], nonce),

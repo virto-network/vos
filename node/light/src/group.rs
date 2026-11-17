@@ -594,7 +594,7 @@ impl Made {
     }
 
     fn vetoes_any(&self) -> bool {
-        self.method == crate::call::method_id("veto")
+        self.method == vos_wire::personal::method::VETO.0
     }
 }
 

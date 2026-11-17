@@ -125,9 +125,9 @@ impl Gateway {
                 length: feed.len() as u64,
             }
         };
-        if query.method.0 == vos_light::method_id("feed") {
+        if query.method == vos_wire::credentials::method::FEED {
             page(u64::decode_exact(&query.arguments).expect("a place")).encode()
-        } else if query.method.0 == vos_light::method_id("feed_after") {
+        } else if query.method == vos_wire::credentials::method::FEED_AFTER {
             let root = <[u8; 32]>::decode_exact(&query.arguments).expect("a root");
             feed.iter()
                 .rposition(|change| change.root.root == root)

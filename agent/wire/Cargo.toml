@@ -14,6 +14,9 @@ vos-tree = { workspace = true }
 # BLAKE2b-256 of a whole buffer: the credential actor's scopes, bindings,
 # open claims, and the personal agent's ids.
 vos-pvm-precompiles = { workspace = true }
+# The method ids of the stock actors' handlers, derived from their names
+# at build time as the actors' own.
+vos-sdk-macros = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"

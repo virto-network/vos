@@ -42,14 +42,8 @@ pub struct Reply {
 impl Reply {
     /// The handler's answer: its reply, or `Personal`'s error.
     pub fn answer<T: Decode>(&self) -> Result<T, PersonalError> {
-        match &self.outcome {
-            Outcome::Done(bytes) => Ok(T::decode_exact(bytes).expect("the reply decodes")),
-            Outcome::Failed {
-                code: Failure::Handler,
-                detail,
-            } => Err(PersonalError::decode_exact(detail).expect("the error decodes")),
-            other => panic!("{other:?}"),
-        }
+        vos_light::wire::answer(&self.outcome)
+            .unwrap_or_else(|_| panic!("{:?}", self.outcome))
     }
 
     /// Whether `Personal` refused the call with `Settling`: what fell due

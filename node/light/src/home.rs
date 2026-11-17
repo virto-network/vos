@@ -23,9 +23,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use vos_abi::credentials::Digest as Bytes;
-use vos_abi::ids::InstanceId;
+use vos_abi::ids::{InstanceId, MethodId};
 use vos_abi::{Decode, Encode};
 use vos_wire::credentials::{meets, open_work};
+use vos_wire::homes;
 use vos_wire::personal::{Body, Entry, Kit, NewDevice};
 use zeroize::Zeroize;
 
@@ -61,12 +62,17 @@ impl Home {
         nullifier(secret, &self.space, self.agent, self.homes.0)
     }
 
-    fn call(&self, method: &str, arguments: Vec<u8>, expires_ms: u64) -> Result<Call, DeviceError> {
+    fn call(
+        &self,
+        method: MethodId,
+        arguments: Vec<u8>,
+        expires_ms: u64,
+    ) -> Result<Call, DeviceError> {
         Call::new(
             self.space,
             self.agent,
             self.homes.0,
-            call::method_id(method),
+            method.0,
             arguments,
             expires_ms,
         )
@@ -87,7 +93,7 @@ pub fn open_claim(
         home.agent,
         &home.identity,
         home.credentials.0,
-        "claim_open",
+        vos_wire::credentials::method::CLAIM_OPEN,
         (*member, nonce).encode(),
         now,
     )
@@ -236,7 +242,7 @@ impl Claim {
         let mut arguments = self.0.device.encode();
         self.0.kit.encode_to(&mut arguments);
         self.0.agent.encode_to(&mut arguments);
-        let call = home.call("claim", arguments.clone(), expires_ms);
+        let call = home.call(homes::method::CLAIM, arguments.clone(), expires_ms);
         arguments.zeroize();
         call
     }
@@ -347,7 +353,7 @@ impl Prover {
         call: &Call,
         program: &DeviceProgram,
     ) -> Result<Proven, DeviceError> {
-        if call.method != call::method_id("claim") {
+        if call.method != homes::method::CLAIM.0 {
             return Err(DeviceError::Reserved);
         }
         self.prove_in_scope(secret, witness, SCOPE, call, program)
