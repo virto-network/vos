@@ -693,7 +693,8 @@ last for decades.**
 
   Its engagement is open (`open.md`). No value rides on a proof before
   it.
-- **The Stwo fork, as pinned** [built]: olanod/stwo at `e14925a8`, a chain
+- **The Stwo fork, as pinned** [built]: olanod/stwo at `e14925a8` (the
+  fork's tag `vos-1`), a chain
   of branches, each a divergence from upstream with its own tests:
   - `vos/wrap` (`ab294189`): the Blake2b-256 channel (§3.5), FRI fold
     step above 1 with the first round folding by `2^fold_step`

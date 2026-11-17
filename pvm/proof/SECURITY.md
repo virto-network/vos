@@ -487,7 +487,9 @@ two degenerate DEEP lines (the fork's unit tests).
 
 ## The Stwo fork's open divergences
 
-The workspace pins olanod/stwo at `e14925a8` (`vos/neon-compress16`:
+The workspace pins olanod/stwo at `e14925a8`, the fork's annotated tag
+`vos-1`, so the revision stays reachable whatever its branches do
+(`vos/neon-compress16`:
 Blake2s's 16-lane compression run as four NEON groups of four on
 aarch64, its words unchanged, on `vos/simd-m31-reduce`'s `9e9b4ff6`: the
 SIMD backend's Blake2s-M31 digest words reduced canonically over the whole
@@ -825,8 +827,7 @@ Who performs it, and when, is open.
 ## Reporting issues
 
 Report soundness and verifier-DoS bugs privately, never in a public
-issue: **[the owner supplies the private contact address here before
-release]**. Interpreter divergences from the Gray Paper are proving bugs
+issue: write to contact@virto.team. Interpreter divergences from the Gray Paper are proving bugs
 (the tracer drives the interpreter) and are reported the same way.
 
 ## Stability
