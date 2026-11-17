@@ -31,7 +31,7 @@ reference shape, from the security tool (`src/security.rs`):
 |---|---|---|---|---|---|
 | 41 | segments, the shared chip set (the Poseidon2 call among a node kernel's) | Poseidon2-M31 | 104 / 62.81 | 100 / 60 | admitted |
 | 32 | leaves and folds | Poseidon2-M31 | 108 / 63 | 100 / 60 | internal (`Status::Internal`): proved and verified inside the recursion, refused by every outside verifier |
-| 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 146 / 82.70 | 100 / 80 | admitted: what venues accept |
+| 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 106 / 65.80 | 104 / 63 | admitted: what venues accept |
 | 47 | device proofs, masked (variant (c)), `h = 256`, the per-program CPU and the word ledger | Blake2s-M31 | 110 / 62.82 | 100 / 60 | admitted: proven calls at a space's ingress, a device kernel's run each |
 
 - **Conjectured** bits are PoW plus queries times log blowup (the ethSTARK
@@ -73,7 +73,7 @@ reference shape, from the security tool (`src/security.rs`):
   only an x87 FPU (an `i586` target) would not, and nothing builds for one.
 
 **End to end, the proven bound is the weakest inner format's: 62.81 bits,
-not the wrap's 82.6.** Forging a leaf's segment forges the statement. The
+not the wrap's 65.80.** Forging a leaf's segment forges the statement. The
 conjectured bound is 104. Under Grover's heuristic that is about 31 proven
 and 52 conjectured bits against a quantum prover: post-quantum readiness
 rests on the conjectured count.
@@ -171,7 +171,7 @@ from its side note.
 - **The wrap's verifier pins its own circuit.** `vos-pvm-final-verifier`
   holds the wrap's preprocessed root, its log sizes and format 39's
   configuration as constants (the DEEP batching from the format, never
-  from the proof). It refuses bytes over 256 KiB, a non-canonical or
+  from the proof). It refuses bytes over 140 KiB (the layout's longest proof, 140,356 bytes), a non-canonical or
   trailing encoding, and a proof whose shape (trees, samples,
   decommitments, queried values, every column's samples against its
   component's mask) is not the wrap's, all before any Stwo call. It mixes
@@ -514,8 +514,8 @@ panic-freedom does:
   circle fold as its own round would differ by about 0.8 bits on the fold
   term. Format 39's FRI tests `2^17`, so its rounds are `[3, 3, 3, 2]` to
   the `2^6` last layer; its fold term sits 0.19 bits
-  above its batching term (82.98 against 82.79). Under the other model the
-  fold term would bind first, at about 82.2, still above 80. The round
+  above its batching term (66.05 against 65.86). Under the other model the
+  fold term would bind first, at about 65.3, still above its floor, 63. The round
   list the tool counts must equal the one the fork's `FriVerifier::commit`
   derives from the largest column.
 - **DIVERGENCE-012:** affine DEEP batching, opt-in per format (39),
@@ -523,15 +523,14 @@ panic-freedom does:
   batching* (`pcs.py`'s `_get_batching_error`, `johnson_bound.py`'s
   `get_error_linear`) and cites only BCHKS25; the BCIKS20 names are ours,
   so the audit checks that Theorem 1.6's correlated agreement for affine
-  spaces carries BCHKS25 Theorem 4.2's improved `ε_lin`. It carries the
-  wrap from 76.98 to 82.70 proven bits, and needs a cryptographer's review
-  of the citation and the count: if it is wrong, the wrap is at 76.98,
-  below its 80-bit floor (the end-to-end bound, 62.81, is the inner
-  formats' either way).
+  spaces carries BCHKS25 Theorem 4.2's improved `ε_lin`. It needs a
+  cryptographer's review of the citation and the count. At 16 queries
+  format 39 does not rest on it: batched by powers the wrap counts 65.33
+  proven bits, against 65.80 batched affinely, both above its floor, 63
+  (and the end-to-end bound, 62.81, is the inner formats' either way).
   - **What it holds:** batched by powers, the batching term caps 39 at
-    76.98 (74.48 at blowup 64), at its 538 batched values, and at blowup
-    64 with 20 queries under masking that term is the one that binds
-    (81.74).
+    76.98 (74.48 at blowup 64), at its 538 batched values, however many
+    queries are taken.
   - **Its premise in the masked transcript:** every batched function, the
     masked columns' quotients, the FRI mask's and the blinding columns'
     among them, is committed and every sample mixed before the affine
@@ -612,9 +611,10 @@ Its count is the security tool's under (c):
   term takes `k = 2N`, `d = 3` and a factor 2 for `π(z)`, and every other
   formula stays. The salts enter no term (Blake2b-256's collision resistance, which the tool does
   not model, binds them as it binds every tree).
-- **146 / 82.70** at 24 queries, PoW 26, the query term binding at
-  `m = 5`; 23 queries is the least that clears 80 (80.84). The DEEP term
-  is 97.68, ALI 108.38, logup 111.60: the interaction PoW does not bind.
+- **106 / 65.80** at 16 queries, PoW 26, the query term binding at
+  `m = 57`; 16 queries is the least that clears its floor, 104 / 63 (15
+  count 101 / 63, 63.37). The DEEP term is 94.17, ALI 104.87, logup
+  111.60: the interaction PoW does not bind.
 - **Derived, not cited:** the DEEP term's three (c) inputs (`k = 2N`,
   `d = 3`, the factor `2^j`), against Theorem 8 of eprint 2022/1216 with
   the AIR at level `m+1`, the composition at `π(z)` and lifted columns of
@@ -626,7 +626,7 @@ Its count is the security tool's under (c):
   analyses the lifted variant.
 - **The integer multiplicity:** counts are taken at the best integer
   `m ≥ 3`, as soundcalc takes them, so a small parameter move jumps the
-  count (23 queries 80.84, 24 82.70).
+  count (15 queries 63.37, 16 65.80).
 - **The reference shape** counts R2's blinding (12 main and 8 interaction
   columns, 2 constraints, a fraction a row a component) and the FRI mask's
   8 columns as designed, and the batch exactly: 538 values, one a sampled

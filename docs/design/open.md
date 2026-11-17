@@ -146,8 +146,9 @@ The scale results are in `core-model.md` §14, "The scale test".
   can carry state into logs; the fix is the variant alone and a static
   panic message with its place, checked by one audited run of a faulting
   kernel.
-- **The Stwo fork's divergence citation** behind format 39 needs a
-  cryptographer's review; if it falls, the masked wrap takes a new number.
+- **The Stwo fork's divergence citation** behind the affine DEEP batching
+  of formats 39 and 47 needs a cryptographer's review; format 39's floor
+  holds without it (65.33 proven bits batched by powers).
 - **The Blake2b host hook** (`0x400`, Kreivo's `blake2_256`) for the final
   verifier, deferred until a venue's compute weight binds.
 - **The segment format's `component_mask`:** format 41's header mixes no
@@ -195,6 +196,12 @@ The scale results are in `core-model.md` §14, "The scale test".
   panic on values their callers validate, and `vos-pvm-codec`'s bound of
   a decoded `Vec` by items, not bytes: one line each, at the next re-pin
   of the node's programs.
+- **Stwo's `hashbrown` requirement** is open (`>=0.15.2`), so a
+  workspace whose graph holds a newer `hashbrown` re-resolves Stwo onto
+  it: the fuzz targets run Stwo on `hashbrown 0.17.1` (`foldhash 0.2`)
+  where the root, the kit and the Wasm blob run it on `0.15.5`
+  (`tools/gates/locks.py`'s `DRIFT` names the edge). Bounding the
+  requirement in the fork closes it, at its next pin.
 - **The kit's lock:** shipping the lock VOS's `check-kit` builds on beside
   the kit, with a command listing every package of the verify graph a
   consumer resolves at another version; and signed release tags with a
