@@ -12,7 +12,7 @@ use vos_abi::abi::AttestError;
 use vos_abi::ids::MapId;
 use vos_abi::keys::{self, Transform};
 use vos_abi::vos_anchor::{VenueId, space_id};
-use vos_statement::{ProgramId, Statement};
+use vos_statement::Statement;
 use vos_testkit::programs::table_tag;
 use vos_tree::{Blake2b, Hasher};
 
@@ -137,7 +137,7 @@ fn a_balance_is_accepted_at_the_model_venue() {
     totals.report("balance");
     eprintln!("balance: {segments} segments");
 
-    let program = ProgramId(program.id().words());
+    let program = program.id();
     let statement = cut::masked_statement(&attest, program, cut.space);
     let venue = Venue::pinned(VenueId([0x7e; 32]), &[genesis(1)], program);
     venue.anchor(&root).expect("anchored");

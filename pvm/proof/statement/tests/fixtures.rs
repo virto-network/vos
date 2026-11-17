@@ -131,8 +131,8 @@ fn a_proof_too_long_is_refused_before_its_lookup() {
     assert_eq!(report.verdict, jam::REJECT);
     assert_eq!(report.gas[1], 0, "no lookup");
 
-    let words = vos_pvm_final_verifier::Statement {
-        program: valid.input.program.0,
+    let words = vos_pvm_final_verifier::PublicWords {
+        program: valid.input.program,
         io_hash: valid.input.statement.io_hash(),
     }
     .words();

@@ -48,7 +48,7 @@ use stwo::core::vcs_lifted::blake2b_merkle::Blake2bMerkleChannel;
 use vos_pvm_final_verifier::masked::{self, FRI_ROUNDS, MASKED_WRAP, verify_with};
 use vos_pvm_final_verifier::masking::{MaskedFormat, fri_rounds, shape_of, verifier_format};
 use vos_pvm_final_verifier::{
-    Error, MAX_PROOF_BYTES, PREPROCESSED_ROOT_39, PUBLIC_WORDS, Statement, WrapProof,
+    Error, MAX_PROOF_BYTES, PREPROCESSED_ROOT_39, PUBLIC_WORDS, PublicWords, WrapProof,
 };
 use vos_pvm_proof::format::{self, ProofBytes, Status};
 use vos_pvm_recair::wrap::{self, WrapCircuit};
@@ -104,7 +104,7 @@ fn layout() -> WrapComponents {
 }
 
 /// `verify` run, a panic caught and reported as one.
-fn refusal(verify: impl FnOnce() -> Result<Statement, Error>) -> Result<Error, &'static str> {
+fn refusal(verify: impl FnOnce() -> Result<PublicWords, Error>) -> Result<Error, &'static str> {
     match catch_unwind(AssertUnwindSafe(verify)) {
         Ok(Ok(_)) => Err("accepted"),
         Ok(Err(error)) => Ok(error),
@@ -156,7 +156,7 @@ fn the_masked_wrap_verifies_under_the_registrys_entry() {
     assert!(masked.bytes.len() < MAX_PROOF_BYTES);
     let decoded = masked::decode(&masked.bytes).expect("decodes");
     assert_eq!(masked::encode(&decoded), Some(masked.bytes.clone()));
-    let statement = Statement::from_words(&masked.words).unwrap();
+    let statement = PublicWords::from_words(&masked.words).unwrap();
     assert_eq!(
         masked::verify_bytes(&masked.bytes, &masked.words).expect("verifies"),
         statement

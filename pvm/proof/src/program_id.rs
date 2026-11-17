@@ -48,6 +48,8 @@ use alloc::vec::Vec;
 use stwo::core::fields::m31::BaseField;
 use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 
+pub use vos_pvm_final_verifier::ProgramId;
+
 use crate::format::ChannelKind;
 use crate::pcs::Commitment;
 use crate::poseidon2::{P2Hash, P2MerkleHasher, u32_limbs};
@@ -64,26 +66,6 @@ pub const MAX_LEAF_CIRCUITS: usize = MAX_CLASSES;
 
 /// The words of an id's preimage.
 pub const ID_WORDS: usize = 8 + 4 + 8 * MAX_LEAF_CIRCUITS;
-
-/// A kernel's program id: eight M31 words.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ProgramId(pub [BaseField; 8]);
-
-impl ProgramId {
-    /// Its words as integers: the form a statement names it in.
-    pub fn words(&self) -> [u32; 8] {
-        self.0.map(|word| word.0)
-    }
-
-    /// The 32-byte form: each word as four little-endian bytes.
-    pub fn to_bytes(&self) -> [u8; 32] {
-        let mut bytes = [0u8; 32];
-        for (chunk, word) in bytes.chunks_exact_mut(4).zip(&self.0) {
-            chunk.copy_from_slice(&word.0.to_le_bytes());
-        }
-        bytes
-    }
-}
 
 /// The leaf circuits' slot.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -146,7 +128,7 @@ impl IdPreimage {
 
     /// The id it hashes to.
     pub fn id(&self) -> ProgramId {
-        ProgramId(leaf_sponge(&self.words()).0)
+        ProgramId::from(leaf_sponge(&self.words()).0)
     }
 }
 
@@ -361,14 +343,14 @@ impl KernelProgram {
 mod tests {
     use super::*;
     use crate::chip_idx;
-    use crate::shape::SegmentClass;
+    use crate::shape::ClassShape;
     use alloc::vec;
 
     /// A program whose every field differs from its neighbours'.
     fn program() -> KernelProgram {
         let components = chip_idx::ALWAYS | 1 << chip_idx::MUL | 1 << chip_idx::COMPARE;
         let chips = components.count_ones() as usize;
-        let class = |log_steps: u8| SegmentClass {
+        let class = |log_steps: u8| ClassShape {
             log_steps,
             pages: 8,
             log_sizes: (0..chips as u8).map(|chip| 4 + chip % 13).collect(),
@@ -432,7 +414,7 @@ mod tests {
         assert_eq!(id[..8], program.kernel_digest().0);
         assert!(id[8..].iter().all(|&word| word == BaseField::from(0)));
         assert_eq!(
-            program.id().words(),
+            program.id().0,
             [
                 355615325, 1545380536, 453447273, 279479272, 1435617632, 1368078553, 1372432483,
                 1394946262
@@ -470,7 +452,7 @@ mod tests {
             2
         ]);
         assert_eq!(program.kernel_digest().0, sponge(&program.kernel_words()));
-        assert_eq!(program.id().0, sponge(&program.id_preimage().words()));
+        assert_eq!(program.id().felts(), sponge(&program.id_preimage().words()));
     }
 
     /// Every field reaches the id.

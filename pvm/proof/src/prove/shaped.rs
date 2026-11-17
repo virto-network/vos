@@ -9,7 +9,7 @@ use crate::format::Format;
 use crate::framework::MachineProverComponent;
 use crate::pcs::Commitment;
 use crate::proof::Proof;
-use crate::shape::{KernelShape, SegmentShape};
+use crate::shape::{KernelShape, ProofShape};
 use crate::side_note::SideNote;
 
 /// The chips `components` selects, in chip order.
@@ -20,7 +20,7 @@ fn selected(components: u32) -> Vec<&'static dyn MachineProverComponent> {
 }
 
 /// Whether `shape` names chips of the segment AIR, a log size each.
-fn check(shape: &SegmentShape) -> Result<(), SegmentError> {
+fn check(shape: &ProofShape) -> Result<(), SegmentError> {
     if shape.components & !crate::chip_idx::ALL != 0
         || shape.components.count_ones() as usize != shape.log_sizes.len()
     {
@@ -36,7 +36,7 @@ fn check(shape: &SegmentShape) -> Result<(), SegmentError> {
 /// the segment AIR.
 pub fn prove_shaped(
     side_note: &mut SideNote,
-    shape: &SegmentShape,
+    shape: &ProofShape,
     format: &'static Format,
 ) -> Result<Proof, SegmentError> {
     check(shape)?;
@@ -60,7 +60,7 @@ pub fn prove_shaped(
 /// or a malformed or empty shape.
 pub fn program_commitment_for_shape(
     side_note: &SideNote,
-    shape: &SegmentShape,
+    shape: &ProofShape,
     format: &'static Format,
 ) -> Option<Commitment> {
     use crate::pcs::ProofHash;

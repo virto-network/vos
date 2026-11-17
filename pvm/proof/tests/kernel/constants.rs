@@ -35,7 +35,7 @@ pub fn program_id(actor: &str, name: &str) -> [u32; 8] {
         &SEGMENT,
     )
     .expect("the kernel's program");
-    program.id().words()
+    program.id().0
 }
 
 /// Each constant is what its source computes, the wrap's root the final

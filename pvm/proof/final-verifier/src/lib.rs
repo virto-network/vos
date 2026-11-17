@@ -93,14 +93,45 @@ pub struct WrapProof {
     pub stark_proof: StarkProof<Blake2bMerkleHasher>,
 }
 
-/// What a wrap proof states: the program id and the io-hash.
+/// A kernel's program id (`proving.md` §3.6): eight M31 words, each below
+/// `p`. The one type of the value: the prover computes it
+/// (`vos_pvm_proof::program_id`), the wrap's public words carry it
+/// ([`PublicWords`]), a statement names it and a venue pins it
+/// (`vos-statement`, which re-exports it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ProgramId(pub [u32; 8]);
+
+impl ProgramId {
+    /// The 32-byte form: each word as four little-endian bytes.
+    pub fn to_bytes(&self) -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        for (chunk, word) in bytes.chunks_exact_mut(4).zip(&self.0) {
+            chunk.copy_from_slice(&word.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// Its words as field elements, the form a fold recomputes it in.
+    pub fn felts(&self) -> [BaseField; 8] {
+        self.0.map(BaseField::from_u32_unchecked)
+    }
+}
+
+impl From<[BaseField; 8]> for ProgramId {
+    /// The id of eight field words, each canonical.
+    fn from(felts: [BaseField; 8]) -> Self {
+        Self(felts.map(|felt| felt.0))
+    }
+}
+
+/// What a wrap proof's public words state: the program id and the io-hash.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Statement {
-    pub program: [u32; 8],
+pub struct PublicWords {
+    pub program: ProgramId,
     pub io_hash: [u8; 32],
 }
 
-impl Statement {
+impl PublicWords {
     /// Its 24 public words: the program id, then the io-hash's bytes in
     /// pairs, `b0 + 256·b1`.
     pub fn words(&self) -> [u32; PUBLIC_WORDS] {
@@ -109,13 +140,16 @@ impl Statement {
             .iter()
             .map(|&pair| u32::from(u16::from_le_bytes(pair)));
         let mut words = [0; PUBLIC_WORDS];
-        for (word, value) in words.iter_mut().zip(self.program.into_iter().chain(limbs)) {
+        for (word, value) in words
+            .iter_mut()
+            .zip(self.program.0.into_iter().chain(limbs))
+        {
             *word = value;
         }
         words
     }
 
-    /// The statement whose words are `words`: each program word below `p`,
+    /// The public words `words` decoded: each program word below `p`,
     /// each io-hash limb below 2^16.
     pub fn from_words(words: &[u32; PUBLIC_WORDS]) -> Result<Self, Error> {
         let (program, limbs) = words.split_first_chunk::<8>().ok_or(Error::PublicWords)?;
@@ -130,7 +164,7 @@ impl Statement {
                 .to_le_bytes();
         }
         Ok(Self {
-            program: *program,
+            program: ProgramId(*program),
             io_hash,
         })
     }
@@ -232,8 +266,8 @@ impl Decoded {
     }
 
     /// Verifies the proof under its format against the public `words`, and
-    /// returns the statement they make.
-    pub fn verify(self, words: &[u32; PUBLIC_WORDS]) -> Result<Statement, Error> {
+    /// returns what they state.
+    pub fn verify(self, words: &[u32; PUBLIC_WORDS]) -> Result<PublicWords, Error> {
         match self.format {
             masked::FORMAT => masked::verify(self.proof, words),
             _ => Err(Error::Format),
@@ -258,13 +292,13 @@ pub fn decode(format: u32, accepted: &[u32], bytes: &[u8]) -> Result<Decoded, Er
 
 /// Verifies the proof in `bytes` under `format`, the statement's, against
 /// the public `words` ([`decode`], then [`Decoded::verify`]), and returns
-/// the statement they make.
+/// what they state.
 pub fn verify(
     format: u32,
     accepted: &[u32],
     bytes: &[u8],
     words: &[u32; PUBLIC_WORDS],
-) -> Result<Statement, Error> {
+) -> Result<PublicWords, Error> {
     decode(format, accepted, bytes)?.verify(words)
 }
 
@@ -310,24 +344,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_statements_words_round_trip() {
-        let statement = Statement {
-            program: core::array::from_fn(|i| 1_000 + i as u32),
+    fn public_words_round_trip() {
+        let public = PublicWords {
+            program: ProgramId(core::array::from_fn(|i| 1_000 + i as u32)),
             io_hash: core::array::from_fn(|i| (7 * i + 3) as u8),
         };
-        let words = statement.words();
+        let words = public.words();
         assert_eq!(words[8], 3 | 10 << 8);
-        assert_eq!(Statement::from_words(&words).unwrap(), statement);
+        assert_eq!(PublicWords::from_words(&words).unwrap(), public);
         let mut wide = words;
         wide[9] = 1 << 16;
         assert!(matches!(
-            Statement::from_words(&wide),
+            PublicWords::from_words(&wide),
             Err(Error::PublicWords)
         ));
         let mut beyond = words;
         beyond[0] = P;
         assert!(matches!(
-            Statement::from_words(&beyond),
+            PublicWords::from_words(&beyond),
             Err(Error::PublicWords)
         ));
     }

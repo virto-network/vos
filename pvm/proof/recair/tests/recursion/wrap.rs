@@ -24,7 +24,7 @@ use std::time::Instant;
 use stwo::core::fields::m31::{BaseField, P};
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::vcs::blake2b_hash::Blake2bHash;
-use vos_pvm_final_verifier::{Error, PUBLIC_WORDS, Statement, WrapProof, masked};
+use vos_pvm_final_verifier::{Error, PUBLIC_WORDS, ProgramId, PublicWords, WrapProof, masked};
 use vos_pvm_proof::Proof;
 use vos_pvm_proof::format::SEGMENT;
 use vos_pvm_proof::kernel::trace_kernel;
@@ -69,7 +69,7 @@ fn program_of(leaves: &[LeafCircuit], kernel: u32) -> IdPreimage {
 }
 
 fn id(program: &IdPreimage) -> P2Hash {
-    P2Hash(program.id().0)
+    P2Hash(program.id().felts())
 }
 
 impl Run {
@@ -131,7 +131,7 @@ impl Run {
 pub(crate) struct Wrapped {
     pub(crate) proof: WrapProof,
     pub(crate) words: [u32; PUBLIC_WORDS],
-    pub(crate) statement: Statement,
+    pub(crate) statement: PublicWords,
 }
 
 /// The seed the tests' wraps are masked from.
@@ -269,7 +269,7 @@ fn a_one_segment_run_wraps_through_its_leaf() {
     let output = &one.root.output;
     assert!(output.entry && output.halt && output.first == 0);
     let statement = one.wrapped.statement;
-    assert_eq!(statement.program, id(&one.run.program).0.map(|word| word.0));
+    assert_eq!(statement.program, ProgramId::from(id(&one.run.program).0));
     let io = common::kernel::IO;
     let registers: [u64; 13] = core::array::from_fn(|i| match i {
         9..=11 => u64::from(io[i - 9]),
@@ -308,7 +308,10 @@ fn a_tree_root_wraps() {
     assert!(root.output.entry && root.output.halt);
     assert_eq!((root.output.first, root.output.last), (0, 3));
     let wrapped = wrapped(&root, &run.program, "four segments");
-    assert_eq!(wrapped.statement.program, id(&run.program).0.map(|w| w.0));
+    assert_eq!(
+        wrapped.statement.program,
+        ProgramId::from(id(&run.program).0)
+    );
     assert_eq!(
         wrapped.statement.io_hash,
         one_segment().wrapped.statement.io_hash

@@ -237,7 +237,7 @@ fn failed(error: &TreeError) -> &'static str {
 impl Prover for MaskedProver {
     fn program(&self, kernel: &[u8]) -> Result<ProgramId, StatementError> {
         let program = self.kernel(kernel)?;
-        Ok(ProgramId(program.0.id().words()))
+        Ok(program.0.id())
     }
 
     fn prove(&self, kernel: &[u8], attest: &Attest) -> Result<Vec<u8>, StatementError> {

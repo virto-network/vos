@@ -91,9 +91,14 @@ impl From<ShapeError> for stwo::core::verifier::VerificationError {
     }
 }
 
-/// A class of segment.
+/// A class of segment as the prover and verifier pin it: its cut, and the
+/// log size of each chip of the shape alone, in chip order (the form the
+/// program id hashes). A kernel's record holds the same class at a fixed
+/// size, a slot for every chip of the AIR
+/// (`vos_abi::records::SegmentClass`), read into this one by
+/// `KernelShape`'s `TryFrom` of the record's shape (feature `abi`).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SegmentClass {
+pub struct ClassShape {
     /// At most 2^`log_steps` steps a segment.
     pub log_steps: u8,
     /// At most this many pages touched a segment.
@@ -108,13 +113,13 @@ pub struct KernelShape {
     /// Bit i: chip i ([`chip_idx`]).
     pub components: u32,
     /// Cheapest first, at most [`MAX_CLASSES`].
-    pub classes: Vec<SegmentClass>,
+    pub classes: Vec<ClassShape>,
 }
 
 /// One segment's shape: its chips, and each one's log size in chip order,
 /// as a proof carries them (`Proof::component_mask`, `Proof::log_sizes`).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SegmentShape {
+pub struct ProofShape {
     pub components: u32,
     pub log_sizes: Vec<u32>,
 }
@@ -164,8 +169,8 @@ impl KernelShape {
     }
 
     /// Class `index`'s segment shape.
-    pub fn segment(&self, index: usize) -> Option<SegmentShape> {
-        self.classes.get(index).map(|class| SegmentShape {
+    pub fn segment(&self, index: usize) -> Option<ProofShape> {
+        self.classes.get(index).map(|class| ProofShape {
             components: self.components,
             log_sizes: class
                 .log_sizes
@@ -233,7 +238,7 @@ impl TryFrom<&vos_abi::records::Shape> for KernelShape {
             classes: record
                 .classes
                 .iter()
-                .map(|class| SegmentClass {
+                .map(|class| ClassShape {
                     log_steps: class.log_steps,
                     pages: class.pages,
                     log_sizes: class
@@ -262,12 +267,12 @@ mod tests {
         KernelShape {
             components,
             classes: vec![
-                SegmentClass {
+                ClassShape {
                     log_steps: 12,
                     pages: 8,
                     log_sizes: vec![12; chips],
                 },
-                SegmentClass {
+                ClassShape {
                     log_steps: 15,
                     pages: 8,
                     log_sizes: vec![15; chips],

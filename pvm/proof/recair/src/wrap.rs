@@ -33,7 +33,7 @@ use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::vcs::blake2b_hash::Blake2bHash;
 use stwo::core::vcs_lifted::blake2b_merkle::{Blake2bMerkleChannel, Blake2bMerkleHasher};
-use vos_pvm_final_verifier::{PUBLIC_WORDS, Statement, WrapProof};
+use vos_pvm_final_verifier::{PUBLIC_WORDS, ProgramId, PublicWords, WrapProof};
 use vos_pvm_proof::format::{MASKED_WRAP, ProofBytes, lookup};
 use vos_pvm_proof::poseidon2::P2Hash;
 use vos_pvm_proof::program_id::{ID_WORDS, IdPreimage};
@@ -173,11 +173,11 @@ impl WrapCircuit {
         &self,
         root: Proved<'_>,
         program: &IdPreimage,
-    ) -> Result<(WrapValues<SecureField>, Statement), WitnessError> {
+    ) -> Result<(WrapValues<SecureField>, PublicWords), WitnessError> {
         let node = FoldChild::of(self.root, root, program, self.fold_word)?;
         let words = pack(&program.words());
-        let statement = Statement {
-            program: root.output.program.0.map(|word| word.0),
+        let statement = PublicWords {
+            program: ProgramId::from(root.output.program.0),
             io_hash: root.output.io_hash,
         };
         let values = WrapValues {

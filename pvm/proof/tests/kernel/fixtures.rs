@@ -501,7 +501,7 @@ mod statements {
         let midway = masked_wrap(&tail, &program, true);
 
         Proofs {
-            pinned: ProgramId(program.id().words()),
+            pinned: program.id(),
             valid,
             prefix,
             midway,

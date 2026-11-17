@@ -44,7 +44,7 @@ pub use vos_pvm_proof::format;
 pub use vos_pvm_proof::program_id::{
     ENTRY_TIMESTAMP, HALT_PC, KernelEntry, KernelProgram, LeafCircuits, ProgramId,
 };
-pub use vos_pvm_proof::shape::{KernelShape, SegmentClass};
+pub use vos_pvm_proof::shape::{ClassShape, KernelShape};
 
 use vos_pvm_proof::framework_access::{
     AllLookupElements, create_verifier_components, draw_all_lookup_elements,

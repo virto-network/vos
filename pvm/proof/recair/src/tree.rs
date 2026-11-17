@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use stwo::core::fields::qm31::SecureField;
-use vos_pvm_final_verifier::{PUBLIC_WORDS, Statement, WrapProof};
+use vos_pvm_final_verifier::{PUBLIC_WORDS, PublicWords, WrapProof};
 use vos_pvm_proof::format::SEGMENT;
 #[cfg(feature = "watch")]
 use vos_pvm_proof::pcs::ProofHash;
@@ -195,7 +195,7 @@ fn run_watched(
         ..Stats::default()
     };
     let started = Instant::now();
-    let id = P2Hash(program.id().0);
+    let id = P2Hash(program.id().felts());
     let fold_word = FoldCircuit::word();
     let mut circuits = BTreeMap::new();
     let mut nodes = Vec::with_capacity(segments.len());
@@ -311,7 +311,7 @@ pub fn fold(
 pub fn wrap(
     root: &Node,
     program: &IdPreimage,
-) -> Result<(WrapProof, Statement, [u32; PUBLIC_WORDS]), TreeError> {
+) -> Result<(WrapProof, PublicWords, [u32; PUBLIC_WORDS]), TreeError> {
     wrap_with(root, program, wrap::prove)
 }
 
@@ -320,7 +320,7 @@ pub fn wrap_with(
     root: &Node,
     program: &IdPreimage,
     prove: impl FnOnce(&Finalized<SecureField>) -> Result<WrapProof, CircuitError>,
-) -> Result<(WrapProof, Statement, [u32; PUBLIC_WORDS]), TreeError> {
+) -> Result<(WrapProof, PublicWords, [u32; PUBLIC_WORDS]), TreeError> {
     let circuit = WrapCircuit::get();
     let (values, statement) = circuit.values(root.proved(), program)?;
     let finalized = circuit.finalize(&values);
@@ -331,7 +331,7 @@ pub fn wrap_with(
 
 #[cfg(test)]
 mod tests {
-    use vos_pvm_proof::shape::{KernelShape, SegmentClass};
+    use vos_pvm_proof::shape::{ClassShape, KernelShape};
 
     use super::cut_class;
 
@@ -340,7 +340,7 @@ mod tests {
             components: 0,
             classes: classes
                 .iter()
-                .map(|&(log_steps, pages)| SegmentClass {
+                .map(|&(log_steps, pages)| ClassShape {
                     log_steps,
                     pages,
                     log_sizes: Vec::new(),

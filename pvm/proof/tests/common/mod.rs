@@ -381,7 +381,7 @@ pub fn prove_leaf(
 
     let leaf = LeafCircuit::of_class(program, entry, class);
     let (values, output) = leaf
-        .values(proof, P2Hash(program.id().0), fold_word, position)
+        .values(proof, P2Hash(program.id().felts()), fold_word, position)
         .expect("the segment's values");
 
     let mut transcript = vos_pvm_recair::Context::<SecureField>::new();
@@ -538,7 +538,7 @@ pub fn wrap_root(
     assert!(log_sizes.iter().all(|&log| log <= 17));
     let words = wrap::public_words(&finalized);
     assert_eq!(words, statement.words());
-    assert_eq!(statement.program, program.id().words());
+    assert_eq!(statement.program, program.id());
     assert_eq!(statement.io_hash, root.node.output.io_hash);
     let (bytes, proving, peak_mib) = masked_wrap(name, &finalized, &words);
     wrap.add(proving, peak_mib);

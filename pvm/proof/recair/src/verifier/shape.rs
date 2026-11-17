@@ -72,7 +72,9 @@ pub struct BoundaryTerms {
     pub positions: BoundaryChipPositions,
 }
 
-/// A segment verifier circuit's shape.
+/// A segment verifier circuit's shape (a leaf's verifier of one segment
+/// proof); the proof's own chips and log sizes are
+/// `vos_pvm_proof::shape::ProofShape`.
 pub struct SegmentShape {
     /// Its geometry: the trees, the samples, DEEP's plan, FRI's layers and
     /// the compiled constraints.

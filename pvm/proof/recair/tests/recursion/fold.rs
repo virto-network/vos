@@ -73,7 +73,7 @@ struct Tree {
 const CUTS: [(usize, usize); 4] = [(0, 1), (1, 3), (3, 5), (5, 6)];
 
 fn id(program: &IdPreimage) -> P2Hash {
-    P2Hash(program.id().0)
+    P2Hash(program.id().felts())
 }
 
 impl Run {

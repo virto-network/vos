@@ -41,7 +41,7 @@ use vos_pvm_proof::segment::{SegmentCursor, segment_bounds_budgeted};
 use vos_pvm_proof::{Proof, prove_kernel};
 use vos_pvm_proof_verifier::{verify_kernel_chain, verify_kernel_segment};
 use vos_statement::vos_pvm_final_verifier::Error as FinalError;
-use vos_statement::{ProgramId, Refusal, Statement};
+use vos_statement::{Refusal, Statement};
 use vos_tree::{Blake2b, Hasher};
 use vos_venue::{SubmitOutcome, VenueClient};
 
@@ -614,7 +614,7 @@ fn the_windows_leaves_and_folds_prove_and_verify() {
     assert_eq!((root.first, root.last), (0, leaves.len() as u32 - 1));
     assert!(root.entry && root.halt, "the whole run");
     assert_eq!(root.entry_digest, first.entry_digest);
-    assert_eq!(root.program.0, program.id().0);
+    assert_eq!(root.program.0, program.id().felts());
     assert_eq!(root.fold_word, word);
     assert_eq!(root.io_hash, trace.io_hash);
     assert_eq!(end.io_hash, trace.io_hash);
@@ -810,7 +810,7 @@ fn proved_window() -> (Statement, Vec<u8>, [u8; 32], [u8; 32]) {
         started.elapsed().as_secs_f64()
     );
 
-    let program = ProgramId(program.id().words());
+    let program = program.id();
     let statement = cut::masked_statement(&attest, program, space());
     (statement, proof, representative.root, missing.root)
 }

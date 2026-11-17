@@ -56,7 +56,7 @@ impl Golden {
     pub fn verify(
         &self,
         proof: vos_pvm_final_verifier::WrapProof,
-    ) -> Result<vos_pvm_final_verifier::Statement, vos_pvm_final_verifier::Error> {
+    ) -> Result<vos_pvm_final_verifier::PublicWords, vos_pvm_final_verifier::Error> {
         vos_pvm_final_verifier::masked::verify(proof, &self.words)
     }
 
@@ -83,8 +83,8 @@ fn of_fixture(name: &str) -> Golden {
         .find(|fixture| fixture.name == name)
         .unwrap_or_else(|| panic!("the fixture {name:?}"));
     let format = fixture.input.statement.format;
-    let words = vos_pvm_final_verifier::Statement {
-        program: fixture.input.program.0,
+    let words = vos_pvm_final_verifier::PublicWords {
+        program: fixture.input.program,
         io_hash: fixture.input.statement.io_hash(),
     }
     .words();

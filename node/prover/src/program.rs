@@ -51,7 +51,7 @@ pub fn program_id(elf: &[u8], method: &str) -> Result<[u32; 8], ProgramIdError> 
     let (program, _) =
         vos_pvm_recair::leaf::kernel_program(blob, record, derived.transpiler_version, &SEGMENT)
             .map_err(ProgramIdError::Kernel)?;
-    Ok(program.id().words())
+    Ok(program.id().0)
 }
 
 /// Why an actor's package gives no program id for a method: each the

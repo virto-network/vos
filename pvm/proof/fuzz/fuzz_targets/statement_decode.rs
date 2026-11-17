@@ -56,8 +56,8 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(id, statement.id());
     assert!(!input.policy.seen(&id));
 
-    let words = vos_statement::vos_pvm_final_verifier::Statement {
-        program: statement.program.0,
+    let words = vos_statement::vos_pvm_final_verifier::PublicWords {
+        program: statement.program,
         io_hash: statement.io_hash(),
     }
     .words();

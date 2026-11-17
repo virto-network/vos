@@ -1,7 +1,7 @@
 //! A segment proved over every chip of the segment AIR, each at the log size
 //! its rows take: the ones its run does not use at their fewest rows.
 
-use vos_pvm_proof::shape::SegmentShape;
+use vos_pvm_proof::shape::ProofShape;
 use vos_pvm_proof::{Proof, SideNote, chip_idx, format::Format};
 
 /// The segment `segment` makes, called once to size its chips and once to
@@ -24,7 +24,7 @@ pub fn prove_every_chip(segment: impl Fn() -> SideNote, format: &'static Format)
             }
         }
     }
-    let shape = SegmentShape {
+    let shape = ProofShape {
         components: chip_idx::ALL,
         log_sizes,
     };

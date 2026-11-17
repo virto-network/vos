@@ -121,32 +121,19 @@ pub const ID_DOMAIN: &[u8] = b"vos/statement/v1";
 /// accepts.
 pub const LINKED: &[u32] = vos_pvm_final_verifier::LINKED;
 
-/// A kernel's program id: eight M31 words, each below `p`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ProgramId(pub [u32; 8]);
+pub use vos_pvm_final_verifier::ProgramId;
 
-impl ProgramId {
-    /// The 32-byte form: each word as four little-endian bytes.
-    pub fn to_bytes(&self) -> [u8; 32] {
-        let mut bytes = [0u8; 32];
-        for (chunk, word) in bytes.chunks_exact_mut(4).zip(&self.0) {
-            chunk.copy_from_slice(&word.to_le_bytes());
+/// A program id's eight words (each four little-endian bytes), read from
+/// `reader`, a word at or past `p` refused.
+pub fn decode_program(reader: &mut Reader<'_>) -> Result<ProgramId, DecodeError> {
+    let mut words = [0u32; 8];
+    for word in &mut words {
+        *word = reader.u32()?;
+        if *word >= P {
+            return Err(DecodeError::Noncanonical);
         }
-        bytes
     }
-
-    /// A program id's eight words (each four little-endian bytes), read
-    /// from `reader`, a word at or past `p` refused.
-    pub fn decode_from(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
-        let mut words = [0u32; 8];
-        for word in &mut words {
-            *word = reader.u32()?;
-            if *word >= P {
-                return Err(DecodeError::Noncanonical);
-            }
-        }
-        Ok(Self(words))
-    }
+    Ok(ProgramId(words))
 }
 
 /// A statement's id, what a venue remembers it by.
@@ -208,7 +195,7 @@ impl Statement {
 
     pub(crate) fn decode_from(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
         let format = reader.u32()?;
-        let program = ProgramId::decode_from(reader)?;
+        let program = decode_program(reader)?;
         let space = SpaceId(reader.array()?);
         let public_args = reader.bytes()?;
         let output = reader.bytes()?;
@@ -409,8 +396,8 @@ pub fn admit(
     if venue.seen(&id) {
         return Err(Refusal::Repeated);
     }
-    let words = vos_pvm_final_verifier::Statement {
-        program: program.0,
+    let words = vos_pvm_final_verifier::PublicWords {
+        program: *program,
         io_hash,
     }
     .words();

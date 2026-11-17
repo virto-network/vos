@@ -187,7 +187,7 @@ impl Input {
     /// The input at the start of `bytes`, and the bytes it takes.
     pub fn decode_prefix(bytes: &[u8]) -> Result<(Self, usize), DecodeError> {
         let mut reader = Reader::new(bytes);
-        let program = ProgramId::decode_from(&mut reader)?;
+        let program = crate::decode_program(&mut reader)?;
         let now_ms = reader.u64()?;
         let count = reader.count(4)?;
         let formats = (0..count).map(|_| reader.u32()).collect::<Result<_, _>>()?;

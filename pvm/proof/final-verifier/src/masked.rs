@@ -35,7 +35,7 @@ use vos_pvm_recair_air::wrap::WrapComponents;
 
 use crate::masking::{Claim, MaskedFormat, verify_masked};
 use crate::{
-    Error, LAYOUT, LOG_SIZES, PREPROCESSED_ROOT_39, PUBLIC_WORDS, Statement, TREE_WIDTHS,
+    Error, LAYOUT, LOG_SIZES, PREPROCESSED_ROOT_39, PUBLIC_WORDS, PublicWords, TREE_WIDTHS,
     WrapProof, embed,
 };
 
@@ -111,14 +111,14 @@ pub fn encode(proof: &WrapProof) -> Option<Vec<u8>> {
 
 /// Verifies the `format::MASKED_WRAP` proof in `bytes` ([`decode`]) against
 /// the public `words`.
-pub fn verify_bytes(bytes: &[u8], words: &[u32; PUBLIC_WORDS]) -> Result<Statement, Error> {
+pub fn verify_bytes(bytes: &[u8], words: &[u32; PUBLIC_WORDS]) -> Result<PublicWords, Error> {
     verify(decode(bytes)?, words)
 }
 
 /// Verifies a `format::MASKED_WRAP` proof of the wrap circuit against the
-/// public `words`, and returns the statement they make: the program id and
+/// public `words`, and returns what they state: the program id and
 /// the io-hash.
-pub fn verify(proof: WrapProof, words: &[u32; PUBLIC_WORDS]) -> Result<Statement, Error> {
+pub fn verify(proof: WrapProof, words: &[u32; PUBLIC_WORDS]) -> Result<PublicWords, Error> {
     verify_under(&MASKED_WRAP, &PREPROCESSED_ROOT_39, proof, words)
 }
 
@@ -132,7 +132,7 @@ pub fn verify_with(
     preprocessed_root: &[u8; 32],
     proof: WrapProof,
     words: &[u32; PUBLIC_WORDS],
-) -> Result<Statement, Error> {
+) -> Result<PublicWords, Error> {
     verify_under(format, preprocessed_root, proof, words)
 }
 
@@ -141,8 +141,8 @@ fn verify_under(
     preprocessed_root: &[u8; 32],
     proof: WrapProof,
     words: &[u32; PUBLIC_WORDS],
-) -> Result<Statement, Error> {
-    let statement = Statement::from_words(words)?;
+) -> Result<PublicWords, Error> {
+    let statement = PublicWords::from_words(words)?;
     if proof.format_version != format.number || proof.log_sizes[..] != *format.log_sizes {
         return Err(Error::Format);
     }

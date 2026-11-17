@@ -13,7 +13,7 @@
 use alloc::vec::Vec;
 
 use vos_statement::vos_anchor::codec::Reader;
-use vos_statement::{DecodeError, ProgramId};
+use vos_statement::{DecodeError, ProgramId, decode_program};
 
 /// The block's first bytes, found once in a linked program.
 pub const MARKER: [u8; 32] = *b"vos/statement-service/config/v1\0";
@@ -101,7 +101,7 @@ impl Config {
             return Err(DecodeError::Noncanonical);
         }
         let pins = (0..count)
-            .map(|_| ProgramId::decode_from(&mut reader))
+            .map(|_| decode_program(&mut reader))
             .collect::<Result<Vec<_>, _>>()?;
         let rest = reader.take(BYTES.saturating_sub(reader.used()))?;
         if rest.iter().any(|&byte| byte != 0) {

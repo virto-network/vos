@@ -16,7 +16,6 @@ use std::time::{Duration, Instant};
 use vos_abi::result::Attest;
 use vos_abi::vos_anchor::{VenueId, WindowClock};
 use vos_pvm_proof::format::SEGMENT;
-use vos_statement::ProgramId;
 
 use crate::balance;
 use crate::common;
@@ -70,7 +69,7 @@ fn prove(name: &str, actor: &str, attest: &Attest) -> Proved {
         let took = started.elapsed();
         let (proof, stats) = vos_pvm_recair::tree::prove_final(&program, &entry, &trace.side_note)
             .expect("the statement proves");
-        let id = ProgramId(program.id().words());
+        let id = program.id();
         (proof, rerun, took, stats, id)
     });
     let whole = started.elapsed();

@@ -156,7 +156,7 @@ fn a_choice_outside_the_set_is_refused() {
 }
 
 fn id(program: &IdPreimage) -> P2Hash {
-    P2Hash(program.id().0)
+    P2Hash(program.id().felts())
 }
 
 /// In the fold: a run's two leaves under a program without the first

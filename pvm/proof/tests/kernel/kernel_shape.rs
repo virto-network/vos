@@ -26,7 +26,7 @@ use vos_pvm_proof::format::SEGMENT;
 use vos_pvm_proof::kernel::{KernelTrace, kernel_side_note, trace_kernel};
 use vos_pvm_proof::program_id::{KernelEntry, KernelProgram, LeafCircuits};
 use vos_pvm_proof::segment::SegmentCursor;
-use vos_pvm_proof::shape::{KernelShape, SegmentShape};
+use vos_pvm_proof::shape::{KernelShape, ProofShape};
 use vos_pvm_proof::{
     Proof, SegmentError, program_commitment_for_shape, prove_kernel, prove_shaped,
 };
@@ -218,7 +218,7 @@ fn kernels_prove_and_verify_over_their_shapes() {
 
 /// `areas`'s run on three sides, its program, and its first class's
 /// segment shape, which holds the run as one segment.
-fn areas() -> (Kernel, KernelProgram, SegmentShape) {
+fn areas() -> (Kernel, KernelProgram, ProofShape) {
     let kernel = kernel("areas", &[3, 4, 5]);
     let program = kernel.program();
     let shape = program.shape.segment(0).unwrap();

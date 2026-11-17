@@ -320,7 +320,7 @@ impl FoldCircuit {
             FoldChild::of(self.child, right, program, fold_word)?,
         ];
         let mut output = NodeOutput::fold(left.output, right.output);
-        output.program = P2Hash(program.id().0);
+        output.program = P2Hash(program.id().felts());
         output.fold_word = fold_word;
         let words = pack(&program.words());
         let values = FoldValues {
