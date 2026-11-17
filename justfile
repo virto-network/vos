@@ -870,12 +870,14 @@ fuzz secs="60":
     cd node/fuzz; python3 -I ../../pvm/proof/fuzz/corpus.py unpack replay target/replay; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{node_fuzz_targets}}" | split row ' ') { mkdir $"corpus/($target)"; cargo fuzz run --fuzz-dir . -a $target $"corpus/($target)" $"target/replay/($target)" -- -max_total_time={{secs}} -max_len=262145 -len_control=0 -rss_limit_mb=8192 -timeout=600 } }
 
 # The light check, after every edit, and the innermost tier: formatting,
-# the gates' own tripwire, the workspace's lints, and every test target of
-# the fast suites' crates but the heavy ones (`tools/gates/heavy.toml`,
+# the gates' own tripwire, the replay archives' reader's refusals
+# (`pvm/proof/fuzz/test_corpus.py`), the workspace's lints, and every test
+# target of the fast suites' crates but the heavy ones (`tools/gates/heavy.toml`,
 # each a binary past about 20 s): minutes, warm. It builds the guests its
 # tests run, the agent's programs, the test actors and the venues' refine
 # programs, and nothing else outside the workspace.
 check: fmt-check check-tiers check-layers build-test-actors build-programs build-final-verify build-statement-service
+    python3 -I pvm/proof/fuzz/test_corpus.py
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     cargo test {{core_crates}} ...(python3 -I tools/gates/tiers.py fast {{core_crates}} | split row ' ')
     cargo test -p vos-pvm-recair -p vos-pvm-device ...(python3 -I tools/gates/tiers.py fast -p vos-pvm-recair -p vos-pvm-device | split row ' ') -- --test-threads=4
