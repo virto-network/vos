@@ -4,7 +4,7 @@ This directory owns the virtual machine, compiler, snapshot codec, and proof
 implementation used by VOS, the actor ABI (`abi`) and the committed maps'
 Merkle tree its keys are laid out for (`tree`), both VOS's own. No package
 here depends on a path outside this directory (`just check-layers`, which
-would allow `support/`'s vendored crates, none depended on today, and
+would allow `support/`'s vendored crates, of which none is depended on, and
 exempts by name the prover's kernel tests' dev edges to the testkit and
 the model venue). Runtime and compiler changes are reviewed and released
 with the rest of the repository.

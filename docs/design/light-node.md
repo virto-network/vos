@@ -2419,7 +2419,7 @@ picked the circuit; a proven call carries the kernel's claim:
   arguments, nonce, expiry, format, proof) and replaces `public:
   CredentialPublic` with `claim: Vec<u8>`, the kernel's public arguments
   in their SCALE encoding. The format is a device format the node admits:
-  47 alone by release (46 where configured, §4.4).
+  47 alone by release (§4.4).
 - **The guard names the kernel:** `#[msg(proven = spend)]`, naming a
   device kernel of this actor, or `#[msg(proven = owner)]`, the
   credential actor's. `#[msg(credential = Auth("login"))]` and
@@ -2613,14 +2613,15 @@ format, the chips, the sizes and the root.
     format (a program id embeds its format) and a proof is verified
     against the release's program in the proof's own format. An app one
     format behind proves the same release in its format until that
-    format retires. Format 47's release admits 47 alone: 46 is retired at
-    once (its byte ledger is not consistent, `open.md`), and a node
-    admits it only where its configuration says so
+    format retires. Format 47's release admits 47 alone; 46 is retired
+    and deleted (its byte ledger was not consistent, `open.md`). A
+    node's configuration can admit a second device format
     (`Config::device_formats`, a test's: the gate
     `the_previous_device_format_is_admitted_until_it_is_retired` runs a
-    46 proof and a 47 proof at one node, refuses the 46 proof `Format`
-    once 46 is retired now, and has the light node choose 47 where both
-    are admitted and 46 where 46 alone is).
+    proof of the test format 48, `vos_pvm_device::TEST_FORMAT`, and a 47
+    proof at one node, refuses the 48 proof `Format` once 48 is retired,
+    and has the light node choose 47 where both are admitted and 48 where
+    48 alone is).
 - **Pins:** the binding names the program id, so a proof of one kernel
   authorizes nothing under another. No venue pins device ids (device
   proofs are not folded, `proving.md` §11, "Device proofs are not
@@ -2667,7 +2668,7 @@ the next run's.
 |---|---|---|
 | 39 (final, masked wrap), 41 (node segments) | admitted | kept as they are |
 | 44 (credential) | admitted at ingress | retired |
-| 46 (device) | admitted for auth's statement | admitted for every device kernel; superseded by 47 |
+| 46 (device) | admitted for auth's statement | retired and deleted; superseded by 47 |
 | 47 (device, per-program CPU, word-level memory) | none | the device format |
 
 

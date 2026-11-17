@@ -1,4 +1,4 @@
-//! The venue as a JAM refine program (`--features pvm-guest`, built by
+//! The model venue as a JAM refine program (`--features pvm-guest`, built by
 //! `just check-no-std` for the PVM target): it verifies a final proof the
 //! way a JAM service would, or judges a statement with it as a venue does,
 //! and reports its gas by phase.
