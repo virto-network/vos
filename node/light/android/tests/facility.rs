@@ -40,12 +40,12 @@ async fn enroll_sign_in_and_pay_as_the_chrome_confirmed() {
             .iter()
             .any(|(_, value)| value.contains("vote (once in scope “vote”)"))
     );
-    let output = {
-        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&[9; 32]).unwrap();
-        mac.update(&vos_light::source_input(&HANDLE));
-        let output: [u8; 32] = mac.finalize().into_bytes().into();
-        output
-    };
+    // The phone's first keystore key, the enrollment's source.
+    let alias = format!("vos.device.{}", 9u8 * 16 + 1);
+    let output = vos_light::testing::hmac(
+        &vos_light::testing::hmac(&[9; 32], alias.as_bytes()),
+        &vos_light::source_input(&HANDLE),
+    );
     let secret = vos_light::derive_secret(&output, &HANDLE);
     let member = vos_light::member(&secret).to_bytes();
     assert_eq!(bytes(field(&enrolled, "member")), member.to_vec());
@@ -336,37 +336,6 @@ fn a_stream_to_an_onion_goes_over_tor() {
     assert_eq!(refused.code, Code::Api);
 }
 
-/// A client whose user confirms everything, its key in memory.
-struct Confirming;
-
-impl vos_facility::node::Prompts for Confirming {
-    fn confirm(&self, _: vos_facility::Form) -> Answer {
-        Answer::Confirmed {
-            choice: 0,
-            values: Vec::new(),
-        }
-    }
-
-    fn create_key(&self, _: Kind) -> s4_credential_contract::KeyAnswer {
-        s4_credential_contract::KeyAnswer::Done(b"vos.device.screens".to_vec().into())
-    }
-
-    fn evaluate_key(
-        &self,
-        _: Kind,
-        _: &[u8],
-        input: &[u8; 32],
-    ) -> s4_credential_contract::KeyAnswer {
-        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&[9; 32]).unwrap();
-        mac.update(input);
-        s4_credential_contract::KeyAnswer::Done(mac.finalize().into_bytes().to_vec().into())
-    }
-
-    fn sign_key(&self, _: Kind, _: &[u8], _: &[u8]) -> s4_credential_contract::KeyAnswer {
-        s4_credential_contract::KeyAnswer::Declined
-    }
-}
-
 /// s4's screens with an enrolled space's gateway go over its onion, on a
 /// circuit of their own, between the UI's end of a socket pair and the
 /// onion's port 22, whose host key is answered for the UI to pin; once
@@ -391,7 +360,7 @@ fn the_screens_go_over_the_spaces_onion_or_its_opt_out() {
     node.enroll(
         session,
         vos_facility::Enroll::read(&enrollment()).unwrap(),
-        Arc::new(Confirming),
+        Arc::new(Phone::new(9)),
     )
     .unwrap();
     let screens = |host: &str| {
@@ -494,7 +463,7 @@ fn the_onion_is_preferred_and_a_gateway_spelled_otherwise_is_refused() {
         node.enroll(
             session,
             vos_facility::Enroll::read(&enrollment).unwrap(),
-            Arc::new(Confirming),
+            Arc::new(Phone::new(9)),
         )
         .unwrap();
         node.close(session);

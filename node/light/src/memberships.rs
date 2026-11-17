@@ -35,7 +35,7 @@ use vos_wire::books::{DeviceHandle, Enrolled, Space, credential_book};
 use vos_wire::credentials;
 
 use crate::pairing::{Hello, Membership};
-use crate::store::{Store, StoreError};
+use crate::store::{Change, Store, StoreError};
 use crate::{Call, DeviceError, Error, Light};
 
 /// The rows of the enrollments held and the confirmations owed, by space.
@@ -132,15 +132,19 @@ pub fn done(store: &Store, membership: &Membership) -> Result<(), StoreError> {
 /// The confirmations of the joiner offered `memberships`, held in `store`
 /// until [`confirmed`].
 pub fn expect(store: &Store, memberships: &[Membership]) -> Result<(), StoreError> {
-    store.write_group_rows(
-        memberships
-            .iter()
-            .map(|membership| {
-                let key = key(CONFIRM, &membership.space, &membership.handle);
-                (key, Some(membership.encode()))
-            })
-            .collect(),
-    )
+    store.write_group_rows(expected(memberships))
+}
+
+/// The rows [`expect`] writes, for a batch of the caller's: a pairing's
+/// group's.
+pub fn expected(memberships: &[Membership]) -> Vec<Change> {
+    memberships
+        .iter()
+        .map(|membership| {
+            let key = key(CONFIRM, &membership.space, &membership.handle);
+            (key, Some(membership.encode()))
+        })
+        .collect()
 }
 
 /// The confirmations owed.

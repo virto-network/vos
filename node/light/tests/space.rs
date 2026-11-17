@@ -140,21 +140,24 @@ fn second_of(first: &Device, second: &Device) -> u32 {
     first.pair(second)
 }
 
-/// A regroup's removal set is the agent's: a device still on probation and
-/// one paired while the regroup was open are both removed when it matures,
-/// the regrouper's commit takes, and its new group holds it alone; every
-/// other device is refused at its next commit as out of it.
+/// A regroup's removal set is the agent's: the regrouper's commit names
+/// every device the agent's live set removes, or the agent refuses it
+/// (`MissingRemoval`, `NotMatured`). A device still on probation when the
+/// regroup opens and one paired while it is open (whose add the regroup
+/// voids, dropping it) are both out once it matures; the regrouper's
+/// commit takes, and it alone stays in the set.
 #[test]
 fn a_regroup_removes_what_the_agent_removes() {
     let world = World::new();
     let home = world.home(HOME, 2, 1);
     let first = device(&world, 0x31);
     first.claim(&world, home);
-    let probation = device(&world, 0x32);
-    let on_probation = first.pair(&probation);
     // Seasoned, so it may regroup.
     after(policy().seasoning_ms);
+    let probation = device(&world, 0x32);
+    let on_probation = first.pair(&probation);
     first.space.regroup(&first.phone).unwrap();
+    assert_eq!(first.standing(on_probation), Some(Standing::Probation));
     // Paired while the regroup is open.
     let late = device(&world, 0x33);
     let added = first.pair(&late);
@@ -162,15 +165,24 @@ fn a_regroup_removes_what_the_agent_removes() {
     after(policy().operation_delay_ms);
     first.space.update(&first.phone).unwrap();
     let devices = first.space.devices().unwrap();
-    for id in [on_probation, added] {
-        let device = devices.iter().find(|device| device.id == id).unwrap();
-        assert!(device.removed, "device {id} removed: {devices:?}");
+    eprintln!("after the regroup: {devices:?}");
+    for device in &devices {
+        if device.me {
+            assert!(!device.removed, "the regrouper stays: {devices:?}");
+            assert_eq!(device.standing, Standing::Active);
+        } else {
+            assert!(
+                matches!(device.standing, Standing::Removed | Standing::Dropped),
+                "device {} out: {devices:?}",
+                device.id
+            );
+        }
     }
-    assert!(
-        devices.iter().any(|device| device.me && !device.removed),
-        "the regrouper stays"
-    );
+    for id in [on_probation, added] {
+        assert!(devices.iter().any(|device| device.id == id), "{id} listed");
+    }
     let refused = late.space.update(&late.phone).unwrap_err();
+    eprintln!("the late device's next update: {refused:?}");
     assert!(
         matches!(refused, Error::Regrouped { by: 0 } | Error::AgentRefused(_)),
         "{refused:?}"

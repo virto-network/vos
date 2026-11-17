@@ -74,7 +74,7 @@ impl<H: Host> Personal<H> {
                 held.state.restoring = None;
                 held.state.home = None;
                 held.state.agent = None;
-                self.keep(&held.state)?;
+                self.keep(&held.light, &held.state)?;
                 resumed = None;
                 entries.clear();
             }
@@ -82,6 +82,18 @@ impl<H: Host> Personal<H> {
         let agent = match resumed {
             Some(agent) => agent,
             None => {
+                // A claim under way holds the home and agent it claims.
+                if crate::home::Claim::pending(held.light.store())
+                    .map_err(failed)?
+                    .is_some()
+                {
+                    let home = held
+                        .state
+                        .home
+                        .as_ref()
+                        .map_or([0; 32], |at| at.home.handle);
+                    return Err(Error::ClaimElsewhere { home });
+                }
                 let found: Option<u32> = self.home_query(
                     &home,
                     Purpose::Personal,
@@ -95,22 +107,28 @@ impl<H: Host> Personal<H> {
                 let source = self.source(prompts, &mut held)?;
                 let secret = secret(prompts, &source, &home.handle)?;
                 let device = self.device(&mut held, prompts, &home, &secret, &request.label)?;
-                let next = new_kit(prompts, request.kit, &kept)?;
-                let split = crate::group::restoring(
+                let kit = new_kit(prompts, request.kit, &kept)?;
+                // The home, the agent and the restore are the device's in
+                // the split's batch.
+                let mut next = held.state.clone();
+                next.home = Some(kept.clone());
+                next.agent = Some(agent);
+                next.label = request.label;
+                crate::group::restoring_with(
                     held.light.store(),
-                    &[next.key()],
+                    &[kit.key()],
                     &GroupAgent {
                         identity: agent.1,
                         instance: PERSONAL,
                     },
+                    |split| {
+                        next.restoring =
+                            Some(Restoring::new(&device, &split.kit, kit.key(), *split.r2()));
+                        next.rows()
+                    },
                 )
                 .map_err(failed)?;
-                held.state.home = Some(kept.clone());
-                held.state.agent = Some(agent);
-                held.state.label = request.label;
-                held.state.restoring =
-                    Some(Restoring::new(&device, &split.kit, next.key(), *split.r2()));
-                self.keep(&held.state)?;
+                held.state = next;
                 agent
             }
         };
@@ -148,7 +166,8 @@ impl<H: Host> Personal<H> {
                     if let Some(restoring) = held.state.restoring.as_mut() {
                         restoring.signed = Some((message.to_vec(), *signature));
                     }
-                    self.keep(&held.state).map_err(|error| error.to_string())
+                    self.keep(&held.light, &held.state)
+                        .map_err(|error| error.to_string())
                 };
                 let called = link
                     .settled_held(
@@ -186,7 +205,7 @@ impl<H: Host> Personal<H> {
         if let Some(restoring) = held.state.restoring.as_mut() {
             restoring.r2 = None;
         }
-        self.keep(&held.state)?;
+        self.keep(&held.light, &held.state)?;
         Ok(posted)
     }
 
@@ -286,7 +305,7 @@ impl<H: Host> Personal<H> {
         let id = group.id().unwrap_or(0);
         held.group = Some(group);
         held.state.restoring = None;
-        self.keep(&held.state)?;
+        self.keep(&held.light, &held.state)?;
         self.follow(&mut held)?;
         drop(held);
         // Its first commit re-seals the kit under a new `R`.

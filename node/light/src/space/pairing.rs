@@ -9,8 +9,8 @@ use zeroize::Zeroizing;
 
 use super::link::Signer;
 use super::{
-    Acked, Bound, CREDENTIAL_BOOK, Error, Held, Host, Kept, POLL, Paired, Personal, Prompts,
-    failed, link, secret, store_failed, unreached,
+    Acked, CREDENTIAL_BOOK, Error, Held, Host, Kept, POLL, Paired, Personal, Prompts, failed, link,
+    secret, store_failed, unreached,
 };
 use crate::group::{DeviceGroup, Prepared};
 use crate::memberships;
@@ -387,6 +387,9 @@ impl<H: Host> Personal<H> {
                     if held.group.is_some()
                         || crate::home::holds_archive(held.light.store()).map_err(failed)?
                         || held.state.restoring.is_some()
+                        || crate::home::Claim::pending(held.light.store())
+                            .map_err(failed)?
+                            .is_some()
                     {
                         self.leave(&mut held)?;
                     }
@@ -419,32 +422,20 @@ impl<H: Host> Personal<H> {
                 }
             }
         };
-        // What the pairing makes this device's is kept before the
-        // acknowledgement leaves, after which the opener commits the add:
-        // the home and agent, the acknowledgement itself, which a pass puts
-        // in the slot if this process dies first.
+        // What the pairing makes this device's is in its group's batch: the
+        // home and agent, the confirmations it owes, the acknowledgement
+        // itself, which a pass puts in the slot if this process dies before
+        // it leaves; after it, the opener commits the add.
         let kept = Kept {
             home: offer.home.clone(),
             onions: code.onions.clone(),
         };
         self.pin(&kept);
-        held.state.bound = Some(Bound { home: kept, agent });
-        held.state.label = label.to_owned();
-        self.keep(&held.state)?;
-        let group = match DeviceGroup::join(held.light.store(), device, *pairing) {
-            Ok(group) => group,
-            Err(error) => {
-                // Not joined: what the pairing was to make dropped.
-                let store = held.light.store().clone();
-                held.state.unjoined(&store, None)?;
-                self.keep(&held.state)?;
-                return Err(failed(error));
-            }
-        };
-        held.group = Some(group);
-        memberships::expect(held.light.store(), &offer.memberships).map_err(store_failed)?;
-        held.arrived();
-        held.state.acked = Some(Acked {
+        let mut next = held.state.clone();
+        next.home = Some(kept);
+        next.agent = Some(agent);
+        next.label = label.to_owned();
+        next.acked = Some(Acked {
             handle: code.handle,
             onions: code.onions.clone(),
             agent,
@@ -452,11 +443,16 @@ impl<H: Host> Personal<H> {
             expires: code.expires,
             ack: ack.arguments(),
         });
+        let mut rows = next.rows();
+        rows.extend(memberships::expected(&offer.memberships));
+        let group =
+            DeviceGroup::join_with(held.light.store(), device, *pairing, rows).map_err(failed)?;
+        held.group = Some(group);
+        held.state = next;
         held.sync = Signer::new(held.light.sync_key().verifying_key().to_bytes());
-        self.keep(&held.state)?;
         slot_put(&mut slot_signer, ack.arguments())?;
         held.state.acked = None;
-        self.keep(&held.state)?;
+        self.keep(&held.light, &held.state)?;
         self.joined(&mut held)?;
         let device = held.group.as_ref().and_then(DeviceGroup::id).unwrap_or(0);
         self.book(&held.light, device);
@@ -522,7 +518,7 @@ impl<H: Host> Personal<H> {
             }
         };
         held.state.acked = None;
-        self.keep(&held.state)?;
+        self.keep(&held.light, &held.state)?;
         put
     }
 }

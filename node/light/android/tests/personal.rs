@@ -862,50 +862,65 @@ fn signs_in(phone: &Held) {
     panic!("no path");
 }
 
-/// The light store's layout row under `directory`.
-fn layout_of(directory: &std::path::Path) -> Option<Vec<u8>> {
-    let db = fjall::Database::builder(directory.join(vos_facility::personal::LIGHT))
-        .open()
-        .unwrap();
-    let meta = db
-        .keyspace("meta", fjall::KeyspaceCreateOptions::default)
-        .unwrap();
-    meta.get(b"layout").unwrap().map(|value| value.to_vec())
-}
+/// The light store's keyspace the personal space's rows are in.
+const GROUP: &str = "group";
 
 /// A change made to a stopped phone's files.
 type Alter = dyn Fn(&std::path::Path);
 
-/// A personal space this build does not read (its state file of another
-/// version, or none; its store of another layout) is named in need of
-/// repair and left as it is: the facility opens, and its sign-in runs.
+/// An alteration: what it is, the change, and the row it changes (its
+/// keyspace, its key, its value after).
+type Alteration<'a> = (&'a str, &'a Alter, &'a str, &'a [u8], Vec<u8>);
+
+/// The light store's keyspace `keyspace` under `directory`, its row `key`
+/// set to `value`.
+fn set_row(directory: &std::path::Path, keyspace: &str, key: &[u8], value: &[u8]) {
+    let db = fjall::Database::builder(directory.join(vos_facility::personal::LIGHT))
+        .open()
+        .unwrap();
+    let rows = db
+        .keyspace(keyspace, fjall::KeyspaceCreateOptions::default)
+        .unwrap();
+    rows.insert(key, value).unwrap();
+    db.persist(fjall::PersistMode::SyncAll).unwrap();
+}
+
+/// The light store's row `key` of `keyspace` under `directory`.
+fn row_of(directory: &std::path::Path, keyspace: &str, key: &[u8]) -> Option<Vec<u8>> {
+    let db = fjall::Database::builder(directory.join(vos_facility::personal::LIGHT))
+        .open()
+        .unwrap();
+    let rows = db
+        .keyspace(keyspace, fjall::KeyspaceCreateOptions::default)
+        .unwrap();
+    rows.get(key).unwrap().map(|value| value.to_vec())
+}
+
+/// A personal space this build does not read (a row of it that does not
+/// decode; its store of another layout) is named in need of repair and
+/// left as it is: the facility opens, and its sign-in runs.
 #[test]
 fn a_personal_space_this_build_does_not_read_is_kept_and_sign_in_runs() {
-    let later = |directory: &std::path::Path| {
-        let file = directory.join(vos_facility::personal::FILE);
-        let mut bytes = std::fs::read(&file).unwrap();
-        bytes[8..10].copy_from_slice(&(vos_facility::personal::STATE_VERSION + 1).to_le_bytes());
-        std::fs::write(&file, bytes).unwrap();
-    };
-    let unversioned = |directory: &std::path::Path| {
-        std::fs::write(directory.join(vos_facility::personal::FILE), [1, 0, 2]).unwrap();
-    };
-    let layout = |directory: &std::path::Path| {
-        let db = fjall::Database::builder(directory.join(vos_facility::personal::LIGHT))
-            .open()
-            .unwrap();
-        let meta = db
-            .keyspace("meta", fjall::KeyspaceCreateOptions::default)
-            .unwrap();
-        meta.insert(b"layout", 99u32.to_be_bytes()).unwrap();
-        db.persist(fjall::PersistMode::SyncAll).unwrap();
-    };
-    let alterations: [(&str, &Alter); 3] = [
-        ("a later version", &later),
-        ("no version", &unversioned),
-        ("another layout", &layout),
+    let corrupt = |directory: &std::path::Path| set_row(directory, GROUP, b"p/home", &[1, 0, 2]);
+    let layout =
+        |directory: &std::path::Path| set_row(directory, "meta", b"layout", &99u32.to_be_bytes());
+    let alterations: [Alteration; 2] = [
+        (
+            "a row that does not decode",
+            &corrupt,
+            GROUP,
+            b"p/home",
+            vec![1, 0, 2],
+        ),
+        (
+            "another layout",
+            &layout,
+            "meta",
+            b"layout",
+            99u32.to_be_bytes().to_vec(),
+        ),
     ];
-    for (what, alter) in alterations {
+    for (what, alter, keyspace, key, altered) in alterations {
         let world = world();
         let home = world.home(HOME, 2, 1);
         let phone = phone(&world, 0xe1);
@@ -919,13 +934,11 @@ fn a_personal_space_this_build_does_not_read_is_kept_and_sign_in_runs() {
         } = phone;
         drop(node);
         assert_eq!(
-            layout_of(_directory.path()),
+            row_of(_directory.path(), "meta", b"layout"),
             Some(vos_light::store::LAYOUT.to_be_bytes().to_vec()),
             "the light node's layout written"
         );
         alter(_directory.path());
-        let file = _directory.path().join(vos_facility::personal::FILE);
-        let state = std::fs::read(&file).unwrap();
         let phone = Held {
             node: node_as(&world, _directory.path(), tag, &hand),
             hand,
@@ -963,17 +976,10 @@ fn a_personal_space_this_build_does_not_read_is_kept_and_sign_in_runs() {
         } = phone;
         drop(node);
         assert_eq!(
-            std::fs::read(&file).unwrap(),
-            state,
-            "{what}: the file kept"
+            row_of(_directory.path(), keyspace, key),
+            Some(altered),
+            "{what}: the store kept"
         );
-        if what == "another layout" {
-            assert_eq!(
-                layout_of(_directory.path()),
-                Some(99u32.to_be_bytes().to_vec()),
-                "the store kept"
-            );
-        }
     }
 }
 

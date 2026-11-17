@@ -11,8 +11,8 @@ use vos_wire::personal::{Body, Entry};
 
 use super::link::Signer;
 use super::{
-    Bound, Claim, Claimed, EXPIRY_MS, Error, Held, Host, Kept, PERSONAL, POLL, Personal, Prompts,
-    Proof, failed, link, new_kit, secret, store_failed,
+    Claim, Claimed, EXPIRY_MS, Error, Held, Host, Kept, PERSONAL, POLL, Personal, Prompts, Proof,
+    failed, link, new_kit, secret, store_failed,
 };
 use crate::home::{self, Claim as Claiming, Home};
 use crate::route::Purpose;
@@ -227,11 +227,11 @@ impl<H: Host> Personal<H> {
             return Err(Error::HoldsKeys);
         }
         if pending.is_some()
-            && let Some(bound) = &held.state.bound
-            && bound.home.home.handle != kept.home.handle
+            && let Some(at) = &held.state.home
+            && at.home.handle != kept.home.handle
         {
             return Err(Error::ClaimElsewhere {
-                home: bound.home.home.handle,
+                home: at.home.handle,
             });
         }
         self.pin(&kept);
@@ -251,47 +251,47 @@ impl<H: Host> Personal<H> {
                 let agent = self.pooled(&home)?;
                 let device = self.device(held, prompts, &home, &secret, &request.label)?;
                 let kit = new_kit(prompts, request.kit, &kept)?;
-                Claiming::prepare(
+                // The home and agent are the device's in the claim's batch.
+                let mut next = held.state.clone();
+                next.home = Some(kept.clone());
+                next.agent = Some(agent);
+                next.label = request.label;
+                let claim = Claiming::prepare_with(
                     held.light.store(),
                     device,
                     vec![kit.key()],
                     agent.0,
                     agent.1,
+                    next.rows(),
                 )
-                .map_err(failed)?
+                .map_err(failed)?;
+                held.state = next;
+                claim
             }
         };
         let agent = claim.agent();
-        held.state.bound = Some(Bound { home: kept, agent });
-        held.state.label = request.label;
-        self.keep(&held.state)?;
         let witness = self.home_witness(&home, &member)?;
         let now = self.time(home.handle, Purpose::Fetch)?;
         let call = claim.call(&home, now + EXPIRY_MS).map_err(failed)?;
         match self.prove_home::<u32>(&home, secret, witness, call)? {
             Ok(_) | Err(HomesError::Claimed) => {}
             Err(error) => {
-                claim.abandon(held.light.store()).map_err(store_failed)?;
-                held.state.bound = None;
-                self.keep(&held.state)?;
+                let mut next = held.state.clone();
+                (next.home, next.agent) = (None, None);
+                claim
+                    .abandon_with(held.light.store(), next.rows())
+                    .map_err(store_failed)?;
+                held.state = next;
                 return Err(Error::HomeRefused(error));
             }
         }
-        let kept = held
-            .state
-            .bound
-            .as_ref()
-            .ok_or(Error::NoSpace)?
-            .home
-            .clone();
+        let kept = held.state.home.clone().unwrap_or(kept);
         let entries = self.assigned(held, &kept, agent)?;
         let group = claim
             .claimed(held.light.store(), PERSONAL, &entries, self.host.now())
             .map_err(failed)?;
         let device = group.id().unwrap_or(0);
         held.group = Some(group);
-        held.arrived();
-        self.keep(&held.state)?;
         self.book(&held.light, device);
         self.follow(held)?;
         Ok(Claimed {

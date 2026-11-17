@@ -1,4 +1,4 @@
-//! What the state file keeps and how a local actor is installed.
+//! What the personal space's rows keep and how a local actor is installed.
 
 use super::*;
 use vos_wire::personal::{AdminClass, Attestation};
@@ -48,15 +48,11 @@ fn every_field() -> State {
     let mut restoring = Restoring::new(&device, &kit, next, [16; 32]);
     restoring.signed = Some((vec![17; 3], [18; 64]));
     State {
-        home: Some(home.clone()),
+        home: Some(home),
         agent: Some((19, [20; 32])),
         source: Some(b"\x01vos.device.1".to_vec()),
         admin: Some(([21; 32], true, true)),
         label: "phone".into(),
-        bound: Some(Bound {
-            home: home.clone(),
-            agent: (22, [23; 32]),
-        }),
         next_admin: vec![([24; 32], false, true)],
         restoring: Some(restoring),
         acked: Some(Acked {
@@ -67,67 +63,99 @@ fn every_field() -> State {
             expires: 36,
             ack: vec![29; 4],
         }),
-        books: vec![(1, 2), (2, 3)],
-        store: 4,
     }
 }
 
-/// The bytes of [`every_field`] in [`STATE_VERSION`]: a change to what
-/// the file keeps, or to how a type it holds encodes, fails here, and
-/// is a new version.
-const PINNED: &str = concat!(
-    "766f732f70737400030001010101010101010101010101010101010101010101010101010101010101010102",
-    "0202020202020202020202020202020202020202020202020202020202020203000000040404040404040404",
-    "0404040404040404040404040404040404040404040404050000000600000001000000070707070707070707",
-    "0707070707070707070707070707070707070707070707080808080808080808080808080808080808080808",
-    "0808080808080808080808011300000014141414141414141414141414141414141414141414141414141414",
-    "14141414010d00000001766f732e6465766963652e3101151515151515151515151515151515151515151515",
-    "151515151515151515151501010500000070686f6e6501010101010101010101010101010101010101010101",
-    "0101010101010101010101020202020202020202020202020202020202020202020202020202020202020203",
-    "0000000404040404040404040404040404040404040404040404040404040404040404050000000600000001",
-    "0000000707070707070707070707070707070707070707070707070707070707070707080808080808080808",
-    "0808080808080808080808080808080808080808080808160000001717171717171717171717171717171717",
-    "1717171717171717171717171717170100000018181818181818181818181818181818181818181818181818",
-    "18181818181818000101000e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0f",
-    "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0d0d0d0d0d0d0d0d0d0d0d0d0d",
-    "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0df7000000090909090909090909090909090909090909090909",
-    "09090909090909090909090a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a00",
-    "01000b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0500000070686f6e6501",
-    "000000011e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1f1f1f1f1f1f1f1f",
-    "1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f0200000020200c0c0c0c0c0c0c0c0c0c0c0c0c0c",
-    "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d",
-    "0d0d0d0d0d0d0110101010101010101010101010101010101010101010101010101010101010100103000000",
-    "1111111212121212121212121212121212121212121212121212121212121212121212121212121212121212",
-    "1212121212121212121212121212121212121212121212011c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c",
-    "1c1c1c1c1c1c1c1c1c1c1c1c0000000021000000222222222222222222222222222222222222222222222222",
-    "2222222222222222232323232323232323232323232323232323232323232323232323232323232324000000",
-    "00000000040000001d1d1d1d020000000100000002000000020000000300000004000000",
-);
+/// The rows of [`every_field`], each key and its value in hex: a change to
+/// what a row keeps, or to how a type it holds encodes, fails here, and is
+/// a new layout (`crate::store::LAYOUT`).
+const PINNED: &[(&str, &str)] = &[
+    (
+        "p/home",
+        concat!(
+            "01010101010101010101010101010101010101010101010101010101010101010102020202020202",
+            "02020202020202020202020202020202020202020202020202030000000404040404040404040404",
+            "04040404040404040404040404040404040404040405000000060000000100000007070707070707",
+            "07070707070707070707070707070707070707070707070707080808080808080808080808080808",
+            "08080808080808080808080808080808080113000000141414141414141414141414141414141414",
+            "1414141414141414141414141414",
+        ),
+    ),
+    ("p/source", "0d00000001766f732e6465766963652e31"),
+    (
+        "p/admin",
+        "15151515151515151515151515151515151515151515151515151515151515150101",
+    ),
+    ("p/label", "0500000070686f6e65"),
+    (
+        "p/next-admin",
+        "0100000018181818181818181818181818181818181818181818181818181818181818180001",
+    ),
+    (
+        "p/restoring",
+        concat!(
+            "000e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0f0f0f0f0f0f0f",
+            "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d",
+            "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0df700000009090909090909090909090909090909090909",
+            "090909090909090909090909090a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+            "0a0a0a0a0a0001000b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+            "0500000070686f6e6501000000011e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e",
+            "1e1e1e1e1e1e1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f0200",
+            "000020200c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0d0d0d0d",
+            "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d011010101010101010101010",
+            "10101010101010101010101010101010101010101001030000001111111212121212121212121212",
+            "12121212121212121212121212121212121212121212121212121212121212121212121212121212",
+            "12121212121212121212121212",
+        ),
+    ),
+    (
+        "p/acked",
+        concat!(
+            "1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c0000000021000000",
+            "22222222222222222222222222222222222222222222222222222222222222222323232323232323",
+            "2323232323232323232323232323232323232323232323232400000000000000040000001d1d1d1d",
+        ),
+    ),
+];
 
-#[test]
-fn the_state_files_layout_is_pinned_to_its_version() {
-    let bytes = state_bytes(&every_field());
-    assert_eq!(hex::encode(&bytes), PINNED);
-    let read = read_state(&bytes).unwrap();
-    assert_eq!(state_bytes(&read), bytes);
+fn hexed(rows: &[crate::store::Change]) -> Vec<(String, String)> {
+    rows.iter()
+        .map(|(key, value)| {
+            (
+                String::from_utf8_lossy(key).into_owned(),
+                value.as_deref().map(hex::encode).unwrap_or_default(),
+            )
+        })
+        .collect()
 }
 
 #[test]
-fn a_state_file_of_another_version_or_none_is_refused() {
-    let bytes = state_bytes(&every_field());
-    let mut later = bytes.clone();
-    later[MAGIC.len()..MAGIC.len() + 2].copy_from_slice(&(STATE_VERSION + 1).to_le_bytes());
-    assert!(read_state(&later).err().unwrap().contains("version 4"));
-    let unversioned = every_field().encode();
-    assert!(
-        read_state(&unversioned)
-            .err()
-            .unwrap()
-            .contains("no version")
-    );
-    assert!(read_state(&bytes[..bytes.len() - 1]).is_err());
-    assert!(read_state(&bytes[..MAGIC.len() + 1]).is_err());
-    assert!(read_state(&[bytes.as_slice(), &[0]].concat()).is_err());
+fn the_personal_rows_are_pinned_to_the_layout() {
+    let rows = hexed(&every_field().rows());
+    let pinned: Vec<(String, String)> = PINNED
+        .iter()
+        .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+        .collect();
+    assert_eq!(rows, pinned, "{rows:#?}");
+}
+
+/// What the rows keep reads back as it was; a row that does not decode
+/// names the personal space in need of repair; a store not made the
+/// device's is not ready.
+#[test]
+fn the_personal_rows_read_back_and_a_bad_one_needs_repair() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = &crate::Store::open(directory.path(), 1 << 20).unwrap();
+    assert!(!rows::ready(store).unwrap());
+    let state = every_field();
+    store.write_group_rows(state.first_rows()).unwrap();
+    assert!(rows::ready(store).unwrap());
+    let read = State::read(store).unwrap();
+    assert_eq!(hexed(&read.rows()), hexed(&state.rows()));
+    store
+        .write_group_rows(vec![(b"p/home".to_vec(), Some(vec![1, 2, 3]))])
+        .unwrap();
+    assert!(matches!(State::read(store), Err(Error::NeedsRepair(_))));
 }
 
 /// A local actor upgraded in place to a later release the app carries,
@@ -137,9 +165,8 @@ fn a_local_actor_is_upgraded_in_place() {
     let directory = tempfile::tempdir().unwrap();
     let artifacts = artifacts();
     let light = Light::open(directory.path(), &artifacts.agent, Config::default()).unwrap();
-    let mut kept = Vec::new();
-    assert!(install(&light, &artifacts.books, &mut kept).unwrap());
-    assert!(!install(&light, &artifacts.books, &mut kept).unwrap());
+    assert!(install(&light, &artifacts.books).unwrap());
+    assert!(!install(&light, &artifacts.books).unwrap());
     let (instance, package) = &artifacts.books[0];
     let first = crate::release::Package::decode_exact(package).unwrap();
     let next = crate::release::Package {
@@ -147,18 +174,14 @@ fn a_local_actor_is_upgraded_in_place() {
         ..first.clone()
     };
     let books = vec![(*instance, next.encode())];
-    assert!(install(&light, &books, &mut kept).unwrap());
-    assert!(kept.contains(&(instance.0, first.release + 1)));
+    assert!(install(&light, &books).unwrap());
+    assert_eq!(light.release(*instance).unwrap(), Some(first.release + 1));
     // The upgrade stands: the earlier release is refused under it.
     assert!(matches!(
         light.install(*instance, &first, Vec::new()),
         Err(crate::Error::Release { installed }) if installed == first.release + 1
     ));
-    assert!(!install(&light, &artifacts.books, &mut kept).unwrap());
-    // A record lost: the installed release is learnt from the refusal.
-    let mut lost = Vec::new();
-    assert!(install(&light, &artifacts.books, &mut lost).unwrap());
-    assert!(lost.contains(&(instance.0, first.release + 1)));
+    assert!(!install(&light, &artifacts.books).unwrap());
 }
 
 /// The light node's artifacts from this tree's guests: the default agent
@@ -174,4 +197,135 @@ fn artifacts() -> Artifacts {
             (DEVICE_BOOK, package("vos-device-book")),
         ],
     }
+}
+
+/// A host that reaches nothing: a flow refused before its first request.
+struct Nowhere;
+
+impl Host for Nowhere {
+    fn request(&self, _: &[u8; 32], _: Purpose, _: &[u8]) -> Result<Vec<u8>, String> {
+        Err("nowhere".into())
+    }
+
+    fn pin(&self, _: &[u8; 32], _: &[Onion]) {}
+
+    fn route(&self, _: &[u8; 32], _: Purpose) -> crate::route::Route {
+        crate::route::Route::Onion
+    }
+
+    fn prove(&self, _: Proof) -> Result<Vec<u8>, Error> {
+        Err(Error::Failed("nowhere".into()))
+    }
+
+    fn enrollments(&self) -> Result<Vec<Enrolled>, String> {
+        Ok(Vec::new())
+    }
+}
+
+/// A security key, and nothing else.
+struct Key;
+
+impl Prompts for Key {
+    fn show_phrase(&self, _: &str, _: &Card) -> bool {
+        false
+    }
+    fn show_card(&self, _: &Card) -> bool {
+        false
+    }
+    fn enter_phrase(&self) -> Option<zeroize::Zeroizing<String>> {
+        None
+    }
+    fn approve_admin(&self, _: &Approval) -> bool {
+        false
+    }
+    fn create_source(&self) -> Result<Vec<u8>, Error> {
+        Err(Error::Declined)
+    }
+    fn evaluate_source(
+        &self,
+        _: &[u8],
+        _: &[u8; 32],
+    ) -> Result<zeroize::Zeroizing<[u8; 32]>, Error> {
+        Err(Error::Declined)
+    }
+    fn create_kit_key(&self) -> Result<Vec<u8>, Error> {
+        Err(Error::Declined)
+    }
+    fn kit_secret(&self, _: &[u8], salt: &[u8; 32]) -> Result<zeroize::Zeroizing<[u8; 32]>, Error> {
+        Ok(zeroize::Zeroizing::new(*salt))
+    }
+    fn create_admin(&self) -> Result<AdminKey, Error> {
+        Err(Error::Declined)
+    }
+    fn sign_admin(&self, _: &[u8; 32], _: &[u8]) -> Result<[u8; 64], Error> {
+        Err(Error::Declined)
+    }
+}
+
+/// A restore while a claim waits is refused: the claim holds the home and
+/// agent the device keeps, which the restore would write over.
+#[test]
+fn a_restore_is_refused_while_a_claim_waits() {
+    let directory = tempfile::tempdir().unwrap();
+    let space = Personal::open(directory.path(), &artifacts(), Nowhere).unwrap();
+    let state = every_field();
+    let restoring = state.restoring.clone().unwrap();
+    let home = state.home.clone().unwrap();
+    {
+        let held = space.held();
+        let (device, _) = <(NewDevice, NewKit)>::decode_exact(&restoring.arguments).unwrap();
+        crate::home::Claim::prepare(held.light.store(), device, vec![restoring.next], 3, [4; 32])
+            .unwrap();
+    }
+    let refused = space
+        .restore(
+            &Key,
+            Claim {
+                home,
+                kit: KitKind::SecurityKey,
+                label: "phone".into(),
+            },
+            KitKind::SecurityKey,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(refused, Error::ClaimElsewhere { .. }),
+        "{refused:?}"
+    );
+}
+
+/// The device's store is the newest a first batch made its own: a newer
+/// one with none (a leave cut short) is deleted, and so is one a fresh
+/// install was killed before writing; a leave whose first batch was
+/// written is the device's.
+#[test]
+fn the_store_is_the_newest_made_the_devices() {
+    let artifacts = artifacts();
+    let directory = tempfile::tempdir().unwrap();
+    let (generation, light) = store(directory.path(), &artifacts).unwrap();
+    assert_eq!(generation, 0);
+    assert!(rows::ready(light.store()).unwrap());
+    drop(light);
+    let cut = light_dir(directory.path(), 1);
+    create_private(&cut).unwrap();
+    drop(Light::open(&cut, &artifacts.agent, Config::default()).unwrap());
+    let (generation, light) = store(directory.path(), &artifacts).unwrap();
+    assert_eq!(generation, 0);
+    assert!(!cut.exists(), "the leave cut short deleted");
+    drop(light);
+    drop(fresh(directory.path(), &artifacts, 1, &State::default()).unwrap());
+    let (generation, light) = store(directory.path(), &artifacts).unwrap();
+    assert_eq!(generation, 1, "the leave's store is the device's");
+    drop(light);
+
+    let killed = tempfile::tempdir().unwrap();
+    let first = light_dir(killed.path(), 0);
+    create_private(&first).unwrap();
+    drop(Light::open(&first, &artifacts.agent, Config::default()).unwrap());
+    let (generation, light) = store(killed.path(), &artifacts).unwrap();
+    assert_eq!(generation, 0);
+    assert!(
+        rows::ready(light.store()).unwrap(),
+        "made anew and the device's"
+    );
 }

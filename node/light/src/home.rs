@@ -34,7 +34,7 @@ pub use vos_wire::homes::SCOPE;
 
 use crate::group::{Agent, DeviceGroup, GroupError};
 use crate::kit::{KitKey, Split};
-use crate::store::{Store, StoreError};
+use crate::store::{Change, Store, StoreError};
 use crate::{AuthWitness, Call, DeviceError, DeviceProgram, DeviceSecret, Proven, Prover};
 use crate::{call, secret};
 
@@ -201,6 +201,19 @@ impl Claim {
         agent: u32,
         identity: [u8; 32],
     ) -> Result<Self, ClaimError> {
+        Self::prepare_with(store, device, keys, agent, identity, Vec::new())
+    }
+
+    /// [`Claim::prepare`], `rows` of the group keyspace written in the
+    /// same batch: what the claim makes the device's beside it.
+    pub fn prepare_with(
+        store: &Store,
+        device: NewDevice,
+        keys: Vec<KitKey>,
+        agent: u32,
+        identity: [u8; 32],
+        rows: Vec<Change>,
+    ) -> Result<Self, ClaimError> {
         if holds_archive(store)? || store.group_row(CLAIM_ROW)?.is_some() {
             return Err(ClaimError::Held);
         }
@@ -213,7 +226,9 @@ impl Claim {
             agent,
             identity,
         });
-        store.write_group_rows(vec![(CLAIM_ROW.to_vec(), Some(claim.0.encode()))])?;
+        let mut writes = vec![(CLAIM_ROW.to_vec(), Some(claim.0.encode()))];
+        writes.extend(rows);
+        store.write_group_rows(writes)?;
         Ok(claim)
     }
 
@@ -252,7 +267,14 @@ impl Claim {
     /// after `KitTaken`, with another kit, since the same key indexes the
     /// same agent again.
     pub fn abandon(self, store: &Store) -> Result<(), ClaimError> {
-        store.write_group_rows(vec![(CLAIM_ROW.to_vec(), None)])?;
+        self.abandon_with(store, Vec::new())
+    }
+
+    /// [`Claim::abandon`], `rows` written in the same batch.
+    pub fn abandon_with(self, store: &Store, rows: Vec<Change>) -> Result<(), ClaimError> {
+        let mut writes = vec![(CLAIM_ROW.to_vec(), None)];
+        writes.extend(rows);
+        store.write_group_rows(writes)?;
         Ok(())
     }
 

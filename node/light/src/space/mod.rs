@@ -3,19 +3,20 @@
 //! a UI drives, over the [`Host`]'s network, its prompts the user's
 //! ([`Prompts`]).
 //!
-//! - **What the device keeps** ([`FILE`], and the light node's store under
-//!   [`LIGHT`]): the home and the agent it claimed or joined, the secret
-//!   source's key it proves there with, its admin key's public half (the key is
-//!   the UI's, behind a strong biometric), its label. Every group, claim and
-//!   pairing row is the light node's, each change one batch. The file is
-//!   versioned ([`STATE_VERSION`]): one this build does not read is refused and
-//!   kept as it is, the personal space named in need of repair.
+//! - **What the device keeps** is the light node's store alone (under
+//!   [`LIGHT`]): beside its group, claim and pairing rows, the home and the
+//!   agent it claimed or joined, the secret source's key it proves there
+//!   with, its admin key's public half (the key is the UI's, behind a
+//!   strong biometric), its label (`rows`). Each change is one batch: the
+//!   home and agent are written in the batch of the claim, the pairing's
+//!   group or the restore's split that makes them the device's, so a crash
+//!   leaves the device before the step or after it. A store of another
+//!   layout is refused and kept as it is, the personal space named in need
+//!   of repair.
 //! - **What a flow keeps before its step at the agent**: each key the
-//!   moment it is made, and the home and agent the flow takes the group to
-//!   before the call that makes it so; a restart finishes what the store
-//!   shows done ([`Personal::open`]), a flow called again resumes what it
-//!   shows held, and the pass finishes what needs no prompt (an
-//!   acknowledgement, the credential book).
+//!   moment it is made; a flow called again resumes what the store shows
+//!   held, and the pass finishes what needs no prompt (an acknowledgement,
+//!   the credential book).
 //! - **The flows** ([`Personal`]'s methods): the claim at a home-only space
 //!   with a phrase or a security-key kit; pairing, as the device that shows
 //!   the code ([`Personal::pair_offer`], [`Personal::pair_await`]) and as the
@@ -46,6 +47,7 @@ pub mod link;
 mod members;
 mod pairing;
 mod restore;
+mod rows;
 mod set;
 
 use std::path::{Path, PathBuf};
@@ -66,7 +68,7 @@ use crate::home::Home;
 use crate::kit::{KitKey, KitSecret, SecurityKey};
 use crate::route::Purpose;
 use crate::{Config, Light, memberships, wire};
-use files::{create_private, write_private};
+use files::create_private;
 use link::{Agent, AgentLink, Signer};
 
 pub use error::Error;
@@ -75,18 +77,10 @@ pub use host::{AdminKey, Approval, Card, Enrolled, Host, Prompts, Proof};
 pub use pairing::PairCode;
 pub use set::{AdminOffer, Device};
 
-/// The personal space's file, beside the light node's store: [`MAGIC`],
-/// its version (u16, little-endian), then what the device keeps.
-pub const FILE: &str = "personal.state";
-/// The file's first bytes.
-const MAGIC: &[u8; 8] = b"vos/pst\0";
-/// The version of what the file keeps, which this build writes. A file of
-/// another version, or of none (an earlier build's), is refused and its
-/// bytes kept ([`read_state`]).
-pub const STATE_VERSION: u16 = 3;
 /// The light node's store, under the personal space's directory: the
 /// directory of the first store, and the prefix of each later one's, which
-/// a leave makes anew ([`light_dir`]).
+/// a leave makes anew ([`light_dir`]); the device's is the newest whose
+/// first batch made it so.
 pub const LIGHT: &str = "light";
 pub use vos_wire::personal::PERSONAL;
 /// The local actors: the credential book and the device book.
@@ -172,8 +166,9 @@ pub struct Posted {
 
 pub use members::{Membership, Owed};
 
-/// What the device keeps of its personal space.
-#[derive(Clone, Default, Encode, Decode)]
+/// What the device keeps of its personal space, as its rows hold it
+/// (`rows`).
+#[derive(Clone, Default)]
 struct State {
     /// The home its agent is at.
     home: Option<Kept>,
@@ -186,10 +181,6 @@ struct State {
     /// UI's keystore answered them.
     admin: Option<([u8; 32], bool, bool)>,
     label: String,
-    /// The home and agent a claim, a pairing or a move takes the group
-    /// to, kept before the step that makes it so at the agent, until the
-    /// store's group is there.
-    bound: Option<Bound>,
     /// The admin keys offered to replace this device's, the newest last,
     /// until the set shows one of them.
     next_admin: Vec<([u8; 32], bool, bool)>,
@@ -198,11 +189,6 @@ struct State {
     /// A joiner's acknowledgement of its pairing's handover, kept before
     /// it is put in the slot, until it is.
     acked: Option<Acked>,
-    /// Each local actor's instance and the release installed there.
-    books: Vec<(u32, u32)>,
-    /// The light node's store's generation: its directory
-    /// ([`light_dir`]), the next one's made by each leave.
-    store: u32,
 }
 
 /// The directory of the light node's store of `generation` under
@@ -212,6 +198,69 @@ fn light_dir(directory: &Path, generation: u32) -> PathBuf {
         0 => directory.join(LIGHT),
         n => directory.join(format!("{LIGHT}.{n}")),
     }
+}
+
+/// The device's store under `directory`, and its generation: the
+/// newest a first batch made the device's. A newer one with none is a
+/// leave cut short, deleted; none at all, a fresh install, made now.
+/// One this build does not read is refused, and left as it is.
+fn store(directory: &Path, artifacts: &Artifacts) -> Result<(u32, Light), Error> {
+    let mut generations = generations(directory);
+    generations.sort_unstable_by(|a, b| b.cmp(a));
+    for generation in &generations {
+        let dir = light_dir(directory, *generation);
+        let light = Light::open(&dir, &artifacts.agent, Config::default())
+            .map_err(|error| Error::NeedsRepair(format!("its store: {error}")))?;
+        if rows::ready(light.store())? {
+            return Ok((*generation, light));
+        }
+        drop(light);
+        std::fs::remove_dir_all(&dir).map_err(store_failed)?;
+    }
+    let generation = generations.first().copied().unwrap_or(0);
+    let light = fresh(directory, artifacts, generation, &State::default())?;
+    Ok((generation, light))
+}
+
+/// A store made anew as generation `generation`, its local actors
+/// installed, made the device's by its first batch, which writes
+/// `state`.
+fn fresh(
+    directory: &Path,
+    artifacts: &Artifacts,
+    generation: u32,
+    state: &State,
+) -> Result<Light, Error> {
+    let dir = light_dir(directory, generation);
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).map_err(store_failed)?;
+    }
+    create_private(&dir).map_err(store_failed)?;
+    let light = Light::open(&dir, &artifacts.agent, Config::default()).map_err(store_failed)?;
+    install(&light, &artifacts.books)?;
+    light
+        .store()
+        .write_group_rows(state.first_rows())
+        .map_err(store_failed)?;
+    Ok(light)
+}
+
+/// The generations of the stores under `directory`.
+fn generations(directory: &Path) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            match name.strip_prefix(LIGHT)? {
+                "" => Some(0),
+                rest => rest.strip_prefix('.')?.parse().ok(),
+            }
+        })
+        .collect()
 }
 
 /// The stores of generations other than `generation` under `directory`,
@@ -234,13 +283,6 @@ fn drop_stores(directory: &Path, generation: u32) {
             let _ = std::fs::remove_dir_all(&path);
         }
     }
-}
-
-/// Where a flow takes the device's group: the home, and the agent there.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-struct Bound {
-    home: Kept,
-    agent: (u32, [u8; 32]),
 }
 
 /// A restore opened at the agent of `home`: the next kit's key and its
@@ -282,72 +324,7 @@ struct Acked {
     ack: Vec<u8>,
 }
 
-/// What `bytes`, `personal.state`'s, keep, or why this build does not read
-/// them.
-fn read_state(bytes: &[u8]) -> Result<State, String> {
-    let body = bytes
-        .strip_prefix(MAGIC.as_slice())
-        .ok_or("names no version")?;
-    let (version, body) = body.split_first_chunk::<2>().ok_or("is cut short")?;
-    match u16::from_le_bytes(*version) {
-        STATE_VERSION => State::decode_exact(body).ok_or_else(|| "does not decode".into()),
-        other => Err(format!(
-            "is of version {other}, and this build reads {STATE_VERSION}"
-        )),
-    }
-}
-
-/// `state` as `personal.state` keeps it.
-fn state_bytes(state: &State) -> Vec<u8> {
-    let mut bytes = MAGIC.to_vec();
-    bytes.extend_from_slice(&STATE_VERSION.to_le_bytes());
-    state.encode_to(&mut bytes);
-    bytes
-}
-
 impl State {
-    /// A pairing's what the store shows it never joined dropped: the
-    /// home and agent it was to take the group to, its acknowledgement.
-    /// Whether it changed.
-    fn unjoined(
-        &mut self,
-        store: &crate::Store,
-        group: Option<&DeviceGroup>,
-    ) -> Result<bool, Error> {
-        let Some(bound) = &self.bound else {
-            return Ok(false);
-        };
-        let there = group.is_some_and(|group| group.agent().identity == bound.agent.1);
-        let held = crate::home::Claim::pending(store)
-            .map_err(store_failed)?
-            .is_some();
-        if there || held {
-            return Ok(false);
-        }
-        self.bound = None;
-        self.acked = None;
-        Ok(true)
-    }
-
-    /// The home and agent a flow took the group to are the device's once
-    /// the store's group is at that agent: a claim, a pairing or a move
-    /// whose last step the process did not live to see. Whether it
-    /// changed.
-    fn arrived(&mut self, group: Option<&DeviceGroup>) -> bool {
-        let at = |bound: &Bound| group.is_some_and(|group| group.agent().identity == bound.agent.1);
-        match self.bound.take() {
-            Some(bound) if at(&bound) => {
-                self.home = Some(bound.home);
-                self.agent = Some(bound.agent);
-                true
-            }
-            other => {
-                self.bound = other;
-                false
-            }
-        }
-    }
-
     /// The offered admin key `key`, if it is one.
     fn next_admin(&self, key: &[u8; 32]) -> Option<([u8; 32], bool, bool)> {
         self.next_admin.iter().find(|next| next.0 == *key).copied()
@@ -366,39 +343,26 @@ impl State {
 }
 
 /// Each local actor in `books` installed, or upgraded in place: one not
-/// installed, or installed at a release before the package's. `kept`
-/// holds each instance's release installed; whether it changed.
-fn install(
-    light: &Light,
-    books: &[(InstanceId, Vec<u8>)],
-    kept: &mut Vec<(u32, u32)>,
-) -> Result<bool, Error> {
-    let installed = light.instances().map_err(store_failed)?;
+/// installed, or installed at a release before the package's, as the store
+/// records it. Whether one was.
+fn install(light: &Light, books: &[(InstanceId, Vec<u8>)]) -> Result<bool, Error> {
     let mut changed = false;
     for (instance, package) in books {
         let package = crate::release::Package::decode_exact(package)
             .ok_or_else(|| store_failed("a local actor's package does not decode"))?;
-        let at = kept
-            .iter()
-            .find(|(id, _)| *id == instance.0)
-            .map(|(_, release)| *release);
-        if installed.contains(instance) && at.is_some_and(|at| at >= package.release) {
+        let at = light.release(*instance).map_err(store_failed)?;
+        if at.is_some_and(|at| at >= package.release) {
             continue;
         }
-        let release = match light.install(*instance, &package, Vec::new()) {
-            Ok(Outcome::Done(_)) => package.release,
+        match light.install(*instance, &package, Vec::new()) {
+            Ok(Outcome::Done(_)) => changed = true,
             Ok(other) => {
                 return Err(store_failed(format!(
                     "a local actor's install answered {other:?}"
                 )));
             }
-            // Installed already at a later release than this build's.
-            Err(crate::Error::Release { installed }) if installed > package.release => installed,
             Err(error) => return Err(store_failed(error)),
-        };
-        kept.retain(|(id, _)| *id != instance.0);
-        kept.push((instance.0, release));
-        changed = true;
+        }
     }
     Ok(changed)
 }
@@ -412,14 +376,8 @@ struct Held {
     sync: Signer,
     admin: Signer,
     pairing: Option<pairing::Pairing>,
-}
-
-impl Held {
-    /// [`State::arrived`] by the group held.
-    fn arrived(&mut self) -> bool {
-        let Held { state, group, .. } = self;
-        state.arrived(group.as_ref())
-    }
+    /// The store's generation: its directory ([`light_dir`]).
+    generation: u32,
 }
 
 /// Whether a pairing waits on its slot, and whether the user cancelled
@@ -465,7 +423,6 @@ const EXPIRY_MS: u64 = 60_000;
 /// The device's personal space, its flows run over `H`.
 pub struct Personal<H: Host> {
     host: H,
-    file: PathBuf,
     held: Mutex<Held>,
     waiting: Waiting,
     /// How long a flow waits for the agent (ms): [`WAIT_MS`] unless set.
@@ -497,35 +454,18 @@ impl<H: Host> Personal<H> {
     /// the host. A state file or a store this build does not read is
     /// refused as in need of repair, and left as it is.
     pub fn open(directory: &Path, artifacts: &Artifacts, host: H) -> Result<Self, Error> {
-        let file = directory.join(FILE);
-        let mut state = match std::fs::read(&file) {
-            Ok(bytes) => {
-                read_state(&bytes).map_err(|why| Error::NeedsRepair(format!("its file {why}")))?
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => State::default(),
-            Err(error) => {
-                return Err(Error::NeedsRepair(format!(
-                    "its file does not read: {error}"
-                )));
-            }
-        };
-        drop_stores(directory, state.store);
-        let dir = light_dir(directory, state.store);
-        create_private(&dir).map_err(store_failed)?;
-        let light = Light::open(&dir, &artifacts.agent, Config::default())
-            .map_err(|error| Error::NeedsRepair(format!("its store: {error}")))?;
-        let mut changed = install(&light, &artifacts.books, &mut state.books)?;
+        let (generation, light) = store(directory, artifacts)?;
+        drop_stores(directory, generation);
+        let mut state = State::read(light.store())?;
+        install(&light, &artifacts.books)?;
         let group = DeviceGroup::open(light.store())
             .map_err(|error| Error::NeedsRepair(format!("its device group: {error}")))?;
-        changed |= state.arrived(group.as_ref());
-        changed |= state.unjoined(light.store(), group.as_ref())?;
-        if state
+        let expired = state
             .acked
             .as_ref()
-            .is_some_and(|acked| acked.expires < host.now())
-        {
+            .is_some_and(|acked| acked.expires < host.now());
+        if expired {
             state.acked = None;
-            changed = true;
         }
         let sync = Signer::new(light.sync_key().verifying_key().to_bytes());
         let admin = Signer::new(state.admin.map(|(key, ..)| key).unwrap_or_default());
@@ -535,7 +475,6 @@ impl<H: Host> Personal<H> {
         );
         let space = Self {
             host,
-            file,
             held: Mutex::new(Held {
                 light,
                 group,
@@ -543,6 +482,7 @@ impl<H: Host> Personal<H> {
                 sync,
                 admin,
                 pairing: None,
+                generation,
             }),
             waiting: Waiting::default(),
             wait: AtomicU64::new(WAIT_MS),
@@ -551,11 +491,10 @@ impl<H: Host> Personal<H> {
             artifacts: artifacts.clone(),
         };
         let held = space.held();
-        if changed {
-            space.keep(&held.state)?;
+        if expired {
+            space.keep(&held.light, &held.state)?;
         }
-        let bound = held.state.bound.as_ref().map(|bound| &bound.home);
-        for kept in [held.state.home.as_ref(), bound].into_iter().flatten() {
+        if let Some(kept) = &held.state.home {
             space.pin(kept);
         }
         drop(held);
@@ -576,8 +515,12 @@ impl<H: Host> Personal<H> {
         self.host.pin(&kept.home.handle, &kept.onions);
     }
 
-    fn keep(&self, state: &State) -> Result<(), Error> {
-        write_private(&self.file, &state_bytes(state)).map_err(store_failed)?;
+    /// What `state` keeps written to `light`'s store, in one batch.
+    fn keep(&self, light: &Light, state: &State) -> Result<(), Error> {
+        light
+            .store()
+            .write_group_rows(state.rows())
+            .map_err(store_failed)?;
         *self.owed.1.lock().unwrap_or_else(|e| e.into_inner()) = state.source.clone();
         Ok(())
     }
@@ -589,30 +532,21 @@ impl<H: Host> Personal<H> {
 
     /// Leave the personal space this device holds, for good, with no call
     /// to its agent: a store made anew under the next generation's
-    /// directory, the local actors installed there, then made the device's
-    /// by one write of the state file, which drops the home, the agent, the
-    /// admin key and every flow's state and keeps the source and the label;
-    /// the old store's directory deleted after. The device then holds no
-    /// personal space, as at a fresh install: it claims, or pairs, with new
-    /// sync and admin keys. Cut short before the write, the old space
-    /// stands; after it, the old directory goes at the next open.
+    /// directory, its local actors installed there, then made the device's
+    /// by its first batch, which keeps the source and the label and drops
+    /// the home, the agent, the admin key and every flow's state; the old
+    /// store's directory deleted after. The device then holds no personal
+    /// space, as at a fresh install: it claims, or pairs, with new sync and
+    /// admin keys. Cut short before that batch, the old space stands; after
+    /// it, the old directory goes at the next open.
     fn leave(&self, held: &mut Held) -> Result<(), Error> {
-        let generation = held.state.store + 1;
-        let dir = light_dir(&self.directory, generation);
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir).map_err(store_failed)?;
-        }
-        create_private(&dir).map_err(store_failed)?;
-        let light =
-            Light::open(&dir, &self.artifacts.agent, Config::default()).map_err(store_failed)?;
-        let mut state = State {
+        let generation = held.generation + 1;
+        let state = State {
             source: held.state.source.clone(),
             label: held.state.label.clone(),
-            store: generation,
             ..State::default()
         };
-        install(&light, &self.artifacts.books, &mut state.books)?;
-        self.keep(&state)?;
+        let light = fresh(&self.directory, &self.artifacts, generation, &state)?;
         *self.owed.0.lock().unwrap_or_else(|e| e.into_inner()) = light.store().clone();
         held.sync = Signer::new(light.sync_key().verifying_key().to_bytes());
         held.admin = Signer::new([0; 32]);
@@ -620,6 +554,7 @@ impl<H: Host> Personal<H> {
         held.pairing = None;
         held.state = state;
         held.light = light;
+        held.generation = generation;
         drop_stores(&self.directory, generation);
         Ok(())
     }
@@ -754,7 +689,7 @@ impl<H: Host> Personal<H> {
         }
         let source = prompts.create_source()?;
         held.state.source = Some(source.clone());
-        self.keep(&held.state)?;
+        self.keep(&held.light, &held.state)?;
         Ok(source)
     }
 
@@ -820,7 +755,7 @@ impl<H: Host> Personal<H> {
                 let admin = (made.key, made.hardware, made.verified_boot);
                 held.state.admin = Some(admin);
                 held.admin = Signer::new(made.key);
-                self.keep(&held.state)?;
+                self.keep(&held.light, &held.state)?;
                 admin
             }
         };

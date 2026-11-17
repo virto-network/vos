@@ -33,9 +33,7 @@ pub use contract::{
     Claim, Claimed, Device, Home, KitKind, MAX_LABEL, Membership, Notice, Owed, PairCode, Paired,
     Pending, Posted, Seen, Synced, label,
 };
-pub use vos_light::space::{
-    AdminOffer, Artifacts, CREDENTIAL_BOOK, DEVICE_BOOK, FILE, LIGHT, PERSONAL, STATE_VERSION,
-};
+pub use vos_light::space::{AdminOffer, Artifacts, CREDENTIAL_BOOK, DEVICE_BOOK, LIGHT, PERSONAL};
 
 /// The light node's artifacts this crate embeds (`just facility-release`):
 /// the default agent's program, and the local actors' packages.

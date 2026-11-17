@@ -162,7 +162,7 @@ impl<H: Host> Personal<H> {
             held.state.admin = Some(next);
             held.state.next_admin.clear();
             held.admin = Signer::new(next.0);
-            self.keep(&held.state)?;
+            self.keep(&held.light, &held.state)?;
         }
         Ok(())
     }
@@ -295,7 +295,7 @@ impl<H: Host> Personal<H> {
         let next = prompts.create_admin()?;
         let admin = new_admin(next);
         held.state.set_next_admin(next);
-        self.keep(&held.state)?;
+        self.keep(&held.light, &held.state)?;
         let (kept, agent) = (
             held.state.home.clone().ok_or(Error::NoSpace)?,
             held.state.agent.ok_or(Error::NoSpace)?,
@@ -351,7 +351,7 @@ impl<H: Host> Personal<H> {
         let (_, identity) = held.state.agent.ok_or(Error::NoSpace)?;
         let (admin, ..) = held.state.admin.ok_or(Error::NoSpace)?;
         held.state.set_next_admin(next);
-        self.keep(&held.state)?;
+        self.keep(&held.light, &held.state)?;
         let mut offer = AdminOffer {
             device: me,
             key: next.key,
