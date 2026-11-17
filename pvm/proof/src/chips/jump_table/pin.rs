@@ -31,6 +31,12 @@ impl JumpTableChip {
     }
 }
 
+/// The least log size whose rows hold the table: a smaller one cannot pin
+/// it.
+pub(crate) fn table_log_size(side_note: &SideNote) -> u32 {
+    chip_log_size(side_note.jump_table.len())
+}
+
 pub(super) fn chip_log_size(len: usize) -> u32 {
     crate::trace::utils::ceil_log2_at_least_lanes(len.max(1))
 }

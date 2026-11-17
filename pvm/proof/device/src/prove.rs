@@ -16,7 +16,7 @@ use crate::{MaskRng, MaskStats, MaskedProof};
 /// The most gas a device kernel's run is traced with, 2^18: a step a unit,
 /// a Poseidon2 call 3,000, so the most steps the device format's CPU holds,
 /// `2^DEVICE_MAX_LOG_SIZE`, and as much again for its Poseidon2 calls
-/// (auth's 43 take 129,000 beside its 19,000 or so steps): about 87
+/// (auth's 43 take 129,000 beside its 1,312 steps): about 87
 /// Poseidon2 calls a run, fewer as its steps grow, which a device kernel's
 /// install meets as a run out of gas. A longer run stops out of gas rather
 /// than being traced past twice any program's steps, on an executor that

@@ -15,6 +15,8 @@
 //!
 //! The deployment's constants are [`CONFIG`], a block of read-only data
 //! `vos_statement_service::config::configure` fills in the linked program.
+//! Unset or undecodable, refine refuses every item and accumulate applies
+//! none.
 
 #![no_std]
 #![cfg_attr(
@@ -45,28 +47,25 @@ use vos_abi::jam::RefineArgs;
 use vos_pvm_program::read_nat;
 use vos_statement_service::accumulate::{accumulate, operand};
 use vos_statement_service::config::{self, Config};
-use vos_statement_service::refine::{Extrinsics, refine, venue};
+use vos_statement_service::refine::{Extrinsics, refine, refine_unconfigured, venue};
 use vos_statement_service::state::{Storage, keys};
 use vos_statement_service::verdict::{RegisterCode, Verdict};
 
 entries!("_start" => "refine_main", "accumulate" => "accumulate_main");
 
 /// The deployment's constants, as `config::configure` set them in the
-/// linked program; [`config::UNSET`] as built, which pins nothing.
+/// linked program; [`config::UNSET`] as built, which configures nothing.
 #[used]
 #[unsafe(no_mangle)]
 static CONFIG: [u8; config::BYTES] = config::UNSET;
 
-/// The deployment's constants: a block that does not decode pins nothing.
-fn config() -> Config {
+/// The deployment's constants: none when the block is unset or does not
+/// decode, and the service then refuses every item and holds no state.
+fn config() -> Option<Config> {
     // SAFETY: a read of an initialised static; volatile, so the block is
     // read as the linked program holds it, never folded from `UNSET`.
     let block = unsafe { core::ptr::read_volatile(&raw const CONFIG) };
-    Config::decode(&block).unwrap_or(Config {
-        genesis: [0; 32],
-        genesis_ms: 0,
-        pins: Vec::new(),
-    })
+    config::configured(&block)
 }
 
 // ── Host calls ───────────────────────────────────────────────────────────
@@ -205,9 +204,14 @@ unsafe extern "C" fn refine_main(args: *const u8, len: u64) -> Output {
         let service = u32::try_from(args.service).ok()?;
         Some((service, args.payload))
     });
-    let mut output = match service {
-        Some((service, payload)) => refine(&config, venue(&config, service), &payload, &mut Proof),
-        None => Verdict::Refused {
+    let mut output = match (config, service) {
+        (None, service) => {
+            refine_unconfigured(service.as_ref().map_or(&[][..], |(_, payload)| payload))
+        }
+        (Some(config), Some((service, payload))) => {
+            refine(&config, venue(&config, service), &payload, &mut Proof)
+        }
+        (_, None) => Verdict::Refused {
             kind: None,
             code: RegisterCode::Item as u32,
         },
@@ -234,12 +238,11 @@ unsafe extern "C" fn accumulate_main(args: *const u8, len: u64) -> Output {
         let (count, _) = read_nat(args, at.checked_add(used)?)?;
         Some((slot, u32::try_from(service).ok()?, count))
     });
-    if let Some((slot, service, count)) = parsed {
+    if let (Some(config), Some((slot, service, count))) = (config(), parsed) {
         let operands: Vec<_> = (0..count)
             .filter_map(|index| fetch(FetchKind::Input, index))
             .filter_map(|input| operand(&input))
             .collect();
-        let config = config();
         let venue = venue(&config, service);
         accumulate(&config, venue, slot, &operands, &mut Service);
     }

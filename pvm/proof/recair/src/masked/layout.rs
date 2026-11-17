@@ -134,7 +134,7 @@ impl MaskLayout {
             coefficients[position] = *value;
         }
         for &position in &self.upper {
-            coefficients[position] = rng.r#gen::<BaseField>();
+            coefficients[position] = super::salts::uniform_m31(rng);
         }
         Ok(CircleCoefficients::new(column))
     }

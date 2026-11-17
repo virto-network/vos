@@ -98,9 +98,15 @@ pub enum Verdict {
         controller: [u8; 32],
     },
     /// An item of `kind` (none: no item's) refused at refine by `code`, its
-    /// kind's ([`RegisterCode`], [`AnchorCode`], [`ControlCode`]).
+    /// kind's ([`RegisterCode`], [`AnchorCode`], [`ControlCode`]), or
+    /// [`UNCONFIGURED`] for every kind.
     Refused { kind: Option<Kind>, code: u32 },
 }
+
+/// The code of every item a service with no configuration refuses at
+/// refine (`config::configured`), whatever its kind: past every kind's
+/// codes.
+pub const UNCONFIGURED: u32 = u32::MAX;
 
 /// A verdict's tag, its first byte: an item's [`Kind`] for the verdict
 /// of its kind, and 4 for a refusal.

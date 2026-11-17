@@ -15,6 +15,12 @@ suite = []
 # BLAKE2b-256, every digest's; without std.
 blake2 = { version = "0.10", default-features = false }
 
+[lints.rust]
+# No `unsafe` in the crate, set here rather than in its source: the agent's
+# guests link it through `vos-abi`, and a line added above its code would
+# move their panic locations and so their program ids.
+unsafe_code = "forbid"
+
 [dev-dependencies]
 # The small-order keys checked against the curve's own arithmetic.
 curve25519-dalek = "4"

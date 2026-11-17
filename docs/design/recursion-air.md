@@ -389,7 +389,11 @@ old `reduce(lo32), reduce(hi32)`, which folded a word ≥ p onto a smaller
 one, retired with the formats that used it. The absorb
 carries no length or tag (`absorb([a]) = absorb([a, 0])`,
 `P/src/poseidon2/mod.rs:531-547`); that is sound only because the transcript's
-shape is fixed, and a circuit pins it.
+shape is fixed, and a circuit pins it. The modes share one permutation
+input space as well: a one-block absorb of `(n, 3, 0, …)` is draw `n`'s
+input, and `mix_u64(n_bits)` the PoW prefix's
+(`vos-pvm-poseidon2`'s `transcript.rs`), which the fixed shape also makes
+harmless.
 
 ### 4.3 Merkle paths over lifted trees
 

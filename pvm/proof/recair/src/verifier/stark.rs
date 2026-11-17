@@ -13,7 +13,7 @@
 
 use stwo::core::pcs::PcsConfig;
 use vos_pvm_proof::SampleLayout;
-use vos_pvm_proof::format::{ChannelKind, Format};
+use vos_pvm_proof::format::{ChannelKind, DeepBatching, Format};
 
 use crate::compile::{Compiled, Input};
 use crate::context::{Bit, Context, Var};
@@ -96,7 +96,7 @@ impl StarkShape {
     /// # Panics
     /// When the format is not a Poseidon2-M31 format at fold step
     /// 1, last layer degree bound 0 and no fixed lifting height, with both
-    /// PoWs; when a compiled component's columns are not the layout's; when
+    /// PoWs, batching its DEEP quotient by powers; when a compiled component's columns are not the layout's; when
     /// a trace tree is not at the lifting height, or the preprocessed tree
     /// above it.
     pub fn new(
@@ -123,6 +123,11 @@ impl StarkShape {
         assert!(
             config.pow_bits > 0 && format.interaction_pow_bits() > 0,
             "both PoWs"
+        );
+        assert_eq!(
+            format.params.batching,
+            DeepBatching::Powers,
+            "the DEEP quotient batched by powers"
         );
         assert_eq!(
             compiled.components.len(),

@@ -900,4 +900,122 @@ mod tests {
         assert_eq!(info(&full), info(&CpuChip));
         assert_eq!(CpuColumns::ALL.width(), Column::COLUMNS_NUM);
     }
+
+    /// An evaluator at a random point: every mask a uniform M31 value in
+    /// each limb, each constraint's value and each relation entry's
+    /// numerator recorded in the AIR's order.
+    struct AtRandom {
+        rng: Rng,
+        constraints: Vec<SecureField>,
+        numerators: Vec<SecureField>,
+    }
+
+    impl EvalAtRow for AtRandom {
+        type F = SecureField;
+        type EF = SecureField;
+
+        fn next_interaction_mask<const N: usize>(
+            &mut self,
+            _interaction: usize,
+            _offsets: [isize; N],
+        ) -> [SecureField; N] {
+            core::array::from_fn(|_| {
+                SecureField::from_m31_array(core::array::from_fn(|_| {
+                    BaseField::from((self.rng.next() % ((1 << 31) - 1)) as u32)
+                }))
+            })
+        }
+
+        fn add_constraint<G>(&mut self, constraint: G)
+        where
+            SecureField: core::ops::Mul<G, Output = SecureField> + From<G>,
+        {
+            self.constraints.push(SecureField::from(constraint));
+        }
+
+        fn combine_ef(values: [SecureField; 4]) -> SecureField {
+            SecureField::from_partial_evals(values)
+        }
+
+        fn write_logup_frac(&mut self, fraction: Fraction<SecureField, SecureField>) {
+            self.numerators.push(fraction.numerator);
+        }
+    }
+
+    /// Every constraint and relation entry a [`ProgramCpuChip`] drops is
+    /// zero on the full CPU's AIR with the cut columns zero, at random
+    /// points: the cut drops nothing live. Over each opcode's program and
+    /// each precompile's call, every set of one column cut, and random
+    /// sets, and random programs of a few opcodes.
+    #[test]
+    fn every_dropped_constraint_and_fraction_is_zero_at_random_points() {
+        let opcodes: Vec<u8> = (0..=u8::MAX)
+            .filter(|&byte| decode_opcode_fast(byte).is_some())
+            .collect();
+        let program = |opcodes: &[u8]| {
+            let mut code: Vec<u8> = opcodes.iter().flat_map(|&op| [op, 0x21, 3]).collect();
+            let mut bitmask: Vec<u8> = opcodes.iter().flat_map(|_| [1, 0, 0]).collect();
+            code.push(Opcode::Trap as u8);
+            bitmask.push(1);
+            CpuColumns::of_code(&code, &bitmask)
+        };
+        let mut sets: Vec<CpuColumns> = opcodes.iter().map(|&op| program(&[op])).collect();
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..32 {
+            let count = 2 + rng.next() % 6;
+            let chosen: Vec<u8> = (0..count)
+                .map(|_| opcodes[(rng.next() % opcodes.len() as u64) as usize])
+                .collect();
+            sets.push(program(&chosen));
+        }
+        for id in [ECALL_BLAKE2B_COMPRESS, ECALL_POSEIDON2, ECALL_WITNESS_INPUT] {
+            let mut code = vec![Opcode::Ecalli as u8];
+            code.extend(id.to_le_bytes());
+            code.push(Opcode::Trap as u8);
+            sets.push(CpuColumns::of_code(&code, &[1, 0, 0, 0, 0, 1]));
+        }
+        for &cut in Column::ALL_VARIANTS {
+            let mut columns = CpuColumns::NONE;
+            for &column in Column::ALL_VARIANTS {
+                if column as usize != cut as usize {
+                    columns.insert(column);
+                }
+            }
+            sets.push(columns);
+        }
+        for _ in 0..64 {
+            let mut columns = CpuColumns::NONE;
+            let keep = rng.next() % 4;
+            for &column in Column::ALL_VARIANTS {
+                if rng.next() % 4 <= keep {
+                    columns.insert(column);
+                }
+            }
+            sets.push(columns);
+        }
+        for (set, columns) in sets.iter().enumerate() {
+            let chip = ProgramCpuChip::new(*columns);
+            for point in 0..2u64 {
+                let mut random = AtRandom {
+                    rng: Rng(1 + 2 * set as u64 + point),
+                    constraints: Vec::new(),
+                    numerators: Vec::new(),
+                };
+                let trace_eval = TraceEval::<PreprocessedColumn, Column, AtRandom>::with_columns(
+                    &mut random,
+                    |column| columns.contains(column),
+                );
+                constraints::all(&mut random, &Row::new(&trace_eval), &Lookups::dummy());
+                assert!(!random.constraints.is_empty());
+                for (index, value) in random.constraints.iter().enumerate() {
+                    let kept = chip.constraints[index / 64] >> (index % 64) & 1 == 1;
+                    assert!(kept || value.is_zero(), "set {set}: constraint {index}");
+                }
+                for (index, numerator) in random.numerators.iter().enumerate() {
+                    let kept = chip.fractions >> index & 1 == 1;
+                    assert!(kept || numerator.is_zero(), "set {set}: fraction {index}");
+                }
+            }
+        }
+    }
 }

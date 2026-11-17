@@ -59,6 +59,12 @@ impl ProgramMemoryChip {
     }
 }
 
+/// The least log size whose rows hold the table: a smaller one cannot pin
+/// it.
+pub(crate) fn table_log_size(side_note: &SideNote) -> u32 {
+    chip_log_size(side_note.code.len())
+}
+
 /// Compute the chip's log_size: at least LOG_N_LANES, large enough to hold
 /// every PC in 0..code_len.  Uses ceil_log2 with a floor at LOG_N_LANES.
 pub(super) fn chip_log_size(code_len: usize) -> u32 {

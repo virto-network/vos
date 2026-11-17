@@ -238,6 +238,34 @@ fn a_program_outside_the_formats_count_is_refused() {
     }
 }
 
+/// A table larger than its chip's log size holds is refused at install, not
+/// pinned cut: a kernel of 4 KiB of read-only data, 512 words, installs at
+/// its shape and is refused with its data table one log size below it.
+#[test]
+fn a_table_past_its_chips_log_size_is_refused_at_install() {
+    let format = format();
+    let mut asm = Assembler::new();
+    asm.set_ro_data(vec![0x5a; 4096]).set_stack_pages(1);
+    asm.load_u8(Reg::T0, RO_BASE + 7);
+    io_and_halt(&mut asm);
+    let kernel = asm.build();
+    let (active, log_sizes) =
+        device_shape(&format, &kernel, &mut run(&kernel, &[])).expect("a shape");
+    let program = install::<P2>(&format, &kernel, active, &log_sizes).expect("installs");
+    let data = device_chips_of_mask(active)
+        .position(|chip| chip == device_chip::DATA_TABLE)
+        .expect("a data table");
+    let floors = vos_pvm_device::masked::device_floors(&format, program.shape()).expect("floors");
+    assert_eq!(log_sizes[data], 9);
+    assert!(floors[data] < 9, "{floors:?}");
+    let mut short = log_sizes.clone();
+    short[data] -= 1;
+    assert_eq!(
+        install::<P2>(&format, &kernel, active, &short).map(|_| ()),
+        Err(vos_pvm_device::Error::Sizes)
+    );
+}
+
 /// A chip the code reaches and the run never uses proves at its program's
 /// log size, every row padding: a kernel whose multiplication follows its
 /// halt.
@@ -650,6 +678,112 @@ fn the_io_hash_is_bound() {
         verify_device::<P2>(&format, program, &blinded),
         Err(Error::Logup)
     ));
+}
+
+/// A tamper of DeviceBoundaryChip's registers' rows: `edit` given each
+/// register, its final value and its final timestamp.
+fn at_the_halt(
+    program: &DeviceProgram<<P2 as MerkleChannel>::H>,
+    edit: impl Fn(usize, &mut u64, &mut u64),
+) -> impl FnOnce(&mut vos_pvm_proof::masked::MaskedDeviceTrace) {
+    use vos_pvm_proof::chips::device_boundary::Column;
+    let position = device_chips_of_mask(program.active)
+        .position(|chip| chip == device_chip::DEVICE_BOUNDARY)
+        .expect("the boundary chip");
+    move |trace| {
+        let log_size = trace.log_sizes[position];
+        let columns = trace.main_columns_mut().nth(position).expect("the chip");
+        let at =
+            |row| bit_reverse_index(coset_index_to_circle_domain_index(row, log_size), log_size);
+        for row in 0..13 {
+            let mut words = [Column::FinalValue, Column::FinalTs].map(|column| {
+                (0..8).fold(0u64, |word, limb| {
+                    let value = columns[column.offset() + limb].as_slice()[at(row)].0;
+                    word | u64::from(value) << (8 * limb)
+                })
+            });
+            let [value, ts] = &mut words;
+            edit(row, value, ts);
+            for (column, word) in [Column::FinalValue, Column::FinalTs].into_iter().zip(words) {
+                for limb in 0..8 {
+                    let byte = (word >> (8 * limb)) as u8;
+                    columns[column.offset() + limb].as_mut_slice()[at(row)] =
+                        BaseField::from(u32::from(byte));
+                }
+            }
+        }
+    }
+}
+
+/// The run's proof forced with `tamper`, the prover held to `checks`.
+fn tampered(
+    program: &DeviceProgram<<P2 as MerkleChannel>::H>,
+    tamper: impl FnOnce(&mut vos_pvm_proof::masked::MaskedDeviceTrace),
+    checks: Checks,
+) -> Result<Proof<P2>, vos_pvm_device::Error> {
+    prove_device_forced::<P2>(
+        &format(),
+        program,
+        &mut run(&blob(), &witness(1)),
+        MaskRng::Seeded(7),
+        tamper,
+        |_, _| {},
+        checks,
+    )
+    .map(|(proof, _)| proof)
+}
+
+/// φ9..12 read at a timestamp before the halt, with the values they held
+/// then (the run's last writes of them come earlier): their rows' final
+/// timestamp is not the other registers', which `IsChained` refuses at the
+/// prover's check; the forced proof is refused by its logup total first,
+/// the register ledger's closing reads being at the halt.
+#[test]
+fn the_io_registers_read_before_the_halt_are_refused() {
+    use vos_pvm_proof::chips::device_boundary::IO_REGISTERS;
+    let program = the_program();
+    let earlier = || {
+        at_the_halt(program, |register, _, ts| {
+            if IO_REGISTERS.contains(&register) {
+                *ts -= 1;
+            }
+        })
+    };
+    assert!(matches!(
+        tampered(program, earlier(), Checks::ALL),
+        Err(vos_pvm_device::Error::Unsatisfied)
+    ));
+    let proof = tampered(program, earlier(), UNCHECKED).expect("a forced proof");
+    let outcome = verify_device::<P2>(&format(), program, &proof);
+    assert!(matches!(outcome, Err(Error::Logup)), "{outcome:?}");
+}
+
+/// A register's final value other than its last write: every constraint
+/// holds, and the register ledger, whose closing read takes the last
+/// write's value, does not balance.
+#[test]
+fn a_final_value_other_than_the_last_write_is_refused() {
+    let program = the_program();
+    let other = at_the_halt(program, |register, value, _| {
+        if register == 7 {
+            *value ^= 1;
+        }
+    });
+    let proof = tampered(program, other, Checks::ALL).expect("every constraint holds");
+    let outcome = verify_device::<P2>(&format(), program, &proof);
+    assert!(matches!(outcome, Err(Error::Logup)), "{outcome:?}");
+}
+
+/// Every register's final timestamp one below the halt's: `IsChained`
+/// holds, and the halt the execution relation produces is not the one
+/// consumed, nor are the registers' closing reads the ledger's.
+#[test]
+fn a_halt_one_below_the_runs_is_refused() {
+    let program = the_program();
+    let early = at_the_halt(program, |_, _, ts| *ts -= 1);
+    let proof = tampered(program, early, Checks::ALL).expect("every constraint holds");
+    let outcome = verify_device::<P2>(&format(), program, &proof);
+    assert!(matches!(outcome, Err(Error::Logup)), "{outcome:?}");
 }
 
 /// The program is the transcript's: a proof verified against another

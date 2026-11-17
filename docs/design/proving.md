@@ -1077,7 +1077,10 @@ ingress's checks and the origins are `identity-and-authority.md` §5–§7.
 first 8 words of the width-16 permutation (4 + 4 full rounds, 14 partial,
 `vos-pvm-poseidon2`'s constants) of `l ‖ r`, each half 8 words, with no
 feed-forward. The `0x402` host call computes exactly `C`, so the
-actor's tree, the node and the phone agree word for word.
+actor's tree, the node and the phone agree word for word. `C` is a
+pseudo-compression (a preimage is one inverse permutation when both
+halves are free): safe in these fixed-depth trees and tagged chains, not
+a general two-input commitment for a kernel (`pvm/proof/SECURITY.md`).
 - **A digest** is 8 M31 words. Its bytes are the words as little-endian
   `u32`s, 32 bytes; a decode refuses a word ≥ p.
 - **A tag** `T(name)` is the 8-word block `[t, 0, 0, 0, 0, 0, 0, 0]`, where

@@ -21,6 +21,12 @@ impl DataWordTableChip {
     }
 }
 
+/// The least log size whose rows hold the table: a smaller one cannot pin
+/// it.
+pub(crate) fn table_log_size(side_note: &SideNote) -> u32 {
+    crate::trace::utils::ceil_log2_at_least_lanes(entries(side_note).len())
+}
+
 /// The table's entries: the data's words, or address 0's zeros when there
 /// is none.
 pub(super) fn entries(side_note: &SideNote) -> Vec<(u32, [u8; WORD_BYTES])> {

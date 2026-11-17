@@ -165,7 +165,7 @@ impl DeviceProgramId {
 }
 
 /// The canonical encoding of a device proof's masked part.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Deserialize)]
 struct Wire {
     format_version: u32,
     interaction_pow: u64,
@@ -173,21 +173,60 @@ struct Wire {
     stark_proof: stwo::core::proof::StarkProof<Hasher>,
 }
 
+/// [`Wire`] borrowed from a proof, for its encoding: the same bytes, no
+/// copy of the proof.
+#[derive(serde::Serialize)]
+struct WireRef<'a> {
+    format_version: u32,
+    interaction_pow: u64,
+    claimed_sums: &'a [stwo::core::fields::qm31::SecureField],
+    stark_proof: &'a stwo::core::proof::StarkProof<Hasher>,
+}
+
+impl<'a> WireRef<'a> {
+    fn of(format: &Format, proof: &'a MaskedProof<Hasher>) -> Self {
+        Self {
+            format_version: format.number,
+            interaction_pow: proof.interaction_pow,
+            claimed_sums: &proof.claimed_sums,
+            stark_proof: &proof.stark_proof,
+        }
+    }
+}
+
+/// A postcard flavor that compares each byte written with `expected`'s at
+/// its place, and stops at the first that differs: whether an encoding is
+/// `expected`, with nothing allocated.
+struct Matches<'a> {
+    expected: &'a [u8],
+    at: usize,
+}
+
+impl postcard::ser_flavors::Flavor for Matches<'_> {
+    type Output = bool;
+
+    fn try_push(&mut self, byte: u8) -> postcard::Result<()> {
+        if self.expected.get(self.at) != Some(&byte) {
+            return Err(postcard::Error::SerializeBufferFull);
+        }
+        self.at += 1;
+        Ok(())
+    }
+
+    fn finalize(self) -> postcard::Result<bool> {
+        Ok(self.at == self.expected.len())
+    }
+}
+
 /// `proof`'s bytes under the device format `format`, the one encoding
 /// [`decode`] reads; `None` when it cannot be encoded.
 pub fn encode(format: &Format, proof: &MaskedProof<Hasher>) -> Option<Vec<u8>> {
-    postcard::to_allocvec(&Wire {
-        format_version: format.number,
-        interaction_pow: proof.interaction_pow,
-        claimed_sums: proof.claimed_sums.clone(),
-        stark_proof: proof.stark_proof.clone(),
-    })
-    .ok()
+    postcard::to_allocvec(&WireRef::of(format, proof)).ok()
 }
 
 /// The proof in `bytes` under the device format `format`: at most
 /// [`MAX_PROOF_BYTES`], read whole and canonical (re-encoded, the same
-/// bytes).
+/// bytes, compared as they are written).
 pub fn decode(format: &Format, bytes: &[u8]) -> Result<MaskedProof<Hasher>, Refusal> {
     if bytes.len() > MAX_PROOF_BYTES {
         return Err(Refusal::Length);
@@ -202,7 +241,16 @@ pub fn decode(format: &Format, bytes: &[u8]) -> Result<MaskedProof<Hasher>, Refu
         claimed_sums: wire.claimed_sums,
         stark_proof: wire.stark_proof,
     };
-    if !rest.is_empty() || encode(format, &proof).as_deref() != Some(bytes) {
+    let canonical = rest.is_empty()
+        && postcard::serialize_with_flavor(
+            &WireRef::of(format, &proof),
+            Matches {
+                expected: bytes,
+                at: 0,
+            },
+        )
+        .unwrap_or(false);
+    if !canonical {
         return Err(Refusal::Decode);
     }
     Ok(proof)

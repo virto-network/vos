@@ -152,10 +152,12 @@ mod imp {
     }
 
     /// Sweep log sizes to find the scale breaking point, with a rough
-    /// memory estimate per shape.
+    /// memory estimate per shape: each proof's committed main and
+    /// interaction columns at their own log sizes, 4 bytes a value, and
+    /// the same on the evaluation domain at the proof's blowup.
     fn scale_sweep() {
+        use vos_pvm_proof::framework_access::create_verifier_components::trace_and_preprocessed_sizes;
         eprintln!("=== Scale sweep (rough memory estimate) ===");
-        eprintln!("  main_cols=286, interaction_cols=~90, constraint_blowup=4");
         eprintln!();
         for log_size in [10, 12, 14, 16, 17, 18, 19].iter() {
             let (mut side_note, n_steps) = add_side_note(*log_size);
@@ -164,14 +166,25 @@ mod imp {
                 Ok(p) => {
                     let elapsed = t.elapsed();
                     let kb = bincode::serialize(&p).unwrap().len() as f64 / 1024.0;
-                    // Rough memory estimate: main + fft domain at constraint blowup 2^4.
-                    let rows = 1u64 << log_size;
-                    let fft_rows = rows * 16;
-                    let field_bytes = 4u64;
-                    let main_mb = rows * 286 * field_bytes / (1024 * 1024);
-                    let fft_mb = fft_rows * 286 * field_bytes / (1024 * 1024);
+                    let (trees, _) = trace_and_preprocessed_sizes(&p.log_sizes, p.component_mask);
+                    let tree = |index: usize| -> (usize, u64) {
+                        trees
+                            .iter()
+                            .filter_map(|sizes| sizes.get(index))
+                            .flatten()
+                            .fold((0, 0), |(columns, values), &size| {
+                                (columns + 1, values + (1u64 << size))
+                            })
+                    };
+                    let (main_cols, main_values) = tree(1);
+                    let (interaction_cols, interaction_values) = tree(2);
+                    let mib = |values: u64| values * 4 / (1024 * 1024);
+                    let blowup = 1u64 << p.pcs_config.fri_config.log_blowup_factor;
+                    let committed = main_values + interaction_values;
                     eprintln!(
-                        "  log_size={log_size:>2} ({n_steps:>7} steps): prove={elapsed:>8.2?}, proof={kb:>5.1} KB, main_trace≈{main_mb}MB, fft_domain≈{fft_mb}MB"
+                        "  log_size={log_size:>2} ({n_steps:>7} steps): prove={elapsed:>8.2?}, proof={kb:>5.1} KB, {main_cols} main and {interaction_cols} interaction columns, committed≈{}MB, extended≈{}MB",
+                        mib(committed),
+                        mib(committed * blowup)
                     );
                 }
                 Err(e) => {

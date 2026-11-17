@@ -4,8 +4,9 @@
 //!
 //! A row PRODUCES the word's `ts = 0` write into the `MemoryWord` relation,
 //! its bytes the word's first touch and its last field `2·permission`, and
-//! its closing read at the row's closing timestamp; `WordMemoryChip` binds
-//! both to the word's accesses.
+//! its closing read at the row's closing timestamp, a witness bound to no
+//! final state; `WordMemoryChip` binds both to the word's accesses, the
+//! closing read its group's last row.
 //!
 //! **The address** is 29 boolean columns, its bits 3..32, so it is a
 //! multiple of [`WORD_BYTES`] and its four limbs are bytes, the low one at

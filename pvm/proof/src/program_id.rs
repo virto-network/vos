@@ -22,7 +22,7 @@
 //! order:
 //!
 //! 1. the domain, `vos/program-id`'s 14 bytes as 7 limbs, and the
-//!    preimage's version, 3 (a u32);
+//!    preimage's version, 1 ([`VERSION`], a u32);
 //! 2. `TRANSPILER_VERSION`, the derivation's version (a u32);
 //! 3. the kernel's `ProgramHash` (32 bytes);
 //! 4. its shape: its chips' mask (a u32), its classes' count (a u32), and

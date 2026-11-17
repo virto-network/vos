@@ -174,6 +174,11 @@ node, `vos` and the JAM statements service's program never). `vos-pvm-device`'s 
 itself, the gates' layer; production enters through `Program` and
 `Verifier` alone.
 
+The kit's vendored manifests keep `other-pins` and `model-judge`: they add
+functions and change none, and `check-kit` refuses them in VOS's build of
+the kit, not in a consumer's. A chain that vendors the kit enables neither
+in its own build.
+
 ### The chip sets
 
 Each chip's check code is its parent file (or directory, its prover

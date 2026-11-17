@@ -8,8 +8,10 @@ use crate::{framework::BuiltInComponent, lookups::ProgramExecutionLookupElements
 
 /// ProgramBoundaryChip: closes the program execution lookup loop.
 ///
-/// Produces (timestamp=0, pc=0) — the initial execution state.
-/// Consumes (timestamp=N, pc=final_next_pc) — the final execution state.
+/// Produces (timestamp, pc) of the segment's first step — its initial
+/// execution state.
+/// Consumes (timestamp + 1, next_pc) of its last step — its final
+/// execution state.
 ///
 /// This ensures that the CpuChip's step chain forms a valid sequence:
 /// boundary→step0→step1→...→stepN-1→boundary.
@@ -18,16 +20,16 @@ pub struct ProgramBoundaryChip;
 
 #[derive(Debug, Copy, Clone, AirColumn)]
 pub enum Column {
-    /// Initial PC (4 limbs) — always 0 for PVM
+    /// Initial PC (4 limbs): the first step's
     #[size = 4]
     InitialPc,
-    /// Initial timestamp (8 limbs) — always 0
+    /// Initial timestamp (8 limbs): the first step's
     #[size = 8]
     InitialTimestamp,
     /// Final next-PC (4 limbs) — the PC after the last instruction
     #[size = 4]
     FinalNextPc,
-    /// Final next-timestamp (8 limbs) — num_steps
+    /// Final next-timestamp (8 limbs): one past the last step's
     #[size = 8]
     FinalNextTimestamp,
     /// 1 for the single real row, 0 for padding

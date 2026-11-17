@@ -24,10 +24,13 @@ use vos_statement::vos_anchor::{
 use vos_statement::vos_pvm_final_verifier::MAX_PROOF_BYTES;
 use vos_statement_service::config::{self, Config};
 use vos_statement_service::item::{
-    Control, Item, MAX_ROOTS, MAX_STATEMENT_BYTES, Op, Register, SignedControl, control_digest,
+    Control, Item, Kind, MAX_ROOTS, MAX_STATEMENT_BYTES, Op, Register, SignedControl,
+    control_digest,
 };
 use vos_statement_service::state::{self, Storage, keys};
-use vos_statement_service::verdict::{AnchorCode, ControlCode, RegisterCode};
+use vos_statement_service::verdict::{
+    AnchorCode, ControlCode, RegisterCode, UNCONFIGURED, Verdict,
+};
 
 use rig::{ACCUMULATE_GAS, EPOCH_MS, Rig, fixture, fixture_rig, load, submit};
 
@@ -135,6 +138,55 @@ fn what_does_not_decode_is_refused() {
     assert_eq!(long, 1);
     let empty = rig.item(Vec::new(), Vec::new());
     assert_eq!((empty.outcome.kind, empty.outcome.code), (None, 1));
+}
+
+/// The program as linked, its configuration block unset, has no venue id
+/// and no clock: it refuses a registration, an anchor, a statement and a
+/// control, each well formed, with the one code `UNCONFIGURED`, and its
+/// accumulate writes no row but its gas.
+#[test]
+fn an_unconfigured_service_refuses_every_item_and_holds_nothing() {
+    let space = founded(1);
+    let live = live_rig(1);
+    let founder = &space.founders[0];
+    let valid = fixture("valid");
+    let op = Op::AddKey(key(0x42).verifying_key().to_bytes());
+    let items = [
+        (Kind::Register, register(&live, &space, founder), Vec::new()),
+        (
+            Kind::Anchor,
+            anchor(&live, &space.id, 1, 7, founder),
+            Vec::new(),
+        ),
+        (
+            Kind::Submit,
+            submit(&valid.input.statement.encode()),
+            vec![valid.proof.clone()],
+        ),
+        (
+            Kind::Control,
+            control(&live, &space.id, 0, op, &space.controller),
+            Vec::new(),
+        ),
+    ];
+    let mut rig = Rig::unconfigured(3);
+    let package: Vec<_> = items
+        .iter()
+        .map(|(_, payload, extrinsics)| (payload.clone(), extrinsics.clone()))
+        .collect();
+    let refined = rig.refine_and_accumulate(&package).refined;
+    for ((kind, _, _), (output, _)) in items.iter().zip(&refined) {
+        let (verdict, _) = Verdict::decode_prefix(output).expect("a verdict");
+        assert_eq!(
+            verdict,
+            Verdict::Refused {
+                kind: Some(*kind),
+                code: UNCONFIGURED
+            }
+        );
+    }
+    let rows: Vec<&[u8]> = rig.storage.keys().map(Vec::as_slice).collect();
+    assert_eq!(rows, [keys::GAS]);
 }
 
 // ── Spaces and anchors ────────────────────────────────────────────────────

@@ -138,6 +138,17 @@ The scale results are in `core-model.md` §14, "The scale test".
   cryptographer's review; if it falls, the masked wrap takes a new number.
 - **The Blake2b host hook** (`0x400`, Kreivo's `blake2_256`) for the final
   verifier, deferred until a venue's compute weight binds.
+- **The segment format's `component_mask`:** format 41's header mixes no
+  mask (`pvm/proof/SECURITY.md`'s segment trust boundary); a kernel's
+  verifier pins the class, and a chip dropped or added only restricts.
+  Mix the mask into the transcript at the next segment format.
+- **The statements service's balance:** a registration costs its sender
+  core time alone, with no deposit as Kreivo takes, and every item writes
+  an outcome and a queue row kept a day while spaces and evidence are
+  never dropped, so anyone who buys core time can walk the service to its
+  threshold, after which every item's accumulate reverts until the
+  operator funds it. What a registration costs the service in bytes is
+  unmeasured.
 - **The external audit's scope:** the device shape, the stock kernels, the
   Poseidon2 chip and their masking, with the recursion AIR, the final
   verifier, `derive` and the security tool's counts. Engage before any

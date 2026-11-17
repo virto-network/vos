@@ -6,9 +6,10 @@
 //!
 //! The block is [`MARKER`], then the genesis hash (32), the genesis time
 //! (8, little-endian), the pins' count (1) and [`MAX_PINS`] pins, each a
-//! program id's 32 bytes; past the count, zeros. An unconfigured program
-//! pins nothing, so it refuses every statement as of another program than
-//! its pins (code 3).
+//! program id's 32 bytes; past the count, zeros. A program whose block is
+//! [`UNSET`] or does not decode ([`configured`]) has no venue id and no
+//! clock: it refuses every item at refine
+//! ([`crate::verdict::UNCONFIGURED`]) and holds no state.
 
 use alloc::vec::Vec;
 
@@ -115,6 +116,16 @@ impl Config {
     }
 }
 
+/// The configuration a linked program's block holds: none when it does not
+/// decode, or is [`UNSET`], as built, whose configuration is no genesis, no
+/// genesis time and no pin. Read from what the block decodes to, so the
+/// program holds no second copy of the block to compare with.
+pub fn configured(block: &[u8; BYTES]) -> Option<Config> {
+    let config = Config::decode(block).ok()?;
+    let unset = config.genesis == [0; 32] && config.genesis_ms == 0 && config.pins.is_empty();
+    (!unset).then_some(config)
+}
+
 /// `program`, a linked service program, configured: its one block replaced
 /// by `config`'s.
 pub fn configure(program: &mut [u8], config: &Config) -> Result<(), ConfigError> {
@@ -146,6 +157,18 @@ mod tests {
             genesis_ms: 1_735_732_800_000,
             pins: vec![ProgramId([1, 2, 3, 4, 5, 6, 7, 8]), ProgramId([9; 8])],
         }
+    }
+
+    /// A linked program is configured by a block that decodes and is not
+    /// the unset one.
+    #[test]
+    fn the_unset_block_and_an_undecodable_one_configure_nothing() {
+        let block = config().encode().unwrap();
+        assert_eq!(configured(&block), Some(config()));
+        assert_eq!(configured(&UNSET), None);
+        let mut other = block;
+        other[0] ^= 1;
+        assert_eq!(configured(&other), None);
     }
 
     /// A configuration's block decodes to it; the unset block to one of no
