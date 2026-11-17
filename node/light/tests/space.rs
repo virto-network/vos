@@ -13,7 +13,7 @@ use vos_abi::Encode;
 use vos_light::space::{Artifacts, CREDENTIAL_BOOK, Claim, DEVICE_BOOK, Error, Personal};
 use vos_light::testing::{Phone, Reach, World, policy};
 use vos_testkit::programs::program_elf;
-use vos_wire::personal::{KitKind, PersonalError, Standing};
+use vos_wire::personal::{KitKind, PersonalError, Policy, Standing};
 
 const HOME: [u8; 32] = [0x61; 32];
 
@@ -94,6 +94,17 @@ impl Device {
     }
 }
 
+/// A world whose homes keep a joiner on probation long past a pairing's
+/// time over the in-process Tor.
+fn world() -> Arc<World> {
+    let world = World::new();
+    world.state.lock().unwrap().policy = Some(Policy {
+        probation_ms: 60_000,
+        ..policy()
+    });
+    world
+}
+
 fn after(ms: u64) {
     std::thread::sleep(Duration::from_millis(ms + 300));
 }
@@ -103,7 +114,7 @@ fn after(ms: u64) {
 /// the state it names.
 #[test]
 fn a_space_is_claimed_and_paired_through_the_light_node() {
-    let world = World::new();
+    let world = world();
     let home = world.home(HOME, 2, 1);
     let first = device(&world, 0x11);
     first.claim(&world, home);
@@ -144,7 +155,7 @@ fn a_space_is_claimed_and_paired_through_the_light_node() {
 /// stays in the set.
 #[test]
 fn a_regroup_removes_what_the_agent_removes() {
-    let world = World::new();
+    let world = world();
     let home = world.home(HOME, 2, 1);
     let first = device(&world, 0x31);
     first.claim(&world, home);
