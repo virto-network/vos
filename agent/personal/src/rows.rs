@@ -52,7 +52,7 @@ impl Candidate {
 
 /// The lease: until when it runs, when the claim took the agent, and
 /// whether a re-proof lifted the quota: one five sixths of a lease after
-/// the claim at least, when the device's yearly prompt first falls.
+/// the claim at least, in the lease's last sixth.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Lease {
     pub until: u64,

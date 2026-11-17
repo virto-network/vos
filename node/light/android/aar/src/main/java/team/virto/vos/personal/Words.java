@@ -82,7 +82,7 @@ public final class Words {
       case Pending.REMOVED:
         return "This device was removed";
       case Pending.STUCK:
-        return "This device cannot follow the others: pair it again";
+        return "This device cannot follow the others: remove it from another, then pair it again";
       default:
         return "The sync found something wrong";
     }

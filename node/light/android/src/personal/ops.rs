@@ -663,14 +663,17 @@ impl Space {
     /// shows it, so a retry sends the same claim.
     pub fn claim(&self, prompts: Lent<'_>, request: Claim) -> Result<Claimed, Refusal> {
         let request = request.check()?;
-        self.claiming(&mut self.held(), prompts, request)
+        self.claiming(&mut self.held(), prompts, request, None)
     }
 
+    /// The claim of `request`, with the device's secret at its home if
+    /// derived already (`ready`).
     fn claiming(
         &self,
         held: &mut Held,
         prompts: Lent<'_>,
         request: Claim,
+        ready: Option<Box<vos_light::DeviceSecret>>,
     ) -> Result<Claimed, Refusal> {
         if held.group.is_some() {
             return Err(refused(
@@ -699,8 +702,13 @@ impl Space {
         }
         self.pin(&kept);
         let home = kept.home.clone();
-        let reference = self.source(prompts, held)?;
-        let secret = secret(prompts, &reference, &home.handle)?;
+        let secret = match ready {
+            Some(secret) => secret,
+            None => {
+                let reference = self.source(prompts, held)?;
+                secret(prompts, &reference, &home.handle)?
+            }
+        };
         let member = vos_light::member(&secret).to_bytes();
         self.open_claim(&home, &member)?;
         let claim = match pending {
@@ -1264,9 +1272,9 @@ impl Space {
     /// its hello (its keys, its "home" nullifier, its key package, its
     /// handle in each offered space, each from its source at its prompt),
     /// the handover, its group joined; the acknowledgement left. A device
-    /// that holds another personal space, or this one's as a device that
-    /// cannot follow it or is out of it, leaves it once the opener's offer
-    /// is read ([`Space::leave`]); one that follows this one is refused.
+    /// that holds another personal space, or this one's once out of it
+    /// (its removal matured), leaves it once the opener's offer is read
+    /// ([`Space::leave`]); one the set still holds live is refused.
     pub fn pair_join(
         &self,
         prompts: Lent<'_>,
@@ -2310,12 +2318,34 @@ impl Space {
         let holds = held.group.is_some()
             || vos_light::home::holds_archive(store).map_err(failed)?
             || held.state.restoring.is_some();
+        let mut ready = None;
         if holds && Claiming::pending(store).map_err(failed)?.is_none() {
+            // Everything the new home could refuse is asked before the
+            // leave, which cannot be undone: its open claim, an agent to
+            // give, and no agent under this device's nullifier there.
             self.pin(&kept);
-            self.pooled(&kept.home)?;
+            let home = &kept.home;
+            let reference = self.source(prompts, &mut held)?;
+            let secret = secret(prompts, &reference, &home.handle)?;
+            self.open_claim(home, &vos_light::member(&secret).to_bytes())?;
+            self.pooled(home)?;
+            let holding: Option<u32> = self.home_query(
+                home,
+                Purpose::Personal,
+                home.homes.0,
+                "agent",
+                home.nullifier(&secret).encode(),
+            )?;
+            if holding.is_some() {
+                return Err(refused(
+                    Refused::Refused,
+                    "this device holds an agent at that home already",
+                ));
+            }
             self.leave(&mut held)?;
+            ready = Some(secret);
         }
-        self.claiming(&mut held, prompts, request)
+        self.claiming(&mut held, prompts, request, ready)
     }
 }
 

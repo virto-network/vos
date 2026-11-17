@@ -7,11 +7,12 @@
 //!
 //! - **What the device keeps** ([`FILE`], and the light node's store under
 //!   [`LIGHT`]): the home and the agent it claimed or joined, the secret
-//!   source's key it proves there with, its admin key's public half (the
-//!   key is the UI's, behind a strong biometric), its label. Every group,
-//!   claim and pairing row is the light node's, each change one batch. The file is versioned ([`STATE_VERSION`]): one this build does
-//!   not read is refused and kept as it is, the personal space named in
-//!   need of repair, sign-in and payments unaffected.
+//!   source's key it proves there with, its admin key's public half (the key is
+//!   the UI's, behind a strong biometric), its label. Every group, claim and
+//!   pairing row is the light node's, each change one batch. The file is
+//!   versioned ([`STATE_VERSION`]): one this build does not read is refused and
+//!   kept as it is, the personal space named in need of repair, sign-in and
+//!   payments unaffected.
 //! - **What a flow keeps before its step at the agent**: each key the
 //!   moment it is made, and the home and agent the flow takes the group to
 //!   before the call that makes it so; a restart finishes what the store

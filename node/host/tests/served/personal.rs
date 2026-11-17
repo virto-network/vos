@@ -1,13 +1,13 @@
-//! A personal space end to end on three nodes (`light-node.md` §3.3,
-//! §3.8), every request as the device library makes it and through a
-//! node's socket with the onion's mark, at a test home whose delays and
-//! lease are seconds and whose open claim's difficulty is low: a phone
-//! joins the home-only space by its open claim and claims a personal agent
-//! there with a phrase kit, sealed to the pooled agent `Homes` names; a
-//! second phone is paired through a slot over Noise, its "home" nullifier
-//! recorded at `Homes` as its add is confirmed; the first enrolls it in another space by its owner proof and it confirms by
-//! its own; the first is retired, removed by the second and revoked in
-//! that space; and a second claim is refused at the device and at `Homes`.
+//! A personal space end to end on three nodes (`light-node.md` §3.3, §3.8),
+//! every request as the device library makes it and through a node's socket
+//! with the onion's mark, at a test home whose delays and lease are seconds and
+//! whose open claim's difficulty is low: a phone joins the home-only space by
+//! its open claim and claims a personal agent there with a phrase kit, sealed
+//! to the pooled agent `Homes` names; a second phone is paired through a slot
+//! over Noise, its "home" nullifier recorded at `Homes` as its add is
+//! confirmed; the first enrolls it in another space by its owner proof and it
+//! confirms by its own; the first is retired, removed by the second and revoked
+//! in that space; and a second claim is refused at the device and at `Homes`.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;

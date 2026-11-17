@@ -48,7 +48,8 @@ byte_enum! {
         Removed = 7 as REMOVED,
         /// The personal space raised an alarm: `detail` names it.
         Alarm = 9 as ALARM,
-        /// This device cannot follow its group: it re-pairs, or regroups.
+        /// This device cannot follow its group: removed from another
+        /// device, it pairs again; or it regroups.
         Stuck = 10 as STUCK,
     }
 }

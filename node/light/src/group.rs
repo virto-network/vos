@@ -1676,7 +1676,7 @@ impl DeviceGroup {
             remove,
             rekey,
         };
-        self.hold(effect, r2, |mls, rows| mls.restart(&[], now / 1000, rows))
+        self.hold(effect, r2, |mls, rows| mls.restart(now / 1000, rows))
     }
 
     /// Pair `device` at `now`: the commit adding it, and what the new

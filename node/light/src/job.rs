@@ -24,7 +24,7 @@
 //!
 //! **A device that cannot follow** (stuck, or out of the group) reads the
 //! log, the overview and the device set, and leaves its scopes alone: it
-//! re-pairs or regroups first. A pass that stops on an error hands back
+//! is removed and pairs again, or regroups, first. A pass that stops on an error hands back
 //! what it had found ([`Stopped`]), its alarms with it.
 //!
 //! **What the chrome raises** ([`Pass::notices`]): the device set's open
@@ -166,8 +166,8 @@ pub enum Notice {
     Restore,
     /// This device is out of the group.
     Removed,
-    /// This device cannot follow the confirmed epoch: it re-pairs, or
-    /// regroups.
+    /// This device cannot follow the confirmed epoch: removed from another
+    /// device, it pairs again; or it regroups.
     Stuck,
     Alarm(Alarm),
 }

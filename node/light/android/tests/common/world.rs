@@ -268,6 +268,8 @@ pub struct Homes {
     key: SigningKey,
     pub pool: Vec<u32>,
     pub kits: HashMap<[u8; 32], u32>,
+    /// The agent each claiming device's nullifier holds.
+    pub nullifiers: HashMap<[u8; 32], u32>,
 }
 
 /// A space's agent: its identity, its credential actor and its tree, its
@@ -440,6 +442,7 @@ impl World {
             key,
             pool: agents,
             kits: HashMap::new(),
+            nullifiers: HashMap::new(),
         });
         agent
     }
@@ -716,6 +719,10 @@ impl State {
             let index = <[u8; 32]>::decode_exact(&query.arguments).unwrap();
             return done(homes.kits.get(&index).copied());
         }
+        if named("agent") {
+            let nullifier = <[u8; 32]>::decode_exact(&query.arguments).unwrap();
+            return done(homes.nullifiers.get(&nullifier).copied());
+        }
         panic!("no such query")
     }
 
@@ -791,6 +798,7 @@ impl State {
                 };
             };
             homes.pool.remove(at);
+            homes.nullifiers.insert(device.nullifier, chosen);
             for entry in &kit.entries {
                 homes
                     .kits

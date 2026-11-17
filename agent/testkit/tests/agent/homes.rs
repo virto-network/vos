@@ -804,8 +804,8 @@ fn the_cap_keeps_the_pool_and_an_empty_pool_is_pool_empty() {
 }
 
 /// The quota ramps: a claimed agent holds the policy's smaller quota until
-/// a re-proof through `Homes` five sixths of a lease after its claim, when
-/// the device's yearly prompt first falls, and the larger one after; a
+/// a re-proof through `Homes` five sixths of a lease after its claim, in
+/// the lease's last sixth, and the larger one after; a
 /// re-proof made at once renews the lease and lifts nothing.
 #[test]
 fn the_quota_ramps_at_the_first_yearly_re_proof() {

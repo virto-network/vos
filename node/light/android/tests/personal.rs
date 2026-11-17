@@ -693,7 +693,8 @@ fn a_fourth_phone_pairs_after_an_admin_replacement() {
 /// no more, pair again from it, each leaving the space it held and joining
 /// with new keys at the same agent; a fourth phone then pairs, the
 /// second's vote the one its commit needs, and all three hold the new
-/// group's keys, the third's old ones no more.
+/// group's keys, the third's old ones no more. A live device scanning
+/// its own space's code is refused.
 #[test]
 fn after_a_regroup_the_others_pair_again() {
     let (world, first, second, third) = three_phones(0xa1);
@@ -740,6 +741,31 @@ fn after_a_regroup_the_others_pair_again() {
     let devices = fourth.node.personal().unwrap().devices().unwrap();
     let standing: Vec<_> = devices.iter().filter(|device| !device.removed).collect();
     assert_eq!(standing.len(), 3, "{devices:?}");
+
+    // A device the set holds live scanning its own space's code is
+    // refused, and keeps the store and keys it has.
+    let sync = fourth.node.space().unwrap().sync_key();
+    let code = first
+        .node
+        .personal()
+        .unwrap()
+        .pair_offer(&*first.hand)
+        .unwrap();
+    let refused = fourth
+        .node
+        .personal()
+        .unwrap()
+        .pair_join(&*fourth.hand, &code.code, "again")
+        .unwrap_err();
+    assert!(
+        refused.message.contains("in that personal space already"),
+        "{refused:?}"
+    );
+    assert_eq!(fourth.node.space().unwrap().sync_key(), sync);
+    assert_eq!(
+        fourth.node.space().unwrap().scope_key(b"notes").unwrap(),
+        key
+    );
 }
 
 /// A space the first phone enrolls in after its claim: recorded in the

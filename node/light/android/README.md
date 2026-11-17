@@ -97,32 +97,32 @@ with the last.
 ## The personal space
 
 The device's personal space (VOS's `light-node.md` §3): the light node under
-`light/`, its group at the personal agent, and the flows the chrome drives:
-the claim at a home-only space with a phrase or a security-key kit; pairing,
-as the device that shows the code and as the one that scans it; the
-memberships a pairing leaves (an enrollment owed, a confirmation); the
-device set (remove, veto, cosign, resolve, rotate the kit, replace the admin
-key, a regroup keeping this device alone, a commit now); a restore from the
-kit; a move home (leave, claim at the new home; the other devices pair again
-from it, leaving the space they held). Each admin call is signed by the admin key, an Ed25519 key in the
+`light/`, its group at the personal agent, and the flows the chrome drives: the
+claim at a home-only space with a phrase or a security-key kit; pairing, as the
+device that shows the code and as the one that scans it; the memberships a
+pairing leaves (an enrollment owed, a confirmation); the device set (remove,
+veto, cosign, resolve, rotate the kit, replace the admin key, a regroup keeping
+this device alone, a commit now); a restore from the kit; a move home (leave,
+claim at the new home; the other devices pair again from it, leaving the space
+they held). Each admin call is signed by the admin key, an Ed25519 key in the
 UI's Keystore behind a strong biometric (`IVosPrompts.signKey`). The light
 node's artifacts (`release/agent.program`, `release/*-book.package`) are
-embedded, `just facility-release` writes them with the stock kernels', and
-the tests run this tree's personal agent in process. A local actor
-installed at an earlier release than the app carries is upgraded in place.
+embedded, `just facility-release` writes them with the stock kernels', and the
+tests run this tree's personal agent in process. A local actor installed at an
+earlier release than the app carries is upgraded in place.
 
-What the device keeps beside the light node is `personal.state`, versioned:
-a file or a store this build does not read is refused and left as it is,
-the personal space named in need of repair, sign-in and payments unaffected.
-Each flow keeps its keys the moment it makes them, and the home and agent it
-goes to before the call that makes it so: `:vos` killed at any step leaves a
-flow that the same call resumes (a claim, a restore, a move: no new kit, no
-second agent) or the background job finishes (a pairing's acknowledgement,
-the credential book's records). Leaving a personal space (a move, a pairing
-from another one) makes the light node's store anew under `light.<n>`, made
-the device's by one write of `personal.state`, the old store deleted after. `tests/crashes.rs` kills it at
-each request of each flow. A device paired in enrolls in each offered space
-with the key its handle there came from.
+What the device keeps beside the light node is `personal.state`, versioned: a
+file or a store this build does not read is refused and left as it is, the
+personal space named in need of repair, sign-in and payments unaffected. Each
+flow keeps its keys the moment it makes them, and the home and agent it goes to
+before the call that makes it so: `:vos` killed at any step leaves a flow that
+the same call resumes (a claim, a restore, a move: no new kit, no second agent)
+or the background job finishes (a pairing's acknowledgement, the credential
+book's records). Leaving a personal space (a move, a pairing from another one)
+makes the light node's store anew under `light.<n>`, made the device's by one
+write of `personal.state`, the old store deleted after. `tests/crashes.rs` kills
+it at each request of each flow. A device paired in enrolls in each offered
+space with the key its handle there came from.
 
 ## Tor
 

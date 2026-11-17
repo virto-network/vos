@@ -204,7 +204,7 @@ The scale results are in `core-model.md` §14, "The scale test".
   claim (E28) move to slice 9, so no device proves `Homes.renew`, and a
   joiner holds no leaf at a home-only home to prove it with. Each agent's
   lease runs out 13 months after its claim and it enters its 180 days'
-  grace (pushes refused; reads, a restore and a move still served) unless
+  grace (pushes refused; reads and a restore still served) unless
   slice 9 ships both before then or the home sets a longer lease
   (`Policy::lease_ms`, 395 days by default). `Homes.renew`, `Personal.renew`, the
   recorded nullifiers, the lease and the grace stay built.
@@ -215,6 +215,16 @@ The scale results are in `core-model.md` §14, "The scale test".
   any commit of a device renews its own leaf ("Commit now" makes one), so
   a device that commits nothing for a year blocks the next pairing until
   it commits or is removed.
+- **No notice of a lapsed lease** [risk, dated 2026-11-17, decision 16]:
+  the notice that raised the yearly re-proof also raised a lapsed lease,
+  and went with it; a lapsed agent's pushes are refused (`Lapsed`) with
+  no notice of its own. Slice 9's re-proof flow brings both back.
+- **A left personal space's admin key** [known limit, dated 2026-11-17]:
+  a leave (a move, a pairing from another space) drops the light node's
+  store and keys but leaves the admin key in the UI's keystore, where it
+  could still sign at the old agent, at which the device stays listed
+  until its other devices remove it. Deleting it needs a prompts call of
+  its own.
 - **Scope checkpoints** [slice 9, dated 2026-11-17, decision 16;
   `light-node.md` §3.6, §8 C4; `node/light/SECURITY.md`]: a newly paired
   or restored device reads each scope from its start and has read no

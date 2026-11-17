@@ -451,8 +451,8 @@ admitted. What its operators are trusted with, and the limits that stay
   which the app states.
 - **The lease and the pool.** An agent lapses when its yearly re-proof
   stops (an expelled member's included), 13 months after the last, into
-  180 days of grace in which it serves reads, a restore, a removal and a
-  move and refuses pushes (B14); reaping after the grace is later work.
+  180 days of grace in which it serves reads, a restore and a removal,
+  and refuses pushes (B14); reaping after the grace is later work.
   No device makes the re-proof in slice 8 (decision 16), so every agent
   lapses 13 months after its claim unless the home sets a longer lease
   (`docs/design/open.md`). A move home is a leave and a new claim: the

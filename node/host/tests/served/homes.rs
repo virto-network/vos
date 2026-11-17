@@ -1,13 +1,13 @@
 //! The home on three nodes of a founded space (`light-node.md` §3.3): the
 //! home's agent holding the credential actor and `Homes`; the keeper
-//! (`vos-keeper`) making 200 personal agents, each `Personal` installed
-//! and the home's agent granted its role `homes`, and stocking them; each
-//! claimed by a member's proof of `Auth("home")`, made as a device makes
-//! it, and assigned by `Personal`'s answer across agents; a member joining
-//! by the open claim, its work found by the device library, and claiming
-//! the agent the keeper tops the pool up with; a double claim
-//! refused at `Homes`; the scope "home" proving nothing but a claim; and the keeper's upgrade across the pool in batches, stopping
-//! at the batch an install refuses.
+//! (`vos-keeper`) making 200 personal agents, each `Personal` installed and the
+//! home's agent granted its role `homes`, and stocking them; each claimed by a
+//! member's proof of `Auth("home")`, made as a device makes it, and assigned by
+//! `Personal`'s answer across agents; a member joining by the open claim, its
+//! work found by the device library, and claiming the agent the keeper tops the
+//! pool up with; a double claim refused at `Homes`; the scope "home" proving
+//! nothing but a claim; and the keeper's upgrade across the pool in batches,
+//! stopping at the batch an install refuses.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -84,10 +84,10 @@ impl Founded {
     /// The home, its agents configured with `policy` before their claims.
     pub(crate) fn with(policy: Policy) -> Self {
         let cluster = Cluster::founded(SEED, Some(WindowClock::DEFAULT));
-        Self::on(Arc::new(cluster), HANDLE, policy)
+        Self::on(Arc::new(cluster), policy)
     }
 
-    fn on(cluster: Arc<Cluster>, handle: [u8; 32], policy: Policy) -> Self {
+    fn on(cluster: Arc<Cluster>, policy: Policy) -> Self {
         let agent = cluster
             .node(1)
             .unwrap()
@@ -134,7 +134,7 @@ impl Founded {
             auth: DeviceProgram::from_release(&device).unwrap(),
         };
         founded
-            .write::<(), CredentialError>(CREDENTIALS, "found", handle)
+            .write::<(), CredentialError>(CREDENTIALS, "found", HANDLE)
             .unwrap();
         founded
             .write::<(), HomesError>(

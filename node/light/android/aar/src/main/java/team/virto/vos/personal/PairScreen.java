@@ -167,6 +167,15 @@ final class PairScreen extends Screen {
       return;
     }
     String name = label.trim();
+    app.ask(
+        "Join this personal space?",
+        "A personal space this phone holds now is left for good: what this phone keeps of "
+            + "it is deleted, and its other devices should remove this one.",
+        "Join",
+        () -> joined(scanned, name));
+  }
+
+  private void joined(byte[] scanned, String name) {
     app.run(
         "Joining your personal space…",
         (personal, prompts, refused) -> personal.pairJoin(scanned, name, prompts, refused),
@@ -180,9 +189,7 @@ final class PairScreen extends Screen {
                       ? " Confirm its "
                           + paired.memberships
                           + " membership(s) from Devices, changes and keys."
-                      : "")
-                  + " Its membership at your home is made in the background within a few "
-                  + "hours, at a random time, so the home cannot tell it is this pairing's.");
+                      : ""));
         },
         (personal, prompts, refused) -> {
           personal.pairCancel();

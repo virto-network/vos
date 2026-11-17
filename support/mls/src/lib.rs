@@ -632,21 +632,19 @@ impl Mls {
         })
     }
 
-    /// Restart: a new group of this member at `time`, its commit adding
-    /// the devices of `adds` (their key packages) applied at once and
-    /// held, the current group kept until the restart is swapped in. The
-    /// new group's state, the held commit and the caller's `rows` of it in
-    /// one batch, written before this returns.
+    /// Restart: a new group of this member alone at `time`, its commit
+    /// applied at once and held, the current group kept until the restart
+    /// is swapped in. The new group's state, the held commit and the
+    /// caller's `rows` of it in one batch, written before this returns.
     pub fn restart(
         &mut self,
-        adds: &[Vec<u8>],
         time: u64,
         rows: impl FnOnce(&Commit) -> Writes,
     ) -> Result<Commit, Error> {
         if self.held_row()?.is_some() {
             return Err(Error::Held);
         }
-        match self.started(adds, time) {
+        match self.started(time) {
             Ok(commit) => {
                 self.flush(rows(&commit))?;
                 Ok(commit)
@@ -659,7 +657,7 @@ impl Mls {
         }
     }
 
-    fn started(&mut self, adds: &[Vec<u8>], time: u64) -> Result<Commit, Error> {
+    fn started(&mut self, time: u64) -> Result<Commit, Error> {
         let mut group = self
             .client
             .create_group(
@@ -668,17 +666,12 @@ impl Mls {
                 Some(MlsTime::from(time)),
             )
             .map_err(|error| self.failure(error))?;
-        let mut builder = group.commit_builder().commit_time(MlsTime::from(time));
-        for package in adds {
-            builder = builder.add_member(MlsMessage::from_bytes(package)?)?;
-        }
-        let output = builder.build()?;
+        let output = group
+            .commit_builder()
+            .commit_time(MlsTime::from(time))
+            .build()?;
         group.apply_pending_commit()?;
         let handshake = output.commit_message.to_bytes()?;
-        let welcome = match output.welcome_messages.first() {
-            Some(welcome) => Some(welcome.to_bytes()?),
-            None => None,
-        };
         let epoch = group.current_epoch();
         let held = Held {
             hash: handshake_hash(&handshake),
@@ -690,7 +683,7 @@ impl Mls {
         self.namespace.put(NEXT, Some(group.group_id().to_vec()));
         Ok(Commit {
             handshake,
-            welcome,
+            welcome: None,
             epoch,
         })
     }

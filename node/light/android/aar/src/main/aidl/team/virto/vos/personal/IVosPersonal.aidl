@@ -64,8 +64,8 @@ interface IVosPersonal {
 
     /**
      * Join through a scanned code, this device named `label`: one that holds another personal
-     * space, or this one's as a device that cannot follow it or is out of it (after a move or a
-     * regroup), leaves it first.
+     * space, or this one's once out of it (its removal matured, as after a regroup), leaves it
+     * first; one the set still holds live is refused.
      */
     Paired pairJoin(in byte[] code, String label, IVosPrompts prompts, out Refusal refused);
 

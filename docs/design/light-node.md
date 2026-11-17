@@ -65,7 +65,7 @@ devices decrypt each other's messages".
 | E12 | Keep MLS, built as one shared `vos-mls` layer: the personal space its first user, member messaging and virtual clients later; one stack, fewer pieces. |
 | E13 | P2 (the shielded pool, the wallet, PG4) moves to slice 9, built on the finished personal space and Tor. Slice 8 ships P1. |
 | E14 | A home-only space by default: a space the user holds no other membership in, hosting personal agents. A user may home in a space they belong to, the app stating that its operators can link the agent to them. |
-| E15 | A yearly membership re-proof (`Auth("home")`, one prompt a year) keeps the agent; an expelled member's agent lapses into a grace period, its data recoverable by the kit or a move. [Amended 2026-11-17, decision 16: the device's re-proof flow moves to slice 9; `Homes`' `renew`, the lease and the grace stay built.] |
+| E15 | A yearly membership re-proof (`Auth("home")`, one prompt a year) keeps the agent; an expelled member's agent lapses into a grace period, its data recoverable by the kit or a move. [Amended 2026-11-17, decision 16: the device's re-proof flow moves to slice 9; `Homes`' `renew`, the lease and the grace stay built; a move makes no call to the old home, so the grace serves the kit's restore.] |
 | E16 | Recovery in slice 8: the phrase or printed kit, and a FIDO2 security key as a kit (the `hmac-secret` path). An encrypted export file is later. |
 | E17 | Tor-only is a rule for the personal agent: it refuses anything that did not come through the onion service. Bridges and pluggable transports weighed for slice 8 against later (§6.5). |
 | E18 | cipher-clerk v0.4 (the shielded redesign, R1–R11) moves to slice 9 with P2; P1 runs on v0.3.0 unchanged. |
@@ -567,7 +567,8 @@ built]:
   needs [built]), the inbox, pairing slots, and any commit but one
   carrying a removal and no add, and still takes device-set
   operations, `alive` and confirmations, serves the devices' and the
-  kit's reads, a restore (§3.5) and the move to another home (§3.9), so
+  kit's reads and a restore (§3.5; a move to another home, §3.9, makes no
+  call to the old home), so
   the data stays recoverable and a stolen phone can still be removed. A
   re-proof ends the grace.
 - **On a test home** the delays of §3.5 and the lease are set per space
@@ -1916,8 +1917,8 @@ skip expired items, each write deletes a few; no timer).
 4. **A adds B in one admin call, on one prompt:** for a strong admin an
    add is immediate, so the add and its commit are one call,
    `commit(epoch, add(B's keys, B's "home" nullifier), handshake,
-   welcome_hash)` (B computes its nullifier from its own member secret;
-   its membership in the home follows below), with B's Welcome in the
+   welcome_hash)` (B computes its nullifier from its own member secret),
+   with B's Welcome in the
    evidence call. B is in probation, and reads and writes at once through
    the archive. A delayed admin's add is an operation first and its
    commit, after the 72 h, a second call.
@@ -2122,7 +2123,7 @@ where the text above leaves a choice, this is the one taken]:
   keep it: the control log, each scope's ciphertext, the recovery
   envelopes and the old kit's entries. The moved devices are never
   removed there. Its lease lapses 13 months after its claim, then refuses
-  pushes and serves reads, a restore and a move for the 180 days' grace
+  pushes and serves reads and a restore for the 180 days' grace
   (B14); reaping is later work. An old kit kept across the move still
   restores there, and reads the history to the move.
 - *Known limits:* each scope's id and a reused kit's index at `Homes` are
@@ -3778,7 +3779,10 @@ device's crates faster); Q9's size argument for it is small.
   device's by one write of the state file, which keeps the secret source
   and the label and drops the home, the agent, the admin key's public
   half and every flow's state; the old directory is deleted after, or at
-  the next open. A move home is a leave and a claim (§3.9); a pairing
+  the next open. The old admin key stays in the UI's keystore, unused
+  (`open.md`). A move home is a leave and a claim (§3.9), the new home
+  asked first for all it could refuse (its open claim, an agent to give,
+  no agent under the device's nullifier); a pairing
   leaves first when the device holds another personal space, or this
   one's while the set no longer holds it live (the agent admits its key
   no more), and is refused while the set holds it live. The light node's
@@ -4050,13 +4054,16 @@ for a fresh nullifier at each round, is held to its enrollments of the
 year at a home that is the user's own space: its limit and two
 replacements (§3.8), so at most that many agents a period, each lapsing
 13 months after its last re-proof, which a revoked leaf cannot make. At a
-home-only space each device's open claim is under the period's cap.
+home-only space each device's open claim is under the period's cap (only
+the claiming device's in slice 8, decision 16).
 
 **B14. A member is expelled, or stops re-proving.** *Mitigation:* the
 lease lapses 13 months after the last re-proof; the agent then refuses
-pushes for 180 days of grace but serves reads, a restore and a move, so the
+pushes for 180 days of grace but serves reads and a restore, so the
 data stays recoverable (E15). Each device's home nullifier is recorded at
-its add, so any device can re-prove even after the claiming one is gone.
+its add, so any device can re-prove even after the claiming one is gone
+(slice 9: a joiner holds no leaf at a home-only home to prove with,
+decision 16).
 *Known limit:* reaping after the grace is later work; no device re-proves
 in slice 8 (decision 16; `open.md`). (8.14)
 
@@ -4344,7 +4351,8 @@ given to any space; devices poll and raise local notifications. (8.22)
 
 **L5. Device changes and counts link the agent to the member.**
 *Mitigation:* at a home-only space each device joins by its own open
-claim and the registrar has no person to count. *Known limit* at a home
+claim and the registrar has no person to count (in slice 8 only the
+claiming device joins, decision 16, which the operators see no less). *Known limit* at a home
 that is the user's own space, stated in the app. (8.14, 8.23a)
 
 **L6. `once` scopes with one leaf per device** admit a member once per

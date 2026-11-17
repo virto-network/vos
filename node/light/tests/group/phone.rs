@@ -211,7 +211,7 @@ impl Phone {
         }
     }
 
-    /// Commit an update now: the yearly prompt's, carrying every matured
+    /// Commit an update now ("Commit now"), carrying every matured
     /// removal.
     pub fn update(&mut self, home: &mut Home) -> Result<Candidacy, PersonalError> {
         let prepared = self.group().commit(None, home.now()).unwrap();
