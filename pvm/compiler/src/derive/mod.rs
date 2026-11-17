@@ -65,7 +65,10 @@
 //!
 //! **Bounded work:** every lookup is logarithmic, and a kernel is built
 //! from what its entry reaches alone, so a derivation's work grows with the
-//! ELF once and with each kernel's reach and size, whatever the ELF claims.
+//! ELF once and with each kernel's reach and size, whatever the ELF claims:
+//! the sections it copies hold at most the file's bytes, the walk reads
+//! each code byte once however function ranges overlap, and the programs
+//! it keeps hold at most [`MAX_DERIVED`] bytes.
 //!
 //! **Bit-reproducible:** the output's order comes from sorted sections,
 //! symbols and addresses, never from a map's iteration, so the same ELF and
