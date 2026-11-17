@@ -33,7 +33,9 @@ writes the kit into `<dir>`: from the working tree, or from `--rev`'s
 commit. A kit vendored from uncommitted sources says so in `VENDOR`, and no
 sync accepts it; a release vendors from a tag, and a sync refuses a kit
 that names none (`--allow-untagged`, against a local clone alone, for
-VOS's own checks).
+VOS's own checks). It refuses conformance vectors that do not describe
+the fixtures it carries: a proof of another length or hash, a patch or a
+byte range past its fixture.
 
     python3 -I vos_kit.py sync <dir> [--vos <local clone or https:// URL>] [--scratch <dir>]
 
@@ -50,7 +52,14 @@ Rust.
 
 A consumer never runs the kit's own copy of this script, which the kit's
 changes could replace: `vos-sync.sh`, kept outside the kit, takes the
-script from the tag in VOS's canonical repository and runs that.
+script from the tag in VOS's canonical repository and runs that, and
+refuses a kit whose `VENDOR` names another tag than the one the consumer
+expects. The tags are not signed: push access to the canonical
+repository is what the sync's trust rests on.
+
+The kit ships no lock file: a consumer's build resolves the crates'
+dependencies on its own lock. `pvm/proof/kit/Cargo.lock` is the one VOS's
+`just check-kit` builds the kit on.
 """
 
 import argparse
@@ -458,6 +467,7 @@ def kit(tree: Tree) -> dict[str, bytes]:
         files[f"fixtures/{Path(path).name}"] = tree.files[path]
     for path, name in CONFORMANCE:
         files[f"conformance/{name}"] = tree.read(path)
+    vectors_fit(files)
     for path, name in LICENSES:
         files[name] = tree.read(path)
     files[KIT_SCRIPT] = tree.read(SCRIPT)
@@ -488,6 +498,56 @@ def kit(tree: Tree) -> dict[str, bytes]:
     ]
     files[VENDOR] = ("\n".join(lines) + "\n").encode()
     return files
+
+
+def vectors_fit(files: dict[str, bytes]) -> None:
+    """The conformance vectors describe the fixtures the kit carries:
+    `mutations.json`'s proof is the kit's by length and BLAKE2b-256, each
+    patch lies within the bytes it patches, and every `{fixture, from, to}`
+    of `spaces.json` names a fixture of the kit and lies within it. A
+    fixture written anew without the vectors fails here: the reference
+    mock writes them (`tools/kreivo/conformance`, `just conformance` on the
+    node side)."""
+    stale = "the conformance vectors (tools/kreivo/conformance, written by the reference mock) do not describe the kit's fixtures"
+
+    def fixture(name) -> bytes:
+        if not isinstance(name, str) or f"fixtures/{name}" not in files:
+            raise KitError(f"{stale}: they name a fixture {name!r} the kit does not carry")
+        return files[f"fixtures/{name}"]
+
+    def within(patches, length: int, what: str) -> None:
+        for patch in patches:
+            if not 0 <= patch["offset"] <= patch["offset"] + patch["removed"] <= length:
+                raise KitError(f"{stale}: {patch['name']!r} patches past {what}'s {length} bytes")
+
+    mutations = json.loads(files["conformance/mutations.json"])
+    proof = fixture(mutations["proof"])
+    digest = hashlib.blake2b(proof, digest_size=32).hexdigest()
+    if (mutations["proof_length"], mutations["proof_blake2b_256"]) != (len(proof), digest):
+        raise KitError(
+            f"{stale}: mutations.json names a {mutations['proof']} of {mutations['proof_length']} bytes "
+            f"({mutations['proof_blake2b_256']}), the kit's is {len(proof)} bytes ({digest})"
+        )
+    within(mutations["proof_mutants"] + mutations["masked_field_mutants"], len(proof), mutations["proof"])
+    within(mutations["statement_mutants"], len(bytes.fromhex(mutations["statement"])), "the statement")
+
+    def ranges(value):
+        if isinstance(value, dict):
+            if "fixture" in value:
+                yield value
+            else:
+                for item in value.values():
+                    yield from ranges(item)
+        elif isinstance(value, list):
+            for item in value:
+                yield from ranges(item)
+
+    for cut in ranges(json.loads(files["conformance/spaces.json"])):
+        length = len(fixture(cut["fixture"]))
+        if not 0 <= cut["from"] <= cut["to"] <= length:
+            raise KitError(
+                f"{stale}: spaces.json cuts {cut['fixture']} at {cut['from']}..{cut['to']}, past its {length} bytes"
+            )
 
 
 def tree_hash(files: dict[str, bytes]) -> str:

@@ -3,7 +3,11 @@
 """The sync check's own test (`just check-kit`), on a scratch clone of VOS
 with a test tag at `--rev`:
 - a kit vendored at the tag syncs, by `vos_kit.py` and by the consumer's
-  bootstrap `vos-sync.sh`;
+  bootstrap `vos-sync.sh` given the tag it expects; a kit vendored at
+  another tag syncs by `vos_kit.py` and is refused by the bootstrap given
+  the first;
+- a fixture the conformance vectors do not describe (a byte of the wrap
+  changed) is refused by the vendoring;
 - one byte changed in any vendored file is refused, whether `VENDOR`'s hash
   is left as it was or recomputed over the change; so is a file added or
   removed;
@@ -49,9 +53,9 @@ class Check:
     def sync(self, kit: Path) -> subprocess.CompletedProcess:
         return run("sync", str(kit), "--vos", str(self.clone), "--scratch", str(self.scratch / "work"))
 
-    def bootstrap(self, kit: Path) -> subprocess.CompletedProcess:
+    def bootstrap(self, kit: Path, expected: str = TAG) -> subprocess.CompletedProcess:
         return subprocess.run(
-            ["bash", str(BOOTSTRAP), str(kit), str(self.clone)],
+            ["bash", str(BOOTSTRAP), str(kit), expected, str(self.clone)],
             capture_output=True,
             text=True,
             check=False,
@@ -105,6 +109,7 @@ def main() -> None:
     git("clone", "--quiet", "--bare", "--shared", "--no-tags", common, str(clone))
     git("-C", str(clone), "tag", TAG, commit)
     git("-C", str(clone), "tag", f"{TAG}-other", f"{commit}^")
+    git("-C", str(clone), "tag", f"{TAG}-also", commit)
     check = Check(scratch, clone)
 
     kit = scratch / "kit"
@@ -112,6 +117,28 @@ def main() -> None:
     check.accepted(done, "vendoring at the test tag")
     check.accepted(check.sync(kit), "a kit vendored at a tag")
     check.accepted(check.bootstrap(kit), "a kit vendored at a tag, by the bootstrap")
+
+    # A kit of another tag is VOS's there, and not the tag the consumer
+    # expects.
+    other = scratch / "other"
+    check.accepted(run("vendor", str(other), "--repo", str(clone), "--rev", f"{TAG}-also"), "vendoring at another tag")
+    check.accepted(check.sync(other), "a kit vendored at another tag")
+    check.refused(check.bootstrap(other), f"names tag {TAG}-also, expected {TAG}", "a kit of another tag, by the bootstrap")
+    shutil.rmtree(other)
+
+    # The wrap changed under the vectors: the vendoring refuses it.
+    checkout = scratch / "checkout"
+    git("clone", "--quiet", "--shared", "--branch", TAG, str(clone), str(checkout))
+    wrap = checkout / "pvm/proof/fixtures/wrap.proof"
+    content = bytearray(wrap.read_bytes())
+    content[len(content) // 2] ^= 0x01
+    wrap.write_bytes(bytes(content))
+    check.refused(
+        run("vendor", str(scratch / "stale"), "--repo", str(checkout)),
+        "do not describe the kit's fixtures",
+        "a wrap the conformance vectors do not describe",
+    )
+    shutil.rmtree(checkout)
 
     victims = [
         "vos-statement/src/lib.rs",
@@ -171,7 +198,8 @@ def main() -> None:
     shutil.rmtree(scratch, ignore_errors=True)
     print(
         f"the sync check refuses a one-byte change in each of {len(victims)} vendored files, a file "
-        "added and one removed, a kit's own script, and VENDOR's untagged, malformed or moved names"
+        "added and one removed, a kit's own script, VENDOR's untagged, malformed or moved names and a "
+        "tag the consumer does not expect; the vendoring refuses a wrap its vectors do not describe"
     )
 
 
