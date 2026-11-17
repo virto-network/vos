@@ -155,6 +155,19 @@ test-proof: build-test-actors build-programs build-final-verify judge-wasm
     cargo test -p vos-pvm-recair --test recursion wrap_files:: -- --test-threads=1
     just test-carriers
 
+# The proving gates' counts only a proving run measures, written anew
+# (`VOS_PINS=write`) after a change that moves format 39: the masked
+# wrap's verify gas and Wasm instructions over seeds and at the fitted
+# worst shape (`pvm/proof/counts.txt`), and the node's predicate wrap
+# (`node/kernel-tests/tests/counts.txt`). Under the 12 GiB limit
+# `test-proof` names; in no tier, as `repin` is in none.
+repin-proof: build-test-actors build-programs build-final-verify judge-wasm
+    with-env { VOS_PINS: "write" } { cargo test -p vos-pvm-recair --features heavy-gates --test recursion heavy_the_verify_gates_hold_over_seeds -- --exact --test-threads=1 }
+    with-env { VOS_PINS: "write" } { cargo test -p vos-kernel-tests --features debug-internals --test kernel kernel_shape::the_predicate_wraps -- --exact --test-threads=1 }
+    cargo test -p vos-pvm-recair --features heavy-gates --test recursion heavy_the_verify_gates_hold_over_seeds -- --exact --test-threads=1
+    cargo test -p vos-kernel-tests --features debug-internals --test kernel kernel_shape::the_predicate_wraps -- --exact --test-threads=1
+    git status --porcelain -- pvm/proof/counts.txt node/kernel-tests/tests/counts.txt
+
 # The carrier audit (`proving.md` §5's R7, `vos_checker::carriers`):
 # three nodes proving a read's statement with the masked prover, every
 # debug output's environment set, and every carrier of the run searched for
@@ -431,8 +444,8 @@ blobs-lock: build-blobs
 #    counts over them, `pvm/proof/counts.txt`: a statement judged
 #    and refined on the JAM-only host, the one-segment masked wrap's verify
 #    (the heavy gates' counts and the node's,
-#    `node/kernel-tests/tests/counts.txt`, are `test-proof`'s runs under
-#    `VOS_PINS=write`);
+#    `node/kernel-tests/tests/counts.txt`, are a proving run's: `just
+#    repin-proof`);
 # 6. the conformance vectors over them, `tools/kreivo/conformance`
 #    (`conformance`);
 # 7. the lock `check-kit` builds the kit on, `pvm/proof/kit/Cargo.lock`
