@@ -11,7 +11,7 @@
 //! All emission functions have `debug_assert!(self.write_pos + N <= self.capacity)`
 //! guards. Callers reserve room via [`Assembler::reserve`] before each
 //! instruction or sequence, in every build: a reservation grows the buffer to
-//! hold it and [`SLACK`] more, and refuses one past [`MAX_NATIVE`] or one made
+//! hold it and `SLACK` more, and refuses one past `MAX_NATIVE` or one made
 //! after the previous sequence overran its own, so every native offset fits
 //! an `i32` and its casts to `u32` and `i32` are exact. That no instruction
 //! overruns [`INSTRUCTION`] is the codegen's tests'.
@@ -313,7 +313,7 @@ impl Assembler {
 
     /// Reserve `n` bytes for the next sequence, growing the buffer if
     /// needed. Refused when the previous sequence wrote past its own
-    /// reservation, or the code would pass [`MAX_NATIVE`].
+    /// reservation, or the code would pass `MAX_NATIVE`.
     #[inline(always)]
     pub fn reserve(&mut self, n: usize) -> Result<(), String> {
         self.within_reservation()?;
@@ -366,7 +366,7 @@ impl Assembler {
     }
 
     /// Bind a label to the current write position, which a reservation
-    /// keeps below [`MAX_NATIVE`].
+    /// keeps below `MAX_NATIVE`.
     pub fn bind_label(&mut self, label: Label) {
         self.labels[label.0 as usize] = (self.write_pos + 1) as u32; // +1: 0 is LABEL_UNBOUND
     }

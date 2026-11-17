@@ -415,3 +415,26 @@ pub(super) fn overlapping(sorted: &[(u64, u64)], ranges: &[(u64, u64)]) -> Vec<(
     }
     kept
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Ranges;
+
+    /// `take` gives the parts of a range not read yet, in order, and marks
+    /// the whole range read: around, inside, over and beside what was.
+    #[test]
+    fn a_range_is_read_once() {
+        let mut read = Ranges::default();
+        assert_eq!(read.take(10, 20), [(10, 20)]);
+        assert_eq!(read.take(10, 20), []);
+        assert_eq!(read.take(12, 18), []);
+        assert_eq!(read.take(5, 15), [(5, 10)]);
+        assert_eq!(read.take(15, 25), [(20, 25)]);
+        assert_eq!(read.take(30, 40), [(30, 40)]);
+        assert_eq!(read.take(0, 50), [(0, 5), (25, 30), (40, 50)]);
+        assert_eq!(read.take(50, 60), [(50, 60)]);
+        assert_eq!(read.take(0, 60), []);
+        assert_eq!(read.take(7, 7), []);
+        assert_eq!(read.0.len(), 1);
+    }
+}
