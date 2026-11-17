@@ -182,6 +182,50 @@ fn a_node_kernels_poseidon2_calls_prove_through_segments() {
     assert_eq!(&registers[9..13], &[0x11, 0x22, 0x33, 0x44]);
 }
 
+/// The production entry point, end to end: the kernel's run proved to its
+/// final proof by `tree::prove_final` (the class cut, a leaf a segment at
+/// its position, adjacent pairs folded, an odd node carried up, the root
+/// wrapped masked), and its bytes accepted by the final verifier against
+/// the statement the run makes, the program's id and its io-hash.
+#[test]
+fn a_node_kernels_run_proves_to_its_final_proof() {
+    let blob = blob();
+    let record = record(&blob);
+    let (program, entry) = vos_pvm_recair::leaf::kernel_program(
+        &blob,
+        &record,
+        vos_pvm_compiler::TRANSPILER_VERSION,
+        &SEGMENT,
+    )
+    .expect("the kernel's program");
+    let trace = trace_kernel(&blob, &witness(), 100_000_000).expect("halts");
+    let (bytes, stats) =
+        vos_pvm_recair::tree::prove_final(&program, &entry, &trace.side_note).expect("proves");
+    eprintln!(
+        "prove_final: {} segments, {} leaves, {} folds in {:.2}s (the wrap {:.2}s), {} bytes",
+        stats.segments,
+        stats.leaves,
+        stats.folds,
+        stats.took().as_secs_f64(),
+        stats.wrap_took.as_secs_f64(),
+        bytes.len(),
+    );
+    assert!(stats.segments >= 2, "{} segments", stats.segments);
+    assert_eq!(stats.leaves, stats.segments);
+    assert_eq!(stats.folds, stats.leaves - 1);
+    let statement = vos_pvm_final_verifier::PublicWords {
+        program: program.id(),
+        io_hash: trace.io_hash,
+    };
+    let format = vos_pvm_final_verifier::masked::FORMAT;
+    let verified = vos_pvm_final_verifier::verify(format, &[format], &bytes, &statement.words())
+        .expect("the final proof verifies");
+    assert_eq!(verified, statement);
+    let mut other = statement;
+    other.io_hash[0] ^= 1;
+    assert!(vos_pvm_final_verifier::verify(format, &[format], &bytes, &other.words()).is_err());
+}
+
 /// A forged run proved over the full chip set is refused, by the prover or
 /// by the verifier.
 fn refused(mut side_note: SideNote, what: &str) {

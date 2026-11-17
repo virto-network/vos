@@ -317,3 +317,56 @@ fn the_device_programs_id_is_pinned() {
         (CHIPS, &LOG_SIZES[..], &CPU[..], ID)
     );
 }
+
+/// A release artifact names the program its kernel, chips and log sizes
+/// make: one taken from a `sized_for` program gives the same program and id
+/// through `Program::from_release`, with no reference run; each mutant is
+/// refused, its chips not the code's, a log size under its floor, a size
+/// missing, another id or a format this build does not prove.
+#[test]
+fn a_release_names_its_program() {
+    let kernel = blob();
+    let program = Program::sized_for(
+        FORMAT.number,
+        &kernel,
+        vos_pvm_device::ReferenceArguments(&witness(1)),
+        0,
+    )
+    .expect("installs");
+    let release = vos_pvm_device::Release {
+        elf: [0x5e; 32],
+        method: vos_abi::ids::MethodId(1),
+        kernel: kernel.clone(),
+        format: FORMAT.number,
+        chips: program.program().active,
+        log_sizes: program.log_sizes().to_vec(),
+        id: program.id().0,
+    };
+    let released = Program::from_release(&release).expect("the release's program");
+    assert_eq!(released.id(), program.id());
+    assert_eq!(released.log_sizes(), program.log_sizes());
+    assert_eq!(released.program().active, program.program().active);
+
+    let refused = |mutate: &dyn Fn(&mut vos_pvm_device::Release)| {
+        let mut mutant = release.clone();
+        mutate(&mut mutant);
+        Program::from_release(&mutant).err()
+    };
+    use vos_pvm_device::Error;
+    assert_eq!(
+        refused(&|r| r.chips ^= 1 << r.chips.trailing_zeros()),
+        Some(Error::Chips)
+    );
+    assert_eq!(
+        refused(&|r| r.log_sizes[0] = 0),
+        Some(Error::Floor { chip: 0 })
+    );
+    assert_eq!(
+        refused(&|r| {
+            r.log_sizes.pop();
+        }),
+        Some(Error::Sizes)
+    );
+    assert_eq!(refused(&|r| r.id[0] ^= 1), Some(Error::IdMismatch));
+    assert_eq!(refused(&|r| r.format = 0), Some(Error::Format(0)));
+}
