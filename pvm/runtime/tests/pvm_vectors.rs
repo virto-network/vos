@@ -1814,6 +1814,12 @@ fn perms_of(v: &Vector) -> Vec<u8> {
 /// Run `v` on the interpreter. Returns the exit and the machine for
 /// post-state inspection.
 fn run_interpreter(v: &Vector) -> (ExitReason, Interpreter) {
+    run_interpreter_tracing(v, false)
+}
+
+/// [`run_interpreter`], `tracing` taking the stepping path the prover
+/// traces (`Interpreter::step`) instead of the predecoded one.
+fn run_interpreter_tracing(v: &Vector, tracing: bool) -> (ExitReason, Interpreter) {
     let span = span_of(&v.page_map) as usize;
     let mut flat = vec![0u8; span];
     for (addr, bytes) in &v.memory {
@@ -1829,6 +1835,7 @@ fn run_interpreter(v: &Vector) -> (ExitReason, Interpreter) {
     );
     vm.set_page_perms(perms_of(v));
     vm.set_pc(v.initial_pc);
+    vm.tracing_enabled = tracing;
     let (exit, _gas_used) = vm.run();
     (exit, vm)
 }
@@ -2229,6 +2236,38 @@ fn graypaper_v080_block_gas_corpus_matches_the_oracle_table() {
 }
 
 /// The complete corpus holds on the interpreter.
+/// The interpreter's stepping path, which the prover traces, ends every
+/// vector as its predecoded path does: exit, pc, registers, gas and every
+/// mapped byte.
+#[test]
+fn graypaper_v080_stepping_path_matches_the_predecoded_path() {
+    let vectors = discover_v080();
+    for (name, v) in &vectors {
+        let (fast_exit, fast) = run_interpreter(v);
+        let (exit, stepping) = run_interpreter_tracing(v, true);
+        assert_eq!(exit, fast_exit, "{name}: stepping exit");
+        assert_eq!(exit, v.exp_status, "{name}: stepping exit status");
+        assert_eq!(stepping.pc, fast.pc, "{name}: stepping pc");
+        assert_eq!(
+            stepping.registers, fast.registers,
+            "{name}: stepping registers"
+        );
+        assert_eq!(stepping.gas, fast.gas, "{name}: stepping gas");
+        for (base, len, _) in &v.page_map {
+            let mut want = vec![0; *len as usize];
+            let mut got = vec![0; *len as usize];
+            fast.memory().read_bytes(*base, &mut want);
+            stepping.memory().read_bytes(*base, &mut got);
+            assert_eq!(got, want, "{name}: stepping memory at {base:#x}");
+        }
+    }
+    assert_eq!(
+        vectors.len(),
+        V080_CASE_COUNT,
+        "complete v0.8 corpus cardinality"
+    );
+}
+
 #[test]
 fn graypaper_v080_interpreter_satisfies_every_vector() {
     let vectors = discover_v080();
@@ -2338,6 +2377,38 @@ fn graypaper_v080_block_gas_matches_checked_in_oracle() {
                 vm.gas,
                 resume["remaining_gas"].as_u64().expect("resume gas"),
                 "{file}: resume remaining gas"
+            );
+        }
+
+        // The stepping path, which the prover traces, judges alike.
+        let mut stepping =
+            Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![], gas);
+        stepping.tracing_enabled = true;
+        assert_eq!(
+            stepping.run().0,
+            exit_from_json(first),
+            "{file}: stepping first exit"
+        );
+        assert_eq!(
+            stepping.gas,
+            first["remaining_gas"].as_u64().expect("remaining gas"),
+            "{file}: stepping first remaining gas"
+        );
+        if !value["expected"]["resume"].is_null() {
+            let resume = &value["expected"]["resume"];
+            assert!(
+                stepping.resume_after_host_call(),
+                "{file}: stepping resume follows a standard host call"
+            );
+            assert_eq!(
+                stepping.run().0,
+                exit_from_json(resume),
+                "{file}: stepping resume exit"
+            );
+            assert_eq!(
+                stepping.gas,
+                resume["remaining_gas"].as_u64().expect("resume gas"),
+                "{file}: stepping resume remaining gas"
             );
         }
 
