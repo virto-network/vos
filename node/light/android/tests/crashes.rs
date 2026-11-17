@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use common::phone::*;
 use common::world::{Death, Step};
 use common::*;
-use vos_facility::personal::{Claim, KitKind};
+use vos_facility::personal::{Claim, KitKind, Why};
 use vos_wire::personal::Policy;
 
 /// The deaths tried in `trace`: at each call (by its occurrence) and each
@@ -117,7 +117,7 @@ fn a_claim_killed_at_any_step_ends_at_one_agent_with_one_kit() {
             .claim(&*phone.hand, claim(&world, home))
         {
             Ok(_) => {}
-            Err(refusal) if refusal.message.contains("holds a personal space already") => {}
+            Err(refusal) if refusal.why == Why::AlreadyHeld => {}
             Err(refusal) => panic!("{at}: the claim again: {refusal:?}"),
         }
         let synced = phone.node.sync_personal().unwrap();
@@ -402,7 +402,7 @@ fn a_move_killed_at_any_step_ends_at_one_agent_with_one_kit() {
             .move_home(&*phone.hand, moving(&world, elsewhere))
         {
             Ok(_) => {}
-            Err(refusal) if refusal.message.contains("at that home already") => {}
+            Err(refusal) if refusal.why == Why::AtThatHome => {}
             Err(refusal) => panic!("{at}: the move again: {refusal:?}"),
         }
         assert_eq!(pool(&world, elsewhere), 1, "{at}: one agent given");

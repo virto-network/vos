@@ -9,7 +9,6 @@ import java.util.ArrayList;
 import java.util.List;
 import team.virto.s4.VosClient;
 import team.virto.s4.vos.EnrolledSpace;
-import team.virto.s4.vos.Refusal;
 import team.virto.vos.R;
 
 /**
@@ -37,7 +36,7 @@ final class NetworkScreen extends Screen {
     check();
     app.read(
         // The enrollments are s4's interface's, through s4's binding.
-        (personal, prompts, refused) -> VosClient.get(app).enrollments(refused),
+        PersonalActivity.own((personal, refused) -> VosClient.get(app).enrollments(refused)),
         read -> {
           spaces = read;
           redraw();
@@ -54,7 +53,8 @@ final class NetworkScreen extends Screen {
     redraw();
     // Uncovered: the bridges' field stays usable while Tor tries.
     app.read(
-        (personal, prompts, refused) -> personal.bootstrap(refused) ? Boolean.TRUE : null,
+        PersonalActivity.own(
+            (personal, refused) -> personal.bootstrap(refused) ? Boolean.TRUE : null),
         done -> {
           state = "Tor is connected: your devices sync.";
           redraw();
@@ -62,8 +62,8 @@ final class NetworkScreen extends Screen {
         this::paused);
   }
 
-  private void paused(Refusal refused) {
-    state = "Backup paused: " + Words.refusal(refused.code, refused.message);
+  private void paused(Refused refused) {
+    state = "Backup paused: " + Words.why(refused);
     redraw();
   }
 
@@ -131,7 +131,8 @@ final class NetworkScreen extends Screen {
   private void bridges(String[] lines) {
     app.run(
         lines.length == 0 ? "Connecting through the public relays…" : "Connecting through bridges…",
-        (personal, prompts, refused) -> personal.bridges(lines, refused) ? Boolean.TRUE : null,
+        PersonalActivity.own(
+            (personal, refused) -> personal.bridges(lines, refused) ? Boolean.TRUE : null),
         done -> {
           state = "Tor is connected: your devices sync.";
           redraw();
@@ -144,8 +145,9 @@ final class NetworkScreen extends Screen {
   private void optOut(EnrolledSpace space, boolean out) {
     app.run(
         out ? "Taking the space off Tor…" : "Putting the space back on Tor…",
-        (personal, prompts, refused) ->
-            personal.optOut(space.handle, out, refused) ? Boolean.TRUE : null,
+        PersonalActivity.own(
+            (personal, refused) ->
+                personal.optOut(space.handle, out, refused) ? Boolean.TRUE : null),
         done -> {
           space.optedOut = out;
           redraw();

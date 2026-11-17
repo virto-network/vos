@@ -196,6 +196,8 @@ pub struct Arti {
     tor: RwLock<Option<Tor>>,
     /// Whether the client is dormant, for an arti built anew.
     dormant: std::sync::atomic::AtomicBool,
+    /// What its last bootstrap found, and why it failed.
+    state: Mutex<(crate::personal::Tor, String)>,
 }
 
 impl Arti {
@@ -207,6 +209,7 @@ impl Arti {
             directory,
             tor: RwLock::new(None),
             dormant: Default::default(),
+            state: Mutex::default(),
         });
         arti.rebuild(bridges)?;
         Ok(arti)
@@ -231,7 +234,7 @@ impl Arti {
     /// goes through; on a failure the one built before stays.
     async fn replace(&self, bridges: &[String]) -> Result<(), BootstrapError> {
         let candidate = self.build(bridges)?;
-        candidate.bootstrap().await?;
+        self.found(candidate.bootstrap().await)?;
         *self.tor.write().unwrap_or_else(|e| e.into_inner()) = Some(candidate);
         Ok(())
     }
@@ -243,10 +246,26 @@ impl Arti {
     /// Bootstrap the arti built last: its failure named (a wrong clock, a
     /// bridge that does not answer, a network that blocks Tor).
     pub async fn bootstrap(&self) -> Result<(), BootstrapError> {
-        match self.current() {
+        let bootstrapped = match self.current() {
             Some(tor) => tor.bootstrap().await,
             None => Err(BootstrapError::Tor("not built".into())),
-        }
+        };
+        self.found(bootstrapped)
+    }
+
+    /// A bootstrap's outcome kept as Tor's state.
+    fn found(&self, bootstrapped: Result<(), BootstrapError>) -> Result<(), BootstrapError> {
+        use crate::personal::Tor as State;
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = match &bootstrapped {
+            Ok(()) => (State::Connected, String::new()),
+            Err(error) => (State::Blocked, error.to_string()),
+        };
+        bootstrapped
+    }
+
+    /// Tor's state as its last bootstrap found it, and why it is blocked.
+    pub fn state(&self) -> (crate::personal::Tor, String) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -551,6 +570,15 @@ impl Net {
         kept.put(BRIDGES, &lines)?;
         self.state().bridges = lines;
         Ok(())
+    }
+
+    /// Tor's state, and why it is blocked: connected for a client that
+    /// runs no arti (an in-process dial).
+    pub fn tor(&self) -> (crate::personal::Tor, String) {
+        match &self.arti {
+            Some(arti) => arti.state(),
+            None => (crate::personal::Tor::Connected, String::new()),
+        }
     }
 
     /// Bootstrap the process's arti, if it runs one.

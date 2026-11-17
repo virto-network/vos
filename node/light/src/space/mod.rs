@@ -49,6 +49,7 @@ mod pairing;
 mod restore;
 mod rows;
 mod set;
+mod status;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -76,6 +77,7 @@ pub(crate) use error::{failed, store_failed, unreached};
 pub use host::{AdminKey, Approval, Card, Enrolled, Host, Prompts, Proof};
 pub use pairing::PairCode;
 pub use set::{AdminOffer, Device};
+pub use status::{Phase, Status};
 
 /// The light node's store, under the personal space's directory: the
 /// directory of the first store, and the prefix of each later one's, which
@@ -296,6 +298,8 @@ struct Restoring {
     arguments: Vec<u8>,
     r2: Option<[u8; 32]>,
     signed: Option<(Vec<u8>, [u8; 64])>,
+    /// When it matures uncontested, once the agent's log showed it.
+    matures: u64,
 }
 
 impl Restoring {
@@ -307,6 +311,7 @@ impl Restoring {
             arguments: (device.clone(), kit.clone()).encode(),
             r2: Some(r2),
             signed: None,
+            matures: 0,
         }
     }
 }

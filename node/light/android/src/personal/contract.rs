@@ -11,7 +11,6 @@
 //! in the tests; under the `jni` feature each is its parcelable.
 
 use s4_credential_contract::{MAX_ONIONS, Onion, byte_enum, parcel};
-use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::{Code, Refusal};
@@ -29,9 +28,10 @@ byte_enum! {
     package "team.virto.vos.personal";
     /// What a local notification raises: a pending operation of the device
     /// set, a pending restore, this device's removal, or an alarm.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
     pub enum Pending {
         /// A device added by a delayed admin.
+        #[default]
         Add = 0 as ADD,
         Remove = 1 as REMOVE,
         /// A device's admin key replaced.
@@ -46,7 +46,7 @@ byte_enum! {
         Restoring = 6 as RESTORING,
         /// This device is out of its group.
         Removed = 7 as REMOVED,
-        /// The personal space raised an alarm: `detail` names it.
+        /// The personal space raised an alarm: its `alarm` names it.
         Alarm = 9 as ALARM,
         /// This device cannot follow its group: removed from another
         /// device, it pairs again; or it regroups.
@@ -79,9 +79,220 @@ byte_enum! {
     }
 }
 
+byte_enum! {
+    package "team.virto.vos.personal";
+    /// Where the device's personal space is (`PersonalStatus.phase`).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+    pub enum Phase {
+        /// None: a claim, a pairing or a restore makes one.
+        #[default]
+        None = 0 as NONE,
+        /// A claim under way: claiming at its home again finishes it.
+        Claiming = 1 as CLAIMING,
+        /// Paired, not yet added by the opener's confirmed commit.
+        Joining = 2 as JOINING,
+        /// The device holds the group and follows it.
+        Held = 3 as HELD,
+        /// A restore opened, maturing at `matures`; then `restored`.
+        Restoring = 4 as RESTORING,
+        /// Out of its group: it pairs again, or claims.
+        Removed = 5 as REMOVED,
+        /// It cannot follow its group: it pairs again, or regroups.
+        Stuck = 6 as STUCK,
+        /// What the device keeps of it is not this build's: `repair` says
+        /// what; the app's data cleared, it claims or pairs again.
+        NeedsRepair = 7 as NEEDS_REPAIR,
+    }
+}
+
+byte_enum! {
+    package "team.virto.vos.personal";
+    /// Tor as the process's client last found it.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+    pub enum Tor {
+        /// Bootstrapping, or not yet asked.
+        #[default]
+        Starting = 0 as STARTING,
+        Connected = 1 as CONNECTED,
+        /// Its bootstrap failed: `torWhy` names why.
+        Blocked = 2 as BLOCKED,
+    }
+}
+
+byte_enum! {
+    package "team.virto.vos.personal";
+    /// What alarm a notice raises (`vos_light::group::Alarm`'s kinds).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+    pub enum Alarm {
+        /// Not an alarm.
+        #[default]
+        None = 0 as NONE,
+        /// The log does not chain from what this device saw: a rollback or
+        /// a fork.
+        Log = 1 as LOG,
+        /// A vote does not verify against the candidate: two logs shown.
+        SplitLog = 2 as SPLIT_LOG,
+        /// The log names this device absent though it called.
+        NamedAbsent = 3 as NAMED_ABSENT,
+        /// This device refused a candidate commit.
+        Refused = 4 as REFUSED,
+        /// This device cannot follow a confirmed epoch: `remedy` says what.
+        CannotFollow = 5 as CANNOT_FOLLOW,
+        /// The agent's verdict is not this device's count.
+        Verdict = 6 as VERDICT,
+        /// A maturity the evidence does not support.
+        Unsigned = 7 as UNSIGNED,
+        /// The device's clock and the agent's disagree by over an hour.
+        Clock = 8 as CLOCK,
+        /// The kit signed an operation: veto it, or rotate the kit.
+        Kit = 9 as KIT,
+        /// The log's head went back: a rollback.
+        Rollback = 10 as ROLLBACK,
+        /// A writer's view of the log is not this device's: a split log.
+        View = 11 as VIEW,
+        /// An admin call of this device's the agent took is gone.
+        Dropped = 12 as DROPPED,
+        /// A scope served short of what a writer read: a partition.
+        Partition = 13 as PARTITION,
+        /// An envelope withheld.
+        Withheld = 14 as WITHHELD,
+        /// An envelope sealed under an older epoch.
+        Stale = 15 as STALE,
+        /// A node by no device of the set.
+        Author = 16 as AUTHOR,
+        /// This device's own envelope gone: pushed again.
+        Deleted = 17 as DELETED,
+        /// Log entries withheld.
+        Unserved = 18 as UNSERVED,
+        /// An entry lowering the policy's delays: refused.
+        Policy = 19 as POLICY,
+    }
+}
+
+byte_enum! {
+    package "team.virto.vos.personal";
+    /// What a device that cannot follow its group does.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+    pub enum Remedy {
+        #[default]
+        None = 0 as NONE,
+        /// Pair again from another live device.
+        RePair = 1 as RE_PAIR,
+        /// No other live device to pair from: regroup.
+        Regroup = 2 as REGROUP,
+    }
+}
+
+byte_enum! {
+    package "team.virto.vos.personal";
+    /// Why a personal operation was refused (`vos_light::space::Error`'s
+    /// kinds, and the facility's own): what the screen acts on, the words
+    /// its own (`Words.why`).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+    pub enum Why {
+        /// Not refused: the operation answered.
+        #[default]
+        None = 0 as NONE,
+        /// The device holds no personal space.
+        NoSpace = 1 as NO_SPACE,
+        /// It holds one already.
+        AlreadyHeld = 2 as ALREADY_HELD,
+        /// It holds a personal space's keys already: restore or pair.
+        HoldsKeys = 3 as HOLDS_KEYS,
+        /// A claim at another home is under way: claim there to finish it.
+        ClaimElsewhere = 4 as CLAIM_ELSEWHERE,
+        /// The personal space is at that home already.
+        AtThatHome = 5 as AT_THAT_HOME,
+        /// No restore is open.
+        NoRestore = 6 as NO_RESTORE,
+        /// No pairing is under way.
+        NoPairing = 7 as NO_PAIRING,
+        /// What the device keeps is not this build's: `detail` says what.
+        NeedsRepair = 8 as NEEDS_REPAIR,
+        /// The user declined.
+        Declined = 9 as DECLINED,
+        /// The flow was cancelled.
+        Cancelled = 10 as CANCELLED,
+        /// Not a recovery kit.
+        NotAKit = 11 as NOT_A_KIT,
+        /// The kit is not this agent's.
+        WrongKit = 12 as WRONG_KIT,
+        NotAPairingCode = 13 as NOT_A_PAIRING_CODE,
+        NotAnOffer = 14 as NOT_AN_OFFER,
+        /// The offer is stale: ask for a new one.
+        StaleOffer = 15 as STALE_OFFER,
+        /// This device's own key.
+        OwnKey = 16 as OWN_KEY,
+        /// The device is not in the set.
+        NotInSet = 17 as NOT_IN_SET,
+        /// The secret source failed.
+        Source = 18 as SOURCE,
+        /// The home serves no claim.
+        NoOpenClaim = 19 as NO_OPEN_CLAIM,
+        /// The home refused to open a claim.
+        OpenClaimRefused = 20 as OPEN_CLAIM_REFUSED,
+        /// The home has no agent to give.
+        NoAgentToGive = 21 as NO_AGENT_TO_GIVE,
+        /// No agent holds this kit at that home.
+        NoAgentForKit = 22 as NO_AGENT_FOR_KIT,
+        /// This device holds an agent at that home already.
+        HoldsAgentThere = 23 as HOLDS_AGENT_THERE,
+        /// The agent is not known at that home.
+        UnknownAgent = 24 as UNKNOWN_AGENT,
+        /// The space's tree is not read yet: try again.
+        NoLeaf = 25 as NO_LEAF,
+        /// The home refused: `detail` names its error.
+        HomeRefused = 26 as HOME_REFUSED,
+        /// The proof's format was retired: update the app.
+        Update = 27 as UPDATE,
+        /// The proof was rejected.
+        Rejected = 28 as REJECTED,
+        /// The personal agent refused: `detail` names its error.
+        AgentRefused = 29 as AGENT_REFUSED,
+        /// The agent has not taken it yet: try again.
+        NotTakenYet = 30 as NOT_TAKEN_YET,
+        /// Not yet joined: try again.
+        NotJoinedYet = 31 as NOT_JOINED_YET,
+        /// The commit awaits the devices' votes.
+        AwaitsVotes = 32 as AWAITS_VOTES,
+        /// The commit is undecided.
+        Undecided = 33 as UNDECIDED,
+        /// The commit was void: try again.
+        CommitVoid = 34 as COMMIT_VOID,
+        /// Another device committed meanwhile: try again.
+        CommittedMeanwhile = 35 as COMMITTED_MEANWHILE,
+        /// The pairing's slot expired.
+        SlotExpired = 36 as SLOT_EXPIRED,
+        /// The device is in that space already.
+        InSetAlready = 37 as IN_SET_ALREADY,
+        /// The agent's set does not hold this device.
+        NotInAgentSet = 38 as NOT_IN_AGENT_SET,
+        /// `device` regrouped: this device pairs again.
+        Regrouped = 39 as REGROUPED,
+        /// The device is not enrolled in that space.
+        NotEnrolled = 40 as NOT_ENROLLED,
+        /// Nothing is owed there.
+        NothingOwed = 41 as NOTHING_OWED,
+        /// The enrollment was spent.
+        Spent = 42 as SPENT,
+        /// The registrar refused: `detail` names its error.
+        RegistrarRefused = 43 as REGISTRAR_REFUSED,
+        /// The space was not reached over Tor: `detail` says how.
+        Unreachable = 44 as UNREACHABLE,
+        /// The proof failed.
+        Prove = 45 as PROVE,
+        /// The device's store failed.
+        Store = 46 as STORE,
+        /// The request's arguments are not the operation's.
+        Arguments = 47 as ARGUMENTS,
+        /// The facility failed: `detail` says how.
+        Failed = 48 as FAILED,
+    }
+}
+
 parcel! {
     package "team.virto.vos.personal";
-    registry REGISTRY with [Pending, KitKind, Owed];
+    registry REGISTRY with [Pending, KitKind, Owed, Phase, Tor, Alarm, Remedy, Why];
 
     /// One pass of the facility's sync, a background job's: of the
     /// enrollments kept, how many synced and how many failed (the personal
@@ -102,15 +313,52 @@ parcel! {
 
     /// One thing the chrome raises: an operation's at its log `index`,
     /// taken at `at` (the agent's time, 0 when this pass did not read it)
-    /// and maturing at `matures` unless vetoed; `fresh` when no pass raised
-    /// it before, so its notification alerts.
-    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    /// and maturing at `matures` unless vetoed, signed by device `by` or by
+    /// the kit (`by_kit`), `contested` by another; or an alarm of its kind,
+    /// `index` its place (its log index, epoch, position or skew) and its
+    /// `remedy`. `fresh` when no pass raised it before, so its
+    /// notification alerts.
+    #[derive(Clone, Debug, PartialEq, Eq, Default)]
     pub struct Notice {
         pub pending: Pending => enum Pending,
         pub index: u64 => long,
         pub at: u64 => long,
         pub matures: u64 => long,
         pub fresh: bool => boolean,
+        pub by: u32 => long,
+        pub by_kit: bool => boolean,
+        pub contested: bool => boolean,
+        pub alarm: Alarm => enum Alarm,
+        pub remedy: Remedy => enum Remedy,
+    }
+
+    /// The personal space's state, read without a request: its phase (a
+    /// restore's maturing at `matures`), its home (none: zeros, no onion),
+    /// agent and this device's id, Tor's state and why it is blocked, the
+    /// memberships owed, the notices standing, and what needs repair.
+    #[derive(Clone, Debug, PartialEq, Eq, Default)]
+    pub struct PersonalStatus {
+        pub phase: Phase => enum Phase,
+        pub matures: u64 => long,
+        pub home: Home => Home,
+        pub agent: u32 => long,
+        pub device: u32 => long,
+        pub tor: Tor => enum Tor,
+        pub tor_why: String => String,
+        pub owed: u32 => int,
+        pub standing: Vec<Notice> => Notice[],
+        pub repair: String => String,
+    }
+
+    /// Why a personal operation was refused: its kind, a time or a device
+    /// it names (a restore's maturity, the device that regrouped), and its
+    /// detail (an agent's error's name, a store's failure): no prose the
+    /// screen shows as it is.
+    #[derive(Clone, Debug, PartialEq, Eq, Default)]
+    pub struct Refused {
+        pub why: Why => enum Why,
+        pub at: u64 => long,
+        pub device: u32 => long,
         pub detail: String => String,
     }
 
@@ -126,7 +374,7 @@ parcel! {
     /// holding its credential actor and `Homes`, with the identity calls to
     /// it are signed for, their instances, and its onions (a home is
     /// onion-only).
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq, Default)]
     pub struct Home {
         pub space: [u8; 32] => byte[],
         pub handle: [u8; 32] => byte[],
@@ -252,5 +500,78 @@ impl Claim {
             home: self.home.check()?,
             ..self
         })
+    }
+}
+
+impl From<Refusal> for Refused {
+    /// A refusal of the facility's own (an argument, a store, a personal
+    /// space that does not open): its code's kind, its message the detail.
+    fn from(refusal: Refusal) -> Self {
+        let why = match refusal.code {
+            Code::Arguments => Why::Arguments,
+            Code::Declined => Why::Declined,
+            Code::NotEnrolled => Why::NotEnrolled,
+            Code::NoPath => Why::NoLeaf,
+            Code::Source => Why::Source,
+            Code::Api => Why::Unreachable,
+            Code::Prove => Why::Prove,
+            Code::Store if refusal.message.contains("needs repair") => Why::NeedsRepair,
+            Code::Store => Why::Store,
+            _ => Why::Failed,
+        };
+        Refused {
+            why,
+            detail: refusal.message,
+            ..Refused::default()
+        }
+    }
+}
+
+impl From<Refused> for Refusal {
+    /// A personal refusal where the facility's own operations answer s4's:
+    /// its kind's code, its detail the message.
+    fn from(refused: Refused) -> Self {
+        let code = match refused.why {
+            Why::NoSpace | Why::NotEnrolled => Code::NotEnrolled,
+            Why::Declined | Why::Cancelled => Code::Declined,
+            Why::Arguments => Code::Arguments,
+            Why::Source => Code::Source,
+            Why::NoLeaf => Code::NoPath,
+            Why::Unreachable | Why::NotTakenYet | Why::NotJoinedYet => Code::Api,
+            Why::Prove => Code::Prove,
+            Why::Store | Why::NeedsRepair => Code::Store,
+            Why::Failed | Why::UnknownAgent => Code::Failed,
+            _ => Code::Refused,
+        };
+        let message = if refused.detail.is_empty() {
+            format!("{:?}", refused.why)
+        } else {
+            format!("{:?}: {}", refused.why, refused.detail)
+        };
+        Refusal::new(code, message)
+    }
+}
+
+#[cfg(feature = "jni")]
+impl Refused {
+    /// Write `self` into an operation's `out Refused` parcelable `object`.
+    pub fn write_into(
+        &self,
+        env: &mut jni::Env<'_>,
+        object: &jni::objects::JObject<'_>,
+    ) -> s4_credential_contract::java::Result<()> {
+        use s4_credential_contract::java::{Fields, Value as _};
+        let fields = Fields::of::<Self>(object)?;
+        self.why.write(&fields, env, "why")?;
+        self.at.write(&fields, env, "at")?;
+        self.device.write(&fields, env, "device")?;
+        self.detail.write(&fields, env, "detail")
+    }
+}
+
+#[cfg(feature = "jni")]
+impl From<s4_credential_contract::java::JavaError> for Refused {
+    fn from(error: s4_credential_contract::java::JavaError) -> Self {
+        Refused::from(Refusal::from(error))
     }
 }

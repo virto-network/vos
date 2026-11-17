@@ -145,16 +145,21 @@ impl<H: Host> Personal<H> {
             entries = link.log_all(0).map_err(unreached)?.map_err(agent_refused)?;
         }
         let taken = entries.iter().find_map(|(index, entry)| match &entry.body {
-            Body::Operation { call, .. }
+            Body::Operation { call, matures, .. }
                 if call.method == method::RESTORE.0 && call.arguments == restoring.arguments =>
             {
-                Some(Posted {
-                    index: *index,
-                    at: entry.at,
-                })
+                Some((
+                    Posted {
+                        index: *index,
+                        at: entry.at,
+                    },
+                    *matures,
+                ))
             }
             _ => None,
         });
+        let matures = taken.as_ref().map(|(_, matures)| *matures);
+        let taken = taken.map(|(posted, _)| posted);
         let (posted, message, signature) = match (taken, &restoring.signed) {
             (Some(posted), Some((message, signature))) => (posted, message.clone(), *signature),
             _ => {
@@ -202,8 +207,23 @@ impl<H: Host> Personal<H> {
                 },
             )?;
         }
+        // When it matures, as the log took it.
+        let matures = match matures {
+            Some(matures) => matures,
+            None => link
+                .log_all(posted.index)
+                .map_err(unreached)?
+                .map_err(agent_refused)?
+                .iter()
+                .find_map(|(index, entry)| match &entry.body {
+                    Body::Operation { matures, .. } if *index == posted.index => Some(*matures),
+                    _ => None,
+                })
+                .unwrap_or(0),
+        };
         if let Some(restoring) = held.state.restoring.as_mut() {
             restoring.r2 = None;
+            restoring.matures = matures;
         }
         self.keep(&held.light, &held.state)?;
         Ok(posted)

@@ -39,7 +39,7 @@ use crate::chrome::Chrome;
 use crate::enrollment::Store;
 use crate::job::{Job, Part};
 use crate::net::{Arti, Net};
-use crate::personal::{Artifacts, Space};
+use crate::personal::{Artifacts, PersonalStatus, Phase, Refused, Space, Why};
 use crate::source::{BoxFuture, Kind, Output, Reference, Source, SourceError};
 use crate::stream::{Dialer, Tcp};
 use crate::{
@@ -171,7 +171,7 @@ pub struct Node {
     job: Job,
     /// The personal space, or why it does not open: sign-in and payments
     /// run whatever it is.
-    personal: Option<Result<Arc<Space>, Refusal>>,
+    personal: Option<Result<Arc<Space>, Refused>>,
     sessions: Mutex<Sessions>,
     warming: Mutex<Vec<Warming>>,
     /// Whether the app is in the foreground, and the operations and jobs
@@ -192,8 +192,12 @@ fn no_session() -> Refusal {
     )
 }
 
-fn no_personal() -> Refusal {
-    refused(Code::Failed, "this facility runs no personal space")
+fn no_personal() -> Refused {
+    Refused {
+        why: Why::Failed,
+        detail: "this facility runs no personal space".into(),
+        ..Refused::default()
+    }
 }
 
 /// The runtime the facility runs on.
@@ -585,7 +589,7 @@ impl Node {
 
     /// The personal space, or why it does not open: its reads, and the
     /// test seams that need no client awake.
-    pub fn space(&self) -> Result<&Arc<Space>, Refusal> {
+    pub fn space(&self) -> Result<&Arc<Space>, Refused> {
         match &self.personal {
             Some(Ok(space)) => Ok(space),
             Some(Err(refusal)) => Err(refusal.clone()),
@@ -593,10 +597,30 @@ impl Node {
         }
     }
 
+    /// The personal space's state, read without a request: its phase
+    /// (in need of repair when it does not open as this build reads it),
+    /// Tor's state and the notices standing after the last pass.
+    pub fn status(&self) -> Result<PersonalStatus, Refused> {
+        let (tor, tor_why) = self.facility.net().tor();
+        let standing = self.job.standing().map_err(Refused::from)?;
+        let mut status = match &self.personal {
+            Some(Ok(space)) => space.status()?,
+            Some(Err(refused)) if refused.why == Why::NeedsRepair => PersonalStatus {
+                phase: Phase::NeedsRepair,
+                repair: refused.detail.clone(),
+                ..PersonalStatus::default()
+            },
+            Some(Err(refused)) => return Err(refused.clone()),
+            None => return Err(no_personal()),
+        };
+        (status.tor, status.tor_why, status.standing) = (tor, tor_why, standing);
+        Ok(status)
+    }
+
     /// The personal space for one flow, called on it directly
     /// (`node.personal()?.claim(..)`): its client awake while the flow
     /// runs, the job attached once the device holds a group.
-    pub fn personal(&self) -> Result<Personal<'_>, Refusal> {
+    pub fn personal(&self) -> Result<Personal<'_>, Refused> {
         let space = self.space()?;
         Ok(Personal {
             space,

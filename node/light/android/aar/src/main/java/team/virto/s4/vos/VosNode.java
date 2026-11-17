@@ -27,7 +27,9 @@ import team.virto.vos.personal.Membership;
 import team.virto.vos.personal.Notice;
 import team.virto.vos.personal.PairCode;
 import team.virto.vos.personal.Paired;
+import team.virto.vos.personal.PersonalStatus;
 import team.virto.vos.personal.Posted;
+import team.virto.vos.personal.Refused;
 import team.virto.vos.personal.Synced;
 
 /**
@@ -412,19 +414,25 @@ public final class VosNode {
     }
 
     @Override
-    public Claimed claim(ClaimRequest request, IVosPrompts prompts, Refusal refused) {
+    public PersonalStatus status(Refused refused) {
+      caller();
+      return nativeStatus(handle, refused);
+    }
+
+    @Override
+    public Claimed claim(ClaimRequest request, IVosPrompts prompts, Refused refused) {
       caller();
       return nativeClaim(handle, request, prompts, refused);
     }
 
     @Override
-    public PairCode pairOffer(IVosPrompts prompts, Refusal refused) {
+    public PairCode pairOffer(IVosPrompts prompts, Refused refused) {
       caller();
       return nativePairOffer(handle, prompts, refused);
     }
 
     @Override
-    public Paired pairAwait(IVosPrompts prompts, Refusal refused) {
+    public Paired pairAwait(IVosPrompts prompts, Refused refused) {
       caller();
       return nativePairAwait(handle, prompts, refused);
     }
@@ -432,131 +440,131 @@ public final class VosNode {
     @Override
     public void pairCancel() {
       caller();
-      nativePairCancel(handle, new Refusal());
+      nativePairCancel(handle, new Refused());
     }
 
     @Override
-    public Paired pairJoin(byte[] code, String label, IVosPrompts prompts, Refusal refused) {
+    public Paired pairJoin(byte[] code, String label, IVosPrompts prompts, Refused refused) {
       caller();
       return nativePairJoin(handle, code, label, prompts, refused);
     }
 
     @Override
-    public Membership[] memberships(Refusal refused) {
+    public Membership[] memberships(Refused refused) {
       caller();
       return nativeMemberships(handle, Membership.class, refused);
     }
 
     @Override
-    public boolean enrollDevice(Membership membership, IVosPrompts prompts, Refusal refused) {
+    public boolean enrollDevice(Membership membership, IVosPrompts prompts, Refused refused) {
       caller();
       return nativeEnrollDevice(handle, membership, prompts, refused);
     }
 
     @Override
-    public boolean confirmDevice(Membership membership, IVosPrompts prompts, Refusal refused) {
+    public boolean confirmDevice(Membership membership, IVosPrompts prompts, Refused refused) {
       caller();
       return nativeConfirmDevice(handle, membership, prompts, refused);
     }
 
     @Override
-    public boolean dropEnrollment(Membership membership, Refusal refused) {
+    public boolean dropEnrollment(Membership membership, Refused refused) {
       caller();
       return nativeDropEnrollment(handle, membership, refused);
     }
 
     @Override
-    public int revoke(long device, IVosPrompts prompts, Refusal refused) {
+    public int revoke(long device, IVosPrompts prompts, Refused refused) {
       caller();
       return nativeRevoke(handle, device, prompts, refused);
     }
 
     @Override
-    public Device[] devices(Refusal refused) {
+    public Device[] devices(Refused refused) {
       caller();
       return nativeDevices(handle, Device.class, refused);
     }
 
     @Override
-    public Notice[] operations(Refusal refused) {
+    public Notice[] operations(Refused refused) {
       caller();
       return nativeOperations(handle, Notice.class, refused);
     }
 
     @Override
-    public Posted remove(long device, IVosPrompts prompts, Refusal refused) {
+    public Posted remove(long device, IVosPrompts prompts, Refused refused) {
       caller();
       return nativeRemove(handle, device, prompts, refused);
     }
 
     @Override
-    public Posted veto(long index, IVosPrompts prompts, Refusal refused) {
+    public Posted veto(long index, IVosPrompts prompts, Refused refused) {
       caller();
       return nativeVeto(handle, index, prompts, refused);
     }
 
     @Override
-    public Posted cosign(long index, IVosPrompts prompts, Refusal refused) {
+    public Posted cosign(long index, IVosPrompts prompts, Refused refused) {
       caller();
       return nativeCosign(handle, index, prompts, refused);
     }
 
     @Override
-    public Posted resolve(long index, boolean upheld, IVosPrompts prompts, Refusal refused) {
+    public Posted resolve(long index, boolean upheld, IVosPrompts prompts, Refused refused) {
       caller();
       return nativeResolve(handle, index, upheld, prompts, refused);
     }
 
     @Override
-    public Posted rotateKit(byte kit, IVosPrompts prompts, Refusal refused) {
+    public Posted rotateKit(byte kit, IVosPrompts prompts, Refused refused) {
       caller();
       return nativeRotateKit(handle, kit, prompts, refused);
     }
 
     @Override
-    public Posted replaceAdmin(byte kit, IVosPrompts prompts, Refusal refused) {
+    public Posted replaceAdmin(byte kit, IVosPrompts prompts, Refused refused) {
       caller();
       return nativeReplaceAdmin(handle, kit, prompts, refused);
     }
 
     @Override
-    public byte[] adminOffer(IVosPrompts prompts, Refusal refused) {
+    public byte[] adminOffer(IVosPrompts prompts, Refused refused) {
       caller();
       return nativeAdminOffer(handle, prompts, refused);
     }
 
     @Override
-    public Posted replaceAdminOf(byte[] code, IVosPrompts prompts, Refusal refused) {
+    public Posted replaceAdminOf(byte[] code, IVosPrompts prompts, Refused refused) {
       caller();
       return nativeReplaceAdminOf(handle, code, prompts, refused);
     }
 
     @Override
-    public Posted regroup(IVosPrompts prompts, Refusal refused) {
+    public Posted regroup(IVosPrompts prompts, Refused refused) {
       caller();
       return nativeRegroup(handle, prompts, refused);
     }
 
     @Override
-    public boolean update(IVosPrompts prompts, Refusal refused) {
+    public boolean update(IVosPrompts prompts, Refused refused) {
       caller();
       return nativeUpdate(handle, prompts, refused);
     }
 
     @Override
-    public Posted restore(ClaimRequest request, byte old, IVosPrompts prompts, Refusal refused) {
+    public Posted restore(ClaimRequest request, byte old, IVosPrompts prompts, Refused refused) {
       caller();
       return nativeRestore(handle, request, old, prompts, refused);
     }
 
     @Override
-    public Claimed restored(byte kit, IVosPrompts prompts, Refusal refused) {
+    public Claimed restored(byte kit, IVosPrompts prompts, Refused refused) {
       caller();
       return nativeRestored(handle, kit, prompts, refused);
     }
 
     @Override
-    public Claimed moveHome(ClaimRequest request, IVosPrompts prompts, Refusal refused) {
+    public Claimed moveHome(ClaimRequest request, IVosPrompts prompts, Refused refused) {
       caller();
       return nativeMoveHome(handle, request, prompts, refused);
     }
@@ -666,72 +674,74 @@ public final class VosNode {
       long handle, byte[] space, boolean optedOut, Refusal refused);
 
   private static native Claimed nativeClaim(
-      long handle, ClaimRequest request, IVosPrompts prompts, Refusal refused);
+      long handle, ClaimRequest request, IVosPrompts prompts, Refused refused);
 
   private static native PairCode nativePairOffer(
-      long handle, IVosPrompts prompts, Refusal refused);
+      long handle, IVosPrompts prompts, Refused refused);
 
-  private static native Paired nativePairAwait(long handle, IVosPrompts prompts, Refusal refused);
+  private static native Paired nativePairAwait(long handle, IVosPrompts prompts, Refused refused);
 
-  private static native boolean nativePairCancel(long handle, Refusal refused);
+  private static native boolean nativePairCancel(long handle, Refused refused);
 
   private static native Paired nativePairJoin(
-      long handle, byte[] code, String label, IVosPrompts prompts, Refusal refused);
+      long handle, byte[] code, String label, IVosPrompts prompts, Refused refused);
 
   private static native Membership[] nativeMemberships(
-      long handle, Class<Membership> element, Refusal refused);
+      long handle, Class<Membership> element, Refused refused);
 
   private static native boolean nativeEnrollDevice(
-      long handle, Membership membership, IVosPrompts prompts, Refusal refused);
+      long handle, Membership membership, IVosPrompts prompts, Refused refused);
 
   private static native boolean nativeConfirmDevice(
-      long handle, Membership membership, IVosPrompts prompts, Refusal refused);
+      long handle, Membership membership, IVosPrompts prompts, Refused refused);
 
   private static native boolean nativeDropEnrollment(
-      long handle, Membership membership, Refusal refused);
+      long handle, Membership membership, Refused refused);
 
   private static native int nativeRevoke(
-      long handle, long device, IVosPrompts prompts, Refusal refused);
+      long handle, long device, IVosPrompts prompts, Refused refused);
 
-  private static native Device[] nativeDevices(long handle, Class<Device> element, Refusal refused);
+  private static native Device[] nativeDevices(long handle, Class<Device> element, Refused refused);
 
   private static native Notice[] nativeOperations(
-      long handle, Class<Notice> element, Refusal refused);
+      long handle, Class<Notice> element, Refused refused);
 
   private static native Posted nativeRemove(
-      long handle, long device, IVosPrompts prompts, Refusal refused);
+      long handle, long device, IVosPrompts prompts, Refused refused);
 
   private static native Posted nativeVeto(
-      long handle, long index, IVosPrompts prompts, Refusal refused);
+      long handle, long index, IVosPrompts prompts, Refused refused);
 
   private static native Posted nativeCosign(
-      long handle, long index, IVosPrompts prompts, Refusal refused);
+      long handle, long index, IVosPrompts prompts, Refused refused);
 
   private static native Posted nativeResolve(
-      long handle, long index, boolean upheld, IVosPrompts prompts, Refusal refused);
+      long handle, long index, boolean upheld, IVosPrompts prompts, Refused refused);
 
   private static native Posted nativeRotateKit(
-      long handle, byte kit, IVosPrompts prompts, Refusal refused);
+      long handle, byte kit, IVosPrompts prompts, Refused refused);
 
   private static native Posted nativeReplaceAdmin(
-      long handle, byte kit, IVosPrompts prompts, Refusal refused);
+      long handle, byte kit, IVosPrompts prompts, Refused refused);
 
   private static native byte[] nativeAdminOffer(
-      long handle, IVosPrompts prompts, Refusal refused);
+      long handle, IVosPrompts prompts, Refused refused);
 
   private static native Posted nativeReplaceAdminOf(
-      long handle, byte[] code, IVosPrompts prompts, Refusal refused);
+      long handle, byte[] code, IVosPrompts prompts, Refused refused);
 
-  private static native Posted nativeRegroup(long handle, IVosPrompts prompts, Refusal refused);
+  private static native Posted nativeRegroup(long handle, IVosPrompts prompts, Refused refused);
 
-  private static native boolean nativeUpdate(long handle, IVosPrompts prompts, Refusal refused);
+  private static native boolean nativeUpdate(long handle, IVosPrompts prompts, Refused refused);
 
   private static native Posted nativeRestore(
-      long handle, ClaimRequest request, byte old, IVosPrompts prompts, Refusal refused);
+      long handle, ClaimRequest request, byte old, IVosPrompts prompts, Refused refused);
 
   private static native Claimed nativeRestored(
-      long handle, byte kit, IVosPrompts prompts, Refusal refused);
+      long handle, byte kit, IVosPrompts prompts, Refused refused);
 
   private static native Claimed nativeMoveHome(
-      long handle, ClaimRequest request, IVosPrompts prompts, Refusal refused);
+      long handle, ClaimRequest request, IVosPrompts prompts, Refused refused);
+
+  private static native PersonalStatus nativeStatus(long handle, Refused refused);
 }

@@ -16,8 +16,8 @@ use s4_credential_contract::Onion;
 use s4_credential_contract::java::{JavaError, Parcel};
 use s4_credential_contract::jvm::{compile, round_trip, with_vm};
 use vos_facility::personal::contract::{
-    AIDL, Claim, Claimed, Device, Home, KitKind, Membership, Notice, Owed, PairCode, Paired,
-    Pending, Posted, REGISTRY, Seen, Synced,
+    AIDL, Alarm, Claim, Claimed, Device, Home, KitKind, Membership, Notice, Owed, PairCode, Paired,
+    Pending, PersonalStatus, Phase, Posted, REGISTRY, Refused, Remedy, Seen, Synced, Tor, Why,
 };
 
 #[test]
@@ -49,7 +49,11 @@ fn every_type_crosses_its_parcelable_unchanged() {
                         at: 1_700_000_000_000,
                         matures: u64::MAX,
                         fresh: true,
-                        detail: "Rollback { next: 4 }".into(),
+                        by: u32::MAX,
+                        by_kit: true,
+                        contested: true,
+                        alarm: Alarm::Rollback,
+                        remedy: Remedy::RePair,
                     })
                     .collect(),
                 seen: vec![Seen {
@@ -137,6 +141,44 @@ fn every_type_crosses_its_parcelable_unchanged() {
                 at: 1_700_000_000_000,
             },
         );
+        for (at, phase) in Phase::ALL.iter().enumerate() {
+            round_trip(
+                env,
+                PersonalStatus {
+                    phase: *phase,
+                    matures: 1_700_000_000_000,
+                    home: home.clone(),
+                    agent: 4,
+                    device: u32::MAX,
+                    tor: Tor::ALL[at % Tor::ALL.len()],
+                    tor_why: "a network that blocks Tor".into(),
+                    owed: 2,
+                    standing: Alarm::ALL
+                        .iter()
+                        .zip(Remedy::ALL.iter().cycle())
+                        .map(|(alarm, remedy)| Notice {
+                            pending: Pending::Alarm,
+                            alarm: *alarm,
+                            remedy: *remedy,
+                            ..Notice::default()
+                        })
+                        .collect(),
+                    repair: "its row p/home does not decode".into(),
+                },
+            );
+        }
+        round_trip(env, PersonalStatus::default());
+        for why in Why::ALL {
+            round_trip(
+                env,
+                Refused {
+                    why: *why,
+                    at: u64::MAX,
+                    device: 3,
+                    detail: "NotAdmitted".into(),
+                },
+            );
+        }
 
         // What the other side may hand over, read strictly: an enum's byte
         // of no value, a count below zero.

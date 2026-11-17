@@ -3,12 +3,16 @@
 
 package team.virto.vos.personal;
 
+import team.virto.vos.personal.Alarm;
 import team.virto.vos.personal.Pending;
+import team.virto.vos.personal.Remedy;
 
 /**
  * One thing the chrome raises: an operation's at its log index, taken at {@code at} (the agent's
- * time, 0 when this pass did not read it) and maturing at {@code matures} unless vetoed;
- * {@code fresh} when no pass raised it before, so its notification alerts.
+ * time, 0 when this pass did not read it) and maturing at {@code matures} unless vetoed, signed by
+ * device {@code by} or by the kit ({@code byKit}), {@code contested} by another; or an alarm of its
+ * kind, {@code index} its place and its {@code remedy}. {@code fresh} when no pass raised it
+ * before, so its notification alerts.
  */
 parcelable Notice {
     Pending pending;
@@ -16,5 +20,9 @@ parcelable Notice {
     long at;
     long matures;
     boolean fresh;
-    String detail;
+    long by;
+    boolean byKit;
+    boolean contested;
+    Alarm alarm;
+    Remedy remedy;
 }

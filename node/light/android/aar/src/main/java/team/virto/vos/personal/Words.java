@@ -88,9 +88,246 @@ public final class Words {
     }
   }
 
-  /** Whether an operation's detail says it is contested, as the facility words it. */
-  public static boolean contested(String detail) {
-    return detail != null && detail.endsWith(", contested");
+  /** What a notice is: its kind, who signed it, and whether it is contested; an alarm's words. */
+  public static String notice(Notice notice) {
+    if (notice.pending == Pending.ALARM) {
+      return alarm(notice.alarm, notice.index) + remedy(notice.remedy);
+    }
+    return pending(notice.pending) + signer(notice);
+  }
+
+  /** Who signed an operation's notice, and whether it is contested; nothing for other kinds. */
+  public static String signer(Notice notice) {
+    if (notice.byKit) {
+      return " (by the kit)";
+    }
+    if (notice.pending <= Pending.RESTORE) {
+      return " (by device " + notice.by + (notice.contested ? ", contested" : "") + ")";
+    }
+    return "";
+  }
+
+  /** An alarm's words, {@code at} its place (a log index, an epoch, a position, a skew in s). */
+  public static String alarm(byte alarm, long at) {
+    switch (alarm) {
+      case Alarm.LOG:
+        return "The log does not chain at entry " + at;
+      case Alarm.SPLIT_LOG:
+        return "A vote on epoch " + at + " is of another log";
+      case Alarm.NAMED_ABSENT:
+        return "Epoch " + at + " names this device absent though it called";
+      case Alarm.REFUSED:
+        return "This device refused epoch " + at;
+      case Alarm.CANNOT_FOLLOW:
+        return "This device cannot follow epoch " + at;
+      case Alarm.VERDICT:
+        return "The agent's verdict on epoch " + at + " is not this device's";
+      case Alarm.UNSIGNED:
+        return "Log entry " + at + " matures with no evidence";
+      case Alarm.CLOCK:
+        return "This device's clock is " + at + " s off the agent's";
+      case Alarm.KIT:
+        return "The recovery kit signed operation " + at + ": veto it, or rotate the kit";
+      case Alarm.ROLLBACK:
+        return "The agent's log went back to " + at;
+      case Alarm.VIEW:
+        return "A device saw log entry " + at + " otherwise";
+      case Alarm.DROPPED:
+        return "This device's call at " + at + " is not in the log";
+      case Alarm.PARTITION:
+        return "The agent serves less than a device read, at " + at;
+      case Alarm.WITHHELD:
+        return "The agent withheld an envelope at " + at;
+      case Alarm.STALE:
+        return "An envelope at " + at + " is sealed under a past epoch";
+      case Alarm.AUTHOR:
+        return "An envelope at " + at + " is by no device of the set";
+      case Alarm.DELETED:
+        return "This device's envelope at " + at + " was gone: pushed again";
+      case Alarm.UNSERVED:
+        return "The agent named its log's head at " + at + " and served less of it";
+      case Alarm.POLICY:
+        return "Log entry " + at + " lowers the device set's delays: refused";
+      default:
+        return "An alarm (" + alarm + ")";
+    }
+  }
+
+  /** What an alarm's remedy asks, after its words; nothing when it has none. */
+  public static String remedy(byte remedy) {
+    switch (remedy) {
+      case Remedy.RE_PAIR:
+        return ": pair this phone again from another of your devices";
+      case Remedy.REGROUP:
+        return ": no other device to pair from, regroup";
+      default:
+        return "";
+    }
+  }
+
+  /** Where the personal space is. */
+  public static String phase(byte phase) {
+    switch (phase) {
+      case Phase.NONE:
+        return "This phone holds no personal space";
+      case Phase.CLAIMING:
+        return "A claim is under way: claim at its home again to finish it";
+      case Phase.JOINING:
+        return "Paired: waiting to be added";
+      case Phase.HELD:
+        return "Your personal space";
+      case Phase.RESTORING:
+        return "A restore is under way";
+      case Phase.REMOVED:
+        return "This phone is out of your personal space: pair it again";
+      case Phase.STUCK:
+        return "This phone cannot follow your devices: pair it again, or regroup";
+      case Phase.NEEDS_REPAIR:
+        return "This phone's personal space needs repair: clear the app's data, then claim or pair";
+      default:
+        return "Unknown (" + phase + ")";
+    }
+  }
+
+  /** Tor as the facility last found it. */
+  public static String tor(byte tor, String why) {
+    switch (tor) {
+      case Tor.CONNECTED:
+        return "Tor connected";
+      case Tor.BLOCKED:
+        return "Tor blocked" + (why == null || why.isEmpty() ? "" : ": " + why);
+      default:
+        return "Tor starting";
+    }
+  }
+
+  /** Why a personal operation was refused, in words, its detail after when it has one. */
+  public static String why(Refused refused) {
+    String said = whyWords(refused);
+    return refused.detail == null || refused.detail.isEmpty() || said.endsWith(refused.detail)
+        ? said
+        : said + " (" + refused.detail + ")";
+  }
+
+  private static String whyWords(Refused refused) {
+    switch (refused.why) {
+      case Why.NO_SPACE:
+        return "this phone holds no personal space";
+      case Why.ALREADY_HELD:
+        return "this phone holds a personal space already";
+      case Why.HOLDS_KEYS:
+        return "this phone holds a personal space's keys already: restore or pair it";
+      case Why.CLAIM_ELSEWHERE:
+        return "a claim at another home is under way: claim there again to finish it";
+      case Why.AT_THAT_HOME:
+        return "your personal space is at that home already";
+      case Why.NO_RESTORE:
+        return "no restore is under way";
+      case Why.NO_PAIRING:
+        return "no pairing is under way";
+      case Why.NEEDS_REPAIR:
+        return "this phone's personal space needs repair";
+      case Why.DECLINED:
+        return "declined";
+      case Why.CANCELLED:
+        return "cancelled";
+      case Why.NOT_A_KIT:
+        return "that is not a recovery kit";
+      case Why.WRONG_KIT:
+        return "that kit is not this personal space's";
+      case Why.NOT_A_PAIRING_CODE:
+        return "that is not a pairing code";
+      case Why.NOT_AN_OFFER:
+        return "that is not an admin-key code";
+      case Why.STALE_OFFER:
+        return "that admin-key code is not signed by its device, or is stale";
+      case Why.OWN_KEY:
+        return "a device does not sign its own key's replacement";
+      case Why.NOT_IN_SET:
+        return "that device is not in the set";
+      case Why.SOURCE:
+        return "the phone's key failed";
+      case Why.NO_OPEN_CLAIM:
+        return "that home serves no claim";
+      case Why.OPEN_CLAIM_REFUSED:
+        return "that home refused to open a claim";
+      case Why.NO_AGENT_TO_GIVE:
+        return "that home has no personal agent to give";
+      case Why.NO_AGENT_FOR_KIT:
+        return "no personal space at that home holds this kit";
+      case Why.HOLDS_AGENT_THERE:
+        return "this phone holds an agent at that home already";
+      case Why.UNKNOWN_AGENT:
+        return "that home does not know the agent";
+      case Why.NO_LEAF:
+        return "the space is not read yet: try again";
+      case Why.HOME_REFUSED:
+        return "the home refused";
+      case Why.UPDATE:
+        return "update the app: this proof's format is retired";
+      case Why.REJECTED:
+        return "the proof was rejected";
+      case Why.AGENT_REFUSED:
+        return "your personal agent refused";
+      case Why.NOT_TAKEN_YET:
+      case Why.NOT_JOINED_YET:
+      case Why.COMMIT_VOID:
+      case Why.COMMITTED_MEANWHILE:
+        return "not yet: try again";
+      case Why.AWAITS_VOTES:
+        return "waiting for your other devices";
+      case Why.UNDECIDED:
+        return "your devices have not decided yet";
+      case Why.SLOT_EXPIRED:
+        return "the pairing's code expired";
+      case Why.IN_SET_ALREADY:
+        return "this phone is in that personal space already";
+      case Why.NOT_IN_AGENT_SET:
+        return "your personal agent does not hold this phone";
+      case Why.REGROUPED:
+        return "device " + refused.device + " regrouped: pair this phone again";
+      case Why.NOT_ENROLLED:
+        return "this phone is not enrolled there";
+      case Why.NOTHING_OWED:
+        return "nothing is owed there";
+      case Why.SPENT:
+        return "that enrollment was used";
+      case Why.REGISTRAR_REFUSED:
+        return "the space refused";
+      case Why.UNREACHABLE:
+        return "not reached over Tor";
+      case Why.PROVE:
+        return "the proof failed";
+      case Why.STORE:
+        return "this phone's storage failed";
+      case Why.ARGUMENTS:
+        return "not a request the facility takes";
+      default:
+        return refused.detail == null || refused.detail.isEmpty()
+            ? "the facility failed"
+            : refused.detail;
+    }
+  }
+
+  /** One of the facility's own refusals ({@code code}, {@code message}) filled into {@code into}. */
+  public static void refused(int code, String message, Refused into) {
+    switch (code) {
+      case ErrorCode.DECLINED:
+        into.why = Why.DECLINED;
+        break;
+      case ErrorCode.NOT_ENROLLED:
+        into.why = Why.NOT_ENROLLED;
+        break;
+      case ErrorCode.API:
+        into.why = Why.UNREACHABLE;
+        break;
+      case ErrorCode.STORE:
+        into.why = Why.STORE;
+        break;
+      default:
+        into.why = Why.FAILED;
+    }
+    into.detail = message == null ? "" : message;
   }
 
   /** A refusal's words: its message, or its code when it has none. */

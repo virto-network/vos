@@ -111,7 +111,8 @@ fn removal() -> Notice {
         at: 1_000,
         matures: 1_000 + 72 * 3_600_000,
         fresh: false,
-        detail: "by device 1".into(),
+        by: 1,
+        ..Notice::default()
     }
 }
 
@@ -185,11 +186,9 @@ fn an_alarm_stands_after_the_pass_that_raised_it() {
     let (node, _world) = enrolled(directory.path());
     let alarm = Notice {
         pending: Pending::Alarm,
-        index: 0,
-        at: 0,
-        matures: 0,
-        fresh: false,
-        detail: "Rollback { next: 4 }".into(),
+        index: 4,
+        alarm: vos_facility::personal::contract::Alarm::Rollback,
+        ..Notice::default()
     };
     let rollback = Alarm::Rollback { next: 4 };
     let found = |notices: Vec<Notice>, stopped: Option<&str>| {

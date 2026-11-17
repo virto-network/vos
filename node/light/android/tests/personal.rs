@@ -18,7 +18,7 @@ use std::collections::HashSet;
 
 use common::phone::*;
 use common::*;
-use vos_facility::personal::{Claim, KitKind, Owed};
+use vos_facility::personal::{Claim, KitKind, Owed, Why};
 use vos_light::tor::Target;
 
 /// The path the brief names: a claim with a security-key kit, a pairing
@@ -104,7 +104,7 @@ fn a_personal_space_is_claimed_paired_retired_and_moved() {
         .unwrap()
         .confirm_device(&*second.hand, confirming[0])
         .unwrap_err();
-    assert_eq!(refused.code, s4_credential_contract::Code::NotEnrolled);
+    assert_eq!(refused.why, Why::NotEnrolled, "{refused:?}");
     let theirs = second.enroll();
     assert!(
         in_club(&world, &theirs),
@@ -278,7 +278,7 @@ fn the_device_sets_operations_are_signed_by_the_admin_key() {
         std::thread::sleep(Duration::from_millis(300));
         first.node.space().unwrap().pair_cancel();
         let cancelled = opener.join().unwrap().unwrap_err();
-        assert_eq!(cancelled.code, vos_facility::Code::Declined);
+        assert_eq!(cancelled.why, Why::Cancelled, "{cancelled:?}");
     });
     first.pair(&second, "second");
     first.pair(&third, "third");
@@ -301,7 +301,7 @@ fn the_device_sets_operations_are_signed_by_the_admin_key() {
     assert!(
         ["Unseasoned", "Probation"]
             .iter()
-            .any(|refusal| unseasoned.message.contains(refusal)),
+            .any(|refusal| unseasoned.detail.contains(refusal)),
         "{unseasoned:?}"
     );
     // A new admin key for the third, offered to the others: the third
@@ -335,7 +335,7 @@ fn the_device_sets_operations_are_signed_by_the_admin_key() {
             .unwrap()
             .replace_admin_of(&*first.hand, &code)
             .unwrap_err();
-        assert!(refused.message.contains("not signed"), "{refused:?}");
+        assert_eq!(refused.why, Why::StaleOffer, "{refused:?}");
     }
     let own = third
         .node
@@ -343,7 +343,7 @@ fn the_device_sets_operations_are_signed_by_the_admin_key() {
         .unwrap()
         .replace_admin_of(&*third.hand, &offer)
         .unwrap_err();
-    assert!(own.message.contains("Targeted"), "{own:?}");
+    assert!(own.detail.contains("Targeted"), "{own:?}");
     after(policy().probation_ms.max(policy().seasoning_ms));
     for phone in [&first, &second, &third] {
         phone.node.sync_personal().unwrap();
@@ -711,7 +711,7 @@ fn after_a_regroup_the_others_pair_again() {
         let _ = phone.node.sync_personal();
     }
     let out = third.node.personal().unwrap().devices().unwrap_err();
-    assert!(out.message.contains("NotAdmitted"), "{out:?}");
+    assert!(out.detail.contains("NotAdmitted"), "{out:?}");
     let devices = first.node.personal().unwrap().devices().unwrap();
     let standing: Vec<_> = devices.iter().filter(|device| !device.removed).collect();
     assert_eq!(standing.len(), 1, "{devices:?}");
@@ -757,10 +757,7 @@ fn after_a_regroup_the_others_pair_again() {
         .unwrap()
         .pair_join(&*fourth.hand, &code.code, "again")
         .unwrap_err();
-    assert!(
-        refused.message.contains("in that personal space already"),
-        "{refused:?}"
-    );
+    assert!(refused.why == Why::InSetAlready, "{refused:?}");
     assert_eq!(fourth.node.space().unwrap().sync_key(), sync);
     assert_eq!(
         fourth.node.space().unwrap().scope_key(b"notes").unwrap(),
@@ -950,11 +947,7 @@ fn a_personal_space_this_build_does_not_read_is_kept_and_sign_in_runs() {
             .personal()
             .and_then(|personal| personal.devices())
             .unwrap_err();
-        assert_eq!(refused.code, Code::Store, "{what}");
-        assert!(
-            refused.message.contains("needs repair"),
-            "{what}: {refused:?}"
-        );
+        assert_eq!(refused.why, Why::NeedsRepair, "{what}: {refused:?}");
         let again = phone
             .node
             .personal()
@@ -969,7 +962,7 @@ fn a_personal_space_this_build_does_not_read_is_kept_and_sign_in_runs() {
                 )
             })
             .unwrap_err();
-        assert_eq!(again.code, Code::Store, "{what}");
+        assert_eq!(again.why, Why::NeedsRepair, "{what}: {again:?}");
         signs_in(&phone);
         let Held {
             node, _directory, ..
@@ -1138,7 +1131,7 @@ fn a_move_cut_short_after_its_leave_claims_again() {
         .unwrap()
         .move_home(&*phone.hand, moving)
         .unwrap_err();
-    assert!(again.message.contains("at that home already"), "{again:?}");
+    assert_eq!(again.why, Why::AtThatHome, "{again:?}");
     let pool = world.state.lock().unwrap().spaces[&elsewhere]
         .homes
         .as_ref()
