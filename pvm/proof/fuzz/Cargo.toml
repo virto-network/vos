@@ -31,6 +31,10 @@ vos-anchor = { path = "../anchor", features = ["vectors"] }
 # program the assembler builds.
 vos-pvm-device = { path = "../device" }
 vos-pvm-compiler = { path = "../../compiler" }
+# The device proof's encoding, its interaction PoW nonce written again.
+postcard = { version = "1", features = ["alloc"] }
+# The JAM statements service's refine, on the work items a JAM node gives.
+vos-statement-service = { path = "../statement/service" }
 stwo = { git = "https://github.com/olanod/stwo", rev = "e14925a81606b4d68c6a5d3047d382a20bd953d3", default-features = false }
 
 # Skip the test profile's default panic strategy override;
@@ -90,3 +94,27 @@ path = "fuzz_targets/device_verify_bytes.rs"
 test = false
 doc = false
 
+
+[[bin]]
+name = "device_verify_mutate"
+path = "fuzz_targets/device_verify_mutate.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "derive_elf"
+path = "fuzz_targets/derive_elf.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "program_blob"
+path = "fuzz_targets/program_blob.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "service_item"
+path = "fuzz_targets/service_item.rs"
+test = false
+doc = false

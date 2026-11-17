@@ -1,5 +1,6 @@
-//! The mutations `final_verifier_mutate` applies to a golden wrap, by its
-//! structure and by its bytes; `examples/paths.rs` replays them too.
+//! The mutations `final_verifier_mutate` applies to a golden wrap and
+//! `device_verify_mutate` to a golden device proof, by their structure and
+//! by their bytes; `examples/paths.rs` replays them too.
 
 #![allow(dead_code)]
 
@@ -7,7 +8,12 @@ use arbitrary::Arbitrary;
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::poly::line::LinePoly;
+use stwo::core::proof::StarkProof;
+use stwo::core::vcs::blake2_hash::Blake2sHash;
 use stwo::core::vcs::blake2b_hash::Blake2bHash;
+use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleHasher;
+use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
+use vos_pvm_final_verifier::masking::MaskedProof;
 use vos_pvm_final_verifier::WrapProof;
 
 /// Where in the proof a structural mutation lands.
@@ -130,8 +136,14 @@ fn reshape_nested<T: Clone>(trees: &mut Vec<Vec<Vec<T>>>, outer: usize, inner: u
 }
 
 /// A vector at `place` resized by `how`.
-fn reshape(proof: &mut WrapProof, place: Place, outer: usize, inner: usize, how: Resize) {
-    let stark = &mut proof.stark_proof.0;
+fn reshape<H: MerkleHasherLifted>(
+    proof: &mut StarkProof<H>,
+    place: Place,
+    outer: usize,
+    inner: usize,
+    how: Resize,
+) {
+    let stark = &mut proof.0;
     let fri = &mut stark.fri_proof;
     match place {
         Place::Commitments => resize(&mut stark.commitments.0, how),
@@ -164,15 +176,15 @@ fn reshape(proof: &mut WrapProof, place: Place, outer: usize, inner: usize, how:
 }
 
 /// A value at `place` set.
-fn set_value(
-    proof: &mut WrapProof,
+fn set_value<H: MerkleHasherLifted>(
+    proof: &mut StarkProof<H>,
     place: Place,
     outer: usize,
     inner: usize,
     at: usize,
     limbs: [u32; 4],
 ) {
-    let stark = &mut proof.stark_proof.0;
+    let stark = &mut proof.0;
     let fri = &mut stark.fri_proof;
     let value = secure(limbs);
     let target = match place {
@@ -208,8 +220,14 @@ fn set_value(
 }
 
 /// A hash at `place` set.
-fn set_hash(proof: &mut WrapProof, place: Place, outer: usize, at: usize, hash: [u8; 32]) {
-    let stark = &mut proof.stark_proof.0;
+fn set_hash<H: MerkleHasherLifted>(
+    proof: &mut StarkProof<H>,
+    place: Place,
+    outer: usize,
+    at: usize,
+    hash: H::Hash,
+) {
+    let stark = &mut proof.0;
     let fri = &mut stark.fri_proof;
     let target = match place {
         Place::Commitments => pick(&mut stark.commitments.0, at),
@@ -222,11 +240,17 @@ fn set_hash(proof: &mut WrapProof, place: Place, outer: usize, at: usize, hash: 
         _ => pick(&mut fri.first_layer.decommitment.hash_witness, at),
     };
     if let Some(target) = target {
-        *target = Blake2bHash(hash);
+        *target = hash;
     }
 }
 
-pub fn apply(proof: &mut WrapProof, mutation: &Mutation) {
+/// `mutation` applied to a STARK proof's own parts, a hash made by `hash`;
+/// whether it was one of theirs.
+fn apply_stark<H: MerkleHasherLifted>(
+    proof: &mut StarkProof<H>,
+    mutation: &Mutation,
+    hash: impl Fn([u8; 32]) -> H::Hash,
+) -> bool {
     match *mutation {
         Mutation::Resize {
             place,
@@ -245,15 +269,11 @@ pub fn apply(proof: &mut WrapProof, mutation: &Mutation) {
             place,
             outer,
             at,
-            hash,
-        } => set_hash(proof, place, outer.into(), at.into(), hash),
-        Mutation::ProofOfWork(nonce) => proof.stark_proof.0.proof_of_work = nonce,
-        Mutation::InteractionPow(nonce) => proof.interaction_pow = nonce,
-        Mutation::ClaimedSum { at, limbs } => {
-            proof.claimed_sums[usize::from(at) % 3] = secure(limbs)
-        }
+            hash: bytes,
+        } => set_hash(proof, place, outer.into(), at.into(), hash(bytes)),
+        Mutation::ProofOfWork(nonce) => proof.0.proof_of_work = nonce,
         Mutation::Config { field, value } => {
-            let config = &mut proof.stark_proof.0.config;
+            let config = &mut proof.0.config;
             match field % 5 {
                 0 => config.pow_bits = value,
                 1 => config.fri_config.log_blowup_factor = value,
@@ -262,12 +282,41 @@ pub fn apply(proof: &mut WrapProof, mutation: &Mutation) {
                 _ => config.fri_config.fold_step = value,
             }
         }
+        _ => return false,
+    }
+    true
+}
+
+pub fn apply(proof: &mut WrapProof, mutation: &Mutation) {
+    if apply_stark(&mut proof.stark_proof, mutation, Blake2bHash) {
+        return;
+    }
+    match *mutation {
+        Mutation::InteractionPow(nonce) => proof.interaction_pow = nonce,
+        Mutation::ClaimedSum { at, limbs } => {
+            proof.claimed_sums[usize::from(at) % 3] = secure(limbs)
+        }
         Mutation::LogSize { at, value } => proof.log_sizes[usize::from(at) % 3] = value,
         Mutation::Format(format) => proof.format_version = format,
-        Mutation::Flip { .. }
-        | Mutation::Insert { .. }
-        | Mutation::Remove { .. }
-        | Mutation::Truncate { .. } => {}
+        _ => {}
+    }
+}
+
+/// `mutation` applied to a device proof's structure. Its format and log
+/// sizes are the program's, which its encoding does not carry: those
+/// mutations change nothing.
+pub fn apply_device(proof: &mut MaskedProof<Blake2sM31MerkleHasher>, mutation: &Mutation) {
+    if apply_stark(&mut proof.stark_proof, mutation, Blake2sHash) {
+        return;
+    }
+    match *mutation {
+        Mutation::InteractionPow(nonce) => proof.interaction_pow = nonce,
+        Mutation::ClaimedSum { at, limbs } => {
+            if let Some(sum) = pick(&mut proof.claimed_sums, at.into()) {
+                *sum = secure(limbs);
+            }
+        }
+        _ => {}
     }
 }
 

@@ -54,6 +54,11 @@ impl Verifier {
 
     /// Verifies the proof in `bytes` ([`decode`]) of this program's kernel
     /// stating the io-hash `io`.
+    ///
+    /// The crate runs with std and is not linted panic-free: a caller
+    /// verifying bytes it was given treats a panic here as a refusal
+    /// (`catch_unwind`), as it treats `Err`. The fuzz targets
+    /// `device_verify_bytes` and `device_verify_mutate` hold it to no panic.
     pub fn verify(&self, io: &[u8; 32], bytes: &[u8]) -> Result<(), Refusal> {
         verify(&self.format, &self.program, &self.masked, io, bytes)
     }

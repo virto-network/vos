@@ -16,11 +16,35 @@ anchor_decode	vector: Noncanonical
 anchor_decode	vector: Short
 anchor_decode	vector: Trailing
 anchor_decode	vector: decodes
+derive_elf	CodeSections
+derive_elf	NoRelocations
+derive_elf	NoSchema
+derive_elf	Relocation
+derive_elf	Table
+derive_elf	Transpile
+derive_elf	derived
 device_verify_bytes	Decode
 device_verify_bytes	Format
 device_verify_bytes	InteractionPow
 device_verify_bytes	accepted
 device_verify_bytes	shorter than an io-hash
+device_verify_mutate	Format
+device_verify_mutate	InteractionPow
+device_verify_mutate	Logup
+device_verify_mutate	Noncanonical
+device_verify_mutate	Program
+device_verify_mutate	Shape
+device_verify_mutate	Stark
+device_verify_mutate	accepted
+device_verify_mutate	bytes: Decode
+device_verify_mutate	bytes: Format
+device_verify_mutate	bytes: InteractionPow
+device_verify_mutate	bytes: Logup
+device_verify_mutate	bytes: Noncanonical
+device_verify_mutate	bytes: Program
+device_verify_mutate	bytes: Shape
+device_verify_mutate	bytes: Stark
+device_verify_mutate	bytes: accepted
 final_verifier_bytes	39: Circuit
 final_verifier_bytes	39: Decode
 final_verifier_bytes	39: Format
@@ -81,7 +105,37 @@ masked_shape	Stark(queries do not resolve to their commitment in inner layer 1)
 masked_shape	Stark(queries do not resolve to their commitment in inner layer 2)
 masked_shape	Stark(queries do not resolve to their commitment in the first layer)
 masked_shape	accepted
+program_blob	HostCall
+program_blob	Panic
+program_blob	refused: InvalidBlob
 prove_verify_roundtrip	a program
+service_item	Refused(None, 1)
+service_item	Refused(Some(Anchor), 2)
+service_item	Refused(Some(Anchor), 3)
+service_item	Refused(Some(Control), 1)
+service_item	Refused(Some(Control), 2)
+service_item	Refused(Some(Register), 1)
+service_item	Refused(Some(Register), 2)
+service_item	Refused(Some(Register), 3)
+service_item	Submit(0)
+service_item	Submit(1)
+service_item	Submit(2)
+service_item	Submit(257)
+service_item	Submit(260)
+service_item	Submit(261)
+service_item	Submit(262)
+service_item	Submit(263)
+service_item	Submit(264)
+service_item	Submit(265)
+service_item	Submit(274)
+service_item	Submit(275)
+service_item	Submit(276)
+service_item	Submit(277)
+service_item	Submit(3)
+service_item	Submit(4)
+service_item	as a verdict: Noncanonical
+service_item	as a verdict: Short
+service_item	as a verdict: decodes
 statement_decode	Format
 statement_decode	Program
 statement_decode	Proof(Decode)

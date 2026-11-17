@@ -59,6 +59,7 @@ last:
 | `pvm/proof/fuzz/Cargo.lock` | the prover's fuzz targets' lock, VOS's pruned to what they link, and the fuzzing tools (`libfuzzer-sys`, `arbitrary`) | `just locks` | `just check-locks` | `gate` |
 | `pvm/proof/final-verifier/src/constants.rs` | the wrap's preprocessed root (`PREPROCESSED_ROOT_39`), a venue's verifying key | by hand, at a change of the wrap's circuit | `vos-pvm-recair`'s `recursion` test (`masked::`) and `vos-pvm-proof`'s `constants::` test compute it | `gate`; `ci-full` |
 | `pvm/proof/fuzz/replay` | each of the prover's fuzz targets' replay corpus, one archive a target (`<target>.tar`, `fuzz/corpus.py`: the same inputs, the same bytes): inputs kept because they reached a path | `just fuzz-refresh` (seeded from the goldens, fuzzed, merged, packed) | `just fuzz-replay` (unpacked into `fuzz/target/replay/`) | `gate` |
+| `pvm/proof/fuzz/device-golden.proof` | the golden device proof `device_verify_mutate` mutates (its io-hash, then the proof), kept so its corpus replays against one proof | the fuzz seed (`cargo run --example seed`, in `just fuzz-refresh`), anew only when the device program no longer accepts it | the device targets, which refuse to start on a golden the program does not accept (`just fuzz-replay`) | `gate` |
 | `pvm/proof/fuzz/reach.txt` | the verdicts each of the prover's replay corpora reaches, its accepted goldens among them | from `just fuzz-reach`'s output after `just fuzz-refresh` | `just fuzz-reach` | `gate` |
 
 The node side keeps pins of its own beside these, which its `just repin`

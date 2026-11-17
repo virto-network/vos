@@ -2,6 +2,8 @@
 //! unpacked into `target/replay/<target>/`) reaches: the verdict its
 //! target's verifier, decoder or venue gives it, counted by verdict a
 //! target. `prove_verify_roundtrip`'s inputs are programs, counted alone.
+//! A verdict that carries values (a derive's refusal, a run's exit) is
+//! counted by its variant.
 //!
 //! With `--each`, it prints a line `<target>\t<input>\t<verdict>` for
 //! each verdict of each input instead: what a corpus is pruned by.
@@ -17,12 +19,18 @@
 //! cargo run --release --example paths [-- --expect reach.txt]
 //! ```
 
+#[path = "../fuzz_targets/device_golden.rs"]
+mod device_golden;
 #[path = "../fuzz_targets/device_program.rs"]
 mod device_program;
 #[path = "../fuzz_targets/golden.rs"]
 mod golden;
 #[path = "../fuzz_targets/mutation.rs"]
 mod mutation;
+#[path = "../fuzz_targets/program_run.rs"]
+mod program_run;
+#[path = "../fuzz_targets/service.rs"]
+mod service;
 #[path = "../fuzz_targets/shape.rs"]
 mod shape;
 
@@ -33,8 +41,10 @@ use std::sync::OnceLock;
 use arbitrary::{Arbitrary, Unstructured};
 use vos_anchor::vectors::Vector;
 use vos_anchor::{Anchor, SpaceGenesis};
+use vos_pvm::PvmBackend;
 use vos_pvm_final_verifier::{masked, Error, LINKED};
 use vos_statement::model::judge_bytes;
+use vos_statement_service::verdict::Verdict;
 
 /// A verifier's verdict, its variant and what it names.
 fn verdict<T>(result: Result<T, Error>) -> String {
@@ -133,6 +143,48 @@ fn paths(target: &str, bytes: &[u8]) -> Vec<String> {
                 Err(refusal) => format!("{refusal:?}"),
             },
         }],
+        "device_verify_mutate" => {
+            let Ok(mutations) =
+                Vec::<mutation::Mutation>::arbitrary_take_rest(Unstructured::new(bytes))
+            else {
+                return vec!["no mutations".into()];
+            };
+            let golden = device_golden::golden();
+            let mut proof = golden.decode();
+            for mutation in &mutations {
+                mutation::apply_device(&mut proof, mutation);
+            }
+            let ground = match golden.ground(&proof) {
+                None => "does not encode".into(),
+                Some((_, Ok(()))) => "accepted".into(),
+                Some((_, Err(refusal))) => format!("{refusal:?}"),
+            };
+            let mut bytes = vos_pvm_device::encode(&vos_pvm_device::FORMAT, &proof)
+                .unwrap_or_else(|| golden.proof.clone());
+            for mutation in &mutations {
+                mutation::apply_bytes(&mut bytes, mutation);
+            }
+            let bytes = match golden.verifier.verify(&golden.io, &bytes) {
+                Ok(()) => "bytes: accepted".into(),
+                Err(refusal) => format!("bytes: {refusal:?}"),
+            };
+            vec![ground, bytes]
+        }
+        "derive_elf" => vec![match vos_pvm_compiler::derive(bytes) {
+            Ok(_) => "derived".into(),
+            Err(error) => program_run::variant(&format!("{error:?}")).to_owned(),
+        }],
+        "program_blob" => vec![program_run::label(&program_run::run(
+            bytes,
+            PvmBackend::ForceInterpreter,
+        ))],
+        "service_item" => vec![
+            service::label(&service::verdict(bytes)),
+            match Verdict::decode_prefix(bytes) {
+                Ok(_) => "as a verdict: decodes".into(),
+                Err(error) => format!("as a verdict: {error:?}"),
+            },
+        ],
         "anchor_decode" => vec![
             decoded("genesis", SpaceGenesis::decode(bytes)),
             decoded("anchor", Anchor::decode(bytes)),

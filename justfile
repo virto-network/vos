@@ -833,12 +833,22 @@ _kit-workspace:
 # the golden wraps mutated, on format 39's layout past its header and on
 # its queried parts reshaped within the layout's bounds; the statement's
 # and the space's decoders and the venue's check; prove-then-verify on
-# random programs; and the device verifier on ingress's bytes, under 47.
+# random programs; the device verifier on ingress's bytes and on the
+# golden device proof mutated, under 47; the compiler's derive on ELF
+# bytes; a standard program's parse and run on both backends; and the JAM
+# statements service's refine on work items.
 # The node's (`node/fuzz`): the node API's frame reader and operator
 # envelope, and a credentialed call's decode, ingress's. A target's
 # property is no panic and nothing accepted but a golden (a device proof:
 # its one encoding).
-proof_fuzz_targets := "final_verifier_bytes final_verifier_mutate statement_decode prove_verify_roundtrip masked_bytes masked_shape anchor_decode device_verify_bytes"
+# Each target's libFuzzer bounds where they are not the default's (an
+# input of 256 KiB and a byte, 8 GiB, ten minutes an input): a device
+# input up to an io-hash and a whole device proof (`MAX_PROOF_BYTES`), and
+# an ELF as large under the memory and time derive is held to whatever the
+# ELF claims.
+_fuzz_limits := '{device_verify_bytes: [-max_len=1572896 -rss_limit_mb=8192 -timeout=600], derive_elf: [-max_len=1572896 -rss_limit_mb=512 -timeout=10]}'
+_fuzz_default := '[-max_len=262145 -rss_limit_mb=8192 -timeout=600]'
+proof_fuzz_targets := "final_verifier_bytes final_verifier_mutate statement_decode prove_verify_roundtrip masked_bytes masked_shape anchor_decode device_verify_bytes device_verify_mutate derive_elf program_blob service_item"
 node_fuzz_targets := "api_reader operated_decode credentialed_decode"
 
 # Each target's checked-in corpus (`replay/<target>.tar` of its workspace,
@@ -865,16 +875,16 @@ fuzz-reach:
 # The prover's replay corpora rebuilt from the goldens (but
 # `prove_verify_roundtrip`'s, whose programs need no golden): each target
 # seeded (`--example seed`), fuzzed `secs` seconds from its seeds and its
-# replay corpus as `just fuzz` runs it (a device input up to an io-hash and
-# a whole device proof, `MAX_PROOF_BYTES`), then merged (`-merge=1`) into a new
-# replay corpus of the inputs that add coverage, the old one's among them.
+# replay corpus as `just fuzz` runs it (each under `_fuzz_limits`' bounds),
+# then merged (`-merge=1`) into a new replay corpus of the inputs that add
+# coverage, the old one's among them.
 # It writes each `replay/<target>.tar` anew (`corpus.py pack`: the same
 # inputs, the same bytes) and marks a new archive (`git add -N`), so a
 # remote run's diff carries it; `just fuzz-reach` then lists what the new
 # corpus reaches.
 fuzz-refresh secs="120":
     cd pvm/proof/fuzz; cargo run --release --locked --example seed
-    cd pvm/proof/fuzz; python3 -I corpus.py unpack replay target/replay; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{proof_fuzz_targets}}" | split row ' ' | where {|target| $target != "prove_verify_roundtrip" }) { let max_len = if $target == "device_verify_bytes" { 1572896 } else { 262145 }; mkdir $"corpus/($target)"; cargo fuzz run -a $target $"corpus/($target)" $"target/replay/($target)" -- -max_total_time={{secs}} $"-max_len=($max_len)" -len_control=0 -rss_limit_mb=8192 -timeout=600; rm -rf $"target/merged/($target)"; mkdir $"target/merged/($target)"; cargo fuzz run -a $target $"target/merged/($target)" $"corpus/($target)" $"target/replay/($target)" -- -merge=1 $"-max_len=($max_len)" -rss_limit_mb=8192 -timeout=600; python3 -I corpus.py pack $"target/merged/($target)" $"replay/($target).tar" } }
+    cd pvm/proof/fuzz; python3 -I corpus.py unpack replay target/replay; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{proof_fuzz_targets}}" | split row ' ' | where {|target| $target != "prove_verify_roundtrip" }) { let limits = ({{_fuzz_limits}} | get -o $target | default {{_fuzz_default}}); mkdir $"corpus/($target)"; cargo fuzz run -a $target $"corpus/($target)" $"target/replay/($target)" -- -max_total_time={{secs}} -len_control=0 ...$limits; rm -rf $"target/merged/($target)"; mkdir $"target/merged/($target)"; cargo fuzz run -a $target $"target/merged/($target)" $"corpus/($target)" $"target/replay/($target)" -- -merge=1 ...$limits; python3 -I corpus.py pack $"target/merged/($target)" $"replay/($target).tar" } }
     git add -N pvm/proof/fuzz/replay
 
 # Each target `secs` seconds from its corpus (a minute in `ci-full`, five in
@@ -887,7 +897,7 @@ fuzz-refresh secs="120":
 # run here) starts from an empty one beside its replay.
 fuzz secs="60":
     cd pvm/proof/fuzz; cargo run --release --locked --example seed
-    cd pvm/proof/fuzz; python3 -I corpus.py unpack replay target/replay; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{proof_fuzz_targets}}" | split row ' ') { let max_len = if $target == "device_verify_bytes" { 1572896 } else { 262145 }; mkdir $"corpus/($target)"; let build = if $target == "prove_verify_roundtrip" { [-O -s none --target-dir target/no-sanitizer] } else { [-a] }; cargo fuzz run ...$build $target $"corpus/($target)" $"target/replay/($target)" -- -max_total_time={{secs}} $"-max_len=($max_len)" -len_control=0 -rss_limit_mb=8192 -timeout=600 } }
+    cd pvm/proof/fuzz; python3 -I corpus.py unpack replay target/replay; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{proof_fuzz_targets}}" | split row ' ') { let limits = ({{_fuzz_limits}} | get -o $target | default {{_fuzz_default}}); mkdir $"corpus/($target)"; let build = if $target == "prove_verify_roundtrip" { [-O -s none --target-dir target/no-sanitizer] } else { [-a] }; cargo fuzz run ...$build $target $"corpus/($target)" $"target/replay/($target)" -- -max_total_time={{secs}} -len_control=0 ...$limits } }
     cd node/fuzz; python3 -I ../../pvm/proof/fuzz/corpus.py unpack replay target/replay; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{node_fuzz_targets}}" | split row ' ') { mkdir $"corpus/($target)"; cargo fuzz run --fuzz-dir . -a $target $"corpus/($target)" $"target/replay/($target)" -- -max_total_time={{secs}} -max_len=262145 -len_control=0 -rss_limit_mb=8192 -timeout=600 } }
 
 # The light check, after every edit, and the innermost tier: formatting,

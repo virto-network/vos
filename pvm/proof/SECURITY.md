@@ -234,8 +234,10 @@ transcript. The pin code that decides it (`src/chips/cpu/cut/pin.rs`,
 
 **A panic is a refusal, not a crash:** the device crate runs with std and
 is not linted panic-free; ingress catches a verifier's panic and counts it
-a failed proof (`node/host/src/credentialed.rs`'s `verifies`). The fuzz
-target `device_verify_bytes` holds it to no panic on arbitrary bytes.
+a failed proof (`node/host/src/credentialed.rs`'s `verifies`), as
+`Verifier::verify`'s docs ask of a caller. The fuzz targets
+`device_verify_bytes` and `device_verify_mutate` hold it to no panic on
+arbitrary bytes and on the golden device proof mutated past its pre-check.
 
 **The interaction PoW is 8 bits:** well-formed junk ground for 2^8 nonces
 passes `precheck` and costs a decode and the composition (11–27 ms on one
@@ -281,15 +283,21 @@ panic-free on every input by construction:
   `masking::verify_masked` (its `replay`, then `verify_values`) is in the
   table below with what guards it. Two had no guard and are the fork's fix
   (DIVERGENCE-013).
-- **Fuzzing:** eight targets (`fuzz/`, the justfile's
+- **Fuzzing:** twelve targets (`fuzz/`, the justfile's
   `proof_fuzz_targets`): the final verifier on arbitrary bytes
   (`final_verifier_bytes`), on the golden wraps mutated
   (`final_verifier_mutate`), on format 39's layout past its header
   (`masked_bytes`) and on its queried parts reshaped (`masked_shape`); the
   statement's decoder and the venue's check (`statement_decode`); the
   anchor's decoders (`anchor_decode`); prove-then-verify on random
-  programs (`prove_verify_roundtrip`); and the device verifier on ingress's
-  bytes (`device_verify_bytes`). A checked-in corpus is replayed by `just
+  programs (`prove_verify_roundtrip`); the device verifier on ingress's
+  bytes (`device_verify_bytes`) and on the golden device proof mutated by
+  its structure, its interaction PoW ground again (`device_verify_mutate`);
+  the compiler's `derive` on ELF bytes, under 512 MiB and ten seconds an
+  input (`derive_elf`); a standard program's parse and run on the
+  interpreter and the recompiler, compared (`program_blob`); and the JAM
+  statements service's refine on work items, its verdict read back
+  (`service_item`). A checked-in corpus is replayed by `just
   gate` (`just fuzz-replay`), and `just fuzz` runs a minute a target in
   `ci-full` and five in the full gate (`just slice-gate`).
 
@@ -378,12 +386,32 @@ reaches it; `just fuzz-replay` (in `just gate`) unpacks the archives into
   trailing inputs, and a decode;
 - the device verifier (`device_verify_bytes`): an input shorter than an
   io-hash, the decode, the format, the interaction PoW pre-check, and an
-  honest proof accepted.
+  honest proof accepted;
+- the device verifier mutated (`device_verify_mutate`), the interaction
+  PoW ground again so a proof passes the pre-check: the format (a
+  configuration changed), non-canonical values, the shape, another
+  program's preprocessed root, the logup sums, the STARK, the PoW where
+  no nonce of the grind passes, and mutations that cancel, accepted; its
+  bytes mutated after, the same refusals and the pre-check's decode;
+- derive (`derive_elf`): ELFs refused for their code sections, their
+  relocations, their schema, their jump tables and their transpile, and
+  ELFs derived, each twice to the same result;
+- a standard program (`program_blob`): blobs refused, runs ending in a
+  panic or a host call, each the same on both backends;
+- the statements service (`service_item`): items refused by kind and
+  code (no item, a registration's, an anchor's and a control's decode and
+  signature), statements refused at each of refine's codes, the golden
+  accepted (`Submit(0)`), every verdict read back whole, and the bytes
+  read as a verdict decoding or refused.
 
 Not covered: FRI's last layer (its evaluations; its degree, which the
-layout holds), the device verifier past its pre-check on a malformed
-proof (its masked verify is 39's, which the targets above reach), and
-the two degenerate DEEP lines (the fork's unit tests).
+layout holds), which STARK check refuses a device proof (the device's
+`Refusal` names the kind alone, so `reach.txt` holds the kind), a
+program run past its first host call (none is dispatched) or ending in a
+halt, out of gas or a page fault (the corpus reaches none yet), the
+recompiler on a host without it (the interpreter alone runs there), the
+ABI records, the codec and the tree's proofs (their proptests), and the
+two degenerate DEEP lines (the fork's unit tests).
 
 ## The Stwo fork's open divergences
 
