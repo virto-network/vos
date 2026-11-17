@@ -39,7 +39,9 @@ use crate::config::Config;
 use crate::item::{
     Item, Kind, MAX_ROOTS, MAX_STATEMENT_BYTES, Register, SignedControl, control_digest,
 };
-use crate::verdict::{AnchorCode, ControlCode, Judged, RegisterCode, Registered, Root, Verdict};
+use crate::verdict::{
+    AnchorCode, ControlCode, Judged, RegisterCode, Registered, Root, UNCONFIGURED, Verdict,
+};
 
 /// The item's extrinsics, which a `Submit` reads its proof from.
 pub trait Extrinsics {
@@ -79,6 +81,16 @@ fn signed(key: &[u8; 32], digest: &[u8; 32], signature: &[u8; 64]) -> bool {
         key.verify_strict(digest, &Signature::from_bytes(signature))
             .is_ok()
     })
+}
+
+/// The verdict on `payload` at a service with no configuration
+/// (`config::configured`): refused as [`UNCONFIGURED`], its kind the one
+/// its first byte names, if any.
+pub fn refine_unconfigured(payload: &[u8]) -> Verdict {
+    Verdict::Refused {
+        kind: payload.first().copied().and_then(Kind::from_u8),
+        code: UNCONFIGURED,
+    }
 }
 
 /// The verdict on `payload`, an item at `venue` ([`venue`]'s for the

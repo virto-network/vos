@@ -18,7 +18,9 @@
 //! - **A deployment's constants** ([`config`]): the JAM chain's genesis hash
 //!   (the venue's id is `VenueId::jam(genesis, service)`), its genesis time
 //!   and the programs it pins; set in the linked program before it is
-//!   deployed, changed by redeploy.
+//!   deployed, changed by redeploy. A program whose block is unset or does
+//!   not decode refuses every item ([`verdict::UNCONFIGURED`]) and holds
+//!   no state.
 //!
 //! **What refine cannot do.** It reads no state, so it cannot check `seen`:
 //! a replayed statement costs a whole refine, about 120M gas, before

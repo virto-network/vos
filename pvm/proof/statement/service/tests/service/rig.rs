@@ -48,6 +48,14 @@ pub(crate) struct Landed {
     pub(crate) accumulate: u64,
 }
 
+/// A work package refined then accumulated: its hash, each item's refine
+/// output and gas, and the accumulate's gas.
+pub(crate) struct Package {
+    pub(crate) hash: [u8; 32],
+    pub(crate) refined: Vec<(Vec<u8>, u64)>,
+    pub(crate) accumulate: u64,
+}
+
 /// The service on the JAM-only host, its storage in memory, at a slot.
 pub(crate) struct Rig {
     pub(crate) config: Config,
@@ -67,6 +75,26 @@ impl Rig {
         let prepared = PreparedProgram::new(&program).expect("the program");
         Self {
             config,
+            program,
+            prepared,
+            service,
+            storage: BTreeMap::new(),
+            slot: 0,
+            packages: 0,
+        }
+    }
+
+    /// The service as linked, its configuration block unset: `config` is
+    /// none the program holds.
+    pub(crate) fn unconfigured(service: u32) -> Self {
+        let program = linked().to_vec();
+        let prepared = PreparedProgram::new(&program).expect("the program");
+        Self {
+            config: Config {
+                genesis: [0; 32],
+                genesis_ms: 0,
+                pins: Vec::new(),
+            },
             program,
             prepared,
             service,
@@ -124,6 +152,25 @@ impl Rig {
     /// A work package of `items`, each a payload and its extrinsics, refined
     /// then accumulated: each item's outcome.
     pub(crate) fn package(&mut self, items: &[(Vec<u8>, Vec<Vec<u8>>)]) -> Vec<Landed> {
+        let package = self.refine_and_accumulate(items);
+        let accumulate = package.accumulate;
+        items
+            .iter()
+            .zip(package.refined)
+            .map(|((payload, _), (_, refine))| {
+                let id = state::outcome_id(&package.hash, &blake2b_256(&[payload]));
+                Landed {
+                    outcome: state::outcome(&mut self.storage, &id).expect("an outcome"),
+                    id,
+                    refine,
+                    accumulate,
+                }
+            })
+            .collect()
+    }
+
+    /// A work package of `items` refined then accumulated.
+    pub(crate) fn refine_and_accumulate(&mut self, items: &[(Vec<u8>, Vec<Vec<u8>>)]) -> Package {
         let jam_items: Vec<JamItem> = items
             .iter()
             .map(|(payload, extrinsics)| JamItem {
@@ -153,17 +200,17 @@ impl Rig {
             let refined = jam::refine(&self.program, &args.encode(), jam, REFINE_GAS);
             assert_eq!(refined.exit, ExitReason::Halt, "refine");
             assert!(refined.output.len() <= MAX_VERDICT_BYTES);
-            refines.push(refined.gas);
             let operand = Operand {
                 package_hash,
                 segment_root: [0; 32],
                 authorizer: [0; 32],
                 payload_hash: blake2b_256(&[payload]),
                 gas_limit: ACCUMULATE_GAS,
-                result: Ok(refined.output),
+                result: Ok(refined.output.clone()),
                 auth_trace: Vec::new(),
             };
             inputs.push(AccumulateInput::Operand(operand).encode());
+            refines.push((refined.output, refined.gas));
         }
         let (exit, accumulate) = jam::accumulate(
             &self.prepared,
@@ -174,19 +221,11 @@ impl Rig {
             ACCUMULATE_GAS,
         );
         assert_eq!(exit, ExitReason::Halt, "accumulate");
-        items
-            .iter()
-            .zip(refines)
-            .map(|((payload, _), refine)| {
-                let id = state::outcome_id(&package_hash, &blake2b_256(&[payload]));
-                Landed {
-                    outcome: state::outcome(&mut self.storage, &id).expect("an outcome"),
-                    id,
-                    refine,
-                    accumulate,
-                }
-            })
-            .collect()
+        Package {
+            hash: package_hash,
+            refined: refines,
+            accumulate,
+        }
     }
 
     /// A package of the one item `payload`, with `extrinsics`.
