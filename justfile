@@ -832,7 +832,7 @@ fuzz secs="60":
 # each a binary past about 20 s): minutes, warm. It builds the guests its
 # tests run, the agent's programs, the test actors and the venues' refine
 # programs, and nothing else outside the workspace.
-check: fmt-check check-tiers build-test-actors build-programs build-final-verify build-statement-service
+check: fmt-check check-tiers check-layers build-test-actors build-programs build-final-verify build-statement-service
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     cargo test {{core_crates}} ...(python3 -I tools/gates/tiers.py fast {{core_crates}} | split row ' ')
     cargo test -p vos-pvm-recair -p vos-pvm-device ...(python3 -I tools/gates/tiers.py fast -p vos-pvm-recair -p vos-pvm-device | split row ' ') -- --test-threads=4
@@ -880,6 +880,34 @@ test-changed base="vos-core" *flags="": build-test-actors build-programs
 # The advisory database is fetched; without a network it is the cached one.
 deny:
     cargo deny check --hide-inclusion-graph
+
+# The layers: a package under `pvm/` has no path dependency outside
+# `pvm/`, on a normal, a build or a dev edge, so the PVM, its compiler,
+# its prover and the actor ABI read alone. Git and registry dependencies
+# (the Stwo fork, CipherClerk) and `support/`'s vendored crates are
+# allowed, and listed. One exemption, by name: the prover's kernel tests
+# (`vos-pvm-proof`'s dev edges to `vos-testkit` and `vos-venue`) check a
+# kernel's traced run against the agent's reference model running the
+# test actors, and judge its statements at the model venue. An exemption
+# that is no edge fails too. Every package under `pvm/` is read, the
+# workspaces built apart included (`cargo metadata` of each manifest).
+check-layers:
+    let exempt = [[package dependency]; [vos-pvm-proof vos-testkit] [vos-pvm-proof vos-venue]]; \
+    let manifests = (glob pvm/**/Cargo.toml --exclude ['**/target/**'] | where {|manifest| open --raw $manifest | str contains '[package]' }); \
+    if ($manifests | is-empty) { error make { msg: "no package under pvm/" } }; \
+    let packages = ($manifests | each {|manifest| cargo metadata --no-deps --offline --format-version 1 --manifest-path $manifest | from json | get packages | where manifest_path == $manifest | first }); \
+    let edges = ($packages | each {|package| $package.dependencies | each {|dependency| { package: $package.name, dependency: $dependency.name, kind: ($dependency.kind | default normal), path: ($dependency.path? | default "" | if ($in | is-empty) { "" } else { $in | path relative-to $env.PWD }), source: ($dependency.source? | default "") } } } | flatten); \
+    let local = ($edges | where path != ""); \
+    let outside = ($local | where {|edge| not ($edge.path | str starts-with "pvm/") and not ($edge.path | str starts-with "support/") }); \
+    let found = ($outside | where {|edge| not ($edge.kind == dev and ($exempt | any {|pair| $pair.package == $edge.package and $pair.dependency == $edge.dependency })) }); \
+    let stale = ($exempt | where {|pair| not ($outside | any {|edge| $edge.kind == dev and $edge.package == $pair.package and $edge.dependency == $pair.dependency }) }); \
+    print $"support/ crates allowed: ($local | where {|edge| $edge.path | str starts-with 'support/' } | get dependency | uniq | str join ', ' | if ($in | is-empty) { 'none' } else { $in })"; \
+    print $"git crates allowed: ($edges | where {|edge| $edge.source | str starts-with 'git+' } | get dependency | uniq | str join ', ')"; \
+    for edge in ($outside | where {|edge| not ($found | any {|f| $f == $edge }) }) { print $"exempt: ($edge.package) -> ($edge.dependency) \(($edge.kind), ($edge.path)\)" }; \
+    for edge in $found { print -e $"($edge.package) -> ($edge.dependency) \(($edge.kind)\): ($edge.path) is outside pvm/" }; \
+    for pair in $stale { print -e $"the exemption ($pair.package) -> ($pair.dependency) is no dev edge outside pvm/" }; \
+    if ($found ++ $stale | is-not-empty) { error make { msg: "a package under pvm/ depends on a path outside pvm/" } }; \
+    print $"no package under pvm/ depends on a path outside it: ($packages | length) packages, ($local | length) path edges"
 
 # The gates' tripwire (`tools/gates/tiers.py`): the tiers nest, every test
 # target of the workspace is run by `check` or listed heavy and run by
