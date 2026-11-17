@@ -322,7 +322,7 @@ pub fn record_canonical_transcript(proof: &Proof) -> RecursionTranscript {
 /// positions — it is not duplicated here.
 pub struct RecursionData {
     /// The recorded transcript (records + prefix_len), identical to
-    /// [`record_canonical_transcript`]'s — cross-checked equal in the gate test.
+    /// `record_canonical_transcript`'s — cross-checked equal in the gate test.
     pub transcript: RecursionTranscript,
     /// Composition `random_coeff` (the Horner base the OODS embed folds under).
     pub random_coeff: SecureField,
@@ -394,7 +394,7 @@ pub struct DeepBatch {
 /// evals (`fri_answers`); it VALIDATES the extraction end-to-end by running the
 /// real per-tree Merkle decommit and `FriVerifier::decommit` (both must succeed).
 ///
-/// The replay reproduces the same transcript [`record_canonical_transcript`]
+/// The replay reproduces the same transcript `record_canonical_transcript`
 /// captures from the real stwo `verify` (cross-checked equal in the gate test), so
 /// the captured challenges are exactly what the proof was produced under.
 ///
