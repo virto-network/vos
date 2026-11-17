@@ -610,8 +610,8 @@ fn masked_wrap(
     assert!(peak_mib <= 4608, "{peak_mib} MiB of heap");
     assert!(resident_mib <= 8 << 10, "{resident_mib} MiB resident");
     // Pin A's count of the revealed functionals: `2(4|O| + q(|O| + 1))`
-    // at `q = 24` and `|O| = 2`, the budget `h = 256` covers twice.
-    assert!(stats.revealed_rows <= 160, "{stats:?}");
+    // at `q = 16` and `|O| = 2`, the budget `h = 256` covers more than twice.
+    assert!(stats.revealed_rows <= 112, "{stats:?}");
     assert_eq!(proof.format_version, masked::FORMAT);
     assert_eq!(
         proof.stark_proof.commitments[0],

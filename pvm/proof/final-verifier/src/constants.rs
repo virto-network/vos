@@ -19,6 +19,7 @@ pub const PREPROCESSED_ROOT_39: [u8; 32] = [
 pub const TREE_WIDTHS: [usize; 4] = [57, 381, 48, 20];
 
 /// The longest wrap proof a decode reads, in bytes: a bound on a venue's
-/// decode and verify work, which a weight is charged by. A
-/// `format::MASKED_WRAP` proof is about 150 KB.
-pub const MAX_PROOF_BYTES: usize = 256 << 10;
+/// decode and verify work, which a weight is charged by. The layout's
+/// longest, every witness at its bound, is 140,356 bytes; a
+/// `format::MASKED_WRAP` proof is about 100 KB.
+pub const MAX_PROOF_BYTES: usize = 140 << 10;

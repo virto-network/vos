@@ -18,9 +18,9 @@
 //!   [`control_digest`].
 //!
 //! JAM-NP's CE 133 bounds a work package, payloads among it, at 204,802
-//! bytes, below the 256 KiB a proof may take: the proof goes as an
-//! extrinsic, which a package names by hash and length, under the bundle's
-//! own bound (`W_B`).
+//! bytes, which a payload holding a proof of up to 140 KiB would crowd: the
+//! proof goes as an extrinsic, which a package names by hash and length,
+//! under the bundle's own bound (`W_B`).
 
 use alloc::vec::Vec;
 

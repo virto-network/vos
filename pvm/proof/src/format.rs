@@ -11,7 +11,7 @@
 //! | number | proofs | channel | log blowup, queries, PoW, fold step, last layer, interaction PoW | floors | at its reference shape |
 //! |---|---|---|---|---|---|
 //! | 32 | leaves and folds | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 63 |
-//! | 39 | the final wrap, masked | Blake2b-256 | 5, 24, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 |
+//! | 39 | the final wrap, masked | Blake2b-256 | 5, 16, 26, 3, 6, 8, affine DEEP batching | 104 / 63 | 106 / 65 |
 //! | 41 | segments | Poseidon2-M31 | 2, 40, 24, 1, 0, 8 | 100 / 60 | 104 / 62 |
 //! | 47 | device proofs, masked, the per-program CPU and the word ledger | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 |
 //!
@@ -68,16 +68,18 @@
 //!   interaction column masked to twice its rows' degree, the preprocessed
 //!   ones left as they are, the composition committed whole at four times the
 //!   tallest component's rows and sampled at `π(z)`, R2's blinding, a FRI mask
-//!   of eight columns and salted trees. Its FRI runs at blowup 32 with 24
-//!   queries: 146 / 82 (82.70), the query term binding; 23 queries is the
-//!   least that clears 80 (80.84). Blowup 64 at 20 queries counts 81.74, its
-//!   DEEP batching term binding, at twice the prover's memory. It needs DEEP
-//!   batching with an independent coefficient a sampled value
-//!   ([`DeepBatching::Affine`]) for its proven 80: Stwo batches by powers of
-//!   one coefficient, whose error is the batched values' count times a
-//!   proximity-gap error that grows with the blowup, and batched by powers
-//!   it caps at 76.98 at blowup 32 and 74.48 at blowup 64. The fork batches
-//!   affinely when a configuration asks ([`FormatParams::batching`]).
+//!   of eight columns and salted trees. Its FRI runs at blowup 32 with 16
+//!   queries: 106 / 65 (65.80), the query term binding. Its floor, 104 /
+//!   63, is the weakest inner format's (41) on either count: forging a
+//!   fold's input forges the final proof, so the system's proven bound is
+//!   the inner formats' (62.81) whatever the wrap's, and 16 queries is the
+//!   least that clears it (15 count 101 / 63). Blowup 64 at 13 queries
+//!   counts 104 / 64 at twice the prover's memory. It batches DEEP with an
+//!   independent coefficient a sampled value ([`DeepBatching::Affine`]), as
+//!   the device format does: batched by powers it would count 65.33, and
+//!   Stwo's powers of one coefficient cap a count at 76.98 at blowup 32,
+//!   however many queries are taken. The fork batches affinely when a
+//!   configuration asks ([`FormatParams::batching`]).
 //!   Batching is not in a proof's bytes: a verifier sets it from the format
 //!   ([`Format::verifier_config`]). Its proofs are a fixed layout
 //!   ([`ProofBytes::FixedLayout`]).
@@ -137,8 +139,8 @@ pub const COUNTS: [Count; 4] = [
         number: MASKED_WRAP.number,
         reference: MASKED_WRAP_REFERENCE,
         bits: SecurityBits {
-            conjectured: 146,
-            proven: 82,
+            conjectured: 106,
+            proven: 65,
         },
     },
     Count {

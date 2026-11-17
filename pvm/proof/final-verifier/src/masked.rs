@@ -42,7 +42,7 @@ use crate::{
 /// The masked wrap's format number, the registry entry's.
 pub const FORMAT: u32 = registry::MASKED_WRAP.number;
 
-/// The masked wrap's PCS configuration, the registry entry's: blowup 32, 24
+/// The masked wrap's PCS configuration, the registry entry's: blowup 32, 16
 /// queries, PoW 26, FRI fold step 3, a 2^6 last layer, affine DEEP
 /// batching.
 pub const CONFIG: PcsConfig = registry::MASKED_WRAP.pcs_config();
@@ -247,7 +247,7 @@ mod tests {
                     fri_config: FriConfig {
                         log_last_layer_degree_bound: 6,
                         log_blowup_factor: 5,
-                        n_queries: 24,
+                        n_queries: 16,
                         fold_step: 3,
                     },
                     lifting_log_size: None,

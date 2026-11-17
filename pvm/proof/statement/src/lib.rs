@@ -415,7 +415,7 @@ pub fn admit(
 /// `program` is the id the venue pinned for the kernel whose handler acts
 /// on the statement, never what the caller supplies (the crate's docs).
 ///
-/// [`admit`]'s checks, then the proof (at most 256 KiB, the format's own
+/// [`admit`]'s checks, then the proof (at most 140 KiB, the format's own
 /// decode, nothing after it), verified against the pinned program id and
 /// the recomputed io-hash.
 pub fn judge(

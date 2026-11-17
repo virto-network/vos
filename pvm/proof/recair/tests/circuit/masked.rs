@@ -276,7 +276,7 @@ fn masked_wrap_shape() -> SecurityShape {
 
 /// The registry's reference for `format::MASKED_WRAP` is the built masked
 /// wrap's shape, field for field: 538 batched values, 3 at most a column;
-/// it counts 82.69 to 82.70 proven bits.
+/// it counts 65.79 to 65.80 proven bits.
 #[test]
 fn the_masked_reference_shape_is_the_built_wraps() {
     let built = masked_wrap_shape();
@@ -286,7 +286,7 @@ fn the_masked_reference_shape_is_the_built_wraps() {
         (538, 3)
     );
     let count = proven_count(&MASKED_WRAP.params, &built).unwrap();
-    assert!((82.69..82.70).contains(&count), "{count}");
+    assert!((65.79..65.80).contains(&count), "{count}");
 }
 
 /// The paths among `paths` whose source names any of `needles`.

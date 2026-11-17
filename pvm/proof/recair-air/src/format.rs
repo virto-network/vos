@@ -242,12 +242,21 @@ pub const LEAF_FOLD: Format = Format {
 /// Format 39's masking: 8 salt columns a tree (248 bits); an `R` of 8
 /// columns, whose 8 independent DEEP coefficients span QM31 over M31 but
 /// with probability about `p^-5`, so R3 holds without a check; and `h = 256`,
-/// at least `2(4|O| + q(|O| + 1)) = 160` for `q = 24` queries and `|O| = 2`
+/// at least `2(4|O| + q(|O| + 1)) = 112` for `q = 16` queries and `|O| = 2`
 /// offsets, and at most a quarter of the smallest component's `2^11` rows.
 pub const MASKED_WRAP_MASKING: Masking = Masking {
     salt_columns: 8,
     fri_mask_columns: 8,
     log_mask_rows: 8,
+};
+
+/// Format 39's floor: no weaker than the weakest inner format on either
+/// count (segments, 41: 104 conjectured, 62.81 proven), since forging a
+/// fold's input forges the final proof and the system's bound is the
+/// weakest inner format's.
+const WRAP_FLOOR: SecurityFloor = SecurityFloor {
+    conjectured: 104,
+    proven: 63,
 };
 
 /// The final wrap, masked: the recursion AIR under masking variant (c), on
@@ -258,7 +267,7 @@ pub const MASKED_WRAP: Format = Format {
     channel: ChannelKind::Blake2b256,
     params: FormatParams {
         log_blowup: 5,
-        n_queries: 24,
+        n_queries: 16,
         pow_bits: 26,
         fold_step: 3,
         log_last_layer: 6,
@@ -267,10 +276,7 @@ pub const MASKED_WRAP: Format = Format {
     },
     bytes: ProofBytes::FixedLayout,
     masking: Some(MASKED_WRAP_MASKING),
-    floor: SecurityFloor {
-        conjectured: 100,
-        proven: 80,
-    },
+    floor: WRAP_FLOOR,
     status: Status::Admitted,
 };
 
@@ -438,7 +444,7 @@ mod tests {
                 u64::from_le_bytes(*b"STARK/FS"),
                 39,
                 26,
-                24,
+                16,
                 5,
                 6,
                 3,

@@ -66,7 +66,7 @@ fn the_bit_counts_are_pinned_per_format() {
         .collect();
     assert_eq!(
         pinned,
-        [(32, 108, 63), (39, 146, 82), (41, 104, 62), (47, 110, 62),]
+        [(32, 108, 63), (39, 106, 65), (41, 104, 62), (47, 110, 62),]
     );
     assert!(
         REGISTRY

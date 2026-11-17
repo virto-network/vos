@@ -3,8 +3,8 @@
 //!
 //! - **Its items** ([`item`]): `Register`, `Anchor`, `Submit { statement,
 //!   proof }` and `Control`, a statement in the item's payload and its
-//!   proof its first extrinsic. JAM-NP's CE 133 bounds a work package at
-//!   204,802 bytes, below the 256 KiB a proof may take.
+//!   proof its first extrinsic, under the bundle's own bound rather than
+//!   the 204,802 bytes JAM-NP's CE 133 bounds a work package at.
 //! - **Refine** ([`refine`]) reads no state: it applies the registration's
 //!   checks that read none (`vos_anchor::venue::registration`), verifies an
 //!   anchor's or a control's ed25519 signature against the key it names,

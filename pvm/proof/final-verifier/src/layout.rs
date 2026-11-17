@@ -377,9 +377,6 @@ impl Writer {
     }
 }
 
-/// The bytes reserved for an encoding: a masked wrap's proof is about 150 KB.
-const CAPACITY: usize = 160 << 10;
-
 /// `proof` in the module's layout; `None` for a proof it cannot hold: a
 /// column of other samples than the format fixes, or a tree whose queried
 /// columns differ in length.
@@ -387,7 +384,7 @@ pub(crate) fn encode(proof: &WrapProof) -> Option<Vec<u8>> {
     let stark = &proof.stark_proof;
     let config = &stark.config;
     let mut writer = Writer {
-        bytes: Vec::with_capacity(CAPACITY),
+        bytes: Vec::with_capacity(MAX_PROOF_BYTES),
     };
     writer.u32(proof.format_version);
     for &log_size in &proof.log_sizes {
@@ -461,6 +458,53 @@ mod tests {
     use super::*;
 
     use crate::masked::FORMAT;
+
+    /// The longest proof the layout reads: every count at its pin or its
+    /// bound, every witness full.
+    const fn counted(items: usize, bytes: usize) -> usize {
+        4 + items * bytes
+    }
+
+    const LONGEST: usize = {
+        let layer = counted(MAX_FRI_WITNESS, 16) + counted(MAX_WITNESS_HASHES, HASH) + HASH;
+        let mut sampled = 0;
+        let mut tree = 0;
+        while tree < TREES {
+            let mut column = 0;
+            while column < TREE_WIDTHS[tree] {
+                sampled += crate::masked::samples(tree, column);
+                column += 1;
+            }
+            tree += 1;
+        }
+        let queried = TREE_WIDTHS[0] + TREE_WIDTHS[1] + TREE_WIDTHS[2] + TREE_WIDTHS[3];
+        4 * (1 + HEADER.len())
+            + 8
+            + 3 * 16
+            + counted(TREES, HASH)
+            + 4
+            + 4 * TREES
+            + 16 * sampled
+            + 4
+            + TREES * counted(MAX_WITNESS_HASHES, HASH)
+            + 4
+            + 8 * TREES
+            + LIMB * MAX_QUERIES * queried
+            + 8
+            + layer
+            + 4
+            + INNER_LAYERS * layer
+            + counted(LAST_LAYER, 16)
+    };
+
+    /// `MAX_PROOF_BYTES` bounds the longest proof the layout reads, with
+    /// less than 4 KiB to spare: a weight charged by it pays for no bytes a
+    /// decode cannot accept.
+    #[test]
+    fn the_length_cap_is_the_layouts() {
+        assert_eq!(LONGEST, 140_356);
+        const { assert!(LONGEST <= MAX_PROOF_BYTES && MAX_PROOF_BYTES < LONGEST + 4096) };
+    }
 
     fn encode_ok(proof: &WrapProof) -> Vec<u8> {
         encode(proof).expect("the layout holds it")
@@ -582,7 +626,7 @@ mod tests {
             ("a log size", |p| p.log_sizes[1] = 16),
             ("the PoW bits", |p| p.stark_proof.0.config.pow_bits = 20),
             ("the queries", |p| {
-                p.stark_proof.0.config.fri_config.n_queries = 23
+                p.stark_proof.0.config.fri_config.n_queries = 15
             }),
             ("the blowup", |p| {
                 p.stark_proof.0.config.fri_config.log_blowup_factor = 6

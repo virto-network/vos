@@ -1,6 +1,6 @@
 //! The JAM statements service's program (`statement-service.elf`, built by
 //! `just check-no-std`) on the JAM-only host, refine and accumulate, each
-//! item a work package's: a proof read from a 256 KiB extrinsic; every
+//! item a work package's: a proof read from a 140 KiB extrinsic; every
 //! golden fixture judged as every venue judges it; registrations, anchors
 //! and an equivocation, which ends the space; the controller's controls;
 //! a row that does not decode, or a write past the balance, trapping the
@@ -32,11 +32,11 @@ use vos_statement_service::verdict::{AnchorCode, ControlCode, RegisterCode};
 use rig::{ACCUMULATE_GAS, EPOCH_MS, Rig, fixture, fixture_rig, load, submit};
 
 /// The proof is the `Submit` item's first extrinsic, read whole: the valid
-/// fixture's accepted; 256 KiB, `MAX_PROOF_BYTES`, read and refused by the
+/// fixture's accepted; 140 KiB, `MAX_PROOF_BYTES`, read and refused by the
 /// verifier; a byte more refused by its length before it is read; none, as
 /// an empty proof.
 #[test]
-fn a_256_kib_extrinsic_is_read_as_the_proof() {
+fn a_140_kib_extrinsic_is_read_as_the_proof() {
     let valid = fixture("valid");
     let statement = valid.input.statement.encode();
     let mut rig = fixture_rig(&valid);
@@ -66,7 +66,7 @@ fn a_256_kib_extrinsic_is_read_as_the_proof() {
         "a {} B extrinsic read: refine {} gas; a byte more, unread: {} gas; none: {} gas",
         MAX_PROOF_BYTES, full.refine, over.refine, none.refine
     );
-    assert!(full.refine > over.refine + 96 * 256, "the 256 KiB fetched");
+    assert!(full.refine > over.refine + 96 * 140, "the 140 KiB fetched");
 }
 
 /// Every golden fixture, at a service of its venue's configured with its
