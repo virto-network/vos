@@ -4,11 +4,13 @@
 use super::*;
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::common::leakage::{Fields, Key, Verdicts, indistinguishable, published, uniform};
-use crate::wrap::whole_run_root;
+use crate::wrap::{values_of, whole_run_root};
 use vos_pvm_proof::format::Format;
 use vos_pvm_proof::program_id::IdPreimage;
+use vos_pvm_recair::masked::MaskRng;
 use vos_pvm_recair::prove::prove_on;
 use vos_pvm_recair::tree::Node;
 

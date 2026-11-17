@@ -85,7 +85,7 @@ libc = "0.2"
 # it must match.
 vos-testkit = { path = "../../agent/testkit" }
 bincode = "1"
-# The wrap's wire format, which the final verifier decodes.
+# The segment fixtures' encoding.
 postcard = { version = "1", features = ["alloc"] }
 vos-pvm-proof-verifier = { workspace = true }
 # The window kernel's arguments: a space's pseudo-account rows in a tree at

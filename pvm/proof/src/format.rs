@@ -132,8 +132,9 @@ pub use stwo::core::pcs::DeepBatching;
 /// How a format's proofs are laid out in bytes when they leave the prover.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProofBytes {
-    /// The proof's serde form, the final wrap's as its postcard encoding:
-    /// varint lengths, whose canonical form a decoder checks by re-encoding.
+    /// The proof's serde form as its postcard encoding (segment, leaf and
+    /// fold, and device proofs): varint lengths, whose canonical form a
+    /// decoder checks by re-encoding.
     Postcard,
     /// The fields in a fixed order, little-endian, with explicit u32 counts
     /// and no varints, every count checked against the format before any

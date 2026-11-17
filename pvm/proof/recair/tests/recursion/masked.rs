@@ -33,11 +33,10 @@
 
 use crate::common::bump_m31;
 use crate::jam;
-use crate::wrap::{one_segment, values_of};
+use crate::wrap::one_segment;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
-use std::time::Instant;
 
 use num_traits::One;
 use stwo::core::channel::Blake2bChannel;
@@ -53,7 +52,7 @@ use vos_pvm_final_verifier::{
     Error, MAX_PROOF_BYTES, PREPROCESSED_ROOT_39, PUBLIC_WORDS, Statement, WrapProof,
 };
 use vos_pvm_proof::format::{self, ProofBytes, Status};
-use vos_pvm_recair::masked::{MaskRng, verifier_format};
+use vos_pvm_recair::masked::verifier_format;
 use vos_pvm_recair::wrap::{self, WrapCircuit};
 use vos_pvm_recair_air::masked::{MaskPins, WrapComponents};
 
@@ -73,12 +72,7 @@ fn masked_wrap() -> &'static Masked {
         let proof = one.wrapped.proof.clone();
         let words = one.wrapped.words;
         let bytes = wrap::proof_bytes(&proof).expect("format 39's bytes");
-        let postcard = postcard::to_allocvec(&proof).expect("encodes");
-        eprintln!(
-            "one segment: the masked wrap, {} bytes (postcard {})",
-            bytes.len(),
-            postcard.len(),
-        );
+        eprintln!("one segment: the masked wrap, {} bytes", bytes.len());
         write("one-segment-39", masked::FORMAT, &bytes, &words);
         Masked {
             proof,

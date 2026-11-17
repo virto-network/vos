@@ -731,20 +731,15 @@ build-std. It holds:
   host call), so a JAM verifier hashes in software;
 - the public logup sum from the program id, the io-hash, `u` and `one`;
 - the components built once, and a shape check before any Stwo call
-  (`check_shape`, `check_samples`: the verifier must be panic-free,
+  (`check_shape`, `samples_fit`: the verifier must be panic-free,
   `proving.md` §6); format 39 decodes a fixed layout.
 
-**Built** [measured]: `verify(proof, words)` returns the
+**Built, format 39** [measured]: `verify(proof, words)` returns the
 program id and the io-hash the 24 words state. It checks the format, the
 configuration (the batching from the format) and the log sizes, the
-proof's shape before any Stwo call (four trees of commitments, samples,
-decommitments and queried values; every column's samples against the
-components' masks; every limb canonical), the preprocessed root against
-its constant, the header and the interaction PoW, then the logup sums with
-the 24 words' and `u`'s public terms, then Stwo's verifier, the components
-built once.
-
-**The masked verifier, format 39** [measured]: it reads the proof's fixed
+proof's shape before any Stwo call, the preprocessed root against its
+constant, the header and the interaction PoW, then the logup sums with
+the 24 words' and `u`'s public terms. It reads the proof's fixed
 layout and runs over Stwo's PCS (`CommitmentSchemeVerifier::{commit,
 verify_values}`), never `core::verifier::verify`, whose composition split
 is hardcoded (DIVERGENCE-004); the two facts it leaves to Stwo are pinned

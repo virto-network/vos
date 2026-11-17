@@ -887,7 +887,7 @@ last for decades.**
     (no unwinding on wasm32 without std; a panic aborts the block's
     import), so no guard can wrap the decode and the verifier. The final
     verifier and the statement code must not panic on any input: the
-    shape and sample checks (`check_shape`, `check_samples`) refuse
+    shape and sample checks (`check_shape`, `samples_fit`) refuse
     before Stwo reaches its indexing and `unwrap`s, and the statement's
     decode bounds every count by the bytes left. The final verifier,
     `vos-statement` and `vos-anchor` deny `unwrap`, `expect`, indexing,
@@ -1968,8 +1968,8 @@ counts as conjectured / proven at the reference shape [model]:
 
 - **A number names one AIR and one set of parameters,** and is never
   reused: every number not in the table is refused. 38 is held by no
-  format; the tests use it as "a number no format holds". 28 (an unmasked
-  wrap the tests once took) and 44 are never reused.
+  format; the tests use it as "a number no format holds". 28 and 44 are
+  retired and never reused.
 - **Each entry** holds its channel, its parameters, the DEEP batching its
   proven floor assumes and both bit counts.
 - **Every entry uses A.3's encodings** and exactly its parameters.
@@ -2072,8 +2072,8 @@ output; its `public_args` a venue's id and a nonce, which the io-hash
 binds and no venue reads apart) in three segments, folds them and wraps
 the root under format 39, masked from the seeded test seam
 (`MaskRng::Seeded`, so the bytes are its own every run: `wrap.proof`,
-148,612 bytes); and it wraps two roots that are not a whole run, as a cheating prover would, the
-wrap's checks failing (`wrap-prefix.proof`, `wrap-midway.proof`). The
+148,612 bytes); and it wraps two roots that are not a whole run, as a
+cheating prover would, the wrap's checks failing (`wrap-prefix.proof`, `wrap-midway.proof`). The
 generator makes the same bytes in every build of the prover: a kernel's
 program id does not depend on the features a build turns on (the drawn
 relations are kept in the order drawn, never in `TypeId` order).
@@ -2100,9 +2100,9 @@ changed. Every verdict is the same natively, in Wasm (PVF and client;
 - **The id is the same at every venue,** and a refused proof's class is
   the first check it fails.
 - **The id leaves the format out,** so a run wrapped under each of two
-  final formats a venue accepts during a transition is one statement,
-  refused the second time as a repeat (`vos-statement`'s
-  `every_field_is_bound`). Past `MaxRootAge` a replay is unanchored (its
+  final formats a venue accepts during a transition has one id under
+  either (`vos-statement`'s `every_field_is_bound`), and a venue's repeat
+  check refuses it the second time. Past `MaxRootAge` a replay is unanchored (its
   `Seen` entry and anchors dropped).
 - **Why `0x108` and `0x109`:** the words are mixed before the interaction
   PoW (8 bits), so a proof of other words fails there (`0x108`) with
@@ -2111,8 +2111,8 @@ changed. Every verdict is the same natively, in Wasm (PVF and client;
 - **Cheap refusals:** a judgement refused before its proof costs no proof
   lookup on the JAM-only host, and a proof longer than 256 KiB is refused
   before its lookup.
-- **The guests' size:** the production guest's program is 391,784 bytes
-  (the test guest's 454,662), within JAM's 4,000,000-byte bound on a
+- **The guests' size:** the venue's guest's program is 391,784 bytes,
+  within JAM's 4,000,000-byte bound on a
   service's code, its only size bound.
 
 **A.7 Budgets per node.** Heavy tests run

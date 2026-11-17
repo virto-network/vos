@@ -1,6 +1,6 @@
 //! The venue's JAM programs' runtime, shared by the guests that link the
-//! final verifier (`final-verify` and `vos-statement-service`'s): a stack of its own and the entries onto it,
-//! the heap, the host calls and their convention, the output, the panic
+//! final verifier (`final-verify` and `vos-statement-service`'s): a stack
+//! of its own and the entries onto it, the heap, the host calls and their convention, the output, the panic
 //! handler and the single-core atomic libcalls.
 
 use core::cell::UnsafeCell;

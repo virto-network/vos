@@ -140,3 +140,16 @@ fn a_proof_too_long_is_refused_before_its_lookup() {
     assert_eq!(report.verdict, jam::UNDECODABLE, "{}", report.error);
     assert_eq!(report.gas[1], 0, "no lookup");
 }
+
+/// A payload of any other mode than `Words` and `Judge` is refused on the
+/// JAM-only host as a bad payload, before any proof is read: the guest
+/// accepts nothing without a proof.
+#[test]
+fn another_mode_is_a_bad_payload() {
+    let (program, _) = jam::program();
+    for mode in [2, 0xff] {
+        let (_, report) = jam::run_payload(&program, vec![mode, 0, 0, 0, 0], None);
+        assert_eq!(report.verdict, jam::BAD_PAYLOAD, "mode {mode}");
+        assert_eq!(report.gas[1], 0, "mode {mode}: no lookup");
+    }
+}

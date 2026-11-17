@@ -622,8 +622,8 @@ fn the_windows_leaves_and_folds_prove_and_verify() {
 
 /// The window end to end on the million-row map: its run, at most 1M steps,
 /// its space path within a fifth of its budget; proved whole, folded to one
-/// root and wrapped masked under `format::MASKED_WRAP`; and its statement (the reader's agent and
-/// instance, the peer, the currency and `c_prev` public,
+/// root and wrapped masked under `format::MASKED_WRAP`; and its statement
+/// (the reader's agent and instance, the peer, the currency and `c_prev` public,
 /// `(net, seq, c_new)` its output, `S_w` its root) judged at the model
 /// venue, which pins the kernel's program and holds `S_w` anchored by the
 /// space's founding key.

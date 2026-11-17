@@ -265,8 +265,8 @@ fn the_fixtures_are_judged() {
 /// The production venue pins the kernel's program id, accepts
 /// `format::MASKED_WRAP`, registers `S`'s space, anchors `S`'s two roots
 /// (windows 41 and 42), judges at window 42's boundary and has accepted one
-/// other statement. The cases (`statements.cases`), each a venue's state, a statement and a
-/// proof, each but the valid ones a replay of a valid statement with one
+/// other statement. The cases (`statements.cases`), each a venue's state,
+/// a statement and a proof, each but the valid ones a replay of a valid statement with one
 /// thing changed, so each fails one check alone: a venue that verifies the
 /// proof before it reads its state (the JAM service's refine) reaches the
 /// same class as one that reads its state first:

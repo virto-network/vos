@@ -92,9 +92,9 @@ vectors:
 # attests on the agent's model, the settlement window's kernel read at a
 # cut and proved over its shape, the kernels' leaves and the window
 # kernel's folds proved on the recursion AIR, the window's and the
-# balance's whole runs folded and wrapped under format 39, their statements judged at the model venue against the space's
-# anchors, and the fixtures checked against their generator and judged in
-# Wasm.
+# balance's whole runs folded and wrapped under format 39, their
+# statements judged at the model venue against the space's anchors, and
+# the fixtures checked against their generator and judged in Wasm.
 # The repository's constants (`pvm/proof/src/constants.rs`) are recomputed
 # with and without `debug-internals`, and the prover worker's throughput at
 # the default window length is measured (`kernel`'s `throughput`).
