@@ -58,7 +58,13 @@ guest_flags := "--target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core
 # `/rustc`, never this checkout's or this machine's paths, so its bytes are
 # the same in every checkout (`blobs.lock`).
 _venue-guest package bin features:
-    let cargo = ($env.CARGO_HOME? | default ($env.HOME | path join .cargo)); let sysroot = (rustc --print sysroot | str trim); let remaps = [$"--remap-path-prefix=($env.PWD)/=" $"--remap-path-prefix=($cargo)=/cargo" $"--remap-path-prefix=($sysroot)=/rustc"]; with-env { CARGO_INCREMENTAL: "0", CARGO_ENCODED_RUSTFLAGS: ($remaps | str join (char -u "1f")) } { cargo build -p {{package}} --release --features {{features}} --bin {{bin}} {{guest_flags}} }
+    let cargo = ($env.CARGO_HOME? | default ($env.HOME | path join .cargo)); \
+        let sysroot = (rustc --print sysroot | str trim); \
+        let remaps = [$"--remap-path-prefix=($env.PWD)/=" $"--remap-path-prefix=($cargo)=/cargo" \
+        $"--remap-path-prefix=($sysroot)=/rustc"]; \
+        with-env { CARGO_INCREMENTAL: "0", CARGO_ENCODED_RUSTFLAGS: ($remaps \
+        | str join (char -u "1f")) } { cargo build -p {{package}} --release --features {{features}} --bin {{bin}} \
+        {{guest_flags}} }
 
 # The phone bench's two Android binaries (arm64-v8a, the NDK s4 builds
 # with), the seeded one holding an x86 run's proof hashes: `tools/phone`.
@@ -73,7 +79,10 @@ test-recair:
 
 # Bench guests, built with the guest toolchain in `pvm/guest`.
 build-bench-guests:
-    with-env { CARGO_INCREMENTAL: "0" } { for guest in [pvm/bench/guests/workflows pvm/bench/guests/actor pvm/bench/guests/agent pvm/bench/guests/hash-software pvm/bench/guests/hash-precompile pvm/bench/guests/poseidon2 pvm/bench/guests/diverse] { do { cd $guest; cargo build --release --target ../../../guest/riscv64em-vos.json } } }
+    with-env { CARGO_INCREMENTAL: "0" } { for guest in \
+        [pvm/bench/guests/workflows pvm/bench/guests/actor pvm/bench/guests/agent pvm/bench/guests/hash-software \
+        pvm/bench/guests/hash-precompile pvm/bench/guests/poseidon2 pvm/bench/guests/diverse] { do { cd $guest; \
+        cargo build --release --target ../../../guest/riscv64em-vos.json } } }
 
 # Cross-host checks that need the bench guests. The bench tests that prove
 # run in `test-bench-proof`.
@@ -130,8 +139,14 @@ vectors:
 test-proof: build-test-actors build-programs build-final-verify judge-wasm
     cargo test -p vos-pvm-proof --features debug-internals --lib --bins --test gates --test isa -- --test-threads=2
     cargo test -p vos-kernel-tests --features debug-internals --lib --test witness_input -- --test-threads=2
-    for test in (cargo test -p vos-pvm-proof --features debug-internals --test kernel -- --list --format terse | lines | where {|line| $line ends-with ': test' } | each {|line| $line | str replace ': test' '' }) { cargo test -p vos-pvm-proof --features debug-internals --test kernel $test -- --exact --test-threads=1 }
-    for test in (cargo test -p vos-kernel-tests --features debug-internals --test kernel -- --list --format terse --skip reads:: | lines | where {|line| $line ends-with ': test' } | each {|line| $line | str replace ': test' '' }) { cargo test -p vos-kernel-tests --features debug-internals --test kernel $test -- --exact --test-threads=1 }
+    for test in (cargo test -p vos-pvm-proof --features debug-internals --test kernel -- --list --format terse \
+        | lines | where {|line| $line ends-with ': test' } | each {|line| $line \
+        | str replace ': test' '' }) { cargo test -p vos-pvm-proof --features debug-internals --test kernel $test -- \
+        --exact --test-threads=1 }
+    for test in (cargo test -p vos-kernel-tests --features debug-internals --test kernel -- --list --format terse \
+        --skip reads:: | lines | where {|line| $line ends-with ': test' } | each {|line| $line \
+        | str replace ': test' '' }) { cargo test -p vos-kernel-tests --features debug-internals --test kernel $test \
+        -- --exact --test-threads=1 }
     cargo test -p vos-kernel-tests --features debug-internals --test kernel reads:: -- --test-threads=1
     cargo test -p vos-pvm-proof --test kernel constants:: -- --test-threads=1
     cargo test -p vos-kernel-tests --test kernel constants:: -- --test-threads=1
@@ -166,7 +181,10 @@ test-carriers: build-test-actors build-programs
 # golden vectors computed by the blob, every digest the pinned bytes.
 judge-wasm: build-wasm-blobs
     cd pvm/proof/final-verifier/wasm/run; cargo build --release --locked
-    let run = "pvm/proof/final-verifier/wasm/run/target/release/vos-pvm-final-verifier-wasm-run"; for task in [["judge" "pvm/proof/fixtures"] ["anchors"]] { for semantics in [pvf client] { ^$run "pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm" $semantics ...$task } }
+    let run = "pvm/proof/final-verifier/wasm/run/target/release/vos-pvm-final-verifier-wasm-run"; \
+        for task in [["judge" "pvm/proof/fixtures"] ["anchors"]] { for semantics in [pvf client] { \
+        ^$run "pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm" \
+        $semantics ...$task } }
 
 # The final verifier's Wasm blob, built as a runtime builds it, from the
 # fixed path (`_at-fixed-path`), `--locked` on its lock file (`just locks`).
@@ -220,8 +238,27 @@ fixtures:
 # `/usr/aarch64-linux-gnu`) and the toolchain's `aarch64-unknown-linux-gnu`
 # target; on an ARM host, run `vos program-id` natively.
 repro-aarch64: build-test-actors
-    with-env { CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: "aarch64-linux-gnu-gcc", CC_aarch64_unknown_linux_gnu: "aarch64-linux-gnu-gcc", AR_aarch64_unknown_linux_gnu: "aarch64-linux-gnu-ar" } { cargo build -p vos-cli --no-default-features --features prover --target aarch64-unknown-linux-gnu }
-    let source = ([pvm/proof/src/constants.rs pvm/proof/final-verifier/src/constants.rs] | each {|file| open --raw $file } | str join "\n"); let pinned = {|name| $source | parse --regex ("pub const " + $name + ": \\[u\\d+; \\d+\\] = \\[(?<values>[^\\]]*)\\]") | get values.0 | split row "," | each {|value| $value | str trim } | where {|value| $value != "" } | str join " " }; let vos = {|...args| ^qemu-aarch64 -L /usr/aarch64-linux-gnu target/aarch64-unknown-linux-gnu/debug/vos program-id ...$args | str trim }; for case in [[window settle WINDOW_PROGRAM] [balance at_least BALANCE_PROGRAM] [kernels areas PREDICATE_PROGRAM]] { let printed = (do $vos $"agent/test-actors/target/riscv64em-vos/release/($case.0).elf" $case.1); if $printed != (do $pinned $case.2) { error make { msg: $"($case.2) on aarch64: ($printed)" } } }; let circuits = (do $vos "--circuits" | lines); let names = ($circuits | each {|line| $line | split row " " | first }); if $names != [H_FOLD PREPROCESSED_ROOT_39] { error make { msg: $"the circuits printed on aarch64: ($names)" } }; for line in $circuits { let parts = ($line | split row " "); if ($parts | skip 1 | str join " ") != (do $pinned $parts.0) { error make { msg: $"($parts.0) on aarch64: ($line)" } } }; print "the program ids and the circuits' constants on aarch64 are the repository's"
+    with-env { CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: "aarch64-linux-gnu-gcc", \
+        CC_aarch64_unknown_linux_gnu: "aarch64-linux-gnu-gcc", AR_aarch64_unknown_linux_gnu: "aarch64-linux-gnu-ar" } \
+        { cargo build -p vos-cli --no-default-features --features prover --target aarch64-unknown-linux-gnu }
+    let source = ([pvm/proof/src/constants.rs pvm/proof/final-verifier/src/constants.rs] \
+        | each {|file| open --raw $file } | str join "\n"); \
+        let pinned = {|name| $source | parse --regex ("pub const " + $name + \
+        ": \\[u\\d+; \\d+\\] = \\[(?<values>[^\\]]*)\\]") | get values.0 | split row "," | each {|value| $value \
+        | str trim } | where {|value| $value != "" } | str join " " }; \
+        let vos = {|...args| ^qemu-aarch64 -L /usr/aarch64-linux-gnu target/aarch64-unknown-linux-gnu/debug/vos \
+        program-id ...$args | str trim }; for case in [[window settle WINDOW_PROGRAM] \
+        [balance at_least BALANCE_PROGRAM] [kernels areas PREDICATE_PROGRAM]] { \
+        let printed = (do $vos $"agent/test-actors/target/riscv64em-vos/release/($case.0).elf" $case.1); \
+        if $printed != (do $pinned $case.2) { error make { msg: $"($case.2) on aarch64: ($printed)" } } }; \
+        let circuits = (do $vos "--circuits" | lines); \
+        let names = ($circuits | each {|line| $line | split row " " | first }); \
+        if $names != [H_FOLD PREPROCESSED_ROOT_39] { error make { \
+        msg: $"the circuits printed on aarch64: ($names)" } }; \
+        for line in $circuits { let parts = ($line | split row " "); \
+        if ($parts | skip 1 | str join " ") != (do $pinned $parts.0) { error make { \
+        msg: $"($parts.0) on aarch64: ($line)" } } }; \
+        print "the program ids and the circuits' constants on aarch64 are the repository's"
 
 # The conformance vectors of Kreivo's spaces pallet and the mutation lists
 # (`tools/kreivo/conformance`, `spaces-pallet.md` §10), written anew by the
@@ -238,7 +275,11 @@ export MIMALLOC_ALLOW_THP := "0"
 # Formatting: the workspace's, and each crate's it excludes.
 fmt-check:
     cargo fmt --all -- --check
-    for manifest in (((open programs.toml | get program.crate) ++ [agent/test-actors pvm/bench/guests pvm/proof/fuzz node/fuzz pvm/proof/final-verifier/wasm node/gateway/demo node/light/android]) | each {|dir| glob $'($dir)/**/Cargo.toml' --exclude ['**/target/**'] } | flatten | where {|manifest| open --raw $manifest | str contains '[package]' }) { cargo fmt --manifest-path $manifest -- --check }
+    for manifest in (((open programs.toml | get program.crate) ++ \
+        [agent/test-actors pvm/bench/guests pvm/proof/fuzz node/fuzz pvm/proof/final-verifier/wasm node/gateway/demo \
+        node/light/android]) | each {|dir| glob $'($dir)/**/Cargo.toml' --exclude ['**/target/**'] } | flatten \
+        | where {|manifest| open --raw $manifest \
+        | str contains '[package]' }) { cargo fmt --manifest-path $manifest -- --check }
 
 # The docs' links: none broken, and none from a public doc to a private
 # item; and the proof docs' tripwire (`tools/gates/docs.py`): no doc names
@@ -247,7 +288,8 @@ fmt-check:
 doc-check:
     python3 -I tools/gates/docs.py
     with-env { RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links" } { cargo doc --workspace --no-deps --quiet }
-    with-env { RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links" } { cargo doc -p vos-venue -p vos-kreivo --features vos-venue/model,vos-kreivo/kreivo-mock --no-deps --quiet }
+    with-env { RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links" } { \
+        cargo doc -p vos-venue -p vos-kreivo --features vos-venue/model,vos-kreivo/kreivo-mock --no-deps --quiet }
 
 clippy:
     cargo clippy --workspace --all-targets --quiet -- -D warnings
@@ -271,7 +313,10 @@ clippy-prover:
 # 0x800 marker and fixtures. The proof crate's own `kernel` module and a
 # 0x800 rounding constant are not remnants.
 jar-check:
-    let hits = (rg -n --glob '!**/target/**' 'IsaMode|CapabilityManifest|\blink_elf\b|link_elf_with_argument_pages|run_with_vos_stubs|ECALL_VOS_|VOS_OBJECT_CAP|Opcode::Ecall\b|ExitReason::Ecall|ExitReason::Trap\b|vos_pvm::kernel::|InvocationKernel|vm_pool|JAR\\x02|\.gp072\.json|\bGasModel\b|\bPerInstruction\b|\bmem_cycles\b|Opcode::Sbrk|\bsbrk\(|(?i:csr\w*,? 0x800)\b|\(\d, 0x800\)|Some\(0x800\)' pvm | complete); if ($hits.exit_code == 0) { print $hits.stdout; error make { msg: "JAR remnants found" } } else { print "no JAR remnants" }
+    let hits = (rg -n --glob '!**/target/**' \
+        'IsaMode|CapabilityManifest|\blink_elf\b|link_elf_with_argument_pages|run_with_vos_stubs|ECALL_VOS_|VOS_OBJECT_CAP|Opcode::Ecall\b|ExitReason::Ecall|ExitReason::Trap\b|vos_pvm::kernel::|InvocationKernel|vm_pool|JAR\\x02|\.gp072\.json|\bGasModel\b|\bPerInstruction\b|\bmem_cycles\b|Opcode::Sbrk|\bsbrk\(|(?i:csr\w*,? 0x800)\b|\(\d, 0x800\)|Some\(0x800\)' \
+        pvm | complete); if ($hits.exit_code == 0) { print $hits.stdout; \
+        error make { msg: "JAR remnants found" } } else { print "no JAR remnants" }
 
 # The SDK's test actors, built with the guest toolchain in `pvm/guest`,
 # from the fixed path: some depend on crates outside their workspace. The
@@ -324,7 +369,20 @@ build-final-verify: (_venue-guest "vos-statement" "final-verify" "pvm-guest")
 # Wasm blobs, whose code that hash orders, are built from a fixed path
 # (`_at-fixed-path`).
 _blob-hashes:
-    if ($env.CARGO_TARGET_DIR? | is-not-empty) { error make { msg: "the blobs are hashed where the recipes build them: unset CARGO_TARGET_DIR" } }; let fixed = ["target/riscv64em-vos/release/final-verify.elf" "target/riscv64em-vos/release/statement-service.elf"] ++ (open programs.toml | get program.elf) ++ ["pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm"]; let actors = (cargo metadata --manifest-path agent/test-actors/Cargo.toml --no-deps --format-version 1 | from json | get packages.targets | flatten | where {|target| "bin" in $target.kind } | get name | sort | each {|name| $"agent/test-actors/target/riscv64em-vos/release/($name).elf" }); let sysroot = (rustc --print sysroot | str trim); let objcopy = ($sysroot | path join lib rustlib (rustc -vV | lines | parse "host: {host}" | get host.0) bin rust-objcopy); let stripped = (mktemp -t); for path in ($fixed ++ $actors) { with-env { LD_LIBRARY_PATH: ($sysroot | path join lib) } { ^$objcopy --strip-all $path $stripped }; print $"(open --raw $stripped | hash sha256)  ($path)" }; rm $stripped
+    if ($env.CARGO_TARGET_DIR? | is-not-empty) { error make { \
+        msg: "the blobs are hashed where the recipes build them: unset CARGO_TARGET_DIR" } }; \
+        let fixed = ["target/riscv64em-vos/release/final-verify.elf" \
+        "target/riscv64em-vos/release/statement-service.elf"] ++ (open programs.toml \
+        | get program.elf) ++ ["pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm"]; \
+        let actors = (cargo metadata --manifest-path agent/test-actors/Cargo.toml --no-deps --format-version 1 \
+        | from json | get packages.targets | flatten | where {|target| "bin" in $target.kind } | get name | sort \
+        | each {|name| $"agent/test-actors/target/riscv64em-vos/release/($name).elf" }); \
+        let sysroot = (rustc --print sysroot | str trim); \
+        let objcopy = ($sysroot | path join lib rustlib (rustc -vV | lines | parse "host: {host}" \
+        | get host.0) bin rust-objcopy); let stripped = (mktemp -t); \
+        for path in ($fixed ++ $actors) { with-env { LD_LIBRARY_PATH: ($sysroot \
+        | path join lib) } { ^$objcopy --strip-all $path $stripped }; \
+        print $"(open --raw $stripped | hash sha256)  ($path)" }; rm $stripped
 
 # The pinned blobs by role: `final-verify.elf` and the Wasm blob, the
 # harnesses' programs, deployed nowhere, link the model judge
@@ -353,7 +411,10 @@ build-blobs: build-final-verify build-statement-service build-programs build-was
 # `blobs.lock` written anew from the blobs as built: after a change that
 # moves one, which the lock's diff then shows.
 blobs-lock: build-blobs
-    {{_hashed}}; $built | prepend ["# Every pinned guest blob's SHA-256, its symbols and relocations stripped," "# as `just build-blobs` builds it: `just blobs-lock` writes it, `just" "# check-blobs` checks it (the justfile's `_blob-hashes` says which blobs)."] | str join "\n" | $in + "\n" | save -f blobs.lock
+    {{_hashed}}; $built | prepend ["# Every pinned guest blob's SHA-256, its symbols and relocations stripped," \
+        "# as `just build-blobs` builds it: `just blobs-lock` writes it, `just" \
+        "# check-blobs` checks it (the justfile's `_blob-hashes` says which blobs)."] | str join "\n" | $in + "\n" \
+        | save -f blobs.lock
 
 # Every pin store written anew from this tree, in dependency order, after
 # a change that moves a guest, a circuit or the lock file: one command at
@@ -399,7 +460,12 @@ repin: locks blobs-lock facility-release
     with-env { VOS_PINS: "write" } { cargo test -p vos-pvm-recair --test recursion masked::the_masked_wrap_verifies_on_the_jam_only_host -- --exact }
     just conformance
     just kit-lock
-    let moved = (git status --porcelain -- blobs.lock node/light/android/release node/light/tests/device.pins pvm/proof/src/constants.rs pvm/proof/fixtures pvm/proof/counts.txt tools/kreivo/conformance pvm/proof/kit/Cargo.lock pvm/proof/final-verifier/wasm/blob/Cargo.lock pvm/proof/fuzz/Cargo.lock node/kernel-tests/tests/counts.txt | lines); if ($moved | is-empty) { print "repin: every pin store is this tree's already" } else { print "repin: moved"; $moved | each {|line| print $line }; null }
+    let moved = (git status --porcelain -- blobs.lock node/light/android/release node/light/tests/device.pins \
+        pvm/proof/src/constants.rs pvm/proof/fixtures pvm/proof/counts.txt tools/kreivo/conformance \
+        pvm/proof/kit/Cargo.lock pvm/proof/final-verifier/wasm/blob/Cargo.lock pvm/proof/fuzz/Cargo.lock \
+        node/kernel-tests/tests/counts.txt | lines); \
+        if ($moved | is-empty) { print "repin: every pin store is this tree's already" } else { print "repin: moved"; \
+        $moved | each {|line| print $line }; null }
 
 # The pinned blobs' hashes, `_blob-hashes`' lines; its failure fails the
 # recipe that reads them.
@@ -409,7 +475,13 @@ _hashed := 'let hashed = (just _blob-hashes | complete); if $hashed.exit_code !=
 # the lock naming every blob built: a change that moves a blob moves its
 # line.
 check-blobs: build-blobs check-blob-roles
-    {{_hashed}}; let locked = (open --raw blobs.lock | lines | where {|line| not ($line | str starts-with "#") }); let moved = ($built | where {|line| $line not-in $locked }); let gone = ($locked | where {|line| $line not-in $built }); for line in $moved { print -e $"built: ($line)" }; for line in $gone { print -e $"locked: ($line)" }; if ($moved ++ $gone | is-not-empty) { error make { msg: "the guest blobs are not blobs.lock's: `just repin` after a change that moves them" } }; print $"every pinned guest blob is blobs.lock's: ($built | length) blobs"
+    {{_hashed}}; let locked = (open --raw blobs.lock | lines | where {|line| not ($line | str starts-with "#") }); \
+        let moved = ($built | where {|line| $line not-in $locked }); \
+        let gone = ($locked | where {|line| $line not-in $built }); for line in $moved { print -e $"built: ($line)" }; \
+        for line in $gone { print -e $"locked: ($line)" }; \
+        if ($moved ++ $gone | is-not-empty) { error make { \
+        msg: "the guest blobs are not blobs.lock's: `just repin` after a change that moves them" } }; \
+        print $"every pinned guest blob is blobs.lock's: ($built | length) blobs"
 
 # The SDK, its macros' restrictions, the test actors on the testkit, the
 # default agent against it, the checker's own model, the node running the
@@ -480,7 +552,10 @@ test-facility: build-programs
 facility-contract:
     let sdk = ($env.ANDROID_HOME? | default ($env.ANDROID_SDK_ROOT? | default "/opt/android-sdk")); \
     let java = ($env.S4_ANDROID_JAVA_HOME? | default ($env.JAVA_HOME? | default "/usr/lib/jvm/java-17-openjdk")); \
-    if not (($"($sdk)/build-tools/36.1.0/aidl" | path exists) and ($"($java)/bin/javac" | path exists)) { print -e $"facility-contract SKIPPED: no aidl under ($sdk) or no javac under ($java)" } else { with-env { ANDROID_HOME: $sdk, JAVA_HOME: $java, ANDROID_BUILD_TOOLS_VERSION: "36.1.0" } { cargo test --manifest-path node/light/android/Cargo.toml --features jvm --ignore-rust-version --test jvm } }
+    if not (($"($sdk)/build-tools/36.1.0/aidl" | path exists) and ($"($java)/bin/javac" \
+        | path exists)) { print -e $"facility-contract SKIPPED: no aidl under ($sdk) or no javac under ($java)" } else \
+        { with-env { ANDROID_HOME: $sdk, JAVA_HOME: $java, ANDROID_BUILD_TOOLS_VERSION: "36.1.0" } { \
+        cargo test --manifest-path node/light/android/Cargo.toml --features jvm --ignore-rust-version --test jvm } }
 
 # Pin s4 at `rev` (a full commit id) everywhere VOS names it: the
 # workspace's `s4-server`, the facility's and the demo's crates (outside
@@ -488,7 +563,9 @@ facility-contract:
 # `tests/pin.rs` fails while any two differ.
 pin-s4 rev:
     if not ("{{rev}}" =~ '^[0-9a-f]{40}$') { error make { msg: "a full 40-digit commit id" } }; \
-    for manifest in [Cargo.toml node/light/android/Cargo.toml node/gateway/demo/Cargo.toml] { open --raw $manifest | str replace --all --regex '(git = "https://codeberg.org/Virto/s4", rev = ")[0-9a-f]{40}"' ('${1}' + "{{rev}}" + '"') | save --force --raw $manifest }; \
+    for manifest in [Cargo.toml node/light/android/Cargo.toml node/gateway/demo/Cargo.toml] { open --raw $manifest \
+        | str replace --all --regex '(git = "https://codeberg.org/Virto/s4", rev = ")[0-9a-f]{40}"' ('${1}' + \
+        "{{rev}}" + '"') | save --force --raw $manifest }; \
     cargo update -p s4-server; \
     cargo update --manifest-path node/light/android/Cargo.toml -p s4-protocol -p s4-credential-contract -p s4-server; \
     cargo update --manifest-path node/gateway/demo/Cargo.toml -p s4-protocol -p s4-credential-contract -p s4-server; \
@@ -673,7 +750,10 @@ _debug-names-absent:
 # `binary` names none of the debug outputs' environment variables nor the
 # instruction trace's message.
 _names-absent binary:
-    let path = '{{binary}}'; let binary = (open --raw $path); for name in [VOS_PVM_DEBUG CPU_DUMP CPU_EXPR_DUMP VOS_PROOF_PROFILE pvm-inst] { if ($binary | bytes index-of ($name | into binary)) >= 0 { error make { msg: $"($path) names ($name)" } } }; print $"($path) names no debug output"
+    let path = '{{binary}}'; let binary = (open --raw $path); \
+        for name in [VOS_PVM_DEBUG CPU_DUMP CPU_EXPR_DUMP VOS_PROOF_PROFILE pvm-inst] { if ($binary \
+        | bytes index-of ($name | into binary)) >= 0 { error make { msg: $"($path) names ($name)" } } }; \
+        print $"($path) names no debug output"
 
 # The release build of the node's binary with the prover, the release
 # profile's code, scanned as `_debug-names-absent` scans the debug build.
@@ -693,11 +773,29 @@ check-release-names:
 # keeps, are not flagged.
 check-venue-rules:
     let roots = [pvm/proof/statement/src pvm/proof/statement/service/src node/venue/src tools/kreivo/src tools/jam-dev/src]; \
-    let markers = ['MAX_ROOT_AGE_MS' '\.boundary\(' 'verify_strict' 'SMALL_ORDER' 'small_order\(' 'registrable' 'MIN_LENGTH_MS' 'MAX_LENGTH_MS' 'MAX_FOUNDING_KEYS' '[<>]=?\s*last\b' '\blast\s*[<>]']; \
+    let markers = ['MAX_ROOT_AGE_MS' '\.boundary\(' 'verify_strict' 'SMALL_ORDER' 'small_order\(' 'registrable' \
+        'MIN_LENGTH_MS' 'MAX_LENGTH_MS' 'MAX_FOUNDING_KEYS' '[<>]=?\s*last\b' '\blast\s*[<>]']; \
     let allowed = [[file marker]; [node/venue/src/lib.rs verify_strict] [pvm/proof/statement/service/src/refine.rs verify_strict] [tools/kreivo/src/mock/chain.rs MAX_FOUNDING_KEYS]]; \
-    let sources = ($roots | each {|root| glob $"($root)/**/*.rs" } | flatten | each {|path| $path | path relative-to $env.PWD } | where {|path| not ($path =~ '(^|/)(tests?|conformance)(/|\.rs$)') }); \
-    let found = ($sources | each {|file| let code = (open --raw $file | lines | take until {|line| $line =~ '^#\[cfg\(test\)\]' } | each {|line| $line | str replace -r '//.*$' '' } | str join "\n" | str replace -a -r '(?m)^\s*(pub )?use [^;]*;' ''); $markers | where {|marker| ($code =~ $marker) and not ($allowed | any {|a| $a.file == $file and $a.marker == $marker }) } | each {|marker| $"($file) holds ($marker)" } } | flatten); \
-    let calls = [[file call]; [pvm/proof/statement/src/model.rs 'rules::anchored('] [pvm/proof/statement/service/src/accumulate.rs 'rules::anchor('] [pvm/proof/statement/service/src/accumulate.rs 'rules::register('] [pvm/proof/statement/service/src/accumulate.rs 'rules::anchored('] [pvm/proof/statement/service/src/refine.rs 'rules::registration('] [node/venue/src/model.rs 'rules::anchor('] [node/venue/src/model.rs 'rules::register('] [node/venue/src/model.rs 'rules::registration('] [node/venue/src/model.rs 'rules::anchored('] [tools/kreivo/src/mock/pallet.rs 'rules::anchor('] [tools/kreivo/src/mock/pallet.rs 'rules::register('] [tools/kreivo/src/mock/pallet.rs 'rules::registration('] [tools/kreivo/src/mock/pallet.rs 'rules::anchored('] [tools/kreivo/src/venue.rs 'rules::anchored('] [tools/jam-dev/src/venue.rs 'rules::anchored('] [node/venue/src/model.rs 'rules::add_key('] [pvm/proof/statement/service/src/accumulate.rs 'rules::add_key('] [tools/kreivo/src/mock/pallet.rs 'rules::add_key(']]; \
+    let sources = ($roots | each {|root| glob $"($root)/**/*.rs" } | flatten | each {|path| $path \
+        | path relative-to $env.PWD } | where {|path| not ($path =~ '(^|/)(tests?|conformance)(/|\.rs$)') }); \
+    let found = ($sources | each {|file| let code = (open --raw $file | lines \
+        | take until {|line| $line =~ '^#\[cfg\(test\)\]' } | each {|line| $line | str replace -r '//.*$' '' } \
+        | str join "\n" | str replace -a -r '(?m)^\s*(pub )?use [^;]*;' ''); \
+        $markers | where {|marker| ($code =~ $marker) and not ($allowed \
+        | any {|a| $a.file == $file and $a.marker == $marker }) } | each {|marker| $"($file) holds ($marker)" } } \
+        | flatten); \
+    let calls = [[file call]; [pvm/proof/statement/src/model.rs 'rules::anchored('] \
+        [pvm/proof/statement/service/src/accumulate.rs 'rules::anchor('] \
+        [pvm/proof/statement/service/src/accumulate.rs 'rules::register('] \
+        [pvm/proof/statement/service/src/accumulate.rs 'rules::anchored('] \
+        [pvm/proof/statement/service/src/refine.rs 'rules::registration('] [node/venue/src/model.rs 'rules::anchor('] \
+        [node/venue/src/model.rs 'rules::register('] [node/venue/src/model.rs 'rules::registration('] \
+        [node/venue/src/model.rs 'rules::anchored('] [tools/kreivo/src/mock/pallet.rs 'rules::anchor('] \
+        [tools/kreivo/src/mock/pallet.rs 'rules::register('] [tools/kreivo/src/mock/pallet.rs 'rules::registration('] \
+        [tools/kreivo/src/mock/pallet.rs 'rules::anchored('] [tools/kreivo/src/venue.rs 'rules::anchored('] \
+        [tools/jam-dev/src/venue.rs 'rules::anchored('] [node/venue/src/model.rs 'rules::add_key('] \
+        [pvm/proof/statement/service/src/accumulate.rs 'rules::add_key('] \
+        [tools/kreivo/src/mock/pallet.rs 'rules::add_key(']]; \
     let missing = ($calls | where {|row| not (open --raw $row.file | str contains $row.call) } | each {|row| $"($row.file) calls no ($row.call)" }); \
     for failure in ($found ++ $missing) { print -e $failure }; \
     if ($found ++ $missing | is-not-empty) { error make { msg: "an anchor rule lives outside vos_anchor::venue, or a venue does not call it" } }; \
@@ -832,7 +930,12 @@ vos-sync dir:
 # the kit's own script never trusted, `VENDOR`'s tag required and checked.
 check-kit: _kit-workspace
     cd target/kit/build; cargo +1.94.1 build --workspace --target wasm32v1-none --locked --quiet
-    cd target/kit/build; let std = (cargo +1.94.1 tree --workspace -e normal --target wasm32v1-none -f '{p}|{f}' --prefix none --locked | lines | where {|line| $line | split row '|' | last | split row ',' | any {|feature| $feature in [std model-judge other-pins] } } | uniq); if ($std | is-not-empty) { error make { msg: $"std, the model venue or a test seam reaches the kit: ($std | str join ', ')" } } else { print "no std feature, model venue or test seam in the kit's wasm32v1-none build" }
+    cd target/kit/build; let std = (cargo +1.94.1 tree --workspace -e normal --target wasm32v1-none -f '{p}|{f}' \
+        --prefix none --locked | lines | where {|line| $line | split row '|' | last | split row ',' \
+        | any {|feature| $feature in [std model-judge other-pins] } } | uniq); \
+        if ($std | is-not-empty) { error make { msg: \
+        $"std, the model venue or a test seam reaches the kit: ($std | str join ', ')" } } else { \
+        print "no std feature, model venue or test seam in the kit's wasm32v1-none build" }
     cd target/kit/build; cargo +1.94.1 build -p vos-statement --features fixtures --locked --quiet
     python3 -I pvm/proof/kit/check.py --scratch target/kit/sync
 
@@ -860,10 +963,14 @@ check-locks:
     python3 -I tools/gates/locks.py check
 
 _kit-workspace:
-    if not ((do { rustup target list --installed --toolchain 1.94.1 } | complete).stdout | lines | any {|target| $target == 'wasm32v1-none' }) { rustup toolchain install 1.94.1 --profile minimal --target wasm32v1-none --no-self-update }
+    if not ((do { rustup target list --installed --toolchain 1.94.1 } | complete).stdout | lines \
+        | any {|target| $target == 'wasm32v1-none' }) { \
+        rustup toolchain install 1.94.1 --profile minimal --target wasm32v1-none --no-self-update }
     rm -rf target/kit/build
     python3 -I pvm/proof/kit/vos_kit.py vendor target/kit/build/vendor/vos-verifier
-    {workspace: {resolver: "3", members: (glob target/kit/build/vendor/vos-verifier/*/Cargo.toml | each {|manifest| $manifest | path dirname | path relative-to ($env.PWD | path join target/kit/build) } | sort)}, profile: {dev: {debug: false}}} | to toml | save -f target/kit/build/Cargo.toml
+    {workspace: {resolver: "3", members: (glob target/kit/build/vendor/vos-verifier/*/Cargo.toml \
+        | each {|manifest| $manifest | path dirname | path relative-to ($env.PWD | path join target/kit/build) } \
+        | sort)}, profile: {dev: {debug: false}}} | to toml | save -f target/kit/build/Cargo.toml
     cp pvm/proof/kit/Cargo.lock target/kit/build/Cargo.lock
 
 # The fuzz targets, each workspace built apart with `cargo fuzz`. The
@@ -900,15 +1007,23 @@ node_fuzz_targets := "api_reader operated_decode credentialed_decode"
 # refuses a lock file the build would change.
 fuzz-replay:
     cd pvm/proof/fuzz; cargo fetch --locked
-    cd pvm/proof/fuzz; python3 -I corpus.py unpack replay target/replay; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{proof_fuzz_targets}}" | split row ' ') { cargo fuzz run -O -s none --target-dir target/no-sanitizer $target $"target/replay/($target)" -- -runs=0 } }
-    cd node/fuzz; python3 -I ../../pvm/proof/fuzz/corpus.py unpack replay target/replay; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{node_fuzz_targets}}" | split row ' ') { cargo fuzz run --fuzz-dir . -O -s none --target-dir target/no-sanitizer $target $"target/replay/($target)" -- -runs=0 } }
+    cd pvm/proof/fuzz; python3 -I corpus.py unpack replay target/replay; \
+        with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{proof_fuzz_targets}}" \
+        | split row ' ') { cargo fuzz run -O -s none --target-dir target/no-sanitizer $target \
+        $"target/replay/($target)" -- -runs=0 } }
+    cd node/fuzz; python3 -I ../../pvm/proof/fuzz/corpus.py unpack replay target/replay; \
+        with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{node_fuzz_targets}}" \
+        | split row ' ') { cargo fuzz run --fuzz-dir . -O -s none --target-dir target/no-sanitizer $target \
+        $"target/replay/($target)" -- -runs=0 } }
 
 # What each replay corpus reaches (`cargo run --example paths` in
 # `pvm/proof/fuzz`), held to `pvm/proof/fuzz/reach.txt`: every verdict it
 # lists for a target reached by one of the target's inputs at least, so a
 # corpus that drifts off a check fails `gate`.
 fuzz-reach:
-    cd pvm/proof/fuzz; python3 -I corpus.py unpack replay target/replay; with-env { RUSTFLAGS: "-C target-cpu=native" } { cargo run --release --locked --target-dir target/no-sanitizer --example paths -- --expect reach.txt }
+    cd pvm/proof/fuzz; python3 -I corpus.py unpack replay target/replay; \
+        with-env { RUSTFLAGS: "-C target-cpu=native" } { \
+        cargo run --release --locked --target-dir target/no-sanitizer --example paths -- --expect reach.txt }
 
 # The prover's replay corpora rebuilt from the goldens (but
 # `prove_verify_roundtrip`'s, whose programs need no golden): each target
@@ -922,7 +1037,14 @@ fuzz-reach:
 # corpus reaches.
 fuzz-refresh secs="120":
     cd pvm/proof/fuzz; cargo run --release --locked --example seed
-    cd pvm/proof/fuzz; python3 -I corpus.py unpack replay target/replay; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{proof_fuzz_targets}}" | split row ' ' | where {|target| $target != "prove_verify_roundtrip" }) { let limits = ({{_fuzz_limits}} | get -o $target | default {{_fuzz_default}}); mkdir $"corpus/($target)"; cargo fuzz run -a $target $"corpus/($target)" $"target/replay/($target)" -- -max_total_time={{secs}} -len_control=0 ...$limits; rm -rf $"target/merged/($target)"; mkdir $"target/merged/($target)"; cargo fuzz run -a $target $"target/merged/($target)" $"corpus/($target)" $"target/replay/($target)" -- -merge=1 ...$limits; python3 -I corpus.py pack $"target/merged/($target)" $"replay/($target).tar" } }
+    cd pvm/proof/fuzz; python3 -I corpus.py unpack replay target/replay; \
+        with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{proof_fuzz_targets}}" | split row ' ' \
+        | where {|target| $target != "prove_verify_roundtrip" }) { let limits = ({{_fuzz_limits}} | get -o $target \
+        | default {{_fuzz_default}}); mkdir $"corpus/($target)"; \
+        cargo fuzz run -a $target $"corpus/($target)" $"target/replay/($target)" -- -max_total_time={{secs}} \
+        -len_control=0 ...$limits; rm -rf $"target/merged/($target)"; mkdir $"target/merged/($target)"; \
+        cargo fuzz run -a $target $"target/merged/($target)" $"corpus/($target)" $"target/replay/($target)" -- \
+        -merge=1 ...$limits; python3 -I corpus.py pack $"target/merged/($target)" $"replay/($target).tar" } }
     git add -N pvm/proof/fuzz/replay
 
 # Each target `secs` seconds from its corpus (a minute in `ci-full`, five in
@@ -935,8 +1057,18 @@ fuzz-refresh secs="120":
 # run here) starts from an empty one beside its replay.
 fuzz secs="60":
     cd pvm/proof/fuzz; cargo run --release --locked --example seed
-    cd pvm/proof/fuzz; python3 -I corpus.py unpack replay target/replay; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{proof_fuzz_targets}}" | split row ' ') { let limits = ({{_fuzz_limits}} | get -o $target | default {{_fuzz_default}}); mkdir $"corpus/($target)"; let build = if $target == "prove_verify_roundtrip" { [-O -s none --target-dir target/no-sanitizer] } else { [-a] }; cargo fuzz run ...$build $target $"corpus/($target)" $"target/replay/($target)" -- -max_total_time={{secs}} -len_control=0 ...$limits } }
-    cd node/fuzz; python3 -I ../../pvm/proof/fuzz/corpus.py unpack replay target/replay; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{node_fuzz_targets}}" | split row ' ') { mkdir $"corpus/($target)"; cargo fuzz run --fuzz-dir . -a $target $"corpus/($target)" $"target/replay/($target)" -- -max_total_time={{secs}} -max_len=262145 -len_control=0 -rss_limit_mb=8192 -timeout=600 } }
+    cd pvm/proof/fuzz; python3 -I corpus.py unpack replay target/replay; \
+        with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{proof_fuzz_targets}}" \
+        | split row ' ') { let limits = ({{_fuzz_limits}} | get -o $target | default {{_fuzz_default}}); \
+        mkdir $"corpus/($target)"; let build = if $target == "prove_verify_roundtrip" { \
+        [-O -s none --target-dir target/no-sanitizer] } else { [-a] }; \
+        cargo fuzz run ...$build $target $"corpus/($target)" $"target/replay/($target)" -- -max_total_time={{secs}} \
+        -len_control=0 ...$limits } }
+    cd node/fuzz; python3 -I ../../pvm/proof/fuzz/corpus.py unpack replay target/replay; \
+        with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{node_fuzz_targets}}" \
+        | split row ' ') { mkdir $"corpus/($target)"; \
+        cargo fuzz run --fuzz-dir . -a $target $"corpus/($target)" $"target/replay/($target)" -- \
+        -max_total_time={{secs}} -max_len=262145 -len_control=0 -rss_limit_mb=8192 -timeout=600 } }
 
 # The light check, after every edit, and the innermost tier: formatting,
 # the gates' own tripwire, the replay archives' reader's refusals
@@ -998,7 +1130,9 @@ test-changed base="vos-core" *flags="": build-test-actors build-programs
 # nothing there allowed).
 deny:
     cargo deny check --hide-inclusion-graph
-    for manifest in [pvm/proof/final-verifier/wasm/blob/Cargo.toml pvm/proof/fuzz/Cargo.toml] { cargo deny --locked --manifest-path $manifest check --hide-inclusion-graph -A advisory-not-detected advisories sources }
+    for manifest in [pvm/proof/final-verifier/wasm/blob/Cargo.toml pvm/proof/fuzz/Cargo.toml] { \
+        cargo deny --locked --manifest-path $manifest check --hide-inclusion-graph -A advisory-not-detected advisories \
+        sources }
 
 # The layers: a package under `pvm/` has no path dependency outside
 # `pvm/`, on a normal, a build or a dev edge, so the PVM, its compiler,
@@ -1009,8 +1143,12 @@ deny:
 check-layers:
     let manifests = (glob pvm/**/Cargo.toml --exclude ['**/target/**'] | where {|manifest| open --raw $manifest | str contains '[package]' }); \
     if ($manifests | is-empty) { error make { msg: "no package under pvm/" } }; \
-    let packages = ($manifests | each {|manifest| cargo metadata --no-deps --offline --format-version 1 --manifest-path $manifest | from json | get packages | where manifest_path == $manifest | first }); \
-    let edges = ($packages | each {|package| $package.dependencies | each {|dependency| { package: $package.name, dependency: $dependency.name, kind: ($dependency.kind | default normal), path: ($dependency.path? | default "" | if ($in | is-empty) { "" } else { $in | path relative-to $env.PWD }), source: ($dependency.source? | default "") } } } | flatten); \
+    let packages = ($manifests | each {|manifest| cargo metadata --no-deps --offline --format-version 1 \
+        --manifest-path $manifest | from json | get packages | where manifest_path == $manifest | first }); \
+    let edges = ($packages | each {|package| $package.dependencies \
+        | each {|dependency| { package: $package.name, dependency: $dependency.name, kind: ($dependency.kind \
+        | default normal), path: ($dependency.path? | default "" | if ($in | is-empty) { "" } else { $in \
+        | path relative-to $env.PWD }), source: ($dependency.source? | default "") } } } | flatten); \
     let local = ($edges | where path != ""); \
     let outside = ($local | where {|edge| not ($edge.path | str starts-with "pvm/") }); \
     print $"git crates allowed: ($edges | where {|edge| $edge.source | str starts-with 'git+' } | get dependency | uniq | str join ', ')"; \
@@ -1035,7 +1173,10 @@ check-tiers:
 reads_tests := "window_kernel::the_window_settles_at_a_cut window_kernel::a_carried_state_that_does_not_open_is_refused window_kernel::an_older_cut_is_refused window_kernel::rows_off_the_cut_are_refused balance::a_balance_is_stated_at_a_cut balance::a_commitment_that_does_not_open_is_refused reads::a_read_at_a_cut_re_runs_as_its_live_run"
 
 test-reads: build-test-actors build-programs
-    let named = ([{{reads_tests}}] | length); let listed = (cargo test -p vos-kernel-tests --test kernel -- --list --exact {{reads_tests}} | lines | where {|line| $line ends-with ': test' } | length); if $listed != $named { error make { msg: $"test-reads names ($named) tests, of which ($listed) exist" } }
+    let named = ([{{reads_tests}}] | length); \
+        let listed = (cargo test -p vos-kernel-tests --test kernel -- --list --exact {{reads_tests}} | lines \
+        | where {|line| $line ends-with ': test' } | length); \
+        if $listed != $named { error make { msg: $"test-reads names ($named) tests, of which ($listed) exist" } }
     cargo test -p vos-kernel-tests --test kernel -- --test-threads=1 --exact {{reads_tests}}
 
 # Before a merge, and at the end of each planned stage of work: `gate`,
