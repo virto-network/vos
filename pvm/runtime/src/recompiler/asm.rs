@@ -1539,20 +1539,9 @@ impl Assembler {
 
     // -- Misc --
 
-    /// ud2 (undefined instruction, for traps)
-    pub fn ud2(&mut self) {
-        self.emit(0x0F);
-        self.emit(0x0B);
-    }
-
     /// nop
     pub fn nop(&mut self) {
         self.emit(0x90);
-    }
-
-    /// int3 (debug breakpoint)
-    pub fn int3(&mut self) {
-        self.emit(0xCC);
     }
 
     // === Finalization ===
