@@ -4,6 +4,27 @@ The crates here trace PVM programs and prove their runs. A proof's format
 ([`src/format.rs`](src/format.rs)) names its AIR, channel and parameters; two
 paths use them.
 
+The terms below are defined in full in the node side's
+`docs/design/core-model.md` (§11.1) and in the code they name:
+
+- **Kernel:** the program linked from one attestable method's entry alone
+  (the code and data its relocations reach), which reads its arguments
+  through the witness input and halts with its io-hash in φ9 to φ12, the
+  PVM's registers 9 to 12 (`pvm/compiler/src/derive/mod.rs`). A **device
+  kernel** is one a member's device proves whole, under format 47.
+- **Install record:** what installing an actor fixes of each kernel,
+  `vos_abi::records::Kernel`: its program's hash, the root of its initial
+  memory and its **shape**: the chips of the segment AIR its code can
+  reach and, for each **class** of segment (a cut: at most so many steps
+  and pages), the log size of each chip (`pvm/abi/src/records.rs`).
+- **Attest:** the agent's record of one run of a kernel (its program, the
+  window, the witness input, the output, the public arguments and the
+  roots read), from which a node proves the run's statement.
+- **Segment, leaf, fold, wrap:** a slice of a kernel's run proved over one
+  class (format 41); a segment verified in the recursion AIR, and two
+  children verified (format 32); the masked root proof a venue verifies
+  (format 39). The tables below give each.
+
 **A node's statements.** A kernel's run is cut into segments of its shape's
 classes and proved to one final proof:
 
@@ -11,7 +32,7 @@ classes and proved to one final proof:
 |---|---|---|---|
 | 41 | a segment, over its kernel's shape | `vos-pvm-proof` (`prove_kernel`, `prove_shaped`) | its leaf; natively `vos-pvm-proof-verifier`, the reference a leaf is held to |
 | 32 | a leaf (a segment verified) and a fold (two children verified) | `vos-pvm-recair` (`tree::prove_run`) | the fold above it, the wrap; natively `vos-pvm-recair` |
-| 39 | the wrap, masked: the run's program id and io-hash | `vos-pvm-recair` (`tree::prove_final`) | `vos-pvm-final-verifier`, which a venue runs (`vos-statement`, its guests and Wasm blob) |
+| 39 | the wrap, masked: the run's program id and io-hash | `vos-pvm-recair` (`tree::prove_final`) | `vos-pvm-final-verifier`, which a venue runs through `vos-statement`: natively, in a chain's runtime through the verifier kit (`kit/`), or as the JAM statements service (`statement-service.elf`) |
 
 **A member's device.** A device kernel's whole run is one proof:
 
@@ -40,6 +61,13 @@ let proofs: Vec<_> = segments.into_iter().map(|segment| segment.proof).collect()
 vos_pvm_proof_verifier::verify_kernel_chain(proofs, &program, &entry).expect("valid");
 ```
 
+`shape` is the install record's (`KernelShape::try_from(&record.shape)`),
+`program` the kernel's `KernelProgram` (its program hash, shape, format,
+image root and each class's preprocessed root) and `entry`
+`KernelEntry::of(&program, &blob)`. `tests/kernel/fixtures.rs` (`record`,
+`program`, `generate`) and `tests/common/mod.rs` (`kernel_program`) build
+each, runnable.
+
 The node's prover (`node/prover`, on the node side) proves a kernel's
 statements to the wrap with `vos_pvm_recair::tree::prove_final`.
 
@@ -51,13 +79,31 @@ last:
 
 | Pin | Holds | Written by | Checked by | Tier |
 |---|---|---|---|---|
-| `blobs.lock` | every guest blob's SHA-256, stripped: the venue guests (`final-verify.elf`, `statement-service.elf`), the final verifier's Wasm blob and, on the node side, the agent programs and the test actors | `just blobs-lock` | `just check-blobs` | `gate` |
+| `blobs.lock` | every guest blob's SHA-256, stripped: the JAM statements service's program (`statement-service.elf`, deployed), the harnesses' programs (`final-verify.elf` and the final verifier's Wasm blob, deployed nowhere) and, on the node side, the agent programs and the test actors | `just blobs-lock` | `just check-blobs` | `gate` |
 | `pvm/proof/src/constants.rs` | the known programs' ids and the circuits' constants (`H_FOLD`, the leaf circuits) | `VOS_PINS=write` on the `kernel` tests' `constants::`: `vos-pvm-proof`'s for the circuits', and on the node side `vos-kernel-tests`' for the programs' ids, from the test actors | the same tests | `ci-full` (`test-proof`), the programs' ids on the node side; a moved fold circuit moves the wrap's root, which `gate` checks |
 | `pvm/proof/fixtures` | the golden fixtures: segment proofs and their patches, the wrap's proofs, the statements' cases | `just fixtures` | `the_fixtures_are_the_generators`: every file the generator's bytes, and no file it does not make | `ci-full` (`test-proof`) |
 | `pvm/proof/kit/Cargo.lock` | the verifier kit's lock file, VOS's pruned to what the kit links | `just kit-lock` | `just check-kit` | `gate` |
 | `pvm/proof/final-verifier/src/constants.rs` | the wrap's preprocessed root (`PREPROCESSED_ROOT_39`), a venue's verifying key | by hand, at a change of the wrap's circuit | `vos-pvm-recair`'s `recursion` test (`masked::`) and `vos-pvm-proof`'s `constants::` test compute it | `gate`; `ci-full` |
 | `pvm/proof/fuzz/replay` | each of the prover's fuzz targets' replay corpus, one archive a target (`<target>.tar`, `fuzz/corpus.py`: the same inputs, the same bytes): inputs kept because they reached a path | `just fuzz-refresh` (seeded from the goldens, fuzzed, merged, packed) | `just fuzz-replay` (unpacked into `fuzz/target/replay/`) | `gate` |
 | `pvm/proof/fuzz/reach.txt` | the verdicts each of the prover's replay corpora reaches, its accepted goldens among them | from `just fuzz-reach`'s output after `just fuzz-refresh` | `just fuzz-reach` | `gate` |
+
+Of `blobs.lock`'s blobs, only `statement-service.elf` is deployed, as the
+JAM statements service. `final-verify.elf` and the Wasm blob are the
+harnesses' programs: they link the model judge (`vos-statement`'s
+`model-judge`), whose pinned program and venue state come in its input,
+to judge the fixtures on the JAM-only host and in Wasm. A chain's runtime
+links no blob of this tree: it builds the kit's five crates (`kit/`) at
+the commit and tree hash its `VENDOR` names. From `blobs.lock` to a
+deployed service's code hash: build `statement-service.elf` (`just
+build-statement-service`) and check it against its line (`just
+check-blobs`, the stripped ELF's hash); link the ELF to a PVM program
+(`vos_pvm_compiler::link_elf_spi`); fill its configuration block with the
+deployment's published configuration
+(`vos_statement_service::config::configure`: the chain's genesis hash and
+time and the pinned program ids; unconfigured, it pins none and refuses
+every statement); and make it a service blob with the deployment's
+metadata (`vos_pvm_compiler::spi::service_blob`). The service's code hash
+on JAM is that blob's BLAKE2b-256.
 
 The node side keeps pins of its own beside these, which its `just repin`
 writes with them: the facility's release artifacts (`node/light/android/release`),
@@ -93,10 +139,14 @@ accepted proof that is not a current golden), so `just fuzz-refresh` follows `ju
 
 After a change that moves a guest, a circuit or the lock file, `just
 repin` writes every generated store anew in dependency order (guests and
-`blobs.lock`, the release artifacts, the device program ids, the
-constants, the fixtures, the conformance vectors, the kit's lock file),
+`blobs.lock`, the circuits' constants, the fixtures, the kit's lock file;
+and the node side's `just repin` with them the release artifacts, the
+device program ids, the known programs' ids and the conformance vectors),
 runs each pinning test again without its write mode, and lists the stores
-that moved. On a tree whose pins are current it changes nothing. At a
+that moved. The kit refuses conformance vectors that do not describe the
+fixtures it carries (`vos_kit.py`: the proof's length and hash, every
+patch and byte range within its fixture), so a fixture written anew
+without them fails at `just check-kit` and at every vendoring. On a tree whose pins are current it changes nothing. At a
 merge, run it instead of resolving pins by hand, and check that the
 stores that moved are the ones the change meant to move: a program id is
 a venue's pin, and a moved one is a release.
