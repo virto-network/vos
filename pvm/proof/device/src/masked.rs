@@ -23,7 +23,7 @@ use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use vos_pvm_proof::chips::CpuColumns;
 use vos_pvm_proof::device::{DeviceLayout, DeviceShape};
 
-use super::MaskedProof;
+use vos_pvm_recair::masked::MaskedProof;
 
 mod prove;
 mod verify;

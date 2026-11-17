@@ -14,7 +14,7 @@ use crate::secret::{self, DeviceSecret};
 use crate::threads::thread_pool;
 use crate::{AuthWitness, Call, DeviceError, scope};
 
-use vos_pvm_recair::masked::MaskRng;
+use vos_pvm_device::MaskRng;
 
 /// The most memory a device kernel's proof takes, in bytes: the device
 /// budget, above the stock auth kernel's peak resident size measured on

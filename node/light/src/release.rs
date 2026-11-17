@@ -30,7 +30,7 @@ pub const TRANSPILER: u32 = 1;
 /// A device kernel's release artifact: method `method`'s kernel of the
 /// package whose ELF hash (`vos_pvm_compiler::Derived::elf`) is `elf`,
 /// and its device program as every node computes it from that package
-/// (`vos_pvm_recair::device::Program::of`):
+/// (`vos_pvm_device::Program::of`):
 /// its chips, its log sizes, its format and its id. The light node
 /// commits the program's preprocessed tree from these at its first proof
 /// ([`crate::DeviceProgram::released`]) and checks the id it gets.
@@ -103,15 +103,15 @@ pub fn agent(elf: &[u8]) -> Result<Vec<u8>, String> {
 /// format.
 #[cfg(feature = "release")]
 pub fn devices(elf: &[u8]) -> Result<Vec<Device>, String> {
-    devices_in(vos_pvm_recair::device::FORMAT.number, elf)
+    devices_in(vos_pvm_device::FORMAT.number, elf)
 }
 
 /// [`devices`] in the device format numbered `format`, one this build
-/// proves (`vos_pvm_recair::device::FORMATS`): an app's artifacts for a
+/// proves (`vos_pvm_device::FORMATS`): an app's artifacts for a
 /// space that admits only that format.
 #[cfg(feature = "release")]
 pub fn devices_in(format: u32, elf: &[u8]) -> Result<Vec<Device>, String> {
-    let format = vos_pvm_recair::device::format(format)
+    let format = vos_pvm_device::format(format)
         .ok_or_else(|| format!("no device format {format} in this build"))?;
     let derived = vos_pvm_compiler::derive(elf).map_err(|error| error.to_string())?;
     let derivation = derived.derivation();
@@ -125,9 +125,8 @@ pub fn devices_in(format: u32, elf: &[u8]) -> Result<Vec<Device>, String> {
                 .find(|(bound, _)| bound == method)
                 .map(|(_, kernel)| kernel.clone())
                 .ok_or_else(|| format!("device kernel {method:#010x} has no kernel"))?;
-            let program =
-                vos_pvm_recair::device::Program::of(format, &kernel, reference, *headroom)
-                    .map_err(|error| format!("device kernel {method:#010x}: {error}"))?;
+            let program = vos_pvm_device::Program::of(format, &kernel, reference, *headroom)
+                .map_err(|error| format!("device kernel {method:#010x}: {error}"))?;
             Ok(Device {
                 elf: derivation.elf,
                 method: MethodId(*method),

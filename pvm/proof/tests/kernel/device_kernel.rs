@@ -50,9 +50,7 @@ fn a_device_kernels_shape_holds_no_blake2b() {
 /// its own io-hash alone: a witness-independent trace.
 #[test]
 fn every_path_shape_proves_under_one_device_program() {
-    use vos_pvm_recair::device::{
-        FORMAT, MAX_PROOF_BYTES, Program, auth_reference, claim_io, encode,
-    };
+    use vos_pvm_device::{FORMAT, MAX_PROOF_BYTES, Program, auth_reference, claim_io, encode};
     use vos_pvm_recair::masked::MaskRng;
     let blob = kernel("device", "auth");
     let program =
@@ -161,7 +159,7 @@ fn sdk_form_kernels_run_within_the_lean_kernels_steps() {
 /// io-hash alone.
 #[test]
 fn sdk_form_kernels_prove_under_their_programs() {
-    use vos_pvm_recair::device::{FORMAT, Program, encode};
+    use vos_pvm_device::{FORMAT, Program, encode};
     use vos_pvm_recair::masked::MaskRng;
     let full: Vec<usize> = (0..32).collect();
     let cases = [
@@ -229,7 +227,7 @@ fn credentials() -> Vec<u8> {
 /// program their own arguments prove under.
 #[test]
 fn a_reference_program_returns_its_kernels_reference_arguments() {
-    use vos_pvm_recair::device::{FORMAT, Program, auth_reference, reference_arguments};
+    use vos_pvm_device::{FORMAT, Program, auth_reference, reference_arguments};
     let (kernel, reference, headroom) = release(&vos_testkit::programs::package("device"), "auth");
     assert_eq!(headroom, 0);
     let arguments = reference_arguments(&reference).expect("the reference runs");
@@ -271,7 +269,7 @@ fn a_reference_program_returns_its_kernels_reference_arguments() {
 /// program id, whose proofs a witness still gives and its verifier takes.
 #[test]
 fn a_headroom_raises_every_log_size() {
-    use vos_pvm_recair::device::{FORMAT, Program, encode};
+    use vos_pvm_device::{FORMAT, Program, encode};
     use vos_pvm_recair::masked::MaskRng;
     let (kernel, reference, _) = release(&credentials(), "owner");
     let program = Program::of(&FORMAT, &kernel, &reference, 0).unwrap();
@@ -296,7 +294,7 @@ fn a_headroom_raises_every_log_size() {
 /// every one proves under one program.
 #[test]
 fn random_witnesses_fit_the_reference_programs() {
-    use vos_pvm_recair::device::{FORMAT, Program};
+    use vos_pvm_device::{FORMAT, Program};
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
     let mut next = move || {
         state ^= state << 13;
@@ -342,7 +340,7 @@ fn random_witnesses_fit_the_reference_programs() {
 /// io-hash and the same nullifier; their program ids differ.
 #[test]
 fn two_releases_compute_one_claim() {
-    use vos_pvm_recair::device::{FORMAT, Program};
+    use vos_pvm_device::{FORMAT, Program};
     let (lean, lean_reference, _) = release(&vos_testkit::programs::package("device"), "auth");
     let (next, next_reference, _) = release(&vos_testkit::programs::package("device-next"), "auth");
     let full: Vec<usize> = (0..32).collect();

@@ -18,7 +18,7 @@
 //! ring, `once`), or a device kernel of the method's own actor, whose
 //! claim its handler checks at apply. Its program is one this node
 //! computes from a release of the installed kernel
-//! ([`vos_pvm_recair::device::Program::of`], kept per release), its
+//! ([`vos_pvm_device::Program::of`], kept per release), its
 //! io-hash the Poseidon2 `H_io` of the claim, and the claim's last 32
 //! bytes the binding naming that program's id.
 //!
@@ -41,8 +41,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use vos_pvm_recair::ProveError;
-use vos_pvm_recair::device::{self as device, Verifier};
+use vos_pvm_device::ProveError;
+use vos_pvm_device::{self as device, Verifier};
 use vos_wire::abi::Kind;
 use vos_wire::abi::cap;
 use vos_wire::batch::CredentialedInput;

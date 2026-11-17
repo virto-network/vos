@@ -37,7 +37,7 @@ pub struct Derivation {
 /// arguments, a public, valid witness, and the headroom over that run's
 /// sizes. A device program is the kernel's chips at the log sizes its run
 /// on those arguments needs, each raised by `headroom`
-/// (`vos_pvm_recair::device::Program`), so every node and every release
+/// (`vos_pvm_device::Program`), so every node and every release
 /// computes the same program from the same three.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Reference {

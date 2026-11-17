@@ -376,10 +376,12 @@ def changed(base, with_heavy):
     selected -= UPPER
     features = [f"{package}/{feature}" for package, feature in
                 (("vos-anchor", "vectors"), ("vos-statement", "fixtures")) if package in selected]
-    # The recursion AIR's suite runs four tests at a time, under the
-    # gates' memory limit: apart from the rest.
-    for packages, threads in ((sorted(selected - {"vos-pvm-recair"}), []),
-                              (sorted(selected & {"vos-pvm-recair"}), ["--", "--test-threads=4"])):
+    # The masked prover's suites (the recursion AIR's and the device
+    # profile's) run four tests at a time, under the gates' memory limit:
+    # apart from the rest.
+    masked = {"vos-pvm-recair", "vos-pvm-device"}
+    for packages, threads in ((sorted(selected - masked), []),
+                              (sorted(selected & masked), ["--", "--test-threads=4"])):
         if not packages:
             continue
         command = ["cargo", "test"] + [argument for package in packages for argument in ("-p", package)]

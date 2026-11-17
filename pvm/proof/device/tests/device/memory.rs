@@ -10,6 +10,9 @@ use stwo::core::verifier::VerificationError;
 use stwo::prover::ProvingError;
 use vos_pvm::instruction::Opcode;
 use vos_pvm_compiler::assembler::{Assembler, Reg};
+use vos_pvm_device::masked::{
+    DeviceProgram, device_shape, install, prove_device, prove_device_forced, verify_device,
+};
 use vos_pvm_final_verifier::Error;
 use vos_pvm_proof::AirColumn;
 use vos_pvm_proof::chips::word_memory::{self, boundary};
@@ -19,9 +22,6 @@ use vos_pvm_proof::masked::MaskedDeviceTrace;
 use vos_pvm_proof::poseidon2::P2MerkleChannel;
 use vos_pvm_proof::side_note::SideNote;
 use vos_pvm_recair::ProveError;
-use vos_pvm_recair::masked::device::{
-    DeviceProgram, device_shape, install, prove_device, prove_device_forced, verify_device,
-};
 use vos_pvm_recair::masked::{Checks, MaskRng};
 
 use crate::support::{HEAP, RO_BASE, RO_DATA, RW_BASE, RW_DATA, io_and_halt};

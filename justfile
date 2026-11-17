@@ -60,10 +60,11 @@ test:
 phone out="target/phone":
     tools/phone/build.sh {{out}}
 
-# The recursion AIR's prover tests, four at a time: at every core at once
-# its recursion suite passed 12 GiB, the limit the gates run under.
+# The recursion AIR's prover tests and the device profile's, on its masked
+# prover, four at a time: at every core at once the recursion suite passed
+# 12 GiB, the limit the gates run under.
 test-recair:
-    cargo test -p vos-pvm-recair -- --test-threads=4
+    cargo test -p vos-pvm-recair -p vos-pvm-device -- --test-threads=4
 
 # Bench guests, built with the guest toolchain in `pvm/guest`.
 build-bench-guests:
@@ -108,7 +109,8 @@ vectors:
 # `systemd-run --user --scope -p MemoryMax=12G -p MemorySwapMax=0 just test-proof`.
 # They cover every admitted format, the Poseidon2-M31 segment format among
 # them; the verifier's suite runs in `test`.
-# Then the masking's heavy gates (`vos-pvm-recair`'s `heavy-gates`): the
+# Then the masking's heavy gates (`vos-pvm-recair`'s and `vos-pvm-device`'s
+# `heavy-gates`): the
 # leakage tests at a medium N (500 proofs a witness on the small circuit, 16
 # on the real wrap, 64 a witness on the device segment; `LEAKAGE_N`,
 # `LEAKAGE_WRAP_N` and `LEAKAGE_SEGMENT_N` set others, and `slice-gate` the
@@ -124,7 +126,8 @@ test-proof: build-test-actors build-programs build-final-verify judge-wasm
     for test in (cargo test -p vos-pvm-proof --features debug-internals --test kernel -- --list --format terse --skip reads:: --skip wrap_files:: | lines | where {|line| $line ends-with ': test' } | each {|line| $line | str replace ': test' '' }) { cargo test -p vos-pvm-proof --features debug-internals --test kernel $test -- --exact --test-threads=1 }
     cargo test -p vos-pvm-proof --features debug-internals --test kernel reads:: -- --test-threads=1
     cargo test -p vos-pvm-proof --test kernel constants:: -- --test-threads=1
-    cargo test -p vos-pvm-recair --features heavy-gates --test circuit --test recursion --test device -- leakage heavy --test-threads=1
+    cargo test -p vos-pvm-recair --features heavy-gates --test circuit --test recursion -- leakage heavy --test-threads=1
+    cargo test -p vos-pvm-device --features heavy-gates --test device -- leakage heavy --test-threads=1
     cargo test -p vos-pvm-proof --features debug-internals --test kernel wrap_files:: -- --test-threads=1
     just test-carriers
 
@@ -825,7 +828,7 @@ fuzz secs="60":
 check: fmt-check check-tiers build-test-actors build-programs build-final-verify build-statement-service
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     cargo test {{core_crates}} ...(python3 -I tools/gates/tiers.py fast {{core_crates}} | split row ' ')
-    cargo test -p vos-pvm-recair ...(python3 -I tools/gates/tiers.py fast -p vos-pvm-recair | split row ' ') -- --test-threads=4
+    cargo test -p vos-pvm-recair -p vos-pvm-device ...(python3 -I tools/gates/tiers.py fast -p vos-pvm-recair -p vos-pvm-device | split row ' ') -- --test-threads=4
     cargo test {{agent_crates}} ...(python3 -I tools/gates/tiers.py fast {{agent_crates}} | split row ' ')
 
 # The step gate, after each step of work and before its commit: `check`,
@@ -847,7 +850,7 @@ gate: check doc-check deny check-venue-rules check-no-std check-no-leaks check-n
     just clippy-prover
     cargo test {{core_crates}} ...(python3 -I tools/gates/tiers.py heavy {{core_crates}} | split row ' ')
     cargo test {{core_crates}} --doc
-    cargo test -p vos-pvm-recair ...(python3 -I tools/gates/tiers.py heavy -p vos-pvm-recair | split row ' ') -- --test-threads=4
+    cargo test -p vos-pvm-recair -p vos-pvm-device ...(python3 -I tools/gates/tiers.py heavy -p vos-pvm-recair -p vos-pvm-device | split row ' ') -- --test-threads=4
     cargo test {{agent_crates}} ...(python3 -I tools/gates/tiers.py heavy {{agent_crates}} | split row ' ')
     cargo test {{agent_crates}} --doc
     just test-gateway-onion

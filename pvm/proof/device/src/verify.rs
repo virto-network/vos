@@ -9,8 +9,9 @@ use vos_pvm_final_verifier::masking::MaskedFormat;
 use vos_pvm_proof::format::Format;
 
 use super::{Hasher, MAX_PROOF_BYTES};
-use crate::masked::MaskedProof;
-use crate::masked::device::{DeviceProgram, DeviceProof, device_format, verify_device_in};
+use vos_pvm_recair::masked::MaskedProof;
+
+use crate::masked::{DeviceProgram, DeviceProof, device_format, verify_device_in};
 
 /// The domain a program id hashes first.
 const PROGRAM_DOMAIN: &[u8] = b"vos/device/program/v1";
@@ -156,7 +157,7 @@ pub fn program_id(format: &Format, program: &DeviceProgram<Hasher>) -> [u8; 32] 
             hash.update(word.to_le_bytes());
         }
     }
-    hash.update(crate::masked::device::DEVICE_WORD_MEMORY_TAG.to_le_bytes());
+    hash.update(crate::masked::DEVICE_WORD_MEMORY_TAG.to_le_bytes());
     let Blake2sHash(root) = program.circuit;
     hash.update(root);
     hash.finalize().into()

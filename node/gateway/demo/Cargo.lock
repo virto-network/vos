@@ -8547,8 +8547,8 @@ dependencies = [
  "vos-pvm",
  "vos-pvm-codec",
  "vos-pvm-compiler",
+ "vos-pvm-device",
  "vos-pvm-precompiles",
- "vos-pvm-recair",
  "vos-wire",
  "x25519-dalek",
  "zeroize",
@@ -8602,7 +8602,7 @@ dependencies = [
  "vos-node-prover",
  "vos-pvm",
  "vos-pvm-compiler",
- "vos-pvm-recair",
+ "vos-pvm-device",
  "vos-raft",
  "vos-tree",
  "vos-venue",
@@ -8660,6 +8660,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "vos-pvm-device"
+version = "0.1.0"
+dependencies = [
+ "blake2 0.10.6",
+ "num-traits",
+ "postcard",
+ "serde",
+ "stwo",
+ "vos-pvm-final-verifier",
+ "vos-pvm-precompiles",
+ "vos-pvm-proof",
+ "vos-pvm-recair",
+ "vos-pvm-recair-air",
+ "vos-wire",
+]
+
+[[package]]
 name = "vos-pvm-final-verifier"
 version = "0.1.0"
 dependencies = [
@@ -8698,6 +8715,7 @@ dependencies = [
  "stwo",
  "stwo-constraint-framework",
  "vos-pvm",
+ "vos-pvm-final-verifier",
  "vos-pvm-poseidon2",
  "vos-pvm-precompiles",
  "vos-pvm-program",

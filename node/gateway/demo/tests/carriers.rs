@@ -383,8 +383,8 @@ fn no_carrier_through_the_onion_holds_a_members_device_secret_or_its_place() {
     audit
         .needles
         .kernel_arguments("the member", &arguments, claim.len());
-    let kernel = vos_pvm_recair::device::Program::released(
-        &vos_pvm_recair::device::FORMAT,
+    let kernel = vos_pvm_device::Program::released(
+        &vos_pvm_device::FORMAT,
         &auth.kernel,
         auth.chips,
         &auth.log_sizes,
@@ -406,7 +406,7 @@ fn no_carrier_through_the_onion_holds_a_members_device_secret_or_its_place() {
     let watched_proof = Proven {
         format: DEVICE_FORMAT,
         claim,
-        proof: vos_pvm_recair::device::encode(&vos_pvm_recair::device::FORMAT, &proved.proof)
+        proof: vos_pvm_device::encode(&vos_pvm_device::FORMAT, &proved.proof)
             .unwrap(),
     };
     let answer = proven(&watched, &watched_proof);

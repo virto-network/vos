@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use vos_light::release::device;
 use vos_light::{AuthWitness, Call, Digest, Prover, ProverConfig, Threads, claim_io};
 use vos_light::{derive_secret, member};
-use vos_pvm_recair::device::{FORMAT, Program, decode, encode};
+use vos_pvm_device::{FORMAT, Program, decode, encode};
 use vos_wire::credentials::{DEPTH, EMPTY, leaf, root_of};
 
 const ROUNDS: usize = 200;
@@ -97,7 +97,7 @@ fn main() {
     ];
     println!(
         "format {}, {ROUNDS} runs each, one thread; median / 95th percentile",
-        vos_pvm_recair::device::FORMAT.number
+        vos_pvm_device::FORMAT.number
     );
     let decoded = decode(&FORMAT, &honest).unwrap();
     let released = Program::released(&FORMAT, &auth.kernel, auth.chips, &auth.log_sizes).unwrap();
@@ -105,12 +105,8 @@ fn main() {
     let header = device_program.header();
     let steps: [(&str, &dyn Fn() -> bool); 5] = [
         ("its masked format and layout, at install", &|| {
-            vos_pvm_recair::masked::device::device_format(
-                &vos_pvm_recair::device::FORMAT,
-                device_program,
-                &header,
-            )
-            .is_some()
+            vos_pvm_device::masked::device_format(&vos_pvm_device::FORMAT, device_program, &header)
+                .is_some()
         }),
         ("the io-hash's public values", &|| {
             !vos_pvm_proof::masked::device_public_values(&io).is_empty()

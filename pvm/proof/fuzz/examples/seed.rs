@@ -21,7 +21,7 @@ use std::path::Path;
 
 use vos_anchor::vectors;
 use vos_anchor::{Anchor, RootKind};
-use vos_pvm_recair::masked::MaskRng;
+use vos_pvm_device::MaskRng;
 use vos_statement::fixtures;
 
 #[path = "../fuzz_targets/device_program.rs"]

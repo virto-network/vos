@@ -35,11 +35,14 @@
 use vos_pvm_proof::format::{DEVICE_PROOF, Format};
 use vos_wire::credentials::{self, DEPTH, EMPTY, Tag, Words};
 
+pub mod masked;
 mod prove;
 mod verify;
 
 pub use prove::{GAS, Program, REFERENCE_GAS, reference_arguments};
 pub use verify::{Verifier, claim_io, decode, encode, program_id};
+pub use vos_pvm_recair::ProveError;
+pub use vos_pvm_recair::masked::{MaskRng, MaskStats, MaskedProof};
 
 /// The device format: format 47, the per-program CPU and the word ledger.
 pub const FORMAT: Format = DEVICE_PROOF;

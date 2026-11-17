@@ -30,6 +30,7 @@ members = [
     "pvm/proof/poseidon2",
     "pvm/proof/recair-air",
     "pvm/proof/recair",
+    "pvm/proof/device",
     "pvm/proof/final-verifier",
     "pvm/proof/statement",
     "pvm/proof/statement/service",
@@ -76,6 +77,7 @@ default-members = [
     "pvm/proof/poseidon2",
     "pvm/proof/recair-air",
     "pvm/proof/recair",
+    "pvm/proof/device",
     "pvm/proof/final-verifier",
     "pvm/proof/statement",
     "pvm/proof/statement/service",
@@ -216,6 +218,10 @@ opt-level = 3
 opt-level = 3
 [profile.test.package.vos-pvm-recair]
 opt-level = 3
+[profile.dev.package.vos-pvm-device]
+opt-level = 3
+[profile.test.package.vos-pvm-device]
+opt-level = 3
 # The masked wrap's randomness: ChaCha20 streams for every mask and salt.
 [profile.dev.package.rand_chacha]
 opt-level = 3
@@ -257,6 +263,7 @@ vos-pvm-precompiles = { path = "pvm/proof/precompiles" }
 vos-pvm-poseidon2 = { path = "pvm/proof/poseidon2" }
 vos-pvm-recair-air = { path = "pvm/proof/recair-air" }
 vos-pvm-recair = { path = "pvm/proof/recair", default-features = false }
+vos-pvm-device = { path = "pvm/proof/device" }
 vos-pvm-final-verifier = { path = "pvm/proof/final-verifier" }
 vos-light = { path = "node/light" }
 merkle-crdt = { path = "support/merkle-crdt" }

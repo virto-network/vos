@@ -4,7 +4,6 @@
 use stwo::core::channel::MerkleChannel;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
-use stwo::prover::ComponentProver;
 use stwo::prover::backend::BackendForChannel;
 use stwo::prover::backend::simd::SimdBackend;
 use vos_pvm_proof::chips::CpuColumns;
@@ -16,19 +15,13 @@ use vos_pvm_proof::masked::{
 };
 use vos_pvm_proof::side_note::SideNote;
 
-use super::super::{
-    Checks, Committed, MaskRng, MaskStats, MaskedProvers, MaskedTrace, prove_masked_program,
-};
+use vos_pvm_recair::ProveError;
+use vos_pvm_recair::masked::{Checks, Committed, MaskRng, MaskStats, MaskedTrace};
+use vos_pvm_recair::trace::FirstRowFraction;
+use vos_pvm_recair_air::masking::MaskedComponents;
+
 use super::verify::{device_floors, device_format};
 use super::{DeviceProgram, DeviceProof};
-use crate::prove::ProveError;
-use crate::trace::FirstRowFraction;
-
-impl MaskedProvers for DeviceComponents {
-    fn provers(&self) -> Vec<&dyn ComponentProver<SimdBackend>> {
-        DeviceComponents::provers(self)
-    }
-}
 
 /// The device shape of kernel `blob` under `format`: the chips its code can
 /// reach, and a log size each at least `reference`'s run needs and at least
@@ -269,14 +262,8 @@ where
         public: &public,
         interaction: &interaction,
     };
-    let (proof, stats) = prove_masked_program::<MC, DeviceComponents>(
-        format,
-        &program.header(),
-        masked,
-        committed,
-        rng,
-        checks,
-    )?;
+    let (proof, stats) =
+        prove_masked::<MC>(format, &program.header(), masked, committed, rng, checks)?;
     Ok((
         DeviceProof {
             io: trace.io,
@@ -284,4 +271,35 @@ where
         },
         stats,
     ))
+}
+
+/// The masked prover on `program`'s words, held to every check; a forced
+/// proof's `checks` only on the tests' dev edge (`seeded-masks`), so a
+/// production build has no path to a proof the prover's own checks refuse.
+fn prove_masked<MC: MerkleChannel>(
+    format: &Format,
+    program: &[u64],
+    trace: MaskedTrace<
+        '_,
+        <DeviceComponents as MaskedComponents>::Relations,
+        <DeviceComponents as MaskedComponents>::Active,
+    >,
+    committed: Option<&Committed<MC>>,
+    rng: MaskRng,
+    checks: Checks,
+) -> Result<(vos_pvm_recair::masked::MaskedProof<MC::H>, MaskStats), ProveError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    #[cfg(feature = "seeded-masks")]
+    return vos_pvm_recair::masked::prove_masked_program_forced::<MC, DeviceComponents>(
+        format, program, trace, committed, rng, checks,
+    );
+    #[cfg(not(feature = "seeded-masks"))]
+    {
+        let _ = checks;
+        vos_pvm_recair::masked::prove_masked_program::<MC, DeviceComponents>(
+            format, program, trace, committed, rng,
+        )
+    }
 }

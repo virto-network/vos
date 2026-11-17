@@ -87,9 +87,9 @@
 //!   it read.
 //!
 //! The release artifacts are computed in the registry's device format
-//! ([`vos_pvm_recair::device::FORMAT`]); a program proves in its
+//! ([`vos_pvm_device::FORMAT`]); a program proves in its
 //! artifact's format, one this build proves
-//! ([`vos_pvm_recair::device::FORMATS`]). No witness is logged, and
+//! ([`vos_pvm_device::FORMATS`]). No witness is logged, and
 //! its proofs' masks are the operating system's (a seeded stream exists
 //! only under the `seeded-masks` test seam, which no production build
 //! enables). `SECURITY.md` states what the secret is exposed to.

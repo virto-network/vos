@@ -24,7 +24,7 @@ vos-light = { workspace = true }
 vos-wire = { workspace = true }
 # The device profile's masked prover and verifier, and its format.
 vos-pvm-proof = { workspace = true }
-vos-pvm-recair = { workspace = true }
+vos-pvm-device = { workspace = true }
 vos-pvm-recair-air = { workspace = true }
 serde = { workspace = true }
 postcard = { version = "1", features = ["alloc"] }
@@ -39,7 +39,7 @@ mimalloc = { version = "0.1.52", optional = true }
 # (`build.rs`): the transpiler and the release build, on the host alone.
 [build-dependencies]
 vos-pvm-compiler = { workspace = true }
-vos-pvm-recair = { workspace = true }
+vos-pvm-device = { workspace = true }
 vos-light = { workspace = true, features = ["release"] }
 vos-wire = { workspace = true }
 

@@ -26,12 +26,10 @@ use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 use stwo::core::vcs_lifted::blake2b_merkle::Blake2bMerkleChannel;
 use stwo::prover::backend::BackendForChannel;
 use stwo::prover::backend::simd::SimdBackend;
+use vos_pvm_device::masked::{DeviceProof, DeviceProver, device_shape, install, verify_device};
+use vos_pvm_device::{MaskRng, MaskedProof};
 use vos_pvm_proof::format::{ChannelKind, DEVICE_PROOF, Format, FormatParams, Masking};
 use vos_pvm_proof::masked::DeviceComponents;
-use vos_pvm_recair::masked::device::{
-    DeviceProof, DeviceProver, device_shape, install, verify_device,
-};
-use vos_pvm_recair::masked::{MaskRng, MaskedProof};
 use vos_pvm_recair_air::masking::MaskedComponents;
 
 use crate::{hex, ms, peak_rss_mib, quantile};

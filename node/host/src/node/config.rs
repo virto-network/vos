@@ -171,7 +171,7 @@ pub struct Config {
     /// The device formats this node admits, newest first, each with the
     /// retirement its release set, if any (`light-node.md` §4.4): by
     /// default the release's, [`crate::DEVICE_FORMATS`]. At most two, each
-    /// one this binary verifies (`vos_pvm_recair::device::FORMATS`), else
+    /// one this binary verifies (`vos_pvm_device::FORMATS`), else
     /// the node does not open. It narrows what this node's ingress admits;
     /// apply refuses a format the release does not admit, or retired,
     /// whatever any node admits.

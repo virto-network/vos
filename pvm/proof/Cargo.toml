@@ -100,6 +100,9 @@ vos-tree = { workspace = true }
 # final verifier; the fixtures' masked wraps, from the seeded seam
 # (`seeded-masks`, a dev edge: no production build has it).
 vos-pvm-recair = { workspace = true, features = ["recursion", "seeded-masks"] }
+# The device kernels' programs, proved and verified under the device
+# format.
+vos-pvm-device = { workspace = true }
 # The golden statements: their types, the venue's check, the fixtures'
 # encoding, and the venue's JAM refine program on the JAM-only host.
 vos-statement = { workspace = true, features = ["fixtures"] }

@@ -506,14 +506,13 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
             &tree::compress(&Tag::Nf.block(), &words),
             &tree::words(&scope).unwrap(),
         ));
-        let public = vos_pvm_recair::device::auth_public(
+        let public = vos_pvm_device::auth_public(
             &witness.root.to_bytes(),
             &scope,
             &nullifier,
             &call.binding(program.id()).to_bytes(),
         );
-        let arguments =
-            vos_pvm_recair::device::auth_arguments(&siblings, &words, witness.slot, &public);
+        let arguments = vos_pvm_device::auth_arguments(&siblings, &words, witness.slot, &public);
         let proof = prover.prove_kernel(&program, &arguments).unwrap();
         (
             Proven {
@@ -560,8 +559,8 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
     audit
         .needles
         .kernel_arguments("the member", &arguments, claim.len());
-    let kernel = vos_pvm_recair::device::Program::released(
-        &vos_pvm_recair::device::FORMAT,
+    let kernel = vos_pvm_device::Program::released(
+        &vos_pvm_device::FORMAT,
         &auth.kernel,
         auth.chips,
         &auth.log_sizes,
@@ -583,8 +582,7 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
     let watched_proof = Proven {
         format: DEVICE_FORMAT,
         claim,
-        proof: vos_pvm_recair::device::encode(&vos_pvm_recair::device::FORMAT, &proved.proof)
-            .unwrap(),
+        proof: vos_pvm_device::encode(&vos_pvm_device::FORMAT, &proved.proof).unwrap(),
     };
     answers.push(ran(send(&watched, &watched_proof)));
 

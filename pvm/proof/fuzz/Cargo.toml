@@ -34,7 +34,7 @@ vos-wire = { path = "../../../agent/wire" }
 vos-pvm-precompiles = { path = "../precompiles" }
 # The device verifier on the bytes ingress receives, under a small kernel's
 # program the assembler builds.
-vos-pvm-recair = { path = "../recair", default-features = false }
+vos-pvm-device = { path = "../device" }
 vos-pvm-compiler = { path = "../../compiler" }
 stwo = { git = "https://github.com/olanod/stwo", rev = "e14925a81606b4d68c6a5d3047d382a20bd953d3", default-features = false }
 

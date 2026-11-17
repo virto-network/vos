@@ -8,12 +8,12 @@ use stwo::core::circle::CirclePoint;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::quotients::deep_values_of_column;
 use stwo_constraint_framework::InfoEvaluator;
+use vos_pvm_device::masked::{device_floors, device_reveals};
 use vos_pvm_proof::device::{DEVICE_ALL, DEVICE_MAX_LOG_SIZE, DeviceShape, device_chips_of_mask};
 use vos_pvm_proof::format::{DEVICE_PROOF, DEVICE_REFERENCE, FormatParams, lookup};
 use vos_pvm_proof::framework_access::MAX_RELATION_WIDTH;
 use vos_pvm_proof::masked::{DeviceComponents, drive_masked_device_chip};
 use vos_pvm_proof::security::{SecurityShape, proven_count, security_bits};
-use vos_pvm_recair::masked::device::{device_floors, device_reveals};
 use vos_pvm_recair_air::masking::{
     BlindRelation, MaskedComponent, MaskedComponents, air_log_size, committed_log_sizes,
     composition_log_degree_bound, sample_points,

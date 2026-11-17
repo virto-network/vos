@@ -1,5 +1,5 @@
 //! Fuzz target: arbitrary bytes through the device verifier
-//! (`vos_pvm_recair::device::Verifier::verify`), the call ingress makes on
+//! (`vos_pvm_device::Verifier::verify`), the call ingress makes on
 //! an executor: the input's first 32 bytes the io-hash, the rest the
 //! proof, under one small kernel's program. Seeded with an honest proof of
 //! it (`cargo run --example seed`).
@@ -13,7 +13,7 @@
 use std::sync::OnceLock;
 
 use libfuzzer_sys::fuzz_target;
-use vos_pvm_recair::device::{decode, encode, Verifier, FORMAT};
+use vos_pvm_device::{decode, encode, Verifier, FORMAT};
 
 #[path = "device_program.rs"]
 mod device_program;

@@ -7,9 +7,10 @@ use vos_pvm_proof::format::Format;
 
 use super::Hasher;
 use super::verify::{Masked, Verifier, encode, masked, program_id, verify};
-use crate::masked::device::{DeviceProgram, DeviceProof, DeviceProver, device_shape};
-use crate::masked::{MaskRng, MaskStats, MaskedProof};
-use crate::prove::ProveError;
+use vos_pvm_recair::ProveError;
+use vos_pvm_recair::masked::{MaskRng, MaskStats, MaskedProof};
+
+use crate::masked::{DeviceProgram, DeviceProof, DeviceProver, device_shape};
 
 /// The most gas a device kernel's run is traced with, 2^18: a step a unit,
 /// a Poseidon2 call 3,000, so the most steps the device format's CPU holds,

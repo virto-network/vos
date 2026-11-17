@@ -1,13 +1,13 @@
 //! Device programs as ingress and a device take them
-//! (`vos_pvm_recair::device`): a program's id, a proof's bytes, and
+//! (`vos_pvm_device`): a program's id, a proof's bytes, and
 //! a run past the program's log sizes refused by the prover, under the
 //! device format itself.
 
 use vos_pvm_compiler::assembler::{Assembler, Reg};
+use vos_pvm_device::{FORMAT, MAX_PROOF_BYTES, Program, decode, encode, program_id};
 use vos_pvm_final_verifier::Error;
 use vos_pvm_proof::core::ecall::ECALL_WITNESS_INPUT;
 use vos_pvm_recair::ProveError;
-use vos_pvm_recair::device::{FORMAT, MAX_PROOF_BYTES, Program, decode, encode, program_id};
 use vos_pvm_recair::masked::MaskRng;
 
 use crate::support::{blob, io_and_halt, io_bytes, witness};
@@ -170,11 +170,11 @@ fn a_proof_whose_interaction_pow_fails_is_refused_before_its_decode() {
     // byte of the leading fields flipped, each verified both ways.
     let full = |io: &[u8; 32], bytes: &[u8]| {
         decode(&FORMAT, bytes).is_ok_and(|decoded| {
-            let proof = vos_pvm_recair::masked::device::DeviceProof {
+            let proof = vos_pvm_device::masked::DeviceProof {
                 io: *io,
                 proof: decoded,
             };
-            vos_pvm_recair::masked::device::verify_device::<
+            vos_pvm_device::masked::verify_device::<
                 stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel,
             >(&FORMAT, program.program(), &proof)
             .is_ok()
@@ -195,8 +195,8 @@ fn a_proof_whose_interaction_pow_fails_is_refused_before_its_decode() {
 /// refuses the other's as `Format` before any decode.
 #[test]
 fn a_proof_of_one_device_format_is_refused_under_the_other() {
-    let previous = vos_pvm_recair::device::format(48).expect("48 is proved");
-    assert_eq!(vos_pvm_recair::device::FORMATS[0], FORMAT);
+    let previous = vos_pvm_device::format(48).expect("48 is proved");
+    assert_eq!(vos_pvm_device::FORMATS[0], FORMAT);
     let current = Program::install(&FORMAT, &blob(), &witness(1), 0).expect("installs");
     let other_format = Program::install(previous, &blob(), &witness(1), 0).expect("installs");
     assert_eq!(

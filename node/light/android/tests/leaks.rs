@@ -43,11 +43,14 @@ static FOUND: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
 static FIRST: [OnceLock<String>; 8] = [const { OnceLock::new() }; 8];
 static PROVER: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
 
-/// Whether a free's backtrace is the device prover's (`vos-pvm-recair`'s
-/// `device`): a frame of its crate, or, since an inlined frame names its
-/// function alone, a frame in its source files.
+/// Whether a free's backtrace is the device prover's (`vos-pvm-device`,
+/// on `vos-pvm-recair`'s masked prover): a frame of either crate, or, since
+/// an inlined frame names its function alone, a frame in their source
+/// files.
 fn by_the_prover(trace: &str) -> bool {
-    trace.contains("vos_pvm_recair::") || trace.contains("pvm/proof/recair/src/")
+    ["vos_pvm_device::", "pvm/proof/device/src/", "vos_pvm_recair::", "pvm/proof/recair/src/"]
+        .iter()
+        .any(|frame| trace.contains(frame))
 }
 
 static ARMED: AtomicBool = AtomicBool::new(false);

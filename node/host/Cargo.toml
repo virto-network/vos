@@ -59,7 +59,7 @@ vos-node-prover = { workspace = true }
 vos-wire = { workspace = true }
 # A device proof's program, computed from its installed kernel, and its
 # verifier.
-vos-pvm-recair = { workspace = true }
+vos-pvm-device = { workspace = true }
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc", "ring"] }
 
 [dev-dependencies]
@@ -72,8 +72,11 @@ vos-keeper = { path = "../../tools/keeper" }
 # and the release build of its device programs.
 vos-light = { workspace = true, features = ["release"] }
 # A second device format beside the release's, the format window's tests'
-# (`device::TEST_FORMAT`): a dev edge, no production build has it.
-vos-pvm-recair = { workspace = true, features = ["test-device-format"] }
+# (`vos_pvm_device::TEST_FORMAT`): a dev edge, no production build has it.
+vos-pvm-device = { workspace = true, features = ["test-device-format"] }
+# The masked prover's drawn randomness, which the carrier audit searches
+# for.
+vos-pvm-recair = { workspace = true }
 # A kernel run alone, as an attest runs it.
 vos-testkit = { path = "../../agent/testkit" }
 proptest = "1"

@@ -13,7 +13,7 @@ release = ["dep:vos-pvm-compiler"]
 # The prover's seeded masks (`Prover::seeded`), so a proof's bytes are any
 # machine's: the phone bench's seeded build alone. A test seam: no
 # production build enables it (`just check-no-seeded-masks`).
-seeded-masks = ["vos-pvm-recair/seeded-masks"]
+seeded-masks = ["vos-pvm-device/seeded-masks"]
 # The client over arti (`tor`): one `TorClient`, `vos-api` over SSH over a
 # space's onion, a connection a purpose. One arti version a release,
 # pinned exactly as the gateway's; built with `--ignore-rust-version`, as
@@ -40,7 +40,7 @@ vos-exec = { workspace = true }
 vos-pvm = { workspace = true }
 vos-pvm-compiler = { workspace = true, optional = true }
 # The device kernels' programs, their masked prover and verifier.
-vos-pvm-recair = { workspace = true }
+vos-pvm-device = { workspace = true }
 # The tags, the compression, the tree and the node API's types and kinds;
 # the work an agent program runs, and its apply.
 vos-wire = { workspace = true }

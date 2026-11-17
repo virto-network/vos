@@ -13,8 +13,8 @@ use vos_pvm_proof::framework_access::AllLookupElements;
 use vos_pvm_proof::masked::{DeviceComponents, device_bound_sums, device_public_values};
 use vos_pvm_recair_air::masking::MaskedComponents;
 
-use super::super::{Reveal, mask_rows, reveals, verifier_format};
 use super::{DeviceProgram, DeviceProof};
+use vos_pvm_recair::masked::{Reveal, mask_rows, reveals, verifier_format};
 
 /// Each of the chips `active` names padded to four times its `h` under
 /// `format` ([`mask_rows`]), in `DEVICE_ORDER`: the least log sizes a

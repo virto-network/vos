@@ -19,6 +19,10 @@ use stwo::prover::ProvingError;
 use stwo::prover::backend::BackendForChannel;
 use stwo::prover::backend::simd::SimdBackend;
 use vos_pvm_compiler::assembler::{Assembler, Reg};
+use vos_pvm_device::masked::{
+    DeviceProgram, DeviceProver, device_format, device_shape, install, prove_device,
+    prove_device_forced, verify_device,
+};
 use vos_pvm_final_verifier::Error;
 use vos_pvm_final_verifier::masking::{Claim, verify_masked};
 use vos_pvm_proof::AirColumn;
@@ -33,10 +37,6 @@ use vos_pvm_proof::poseidon2::P2MerkleChannel;
 use vos_pvm_proof::segment::SegmentCursor;
 use vos_pvm_proof::side_note::SideNote;
 use vos_pvm_recair::ProveError;
-use vos_pvm_recair::masked::device::{
-    DeviceProgram, DeviceProver, device_format, device_shape, install, prove_device,
-    prove_device_forced, verify_device,
-};
 use vos_pvm_recair::masked::{Checks, MaskRng};
 use vos_pvm_recair_air::masking::MaskedComponents;
 
@@ -218,9 +218,8 @@ fn a_program_outside_the_formats_count_is_refused() {
     let mut tall = honest.clone();
     tall.log_sizes[0] = DEVICE_MAX_LOG_SIZE + 1;
     let mut short = honest.clone();
-    short.log_sizes[0] = vos_pvm_recair::masked::device::device_floors(&format, honest.shape())
-        .expect("floors")[0]
-        - 1;
+    short.log_sizes[0] =
+        vos_pvm_device::masked::device_floors(&format, honest.shape()).expect("floors")[0] - 1;
     assert!(install::<P2>(&format, &blob(), tall.active, &tall.log_sizes).is_err());
     for program in [&tall, &short] {
         assert!(matches!(

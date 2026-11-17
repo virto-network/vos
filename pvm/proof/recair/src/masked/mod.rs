@@ -36,7 +36,6 @@
 //! whose set is [`WrapComponents`].
 
 mod commit;
-pub mod device;
 mod drawn;
 mod layout;
 mod rank;
@@ -74,6 +73,7 @@ use stwo::prover::{
 use stwo_constraint_framework::Relation;
 use vos_pvm_final_verifier::masking::{MaskedFormat, shape_of};
 use vos_pvm_proof::format::{Format, Masking};
+use vos_pvm_proof::masked::DeviceComponents;
 use vos_pvm_proof::proof::mix_statement_header;
 use vos_pvm_recair_air::masking::{
     self as air, BLIND_COLUMNS, BlindRelation, MASKED_COLUMN_EXPANSION,
@@ -213,6 +213,14 @@ pub trait MaskedProvers: MaskedComponents {
 impl MaskedProvers for WrapComponents {
     fn provers(&self) -> Vec<&dyn ComponentProver<SimdBackend>> {
         vec![&self.p2, &self.qm31, &self.h8]
+    }
+}
+
+/// The device's masked chip set (`vos_pvm_proof::masked`), which
+/// `vos-pvm-device` proves.
+impl MaskedProvers for DeviceComponents {
+    fn provers(&self) -> Vec<&dyn ComponentProver<SimdBackend>> {
+        DeviceComponents::provers(self)
     }
 }
 
@@ -400,7 +408,7 @@ pub(crate) fn prove_masked_checked<MC: MerkleChannel, C: MaskedProvers>(
 where
     SimdBackend: BackendForChannel<MC>,
 {
-    prove_masked_program::<MC, C>(format, &[], trace, None, rng, checks)
+    prove_masked_held::<MC, C>(format, &[], trace, None, rng, checks)
 }
 
 /// What every proof of one program shares, computed once: the twiddles
@@ -421,11 +429,7 @@ where
 {
     /// The preprocessed columns of components of `log_sizes`, committed
     /// under `format`. `None` when a log size overflows.
-    pub(crate) fn new(
-        format: &Format,
-        log_sizes: &[u32],
-        preprocessed: Evaluations,
-    ) -> Option<Self> {
+    pub fn new(format: &Format, log_sizes: &[u32], preprocessed: Evaluations) -> Option<Self> {
         let lifting = lifting_log_size(format, log_sizes)?;
         let twiddles =
             SimdBackend::precompute_twiddles(CanonicCoset::new(lifting).circle_domain().half_coset);
@@ -457,11 +461,44 @@ where
     Committed(&'a CommitmentTreeProver<SimdBackend, MC>),
 }
 
-/// [`prove_masked_checked`] of `program`, words the transcript mixes right
-/// after the header (`MaskedFormat::program`); its preprocessed tree
+/// [`prove_masked`] of `program`, words the transcript mixes right after
+/// the header (`MaskedFormat::program`); its preprocessed tree
 /// `committed`'s when given, which must be the trace's columns committed
-/// under `format` (`trace.preprocessed` is then not read).
-pub(crate) fn prove_masked_program<MC: MerkleChannel, C: MaskedProvers>(
+/// under `format` (`trace.preprocessed` is then not read): a device
+/// program's proofs.
+pub fn prove_masked_program<MC: MerkleChannel, C: MaskedProvers>(
+    format: &Format,
+    program: &[u64],
+    trace: MaskedTrace<'_, C::Relations, C::Active>,
+    committed: Option<&Committed<MC>>,
+    rng: MaskRng,
+) -> Result<(MaskedProof<MC::H>, MaskStats), ProveError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    prove_masked_held::<MC, C>(format, program, trace, committed, rng, Checks::ALL)
+}
+
+/// [`prove_masked_program`] held to `checks` alone: the forgery gates'
+/// forced proofs. Only the tests' dev edge has it (`seeded-masks`).
+#[cfg(feature = "seeded-masks")]
+pub fn prove_masked_program_forced<MC: MerkleChannel, C: MaskedProvers>(
+    format: &Format,
+    program: &[u64],
+    trace: MaskedTrace<'_, C::Relations, C::Active>,
+    committed: Option<&Committed<MC>>,
+    rng: MaskRng,
+    checks: Checks,
+) -> Result<(MaskedProof<MC::H>, MaskStats), ProveError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    prove_masked_held::<MC, C>(format, program, trace, committed, rng, checks)
+}
+
+/// [`prove_masked_checked`] of `program`, its preprocessed tree
+/// `committed`'s when given ([`prove_masked_program`]).
+fn prove_masked_held<MC: MerkleChannel, C: MaskedProvers>(
     format: &Format,
     program: &[u64],
     trace: MaskedTrace<'_, C::Relations, C::Active>,

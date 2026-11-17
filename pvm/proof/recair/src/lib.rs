@@ -20,12 +20,11 @@
 //! - [`masked`] is the masked prover (masking variant (c)), over any component
 //!   set and Merkle channel: the masks, salts, blinding and FRI mask in the
 //!   masked transcript's order, R1 checked on the transcript, the randomness
-//!   hedged.
-//! - [`device`] is a device kernel's program and proof under the device
-//!   format, on the Blake2s-M31 channel.
+//!   hedged; the masked wrap's and, through `vos-pvm-device`, a device
+//!   kernel's.
 //!
-//! Behind the `recursion` feature, on by default (a device builds without
-//! it):
+//! Behind the `recursion` feature, on by default (`vos-pvm-device` builds
+//! the crate without it):
 //!
 //! - [`leaf`] is a kernel leaf: a segment verified, its boundary states
 //!   digested and flagged, and the node output it states.
@@ -40,7 +39,6 @@
 pub mod circuit;
 pub mod compile;
 pub mod context;
-pub mod device;
 #[cfg(feature = "recursion")]
 pub mod fold;
 pub mod gadgets;

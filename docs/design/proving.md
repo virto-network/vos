@@ -691,7 +691,7 @@ last for decades.**
   (DeviceIoChip's) stays unblinded; the fixed tables pad by
   repeating their entries with no multiplicity; every chip pads to four
   times its `h`. The device shape proves them masked against its program
-  (`vos_pvm_recair::masked::device`): the program's chips mixed after the
+  (`vos_pvm_device::masked`): the program's chips mixed after the
   header, its log sizes pinned, the io-hash the one public sum. Node
   segment, leaf and fold proofs stay unmasked, in the prover role, as the
   witness rows do.
@@ -1331,7 +1331,7 @@ reporting every window (§7).
   permutation [measured, 2026-10-26], as it does BLAKE2b.
 
 **2. The device profile** [built: `vos_pvm_proof::device`,
-`vos_pvm_recair::device`]. The general zkVM runs on
+`vos_pvm_device`]. The general zkVM runs on
 phones, for any device kernel. It proves one segment with no page-Merkle
 boundary, over the shared chip set (§3.2) and four chips of its own
 (DeviceMemoryChip, a row a byte the run touches, its region and first
@@ -1405,7 +1405,7 @@ same statement under BLAKE2b's io-hash [measured, Fairphone 6,
   words that `C` compresses in place. The kernel's end absorbs its `E`
   where it wrote it; the testkit checks a device return with
   `compute_device_io_hash`; ingress computes it from the request's claim
-  (`vos_pvm_recair::device::claim_io`). In a kernel the lane's call is `0x402` issued
+  (`vos_pvm_device::claim_io`). In a kernel the lane's call is `0x402` issued
   directly (`Poseidon2Call`, which traps where no host serves it, as the
   lean kernel's own calls do), never `poseidon2_compress_into`, which
   would link the software permutation.
@@ -1584,7 +1584,7 @@ and 100 conjectured [model]:
   counted on its masked reference, where (c)'s lifted composition costs
   bits against the unmasked count.
 
-**The device program** [built, `vos_pvm_recair::device`; decided]:
+**The device program** [built, `vos_pvm_device`; decided]:
 what a device proof is verified against, computed from the kernel alone,
 never taken from a request. Its chips are those the kernel's code reaches
 (`device_chips_of_code`); its log sizes are those a reference run needs,

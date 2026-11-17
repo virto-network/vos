@@ -7,11 +7,11 @@ use stwo::core::channel::MerkleChannel;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 use vos_pvm::instruction::Opcode;
 use vos_pvm_compiler::assembler::{Assembler, Reg};
+use vos_pvm_device::masked::{DeviceProgram, prove_device_forced, verify_device};
+use vos_pvm_device::program_id;
 use vos_pvm_proof::chips::CpuColumns;
 use vos_pvm_proof::core::ecall::{ECALL_POSEIDON2, ECALL_WITNESS_INPUT};
 use vos_pvm_proof::format::{ChannelKind, Format};
-use vos_pvm_recair::device::program_id;
-use vos_pvm_recair::masked::device::{DeviceProgram, prove_device_forced, verify_device};
 use vos_pvm_recair::masked::{Checks, MaskRng};
 
 use crate::support::{

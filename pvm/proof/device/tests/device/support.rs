@@ -8,6 +8,9 @@ use stwo::core::pcs::DeepBatching;
 use stwo::prover::backend::BackendForChannel;
 use stwo::prover::backend::simd::SimdBackend;
 use vos_pvm_compiler::assembler::{Assembler, Reg};
+use vos_pvm_device::masked::{
+    DeviceProgram, DeviceProof, device_shape, install, prove_device, verify_device,
+};
 use vos_pvm_final_verifier::Error;
 use vos_pvm_proof::core::ecall::{ECALL_POSEIDON2, ECALL_WITNESS_INPUT};
 use vos_pvm_proof::format::{ChannelKind, Format, FormatParams, Masking, SEGMENT};
@@ -16,9 +19,6 @@ use vos_pvm_proof::side_note::SideNote;
 use vos_pvm_recair::ProveError;
 use vos_pvm_recair::masked::MaskRng;
 use vos_pvm_recair::masked::MaskStats;
-use vos_pvm_recair::masked::device::{
-    DeviceProgram, DeviceProof, device_shape, install, prove_device, verify_device,
-};
 
 /// The kernel's io-hash words, φ9..12: its one public output, the same for
 /// every witness.

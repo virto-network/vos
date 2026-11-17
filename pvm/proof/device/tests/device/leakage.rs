@@ -43,7 +43,7 @@ use vos_pvm_proof::proof::mix_statement_header;
 use vos_pvm_recair::masked::MaskRng;
 use vos_pvm_recair_air::masking::MaskedComponents;
 
-use crate::common::leakage::{
+use crate::statistics::{
     Fields, Key, Kind, Verdicts, indistinguishable, leaked, published, uniform,
 };
 use crate::support::{
@@ -59,7 +59,7 @@ fn n() -> usize {
     #[cfg(feature = "heavy-gates")]
     {
         static N: OnceLock<usize> = OnceLock::new();
-        *N.get_or_init(|| crate::common::leakage::heavy_n("LEAKAGE_SEGMENT_N", MEDIUM))
+        *N.get_or_init(|| crate::statistics::heavy_n("LEAKAGE_SEGMENT_N", MEDIUM))
     }
     #[cfg(not(feature = "heavy-gates"))]
     {
@@ -130,7 +130,7 @@ fn the_published_values_do_not_depend_on_the_witness() {
 #[cfg(feature = "heavy-gates")]
 #[test]
 fn heavy_the_device_formats_proofs_do_not_depend_on_the_witness() {
-    witness_independent(&vos_pvm_recair::device::FORMAT);
+    witness_independent(&vos_pvm_device::FORMAT);
 }
 
 /// [`heavy_the_device_formats_proofs_do_not_depend_on_the_witness`] at

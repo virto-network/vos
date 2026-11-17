@@ -494,7 +494,7 @@ fn every_ingress_refusal_comes_in_its_check_order() {
     let mut call = Credentialed {
         method: founded.method(POLL, "tally"),
         format: 38,
-        proof: vec![7; vos_pvm_recair::device::MAX_PROOF_BYTES + 1],
+        proof: vec![7; vos_pvm_device::MAX_PROOF_BYTES + 1],
         expires_ms: real.expires_ms + 600_000,
         claim: vec![1; vos_wire::abi::cap::CLAIM + 1],
         arguments: vec![0; vos_wire::abi::cap::REQUEST - vos_wire::abi::cap::CLAIM + 1],
@@ -584,11 +584,9 @@ fn every_ingress_refusal_comes_in_its_check_order() {
     assert_eq!(refused(founded.send(at, &again)), CredentialRefusal::Once);
     // A proof with a wrong PoW: refused as any proof that fails.
     let mut wrong = founded.auth(at, &secret, &founded.path(&secret), ("login", "login"), ());
-    let mut decoded =
-        vos_pvm_recair::device::decode(&vos_pvm_recair::device::FORMAT, &wrong.proof).unwrap();
+    let mut decoded = vos_pvm_device::decode(&vos_pvm_device::FORMAT, &wrong.proof).unwrap();
     decoded.stark_proof.0.proof_of_work ^= 1;
-    wrong.proof =
-        vos_pvm_recair::device::encode(&vos_pvm_recair::device::FORMAT, &decoded).unwrap();
+    wrong.proof = vos_pvm_device::encode(&vos_pvm_device::FORMAT, &decoded).unwrap();
     assert_eq!(refused(founded.send(at, &wrong)), CredentialRefusal::Proof);
     // No log entry holds a proof's bytes.
     let node = founded.cluster.node(at).unwrap();
@@ -1271,7 +1269,7 @@ const DEVICE: InstanceId = InstanceId(4);
 /// The hand-lean `auth` kernel's claim (the `device` actor's): its kind
 /// byte, then the four digests.
 fn device_claim(root: &Digest, scope: &Digest, nullifier: &Digest, binding: &Digest) -> Vec<u8> {
-    vos_pvm_recair::device::auth_public(root, scope, nullifier, binding).to_vec()
+    vos_pvm_device::auth_public(root, scope, nullifier, binding).to_vec()
 }
 
 /// An actor's own kernel's proof (`#[msg(proven = auth)]`, the `device`
@@ -1335,8 +1333,7 @@ fn an_actor_kernels_proof_is_checked_by_its_handler_at_apply() {
             .0
             .map(|sibling| tree::words(&sibling).unwrap());
         let public = claim.clone().try_into().expect("auth's public bytes");
-        let arguments =
-            vos_pvm_recair::device::auth_arguments(&siblings, &words, path.slot, &public);
+        let arguments = vos_pvm_device::auth_arguments(&siblings, &words, path.slot, &public);
         let proof = founded
             .prover
             .prove_kernel(program, &arguments)
@@ -1748,7 +1745,7 @@ fn the_previous_device_format_is_admitted_until_it_is_retired() {
     use vos_light::wire::{self, Answer};
     use vos_light::{DeviceError, Proven};
 
-    let previous = vos_pvm_recair::device::TEST_FORMAT.number;
+    let previous = vos_pvm_device::TEST_FORMAT.number;
     assert_eq!((DEVICE_FORMAT, previous), (47, 48));
     let founded = Founded::new();
     let auth = founded.method(CREDENTIALS, "auth");
@@ -1924,7 +1921,7 @@ fn the_previous_device_format_is_admitted_until_it_is_retired() {
 /// runs nowhere.
 #[test]
 fn a_format_the_release_does_not_admit_is_refused_at_apply() {
-    let previous = vos_pvm_recair::device::TEST_FORMAT.number;
+    let previous = vos_pvm_device::TEST_FORMAT.number;
     let founded = Founded::new();
     let auth = founded.method(CREDENTIALS, "auth");
     let elf = std::fs::read(program_elf("vos-credentials")).unwrap();

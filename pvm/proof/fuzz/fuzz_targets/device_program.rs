@@ -5,7 +5,7 @@
 
 use vos_pvm_compiler::assembler::{Assembler, Reg};
 use vos_pvm_proof::core::ecall::ECALL_WITNESS_INPUT;
-use vos_pvm_recair::device::{Program, FORMAT};
+use vos_pvm_device::{Program, FORMAT};
 
 /// The words the kernel leaves in φ9..12, its io-hash.
 const IO: [u32; 4] = [0x4433_2211, 0x0807_0605, 0x7f00_00ff, 0x1abc_def0];
