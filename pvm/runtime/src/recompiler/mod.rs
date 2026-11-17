@@ -267,12 +267,14 @@ pub(crate) fn prepare_external_entry(
 }
 
 /// Compile PVM code to native x86-64 without creating an execution context.
-/// Returns the compiled artifacts that can be stored in a CodeCap.
+/// Returns the compiled artifacts that can be stored in a CodeCap. Refused
+/// past [`crate::spi::MAX_CODE`] bytes of code.
 pub fn compile_code(
     code: &[u8],
     bitmask: &[u8],
     jump_table: &[u32],
 ) -> Result<CompiledCode, String> {
+    crate::spi::code_fits(code)?;
     let helpers = HelperFns {
         mem_read_u8: mem_read_u8 as *const () as u64,
         mem_read_u16: mem_read_u16 as *const () as u64,
@@ -292,7 +294,7 @@ pub fn compile_code(
         .collect();
 
     let compiler = Compiler::new(&block_starts, jump_table, helpers, code.len(), true);
-    let result = compiler.compile(code, bitmask);
+    let result = compiler.compile(code, bitmask)?;
     let dispatch_table = result.dispatch_table;
 
     let native_code = if let Some(mmap_ptr) = result.mmap_ptr {
@@ -677,6 +679,7 @@ impl RecompiledPvm {
         gas: Gas,
         data_layout: Option<DataLayout>,
     ) -> Result<Self, String> {
+        crate::spi::code_fits(code)?;
         let debug = debug_from_environment();
 
         // Gas blocks and validation are now computed inline during the compile loop.
@@ -763,7 +766,7 @@ impl RecompiledPvm {
             code.len(),
             true, // use mmap-backed assembler
         );
-        let compile_result = compiler.compile(code, &bitmask);
+        let compile_result = compiler.compile(code, &bitmask)?;
         let _t_compile = _t2.elapsed();
         let dispatch_table = compile_result.dispatch_table;
 
@@ -1283,6 +1286,51 @@ mod tests {
             rw_start: 0,
             rw_data: vec![],
         }
+    }
+
+    /// Each opcode, its arguments' bytes of several lengths and values,
+    /// compiles within its reservation ([`asm::INSTRUCTION`]): a compile
+    /// whose instruction overran it is refused.
+    #[test]
+    fn every_instruction_fits_its_reservation() {
+        for opcode in
+            (0..=u8::MAX).filter(|&byte| crate::instruction::Opcode::from_byte(byte).is_some())
+        {
+            for len in [0, 3, 8, 16, 24] {
+                for fill in [0x00, 0xff, 0x80, 0x7f, 0x5a] {
+                    let mut code = vec![opcode];
+                    code.extend(core::iter::repeat_n(fill, len));
+                    code.push(0);
+                    let mut bitmask = vec![0; code.len()];
+                    bitmask[0] = 1;
+                    bitmask[len + 1] = 1;
+                    compile_code(&code, &bitmask, &[]).unwrap_or_else(|error| {
+                        panic!("opcode {opcode}, {len} bytes of {fill:#x}: {error}")
+                    });
+                }
+            }
+        }
+    }
+
+    /// Code past [`crate::spi::MAX_CODE`] bytes is refused before any work,
+    /// on both backends and by validation.
+    #[test]
+    fn code_past_its_cap_is_refused_on_both_backends() {
+        let code = vec![0; crate::spi::MAX_CODE + 1];
+        let bitmask = vec![1; code.len()];
+        for backend in [
+            crate::backend::PvmBackend::ForceInterpreter,
+            crate::backend::PvmBackend::ForceRecompiler,
+        ] {
+            assert!(crate::backend::compile(&code, &bitmask, &[], backend).is_err());
+        }
+        assert!(compile_code(&code, &bitmask, &[]).is_err());
+        let blob = crate::spi::CodeBlob {
+            jump_table: Vec::new(),
+            code,
+            bitmask,
+        };
+        assert!(!crate::spi::validate_code_blob(&blob, 0));
     }
 
     #[test]

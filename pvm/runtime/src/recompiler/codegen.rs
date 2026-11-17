@@ -21,7 +21,7 @@
 //!
 //! Reserved: R15 = JitContext pointer, RDX = scratch, RSP = native stack.
 
-use super::asm::{Assembler, Cc, Label, Reg};
+use super::asm::{self, Assembler, Cc, Label, Reg};
 use crate::args::{self, Args};
 use crate::gas_sim::GasSimulator;
 use crate::instruction::Opcode;
@@ -235,11 +235,14 @@ impl Compiler {
 
     /// Compile directly from raw code+bitmask in one streaming traversal:
     /// gas block discovery + decode + gas sim + codegen in one loop.
-    pub fn compile(mut self, code: &[u8], bitmask: &[u8]) -> CompileResult {
+    /// Refused when the native code would pass what an `i32` offset
+    /// reaches, an instruction overruns its reservation, or the buffer
+    /// cannot grow.
+    pub fn compile(mut self, code: &[u8], bitmask: &[u8]) -> Result<CompileResult, String> {
         let code_len = code.len();
 
         // Emit prologue
-        self.emit_prologue();
+        self.emit_prologue()?;
 
         // No pre-scan: gas block starts (ϖ) are discovered
         // inline — PC=0 is always a gas block start, and after every terminator
@@ -264,7 +267,7 @@ impl Compiler {
         let code_ptr = code.as_ptr();
 
         while pc < code.len() {
-            self.asm.ensure_capacity(512);
+            self.asm.reserve(asm::INSTRUCTION)?;
 
             // Not an instruction start: execution can only arrive here by
             // falling through a skip capped at 24 into an argument-byte gap —
@@ -553,6 +556,9 @@ impl Compiler {
             pc += 1 + skip;
         }
 
+        // The trailing sentinel's code.
+        self.asm.reserve(asm::INSTRUCTION)?;
+
         // Finalize last gas block
         if let Some((stub_label, block_pc, cost_patch)) = pending_gas.take() {
             if !next_is_gas_start {
@@ -605,7 +611,8 @@ impl Compiler {
         self.emit_exit(EXIT_PANIC, 0);
 
         // Emit epilogue and exit sequences
-        self.emit_exit_sequences();
+        self.emit_exit_sequences()?;
+        self.asm.within_reservation()?;
 
         // Build dispatch table: PVM PC → native code offset. Entries default
         // to the panic stub: entering the program at a PC that is not a
@@ -643,7 +650,7 @@ impl Compiler {
                 // Wrap in a Vec that will munmap on drop (via NativeCode).
                 // We return a CompileResult with a dummy native_code — the caller
                 // should use native_mmap_ptr/len/cap instead.
-                CompileResult {
+                Ok(CompileResult {
                     native_code: Vec::new(), // not used when mmap_ptr is set
                     dispatch_table,
                     fault_resume_offsets,
@@ -655,9 +662,9 @@ impl Compiler {
                     mmap_ptr: Some(ptr),
                     mmap_len: code_len,
                     mmap_cap,
-                }
+                })
             }
-            Err(_) => CompileResult {
+            Err(_) => Ok(CompileResult {
                 native_code: self.asm.finalize(),
                 dispatch_table,
                 fault_resume_offsets,
@@ -669,7 +676,7 @@ impl Compiler {
                 mmap_ptr: None,
                 mmap_len: 0,
                 mmap_cap: 0,
-            },
+            }),
         }
     }
 
@@ -2655,8 +2662,8 @@ impl Compiler {
 
     /// Emit prologue: save callee-saved, load PVM registers from context,
     /// then dispatch to the correct basic block based on entry_pc.
-    fn emit_prologue(&mut self) {
-        self.asm.ensure_capacity(512); // prologue needs ~200 bytes
+    fn emit_prologue(&mut self) -> Result<(), String> {
+        self.asm.reserve(asm::INSTRUCTION)?; // prologue needs ~200 bytes
         // Save callee-saved registers
         self.asm.push(Reg::RBX);
         self.asm.push(Reg::RBP);
@@ -2710,14 +2717,15 @@ impl Compiler {
         // Jump to the dispatch target (pop into SCRATCH, then indirect jump)
         self.asm.pop(SCRATCH);
         self.asm.jmp_reg(SCRATCH);
+        Ok(())
     }
 
     /// Emit exit sequences and epilogue.
-    fn emit_exit_sequences(&mut self) {
+    fn emit_exit_sequences(&mut self) -> Result<(), String> {
         // Reserve capacity for exit sequences + all OOG stubs.
         // Each OOG stub is ~12 bytes.
-        let needed = 512 + self.oog_stubs.len() * 16;
-        self.asm.ensure_capacity(needed);
+        let needed = asm::INSTRUCTION + self.oog_stubs.len() * 16;
+        self.asm.reserve(needed)?;
         // Shared OOG handler that reads PC from SCRATCH — emitted BEFORE OOG
         // stubs so backward jumps from stubs can use jmp rel8 (2 bytes).
         self.asm.bind_label(self.oog_pc_label);
@@ -2764,6 +2772,7 @@ impl Compiler {
         self.asm.pop(Reg::RBP);
         self.asm.pop(Reg::RBX);
         self.asm.ret();
+        Ok(())
     }
 
     /// Get the memory read helper for a load opcode.
