@@ -146,7 +146,7 @@ impl BuiltInComponent for RegisterMemoryChip {
         // The ledger is sorted by (RegAddr, Ts0).  These constraints pin that
         // ordering and bind each read to the immediately-preceding same-reg
         // row, closing the read-consistency soundness gap (see
-        // docs/design/ledger-read-consistency.md).  All
+        // pvm/proof/docs/design/ledger-read-consistency.md).  All
         // constraints stay ≤ degree 2 (this chip can't raise
         // LOG_CONSTRAINT_DEGREE_BOUND), via the BothRealH / OrderValH helpers.
         let is_pad_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsPadding);

@@ -49,7 +49,7 @@ impl BuiltInProverComponent for RegisterMemoryChip {
         // access, which its place in its register's chain orders. A merged
         // row spanning several timestamps would need per-slot ordering and
         // a link to the next row, which the AIR has not
-        // (docs/design/ledger-read-consistency.md, (D)).
+        // (pvm/proof/docs/design/ledger-read-consistency.md, (D)).
         let num_rows_real = entries.len();
         let mut log_size = crate::trace::utils::ceil_log2_at_least_lanes(num_rows_real);
         // Guarantee ≥ 1 padding row so the cyclic last→row-0 wraparound is always
