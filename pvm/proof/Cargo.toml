@@ -92,7 +92,6 @@ vos-pvm-proof = { path = ".", features = ["chip-isolated"] }
 vos-pvm-compiler = { workspace = true }
 # The tests' heap handed back between proofs (`malloc_trim`).
 libc = "0.2"
-bincode = "1"
 # The segment fixtures' encoding.
 postcard = { version = "1", features = ["alloc"] }
 vos-pvm-proof-verifier = { workspace = true }

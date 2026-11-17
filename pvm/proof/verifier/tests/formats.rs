@@ -87,7 +87,7 @@ fn poseidon2_stark(proof: &mut Proof) -> &mut StarkProof<P2MerkleHasher> {
     P2MerkleChannel::stark_mut(&mut proof.stark_proof).expect("a Poseidon2-M31 proof")
 }
 
-/// Every admitted format proves, round-trips through bincode and postcard,
+/// Every admitted format proves, round-trips through postcard,
 /// and verifies with and without the side note, in one verifier build; its
 /// proof carries its format's channel and parameters.
 #[test]
@@ -100,15 +100,12 @@ fn every_admitted_format_round_trips() {
         let commitment = proof.preprocessed_commitment().unwrap();
         assert_eq!(commitment.channel(), format.channel);
 
-        let bincoded: Proof = bincode::deserialize(&bincode::serialize(proof).unwrap()).unwrap();
-        let posted: Proof = postcard::from_bytes(&postcard::to_allocvec(proof).unwrap()).unwrap();
-        for decoded in [bincoded, posted] {
-            assert_eq!(decoded.interaction_pow, proof.interaction_pow);
-            verify_standalone(decoded.clone(), commitment)
-                .unwrap_or_else(|error| panic!("format {}: {error}", format.number));
-            vos_pvm_proof::verify(decoded, side_note)
-                .unwrap_or_else(|error| panic!("format {}: {error}", format.number));
-        }
+        let decoded: Proof = postcard::from_bytes(&postcard::to_allocvec(proof).unwrap()).unwrap();
+        assert_eq!(decoded.interaction_pow, proof.interaction_pow);
+        verify_standalone(decoded.clone(), commitment)
+            .unwrap_or_else(|error| panic!("format {}: {error}", format.number));
+        vos_pvm_proof::verify(decoded, side_note)
+            .unwrap_or_else(|error| panic!("format {}: {error}", format.number));
     }
 }
 

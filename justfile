@@ -651,7 +651,15 @@ check-venue-rules:
     if ($found ++ $missing | is-not-empty) { error make { msg: "an anchor rule lives outside vos_anchor::venue, or a venue does not call it" } }; \
     print $"the venue rules live in vos_anchor::venue alone: ($sources | length) files searched, ($calls | length) calls found"
 
-# Every `check-no-*` gate below, each build resolved once.
+# Every `check-no-*` gate below, each build resolved once, and two more
+# of the table's: the model venue (`venue-model`: `vos-venue`'s `model`
+# and Kreivo's mock, `kreivo-mock`, on no normal or build edge of any
+# workspace member; `vos-statement`'s `model-judge` in neither the node,
+# the `vos` binary nor the JAM statements service's program, which the
+# development tools' harnesses link), and the guests' heap peak
+# (`heap-peak`: `vos-statement`'s and the JAM statements service's, a
+# measurement build's, in no workspace member's, the `vos` binary's with
+# the prover nor the venues' guests' builds).
 check-no-leaks: (_forbidden "tools" "venue-model" "seeded-masks" "debug-internals" "test-device-format" "store-dump" "heap-peak") _seeded-masks-unimplied _debug-names-absent
     print "no test seam, debug output, test device format, store dump, heap peak, model venue or development tool in a production build"
 
@@ -662,18 +670,6 @@ check-no-leaks: (_forbidden "tools" "venue-model" "seeded-masks" "debug-internal
 # holds a package under `tools/`, on a normal or build edge.
 check-no-tools: (_forbidden "tools")
     print "no development tool in the node"
-
-# A node carries no venue's client: `vos-venue`'s model venue (`model`)
-# reaches neither the `vos` binary, with or without the prover, nor
-# `vos-node`, on a normal or build edge (the tests enable it on dev
-# edges), and no normal or build edge of any workspace member enables it,
-# nor Kreivo's mock (`vos-kreivo`'s `kreivo-mock`). Neither the node, the
-# `vos` binary nor the JAM statements service's program links
-# `vos-statement`'s model venue either (`model-judge`: a judge whose pinned
-# program and state its input carries), which the development tools'
-# harnesses do.
-check-no-venue-model: (_forbidden "venue-model")
-    print "no model venue in the node"
 
 # The masked prover's test seams (`vos-pvm-recair`'s `seeded-masks`: the
 # seeded randomness `MaskRng::Seeded` and the forced proof
@@ -708,14 +704,6 @@ check-no-debug-internals: (_forbidden "debug-internals") _debug-names-absent
 # checker enables it, a dev edge of both).
 check-no-store-dump: (_forbidden "store-dump")
     print "no store dump in a production build"
-
-# The guests' heap peak (`vos-statement`'s and the JAM statements service's
-# `heap-peak`), a measurement build's, reaches no production build: no
-# normal or build edge of any workspace member, of the `vos` binary with
-# the prover, nor of the venues' guests (`final-verify` and the service's
-# program) enables it.
-check-no-heap-peak: (_forbidden "heap-peak")
-    print "no heap peak in a production build"
 
 # The builds without std. vos-raft and merkle-crdt (without its fjall store)
 # for an embedded target, on core and alloc alone, built from the

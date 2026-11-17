@@ -11,5 +11,4 @@ stwo = { workspace = true }
 [dev-dependencies]
 vos-pvm = { workspace = true }
 vos-pvm-proof = { path = ".." } # tests use the prover too
-bincode = "1"          # on-wire proof serialization (size measurement)
 postcard = { version = "1", features = ["alloc"] } # the settlement verifier's wire format

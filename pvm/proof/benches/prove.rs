@@ -125,7 +125,7 @@ mod imp {
         let proof = prove(&mut side_note).expect("proving failed");
         let prove_time = t1.elapsed();
 
-        let proof_kb = bincode::serialize(&proof).unwrap().len() as f64 / 1024.0;
+        let proof_kb = postcard::to_allocvec(&proof).unwrap().len() as f64 / 1024.0;
 
         let t2 = std::time::Instant::now();
         verify(proof, &side_note).expect("verification failed");
@@ -142,7 +142,7 @@ mod imp {
         eprintln!("=== LogSize={log_size} ({n_steps} steps) ===");
         let (proof, profile) = prove_profiled(&mut side_note).expect("proving failed");
         eprintln!("{profile}");
-        let proof_bytes = bincode::serialize(&proof).unwrap();
+        let proof_bytes = postcard::to_allocvec(&proof).unwrap();
         eprintln!(
             "Proof size: {} bytes ({:.1} KB)",
             proof_bytes.len(),
@@ -163,7 +163,7 @@ mod imp {
             match prove(&mut side_note) {
                 Ok(p) => {
                     let elapsed = t.elapsed();
-                    let kb = bincode::serialize(&p).unwrap().len() as f64 / 1024.0;
+                    let kb = postcard::to_allocvec(&p).unwrap().len() as f64 / 1024.0;
                     // Rough memory estimate: main + fft domain at constraint blowup 2^4.
                     let rows = 1u64 << log_size;
                     let fft_rows = rows * 16;
