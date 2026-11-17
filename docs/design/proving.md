@@ -376,32 +376,25 @@ attribution). Its full design is `recursion-air.md`.
 
 - **One wrap per statement,** a 1-to-1 node over the root. Its tallest
   component is 2^15 rows [model].
-- **Parameters** (format 28): blowup 64, 20 queries, PoW 26, interaction
-  PoW 8, fold step 3, a 2^6 last layer, and **affine DEEP batching** (an
-  independent coefficient a sampled value). That is 146 conjectured and 82
-  proven bits (82.6; 80 needs 19 queries) [model].
+- **Parameters** (format 39, masked under variant (c), A.4): blowup 32,
+  24 queries, PoW 26, interaction PoW 8, fold step 3, a 2^6 last layer,
+  and **affine DEEP batching** (an independent coefficient a sampled
+  value). That is 146 conjectured and 82 proven bits (82.70; 80 needs 23
+  queries) [model].
 - **Why affine batching:** Stwo batches the sampled values by powers of one
   coefficient, and that term's error is the values' count times a
-  proximity-gap error that grows with the blowup. At blowup 64 it caps the
-  proven count at 74.7 bits however many queries are taken, 18 or 20
-  [model]. The ways to 80 [model]:
-  - **affine DEEP batching** at blowup 64 and 19–20 queries, about 1.06×
-    the verifier's cost, a change to our fork for the wrap's format only
-    (recommended);
-  - **a 6-bit PoW in the batching phase** at blowup 64 and 20 queries, about
-    1.11×;
-  - **blowup 8 with 41 queries,** about 1.97×.
+  proximity-gap error that grows with the blowup. Batched by powers, the
+  masked wrap caps at 76.98 proven bits at blowup 32 and 74.48 at blowup
+  64 however many queries are taken; only blowup 8, with 41 queries,
+  reaches 80 [model].
 
-  **Chosen: affine batching,** the cheapest, built in our fork for the
-  configurations that ask for it (`PcsConfig::deep_batching`, its
-  `DIVERGENCE-012`) and off by default, so no other format's proofs
-  change. A proof does not carry its batching: a verifier takes it from
-  the format. The security tool counts its batching term as `ε_lin(k)`
-  (BCIKS20 Theorem 1.6), and its first FRI round as the fork folds it, by
-  `2^fold_step` with the circle fold in it (`DIVERGENCE-011`).
-- **Masked** as format 39 (variant (c), A.4): blowup 32, 24 queries, PoW
-  26, interaction PoW 8, fold step 3, a 2^6 last layer, affine DEEP
-  batching; 146 / 82 (82.70) [model]. Format 28 stays a test format.
+  **Chosen: affine batching,** built in our fork for the configurations
+  that ask for it (`PcsConfig::deep_batching`, its `DIVERGENCE-012`) and
+  off by default, so no other format's proofs change. A proof does not
+  carry its batching: a verifier takes it from the format. The security
+  tool counts its batching term as `ε_lin(k)` (BCIKS20 Theorem 1.6), and
+  its first FRI round as the fork folds it, by `2^fold_step` with the
+  circle fold in it (`DIVERGENCE-011`).
 - **The final channel** [decided]: Blake2b-256 Merkle trees and a
   Blake2b Fiat–Shamir transcript. This is new code in our Stwo fork.
   VOS's `0x400` serves a Blake2b compression and Kreivo's host
@@ -409,24 +402,11 @@ attribution). Its full design is `recursion-air.md`.
   0.8.0 has no hash host call), so a JAM verifier hashes in software. On
   Kreivo the host hash would shorten ref_time, but proof_size binds a
   block and length sets the fee.
-- **Cost:**
-  - about 85M JAM gas unmasked with Blake2b in software, and 64M through
-    VOS's `0x400` precompile [model];
-  - about 122 KB unmasked [model].
-- **Built** [measured, x86 dev machine, 2026-10-18], unmasked:
-  - **96.4M JAM gas** on the JAM-only host, Blake2b-256 in software: the
-    proof's postcard decode 16.0M of it, the verify 80.3M; a 469 KB PVM
-    program, a 339 KiB heap peak;
-  - **38.2M retired Wasm instructions** under the PVF's semantics (37.7M
-    the client's), 2.1 ms, a 292 KB blob;
-  - **122–125 KB** (the window kernel's 123,686 bytes);
-  - **5.45 s and a 2.5 GiB heap** to prove the window kernel's wrap.
-- **Built masked, format 39** [measured, x86 dev machine, 2026-10-19 and
+- **Built, format 39** [measured, x86 dev machine, 2026-10-19 and
   2026-10-24], its proof decoded from a fixed layout
   (`vos_pvm_final_verifier::masked`), never postcard:
   - **the window kernel's wrap:** 148,868 bytes, proved in 7.44 s under
-    load at a 3,627 MiB heap peak (format 28's in the same run: 4.55 s,
-    2,498 MiB, 122,085 bytes);
+    load at a 3,627 MiB heap peak;
   - **on the JAM-only host** (`final-verify.elf`, Blake2b-256 in
     software, the guests' allocator a bump over its arena): a `valid`
     fixture proof of 146,564 bytes in 79.3M gas, the decode 1.50M of it
@@ -506,11 +486,9 @@ pub struct Statement {
 - **Repeats:** a venue refuses a statement id it has seen. A kernel whose
   legitimate statements can repeat carries a nonce in `public_args`.
   A venue keys on the statement id, never on the proof's bytes or their
-  hash: postcard's varints need not be minimal, so one proof has many
-  encodings, and many proofs state one statement.
+  hash: many proofs state one statement.
 - **The venue's check** (`vos_statement::judge`), in order: the format
-  (one the venue accepts and the build links: 39, and 28 only under
-  `test-formats`, which no production build enables); the statement's
+  (one the venue accepts and the build links: 39); the statement's
   program against the venue's
   pins; the space, at least one root and every root the statement's; every
   root anchored (`vos_anchor::venue::anchored`: the space active at the
@@ -578,10 +556,8 @@ pub struct Statement {
     can depend on it; its `model` is a venue as plain data, which the
     fixtures are judged against, and its JAM refine program
     (`final-verify.elf`) the harness's on the JAM-only host, which judges
-    the fixtures and accepts nothing without a proof; its test build
-    (`final-verify-test.elf`) links format 28 beside 39 and alone computes
-    the anchor vectors (its `ANCHORS` mode, no proof read). Neither is
-    deployed as a venue; the JAM venue is the statements service;
+    the fixtures and accepts nothing without a proof. It is not deployed
+    as a venue; the JAM venue is the statements service;
   - `statement/service` (`vos-statement-service`): the JAM statements
     service (§6), its refine and accumulate over `vos-statement`, built
     as a JAM program (`statement-service.elf`);
@@ -624,8 +600,7 @@ last for decades.**
 | segment proofs (format 41) | ≥ 100 / ≥ 60 | blowup 4 (log 2), 40 queries, PoW 24, plus interaction PoW 8; FRI fold step 1, log last-layer degree bound 0 | 104 / 62 (62.81) |
 | leaf and fold proofs (32) | ≥ 100 / ≥ 60 | blowup 4, 44 queries, PoW 20, plus interaction PoW 8; fold step 1, last layer 2^0 | 108 / 63 |
 | device proofs (47, and 46 while its code lives; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | blowup 4, 47 queries, PoW 16, interaction PoW 8; variant (c), `h = 256` (§8, "The device parameters") | 110 / 62 (62.82, each) |
-| the final wrap, unmasked (28; tests only) | ≥ 100 / ≥ 80 | blowup 64 (log 6), 20 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching (§3.5) | 146 / 82 (82.60) |
-| the final wrap, masked (39) | ≥ 100 / ≥ 80 | blowup 32 (log 5), 24 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching; variant (c) | 146 / 82 (82.70) |
+| the final wrap, masked (39) | ≥ 100 / ≥ 80 | blowup 32 (log 5), 24 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching (§3.5); variant (c) | 146 / 82 (82.70) |
 
 - **The counts** are the security tool's (`pvm/proof/src/security.rs`) at
   each format's reference shape [model], pinned by the format tests.
@@ -1987,15 +1962,14 @@ counts as conjectured / proven at the reference shape [model]:
 |---|---|---|---|---|---|---|
 | 41 | segments | Poseidon2-M31 | 2, 40, 24, 1, 0, 8 | 100 / 60 | 104 / 62 | admitted |
 | 32 | leaf and fold (one padded shape) | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 63 | reserved |
-| 28 | the final wrap, unmasked (tests only) | Blake2b-256 | 6, 20, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 | admitted |
-| 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 5, 24, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 | admitted; the one production venues accept |
+| 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 5, 24, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 | admitted: the final format |
 | 46 | device proofs, masked (variant (c)), `h = 256`, the full CPU and the byte ledger | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 (62.82), on its masked shape | registered and verifiable; a node admits it only where configured (its byte ledger unsound, `open.md`) |
 | 47 | device proofs, masked (variant (c)), `h = 256`, the per-program CPU and the word ledger | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 (62.82), on its masked shape | admitted: the device format |
 
 - **A number names one AIR and one set of parameters,** and is never
   reused: every number not in the table is refused. 38 is held by no
-  format; the tests use it as "a number no format holds". 44 is never
-  reused.
+  format; the tests use it as "a number no format holds". 28 (an unmasked
+  wrap the tests once took) and 44 are never reused.
 - **Each entry** holds its channel, its parameters, the DEEP batching its
   proven floor assumes and both bit counts.
 - **Every entry uses A.3's encodings** and exactly its parameters.
@@ -2006,18 +1980,14 @@ counts as conjectured / proven at the reference shape [model]:
   62.74, their batching term binding.
 - **41, 46 and 47 name the segment AIR,** hardened, without the columns and
   next-row masks no constraint reads (§3.2), its chip set shared by the
-  node's segments and the device shape; 28, 32 and 39 prove the
+  node's segments and the device shape; 32 and 39 prove the
   recursion AIR, 32's leaves verifying the segment AIR. A reserved entry is refused until its AIR and channel
   exist. 32's exist: `vos-pvm-recair` proves and verifies its proofs
   natively, and the registry
   refuses it, as no verifier outside the recursion reads a leaf or a fold.
-  28 and 39 are admitted: `vos-pvm-recair` proves the wrap and
-  `vos-pvm-final-verifier` verifies it, 39 by its fixed layout; 28 is
-  linked only under `test-formats`, which no production build enables
-  (`just check-no-test-formats`); a segment verifier takes only a segment
-  format.
-- **Masking takes its own number, 39,** not a bump of 28's, since a
-  number names one set of parameters.
+  39 is admitted: `vos-pvm-recair` proves the wrap masked and
+  `vos-pvm-final-verifier` verifies it by its fixed layout; a segment
+  verifier takes only a segment format.
 
 **A.5 What may leave the prover role:**
 - the `Statement`;
@@ -2102,42 +2072,37 @@ output; its `public_args` a venue's id and a nonce, which the io-hash
 binds and no venue reads apart) in three segments, folds them and wraps
 the root under format 39, masked from the seeded test seam
 (`MaskRng::Seeded`, so the bytes are its own every run: `wrap.proof`,
-148,612 bytes), and under 28 (`wrap-28.proof`, 123,797 bytes); and it
-wraps two roots that are not a whole run, as a cheating prover would, the
+148,612 bytes); and it wraps two roots that are not a whole run, as a cheating prover would, the
 wrap's checks failing (`wrap-prefix.proof`, `wrap-midway.proof`). The
 generator makes the same bytes in every build of the prover: a kernel's
 program id does not depend on the features a build turns on (the drawn
 relations are kept in the order drawn, never in `TypeId` order).
 
-The production venue accepts {39}, the test venue {28, 39}; each
-registers `S`'s space from window 40 and judges at window 42's boundary.
-25 cases (`statements.cases`, 15 KB), each a venue's state, a statement,
-a proof or a patch of one, and its verdict; each but the two accepted a
-replay of an accepted statement with one thing changed. Every verdict is
-the same natively (both formats linked), in Wasm (the production blob, 39
-alone, and the test blob; PVF and client; `just judge-wasm`) and on the
-JAM-only host (`final-verify.elf`, 39 alone, and `final-verify-test.elf`).
-A build linking 39 alone refuses a statement of 28 as `0x2`, its first
-check:
+The venue accepts {39}, registers `S`'s space from window 40 and judges
+at window 42's boundary. 20 cases (`statements.cases`), each a venue's
+state, a statement, a proof or a patch of one, and its verdict; each but
+the accepted one a replay of an accepted statement with one thing
+changed. Every verdict is the same natively, in Wasm (PVF and client;
+`just judge-wasm`) and on the JAM-only host (`final-verify.elf`):
 
-| case | verdict | JAM-only host, 39 alone [measured] |
+| case | verdict | JAM-only host [measured] |
 |---|---|---|
 | valid | accepted | 79.4M gas |
-| format 28 at the test venue | accepted (`0x2` where 28 is not linked) | test guest 76.2M |
-| tampered; tampered, format 28 at the test venue | `0x112` | 47.6M; test guest 52.8M |
+| tampered | `0x112` | 47.6M |
 | wrong program; wrong io-hash; the nonce; the roots' order; a root dropped | `0x108` | 11.0M |
 | prefix; mid-way | `0x109` | 11.1M |
-| unaccepted format (38); format 28 at a production venue | `0x2` | 0.1M |
+| unaccepted format (38) | `0x2` | 0.1M |
 | another program than the pin | `0x3` | 0.1M |
 | another space; the space; rootless; rooted, of no space | `0x4` | 0.1M |
 | unanchored root; a root's window; a root; replayed past MaxRootAge | `0x5` | 0.1M |
-| repeated; accepted under 39, replayed under 28; accepted under 28, replayed under 39 | `0x6` | 0.1M |
+| repeated | `0x6` | 0.1M |
 
 - **The id is the same at every venue,** and a refused proof's class is
   the first check it fails.
-- **A transition holds both ways:** the id leaves the format out, so `S`
-  accepted under one format is the same statement under the other,
-  refused as a repeat. Past `MaxRootAge` a replay is unanchored (its
+- **The id leaves the format out,** so a run wrapped under each of two
+  final formats a venue accepts during a transition is one statement,
+  refused the second time as a repeat (`vos-statement`'s
+  `every_field_is_bound`). Past `MaxRootAge` a replay is unanchored (its
   `Seen` entry and anchors dropped).
 - **Why `0x108` and `0x109`:** the words are mixed before the interaction
   PoW (8 bits), so a proof of other words fails there (`0x108`) with
@@ -2158,7 +2123,7 @@ under `systemd-run` with these caps as `MemoryMax`.
 | segment (the window kernel's) | its class | ≤ 24 GiB | ≤ 8 s |
 | leaf | ≤ the padded shape | ≤ 4 GiB | 1.2–2.6 s [projected]; ≤ 1× the segment's proving (target 0.13–0.5×) |
 | fold | the padded shape | ≤ 4 GiB; 942 MiB of heap [measured] | 1.2–2.6 s [projected]; ≤ the leaf's; 1.5 s [measured] |
-| wrap | ≤ 2^17; 2^14 / 2^15 / 2^11 [measured] | ≤ 8 GiB unmasked; a 2.5 GiB heap [measured]. 39: ≤ 8 GiB; a 3,627 MiB heap [measured] | 4.4–9.5 s [projected]; 5.45 s [measured]. 39: ≤ 15 s; 7.44–8.40 s under load [measured] |
+| wrap (39) | ≤ 2^17; 2^14 / 2^15 / 2^11 [measured] | ≤ 8 GiB; a 3,627 MiB heap [measured] | ≤ 15 s; 7.44–8.40 s under load [measured] |
 
 A window of 16 segments proves end to end in about 3–5 minutes
 [projected].

@@ -19,9 +19,6 @@ classes and proved to one final proof:
 |---|---|---|---|
 | 47 | a device proof, masked, under its program | `vos-pvm-recair` (`device::Program::prove`), on a phone through `vos-light` | `vos-pvm-recair`'s `device::Verifier`, run by `vos-node`'s ingress |
 
-28 (the wrap, unmasked) is the tests' and the fixtures' alone, behind
-`test-formats`, which no production build enables.
-
 | Package | Purpose |
 |---|---|
 | `vos-pvm-proof` | the segment AIR: trace, prove, the format registry, the device chips |

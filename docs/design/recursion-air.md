@@ -683,7 +683,7 @@ and fold layout of §1.1 is unchanged.
 | | value | tag |
 |---|---|---|
 | rows p2 / qm31 / h8 | 15,311 / 20,766 / 1,794 → 2^14 / 2^15 / 2^11, tallest **2^15** (≤ 2^17) | model |
-| own parameters | blowup 64, 20 queries, PoW 26, interaction PoW 8, fold step 3, last layer 2^6, Blake2b-256 Merkle and channel, affine DEEP batching for 80 proven bits (`proving.md` §3.5) | decided (format 28) |
+| own parameters | blowup 32, 24 queries, PoW 26, interaction PoW 8, fold step 3, last layer 2^6, Blake2b-256 Merkle and channel, affine DEEP batching for 80 proven bits, masked under variant (c) (`proving.md` §3.5) | decided (format 39) |
 | cells, extended cells | 7.5M, 481M | model |
 | memory, time | 2.2–4.9 GiB, 4.4–9.5 s unmasked [projected]; masked (format 39) as built: a 3.6 GiB heap [measured] | projected, measured |
 | JAM gas, unmasked | 81.1M with the model's Blake2s; **85.2M Blake2b-256 in software (×1.05); 64.1M through `0x400` (×0.79)** | model |
@@ -732,8 +732,7 @@ build-std. It holds:
 - the public logup sum from the program id, the io-hash, `u` and `one`;
 - the components built once, and a shape check before any Stwo call
   (`check_shape`, `check_samples`: the verifier must be panic-free,
-  `proving.md` §6); format 28 keeps postcard's decode (16.0M of its 96.4M
-  gas); format 39 decodes a fixed layout.
+  `proving.md` §6); format 39 decodes a fixed layout.
 
 **Built** [measured]: `verify(proof, words)` returns the
 program id and the io-hash the 24 words state. It checks the format, the
@@ -743,7 +742,7 @@ decommitments and queried values; every column's samples against the
 components' masks; every limb canonical), the preprocessed root against
 its constant, the header and the interaction PoW, then the logup sums with
 the 24 words' and `u`'s public terms, then Stwo's verifier, the components
-built once. **469 KB** as a PVM program, **292 KB** as a Wasm blob.
+built once.
 
 **The masked verifier, format 39** [measured]: it reads the proof's fixed
 layout and runs over Stwo's PCS (`CommitmentSchemeVerifier::{commit,
@@ -751,7 +750,7 @@ verify_values}`), never `core::verifier::verify`, whose composition split
 is hardcoded (DIVERGENCE-004); the two facts it leaves to Stwo are pinned
 by the format: the trees' widths (57 / 381 / 48 / 20) and the FRI round
 list (`[3, 3, 3, 2]`). `R` has 8 columns, so it needs no rank check. A
-production venue links 39 alone (391,784 bytes as a PVM program); the
+venue links it (391,784 bytes as a PVM program); the
 `valid` fixture verifies in 79.3M gas on the JAM-only host, its decode
 1.50M (`proving.md` §3.5).
 

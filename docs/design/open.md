@@ -79,7 +79,7 @@ The scale results are in `core-model.md` §14, "The scale test".
     table. Padding inside both ledgers is harmless (gates
     `memory_ledger_padding_gate::padding_between_the_ledgers_real_rows_is_harmless`
     and `register_ledger_gate::padding_between_the_ledgers_real_rows_is_harmless`).
-    28, 32 and 39 prove the recursion AIR, which has no memory argument.
+    32 and 39 prove the recursion AIR, which has no memory argument.
   - **Device 46: not consistent; retired behind 47.** `DeviceMemoryChip`
     lets a byte have as many rows as the prover puts (its address bits
     free, no ordering, `Last` and `ClosingTs` free), so a byte can have

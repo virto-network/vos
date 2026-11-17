@@ -224,16 +224,12 @@ VOS writes the kit; Kreivo vendors it whole and edits none of it.
     stay in VOS; `[lib] test = false`, so `cargo test --workspace` in
     Kreivo, which takes path dependencies under its root as members,
     builds none);
-  - **no `test-formats` feature:** format 28, the unmasked wrap, which no
-    production venue accepts, stays in VOS with the JAM program's
-    `pvm-guest`; its code compiles out of the kit, so no Kreivo build can
-    link it;
+  - **no `pvm-guest` feature:** the JAM program stays in VOS; its code
+    compiles out of the kit;
   - `fixtures/`: the golden fixtures, the final proofs and
     `statements.cases`, which `vos-statement`'s `fixtures` feature (std,
-    tests and benchmarks only) reads beside the crates. Its cases record
-    the verdicts of a build linking 28 and 39; the kit links 39 alone, so
-    a case of format 28 is refused as `Format` (2), as
-    `Fixture::verdict_linking` gives it;
+    tests and benchmarks only) reads beside the crates, each case with the
+    verdict every venue reaches;
   - `conformance/`: §10's vectors;
   - `vos_kit.py`, the vendoring and sync script;
   - `.gitattributes` (`* -text`), so a checkout converting line endings
