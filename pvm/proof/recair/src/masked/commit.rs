@@ -174,7 +174,7 @@ fn blinding(n_components: usize, public: &[usize], rng: &mut ChaCha20Rng) -> Vec
         .filter(|component| !public.contains(component))
         .collect();
     let drawn: Vec<SecureField> = (1..blinded.len())
-        .map(|_| SecureField::from_m31_array(core::array::from_fn(|_| rng.r#gen())))
+        .map(|_| SecureField::from_m31_array(core::array::from_fn(|_| salts::uniform_m31(rng))))
         .collect();
     let mut values = vec![SecureField::zero(); n_components];
     for (&component, &value) in blinded.iter().zip(&drawn) {

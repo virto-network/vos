@@ -58,16 +58,32 @@ impl MaskRng {
             #[cfg(feature = "seeded-masks")]
             Self::Seeded(seed) => entropy[..8].copy_from_slice(&seed.to_le_bytes()),
         }
-        let seed = Blake2b256::new()
+        let mut seed = [0u8; 32];
+        Blake2b256::new()
             .chain_update(SEED_DOMAIN)
             .chain_update(entropy)
             .chain_update(witness)
             .chain_update(attempt.to_le_bytes())
-            .finalize();
+            .finalize_into((&mut seed).into());
         super::drawn::note("an attempt's entropy", &entropy);
         super::drawn::note("an attempt's seed", &seed);
-        Ok(ChaCha20Rng::from_seed(seed.into()))
+        let rng = ChaCha20Rng::from_seed(seed);
+        wipe(&mut entropy);
+        wipe(&mut seed);
+        Ok(rng)
     }
+}
+
+/// `bytes` overwritten with zeros by volatile writes, which the compiler
+/// keeps though nothing reads them after: the attempt's entropy and seed
+/// arrays, once its stream is keyed. The stream holds its key until it is
+/// dropped, and the hasher's and the key's copies are not wiped.
+fn wipe(bytes: &mut [u8; 32]) {
+    for byte in bytes.iter_mut() {
+        // SAFETY: `byte` is a valid, aligned, exclusive reference.
+        unsafe { core::ptr::write_volatile(byte, 0) };
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
 
 /// What a masked proof states beside its columns: the hedge binds it.

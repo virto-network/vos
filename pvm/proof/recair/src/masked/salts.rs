@@ -21,9 +21,21 @@ use stwo::prover::{CommitmentSchemeProver, CommitmentTreeProver, Poly};
 /// Words a parallel chunk of a uniform column fills from its own stream.
 const CHUNK_WORDS: usize = 1 << 16;
 
+/// One uniform M31 value from `rng`: 31 bits of a word, the value `p` drawn
+/// again. Every field value the masked prover draws (a column's, a mask's
+/// coefficient, a blinding value's limb) is drawn by this rule.
+pub(crate) fn uniform_m31<R: RngCore + ?Sized>(rng: &mut R) -> BaseField {
+    loop {
+        let word = rng.next_u32() & P;
+        if word != P {
+            return BaseField::from_u32_unchecked(word);
+        }
+    }
+}
+
 /// `2^log_size` uniform M31 values, written straight into packed SIMD
-/// lanes: chunk `i` from `seed`'s ChaCha20 stream `i`, 31 bits a word, the
-/// value `p` drawn again.
+/// lanes: chunk `i` from `seed`'s ChaCha20 stream `i`, by
+/// [`uniform_m31`]'s rule.
 pub(crate) fn uniform_column(seed: [u8; 32], log_size: u32) -> BaseColumn {
     let length = 1usize << log_size;
     let mut data =
