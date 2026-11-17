@@ -45,8 +45,8 @@ jvm = ["jni", "s4-credential-contract/jvm"]
 [dependencies]
 # The facility's protocol and its Binder contract: s4's, by git revision,
 # as the gateway names s4-server.
-s4-protocol = { git = "https://codeberg.org/Virto/s4", rev = "084f598218c9468cbdd30dcad139d94e7cd754bc" }
-s4-credential-contract = { git = "https://codeberg.org/Virto/s4", rev = "084f598218c9468cbdd30dcad139d94e7cd754bc" }
+s4-protocol = { git = "https://codeberg.org/Virto/s4", rev = "0bba2442e07386d9ab33e64e2339bc438af24cd4" }
+s4-credential-contract = { git = "https://codeberg.org/Virto/s4", rev = "0bba2442e07386d9ab33e64e2339bc438af24cd4" }
 # The light node, with its device library: the secret's derivation, the
 # proofs, the node-API requests and the path kept apart from proofs.
 vos-light = { path = "..", features = ["tor"] }
@@ -77,7 +77,7 @@ vos-testkit = { path = "../../../agent/testkit" }
 # program over the interpreter, its work applied as accumulate applies it.
 vos-exec = { path = "../../exec" }
 vos-pvm = { path = "../../../pvm/runtime" }
-s4-server = { git = "https://codeberg.org/Virto/s4", rev = "084f598218c9468cbdd30dcad139d94e7cd754bc" }
+s4-server = { git = "https://codeberg.org/Virto/s4", rev = "0bba2442e07386d9ab33e64e2339bc438af24cd4" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "sync", "time"] }
 tempfile = "3"
 hmac = "0.12"
