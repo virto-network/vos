@@ -35,11 +35,11 @@ prover = [
 ]
 # A kernel's shape read from its install's record (`vos_abi::records::Shape`).
 abi = ["dep:vos-abi"]
-# Diagnostic helpers (`debug_claimed_sums`) for prover-side debugging of
-# logup imbalances.  Off by default so the production prover surface
-# stays clean; turn on with `--features debug-internals` to bisect
-# "ConstraintsNotSatisfied" vs. "claimed logup sum is not zero" failure
-# modes when adding constraints; and `prove_chip_isolated_format`, a
+# Diagnostic helpers for prover-side debugging: off by default so the
+# production prover surface stays clean; turn on with `--features
+# debug-internals` for `debug_assert_constraints_explicit`, the first
+# failing constraint of a trace that does not prove; and
+# `prove_chip_isolated_format`, a
 # chip's proof alone, which the recursion prover's tests measure a leaf on.
 # Also the environment's debug outputs, which show a trace's rows and sizes
 # (`CPU_DUMP`, `CPU_EXPR_DUMP`, `VOS_PROOF_PROFILE`): no production build

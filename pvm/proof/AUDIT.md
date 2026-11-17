@@ -163,8 +163,10 @@ Public items a production build never compiles, each behind a feature
 check-kit` refuses `other-pins` and `model-judge` in the kit's build,
 whose crates hold none of the others: `vos-pvm-proof`'s `chip-isolated`
 (`prove_with_explicit_components`, `verify_with_explicit_components`,
-`harness`; their proofs carry `component_mask = 0`, which
-`verify_standalone` refuses); `vos-pvm-recair`'s `seeded-masks` (seeded
+`harness`, whose proofs carry `component_mask = 0`, which
+`verify_standalone` refuses; `prove_with_boundary_override`, a prover of
+forged boundary states for the boundary-binding gate; and
+`record_canonical_transcript`, the recursion seams' recorded transcript); `vos-pvm-recair`'s `seeded-masks` (seeded
 randomness, the forced prove); `vos-pvm-final-verifier`'s `other-pins`
 (`masked::verify_with`, the wrap under other pins); `vos-pvm-device`'s
 `test-device-format`; and `vos-statement`'s `model-judge` (`model`, a

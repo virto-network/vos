@@ -36,7 +36,7 @@ mod request;
 mod shaped;
 
 #[cfg(feature = "debug-internals")]
-pub use debug::{debug_assert_constraints_explicit, debug_claimed_sums};
+pub use debug::debug_assert_constraints_explicit;
 pub use profile::ProveProfile;
 pub(crate) use request::{ProveRequest, Sizes};
 pub use shaped::{KernelSegment, program_commitment_for_shape, prove_kernel, prove_shaped};
@@ -448,8 +448,8 @@ pub(crate) fn derive_segment_states(side_note: &SideNote) -> (SegmentState, Segm
 /// boundary-binding gate test (`tests/gates/boundary_binding.rs`) can assert
 /// such proofs are REJECTED by `verify` / `verify_standalone`. It grants
 /// no capability an adversary lacks, but it is not part of the supported
-/// proving API.
-#[doc(hidden)]
+/// proving API: a test seam (`chip-isolated`).
+#[cfg(feature = "chip-isolated")]
 pub fn prove_with_boundary_override(
     side_note: &mut SideNote,
     initial_state: SegmentState,

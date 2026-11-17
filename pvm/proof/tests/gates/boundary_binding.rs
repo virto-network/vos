@@ -11,9 +11,8 @@
 //!
 //! These tests model that adversary via `prove_with_boundary_override`
 //! (honest columns, forged metadata) and assert both `verify` and
-//! `verify_standalone` reject every variant. The voucher io-hash
-//! (`Proof::public_io_hash`, φ[9..13] of `final_state.registers`) reads
-//! this metadata, so external-voucher verification requires these to
+//! `verify_standalone` reject every variant. The io-hash (φ[9..13] of
+//! `final_state.registers`) is read from this metadata, so external-voucher verification requires these to
 //! hold.
 //!
 //! SCOPE — these cover the metadata→column half of the binding (the
@@ -35,7 +34,7 @@ use vos_pvm_proof::{SegmentState, SideNote, prove};
 use vos_pvm_proof_verifier::verify_standalone;
 
 /// Trace a tiny Add64 program whose destination is φ[9] — the first
-/// register of the io-hash window `public_io_hash` reads.
+/// register of the io-hash window φ[9..13].
 fn traced_program() -> (Vec<PvmStep>, Vec<u8>, Vec<u8>) {
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[1] = 5;

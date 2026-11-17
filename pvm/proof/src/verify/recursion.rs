@@ -278,6 +278,8 @@ pub struct RecursionTranscript {
 ///
 /// Pairs with [`reconstruct_oods_for_recursion`] (same prefix, returns the OODS
 /// masks + scalars). Panics if the proof fails to verify (recursion harness assumes a valid proof).
+/// A test seam (`chip-isolated`).
+#[cfg(feature = "chip-isolated")]
 pub fn record_canonical_transcript(proof: &Proof) -> RecursionTranscript {
     use alloc::rc::Rc;
     use core::cell::RefCell;

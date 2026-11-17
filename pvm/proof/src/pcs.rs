@@ -229,14 +229,6 @@ impl StarkProofAny {
         }
     }
 
-    /// The number of trees.
-    pub fn commitment_count(&self) -> usize {
-        match self {
-            Self::Poseidon2M31(proof) => proof.commitments.len(),
-            Self::Blake2sM31(proof) => proof.commitments.len(),
-        }
-    }
-
     /// The root of tree `index`.
     pub fn commitment(&self, index: usize) -> Option<Commitment> {
         match self {

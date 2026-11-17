@@ -16,10 +16,11 @@ use crate::{lookups::AllLookupElements, side_note::SideNote};
 #[cfg(feature = "chip-isolated")]
 mod explicit;
 mod recursion;
+#[cfg(feature = "chip-isolated")]
+pub use recursion::record_canonical_transcript;
 pub use recursion::{
-    ComponentOodsMask, OodsReconstruction, RecursionData, RecursionTranscript, SampleLayout,
-    extract_recursion_data, reconstruct_oods_for_recursion, record_canonical_transcript,
-    replay_stark, sample_layout, sample_layout_of,
+    OodsReconstruction, RecursionData, RecursionTranscript, SampleLayout, extract_recursion_data,
+    reconstruct_oods_for_recursion, replay_stark, sample_layout, sample_layout_of,
 };
 
 /// The per-component log size cap `verify` applies, the protocol's.
