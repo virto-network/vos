@@ -18,7 +18,9 @@ fn a_read_at_a_cut_is_served_and_stated() {
     let keys = vec![1u64, 2, 9];
     let id = reads.start(T0 + 10, "sum_at_cut", keys.clone());
     let record = reads.record(id);
-    let deadline = CLOCK.boundary(WINDOW + defaults::READ_WINDOWS).unwrap();
+    let deadline = CLOCK
+        .boundary(WINDOW + vos_abi::defaults::READ_WINDOWS)
+        .unwrap();
     assert!(
         matches!(
             record.state,
@@ -301,10 +303,10 @@ fn an_ask_is_refused_at_once() {
     let mut reads = Reads::with(&[(1, 10)]);
     let id = reads.start(T0 + 10, "sum_at_cut", vec![1u64, 1]);
     assert_eq!(ended(&reads.record(id)), &failed_with(AttestError::Reads));
-    let many: Vec<u64> = (0..defaults::MAX_READS as u64 + 1).collect();
+    let many: Vec<u64> = (0..vos_abi::defaults::MAX_READS as u64 + 1).collect();
     let id = reads.start(T0 + 20, "sum_at_cut", many);
     assert_eq!(ended(&reads.record(id)), &failed_with(AttestError::Reads));
-    let fewest: Vec<u64> = (0..defaults::MAX_READS as u64).collect();
+    let fewest: Vec<u64> = (0..vos_abi::defaults::MAX_READS as u64).collect();
     let id = reads.start(T0 + 30, "sum_at_cut", fewest);
     assert!(matches!(
         reads.record(id).state,
@@ -320,7 +322,9 @@ fn a_read_not_served_by_its_deadline_ends_not_closed() {
     let mut reads = Reads::with(&[(1, 10)]);
     let id = reads.start(T0 + 10, "sum_at_cut", vec![1u64]);
     let (request, read) = reads.asked(WINDOW, id, 0);
-    let deadline = CLOCK.boundary(WINDOW + defaults::READ_WINDOWS).unwrap();
+    let deadline = CLOCK
+        .boundary(WINDOW + vos_abi::defaults::READ_WINDOWS)
+        .unwrap();
     let early = reads.node.sweep(deadline - 1);
     reads.batch(deadline - 1, vec![early]);
     assert!(matches!(

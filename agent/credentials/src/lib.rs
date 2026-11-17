@@ -92,7 +92,7 @@ use vos_sdk::prelude::*;
 use vos_wire::credentials::{
     CONFIRM_MS, Change, CredentialError, ENROLL_MANY, ENROLLMENT_PERIOD_MS, FEED_BYTES, Feed,
     MAX_DEVICES, MAX_DIFFICULTY, MAX_ONIONS, Onion, Open, Path, REPLACEMENTS, Ring, RootEntry,
-    Siblings,
+    Siblings, meets, open_salt, open_work,
 };
 
 /// The open claim's terms and the current period's count.
@@ -402,14 +402,9 @@ impl Credentials {
             .into_iter()
             .flatten()
             .any(|period| {
-                let salt = vos_wire::credentials::open_salt(&opening.seed, period);
-                vos_wire::credentials::meets(
-                    &vos_wire::credentials::open_work(
-                        &self.handle.get_or_default(),
-                        &member,
-                        &salt,
-                        nonce,
-                    ),
+                let salt = open_salt(&opening.seed, period);
+                meets(
+                    &open_work(&self.handle.get_or_default(), &member, &salt, nonce),
                     opening.difficulty,
                 )
             });
@@ -735,7 +730,7 @@ impl Credentials {
         let opening = self.opening.get().filter(|opening| opening.cap > 0)?;
         let now = ctx.now();
         Some(Open {
-            salt: vos_wire::credentials::open_salt(&opening.seed, now / opening.period_ms),
+            salt: open_salt(&opening.seed, now / opening.period_ms),
             difficulty: opening.difficulty,
             period_ms: opening.period_ms,
             cap: opening.cap,

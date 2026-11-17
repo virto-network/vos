@@ -40,13 +40,13 @@ use memory::{copy_out, read, read_key, row, window, write};
 const READS: usize = cap::REQUEST;
 
 /// Whether `rows` are a read at a cut of `instance`'s rows: at least one,
-/// at most [`defaults::MAX_READS`], strictly increasing, each a committed
+/// at most [`vos_abi::defaults::MAX_READS`], strictly increasing, each a committed
 /// row of `instance`'s ([`keys::committed_entry`]) no longer than a tree's
 /// key.
 fn valid_reads(instance: InstanceId, rows: &[Vec<u8>]) -> bool {
     let prefix = keys::instance_committed(instance);
     !rows.is_empty()
-        && rows.len() <= defaults::MAX_READS
+        && rows.len() <= vos_abi::defaults::MAX_READS
         && rows.windows(2).all(|pair| pair[0] < pair[1])
         && rows.iter().all(|row| {
             row.starts_with(&prefix)
@@ -695,7 +695,7 @@ impl<'a> Invocation<'a> {
                 .insert(key, Some(value));
         }
         let deadline = clock
-            .boundary(window.saturating_add(defaults::READ_WINDOWS))
+            .boundary(window.saturating_add(vos_abi::defaults::READ_WINDOWS))
             .unwrap_or(u64::MAX);
         Ok(Ok(Pause::Attesting(alloc::boxed::Box::new(Attesting {
             counter: awaiting.counter,
@@ -868,7 +868,7 @@ impl<'a> Invocation<'a> {
         }
         self.messages.push(Outgoing { to: agent, body });
         let within = match within {
-            0 => defaults::AWAIT_MS,
+            0 => vos_abi::defaults::AWAIT_MS,
             within => within,
         };
         Ok(Pause::Await {

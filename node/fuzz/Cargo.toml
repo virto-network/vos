@@ -17,6 +17,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 # The node API's frame reader and operator envelope, as a node reads them.
 vos-api = { path = "../api" }
+# The identifiers and the codec those bodies are in.
 vos-abi = { path = "../../pvm/abi" }
 # A proven call's body and the credential actor's claims, as ingress reads
 # them.

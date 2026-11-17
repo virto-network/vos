@@ -8849,7 +8849,6 @@ name = "vos-wire"
 version = "0.1.0"
 dependencies = [
  "vos-abi",
- "vos-anchor",
  "vos-pvm-codec",
  "vos-pvm-precompiles",
  "vos-tree",

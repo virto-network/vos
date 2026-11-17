@@ -165,7 +165,7 @@ codes! {
         /// yet: it runs no cuts, so its statements are rootless.
         NoSpace = 1,
         /// The rows it reads are none, past
-        /// `vos_wire::defaults::MAX_READS`, not strictly increasing, or not
+        /// [`crate::defaults::MAX_READS`], not strictly increasing, or not
         /// each a committed row of the workflow's instance.
         Reads = 2,
         /// No attestable method of the instance's by that id.
@@ -182,7 +182,7 @@ codes! {
         /// [`super::cap::Limits::served`], or of another agent, instance,
         /// window, space or read set.
         Unserved = 6,
-        /// Not served within `vos_wire::defaults::READ_WINDOWS` windows.
+        /// Not served within [`crate::defaults::READ_WINDOWS`] windows.
         NotClosed = 7,
         /// The output did not decode as the method's type: the SDK's own.
         Undecodable = 8,

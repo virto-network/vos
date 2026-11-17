@@ -254,7 +254,7 @@ fn a_report_goes_once_a_window() {
 #[test]
 fn a_close_sends_each_path_once() {
     let mut reads = Reads::with(&[(1, 10)]);
-    let count = 2 * vos_abi::defaults::CLOSE_PATHS + 6;
+    let count = 2 * vos_wire::defaults::CLOSE_PATHS + 6;
     let paths: Vec<AgentPath> = (0..count as u32)
         .map(|n| AgentPath {
             agent: AgentId(0x0300_0000 + n),
@@ -280,7 +280,7 @@ fn a_close_sends_each_path_once() {
         .iter()
         .flat_map(|step| ran(step).messages.iter().map(|message| message.to))
         .collect();
-    assert_eq!(first.len(), 2 * vos_abi::defaults::CLOSE_PATHS);
+    assert_eq!(first.len(), 2 * vos_wire::defaults::CLOSE_PATHS);
     let second = sent(&reads.batch(T0 + 2, vec![close(7)]));
     assert_eq!(second.len(), 6);
     assert_eq!(
@@ -289,7 +289,7 @@ fn a_close_sends_each_path_once() {
     );
     assert!(sent(&reads.batch(T0 + 3, vec![close(7)])).is_empty());
     let result = reads.batch(T0 + 4, vec![close(8), close(6)]);
-    assert_eq!(sent(&result).len(), vos_abi::defaults::CLOSE_PATHS);
+    assert_eq!(sent(&result).len(), vos_wire::defaults::CLOSE_PATHS);
     assert!(ran(&result.steps[1]).messages.is_empty());
     let empty = Input::Close {
         window: 9,

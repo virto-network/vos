@@ -30,22 +30,19 @@ pub const MAX_KEY_SESSIONS: u64 = 64;
 /// crosses more boundaries cuts the newest this many windows, and the
 /// older ones are never cut. A consensus constant, on every host.
 pub const MAX_CUTS: u64 = 32;
-/// The most rows one read at a window's cut names
-/// ([`vos_abi::abi::Op::AttestAt`]): about what [`vos_abi::abi::cap::SERVED`]
-/// holds, each row's share of the proof included.
-pub const MAX_READS: usize = 256;
-/// How many windows a read at a window's cut waits to be served: one asked
-/// in window `w` that no [`crate::batch::Input::Resume`] has served by the
-/// boundary `B_{w + READ_WINDOWS}` ends
-/// [`vos_abi::abi::AttestError::NotClosed`]. It is served at its own window's
-/// cut alone, once the representative's `Closed` of that window comes; the
-/// caller asks again.
-pub const READ_WINDOWS: u64 = 2;
 /// How many windows behind the latest recorded cut the agent keeps its cut
 /// and close rows: a cut recording window `w` deletes those of every window
 /// before `w − CUT_KEEP`. It covers a read's whole life, to its deadline. A
 /// consensus constant, on every host.
-pub const CUT_KEEP: u64 = READ_WINDOWS;
+pub const CUT_KEEP: u64 = vos_abi::defaults::READ_WINDOWS;
+/// The most paths one of the representative's closes sends, a message
+/// each, within every target's messages a step
+/// ([`vos_abi::abi::cap::Limits::messages`]): a window whose agents asked for
+/// more goes in several.
+pub const CLOSE_PATHS: usize = 8;
+
+// A close's paths, a message each, fit a step on every target.
+const _: () = assert!(CLOSE_PATHS <= vos_abi::abi::cap::JAM.messages);
 
 // An expired session's batch time is past its t0 plus the skew: it was
 // created within the skew of t0, so a collected session can never be
@@ -214,9 +211,6 @@ const _: () = assert!(matches!(DEVICE_FORMATS.len(), 1 | 2));
 /// and the call is long refused as expired.
 pub const BINDING_KEPT_MS: u64 = 60_000;
 
-/// An await's deadline when its call sets none: after the batch time
-/// of the step that awaits, in milliseconds.
-pub const AWAIT_MS: u64 = 60 * 1000;
 /// The most workflows an agent holds that have not ended: a start past
 /// it fails. An ended one, kept for its result until collected, is not
 /// among them.

@@ -39,6 +39,7 @@ use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
+use vos_abi::credentials as tree;
 use vos_abi::credentials::{Tag, Words};
 use vos_abi::ids::{AgentId, InstanceId, Principal};
 use vos_abi::result::{InputRef, Outcome, Step, WorkResult};
@@ -57,12 +58,9 @@ use vos_light::{
 use vos_node::client::{self, Client, Target};
 use vos_node::store::EntryKind;
 use vos_pvm_recair::masked::{MaskRng, drawn_in};
+use vos_wire::credentials::{AuthClaim, Path, Siblings, scope};
 use vos_wire::ingress::{CredentialRefusal, Credentialed, Response};
 use vos_wire::peer::NodeNumber;
-use vos_wire::{
-    credentials as tree,
-    credentials::{AuthClaim, Path, Siblings},
-};
 
 use crate::harness::{Cluster, NODES};
 
@@ -505,7 +503,7 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
     let program = DeviceProgram::from_release(&device.unwrap()).unwrap();
     let siblings = witness.siblings.map(|sibling| sibling.0);
     let device_proof_of = |call: &Call| {
-        let scope = tree::scope(&founded.space, agent, DEVICE, b"login");
+        let scope = scope(&founded.space, agent, DEVICE, b"login");
         let nullifier = tree::digest(&tree::compress(
             &tree::compress(&Tag::Nf.block(), &words),
             &tree::words(&scope).unwrap(),

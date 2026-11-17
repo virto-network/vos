@@ -1487,7 +1487,8 @@ same statement under BLAKE2b's io-hash [measured, Fairphone 6,
   reaches. So nothing a device kernel reaches may call `compute_io_hash`,
   the SDK's node ends (`attested`, `attested_output`) or
   the credential tree's BLAKE2b helpers (`vos_abi::credentials::tag_word`,
-  `vos_wire::credentials`' `scope` and `Bound::digest`); a kernel takes the tags as `Tag::word()`'s constants.
+  `vos_wire::credentials`' `scope` and `Bound::digest`); a kernel takes
+  the tags as `Tag::word()`'s constants.
   The derivation refuses one that does, and a gate holds the auth kernel's
   device chips to neither BLAKE2b's nor the AND table's
   (`device_kernel::a_device_kernels_shape_holds_no_blake2b`).

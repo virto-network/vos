@@ -2,13 +2,13 @@
 //! served rows checked and its kernel run on them.
 
 use vos_abi::abi::{AttestError, Failure, Kind, cap, price};
+use vos_abi::defaults;
 use vos_abi::ids::{InstanceId, MethodId, ProgramHash, RequestId};
 use vos_abi::records::{PendingRead, WorkflowState};
 use vos_abi::result::{Attest, Attested};
 use vos_abi::served::Served;
 use vos_abi::{Decode, Encode, SpaceId, keys};
 use vos_pvm::refine::Machine;
-use vos_wire::defaults;
 
 use super::Invocation;
 use crate::model::memory::{kernel, parts, read};

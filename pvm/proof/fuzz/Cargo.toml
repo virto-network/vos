@@ -84,9 +84,6 @@ path = "fuzz_targets/anchor_decode.rs"
 test = false
 doc = false
 
-
-
-
 [[bin]]
 name = "device_verify_bytes"
 path = "fuzz_targets/device_verify_bytes.rs"

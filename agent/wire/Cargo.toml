@@ -11,8 +11,8 @@ vos-abi = { workspace = true }
 scale = { package = "vos-pvm-codec", path = "../../pvm/codec", default-features = false, features = ["anchor"] }
 # A package's proofs of its rows.
 vos-tree = { workspace = true }
-# BLAKE2b-256 of a whole buffer: the credential actor's scopes, bindings
-# and open claims.
+# BLAKE2b-256 of a whole buffer: the credential actor's scopes, bindings,
+# open claims, and the personal agent's ids.
 vos-pvm-precompiles = { workspace = true }
 
 [dev-dependencies]

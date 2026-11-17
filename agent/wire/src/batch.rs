@@ -181,7 +181,7 @@ pub enum Input {
     /// salt and path against it. Refine sends each agent past the close
     /// mark ([`vos_abi::keys::close_mark`]) its [`Body::Closed`]. The node
     /// puts it in a batch once its replica has built the cut, at most
-    /// [`vos_abi::defaults::CLOSE_PATHS`] paths a close.
+    /// [`crate::defaults::CLOSE_PATHS`] paths a close.
     #[codec(index = 8)]
     Close {
         window: u64,

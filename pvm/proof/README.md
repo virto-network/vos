@@ -59,7 +59,7 @@ last:
 | `tools/kreivo/conformance` | Kreivo's spaces pallet's conformance vectors, over the fixtures | `just conformance` | `just check` |
 | `pvm/proof/kit/Cargo.lock` | the verifier kit's lock file, VOS's pruned to what the kit links | `just kit-lock` | `just check-kit` |
 | `pvm/proof/final-verifier/src/constants.rs` | the wrap's preprocessed root (`PREPROCESSED_ROOT_39`), a venue's verifying key | by hand, at a change of the wrap's circuit | `vos-pvm-proof`'s `constants::` test computes it |
-| `pvm/proof/fuzz/replay` | each fuzz target's replay corpus: inputs kept because they reached a path once, a regression set never generated | the fuzzer, kept by hand | `just fuzz-replay`, in `gate` |
+| `pvm/proof/fuzz/replay`, `node/fuzz/replay` | each fuzz target's replay corpus, the prover's and the node's: inputs kept because they reached a path once, a regression set never generated | the fuzzer, kept by hand | `just fuzz-replay`, in `gate` |
 
 After a change that moves a guest, a circuit or the lock file, `just
 repin` writes every generated store anew in dependency order (guests and

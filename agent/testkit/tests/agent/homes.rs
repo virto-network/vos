@@ -9,7 +9,8 @@
 //! work, closed or past its cap; and the cap below the keeper's refill
 //! rate, a pool the keeper stops filling ending `PoolEmpty`.
 
-use vos_abi::credentials::Digest;
+use tree::Digest;
+use vos_abi::credentials as tree;
 use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal};
 use vos_abi::message::Body;
 use vos_abi::result::{Outcome, Outgoing, Run};
@@ -17,14 +18,11 @@ use vos_abi::{Decode, Encode, SpaceId};
 use vos_testkit::programs::program_elf;
 use vos_testkit::{World, answer};
 use vos_wire::batch::{Input, Message};
+use vos_wire::credentials::{CredentialError, Open, RootEntry, meets, open_work};
 use vos_wire::homes::{AgentsPage, Counts, HomesError, Standing, Terms};
 use vos_wire::personal::{
     AdminClass, Attestation, Envelope, Kit, KitEntry, KitKind, NewDevice, Overview, PersonalError,
     Policy, RECOVERY, Recorded, kit_index,
-};
-use vos_wire::{
-    credentials as tree,
-    credentials::{CredentialError, Open, RootEntry, meets, open_work},
 };
 
 use crate::common::ALICE;
@@ -89,7 +87,7 @@ fn kit_of(n: u32) -> Kit {
 
 /// A member digest for `seed`: eight words below p.
 fn member(seed: u32) -> Digest {
-    vos_abi::credentials::digest(&[seed, 11, 12, 13, 14, 15, 16, 17])
+    tree::digest(&[seed, 11, 12, 13, 14, 15, 16, 17])
 }
 
 /// A nonce whose work for `member` meets `open`'s difficulty.
@@ -844,12 +842,12 @@ fn the_quota_ramps_at_the_first_yearly_re_proof() {
 
 /// An owner digest for `seed`, apart from every [`member`].
 fn owner(seed: u32) -> Digest {
-    vos_abi::credentials::digest(&[seed, 1, 2, 3, 4, 5, 6, 7])
+    tree::digest(&[seed, 1, 2, 3, 4, 5, 6, 7])
 }
 
 /// A person's limit.
 const LIMIT: u8 = 2;
-const REPLACEMENTS: u8 = tree::REPLACEMENTS;
+const REPLACEMENTS: u8 = vos_wire::credentials::REPLACEMENTS;
 
 /// B13 at a home that is the user's own space: a person of limit 2 whose
 /// device enrolls a new device, which claims a pooled agent under its own

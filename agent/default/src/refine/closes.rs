@@ -14,8 +14,9 @@ use vos_abi::served::{
     AgentRoot, ClosedRow, REPORTS_KEPT, REPRESENTATIVE, representative_ask, representative_row,
 };
 use vos_abi::vos_anchor::RootKind;
-use vos_abi::{Decode, Encode, SpaceId, WindowClock, defaults, keys};
+use vos_abi::{Decode, Encode, SpaceId, WindowClock, keys};
 use vos_wire::batch::AgentPath;
+use vos_wire::defaults;
 
 use super::Overlay;
 use super::base::{Base, Corrupt};

@@ -21,8 +21,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
+use tree::Digest;
 use vos_abi::abi::{Failure, Refusal};
-use vos_abi::credentials::Digest;
+use vos_abi::credentials as tree;
 use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal};
 use vos_abi::records::RETIREMENT_MS;
 use vos_abi::result::Outcome;
@@ -34,15 +35,14 @@ use vos_light::release::Release;
 use vos_light::{AuthWitness, Call, DEVICE_FORMAT, DeviceProgram, Prover, ProverConfig, Threads};
 use vos_net::Class;
 use vos_node::client::{self, Client};
+use vos_wire::credentials::{
+    AuthClaim, Bound, CredentialError, ENROLL_MANY, Path, RING, RootEntry, binding, scope,
+};
 use vos_wire::defaults::ROOT_GRACE_MS;
 use vos_wire::ingress::{
     CredentialRefusal, Credentialed, DeviceWindow, FormatWindow, Rejection, Response,
 };
 use vos_wire::peer::{NodeNumber, PeerMessage};
-use vos_wire::{
-    credentials as tree,
-    credentials::{AuthClaim, Bound, CredentialError, Path, RootEntry},
-};
 
 use crate::harness::{Cluster, NODES};
 
@@ -232,7 +232,7 @@ impl Founded {
     }
 
     fn scope(&self, instance: InstanceId, name: &str) -> Digest {
-        tree::scope(&self.space, self.agent, instance, name.as_bytes())
+        scope(&self.space, self.agent, instance, name.as_bytes())
     }
 
     /// The device library's call of `instance`'s `name` with a fresh nonce,
@@ -352,7 +352,7 @@ impl Founded {
             expires_ms: call.expires_ms,
         }
         .digest();
-        tree::binding(&b)
+        binding(&b)
     }
 
     fn send(&self, at: NodeNumber, call: &Credentialed) -> Response {
@@ -925,7 +925,7 @@ fn an_unknown_root_is_retried_on_a_path_fetched_again() {
 
     // Pushed out by 64 later roots, each a batch of its own.
     let early = founded.path(&replaced);
-    for seed in 100..100 + tree::RING as u32 + 4 {
+    for seed in 100..100 + RING as u32 + 4 {
         founded.write(CREDENTIALS, "enroll", Secret::new(seed).member());
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -1092,7 +1092,7 @@ fn the_device_librarys_proofs_are_admitted() {
         SCOPE_VECTOR
     );
     assert_eq!(
-        tree::scope(&SpaceId([0x51; 32]), AgentId(4), InstanceId(2), b"login"),
+        scope(&SpaceId([0x51; 32]), AgentId(4), InstanceId(2), b"login"),
         SCOPE_VECTOR
     );
 
@@ -1186,7 +1186,7 @@ fn the_device_librarys_proofs_are_admitted() {
 
     // Pushed out of the ring: the library's answer, the feed read again,
     // and a new proof at its root admitted.
-    for seed in 200..200 + tree::RING as u32 + 4 {
+    for seed in 200..200 + RING as u32 + 4 {
         founded.write(CREDENTIALS, "enroll", Secret::new(seed).member());
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -1302,12 +1302,9 @@ fn an_actor_kernels_proof_is_checked_by_its_handler_at_apply() {
     let leader = founded.cluster.leader(agent).unwrap();
     // The kernel takes the secret's words: a test's member, its secret
     // public.
-    let words: vos_abi::credentials::Words = core::array::from_fn(|i| 0x6d00_0000 + i as u32);
-    let compress = vos_abi::credentials::compress;
-    let member = vos_abi::credentials::digest(&compress(
-        &vos_abi::credentials::Tag::Member.block(),
-        &words,
-    ));
+    let words: tree::Words = core::array::from_fn(|i| 0x6d00_0000 + i as u32);
+    let compress = tree::compress;
+    let member = tree::digest(&compress(&tree::Tag::Member.block(), &words));
     founded.write(CREDENTIALS, "enroll", member);
     let path = {
         let path: Option<Path> = founded.read(CREDENTIALS, "path", member);
@@ -1322,9 +1319,9 @@ fn an_actor_kernels_proof_is_checked_by_its_handler_at_apply() {
     // no scope, so each name is another nullifier of one member.
     let nullifier = |name: &str| {
         let scope = founded.scope(DEVICE, name);
-        let nullifier = vos_abi::credentials::digest(&compress(
-            &compress(&vos_abi::credentials::Tag::Nf.block(), &words),
-            &vos_abi::credentials::words(&scope).unwrap(),
+        let nullifier = tree::digest(&compress(
+            &compress(&tree::Tag::Nf.block(), &words),
+            &tree::words(&scope).unwrap(),
         ));
         (scope, nullifier)
     };
@@ -1337,7 +1334,7 @@ fn an_actor_kernels_proof_is_checked_by_its_handler_at_apply() {
         let siblings = path
             .siblings
             .0
-            .map(|sibling| vos_abi::credentials::words(&sibling).unwrap());
+            .map(|sibling| tree::words(&sibling).unwrap());
         let public = claim.clone().try_into().expect("auth's public bytes");
         let arguments = vos_pvm_device::auth_arguments(&siblings, &words, path.slot, &public);
         let proof = founded
@@ -1425,7 +1422,7 @@ fn an_actor_kernels_proof_is_checked_by_its_handler_at_apply() {
         "another nullifier than the proof's"
     );
     let mut wide = proof.clone();
-    wide.claim[1 + 64..1 + 68].copy_from_slice(&vos_abi::credentials::P.to_le_bytes());
+    wide.claim[1 + 64..1 + 68].copy_from_slice(&tree::P.to_le_bytes());
     assert_eq!(
         send(at, &fresh, &wide),
         Answer::Refused(CredentialRefusal::Proof),
@@ -1991,7 +1988,7 @@ fn a_proof_from_the_tree_kept_from_its_feed_is_admitted() {
     let secret = vos_light::derive_secret(&[0x5f; 32], &[0x42; 32]);
     let mine = vos_light::member(&secret);
     for batch in 0..6u32 {
-        let members: Vec<Digest> = (0..tree::ENROLL_MANY as u32)
+        let members: Vec<Digest> = (0..ENROLL_MANY as u32)
             .map(|seed| Secret::new(1_000 * batch + seed).member())
             .collect();
         founded.write(CREDENTIALS, "enroll_many", members);

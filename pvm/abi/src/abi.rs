@@ -340,7 +340,7 @@ operations! {
         ///
         /// φ7 agent, φ8 instance, φ9 method, φ10/φ11 arguments, φ12 the
         /// deadline, milliseconds after the batch's time (0 for the default,
-        /// `vos_wire::defaults::AWAIT_MS`). Sent after the step commits, as a
+        /// [`crate::defaults::AWAIT_MS`]). Sent after the step commits, as a
         /// request: the answer is the callee's outcome, `Started` for a
         /// workflow method, or `Failed` with [`Failure::TimedOut`] once the
         /// deadline passed. The agent is another: a request of this
@@ -364,7 +364,7 @@ operations! {
         /// Otherwise its step records the request of the batch time's
         /// window ([`crate::keys::request`]), and the workflow pauses until
         /// a `vos_wire::batch::Input::Resume` serves the rows proved at the
-        /// window's cut, or `vos_wire::defaults::READ_WINDOWS` windows pass:
+        /// window's cut, or [`crate::defaults::READ_WINDOWS`] windows pass:
         /// its input then an encoded [`crate::result::Attested`], the
         /// kernel's output on the arguments and the served rows, or why
         /// there is none.

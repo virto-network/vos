@@ -4,9 +4,10 @@
 //! layout of an agent's rows ([`keys`]), a program's schema ([`schema`]),
 //! the records of an install and of a workflow ([`records`]), a step's
 //! result ([`result`]), the messages between agents ([`message`]), the rows
-//! a read at a cut is served ([`served`]), the credential tree a device
-//! kernel proves over ([`credentials`]), and the arguments a JAM node
-//! invokes a program with ([`jam`]).
+//! a read at a cut is served ([`served`]), the storage-backed types'
+//! merges ([`merge`]), the credential tree a device kernel proves over
+//! ([`credentials`]), and the arguments a JAM node invokes a program with
+//! ([`jam`]).
 //!
 //! Everything here is SCALE-coded with the workspace codec, the encoding JAM
 //! uses, except the Gray Paper structures in [`jam`], which follow the Gray
@@ -32,6 +33,7 @@ pub use scale;
 pub use scale::{Decode, DecodeError, Encode};
 pub use vos_anchor::{self, SpaceGenesis, SpaceId, WindowClock};
 
-/// The defaults the ABI's bounds are set by. Each is a constant, cheap to
-/// change.
+/// The defaults the ABI's bounds are set by: a handler's gas, the serving
+/// prices, a read at a cut's rows and windows, an await's deadline and a
+/// sweep's bindings. Each is a constant, cheap to change.
 pub mod defaults;

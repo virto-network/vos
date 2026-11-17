@@ -15,7 +15,7 @@ use vos_abi::{SpaceId, WindowClock};
 use vos_venue::vos_statement::{ProgramId, Statement, StatementId};
 use vos_venue::{SubmitOutcome, VenueClient};
 
-use vos_wire::defaults::READ_WINDOWS;
+use vos_abi::defaults::READ_WINDOWS;
 
 use crate::job::{Job, MAX_ATTEMPTS, MAX_RESUBMITS, Refusal, State, deadline};
 

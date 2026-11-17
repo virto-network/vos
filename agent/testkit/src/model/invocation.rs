@@ -610,7 +610,7 @@ impl<'a> Invocation<'a> {
         }
         self.messages.push(Outgoing { to: agent, body });
         let within = if within == 0 {
-            vos_wire::defaults::AWAIT_MS
+            vos_abi::defaults::AWAIT_MS
         } else {
             within
         };

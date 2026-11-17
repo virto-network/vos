@@ -4,11 +4,6 @@
 /// own ([`crate::keys::due`]), so a backlog of them never holds a
 /// session's or a workflow's row back.
 pub const SWEEP_BINDINGS: usize = 64;
-/// The most paths one of the representative's closes sends, a message
-/// each, within every target's messages a step
-/// ([`crate::abi::cap::Limits::messages`]): a window whose agents asked for
-/// more goes in several.
-pub const CLOSE_PATHS: usize = 8;
 /// A handler's gas limit when its schema declares none: about 330
 /// gets, 150 puts or 5,000 register-only operations, or about 16,000
 /// BLAKE2b compressions.
@@ -32,3 +27,17 @@ pub const PRECOMPILE_SERVING: u64 = 27_000;
 /// arithmetic dearer in the guest than a BLAKE2b compression's. Measured by
 /// the same test.
 pub const POSEIDON2_SERVING: u64 = 60_000;
+/// The most rows one read at a window's cut names
+/// ([`crate::abi::Op::AttestAt`]): about what [`crate::abi::cap::SERVED`]
+/// holds, each row's share of the proof included.
+pub const MAX_READS: usize = 256;
+/// How many windows a read at a window's cut waits to be served: one asked
+/// in window `w` that no `vos_wire::batch::Input::Resume` has served by the
+/// boundary `B_{w + READ_WINDOWS}` ends
+/// [`crate::abi::AttestError::NotClosed`]. It is served at its own window's
+/// cut alone, once the representative's `Closed` of that window comes; the
+/// caller asks again.
+pub const READ_WINDOWS: u64 = 2;
+/// An await's deadline when its call sets none: after the batch time
+/// of the step that awaits, in milliseconds.
+pub const AWAIT_MS: u64 = 60 * 1000;
