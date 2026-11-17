@@ -891,3 +891,84 @@ fn peek_and_poke_accept_empty_inner_range_above_u32_max() {
         assert_eq!(context.outer.registers()[7], result::OK);
     }
 }
+
+/// Scans every row (an empty prefix, no cursor) into 0x2_0100, its
+/// capacity φ12 = 2^64 - 1, past the writable page, then halts with φ7
+/// holding the call's result.
+fn state_scanning_program() -> Vec<u8> {
+    let [lo, hi] = (crate::inner::host_call::STATE_SCAN as u16).to_le_bytes();
+    let (code, starts) = crate::test_support::code(&[
+        &[51, 7, 0x00, 0x00, 0x02],  // load_imm φ7, 0x2_0000 (prefix)
+        &[51, 8, 0],                 // load_imm φ8, 0
+        &[51, 9, 0x00, 0x00, 0x02],  // load_imm φ9, 0x2_0000 (cursor)
+        &[51, 10, 0],                // load_imm φ10, 0
+        &[51, 11, 0x00, 0x01, 0x02], // load_imm φ11, 0x2_0100 (output)
+        &[51, 12, 0xff],             // load_imm φ12, -1
+        &[10, lo, hi],               // ecalli state_scan
+        &[50, 0],                    // jump_ind φ0 (halt)
+    ]);
+    standard_program_with_rw(&code, &starts, &[0; 0x60])
+}
+
+/// `count` rows of sixteen bytes each, a two-byte key and a six-byte
+/// value, counting the rows read.
+struct Rows {
+    count: usize,
+    read: core::sync::atomic::AtomicUsize,
+}
+
+impl StateReader for Rows {
+    fn read(&self, _: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn rows<'a>(
+        &'a self,
+        _: &'a [u8],
+        _: Option<&'a [u8]>,
+    ) -> alloc::boxed::Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + 'a> {
+        alloc::boxed::Box::new((0..self.count).map(|row| {
+            self.read
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            ((row as u16).to_le_bytes().to_vec(), vec![0; 6])
+        }))
+    }
+}
+
+#[test]
+fn state_scan_charges_by_the_byte_and_reads_no_row_it_cannot_pay_for() {
+    let program = state_scanning_program();
+    let scan = |count, gas| {
+        let rows = alloc::sync::Arc::new(Rows {
+            count,
+            read: 0.into(),
+        });
+        let invocation = RefineContext::load(&program, &[], gas)
+            .unwrap()
+            .with_state(rows.clone())
+            .run();
+        (
+            invocation,
+            rows.read.load(core::sync::atomic::Ordering::Relaxed),
+        )
+    };
+    let (empty, _) = scan(0, 1_000_000);
+    assert_eq!(empty.exit, ExitReason::Halt);
+    assert_eq!(empty.registers[7], 0);
+
+    // Four rows fit the writable page, though the capacity passes it: all
+    // served, for the base price and their 64 bytes.
+    let (four, read) = scan(4, 1_000_000);
+    assert_eq!(four.exit, ExitReason::Halt);
+    assert_eq!((four.registers[7], read), (64, 4));
+    assert_eq!(four.gas_used - empty.gas_used, 64 * STATE_READ_BYTE_GAS);
+    let mut served = [0u8; 16];
+    four.memory().read_bytes(0x2_0110, &mut served);
+    assert_eq!(served, [2, 0, 0, 0, 1, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+    // Gas for two rows and half a third: out of gas at the third, the
+    // rest of a long state never read.
+    let (short, read) = scan(1 << 20, empty.gas_used + 40 * STATE_READ_BYTE_GAS);
+    assert_eq!(short.exit, ExitReason::OutOfGas);
+    assert_eq!(read, 3);
+}
