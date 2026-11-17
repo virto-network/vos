@@ -10,9 +10,9 @@ default = ["prover", "abi"]
 # iteration.  Disable for a verifier-only build (smaller dep tree,
 # no_std-friendly, builds for wasm32-unknown-unknown).
 #
-# `javm` (the reference PVM interpreter the tracer drives) is prover-only:
-# the verifier never executes PVM code, and javm does not build on 32-bit
-# targets (CODE_WINDOW_SIZE = 1 << 32 overflows usize), so it must stay out
+# `vos-pvm` (`pvm/runtime`, the PVM interpreter the tracer drives) is
+# prover-only: the verifier never executes PVM code, and vos-pvm does not
+# build on 32-bit targets (CODE_WINDOW_SIZE = 1 << 32 overflows usize), so it must stay out
 # of the wasm32 verifier graph.
 #
 # The stwo `std`/`prover`/`parallel` features are forwarded here rather than

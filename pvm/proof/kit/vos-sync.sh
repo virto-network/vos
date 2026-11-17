@@ -5,10 +5,18 @@
 # the consumer's review (e.g. Kreivo's `scripts/vos-sync.sh`, CODEOWNERS),
 # since a change to the kit could replace the kit's own script: this one
 # pins VOS's canonical repository, checks that the tag the kit's `VENDOR`
-# names is there, takes `vos_kit.py` from that tag and runs it.
+# names is the one the consumer expects and is there, takes `vos_kit.py`
+# from that tag and runs it.
 #
-#   vos-sync.sh <kit directory> [<a local VOS clone>]
+#   vos-sync.sh <kit directory> <expected tag> [<a local VOS clone>]
 #
+# The expected tag is the consumer's, kept outside the kit under the same
+# review as this script (e.g. Kreivo's `scripts/vos-verifier.tag`), so a
+# kit vendored at another tag, an older one before a fix among them, is
+# refused, and a re-pin is a reviewed change outside the kit. VOS's tags
+# are not signed: push access to VOS's canonical repository is what this
+# check's trust rests on. The kit ships no lock file: the consumer's
+# build resolves its dependencies on the consumer's own lock.
 # Without a clone it clones VOS bare, without blobs, into a scratch
 # directory under $VOS_SYNC_SCRATCH (default: $TMPDIR), removed after.
 # Needs bash, git and Python 3.11 or later.
@@ -22,19 +30,21 @@ fail() {
     exit 1
 }
 
-[ $# -ge 1 ] && [ $# -le 2 ] || fail "usage: vos-sync.sh <kit directory> [<a local VOS clone>]"
+[ $# -ge 2 ] && [ $# -le 3 ] || fail "usage: vos-sync.sh <kit directory> <expected tag> [<a local VOS clone>]"
 kit=$1
+expected=$2
 [ -f "$kit/VENDOR" ] || fail "$kit has no VENDOR file"
 tag=$(sed -n 's/^tag = "\(.*\)"$/\1/p' "$kit/VENDOR")
 [[ "$tag" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ ]] || fail "VENDOR names no tag a kit is vendored from"
+[ "$tag" = "$expected" ] || fail "VENDOR names tag $tag, expected $expected"
 
 base=${VOS_SYNC_SCRATCH:-${TMPDIR:-/tmp}}
 mkdir -p "$base"
 scratch=$(mktemp -d "$base/vos-sync.XXXXXX")
 trap 'rm -rf "$scratch"' EXIT
 
-if [ $# -eq 2 ]; then
-    repo=$2
+if [ $# -eq 3 ]; then
+    repo=$3
 else
     git clone --quiet --bare --filter=blob:none -- "$VOS_URL" "$scratch/vos.git"
     repo=$scratch/vos.git

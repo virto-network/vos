@@ -2,9 +2,12 @@
 //! ids of the test actors' kernels the known statements are made by, the
 //! fold circuit's hash `H_fold` (every node's fold word), and the final
 //! wrap's preprocessed root (`format::MASKED_WRAP`), the final verifier's
-//! constant re-exported: `just repin` writes the others, and a circuit
-//! change that moves the root is written into `vos-pvm-final-verifier` by
-//! hand (a venue's verifying key).
+//! constant re-exported. `just repin` writes `H_fold` by this crate's
+//! `kernel` test and, on the node side, the program ids by
+//! `vos-kernel-tests`' (from the test actors, which a tree of `pvm/`
+//! alone does not hold: there the ids are neither written nor checked); a
+//! circuit change that moves the root is written into
+//! `vos-pvm-final-verifier` by hand (a venue's verifying key).
 //!
 //! `test-proof` recomputes each from its source under both of the
 //! prover's feature sets (with and without `debug-internals`): `H_fold`

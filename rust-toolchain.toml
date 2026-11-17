@@ -1,6 +1,7 @@
 [toolchain]
 channel = "nightly-2025-07-14"
-# The settlement verifier builds the standard library for its PVM target.
+# The venue guests (`final-verify`, the JAM statements service's program)
+# build the standard library for the PVM target.
 components = ["rust-src"]
 # `just check-no-std` builds the proof verifier for wasm32; `just
 # android-facility` the facility for ARM64 phones.

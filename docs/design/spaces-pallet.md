@@ -11,7 +11,8 @@ things:
 - the verifier crates, packaged for vendoring with a sync check (§3.1);
 - the conformance vectors in §10, and a node client tested against a mock
   of the interface in §9; the transport that takes that client to a live
-  Kreivo node is a port of master's substrate extension (§9.1).
+  Kreivo node is a port of the substrate extension VOS's master held at
+  `d2378274c` (§9.1).
 
 `KR` below is Kreivo's `runtime/kreivo/src` at master 87f8728.
 
@@ -256,16 +257,21 @@ VOS writes the kit; Kreivo vendors it whole and edits none of it.
   the kit could replace. Kreivo copies `pvm/proof/kit/vos-sync.sh` from
   the VOS tag into its own tree, outside `vendor/` (e.g.
   `scripts/vos-sync.sh`, under CODEOWNERS), and runs it in CI and a
-  `just vos-sync` recipe, with bash, git and Python 3.11:
+  `just vos-sync` recipe, with bash, git and Python 3.11, beside the tag
+  it expects, kept in a file under the same review (e.g.
+  `scripts/vos-verifier.tag`):
 
   ```
-  scripts/vos-sync.sh vendor/vos-verifier [<a local VOS clone>]
+  scripts/vos-sync.sh vendor/vos-verifier "$(cat scripts/vos-verifier.tag)" [<a local VOS clone>]
   ```
 
   The bootstrap pins VOS's canonical repository
   (`https://codeberg.org/Virto/VOS.git`), clones it bare without blobs
   (or takes a local clone given as its argument), checks that the tag
-  `VENDOR` names is there, and runs `vos_kit.py` as that tag holds it:
+  `VENDOR` names is the expected one (a kit vendored at another tag, an
+  older one before a fix among them, is refused, and a re-pin is a
+  reviewed one-line change outside `vendor/`) and that VOS holds it, and
+  runs `vos_kit.py` as that tag holds it:
   - **the tree's hash** against `VENDOR`'s;
   - **`VENDOR`'s names:** a tag is required (a name of `A–Z a–z 0–9 . _ /
     -`, not starting with `-`), the commit 40 hex digits, and the tag
@@ -283,6 +289,14 @@ VOS writes the kit; Kreivo vendors it whole and edits none of it.
   the checkout itself, a kit vendored at a commit accepted there alone.
   A re-pin is a new vendor at a new tag and a sync, never an edit under
   `vendor/`.
+- **What the sync's trust rests on:** VOS's tags are not signed, so
+  whoever can push a tag to VOS's canonical repository can bless a
+  commit: push access to that repository is the root of the check.
+- **The kit ships no lock file.** Kreivo's runtime resolves the kit's
+  dependencies on Kreivo's own `Cargo.lock`, so the versions it links,
+  like its feature unification, are outside VOS's check;
+  `pvm/proof/kit/Cargo.lock` is the lock VOS's `just check-kit` builds
+  the kit on.
 
 ## 4. Configuration
 
@@ -760,7 +774,7 @@ whose key is listed leads.
 
 The **mock** VOS tests against implements exactly this table and §6–§8.
 
-### 9.1 The node-side chain transport: master's substrate extension, ported
+### 9.1 The node-side chain transport: the substrate extension, ported
 
 VOS ships the client's logic, not its chain transport:
 - `KreivoVenue`, the `VenueClient` the node anchors and submits through;
@@ -768,12 +782,13 @@ VOS ships the client's logic, not its chain transport:
 - the `Sender`, which sends a call at most once;
 - the `Transport` trait under them (`tools/kreivo/src/transport.rs`).
 
-**Where the transport comes from.** VOS master already has a Substrate
-integration on `sube`: `extensions/substrate`. It runs sube over the
-smoldot light client and submits externally signed V4 transactions. Its
-submission is replay-safe, and it hardens nonces and cancellation. It is
-written against master's old extension ABI, and vos-core has no extension
-host yet (`open.md`, "The extension host").
+**Where the transport comes from.** VOS's master at `d2378274c` holds a
+Substrate integration on `sube`: `extensions/substrate` (the change that
+lands `pvm/` alone removes it from master; read it at that commit). It
+runs sube over the smoldot light client and submits externally signed V4
+transactions. Its submission is replay-safe, and it hardens nonces and
+cancellation. It is written against that tree's old extension ABI, and
+vos-core has no extension host yet (`open.md`, "The extension host").
 - The node-side Kreivo transport is expected to be a port of that
   extension onto vos-core's extension host.
 - **Who owns what:**
@@ -793,9 +808,9 @@ host yet (`open.md`, "The extension host").
   `node/venue/src/kreivo/chain.rs` at VOS commit `9e63e5a9`. Its review
   found the behaviours below.
 
-**What the transport must provide** ("ext": master's extension already
-covers it; "part": it covers part, and the port finishes it; unmarked: the
-port adds it):
+**What the transport must provide** ("ext": the extension at
+`d2378274c` already covers it; "part": it covers part, and the port
+finishes it; unmarked: the port adds it):
 - **Signing with the node's sr25519 key.**
   - ext: signing is external, so no key enters the extension. It
     prepares the exact V4 signing payload and checks the signature.
@@ -938,7 +953,11 @@ tag's, byte for byte.
   hand-rolled encodings. It takes `parity-scale-codec` as a std, test-only
   dependency, outside the vendored tree.
 - **The files** (`conformance/` in the kit; in VOS `tools/kreivo/conformance`,
-  written by `just conformance`, refused stale by `just check`, the vectors' own test):
+  written by the node side's `just conformance`, refused stale by the node
+  side's `just check`, the vectors' own test; and held to the fixtures the
+  kit carries wherever the kit is vendored: `vos_kit.py` refuses vectors
+  whose proof is not the kit's by length and hash, or whose patches or
+  byte ranges lie past their fixture):
   - `spaces.json`: the constants (§4's suggested values, `UNITS =
     10^12`, `FeeBound = UNITS`, the existential deposit `UNITS / 1000`,
     `ForfeitTo` the `py/trsry` pallet account), labels for the accounts and
