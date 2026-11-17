@@ -54,26 +54,41 @@ static ALLOCATOR: RuntimeAllocator = RuntimeAllocator;
 type Offset = u16;
 const OFFSET_LENGTH: usize = core::mem::size_of::<Offset>();
 
-// The same alignment scheme as `sp_io::global_alloc_wasm`: the host aligns
-// to 8, larger alignments are padded and the offset kept just before the
-// returned pointer. `realloc` is GlobalAlloc's default (allocate, copy,
-// free), as there.
+/// The alignment the host's allocations have.
+const HOST_ALIGN: usize = 8;
+
+// The host aligns to 8: an allocation aligned to 8 or less is the host's
+// own, with nothing before or after it. A larger alignment is padded by
+// `align` bytes and the pointer moved past at least `OFFSET_LENGTH` of
+// them to the next aligned address, the distance kept in the bytes just
+// before it. `realloc` is GlobalAlloc's default (allocate, copy, free).
 unsafe impl GlobalAlloc for RuntimeAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let align = layout.align();
         let size = layout.size();
+        let padding = if align <= HOST_ALIGN { 0 } else { align };
         let Some(bytes) = size
-            .checked_add(align.saturating_sub(8))
+            .checked_add(padding)
             .and_then(|bytes| u32::try_from(bytes).ok())
         else {
             return core::ptr::null_mut();
         };
         let ptr = unsafe { ext_allocator_malloc_version_1(bytes) } as *mut u8;
-        let offset = ptr.align_offset(align);
-        if offset > Offset::MAX as usize || ptr.is_null() {
-            return core::ptr::null_mut();
+        if ptr.is_null() || padding == 0 {
+            return ptr;
         }
-        // SAFETY: the host allocated `size + align - 8` bytes from `ptr`.
+        let Some(offset) = ptr
+            .wrapping_add(OFFSET_LENGTH)
+            .align_offset(align)
+            .checked_add(OFFSET_LENGTH)
+            .filter(|&offset| offset <= padding && offset <= Offset::MAX as usize)
+        else {
+            unsafe { ext_allocator_free_version_1(ptr as u32) };
+            return core::ptr::null_mut();
+        };
+        // SAFETY: the host allocated `size + align` bytes from `ptr`, and
+        // `OFFSET_LENGTH <= offset <= align`: the offset's bytes and the
+        // `size` bytes after `ptr + offset` are within them.
         unsafe {
             let ptr = ptr.add(offset);
             (ptr.sub(OFFSET_LENGTH) as *mut Offset).write_unaligned(offset as Offset);
@@ -81,8 +96,13 @@ unsafe impl GlobalAlloc for RuntimeAllocator {
         }
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, _: Layout) {
-        // SAFETY: `ptr` came from `alloc`, its offset just before it.
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if layout.align() <= HOST_ALIGN {
+            unsafe { ext_allocator_free_version_1(ptr as u32) };
+            return;
+        }
+        // SAFETY: `ptr` came from `alloc` at this layout's alignment, its
+        // offset in the bytes just before it.
         unsafe {
             let offset = (ptr.sub(OFFSET_LENGTH) as *const Offset).read_unaligned();
             ext_allocator_free_version_1(ptr.sub(offset as usize) as u32);
