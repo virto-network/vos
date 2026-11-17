@@ -272,11 +272,7 @@ fn heavy_the_verify_gates_hold_over_seeds() {
         hashes.push((trees + fri_hashes) as f64);
         let name = format!("gate-{seed:02}");
         write(&name, masked::FORMAT, bytes, words);
-        files.push(
-            Path::new(env!("CARGO_TARGET_TMPDIR"))
-                .join("wrap")
-                .join(format!("{name}.proof")),
-        );
+        files.push(crate::common::wrap_files::directory().join(format!("{name}.proof")));
     }
     let decode = phases.iter().map(|&(decode, _)| decode).max().unwrap();
     let verify = phases.iter().map(|&(_, verify)| verify).max().unwrap();

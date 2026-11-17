@@ -64,7 +64,7 @@ phone out="target/phone":
 # prover, four at a time: at every core at once the recursion suite passed
 # 12 GiB, the limit the gates run under.
 test-recair:
-    cargo test -p vos-pvm-recair -p vos-pvm-device -- --test-threads=4
+    cargo test -p vos-pvm-recair -p vos-pvm-device -- --test-threads=4 --skip wrap_files::
 
 # Bench guests, built with the guest toolchain in `pvm/guest`.
 build-bench-guests:
@@ -125,14 +125,14 @@ vectors:
 test-proof: build-test-actors build-programs build-final-verify judge-wasm
     cargo test -p vos-pvm-proof --features debug-internals --lib --bins --test gates --test isa -- --test-threads=2
     cargo test -p vos-kernel-tests --features debug-internals --lib --test witness_input -- --test-threads=2
-    for test in (cargo test -p vos-pvm-proof --features debug-internals --test kernel -- --list --format terse --skip wrap_files:: | lines | where {|line| $line ends-with ': test' } | each {|line| $line | str replace ': test' '' }) { cargo test -p vos-pvm-proof --features debug-internals --test kernel $test -- --exact --test-threads=1 }
+    for test in (cargo test -p vos-pvm-proof --features debug-internals --test kernel -- --list --format terse | lines | where {|line| $line ends-with ': test' } | each {|line| $line | str replace ': test' '' }) { cargo test -p vos-pvm-proof --features debug-internals --test kernel $test -- --exact --test-threads=1 }
     for test in (cargo test -p vos-kernel-tests --features debug-internals --test kernel -- --list --format terse --skip reads:: | lines | where {|line| $line ends-with ': test' } | each {|line| $line | str replace ': test' '' }) { cargo test -p vos-kernel-tests --features debug-internals --test kernel $test -- --exact --test-threads=1 }
     cargo test -p vos-kernel-tests --features debug-internals --test kernel reads:: -- --test-threads=1
     cargo test -p vos-pvm-proof --test kernel constants:: -- --test-threads=1
     cargo test -p vos-kernel-tests --test kernel constants:: -- --test-threads=1
     cargo test -p vos-pvm-recair --features heavy-gates --test circuit --test recursion -- leakage heavy --test-threads=1
     cargo test -p vos-pvm-device --features heavy-gates --test device -- leakage heavy --test-threads=1
-    cargo test -p vos-pvm-proof --features debug-internals --test kernel wrap_files:: -- --test-threads=1
+    cargo test -p vos-pvm-recair --test recursion wrap_files:: -- --test-threads=1
     just test-carriers
 
 # The carrier audit (`proving.md` §5's R7, `vos_checker::carriers`):
@@ -900,7 +900,7 @@ gate: check doc-check deny check-venue-rules check-no-std check-no-leaks check-n
     just clippy-prover
     cargo test {{core_crates}} ...(python3 -I tools/gates/tiers.py heavy {{core_crates}} | split row ' ')
     cargo test {{core_crates}} --doc
-    cargo test -p vos-pvm-recair -p vos-pvm-device ...(python3 -I tools/gates/tiers.py heavy -p vos-pvm-recair -p vos-pvm-device | split row ' ') -- --test-threads=4
+    cargo test -p vos-pvm-recair -p vos-pvm-device ...(python3 -I tools/gates/tiers.py heavy -p vos-pvm-recair -p vos-pvm-device | split row ' ') -- --test-threads=4 --skip wrap_files::
     cargo test {{agent_crates}} ...(python3 -I tools/gates/tiers.py heavy {{agent_crates}} | split row ' ')
     cargo test {{agent_crates}} --doc
     just test-gateway-onion

@@ -2,17 +2,19 @@
 //! output: each a final wrap of `format::MASKED_WRAP` that verifies against
 //! its public words, its format, its words or its judgement's input, and
 //! nothing else, so no segment, leaf or fold proof is ever written there.
-//! Run by `just test-proof` after the suites that write them, which
-//! leave some: an empty directory fails.
+//! The writers are this binary's masked wraps and `vos-kernel-tests`' wraps
+//! (`../common/wrap_files.rs`). Run by `just test-proof` after the suites
+//! that write them, which leave some: an empty directory fails. Every other
+//! run of this binary skips it (`--skip wrap_files::`), since it would race
+//! its writers.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
 use vos_pvm_final_verifier::{PUBLIC_WORDS, masked};
 
 #[test]
 fn the_wrap_directory_holds_final_wraps_alone() {
-    let directory = Path::new(env!("CARGO_TARGET_TMPDIR")).join("wrap");
+    let directory = crate::common::wrap_files::directory();
     let entries = std::fs::read_dir(&directory).expect("the suites' wrap files");
     let mut wraps: BTreeMap<String, BTreeMap<String, Vec<u8>>> = BTreeMap::new();
     for entry in entries {

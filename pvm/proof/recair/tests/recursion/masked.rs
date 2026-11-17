@@ -32,6 +32,7 @@
 //! 16 [measured]).
 
 use crate::common::bump_m31;
+use crate::common::wrap_files::write;
 use crate::jam;
 use crate::wrap::one_segment;
 
@@ -79,23 +80,6 @@ fn masked_wrap() -> &'static Masked {
             words,
         }
     })
-}
-
-/// A wrap's proof, format and public words, under the target's tmp
-/// directory as `wrap/<name>.{proof,format,words}`: the Wasm harness's
-/// input (`final-verifier/wasm/run`) and the fuzz targets'
-/// `format::MASKED_WRAP` golden.
-fn write(name: &str, format: u32, proof: &[u8], words: &[u32; PUBLIC_WORDS]) {
-    let directory = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("wrap");
-    std::fs::create_dir_all(&directory).expect("the wrap's directory");
-    let words: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
-    for (extension, bytes) in [
-        ("proof", proof),
-        ("format", &format.to_le_bytes()[..]),
-        ("words", &words),
-    ] {
-        std::fs::write(directory.join(format!("{name}.{extension}")), bytes).expect("writes");
-    }
 }
 
 /// The wrap's set under any relations: its trees' layout.

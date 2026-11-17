@@ -2,7 +2,6 @@
 //! folds and wrap, the balance's, the device kernels, reads at a cut, the
 //! known programs' ids and the prover worker's throughput.
 
-#[path = "../../../../pvm/proof/tests/common/mod.rs"]
 mod common;
 
 #[global_allocator]
