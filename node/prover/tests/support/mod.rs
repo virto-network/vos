@@ -8,12 +8,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use vos_abi::ids::{AgentId, ProgramHash};
+use vos_abi::result::Attest;
+use vos_abi::vos_anchor::{Anchor, RootKind, RootRead, SpaceId, VenueId, WindowClock};
 use vos_node_prover::{Host, Jobs, Options, Prover, Record, State, StatementError, Worker};
 use vos_venue::vos_statement::{ProgramId, Refusal, Statement, StatementId};
 use vos_venue::{AnchorOutcome, Held, Status, SubmitOutcome, UNJUDGED, VenueClient};
-use vos_wire::ids::{AgentId, ProgramHash};
-use vos_wire::result::Attest;
-use vos_wire::vos_anchor::{Anchor, RootKind, RootRead, SpaceId, VenueId, WindowClock};
 
 pub(crate) use memory::MemoryJobs;
 

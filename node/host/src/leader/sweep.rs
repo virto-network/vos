@@ -4,10 +4,11 @@
 use std::ops::Bound;
 use std::time::{Duration, Instant};
 
-use vos_wire::ids::AgentId;
-use vos_wire::keys::{Due, DueIndex};
-use vos_wire::result::Write;
-use vos_wire::{defaults, keys};
+use vos_abi::ids::AgentId;
+use vos_abi::keys;
+use vos_abi::keys::{Due, DueIndex};
+use vos_abi::result::Write;
+use vos_wire::defaults;
 
 use super::Leader;
 use crate::fault::{Fault, read};
@@ -177,8 +178,8 @@ impl Leader {
 
 #[cfg(test)]
 mod tests {
-    use vos_wire::ids::{AgentId, SessionId};
-    use vos_wire::result::Write;
+    use vos_abi::ids::{AgentId, SessionId};
+    use vos_abi::result::Write;
 
     use super::*;
     use crate::store::{Fjall, PersistMode};
@@ -259,7 +260,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Fjall::open(dir.path()).unwrap();
         let mut sweeps = Sweeps::default();
-        let bindings: Vec<Write> = (0..2 * defaults::SWEEP_BINDINGS)
+        let bindings: Vec<Write> = (0..2 * vos_abi::defaults::SWEEP_BINDINGS)
             .map(|n| put(keys::due(5, Due::Binding([n as u8; 32]))))
             .collect();
         apply(&store, 1, &bindings);
@@ -267,7 +268,7 @@ mod tests {
         let first = sweeps.first_due(&store.snapshot(), AGENT).unwrap();
         assert_eq!(first, Some((5, Due::Binding([0; 32]))));
         let rows = sweeps.due_rows(&store.snapshot(), AGENT, 10).unwrap();
-        assert_eq!(rows.len(), 1 + defaults::SWEEP_BINDINGS);
+        assert_eq!(rows.len(), 1 + vos_abi::defaults::SWEEP_BINDINGS);
         assert_eq!(rows[0], (10, Due::Session(SessionId(10))));
         assert!(
             rows[1..]

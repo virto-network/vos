@@ -7,7 +7,8 @@
 use std::fmt;
 
 use blake2::{Blake2b512, Digest as _};
-use vos_wire::credentials::{self, EMPTY, P, Path, Tag, Words};
+use vos_abi::credentials::{self, EMPTY, P, Tag, Words};
+use vos_wire::credentials::Path;
 
 use super::{Kind, Needle, Needles, SMALL_FLOOR};
 
@@ -68,7 +69,7 @@ impl Needles {
         }
         for (what, bytes) in [("o", &source_output[..]), ("s", &secret[..])] {
             let hashes = [
-                ("BLAKE2b-256", vos_wire::vos_anchor::blake2b_256(&[bytes])),
+                ("BLAKE2b-256", vos_abi::vos_anchor::blake2b_256(&[bytes])),
                 ("BLAKE3", *blake3::hash(bytes).as_bytes()),
             ];
             for (hash, digest) in hashes {

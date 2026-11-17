@@ -10,15 +10,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use vos_abi::ids::{AgentId, InstanceId, Principal};
+use vos_abi::records::{Installed, unstored};
+use vos_abi::schema::Schema;
+use vos_abi::{Decode, Encode, keys};
 use vos_api::{Kind, Mark};
-use vos_wire::ids::{AgentId, InstanceId, Principal};
 use vos_wire::ingress::{
     AdmissionRefusal, AgentInfo, QueryCall, Rejection, Response, WorkflowRead,
     workflow_read_horizon,
 };
-use vos_wire::records::{Installed, unstored};
-use vos_wire::schema::Schema;
-use vos_wire::{Decode, Encode, keys};
 
 use crate::node::Inner;
 use crate::queries::Asked;

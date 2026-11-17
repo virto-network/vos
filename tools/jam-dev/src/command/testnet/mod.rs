@@ -19,18 +19,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use vos_abi::abi::cap::Target;
+use vos_abi::ids::{InstanceId, MethodId, ProgramHash};
+use vos_abi::records::{Workflow, WorkflowState, unstored};
+use vos_abi::result::{Outcome, Step, WorkResult, digest};
+use vos_abi::{Decode, Encode, keys};
 use vos_jam::programs::Installable;
 use vos_jam::{Builder, Chain, Emulated, Error, Runner, Store, Taken};
 use vos_jam_dev::live::statements::{ENDOWMENT, PREIMAGE_TIMEOUT};
 use vos_jam_dev::live::{Live, PolkaJam};
 use vos_pvm::refine::PreparedProgram;
-use vos_wire::abi::cap::Target;
 use vos_wire::batch::{Admin, Input};
-use vos_wire::ids::{InstanceId, MethodId, ProgramHash};
 use vos_wire::package::slot_of;
-use vos_wire::records::{Workflow, WorkflowState, unstored};
-use vos_wire::result::{Outcome, Step, WorkResult, digest};
-use vos_wire::{Decode, Encode, keys};
 
 use super::reference::Vos;
 use super::{METADATA, write_service};
@@ -117,8 +117,8 @@ impl Actors {
                 derivation: package.derivation.clone(),
                 roles: vec![],
                 target: Target::Jam,
-                space: vos_wire::SpaceId::NONE,
-                clock: vos_wire::WindowClock::DEFAULT,
+                space: vos_abi::SpaceId::NONE,
+                clock: vos_abi::WindowClock::DEFAULT,
             })
         };
         vec![install(COUNTER, &self.counter), install(SHOP, &self.shop)]

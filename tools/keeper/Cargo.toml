@@ -17,4 +17,5 @@ hex = "0.4"
 # The operator's signed commands and the keeper's calls at `Homes`, each
 # node's API over its socket or a loopback gateway.
 vos-node = { path = "../../node/host" }
+vos-abi = { workspace = true }
 vos-wire = { workspace = true }

@@ -13,15 +13,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ed25519_dalek::SigningKey;
 use merkle_crdt::{Author, Node};
+use vos_abi::abi::Failure;
+use vos_abi::ids::{InstanceId, MethodId, Principal};
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode};
 use vos_light::group::{Archive, archive};
 use vos_light::release::{self, Package};
 use vos_light::sync::{self, Blake2b256, Call, Cid, Hold, Op, Ops, Quarantine};
 use vos_light::{Config, Disk, Error, Light, MAX_ARGUMENTS};
 use vos_testkit::programs;
-use vos_wire::abi::Failure;
-use vos_wire::ids::{InstanceId, MethodId, Principal};
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode};
 
 const BOOK: InstanceId = InstanceId(2);
 const DEVICE: Principal = Principal::Client([0xd1; 32]);
@@ -470,7 +470,7 @@ fn invalid_operations_are_quarantined_never_applied_and_reported() {
     let new: Vec<_> = after.iter().filter(|row| !before.contains(row)).collect();
     let quarantined_rows = new
         .iter()
-        .filter(|(key, _)| key.starts_with(&vos_wire::keys::quarantined_op_prefix(BOOK)))
+        .filter(|(key, _)| key.starts_with(&vos_abi::keys::quarantined_op_prefix(BOOK)))
         .count();
     assert_eq!(quarantined_rows, 4);
     let replayed = device.light.replay(BOOK).unwrap();

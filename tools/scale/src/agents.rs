@@ -11,10 +11,10 @@ use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
+use vos_abi::ids::{AgentId, InstanceId};
+use vos_abi::result::Outcome;
 use vos_node::client::{Client, Operator};
-use vos_wire::ids::{AgentId, InstanceId};
 use vos_wire::ingress::{Install, Response};
-use vos_wire::result::Outcome;
 
 use crate::deploy::Deployed;
 use crate::hosts::wait_for;
@@ -306,7 +306,7 @@ pub fn create(inventory: &Inventory, request: &Request) -> Result<Agents, String
             &operators,
             agent,
             &replicas,
-            vos_wire::served::REPRESENTATIVE.0,
+            vos_abi::served::REPRESENTATIVE.0,
             &read_elf(path)?,
             Vec::new(),
         )?;
@@ -315,7 +315,7 @@ pub fn create(inventory: &Inventory, request: &Request) -> Result<Agents, String
             agent: agent.0,
             replicas,
             actor: "representative".into(),
-            instance: vos_wire::served::REPRESENTATIVE.0,
+            instance: vos_abi::served::REPRESENTATIVE.0,
             leader: None,
         });
     }

@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Mutex;
 
+use vos_abi::result::{InputRef, Outcome, Run, Step, WorkResult};
 use vos_wire::peer::NodeNumber;
-use vos_wire::result::{InputRef, Outcome, Run, Step, WorkResult};
 
 use crate::lock;
 use crate::store::Origin;

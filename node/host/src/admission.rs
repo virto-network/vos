@@ -25,11 +25,11 @@
 //! every request read of any of its agents so, checked from the frame's
 //! kind and mark before its body is decoded.
 
+use vos_abi::ids::{AgentId, Session};
+use vos_abi::keys;
+use vos_abi::records::{Admitting, unstored};
 use vos_api::{Kind, Mark};
-use vos_wire::ids::{AgentId, Session};
 use vos_wire::ingress::{AdmissionRefusal, Rejection, Response};
-use vos_wire::keys;
-use vos_wire::records::{Admitting, unstored};
 
 use crate::fault::{Fault, read};
 use crate::node::Inner;

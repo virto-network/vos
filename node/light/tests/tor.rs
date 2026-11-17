@@ -17,6 +17,10 @@ use russh::keys::{PublicKeyOrCertificate, ssh_key};
 use russh::server::{Auth, ChannelOpenHandle, Msg, Session, VerifiedPublicKey};
 use russh::{Channel, ChannelId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use vos_abi::credentials::{self, DEPTH, EMPTY, Words};
+use vos_abi::ids::AgentId;
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode};
 use vos_api::{Event, Framing, Kind, Reader, Requests, frame};
 use vos_light::route::{Clearnet, Purpose, Refused, Route, Routes};
 use vos_light::tor::{
@@ -24,11 +28,8 @@ use vos_light::tor::{
     onion_address,
 };
 use vos_light::{DeviceError, TreeKeeper, wire};
-use vos_wire::credentials::{self, Change, DEPTH, EMPTY, Feed, Onion, RootEntry, Words};
-use vos_wire::ids::AgentId;
+use vos_wire::credentials::{Change, Feed, Onion, RootEntry};
 use vos_wire::ingress::{QueryCall, Response};
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode};
 
 /// What the gateway's capture holds of one connection.
 #[derive(Clone, Debug)]

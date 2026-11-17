@@ -65,13 +65,13 @@ use sha2::{Digest as _, Sha256};
 use stwo::core::channel::{Blake2sM31Channel, Channel};
 use stwo::core::proof_of_work::GrindOps;
 use stwo::prover::backend::simd::SimdBackend;
+use vos_abi::Decode;
+use vos_abi::credentials::{leaf, root_of};
 use vos_light::release::Release;
 use vos_light::{
     AuthWitness, Call, DEVICE_FORMAT, DeviceProgram, Digest, Proven, Prover, ProverConfig, Threads,
     derive_secret, member, verify,
 };
-use vos_wire::Decode;
-use vos_wire::credentials::{leaf, root_of};
 
 mod device;
 mod group;

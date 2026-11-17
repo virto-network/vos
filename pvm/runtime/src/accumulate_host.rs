@@ -6,7 +6,7 @@
 //! Paper natural encoding, and reads each input with `fetch` (kind 15 for
 //! one input, 14 for the encoded sequence). An input is a work item's
 //! operand or a deferred transfer, encoded with its kind (see
-//! `vos_wire::jam::AccumulateInput`). `read` and `write` reach
+//! `vos_abi::jam::AccumulateInput`). `read` and `write` reach
 //! the agent's own storage. `gas` and `log` are served as in refine. Every
 //! other call answers `WHAT`: the node serves no service-management calls.
 //!

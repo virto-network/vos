@@ -4,11 +4,11 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use vos_abi::ids::{AgentId, InstanceId, MethodId, WorkflowId};
+use vos_abi::schema::Schema;
+use vos_abi::{Decode, Encode};
 use vos_api::Kind;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, WorkflowId};
 use vos_wire::ingress::{Consistency, Rejection, Response};
-use vos_wire::schema::Schema;
-use vos_wire::{Decode, Encode};
 
 use super::{
     Client, ClientError, Target, Transport, decode_answer, naming, signed_query,

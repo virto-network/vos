@@ -21,6 +21,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
+use vos_abi::abi::{Failure, Refusal};
+use vos_abi::credentials::Digest;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal};
+use vos_abi::records::RETIREMENT_MS;
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode, SpaceId, WindowClock};
 use vos_checker::Nodes;
 use vos_checker::calls::installed;
 use vos_checker::programs::{actor, actor_elf, method, program_elf};
@@ -28,19 +34,15 @@ use vos_light::release::Release;
 use vos_light::{AuthWitness, Call, DEVICE_FORMAT, DeviceProgram, Prover, ProverConfig, Threads};
 use vos_net::Class;
 use vos_node::client::{self, Client};
-use vos_wire::abi::{Failure, Refusal};
-use vos_wire::credentials::{
-    self as tree, AuthClaim, Bound, CredentialError, Digest, Path, RootEntry,
-};
 use vos_wire::defaults::ROOT_GRACE_MS;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
 use vos_wire::ingress::{
     CredentialRefusal, Credentialed, DeviceWindow, FormatWindow, Rejection, Response,
 };
 use vos_wire::peer::{NodeNumber, PeerMessage};
-use vos_wire::records::RETIREMENT_MS;
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode, SpaceId, WindowClock};
+use vos_wire::{
+    credentials as tree,
+    credentials::{AuthClaim, Bound, CredentialError, Path, RootEntry},
+};
 
 use crate::harness::{Cluster, NODES};
 
@@ -497,8 +499,8 @@ fn every_ingress_refusal_comes_in_its_check_order() {
         format: 38,
         proof: vec![7; vos_pvm_device::MAX_PROOF_BYTES + 1],
         expires_ms: real.expires_ms + 600_000,
-        claim: vec![1; vos_wire::abi::cap::CLAIM + 1],
-        arguments: vec![0; vos_wire::abi::cap::REQUEST - vos_wire::abi::cap::CLAIM + 1],
+        claim: vec![1; vos_abi::abi::cap::CLAIM + 1],
+        arguments: vec![0; vos_abi::abi::cap::REQUEST - vos_abi::abi::cap::CLAIM + 1],
         ..real.clone()
     };
     let check = |call: &Credentialed, code: CredentialRefusal, what: &str| match (
@@ -1300,9 +1302,12 @@ fn an_actor_kernels_proof_is_checked_by_its_handler_at_apply() {
     let leader = founded.cluster.leader(agent).unwrap();
     // The kernel takes the secret's words: a test's member, its secret
     // public.
-    let words: tree::Words = core::array::from_fn(|i| 0x6d00_0000 + i as u32);
-    let compress = tree::compress;
-    let member = tree::digest(&compress(&tree::Tag::Member.block(), &words));
+    let words: vos_abi::credentials::Words = core::array::from_fn(|i| 0x6d00_0000 + i as u32);
+    let compress = vos_abi::credentials::compress;
+    let member = vos_abi::credentials::digest(&compress(
+        &vos_abi::credentials::Tag::Member.block(),
+        &words,
+    ));
     founded.write(CREDENTIALS, "enroll", member);
     let path = {
         let path: Option<Path> = founded.read(CREDENTIALS, "path", member);
@@ -1317,9 +1322,9 @@ fn an_actor_kernels_proof_is_checked_by_its_handler_at_apply() {
     // no scope, so each name is another nullifier of one member.
     let nullifier = |name: &str| {
         let scope = founded.scope(DEVICE, name);
-        let nullifier = tree::digest(&compress(
-            &compress(&tree::Tag::Nf.block(), &words),
-            &tree::words(&scope).unwrap(),
+        let nullifier = vos_abi::credentials::digest(&compress(
+            &compress(&vos_abi::credentials::Tag::Nf.block(), &words),
+            &vos_abi::credentials::words(&scope).unwrap(),
         ));
         (scope, nullifier)
     };
@@ -1332,7 +1337,7 @@ fn an_actor_kernels_proof_is_checked_by_its_handler_at_apply() {
         let siblings = path
             .siblings
             .0
-            .map(|sibling| tree::words(&sibling).unwrap());
+            .map(|sibling| vos_abi::credentials::words(&sibling).unwrap());
         let public = claim.clone().try_into().expect("auth's public bytes");
         let arguments = vos_pvm_device::auth_arguments(&siblings, &words, path.slot, &public);
         let proof = founded
@@ -1420,7 +1425,7 @@ fn an_actor_kernels_proof_is_checked_by_its_handler_at_apply() {
         "another nullifier than the proof's"
     );
     let mut wide = proof.clone();
-    wide.claim[1 + 64..1 + 68].copy_from_slice(&tree::P.to_le_bytes());
+    wide.claim[1 + 64..1 + 68].copy_from_slice(&vos_abi::credentials::P.to_le_bytes());
     assert_eq!(
         send(at, &fresh, &wide),
         Answer::Refused(CredentialRefusal::Proof),

@@ -4,8 +4,8 @@
 
 use alloc::vec::Vec;
 
-use vos_wire::scale::DecodeError;
-use vos_wire::{Decode, Encode};
+use vos_abi::scale::DecodeError;
+use vos_abi::{Decode, Encode};
 
 use crate::runtime::Output;
 
@@ -13,7 +13,7 @@ use crate::runtime::Output;
 /// written once, in place, as the io-hash's encoding `E` (each part a
 /// compact length then its bytes, then a root count of 0: a device kernel
 /// reads none), which is both what the host reads at the halt
-/// ([`vos_wire::result::KernelReturn::from_device_return`]) and what the io-hash absorbs
+/// ([`vos_abi::result::KernelReturn::from_device_return`]) and what the io-hash absorbs
 /// where it lies, through the Poseidon2 call alone
 /// ([`vos_pvm_precompiles::device_io::padded_device_io_words`]): no BLAKE2b, no
 /// re-encoding, no copy.

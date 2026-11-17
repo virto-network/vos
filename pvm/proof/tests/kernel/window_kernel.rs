@@ -30,6 +30,11 @@ use cipher_clerk::conventions::PseudoAccount;
 use cipher_clerk::ids::JournalId;
 use cipher_clerk::kernel::Value;
 use cipher_clerk::types::{Account, Layer};
+use vos_abi::abi::AttestError;
+use vos_abi::served::Served;
+use vos_abi::vos_anchor::venue::AnchorRefusal;
+use vos_abi::vos_anchor::{RootRead, VenueId, space_id, space_root};
+use vos_abi::{Encode, SpaceId};
 use vos_pvm_proof::format::SEGMENT;
 use vos_pvm_proof::program_id::KernelEntry;
 use vos_pvm_proof::segment::{SegmentCursor, segment_bounds_budgeted};
@@ -39,11 +44,6 @@ use vos_statement::vos_pvm_final_verifier::Error as FinalError;
 use vos_statement::{ProgramId, Refusal, Statement};
 use vos_tree::{Blake2b, Hasher};
 use vos_venue::{SubmitOutcome, VenueClient};
-use vos_wire::abi::AttestError;
-use vos_wire::served::Served;
-use vos_wire::vos_anchor::venue::AnchorRefusal;
-use vos_wire::vos_anchor::{RootRead, VenueId, space_id, space_root};
-use vos_wire::{Encode, SpaceId};
 
 const PEER: [u8; 32] = [0xB2; 32];
 const OPERATOR: [u8; 32] = [0x0C; 32];
@@ -748,7 +748,7 @@ fn the_window_is_stated_at_the_model_venue() {
         "a missing representative row"
     );
 
-    let (net, seq, c_new) = vos_wire::Decode::decode(&statement.output)
+    let (net, seq, c_new) = vos_abi::Decode::decode(&statement.output)
         .map(|(settlement, _): (Settlement, _)| settlement)
         .expect("the settlement");
     let tampered = Statement {

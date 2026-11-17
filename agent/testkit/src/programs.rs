@@ -12,10 +12,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
+use vos_abi::ids::{MethodId, ProgramHash};
+use vos_abi::records::Derivation;
+use vos_abi::schema::Schema;
 use vos_pvm_compiler::Derived;
-use vos_wire::ids::{MethodId, ProgramHash};
-use vos_wire::records::Derivation;
-use vos_wire::schema::Schema;
 
 /// The repository's root.
 fn root() -> PathBuf {
@@ -241,7 +241,7 @@ impl Programs {
 /// The tag of an actor's table or committed map named `name`, as
 /// `#[actor]` derives it.
 pub fn table_tag(name: &str) -> u32 {
-    vos_wire::ids::derive_id("vos/table/", name)
+    vos_abi::ids::derive_id("vos/table/", name)
 }
 
 /// The schema `program` carries.

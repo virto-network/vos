@@ -32,11 +32,11 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::Signer;
+use vos_abi::ids::AgentId;
+use vos_abi::keys;
+use vos_abi::vos_anchor::{Anchor, RootKind};
 use vos_venue::{AnchorOutcome, Held};
-use vos_wire::ids::AgentId;
-use vos_wire::keys;
 use vos_wire::peer::{NodeNumber, PeerMessage};
-use vos_wire::vos_anchor::{Anchor, RootKind};
 
 use super::Leader;
 use crate::lock;

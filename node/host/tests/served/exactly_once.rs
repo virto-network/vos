@@ -14,6 +14,9 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use vos_abi::ids::{AgentId, InstanceId, MethodId};
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode, WindowClock, keys};
 use vos_checker::calls::install_at_leader;
 use vos_checker::programs::{actor, package, schema};
 use vos_checker::rounds::{ASKED, ROUNDS, Rounds, TOLD};
@@ -22,9 +25,6 @@ use vos_checker::{
     check_tallies, wait_until,
 };
 use vos_node::Node;
-use vos_wire::ids::{AgentId, InstanceId, MethodId};
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode, WindowClock, keys};
 
 use crate::faults::faults;
 use crate::harness::{Cluster, NODES, query};

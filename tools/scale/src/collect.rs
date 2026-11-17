@@ -8,7 +8,7 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use vos_wire::ids::AgentId;
+use vos_abi::ids::AgentId;
 use vos_wire::ingress::Response;
 
 use crate::agents::Agents;

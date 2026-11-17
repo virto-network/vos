@@ -6,14 +6,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use proptest::prelude::*;
-use vos_wire::Encode;
-use vos_wire::abi::Refusal;
+use vos_abi::Encode;
+use vos_abi::abi::Refusal;
+use vos_abi::ids::{Session, SessionId, SessionRef};
+use vos_abi::keys;
+use vos_abi::keys::Due;
+use vos_abi::records::{SessionMark, stored};
+use vos_abi::result::{InputRef, Outcome, Run, Step, WorkResult, Write};
 use vos_wire::batch::Input;
-use vos_wire::ids::{Session, SessionId, SessionRef};
-use vos_wire::keys::Due;
-use vos_wire::records::{SessionMark, stored};
-use vos_wire::result::{InputRef, Outcome, Run, Step, WorkResult, Write};
-use vos_wire::{defaults, expiry, keys};
+use vos_wire::{defaults, expiry};
 
 use crate::common::{Node, counter_only, done, increment_in, ran, ran_step, refused, setup};
 

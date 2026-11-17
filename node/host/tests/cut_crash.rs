@@ -32,9 +32,9 @@ mod model;
 use std::path::Path;
 use std::time::Duration;
 
+use vos_abi::keys;
 use vos_checker::crash::{Round, Rounds, journal};
 use vos_node::roots;
-use vos_wire::keys;
 
 use model::{AGENT, Entry, History, MAPS, Replica, check_proof, cuts, row, undos, workload};
 

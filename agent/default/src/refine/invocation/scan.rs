@@ -3,8 +3,8 @@
 
 use alloc::vec::Vec;
 
-use vos_wire::Encode;
-use vos_wire::keys::Transform;
+use vos_abi::Encode;
+use vos_abi::keys::Transform;
 
 use super::Invocation;
 use crate::refine::base::Corrupt;

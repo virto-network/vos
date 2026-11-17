@@ -3,6 +3,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use vos_abi::Encode;
+use vos_abi::ids::AgentId;
+use vos_abi::result::Outcome;
 use vos_checker::carriers::{self, Audit, Canary, Kind, Logs, Reach};
 use vos_net::{Class, Network, Peer};
 use vos_node::{Config, Hooks};
@@ -10,11 +13,8 @@ use vos_node_prover::Prover;
 use vos_node_prover::masked::Disclosing;
 use vos_venue::VenueClient;
 use vos_venue::vos_statement::Statement;
-use vos_wire::Encode;
 use vos_wire::batch::Request;
-use vos_wire::ids::AgentId;
 use vos_wire::peer::NodeNumber;
-use vos_wire::result::Outcome;
 
 use crate::common::{ALICE, Cluster, wait_until};
 use crate::support::past_close;

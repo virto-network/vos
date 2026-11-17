@@ -7,15 +7,15 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use vos_abi::Decode;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal};
+use vos_abi::keys;
+use vos_abi::records::{Installed, unstored};
+use vos_abi::result::Outcome;
 use vos_raft::core::ReadIndexError;
-use vos_wire::Decode;
 use vos_wire::batch::{Query, Work};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
 use vos_wire::ingress::{Consistency, Rejection, Response};
-use vos_wire::keys;
 use vos_wire::peer::{NodeNumber, PeerMessage};
-use vos_wire::records::{Installed, unstored};
-use vos_wire::result::Outcome;
 
 use crate::asking::{PAUSE, REASK, pause};
 use crate::fault::Fault;

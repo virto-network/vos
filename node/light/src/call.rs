@@ -2,10 +2,10 @@
 //! and its binding, computed here so a client never builds them.
 
 use scale::Encode as _;
-use vos_wire::SpaceId;
-use vos_wire::abi::cap;
+use vos_abi::SpaceId;
+use vos_abi::abi::cap;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, derive_id};
 use vos_wire::credentials;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, derive_id};
 
 use crate::{DeviceError, Digest};
 

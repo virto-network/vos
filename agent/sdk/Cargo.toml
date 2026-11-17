@@ -7,7 +7,7 @@ description = "The VOS actor SDK: contexts, tables and the actor side of the ABI
 
 [dependencies]
 vos-sdk-macros = { workspace = true }
-vos-wire = { workspace = true }
+vos-abi = { workspace = true }
 # The proofs a read at a window's cut is served with, checked in the kernel.
 vos-tree = { workspace = true }
 vos-pvm-precompiles = { workspace = true }

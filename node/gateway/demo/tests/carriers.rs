@@ -34,6 +34,10 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use vos_abi::credentials as tree;
+use vos_abi::credentials::Tag;
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode};
 use vos_checker::carriers::{self, Audit, Kind, Logs, Reach};
 use vos_gateway_demo::{CREDENTIALS, LocalSpace, PAYMENTS, POLL, Served, random};
 use vos_light::route::{Purpose, Routes};
@@ -44,10 +48,8 @@ use vos_light::{
     TreeKeeper,
 };
 use vos_pvm_recair::masked::{MaskRng, drawn_in};
-use vos_wire::credentials::{self as tree, AuthClaim, Path, Siblings, Tag};
+use vos_wire::credentials::{AuthClaim, Path, Siblings};
 use vos_wire::ingress::CredentialRefusal;
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode};
 
 /// The space's handle, which the member's secret source is asked for.
 const HANDLE: [u8; 32] = [0x48; 32];
@@ -323,7 +325,7 @@ fn no_carrier_through_the_onion_holds_a_members_device_secret_or_its_place() {
         let body = ask(Purpose::Proven, wire::credentialed(call, proof));
         wire::credentialed_answer(&body).unwrap()
     };
-    let call_of = |instance: vos_wire::ids::InstanceId, name: &str, arguments: Vec<u8>| {
+    let call_of = |instance: vos_abi::ids::InstanceId, name: &str, arguments: Vec<u8>| {
         Call::new(
             space_id,
             agent.0,

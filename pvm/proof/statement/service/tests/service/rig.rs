@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
+use vos_abi::jam::{AccumulateInput, Operand, RefineArgs};
 use vos_pvm::ExitReason;
 use vos_pvm::refine::PreparedProgram;
 use vos_pvm::refine_host::{JamItem, JamRefine};
@@ -15,7 +16,6 @@ use vos_statement_service::config::{Config, configure};
 use vos_statement_service::item::Item;
 use vos_statement_service::state::{self, AnchorRecord, Outcome, SpaceRecord, Storage, keys};
 use vos_statement_service::{MAX_VERDICT_BYTES, SLOT_MS};
-use vos_wire::jam::{AccumulateInput, Operand, RefineArgs};
 
 use crate::jam;
 

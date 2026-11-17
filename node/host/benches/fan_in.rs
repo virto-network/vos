@@ -38,6 +38,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use support::{count, cpu_ticks};
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, Session};
+use vos_abi::result::Outcome;
+use vos_abi::{Encode, keys};
 use vos_checker::calls::installed;
 use vos_checker::programs::{Programs, method};
 use vos_checker::spaces::{open_node, space};
@@ -45,11 +48,8 @@ use vos_net::Class;
 use vos_node::peer::Refusal;
 use vos_node::{CallError, Config, Node, Peers, Reply};
 use vos_wire::batch::Request;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
 use vos_wire::ingress::Stats;
 use vos_wire::peer::NodeNumber;
-use vos_wire::result::Outcome;
-use vos_wire::{Encode, keys};
 
 const COUNTER: InstanceId = InstanceId(1);
 const NODES: u8 = 3;

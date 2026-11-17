@@ -54,7 +54,7 @@
 //! step, never inside one, so a step touching more pages than the shape's
 //! largest class (24, or 17 for a kernel holding the Poseidon2 chip,
 //! [`crate::shape::POSEIDON2_CLASSES`]) has no proof: a witness-input call
-//! writing more than about 64 KiB at once (`vos_wire::abi::precompile::
+//! writing more than about 64 KiB at once (`vos_abi::abi::precompile::
 //! WITNESS_INPUT`). The derivation does not see a run's calls; a kernel
 //! reads a larger input in several.
 //!
@@ -95,20 +95,20 @@ use kernel::kernel;
 pub const TRANSPILER_VERSION: u32 = 1;
 
 /// The bytes of its actor's heap arena a handler's or a kernel's program
-/// holds, [`vos_wire::abi::INVOCATION_HEAP`], the most the SDK's allocator
+/// holds, [`vos_abi::abi::INVOCATION_HEAP`], the most the SDK's allocator
 /// gives one: a workflow's machine maps the rest.
-pub const INVOCATION_HEAP: u64 = vos_wire::abi::INVOCATION_HEAP as u64;
+pub const INVOCATION_HEAP: u64 = vos_abi::abi::INVOCATION_HEAP as u64;
 
 /// A page of the PVM's memory.
 const PAGE: u64 = vos_pvm::PVM_PAGE_SIZE as u64;
 
 /// The most bytes a kernel's arguments hold: an attest's, at most a
 /// request's.
-const ARGUMENTS: u64 = vos_wire::abi::cap::REQUEST as u64;
+const ARGUMENTS: u64 = vos_abi::abi::cap::REQUEST as u64;
 
 /// The most bytes the input of a kernel that reads at a window's cut
 /// holds: its arguments, then the served rows.
-const SERVED_INPUT: u64 = ARGUMENTS + vos_wire::abi::cap::SERVED as u64;
+const SERVED_INPUT: u64 = ARGUMENTS + vos_abi::abi::cap::SERVED as u64;
 
 /// What one witness-input call of a kernel that reads at a window's cut
 /// asks for at most: a request's bytes, as any kernel's whole arguments,
@@ -134,7 +134,7 @@ const REFERENCE: u64 = 1 << 34;
 const HEADROOM_SHIFT: u32 = 40;
 
 /// The largest ELF a derivation reads: an install's body.
-pub use vos_wire::abi::cap::MAX_ELF;
+pub use vos_abi::abi::cap::MAX_ELF;
 
 /// The most attestable methods an actor may have: a schema's methods.
 const MAX_ATTESTABLES: usize = 1024;
@@ -156,7 +156,7 @@ pub struct Derived {
     /// and not held to the recursion's leaves: a device proves it under its
     /// device profile, whose chips its code gives
     /// (`vos_pvm_proof::device::device_chips_of_code`).
-    pub shapes: Vec<vos_wire::records::Shape>,
+    pub shapes: Vec<vos_abi::records::Shape>,
     /// The device kernels' methods (`#[attestable(device)]`), ascending.
     pub devices: Vec<u32>,
     /// Each device kernel's reference program and headroom, by its method
@@ -188,8 +188,8 @@ impl Derived {
     }
 
     /// The derivation an install of the package it is derived from names.
-    pub fn derivation(&self) -> vos_wire::records::Derivation {
-        vos_wire::records::Derivation::new(
+    pub fn derivation(&self) -> vos_abi::records::Derivation {
+        vos_abi::records::Derivation::new(
             self.elf,
             &self.actor,
             &self.kernels,
@@ -332,7 +332,7 @@ pub fn derive(elf: &[u8]) -> Result<Derived, DeriveError> {
         schema,
         heap,
         transpiler_version: TRANSPILER_VERSION,
-        elf: vos_wire::result::digest(&without_temporary_names(elf)?),
+        elf: vos_abi::result::digest(&without_temporary_names(elf)?),
     })
 }
 
@@ -360,10 +360,10 @@ fn references_as_declared(
                 "method {method:#010x}'s reference run is no device kernel's"
             )));
         }
-        if reference.reference > Some(vos_wire::records::MAX_HEADROOM) {
+        if reference.reference > Some(vos_abi::records::MAX_HEADROOM) {
             return Err(DeriveError::Table(format!(
                 "method {method:#010x}'s headroom is past {}",
-                vos_wire::records::MAX_HEADROOM
+                vos_abi::records::MAX_HEADROOM
             )));
         }
     }
@@ -377,7 +377,7 @@ fn references_as_declared(
 fn step_fits(
     method: u32,
     input: Input,
-    shape: &vos_wire::records::Shape,
+    shape: &vos_abi::records::Shape,
 ) -> Result<(), DeriveError> {
     let most = shape
         .classes
@@ -423,9 +423,9 @@ fn invocation_heap(elf: &mut LinkedElf) -> Result<u32, DeriveError> {
 /// marked a device kernel's. An ELF with attestable entries and a schema
 /// that does not read is refused.
 fn kinds_as_declared(schema: &[u8], entries: &[AttestEntry]) -> Result<(), DeriveError> {
-    use vos_wire::abi::Kind;
+    use vos_abi::abi::Kind;
     let table = |why: String| DeriveError::Table(why);
-    let schema = match vos_wire::schema::Schema::read(schema) {
+    let schema = match vos_abi::schema::Schema::read(schema) {
         Ok(schema) => schema,
         // An ELF of no attestable method needs no schema that reads.
         Err(_) if entries.is_empty() => return Ok(()),
@@ -434,7 +434,7 @@ fn kinds_as_declared(schema: &[u8], entries: &[AttestEntry]) -> Result<(), Deriv
     for entry in entries {
         let method = entry.method;
         let kind = schema
-            .method(vos_wire::ids::MethodId(method))
+            .method(vos_abi::ids::MethodId(method))
             .map(|method| method.kind);
         if (kind == Some(Kind::Reading)) != (entry.input == Input::Served) {
             return Err(table(format!(
@@ -674,9 +674,9 @@ mod tests {
     /// kernel guard names a method whose entry is marked.
     #[test]
     fn a_device_kernels_mark_is_its_schemas() {
-        use vos_wire::abi::Kind;
-        use vos_wire::ids::MethodId;
-        use vos_wire::schema::{CredentialGuard, MethodSchema, Schema};
+        use vos_abi::abi::Kind;
+        use vos_abi::ids::MethodId;
+        use vos_abi::schema::{CredentialGuard, MethodSchema, Schema};
         let method = |id: u32, name: &str, kind: Kind| MethodSchema {
             id: MethodId(id),
             name: name.as_bytes().to_vec(),
@@ -732,7 +732,7 @@ mod tests {
     /// shape whose classes hold fewer is refused at derive.
     #[test]
     fn the_prologues_step_fits_the_largest_class() {
-        use vos_wire::records::{SegmentClass, Shape};
+        use vos_abi::records::{SegmentClass, Shape};
         let shape = |classes: &[(u8, u16)]| Shape {
             policy: crate::shape::POLICY,
             chips: 0,
@@ -741,7 +741,7 @@ mod tests {
                 .map(|&(log_steps, pages)| SegmentClass {
                     log_steps,
                     pages,
-                    log_sizes: [0; vos_wire::records::SEGMENT_CHIPS],
+                    log_sizes: [0; vos_abi::records::SEGMENT_CHIPS],
                 })
                 .collect(),
         };

@@ -3,11 +3,11 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use vos_wire::abi::Refusal;
+use vos_abi::abi::Refusal;
+use vos_abi::ids::AgentId;
+use vos_abi::keys;
+use vos_abi::result::{Outcome, Step, WorkResult};
 use vos_wire::batch::Request;
-use vos_wire::ids::AgentId;
-use vos_wire::keys;
-use vos_wire::result::{Outcome, Step, WorkResult};
 
 use super::{Leader, is_due};
 use crate::calls::session_mark;

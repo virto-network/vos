@@ -5,7 +5,7 @@
 //! loaded host adds to a window's close; with a writer at each agent
 //! rewriting rows of the reader's committed map, and a reader starting
 //! workflows that read sixteen of them at their window's cut
-//! ([`vos_wire::abi::Op::AttestAt`]). The space's representative,
+//! ([`vos_abi::abi::Op::AttestAt`]). The space's representative,
 //! replicated on the three nodes, closes each window at `B_w + D`, 400 ms
 //! here: each read is served by its leader once its window is closed.
 //!
@@ -26,19 +26,19 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use vos_abi::abi::{AttestError, Rows};
+use vos_abi::ids::{AgentId, InstanceId, Principal, Session};
+use vos_abi::keys::{self, Transform};
+use vos_abi::records::unstored;
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode, WindowClock};
 use vos_checker::calls::install_at_leader;
 use vos_checker::programs::{actor, method, package, table_tag};
 use vos_checker::{ANSWERED, Mode, cuts, replicated, wait_until};
 use vos_node::roots;
 use vos_node::store::Snapshot;
 use vos_node::{Node, Reply};
-use vos_wire::abi::{AttestError, Rows};
 use vos_wire::batch::Request;
-use vos_wire::ids::{AgentId, InstanceId, Principal, Session};
-use vos_wire::keys::{self, Transform};
-use vos_wire::records::unstored;
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode, WindowClock};
 
 use crate::exactly_once::{Alongside, exactly_once};
 use crate::harness::{Cluster, NODES};
@@ -260,7 +260,7 @@ impl Alongside for Cuts {
         install_at_leader(
             || cluster.leading(representative),
             representative,
-            vos_wire::served::REPRESENTATIVE,
+            vos_abi::served::REPRESENTATIVE,
             &vos_checker::programs::program_package("vos-representative"),
         );
         *self.representative.lock().unwrap() = Some(representative);
@@ -345,7 +345,7 @@ impl Cuts {
         let mut checked = 0;
         for anchor in &anchors {
             if let Some(root) = roots.get(&anchor.window) {
-                let expected = vos_wire::vos_anchor::space_root(&space, anchor.window, root);
+                let expected = vos_abi::vos_anchor::space_root(&space, anchor.window, root);
                 assert_eq!(anchor.root, expected, "S_{} anchored", anchor.window);
                 checked += 1;
             }
@@ -465,7 +465,7 @@ fn closes(cluster: &Cluster, representative: AgentId) -> usize {
                 let (root, _) = roots::cut_root(snapshot, representative, *window)
                     .unwrap()
                     .expect("the root at the cut");
-                vos_wire::vos_anchor::space_root(&cluster.space.id(), *window, &root)
+                vos_abi::vos_anchor::space_root(&cluster.space.id(), *window, &root)
             })
             .collect();
         assert!(

@@ -1,4 +1,4 @@
-//! The merge fields converge (`vos_wire::merge`): signed histories of three
+//! The merge fields converge (`vos_abi::merge`): signed histories of three
 //! authors, with equivocations, delivered to three replicas in random
 //! orders and chunks through the light node's node apply
 //! (`vos_light::sync::apply_node`), each operation's writes made as the
@@ -11,13 +11,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use ed25519_dalek::SigningKey;
 use merkle_crdt::{Apply, Author, Event, MemStore, Node, Replica, Rows};
 use proptest::prelude::*;
+use vos_abi::abi::MergeRows;
+use vos_abi::ids::{InstanceId, MethodId};
+use vos_abi::keys::{self, Transform};
+use vos_abi::merge::{self, Cutoff, Entry, Keep, Origin};
+use vos_abi::records::{stored, unstored};
+use vos_abi::{Decode, Encode};
 use vos_light::sync::{self, Blake2b256, Call, Cid, Op, Ops};
-use vos_wire::abi::MergeRows;
-use vos_wire::ids::{InstanceId, MethodId};
-use vos_wire::keys::{self, Transform};
-use vos_wire::merge::{self, Cutoff, Entry, Keep, Origin};
-use vos_wire::records::{stored, unstored};
-use vos_wire::{Decode, Encode};
 
 const INSTANCE: InstanceId = InstanceId(3);
 const AUTHORS: usize = 3;

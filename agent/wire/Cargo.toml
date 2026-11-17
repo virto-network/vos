@@ -3,16 +3,16 @@ name = "vos-wire"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Wire types shared by the VOS node, the default agent program and the actor SDK."
+description = "The VOS node's formats and the stock actors' messages, on the actor ABI."
 
 [dependencies]
+# The actor ABI the formats carry.
+vos-abi = { workspace = true }
 scale = { package = "vos-pvm-codec", path = "../../pvm/codec", default-features = false, features = ["anchor"] }
-# The space an agent belongs to, and the clock that numbers its windows.
-vos-anchor = { path = "../../pvm/proof/anchor" }
-vos-pvm-program = { workspace = true }
-# The key transforms every table's rows are keyed by.
+# A package's proofs of its rows.
 vos-tree = { workspace = true }
-# BLAKE2b-256 of a whole buffer: pages' and, on JAM, work results' hashes.
+# BLAKE2b-256 of a whole buffer: the credential actor's scopes, bindings
+# and open claims.
 vos-pvm-precompiles = { workspace = true }
 
 [dev-dependencies]

@@ -27,12 +27,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use smol::{LocalExecutor, Timer};
+use vos_abi::Encode;
+use vos_abi::ids::{AgentId, InstanceId, WorkflowId};
+use vos_abi::result::Outcome;
 use vos_api::Kind as ApiKind;
 use vos_node::client::{Target, signed_workflow_read, workflow_read_not_after};
-use vos_wire::Encode;
-use vos_wire::ids::{AgentId, InstanceId, WorkflowId};
 use vos_wire::ingress::{Consistency, Response, WorkflowStatus};
-use vos_wire::result::Outcome;
 
 use crate::agents::{Mix, Placed};
 use crate::drive::{LATE_US, Plan};

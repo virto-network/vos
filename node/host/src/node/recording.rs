@@ -15,7 +15,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use vos_wire::ids::AgentId;
+use vos_abi::ids::AgentId;
 use vos_wire::peer::{CreationRecord, NodeNumber, PeerMessage, Placement};
 
 use super::Inner;
@@ -342,7 +342,7 @@ pub(super) fn start(inner: &Arc<Inner>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vos_wire::ids::ProgramHash;
+    use vos_abi::ids::ProgramHash;
 
     fn record(agent: u32) -> CreationRecord {
         CreationRecord {
@@ -352,7 +352,7 @@ mod tests {
             time: 0,
             program: ProgramHash([0; 32]),
             accumulate_gas: 0,
-            space: vos_wire::SpaceId::NONE,
+            space: vos_abi::SpaceId::NONE,
         }
     }
 

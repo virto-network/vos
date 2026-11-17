@@ -335,12 +335,12 @@ operations! {
         /// there, its effects commit with its snapshot, and the call returns
         /// only when the agent resumes the machine, in a later step, with φ7
         /// the length of the input that resumed it, which `Input` copies out:
-        /// an encoded [`crate::batch::Answer`] for an await, nothing for a
+        /// an encoded [`crate::message::Answer`] for an await, nothing for a
         /// sleep. φ8 is 0.
         ///
         /// φ7 agent, φ8 instance, φ9 method, φ10/φ11 arguments, φ12 the
         /// deadline, milliseconds after the batch's time (0 for the default,
-        /// [`crate::defaults::AWAIT_MS`]). Sent after the step commits, as a
+        /// `vos_wire::defaults::AWAIT_MS`). Sent after the step commits, as a
         /// request: the answer is the callee's outcome, `Started` for a
         /// workflow method, or `Failed` with [`Failure::TimedOut`] once the
         /// deadline passed. The agent is another: a request of this
@@ -363,8 +363,8 @@ operations! {
         /// set, an unknown method or arguments past the target's cap.
         /// Otherwise its step records the request of the batch time's
         /// window ([`crate::keys::request`]), and the workflow pauses until
-        /// a [`crate::batch::Input::Resume`] serves the rows proved at the
-        /// window's cut, or [`crate::defaults::READ_WINDOWS`] windows pass:
+        /// a `vos_wire::batch::Input::Resume` serves the rows proved at the
+        /// window's cut, or `vos_wire::defaults::READ_WINDOWS` windows pass:
         /// its input then an encoded [`crate::result::Attested`], the
         /// kernel's output on the arguments and the served rows, or why
         /// there is none.

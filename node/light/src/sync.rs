@@ -3,7 +3,7 @@
 //! batch of operations. An operation is a merge handler's call with the
 //! time and seed of the device that issued it, and the release of its
 //! actor that device ran, so every device that applies the node runs the
-//! handler again and writes the same entries (`vos_wire::merge`).
+//! handler again and writes the same entries (`vos_abi::merge`).
 //!
 //! Applying a node ([`apply_node`]) writes beside its operations' runs:
 //! its Lamport clock, which orders the merge fields' entries; and its
@@ -33,11 +33,11 @@ use fjall::{Keyspace, OwnedWriteBatch};
 use merkle_crdt::{
     Author, Changes, Decode, Encode, Event, FjallError, FjallStore, Loaded, Rows, Store,
 };
-use vos_wire::abi::Failure;
-use vos_wire::ids::{InstanceId, MethodId};
-use vos_wire::keys;
-use vos_wire::merge::{Cutoff, Origin};
-use vos_wire::records::{stored, unstored};
+use vos_abi::abi::Failure;
+use vos_abi::ids::{InstanceId, MethodId};
+use vos_abi::keys;
+use vos_abi::merge::{Cutoff, Origin};
+use vos_abi::records::{stored, unstored};
 
 /// The hash a scope's nodes are named by: BLAKE2b-256.
 #[derive(Debug)]
@@ -139,7 +139,7 @@ impl Decode for Op {
 }
 
 /// Why an operation is held: it runs once this device can run it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, vos_wire::Encode, vos_wire::Decode)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, vos_abi::Encode, vos_abi::Decode)]
 #[repr(u8)]
 pub enum Hold {
     /// A kind this build does not know: it runs after the app's update.
@@ -156,7 +156,7 @@ pub enum Hold {
 }
 
 /// Why an operation is quarantined: it is never applied.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, vos_wire::Encode, vos_wire::Decode)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, vos_abi::Encode, vos_abi::Decode)]
 pub enum Quarantine {
     /// Its frame is one no device records: arguments past
     /// [`crate::MAX_ARGUMENTS`].
@@ -189,14 +189,14 @@ pub type Held = Kept<Hold>;
 /// An operation quarantined.
 pub type Quarantined = Kept<Quarantine>;
 
-impl<W: Copy + vos_wire::Encode + vos_wire::Decode> Kept<W> {
+impl<W: Copy + vos_abi::Encode + vos_abi::Decode> Kept<W> {
     /// The kept operation of the row `key`, `value`, under `prefix`
     /// ([`keys::held_prefix`] or [`keys::quarantined_op_prefix`]).
     pub(crate) fn read(prefix: &[u8], key: &[u8], value: &[u8]) -> Result<Self, CorruptRow> {
         let rest = key.strip_prefix(prefix).ok_or(CorruptRow)?;
         let (cid, _index) = rest.split_first_chunk::<32>().ok_or(CorruptRow)?;
         let (origin, op, why) = unstored(value)
-            .and_then(<(Origin, Vec<u8>, W) as vos_wire::Decode>::decode_exact)
+            .and_then(<(Origin, Vec<u8>, W) as vos_abi::Decode>::decode_exact)
             .ok_or(CorruptRow)?;
         Ok(Self {
             cid: merkle_crdt::Cid(*cid),
@@ -207,7 +207,7 @@ impl<W: Copy + vos_wire::Encode + vos_wire::Decode> Kept<W> {
     }
 
     fn row(&self) -> Vec<u8> {
-        stored(&vos_wire::Encode::encode(&(
+        stored(&vos_abi::Encode::encode(&(
             self.origin,
             self.op.encode(),
             self.why,
@@ -228,13 +228,13 @@ pub fn scope_name(instance: InstanceId) -> [u8; 4] {
 pub struct CorruptRow;
 
 /// The value of a stored row of a light node's, as it wrote it.
-fn read<T: vos_wire::Decode>(rows: &mut dyn Rows, key: &[u8]) -> Result<Option<T>, CorruptRow> {
+fn read<T: vos_abi::Decode>(rows: &mut dyn Rows, key: &[u8]) -> Result<Option<T>, CorruptRow> {
     rows.read(key)
         .map(|bytes| unstored(&bytes).and_then(T::decode_exact).ok_or(CorruptRow))
         .transpose()
 }
 
-fn write(rows: &mut dyn Rows, key: &[u8], value: &impl vos_wire::Encode) {
+fn write(rows: &mut dyn Rows, key: &[u8], value: &impl vos_abi::Encode) {
     rows.write(key, Some(&stored(&value.encode())));
 }
 

@@ -15,11 +15,11 @@
 
 use std::time::{Duration, Instant};
 
+use vos_abi::credentials::{DEPTH, EMPTY, leaf, root_of};
 use vos_light::release::device;
 use vos_light::{AuthWitness, Call, Digest, Prover, ProverConfig, Threads, claim_io};
 use vos_light::{derive_secret, member};
 use vos_pvm_device::{FORMAT, Program, decode, encode};
-use vos_wire::credentials::{DEPTH, EMPTY, leaf, root_of};
 
 const ROUNDS: usize = 200;
 

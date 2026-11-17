@@ -2,7 +2,7 @@
 //! refine returns for it.
 //!
 //! On JAM the agent's whole keyspace is one tree ([`vos_tree`]), whose keys
-//! are the row keys themselves, prefix-free ([`crate::keys`]), and whose
+//! are the row keys themselves, prefix-free ([`vos_abi::keys`]), and whose
 //! values are the rows as stored. Refine serves its state reads from the
 //! package's witness, verified once against the root before, runs the batch
 //! as a VOS node's refine does, applies its work result as a VOS node's
@@ -28,7 +28,7 @@ use vos_tree::{BatchProof, Hash, RangeProof, Salt};
 
 use crate::batch::Batch;
 use crate::defaults::SESSION_SKEW_MS;
-use crate::ids::{ProgramHash, WorkflowId};
+use vos_abi::ids::{ProgramHash, WorkflowId};
 
 /// A segment's length: a page then eight zero bytes.
 pub const SEGMENT: usize = 4104;
@@ -129,7 +129,7 @@ pub struct JamOutput {
     pub root_after: Hash,
     pub time: u64,
     pub seed: [u8; 32],
-    /// The work result's encoding's [`crate::result::digest`].
+    /// The work result's encoding's [`vos_abi::result::digest`].
     pub work_result_hash: Hash,
     pub pages: u32,
     pub exports: u32,
@@ -140,7 +140,7 @@ pub struct JamOutput {
 /// `service` for ([`crate::ingress::call_message`]), as it signs for a
 /// VOS node's agent by the agent's.
 pub fn identity(service: u64) -> Hash {
-    crate::result::digest(&[b"vos/jam/service".as_slice(), &service.to_le_bytes()].concat())
+    vos_abi::result::digest(&[b"vos/jam/service".as_slice(), &service.to_le_bytes()].concat())
 }
 
 /// The segments a work result of `len` bytes takes.

@@ -23,6 +23,7 @@ vos-node = { path = "../../host" }
 vos-testkit = { path = "../../../agent/testkit" }
 # The test homes' pools of personal agents.
 vos-keeper = { path = "../../../tools/keeper" }
+vos-abi = { path = "../../../pvm/abi" }
 vos-wire = { path = "../../../agent/wire" }
 vos-api = { path = "../../api" }
 # An agent's identity, its creation record's BLAKE2b-256.

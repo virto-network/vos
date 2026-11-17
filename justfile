@@ -24,7 +24,7 @@ default:
 # `phone`) or a release (`release`, `vendor-verifier`).
 
 # The fast suites' crates, which `test`, `check` and `gate` run.
-core_crates := "-p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-pvm-codec-derive -p vos-pvm-proof-derive -p vos-raft -p merkle-crdt -p vos-mls -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-anchor -p vos-statement -p vos-statement-service --features vos-anchor/vectors,vos-statement/fixtures"
+core_crates := "-p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-pvm-codec-derive -p vos-pvm-proof-derive -p vos-raft -p merkle-crdt -p vos-mls -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-abi -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-anchor -p vos-statement -p vos-statement-service --features vos-anchor/vectors,vos-statement/fixtures"
 
 # The agent's suites' crates, which `test-agent`, `check` and `gate` run.
 agent_crates := "-p vos-exec -p vos-light -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-api -p vos-http -p vos-gateway -p vos-node -p vos-node-prover -p vos-venue -p vos-kreivo -p vos-net -p vos-cli -p vos-jam-dev -p vos-scale -p vos-keeper"
@@ -47,8 +47,8 @@ _venue-guest package bin features:
 
 # Fast suites: runtime, compiler, program format, codec, support crates,
 # precompile shim, Poseidon2, verifier, the recursion AIR and its gate VM,
-# prover library, wire types. The node runs the agent, so it is tested
-# with it.
+# prover library, the actor ABI and the node's wire types. The node runs
+# the agent, so it is tested with it.
 test:
     cargo test {{core_crates}}
     cargo test -p vos-statement --features heap-peak --test heap
@@ -218,7 +218,7 @@ export MIMALLOC_ALLOW_THP := "0"
 # Formatting: the workspace's, and each crate's it excludes.
 fmt-check:
     cargo fmt --all -- --check
-    for manifest in (((open programs.toml | get program.crate) ++ [agent/test-actors pvm/bench/guests pvm/proof/fuzz pvm/proof/final-verifier/wasm node/gateway/demo node/light/android]) | each {|dir| glob $'($dir)/**/Cargo.toml' --exclude ['**/target/**'] } | flatten | where {|manifest| open --raw $manifest | str contains '[package]' }) { cargo fmt --manifest-path $manifest -- --check }
+    for manifest in (((open programs.toml | get program.crate) ++ [agent/test-actors pvm/bench/guests pvm/proof/fuzz node/fuzz pvm/proof/final-verifier/wasm node/gateway/demo node/light/android]) | each {|dir| glob $'($dir)/**/Cargo.toml' --exclude ['**/target/**'] } | flatten | where {|manifest| open --raw $manifest | str contains '[package]' }) { cargo fmt --manifest-path $manifest -- --check }
 
 # The docs' links: none broken, and none from a public doc to a private
 # item.
@@ -328,9 +328,9 @@ blobs-lock: build-blobs
 # again without it, so a store a write did not settle fails here. Not
 # written, on purpose: the final verifier's own constants
 # (`pvm/proof/final-verifier/src/constants.rs`), a venue's verifying key,
-# which a circuit change moves by hand; and the fuzz targets' replay corpus
-# (`pvm/proof/fuzz/replay`), which is kept, not generated. Last, the stores
-# that moved are listed.
+# which a circuit change moves by hand; and the fuzz targets' replay
+# corpora (`pvm/proof/fuzz/replay`, `node/fuzz/replay`), which are kept,
+# not generated. Last, the stores that moved are listed.
 repin: blobs-lock facility-release
     with-env { VOS_PINS: "write" } { cargo test -p vos-light --test device the_stock_kernels_programs_are_pinned }
     cargo test -p vos-light --test device the_stock_kernels_programs_are_pinned
@@ -790,35 +790,41 @@ _kit-workspace:
     {workspace: {resolver: "3", members: (glob target/kit/build/vendor/vos-verifier/*/Cargo.toml | each {|manifest| $manifest | path dirname | path relative-to ($env.PWD | path join target/kit/build) } | sort)}, profile: {dev: {debug: false}}} | to toml | save -f target/kit/build/Cargo.toml
     cp pvm/proof/kit/Cargo.lock target/kit/build/Cargo.lock
 
-# The fuzz targets (`pvm/proof/fuzz`, built apart with `cargo fuzz`): the
-# final verifier on arbitrary bytes, on the golden wraps mutated, on format
-# 39's layout past its header and on its queried parts reshaped within the
-# layout's bounds; the statement's and the space's decoders and the venue's
-# check; prove-then-verify on random programs; and a credentialed call's
-# decode and the device verifier's bytes, ingress's, under 47. A target's property
-# is no panic and nothing accepted but a golden (a device proof: its one
-# encoding).
-fuzz_targets := "final_verifier_bytes final_verifier_mutate statement_decode prove_verify_roundtrip masked_bytes masked_shape anchor_decode api_reader operated_decode credentialed_decode device_verify_bytes"
+# The fuzz targets, each workspace built apart with `cargo fuzz`. The
+# prover's (`pvm/proof/fuzz`): the final verifier on arbitrary bytes, on
+# the golden wraps mutated, on format 39's layout past its header and on
+# its queried parts reshaped within the layout's bounds; the statement's
+# and the space's decoders and the venue's check; prove-then-verify on
+# random programs; and the device verifier on ingress's bytes, under 47.
+# The node's (`node/fuzz`): the node API's frame reader and operator
+# envelope, and a credentialed call's decode, ingress's. A target's
+# property is no panic and nothing accepted but a golden (a device proof:
+# its one encoding).
+proof_fuzz_targets := "final_verifier_bytes final_verifier_mutate statement_decode prove_verify_roundtrip masked_bytes masked_shape anchor_decode device_verify_bytes"
+node_fuzz_targets := "api_reader operated_decode credentialed_decode"
 
-# Each target's checked-in corpus (`pvm/proof/fuzz/replay`) run once, every
-# input, optimized and without a sanitizer: no crash. `cargo run --example
-# paths` there lists what each input reaches. `cargo fuzz` sets RUSTFLAGS,
-# which replaces the host's `target-cpu=native` (`.cargo/config.toml`), so
-# the recipes pass it again: without it the prover's SIMD falls back to its
-# generic code, and one proof takes many minutes.
+# Each target's checked-in corpus (`replay/` of its workspace) run once,
+# every input, optimized and without a sanitizer: no crash. `cargo run
+# --example paths` there lists what each input reaches. `cargo fuzz` sets
+# RUSTFLAGS, which replaces the host's `target-cpu=native`
+# (`.cargo/config.toml`), so the recipes pass it again: without it the
+# prover's SIMD falls back to its generic code, and one proof takes many
+# minutes.
 fuzz-replay:
-    cd pvm/proof/fuzz; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{fuzz_targets}}" | split row ' ') { cargo fuzz run -O -s none --target-dir target/no-sanitizer $target $"replay/($target)" -- -runs=0 } }
+    cd pvm/proof/fuzz; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{proof_fuzz_targets}}" | split row ' ') { cargo fuzz run -O -s none --target-dir target/no-sanitizer $target $"replay/($target)" -- -runs=0 } }
+    cd node/fuzz; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{node_fuzz_targets}}" | split row ' ') { cargo fuzz run -O -s none --target-dir target/no-sanitizer $target $"replay/($target)" -- -runs=0 } }
 
 # Each target `secs` seconds from its corpus (a minute in `ci-full`, five in
-# `slice-gate`: `just fuzz 300`), seeded from the fixtures and the anchor's
-# vectors, the checked-in corpus beside it: no crash. One at a time;
-# the sanitized targets with debug assertions and overflow checks (`-a`),
-# the prove target optimized and without a sanitizer, its proving too slow
-# under either. A target with no corpus yet (none seeded, never run here)
-# starts from an empty one beside its replay.
+# `slice-gate`: `just fuzz 300`), the prover's seeded from the fixtures and
+# the anchor's vectors, the checked-in corpus beside it: no crash. One at a
+# time; the sanitized targets with debug assertions and overflow checks
+# (`-a`), the prove target optimized and without a sanitizer, its proving
+# too slow under either. A target with no corpus yet (none seeded, never
+# run here) starts from an empty one beside its replay.
 fuzz secs="60":
     cd pvm/proof/fuzz; cargo run --release --example seed
-    cd pvm/proof/fuzz; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{fuzz_targets}}" | split row ' ') { mkdir $"corpus/($target)"; let build = if $target == "prove_verify_roundtrip" { [-O -s none --target-dir target/no-sanitizer] } else { [-a] }; cargo fuzz run ...$build $target $"corpus/($target)" $"replay/($target)" -- -max_total_time={{secs}} -max_len=262145 -len_control=0 -rss_limit_mb=8192 -timeout=600 } }
+    cd pvm/proof/fuzz; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{proof_fuzz_targets}}" | split row ' ') { mkdir $"corpus/($target)"; let build = if $target == "prove_verify_roundtrip" { [-O -s none --target-dir target/no-sanitizer] } else { [-a] }; cargo fuzz run ...$build $target $"corpus/($target)" $"replay/($target)" -- -max_total_time={{secs}} -max_len=262145 -len_control=0 -rss_limit_mb=8192 -timeout=600 } }
+    cd node/fuzz; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{node_fuzz_targets}}" | split row ' ') { mkdir $"corpus/($target)"; cargo fuzz run -a $target $"corpus/($target)" $"replay/($target)" -- -max_total_time={{secs}} -max_len=262145 -len_control=0 -rss_limit_mb=8192 -timeout=600 } }
 
 # The light check, after every edit, and the innermost tier: formatting,
 # the gates' own tripwire, the workspace's lints, and every test target of

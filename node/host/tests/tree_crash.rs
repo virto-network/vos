@@ -22,17 +22,17 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use vos_abi::Encode;
+use vos_abi::ids::{AgentId, InstanceId, MapId};
+use vos_abi::keys::{self, Transform};
+use vos_abi::records::{stored, versioned};
+use vos_abi::result::Write;
 use vos_checker::crash::{Round, Rounds, journal};
 use vos_node::NoHooks;
 use vos_node::roots::{self, Build};
 use vos_node::storage::{Change, StorageThread};
 use vos_node::store::Fjall;
 use vos_tree::{Blake2b, Hash, Hasher, Leaf};
-use vos_wire::Encode;
-use vos_wire::ids::{AgentId, InstanceId, MapId};
-use vos_wire::keys::{self, Transform};
-use vos_wire::records::{stored, versioned};
-use vos_wire::result::Write;
 
 const AGENT: AgentId = AgentId(1);
 const MAPS: [MapId; 2] = [

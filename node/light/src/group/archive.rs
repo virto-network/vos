@@ -15,8 +15,8 @@ use blake2::digest::Digest;
 use blake2::digest::consts::U16;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use vos_abi::{Decode, Encode};
 use vos_wire::personal::Scope;
-use vos_wire::{Decode, Encode};
 use zeroize::{Zeroize, Zeroizing};
 
 /// The `R`s a device holds drawn and not yet named.

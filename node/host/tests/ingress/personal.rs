@@ -11,11 +11,11 @@ use std::io::Write;
 use std::os::unix::net::UnixStream;
 
 use ed25519_dalek::{Signature, Verifier};
+use vos_abi::abi::Failure;
+use vos_abi::ids::{Principal, derive_id};
 use vos_api::{Framing, Kind, Mark, marked};
 use vos_checker::programs::{package, program_package};
 use vos_node::client::{signed_call, signed_query};
-use vos_wire::abi::Failure;
-use vos_wire::ids::{Principal, derive_id};
 use vos_wire::ingress::{AdmissionRefusal, CallMessage, Rejection as Rejected};
 use vos_wire::personal::{
     AdminClass, Attached, Attestation, Body, Candidacy, Effect, Entry, Envelope, Header, Kit,

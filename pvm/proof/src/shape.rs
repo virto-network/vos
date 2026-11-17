@@ -37,7 +37,7 @@ use crate::chip_idx;
 /// breaks, never a run's value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShapeError {
-    /// The record is of another shape policy (`vos_wire::records::Shape::POLICY`).
+    /// The record is of another shape policy (`vos_abi::records::Shape::POLICY`).
     Policy,
     /// A chip outside the segment AIR.
     Outside,
@@ -123,11 +123,11 @@ pub struct SegmentShape {
 pub const MAX_LOG_SIZE: u8 = crate::proof::MAX_PROOF_LOG_SIZE as u8;
 
 /// The most classes a shape has: a kernel's record's cap
-/// (`vos_wire::records::MAX_CLASSES`).
+/// (`vos_abi::records::MAX_CLASSES`).
 pub const MAX_CLASSES: usize = 4;
 
-#[cfg(feature = "wire")]
-const _: () = assert!(MAX_CLASSES == vos_wire::records::MAX_CLASSES);
+#[cfg(feature = "abi")]
+const _: () = assert!(MAX_CLASSES == vos_abi::records::MAX_CLASSES);
 
 impl KernelShape {
     /// Whether it is a shape a verifier accepts: within the segment AIR,
@@ -206,12 +206,12 @@ impl KernelShape {
 /// [`MAX_CLASSES`] classes, or the
 /// shape is otherwise not one [`KernelShape::check`] accepts; so a record a
 /// verifier takes is of exactly one shape.
-#[cfg(feature = "wire")]
-impl TryFrom<&vos_wire::records::Shape> for KernelShape {
+#[cfg(feature = "abi")]
+impl TryFrom<&vos_abi::records::Shape> for KernelShape {
     type Error = ShapeError;
 
-    fn try_from(record: &vos_wire::records::Shape) -> Result<Self, ShapeError> {
-        if record.policy != vos_wire::records::Shape::POLICY {
+    fn try_from(record: &vos_abi::records::Shape) -> Result<Self, ShapeError> {
+        if record.policy != vos_abi::records::Shape::POLICY {
             return Err(ShapeError::Policy);
         }
         if record.chips & !chip_idx::ALL != 0 {
@@ -336,18 +336,18 @@ mod tests {
     }
 
     /// A record of [`shape`]'s chips, each class sized as its.
-    #[cfg(feature = "wire")]
-    fn record() -> vos_wire::records::Shape {
+    #[cfg(feature = "abi")]
+    fn record() -> vos_abi::records::Shape {
         let shape = shape();
-        vos_wire::records::Shape {
-            policy: vos_wire::records::Shape::POLICY,
+        vos_abi::records::Shape {
+            policy: vos_abi::records::Shape::POLICY,
             chips: shape.components,
             classes: shape
                 .classes
                 .iter()
                 .map(|class| {
                     let mut sizes = class.log_sizes.iter();
-                    vos_wire::records::SegmentClass {
+                    vos_abi::records::SegmentClass {
                         log_steps: class.log_steps,
                         pages: class.pages,
                         log_sizes: core::array::from_fn(|chip| {
@@ -365,7 +365,7 @@ mod tests {
 
     /// A record converts to the shape of its chips, each class's sizes
     /// those of its chips in chip order.
-    #[cfg(feature = "wire")]
+    #[cfg(feature = "abi")]
     #[test]
     fn a_record_is_of_one_shape() {
         assert_eq!(KernelShape::try_from(&record()), Ok(shape()));
@@ -382,10 +382,10 @@ mod tests {
     /// moved, its classes laid out otherwise), naming a chip past the AIR,
     /// sizing a chip outside its chips, without a chip every proof holds,
     /// or with more classes than the cap is refused.
-    #[cfg(feature = "wire")]
+    #[cfg(feature = "abi")]
     #[test]
     fn a_malformed_record_is_refused() {
-        let refusal = |change: fn(&mut vos_wire::records::Shape)| {
+        let refusal = |change: fn(&mut vos_abi::records::Shape)| {
             let mut record = record();
             change(&mut record);
             KernelShape::try_from(&record).unwrap_err()

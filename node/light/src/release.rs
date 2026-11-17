@@ -18,11 +18,11 @@
 //! `devices`): the release build's edge to the transpiler, which the app's
 //! build never enables.
 
-use vos_pvm::pool::CodeHash;
 #[cfg(feature = "release")]
-use vos_wire::ids::MethodId;
-use vos_wire::records::Derivation;
-use vos_wire::{Decode, Encode};
+use vos_abi::ids::MethodId;
+use vos_abi::records::Derivation;
+use vos_abi::{Decode, Encode};
+use vos_pvm::pool::CodeHash;
 
 /// The transpiler's version whose packages this light node installs: the
 /// derivation's (`vos_pvm_compiler::TRANSPILER_VERSION`), which the

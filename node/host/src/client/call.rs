@@ -3,11 +3,11 @@
 
 use std::time::Duration;
 
+use vos_abi::Encode;
+use vos_abi::abi::Refusal;
+use vos_abi::ids::{AgentId, InstanceId, MethodId};
 use vos_api::Kind;
-use vos_wire::Encode;
-use vos_wire::abi::Refusal;
 use vos_wire::defaults;
-use vos_wire::ids::{AgentId, InstanceId, MethodId};
 use vos_wire::ingress::{Contact, Rejection, Response};
 
 use super::{Client, ClientError, Transport, decode_answer, naming, signed_call};

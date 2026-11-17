@@ -30,17 +30,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use support::{count, cpu_ticks};
+use vos_abi::Encode;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, Session};
+use vos_abi::result::Outcome;
 use vos_checker::calls::install_at_leader;
 use vos_checker::percentiles;
 use vos_checker::programs::{Programs, method};
 use vos_checker::spaces::{open_node, space};
 use vos_node::store::EntryKind;
 use vos_node::{CallError, Config, Hooks, Node, Peers, Reply, Space};
-use vos_wire::Encode;
 use vos_wire::batch::Request;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
 use vos_wire::peer::NodeNumber;
-use vos_wire::result::Outcome;
 
 const COUNTER: InstanceId = InstanceId(1);
 const NODES: u8 = 3;

@@ -26,10 +26,11 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use vos_wire::credentials::{Digest as Bytes, meets, open_work};
-use vos_wire::ids::InstanceId;
+use vos_abi::credentials::Digest as Bytes;
+use vos_abi::ids::InstanceId;
+use vos_abi::{Decode, Encode};
+use vos_wire::credentials::{meets, open_work};
 use vos_wire::personal::{Body, Entry, Kit, NewDevice};
-use vos_wire::{Decode, Encode};
 use zeroize::Zeroize;
 
 pub use vos_wire::homes::SCOPE;

@@ -6,10 +6,10 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
+use vos_abi::ids::{AgentId, InstanceId};
 use vos_keeper::{Home, Keeper};
 use vos_node::client::{self, Client, Operator, Target};
 use vos_node::tls::Trust;
-use vos_wire::ids::{AgentId, InstanceId};
 
 #[derive(Parser)]
 #[command(about = "Keep a home's pool of personal agents")]

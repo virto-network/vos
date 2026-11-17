@@ -21,9 +21,9 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use vos_wire::ids::AgentId;
+use vos_abi::ids::AgentId;
+use vos_abi::result::Write;
 use vos_wire::peer::{CreationRecord, Placement};
-use vos_wire::result::Write;
 
 use crate::store::{Fjall, HardState, LogEntry, Membership, Row, Switch};
 use crate::{Hooks, lock, raise};

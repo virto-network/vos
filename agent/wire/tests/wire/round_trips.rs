@@ -1,15 +1,15 @@
 //! Every wire type round-trips through its encoding.
 
 use proptest::prelude::*;
-use vos_wire::abi::{self, Failure, Rows};
-use vos_wire::batch::Batch;
-use vos_wire::ids::{
+use vos_abi::abi::{self, Failure, Rows};
+use vos_abi::ids::{
     AgentId, InstanceId, MapId, ProgramHash, RequestId, Session, SessionId, WorkflowId,
 };
-use vos_wire::jam::{AccumulateInput, Operand, RefineArgs, Transfer};
-use vos_wire::keys::{self, Due, Transform};
-use vos_wire::records::{leaf_value, stored};
-use vos_wire::result::WorkResult;
+use vos_abi::jam::{AccumulateInput, Operand, RefineArgs, Transfer};
+use vos_abi::keys::{self, Due, Transform};
+use vos_abi::records::{leaf_value, stored};
+use vos_abi::result::WorkResult;
+use vos_wire::batch::Batch;
 
 use crate::strategies::*;
 

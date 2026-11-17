@@ -14,9 +14,9 @@ mod set;
 
 use ed25519_dalek::{Signer, SigningKey};
 use mls_rs::{ExtensionList, ProtocolVersion};
+use vos_abi::Encode;
+use vos_abi::ids::InstanceId;
 use vos_light::group::{Alarm, Course, DeviceGroup, Event, Remedy, Why};
-use vos_wire::Encode;
-use vos_wire::ids::InstanceId;
 use vos_wire::personal::{
     Attached, Body, Effect, Entry, Overview, PersonalError, Policy, Recorded, Scope, Vote, chain,
     vote_message,

@@ -14,14 +14,14 @@ use cipher_clerk::conventions::PseudoAccount;
 use cipher_clerk::ids::JournalId;
 use cipher_clerk::kernel::Value;
 use cipher_clerk::types::{Account, Layer};
+use vos_abi::Encode;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, RequestId, Session};
+use vos_abi::result::{Attest, Outcome, Step};
+use vos_abi::vos_anchor::VenueId;
 use vos_checker::programs::{actor, method};
 use vos_tree::{Blake2b, Hasher};
-use vos_wire::Encode;
 use vos_wire::batch::Request;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, RequestId, Session};
 use vos_wire::peer::NodeNumber;
-use vos_wire::result::{Attest, Outcome, Step};
-use vos_wire::vos_anchor::VenueId;
 
 use crate::common::{ALICE, Cluster};
 use crate::support::{READER, agent_with, call, reader_agent, results};

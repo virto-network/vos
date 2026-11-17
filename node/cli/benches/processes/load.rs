@@ -9,12 +9,12 @@ use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
 use smol::io::{AsyncReadExt, AsyncWriteExt};
+use vos_abi::ids::{AgentId, MethodId, Session};
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode};
 use vos_api::{Framing, Kind, MAX_ANSWER, frame};
 use vos_node::client::{Target, signed_call};
-use vos_wire::ids::{AgentId, MethodId, Session};
 use vos_wire::ingress::Response;
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode};
 
 use crate::nodes::{Cpu, Space, cpus, pin_thread};
 use crate::{COUNTER, NODES, WARM};

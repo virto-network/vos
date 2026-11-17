@@ -44,15 +44,15 @@ use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
 use rayon::prelude::*;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal};
+use vos_abi::result::Outcome;
+use vos_abi::{Encode, SpaceId, WindowClock};
 use vos_checker::calls::installed;
 use vos_checker::programs::{Programs, actor, method, package, program, program_elf};
 use vos_light::{Call, DeviceProgram, Prover, ProverConfig, Threads};
 use vos_node::client::{self, Client, ClientError, Operator, Target};
 use vos_node::{Config, Node};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
 use vos_wire::ingress::{CredentialRefusal, Credentialed, Rejection, Response, Stage};
-use vos_wire::result::Outcome;
-use vos_wire::{Encode, SpaceId, WindowClock};
 
 const PAYMENTS: InstanceId = InstanceId(2);
 const COUNTER: InstanceId = InstanceId(1);

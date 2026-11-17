@@ -677,7 +677,7 @@ async fn a_refused_root_is_proved_again_and_a_retired_format_asks_for_an_update(
 
     // A device format the space no longer admits.
     for retired in [
-        Response::Refused(vos_wire::abi::Refusal::Format),
+        Response::Refused(vos_abi::abi::Refusal::Format),
         Response::Rejected(ingress::Rejection::Credential(
             ingress::CredentialRefusal::Format,
         )),

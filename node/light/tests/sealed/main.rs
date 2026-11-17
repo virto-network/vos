@@ -20,6 +20,9 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use ed25519_dalek::SigningKey;
+use vos_abi::ids::{InstanceId, MethodId};
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode};
 use vos_light::personal::{
     Answer, Frontier, Link, SealedSync, SyncError, Unusable, Waiting, open_recovery, recovery_key,
 };
@@ -28,10 +31,7 @@ use vos_light::route::Route;
 use vos_light::sealed::{self, OpenError};
 use vos_light::{Error, Light, MAX_ARGUMENTS};
 use vos_testkit::programs;
-use vos_wire::ids::{InstanceId, MethodId};
 use vos_wire::personal::{Envelope, PersonalError, Policy, Pushed, RECOVERY, Scope, Woken};
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode};
 
 use home::Home;
 use phone::Phone;
@@ -82,7 +82,7 @@ fn set(light: &Light, instance: InstanceId, key: u64, value: u64) {
 fn count(light: &Light, instance: InstanceId, key: u64) -> Option<u64> {
     let outcome = light
         .query(
-            vos_wire::ids::Principal::Client([0xd1; 32]),
+            vos_abi::ids::Principal::Client([0xd1; 32]),
             instance,
             method("count"),
             key.encode(),

@@ -24,8 +24,8 @@
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use vos_abi::{Decode, Encode};
 use vos_wire::personal::{Header, MAX_ENVELOPE, Scope};
-use vos_wire::{Decode, Encode};
 use zeroize::Zeroizing;
 
 /// The AEAD's tag.

@@ -29,13 +29,14 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
-use crate::abi::cap::Target;
-use crate::ids::{Session, SessionId, SessionRef};
-use crate::keys::Due;
-use crate::records::{SessionMark, stored, stored_versioned, unstored};
-use crate::result::{InputRef, Page, Run, Step, WorkResult};
-use crate::{Decode, Encode, defaults, expiry, keys};
-use crate::{SpaceId, WindowClock};
+use crate::{defaults, expiry};
+use vos_abi::abi::cap::Target;
+use vos_abi::ids::{Session, SessionId, SessionRef};
+use vos_abi::keys::Due;
+use vos_abi::records::{SessionMark, stored, stored_versioned, unstored};
+use vos_abi::result::{InputRef, Page, Run, Step, WorkResult};
+use vos_abi::{Decode, Encode, keys};
+use vos_abi::{SpaceId, WindowClock};
 
 /// The agent's rows as apply reads and writes them, each as stored.
 pub trait State {

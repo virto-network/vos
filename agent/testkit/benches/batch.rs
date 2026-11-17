@@ -20,21 +20,21 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
+use vos_abi::abi::cap;
+use vos_abi::abi::cap::Target;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, WorkflowId};
+use vos_abi::jam::{AccumulateInput, Operand, RefineArgs};
+use vos_abi::keys::{self, Due};
+use vos_abi::records::{Workflow, unstored};
+use vos_abi::result::{InputRef, Outcome, Step, WorkResult, split_output};
+use vos_abi::{Decode, Encode};
 use vos_pvm::accumulate_host::{self, ACCUMULATE_ENTRY, AccumulateContext};
 use vos_pvm::pool::{MachinePool, OuterMachines};
 use vos_pvm::refine_host::{RefineContext, StateReader};
 use vos_pvm::{ExitReason, PvmBackend};
 use vos_testkit::node::serve;
 use vos_testkit::programs::{actor, agent, method};
-use vos_wire::abi::cap;
-use vos_wire::abi::cap::Target;
 use vos_wire::batch::{Admin, Batch, Input, Request, Work};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, WorkflowId};
-use vos_wire::jam::{AccumulateInput, Operand, RefineArgs};
-use vos_wire::keys::{self, Due};
-use vos_wire::records::{Workflow, unstored};
-use vos_wire::result::{InputRef, Outcome, Step, WorkResult, split_output};
-use vos_wire::{Decode, Encode};
 
 const AGENT: AgentId = AgentId(7);
 const COUNTER: InstanceId = InstanceId(1);
@@ -89,8 +89,8 @@ impl Node {
             derivation: vos_testkit::programs::bare(program),
             roles: vec![],
             target: Target::Vos,
-            space: vos_wire::SpaceId::NONE,
-            clock: vos_wire::WindowClock::DEFAULT,
+            space: vos_abi::SpaceId::NONE,
+            clock: vos_abi::WindowClock::DEFAULT,
         })
     }
 

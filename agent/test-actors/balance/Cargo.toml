@@ -17,4 +17,4 @@ bench = false
 
 [dependencies]
 vos-sdk = { workspace = true }
-vos-tree = { path = "../../tree" }
+vos-tree = { path = "../../../pvm/tree" }

@@ -141,15 +141,15 @@ codes! {
         /// not repeated.
         Replayed = 8,
         /// An auth call whose root is neither the credential actor's newest
-        /// nor superseded at most [`crate::defaults::ROOT_GRACE_MS`] before
-        /// the time [`crate::credentials::judged_at`] makes of the batch's.
+        /// nor superseded at most `vos_wire::defaults::ROOT_GRACE_MS` before
+        /// the time `vos_wire::credentials::judged_at` makes of the batch's.
         StaleRoot = 9,
         /// An auth call of a `once` guard whose nullifier its scope has
         /// admitted.
         Once = 10,
         /// A credentialed call whose proof's device format the release does
         /// not admit, or it or the agent's log retired by the batch's time
-        /// ([`crate::defaults::DEVICE_FORMATS`],
+        /// (`vos_wire::defaults::DEVICE_FORMATS`,
         /// [`crate::keys::format_retired`]).
         Format = 11,
     }
@@ -165,7 +165,7 @@ codes! {
         /// yet: it runs no cuts, so its statements are rootless.
         NoSpace = 1,
         /// The rows it reads are none, past
-        /// [`crate::defaults::MAX_READS`], not strictly increasing, or not
+        /// `vos_wire::defaults::MAX_READS`, not strictly increasing, or not
         /// each a committed row of the workflow's instance.
         Reads = 2,
         /// No attestable method of the instance's by that id.
@@ -182,7 +182,7 @@ codes! {
         /// [`super::cap::Limits::served`], or of another agent, instance,
         /// window, space or read set.
         Unserved = 6,
-        /// Not served within [`crate::defaults::READ_WINDOWS`] windows.
+        /// Not served within `vos_wire::defaults::READ_WINDOWS` windows.
         NotClosed = 7,
         /// The output did not decode as the method's type: the SDK's own.
         Undecodable = 8,

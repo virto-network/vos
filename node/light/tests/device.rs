@@ -12,22 +12,20 @@ use blake2::{Blake2b512, Digest as _};
 use ed25519_dalek::{Signature, VerifyingKey};
 use scale::{Decode, Encode};
 use sha2::Sha256;
+use vos_abi::credentials::{self, DEPTH, EMPTY, P, Tag, Words, compress, leaf};
+use vos_abi::ids::{AgentId, InstanceId, MethodId, derive_id};
+use vos_abi::result::Outcome;
 use vos_api::Kind;
 use vos_light::wire::{self, Answer};
 use vos_light::{
     AuthWitness, Call, DEVICE_FORMAT, DeviceError, DeviceProgram, Digest, PEAK_BYTES, Proven,
     Prover, ProverConfig, Threads, derive_secret, member, owner, scope, source_input, verify,
 };
-use vos_wire::credentials::{
-    self, AuthClaim, DEPTH, EMPTY, Feed, OwnerClaim, P, RING, Ring, RootRefusal, Tag, Words,
-    compress, leaf,
-};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, derive_id};
+use vos_wire::credentials::{AuthClaim, Feed, OwnerClaim, RING, Ring, RootRefusal};
 use vos_wire::ingress::{
     AdmissionRefusal, Consistency, CredentialRefusal, Credentialed, QueryCall, Rejection, Response,
     query_message,
 };
-use vos_wire::result::Outcome;
 
 const HANDLE: [u8; 32] = [7; 32];
 const NAME: &[u8] = b"login";
@@ -427,7 +425,7 @@ fn a_bad_witness_is_refused_before_proving() {
         DeviceError::Config
     );
     let long = Call {
-        arguments: vec![0; vos_wire::abi::cap::REQUEST - vos_wire::abi::cap::CLAIM + 1],
+        arguments: vec![0; vos_abi::abi::cap::REQUEST - vos_abi::abi::cap::CLAIM + 1],
         ..call.clone()
     };
     assert_eq!(

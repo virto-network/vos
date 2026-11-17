@@ -14,7 +14,7 @@
 
 use std::path::Path;
 
-use vos_wire::Encode;
+use vos_abi::Encode;
 
 fn main() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

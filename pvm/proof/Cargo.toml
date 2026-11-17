@@ -5,7 +5,7 @@ version.workspace = true
 license.workspace = true
 
 [features]
-default = ["prover", "wire"]
+default = ["prover", "abi"]
 # Prover-side: trace generation, proof creation, the tracer and parallel
 # iteration.  Disable for a verifier-only build (smaller dep tree,
 # no_std-friendly, builds for wasm32-unknown-unknown).
@@ -33,8 +33,8 @@ prover = [
     "serde/std",
     "num-traits/std",
 ]
-# A kernel's shape read from its install's record (`vos_wire::records::Shape`).
-wire = ["dep:vos-wire"]
+# A kernel's shape read from its install's record (`vos_abi::records::Shape`).
+abi = ["dep:vos-abi"]
 # Diagnostic helpers (`debug_claimed_sums`) for prover-side debugging of
 # logup imbalances.  Off by default so the production prover surface
 # stays clean; turn on with `--features debug-internals` to bisect
@@ -76,7 +76,7 @@ vos-pvm-recair-air = { workspace = true }
 # The final wrap's preprocessed root, which `constants` re-exports: one copy,
 # the venue's.
 vos-pvm-final-verifier = { workspace = true }
-vos-wire = { workspace = true, optional = true }
+vos-abi = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
 
 [dev-dependencies]

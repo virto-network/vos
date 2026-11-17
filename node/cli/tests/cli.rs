@@ -187,7 +187,7 @@ fn a_space_is_founded_once() {
     assert_eq!(genesis.nodes, [(1, [0x11; 32]), (2, [0x22; 32])]);
     assert_eq!(
         space.clock(),
-        vos_wire::WindowClock {
+        vos_abi::WindowClock {
             origin_ms: 5_000,
             length_ms: 120_000
         }
@@ -539,7 +539,7 @@ struct LoseAnswer {
 }
 
 impl vos_node::Hooks for LoseAnswer {
-    fn after_commit(&self, _: vos_wire::ids::AgentId, _: u64) -> bool {
+    fn after_commit(&self, _: vos_abi::ids::AgentId, _: u64) -> bool {
         use std::sync::atomic::Ordering;
         if self.armed.swap(false, Ordering::SeqCst) {
             self.tripped.store(true, Ordering::SeqCst);
@@ -556,7 +556,8 @@ impl vos_node::Hooks for LoseAnswer {
 fn a_pending_call_whose_session_was_collected_is_lost() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use vos_wire::{defaults, expiry, keys};
+    use vos_abi::keys;
+    use vos_wire::{defaults, expiry};
 
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("node");
@@ -626,7 +627,7 @@ fn a_pending_call_whose_session_was_collected_is_lost() {
     // Back after its session's row came due: the idle leader collects it.
     clock.store(expiry::due(expiry::bucket(start)), Ordering::SeqCst);
     let (node, url) = open();
-    let id = vos_wire::ids::AgentId(agent.parse().unwrap());
+    let id = vos_abi::ids::AgentId(agent.parse().unwrap());
     wait_until("the session is collected", Duration::from_secs(20), || {
         vos_checker::applied::<u64>(node.probes().store(), id, &keys::live_sessions()) == Some(0)
     });

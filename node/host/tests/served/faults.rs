@@ -6,15 +6,16 @@
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use vos_abi::ids::{AgentId, Session, SessionId, WorkflowId};
+use vos_abi::keys::Due;
+use vos_abi::records::{Workflow, WorkflowState, unstored};
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode, keys};
 use vos_checker::rounds::ROUNDS;
 use vos_checker::{ANSWERED, ATTEMPT, Client, PAUSING, Random, Touring, wait_until};
 use vos_node::Node;
-use vos_wire::ids::{AgentId, Session, SessionId, WorkflowId};
-use vos_wire::keys::Due;
+use vos_wire::defaults;
 use vos_wire::peer::NodeNumber;
-use vos_wire::records::{Workflow, WorkflowState, unstored};
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode, defaults, keys};
 
 use crate::exactly_once::tallied;
 use crate::harness::{Cluster, NODES, query};

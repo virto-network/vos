@@ -5,14 +5,14 @@
 //! stored in part.
 
 use super::*;
-use vos_wire::{SpaceId, WindowClock};
+use vos_abi::{SpaceId, WindowClock};
 
 const SPACE: SpaceId = SpaceId([0x5a; 32]);
 /// The shortest windows a venue registers, the first boundary 90 s after
 /// `T0`.
 const CLOCK: WindowClock = WindowClock {
     origin_ms: T0 - 30_000,
-    length_ms: vos_wire::vos_anchor::MIN_LENGTH_MS,
+    length_ms: vos_abi::vos_anchor::MIN_LENGTH_MS,
 };
 
 /// An install of `program` at `instance` for `target`, into `SPACE`.
@@ -133,7 +133,7 @@ fn a_record_stored_in_part_traps_on_every_host() {
             };
             assert_eq!(
                 run.outcome,
-                Outcome::failed(vos_wire::abi::Failure::Trapped),
+                Outcome::failed(vos_abi::abi::Failure::Trapped),
                 "{target:?}: a record of rows {held:03b} alone"
             );
             assert!(run.writes.is_empty(), "nothing installed");

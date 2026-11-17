@@ -1,4 +1,4 @@
-//! Reads at a window's cut ([`vos_wire::abi::Op::AttestAt`]) on the default
+//! Reads at a window's cut ([`vos_abi::abi::Op::AttestAt`]) on the default
 //! agent, step by step against the testkit: a workflow's ask recorded as
 //! its window's pending request, its rows served by a `Resume` and run
 //! through the `&self` method's kernel, which checks them against the
@@ -13,20 +13,22 @@
 
 use std::collections::BTreeMap;
 
+use vos_abi::abi::cap::{self, Target};
+use vos_abi::abi::{AttestError, Failure, Kind, price};
+use vos_abi::ids::{AgentId, InstanceId, MethodId, ProgramHash, RequestId, Session, WorkflowId};
+use vos_abi::keys::{self, Due, Transform};
+use vos_abi::message::Body;
+use vos_abi::records::{PendingRead, Workflow, WorkflowState, unstored, unversioned};
+use vos_abi::result::{Attest, InputRef, Outcome, Run, Step, WorkResult};
+use vos_abi::served::{Served, space_root};
+use vos_abi::vos_anchor::{MIN_LENGTH_MS, RootKind, RootRead, VenueId};
+use vos_abi::{Decode, Encode, SpaceId, WindowClock};
 use vos_pvm_compiler::Derived;
 use vos_testkit::model::{Model, run_kernel};
 use vos_testkit::programs::{derived, kernel, method};
 use vos_tree::{BatchProof, Blake2b, MemStore};
-use vos_wire::abi::cap::{self, Target};
-use vos_wire::abi::{AttestError, Failure, Kind, price};
-use vos_wire::batch::{Body, Input, Message, Request};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, ProgramHash, RequestId, Session, WorkflowId};
-use vos_wire::keys::{self, Due, Transform};
-use vos_wire::records::{PendingRead, Workflow, WorkflowState, unstored, unversioned};
-use vos_wire::result::{Attest, InputRef, Outcome, Run, Step, WorkResult};
-use vos_wire::served::{Served, space_root};
-use vos_wire::vos_anchor::{MIN_LENGTH_MS, RootKind, RootRead, VenueId};
-use vos_wire::{Decode, Encode, SpaceId, WindowClock, defaults};
+use vos_wire::batch::{Input, Message, Request};
+use vos_wire::defaults;
 
 use crate::common::{AGENT, ALICE, Node, agrees, install_in, ran};
 
@@ -278,7 +280,7 @@ impl Reads {
             // its boundary: a test serving within the window stands for it.
             if self.node.get(&keys::cut(window)).is_none() {
                 let version = self.node.value::<u64>(&keys::version()).unwrap_or(0);
-                let cut = vos_wire::records::stored(&version.encode());
+                let cut = vos_abi::records::stored(&version.encode());
                 self.node.state.insert(keys::cut(window), cut);
                 self.kit.set_row(keys::cut(window), version.encode());
             }
@@ -365,7 +367,7 @@ fn representative(
 /// The full keys of the reader's entries under `keys`, sorted, as a read
 /// names them.
 fn entry_rows(keys: &[u64]) -> Vec<Vec<u8>> {
-    let map = vos_wire::ids::MapId {
+    let map = vos_abi::ids::MapId {
         instance: READER,
         tag: vos_testkit::programs::table_tag("entries"),
         transform: Transform::Hashed,

@@ -13,10 +13,10 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use vos_abi::result::Attest;
+use vos_abi::vos_anchor::MAX_ROOT_AGE_MS;
 use vos_node_prover::{Jobs, MAX_ATTEMPTS, MAX_RESUBMITS, Options, Refusal, State};
 use vos_venue::vos_statement::ProgramId;
-use vos_wire::result::Attest;
-use vos_wire::vos_anchor::MAX_ROOT_AGE_MS;
 
 use support::*;
 

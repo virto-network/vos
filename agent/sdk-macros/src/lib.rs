@@ -195,7 +195,7 @@ pub fn in_place(item: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn method_id(input: TokenStream) -> TokenStream {
     let name = parse_macro_input!(input as LitStr);
-    let id = vos_wire::ids::derive_id("vos/method/", &name.value());
+    let id = vos_abi::ids::derive_id("vos/method/", &name.value());
     if id == 0 {
         return Error::new(name.span(), "the name derives the reserved id 0")
             .into_compile_error()

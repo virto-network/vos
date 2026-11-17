@@ -2,11 +2,11 @@
 //! agent and for the node.
 
 use fjall::Slice;
-use vos_wire::ids::AgentId;
+use vos_abi::ids::AgentId;
 
 use super::{BlobRef, HardState, LogEntry, Membership, NodeNumber};
 
-/// The first byte of an agent-relative system key ([`vos_wire::keys`]).
+/// The first byte of an agent-relative system key ([`vos_abi::keys`]).
 pub(super) const SYSTEM: u8 = 0x00;
 /// After an agent id, the node's own rows for the agent: above every
 /// epoch (`0..=0xfe`), so no agent row reaches them.

@@ -13,6 +13,10 @@
 
 use std::sync::OnceLock;
 
+use vos_abi::Encode;
+use vos_abi::abi::cap::Target;
+use vos_abi::ids::{AgentId, InstanceId, Principal, ProgramHash};
+use vos_abi::result::Attest;
 use vos_pvm::PVM_HALT_ADDR;
 use vos_pvm::precompile::WitnessRead;
 use vos_pvm_program::{StandardProgram, build_standard_program};
@@ -23,10 +27,6 @@ use vos_pvm_proof::segment::SegmentCursor;
 use vos_pvm_proof::{prove, verify};
 use vos_testkit::model::Model;
 use vos_testkit::programs::{derived, method};
-use vos_wire::Encode;
-use vos_wire::abi::cap::Target;
-use vos_wire::ids::{AgentId, InstanceId, Principal, ProgramHash};
-use vos_wire::result::Attest;
 
 const PAGE: u64 = 4096;
 const RW: u64 = 0x3_0000;
@@ -289,8 +289,8 @@ fn kernels() -> Model {
 }
 
 /// The derivation an install of the `kernels` actor records.
-fn install() -> &'static vos_wire::records::Derivation {
-    static DERIVATION: OnceLock<vos_wire::records::Derivation> = OnceLock::new();
+fn install() -> &'static vos_abi::records::Derivation {
+    static DERIVATION: OnceLock<vos_abi::records::Derivation> = OnceLock::new();
     DERIVATION.get_or_init(|| derived("kernels").derivation())
 }
 
@@ -315,7 +315,7 @@ fn live_attests(values: &[u64]) -> Vec<Attest> {
         &values.to_vec().encode(),
     );
     assert!(
-        matches!(step.outcome, vos_wire::result::Outcome::Done(_)),
+        matches!(step.outcome, vos_abi::result::Outcome::Done(_)),
         "{:?}",
         step.outcome
     );

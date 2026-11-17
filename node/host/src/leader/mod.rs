@@ -23,10 +23,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use smol::future::FutureExt;
+use vos_abi::ids::AgentId;
+use vos_abi::keys;
+use vos_abi::result::{InputRef, Run, Step, WorkResult};
 use vos_raft::Role;
-use vos_wire::ids::AgentId;
-use vos_wire::result::{InputRef, Run, Step, WorkResult};
-use vos_wire::{defaults, keys};
+use vos_wire::defaults;
 
 use crate::fault::{Fault, read};
 use crate::group::{Local, Shared, State};

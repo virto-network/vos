@@ -8,11 +8,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use vos_abi::Encode;
+use vos_abi::abi::cap;
 use vos_api::{ENVELOPE, Mark, Operated};
 use vos_http::routes::{self, Authorization, Routed};
 use vos_http::{Handler, Head, Limits as HttpLimits, Serve};
-use vos_wire::Encode;
-use vos_wire::abi::cap;
 use vos_wire::ingress::{OperatorRefusal, Rejection, Response};
 
 use crate::limits::Limits;

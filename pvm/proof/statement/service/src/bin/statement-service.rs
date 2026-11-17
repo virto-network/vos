@@ -41,13 +41,13 @@ mod runtime;
 use alloc::vec::Vec;
 
 use runtime::{Call, FetchKind, NONE, Output, STACK_BYTES, gas_left};
+use vos_abi::jam::RefineArgs;
 use vos_pvm_program::read_nat;
 use vos_statement_service::accumulate::{accumulate, operand};
 use vos_statement_service::config::{self, Config};
 use vos_statement_service::refine::{Extrinsics, refine, venue};
 use vos_statement_service::state::{Storage, keys};
 use vos_statement_service::verdict::{RegisterCode, Verdict};
-use vos_wire::jam::RefineArgs;
 
 entries!("_start" => "refine_main", "accumulate" => "accumulate_main");
 

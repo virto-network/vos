@@ -15,6 +15,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
+use vos_abi::abi::Failure;
+use vos_abi::credentials::Digest;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal};
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode, SpaceId, WindowClock};
 use vos_checker::Nodes;
 use vos_checker::calls::installed;
 use vos_checker::programs::{actor_elf, program_elf};
@@ -23,14 +28,10 @@ use vos_light::{
     AuthWitness, Call, DeviceError, DeviceProgram, Prover, ProverConfig, Threads, method_id,
 };
 use vos_node::client::{self, Client, Operator};
-use vos_wire::abi::Failure;
-use vos_wire::credentials::{CredentialError, Digest, Open, Path};
+use vos_wire::credentials::{CredentialError, Open, Path};
 use vos_wire::homes::{AgentsPage, Counts, HomesError, Standing, Terms};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
 use vos_wire::ingress::{Credentialed, NodeId, Response};
 use vos_wire::personal::{AdminClass, Attestation, Kit, KitEntry, KitKind, NewDevice, Policy};
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode, SpaceId, WindowClock};
 
 use crate::harness::{Cluster, NODES, OPERATOR_SEED};
 

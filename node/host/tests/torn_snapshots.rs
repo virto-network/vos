@@ -7,10 +7,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use vos_abi::ids::{AgentId, InstanceId};
+use vos_abi::keys::{self, Transform};
+use vos_abi::result::Write;
 use vos_node::store::{Fjall, PersistMode, Tuning};
-use vos_wire::ids::{AgentId, InstanceId};
-use vos_wire::keys::{self, Transform};
-use vos_wire::result::Write;
 
 const AGENT: AgentId = AgentId(1);
 const ROWS: u64 = 1_000;

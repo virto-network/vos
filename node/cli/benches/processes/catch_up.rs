@@ -17,11 +17,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
+use vos_abi::Encode;
+use vos_abi::ids::AgentId;
+use vos_abi::result::Outcome;
 use vos_node::client::Client;
-use vos_wire::Encode;
-use vos_wire::ids::AgentId;
 use vos_wire::ingress::{ReplicaStatus, Response};
-use vos_wire::result::Outcome;
 
 use crate::load::Signed;
 use crate::nodes::{Process, Space};

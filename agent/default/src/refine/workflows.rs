@@ -13,14 +13,15 @@
 
 use alloc::vec::Vec;
 
+use vos_abi::abi::{AttestError, Failure, Kind, cap};
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, RequestId, WorkflowId};
+use vos_abi::keys::{self, Due};
+use vos_abi::message::{Answer, Await};
+use vos_abi::records::{Snapshot, Workflow, WorkflowState};
+use vos_abi::result::{Attested, InputRef, Outcome, Outgoing, Page, Run};
+use vos_abi::{Decode, Encode};
 use vos_pvm_program::REGISTER_COUNT;
-use vos_wire::abi::{AttestError, Failure, Kind, cap};
-use vos_wire::batch::{Answer, Await};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, RequestId, WorkflowId};
-use vos_wire::keys::{self, Due};
-use vos_wire::records::{Snapshot, Workflow, WorkflowState};
-use vos_wire::result::{Attested, InputRef, Outcome, Outgoing, Page, Run};
-use vos_wire::{Decode, Encode, defaults};
+use vos_wire::defaults;
 
 use super::base::Base;
 use super::batch::{Batched, Stepped};
@@ -389,7 +390,7 @@ pub(crate) fn wait(
                 WorkflowState::Ended(outcome) => Some(outcome.clone().into()),
                 _ => {
                     workflow.waiter = Some(awaiting);
-                    run.writes.push(vos_wire::result::Write {
+                    run.writes.push(vos_abi::result::Write {
                         key: keys::workflow(id),
                         value: Some(workflow.encode()),
                     });

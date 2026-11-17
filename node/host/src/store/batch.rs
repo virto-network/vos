@@ -3,10 +3,10 @@
 use std::collections::HashMap;
 
 use fjall::PersistMode;
-use vos_wire::Encode;
-use vos_wire::ids::AgentId;
+use vos_abi::Encode;
+use vos_abi::ids::AgentId;
+use vos_abi::result::Write;
 use vos_wire::peer::{CreationRecord, Placement};
-use vos_wire::result::Write;
 
 use super::keys::{
     NodeRow, agent_key, encode_entry, encode_hard, encode_last_result, encode_membership,

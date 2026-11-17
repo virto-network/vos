@@ -6,13 +6,13 @@ use std::path::Path;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
+use vos_abi::abi::cap::Refused;
+use vos_abi::abi::{Failure, Refusal};
+use vos_abi::ids::{AgentId, InstanceId, MethodId, WorkflowId};
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode};
 use vos_node::client::{Client, ClientError};
-use vos_wire::abi::cap::Refused;
-use vos_wire::abi::{Failure, Refusal};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, WorkflowId};
 use vos_wire::ingress::{Consistency, Response, WorkflowStatus};
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode};
 
 use crate::args::{CallArgs, NodeArgs, WorkflowArgs};
 use crate::kept::Kept;

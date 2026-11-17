@@ -4,12 +4,13 @@
 
 use alloc::collections::BTreeMap;
 
-use vos_wire::abi::Refusal;
+use vos_abi::abi::Refusal;
+use vos_abi::ids::{Session, SessionId, SessionRef};
+use vos_abi::keys;
+use vos_abi::records::SessionMark;
+use vos_abi::result::InputRef;
 use vos_wire::batch::Request;
-use vos_wire::ids::{Session, SessionId, SessionRef};
-use vos_wire::records::SessionMark;
-use vos_wire::result::InputRef;
-use vos_wire::{defaults, keys};
+use vos_wire::defaults;
 
 use super::base::{Base, Corrupt};
 

@@ -9,6 +9,25 @@ use crate::keys::Transform;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub struct AgentId(pub u32);
 
+impl AgentId {
+    /// The id of node `creator`'s agent `serial`, below `1 << 24`: a node
+    /// numbers the agents it creates in its own range, the id's top 8 bits
+    /// its number.
+    pub fn new(creator: u8, serial: u32) -> Self {
+        AgentId(u32::from(creator) << 24 | serial)
+    }
+
+    /// The number of the node whose range the agent is in.
+    pub fn creator(self) -> u8 {
+        (self.0 >> 24) as u8
+    }
+
+    /// Which of its creator's agents it is.
+    pub fn serial(self) -> u32 {
+        self.0 & 0x00ff_ffff
+    }
+}
+
 /// An actor instance installed in an agent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub struct InstanceId(pub u32);

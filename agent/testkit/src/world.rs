@@ -26,17 +26,17 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
+use vos_abi::abi::Failure;
+use vos_abi::abi::cap::Target;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, Session};
+use vos_abi::records::Derivation;
+use vos_abi::result::{Outcome, Outgoing, Run, Step};
+use vos_abi::{Decode, Encode, SpaceId, WindowClock};
 use vos_pvm_compiler::Derived;
-use vos_wire::abi::Failure;
-use vos_wire::abi::cap::Target;
 use vos_wire::batch::{Admin, CredentialedInput, Input, Message, Query, Request, Work};
 use vos_wire::credentials::{self, AuthClaim, OwnerClaim, RootEntry};
 use vos_wire::defaults::{DEVICE_FORMATS, SESSION_EXPIRY_MS};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
 use vos_wire::ingress::Grant;
-use vos_wire::records::Derivation;
-use vos_wire::result::{Outcome, Outgoing, Run, Step};
-use vos_wire::{Decode, Encode, SpaceId, WindowClock};
 
 use crate::node::Node;
 use crate::programs::method;

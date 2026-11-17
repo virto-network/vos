@@ -5,19 +5,19 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use vos_abi::abi::Failure;
+use vos_abi::abi::cap::Target;
+use vos_abi::credentials::{DEPTH, Digest, EMPTY};
+use vos_abi::ids::{InstanceId, Principal};
+use vos_abi::result::{Outcome, Step, WorkResult};
+use vos_abi::{Decode, Encode};
 use vos_pvm_poseidon2::{M31, P};
 use vos_testkit::programs::{method, program, program_elf};
-use vos_wire::abi::Failure;
-use vos_wire::abi::cap::Target;
 use vos_wire::batch::{Admin, Input};
 use vos_wire::credentials::{
-    Change, CredentialError, DEPTH, Digest, EMPTY, FEED_BYTES, Feed, MAX_ONIONS, Onion, Path,
-    RootEntry,
+    Change, CredentialError, FEED_BYTES, Feed, MAX_ONIONS, Onion, Path, RootEntry,
 };
-use vos_wire::ids::{InstanceId, Principal};
 use vos_wire::ingress::Grant;
-use vos_wire::result::{Outcome, Step, WorkResult};
-use vos_wire::{Decode, Encode};
 
 use crate::common::{ALICE, BOB, COUNTER, GAS, Node, Sessions, counter_only, ran};
 
@@ -199,8 +199,8 @@ impl Actor {
             derivation: derived.derivation(),
             roles: vec![(b"registrar".to_vec(), REGISTRAR)],
             target,
-            space: vos_wire::SpaceId::NONE,
-            clock: vos_wire::WindowClock::DEFAULT,
+            space: vos_abi::SpaceId::NONE,
+            clock: vos_abi::WindowClock::DEFAULT,
         });
         let grant = Input::Admin(Admin::SetRole(Grant {
             principal: ALICE,
@@ -451,7 +451,7 @@ fn the_feed_replays_to_the_tree() {
     assert_eq!(length, 6);
     assert_eq!(
         changes[4].leaves,
-        vec![(2, vos_wire::credentials::digest(&EMPTY[0]))]
+        vec![(2, vos_abi::credentials::digest(&EMPTY[0]))]
     );
     assert_eq!(changes[5].leaves.len(), 256);
     replay(&changes);
@@ -770,19 +770,19 @@ fn the_ring_keeps_a_root_a_batch_from_its_time() {
         assert_eq!(root.since, time);
         roots.push(root.root);
     }
-    let rows = vos_wire::abi::Rows::Table {
+    let rows = vos_abi::abi::Rows::Table {
         tag: vos_testkit::programs::table_tag(tables::RING),
-        transform: vos_wire::keys::Transform::Hashed,
+        transform: vos_abi::keys::Transform::Hashed,
     };
-    let key = vos_wire::keys::row(CREDENTIALS, rows, &[tables::RING_KEY]).unwrap();
+    let key = vos_abi::keys::row(CREDENTIALS, rows, &[tables::RING_KEY]).unwrap();
     let ring: Ring = actor.node.value(&key).expect("the ring's row");
     // A cell's row is its table's row under the one-byte key 0.
     let cell = |name: &str| -> u64 {
-        let rows = vos_wire::abi::Rows::Table {
+        let rows = vos_abi::abi::Rows::Table {
             tag: vos_testkit::programs::table_tag(name),
-            transform: vos_wire::keys::Transform::Hashed,
+            transform: vos_abi::keys::Transform::Hashed,
         };
-        let key = vos_wire::keys::row(CREDENTIALS, rows, &[0]).unwrap();
+        let key = vos_abi::keys::row(CREDENTIALS, rows, &[0]).unwrap();
         actor.node.value(&key).expect("the cell's row")
     };
     assert_eq!(cell(tables::COUNT), actor.query::<(), u64>("count", ()));
@@ -827,8 +827,8 @@ fn an_enrollment_of_the_most_members_fits_a_handler() {
     let steps = actor.node.batch(3, vec![enroll, revoke]).steps;
     let (one, gone) = (ran(&steps[0]).gas_used, ran(&steps[1]).gas_used);
     println!("enroll_many(256): {many} gas; enroll: {one}; revoke: {gone}");
-    assert!(many <= vos_wire::defaults::MAX_HANDLER_GAS);
-    assert!(one <= vos_wire::defaults::HANDLER_GAS && gone <= vos_wire::defaults::HANDLER_GAS);
+    assert!(many <= vos_abi::defaults::MAX_HANDLER_GAS);
+    assert!(one <= vos_abi::defaults::HANDLER_GAS && gone <= vos_abi::defaults::HANDLER_GAS);
 }
 
 /// An actor's Poseidon2 call, which its agent serves: the reference

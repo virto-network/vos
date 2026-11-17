@@ -20,12 +20,12 @@ use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
+use vos_abi::Encode;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, derive_id};
+use vos_abi::result::Outcome;
 use vos_node::client::{Client, Operator};
-use vos_wire::Encode;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, derive_id};
 use vos_wire::ingress::Response;
 use vos_wire::personal::{AdminClass, Attestation, Kit, NewDevice, Policy};
-use vos_wire::result::Outcome;
 
 use crate::agents::{Mix, Placed, created, install, operators, place, read_elf};
 use crate::deploy::Deployed;

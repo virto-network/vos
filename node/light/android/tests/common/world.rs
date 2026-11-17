@@ -25,17 +25,17 @@ use russh::keys::ssh_key;
 use russh::server::{Auth, Msg, Session};
 use russh::{Channel, ChannelId};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use vos_abi::credentials as tree;
+use vos_abi::credentials::{DEPTH, EMPTY, Words};
+use vos_abi::ids::{AgentId, ProgramHash};
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode, SpaceId};
 use vos_api::{Event, Framing, Kind, Reader, Requests, frame};
 use vos_light::tor::{Circuit, Dial, Dialing, Stream, Target, onion_address};
-use vos_wire::credentials::{
-    self as tree, Change, DEPTH, EMPTY, Feed, Onion, Open, RootEntry, Words,
-};
-use vos_wire::ids::{AgentId, ProgramHash};
+use vos_wire::credentials::{Change, Feed, Onion, Open, RootEntry};
 use vos_wire::ingress::{self, AgentInfo, Credentialed, QueryCall, Response};
 use vos_wire::peer::CreationRecord;
 use vos_wire::personal::{Kit, NewDevice, Policy};
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode, SpaceId};
 
 use super::host::Host;
 
@@ -740,8 +740,8 @@ impl State {
         );
         assert_eq!(call.method.0, vos_light::method_id("claim_open"));
         let (member, nonce) = <([u8; 32], u64)>::decode_exact(&call.arguments).unwrap();
-        assert!(tree::meets(
-            &tree::open_work(&space.handle, &member, &[3; 32], nonce),
+        assert!(vos_wire::credentials::meets(
+            &vos_wire::credentials::open_work(&space.handle, &member, &[3; 32], nonce),
             2
         ));
         done(space.tree.enroll(&member, now))
@@ -795,7 +795,7 @@ impl State {
             let homes = space.homes.as_mut().unwrap();
             let Some(at) = homes.pool.iter().position(|agent| *agent == chosen) else {
                 return Outcome::Failed {
-                    code: vos_wire::abi::Failure::Handler,
+                    code: vos_abi::abi::Failure::Handler,
                     detail: vos_wire::homes::HomesError::Claimed.encode(),
                 };
             };

@@ -26,8 +26,8 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use ed25519_dalek::SigningKey;
 use sha2::Sha256;
+use vos_abi::{Decode, Encode};
 use vos_wire::personal::{Kit, KitEntry, KitKind, NewKit, r_hash, r2_hash};
-use vos_wire::{Decode, Encode};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 

@@ -29,8 +29,8 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use vos_abi::{SpaceGenesis, SpaceId, WindowClock};
 use vos_wire::peer::NodeNumber;
-use vos_wire::{SpaceGenesis, SpaceId, WindowClock};
 
 /// One node of a space.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -145,7 +145,7 @@ impl Space {
                 ));
             }
         }
-        self.id = vos_wire::vos_anchor::space_id(&genesis);
+        self.id = vos_abi::vos_anchor::space_id(&genesis);
         self.genesis = Some(genesis);
         Ok(self)
     }
@@ -171,7 +171,7 @@ impl Space {
     /// A genesis founding this space: its nodes as listed, `clock`, the
     /// founder's `time` and `nonce`. A venue must be able to register it:
     /// the clock's length one it registers, and 1 to
-    /// [`vos_wire::vos_anchor::MAX_FOUNDING_KEYS`] nodes.
+    /// [`vos_abi::vos_anchor::MAX_FOUNDING_KEYS`] nodes.
     pub fn found(
         &self,
         clock: WindowClock,
@@ -182,15 +182,15 @@ impl Space {
             return Err(format!(
                 "windows of {} ms: a venue registers {} to {} ms",
                 clock.length_ms,
-                vos_wire::vos_anchor::MIN_LENGTH_MS,
-                vos_wire::vos_anchor::MAX_LENGTH_MS
+                vos_abi::vos_anchor::MIN_LENGTH_MS,
+                vos_abi::vos_anchor::MAX_LENGTH_MS
             ));
         }
         let founders = self.nodes.len();
-        if !(1..=vos_wire::vos_anchor::MAX_FOUNDING_KEYS).contains(&founders) {
+        if !(1..=vos_abi::vos_anchor::MAX_FOUNDING_KEYS).contains(&founders) {
             return Err(format!(
                 "{founders} nodes: a venue registers a space of 1 to {} founding nodes",
-                vos_wire::vos_anchor::MAX_FOUNDING_KEYS
+                vos_abi::vos_anchor::MAX_FOUNDING_KEYS
             ));
         }
         let mut nodes: Vec<(NodeNumber, [u8; 32])> = self
@@ -344,8 +344,8 @@ mod tests {
 
         let space = Space::read(&path).unwrap();
         assert_eq!(space.genesis(), Some(&genesis));
-        assert_eq!(space.id(), vos_wire::vos_anchor::space_id(&genesis));
-        assert_ne!(space.id(), vos_wire::vos_anchor::space_id(&again));
+        assert_eq!(space.id(), vos_abi::vos_anchor::space_id(&genesis));
+        assert_ne!(space.id(), vos_abi::vos_anchor::space_id(&again));
         assert_eq!(space.clock(), clock);
 
         let short = WindowClock {
@@ -392,7 +392,7 @@ mod tests {
         std::fs::write(genesis_path(&path), format!("# the genesis\n{hex}\n")).unwrap();
         assert_eq!(
             Space::read(&path).unwrap().id(),
-            vos_wire::vos_anchor::space_id(&genesis)
+            vos_abi::vos_anchor::space_id(&genesis)
         );
 
         let mut other = genesis.clone();

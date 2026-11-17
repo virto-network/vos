@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use vos_abi::result::digest;
 use vos_pvm_compiler::{ServiceMetadata, service_blob};
 use vos_statement::vos_anchor::{RootKind, SpaceId};
 use vos_statement_service::MAX_ITEMS;
@@ -16,7 +17,6 @@ use vos_statement_service::state::{Outcome, SpaceRecord, keys, outcome_id};
 use vos_tree::Hash;
 use vos_wire::package::EPOCH_MS;
 use vos_wire::package::SLOT_MS;
-use vos_wire::result::digest;
 
 use super::package::{WorkItem, payloads};
 use super::{PolkaJam, failed};

@@ -1,18 +1,18 @@
 //! Work results: written step by step, bounded, applied and hashed.
 
-use vos_wire::abi::{self, Failure, Refusal};
-use vos_wire::batch::{Answer, Await, Body};
-use vos_wire::ids::{
+use vos_abi::abi::{self, Failure, Refusal};
+use vos_abi::ids::{
     AgentId, InstanceId, MapId, MethodId, Principal, ProgramHash, Session, SessionId, SessionRef,
     WorkflowId,
 };
-use vos_wire::keys::{self, Due, Transform};
-use vos_wire::records::{Snapshot, Workflow, WorkflowState};
-use vos_wire::result::{
+use vos_abi::keys::{self, Due, Transform};
+use vos_abi::message::{Answer, Await, Body};
+use vos_abi::records::{Snapshot, Workflow, WorkflowState};
+use vos_abi::result::{
     self, Attest, CommittedWrite, InputRef, InstanceGas, Outcome, Outgoing, Page, PageSection,
     ResultWriter, Run, Step, WorkResult, Write,
 };
-use vos_wire::{Decode, Encode};
+use vos_abi::{Decode, Encode};
 
 #[test]
 fn a_result_written_step_by_step_is_the_work_result_encoding() {
@@ -171,7 +171,7 @@ fn largest_step(gas: u64, at_cut: bool) -> Step {
 #[test]
 fn the_largest_step_fits_its_bound() {
     use abi::cap;
-    use vos_wire::defaults::MAX_HANDLER_GAS;
+    use vos_abi::defaults::MAX_HANDLER_GAS;
     let largest_await = Await {
         workflow: WorkflowId(u64::MAX),
         counter: u64::MAX,
@@ -214,7 +214,7 @@ fn the_largest_step_fits_its_bound() {
                 .collect(),
             pending: Some(u64::MAX),
         }),
-        target: vos_wire::abi::cap::Target::Jam,
+        target: vos_abi::abi::cap::Target::Jam,
         stored: u64::MAX,
     };
     let rows = [
@@ -296,8 +296,8 @@ fn a_batchs_time_fits_its_slot_within_the_skew() {
 #[test]
 fn a_result_applies_to_each_hosts_rows() {
     use std::collections::BTreeMap;
+    use vos_abi::records::{stored, stored_versioned};
     use vos_wire::apply::{Host, State, apply};
-    use vos_wire::records::{stored, stored_versioned};
     struct Rows(BTreeMap<Vec<u8>, Vec<u8>>);
     impl State for Rows {
         fn read(&mut self, key: &[u8]) -> Option<Vec<u8>> {
@@ -379,7 +379,7 @@ fn digests_are_blake2b_256() {
     for len in [0, 1, 127, 128, 129, 4096, 4104] {
         let bytes: Vec<u8> = (0..len).map(|at| (at * 7) as u8).collect();
         assert_eq!(
-            vos_wire::result::digest(&bytes),
+            vos_abi::result::digest(&bytes),
             Blake2b.hash(&[], &[&bytes]),
             "{len} bytes"
         );

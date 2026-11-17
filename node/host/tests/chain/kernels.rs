@@ -1,10 +1,10 @@
 //! The kernels the run's statements are of, each by its blob and the
 //! program id recomputed from it, and the statement a record makes.
 
+use vos_abi::ids::ProgramHash;
+use vos_abi::result::Attest;
 use vos_node_prover::Prover;
 use vos_venue::vos_statement::{ProgramId, Statement};
-use vos_wire::ids::ProgramHash;
-use vos_wire::result::Attest;
 
 use crate::venues::Serial;
 

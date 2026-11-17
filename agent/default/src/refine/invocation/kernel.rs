@@ -3,11 +3,11 @@
 
 use alloc::vec::Vec;
 
-use vos_wire::Decode;
-use vos_wire::abi::{Failure, cap, precompile};
-use vos_wire::defaults;
-use vos_wire::ids::ProgramHash;
-use vos_wire::result::KernelReturn;
+use vos_abi::Decode;
+use vos_abi::abi::{Failure, cap, precompile};
+use vos_abi::defaults;
+use vos_abi::ids::ProgramHash;
+use vos_abi::result::KernelReturn;
 
 use crate::machines::{self, ARGUMENTS, Exit, Machine};
 use crate::refine::base::Meter;

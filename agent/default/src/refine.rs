@@ -20,12 +20,12 @@ mod workflows;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use vos_wire::abi::Kind;
+use vos_abi::abi::Kind;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal};
+use vos_abi::jam::RefineArgs;
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode};
 use vos_wire::batch::{Query, Work};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
-use vos_wire::jam::RefineArgs;
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode};
 
 use base::{Base, Source};
 use batch::run_batch;
@@ -35,7 +35,7 @@ type Overlay = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
 
 /// A call of an instance's method: a request's, a message's, a query's, a
 /// nested call's, or a workflow's, of its method by its owner. Its
-/// arguments are what [`vos_wire::abi::Op::Input`] copies out: for a
+/// arguments are what [`vos_abi::abi::Op::Input`] copies out: for a
 /// workflow's step, the step's input.
 #[derive(Clone, Copy)]
 struct Call<'a> {

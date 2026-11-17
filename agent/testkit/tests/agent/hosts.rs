@@ -3,14 +3,14 @@
 //! PolkaJam's prices; and the host calls every program makes. A JAM
 //! package, its state witnessed, against a VOS node: `jam`.
 
+use vos_abi::abi::{self, cap, surface};
+use vos_abi::ids::AgentId;
+use vos_abi::result::WorkResult;
+use vos_abi::{Decode, Encode};
 use vos_pvm::ExitReason;
 use vos_testkit::programs::agent;
-use vos_wire::abi::{self, cap, surface};
 use vos_wire::batch::{Admin, Input, Message, Work};
-use vos_wire::ids::AgentId;
 use vos_wire::ingress::Grant;
-use vos_wire::result::WorkResult;
-use vos_wire::{Decode, Encode};
 
 use crate::common::{
     ALICE, Actors, BOB, CALLER, COUNTER, GAS, LEDGER, MINTER, Node, Sessions, done, install,
@@ -133,7 +133,7 @@ fn the_agent_serves_the_precompiles_a_node_does_at_its_price() {
     assert!(surface::kernel(abi::precompile::POSEIDON2));
     assert_eq!(
         vos_pvm::precompile::WITNESS_INPUT_MAX,
-        vos_wire::abi::cap::WORK_RESULT
+        vos_abi::abi::cap::WORK_RESULT
     );
 }
 
@@ -236,7 +236,7 @@ fn vos_and_jam_hosts_agree_on_batches_that_run_actors() {
         Input::Message(Message {
             from: AgentId(5),
             sequence: 1,
-            body: vos_wire::batch::Body::Call {
+            body: vos_abi::message::Body::Call {
                 instance: COUNTER,
                 method: method(COUNTER, "hash"),
                 arguments: (vec![1u8; 1000], 2u32).encode(),

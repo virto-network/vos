@@ -9,6 +9,14 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use vos_abi::abi::cap::Target;
+use vos_abi::abi::{Rows, cap};
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, WorkflowId};
+use vos_abi::keys::{self, Transform};
+use vos_abi::message::{Answer, Await, Body};
+use vos_abi::records::{Workflow, WorkflowState, stored, unstored};
+use vos_abi::result::{Outcome, Outgoing, PAGE, Step, WorkResult, digest, split_output};
+use vos_abi::{Decode, Encode};
 use vos_jam::builder::POLKAJAM_REFINE_GAS;
 use vos_jam::{
     Builder, Chain, Emulated, Error, Fate, Fault, Landed, Refined, Runner, Store, Taken, builder,
@@ -16,16 +24,10 @@ use vos_jam::{
 use vos_pvm::PvmBackend;
 use vos_testkit::programs::{actor, method};
 use vos_tree::{Blake2b, Hash, Hasher, empty_root};
-use vos_wire::abi::cap::Target;
-use vos_wire::abi::{Rows, cap};
-use vos_wire::batch::{Admin, Answer, Await, Body, Input, Message, Request, Work};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, WorkflowId};
-use vos_wire::keys::{self, Transform};
+use vos_wire::batch::{Admin, Input, Message, Request, Work};
+use vos_wire::defaults;
 use vos_wire::package::slot_of;
 use vos_wire::package::{Opened, Package};
-use vos_wire::records::{Workflow, WorkflowState, stored, unstored};
-use vos_wire::result::{Outcome, Outgoing, PAGE, Step, WorkResult, digest, split_output};
-use vos_wire::{Decode, Encode, defaults};
 
 mod agreement;
 mod cuts;
@@ -285,7 +287,7 @@ fn ran_or_refused(result: &WorkResult) {
     for step in &result.steps {
         if let Step::Ran(run) = step {
             assert!(
-                matches!(run.outcome, vos_wire::result::Outcome::Done(_)),
+                matches!(run.outcome, vos_abi::result::Outcome::Done(_)),
                 "{:?}",
                 run.outcome
             );
@@ -339,8 +341,8 @@ type WitnessKeys = Vec<(Vec<u8>, Opened)>;
 /// keys under its multiproof, and each range complete. A committed row's
 /// leaf commits its bare value.
 fn shows(package: &Package) -> bool {
+    use vos_abi::records::leaf_value;
     use vos_tree::value_hash;
-    use vos_wire::records::leaf_value;
     let commitment = |key: &[u8], salt: &[u8; 16], value: &[u8]| {
         value_hash(&Blake2b, salt, leaf_value(key, value).expect("a value row"))
     };

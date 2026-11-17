@@ -3,7 +3,7 @@
 //! statement's proof recorded.
 
 use super::*;
-use vos_wire::served::AgentPath;
+use vos_wire::batch::AgentPath;
 
 /// The start of window `window`.
 fn start_of(window: u64) -> u64 {
@@ -125,7 +125,7 @@ fn only_a_window_a_read_waits_on_is_cut() {
 #[test]
 fn a_read_never_moves_the_reading_window_back() {
     let mut reads = Reads::with(&[(1, 10)]);
-    let later = vos_wire::records::stored(&(WINDOW + 1).encode());
+    let later = vos_abi::records::stored(&(WINDOW + 1).encode());
     reads.node.state.insert(keys::reading(), later);
     reads.kit.set_row(keys::reading(), (WINDOW + 1).encode());
     reads.start(T0 + 10, "sum_at_cut", vec![1u64]);
@@ -211,14 +211,14 @@ fn a_report_goes_once_a_window() {
         root: [window as u8; 32],
     };
     let result = reads.batch(T0 + 1, vec![report(3, REPRESENTATIVE)]);
-    let call = vos_wire::served::AgentRoot {
+    let call = vos_abi::served::AgentRoot {
         kind: RootKind::Space,
         window: 3,
         root: [3; 32],
     };
     assert_eq!(
         ran(&result.steps[0]).messages,
-        [vos_wire::result::Outgoing {
+        [vos_abi::result::Outgoing {
             to: REPRESENTATIVE,
             body: Body::Report(call),
         }]
@@ -254,7 +254,7 @@ fn a_report_goes_once_a_window() {
 #[test]
 fn a_close_sends_each_path_once() {
     let mut reads = Reads::with(&[(1, 10)]);
-    let count = 2 * defaults::CLOSE_PATHS + 6;
+    let count = 2 * vos_abi::defaults::CLOSE_PATHS + 6;
     let paths: Vec<AgentPath> = (0..count as u32)
         .map(|n| AgentPath {
             agent: AgentId(0x0300_0000 + n),
@@ -280,7 +280,7 @@ fn a_close_sends_each_path_once() {
         .iter()
         .flat_map(|step| ran(step).messages.iter().map(|message| message.to))
         .collect();
-    assert_eq!(first.len(), 2 * defaults::CLOSE_PATHS);
+    assert_eq!(first.len(), 2 * vos_abi::defaults::CLOSE_PATHS);
     let second = sent(&reads.batch(T0 + 2, vec![close(7)]));
     assert_eq!(second.len(), 6);
     assert_eq!(
@@ -289,7 +289,7 @@ fn a_close_sends_each_path_once() {
     );
     assert!(sent(&reads.batch(T0 + 3, vec![close(7)])).is_empty());
     let result = reads.batch(T0 + 4, vec![close(8), close(6)]);
-    assert_eq!(sent(&result).len(), defaults::CLOSE_PATHS);
+    assert_eq!(sent(&result).len(), vos_abi::defaults::CLOSE_PATHS);
     assert!(ran(&result.steps[1]).messages.is_empty());
     let empty = Input::Close {
         window: 9,
@@ -372,7 +372,7 @@ fn a_closed_is_taken_once_from_the_representative() {
         ],
     );
     reads.closes = 2;
-    let held = |reads: &Reads| row::<vos_wire::served::ClosedRow>(reads, &keys::closed(WINDOW));
+    let held = |reads: &Reads| row::<vos_abi::served::ClosedRow>(reads, &keys::closed(WINDOW));
     assert_eq!(held(&reads).unwrap().rep_root, [2; 32]);
     assert!(reads.node.get(&keys::closed(9)).is_none(), "not cut");
     reads.batch(time + 2, vec![closed(REPRESENTATIVE, 3, WINDOW, 4)]);

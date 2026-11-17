@@ -17,13 +17,13 @@
 //! statement's encoding and a work report in its database, a report's
 //! hash in its log).
 
+use vos_abi::result::digest;
+use vos_abi::vos_anchor::MAX_ROOT_AGE_MS;
 use vos_checker::carriers::{self, Audit, Kind, Reach};
 use vos_statement_service::accumulate::BUCKET_MS;
 use vos_statement_service::item::Item;
 use vos_wire::package::SLOT_MS;
 use vos_wire::peer::NodeNumber;
-use vos_wire::result::digest;
-use vos_wire::vos_anchor::MAX_ROOT_AGE_MS;
 
 use crate::run::{CANARY, Jam, Run, Stated};
 use crate::venues::REPORTED;

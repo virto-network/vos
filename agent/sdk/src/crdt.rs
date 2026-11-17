@@ -3,7 +3,7 @@
 //! alike, stored per author, and read filtered by a query.
 //!
 //! Each holds no rows: each operation goes to the agent, which keeps one
-//! entry an element or key and author ([`vos_wire::merge`]) and reads the
+//! entry an element or key and author ([`vos_abi::merge`]) and reads the
 //! latest entry among the authors not cut off, an author that equivocated
 //! or that the device set removed past its frontier. A merge handler only
 //! writes them, and a query only reads them: a merge handler's effects
@@ -24,8 +24,8 @@
 
 use core::marker::PhantomData;
 
-use vos_wire::abi::{Keep, MergeRows};
-use vos_wire::{Decode, Encode};
+use vos_abi::abi::{Keep, MergeRows};
+use vos_abi::{Decode, Encode};
 
 use crate::host;
 use crate::table::{Bind, DefaultTransform, Iter, KeyTransform, TableKey, Tag, encoded};

@@ -70,15 +70,15 @@ pub const fn price(id: u64) -> Option<crate::Gas> {
 pub const WITNESS_INPUT: u64 = 0x401;
 
 /// Gas for one witness-input call, before its bytes: the agent's copy into
-/// the kernel, the work of an actor's `input` (`vos_wire::abi::price::INPUT`).
+/// the kernel, the work of an actor's `input` (`vos_abi::abi::price::INPUT`).
 pub const WITNESS_INPUT_GAS: crate::Gas = 2_500;
 
 /// Gas for each byte a witness-input call writes, an actor's per-byte price
-/// (`vos_wire::abi::price::PER_BYTE`).
+/// (`vos_abi::abi::price::PER_BYTE`).
 pub const WITNESS_INPUT_BYTE_GAS: crate::Gas = 24;
 
 /// The most bytes a kernel's whole witness input holds, a work result's cap
-/// (`vos_wire::abi::cap::WORK_RESULT`): the attest that records it fits one.
+/// (`vos_abi::abi::cap::WORK_RESULT`): the attest that records it fits one.
 pub const WITNESS_INPUT_MAX: usize = 4 << 20;
 
 /// Whether `id` names a call a kernel may make: the BLAKE2b or the

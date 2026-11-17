@@ -37,12 +37,12 @@
 //! No push-notification token is given to any space (§8, L3).
 
 use ed25519_dalek::Signer as _;
-use vos_wire::ids::InstanceId;
+use vos_abi::ids::InstanceId;
+use vos_abi::{Decode, Encode};
 use vos_wire::personal::{
     Attached, Body, DeviceId, DeviceView, Entry, Op, Overview, PersonalError, Recorded, Signer,
     Vote, Voted,
 };
-use vos_wire::{Decode, Encode};
 
 use crate::group::{self, Alarm, DeviceGroup, Event, Open};
 use crate::home;

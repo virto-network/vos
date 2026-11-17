@@ -8,7 +8,7 @@
 //! the window: the reports applied before it are in `A_rep`, the later
 //! ones are not. Each agent's leader reports its root after its cut's
 //! build ([`vos_wire::batch::Input::Report`]), which the agent's refine
-//! sends as a [`vos_wire::batch::Body::Report`] and the representative's
+//! sends as a [`vos_abi::message::Body::Report`] and the representative's
 //! refine stores natively in `roots` and `asked`, so no program's call can
 //! write them; the actor declares them for its view. Its node
 //! builds its tree at its cut, signs the anchor of `S_w` and sends each
@@ -19,7 +19,7 @@
 use vos_sdk::prelude::*;
 
 /// An agent's root's row: the agent, the root's kind, the window, as
-/// `vos_wire::served::representative_row` keys it.
+/// `vos_abi::served::representative_row` keys it.
 pub type RepKey = (u32, (u8, u64));
 
 #[actor]

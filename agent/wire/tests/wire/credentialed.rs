@@ -3,14 +3,15 @@
 //! the origins, the binding digest and the scope, and the system rows
 //! apply keeps.
 
-use vos_wire::abi::Refusal;
+use vos_abi::abi::Refusal;
+use vos_abi::credentials::Tag;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal};
+use vos_abi::keys::{self, Due};
+use vos_abi::result::InputRef;
+use vos_abi::{Decode, Encode, SpaceId, defaults};
 use vos_wire::batch::{CredentialedInput, Input};
-use vos_wire::credentials::{self, AuthClaim, Bound, OwnerClaim, Tag};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
+use vos_wire::credentials::{self, AuthClaim, Bound, OwnerClaim};
 use vos_wire::ingress::{CredentialRefusal, Credentialed, Rejection};
-use vos_wire::keys::{self, Due};
-use vos_wire::result::InputRef;
-use vos_wire::{Decode, Encode, SpaceId, defaults};
 
 fn blake2b(bytes: &[u8]) -> [u8; 32] {
     vos_pvm::precompile::blake2b_256(bytes)
@@ -229,9 +230,12 @@ fn the_binding_and_the_scope_are_their_fields_hashes() {
         assert_ne!(other.digest(), expected);
     }
     let binding = credentials::binding(&expected);
-    let words = credentials::compress(&Tag::Binding.block(), &credentials::reduced(&expected));
-    assert_eq!(binding, credentials::digest(&words));
-    assert!(credentials::words(&binding).is_some());
+    let words = vos_abi::credentials::compress(
+        &Tag::Binding.block(),
+        &vos_abi::credentials::reduced(&expected),
+    );
+    assert_eq!(binding, vos_abi::credentials::digest(&words));
+    assert!(vos_abi::credentials::words(&binding).is_some());
 
     let scope = credentials::scope(&space, AgentId(1), InstanceId(2), b"vote");
     let hash = blake2b(
@@ -245,8 +249,9 @@ fn the_binding_and_the_scope_are_their_fields_hashes() {
         ]
         .concat(),
     );
-    let words = credentials::compress(&Tag::Scope.block(), &credentials::reduced(&hash));
-    assert_eq!(scope, credentials::digest(&words));
+    let words =
+        vos_abi::credentials::compress(&Tag::Scope.block(), &vos_abi::credentials::reduced(&hash));
+    assert_eq!(scope, vos_abi::credentials::digest(&words));
     // The device library's vector (`vos-light`'s `SCOPE_VECTOR`): the
     // name in SCALE, as `proving.md` §8 pins it.
     assert_eq!(
@@ -266,9 +271,9 @@ fn the_binding_and_the_scope_are_their_fields_hashes() {
     // Two spaces sharing a handle: one secret, one guard's name, two
     // nullifiers.
     let secret = [1, 2, 3, 4, 5, 6, 7, 8];
-    let nullifier = |scope: &credentials::Digest| {
-        let key = credentials::compress(&Tag::Nf.block(), &secret);
-        credentials::compress(&key, &credentials::words(scope).unwrap())
+    let nullifier = |scope: &vos_abi::credentials::Digest| {
+        let key = vos_abi::credentials::compress(&Tag::Nf.block(), &secret);
+        vos_abi::credentials::compress(&key, &vos_abi::credentials::words(scope).unwrap())
     };
     let elsewhere = credentials::scope(&SpaceId([0x12; 32]), AgentId(1), InstanceId(2), b"vote");
     assert_ne!(nullifier(&scope), nullifier(&elsewhere));
@@ -299,7 +304,7 @@ fn the_credential_rows_are_their_own_and_read_back() {
     assert_eq!(keys::due_entry(&row), Some((7, Due::Binding([9; 32]))));
     assert_eq!(keys::due_entry(&row[..row.len() - 1]), None);
     assert_eq!(keys::due_entry(&[&row[..], &[0]].concat()), None);
-    let session = keys::due(7, Due::Session(vos_wire::ids::SessionId(1)));
+    let session = keys::due(7, Due::Session(vos_abi::ids::SessionId(1)));
     assert_eq!(
         keys::due_entry(&[&session[..], &[0]].concat()),
         None,
@@ -316,15 +321,15 @@ fn the_credential_rows_are_their_own_and_read_back() {
     };
     let listed = keys::sweep_rows(scan, 7, 8).unwrap();
     assert_eq!(listed.len(), 1 + defaults::SWEEP_BINDINGS);
-    assert_eq!(listed[0], (7, Due::Session(vos_wire::ids::SessionId(1))));
+    assert_eq!(listed[0], (7, Due::Session(vos_abi::ids::SessionId(1))));
 }
 
 /// The ring's row is the credential actor's hashed table `ring`'s one row,
 /// under the key byte 0, at that actor's instance alone.
 #[test]
 fn the_rings_row_is_its_tables_one_row() {
-    let rows = vos_wire::abi::Rows::Table {
-        tag: vos_wire::ids::derive_id("vos/table/", credentials::tables::RING),
+    let rows = vos_abi::abi::Rows::Table {
+        tag: vos_abi::ids::derive_id("vos/table/", credentials::tables::RING),
         transform: keys::Transform::Hashed,
     };
     let actor = InstanceId(9);

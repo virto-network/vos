@@ -7,14 +7,14 @@
 use crate::common;
 use crate::cut::{self, AGENT, Cut, INSTANCE, Rng, Venue, genesis, read_live, traced};
 
+use vos_abi::Encode;
+use vos_abi::abi::AttestError;
+use vos_abi::ids::MapId;
+use vos_abi::keys::{self, Transform};
+use vos_abi::vos_anchor::{VenueId, space_id};
 use vos_statement::{ProgramId, Statement};
 use vos_testkit::programs::table_tag;
 use vos_tree::{Blake2b, Hasher};
-use vos_wire::Encode;
-use vos_wire::abi::AttestError;
-use vos_wire::ids::MapId;
-use vos_wire::keys::{self, Transform};
-use vos_wire::vos_anchor::{VenueId, space_id};
 
 pub(crate) const ACCOUNT: [u8; 32] = [0xAC; 32];
 const BALANCE: u64 = 5_000;

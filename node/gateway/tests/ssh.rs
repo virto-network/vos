@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::SigningKey;
 use russh::keys::{PublicKeyOrCertificate, ssh_key};
 use russh::{ChannelMsg, client};
+use vos_abi::ids::InstanceId;
+use vos_abi::{Decode, Encode};
 use vos_api::{FRAME_ERROR, FrameError, Framing, Kind, frame};
 use vos_checker::programs::Programs;
 use vos_gateway::Gateway;
@@ -24,9 +26,7 @@ use vos_gateway::limits::{Limits, PerAddress};
 use vos_gateway::upstream::{Address, Upstream};
 use vos_node::client::{Client, Operator, Target, signed_query};
 use vos_node::{Config, Node};
-use vos_wire::ids::InstanceId;
 use vos_wire::ingress::{Consistency, Rejection, Response};
-use vos_wire::{Decode, Encode};
 
 const OPERATOR: [u8; 32] = [31; 32];
 const COUNTER: InstanceId = InstanceId(1);
@@ -343,7 +343,7 @@ async fn the_relay_marks_each_frame_with_its_port() {
         served.clock.load(Ordering::SeqCst) + 10_000,
         Consistency::Applied { at: 0 },
         GATED,
-        vos_wire::ids::MethodId(vos_wire::ids::derive_id("vos/method/", "count")),
+        vos_abi::ids::MethodId(vos_abi::ids::derive_id("vos/method/", "count")),
         Vec::new(),
     );
     let body = (gated, query).encode();
@@ -630,12 +630,12 @@ async fn a_flood_of_junk_proofs_is_held_to_the_caps_and_members_are_served() {
             "{body:?}"
         );
     }
-    let session = vos_wire::ids::Session {
+    let session = vos_abi::ids::Session {
         key: key.verifying_key().to_bytes(),
         name: [3; 16],
         t0: served.clock.load(Ordering::SeqCst),
     };
-    let increment = vos_wire::ids::MethodId(vos_wire::ids::derive_id("vos/method/", "increment"));
+    let increment = vos_abi::ids::MethodId(vos_abi::ids::derive_id("vos/method/", "increment"));
     let call = vos_node::client::signed_call(
         &identity,
         &key,
@@ -874,7 +874,7 @@ async fn the_onions_ssh_serves_the_screens_marked_onion_and_limited_per_circuit(
             served.clock.load(Ordering::SeqCst) + 10_000,
             Consistency::Applied { at: 0 },
             GATED,
-            vos_wire::ids::MethodId(vos_wire::ids::derive_id("vos/method/", "count")),
+            vos_abi::ids::MethodId(vos_abi::ids::derive_id("vos/method/", "count")),
             Vec::new(),
         );
         frame(

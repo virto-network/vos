@@ -2,8 +2,8 @@
 //! actor's ELF, and run on the arguments their witness input reads.
 
 use super::*;
-use vos_wire::abi::cap::Target;
-use vos_wire::records::Kernel;
+use vos_abi::abi::cap::Target;
+use vos_abi::records::Kernel;
 
 /// A kernel's machine maps no arguments: they reach it through its
 /// witness input. A store at the standard argument window, which φ7 names,
@@ -90,7 +90,7 @@ fn an_install_binds_each_kernel_to_an_attestable_method() {
     let with = |kernels: Vec<Kernel>| {
         Input::Admin(Admin::Install {
             instance,
-            derivation: vos_wire::records::Derivation {
+            derivation: vos_abi::records::Derivation {
                 kernels,
                 ..derivation.clone()
             },
@@ -134,7 +134,7 @@ fn an_install_binds_each_kernel_to_an_attestable_method() {
         ran(&result.steps[4]).outcome,
         Outcome::Done(derivation.encode())
     );
-    let installed: vos_wire::records::Installed =
+    let installed: vos_abi::records::Installed =
         node.value(&keys::installed(LEDGER)).expect("installed");
     assert_eq!(installed.derivation, derivation);
 }
@@ -165,8 +165,8 @@ fn derived_kernels_run_in_the_agent() {
             derivation: derived.derivation(),
             roles: vec![],
             target,
-            space: vos_wire::SpaceId::NONE,
-            clock: vos_wire::WindowClock::DEFAULT,
+            space: vos_abi::SpaceId::NONE,
+            clock: vos_abi::WindowClock::DEFAULT,
         });
         node.add(&derived.actor);
         for (_, kernel) in &kernels {
@@ -225,8 +225,8 @@ fn a_device_kernels_method_is_never_attested() {
                 .map(|role| (role.as_bytes().to_vec(), 1))
                 .collect(),
             target: Target::Vos,
-            space: vos_wire::SpaceId::NONE,
-            clock: vos_wire::WindowClock::DEFAULT,
+            space: vos_abi::SpaceId::NONE,
+            clock: vos_abi::WindowClock::DEFAULT,
         })
     };
     let installs = vec![

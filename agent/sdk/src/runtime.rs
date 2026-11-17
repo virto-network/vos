@@ -8,10 +8,10 @@ use core::future::Future;
 use core::mem::ManuallyDrop;
 use core::pin::pin;
 use core::task::{Context, Poll, Waker};
-use vos_wire::result::KernelReturn;
-use vos_wire::schema::Admission;
-use vos_wire::served::{Served, representative_row, space_root};
-use vos_wire::vos_anchor::{RootKind, RootRead};
+use vos_abi::result::KernelReturn;
+use vos_abi::schema::Admission;
+use vos_abi::served::{Served, representative_row, space_root};
+use vos_abi::vos_anchor::{RootKind, RootRead};
 
 /// The invocation's arguments, decoded as `T`. Arguments that do not
 /// decode trap, which fails the step.
@@ -27,7 +27,7 @@ pub fn arguments<T: crate::Decode>() -> T {
 /// linker script places last in the read-write data; and its panic
 /// handler, a trap. The entry macros include it. With `actor`, an actor
 /// program's: a handler or a kernel is given the arena's first
-/// [`vos_wire::abi::INVOCATION_HEAP`] bytes alone.
+/// [`vos_abi::abi::INVOCATION_HEAP`] bytes alone.
 #[macro_export]
 macro_rules! program_runtime {
     (@heap $arena:expr, $actor:literal) => {
@@ -70,14 +70,14 @@ macro_rules! program_runtime {
     };
 }
 
-/// An actor program's heap by default, [`vos_wire::abi::INVOCATION_HEAP`].
+/// An actor program's heap by default, [`vos_abi::abi::INVOCATION_HEAP`].
 /// An install derives programs that hold at most its first 512 KiB, all a
 /// handler or a kernel maps; a workflow, which runs in its actor's program,
 /// maps the rest past it, and arms each page it may write at every step
 /// (`defaults::ARM_PAGE`). So an actor configures the least heap its
 /// largest workflow needs, and its handlers run within the first 512 KiB of
 /// it: past them, an allocation fails and the invocation traps.
-pub const PROGRAM_HEAP: usize = vos_wire::abi::INVOCATION_HEAP;
+pub const PROGRAM_HEAP: usize = vos_abi::abi::INVOCATION_HEAP;
 
 /// A program's output, by the halt convention: its address in φ7 and its
 /// length in φ8. An attestable method's entry returns it, and so do the
@@ -165,7 +165,7 @@ pub fn served(input: &[u8]) -> &'static Served {
 /// representative's root, the root read it states. A refusal traps, which
 /// fails the attest.
 pub fn verify_served(served: &Served) -> RootRead {
-    let prefix = vos_wire::keys::instance_committed(served.instance);
+    let prefix = vos_abi::keys::instance_committed(served.instance);
     let mut claims: Vec<(&[u8], Option<vos_tree::Hash>)> = Vec::with_capacity(served.rows.len());
     for (index, (key, read)) in served.rows.iter().enumerate() {
         assert!(key.starts_with(&prefix), "a row of another instance");
@@ -233,7 +233,7 @@ pub const REFERENCE: u64 = 1 << 34;
 /// Where a reference's method word holds its kernel's headroom
 /// (`headroom = k`): each of the device program's log sizes raised by `k`
 /// over the reference run's, `k` at most
-/// [`vos_wire::records::MAX_HEADROOM`].
+/// [`vos_abi::records::MAX_HEADROOM`].
 pub const HEADROOM_SHIFT: u32 = 40;
 
 /// An actor program: `actor_program!(crate_name::module)`, naming the
@@ -293,7 +293,7 @@ macro_rules! actor_program {
 /// long, of which `methods` its methods' encoding): its methods alone, or
 /// with the credentials' part when the actor is the credential actor, a
 /// method is `guarded` or the actor asks an admission, then the admission
-/// when it asks one ([`vos_wire::schema::Schema::section`]).
+/// when it asks one ([`vos_abi::schema::Schema::section`]).
 pub const fn schema_len(
     marked: usize,
     methods: usize,
@@ -381,9 +381,9 @@ mod tests {
     use alloc::boxed::Box;
     use alloc::vec;
 
-    use vos_wire::abi::Kind;
-    use vos_wire::ids::MethodId;
-    use vos_wire::schema::{CredentialGuard, MethodSchema, Schema};
+    use vos_abi::abi::Kind;
+    use vos_abi::ids::MethodId;
+    use vos_abi::schema::{CredentialGuard, MethodSchema, Schema};
 
     use super::*;
 

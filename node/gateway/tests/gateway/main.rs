@@ -15,6 +15,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Session, WorkflowId};
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode};
 use vos_api::{Kind, Mark};
 use vos_checker::calls::{install_of, installed};
 use vos_checker::programs::Programs;
@@ -26,12 +29,9 @@ use vos_gateway::upstream::{Address, Upstream};
 use vos_http::routes::operated_header;
 use vos_node::client::{Client, Operator, Target, signed_call, signed_operated, signed_query};
 use vos_node::{Config, Node, Peers};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Session, WorkflowId};
 use vos_wire::ingress::{
     Consistency, Contact, NodeId, OperatorRefusal, Rejection, Response, WorkflowRead,
 };
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode};
 
 const COUNTER: InstanceId = InstanceId(1);
 /// The seed of the operator key the nodes list.

@@ -8,10 +8,10 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use scale::{Decode, Encode};
 
-use crate::abi::Refusal;
-use crate::ids::{AgentId, InstanceId, MethodId, Principal, Session, WorkflowId};
 use crate::peer::{CreationRecord, NodeNumber};
-use crate::result::Outcome;
+use vos_abi::abi::Refusal;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, Session, WorkflowId};
+use vos_abi::result::Outcome;
 
 const CALL_DOMAIN: &[u8] = b"vos/call/v1";
 const QUERY_DOMAIN: &[u8] = b"vos/query/v1";
@@ -195,7 +195,7 @@ pub enum Consistency {
 /// The operator's `POST /agents/{agent}/install`: the package, the ELF its
 /// actor's crate built, as it is, from which the node derives its programs,
 /// and the agent's role byte for each role name its schema uses. Answered
-/// with the install's outcome, the [`crate::records::Derivation`] encoded.
+/// with the install's outcome, the [`vos_abi::records::Derivation`] encoded.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Install {
     pub instance: InstanceId,
@@ -281,7 +281,7 @@ pub enum Rejection {
     #[codec(index = 10)]
     Operator(OperatorRefusal),
     /// A request the agent's admission refuses
-    /// ([`crate::schema::Admission`]): why.
+    /// ([`vos_abi::schema::Admission`]): why.
     #[codec(index = 11)]
     Admission(AdmissionRefusal),
 }
@@ -316,8 +316,8 @@ pub enum CredentialRefusal {
     #[codec(index = 1)]
     Format,
     /// The proof past its format's cap, the claim past
-    /// [`crate::abi::cap::CLAIM`], or the arguments past
-    /// [`crate::abi::cap::REQUEST`] less it.
+    /// [`vos_abi::abi::cap::CLAIM`], or the arguments past
+    /// [`vos_abi::abi::cap::REQUEST`] less it.
     #[codec(index = 2)]
     Size,
     /// `expires_ms` before `now`, the node's time, or more than
@@ -371,8 +371,8 @@ pub enum CredentialRefusal {
 pub struct Credentialed {
     pub instance: InstanceId,
     pub method: MethodId,
-    /// At most [`crate::abi::cap::REQUEST`] less
-    /// [`crate::abi::cap::CLAIM`] bytes.
+    /// At most [`vos_abi::abi::cap::REQUEST`] less
+    /// [`vos_abi::abi::cap::CLAIM`] bytes.
     pub arguments: Vec<u8>,
     /// The client's, drawn at random.
     pub nonce: [u8; 16],
@@ -381,7 +381,7 @@ pub struct Credentialed {
     /// The proof's device format, from the proof registry.
     pub format: u32,
     /// The kernel's public arguments in their SCALE encoding, at most
-    /// [`crate::abi::cap::CLAIM`] bytes, its last 32 the call's binding
+    /// [`vos_abi::abi::cap::CLAIM`] bytes, its last 32 the call's binding
     /// ([`crate::credentials::claim_binding`]).
     pub claim: Vec<u8>,
     pub proof: Vec<u8>,

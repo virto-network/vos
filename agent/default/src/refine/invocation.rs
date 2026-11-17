@@ -16,17 +16,18 @@ use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 
-use vos_wire::abi::cap::{self, Limits};
-use vos_wire::abi::{
+use vos_abi::abi::cap::{self, Limits};
+use vos_abi::abi::{
     self, AttestError, Failure, Kind, MergeRows, Op, Rows, code, precompile, price,
 };
-use vos_wire::batch::{Await, Body};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, RequestId, WorkflowId};
-use vos_wire::merge::{Cutoff, Origin};
-use vos_wire::records::{Installed, PendingRead};
-use vos_wire::result::{Attest, Attested, InstanceGas, KernelReturn, Outcome, Outgoing};
-use vos_wire::served::{ClosedRow, Served};
-use vos_wire::{Decode, Encode, SpaceId, WindowClock, defaults, keys};
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, RequestId, WorkflowId};
+use vos_abi::merge::{Cutoff, Origin};
+use vos_abi::message::{Await, Body};
+use vos_abi::records::{Installed, PendingRead};
+use vos_abi::result::{Attest, Attested, InstanceGas, KernelReturn, Outcome, Outgoing};
+use vos_abi::served::{ClosedRow, Served};
+use vos_abi::{Decode, Encode, SpaceId, WindowClock, keys};
+use vos_wire::defaults;
 
 use super::base::{Base, Corrupt, Meter, role_byte};
 use super::{Call, Overlay};

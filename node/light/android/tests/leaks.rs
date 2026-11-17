@@ -403,7 +403,8 @@ fn nothing_the_facility_shows_or_keeps_carries_a_secret() {
         }
     };
     let (_, request) = world.last_credentialed();
-    let claim = tree::AuthClaim::decode_exact(&request.claim).expect("an auth claim");
+    let claim =
+        vos_wire::credentials::AuthClaim::decode_exact(&request.claim).expect("an auth claim");
     assert_eq!(
         claim.map_root,
         world.root(AGENT),

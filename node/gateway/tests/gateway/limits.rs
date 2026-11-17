@@ -31,7 +31,7 @@ fn install_request(served: &Served, authorization: &str) -> String {
     format!(
         "POST /agents/{}/install HTTP/1.1\r\nHost: node\r\nAuthorization: {authorization}\r\nContent-Length: {}\r\n\r\n",
         served.agent.0,
-        vos_wire::abi::cap::MAX_ELF
+        vos_abi::abi::cap::MAX_ELF
     )
 }
 
@@ -69,7 +69,7 @@ fn install_size_bodies_are_bounded_and_refused_from_their_heads() {
         format!(
             "POST /agents/{}/install HTTP/1.1\r\nHost: node\r\nContent-Length: {}\r\n\r\n",
             served.agent.0,
-            vos_wire::abi::cap::MAX_ELF
+            vos_abi::abi::cap::MAX_ELF
         )
         .as_bytes(),
     );
@@ -121,7 +121,7 @@ fn a_refusal_for_size_never_reaches_the_node() {
     let path = format!("/agents/{}/install", served.agent.0);
     let header = format!(
         "POST {path} HTTP/1.1\r\nHost: node\r\nContent-Length: {}\r\n\r\n",
-        vos_wire::abi::cap::MAX_ELF + vos_api::ENVELOPE + 1
+        vos_abi::abi::cap::MAX_ELF + vos_api::ENVELOPE + 1
     );
     assert_eq!(exchange(served.front.address, header.as_bytes()).0, 413);
     assert_eq!(served.node.probes().api_frames(), before);

@@ -13,10 +13,10 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use ed25519_dalek::SigningKey;
+use vos_abi::ids::MethodId;
+use vos_abi::schema::Schema;
 use vos_node::client::ClientError;
 use vos_node::{Config, Node, Space};
-use vos_wire::ids::MethodId;
-use vos_wire::schema::Schema;
 
 use args::{Cli, Command, KeyCommand, NodeCommand, RunArgs, SpaceCommand};
 use call::read_workflow;
@@ -248,7 +248,7 @@ fn found(space: &Path, data: &Path, window_ms: u64, origin_ms: Option<u64>) -> R
         .as_millis() as u64;
     let mut nonce = [0u8; 16];
     getrandom::getrandom(&mut nonce).map_err(|error| error.to_string())?;
-    let clock = vos_wire::WindowClock {
+    let clock = vos_abi::WindowClock {
         origin_ms: origin_ms.unwrap_or(time),
         length_ms: window_ms,
     };
@@ -265,10 +265,7 @@ fn found(space: &Path, data: &Path, window_ms: u64, origin_ms: Option<u64>) -> R
          and restart the nodes, before creating any agent",
         path.display()
     );
-    println!(
-        "{}",
-        hex::encode(vos_wire::vos_anchor::space_id(&genesis).0)
-    );
+    println!("{}", hex::encode(vos_abi::vos_anchor::space_id(&genesis).0));
     Ok(())
 }
 

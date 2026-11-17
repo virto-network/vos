@@ -6,12 +6,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use smol::future::FutureExt;
-use vos_wire::Encode;
+use vos_abi::Encode;
+use vos_abi::keys;
+use vos_abi::keys::Due;
+use vos_abi::records::unstored;
+use vos_abi::result::{Step, WorkResult, Write as StateWrite};
 use vos_wire::batch::{Batch, Work};
-use vos_wire::keys;
-use vos_wire::keys::Due;
-use vos_wire::records::unstored;
-use vos_wire::result::{Step, WorkResult, Write as StateWrite};
 
 use super::{Ended, Leader, is_due, leads};
 use crate::blobs::{Held, Keep, blob_ref};
@@ -161,7 +161,7 @@ impl Leader {
             .find(|write| write.key == keys::version())
             .and_then(|write| write.value.as_deref())
             .and_then(unstored)
-            .and_then(|bytes| vos_wire::Decode::decode(bytes).ok())
+            .and_then(|bytes| vos_abi::Decode::decode(bytes).ok())
             .map(|(version, _): (u64, usize)| version);
         if written != Some(version + 1) {
             return Err(Fault::Invariant(format!(

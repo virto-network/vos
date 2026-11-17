@@ -3,8 +3,8 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use vos_wire::ids::{AgentId, MethodId};
-use vos_wire::records::WorkflowState;
+use vos_abi::ids::{AgentId, MethodId};
+use vos_abi::records::WorkflowState;
 
 /// How an invocation ended, short of failing the whole step.
 pub(crate) enum Ended {

@@ -11,8 +11,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
 
-use vos_wire::ids::InstanceId;
-use vos_wire::keys;
+use vos_abi::ids::InstanceId;
+use vos_abi::keys;
 
 use crate::Random;
 

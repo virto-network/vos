@@ -466,7 +466,7 @@ impl Inner {
     /// enrolled guard proves with it.
     pub(crate) fn program(&self, kernel: &[u8]) -> Result<Arc<DeviceProgram>, DeviceError> {
         self.programs.get(warm::key(kernel), || {
-            <Release as vos_wire::Decode>::decode_exact(kernel)
+            <Release as vos_abi::Decode>::decode_exact(kernel)
                 .ok_or(DeviceError::Prove)
                 .and_then(|device| {
                     DeviceProgram::from_release(&device).map_err(DeviceError::Program)
@@ -1364,13 +1364,13 @@ fn describe(method: &Method) -> (String, String) {
 /// `Some(true)` for one superseded past its grace, at ingress
 /// (`RootStale`) or at apply (`StaleRoot`).
 fn root_refused(answer: &[u8]) -> Option<bool> {
-    use vos_wire::abi::Refusal as Refused;
+    use vos_abi::abi::Refusal as Refused;
     use vos_wire::ingress::Response;
     match wire::credentialed_answer(answer) {
         Ok(wire::Answer::RootUnknown) => Some(false),
         Ok(wire::Answer::RootStale) => Some(true),
         Ok(wire::Answer::Other(body)) => matches!(
-            <Response as vos_wire::Decode>::decode_exact(&body),
+            <Response as vos_abi::Decode>::decode_exact(&body),
             Some(Response::Refused(Refused::StaleRoot))
         )
         .then_some(true),
@@ -1389,12 +1389,12 @@ pub(crate) fn update_refused(answer: &[u8]) -> Result<(), Refusal> {
 }
 
 fn format_refused(answer: &[u8]) -> bool {
-    use vos_wire::abi::Refusal as Refused;
+    use vos_abi::abi::Refusal as Refused;
     use vos_wire::ingress::{CredentialRefusal, Response};
     match wire::credentialed_answer(answer) {
         Ok(wire::Answer::Refused(CredentialRefusal::Format)) => true,
         Ok(wire::Answer::Other(body)) => matches!(
-            <Response as vos_wire::Decode>::decode_exact(&body),
+            <Response as vos_abi::Decode>::decode_exact(&body),
             Some(Response::Refused(Refused::Format))
         ),
         _ => false,
@@ -1544,9 +1544,9 @@ mod tests {
         for artifact in [&stock.auth, &stock.owner] {
             facility.inner.program(artifact).unwrap();
         }
-        let mut renamed = <Release as vos_wire::Decode>::decode_exact(&stock.owner).unwrap();
+        let mut renamed = <Release as vos_abi::Decode>::decode_exact(&stock.owner).unwrap();
         renamed.id[0] ^= 1;
-        let renamed = vos_wire::Encode::encode(&renamed);
+        let renamed = vos_abi::Encode::encode(&renamed);
         assert_eq!(
             facility.inner.program(&renamed).map(drop),
             Err(DeviceError::Program(vos_light::ProgramError::IdMismatch))

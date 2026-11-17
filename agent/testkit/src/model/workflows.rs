@@ -15,17 +15,18 @@
 
 use std::collections::BTreeMap;
 
+use vos_abi::abi::cap::{self, Limits};
+use vos_abi::abi::{self, AttestError, Failure, Kind, Op, code, price};
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, RequestId, WorkflowId};
+use vos_abi::keys::{self, Due};
+use vos_abi::message::{Answer, Await};
+use vos_abi::records::{Snapshot, Workflow, WorkflowState};
+use vos_abi::result::{Attested, InstanceGas, Outcome, Outgoing, PAGE, Page, Write, digest};
+use vos_abi::{Decode, Encode};
 use vos_pvm::ExitReason;
 use vos_pvm::refine::{Machine, MemoryModel, PreparedProgram};
 use vos_pvm::spi::StandardLayout;
-use vos_wire::abi::cap::{self, Limits};
-use vos_wire::abi::{self, AttestError, Failure, Kind, Op, code, price};
-use vos_wire::batch::{Answer, Await};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, RequestId, WorkflowId};
-use vos_wire::keys::{self, Due};
-use vos_wire::records::{Snapshot, Workflow, WorkflowState};
-use vos_wire::result::{Attested, InstanceGas, Outcome, Outgoing, PAGE, Page, Write, digest};
-use vos_wire::{Decode, Encode, defaults};
+use vos_wire::defaults;
 
 use super::invocation::{Call, Ended, Invocation};
 use super::memory::precompile;

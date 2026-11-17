@@ -14,6 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use parity_scale_codec::Decode;
+use vos_abi::ids::AgentId;
+use vos_abi::vos_anchor::{Anchor, VenueId, WindowClock};
 use vos_checker::stays;
 use vos_kreivo::calls::{Call, RuntimeCall};
 use vos_kreivo::mock::transport::MockChain;
@@ -22,9 +24,7 @@ use vos_kreivo::mock::{Account, Chain, Constants, Origin, keys};
 use vos_kreivo::{KreivoVenue, Options};
 use vos_node::Config;
 use vos_venue::{AnchorOutcome, Status, VenueClient};
-use vos_wire::ids::AgentId;
 use vos_wire::peer::NodeNumber;
-use vos_wire::vos_anchor::{Anchor, VenueId, WindowClock};
 
 use crate::common::{Cluster, wait_until};
 use crate::support::clock;
@@ -58,7 +58,7 @@ type Client = (NodeNumber, [u8; 32], Arc<Watched>);
 
 /// Node `number`'s Kreivo account: the mock's signer.
 fn account_of(number: NodeNumber) -> [u8; 32] {
-    vos_wire::vos_anchor::blake2b_256(&[b"test account", &[number]])
+    vos_abi::vos_anchor::blake2b_256(&[b"test account", &[number]])
 }
 
 /// The mock Kreivo the space anchors at, timed by its own clock, which the
@@ -88,7 +88,7 @@ impl Kreivo {
         let (chain, clients) = (Arc::clone(&self.chain), Arc::clone(&self.clients));
         move |number, config| {
             let space =
-                vos_wire::vos_anchor::space_id(config.space.as_ref().unwrap().genesis().unwrap());
+                vos_abi::vos_anchor::space_id(config.space.as_ref().unwrap().genesis().unwrap());
             let mut clients = clients.lock().unwrap();
             let made = clients
                 .iter()

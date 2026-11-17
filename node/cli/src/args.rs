@@ -146,7 +146,7 @@ pub enum SpaceCommand {
         data: PathBuf,
         /// Each window's length, in milliseconds: from 120,000 to
         /// 3,600,000.
-        #[arg(long, default_value_t = vos_wire::vos_anchor::DEFAULT_LENGTH_MS)]
+        #[arg(long, default_value_t = vos_abi::vos_anchor::DEFAULT_LENGTH_MS)]
         window_ms: u64,
         /// Where window 0 starts, in milliseconds since the Unix epoch: the
         /// founding time by default.

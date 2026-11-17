@@ -2,13 +2,13 @@
 //! every operation's price, and the reserve a step keeps for the agent's
 //! own work.
 
+use vos_abi::abi::cap;
+use vos_abi::ids::{InstanceId, MethodId};
+use vos_abi::result::{Outcome, WorkResult};
+use vos_abi::schema::Schema;
+use vos_abi::{Decode, Encode};
 use vos_testkit::model::Model;
-use vos_wire::abi::cap;
 use vos_wire::defaults;
-use vos_wire::ids::{InstanceId, MethodId};
-use vos_wire::result::{Outcome, WorkResult};
-use vos_wire::schema::Schema;
-use vos_wire::{Decode, Encode};
 
 use crate::common::{
     AGENT, ALICE, CALLER, COUNTER, GAS, LEDGER, Node, counter_only, install, ran, ran_done,
@@ -23,7 +23,7 @@ use crate::common::{
 /// batch's worth before it), it must leave a fifth of the charge spare.
 #[test]
 fn every_operation_pays_for_its_serving() {
-    use vos_wire::abi::price::{
+    use vos_abi::abi::price::{
         self, ATTEST, GET, INPUT, KEY_BYTE, LOG, MACHINE, OPERATION, PER_BYTE, PUT, RANDOM, SCAN,
         SEND,
     };
@@ -244,9 +244,9 @@ fn every_operation_pays_for_its_serving() {
 /// (`STEP_RESERVE` and the record's `RECORD_BYTE`).
 #[test]
 fn the_install_reserve_and_record_price_cover_the_largest_install() {
+    use vos_abi::abi::Kind;
+    use vos_abi::schema::{MAX_LEN, MethodSchema};
     use vos_pvm_program::{CodeBlob, StandardProgram, build_standard_program};
-    use vos_wire::abi::Kind;
-    use vos_wire::schema::{MAX_LEN, MethodSchema};
     let methods: Vec<MethodSchema> = (1..=1000u32)
         .map(|id| MethodSchema {
             id: MethodId(id),
@@ -288,7 +288,7 @@ fn the_install_reserve_and_record_price_cover_the_largest_install() {
     assert!(matches!(ran(&result.steps[0]).outcome, Outcome::Done(_)));
     let first_read = sessions.request(ALICE, big_instance, MethodId(1), ());
     let reading = node.agent_gas(vec![first_read]) - empty;
-    let record = node.state[&vos_wire::keys::installed(big_instance)].len() as u64;
+    let record = node.state[&vos_abi::keys::installed(big_instance)].len() as u64;
     let taken = defaults::STEP_RESERVE + defaults::RECORD_BYTE * record;
     println!("install {installing}, first read of {record} bytes and run {reading} of {taken}");
     assert!(
@@ -306,13 +306,14 @@ fn the_install_reserve_and_record_price_cover_the_largest_install() {
 /// collecting as many sessions as a sweep may.
 #[test]
 fn the_reserves_cover_the_agents_own_work() {
-    use vos_wire::batch::{Body, Input, Message};
-    use vos_wire::ids::{AgentId, Session};
+    use vos_abi::ids::{AgentId, Session};
+    use vos_abi::message::Body;
+    use vos_wire::batch::{Input, Message};
     for (host, node) in [("VOS", Node::new()), ("JAM", Node::jam(true))] {
         let (actors, mut node) = counter_only(node);
         let value = actors.method(COUNTER, "value");
         let empty = node.agent_gas(vec![]);
-        let record = node.state[&vos_wire::keys::installed(COUNTER)].len() as u64;
+        let record = node.state[&vos_abi::keys::installed(COUNTER)].len() as u64;
         let check = |name: &str, cost: i64, taken: u64| {
             println!("{host}: {name} costs the agent {cost} of {taken}");
             assert!(cost <= (taken * 4 / 5) as i64, "{host}: {name}");
@@ -394,7 +395,7 @@ fn the_reserves_cover_the_agents_own_work() {
             .unwrap()
             .0;
         assert!(
-            matches!(&swept.steps[0], vos_wire::result::Step::Swept { due, .. } if due.len() == defaults::SWEEP_LIMIT)
+            matches!(&swept.steps[0], vos_abi::result::Step::Swept { due, .. } if due.len() == defaults::SWEEP_LIMIT)
         );
         let idle = node.run_refine(&node.work(later, vec![]), GAS).gas_used;
         check(
@@ -404,14 +405,14 @@ fn the_reserves_cover_the_agents_own_work() {
         );
         // And as many binding digests as a sweep forgets beside them.
         // Due before the sessions, so the sweep lists both its counts' worth.
-        for index in 0..defaults::SWEEP_BINDINGS as u32 {
+        for index in 0..vos_abi::defaults::SWEEP_BINDINGS as u32 {
             let mut binding = [0u8; 32];
             binding[..4].copy_from_slice(&index.to_le_bytes());
-            let row = vos_wire::keys::due(1, vos_wire::keys::Due::Binding(binding));
-            node.state.insert(row, vos_wire::records::stored(&[]));
-            let kept = vos_wire::keys::binding(&binding);
+            let row = vos_abi::keys::due(1, vos_abi::keys::Due::Binding(binding));
+            node.state.insert(row, vos_abi::records::stored(&[]));
+            let kept = vos_abi::keys::binding(&binding);
             node.state
-                .insert(kept, vos_wire::records::stored(&later.encode()));
+                .insert(kept, vos_abi::records::stored(&later.encode()));
         }
         let sweeping = node.run_refine(&node.work(later, vec![node.sweep(later)]), GAS);
         let swept = WorkResult::decode(&sweeping.output_bounded(cap::OUTPUT).unwrap())
@@ -419,8 +420,8 @@ fn the_reserves_cover_the_agents_own_work() {
             .0;
         assert!(matches!(
             &swept.steps[0],
-            vos_wire::result::Step::Swept { due, bindings }
-                if due.len() == defaults::SWEEP_LIMIT && bindings.len() == defaults::SWEEP_BINDINGS
+            vos_abi::result::Step::Swept { due, bindings }
+                if due.len() == defaults::SWEEP_LIMIT && bindings.len() == vos_abi::defaults::SWEEP_BINDINGS
         ));
         check(
             "a full sweep with bindings",
@@ -438,7 +439,7 @@ fn the_reserves_cover_the_agents_own_work() {
 /// compression, `POSEIDON2_SERVING` for a Poseidon2 one).
 #[test]
 fn serving_a_precompile_costs_the_agent_its_bounce() {
-    use vos_wire::abi::precompile::{BLAKE2B_COMPRESS, POSEIDON2, price, serving};
+    use vos_abi::abi::precompile::{BLAKE2B_COMPRESS, POSEIDON2, price, serving};
     for (name, kind, id) in [
         ("BLAKE2b", 19u8, BLAKE2B_COMPRESS),
         ("Poseidon2", 20, POSEIDON2),
@@ -487,10 +488,11 @@ fn serving_a_precompile_costs_the_agent_its_bounce() {
 /// shapes at derive's classes and at the most classes a shape has.
 #[test]
 fn the_start_reserves_cover_decoding_a_batch() {
+    use vos_abi::abi::cap::Target;
+    use vos_abi::ids::{AgentId, InstanceId};
+    use vos_abi::message::Body;
     use vos_testkit::programs::derived;
-    use vos_wire::abi::cap::Target;
-    use vos_wire::batch::{Admin, Body, Input, Message};
-    use vos_wire::ids::{AgentId, InstanceId};
+    use vos_wire::batch::{Admin, Input, Message};
     let (actors, node, _, _) = setup();
     let increment = actors.method(COUNTER, "increment");
     let requests = |count: u64, len: usize| -> Vec<Input> {
@@ -521,9 +523,9 @@ fn the_start_reserves_cover_decoding_a_batch() {
         kernel
             .shape
             .classes
-            .resize(vos_wire::records::MAX_CLASSES, class);
+            .resize(vos_abi::records::MAX_CLASSES, class);
     }
-    let installs = |count: u32, derivation: &vos_wire::records::Derivation| -> Vec<Input> {
+    let installs = |count: u32, derivation: &vos_abi::records::Derivation| -> Vec<Input> {
         (1..=count)
             .map(|instance| {
                 Input::Admin(Admin::Install {
@@ -531,8 +533,8 @@ fn the_start_reserves_cover_decoding_a_batch() {
                     derivation: derivation.clone(),
                     roles: vec![],
                     target: Target::Vos,
-                    space: vos_wire::SpaceId::NONE,
-                    clock: vos_wire::WindowClock::DEFAULT,
+                    space: vos_abi::SpaceId::NONE,
+                    clock: vos_abi::WindowClock::DEFAULT,
                 })
             })
             .collect()
@@ -573,7 +575,7 @@ fn the_start_reserves_cover_decoding_a_batch() {
 #[test]
 fn the_workflow_reserves_cover_the_agents_own_work() {
     use crate::workflows::Flows;
-    use vos_wire::result::{Run, Step};
+    use vos_abi::result::{Run, Step};
     /// A step's measure: the agent's gas beyond the step's, the pages its
     /// program may write, those it stored, and those it restored.
     type Measure = (u64, u64, u64, u64);
@@ -648,8 +650,8 @@ fn the_workflow_reserves_cover_the_agents_own_work() {
 #[test]
 fn a_pause_pays_for_its_serving() {
     use crate::workflows::Flows;
-    use vos_wire::abi::price::{OPERATION, PAUSE, PER_BYTE};
-    use vos_wire::result::Step;
+    use vos_abi::abi::price::{OPERATION, PAUSE, PER_BYTE};
+    use vos_abi::result::Step;
     // The agent's gas beyond its steps' for a start and its first step.
     let own = |kind: u8, len: u32| -> i64 {
         let mut flows = Flows::new(Node::new());
@@ -682,8 +684,8 @@ fn a_pause_pays_for_its_serving() {
 #[test]
 fn a_section_pays_for_its_serving() {
     use crate::workflows::Flows;
-    use vos_wire::abi::price::SECTION;
-    use vos_wire::result::Step;
+    use vos_abi::abi::price::SECTION;
+    use vos_abi::result::Step;
     // The agent's gas beyond its steps' for a start and its first step.
     let own = |count: u32| -> i64 {
         let mut flows = Flows::new(Node::new());
@@ -705,13 +707,13 @@ fn a_section_pays_for_its_serving() {
 /// A sweep listing the most rows one may: its sessions' and workflows', and
 /// its bindings' beside them.
 fn most_swept() -> vos_wire::batch::Input {
-    use vos_wire::ids::{SessionId, WorkflowId};
-    use vos_wire::keys::Due;
+    use vos_abi::ids::{SessionId, WorkflowId};
+    use vos_abi::keys::Due;
     let others = (0..defaults::SWEEP_LIMIT as u64).map(|id| match id % 2 {
         0 => (id, Due::Session(SessionId(id))),
         _ => (id, Due::Workflow(WorkflowId(id))),
     });
-    let bindings = (0..defaults::SWEEP_BINDINGS as u64).map(|id| {
+    let bindings = (0..vos_abi::defaults::SWEEP_BINDINGS as u64).map(|id| {
         let mut binding = [0xb1; 32];
         binding[..8].copy_from_slice(&id.to_le_bytes());
         (id, Due::Binding(binding))

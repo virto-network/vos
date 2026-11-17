@@ -10,13 +10,13 @@
 //! pushes (B2).
 
 use ed25519_dalek::SigningKey;
+use vos_abi::Encode;
+use vos_abi::ids::InstanceId;
 use vos_light::group::{Alarm, DeviceGroup, Event, Pairing, Restored};
 use vos_light::personal::{Answer, Frontier, Link, SealedSync, Unusable, Waiting};
 use vos_light::route::Route;
 use vos_light::sealed::{self, Body as Sealed, View};
 use vos_light::sync::Quarantine;
-use vos_wire::Encode;
-use vos_wire::ids::InstanceId;
 use vos_wire::personal::{
     AdminCall, Attached, Body, DeviceView, Entry, Op, OpState, Overview, PersonalError, Pushed,
     Recorded, Scope, Signer, Woken, chain,

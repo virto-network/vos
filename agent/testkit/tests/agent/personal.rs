@@ -21,19 +21,19 @@ mod upgrade;
 use std::borrow::{Borrow, BorrowMut};
 use std::collections::BTreeMap;
 
+use vos_abi::abi::Failure;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, Session};
+use vos_abi::result::{Outcome, Run};
+use vos_abi::{Decode, Encode};
 use vos_testkit::World;
 use vos_testkit::programs::program_elf;
-use vos_wire::abi::Failure;
 use vos_wire::batch::{Query, Work};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
 use vos_wire::ingress::call_message;
 use vos_wire::personal::{
     AdminClass, Attached, Attestation, Candidacy, DeviceId, Effect, HOUR_MS, Header, Kit, KitEntry,
     KitKind, NewDevice, NewKit, Operation, Overview, PersonalError, Policy, Pushed, Recorded,
     RecoveryView, Scope, Voted, Woken, r_hash, r2_hash,
 };
-use vos_wire::result::{Outcome, Run};
-use vos_wire::{Decode, Encode};
 
 use crate::common::{AGENT, Node};
 

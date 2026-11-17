@@ -31,9 +31,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
+use vos_abi::ids::AgentId;
 use vos_checker::{Random, percentiles};
 use vos_node::store::{Fjall, LogEntry, PersistMode};
-use vos_wire::ids::AgentId;
 
 mod support;
 

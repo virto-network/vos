@@ -11,14 +11,14 @@
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 
+use vos_abi::abi::Failure;
+use vos_abi::ids::derive_id;
+use vos_abi::schema::Schema;
 use vos_api::{Framing, Kind, Mark, marked};
 use vos_checker::programs::package;
 use vos_node::client::{signed_call, signed_query};
 use vos_node::{CallError, Reply};
-use vos_wire::abi::Failure;
-use vos_wire::ids::derive_id;
 use vos_wire::ingress::{AdmissionRefusal, Credentialed};
-use vos_wire::schema::Schema;
 
 use super::api::{connect, receive};
 use super::*;

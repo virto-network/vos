@@ -1,6 +1,6 @@
 //! The worker: from the records of the agents this node replicates, each
 //! attest at a window's cut whose statement waits to be proved
-//! (`vos_wire::keys::attested`, the same on every replica and carried by
+//! (`vos_abi::keys::attested`, the same on every replica and carried by
 //! its snapshots) becomes a job; for the agents it leads, one job at a time
 //! is proved, and each proof is kept, recorded in its agent, and submitted
 //! once its roots are anchored. Each unfinished job's kernel is held.
@@ -9,11 +9,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use vos_abi::ids::{AgentId, ProgramHash};
+use vos_abi::result::Attest;
+use vos_abi::{SpaceId, WindowClock};
 use vos_venue::vos_statement::{ProgramId, Statement, StatementId};
 use vos_venue::{SubmitOutcome, VenueClient};
-use vos_wire::ids::{AgentId, ProgramHash};
-use vos_wire::result::Attest;
-use vos_wire::{SpaceId, WindowClock};
 
 use vos_wire::defaults::READ_WINDOWS;
 
@@ -23,7 +23,7 @@ mod submit;
 
 /// The longest wait before a statement not accepted goes again: the
 /// longest window a space's clock registers.
-const RETRY_MAX: Duration = Duration::from_millis(vos_wire::vos_anchor::MAX_LENGTH_MS);
+const RETRY_MAX: Duration = Duration::from_millis(vos_abi::vos_anchor::MAX_LENGTH_MS);
 
 /// The final proofs' format: the masked wrap's.
 pub const FORMAT: u32 = vos_venue::vos_statement::vos_pvm_final_verifier::masked::FORMAT;
@@ -37,14 +37,14 @@ pub trait Host {
     /// into jobs, so a new leader holds them already.
     fn agents(&self) -> Vec<AgentId>;
     /// The records of `agent`'s attests at the cuts of window `from` and
-    /// later (`vos_wire::keys::attested`), as this replica applied them, in
+    /// later (`vos_abi::keys::attested`), as this replica applied them, in
     /// window order.
     fn attested(&self, agent: AgentId, from: u64) -> Result<Vec<Record>, String>;
     /// A program's blob, by its hash: a kernel an attest names. When this
     /// node does not hold it, `agent`'s other replicas are asked for it.
     fn program(&self, agent: AgentId, hash: &ProgramHash) -> Option<Vec<u8>>;
     /// The proof `agent` holds recorded for statement `id` of window
-    /// `window`'s cut (`vos_wire::keys::proven`), as this replica applied
+    /// `window`'s cut (`vos_abi::keys::proven`), as this replica applied
     /// it.
     fn proven(&self, agent: AgentId, window: u64, id: &StatementId) -> Option<[u8; 32]>;
     /// Keep a final proof: its BLAKE2b-256.

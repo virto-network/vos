@@ -17,20 +17,20 @@
 use std::time::Instant;
 
 use ed25519_dalek::{Signer as _, SigningKey};
+use vos_abi::abi::Failure;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Session};
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode};
 use vos_api::Kind;
 use vos_light::job::{Control, Post};
 use vos_light::personal::{Answer, Frontier, Link};
 use vos_light::route::{Purpose, Route};
 use vos_light::wire;
-use vos_wire::abi::Failure;
 use vos_wire::defaults::SESSION_EXPIRY_MS;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Session};
 use vos_wire::ingress::{self, Consistency, QueryCall, Response};
 use vos_wire::personal::{
     DeviceView, Entry, Envelope, Overview, PersonalError, Pushed, Scope, Woken,
 };
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode};
 
 use crate::net::{Net, SpaceId};
 

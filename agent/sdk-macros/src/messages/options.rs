@@ -109,10 +109,10 @@ pub(super) fn msg_options(attribute: &Attribute) -> syn::Result<Options> {
                     return Err(meta.error("expected an integer headroom"));
                 };
                 let headroom: u8 = value.base10_parse()?;
-                if headroom > vos_wire::records::MAX_HEADROOM {
+                if headroom > vos_abi::records::MAX_HEADROOM {
                     return Err(meta.error(format!(
                         "a device kernel's headroom is at most {}",
-                        vos_wire::records::MAX_HEADROOM
+                        vos_abi::records::MAX_HEADROOM
                     )));
                 }
                 options.headroom = Some((headroom, span));
@@ -197,8 +197,8 @@ pub(super) fn resolve(kernel: &str, span: Span, devices: &[&str]) -> syn::Result
         });
     }
     match kernel {
-        vos_wire::schema::stock::OWNER => Ok(CredentialGuard::Owner),
-        vos_wire::schema::stock::AUTH => Err(Error::new(
+        vos_abi::schema::stock::OWNER => Ok(CredentialGuard::Owner),
+        vos_abi::schema::stock::AUTH => Err(Error::new(
             span,
             "the stock `auth` kernel proves a pseudonym in a scope: name it, \
              `credential = Auth(\"name\")`",

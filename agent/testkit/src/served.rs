@@ -2,11 +2,11 @@
 //! salted from a seed, and a representative's tree of agents' roots with a
 //! row's salt and path in it.
 
+use vos_abi::Encode;
+use vos_abi::ids::AgentId;
+use vos_abi::served::representative_row;
+use vos_abi::vos_anchor::RootKind;
 use vos_tree::{BatchProof, Blake2b, Hash, Leaf, MemStore};
-use vos_wire::Encode;
-use vos_wire::ids::AgentId;
-use vos_wire::served::representative_row;
-use vos_wire::vos_anchor::RootKind;
 
 /// A tree over `rows` (full keys and stored values), each leaf salted from
 /// `seed`, into `store`: its root.

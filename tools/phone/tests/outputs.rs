@@ -7,10 +7,14 @@
 use std::path::Path;
 use std::process::Command;
 
+use vos_abi::credentials::{Tag, leaf, root_of};
+use vos_abi::ids::{AgentId, InstanceId};
+use vos_abi::{Encode, SpaceId};
 use vos_checker::carriers::{Audit, Kind, Reach};
-use vos_wire::credentials::{self as tree, AuthClaim, Siblings, Tag, leaf, root_of};
-use vos_wire::ids::{AgentId, InstanceId};
-use vos_wire::{Encode, SpaceId};
+use vos_wire::{
+    credentials as tree,
+    credentials::{AuthClaim, Siblings},
+};
 
 #[allow(dead_code)]
 #[path = "../src/member.rs"]
@@ -57,13 +61,20 @@ fn the_benchs_lines_and_proofs_hold_no_secret() {
     let words = audit
         .needles
         .device_secret("the bench's member", &SOURCE_OUTPUT, &HANDLE);
-    let member = tree::digest(&tree::compress(&Tag::Member.block(), &words));
+    let member = vos_abi::credentials::digest(&vos_abi::credentials::compress(
+        &Tag::Member.block(),
+        &words,
+    ));
     let siblings = siblings();
-    let root = root_of(&leaf(&tree::words(&member).unwrap()), SLOT, &siblings);
+    let root = root_of(
+        &leaf(&vos_abi::credentials::words(&member).unwrap()),
+        SLOT,
+        &siblings,
+    );
     let path = tree::Path {
-        root: tree::digest(&root),
+        root: vos_abi::credentials::digest(&root),
         slot: SLOT,
-        siblings: Siblings(siblings.map(|sibling| tree::digest(&sibling))),
+        siblings: Siblings(siblings.map(|sibling| vos_abi::credentials::digest(&sibling))),
     };
     audit
         .needles
@@ -72,9 +83,9 @@ fn the_benchs_lines_and_proofs_hold_no_secret() {
     // The stock auth kernel's witness input by the member: the path's
     // siblings and its slot's eight bytes, the secret, the claim.
     let scope = tree::scope(&SpaceId([0x53; 32]), AgentId(7), InstanceId(3), b"login");
-    let nullifier = tree::digest(&tree::compress(
-        &tree::compress(&Tag::Nf.block(), &words),
-        &tree::words(&scope).unwrap(),
+    let nullifier = vos_abi::credentials::digest(&vos_abi::credentials::compress(
+        &vos_abi::credentials::compress(&Tag::Nf.block(), &words),
+        &vos_abi::credentials::words(&scope).unwrap(),
     ));
     let claim = AuthClaim {
         map_root: path.root,
@@ -85,7 +96,7 @@ fn the_benchs_lines_and_proofs_hold_no_secret() {
     .encode();
     let mut input = path.siblings.0.concat();
     input.extend_from_slice(&u64::from(SLOT).to_le_bytes());
-    input.extend_from_slice(&tree::digest(&words));
+    input.extend_from_slice(&vos_abi::credentials::digest(&words));
     input.extend_from_slice(&claim);
     audit
         .needles
@@ -98,7 +109,7 @@ fn the_benchs_lines_and_proofs_hold_no_secret() {
     let proved = dir.path().join("kernel.proof");
     let elf = std::fs::read(vos_testkit::programs::program_elf("vos-credentials")).unwrap();
     let device = vos_light::release::device(&elf, "auth").unwrap();
-    std::fs::write(&kernel, vos_wire::Encode::encode(&device)).unwrap();
+    std::fs::write(&kernel, vos_abi::Encode::encode(&device)).unwrap();
     std::fs::write(&witness, &input).unwrap();
     let out = proofs.to_str().unwrap();
     run(

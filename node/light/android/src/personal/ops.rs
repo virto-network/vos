@@ -11,6 +11,8 @@
 use std::time::Duration;
 
 use ed25519_dalek::Signer as _;
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode};
 use vos_light::group::{Agent as GroupAgent, DeviceGroup, Event, Prepared, Restored};
 use vos_light::home::{self, Claim as Claiming, Home as HomeSpace};
 use vos_light::kit::{KitSecret, SecurityKey};
@@ -30,8 +32,6 @@ use vos_wire::personal::{
     AdminClass, Attached, Attestation, Body, Candidacy, DeviceView, Entry, InboxItem, NewAdmin,
     NewDevice, OpState, Overview, PersonalError, RECOVERY, Recorded, RecoveryView, Standing,
 };
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode};
 use zeroize::Zeroizing;
 
 pub(super) mod regroup;
@@ -369,8 +369,8 @@ fn kept_of(home: &Home) -> Kept {
             handle: home.handle,
             agent: home.agent,
             identity: home.identity,
-            homes: vos_wire::ids::InstanceId(home.homes),
-            credentials: vos_wire::ids::InstanceId(home.credentials),
+            homes: vos_abi::ids::InstanceId(home.homes),
+            credentials: vos_abi::ids::InstanceId(home.credentials),
         },
         onions: crate::net::onions(&home.onions),
     }
@@ -808,7 +808,7 @@ impl Space {
             };
             let join = light.call(
                 CREDENTIAL_BOOK,
-                vos_wire::ids::MethodId(vos_light::method_id("join")),
+                vos_abi::ids::MethodId(vos_light::method_id("join")),
                 (enrollment.space, entry).encode(),
             );
             if join.is_ok() {
@@ -848,8 +848,8 @@ impl Space {
                     handle: acked.handle,
                     agent: 0,
                     identity: [0; 32],
-                    homes: vos_wire::ids::InstanceId(0),
-                    credentials: vos_wire::ids::InstanceId(0),
+                    homes: vos_abi::ids::InstanceId(0),
+                    credentials: vos_abi::ids::InstanceId(0),
                 },
                 onions: acked.onions.clone(),
             };
@@ -1278,7 +1278,7 @@ impl Space {
     fn checkpoints(
         &self,
         held: &mut Held,
-        instances: &[vos_wire::ids::InstanceId],
+        instances: &[vos_abi::ids::InstanceId],
     ) -> Vec<vos_light::group::Checkpoint> {
         self.with_link(held, Purpose::Personal, |link, held| {
             let Held { light, group, .. } = held;
@@ -1335,8 +1335,8 @@ impl Space {
                 handle: code.handle,
                 agent: 0,
                 identity: [0; 32],
-                homes: vos_wire::ids::InstanceId(0),
-                credentials: vos_wire::ids::InstanceId(0),
+                homes: vos_abi::ids::InstanceId(0),
+                credentials: vos_abi::ids::InstanceId(0),
             },
             onions: code.onions.clone(),
         };

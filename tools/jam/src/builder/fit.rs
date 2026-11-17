@@ -64,14 +64,15 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use vos_wire::abi::cap::{self, Target};
+use vos_abi::abi::cap::{self, Target};
+use vos_abi::ids::{ProgramHash, WorkflowId};
+use vos_abi::keys;
+use vos_abi::keys::Due;
+use vos_abi::records::{Workflow, WorkflowState};
+use vos_abi::result::{PAGE, digest};
 use vos_wire::batch::{Admin, Batch, Input, Work};
-use vos_wire::ids::{ProgramHash, WorkflowId};
-use vos_wire::keys::Due;
+use vos_wire::defaults;
 use vos_wire::package::{MAX_SEGMENTS, Package, SEGMENT, result_segments};
-use vos_wire::records::{Workflow, WorkflowState};
-use vos_wire::result::{PAGE, digest};
-use vos_wire::{defaults, keys};
 
 use super::{Builder, record};
 use crate::da::Segments;
@@ -539,7 +540,7 @@ fn skip(inputs: &mut Vec<Input>, workflow: WorkflowId) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use vos_wire::ids::{AgentId, SessionId};
+    use vos_abi::ids::{AgentId, SessionId};
 
     use super::*;
 

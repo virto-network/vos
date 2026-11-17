@@ -51,6 +51,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 vos-api = { workspace = true, features = ["client", "quic"] }
 vos-http = { workspace = true, features = ["server"] }
 vos-net = { workspace = true }
+vos-abi = { workspace = true }
 vos-wire = { workspace = true }
 s4-server = { workspace = true, optional = true }
 russh = { version = "0.65", default-features = false, features = ["ring", "flate2"], optional = true }

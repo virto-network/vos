@@ -3,17 +3,17 @@
 //! operation's author, at the time and seed of the device that issued it,
 //! and its one step is the work result, which the device applies itself.
 //! Every device that applies the operation runs it so, and writes the
-//! same entries ([`vos_wire::merge`]). The step writes its instance's
+//! same entries ([`vos_abi::merge`]). The step writes its instance's
 //! merge fields alone: any other method is `Unknown`, and a run that
 //! writes another row, reads a merge field or uses an operation beyond
 //! its kind's fails `Trapped`, with nothing written.
 
 use alloc::vec::Vec;
 
-use vos_wire::abi::{Failure, Kind};
+use vos_abi::abi::{Failure, Kind};
+use vos_abi::ids::{AgentId, Principal};
+use vos_abi::result::{InputRef, Outcome, ResultWriter, Run, Step};
 use vos_wire::batch::Merge;
-use vos_wire::ids::{AgentId, Principal};
-use vos_wire::result::{InputRef, Outcome, ResultWriter, Run, Step};
 
 use super::Call;
 use super::base::{Base, Source};

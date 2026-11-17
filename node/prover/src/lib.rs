@@ -3,7 +3,7 @@
 //! **The role** is the leader of the agent whose record it is: a node
 //! proves and submits the statements of the agents it leads. The records
 //! of its attests at a window's cut are the agent's state
-//! (`vos_wire::keys::attested`): every replica's apply writes each one a
+//! (`vos_abi::keys::attested`): every replica's apply writes each one a
 //! work result makes, with its witness, and drops it once its roots age,
 //! and a snapshot carries them. So every replica running a prover holds a
 //! job of each, a new leader too, one that installed a snapshot among

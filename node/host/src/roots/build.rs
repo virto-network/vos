@@ -5,12 +5,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use vos_abi::ids::AgentId;
+use vos_abi::keys;
+use vos_abi::records::unstored;
+use vos_abi::result::Write;
+use vos_abi::{Encode, SpaceId, WindowClock};
 use vos_tree::{Blake2b, Child, Leaf, empty_root};
-use vos_wire::ids::AgentId;
-use vos_wire::keys;
-use vos_wire::records::unstored;
-use vos_wire::result::Write;
-use vos_wire::{Encode, SpaceId, WindowClock};
 
 use super::{
     AgentStore, BATCH, Error, ROWS_PER_KEY, RootRow, built, cuts, root_row, state_version,

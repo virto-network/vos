@@ -5,9 +5,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
+use vos_abi::ids::AgentId;
+use vos_abi::keys;
 use vos_wire::batch::Batch;
-use vos_wire::ids::AgentId;
-use vos_wire::keys;
 
 use super::close::Closes;
 use super::execute::{Flight, Launched};

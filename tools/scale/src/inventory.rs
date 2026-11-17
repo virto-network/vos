@@ -131,7 +131,7 @@ fn memory_max() -> String {
     "16G".into()
 }
 fn window_ms() -> u64 {
-    vos_wire::vos_anchor::DEFAULT_LENGTH_MS
+    vos_abi::vos_anchor::DEFAULT_LENGTH_MS
 }
 fn max_clock_offset_ms() -> u64 {
     100

@@ -5,15 +5,15 @@ mod at_cut;
 
 use std::collections::BTreeMap;
 
+use vos_abi::abi::cap::{self, Limits};
+use vos_abi::abi::{self, Failure, Kind, Op, Rows, code, price};
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, WorkflowId};
+use vos_abi::message::{Await, Body};
+use vos_abi::records::WorkflowState;
+use vos_abi::result::{Attest, InstanceGas, KernelReturn, Outcome, Outgoing};
+use vos_abi::{Encode, keys};
 use vos_pvm::ExitReason;
 use vos_pvm::refine::Machine;
-use vos_wire::abi::cap::{self, Limits};
-use vos_wire::abi::{self, Failure, Kind, Op, Rows, code, price};
-use vos_wire::batch::{Await, Body};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, WorkflowId};
-use vos_wire::records::WorkflowState;
-use vos_wire::result::{Attest, InstanceGas, KernelReturn, Outcome, Outgoing};
-use vos_wire::{Encode, keys};
 
 use super::Model;
 use super::memory::{
@@ -391,7 +391,7 @@ impl<'a> Invocation<'a> {
         r: &[u64; 13],
     ) -> Result<(), Failure> {
         // No merge lane here, as in `memory::row`.
-        if vos_wire::abi::MergeRows::is(r[7]) {
+        if vos_abi::abi::MergeRows::is(r[7]) {
             return Err(Failure::Trapped);
         }
         let cursor = match r[12] {

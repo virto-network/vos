@@ -411,7 +411,7 @@ fn digest(shown: &str) -> [u8; 32] {
 fn stock() -> Stock {
     let elf = std::fs::read(vos_testkit::programs::program_elf("vos-credentials")).unwrap();
     let artifact =
-        |kernel| vos_wire::Encode::encode(&vos_light::release::device(&elf, kernel).unwrap());
+        |kernel| vos_abi::Encode::encode(&vos_light::release::device(&elf, kernel).unwrap());
     let stock = Stock {
         auth: artifact("auth"),
         owner: artifact("owner"),
@@ -552,8 +552,8 @@ async fn a_request_naming_another_method_never_reaches_the_node() {
     let (space, mut phone, _dirs) = demo(Arc::clone(&user)).await;
     let request = |instance: u32, name: &str| {
         let body = vos_wire::ingress::Credentialed {
-            instance: vos_wire::ids::InstanceId(instance),
-            method: vos_wire::ids::MethodId(vos_wire::ids::derive_id("vos/method/", name)),
+            instance: vos_abi::ids::InstanceId(instance),
+            method: vos_abi::ids::MethodId(vos_abi::ids::derive_id("vos/method/", name)),
             arguments: Vec::new(),
             nonce: [7; 16],
             expires_ms: 0,
@@ -562,7 +562,7 @@ async fn a_request_naming_another_method_never_reaches_the_node() {
             proof: vec![0; 64],
         };
         let mut bytes = (vos_api::Kind::Credentialed as u16).to_le_bytes().to_vec();
-        vos_wire::Encode::encode_to(&(space.agent(), body), &mut bytes);
+        vos_abi::Encode::encode_to(&(space.agent(), body), &mut bytes);
         bytes
     };
     let at = phone.click("Sign in").await;

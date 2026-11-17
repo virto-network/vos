@@ -16,7 +16,7 @@ use quote::{format_ident, quote};
 use syn::spanned::Spanned;
 use syn::{Attribute, Error, Fields, ItemStruct, Meta, PathArguments, Type};
 
-use vos_wire::schema::ADMITTED;
+use vos_abi::schema::ADMITTED;
 
 use crate::names::Ids;
 use crate::{is_named, string_arg};

@@ -11,6 +11,9 @@
 //! the other devices and revoked in every space its handles name.
 
 use ed25519_dalek::SigningKey;
+use vos_abi::Encode;
+use vos_abi::ids::InstanceId;
+use vos_abi::result::Outcome;
 use vos_light::group::{DeviceGroup, Event};
 use vos_light::home::{self, Claim, ClaimError, Home as HomeSpace};
 use vos_light::memberships::{self, Enrollment};
@@ -19,11 +22,8 @@ use vos_light::pairing::{
 };
 use vos_light::release;
 use vos_testkit::programs;
-use vos_wire::Encode;
 use vos_wire::books::{Agent, DeviceHandle, Enrolled, Location};
-use vos_wire::ids::InstanceId;
 use vos_wire::personal::{Attached, DeviceView, InboxItem, PersonalError, Recorded, Status};
-use vos_wire::result::Outcome;
 
 use crate::home::{Home, PERSONAL};
 use crate::phone::{Phone, kit_key};
@@ -717,7 +717,7 @@ fn a_claim_with_a_phrase_and_a_security_key_starts_the_group() {
     let call_again = claim.call(&home_space(&home), call.expires_ms).unwrap();
     assert_eq!(call_again.arguments, call.arguments, "the same claim again");
     let (device, kit, agent): (vos_wire::personal::NewDevice, vos_wire::personal::Kit, u32) =
-        vos_wire::Decode::decode_exact(&call.arguments).unwrap();
+        vos_abi::Decode::decode_exact(&call.arguments).unwrap();
     assert_eq!((device, agent), (phone.keys.clone(), 7));
     let early = home.log(phone.sync_key(), 0).unwrap_or_default();
     assert!(matches!(

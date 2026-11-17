@@ -16,6 +16,10 @@ use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use ed25519_dalek::{Signer as _, SigningKey};
+use vos_abi::abi::Failure;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, Session};
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode};
 use vos_api::{Framing, Kind, Mark, marked};
 use vos_checker::Nodes;
 use vos_checker::calls::installed;
@@ -28,18 +32,14 @@ use vos_light::pairing::{Code, Hello, Joined, Joiner, Membership, Offer, Opened,
 use vos_light::wire::{self, Answer};
 use vos_light::{AuthWitness, Call, Config, DeviceProgram, Light, Prover, ProverConfig, Threads};
 use vos_node::client::Client;
-use vos_wire::abi::Failure;
 use vos_wire::books::DeviceHandle;
 use vos_wire::credentials::{CredentialError, Open, Path};
 use vos_wire::homes::HomesError;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
 use vos_wire::ingress::{Call as Signed, Response};
 use vos_wire::personal::{
     AdminClass, Attached, Attestation, Body, Candidacy, Entry, InboxItem, NewDevice, PersonalError,
     Policy, Recorded, Vote,
 };
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode};
 
 use crate::harness::{NODES, OPERATOR_SEED};
 use crate::homes::{CREDENTIALS, Founded, HANDLE, HOMES, PERSONAL, witness};

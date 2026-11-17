@@ -24,7 +24,7 @@ fn a_placement_comes_from_its_creator_then_from_its_members() {
     let record = CreationRecord {
         agent,
         replicas: vec![1, 2, 3],
-        creator: CreationRecord::creator_of(agent),
+        creator: agent.creator(),
         time: 0,
         program: ProgramHash([0; 32]),
         accumulate_gas: 0,
@@ -93,7 +93,7 @@ fn a_placement_comes_from_its_creator_then_from_its_members() {
     };
     assert_eq!(check(3, stranger), Err(Refusal::NotTheCreator));
     // A record of another space, or of none, from its very creator.
-    for space in [vos_wire::SpaceId([0xb2; 32]), vos_wire::SpaceId::NONE] {
+    for space in [vos_abi::SpaceId([0xb2; 32]), vos_abi::SpaceId::NONE] {
         let other = CreationRecord {
             space,
             ..record.clone()

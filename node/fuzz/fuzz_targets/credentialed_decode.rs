@@ -10,10 +10,10 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
+use vos_abi::ids::AgentId;
+use vos_abi::{Decode, Encode, SpaceId};
 use vos_wire::credentials::{self, AuthClaim, Bound, OwnerClaim};
-use vos_wire::ids::AgentId;
 use vos_wire::ingress::Credentialed;
-use vos_wire::{Decode, Encode, SpaceId};
 
 fuzz_target!(|data: &[u8]| {
     let Some((agent, call)) = <(AgentId, Credentialed)>::decode_exact(data) else {
@@ -41,11 +41,11 @@ fuzz_target!(|data: &[u8]| {
         expires_ms: call.expires_ms,
     }
     .digest();
-    assert!(credentials::words(&credentials::binding(&b)).is_some());
+    assert!(vos_abi::credentials::words(&credentials::binding(&b)).is_some());
     let name = &call.arguments[..call.arguments.len().min(64)];
     let scope = credentials::scope(&space, agent, call.instance, name);
-    assert!(credentials::words(&scope).is_some());
-    if call.claim.len() <= vos_wire::abi::cap::CLAIM {
+    assert!(vos_abi::credentials::words(&scope).is_some());
+    if call.claim.len() <= vos_abi::abi::cap::CLAIM {
         assert!(vos_pvm_precompiles::compute_device_io_hash(&call.claim, &[], &[]).is_some());
     }
 });

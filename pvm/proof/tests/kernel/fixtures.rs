@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use stwo::core::fields::qm31::SecureField;
+use vos_abi::ids::{MethodId, ProgramHash};
 use vos_pvm::instruction::Opcode;
 use vos_pvm_compiler::shape::kernel_shape;
 use vos_pvm_proof::format::{Format, MASKED_WRAP, SEGMENT};
@@ -38,7 +39,6 @@ use vos_pvm_proof::pcs::{Commitment, StarkProofAny};
 use vos_pvm_proof::program_id::KernelProgram;
 use vos_pvm_proof::{Proof, prove_kernel};
 use vos_pvm_proof_verifier::{verify_kernel_segment, verify_standalone};
-use vos_wire::ids::{MethodId, ProgramHash};
 
 /// The admitted segment formats, each with the one its wrong-format
 /// fixture is relabelled to: the wrap's, admitted but no segment format.
@@ -108,8 +108,8 @@ fn kernel() -> Vec<u8> {
 }
 
 /// A kernel's record, as its install would make it.
-fn record(blob: &[u8]) -> vos_wire::records::Kernel {
-    vos_wire::records::Kernel {
+fn record(blob: &[u8]) -> vos_abi::records::Kernel {
+    vos_abi::records::Kernel {
         method: MethodId(1),
         program: ProgramHash::of(blob),
         image_root: vos_pvm_program::parse_standard_program(blob)

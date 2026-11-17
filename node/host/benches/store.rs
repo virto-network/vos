@@ -16,12 +16,12 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use vos_abi::ids::{AgentId, InstanceId, SessionId};
+use vos_abi::keys;
+use vos_abi::result::Write;
 use vos_checker::Random;
 use vos_node::store::{Fjall, HardState, LogEntry, PersistMode, Tuning};
 use vos_wire::defaults::REPLY_WINDOW;
-use vos_wire::ids::{AgentId, InstanceId, SessionId};
-use vos_wire::keys;
-use vos_wire::result::Write;
 
 mod support;
 

@@ -52,9 +52,9 @@ use std::hash::Hash;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-use vos_wire::Encode;
+use vos_abi::Encode;
+use vos_abi::ids::AgentId;
 use vos_wire::batch::Batch;
-use vos_wire::ids::AgentId;
 use vos_wire::peer::{CreationRecord, NodeNumber};
 
 /// The identity of the agent `record` creates: its record's hash. Clients

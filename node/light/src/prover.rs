@@ -5,7 +5,7 @@
 //! system's.
 
 use scale::Encode;
-use vos_wire::abi::cap;
+use vos_abi::abi::cap;
 use vos_wire::credentials::{AuthClaim, OwnerClaim, claim_binding};
 use zeroize::Zeroize;
 

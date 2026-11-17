@@ -41,6 +41,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use ed25519_dalek::SigningKey;
+use vos_abi::ids::InstanceId;
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode};
 use vos_light::group::{Alarm, DeviceGroup};
 use vos_light::home::Home as HomeSpace;
 use vos_light::kit::KitKey;
@@ -48,10 +51,7 @@ use vos_light::memberships;
 use vos_light::route::Purpose;
 use vos_light::{Config, Light};
 use vos_wire::credentials::Onion;
-use vos_wire::ids::InstanceId;
 use vos_wire::personal::{NewDevice, NewKit};
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode};
 
 use crate::enrollment::{create_private, write_private};
 use crate::job::{Passed, Personal};

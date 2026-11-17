@@ -31,7 +31,7 @@
 use vos_statement::vos_anchor::venue::{self as rules, Anchoring, Held, Roots, Status, VenueState};
 use vos_statement::vos_anchor::{Anchor, RootKind, RootRead, SpaceId, VenueId};
 
-use vos_wire::jam::AccumulateInput;
+use vos_abi::jam::AccumulateInput;
 
 use crate::SLOT_MS;
 use crate::config::Config;
@@ -51,8 +51,8 @@ const PRUNE_BASE: u32 = 8;
 
 /// A work item's result as accumulate takes it: its package's and its
 /// payload's hashes, and refine's output or its work error
-/// (`vos_wire::jam`'s, as a JAM node gives it: `fetch` kind 15).
-pub use vos_wire::jam::Operand;
+/// (`vos_abi::jam`'s, as a JAM node gives it: `fetch` kind 15).
+pub use vos_abi::jam::Operand;
 
 /// The operand an accumulate input holds: none for a deferred transfer,
 /// or bytes that are not an input in their one encoding.

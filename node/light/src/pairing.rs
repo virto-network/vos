@@ -46,11 +46,11 @@ use blake2::Blake2b;
 use blake2::digest::Digest as _;
 use blake2::digest::consts::{U16, U32};
 use ed25519_dalek::SigningKey;
+use vos_abi::ids::InstanceId;
+use vos_abi::{Decode, Encode};
 use vos_wire::books::{DeviceHandle, Space};
 use vos_wire::credentials::Onion;
-use vos_wire::ids::InstanceId;
 use vos_wire::personal::{Author, InboxItem, NewDevice, Recipient, Scope};
-use vos_wire::{Decode, Encode};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::group::Pairing;

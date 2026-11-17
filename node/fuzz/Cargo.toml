@@ -1,0 +1,51 @@
+[package]
+name = "vos-node-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Not a workspace member: `cargo fuzz` builds it under its own settings
+# (libFuzzer instrumentation, its own rustc flags), which a workspace
+# member's would conflict with. Its dependencies are the tree's, by path.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# The node API's frame reader and operator envelope, as a node reads them.
+vos-api = { path = "../api" }
+vos-abi = { path = "../../pvm/abi" }
+# A proven call's body and the credential actor's claims, as ingress reads
+# them.
+vos-wire = { path = "../../agent/wire" }
+# A proven call's claim's io-hash, as ingress computes it.
+vos-pvm-precompiles = { path = "../../pvm/proof/precompiles" }
+
+# libfuzzer-sys requires panic=abort on its own targets.
+[profile.release]
+debug = 1
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
+
+[[bin]]
+name = "api_reader"
+path = "fuzz_targets/api_reader.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "operated_decode"
+path = "fuzz_targets/operated_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "credentialed_decode"
+path = "fuzz_targets/credentialed_decode.rs"
+test = false
+doc = false

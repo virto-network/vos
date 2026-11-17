@@ -19,10 +19,10 @@
 
 use std::fmt;
 
+use vos_abi::Decode;
+use vos_abi::result::Attest;
+use vos_abi::served::Served;
 use vos_node_prover::Internals;
-use vos_wire::Decode;
-use vos_wire::result::Attest;
-use vos_wire::served::Served;
 
 use super::{Kind, Reach};
 
@@ -495,7 +495,7 @@ impl Needles {
             let mut hashes = vec![
                 (
                     "BLAKE2b-256".to_string(),
-                    vos_wire::vos_anchor::blake2b_256(&[&bytes]),
+                    vos_abi::vos_anchor::blake2b_256(&[&bytes]),
                 ),
                 ("BLAKE3".to_string(), *blake3::hash(&bytes).as_bytes()),
             ];
@@ -503,7 +503,7 @@ impl Needles {
                 let named = String::from_utf8_lossy(domain);
                 hashes.push((
                     format!("BLAKE2b-256 under {named}"),
-                    vos_wire::vos_anchor::blake2b_256(&[domain, &bytes]),
+                    vos_abi::vos_anchor::blake2b_256(&[domain, &bytes]),
                 ));
             }
             for (hash, digest) in hashes {

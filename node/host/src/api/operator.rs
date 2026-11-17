@@ -7,9 +7,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use vos_abi::ids::AgentId;
 use vos_api::{Kind, Operated};
 use vos_wire::batch::Admin;
-use vos_wire::ids::AgentId;
 use vos_wire::ingress::{
     Create, Grant, Install, OperatorRefusal, Rejection, Replace, Response, Retire,
 };

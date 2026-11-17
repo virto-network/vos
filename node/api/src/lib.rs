@@ -17,7 +17,7 @@ pub use frame::{
 pub use operated::{CREDENTIALS, OPERATOR_DOMAIN, Operated, operator_message};
 
 use scale::{Decode, Encode};
-use vos_wire::abi::cap;
+use vos_abi::abi::cap;
 
 /// The most a request's body holds beyond its call's cap: its envelope.
 pub const ENVELOPE: usize = 4096;

@@ -1,11 +1,11 @@
 //! The agent's keys, byte for byte.
 
-use vos_wire::Encode;
-use vos_wire::abi::{self, Failure, Rows};
-use vos_wire::ids::{
+use vos_abi::Encode;
+use vos_abi::abi::{self, Failure, Rows};
+use vos_abi::ids::{
     AgentId, InstanceId, MapId, Principal, ProgramHash, RequestId, Session, SessionId, WorkflowId,
 };
-use vos_wire::keys::{self, Due, Transform};
+use vos_abi::keys::{self, Due, Transform};
 
 /// Every key's layout, byte for byte: each row tag once, the integers
 /// big-endian. Stored state is keyed by these bytes.
@@ -380,7 +380,7 @@ fn rows_are_keyed_by_their_table() {
         Err(Failure::Cap)
     );
     assert!(keys::row(instance, table(Transform::Ordered), &long[1..]).is_ok());
-    let value = vos_wire::records::stored_versioned(0, &vec![0; abi::cap::VALUE]);
+    let value = vos_abi::records::stored_versioned(0, &vec![0; abi::cap::VALUE]);
     let largest = (hashed, value).encode().len();
     assert_eq!(largest, abi::cap::STORED_ROW);
 }
@@ -398,34 +398,33 @@ fn page_rows_name_their_page() {
 /// and its rows keyed `agent (4, BE) ‖ kind ‖ w (8, BE)`, ordered.
 #[test]
 fn the_representatives_rows_keep_their_bytes() {
-    use vos_wire::served::{
+    use vos_abi::served::{
         REPRESENTATIVE_ROOTS, REPRESENTATIVE_TAG, representative_map, representative_row,
     };
-    use vos_wire::vos_anchor::RootKind;
+    use vos_abi::vos_anchor::RootKind;
     assert_eq!(
         REPRESENTATIVE_TAG,
-        vos_wire::ids::derive_id("vos/table/", REPRESENTATIVE_ROOTS)
+        vos_abi::ids::derive_id("vos/table/", REPRESENTATIVE_ROOTS)
     );
     let raw = [&7u32.to_be_bytes()[..], &[0], &9u64.to_be_bytes()].concat();
     assert_eq!(
-        representative_row(vos_wire::ids::AgentId(7), RootKind::Space, 9),
+        representative_row(vos_abi::ids::AgentId(7), RootKind::Space, 9),
         keys::committed(&representative_map(), &Transform::Ordered.apply(&raw))
     );
 }
 
 /// The admission row, and an admitted key's row: the declaring actor's
 /// hashed table `admitted`, keyed by the key's bytes. Ingress refuses or
-/// admits by them.
+/// admits by them (its rejections' bytes: `vos-wire`'s tests).
 #[test]
 fn the_admission_rows_keep_their_bytes() {
-    use vos_wire::Decode;
-    use vos_wire::ingress::{AdmissionRefusal, Rejection};
-    use vos_wire::records::Admitting;
-    use vos_wire::schema::{ADMITTED, Admission};
+    use vos_abi::Decode;
+    use vos_abi::records::Admitting;
+    use vos_abi::schema::{ADMITTED, Admission};
     assert_eq!(keys::admission(), [0x00, 0x29]);
     let key = [7u8; 32];
     let rows = Rows::Table {
-        tag: vos_wire::ids::derive_id("vos/table/", ADMITTED),
+        tag: vos_abi::ids::derive_id("vos/table/", ADMITTED),
         transform: Transform::Hashed,
     };
     assert_eq!(
@@ -443,13 +442,5 @@ fn the_admission_rows_keep_their_bytes() {
     assert_eq!(
         Admitting::decode_exact(&[4, 3, 2, 1, 1, 0]),
         Some(admitting)
-    );
-    assert_eq!(
-        Rejection::Admission(AdmissionRefusal::OnionOnly).encode(),
-        [11, 0]
-    );
-    assert_eq!(
-        Rejection::Admission(AdmissionRefusal::UnknownKey).encode(),
-        [11, 1]
     );
 }

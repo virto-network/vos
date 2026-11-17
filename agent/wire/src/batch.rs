@@ -3,24 +3,20 @@
 use alloc::vec::Vec;
 use scale::{Decode, Encode};
 
-use crate::abi::Failure;
-use crate::ids::{
-    AgentId, InstanceId, MethodId, Principal, ProgramHash, RequestId, Session, WorkflowId,
-};
 use crate::ingress::Grant;
-use crate::keys::Due;
-use crate::records::Derivation;
-use crate::result::Outcome;
-use crate::served::AgentPath;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, RequestId, Session};
+use vos_abi::keys::Due;
+use vos_abi::message::{Await, Body};
+use vos_abi::records::Derivation;
 
 /// A refine's work item payload: a batch through the log, a query on
 /// applied state, a batch on JAM, or a merge on a device.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Work {
-    /// Refine returns the encoded [`crate::result::WorkResult`].
+    /// Refine returns the encoded [`vos_abi::result::WorkResult`].
     #[codec(index = 0)]
     Batch(Batch),
-    /// Refine returns the encoded [`crate::result::Outcome`] and nothing
+    /// Refine returns the encoded [`vos_abi::result::Outcome`] and nothing
     /// else: a query never writes.
     #[codec(index = 1)]
     Query(Query),
@@ -29,7 +25,7 @@ pub enum Work {
     /// result and its pages.
     #[codec(index = 2)]
     Package(crate::package::Package),
-    /// Refine returns the encoded [`crate::result::WorkResult`] of the
+    /// Refine returns the encoded [`vos_abi::result::WorkResult`] of the
     /// merge's one step, and an empty page section, as for a batch.
     #[codec(index = 3)]
     Merge(Merge),
@@ -88,7 +84,7 @@ pub struct Query {
 pub struct Merge {
     pub time: u64,
     pub seed: [u8; 32],
-    pub origin: crate::merge::Origin,
+    pub origin: vos_abi::merge::Origin,
     pub instance: InstanceId,
     pub method: MethodId,
     pub arguments: Vec<u8>,
@@ -155,9 +151,9 @@ pub enum Input {
         awaiting: Option<Await>,
     },
     /// A read at window `window`'s cut, `request`, served: the encoded
-    /// [`crate::served::Served`] of its rows proved at the cut, or `None`
+    /// [`vos_abi::served::Served`] of its rows proved at the cut, or `None`
     /// when the cut could not prove them or they pass the target's
-    /// [`crate::abi::cap::Limits::served`]. Refine runs the kernel on the
+    /// [`vos_abi::abi::cap::Limits::served`]. Refine runs the kernel on the
     /// call's arguments and the served bytes, and resumes the workflow
     /// with its output, if it still awaits that request. The node puts it
     /// in a batch once its replica has built the cut.
@@ -170,7 +166,7 @@ pub enum Input {
     /// The agent's root at window `window`'s cut, `root`, for its space's
     /// representative `to`: refine sends it to the representative as a
     /// [`Body::Report`], once a window, after the latest window it reported
-    /// ([`crate::keys::reported`]). The node puts it in a batch once its
+    /// ([`vos_abi::keys::reported`]). The node puts it in a batch once its
     /// replica has built the cut, which it records only for a window a
     /// read waits on, or every window when the agent reports every one
     /// ([`Admin::ReportEveryWindow`]).
@@ -183,9 +179,9 @@ pub enum Input {
     /// The representative's close of window `window`: its root at its cut
     /// of the window, `rep_root`, and for each agent that asked, its row's
     /// salt and path against it. Refine sends each agent past the close
-    /// mark ([`crate::keys::close_mark`]) its [`Body::Closed`]. The node
+    /// mark ([`vos_abi::keys::close_mark`]) its [`Body::Closed`]. The node
     /// puts it in a batch once its replica has built the cut, at most
-    /// [`crate::defaults::CLOSE_PATHS`] paths a close.
+    /// [`vos_abi::defaults::CLOSE_PATHS`] paths a close.
     #[codec(index = 8)]
     Close {
         window: u64,
@@ -195,8 +191,8 @@ pub enum Input {
     /// The statement `id` of one of the agent's attests at window
     /// `window`'s cut proved, its final proof the blob `proof` (its
     /// BLAKE2b-256) in the prover's blob store, the attest's record the one
-    /// whose digest is `attested` ([`crate::result::Attest::digest`]):
-    /// refine records it ([`crate::keys::proven`]), the first proof of an id
+    /// whose digest is `attested` ([`vos_abi::result::Attest::digest`]):
+    /// refine records it ([`vos_abi::keys::proven`]), the first proof of an id
     /// alone. The prover, the agent's leader, puts it in a batch once the
     /// proof is stored.
     #[codec(index = 9)]
@@ -236,7 +232,7 @@ pub struct CredentialedInput {
     /// By batch time.
     pub expires_ms: u64,
     /// The kernel's claim, its public arguments: at most
-    /// [`crate::abi::cap::CLAIM`] bytes.
+    /// [`vos_abi::abi::cap::CLAIM`] bytes.
     pub claim: Vec<u8>,
     /// The kernel the proof is of: a method of the credential actor for a
     /// stock guard, of `instance` for a kernel guard, whose apply runs the
@@ -266,117 +262,26 @@ pub struct Message {
     pub body: Body,
 }
 
-/// What a message between agents carries.
+/// The representative's close of a window as its node keeps it
+/// ([`vos_abi::keys::closing`]), once its cut's build is done: its root at the
+/// cut, and for each agent that reported the window and whose row the cut
+/// holds, in agent order, the row's salt and a `vos_tree::BatchProof`'s
+/// encoding of it against the root. A window no agent's row reaches has
+/// none: nothing is anchored of it.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub enum Body {
-    /// A call of `instance`'s `method`. One that names an await is a
-    /// request: its step replies to the sender, whatever its outcome.
-    #[codec(index = 0)]
-    Call {
-        instance: InstanceId,
-        method: MethodId,
-        arguments: Vec<u8>,
-        awaiting: Option<Await>,
-    },
-    /// A request's answer, for the await it names.
-    #[codec(index = 1)]
-    Reply { awaiting: Await, answer: Answer },
-    /// The sender awaits the result of a workflow it started here, at
-    /// `awaiting`: answered with its outcome once it ends, at once if it
-    /// has.
-    #[codec(index = 2)]
-    Wait {
-        workflow: WorkflowId,
-        awaiting: Await,
-    },
-    /// The space's representative closed window `window`: its root at its
-    /// cut of the window, and the receiver's row's salt and path against
-    /// it, which every read the receiver serves at that window's cut
-    /// carries ([`crate::keys::closed`]).
-    #[codec(index = 3)]
-    Closed {
-        window: u64,
-        rep_root: [u8; 32],
-        rep_salt: [u8; 16],
-        space_path: Vec<u8>,
-    },
-    /// The sender's root at a window's cut, for the receiver, its space's
-    /// representative: refine stores it natively in the representative's
-    /// committed map ([`crate::served::representative_row`]), as no
-    /// program's call can, the sender its message's.
-    #[codec(index = 4)]
-    Report(crate::served::AgentRoot),
+pub struct Closing {
+    pub root: [u8; 32],
+    pub paths: Vec<AgentPath>,
 }
 
-impl Body {
-    /// The bytes it carries: a call's arguments, or a reply's.
-    pub fn payload_len(&self) -> usize {
-        match self {
-            Body::Call { arguments, .. } => arguments.len(),
-            Body::Reply { answer, .. } => match answer {
-                Answer::Done(bytes) | Answer::Failed { detail: bytes, .. } => bytes.len(),
-                Answer::Started(_) => 0,
-            },
-            Body::Wait { .. } | Body::Report(_) => 0,
-            Body::Closed { space_path, .. } => space_path.len(),
-        }
-    }
-
-    /// The await a request names, which its step answers.
-    pub fn awaiting(&self) -> Option<Await> {
-        match self {
-            Body::Call { awaiting, .. } => *awaiting,
-            Body::Wait { awaiting, .. } => Some(*awaiting),
-            Body::Reply { .. } | Body::Closed { .. } | Body::Report(_) => None,
-        }
-    }
-}
-
-/// An await of a workflow: the workflow, and its count of awaits when it
-/// made this one, so a reply finds the await it answers, or none.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
-pub struct Await {
-    pub workflow: WorkflowId,
-    pub counter: u64,
-}
-
-/// What a request is answered: its step's outcome, or the workflow it
-/// started.
+/// An agent's row at the representative's cut of a window: the agent, the
+/// row's salt, and a `vos_tree::BatchProof`'s encoding of the row against
+/// the representative's root.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub enum Answer {
-    /// The handler's reply.
-    #[codec(index = 0)]
-    Done(Vec<u8>),
-    /// The step failed, with its code and detail. A request refused before
-    /// its handler ran fails too: [`Failure::Unknown`] for no such
-    /// instance or method, [`Failure::Forbidden`] when the requesting
-    /// agent lacks the handler's role.
-    #[codec(index = 1)]
-    Failed { code: Failure, detail: Vec<u8> },
-    /// The request started a workflow, which answers its result to an
-    /// await of its own.
-    #[codec(index = 2)]
-    Started(WorkflowId),
-}
-
-impl Answer {
-    /// A request's step that failed with `code`, and no detail.
-    pub fn failed(code: Failure) -> Self {
-        Answer::Failed {
-            code,
-            detail: Vec::new(),
-        }
-    }
-}
-
-impl From<Outcome> for Answer {
-    fn from(outcome: Outcome) -> Self {
-        match outcome {
-            Outcome::Done(reply) => Answer::Done(reply),
-            Outcome::Failed { code, detail } => Answer::Failed { code, detail },
-            Outcome::Started(workflow) => Answer::Started(workflow),
-        }
-    }
+pub struct AgentPath {
+    pub agent: AgentId,
+    pub salt: [u8; 16],
+    pub path: Vec<u8>,
 }
 
 /// An operator command, applied through the log like any input.
@@ -395,9 +300,9 @@ pub enum Admin {
         instance: InstanceId,
         derivation: Derivation,
         roles: Vec<(Vec<u8>, u8)>,
-        target: crate::abi::cap::Target,
-        space: crate::SpaceId,
-        clock: crate::WindowClock,
+        target: vos_abi::abi::cap::Target,
+        space: vos_abi::SpaceId,
+        clock: vos_abi::WindowClock,
     },
     /// Grant a principal a role in this agent, or (`None`) revoke it, as
     /// the operator posted it. A role is a byte; a package's schema names
@@ -407,7 +312,7 @@ pub enum Admin {
     /// Record the agent's cut, and report its root there, at every window
     /// (`true`), as an issuer whose verifiers demand a recent root does, or
     /// only at the windows a read waits on (`false`, the default)
-    /// ([`crate::keys::every_window`]). Set on the representative, it
+    /// ([`vos_abi::keys::every_window`]). Set on the representative, it
     /// anchors nothing of its own: a window is anchored for the reports of
     /// other agents its cut holds.
     #[codec(index = 2)]

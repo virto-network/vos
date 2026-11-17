@@ -17,9 +17,9 @@
 //! it too. At or below the applied index the state holds its effect, so
 //! the log is compacted past it rather than left ending below it.
 
+use vos_abi::ids::AgentId;
 use vos_raft::core::{Load, Recovered, SnapshotSwitch, Write};
 use vos_raft::{ActiveConfigRecord, EntryKind as RaftKind, LogEntry as RaftEntry, Meta};
-use vos_wire::ids::AgentId;
 
 use crate::blobs::Blobs;
 use crate::storage::Change;

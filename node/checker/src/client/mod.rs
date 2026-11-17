@@ -10,15 +10,15 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
+use vos_abi::abi::Refusal;
+use vos_abi::ids::{AgentId, InstanceId, Session};
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode};
 use vos_api::Kind;
 use vos_node::client::{ClientError, naming, send_within, signed_call};
-use vos_wire::abi::Refusal;
 use vos_wire::defaults::SESSION_SKEW_MS;
-use vos_wire::ids::{AgentId, InstanceId, Session};
 use vos_wire::ingress::{Rejection, Response};
 use vos_wire::peer::NodeNumber;
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode};
 
 use crate::model::{ANSWERED, ATTEMPT, COUNTER, INBOX, Methods, Mode, Nodes, SECOND};
 use crate::rounds;

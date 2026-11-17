@@ -19,17 +19,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::{Signer, SigningKey};
+use vos_abi::WindowClock;
+use vos_abi::ids::AgentId;
+use vos_abi::keys;
+use vos_abi::result::Write;
+use vos_abi::vos_anchor::{Anchor, MAX_ROOT_AGE_MS, RootKind, SpaceId};
 use vos_checker::stays;
 use vos_node::store::PersistMode;
 use vos_node::{AnchorAlert, Config, Hooks, ReplaceError, roots};
 use vos_venue::{AnchorOutcome, Held, ModelVenue, Status, VenueClient};
-use vos_wire::WindowClock;
-use vos_wire::ids::AgentId;
 use vos_wire::ingress::Unplaced;
-use vos_wire::keys;
 use vos_wire::peer::NodeNumber;
-use vos_wire::result::Write;
-use vos_wire::vos_anchor::{Anchor, MAX_ROOT_AGE_MS, RootKind, SpaceId};
 
 use crate::common::{Cluster, wait_until};
 use crate::support::Anchoring;
@@ -732,14 +732,14 @@ fn an_aged_window_is_settled_unsent() {
 /// a node of no space, signs none.
 #[test]
 fn only_a_founding_node_signs_the_registration() {
-    let venue = vos_wire::vos_anchor::VenueId([0x5e; 32]);
+    let venue = vos_abi::vos_anchor::VenueId([0x5e; 32]);
     let cluster = Cluster::founded_by(3, &[1, 2], clock(), |_, _| {});
     let space = cluster.space.id();
     let (key, signature) = cluster
         .node(2)
         .sign_registration(&venue, &[9; 32])
         .expect("a founder signs");
-    let digest = vos_wire::vos_anchor::register_digest(&venue, &space, &[9; 32]);
+    let digest = vos_abi::vos_anchor::register_digest(&venue, &space, &[9; 32]);
     assert_eq!(key, cluster.node(2).id().0, "by its node key");
     ed25519_dalek::VerifyingKey::from_bytes(&key)
         .unwrap()

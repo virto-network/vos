@@ -125,7 +125,7 @@ pub fn cut_proof_entry(key: &[u8]) -> Option<(RequestId, u64)> {
 
 /// The last window whose root at its cut the agent reported to its
 /// space's representative, and the representative's id
-/// ([`crate::batch::Input::Report`]): replicated, written by the report's
+/// (`vos_wire::batch::Input::Report`): replicated, written by the report's
 /// step. A report of that window or an earlier one sends nothing, and a
 /// `Closed` comes only from that agent.
 pub fn reported() -> Vec<u8> {
@@ -157,7 +157,7 @@ pub fn cut_mark() -> Vec<u8> {
 /// ([`crate::abi::Op::AttestAt`]), or, at the space's representative, an
 /// agent's report of it. Replicated, written by those steps; apply records
 /// the cut of the window the agent's batch-time mark lies in only when it
-/// is this one or an earlier ([`crate::apply`]).
+/// is this one or an earlier (`vos_wire::apply`).
 pub fn reading() -> Vec<u8> {
     Row::Reading.prefix().to_vec()
 }
@@ -176,20 +176,20 @@ pub fn quarantined_prefix() -> Vec<u8> {
 }
 
 /// Present when the agent records its cut, and reports its root there, at
-/// every window ([`crate::batch::Admin::ReportEveryWindow`]). Replicated.
+/// every window (`vos_wire::batch::Admin::ReportEveryWindow`). Replicated.
 pub fn every_window() -> Vec<u8> {
     Row::EveryWindow.prefix().to_vec()
 }
 
 /// The representative's mark of the closes it has sent
-/// ([`crate::batch::Input::Close`]): the window, and the last agent sent
+/// (`vos_wire::batch::Input::Close`): the window, and the last agent sent
 /// its path for it. Replicated.
 pub fn close_mark() -> Vec<u8> {
     Row::CloseMark.prefix().to_vec()
 }
 
 /// The last window whose root agent `agent` reported to this agent, its
-/// space's representative ([`crate::batch::Body::Report`]): replicated,
+/// space's representative ([`crate::message::Body::Report`]): replicated,
 /// written by the report's step. A report of that window or an earlier
 /// one stores nothing.
 pub fn reports(agent: AgentId) -> Vec<u8> {
@@ -198,7 +198,7 @@ pub fn reports(agent: AgentId) -> Vec<u8> {
 
 /// The final proof of the agent's statement `id` (a
 /// `vos_statement::StatementId`) of an attest at window `window`'s cut, as
-/// its prover recorded it ([`crate::batch::Input::Proven`]): the proof's
+/// its prover recorded it (`vos_wire::batch::Input::Proven`): the proof's
 /// BLAKE2b-256, a blob in the prover's store. Replicated, written by the
 /// step of the first `Proven` of the id; a later one is ignored. Every
 /// replica learns from it that the statement is proved, so a new leader
@@ -211,7 +211,7 @@ pub fn proven(window: u64, id: &[u8; 32]) -> Vec<u8> {
 /// The representative's close of the window `window`, node-local, written
 /// by the commit that finishes its cut's build when some agent's row
 /// reaches it: its root there, and the path of each agent that reported
-/// the window ([`crate::served::Closing`]).
+/// the window (`vos_wire::batch::Closing`).
 pub fn closing(window: u64) -> Vec<u8> {
     TreeRow::Closing.key(&window.to_be_bytes())
 }

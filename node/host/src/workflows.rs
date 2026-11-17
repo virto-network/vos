@@ -13,11 +13,11 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use vos_wire::Decode;
-use vos_wire::ids::{AgentId, Principal, WorkflowId};
+use vos_abi::Decode;
+use vos_abi::ids::{AgentId, Principal, WorkflowId};
+use vos_abi::keys;
+use vos_abi::records::{Workflow, WorkflowHead, WorkflowState, unstored};
 use vos_wire::ingress::{Consistency, Response, WorkflowStatus};
-use vos_wire::keys;
-use vos_wire::records::{Workflow, WorkflowHead, WorkflowState, unstored};
 
 use crate::node::Inner;
 use crate::store::Snapshot;
@@ -141,9 +141,9 @@ fn status(record: &WorkflowHead, reader: Principal) -> WorkflowStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vos_wire::Encode;
-    use vos_wire::ids::{InstanceId, MethodId, ProgramHash};
-    use vos_wire::result::Outcome;
+    use vos_abi::Encode;
+    use vos_abi::ids::{InstanceId, MethodId, ProgramHash};
+    use vos_abi::result::Outcome;
 
     /// The head of a record of `owner`'s workflow in `state`.
     fn record(owner: Principal, state: WorkflowState) -> WorkflowHead {
@@ -160,7 +160,7 @@ mod tests {
             waiter: None,
             state,
             snapshot: None,
-            target: vos_wire::abi::cap::Target::Vos,
+            target: vos_abi::abi::cap::Target::Vos,
             stored: 0,
         };
         WorkflowHead::decode(&record.encode()).unwrap().0

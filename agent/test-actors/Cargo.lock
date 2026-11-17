@@ -411,10 +411,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "vos-abi"
+version = "0.1.0"
+dependencies = [
+ "vos-anchor",
+ "vos-pvm-codec",
+ "vos-pvm-precompiles",
+ "vos-pvm-program",
+ "vos-tree",
+]
+
+[[package]]
 name = "vos-agent"
 version = "0.1.0"
 dependencies = [
  "lz4_flex",
+ "vos-abi",
  "vos-pvm-precompiles",
  "vos-pvm-program",
  "vos-sdk",
@@ -433,6 +445,7 @@ dependencies = [
 name = "vos-credentials"
 version = "0.1.0"
 dependencies = [
+ "vos-abi",
  "vos-sdk",
  "vos-wire",
 ]
@@ -485,10 +498,10 @@ dependencies = [
 name = "vos-sdk"
 version = "0.1.0"
 dependencies = [
+ "vos-abi",
  "vos-pvm-precompiles",
  "vos-sdk-macros",
  "vos-tree",
- "vos-wire",
 ]
 
 [[package]]
@@ -498,7 +511,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
- "vos-wire",
+ "vos-abi",
 ]
 
 [[package]]
@@ -513,10 +526,10 @@ dependencies = [
 name = "vos-wire"
 version = "0.1.0"
 dependencies = [
+ "vos-abi",
  "vos-anchor",
  "vos-pvm-codec",
  "vos-pvm-precompiles",
- "vos-pvm-program",
  "vos-tree",
 ]
 

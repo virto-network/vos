@@ -8,9 +8,9 @@
 //! delay does, and a device that cannot follow regroups.
 
 use ed25519_dalek::SigningKey;
+use vos_abi::Encode;
 use vos_light::group::{Alarm, Course, DeviceGroup, Event, GroupError, Remedy, Restored, Why};
 use vos_light::kit::KitKey;
-use vos_wire::Encode;
 use vos_wire::personal::{
     Attached, Body, DeviceView, Effect, Entry, OpState, Operation, Overview, PersonalError,
     Recorded, RecoveryView, Woken, chain,

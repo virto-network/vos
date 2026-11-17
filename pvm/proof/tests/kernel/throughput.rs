@@ -13,10 +13,10 @@
 
 use std::time::{Duration, Instant};
 
+use vos_abi::result::Attest;
+use vos_abi::vos_anchor::{VenueId, WindowClock};
 use vos_pvm_proof::format::SEGMENT;
 use vos_statement::ProgramId;
-use vos_wire::result::Attest;
-use vos_wire::vos_anchor::{VenueId, WindowClock};
 
 use crate::balance;
 use crate::common;

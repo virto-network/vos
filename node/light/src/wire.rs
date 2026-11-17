@@ -10,15 +10,15 @@
 
 use ed25519_dalek::{Signer, SigningKey};
 use scale::{Decode, Encode};
+use vos_abi::ids::Session;
+use vos_abi::ids::{AgentId, InstanceId, MethodId};
+use vos_abi::result::Outcome;
 use vos_api::Kind;
 use vos_wire::credentials::Feed;
-use vos_wire::ids::Session;
-use vos_wire::ids::{AgentId, InstanceId, MethodId};
 use vos_wire::ingress::{
     self, AgentInfo, Consistency, CredentialRefusal, Credentialed, QueryCall, Rejection, Response,
     query_message,
 };
-use vos_wire::result::Outcome;
 use zeroize::Zeroize;
 
 use crate::{Call, DeviceError, Proven};

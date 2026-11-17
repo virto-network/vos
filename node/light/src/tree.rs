@@ -64,7 +64,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use scale::{Decode, Encode};
-use vos_wire::credentials::{self, DEPTH, EMPTY, ENROLL_MANY, FEED_BYTES, Feed, RootEntry, Words};
+use vos_abi::credentials::{self, DEPTH, EMPTY, Words};
+use vos_wire::credentials::{ENROLL_MANY, FEED_BYTES, Feed, RootEntry};
 
 use crate::{AuthWitness, DeviceError, Digest, wire};
 

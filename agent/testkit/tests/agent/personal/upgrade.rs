@@ -3,16 +3,16 @@
 //! installed over a populated agent, reads every envelope and operation
 //! back and goes on.
 
+use vos_abi::abi::cap::Target;
 use vos_testkit::node::ran;
 use vos_testkit::programs::derived;
-use vos_wire::abi::cap::Target;
 use vos_wire::batch::{Admin, Input};
 use vos_wire::personal::{
     Acknowledged, Candidacy, DeviceView, Entry, Envelope, InboxItem, Operation, Overview,
     Recipient, Recorded, RecoveryView, Verdict, Voted,
 };
 
-use vos_wire::{SpaceId, WindowClock};
+use vos_abi::{SpaceId, WindowClock};
 
 use super::*;
 

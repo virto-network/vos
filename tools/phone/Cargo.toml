@@ -21,6 +21,7 @@ mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 vos-light = { workspace = true }
+vos-abi = { workspace = true }
 vos-wire = { workspace = true }
 # The device profile's masked prover and verifier, and its format.
 vos-pvm-proof = { workspace = true }
@@ -41,7 +42,7 @@ mimalloc = { version = "0.1.52", optional = true }
 vos-pvm-compiler = { workspace = true }
 vos-pvm-device = { workspace = true }
 vos-light = { workspace = true, features = ["release"] }
-vos-wire = { workspace = true }
+vos-abi = { workspace = true }
 
 [dev-dependencies]
 # Its outputs searched for the member's secret (`tests/outputs.rs`): dev

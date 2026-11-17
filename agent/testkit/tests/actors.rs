@@ -2,12 +2,12 @@
 //! build-test-actors`) running on the testkit. The tests fail, not skip,
 //! when the programs are missing.
 
+use vos_abi::abi::{Failure, Kind};
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash};
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode};
 use vos_testkit::model::{InstallError, Model, decode};
 use vos_testkit::programs::{actor, kernel, method, schema};
-use vos_wire::abi::{Failure, Kind};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash};
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode};
 
 const COUNTER: InstanceId = InstanceId(1);
 const LEDGER: InstanceId = InstanceId(2);

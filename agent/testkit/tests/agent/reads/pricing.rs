@@ -9,7 +9,7 @@ use super::*;
 fn unpaid(node: &Node, time: u64, inputs: Vec<Input>) -> i64 {
     let invocation = node.run_refine(&node.work(time, inputs), crate::common::GAS);
     let output = invocation.output_bounded(cap::OUTPUT).unwrap();
-    let (result, _) = vos_wire::result::split_output(&output).unwrap();
+    let (result, _) = vos_abi::result::split_output(&output).unwrap();
     let steps: u64 = result.steps.iter().map(|step| ran(step).gas_used).sum();
     invocation.gas_used as i64 - steps as i64
 }
@@ -39,8 +39,8 @@ fn serving_a_read_pays_for_itself() {
         )
     };
     let spent = at(Some(&served)) - at(None);
-    let accounted =
-        defaults::SERVED_BYTE * bytes as u64 + defaults::PRECOMPILE_SERVING * ran.compressions;
+    let accounted = defaults::SERVED_BYTE * bytes as u64
+        + vos_abi::defaults::PRECOMPILE_SERVING * ran.compressions;
     println!(
         "a read of {} rows, {bytes} bytes and {} compressions served: the agent spends {spent} \
          beyond its charges, {:.1} a byte, of {accounted} accounted",

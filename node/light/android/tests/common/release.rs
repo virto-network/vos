@@ -9,8 +9,8 @@
 //! facility-release` writes them; the `release` test holds the embedded
 //! ones to them.
 
+use vos_abi::Encode as _;
 use vos_testkit::programs;
-use vos_wire::Encode as _;
 
 /// Each artifact's file name and bytes.
 pub fn artifacts() -> Vec<(&'static str, Vec<u8>)> {

@@ -10,12 +10,12 @@
 
 use alloc::vec::Vec;
 
+use vos_abi::jam::AccumulateInput;
+use vos_abi::result::split_output;
+use vos_abi::{Decode, Encode};
 use vos_tree::{Blake2b, Hash, empty_root};
 use vos_wire::apply::{Host, State, apply};
-use vos_wire::jam::AccumulateInput;
 use vos_wire::package::{EXPORTS, Exports, JamOutput, ROOT, timely};
-use vos_wire::result::split_output;
-use vos_wire::{Decode, Encode};
 
 use crate::host::{fetch_input, read, solicit, write};
 

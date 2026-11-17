@@ -8,11 +8,11 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use vos_abi::ids::AgentId;
 use vos_checker::calls::install_of;
 use vos_checker::processes::{self, Running, first_run, read_log};
 use vos_checker::spaces::{HeldPort, free_udp_port};
 use vos_node::client::{Operator, Target};
-use vos_wire::ids::AgentId;
 use vos_wire::ingress::Response;
 
 use crate::{COUNTER, NODES};

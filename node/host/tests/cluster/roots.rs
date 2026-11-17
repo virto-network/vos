@@ -6,19 +6,19 @@
 
 use std::time::Duration;
 
+use vos_abi::Encode;
+use vos_abi::ids::{AgentId, MapId};
+use vos_abi::keys;
+use vos_abi::records::{unstored, unversioned};
+use vos_abi::result::Write;
 use vos_checker::calls::done;
 use vos_checker::programs::table_tag;
 use vos_node::Node;
 use vos_node::roots::{self, AgentStore};
 use vos_node::store::PersistMode;
 use vos_tree::{Blake2b, Hash, value_hash};
-use vos_wire::Encode;
 use vos_wire::batch::Request;
-use vos_wire::ids::{AgentId, MapId};
-use vos_wire::keys;
 use vos_wire::peer::NodeNumber;
-use vos_wire::records::{unstored, unversioned};
-use vos_wire::result::Write;
 
 use crate::common::{
     ALICE, COUNTER, Cluster, compacting, log_start, old_epochs_dropped, wait_until,

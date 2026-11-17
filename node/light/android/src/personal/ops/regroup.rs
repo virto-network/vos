@@ -24,9 +24,9 @@ use std::time::{Duration, Instant};
 
 use ed25519_dalek::{Signer as _, SigningKey};
 use sha2::{Digest as _, Sha256};
+use vos_abi::{Decode, Encode};
 use vos_light::group::{Course, DeviceGroup};
 use vos_wire::personal::{InboxItem, Recipient};
-use vos_wire::{Decode, Encode};
 
 use super::super::link::AgentLink;
 use super::{Held, Refusal, Refused, Space, State, agent_refused, no_space, refused, unreached};

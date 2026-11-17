@@ -3,14 +3,15 @@
 
 use alloc::vec::Vec;
 
-use vos_wire::abi::cap::{Limits, Refused, Target};
-use vos_wire::abi::{Failure, Kind, cap};
+use vos_abi::abi::cap::{Limits, Refused, Target};
+use vos_abi::abi::{Failure, Kind, cap};
+use vos_abi::ids::InstanceId;
+use vos_abi::records::{Admitting, Derivation, Installed, MAX_HEADROOM, Previous, RETIREMENT_MS};
+use vos_abi::result::{InputRef, Outcome, Step, Write};
+use vos_abi::schema::Schema;
+use vos_abi::{Decode, Encode, SpaceId, WindowClock, keys};
 use vos_wire::batch::Admin;
-use vos_wire::ids::InstanceId;
-use vos_wire::records::{Admitting, Derivation, Installed, MAX_HEADROOM, Previous, RETIREMENT_MS};
-use vos_wire::result::{InputRef, Outcome, Step, Write};
-use vos_wire::schema::Schema;
-use vos_wire::{Decode, Encode, SpaceId, WindowClock, defaults, keys};
+use vos_wire::defaults;
 
 use super::base::{Base, Corrupt, Source};
 use super::inputs::consumed;
@@ -353,7 +354,7 @@ fn package(derivation: Derivation, roles: Vec<(Vec<u8>, u8)>, target: Target) ->
     let machine = Machine::acquire(&derivation.program.0).ok()?;
     let header = machine.peek(SCHEMA_AT, 8)?;
     let len = u32::from_le_bytes(header[4..8].try_into().ok()?) as usize;
-    if len > vos_wire::schema::MAX_LEN {
+    if len > vos_abi::schema::MAX_LEN {
         return None;
     }
     let section = machine.peek(SCHEMA_AT, 8 + len)?;

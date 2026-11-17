@@ -10,11 +10,11 @@ use core::time::Duration;
 
 use alloc::vec::Vec;
 
-use vos_wire::abi::{AttestError, Failure};
-use vos_wire::batch::Answer;
-use vos_wire::ids::{AgentId, InstanceId, Principal, WorkflowId};
-use vos_wire::result::Attested;
-use vos_wire::{Decode, DecodeError, Encode, keys};
+use vos_abi::abi::{AttestError, Failure};
+use vos_abi::ids::{AgentId, InstanceId, Principal, WorkflowId};
+use vos_abi::message::Answer;
+use vos_abi::result::Attested;
+use vos_abi::{Decode, DecodeError, Encode, keys};
 
 use crate::host;
 use crate::state::{self, New, Tables};

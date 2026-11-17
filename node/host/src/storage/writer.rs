@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use vos_wire::ids::AgentId;
+use vos_abi::ids::AgentId;
 
 use super::{Change, Commit, Shared};
 use crate::store::{Batch, Fjall, PersistMode};
@@ -336,7 +336,7 @@ impl Staged {
             applied: HashMap::new(),
             dirtied: Vec::new(),
             retired: Vec::new(),
-            wakes: [vos_wire::keys::dirty_prefix(), vos_wire::keys::cuts()],
+            wakes: [vos_abi::keys::dirty_prefix(), vos_abi::keys::cuts()],
         }
     }
 

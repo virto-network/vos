@@ -5,7 +5,7 @@
 //! stock kernels, `auth` and `owner` from the credential actor's ELF
 //! (`just build-programs`).
 
-use vos_wire::Encode;
+use vos_abi::Encode;
 
 fn main() -> Result<(), String> {
     let mut arguments = std::env::args().skip(1);

@@ -10,6 +10,8 @@
 
 use crate::common;
 
+use vos_abi::ids::{MethodId, ProgramHash};
+use vos_abi::records::Kernel;
 use vos_pvm_compiler::assembler::{Assembler, Reg};
 use vos_pvm_proof::SideNote;
 use vos_pvm_proof::chip_idx;
@@ -19,8 +21,6 @@ use vos_pvm_proof::kernel::trace_kernel;
 use vos_pvm_proof::program_id::KernelEntry;
 use vos_pvm_proof::{Proof, prove_kernel};
 use vos_pvm_proof_verifier::{verify_kernel_chain, verify_kernel_segment};
-use vos_wire::ids::{MethodId, ProgramHash};
-use vos_wire::records::Kernel;
 
 /// The Poseidon2 calls the kernel chains.
 const CALLS: i32 = 1_500;

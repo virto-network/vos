@@ -1,22 +1,23 @@
 //! Encodings pinned byte for byte, and Gray Paper structures captured from
 //! PolkaJam.
 
-use vos_wire::abi::Failure;
-use vos_wire::batch::{Admin, Answer, Await, Batch, Body, Input, Merge, Message, Work};
-use vos_wire::ids::{
+use vos_abi::abi::Failure;
+use vos_abi::ids::{
     AgentId, InstanceId, MapId, MethodId, Principal, ProgramHash, Session, SessionId, WorkflowId,
     derive_id,
 };
-use vos_wire::ingress::Grant;
-use vos_wire::jam::{AccumulateInput, RefineArgs, WorkError};
-use vos_wire::keys::{Due, Transform};
-use vos_wire::merge::Origin;
-use vos_wire::records::{
+use vos_abi::jam::{AccumulateInput, RefineArgs, WorkError};
+use vos_abi::keys::{Due, Transform};
+use vos_abi::merge::Origin;
+use vos_abi::message::{Answer, Await, Body};
+use vos_abi::records::{
     Derivation, DeviceRelease, Kernel, Previous, Reference, SegmentClass, Shape, Snapshot,
     Workflow, WorkflowState,
 };
-use vos_wire::result::{CommittedWrite, InputRef, Outcome, Outgoing, Page, Run, Write};
-use vos_wire::{Decode, Encode};
+use vos_abi::result::{CommittedWrite, InputRef, Outcome, Outgoing, Page, Run, Write};
+use vos_abi::{Decode, Encode};
+use vos_wire::batch::{Admin, Batch, Input, Merge, Message, Work};
+use vos_wire::ingress::Grant;
 
 use crate::strategies::{hex, round_trip};
 
@@ -101,10 +102,10 @@ fn captured_inputs_decode_and_reencode() {
 /// ELF.
 #[test]
 fn installs_keep_their_bytes() {
-    use vos_wire::abi::cap::Target;
+    use vos_abi::abi::cap::Target;
+    use vos_abi::records::Installed;
+    use vos_abi::schema::Schema;
     use vos_wire::ingress::Install;
-    use vos_wire::records::Installed;
-    use vos_wire::schema::Schema;
     let derivation = Derivation {
         program: ProgramHash([3; 32]),
         kernels: vec![
@@ -181,8 +182,8 @@ fn installs_keep_their_bytes() {
         derivation: derivation.clone(),
         roles: vec![(b"m".to_vec(), 7)],
         target: Target::Jam,
-        space: vos_wire::SpaceId([0xa1; 32]),
-        clock: vos_wire::WindowClock {
+        space: vos_abi::SpaceId([0xa1; 32]),
+        clock: vos_abi::WindowClock {
             origin_ms: 0x0102_0304_0506_0708,
             length_ms: 600_000,
         },
@@ -339,11 +340,11 @@ fn committed_writes_keep_their_bytes() {
     assert_eq!(Run::decode(&bytes).unwrap().0, run);
     assert_eq!(Transform::Hashed.encode(), [0]);
     assert_eq!(
-        vos_wire::records::versioned(0x0102, &[0xdd]),
+        vos_abi::records::versioned(0x0102, &[0xdd]),
         [0x02, 0x01, 0, 0, 0, 0, 0, 0, 0xdd]
     );
     assert_eq!(
-        vos_wire::records::unversioned(&[0x02, 0x01, 0, 0, 0, 0, 0, 0, 0xdd]),
+        vos_abi::records::unversioned(&[0x02, 0x01, 0, 0, 0, 0, 0, 0, 0xdd]),
         Some((0x0102, &[0xdd][..]))
     );
 }
@@ -655,7 +656,7 @@ fn workflows_keep_their_bytes() {
             pages: vec![(12, [13; 32])],
             pending: Some(11),
         }),
-        target: vos_wire::abi::cap::Target::Jam,
+        target: vos_abi::abi::cap::Target::Jam,
         stored: 14,
     };
     let bytes = [
@@ -688,7 +689,7 @@ fn workflows_keep_their_bytes() {
     assert_eq!(record.encode(), bytes);
     round_trip(&record);
     // Its head is its fields before the snapshot.
-    let (head, used) = vos_wire::records::WorkflowHead::decode(&bytes).unwrap();
+    let (head, used) = vos_abi::records::WorkflowHead::decode(&bytes).unwrap();
     assert_eq!(
         (head.method, head.owner, head.state),
         (record.method, record.owner, record.state.clone())
@@ -714,16 +715,6 @@ fn workflows_keep_their_bytes() {
     );
 }
 
-/// An agent's id is its creator's number over 24 bits of its serial.
-#[test]
-fn an_agent_id_holds_its_creator_and_serial() {
-    use vos_wire::peer::CreationRecord;
-    let agent = CreationRecord::agent_id(0x0a, 0x0b_0c0d);
-    assert_eq!(agent, AgentId(0x0a0b_0c0d));
-    assert_eq!(CreationRecord::creator_of(agent), 0x0a);
-    assert_eq!(CreationRecord::serial_of(agent), 0x0b_0c0d);
-}
-
 /// Every frame between nodes starts with its variant's index, the indexes
 /// running from 0 without a gap. A directory acknowledgement's order is
 /// its term, index and commitment, a `Behind` names its pair alone, and a
@@ -742,7 +733,7 @@ fn peer_messages_keep_their_bytes() {
         time: 0,
         program: ProgramHash([0; 32]),
         accumulate_gas: 0,
-        space: vos_wire::SpaceId::NONE,
+        space: vos_abi::SpaceId::NONE,
     };
     let order = Order {
         term: 2,
@@ -1069,4 +1060,24 @@ fn a_merge_encodes_in_field_order() {
     assert_eq!(work.batch(), None);
     round_trip(&work);
     assert_eq!(InputRef::Merge.encode(), [10]);
+}
+
+/// Ingress's answers keep their bytes: a refusal's code, and an admission's
+/// rejections.
+#[test]
+fn ingress_refusals_and_rejections_keep_their_bytes() {
+    use vos_abi::abi::Refusal;
+    use vos_wire::ingress::{AdmissionRefusal, Rejection, Response};
+    assert_eq!(
+        Response::Refused(Refusal::Sequence).encode(),
+        [1, 1, 0, 0, 0]
+    );
+    assert_eq!(
+        Rejection::Admission(AdmissionRefusal::OnionOnly).encode(),
+        [11, 0]
+    );
+    assert_eq!(
+        Rejection::Admission(AdmissionRefusal::UnknownKey).encode(),
+        [11, 1]
+    );
 }

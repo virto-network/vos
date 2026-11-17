@@ -2,18 +2,18 @@
 //! in the reference model alike, and what the differential tests compare
 //! of a batch's steps.
 
+use vos_abi::abi::cap::Target;
+use vos_abi::ids::{InstanceId, MethodId, Principal, ProgramHash, Session, SessionRef};
+use vos_abi::result::{InputRef, Outcome, Run, Step, WorkResult, Write};
+use vos_abi::{Encode, SpaceId, WindowClock};
 use vos_pvm_compiler::Derived;
 use vos_testkit::model::{Model, Step as KitStep};
 pub use vos_testkit::node::{
     AGENT, GAS, Node, Sessions, done, failed, ran, ran_done, refused, request,
 };
 use vos_testkit::programs::{actor, bare, derived, kernel, method};
-use vos_wire::abi::cap::Target;
 use vos_wire::batch::{Admin, Input, Request};
-use vos_wire::ids::{InstanceId, MethodId, Principal, ProgramHash, Session, SessionRef};
 use vos_wire::ingress::Grant;
-use vos_wire::result::{InputRef, Outcome, Run, Step, WorkResult, Write};
-use vos_wire::{Encode, SpaceId, WindowClock};
 
 pub const COUNTER: InstanceId = InstanceId(1);
 pub const LEDGER: InstanceId = InstanceId(2);
@@ -87,8 +87,8 @@ impl Actors {
             derivation: derived("ledger").derivation(),
             roles: vec![(b"minter".to_vec(), MINTER)],
             target,
-            space: vos_wire::SpaceId::NONE,
-            clock: vos_wire::WindowClock::DEFAULT,
+            space: vos_abi::SpaceId::NONE,
+            clock: vos_abi::WindowClock::DEFAULT,
         })
     }
 
@@ -174,8 +174,8 @@ pub fn install_for(target: Target, instance: InstanceId, program: ProgramHash) -
         derivation: bare(program),
         roles: vec![],
         target,
-        space: vos_wire::SpaceId::NONE,
-        clock: vos_wire::WindowClock::DEFAULT,
+        space: vos_abi::SpaceId::NONE,
+        clock: vos_abi::WindowClock::DEFAULT,
     })
 }
 

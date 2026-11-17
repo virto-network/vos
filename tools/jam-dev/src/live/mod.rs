@@ -316,7 +316,7 @@ mod tests {
     /// empty tree's root before its first package, and the last exports.
     #[test]
     fn the_storage_reads_as_what_landed() {
-        use vos_wire::Encode;
+        use vos_abi::Encode;
         use vos_wire::package::Exports;
         let empty = Landed::read(None, None).unwrap();
         assert_eq!(empty.root, vos_tree::empty_root(&vos_tree::Blake2b));

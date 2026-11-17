@@ -1,7 +1,7 @@
 //! The VOS actor SDK.
 //!
 //! An actor is a standard PVM program that an agent runs as an inner
-//! machine. This crate is its side of the actor ABI ([`vos_wire::abi`]).
+//! machine. This crate is its side of the actor ABI ([`vos_abi::abi`]).
 //!
 //! An actor crate starts with `use vos_sdk::prelude::*;`: the derived
 //! encodings name `scale` and `Vec`, which the prelude brings into scope.
@@ -24,9 +24,9 @@ pub mod state;
 pub mod table;
 
 pub use alloc::vec::Vec;
+pub use vos_abi::vos_anchor::VenueId;
+pub use vos_abi::{Decode, Encode, abi, credentials, keys, scale, schema, served};
 pub use vos_sdk_macros::{actor, messages, method_id};
-pub use vos_wire::vos_anchor::VenueId;
-pub use vos_wire::{Decode, Encode, abi, credentials, keys, scale, schema, served};
 
 /// What an actor crate needs in scope: the macros, the contexts, tables,
 /// cells and committed maps, and the names the derived encodings use.
@@ -41,7 +41,7 @@ pub mod prelude {
     pub use crate::crdt;
     pub use crate::table::{Cell, CommittedMap, Hashed, Ordered, Table};
     pub use crate::{Decode, Encode, actor, messages, scale};
-    pub use vos_wire::abi::AttestError;
-    pub use vos_wire::ids::{AgentId, InstanceId, Principal, WorkflowId};
-    pub use vos_wire::vos_anchor::VenueId;
+    pub use vos_abi::abi::AttestError;
+    pub use vos_abi::ids::{AgentId, InstanceId, Principal, WorkflowId};
+    pub use vos_abi::vos_anchor::VenueId;
 }

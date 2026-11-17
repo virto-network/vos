@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+use vos_abi::result::Write as StateWrite;
 use vos_raft::core::{Action, Answer, Core};
 use vos_raft::{Config, Message, Role};
-use vos_wire::result::Write as StateWrite;
 
 use super::*;
 use crate::NoHooks;

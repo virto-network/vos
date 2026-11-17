@@ -28,10 +28,10 @@
 //! it enrolls the member; from then on the person's devices enroll and
 //! revoke one another.
 
+use vos_abi::ids::{InstanceId, MethodId, Principal};
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode};
 use vos_wire::books::{DeviceHandle, Enrolled, Space};
-use vos_wire::ids::{InstanceId, MethodId, Principal};
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode};
 
 use crate::pairing::{Hello, Membership};
 use crate::store::{Store, StoreError};

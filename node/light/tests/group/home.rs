@@ -4,16 +4,16 @@
 //! batch time is the test's.
 
 use ed25519_dalek::{Signer, SigningKey, Verifier};
+use vos_abi::abi::Failure;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal};
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode, SpaceId};
 use vos_light::release::{self, Package};
 use vos_testkit::World;
 use vos_testkit::programs;
-use vos_wire::abi::Failure;
 use vos_wire::batch::{Input, Request};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
 use vos_wire::ingress::call_message;
 use vos_wire::personal::{Entry, PersonalError, Policy};
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode, SpaceId};
 
 pub const PERSONAL: InstanceId = InstanceId(5);
 /// The agent's identity, which calls are signed for.

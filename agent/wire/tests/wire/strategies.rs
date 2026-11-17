@@ -1,22 +1,23 @@
 //! Strategies for the wire types, and a round trip through their encoding.
 
 use proptest::prelude::*;
-use vos_wire::abi::cap::Target;
-use vos_wire::abi::{Failure, Refusal};
-use vos_wire::batch::{Admin, Answer, Await, Body, Input, Message, Request};
-use vos_wire::ids::{
+use vos_abi::abi::cap::Target;
+use vos_abi::abi::{Failure, Refusal};
+use vos_abi::ids::{
     AgentId, InstanceId, MapId, MethodId, Principal, ProgramHash, RequestId, Session, SessionId,
     SessionRef, WorkflowId,
 };
-use vos_wire::ingress::Grant;
-use vos_wire::jam::WorkError;
-use vos_wire::keys::{Due, Transform};
-use vos_wire::records::{Derivation, Kernel, SegmentClass, Shape};
-use vos_wire::result::{
+use vos_abi::jam::WorkError;
+use vos_abi::keys::{Due, Transform};
+use vos_abi::message::{Answer, Await, Body};
+use vos_abi::records::{Derivation, Kernel, SegmentClass, Shape};
+use vos_abi::result::{
     Attest, CommittedWrite, InputRef, InstanceGas, Outcome, Outgoing, Page, Run, Step, Write,
 };
-use vos_wire::vos_anchor::{RootKind, RootRead};
-use vos_wire::{Decode, Encode, SpaceId};
+use vos_abi::vos_anchor::{RootKind, RootRead};
+use vos_abi::{Decode, Encode, SpaceId};
+use vos_wire::batch::{Admin, Input, Message, Request};
+use vos_wire::ingress::Grant;
 
 pub(crate) fn bytes() -> impl Strategy<Value = Vec<u8>> {
     prop::collection::vec(any::<u8>(), 0..300)
@@ -90,8 +91,8 @@ pub(crate) fn body() -> impl Strategy<Value = Body> {
             awaiting,
         }),
         (any::<u64>(), any::<[u8; 32]>()).prop_map(|(window, root)| {
-            Body::Report(vos_wire::served::AgentRoot {
-                kind: vos_wire::vos_anchor::RootKind::Space,
+            Body::Report(vos_abi::served::AgentRoot {
+                kind: vos_abi::vos_anchor::RootKind::Space,
                 window,
                 root,
             })
@@ -177,8 +178,8 @@ pub(crate) fn input() -> impl Strategy<Value = Input> {
                         },
                         roles,
                         target,
-                        space: vos_wire::SpaceId::NONE,
-                        clock: vos_wire::WindowClock::DEFAULT,
+                        space: vos_abi::SpaceId::NONE,
+                        clock: vos_abi::WindowClock::DEFAULT,
                     })
                 }
             ),

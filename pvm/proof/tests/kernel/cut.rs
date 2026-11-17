@@ -11,6 +11,17 @@ use std::sync::Arc;
 use cipher_clerk::kernel::Value;
 use cipher_clerk::types::Account;
 use ed25519_dalek::{Signer, SigningKey};
+use vos_abi::abi::cap::Target;
+use vos_abi::abi::{AttestError, Failure};
+use vos_abi::ids::{AgentId, InstanceId, MapId, Principal, ProgramHash, RequestId};
+use vos_abi::keys::{self, Transform};
+use vos_abi::message::Body;
+use vos_abi::records::{PendingRead, WorkflowState};
+use vos_abi::result::{Attest, KernelReturn, Outcome};
+use vos_abi::served::{Served, representative_row};
+use vos_abi::vos_anchor::venue::{AnchorRefusal, Anchoring};
+use vos_abi::vos_anchor::{Anchor, RootKind, RootRead, SpaceGenesis, VenueId, space_root};
+use vos_abi::{Decode, Encode, SpaceId, WindowClock};
 use vos_pvm_final_verifier::masked;
 use vos_pvm_proof::format::SEGMENT;
 use vos_pvm_proof::kernel::{KernelTrace, trace_kernel};
@@ -23,17 +34,6 @@ use vos_testkit::model::Step;
 use vos_testkit::programs::{derived, method, table_tag};
 use vos_tree::{BatchProof, Blake2b, Hash, MemStore};
 use vos_venue::{ModelVenue, VenueClient};
-use vos_wire::abi::cap::Target;
-use vos_wire::abi::{AttestError, Failure};
-use vos_wire::batch::Body;
-use vos_wire::ids::{AgentId, InstanceId, MapId, Principal, ProgramHash, RequestId};
-use vos_wire::keys::{self, Transform};
-use vos_wire::records::{PendingRead, WorkflowState};
-use vos_wire::result::{Attest, KernelReturn, Outcome};
-use vos_wire::served::{Served, representative_row};
-use vos_wire::vos_anchor::venue::{AnchorRefusal, Anchoring};
-use vos_wire::vos_anchor::{Anchor, RootKind, RootRead, SpaceGenesis, VenueId, space_root};
-use vos_wire::{Decode, Encode, SpaceId, WindowClock};
 
 use crate::common::{self, NodeRun, Totals};
 
@@ -329,7 +329,7 @@ pub fn read_live(
 }
 
 /// `actor`'s kernel that made `attest`, and its install's record of it.
-pub fn kernel_of(actor: &str, attest: &Attest) -> (Vec<u8>, vos_wire::records::Kernel) {
+pub fn kernel_of(actor: &str, attest: &Attest) -> (Vec<u8>, vos_abi::records::Kernel) {
     let derived = derived(actor);
     let install = derived.derivation();
     let blob = derived
@@ -431,7 +431,7 @@ pub fn prove_at_first_class(
 pub fn prove_whole(
     name: &str,
     blob: &[u8],
-    record: &vos_wire::records::Kernel,
+    record: &vos_abi::records::Kernel,
     trace: &KernelTrace,
     cut: usize,
 ) -> (KernelProgram, NodeRun, usize, Totals) {

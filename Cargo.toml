@@ -5,7 +5,6 @@ members = [
     "agent/sdk",
     "agent/sdk-macros",
     "agent/testkit",
-    "agent/tree",
     "node/host",
     "node/exec",
     "node/light",
@@ -25,6 +24,8 @@ members = [
     "pvm/program",
     "pvm/codec",
     "pvm/codec-derive",
+    "pvm/tree",
+    "pvm/abi",
     "pvm/proof",
     "pvm/proof/precompiles",
     "pvm/proof/poseidon2",
@@ -53,7 +54,6 @@ default-members = [
     "agent/sdk",
     "agent/sdk-macros",
     "agent/testkit",
-    "agent/tree",
     "node/host",
     "node/exec",
     "node/light",
@@ -72,6 +72,8 @@ default-members = [
     "pvm/program",
     "pvm/codec",
     "pvm/codec-derive",
+    "pvm/tree",
+    "pvm/abi",
     "pvm/proof",
     "pvm/proof/precompiles",
     "pvm/proof/poseidon2",
@@ -90,6 +92,7 @@ default-members = [
 exclude = [
     # Built with `cargo fuzz` (nightly flags, panic = abort).
     "pvm/proof/fuzz",
+    "node/fuzz",
     "pvm/bench/guests",
     "agent/test-actors",
     # The agent's guest programs (`programs.toml`), whose crates name it
@@ -277,7 +280,8 @@ vos-pvm-program = { path = "pvm/program" }
 vos-pvm-codec = { path = "pvm/codec", default-features = false }
 vos-pvm-codec-derive = { path = "pvm/codec-derive" }
 vos-wire = { path = "agent/wire" }
-vos-tree = { path = "agent/tree" }
+vos-abi = { path = "pvm/abi" }
+vos-tree = { path = "pvm/tree" }
 vos-exec = { path = "node/exec" }
 vos-net = { path = "node/net" }
 vos-api = { path = "node/api" }

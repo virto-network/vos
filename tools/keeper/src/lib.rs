@@ -23,13 +23,13 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use vos_abi::abi::Failure;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, derive_id};
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode};
 use vos_node::client::{Client, Operator};
-use vos_wire::abi::Failure;
 use vos_wire::homes::{AgentsPage, Counts, HomesError, PAGE};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, derive_id};
 use vos_wire::ingress::{Install, Response};
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode};
 
 /// The role byte `Personal`'s install names `homes` by.
 pub const HOMES_ROLE: u8 = 1;

@@ -7,10 +7,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use vos_abi::{Decode, Encode};
 use vos_api::client::Answer;
 use vos_api::{FRAME_ERROR, FrameError, Kind, Mark};
 use vos_wire::ingress::{Contact, OperatorRefusal, Rejection, Response};
-use vos_wire::{Decode, Encode};
 
 use crate::upstream::Upstream;
 

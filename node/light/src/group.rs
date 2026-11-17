@@ -56,14 +56,14 @@ mod set;
 
 use std::collections::BTreeMap;
 
+use vos_abi::ids::InstanceId;
+use vos_abi::{Decode, Encode};
 use vos_mls::{Mls, Namespace};
-use vos_wire::ids::InstanceId;
 use vos_wire::ingress::CallMessage;
 use vos_wire::personal::{
     AdminClass, Attached, DeviceId, DeviceView, Effect, KitEntry, NewDevice, Op, Policy, Scope,
     Signer, Status, Vote, welcome_hash,
 };
-use vos_wire::{Decode, Encode};
 use zeroize::Zeroize;
 
 use crate::kit::{KitKey, Split};

@@ -6,18 +6,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use vos_abi::abi::Refusal;
+use vos_abi::ids::AgentId;
+use vos_abi::{Encode, SpaceId, WindowClock, keys};
 use vos_checker::calls::done;
 use vos_checker::hooks::carries;
 use vos_checker::programs::actor;
 use vos_node::peer::Refusal as PeerRefusal;
 use vos_node::store::EntryKind;
 use vos_node::{CallError, Hooks, Node, Reply, Space};
-use vos_wire::abi::Refusal;
 use vos_wire::batch::Batch;
-use vos_wire::ids::AgentId;
 use vos_wire::ingress::{Call, Contact, NodeId, Response};
 use vos_wire::peer::{NodeNumber, PeerMessage};
-use vos_wire::{Encode, SpaceId, WindowClock, keys};
 
 use crate::common::{COUNTER, Cluster, WithholdBlobs, retired, wait_until};
 

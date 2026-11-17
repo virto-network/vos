@@ -74,9 +74,9 @@ fn every_route_through_the_gateway_answers_as_pinned() {
     use ed25519_dalek::Signer;
     workflow.signature = key.sign(&workflow.message(&identity)).to_bytes();
     let workflow = workflow.encode();
-    let oversize = vec![0u8; vos_wire::abi::cap::REQUEST + vos_api::ENVELOPE + 1];
+    let oversize = vec![0u8; vos_abi::abi::cap::REQUEST + vos_api::ENVELOPE + 1];
     let grant = vos_wire::ingress::Grant {
-        principal: vos_wire::ids::Principal::Client([9; 32]),
+        principal: vos_abi::ids::Principal::Client([9; 32]),
         role: Some(1),
     }
     .encode();
@@ -143,8 +143,8 @@ fn every_route_through_the_gateway_answers_as_pinned() {
     // A credentialed call in shape, its proof not one: the node refuses it
     // by its own checks (a node of no space), the gateway checking none.
     let credentialed = vos_wire::ingress::Credentialed {
-        instance: vos_wire::ids::InstanceId(1),
-        method: vos_wire::ids::MethodId(2),
+        instance: vos_abi::ids::InstanceId(1),
+        method: vos_abi::ids::MethodId(2),
         arguments: vec![3],
         nonce: [4; 16],
         expires_ms: served.now() + 60_000,
@@ -642,7 +642,7 @@ fn every_route_through_the_gateway_answers_as_pinned() {
                 assert_eq!(info.record.agent, served.agent, "{name}");
             }
             Pin::Schema => {
-                let schema = vos_wire::schema::Schema::decode_exact(&body).expect(name);
+                let schema = vos_abi::schema::Schema::decode_exact(&body).expect(name);
                 assert_eq!(schema.method_id("increment"), Some(served.increment));
             }
             Pin::Done => assert!(

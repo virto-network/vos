@@ -4,10 +4,10 @@ use alloc::vec::Vec;
 use scale::{Decode, Encode};
 
 use crate::abi::{AttestError, Failure, Refusal, cap};
-use crate::batch::{Answer, Await, Body};
 use crate::ids::{
     AgentId, InstanceId, MapId, ProgramHash, RequestId, SessionId, SessionRef, WorkflowId,
 };
+use crate::message::{Answer, Await, Body};
 use crate::vos_anchor::RootRead;
 
 /// What one refine produced. Steps are in dispatch order; accumulate applies
@@ -287,32 +287,32 @@ pub enum InputRef {
     /// goes or moves with the step.
     #[codec(index = 4)]
     Due { workflow: WorkflowId },
-    /// A read at a window's cut served ([`crate::batch::Input::Resume`]):
+    /// A read at a window's cut served (`vos_wire::batch::Input::Resume`):
     /// the step of the workflow awaiting it, if it still does.
     #[codec(index = 5)]
     Resume { request: RequestId },
     /// The agent's report of its root at window `window`'s cut
-    /// ([`crate::batch::Input::Report`]).
+    /// (`vos_wire::batch::Input::Report`).
     #[codec(index = 6)]
     Report { window: u64 },
     /// The representative's close of window `window`
-    /// ([`crate::batch::Input::Close`]).
+    /// (`vos_wire::batch::Input::Close`).
     #[codec(index = 7)]
     Close { window: u64 },
     /// A statement of the agent's at window `window`'s cut proved, of the
     /// attest whose record's digest is `attested`
-    /// ([`crate::batch::Input::Proven`]).
+    /// (`vos_wire::batch::Input::Proven`).
     #[codec(index = 8)]
     Proven {
         window: u64,
         id: [u8; 32],
         attested: [u8; 32],
     },
-    /// A credentialed call ([`crate::batch::Input::Credentialed`]), by its
+    /// A credentialed call (`vos_wire::batch::Input::Credentialed`), by its
     /// binding digest.
     #[codec(index = 9)]
     Credentialed { binding: [u8; 32] },
-    /// A merge on a device ([`crate::batch::Merge`]).
+    /// A merge on a device (`vos_wire::batch::Merge`).
     #[codec(index = 10)]
     Merge,
 }

@@ -15,17 +15,17 @@ mod workflows;
 
 use std::collections::BTreeMap;
 
-use vos_wire::abi::cap::{Limits, Refused, Target};
-use vos_wire::abi::{Failure, Kind};
-use vos_wire::batch::{Await, Body};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, WorkflowId};
-use vos_wire::keys;
-use vos_wire::records::versioned;
-use vos_wire::result::{
+use vos_abi::abi::cap::{Limits, Refused, Target};
+use vos_abi::abi::{Failure, Kind};
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, WorkflowId};
+use vos_abi::keys;
+use vos_abi::message::{Await, Body};
+use vos_abi::records::versioned;
+use vos_abi::result::{
     Attest, CommittedWrite, InstanceGas, KernelReturn, Outcome, Outgoing, Page, Write,
 };
-use vos_wire::schema::{Schema, SchemaError};
-use vos_wire::{Decode, SpaceId, WindowClock};
+use vos_abi::schema::{Schema, SchemaError};
+use vos_abi::{Decode, SpaceId, WindowClock};
 
 use invocation::{Call, Invocation};
 
@@ -287,7 +287,7 @@ impl Model {
         }
         let layout = parsed.layout(&[]).ok_or(InstallError::NotAProgram)?;
         let pages =
-            (layout.rw.size + layout.stack.size) / vos_wire::result::PAGE as u64 + u64::from(heap);
+            (layout.rw.size + layout.stack.size) / vos_abi::result::PAGE as u64 + u64::from(heap);
         statics_within(program, pages, &schema, kernels.len(), target.limits())
             .map_err(InstallError::Refused)?;
         self.target = Some(target);
@@ -479,7 +479,7 @@ impl Model {
                 rep_salt,
                 space_path,
             } => {
-                let row = vos_wire::served::ClosedRow {
+                let row = vos_abi::served::ClosedRow {
                     rep_root: *rep_root,
                     rep_salt: *rep_salt,
                     space_path: space_path.clone(),
@@ -561,7 +561,7 @@ fn statics_within(
     // A device kernel's gas bounds a device's run, which no node makes.
     for method in &schema.methods {
         if method.kind.is_attestable()
-            && method.kind != vos_wire::abi::Kind::Device
+            && method.kind != vos_abi::abi::Kind::Device
             && let Some(gas) = method.gas.filter(|&gas| gas > most)
         {
             return Err(Refused::KernelGas {
@@ -618,7 +618,7 @@ pub struct KernelRan {
 /// attest runs it, or why it failed.
 pub fn run_kernel(program: &[u8], input: &[u8], gas: u64) -> Result<KernelRan, Failure> {
     let run =
-        memory::kernel(program, input, gas, vos_wire::abi::cap::REPLY).map_err(|(code, _)| code)?;
+        memory::kernel(program, input, gas, vos_abi::abi::cap::REPLY).map_err(|(code, _)| code)?;
     Ok(KernelRan {
         output: run.output,
         io_hash: run.io_hash,
@@ -635,7 +635,7 @@ pub fn run_device_kernel(program: &[u8], input: &[u8], gas: u64) -> Result<Kerne
         program,
         input,
         gas,
-        vos_wire::abi::cap::REPLY,
+        vos_abi::abi::cap::REPLY,
         vos_pvm::precompile::is_device_kernel_call,
     )
     .map_err(|(code, _)| code)?;
@@ -667,7 +667,7 @@ pub fn device_auth_input() -> (Vec<u8>, Vec<u8>) {
 /// 7,919·i`) at `slot`, the siblings at the levels `filled` nonzero and
 /// the rest the empty tree's: a path of its own shape.
 pub fn device_auth_arguments(seed: u32, slot: u32, filled: &[usize]) -> (Vec<u8>, Vec<u8>) {
-    use vos_wire::credentials::{DEPTH, EMPTY, Tag, compress, digest, leaf, root_of};
+    use vos_abi::credentials::{DEPTH, EMPTY, Tag, compress, digest, leaf, root_of};
     let secret: [u32; 8] = core::array::from_fn(|i| seed + 7_919 * i as u32);
     let mut siblings: [[u32; 8]; DEPTH] = core::array::from_fn(|level| EMPTY[level]);
     for (n, &level) in filled.iter().enumerate() {
@@ -716,7 +716,7 @@ pub fn device_sdk_auth_arguments(seed: u32, slot: u32, filled: &[usize]) -> (Vec
 /// claim's 64 bytes. The `sdk-device` test actor's `owner` and
 /// `owner_lean` both read it.
 pub fn device_owner_arguments(seed: u32) -> (Vec<u8>, Vec<u8>) {
-    use vos_wire::credentials::{Tag, compress, digest};
+    use vos_abi::credentials::{Tag, compress, digest};
     let secret: [u32; 8] = core::array::from_fn(|i| seed + 7_919 * i as u32);
     let owner = compress(&Tag::Owner.block(), &secret);
     let binding: [u32; 8] = core::array::from_fn(|i| 0x0b1b_0000 + i as u32);

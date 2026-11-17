@@ -39,6 +39,10 @@ use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
+use vos_abi::credentials::{Tag, Words};
+use vos_abi::ids::{AgentId, InstanceId, Principal};
+use vos_abi::result::{InputRef, Outcome, Step, WorkResult};
+use vos_abi::{Decode, Encode, SpaceId, WindowClock};
 use vos_api::{Event, FRAME_ERROR, Frame, FrameError, Framing, Kind as ApiKind, Reader};
 use vos_checker::Nodes;
 use vos_checker::calls::installed;
@@ -53,12 +57,12 @@ use vos_light::{
 use vos_node::client::{self, Client, Target};
 use vos_node::store::EntryKind;
 use vos_pvm_recair::masked::{MaskRng, drawn_in};
-use vos_wire::credentials::{self as tree, AuthClaim, Path, Siblings, Tag, Words};
-use vos_wire::ids::{AgentId, InstanceId, Principal};
 use vos_wire::ingress::{CredentialRefusal, Credentialed, Response};
 use vos_wire::peer::NodeNumber;
-use vos_wire::result::{InputRef, Outcome, Step, WorkResult};
-use vos_wire::{Decode, Encode, SpaceId, WindowClock};
+use vos_wire::{
+    credentials as tree,
+    credentials::{AuthClaim, Path, Siblings},
+};
 
 use crate::harness::{Cluster, NODES};
 
@@ -88,7 +92,7 @@ const CANARY: &str = "credential-carrier-canary";
 /// The member's secret source's output: high in entropy, so a carrier
 /// holding it is found.
 fn source_output() -> [u8; 32] {
-    vos_wire::vos_anchor::blake2b_256(&[b"the carrier audit's secret source"])
+    vos_abi::vos_anchor::blake2b_256(&[b"the carrier audit's secret source"])
 }
 
 /// One connection to a node's API socket, every byte each way kept: the
@@ -250,7 +254,7 @@ impl Founded {
             .call(
                 self.agent,
                 instance,
-                vos_wire::ids::MethodId(self.method(instance, name)),
+                vos_abi::ids::MethodId(self.method(instance, name)),
                 &arguments.encode(),
             )
             .unwrap();

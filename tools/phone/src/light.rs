@@ -21,11 +21,11 @@
 use std::path::Path;
 use std::time::Instant;
 
+use vos_abi::ids::{InstanceId, MethodId, Principal};
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode, keys};
 use vos_light::release::Package;
 use vos_light::{Config, Light};
-use vos_wire::ids::{InstanceId, MethodId, Principal};
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode, keys};
 
 /// The default agent's program, linked, and the notes actor's package, as
 /// the build script computed them; empty when it found no ELFs to build

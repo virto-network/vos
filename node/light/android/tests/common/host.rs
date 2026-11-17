@@ -12,19 +12,19 @@ use std::ops::Bound;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use ed25519_dalek::{Signer as _, SigningKey, Verifier as _};
+use vos_abi::abi::cap::Target;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, Session};
+use vos_abi::records::unstored;
+use vos_abi::result::{Outcome, Step, split_output};
+use vos_abi::{Decode, Encode, SpaceId, WindowClock, keys};
 use vos_exec::{Machines, ProgramStore, StateReader};
 use vos_light::release::Package;
 use vos_pvm::PvmBackend;
 use vos_pvm::pool::{MachinePool, OuterMachines};
-use vos_wire::abi::cap::Target;
 use vos_wire::apply::{Host as Applied, State, apply};
 use vos_wire::batch::{Admin, Batch, Input, Query, Request, Work};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
 use vos_wire::ingress::{self, Grant, QueryCall};
 use vos_wire::personal::Policy;
-use vos_wire::records::unstored;
-use vos_wire::result::{Outcome, Step, split_output};
-use vos_wire::{Decode, Encode, SpaceId, WindowClock, keys};
 
 pub const PERSONAL: InstanceId = InstanceId(5);
 const GAS: u64 = 4_000_000_000;

@@ -21,12 +21,12 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::ops::Range;
 
+use vos_abi::abi::Failure;
+use vos_abi::abi::cap::Limits;
+use vos_abi::ids::{ProgramHash, WorkflowId};
+use vos_abi::records::Workflow;
+use vos_abi::result::{PAGE, Page, PageSection, digest};
 use vos_pvm_program::{REGISTER_COUNT, StandardHeader};
-use vos_wire::abi::Failure;
-use vos_wire::abi::cap::Limits;
-use vos_wire::ids::{ProgramHash, WorkflowId};
-use vos_wire::records::Workflow;
-use vos_wire::result::{PAGE, Page, PageSection, digest};
 
 use super::base::Base;
 use crate::host::{historical_lookup_from, lost};

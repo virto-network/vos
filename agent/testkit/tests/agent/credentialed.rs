@@ -10,19 +10,18 @@
 //! persons, whose devices enroll and revoke each other by their owner
 //! proofs.
 
+use vos_abi::abi::cap::Target;
+use vos_abi::abi::{Failure, Refusal};
+use vos_abi::credentials::Digest;
+use vos_abi::ids::{InstanceId, Principal, Session};
+use vos_abi::keys::{self, Due};
+use vos_abi::result::{Outcome, Step};
+use vos_abi::{Decode, Encode, SpaceId, WindowClock};
 use vos_testkit::programs::{actor, actor_elf, method, program, program_elf};
-use vos_wire::abi::cap::Target;
-use vos_wire::abi::{Failure, Refusal};
 use vos_wire::batch::{Admin, CredentialedInput, Input, Request};
-use vos_wire::credentials::{
-    self, AuthClaim, CredentialError, Digest, OwnerClaim, Ring, RootEntry,
-};
+use vos_wire::credentials::{self, AuthClaim, CredentialError, OwnerClaim, Ring, RootEntry};
 use vos_wire::defaults::{self, BINDING_KEPT_MS, CREDENTIAL_HORIZON_MS, ROOT_GRACE_MS};
-use vos_wire::ids::{InstanceId, Principal, Session};
 use vos_wire::ingress::Grant;
-use vos_wire::keys::{self, Due};
-use vos_wire::result::{Outcome, Step};
-use vos_wire::{Decode, Encode, SpaceId, WindowClock};
 
 use crate::common::{AGENT, ALICE, BOB, Node, failed, ran, refused};
 
@@ -38,7 +37,7 @@ const START: u64 = 1_000_000;
 
 /// The owner digest of a secret, as an owner proof states it.
 fn owner(seed: u32) -> Digest {
-    credentials::digest(&[seed, 1, 2, 3, 4, 5, 6, 7])
+    vos_abi::credentials::digest(&[seed, 1, 2, 3, 4, 5, 6, 7])
 }
 
 /// A node holding the credential actor (a member enrolled), the ledger
@@ -932,7 +931,7 @@ fn a_batch_runs_at_most_its_credentialed_calls() {
 
 /// A device's member digest, apart from every [`owner`].
 fn member(seed: u32) -> Digest {
-    credentials::digest(&[seed, 11, 12, 13, 14, 15, 16, 17])
+    vos_abi::credentials::digest(&[seed, 11, 12, 13, 14, 15, 16, 17])
 }
 
 /// A person's devices enroll and revoke each other by their owner proofs

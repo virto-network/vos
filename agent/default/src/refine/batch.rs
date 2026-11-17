@@ -5,12 +5,14 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::ops::Range;
 
-use vos_wire::abi::Failure;
-use vos_wire::batch::{Batch, Body, Input, Message};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Session, WorkflowId};
-use vos_wire::records::{SessionMark, Workflow};
-use vos_wire::result::{InputRef, Outcome, ResultWriter, Run, Step};
-use vos_wire::{defaults, keys};
+use vos_abi::abi::Failure;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Session, WorkflowId};
+use vos_abi::keys;
+use vos_abi::message::Body;
+use vos_abi::records::{SessionMark, Workflow};
+use vos_abi::result::{InputRef, Outcome, ResultWriter, Run, Step};
+use vos_wire::batch::{Batch, Input, Message};
+use vos_wire::defaults;
 
 use super::Call;
 use super::admin::admin;

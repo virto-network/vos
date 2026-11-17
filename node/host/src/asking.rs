@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use smol::future::FutureExt;
-use vos_wire::ids::AgentId;
+use vos_abi::ids::AgentId;
 use vos_wire::peer::NodeNumber;
 
 use crate::group::State;

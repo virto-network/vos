@@ -25,10 +25,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable};
+use vos_abi::ids::{AgentId, InstanceId};
+use vos_abi::{Decode, Encode};
 use vos_exec::{ProgramStore, StateReader};
 use vos_wire::apply::State;
-use vos_wire::ids::{AgentId, InstanceId};
-use vos_wire::{Decode, Encode};
 
 use crate::group::Archive;
 

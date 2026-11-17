@@ -5,8 +5,8 @@
 //! queued.
 //! Refine keeps the first proof of an id alone.
 
+use vos_abi::keys;
 use vos_wire::batch::Input;
-use vos_wire::keys;
 
 use super::Leader;
 use crate::fault::Fault;

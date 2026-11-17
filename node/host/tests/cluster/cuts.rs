@@ -18,14 +18,14 @@ use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use vos_abi::keys;
+use vos_abi::result::Outcome;
+use vos_abi::vos_anchor::MAX_LENGTH_MS;
+use vos_abi::{Decode, Encode, WindowClock};
 use vos_checker::stays;
 use vos_node::roots::{self, CutProof, ReadRow};
 use vos_tree::{Blake2b, Hash};
 use vos_venue::VenueClient;
-use vos_wire::keys::{self};
-use vos_wire::result::Outcome;
-use vos_wire::vos_anchor::MAX_LENGTH_MS;
-use vos_wire::{Decode, Encode, WindowClock};
 
 use crate::common::{Cluster, compacting, log_start, wait_until};
 use crate::support::past_close;
@@ -426,10 +426,10 @@ fn a_read_at_a_cut_is_served_by_its_leader() {
     let node = cluster.node(leader);
     let mut ended = None;
     wait_until("the read is served and its workflow ends", || {
-        let record: Option<vos_wire::records::Workflow> =
+        let record: Option<vos_abi::records::Workflow> =
             vos_checker::applied(node.probes().store(), agent, &keys::workflow(id.workflow));
         ended = record.and_then(|record| match record.state {
-            vos_wire::records::WorkflowState::Ended(outcome) => Some(outcome),
+            vos_abi::records::WorkflowState::Ended(outcome) => Some(outcome),
             _ => None,
         });
         ended.is_some()
@@ -439,8 +439,8 @@ fn a_read_at_a_cut_is_served_by_its_leader() {
         .into_iter()
         .flat_map(|(_, result)| result.steps)
         .find_map(|step| match step {
-            vos_wire::result::Step::Ran(run)
-                if run.input == (vos_wire::result::InputRef::Resume { request: id }) =>
+            vos_abi::result::Step::Ran(run)
+                if run.input == (vos_abi::result::InputRef::Resume { request: id }) =>
             {
                 run.attests.into_iter().next()
             }
@@ -448,14 +448,14 @@ fn a_read_at_a_cut_is_served_by_its_leader() {
         })
         .expect("the read's attest");
     let rep_root = rep_root(&cluster, representative, 0);
-    let keys_read: Vec<u64> = vos_wire::Decode::decode(&attest.witness_input).unwrap().0;
+    let keys_read: Vec<u64> = vos_abi::Decode::decode(&attest.witness_input).unwrap().0;
     let mut public_args = (agent, READER).encode();
     public_args.extend(keys_read.encode());
-    let stated = vos_wire::vos_anchor::RootRead {
-        kind: vos_wire::vos_anchor::RootKind::Space,
+    let stated = vos_abi::vos_anchor::RootRead {
+        kind: vos_abi::vos_anchor::RootKind::Space,
         space: cluster.space.id(),
         window: 0,
-        root: vos_wire::vos_anchor::space_root(&cluster.space.id(), 0, &rep_root),
+        root: vos_abi::vos_anchor::space_root(&cluster.space.id(), 0, &rep_root),
     };
     assert_eq!(attest.window, Some(0));
     assert_eq!(attest.output, sum.encode());

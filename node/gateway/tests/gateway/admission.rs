@@ -5,8 +5,8 @@
 //! marked onion an unknown key is refused `UnknownKey`, and a key its door
 //! admitted runs.
 
+use vos_abi::ids::derive_id;
 use vos_checker::programs::package;
-use vos_wire::ids::derive_id;
 use vos_wire::ingress::AdmissionRefusal;
 
 use super::*;

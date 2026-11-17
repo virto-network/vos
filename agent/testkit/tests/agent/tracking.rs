@@ -3,11 +3,11 @@
 //! written, through the agent's own code, which a test guest (`tracker`)
 //! drives.
 
+use vos_abi::ids::ProgramHash;
+use vos_abi::{Decode, Encode, scale};
 use vos_pvm::PvmBackend;
 use vos_pvm_program::{CodeBlob, StandardProgram, build_standard_program};
 use vos_testkit::programs::actor;
-use vos_wire::ids::ProgramHash;
-use vos_wire::{Decode, Encode, scale};
 
 use crate::common::{Actors, Node};
 
@@ -381,7 +381,7 @@ fn the_witness_input_reads_short_then_ends() {
     let empty = agreed(&program, &witness_probe(&program, &[]));
     assert_eq!(
         empty.gas - report.gas,
-        vos_wire::abi::precompile::WITNESS_INPUT_BYTE * READER_INPUT.len() as u64
+        vos_abi::abi::precompile::WITNESS_INPUT_BYTE * READER_INPUT.len() as u64
     );
 }
 
@@ -414,7 +414,7 @@ fn a_kernel_refuses_an_input_past_its_arguments() {
     // bytes past them, which the method's decoding leaves.
     let values: Vec<u64> = (0..8_191).collect();
     let mut input = values.encode();
-    input.resize(vos_wire::abi::cap::REQUEST, 0);
+    input.resize(vos_abi::abi::cap::REQUEST, 0);
     let probe = |input: &[u8]| Probe {
         gas: 100_000_000,
         ..witness_probe(&checksum, input)

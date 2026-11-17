@@ -638,7 +638,7 @@ pub fn binding(binding: &[u8; 32]) -> Vec<u8> {
 
 /// Device format `format`'s retirement in this agent, its batch time:
 /// from then apply refuses a proof of it on every replica, and ingress at
-/// each ([`crate::batch::Admin::RetireFormat`]). Kept for good.
+/// each (`vos_wire::batch::Admin::RetireFormat`). Kept for good.
 pub fn format_retired(format: u32) -> Vec<u8> {
     key(&[&Row::FormatRetired.prefix(), &format.to_be_bytes()])
 }
@@ -756,7 +756,7 @@ impl DueIndex {
 /// lists in them: the batch time it is due at, then, for a session or a
 /// workflow, its kind and id, big-endian, so a scan meets the earliest
 /// first. A session's row is due once it may have expired
-/// ([`crate::expiry::due`]), and lies at or before that. A binding's row is
+/// (`vos_wire::expiry::due`), and lies at or before that. A binding's row is
 /// in its own index ([`DueIndex::Bindings`]): its time, then its 32 bytes.
 pub fn due(at: u64, entry: Due) -> Vec<u8> {
     let (kind, number) = match &entry {
@@ -968,7 +968,7 @@ pub fn batch_time() -> Vec<u8> {
 }
 
 /// A kept reply, by session and sequence; the window keeps the last
-/// [`crate::defaults::REPLY_WINDOW`].
+/// `vos_wire::defaults::REPLY_WINDOW`.
 pub fn reply(session: SessionId, sequence: u64) -> Vec<u8> {
     key(&[
         &Row::Reply.prefix(),

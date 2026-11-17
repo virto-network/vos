@@ -7,16 +7,16 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
+use vos_abi::ids::{AgentId, MethodId, Session};
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode, keys};
 use vos_api::Kind;
 use vos_checker::calls::{Total, install_at_leader, signed_query};
 use vos_checker::programs::{actor, method, package};
 use vos_checker::{ANSWERED, COUNTER, Nodes, wait_until};
 use vos_node::client::{Client, naming, send_within, signed_call};
-use vos_wire::ids::{AgentId, MethodId, Session};
 use vos_wire::ingress::{Call, Consistency, Rejection, Response};
 use vos_wire::peer::NodeNumber;
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode, keys};
 
 use crate::harness::{Cluster, NODES, query, session_mark};
 

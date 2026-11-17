@@ -18,7 +18,7 @@ vos-pvm-precompiles = { workspace = true }
 # transcript's header and the security accounting.
 vos-pvm-proof = { workspace = true }
 # A kernel's install record, which a leaf's program is computed from.
-vos-wire = { workspace = true }
+vos-abi = { workspace = true }
 stwo = { workspace = true, features = ["std", "prover", "parallel"] }
 stwo-constraint-framework = { workspace = true, features = ["std", "prover", "parallel"] }
 num-traits = "0.2"

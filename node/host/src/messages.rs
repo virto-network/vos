@@ -10,8 +10,8 @@
 
 use std::sync::atomic::Ordering;
 
+use vos_abi::ids::AgentId;
 use vos_wire::batch::Message;
-use vos_wire::ids::AgentId;
 use vos_wire::peer::{NodeNumber, PeerMessage};
 
 use crate::node::{CallError, Inner, Pending};

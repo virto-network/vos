@@ -5,10 +5,10 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
-use vos_wire::ids::AgentId;
-use vos_wire::records::{Installed, unstored};
-use vos_wire::result::{WorkResult, Write as StateWrite};
-use vos_wire::{Decode, keys};
+use vos_abi::ids::AgentId;
+use vos_abi::records::{Installed, unstored};
+use vos_abi::result::{WorkResult, Write as StateWrite};
+use vos_abi::{Decode, keys};
 
 use super::Shared;
 use crate::fault::{Fault, read};

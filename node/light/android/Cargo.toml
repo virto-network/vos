@@ -51,6 +51,7 @@ s4-credential-contract = { git = "https://codeberg.org/Virto/s4", rev = "084f598
 # proofs, the node-API requests and the path kept apart from proofs.
 vos-light = { path = "..", features = ["tor"] }
 vos-api = { path = "../../api" }
+vos-abi = { path = "../../../pvm/abi" }
 vos-wire = { path = "../../../agent/wire" }
 # The personal agent's calls, signed by the light node's sync key; the
 # personal space's state in the light node's encoding.

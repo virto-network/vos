@@ -219,7 +219,7 @@ fn a_pairing_slot_admits_its_key_for_its_slot_alone() {
     );
     assert!(
         home.node()
-            .get(&vos_wire::keys::admitted(PERSONAL, &[0x52; 32]))
+            .get(&vos_abi::keys::admitted(PERSONAL, &[0x52; 32]))
             .is_none()
     );
     // A slot left open expires in ten minutes.
@@ -237,7 +237,7 @@ fn a_pairing_slot_admits_its_key_for_its_slot_alone() {
     home.call::<Recorded>(sync(0), "alive", ()).unwrap();
     assert!(
         home.node()
-            .get(&vos_wire::keys::admitted(PERSONAL, &[0x62; 32]))
+            .get(&vos_abi::keys::admitted(PERSONAL, &[0x62; 32]))
             .is_none(),
         "its key admitted no more once a call settled it"
     );

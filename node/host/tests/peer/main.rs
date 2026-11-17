@@ -11,18 +11,18 @@ mod placements;
 mod wire;
 
 use proptest::prelude::*;
+use vos_abi::Encode;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, ProgramHash, Session};
+use vos_abi::result::Outcome;
 use vos_net::Class;
 use vos_node::peer::{self, Drops, Refusal, decode, from_wire, to_wire};
 use vos_raft::core::{Action, Core, Recovered, Write};
 use vos_raft::{AppendResult, Config, LogEntry, Message, Role};
-use vos_wire::Encode;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, ProgramHash, Session};
 use vos_wire::ingress::{Call, Response};
 use vos_wire::peer::{
     Configuration, CreationRecord, Leading, Manifest, NodeNumber, PeerMessage, Placement, Raft,
     SnapshotAck, SnapshotChunk,
 };
-use vos_wire::result::Outcome;
 
 const AGENT: AgentId = AgentId(7);
 
@@ -68,7 +68,7 @@ fn forward() -> PeerMessage {
 
 const SPACE: [NodeNumber; 4] = [1, 2, 3, 4];
 /// The space's id.
-const OURS: vos_wire::SpaceId = vos_wire::SpaceId([0xa1; 32]);
+const OURS: vos_abi::SpaceId = vos_abi::SpaceId([0xa1; 32]);
 
 /// A placement of `replicas`, the configuration before it `before`,
 /// announced at `term` and `index`, committed or not, and not joint.

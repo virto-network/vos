@@ -7,14 +7,14 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use vos_abi::Decode;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal};
+use vos_abi::records::unstored;
+use vos_abi::result::Outcome;
 use vos_raft::Role;
-use vos_wire::Decode;
 use vos_wire::batch::{Admin, Message, Request};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
 use vos_wire::ingress::{Grant, NodeId};
 use vos_wire::peer::{NodeNumber, Placement};
-use vos_wire::records::unstored;
-use vos_wire::result::Outcome;
 
 use super::{CallError, Error, Inner, Node, Pending, ReplaceError, Reply};
 use crate::lock;
@@ -31,7 +31,7 @@ impl Inner {
         let state = run.shared.state();
         let snapshot = self.store.snapshot();
         // No count is none held; one that does not read is no answer.
-        let sessions = match snapshot.get(agent, &vos_wire::keys::live_sessions()) {
+        let sessions = match snapshot.get(agent, &vos_abi::keys::live_sessions()) {
             Ok(None) => Some(0),
             Ok(Some(bytes)) => unstored(&bytes)
                 .and_then(|bytes| u64::decode(bytes).ok())
@@ -39,7 +39,7 @@ impl Inner {
             Err(_) => None,
         };
         let outbox = snapshot
-            .scan(agent, &vos_wire::keys::outbox_prefix(), None)
+            .scan(agent, &vos_abi::keys::outbox_prefix(), None)
             .try_fold(0u64, |count, row| row.map(|_| count + 1));
         let (Ok(rows), Ok(last), Some(sessions), Ok(outbox)) = (
             self.store.agent_rows(agent),
@@ -119,7 +119,7 @@ impl Node {
     /// key: only a founding node signs one.
     pub fn sign_registration(
         &self,
-        venue: &vos_wire::vos_anchor::VenueId,
+        venue: &vos_abi::vos_anchor::VenueId,
         controller: &[u8; 32],
     ) -> Option<([u8; 32], [u8; 64])> {
         use ed25519_dalek::Signer;
@@ -129,8 +129,8 @@ impl Node {
         if !genesis.nodes.iter().any(|(_, founder)| *founder == public) {
             return None;
         }
-        let space = vos_wire::vos_anchor::space_id(genesis);
-        let digest = vos_wire::vos_anchor::register_digest(venue, &space, controller);
+        let space = vos_abi::vos_anchor::space_id(genesis);
+        let digest = vos_abi::vos_anchor::register_digest(venue, &space, controller);
         Some((public, key.sign(&digest).to_bytes()))
     }
 

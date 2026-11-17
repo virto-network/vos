@@ -39,11 +39,11 @@ use std::task::{Context, Poll};
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use vos_abi::{Decode as _, Encode as _};
 use vos_light::route::{Clearnet, Purpose, Refused, Routes};
 use vos_light::tor::{BootstrapError, Circuit, Client, Config, Dial, Dialing, Registrar, Target};
 use vos_light::tor::{Hour, Tor, TorConfig};
 use vos_wire::credentials::Onion;
-use vos_wire::{Decode as _, Encode as _};
 
 use crate::enrollment::{create_private, write_private};
 

@@ -16,9 +16,9 @@ use crate::store::View;
 /// read: the agent reads it whole, and traps on a part.
 pub(crate) fn witness(view: &View, simulation: &Simulation) -> Result<StateWitness, Error> {
     let record = [
-        vos_wire::keys::target(),
-        vos_wire::keys::space(),
-        vos_wire::keys::clock(),
+        vos_abi::keys::target(),
+        vos_abi::keys::space(),
+        vos_abi::keys::clock(),
     ];
     let extra: &[Vec<u8>] = if record.iter().any(|key| simulation.reads.contains(key)) {
         &record

@@ -1,9 +1,9 @@
 //! What a node answers when a call, a replacement or its start fails.
 
-use vos_wire::abi::Refusal;
-use vos_wire::ids::AgentId;
+use vos_abi::abi::Refusal;
+use vos_abi::ids::AgentId;
+use vos_abi::result::Outcome;
 use vos_wire::ingress::{Contact, Unplaced};
-use vos_wire::result::Outcome;
 
 /// How the node answered a request or an admin command.
 #[derive(Clone, Debug, PartialEq, Eq)]

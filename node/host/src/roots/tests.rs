@@ -5,12 +5,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use vos_abi::Encode;
+use vos_abi::ids::{AgentId, InstanceId, MapId};
+use vos_abi::keys::{self, Transform};
+use vos_abi::records::{stored, versioned};
+use vos_abi::result::Write;
 use vos_tree::{Blake2b, Leaf, NodeStore, empty_root, node_at, value_hash};
-use vos_wire::Encode;
-use vos_wire::ids::{AgentId, InstanceId, MapId};
-use vos_wire::keys::{self, Transform};
-use vos_wire::records::{stored, versioned};
-use vos_wire::result::Write;
 
 use super::{Build, Error, agent_root, prove, root, rows_match_tree};
 use crate::NoHooks;
@@ -469,7 +469,7 @@ fn roots_are_nodes_of_jams_tree() {
                     // escaped past one block, and a key beside its own
                     // extension, which the escape keeps prefix-free.
                     let raw = match random.below(16) {
-                        0 => vec![0; vos_wire::abi::cap::ORDERED_KEY],
+                        0 => vec![0; vos_abi::abi::cap::ORDERED_KEY],
                         1 => vec![1],
                         2 => vec![1, 0],
                         _ => key(random.below(64)),

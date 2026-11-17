@@ -1,13 +1,14 @@
 //! A workflow's read at a window's cut: its request recorded, then the
 //! served rows checked and its kernel run on them.
 
+use vos_abi::abi::{AttestError, Failure, Kind, cap, price};
+use vos_abi::ids::{InstanceId, MethodId, ProgramHash, RequestId};
+use vos_abi::records::{PendingRead, WorkflowState};
+use vos_abi::result::{Attest, Attested};
+use vos_abi::served::Served;
+use vos_abi::{Decode, Encode, SpaceId, keys};
 use vos_pvm::refine::Machine;
-use vos_wire::abi::{AttestError, Failure, Kind, cap, price};
-use vos_wire::ids::{InstanceId, MethodId, ProgramHash, RequestId};
-use vos_wire::records::{PendingRead, WorkflowState};
-use vos_wire::result::{Attest, Attested};
-use vos_wire::served::Served;
-use vos_wire::{Decode, Encode, SpaceId, defaults, keys};
+use vos_wire::defaults;
 
 use super::Invocation;
 use crate::model::memory::{kernel, parts, read};
@@ -179,7 +180,7 @@ impl Invocation<'_> {
         let (asked, _) = PendingRead::decode(&asked).ok()?;
         let (served, used) = Served::decode(bytes).ok()?;
         let closed = self.read_state(&keys::closed(window)).ok()??;
-        let closed = vos_wire::served::ClosedRow::decode_exact(&closed)?;
+        let closed = vos_abi::served::ClosedRow::decode_exact(&closed)?;
         let holds = used == bytes.len()
             && self.kit.space.map(|(space, _)| space) == Some(served.space)
             && served.window == window

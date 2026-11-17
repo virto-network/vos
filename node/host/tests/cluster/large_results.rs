@@ -8,6 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use vos_abi::ids::AgentId;
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode};
 use vos_checker::calls::done;
 use vos_checker::hooks::Holds;
 use vos_net::Class;
@@ -15,10 +18,7 @@ use vos_node::blobs::Blobs;
 use vos_node::store::{BlobRef, EntryKind, Fjall, LARGE_RESULT};
 use vos_node::{CallError, Hooks, Node, Reply};
 use vos_wire::batch::Request;
-use vos_wire::ids::AgentId;
 use vos_wire::peer::NodeNumber;
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode};
 
 use crate::common::{Cluster, compacting, log_start, wait_until};
 

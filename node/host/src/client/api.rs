@@ -12,8 +12,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use vos_abi::Encode;
 use vos_api::{Framing, Kind, MAX_ANSWER, frame};
-use vos_wire::Encode;
 
 use super::target::Api as Way;
 use super::transport::Body;

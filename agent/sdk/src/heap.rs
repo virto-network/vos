@@ -3,7 +3,7 @@
 //! memory is reused. Blocks past the largest class go on one first-fit
 //! list. Fresh memory is bumped from the arena's start. In an actor's
 //! program (`ACTOR`) a handler or a kernel, whose program holds only the
-//! arena's first [`vos_wire::abi::INVOCATION_HEAP`] bytes, is given none
+//! arena's first [`vos_abi::abi::INVOCATION_HEAP`] bytes, is given none
 //! past them: its allocation fails there, and the invocation traps. A
 //! workflow, whose machine maps the whole arena, marks itself so
 //! ([`whole_arena`]) before it allocates. Pages a program never touches
@@ -21,7 +21,7 @@ const PAGE: usize = 4096;
 
 /// Whether the running invocation maps its actor's whole arena: a
 /// workflow's does, a handler's and a kernel's hold its first
-/// [`vos_wire::abi::INVOCATION_HEAP`] bytes.
+/// [`vos_abi::abi::INVOCATION_HEAP`] bytes.
 struct Whole(UnsafeCell<bool>);
 
 // SAFETY: a program runs on one thread.
@@ -74,7 +74,7 @@ impl<const ARENA: usize> Arena<ARENA> {
 
 /// A heap over an arena of `ARENA` bytes, its state apart from it. An
 /// actor program's (`ACTOR`) gives a handler or a kernel the arena's first
-/// [`vos_wire::abi::INVOCATION_HEAP`] bytes alone, a workflow marked
+/// [`vos_abi::abi::INVOCATION_HEAP`] bytes alone, a workflow marked
 /// ([`whole_arena`]) all of it; any other program's, all of it.
 pub struct Heap<const ARENA: usize, const ACTOR: bool = false> {
     arena: &'static Arena<ARENA>,
@@ -105,7 +105,7 @@ impl<const ARENA: usize, const ACTOR: bool> Heap<ARENA, ACTOR> {
     /// The arena bytes the running invocation may allocate.
     fn usable(&self) -> usize {
         if ACTOR && !whole() {
-            ARENA.min(vos_wire::abi::INVOCATION_HEAP)
+            ARENA.min(vos_abi::abi::INVOCATION_HEAP)
         } else {
             ARENA
         }
@@ -249,8 +249,8 @@ mod tests {
         static HEAP: Heap<{ 2 << 20 }, true> = Heap::new(&ARENA);
         static PROGRAM_ARENA: Arena<{ 2 << 20 }> = Arena::new();
         static PROGRAM: Heap<{ 2 << 20 }> = Heap::new(&PROGRAM_ARENA);
-        let past = Layout::from_size_align(vos_wire::abi::INVOCATION_HEAP + 1, 8).unwrap();
-        let within = Layout::from_size_align(vos_wire::abi::INVOCATION_HEAP, 8).unwrap();
+        let past = Layout::from_size_align(vos_abi::abi::INVOCATION_HEAP + 1, 8).unwrap();
+        let within = Layout::from_size_align(vos_abi::abi::INVOCATION_HEAP, 8).unwrap();
         // SAFETY: allocations of nonzero size.
         unsafe {
             assert!(!PROGRAM.alloc(past).is_null(), "a program's heap is whole");

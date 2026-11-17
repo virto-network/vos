@@ -26,6 +26,7 @@ disclosing = ["prove", "vos-pvm-recair/watch"]
 tracing = "0.1"
 # Every statement's venue: its anchors read, its statements submitted.
 vos-venue = { workspace = true }
+vos-abi = { workspace = true }
 vos-wire = { workspace = true }
 vos-pvm-proof = { workspace = true, optional = true }
 vos-pvm-recair = { workspace = true, optional = true, features = ["recursion"] }

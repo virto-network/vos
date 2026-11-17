@@ -556,8 +556,8 @@ fn the_caps_hold() {
 /// pauses.
 #[test]
 fn a_workflow_on_jam_holds_its_pages_to_jam_limits() {
-    use vos_wire::abi::cap::JAM;
-    use vos_wire::result::PAGE;
+    use vos_abi::abi::cap::JAM;
+    use vos_abi::result::PAGE;
     let cap = Outcome::failed(Failure::Cap);
     let paused = Outcome::Done(vec![]);
     let half = (JAM.held_pages * PAGE * 3 / 4) as u32;
@@ -596,7 +596,7 @@ fn a_workflow_on_jam_holds_its_pages_to_jam_limits() {
 /// resumes.
 #[test]
 fn a_jam_workflow_past_its_pages_keep_expires() {
-    use vos_wire::abi::cap::JAM;
+    use vos_abi::abi::cap::JAM;
     let kept = JAM.pages_kept.expect("JAM keeps pages for a time");
     for target in [Target::Vos, Target::Jam] {
         for node in [Node::new(), Node::jam(true)] {
@@ -660,7 +660,7 @@ fn a_workflow_maps_the_heap_its_program_leaves_out() {
 }
 
 /// The bytes of a page.
-const PAGE_U64: u64 = vos_wire::result::PAGE as u64;
+const PAGE_U64: u64 = vos_abi::result::PAGE as u64;
 
 /// A workflow's machine counts toward the machines a step may hold, though
 /// it is on no call stack: its chain of nested calls fails one call shorter
@@ -880,7 +880,7 @@ fn lost_workflow_state_stops_the_refine() {
             let refined = flows.refine(1, vec![answer.clone()]);
             assert_eq!(
                 refined.exit,
-                vos_pvm::ExitReason::HostCall(vos_wire::abi::surface::LOST),
+                vos_pvm::ExitReason::HostCall(vos_abi::abi::surface::LOST),
                 "{key:?}"
             );
             flows.node.state.insert(row.clone(), held.clone());
@@ -904,7 +904,7 @@ fn a_lost_pinned_program_stops_the_refine() {
     let program = flows.program("shop");
     let blob = flows.node.forget(&program);
     let refined = flows.refine(1, vec![answer.clone()]);
-    let lost = vos_pvm::ExitReason::HostCall(vos_wire::abi::surface::LOST);
+    let lost = vos_pvm::ExitReason::HostCall(vos_abi::abi::surface::LOST);
     assert_eq!(refined.exit, lost, "a workflow's program");
     flows.node.add(&blob);
     let counter = flows.node.forget(&ProgramHash::of(&flows.actors.counter));

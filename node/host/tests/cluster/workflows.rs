@@ -7,16 +7,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use vos_abi::ids::{AgentId, InstanceId, MethodId, WorkflowId};
+use vos_abi::records::{Workflow, WorkflowState};
+use vos_abi::result::{InputRef, Outcome, Run, Step, WorkResult, Write};
+use vos_abi::{Decode, Encode, keys};
 use vos_checker::calls::{Ran, installed};
 use vos_checker::hooks::Holds;
 use vos_checker::programs::{derived, method, package};
 use vos_node::store::{EntryKind, PersistMode};
 use vos_node::{Node, Reply};
 use vos_pvm::pool::CodeHash;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, WorkflowId};
-use vos_wire::records::{Workflow, WorkflowState};
-use vos_wire::result::{InputRef, Outcome, Run, Step, WorkResult, Write};
-use vos_wire::{Decode, Encode, keys};
 
 use crate::common::{ALICE, Cluster, compacting, log_start, retired, wait_until};
 

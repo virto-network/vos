@@ -1,8 +1,8 @@
 //! A client's call, as a builder takes it.
 
 use ed25519_dalek::{Signature, VerifyingKey};
+use vos_abi::ids::Principal;
 use vos_wire::batch::{Input, Request};
-use vos_wire::ids::Principal;
 use vos_wire::ingress::Call;
 
 use crate::Error;
@@ -32,7 +32,7 @@ pub fn admit(service: u64, call: Call) -> Result<Input, Error> {
 #[cfg(test)]
 mod tests {
     use ed25519_dalek::{Signer, SigningKey};
-    use vos_wire::ids::{InstanceId, MethodId, Session};
+    use vos_abi::ids::{InstanceId, MethodId, Session};
 
     use super::*;
 

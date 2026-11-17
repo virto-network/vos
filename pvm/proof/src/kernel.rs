@@ -1,7 +1,7 @@
 //! A kernel's run re-traced for its proof, from what its attest recorded.
 //!
 //! An attest records its kernel's program and the bytes the kernel read
-//! through its witness input (`vos_wire::result::Attest::witness_input`).
+//! through its witness input (`vos_abi::result::Attest::witness_input`).
 //! The prover lays the kernel out as the agent does, with no arguments,
 //! serves its witness-input calls from those bytes and its BLAKE2b calls
 //! natively, and runs it to its halt. The layout's pages and their

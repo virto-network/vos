@@ -8331,6 +8331,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a02e4885ed3bc0f2de90ea6dd45ebcbb66dacffe03547fadbb0eeae2770887d"
 
 [[package]]
+name = "vos-abi"
+version = "0.1.0"
+dependencies = [
+ "vos-anchor",
+ "vos-pvm-codec",
+ "vos-pvm-precompiles",
+ "vos-pvm-program",
+ "vos-tree",
+]
+
+[[package]]
 name = "vos-anchor"
 version = "0.1.0"
 dependencies = [
@@ -8345,6 +8356,7 @@ dependencies = [
  "async-lock",
  "futures-lite",
  "quinn",
+ "vos-abi",
  "vos-pvm-codec",
  "vos-wire",
 ]
@@ -8365,6 +8377,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "vos-abi",
  "vos-api",
  "vos-gateway",
  "vos-kreivo",
@@ -8384,6 +8397,7 @@ dependencies = [
  "fjall",
  "hex",
  "tracing",
+ "vos-abi",
  "vos-pvm",
  "vos-wire",
 ]
@@ -8402,6 +8416,7 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "toml 0.9.12+spec-1.1.0",
+ "vos-abi",
  "vos-api",
  "vos-light",
  "vos-pvm-codec",
@@ -8439,6 +8454,7 @@ dependencies = [
  "tor-rtcompat",
  "tracing",
  "tracing-subscriber",
+ "vos-abi",
  "vos-api",
  "vos-http",
  "vos-net",
@@ -8463,6 +8479,7 @@ dependencies = [
  "toml 1.1.5+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
+ "vos-abi",
  "vos-api",
  "vos-checker",
  "vos-facility",
@@ -8489,6 +8506,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "vos-abi",
  "vos-api",
  "vos-net",
  "vos-wire",
@@ -8501,6 +8519,7 @@ dependencies = [
  "clap",
  "ed25519-dalek 2.2.0",
  "hex",
+ "vos-abi",
  "vos-node",
  "vos-wire",
 ]
@@ -8542,6 +8561,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tor-rtcompat",
+ "vos-abi",
  "vos-api",
  "vos-exec",
  "vos-mls",
@@ -8596,6 +8616,7 @@ dependencies = [
  "rustls-webpki",
  "smol",
  "tracing",
+ "vos-abi",
  "vos-api",
  "vos-exec",
  "vos-http",
@@ -8615,6 +8636,7 @@ name = "vos-node-prover"
 version = "0.1.0"
 dependencies = [
  "tracing",
+ "vos-abi",
  "vos-venue",
  "vos-wire",
 ]
@@ -8655,9 +8677,9 @@ dependencies = [
  "rustc-demangle",
  "thiserror 2.0.18",
  "tracing",
+ "vos-abi",
  "vos-pvm",
  "vos-pvm-program",
- "vos-wire",
 ]
 
 [[package]]
@@ -8669,13 +8691,13 @@ dependencies = [
  "postcard",
  "serde",
  "stwo",
+ "vos-abi",
  "vos-pvm-codec",
  "vos-pvm-final-verifier",
  "vos-pvm-precompiles",
  "vos-pvm-proof",
  "vos-pvm-recair",
  "vos-pvm-recair-air",
- "vos-wire",
 ]
 
 [[package]]
@@ -8716,6 +8738,7 @@ dependencies = [
  "serde",
  "stwo",
  "stwo-constraint-framework",
+ "vos-abi",
  "vos-pvm",
  "vos-pvm-final-verifier",
  "vos-pvm-poseidon2",
@@ -8723,7 +8746,6 @@ dependencies = [
  "vos-pvm-program",
  "vos-pvm-proof-derive",
  "vos-pvm-recair-air",
- "vos-wire",
 ]
 
 [[package]]
@@ -8752,12 +8774,12 @@ dependencies = [
  "serde",
  "stwo",
  "stwo-constraint-framework",
+ "vos-abi",
  "vos-pvm-final-verifier",
  "vos-pvm-poseidon2",
  "vos-pvm-precompiles",
  "vos-pvm-proof",
  "vos-pvm-recair-air",
- "vos-wire",
 ]
 
 [[package]]
@@ -8787,9 +8809,9 @@ name = "vos-statement-service"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek 2.2.0",
+ "vos-abi",
  "vos-pvm-program",
  "vos-statement",
- "vos-wire",
 ]
 
 [[package]]
@@ -8797,6 +8819,7 @@ name = "vos-testkit"
 version = "0.1.0"
 dependencies = [
  "blake2 0.10.6",
+ "vos-abi",
  "vos-pvm",
  "vos-pvm-compiler",
  "vos-tree",
@@ -8825,10 +8848,10 @@ dependencies = [
 name = "vos-wire"
 version = "0.1.0"
 dependencies = [
+ "vos-abi",
  "vos-anchor",
  "vos-pvm-codec",
  "vos-pvm-precompiles",
- "vos-pvm-program",
  "vos-tree",
 ]
 

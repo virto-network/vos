@@ -33,6 +33,7 @@ quinn = { version = "0.11.12", default-features = false, features = ["runtime-sm
 vos-gateway = { path = "../../node/gateway" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync"] }
 vos-pvm = { workspace = true }
+vos-abi = { workspace = true }
 vos-wire = { workspace = true }
 
 [dev-dependencies]

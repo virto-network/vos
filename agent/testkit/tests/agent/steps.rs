@@ -5,16 +5,17 @@
 use std::collections::BTreeMap;
 
 use proptest::prelude::*;
+use vos_abi::abi::{Failure, Refusal, Rows, cap, code};
+use vos_abi::ids::{AgentId, InstanceId, MethodId, WorkflowId};
+use vos_abi::keys::{self, Transform};
+use vos_abi::records::{Workflow, WorkflowState, unstored};
+use vos_abi::result::{InputRef, Outcome, WorkResult};
+use vos_abi::{Decode, Encode};
 use vos_pvm::ExitReason;
 use vos_testkit::model::{Model, decode};
 use vos_testkit::programs::{method, table_tag};
-use vos_wire::abi::{Failure, Refusal, Rows, cap, code};
 use vos_wire::batch::{Admin, Input};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, WorkflowId};
-use vos_wire::keys::{self, Transform};
-use vos_wire::records::{Workflow, WorkflowState, unstored};
-use vos_wire::result::{InputRef, Outcome, WorkResult};
-use vos_wire::{Decode, Encode, defaults};
+use vos_wire::defaults;
 
 mod kernels;
 mod scans;
@@ -265,7 +266,7 @@ fn a_refine_dispatches_only_what_its_budget_can_finish() {
         .map(|_| sessions.request(ALICE, COUNTER, increment, 1u64))
         .collect();
     let mut counts = Vec::new();
-    for budget in (0..60).map(|step| defaults::HANDLER_GAS + step * 1_000_000) {
+    for budget in (0..60).map(|step| vos_abi::defaults::HANDLER_GAS + step * 1_000_000) {
         let work = node.budgeted_work(1, [0; 32], budget, inputs.clone());
         let bytes = node.refine_with(&work, budget);
         assert_eq!(
@@ -344,7 +345,7 @@ fn a_step_whose_precompiles_overrun_the_budget_waits_or_fails() {
             + defaults::STEP_RESERVE
             + 50_000_000
             + defaults::FINISH_RESERVE
-            + calls * defaults::PRECOMPILE_SERVING
+            + calls * vos_abi::defaults::PRECOMPILE_SERVING
     };
     let refine = |inputs: &[Input], budget: u64| {
         let work = node.budgeted_work(1, [0; 32], budget, inputs.to_vec());
@@ -409,7 +410,7 @@ fn a_full_batch_of_small_steps_fits_the_default_budget() {
     println!(
         "256 increments take {taken} of {}: {} would fit",
         defaults::REFINE_GAS,
-        256 * (defaults::REFINE_GAS - defaults::HANDLER_GAS) / taken
+        256 * (defaults::REFINE_GAS - vos_abi::defaults::HANDLER_GAS) / taken
     );
     assert!(taken * 5 < defaults::REFINE_GAS, "{taken}");
 }

@@ -27,6 +27,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use vos_abi::ids::AgentId;
 use vos_checker::Random;
 use vos_checker::crash::{Round, Rounds, tear};
 use vos_node::NoHooks;
@@ -34,7 +35,6 @@ use vos_node::blobs::{Blobs, Horizons, Keep, blob_ref};
 use vos_node::raft::recovery_cut;
 use vos_node::storage::{Change, StorageThread};
 use vos_node::store::{Fjall, LogEntry};
-use vos_wire::ids::AgentId;
 
 const AGENT: AgentId = AgentId(1);
 /// Twelve rounds, the last six tearing a tail before reopening.

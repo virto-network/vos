@@ -17,14 +17,15 @@
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 
-use vos_wire::abi::{Failure, Refusal};
+use vos_abi::abi::{Failure, Refusal};
+use vos_abi::ids::{InstanceId, MethodId, Principal};
+use vos_abi::keys::{self, Due};
+use vos_abi::result::{InputRef, Outcome, Step, Write};
+use vos_abi::schema::CredentialGuard;
+use vos_abi::{Decode, Encode, SpaceId};
 use vos_wire::batch::CredentialedInput;
 use vos_wire::credentials::{self, AuthClaim, Ring};
-use vos_wire::ids::{InstanceId, MethodId, Principal};
-use vos_wire::keys::{self, Due};
-use vos_wire::result::{InputRef, Outcome, Step, Write};
-use vos_wire::schema::CredentialGuard;
-use vos_wire::{Decode, Encode, SpaceId, defaults};
+use vos_wire::defaults;
 
 use super::Call;
 use super::base::{Base, Corrupt};

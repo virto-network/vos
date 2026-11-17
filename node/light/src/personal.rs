@@ -51,11 +51,11 @@ use blake2::Blake2b;
 use blake2::digest::Digest as _;
 use blake2::digest::consts::U32;
 use merkle_crdt::Ingested;
-use vos_wire::ids::InstanceId;
+use vos_abi::ids::InstanceId;
+use vos_abi::{Decode, Encode};
 use vos_wire::personal::{
     DeviceId, Envelope, PersonalError, Pushed, RECOVERY, RecoveryView, Scope, Woken, envelope_id,
 };
-use vos_wire::{Decode, Encode};
 use zeroize::Zeroizing;
 
 use crate::group::{Alarm, Archive, DeviceGroup, GroupError};

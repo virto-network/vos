@@ -201,10 +201,10 @@ macro_rules! chips {
             pub const ALWAYS: u32 = ALL & !OPTIONAL;
         }
 
-        #[cfg(feature = "wire")]
+        #[cfg(feature = "abi")]
         const _: () = assert!(
-            chip_idx::COUNT == vos_wire::records::SEGMENT_CHIPS
-                $(&& chip_idx::$index == vos_wire::records::segment_chip::$index)*
+            chip_idx::COUNT == vos_abi::records::SEGMENT_CHIPS
+                $(&& chip_idx::$index == vos_abi::records::segment_chip::$index)*
         );
 
         const BASE_COMPONENTS: &[&DynChip] = &[$(&$chip),*];

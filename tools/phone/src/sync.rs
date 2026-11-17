@@ -20,15 +20,15 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Instant;
 
+use vos_abi::ids::{InstanceId, MethodId};
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode};
 use vos_light::personal::{Answer, Frontier, Link, SealedSync};
 use vos_light::release::Package;
 use vos_light::route::Route;
-use vos_wire::ids::{InstanceId, MethodId};
 use vos_wire::personal::{
     ANSWER_BYTES, Envelope, Header, MAX_ENVELOPE, PersonalError, Pushed, Scope, Woken, envelope_id,
 };
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode};
 
 use crate::group::{Device, household};
 use crate::light::{AGENT, NOTES};

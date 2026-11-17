@@ -10,14 +10,13 @@
 use std::collections::BTreeMap;
 
 use scale::{Decode, Encode};
+use vos_abi::credentials::{self, DEPTH, EMPTY, P, Words, compress, leaf};
+use vos_abi::ids::{AgentId, MethodId};
+use vos_abi::result::Outcome;
 use vos_light::{DeviceError, Digest, Synced, TreeKeeper, derive_secret, member, wire};
-use vos_wire::credentials::{
-    self, Change, DEPTH, EMPTY, Feed, P, RootEntry, Words, compress, leaf,
-};
-use vos_wire::ids::{AgentId, MethodId};
+use vos_wire::credentials::{Change, Feed, RootEntry};
 use vos_wire::ingress::QueryCall;
 use vos_wire::ingress::Response;
-use vos_wire::result::Outcome;
 
 /// A sparse tree rebuilt from its leaves at every read: the reference.
 #[derive(Clone, Default)]

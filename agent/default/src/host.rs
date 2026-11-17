@@ -3,8 +3,8 @@
 
 use alloc::vec::Vec;
 
-use vos_wire::Decode;
-use vos_wire::abi::{cap, code};
+use vos_abi::Decode;
+use vos_abi::abi::{cap, code};
 
 pub const GAS: u64 = 0;
 pub const FETCH: u64 = 2;
@@ -19,7 +19,7 @@ pub const PAGES: u64 = 12;
 pub const INVOKE: u64 = 13;
 pub const EXPUNGE: u64 = 14;
 pub const SOLICIT: u64 = 24;
-pub use vos_wire::abi::surface::{INSTANTIATE, LOST, STATE_READ, STATE_SCAN};
+pub use vos_abi::abi::surface::{INSTANTIATE, LOST, STATE_READ, STATE_SCAN};
 
 /// The calling service, for `read` and `historical_lookup`.
 pub const SELF_SERVICE: u64 = u64::MAX;

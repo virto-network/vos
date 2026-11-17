@@ -15,6 +15,7 @@ vos-pvm-compiler = { workspace = true }
 # The tree's longest key, which a read at a cut's rows are held to, and
 # the served rows' trees (`served`).
 vos-tree = { workspace = true }
+vos-abi = { workspace = true }
 vos-wire = { workspace = true }
 
 [dev-dependencies]

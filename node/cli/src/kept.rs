@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use vos_abi::ids::AgentId;
 use vos_node::client;
-use vos_wire::ids::AgentId;
 
 use crate::{at, key_bytes};
 

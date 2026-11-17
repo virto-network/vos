@@ -27,11 +27,6 @@ vos-statement = { path = "../statement", features = ["fixtures"] }
 # A space's genesis, anchors, migrations and golden vectors, as a venue
 # decodes them.
 vos-anchor = { path = "../anchor", features = ["vectors"] }
-# The node API's frame reader and operator envelope, as a node reads them.
-vos-api = { path = "../../../node/api" }
-vos-wire = { path = "../../../agent/wire" }
-# A proven call's claim's io-hash, as ingress computes it.
-vos-pvm-precompiles = { path = "../precompiles" }
 # The device verifier on the bytes ingress receives, under a small kernel's
 # program the assembler builds.
 vos-pvm-device = { path = "../device" }
@@ -89,23 +84,8 @@ path = "fuzz_targets/anchor_decode.rs"
 test = false
 doc = false
 
-[[bin]]
-name = "api_reader"
-path = "fuzz_targets/api_reader.rs"
-test = false
-doc = false
 
-[[bin]]
-name = "operated_decode"
-path = "fuzz_targets/operated_decode.rs"
-test = false
-doc = false
 
-[[bin]]
-name = "credentialed_decode"
-path = "fuzz_targets/credentialed_decode.rs"
-test = false
-doc = false
 
 [[bin]]
 name = "device_verify_bytes"

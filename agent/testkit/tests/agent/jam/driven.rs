@@ -111,8 +111,8 @@ fn the_builder_refuses_an_install_for_vos() {
 /// builder fails it `Target`, its detail JAM, and installs nothing.
 #[test]
 fn the_refine_refuses_an_install_for_vos() {
-    use vos_wire::abi::Failure;
-    use vos_wire::abi::cap::Refused;
+    use vos_abi::abi::Failure;
+    use vos_abi::abi::cap::Refused;
 
     let actors = Actors::load();
     let mut paired = Paired::new(PvmBackend::Default, &programs(&actors), POLKAJAM_REFINE_GAS);
@@ -272,7 +272,7 @@ fn a_workflow_at_its_page_cap_runs_to_its_end_at_the_builders_budget() {
     let start = paired.request(ALICE, SHOP, method(&shop, "fill"), (0u32, sizes));
     let mut time = T0 + 1_000;
     paired.batch(time, vec![start]);
-    assert_eq!(paired.record(0).gas, defaults::MAX_HANDLER_GAS);
+    assert_eq!(paired.record(0).gas, vos_abi::defaults::MAX_HANDLER_GAS);
     // Its steps until it holds every chunk, asleep before its last.
     let mut held = 0;
     while held < most - 16 {
@@ -409,7 +409,7 @@ fn a_jam_workflow_past_its_pages_keep_ends_without_them() {
         taken.prepared.package.imports.is_empty(),
         "no page imported"
     );
-    let expired = Outcome::failed(vos_wire::abi::Failure::Expired);
+    let expired = Outcome::failed(vos_abi::abi::Failure::Expired);
     let record = driven.builder.workflow(&ALICE, workflow).unwrap().unwrap();
     assert_eq!(record.state, WorkflowState::Ended(expired));
     assert!(record.snapshot.is_none(), "its pages dropped");

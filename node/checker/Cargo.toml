@@ -39,6 +39,7 @@ vos-node = { path = "../host", features = ["dump"] }
 # The carrier audit's tap on the frames between the nodes.
 vos-net = { workspace = true }
 vos-testkit = { path = "../../agent/testkit" }
+vos-abi = { workspace = true }
 vos-wire = { workspace = true }
 # The end-to-end suites through a gateway in front of the nodes' sockets.
 vos-gateway = { path = "../gateway" }

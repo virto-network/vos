@@ -2,13 +2,14 @@
 //! its outcome, a reply consumed in its pair's order, and a message the
 //! leader asserts failed in refine, each against the testkit.
 
+use vos_abi::Encode;
+use vos_abi::abi::{Failure, Refusal};
+use vos_abi::ids::{AgentId, InstanceId, MethodId, WorkflowId};
+use vos_abi::keys;
+use vos_abi::message::{Answer, Await, Body};
+use vos_abi::result::{Outcome, Outgoing, Step};
 use vos_testkit::model::{Model, Step as KitStep, decode};
-use vos_wire::Encode;
-use vos_wire::abi::{Failure, Refusal};
-use vos_wire::batch::{Answer, Await, Body, Input, Message};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, WorkflowId};
-use vos_wire::keys;
-use vos_wire::result::{Outcome, Outgoing, Step};
+use vos_wire::batch::{Input, Message};
 
 use crate::common::{ALICE, COUNTER, LEDGER, Node, failed, ran, refused, setup};
 

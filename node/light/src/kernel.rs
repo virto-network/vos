@@ -3,7 +3,7 @@
 //! computed from the kernel as a space's ingress computes it), and a run
 //! of it proved against that program.
 
-use vos_wire::ids::MethodId;
+use vos_abi::ids::MethodId;
 use vos_wire::ingress::DeviceWindow;
 
 use crate::release::Release;

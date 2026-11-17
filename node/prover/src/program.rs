@@ -2,8 +2,8 @@
 //! kernel: what `vos program-id <elf> <method>` prints, and the
 //! reproducibility gate recomputes on another architecture.
 
+use vos_abi::schema::Schema;
 use vos_pvm_proof::format::SEGMENT;
-use vos_wire::schema::Schema;
 
 /// The circuits' constants every statement's proof rests on, as the
 /// repository pins them (`vos_pvm_proof::constants`), computed here: by
@@ -63,7 +63,7 @@ pub enum ProgramIdError {
     /// The actor is not a standard program.
     NotStandard,
     /// The actor's schema does not read.
-    Schema(vos_wire::schema::SchemaError),
+    Schema(vos_abi::schema::SchemaError),
     /// The schema names no such method.
     NoMethod,
     /// The method is not attestable.

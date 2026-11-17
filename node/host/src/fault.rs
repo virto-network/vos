@@ -1,9 +1,9 @@
 //! Why a batch, an apply or a query produced nothing ([`vos_exec::Fault`]),
 //! and the applied state's reads that fail with it.
 
-use vos_wire::Decode;
-use vos_wire::ids::AgentId;
-use vos_wire::records::unstored;
+use vos_abi::Decode;
+use vos_abi::ids::AgentId;
+use vos_abi::records::unstored;
 
 use crate::executor::Panicked;
 use crate::store::Snapshot;

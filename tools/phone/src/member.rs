@@ -1,7 +1,7 @@
 //! The bench's member: fixed, public values its every cell proves with,
 //! which its outputs' audit (`tests/outputs.rs`) searches for.
 
-use vos_wire::credentials::{DEPTH, EMPTY, Words};
+use vos_abi::credentials::{DEPTH, EMPTY, Words};
 
 /// The space's handle and the secret source's output.
 pub const HANDLE: [u8; 32] = [0x48; 32];

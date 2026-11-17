@@ -6,6 +6,7 @@
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
+use vos_abi::result::Attest;
 use vos_jam_dev::JamVenue;
 use vos_jam_dev::live::{PolkaJam, Watch};
 use vos_kreivo::Transport;
@@ -16,7 +17,6 @@ use vos_node_prover::{Internals, Prover, StatementError};
 use vos_statement_service::state::Outcome;
 use vos_venue::vos_statement::{ProgramId, Statement};
 use vos_venue::{SubmitOutcome, VenueClient};
-use vos_wire::result::Attest;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -192,7 +192,7 @@ impl Wire {
     pub fn outcome(&self, jam: &JamVenue, payload: &[u8]) -> Option<Outcome> {
         self.sent().iter().find_map(|sent| {
             jam.statements
-                .outcome(&vos_wire::result::digest(&sent.package), payload)
+                .outcome(&vos_abi::result::digest(&sent.package), payload)
                 .ok()
                 .flatten()
         })

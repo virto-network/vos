@@ -8,10 +8,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use smol::Timer;
+use vos_abi::ids::AgentId;
+use vos_abi::{Decode, Encode};
 use vos_api::{FRAME_ERROR, FrameError, Kind, Mark};
-use vos_wire::ids::AgentId;
 use vos_wire::ingress::Response;
-use vos_wire::{Decode, Encode};
 
 /// How long a connection may take to open, its handshake included.
 const CONNECT: Duration = Duration::from_secs(10);

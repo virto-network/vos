@@ -6,10 +6,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use vos_abi::ids::AgentId;
 use vos_checker::calls::{Ran, done};
 use vos_checker::hooks::{FailNextSync, Gate};
 use vos_node::CallError;
-use vos_wire::ids::AgentId;
 use vos_wire::peer::NodeNumber;
 
 use crate::common::{COUNTER, Cluster, wait_until};

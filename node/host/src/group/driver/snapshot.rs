@@ -9,9 +9,9 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use smol::future::FutureExt;
+use vos_abi::Encode;
 use vos_net::Class;
 use vos_raft::{ActiveConfigRecord, Role};
-use vos_wire::Encode;
 use vos_wire::peer::{
     Configuration, Manifest, NodeNumber, PeerMessage, SnapshotAck, SnapshotChunk,
 };

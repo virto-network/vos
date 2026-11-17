@@ -4,10 +4,10 @@
 
 use std::collections::BTreeMap;
 
-use vos_wire::Decode;
-use vos_wire::abi::AttestError;
+use vos_abi::Decode;
+use vos_abi::abi::AttestError;
+use vos_abi::result::Outcome;
 use vos_wire::ingress::{Response, WorkflowStatus};
-use vos_wire::result::Outcome;
 
 use crate::drive::Plan;
 use crate::histogram::Histogram;
@@ -30,7 +30,7 @@ pub fn refusal(answer: &Result<Response, String>) -> String {
             ..
         } => {
             return match AttestError::decode(detail) {
-                Ok((error, _)) if *code == vos_wire::abi::Failure::Handler => {
+                Ok((error, _)) if *code == vos_abi::abi::Failure::Handler => {
                     format!("Failed({code:?}: {error:?})")
                 }
                 _ => format!("Failed({code:?})"),
@@ -247,10 +247,10 @@ pub fn mix_line(plan: &Plan, whole: &BTreeMap<&str, KindStats>) -> serde_json::V
 #[cfg(test)]
 mod tests {
     use super::{KindStats, refusal};
-    use vos_wire::Encode;
-    use vos_wire::abi::{AttestError, Failure, Refusal};
+    use vos_abi::Encode;
+    use vos_abi::abi::{AttestError, Failure, Refusal};
+    use vos_abi::result::Outcome;
     use vos_wire::ingress::{Rejection, Response, WorkflowStatus};
-    use vos_wire::result::Outcome;
 
     #[test]
     fn a_refusal_is_named_by_its_variant_and_the_inner_one() {

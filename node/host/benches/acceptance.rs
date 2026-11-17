@@ -22,17 +22,18 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, Session, WorkflowId};
+use vos_abi::message::{Answer, Await, Body};
+use vos_abi::records::{Workflow, WorkflowState};
+use vos_abi::result::Outcome;
+use vos_abi::{Encode, keys};
 use vos_checker::calls::{done, installed};
 use vos_checker::percentiles;
 use vos_checker::programs::{Programs, method};
 use vos_checker::rounds::{ROUNDS, Rounds, Tour};
 use vos_node::{Config, Hooks, Node, Reply};
-use vos_wire::batch::{Answer, Await, Batch, Body, Message, Request};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session, WorkflowId};
+use vos_wire::batch::{Batch, Message, Request};
 use vos_wire::ingress::Stats;
-use vos_wire::records::{Workflow, WorkflowState};
-use vos_wire::result::Outcome;
-use vos_wire::{Encode, keys};
 
 const COUNTER: InstanceId = InstanceId(1);
 const ALICE: Principal = Principal::Client([1; 32]);

@@ -215,7 +215,7 @@ pub fn forge_three_reg_result(
 /// each class's preprocessed root computed from its code alone.
 pub fn kernel_program(
     blob: &[u8],
-    record: &vos_wire::records::Kernel,
+    record: &vos_abi::records::Kernel,
     format: &'static vos_pvm_proof::format::Format,
 ) -> vos_pvm_proof::program_id::KernelProgram {
     let shape =

@@ -4,11 +4,11 @@
 use std::collections::{BTreeSet, HashMap};
 use std::time::Instant;
 
+use vos_abi::ids::AgentId;
+use vos_abi::keys;
+use vos_abi::records::unstored;
+use vos_abi::result::Outgoing;
 use vos_wire::batch::Message;
-use vos_wire::ids::AgentId;
-use vos_wire::keys;
-use vos_wire::records::unstored;
-use vos_wire::result::Outgoing;
 
 use super::Leader;
 use super::window::Window;
@@ -83,7 +83,7 @@ impl Leader {
                 continue;
             };
             let Some(outgoing) = unstored(&value).and_then(|bytes| {
-                <Outgoing as vos_wire::Decode>::decode(bytes)
+                <Outgoing as vos_abi::Decode>::decode(bytes)
                     .ok()
                     .map(|(outgoing, _)| outgoing)
             }) else {

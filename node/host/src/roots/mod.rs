@@ -35,11 +35,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use vos_abi::ids::{AgentId, MapId};
+use vos_abi::keys;
+use vos_abi::records::{unstored, unversioned};
+use vos_abi::{Decode, Encode, scale};
 use vos_tree::{BatchProof, Blake2b, Child, Hash, Leaf, Node, NodeStore, empty_root, node_at};
-use vos_wire::ids::{AgentId, MapId};
-use vos_wire::keys;
-use vos_wire::records::{unstored, unversioned};
-use vos_wire::{Decode, Encode, scale};
 
 use crate::store::Snapshot;
 

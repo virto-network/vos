@@ -2,7 +2,7 @@
 //! set in the candidate's entry, the votes and the verdicts, and the
 //! matured removals every commit carries.
 
-use vos_wire::abi::Failure;
+use vos_abi::abi::Failure;
 use vos_wire::personal::{
     Body, Candidacy, DeviceView, Effect, Entry, Overview, PersonalError, Policy, Recorded,
     Standing, Verdict, Void, Voted,
@@ -213,7 +213,7 @@ fn a_nack_a_second_h_or_the_window_voids_a_candidate() {
     );
     assert!(
         home.node()
-            .get(&vos_wire::keys::admitted(PERSONAL, &device(2).sync))
+            .get(&vos_abi::keys::admitted(PERSONAL, &device(2).sync))
             .is_none()
     );
     // A nack from the set.

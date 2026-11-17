@@ -1,0 +1,7 @@
+# cargo-fuzz artifacts
+target/
+corpus/
+artifacts/
+coverage/
+# Resolved afresh by each build.
+Cargo.lock

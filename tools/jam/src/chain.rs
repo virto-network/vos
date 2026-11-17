@@ -6,13 +6,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use vos_abi::Decode;
+use vos_abi::jam::{AccumulateInput, Operand};
 use vos_pvm::ExitReason;
 use vos_pvm::accumulate_host::{AccumulateContext, ServiceStorage};
 use vos_pvm::refine::MemoryModel;
 use vos_pvm::refine_host::RefineContext;
 use vos_tree::{Blake2b, Hash, Hasher};
-use vos_wire::Decode;
-use vos_wire::jam::{AccumulateInput, Operand};
 use vos_wire::package::{EXPORTS, Exports, JamOutput, ROOT, slot_of};
 
 use crate::Error;

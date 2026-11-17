@@ -9,12 +9,12 @@ use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::SigningKey;
+use vos_abi::ids::AgentId;
+use vos_abi::ids::ProgramHash;
 use vos_net::{Arrivals, Network};
 use vos_pvm::PvmBackend;
 use vos_pvm::pool::{CodeHash, MachinePool, OuterMachines};
 use vos_wire::defaults;
-use vos_wire::ids::AgentId;
-use vos_wire::ids::ProgramHash;
 use vos_wire::ingress::NodeId;
 use vos_wire::peer::{CreationRecord, NodeNumber, Placement};
 
@@ -102,8 +102,8 @@ impl Node {
         };
         let next = records
             .iter()
-            .filter(|record| CreationRecord::creator_of(record.agent) == number)
-            .map(|record| CreationRecord::serial_of(record.agent) + 1)
+            .filter(|record| record.agent.creator() == number)
+            .map(|record| record.agent.serial() + 1)
             .max()
             .unwrap_or(1);
         let settings = Settings::of(&config);

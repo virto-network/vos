@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use parity_scale_codec::Encode;
+use vos_abi::vos_anchor::{SpaceGenesis, SpaceId, VenueId, blake2b_256, space_id};
 use vos_kreivo::calls::{AccountId, BalancesCall, Call, MultiAddress, RuntimeCall};
 use vos_kreivo::mock::transport::MockChain;
 use vos_kreivo::mock::types::{Active, Handler, ProgramInfo};
@@ -17,7 +18,6 @@ use vos_kreivo::transport::{Outcome, Sent};
 use vos_kreivo::{KreivoVenue, Options, Sender, Transport};
 use vos_venue::vos_statement::ProgramId;
 use vos_wire::peer::NodeNumber;
-use vos_wire::vos_anchor::{SpaceGenesis, SpaceId, VenueId, blake2b_256, space_id};
 
 use crate::venues::Enveloped;
 

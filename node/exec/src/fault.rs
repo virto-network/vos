@@ -1,7 +1,7 @@
 //! Why a run of the agent program produced nothing.
 
+use vos_abi::Decode;
 use vos_pvm::ExitReason;
-use vos_wire::Decode;
 
 /// Why a batch, an apply, a query or a merge produced nothing.
 #[derive(Debug)]

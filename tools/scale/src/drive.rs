@@ -8,7 +8,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use vos_wire::ids::AgentId;
+use vos_abi::ids::AgentId;
 use vos_wire::ingress::Response;
 
 use crate::agents::{Agents, Placed};
@@ -207,7 +207,7 @@ pub fn drive(inventory: &Inventory, run: &Run, load: &Load) -> Result<(), String
     let window = (
         deployed.origin_ms,
         if deployed.origin_ms > 0 { length } else { 0 },
-        (length / 5).min(vos_wire::vos_anchor::MAX_REPRESENTATIVE_DELAY_MS),
+        (length / 5).min(vos_abi::vos_anchor::MAX_REPRESENTATIVE_DELAY_MS),
     );
     let mut drain_s = 0;
     for (index, host) in drivers.iter().enumerate() {

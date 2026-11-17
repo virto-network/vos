@@ -6,16 +6,18 @@
 
 use std::collections::BTreeMap;
 
+use vos_abi::Encode;
+use vos_abi::abi::cap::Target;
+use vos_abi::abi::{Failure, Op, cap, price};
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, WorkflowId};
+use vos_abi::keys::{self, Due};
+use vos_abi::message::{Answer, Await, Body};
+use vos_abi::records::{Workflow, WorkflowState, stored};
+use vos_abi::result::{InputRef, Outcome, Outgoing, Run, Step, WorkResult, split_output};
 use vos_testkit::model::{Model, decode};
 use vos_testkit::programs::{actor, method};
-use vos_wire::abi::cap::Target;
-use vos_wire::abi::{Failure, Op, cap, price};
-use vos_wire::batch::{Admin, Answer, Await, Body, Input, Message};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, WorkflowId};
-use vos_wire::keys::{self, Due};
-use vos_wire::records::{Workflow, WorkflowState, stored};
-use vos_wire::result::{InputRef, Outcome, Outgoing, Run, Step, WorkResult, split_output};
-use vos_wire::{Encode, defaults};
+use vos_wire::batch::{Admin, Input, Message};
+use vos_wire::defaults;
 
 use crate::common::{ALICE, Actors, COUNTER, LEDGER, Node, SHOP, Sessions, agrees, ran};
 
@@ -127,8 +129,8 @@ impl Flows {
             derivation: vos_testkit::programs::bare(self.node.add(shop)),
             roles: vec![],
             target,
-            space: vos_wire::SpaceId::NONE,
-            clock: vos_wire::WindowClock::DEFAULT,
+            space: vos_abi::SpaceId::NONE,
+            clock: vos_abi::WindowClock::DEFAULT,
         })
     }
 
@@ -150,8 +152,8 @@ impl Flows {
             derivation: derived.derivation(),
             roles: vec![],
             target: Target::Vos,
-            space: vos_wire::SpaceId::NONE,
-            clock: vos_wire::WindowClock::DEFAULT,
+            space: vos_abi::SpaceId::NONE,
+            clock: vos_abi::WindowClock::DEFAULT,
         })
     }
 

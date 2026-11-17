@@ -16,10 +16,10 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
+use vos_abi::ids::{AgentId, InstanceId, Principal, Session};
+use vos_abi::{Decode, Encode};
 use vos_api::Kind;
-use vos_wire::ids::{AgentId, InstanceId, Principal, Session};
 use vos_wire::ingress::{AgentInfo, Contact, Credentialed, DeviceWindow, NodeId, Response};
-use vos_wire::{Decode, Encode};
 
 use crate::lock;
 use crate::tls::Trust;

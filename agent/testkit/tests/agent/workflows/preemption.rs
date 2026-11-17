@@ -5,7 +5,7 @@
 //! cannot move fails instead.
 
 use super::*;
-use vos_wire::abi::{Op, precompile};
+use vos_abi::abi::{Op, precompile};
 
 /// What a step of workflow `id` keeps of the meter, its record's read
 /// included: a batch's budget past it is the step's room.
@@ -440,7 +440,7 @@ fn a_compression_whose_output_the_meter_cannot_pay_waits_unserved() {
                 .writes
                 .iter()
                 .find(|write| write.key == keys::workflow(WorkflowId(0)))
-                .and_then(|write| vos_wire::Decode::decode(write.value.as_ref()?).ok())
+                .and_then(|write| vos_abi::Decode::decode(write.value.as_ref()?).ok())
                 .and_then(|(record, _): (Workflow, _)| record.snapshot)
                 .and_then(|snapshot| snapshot.pending)
         };
@@ -486,7 +486,7 @@ fn a_call_whose_reply_the_meter_cannot_pay_waits_unserved() {
                 .writes
                 .iter()
                 .find(|write| write.key == keys::workflow(WorkflowId(0)))?;
-            vos_wire::Decode::decode(write.value.as_ref()?)
+            vos_abi::Decode::decode(write.value.as_ref()?)
                 .ok()
                 .map(|(record, _)| record)
         };

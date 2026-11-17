@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use smol::{LocalExecutor, Timer};
-use vos_wire::Encode;
+use vos_abi::Encode;
 use vos_wire::ingress::Response;
 use vos_wire::personal::{Envelope, Header, MAX_ENVELOPE, Pushed, Recorded, Scope};
 

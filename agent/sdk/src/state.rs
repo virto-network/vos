@@ -16,8 +16,8 @@ pub trait Marked {
     /// `#[actor(known_keys, onion_only)]`: what its agent's ingress asks of
     /// the requests it takes (`light-node.md` §3.3). An actor that asks
     /// known keys keeps them as the rows of its table `admitted`
-    /// ([`vos_wire::schema::ADMITTED`]).
-    const ADMISSION: vos_wire::schema::Admission;
+    /// ([`vos_abi::schema::ADMITTED`]).
+    const ADMISSION: vos_abi::schema::Admission;
 }
 
 /// The actor's struct, its handles unbound. `#[actor]` implements it, each
@@ -32,7 +32,7 @@ pub trait New {
 /// `<Actor>View`.
 pub trait View {
     /// The view over `served`, each map bound to its tag.
-    fn served(served: &'static vos_wire::served::Served) -> Self;
+    fn served(served: &'static vos_abi::served::Served) -> Self;
 }
 
 /// The instance's state: the actor's struct, each handle bound to its

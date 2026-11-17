@@ -1,11 +1,11 @@
 //! A statement's job in the prover's table: where its record is, the
 //! statement, and how far it has come.
 
+use vos_abi::ids::AgentId;
+use vos_abi::result::Attest;
+use vos_abi::vos_anchor::{MAX_ROOT_AGE_MS, WindowClock};
+use vos_abi::{Decode, Encode, scale};
 use vos_venue::vos_statement::Statement;
-use vos_wire::ids::AgentId;
-use vos_wire::result::Attest;
-use vos_wire::vos_anchor::{MAX_ROOT_AGE_MS, WindowClock};
-use vos_wire::{Decode, Encode, scale};
 
 /// Why a statement is refused for good: by the venue, with its code, or by
 /// the prover. A job's row holds its code, a `u32`, the prover's past every
@@ -63,7 +63,7 @@ impl Encode for Refusal {
 }
 
 impl Decode for Refusal {
-    fn decode(data: &[u8]) -> Result<(Self, usize), vos_wire::DecodeError> {
+    fn decode(data: &[u8]) -> Result<(Self, usize), vos_abi::DecodeError> {
         u32::decode(data).map(|(code, used)| (Self::of(code), used))
     }
 }
@@ -129,7 +129,7 @@ impl State {
 pub struct Job {
     pub agent: AgentId,
     /// The digest of the attest's record ([`Attest::digest`]), which names
-    /// it in its agent's state (`vos_wire::keys::attested`).
+    /// it in its agent's state (`vos_abi::keys::attested`).
     pub attested: [u8; 32],
     /// The window whose cut the attest read at.
     pub window: u64,

@@ -11,15 +11,15 @@ mod model;
 
 use std::collections::BTreeMap;
 
+use vos_abi::Encode;
+use vos_abi::ids::RequestId;
+use vos_abi::keys;
+use vos_abi::records::{PendingRead, stored_versioned};
+use vos_abi::result::Write;
 use vos_node::roots::{self, AgentStore};
 use vos_node::storage::Change;
 use vos_tree::BatchProof;
-use vos_wire::Encode;
 use vos_wire::defaults::MAX_CUTS;
-use vos_wire::ids::RequestId;
-use vos_wire::keys;
-use vos_wire::records::{PendingRead, stored_versioned};
-use vos_wire::result::Write;
 
 use model::{
     AGENT, CLOCK, Committed, Entry, History, MAPS, Replica, SPACE, check_proof, committed, cuts,
@@ -328,7 +328,7 @@ impl Jumps {
 /// root at any cut.
 #[test]
 fn an_agent_of_no_space_runs_no_cuts() {
-    for record in [Some(vos_wire::SpaceId::NONE), None] {
+    for record in [Some(vos_abi::SpaceId::NONE), None] {
         let dir = tempfile::tempdir().unwrap();
         let replica = Replica::open(dir.path());
         let mut history = History::default();
@@ -491,7 +491,7 @@ fn a_cut_built_already_is_finished_alone() {
     let (row, stored) = model::scan(&snapshot, &keys::committed_all())[0].clone();
     let cut = Write {
         key: keys::cut(5),
-        value: Some(vos_wire::records::stored(&10u64.encode())),
+        value: Some(vos_abi::records::stored(&10u64.encode())),
     };
     let twice = |value: u8| Write {
         key: row.clone(),
@@ -540,7 +540,7 @@ fn an_orphaned_undo_row_is_swept() {
 fn a_request_that_does_not_read_is_left_unproved() {
     let mut history = history(12);
     let bad = |workflow: u64| RequestId {
-        workflow: vos_wire::ids::WorkflowId(workflow),
+        workflow: vos_abi::ids::WorkflowId(workflow),
         awaits: 0,
     };
     let malformed = row(MAPS[0], &7u64.to_be_bytes())[..keys::COMMITTED_PREFIX].to_vec();

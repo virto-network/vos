@@ -12,13 +12,13 @@ use std::process::{Command, Stdio};
 use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest};
 use proptest::prelude::*;
+use vos_abi::Encode;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal};
+use vos_abi::result::Outcome;
+use vos_abi::schema::Schema;
 use vos_pvm_compiler::{DeriveError, INVOCATION_HEAP, derive, link_elf_spi};
 use vos_testkit::model::{Model, decode};
 use vos_testkit::programs::{actor_elf, derived, method, package};
-use vos_wire::Encode;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
-use vos_wire::result::Outcome;
-use vos_wire::schema::Schema;
 
 /// Every test actor's package, by name: those an install takes.
 const PACKAGES: [&str; 16] = [
@@ -122,7 +122,7 @@ fn the_actors_program_is_the_elf_linked() {
             .unwrap()
             .methods
             .iter()
-            .filter(|method| method.kind == vos_wire::abi::Kind::Attestable)
+            .filter(|method| method.kind == vos_abi::abi::Kind::Attestable)
             .map(|method| method.id.0)
             .collect();
         let mut kernels: Vec<u32> = derived.kernels.iter().map(|(id, _)| *id).collect();
@@ -259,7 +259,7 @@ fn a_kernel_making_a_host_call_is_refused() {
     let DeriveError::HostCall { id, chain, .. } = &error else {
         panic!("{error}");
     };
-    assert_eq!(*id, vos_wire::abi::Op::Now.id());
+    assert_eq!(*id, vos_abi::abi::Op::Now.id());
     assert!(chain[0].ends_with("__vos_attest_stamp"), "{chain:?}");
     assert!(
         chain.iter().any(|name| name.contains("stamped")),
@@ -530,9 +530,9 @@ fn every_package_is_built() {
 /// alike, and a member it does not hold traps it.
 #[test]
 fn a_device_kernel_states_its_parts_under_the_poseidon2_io_hash() {
+    use vos_abi::abi::{Failure, Kind};
+    use vos_abi::result::KernelReturn;
     use vos_testkit::model::{device_auth_input, device_parts, run_device_kernel, run_kernel};
-    use vos_wire::abi::{Failure, Kind};
-    use vos_wire::result::KernelReturn;
     const GAS: u64 = 50_000_000;
     let derived = derived("device");
     let schema = Schema::read(&derived.schema).unwrap();

@@ -25,5 +25,6 @@ lz4_flex = { version = "0.13", default-features = false, features = ["checked-de
 vos-pvm-program = { path = "../../pvm/program" }
 vos-pvm-precompiles = { path = "../../pvm/proof/precompiles" }
 vos-sdk = { path = "../sdk" }
-vos-tree = { path = "../tree" }
+vos-tree = { path = "../../pvm/tree" }
+vos-abi = { path = "../../pvm/abi" }
 vos-wire = { path = "../wire" }

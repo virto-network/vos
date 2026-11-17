@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use vos_wire::ids::{InstanceId, SessionId};
-use vos_wire::keys;
-use vos_wire::result::Write;
+use vos_abi::ids::{InstanceId, SessionId};
+use vos_abi::keys;
+use vos_abi::result::Write;
 
 use super::*;
 

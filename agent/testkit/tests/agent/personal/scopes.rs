@@ -3,11 +3,11 @@
 //! the quotas, their exemptions and each device's share; and what a push
 //! and a read cost.
 
+use vos_abi::result::Outcome;
 use vos_wire::personal::{
     Acknowledged, Candidacy, Envelope, MAX_ENVELOPE, PersonalError, Policy, Pushed, RECOVERY,
     Recorded, envelope_id,
 };
-use vos_wire::result::Outcome;
 
 use super::*;
 
@@ -248,8 +248,8 @@ fn a_push_and_its_read_cost() {
         );
         assert!(written - len < 1024, "a push's rows beyond its bytes");
         // Within a handler's default gas, a read's and a push's alike.
-        assert!(run.gas_used < vos_wire::defaults::HANDLER_GAS);
-        assert!(since.gas_used < vos_wire::defaults::HANDLER_GAS);
+        assert!(run.gas_used < vos_abi::defaults::HANDLER_GAS);
+        assert!(since.gas_used < vos_abi::defaults::HANDLER_GAS);
     }
 }
 

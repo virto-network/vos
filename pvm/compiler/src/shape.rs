@@ -1,5 +1,5 @@
 //! A kernel's shape: the chips of the segment AIR its code can reach, and
-//! the log size of each per class of segment ([`vos_wire::records::Shape`]).
+//! the log size of each per class of segment ([`vos_abi::records::Shape`]).
 //!
 //! - **The chips** come from the kernel's code alone, so a path a run does
 //!   not take (an error branch's division) is still covered: every
@@ -20,12 +20,12 @@
 //! (`vos_pvm_proof::chip_idx`, its CPU's opcode classes); the prover's
 //! tests hold this module to them, opcode by opcode and size by size.
 
+use vos_abi::records::{SEGMENT_CHIPS, SegmentClass, Shape};
 use vos_pvm::instruction::{Opcode, decode_opcode_fast};
 use vos_pvm::precompile::{BLAKE2B_COMPRESS, POSEIDON2, WITNESS_INPUT};
-use vos_wire::records::{SEGMENT_CHIPS, SegmentClass, Shape};
 
 /// The segment AIR's chips, in its order.
-pub use vos_wire::records::segment_chip as chip;
+pub use vos_abi::records::segment_chip as chip;
 
 /// The chips a code selects: the rest are in every shape.
 const SELECTED: u32 = 1 << chip::BLAKE2B
@@ -62,8 +62,8 @@ pub const CLASSES: [(u8, u16); 3] = [(12, 8), (15, 8), (12, 24)];
 /// ([`crate::leaf`]). A segment of more pages is cut again.
 pub const POSEIDON2_CLASSES: [(u8, u16); 3] = [(12, 8), (15, 8), (12, 17)];
 
-const _: () = assert!(CLASSES.len() <= vos_wire::records::MAX_CLASSES);
-const _: () = assert!(POSEIDON2_CLASSES.len() <= vos_wire::records::MAX_CLASSES);
+const _: () = assert!(CLASSES.len() <= vos_abi::records::MAX_CLASSES);
+const _: () = assert!(POSEIDON2_CLASSES.len() <= vos_abi::records::MAX_CLASSES);
 
 /// The rows of a SIMD lane, the least a chip has: 2^4.
 const LOG_LANES: u8 = 4;

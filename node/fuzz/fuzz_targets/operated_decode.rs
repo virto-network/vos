@@ -8,8 +8,8 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
+use vos_abi::{Decode, Encode};
 use vos_api::{Kind, Operated};
-use vos_wire::{Decode, Encode};
 
 fuzz_target!(|data: &[u8]| {
     let Some(operated) = Operated::decode_exact(data) else {

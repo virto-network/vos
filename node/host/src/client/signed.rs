@@ -4,8 +4,8 @@
 //! node.
 
 use ed25519_dalek::{Signer, SigningKey};
+use vos_abi::ids::{InstanceId, MethodId, Session, WorkflowId};
 use vos_api::{Kind, Operated};
-use vos_wire::ids::{InstanceId, MethodId, Session, WorkflowId};
 use vos_wire::ingress::{
     Call, Consistency, NodeId, QueryCall, WORKFLOW_READ_HORIZON_MS, WorkflowRead,
     workflow_read_horizon,

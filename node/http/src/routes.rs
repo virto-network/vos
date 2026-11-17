@@ -5,12 +5,12 @@
 //! the gateway's HTTP forms its requests by its inverse ([`path`]).
 
 use base64::Engine;
+use vos_abi::abi::Refusal;
+use vos_abi::{Decode, Encode};
 use vos_api::{CREDENTIALS, FRAME_ERROR, FrameError, Kind, Operated};
-use vos_wire::abi::Refusal;
 use vos_wire::ingress::{
     AdmissionRefusal, CredentialRefusal, OperatorRefusal, Rejection, Response as Answer,
 };
-use vos_wire::{Decode, Encode};
 
 use crate::request::{Request, Response};
 

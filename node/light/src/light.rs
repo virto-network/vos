@@ -32,18 +32,19 @@ use ed25519_dalek::SigningKey;
 use merkle_crdt::{
     Apply, Author, Event, FjallError, FjallStore, Ingested, Outgoing, Replica, Rows,
 };
+use vos_abi::abi::Failure;
+use vos_abi::abi::cap::Target;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal};
+use vos_abi::merge::{Cutoff, Origin};
+use vos_abi::records::{Installed, stored, unstored};
+use vos_abi::result::{Outcome, Run, Step, split_output};
+use vos_abi::{Decode, Encode, SpaceId, WindowClock, keys};
 use vos_exec::{Fault, Machines, ProgramStore, StateReader, decode, panic_message};
 use vos_pvm::PvmBackend;
 use vos_pvm::pool::{MachinePool, OuterMachines};
-use vos_wire::abi::Failure;
-use vos_wire::abi::cap::Target;
 use vos_wire::apply::{Host, apply};
 use vos_wire::batch::{Admin, Batch, Input, Merge, Query, Work};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
-use vos_wire::merge::{Cutoff, Origin};
-use vos_wire::records::{Installed, stored, unstored};
-use vos_wire::result::{Outcome, Run, Step, split_output};
-use vos_wire::{Decode, Encode, SpaceId, WindowClock, defaults, keys};
+use vos_wire::defaults;
 
 use crate::release::Package;
 use crate::store::{Applying, CACHE_BYTES, Operation, Snapshot, Store, StoreError};

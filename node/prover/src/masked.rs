@@ -11,16 +11,16 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use vos_abi::Decode;
+use vos_abi::ids::{MethodId, ProgramHash};
+use vos_abi::records::Kernel;
+use vos_abi::result::{Attest, KernelReturn};
 use vos_pvm_proof::SideNote;
 use vos_pvm_proof::format::SEGMENT;
 use vos_pvm_proof::kernel::{KernelTrace, trace_kernel};
 use vos_pvm_proof::program_id::{KernelEntry, KernelProgram};
 use vos_pvm_recair::tree::{Stats, TreeError};
 use vos_venue::vos_statement::ProgramId;
-use vos_wire::Decode;
-use vos_wire::ids::{MethodId, ProgramHash};
-use vos_wire::records::Kernel;
-use vos_wire::result::{Attest, KernelReturn};
 
 use crate::RERUN_GAS;
 #[cfg(feature = "disclosing")]

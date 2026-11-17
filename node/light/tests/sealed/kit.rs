@@ -726,7 +726,7 @@ fn read_voided(home: &mut Home, phone: &mut Phone, epoch: u64) -> bool {
 }
 
 /// A chunk of an archive, as sealed sync frames it.
-#[derive(vos_wire::Decode)]
+#[derive(vos_abi::Decode)]
 struct Chunk {
     _digest: [u8; 32],
     part: u16,

@@ -43,10 +43,10 @@ pub use model::{ANSWERED, ATTEMPT, COUNTER, INBOX, Log, Methods, Mode, Nodes, SE
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+use vos_abi::ids::AgentId;
+use vos_abi::records::unstored;
+use vos_abi::{Decode, keys};
 use vos_node::store::{Fjall, Snapshot};
-use vos_wire::ids::AgentId;
-use vos_wire::records::unstored;
-use vos_wire::{Decode, keys};
 
 /// A small seeded generator, so a failing run can be run again.
 pub struct Random(pub u64);

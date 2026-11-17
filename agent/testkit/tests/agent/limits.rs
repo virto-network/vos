@@ -3,15 +3,15 @@
 //! statics pass them, or which names another target than its agent's, is
 //! refused.
 
+use vos_abi::abi::cap::{JAM, Refused, Target, VOS};
+use vos_abi::abi::{Failure, INVOCATION_HEAP};
+use vos_abi::ids::{InstanceId, MethodId, ProgramHash, WorkflowId};
+use vos_abi::records::{Derivation, Workflow, WorkflowState};
+use vos_abi::result::Outcome;
+use vos_abi::{Encode, SpaceId, WindowClock, keys};
 use vos_testkit::model::{InstallError, Model};
 use vos_testkit::programs::{actor, derived, method, package};
-use vos_wire::abi::cap::{JAM, Refused, Target, VOS};
-use vos_wire::abi::{Failure, INVOCATION_HEAP};
 use vos_wire::batch::{Admin, Input};
-use vos_wire::ids::{InstanceId, MethodId, ProgramHash, WorkflowId};
-use vos_wire::records::{Derivation, Workflow, WorkflowState};
-use vos_wire::result::Outcome;
-use vos_wire::{Encode, SpaceId, WindowClock, keys};
 
 use crate::common::{AGENT, ALICE, COUNTER, MINTER, Node, Sessions, ran};
 
@@ -28,8 +28,8 @@ fn install(instance: InstanceId, derivation: Derivation, target: Target) -> Inpu
         derivation,
         roles: vec![(b"minter".to_vec(), MINTER)],
         target,
-        space: vos_wire::SpaceId::NONE,
-        clock: vos_wire::WindowClock::DEFAULT,
+        space: vos_abi::SpaceId::NONE,
+        clock: vos_abi::WindowClock::DEFAULT,
     })
 }
 

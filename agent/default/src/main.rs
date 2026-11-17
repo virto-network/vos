@@ -17,7 +17,7 @@ use vos_agent::{host, machines};
 use vos_sdk::runtime::Output;
 
 // The heap holds a batch's overlays and its output, up to
-// `vos_wire::abi::cap::OUTPUT`.
+// `vos_abi::abi::cap::OUTPUT`.
 vos_sdk::program_runtime!(64 << 20);
 
 core::arch::global_asm!(

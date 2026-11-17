@@ -17,11 +17,11 @@ use cipher_clerk::conventions::PseudoAccount;
 use cipher_clerk::ids::JournalId;
 use cipher_clerk::kernel::Value;
 use cipher_clerk::types::{Account, Layer};
+use vos_abi::result::Attest;
+use vos_abi::served::Served;
+use vos_abi::{Encode, SpaceId};
 use vos_pvm_proof::kernel::KernelTrace;
 use vos_pvm_proof::segment::segment_bounds_budgeted;
-use vos_wire::result::Attest;
-use vos_wire::served::Served;
-use vos_wire::{Encode, SpaceId};
 
 use crate::cut::{
     self, AGENT, AGENTS, BUDGET_PATH_BYTES, BUDGET_PATH_COMPRESSIONS, BUDGET_ROW_BYTES,

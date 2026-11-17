@@ -4,8 +4,8 @@
 //! counts it.
 
 use ed25519_dalek::{Signature, VerifyingKey};
+use vos_abi::Decode;
 use vos_mls::{Expected, Kind};
-use vos_wire::Decode;
 use vos_wire::ingress::CallMessage;
 use vos_wire::personal::{
     Attached, Body, DeviceId, Effect, Entry, Op, OpState, Policy, Signer, Verdict, Void, Vote,

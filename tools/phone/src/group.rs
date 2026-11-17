@@ -17,9 +17,9 @@ use std::path::Path;
 use std::time::Instant;
 
 use ed25519_dalek::{Signer, SigningKey};
+use vos_abi::ids::{InstanceId, MethodId, Session};
 use vos_light::group::{Agent, DeviceGroup, Event, Prepared};
 use vos_light::{Config, Light};
-use vos_wire::ids::{InstanceId, MethodId, Session};
 use vos_wire::ingress::call_message;
 use vos_wire::personal::{
     AdminCall, AdminClass, Attestation, Body, DeviceId, Entry, NewDevice, chain,

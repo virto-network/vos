@@ -7,8 +7,8 @@ use std::ops::Bound;
 use std::sync::{Arc, Mutex};
 
 use fjall::Readable;
-use vos_wire::ids::AgentId;
-use vos_wire::result::Write;
+use vos_abi::ids::AgentId;
+use vos_abi::result::Write;
 
 use super::keys::{
     AGENT_KEY_PREFIX, NodeRow, agent_key, applied, decode_entry, decode_last_result,

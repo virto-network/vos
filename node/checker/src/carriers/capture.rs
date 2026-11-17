@@ -10,17 +10,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use vos_abi::ids::AgentId;
+use vos_abi::result::WorkResult;
+use vos_abi::vos_anchor::Anchor;
+use vos_abi::{Decode, Encode};
 use vos_net::memory::Hub;
 use vos_node::store::EntryKind;
 use vos_node::{Hooks, Node};
 use vos_statement_service::item::Item;
 use vos_venue::vos_statement::Statement;
 use vos_venue::{AnchorOutcome, SubmitOutcome, VenueClient};
-use vos_wire::ids::AgentId;
 use vos_wire::peer::NodeNumber;
-use vos_wire::result::WorkResult;
-use vos_wire::vos_anchor::Anchor;
-use vos_wire::{Decode, Encode};
 
 use super::{Audit, Reach, lock};
 

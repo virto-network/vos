@@ -12,11 +12,11 @@
 //! its computations' digest.
 
 use ed25519_dalek::SigningKey;
+use vos_abi::Encode;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, WorkflowId};
+use vos_abi::schema::Schema;
 use vos_node::client::signed_workflow_read;
-use vos_wire::Encode;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, WorkflowId};
 use vos_wire::ingress::{Consistency, Install};
-use vos_wire::schema::Schema;
 
 /// The rounds instance at each agent whose tours start there, and which
 /// tallies their amounts.

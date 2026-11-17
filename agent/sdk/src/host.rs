@@ -1,5 +1,5 @@
 //! The actor ABI client: one function per operation of
-//! [`vos_wire::abi::Op`], following its register conventions.
+//! [`vos_abi::abi::Op`], following its register conventions.
 //!
 //! On the guest target an operation is an `ecalli`. Elsewhere there is no
 //! host to call: the functions compile, for crates that link an actor's
@@ -7,7 +7,7 @@
 
 use alloc::vec::Vec;
 
-use vos_wire::abi::{Op, Rows, cap, code};
+use vos_abi::abi::{Op, Rows, cap, code};
 
 /// An `ecalli` of host call `$id`, a constant, with φ7 to φ12 from `$a`,
 /// an array of six: φ7 and φ8 after it. The default agent makes its own
@@ -244,7 +244,7 @@ fn with_reply_buffer<R>(f: impl FnOnce(&mut [u8]) -> R) -> R {
 }
 
 /// A nested call's result: the reply, or an error code, a
-/// [`vos_wire::abi::Failure`], with its detail. The callee runs once, so
+/// [`vos_abi::abi::Failure`], with its detail. The callee runs once, so
 /// the output holds [`cap::REPLY`] bytes.
 pub fn call(instance: u32, method: u32, arguments: &[u8]) -> Result<Vec<u8>, (u32, Vec<u8>)> {
     returned(|out| {
@@ -295,7 +295,7 @@ fn returned(operation: impl FnOnce(&mut [u8]) -> (u64, u64)) -> Result<Vec<u8>, 
 }
 
 /// The input a workflow's machine was resumed with, `len` bytes: an
-/// encoded [`vos_wire::batch::Answer`] after an await, nothing after a
+/// encoded [`vos_abi::message::Answer`] after an await, nothing after a
 /// sleep. Copied by the agent straight into fresh capacity, which nothing
 /// writes first.
 fn resumed(len: u64) -> Vec<u8> {
@@ -343,8 +343,8 @@ pub fn result(agent: u32, workflow: u64, within: u64) -> Vec<u8> {
 
 /// A workflow's read at its window's cut through attestable `method` on
 /// `arguments`, of the rows `reads` encodes: it pauses, and returns the
-/// encoded [`vos_wire::result::Attested`] once the agent resumes it; or,
-/// refused at once, the [`vos_wire::abi::AttestError`] code.
+/// encoded [`vos_abi::result::Attested`] once the agent resumes it; or,
+/// refused at once, the [`vos_abi::abi::AttestError`] code.
 pub fn attest_at(method: u32, arguments: &[u8], reads: &[u8]) -> Result<Vec<u8>, u32> {
     let (len, refused) = ecalli!(
         Op::AttestAt.id(),

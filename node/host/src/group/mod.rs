@@ -11,9 +11,9 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
+use vos_abi::ids::AgentId;
 use vos_raft::core::{ChangeMembershipError, ProposeError, ReadIndexError};
 use vos_raft::{Message, Role};
-use vos_wire::ids::AgentId;
 use vos_wire::peer::{CreationRecord, NodeNumber, SnapshotAck, SnapshotChunk};
 
 use crate::blobs::Held;

@@ -30,7 +30,7 @@ ed25519-dalek = { version = "2", default-features = false }
 # The Gray Paper's naturals, and the refine arguments and accumulate inputs
 # a JAM node gives, in their one encoding.
 vos-pvm-program = { workspace = true }
-vos-wire = { workspace = true }
+vos-abi = { workspace = true }
 
 [dev-dependencies]
 # The golden fixtures, judged by the service as by every venue.

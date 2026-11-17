@@ -35,6 +35,7 @@ vos-node = { path = "../host" }
 vos-node-prover = { workspace = true, optional = true }
 vos-pvm = { workspace = true }
 vos-pvm-compiler = { workspace = true }
+vos-abi = { workspace = true }
 vos-wire = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -7,9 +7,9 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use smol::future::FutureExt;
+use vos_abi::Encode;
+use vos_abi::ids::AgentId;
 use vos_net::{Arrivals, Class, Incoming};
-use vos_wire::Encode;
-use vos_wire::ids::AgentId;
 use vos_wire::peer::{NodeNumber, PeerMessage};
 
 use crate::calls::Forwardable;

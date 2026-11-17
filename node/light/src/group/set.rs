@@ -4,7 +4,7 @@
 //! evidence supports it: its delay passed unvetoed, or a second signature,
 //! or a resolution, each verified.
 
-use vos_wire::Encode;
+use vos_abi::Encode;
 use vos_wire::ingress::CallMessage;
 use vos_wire::personal::{AdminCall, AdminClass, DeviceId, Op, Signer};
 

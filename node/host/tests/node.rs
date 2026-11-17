@@ -11,17 +11,19 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
+use vos_abi::abi::Refusal;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, Session};
+use vos_abi::message::Body;
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode, keys};
 use vos_checker::calls::{done, installed};
 use vos_checker::hooks::{Gate, carries};
 use vos_checker::programs::Programs;
 use vos_checker::spaces::wait_in_process as wait_until;
 use vos_node::store::EntryKind;
 use vos_node::{CallError, Config, Hooks, Node, Reply};
-use vos_wire::abi::Refusal;
-use vos_wire::batch::{Batch, Body, Message, Request};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode, defaults, keys};
+use vos_wire::batch::{Batch, Message, Request};
+use vos_wire::defaults;
 
 const COUNTER: InstanceId = InstanceId(1);
 const ALICE: Principal = Principal::Client([1; 32]);

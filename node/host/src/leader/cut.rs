@@ -8,12 +8,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use vos_abi::ids::AgentId;
+use vos_abi::keys;
+use vos_abi::result::WorkResult;
+use vos_abi::{SpaceId, WindowClock};
 use vos_wire::apply::Waits;
 use vos_wire::batch::Batch;
-use vos_wire::ids::AgentId;
-use vos_wire::keys;
-use vos_wire::result::WorkResult;
-use vos_wire::{SpaceId, WindowClock};
 
 use super::{Ended, Leader};
 use crate::fault::{Fault, read};

@@ -7,6 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use smol::future::FutureExt;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, Session};
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode, WindowClock};
 use vos_checker::calls::{done, install_at_leader};
 use vos_checker::programs::Programs;
 pub use vos_checker::spaces::wait_in_process as wait_until;
@@ -16,11 +19,8 @@ use vos_net::memory::{Endpoint, Hub};
 use vos_net::{Arrivals, Class, Network};
 use vos_node::{CallError, Config, Hooks, Node, Peers, ReplaceError, Reply, Space};
 use vos_wire::batch::Request;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
 use vos_wire::ingress::Unplaced;
 use vos_wire::peer::{NodeNumber, PeerMessage};
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode, WindowClock};
 
 pub const COUNTER: InstanceId = InstanceId(1);
 pub const ALICE: Principal = Principal::Client([1; 32]);
@@ -403,7 +403,7 @@ impl Cluster {
         });
         self.install_package(
             agent,
-            vos_wire::served::REPRESENTATIVE,
+            vos_abi::served::REPRESENTATIVE,
             &vos_checker::programs::program_package("vos-representative"),
         );
         agent

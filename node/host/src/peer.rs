@@ -27,13 +27,11 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use vos_abi::ids::AgentId;
+use vos_abi::{Decode, SpaceId};
 use vos_net::Class;
 use vos_raft::{AppendResult, EntryKind, LogEntry, Message};
-use vos_wire::ids::AgentId;
-use vos_wire::peer::{
-    self, CreationRecord, NodeNumber, PeerMessage, Placement, Raft, SnapshotChunk,
-};
-use vos_wire::{Decode, SpaceId};
+use vos_wire::peer::{self, NodeNumber, PeerMessage, Placement, Raft, SnapshotChunk};
 
 /// The wire's message for the core's.
 pub fn to_wire(message: &Message<NodeNumber>) -> Raft {
@@ -404,7 +402,7 @@ pub fn check(
         // removing itself.
         PeerMessage::Directory { record, .. } if record.space != *ours => Err(Refusal::OtherSpace),
         PeerMessage::Directory { record, placement } => {
-            let creator = CreationRecord::creator_of(record.agent);
+            let creator = record.agent.creator();
             let from_creator = record.creator == from && creator == from;
             let relayed = record.creator == creator
                 && record.replicas.contains(&from)

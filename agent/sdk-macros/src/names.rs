@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use proc_macro2::Span;
 use syn::Error;
-use vos_wire::ids::derive_id;
+use vos_abi::ids::derive_id;
 
 /// Track derived ids: 0 is reserved and two names must not share one.
 pub(crate) struct Ids {

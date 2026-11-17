@@ -65,9 +65,9 @@
 //! each carry round's sealed bytes are held before they are sent and sent
 //! again as they are.
 
-use vos_wire::ids::InstanceId;
+use vos_abi::ids::InstanceId;
+use vos_abi::{Decode, Encode};
 use vos_wire::personal::{Entry, NewDevice};
-use vos_wire::{Decode, Encode};
 
 use crate::group::{CarriedAuthor, Course, DeviceGroup, GroupError, Pairing, same_space};
 use crate::home::{Claim, ClaimError, Home};

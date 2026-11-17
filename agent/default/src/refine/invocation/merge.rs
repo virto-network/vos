@@ -1,4 +1,4 @@
-//! Merge fields' rows (`vos_wire::merge`): a merge handler's writes, its
+//! Merge fields' rows (`vos_abi::merge`): a merge handler's writes, its
 //! operation's entries, each kept against its author's stored one; and a
 //! query's reads, each element's latest entry among the authors not cut
 //! off. A query writes nothing, so it reads applied state.
@@ -6,11 +6,11 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use vos_wire::abi::{Failure, Keep, Kind, MergeRows, Op, cap, code, price};
-use vos_wire::ids::InstanceId;
-use vos_wire::keys::{self, AUTHOR, Transform};
-use vos_wire::merge::{self, Cutoff, Entry};
-use vos_wire::{Decode, Encode};
+use vos_abi::abi::{Failure, Keep, Kind, MergeRows, Op, cap, code, price};
+use vos_abi::ids::InstanceId;
+use vos_abi::keys::{self, AUTHOR, Transform};
+use vos_abi::merge::{self, Cutoff, Entry};
+use vos_abi::{Decode, Encode};
 
 use super::Invocation;
 use super::memory::{copy_out, read, read_key, write};

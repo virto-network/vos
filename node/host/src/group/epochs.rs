@@ -1,7 +1,7 @@
 //! An agent's old epochs, dropped in the background, and the marks that
 //! keep an install out of an epoch a drop runs on.
 
-use vos_wire::ids::AgentId;
+use vos_abi::ids::AgentId;
 
 use crate::lock;
 use crate::node::Inner;

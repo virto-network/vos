@@ -280,11 +280,7 @@ fn the_gateway_follows_redirects_and_routes_operators_by_their_node() {
     let Ok(Response::Created(created)) = through(nodes[1].id()).create_agent(Vec::new()) else {
         panic!("an agent on node 2")
     };
-    assert_eq!(
-        vos_wire::peer::CreationRecord::creator_of(created),
-        2,
-        "created by node 2"
-    );
+    assert_eq!(created.creator(), 2, "created by node 2");
     let sent = front.gateway.sent();
     assert_eq!(
         through(NodeId([3; 32])).stats().unwrap(),

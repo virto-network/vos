@@ -56,6 +56,7 @@ vos-venue = { workspace = true }
 # The prover worker: the statements of the agents a node leads proved,
 # recorded and submitted.
 vos-node-prover = { workspace = true }
+vos-abi = { workspace = true }
 vos-wire = { workspace = true }
 # A device proof's program, computed from its installed kernel, and its
 # verifier.

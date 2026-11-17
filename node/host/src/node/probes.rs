@@ -4,8 +4,8 @@
 
 use std::sync::atomic::Ordering;
 
+use vos_abi::ids::AgentId;
 use vos_pvm::pool::CodeHash;
-use vos_wire::ids::AgentId;
 
 use super::Node;
 use crate::store::Fjall;
@@ -79,7 +79,7 @@ impl<'a> Probes<'a> {
     pub fn prove<K: AsRef<[u8]>>(
         &self,
         agent: AgentId,
-        map: vos_wire::ids::MapId,
+        map: vos_abi::ids::MapId,
         keys: &[K],
     ) -> Result<crate::roots::Proven, crate::roots::Error> {
         crate::roots::prove(&self.0.inner.store.snapshot(), agent, map, keys)

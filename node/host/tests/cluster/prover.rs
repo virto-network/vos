@@ -18,16 +18,16 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use vos_abi::ids::{AgentId, Session};
+use vos_abi::result::{Attest, Outcome};
+use vos_abi::{Decode, keys};
 use vos_checker::stays;
 use vos_node::{Config, Node};
 use vos_node_prover::{FORMAT, Job, Options, Prover, State, StatementError};
 use vos_venue::VenueClient;
 use vos_venue::vos_statement::{ProgramId, Statement, StatementId};
 use vos_wire::batch::Request;
-use vos_wire::ids::{AgentId, Session};
 use vos_wire::peer::NodeNumber;
-use vos_wire::result::{Attest, Outcome};
-use vos_wire::{Decode, keys};
 
 use crate::common::{Cluster, log_start, wait_until};
 use crate::support::past_close;

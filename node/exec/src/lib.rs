@@ -15,18 +15,19 @@ pub use vos_pvm::refine_host::StateReader;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use vos_abi::Encode;
+use vos_abi::abi::surface::LOST;
+use vos_abi::abi::{cap, code};
+use vos_abi::ids::AgentId;
+use vos_abi::jam::{AccumulateInput, Operand, RefineArgs};
+use vos_abi::result::Write;
 use vos_pvm::ExitReason;
 use vos_pvm::accumulate_host::{self, ACCUMULATE_ENTRY, AccumulateContext, ServiceStorage};
 use vos_pvm::pool::{CodeHash, MachinePool, OuterMachines};
 use vos_pvm::refine::Machine;
 use vos_pvm::refine_host::{ProgramSource, RefineContext, serve_lookup};
-use vos_wire::abi::surface::LOST;
-use vos_wire::abi::{cap, code};
 use vos_wire::batch::Work;
-use vos_wire::ids::AgentId;
-use vos_wire::jam::{AccumulateInput, Operand, RefineArgs};
-use vos_wire::result::Write;
-use vos_wire::{Encode, defaults};
+use vos_wire::defaults;
 
 const REFINE_ENTRY: u32 = 0;
 
@@ -262,11 +263,11 @@ impl ServiceStorage for Overlay<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vos_abi::abi::cap::Target;
+    use vos_abi::ids::{InstanceId, MethodId, Principal, ProgramHash};
     use vos_pvm::accumulate_host::SELF_SERVICE;
     use vos_pvm_program::{CodeBlob, StandardProgram, build_standard_program};
-    use vos_wire::abi::cap::Target;
     use vos_wire::batch::{Admin, Batch, Input, Query};
-    use vos_wire::ids::{InstanceId, MethodId, Principal, ProgramHash};
 
     /// Programs in memory, each with the agents that pin it.
     #[derive(Default)]
@@ -348,7 +349,7 @@ mod tests {
             budget: 0,
             inputs: vec![Input::Admin(Admin::Install {
                 instance: InstanceId(1),
-                derivation: vos_wire::records::Derivation {
+                derivation: vos_abi::records::Derivation {
                     program: ProgramHash(installed),
                     kernels: Vec::new(),
                     elf: [0; 32],
@@ -358,8 +359,8 @@ mod tests {
                 },
                 roles: Vec::new(),
                 target: Target::Vos,
-                space: vos_wire::SpaceId::NONE,
-                clock: vos_wire::WindowClock::DEFAULT,
+                space: vos_abi::SpaceId::NONE,
+                clock: vos_abi::WindowClock::DEFAULT,
             })],
         });
         let programs = |agent, work| AgentPrograms::new(&store, AgentId(agent), work);

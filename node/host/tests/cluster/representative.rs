@@ -16,15 +16,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use vos_abi::ids::{AgentId, RequestId};
+use vos_abi::keys;
+use vos_abi::result::Outcome;
+use vos_abi::served::{ClosedRow, Served};
+use vos_abi::vos_anchor::{MIN_LENGTH_MS, RootKind, RootRead, space_root};
+use vos_abi::{Encode, WindowClock};
 use vos_node::Hooks;
 use vos_node::roots::{self, CutProof};
 use vos_venue::VenueClient;
-use vos_wire::ids::{AgentId, RequestId};
-use vos_wire::keys;
-use vos_wire::result::Outcome;
-use vos_wire::served::{ClosedRow, Served};
-use vos_wire::vos_anchor::{MIN_LENGTH_MS, RootKind, RootRead, space_root};
-use vos_wire::{Encode, WindowClock};
 
 use crate::common::{Cluster, wait_until};
 use crate::support::{
@@ -258,7 +258,7 @@ fn an_agent_that_misses_the_close_ends_not_closed() {
     let input = [keys.encode(), witness.encode()].concat();
     assert_eq!(
         vos_testkit::model::run_kernel(&kernel, &input, 1 << 32).err(),
-        Some(vos_wire::abi::Failure::Trapped),
+        Some(vos_abi::abi::Failure::Trapped),
         "the prologue refuses it at window 0"
     );
 
@@ -266,7 +266,7 @@ fn an_agent_that_misses_the_close_ends_not_closed() {
     let ended = ended(&cluster, late, missed);
     assert!(
         matches!(&ended, Outcome::Failed { detail, .. }
-            if *detail == vos_wire::abi::AttestError::NotClosed.encode()),
+            if *detail == vos_abi::abi::AttestError::NotClosed.encode()),
         "{ended:?}"
     );
     assert!(logged(replica(&cluster, late), late, missed).is_empty());

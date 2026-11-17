@@ -14,10 +14,10 @@ use alloc::vec::Vec;
 
 use scale::{Decode, Encode};
 
-use crate::SpaceId;
 use crate::batch::{CredentialedInput, Message};
-use crate::ids::{AgentId, ProgramHash};
 use crate::ingress::{Call, Response};
+use vos_abi::SpaceId;
+use vos_abi::ids::{AgentId, ProgramHash};
 
 /// A node of the space: the 8-bit node part of an agent id.
 pub type NodeNumber = u8;
@@ -206,24 +206,6 @@ pub struct CreationRecord {
     /// The space it belongs to, its genesis's hash; [`SpaceId::NONE`] on a
     /// node whose space has no genesis.
     pub space: SpaceId,
-}
-
-impl CreationRecord {
-    /// The number of the node whose range `agent` is in.
-    pub fn creator_of(agent: AgentId) -> NodeNumber {
-        (agent.0 >> 24) as NodeNumber
-    }
-
-    /// The id of node `creator`'s agent `serial`, below `1 << 24`, in its
-    /// range.
-    pub fn agent_id(creator: NodeNumber, serial: u32) -> AgentId {
-        AgentId(u32::from(creator) << 24 | serial)
-    }
-
-    /// Which of its creator's agents `agent` is.
-    pub fn serial_of(agent: AgentId) -> u32 {
-        agent.0 & 0x00ff_ffff
-    }
 }
 
 /// Where an agent runs: its group's configuration, as the leader that

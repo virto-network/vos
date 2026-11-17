@@ -21,9 +21,9 @@
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 
-use vos_wire::abi::{Rows, cap, code};
-use vos_wire::keys;
-use vos_wire::{Decode, Encode};
+use vos_abi::abi::{Rows, cap, code};
+use vos_abi::keys;
+use vos_abi::{Decode, Encode};
 
 use crate::host;
 
@@ -347,13 +347,13 @@ pub struct Read {
 /// workflow named fails the attest. It neither iterates nor writes.
 pub struct ServedMap<K, V, T = DefaultTransform> {
     tag: Tag,
-    served: &'static vos_wire::served::Served,
+    served: &'static vos_abi::served::Served,
     _rows: PhantomData<fn(K, T) -> V>,
 }
 
 impl<K, V, T: KeyTransform> ServedMap<K, V, T> {
     /// The map of tag `tag` over the rows `served`.
-    pub fn bound(tag: Tag, served: &'static vos_wire::served::Served) -> Self {
+    pub fn bound(tag: Tag, served: &'static vos_abi::served::Served) -> Self {
         Self {
             tag,
             served,

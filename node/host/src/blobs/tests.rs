@@ -2,7 +2,7 @@ use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::time::Duration;
 
-use vos_wire::ids::AgentId;
+use vos_abi::ids::AgentId;
 
 use super::collect::Cutoffs;
 use super::index::{location_key, segment_key};

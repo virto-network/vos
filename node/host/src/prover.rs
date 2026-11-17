@@ -16,14 +16,14 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use vos_abi::ids::{AgentId, ProgramHash};
+use vos_abi::result::{Attest, Step, WorkResult, Write};
+use vos_abi::vos_anchor::MAX_ROOT_AGE_MS;
+use vos_abi::{Decode, Encode, SpaceId, WindowClock, keys};
 use vos_node_prover::{Backlog, Host, Job, Jobs, Options, Prover, Record, Worker};
 use vos_raft::Role;
 use vos_venue::vos_statement::StatementId;
-use vos_wire::ids::{AgentId, ProgramHash};
 use vos_wire::peer::{NodeNumber, PeerMessage};
-use vos_wire::result::{Attest, Step, WorkResult, Write};
-use vos_wire::vos_anchor::MAX_ROOT_AGE_MS;
-use vos_wire::{Decode, Encode, SpaceId, WindowClock, keys};
 
 use crate::blobs::{Keep, blob_ref};
 use crate::fault::{Fault, read};

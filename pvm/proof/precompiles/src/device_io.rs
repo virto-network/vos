@@ -28,7 +28,7 @@
 //! keyed commitment and must never be used as one.
 
 /// `t_io`, the tag word of the name `io`: `u32_le(BLAKE2b-256("vos/p2/io")
-/// [0..4]) & 0x7fff_ffff`, reduced mod p, pinned (`vos_wire::credentials::
+/// [0..4]) & 0x7fff_ffff`, reduced mod p, pinned (`vos_abi::credentials::
 /// Tag::Io` is the same word).
 pub const DEVICE_IO_TAG: u32 = 0x7038_de5c;
 

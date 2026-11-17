@@ -25,10 +25,10 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use vos_abi::ids::{AgentId, ProgramHash};
 use vos_net::Network;
 use vos_pvm::pool::CodeHash;
 use vos_wire::batch::Request;
-use vos_wire::ids::{AgentId, ProgramHash};
 use vos_wire::ingress::{Contact, NodeId};
 use vos_wire::peer::{NodeNumber, Placement};
 
@@ -194,22 +194,22 @@ pub(crate) struct Counters {
 impl Inner {
     /// The space the node's agents belong to, and the clock that numbers
     /// its windows: its genesis's, or no space and the default clock.
-    pub(crate) fn space_and_clock(&self) -> (vos_wire::SpaceId, vos_wire::WindowClock) {
+    pub(crate) fn space_and_clock(&self) -> (vos_abi::SpaceId, vos_abi::WindowClock) {
         self.space.as_ref().map_or(
-            (vos_wire::SpaceId::NONE, vos_wire::WindowClock::DEFAULT),
+            (vos_abi::SpaceId::NONE, vos_abi::WindowClock::DEFAULT),
             |space| (space.id(), space.clock()),
         )
     }
 
     /// The space's genesis, when the node has one.
-    pub(crate) fn genesis(&self) -> Option<&vos_wire::vos_anchor::SpaceGenesis> {
+    pub(crate) fn genesis(&self) -> Option<&vos_abi::vos_anchor::SpaceGenesis> {
         self.space.as_ref().and_then(|space| space.genesis())
     }
 
-    /// The space's representative ([`vos_wire::served::representative`]):
+    /// The space's representative ([`vos_abi::served::representative`]):
     /// none without a genesis.
     pub(crate) fn representative(&self) -> Option<AgentId> {
-        self.genesis().and_then(vos_wire::served::representative)
+        self.genesis().and_then(vos_abi::served::representative)
     }
 
     /// The anchor keys the space has registered: the venue's listing, or,
@@ -625,7 +625,7 @@ mod tests {
     fn an_epoch_being_dropped_takes_no_install() {
         use crate::group::empty_epoch;
         use crate::storage::Change;
-        use vos_wire::ids::AgentId;
+        use vos_abi::ids::AgentId;
         let dir = tempfile::tempdir().unwrap();
         let node = Node::open(dir.path(), Config::new(agent_program())).unwrap();
         let inner = &node.inner;

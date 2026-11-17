@@ -17,6 +17,9 @@
 use std::convert::Infallible;
 
 use ed25519_dalek::SigningKey;
+use vos_abi::ids::{InstanceId, MethodId, Principal};
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode};
 use vos_light::group::{Checkpoint, DeviceGroup};
 use vos_light::home::{Claim, Home as HomeSpace};
 use vos_light::kit::{KitKey, KitSecret};
@@ -27,12 +30,9 @@ use vos_light::route::Route;
 use vos_light::{Prover, ProverConfig, Threads};
 use vos_wire::credentials::CredentialError;
 use vos_wire::homes::HomesError;
-use vos_wire::ids::{InstanceId, MethodId, Principal};
 use vos_wire::personal::{
     Body, Entry, Envelope, NewDevice, PersonalError, Pushed, RECOVERY, Scope, Woken,
 };
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode};
 
 use crate::harness::NODES;
 use crate::homes::{CREDENTIALS, Founded, HOMES, PERSONAL};

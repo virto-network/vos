@@ -8,15 +8,15 @@ use std::collections::BTreeSet;
 
 use ed25519_dalek::SigningKey;
 use merkle_crdt::{Author, Node};
+use vos_abi::abi::Failure;
+use vos_abi::ids::{InstanceId, MethodId, Principal};
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode};
 use vos_light::group::{Archive, archive};
 use vos_light::release::{self, Package};
 use vos_light::sync::{self, Blake2b256, Call, Cid, Hold, Op, Ops};
 use vos_light::{Config, Error, Light};
 use vos_testkit::programs;
-use vos_wire::abi::Failure;
-use vos_wire::ids::{InstanceId, MethodId, Principal};
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode};
 
 const NOTES: InstanceId = InstanceId(1);
 const DEVICE: Principal = Principal::Client([0xd1; 32]);

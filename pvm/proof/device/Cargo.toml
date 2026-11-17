@@ -18,7 +18,7 @@ vos-pvm-proof = { workspace = true }
 vos-pvm-precompiles = { workspace = true }
 # The credentials tree a device kernel's auth arguments are laid out over,
 # and a release artifact's encoding.
-vos-wire = { workspace = true }
+vos-abi = { workspace = true }
 scale = { package = "vos-pvm-codec", path = "../../codec", default-features = false }
 stwo = { workspace = true, features = ["std", "prover", "parallel"] }
 num-traits = "0.2"

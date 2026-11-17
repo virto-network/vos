@@ -5,9 +5,9 @@ use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::sync::Mutex;
 use std::time::Instant;
 
+use vos_abi::ids::AgentId;
+use vos_abi::keys::Due;
 use vos_wire::batch::{Admin, CredentialedInput, Input, Message, Request};
-use vos_wire::ids::AgentId;
-use vos_wire::keys::Due;
 use vos_wire::peer::NodeNumber;
 
 use super::{CallError, Inner, Reply};

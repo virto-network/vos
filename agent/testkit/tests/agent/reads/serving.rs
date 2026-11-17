@@ -70,7 +70,7 @@ fn a_read_at_a_cut_is_served_and_stated() {
     );
     assert_eq!(
         space_root(&SPACE, WINDOW, &served.rep_root),
-        vos_wire::vos_anchor::space_root(&SPACE, WINDOW, &served.rep_root)
+        vos_abi::vos_anchor::space_root(&SPACE, WINDOW, &served.rep_root)
     );
     assert!(
         reads.node.get(&keys::request(WINDOW, request)).is_none(),
@@ -194,7 +194,7 @@ fn the_kernel_traps_on_another_window_or_instance() {
         run_kernel(&kernel, &input, 1 << 32)
     };
     let ran = run(&served).expect("the rows as served");
-    let parts = vos_wire::result::KernelReturn::decode(&ran.output)
+    let parts = vos_abi::result::KernelReturn::decode(&ran.output)
         .unwrap()
         .0;
     assert_eq!(parts.output, 30u64.encode());

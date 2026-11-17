@@ -6,12 +6,12 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
+use vos_abi::Decode;
+use vos_abi::ids::WorkflowId;
+use vos_abi::result::Outcome;
 use vos_api::Kind;
 use vos_node::client::{naming, send_within, workflow_read_not_after};
-use vos_wire::Decode;
-use vos_wire::ids::WorkflowId;
 use vos_wire::ingress::{Consistency, Rejection, Response, WorkflowStatus};
-use vos_wire::result::Outcome;
 
 use super::Client;
 use crate::model::Nodes;
@@ -310,7 +310,7 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
-    use vos_wire::ids::MethodId;
+    use vos_abi::ids::MethodId;
 
     use super::*;
 

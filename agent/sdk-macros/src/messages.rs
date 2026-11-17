@@ -8,9 +8,9 @@ use syn::{
     Attribute, Error, Expr, ExprLit, FnArg, Ident, ImplItem, ImplItemFn, ItemImpl, Lit, Meta, Pat,
     PathArguments, ReturnType, Type,
 };
-use vos_wire::abi::Kind;
-use vos_wire::ids::MethodId;
-use vos_wire::schema::{CredentialGuard, MAX_GUARD_NAME, MethodSchema, Schema};
+use vos_abi::abi::Kind;
+use vos_abi::ids::MethodId;
+use vos_abi::schema::{CredentialGuard, MAX_GUARD_NAME, MethodSchema, Schema};
 
 use crate::names::{Ids, snake, upper_camel};
 use crate::{is_named, last_segment, string_arg};

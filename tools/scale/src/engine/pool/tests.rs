@@ -1,7 +1,7 @@
 use super::Pool;
 use std::time::Duration;
+use vos_abi::ids::AgentId;
 use vos_api::Kind;
-use vos_wire::ids::AgentId;
 use vos_wire::ingress::{Rejection, Response};
 
 /// A node's API over QUIC, as a driver's pool reaches it: one

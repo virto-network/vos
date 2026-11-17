@@ -14,4 +14,5 @@ vos-pvm = { workspace = true }
 vos-pvm-compiler = { workspace = true }
 vos-pvm-program = { workspace = true }
 vos-tree = { workspace = true }
+vos-abi = { workspace = true }
 vos-wire = { workspace = true }

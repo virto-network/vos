@@ -25,9 +25,9 @@ mod simulate;
 mod store;
 mod witness;
 
+use vos_abi::ids::WorkflowId;
 use vos_pvm::ExitReason;
 use vos_pvm::refine::RefineError;
-use vos_wire::ids::WorkflowId;
 
 pub use admit::admit;
 pub use builder::{Attempt, Builder, Fate, Prepared, Taken};
@@ -96,7 +96,7 @@ pub enum Error {
     /// An install for another target than JAM, which a JAM service's
     /// agent runs on.
     #[error("an install for {0:?}: a JAM service takes installs for JAM alone")]
-    Target(vos_wire::abi::cap::Target),
+    Target(vos_abi::abi::cap::Target),
 }
 
 /// A store's error as a string: `Store` keeps `PartialEq`.

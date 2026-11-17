@@ -6,9 +6,9 @@
 //! compression about 19,000 gas, after the precompile's call, which
 //! PolkaJam answers `WHAT` for 1,000.
 
+use vos_abi::abi::cap::{self, Limits};
+use vos_abi::abi::price;
 use vos_tree::Entry;
-use vos_wire::abi::cap::{self, Limits};
-use vos_wire::abi::price;
 use vos_wire::defaults;
 use vos_wire::package::{Package, SEGMENT, result_segments};
 
@@ -166,7 +166,7 @@ const MESSAGE_FRAMING: usize = 40;
 /// workflow's step may use, twice a handler's largest limit, whichever is
 /// fewer.
 pub const fn effects(limits: &Limits) -> u64 {
-    let by_gas = (2 * defaults::MAX_HANDLER_GAS / price::PUT) as usize;
+    let by_gas = (2 * vos_abi::defaults::MAX_HANDLER_GAS / price::PUT) as usize;
     let rows = if limits.step_rows < by_gas {
         limits.step_rows
     } else {
@@ -260,10 +260,10 @@ pub(crate) fn own(package: &Package, simulation: &Simulation) -> u64 {
 mod tests {
     use core::cell::Cell;
 
+    use vos_abi::abi::Rows;
+    use vos_abi::ids::InstanceId;
+    use vos_abi::keys::{self, Transform};
     use vos_tree::{Blake2b, Hash, Hasher, leaf_hash};
-    use vos_wire::abi::Rows;
-    use vos_wire::ids::InstanceId;
-    use vos_wire::keys::{self, Transform};
 
     use super::{compressions, leaf};
     use crate::gas::cap;

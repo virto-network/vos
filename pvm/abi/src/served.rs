@@ -23,7 +23,7 @@ use crate::{Decode, Encode};
 pub type ReadRow = (Vec<u8>, Option<([u8; 16], Vec<u8>)>);
 
 /// The witness of a read at window `window`'s cut, inline in its
-/// [`crate::batch::Input::Resume`] and, after the call's arguments, in its
+/// `vos_wire::batch::Input::Resume` and, after the call's arguments, in its
 /// kernel's witness input.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Served {
@@ -76,7 +76,7 @@ pub const ASKED_TAG: u32 = 0xf5ab_2cca;
 pub const REPORTS_KEPT: u64 = 2;
 
 /// An agent's report of its root at a window's cut, a
-/// [`crate::batch::Body::Report`]: the root's kind, the window and the
+/// [`crate::message::Body::Report`]: the root's kind, the window and the
 /// root. The reporting agent is the message's sender, and its report asks
 /// for its path at the window's close.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
@@ -97,33 +97,11 @@ pub struct ClosedRow {
     pub space_path: Vec<u8>,
 }
 
-/// The representative's close of a window as its node keeps it
-/// ([`keys::closing`]), once its cut's build is done: its root at the
-/// cut, and for each agent that reported the window and whose row the cut
-/// holds, in agent order, the row's salt and a `vos_tree::BatchProof`'s
-/// encoding of it against the root. A window no agent's row reaches has
-/// none: nothing is anchored of it.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct Closing {
-    pub root: [u8; 32],
-    pub paths: Vec<AgentPath>,
-}
-
-/// An agent's row at the representative's cut of a window: the agent, the
-/// row's salt, and a `vos_tree::BatchProof`'s encoding of the row against
-/// the representative's root.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct AgentPath {
-    pub agent: AgentId,
-    pub salt: [u8; 16],
-    pub path: Vec<u8>,
-}
-
 /// The agent that represents a space: the first founding node's agent 0,
 /// a serial no node gives an agent it creates otherwise.
 pub fn representative(genesis: &crate::SpaceGenesis) -> Option<AgentId> {
     let (founder, _) = genesis.nodes.first()?;
-    Some(crate::peer::CreationRecord::agent_id(*founder, 0))
+    Some(AgentId::new(*founder, 0))
 }
 
 /// The representative's committed map of agents' roots at their cuts.

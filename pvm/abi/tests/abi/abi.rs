@@ -1,12 +1,12 @@
 //! The actor ABI: kinds, operations, codes and schemas.
 
-use vos_wire::abi::{self, Failure, Keep, Kind, MergeRows, Op, Refusal, Rows};
-use vos_wire::ids::{MethodId, WorkflowId};
-use vos_wire::keys::Transform;
-use vos_wire::result::{InputRef, Outcome, Step};
-use vos_wire::{Decode, Encode};
+use vos_abi::abi::{self, Failure, Keep, Kind, MergeRows, Op, Refusal, Rows};
+use vos_abi::ids::{MethodId, WorkflowId};
+use vos_abi::keys::Transform;
+use vos_abi::result::{InputRef, Outcome, Step};
+use vos_abi::{Decode, Encode};
 
-use crate::strategies::hex;
+use crate::hex;
 
 #[test]
 fn kinds_reach_only_their_operations() {
@@ -203,7 +203,7 @@ fn result_codes_are_the_hosts() {
 
 #[test]
 fn schemas_read_back_from_their_section_and_validate() {
-    use vos_wire::schema::{MAGIC, MethodSchema, Schema, SchemaError};
+    use vos_abi::schema::{MAGIC, MethodSchema, Schema, SchemaError};
     let method = |id: u32, kind| MethodSchema {
         id: MethodId(id),
         name: b"transfer".to_vec(),
@@ -273,7 +273,7 @@ fn schemas_read_back_from_their_section_and_validate() {
 /// empty mark with none after it, or bytes past it do not read.
 #[test]
 fn an_admission_follows_the_credentials_part() {
-    use vos_wire::schema::{Admission, MethodSchema, Schema, SchemaError};
+    use vos_abi::schema::{Admission, MethodSchema, Schema, SchemaError};
     let schema = |credentials, admission| Schema {
         methods: vec![MethodSchema {
             id: MethodId(5),
@@ -347,8 +347,8 @@ fn an_admission_follows_the_credentials_part() {
 /// the program; the credential actor's mark is the section's last byte.
 #[test]
 fn credential_guards_validate_and_the_mark_is_last() {
-    use vos_wire::ids::Principal;
-    use vos_wire::schema::{CredentialGuard, MethodSchema, Schema, SchemaError};
+    use vos_abi::ids::Principal;
+    use vos_abi::schema::{CredentialGuard, MethodSchema, Schema, SchemaError};
     let auth = |name: &[u8]| CredentialGuard::Auth {
         name: name.to_vec(),
         once: true,
@@ -469,7 +469,7 @@ fn credential_guards_validate_and_the_mark_is_last() {
 /// name, kind, role, gas, marking and credential guard, in that order.
 #[test]
 fn method_schemas_encode_field_by_field() {
-    use vos_wire::schema::MethodSchema;
+    use vos_abi::schema::MethodSchema;
     let method = MethodSchema {
         id: MethodId(0x0102_0304),
         name: b"get".to_vec(),
@@ -488,7 +488,7 @@ fn method_schemas_encode_field_by_field() {
         role: None,
         gas: None,
         linearizable: false,
-        credential: Some(Box::new(vos_wire::schema::CredentialGuard::Auth {
+        credential: Some(Box::new(vos_abi::schema::CredentialGuard::Auth {
             name: b"v".to_vec(),
             once: true,
         })),
@@ -499,7 +499,7 @@ fn method_schemas_encode_field_by_field() {
         hex("0403020103000000676574000000000100010000007601")
     );
     let proven = MethodSchema {
-        credential: Some(Box::new(vos_wire::schema::CredentialGuard::Kernel {
+        credential: Some(Box::new(vos_abi::schema::CredentialGuard::Kernel {
             name: b"k".to_vec(),
         })),
         ..guarded
@@ -620,13 +620,13 @@ fn codes_keep_their_values() {
         assert!(Failure::decode(&outside.to_le_bytes()).is_err());
     }
     // An install's refusal, its failure's detail.
-    use vos_wire::abi::cap::{Refused, Target};
+    use vos_abi::abi::cap::{Refused, Target};
     let target = Refused::Target { agent: Target::Jam };
     assert_eq!(target.encode(), [0, 1]);
     assert_eq!(target.failure(), Failure::Target);
     let space = Refused::Space {
-        space: vos_wire::SpaceId([0xa1; 32]),
-        clock: vos_wire::WindowClock {
+        space: vos_abi::SpaceId([0xa1; 32]),
+        clock: vos_abi::WindowClock {
             origin_ms: 1,
             length_ms: 600_000,
         },
@@ -643,7 +643,7 @@ fn codes_keep_their_values() {
     );
     assert_eq!(space.failure(), Failure::Space);
     let gas = Refused::KernelGas {
-        method: vos_wire::ids::MethodId(3),
+        method: vos_abi::ids::MethodId(3),
         gas: 5,
         most: 4,
     };
@@ -676,8 +676,13 @@ fn codes_keep_their_values() {
         workflow: WorkflowId(7),
     };
     assert_eq!(due.encode(), [&[4][..], &7u64.to_le_bytes()].concat());
-    assert_eq!(
-        vos_wire::ingress::Response::Refused(Refusal::Sequence).encode(),
-        [1, 1, 0, 0, 0]
-    );
+}
+
+/// An agent's id is its creator's number over 24 bits of its serial.
+#[test]
+fn an_agent_id_holds_its_creator_and_serial() {
+    let agent = vos_abi::ids::AgentId::new(0x0a, 0x0b_0c0d);
+    assert_eq!(agent, vos_abi::ids::AgentId(0x0a0b_0c0d));
+    assert_eq!(agent.creator(), 0x0a);
+    assert_eq!(agent.serial(), 0x0b_0c0d);
 }

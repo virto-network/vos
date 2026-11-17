@@ -14,17 +14,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use vos_abi::Encode;
+use vos_abi::ids::{AgentId, InstanceId, MapId};
+use vos_abi::keys::{self, Transform};
+use vos_abi::records::{stored, versioned};
+use vos_abi::result::Write;
 use vos_checker::Random;
 use vos_node::NoHooks;
 use vos_node::roots::{self, Build};
 use vos_node::storage::{Change, StorageThread};
 use vos_node::store::Fjall;
 use vos_tree::{Blake2b, Hasher};
-use vos_wire::Encode;
-use vos_wire::ids::{AgentId, InstanceId, MapId};
-use vos_wire::keys::{self, Transform};
-use vos_wire::records::{stored, versioned};
-use vos_wire::result::Write;
 
 mod support;
 

@@ -3,15 +3,15 @@
 
 use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest};
+use vos_abi::abi::{Failure, Rows, cap, price};
+use vos_abi::ids::InstanceId;
+use vos_abi::keys;
+use vos_abi::records::unversioned;
+use vos_abi::result::KernelReturn;
+use vos_abi::{Decode, Encode};
 use vos_pvm::ExitReason;
 use vos_pvm::precompile::{WITNESS_INPUT, WitnessFault, WitnessInput};
 use vos_pvm::refine::Machine;
-use vos_wire::abi::{Failure, Rows, cap, price};
-use vos_wire::ids::InstanceId;
-use vos_wire::keys;
-use vos_wire::records::unversioned;
-use vos_wire::result::KernelReturn;
-use vos_wire::{Decode, Encode};
 
 /// The value applied state holds under `key`: in a committed map's value
 /// row, without the version that wrote it.
@@ -34,7 +34,7 @@ pub(crate) fn row(
     address: u64,
     len: u64,
 ) -> Result<Vec<u8>, Failure> {
-    if vos_wire::abi::MergeRows::is(rows) {
+    if vos_abi::abi::MergeRows::is(rows) {
         return Err(Failure::Trapped);
     }
     let key = read_key(machine, address, len)?;

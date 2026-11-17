@@ -13,7 +13,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 
-use vos_wire::{Decode, Encode};
+use vos_abi::{Decode, Encode};
 
 use crate::route::Purpose;
 
@@ -62,7 +62,7 @@ impl Encode for Opened {
 }
 
 impl Decode for Opened {
-    fn decode(data: &[u8]) -> Result<(Self, usize), vos_wire::DecodeError> {
+    fn decode(data: &[u8]) -> Result<(Self, usize), vos_abi::DecodeError> {
         let (counts, used) = Vec::<u32>::decode(data)?;
         let ((failed, clearnet), more) = <(u32, u32)>::decode(&data[used..])?;
         let mut rendezvous = [0; Purpose::ALL.len()];

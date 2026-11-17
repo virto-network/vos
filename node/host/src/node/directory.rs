@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use smol::future::FutureExt;
-use vos_wire::ids::AgentId;
+use vos_abi::ids::AgentId;
 use vos_wire::peer::{CreationRecord, NodeNumber, Order, PeerMessage, Placement};
 
 use super::{Agent, Inner, Run};
@@ -649,9 +649,9 @@ mod tests {
             replicas: vec![1, 2, 3],
             creator: 1,
             time: 0,
-            program: vos_wire::ids::ProgramHash([0; 32]),
+            program: vos_abi::ids::ProgramHash([0; 32]),
             accumulate_gas: 0,
-            space: vos_wire::SpaceId::NONE,
+            space: vos_abi::SpaceId::NONE,
         });
         assert!(should_answer(&created, 3, 2));
     }

@@ -16,6 +16,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use ed25519_dalek::SigningKey;
+use vos_abi::ids::{AgentId, InstanceId, Principal};
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode, WindowClock};
 use vos_gateway::Gateway;
 use vos_gateway::limits::{Limits, PerAddress};
 use vos_gateway::ssh::{App, Placeholder};
@@ -23,10 +26,7 @@ use vos_gateway::upstream::{Address, Upstream};
 use vos_node::client::{self, Client, Operator, Target};
 use vos_node::{Config, Node};
 use vos_testkit::programs::{actor_elf, agent, method};
-use vos_wire::ids::{AgentId, InstanceId, Principal};
 use vos_wire::ingress::{Install, Response};
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode, WindowClock};
 
 use crate::app::{Demo, DemoApp};
 
@@ -43,7 +43,7 @@ pub const INVITATION_MS: u64 = 600_000;
 pub struct LocalSpace {
     node: Node,
     socket: PathBuf,
-    space: vos_wire::SpaceId,
+    space: vos_abi::SpaceId,
     key: SigningKey,
     agent: AgentId,
     operator: Mutex<Client>,

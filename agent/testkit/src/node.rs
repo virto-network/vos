@@ -7,6 +7,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
+use vos_abi::abi::surface::LOST;
+use vos_abi::abi::{Failure, Refusal, cap, code};
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, SessionId};
+use vos_abi::jam::{AccumulateInput, Operand, RefineArgs};
+use vos_abi::records::{Installed, SessionMark, unstored};
+use vos_abi::result::{Outcome, Run, Step, WorkResult};
+use vos_abi::{Decode, Encode, keys};
 use vos_pvm::accumulate_host::AccumulateContext;
 use vos_pvm::inner::gp_call::HISTORICAL_LOOKUP;
 use vos_pvm::pool::{CodeHash, MachinePool};
@@ -15,14 +22,7 @@ use vos_pvm::refine_host::{
     JamItem, JamRefine, Preimages, ProgramSource, RefineContext, serve_lookup,
 };
 use vos_pvm::{ExitReason, PvmBackend};
-use vos_wire::abi::surface::LOST;
-use vos_wire::abi::{Failure, Refusal, cap, code};
 use vos_wire::batch::{Batch, Input, Query, Request, Work};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, SessionId};
-use vos_wire::jam::{AccumulateInput, Operand, RefineArgs};
-use vos_wire::records::{Installed, SessionMark, unstored};
-use vos_wire::result::{Outcome, Run, Step, WorkResult};
-use vos_wire::{Decode, Encode, keys};
 
 use crate::programs::agent;
 

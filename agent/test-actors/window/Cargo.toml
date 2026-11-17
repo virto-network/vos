@@ -20,4 +20,4 @@ bench = false
 # cipher-clerk's `pvm-precompile` feature.
 cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", tag = "v0.3.0", default-features = false, features = ["settlement"] }
 vos-sdk = { workspace = true }
-vos-tree = { path = "../../tree" }
+vos-tree = { path = "../../../pvm/tree" }

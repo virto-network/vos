@@ -15,6 +15,10 @@
 
 use crate::common;
 
+use vos_abi::Encode;
+use vos_abi::abi::cap::Target;
+use vos_abi::ids::{AgentId, InstanceId, Principal, ProgramHash};
+use vos_abi::result::Attest;
 use vos_pvm::instruction::Opcode;
 use vos_pvm_compiler::shape as derived_shape;
 use vos_pvm_proof::chip_idx;
@@ -31,10 +35,6 @@ use vos_pvm_proof_verifier::{
 };
 use vos_testkit::model::Model;
 use vos_testkit::programs::{derived, method};
-use vos_wire::Encode;
-use vos_wire::abi::cap::Target;
-use vos_wire::ids::{AgentId, InstanceId, Principal, ProgramHash};
-use vos_wire::result::Attest;
 
 const GAS: u64 = 100_000_000;
 
@@ -42,7 +42,7 @@ const GAS: u64 = 100_000_000;
 /// it.
 struct Kernel {
     blob: Vec<u8>,
-    record: vos_wire::records::Kernel,
+    record: vos_abi::records::Kernel,
     trace: KernelTrace,
 }
 
@@ -137,7 +137,7 @@ fn kernel(name: &str, values: &[u64]) -> Kernel {
 }
 
 /// The derivation's chips are the AIR's (their order is one table,
-/// `vos_wire::records::segment_chip`): the chips every proof holds, and,
+/// `vos_abi::records::segment_chip`): the chips every proof holds, and,
 /// opcode by opcode, the chips a step of it activates.
 #[test]
 fn derive_reads_the_airs_chips() {
@@ -264,8 +264,8 @@ fn a_proof_missing_a_chip_is_refused() {
         .unwrap();
     let kernel = Kernel {
         trace: trace_kernel(&blob, &[], GAS).expect("halts"),
-        record: vos_wire::records::Kernel {
-            method: vos_wire::ids::MethodId(1),
+        record: vos_abi::records::Kernel {
+            method: vos_abi::ids::MethodId(1),
             program: ProgramHash::of(&blob),
             image_root,
             shape: record,

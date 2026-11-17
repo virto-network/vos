@@ -160,7 +160,7 @@ fn every_other_message_survives_the_wire() {
             message: vos_wire::batch::Message {
                 from: AgentId(9),
                 sequence: 3,
-                body: vos_wire::batch::Body::Call {
+                body: vos_abi::message::Body::Call {
                     instance: InstanceId(1),
                     method: MethodId(2),
                     arguments: vec![4],

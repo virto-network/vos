@@ -3,9 +3,9 @@
 //! key, evidence and votes under the sync key, and its reads of the log.
 
 use ed25519_dalek::{Signer, SigningKey};
+use vos_abi::Encode;
 use vos_light::group::{DeviceGroup, Event, Pairing, Prepared};
 use vos_light::kit::{KitKey, KitSecret, SecurityKey, Split};
-use vos_wire::Encode;
 use vos_wire::personal::{
     AdminClass, Attached, Attestation, Candidacy, NewDevice, PersonalError, Recorded, Vote,
 };

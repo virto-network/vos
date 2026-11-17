@@ -36,21 +36,20 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use vos_abi::ids::{AgentId, RequestId};
+use vos_abi::keys;
+use vos_abi::records::{PendingRead, unstored};
+use vos_abi::result::Write;
+use vos_abi::served::{representative_ask_entry, representative_asks_of, representative_row};
+use vos_abi::vos_anchor::{MAX_ROOT_AGE_MS, RootKind, space_root};
+use vos_abi::{Decode, Encode, SpaceId, WindowClock, scale};
 use vos_tree::{BatchProof, Hash, NodeStore};
-use vos_wire::ids::{AgentId, RequestId};
-use vos_wire::keys;
-use vos_wire::records::{PendingRead, unstored};
-use vos_wire::result::Write;
-use vos_wire::served::{
-    AgentPath, Closing, representative_ask_entry, representative_asks_of, representative_row,
-};
-use vos_wire::vos_anchor::{MAX_ROOT_AGE_MS, RootKind, space_root};
-use vos_wire::{Decode, Encode, SpaceId, WindowClock, scale};
+use vos_wire::batch::{AgentPath, Closing};
 
 use super::{AgentStore, Error, decoded, value_row};
 use crate::store::Snapshot;
 
-pub use vos_wire::served::ReadRow;
+pub use vos_abi::served::ReadRow;
 
 /// What every replica persists for a pending request once its window's cut
 /// is built ([`keys::cut_proof`]): the window, the cut's version and the

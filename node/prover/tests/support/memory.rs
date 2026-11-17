@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use vos_abi::ids::AgentId;
 use vos_venue::vos_statement::StatementId;
-use vos_wire::ids::AgentId;
 
 use vos_node_prover::{Job, Jobs};
 

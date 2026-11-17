@@ -3,8 +3,8 @@
 use alloc::vec::Vec;
 
 use crate::abi::cap::Target;
-use crate::batch::Await;
 use crate::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash};
+use crate::message::Await;
 use crate::result::Outcome;
 use crate::schema::{Admission, Schema};
 use crate::{Decode, Encode};
@@ -74,7 +74,7 @@ pub struct Previous {
 
 /// How long an install keeps a device kernel's previous release admitted
 /// by default: 60 days. The operator may retire it at any earlier time,
-/// now included ([`crate::batch::Admin::Retire`]).
+/// now included (`vos_wire::batch::Admin::Retire`).
 pub const RETIREMENT_MS: u64 = 60 * 24 * 60 * 60 * 1000;
 
 /// An attestable method's kernel: its program; the root of the page tree
@@ -165,7 +165,7 @@ pub mod segment_chip {
 const _: () = assert!(segment_chip::BITWISE_AND_BYTE + 1 == SEGMENT_CHIPS);
 
 /// The most classes a kernel's shape has: what decoding a kernel's record
-/// within [`DECODE_KERNEL`](crate::defaults::DECODE_KERNEL) covers.
+/// within `vos_wire::defaults::DECODE_KERNEL` covers.
 pub const MAX_CLASSES: usize = 4;
 
 impl Derivation {

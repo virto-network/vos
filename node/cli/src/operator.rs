@@ -2,14 +2,14 @@
 //! directory for that node: agents, installs and roles.
 
 use ed25519_dalek::SigningKey;
+use vos_abi::Decode;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, derive_id};
+use vos_abi::records::Derivation;
+use vos_abi::result::Outcome;
+use vos_abi::schema::Schema;
 use vos_node::client::Operator;
 use vos_node::{NODE_KEY, OPERATOR_KEY};
-use vos_wire::Decode;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, derive_id};
 use vos_wire::ingress::{Install, Response, Retire};
-use vos_wire::records::Derivation;
-use vos_wire::result::Outcome;
-use vos_wire::schema::Schema;
 
 use crate::args::{AgentCommand, InstallArgs, OperatorArgs, RoleArgs};
 use crate::call::{print_admin_answer, said};

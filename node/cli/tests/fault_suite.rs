@@ -33,6 +33,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use vos_abi::ids::AgentId;
+use vos_abi::keys;
 use vos_checker::processes::relay::Link;
 use vos_checker::processes::{Options, PROCESS_WAIT, Processes};
 use vos_checker::programs::package;
@@ -40,10 +42,9 @@ use vos_checker::{
     ANSWERED, COUNTER, Client, INBOX, Mode, Nodes, PAUSING, Random, SECOND, mark, wait_until,
 };
 use vos_node::store::Fjall;
-use vos_wire::ids::AgentId;
+use vos_wire::defaults;
 use vos_wire::ingress::{Consistency, Response, Unplaced};
 use vos_wire::peer::NodeNumber;
-use vos_wire::{defaults, keys};
 
 const NODES: usize = 5;
 /// Agents the clients call, each on three nodes.

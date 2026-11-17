@@ -5,7 +5,7 @@
 //! reference are.
 //!
 //! A digest is eight M31 words, its bytes the words as little-endian
-//! `u32`s ([`vos_wire::credentials`]'s), held 8-aligned so the guest moves
+//! `u32`s ([`vos_abi::credentials`]'s), held 8-aligned so the guest moves
 //! it as four `u64`s. The compression `C(l, r)` is the first eight words
 //! of the width-16 permutation of `l ‖ r`; a word at or above p traps.
 //!
@@ -19,10 +19,10 @@
 use alloc::vec::Vec;
 use core::mem::MaybeUninit;
 
-use vos_wire::scale::DecodeError;
+use vos_abi::scale::DecodeError;
 
+pub use vos_abi::credentials::{DEPTH, Tag};
 pub use vos_sdk_macros::InPlace;
-pub use vos_wire::credentials::{DEPTH, Tag};
 
 /// A digest: eight M31 words, 8-aligned. Its encoding is its 32 bytes, the
 /// words as little-endian `u32`s.
@@ -138,14 +138,14 @@ pub fn decode_in_place<T: InPlace>(data: &[u8]) -> Result<(T, usize), DecodeErro
     ))
 }
 
-impl vos_wire::Encode for Digest {
+impl vos_abi::Encode for Digest {
     #[inline(always)]
     fn encode_to(&self, buf: &mut Vec<u8>) {
         encode_in_place(self, buf)
     }
 }
 
-impl vos_wire::Decode for Digest {
+impl vos_abi::Decode for Digest {
     #[inline]
     fn decode(data: &[u8]) -> Result<(Self, usize), DecodeError> {
         decode_in_place(data)
@@ -218,7 +218,7 @@ pub mod reference {
         let mut siblings = [Digest([0; 8]); DEPTH];
         let mut level = 0;
         while level < DEPTH {
-            siblings[level] = Digest(vos_wire::credentials::EMPTY[level]);
+            siblings[level] = Digest(vos_abi::credentials::EMPTY[level]);
             level += 1;
         }
         Path { siblings, slot: 0 }
@@ -408,15 +408,15 @@ mod tests {
     extern crate std;
 
     use super::*;
-    use vos_wire::credentials::{self, EMPTY, Words};
-    use vos_wire::{Decode, Encode};
+    use vos_abi::credentials::{self, EMPTY, Words};
+    use vos_abi::{Decode, Encode};
 
     fn digest(words: &Words) -> Digest {
         Digest(*words)
     }
 
     /// The tags' and the digests' compressions, and a path's root, are
-    /// `vos_wire::credentials`' for every slot's shape.
+    /// `vos_abi::credentials`' for every slot's shape.
     #[test]
     fn hashes_and_roots_are_the_trees() {
         let secret: Words = core::array::from_fn(|i| 0x0123_4567 + 7_919 * i as u32);

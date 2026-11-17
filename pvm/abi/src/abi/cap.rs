@@ -32,7 +32,7 @@ pub const MESSAGES: usize = 16;
 pub const MESSAGE: usize = 64 << 10;
 pub const ATTESTS: usize = 16;
 /// The rows a read at a window's cut is served, inline in its
-/// [`crate::batch::Input::Resume`]: about 155 rows of a million-row map,
+/// `vos_wire::batch::Input::Resume`: about 155 rows of a million-row map,
 /// whose proofs take about 2,970 compressions, within a kernel's bound on
 /// JAM.
 pub const SERVED: usize = 128 << 10;
@@ -52,14 +52,14 @@ pub const WORKFLOW_PAGES: usize = 4096;
 ///
 /// **The budget binds first.** A step takes from its batch's budget,
 /// whatever host it runs on:
-/// - before it runs, and every step: [`crate::defaults::WORKFLOW_RESERVE`],
-///   [`crate::defaults::ARM_PAGE`] for each page its program may write,
-///   [`crate::defaults::RESTORED_PAGE`] for each page its workflow holds,
+/// - before it runs, and every step: `vos_wire::defaults::WORKFLOW_RESERVE`,
+///   `vos_wire::defaults::ARM_PAGE` for each page its program may write,
+///   `vos_wire::defaults::RESTORED_PAGE` for each page its workflow holds,
 ///   and its gas limit;
 /// - its machine's gas: its effect-free code's share, the limit, and the
 ///   limit again for each unit from its first effect, when the refine has
 ///   it beyond what the step used, or the step ends at that effect;
-/// - [`crate::defaults::WRITTEN_PAGE`] for each page it writes, before the
+/// - `vos_wire::defaults::WRITTEN_PAGE` for each page it writes, before the
 ///   page opens, again in every step that writes it.
 ///
 /// So the pages a step restores and writes satisfy `restored ×
@@ -74,7 +74,7 @@ pub const WORKFLOW_PAGES: usize = 4096;
 pub const STEP_PAGES: usize = 8 << 20;
 /// The pages a workflow's snapshot may hold, 2.25 MiB: a step that
 /// would leave it more fails, so the least budget a node refines with
-/// ([`crate::defaults::min_refine_gas`]) restores any snapshot. On JAM,
+/// (`vos_wire::defaults::min_refine_gas`) restores any snapshot. On JAM,
 /// the step that ends a workflow holding them all, at the largest
 /// limit, restores every page and drops every page's row, and a
 /// package of that step alone, bar its own effects, fits a work
@@ -165,7 +165,7 @@ impl Target {
 /// What an instance may do and be on its [`Target`]. A step past an effect
 /// or memory limit fails, [`super::Failure::Cap`]; a program past a static
 /// one is refused at install, likewise. Every target pays the same prices,
-/// a page's included ([`crate::defaults::WRITTEN_PAGE`] and its kin): the
+/// a page's included (`vos_wire::defaults::WRITTEN_PAGE` and its kin): the
 /// limits cap what a step does, and never price it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
@@ -185,7 +185,7 @@ pub struct Limits {
     /// its statement's parts.
     pub attest: usize,
     /// The served rows of a read at a window's cut, inline in its
-    /// [`crate::batch::Input::Resume`]: past it, the read is unserved.
+    /// `vos_wire::batch::Input::Resume`: past it, the read is unserved.
     pub served: usize,
     /// The pages a workflow's program may write, its data, heap and stack:
     /// a start of a workflow of a larger one fails.

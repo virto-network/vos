@@ -8,14 +8,14 @@
 
 use std::path::Path;
 
+use vos_abi::ids::{InstanceId, Principal};
+use vos_abi::records::unstored;
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode, keys};
 use vos_checker::crash::{Round, Rounds, journal};
 use vos_light::release::{self, Package};
 use vos_light::{Config, Light};
 use vos_testkit::programs;
-use vos_wire::ids::{InstanceId, Principal};
-use vos_wire::records::unstored;
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode, keys};
 
 const NOTES: InstanceId = InstanceId(1);
 const DEVICE: Principal = Principal::Client([0xd1; 32]);

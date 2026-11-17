@@ -21,9 +21,9 @@
 
 use std::time::{Duration, Instant};
 
+use vos_abi::Encode;
 use vos_checker::Random;
 use vos_node::roots;
-use vos_wire::Encode;
 
 #[path = "../tests/cuts/model.rs"]
 mod model;
@@ -98,8 +98,8 @@ fn main() {
     // built, in an agent that cuts every window, so the result crossing
     // `B_0` cuts though no read waits there.
     let mut install = Entry::install(agent.time, SPACE);
-    install.writes.push(vos_wire::result::Write {
-        key: vos_wire::keys::every_window(),
+    install.writes.push(vos_abi::result::Write {
+        key: vos_abi::keys::every_window(),
         value: Some(Vec::new()),
     });
     agent.apply(&install);

@@ -5,8 +5,8 @@
 
 use std::sync::Arc;
 
+use vos_abi::ids::AgentId;
 use vos_exec::{ProgramStore, StateReader};
-use vos_wire::ids::AgentId;
 
 use crate::blobs::Blobs;
 use crate::store::Snapshot;

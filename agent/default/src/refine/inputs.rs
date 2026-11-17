@@ -4,14 +4,16 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use vos_wire::abi::{Failure, Kind, Refusal};
-use vos_wire::batch::{Await, Body, Message};
-use vos_wire::ids::{AgentId, Principal};
-use vos_wire::keys::Due;
-use vos_wire::records::Workflow;
-use vos_wire::result::{CommittedWrite, InputRef, Outcome, Outgoing, Run, Step, Write};
-use vos_wire::served::ClosedRow;
-use vos_wire::{Encode, defaults, keys};
+use vos_abi::abi::{Failure, Kind, Refusal};
+use vos_abi::ids::{AgentId, Principal};
+use vos_abi::keys::Due;
+use vos_abi::message::{Await, Body};
+use vos_abi::records::Workflow;
+use vos_abi::result::{CommittedWrite, InputRef, Outcome, Outgoing, Run, Step, Write};
+use vos_abi::served::ClosedRow;
+use vos_abi::{Encode, keys};
+use vos_wire::batch::Message;
+use vos_wire::defaults;
 
 use super::base::{Base, Corrupt};
 use super::batch::{Mark, Stepped};

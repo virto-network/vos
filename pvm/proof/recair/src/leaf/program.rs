@@ -6,7 +6,7 @@
 //! commitment to the kernel's preprocessed trace at the class's sizes, and
 //! the leaf's own preprocessed commitment at the padded shape: seconds a
 //! class, and the prover's dependencies, where an install derives programs
-//! and shapes only. An install's record ([`vos_wire::records::Kernel`])
+//! and shapes only. An install's record ([`vos_abi::records::Kernel`])
 //! carries what the prover role needs: the kernel's hash, its image root and
 //! its shape, the shape's policy version among it; the transpiler's version
 //! is the derivation's. The program id covers the shape itself, so a record
@@ -35,7 +35,7 @@ pub(crate) fn leaf_circuit_hashes(program: &KernelProgram, entry: &KernelEntry) 
 /// code, and the leaf circuits' hashes in its slot; and its entry.
 pub fn kernel_program(
     blob: &[u8],
-    record: &vos_wire::records::Kernel,
+    record: &vos_abi::records::Kernel,
     transpiler: u32,
     format: &'static Format,
 ) -> Result<(KernelProgram, KernelEntry), KernelError> {

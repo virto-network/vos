@@ -31,8 +31,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, Readable};
-use vos_wire::Decode;
-use vos_wire::ids::AgentId;
+use vos_abi::Decode;
+use vos_abi::ids::AgentId;
 use vos_wire::peer::{CreationRecord, Placement};
 
 use crate::blobs::{IndexRow, pinned_hash};

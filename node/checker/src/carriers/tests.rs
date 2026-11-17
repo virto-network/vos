@@ -1,8 +1,8 @@
+use vos_abi::Encode;
+use vos_abi::ids::{AgentId, InstanceId, ProgramHash};
+use vos_abi::result::Attest;
+use vos_abi::served::Served;
 use vos_node_prover::Internals;
-use vos_wire::Encode;
-use vos_wire::ids::{AgentId, InstanceId, ProgramHash};
-use vos_wire::result::Attest;
-use vos_wire::served::Served;
 
 use super::*;
 
@@ -112,7 +112,7 @@ fn a_short_or_constant_value_is_no_needle() {
 /// A read's record: its arguments, a public one among them, then its rows.
 fn attest(value: u64) -> (Attest, usize) {
     let served = Served {
-        space: vos_wire::SpaceId([3; 32]),
+        space: vos_abi::SpaceId([3; 32]),
         window: 4,
         agent: AgentId(5),
         instance: InstanceId(6),
@@ -167,7 +167,7 @@ fn a_records_rows_and_private_arguments_are_needles() {
             found
         );
     }
-    let domain = vos_wire::vos_anchor::blake2b_256(&[b"vos/io/v1", &(10..30).collect::<Vec<u8>>()]);
+    let domain = vos_abi::vos_anchor::blake2b_256(&[b"vos/io/v1", &(10..30).collect::<Vec<u8>>()]);
     assert_eq!(
         audit(
             Reach::Leaves,
@@ -367,13 +367,14 @@ fn a_word_is_found_in_its_forms() {
 /// needle searched everywhere; its place but the empty siblings.
 #[test]
 fn a_members_secret_and_place_are_needles() {
-    use vos_wire::credentials::{DEPTH, EMPTY, Path, Siblings, digest};
+    use vos_abi::credentials::{DEPTH, EMPTY, digest};
+    use vos_wire::credentials::{Path, Siblings};
 
     let mut needles = Needles::default();
     let words = needles.device_secret("member", &[0x6f; 32], &[0x48; 32]);
     let (w, again) = super::credential::derive(&[0x6f; 32], &[0x48; 32]);
     assert_eq!(words, again);
-    assert!(words.iter().all(|&word| word < vos_wire::credentials::P));
+    assert!(words.iter().all(|&word| word < vos_abi::credentials::P));
     assert!(needles.named(Kind::DeviceSecret, "s's word").count() >= 7);
     let mut audit = Audit {
         needles: needles.clone(),

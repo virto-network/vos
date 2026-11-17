@@ -13,16 +13,16 @@
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
+use vos_abi::ids::{AgentId, InstanceId};
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode, keys};
 use vos_checker::calls::{Total, call, increment, query_at, served_method};
 use vos_checker::processes::{Options, PROCESS_WAIT, Processes};
 use vos_checker::programs::package;
 use vos_checker::rounds::{ASKED, ROUNDS, Rounds, TOLD, Tour};
 use vos_checker::{COUNTER, INBOX, mark, wait_until};
 use vos_node::client::Client;
-use vos_wire::ids::{AgentId, InstanceId};
 use vos_wire::ingress::{Consistency, Response, WorkflowStatus};
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode, keys};
 
 /// Three nodes, their clients on the API's sockets.
 fn start() -> Processes {

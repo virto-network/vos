@@ -10,18 +10,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use vos_abi::abi::Failure;
+use vos_abi::ids::{AgentId, WorkflowId};
+use vos_abi::keys;
+use vos_abi::message::{Answer, Await, Body};
+use vos_abi::result::{InputRef, Outcome, Run, Step, WorkResult};
+use vos_abi::{Decode, Encode};
 use vos_checker::hooks::{Holds, carries};
 use vos_net::Class;
 use vos_node::peer::Refusal;
 use vos_node::store::EntryKind;
 use vos_node::{CallError, Hooks, Reply};
-use vos_wire::abi::Failure;
-use vos_wire::batch::{Answer, Await, Batch, Body, Message};
-use vos_wire::ids::{AgentId, WorkflowId};
-use vos_wire::keys;
+use vos_wire::batch::{Batch, Message};
 use vos_wire::peer::{NodeNumber, PeerMessage};
-use vos_wire::result::{InputRef, Outcome, Run, Step, WorkResult};
-use vos_wire::{Decode, Encode};
 
 use crate::common::{COUNTER, Cluster, wait_until};
 

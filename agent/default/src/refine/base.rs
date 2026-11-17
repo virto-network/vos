@@ -7,12 +7,13 @@ use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 use core::ops::Range;
 
-use vos_wire::abi::{Failure, cap};
+use vos_abi::abi::{Failure, cap};
+use vos_abi::ids::{AgentId, InstanceId, Principal, WorkflowId};
+use vos_abi::records::{Installed, unstored, unversioned};
+use vos_abi::result::{PAGE, PageSection};
+use vos_abi::{Decode, keys};
 use vos_wire::credentials::Ring;
-use vos_wire::ids::{AgentId, InstanceId, Principal, WorkflowId};
-use vos_wire::records::{Installed, unstored, unversioned};
-use vos_wire::result::{PAGE, PageSection};
-use vos_wire::{Decode, defaults, keys};
+use vos_wire::defaults;
 
 use super::Overlay;
 use super::jam::Witnessed;

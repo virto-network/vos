@@ -10,10 +10,10 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
+use vos_abi::Encode;
+use vos_abi::abi::Refusal;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Session};
 use vos_node::client::{signed_call, signed_query};
-use vos_wire::Encode;
-use vos_wire::abi::Refusal;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Session};
 use vos_wire::ingress::{Consistency, Rejection, Response};
 
 use crate::load::{self, Kind, Planned, Users};
@@ -423,9 +423,9 @@ impl Shared {
 mod tests {
     use super::{Fate, UserSession, fate};
     use ed25519_dalek::SigningKey;
-    use vos_wire::abi::Refusal;
+    use vos_abi::abi::Refusal;
+    use vos_abi::result::Outcome;
     use vos_wire::ingress::{Rejection, Response};
-    use vos_wire::result::Outcome;
 
     #[test]
     fn a_call_refused_before_it_ran_gives_its_sequence_to_the_next() {

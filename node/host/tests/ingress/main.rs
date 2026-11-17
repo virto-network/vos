@@ -27,6 +27,11 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::SigningKey;
 use std::collections::HashMap;
 
+use vos_abi::abi::Refusal;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Session, WorkflowId};
+use vos_abi::keys;
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode};
 use vos_api::Kind;
 use vos_checker::calls::{done, installed};
 use vos_checker::hooks::{FailNextSync, Gate, carries};
@@ -35,16 +40,12 @@ use vos_checker::rounds::{ASKED, ROUNDS, Rounds, TOLD, Tour, TourMethods, signed
 use vos_checker::spaces::wait_in_process as wait_until;
 use vos_node::client::{self, Client, ClientError, Operator, Target};
 use vos_node::{Config, Hooks, Node};
-use vos_wire::abi::Refusal;
 use vos_wire::batch::Batch;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Session, WorkflowId};
 use vos_wire::ingress::{
     Call, Consistency, MAX_WORKFLOW_WAIT_MS, Rejection, Response, WorkflowRead, WorkflowStatus,
     workflow_read_horizon,
 };
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode};
-use vos_wire::{defaults, expiry, keys};
+use vos_wire::{defaults, expiry};
 
 const COUNTER: InstanceId = InstanceId(1);
 /// The seed of the operator key every served node lists.
@@ -70,7 +71,7 @@ fn schema_marked(
     socket: &std::path::Path,
     agent: AgentId,
     instance: InstanceId,
-) -> Option<vos_wire::schema::Schema> {
+) -> Option<vos_abi::schema::Schema> {
     use std::io::Write;
     let mut stream = api::connect(socket);
     let body = (agent, instance).encode();

@@ -43,6 +43,7 @@ vos-pvm-compiler = { workspace = true, optional = true }
 vos-pvm-device = { workspace = true }
 # The tags, the compression, the tree and the node API's types and kinds;
 # the work an agent program runs, and its apply.
+vos-abi = { workspace = true }
 vos-wire = { workspace = true }
 vos-api = { workspace = true }
 vos-pvm-precompiles = { workspace = true }

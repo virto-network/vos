@@ -6,10 +6,10 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Session};
+use vos_abi::schema::Schema;
 use vos_node::client::Target;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Session};
 use vos_wire::peer::NodeNumber;
-use vos_wire::schema::Schema;
 
 /// The counter instance a client forwarding to the next agent increments.
 pub const COUNTER: InstanceId = InstanceId(1);

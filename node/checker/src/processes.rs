@@ -18,8 +18,8 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use vos_abi::ids::AgentId;
 use vos_node::client::{Operator, Target};
-use vos_wire::ids::AgentId;
 use vos_wire::ingress::{ReplicaStatus, Response};
 use vos_wire::peer::NodeNumber;
 

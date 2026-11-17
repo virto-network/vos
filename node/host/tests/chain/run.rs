@@ -8,6 +8,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
+use vos_abi::keys;
+use vos_abi::records::{Workflow, WorkflowState};
+use vos_abi::result::{Attest, Outcome};
+use vos_abi::vos_anchor::{
+    MAX_ROOT_AGE_MS, MIN_LENGTH_MS, RootKind, SpaceId, WindowClock, blake2b_256,
+};
 use vos_checker::carriers::{self, Canary, Frames, Logs, Tapped};
 use vos_jam_dev::JamVenue;
 use vos_kreivo::KreivoVenue;
@@ -17,14 +23,8 @@ use vos_statement_service::item::Item;
 use vos_statement_service::state::{Outcome as Judged, keys as jam_keys};
 use vos_venue::vos_statement::{Refusal, Statement};
 use vos_venue::{Status, SubmitOutcome, VenueClient};
-use vos_wire::keys;
 use vos_wire::package::SLOT_MS;
 use vos_wire::peer::NodeNumber;
-use vos_wire::records::{Workflow, WorkflowState};
-use vos_wire::result::{Attest, Outcome};
-use vos_wire::vos_anchor::{
-    MAX_ROOT_AGE_MS, MIN_LENGTH_MS, RootKind, SpaceId, WindowClock, blake2b_256,
-};
 
 use crate::agents::{Agents, Asked, READ_ENDS};
 use crate::common::Cluster;
@@ -207,7 +207,7 @@ impl Run {
             |venue: Arc<dyn Fn(NodeNumber, SpaceId) -> Arc<dyn VenueClient> + Send + Sync>| {
                 let (prover, hooks): (Arc<dyn Prover>, _) = (prover.clone(), Arc::clone(&canary));
                 move |number: NodeNumber, config: &mut Config| {
-                    let space = vos_wire::vos_anchor::space_id(
+                    let space = vos_abi::vos_anchor::space_id(
                         config.space.as_ref().unwrap().genesis().unwrap(),
                     );
                     config.venue = Some(venue(number, space));
@@ -561,7 +561,7 @@ fn replay(jam: &Jam, statement: &Statement, proof: &[u8]) -> u32 {
         let landed = jam.wire.sent()[since..].iter().find_map(|sent| {
             jam.venue
                 .statements
-                .outcome(&vos_wire::result::digest(&sent.package), &payload)
+                .outcome(&vos_abi::result::digest(&sent.package), &payload)
                 .ok()
                 .flatten()
         });

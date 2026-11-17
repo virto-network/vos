@@ -10,14 +10,14 @@ use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
 use smol::LocalExecutor;
+use vos_abi::abi::Failure;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Session};
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode};
 use vos_api::{Kind, Mark};
 use vos_node::client::{signed_call, signed_query};
-use vos_wire::abi::Failure;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Session};
 use vos_wire::ingress::{Consistency, Response};
 use vos_wire::personal::PersonalError;
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode};
 
 use super::{INSTANCE, Member, device_keys, method};
 use crate::deploy::DeployedNode;

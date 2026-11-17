@@ -8,10 +8,10 @@
 use std::sync::Arc;
 
 use ed25519_dalek::{Signer, SigningKey};
+use vos_abi::Encode;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Session};
 use vos_api::client::Answer;
 use vos_api::{Kind, Mark};
-use vos_wire::Encode;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Session};
 use vos_wire::ingress::{Call, Consistency, QueryCall};
 
 use vos_gateway::Gateway;

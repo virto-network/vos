@@ -2,24 +2,25 @@
 //! agent, against the testkit: an agent's report, sent as the agent's
 //! report step sends it, stores the agent's root in the representative's
 //! committed map under exactly the key a read's path names
-//! ([`vos_wire::served::representative_row`]) as a bare 32-byte value, as
+//! ([`vos_abi::served::representative_row`]) as a bare 32-byte value, as
 //! a kernel's prologue checks it; an ask under the key its node reads, and
 //! the window as one a read waits on; the rows of old windows gone; and no
 //! program's call writes any of it.
 
-use vos_testkit::model::Model;
-use vos_testkit::programs::{program_package, table_tag};
-use vos_wire::abi::cap::Target;
-use vos_wire::batch::{Body, Input, Message};
-use vos_wire::ids::{AgentId, MapId, MethodId, Principal, derive_id};
-use vos_wire::keys::{self, Transform};
-use vos_wire::records::unversioned;
-use vos_wire::served::{
+use vos_abi::abi::cap::Target;
+use vos_abi::ids::{AgentId, MapId, MethodId, Principal, derive_id};
+use vos_abi::keys::{self, Transform};
+use vos_abi::message::Body;
+use vos_abi::records::unversioned;
+use vos_abi::served::{
     ASKED_TAG, AgentRoot, REPRESENTATIVE, REPRESENTATIVE_ASKED, REPRESENTATIVE_ROOTS,
     REPRESENTATIVE_TAG, representative_ask, representative_row,
 };
-use vos_wire::vos_anchor::{MIN_LENGTH_MS, RootKind};
-use vos_wire::{Encode, SpaceId, WindowClock};
+use vos_abi::vos_anchor::{MIN_LENGTH_MS, RootKind};
+use vos_abi::{Encode, SpaceId, WindowClock};
+use vos_testkit::model::Model;
+use vos_testkit::programs::{program_package, table_tag};
+use vos_wire::batch::{Input, Message};
 
 use crate::common::{Node, agrees, install_in, ran};
 
@@ -51,7 +52,7 @@ fn representative() -> (Node, Model) {
     assert!(
         matches!(
             ran(&installed.steps[0]).outcome,
-            vos_wire::result::Outcome::Done(_)
+            vos_abi::result::Outcome::Done(_)
         ),
         "{:?}",
         ran(&installed.steps[0]).outcome
@@ -143,7 +144,7 @@ fn reports_are_stored(node: &mut Node, kit: &mut Model, a: AgentId, b: AgentId) 
         };
         let expected = kit.message(message.from, &message.body);
         let run = ran(step);
-        assert_eq!(run.outcome, vos_wire::result::Outcome::Done(Vec::new()));
+        assert_eq!(run.outcome, vos_abi::result::Outcome::Done(Vec::new()));
         agrees(index, run, &expected);
     }
     assert_eq!(
@@ -205,7 +206,7 @@ fn no_call_writes_a_report(node: &mut Node, a: AgentId) {
     }
     .encode();
     let client = Input::Request(vos_wire::batch::Request {
-        session: vos_wire::ids::Session {
+        session: vos_abi::ids::Session {
             key: [1; 32],
             name: [0; 16],
             t0: at(8),
@@ -228,7 +229,7 @@ fn no_call_writes_a_report(node: &mut Node, a: AgentId) {
     });
     let result = node.batch(at(8), vec![client, call]);
     for step in &result.steps {
-        if let vos_wire::result::Step::Ran(run) = step {
+        if let vos_abi::result::Step::Ran(run) = step {
             assert!(run.committed.is_empty());
         }
     }
@@ -253,7 +254,7 @@ fn a_row_that_does_not_decode_is_quarantined() {
     let corrupt = vec![1, 2, 3];
     for key in [keys::reports(a), keys::reported()] {
         node.state
-            .insert(key.clone(), vos_wire::records::stored(&corrupt));
+            .insert(key.clone(), vos_abi::records::stored(&corrupt));
         kit.set_row(key, corrupt.clone());
     }
     let inputs = vec![

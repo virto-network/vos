@@ -5,9 +5,10 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 
+use vos_abi::ids::AgentId;
+use vos_abi::message::Body;
 use vos_node::Hooks;
-use vos_wire::batch::{Batch, Body, Input, Message};
-use vos_wire::ids::AgentId;
+use vos_wire::batch::{Batch, Input, Message};
 
 /// Holds whoever passes while it is closed, counting them. As a node's
 /// hooks, it holds the node's commits.

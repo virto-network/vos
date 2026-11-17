@@ -4,16 +4,16 @@
 //! statement accepted, and one whose output, public arguments or witness
 //! is not refused; and `vos program-id`'s ids, the repository's constants.
 
+use vos_abi::Encode;
+use vos_abi::abi::cap::Target;
+use vos_abi::ids::{AgentId, InstanceId, Principal, ProgramHash};
+use vos_abi::result::Attest;
 use vos_node_prover::masked::{MaskedProver, kernel_record};
 use vos_node_prover::program::program_id;
 use vos_node_prover::{Prover, StatementError};
 use vos_pvm_proof::constants;
 use vos_testkit::model::Model;
 use vos_testkit::programs::{actor_elf, derived, method};
-use vos_wire::Encode;
-use vos_wire::abi::cap::Target;
-use vos_wire::ids::{AgentId, InstanceId, Principal, ProgramHash};
-use vos_wire::result::Attest;
 
 /// The `kernels` actor's `check` run live on `values`: each kernel's blob
 /// and the attest it recorded.

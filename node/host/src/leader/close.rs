@@ -10,11 +10,11 @@
 //! nothing for a window its mark has passed ([`keys::reported`],
 //! [`keys::close_mark`]).
 
+use vos_abi::ids::AgentId;
+use vos_abi::keys;
+use vos_abi::{Decode, defaults};
+use vos_wire::batch::Closing;
 use vos_wire::batch::Input;
-use vos_wire::ids::AgentId;
-use vos_wire::keys;
-use vos_wire::served::Closing;
-use vos_wire::{Decode, defaults};
 
 use super::Leader;
 use crate::fault::{Fault, read};

@@ -49,12 +49,12 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
+use vos_abi::Decode;
+use vos_abi::ids::{AgentId, InstanceId};
+use vos_abi::result::Outcome;
 use vos_checker::calls::signed_query;
 use vos_checker::programs::package;
-use vos_wire::Decode;
-use vos_wire::ids::{AgentId, InstanceId};
 use vos_wire::ingress::{Consistency, Response};
-use vos_wire::result::Outcome;
 
 use load::{
     Bodies, Leaders, Pace, Plan, Signed, closed_calls, drive, new_sessions, open_calls, plans,

@@ -7,6 +7,11 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, Session, SessionId};
+use vos_abi::keys;
+use vos_abi::records::{SessionMark, unstored};
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, WindowClock};
 use vos_checker::hooks::Gate;
 use vos_checker::programs::agent;
 use vos_checker::spaces::space;
@@ -14,12 +19,7 @@ use vos_checker::{Log, Nodes};
 use vos_net::memory::Hub;
 use vos_node::client::Target;
 use vos_node::{CallError, Config, Hooks, Node, Peers, Space};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session, SessionId};
-use vos_wire::keys;
 use vos_wire::peer::NodeNumber;
-use vos_wire::records::{SessionMark, unstored};
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, WindowClock};
 
 pub const NODES: NodeNumber = 3;
 
@@ -140,7 +140,7 @@ impl Cluster {
         let offset = Arc::new(AtomicI64::new(0));
         let venue_offset = Arc::clone(&offset);
         let venue = Arc::new(vos_venue::ModelVenue::new(
-            vos_wire::vos_anchor::VenueId([0x7e; 32]),
+            vos_abi::vos_anchor::VenueId([0x7e; 32]),
             Arc::new(move || {
                 vos_node::wall_clock().saturating_add_signed(venue_offset.load(Ordering::SeqCst))
             }),

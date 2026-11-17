@@ -131,7 +131,7 @@ pub use threads::thread_pool;
 pub use tree::{Synced, TreeKeeper};
 pub use vos_pvm_device::Error as ProgramError;
 
-use vos_wire::credentials::{self, P};
+use vos_abi::credentials::{self, P};
 use vos_wire::ingress::Rejection;
 
 /// A digest: eight M31 words, each below `p`. Its bytes are the words as

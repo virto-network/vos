@@ -4,7 +4,7 @@
 
 use blake2::{Blake2b512, Digest as _};
 use sha2::Sha256;
-use vos_wire::credentials::{P, Tag, Words, compress};
+use vos_abi::credentials::{P, Tag, Words, compress};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::Digest;

@@ -3,9 +3,9 @@
 
 use alloc::vec::Vec;
 
-use vos_wire::abi::{Failure, Rows, cap, price};
-use vos_wire::ids::InstanceId;
-use vos_wire::keys;
+use vos_abi::abi::{Failure, Rows, cap, price};
+use vos_abi::ids::InstanceId;
+use vos_abi::keys;
 
 use crate::machines::Machine;
 

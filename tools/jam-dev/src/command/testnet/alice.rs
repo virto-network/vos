@@ -1,12 +1,12 @@
 //! Alice, the run's client: her calls, signed for the agent's service.
 
 use ed25519_dalek::SigningKey;
+use vos_abi::ids::{InstanceId, MethodId, Principal, Session};
+use vos_abi::result::digest;
 use vos_jam::{Error, admit};
 use vos_node::client::signed_call;
 use vos_wire::batch::Input;
-use vos_wire::ids::{InstanceId, MethodId, Principal, Session};
 use vos_wire::package::identity;
-use vos_wire::result::digest;
 
 /// Alice: her key, the session her first call starts, and the sequence of
 /// her last call in it.

@@ -6,17 +6,17 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use vos_abi::abi::surface::LOST;
+use vos_abi::abi::{cap, code};
+use vos_abi::jam::{AccumulateInput, Operand};
+use vos_abi::result::{WorkResult, split_output};
 use vos_pvm::ExitReason;
 use vos_pvm::accumulate_host::AccumulateContext;
 use vos_pvm::inner::gp_call::HISTORICAL_LOOKUP;
 use vos_pvm::refine::{Machine, MemoryModel};
 use vos_pvm::refine_host::{RefineContext, StateReader, serve_lookup};
-use vos_wire::abi::surface::LOST;
-use vos_wire::abi::{cap, code};
 use vos_wire::batch::{Batch, Work};
 use vos_wire::defaults;
-use vos_wire::jam::{AccumulateInput, Operand};
-use vos_wire::result::{WorkResult, split_output};
 
 use vos_jam::{Error, Runner};
 

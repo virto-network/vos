@@ -19,11 +19,11 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGua
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use smol::future::FutureExt;
+use vos_abi::Encode;
+use vos_abi::ids::AgentId;
 use vos_net::{Class, Incoming};
 use vos_raft::Role;
 use vos_raft::pair::{Frame, PeerTable, Round, Telling};
-use vos_wire::Encode;
-use vos_wire::ids::AgentId;
 use vos_wire::peer::{Leading, NodeNumber, PeerMessage};
 
 use crate::group::{Local, Quiet};

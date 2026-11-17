@@ -139,7 +139,7 @@ fn a_page_section_near_its_cap_fits_the_heap() {
             _ => None,
         })
         .sum();
-    let cap = cap::RESULT_PAGES / vos_wire::result::PAGE;
+    let cap = cap::RESULT_PAGES / vos_abi::result::PAGE;
     assert!(stored > 3 * cap / 4 && stored <= cap, "{stored} pages");
     assert!(matches!(flows.record(7).state, WorkflowState::Ready(_)));
     let sweep = flows.sweeping(1);

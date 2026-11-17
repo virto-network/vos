@@ -25,9 +25,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use vos_abi::Encode;
 use vos_api::Kind;
 use vos_api::client::Answer;
-use vos_wire::Encode;
 use vos_wire::ingress::Response;
 
 use crate::limits::{Rate, counted};

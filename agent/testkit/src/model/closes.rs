@@ -5,15 +5,15 @@
 
 use std::collections::BTreeMap;
 
-use vos_wire::batch::Body;
-use vos_wire::ids::AgentId;
-use vos_wire::result::{Outcome, Outgoing, Write};
-use vos_wire::served::{
-    AgentPath, AgentRoot, ClosedRow, REPORTS_KEPT, REPRESENTATIVE, representative_ask,
-    representative_row,
+use vos_abi::ids::AgentId;
+use vos_abi::message::Body;
+use vos_abi::result::{Outcome, Outgoing, Write};
+use vos_abi::served::{
+    AgentRoot, ClosedRow, REPORTS_KEPT, REPRESENTATIVE, representative_ask, representative_row,
 };
-use vos_wire::vos_anchor::RootKind;
-use vos_wire::{Decode, Encode, SpaceId, defaults, keys};
+use vos_abi::vos_anchor::RootKind;
+use vos_abi::{Decode, Encode, SpaceId, defaults, keys};
+use vos_wire::batch::AgentPath;
 
 use super::{Model, Step};
 

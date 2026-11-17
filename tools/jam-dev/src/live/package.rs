@@ -14,8 +14,8 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde_json::json;
+use vos_abi::result::digest;
 use vos_tree::Hash;
-use vos_wire::result::digest;
 
 use super::rpc::decoded;
 use super::{PolkaJam, Watch, failed};

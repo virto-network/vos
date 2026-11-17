@@ -8,12 +8,12 @@ use std::ops::Deref;
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
+use vos_abi::ids::{AgentId, InstanceId, MethodId};
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode};
 use vos_node::client::{Client, Target};
 use vos_node::{CallError, Node, Reply};
-use vos_wire::ids::{AgentId, InstanceId, MethodId};
 use vos_wire::ingress::{Consistency, Install, Response};
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode};
 
 use crate::processes::PROCESS_WAIT;
 use crate::wait_until;

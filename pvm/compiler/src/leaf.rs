@@ -27,7 +27,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use vos_wire::records::{SEGMENT_CHIPS, Shape};
+use vos_abi::records::{SEGMENT_CHIPS, Shape};
 
 /// A column's mask: the rows its constraints read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,7 +110,7 @@ pub const RELATIONS: [(&str, u32); 21] = [
     ("MerkleNode", 66),
 ];
 
-/// The segment AIR's chips, in its order (`vos_wire::records::segment_chip`).
+/// The segment AIR's chips, in its order (`vos_abi::records::segment_chip`).
 pub const CHIPS: [Chip; SEGMENT_CHIPS] = [
     // CPU
     Chip {
@@ -843,7 +843,7 @@ pub(crate) fn oversized_leaves(shape: &Shape) -> Vec<(usize, [usize; 3])> {
 
 #[cfg(test)]
 mod tests {
-    use vos_wire::records::SegmentClass;
+    use vos_abi::records::SegmentClass;
 
     use super::*;
 

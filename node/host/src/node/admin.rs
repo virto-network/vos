@@ -4,10 +4,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use vos_abi::abi::cap::Target;
+use vos_abi::ids::{AgentId, InstanceId, MethodId, ProgramHash};
 use vos_raft::Role;
-use vos_wire::abi::cap::Target;
 use vos_wire::batch::Admin;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, ProgramHash};
 use vos_wire::ingress::Unplaced;
 use vos_wire::peer::{CreationRecord, NodeNumber, Placement};
 
@@ -123,7 +123,7 @@ impl Inner {
     ) -> Result<AgentId, CallError> {
         let replicas = self.replicas(replicas)?;
         let mut next = self.next_agent.lock().await;
-        let agent = CreationRecord::agent_id(self.number, *next);
+        let agent = AgentId::new(self.number, *next);
         if *next >= 1 << 24 || agent == crate::store::NODE_AGENT {
             return Err(CallError::Failed(
                 "this node's agent ids are exhausted".into(),
@@ -152,10 +152,10 @@ impl Inner {
                 "a space without a genesis has no representative".into(),
             ));
         };
-        if CreationRecord::creator_of(agent) != self.number {
+        if agent.creator() != self.number {
             return Err(CallError::Failed(format!(
                 "node {} creates the representative",
-                CreationRecord::creator_of(agent)
+                agent.creator()
             )));
         }
         let replicas = self.replicas(replicas)?;

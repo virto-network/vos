@@ -4,9 +4,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
+use vos_abi::Encode;
+use vos_abi::ids::{AgentId, Principal};
 use vos_api::Kind;
-use vos_wire::Encode;
-use vos_wire::ids::{AgentId, Principal};
 use vos_wire::ingress::{
     Create, Grant, Install, NodeId, OperatorRefusal, Rejection, Replace, Response, Retire,
 };

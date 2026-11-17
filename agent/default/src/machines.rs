@@ -13,10 +13,10 @@
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
+use vos_abi::abi::{Failure, code, precompile};
 use vos_pvm_program::{
     HALT_ADDRESS, INPUT_SIZE, PAGE_SIZE, REGISTER_COUNT, Region, StandardHeader, ZONE_SIZE,
 };
-use vos_wire::abi::{Failure, code, precompile};
 
 use crate::host::{
     EXPUNGE, INSTANTIATE, INVOKE, MACHINE, PAGES, PEEK, POKE, ecalli, historical_lookup,

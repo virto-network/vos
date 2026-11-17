@@ -24,13 +24,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use vos_abi::ids::{AgentId, InstanceId};
+use vos_abi::keys;
+use vos_abi::result::Write;
 use vos_checker::crash::{Round, Rounds, journal, slot_key};
 use vos_node::NoHooks;
 use vos_node::storage::{Change, StorageThread};
 use vos_node::store::{Fjall, HardState, Membership, Switch, next_epoch};
-use vos_wire::ids::{AgentId, InstanceId};
-use vos_wire::keys;
-use vos_wire::result::Write;
 
 const AGENT: AgentId = AgentId(1);
 const KEYS: u64 = 600;

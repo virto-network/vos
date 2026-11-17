@@ -3,13 +3,13 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use vos_abi::Decode;
+use vos_abi::ids::InstanceId;
+use vos_abi::result::Outcome;
 use vos_api::Kind;
 use vos_node::client::ClientError;
-use vos_wire::Decode;
-use vos_wire::ids::InstanceId;
 use vos_wire::ingress::{Consistency, Rejection, Response};
 use vos_wire::peer::NodeNumber;
-use vos_wire::result::Outcome;
 
 use super::{Client, post};
 use crate::calls;

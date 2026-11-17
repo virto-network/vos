@@ -6,7 +6,7 @@ use vos_wire::personal::{
     Acknowledged, DeviceView, Entry, Envelope, InboxItem, PersonalError, Recorded, Scope,
 };
 
-use vos_wire::ids::AgentId;
+use vos_abi::ids::AgentId;
 
 use super::*;
 

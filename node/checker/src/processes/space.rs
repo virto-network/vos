@@ -2,8 +2,8 @@
 //! created and installed, their identities and methods, and their replicas
 //! converged.
 
+use vos_abi::ids::{AgentId, InstanceId};
 use vos_node::client::Operator;
-use vos_wire::ids::{AgentId, InstanceId};
 use vos_wire::ingress::{Install, ReplicaStatus, Response};
 use vos_wire::peer::NodeNumber;
 

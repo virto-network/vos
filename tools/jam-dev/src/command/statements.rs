@@ -24,6 +24,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::{Signer, SigningKey};
+use vos_abi::jam::RefineArgs;
+use vos_abi::result::digest;
 use vos_jam_dev::live::statements::{Deployed, deploy};
 use vos_jam_dev::live::{PolkaJam, Watch};
 use vos_jam_dev::venue::{JamVenue, register_code};
@@ -39,9 +41,7 @@ use vos_statement_service::item::{Item, Op};
 use vos_statement_service::state::Outcome;
 use vos_statement_service::verdict::{AnchorCode, ControlCode};
 use vos_venue::VenueClient;
-use vos_wire::jam::RefineArgs;
 use vos_wire::package::EPOCH_MS;
-use vos_wire::result::digest;
 
 use crate::at;
 

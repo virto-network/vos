@@ -9,13 +9,13 @@
 //! workflow learns at once. One not closed waits until its deadline ends
 //! it.
 
-use vos_wire::abi::cap::{Limits, Target};
+use vos_abi::abi::cap::{Limits, Target};
+use vos_abi::ids::{AgentId, RequestId};
+use vos_abi::keys;
+use vos_abi::records::{PendingRead, unstored};
+use vos_abi::served::{ClosedRow, Served};
+use vos_abi::{Decode, Encode, SpaceId};
 use vos_wire::batch::Input;
-use vos_wire::ids::{AgentId, RequestId};
-use vos_wire::keys;
-use vos_wire::records::{PendingRead, unstored};
-use vos_wire::served::{ClosedRow, Served};
-use vos_wire::{Decode, Encode, SpaceId};
 
 use super::Leader;
 use crate::fault::{Fault, read};

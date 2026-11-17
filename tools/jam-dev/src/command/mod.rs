@@ -8,8 +8,8 @@ mod testnet;
 use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
+use vos_abi::result::digest;
 use vos_pvm_compiler::{ServiceMetadata, service_blob};
-use vos_wire::result::digest;
 
 use crate::{at, link};
 

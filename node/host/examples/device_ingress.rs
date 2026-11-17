@@ -28,16 +28,18 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
+use vos_abi::credentials as tree;
+use vos_abi::credentials::{Tag, Words};
+use vos_abi::ids::{AgentId, InstanceId, Principal};
+use vos_abi::result::Outcome;
+use vos_abi::{Decode, Encode, SpaceId, WindowClock};
 use vos_checker::calls::installed;
 use vos_checker::programs::{Programs, actor, method, package, program, program_elf};
 use vos_light::{DEVICE_FORMAT, DeviceProgram, Prover, ProverConfig, Threads};
 use vos_node::client::{self, Client, Target};
 use vos_node::{Config, Node};
-use vos_wire::credentials::{self as tree, AuthClaim, Bound, Path as TreePath, Tag, Words};
-use vos_wire::ids::{AgentId, InstanceId, Principal};
+use vos_wire::credentials::{AuthClaim, Bound, Path as TreePath};
 use vos_wire::ingress::{Credentialed, Response};
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode, SpaceId, WindowClock};
 
 const CREDENTIALS: InstanceId = InstanceId(9);
 const POLL: InstanceId = InstanceId(3);
@@ -211,7 +213,7 @@ impl Served {
             proof: Vec::new(),
         };
         let path = self.path();
-        let scope = tree::scope(&self.space, self.agent, POLL, b"login");
+        let scope = vos_wire::credentials::scope(&self.space, self.agent, POLL, b"login");
         let words = |digest: &tree::Digest| tree::words(digest).expect("a digest's words");
         let nullifier = tree::digest(&tree::compress(
             &tree::compress(&Tag::Nf.block(), &SECRET),
@@ -232,7 +234,7 @@ impl Served {
             map_root: path.root,
             scope,
             nullifier,
-            binding: tree::binding(&bound),
+            binding: vos_wire::credentials::binding(&bound),
         }
         .encode();
         // The kernel's arguments in place: the path's siblings and its slot's
@@ -273,7 +275,7 @@ fn main() {
     let served = start();
     std::fs::write(
         options.dir.join("auth.device"),
-        vos_wire::Encode::encode(&device),
+        vos_abi::Encode::encode(&device),
     )
     .expect("the release artifact written");
     let prover = options.prove.then(|| {

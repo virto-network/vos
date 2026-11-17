@@ -76,4 +76,4 @@ pub(crate) fn refused(code: Code, message: impl Into<String>) -> Refusal {
 }
 
 const _: () = assert!(s4_credential_contract::MAX_NAME == vos_light::NAME_BYTES);
-const _: () = assert!(s4_credential_contract::MAX_ARGUMENTS == vos_wire::abi::cap::REQUEST);
+const _: () = assert!(s4_credential_contract::MAX_ARGUMENTS == vos_abi::abi::cap::REQUEST);
