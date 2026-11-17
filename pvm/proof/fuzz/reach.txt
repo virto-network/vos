@@ -1,0 +1,6 @@
+# What each replay corpus (`replay/<target>/`) must reach, checked by `just
+# fuzz-reach` (`cargo run --release --example paths -- --expect
+# reach.txt`): a line `<target>\t<verdict>` a verdict the example prints
+# for one input of the target at least. Written from the example's output
+# when the corpora are rebuilt (`just fuzz-refresh`), never widened by hand
+# past what the corpus reaches.

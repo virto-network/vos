@@ -3,11 +3,18 @@
 //! counted by verdict a target. `prove_verify_roundtrip`'s inputs are
 //! programs, counted alone.
 //!
+//! With `--expect <file>` (`just fuzz-reach`, `reach.txt`), it fails
+//! unless every verdict the file lists for a target, a line
+//! `<target>\t<verdict>`, is reached by one of its inputs at least: a
+//! corpus that drifts off a check stops guarding it, and the gate says so.
+//!
 //! ```text
 //! cd pvm/proof/fuzz
-//! cargo run --release --example paths
+//! cargo run --release --example paths [-- --expect reach.txt]
 //! ```
 
+#[path = "../fuzz_targets/device_program.rs"]
+mod device_program;
 #[path = "../fuzz_targets/golden.rs"]
 mod golden;
 #[path = "../fuzz_targets/mutation.rs"]
@@ -15,8 +22,9 @@ mod mutation;
 #[path = "../fuzz_targets/shape.rs"]
 mod shape;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::OnceLock;
 
 use arbitrary::{Arbitrary, Unstructured};
 use vos_anchor::vectors::Vector;
@@ -38,6 +46,12 @@ fn decoded<T, E: std::fmt::Debug>(name: &str, result: Result<T, E>) -> String {
         Ok(_) => format!("{name}: decodes"),
         Err(error) => format!("{name}: {error:?}"),
     }
+}
+
+/// `device_verify_bytes`' program's verifier, made once.
+fn device_verifier() -> &'static vos_pvm_device::Verifier {
+    static VERIFIER: OnceLock<vos_pvm_device::Verifier> = OnceLock::new();
+    VERIFIER.get_or_init(|| device_program::program().verifier())
 }
 
 /// The verdicts `bytes` reaches as `target`'s input.
@@ -108,6 +122,13 @@ fn paths(target: &str, bytes: &[u8]) -> Vec<String> {
             Ok(_) => "accepted".into(),
             Err(refusal) => format!("{refusal:?}"),
         }],
+        "device_verify_bytes" => vec![match bytes.split_first_chunk::<32>() {
+            None => "shorter than an io-hash".into(),
+            Some((io, proof)) => match device_verifier().verify(io, proof) {
+                Ok(()) => "accepted".into(),
+                Err(refusal) => format!("{refusal:?}"),
+            },
+        }],
         "anchor_decode" => vec![
             decoded("genesis", SpaceGenesis::decode(bytes)),
             decoded("anchor", Anchor::decode(bytes)),
@@ -117,7 +138,35 @@ fn paths(target: &str, bytes: &[u8]) -> Vec<String> {
     }
 }
 
+/// The verdicts `file` lists, by target: each line `<target>\t<verdict>`,
+/// blank lines and `#` comments skipped.
+fn expected(file: &Path) -> BTreeMap<String, BTreeSet<String>> {
+    let text = std::fs::read_to_string(file).expect("the expected verdicts");
+    let mut expected: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (target, verdict) = line
+            .split_once('\t')
+            .expect("a line `<target>\\t<verdict>`");
+        expected
+            .entry(target.to_owned())
+            .or_default()
+            .insert(verdict.to_owned());
+    }
+    expected
+}
+
 fn main() {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let expect = match arguments.as_slice() {
+        [] => None,
+        [flag, file] if flag == "--expect" => Some(expected(Path::new(file))),
+        _ => panic!("usage: paths [--expect <file>]"),
+    };
+    let mut reached: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let replay = Path::new(env!("CARGO_MANIFEST_DIR")).join("replay");
     let mut targets: Vec<_> = std::fs::read_dir(&replay)
         .expect("the replay corpus")
@@ -140,8 +189,31 @@ fn main() {
             }
         }
         println!("{target}: {inputs} inputs");
-        for (path, count) in counts {
+        for (path, count) in &counts {
             println!("  {count:>5}  {path}");
         }
+        reached.insert(target, counts.into_keys().collect());
     }
+    let Some(expect) = expect else {
+        return;
+    };
+    let missing: Vec<String> = expect
+        .iter()
+        .flat_map(|(target, verdicts)| {
+            let reached = reached.get(target);
+            verdicts
+                .iter()
+                .filter(move |verdict| !reached.is_some_and(|reached| reached.contains(*verdict)))
+                .map(move |verdict| format!("{target}: {verdict}"))
+        })
+        .collect();
+    for line in &missing {
+        eprintln!("not reached: {line}");
+    }
+    assert!(
+        missing.is_empty(),
+        "the replay corpus does not reach {} expected verdicts",
+        missing.len()
+    );
+    println!("every expected verdict reached");
 }

@@ -825,6 +825,26 @@ fuzz-replay:
     cd pvm/proof/fuzz; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{proof_fuzz_targets}}" | split row ' ') { cargo fuzz run -O -s none --target-dir target/no-sanitizer $target $"replay/($target)" -- -runs=0 } }
     cd node/fuzz; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{node_fuzz_targets}}" | split row ' ') { cargo fuzz run --fuzz-dir . -O -s none --target-dir target/no-sanitizer $target $"replay/($target)" -- -runs=0 } }
 
+# What each replay corpus reaches (`cargo run --example paths` in
+# `pvm/proof/fuzz`), held to `pvm/proof/fuzz/reach.txt`: every verdict it
+# lists for a target reached by one of the target's inputs at least, so a
+# corpus that drifts off a check fails `gate`.
+fuzz-reach:
+    cd pvm/proof/fuzz; with-env { RUSTFLAGS: "-C target-cpu=native" } { cargo run --release --target-dir target/no-sanitizer --example paths -- --expect reach.txt }
+
+# The prover's replay corpora rebuilt from the goldens (but
+# `prove_verify_roundtrip`'s, whose programs need no golden): each target
+# seeded (`--example seed`), fuzzed `secs` seconds from its seeds and its
+# replay corpus as `just fuzz` runs it, then merged (`-merge=1`) into a new
+# replay corpus of the inputs that add coverage, the old one's among them.
+# It writes `replay/` and marks its new files (`git add -N`), so a remote
+# run's diff carries them; `just fuzz-reach` then lists what the new corpus
+# reaches.
+fuzz-refresh secs="120":
+    cd pvm/proof/fuzz; cargo run --release --example seed
+    cd pvm/proof/fuzz; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{proof_fuzz_targets}}" | split row ' ' | where {|target| $target != "prove_verify_roundtrip" }) { mkdir $"corpus/($target)"; cargo fuzz run -a $target $"corpus/($target)" $"replay/($target)" -- -max_total_time={{secs}} -max_len=262145 -len_control=0 -rss_limit_mb=8192 -timeout=600; rm -rf $"target/merged/($target)"; mkdir $"target/merged/($target)"; cargo fuzz run -a $target $"target/merged/($target)" $"corpus/($target)" $"replay/($target)" -- -merge=1 -max_len=262145 -rss_limit_mb=8192 -timeout=600; rm -rf $"replay/($target)"; mv $"target/merged/($target)" $"replay/($target)" } }
+    git add -N pvm/proof/fuzz/replay
+
 # Each target `secs` seconds from its corpus (a minute in `ci-full`, five in
 # `slice-gate`: `just fuzz 300`), the prover's seeded from the fixtures and
 # the anchor's vectors, the checked-in corpus beside it: no crash. One at a
@@ -860,7 +880,7 @@ check: fmt-check check-tiers check-layers build-test-actors build-programs build
 # `vos.credential` facility; last the reads at a cut.
 # Left to `just ci`: the slow fault runs, the PVM vectors, the bench and
 # prover library tests, and the lints of other feature sets.
-gate: check doc-check deny check-venue-rules check-no-std check-no-leaks check-no-faults check-kit fuzz-replay
+gate: check doc-check deny check-venue-rules check-no-std check-no-leaks check-no-faults check-kit fuzz-replay fuzz-reach
     cargo clippy -p vos-venue --all-targets --quiet -- -D warnings
     cargo clippy -p vos-http --all-targets --quiet -- -D warnings
     cargo clippy -p vos-pvm-recair --no-default-features --lib --quiet -- -D warnings
