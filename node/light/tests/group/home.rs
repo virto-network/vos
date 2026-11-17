@@ -42,8 +42,7 @@ pub struct Reply {
 impl Reply {
     /// The handler's answer: its reply, or `Personal`'s error.
     pub fn answer<T: Decode>(&self) -> Result<T, PersonalError> {
-        vos_light::wire::answer(&self.outcome)
-            .unwrap_or_else(|_| panic!("{:?}", self.outcome))
+        vos_light::wire::answer(&self.outcome).unwrap_or_else(|_| panic!("{:?}", self.outcome))
     }
 
     /// Whether `Personal` refused the call with `Settling`: what fell due

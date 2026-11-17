@@ -131,6 +131,21 @@ pub fn answer<T: Decode, E: Decode>(outcome: &Outcome) -> Result<Result<T, E>, D
     }
 }
 
+/// Whether a proven call's `answer` refuses its proof's format: the space
+/// no longer admits this app's proofs, and the app is to be updated.
+pub fn format_refused(answer: &[u8]) -> bool {
+    use vos_abi::abi::Refusal;
+    use vos_wire::ingress::CredentialRefusal;
+    match credentialed_answer(answer) {
+        Ok(Answer::Refused(CredentialRefusal::Format)) => true,
+        Ok(Answer::Other(body)) => matches!(
+            Response::decode_exact(&body),
+            Some(Response::Refused(Refusal::Format))
+        ),
+        _ => false,
+    }
+}
+
 /// A query's reply, decoded as `T`, from its answer.
 pub fn query_answer<T: Decode>(body: &[u8]) -> Result<T, DeviceError> {
     T::decode_exact(&reply(body)?).ok_or(DeviceError::Decode)

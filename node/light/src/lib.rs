@@ -105,6 +105,7 @@ pub mod release;
 pub mod route;
 pub mod sealed;
 mod secret;
+pub mod space;
 pub mod store;
 pub mod sync;
 mod threads;

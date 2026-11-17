@@ -174,7 +174,7 @@ pub fn node_over(
         directory.to_owned(),
         device,
         net,
-        vos_facility::personal::Artifacts::embedded(),
+        vos_facility::personal::embedded(),
     )
     .unwrap()
 }

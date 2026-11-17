@@ -1,37 +1,32 @@
-// SPDX-FileCopyrightText: 2026 Virto
-// SPDX-License-Identifier: AGPL-3.0-or-later
-
-//! The link to the personal agent over Tor: sealed sync's [`Link`] and the
-//! pass's [`Control`], every request through the facility's client to the
-//! home's onion under one purpose (`Personal` for what the user does,
-//! `Background` for the job's pass), so the two never share a circuit or
-//! an SSH key.
+//! The link to the personal agent: sealed sync's [`Link`] and the pass's
+//! [`Control`], every request through the [`Host`] to the home under one
+//! purpose (`Personal` for what the user does, `Background` for the job's
+//! pass), so the two never share a circuit or an SSH key.
 //!
 //! A call is signed by a key in a session the link keeps for it: the sync
 //! key's in-process, the admin key's in the UI process behind its strong
 //! biometric (the [`Sign`] a flow lends). A call refused with `Settling` is
 //! sent again after a `wake`. A read is a query signed by the sync key.
-//! Every round trip blocks the calling thread on the facility's runtime:
-//! sealed sync and the pass are synchronous, and are never called on it.
+//! Every round trip blocks the calling thread: sealed sync and the pass
+//! are synchronous.
 
 use std::time::Instant;
 
+use super::Host;
+use crate::job::{Control, Post};
+use crate::personal::{Answer, Frontier, Link};
+use crate::route::{Purpose, Route};
+use crate::wire;
 use ed25519_dalek::{Signer as _, SigningKey};
 use vos_abi::ids::{AgentId, InstanceId, MethodId, Session};
 use vos_abi::result::Outcome;
 use vos_abi::{Decode, Encode};
 use vos_api::Kind;
-use vos_light::job::{Control, Post};
-use vos_light::personal::{Answer, Frontier, Link};
-use vos_light::route::{Purpose, Route};
-use vos_light::wire;
 use vos_wire::defaults::SESSION_EXPIRY_MS;
 use vos_wire::ingress::{self, Consistency, QueryCall, Response};
 use vos_wire::personal::{
     DeviceView, Entry, Envelope, Overview, PersonalError, Pushed, Scope, Woken, method,
 };
-
-use crate::net::{Net, SpaceId};
 
 /// How long a query is good for, by the node's clock.
 const QUERY_MS: u64 = 60_000;
@@ -90,10 +85,9 @@ pub fn answer<T: Decode>(outcome: &Outcome) -> Result<Result<T, PersonalError>, 
 }
 
 /// A link to the personal agent at the home `space`.
-pub struct AgentLink<'a> {
-    net: &'a Net,
-    runtime: &'a tokio::runtime::Handle,
-    space: SpaceId,
+pub struct AgentLink<'a, H: Host> {
+    host: &'a H,
+    space: [u8; 32],
     purpose: Purpose,
     agent: Agent,
     sync: &'a SigningKey,
@@ -102,19 +96,17 @@ pub struct AgentLink<'a> {
     clock: Option<(u64, Instant)>,
 }
 
-impl<'a> AgentLink<'a> {
+impl<'a, H: Host> AgentLink<'a, H> {
     pub fn new(
-        net: &'a Net,
-        runtime: &'a tokio::runtime::Handle,
-        space: SpaceId,
+        host: &'a H,
+        space: [u8; 32],
         purpose: Purpose,
         agent: Agent,
         sync: &'a SigningKey,
         signer: &'a mut Signer,
     ) -> Self {
         Self {
-            net,
-            runtime,
+            host,
             space,
             purpose,
             agent,
@@ -130,8 +122,7 @@ impl<'a> AgentLink<'a> {
 
     /// `request`'s answer body, sent under the link's purpose.
     pub fn send(&self, request: &[u8]) -> Result<Vec<u8>, String> {
-        self.runtime
-            .block_on(self.net.request(self.space, self.purpose, request))
+        self.host.request(&self.space, self.purpose, request)
     }
 
     /// The node's time now: read once a link, then counted on.
@@ -311,14 +302,11 @@ impl<'a> AgentLink<'a> {
     }
 }
 
-impl Link for AgentLink<'_> {
+impl<H: Host> Link for AgentLink<'_, H> {
     type Error = String;
 
     fn route(&self) -> Route {
-        match self.net.client().routes(&self.space) {
-            Some(routes) => routes.route(self.purpose).unwrap_or(Route::Clearnet),
-            None => Route::Clearnet,
-        }
+        self.host.route(&self.space, self.purpose)
     }
 
     fn push(
@@ -349,7 +337,7 @@ impl Link for AgentLink<'_> {
     }
 }
 
-impl Control for AgentLink<'_> {
+impl<H: Host> Control for AgentLink<'_, H> {
     fn log(&mut self, from: u64) -> Answer<Vec<(u64, Entry)>, String> {
         self.query(method::LOG, from)
     }

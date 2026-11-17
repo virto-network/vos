@@ -221,7 +221,7 @@ impl Node {
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
             Arc::new(Net::over(arti, &directory))
         };
-        let node = Self::over(runtime, directory, device, net, Artifacts::embedded())?;
+        let node = Self::over(runtime, directory, device, net, crate::personal::embedded())?;
         let net = Arc::clone(node.facility.net());
         node.runtime.spawn(async move {
             // A failure is named when the chrome asks (`bootstrap`).
