@@ -3,6 +3,9 @@
 //! counted by verdict a target. `prove_verify_roundtrip`'s inputs are
 //! programs, counted alone.
 //!
+//! With `--each`, it prints a line `<target>\t<input>\t<verdict>` for
+//! each verdict of each input instead: what a corpus is pruned by.
+//!
 //! With `--expect <file>` (`just fuzz-reach`, `reach.txt`), it fails
 //! unless every verdict the file lists for a target, a line
 //! `<target>\t<verdict>`, is reached by one of its inputs at least: a
@@ -161,10 +164,11 @@ fn expected(file: &Path) -> BTreeMap<String, BTreeSet<String>> {
 
 fn main() {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    let expect = match arguments.as_slice() {
-        [] => None,
-        [flag, file] if flag == "--expect" => Some(expected(Path::new(file))),
-        _ => panic!("usage: paths [--expect <file>]"),
+    let (expect, each) = match arguments.as_slice() {
+        [] => (None, false),
+        [flag] if flag == "--each" => (None, true),
+        [flag, file] if flag == "--expect" => (Some(expected(Path::new(file))), false),
+        _ => panic!("usage: paths [--each | --expect <file>]"),
     };
     let mut reached: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let replay = Path::new(env!("CARGO_MANIFEST_DIR")).join("replay");
@@ -182,9 +186,14 @@ fn main() {
         let mut counts: BTreeMap<String, usize> = BTreeMap::new();
         let mut inputs = 0;
         for entry in std::fs::read_dir(&directory).expect("the target's corpus") {
-            let bytes = std::fs::read(entry.expect("an entry").path()).expect("an input");
+            let file = entry.expect("an entry").path();
+            let bytes = std::fs::read(&file).expect("an input");
             inputs += 1;
             for path in paths(&target, &bytes) {
+                if each {
+                    let name = file.file_name().and_then(|name| name.to_str());
+                    println!("{target}\t{}\t{path}", name.unwrap_or_default());
+                }
                 *counts.entry(path).or_default() += 1;
             }
         }

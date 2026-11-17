@@ -345,32 +345,43 @@ The channel's draws and `verify_pow_nonce` index nothing from the proof.
 
 ### The corpus
 
-`fuzz/replay/<target>/` holds each target's corpus, minimized by
-`cargo fuzz cmin` after a five-minute run and kept small; `just
-fuzz-replay` (in `just gate`) runs every input once; `cargo run --example
-paths` lists what each input reaches. It covers:
+`fuzz/replay/<target>/` holds each target's corpus, rebuilt by `just
+fuzz-refresh` (seeded from the goldens, fuzzed, merged to the inputs that
+add coverage) and pruned to what a verdict needs, a whole proof kept only
+where no smaller input reaches it; `just fuzz-replay` (in `just gate`)
+runs every input once, and `just fuzz-reach` (in `gate` too) holds what
+the corpus reaches to `fuzz/reach.txt`, which `cargo run --example
+paths` writes. It reaches:
 
-- format 39 by bytes: every header word, the decode, non-canonical
-  encodings, the shape (four commitments, a tree's sampled columns, four
-  trees of sampled values);
-- 39 mutated: the format, non-canonical encodings, the circuit,
-  the interaction PoW, the logup sums, the shapes (four trees or
-  commitments, a column's samples, a tree's queried columns, FRI's
-  layers), OODS, PoW, Merkle (queried-value shape, root, witness short
-  and long), FRI (first and inner layers' evaluations and commitments,
-  the layer count), and mutations that cancel, accepted;
-- 39 reshaped: non-canonical encodings, Merkle (shape, root, witness
-  short and long), FRI's first and inner layers' evaluations and
-  commitments;
-- the venue: a short or non-canonical statement, the format, the
-  program, the venue, the space, an unanchored root, a repeat, and the
-  proof's decode, format, non-canonical encoding and shape;
-- the anchor: each decoder's short, non-canonical and trailing inputs,
-  and a decode.
+- format 39 by bytes (`final_verifier_bytes`, `masked_bytes` past the
+  golden's header): the format word, the decode, non-canonical encodings,
+  the shape before any Stwo call (four commitments, four decommitments,
+  four trees of sampled and of queried values, a tree's sampled columns, a
+  count over its bound), and, on whole proofs, the circuit, the
+  interaction PoW, the logup sums, a Merkle root and the golden accepted;
+- 39 mutated (`final_verifier_mutate`): the format, non-canonical
+  encodings, the circuit, the interaction PoW, the logup sums, the shapes
+  (four trees, a column's samples, a tree's queried columns, FRI's
+  layers), OODS, PoW, Merkle (queried-value shape, root, witness short and
+  long), FRI (first and inner layers' evaluations and commitments), and
+  mutations that cancel, accepted;
+- 39 reshaped (`masked_shape`): non-canonical encodings, Merkle (shape,
+  root, witness short and long), FRI's first and inner layers'
+  evaluations and commitments, and accepted;
+- the venue (`statement_decode`): a short or non-canonical statement, the
+  format, the program, the space, an unanchored root, a repeat, the
+  proof's decode, format, non-canonical encoding and shape, and the golden
+  accepted;
+- the anchor (`anchor_decode`): each decoder's short, non-canonical and
+  trailing inputs, and a decode;
+- the device verifier (`device_verify_bytes`): an input shorter than an
+  io-hash, the decode, the format, the interaction PoW pre-check, and an
+  honest proof accepted.
 
 Not covered: FRI's last layer (its evaluations; its degree, which the
-layout holds) and the two degenerate DEEP lines (the fork's unit
-tests).
+layout holds), the device verifier past its pre-check on a malformed
+proof (its masked verify is 39's, which the targets above reach), and
+the two degenerate DEEP lines (the fork's unit tests).
 
 ## The Stwo fork's open divergences
 
