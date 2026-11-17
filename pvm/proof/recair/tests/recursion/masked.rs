@@ -46,12 +46,11 @@ use stwo::core::fri::{CirclePolyDegreeBound, FriVerificationError, FriVerifier};
 use stwo::core::vcs::blake2b_hash::Blake2bHash;
 use stwo::core::vcs_lifted::blake2b_merkle::Blake2bMerkleChannel;
 use vos_pvm_final_verifier::masked::{self, FRI_ROUNDS, MASKED_WRAP, verify_with};
-use vos_pvm_final_verifier::masking::{MaskedFormat, fri_rounds, shape_of};
+use vos_pvm_final_verifier::masking::{MaskedFormat, fri_rounds, shape_of, verifier_format};
 use vos_pvm_final_verifier::{
     Error, MAX_PROOF_BYTES, PREPROCESSED_ROOT_39, PUBLIC_WORDS, Statement, WrapProof,
 };
 use vos_pvm_proof::format::{self, ProofBytes, Status};
-use vos_pvm_recair::masked::verifier_format;
 use vos_pvm_recair::wrap::{self, WrapCircuit};
 use vos_pvm_recair_air::format::Masking;
 use vos_pvm_recair_air::wrap::WrapComponents;

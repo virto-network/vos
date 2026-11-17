@@ -6,11 +6,13 @@
 //! reproduces a proof byte for byte. Each proof is verified by the final
 //! verifier's masked verifier (`vos_pvm_final_verifier::masked`), over the
 //! set and channel it was proved on, under the format as the verifier pins
-//! it (`vos_pvm_recair::masked::verifier_format`).
+//! it (`vos_pvm_final_verifier::masking::verifier_format`).
 
 use crate::common::random_circuit;
 use vos_pvm_final_verifier::Error;
-use vos_pvm_final_verifier::masking::{Claim, MaskedFormat, replay, verify_masked};
+use vos_pvm_final_verifier::masking::{
+    Claim, MaskedFormat, replay, verifier_format, verify_masked,
+};
 
 use num_traits::{One, Zero};
 use stwo::core::air::Component;
@@ -27,7 +29,7 @@ use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 use stwo_constraint_framework::{FrameworkComponent, TraceLocationAllocator};
 use vos_pvm_proof::format::{DeepBatching, Format, FormatParams, MASKED_WRAP, Masking};
 use vos_pvm_recair::masked::{
-    MaskRng, MaskStats, MaskedProvers, MaskedTrace, prove_masked, rank_m31, verifier_format,
+    MaskRng, MaskStats, MaskedProvers, MaskedTrace, prove_masked, rank_m31,
 };
 use vos_pvm_recair::prove::{prove_masked_on, prove_masked_tampered};
 use vos_pvm_recair::trace::{self, FirstRowFraction};

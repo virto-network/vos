@@ -21,6 +21,7 @@ use stwo::prover::backend::BackendForChannel;
 use stwo::prover::backend::simd::SimdBackend;
 use vos_pvm_device::masked::{prove_device_forced, verify_device};
 use vos_pvm_final_verifier::Error;
+use vos_pvm_final_verifier::masking::mask_rows;
 use vos_pvm_proof::AirColumn;
 use vos_pvm_proof::chips::{range_multiplicity, register_memory};
 use vos_pvm_proof::device::{DeviceShape, device_chip, device_chips_of_mask};
@@ -28,7 +29,7 @@ use vos_pvm_proof::format::{ChannelKind, Format};
 use vos_pvm_proof::framework_access::AllLookupElements;
 use vos_pvm_proof::masked::{DeviceComponents, MaskedDeviceTrace};
 use vos_pvm_proof::poseidon2::P2MerkleChannel;
-use vos_pvm_recair::masked::{Checks, MaskRng, mask_rows};
+use vos_pvm_recair::masked::{Checks, MaskRng};
 use vos_pvm_recair::trace::FirstRowFraction;
 use vos_pvm_recair_air::masking::{
     MaskedComponent, MaskedComponents, composition_log_degree_bound, sample_points,

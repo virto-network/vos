@@ -24,9 +24,9 @@
 //!   [`crate::Refusal`].
 
 use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
+use vos_pvm_final_verifier::masking::MaskedProof;
 use vos_pvm_proof::chips::CpuColumns;
 use vos_pvm_proof::device::{DeviceLayout, DeviceShape};
-use vos_pvm_recair::masked::MaskedProof;
 
 mod prove;
 mod verify;

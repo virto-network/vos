@@ -6,6 +6,7 @@ use stwo::core::fields::qm31::SecureField;
 use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use stwo::prover::backend::BackendForChannel;
 use stwo::prover::backend::simd::SimdBackend;
+use vos_pvm_final_verifier::masking::MaskedProof;
 use vos_pvm_proof::chips::CpuColumns;
 use vos_pvm_proof::device::{DEVICE_MAX_LOG_SIZE, DeviceLayout, DeviceShape, device_chips_of_code};
 use vos_pvm_proof::format::Format;
@@ -287,7 +288,7 @@ fn prove_masked<MC: MerkleChannel>(
     committed: Option<&Committed<MC>>,
     rng: MaskRng,
     checks: Checks,
-) -> Result<(vos_pvm_recair::masked::MaskedProof<MC::H>, MaskStats), Error>
+) -> Result<(MaskedProof<MC::H>, MaskStats), Error>
 where
     SimdBackend: BackendForChannel<MC>,
 {

@@ -27,6 +27,12 @@
 //! composition tree's 4 coordinates and `R`'s columns one each, its salts
 //! none); FRI's layers the rounds its degree bound folds in, its last layer
 //! the format's; every M31 limb canonical.
+//!
+//! **What a format pins of a component set** ([`verifier_format`],
+//! [`mask_rows`], [`reveals`]): pure functions of the format and the set's
+//! layout. The masked prover sizes its masks by them, and the device
+//! verifier fixes a program's floors and its pinned format with them, so
+//! both read one definition, on the verify side.
 
 use alloc::vec::Vec;
 
@@ -42,7 +48,7 @@ use stwo::core::pcs::{CommitmentSchemeVerifier, PcsConfig, TreeVec};
 use stwo::core::proof::StarkProof;
 use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use stwo::core::verifier::VerificationError;
-use vos_pvm_recair_air::format::{Masking, mix_statement_header};
+use vos_pvm_recair_air::format::{Format, Masking, mix_statement_header};
 use vos_pvm_recair_air::masking::{
     MaskedComponents, air_log_size, blinds_its_sums, committed_log_sizes, composition_oods_eval,
     eval_lifted_composition, sample_points, sample_points_from_zero,
@@ -102,6 +108,90 @@ pub fn shape_of(
     Some((widths, deep_values(&points)))
 }
 
+/// A masked registry entry as its verifier pins it
+/// ([`MaskedFormat`]): its number, its
+/// configuration and interaction PoW, its masking, `log_sizes`, and the
+/// trees' widths and DEEP values of the component set laid out as `layout`
+/// at them. `None` for an unmasked format or a set whose masks do not fit
+/// its trees.
+pub fn verifier_format<'a>(
+    format: &Format,
+    log_sizes: &'a [u32],
+    layout: &impl MaskedComponents,
+) -> Option<MaskedFormat<'a>> {
+    let masking = format.masking?;
+    let (tree_widths, deep_values) = shape_of(layout, &masking)?;
+    Some(MaskedFormat {
+        number: format.number,
+        config: format.pcs_config(),
+        interaction_pow_bits: format.interaction_pow_bits(),
+        masking,
+        log_sizes,
+        tree_widths,
+        deep_values,
+        program: &[],
+    })
+}
+
+/// Each component's `log2 h`: twice the rows a column of it reveals
+/// ([`Reveal`]), rounded up to a power of two, capped at the format's `h`,
+/// which must cover the rows themselves (`docs/design/proving.md` §5, how
+/// large `h` must be); a cap below them leaves R1 refusing every
+/// transcript. A component none of whose masked columns reads a
+/// second row takes about half the `h` of one that does; R1 checks each on
+/// every transcript. `None` for an unmasked format, or a set whose masks do
+/// not fit its trees.
+pub fn mask_rows(format: &Format, set: &impl MaskedComponents) -> Option<Vec<u32>> {
+    let format_rows = format.masking?.log_mask_rows;
+    reveals(format, set)?
+        .into_iter()
+        .map(|reveal| {
+            if reveal.offsets == 0 {
+                return Some(format_rows);
+            }
+            let rows = reveal.rows.checked_mul(2)?.checked_next_power_of_two()?;
+            Some(rows.ilog2().min(format_rows))
+        })
+        .collect()
+}
+
+/// The most a component's masked column reveals of its randomizer in one
+/// transcript (`docs/design/proving.md` §5's count): its widest set of
+/// offsets `O` (0 when none of its masked columns is sampled) and
+/// `4|O| + q(|O| + 1)` rows, four for each out-of-domain sample, one for
+/// each of the `q` decommitted queries and one for each of the
+/// composition's `|O|` reads at a query. Coinciding points reveal fewer;
+/// R1 counts a transcript's own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reveal {
+    pub offsets: usize,
+    pub rows: usize,
+}
+
+/// [`Reveal`] for each of `set`'s components under `format`'s queries.
+/// `None` for a set with no component, or a count that overflows.
+pub fn reveals(format: &Format, set: &impl MaskedComponents) -> Option<Vec<Reveal>> {
+    let queries = format.params.n_queries;
+    let air_level = air_log_size(set)?;
+    set.components()
+        .into_iter()
+        .map(|component| {
+            let offsets = component
+                .mask_points(CirclePoint::zero(), air_level)
+                .iter()
+                .skip(1)
+                .flatten()
+                .map(Vec::len)
+                .max()
+                .unwrap_or(0);
+            let rows = offsets
+                .checked_mul(4)?
+                .checked_add(queries.checked_mul(offsets.checked_add(1)?)?)?;
+            Some(Reveal { offsets, rows })
+        })
+        .collect()
+}
+
 /// The folding steps `FriVerifier::commit` takes from a committed degree
 /// bound `2^log_degree_bound` to the last layer: the first layer's
 /// `fold_step` (the circle fold among it), then `fold_step` an inner layer,
@@ -146,6 +236,16 @@ pub struct Claim<'a, R, Hash> {
     pub bound_sums: Option<&'a BoundSums<'a, R>>,
     pub interaction_pow: u64,
     pub claimed_sums: &'a [SecureField],
+}
+
+/// A masked proof, without its format's header fields: what the masked
+/// prover emits and [`verify_masked`] reads beside a [`Claim`].
+#[derive(Clone, Debug)]
+pub struct MaskedProof<H: MerkleHasherLifted> {
+    pub interaction_pow: u64,
+    /// Each component's claimed sum, blinded.
+    pub claimed_sums: Vec<SecureField>,
+    pub stark_proof: StarkProof<H>,
 }
 
 /// Each column of `values` holds one value for each of its sample points.

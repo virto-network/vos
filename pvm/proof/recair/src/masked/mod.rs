@@ -71,7 +71,7 @@ use stwo::prover::{
     DomainEvaluationAccumulator, ProvingError, Trace,
 };
 use stwo_constraint_framework::Relation;
-use vos_pvm_final_verifier::masking::{MaskedFormat, shape_of};
+use vos_pvm_final_verifier::masking::{MaskedProof, mask_rows};
 use vos_pvm_proof::format::mix_statement_header;
 use vos_pvm_proof::format::{Format, Masking};
 use vos_pvm_proof::masked::DeviceComponents;
@@ -106,65 +106,6 @@ pub(crate) fn lifting_log_size(format: &Format, log_sizes: &[u32]) -> Option<u32
         .checked_add(format.params.log_blowup)
 }
 
-/// Each component's `log2 h`: twice the rows a column of it reveals
-/// ([`Reveal`]), rounded up to a power of two, capped at the format's `h`,
-/// which must cover the rows themselves (`docs/design/proving.md` §5, how
-/// large `h` must be); a cap below them leaves R1 refusing every
-/// transcript. A component none of whose masked columns reads a
-/// second row takes about half the `h` of one that does; R1 checks each on
-/// every transcript. `None` for an unmasked format, or a set whose masks do
-/// not fit its trees.
-pub fn mask_rows(format: &Format, set: &impl MaskedComponents) -> Option<Vec<u32>> {
-    let format_rows = format.masking?.log_mask_rows;
-    reveals(format, set)?
-        .into_iter()
-        .map(|reveal| {
-            if reveal.offsets == 0 {
-                return Some(format_rows);
-            }
-            let rows = reveal.rows.checked_mul(2)?.checked_next_power_of_two()?;
-            Some(rows.ilog2().min(format_rows))
-        })
-        .collect()
-}
-
-/// The most a component's masked column reveals of its randomizer in one
-/// transcript (`docs/design/proving.md` §5's count): its widest set of
-/// offsets `O` (0 when none of its masked columns is sampled) and
-/// `4|O| + q(|O| + 1)` rows, four for each out-of-domain sample, one for
-/// each of the `q` decommitted queries and one for each of the
-/// composition's `|O|` reads at a query. Coinciding points reveal fewer;
-/// R1 counts a transcript's own.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Reveal {
-    pub offsets: usize,
-    pub rows: usize,
-}
-
-/// [`Reveal`] for each of `set`'s components under `format`'s queries.
-/// `None` for a set with no component, or a count that overflows.
-pub fn reveals(format: &Format, set: &impl MaskedComponents) -> Option<Vec<Reveal>> {
-    let queries = format.params.n_queries;
-    let air_level = air::air_log_size(set)?;
-    set.components()
-        .into_iter()
-        .map(|component| {
-            let offsets = component
-                .mask_points(CirclePoint::zero(), air_level)
-                .iter()
-                .skip(1)
-                .flatten()
-                .map(Vec::len)
-                .max()
-                .unwrap_or(0);
-            let rows = offsets
-                .checked_mul(4)?
-                .checked_add(queries.checked_mul(offsets.checked_add(1)?)?)?;
-            Some(Reveal { offsets, rows })
-        })
-        .collect()
-}
-
 /// The preprocessed columns as a masked format commits them: interpolated
 /// on `twiddles` and each extended one level.
 pub(crate) fn extend_preprocessed(
@@ -175,31 +116,6 @@ pub(crate) fn extend_preprocessed(
         .into_iter()
         .map(|poly| poly.extend(poly.log_size() + MASKED_COLUMN_EXPANSION))
         .collect()
-}
-
-/// A masked registry entry as its verifier pins it
-/// (`vos_pvm_final_verifier::masking::MaskedFormat`): its number, its
-/// configuration and interaction PoW, its masking, `log_sizes`, and the
-/// trees' widths and DEEP values of the component set laid out as `layout`
-/// at them. `None` for an unmasked format or a set whose masks do not fit
-/// its trees.
-pub fn verifier_format<'a>(
-    format: &Format,
-    log_sizes: &'a [u32],
-    layout: &impl MaskedComponents,
-) -> Option<MaskedFormat<'a>> {
-    let masking = format.masking?;
-    let (tree_widths, deep_values) = shape_of(layout, &masking)?;
-    Some(MaskedFormat {
-        number: format.number,
-        config: format.pcs_config(),
-        interaction_pow_bits: format.interaction_pow_bits(),
-        masking,
-        log_sizes,
-        tree_widths,
-        deep_values,
-        program: &[],
-    })
 }
 
 /// A component set's provers: what the masked prover evaluates the
@@ -308,15 +224,6 @@ pub struct MaskedTrace<'a, R, A = ()> {
     pub public: &'a [SecureField],
     /// The interaction trace.
     pub interaction: &'a Interaction<'a, R>,
-}
-
-/// A masked proof, without its format's header fields.
-#[derive(Clone, Debug)]
-pub struct MaskedProof<H: MerkleHasherLifted> {
-    pub interaction_pow: u64,
-    /// Each component's claimed sum, blinded.
-    pub claimed_sums: Vec<SecureField>,
-    pub stark_proof: StarkProof<H>,
 }
 
 /// What a masked prove measured.
