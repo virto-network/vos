@@ -107,9 +107,15 @@ rests on the conjectured count.
   a step, so a call cannot read its own result. What a kernel read is the
   `witness_input` of its attest.
 - **The halt rule:** a halting step's `next_pc` is `PVM_HALT_ADDR`
-  (2^32 − 2^16), which no code offset reaches, so a segment ends at that
-  pc exactly when it ends at a halt. A trap keeps `next_pc = pc`: a panic
-  cannot present as a halt. At the halt φ9..12 hold the io-hash.
+  (2^32 − 2^16), which no static jump, branch or jump-table entry of a
+  pinned program names: `kernel::kernel_side_note`, which every install's
+  pin starts from, refuses a program any of whose control transfers lands
+  on no basic block start (`vos_pvm::interpreter::bad_transfer`), the halt
+  address among them, as `derive` does. The AIR checks only that a next pc
+  is an instruction start, so the refusal is what keeps a proved run to
+  the transfers the machine takes, and a segment ends at that pc exactly
+  when it ends at a halt. A trap keeps `next_pc = pc`: a panic cannot
+  present as a halt. At the halt φ9..12 hold the io-hash.
 - **No gas is proved.** A statement says nothing of a run's cost: the live
   host meters, and live ≡ traced holds for the runs the host completed.
   The prover role bears the cost of a run it chose to prove.

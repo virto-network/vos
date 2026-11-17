@@ -227,8 +227,8 @@ pub enum DeriveError {
          read-write data at {end:#x} from a page: build with the guest's linker script"
     )]
     Heap { start: u64, size: u64, end: u64 },
-    #[error("a kernel's instruction at {0:#x} jumps statically to the halt address")]
-    HaltTarget(u64),
+    #[error("a kernel's control transfer panics whatever its registers hold: {0}")]
+    Transfer(vos_pvm::interpreter::BadTransfer),
     #[error("a kernel reaches code from {0:#x} to {1:#x}, which no code section holds whole")]
     Unreadable(u64, u64),
     #[error(
@@ -613,6 +613,51 @@ mod tests {
             .into_iter()
             .flat_map(u32::to_le_bytes)
             .collect()
+    }
+
+    /// A kernel whose jump table names the halt address, or whose branch
+    /// lands inside a block, is refused; with the entry a block start, or
+    /// a `fallthrough` ending the block before the target, it is not.
+    #[test]
+    fn a_kernel_transferring_to_no_block_start_is_refused() {
+        use crate::assembler::{Assembler, Reg};
+        use vos_pvm::interpreter::BadTransfer;
+        let code = |asm: &Assembler| {
+            vos_pvm::spi::parse_standard_program(&asm.build())
+                .unwrap()
+                .code
+        };
+        let halt = vos_pvm::PVM_HALT_ADDR as u32;
+        let mut trap = Assembler::new();
+        trap.trap();
+        let blob = code(&trap);
+        assert!(matches!(
+            kernel::transfers(&blob.code, &blob.bitmask, &[0, halt]),
+            Err(DeriveError::Transfer(BadTransfer::JumpTable { index: 1, target })) if target == halt
+        ));
+        assert!(kernel::transfers(&blob.code, &blob.bitmask, &[0]).is_ok());
+
+        let branching = |ended: bool| {
+            let mut asm = Assembler::new();
+            asm.load_imm(Reg::T0, 0);
+            if ended {
+                asm.fallthrough();
+            }
+            let target = asm.current_offset();
+            asm.load_imm(Reg::T1, 0);
+            let here = asm.current_offset();
+            asm.branch_lt_u_imm(Reg::T0, 1, target.wrapping_sub(here))
+                .trap();
+            (code(&asm), here, target)
+        };
+        let (blob, here, target) = branching(false);
+        assert!(matches!(
+            kernel::transfers(&blob.code, &blob.bitmask, &[]),
+            Err(DeriveError::Transfer(BadTransfer::Static { pc, target: to }))
+                if (pc, to) == (here as usize, u64::from(target))
+        ));
+        let (blob, ..) = branching(true);
+        assert!(kernel::transfers(&blob.code, &blob.bitmask, &[]).is_ok());
     }
 
     /// Ids 110 to 114 are no precompile: a kernel that reaches one is

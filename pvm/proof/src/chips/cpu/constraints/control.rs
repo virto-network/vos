@@ -297,10 +297,12 @@ pub(in crate::chips::cpu) fn jump_ind<E: EvalAtRow>(
     {
         // Boolean witnesses. A halt selector is only valid on JumpInd,
         // pins the computed address to the distinguished halt target,
-        // continues at that target, outside a derived program's code,
-        // whose static targets and jump-table entries all lie in it (so
-        // its segment's `pc_out` is the halt address exactly when it
-        // ends at a halt), and forbids a successor row.
+        // continues at that target, outside the program's code, and
+        // forbids a successor row. The pin refuses a program whose static
+        // targets or jump-table entries are no basic block start
+        // (`kernel::kernel_side_note`), so none is the halt address and a
+        // segment's `pc_out` is the halt address exactly when it ends at a
+        // halt.
         eval.add_constraint(
             row.is_jump_ind[0].clone() * (E::F::one() - row.is_jump_ind[0].clone()),
         );

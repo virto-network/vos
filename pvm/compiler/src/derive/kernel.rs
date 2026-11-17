@@ -144,8 +144,9 @@ fn reached_data(elf: &LinkedElf, objects: &[(u64, u64)]) -> (Vec<u8>, Vec<u8>) {
 
 /// The kernel of `method` as its blob, `transpiled` from its linked ELF:
 /// refused if it makes a host call no kernel of its kind (a `device`
-/// kernel's or a node's) may, jumps to the halt statically, or its argument
-/// pages are not its read-write data's last.
+/// kernel's or a node's) may, has a control transfer that lands on no basic
+/// block start ([`transfers`]), or its argument pages are not its
+/// read-write data's last.
 fn checked_blob(
     graph: &Graph,
     reached: &Reached,
@@ -178,9 +179,8 @@ fn checked_blob(
             },
         );
     }
-    if let Some(pc) = transpiled.static_halt_target() {
-        return Err(DeriveError::HaltTarget(pc));
-    }
+    let (code, bitmask, jump_table) = transpiled.code();
+    transfers(code, bitmask, jump_table)?;
     let blob = spi_blob(transpiled)?;
     // The argument pages are where the prologue reads into: the first of
     // the read-write region's trailing zero pages.
@@ -195,6 +195,22 @@ fn checked_blob(
         .into());
     }
     Ok(blob)
+}
+
+/// Refuses code whose jump table, static jumps or branches name a target
+/// that is no basic block start, the halt address among them: the machine
+/// panics at such a transfer, and the proof's pin, which knows instruction
+/// starts alone, refuses the program too
+/// (`vos_pvm_proof::kernel::kernel_side_note`).
+pub(super) fn transfers(
+    code: &[u8],
+    bitmask: &[u8],
+    jump_table: &[u32],
+) -> Result<(), DeriveError> {
+    match vos_pvm::interpreter::bad_transfer(code, bitmask, jump_table) {
+        Some(bad) => Err(DeriveError::Transfer(bad)),
+        None => Ok(()),
+    }
 }
 
 /// Where a kernel derived from `elf` reads its `input`: the page past its
