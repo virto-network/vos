@@ -337,7 +337,8 @@ fn a_segment_past_its_class_is_refused() {
     smaller.log_sizes[chip_idx::CPU] = 4;
     match prove_shaped(&mut kernel.whole(), &smaller, &SEGMENT) {
         Err(SegmentError::Shape {
-            chip, pinned: 4, ..
+            chip,
+            overflow: true,
         }) => assert_eq!(chip, chip_idx::CPU),
         other => panic!("{:?}", other.map(|proof| proof.log_sizes)),
     }

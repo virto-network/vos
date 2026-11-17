@@ -329,12 +329,7 @@ fn a_witness_read_past_the_largest_class_is_refused_as_a_shape() {
     input.extend((0..PAST).map(|i| i as u8));
     let full = run_on(&blob, &input);
     match prove_kernel(&full, &program.shape, 0, &SEGMENT) {
-        Err(
-            error @ vos_pvm_proof::SegmentError::Shape {
-                log_size, pinned, ..
-            },
-        ) => {
-            assert!(log_size > pinned, "{error}");
+        Err(error @ vos_pvm_proof::SegmentError::Shape { overflow: true, .. }) => {
             eprintln!("refused: {error}");
         }
         Err(error) => panic!("refused otherwise: {error}"),

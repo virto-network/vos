@@ -388,8 +388,9 @@ pub use prove::{
 #[cfg(feature = "prover")]
 pub use prove::{
     ProveProfile, install_thread_pool, prepare_side_note_for_verification, prove_profiled,
-    prove_with_explicit_components,
 };
+#[cfg(feature = "chip-isolated")]
+pub use prove::prove_with_explicit_components;
 #[cfg(feature = "debug-internals")]
 pub use prove::{
     debug_assert_constraints_explicit, debug_claimed_sums, prove_chip_isolated_format,
@@ -410,8 +411,10 @@ pub use verify::{DEFAULT_MAX_LOG_SIZE, verify};
 pub use verify::{
     ComponentOodsMask, OodsReconstruction, RecursionData, RecursionTranscript, SampleLayout,
     extract_recursion_data, reconstruct_oods_for_recursion, record_canonical_transcript,
-    replay_stark, sample_layout, sample_layout_of, verify_with_explicit_components,
+    replay_stark, sample_layout, sample_layout_of,
 };
+#[cfg(feature = "chip-isolated")]
+pub use verify::verify_with_explicit_components;
 
 /// Chip-isolated harness surface — re-exports the trait
 /// objects callers need to assemble an explicit component slice for
@@ -419,9 +422,8 @@ pub use verify::{
 /// Intended only for chip-isolated tests; production code should use
 /// `prove` / `verify`.  Callers build their own
 /// `&[&dyn MachineProverComponent]` slice from the chip structs in
-/// `crate::chips`.
-#[doc(hidden)]
-#[cfg(feature = "prover")]
+/// `crate::chips`. A test seam (`chip-isolated`).
+#[cfg(any(test, feature = "chip-isolated"))]
 pub mod harness {
     pub use crate::framework::{MachineComponent, MachineProverComponent};
 

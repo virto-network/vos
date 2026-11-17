@@ -52,14 +52,11 @@ pub enum SegmentError {
     /// A sparse memory image without its program's layout: its proof would
     /// carry an identity with every page writable.
     NoMemoryLayout,
-    /// Chip `chip` (a [`chip_idx`](crate::chip_idx)) takes log size
-    /// `log_size`, not the `pinned` one its shape gives it: its rows need
-    /// more, or it is a fixed size other than the shape's.
-    Shape {
-        chip: usize,
-        log_size: u32,
-        pinned: u32,
-    },
+    /// Chip `chip` (a [`chip_idx`](crate::chip_idx)) takes another log
+    /// size than its shape gives it: its rows need more (`overflow`), or it
+    /// is a fixed size other than the shape's. The size it needs, a value
+    /// of the run, is not held.
+    Shape { chip: usize, overflow: bool },
     /// The shape names a chip outside the segment AIR, has a log size more
     /// or fewer than its chips, or lacks the class named.
     MalformedShape,
@@ -88,12 +85,12 @@ impl core::fmt::Display for SegmentError {
             }
             Self::Shape {
                 chip,
-                log_size,
-                pinned,
-            } => write!(
-                formatter,
-                "chip {chip} takes log size {log_size}, its shape {pinned}"
-            ),
+                overflow: true,
+            } => write!(formatter, "chip {chip} needs more rows than its shape"),
+            Self::Shape {
+                chip,
+                overflow: false,
+            } => write!(formatter, "chip {chip} is another size than its shape"),
             Self::MalformedShape => formatter.write_str("the shape is not one of the segment AIR"),
         }
     }
@@ -314,7 +311,9 @@ fn prove_impl(
 /// validation harness to prove a single high-bound chip + its lookup
 /// closure without dragging in always-active CpuChip.  Proofs produced here have
 /// `component_mask = 0` and are not verifiable via `verify_standalone`;
-/// pair only with `verify_with_explicit_components`.
+/// pair only with `verify_with_explicit_components`. A test seam
+/// (`chip-isolated`).
+#[cfg(feature = "chip-isolated")]
 pub fn prove_with_explicit_components(
     side_note: &mut SideNote,
     components: &[&'static dyn crate::framework::MachineProverComponent],
@@ -710,8 +709,7 @@ fn traced_sizes(
             .unwrap_or(position);
         return Err(SegmentError::Shape {
             chip,
-            log_size,
-            pinned,
+            overflow: log_size > pinned,
         });
     }
     Ok(log_sizes)

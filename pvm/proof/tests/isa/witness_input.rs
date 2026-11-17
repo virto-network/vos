@@ -177,10 +177,7 @@ fn the_re_run_reads_exactly_its_input() {
     let longer = [&READER_INPUT[..], &[0xff; 11]].concat();
     assert_eq!(
         trace_kernel(&program, &longer, GAS).err(),
-        Some(KernelTraceError::Unread {
-            read: 20,
-            input: 21
-        })
+        Some(KernelTraceError::Unread)
     );
     let oversize = vec![0u8; vos_pvm::precompile::WITNESS_INPUT_MAX + 1];
     assert_eq!(

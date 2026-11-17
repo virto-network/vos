@@ -58,33 +58,64 @@ pub struct RecairProof<H: MerkleHasherLifted = P2MerkleHasher> {
     pub stark_proof: StarkProof<H>,
 }
 
-/// Why a proof is refused.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VerifyError(pub String);
+/// Why a proof is refused: the check that refused it, none of the proof's
+/// own values.
+#[derive(Debug)]
+pub enum VerifyError {
+    /// Not the recursion AIR's format, channel or configuration.
+    Format,
+    /// A component's log size outside the proof bounds, or too many
+    /// outputs.
+    Size,
+    /// Not three trees, or a Merkle or FRI witness past its bound, or FRI's
+    /// last layer of another length than the format's.
+    Shape,
+    /// A limb at or past `p`.
+    Noncanonical,
+    /// The proof is of another circuit.
+    Circuit,
+    /// The claimed sums and the public terms do not add to zero.
+    Logup,
+    /// The queried rows are not the Fiat–Shamir query positions.
+    Queries,
+    /// The shared preflight's refusal.
+    Malformed(vos_pvm_proof::proof::Malformed),
+    /// The format's security floor not met at the proof's shape.
+    Security(vos_pvm_proof::proof::SecurityError),
+    /// Stwo's verifier refused.
+    Stwo(stwo::core::verifier::VerificationError),
+}
 
 impl core::fmt::Display for VerifyError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(&self.0)
+        match self {
+            Self::Format => f.write_str("not the recursion AIR's format"),
+            Self::Size => f.write_str("a log size or the outputs past the proof bounds"),
+            Self::Shape => f.write_str("the trees, a witness or FRI's last layer not the format's"),
+            Self::Noncanonical => f.write_str("the proof has a noncanonical M31 limb"),
+            Self::Circuit => f.write_str("the proof is of another circuit"),
+            Self::Logup => f.write_str("the claimed sums and the public terms do not add to zero"),
+            Self::Queries => {
+                f.write_str("queried-value rows differ from the Fiat-Shamir query positions")
+            }
+            Self::Malformed(refusal) => refusal.fmt(f),
+            Self::Security(refusal) => refusal.fmt(f),
+            Self::Stwo(error) => write!(f, "Stwo verification: {error}"),
+        }
     }
 }
 
 impl std::error::Error for VerifyError {}
 
-impl From<String> for VerifyError {
-    fn from(message: String) -> Self {
-        Self(message)
-    }
-}
-
 impl From<vos_pvm_proof::proof::Malformed> for VerifyError {
     fn from(refusal: vos_pvm_proof::proof::Malformed) -> Self {
-        Self(refusal.to_string())
+        Self::Malformed(refusal)
     }
 }
 
 impl From<vos_pvm_proof::proof::SecurityError> for VerifyError {
     fn from(refusal: vos_pvm_proof::proof::SecurityError) -> Self {
-        Self(refusal.to_string())
+        Self::Security(refusal)
     }
 }
 
@@ -421,28 +452,20 @@ fn preflight(proof: &RecairProof, format: &Format) -> Result<(), VerifyError> {
         || format.kind != ProofKind::LeafFold
         || format.channel != ChannelKind::Poseidon2M31
     {
-        return Err(VerifyError(format!(
-            "proof format {} is not the recursion AIR's",
-            proof.format_version
-        )));
+        return Err(VerifyError::Format);
     }
     if format.verifier_config(&stark.config) != format.pcs_config() {
-        return Err(VerifyError(format!(
-            "proof parameters differ from format {}'s",
-            format.number
-        )));
+        return Err(VerifyError::Format);
     }
-    if let Some(log_size) = proof
+    if !proof
         .log_sizes
         .iter()
-        .find(|&&log_size| !(MIN_PROOF_LOG_SIZE..=MAX_PROOF_LOG_SIZE).contains(&log_size))
+        .all(|log_size| (MIN_PROOF_LOG_SIZE..=MAX_PROOF_LOG_SIZE).contains(log_size))
     {
-        return Err(VerifyError(format!(
-            "component log size {log_size} is outside {MIN_PROOF_LOG_SIZE}..={MAX_PROOF_LOG_SIZE}"
-        )));
+        return Err(VerifyError::Size);
     }
     if proof.outputs.len() > (1usize << MAX_PROOF_LOG_SIZE) {
-        return Err(VerifyError("too many outputs".into()));
+        return Err(VerifyError::Size);
     }
     if [
         stark.commitments.len(),
@@ -451,18 +474,14 @@ fn preflight(proof: &RecairProof, format: &Format) -> Result<(), VerifyError> {
         stark.queried_values.len(),
     ] != [PROOF_COMMITMENT_TREE_COUNT; 4]
     {
-        return Err(VerifyError(format!(
-            "a Stwo proof has exactly {PROOF_COMMITMENT_TREE_COUNT} trees"
-        )));
+        return Err(VerifyError::Shape);
     }
     if stark
         .decommitments
         .iter()
         .any(|decommitment| decommitment.hash_witness.len() > MAX_MERKLE_WITNESS_HASHES)
     {
-        return Err(VerifyError(
-            "a trace Merkle witness exceeds its bound".into(),
-        ));
+        return Err(VerifyError::Shape);
     }
     let fri = &stark.fri_proof;
     let bounded = |layer: &stwo::core::fri::FriLayerProof<P2MerkleHasher>| {
@@ -470,14 +489,10 @@ fn preflight(proof: &RecairProof, format: &Format) -> Result<(), VerifyError> {
             && layer.decommitment.hash_witness.len() <= MAX_MERKLE_WITNESS_HASHES
     };
     if !bounded(&fri.first_layer) || !fri.inner_layers.iter().all(bounded) {
-        return Err(VerifyError(
-            "a FRI layer's witness exceeds its bound".into(),
-        ));
+        return Err(VerifyError::Shape);
     }
     if fri.last_layer_poly.iter().count() != 1usize << format.params.log_last_layer {
-        return Err(VerifyError(
-            "the FRI last layer has the wrong length".into(),
-        ));
+        return Err(VerifyError::Shape);
     }
     let canonical = |value: &SecureField| {
         value
@@ -492,7 +507,7 @@ fn preflight(proof: &RecairProof, format: &Format) -> Result<(), VerifyError> {
         .all(canonical)
         || !vos_pvm_proof::proof::stark_fields_are_canonical(stark, ProofHash::is_canonical)
     {
-        return Err(VerifyError("the proof has a noncanonical M31 limb".into()));
+        return Err(VerifyError::Noncanonical);
     }
     Ok(())
 }
@@ -504,7 +519,7 @@ pub fn verify(proof: RecairProof, circuit_hash: &Digest) -> Result<(), VerifyErr
     let stark = &proof.stark_proof;
     let log_sizes = proof.log_sizes;
     if circuit_hash_of(&log_sizes, &stark.commitments[0]) != *circuit_hash {
-        return Err(VerifyError("the proof is of another circuit".into()));
+        return Err(VerifyError::Circuit);
     }
 
     // The layout and the security count do not depend on the challenges.
@@ -537,9 +552,7 @@ pub fn verify(proof: RecairProof, circuit_hash: &Digest) -> Result<(), VerifyErr
             layout.public_terms(proof.outputs.iter().copied()),
         );
     if !total.is_zero() {
-        return Err(VerifyError(
-            "the claimed sums and the public terms do not add to zero".into(),
-        ));
+        return Err(VerifyError::Logup);
     }
 
     let queries = vos_pvm_proof::proof::expected_fiat_shamir_query_count::<P2MerkleChannel>(
@@ -555,12 +568,10 @@ pub fn verify(proof: RecairProof, circuit_hash: &Digest) -> Result<(), VerifyErr
         ],
     )?;
     if queries != protocol.query_count {
-        return Err(VerifyError(
-            "queried-value rows differ from the Fiat-Shamir query positions".into(),
-        ));
+        return Err(VerifyError::Queries);
     }
 
     let components = Components::new(&relation, &log_sizes, &proof.claimed_sums);
     stwo::core::verifier::verify(&components.as_dyn(), channel, scheme, proof.stark_proof)
-        .map_err(|error| VerifyError(format!("Stwo verification: {error}")))
+        .map_err(VerifyError::Stwo)
 }

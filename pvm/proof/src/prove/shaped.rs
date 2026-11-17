@@ -122,9 +122,7 @@ pub fn prove_kernel(
                     class,
                     proof,
                 }),
-                Err(SegmentError::Shape {
-                    log_size, pinned, ..
-                }) if log_size > pinned && b - a > 1 => {
+                Err(SegmentError::Shape { overflow: true, .. }) if b - a > 1 => {
                     let middle = a + (b - a) / 2;
                     pending.push((middle, b));
                     pending.push((a, middle));
@@ -148,8 +146,7 @@ fn prove_at_first_class(
     let steps = (b - a).next_power_of_two().trailing_zeros();
     let mut overflow = SegmentError::Shape {
         chip: crate::chip_idx::CPU,
-        log_size: steps,
-        pinned: 0,
+        overflow: true,
     };
     for (index, class) in shape.classes.iter().enumerate() {
         if steps > u32::from(class.log_steps) {
@@ -158,11 +155,7 @@ fn prove_at_first_class(
         let segment = shape.segment(index).ok_or(SegmentError::MalformedShape)?;
         match prove_shaped(&mut cursor.side_note(a, b), &segment, format) {
             Ok(proof) => return Ok((index, proof)),
-            Err(
-                error @ SegmentError::Shape {
-                    log_size, pinned, ..
-                },
-            ) if log_size > pinned => overflow = error,
+            Err(error @ SegmentError::Shape { overflow: true, .. }) => overflow = error,
             Err(error) => return Err(error),
         }
     }

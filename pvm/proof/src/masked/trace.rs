@@ -129,8 +129,7 @@ pub fn masked_device_trace(
     {
         return Err(SegmentError::Shape {
             chip,
-            log_size: trace.log_size,
-            pinned,
+            overflow: trace.log_size > pinned,
         });
     }
     let mut io = [0u8; 32];

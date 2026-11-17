@@ -41,7 +41,9 @@ pub struct KernelTrace {
     pub reads: Vec<WitnessRead>,
 }
 
-/// Why a kernel's run could not be re-traced.
+/// Why a kernel's run could not be re-traced: the kind of refusal alone,
+/// none of the run's values (its exit's address or step, the bytes it
+/// read), which stay with the prover role.
 #[derive(Debug, PartialEq, Eq)]
 pub enum KernelTraceError {
     /// The blob is not a standard program, or its layout does not fit.
@@ -49,12 +51,12 @@ pub enum KernelTraceError {
     /// The input is past a witness input's cap.
     Input,
     /// The run stopped otherwise than by its halt.
-    Exit(ExitReason),
+    Exit,
     /// Its output is not readable where φ7 and φ8 name it.
     Output,
     /// It read fewer bytes than the input holds: it is not the run the
     /// input was recorded from.
-    Unread { read: usize, input: usize },
+    Unread,
 }
 
 /// Program `blob` loaded as the agent loads it, on `arguments` with `gas`:
@@ -212,15 +214,12 @@ fn trace(
     let (mut tracer, image, permissions) = start(blob, arguments, input, gas, forge)?;
     let exit = tracer.run_with_precompiles();
     if exit != ExitReason::Halt {
-        return Err(KernelTraceError::Exit(exit));
+        return Err(KernelTraceError::Exit);
     }
-    if let Some((read, left)) = tracer.witness_cursor()
+    if let Some((_, left)) = tracer.witness_cursor()
         && left > 0
     {
-        return Err(KernelTraceError::Unread {
-            read,
-            input: read + left,
-        });
+        return Err(KernelTraceError::Unread);
     }
     let registers = tracer.pvm.registers;
     let length = usize::try_from(registers[8]).map_err(|_| KernelTraceError::Output)?;

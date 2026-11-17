@@ -561,13 +561,13 @@ _forbidden +gates:
         [venue-model "-p vos-node" [model] []] \
         [venue-model "-p vos-node --features prover" [model] []] \
         [venue-model "-p vos-statement-service --features pvm-guest" [model] []] \
-        [seeded-masks "--workspace" [seeded-masks other-pins] []] \
-        [seeded-masks "-p vos-cli --features prover" [seeded-masks other-pins] []] \
-        [seeded-masks "-p vos-light" [seeded-masks other-pins] []] \
-        [seeded-masks "--manifest-path agent/programs/Cargo.toml --workspace" [seeded-masks other-pins] []] \
-        [seeded-masks "--manifest-path pvm/proof/fuzz/Cargo.toml" [seeded-masks other-pins] []] \
-        [seeded-masks "--manifest-path pvm/proof/final-verifier/wasm/run/Cargo.toml" [seeded-masks other-pins] []] \
-        [seeded-masks "--manifest-path pvm/proof/final-verifier/wasm/blob/Cargo.toml" [seeded-masks other-pins] []] \
+        [seeded-masks "--workspace" [seeded-masks other-pins chip-isolated] []] \
+        [seeded-masks "-p vos-cli --features prover" [seeded-masks other-pins chip-isolated] []] \
+        [seeded-masks "-p vos-light" [seeded-masks other-pins chip-isolated] []] \
+        [seeded-masks "--manifest-path agent/programs/Cargo.toml --workspace" [seeded-masks other-pins chip-isolated] []] \
+        [seeded-masks "--manifest-path pvm/proof/fuzz/Cargo.toml" [seeded-masks other-pins chip-isolated] []] \
+        [seeded-masks "--manifest-path pvm/proof/final-verifier/wasm/run/Cargo.toml" [seeded-masks other-pins chip-isolated] []] \
+        [seeded-masks "--manifest-path pvm/proof/final-verifier/wasm/blob/Cargo.toml" [seeded-masks other-pins chip-isolated] []] \
         [debug-internals "--workspace" [debug-internals disclosing watch] []] \
         [debug-internals "-p vos-cli --features prover" [debug-internals disclosing watch] []] \
         [debug-internals "-p vos-statement-service --features pvm-guest" [debug-internals] []] \
@@ -666,9 +666,10 @@ check-no-venue-model: (_forbidden "venue-model")
 
 # The masked prover's test seams (`vos-pvm-recair`'s `seeded-masks`: the
 # seeded randomness `MaskRng::Seeded` and the forced proof
-# `prove_masked_unchecked`), and the final verifier's (`other-pins`: the wrap
-# verified under other pins, `masked::verify_with`) reach no production
-# build: no normal or build edge
+# `prove_masked_unchecked`), the final verifier's (`other-pins`: the wrap
+# verified under other pins, `masked::verify_with`) and the proof crate's
+# (`chip-isolated`: a chip slice proved and verified alone) reach no
+# production build: no normal or build edge
 # of any workspace member, nor of the workspaces built apart (the agent,
 # the fuzz targets, the final verifier's Wasm blob and its runner), enables
 # it (the prover's tests enable it on a dev edge), and the proof crate's

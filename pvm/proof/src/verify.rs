@@ -78,7 +78,9 @@ pub fn verify(proof: Proof, side_note: &SideNote) -> Result<(), VerificationErro
 /// The boundary-binding claimed-sum check is SKIPPED on this path (the
 /// caller's arbitrary chip slice has no stable component positions);
 /// chip-isolated proofs are not verifiable across a trust boundary
-/// anyway — `verify_standalone` rejects their `component_mask = 0`.
+/// anyway — `verify_standalone` rejects their `component_mask = 0`. A test
+/// seam (`chip-isolated`).
+#[cfg(feature = "chip-isolated")]
 pub fn verify_with_explicit_components(
     proof: Proof,
     side_note: &SideNote,

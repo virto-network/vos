@@ -9040,6 +9040,7 @@ dependencies = [
  "vos-pvm-poseidon2",
  "vos-pvm-precompiles",
  "vos-pvm-program",
+ "vos-pvm-proof",
  "vos-pvm-proof-derive",
  "vos-pvm-proof-verifier",
  "vos-pvm-recair",

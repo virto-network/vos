@@ -44,7 +44,14 @@ abi = ["dep:vos-abi"]
 # Also the environment's debug outputs, which show a trace's rows and sizes
 # (`CPU_DUMP`, `CPU_EXPR_DUMP`, `VOS_PROOF_PROFILE`): no production build
 # enables it (`just check-no-debug-internals`).
-debug-internals = ["prover"]
+debug-internals = ["prover", "chip-isolated"]
+# The chip-isolated test seams: a proof of a chosen chip slice and its
+# verify (`prove_with_explicit_components`,
+# `verify_with_explicit_components`) and the trait objects to build the
+# slice with (`harness`), for the chip gates' and the recursion tests' dev
+# edges. Their proofs carry no shape `verify_standalone` admits; no
+# production build enables it (`just check-no-leaks`).
+chip-isolated = ["prover"]
 # The masked device segment's forging seam (`masked::ChipTraces`'s
 # `*_columns_mut`), for the soundness gates' forced proofs alone: no
 # production build enables it (`just check-no-leaks`).
@@ -80,6 +87,8 @@ vos-abi = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
+# The chip gates prove and verify chip slices alone.
+vos-pvm-proof = { path = ".", features = ["chip-isolated"] }
 vos-pvm-compiler = { workspace = true }
 # The tests' heap handed back between proofs (`malloc_trim`).
 libc = "0.2"

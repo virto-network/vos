@@ -550,7 +550,7 @@ pub fn assert_refused(proof: RecairProof, hash: &Digest, reason: &str, forgery: 
     match verify(proof, hash) {
         Ok(()) => panic!("SOUNDNESS GAP: the forgery {forgery} was accepted"),
         Err(error) => assert!(
-            error.0.contains(reason),
+            error.to_string().contains(reason),
             "{forgery}: refused for another reason than {reason:?}: {error}"
         ),
     }
