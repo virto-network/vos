@@ -812,7 +812,7 @@ node_fuzz_targets := "api_reader operated_decode credentialed_decode"
 # minutes.
 fuzz-replay:
     cd pvm/proof/fuzz; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{proof_fuzz_targets}}" | split row ' ') { cargo fuzz run -O -s none --target-dir target/no-sanitizer $target $"replay/($target)" -- -runs=0 } }
-    cd node/fuzz; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{node_fuzz_targets}}" | split row ' ') { cargo fuzz run -O -s none --target-dir target/no-sanitizer $target $"replay/($target)" -- -runs=0 } }
+    cd node/fuzz; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{node_fuzz_targets}}" | split row ' ') { cargo fuzz run --fuzz-dir . -O -s none --target-dir target/no-sanitizer $target $"replay/($target)" -- -runs=0 } }
 
 # Each target `secs` seconds from its corpus (a minute in `ci-full`, five in
 # `slice-gate`: `just fuzz 300`), the prover's seeded from the fixtures and
@@ -824,7 +824,7 @@ fuzz-replay:
 fuzz secs="60":
     cd pvm/proof/fuzz; cargo run --release --example seed
     cd pvm/proof/fuzz; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{proof_fuzz_targets}}" | split row ' ') { mkdir $"corpus/($target)"; let build = if $target == "prove_verify_roundtrip" { [-O -s none --target-dir target/no-sanitizer] } else { [-a] }; cargo fuzz run ...$build $target $"corpus/($target)" $"replay/($target)" -- -max_total_time={{secs}} -max_len=262145 -len_control=0 -rss_limit_mb=8192 -timeout=600 } }
-    cd node/fuzz; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{node_fuzz_targets}}" | split row ' ') { mkdir $"corpus/($target)"; cargo fuzz run -a $target $"corpus/($target)" $"replay/($target)" -- -max_total_time={{secs}} -max_len=262145 -len_control=0 -rss_limit_mb=8192 -timeout=600 } }
+    cd node/fuzz; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{node_fuzz_targets}}" | split row ' ') { mkdir $"corpus/($target)"; cargo fuzz run --fuzz-dir . -a $target $"corpus/($target)" $"replay/($target)" -- -max_total_time={{secs}} -max_len=262145 -len_control=0 -rss_limit_mb=8192 -timeout=600 } }
 
 # The light check, after every edit, and the innermost tier: formatting,
 # the gates' own tripwire, the workspace's lints, and every test target of
