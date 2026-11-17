@@ -20,13 +20,15 @@ verifier, and the gates its build passed.
     `recair/tests/recursion/leaves.rs`. The counts marked pre-hardening
     are an older count over the pre-hardening shape, not recounted;
   - **[projected]**: time and memory from other provers' measured rates.
-- **How a measured time or memory was built, and by what:** a `cargo
-  test` binary's, the test profile with `target-cpu=native` (as
-  `proving.md`'s status list says); the circuits' counts and the wrap's
-  gas by `vos-pvm-recair`'s and `vos-statement`'s suites (`just
-  test-proof`), the window kernel's segments, leaves, folds and wrap by
-  the node side's `vos-kernel-tests` (the window kernel is a test
-  actor's, which a tree of `pvm/` alone does not hold).
+- **How a measured time or memory was built, and by what:** the times
+  and memory the prover's tests print are a `cargo test` binary's, the
+  test profile with `target-cpu=native` (as `proving.md`'s status list
+  says). The circuits' counts and the wrap's gas are `vos-pvm-recair`'s
+  `recursion` test's (`just gate`), the fixtures' gas `vos-statement`'s
+  `fixtures` test's (`just check`); the window kernel's segments,
+  leaves, folds and wrap the node side's `vos-kernel-tests`' (the window
+  kernel is a test actor's, which a tree of `pvm/` alone does not
+  hold).
 - **Paths:**
   - `P` = vos-core's `pvm/proof` (at `b5d42dc2`);
   - `ST` = Stwo at the fork's pin `e14925a8` (`olanod/stwo`, `crates/`);

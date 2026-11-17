@@ -241,8 +241,8 @@ target `device_verify_bytes` holds it to no panic on arbitrary bytes.
 
 **The interaction PoW is 8 bits:** well-formed junk ground for 2^8 nonces
 passes `precheck` and costs a decode and the composition (11–27 ms on one
-x86 thread, the dev machine's test-profile build with `target-cpu=native`)
-before the PoW refuses it (`docs/design/open.md`).
+x86 thread by the machine's load, measured at format 46) before the PoW
+refuses it (`docs/design/open.md`).
 
 ## Panic-freedom
 

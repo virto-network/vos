@@ -162,7 +162,7 @@ none, the wrap, passes a check that holds).
   `statement/src/bin/guest/runtime.rs` with `statement/src/bin/guest/heap.rs`:
   the guest's own stack and the switch onto it, the allocator, the host
   calls and their convention, the panic handler and the single-core atomic
-  libcalls. The service's `unsafe` code is there.
+  libcalls. The service's `unsafe` code is in these three files.
 
 ### Test seams
 

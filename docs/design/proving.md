@@ -14,18 +14,22 @@ proofs a phone makes. The recursion AIR's own design is
   (Snapdragon 7s Gen 3: four Cortex-A720-class and four A520 cores). A
   [measured] number with no hardware or date ran on the x86 dev machine,
   on or before 2026-11-01.
-- **How a number was built and where it is measured:** an x86 [measured]
-  time or memory is a `cargo test` binary's unless it says otherwise: the
-  test profile (`opt-level = 3` for the proof crates alone, the root
-  `Cargo.toml`; debug assertions and overflow checks on; no LTO) with
-  `target-cpu=native` (`.cargo/config.toml`: AVX2 and the host's other
-  features). A release build, or a portable one without AVX2, differs.
-  Each says which run measured it: a test or recipe of `pvm/` (`just
-  test-proof`'s suites; the fixtures' gas, `vos-statement`'s fixtures
-  test and `just judge-wasm`), or **[node side]**: the node side's tests
-  and tools (`node/kernel-tests`' kernels and `throughput`, the phone
-  bench `tools/phone`, the end-to-end runs), which a tree of `pvm/`
-  alone does not hold. Every phone number is the phone bench's.
+- **How a number was built and where it is measured:** the proving
+  times and memory the prover's tests print (`pvm/proof/tests/common`'s
+  `measured` and `Totals::report`: the segments', leaves', folds' and
+  wraps') are a `cargo test` binary's: the test profile (`opt-level = 3`
+  for the proof crates alone, the root `Cargo.toml`; debug assertions and
+  overflow checks on; no LTO) with `target-cpu=native`
+  (`.cargo/config.toml`: AVX2 and the host's other features). A release
+  build, or a portable one without AVX2, differs. The runs: a test or
+  recipe of `pvm/` (the prover's suites, `just test-proof`; the wrap's
+  gas on the JAM-only host, `vos-pvm-recair`'s `recursion` test, in
+  `gate`; the fixtures' gas, `vos-statement`'s `fixtures` test, in
+  `check`; the Wasm counts, `just judge-wasm`), or **[node side]**: the
+  node side's tests and tools (`node/kernel-tests`' kernels and
+  `throughput`, the phone bench `tools/phone`, the end-to-end runs),
+  which a tree of `pvm/` alone does not hold. Every phone number is the
+  phone bench's.
 - **Open work** is listed in `open.md`.
 
 ## 1. Requirements [decided]
@@ -2177,5 +2181,5 @@ budget.
 A window of 16 segments proves end to end on one prover in about 2.6
 minutes by the window statement's measured times (§3.2: a segment 5.7 s,
 a leaf 1.9 s, a fold 1.75 s, the wrap 7.1 s; 16 × 5.7 + 16 × 1.9 + 15 ×
-1.75 + 7.1 ≈ 155 s) [derived, node side], inside the 3–5 minutes the
+1.75 + 7.1 ≈ 155 s) [derived, node side], under the 3–5 minutes the
 design projected.

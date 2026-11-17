@@ -7,12 +7,12 @@ default:
 #
 #   check ⊆ gate ⊆ ci ⊆ ci-full ⊆ slice-gate
 #
-# Each named for when it runs, by what it adds, the pins it holds and its
-# cost. There is no hosted CI: "ci" names the pre-push hook's recipe.
+# Each named for when it runs, by what it adds and the pins it holds.
+# There is no hosted CI: "ci" names the pre-push hook's recipe.
 # - `check`, after every edit (minutes, warm): formatting, the gates' own
 #   tripwire, the workspace's lints and the fast tests. Holds the final
 #   verifier's layout constants (format 39's), the conformance vectors.
-# - `gate`, before each commit (tens of minutes): `check`, the heavy test
+# - `gate`, before each commit: `check`, the heavy test
 #   targets (`tools/gates/heavy.toml`), the docs' tripwire, deny, the
 #   builds without std, every guest and its blob, the leak checks, the
 #   verifier kit, the fuzz corpora replayed and their reach, and the
@@ -23,8 +23,8 @@ default:
 #   and every feature set's lints, the JAR check, the PVM vectors, the
 #   bench's cross-host checks, the slow fault runs and the prover's library
 #   tests. Holds the formats' bit counts (`COUNTS`).
-# - `ci-full`, by hand before a release candidate (hours, under a 12 GiB
-#   memory cap): `ci` and the prover suites (`test-proof`: the forgery and
+# - `ci-full`, by hand before a release candidate (under a 12 GiB memory
+#   cap): `ci` and the prover suites (`test-proof`: the forgery and
 #   soundness gates, the leakage tests at a medium N), the bench's proving
 #   tests and the fuzz targets a minute each. Holds `H_FOLD`, the known
 #   programs' ids and the golden fixtures.
@@ -324,7 +324,7 @@ _blob-hashes:
 # harnesses' programs, deployed nowhere, link the model judge
 # (`vos-statement`'s `model-judge`, whose pinned program and state its
 # input carries); `statement-service.elf`, the one deployed, links none
-# (`check-no-venue-model`); every other line of `blobs.lock` is an agent
+# (`_forbidden`'s `venue-model` rows); every other line of `blobs.lock` is an agent
 # program (`programs.toml`) or a test actor, on the node side. A blob that
 # joins the lock joins one of these, or fails here.
 check-blob-roles:

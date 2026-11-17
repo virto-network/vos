@@ -178,8 +178,8 @@ and its shared lookup tables. The design is `docs/design/proving.md`.
 The docs' x86 times and memory assume the host's own code generation:
 `.cargo/config.toml` builds for an x86-64 host with `target-cpu=native`,
 so Stwo's SIMD backend and the packed Poseidon2 run on AVX2 (AVX-512
-where the host has it), and the tests' profile, which the numbers come
-from, optimizes the proof crates alone. A portable build (`RUSTFLAGS=""`)
+where the host has it), and the tests' profile, in which the prover's
+tests time their runs, optimizes the proof crates alone. A portable build (`RUSTFLAGS=""`)
 has no AVX2 path and proves slower, by a factor not measured; the guests
 and the Wasm blob are other targets, unaffected.
 
