@@ -18,6 +18,14 @@ merged with the trees around it:
   conformance vectors from `tools/kreivo/conformance/` (data the
   reference mock writes, on the node side), so vendoring it and `just
   check-kit` read that directory.
+- **A tripwire over the whole repository:** `vos-pvm-recair`'s
+  `gates::pins` (`proof/recair/tests/gates/pins.rs`) reads every Rust
+  source of the checkout, the node side's among them, for a call that
+  commits an unchecked wiring.
+- **Committed fixtures from agent programs:**
+  `compiler/tests/fixtures/roomy.elf` is the `roomy` test actor's ELF
+  (`agent/test-actors`, on the node side), built there and committed here;
+  the directory's tests read the committed file alone.
 - **The shared files:** the root `Cargo.toml` and `Cargo.lock`,
   `blobs.lock` and the `justfile`. The venue guests (`final-verify.elf`,
   `statement-service.elf`) resolve on the root lock, so a dependency
@@ -29,13 +37,9 @@ merged with the trees around it:
   each test actor's kernel re-run from its attest against the agent's
   reference model, read at a cut, proved, folded, wrapped and judged at
   the model venue, with the check of the known programs' ids in
-  `proof/src/constants.rs` (`just repin` writes them) and `just
-  test-reads`' tests. They include the prover's test helpers
-  (`proof/tests/common`).
-- **Committed fixtures from agent programs:**
-  `compiler/tests/fixtures/roomy.elf` is the `roomy` test actor's ELF
-  (`agent/test-actors`, on the node side), built there and committed here;
-  the directory's tests read the committed file alone.
+  `proof/src/constants.rs` (the node side's `just repin` writes them) and
+  the node side's `just test-reads`. They include the prover's test
+  helpers (`proof/tests/common`).
 
 ## Source provenance
 

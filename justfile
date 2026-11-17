@@ -927,8 +927,8 @@ deny:
 # The layers: a package under `pvm/` has no path dependency outside
 # `pvm/`, on a normal, a build or a dev edge, so the PVM, its compiler,
 # its prover and the actor ABI read, build and test alone. Git and registry
-# dependencies (the Stwo fork, CipherClerk) and `support/`'s vendored
-# crates are allowed, and listed. Every package under `pvm/` is read, the
+# dependencies (the Stwo fork) and `support/`'s vendored crates are
+# allowed, and listed. Every package under `pvm/` is read, the
 # workspaces built apart included (`cargo metadata` of each manifest).
 check-layers:
     let manifests = (glob pvm/**/Cargo.toml --exclude ['**/target/**'] | where {|manifest| open --raw $manifest | str contains '[package]' }); \

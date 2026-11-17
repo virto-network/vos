@@ -1,4 +1,5 @@
-//! Test helpers shared across the test binaries (`gates`, `isa`, `kernel`),
+//! Test helpers shared across the test binaries (`gates`, `isa`, `kernel`,
+//! and on the node side `vos-kernel-tests`' `kernel` and `witness_input`),
 //! each of which includes this module as `common`.
 
 #![allow(dead_code)]

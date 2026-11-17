@@ -234,9 +234,11 @@ def covered(lines, members, manifests):
 
 
 def listed_programs():
-    """`programs.toml`'s programs: none in a tree without the agent."""
-    path = ROOT / "programs.toml"
-    return tomllib.loads(path.read_text())["program"] if path.exists() else []
+    """`programs.toml`'s programs: none in a tree without the agent's guest
+    workspace (`agent/programs`)."""
+    if not (ROOT / "agent/programs/Cargo.toml").exists():
+        return []
+    return tomllib.loads((ROOT / "programs.toml").read_text())["program"]
 
 
 def programs():

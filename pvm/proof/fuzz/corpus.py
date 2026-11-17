@@ -15,8 +15,13 @@ An archive is a plain POSIX ustar archive of regular files, by name in
 byte order, each of mode 0644, owner and group 0 with no names, and time
 0: the same inputs make the same bytes, so a refresh that finds no new
 input leaves the archive as it was. `unpack` takes nothing but such files,
-each a plain name (no directory, no link), and refuses an archive that
-`pack` would not write byte for byte from the inputs it holds.
+each a plain name (no directory, no link), and refuses an archive that is
+not in that form: names out of order, another mode, owner, time or
+format.
+
+A corpus is pruned by its unpacked inputs (`cargo run --example paths --
+--each` lists what each reaches): remove the inputs from
+`target/replay/<target>/`, then `pack` it into `replay/<target>.tar`.
 """
 
 import io
@@ -45,6 +50,8 @@ def archived(inputs: Path) -> tuple[bytes, int]:
             if not path.is_file() or path.is_symlink() or not plain(path.name):
                 raise CorpusError(f"{path} is no input: a corpus is a directory of files")
             data = path.read_bytes()
+            if len(path.name.encode()) > 100:
+                raise CorpusError(f"{path}: a name past ustar's 100 bytes")
             info = tarfile.TarInfo(path.name)
             info.size = len(data)
             info.mode = 0o644
@@ -72,19 +79,24 @@ def unpack(archives: Path, directory: Path) -> None:
     for archive in found:
         target = directory / archive.stem
         target.mkdir(parents=True)
-        count = 0
-        with tarfile.open(archive, mode="r:") as tar:
-            for member in tar:
-                if not member.isreg() or not plain(member.name):
-                    raise CorpusError(f"{archive}: {member.name!r} is no input")
-                source = tar.extractfile(member)
-                (target / member.name).write_bytes(source.read())
-                count += 1
-        if count == 0:
+        names = []
+        try:
+            with tarfile.open(archive, mode="r:", format=tarfile.USTAR_FORMAT) as tar:
+                for member in tar:
+                    if not member.isreg() or not plain(member.name):
+                        raise CorpusError(f"{archive}: {member.name!r} is no input")
+                    canonical = (member.mode, member.uid, member.gid, member.uname, member.gname, member.mtime)
+                    if canonical != (0o644, 0, 0, "", "", 0) or member.pax_headers:
+                        raise CorpusError(f"{archive}: {member.name} is not as `pack` writes it")
+                    (target / member.name).write_bytes(tar.extractfile(member).read())
+                    names.append(member.name)
+        except tarfile.TarError as error:
+            raise CorpusError(f"{archive}: {error}") from error
+        if not names:
             raise CorpusError(f"{archive} holds no input")
-        if archived(target)[0] != archive.read_bytes():
-            raise CorpusError(f"{archive} is not its inputs' archive as `pack` writes it")
-        print(f"{target}: {count} inputs")
+        if names != sorted(set(names), key=str.encode):
+            raise CorpusError(f"{archive}: its inputs are not in order, or repeat")
+        print(f"{target}: {len(names)} inputs")
 
 
 def main(argv: list[str]) -> int:

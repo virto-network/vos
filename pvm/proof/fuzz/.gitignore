@@ -5,3 +5,5 @@ artifacts/
 coverage/
 # Resolved afresh by each build, and by `just check-no-seeded-masks`.
 Cargo.lock
+# A pack interrupted before its rename.
+replay/*.partial

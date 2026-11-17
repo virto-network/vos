@@ -13,10 +13,12 @@ It fails when
   `src/chips/cpu/cut.rs`), the end of one under `pvm/proof/`;
 - a fuzz target of the justfile's `proof_fuzz_targets` goes unnamed in
   `pvm/proof/SECURITY.md`;
-- a relative link of a tracked Markdown doc (`[text](path)`, its
-  `#anchor` aside) names no file or directory of the tree.
+- a link of a tracked Markdown doc (`[text](path)`, its `#anchor` aside;
+  a leading `/` from the repository's root) names no tracked file or
+  directory.
 """
 
+import os
 import pathlib
 import re
 import subprocess
@@ -93,11 +95,17 @@ LINK = re.compile(r"\[[^\]]*\]\(([^()\s]+)(?:\s+\"[^\"]*\")?\)")
 
 
 def links() -> list[str]:
-    tracked = subprocess.run(
-        ["git", "ls-files", "-z", "*.md"], cwd=ROOT, check=True, capture_output=True, text=True
-    ).stdout.split("\0")
+    files = set(
+        filter(
+            None,
+            subprocess.run(
+                ["git", "ls-files", "-z"], cwd=ROOT, check=True, capture_output=True, text=True
+            ).stdout.split("\0"),
+        )
+    )
+    known = files | {str(parent) for file in files for parent in pathlib.PurePosixPath(file).parents}
     broken = []
-    for name in filter(None, tracked):
+    for name in sorted(file for file in files if file.endswith(".md")):
         doc = ROOT / name
         text = re.sub(r"```.*?```", "", doc.read_text(), flags=re.S)
         for line in text.splitlines():
@@ -105,8 +113,13 @@ def links() -> list[str]:
                 if re.match(r"[a-z][a-z0-9+.-]*:", target) or target.startswith("#"):
                     continue
                 path = target.split("#", 1)[0]
-                if path and not (doc.parent / path).exists():
-                    broken.append(f"{name}: links {target}, which does not exist")
+                if not path:
+                    continue
+                resolved = os.path.normpath(
+                    path.lstrip("/") if path.startswith("/") else os.path.join(os.path.dirname(name), path)
+                )
+                if resolved not in known:
+                    broken.append(f"{name}: links {target}, which is no tracked path")
     return broken
 
 

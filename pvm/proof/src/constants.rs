@@ -1,16 +1,18 @@
 //! The known programs' constants, pinned in the repository: the program
-//! ids of the kernels the slice's statements are made by, the fold
-//! circuit's hash `H_fold` (every node's fold word), and the final wrap's
-//! preprocessed root (`format::MASKED_WRAP`), the final verifier's constant
-//! re-exported: `just repin` writes the others, and a circuit change that
-//! moves the root is written into `vos-pvm-final-verifier` by hand (a
-//! venue's verifying key).
+//! ids of the test actors' kernels the known statements are made by, the
+//! fold circuit's hash `H_fold` (every node's fold word), and the final
+//! wrap's preprocessed root (`format::MASKED_WRAP`), the final verifier's
+//! constant re-exported: `just repin` writes the others, and a circuit
+//! change that moves the root is written into `vos-pvm-final-verifier` by
+//! hand (a venue's verifying key).
 //!
 //! `test-proof` recomputes each from its source under both of the
-//! prover's feature sets (with and without `debug-internals`), and `just
-//! repro-aarch64` recomputes the program ids from the built ELFs by `vos
-//! program-id` on aarch64: a change of the derivation, a shape, a circuit
-//! or a hash that moves one fails there, not at a venue.
+//! prover's feature sets (with and without `debug-internals`): `H_fold`
+//! and the root by this crate's `kernel` test, the program ids, from the
+//! test actors' ELFs, by `vos-kernel-tests`' on the node side, where `just
+//! repro-aarch64` also recomputes them by `vos program-id` on aarch64. A
+//! change of the derivation, a shape, a circuit or a hash that moves one
+//! fails there, not at a venue.
 //!
 //! **What they do not do:** they pin the known programs' ids; they do not
 //! make a submitted id trustworthy. A venue or an installer trusts a
