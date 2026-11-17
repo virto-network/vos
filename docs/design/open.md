@@ -129,7 +129,19 @@ The scale results are in `core-model.md` §14, "The scale test".
   the segment cut and closing-flag rule (`pvm/proof/SECURITY.md`).
 - **Completeness limits:** an invalid dynamic jump cannot be proved; the
   ledgers cannot prove a gap of 2^27 steps between two accesses to one key;
-  a BLAKE2b pointer within 256 bytes of 2^32 cannot be proved.
+  a BLAKE2b pointer within 256 bytes of 2^32 cannot be proved. The 2^27 gap
+  is also a soundness bound: the ledgers compare timestamps mod p, and the
+  per-segment `ts = 0` anchor bounds every access within 2^27, so no
+  provable segment reaches the alias 2^30 steps away
+  (`pvm/proof/SECURITY.md`, "The leaf's binding").
+- **The leaf's timestamp bytes:** the leaf range-checks the io-hash's 32
+  boundary bytes alone, and rests on the fold chain for the rest; a leaf
+  alone accepts a `ts_in` whose first limb is `p − 1`. Range-check
+  `ts_in`'s 8 bytes in the leaf at the next re-pin (or all 264 unchecked
+  boundary bytes, about 3.4k `qm31` rows of the leaf's 28.8k spare
+  [estimate]), with a gate: a consistent segment trace whose `ts_in`
+  first limb is `p − 1`, accepted by a leaf alone and refused at the fold.
+  That gate is a recursion run, and no test builds such a leaf yet.
 - **Live fault text:** `ExitReason`'s `Debug` and executor panic messages
   can carry state into logs; the fix is the variant alone and a static
   panic message with its place, checked by one audited run of a faulting

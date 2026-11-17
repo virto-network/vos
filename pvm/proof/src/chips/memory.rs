@@ -218,7 +218,11 @@ impl BuiltInComponent for MemoryChip {
         // (a precompile whose output overlaps its input) reads the value
         // from before it; lo=1 ⇒ lo strictly increases (hi equal) ⇒ addr↑;
         // hi=1 ⇒ hi strictly increases ⇒ addr↑.  0 on every non-real→real
-        // transition (all three coeffs are 0 there).
+        // transition (all three coeffs are 0 there). The timestamps enter
+        // reduced mod p, so two accesses about 2^30 steps apart would alias;
+        // each address's run starting at a `ts = 0` write keeps a provable
+        // segment's accesses under 2^28, a soundness bound
+        // (`crate::standalone::TIMESTAMP_BOUND`).
         let combine_ts = |bytes: &[E::F; 8]| -> E::F {
             let mut acc = E::F::zero();
             let mut pow = E::F::one();

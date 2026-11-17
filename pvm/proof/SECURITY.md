@@ -95,7 +95,10 @@ rests on the conjectured count.
 - **Recorded, unfixed:** an invalid dynamic jump cannot be proved (no
   kernel needs it); the ledgers cannot prove a gap of 2^27 steps between
   two accesses to one key; a BLAKE2b pointer within 256 bytes of 2^32
-  cannot be proved. Each makes an honest run unprovable, never a false one provable.
+  cannot be proved. Each makes an honest run unprovable, never a false one
+  provable. The 2^27 gap is also a soundness bound: the ledgers compare
+  timestamps mod p, and it is what keeps two accesses 2^30 steps apart
+  from aliasing (the leaf's binding, below).
 - **The Ristretto and scalar chips are removed:** they were unsound.
   Precompile ids 110 to 114 are served nowhere, and `derive` refuses a
   kernel that reaches one.
@@ -133,12 +136,15 @@ rests on the conjectured count.
 | `proof.stark_proof` | no | verified by Stwo, after a hostile-input preflight of every nested length |
 | `proof.claimed_sums` | no | must sum to zero; the boundary chips' must equal the sums recomputed from the boundary states |
 | `proof.log_sizes` | no | capped by `DEFAULT_MAX_LOG_SIZE`; no public verify entry takes another cap (only the bare preflights, `proof::preflight_proof_structure` and `proof::preflight_proof_structure_readonly`, do) |
-| `proof.initial_state`, `proof.final_state` | bound | registers, pc and ts bound to the committed boundary columns and to the trace; `memory_root` to the in-AIR page tree of the images |
+| `proof.initial_state`, `proof.final_state` | bound | registers, pc and ts bound to the committed boundary columns and to the trace, both ts in `[1, 2^28)` (`TIMESTAMP_BOUND`); `memory_root` to the in-AIR page tree of the images |
 | `proof.pcs_config` | no | the format's exactly; Fiat–Shamir-bound |
 | `hash`, the preprocessed root | **yes** | the class's program identity: its code, layout and permissions, at its shape. For a kernel, the install's record derives it, and the program id covers it |
 
-The preflight, the format checks, the root against `hash`, the logup sum,
-the boundary binding, then Stwo's verifier, in that order.
+The preflight, the format checks, the boundary timestamps' range, the root
+against `hash`, the logup sum, the boundary binding, then Stwo's verifier,
+in that order. The checks are written once (`src/standalone.rs`); the
+prover-side `vos_pvm_proof::verify` runs them at the root it commits again
+from its side note.
 
 ## Trust boundary: a statement
 
@@ -194,6 +200,33 @@ the boundary binding, then Stwo's verifier, in that order.
   hardening of the base AIR) changes every program id; a change to the
   recursion's compiler or gates changes every leaf circuit's hash, the fold
   circuit's hash and the wrap's pinned root.
+
+### The leaf's binding: two inductions
+
+A leaf re-does the native verifier's checks in circuit, over the boundary
+states' 296 bytes as wires. Two properties every statement rests on hold
+along the fold chain, not in a leaf alone (`recair/src/leaf/mod.rs`):
+
+- **The boundary bytes are bytes.** The leaf range-checks 32 of the 296
+  (the io-hash's); a wire of 256 or more would enter the segment AIR as a
+  register, a timestamp or a root limb no native state can express. The
+  leftmost entry is byte constants (the entry flag, which the wrap
+  requires), every exit equals the next entry wire for wire (the fold's
+  continuity), and an exit is bytes the AIR produced (the next timestamp's
+  and a register write's limbs Range256-checked, a memory root the
+  BLAKE2b boundary compression's output, under `blake2b_boundary_gate`) or
+  a copy of its entry.
+- **Timestamps stay in the ledgers' range.** The register and memory
+  ledgers compare `2·ts + is_write` reduced mod p, so two accesses about
+  2^30 steps apart alias; no gas is proved and the CPU's timestamp is a
+  64-bit counter. Every chain of a segment starts at a `ts = 0` write, so
+  a segment whose timestamps lie in `[2^27, p/2)` is unprovable, and a
+  run, contiguous from ts 1, cannot cross that zone. The native verifier
+  states the bound for a segment alone (both boundary timestamps under
+  2^28); the leaf does not range-check the timestamp's bytes, and a leaf
+  alone accepts a first limb of `p − 1`, which the fold chain then cannot
+  continue from an honest entry. Range-checking `ts_in`'s bytes in the leaf
+  is recorded for the next re-pin (`docs/design/open.md`).
 
 ## Trust boundary: a device proof
 

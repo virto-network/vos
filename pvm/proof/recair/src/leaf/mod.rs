@@ -32,8 +32,34 @@
 //! the fold binds (`proving.md` §3.4); the position `(p, p)` is free.
 //!
 //! Every other use of the boundary bytes is exact on M31 values (`proving.md`
-//! A.3): the transcript, the digests, the flags' comparisons. A value of 256
-//! or more there aliases no other state.
+//! A.3): the transcript, the digests, the flags' comparisons.
+//!
+//! **Why 32 range-checked bytes of 296 suffice.** A boundary wire that is no
+//! byte would enter the segment AIR as a register, a timestamp or a root
+//! limb no native state can express (the native verifier's are `u64` and
+//! `[u8; 32]`), and the leaf alone accepts one: `assert_ts_nonzero` takes a
+//! first limb of `p − 1`. Every statement still holds, by induction along
+//! the fold chain:
+//! - the leftmost entry is byte constants: the entry flag ties it to the
+//!   kernel's entry state, and the wrap refuses a root without the flag;
+//! - every exit equals the next segment's entry wire for wire: the fold
+//!   checks the exit's digest equal to the entry's, each the leaf sponge
+//!   over the wires as they are;
+//! - an exit is bytes the segment AIR produced, or a copy of its entry: its
+//!   timestamp is `next_timestamp`, whose limbs are Range256-checked
+//!   (`pvm/proof/src/chips/cpu/constraints/row.rs`); a register is the
+//!   CPU's write tuple's `row.result`, Range256-checked on every real row
+//!   (`cpu/constraints/memory.rs`), the boundary chips being the register
+//!   relation's only other producers; a memory root's limbs are the node
+//!   compression's output (`chips/memory_merkle.rs`), which BLAKE2b's
+//!   boundary compression core derives through Range256 lookups
+//!   (`chips/blake2b/boundary.rs`, under `blake2b_boundary_gate`).
+//!
+//! So a wire past 255 never reaches a leaf whose statement the wrap
+//! accepts. The boundary timestamps' range rests on the same chain: the run
+//! starts at ts 1, and a segment cannot cross the zone the ledgers' mod-p
+//! comparison leaves unprovable (`vos_pvm_proof::standalone::TIMESTAMP_BOUND`).
+//! A leaf alone, outside a fold, is held to neither.
 
 mod output;
 mod program;
