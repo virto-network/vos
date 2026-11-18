@@ -904,6 +904,11 @@ impl Assembler {
     pub fn sub_rr(&mut self, dst: Reg, src: Reg) {
         self.alu_rr64(0x29, dst, src);
     }
+    /// sbb dst, src: `dst - src - CF`; `sbb r, r` is `-CF`, a mask.
+    #[inline(always)]
+    pub fn sbb_rr(&mut self, dst: Reg, src: Reg) {
+        self.alu_rr64(0x19, dst, src);
+    }
     #[inline(always)]
     pub fn and_rr(&mut self, dst: Reg, src: Reg) {
         self.alu_rr64(0x21, dst, src);

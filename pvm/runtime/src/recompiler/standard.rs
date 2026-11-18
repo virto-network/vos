@@ -116,6 +116,9 @@ pub(crate) fn run_standard(
         super::codegen::EXIT_TRACKING_FAILED => {
             return Err("native write tracking failed".into());
         }
+        super::codegen::EXIT_INVALID_ENTRY => {
+            return Err("native entry past the dispatch table".into());
+        }
         _ => return Err("invalid native exit reason".into()),
     }))
 }

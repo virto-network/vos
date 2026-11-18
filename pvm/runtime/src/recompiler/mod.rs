@@ -1376,6 +1376,49 @@ mod tests {
         }
     }
 
+    /// The prologue's dispatch reads no entry past the table, even for an
+    /// index no validated entry produces: it is the host's failure, and no
+    /// guest register is touched.
+    #[test]
+    fn a_dispatch_index_past_the_table_is_refused_by_native_code() {
+        let compiled = compile_code(&[0], &[1], &[]).unwrap();
+        let window = crate::backing::CodeWindow::new().unwrap();
+        let context = window.ctx_ptr().cast::<JitContext>();
+        let past = compiled.dispatch_table.len() as u32;
+        // SAFETY: the window's context page is aligned and writable; the
+        // tables outlive the run, which faults nowhere.
+        unsafe {
+            context.write(JitContext {
+                regs: [7; 13],
+                gas: 1_000,
+                gas_charged: 1,
+                host_pending: 0,
+                host_resume_pc: 0,
+                dispatch_len: past,
+                exit_reason: 0,
+                exit_arg: 0,
+                jt_ptr: std::ptr::null(),
+                jt_len: 0,
+                _pad0: 0,
+                bb_starts: compiled.block_starts.as_ptr(),
+                bb_len: compiled.block_starts.len() as u32,
+                _pad1: 0,
+                entry_pc: past,
+                pc: 0,
+                dispatch_table: compiled.dispatch_table.as_ptr(),
+                code_base: compiled.native_code.ptr as u64,
+                flat_buf: window.base(),
+                flat_perms: window.perms(),
+                fast_reentry: 0,
+            });
+            let mut frame = 0;
+            compiled.native_code.entry()(context, &mut frame);
+            assert_eq!((*context).exit_reason, codegen::EXIT_INVALID_ENTRY);
+            assert_eq!((*context).regs, [7; 13]);
+            assert_eq!((*context).gas, 1_000);
+        }
+    }
+
     #[test]
     fn test_recompile_trap() {
         let code = vec![0u8]; // trap

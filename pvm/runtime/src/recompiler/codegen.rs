@@ -94,6 +94,9 @@ pub const EXIT_HOST_CALL: u32 = 4;
 /// Set by the fault handler when write tracking could not start for a
 /// slot; never produced by generated code.
 pub const EXIT_TRACKING_FAILED: u32 = 5;
+/// The entry's dispatch index is past the dispatch table: the host's
+/// failure, which every external entry validates first.
+pub const EXIT_INVALID_ENTRY: u32 = 6;
 
 /// Result of compilation.
 pub struct CompileResult {
@@ -156,6 +159,8 @@ pub struct Compiler {
     exit_label: Label,
     /// The epilogue past the register stores ([`CompileResult::abort_label_offset`]).
     abort_label: Label,
+    /// A prologue dispatch past the table: [`EXIT_INVALID_ENTRY`].
+    invalid_entry_label: Label,
     /// Label for the shared out-of-gas exit (sets EXIT_OOG + jumps to exit).
     oog_label: Label,
     /// Label for panic exit.
@@ -217,6 +222,7 @@ impl Compiler {
         let _reserved = asm.new_label(); // Label(0)
         let exit_label = asm.new_label();
         let abort_label = asm.new_label();
+        let invalid_entry_label = asm.new_label();
         let oog_label = asm.new_label();
         let panic_label = asm.new_label();
         let oog_pc_label = asm.new_label();
@@ -236,6 +242,7 @@ impl Compiler {
             asm,
             exit_label,
             abort_label,
+            invalid_entry_label,
             oog_label,
             panic_label,
             oog_pc_label,
@@ -2131,6 +2138,7 @@ impl Compiler {
 
         // target_pc = jt_ptr[idx] (u32 array, need idx*4)
         self.asm.push(Reg::RAX); // save φ[11]
+        self.emit_index_mask(CTX_JT_LEN);
         self.asm.shl_ri64(SCRATCH, 2); // idx *= 4
         self.asm.mov_load64(Reg::RAX, CTX, CTX_JT_PTR);
         self.asm.add_rr(Reg::RAX, SCRATCH);
@@ -2140,6 +2148,7 @@ impl Compiler {
         let djump_panic = self.asm.new_label();
         self.asm.cmp_mem32_r(CTX, CTX_BB_LEN, SCRATCH);
         self.asm.jcc_label(Cc::BE, djump_panic); // bb_len <= target → panic
+        self.emit_index_mask(CTX_BB_LEN);
         self.asm.mov_load64(Reg::RAX, CTX, CTX_BB_STARTS);
         self.asm.movzx_load8_sib(Reg::RAX, Reg::RAX, SCRATCH);
         self.asm.cmp_ri32(Reg::RAX, 1);
@@ -2163,6 +2172,16 @@ impl Compiler {
 
         self.asm.bind_label(djump_halt);
         self.emit_exit(EXIT_HALT, 0);
+    }
+
+    /// After a bounds check of the index in SCRATCH against the length at
+    /// `len`, zero the index when it is out of bounds without a branch, so
+    /// a mispredicted check cannot read past the table. Clobbers RAX.
+    fn emit_index_mask(&mut self, len: i32) {
+        self.asm.mov_load32(Reg::RAX, CTX, len);
+        self.asm.cmp_rr(SCRATCH, Reg::RAX); // CF = index < len
+        self.asm.sbb_rr(Reg::RAX, Reg::RAX); // all ones in bounds, else zero
+        self.asm.and_rr(SCRATCH, Reg::RAX);
     }
 
     /// Emit setcc for three-register comparisons: rd = (ra CMP rb) ? 1 : 0.
@@ -2745,6 +2764,10 @@ impl Compiler {
 
         self.asm.bind_label(regular_dispatch);
         self.asm.mov_load32(SCRATCH, CTX, CTX_ENTRY_PC);
+        // Every external entry is validated before native code runs; an
+        // index past the table still never reads past it.
+        self.asm.cmp_mem32_r(CTX, CTX_DISPATCH_LEN, SCRATCH);
+        self.asm.jcc_label(Cc::BE, self.invalid_entry_label);
         self.asm.mov_load64(Reg::RAX, CTX, CTX_DISPATCH_TABLE);
         self.asm.movsxd_load_sib4(Reg::RAX, Reg::RAX, SCRATCH);
         self.asm.mov_load64(SCRATCH, CTX, CTX_CODE_BASE);
@@ -2791,6 +2814,12 @@ impl Compiler {
         }
 
         // Page faults are handled by the SIGSEGV handler (signal.rs).
+
+        // Before any guest register is loaded: leave them as they were.
+        self.asm.bind_label(self.invalid_entry_label);
+        self.asm
+            .mov_store32_imm(CTX, CTX_EXIT_REASON, EXIT_INVALID_ENTRY as i32);
+        self.asm.jmp_label(self.abort_label);
 
         // Panic exit
         self.asm.bind_label(self.panic_label);
