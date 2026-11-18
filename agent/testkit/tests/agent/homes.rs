@@ -613,7 +613,7 @@ fn a_lapsed_agent_serves_reads_a_restore_and_a_removal_and_refuses_pushes() {
     let read: Vec<Envelope> = home.query(sync(1), "since", (scope(1), 0u64)).unwrap();
     assert_eq!(read.len(), 1, "reads are served");
     // A stolen phone is removed.
-    home.call::<Recorded>(admin(0), "remove", 1u32).unwrap();
+    home.operate(admin(0), "remove", 1u32).unwrap();
     home.pass(3 * MINUTE);
     let removal = home.commit_removing(0, vec![1]);
     assert_eq!(removal.set, vec![0]);
