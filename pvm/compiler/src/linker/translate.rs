@@ -205,6 +205,10 @@ pub(super) fn translate_section_linked(
             }
 
             if let Some(&target_addr) = elf.hi20_targets.get(&rv_addr) {
+                // An AUIPC consumes no buffered LUI or AUIPC: emit it first,
+                // as `translate_one` does, so it is neither emitted after
+                // this load nor removed with it by a fusion.
+                ctx.flush_pending()?;
                 // PCREL_HI20: AUIPC for data reference.
                 // Peek ahead: if the next instruction is a paired LO12 ADDI (nop),
                 // skip it and set pending_load_imm to enable cascading fusion
@@ -249,6 +253,11 @@ pub(super) fn translate_section_linked(
         // with the pending_load_imm the HI20 set.
         let lo12 = elf.lo12_sites.contains(&rv_addr);
         let (rd, rs1, funct3) = (riscv::rd(inst), riscv::rs1(inst), riscv::funct3(inst));
+        // A LO12 site bypasses `translate_one` too: a LUI or AUIPC buffered
+        // before it is emitted first, as it would be there.
+        if lo12 && matches!(riscv::opcode(inst), op::OP_IMM | op::LOAD | op::STORE) {
+            ctx.flush_buffered()?;
+        }
         if riscv::opcode(inst) == op::LOAD && rd == 0 {
             ctx.discard_into = dead_register(&data[offset + 4..]);
         }

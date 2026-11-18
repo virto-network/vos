@@ -1,6 +1,6 @@
 use super::relocs::overlaps_data_relocation;
 use super::*;
-use crate::riscv::rv::{addi, auipc, jal, jalr, ld, lui, sd, sub};
+use crate::riscv::rv::{add, addi, auipc, jal, jalr, ld, lui, sd, sub};
 use vos_pvm::{ExitReason, refine};
 
 #[test]
@@ -192,4 +192,84 @@ fn relocated_call_flushes_pending_lui_before_transfer() {
         Some(&LIMIT.to_le_bytes()[..]),
         "the callee must observe the LUI value before control transfers"
     );
+}
+
+const A3: u32 = 13;
+/// The read-write base, which `LinkedElf::text` links at.
+const RW: u64 = 0x2_0000;
+
+/// `text` with a PC-relative pair's HI20 at each of `hi20` naming the
+/// read-write base, and each of `lo12` a LO12 site of it, run with
+/// read-write data `rw`: its output, the eight bytes at `a0`.
+fn run_relocated(text: Vec<u8>, hi20: &[u64], lo12: &[u64], rw: u64) -> Option<Vec<u8>> {
+    let elf = LinkedElf {
+        relocations: hi20.len() + lo12.len(),
+        hi20_targets: hi20.iter().map(|&at| (TEXT_VADDR + at, RW)).collect(),
+        lo12_sites: lo12.iter().map(|&at| TEXT_VADDR + at).collect(),
+        rw_data: rw.to_le_bytes().to_vec(),
+        rw_len: 8,
+        ..LinkedElf::text(TEXT_VADDR, text)
+    };
+    let blob = spi_blob(transpile_with(&elf, Link::Whole).expect("translates")).expect("links");
+    let invocation = refine::execute(&blob, &[], 10_000_000).expect("executes");
+    assert_eq!(invocation.exit, ExitReason::Halt);
+    invocation.output_bounded(8)
+}
+
+/// A LO12 store whose value a LUI buffered just before it loads stores
+/// that value, not the register's earlier one: the LUI is emitted first.
+#[test]
+fn a_lo12_store_stores_the_lui_before_it() {
+    let text = assemble(&[
+        auipc(A0, 0),   // 0: HI20, a0 = RW
+        lui(A1, 0x10),  // 4: buffered, a1 = 0x10000
+        sd(A1, A0, 0),  // 8: LO12, [RW] = a1
+        addi(A1, 0, 8), // 12
+        jalr(0, RA),    // 16
+    ]);
+    let output = run_relocated(text, &[0], &[8], 0);
+    assert_eq!(output.as_deref(), Some(&0x1_0000u64.to_le_bytes()[..]));
+}
+
+/// A LO12 load or address into the register a LUI buffered just before it
+/// keeps what the LO12 site writes: the LUI is not emitted after it.
+#[test]
+fn a_lo12_load_or_addi_is_not_overwritten_by_the_lui_before_it() {
+    let load = assemble(&[
+        auipc(A0, 0),   // 0: HI20, a0 = RW
+        lui(A2, 0x5),   // 4: buffered, a2 = 0x5000
+        ld(A2, A0, 0),  // 8: LO12, a2 = [RW] = 7
+        sd(A2, A0, 0),  // 12
+        addi(A1, 0, 8), // 16
+        jalr(0, RA),    // 20
+    ]);
+    let output = run_relocated(load, &[0], &[8], 7);
+    assert_eq!(output.as_deref(), Some(&7u64.to_le_bytes()[..]));
+    let address = assemble(&[
+        auipc(A0, 0),    // 0: HI20, a0 = RW
+        lui(A2, 0x5),    // 4: buffered, a2 = 0x5000
+        addi(A2, A0, 0), // 8: LO12, a2 = RW
+        sd(A2, A0, 0),   // 12
+        addi(A1, 0, 8),  // 16
+        jalr(0, RA),     // 20
+    ]);
+    let output = run_relocated(address, &[0], &[8], 7);
+    assert_eq!(output.as_deref(), Some(&RW.to_le_bytes()[..]));
+}
+
+/// A LUI buffered before a HI20's AUIPC is emitted before the AUIPC's
+/// load, so a fusion that removes that load as dead keeps the LUI's.
+#[test]
+fn a_lui_before_a_hi20_survives_the_fusion_of_its_load() {
+    let text = assemble(&[
+        addi(A2, 0, 0),  // 0
+        lui(A3, 0x5),    // 4: buffered, a3 = 0x5000
+        auipc(A0, 0),    // 8: HI20, a0 = RW
+        add(A0, A0, A2), // 12: fuses with the HI20's load
+        sd(A3, A0, 0),   // 16
+        addi(A1, 0, 8),  // 20
+        jalr(0, RA),     // 24
+    ]);
+    let output = run_relocated(text, &[8], &[], 0);
+    assert_eq!(output.as_deref(), Some(&0x5000u64.to_le_bytes()[..]));
 }

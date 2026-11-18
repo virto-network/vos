@@ -104,6 +104,17 @@ impl TranslationContext {
         Ok(())
     }
 
+    /// Emit a buffered LUI or AUIPC, as [`Self::translate_one`] does before
+    /// an instruction that consumes neither, for the relocated instructions
+    /// that bypass it. A load_imm pending for fusion stays pending only when
+    /// nothing is emitted after it.
+    pub(crate) fn flush_buffered(&mut self) -> Result<(), TranspileError> {
+        if self.pending_auipc.is_some() || self.pending_lui.is_some() {
+            self.flush_pending()?;
+        }
+        Ok(())
+    }
+
     /// Begin translating one RISC-V instruction at an address whose PVM
     /// location may be referenced by another control-flow edge.
     ///
