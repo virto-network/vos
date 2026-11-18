@@ -132,6 +132,24 @@ pub mod gas {
     }
 }
 
+/// The rules an invocation's inner machines follow where a VOS host and the
+/// Gray Paper's text part.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Profile {
+    /// A VOS host's: a machine that halts or panics restarts at counter 0
+    /// with its first block unfunded, so the next `invoke` pays for it
+    /// again.
+    #[default]
+    Vos = 0,
+    /// Gray Paper v0.8.0's, as a JAM node runs refine: Ψ returns counter 0
+    /// on a halt or panic and carries the gas-charged flag out
+    /// (`pvm.tex`, Ψ), which `invoke` stores in the machine
+    /// (`pvm_invocations.tex`, `invoke`), so the next `invoke` runs block 0
+    /// unpaid when the machine had funded the block it stopped in.
+    GrayPaper = 1,
+}
+
 /// Result-code-shaped failures from an inner-machine operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InnerError {
@@ -283,6 +301,7 @@ pub struct InnerMachines {
     machines: BTreeMap<u32, InnerMachine>,
     next_generation: u64,
     backend: PvmBackend,
+    profile: Profile,
     /// The node's pool, which serves `instantiate`.
     #[cfg(feature = "std")]
     pool: Option<Arc<crate::pool::MachinePool>>,
@@ -299,16 +318,28 @@ impl InnerMachines {
         Self::default()
     }
 
-    /// Select execution for this invocation's dictionary. Each machine keeps
-    /// independent memory, registers and gas; only preparation is immutable.
+    /// Select execution for this invocation's dictionary, under the VOS
+    /// host's [`Profile`]. Each machine keeps independent memory, registers
+    /// and gas; only preparation is immutable.
     pub fn with_backend(backend: PvmBackend) -> Self {
         Self {
             machines: BTreeMap::new(),
             next_generation: 0,
             backend,
+            profile: Profile::Vos,
             #[cfg(feature = "std")]
             pool: None,
         }
+    }
+
+    /// Follow `profile` from now on.
+    pub fn set_profile(&mut self, profile: Profile) {
+        self.profile = profile;
+    }
+
+    /// The rules this dictionary follows.
+    pub fn profile(&self) -> Profile {
+        self.profile
     }
 
     /// Serve `instantiate` from `pool`, and return its machines there.
@@ -534,13 +565,18 @@ impl InnerMachines {
                 return Err(InnerError::Backend);
             }
         };
+        let profile = self.profile;
+        let restart = |vm: &mut Interpreter| match profile {
+            Profile::Vos => vm.set_pc(0),
+            Profile::GrayPaper => vm.pc = 0,
+        };
         let exit = match exit {
             ExitReason::Halt => {
-                vm.pc = 0;
+                restart(vm);
                 InnerExit::Halt
             }
             ExitReason::Panic => {
-                vm.pc = 0;
+                restart(vm);
                 InnerExit::Panic
             }
             ExitReason::OutOfGas => InnerExit::OutOfGas,

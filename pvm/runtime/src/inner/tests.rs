@@ -271,6 +271,126 @@ fn invoke_resumes_after_host_call_then_panics_on_trap() {
     assert_eq!(machines.expunge(id), Ok(0));
 }
 
+/// The backends this host runs.
+fn backends() -> Vec<PvmBackend> {
+    let mut backends = vec![PvmBackend::ForceInterpreter];
+    if cfg!(all(
+        feature = "std",
+        target_os = "linux",
+        target_arch = "x86_64"
+    )) {
+        backends.push(PvmBackend::ForceRecompiler);
+    }
+    backends
+}
+
+/// A machine of `n` one-byte `load_imm`s and a `trap`, one block, run
+/// with ample gas under `profile`, then again with `gas`: the gas the
+/// first run used, and the second run's outcome.
+fn run_again_after_a_panic(
+    backend: PvmBackend,
+    profile: Profile,
+    n: usize,
+    gas: Gas,
+) -> (Gas, InvokeOutcome) {
+    let mut code = vec![51u8; n];
+    code.push(0);
+    let mut machines = InnerMachines::with_backend(backend);
+    machines.set_profile(profile);
+    let program = vos_pvm_program::build_compact_code_blob(&vos_pvm_program::CodeBlob {
+        jump_table: vec![],
+        bitmask: vec![1; code.len()],
+        code,
+    })
+    .unwrap();
+    let id = machines.create(&program, 0).unwrap();
+    let ample = 100_000_000;
+    let first = machines
+        .invoke(
+            id,
+            InvokeState {
+                gas: ample,
+                registers: [0; PVM_REGISTER_COUNT],
+            },
+        )
+        .unwrap();
+    assert_eq!(first.exit, InnerExit::Panic, "{backend:?}, {profile:?}");
+    let again = machines
+        .invoke(
+            id,
+            InvokeState {
+                gas,
+                registers: [0; PVM_REGISTER_COUNT],
+            },
+        )
+        .unwrap();
+    (ample - first.state.gas, again)
+}
+
+/// On a VOS host a machine that panicked restarts with its first block
+/// unfunded: invoked again with no gas it is out of gas, and with gas it
+/// pays the whole block again. (Under the Gray Paper's text, the same
+/// machine given no gas panicked again having run its million-instruction
+/// block for nothing.)
+#[test]
+fn a_panicked_machine_pays_its_first_block_again_on_a_vos_host() {
+    const N: usize = 100_000;
+    for backend in backends() {
+        let (block, again) = run_again_after_a_panic(backend, Profile::Vos, N, 0);
+        assert_eq!(block, N as Gas / 4 + 2, "{backend:?}: the block's price");
+        assert_eq!(again.exit, InnerExit::OutOfGas, "{backend:?}");
+        assert_eq!(again.state.gas, 0, "{backend:?}");
+        let (_, again) = run_again_after_a_panic(backend, Profile::Vos, N, block);
+        assert_eq!(again.exit, InnerExit::Panic, "{backend:?}");
+        assert_eq!(again.state.gas, 0, "{backend:?}: the block paid again");
+    }
+}
+
+/// Under the Gray Paper's text a machine that panicked keeps its funded
+/// flag, so its next `invoke` runs the block it restarts at unpaid: the
+/// JAM-only host's rule, kept literal there.
+#[test]
+fn a_panicked_machine_reruns_its_first_block_unpaid_under_the_gray_paper() {
+    for backend in backends() {
+        let (_, again) = run_again_after_a_panic(backend, Profile::GrayPaper, 10_000, 0);
+        assert_eq!(again.exit, InnerExit::Panic, "{backend:?}");
+        assert_eq!(again.state.gas, 0, "{backend:?}");
+    }
+}
+
+/// A machine that halted restarts as a panicked one does, under each
+/// profile.
+#[test]
+fn a_halted_machine_restarts_as_a_panicked_one() {
+    let halt = compact_blob(&[50, 0], &[0]);
+    for backend in backends() {
+        for (profile, second) in [
+            (Profile::Vos, InnerExit::OutOfGas),
+            (Profile::GrayPaper, InnerExit::Halt),
+        ] {
+            let mut machines = InnerMachines::with_backend(backend);
+            machines.set_profile(profile);
+            let id = machines.create(&halt, 0).unwrap();
+            let mut registers = [0; PVM_REGISTER_COUNT];
+            registers[0] = PVM_HALT_ADDR;
+            let first = machines
+                .invoke(
+                    id,
+                    InvokeState {
+                        gas: 1_000,
+                        registers,
+                    },
+                )
+                .unwrap();
+            assert_eq!(first.exit, InnerExit::Halt);
+            let again = machines
+                .invoke(id, InvokeState { gas: 0, registers })
+                .unwrap();
+            assert_eq!(again.exit, second, "{backend:?}, {profile:?}");
+        }
+    }
+}
+
 #[test]
 fn a_reused_slot_has_a_new_identity() {
     let mut machines = InnerMachines::new();
@@ -347,9 +467,9 @@ fn invoke_reports_halt_fault_and_out_of_gas() {
 #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn recompiled_inner_matches_reference_when_reusing_terminal_machines() {
-    // A terminal exit resets the inner PC, but does not discard the
-    // interpreter's funded gas block. Reusing the same machine must not
-    // silently charge it again under a different execution backend.
+    // A terminal exit resets the inner PC; under the Gray Paper's rules it
+    // keeps the funded flag, under a VOS host's it clears it. Reusing the
+    // same machine charges alike on either execution backend.
     let cases = [
         ("host then trap", vec![10, 42, 0], vec![0, 2], 0),
         (
@@ -365,9 +485,13 @@ fn recompiled_inner_matches_reference_when_reusing_terminal_machines() {
         ("final fallthrough", vec![1], vec![0], 0),
     ];
     for (name, code, starts, return_address) in cases {
-        for initial_gas in [0, 1, 100, 1_000] {
+        for (initial_gas, profile) in [0, 1, 100, 1_000]
+            .into_iter()
+            .flat_map(|gas| [(gas, Profile::Vos), (gas, Profile::GrayPaper)])
+        {
             let run = |backend| {
                 let mut machines = InnerMachines::with_backend(backend);
+                machines.set_profile(profile);
                 let id = machines
                     .create(&compact_blob(&code, &starts), 0)
                     .unwrap_or_else(|error| panic!("{name}, {backend:?}: {error:?}"));
@@ -389,7 +513,7 @@ fn recompiled_inner_matches_reference_when_reusing_terminal_machines() {
             assert_eq!(
                 run(PvmBackend::ForceRecompiler),
                 run(PvmBackend::ForceInterpreter),
-                "{name}, initial gas {initial_gas}"
+                "{name}, initial gas {initial_gas}, {profile:?}"
             );
         }
     }
@@ -397,12 +521,18 @@ fn recompiled_inner_matches_reference_when_reusing_terminal_machines() {
 
 #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
 #[test]
-fn recompiled_inner_invalid_entry_preserves_existing_funding() {
+fn recompiled_inner_invalid_entry_matches_reference_under_each_profile() {
     for pc in [1, 4, u32::MAX] {
-        for funded in [false, true] {
+        for (funded, profile) in [false, true]
+            .into_iter()
+            .flat_map(|funded| [(funded, Profile::Vos), (funded, Profile::GrayPaper)])
+        {
+            // A VOS host restarts a panicked machine unfunded.
+            let kept = funded && profile == Profile::GrayPaper;
             for gas in [0, 1_000] {
                 let run = |backend| {
                     let mut machines = InnerMachines::with_backend(backend);
+                    machines.set_profile(profile);
                     let id = machines.create(&host_then_trap(), 0).unwrap();
                     let vm = machines.machines.get_mut(&id).unwrap().vm().unwrap();
                     vm.pc = pc;
@@ -418,7 +548,7 @@ fn recompiled_inner_invalid_entry_preserves_existing_funding() {
                         if step == 0 {
                             assert_eq!(outcome.exit, InnerExit::Panic);
                             assert_eq!(outcome.state.gas, gas);
-                            assert_eq!(vm.gas_charged, funded);
+                            assert_eq!(vm.gas_charged, kept);
                         }
                         observations.push((outcome.clone(), vm.pc, vm.gas_charged));
                         state = outcome.state;
@@ -428,7 +558,7 @@ fn recompiled_inner_invalid_entry_preserves_existing_funding() {
                 assert_eq!(
                     run(PvmBackend::ForceRecompiler),
                     run(PvmBackend::ForceInterpreter),
-                    "invalid pc {pc}, funded {funded}, gas {gas}"
+                    "invalid pc {pc}, funded {funded}, gas {gas}, {profile:?}"
                 );
             }
         }

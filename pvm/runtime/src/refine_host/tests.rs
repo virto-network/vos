@@ -1052,3 +1052,63 @@ fn the_jam_only_hosts_state_stand_in_serves_state_reads_alone() {
         Some(RefineError::NoStateReader)
     );
 }
+
+/// An outer program that creates an inner machine of `n` one-byte
+/// `load_imm`s and a `trap` (its arguments), invokes it with 100,000 gas,
+/// then again with none, and halts: φ7 the second invoke's status.
+fn panic_then_invoke_unpaid(n: usize) -> (Vec<u8>, Vec<u8>) {
+    const RW_BASE: u32 = 2 * crate::PVM_ZONE_SIZE;
+    let mut frame = [0u8; 112];
+    frame[..8].copy_from_slice(&100_000u64.to_le_bytes());
+    let [b0, b1, b2, _] = RW_BASE.to_le_bytes();
+    let code = [
+        10, 9, // machine(φ7, φ8): the arguments
+        51, 8, b0, b1, b2, // φ8 <- the frame
+        10, 13, // invoke(0, frame)
+        33, 3, b0, b1, b2, // the frame's gas <- 0
+        51, 7, // φ7 <- 0
+        10, 13, // invoke(0, frame)
+        50, 0, // halt
+    ];
+    let outer = standard_program_with_rw(&code, &[0, 2, 7, 9, 14, 16, 18], &frame);
+    let mut inner = vec![51u8; n];
+    inner.push(0);
+    let inner = build_compact_code_blob(&CodeBlob {
+        jump_table: vec![],
+        bitmask: vec![1; inner.len()],
+        code: inner,
+    })
+    .unwrap();
+    (outer, inner)
+}
+
+/// A VOS host's inner machine that panicked pays its first block again
+/// on its next `invoke`, so one invoked with no gas is out of gas; the
+/// JAM-only host keeps the Gray Paper's rule, under which it panics again
+/// having run the block unpaid. Alike on both backends.
+#[test]
+fn a_panicked_inner_machine_is_rerun_unpaid_only_on_the_jam_only_host() {
+    const PANIC_STATUS: u64 = 1;
+    const OUT_OF_GAS_STATUS: u64 = 4;
+    let (outer, inner) = panic_then_invoke_unpaid(10_000);
+    let mut backends = vec![PvmBackend::ForceInterpreter];
+    if cfg!(all(
+        feature = "std",
+        target_os = "linux",
+        target_arch = "x86_64"
+    )) {
+        backends.push(PvmBackend::ForceRecompiler);
+    }
+    for backend in backends {
+        let load = || {
+            RefineContext::load_with_backend(&outer, &inner, 1_000_000, MemoryModel::Auto, backend)
+                .unwrap()
+        };
+        let vos = load().try_run().unwrap();
+        assert_eq!(vos.exit, ExitReason::Halt, "{backend:?}");
+        assert_eq!(vos.registers[7], OUT_OF_GAS_STATUS, "{backend:?}");
+        let jam = load().try_run_jam(JamRefine::default()).unwrap().invocation;
+        assert_eq!(jam.exit, ExitReason::Halt, "{backend:?}");
+        assert_eq!(jam.registers[7], PANIC_STATUS, "{backend:?}");
+    }
+}

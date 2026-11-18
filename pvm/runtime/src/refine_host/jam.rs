@@ -240,10 +240,11 @@ pub struct JamRun {
 impl RefineContext {
     /// Run as a JAM node would, serving what `jam` gives: Gray Paper
     /// v0.8.0's refine calls at its tariff ([`jam_gas`] and the inner
-    /// machines' `crate::inner::gas`), no precompile computed and no VOS
-    /// extension served, whatever pool or state reader the context holds;
-    /// every other call answers `WHAT` at `C_unknown` while execution
-    /// continues.
+    /// machines' `crate::inner::gas`), its inner machines under its rules
+    /// ([`crate::inner::Profile::GrayPaper`]), no precompile computed and
+    /// no VOS extension served, whatever pool or state reader the context
+    /// holds; every other call answers `WHAT` at `C_unknown` while
+    /// execution continues.
     pub fn try_run_jam(mut self, jam: JamRefine) -> Result<JamRun, RefineError> {
         self.host = Host::Jam { state: false };
         self.run_jam(jam)
@@ -267,7 +268,8 @@ impl RefineContext {
         self.run_jam(jam)
     }
 
-    fn run_jam(self, jam: JamRefine) -> Result<JamRun, RefineError> {
+    fn run_jam(mut self, jam: JamRefine) -> Result<JamRun, RefineError> {
+        self.inner.set_profile(crate::inner::Profile::GrayPaper);
         let mut exports = Vec::new();
         let invocation =
             self.try_run_with_host(|id, machine| serve_jam(&jam, &mut exports, id, machine))?;
