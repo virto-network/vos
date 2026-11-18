@@ -319,12 +319,16 @@ fn host_calls(text: &[u32]) -> Result<Vec<(u64, u32)>, TranspileError> {
 }
 
 /// A marked ecall's id is the constant its block loads into t0, by `li`
-/// whether one instruction or two.
+/// whether one instruction or two (LUI then ADDI or ADDIW).
 #[test]
 fn an_ecalli_takes_the_constant_its_block_loads_into_t0() {
     let calls = host_calls(&[addi(T0, 0, 0x401), MARK, ECALL, jalr(0, RA)]);
     assert_eq!(calls.unwrap(), [(TEXT_VADDR + 8, 0x401)]);
     let calls = host_calls(&[lui(T0, 1), addi(T0, T0, 1), MARK, ECALL, jalr(0, RA)]);
+    assert_eq!(calls.unwrap(), [(TEXT_VADDR + 12, 0x1001)]);
+    // `li t0, N` as RV64 lowers a 32-bit N: LUI then ADDIW.
+    let addiw = crate::riscv::rv::i_type(0x1b, 0, T0, T0, 1);
+    let calls = host_calls(&[lui(T0, 1), addiw, MARK, ECALL, jalr(0, RA)]);
     assert_eq!(calls.unwrap(), [(TEXT_VADDR + 12, 0x1001)]);
 }
 

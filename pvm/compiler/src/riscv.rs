@@ -143,26 +143,27 @@ impl TranslationContext {
         Ok(())
     }
 
-    /// Forget t0's constant when `inst` writes t0 (x5) any other way than
-    /// as an immediate the translation tracks.
+    /// Follow t0's (x5's) constant through `inst`, before it is
+    /// translated: `li t0, N` in any of its forms (`addi` or `addiw` from
+    /// x0, or `lui` then `addi` or `addiw` of t0) fixes it, and any other
+    /// write to t0 leaves it unknown.
     pub(crate) fn note_write(&mut self, inst: u32) {
-        let writes = matches!(
-            opcode(inst),
-            op::LUI
-                | op::AUIPC
-                | op::JAL
-                | op::JALR
-                | op::LOAD
-                | op::OP_IMM
-                | op::OP
-                | op::OP_IMM_32
-                | op::OP_32
-                | op::CUSTOM_0
-                | op::SYSTEM
-        );
-        if writes && rd(inst) == 5 {
-            self.last_t0_imm = None;
+        const T0: u8 = 5;
+        if rd(inst) != T0 {
+            return;
         }
+        let (rs1, imm) = (rs1(inst), i64::from(i_imm(inst)));
+        let base = match rs1 {
+            0 => Some(0),
+            T0 => self.last_t0_imm,
+            _ => None,
+        };
+        self.last_t0_imm = match (opcode(inst), funct3(inst)) {
+            (op::LUI, _) => Some(i64::from(u_imm(inst))),
+            (op::OP_IMM, 0) => base.map(|base| base.wrapping_add(imm)),
+            (op::OP_IMM_32, 0) => base.map(|base| i64::from(base.wrapping_add(imm) as i32)),
+            _ => None,
+        };
     }
 
     /// Translate the 32-bit RISC-V instruction `inst` at `addr`.

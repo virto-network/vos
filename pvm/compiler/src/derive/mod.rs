@@ -70,7 +70,8 @@
 //! however function ranges overlap, the data its kernels copy is at most
 //! [`MAX_KERNEL_DATA`] bytes, the programs it keeps hold at most
 //! [`MAX_DERIVED`] bytes, and a leaf is sized once for each class however
-//! many kernels share it.
+//! many kernels share it: a sizing takes a few milliseconds, so kernels of
+//! distinct shapes, each with up to four classes, take seconds at most.
 //!
 //! **Bit-reproducible:** the output's order comes from sorted sections,
 //! symbols and addresses, never from a map's iteration, so the same ELF and

@@ -16,11 +16,6 @@ impl TranslationContext {
         rs1: u8,
         imm: i32,
     ) -> Result<(), TranspileError> {
-        // Track `li t0, N` (ADDI x5, x0, N) for ecall ID translation
-        if funct3 == 0 && rd == 5 && rs1 == 0 {
-            self.last_t0_imm = Some(i64::from(imm));
-        }
-
         // AUIPC+ADDI fusion: the full address, a jump-table address when it
         // is code (a function pointer), so indirect calls via djump work.
         if let Some((auipc_rd, auipc_val)) = self.pending_auipc.take() {
@@ -37,10 +32,6 @@ impl TranslationContext {
         if let Some((lui_rd, lui_val)) = self.pending_lui.take() {
             if funct3 == 0 && rd == lui_rd && rs1 == lui_rd && rd != 0 {
                 let combined = lui_val.wrapping_add(imm as i64);
-                // `li t0, N` of a larger N: LUI and ADDI.
-                if rd == 5 {
-                    self.last_t0_imm = Some(combined);
-                }
                 // Track for potential fusion with subsequent ALU op
                 let pos = self.code.len();
                 self.emit_load_imm(rd, combined)?;
