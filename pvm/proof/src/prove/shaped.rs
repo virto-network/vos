@@ -57,8 +57,10 @@ pub fn prove_shaped(
 /// The preprocessed root of a segment over `shape` under `format`, for the
 /// program `side_note` holds ([`crate::kernel::kernel_side_note`]): the
 /// root every segment of the class commits, whatever its run, which a
-/// kernel's program id pins. `None` on a format the registry does not admit
-/// or a malformed or empty shape.
+/// kernel's program id pins. `None` on a format the registry does not admit,
+/// a malformed or empty shape, one whose code or jump table is larger than
+/// its chip's log size holds, or one whose proofs would count below the
+/// format's security floor (refused before any column is generated).
 pub fn program_commitment_for_shape(
     side_note: &SideNote,
     shape: &ProofShape,
@@ -69,8 +71,30 @@ pub fn program_commitment_for_shape(
     if shape.components == 0 || shape.log_sizes.contains(&0) {
         return None;
     }
-    install_thread_pool();
+    let size_of = |chip: usize| {
+        (shape.components & 1 << chip != 0)
+            .then(|| shape.log_sizes[(shape.components & ((1 << chip) - 1)).count_ones() as usize])
+    };
+    let tables = [
+        (
+            crate::chip_idx::PROGRAM_MEMORY,
+            crate::chips::program_memory::table_log_size(side_note),
+        ),
+        (
+            crate::chip_idx::JUMP_TABLE,
+            crate::chips::jump_table::table_log_size(side_note),
+        ),
+    ];
+    if tables
+        .iter()
+        .any(|&(chip, table)| size_of(chip).is_some_and(|size| size < table))
+    {
+        return None;
+    }
     let config = Target::of(format).ok()?.format.pcs_config();
+    let layout = crate::sample_layout(shape.components, &shape.log_sizes, &config);
+    crate::proof::check_format_security(format, &config, &layout.security_shape).ok()?;
+    install_thread_pool();
     let components = selected(shape.components);
     crate::with_stack!(format.channel, Stack => {
         Some(

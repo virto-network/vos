@@ -51,6 +51,17 @@ pub enum ShapeError {
     ClassChips,
     /// A class's log size outside a lane's 2^4 rows to [`MAX_LOG_SIZE`].
     LogSize,
+    /// A class's steps outside one to `2^MAX_LOG_SIZE`, or more than its
+    /// CPU's rows, a row a step.
+    Steps,
+    /// A class of no page.
+    Pages,
+    /// A class gives a fixed table fewer rows than its entries
+    /// ([`FIXED_TABLES`]).
+    Table,
+    /// A class whose proofs would count below its format's security
+    /// floor at their shape.
+    Security,
     /// A proof holds a chip its shape does not.
     MoreChips,
     /// A proof lacks a chip its shape holds.
@@ -70,6 +81,10 @@ impl ShapeError {
             Self::Classes => "the shape has more classes than a kernel's record holds",
             Self::ClassChips => "a class sizes other chips than the shape's",
             Self::LogSize => "a class has a log size out of range",
+            Self::Steps => "a class's steps are out of range or past its CPU's rows",
+            Self::Pages => "a class has no page",
+            Self::Table => "a class gives a fixed table fewer rows than its entries",
+            Self::Security => "a class's proofs count below its format's floor",
             Self::MoreChips => "the proof holds more chips than its kernel's shape",
             Self::FewerChips => "the proof holds fewer chips than its kernel's shape",
             Self::NoSuchClass => "the proof's log sizes are no class of its kernel's shape",
@@ -127,6 +142,19 @@ pub struct ProofShape {
 /// The most a pinned log size may be: a verifier's default cap.
 pub const MAX_LOG_SIZE: u8 = crate::proof::MAX_PROOF_LOG_SIZE as u8;
 
+/// Each fixed table's chip and the log size of its entries, the least a
+/// class gives it: a table at more rows repeats its entries, at fewer it
+/// does not hold them.
+pub const FIXED_TABLES: [(usize, u8); 7] = [
+    (chip_idx::POWER_OF_TWO, 6),
+    (chip_idx::RANGE_MULTIPLICITY_256, 8),
+    (chip_idx::BITWISE_LOOKUP, 8),
+    (chip_idx::POPCOUNT, 8),
+    (chip_idx::BITCOUNT, 8),
+    (chip_idx::BYTE_TO_BITS, 8),
+    (chip_idx::BITWISE_AND_BYTE, 16),
+];
+
 /// The most classes a shape has: a kernel's record's cap
 /// (`vos_abi::records::MAX_CLASSES`).
 pub const MAX_CLASSES: usize = 4;
@@ -138,7 +166,11 @@ impl KernelShape {
     /// Whether it is a shape a verifier accepts: within the segment AIR,
     /// holding every chip of [`chip_idx::ALWAYS`], with one to
     /// [`MAX_CLASSES`] classes, each giving every chip a log size from a
-    /// lane's 2^4 rows to [`MAX_LOG_SIZE`].
+    /// lane's 2^4 rows to [`MAX_LOG_SIZE`] and each fixed table at least
+    /// its entries ([`FIXED_TABLES`]), cutting at a page or more and at
+    /// most as many steps as its CPU's rows. A shape it accepts cuts and
+    /// sizes without a panic; whether its proofs meet their format's
+    /// security floor is [`KernelShape::check_security`]'s.
     pub fn check(&self) -> Result<(), ShapeError> {
         if self.components & !chip_idx::ALL != 0 {
             return Err(ShapeError::Outside);
@@ -164,6 +196,40 @@ impl KernelShape {
             {
                 return Err(ShapeError::LogSize);
             }
+            // The CPU is the first chip of every shape.
+            if class.log_steps > class.log_sizes[0] {
+                return Err(ShapeError::Steps);
+            }
+            if class.pages == 0 {
+                return Err(ShapeError::Pages);
+            }
+            let short = FIXED_TABLES.iter().any(|&(chip, least)| {
+                self.components & 1 << chip != 0
+                    && class.log_sizes[(self.components & ((1 << chip) - 1)).count_ones() as usize]
+                        < least
+            });
+            if short {
+                return Err(ShapeError::Table);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether every class's proofs under `format` count at least its
+    /// security floor at their shape, as a verifier counts them
+    /// ([`crate::proof::check_format_security`]): what a venue holds an
+    /// install's shape to before building its leaves, whose circuits
+    /// assume it. The shape is [`KernelShape::check`]'s first. A prover
+    /// build's: the leaves are built in one.
+    #[cfg(feature = "prover")]
+    pub fn check_security(&self, format: &crate::format::Format) -> Result<(), ShapeError> {
+        self.check()?;
+        let config = format.pcs_config();
+        for index in 0..self.classes.len() {
+            let segment = self.segment(index).ok_or(ShapeError::NoClass)?;
+            let layout = crate::sample_layout(segment.components, &segment.log_sizes, &config);
+            crate::proof::check_format_security(format, &config, &layout.security_shape)
+                .map_err(|_| ShapeError::Security)?;
         }
         Ok(())
     }
@@ -270,12 +336,12 @@ mod tests {
                 ClassShape {
                     log_steps: 12,
                     pages: 8,
-                    log_sizes: vec![12; chips],
+                    log_sizes: vec![16; chips],
                 },
                 ClassShape {
                     log_steps: 15,
                     pages: 8,
-                    log_sizes: vec![15; chips],
+                    log_sizes: vec![17; chips],
                 },
             ],
         }
@@ -288,16 +354,16 @@ mod tests {
         let shape = shape();
         shape.check().unwrap();
         let chips = shape.components.count_ones() as usize;
-        assert_eq!(shape.class_of(shape.components, &vec![15; chips]), Ok(1));
-        assert_eq!(shape.class_of(shape.components, &vec![12; chips]), Ok(0));
-        let mut other = vec![15; chips];
-        other[0] = 16;
+        assert_eq!(shape.class_of(shape.components, &vec![17; chips]), Ok(1));
+        assert_eq!(shape.class_of(shape.components, &vec![16; chips]), Ok(0));
+        let mut other = vec![17; chips];
+        other[0] = 18;
         assert!(shape.class_of(shape.components, &other).is_err());
         assert!(
             shape
                 .class_of(
                     shape.components | 1 << chip_idx::DIVREM,
-                    &vec![15; chips + 1]
+                    &vec![17; chips + 1]
                 )
                 .is_err()
         );
@@ -305,13 +371,13 @@ mod tests {
             shape
                 .class_of(
                     shape.components & !(1 << chip_idx::MUL),
-                    &vec![15; chips - 1]
+                    &vec![17; chips - 1]
                 )
                 .is_err()
         );
         assert!(
             shape
-                .class_of(shape.components, &vec![15; chips - 1])
+                .class_of(shape.components, &vec![17; chips - 1])
                 .is_err()
         );
     }
@@ -338,6 +404,46 @@ mod tests {
         let mut many = shape();
         many.classes = vec![many.classes[0].clone(); MAX_CLASSES + 1];
         assert_eq!(many.check(), Err(ShapeError::Classes));
+    }
+
+    /// Each fixed table's least log size is its chip's trace's at its
+    /// natural size.
+    #[cfg(feature = "prover")]
+    #[test]
+    fn the_fixed_tables_are_their_chips_sizes() {
+        let side_note = crate::SideNote::new(vec![], vec![0], vec![1]);
+        for (chip, least) in FIXED_TABLES {
+            let trace = crate::BASE_COMPONENTS[chip].generate_component_trace_immut_min(&side_note, 0);
+            assert_eq!(trace.log_size(), u32::from(least), "chip {chip}");
+        }
+    }
+
+    /// A class giving a fixed table fewer rows than its entries, at which its
+    /// preprocessed columns would not fit their domain, is refused.
+    #[test]
+    fn a_class_short_of_a_fixed_table_is_refused() {
+        let mut short = shape();
+        let position = (short.components & ((1 << chip_idx::POWER_OF_TWO) - 1)).count_ones();
+        short.classes[0].log_sizes[position as usize] = 5;
+        assert_eq!(short.check(), Err(ShapeError::Table));
+    }
+
+    /// A class of no page, of more steps than its CPU's rows, or of a shift
+    /// past a word's bits, which a hostile install record may name and a
+    /// cut would panic on, is refused.
+    #[test]
+    fn a_class_that_cannot_cut_is_refused() {
+        let mut pageless = shape();
+        pageless.classes[0].pages = 0;
+        assert_eq!(pageless.check(), Err(ShapeError::Pages));
+        for log_steps in [17, 64, u8::MAX] {
+            let mut long = shape();
+            long.classes[0].log_steps = log_steps;
+            assert_eq!(long.check(), Err(ShapeError::Steps));
+        }
+        let mut most = shape();
+        most.classes[0].log_steps = 16;
+        assert!(most.check().is_ok());
     }
 
     /// A record of [`shape`]'s chips, each class sized as its.

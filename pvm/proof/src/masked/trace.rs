@@ -155,7 +155,9 @@ pub fn masked_device_trace(
 /// `code` its kernel's side note (no run needed), at the shape `shape`,
 /// `log_sizes`: what its program id's preprocessed root commits. Refused
 /// as [`SegmentError::Shape`] when a table (the code, the jump table, the
-/// data) needs more rows than its chip's log size.
+/// data, a fixed table's entries, [`crate::shape::FIXED_TABLES`]) needs more
+/// rows than its chip's log size: a release artifact's sizes are held to
+/// them before any column is generated.
 pub fn device_preprocessed(
     code: &SideNote,
     layout: &crate::device::DeviceLayout,
@@ -173,11 +175,15 @@ pub fn device_preprocessed(
     )));
     use crate::device::device_chip;
     for (&chip, &log_size) in chips.iter().zip(log_sizes) {
+        let fixed = crate::shape::FIXED_TABLES
+            .iter()
+            .find(|&&(table, _)| table == chip)
+            .map_or(0, |&(_, least)| u32::from(least));
         let table = match chip {
             device_chip::PROGRAM_MEMORY => crate::chips::program_memory::table_log_size(&side_note),
             device_chip::JUMP_TABLE => crate::chips::jump_table::table_log_size(&side_note),
             device_chip::DATA_TABLE => crate::chips::word_memory::data::table_log_size(&side_note),
-            _ => 0,
+            _ => fixed,
         };
         if table > log_size {
             return Err(SegmentError::Shape {
