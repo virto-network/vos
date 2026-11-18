@@ -68,8 +68,10 @@ proofs a phone makes. The recursion AIR's own design is
     The page-Merkle boundary and BLAKE2b's chips are a large share of
     any shape that holds them.
   - Verify gas is linear in columns. The best measured segment verify
-    is 1.17B gas, and every projected lever stacked still leaves
-    0.45–0.7B.
+    is 1.17B gas (a Blake2s channel, the window kernel's shape) [measured
+    elsewhere: the research's JAM-only host and its tariff of then, by
+    2026-10-16, not rerun on this tree], and every projected lever
+    stacked still leaves 0.45–0.7B.
 - **A small final proof is cheap to verify.**
   - A proxy (320 columns, log 16, blowup 64, 13 queries, fold step 3, a
     2^6 last layer) measured 54.4M gas and 80 KB unmasked; about 66–76M

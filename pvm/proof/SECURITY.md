@@ -180,6 +180,13 @@ the conjectured count.
   the transfers the machine takes, and a segment ends at that pc exactly
   when it ends at a halt. A trap keeps `next_pc = pc`: a panic cannot
   present as a halt. At the halt φ9..12 hold the io-hash.
+- **The halt output:** `kernel::trace_program` returns Gray Paper Ψ_M's
+  output: empty for a zero length whatever φ7, empty for a range any byte
+  of which is unreadable. `kernel::trace_kernel` holds the kernel
+  contract: an empty output whatever φ7; a nonempty output must be
+  readable, else `KernelTraceError::Output`; an allocation failure is
+  `KernelTraceError::Allocation`. The proof binds the io-hash (φ9..φ12),
+  not the output bytes.
 - **No gas is proved.** A statement says nothing of a run's cost: the live
   host meters, and live ≡ traced holds for the runs the host completed.
   The prover role bears the cost of a run it chose to prove (§ Three
@@ -897,6 +904,15 @@ the prover role, where an audit most needs it said.
   that a next pc is an instruction start, so this refusal is what keeps a
   proved run to the transfers the machine takes (§ The halt rule): a
   program id pinned without it would admit runs the machine never makes.
+- **The loader's bounds:** the proof tracer's loader
+  (`kernel::trace_kernel`, `trace_program`, `kernel_side_note`) accepts
+  every program the Gray Paper reader and validation accept, with no
+  executor code bound. It refuses code longer than a proof's program
+  memory holds (2^`MAX_PROOF_LOG_SIZE` = 2^24 bytes) as
+  `KernelTraceError::Code`, the prover's own resource bound. An installed
+  kernel must be its program's one encoding
+  (`KernelTraceError::NotCanonical`, `KernelError::NotCanonical`), so one
+  program id names one blob.
 - **Continuity is a digest equality:** a fold requires the left child's
   exit state digest to equal the right child's entry state digest, each
   the Poseidon2-M31 leaf sponge (`recair/src/gadgets.rs`'s `leaf_hash`,
