@@ -176,25 +176,35 @@ build-wasm-blobs:
 # lays out the program's code: built from the fixed path, a guest whose
 # path dependencies lie outside its workspace is the same bytes from any
 # checkout. The path is part of the blobs' bytes, so it cannot move to a
-# per-user directory: on a host with other users, `/tmp/vos-checkout` or
-# its lock made by another user (who builds from it, or left it) blocks
-# this user's builds, and the recipe stops naming that user; build inside
-# a private mount namespace that binds the checkout at the fixed path
-# instead.
+# per-user directory. What keeps another user from pointing the build at
+# other sources, each checked, the build refused without it: `/tmp` is
+# root's and sticky, so no other user can replace or remove this user's
+# link or lock there, and the kernel follows no other user's symbolic
+# link in it (`fs.protected_symlinks`), so the lock cannot be redirected;
+# the link, once made, is this user's and names this checkout. On a host
+# with other users, a `/tmp/vos-checkout` or lock another user made (who
+# builds from it, or left it) blocks this user's builds, and the recipe
+# names that user; build inside a private mount namespace that binds the
+# checkout at the fixed path instead.
 _at-fixed-path dir +args:
     #!/usr/bin/env bash
     set -euo pipefail
     fixed=/tmp/vos-checkout
+    me=$(id -un)
+    here=$(pwd -P)
+    if [ "$(stat -c %U /tmp)" != root ] || [ ! -k /tmp ]; then echo "/tmp is not root's and sticky: another user could replace $fixed" >&2; exit 1; fi
+    if [ "$(cat /proc/sys/fs/protected_symlinks)" != 1 ]; then echo "fs.protected_symlinks is off: another user's link could redirect $fixed.lock" >&2; exit 1; fi
     for entry in "$fixed.lock" "$fixed"; do
         if [ -e "$entry" ] || [ -L "$entry" ]; then
             owner=$(stat -c %U "$entry")
-            if [ "$owner" != "$(id -un)" ]; then echo "$entry is $owner's, not $(id -un)'s: another user builds from the fixed path on this host" >&2; exit 1; fi
+            if [ "$owner" != "$me" ]; then echo "$entry is $owner's, not $me's: another user builds from the fixed path on this host" >&2; exit 1; fi
         fi
     done
-    exec 9>"$fixed.lock"
+    exec 9>>"$fixed.lock"
     flock 9
     if [ -e "$fixed" ] && [ ! -L "$fixed" ]; then echo "$fixed is not a symbolic link" >&2; exit 1; fi
-    ln -sfn "$(pwd -P)" "$fixed"
+    ln -sfn "$here" "$fixed"
+    if [ "$(stat -c %U "$fixed")" != "$me" ] || [ "$(readlink "$fixed")" != "$here" ]; then echo "$fixed is not this user's link to $here" >&2; exit 1; fi
     cd "{{dir}}"
     CARGO_INCREMENTAL=0 cargo build --manifest-path "$fixed/{{dir}}/Cargo.toml" {{args}}
 
