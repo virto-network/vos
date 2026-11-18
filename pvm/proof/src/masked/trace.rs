@@ -42,6 +42,7 @@ pub struct ChipTraces {
 /// `column`'s values overwritten with zeros by volatile writes, which the
 /// compiler keeps though nothing reads them after: a witness's column, once
 /// it is no longer needed. The allocator gets the zeros back.
+#[allow(unsafe_code)]
 pub fn wipe_column(column: &mut BaseColumn) {
     use stwo::prover::backend::simd::m31::PackedBaseField;
     for packed in &mut column.data {

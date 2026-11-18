@@ -17,6 +17,8 @@
 //!   started, with a full four-byte immediate that trailing continuation
 //!   bytes cannot change.
 
+#![forbid(unsafe_code)]
+
 pub mod assembler;
 mod derive;
 pub mod leaf;

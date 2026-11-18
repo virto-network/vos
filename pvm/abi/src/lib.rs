@@ -13,6 +13,7 @@
 //! uses, except the Gray Paper structures in [`jam`], which follow the Gray
 //! Paper's own encoding.
 
+#![forbid(unsafe_code)]
 #![no_std]
 
 extern crate alloc;

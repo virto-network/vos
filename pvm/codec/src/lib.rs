@@ -9,6 +9,7 @@
 //! - `Option<T>`: discriminator byte (0=None, 1=Some) + payload
 //! - Enums: u8 discriminator + variant payload
 
+#![forbid(unsafe_code)]
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 

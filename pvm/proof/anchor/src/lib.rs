@@ -42,6 +42,7 @@
 //! that can overflow is a lint error, each one left allowed in place with
 //! the reason it cannot fail.
 
+#![forbid(unsafe_code)]
 #![no_std]
 #![cfg_attr(
     not(test),

@@ -1,5 +1,7 @@
 //! Shared helpers for the PVM benches and cross-host checks.
 
+#![forbid(unsafe_code)]
+
 use vos_pvm::ExitReason;
 use vos_pvm::refine::{Machine, MachineObservation};
 use vos_pvm::refine_host::RefineContext;

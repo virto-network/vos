@@ -98,6 +98,9 @@
 //! [into_run]: crate::core::tracing::TracingPvm::into_run
 //! [into_side_note]: crate::core::tracing::TracingPvm::into_side_note
 
+// One volatile wipe (`masked::wipe_column`) is this crate's only unsafe
+// code; it is allowed there alone.
+#![deny(unsafe_code)]
 #![cfg_attr(not(feature = "prover"), no_std)]
 // In verifier-only builds (--no-default-features), prover-only modules are
 // gated out, so many helper fns / structs / consts in always-compiled

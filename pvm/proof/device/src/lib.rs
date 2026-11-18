@@ -44,6 +44,8 @@
 //!   arguments and no output; its arguments are the siblings, the secret,
 //!   the slot and those public bytes, in that order ([`auth_arguments`]).
 
+#![forbid(unsafe_code)]
+
 use vos_abi::credentials::{self, DEPTH, EMPTY, Tag, Words};
 use vos_abi::ids::MethodId;
 use vos_abi::{Decode, Encode};
