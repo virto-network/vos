@@ -789,7 +789,7 @@ impl RecompiledPvm {
         let gas_block_start_by_pc = compile_result.gas_block_start_by_pc;
         let block_gas_costs = compile_result.block_gas_costs;
         let signal_state = {
-            signal::ensure_installed();
+            signal::ensure_installed()?;
             let ss = Box::new(signal::SignalState {
                 code_start: native_code.ptr as usize,
                 code_end: native_code.ptr as usize + native_code.len,

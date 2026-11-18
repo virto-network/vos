@@ -55,7 +55,11 @@ pub(crate) fn run_standard(
     )
     .is_none()
     {
-        signal::ensure_installed();
+        if let Err(error) = signal::ensure_installed() {
+            // Nothing native ran: the interpreter takes the slice.
+            tracing::debug!(%error, "interpreting without a fault handler");
+            return Ok(None);
+        }
         let code_start = compiled.native_code.ptr as usize;
         let mut state = signal::SignalState {
             code_start,
