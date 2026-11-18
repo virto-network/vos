@@ -236,7 +236,7 @@ pub enum DeriveError {
     Heap { start: u64, size: u64, end: u64 },
     #[error("the derivation's programs hold {0} bytes, past {MAX_DERIVED}")]
     Derived(usize),
-    #[error("a kernel's control transfer panics whatever its registers hold: {0}")]
+    #[error("a kernel's control transfer lands on no basic block start: {0}")]
     Transfer(vos_pvm::interpreter::BadTransfer),
     #[error("a kernel reaches code from {0:#x} to {1:#x}, which no code section holds whole")]
     Unreadable(u64, u64),

@@ -205,12 +205,23 @@ The scale results are in `core-model.md` §14, "The scale test".
 - **The kit's lock:** shipping the lock VOS's `check-kit` builds on beside
   the kit, with a command listing every package of the verify graph a
   consumer resolves at another version; and signed release tags with a
-  bootstrap that verifies them (today push access to VOS is the trust
-  root).
+  bootstrap that verifies them (without them push access to VOS is the
+  trust root).
 - **A release-profile proving bench in `pvm/`** (`prove_final` over the
   Poseidon2-M31 kernel, a device prove and verify), so the timings the
   docs quote from the test profile have a reproducible twin.
-
+- **Kreivo's `MaxProofLen`** (`spaces-pallet.md`, the reference mock and
+  its vectors) suggests 262,144 bytes where the final verifier refuses
+  past `MAX_PROOF_BYTES`, 143,360: a weight charged by the pallet's bound
+  pays for bytes no decode accepts. Lower it with the mock and its vectors.
+- **The prover's entry points under `pvm/`:** `Program::from_kernel` has
+  no caller there (the node side's device install is it), and no test
+  holds `tree::prove_run`'s root to a hand-built tree at `cut_class`'s
+  cut.
+- **Fuzz seeds:** `prove_verify_roundtrip`'s replay seeded from the ISA
+  tests' programs (an encoder of its `arbitrary` input), and a halting
+  program in `program_blob`'s, so both backends are compared on a
+  completed run, not only on refusals and panics.
 - **The external audit's scope:** the device shape, the stock kernels, the
   Poseidon2 chip and their masking, with the recursion AIR, the final
   verifier, `derive` and the security tool's counts. Engage before any

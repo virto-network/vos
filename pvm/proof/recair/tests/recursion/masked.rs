@@ -415,6 +415,7 @@ fn the_masked_wrap_verifies_on_the_jam_only_host() {
     );
     assert_eq!(report.verdict, jam::ACCEPT, "{}", report.error);
     assert!(decode <= 4_000_000, "decode {decode} gas");
+    assert!(verify <= jam::VERIFY_GAS, "verify {verify} gas");
     jam::pinned(&jam::counts(), "masked-wrap-verify-gas", verify, 0);
 
     let request = jam::words_request(masked::FORMAT, &masked.words);

@@ -1097,13 +1097,13 @@ check: fmt-check check-tiers check-layers build-test-actors build-programs build
     cargo test -p vos-pvm-recair -p vos-pvm-device ...(python3 -I tools/gates/tiers.py fast -p vos-pvm-recair -p vos-pvm-device | split row ' ') -- --test-threads=4
     cargo test {{agent_crates}} ...(python3 -I tools/gates/tiers.py fast {{agent_crates}} | split row ' ')
 
-# The step gate, after each step of work and before its commit: `check`,
+# The commit gate, before each commit: `check`,
 # then the docs' links, the dependencies' licences and advisories (`deny`),
 # the side workspaces' lock files held to the root's (`check-locks`), the
 # venue rules' tripwire, the builds without std
 # with every guest built and its blob checked, the production builds'
 # leaks, the verifier kit, the fuzz corpus replayed, the lints of the
-# feature sets a step touches, the heavy test targets and the doc tests of
+# feature sets a change touches, the heavy test targets and the doc tests of
 # the fast suites' crates, and the edge's suites: the gateway's onion and
 # SSH ports with the demo, the light node's Tor client and the
 # `vos.credential` facility; last the reads at a cut.
@@ -1210,7 +1210,7 @@ ci: gate clippy jar-check vectors test-bench test-faults
 # `--test-threads`), so the peak stays under the cap.
 ci-full: ci check-release-names test-bench-proof test-proof (fuzz "60")
 
-# The gate at a slice's end: `ci-full`'s recipes, with the leakage tests at
+# The release gate, before a release: `ci-full`'s recipes, with the leakage tests at
 # their full N (2,000 proofs a witness on the small circuit, 32 on the real
 # wrap, 256 a witness on the device segment) and the fuzz targets five
 # minutes each. Under the same limit.

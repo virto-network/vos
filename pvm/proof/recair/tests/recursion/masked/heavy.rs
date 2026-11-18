@@ -290,6 +290,10 @@ fn heavy_the_verify_gates_hold_over_seeds() {
         decode_worst <= 4e6,
         "decode {decode_worst} gas at the worst shape"
     );
+    assert!(
+        verify <= jam::VERIFY_GAS && verify_worst <= jam::VERIFY_GAS as f64,
+        "verify {verify} gas, {verify_worst} at the worst shape"
+    );
     let counts = jam::counts();
     jam::pinned(&counts, "masked-wrap-verify-gas-max", verify, 0);
     jam::pinned(

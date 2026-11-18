@@ -83,7 +83,7 @@ last:
 | `pvm/proof/src/constants.rs` | the known programs' ids and the circuits' constants (`H_FOLD`, the leaf circuits) | `VOS_PINS=write` on the `kernel` tests' `constants::`: `vos-pvm-proof`'s for the circuits', and on the node side `vos-kernel-tests`' for the programs' ids, from the test actors | the same tests | `ci-full` (`test-proof`), the programs' ids on the node side; a moved fold circuit moves the wrap's root, which `gate` checks |
 | `pvm/proof/fixtures` | the golden fixtures: segment proofs and their patches, the wrap's proofs, the statements' cases | `just fixtures` | `the_fixtures_are_the_generators`: every file the generator's bytes, and no file it does not make | `ci-full` (`test-proof`) |
 | `pvm/proof/counts.txt` | the proving gates' counts: JAM gas of a statement judged and refined and of the masked wrap's verify (one segment, the maximum over seeds and the fitted worst shape), the Wasm verifier's instructions; each exact, or within 2% where fitted | `VOS_PINS=write` on the test that measures it: `just repin` for the statement's and the one-segment wrap's, `just repin-proof` for the heavy gates' (`vos-pvm-recair`'s `heavy-gates`) | the same tests | `check` (the statement's), `gate` (the one-segment wrap's), `ci-full` (`test-proof`, the heavy gates') |
-| `pvm/proof/kit/Cargo.lock` | the lock VOS's `check-kit` builds the vendored kit on, VOS's pruned to what the kit links (the kit does not ship it: a runtime resolves the kit's dependencies on its own lock) | `just kit-lock` | `just check-kit` | `gate` |
+| `pvm/proof/kit/Cargo.lock` | the lock VOS's `check-kit` builds the vendored kit on, VOS's pruned to what the kit links (the kit does not ship it: a runtime resolves the kit's dependencies on its own lock) | `just kit-lock` | `just check-locks`: every package at the root lock's versions | `gate` |
 | `pvm/proof/final-verifier/wasm/blob/Cargo.lock` | the Wasm blob's lock, VOS's pruned to what the blob links: the blob `blobs.lock` pins is built `--locked` on it | `just locks` | `just check-locks`: every package the root lock's | `gate` |
 | `pvm/proof/fuzz/Cargo.lock` | the prover's fuzz targets' lock, VOS's pruned to what they link, and the fuzzing tools (`libfuzzer-sys`, `arbitrary`); one edge resolves otherwise, named in `tools/gates/locks.py`'s `DRIFT`: Stwo's open `hashbrown >=0.15.2` onto the `hashbrown 0.17.1` the targets' graph holds, where the root, the kit and the Wasm blob take `0.15.5` | `just locks` | `just check-locks` | `gate` |
 | `pvm/proof/final-verifier/src/constants.rs` | the wrap's preprocessed root (`PREPROCESSED_ROOT_39`), a venue's verifying key | by hand, at a change of the wrap's circuit | `vos-pvm-recair`'s `recursion` test (`masked::`) and `vos-pvm-proof`'s `constants::` test compute it | `gate`; `ci-full` |
@@ -104,8 +104,8 @@ check-blobs`, the stripped ELF's hash); link the ELF to a PVM program
 (`vos_pvm_compiler::link_elf_spi`); fill its configuration block with the
 deployment's published configuration
 (`vos_statement_service::config::configure`: the chain's genesis hash and
-time and the pinned program ids; unconfigured, it pins none and refuses
-every statement); and make it a service blob with the deployment's
+time and the pinned program ids; unconfigured, it refuses every item and
+holds no state); and make it a service blob with the deployment's
 metadata (`vos_pvm_compiler::spi::service_blob`). The service's code hash
 on JAM is that blob's BLAKE2b-256.
 

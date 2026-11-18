@@ -11,10 +11,12 @@
 //! All emission functions have `debug_assert!(self.write_pos + N <= self.capacity)`
 //! guards. Callers reserve room via [`Assembler::reserve`] before each
 //! instruction or sequence, in every build: a reservation grows the buffer to
-//! hold it and `SLACK` more, and refuses one past `MAX_NATIVE` or one made
-//! after the previous sequence overran its own, so every native offset fits
-//! an `i32` and its casts to `u32` and `i32` are exact. That no instruction
-//! overruns [`INSTRUCTION`] is the codegen's tests'.
+//! hold it and `SLACK` more, and refuses one past `MAX_NATIVE`, so every
+//! native offset fits an `i32` and its casts to `u32` and `i32` are exact.
+//! That no instruction writes past its reservation is the codegen's test
+//! (`every_instruction_fits_its_reservation`) alone: the next reservation
+//! refuses a sequence that overran its own, a tripwire after the bytes are
+//! written, not a bound before them.
 //! Vec length is synced via `set_len(write_pos)` only at finalization boundaries.
 
 /// The bytes reserved for one PVM instruction's native code.

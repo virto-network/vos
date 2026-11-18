@@ -2784,8 +2784,10 @@ pub fn compute_basic_block_starts(code: &[u8], bitmask: &[u8]) -> Vec<bool> {
     starts
 }
 
-/// A control transfer the machine panics on whatever its registers hold: a
-/// target that is no basic block start ([`compute_basic_block_starts`]).
+/// A control transfer to a target that is no basic block start
+/// ([`compute_basic_block_starts`]), which the machine panics on when it
+/// takes it: a jump-table entry, a static jump's or a branch's target, or a
+/// branch's fall-through past the code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BadTransfer {
     /// Jump-table entry `index` names `target`.
@@ -2812,10 +2814,10 @@ impl core::fmt::Display for BadTransfer {
     }
 }
 
-/// The first control transfer of a program that the machine panics on
-/// whatever its registers hold (eq A.17, A.18): a jump-table entry, a
-/// static jump's or branch's target, or a branch's fall-through that is no
-/// basic block start. The halt address is none, so a jump-table entry
+/// The first control transfer of a program that lands on no basic block
+/// start, which the machine panics on when it takes it (eq A.17, A.18): a
+/// jump-table entry, a static jump's or branch's target, or a branch's
+/// fall-through. The halt address is none, so a jump-table entry
 /// naming it is one; a dynamic jump reaches the halt only through its
 /// address, never through the table. `None` when every transfer lands on a
 /// block start.

@@ -17,8 +17,9 @@ graph resolves to another version there than in the root's. A package the
 root's graph lacks altogether (a dependency of a feature only the side
 enables) is `deny`'s to check, over the side's manifest.
 
-The side workspaces (`SIDES`): the final verifier's Wasm blob, whose
-bytes `blobs.lock` pins, and the prover's fuzz targets. The blob's runner
+The side workspaces (`SIDES`): the verifier kit as `just check-kit`
+builds it, the final verifier's Wasm blob, whose bytes `blobs.lock` pins,
+and the prover's fuzz targets. The blob's runner
 (`pvm/proof/final-verifier/wasm/run`) keeps a lock of its own: it links
 wasmtime, a tool that measures the blob and is no part of it.
 """
@@ -33,6 +34,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 # version): its tools, and their own dependencies the root's graph does not
 # hold.
 SIDES = {
+    "pvm/proof/kit": set(),
     "pvm/proof/final-verifier/wasm/blob": set(),
     "pvm/proof/fuzz": {"libfuzzer-sys", "arbitrary", "derive_arbitrary"},
 }
@@ -44,10 +46,12 @@ SIDES = {
 # the highest version a lock holds within an open requirement. Stwo asks
 # for `hashbrown >=0.15.2`; the fuzz targets' graph holds `indexmap`'s
 # `hashbrown 0.17.1`, so Stwo resolves onto it there (and onto its
-# `foldhash 0.2`), where the root, the kit and the Wasm blob resolve
-# `0.15.5`. Bounding the requirement is the fork's.
+# `foldhash 0.2`, the hasher Stwo's features turn on there), where the
+# root, the kit and the Wasm blob resolve `0.15.5`. Bounding the
+# requirement is the fork's.
 DRIFT = {
-    "pvm/proof/fuzz": {("stwo", "hashbrown"), ("stwo-constraint-framework", "hashbrown")},
+    "pvm/proof/fuzz": {("stwo", "hashbrown"), ("stwo-constraint-framework", "hashbrown"),
+                       ("hashbrown", "foldhash")},
 }
 
 Key = tuple[str, str, str]
@@ -88,7 +92,12 @@ def reach(edges: dict[Key, set[Key]], starts: set[Key]) -> set[Key]:
 
 def own(side: pathlib.Path) -> set[str]:
     """The packages of the workspace at `side` (its manifest's package and
-    members)."""
+    members); for the kit, which `just check-kit` builds in a workspace of
+    its vendored crates, its lock's path packages."""
+    if not (side / "Cargo.toml").exists():
+        with (side / "Cargo.lock").open("rb") as file:
+            data = tomllib.load(file)
+        return {package["name"] for package in data.get("package", []) if "source" not in package}
     with (side / "Cargo.toml").open("rb") as file:
         manifest = tomllib.load(file)
     names = set()
@@ -127,10 +136,12 @@ def check(root: pathlib.Path, sides: dict[str, set[str]]) -> int:
             if key in shared:
                 continue
             shared.add(key)
-            if key in drifted:
-                continue
             todo.extend(target for target in edges[key]
                         if target[0] not in tools and (key[0], target[0]) not in drift)
+        if not any(key[0] == "stwo" for key in shared):
+            print(f"{directory}/Cargo.lock: Stwo is not in the graph held to the root's", file=sys.stderr)
+            failed += 1
+            continue
         off = []
         for key in sorted(shared):
             if key[0] in names:

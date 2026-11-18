@@ -194,6 +194,7 @@ pub fn verified_wrap(
         report.peak_live >> 10,
     );
     assert_eq!(report.verdict, jam::ACCEPT, "{}", report.error);
+    assert!(gas <= jam::STATEMENT_GAS, "{gas} gas");
     jam::pinned(
         &jam::root().join("node/kernel-tests/tests/counts.txt"),
         "predicate-wrap-verify-gas",

@@ -1877,7 +1877,7 @@ that narrows the inner proof makes folds cheaper too.
 | the final wrap misses its gas or size | **retired:** the masked wrap verified on the JAM-only host in 59.2M gas and in Wasm in 36.1M instructions at the worst shape (§3.5) [measured] |
 | the multi-step FRI path, or the Blake2b channel, is unsound | a review plus tamper tests before a format admits them |
 | the wrap is weaker than the inner formats | **retired:** 16 queries, 106 / 65 proven bits (65.80), above the weakest inner format's 104 / 62.81 (§3.5) [model] |
-| masking the wrap costs more than (c)'s factor | **retired:** format 39 at a 3.6 GiB heap and 79.3M gas at 24 queries [measured], within the design's budget of 24 GiB and 200M gas and the tests' tighter bounds (A.7); leakage and soundness tests |
+| masking the wrap costs more than (c)'s factor | **retired:** format 39 at a 3.6 GiB heap and 79.3M gas at 24 queries, 59.2M at 16 [measured], within the design's budget of 24 GiB and 200M gas and the tests' tighter bounds (A.7); leakage and soundness tests |
 | the cut and held build fail under failover | the cut and the held build across a leader change |
 | the prover worker falls behind the window cadence | the worker measured against the cadence |
 | the teammate's pallet diverges from the design | the pallet against the conformance vectors |

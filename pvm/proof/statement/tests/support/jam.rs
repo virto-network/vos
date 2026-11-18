@@ -200,6 +200,12 @@ pub fn counts() -> PathBuf {
 /// Under `VOS_PINS=write` (`just repin`) the pin is written instead, so
 /// every movement is a diff of the file; run the writing tests one at a
 /// time.
+/// The JAM gas a masked wrap's verify may take on the JAM-only host, and a
+/// statement judged or refined: each count's ceiling beside its pin, so a
+/// re-pin (`VOS_PINS=write`) takes no count past its budget.
+pub const VERIFY_GAS: u64 = 125_000_000;
+pub const STATEMENT_GAS: u64 = 150_000_000;
+
 pub fn pinned(file: &std::path::Path, name: &str, count: u64, percent: u64) {
     let text = std::fs::read_to_string(file).unwrap_or_default();
     let pin = text
