@@ -15,6 +15,7 @@ mod arith_gate;
 mod blake2b_boundary_gate;
 mod blake2b_gate;
 mod boundary_binding;
+mod boundary_local_gate;
 mod control_flow_negative;
 mod cpu_halt_gate;
 mod cpu_memory_zone_gate;

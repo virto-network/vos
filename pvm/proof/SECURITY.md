@@ -89,7 +89,7 @@ differs from this copy; every figure is rounded down:
   quotient batches, one coefficient each: a column's samples and, for a
   column sampled at two points, the periodicity value the fork adds
   (`deep_values_of_column`); `c`, the most of one column, is counted the
-  same way, 3. The segment shape batches 11,091 values; 41's query term
+  same way, 3. The segment shape batches 11,107 values; 41's query term
   binds. The masked device reference (every device chip at 2^17 rows)
   batches 7,470, and 47 batches affinely.
 - A verifier rejects a number the registry does not admit

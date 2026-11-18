@@ -152,7 +152,7 @@ fn the_segment_chips_pass_the_degree_audit_under_c() {
         degrees.extend(counted);
     }
     assert_eq!(degrees.len(), SEGMENT_REFERENCE.constraints as usize);
-    assert_eq!(histogram(&degrees), [0, 16, 4668, 1066]);
+    assert_eq!(histogram(&degrees), [0, 24, 4671, 1066]);
 }
 
 /// R5 on the device's masked segment: every chip a device shape may hold

@@ -1,4 +1,5 @@
 use crate::prelude::*;
+use num_traits::One;
 use stwo::core::fields::m31::BaseField;
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
@@ -87,6 +88,9 @@ impl BuiltInComponent for RegisterMemoryClosingChip {
         let reg_val = crate::trace::trace_eval!(trace_eval, Column::RegVal);
         let ts = crate::trace::trace_eval!(trace_eval, Column::Ts);
         let is_real = crate::trace::trace_eval!(trace_eval, Column::IsReal);
+
+        // IsReal is boolean: a row emits its tuple once or not at all.
+        eval.add_constraint(is_real[0].clone() * (is_real[0].clone() - E::F::one()));
 
         // Tuple shape: (reg_addr[1], reg_val[8], timestamp[8], is_write[1]) =
         // 18 limbs.  Mirrors the boundary chip's emission so consumers see the

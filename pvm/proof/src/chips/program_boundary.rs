@@ -1,4 +1,5 @@
 use crate::prelude::*;
+use num_traits::One;
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
@@ -57,6 +58,9 @@ impl BuiltInComponent for ProgramBoundaryChip {
         let init_pc = crate::trace::trace_eval!(trace_eval, Column::InitialPc);
         let final_next_ts = crate::trace::trace_eval!(trace_eval, Column::FinalNextTimestamp);
         let final_next_pc = crate::trace::trace_eval!(trace_eval, Column::FinalNextPc);
+
+        // IsReal is boolean: a row emits its tuple once or not at all.
+        eval.add_constraint(is_real[0].clone() * (is_real[0].clone() - E::F::one()));
 
         // Produce (initial_timestamp, initial_pc)
         let mut produce_tuple: Vec<E::F> = init_ts.to_vec();

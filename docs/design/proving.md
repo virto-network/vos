@@ -711,7 +711,7 @@ last for decades.**
   model]. PoW 24 keeps the proven count: 44 queries at PoW 20 count
   62.74, where the batching term binds.
   Counted on format 41's own reference (every chip at 2^20 rows, the
-  Poseidon2 chip among them; 11,091 sampled values, 5,750 constraints): 40
+  Poseidon2 chip among them; 11,107 sampled values, 5,761 constraints): 40
   queries and PoW 24 count 62.81 proven bits, so they stand.
 - **Devices:** §8, "The device parameters".
 

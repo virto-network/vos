@@ -192,14 +192,14 @@ pub const CHIPS: [Chip; SEGMENT_CHIPS] = [
         main: &[
             (Current, 256),
             (Next, 128),
-            (Current, 136),
-            (Next, 21),
+            (Current, 128),
+            (Next, 29),
             (Current, 49),
         ],
         interaction: &[(Current, 516), (Previous, 4)],
         relations: 0x180002,
-        gates: 4874,
-        constraints: 480,
+        gates: 4882,
+        constraints: 488,
     },
     // MEMORY_MERKLE
     Chip {
@@ -241,8 +241,8 @@ pub const CHIPS: [Chip; SEGMENT_CHIPS] = [
         main: &[(Current, 10)],
         interaction: &[(Previous, 4)],
         relations: 0x00040,
-        gates: 19,
-        constraints: 1,
+        gates: 21,
+        constraints: 2,
     },
     // REGISTER_MEMORY_CLOSING
     Chip {
@@ -250,8 +250,8 @@ pub const CHIPS: [Chip; SEGMENT_CHIPS] = [
         main: &[(Current, 18)],
         interaction: &[(Previous, 4)],
         relations: 0x00040,
-        gates: 26,
-        constraints: 1,
+        gates: 28,
+        constraints: 2,
     },
     // PROGRAM_BOUNDARY
     Chip {
@@ -259,8 +259,8 @@ pub const CHIPS: [Chip; SEGMENT_CHIPS] = [
         main: &[(Current, 25)],
         interaction: &[(Previous, 4)],
         relations: 0x00004,
-        gates: 37,
-        constraints: 1,
+        gates: 39,
+        constraints: 2,
     },
     // PROGRAM_MEMORY
     Chip {
@@ -896,16 +896,16 @@ mod tests {
         let terms = leaf_terms(shape.chips, &shape.classes[0].log_sizes);
         assert_eq!(
             (terms.points, terms.blocks, terms.singles),
-            (16, 1_099, 784)
+            (16, 1_101, 784)
         );
         assert_eq!(terms.merkle[0], 40 * (954 + 78));
         assert_eq!(terms.fri, [40 * 243, 40 * 106, 0]);
-        assert_eq!(terms.oods[1], 33_849);
-        assert_eq!(terms.deep_once[1], 19_627);
-        assert_eq!(terms.rows(), [55_496, 99_947, 43_960]);
+        assert_eq!(terms.oods[1], 33_874);
+        assert_eq!(terms.deep_once[1], 19_659);
+        assert_eq!(terms.rows(), [55_500, 100_004, 44_040]);
         assert_eq!(
             leaf_rows(shape.chips, &shape.classes[0].log_sizes),
-            [55_496, 99_947 + FINALIZE, 43_960]
+            [55_500, 100_004 + FINALIZE, 44_040]
         );
         assert!(LeafRows::default().oversized(&shape).is_empty());
     }
