@@ -44,6 +44,9 @@ struct ConformanceState {
     rob_len: u8,
     /// The fewest cycles an EXE entry has left after the last tick.
     least_executing: u8,
+    /// Whether quiet ticks run at once; the tests also tick one by one.
+    #[cfg(test)]
+    skips: bool,
 }
 
 impl Default for ConformanceState {
@@ -56,6 +59,8 @@ impl Default for ConformanceState {
             rob: [RobEntry::default(); ROB_CAPACITY],
             rob_len: 0,
             least_executing: u8::MAX,
+            #[cfg(test)]
+            skips: true,
         }
     }
 }
@@ -170,6 +175,10 @@ impl ConformanceState {
     /// step per instruction, not a step per cycle. Runs of one tick are
     /// left to `tick`.
     fn skip_quiet_ticks(&mut self) {
+        #[cfg(test)]
+        if !self.skips {
+            return;
+        }
         let least = self.least_executing;
         if !(3..u8::MAX).contains(&least)
             || (self.rob_len > 0 && self.rob[0].state == RobState::Fin)
@@ -742,6 +751,38 @@ mod proptests {
                 simulator.flush_and_get_cost(),
                 reference_conformance_cost(&costs),
             );
+        }
+
+        /// Long mixed blocks, thousands of instructions past what the
+        /// literal transcription indexes, cost the same whether quiet ticks
+        /// run at once or one by one.
+        #[test]
+        fn quiet_ticks_run_at_once_change_no_cost(
+            raw in proptest::collection::vec(
+                (prop_oneof![1u8..=4, 1u8..=80, Just(60u8)], 1u8..5, 0u8..7, any::<u16>(), any::<u16>(), 0u8..8),
+                0..4000,
+            ),
+        ) {
+            let costs: alloc::vec::Vec<FastCost> = raw
+                .into_iter()
+                .map(|(cycles, decode_slots, exec_unit, src, dst, kind)| FastCost {
+                    cycles: if kind == 0 { 0 } else { cycles },
+                    decode_slots: if kind == 0 { 1 } else { decode_slots },
+                    exec_unit: if kind == 0 { 0 } else { exec_unit },
+                    src_mask: src & 0x1fff,
+                    dst_mask: dst & 0x1fff,
+                    is_terminator: false,
+                    is_move_reg: kind == 0,
+                })
+                .collect();
+            let run = |skips: bool| {
+                let mut state = ConformanceState { skips, ..ConformanceState::default() };
+                for &cost in &costs {
+                    state.feed(cost);
+                }
+                state.drain()
+            };
+            prop_assert_eq!(run(true), run(false));
         }
 
         /// flush_and_get_cost always returns at least 1.

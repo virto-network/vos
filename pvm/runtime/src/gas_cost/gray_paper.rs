@@ -277,6 +277,65 @@ mod tests {
     }
 
     proptest! {
+        /// Programs of several blocks of valid instructions, each ended by
+        /// a terminator, cost block by block in both backends' preparation
+        /// (the interpreter's predecode, the recompiler's compile) what the
+        /// literal scheduler gives on the text's tables.
+        #[test]
+        fn both_backends_price_blocks_as_the_texts_table(
+            blocks in proptest::collection::vec(
+                (proptest::collection::vec((any::<u8>(), any::<[u8; 3]>()), 0..30), any::<u8>()),
+                1..6,
+            ),
+        ) {
+            let body: alloc::vec::Vec<u8> = (0..=u8::MAX)
+                .filter(|&op| crate::instruction::Opcode::from_byte(op).is_some() && !terminates(op))
+                .collect();
+            let ends: alloc::vec::Vec<u8> = (0..=u8::MAX).filter(|&op| terminates(op)).collect();
+            let mut code = alloc::vec::Vec::new();
+            let mut starts = alloc::vec::Vec::new();
+            let mut block_starts = alloc::vec::Vec::new();
+            for (instructions, end) in &blocks {
+                block_starts.push(code.len());
+                for (pick, operands) in instructions {
+                    starts.push(code.len());
+                    code.push(body[usize::from(*pick) % body.len()]);
+                    code.extend_from_slice(operands);
+                }
+                starts.push(code.len());
+                code.push(ends[usize::from(*end) % ends.len()]);
+                code.extend_from_slice(&[0x21, 0x43, 0x65]);
+            }
+            let mut bitmask = alloc::vec![0u8; code.len()];
+            for &start in &starts {
+                bitmask[start] = 1;
+            }
+            let expected: alloc::vec::Vec<u32> = block_starts
+                .iter()
+                .map(|&start| {
+                    let costs: alloc::vec::Vec<FastCost> = starts
+                        .iter()
+                        .filter(|&&pc| pc >= start)
+                        .map(|&pc| cost(&code, &bitmask, pc).expect("a row"))
+                        .scan(false, |ended, cost| {
+                            (!core::mem::replace(ended, cost.is_terminator)).then_some(cost)
+                        })
+                        .collect();
+                    crate::gas_sim::reference_conformance_cost(&costs)
+                })
+                .collect();
+            let interpreter = crate::Interpreter::predecode(&code, &bitmask, &[]);
+            let priced = |costs: &[u32]| -> alloc::vec::Vec<u32> {
+                block_starts.iter().map(|&start| costs[start]).collect()
+            };
+            prop_assert_eq!(priced(&interpreter.block_gas_costs), expected.clone());
+            #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+            {
+                let native = crate::recompiler::compile_code(&code, &bitmask, &[]).unwrap();
+                prop_assert_eq!(priced(&native.block_gas_costs), expected);
+            }
+        }
+
         /// Blocks of valid instructions cost on the production simulator
         /// what the literal scheduler gives on the text's tables.
         #[test]
