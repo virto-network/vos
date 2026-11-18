@@ -890,3 +890,33 @@ fn the_address_space_has_two_to_the_twenty_pages() {
         Err(InnerError::Invalid)
     );
 }
+
+/// `instantiate` takes no installed program whose code is past what
+/// `machine` takes on a VOS host, so neither call names a program one
+/// backend refuses: `FULL` on both, before any machine is laid out.
+#[cfg(feature = "std")]
+#[test]
+fn a_vos_host_instantiates_no_program_past_the_machine_bound() {
+    let code = blob_of_len(budget::MACHINE_BLOB + 1);
+    let code = vos_pvm_program::parse_compact_code_blob(&code).unwrap();
+    let blob = vos_pvm_program::build_standard_program(&vos_pvm_program::StandardProgram {
+        ro_data: vec![],
+        rw_data: vec![],
+        heap_pages: 0,
+        stack_size: 4096,
+        code,
+    })
+    .unwrap();
+    let pool = Arc::new(crate::pool::MachinePool::new());
+    let program = pool.program(&pool.install(&blob).unwrap()).unwrap();
+    for backend in backends() {
+        let mut machines = InnerMachines::with_backend(backend);
+        machines.set_pool(Arc::clone(&pool));
+        assert_eq!(
+            machines.instantiate(&program, 0),
+            Err(InnerError::Budget),
+            "{backend:?}"
+        );
+    }
+    assert_eq!(pool.idle(), 0, "no machine laid out");
+}

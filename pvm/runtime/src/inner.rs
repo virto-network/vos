@@ -143,9 +143,9 @@ pub mod gas {
 /// happens to hold, so either backend refuses alike, as `FULL`. Under
 /// [`Profile::GrayPaper`] none applies.
 pub mod budget {
-    /// The longest compact code blob `machine` prepares: the recompiler's
-    /// code bound, so every inner program a VOS host takes runs on either
-    /// backend.
+    /// The longest compact code blob `machine` prepares, or `instantiate`
+    /// lends a machine of: the recompiler's code bound, so every inner
+    /// program a VOS host takes runs on either backend.
     pub const MACHINE_BLOB: usize = 2 << 20;
     /// The blob bytes the invocation's live machines hold together.
     pub const LIVE_BLOBS: usize = 4 << 20;
@@ -498,7 +498,10 @@ impl InnerMachines {
             return Err(InnerError::Invalid);
         }
         let mapped_pages = program.mapped_pages();
-        if self.profile == Profile::Vos && self.mapped_pages + mapped_pages > budget::MAPPED_PAGES {
+        if self.profile == Profile::Vos
+            && (program.code_blob().len() > budget::MACHINE_BLOB
+                || self.mapped_pages + mapped_pages > budget::MAPPED_PAGES)
+        {
             return Err(InnerError::Budget);
         }
         let (mut vm, execution, ticket) = pool
