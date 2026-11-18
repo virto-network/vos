@@ -3019,8 +3019,8 @@ a home's read no longer names stay pinned beside the new set for 7 days,
 so one forged answer cannot leave the device without a way home
 [built, 2026-11-18]. A home's routes are kept under a key of their own
 (`route::home`, a hash of its handle), apart from every enrolled space's
-(kept under the space's handle), so an enrollment naming the home's handle
-reaches none of them, nor its opt-out; such an enrollment is refused
+(`route::space`, a hash of another domain), so no handle an enrollment
+names, the home's or its key, reaches them or their opt-out; such an enrollment is refused
 unless it names the home's own onion set (a home in a space the user
 belongs to). The recovery kit carries the set
 current at the claim; a space whose onions have all changed since is
