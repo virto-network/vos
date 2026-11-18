@@ -42,6 +42,8 @@ struct ConformanceState {
     exec_units: [u8; 5],
     rob: [RobEntry; ROB_CAPACITY],
     rob_len: u8,
+    /// The fewest cycles an EXE entry has left after the last tick.
+    least_executing: u8,
 }
 
 impl Default for ConformanceState {
@@ -53,6 +55,7 @@ impl Default for ConformanceState {
             exec_units: EXEC_UNITS,
             rob: [RobEntry::default(); ROB_CAPACITY],
             rob_len: 0,
+            least_executing: u8::MAX,
         }
     }
 }
@@ -158,38 +161,29 @@ impl ConformanceState {
 
     /// Run at once the ticks after this one in which nothing but the
     /// executing entries' countdown changes: called right after a tick that
-    /// left the machine unable to decode, when no entry can start, none is
-    /// decoded, retiring, or one cycle from releasing its units. Each such
-    /// tick only decrements every EXE entry's cycles and counts a cycle, so
-    /// running `least - 1` of them together, `least` the fewest cycles left
-    /// to an EXE entry, gives the state the ticks one by one give: a block
-    /// of long divisions costs a step per instruction, not a step per
-    /// cycle.
+    /// left the machine unable to decode. A tick leaves no entry decoding;
+    /// when none is retiring, none can start and none is one cycle from
+    /// releasing its units, each following tick only decrements every EXE
+    /// entry's cycles and counts a cycle. So `least - 1` of them run
+    /// together, `least` the fewest cycles an EXE entry has left, give the
+    /// state the ticks one by one give: a block of long divisions costs a
+    /// step per instruction, not a step per cycle. Runs of one tick are
+    /// left to `tick`.
     fn skip_quiet_ticks(&mut self) {
-        let len = usize::from(self.rob_len);
-        if self.rob[..len]
-            .first()
-            .is_some_and(|entry| entry.state == RobState::Fin)
+        let least = self.least_executing;
+        if !(3..u8::MAX).contains(&least)
+            || (self.rob_len > 0 && self.rob[0].state == RobState::Fin)
+            || self.ready().is_some()
         {
             return;
         }
-        let mut least = u8::MAX;
-        for entry in &self.rob[..len] {
-            match entry.state {
-                RobState::Dec => return,
-                RobState::Exe => least = least.min(entry.cycles_left),
-                RobState::Wait | RobState::Fin => {}
-            }
-        }
-        if least == u8::MAX || least <= 1 || self.ready().is_some() {
-            return;
-        }
         let quiet = least - 1;
-        for entry in &mut self.rob[..len] {
+        for entry in &mut self.rob[..usize::from(self.rob_len)] {
             if entry.state == RobState::Exe {
                 entry.cycles_left -= quiet;
             }
         }
+        self.least_executing = 1;
         self.cycles += u32::from(quiet);
     }
 
@@ -221,6 +215,7 @@ impl ConformanceState {
             .take_while(|entry| entry.state == RobState::Fin)
             .count();
 
+        let mut least_executing = u8::MAX;
         for entry in &mut self.rob[..len] {
             let old_state = entry.state;
             let old_cycles = entry.cycles_left;
@@ -232,7 +227,11 @@ impl ConformanceState {
             if old_state == RobState::Exe && old_cycles > 0 {
                 entry.cycles_left -= 1;
             }
+            if entry.state == RobState::Exe {
+                least_executing = least_executing.min(entry.cycles_left);
+            }
         }
+        self.least_executing = least_executing;
 
         if retired != 0 {
             self.rob.copy_within(retired..len, 0);
