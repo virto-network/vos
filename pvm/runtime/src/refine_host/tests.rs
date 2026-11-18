@@ -998,3 +998,57 @@ fn the_jam_only_host_serves_no_vos_extension_whatever_the_context_holds() {
         assert_eq!(equipped.gas_used, bare.gas_used, "the unknown call's price");
     }
 }
+
+/// The JAM-only host's state stand-in serves state reads from the
+/// context's reader and nothing else of VOS's: an instantiate answers
+/// `WHAT` at the unknown call's price, as on the plain JAM-only host, which
+/// still serves no state read. Without a reader it does not run.
+#[cfg(feature = "std")]
+#[test]
+fn the_jam_only_hosts_state_stand_in_serves_state_reads_alone() {
+    let reading = state_reading_program();
+    let stand_in = RefineContext::load(&reading, &[], 1_000_000)
+        .unwrap()
+        .with_state(alloc::sync::Arc::new(Fixed))
+        .try_run_jam_with_state_stand_in(JamRefine::default())
+        .unwrap()
+        .invocation;
+    assert_eq!(stand_in.exit, ExitReason::Halt);
+    assert_eq!(stand_in.registers[7], 5, "the value's length");
+    let plain = RefineContext::load(&reading, &[], 1_000_000)
+        .unwrap()
+        .with_state(alloc::sync::Arc::new(Fixed))
+        .try_run_jam(JamRefine::default())
+        .unwrap()
+        .invocation;
+    assert_eq!(plain.registers[7], result::WHAT);
+
+    let instantiating = instantiating_program([7; 32]);
+    let pool = alloc::sync::Arc::new(crate::pool::MachinePool::new());
+    let run = |stand_in: bool| {
+        let context = RefineContext::load(&instantiating, &[], 1_000_000)
+            .unwrap()
+            .with_state(alloc::sync::Arc::new(Fixed))
+            .with_pool(alloc::sync::Arc::clone(&pool));
+        let run = if stand_in {
+            context.try_run_jam_with_state_stand_in(JamRefine::default())
+        } else {
+            context.try_run_jam(JamRefine::default())
+        };
+        run.unwrap().invocation
+    };
+    let (stand_in, plain) = (run(true), run(false));
+    assert_eq!(stand_in.registers[7], result::WHAT);
+    assert_eq!(
+        stand_in.gas_used, plain.gas_used,
+        "the unknown call's price"
+    );
+
+    assert_eq!(
+        RefineContext::load(&reading, &[], 1_000_000)
+            .unwrap()
+            .try_run_jam_with_state_stand_in(JamRefine::default())
+            .err(),
+        Some(RefineError::NoStateReader)
+    );
+}

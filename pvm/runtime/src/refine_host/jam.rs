@@ -3,7 +3,11 @@
 //! `gas`, `grow_heap`, `fetch`, `historical_lookup`, `export` and the inner
 //! machines', at its tariff (`definitions.tex`), and no VOS extension
 //! whatever the context holds: every other call is unknown, `WHAT` at
-//! `C_unknown`.
+//! `C_unknown`. Its state stand-in
+//! (`RefineContext::try_run_jam_with_state_stand_in`) also serves
+//! `state_read` and `state_scan` from the context's state reader, in place
+//! of the witness a package carries: the builder's recording simulation
+//! and tests run on it, and no JAM node does.
 
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
@@ -241,7 +245,29 @@ impl RefineContext {
     /// every other call answers `WHAT` at `C_unknown` while execution
     /// continues.
     pub fn try_run_jam(mut self, jam: JamRefine) -> Result<JamRun, RefineError> {
-        self.host = Host::Jam;
+        self.host = Host::Jam { state: false };
+        self.run_jam(jam)
+    }
+
+    /// [`Self::try_run_jam`], and `state_read` and `state_scan` served from
+    /// the context's state reader at the VOS node's prices: a stand-in for
+    /// the witness a package carries, which the builder's recording
+    /// simulation and tests run a batch's refine on. It is no JAM host: a
+    /// JAM node serves no state. `INSTANTIATE` and every other VOS call
+    /// still answer `WHAT`. [`RefineError::NoStateReader`] when the
+    /// context holds no state reader.
+    pub fn try_run_jam_with_state_stand_in(
+        mut self,
+        jam: JamRefine,
+    ) -> Result<JamRun, RefineError> {
+        if self.state.is_none() {
+            return Err(RefineError::NoStateReader);
+        }
+        self.host = Host::Jam { state: true };
+        self.run_jam(jam)
+    }
+
+    fn run_jam(self, jam: JamRefine) -> Result<JamRun, RefineError> {
         let mut exports = Vec::new();
         let invocation =
             self.try_run_with_host(|id, machine| serve_jam(&jam, &mut exports, id, machine))?;

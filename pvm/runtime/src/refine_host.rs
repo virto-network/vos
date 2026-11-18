@@ -53,8 +53,10 @@ enum Host {
     Node { precompiles: bool },
     /// The JAM-only host ([`RefineContext::try_run_jam`]), Gray Paper
     /// refine at its tariff: no precompile computed, no VOS extension
-    /// served.
-    Jam,
+    /// served, but for `state_read` and `state_scan` from the context's
+    /// state reader when `state` is set, a stand-in for a package's
+    /// witness ([`RefineContext::try_run_jam_with_state_stand_in`]).
+    Jam { state: bool },
 }
 
 /// A standard outer PVM plus its per-invocation inner-machine dictionary.
@@ -220,6 +222,12 @@ impl RefineContext {
         matches!(self.host, Host::Node { .. })
     }
 
+    /// Whether `state_read` and `state_scan` are served from the state
+    /// reader: a VOS node's, or the JAM-only host's state stand-in.
+    fn serves_state(&self) -> bool {
+        self.state.is_some() && (self.serves_vos() || self.host == Host::Jam { state: true })
+    }
+
     /// Whether the outer machine's precompiles are computed in place.
     fn computes_precompiles(&self) -> bool {
         self.host == (Host::Node { precompiles: true })
@@ -238,17 +246,13 @@ impl RefineContext {
             Ok(host_call::INVOKE) => self.invoke(),
             Ok(host_call::EXPUNGE) => self.expunge(),
             // VOS extensions, never on the JAM-only host whatever the
-            // context holds.
+            // context holds, but for its state stand-in's reads.
             #[cfg(feature = "std")]
             Ok(host_call::INSTANTIATE) if self.serves_vos() && self.inner.pool().is_some() => {
                 self.instantiate()
             }
-            Ok(host_call::STATE_READ) if self.serves_vos() && self.state.is_some() => {
-                self.state_read()
-            }
-            Ok(host_call::STATE_SCAN) if self.serves_vos() && self.state.is_some() => {
-                self.state_scan()
-            }
+            Ok(host_call::STATE_READ) if self.serves_state() => self.state_read(),
+            Ok(host_call::STATE_SCAN) if self.serves_state() => self.state_scan(),
             Ok(gp_call::GAS) => self.gas(),
             // `log` is no call of the Gray Paper's.
             Ok(gp_call::LOG) if self.serves_vos() => self.log(),
@@ -302,7 +306,7 @@ impl RefineContext {
     /// `gas`: φ7 becomes the gas left after this call's own cost.
     fn gas(&mut self) -> Result<(), Stop> {
         self.charge(match self.host {
-            Host::Jam => jam_gas::GAS,
+            Host::Jam { .. } => jam_gas::GAS,
             Host::Node { .. } => BASE_CALL_GAS,
         })?;
         let left = self.outer.gas_remaining();
