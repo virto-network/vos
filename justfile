@@ -1,5 +1,12 @@
 set shell := ["nu", "-c"]
 
+# The pinning tests write their pins under `VOS_PINS=write` and hold them
+# otherwise. No recipe inherits it: the recipes that write pins (`repin`,
+# `repin-proof`, `fixtures`, each in no tier) set it on their own lines, so
+# a `VOS_PINS=write` left in the caller's environment cannot turn a gate's
+# check into a rewrite (`just check-tiers` holds the tiers to that).
+unexport VOS_PINS
+
 default:
     @just --list
 
