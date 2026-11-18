@@ -6,7 +6,7 @@ use stwo::core::vcs::blake2_hash::Blake2sHash;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 use vos_pvm_final_verifier::masking::MaskedFormat;
 use vos_pvm_final_verifier::masking::MaskedProof;
-use vos_pvm_proof::format::Format;
+use vos_pvm_proof::format::{DeepBatching, Format};
 
 use super::{DeviceProgramId, Hasher, MAX_PROOF_BYTES, Refusal};
 
@@ -199,14 +199,28 @@ fn precheck(
 impl DeviceProgramId {
     /// The id of `program` under `format`: BLAKE2b-256 of the domain, the
     /// format's number, its parameters (log blowup, queries, PoW, fold
-    /// step, log last layer, interaction PoW, `log h`), the chips, the count
-    /// of log sizes and each, when the CPU is cut its column words (eight
-    /// little-endian bytes each), the word ledger's tag (eight
-    /// little-endian bytes, `DEVICE_WORD_MEMORY_TAG`), and the preprocessed
-    /// root, every other integer four little-endian bytes.
+    /// step, log last layer, interaction PoW, `log h`, the DEEP batching's
+    /// tag, 0 powers and 1 affine), its channel's tag, its masking's salt
+    /// and `R` column counts, the chips, the count of log sizes and each,
+    /// when the CPU is cut its column words (eight little-endian bytes
+    /// each), the word ledger's tag (eight little-endian bytes,
+    /// `DEVICE_WORD_MEMORY_TAG`), and the preprocessed root, every other
+    /// integer four little-endian bytes. Every parameter of the format is
+    /// hashed, so the id names it whole, not by its number alone.
     pub fn of(format: &Format, program: &DeviceProgram<Hasher>) -> Self {
         let params = &format.params;
-        let log_mask_rows = format.masking.map_or(0, |masking| masking.log_mask_rows);
+        let (salt_columns, fri_mask_columns, log_mask_rows) =
+            format.masking.map_or((0, 0, 0), |masking| {
+                (
+                    masking.salt_columns as u32,
+                    masking.fri_mask_columns as u32,
+                    masking.log_mask_rows,
+                )
+            });
+        let batching = match params.batching {
+            DeepBatching::Powers => 0,
+            DeepBatching::Affine => 1,
+        };
         let mut hash = Blake2b::<U32>::new();
         hash.update(PROGRAM_DOMAIN);
         for word in [
@@ -218,6 +232,10 @@ impl DeviceProgramId {
             params.log_last_layer,
             params.interaction_pow_bits,
             log_mask_rows,
+            batching,
+            u32::from(format.channel as u8),
+            salt_columns,
+            fri_mask_columns,
             program.active,
             program.log_sizes.len() as u32,
         ]
