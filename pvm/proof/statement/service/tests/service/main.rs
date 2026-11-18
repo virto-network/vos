@@ -438,7 +438,10 @@ fn anchors_follow_the_venue_rules() {
     let held = state::anchor(&mut rig.storage, &space.id, RootKind::Space, 998).unwrap();
     assert_eq!(held.root, [1; 32]);
     assert_eq!(held.signer, founder.verifying_key().to_bytes());
-    assert_eq!(rig.space(&space.id).unwrap().last, Some(998));
+    assert_eq!(
+        rig.space(&space.id).unwrap().last(RootKind::Space),
+        Some(998)
+    );
     let second = anchor(&rig, &space.id, 998, 1, &space.founders[1]);
     assert_eq!(code(&mut rig, second), AnchorCode::Again as u32);
     let payload = anchor(&rig, &space.id, 997, 1, founder);
@@ -778,4 +781,137 @@ fn the_service_fits_jams_code_bound_with_one_configuration_block() {
         .collect();
     assert_eq!(at.len(), 1);
     assert_eq!(&program[at[0]..at[0] + config::BYTES], &config::UNSET);
+}
+
+// ── One item at a time ────────────────────────────────────────────────────
+
+/// `count` inputs of a package, each the input of `item` under its own
+/// payload hash, its authorizer's trace `trace` bytes.
+fn traced_inputs(item: &[u8], count: usize, trace: usize) -> Vec<Vec<u8>> {
+    use vos_abi::jam::AccumulateInput;
+    let Some(AccumulateInput::Operand(operand)) = AccumulateInput::decode(item) else {
+        panic!("an operand");
+    };
+    (0..count)
+        .map(|index| {
+            let mut payload_hash = [0; 32];
+            payload_hash[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            AccumulateInput::Operand(vos_abi::jam::Operand {
+                payload_hash,
+                auth_trace: vec![0x7a; trace],
+                ..operand.clone()
+            })
+            .encode()
+        })
+        .collect()
+}
+
+/// 700 items whose authorizers' traces hold 48 KiB each, the most a
+/// report's unbounded blobs hold: held at once, each twice, as the inputs
+/// once were, they pass the guest's 64 MiB arena and every item of the
+/// accumulate reverts. Taken one at a time, their traces never fetched,
+/// every item lands.
+#[test]
+fn inputs_are_taken_one_at_a_time_their_traces_unread() {
+    let mut rig = live_rig(1_000);
+    let item = rig.operand(&[9], Vec::new(), [0xa1; 32]);
+    let inputs = traced_inputs(&item, 700, 48 << 10);
+    assert!(inputs.iter().map(Vec::len).sum::<usize>() * 2 > 64 << 20);
+    let (exit, gas) = jam::accumulate(
+        &rig.prepared,
+        rig.slot,
+        u64::from(rig.service),
+        &inputs,
+        &mut rig.storage,
+        1 << 32,
+    );
+    assert_eq!(exit, ExitReason::Halt);
+    let outcomes = rig
+        .storage
+        .keys()
+        .filter(|key| key[0] == keys::Prefix::Outcome as u8)
+        .count();
+    assert_eq!(outcomes, 700);
+    eprintln!("700 refused items: {gas} gas, {} an item", gas / 700);
+}
+
+/// Two items of one payload in one package: the first is applied and its
+/// outcome kept; the second, whose outcome would be the first's, is not
+/// applied. An accepted statement then a junk proof reports the
+/// acceptance; the junk proof first reports its refusal, and the
+/// statement, never applied, is accepted from a later package.
+#[test]
+fn of_two_items_of_one_payload_in_a_package_the_first_is_taken() {
+    let valid = fixture("valid");
+    let mut rig = fixture_rig(&valid);
+    let payload = submit(&valid.input.statement.encode());
+    let (good, junk) = (vec![valid.proof.clone()], vec![vec![0; 16]]);
+    let landed = rig.package(&[
+        (payload.clone(), good.clone()),
+        (payload.clone(), junk.clone()),
+    ]);
+    assert_eq!(landed[0].id, landed[1].id);
+    assert_eq!(landed[0].outcome.code, 0);
+
+    let mut rig = fixture_rig(&valid);
+    let landed = rig.package(&[(payload.clone(), junk), (payload.clone(), good.clone())]);
+    assert_eq!(landed[0].outcome.code >> 8, 1, "the junk proof's refusal");
+    assert_eq!(
+        state::seen(&mut rig.storage, &valid.input.statement.id()),
+        None
+    );
+    assert_eq!(rig.item(payload, good).outcome.code, 0);
+}
+
+/// After a week with no accumulate, one item's accumulate passes the idle
+/// hours and drops the rows past their hour: an hour no row was queued in
+/// takes none of the budget, which once passed one hour an accumulate past
+/// its rows.
+#[test]
+fn the_rows_drop_at_the_first_accumulate_after_a_week_idle() {
+    let valid = fixture("valid");
+    let mut rig = fixture_rig(&valid);
+    let rooted = submit(&valid.input.statement.encode());
+    assert_eq!(rig.item(rooted, vec![valid.proof.clone()]).outcome.code, 0);
+    let id = valid.input.statement.id();
+    let expiry = state::seen(&mut rig.storage, &id).unwrap();
+    rig.at(expiry + 150 * 3_600_000);
+    rig.item(vec![9], Vec::new());
+    assert_eq!(state::seen(&mut rig.storage, &id), None, "dropped at once");
+}
+
+/// The most gas one item's accumulate takes on the VOS accumulate host
+/// (each call at its flat price), by kind: what a work item's accumulate
+/// gas must at least cover there. An item past its own gas runs the
+/// shared invocation out, and reverts from its checkpoint on.
+#[test]
+fn an_items_accumulate_takes_at_most_its_stated_gas() {
+    use vos_statement_service::accumulate::ITEM_GAS_VOS_HOST;
+    let valid = fixture("valid");
+    let mut rig = fixture_rig(&valid);
+    let empty = rig.refine_and_accumulate(&[]).accumulate;
+    let mut most = 0;
+    let mut take = |rig: &mut Rig, name: &str, payload: Vec<u8>, extrinsics: Vec<Vec<u8>>| {
+        let landed = rig.item(payload, extrinsics);
+        let gas = landed.accumulate - empty;
+        eprintln!("{name}: {gas} gas (code {:#x})", landed.outcome.code);
+        most = most.max(gas);
+    };
+    take(&mut rig, "refused", vec![9], Vec::new());
+    let statement = submit(&valid.input.statement.encode());
+    take(
+        &mut rig,
+        "accepted statement",
+        statement,
+        vec![valid.proof.clone()],
+    );
+    let mut rig = live_rig(1_000);
+    let space = founded(16);
+    let payload = register(&rig, &space, &space.founders[0]);
+    take(&mut rig, "registration", payload, Vec::new());
+    let mut rig = live_rig(1_000);
+    registered_from(&mut rig, &space, 990);
+    let payload = anchor(&rig, &space.id, 998, 1, &space.founders[0]);
+    take(&mut rig, "anchor", payload, Vec::new());
+    assert!(most <= ITEM_GAS_VOS_HOST, "{most} gas");
 }

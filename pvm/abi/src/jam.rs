@@ -182,7 +182,38 @@ impl Operand {
         bytes.extend_from_slice(&self.auth_trace);
     }
 
+    /// The most bytes an operand's encoding holds before its result's
+    /// output: the four hashes, the gas limit's natural, the result's tag
+    /// and its output's length.
+    pub const HEAD: usize = 4 * 32 + 9 + 1 + 9;
+
+    /// Where the authorizer's trace starts in an operand's encoding whose
+    /// first bytes are `head`: none when `head` ends before the result's
+    /// tag and its output's length, or names no result.
+    pub fn untraced_len(head: &[u8]) -> Option<usize> {
+        let (_, used) = read_nat(head, 128)?;
+        let at = 128 + used;
+        match *head.get(at)? {
+            0 => {
+                let (len, used) = read_nat(head, at + 1)?;
+                (at + 1 + used).checked_add(usize::try_from(len).ok()?)
+            }
+            code => WorkError::from_code(code).map(|_| at + 1),
+        }
+    }
+
+    /// The operand `bytes` holds up to its authorizer's trace, which is
+    /// left out (empty): what accumulate reads of an input whose trace it
+    /// does not fetch. None when `bytes` is not exactly that prefix.
+    pub fn decode_untraced(bytes: &[u8]) -> Option<Self> {
+        Self::decode_from(bytes, false)
+    }
+
     fn decode(bytes: &[u8]) -> Option<Self> {
+        Self::decode_from(bytes, true)
+    }
+
+    fn decode_from(bytes: &[u8], traced: bool) -> Option<Self> {
         let hash = |at: usize| -> Option<[u8; 32]> { bytes.get(at..at + 32)?.try_into().ok() };
         let package_hash = hash(0)?;
         let segment_root = hash(32)?;
@@ -200,7 +231,11 @@ impl Operand {
             }
             code => Err(WorkError::from_code(code)?),
         };
-        let (auth_trace, end) = read_bytes(bytes, at)?;
+        let (auth_trace, end) = if traced {
+            read_bytes(bytes, at)?
+        } else {
+            (&[][..], at)
+        };
         (bytes.len() == end).then_some(Self {
             package_hash,
             segment_root,
@@ -246,5 +281,48 @@ impl Transfer {
             memo: bytes[16..144].try_into().ok()?,
             gas: u64::from_le_bytes(bytes[144..152].try_into().ok()?),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+
+    use super::*;
+
+    /// An operand's encoding up to its trace decodes without it, whatever
+    /// its result, and the trace starts where `untraced_len` says.
+    #[test]
+    fn an_operand_decodes_without_its_trace() {
+        for result in [Ok(vec![7; 300]), Ok(Vec::new()), Err(WorkError::Panic)] {
+            let operand = Operand {
+                package_hash: [1; 32],
+                segment_root: [2; 32],
+                authorizer: [3; 32],
+                payload_hash: [4; 32],
+                gas_limit: 1 << 40,
+                result,
+                auth_trace: vec![9; 1000],
+            };
+            let mut bytes = Vec::new();
+            operand.encode_to(&mut bytes);
+            let end = Operand::untraced_len(&bytes[..Operand::HEAD.min(bytes.len())])
+                .expect("the head names the result");
+            assert_eq!(
+                bytes.len() - end,
+                2 + 1000,
+                "a natural of 1000, then the trace"
+            );
+            let untraced = Operand::decode_untraced(&bytes[..end]).expect("decodes");
+            assert_eq!(
+                untraced,
+                Operand {
+                    auth_trace: Vec::new(),
+                    ..operand.clone()
+                }
+            );
+            assert_eq!(Operand::decode(&bytes), Some(operand));
+            assert_eq!(Operand::decode_untraced(&bytes[..end - 1]), None);
+        }
     }
 }

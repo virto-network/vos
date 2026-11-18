@@ -159,8 +159,9 @@ pub struct SpaceRecord {
     /// The first window it anchors here: the service's next at its
     /// registration.
     pub start: u64,
-    /// The last window anchored, which a later anchor must pass.
-    pub last: Option<u64>,
+    /// The last window anchored of each root kind, by its byte: a later
+    /// anchor of the kind must pass it.
+    pub last: [Option<u64>; RootKind::COUNT],
     /// It equivocated: its roots are not anchored, its anchors refused, for
     /// good.
     pub ended: bool,
@@ -169,12 +170,26 @@ pub struct SpaceRecord {
 }
 
 impl SpaceRecord {
+    /// The last window anchored of `kind`.
+    pub fn last(&self, kind: RootKind) -> Option<u64> {
+        self.last.get(usize::from(kind as u8)).copied().flatten()
+    }
+
+    /// `window` the last anchored of `kind`.
+    pub fn set_last(&mut self, kind: RootKind, window: u64) {
+        if let Some(last) = self.last.get_mut(usize::from(kind as u8)) {
+            *last = Some(window);
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         self.clock.encode_to(&mut out);
         out.extend_from_slice(&self.controller);
         out.extend_from_slice(&self.start.to_le_bytes());
-        codec::option_u64(&mut out, self.last);
+        for last in self.last {
+            codec::option_u64(&mut out, last);
+        }
         codec::flag(&mut out, self.ended);
         out.extend_from_slice(&self.nonce.to_le_bytes());
         codec::compact(&mut out, self.keys.len() as u64);
@@ -189,7 +204,10 @@ impl SpaceRecord {
         let clock = WindowClock::decode_from(&mut reader)?;
         let controller = reader.array()?;
         let start = reader.u64()?;
-        let last = reader.option_u64()?;
+        let mut last = [None; RootKind::COUNT];
+        for window in &mut last {
+            *window = reader.option_u64()?;
+        }
         let ended = reader.flag()?;
         let nonce = reader.u64()?;
         let count = reader.count(32)?;
@@ -357,13 +375,13 @@ mod tests {
             controller: [1; 32],
             keys: vec![[2; 32], [3; 32]],
             start: 4,
-            last: Some(7),
+            last: [Some(7)],
             ended: true,
             nonce: 3,
         };
         assert_eq!(SpaceRecord::decode(&space.encode()), Ok(space.clone()));
         let open = SpaceRecord {
-            last: None,
+            last: [None],
             ended: false,
             keys: Vec::new(),
             ..space

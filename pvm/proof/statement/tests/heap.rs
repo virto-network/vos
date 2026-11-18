@@ -116,3 +116,24 @@ fn an_exhausted_arena_answers_null() {
         assert!(!heap.alloc(layout(8, 8)).is_null(), "what fits still does");
     }
 }
+
+/// A reset frees every block allocated since its mark at once, in
+/// whatever order they were freed, and only once all of them are.
+#[test]
+fn a_reset_frees_what_was_allocated_since_its_mark() {
+    let heap = Box::new(Heap::<N>::new());
+    unsafe {
+        let kept = heap.alloc(layout(16, 8));
+        let mark = heap.mark();
+        let a = heap.alloc(layout(32, 8));
+        let b = heap.alloc(layout(64, 8));
+        heap.dealloc(a, layout(32, 8));
+        assert_eq!(heap.state().top, 112, "not the last: kept");
+        heap.reset(mark);
+        assert_eq!(heap.state().top, 112, "b is live: no reset");
+        heap.dealloc(b, layout(64, 8));
+        heap.reset(mark);
+        assert_eq!(heap.state().top, 16);
+        assert_eq!(heap.alloc(layout(8, 8)), kept.add(16));
+    }
+}

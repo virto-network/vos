@@ -303,6 +303,11 @@ pub enum RootKind {
 }
 
 impl RootKind {
+    /// Every kind, by its byte.
+    pub const ALL: [Self; 1] = [Self::Space];
+    /// How many kinds there are.
+    pub const COUNT: usize = Self::ALL.len();
+
     /// The kind byte `byte` names; none for an unknown one.
     pub const fn from_u8(byte: u8) -> Option<Self> {
         match byte {

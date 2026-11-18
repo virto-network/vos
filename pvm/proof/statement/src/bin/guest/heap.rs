@@ -24,6 +24,13 @@ pub struct State {
     pub allocs: usize,
 }
 
+/// The arena at a point of an invocation: its top, and the bytes live.
+#[derive(Clone, Copy)]
+pub struct Mark {
+    top: usize,
+    live: usize,
+}
+
 pub struct Heap<const N: usize> {
     arena: UnsafeCell<Arena<N>>,
     state: UnsafeCell<State>,
@@ -79,6 +86,33 @@ impl<const N: usize> Heap<N> {
             state.fallen_from = kept ^ ((kept ^ from) & higher);
         }
         state.top = top;
+    }
+
+    /// Where the arena is now, for [`Heap::reset`].
+    #[allow(dead_code, reason = "the verifier's guest resets no arena")]
+    pub fn mark(&self) -> Mark {
+        let state = self.state();
+        Mark {
+            top: state.top,
+            live: state.live,
+        }
+    }
+
+    /// Free every block allocated since `mark` at once, as a loop over
+    /// items frees each item's, whatever order its blocks were freed in:
+    /// the top falls back to the mark's. Nothing happens unless the bytes
+    /// live are the mark's again.
+    ///
+    /// # Safety
+    ///
+    /// No block allocated since `mark` is used again, and no block live at
+    /// `mark` was freed since.
+    #[allow(dead_code, reason = "the verifier's guest resets no arena")]
+    pub unsafe fn reset(&self, mark: Mark) {
+        let state = self.state();
+        if state.live == mark.live && state.top >= mark.top {
+            self.move_top(mark.top);
+        }
     }
 
     /// How much of the arena an invocation touched: the highest top

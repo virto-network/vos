@@ -77,6 +77,7 @@ pub enum Call {
     Read = 4,
     Write = 5,
     HistoricalLookup = 7,
+    Checkpoint = 18,
 }
 
 /// `fetch`'s kinds (φ10) the guests read.
