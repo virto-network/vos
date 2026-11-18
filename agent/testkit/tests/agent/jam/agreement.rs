@@ -589,3 +589,45 @@ fn a_package_refines_and_accumulates_only_on_what_it_shows() {
         Err(Error::Root)
     );
 }
+
+/// The emulated chain refines and accumulates a service whose code is up
+/// to `W_C`, 4,000,000 bytes, its whole blob counted, and answers `BIG`
+/// past it, running nothing: the code is one trap, so a run panics.
+#[test]
+fn the_chain_holds_a_service_to_the_service_code_bound() {
+    for (len, fits) in [(4_000_000, true), (4_000_001, false)] {
+        let blob = vos_testkit::programs::sized(len);
+        let program = Arc::new(vos_pvm::refine::PreparedProgram::new(&blob).unwrap());
+        let runner = Runner::new(program, &blob, u64::from(AGENT.0), []);
+        let mut chain = Emulated::default();
+        let refined = chain.refine(&runner, &[], Vec::new(), POLKAJAM_REFINE_GAS);
+        let output = vos_wire::package::JamOutput {
+            root_before: [0; 32],
+            root_after: [0; 32],
+            time: 0,
+            seed: [0; 32],
+            work_result_hash: [0; 32],
+            pages: 0,
+            exports: 0,
+            solicit: Vec::new(),
+        };
+        let refined_as = Refined {
+            package_hash: [0; 32],
+            bytes: output.encode(),
+            output,
+            segment_root: [0; 32],
+            gas_used: 0,
+        };
+        let accumulated = chain.accumulate(&runner, &refined_as, 1);
+        if fits {
+            let panicked = Error::Refine(vos_pvm::ExitReason::Panic);
+            assert_eq!(refined.err(), Some(panicked), "{len} bytes");
+            let panicked = Error::Accumulate(vos_pvm::ExitReason::Panic);
+            assert_eq!(accumulated, Err(panicked), "{len} bytes");
+        } else {
+            assert_eq!(refined.err(), Some(Error::Big), "{len} bytes");
+            assert_eq!(accumulated, Err(Error::Big), "{len} bytes");
+        }
+        assert!(chain.storage.is_empty() && chain.solicited.is_empty());
+    }
+}

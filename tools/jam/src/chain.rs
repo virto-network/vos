@@ -97,7 +97,8 @@ pub struct Refined {
 impl Emulated {
     /// Refine the package `payload` encodes on the JAM-only host with
     /// `gas`, its imports' segments `imports`, as a guarantor does; its
-    /// exports kept in DA.
+    /// exports kept in DA. A service past `W_C` refines as [`Error::Big`],
+    /// running nothing.
     pub fn refine(
         &mut self,
         runner: &Runner,
@@ -105,6 +106,7 @@ impl Emulated {
         imports: Vec<Vec<u8>>,
         gas: u64,
     ) -> Result<Refined, Error> {
+        runner.admitted()?;
         let package_hash = Blake2b.hash(b"vos/jam/package", &[payload]);
         let arguments = runner.arguments(payload, package_hash);
         let run = RefineContext::load_prepared(&runner.program, &arguments, gas, MemoryModel::Auto)
@@ -132,13 +134,15 @@ impl Emulated {
         })
     }
 
-    /// Accumulate `refined` at `slot`: the root the service stores after.
+    /// Accumulate `refined` at `slot`: the root the service stores after;
+    /// [`Error::Big`], its storage untouched, for a service past `W_C`.
     pub fn accumulate(
         &mut self,
         runner: &Runner,
         refined: &Refined,
         slot: u64,
     ) -> Result<Option<Hash>, Error> {
+        runner.admitted()?;
         let input = AccumulateInput::Operand(Operand {
             package_hash: refined.package_hash,
             segment_root: refined.segment_root,
@@ -182,7 +186,8 @@ impl Chain for Emulated {
 
     /// Refine the package with the gas it asks, its imports from DA, then
     /// accumulate it in the slot after its time's, unless a fault says
-    /// otherwise. A refine that fails leaves the chain as it was.
+    /// otherwise. A refine that fails, or answers `BIG`, leaves the chain
+    /// as it was.
     fn submit(&mut self, runner: &Runner, prepared: &Prepared) -> Result<String, Error> {
         let fault = (!self.faults.is_empty()).then(|| self.faults.remove(0));
         let imports = prepared
@@ -197,6 +202,7 @@ impl Chain for Emulated {
         let refined = match self.refine(runner, &prepared.payload, imports, gas) {
             Ok(refined) => refined,
             Err(Error::Refine(exit)) => return Ok(format!("refine stopped: {exit:?}")),
+            Err(Error::Big) => return Ok("refined as BIG: the service's code is past W_C".into()),
             Err(error) => return Err(error),
         };
         let mut slot = slot_of(prepared.package.batch.time) + 1;

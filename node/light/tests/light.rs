@@ -122,6 +122,28 @@ struct State {
     titles: Vec<(u64, String)>,
 }
 
+/// A light node opens with an agent program up to the Gray Paper's bound
+/// on a service's code, 4,000,000 bytes, its whole blob counted, and
+/// refuses one a byte past it.
+#[test]
+fn the_agent_program_is_held_to_the_service_code_bound() {
+    for (len, fits) in [(4_000_000, true), (4_000_001, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let opened = Light::open(dir.path(), &programs::sized(len), Config::default());
+        match opened {
+            Ok(_) => assert!(fits, "{len} bytes"),
+            Err(Error::Fault(fault)) => {
+                assert!(!fits, "{len} bytes");
+                assert_eq!(
+                    fault.message(),
+                    "the agent is past the service-code bound (W_C)"
+                );
+            }
+            Err(error) => panic!("{len} bytes: {error:?}"),
+        }
+    }
+}
+
 /// The artifacts round-trip as the app embeds them, and install: the notes
 /// actor's merge handlers write its fields, its queries read them, and the
 /// light node opened again holds it all, its programs pooled from the

@@ -174,6 +174,22 @@ fn calls_apply_and_survive_a_restart() {
     assert_eq!(unknown, Err(CallError::NoAgent));
 }
 
+/// A node runs an agent program up to the Gray Paper's bound on a
+/// service's code, 4,000,000 bytes, its whole blob counted, and refuses
+/// one a byte past it at its start.
+#[test]
+fn the_agent_program_is_held_to_the_service_code_bound() {
+    for (len, fits) in [(4_000_000, true), (4_000_001, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let opened = Node::open(dir.path(), Config::new(vos_testkit::programs::sized(len)));
+        match opened {
+            Ok(_) => assert!(fits, "{len} bytes"),
+            Err(vos_node::Error::ServiceTooBig) => assert!(!fits, "{len} bytes"),
+            Err(error) => panic!("{len} bytes: {error:?}"),
+        }
+    }
+}
+
 #[test]
 fn no_reply_before_its_commit_is_durable_and_a_full_queue_is_busy() {
     let programs = Programs::load();

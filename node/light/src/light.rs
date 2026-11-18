@@ -41,7 +41,7 @@ use vos_abi::result::{Outcome, Run, Step, split_output};
 use vos_abi::{Decode, Encode, SpaceId, WindowClock, keys};
 use vos_exec::{Fault, Machines, ProgramStore, StateReader, decode, panic_message};
 use vos_pvm::PvmBackend;
-use vos_pvm::pool::{MachinePool, OuterMachines};
+use vos_pvm::pool::{MachinePool, OuterMachines, PoolError};
 use vos_wire::apply::{Host, apply};
 use vos_wire::batch::{Admin, Batch, Input, Merge, Query, Work};
 use vos_wire::defaults;
@@ -310,7 +310,18 @@ impl Light {
         let unloadable = |error| Error::Fault(Fault::Agent(format!("{error:?}")));
         // One operation runs at a time: one machine kept idle.
         let program = OuterMachines::with_idle_limit(agent, PvmBackend::ForceInterpreter, 1)
-            .map_err(unloadable)?;
+            .map_err(|error| {
+                Error::Fault(Fault::Agent(
+                    match error {
+                        PoolError::ServiceTooBig => {
+                            "the agent is past the service-code bound (W_C)"
+                        }
+                        PoolError::InvalidProgram => "the agent is not a standard program",
+                        PoolError::Backend => "the agent's backend failed",
+                    }
+                    .into(),
+                ))
+            })?;
         // A phone's pool: few idle machines, as one operation runs at a time.
         let pool = Arc::new(MachinePool::with_idle_limits(8, 2));
         for (_, program) in store.programs()? {

@@ -69,6 +69,13 @@ impl JamCommand {
 /// written to `out`: the blob.
 fn write_service(code: &[u8], metadata: &ServiceMetadata, out: &Path) -> Result<Vec<u8>, String> {
     let blob = service_blob(code, metadata);
+    if !vos_pvm::spi::service_fits(&blob) {
+        return Err(format!(
+            "the service's code is {} bytes, past W_C ({}): JAM refines and accumulates it as BIG",
+            blob.len(),
+            vos_pvm::spi::MAX_SERVICE_CODE
+        ));
+    }
     std::fs::write(out, &blob).map_err(at(out))?;
     Ok(blob)
 }

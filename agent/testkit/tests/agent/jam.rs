@@ -87,6 +87,7 @@ impl Paired {
             program: vos.program(),
             service: u64::from(AGENT.0),
             preimages: vos.preimages(),
+            fits: vos_pvm::spi::service_fits(&vos_testkit::programs::agent()),
         };
         Self {
             vos,

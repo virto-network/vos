@@ -256,3 +256,18 @@ pub fn method(program: &[u8], name: &str) -> MethodId {
         .method_id(name)
         .unwrap_or_else(|| panic!("no method {name}"))
 }
+
+/// A standard program of exactly `len` bytes, its code one trap and its
+/// read-write data the rest: a service's code at a size bound.
+pub fn sized(len: usize) -> Vec<u8> {
+    let code = [0, 1, 1, 0, 1];
+    let rw = len - 15 - code.len();
+    let mut blob = vec![0, 0, 0];
+    blob.extend_from_slice(&u32::try_from(rw).expect("past 2^24").to_le_bytes()[..3]);
+    blob.extend_from_slice(&[0, 0, 0x00, 0x10, 0x00]);
+    blob.resize(blob.len() + rw, 0);
+    blob.extend_from_slice(&(code.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&code);
+    debug_assert_eq!(blob.len(), len);
+    blob
+}

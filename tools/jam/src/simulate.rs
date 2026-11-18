@@ -32,6 +32,10 @@ pub struct Runner {
     pub program: Arc<PreparedProgram>,
     pub service: u64,
     pub preimages: Arc<dyn Preimages>,
+    /// Whether the service's code, the blob JAM looks up, is within `W_C`
+    /// (`vos_pvm::spi::service_fits`): refine and accumulate of one past
+    /// it answer [`Error::Big`].
+    pub fits: bool,
 }
 
 /// A service's own preimages, by their hashes: a lookup naming another
@@ -50,9 +54,11 @@ impl Preimages for Own {
 }
 
 impl Runner {
-    /// `program` as service `service`'s, its preimages `programs`.
+    /// `program` as service `service`'s, whose code JAM looks up is
+    /// `code`, its preimages `programs`.
     pub fn new(
         program: Arc<PreparedProgram>,
+        code: &[u8],
         service: u64,
         programs: impl IntoIterator<Item = Vec<u8>>,
     ) -> Self {
@@ -64,7 +70,13 @@ impl Runner {
             program,
             service,
             preimages: Arc::new(Own { service, programs }),
+            fits: vos_pvm::spi::service_fits(code),
         }
+    }
+
+    /// [`Error::Big`] for a service past `W_C`, before any run.
+    pub(crate) fn admitted(&self) -> Result<(), Error> {
+        if self.fits { Ok(()) } else { Err(Error::Big) }
     }
 
     /// What a JAM node gives a refine of `payload`, which imports
@@ -120,6 +132,7 @@ pub(crate) fn simulate(
     pages: Pages,
     batch: &Batch,
 ) -> Result<Simulation, Error> {
+    runner.admitted()?;
     let payload = Work::encode_batch(batch);
     let arguments = runner.arguments(&payload, [0; 32]);
     let gas = batch.budget + defaults::batch_start(batch, arguments.len());

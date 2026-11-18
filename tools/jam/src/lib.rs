@@ -40,6 +40,11 @@ pub use store::{Exported, Pending, Store, View};
 pub enum Error {
     #[error("the agent's program: {0:?}")]
     Load(RefineError),
+    /// The service's code is past the Gray Paper's bound on it (`W_C`,
+    /// `vos_pvm::spi::MAX_SERVICE_CODE`): JAM refines and accumulates it as
+    /// `BIG`, running nothing.
+    #[error("the service's code is past W_C: BIG")]
+    Big,
     #[error("refine stopped: {0:?}")]
     Refine(ExitReason),
     #[error("accumulate stopped: {0:?}")]

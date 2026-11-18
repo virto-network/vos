@@ -202,7 +202,7 @@ impl Testnet {
         let prepared =
             Arc::new(PreparedProgram::new(&self.agent).map_err(|error| format!("{error:?}"))?);
         let programs = self.actors.programs();
-        let runner = Runner::new(prepared, service, programs.values().cloned());
+        let runner = Runner::new(prepared, &blob, service, programs.values().cloned());
         let mut rig = Rig {
             builder: Builder::new(Store::open(&store)?, parameters.max_refine_gas)?,
             chain: Live {

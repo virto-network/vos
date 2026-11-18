@@ -13,7 +13,7 @@ use vos_abi::ids::AgentId;
 use vos_abi::ids::ProgramHash;
 use vos_net::{Arrivals, Network};
 use vos_pvm::PvmBackend;
-use vos_pvm::pool::{CodeHash, MachinePool, OuterMachines};
+use vos_pvm::pool::{CodeHash, MachinePool, OuterMachines, PoolError};
 use vos_wire::defaults;
 use vos_wire::ingress::NodeId;
 use vos_wire::peer::{CreationRecord, NodeNumber, Placement};
@@ -83,7 +83,13 @@ impl Node {
         // as many machines idle as can run at once.
         let program =
             OuterMachines::with_idle_limit(&config.agent, PvmBackend::Default, config.executors)
-                .map_err(|error| Error::Program(format!("{error:?}")))?;
+                .map_err(|error| match error {
+                    PoolError::ServiceTooBig => Error::ServiceTooBig,
+                    PoolError::InvalidProgram => {
+                        Error::Program("the agent is not a standard program".into())
+                    }
+                    PoolError::Backend => Error::Program("the agent's backend failed".into()),
+                })?;
         let program_hash = ProgramHash(CodeHash::of(&config.agent).0);
         let records = store.agents()?;
         let placements = store.placements()?;
