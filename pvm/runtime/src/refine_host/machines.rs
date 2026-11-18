@@ -85,7 +85,13 @@ impl RefineContext {
                 // once a node whether it succeeds or not, bounded by the
                 // service-code bound.
                 let bytes = self.programs.as_ref()?.program(&hash)?;
-                if !crate::spi::service_fits(&bytes) || crate::pool::CodeHash::of(&bytes) != hash {
+                if !crate::spi::service_fits(&bytes) {
+                    pool.refuse(hash);
+                    return None;
+                }
+                // Bytes of another program say nothing of this one's: not
+                // remembered.
+                if crate::pool::CodeHash::of(&bytes) != hash {
                     return None;
                 }
                 pool.install(&bytes).ok()?;

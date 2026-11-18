@@ -609,9 +609,16 @@ impl MachinePool {
         Ok(hash)
     }
 
-    /// Whether a blob of this hash failed to install.
+    /// Whether a blob of this hash failed to install, or was refused
+    /// before installing ([`MachinePool::refuse`]).
     pub fn refused(&self, hash: &CodeHash) -> bool {
         lock(&self.refused).contains(hash)
+    }
+
+    /// Remember that the program of `hash` is refused, so it is never read
+    /// again: one past the service-code bound, say.
+    pub fn refuse(&self, hash: CodeHash) {
+        lock(&self.refused).insert(hash);
     }
 
     /// Remove an installed program and drop its idle machines. Machines
