@@ -506,6 +506,145 @@ mod tests {
         );
     }
 
+    /// Every load and store faults alike on every backend, on an unmapped
+    /// page and (a store) on a read-only one: each native guest access is
+    /// at its own trap entry, so the fault is the guest's.
+    #[test]
+    fn every_access_faults_alike_on_every_backend() {
+        use crate::interpreter::{PERM_NONE, PERM_RO, PERM_RW};
+        let address = [0, 0, 2, 0]; // 0x20000
+        let mut programs: Vec<Vec<u8>> = Vec::new();
+        for opcode in 30..=33 {
+            programs.push([&[opcode, 4][..], &address, &[1]].concat()); // store_imm
+        }
+        for opcode in 52..=62 {
+            programs.push([&[opcode, 0][..], &address].concat()); // load, store
+        }
+        for opcode in 70..=73 {
+            programs.push([&[opcode, 0x40][..], &address, &[1]].concat()); // store_imm_ind
+        }
+        for opcode in 120..=130 {
+            programs.push([&[opcode, 0][..], &address].concat()); // load_ind, store_ind
+        }
+        for program in programs {
+            let mut code = program.clone();
+            code.push(0);
+            let mut bitmask = alloc::vec![0; code.len()];
+            bitmask[0] = 1;
+            bitmask[program.len()] = 1;
+            for denied in [PERM_NONE, PERM_RO] {
+                let outcomes: Vec<_> = crate::test_support::backends()
+                    .into_iter()
+                    .map(|backend| {
+                        let mut machine = StandardMachine::new(
+                            &code,
+                            &bitmask,
+                            &[],
+                            [0; 13],
+                            1_000,
+                            0x30000,
+                            backend,
+                        )
+                        .unwrap();
+                        assert_eq!(machine.backend(), backend);
+                        let mut perms = alloc::vec![PERM_RW; 0x30];
+                        perms[0x20] = denied;
+                        machine.interpreter.set_page_perms(perms);
+                        let exit = machine.run().unwrap();
+                        let vm = &machine.interpreter;
+                        (exit, vm.gas, vm.pc, vm.registers)
+                    })
+                    .collect();
+                assert!(
+                    outcomes.iter().all(|outcome| *outcome == outcomes[0]),
+                    "opcode {}: {outcomes:?}",
+                    program[0]
+                );
+                if denied == PERM_NONE {
+                    assert_eq!(outcomes[0].0, crate::ExitReason::PageFault(0x20000));
+                }
+            }
+        }
+    }
+
+    /// A machine whose native window retires between slices (its map
+    /// past a window's permission runs, after a host call and a page
+    /// fault) continues on the interpreter with the interpreter's result:
+    /// exits, gas (the faulting block charged once), counter, registers,
+    /// memory and the pages reported written.
+    #[test]
+    fn a_machine_moves_to_the_interpreter_between_slices_alike() {
+        use crate::interpreter::{PERM_NONE, PERM_RO, PERM_RW};
+        // 0: store_imm_u32 [0x10000], 42    7: ecalli 1
+        // 9: load_u8 φ0, [0x20000]          15: store_imm_u32 [0x10004], 7
+        // 22: trap
+        let code = [
+            32, 4, 0, 0, 1, 0, 42, 10, 1, 52, 0, 0, 0, 2, 0, 32, 4, 4, 0, 1, 0, 7, 0,
+        ];
+        let mut bitmask = [0; 23];
+        for start in [0, 7, 9, 15, 22] {
+            bitmask[start] = 1;
+        }
+        let pages = 0x200;
+        let outcomes: Vec<_> = crate::test_support::backends()
+            .into_iter()
+            .map(|backend| {
+                let mut machine = StandardMachine::new(
+                    &code,
+                    &bitmask,
+                    &[],
+                    [0; 13],
+                    10_000,
+                    pages as u64 * 4096,
+                    backend,
+                )
+                .unwrap();
+                assert_eq!(machine.backend(), backend);
+                let mut perms = alloc::vec![PERM_RW; pages];
+                perms[0x20] = PERM_NONE;
+                machine.interpreter.set_page_perms(perms.clone());
+                let host = machine.run().unwrap();
+                assert!(!machine.interpreter.memory().retired());
+                assert!(machine.interpreter.resume_after_host_call());
+                let fault = machine.run().unwrap();
+                assert!(!machine.interpreter.memory().retired());
+                perms[0x20] = PERM_RO;
+                for (offset, page) in perms[0x40..].iter_mut().enumerate() {
+                    *page = if offset.is_multiple_of(2) {
+                        PERM_RO
+                    } else {
+                        PERM_NONE
+                    };
+                }
+                machine.interpreter.set_page_perms(perms);
+                let end = machine.run().unwrap();
+                if backend == PvmBackend::ForceRecompiler {
+                    assert!(machine.interpreter.memory().retired(), "the window retired");
+                }
+                let vm = &mut machine.interpreter;
+                let mut stored = [0; 8];
+                vm.memory().read_bytes(0x10000, &mut stored);
+                let written = vm.memory_mut().take_dirty_pages();
+                (
+                    host,
+                    fault,
+                    end,
+                    vm.gas,
+                    vm.pc,
+                    vm.registers,
+                    stored,
+                    written,
+                )
+            })
+            .collect();
+        let (host, fault, end, ..) = &outcomes[0];
+        assert_eq!(host, &crate::ExitReason::HostCall(1));
+        assert_eq!(fault, &crate::ExitReason::PageFault(0x20000));
+        assert_eq!(end, &crate::ExitReason::Panic);
+        assert_eq!(outcomes[0].6, [42, 0, 0, 0, 7, 0, 0, 0]);
+        assert!(outcomes.iter().all(|outcome| *outcome == outcomes[0]));
+    }
+
     /// The operator's override is honoured, and one this process does not
     /// know is an error, never a silent default.
     #[test]
