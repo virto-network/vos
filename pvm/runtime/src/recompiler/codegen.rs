@@ -2788,7 +2788,7 @@ impl Compiler {
     /// Emit exit sequences and epilogue.
     fn emit_exit_sequences(&mut self) -> Result<(), String> {
         // Reserve capacity for exit sequences + all OOG and wrap stubs:
-        // each OOG stub is ~12 bytes, each wrap stub ~32.
+        // each OOG stub is ~12 bytes, each wrap stub at most `WRAP_STUB`.
         let needed =
             asm::INSTRUCTION + self.oog_stubs.len() * 16 + self.wrap_stubs.len() * WRAP_STUB;
         self.asm.reserve(needed)?;

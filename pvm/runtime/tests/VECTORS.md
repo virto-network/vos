@@ -33,8 +33,9 @@ The runtime keeps three checked-in contracts, all for Gray Paper v0.8.0:
   table at every width (zero, padded, five to eight bytes, past a
   register), the `machine` call's reader, Ψ's uncharged panic on an entry
   that is no instruction start (past the code, an operand byte) against an
-  interior instruction start, the recompiler's own code bound against the
-  interpreter and the service-code bound `W_C` at service admission, and
+  interior instruction start, code past the recompiler's native bound
+  running on the interpreter alike, the service-code bound `W_C` at
+  service admission, and
   Ψ_M's halt output (an empty length whatever its pointer, an unreadable
   range empty, an embedder's bound its own refusal), and operand decoding
   at its edges (A.5): a register nibble above 12, operand bytes past an

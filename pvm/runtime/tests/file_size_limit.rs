@@ -25,7 +25,17 @@ fn a_file_size_limit_below_a_window_runs_programs_interpreted() {
     assert!(vos_pvm::backing::BackingStore::new(1 << 10).is_some());
     let choice = vos_pvm::backend::backend_choice().unwrap();
     assert_eq!(choice.backend, PvmBackend::ForceInterpreter);
-    assert_eq!(choice.unavailable, Some(Unavailable::GuestMemory));
+    // The probe checks write tracking before it builds a guest window, so
+    // a host without userfaultfd write-protect refuses the recompiler
+    // there first.
+    assert!(
+        matches!(
+            choice.unavailable,
+            Some(Unavailable::GuestMemory | Unavailable::WriteTracking)
+        ),
+        "{:?}",
+        choice.unavailable
+    );
     assert!(matches!(
         vos_pvm::backend::compile(&[0], &[1], &[], PvmBackend::Default),
         Ok(vos_pvm::backend::CompiledProgram::Interpreter(_))
