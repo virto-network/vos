@@ -334,3 +334,165 @@ fn a_pooled_machine_runs_again_after_an_uncharged_panic() {
         assert_eq!(invocation.registers[7], 2, "{backend:?}");
     }
 }
+
+// ── Operand decoding at its edges (`pvm.tex`, A.5) ───────────────────────
+
+/// A compact code blob of `code`, no jump table, instructions at `starts`.
+fn compact(code: &[u8], starts: &[usize]) -> Vec<u8> {
+    let mut packed = vec![0u8; code.len().div_ceil(8)];
+    for &start in starts {
+        packed[start / 8] |= 1 << (start % 8);
+    }
+    let mut blob = vec![0, 0, u8::try_from(code.len()).unwrap()];
+    blob.extend_from_slice(code);
+    blob.extend_from_slice(&packed);
+    blob
+}
+
+/// `code` as a standard program with a page of read-write data, through
+/// the loader's `deblob` and the production memory path on every backend:
+/// its exit, gas used, registers and first read-write byte, alike on each.
+/// The gas each case pins is its one block's cost, which both backends
+/// charge; the block-gas corpus (`vectors-v080-gas`) holds the cost model
+/// itself to independently derived values.
+fn decoded(code: &[u8], starts: &[usize]) -> (ExitReason, u64, [u64; 13], u8) {
+    let blob = standard(&[0xAA], &compact(code, starts));
+    assert!(
+        vos_pvm::spi::parse_standard_program(&blob).is_some(),
+        "deblob takes it"
+    );
+    let outcomes: Vec<_> = backends()
+        .into_iter()
+        .map(|backend| {
+            let invocation = run(&blob, 1_000, backend);
+            let mut byte = [0u8];
+            invocation.memory().read_bytes(0x2_0000, &mut byte);
+            (
+                invocation.exit,
+                invocation.gas_used,
+                invocation.registers,
+                byte[0],
+            )
+        })
+        .collect();
+    assert!(
+        outcomes.windows(2).all(|pair| pair[0] == pair[1]),
+        "{outcomes:?}"
+    );
+    outcomes[0].clone()
+}
+
+/// A register nibble above 12 names φ12 (`r = min(12, nibble)`): a
+/// `move_reg` reading nibble 14 copies φ12, and one writing nibble 15
+/// writes it.
+///
+/// ```text
+/// 0: load_imm φ12, 0x34   51 0c 34
+/// 3: move_reg φ7, φ14→12  64 e7
+/// 5: load_imm φ8, 9       51 08 09
+/// 8: move_reg φ15→12, φ8  64 8f
+/// a: jump_ind φ0, 0       32 00      a halt
+/// ```
+#[test]
+fn a_register_nibble_above_twelve_names_twelve() {
+    let code = [51, 12, 0x34, 100, 0xe7, 51, 8, 9, 100, 0x8f, 50, 0];
+    let (exit, gas, registers, _) = decoded(&code, &[0, 3, 5, 8, 10]);
+    assert_eq!(exit, ExitReason::Halt);
+    assert_eq!((registers[7], registers[12]), (0x34, 9));
+    assert_eq!(gas, 23);
+}
+
+/// Operand bytes past an instruction's skip are the following bytes, and
+/// past the code zeros (`ζ = c ⌢ [0, 0, ...]`): a `load_imm` of skip 0
+/// takes its register from the next opcode's low nibble (`load_imm`, 51:
+/// φ3) and an empty immediate; a trailing `jump_ind` of skip 0 reads φ0
+/// from past the code, and halts.
+///
+/// ```text
+/// 0: load_imm φ3, 9       51 03 09
+/// 3: load_imm φ(51 & 15)  51          φ3 = 0
+/// 4: load_imm φ7, 5       51 07 05
+/// 7: jump_ind φ0, 0       32          its operand past the code
+/// ```
+#[test]
+fn operand_bytes_past_the_skip_and_the_code_are_read_as_the_text_says() {
+    let code = [51, 3, 9, 51, 51, 7, 5, 50];
+    let (exit, gas, registers, _) = decoded(&code, &[0, 3, 4, 7]);
+    assert_eq!(exit, ExitReason::Halt);
+    assert_eq!((registers[3], registers[7]), (0, 5));
+    assert_eq!(gas, 22);
+}
+
+/// `load_imm_64` reads its eight immediate bytes whatever its skip
+/// (`ν_X = E⁻¹_8(ζ_{ı+2..+8})`): with a skip of 3 it takes the next
+/// instruction's bytes, then zeros past the code.
+///
+/// ```text
+/// 0: load_imm_64 φ7, ...  14 07 11 22
+/// 4: jump_ind φ0, 0       32 00
+/// ```
+#[test]
+fn load_imm_64_reads_eight_bytes_past_a_short_skip() {
+    let code = [20, 7, 0x11, 0x22, 50, 0];
+    let (exit, gas, registers, _) = decoded(&code, &[0, 4]);
+    assert_eq!(exit, ExitReason::Halt);
+    assert_eq!(registers[7], 0x0032_2211);
+    assert_eq!(gas, 22);
+}
+
+/// An immediate-length field of 5 to 7 is 4 (`l_X = min(4, field)`): a
+/// `store_imm_u8` whose field says 5, 6 or 7 reads a four-byte address and
+/// stores the byte after it; a `store_imm_ind_u8` with the field in its
+/// high nibble reads a four-byte offset.
+///
+/// ```text
+/// 0: store_imm_u8 [0x2_0000], 0x7f        1e 0f 00 00 02 00 7f  (field f & 7)
+/// 7: load_imm φ2, 0x2_0000                33 02 00 00 02
+/// c: store_imm_ind_u8 [φ2 + 0], 0x55      46 f2 00 00 00 00 55  (field f >> 4 & 7)
+/// 13: jump_ind φ0, 0                      32 00
+/// ```
+#[test]
+fn an_immediate_length_field_past_four_reads_four() {
+    for field in [5u8, 6, 7] {
+        let code = [
+            30,
+            field,
+            0,
+            0,
+            2,
+            0,
+            0x7f,
+            51,
+            2,
+            0,
+            0,
+            2,
+            70,
+            2 | field << 4,
+            0,
+            0,
+            0,
+            0,
+            0x55,
+            50,
+            0,
+        ];
+        let stored_first = decoded(
+            &code[..7]
+                .iter()
+                .chain(&[50, 0])
+                .copied()
+                .collect::<Vec<_>>(),
+            &[0, 7],
+        );
+        assert_eq!(stored_first.0, ExitReason::Halt, "field {field}");
+        assert_eq!(
+            stored_first.3, 0x7f,
+            "field {field}: the address's four bytes"
+        );
+        let (exit, gas, _, byte) = decoded(&code, &[0, 7, 12, 19]);
+        assert_eq!(exit, ExitReason::Halt, "field {field}");
+        assert_eq!(byte, 0x55, "field {field}: the offset's four bytes");
+        assert_eq!(gas, 26, "field {field}");
+    }
+}
