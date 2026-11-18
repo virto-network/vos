@@ -30,8 +30,8 @@ use crate::{Answer, Code, Facility, Field, Form};
 use s4_credential_contract::KeyAnswer;
 
 pub use contract::{
-    Claim, Claimed, Device, Home, KitKind, MAX_LABEL, Membership, Notice, Owed, PairCode, Paired,
-    Pending, PersonalStatus, Phase, Posted, Refused, Seen, Synced, Tor, Why, label,
+    Claim, Claimed, Device, Home, KitKind, KitView, MAX_LABEL, Membership, Notice, Owed, PairCode,
+    Paired, Pending, PersonalStatus, Phase, Posted, Refused, Seen, Synced, Tor, Why, label,
 };
 pub use vos_light::space::{AdminOffer, Artifacts, CREDENTIAL_BOOK, DEVICE_BOOK, LIGHT, PERSONAL};
 
@@ -281,6 +281,32 @@ impl space::Prompts for Asked<'_> {
         })
     }
 
+    fn confirm_pairing(&self, check: &str) -> bool {
+        self.shown(Form {
+            title: "Pair a new device".into(),
+            detail: "Confirm only if the new device shows this same check. Someone else who saw \
+                     the code would show another, and would be given your keys."
+                .into(),
+            rows: vec![("Check".into(), check.to_owned())],
+            fields: Vec::new(),
+            notice: None,
+            choices: vec!["It shows the same".into()],
+        })
+    }
+
+    fn show_pairing(&self, check: &str) -> bool {
+        self.shown(Form {
+            title: "Pairing".into(),
+            detail: "Your other device asks you to confirm this check. Go on once it is confirmed \
+                     there."
+                .into(),
+            rows: vec![("Check".into(), check.to_owned())],
+            fields: Vec::new(),
+            notice: None,
+            choices: vec!["Go on".into()],
+        })
+    }
+
     fn create_source(&self) -> Result<Vec<u8>, Error> {
         let key = key_answer(self.0.create_key(Kind::Keystore))?;
         Reference::from_bytes(&[&[Kind::Keystore as u8], &key[..]].concat())
@@ -413,22 +439,39 @@ fn kit(kind: KitKind) -> vos_wire::personal::KitKind {
 /// A claim as the chrome makes it, checked, as the personal space takes it.
 fn claim(request: Claim) -> Result<space::Claim, Refused> {
     let request = request.check()?;
-    let home = request.home;
     Ok(space::Claim {
-        home: space::Kept {
-            home: vos_light::home::Home {
-                space: home.space,
-                handle: home.handle,
-                agent: home.agent,
-                identity: home.identity,
-                homes: InstanceId(home.homes),
-                credentials: InstanceId(home.credentials),
-            },
-            onions: crate::net::onions(&home.onions),
-        },
+        home: kept(request.home),
         kit: kit(request.kit),
         label: request.label,
     })
+}
+
+/// A home as the chrome names it, checked ([`Home::check`]): as the
+/// personal space reaches it.
+fn kept(home: Home) -> space::Kept {
+    space::Kept {
+        home: vos_light::home::Home {
+            space: home.space,
+            handle: home.handle,
+            agent: home.agent,
+            identity: home.identity,
+            homes: InstanceId(home.homes),
+            credentials: InstanceId(home.credentials),
+        },
+        onions: crate::net::onions(&home.onions),
+    }
+}
+
+fn device(device: space::Device) -> Device {
+    Device {
+        id: device.id,
+        label: device.label,
+        strong: device.strong,
+        standing: device.standing as u8,
+        seen: device.seen,
+        removed: device.removed,
+        me: device.me,
+    }
 }
 
 fn claimed(claimed: space::Claimed) -> Claimed {
@@ -632,18 +675,60 @@ impl Space {
 
     pub fn devices(&self) -> Result<Vec<Device>, Refused> {
         let all = self.0.devices().map_err(refusal)?;
-        Ok(all
-            .into_iter()
-            .map(|device| Device {
-                id: device.id,
-                label: device.label,
-                strong: device.strong,
-                standing: device.standing as u8,
-                seen: device.seen,
-                removed: device.removed,
-                me: device.me,
-            })
-            .collect())
+        Ok(all.into_iter().map(device).collect())
+    }
+
+    pub fn kit_view(
+        &self,
+        prompts: Lent<'_>,
+        home: Home,
+        kind: KitKind,
+    ) -> Result<KitView, Refused> {
+        let view = self
+            .0
+            .kit_view(&Asked(prompts), kept(home.check()?), kit(kind))
+            .map_err(refusal)?;
+        Ok(KitView {
+            devices: view.devices.into_iter().map(device).collect(),
+            operations: view
+                .operations
+                .into_iter()
+                .map(crate::job::notice)
+                .collect(),
+        })
+    }
+
+    pub fn remove_by_kit(
+        &self,
+        prompts: Lent<'_>,
+        home: Home,
+        kind: KitKind,
+        device: u32,
+    ) -> Result<Posted, Refused> {
+        self.0
+            .remove_by_kit(&Asked(prompts), kept(home.check()?), kit(kind), device)
+            .map(posted)
+            .map_err(refusal)
+    }
+
+    pub fn resolve_by_kit(
+        &self,
+        prompts: Lent<'_>,
+        home: Home,
+        kind: KitKind,
+        index: u64,
+        upheld: bool,
+    ) -> Result<Posted, Refused> {
+        self.0
+            .resolve_by_kit(
+                &Asked(prompts),
+                kept(home.check()?),
+                kit(kind),
+                index,
+                upheld,
+            )
+            .map(posted)
+            .map_err(refusal)
     }
 
     pub fn operations(&self) -> Result<Vec<Notice>, Refused> {

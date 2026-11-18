@@ -529,6 +529,8 @@ pub(crate) fn notice(raised: vos_light::job::Notice) -> Notice {
         Found::Restore => plain(Pending::Restoring),
         Found::Removed => plain(Pending::Removed),
         Found::Stuck => plain(Pending::Stuck),
+        Found::Commit(vos_light::job::Commit::Removals) => plain(Pending::Commit),
+        Found::Commit(vos_light::job::Commit::Reseal) => plain(Pending::Reseal),
         Found::Alarm(found) => {
             let (alarm, index, remedy) = alarm(&found);
             Notice {

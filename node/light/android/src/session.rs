@@ -16,6 +16,7 @@ use vos_light::{
     AuthWitness, Call, DeviceError, DeviceProgram, DeviceSecret, Digest, PEAK_BYTES, Prover,
     ProverConfig, TreeKeeper,
 };
+use vos_wire::ingress::DeviceWindow;
 
 use crate::chrome::{Answer, Chrome, Field, Form, short};
 use crate::enrollment::{Agent, Enrollment, Guard, Method, Origin, Store, write_private};
@@ -50,6 +51,14 @@ const ROOT_POLL: Duration = Duration::from_millis(250);
 const ROOT_SPREAD: Duration = Duration::from_millis(TreeKeeper::UNKNOWN_SPREAD_MS);
 /// A space that no longer admits the device format this app proves in.
 const UPDATE: &str = "the space no longer admits this app's proofs: update the app";
+/// A space whose window admits none of this app's programs: the app or the
+/// space is behind the other.
+const WINDOW: &str =
+    "the space admits none of this app's programs: the app or the space must update";
+/// A window a space's node could not compute whole yet.
+const UNAVAILABLE: &str = "the space's node cannot read its device window yet: try again";
+/// How long a space's device window is taken as read.
+const WINDOW_TTL: Duration = Duration::from_secs(600);
 /// The furthest the node's time may be from the device's: past it, a relay
 /// that lies about the time could keep a confirmed proof for later.
 const CLOCK_SKEW_MS: u64 = 300_000;
@@ -102,6 +111,10 @@ pub(crate) struct Inner {
     trees: Mutex<HashMap<(String, String), Arc<Tree>>>,
     /// The device's personal space, while it runs.
     paired: Mutex<Option<std::sync::Weak<dyn Paired>>>,
+    /// Each space's device window for an instance, as its node answered it
+    /// last, and when: read before a proof, and kept for [`WINDOW_TTL`]
+    /// while it admits this app's programs.
+    windows: Mutex<HashMap<([u8; 32], u32, u32), (Instant, DeviceWindow)>>,
 }
 
 /// What an enrollment asks of the device's personal space.
@@ -211,6 +224,7 @@ impl Facility {
                 net,
                 trees: Mutex::new(HashMap::new()),
                 paired: Mutex::new(None),
+                windows: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -466,6 +480,61 @@ impl Inner {
             Guard::Auth { .. } => self.stock.auth.as_slice(),
             Guard::Owner => self.stock.owner.as_slice(),
         })
+    }
+
+    /// Whether the space admits `kernel`'s program for `method` of
+    /// `enrollment`, as its device window says (`light-node.md` §4.4): read
+    /// before anything is asked or proved, so a space behind the app, or
+    /// ahead of it, is refused with the window's words and not a proof's.
+    pub(crate) async fn admits(
+        &self,
+        enrollment: &Enrollment,
+        method: &Method,
+        kernel: &[u8],
+    ) -> Result<(), Refusal> {
+        let shipped = <Release as vos_abi::Decode>::decode_exact(kernel)
+            .ok_or_else(|| refused(Code::Prove, "a stock kernel's artifact does not decode"))?;
+        let key = (enrollment.handle, method.agent, method.instance);
+        let held = self
+            .windows
+            .lock()
+            .expect("windows poisoned")
+            .get(&key)
+            .filter(|(at, _)| at.elapsed() < WINDOW_TTL)
+            .map(|(_, window)| window.clone());
+        let window = match held {
+            Some(window) => window,
+            None => {
+                let answer = self
+                    .net
+                    .request(
+                        enrollment.handle,
+                        Purpose::Fetch,
+                        &wire::devices_request(method.agent, method.instance),
+                    )
+                    .await
+                    .map_err(|error| refused(Code::Api, error))?;
+                let window = wire::devices_answer(&answer)
+                    .map_err(|error| refused(Code::Api, error.to_string()))?
+                    .ok_or_else(|| refused(Code::Refused, "the space holds no such instance"))?;
+                self.windows
+                    .lock()
+                    .expect("windows poisoned")
+                    .insert(key, (Instant::now(), window.clone()));
+                window
+            }
+        };
+        // A window that admits none of them is read again next time: the
+        // space, or the app, may have moved meanwhile.
+        let chosen = vos_light::choose(std::slice::from_ref(&shipped), &window, shipped.method);
+        if chosen.is_err() {
+            self.windows.lock().expect("windows poisoned").remove(&key);
+        }
+        match chosen {
+            Ok(_) => Ok(()),
+            Err(DeviceError::Unavailable) => Err(refused(Code::Api, UNAVAILABLE)),
+            Err(_) => Err(refused(Code::Refused, WINDOW)),
+        }
     }
 
     /// Every enrolled kernel, the programs of others dropped.
@@ -949,6 +1018,9 @@ impl Session {
                 "a once-guarded call is proved with no arguments the chrome cannot show",
             ));
         }
+        self.inner
+            .admits(&enrollment, method, &self.inner.stock.auth)
+            .await?;
         let Some(witness) = self.witness().await else {
             return Err(refused(
                 Code::NoPath,
@@ -1114,6 +1186,9 @@ impl Session {
             &request.method,
             |method| method.guard == Guard::Owner && method.name == TRANSFER,
         )?;
+        self.inner
+            .admits(&enrollment, method, &self.inner.stock.owner)
+            .await?;
         let (mut payee, mut amount) = (request.payee.clone(), request.amount.to_string());
         let mut notice = None;
         let (payee, amount) = loop {

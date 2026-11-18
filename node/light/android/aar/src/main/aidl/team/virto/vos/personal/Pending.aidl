@@ -25,4 +25,14 @@ enum Pending {
     ALARM = 9,
     /** This device cannot follow its group: it re-pairs, or regroups. */
     STUCK = 10,
+    /**
+     * A commit is owed for the removals that matured: until one carries them, the removed devices
+     * hold the keys. "Commit now".
+     */
+    COMMIT = 11,
+    /**
+     * A commit is owed that re-seals the recovery kit: the agent's verdict left the kit sealed
+     * under a removed device's secret. "Commit now".
+     */
+    RESEAL = 12,
 }

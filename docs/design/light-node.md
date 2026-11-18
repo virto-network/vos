@@ -2533,10 +2533,11 @@ format, the chips, the sizes and the root.
     formats and each device kernel's programs, ids, formats and dates) and
     proves with the newest program it ships that the window holds, in a
     format it holds (`vos_light::choose`, `wire::devices_request` [built];
-    the app's sign-in calls them when the facility moves to release
-    artifacts, plan 8.24b). When the space admits none it refuses before
-    proving (`DeviceError::Window`: "the space admits none of this app's
-    programs for the kernel: the app or the space must update"); a window
+    the facility's sign-in and payment read it before their prompt, over
+    `Fetch`, kept ten minutes while it admits the app's programs [built,
+    2026-11-18]). When the space admits none it refuses before any prompt,
+    use of the secret or proof (`DeviceError::Window`: "the space admits
+    none of this app's programs: the app or the space must update"); a window
     a node could not compute whole yet (a blob it does not hold) is marked
     `unavailable`, and the app asks again rather than saying either side
     must update. An app ships its release's artifacts, one per kernel

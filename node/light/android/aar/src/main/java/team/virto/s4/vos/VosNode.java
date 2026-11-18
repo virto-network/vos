@@ -22,7 +22,9 @@ import java.util.Set;
 import team.virto.vos.personal.ClaimRequest;
 import team.virto.vos.personal.Claimed;
 import team.virto.vos.personal.Device;
+import team.virto.vos.personal.Home;
 import team.virto.vos.personal.IVosPersonal;
+import team.virto.vos.personal.KitView;
 import team.virto.vos.personal.Membership;
 import team.virto.vos.personal.Notice;
 import team.virto.vos.personal.PairCode;
@@ -551,6 +553,26 @@ public final class VosNode {
     }
 
     @Override
+    public KitView kitView(Home home, byte kit, IVosPrompts prompts, Refused refused) {
+      caller();
+      return nativeKitView(handle, home, kit, prompts, refused);
+    }
+
+    @Override
+    public Posted removeByKit(
+        Home home, byte kit, long device, IVosPrompts prompts, Refused refused) {
+      caller();
+      return nativeRemoveByKit(handle, home, kit, device, prompts, refused);
+    }
+
+    @Override
+    public Posted resolveByKit(
+        Home home, byte kit, long index, boolean upheld, IVosPrompts prompts, Refused refused) {
+      caller();
+      return nativeResolveByKit(handle, home, kit, index, upheld, prompts, refused);
+    }
+
+    @Override
     public Claimed restored(byte kit, IVosPrompts prompts, Refused refused) {
       caller();
       return nativeRestored(handle, kit, prompts, refused);
@@ -722,6 +744,21 @@ public final class VosNode {
       long handle, byte[] code, IVosPrompts prompts, Refused refused);
 
   private static native Posted nativeRegroup(long handle, IVosPrompts prompts, Refused refused);
+
+  private static native KitView nativeKitView(
+      long handle, Home home, byte kit, IVosPrompts prompts, Refused refused);
+
+  private static native Posted nativeRemoveByKit(
+      long handle, Home home, byte kit, long device, IVosPrompts prompts, Refused refused);
+
+  private static native Posted nativeResolveByKit(
+      long handle,
+      Home home,
+      byte kit,
+      long index,
+      boolean upheld,
+      IVosPrompts prompts,
+      Refused refused);
 
   private static native boolean nativeUpdate(long handle, IVosPrompts prompts, Refused refused);
 

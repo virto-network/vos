@@ -21,7 +21,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-use crate::personal::{Claim, KitKind, Membership, Refused, contract};
+use crate::personal::{Claim, Home, KitKind, Membership, Refused, contract};
 use jni::errors::LogErrorAndDefault;
 use jni::objects::{Global, JByteArray, JClass, JLongArray, JObject, JObjectArray, JString};
 use jni::sys::{jboolean, jbyte, jint, jlong};
@@ -687,6 +687,27 @@ natives! {
         let request = Claim::from_java(env, &request)?;
         let lent = prompts(env, &lent)?;
         let posted = node.personal()?.restore(&*lent, request, kit(old)?)?;
+        made(env, &posted)
+    }
+
+    personal fn Java_team_virto_s4_vos_VosNode_nativeKitView(home: JObject<'l>, kind: jbyte, lent: JObject<'l>) -> JObject<'l>, |env, node| {
+        let home = Home::from_java(env, &home)?;
+        let lent = prompts(env, &lent)?;
+        let view = node.personal()?.kit_view(&*lent, home, kit(kind)?)?;
+        made(env, &view)
+    }
+
+    personal fn Java_team_virto_s4_vos_VosNode_nativeRemoveByKit(home: JObject<'l>, kind: jbyte, device: jlong, lent: JObject<'l>) -> JObject<'l>, |env, node| {
+        let home = Home::from_java(env, &home)?;
+        let lent = prompts(env, &lent)?;
+        let posted = node.personal()?.remove_by_kit(&*lent, home, kit(kind)?, word(device)?)?;
+        made(env, &posted)
+    }
+
+    personal fn Java_team_virto_s4_vos_VosNode_nativeResolveByKit(home: JObject<'l>, kind: jbyte, index: jlong, upheld: jboolean, lent: JObject<'l>) -> JObject<'l>, |env, node| {
+        let home = Home::from_java(env, &home)?;
+        let lent = prompts(env, &lent)?;
+        let posted = node.personal()?.resolve_by_kit(&*lent, home, kit(kind)?, index as u64, upheld)?;
         made(env, &posted)
     }
 

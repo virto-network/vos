@@ -184,6 +184,10 @@ final class Notices {
         return R.string.vos_pending_removed;
       case Pending.STUCK:
         return R.string.vos_pending_stuck;
+      case Pending.COMMIT:
+        return R.string.vos_pending_commit;
+      case Pending.RESEAL:
+        return R.string.vos_pending_reseal;
       default:
         return R.string.vos_pending_alarm;
     }

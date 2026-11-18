@@ -51,6 +51,12 @@ byte_enum! {
         /// This device cannot follow its group: removed from another
         /// device, it pairs again; or it regroups.
         Stuck = 10 as STUCK,
+        /// A commit is owed for the removals that matured: until one
+        /// carries them, the removed devices hold the epoch's keys.
+        Commit = 11 as COMMIT,
+        /// A commit is owed that re-seals the kit under a new `R`: the
+        /// agent's verdict left it sealed under one a removed device holds.
+        Reseal = 12 as RESEAL,
     }
 }
 
@@ -442,6 +448,14 @@ parcel! {
         pub seen: u64 => long,
         pub removed: bool => boolean,
         pub me: bool => boolean,
+    }
+
+    /// The device set as the kit reads it at its home: each device, and
+    /// the operations open, as the chrome raises them.
+    #[derive(Clone, Debug, PartialEq, Eq, Default)]
+    pub struct KitView {
+        pub devices: Vec<Device> => Device[],
+        pub operations: Vec<Notice> => Notice[],
     }
 
     /// An admin call the agent took: its log index and batch time.

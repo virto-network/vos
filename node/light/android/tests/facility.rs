@@ -685,3 +685,85 @@ async fn signed_in(
         }
     }
 }
+
+/// A sign-in or a payment reads the space's device window first (§4.4):
+/// a space whose window admits none of this app's programs, the app or the
+/// space behind the other, is refused with the window's words before any
+/// prompt, any use of the secret or any proof; a window the node cannot
+/// compute yet is refused to be asked again; the stock window proves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_window_without_this_apps_programs_is_refused_before_proving() {
+    let world = world();
+    let directory = tempfile::tempdir().unwrap();
+    let source = Arc::new(Phone::new(9));
+    let facility = facility(
+        &world,
+        directory.path(),
+        Arc::clone(&source) as Arc<dyn Source>,
+    );
+    let session = facility.session(gateway());
+    let chrome = Scripted::default();
+    chrome.will(confirm(&[]));
+    chrome.will(confirm(&[]));
+    let enrolled = session.ask("enroll", &enrollment(), &chrome).await.unwrap();
+    world.enroll(
+        AGENT,
+        &<[u8; 32]>::try_from(bytes(field(&enrolled, "member"))).unwrap(),
+    );
+    session.granted();
+    let login = object(&[
+        ("agent", Value::from(AGENT)),
+        ("instance", Value::from(POLL)),
+        ("method", Value::from("login")),
+        ("arguments", Value::Bytes(Vec::new())),
+    ]);
+    let pay = object(&[
+        ("agent", Value::from(AGENT)),
+        ("instance", Value::from(PAYMENTS)),
+        ("method", Value::from("transfer")),
+        ("payee", Value::from("shop")),
+        ("amount", Value::from(20u64)),
+    ]);
+
+    let mut ahead = world.stock.window();
+    for kernel in &mut ahead.kernels {
+        kernel.programs[0].id = [0x77; 32];
+    }
+    let (forms, uses, sent) = (
+        chrome.shown.lock().unwrap().len(),
+        *source.uses.lock().unwrap(),
+        world.state.lock().unwrap().credentialed.len(),
+    );
+    world.state.lock().unwrap().window = Some(ahead.clone());
+    for (operation, request) in [("sign_in", &login), ("pay", &pay)] {
+        let refused = session.ask(operation, request, &chrome).await.unwrap_err();
+        assert_eq!(refused.code, Code::Refused, "{operation}");
+        assert!(refused.message.contains("must update"), "{refused:?}");
+    }
+    for kernel in &mut ahead.kernels {
+        kernel.unavailable = true;
+    }
+    world.state.lock().unwrap().window = Some(ahead);
+    let refused = session.ask("sign_in", &login, &chrome).await.unwrap_err();
+    assert_eq!(refused.code, Code::Api);
+    assert_eq!(chrome.shown.lock().unwrap().len(), forms, "no prompt");
+    assert_eq!(*source.uses.lock().unwrap(), uses, "no use of the secret");
+    assert_eq!(
+        world.state.lock().unwrap().credentialed.len(),
+        sent,
+        "nothing proved, nothing sent"
+    );
+
+    world.state.lock().unwrap().window = None;
+    loop {
+        chrome.will(confirm(&[]));
+        match session.ask("sign_in", &login, &chrome).await {
+            Ok(_) => break,
+            Err(error) if error.code == Code::NoPath => {
+                chrome.answers.lock().unwrap().clear();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => panic!("{error:?}"),
+        }
+    }
+}

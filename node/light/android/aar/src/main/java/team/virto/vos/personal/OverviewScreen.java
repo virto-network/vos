@@ -143,8 +143,13 @@ final class OverviewScreen extends Screen {
     if (status.owed > 0) {
       into.addView(warning(status.owed + " membership(s) of your other spaces wait for you."));
     }
+    boolean owed = false;
     for (Notice notice : status.standing) {
       into.addView(warning(Words.notice(notice)));
+      owed |= notice.pending == Pending.COMMIT || notice.pending == Pending.RESEAL;
+    }
+    if (owed) {
+      into.addView(button("Commit now", v -> commit()));
     }
     into.addView(button("Devices, changes and keys", v -> app.open(new DevicesScreen(app))));
     into.addView(button("Pair a new device", v -> app.open(new PairScreen(app, true))));
@@ -165,6 +170,17 @@ final class OverviewScreen extends Screen {
     into.addView(
         button("Join from another device", v -> app.open(new PairScreen(app, false))));
     into.addView(button("Restore from a recovery kit", v -> app.open(new RestoreScreen(app))));
+  }
+
+  /** The commit a notice asks for, behind the biometric. */
+  private void commit() {
+    app.run(
+        "Committing: removals carried, the kit sealed again…",
+        (personal, prompts, refused) -> personal.update(prompts, refused) ? Boolean.TRUE : null,
+        done -> {
+          app.say("Committed.");
+          shown();
+        });
   }
 
   private void sync() {

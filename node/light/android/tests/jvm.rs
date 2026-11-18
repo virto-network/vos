@@ -16,8 +16,9 @@ use s4_credential_contract::Onion;
 use s4_credential_contract::java::{JavaError, Parcel};
 use s4_credential_contract::jvm::{compile, round_trip, with_vm};
 use vos_facility::personal::contract::{
-    AIDL, Alarm, Claim, Claimed, Device, Home, KitKind, Membership, Notice, Owed, PairCode, Paired,
-    Pending, PersonalStatus, Phase, Posted, REGISTRY, Refused, Remedy, Seen, Synced, Tor, Why,
+    AIDL, Alarm, Claim, Claimed, Device, Home, KitKind, KitView, Membership, Notice, Owed,
+    PairCode, Paired, Pending, PersonalStatus, Phase, Posted, REGISTRY, Refused, Remedy, Seen,
+    Synced, Tor, Why,
 };
 
 #[test]
@@ -134,6 +135,28 @@ fn every_type_crosses_its_parcelable_unchanged() {
                 me: true,
             },
         );
+        round_trip(
+            env,
+            KitView {
+                devices: vec![Device {
+                    id: 0,
+                    label: "lost phone".into(),
+                    strong: true,
+                    standing: 2,
+                    seen: 1_700_000_000_000,
+                    removed: false,
+                    me: false,
+                }],
+                operations: vec![Notice {
+                    pending: Pending::Remove,
+                    index: 9,
+                    by_kit: true,
+                    contested: true,
+                    ..Notice::default()
+                }],
+            },
+        );
+        round_trip(env, KitView::default());
         round_trip(
             env,
             Posted {

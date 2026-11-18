@@ -83,6 +83,10 @@ public final class Words {
         return "This device was removed";
       case Pending.STUCK:
         return "This device cannot follow the others: remove it from another, then pair it again";
+      case Pending.COMMIT:
+        return "A removed device still holds your keys until you commit: commit now";
+      case Pending.RESEAL:
+        return "Your recovery kit must be sealed again: commit now";
       default:
         return "The sync found something wrong";
     }

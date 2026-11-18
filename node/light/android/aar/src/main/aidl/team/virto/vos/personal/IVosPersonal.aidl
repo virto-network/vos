@@ -8,7 +8,9 @@ import team.virto.s4.vos.Refusal;
 import team.virto.vos.personal.ClaimRequest;
 import team.virto.vos.personal.Claimed;
 import team.virto.vos.personal.Device;
+import team.virto.vos.personal.Home;
 import team.virto.vos.personal.KitKind;
+import team.virto.vos.personal.KitView;
 import team.virto.vos.personal.Membership;
 import team.virto.vos.personal.Notice;
 import team.virto.vos.personal.PairCode;
@@ -146,6 +148,26 @@ interface IVosPersonal {
      * kind split for it; it matures after the kit's delay unless a device answers.
      */
     Posted restore(in ClaimRequest request, KitKind old, IVosPrompts prompts, out Refused refused);
+
+    /**
+     * The device set and its open operations, read under the kit of the kind entered at the agent
+     * the home's `Homes` names for it: what a fresh install shows before the kit removes a device
+     * or resolves a contest.
+     */
+    KitView kitView(in Home home, KitKind kit, IVosPrompts prompts, out Refused refused);
+
+    /**
+     * Remove a device by the kit of the kind entered, from any install (a lost phone left powered,
+     * whose background job would answer every restore): it matures after the kit's delay unless
+     * that device vetoes it with its admin key. Called again, a removal whose evidence was lost has
+     * it posted.
+     */
+    Posted removeByKit(in Home home, KitKind kit, long device, IVosPrompts prompts, out Refused refused);
+
+    /** Resolve a contested operation by the kit of the kind entered, at once: upheld, or dropped. */
+    Posted resolveByKit(
+            in Home home, KitKind kit, long index, boolean upheld, IVosPrompts prompts,
+            out Refused refused);
 
     /** The restore matured: the kit entered again, the personal space read back. */
     Claimed restored(KitKind kit, IVosPrompts prompts, out Refused refused);

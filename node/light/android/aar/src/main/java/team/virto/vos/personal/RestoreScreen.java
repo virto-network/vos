@@ -9,13 +9,16 @@ import android.widget.LinearLayout;
 /**
  * A restore from the recovery kit, in two steps: opened at the home the kit's card names (a new
  * kit made for it), it matures after the kit's delay unless a device of the set answers; then
- * finished with the same kit entered again, the personal space read back.
+ * finished with the same kit entered again, the personal space read back. A lost phone left on
+ * answers every restore: the kit reads the device set, removes that phone (it matures after the
+ * kit's delay, and its background sync cannot veto it) and resolves a contest, from this install.
  */
 final class RestoreScreen extends Screen {
   private String code = "";
   private String label = Words.label(Build.MODEL);
   private byte old = KitKind.PHRASE;
   private byte next = KitKind.PHRASE;
+  private KitView view;
 
   RestoreScreen(PersonalActivity app) {
     super(app);
@@ -55,6 +58,88 @@ final class RestoreScreen extends Screen {
     into.addView(
         text("Once the delay passed: enter the kit you opened it with again (chosen above)."));
     into.addView(button("Finish the restore", v -> finish()));
+    into.addView(heading("A lost phone answers the restore"));
+    into.addView(
+        text(
+            "A lost phone left on answers every restore by itself. Read your devices with the kit "
+                + "(chosen above), remove that phone with the kit, and open the restore again once "
+                + "its removal matured."));
+    into.addView(
+        button(
+            "Read the devices with the kit",
+            v -> {
+              Home at = home.home();
+              if (at != null) {
+                read(at);
+              }
+            }));
+    if (view == null) {
+      return;
+    }
+    for (Device device : view.devices) {
+      into.addView(
+          text(
+              device.label
+                  + ": "
+                  + Words.standing(device.standing)
+                  + (device.removed ? " (removed)" : "")));
+      if (!device.removed) {
+        into.addView(
+            button(
+                "Remove " + device.label + " with the kit",
+                v -> {
+                  Home at = home.home();
+                  if (at != null) {
+                    remove(at, device);
+                  }
+                }));
+      }
+    }
+    for (Notice notice : view.operations) {
+      into.addView(text(Words.notice(notice)));
+      if (notice.contested) {
+        into.addView(
+            buttons(
+                button("Uphold it with the kit", v -> resolve(home.home(), notice.index, true)),
+                button("Drop it with the kit", v -> resolve(home.home(), notice.index, false))));
+      }
+    }
+  }
+
+  private void read(Home home) {
+    byte kit = old;
+    app.run(
+        "Reading your devices with the kit…",
+        (personal, prompts, refused) -> personal.kitView(home, kit, prompts, refused),
+        (KitView read) -> {
+          view = read;
+          redraw();
+        });
+  }
+
+  private void remove(Home home, Device device) {
+    byte kit = old;
+    app.run(
+        "Removing " + device.label + " with the kit…",
+        (personal, prompts, refused) -> personal.removeByKit(home, kit, device.id, prompts, refused),
+        (Posted posted) ->
+            app.say(
+                device.label
+                    + "'s removal is open (log entry "
+                    + posted.index
+                    + "). It matures after your kit's delay; then open the restore again."));
+  }
+
+  private void resolve(Home home, long index, boolean upheld) {
+    if (home == null) {
+      return;
+    }
+    byte kit = old;
+    app.run(
+        "Resolving the contest with the kit…",
+        (personal, prompts, refused) ->
+            personal.resolveByKit(home, kit, index, upheld, prompts, refused),
+        (Posted posted) -> app.say("Resolved (log entry " + posted.index + ")."));
   }
 
   private void open(Home home) {
